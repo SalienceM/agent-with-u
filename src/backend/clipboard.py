@@ -8,7 +8,7 @@ PySide6's QClipboard.image() works reliably across platforms,
 including with Snipaste, ShareX, and other screenshot tools.
 
 ★ 临时文件策略：
-  捕获到图片后同步落盘到 ~/.claude-shell/tmp/<id>.png，
+  捕获到图片后同步落盘到 ~/.agent-with-u/tmp/<id>.png，
   ImageAttachment.file_path 记录路径。
   应用启动时调用 cleanup_old_temp_files() 清理过期文件（默认 24 小时）。
 """
@@ -26,7 +26,7 @@ from ..types import ImageAttachment, new_id
 
 
 # ★ 临时目录：与 session 存储同级
-TEMP_DIR = Path.home() / ".claude-shell" / "tmp"
+TEMP_DIR = Path.home() / ".agent-with-u" / "tmp"
 
 
 def _ensure_temp_dir() -> Path:

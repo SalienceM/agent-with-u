@@ -1,7 +1,7 @@
 """
 AppConfigStore: Manages application-level configuration (theme, preferences, etc.).
 
-Config stored in ~/.claude-shell/app-config.json
+Config stored in ~/.agent-with-u/app-config.json
 """
 
 import json
@@ -13,7 +13,7 @@ class AppConfigStore:
     """Application configuration store with persistence."""
 
     def __init__(self):
-        self._config_path = Path.home() / ".claude-shell" / "app-config.json"
+        self._config_path = Path.home() / ".agent-with-u" / "app-config.json"
         self._config: dict = {}
         self._load()
 

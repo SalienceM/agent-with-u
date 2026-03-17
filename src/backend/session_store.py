@@ -1,8 +1,8 @@
 """
 SessionStore: Manages session persistence as JSON files.
 
-Sessions stored in ~/.claude-shell/sessions/<id>.json
-Index kept in ~/.claude-shell/sessions/index.json for fast listing.
+Sessions stored in ~/.agent-with-u/sessions/<id>.json
+Index kept in ~/.agent-with-u/sessions/index.json for fast listing.
 
 ★ Optimizations:
 - Batch index saves (debounced) to reduce I/O
@@ -21,7 +21,7 @@ from ..types import Session, ChatMessage, ImageAttachment, ToolCallInfo
 
 class SessionStore:
     def __init__(self):
-        self._dir = Path.home() / ".claude-shell" / "sessions"
+        self._dir = Path.home() / ".agent-with-u" / "sessions"
         self._dir.mkdir(parents=True, exist_ok=True)
         self._index_path = self._dir / "index.json"
         self._index: dict[str, dict] = {}

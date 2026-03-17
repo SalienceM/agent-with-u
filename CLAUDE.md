@@ -1,8 +1,8 @@
-# Claude Shell - Project Documentation
+# AgentWithU - Project Documentation
 
 ## Project Overview
 
-Claude Shell is an enhanced Claude Code frontend application built with PySide6 and React. It provides a rich GUI for interacting with Claude AI, featuring clipboard image paste support, multi-model switching, session management, and streaming responses.
+AgentWithU is an enhanced Claude Code frontend application built with PySide6 and React. It provides a rich GUI for interacting with Claude AI, featuring clipboard image paste support, multi-model switching, session management, and streaming responses.
 
 **Key Features:**
 - Clipboard image paste (solves Snipaste integration pain point)
@@ -112,7 +112,7 @@ python -m src.main
 pip install pyinstaller
 
 # Build standalone executable
-pyinstaller --name "Claude Shell" --windowed --add-data "frontend/dist:frontend/dist" src/main.py
+pyinstaller --name "AgentWithU" --windowed --add-data "frontend/dist:frontend/dist" src/main.py
 ```
 
 ## Coding Conventions
@@ -174,8 +174,8 @@ pyinstaller --name "Claude Shell" --windowed --add-data "frontend/dist:frontend/
    - Final `done` delta triggers state commit and persistence
 
 4. **Session Persistence**:
-   - Sessions stored in `~/.claude-shell/sessions/<id>.json`
-   - Index file at `~/.claude-shell/sessions/index.json` for fast listing
+   - Sessions stored in `~/.agent-with-u/sessions/<id>.json`
+   - Index file at `~/.agent-with-u/sessions/index.json` for fast listing
    - Auto-save after each message completion
 
 ### Model Backends

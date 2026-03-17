@@ -1,5 +1,5 @@
 """
-Claude Shell — Entry point.
+AgentWithU — Entry point.
 
 Usage:
     python -m src.main          # production (loads frontend/dist)
@@ -33,7 +33,7 @@ def load_claude_settings():
     """
     settings_path = Path.home() / ".claude" / "settings.json"
     if not settings_path.exists():
-        print(f"[claude-shell] No settings found at {settings_path}")
+        print(f"[agent-with-u] No settings found at {settings_path}")
         return
 
     try:
@@ -42,15 +42,15 @@ def load_claude_settings():
         for key, value in env_vars.items():
             if key not in os.environ:  # Don't override explicitly set vars
                 os.environ[key] = str(value)
-                print(f"[claude-shell] Loaded from settings.json: {key}={'***' if 'TOKEN' in key or 'KEY' in key else value}")
+                print(f"[agent-with-u] Loaded from settings.json: {key}={'***' if 'TOKEN' in key or 'KEY' in key else value}")
 
         # Agent SDK needs ANTHROPIC_API_KEY — copy from AUTH_TOKEN if not set
         if "ANTHROPIC_API_KEY" not in os.environ and "ANTHROPIC_AUTH_TOKEN" in os.environ:
             os.environ["ANTHROPIC_API_KEY"] = os.environ["ANTHROPIC_AUTH_TOKEN"]
-            print("[claude-shell] Copied ANTHROPIC_AUTH_TOKEN → ANTHROPIC_API_KEY")
+            print("[agent-with-u] Copied ANTHROPIC_AUTH_TOKEN → ANTHROPIC_API_KEY")
 
     except Exception as e:
-        print(f"[claude-shell] Failed to load settings.json: {e}")
+        print(f"[agent-with-u] Failed to load settings.json: {e}")
 
 
 def run_async_loop(loop: asyncio.AbstractEventLoop):
@@ -68,7 +68,7 @@ def main():
         npm_bin = os.path.join(os.environ.get("APPDATA", ""), "npm")
         if npm_bin and npm_bin not in os.environ.get("PATH", ""):
             os.environ["PATH"] = npm_bin + os.pathsep + os.environ.get("PATH", "")
-            print(f"[claude-shell] Added npm to PATH: {npm_bin}")
+            print(f"[agent-with-u] Added npm to PATH: {npm_bin}")
     # ========== 加到这里 ==========
     
     # Load Claude Code settings (Coding Plan credentials, etc.)
@@ -79,7 +79,7 @@ def main():
 
     # Create Qt application
     app = QApplication(sys.argv)
-    app.setApplicationName("Claude Shell")
+    app.setApplicationName("AgentWithU")
     app.setOrganizationName("MasterMu")
 
     # Apply global dark stylesheet

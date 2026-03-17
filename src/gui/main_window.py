@@ -24,7 +24,7 @@ class MainWindow(QMainWindow):
         super().__init__()
         self._bridge = bridge
 
-        self.setWindowTitle("Claude Shell")
+        self.setWindowTitle("AgentWithU")
         self.resize(1200, 800)
         self.setMinimumSize(800, 600)
 

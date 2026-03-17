@@ -321,7 +321,7 @@ export const App: React.FC = () => {
       <div style={{ flex: 1, display: 'flex', flexDirection: 'column', minWidth: 0 }}>
         {/* ---- 顶部栏 ---- */}
         <div style={headerStyle}>
-          <span style={{ fontSize: 15, fontWeight: 600, color: 'var(--theme-text, #1f2328)' }}>Claude Shell</span>
+          <span style={{ fontSize: 15, fontWeight: 600, color: 'var(--theme-text, #1f2328)' }}>AgentWithU</span>
           {/* ★ 显示当前工作目录 */}
           <span style={workingDirStyle} title={activeSession?.workingDir || 'Not set'}>
             {formatWorkingDir(activeSession?.workingDir)}
@@ -357,7 +357,7 @@ export const App: React.FC = () => {
               }}
             >
               <div style={{ fontSize: 24, fontWeight: 600, color: 'var(--theme-text-muted, #8c959f)' }}>
-                Claude Shell
+                AgentWithU
               </div>
               <div style={{ fontSize: 14, color: 'var(--theme-text-muted, #8c959f)' }}>
                 Paste screenshots with Ctrl+V, switch models, save sessions.

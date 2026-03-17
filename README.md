@@ -1,4 +1,4 @@
-# Claude Shell (Python 版)
+# AgentWithU (Python 版)
 
 > Claude Code 增强前端 — 剪贴板图片粘贴、富消息 UI、多模型切换、会话管理。
 > 底层 PySide6 + QWebEngine，前端 React + Vite，`pip install` 即用。
@@ -46,7 +46,7 @@
 
 ```bash
 # 1. 安装 Python 依赖（就这一步，没有 Electron 下载问题）
-cd claude-shell-py
+cd agent-with-u-py
 pip install -r requirements.txt
 
 # 2. 构建前端（只需要一次）
@@ -73,13 +73,13 @@ python -m src.main --dev
 
 ```bash
 pip install pyinstaller
-pyinstaller --name "Claude Shell" --windowed --add-data "frontend/dist:frontend/dist" src/main.py
+pyinstaller --name "AgentWithU" --windowed --add-data "frontend/dist:frontend/dist" src/main.py
 ```
 
 ## 项目结构
 
 ```
-claude-shell-py/
+agent-with-u-py/
 ├── pyproject.toml
 ├── requirements.txt
 ├── src/

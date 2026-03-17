@@ -1,7 +1,7 @@
 """
 BackendStore: Manages backend configuration persistence as JSON files.
 
-Backend configs stored in ~/.claude-shell/backends/config.json
+Backend configs stored in ~/.agent-with-u/backends/config.json
 """
 
 import json
@@ -14,7 +14,7 @@ from ..types import ModelBackendConfig, BackendType
 
 class BackendStore:
     def __init__(self):
-        self._dir = Path.home() / ".claude-shell" / "backends"
+        self._dir = Path.home() / ".agent-with-u" / "backends"
         self._dir.mkdir(parents=True, exist_ok=True)
         self._config_path = self._dir / "config.json"
         self._configs: dict[str, ModelBackendConfig] = {}
