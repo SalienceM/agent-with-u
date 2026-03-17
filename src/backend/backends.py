@@ -121,56 +121,11 @@ STREAM_CHUNK_DELAY = 0.015   # seconds between chunks (~266 chars/s)
 class ClaudeAgentBackend(ModelBackend):
     """
     Uses the official `claude_agent_sdk` Python package (pip install claude-agent-sdk).
-    The package bundles the Claude Code CLI internally, so no separate CLI installation
-    is required. Supports images by writing them to temporary files that Claude can
-    read via the built-in Read tool.
+    The package bundles the Claude Code CLI internally — no separate CLI installation needed.
+
+    Image support: images are passed natively via the AsyncIterable[dict] form of
+    the prompt parameter using Anthropic content blocks (type: image / source: base64).
     """
-
-    def _get_cli_path(self) -> str:
-        """Get the claude CLI executable path.
-
-        On Windows, npm global packages are installed in %APPDATA%\\npm\\
-        The claude CLI is typically at %APPDATA%\\npm\\claude.cmd
-        """
-        cli = getattr(self.config, "cli_path", None)
-        if cli and os.path.exists(str(cli)):
-            return str(cli)
-
-        if sys.platform == "win32":
-            # ★ Fix: Use the actual npm bin directory from PATH or APPDATA
-            appdata = os.environ.get("APPDATA", "")
-            npm_bin = os.path.join(appdata, "npm")
-
-            # Check for claude.cmd first (Windows batch file)
-            for name in ("claude.cmd", "claude.bat", "claude.exe", "claude"):
-                p = os.path.join(npm_bin, name)
-                if os.path.exists(p):
-                    print(f"[ClaudeAgent] Found claude CLI at: {p}",
-                          file=sys.stderr, flush=True)
-                    return p
-
-            # Also check if 'claude' is in PATH
-            import shutil
-            claude_in_path = shutil.which("claude")
-            if claude_in_path:
-                print(f"[ClaudeAgent] Found claude in PATH: {claude_in_path}",
-                      file=sys.stderr, flush=True)
-                return claude_in_path
-
-            # Return the .cmd path even if it doesn't exist yet (for better error message)
-            return os.path.join(npm_bin, "claude.cmd")
-
-        # Unix/macOS
-        return "claude"
-
-    @staticmethod
-    def _apply_windows_cmd_wrap(cli_path: str, cmd: list[str]) -> list[str]:
-        """Windows 上 .cmd/.bat 文件不能被 Popen 直接执行，需要 cmd.exe /c 包装。"""
-        if sys.platform == "win32" and cli_path.lower().endswith((".cmd", ".bat")):
-            return ["cmd.exe", "/c"] + cmd
-        return cmd
-
-    # ------------------------------------------------------------------ #
 
     async def send_message(
         self,
@@ -200,7 +155,6 @@ class ClaudeAgentBackend(ModelBackend):
             return {}
 
         agent_sid = agent_session_id
-        temp_files: list[str] = []
 
         print(f"[ClaudeAgent] 收到请求, agent_session_id={agent_session_id!r}",
               file=sys.stderr, flush=True)
@@ -222,37 +176,42 @@ class ClaudeAgentBackend(ModelBackend):
                 if val:
                     env_dict[key] = val
 
-            # ★ 图片处理：写入临时文件，在 prompt 中注明路径由 Read 工具读取
-            image_paths: list[str] = []
-            if images:
-                import tempfile
-                import base64 as _b64
-                for img in images:
-                    if img.file_path and os.path.exists(img.file_path):
-                        image_paths.append(img.file_path)
-                    elif img.base64:
-                        ext = "png" if "png" in img.mime_type else "jpg"
-                        tf = tempfile.NamedTemporaryFile(
-                            suffix=f".{ext}", delete=False, prefix="claude_img_"
-                        )
-                        tf.write(_b64.b64decode(img.base64))
-                        tf.close()
-                        image_paths.append(tf.name)
-                        temp_files.append(tf.name)
+            # ★ 图片处理：使用 AsyncIterable[dict] 形式的 prompt 原生传递图片
+            # SDK 支持通过 yield Anthropic content blocks 的方式直接传递图片
+            has_images = bool(images)
 
-            prompt_text = content
-            if image_paths:
-                paths_str = "\n".join(f"  - {p}" for p in image_paths)
-                prompt_text = (
-                    f"{content}\n\n"
-                    f"[用户附加了以下图片，请使用 Read 工具查看它们]:\n{paths_str}"
-                )
+            async def _build_prompt():
+                if not has_images:
+                    yield content
+                    return
+                import base64 as _b64
+                content_blocks: list[dict] = []
+                for img in images:  # type: ignore[union-attr]
+                    img_b64 = img.base64
+                    if not img_b64 and img.file_path and os.path.exists(img.file_path):
+                        with open(img.file_path, "rb") as f:
+                            img_b64 = _b64.b64encode(f.read()).decode("ascii")
+                    if img_b64:
+                        content_blocks.append({
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": img.mime_type,
+                                "data": img_b64,
+                            },
+                        })
+                content_blocks.append({"type": "text", "text": content})
+                yield {
+                    "type": "user",
+                    "message": {"role": "user", "content": content_blocks},
+                }
 
             options_kwargs: dict = dict(
                 allowed_tools=tools,
                 cwd=cwd,
                 env=env_dict,
                 permission_mode="bypassPermissions" if skip_permissions else "default",
+                include_partial_messages=True,
             )
             if agent_session_id:
                 options_kwargs["resume"] = agent_session_id
@@ -265,33 +224,55 @@ class ClaudeAgentBackend(ModelBackend):
             options = ClaudeAgentOptions(**options_kwargs)
 
             print(f"[ClaudeAgent] SDK query: model={model}, resume={agent_session_id!r}, "
-                  f"images={len(image_paths)}, cwd={cwd}",
+                  f"images={len(images or [])}, cwd={cwd}",
                   file=sys.stderr, flush=True)
 
-            async for message in sdk_query(prompt=prompt_text, options=options):
+            async for message in sdk_query(prompt=_build_prompt(), options=options):
                 if self._cancelled:
                     break
 
                 msg_type = getattr(message, "type", type(message).__name__)
 
-                if msg_type == "system":
+                # ★ StreamEvent: include_partial_messages=True 时的流式增量事件
+                if msg_type == "stream_event":
+                    evt = getattr(message, "event", {})
+                    etype = evt.get("type", "")
+                    if etype == "content_block_delta":
+                        delta = evt.get("delta", {})
+                        dtype = delta.get("type", "")
+                        if dtype == "text_delta":
+                            emit("text_delta", text=delta.get("text", ""))
+                        elif dtype == "thinking_delta":
+                            thinking = delta.get("thinking", "")
+                            if thinking:
+                                emit("thinking", text=thinking)
+                        elif dtype == "input_json_delta":
+                            partial = delta.get("partial_json", "")
+                            if partial:
+                                emit("tool_input", tool_call={"inputDelta": partial})
+                    elif etype == "content_block_start":
+                        block = evt.get("content_block", {})
+                        if block.get("type") == "tool_use":
+                            emit("tool_start", tool_call={
+                                "id": block.get("id", ""),
+                                "name": block.get("name", ""),
+                                "input": "",
+                                "status": "running",
+                            })
+
+                elif msg_type == "system":
                     if getattr(message, "subtype", None) == "init":
                         agent_sid = getattr(message, "session_id", agent_sid)
                         print(f"[ClaudeAgent] session_id={agent_sid}",
                               file=sys.stderr, flush=True)
 
                 elif msg_type == "assistant":
+                    # include_partial_messages=True 时 assistant 消息是已完成块的汇总
+                    # 流式增量已通过 stream_event 处理，此处只处理 thinking/tool_use
                     for block in getattr(message, "content", []):
                         btype = getattr(block, "type", "")
-                        if btype == "text":
-                            text = getattr(block, "text", "")
-                            if text:
-                                for i in range(0, len(text), STREAM_CHUNK_SIZE):
-                                    if self._cancelled:
-                                        break
-                                    emit("text_delta", text=text[i:i + STREAM_CHUNK_SIZE])
-                                    await asyncio.sleep(STREAM_CHUNK_DELAY)
-                        elif btype == "thinking":
+                        if btype == "thinking":
+                            # thinking 不走增量，完整输出
                             thinking = getattr(block, "thinking", "")
                             if thinking:
                                 emit("thinking", text=thinking)
@@ -361,13 +342,6 @@ class ClaudeAgentBackend(ModelBackend):
             emit("error", error=str(e))
             emit("done")
             return {"agentSessionId": agent_sid}
-        finally:
-            for f in temp_files:
-                try:
-                    if os.path.exists(f):
-                        os.unlink(f)
-                except Exception:
-                    pass
 
 
 # ---------------------------------------------------------------------------
