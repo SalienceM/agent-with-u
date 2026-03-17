@@ -339,7 +339,14 @@ class Bridge(QObject):
                         output=None,
                         status=delta.tool_call.get("status", "running"),
                     )
-                    iter_tools.append(tc)
+                    # ★ 去重：stream_event 和 AssistantMessage 都会触发 tool_start
+                    # 只更新已有条目的 input，避免保存重复工具调用
+                    existing = next((t for t in iter_tools if t.id and t.id == tc.id), None)
+                    if existing:
+                        if tc.input:
+                            existing.input = tc.input
+                    else:
+                        iter_tools.append(tc)
 
                 elif delta.type == "tool_input" and delta.tool_call:
                     input_delta = delta.tool_call.get("inputDelta", "")
@@ -450,6 +457,7 @@ class Bridge(QObject):
                         session.id, message_id, "error",
                         error="无法恢复之前的对话会话，已尝试使用压缩历史重试",
                     ))
+                    success = False  # ★ 防止 error 后再发 done（避免前端 toolCalls 状态错误）
 
                 if (
                     stop_reason == "max_tokens"

@@ -261,10 +261,19 @@ export function useChat(sessionId: string, backendId: string, backends?: any[], 
           setMessages((prev) =>
             prev.map((m) => {
               if (m.id !== mid) return m;
+              // ★ 无论哪条路径，都确保 running → done
+              // 当 toolCallsRef 被 error 事件清空时，直接修复 m.toolCalls 中残留的 running 状态
+              const resolvedToolCalls = finalToolCalls.length > 0
+                ? finalToolCalls
+                : (m.toolCalls || []).map((tc) =>
+                    tc.status === 'running'
+                      ? { ...tc, status: 'done', output: tc.output || '(completed)' }
+                      : tc
+                  );
               return {
                 ...m,
                 streaming: false,
-                toolCalls: finalToolCalls.length > 0 ? finalToolCalls : m.toolCalls,
+                toolCalls: resolvedToolCalls.length > 0 ? resolvedToolCalls : m.toolCalls,
                 ...(delta.usage ? { usage: delta.usage } : {}),
               };
             })
