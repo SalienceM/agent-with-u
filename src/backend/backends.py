@@ -227,9 +227,13 @@ class ClaudeAgentBackend(ModelBackend):
                   f"images={len(images or [])}, cwd={cwd}",
                   file=sys.stderr, flush=True)
 
+            _done_emitted = False
             async for message in sdk_query(prompt=_build_prompt(), options=options):
                 if self._cancelled:
                     break
+                # result 消息已处理完毕，静默耗尽剩余消息避免 anyio cancel scope 错误
+                if _done_emitted:
+                    continue
 
                 _CLASS_TYPE_MAP = {
                     "SystemMessage": "system",
@@ -345,13 +349,12 @@ class ClaudeAgentBackend(ModelBackend):
                         print(f"[ClaudeAgent] usage 读取失败: {ue}",
                               file=sys.stderr, flush=True)
                     emit("done", **({"usage": usage_dict} if usage_dict else {}))
-                    break  # result 是终止消息，不再迭代
+                    _done_emitted = True  # 不 break，让生成器自然耗尽以避免 anyio cancel scope 错误
 
                 else:
                     print(f"[ClaudeAgent] 未处理的消息类型: {msg_type}",
                           file=sys.stderr, flush=True)
-            else:
-                # for 循环自然结束（没有 break），说明没收到 result 消息，补发 done
+            if not _done_emitted:
                 emit("done")
             return {"agentSessionId": agent_sid}
 
