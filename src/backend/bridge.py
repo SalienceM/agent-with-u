@@ -355,11 +355,20 @@ class Bridge(QObject):
 
                 elif delta.type == "tool_result" and delta.tool_call:
                     tc_id = delta.tool_call.get("id", "")
+                    matched = False
                     for tc in iter_tools:
                         if tc.id == tc_id:
                             tc.output = delta.tool_call.get("output")
                             tc.status = delta.tool_call.get("status", "done")
+                            matched = True
                             break
+                    # ★ Fallback：ID 匹配失败时，更新最后一个 running 的工具
+                    if not matched:
+                        for tc in reversed(iter_tools):
+                            if tc.status == "running":
+                                tc.output = delta.tool_call.get("output")
+                                tc.status = delta.tool_call.get("status", "done")
+                                break
 
                 # 转发给前端（除了 done 以外的所有类型）
                 self._emit_delta(delta)

@@ -306,8 +306,17 @@ class ClaudeAgentBackend(ModelBackend):
 
                 elif msg_type == "user":
                     for block in getattr(message, "content", []):
-                        if getattr(block, "type", "") == "tool_result":
-                            result_content = getattr(block, "content", "")
+                        btype = (
+                            getattr(block, "type", None)
+                            or (block.get("type") if isinstance(block, dict) else None)
+                            or ""
+                        )
+                        if btype == "tool_result":
+                            result_content = (
+                                getattr(block, "content", None)
+                                or (block.get("content") if isinstance(block, dict) else None)
+                                or ""
+                            )
                             if isinstance(result_content, list):
                                 result_content = "\n".join(
                                     (p.get("text", json.dumps(p, ensure_ascii=False))
@@ -317,12 +326,26 @@ class ClaudeAgentBackend(ModelBackend):
                             output_str = str(result_content or "")
                             if len(output_str) > 5000:
                                 output_str = output_str[:5000] + "\n... (truncated)"
-                            is_error = getattr(block, "is_error", False)
-                            print(f"[ClaudeAgent] tool_result: id={getattr(block, 'tool_use_id', '')}, "
+                            is_error = (
+                                getattr(block, "is_error", None)
+                                or (block.get("is_error") if isinstance(block, dict) else None)
+                                or False
+                            )
+                            # ★ 兼容多种属性名，确保拿到正确的 tool_use_id
+                            tool_id = (
+                                getattr(block, "tool_use_id", None)
+                                or (block.get("tool_use_id") if isinstance(block, dict) else None)
+                                or getattr(block, "tool_call_id", None)
+                                or (block.get("tool_call_id") if isinstance(block, dict) else None)
+                                or getattr(block, "id", None)
+                                or (block.get("id") if isinstance(block, dict) else None)
+                                or ""
+                            )
+                            print(f"[ClaudeAgent] tool_result: id={tool_id!r}, "
                                   f"status={'error' if is_error else 'done'}, len={len(output_str)}",
                                   file=sys.stderr, flush=True)
                             emit("tool_result", tool_call={
-                                "id": getattr(block, "tool_use_id", ""),
+                                "id": tool_id,
                                 "output": output_str,
                                 "status": "error" if is_error else "done",
                             })

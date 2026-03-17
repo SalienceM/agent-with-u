@@ -71,7 +71,15 @@ function normalizeMessage(msg: any): ChatMessage {
     msg.thinking ||
     msg.thinkingBlocks?.map((b: any) => b.content).join('\n\n') ||
     undefined;
-  return { ...msg, thinking };
+
+  // ★ 修复存储中残留的 running 工具状态：非流式消息的工具调用不可能还在运行
+  const toolCalls = msg.streaming
+    ? msg.toolCalls
+    : msg.toolCalls?.map((tc: any) =>
+        tc.status === 'running' ? { ...tc, status: 'done' } : tc
+      );
+
+  return { ...msg, thinking, ...(toolCalls !== undefined ? { toolCalls } : {}) };
 }
 
 export function useChat(sessionId: string, backendId: string, backends?: any[], skipPermissions: boolean = true) {
@@ -207,16 +215,37 @@ export function useChat(sessionId: string, backendId: string, backends?: any[], 
           const resultId = delta.toolCall?.id || '';
           const output = delta.toolCall?.output || '';
           const status = delta.toolCall?.status || 'done';
-          // Debug: log the tool result
           console.log('[useChat] tool_result:', { resultId, status, toolCallsCount: toolCallsRef.current.length });
-          const newToolCalls = toolCallsRef.current.map((tc) => {
-            if (tc.id === resultId) {
+
+          let matched = false;
+          let newToolCalls = toolCallsRef.current.map((tc) => {
+            if (resultId && tc.id === resultId) {
+              matched = true;
               const duration = tc.startTime ? Date.now() - tc.startTime : undefined;
-              console.log('[useChat] tool matched:', { id: resultId, duration });
+              console.log('[useChat] tool matched by id:', { id: resultId, duration });
               return { ...tc, output, status, duration };
             }
             return tc;
           });
+
+          // ★ Fallback：ID 匹配失败时更新最后一个 running 工具（防止 tool_use_id 属性名问题）
+          if (!matched) {
+            console.warn('[useChat] tool_result id not matched, falling back to last running tool');
+            const lastRunningIdx = newToolCalls.reduceRight(
+              (found, tc, i) => (found === -1 && tc.status === 'running' ? i : found),
+              -1
+            );
+            if (lastRunningIdx >= 0) {
+              const tc = newToolCalls[lastRunningIdx];
+              const duration = tc.startTime ? Date.now() - tc.startTime : undefined;
+              newToolCalls = [
+                ...newToolCalls.slice(0, lastRunningIdx),
+                { ...tc, output, status, duration },
+                ...newToolCalls.slice(lastRunningIdx + 1),
+              ];
+            }
+          }
+
           toolCallsRef.current = newToolCalls;
           setMessages((prev) =>
             prev.map((m) =>
