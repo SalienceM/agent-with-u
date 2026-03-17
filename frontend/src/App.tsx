@@ -9,9 +9,7 @@ import { useChat } from './hooks/useChat';
 import { useConfig } from './hooks/useConfig';
 import { themes } from './hooks/useConfig';
 import { messagesToMarkdown, messagesToJson } from './utils/markdown';
-// highlight.js 主题 CSS（作为字符串注入，支持主题切换）
-import hljsLightCss from 'highlight.js/styles/github.css?inline';
-import hljsDarkCss from 'highlight.js/styles/github-dark-dimmed.css?inline';
+import { hljsLightCss, hljsDarkCss } from './utils/hljsThemes';
 
 export const App: React.FC = () => {
   const [backends, setBackends] = useState<any[]>([]);
