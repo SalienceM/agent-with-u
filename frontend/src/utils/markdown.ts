@@ -15,10 +15,10 @@ export function markdownToHtml(src: string): string {
   let text = src.replace(/```(\w*)\n([\s\S]*?)```/g, (_, lang, code) => {
     const ph = `\u0000CB${idx}\u0000`;
     const langTag = lang
-      ? `<div style="font-size:11px;color:rgba(255,255,255,0.3);margin-bottom:4px;font-family:sans-serif">${esc(lang)}</div>`
+      ? `<div style="font-size:11px;color:var(--theme-text-muted);margin-bottom:4px;font-family:sans-serif">${esc(lang)}</div>`
       : '';
     codeBlocks[idx] =
-      `<pre style="background:#0d0d1a;border:1px solid rgba(255,255,255,0.1);border-radius:8px;padding:12px 16px;overflow-x:auto;font-size:13px;line-height:1.6;margin:8px 0">` +
+      `<pre style="background:var(--theme-code-bg);border:1px solid var(--theme-border);border-radius:8px;padding:12px 16px;overflow-x:auto;font-size:13px;line-height:1.6;margin:8px 0;color:var(--theme-text)">` +
       `${langTag}<code>${esc(code.trim())}</code></pre>`;
     idx++;
     return ph;
@@ -35,7 +35,7 @@ export function markdownToHtml(src: string): string {
       // 行内代码
       t = t.replace(
         /`([^`\n]+)`/g,
-        '<code style="background:rgba(255,255,255,0.08);padding:1px 5px;border-radius:4px;font-size:0.88em">$1</code>',
+        '<code style="background:var(--theme-code-bg);color:var(--theme-text);padding:1px 5px;border-radius:4px;font-size:0.88em">$1</code>',
       );
       // 粗斜体
       t = t.replace(/\*\*\*(.+?)\*\*\*/g, '<strong><em>$1</em></strong>');
@@ -46,19 +46,19 @@ export function markdownToHtml(src: string): string {
       // 链接
       t = t.replace(
         /\[([^\]]+)\]\(([^)]+)\)/g,
-        '<a href="$2" target="_blank" rel="noopener" style="color:#8b9cf7;text-decoration:underline">$1</a>',
+        '<a href="$2" target="_blank" rel="noopener" style="color:var(--theme-accent);text-decoration:underline">$1</a>',
       );
       // 标题
-      t = t.replace(/^#### (.+)$/gm, '<h4 style="font-size:1em;font-weight:600;margin:14px 0 2px;color:#e8e8e8">$1</h4>');
-      t = t.replace(/^### (.+)$/gm, '<h3 style="font-size:1.05em;font-weight:600;margin:14px 0 2px;color:#e8e8e8">$1</h3>');
-      t = t.replace(/^## (.+)$/gm, '<h2 style="font-size:1.12em;font-weight:600;margin:16px 0 2px;color:#f0f0f0">$1</h2>');
-      t = t.replace(/^# (.+)$/gm, '<h1 style="font-size:1.2em;font-weight:700;margin:16px 0 2px;color:#fff">$1</h1>');
+      t = t.replace(/^#### (.+)$/gm, '<h4 style="font-size:1em;font-weight:600;margin:14px 0 2px;color:var(--theme-text)">$1</h4>');
+      t = t.replace(/^### (.+)$/gm, '<h3 style="font-size:1.05em;font-weight:600;margin:14px 0 2px;color:var(--theme-text)">$1</h3>');
+      t = t.replace(/^## (.+)$/gm, '<h2 style="font-size:1.12em;font-weight:600;margin:16px 0 2px;color:var(--theme-text)">$1</h2>');
+      t = t.replace(/^# (.+)$/gm, '<h1 style="font-size:1.2em;font-weight:700;margin:16px 0 2px;color:var(--theme-text)">$1</h1>');
       // 无序列表
       t = t.replace(/^[\-\*] (.+)$/gm, '<li style="margin-left:20px;list-style-type:disc;margin-bottom:2px">$1</li>');
       // 有序列表
       t = t.replace(/^\d+\. (.+)$/gm, '<li style="margin-left:20px;list-style-type:decimal;margin-bottom:2px">$1</li>');
       // 分割线
-      t = t.replace(/^---+$/gm, '<hr style="border:none;border-top:1px solid rgba(255,255,255,0.1);margin:12px 0">');
+      t = t.replace(/^---+$/gm, '<hr style="border:none;border-top:1px solid var(--theme-border);margin:12px 0">');
       // 双换行 → 段落
       t = t.replace(/\n\n+/g, '</p><p style="margin:6px 0">');
       // 单换行 → <br>
