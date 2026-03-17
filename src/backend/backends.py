@@ -5,7 +5,6 @@ import os
 import sys
 import asyncio
 import json
-import subprocess
 from abc import ABC, abstractmethod
 from typing import Optional, Callable
 
@@ -119,23 +118,13 @@ STREAM_CHUNK_SIZE = 4        # characters per chunk
 STREAM_CHUNK_DELAY = 0.015   # seconds between chunks (~266 chars/s)
 
 
-class SessionInstance:
-    """
-    Internal class representing a claude CLI instance for one session.
-    Manages the agent_session_id for conversation continuity.
-    """
-    def __init__(
-        self,
-        session_id: str,
-        config: ModelBackendConfig,
-        agent_session_id: Optional[str] = None,
-    ):
-        self.session_id = session_id
-        self.config = config
-        self.agent_session_id = agent_session_id
-
-
 class ClaudeAgentBackend(ModelBackend):
+    """
+    Uses the official `claude_agent_sdk` Python package (pip install claude-agent-sdk).
+    The package bundles the Claude Code CLI internally, so no separate CLI installation
+    is required. Supports images by writing them to temporary files that Claude can
+    read via the built-in Read tool.
+    """
 
     def _get_cli_path(self) -> str:
         """Get the claude CLI executable path.
@@ -184,622 +173,201 @@ class ClaudeAgentBackend(ModelBackend):
     # ------------------------------------------------------------------ #
 
     async def send_message(
-            self,
-            messages: list[ChatMessage],
-            content: str,
-            images: Optional[list[ImageAttachment]],
-            session_id: str,
-            message_id: str,
-            on_delta: Callable[[StreamDelta], None],
-            agent_session_id: Optional[str] = None,
-            working_dir: Optional[str] = None,
-            skip_permissions: Optional[bool] = None,
-        ) -> dict:
-            self._cancelled = False
-
-            def emit(delta_type: str, **kwargs):
-                if not self._cancelled:
-                    on_delta(StreamDelta(session_id, message_id, delta_type, **kwargs))
-
-            agent_sid = agent_session_id
-            cli_path = self._get_cli_path()
-
-            print(f"[ClaudeAgent] 收到请求, agent_session_id={agent_session_id!r}",
-                file=sys.stderr, flush=True)
-
-            try:
-                # ---------- 构建命令行 ----------
-                cmd = [cli_path]
-
-                model = self.get_env("ANTHROPIC_MODEL") or self.config.model
-                if model and model not in ("sonnet", "claude-sonnet", "default"):
-                    cmd.extend(["--model", model])
-
-                if agent_session_id:
-                    cmd.extend(["--resume", agent_session_id])
-
-                cwd = working_dir or getattr(self.config, "working_dir", None) or "."
-
-                tools = getattr(self.config, "allowed_tools", None) or [
-                    "Read", "Edit", "Bash", "Glob", "Grep", "Write"
-                ]
-                for tool in tools:
-                    cmd.extend(["--allowedTools", tool])
-
-                cmd.extend([
-                    "--output-format", "stream-json",
-                    "--verbose",
-                ])
-
-                # ★ Use runtime skip_permissions if provided, otherwise fall back to config
-                if skip_permissions is None:
-                    skip_permissions = getattr(self.config, "skip_permissions", True)
-                if skip_permissions:
-                    cmd.extend(["--dangerously-skip-permissions"])
-
-                # ★ 处理图片：使用 --input-format stream-json 通过 stdin 传递
-                # claude-code 的 stream-json 格式支持图片
-                has_images = images is not None and len(images) > 0
-                stdin_data = None
-
-                if has_images:
-                    # 使用 stdin 方式传递图片和消息
-                    # ★ --input-format 和 --output-format stream-json 都需要 -p (print 模式)
-                    cmd.extend(["--input-format", "stream-json"])
-                    cmd.append("-p")  # 启用 print 模式，prompt 来自 stdin
-
-                    # 构建图片+文字的 content blocks
-                    content_blocks = []
-                    for img in images:
-                        # ★ 优先从临时文件读取 base64（避免大型 base64 在内存中重复传递）
-                        img_b64 = img.base64
-                        if not img_b64 and img.file_path:
-                            import base64 as _b64
-                            with open(img.file_path, "rb") as f:
-                                img_b64 = _b64.b64encode(f.read()).decode("ascii")
-                        content_blocks.append({
-                            "type": "image",
-                            "source": {
-                                "type": "base64",
-                                "media_type": img.mime_type,
-                                "data": img_b64
-                            }
-                        })
-                    content_blocks.append({"type": "text", "text": content})
-
-                    # ★ 正确的 stream-json 输入格式：需要 message.role 包装
-                    stdin_obj = {
-                        "type": "user",
-                        "message": {
-                            "role": "user",
-                            "content": content_blocks
-                        }
-                    }
-                    stdin_data = json.dumps(stdin_obj, ensure_ascii=False)
-                else:
-                    cmd.extend(["-p", content])
-
-                # ★ Windows 修复：.cmd/.bat 文件不能被 Popen 直接执行，需要 cmd.exe /c
-                cmd = self._apply_windows_cmd_wrap(cli_path, cmd)
-
-                print(f"[ClaudeAgent] cmd: {' '.join(cmd[:8])}...",
-                    file=sys.stderr, flush=True)
-                print(f"[ClaudeAgent] cwd: {cwd}", file=sys.stderr, flush=True)
-
-                # ★ stdin 数据落盘为临时文件，规避 cmd.exe /c 管道不透传问题
-                # （直接写 proc.stdin 在 Windows cmd.exe 中间层下会 Broken pipe）
-                stdin_temp_path: Optional[str] = None
-                if has_images and stdin_data:
-                    import tempfile
-                    try:
-                        tf = tempfile.NamedTemporaryFile(
-                            mode="wb", suffix=".json", delete=False,
-                            prefix="claude_stdin_"
-                        )
-                        tf.write((stdin_data + "\n").encode("utf-8"))
-                        tf.close()
-                        stdin_temp_path = tf.name
-                        print(f"[ClaudeAgent] stdin 临时文件: {stdin_temp_path}",
-                              file=sys.stderr, flush=True)
-                    except Exception as e:
-                        print(f"[ClaudeAgent] stdin 临时文件失败，回退管道: {e}",
-                              file=sys.stderr, flush=True)
-
-                # ---------- 用线程跑 subprocess ----------
-                loop = asyncio.get_event_loop()
-                msg_queue: asyncio.Queue = asyncio.Queue()
-
-                # ★ 共享进程引用，让主循环能检测子进程是否存活
-                proc_holder: list[Optional[subprocess.Popen]] = [None]
-
-                def _run_subprocess():
-                    stdin_fh = None
-                    try:
-                        print("[ClaudeAgent] 子进程启动中...",
-                            file=sys.stderr, flush=True)
-
-                        if has_images and stdin_temp_path and sys.platform == "win32":
-                            # ★ Windows：用 shell=True + < 文件重定向
-                            # cmd.exe /c 的 stdin 文件句柄不会透传给子进程，
-                            # 但 shell 的 < 重定向由 cmd.exe 自己解析，可以正确传递。
-                            # 取掉 _apply_windows_cmd_wrap 加的 ["cmd.exe", "/c"] 前缀
-                            actual_cmd = (cmd[2:] if len(cmd) > 2 and cmd[:2] == ["cmd.exe", "/c"]
-                                          else cmd)
-                            args_str = subprocess.list2cmdline(actual_cmd)
-                            shell_cmd = f'{args_str} < "{stdin_temp_path}"'
-                            print(f"[ClaudeAgent] shell_cmd(前120): {shell_cmd[:120]}",
-                                  file=sys.stderr, flush=True)
-                            proc = subprocess.Popen(
-                                shell_cmd,
-                                shell=True,
-                                stdout=subprocess.PIPE,
-                                stderr=subprocess.PIPE,
-                                cwd=cwd,
-                                encoding="utf-8",
-                                errors="replace",
-                                bufsize=1,
-                            )
-                        elif has_images and stdin_temp_path:
-                            # Unix：以文件对象作为 stdin（无管道问题）
-                            stdin_fh = open(stdin_temp_path, "rb")
-                            proc = subprocess.Popen(
-                                cmd,
-                                stdin=stdin_fh,
-                                stdout=subprocess.PIPE,
-                                stderr=subprocess.PIPE,
-                                cwd=cwd,
-                                encoding="utf-8",
-                                errors="replace",
-                                bufsize=1,
-                            )
-                            stdin_fh.close()
-                            stdin_fh = None
-                        elif has_images:
-                            # fallback: PIPE（临时文件创建失败时）
-                            proc = subprocess.Popen(
-                                cmd,
-                                stdin=subprocess.PIPE,
-                                stdout=subprocess.PIPE,
-                                stderr=subprocess.PIPE,
-                                cwd=cwd,
-                                encoding="utf-8",
-                                errors="replace",
-                                bufsize=1,
-                            )
-                        else:
-                            proc = subprocess.Popen(
-                                cmd,
-                                stdout=subprocess.PIPE,
-                                stderr=subprocess.PIPE,
-                                cwd=cwd,
-                                encoding="utf-8",
-                                errors="replace",
-                                bufsize=1,
-                            )
-
-                        proc_holder[0] = proc  # 暴露给主循环
-
-                        # fallback: 管道写入（仅当临时文件不可用时）
-                        if has_images and stdin_data and not stdin_temp_path:
-                            proc.stdin.write(stdin_data + "\n")
-                            proc.stdin.flush()
-                            proc.stdin.close()
-
-                        has_output = False
-                        line_count = 0
-
-                        while True:
-                            raw_line = proc.stdout.readline()
-                            if not raw_line:
-                                break
-                            line = raw_line.strip()
-                            if not line:
-                                continue
-                            has_output = True
-                            line_count += 1
-                            print(f"[ClaudeAgent] 收到第{line_count}行: {line[:120]}",
-                                file=sys.stderr, flush=True)
-                            try:
-                                obj = json.loads(line)
-                                loop.call_soon_threadsafe(
-                                    msg_queue.put_nowait, ("json", obj))
-                            except json.JSONDecodeError:
-                                loop.call_soon_threadsafe(
-                                    msg_queue.put_nowait, ("text", line))
-
-                        proc.wait()
-                        print(f"[ClaudeAgent] 子进程结束, rc={proc.returncode}, 共{line_count}行",
-                            file=sys.stderr, flush=True)
-
-                        stderr_out = proc.stderr.read().strip()
-                        if stderr_out:
-                            print(f"[ClaudeAgent] stderr: {stderr_out[:500]}",
-                                file=sys.stderr, flush=True)
-
-                        if not has_output:
-                            loop.call_soon_threadsafe(
-                                msg_queue.put_nowait, ("fallback", None))
-                        else:
-                            loop.call_soon_threadsafe(
-                                msg_queue.put_nowait, ("done", None))
-
-                    except Exception as e:
-                        print(f"[ClaudeAgent] 子进程异常: {e}",
-                            file=sys.stderr, flush=True)
-                        loop.call_soon_threadsafe(
-                            msg_queue.put_nowait, ("error", str(e)))
-                    finally:
-                        if stdin_fh:
-                            try:
-                                stdin_fh.close()
-                            except Exception:
-                                pass
-                        if stdin_temp_path and os.path.exists(stdin_temp_path):
-                            try:
-                                os.unlink(stdin_temp_path)
-                            except Exception:
-                                pass
-
-                loop.run_in_executor(None, _run_subprocess)
-
-                # ---------- 主循环读队列 ----------
-                # ★ 改动：短轮询 + 进程存活检测，替代硬超时
-                POLL_INTERVAL = 10          # 每 10 秒检查一次
-                MAX_TOTAL_WAIT = 7200       # 安全上限 2 小时
-                total_waited = 0
-
-                while True:
-                    if self._cancelled:
-                        # ★ 取消时杀掉子进程
-                        proc = proc_holder[0]
-                        if proc and proc.poll() is None:
-                            proc.terminate()
-                        break
-
-                    try:
-                        tag, payload = await asyncio.wait_for(
-                            msg_queue.get(), timeout=POLL_INTERVAL)
-                    except asyncio.TimeoutError:
-                        total_waited += POLL_INTERVAL
-                        proc = proc_holder[0]
-
-                        # 子进程还活着 → 继续等
-                        if proc and proc.poll() is None:
-                            if total_waited % 60 == 0:  # 每分钟打一条日志
-                                print(f"[ClaudeAgent] 等待中... 已等 {total_waited}s, "
-                                    f"子进程 pid={proc.pid} 仍在运行",
-                                    file=sys.stderr, flush=True)
-                            if total_waited < MAX_TOTAL_WAIT:
-                                continue
-                            else:
-                                emit("error",
-                                    error=f"已等待 {MAX_TOTAL_WAIT//3600} 小时，强制终止")
-                                proc.terminate()
-                                break
-
-                        # 子进程还没启动 → 再给点时间
-                        if proc is None:
-                            if total_waited < 60:
-                                continue
-                            emit("error", error="子进程启动超时")
-                            break
-
-                        # 子进程已结束但队列为空 → 可能丢了 done 信号
-                        print(f"[ClaudeAgent] 子进程已结束(rc={proc.returncode})，"
-                            f"但未收到完成信号",
-                            file=sys.stderr, flush=True)
-                        break
-
-                    if tag == "done":
-                        break
-                    elif tag == "error":
-                        emit("error", error=str(payload))
-                        break
-                    elif tag == "fallback":
-                        print("[ClaudeAgent] stream-json 无输出，回退到 json 模式",
-                            file=sys.stderr, flush=True)
-                        agent_sid = await self._fallback_json(
-                            cli_path, content, model, agent_session_id,
-                            cwd, tools, emit)
-                        break
-                    elif tag == "text":
-                        total_waited = 0  # ★ 收到数据就重置计时
-                        emit("text_delta", text=payload + "\n")
-                    elif tag == "json":
-                        total_waited = 0  # ★ 收到数据就重置计时
-                        agent_sid, events = self._process_stream_json(
-                            payload, agent_sid)
-                        for evt_type, evt_kwargs in events:
-                            if self._cancelled:
-                                break
-                            emit(evt_type, **evt_kwargs)
-                            if evt_type == "text_delta":
-                                await asyncio.sleep(STREAM_CHUNK_DELAY)
-
-                emit("done")
-                return {"agentSessionId": agent_sid}
-
-            except Exception as e:
-                import traceback
-                traceback.print_exc()
-                emit("error", error=str(e))
-                return {"agentSessionId": agent_sid}
-    # ------------------------------------------------------------------ #
-
-    def _process_stream_json(self, obj: dict, agent_sid) -> tuple:
-        """处理 stream-json 单行 JSON，返回 (agent_sid, events_list)
-
-        ★ 支持的 delta 类型：
-          text_delta  - 正文文本
-          thinking    - 思考内容（可展开查看）
-          tool_start  - 工具调用开始（含 id/name/input）
-          tool_input  - 工具输入增量
-          tool_result - 工具执行结果（含 output/status）
-          done        - 含 usage
-        """
-        events = []
-        msg_type = obj.get("type", "")
-
-        # --- system init ---
-        if msg_type == "system":
-            if obj.get("subtype") == "init":
-                agent_sid = obj.get("session_id", agent_sid)
-                print(f"[ClaudeAgent] session(init): {agent_sid}",
-                      file=sys.stderr, flush=True)
-
-        # --- assistant 完整消息 ---
-        elif msg_type == "assistant":
-            message = obj.get("message", {})
-            for block in message.get("content", []):
-                btype = block.get("type", "")
-
-                if btype == "text":
-                    text = block.get("text", "")
-                    if text:
-                        for i in range(0, len(text), STREAM_CHUNK_SIZE):
-                            chunk = text[i : i + STREAM_CHUNK_SIZE]
-                            events.append(("text_delta", {"text": chunk}))
-
-                # ★ 改动：把 thinking 完整内容传给前端
-                elif btype == "thinking":
-                    thinking_text = block.get("thinking", "")
-                    if thinking_text:
-                        events.append(("thinking", {
-                            "text": thinking_text,
-                        }))
-
-                # ★ 改动：tool_use 带上 id 和完整 input
-                elif btype == "tool_use":
-                    tool_id = block.get("id", "")
-                    tool_name = block.get("name", "unknown")
-                    tool_input = block.get("input", {})
-                    input_str = ""
-                    if tool_input:
-                        input_str = json.dumps(
-                            tool_input, ensure_ascii=False, indent=2
-                        )
-                    events.append(("tool_start", {"tool_call": {
-                        "id": tool_id,
-                        "name": tool_name,
-                        "input": input_str,
-                        "status": "running",
-                    }}))
-
-        # ★ 新增：工具执行结果
-        elif msg_type == "tool":
-            for block in obj.get("content", []):
-                if block.get("type") == "tool_result":
-                    tool_use_id = block.get("tool_use_id", "")
-                    content = block.get("content", "")
-                    # content 可能是字符串或 list
-                    if isinstance(content, list):
-                        text_parts = []
-                        for part in content:
-                            if isinstance(part, dict):
-                                text_parts.append(
-                                    part.get("text", json.dumps(part, ensure_ascii=False))
-                                )
-                            else:
-                                text_parts.append(str(part))
-                        content = "\n".join(text_parts)
-                    is_error = block.get("is_error", False)
-                    # 截断过长输出
-                    output_str = str(content)
-                    if len(output_str) > 5000:
-                        output_str = output_str[:5000] + "\n... (truncated)"
-                    print(f"[ClaudeAgent] tool_result: id={tool_use_id}, status={'error' if is_error else 'done'}, output_len={len(output_str)}",
-                          file=sys.stderr, flush=True)
-                    events.append(("tool_result", {"tool_call": {
-                        "id": tool_use_id,
-                        "output": output_str,
-                        "status": "error" if is_error else "done",
-                    }}))
-
-        # --- 流式 delta ---
-        elif msg_type == "content_block_delta":
-            delta = obj.get("delta", {})
-
-            if delta.get("type") == "text_delta":
-                text = delta.get("text", "")
-                events.append(("text_delta", {"text": text}))
-
-            # ★ 新增：思考内容增量
-            elif delta.get("type") == "thinking_delta":
-                thinking = delta.get("thinking", "")
-                if thinking:
-                    events.append(("thinking", {"text": thinking}))
-
-            # ★ 新增：工具输入增量
-            elif delta.get("type") == "input_json_delta":
-                partial = delta.get("partial_json", "")
-                if partial:
-                    events.append(("tool_input", {"tool_call": {
-                        "inputDelta": partial,
-                    }}))
-
-        # --- tool_use block 开始 ---
-        elif msg_type == "content_block_start":
-            block = obj.get("content_block", {})
-            if block.get("type") == "tool_use":
-                tool_id = block.get("id", "")
-                tool_name = block.get("name", "")
-                print(f"[ClaudeAgent] tool_start: id={tool_id}, name={tool_name}",
-                      file=sys.stderr, flush=True)
-                events.append(("tool_start", {"tool_call": {
-                    "id": tool_id,
-                    "name": tool_name,
-                    "input": "",
-                    "status": "running",
-                }}))
-
-        # --- tool_use block 结束 (tool_result) ---
-        elif msg_type == "content_block_stop":
-            # 工具输入结束（注意：这是输入完成，不是工具执行完成）
-            # 真正的工具执行结果在后续的 tool 或 user 类型消息中
-            index = obj.get("index", -1)
-            print(f"[ClaudeAgent] content_block_stop: index={index}",
-                  file=sys.stderr, flush=True)
-
-        # --- result ---
-        elif msg_type == "result":
-            agent_sid = obj.get("session_id", agent_sid)
-            print(f"[ClaudeAgent] session(result): {agent_sid}",
-                  file=sys.stderr, flush=True)
-
-            # ★ 检测 resume 失败的情况
-            subtype = obj.get("subtype", "")
-            is_error = obj.get("is_error", False)
-            if is_error or subtype == "error_during_execution":
-                print(f"[ClaudeAgent] Resume 失败检测：subtype={subtype}, is_error={is_error}",
-                      file=sys.stderr, flush=True)
-                # 返回一个特殊的标记，表示 resume 失败
-                # 注意：不传 session_id，因为 StreamDelta 已经在构造函数中传入了
-                events.append(("resume_failed", {}))
-
-            usage = obj.get("usage", {})
-            if usage:
-                events.append(("done", {"usage": {
-                    "inputTokens": usage.get("input_tokens"),
-                    "outputTokens": usage.get("output_tokens"),
-                }}))
-
-        # ★ 新增：user 类型消息（工具执行结果回调/用户上下文注入）
-        elif msg_type == "user":
-            # 这是 Claude Code CLI 在工具执行完成后返回的消息
-            # 格式 1: {"type":"user","message":{"content":[{"tool_use_id":"...","type":"tool_result","content":"..."}]}}
-            # 格式 2: {"type":"user","parent_tool_use_id":"...","tool_use_result":{...}}
-            message = obj.get("message", {})
-            parent_tool_id = obj.get("parent_tool_use_id", "")
-            tool_result = obj.get("tool_use_result", {})
-
-            # ★ 优先从 message.content 中提取 tool_result（新格式）
-            if isinstance(message, dict) and message.get("content"):
-                for block in message["content"]:
-                    if block.get("type") == "tool_result":
-                        tool_use_id = block.get("tool_use_id", "")
-                        content = block.get("content", "")
-                        print(f"[ClaudeAgent] tool_result (from user.content): id={tool_use_id}, content_len={len(str(content))}",
-                              file=sys.stderr, flush=True)
-                        # 处理 content 可能是 list 的情况
-                        if isinstance(content, list):
-                            content = "\n".join(str(p) for p in content)
-                        output_str = str(content)
-                        if len(output_str) > 5000:
-                            output_str = output_str[:5000] + "\n... (truncated)"
-                        events.append(("tool_result", {"tool_call": {
-                            "id": tool_use_id,
-                            "output": output_str,
-                            "status": "done",
-                        }}))
-
-            # 旧格式：直接从顶层字段获取
-            elif tool_result:
-                if not parent_tool_id and isinstance(message, str):
-                    parent_tool_id = message[:50]  # fallback
-                if isinstance(tool_result, str):
-                    output_str = tool_result
-                else:
-                    output_str = str(tool_result.get("content", tool_result))
-                if len(output_str) > 5000:
-                    output_str = output_str[:5000] + "\n... (truncated)"
-                events.append(("tool_result", {"tool_call": {
-                    "id": parent_tool_id,
-                    "output": output_str,
-                    "status": "done",
-                }}))
-
-            # 如果有用户消息内容，也作为文本发送
-            if isinstance(message, dict) and message.get("content"):
-                # 已经处理了 tool_result，跳过
-                pass
-            elif isinstance(message, str) and message.strip():
-                print(f"[ClaudeAgent] user 消息：{message[:100]}",
-                      file=sys.stderr, flush=True)
-                events.append(("text_delta", {"text": message + "\n"}))
-
-        # ★ 未知类型打日志，方便调试
-        else:
-            if msg_type:
-                print(f"[ClaudeAgent] 未处理的消息类型: {msg_type}, "
-                      f"keys={list(obj.keys())}",
-                      file=sys.stderr, flush=True)
-
-        return agent_sid, events
-
-    # ------------------------------------------------------------------ #
-
-    async def _fallback_json(self, cli_path, content, model,
-                             agent_session_id, cwd, tools, emit) -> str:
-        cmd = [cli_path]
-        if model and model not in ("sonnet", "claude-sonnet", "default"):
-            cmd.extend(["--model", model])
-        if agent_session_id:
-            cmd.extend(["--resume", agent_session_id])
-        for tool in tools:
-            cmd.extend(["--allowedTools", tool])
-        cmd.extend([
-            "--output-format", "json",
-            "--dangerously-skip-permissions",
-            "-p", content,
-        ])
-        cmd = self._apply_windows_cmd_wrap(cli_path, cmd)
-
-        loop = asyncio.get_event_loop()
-
-        def _run():
-            return subprocess.run(
-                cmd, capture_output=True, text=True, cwd=cwd,
-                encoding="utf-8", errors="replace", timeout=300,
-            )
-
-        r = await loop.run_in_executor(None, _run)
-
-        if r.returncode != 0:
-            emit("error", error=f"CLI error (rc={r.returncode}): {r.stderr[:500]}")
-            return agent_session_id
+        self,
+        messages: list[ChatMessage],
+        content: str,
+        images: Optional[list[ImageAttachment]],
+        session_id: str,
+        message_id: str,
+        on_delta: Callable[[StreamDelta], None],
+        agent_session_id: Optional[str] = None,
+        working_dir: Optional[str] = None,
+        skip_permissions: Optional[bool] = None,
+    ) -> dict:
+        self._cancelled = False
+
+        def emit(delta_type: str, **kwargs):
+            if not self._cancelled:
+                on_delta(StreamDelta(session_id, message_id, delta_type, **kwargs))
 
         try:
-            result = json.loads(r.stdout)
-            text = result.get("result", "")
-            if text:
-                for i in range(0, len(text), STREAM_CHUNK_SIZE):
-                    chunk = text[i : i + STREAM_CHUNK_SIZE]
-                    emit("text_delta", text=chunk)
-                    await asyncio.sleep(STREAM_CHUNK_DELAY)
+            from claude_agent_sdk import query as sdk_query, ClaudeAgentOptions
+        except ImportError:
+            emit("error", error=(
+                "claude-agent-sdk 未安装，请运行: pip install claude-agent-sdk"
+            ))
+            emit("done")
+            return {}
 
-            sid = result.get("session_id", agent_session_id)
-            usage = result.get("usage", {})
-            if usage:
-                emit("done", usage={
-                    "inputTokens": usage.get("input_tokens"),
-                    "outputTokens": usage.get("output_tokens"),
-                })
-            return sid
+        agent_sid = agent_session_id
+        temp_files: list[str] = []
 
-        except json.JSONDecodeError:
-            if r.stdout.strip():
-                emit("text_delta", text=r.stdout)
-            return agent_session_id
+        print(f"[ClaudeAgent] 收到请求, agent_session_id={agent_session_id!r}",
+              file=sys.stderr, flush=True)
+
+        try:
+            model = self.get_env("ANTHROPIC_MODEL") or self.config.model
+            tools: list[str] = getattr(self.config, "allowed_tools", None) or [
+                "Read", "Edit", "Bash", "Glob", "Grep", "Write"
+            ]
+            cwd = working_dir or getattr(self.config, "working_dir", None) or "."
+            if skip_permissions is None:
+                skip_permissions = getattr(self.config, "skip_permissions", True)
+
+            # 收集环境变量传给 SDK
+            env_dict: dict[str, str] = {}
+            for key in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN",
+                        "ANTHROPIC_BASE_URL", "ANTHROPIC_MODEL"):
+                val = self.get_env(key)
+                if val:
+                    env_dict[key] = val
+
+            # ★ 图片处理：写入临时文件，在 prompt 中注明路径由 Read 工具读取
+            image_paths: list[str] = []
+            if images:
+                import tempfile
+                import base64 as _b64
+                for img in images:
+                    if img.file_path and os.path.exists(img.file_path):
+                        image_paths.append(img.file_path)
+                    elif img.base64:
+                        ext = "png" if "png" in img.mime_type else "jpg"
+                        tf = tempfile.NamedTemporaryFile(
+                            suffix=f".{ext}", delete=False, prefix="claude_img_"
+                        )
+                        tf.write(_b64.b64decode(img.base64))
+                        tf.close()
+                        image_paths.append(tf.name)
+                        temp_files.append(tf.name)
+
+            prompt_text = content
+            if image_paths:
+                paths_str = "\n".join(f"  - {p}" for p in image_paths)
+                prompt_text = (
+                    f"{content}\n\n"
+                    f"[用户附加了以下图片，请使用 Read 工具查看它们]:\n{paths_str}"
+                )
+
+            options_kwargs: dict = dict(
+                allowed_tools=tools,
+                cwd=cwd,
+                env=env_dict,
+                permission_mode="bypassPermissions" if skip_permissions else "default",
+            )
+            if agent_session_id:
+                options_kwargs["resume"] = agent_session_id
+            if model and model not in ("sonnet", "claude-sonnet", "default"):
+                options_kwargs["model"] = model
+            cli_path = getattr(self.config, "cli_path", None)
+            if cli_path:
+                options_kwargs["cli_path"] = cli_path
+
+            options = ClaudeAgentOptions(**options_kwargs)
+
+            print(f"[ClaudeAgent] SDK query: model={model}, resume={agent_session_id!r}, "
+                  f"images={len(image_paths)}, cwd={cwd}",
+                  file=sys.stderr, flush=True)
+
+            async for message in sdk_query(prompt=prompt_text, options=options):
+                if self._cancelled:
+                    break
+
+                msg_type = getattr(message, "type", type(message).__name__)
+
+                if msg_type == "system":
+                    if getattr(message, "subtype", None) == "init":
+                        agent_sid = getattr(message, "session_id", agent_sid)
+                        print(f"[ClaudeAgent] session_id={agent_sid}",
+                              file=sys.stderr, flush=True)
+
+                elif msg_type == "assistant":
+                    for block in getattr(message, "content", []):
+                        btype = getattr(block, "type", "")
+                        if btype == "text":
+                            text = getattr(block, "text", "")
+                            if text:
+                                for i in range(0, len(text), STREAM_CHUNK_SIZE):
+                                    if self._cancelled:
+                                        break
+                                    emit("text_delta", text=text[i:i + STREAM_CHUNK_SIZE])
+                                    await asyncio.sleep(STREAM_CHUNK_DELAY)
+                        elif btype == "thinking":
+                            thinking = getattr(block, "thinking", "")
+                            if thinking:
+                                emit("thinking", text=thinking)
+                        elif btype == "tool_use":
+                            tool_input = getattr(block, "input", {})
+                            input_str = (
+                                json.dumps(tool_input, ensure_ascii=False, indent=2)
+                                if tool_input else ""
+                            )
+                            emit("tool_start", tool_call={
+                                "id": getattr(block, "id", ""),
+                                "name": getattr(block, "name", ""),
+                                "input": input_str,
+                                "status": "running",
+                            })
+
+                elif msg_type == "user":
+                    for block in getattr(message, "content", []):
+                        if getattr(block, "type", "") == "tool_result":
+                            result_content = getattr(block, "content", "")
+                            if isinstance(result_content, list):
+                                result_content = "\n".join(
+                                    (p.get("text", json.dumps(p, ensure_ascii=False))
+                                     if isinstance(p, dict) else str(p))
+                                    for p in result_content
+                                )
+                            output_str = str(result_content or "")
+                            if len(output_str) > 5000:
+                                output_str = output_str[:5000] + "\n... (truncated)"
+                            is_error = getattr(block, "is_error", False)
+                            print(f"[ClaudeAgent] tool_result: id={getattr(block, 'tool_use_id', '')}, "
+                                  f"status={'error' if is_error else 'done'}, len={len(output_str)}",
+                                  file=sys.stderr, flush=True)
+                            emit("tool_result", tool_call={
+                                "id": getattr(block, "tool_use_id", ""),
+                                "output": output_str,
+                                "status": "error" if is_error else "done",
+                            })
+
+                elif msg_type == "result":
+                    agent_sid = getattr(message, "session_id", agent_sid)
+                    print(f"[ClaudeAgent] session(result): {agent_sid}",
+                          file=sys.stderr, flush=True)
+                    is_error = getattr(message, "is_error", False)
+                    subtype = getattr(message, "subtype", "")
+                    if is_error or subtype == "error_during_execution":
+                        print(f"[ClaudeAgent] Resume 失败: subtype={subtype}",
+                              file=sys.stderr, flush=True)
+                        emit("resume_failed")
+                    usage = getattr(message, "usage", None)
+                    if usage:
+                        emit("done", usage={
+                            "inputTokens": getattr(usage, "input_tokens", None),
+                            "outputTokens": getattr(usage, "output_tokens", None),
+                        })
+
+                else:
+                    print(f"[ClaudeAgent] 未处理的消息类型: {msg_type}",
+                          file=sys.stderr, flush=True)
+
+            emit("done")
+            return {"agentSessionId": agent_sid}
+
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            emit("error", error=str(e))
+            emit("done")
+            return {"agentSessionId": agent_sid}
+        finally:
+            for f in temp_files:
+                try:
+                    if os.path.exists(f):
+                        os.unlink(f)
+                except Exception:
+                    pass
 
 
 # ---------------------------------------------------------------------------
@@ -891,13 +459,197 @@ class OpenAICompatibleBackend(ModelBackend):
 
 
 # ---------------------------------------------------------------------------
+#  Anthropic API Backend (uses anthropic Python SDK, supports images natively)
+# ---------------------------------------------------------------------------
+
+class AnthropicAPIBackend(ModelBackend):
+    """
+    Uses the official `anthropic` Python SDK to call Claude models directly.
+    Supports images natively via the Anthropic messages API format.
+    No CLI dependency required.
+    """
+
+    async def send_message(
+        self,
+        messages: list[ChatMessage],
+        content: str,
+        images: Optional[list[ImageAttachment]],
+        session_id: str,
+        message_id: str,
+        on_delta: Callable[[StreamDelta], None],
+        skip_permissions: Optional[bool] = None,
+        **kwargs,
+    ) -> dict:
+        self._cancelled = False
+
+        def emit(delta_type: str, **kw):
+            if not self._cancelled:
+                on_delta(StreamDelta(session_id, message_id, delta_type, **kw))
+
+        try:
+            import anthropic as _anthropic
+        except ImportError:
+            emit("error", error=(
+                "anthropic SDK not installed. Run: pip install anthropic"
+            ))
+            emit("done")
+            return {}
+
+        try:
+            api_key = (
+                self.get_env("ANTHROPIC_API_KEY")
+                or self.get_env("ANTHROPIC_AUTH_TOKEN")
+                or self.config.api_key
+            )
+            base_url = (
+                self.get_env("ANTHROPIC_BASE_URL")
+                or self.config.base_url
+            )
+            model = (
+                self.get_env("ANTHROPIC_MODEL")
+                or self.config.model
+                or "claude-sonnet-4-6"
+            )
+
+            client_kwargs: dict = {}
+            if api_key:
+                client_kwargs["api_key"] = api_key
+            if base_url:
+                client_kwargs["base_url"] = base_url
+
+            client = _anthropic.AsyncAnthropic(**client_kwargs)
+
+            # Build conversation history
+            api_messages: list[dict] = []
+            for m in messages:
+                if m.role == "system":
+                    continue
+                msg_content: list | str = m.content
+                # Re-attach images from history if present
+                if m.images:
+                    blocks: list[dict] = []
+                    for img in m.images:
+                        img_b64 = img.base64
+                        if not img_b64 and img.file_path:
+                            import base64 as _b64
+                            with open(img.file_path, "rb") as f:
+                                img_b64 = _b64.b64encode(f.read()).decode("ascii")
+                        blocks.append({
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": img.mime_type,
+                                "data": img_b64,
+                            },
+                        })
+                    blocks.append({"type": "text", "text": m.content})
+                    msg_content = blocks
+                api_messages.append({"role": m.role, "content": msg_content})
+
+            # Build current user message (text + optional images)
+            current_blocks: list[dict] = []
+            if images:
+                for img in images:
+                    img_b64 = img.base64
+                    if not img_b64 and img.file_path:
+                        import base64 as _b64
+                        with open(img.file_path, "rb") as f:
+                            img_b64 = _b64.b64encode(f.read()).decode("ascii")
+                    current_blocks.append({
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": img.mime_type,
+                            "data": img_b64,
+                        },
+                    })
+            current_blocks.append({"type": "text", "text": content})
+            api_messages.append({"role": "user", "content": current_blocks})
+
+            # System prompt
+            system_msgs = [m.content for m in messages if m.role == "system"]
+            system_text = "\n\n".join(system_msgs) if system_msgs else _anthropic.NOT_GIVEN
+
+            print(f"[AnthropicAPI] model={model}, images={len(images or [])}, "
+                  f"history_len={len(api_messages)-1}",
+                  file=sys.stderr, flush=True)
+
+            input_tokens = 0
+            output_tokens = 0
+
+            async with client.messages.stream(
+                model=model,
+                max_tokens=8096,
+                system=system_text,
+                messages=api_messages,
+            ) as stream:
+                async for event in stream:
+                    if self._cancelled:
+                        break
+
+                    etype = type(event).__name__
+
+                    if etype == "RawContentBlockDeltaEvent":
+                        delta = event.delta
+                        dtype = type(delta).__name__
+                        if dtype == "TextDelta":
+                            emit("text_delta", text=delta.text)
+                        elif dtype == "ThinkingDelta":
+                            emit("thinking", text=delta.thinking)
+                        elif dtype == "InputJSONDelta":
+                            emit("tool_input", tool_call={"inputDelta": delta.partial_json})
+
+                    elif etype == "RawContentBlockStartEvent":
+                        block = event.content_block
+                        btype = type(block).__name__
+                        if btype == "ToolUseBlock":
+                            emit("tool_start", tool_call={
+                                "id": block.id,
+                                "name": block.name,
+                                "input": "",
+                                "status": "running",
+                            })
+
+                    elif etype == "RawMessageDeltaEvent":
+                        usage = getattr(event, "usage", None)
+                        if usage:
+                            output_tokens = getattr(usage, "output_tokens", 0)
+
+                    elif etype == "RawMessageStartEvent":
+                        usage = getattr(event.message, "usage", None)
+                        if usage:
+                            input_tokens = getattr(usage, "input_tokens", 0)
+
+            if not self._cancelled:
+                usage_dict: Optional[dict] = None
+                if input_tokens or output_tokens:
+                    usage_dict = {
+                        "inputTokens": input_tokens,
+                        "outputTokens": output_tokens,
+                    }
+                emit("done", **({"usage": usage_dict} if usage_dict else {}))
+
+            return {}
+
+        except Exception as e:
+            if not self._cancelled:
+                import traceback
+                traceback.print_exc()
+                emit("error", error=str(e))
+                emit("done")
+            return {}
+
+
+# ---------------------------------------------------------------------------
 #  Factory
 # ---------------------------------------------------------------------------
 
 def create_backend(config: ModelBackendConfig) -> ModelBackend:
     if config.type == BackendType.CLAUDE_AGENT_SDK:
         return ClaudeAgentBackend(config)
-    elif config.type in (BackendType.OPENAI_COMPATIBLE, BackendType.ANTHROPIC_API):
+    elif config.type == BackendType.ANTHROPIC_API:
+        return AnthropicAPIBackend(config)
+    elif config.type == BackendType.OPENAI_COMPATIBLE:
         return OpenAICompatibleBackend(config)
     else:
         raise ValueError(f"Unknown backend type: {config.type}")
