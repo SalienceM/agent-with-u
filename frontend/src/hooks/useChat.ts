@@ -168,12 +168,19 @@ export function useChat(sessionId: string, backendId: string, backends?: any[], 
             status: 'running',
             startTime: Date.now(),
           };
-          toolCallsRef.current = [...toolCallsRef.current, tc];
-          console.log('[useChat] tool_start:', { id: tc.id, name: tc.name, toolCallsCount: toolCallsRef.current.length });
+          // 去重：同一 tool id 可能从 stream_event 和 AssistantMessage 各发一次
+          const exists = tc.id && toolCallsRef.current.some((t) => t.id === tc.id);
+          const newToolCalls = exists
+            ? toolCallsRef.current.map((t) =>
+                t.id === tc.id ? { ...t, input: tc.input || t.input } : t
+              )
+            : [...toolCallsRef.current, tc];
+          toolCallsRef.current = newToolCalls;
+          console.log('[useChat] tool_start:', { id: tc.id, name: tc.name, exists, toolCallsCount: newToolCalls.length });
           setMessages((prev) =>
             prev.map((m) =>
               m.id === mid
-                ? { ...m, toolCalls: [...toolCallsRef.current], streaming: true }
+                ? { ...m, toolCalls: newToolCalls, streaming: true }
                 : m
             )
           );
@@ -185,10 +192,11 @@ export function useChat(sessionId: string, backendId: string, backends?: any[], 
           if (toolCallsRef.current.length > 0 && inputDelta) {
             const last = toolCallsRef.current[toolCallsRef.current.length - 1];
             last.input = (last.input || '') + inputDelta;
-            toolCallsRef.current = [...toolCallsRef.current];
+            const newToolCalls = [...toolCallsRef.current];
+            toolCallsRef.current = newToolCalls;
             setMessages((prev) =>
               prev.map((m) =>
-                m.id === mid ? { ...m, toolCalls: [...toolCallsRef.current] } : m
+                m.id === mid ? { ...m, toolCalls: newToolCalls } : m
               )
             );
           }
@@ -201,7 +209,7 @@ export function useChat(sessionId: string, backendId: string, backends?: any[], 
           const status = delta.toolCall?.status || 'done';
           // Debug: log the tool result
           console.log('[useChat] tool_result:', { resultId, status, toolCallsCount: toolCallsRef.current.length });
-          toolCallsRef.current = toolCallsRef.current.map((tc) => {
+          const newToolCalls = toolCallsRef.current.map((tc) => {
             if (tc.id === resultId) {
               const duration = tc.startTime ? Date.now() - tc.startTime : undefined;
               console.log('[useChat] tool matched:', { id: resultId, duration });
@@ -209,9 +217,10 @@ export function useChat(sessionId: string, backendId: string, backends?: any[], 
             }
             return tc;
           });
+          toolCallsRef.current = newToolCalls;
           setMessages((prev) =>
             prev.map((m) =>
-              m.id === mid ? { ...m, toolCalls: [...toolCallsRef.current] } : m
+              m.id === mid ? { ...m, toolCalls: newToolCalls } : m
             )
           );
           break;
@@ -235,9 +244,9 @@ export function useChat(sessionId: string, backendId: string, backends?: any[], 
           break;
 
         case 'done': {
-          // ★ When stream ends, mark any remaining running tools as done
+          // ★ 捕获快照，避免 setMessages 回调执行时 toolCallsRef 已被清空
           const now = Date.now();
-          toolCallsRef.current = toolCallsRef.current.map((tc) => {
+          const finalToolCalls = toolCallsRef.current.map((tc) => {
             if (tc.status === 'running' && tc.startTime) {
               return {
                 ...tc,
@@ -255,7 +264,7 @@ export function useChat(sessionId: string, backendId: string, backends?: any[], 
               return {
                 ...m,
                 streaming: false,
-                toolCalls: toolCallsRef.current.length > 0 ? [...toolCallsRef.current] : m.toolCalls,
+                toolCalls: finalToolCalls.length > 0 ? finalToolCalls : m.toolCalls,
                 ...(delta.usage ? { usage: delta.usage } : {}),
               };
             })
