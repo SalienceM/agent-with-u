@@ -174,6 +174,13 @@ class ClaudeAgentBackend(ModelBackend):
         # Unix/macOS
         return "claude"
 
+    @staticmethod
+    def _apply_windows_cmd_wrap(cli_path: str, cmd: list[str]) -> list[str]:
+        """Windows 上 .cmd/.bat 文件不能被 Popen 直接执行，需要 cmd.exe /c 包装。"""
+        if sys.platform == "win32" and cli_path.lower().endswith((".cmd", ".bat")):
+            return ["cmd.exe", "/c"] + cmd
+        return cmd
+
     # ------------------------------------------------------------------ #
 
     async def send_message(
@@ -273,8 +280,7 @@ class ClaudeAgentBackend(ModelBackend):
                     cmd.extend(["-p", content])
 
                 # ★ Windows 修复：.cmd/.bat 文件不能被 Popen 直接执行，需要 cmd.exe /c
-                if sys.platform == "win32" and cli_path.lower().endswith((".cmd", ".bat")):
-                    cmd = ["cmd.exe", "/c"] + cmd
+                cmd = self._apply_windows_cmd_wrap(cli_path, cmd)
 
                 print(f"[ClaudeAgent] cmd: {' '.join(cmd[:8])}...",
                     file=sys.stderr, flush=True)
@@ -689,6 +695,7 @@ class ClaudeAgentBackend(ModelBackend):
             "--dangerously-skip-permissions",
             "-p", content,
         ])
+        cmd = self._apply_windows_cmd_wrap(cli_path, cmd)
 
         loop = asyncio.get_event_loop()
 
