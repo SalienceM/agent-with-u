@@ -1,0 +1,301 @@
+import React, { useEffect, useState, useCallback, memo } from 'react';
+import { api } from '../api';
+
+interface Session {
+  id: string;
+  title: string;
+  messageCount: number;
+  updatedAt: number;
+  workingDir: string;  // ★ Working directory is primary
+  backendId: string;
+}
+
+interface Backend {
+  id: string;
+  label: string;
+}
+
+interface Props {
+  activeSessionId: string | null;
+  onSelectSession: (id: string) => void;
+  onNewSession: () => void;
+  streamingSessions: Set<string>;  // ★ Set of session IDs that are streaming
+}
+
+// ★ Wrap with React.memo to prevent unnecessary re-renders when parent updates
+export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession, onNewSession, streamingSessions }) => {
+  const [sessions, setSessions] = useState<Session[]>([]);
+  const [backends, setBackends] = useState<Backend[]>([]);
+  const [hoveredSessionId, setHoveredSessionId] = useState<string | null>(null);
+  const [sessionToDelete, setSessionToDelete] = useState<Session | null>(null);
+
+  // ★ Memoize refresh function to avoid re-creating it on every render
+  const refresh = useCallback(async () => {
+    setSessions(await api.listSessions());
+  }, []);
+
+  useEffect(() => {
+    api.getBackends().then(setBackends);
+    refresh();
+  }, [refresh]);
+
+  const handleDeleteClick = useCallback((session: Session, e: React.MouseEvent) => {
+    e.stopPropagation();
+    // ★ Check if session is streaming
+    if (streamingSessions.has(session.id)) {
+      alert(`会话 "${session.title}" 正在进行中，无法删除。请等待完成或停止后再试。`);
+      return;
+    }
+    setSessionToDelete(session);
+  }, [streamingSessions]);
+
+  const confirmDelete = useCallback(() => {
+    if (sessionToDelete) {
+      api.deleteSession(sessionToDelete.id).then(refresh);
+      setSessionToDelete(null);
+    }
+  }, [sessionToDelete, refresh]);
+
+  // ★ Listen for session-created event to refresh list
+  useEffect(() => {
+    const handleSessionCreated = () => refresh();
+    window.addEventListener('session-created', handleSessionCreated);
+    return () => window.removeEventListener('session-created', handleSessionCreated);
+  }, [refresh]);
+
+  // ★ Expose refresh to parent via custom event or ref if needed
+  // For now, refresh when window gains focus (user might have created session elsewhere)
+  useEffect(() => {
+    const handleFocus = () => refresh();
+    window.addEventListener('focus', handleFocus);
+    return () => window.removeEventListener('focus', handleFocus);
+  }, [refresh]);
+
+  const getBackendShortLabel = useCallback((backendId: string) => {
+    const backend = backends.find((b) => b.id === backendId);
+    if (!backend) return backendId;
+    const label = backend.label;
+    if (label.includes('Sonnet')) return 'Sonnet';
+    if (label.includes('Opus')) return 'Opus';
+    if (label.includes('Haiku')) return 'Haiku';
+    if (label.includes('GPT')) return 'GPT';
+    return label.split(' ')[0];
+  }, [backends]);
+
+  const formatWorkingDir = useCallback((dir: string): string => {
+    if (!dir) return 'Not set';
+    if (dir === '.') return '(current dir)';
+    // Show last 2-3 segments of the path
+    const parts = dir.replace(/\\/g, '/').split('/');
+    if (parts.length <= 3) return dir;
+    return '.../' + parts.slice(-3).join('/');
+  }, []);
+
+  return (
+    <div style={sidebarStyle}>
+      <style>{`
+        @keyframes pulse {
+          0%, 100% { opacity: 1; transform: scale(1); }
+          50% { opacity: 0.5; transform: scale(1.2); }
+        }
+      `}</style>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '16px 12px 8px' }}>
+        <span style={{ fontSize: 13, fontWeight: 600, color: 'var(--theme-text-muted, rgba(255,255,255,0.5))', textTransform: 'uppercase', letterSpacing: 0.5 }}>
+          Sessions
+        </span>
+        <button onClick={onNewSession} style={newBtnStyle} title="New session">+</button>
+      </div>
+      <div style={{ flex: 1, overflow: 'auto', padding: '4px 8px' }}>
+        {sessions.map((s: any) => {
+          const isRunning = streamingSessions.has(s.id);
+          const isActive = s.id === activeSessionId;
+          return (
+          <div
+            key={s.id}
+            onClick={() => onSelectSession(s.id)}
+            onMouseEnter={() => setHoveredSessionId(s.id)}
+            onMouseLeave={() => setHoveredSessionId(null)}
+            style={{
+              ...itemStyle,
+              ...(isActive ? { background: 'var(--theme-accent-bg, #7aa2f726)' } : {}),
+              ...(hoveredSessionId === s.id && !isActive ? { background: 'var(--theme-bg-tertiary, #242536)' } : {}),
+              ...(isRunning ? { border: '1px solid var(--theme-success, #2da44e)' } : {}),
+            }}
+          >
+            {/* ★ Running indicator */}
+            {isRunning && (
+              <div style={{ position: 'absolute', top: 8, left: 8, display: 'flex', alignItems: 'center', gap: 4 }}>
+                <span style={{ width: 6, height: 6, borderRadius: '50%', background: '#22c55e', animation: 'pulse 1.5s infinite' }} />
+              </div>
+            )}
+
+            {/* ★ Working directory is PRIMARY - shown first and prominently */}
+            <div style={{ fontSize: 11, color: 'var(--theme-success, #2da44e)', fontFamily: 'monospace', marginBottom: 4, paddingLeft: isRunning ? 16 : 0 }}>
+              📁 {formatWorkingDir(s.workingDir)}
+            </div>
+            <div style={{ fontSize: 13, color: isActive ? 'var(--theme-accent, #7aa2f7)' : 'var(--theme-text, #e2e3ea)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', paddingRight: 50 }}>
+              {s.title}
+            </div>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: 4 }}>
+              <span style={{ fontSize: 10, color: 'var(--theme-text-muted, #656d76)' }}>
+                {s.messageCount} msgs
+              </span>
+              {/* Model badge */}
+              <span
+                style={{
+                  ...backendBadgeStyle,
+                  background: getBackendBadgeColor(s.backendId),
+                }}
+                title={getBackendShortLabel(s.backendId)}
+              >
+                {getBackendShortLabel(s.backendId)}
+              </span>
+            </div>
+            <div style={{ position: 'absolute', top: 8, right: 8, display: 'flex', gap: 2, opacity: hoveredSessionId === s.id ? 1 : 0, transition: 'opacity 0.15s' }}>
+              <button
+                onClick={(e) => handleDeleteClick(s, e)}
+                style={actionBtnStyle}
+                title="Delete"
+                disabled={isRunning}
+              >
+                ×
+              </button>
+            </div>
+          </div>
+        );
+      })}
+        {sessions.length === 0 && (
+          <div style={{ textAlign: 'center', color: 'var(--theme-text-muted, #656d76)', fontSize: 13, padding: 20 }}>
+            No sessions yet
+          </div>
+        )}
+      </div>
+
+      {/* 删除确认对话框 */}
+      {sessionToDelete && (
+        <div style={overlayStyle} onClick={() => setSessionToDelete(null)}>
+          <div style={confirmPanelStyle} onClick={(e) => e.stopPropagation()}>
+            <h3 style={{ margin: '0 0 12px 0', fontSize: 16, fontWeight: 600, color: 'var(--theme-text, #1f2328)' }}>
+              确认删除会话
+            </h3>
+            <p style={{ fontSize: 13, color: 'var(--theme-text-muted, #656d76)', margin: '0 0 16px 0', lineHeight: 1.5 }}>
+              确定要删除会话 <strong style={{ color: 'var(--theme-error, #cf222e)' }}>{sessionToDelete.title}</strong> 吗？
+            </p>
+            <p style={{ fontSize: 12, color: 'var(--theme-text-muted, #656d76)', margin: '0 0 16px 0' }}>
+              此操作不可撤销，将删除 {sessionToDelete.messageCount} 条消息。
+            </p>
+            <div style={{ display: 'flex', gap: 8 }}>
+              <button onClick={confirmDelete} style={confirmBtnStyle}>
+                删除
+              </button>
+              <button onClick={() => setSessionToDelete(null)} style={cancelBtnStyle}>
+                取消
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}, (prevProps, nextProps) => {
+  // ★ Only re-render when activeSessionId or streamingSessions changes
+  return prevProps.activeSessionId === nextProps.activeSessionId && prevProps.streamingSessions === nextProps.streamingSessions;
+});
+
+// Simple color mapping for backend badges
+// Using solid colors that work on both light and dark backgrounds
+function getBackendBadgeColor(backendId: string): string {
+  if (backendId.includes('opus')) return '#a855f733';  // Purple with alpha
+  if (backendId.includes('sonnet')) return '#6366f133'; // Indigo with alpha
+  if (backendId.includes('haiku')) return '#22c55e33';  // Green with alpha
+  if (backendId.includes('gpt')) return '#ef444433';    // Red with alpha
+  return '#94a3b833';                                    // Slate with alpha
+}
+
+const sidebarStyle: React.CSSProperties = {
+  width: 260,
+  borderRight: '1px solid var(--theme-border, rgba(0,0,0,0.12))',
+  display: 'flex',
+  flexDirection: 'column',
+  background: 'var(--theme-sidebar-bg, #f6f8fa)',
+  flexShrink: 0,
+};
+
+const runningDotStyle: React.CSSProperties = {
+  width: 6,
+  height: 6,
+  borderRadius: '50%',
+  background: 'var(--theme-success, #2da44e)',
+};
+
+const newBtnStyle: React.CSSProperties = {
+  width: 28,
+  height: 28,
+  borderRadius: 6,
+  border: '1px solid var(--theme-border, rgba(0,0,0,0.12))',
+  background: 'var(--theme-bg-secondary, #f6f8fa)',
+  color: 'var(--theme-text-muted, #656d76)',
+  fontSize: 18,
+  cursor: 'pointer',
+  display: 'flex',
+  alignItems: 'center',
+  justifyContent: 'center',
+};
+
+const itemStyle: React.CSSProperties = {
+  padding: '10px 12px',
+  borderRadius: 8,
+  cursor: 'pointer',
+  marginBottom: 4,
+  position: 'relative',
+  transition: 'background 0.15s',
+};
+
+const actionBtnStyle: React.CSSProperties = {
+  width: 22,
+  height: 22,
+  borderRadius: 4,
+  border: 'none',
+  background: 'transparent',
+  color: 'var(--theme-text-muted, #656d76)',
+  fontSize: 13,
+  cursor: 'pointer',
+  display: 'flex',
+  alignItems: 'center',
+  justifyContent: 'center',
+};
+
+const backendBadgeStyle: React.CSSProperties = {
+  fontSize: 9,
+  padding: '2px 6px',
+  borderRadius: 4,
+  fontWeight: 500,
+  color: 'var(--theme-text, #1f2328)',
+  background: 'var(--theme-bg-tertiary, #eaeef2)',
+  border: '1px solid var(--theme-border, rgba(0,0,0,0.12))',
+};
+
+const overlayStyle: React.CSSProperties = {
+  position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.5)',
+  display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 1000,
+};
+
+const confirmPanelStyle: React.CSSProperties = {
+  background: 'var(--theme-bg-secondary, #ffffff)',
+  border: '1px solid var(--theme-border, rgba(0,0,0,0.15))',
+  borderRadius: 12,
+  padding: 24, width: '90%', maxWidth: 400,
+  boxShadow: '0 4px 20px rgba(0,0,0,0.15)',
+};
+
+const confirmBtnStyle: React.CSSProperties = {
+  flex: 1, padding: 10, borderRadius: 8,
+  background: 'var(--theme-error, #cf222e)', border: 'none',
+  color: '#fff', fontSize: 14, fontWeight: 500, cursor: 'pointer',
+};
+
+const cancelBtnStyle: React.CSSProperties = {
+  flex: 1, padding: 10, borderRadius: 8,
+  background: 'var(--theme-bg-secondary, #f6f8fa)', border: '1px solid var(--theme-border, rgba(0,0,0,0.15))',
+  color: 'var(--theme-text, #1f2328)', fontSize: 14, cursor: 'pointer',
+};

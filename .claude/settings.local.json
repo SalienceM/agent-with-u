@@ -1,0 +1,19 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cd:*)",
+      "Bash(npm run:*)",
+      "Read(//d /c DevFiles/**)",
+      "Bash(python -c \"from src.backend.session_store import SessionStore; from src.backend.backend_store import BackendStore; print\\(''Imports OK''\\)\")",
+      "Bash(python:*)",
+      "WebSearch",
+      "Bash(claude:*)",
+      "Read(//c/Users/Administrator/.claude/**)",
+      "Read(//d/claude-view-tool2/$USERPROFILE/.claude/**)",
+      "Bash(sed:*)",
+      "Bash(npm view:*)",
+      "Read(//c/Users/Administrator/**)",
+      "Read(//d/claude-view-tool2/$USERPROFILE/**)"
+    ]
+  }
+}
