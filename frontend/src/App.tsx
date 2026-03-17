@@ -22,11 +22,19 @@ export const App: React.FC = () => {
   const [newSessionDialogOpen, setNewSessionDialogOpen] = useState(false);
   const [skipPermissions, setSkipPermissions] = useState(true);  // ★ 权限模式开关
   const [streamingSessions, setStreamingSessions] = useState<Set<string>>(new Set());  // ★ Per-session streaming state
+  const [backendConnected, setBackendConnected] = useState<boolean | null>(null);  // ★ null = connecting
   // ★ Track if initial session check has been done to prevent re-opening dialog
   const initialCheckDoneRef = useRef(false);
   const endRef = useRef<HTMLDivElement>(null);
 
   const { config, updateConfig, resetConfig } = useConfig();
+
+  /* ---- 后端连接状态 ---- */
+  useEffect(() => {
+    // Set initial state after wsReady resolves
+    const unsub = api.onConnectionStatus((connected) => setBackendConnected(connected));
+    return unsub;
+  }, []);
 
   /* ---- 加载 backends ---- */
   useEffect(() => {
@@ -322,6 +330,19 @@ export const App: React.FC = () => {
         {/* ---- 顶部栏 ---- */}
         <div style={headerStyle}>
           <span style={{ fontSize: 15, fontWeight: 600, color: 'var(--theme-text, #1f2328)' }}>AgentWithU</span>
+          {/* ★ Backend connection indicator */}
+          {backendConnected === false && (
+            <span
+              style={{
+                fontSize: 11, padding: '2px 8px', borderRadius: 4, fontWeight: 500,
+                background: 'rgba(239,68,68,0.15)', border: '1px solid rgba(239,68,68,0.3)',
+                color: '#ef4444',
+              }}
+              title="Python backend not running. Sessions and data import/export will not work. Run: python -m src.ws_main"
+            >
+              ⚠ backend offline
+            </span>
+          )}
           {/* ★ 显示当前工作目录 */}
           <span style={workingDirStyle} title={activeSession?.workingDir || 'Not set'}>
             {formatWorkingDir(activeSession?.workingDir)}

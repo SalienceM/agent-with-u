@@ -69,12 +69,45 @@ cd frontend && npm run dev
 python -m src.main --dev
 ```
 
-### 打包为独立 exe
+### 打包为独立 exe（PySide6 版）
 
 ```bash
 pip install pyinstaller
 pyinstaller --name "AgentWithU" --windowed --add-data "frontend/dist:frontend/dist" src/main.py
 ```
+
+### 打包为 Tauri 桌面应用（Windows）
+
+> **重要**：Tauri 版使用 WebSocket 与 Python 后端通信。打包前必须先编译 Python sidecar。
+
+**步骤 1：编译 Python sidecar（ws_main）**
+
+```powershell
+pip install pyinstaller
+pyinstaller `
+  --name "agent-with-u-backend" `
+  --onefile `
+  --console `
+  --hidden-import websockets `
+  --hidden-import PIL `
+  src/ws_main_entry.py
+
+# 将编译结果复制到 Tauri sidecar 目录（注意 target triple 后缀）
+New-Item -ItemType Directory -Force -Path src-tauri\binaries
+Copy-Item dist\agent-with-u-backend.exe `
+  src-tauri\binaries\agent-with-u-backend-x86_64-pc-windows-msvc.exe
+```
+
+**步骤 2：构建 Tauri 应用**
+
+```powershell
+npx tauri build --bundles nsis
+```
+
+构建产物在 `src-tauri/target/release/bundle/nsis/`。
+
+> 如果顶部栏显示 **"⚠ backend offline"**，说明 Python sidecar 未运行。
+> 开发模式下请在另一个终端执行 `python -m src.ws_main`。
 
 ## 项目结构
 

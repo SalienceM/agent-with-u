@@ -23,6 +23,9 @@ let ws: WebSocket | null = null;
 let wsReady: Promise<void>;
 let useMock = false;
 
+type ConnectionStatusCallback = (connected: boolean) => void;
+let connectionStatusCallbacks: ConnectionStatusCallback[] = [];
+
 let reqCounter = 0;
 const pending = new Map<string, (result: any) => void>();
 let streamCallbacks: StreamDeltaCallback[] = [];
@@ -96,6 +99,7 @@ wsReady = (async () => {
         settled = true;
         console.warn(`[api] WebSocket timeout (${url}), using mock bridge`);
         useMock = true;
+        connectionStatusCallbacks.forEach((cb) => cb(false));
         resolve();
       }
     }, WS_CONNECT_TIMEOUT_MS);
@@ -108,6 +112,7 @@ wsReady = (async () => {
         clearTimeout(timer);
         ws = socket;
         console.log(`[api] Connected to ${url}`);
+        connectionStatusCallbacks.forEach((cb) => cb(true));
         resolve();
       }
     };
@@ -118,6 +123,7 @@ wsReady = (async () => {
         clearTimeout(timer);
         console.warn(`[api] WebSocket error (${url}), using mock bridge`);
         useMock = true;
+        connectionStatusCallbacks.forEach((cb) => cb(false));
         resolve();
       }
     };
@@ -142,7 +148,10 @@ wsReady = (async () => {
     };
 
     socket.onclose = () => {
-      if (ws === socket) ws = null;
+      if (ws === socket) {
+        ws = null;
+        connectionStatusCallbacks.forEach((cb) => cb(false));
+      }
     };
   });
 })();
@@ -184,7 +193,12 @@ async function nativeSaveFile(defaultPath?: string): Promise<string | null> {
   if (isTauri()) {
     return tauriSaveDialog({
       defaultPath,
-      filters: [{ name: 'Tar Archive', extensions: ['tar.gz'] }],
+      // Windows file dialogs don't support multi-part extensions like 'tar.gz';
+      // use 'gz' to match compressed archives, plus a catch-all fallback.
+      filters: [
+        { name: 'Tar Archive (*.tar.gz)', extensions: ['gz'] },
+        { name: 'All Files', extensions: ['*'] },
+      ],
     });
   }
   return null;
@@ -192,7 +206,12 @@ async function nativeSaveFile(defaultPath?: string): Promise<string | null> {
 
 async function nativeOpenFile(): Promise<string | null> {
   if (isTauri()) {
-    return tauriOpenDialog({ filters: [{ name: 'Tar Archive', extensions: ['tar.gz'] }] });
+    return tauriOpenDialog({
+      filters: [
+        { name: 'Tar Archive (*.tar.gz)', extensions: ['gz'] },
+        { name: 'All Files', extensions: ['*'] },
+      ],
+    });
   }
   return null;
 }
@@ -288,6 +307,16 @@ export const api = {
   async importData(sourcePath: string): Promise<any> {
     const result = await call('importData', sourcePath);
     try { return JSON.parse(result); } catch { return { status: 'error', message: '导入失败' }; }
+  },
+
+  /** Returns true if connected to the real backend, false if in mock mode. */
+  isConnected(): boolean {
+    return !useMock && ws !== null && ws.readyState === WebSocket.OPEN;
+  },
+
+  onConnectionStatus(callback: ConnectionStatusCallback): () => void {
+    connectionStatusCallbacks.push(callback);
+    return () => { connectionStatusCallbacks = connectionStatusCallbacks.filter((cb) => cb !== callback); };
   },
 
   async getAppConfig(): Promise<any> {
