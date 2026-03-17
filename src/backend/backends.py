@@ -330,18 +330,29 @@ class ClaudeAgentBackend(ModelBackend):
                         print(f"[ClaudeAgent] Resume 失败: subtype={subtype}",
                               file=sys.stderr, flush=True)
                         emit("resume_failed")
-                    usage = getattr(message, "usage", None)
-                    if usage:
-                        emit("done", usage={
-                            "inputTokens": getattr(usage, "input_tokens", None),
-                            "outputTokens": getattr(usage, "output_tokens", None),
-                        })
+                    usage_dict: Optional[dict] = None
+                    try:
+                        usage = getattr(message, "usage", None)
+                        if usage:
+                            in_tok = getattr(usage, "input_tokens", None)
+                            out_tok = getattr(usage, "output_tokens", None)
+                            if in_tok is not None or out_tok is not None:
+                                usage_dict = {
+                                    "inputTokens": in_tok or 0,
+                                    "outputTokens": out_tok or 0,
+                                }
+                    except Exception as ue:
+                        print(f"[ClaudeAgent] usage 读取失败: {ue}",
+                              file=sys.stderr, flush=True)
+                    emit("done", **({"usage": usage_dict} if usage_dict else {}))
+                    break  # result 是终止消息，不再迭代
 
                 else:
                     print(f"[ClaudeAgent] 未处理的消息类型: {msg_type}",
                           file=sys.stderr, flush=True)
-
-            emit("done")
+            else:
+                # for 循环自然结束（没有 break），说明没收到 result 消息，补发 done
+                emit("done")
             return {"agentSessionId": agent_sid}
 
         except Exception as e:
