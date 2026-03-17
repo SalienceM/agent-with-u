@@ -237,10 +237,11 @@ class ClaudeAgentBackend(ModelBackend):
 
                 if has_images:
                     # 使用 stdin 方式传递图片和消息
+                    # ★ --input-format 和 --output-format stream-json 都需要 -p (print 模式)
                     cmd.extend(["--input-format", "stream-json"])
+                    cmd.append("-p")  # 启用 print 模式，prompt 来自 stdin
 
-                    # 构建 Anthropic API 格式的消息
-                    import base64
+                    # 构建图片+文字的 content blocks
                     content_blocks = []
                     for img in images:
                         content_blocks.append({
@@ -253,10 +254,13 @@ class ClaudeAgentBackend(ModelBackend):
                         })
                     content_blocks.append({"type": "text", "text": content})
 
-                    # 构建完整的消息对象 (Anthropic API 格式)
+                    # ★ 正确的 stream-json 输入格式：需要 message.role 包装
                     stdin_obj = {
                         "type": "user",
-                        "content": content_blocks
+                        "message": {
+                            "role": "user",
+                            "content": content_blocks
+                        }
                     }
                     stdin_data = json.dumps(stdin_obj, ensure_ascii=False)
                 else:
