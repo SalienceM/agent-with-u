@@ -1,5 +1,9 @@
-PySide6>=6.6.0
+# ── Tauri sidecar（WebSocket 模式，无 Qt 依赖）──
+websockets>=13.0
 claude-agent-sdk>=0.1.0
 anthropic>=0.80.0
 Pillow>=10.0.0
 httpx>=0.27.0
+
+# ── 旧版 PySide6 独立窗口模式（可选，仍可用）──
+# PySide6>=6.6.0

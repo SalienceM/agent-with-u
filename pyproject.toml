@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "AgentWithU — clipboard image paste, rich UI, multi-model switching, session management"
 requires-python = ">=3.10"
 dependencies = [
-    "PySide6>=6.6.0",
+    "websockets>=13.0",
     "claude-agent-sdk>=0.1.0",
     "Pillow>=10.0.0",
     "httpx>=0.27.0",
@@ -17,3 +17,4 @@ dev = [
 
 [project.scripts]
 agent-with-u = "src.main:main"
+agent-with-u-server = "src.ws_main:main"
