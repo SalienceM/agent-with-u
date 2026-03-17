@@ -286,6 +286,25 @@ class ClaudeAgentBackend(ModelBackend):
                     file=sys.stderr, flush=True)
                 print(f"[ClaudeAgent] cwd: {cwd}", file=sys.stderr, flush=True)
 
+                # ★ stdin 数据落盘为临时文件，规避 cmd.exe /c 管道不透传问题
+                # （直接写 proc.stdin 在 Windows cmd.exe 中间层下会 Broken pipe）
+                stdin_temp_path: Optional[str] = None
+                if has_images and stdin_data:
+                    import tempfile
+                    try:
+                        tf = tempfile.NamedTemporaryFile(
+                            mode="wb", suffix=".json", delete=False,
+                            prefix="claude_stdin_"
+                        )
+                        tf.write((stdin_data + "\n").encode("utf-8"))
+                        tf.close()
+                        stdin_temp_path = tf.name
+                        print(f"[ClaudeAgent] stdin 临时文件: {stdin_temp_path}",
+                              file=sys.stderr, flush=True)
+                    except Exception as e:
+                        print(f"[ClaudeAgent] stdin 临时文件失败，回退管道: {e}",
+                              file=sys.stderr, flush=True)
+
                 # ---------- 用线程跑 subprocess ----------
                 loop = asyncio.get_event_loop()
                 msg_queue: asyncio.Queue = asyncio.Queue()
@@ -294,22 +313,39 @@ class ClaudeAgentBackend(ModelBackend):
                 proc_holder: list[Optional[subprocess.Popen]] = [None]
 
                 def _run_subprocess():
+                    stdin_fh = None
                     try:
                         print("[ClaudeAgent] 子进程启动中...",
                             file=sys.stderr, flush=True)
 
-                        # 如果有图片，需要 stdin 管道
                         if has_images:
-                            proc = subprocess.Popen(
-                                cmd,
-                                stdin=subprocess.PIPE,
-                                stdout=subprocess.PIPE,
-                                stderr=subprocess.PIPE,
-                                cwd=cwd,
-                                encoding="utf-8",
-                                errors="replace",
-                                bufsize=1,
-                            )
+                            if stdin_temp_path:
+                                # ★ 用临时文件作为 stdin（规避 cmd.exe 管道透传问题）
+                                stdin_fh = open(stdin_temp_path, "rb")
+                                proc = subprocess.Popen(
+                                    cmd,
+                                    stdin=stdin_fh,
+                                    stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE,
+                                    cwd=cwd,
+                                    encoding="utf-8",
+                                    errors="replace",
+                                    bufsize=1,
+                                )
+                                stdin_fh.close()
+                                stdin_fh = None
+                            else:
+                                # fallback: 直接管道（非 Windows 或临时文件失败）
+                                proc = subprocess.Popen(
+                                    cmd,
+                                    stdin=subprocess.PIPE,
+                                    stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE,
+                                    cwd=cwd,
+                                    encoding="utf-8",
+                                    errors="replace",
+                                    bufsize=1,
+                                )
                         else:
                             proc = subprocess.Popen(
                                 cmd,
@@ -323,8 +359,8 @@ class ClaudeAgentBackend(ModelBackend):
 
                         proc_holder[0] = proc  # 暴露给主循环
 
-                        # 如果有图片数据，写入 stdin
-                        if has_images and stdin_data:
+                        # fallback: 管道写入（仅当临时文件不可用时）
+                        if has_images and stdin_data and not stdin_temp_path:
                             proc.stdin.write(stdin_data + "\n")
                             proc.stdin.flush()
                             proc.stdin.close()
@@ -372,6 +408,17 @@ class ClaudeAgentBackend(ModelBackend):
                             file=sys.stderr, flush=True)
                         loop.call_soon_threadsafe(
                             msg_queue.put_nowait, ("error", str(e)))
+                    finally:
+                        if stdin_fh:
+                            try:
+                                stdin_fh.close()
+                            except Exception:
+                                pass
+                        if stdin_temp_path and os.path.exists(stdin_temp_path):
+                            try:
+                                os.unlink(stdin_temp_path)
+                            except Exception:
+                                pass
 
                 loop.run_in_executor(None, _run_subprocess)
 
