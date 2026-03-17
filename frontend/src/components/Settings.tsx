@@ -32,7 +32,7 @@ export const Settings: React.FC<SettingsProps> = ({
       <div style={panelStyle} onClick={(e) => e.stopPropagation()}>
         {/* 标题栏 */}
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 20 }}>
-          <h2 style={{ margin: 0, fontSize: 18, fontWeight: 600, color: '#fff' }}>⚙ Settings</h2>
+          <h2 style={{ margin: 0, fontSize: 18, fontWeight: 600, color: 'var(--theme-text)' }}>⚙ Settings</h2>
           <button onClick={onClose} style={closeBtnStyle}>✕</button>
         </div>
 
@@ -46,9 +46,9 @@ export const Settings: React.FC<SettingsProps> = ({
               max={20}
               value={config.fontSize}
               onChange={(e) => onConfigChange({ fontSize: Number(e.target.value) })}
-              style={{ flex: 1, accentColor: '#7b61ff' }}
+              style={{ flex: 1, accentColor: 'var(--theme-accent)' }}
             />
-            <span style={{ fontSize: 13, color: 'rgba(255,255,255,0.5)', minWidth: 36, textAlign: 'right' }}>
+            <span style={{ fontSize: 13, color: 'var(--theme-text-muted)', minWidth: 36, textAlign: 'right' }}>
               {config.fontSize}px
             </span>
           </div>
@@ -86,7 +86,7 @@ export const Settings: React.FC<SettingsProps> = ({
               type="checkbox"
               checked={config.renderMarkdown}
               onChange={(e) => onConfigChange({ renderMarkdown: e.target.checked })}
-              style={{ accentColor: '#7b61ff' }}
+              style={{ accentColor: 'var(--theme-accent)' }}
             />
             Render Markdown in assistant messages
           </label>
@@ -102,8 +102,8 @@ export const Settings: React.FC<SettingsProps> = ({
                 onClick={() => onConfigChange({ exportFormat: fmt })}
                 style={{
                   ...formatBtnStyle,
-                  background: config.exportFormat === fmt ? 'rgba(123,97,255,0.25)' : 'rgba(255,255,255,0.05)',
-                  borderColor: config.exportFormat === fmt ? '#7b61ff' : 'rgba(255,255,255,0.1)',
+                  background: config.exportFormat === fmt ? 'var(--theme-accent-bg)' : 'rgba(255,255,255,0.05)',
+                  borderColor: config.exportFormat === fmt ? 'var(--theme-accent)' : 'var(--theme-border)',
                 }}
               >
                 {fmt.toUpperCase()}
@@ -139,7 +139,7 @@ export const Settings: React.FC<SettingsProps> = ({
               📥 Import Data
             </button>
           </div>
-          <p style={{ fontSize: 11, color: 'rgba(255,255,255,0.3)', marginTop: 6, margin: '6px 0 0 0' }}>
+          <p style={{ fontSize: 11, color: 'var(--theme-text-muted)', marginTop: 6, margin: '6px 0 0 0' }}>
             ⚠️ Import will overwrite all existing sessions and backend configs
           </p>
         </div>

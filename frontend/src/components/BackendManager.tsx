@@ -150,7 +150,7 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
       <div style={panelStyle} onClick={(e) => e.stopPropagation()}>
         {/* 标题栏 */}
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 20 }}>
-          <h2 style={{ margin: 0, fontSize: 18, fontWeight: 600, color: '#fff' }}>
+          <h2 style={{ margin: 0, fontSize: 18, fontWeight: 600, color: 'var(--theme-text)' }}>
             {editingBackend ? 'Edit Backend' : 'Backend Manager'}
           </h2>
           <button onClick={onClose} style={closeBtnStyle}>✕</button>
@@ -161,7 +161,7 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
           <>
             <div style={{ marginBottom: 16 }}>
               {backends.length === 0 ? (
-                <div style={{ color: 'rgba(255,255,255,0.4)', fontSize: 13, textAlign: 'center', padding: 20 }}>
+                <div style={{ color: 'var(--theme-text-muted)', fontSize: 13, textAlign: 'center', padding: 20 }}>
                   No backends configured
                 </div>
               ) : (
@@ -172,10 +172,10 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
                     onClick={() => handleEditBackend(backend)}
                   >
                     <div style={{ flex: 1 }}>
-                      <div style={{ fontWeight: 500, color: '#fff', marginBottom: 4 }}>
+                      <div style={{ fontWeight: 500, color: 'var(--theme-text)', marginBottom: 4 }}>
                         {backend.label}
                       </div>
-                      <div style={{ fontSize: 11, color: 'rgba(255,255,255,0.4)' }}>
+                      <div style={{ fontSize: 11, color: 'var(--theme-text-muted)' }}>
                         {backend.type}
                         {backend.model && <span> · Model: {backend.model}</span>}
                         {backend.env?.ANTHROPIC_MODEL && (
@@ -243,16 +243,16 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
             </div>
 
             {/* 环境变量配置 */}
-            <div style={{ marginBottom: 16, padding: 12, background: 'rgba(255,255,255,0.05)', borderRadius: 8 }}>
+            <div style={{ marginBottom: 16, padding: 12, background: 'var(--theme-bg-secondary)', borderRadius: 8 }}>
               <label style={{ ...labelStyle, marginBottom: 8 }}>
                 Environment Variables (Per-Backend)
               </label>
-              <p style={{ fontSize: 11, color: 'rgba(255,255,255,0.4)', margin: '0 0 12px 0' }}>
+              <p style={{ fontSize: 11, color: 'var(--theme-text-muted)', margin: '0 0 12px 0' }}>
                 These override global environment variables for this specific backend.
               </p>
 
               <div style={{ marginBottom: 10 }}>
-                <label style={{ fontSize: 11, color: 'rgba(255,255,255,0.6)', display: 'block', marginBottom: 4 }}>
+                <label style={{ fontSize: 11, color: 'var(--theme-text)', display: 'block', marginBottom: 4 }}>
                   ANTHROPIC_MODEL
                 </label>
                 <input
@@ -265,7 +265,7 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
               </div>
 
               <div style={{ marginBottom: 10 }}>
-                <label style={{ fontSize: 11, color: 'rgba(255,255,255,0.6)', display: 'block', marginBottom: 4 }}>
+                <label style={{ fontSize: 11, color: 'var(--theme-text)', display: 'block', marginBottom: 4 }}>
                   ANTHROPIC_BASE_URL
                 </label>
                 <input
@@ -278,7 +278,7 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
               </div>
 
               <div style={{ marginBottom: 10 }}>
-                <label style={{ fontSize: 11, color: 'rgba(255,255,255,0.6)', display: 'block', marginBottom: 4 }}>
+                <label style={{ fontSize: 11, color: 'var(--theme-text)', display: 'block', marginBottom: 4 }}>
                   ANTHROPIC_AUTH_TOKEN
                 </label>
                 <input
@@ -290,6 +290,24 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
                 />
               </div>
             </div>
+
+            {/* Skip Permissions - 仅 claude-agent-sdk 支持 */}
+            {formData.type === 'claude-agent-sdk' && (
+              <div style={{ marginBottom: 16 }}>
+                <label style={{ ...labelStyle, display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer', marginBottom: 0 }}>
+                  <input
+                    type="checkbox"
+                    checked={formData.skipPermissions !== false}
+                    onChange={(e) => setFormData({ ...formData, skipPermissions: e.target.checked })}
+                    style={{ accentColor: 'var(--theme-accent)', width: 14, height: 14, flexShrink: 0 }}
+                  />
+                  Skip Permissions (bypassPermissions mode)
+                </label>
+                <p style={{ fontSize: 11, color: 'var(--theme-text-muted)', margin: '4px 0 0 22px' }}>
+                  启用后 Claude 可直接调用工具，无需逐条确认。
+                </p>
+              </div>
+            )}
 
             {/* For OpenAI Compatible backends */}
             {formData.type === 'openai-compatible' && (
@@ -333,21 +351,21 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
         {backendToDelete && dependentSessions.length > 0 && (
           <div style={overlayStyle} onClick={() => setBackendToDelete(null)}>
             <div style={{ ...panelStyle, width: 'auto', maxWidth: 520 }} onClick={(e) => e.stopPropagation()}>
-              <h3 style={{ margin: '0 0 12px 0', fontSize: 16, fontWeight: 600, color: '#fff' }}>
+              <h3 style={{ margin: '0 0 12px 0', fontSize: 16, fontWeight: 600, color: 'var(--theme-text)' }}>
                 删除后端将影响 {dependentSessions.length} 个会话
               </h3>
-              <p style={{ fontSize: 13, color: 'rgba(255,255,255,0.6)', margin: '0 0 16px 0', lineHeight: 1.5 }}>
+              <p style={{ fontSize: 13, color: 'var(--theme-text)', margin: '0 0 16px 0', lineHeight: 1.5 }}>
                 后端 <strong style={{ color: 'rgba(255,100,100,0.9)' }}>{backendToDelete.label}</strong> 当前被以下会话引用：
               </p>
               <div style={{ maxHeight: 150, overflowY: 'auto', marginBottom: 16, background: 'rgba(0,0,0,0.2)', borderRadius: 8, padding: 12 }}>
                 {dependentSessions.slice(0, 8).map((s) => (
-                  <div key={s.id} style={{ fontSize: 12, color: 'rgba(255,255,255,0.5)', marginBottom: 6, display: 'flex', justifyContent: 'space-between' }}>
+                  <div key={s.id} style={{ fontSize: 12, color: 'var(--theme-text)', marginBottom: 6, display: 'flex', justifyContent: 'space-between' }}>
                     <span style={{ flex: 1 }}>{s.title || s.workingDir}</span>
-                    <span style={{ fontSize: 10, color: 'rgba(255,255,255,0.3)' }}>{s.messageCount} 条消息</span>
+                    <span style={{ fontSize: 10, color: 'var(--theme-text-muted)' }}>{s.messageCount} 条消息</span>
                   </div>
                 ))}
                 {dependentSessions.length > 8 && (
-                  <div style={{ fontSize: 11, color: 'rgba(255,255,255,0.3)', textAlign: 'center', marginTop: 8 }}>
+                  <div style={{ fontSize: 11, color: 'var(--theme-text-muted)', textAlign: 'center', marginTop: 8 }}>
                     还有 {dependentSessions.length - 8} 个会话...
                   </div>
                 )}
@@ -355,7 +373,7 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
 
               {/* 选择目标后端 */}
               <div style={{ marginBottom: 16 }}>
-                <p style={{ fontSize: 13, color: 'rgba(255,255,255,0.7)', margin: '0 0 8px 0' }}>
+                <p style={{ fontSize: 13, color: 'var(--theme-text)', margin: '0 0 8px 0' }}>
                   请选择目标后端，将这些会话迁移到：
                 </p>
                 <TargetBackendSelector
@@ -384,13 +402,13 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
         {backendToDelete && dependentSessions.length === 0 && (
           <div style={overlayStyle} onClick={() => setBackendToDelete(null)}>
             <div style={{ ...panelStyle, width: 'auto', maxWidth: 400 }} onClick={(e) => e.stopPropagation()}>
-              <h3 style={{ margin: '0 0 12px 0', fontSize: 16, fontWeight: 600, color: '#fff' }}>
+              <h3 style={{ margin: '0 0 12px 0', fontSize: 16, fontWeight: 600, color: 'var(--theme-text)' }}>
                 确认删除后端
               </h3>
-              <p style={{ fontSize: 13, color: 'rgba(255,255,255,0.6)', margin: '0 0 16px 0', lineHeight: 1.5 }}>
+              <p style={{ fontSize: 13, color: 'var(--theme-text)', margin: '0 0 16px 0', lineHeight: 1.5 }}>
                 确定要删除后端 <strong style={{ color: 'rgba(255,100,100,0.9)' }}>{backendToDelete.label}</strong> 吗？
               </p>
-              <p style={{ fontSize: 12, color: 'rgba(255,255,255,0.4)', margin: '0 0 16px 0' }}>
+              <p style={{ fontSize: 12, color: 'var(--theme-text-muted)', margin: '0 0 16px 0' }}>
                 此操作不可撤销。
               </p>
               <div style={{ display: 'flex', gap: 8 }}>
@@ -416,12 +434,12 @@ const overlayStyle: React.CSSProperties = {
 };
 
 const panelStyle: React.CSSProperties = {
-  background: '#1e1e36', border: '1px solid rgba(255,255,255,0.1)', borderRadius: 12,
+  background: 'var(--theme-bg-tertiary)', border: '1px solid var(--theme-border)', borderRadius: 12,
   padding: 24, width: '90%', maxWidth: 520, maxHeight: '85vh', overflowY: 'auto',
 };
 
 const closeBtnStyle: React.CSSProperties = {
-  background: 'none', border: 'none', color: 'rgba(255,255,255,0.4)',
+  background: 'none', border: 'none', color: 'var(--theme-text-muted)',
   fontSize: 18, cursor: 'pointer', padding: '4px 8px',
 };
 
@@ -445,23 +463,23 @@ const addBtnStyle: React.CSSProperties = {
 };
 
 const labelStyle: React.CSSProperties = {
-  fontSize: 12, fontWeight: 500, color: 'rgba(255,255,255,0.7)',
+  fontSize: 12, fontWeight: 500, color: 'var(--theme-text)',
   display: 'block', marginBottom: 6,
 };
 
 const inputStyle: React.CSSProperties = {
   width: '100%', padding: '10px 12px',
-  background: 'rgba(255,255,255,0.08)',
-  border: '1px solid rgba(255,255,255,0.12)', borderRadius: 6,
-  color: '#e0e0e0', fontSize: 13, outline: 'none',
+  background: 'var(--theme-input-bg)',
+  border: '1px solid var(--theme-border)', borderRadius: 6,
+  color: 'var(--theme-text)', fontSize: 13, outline: 'none',
   boxSizing: 'border-box',
 };
 
 const selectStyle: React.CSSProperties = {
   width: '100%', padding: '10px 12px',
-  background: 'rgba(30,30,46,0.95)',
-  border: '1px solid rgba(255,255,255,0.15)', borderRadius: 6,
-  color: '#e0e0e0', fontSize: 13, outline: 'none', cursor: 'pointer',
+  background: 'var(--theme-bg-tertiary)',
+  border: '1px solid var(--theme-border)', borderRadius: 6,
+  color: 'var(--theme-text)', fontSize: 13, outline: 'none', cursor: 'pointer',
   boxSizing: 'border-box',
   fontFamily: 'inherit',
   WebkitAppearance: 'none',
@@ -481,8 +499,8 @@ const saveBtnStyle: React.CSSProperties = {
 
 const cancelBtnStyle: React.CSSProperties = {
   flex: 1, padding: 10, borderRadius: 8,
-  background: 'rgba(255,255,255,0.1)', border: '1px solid rgba(255,255,255,0.15)',
-  color: '#e0e0e0', fontSize: 14, cursor: 'pointer',
+  background: 'var(--theme-input-bg)', border: '1px solid var(--theme-border)',
+  color: 'var(--theme-text)', fontSize: 14, cursor: 'pointer',
 };
 
 const confirmBtnStyle: React.CSSProperties = {
