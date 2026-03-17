@@ -9,6 +9,9 @@ import { useChat } from './hooks/useChat';
 import { useConfig } from './hooks/useConfig';
 import { themes } from './hooks/useConfig';
 import { messagesToMarkdown, messagesToJson } from './utils/markdown';
+// highlight.js 主题 CSS（作为字符串注入，支持主题切换）
+import hljsLightCss from 'highlight.js/styles/github.css?inline';
+import hljsDarkCss from 'highlight.js/styles/github-dark-dimmed.css?inline';
 
 export const App: React.FC = () => {
   const [backends, setBackends] = useState<any[]>([]);
@@ -226,6 +229,8 @@ export const App: React.FC = () => {
   }, [backends, activeSessionId]);
 
   const theme = themes[config.theme] || themes.dark;
+  const isLightTheme = config.theme === 'light';
+  const hljsCss = isLightTheme ? hljsLightCss : hljsDarkCss;
 
   return (
     <div style={{
@@ -248,18 +253,64 @@ export const App: React.FC = () => {
       '--theme-input-bg': theme.inputBg,
       '--theme-sidebar-bg': theme.sidebarBg,
     } as React.CSSProperties}>
-      {/* ★ Global styles for animations */}
+      {/* ★ highlight.js theme - 随主题切换 */}
+      <style>{hljsCss}</style>
+      {/* ★ Markdown 内容样式 + 全局动画 */}
       <style>{`
         @keyframes dialogSlideIn {
-          from {
-            opacity: 0;
-            transform: scale(0.95) translateY(-10px);
-          }
-          to {
-            opacity: 1;
-            transform: scale(1) translateY(0);
-          }
+          from { opacity: 0; transform: scale(0.95) translateY(-10px); }
+          to   { opacity: 1; transform: scale(1) translateY(0); }
         }
+        /* ── Markdown 内容 ── */
+        .md-content { line-height: 1.6; }
+        .md-content p { margin: 6px 0; }
+        .md-content h1,.md-content h2,.md-content h3,
+        .md-content h4,.md-content h5,.md-content h6 {
+          color: var(--theme-text); font-weight: 600; margin: 14px 0 4px;
+        }
+        .md-content h1 { font-size: 1.2em; font-weight: 700; }
+        .md-content h2 { font-size: 1.12em; }
+        .md-content h3 { font-size: 1.05em; }
+        .md-content h4 { font-size: 1em; }
+        .md-content ul, .md-content ol { padding-left: 22px; margin: 4px 0; }
+        .md-content li { margin-bottom: 3px; }
+        .md-content a.md-link { color: var(--theme-accent); text-decoration: underline; }
+        .md-content hr.md-hr { border: none; border-top: 1px solid var(--theme-border); margin: 12px 0; }
+        /* 行内代码 */
+        .md-content code.md-code-inline {
+          background: var(--theme-code-bg); color: var(--theme-text);
+          padding: 1px 5px; border-radius: 4px; font-size: 0.88em; font-family: monospace;
+        }
+        /* 代码块 */
+        .md-content pre.md-pre {
+          background: var(--theme-code-bg); border: 1px solid var(--theme-border);
+          border-radius: 8px; padding: 12px 16px; overflow-x: auto;
+          font-size: 13px; line-height: 1.6; margin: 8px 0;
+        }
+        .md-content pre.md-pre code.hljs {
+          background: transparent; padding: 0; font-family: monospace;
+          font-size: inherit; display: block;
+        }
+        .md-content .md-code-lang {
+          font-size: 11px; color: var(--theme-text-muted);
+          margin-bottom: 4px; font-family: sans-serif;
+        }
+        /* 引用块 */
+        .md-content blockquote.md-blockquote {
+          border-left: 3px solid var(--theme-accent); margin: 8px 0;
+          padding: 4px 12px; color: var(--theme-text-muted);
+        }
+        .md-content blockquote.md-blockquote p { margin: 0; }
+        /* 表格 */
+        .md-table-wrap { overflow-x: auto; margin: 8px 0; }
+        .md-table { border-collapse: collapse; width: 100%; font-size: 0.95em; }
+        .md-table th, .md-table td {
+          border: 1px solid var(--theme-border); padding: 6px 12px; text-align: left;
+        }
+        .md-table th { background: var(--theme-bg-secondary); font-weight: 600; }
+        .md-table tr:nth-child(even) td { background: var(--theme-bg-secondary); }
+        /* 任务列表 */
+        .md-content li input[type="checkbox"] { margin-right: 6px; vertical-align: middle; }
       `}</style>
 
       <Sidebar
