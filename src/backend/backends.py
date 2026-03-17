@@ -231,7 +231,15 @@ class ClaudeAgentBackend(ModelBackend):
                 if self._cancelled:
                     break
 
-                msg_type = getattr(message, "type", type(message).__name__)
+                _CLASS_TYPE_MAP = {
+                    "SystemMessage": "system",
+                    "StreamEvent": "stream_event",
+                    "AssistantMessage": "assistant",
+                    "UserMessage": "user",
+                    "ResultMessage": "result",
+                }
+                _class_name = type(message).__name__
+                msg_type = getattr(message, "type", None) or _CLASS_TYPE_MAP.get(_class_name, _class_name)
 
                 # ★ StreamEvent: include_partial_messages=True 时的流式增量事件
                 if msg_type == "stream_event":
