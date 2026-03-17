@@ -7,13 +7,11 @@
  *   Server → Client: {"event": "streamDelta",    "data": "..."} // push
  *   Server → Client: {"event": "sessionUpdated", "data": "..."} // push
  *
- * In Tauri: Rust sidecar starts Python backend automatically.
- * In dev:   Run `python -m src.ws_main` separately.
- * Fallback: Mock bridge if WebSocket unavailable after timeout.
+ * Tauri mode:  Rust sidecar starts Python backend automatically (release).
+ *              In dev, run `python -m src.ws_main` separately.
+ * Browser mode: Run `python -m src.ws_main` separately, open localhost.
+ * Fallback:   Mock bridge if WebSocket unavailable after timeout.
  */
-
-import { invoke } from '@tauri-apps/api/core';
-import { open as dialogOpen, save as dialogSave } from '@tauri-apps/plugin-dialog';
 
 type StreamDeltaCallback = (delta: any) => void;
 type SessionUpdateCallback = (data: any) => void;
@@ -38,18 +36,54 @@ function isTauri(): boolean {
   return typeof (window as any).__TAURI_INTERNALS__ !== 'undefined';
 }
 
-async function getWsPort(): Promise<number> {
-  if (isTauri()) {
-    try {
-      return await invoke<number>('get_ws_port');
-    } catch {
-      return WS_PORT_DEFAULT;
-    }
+// ── 动态导入 Tauri API（浏览器环境下 graceful fallback）──────
+
+async function tauriInvoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T | null> {
+  try {
+    const { invoke } = await import('@tauri-apps/api/core');
+    return await invoke<T>(cmd, args);
+  } catch {
+    return null;
   }
-  return WS_PORT_DEFAULT;
+}
+
+async function tauriOpenDialog(opts: {
+  directory?: boolean;
+  multiple?: boolean;
+  defaultPath?: string;
+  filters?: { name: string; extensions: string[] }[];
+}): Promise<string | null> {
+  try {
+    const { open } = await import('@tauri-apps/plugin-dialog');
+    const result = await open(opts as any);
+    return typeof result === 'string' ? result : null;
+  } catch {
+    return null;
+  }
+}
+
+async function tauriSaveDialog(opts: {
+  defaultPath?: string;
+  filters?: { name: string; extensions: string[] }[];
+}): Promise<string | null> {
+  try {
+    const { save } = await import('@tauri-apps/plugin-dialog');
+    const result = await save(opts as any);
+    return result ?? null;
+  } catch {
+    return null;
+  }
 }
 
 // ── WebSocket 初始化 ──────────────────────────────────────────
+
+async function getWsPort(): Promise<number> {
+  if (isTauri()) {
+    const port = await tauriInvoke<number>('get_ws_port');
+    if (port) return port;
+  }
+  return WS_PORT_DEFAULT;
+}
 
 wsReady = (async () => {
   const port = await getWsPort();
@@ -92,10 +126,9 @@ wsReady = (async () => {
       try {
         const msg = JSON.parse(e.data);
         if (msg.id !== undefined && pending.has(msg.id)) {
-          // Response to a request
-          const resolve = pending.get(msg.id)!;
+          const cb = pending.get(msg.id)!;
           pending.delete(msg.id);
-          resolve(msg.result ?? null);
+          cb(msg.result ?? null);
         } else if (msg.event === 'streamDelta') {
           const delta = JSON.parse(msg.data);
           streamCallbacks.forEach((cb) => cb(delta));
@@ -109,10 +142,7 @@ wsReady = (async () => {
     };
 
     socket.onclose = () => {
-      if (ws === socket) {
-        ws = null;
-        console.warn('[api] WebSocket closed');
-      }
+      if (ws === socket) ws = null;
     };
   });
 })();
@@ -121,11 +151,7 @@ wsReady = (async () => {
 
 async function call(method: string, ...params: any[]): Promise<any> {
   await wsReady;
-  if (useMock) {
-    return mockDispatch(method, params);
-  }
-  if (!ws || ws.readyState !== WebSocket.OPEN) {
-    console.warn('[api] WebSocket not open, falling back to mock');
+  if (useMock || !ws || ws.readyState !== WebSocket.OPEN) {
     return mockDispatch(method, params);
   }
   return new Promise((resolve) => {
@@ -135,64 +161,38 @@ async function call(method: string, ...params: any[]): Promise<any> {
   });
 }
 
-// fire-and-forget (sendMessage / abortMessage)
 async function send(method: string, ...params: any[]): Promise<void> {
   await wsReady;
-  if (useMock) {
+  if (useMock || !ws || ws.readyState !== WebSocket.OPEN) {
     mockDispatch(method, params);
     return;
   }
-  if (ws && ws.readyState === WebSocket.OPEN) {
-    const id = nextId();
-    // No pending entry: we don't wait for a response
-    ws.send(JSON.stringify({ id, method, params }));
-  }
+  const id = nextId();
+  ws.send(JSON.stringify({ id, method, params }));
 }
 
-// ── 对话框（Tauri plugin-dialog / 浏览器 fallback）──────────
+// ── 对话框（Tauri plugin-dialog）────────────────────────────
 
 async function nativeOpenDirectory(initialPath?: string): Promise<string | null> {
   if (isTauri()) {
-    try {
-      const result = await dialogOpen({
-        directory: true,
-        multiple: false,
-        defaultPath: initialPath,
-      });
-      return typeof result === 'string' ? result : null;
-    } catch {
-      return null;
-    }
+    return tauriOpenDialog({ directory: true, multiple: false, defaultPath: initialPath });
   }
-  return null; // 浏览器环境无法选目录
+  return null;
 }
 
 async function nativeSaveFile(defaultPath?: string): Promise<string | null> {
   if (isTauri()) {
-    try {
-      const result = await dialogSave({
-        defaultPath,
-        filters: [{ name: 'Tar 归档', extensions: ['tar.gz'] }],
-      });
-      return result ?? null;
-    } catch {
-      return null;
-    }
+    return tauriSaveDialog({
+      defaultPath,
+      filters: [{ name: 'Tar Archive', extensions: ['tar.gz'] }],
+    });
   }
   return null;
 }
 
 async function nativeOpenFile(): Promise<string | null> {
   if (isTauri()) {
-    try {
-      const result = await dialogOpen({
-        multiple: false,
-        filters: [{ name: 'Tar 归档', extensions: ['tar.gz'] }],
-      });
-      return typeof result === 'string' ? result : null;
-    } catch {
-      return null;
-    }
+    return tauriOpenDialog({ filters: [{ name: 'Tar Archive', extensions: ['tar.gz'] }] });
   }
   return null;
 }
@@ -203,11 +203,7 @@ async function nativeOpenFile(): Promise<string | null> {
 export const api = {
   async readClipboardImage(): Promise<any | null> {
     const result = await call('readClipboardImage');
-    try {
-      return JSON.parse(result);
-    } catch {
-      return null;
-    }
+    try { return JSON.parse(result); } catch { return null; }
   },
 
   async sendMessage(payload: any): Promise<void> {
@@ -220,16 +216,12 @@ export const api = {
 
   onStreamDelta(callback: StreamDeltaCallback): () => void {
     streamCallbacks.push(callback);
-    return () => {
-      streamCallbacks = streamCallbacks.filter((cb) => cb !== callback);
-    };
+    return () => { streamCallbacks = streamCallbacks.filter((cb) => cb !== callback); };
   },
 
   onSessionUpdated(callback: SessionUpdateCallback): () => void {
     sessionUpdateCallbacks.push(callback);
-    return () => {
-      sessionUpdateCallbacks = sessionUpdateCallbacks.filter((cb) => cb !== callback);
-    };
+    return () => { sessionUpdateCallbacks = sessionUpdateCallbacks.filter((cb) => cb !== callback); };
   },
 
   async executeCommand(payload: {
@@ -320,10 +312,8 @@ let mockAppConfig: any = { fontSize: 14, renderMarkdown: true, exportFormat: 'ma
 
 function mockDispatch(method: string, params: any[]): any {
   switch (method) {
-    case 'readClipboardImage':
-      return 'null';
-    case 'getAppConfig':
-      return JSON.stringify(mockAppConfig);
+    case 'readClipboardImage': return 'null';
+    case 'getAppConfig': return JSON.stringify(mockAppConfig);
     case 'setAppConfig':
       mockAppConfig = JSON.parse(params[0]);
       return JSON.stringify({ status: 'ok' });
@@ -331,22 +321,20 @@ function mockDispatch(method: string, params: any[]): any {
       const payload = JSON.parse(params[0]);
       const msgId = payload.messageId || 'mock-' + Date.now();
       setTimeout(() => {
-        streamCallbacks.forEach((cb) =>
-          cb({
-            sessionId: payload.sessionId, messageId: msgId, type: 'text_delta',
-            text: 'Mock response — WebSocket not connected. Run `python -m src.ws_main`.\n\nSlash commands work! Try `/help`.',
-          })
-        );
+        streamCallbacks.forEach((cb) => cb({
+          sessionId: payload.sessionId, messageId: msgId, type: 'text_delta',
+          text: 'Mock response — WebSocket not connected.\n\nRun: `python -m src.ws_main`\n\nSlash commands work! Try `/help`.',
+        }));
         setTimeout(() => {
-          streamCallbacks.forEach((cb) =>
-            cb({ sessionId: payload.sessionId, messageId: msgId, type: 'done', usage: { inputTokens: 100, outputTokens: 50 } })
-          );
+          streamCallbacks.forEach((cb) => cb({
+            sessionId: payload.sessionId, messageId: msgId, type: 'done',
+            usage: { inputTokens: 100, outputTokens: 50 },
+          }));
         }, 100);
       }, 300);
       return null;
     }
-    case 'abortMessage':
-      return null;
+    case 'abortMessage': return null;
     case 'executeCommand': {
       const p = JSON.parse(params[0]);
       if (p.command === 'compact') return JSON.stringify({ status: 'ok', removed: 5, remaining: 6 });
@@ -354,18 +342,14 @@ function mockDispatch(method: string, params: any[]): any {
     }
     case 'createSession':
       return JSON.stringify({
-        id: 'mock-session-' + Date.now(), title: 'Mock session',
+        id: 'mock-' + Date.now(), title: 'Mock session',
         createdAt: Date.now() / 1000, updatedAt: Date.now() / 1000,
         messages: [], backendId: params[1], autoContinue: true,
       });
-    case 'listSessions':
-      return '[]';
-    case 'loadSession':
-      return 'null';
-    case 'deleteSession':
-      return true;
-    case 'getBackends':
-      return JSON.stringify(mockBackends);
+    case 'listSessions': return '[]';
+    case 'loadSession': return 'null';
+    case 'deleteSession': return true;
+    case 'getBackends': return JSON.stringify(mockBackends);
     case 'saveBackend': {
       const cfg = JSON.parse(params[0]);
       const idx = mockBackends.findIndex((b) => b.id === cfg.id);
@@ -377,7 +361,6 @@ function mockDispatch(method: string, params: any[]): any {
       if (idx >= 0) mockBackends.splice(idx, 1);
       return null;
     }
-    default:
-      return null;
+    default: return null;
   }
 }
