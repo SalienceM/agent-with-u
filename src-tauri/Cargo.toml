@@ -3,6 +3,11 @@ name = "agent-with-u"
 version = "0.1.0"
 edition = "2021"
 
+[package.metadata.bundle]
+name = "AgentWithU"
+identifier = "com.agentwith.u"
+icon = ["icons/icon.ico"]
+
 [lib]
 name = "agent_with_u_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
