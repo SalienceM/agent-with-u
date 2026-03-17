@@ -50,6 +50,7 @@ class ImageAttachment:
     size: int = 0
     width: Optional[int] = None
     height: Optional[int] = None
+    file_path: Optional[str] = None  # ★ 本地临时文件路径（落盘后填充）
 
     def to_dict(self) -> dict:
         return asdict(self)

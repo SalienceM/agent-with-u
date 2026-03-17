@@ -16,6 +16,7 @@ from pathlib import Path
 from PySide6.QtWidgets import QApplication
 
 from .backend.bridge import Bridge
+from .backend.clipboard import ClipboardHandler
 from .gui.main_window import MainWindow
 
 
@@ -72,6 +73,9 @@ def main():
     
     # Load Claude Code settings (Coding Plan credentials, etc.)
     load_claude_settings()
+
+    # ★ 清理超过 24 小时的临时图片文件
+    ClipboardHandler.cleanup_old_temp_files()
 
     # Create Qt application
     app = QApplication(sys.argv)

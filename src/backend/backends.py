@@ -244,12 +244,18 @@ class ClaudeAgentBackend(ModelBackend):
                     # 构建图片+文字的 content blocks
                     content_blocks = []
                     for img in images:
+                        # ★ 优先从临时文件读取 base64（避免大型 base64 在内存中重复传递）
+                        img_b64 = img.base64
+                        if not img_b64 and img.file_path:
+                            import base64 as _b64
+                            with open(img.file_path, "rb") as f:
+                                img_b64 = _b64.b64encode(f.read()).decode("ascii")
                         content_blocks.append({
                             "type": "image",
                             "source": {
                                 "type": "base64",
                                 "media_type": img.mime_type,
-                                "data": img.base64
+                                "data": img_b64
                             }
                         })
                     content_blocks.append({"type": "text", "text": content})
@@ -265,6 +271,10 @@ class ClaudeAgentBackend(ModelBackend):
                     stdin_data = json.dumps(stdin_obj, ensure_ascii=False)
                 else:
                     cmd.extend(["-p", content])
+
+                # ★ Windows 修复：.cmd/.bat 文件不能被 Popen 直接执行，需要 cmd.exe /c
+                if sys.platform == "win32" and cli_path.lower().endswith((".cmd", ".bat")):
+                    cmd = ["cmd.exe", "/c"] + cmd
 
                 print(f"[ClaudeAgent] cmd: {' '.join(cmd[:8])}...",
                     file=sys.stderr, flush=True)
