@@ -318,34 +318,54 @@ class ClaudeAgentBackend(ModelBackend):
                         print("[ClaudeAgent] 子进程启动中...",
                             file=sys.stderr, flush=True)
 
-                        if has_images:
-                            if stdin_temp_path:
-                                # ★ 用临时文件作为 stdin（规避 cmd.exe 管道透传问题）
-                                stdin_fh = open(stdin_temp_path, "rb")
-                                proc = subprocess.Popen(
-                                    cmd,
-                                    stdin=stdin_fh,
-                                    stdout=subprocess.PIPE,
-                                    stderr=subprocess.PIPE,
-                                    cwd=cwd,
-                                    encoding="utf-8",
-                                    errors="replace",
-                                    bufsize=1,
-                                )
-                                stdin_fh.close()
-                                stdin_fh = None
-                            else:
-                                # fallback: 直接管道（非 Windows 或临时文件失败）
-                                proc = subprocess.Popen(
-                                    cmd,
-                                    stdin=subprocess.PIPE,
-                                    stdout=subprocess.PIPE,
-                                    stderr=subprocess.PIPE,
-                                    cwd=cwd,
-                                    encoding="utf-8",
-                                    errors="replace",
-                                    bufsize=1,
-                                )
+                        if has_images and stdin_temp_path and sys.platform == "win32":
+                            # ★ Windows：用 shell=True + < 文件重定向
+                            # cmd.exe /c 的 stdin 文件句柄不会透传给子进程，
+                            # 但 shell 的 < 重定向由 cmd.exe 自己解析，可以正确传递。
+                            # 取掉 _apply_windows_cmd_wrap 加的 ["cmd.exe", "/c"] 前缀
+                            actual_cmd = (cmd[2:] if len(cmd) > 2 and cmd[:2] == ["cmd.exe", "/c"]
+                                          else cmd)
+                            args_str = subprocess.list2cmdline(actual_cmd)
+                            shell_cmd = f'{args_str} < "{stdin_temp_path}"'
+                            print(f"[ClaudeAgent] shell_cmd(前120): {shell_cmd[:120]}",
+                                  file=sys.stderr, flush=True)
+                            proc = subprocess.Popen(
+                                shell_cmd,
+                                shell=True,
+                                stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE,
+                                cwd=cwd,
+                                encoding="utf-8",
+                                errors="replace",
+                                bufsize=1,
+                            )
+                        elif has_images and stdin_temp_path:
+                            # Unix：以文件对象作为 stdin（无管道问题）
+                            stdin_fh = open(stdin_temp_path, "rb")
+                            proc = subprocess.Popen(
+                                cmd,
+                                stdin=stdin_fh,
+                                stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE,
+                                cwd=cwd,
+                                encoding="utf-8",
+                                errors="replace",
+                                bufsize=1,
+                            )
+                            stdin_fh.close()
+                            stdin_fh = None
+                        elif has_images:
+                            # fallback: PIPE（临时文件创建失败时）
+                            proc = subprocess.Popen(
+                                cmd,
+                                stdin=subprocess.PIPE,
+                                stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE,
+                                cwd=cwd,
+                                encoding="utf-8",
+                                errors="replace",
+                                bufsize=1,
+                            )
                         else:
                             proc = subprocess.Popen(
                                 cmd,
