@@ -104,13 +104,27 @@ def compress_messages(messages: list[ChatMessage], keep_recent: int = 6) -> str:
 class BridgeWS:
     """WebSocket bridge，业务逻辑与 Bridge（Qt）完全相同，去掉 Qt 依赖。"""
 
-    def __init__(self):
+    def __init__(self, cli_path: Optional[str] = None):
         self._session_store = SessionStore()
         self._backend_store = BackendStore()
+        # ★ 如果检测到内置 claude CLI，注入到默认后端配置
+        self._cli_path = cli_path
         self._app_config_store = AppConfigStore()
         self._backends: dict[str, ModelBackend] = {}
         stored = self._backend_store.list()
-        self._backend_configs: list[ModelBackendConfig] = list(stored) if stored else list(DEFAULT_BACKENDS)
+        if stored:
+            self._backend_configs: list[ModelBackendConfig] = list(stored)
+        else:
+            # ★ 没有持久化配置时使用默认值；若检测到内置 CLI 则自动注入 cli_path
+            defaults = [
+                ModelBackendConfig(
+                    id=c.id, type=c.type, label=c.label, model=c.model,
+                    allowed_tools=c.allowed_tools, skip_permissions=c.skip_permissions,
+                    cli_path=cli_path if cli_path else c.cli_path,
+                )
+                for c in DEFAULT_BACKENDS
+            ]
+            self._backend_configs = defaults
         self._active_sessions: dict[str, Session] = {}
         self._instance_manager = InstanceManager()
         self._clients: set = set()

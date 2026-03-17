@@ -12,6 +12,7 @@ import json
 import os
 import sys
 from pathlib import Path
+from typing import Optional
 
 import websockets
 
@@ -20,6 +21,47 @@ from .backend.clipboard import ClipboardHandler
 
 WS_HOST = "127.0.0.1"
 WS_PORT = 44321
+
+
+def find_bundled_claude() -> Optional[str]:
+    """
+    自动寻找可用的 claude CLI 路径，优先级：
+    1. PyInstaller 打包环境：sys._MEIPASS 下的 claude/claude.exe
+    2. claude_agent_sdk 内置路径（SDK 自带 CLI）
+    3. None（交给 SDK 自己去 PATH 里找）
+    """
+    exe = "claude.exe" if sys.platform == "win32" else "claude"
+
+    # ── 1. PyInstaller frozen 环境 ──
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        candidate = Path(meipass) / exe
+        if candidate.exists():
+            print(f"[ws_main] Using bundled claude: {candidate}", file=sys.stderr)
+            return str(candidate)
+
+    # ── 2. claude_agent_sdk 包内置路径 ──
+    try:
+        import claude_agent_sdk
+        sdk_dir = Path(claude_agent_sdk.__file__).parent
+        # 常见子目录：bin/, cli/, _bin/
+        for sub in ("bin", "cli", "_bin", "."):
+            candidate = sdk_dir / sub / exe
+            if candidate.exists():
+                print(f"[ws_main] Using SDK-bundled claude: {candidate}", file=sys.stderr)
+                return str(candidate)
+        # SDK 可能通过 __path__ 暴露多个目录
+        for sdk_path in getattr(claude_agent_sdk, "__path__", []):
+            for sub in ("bin", "cli", "_bin", "."):
+                candidate = Path(sdk_path) / sub / exe
+                if candidate.exists():
+                    print(f"[ws_main] Using SDK-bundled claude: {candidate}", file=sys.stderr)
+                    return str(candidate)
+    except Exception:
+        pass
+
+    # ── 3. 让 SDK 自己从 PATH 找 ──
+    return None
 
 
 def load_claude_settings():
@@ -51,7 +93,8 @@ async def main():
     load_claude_settings()
     ClipboardHandler.cleanup_old_temp_files()
 
-    bridge = BridgeWS()
+    cli_path = find_bundled_claude()
+    bridge = BridgeWS(cli_path=cli_path)
 
     print(f"[ws_main] Starting WebSocket server on ws://{WS_HOST}:{WS_PORT}", file=sys.stderr, flush=True)
 
