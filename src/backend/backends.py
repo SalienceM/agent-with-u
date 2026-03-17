@@ -228,7 +228,10 @@ class ClaudeAgentBackend(ModelBackend):
                   file=sys.stderr, flush=True)
 
             _done_emitted = False
-            async for message in sdk_query(prompt=_build_prompt(), options=options):
+            # 无图时直接传字符串，有图时用 async generator 传 content blocks
+            # SDK 对 async generator yield str 的处理与直接传 str 行为不一致
+            prompt_arg = _build_prompt() if has_images else content
+            async for message in sdk_query(prompt=prompt_arg, options=options):
                 if self._cancelled:
                     break
                 # result 消息已处理完毕，静默耗尽剩余消息避免 anyio cancel scope 错误
