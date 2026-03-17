@@ -1,57 +1,55 @@
 /**
- * Markdown → HTML using marked + highlight.js
+ * Markdown → HTML using marked v9 + highlight.js
  * CSS 类替代 inline style，配合 App.tsx 注入的 .md-content 样式表自动适配主题
+ *
+ * marked v9 renderer 使用位置参数（非 token 对象），适配该版本 API
  */
-import { marked } from 'marked';
+import { marked, Renderer } from 'marked';
 import hljs from 'highlight.js';
 
-// ── 自定义渲染器 ──────────────────────────────────────────────
+// ── 自定义渲染器（marked v9 positional-arg API）───────────────
+const renderer = new Renderer();
+
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-const renderer: Record<string, any> = {
-  code({ text, lang }: { text: string; lang?: string }) {
-    const validLang = lang && hljs.getLanguage(lang) ? lang : null;
-    const highlighted = validLang
-      ? hljs.highlight(text, { language: validLang }).value
-      : hljs.highlightAuto(text).value;
-    const langLabel = lang
-      ? `<div class="md-code-lang">${lang}</div>`
-      : '';
-    return `<pre class="md-pre"><code class="hljs">${langLabel}${highlighted}</code></pre>\n`;
-  },
+(renderer as any).code = function (code: string, lang: string | undefined): string {
+  const safeCode = code ?? '';
+  const validLang = lang && hljs.getLanguage(lang) ? lang : null;
+  const highlighted = validLang
+    ? hljs.highlight(safeCode, { language: validLang }).value
+    : safeCode.length > 0 ? hljs.highlightAuto(safeCode).value : safeCode;
+  const langLabel = lang ? `<div class="md-code-lang">${lang}</div>` : '';
+  return `<pre class="md-pre"><code class="hljs">${langLabel}${highlighted}</code></pre>\n`;
+};
 
-  codespan({ text }: { text: string }) {
-    return `<code class="md-code-inline">${text}</code>`;
-  },
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+(renderer as any).codespan = function (code: string): string {
+  return `<code class="md-code-inline">${code}</code>`;
+};
 
-  link({ href, text }: { href: string; text: string }) {
-    return `<a href="${href}" target="_blank" rel="noopener" class="md-link">${text}</a>`;
-  },
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+(renderer as any).link = function (href: string, _title: string | null, text: string): string {
+  return `<a href="${href}" target="_blank" rel="noopener" class="md-link">${text}</a>`;
+};
 
-  heading({ text, depth }: { text: string; depth: number }) {
-    return `<h${depth} class="md-h${depth}">${text}</h${depth}>\n`;
-  },
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+(renderer as any).heading = function (text: string, depth: number): string {
+  return `<h${depth} class="md-h${depth}">${text}</h${depth}>\n`;
+};
 
-  hr() {
-    return '<hr class="md-hr">\n';
-  },
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+(renderer as any).hr = function (): string {
+  return '<hr class="md-hr">\n';
+};
 
-  blockquote({ text }: { text: string }) {
-    return `<blockquote class="md-blockquote">${text}</blockquote>\n`;
-  },
-
-  table({ header, rows }: { header: string; rows: string[] }) {
-    return (
-      `<div class="md-table-wrap"><table class="md-table">` +
-      `<thead>${header}</thead><tbody>${rows.join('')}</tbody>` +
-      `</table></div>\n`
-    );
-  },
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+(renderer as any).blockquote = function (quote: string): string {
+  return `<blockquote class="md-blockquote">${quote}</blockquote>\n`;
 };
 
 marked.use({
   renderer,
-  gfm: true,       // GitHub Flavored Markdown（表格、task list 等）
-  breaks: true,    // 单换行 → <br>
+  gfm: true,    // GitHub Flavored Markdown（表格、task list 等）
+  breaks: true, // 单换行 → <br>
 });
 
 export function markdownToHtml(src: string): string {
