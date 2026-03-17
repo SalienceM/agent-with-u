@@ -26,7 +26,6 @@
   "bundle": {
     "active": true,
     "targets": "all",
-    "icon": [],
-    "externalBin": ["binaries/agent-with-u-backend"]
+    "icon": []
   }
 }
