@@ -19,8 +19,12 @@ import time
 from pathlib import Path
 from typing import Optional
 
-from PySide6.QtCore import QBuffer, QByteArray, QIODevice
-from PySide6.QtGui import QClipboard, QGuiApplication, QImage
+try:
+    from PySide6.QtCore import QBuffer, QByteArray, QIODevice
+    from PySide6.QtGui import QClipboard, QGuiApplication, QImage
+    _HAS_PYSIDE6 = True
+except ImportError:
+    _HAS_PYSIDE6 = False
 
 from ..types import ImageAttachment, new_id
 
@@ -36,14 +40,23 @@ def _ensure_temp_dir() -> Path:
 
 class ClipboardHandler:
     def read_image(self) -> Optional[ImageAttachment]:
-        """Read current clipboard image. Returns None if no image."""
+        """Read current clipboard image. Returns None if no image.
+
+        Uses PySide6 when available (Qt app mode), falls back to
+        PIL.ImageGrab for Tauri sidecar mode (Windows/macOS).
+        """
+        if _HAS_PYSIDE6:
+            return self._read_image_qt()
+        return self._read_image_pil()
+
+    def _read_image_qt(self) -> Optional[ImageAttachment]:
+        """Qt-based clipboard reading (requires PySide6)."""
         clipboard = QGuiApplication.clipboard()
         image: QImage = clipboard.image()
 
         if image.isNull():
             return None
 
-        # Convert QImage to PNG bytes
         ba = QByteArray()
         buf = QBuffer(ba)
         buf.open(QIODevice.OpenModeFlag.WriteOnly)
@@ -51,6 +64,25 @@ class ClipboardHandler:
         buf.close()
 
         png_bytes = bytes(ba.data())
+        return self._make_attachment(png_bytes, image.width(), image.height())
+
+    def _read_image_pil(self) -> Optional[ImageAttachment]:
+        """PIL-based clipboard reading (fallback for non-Qt environments)."""
+        try:
+            from PIL import ImageGrab
+            import io
+            img = ImageGrab.grabclipboard()
+            if img is None:
+                return None
+            buf = io.BytesIO()
+            img.save(buf, format="PNG")
+            return self._make_attachment(buf.getvalue(), img.width, img.height)
+        except Exception as e:
+            print(f"[Clipboard] PIL读取失败: {e}", file=sys.stderr, flush=True)
+            return None
+
+    def _make_attachment(self, png_bytes: bytes, width: int, height: int) -> ImageAttachment:
+        """Build ImageAttachment from raw PNG bytes, writing a temp file."""
         b64 = base64.b64encode(png_bytes).decode("ascii")
         img_id = new_id()
 
@@ -63,23 +95,28 @@ class ClipboardHandler:
                 f.write(png_bytes)
         except Exception as e:
             print(f"[Clipboard] 临时文件写入失败: {e}", file=sys.stderr, flush=True)
-            file_path = None
 
         return ImageAttachment(
             id=img_id,
             base64=b64,
             mime_type="image/png",
             size=len(png_bytes),
-            width=image.width(),
-            height=image.height(),
+            width=width,
+            height=height,
             file_path=file_path,
         )
 
     def has_image(self) -> bool:
         """Check if clipboard currently contains an image."""
-        clipboard = QGuiApplication.clipboard()
-        mime = clipboard.mimeData()
-        return mime.hasImage() if mime else False
+        if _HAS_PYSIDE6:
+            clipboard = QGuiApplication.clipboard()
+            mime = clipboard.mimeData()
+            return mime.hasImage() if mime else False
+        try:
+            from PIL import ImageGrab
+            return ImageGrab.grabclipboard() is not None
+        except Exception:
+            return False
 
     @staticmethod
     def cleanup_old_temp_files(max_age_seconds: int = 86400) -> int:
