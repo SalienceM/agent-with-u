@@ -539,6 +539,11 @@ class AnthropicAPIBackend(ModelBackend):
                 client_kwargs["api_key"] = api_key
             if base_url:
                 client_kwargs["base_url"] = base_url
+                # 中转代理通常要求 Authorization: Bearer 格式（而非官方的 x-api-key）
+                if api_key:
+                    client_kwargs["default_headers"] = {
+                        "Authorization": f"Bearer {api_key}"
+                    }
 
             client = _anthropic.AsyncAnthropic(**client_kwargs)
 
