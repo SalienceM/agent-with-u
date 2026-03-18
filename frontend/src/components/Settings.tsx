@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useRef, useCallback } from 'react';
 import type { AppConfig, ThemeType } from '../hooks/useConfig';
 import { themes } from '../hooks/useConfig';
 
@@ -25,6 +25,20 @@ export const Settings: React.FC<SettingsProps> = ({
   onExportData,
   onImportData,
 }) => {
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
+  const handleFileChange = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      onConfigChange({ bgImage: reader.result as string });
+    };
+    reader.readAsDataURL(file);
+    // Reset so selecting the same file again triggers onChange
+    e.target.value = '';
+  }, [onConfigChange]);
+
   if (!isOpen) return null;
 
   return (
@@ -142,6 +156,57 @@ export const Settings: React.FC<SettingsProps> = ({
           <p style={{ fontSize: 11, color: 'var(--theme-text-muted)', marginTop: 6, margin: '6px 0 0 0' }}>
             ⚠️ Import will overwrite all existing sessions and backend configs
           </p>
+        </div>
+
+        {/* 背景图 */}
+        <div style={sectionStyle}>
+          <label style={labelStyle}>Background Image</label>
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept="image/*"
+            style={{ display: 'none' }}
+            onChange={handleFileChange}
+          />
+          <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginBottom: config.bgImage ? 10 : 0 }}>
+            {config.bgImage && (
+              <img
+                src={config.bgImage}
+                style={{ width: 52, height: 34, objectFit: 'cover', borderRadius: 4, border: '1px solid var(--theme-border)', flexShrink: 0 }}
+              />
+            )}
+            <button onClick={() => fileInputRef.current?.click()} style={actionBtnStyle}>
+              {config.bgImage ? '🖼 Change' : '🖼 Select Image'}
+            </button>
+            {config.bgImage && (
+              <button
+                onClick={() => onConfigChange({ bgImage: '' })}
+                style={{ ...actionBtnStyle, flex: 'none', padding: '8px 10px', background: 'rgba(255,80,80,0.12)', borderColor: 'rgba(255,80,80,0.3)' }}
+                title="Remove background image"
+              >
+                ✕
+              </button>
+            )}
+          </div>
+          {config.bgImage && (
+            <div>
+              <label style={{ ...labelStyle, marginBottom: 4 }}>Opacity</label>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+                <input
+                  type="range"
+                  min={0}
+                  max={1}
+                  step={0.05}
+                  value={config.bgOpacity}
+                  onChange={(e) => onConfigChange({ bgOpacity: Number(e.target.value) })}
+                  style={{ flex: 1, accentColor: 'var(--theme-accent)' }}
+                />
+                <span style={{ fontSize: 13, color: 'var(--theme-text-muted)', minWidth: 36, textAlign: 'right' }}>
+                  {Math.round(config.bgOpacity * 100)}%
+                </span>
+              </div>
+            </div>
+          )}
         </div>
 
         {/* 操作按钮 */}

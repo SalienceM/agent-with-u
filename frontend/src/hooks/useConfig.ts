@@ -8,6 +8,8 @@ export interface AppConfig {
   renderMarkdown: boolean;
   exportFormat: 'markdown' | 'json';
   theme: ThemeType;
+  bgImage: string;
+  bgOpacity: number;
 }
 
 const DEFAULT_CONFIG: AppConfig = {
@@ -15,6 +17,8 @@ const DEFAULT_CONFIG: AppConfig = {
   renderMarkdown: true,
   exportFormat: 'markdown',
   theme: 'dark',
+  bgImage: '',
+  bgOpacity: 0.3,
 };
 
 // Theme color schemes
