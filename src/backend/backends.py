@@ -534,20 +534,6 @@ class AnthropicAPIBackend(ModelBackend):
                 or "claude-sonnet-4-6"
             )
 
-            client_kwargs: dict = {}
-            if api_key:
-                client_kwargs["api_key"] = api_key
-            if base_url:
-                client_kwargs["base_url"] = base_url
-
-            client = _anthropic.AsyncAnthropic(**client_kwargs)
-
-            # 中转代理需要 Authorization: Bearer（官方走 x-api-key）
-            # 用 extra_headers 逐请求注入，比 default_headers 更可靠
-            _extra_headers: dict = {}
-            if base_url and api_key:
-                _extra_headers["Authorization"] = f"Bearer {api_key}"
-
             # Build conversation history
             api_messages: list[dict] = []
             for m in messages:
@@ -608,58 +594,133 @@ class AnthropicAPIBackend(ModelBackend):
 
             # System prompt
             system_msgs = [m.content for m in messages if m.role == "system"]
-            system_text = "\n\n".join(system_msgs) if system_msgs else _anthropic.NOT_GIVEN
+            system_str = "\n\n".join(system_msgs) if system_msgs else None
 
-            print(f"[AnthropicAPI] model={model}, images={len(images or [])}, "
-                  f"history_len={len(api_messages)-1}",
+            print(f"[AnthropicAPI] model={model}, proxy={bool(base_url)}, "
+                  f"images={len(images or [])}, history_len={len(api_messages)-1}",
                   file=sys.stderr, flush=True)
 
             input_tokens = 0
             output_tokens = 0
 
-            async with client.messages.stream(
-                model=model,
-                max_tokens=8096,
-                system=system_text,
-                messages=api_messages,
-                **({"extra_headers": _extra_headers} if _extra_headers else {}),
-            ) as stream:
-                async for event in stream:
-                    if self._cancelled:
-                        break
+            if base_url:
+                # ── 代理模式：httpx 直接调用，完全控制请求头 ──────────────────
+                # Anthropic SDK 始终发送 x-api-key；MiniMax 等代理要求 Authorization: Bearer
+                req_headers = {
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                    "anthropic-version": "2023-06-01",
+                }
+                req_body: dict = {
+                    "model": model,
+                    "max_tokens": 8096,
+                    "messages": api_messages,
+                    "stream": True,
+                }
+                if system_str:
+                    req_body["system"] = system_str
 
-                    etype = type(event).__name__
+                url = base_url.rstrip("/") + "/messages"
+                async with httpx.AsyncClient(timeout=120.0) as hclient:
+                    async with hclient.stream(
+                        "POST", url, headers=req_headers, json=req_body
+                    ) as resp:
+                        if resp.status_code != 200:
+                            body = await resp.aread()
+                            raise Exception(
+                                f"HTTP {resp.status_code}: {body.decode(errors='replace')}"
+                            )
+                        async for line in resp.aiter_lines():
+                            if self._cancelled:
+                                break
+                            if not line.startswith("data: "):
+                                continue
+                            data_str = line[6:].strip()
+                            if not data_str or data_str == "[DONE]":
+                                continue
+                            try:
+                                evt = json.loads(data_str)
+                            except json.JSONDecodeError:
+                                continue
 
-                    if etype == "RawContentBlockDeltaEvent":
-                        delta = event.delta
-                        dtype = type(delta).__name__
-                        if dtype == "TextDelta":
-                            emit("text_delta", text=delta.text)
-                        elif dtype == "ThinkingDelta":
-                            emit("thinking", text=delta.thinking)
-                        elif dtype == "InputJSONDelta":
-                            emit("tool_input", tool_call={"inputDelta": delta.partial_json})
+                            etype = evt.get("type", "")
+                            if etype == "content_block_delta":
+                                delta = evt.get("delta", {})
+                                dtype = delta.get("type", "")
+                                if dtype == "text_delta":
+                                    emit("text_delta", text=delta.get("text", ""))
+                                elif dtype == "thinking_delta":
+                                    emit("thinking", text=delta.get("thinking", ""))
+                                elif dtype == "input_json_delta":
+                                    emit("tool_input", tool_call={
+                                        "inputDelta": delta.get("partial_json", "")
+                                    })
+                            elif etype == "content_block_start":
+                                block = evt.get("content_block", {})
+                                if block.get("type") == "tool_use":
+                                    emit("tool_start", tool_call={
+                                        "id": block.get("id", ""),
+                                        "name": block.get("name", ""),
+                                        "input": "",
+                                        "status": "running",
+                                    })
+                            elif etype == "message_delta":
+                                output_tokens = evt.get("usage", {}).get(
+                                    "output_tokens", output_tokens
+                                )
+                            elif etype == "message_start":
+                                input_tokens = (
+                                    evt.get("message", {})
+                                    .get("usage", {})
+                                    .get("input_tokens", input_tokens)
+                                )
+            else:
+                # ── 官方 Anthropic：使用 SDK ──────────────────────────────────
+                client = _anthropic.AsyncAnthropic(
+                    **({"api_key": api_key} if api_key else {})
+                )
+                async with client.messages.stream(
+                    model=model,
+                    max_tokens=8096,
+                    system=system_str or _anthropic.NOT_GIVEN,
+                    messages=api_messages,
+                ) as stream:
+                    async for event in stream:
+                        if self._cancelled:
+                            break
 
-                    elif etype == "RawContentBlockStartEvent":
-                        block = event.content_block
-                        btype = type(block).__name__
-                        if btype == "ToolUseBlock":
-                            emit("tool_start", tool_call={
-                                "id": block.id,
-                                "name": block.name,
-                                "input": "",
-                                "status": "running",
-                            })
+                        etype = type(event).__name__
 
-                    elif etype == "RawMessageDeltaEvent":
-                        usage = getattr(event, "usage", None)
-                        if usage:
-                            output_tokens = getattr(usage, "output_tokens", 0)
+                        if etype == "RawContentBlockDeltaEvent":
+                            delta = event.delta
+                            dtype = type(delta).__name__
+                            if dtype == "TextDelta":
+                                emit("text_delta", text=delta.text)
+                            elif dtype == "ThinkingDelta":
+                                emit("thinking", text=delta.thinking)
+                            elif dtype == "InputJSONDelta":
+                                emit("tool_input", tool_call={"inputDelta": delta.partial_json})
 
-                    elif etype == "RawMessageStartEvent":
-                        usage = getattr(event.message, "usage", None)
-                        if usage:
-                            input_tokens = getattr(usage, "input_tokens", 0)
+                        elif etype == "RawContentBlockStartEvent":
+                            block = event.content_block
+                            btype = type(block).__name__
+                            if btype == "ToolUseBlock":
+                                emit("tool_start", tool_call={
+                                    "id": block.id,
+                                    "name": block.name,
+                                    "input": "",
+                                    "status": "running",
+                                })
+
+                        elif etype == "RawMessageDeltaEvent":
+                            usage = getattr(event, "usage", None)
+                            if usage:
+                                output_tokens = getattr(usage, "output_tokens", 0)
+
+                        elif etype == "RawMessageStartEvent":
+                            usage = getattr(event.message, "usage", None)
+                            if usage:
+                                input_tokens = getattr(usage, "input_tokens", 0)
 
             if not self._cancelled:
                 usage_dict: Optional[dict] = None
