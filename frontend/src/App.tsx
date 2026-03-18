@@ -12,12 +12,6 @@ import { themes } from './hooks/useConfig';
 import { messagesToMarkdown, messagesToJson } from './utils/markdown';
 import { hljsLightCss, hljsDarkCss } from './utils/hljsThemes';
 
-function hexToRgba(color: string, alpha: number): string {
-  const m = color.match(/^#([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})/i);
-  if (!m) return color;
-  return `rgba(${parseInt(m[1], 16)},${parseInt(m[2], 16)},${parseInt(m[3], 16)},${alpha.toFixed(2)})`;
-}
-
 export const App: React.FC = () => {
   const [backends, setBackends] = useState<any[]>([]);
   const [sessions, setSessions] = useState<any[]>([]);
@@ -267,7 +261,6 @@ export const App: React.FC = () => {
   const hljsCss = isLightTheme ? hljsLightCss : hljsDarkCss;
 
   const hasBg = !!config.bgImage;
-  const panelAlpha = hasBg ? Math.max(0.05, 1 - config.bgOpacity) : 1;
 
   return (
     <div style={{
@@ -275,27 +268,28 @@ export const App: React.FC = () => {
       background: hasBg ? 'transparent' : theme.bg,
       color: theme.text,
       // ★ CSS Variables for theme colors - child components can use these
-      '--theme-bg': hasBg ? hexToRgba(theme.bg, panelAlpha) : theme.bg,
-      '--theme-bg-secondary': hasBg ? hexToRgba(theme.bgSecondary, panelAlpha) : theme.bgSecondary,
-      '--theme-bg-tertiary': hasBg ? hexToRgba(theme.bgTertiary, panelAlpha) : theme.bgTertiary,
+      '--theme-bg': theme.bg,
+      '--theme-bg-secondary': theme.bgSecondary,
+      '--theme-bg-tertiary': theme.bgTertiary,
       '--theme-border': theme.border,
       '--theme-text': theme.text,
       '--theme-text-muted': theme.textMuted,
       '--theme-accent': theme.accent,
       '--theme-accent-hover': theme.accentHover,
       '--theme-accent-bg': theme.accentBg,
-      '--theme-message-bg': hasBg ? hexToRgba(theme.messageBg, panelAlpha) : theme.messageBg,
-      '--theme-user-message-bg': hasBg ? hexToRgba(theme.userMessageBg, panelAlpha) : theme.userMessageBg,
-      '--theme-code-bg': hasBg ? hexToRgba(theme.codeBg, panelAlpha) : theme.codeBg,
-      '--theme-input-bg': hasBg ? hexToRgba(theme.inputBg, panelAlpha) : theme.inputBg,
-      '--theme-sidebar-bg': hasBg ? hexToRgba(theme.sidebarBg, panelAlpha) : theme.sidebarBg,
+      '--theme-message-bg': theme.messageBg,
+      '--theme-user-message-bg': theme.userMessageBg,
+      '--theme-code-bg': theme.codeBg,
+      '--theme-input-bg': theme.inputBg,
+      '--theme-sidebar-bg': theme.sidebarBg,
     } as React.CSSProperties}>
-      {/* ★ 背景图层 */}
+      {/* ★ 背景图层：图片本身控制透明度，面板背景保持实色 */}
       {hasBg && (
         <div style={{
           position: 'fixed', inset: 0, zIndex: -1, pointerEvents: 'none',
           backgroundImage: `url(${config.bgImage})`,
           backgroundSize: 'cover', backgroundPosition: 'center',
+          opacity: config.bgOpacity,
         }} />
       )}
       {/* ★ highlight.js theme - 随主题切换 */}
