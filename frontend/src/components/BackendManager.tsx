@@ -29,6 +29,13 @@ interface BackendManagerProps {
   sessions?: any[];
 }
 
+function _cleanHeaders(h: Record<string, string> | undefined): Record<string, string> | undefined {
+  if (!h) return undefined;
+  const out: Record<string, string> = {};
+  Object.entries(h).forEach(([k, v]) => { if (k.trim() && v.trim()) out[k.trim()] = v.trim(); });
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
 export const BackendManager: React.FC<BackendManagerProps> = ({
   isOpen,
   onClose,
@@ -52,7 +59,6 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
   const [dependentSessions, setDependentSessions] = useState<any[]>([]);
 
   const handleNewBackend = useCallback(() => {
-    console.log('[BackendManager] handleNewBackend clicked');
     setFormData({
       id: `backend-${Date.now()}`,
       type: 'claude-agent-sdk',
@@ -60,56 +66,50 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
       model: '',
       baseUrl: '',
       apiKey: '',
-      env: {
-        ANTHROPIC_MODEL: '',
-        ANTHROPIC_BASE_URL: '',
-        ANTHROPIC_AUTH_TOKEN: '',
-      },
+      env: {},
     });
     setEditingBackend(null);
     setIsEditing(true);
-    console.log('[BackendManager] isEditing set to true');
   }, []);
 
   const handleEditBackend = useCallback((backend: BackendConfig) => {
-    console.log('[BackendManager] handleEditBackend:', backend);
-    setFormData({
-      ...backend,
-      env: {
-        ANTHROPIC_MODEL: backend.env?.ANTHROPIC_MODEL || '',
-        ANTHROPIC_BASE_URL: backend.env?.ANTHROPIC_BASE_URL || '',
-        ANTHROPIC_AUTH_TOKEN: backend.env?.ANTHROPIC_AUTH_TOKEN || '',
-      },
-    });
+    setFormData({ ...backend, env: backend.env || {} });
     setEditingBackend(backend);
     setIsEditing(true);
   }, []);
 
   const handleSave = useCallback(() => {
-    // Clean up empty env values
-    const cleanedEnv: Record<string, string> = {};
-    if (formData.env) {
-      Object.entries(formData.env).forEach(([key, value]) => {
-        if (value && value.trim()) {
-          cleanedEnv[key] = value.trim();
-        }
+    const saved: BackendConfig = {
+      id: formData.id,
+      type: formData.type,
+      label: formData.label,
+    };
+
+    if (formData.type === 'claude-agent-sdk') {
+      // Only env vars + skipPermissions matter
+      const cleanedEnv: Record<string, string> = {};
+      Object.entries(formData.env || {}).forEach(([k, v]) => {
+        if (v && v.trim()) cleanedEnv[k] = v.trim();
       });
+      if (Object.keys(cleanedEnv).length > 0) saved.env = cleanedEnv;
+      saved.skipPermissions = formData.skipPermissions !== false;
+    } else if (formData.type === 'openai-compatible') {
+      // base_url, api_key, model, extra_headers
+      if (formData.baseUrl?.trim()) saved.baseUrl = formData.baseUrl.trim();
+      if (formData.apiKey?.trim()) saved.apiKey = formData.apiKey.trim();
+      if (formData.model?.trim()) saved.model = formData.model.trim();
+      const headers = _cleanHeaders(formData.extraHeaders);
+      if (headers) saved.extraHeaders = headers;
+    } else if (formData.type === 'anthropic-api') {
+      // api_key, base_url, model, extra_headers
+      if (formData.apiKey?.trim()) saved.apiKey = formData.apiKey.trim();
+      if (formData.model?.trim()) saved.model = formData.model.trim();
+      if (formData.baseUrl?.trim()) saved.baseUrl = formData.baseUrl.trim();
+      const headers = _cleanHeaders(formData.extraHeaders);
+      if (headers) saved.extraHeaders = headers;
     }
 
-    const cleanedExtraHeaders: Record<string, string> = {};
-    if (formData.extraHeaders) {
-      Object.entries(formData.extraHeaders).forEach(([key, value]) => {
-        if (key.trim() && value && value.trim()) {
-          cleanedExtraHeaders[key.trim()] = value.trim();
-        }
-      });
-    }
-
-    onSaveBackend({
-      ...formData,
-      env: Object.keys(cleanedEnv).length > 0 ? cleanedEnv : undefined,
-      extraHeaders: Object.keys(cleanedExtraHeaders).length > 0 ? cleanedExtraHeaders : undefined,
-    });
+    onSaveBackend(saved);
     setIsEditing(false);
     onClose();
   }, [formData, onSaveBackend, onClose]);
@@ -188,9 +188,18 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
                       </div>
                       <div style={{ fontSize: 11, color: 'var(--theme-text-muted)' }}>
                         {backend.type}
-                        {backend.model && <span> · Model: {backend.model}</span>}
-                        {backend.env?.ANTHROPIC_MODEL && (
-                          <span> · Env Model: {backend.env.ANTHROPIC_MODEL}</span>
+                        {/* Show model info per type */}
+                        {backend.type === 'claude-agent-sdk' && backend.env?.ANTHROPIC_MODEL && (
+                          <span> · {backend.env.ANTHROPIC_MODEL}</span>
+                        )}
+                        {(backend.type === 'openai-compatible' || backend.type === 'anthropic-api') && backend.model && (
+                          <span> · {backend.model}</span>
+                        )}
+                        {backend.baseUrl && (
+                          <span> · {backend.baseUrl.replace(/^https?:\/\//, '').split('/')[0]}</span>
+                        )}
+                        {backend.type === 'claude-agent-sdk' && backend.env?.ANTHROPIC_BASE_URL && (
+                          <span> · {backend.env.ANTHROPIC_BASE_URL.replace(/^https?:\/\//, '').split('/')[0]}</span>
                         )}
                       </div>
                     </div>
@@ -243,7 +252,21 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
               <div style={selectWrapperStyle}>
                 <select
                   value={formData.type}
-                  onChange={(e) => setFormData({ ...formData, type: e.target.value })}
+                  onChange={(e) => {
+                    // Reset type-specific fields when switching types
+                    const newType = e.target.value;
+                    setFormData({
+                      ...formData,
+                      type: newType,
+                      // Clear type-specific fields on switch
+                      model: '',
+                      baseUrl: '',
+                      apiKey: '',
+                      env: {},
+                      extraHeaders: undefined,
+                      skipPermissions: newType === 'claude-agent-sdk' ? true : undefined,
+                    });
+                  }}
                   style={selectStyle}
                 >
                   <option value="claude-agent-sdk">Claude Agent SDK</option>
@@ -253,130 +276,211 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
               </div>
             </div>
 
-            {/* 环境变量配置 */}
-            <div style={{ marginBottom: 16, padding: 12, background: 'var(--theme-bg-secondary)', borderRadius: 8 }}>
-              <label style={{ ...labelStyle, marginBottom: 8 }}>
-                Environment Variables (Per-Backend)
-              </label>
-              <p style={{ fontSize: 11, color: 'var(--theme-text-muted)', margin: '0 0 12px 0' }}>
-                These override global environment variables for this specific backend.
-              </p>
-
-              <div style={{ marginBottom: 10 }}>
-                <label style={{ fontSize: 11, color: 'var(--theme-text)', display: 'block', marginBottom: 4 }}>
-                  ANTHROPIC_MODEL
-                </label>
-                <input
-                  type="text"
-                  value={formData.env?.ANTHROPIC_MODEL || ''}
-                  onChange={(e) => handleEnvChange('ANTHROPIC_MODEL', e.target.value)}
-                  style={inputStyle}
-                  placeholder="e.g., claude-sonnet-4-5-20251022"
-                />
-              </div>
-
-              <div style={{ marginBottom: 10 }}>
-                <label style={{ fontSize: 11, color: 'var(--theme-text)', display: 'block', marginBottom: 4 }}>
-                  ANTHROPIC_BASE_URL
-                </label>
-                <input
-                  type="text"
-                  value={formData.env?.ANTHROPIC_BASE_URL || ''}
-                  onChange={(e) => handleEnvChange('ANTHROPIC_BASE_URL', e.target.value)}
-                  style={inputStyle}
-                  placeholder="e.g., https://api.anthropic.com"
-                />
-              </div>
-
-              <div style={{ marginBottom: 10 }}>
-                <label style={{ fontSize: 11, color: 'var(--theme-text)', display: 'block', marginBottom: 4 }}>
-                  ANTHROPIC_AUTH_TOKEN
-                </label>
-                <input
-                  type="password"
-                  value={formData.env?.ANTHROPIC_AUTH_TOKEN || ''}
-                  onChange={(e) => handleEnvChange('ANTHROPIC_AUTH_TOKEN', e.target.value)}
-                  style={inputStyle}
-                  placeholder="sk-ant-..."
-                />
-              </div>
-            </div>
-
-            {/* Skip Permissions - 仅 claude-agent-sdk 支持 */}
+            {/* ── Claude Agent SDK 专属配置 ── */}
             {formData.type === 'claude-agent-sdk' && (
-              <div style={{ marginBottom: 16 }}>
-                <label style={{ ...labelStyle, display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer', marginBottom: 0 }}>
-                  <input
-                    type="checkbox"
-                    checked={formData.skipPermissions !== false}
-                    onChange={(e) => setFormData({ ...formData, skipPermissions: e.target.checked })}
-                    style={{ accentColor: 'var(--theme-accent)', width: 14, height: 14, flexShrink: 0 }}
-                  />
-                  Skip Permissions (bypassPermissions mode)
-                </label>
-                <p style={{ fontSize: 11, color: 'var(--theme-text-muted)', margin: '4px 0 0 22px' }}>
-                  启用后 Claude 可直接调用工具，无需逐条确认。
+              <div style={{ marginBottom: 16, padding: 12, background: 'var(--theme-bg-secondary)', borderRadius: 8 }}>
+                <label style={{ ...labelStyle, marginBottom: 8 }}>Claude Agent SDK 配置</label>
+                <p style={{ fontSize: 11, color: 'var(--theme-text-muted)', margin: '0 0 12px 0' }}>
+                  通过环境变量配置 Claude CLI，留空则使用全局 ~/.claude/settings.json 配置。
                 </p>
+
+                <div style={{ marginBottom: 10 }}>
+                  <label style={{ fontSize: 11, color: 'var(--theme-text)', display: 'block', marginBottom: 4 }}>
+                    ANTHROPIC_AUTH_TOKEN
+                  </label>
+                  <input
+                    type="password"
+                    value={formData.env?.ANTHROPIC_AUTH_TOKEN || ''}
+                    onChange={(e) => handleEnvChange('ANTHROPIC_AUTH_TOKEN', e.target.value)}
+                    style={inputStyle}
+                    placeholder="sk-ant-... （留空使用全局配置）"
+                  />
+                </div>
+
+                <div style={{ marginBottom: 10 }}>
+                  <label style={{ fontSize: 11, color: 'var(--theme-text)', display: 'block', marginBottom: 4 }}>
+                    ANTHROPIC_MODEL
+                  </label>
+                  <input
+                    type="text"
+                    value={formData.env?.ANTHROPIC_MODEL || ''}
+                    onChange={(e) => handleEnvChange('ANTHROPIC_MODEL', e.target.value)}
+                    style={inputStyle}
+                    placeholder="e.g., claude-sonnet-4-6（留空由 CLI 自动决定）"
+                  />
+                </div>
+
+                <div style={{ marginBottom: 10 }}>
+                  <label style={{ fontSize: 11, color: 'var(--theme-text)', display: 'block', marginBottom: 4 }}>
+                    ANTHROPIC_BASE_URL（代理地址，可选）
+                  </label>
+                  <input
+                    type="text"
+                    value={formData.env?.ANTHROPIC_BASE_URL || ''}
+                    onChange={(e) => handleEnvChange('ANTHROPIC_BASE_URL', e.target.value)}
+                    style={inputStyle}
+                    placeholder="e.g., https://your-proxy.com（留空使用官方 API）"
+                  />
+                </div>
+
+                <div style={{ marginTop: 12 }}>
+                  <label style={{ ...labelStyle, display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer', marginBottom: 0 }}>
+                    <input
+                      type="checkbox"
+                      checked={formData.skipPermissions !== false}
+                      onChange={(e) => setFormData({ ...formData, skipPermissions: e.target.checked })}
+                      style={{ accentColor: 'var(--theme-accent)', width: 14, height: 14, flexShrink: 0 }}
+                    />
+                    Skip Permissions (bypassPermissions 模式)
+                  </label>
+                  <p style={{ fontSize: 11, color: 'var(--theme-text-muted)', margin: '4px 0 0 22px' }}>
+                    启用后 Claude 可直接调用工具，无需逐条确认。
+                  </p>
+                </div>
               </div>
             )}
 
-            {/* For OpenAI Compatible backends */}
+            {/* ── OpenAI Compatible 专属配置 ── */}
             {formData.type === 'openai-compatible' && (
-              <>
-                <div style={{ marginBottom: 16 }}>
-                  <label style={labelStyle}>Base URL</label>
+              <div style={{ marginBottom: 16, padding: 12, background: 'var(--theme-bg-secondary)', borderRadius: 8 }}>
+                <label style={{ ...labelStyle, marginBottom: 8 }}>OpenAI Compatible 配置</label>
+                <p style={{ fontSize: 11, color: 'var(--theme-text-muted)', margin: '0 0 12px 0' }}>
+                  兼容 OpenAI Chat Completions API 的服务（OpenAI、通义、DeepSeek、Ollama 等）。
+                </p>
+
+                <div style={{ marginBottom: 10 }}>
+                  <label style={{ fontSize: 11, color: 'var(--theme-text)', display: 'block', marginBottom: 4 }}>
+                    Base URL <span style={{ color: 'rgba(239,68,68,0.8)' }}>*</span>
+                  </label>
                   <input
                     type="text"
-                    value={formData.baseUrl}
+                    value={formData.baseUrl || ''}
                     onChange={(e) => setFormData({ ...formData, baseUrl: e.target.value })}
                     style={inputStyle}
                     placeholder="https://api.openai.com/v1"
                   />
                 </div>
 
-                <div style={{ marginBottom: 16 }}>
-                  <label style={labelStyle}>API Key</label>
+                <div style={{ marginBottom: 10 }}>
+                  <label style={{ fontSize: 11, color: 'var(--theme-text)', display: 'block', marginBottom: 4 }}>
+                    API Key
+                  </label>
                   <input
                     type="password"
-                    value={formData.apiKey}
+                    value={formData.apiKey || ''}
                     onChange={(e) => setFormData({ ...formData, apiKey: e.target.value })}
                     style={inputStyle}
                     placeholder="sk-..."
                   />
                 </div>
-              </>
+
+                <div style={{ marginBottom: 10 }}>
+                  <label style={{ fontSize: 11, color: 'var(--theme-text)', display: 'block', marginBottom: 4 }}>
+                    Model <span style={{ color: 'rgba(239,68,68,0.8)' }}>*</span>
+                  </label>
+                  <input
+                    type="text"
+                    value={formData.model || ''}
+                    onChange={(e) => setFormData({ ...formData, model: e.target.value })}
+                    style={inputStyle}
+                    placeholder="e.g., gpt-4o / deepseek-chat / qwen-plus"
+                  />
+                </div>
+
+                <div style={{ marginBottom: 0 }}>
+                  <label style={{ fontSize: 11, color: 'var(--theme-text)', display: 'block', marginBottom: 4 }}>
+                    Extra HTTP Headers（可选，每行 Key: Value）
+                  </label>
+                  <textarea
+                    value={Object.entries(formData.extraHeaders || {}).map(([k, v]) => `${k}: ${v}`).join('\n')}
+                    onChange={(e) => {
+                      const headers: Record<string, string> = {};
+                      e.target.value.split('\n').forEach(line => {
+                        const idx = line.indexOf(':');
+                        if (idx > 0) {
+                          const key = line.slice(0, idx).trim();
+                          const val = line.slice(idx + 1).trim();
+                          if (key) headers[key] = val;
+                        }
+                      });
+                      setFormData({ ...formData, extraHeaders: headers });
+                    }}
+                    style={{ ...inputStyle, height: 70, resize: 'vertical', fontFamily: 'monospace', fontSize: 12 }}
+                    placeholder={'Authorization: Bearer token\nX-Custom-Header: value'}
+                  />
+                </div>
+              </div>
             )}
 
-            {/* Extra HTTP Headers - 用于代理/中继服务需要自定义头的场景 */}
-            {(formData.type === 'anthropic-api' || formData.type === 'openai-compatible') && (
+            {/* ── Anthropic API 专属配置 ── */}
+            {formData.type === 'anthropic-api' && (
               <div style={{ marginBottom: 16, padding: 12, background: 'var(--theme-bg-secondary)', borderRadius: 8 }}>
-                <label style={{ ...labelStyle, marginBottom: 4 }}>Extra HTTP Headers</label>
-                <p style={{ fontSize: 11, color: 'var(--theme-text-muted)', margin: '0 0 10px 0' }}>
-                  为代理/中继服务添加自定义请求头（如 MM-Group-Id）。每行一个，格式：Header-Name: value
+                <label style={{ ...labelStyle, marginBottom: 8 }}>Anthropic API 配置</label>
+                <p style={{ fontSize: 11, color: 'var(--theme-text-muted)', margin: '0 0 12px 0' }}>
+                  直接调用 Anthropic Messages API（支持代理地址）。
                 </p>
-                <textarea
-                  value={Object.entries(formData.extraHeaders || {}).map(([k, v]) => `${k}: ${v}`).join('\n')}
-                  onChange={(e) => {
-                    const headers: Record<string, string> = {};
-                    e.target.value.split('\n').forEach(line => {
-                      const idx = line.indexOf(':');
-                      if (idx > 0) {
-                        const key = line.slice(0, idx).trim();
-                        const val = line.slice(idx + 1).trim();
-                        if (key) headers[key] = val;
-                      }
-                    });
-                    setFormData({ ...formData, extraHeaders: headers });
-                  }}
-                  style={{
-                    ...inputStyle,
-                    height: 80,
-                    resize: 'vertical',
-                    fontFamily: 'monospace',
-                    fontSize: 12,
-                  }}
-                  placeholder={'MM-Group-Id: 123456789\nX-Custom-Header: value'}
-                />
+
+                <div style={{ marginBottom: 10 }}>
+                  <label style={{ fontSize: 11, color: 'var(--theme-text)', display: 'block', marginBottom: 4 }}>
+                    API Key <span style={{ color: 'rgba(239,68,68,0.8)' }}>*</span>
+                  </label>
+                  <input
+                    type="password"
+                    value={formData.apiKey || ''}
+                    onChange={(e) => setFormData({ ...formData, apiKey: e.target.value })}
+                    style={inputStyle}
+                    placeholder="sk-ant-..."
+                  />
+                </div>
+
+                <div style={{ marginBottom: 10 }}>
+                  <label style={{ fontSize: 11, color: 'var(--theme-text)', display: 'block', marginBottom: 4 }}>
+                    Model <span style={{ color: 'rgba(239,68,68,0.8)' }}>*</span>
+                  </label>
+                  <input
+                    type="text"
+                    value={formData.model || ''}
+                    onChange={(e) => setFormData({ ...formData, model: e.target.value })}
+                    style={inputStyle}
+                    placeholder="e.g., claude-sonnet-4-6"
+                  />
+                </div>
+
+                <div style={{ marginBottom: 10 }}>
+                  <label style={{ fontSize: 11, color: 'var(--theme-text)', display: 'block', marginBottom: 4 }}>
+                    Base URL（代理地址，可选）
+                  </label>
+                  <input
+                    type="text"
+                    value={formData.baseUrl || ''}
+                    onChange={(e) => setFormData({ ...formData, baseUrl: e.target.value })}
+                    style={inputStyle}
+                    placeholder="留空使用官方 https://api.anthropic.com"
+                  />
+                </div>
+
+                <div style={{ marginBottom: 0 }}>
+                  <label style={{ fontSize: 11, color: 'var(--theme-text)', display: 'block', marginBottom: 4 }}>
+                    Extra HTTP Headers（可选，每行 Key: Value）
+                  </label>
+                  <textarea
+                    value={Object.entries(formData.extraHeaders || {}).map(([k, v]) => `${k}: ${v}`).join('\n')}
+                    onChange={(e) => {
+                      const headers: Record<string, string> = {};
+                      e.target.value.split('\n').forEach(line => {
+                        const idx = line.indexOf(':');
+                        if (idx > 0) {
+                          const key = line.slice(0, idx).trim();
+                          const val = line.slice(idx + 1).trim();
+                          if (key) headers[key] = val;
+                        }
+                      });
+                      setFormData({ ...formData, extraHeaders: headers });
+                    }}
+                    style={{ ...inputStyle, height: 70, resize: 'vertical', fontFamily: 'monospace', fontSize: 12 }}
+                    placeholder={'MM-Group-Id: 123456789\nX-Custom-Header: value'}
+                  />
+                </div>
               </div>
             )}
 
