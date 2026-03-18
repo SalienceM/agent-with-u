@@ -419,18 +419,32 @@ class OpenAICompatibleBackend(ModelBackend):
         try:
             api_messages = []
             for m in messages:
-                if m.role != "system":
+                if m.role == "system":
+                    continue
+                if m.images:
+                    # 历史消息含图片，重建 multimodal content 块
+                    blocks: list[dict] = []
+                    for img in m.images:
+                        if img.base64:
+                            blocks.append({
+                                "type": "image_url",
+                                "image_url": {"url": f"data:{img.mime_type};base64,{img.base64}"},
+                            })
+                    blocks.append({"type": "text", "text": m.content})
+                    api_messages.append({"role": m.role, "content": blocks})
+                else:
                     api_messages.append({"role": m.role, "content": m.content})
 
-            current_content = []
+            current_content: list[dict] = []
             if images:
                 for img in images:
-                    current_content.append({
-                        "type": "image_url",
-                        "image_url": {
-                            "url": f"data:{img.mime_type};base64,{img.base64}"
-                        },
-                    })
+                    if img.base64:
+                        current_content.append({
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:{img.mime_type};base64,{img.base64}"
+                            },
+                        })
             current_content.append({"type": "text", "text": content})
             api_messages.append({"role": "user", "content": current_content})
 
