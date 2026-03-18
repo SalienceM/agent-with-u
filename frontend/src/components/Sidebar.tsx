@@ -13,6 +13,7 @@ interface Session {
 interface Backend {
   id: string;
   label: string;
+  type: string;
 }
 
 interface Props {
@@ -82,6 +83,25 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
     return label.split(' ')[0];
   }, [backends]);
 
+  const getBackendType = useCallback((backendId: string): string => {
+    const backend = backends.find((b) => b.id === backendId);
+    return backend?.type ?? '';
+  }, [backends]);
+
+  const getTypeLabel = (type: string): string => {
+    if (type === 'claude-agent-sdk') return 'Agent SDK';
+    if (type === 'openai-compatible') return 'OpenAI';
+    if (type === 'anthropic-api') return 'Anthropic';
+    return type;
+  };
+
+  const getTypeColor = (type: string): string => {
+    if (type === 'claude-agent-sdk') return '#6366f1';   // indigo
+    if (type === 'openai-compatible') return '#10b981';  // emerald
+    if (type === 'anthropic-api') return '#f59e0b';      // amber
+    return '#94a3b8';
+  };
+
   const formatWorkingDir = useCallback((dir: string): string => {
     if (!dir) return 'Not set';
     if (dir === '.') return '(current dir)';
@@ -140,16 +160,32 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
               <span style={{ fontSize: 10, color: 'var(--theme-text-muted, #656d76)' }}>
                 {s.messageCount} msgs
               </span>
-              {/* Model badge */}
-              <span
-                style={{
-                  ...backendBadgeStyle,
-                  background: getBackendBadgeColor(s.backendId),
-                }}
-                title={getBackendShortLabel(s.backendId)}
-              >
-                {getBackendShortLabel(s.backendId)}
-              </span>
+              <div style={{ display: 'flex', gap: 4, alignItems: 'center' }}>
+                {/* Backend type badge */}
+                {(() => {
+                  const btype = getBackendType(s.backendId);
+                  return btype ? (
+                    <span style={{
+                      fontSize: 9, padding: '1px 5px', borderRadius: 3, fontWeight: 600,
+                      color: getTypeColor(btype),
+                      background: getTypeColor(btype) + '22',
+                      border: `1px solid ${getTypeColor(btype)}55`,
+                    }}>
+                      {getTypeLabel(btype)}
+                    </span>
+                  ) : null;
+                })()}
+                {/* Backend name badge */}
+                <span
+                  style={{
+                    ...backendBadgeStyle,
+                    background: getBackendBadgeColor(s.backendId),
+                  }}
+                  title={getBackendShortLabel(s.backendId)}
+                >
+                  {getBackendShortLabel(s.backendId)}
+                </span>
+              </div>
             </div>
             <div style={{ position: 'absolute', top: 8, right: 8, display: 'flex', gap: 2, opacity: hoveredSessionId === s.id ? 1 : 0, transition: 'opacity 0.15s' }}>
               <button
