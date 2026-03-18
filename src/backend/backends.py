@@ -539,13 +539,14 @@ class AnthropicAPIBackend(ModelBackend):
                 client_kwargs["api_key"] = api_key
             if base_url:
                 client_kwargs["base_url"] = base_url
-                # 中转代理通常要求 Authorization: Bearer 格式（而非官方的 x-api-key）
-                if api_key:
-                    client_kwargs["default_headers"] = {
-                        "Authorization": f"Bearer {api_key}"
-                    }
 
             client = _anthropic.AsyncAnthropic(**client_kwargs)
+
+            # 中转代理需要 Authorization: Bearer（官方走 x-api-key）
+            # 用 extra_headers 逐请求注入，比 default_headers 更可靠
+            _extra_headers: dict = {}
+            if base_url and api_key:
+                _extra_headers["Authorization"] = f"Bearer {api_key}"
 
             # Build conversation history
             api_messages: list[dict] = []
@@ -621,6 +622,7 @@ class AnthropicAPIBackend(ModelBackend):
                 max_tokens=8096,
                 system=system_text,
                 messages=api_messages,
+                **({"extra_headers": _extra_headers} if _extra_headers else {}),
             ) as stream:
                 async for event in stream:
                     if self._cancelled:
