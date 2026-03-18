@@ -134,6 +134,47 @@ def patch_npm_path():
             os.environ["PATH"] = npm_bin + os.pathsep + os.environ.get("PATH", "")
 
 
+def _kill_port_owner(port: int) -> bool:
+    """
+    杀掉占用 port 的进程。
+    仅在 bind 失败后调用，避免误杀正常实例。
+    返回 True 表示成功发送了 SIGTERM/taskkill。
+    """
+    import signal as _signal
+
+    try:
+        if sys.platform == "win32":
+            import subprocess
+            # netstat 找 PID
+            out = subprocess.check_output(
+                ["netstat", "-ano"],
+                text=True, errors="replace"
+            )
+            for line in out.splitlines():
+                if f":{port}" in line and "LISTENING" in line:
+                    parts = line.split()
+                    pid = int(parts[-1])
+                    if pid and pid != os.getpid():
+                        subprocess.call(["taskkill", "/F", "/PID", str(pid)])
+                        logging.warning(f"[ws_main] Killed PID {pid} that was holding port {port}")
+                        return True
+        else:
+            import subprocess
+            out = subprocess.check_output(
+                ["lsof", "-t", "-i", f"TCP:{port}"],
+                text=True, errors="replace"
+            ).strip()
+            for pid_str in out.splitlines():
+                pid = int(pid_str)
+                if pid and pid != os.getpid():
+                    os.kill(pid, _signal.SIGTERM)
+                    logging.warning(f"[ws_main] Killed PID {pid} that was holding port {port}")
+                    return True
+    except Exception as e:
+        logging.warning(f"[ws_main] Could not kill port owner: {e}")
+    return False
+
+
 async def main():
     log_file = setup_logging()
     logging.info(f"[ws_main] Log file: {log_file}")
@@ -144,10 +185,26 @@ async def main():
     cli_path = find_bundled_claude()
     bridge = BridgeWS(cli_path=cli_path)
 
-    print(f"[ws_main] Starting WebSocket server on ws://{WS_HOST}:{WS_PORT}", file=sys.stderr, flush=True)
+    logging.info(f"[ws_main] Starting WebSocket server on ws://{WS_HOST}:{WS_PORT}")
 
-    async with websockets.serve(bridge.handle_client, WS_HOST, WS_PORT):
-        print(f"[ws_main] Ready.", file=sys.stderr, flush=True)
+    for attempt in range(3):
+        try:
+            server = await websockets.serve(bridge.handle_client, WS_HOST, WS_PORT)
+            break
+        except OSError as e:
+            if e.errno in (98, 10048) and attempt < 2:  # EADDRINUSE (Linux=98, Win=10048)
+                logging.warning(f"[ws_main] Port {WS_PORT} in use (attempt {attempt+1}), trying to free it…")
+                _kill_port_owner(WS_PORT)
+                await asyncio.sleep(1.5)
+            else:
+                logging.error(f"[ws_main] Cannot bind port {WS_PORT}: {e}")
+                raise
+    else:
+        logging.error(f"[ws_main] Giving up after 3 attempts.")
+        sys.exit(1)
+
+    logging.info("[ws_main] Ready.")
+    async with server:
         await asyncio.Future()  # 永久运行直到进程被终止
 
 
