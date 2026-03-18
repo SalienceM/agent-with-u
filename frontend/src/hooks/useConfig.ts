@@ -159,22 +159,25 @@ export function useConfig() {
     });
   }, []);
 
-  // Debounced save: sliders may fire many events; wait 400ms after last change
+  // Debounced save: sliders may fire many events; wait 400ms after last change.
+  // Non-bgImage saves strip bgImage from the payload (backend retains it on disk).
   const scheduleSave = useCallback((cfg: AppConfig) => {
     if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
     saveTimerRef.current = setTimeout(() => {
-      api.setAppConfig(cfg).catch(console.error);
+      const { bgImage: _omit, ...rest } = cfg;
+      api.setAppConfig(rest).catch(console.error);
     }, 400);
   }, []);
 
   const updateConfig = useCallback((patch: Partial<AppConfig>) => {
     setConfig((prev) => {
       const newConfig = { ...prev, ...patch };
-      // bgImage changes save immediately; other changes are debounced
       if ('bgImage' in patch) {
+        // bgImage changes: send full config immediately so image is saved
         if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
         api.setAppConfig(newConfig).catch(console.error);
       } else {
+        // Other changes: debounced, and omit bgImage from payload
         scheduleSave(newConfig);
       }
       return newConfig;

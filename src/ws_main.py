@@ -236,7 +236,7 @@ async def main():
 
     logging.info(f"[ws_main] Starting WebSocket server on ws://{WS_HOST}:{WS_PORT}")
     try:
-        server = await websockets.serve(bridge.handle_client, WS_HOST, WS_PORT)
+        server = await websockets.serve(bridge.handle_client, WS_HOST, WS_PORT, max_size=50 * 1024 * 1024)  # 50MB，支持大图片 base64
     except OSError as e:
         logging.error(f"[ws_main] Cannot bind port {WS_PORT} even after clearing old instance: {e}")
         sys.exit(1)

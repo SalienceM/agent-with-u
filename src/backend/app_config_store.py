@@ -80,6 +80,17 @@ class AppConfigStore:
         return self._config.copy()
 
     def set_all(self, config: dict):
-        """Replace all config values and save."""
-        self._config = config.copy()
+        """Replace all config values and save.
+
+        If 'bgImage' key is absent from config, the existing bgImage is preserved
+        (allows sliders to save without re-transmitting the image data).
+        If 'bgImage' is present (even as empty string), it is updated.
+        """
+        if 'bgImage' not in config and 'bgImage' in self._config:
+            # Patch mode: preserve existing bgImage
+            merged = config.copy()
+            merged['bgImage'] = self._config['bgImage']
+            self._config = merged
+        else:
+            self._config = config.copy()
         self._save()
