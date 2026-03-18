@@ -557,16 +557,23 @@ class AnthropicAPIBackend(ModelBackend):
                             import base64 as _b64
                             with open(img.file_path, "rb") as f:
                                 img_b64 = _b64.b64encode(f.read()).decode("ascii")
-                        blocks.append({
-                            "type": "image",
-                            "source": {
-                                "type": "base64",
-                                "media_type": img.mime_type,
-                                "data": img_b64,
-                            },
-                        })
-                    blocks.append({"type": "text", "text": m.content})
+                        if img_b64:  # skip broken image attachments
+                            blocks.append({
+                                "type": "image",
+                                "source": {
+                                    "type": "base64",
+                                    "media_type": img.mime_type,
+                                    "data": img_b64,
+                                },
+                            })
+                    if m.content:  # only add text block if non-empty
+                        blocks.append({"type": "text", "text": m.content})
+                    if not blocks:
+                        continue  # skip message with no valid content
                     msg_content = blocks
+                elif not m.content:
+                    # Skip empty text messages (e.g. interrupted assistant streams)
+                    continue
                 api_messages.append({"role": m.role, "content": msg_content})
 
             # Build current user message (text + optional images)
@@ -578,15 +585,19 @@ class AnthropicAPIBackend(ModelBackend):
                         import base64 as _b64
                         with open(img.file_path, "rb") as f:
                             img_b64 = _b64.b64encode(f.read()).decode("ascii")
-                    current_blocks.append({
-                        "type": "image",
-                        "source": {
-                            "type": "base64",
-                            "media_type": img.mime_type,
-                            "data": img_b64,
-                        },
-                    })
-            current_blocks.append({"type": "text", "text": content})
+                    if img_b64:  # skip broken image attachments
+                        current_blocks.append({
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": img.mime_type,
+                                "data": img_b64,
+                            },
+                        })
+            if content:  # only add text block if non-empty
+                current_blocks.append({"type": "text", "text": content})
+            if not current_blocks:
+                current_blocks.append({"type": "text", "text": "(image)"})
             api_messages.append({"role": "user", "content": current_blocks})
 
             # System prompt
