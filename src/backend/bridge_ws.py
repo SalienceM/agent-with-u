@@ -410,7 +410,12 @@ class BridgeWS:
         backend_id = payload["backendId"]
         raw_images = payload.get("images")
         auto_continue = payload.get("autoContinue", True)
-        skip_permissions = payload.get("skipPermissions", True)
+        # skip_permissions 优先级：前端 payload 显式值 > backend 配置 > 默认 True
+        if "skipPermissions" in payload:
+            skip_permissions = bool(payload["skipPermissions"])
+        else:
+            backend_cfg = next((c for c in self._backend_configs if c.id == backend_id), None)
+            skip_permissions = getattr(backend_cfg, "skip_permissions", True)
         working_dir = payload.get("workingDir")
 
         images = [ImageAttachment(**img) for img in raw_images] if raw_images else None

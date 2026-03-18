@@ -92,6 +92,14 @@ export const App: React.FC = () => {
   // Phase 2: 每 Session 独立的模型配置
   const activeBackendId = activeSession?.backendId || backends[0]?.id || '';
 
+  /* ---- 切换 backend 时同步 skipPermissions 默认值 ---- */
+  useEffect(() => {
+    const activeBackend = backends.find((b) => b.id === activeBackendId);
+    if (activeBackend) {
+      setSkipPermissions(activeBackend.skipPermissions !== false);
+    }
+  }, [activeBackendId, backends]);
+
   const chat = useChat(activeSessionId || '', activeBackendId, backends, skipPermissions);
 
   // ★ Sync per-session streaming state
