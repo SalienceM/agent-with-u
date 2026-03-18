@@ -20,6 +20,12 @@ from ..types import (
 )
 
 
+def _exc_msg(e: Exception) -> str:
+    """Return a non-empty error message for any exception."""
+    msg = str(e).strip()
+    return msg if msg else f"{type(e).__name__}"
+
+
 class StreamDelta:
     """
     A single streaming event pushed to the frontend.
@@ -388,7 +394,7 @@ class ClaudeAgentBackend(ModelBackend):
         except Exception as e:
             import traceback
             traceback.print_exc()
-            emit("error", error=str(e))
+            emit("error", error=_exc_msg(e))
             emit("done")
             return {"agentSessionId": agent_sid}
 
@@ -491,7 +497,7 @@ class OpenAICompatibleBackend(ModelBackend):
 
         except Exception as e:
             if not self._cancelled:
-                emit("error", error=str(e))
+                emit("error", error=_exc_msg(e))
             return {}
 
 
@@ -760,7 +766,7 @@ class AnthropicAPIBackend(ModelBackend):
             if not self._cancelled:
                 import traceback
                 traceback.print_exc()
-                emit("error", error=str(e))
+                emit("error", error=_exc_msg(e))
                 emit("done")
             return {}
 
