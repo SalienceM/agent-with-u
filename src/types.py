@@ -30,6 +30,7 @@ class ModelBackendConfig:
     # ★ Per-backend environment variables for ANTHROPIC_* settings
     env: Optional[dict[str, str]] = None  # {ANTHROPIC_MODEL, ANTHROPIC_BASE_URL, ANTHROPIC_AUTH_TOKEN}
     cli_path: Optional[str] = None  # Override path to claude CLI binary
+    extra_headers: Optional[dict[str, str]] = None  # Custom HTTP headers for proxy/relay backends
 
     def to_dict(self) -> dict:
         d = asdict(self)

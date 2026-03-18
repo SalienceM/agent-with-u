@@ -37,6 +37,7 @@ class BackendStore:
                         allowed_tools=item.get("allowedTools"),
                         skip_permissions=item.get("skipPermissions", True),
                         env=item.get("env"),
+                        extra_headers=item.get("extraHeaders"),
                     )
                     self._configs[config.id] = config
                 print(f"[BackendStore] Loaded {len(self._configs)} backend configs", flush=True)
@@ -68,6 +69,7 @@ class BackendStore:
             "allowedTools": config.allowed_tools,
             "skipPermissions": config.skip_permissions,
             "env": config.env,
+            "extraHeaders": config.extra_headers,
         }
 
     def list(self) -> list[ModelBackendConfig]:
@@ -123,6 +125,7 @@ class BackendStore:
                     allowed_tools=item.get("allowedTools"),
                     skip_permissions=item.get("skipPermissions", True),
                     env=item.get("env"),
+                    extra_headers=item.get("extraHeaders"),
                 )
                 self._configs[config.id] = config
             # Save to disk

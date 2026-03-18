@@ -750,6 +750,7 @@ class Bridge(QObject):
             allowed_tools=data.get("allowedTools"),
             skip_permissions=data.get("skipPermissions", True),
             env=data.get("env"),  # ★ Per-backend environment variables
+            extra_headers=data.get("extraHeaders"),  # ★ Custom HTTP headers for proxy backends
         )
         # Save to persistent storage
         self._backend_store.save(config)

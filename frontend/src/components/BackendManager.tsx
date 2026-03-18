@@ -17,6 +17,7 @@ interface BackendConfig {
   allowedTools?: string[];
   skipPermissions?: boolean;
   env?: Record<string, string>;
+  extraHeaders?: Record<string, string>;
 }
 
 interface BackendManagerProps {
@@ -95,9 +96,19 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
       });
     }
 
+    const cleanedExtraHeaders: Record<string, string> = {};
+    if (formData.extraHeaders) {
+      Object.entries(formData.extraHeaders).forEach(([key, value]) => {
+        if (key.trim() && value && value.trim()) {
+          cleanedExtraHeaders[key.trim()] = value.trim();
+        }
+      });
+    }
+
     onSaveBackend({
       ...formData,
       env: Object.keys(cleanedEnv).length > 0 ? cleanedEnv : undefined,
+      extraHeaders: Object.keys(cleanedExtraHeaders).length > 0 ? cleanedExtraHeaders : undefined,
     });
     setIsEditing(false);
     onClose();
@@ -334,6 +345,39 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
                   />
                 </div>
               </>
+            )}
+
+            {/* Extra HTTP Headers - 用于代理/中继服务需要自定义头的场景 */}
+            {(formData.type === 'anthropic-api' || formData.type === 'openai-compatible') && (
+              <div style={{ marginBottom: 16, padding: 12, background: 'var(--theme-bg-secondary)', borderRadius: 8 }}>
+                <label style={{ ...labelStyle, marginBottom: 4 }}>Extra HTTP Headers</label>
+                <p style={{ fontSize: 11, color: 'var(--theme-text-muted)', margin: '0 0 10px 0' }}>
+                  为代理/中继服务添加自定义请求头（如 MM-Group-Id）。每行一个，格式：Header-Name: value
+                </p>
+                <textarea
+                  value={Object.entries(formData.extraHeaders || {}).map(([k, v]) => `${k}: ${v}`).join('\n')}
+                  onChange={(e) => {
+                    const headers: Record<string, string> = {};
+                    e.target.value.split('\n').forEach(line => {
+                      const idx = line.indexOf(':');
+                      if (idx > 0) {
+                        const key = line.slice(0, idx).trim();
+                        const val = line.slice(idx + 1).trim();
+                        if (key) headers[key] = val;
+                      }
+                    });
+                    setFormData({ ...formData, extraHeaders: headers });
+                  }}
+                  style={{
+                    ...inputStyle,
+                    height: 80,
+                    resize: 'vertical',
+                    fontFamily: 'monospace',
+                    fontSize: 12,
+                  }}
+                  placeholder={'MM-Group-Id: 123456789\nX-Custom-Header: value'}
+                />
+              </div>
             )}
 
             <div style={{ display: 'flex', gap: 8, marginTop: 20 }}>

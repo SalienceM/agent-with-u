@@ -614,7 +614,12 @@ class AnthropicAPIBackend(ModelBackend):
                     "anthropic-version": "2023-06-01",
                 }
                 if api_key:
+                    # Send both headers: some proxies (e.g. MiniMax) require both
                     req_headers["Authorization"] = f"Bearer {api_key}"
+                    req_headers["x-api-key"] = api_key
+                # Merge user-configured extra headers (can override defaults)
+                if self.config.extra_headers:
+                    req_headers.update(self.config.extra_headers)
                 req_body: dict = {
                     "model": model,
                     "max_tokens": 8096,
