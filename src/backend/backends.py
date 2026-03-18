@@ -459,39 +459,71 @@ class OpenAICompatibleBackend(ModelBackend):
             if self.config.api_key:
                 headers["Authorization"] = f"Bearer {self.config.api_key}"
 
-            async with httpx.AsyncClient(timeout=120.0) as client:
-                async with client.stream(
-                    "POST",
-                    f"{base_url}/chat/completions",
-                    json={
-                        "model": self.config.model or "gpt-4o",
-                        "messages": api_messages,
-                        "stream": True,
-                    },
-                    headers=headers,
-                ) as response:
-                    if response.status_code != 200:
-                        emit("error", error=f"API error: {response.status_code}")
-                        return {}
+            _RETRY_DELAYS = [1.0, 2.0, 4.0]
+            _MAX_RETRIES = len(_RETRY_DELAYS)
+            data_emitted = False
+            last_error: Optional[str] = None
 
-                    async for line in response.aiter_lines():
-                        if self._cancelled:
-                            break
-                        line = line.strip()
-                        if not line.startswith("data: "):
-                            continue
-                        data = line[6:]
-                        if data == "[DONE]":
-                            break
-                        try:
-                            parsed = json.loads(data)
-                            delta = (parsed.get("choices", [{}])[0]
-                                     .get("delta", {}))
-                            if delta.get("content"):
-                                emit("text_delta", text=delta["content"])
-                        except (json.JSONDecodeError, IndexError):
-                            pass
+            for attempt in range(_MAX_RETRIES + 1):
+                if self._cancelled:
+                    break
+                if attempt > 0:
+                    delay = _RETRY_DELAYS[attempt - 1]
+                    print(f"[OpenAI] retry {attempt}/{_MAX_RETRIES} in {delay}s ...",
+                          file=sys.stderr, flush=True)
+                    await asyncio.sleep(delay)
+                try:
+                    async with httpx.AsyncClient(timeout=120.0) as client:
+                        async with client.stream(
+                            "POST",
+                            f"{base_url}/chat/completions",
+                            json={
+                                "model": self.config.model or "gpt-4o",
+                                "messages": api_messages,
+                                "stream": True,
+                            },
+                            headers=headers,
+                        ) as response:
+                            if response.status_code == 429 and attempt < _MAX_RETRIES:
+                                last_error = f"API error: 429 (rate limited, retrying {attempt+1}/{_MAX_RETRIES})"
+                                print(f"[OpenAI] 429 rate limit, will retry", file=sys.stderr, flush=True)
+                                continue
+                            if response.status_code != 200:
+                                emit("error", error=f"API error: {response.status_code}")
+                                return {}
 
+                            async for line in response.aiter_lines():
+                                if self._cancelled:
+                                    break
+                                line = line.strip()
+                                if not line.startswith("data: "):
+                                    continue
+                                data = line[6:]
+                                if data == "[DONE]":
+                                    break
+                                try:
+                                    parsed = json.loads(data)
+                                    delta = (parsed.get("choices", [{}])[0]
+                                             .get("delta", {}))
+                                    if delta.get("content"):
+                                        emit("text_delta", text=delta["content"])
+                                        data_emitted = True
+                                except (json.JSONDecodeError, IndexError):
+                                    pass
+                    last_error = None
+                    break  # success
+
+                except (httpx.ConnectError, httpx.NetworkError,
+                        httpx.TimeoutException, httpx.RemoteProtocolError) as e:
+                    if data_emitted or attempt >= _MAX_RETRIES:
+                        last_error = _exc_msg(e)
+                        break
+                    last_error = _exc_msg(e)
+                    print(f"[OpenAI] network error ({last_error}), will retry",
+                          file=sys.stderr, flush=True)
+
+            if last_error and not self._cancelled:
+                emit("error", error=last_error)
             emit("done")
             return {}
 
@@ -650,59 +682,93 @@ class AnthropicAPIBackend(ModelBackend):
                     req_body["system"] = system_str
 
                 url = base_url.rstrip("/") + "/v1/messages"
-                async with httpx.AsyncClient(timeout=120.0) as hclient:
-                    async with hclient.stream(
-                        "POST", url, headers=req_headers, json=req_body
-                    ) as resp:
-                        if resp.status_code != 200:
-                            body = await resp.aread()
-                            raise Exception(
-                                f"HTTP {resp.status_code}: {body.decode(errors='replace')}"
-                            )
-                        async for line in resp.aiter_lines():
-                            if self._cancelled:
-                                break
-                            if not line.startswith("data:"):
-                                continue
-                            data_str = line[5:].strip()
-                            if not data_str or data_str == "[DONE]":
-                                continue
-                            try:
-                                evt = json.loads(data_str)
-                            except json.JSONDecodeError:
-                                continue
+                _RETRY_DELAYS = [1.0, 2.0, 4.0]
+                _MAX_RETRIES = len(_RETRY_DELAYS)
+                _data_emitted = False
+                _last_err: Optional[str] = None
 
-                            etype = evt.get("type", "")
-                            if etype == "content_block_delta":
-                                delta = evt.get("delta", {})
-                                dtype = delta.get("type", "")
-                                if dtype == "text_delta":
-                                    emit("text_delta", text=delta.get("text", ""))
-                                elif dtype == "thinking_delta":
-                                    emit("thinking", text=delta.get("thinking", ""))
-                                elif dtype == "input_json_delta":
-                                    emit("tool_input", tool_call={
-                                        "inputDelta": delta.get("partial_json", "")
-                                    })
-                            elif etype == "content_block_start":
-                                block = evt.get("content_block", {})
-                                if block.get("type") == "tool_use":
-                                    emit("tool_start", tool_call={
-                                        "id": block.get("id", ""),
-                                        "name": block.get("name", ""),
-                                        "input": "",
-                                        "status": "running",
-                                    })
-                            elif etype == "message_delta":
-                                output_tokens = evt.get("usage", {}).get(
-                                    "output_tokens", output_tokens
-                                )
-                            elif etype == "message_start":
-                                input_tokens = (
-                                    evt.get("message", {})
-                                    .get("usage", {})
-                                    .get("input_tokens", input_tokens)
-                                )
+                for _attempt in range(_MAX_RETRIES + 1):
+                    if self._cancelled:
+                        break
+                    if _attempt > 0:
+                        _d = _RETRY_DELAYS[_attempt - 1]
+                        print(f"[AnthropicAPI] retry {_attempt}/{_MAX_RETRIES} in {_d}s ...",
+                              file=sys.stderr, flush=True)
+                        await asyncio.sleep(_d)
+                    try:
+                        async with httpx.AsyncClient(timeout=120.0) as hclient:
+                            async with hclient.stream(
+                                "POST", url, headers=req_headers, json=req_body
+                            ) as resp:
+                                if resp.status_code == 429 and _attempt < _MAX_RETRIES:
+                                    _last_err = f"HTTP 429 (rate limited, retrying {_attempt+1}/{_MAX_RETRIES})"
+                                    print(f"[AnthropicAPI] 429 rate limit, will retry",
+                                          file=sys.stderr, flush=True)
+                                    continue
+                                if resp.status_code != 200:
+                                    body = await resp.aread()
+                                    raise Exception(
+                                        f"HTTP {resp.status_code}: {body.decode(errors='replace')}"
+                                    )
+                                async for line in resp.aiter_lines():
+                                    if self._cancelled:
+                                        break
+                                    if not line.startswith("data:"):
+                                        continue
+                                    data_str = line[5:].strip()
+                                    if not data_str or data_str == "[DONE]":
+                                        continue
+                                    try:
+                                        evt = json.loads(data_str)
+                                    except json.JSONDecodeError:
+                                        continue
+
+                                    etype = evt.get("type", "")
+                                    if etype == "content_block_delta":
+                                        delta = evt.get("delta", {})
+                                        dtype = delta.get("type", "")
+                                        if dtype == "text_delta":
+                                            emit("text_delta", text=delta.get("text", ""))
+                                            _data_emitted = True
+                                        elif dtype == "thinking_delta":
+                                            emit("thinking", text=delta.get("thinking", ""))
+                                        elif dtype == "input_json_delta":
+                                            emit("tool_input", tool_call={
+                                                "inputDelta": delta.get("partial_json", "")
+                                            })
+                                    elif etype == "content_block_start":
+                                        block = evt.get("content_block", {})
+                                        if block.get("type") == "tool_use":
+                                            emit("tool_start", tool_call={
+                                                "id": block.get("id", ""),
+                                                "name": block.get("name", ""),
+                                                "input": "",
+                                                "status": "running",
+                                            })
+                                    elif etype == "message_delta":
+                                        output_tokens = evt.get("usage", {}).get(
+                                            "output_tokens", output_tokens
+                                        )
+                                    elif etype == "message_start":
+                                        input_tokens = (
+                                            evt.get("message", {})
+                                            .get("usage", {})
+                                            .get("input_tokens", input_tokens)
+                                        )
+                        _last_err = None
+                        break  # success
+
+                    except (httpx.ConnectError, httpx.NetworkError,
+                            httpx.TimeoutException, httpx.RemoteProtocolError) as _ne:
+                        if _data_emitted or _attempt >= _MAX_RETRIES:
+                            _last_err = _exc_msg(_ne)
+                            break
+                        _last_err = _exc_msg(_ne)
+                        print(f"[AnthropicAPI] network error ({_last_err}), will retry",
+                              file=sys.stderr, flush=True)
+
+                if _last_err:
+                    raise Exception(_last_err)
             else:
                 # ── 官方 Anthropic：使用 SDK ──────────────────────────────────
                 client = _anthropic.AsyncAnthropic(
