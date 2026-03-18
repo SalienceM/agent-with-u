@@ -23,11 +23,20 @@ export const App: React.FC = () => {
   const [skipPermissions, setSkipPermissions] = useState(true);  // ★ 权限模式开关
   const [streamingSessions, setStreamingSessions] = useState<Set<string>>(new Set());  // ★ Per-session streaming state
   const [backendConnected, setBackendConnected] = useState<boolean | null>(null);  // ★ null = connecting
+  const [toast, setToast] = useState<{ type: 'success' | 'error' | 'info'; message: string } | null>(null);
+  const [isImporting, setIsImporting] = useState(false);
+  const toastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   // ★ Track if initial session check has been done to prevent re-opening dialog
   const initialCheckDoneRef = useRef(false);
   const endRef = useRef<HTMLDivElement>(null);
 
   const { config, updateConfig, resetConfig } = useConfig();
+
+  const showToast = useCallback((type: 'success' | 'error' | 'info', message: string, durationMs = 4000) => {
+    setToast({ type, message });
+    if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
+    toastTimerRef.current = setTimeout(() => setToast(null), durationMs);
+  }, []);
 
   /* ---- 后端连接状态 ---- */
   useEffect(() => {
@@ -162,15 +171,14 @@ export const App: React.FC = () => {
 
     const result = await api.exportData(targetPath);
     if (result.status === 'ok') {
-      alert(`数据导出成功！\n文件已保存到：${targetPath}`);
+      showToast('success', `导出成功 → ${targetPath}`);
     } else {
-      alert(`数据导出失败：${result.message}`);
+      showToast('error', `导出失败：${result.message}`);
     }
-  }, []);
+  }, [showToast]);
 
   /* ---- 数据导入 ---- */
   const handleImportData = useCallback(async () => {
-    // Confirm before import
     const confirmed = window.confirm(
       '⚠️ 警告：导入将覆盖所有现有的会话和后端配置！\n\n确定要继续吗？'
     );
@@ -179,19 +187,24 @@ export const App: React.FC = () => {
     const sourcePath = await api.selectImportPath();
     if (!sourcePath) return;
 
-    const result = await api.importData(sourcePath);
-    if (result.status === 'ok') {
-      const msg = `数据导入成功！\n\n导入会话数：${result.sessions || 0}\n导入后端配置数：${result.backends || 0}`;
-      alert(msg);
-      // Refresh session and backend lists
-      const sessionList = await api.listSessions();
-      setSessions(sessionList);
-      const backendList = await api.getBackends();
-      setBackends(backendList);
-    } else {
-      alert(`数据导入失败：${result.message}`);
+    setIsImporting(true);
+    showToast('info', '导入中，请稍候…', 60000);
+    try {
+      const result = await api.importData(sourcePath);
+      if (result.status === 'ok') {
+        showToast('success', `导入成功：${result.sessions || 0} 个会话，${result.backends || 0} 个后端配置`);
+        const [sessionList, backendList] = await Promise.all([api.listSessions(), api.getBackends()]);
+        setSessions(sessionList);
+        setBackends(backendList);
+      } else {
+        showToast('error', `导入失败：${result.message}`);
+      }
+    } catch (e: any) {
+      showToast('error', `导入异常：${e?.message ?? e}`);
+    } finally {
+      setIsImporting(false);
     }
-  }, []);
+  }, [showToast]);
 
   /* ---- Backend Manager ---- */
   const handleSaveBackend = useCallback(async (config: any) => {
@@ -457,6 +470,60 @@ export const App: React.FC = () => {
           onCreate={handleCreateSession}
         />
       )}
+
+      {/* ---- 导入 loading 遮罩 ---- */}
+      {isImporting && (
+        <div style={{
+          position: 'fixed', inset: 0, zIndex: 9998,
+          background: 'rgba(0,0,0,0.45)',
+          display: 'flex', alignItems: 'center', justifyContent: 'center',
+        }}>
+          <div style={{
+            background: 'var(--theme-bg-secondary, #21262d)',
+            border: '1px solid var(--theme-border, rgba(255,255,255,0.1))',
+            borderRadius: 10, padding: '24px 36px',
+            display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 14,
+          }}>
+            <div style={{ fontSize: 26 }}>⏳</div>
+            <div style={{ fontSize: 15, fontWeight: 600, color: 'var(--theme-text, #e6edf3)' }}>导入中，请稍候…</div>
+          </div>
+        </div>
+      )}
+
+      {/* ---- Toast 通知 ---- */}
+      {toast && (
+        <div
+          onClick={() => setToast(null)}
+          style={{
+            position: 'fixed', bottom: 28, right: 28, zIndex: 9999,
+            maxWidth: 380, padding: '12px 18px',
+            borderRadius: 8, cursor: 'pointer',
+            fontSize: 14, fontWeight: 500,
+            boxShadow: '0 4px 20px rgba(0,0,0,0.35)',
+            display: 'flex', alignItems: 'flex-start', gap: 10,
+            animation: 'toastIn 0.2s ease',
+            background: toast.type === 'success'
+              ? 'rgba(34,197,94,0.18)'
+              : toast.type === 'error'
+                ? 'rgba(239,68,68,0.18)'
+                : 'rgba(99,102,241,0.18)',
+            border: `1px solid ${
+              toast.type === 'success' ? 'rgba(34,197,94,0.4)'
+              : toast.type === 'error' ? 'rgba(239,68,68,0.4)'
+              : 'rgba(99,102,241,0.4)'
+            }`,
+            color: toast.type === 'success' ? '#4ade80'
+              : toast.type === 'error' ? '#f87171'
+              : '#a5b4fc',
+          }}
+        >
+          <span style={{ flexShrink: 0, fontSize: 16 }}>
+            {toast.type === 'success' ? '✓' : toast.type === 'error' ? '✕' : 'ℹ'}
+          </span>
+          <span style={{ lineHeight: 1.5 }}>{toast.message}</span>
+        </div>
+      )}
+      <style>{`@keyframes toastIn { from { opacity:0; transform:translateY(10px) } to { opacity:1; transform:translateY(0) } }`}</style>
     </div>
   );
 };
