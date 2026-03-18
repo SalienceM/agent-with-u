@@ -134,45 +134,90 @@ def patch_npm_path():
             os.environ["PATH"] = npm_bin + os.pathsep + os.environ.get("PATH", "")
 
 
-def _kill_port_owner(port: int) -> bool:
-    """
-    杀掉占用 port 的进程。
-    仅在 bind 失败后调用，避免误杀正常实例。
-    返回 True 表示成功发送了 SIGTERM/taskkill。
-    """
-    import signal as _signal
+def _get_pid_file(port: int) -> Path:
+    if sys.platform == "win32":
+        base = Path(os.environ.get("APPDATA", Path.home())) / "AgentWithU"
+    else:
+        base = Path.home() / ".agent-with-u"
+    base.mkdir(parents=True, exist_ok=True)
+    return base / f"backend_{port}.pid"
 
+
+def _kill_pid(pid: int, reason: str) -> bool:
+    """发送强制终止信号，返回是否成功。"""
     try:
         if sys.platform == "win32":
             import subprocess
-            # netstat 找 PID
-            out = subprocess.check_output(
-                ["netstat", "-ano"],
-                text=True, errors="replace"
+            ret = subprocess.call(
+                ["taskkill", "/F", "/PID", str(pid)],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             )
-            for line in out.splitlines():
-                if f":{port}" in line and "LISTENING" in line:
-                    parts = line.split()
-                    pid = int(parts[-1])
-                    if pid and pid != os.getpid():
-                        subprocess.call(["taskkill", "/F", "/PID", str(pid)])
-                        logging.warning(f"[ws_main] Killed PID {pid} that was holding port {port}")
-                        return True
+            if ret == 0:
+                logging.warning(f"[ws_main] Killed PID {pid} ({reason})")
+                return True
         else:
-            import subprocess
-            out = subprocess.check_output(
-                ["lsof", "-t", "-i", f"TCP:{port}"],
-                text=True, errors="replace"
-            ).strip()
-            for pid_str in out.splitlines():
-                pid = int(pid_str)
-                if pid and pid != os.getpid():
-                    os.kill(pid, _signal.SIGTERM)
-                    logging.warning(f"[ws_main] Killed PID {pid} that was holding port {port}")
-                    return True
+            import signal as _signal
+            os.kill(pid, _signal.SIGTERM)
+            logging.warning(f"[ws_main] Sent SIGTERM to PID {pid} ({reason})")
+            return True
+    except (ProcessLookupError, PermissionError):
+        pass  # 进程已经不存在
     except Exception as e:
-        logging.warning(f"[ws_main] Could not kill port owner: {e}")
+        logging.warning(f"[ws_main] Failed to kill PID {pid}: {e}")
     return False
+
+
+def _is_pid_alive(pid: int) -> bool:
+    """检查进程是否还活着。"""
+    try:
+        if sys.platform == "win32":
+            import subprocess
+            ret = subprocess.call(
+                ["tasklist", "/FI", f"PID eq {pid}", "/NH"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            return ret == 0
+        else:
+            os.kill(pid, 0)  # 发送 signal 0 仅检查存在性
+            return True
+    except (ProcessLookupError, PermissionError):
+        return False
+    except Exception:
+        return True  # 不确定时保守处理
+
+
+def _ensure_single_instance(port: int) -> None:
+    """
+    单实例锁（PID 文件）：
+    1. 读旧 PID 文件 → 如果旧进程仍在运行则杀掉，等待端口释放
+    2. 写入当前 PID
+    3. 注册 atexit 自动清理
+    """
+    import atexit
+    import time
+
+    pid_file = _get_pid_file(port)
+
+    if pid_file.exists():
+        try:
+            old_pid = int(pid_file.read_text(encoding="utf-8").strip())
+            if old_pid != os.getpid() and _is_pid_alive(old_pid):
+                logging.info(f"[ws_main] Found running instance PID={old_pid}, terminating it…")
+                _kill_pid(old_pid, f"old instance on port {port}")
+                # 等待端口真正释放（最多 3s）
+                for _ in range(6):
+                    time.sleep(0.5)
+                    if not _is_pid_alive(old_pid):
+                        break
+                logging.info(f"[ws_main] Old instance gone, proceeding.")
+        except ValueError:
+            pass  # PID 文件损坏，直接覆盖
+        except Exception as e:
+            logging.warning(f"[ws_main] Could not process stale PID file: {e}")
+
+    pid_file.write_text(str(os.getpid()), encoding="utf-8")
+    atexit.register(lambda: pid_file.unlink(missing_ok=True))
+    logging.info(f"[ws_main] Single-instance lock acquired (PID={os.getpid()}, port={port})")
 
 
 async def main():
@@ -180,27 +225,20 @@ async def main():
     logging.info(f"[ws_main] Log file: {log_file}")
     patch_npm_path()
     load_claude_settings()
+
+    # 单实例保证：杀旧实例 → 写 PID → 绑定端口
+    _ensure_single_instance(WS_PORT)
+
     ClipboardHandler.cleanup_old_temp_files()
 
     cli_path = find_bundled_claude()
     bridge = BridgeWS(cli_path=cli_path)
 
     logging.info(f"[ws_main] Starting WebSocket server on ws://{WS_HOST}:{WS_PORT}")
-
-    for attempt in range(3):
-        try:
-            server = await websockets.serve(bridge.handle_client, WS_HOST, WS_PORT)
-            break
-        except OSError as e:
-            if e.errno in (98, 10048) and attempt < 2:  # EADDRINUSE (Linux=98, Win=10048)
-                logging.warning(f"[ws_main] Port {WS_PORT} in use (attempt {attempt+1}), trying to free it…")
-                _kill_port_owner(WS_PORT)
-                await asyncio.sleep(1.5)
-            else:
-                logging.error(f"[ws_main] Cannot bind port {WS_PORT}: {e}")
-                raise
-    else:
-        logging.error(f"[ws_main] Giving up after 3 attempts.")
+    try:
+        server = await websockets.serve(bridge.handle_client, WS_HOST, WS_PORT)
+    except OSError as e:
+        logging.error(f"[ws_main] Cannot bind port {WS_PORT} even after clearing old instance: {e}")
         sys.exit(1)
 
     logging.info("[ws_main] Ready.")

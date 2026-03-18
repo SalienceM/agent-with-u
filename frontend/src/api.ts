@@ -78,7 +78,7 @@ async function tauriSaveDialog(opts: {
   }
 }
 
-// ── WebSocket 初始化 ──────────────────────────────────────────
+// ── WebSocket 初始化 + 自动重连 ───────────────────────────────
 
 async function getWsPort(): Promise<number> {
   if (isTauri()) {
@@ -88,71 +88,88 @@ async function getWsPort(): Promise<number> {
   return WS_PORT_DEFAULT;
 }
 
+let wsPort = WS_PORT_DEFAULT;
+let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+let reconnectDelay = 1000; // 指数退避：1s → 2s → 4s … 最大 30s
+const MAX_RECONNECT_DELAY = 30000;
+
+function scheduleReconnect() {
+  if (reconnectTimer !== null) return; // 已有排队，不重复
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    doConnect(wsPort);
+  }, reconnectDelay);
+  reconnectDelay = Math.min(reconnectDelay * 2, MAX_RECONNECT_DELAY);
+}
+
+function handleMessage(e: MessageEvent) {
+  try {
+    const msg = JSON.parse(e.data);
+    if (msg.id !== undefined && pending.has(msg.id)) {
+      const cb = pending.get(msg.id)!;
+      pending.delete(msg.id);
+      cb(msg.result ?? null);
+    } else if (msg.event === 'streamDelta') {
+      const delta = JSON.parse(msg.data);
+      streamCallbacks.forEach((cb) => cb(delta));
+    } else if (msg.event === 'sessionUpdated') {
+      const data = JSON.parse(msg.data);
+      sessionUpdateCallbacks.forEach((cb) => cb(data));
+    }
+  } catch (err) {
+    console.error('[api] message parse error:', err);
+  }
+}
+
+/**
+ * 建立一次 WebSocket 连接。
+ * onSettled 在首次 open/close/error 时回调一次（用于 wsReady 的 resolve）。
+ */
+function doConnect(port: number, onSettled?: () => void) {
+  const url = `ws://127.0.0.1:${port}`;
+  const socket = new WebSocket(url);
+  let settled = false;
+  const settle = () => { if (!settled) { settled = true; onSettled?.(); } };
+
+  socket.onopen = () => {
+    ws = socket;
+    useMock = false;
+    reconnectDelay = 1000; // 成功后重置退避
+    if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+    console.log(`[api] Connected to ${url}`);
+    connectionStatusCallbacks.forEach((cb) => cb(true));
+    settle();
+  };
+
+  // onerror 之后一定会触发 onclose，在 onclose 里统一处理
+  socket.onerror = () => settle();
+
+  socket.onmessage = handleMessage;
+
+  socket.onclose = () => {
+    if (ws === socket) {
+      ws = null;
+      // 立即 resolve 所有挂起请求，避免调用方永久阻塞
+      pending.forEach((resolve) => resolve(null));
+      pending.clear();
+      connectionStatusCallbacks.forEach((cb) => cb(false));
+    }
+    settle();
+    scheduleReconnect(); // 断线后自动重连
+  };
+}
+
 wsReady = (async () => {
-  const port = await getWsPort();
-  return new Promise<void>((resolve) => {
-    const url = `ws://127.0.0.1:${port}`;
-    let settled = false;
-
+  wsPort = await getWsPort();
+  await new Promise<void>((resolve) => {
+    // 首次连接超时：不进 mock 模式，继续重试
     const timer = setTimeout(() => {
-      if (!settled) {
-        settled = true;
-        console.warn(`[api] WebSocket timeout (${url}), using mock bridge`);
-        useMock = true;
-        connectionStatusCallbacks.forEach((cb) => cb(false));
-        resolve();
-      }
+      console.warn(`[api] Initial connect timeout, will keep retrying…`);
+      connectionStatusCallbacks.forEach((cb) => cb(false));
+      scheduleReconnect();
+      resolve();
     }, WS_CONNECT_TIMEOUT_MS);
-
-    const socket = new WebSocket(url);
-
-    socket.onopen = () => {
-      if (!settled) {
-        settled = true;
-        clearTimeout(timer);
-        ws = socket;
-        console.log(`[api] Connected to ${url}`);
-        connectionStatusCallbacks.forEach((cb) => cb(true));
-        resolve();
-      }
-    };
-
-    socket.onerror = () => {
-      if (!settled) {
-        settled = true;
-        clearTimeout(timer);
-        console.warn(`[api] WebSocket error (${url}), using mock bridge`);
-        useMock = true;
-        connectionStatusCallbacks.forEach((cb) => cb(false));
-        resolve();
-      }
-    };
-
-    socket.onmessage = (e) => {
-      try {
-        const msg = JSON.parse(e.data);
-        if (msg.id !== undefined && pending.has(msg.id)) {
-          const cb = pending.get(msg.id)!;
-          pending.delete(msg.id);
-          cb(msg.result ?? null);
-        } else if (msg.event === 'streamDelta') {
-          const delta = JSON.parse(msg.data);
-          streamCallbacks.forEach((cb) => cb(delta));
-        } else if (msg.event === 'sessionUpdated') {
-          const data = JSON.parse(msg.data);
-          sessionUpdateCallbacks.forEach((cb) => cb(data));
-        }
-      } catch (err) {
-        console.error('[api] message parse error:', err);
-      }
-    };
-
-    socket.onclose = () => {
-      if (ws === socket) {
-        ws = null;
-        connectionStatusCallbacks.forEach((cb) => cb(false));
-      }
-    };
+    doConnect(wsPort, () => { clearTimeout(timer); resolve(); });
   });
 })();
 
