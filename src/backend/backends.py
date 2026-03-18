@@ -597,7 +597,8 @@ class AnthropicAPIBackend(ModelBackend):
             system_str = "\n\n".join(system_msgs) if system_msgs else None
 
             print(f"[AnthropicAPI] model={model}, proxy={bool(base_url)}, "
-                  f"images={len(images or [])}, history_len={len(api_messages)-1}",
+                  f"images={len(images or [])}, history_len={len(api_messages)-1}, "
+                  f"api_key={'set('+str(len(api_key))+'chars)' if api_key else 'NONE'}",
                   file=sys.stderr, flush=True)
 
             input_tokens = 0
@@ -606,11 +607,12 @@ class AnthropicAPIBackend(ModelBackend):
             if base_url:
                 # ── 代理模式：httpx 直接调用，完全控制请求头 ──────────────────
                 # Anthropic SDK 始终发送 x-api-key；MiniMax 等代理要求 Authorization: Bearer
-                req_headers = {
-                    "Authorization": f"Bearer {api_key}",
+                req_headers: dict[str, str] = {
                     "Content-Type": "application/json",
                     "anthropic-version": "2023-06-01",
                 }
+                if api_key:
+                    req_headers["Authorization"] = f"Bearer {api_key}"
                 req_body: dict = {
                     "model": model,
                     "max_tokens": 8096,
