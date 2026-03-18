@@ -242,6 +242,7 @@ class ClaudeAgentBackend(ModelBackend):
                     "SystemMessage": "system",
                     "StreamEvent": "stream_event",
                     "AssistantMessage": "assistant",
+                    "TaskStartedMessage": "task_started",
                     "UserMessage": "user",
                     "ResultMessage": "result",
                 }
@@ -377,7 +378,7 @@ class ClaudeAgentBackend(ModelBackend):
                     emit("done", **({"usage": usage_dict} if usage_dict else {}))
                     _done_emitted = True  # 不 break，让生成器自然耗尽以避免 anyio cancel scope 错误
 
-                else:
+                elif msg_type not in ("task_started",):
                     print(f"[ClaudeAgent] 未处理的消息类型: {msg_type}",
                           file=sys.stderr, flush=True)
             if not _done_emitted:
