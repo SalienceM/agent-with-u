@@ -29,6 +29,7 @@ class ModelBackendConfig:
     skip_permissions: bool = True  # ★ If False, claude-code will ask for confirmation
     # ★ Per-backend environment variables for ANTHROPIC_* settings
     env: Optional[dict[str, str]] = None  # {ANTHROPIC_MODEL, ANTHROPIC_BASE_URL, ANTHROPIC_AUTH_TOKEN}
+    cli_path: Optional[str] = None  # Override path to claude CLI binary
 
     def to_dict(self) -> dict:
         d = asdict(self)
