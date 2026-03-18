@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import { markdownToHtml } from '../utils/markdown';
 import type { ChatMessage, ToolCall } from '../hooks/useChat';
+import { DiffView } from './DiffView';
 
 // ── 注入全局动画样式 ──
 if (typeof document !== 'undefined' && !document.getElementById('msg-bubble-css')) {
@@ -105,14 +106,19 @@ const ToolCallBlock: React.FC<{ tc: ToolCall }> = ({ tc }) => {
       </div>
       {expanded && (
         <div style={sectionBody}>
-          {tc.input && (
-            <div style={{ marginBottom: 6 }}>
-              <div style={labelStyle}>INPUT</div>
-              <pre style={codeBlock}>{tc.input}</pre>
-            </div>
+          {/* ★ Edit/Write 工具优先展示 Diff 视图 */}
+          {tc.diff ? (
+            <DiffView diff={tc.diff} />
+          ) : (
+            tc.input && (
+              <div style={{ marginBottom: 6 }}>
+                <div style={labelStyle}>INPUT</div>
+                <pre style={codeBlock}>{tc.input}</pre>
+              </div>
+            )
           )}
           {tc.output && (
-            <div>
+            <div style={{ marginTop: tc.diff ? 6 : 0 }}>
               <div style={labelStyle}>OUTPUT</div>
               <pre
                 style={{

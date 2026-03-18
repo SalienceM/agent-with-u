@@ -65,6 +65,10 @@ class ToolCallInfo:
     output: Optional[str] = None
     error: Optional[str] = None
     status: str = "running"
+    # ★ Diff data for Edit/Write tools
+    diff_path: Optional[str] = None
+    diff_before: Optional[str] = None
+    diff_after: Optional[str] = None
 
     def to_dict(self) -> dict:
         d = {
@@ -78,6 +82,12 @@ class ToolCallInfo:
             d["output"] = self.output
         if self.error is not None:
             d["error"] = self.error
+        if self.diff_path is not None:
+            d["diff"] = {
+                "path": self.diff_path,
+                "old": self.diff_before or "",
+                "new": self.diff_after or "",
+            }
         return d
 
 

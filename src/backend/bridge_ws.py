@@ -13,6 +13,7 @@ sendMessage / abortMessage 是 fire-and-forget：立即返回 null，
 
 import asyncio
 import json
+import logging
 import sys
 import time
 from typing import Optional
@@ -128,6 +129,8 @@ class BridgeWS:
         self._active_sessions: dict[str, Session] = {}
         self._instance_manager = InstanceManager()
         self._clients: set = set()
+        # ★ Permission gate: session_id → Future[bool]
+        self._permission_gates: dict[str, "asyncio.Future[bool]"] = {}
 
     # ── WebSocket 基础设施 ───────────────────────────────────────
 
@@ -389,6 +392,45 @@ class BridgeWS:
         except Exception as e:
             return json.dumps({"status": "error", "message": str(e)}, ensure_ascii=False)
 
+    # ── 权限门控 RPC ─────────────────────────────────────────────
+
+    def _rpc_grantPermission(self, session_id: str, granted: bool) -> None:
+        """前端响应权限请求：granted=True 继续执行，False 取消。"""
+        gate = self._permission_gates.get(session_id)
+        if gate and not gate.done():
+            gate.set_result(granted)
+
+    async def _await_permission_grant(
+        self,
+        session_id: str,
+        message_id: str,
+        tools: list,
+        timeout: float = 300.0,
+    ) -> bool:
+        """
+        向所有已连接客户端推送 permissionRequest 事件，
+        挂起当前 coroutine 直到前端调用 grantPermission 或超时。
+        """
+        loop = asyncio.get_event_loop()
+        gate: "asyncio.Future[bool]" = loop.create_future()
+        self._permission_gates[session_id] = gate
+
+        await self._broadcast({
+            "event": "permissionRequest",
+            "data": json.dumps({
+                "sessionId": session_id,
+                "messageId": message_id,
+                "tools": [tc.to_dict() for tc in tools],
+            }, ensure_ascii=False),
+        })
+        try:
+            return await asyncio.wait_for(asyncio.shield(gate), timeout=timeout)
+        except asyncio.TimeoutError:
+            logging.warning(f"[bridge_ws] Permission request timed out for session {session_id}")
+            return False
+        finally:
+            self._permission_gates.pop(session_id, None)
+
     # ════════════════════════════════════════════════════════════
     #  核心：带自动续跑的流式发送（与 bridge.py _async_send 相同逻辑）
     # ════════════════════════════════════════════════════════════
@@ -517,6 +559,27 @@ class BridgeWS:
                         if tc.id == tc_id:
                             tc.output = delta.tool_call.get("output")
                             tc.status = delta.tool_call.get("status", "done")
+                            # ★ 从 Edit 工具的 input JSON 中提取 diff 数据
+                            if tc.name in ("Edit", "MultiEdit") and tc.input:
+                                try:
+                                    inp = json.loads(tc.input)
+                                    old_str = inp.get("old_string", "")
+                                    new_str = inp.get("new_string", "")
+                                    if old_str or new_str:
+                                        tc.diff_path = inp.get("file_path", "")
+                                        tc.diff_before = old_str
+                                        tc.diff_after = new_str
+                                        # 把 diff 注入 delta 传给前端
+                                        delta.tool_call = {
+                                            **delta.tool_call,
+                                            "diff": {
+                                                "path": tc.diff_path,
+                                                "old": old_str,
+                                                "new": new_str,
+                                            },
+                                        }
+                                except Exception:
+                                    pass
                             break
                 self._emit_delta(delta)
 
@@ -578,6 +641,17 @@ class BridgeWS:
                                                  error="无法恢复对话会话，已尝试压缩历史重试"))
 
                 if stop_reason == "max_tokens" and auto_continue and iteration < max_continuations:
+                    # ★ 权限门控：未跳过确认时，auto-continue 前请求用户确认
+                    if not skip_permissions and iter_tools:
+                        granted = await self._await_permission_grant(
+                            session.id, message_id, iter_tools
+                        )
+                        if not granted:
+                            self._emit_delta(StreamDelta(
+                                session.id, message_id, "text_delta",
+                                text="\n\n> ⛔ **Auto-continue cancelled by user.**\n",
+                            ))
+                            break
                     indicator = f"\n\n> ⟳ **Auto-continuing** ({iteration + 2}/{max_continuations + 1})...\n\n"
                     self._emit_delta(StreamDelta(session.id, message_id, "text_delta", text=indicator))
                     all_text.append(indicator)

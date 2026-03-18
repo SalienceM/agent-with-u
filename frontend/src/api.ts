@@ -15,6 +15,7 @@
 
 type StreamDeltaCallback = (delta: any) => void;
 type SessionUpdateCallback = (data: any) => void;
+type PermissionRequestCallback = (data: any) => void;
 
 const WS_PORT_DEFAULT = 44321;
 const WS_CONNECT_TIMEOUT_MS = 3000;
@@ -30,6 +31,7 @@ let reqCounter = 0;
 const pending = new Map<string, (result: any) => void>();
 let streamCallbacks: StreamDeltaCallback[] = [];
 let sessionUpdateCallbacks: SessionUpdateCallback[] = [];
+let permissionRequestCallbacks: PermissionRequestCallback[] = [];
 
 function nextId() {
   return `r${++reqCounter}`;
@@ -115,6 +117,9 @@ function handleMessage(e: MessageEvent) {
     } else if (msg.event === 'sessionUpdated') {
       const data = JSON.parse(msg.data);
       sessionUpdateCallbacks.forEach((cb) => cb(data));
+    } else if (msg.event === 'permissionRequest') {
+      const data = JSON.parse(msg.data);
+      permissionRequestCallbacks.forEach((cb) => cb(data));
     }
   } catch (err) {
     console.error('[api] message parse error:', err);
@@ -344,6 +349,16 @@ export const api = {
   async setAppConfig(config: any): Promise<any> {
     const result = await call('setAppConfig', JSON.stringify(config));
     try { return JSON.parse(result); } catch { return { status: 'error', message: '保存配置失败' }; }
+  },
+
+  /** 响应后端发出的 permissionRequest，granted=true 继续，false 取消。 */
+  async grantPermission(sessionId: string, granted: boolean): Promise<void> {
+    await send('grantPermission', sessionId, granted);
+  },
+
+  onPermissionRequest(callback: PermissionRequestCallback): () => void {
+    permissionRequestCallbacks.push(callback);
+    return () => { permissionRequestCallbacks = permissionRequestCallbacks.filter((cb) => cb !== callback); };
   },
 };
 

@@ -5,6 +5,7 @@ import { MessageBubble } from './components/MessageBubble';
 import { ChatInput } from './components/ChatInput';
 import { Settings } from './components/Settings';
 import { BackendManager } from './components/BackendManager';
+import { PermissionGate } from './components/PermissionGate';
 import { useChat } from './hooks/useChat';
 import { useConfig } from './hooks/useConfig';
 import { themes } from './hooks/useConfig';
@@ -496,6 +497,15 @@ export const App: React.FC = () => {
             <div style={{ fontSize: 15, fontWeight: 600, color: 'var(--theme-text, #e6edf3)' }}>导入中，请稍候…</div>
           </div>
         </div>
+      )}
+
+      {/* ---- 权限确认弹框 ---- */}
+      {chat.pendingPermission && (
+        <PermissionGate
+          request={chat.pendingPermission}
+          onDismiss={chat.clearPermission}
+          onAllowSession={() => setSkipPermissions(true)}
+        />
       )}
 
       {/* ---- Toast 通知 ---- */}

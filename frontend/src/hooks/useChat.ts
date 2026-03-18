@@ -10,6 +10,13 @@ export interface ToolCall {
   status: string;
   startTime?: number;  // ★ Track start time for duration calculation
   duration?: number;   // ★ Duration in milliseconds
+  diff?: { path: string; old: string; new: string };  // ★ Diff data for Edit tools
+}
+
+export interface PermissionRequest {
+  sessionId: string;
+  messageId: string;
+  tools: ToolCall[];
 }
 
 export interface ChatMessage {
@@ -87,6 +94,7 @@ export function useChat(sessionId: string, backendId: string, backends?: any[], 
   const [isStreaming, setIsStreaming] = useState(false);
   const [autoContinue, setAutoContinue] = useState(true);
   const [needsMigrate, setNeedsMigrate] = useState(false);
+  const [pendingPermission, setPendingPermission] = useState<PermissionRequest | null>(null);
 
   // 累积器 refs
   const textRef = useRef('');
@@ -138,6 +146,14 @@ export function useChat(sessionId: string, backendId: string, backends?: any[], 
           setMessages(session.messages.map(normalizeMessage));
         }
       }
+    });
+  }, [sessionId]);
+
+  // ── 权限请求监听 ──
+  useEffect(() => {
+    return api.onPermissionRequest((data: PermissionRequest) => {
+      if (data.sessionId !== sessionId) return;
+      setPendingPermission(data);
     });
   }, [sessionId]);
 
@@ -591,5 +607,9 @@ export function useChat(sessionId: string, backendId: string, backends?: any[], 
     setIsStreaming(false);
   }, [backendId]);
 
-  return { messages, isStreaming, sendMessage, abort, autoContinue, setAutoContinue };
+  return {
+    messages, isStreaming, sendMessage, abort, autoContinue, setAutoContinue,
+    pendingPermission, clearPermission: () => setPendingPermission(null),
+    needsMigrate,
+  };
 }
