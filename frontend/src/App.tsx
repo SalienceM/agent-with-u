@@ -12,6 +12,12 @@ import { themes } from './hooks/useConfig';
 import { messagesToMarkdown, messagesToJson } from './utils/markdown';
 import { hljsLightCss, hljsDarkCss } from './utils/hljsThemes';
 
+function hexToRgba(color: string, alpha: number): string {
+  const m = color.match(/^#([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})/i);
+  if (!m) return color;
+  return `rgba(${parseInt(m[1], 16)},${parseInt(m[2], 16)},${parseInt(m[3], 16)},${alpha.toFixed(2)})`;
+}
+
 export const App: React.FC = () => {
   const [backends, setBackends] = useState<any[]>([]);
   const [sessions, setSessions] = useState<any[]>([]);
@@ -261,6 +267,7 @@ export const App: React.FC = () => {
   const hljsCss = isLightTheme ? hljsLightCss : hljsDarkCss;
 
   const hasBg = !!config.bgImage;
+  const ua = config.uiOpacity ?? 1;  // panel alpha
 
   return (
     <div style={{
@@ -268,20 +275,20 @@ export const App: React.FC = () => {
       background: hasBg ? 'transparent' : theme.bg,
       color: theme.text,
       // ★ CSS Variables for theme colors - child components can use these
-      '--theme-bg': theme.bg,
-      '--theme-bg-secondary': theme.bgSecondary,
-      '--theme-bg-tertiary': theme.bgTertiary,
+      '--theme-bg': ua < 1 ? hexToRgba(theme.bg, ua) : theme.bg,
+      '--theme-bg-secondary': ua < 1 ? hexToRgba(theme.bgSecondary, ua) : theme.bgSecondary,
+      '--theme-bg-tertiary': ua < 1 ? hexToRgba(theme.bgTertiary, ua) : theme.bgTertiary,
       '--theme-border': theme.border,
       '--theme-text': theme.text,
       '--theme-text-muted': theme.textMuted,
       '--theme-accent': theme.accent,
       '--theme-accent-hover': theme.accentHover,
       '--theme-accent-bg': theme.accentBg,
-      '--theme-message-bg': theme.messageBg,
-      '--theme-user-message-bg': theme.userMessageBg,
-      '--theme-code-bg': theme.codeBg,
-      '--theme-input-bg': theme.inputBg,
-      '--theme-sidebar-bg': theme.sidebarBg,
+      '--theme-message-bg': ua < 1 ? hexToRgba(theme.messageBg, ua) : theme.messageBg,
+      '--theme-user-message-bg': ua < 1 ? hexToRgba(theme.userMessageBg, ua) : theme.userMessageBg,
+      '--theme-code-bg': ua < 1 ? hexToRgba(theme.codeBg, ua) : theme.codeBg,
+      '--theme-input-bg': ua < 1 ? hexToRgba(theme.inputBg, ua) : theme.inputBg,
+      '--theme-sidebar-bg': ua < 1 ? hexToRgba(theme.sidebarBg, ua) : theme.sidebarBg,
     } as React.CSSProperties}>
       {/* ★ 背景图层：图片本身控制透明度，面板背景保持实色 */}
       {hasBg && (

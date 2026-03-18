@@ -158,6 +158,28 @@ export const Settings: React.FC<SettingsProps> = ({
           </p>
         </div>
 
+        {/* 界面透明度 */}
+        <div style={sectionStyle}>
+          <label style={labelStyle}>Panel Transparency</label>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+            <input
+              type="range"
+              min={0.1}
+              max={1}
+              step={0.05}
+              value={config.uiOpacity ?? 1}
+              onChange={(e) => onConfigChange({ uiOpacity: Number(e.target.value) })}
+              style={{ flex: 1, accentColor: 'var(--theme-accent)' }}
+            />
+            <span style={{ fontSize: 13, color: 'var(--theme-text-muted)', minWidth: 36, textAlign: 'right' }}>
+              {Math.round((config.uiOpacity ?? 1) * 100)}%
+            </span>
+          </div>
+          <span style={{ display: 'block', marginTop: 4, fontSize: 11, color: 'var(--theme-text-muted)' }}>
+            Controls bubble / sidebar / header background opacity
+          </span>
+        </div>
+
         {/* 背景图 */}
         <div style={sectionStyle}>
           <label style={labelStyle}>Background Image</label>

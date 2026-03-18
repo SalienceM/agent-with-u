@@ -1,4 +1,4 @@
-import { useState, useCallback, useEffect } from 'react';
+import { useState, useCallback, useEffect, useRef } from 'react';
 import { api } from '../api';
 
 export type ThemeType = 'dark' | 'light' | 'midnight' | 'ocean';
@@ -10,6 +10,7 @@ export interface AppConfig {
   theme: ThemeType;
   bgImage: string;
   bgOpacity: number;
+  uiOpacity: number;
 }
 
 const DEFAULT_CONFIG: AppConfig = {
@@ -19,6 +20,7 @@ const DEFAULT_CONFIG: AppConfig = {
   theme: 'dark',
   bgImage: '',
   bgOpacity: 0.3,
+  uiOpacity: 1.0,
 };
 
 // Theme color schemes
@@ -142,6 +144,7 @@ export const themes: Record<ThemeType, {
 export function useConfig() {
   const [config, setConfig] = useState<AppConfig>(DEFAULT_CONFIG);
   const [loaded, setLoaded] = useState(false);
+  const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Load config from backend on mount
   useEffect(() => {
@@ -156,14 +159,27 @@ export function useConfig() {
     });
   }, []);
 
+  // Debounced save: sliders may fire many events; wait 400ms after last change
+  const scheduleSave = useCallback((cfg: AppConfig) => {
+    if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
+    saveTimerRef.current = setTimeout(() => {
+      api.setAppConfig(cfg).catch(console.error);
+    }, 400);
+  }, []);
+
   const updateConfig = useCallback((patch: Partial<AppConfig>) => {
     setConfig((prev) => {
       const newConfig = { ...prev, ...patch };
-      // Save to backend
-      api.setAppConfig(newConfig).catch(console.error);
+      // bgImage changes save immediately; other changes are debounced
+      if ('bgImage' in patch) {
+        if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
+        api.setAppConfig(newConfig).catch(console.error);
+      } else {
+        scheduleSave(newConfig);
+      }
       return newConfig;
     });
-  }, []);
+  }, [scheduleSave]);
 
   const resetConfig = useCallback(() => {
     setConfig(DEFAULT_CONFIG);
