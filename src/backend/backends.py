@@ -620,7 +620,7 @@ class AnthropicAPIBackend(ModelBackend):
                 if system_str:
                     req_body["system"] = system_str
 
-                url = base_url.rstrip("/") + "/messages"
+                url = base_url.rstrip("/") + "/v1/messages"
                 async with httpx.AsyncClient(timeout=120.0) as hclient:
                     async with hclient.stream(
                         "POST", url, headers=req_headers, json=req_body
