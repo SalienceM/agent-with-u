@@ -596,9 +596,11 @@ class AnthropicAPIBackend(ModelBackend):
             system_msgs = [m.content for m in messages if m.role == "system"]
             system_str = "\n\n".join(system_msgs) if system_msgs else None
 
+            if api_key:
+                api_key = api_key.strip()
             print(f"[AnthropicAPI] model={model}, proxy={bool(base_url)}, "
                   f"images={len(images or [])}, history_len={len(api_messages)-1}, "
-                  f"api_key={'set('+str(len(api_key))+'chars)' if api_key else 'NONE'}",
+                  f"api_key={'set('+str(len(api_key))+'chars, prefix='+repr(api_key[:8])+')' if api_key else 'NONE'}",
                   file=sys.stderr, flush=True)
 
             input_tokens = 0
