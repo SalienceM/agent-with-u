@@ -459,7 +459,7 @@ class OpenAICompatibleBackend(ModelBackend):
             if self.config.api_key:
                 headers["Authorization"] = f"Bearer {self.config.api_key}"
 
-            _RETRY_DELAYS = [1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 60.0, 60.0, 60.0, 60.0]
+            _RETRY_DELAYS = [1.0, 2.0, 4.0, 8.0, 8.0, 8.0, 8.0, 8.0, 8.0, 8.0]
             _MAX_RETRIES = len(_RETRY_DELAYS)
             data_emitted = False
             last_error: Optional[str] = None
@@ -682,7 +682,7 @@ class AnthropicAPIBackend(ModelBackend):
                     req_body["system"] = system_str
 
                 url = base_url.rstrip("/") + "/v1/messages"
-                _RETRY_DELAYS = [1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 60.0, 60.0, 60.0, 60.0]
+                _RETRY_DELAYS = [1.0, 2.0, 4.0, 8.0, 8.0, 8.0, 8.0, 8.0, 8.0, 8.0]
                 _MAX_RETRIES = len(_RETRY_DELAYS)
                 _data_emitted = False
                 _last_err: Optional[str] = None
