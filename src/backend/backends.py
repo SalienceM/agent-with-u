@@ -642,6 +642,7 @@ class AnthropicAPIBackend(ModelBackend):
                         async for line in resp.aiter_lines():
                             if self._cancelled:
                                 break
+                            print(f"[SSE RAW] {repr(line[:200])}", file=sys.stderr)
                             if not line.startswith("data: "):
                                 continue
                             data_str = line[6:].strip()
