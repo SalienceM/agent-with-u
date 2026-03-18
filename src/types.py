@@ -33,9 +33,20 @@ class ModelBackendConfig:
     extra_headers: Optional[dict[str, str]] = None  # Custom HTTP headers for proxy/relay backends
 
     def to_dict(self) -> dict:
-        d = asdict(self)
-        d["type"] = self.type.value
-        return d
+        return {
+            "id": self.id,
+            "type": self.type.value,
+            "label": self.label,
+            "baseUrl": self.base_url,
+            "model": self.model,
+            "apiKey": self.api_key,
+            "workingDir": self.working_dir,
+            "allowedTools": self.allowed_tools,
+            "skipPermissions": self.skip_permissions,
+            "env": self.env,
+            "cliPath": self.cli_path,
+            "extraHeaders": self.extra_headers,
+        }
 
     def get_env(self, key: str, default: Optional[str] = None) -> Optional[str]:
         """Get environment variable from backend config."""
