@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useCallback, useEffect, useRef } from 'react';
 import { markdownToHtml } from '../utils/markdown';
 import type { ChatMessage, ToolCall } from '../hooks/useChat';
 import { DiffView } from './DiffView';
@@ -16,9 +16,63 @@ if (typeof document !== 'undefined' && !document.getElementById('msg-bubble-css'
       40% { content: '..'; }
       60%, 100% { content: '...'; }
     }
+    /* ── 气泡内图片约束 ── */
+    .msg-content img {
+      max-width: 100%;
+      height: auto;
+      border-radius: 8px;
+      display: block;
+      cursor: zoom-in;
+      margin: 4px 0;
+    }
   `;
   document.head.appendChild(style);
 }
+
+// ═══════════════════════════════════════
+//  ImageLightbox — 点击放大预览
+// ═══════════════════════════════════════
+const ImageLightbox: React.FC<{ src: string; onClose: () => void }> = ({ src, onClose }) => {
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose(); };
+    document.addEventListener('keydown', onKey);
+    return () => document.removeEventListener('keydown', onKey);
+  }, [onClose]);
+
+  return (
+    <div
+      onClick={onClose}
+      style={{
+        position: 'fixed', inset: 0, zIndex: 9999,
+        background: 'rgba(0,0,0,0.85)',
+        display: 'flex', alignItems: 'center', justifyContent: 'center',
+        cursor: 'zoom-out',
+      }}
+    >
+      <img
+        src={src}
+        alt="preview"
+        onClick={(e) => e.stopPropagation()}
+        style={{
+          maxWidth: '92vw', maxHeight: '92vh',
+          borderRadius: 8,
+          boxShadow: '0 8px 40px rgba(0,0,0,0.6)',
+          cursor: 'default',
+        }}
+      />
+      <button
+        onClick={onClose}
+        style={{
+          position: 'fixed', top: 16, right: 20,
+          background: 'rgba(255,255,255,0.15)', border: 'none',
+          color: '#fff', fontSize: 22, lineHeight: 1,
+          width: 36, height: 36, borderRadius: '50%',
+          cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center',
+        }}
+      >×</button>
+    </div>
+  );
+};
 
 // ═══════════════════════════════════════
 //  ThinkingBlock
@@ -184,6 +238,17 @@ export const MessageBubble: React.FC<Props> = ({
   fontSize = 14,
   renderMarkdown = true,
 }) => {
+  const [lightboxSrc, setLightboxSrc] = useState<string | null>(null);
+  const contentRef = useRef<HTMLDivElement>(null);
+
+  // 委托捕获气泡内 markdown 渲染出的 img 点击
+  const handleContentClick = useCallback((e: React.MouseEvent<HTMLDivElement>) => {
+    const target = e.target as HTMLElement;
+    if (target.tagName === 'IMG') {
+      setLightboxSrc((target as HTMLImageElement).src);
+    }
+  }, []);
+
   // ★ system 消息独立渲染
   if (message.role === 'system') {
     return <SystemMessage message={message} renderMarkdown={renderMarkdown} />;
@@ -202,6 +267,8 @@ export const MessageBubble: React.FC<Props> = ({
     !isUser && renderMarkdown && message.content ? markdownToHtml(message.content) : null;
 
   return (
+    <>
+      {lightboxSrc && <ImageLightbox src={lightboxSrc} onClose={() => setLightboxSrc(null)} />}
     <div
       style={{
         display: 'flex',
@@ -220,6 +287,7 @@ export const MessageBubble: React.FC<Props> = ({
           fontSize,
           lineHeight: 1.6,
           wordBreak: 'break-word',
+          overflow: 'hidden',
         }}
       >
         {/* 附件图片 */}
@@ -235,11 +303,15 @@ export const MessageBubble: React.FC<Props> = ({
                   key={i}
                   src={src}
                   alt="attachment"
+                  onClick={() => setLightboxSrc(src)}
                   style={{
                     maxWidth: '100%',
                     maxHeight: 300,
+                    height: 'auto',
                     borderRadius: 8,
                     border: '1px solid var(--theme-border, rgba(0,0,0,0.12))',
+                    cursor: 'zoom-in',
+                    display: 'block',
                   }}
                 />
               );
@@ -263,7 +335,12 @@ export const MessageBubble: React.FC<Props> = ({
 
         {/* 正文 */}
         {contentHtml ? (
-          <div dangerouslySetInnerHTML={{ __html: contentHtml }} />
+          <div
+            ref={contentRef}
+            className="msg-content"
+            onClick={handleContentClick}
+            dangerouslySetInnerHTML={{ __html: contentHtml }}
+          />
         ) : message.content ? (
           <div style={{ whiteSpace: 'pre-wrap' }}>{message.content}</div>
         ) : null}
@@ -300,6 +377,7 @@ export const MessageBubble: React.FC<Props> = ({
         )}
       </div>
     </div>
+    </>
   );
 };
 
