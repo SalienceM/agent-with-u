@@ -71,27 +71,27 @@ export const themes: Record<ThemeType, {
     error: '#f85149',
   },
   light: {
-    // Refined Light theme - proper warm gray tones
-    // Based on GitHub Light + Tailwind warm grays
+    // Warm Crimson theme - inspired by AgentWithU app icon
+    // Cream background + dark red accents
     name: 'Light',
-    bg: '#ffffff',        // Pure white background
-    bgSecondary: '#f6f8fa',  // GitHub light gray
-    bgTertiary: '#eaeef2',
-    border: 'rgba(0,0,0,0.12)',
-    text: '#1f2328',      // Near-black, GitHub light text
-    textMuted: '#656d76', // GitHub muted gray, NOT transparent
-    accent: '#0969da',    // GitHub blue
-    accentHover: '#0550ae',
-    accentBg: '#0969da1a',
-    messageBg: '#f6f8fa',
-    userMessageBg: '#eaeef2',
-    codeBg: '#f6f8fa',    // GitHub inline code bg
-    inputBg: '#ffffff',
-    sidebarBg: '#f6f8fa',
-    success: '#2da44e',
-    successBg: '#2da44e1a',
-    successBorder: '#2da44e33',
-    error: '#cf222e',
+    bg: '#f0e8d8',           // Warm cream background (icon background tone)
+    bgSecondary: '#e8dcc8',  // Slightly deeper cream for secondary surfaces
+    bgTertiary: '#ddd0b8',   // Tertiary warm cream
+    border: '#9B2335',       // Dark crimson border/lines
+    text: '#1f1a17',         // Warm near-black text
+    textMuted: '#6b5a4e',    // Warm muted brown-gray
+    accent: '#8B1C1C',       // Deep crimson accent (icon primary color)
+    accentHover: '#6e1515',  // Darker crimson on hover
+    accentBg: '#8B1C1C1a',   // Crimson tint background (10% opacity)
+    messageBg: '#e8dcc8',    // Message background
+    userMessageBg: '#ddd0b8',// User message background
+    codeBg: '#e8dcc8',       // Code block background
+    inputBg: '#f0e8d8',      // Input field background
+    sidebarBg: '#e8dcc8',    // Sidebar background
+    success: '#2a7a3b',      // Muted green (harmonizes with warm palette)
+    successBg: '#2a7a3b1a',  // Light green background
+    successBorder: '#2a7a3b33', // Green border
+    error: '#cf222e',        // Error red
   },
   midnight: {
     // True Midnight - deep neutral dark, GitHub-inspired
