@@ -546,7 +546,17 @@ class BridgeWS:
             if not access_token:
                 return json.dumps({"token": None, "error": f"响应中无 access_token: {str(data)[:300]}"}, ensure_ascii=False)
 
-            # 8. 保存到 ~/.claude/.credentials.json
+            # 8. 构造 OAuth 数据并保存到 ~/.claude/.credentials.json
+            # Claude Code CLI 期望格式: {"claudeAiOauth": {"accessToken": ..., "refreshToken": ..., "expiresAt": ms, "scopes": [...]}}
+            expires_at_ms = int(time.time() * 1000) + int(data.get("expires_in", 28800)) * 1000
+            oauth_data: dict = {
+                "accessToken": access_token,
+                "expiresAt": expires_at_ms,
+                "scopes": [s for s in SCOPES.split() if s],
+            }
+            if "refresh_token" in data:
+                oauth_data["refreshToken"] = data["refresh_token"]
+
             creds_path = Path.home() / ".claude" / ".credentials.json"
             creds_path.parent.mkdir(parents=True, exist_ok=True)
             creds: dict = {}
@@ -555,15 +565,20 @@ class BridgeWS:
                     creds = json.loads(creds_path.read_text(encoding="utf-8"))
                 except Exception:
                     pass
-            creds["accessToken"] = access_token
-            if "refresh_token" in data:
-                creds["refreshToken"] = data["refresh_token"]
-            if "expires_in" in data:
-                creds["expiresAt"] = int(time.time() * 1000) + int(data["expires_in"]) * 1000
+            creds["claudeAiOauth"] = oauth_data
             creds_path.write_text(json.dumps(creds, ensure_ascii=False, indent=2), encoding="utf-8")
             print(f"[OAuth] Token 已保存到 {creds_path}", file=sys.stderr, flush=True)
 
-            return json.dumps({"token": access_token, "error": None}, ensure_ascii=False)
+            # CLAUDE_CODE_OAUTH_TOKEN 环境变量期望 JSON 对象字符串（expiresAt 为 ISO 8601）
+            from datetime import datetime, timezone
+            expires_at_iso = datetime.fromtimestamp(expires_at_ms / 1000, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+            token_env_json = json.dumps({
+                "accessToken": access_token,
+                "refreshToken": data.get("refresh_token", ""),
+                "expiresAt": expires_at_iso,
+            }, ensure_ascii=False)
+
+            return json.dumps({"token": token_env_json, "error": None}, ensure_ascii=False)
 
         except Exception as e:
             return json.dumps({"token": None, "error": f"Token 交换异常: {e}"}, ensure_ascii=False)

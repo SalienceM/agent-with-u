@@ -402,7 +402,7 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
                       value={formData.env?.CLAUDE_CODE_OAUTH_TOKEN || ''}
                       onChange={(e) => handleEnvChange('CLAUDE_CODE_OAUTH_TOKEN', e.target.value)}
                       style={inputStyle}
-                      placeholder="点击「获取 Token」自动填入，或手动粘贴 sk-ant-oat01-..."
+                      placeholder="点击「获取 Token」自动填入（JSON 格式，含 accessToken/refreshToken/expiresAt）"
                     />
                     {oauthError && (
                       <p style={{ fontSize: 11, color: 'var(--theme-error, #cf222e)', margin: '4px 0 0 0' }}>
