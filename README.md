@@ -31,7 +31,7 @@ AgentWithU 用 PySide6 托管 QWebEngine，前端是 React，后端是 Python—
 - **富消息渲染** — Markdown、代码块语法高亮、表格、任务列表
 - **流式响应** — token 逐字出现，支持 thinking 块折叠展示
 - **工具调用可视化** — 展示 AI 调用了哪些工具，输入输出一目了然
-- **多模型后端** — Claude Agent SDK · OpenAI 兼容接口（DeepSeek、本地 Ollama 等）
+- **多模型后端** — Claude Agent SDK（完整 Agent 能力，需 Claude Code）· Anthropic API · OpenAI 兼容接口（DeepSeek、本地 Ollama 等，轻量 Chat 模式）
 - **会话管理** — 多会话侧边栏，按工作目录组织，支持迁移模型
 - **权限审批** — 工具调用权限弹窗，diff 预览文件改动
 - **主题 & 外观** — 4 套配色（Dark / Light / Midnight / Ocean）+ 自定义背景图 + 面板透明度
@@ -64,6 +64,22 @@ AgentWithU 用 PySide6 托管 QWebEngine，前端是 React，后端是 Python—
 
 ---
 
+## 后端模式说明
+
+AgentWithU 支持三种后端类型，能力差异如下：
+
+| 后端类型 | 说明 | Agent 能力 | 额外前置 |
+|---------|------|-----------|---------|
+| `claude-agent-sdk` | 调用本地 Claude Code CLI 驱动 Agent Loop | ✅ 完整 Agent：文件读写、Shell 执行、工具调用 | **需先安装 Claude Code** |
+| `anthropic-api` | 直连 Anthropic API，轻量 Chat 模式 | ❌ 仅对话，无本地工具执行 | Anthropic API Key |
+| `openai-compatible` | 兼容 OpenAI 格式的任意接口 | ❌ 仅对话，无本地工具执行 | 对应服务的 API Key |
+
+> **关于 `claude-agent-sdk` 模式**：此模式底层依赖 [Claude Code](https://claude.ai/code) CLI 来实现本地 Agent Loop（自主调用工具、循环执行任务）。使用前须先完成 Claude Code 的安装与鉴权，这是**必选前置项**，缺少则无法启动该后端。
+>
+> `anthropic-api` 和 `openai-compatible` 模式不依赖 Claude Code，可作为**轻量 Chat 客户端**独立使用，适合只需要对话而不需要本地 Agent 能力的场景。
+
+---
+
 ## 快速开始
 
 ### 前置条件
@@ -71,6 +87,7 @@ AgentWithU 用 PySide6 托管 QWebEngine，前端是 React，后端是 Python—
 - Python 3.10+
 - Node.js 18+（仅首次构建前端时需要）
 - `ANTHROPIC_API_KEY` 或对应模型的 API Key
+- **使用 `claude-agent-sdk` 模式时**：需额外安装 [Claude Code](https://claude.ai/code) 并完成鉴权（`claude login`）
 
 ### 安装 & 运行
 
