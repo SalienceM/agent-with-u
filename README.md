@@ -1,3 +1,6 @@
+![AgentWithU](https://github.com/user-attachments/assets/5402414b-f77e-450d-b09c-f3edc51252f5)
+
+
 # AgentWithU
 
 > 一个给人用的 AI 桌面客户端——不是又一个套壳网页，是真正的原生应用。
@@ -108,72 +111,6 @@ API Key:   ollama                      # 任意非空字符串
 ```
 
 DeepSeek、Moonshot、零一万物等 OpenAI 兼容接口同理。
-
----
-
-## 打包发布
-
-### PyInstaller（跨平台 exe / app）
-
-```bash
-pip install pyinstaller
-pyinstaller --name "AgentWithU" --windowed \
-  --add-data "frontend/dist:frontend/dist" src/main.py
-```
-
-### Tauri（Windows NSIS 安装包）
-
-> Tauri 版通过 WebSocket 与 Python sidecar 通信，需先编译 Python 后端。
-
-```powershell
-# Step 1: 编译 Python sidecar
-pip install pyinstaller
-pyinstaller --name "agent-with-u-backend" --onefile --console `
-  --hidden-import websockets --hidden-import PIL `
-  src/ws_main_entry.py
-
-New-Item -ItemType Directory -Force -Path src-tauri\binaries
-Copy-Item dist\agent-with-u-backend.exe `
-  src-tauri\binaries\agent-with-u-backend-x86_64-pc-windows-msvc.exe
-
-# Step 2: 构建 Tauri 安装包
-npx tauri build --bundles nsis
-```
-
-产物在 `src-tauri/target/release/bundle/nsis/`。
-
----
-
-## 项目结构
-
-```
-agent-with-u/
-├── src/
-│   ├── ws_main.py              # WebSocket 服务入口（Tauri / 独立模式）
-│   ├── main.py                 # PySide6 模式入口
-│   ├── types.py                # 共享类型定义
-│   └── backend/
-│       ├── bridge.py           # WebSocket Bridge（RPC 分发）
-│       ├── backends.py         # ModelBackend 接口 + 实现
-│       ├── clipboard.py        # 剪贴板图片读取
-│       ├── session_store.py    # 会话 JSON 持久化
-│       └── app_config_store.py # 应用配置持久化
-└── frontend/src/
-    ├── App.tsx                 # 根组件 + 主题系统
-    ├── api.ts                  # WebSocket RPC 封装
-    ├── components/
-    │   ├── MessageBubble.tsx   # 消息渲染（Markdown · 代码 · 工具调用 · diff）
-    │   ├── ChatInput.tsx       # 输入框 + 图片预览 + slash 命令
-    │   ├── Sidebar.tsx         # 会话列表
-    │   ├── Settings.tsx        # 设置面板
-    │   ├── BackendManager.tsx  # 后端配置管理
-    │   ├── PermissionGate.tsx  # 工具调用权限审批
-    │   └── DiffView.tsx        # 文件 diff 预览
-    └── hooks/
-        ├── useChat.ts          # 聊天状态 + 流式处理 + slash 命令
-        ├── useConfig.ts        # 应用配置 + 主题
-        └── useClipboardImage.ts
-```
 
 ---
 
