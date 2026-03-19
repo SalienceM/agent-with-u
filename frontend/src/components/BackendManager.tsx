@@ -138,8 +138,11 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
     setOauthError(null);
     try {
       const result = await api.startOAuthFlow();
-      if (result.token) {
-        handleEnvChange('CLAUDE_CODE_OAUTH_TOKEN', result.token);
+      if (result.authenticated) {
+        // 认证成功：凭证已保存到 ~/.claude/.credentials.json，CLI 自动读取
+        // 用占位值标记 oauth 模式（不传给 CLI，仅用于 UI 状态恢复）
+        handleEnvChange('CLAUDE_CODE_OAUTH_TOKEN', '__oauth__');
+        setOauthError(null);
       } else {
         setOauthError(result.error || '获取失败');
       }
@@ -379,33 +382,28 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
                 {/* Claude.ai 官方账号 OAuth */}
                 {sdkAuthMode === 'oauth' && (
                   <div style={{ marginBottom: 10 }}>
-                    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 4 }}>
-                      <label style={{ fontSize: 11, color: 'var(--theme-text)' }}>
-                        CLAUDE_CODE_OAUTH_TOKEN
-                      </label>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
                       <button
                         onClick={handleGetOAuthToken}
                         disabled={oauthLoading}
                         style={{
-                          fontSize: 11, padding: '3px 10px', borderRadius: 5, cursor: oauthLoading ? 'wait' : 'pointer',
+                          fontSize: 12, padding: '5px 14px', borderRadius: 5, cursor: oauthLoading ? 'wait' : 'pointer',
                           border: '1px solid var(--theme-accent)',
                           background: oauthLoading ? 'var(--theme-bg-tertiary)' : 'var(--theme-accent-bg)',
                           color: 'var(--theme-accent)',
                           fontWeight: 500,
                         }}
                       >
-                        {oauthLoading ? '等待登录...' : '获取 Token'}
+                        {oauthLoading ? '等待浏览器登录...' : '打开浏览器登录 Claude.ai'}
                       </button>
+                      {!oauthLoading && !oauthError && formData.env?.CLAUDE_CODE_OAUTH_TOKEN === undefined && (
+                        <span style={{ fontSize: 11, color: 'var(--theme-text-muted)' }}>
+                          登录后凭证自动保存，无需复制 Token
+                        </span>
+                      )}
                     </div>
-                    <input
-                      type="password"
-                      value={formData.env?.CLAUDE_CODE_OAUTH_TOKEN || ''}
-                      onChange={(e) => handleEnvChange('CLAUDE_CODE_OAUTH_TOKEN', e.target.value)}
-                      style={inputStyle}
-                      placeholder="点击「获取 Token」自动填入（JSON 格式，含 accessToken/refreshToken/expiresAt）"
-                    />
                     {oauthError && (
-                      <p style={{ fontSize: 11, color: 'var(--theme-error, #cf222e)', margin: '4px 0 0 0' }}>
+                      <p style={{ fontSize: 11, color: 'var(--theme-error, #cf222e)', margin: '6px 0 0 0' }}>
                         {oauthError}
                       </p>
                     )}

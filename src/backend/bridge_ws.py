@@ -573,18 +573,8 @@ class BridgeWS:
             creds_path.write_text(json.dumps(creds, ensure_ascii=False, indent=2), encoding="utf-8")
             print(f"[OAuth] Token 已保存到 {creds_path} (claudeAiOauth 格式)", file=sys.stderr, flush=True)
 
-            # CLAUDE_CODE_OAUTH_TOKEN 环境变量期望 JSON 对象字符串（expiresAt 为 ISO 8601）
-            from datetime import datetime, timezone
-            expires_at_iso = datetime.fromtimestamp(expires_at_ms / 1000, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
-            token_env_value: dict = {
-                "accessToken": access_token,
-                "expiresAt": expires_at_iso,
-            }
-            if "refresh_token" in data:
-                token_env_value["refreshToken"] = data["refresh_token"]
-            token_env_json = json.dumps(token_env_value, ensure_ascii=False)
-
-            return json.dumps({"token": token_env_json, "error": None}, ensure_ascii=False)
+            # 不通过环境变量传 token，直接让 CLI 读取 credentials.json
+            return json.dumps({"authenticated": True, "error": None}, ensure_ascii=False)
 
         except Exception as e:
             return json.dumps({"token": None, "error": f"Token 交换异常: {e}"}, ensure_ascii=False)
