@@ -13,9 +13,8 @@ import sys
 import time
 from typing import Optional
 
-from PySide6.QtCore import QObject, Signal, Slot, QThread, Qt
+from PySide6.QtCore import QObject, Signal, Slot
 from PySide6.QtWidgets import QFileDialog
-from PySide6.QtGui import QGuiApplication
 
 from ..types import (
     ModelBackendConfig,

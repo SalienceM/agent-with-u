@@ -249,11 +249,6 @@ class ClaudeCodeInstance:
             elif tag == "error":
                 emit("error", error=str(payload))
                 break
-            elif tag == "fallback":
-                print("[Instance] Fallback to json mode",
-                      file=sys.stderr, flush=True)
-                # TODO: Implement fallback
-                break
             elif tag == "text":
                 total_waited = 0
                 emit("text_delta", text=payload + "\n")

@@ -1,4 +1,3 @@
-use tauri::Manager;
 use tauri_plugin_shell::ShellExt;
 
 const WS_PORT: u16 = 44321;
