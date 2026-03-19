@@ -573,8 +573,8 @@ class BridgeWS:
             creds_path.write_text(json.dumps(creds, ensure_ascii=False, indent=2), encoding="utf-8")
             print(f"[OAuth] Token 已保存到 {creds_path} (claudeAiOauth 格式)", file=sys.stderr, flush=True)
 
-            # 不通过环境变量传 token，直接让 CLI 读取 credentials.json
-            return json.dumps({"authenticated": True, "error": None}, ensure_ascii=False)
+            # 返回 plain access_token，前端存入 ANTHROPIC_AUTH_TOKEN，每次调用显式传递
+            return json.dumps({"token": access_token, "error": None}, ensure_ascii=False)
 
         except Exception as e:
             return json.dumps({"token": None, "error": f"Token 交换异常: {e}"}, ensure_ascii=False)

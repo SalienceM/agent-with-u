@@ -56,8 +56,6 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
     apiKey: '',
     env: {},
   });
-  // claude-agent-sdk 认证模式：'oauth'（Claude.ai 账号）| 'apikey'（API Key / 代理）
-  const [sdkAuthMode, setSdkAuthMode] = useState<'oauth' | 'apikey'>('apikey');
   const [oauthLoading, setOauthLoading] = useState(false);
   const [oauthError, setOauthError] = useState<string | null>(null);
   const [backendToDelete, setBackendToDelete] = useState<BackendConfig | null>(null);
@@ -81,10 +79,6 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
     setFormData({ ...backend, env: backend.env || {} });
     setEditingBackend(backend);
     setIsEditing(true);
-    // 根据已保存的 env 自动判断认证模式
-    if (backend.type === 'claude-agent-sdk') {
-      setSdkAuthMode(backend.env?.CLAUDE_CODE_OAUTH_TOKEN ? 'oauth' : 'apikey');
-    }
   }, []);
 
   const handleSave = useCallback(() => {
@@ -138,11 +132,9 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
     setOauthError(null);
     try {
       const result = await api.startOAuthFlow();
-      if (result.authenticated) {
-        // 认证成功：凭证已保存到 ~/.claude/.credentials.json，CLI 自动读取
-        // 用占位值标记 oauth 模式（不传给 CLI，仅用于 UI 状态恢复）
-        handleEnvChange('CLAUDE_CODE_OAUTH_TOKEN', '__oauth__');
-        setOauthError(null);
+      if (result.token) {
+        // 把 access_token 直接存入 ANTHROPIC_AUTH_TOKEN，和普通 API key 完全一样
+        handleEnvChange('ANTHROPIC_AUTH_TOKEN', result.token);
       } else {
         setOauthError(result.error || '获取失败');
       }
@@ -152,22 +144,6 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
       setOauthLoading(false);
     }
   }, [handleEnvChange]);
-
-  const handleSdkAuthModeChange = useCallback((mode: 'oauth' | 'apikey') => {
-    setSdkAuthMode(mode);
-    // 切换时清空另一种认证的 token，避免同时保存两个
-    if (mode === 'oauth') {
-      setFormData((prev) => ({
-        ...prev,
-        env: { ...prev.env, ANTHROPIC_AUTH_TOKEN: '', ANTHROPIC_BASE_URL: '' },
-      }));
-    } else {
-      setFormData((prev) => ({
-        ...prev,
-        env: { ...prev.env, CLAUDE_CODE_OAUTH_TOKEN: '' },
-      }));
-    }
-  }, []);
 
   const handleDeleteClick = useCallback((backend: BackendConfig) => {
     // Find sessions that depend on this backend
@@ -237,8 +213,8 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
                         {backend.type === 'claude-agent-sdk' && backend.env?.ANTHROPIC_MODEL && (
                           <span> · {backend.env.ANTHROPIC_MODEL}</span>
                         )}
-                        {backend.type === 'claude-agent-sdk' && backend.env?.CLAUDE_CODE_OAUTH_TOKEN && (
-                          <span> · OAuth</span>
+                        {backend.type === 'claude-agent-sdk' && backend.env?.ANTHROPIC_AUTH_TOKEN && (
+                          <span> · Auth</span>
                         )}
                         {(backend.type === 'openai-compatible' || backend.type === 'anthropic-api') && backend.model && (
                           <span> · {backend.model}</span>
@@ -329,86 +305,50 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
               <div style={{ marginBottom: 16, padding: 12, background: 'var(--theme-bg-secondary)', borderRadius: 8 }}>
                 <label style={{ ...labelStyle, marginBottom: 8 }}>Claude Agent SDK 配置</label>
 
-                {/* 认证方式选择 */}
-                <div style={{ display: 'flex', gap: 8, marginBottom: 14 }}>
-                  {(['apikey', 'oauth'] as const).map((mode) => {
-                    const active = sdkAuthMode === mode;
-                    return (
-                      <button
-                        key={mode}
-                        onClick={() => handleSdkAuthModeChange(mode)}
-                        style={{
-                          flex: 1, padding: '6px 0', fontSize: 12, borderRadius: 6, cursor: 'pointer',
-                          border: `1px solid ${active ? 'var(--theme-accent)' : 'var(--theme-border)'}`,
-                          background: active ? 'var(--theme-accent-bg)' : 'transparent',
-                          color: active ? 'var(--theme-accent)' : 'var(--theme-text-muted)',
-                          fontWeight: active ? 600 : 400,
-                        }}
-                      >
-                        {mode === 'apikey' ? 'API Key / 代理服务' : 'Claude.ai 官方账号'}
-                      </button>
-                    );
-                  })}
+                {/* ANTHROPIC_AUTH_TOKEN：手动粘贴或浏览器 OAuth 自动填入 */}
+                <div style={{ marginBottom: 10 }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 4 }}>
+                    <label style={{ fontSize: 11, color: 'var(--theme-text)' }}>ANTHROPIC_AUTH_TOKEN</label>
+                    <button
+                      onClick={handleGetOAuthToken}
+                      disabled={oauthLoading}
+                      style={{
+                        fontSize: 11, padding: '3px 10px', borderRadius: 5, cursor: oauthLoading ? 'wait' : 'pointer',
+                        border: '1px solid var(--theme-accent)',
+                        background: oauthLoading ? 'var(--theme-bg-tertiary)' : 'var(--theme-accent-bg)',
+                        color: 'var(--theme-accent)', fontWeight: 500,
+                      }}
+                    >
+                      {oauthLoading ? '等待浏览器登录...' : '浏览器登录自动填入'}
+                    </button>
+                  </div>
+                  <input
+                    type="password"
+                    value={formData.env?.ANTHROPIC_AUTH_TOKEN || ''}
+                    onChange={(e) => handleEnvChange('ANTHROPIC_AUTH_TOKEN', e.target.value)}
+                    style={inputStyle}
+                    placeholder="sk-ant-... 或点击右侧按钮通过浏览器登录获取"
+                  />
+                  {oauthError && (
+                    <p style={{ fontSize: 11, color: 'var(--theme-error, #cf222e)', margin: '4px 0 0 0' }}>
+                      {oauthError}
+                    </p>
+                  )}
                 </div>
 
-                {/* API Key / 代理服务 */}
-                {sdkAuthMode === 'apikey' && (<>
-                  <div style={{ marginBottom: 10 }}>
-                    <label style={{ fontSize: 11, color: 'var(--theme-text)', display: 'block', marginBottom: 4 }}>
-                      ANTHROPIC_AUTH_TOKEN
-                    </label>
-                    <input
-                      type="password"
-                      value={formData.env?.ANTHROPIC_AUTH_TOKEN || ''}
-                      onChange={(e) => handleEnvChange('ANTHROPIC_AUTH_TOKEN', e.target.value)}
-                      style={inputStyle}
-                      placeholder="sk-ant-... （留空使用全局 ~/.claude 配置）"
-                    />
-                  </div>
-                  <div style={{ marginBottom: 10 }}>
-                    <label style={{ fontSize: 11, color: 'var(--theme-text)', display: 'block', marginBottom: 4 }}>
-                      ANTHROPIC_BASE_URL（代理地址，可选）
-                    </label>
-                    <input
-                      type="text"
-                      value={formData.env?.ANTHROPIC_BASE_URL || ''}
-                      onChange={(e) => handleEnvChange('ANTHROPIC_BASE_URL', e.target.value)}
-                      style={inputStyle}
-                      placeholder="e.g., https://coding.dashscope.aliyuncs.com/apps/anthropic"
-                    />
-                  </div>
-                </>)}
-
-                {/* Claude.ai 官方账号 OAuth */}
-                {sdkAuthMode === 'oauth' && (
-                  <div style={{ marginBottom: 10 }}>
-                    <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                      <button
-                        onClick={handleGetOAuthToken}
-                        disabled={oauthLoading}
-                        style={{
-                          fontSize: 12, padding: '5px 14px', borderRadius: 5, cursor: oauthLoading ? 'wait' : 'pointer',
-                          border: '1px solid var(--theme-accent)',
-                          background: oauthLoading ? 'var(--theme-bg-tertiary)' : 'var(--theme-accent-bg)',
-                          color: 'var(--theme-accent)',
-                          fontWeight: 500,
-                        }}
-                      >
-                        {oauthLoading ? '等待浏览器登录...' : '打开浏览器登录 Claude.ai'}
-                      </button>
-                      {!oauthLoading && !oauthError && formData.env?.CLAUDE_CODE_OAUTH_TOKEN === undefined && (
-                        <span style={{ fontSize: 11, color: 'var(--theme-text-muted)' }}>
-                          登录后凭证自动保存，无需复制 Token
-                        </span>
-                      )}
-                    </div>
-                    {oauthError && (
-                      <p style={{ fontSize: 11, color: 'var(--theme-error, #cf222e)', margin: '6px 0 0 0' }}>
-                        {oauthError}
-                      </p>
-                    )}
-                  </div>
-                )}
+                {/* ANTHROPIC_BASE_URL：代理地址（可选） */}
+                <div style={{ marginBottom: 10 }}>
+                  <label style={{ fontSize: 11, color: 'var(--theme-text)', display: 'block', marginBottom: 4 }}>
+                    ANTHROPIC_BASE_URL（代理地址，可选）
+                  </label>
+                  <input
+                    type="text"
+                    value={formData.env?.ANTHROPIC_BASE_URL || ''}
+                    onChange={(e) => handleEnvChange('ANTHROPIC_BASE_URL', e.target.value)}
+                    style={inputStyle}
+                    placeholder="e.g., https://coding.dashscope.aliyuncs.com/apps/anthropic"
+                  />
+                </div>
 
                 <div style={{ marginBottom: 10 }}>
                   <label style={{ fontSize: 11, color: 'var(--theme-text)', display: 'block', marginBottom: 4 }}>
