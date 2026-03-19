@@ -1,4 +1,5 @@
-import React, { useState, useCallback } from 'react';
+import React, { useState, useCallback, useRef } from 'react';
+import { api } from '../api';
 
 // Global variable to store selected target backend for migration
 declare global {
@@ -57,6 +58,8 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
   });
   // claude-agent-sdk 认证模式：'oauth'（Claude.ai 账号）| 'apikey'（API Key / 代理）
   const [sdkAuthMode, setSdkAuthMode] = useState<'oauth' | 'apikey'>('apikey');
+  const [oauthLoading, setOauthLoading] = useState(false);
+  const [oauthError, setOauthError] = useState<string | null>(null);
   const [backendToDelete, setBackendToDelete] = useState<BackendConfig | null>(null);
   const [dependentSessions, setDependentSessions] = useState<any[]>([]);
 
@@ -129,6 +132,23 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
       },
     }));
   }, []);
+
+  const handleGetOAuthToken = useCallback(async () => {
+    setOauthLoading(true);
+    setOauthError(null);
+    try {
+      const result = await api.startOAuthFlow();
+      if (result.token) {
+        handleEnvChange('CLAUDE_CODE_OAUTH_TOKEN', result.token);
+      } else {
+        setOauthError(result.error || '获取失败');
+      }
+    } catch (e: any) {
+      setOauthError(e?.message || '获取失败');
+    } finally {
+      setOauthLoading(false);
+    }
+  }, [handleEnvChange]);
 
   const handleSdkAuthModeChange = useCallback((mode: 'oauth' | 'apikey') => {
     setSdkAuthMode(mode);
@@ -359,19 +379,36 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
                 {/* Claude.ai 官方账号 OAuth */}
                 {sdkAuthMode === 'oauth' && (
                   <div style={{ marginBottom: 10 }}>
-                    <label style={{ fontSize: 11, color: 'var(--theme-text)', display: 'block', marginBottom: 4 }}>
-                      CLAUDE_CODE_OAUTH_TOKEN
-                    </label>
+                    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 4 }}>
+                      <label style={{ fontSize: 11, color: 'var(--theme-text)' }}>
+                        CLAUDE_CODE_OAUTH_TOKEN
+                      </label>
+                      <button
+                        onClick={handleGetOAuthToken}
+                        disabled={oauthLoading}
+                        style={{
+                          fontSize: 11, padding: '3px 10px', borderRadius: 5, cursor: oauthLoading ? 'wait' : 'pointer',
+                          border: '1px solid var(--theme-accent)',
+                          background: oauthLoading ? 'var(--theme-bg-tertiary)' : 'var(--theme-accent-bg)',
+                          color: 'var(--theme-accent)',
+                          fontWeight: 500,
+                        }}
+                      >
+                        {oauthLoading ? '等待登录...' : '获取 Token'}
+                      </button>
+                    </div>
                     <input
                       type="password"
                       value={formData.env?.CLAUDE_CODE_OAUTH_TOKEN || ''}
                       onChange={(e) => handleEnvChange('CLAUDE_CODE_OAUTH_TOKEN', e.target.value)}
                       style={inputStyle}
-                      placeholder="sk-ant-oat01-..."
+                      placeholder="点击「获取 Token」自动填入，或手动粘贴 sk-ant-oat01-..."
                     />
-                    <p style={{ fontSize: 11, color: 'var(--theme-text-muted)', margin: '4px 0 0 0' }}>
-                      在终端运行 <code style={{ background: 'var(--theme-bg-tertiary)', padding: '1px 5px', borderRadius: 3 }}>claude setup-token</code> 登录后获取。
-                    </p>
+                    {oauthError && (
+                      <p style={{ fontSize: 11, color: 'var(--theme-error, #cf222e)', margin: '4px 0 0 0' }}>
+                        {oauthError}
+                      </p>
+                    )}
                   </div>
                 )}
 

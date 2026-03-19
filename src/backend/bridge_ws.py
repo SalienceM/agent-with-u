@@ -392,6 +392,120 @@ class BridgeWS:
         except Exception as e:
             return json.dumps({"status": "error", "message": str(e)}, ensure_ascii=False)
 
+    # ── RPC: Claude OAuth Token 获取 ────────────────────────────
+
+    async def _rpc_startOAuthFlow(self) -> str:
+        """
+        运行 `claude setup-token`，自动打开浏览器完成 OAuth 登录，
+        登录完成后从 ~/.claude/.credentials.json 读取 token 返回。
+
+        返回 JSON: {"token": "sk-ant-oat01-...", "error": null}
+                or {"token": null, "error": "错误信息"}
+        """
+        import shutil
+        import re
+        import webbrowser
+        from pathlib import Path
+
+        def _find_claude_cli() -> Optional[str]:
+            # 1. 系统 PATH
+            p = shutil.which("claude")
+            if p:
+                return p
+            # 2. SDK 内置 CLI
+            try:
+                from claude_agent_sdk._impl.client import _get_cli_path  # type: ignore
+                p = _get_cli_path()
+                if p:
+                    return p
+            except Exception:
+                pass
+            try:
+                import claude_agent_sdk as _sdk
+                sdk_dir = Path(_sdk.__file__).parent
+                for candidate in ("_bin/claude", "bin/claude", "claude"):
+                    full = sdk_dir / candidate
+                    if full.exists():
+                        return str(full)
+            except Exception:
+                pass
+            # 3. 常见位置
+            for p in ("~/.local/bin/claude", "~/.npm-global/bin/claude",
+                      "/usr/local/bin/claude"):
+                full = Path(p).expanduser()
+                if full.exists():
+                    return str(full)
+            return None
+
+        def _read_token_from_creds() -> Optional[str]:
+            creds_path = Path.home() / ".claude" / ".credentials.json"
+            if not creds_path.exists():
+                return None
+            try:
+                data = json.loads(creds_path.read_text(encoding="utf-8"))
+                # 递归搜索 accessToken 或 CLAUDE_CODE_OAUTH_TOKEN 格式
+                def _search(obj) -> Optional[str]:
+                    if isinstance(obj, dict):
+                        for k, v in obj.items():
+                            if k in ("accessToken", "access_token", "oauthToken"):
+                                if isinstance(v, str) and v.startswith("sk-ant-"):
+                                    return v
+                            result = _search(v)
+                            if result:
+                                return result
+                    elif isinstance(obj, str) and obj.startswith("sk-ant-oat01-"):
+                        return obj
+                    return None
+                return _search(data)
+            except Exception:
+                return None
+
+        cli = _find_claude_cli()
+        if not cli:
+            return json.dumps({"token": None, "error": "未找到 claude CLI，请先安装 claude-code"}, ensure_ascii=False)
+
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                cli, "setup-token",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+            )
+
+            url_opened = False
+            output_lines: list[str] = []
+            assert proc.stdout is not None
+            async for raw in proc.stdout:
+                line = raw.decode("utf-8", errors="replace").strip()
+                output_lines.append(line)
+                print(f"[OAuth] {line}", file=sys.stderr, flush=True)
+                if not url_opened:
+                    urls = re.findall(r"https://[^\s\"']+", line)
+                    for url in urls:
+                        print(f"[OAuth] 打开浏览器: {url}", file=sys.stderr, flush=True)
+                        webbrowser.open(url)
+                        url_opened = True
+                        break
+
+            await proc.wait()
+
+            token = _read_token_from_creds()
+            if token:
+                return json.dumps({"token": token, "error": None}, ensure_ascii=False)
+
+            # 从输出中尝试提取 token（某些版本 CLI 会打印出来）
+            for line in output_lines:
+                m = re.search(r"sk-ant-oat01-\S+", line)
+                if m:
+                    return json.dumps({"token": m.group(), "error": None}, ensure_ascii=False)
+
+            return json.dumps({
+                "token": None,
+                "error": "登录流程已完成，但未能读取到 Token，请手动复制 ~/.claude/.credentials.json 中的 accessToken",
+            }, ensure_ascii=False)
+
+        except Exception as e:
+            return json.dumps({"token": None, "error": str(e)}, ensure_ascii=False)
+
     # ── 权限门控 RPC ─────────────────────────────────────────────
 
     def _rpc_grantPermission(self, session_id: str, granted: bool) -> None:
