@@ -175,16 +175,19 @@ class ClaudeAgentBackend(ModelBackend):
             if skip_permissions is None:
                 skip_permissions = getattr(self.config, "skip_permissions", True)
 
-            # 收集环境变量传给 SDK（OAuth 模式不传 token，CLI 自动读 ~/.claude/.credentials.json）
+            # 收集环境变量传给 SDK
             env_dict: dict[str, str] = {}
             for key in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN",
-                        "ANTHROPIC_BASE_URL", "ANTHROPIC_MODEL"):
+                        "ANTHROPIC_BASE_URL", "ANTHROPIC_MODEL",
+                        # 代理：后端配置优先，否则从系统环境继承
+                        "HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY", "NO_PROXY",
+                        "https_proxy", "http_proxy", "all_proxy", "no_proxy"):
                 val = self.get_env(key)
                 if val:
                     env_dict[key] = val
             print(f"[ClaudeAgent] auth: API_KEY={'yes' if 'ANTHROPIC_API_KEY' in env_dict else 'no'}"
                   f", AUTH_TOKEN={'yes' if 'ANTHROPIC_AUTH_TOKEN' in env_dict else 'no'}"
-                  f", oauth_creds={'yes' if (Path.home()/'.claude'/'.credentials.json').exists() else 'no'}",
+                  f", proxy={env_dict.get('HTTPS_PROXY') or env_dict.get('https_proxy') or 'none'}",
                   file=sys.stderr, flush=True)
 
             # ★ 图片处理：使用 AsyncIterable[dict] 形式的 prompt 原生传递图片

@@ -371,6 +371,22 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
                   />
                 </div>
 
+                <div style={{ marginBottom: 10 }}>
+                  <label style={{ fontSize: 11, color: 'var(--theme-text)', display: 'block', marginBottom: 4 }}>
+                    HTTPS_PROXY（代理，可选）
+                  </label>
+                  <input
+                    type="text"
+                    value={formData.env?.HTTPS_PROXY || ''}
+                    onChange={(e) => handleEnvChange('HTTPS_PROXY', e.target.value)}
+                    style={inputStyle}
+                    placeholder="留空不走代理，e.g., http://127.0.0.1:7890"
+                  />
+                  <p style={{ fontSize: 10, color: 'var(--theme-text-muted)', margin: '3px 0 0 0' }}>
+                    填写后 CLI 子进程的所有请求均走此代理（Clash 默认端口 7890）
+                  </p>
+                </div>
+
                 <div style={{ marginTop: 12 }}>
                   <label style={{ ...labelStyle, display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer', marginBottom: 0 }}>
                     <input
