@@ -192,6 +192,9 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
                         {backend.type === 'claude-agent-sdk' && backend.env?.ANTHROPIC_MODEL && (
                           <span> · {backend.env.ANTHROPIC_MODEL}</span>
                         )}
+                        {backend.type === 'claude-agent-sdk' && backend.env?.CLAUDE_CODE_OAUTH_TOKEN && (
+                          <span> · OAuth</span>
+                        )}
                         {(backend.type === 'openai-compatible' || backend.type === 'anthropic-api') && backend.model && (
                           <span> · {backend.model}</span>
                         )}
@@ -286,7 +289,26 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
 
                 <div style={{ marginBottom: 10 }}>
                   <label style={{ fontSize: 11, color: 'var(--theme-text)', display: 'block', marginBottom: 4 }}>
+                    CLAUDE_CODE_OAUTH_TOKEN
+                    <span style={{ fontSize: 10, color: 'var(--theme-text-muted)', marginLeft: 6 }}>
+                      （Claude Pro/Max 账号，推荐）
+                    </span>
+                  </label>
+                  <input
+                    type="password"
+                    value={formData.env?.CLAUDE_CODE_OAUTH_TOKEN || ''}
+                    onChange={(e) => handleEnvChange('CLAUDE_CODE_OAUTH_TOKEN', e.target.value)}
+                    style={inputStyle}
+                    placeholder="sk-ant-oat01-... （运行 claude setup-token 获取）"
+                  />
+                </div>
+
+                <div style={{ marginBottom: 10 }}>
+                  <label style={{ fontSize: 11, color: 'var(--theme-text)', display: 'block', marginBottom: 4 }}>
                     ANTHROPIC_AUTH_TOKEN
+                    <span style={{ fontSize: 10, color: 'var(--theme-text-muted)', marginLeft: 6 }}>
+                      （API Key / 代理 Bearer Token）
+                    </span>
                   </label>
                   <input
                     type="password"

@@ -177,7 +177,8 @@ class ClaudeAgentBackend(ModelBackend):
             # 收集环境变量传给 SDK
             env_dict: dict[str, str] = {}
             for key in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN",
-                        "ANTHROPIC_BASE_URL", "ANTHROPIC_MODEL"):
+                        "ANTHROPIC_BASE_URL", "ANTHROPIC_MODEL",
+                        "CLAUDE_CODE_OAUTH_TOKEN"):
                 val = self.get_env(key)
                 if val:
                     env_dict[key] = val
