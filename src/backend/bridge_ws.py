@@ -396,115 +396,177 @@ class BridgeWS:
 
     async def _rpc_startOAuthFlow(self) -> str:
         """
-        运行 `claude setup-token`，自动打开浏览器完成 OAuth 登录，
-        登录完成后从 ~/.claude/.credentials.json 读取 token 返回。
+        自行实现 OAuth PKCE 流程（不依赖 claude CLI setup-token，
+        避免非 TTY 环境下 redirect_uri 缺失的问题）。
+
+        流程:
+          1. 生成 PKCE code_verifier / code_challenge
+          2. 在本地随机端口启动 HTTP 回调服务器
+          3. 构造完整 OAuth URL（含 redirect_uri）并打开浏览器
+          4. 等待浏览器回调（最长 5 分钟）
+          5. 用 authorization_code 换 access_token
+          6. 保存到 ~/.claude/.credentials.json 并返回 token
 
         返回 JSON: {"token": "sk-ant-oat01-...", "error": null}
                 or {"token": null, "error": "错误信息"}
         """
-        import shutil
-        import re
+        import secrets
+        import hashlib
+        import base64
+        import socket
+        import time
+        import urllib.parse
         import webbrowser
+        import threading
         from pathlib import Path
+        from http.server import HTTPServer, BaseHTTPRequestHandler
 
-        def _find_claude_cli() -> Optional[str]:
-            # 1. 系统 PATH
-            p = shutil.which("claude")
-            if p:
-                return p
-            # 2. SDK 内置 CLI
-            try:
-                from claude_agent_sdk._impl.client import _get_cli_path  # type: ignore
-                p = _get_cli_path()
-                if p:
-                    return p
-            except Exception:
+        # OAuth 配置（来自 claude CLI 源码 gq8 常量）
+        CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+        AUTH_URL = "https://claude.ai/oauth/authorize"
+        TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
+        SCOPES = "org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers"
+        TIMEOUT = 300  # 5 分钟
+
+        # 1. 生成 PKCE
+        code_verifier = secrets.token_urlsafe(64)
+        code_challenge = base64.urlsafe_b64encode(
+            hashlib.sha256(code_verifier.encode()).digest()
+        ).rstrip(b"=").decode()
+        state = secrets.token_urlsafe(32)
+
+        # 2. 找可用本地端口
+        with socket.socket() as _s:
+            _s.bind(("127.0.0.1", 0))
+            port = _s.getsockname()[1]
+
+        redirect_uri = f"http://localhost:{port}/callback"
+
+        # 3. 构造完整 OAuth URL
+        auth_url = AUTH_URL + "?" + urllib.parse.urlencode({
+            "client_id": CLIENT_ID,
+            "response_type": "code",
+            "redirect_uri": redirect_uri,
+            "scope": SCOPES,
+            "code_challenge": code_challenge,
+            "code_challenge_method": "S256",
+            "state": state,
+        })
+
+        # 4. 启动本地回调服务器（只接收一个请求）
+        callback_result: dict = {}
+        callback_event = threading.Event()
+        _state = state  # 闭包捕获
+
+        class _CallbackHandler(BaseHTTPRequestHandler):
+            def log_message(self, fmt, *args):  # 静默日志
                 pass
-            try:
-                import claude_agent_sdk as _sdk
-                sdk_dir = Path(_sdk.__file__).parent
-                for candidate in ("_bin/claude", "bin/claude", "claude"):
-                    full = sdk_dir / candidate
-                    if full.exists():
-                        return str(full)
-            except Exception:
-                pass
-            # 3. 常见位置
-            for p in ("~/.local/bin/claude", "~/.npm-global/bin/claude",
-                      "/usr/local/bin/claude"):
-                full = Path(p).expanduser()
-                if full.exists():
-                    return str(full)
-            return None
 
-        def _read_token_from_creds() -> Optional[str]:
-            creds_path = Path.home() / ".claude" / ".credentials.json"
-            if not creds_path.exists():
-                return None
-            try:
-                data = json.loads(creds_path.read_text(encoding="utf-8"))
-                # 递归搜索 accessToken 或 CLAUDE_CODE_OAUTH_TOKEN 格式
-                def _search(obj) -> Optional[str]:
-                    if isinstance(obj, dict):
-                        for k, v in obj.items():
-                            if k in ("accessToken", "access_token", "oauthToken"):
-                                if isinstance(v, str) and v.startswith("sk-ant-"):
-                                    return v
-                            result = _search(v)
-                            if result:
-                                return result
-                    elif isinstance(obj, str) and obj.startswith("sk-ant-oat01-"):
-                        return obj
-                    return None
-                return _search(data)
-            except Exception:
-                return None
+            def do_GET(self):
+                parsed = urllib.parse.urlparse(self.path)
+                if parsed.path != "/callback":
+                    self.send_response(404)
+                    self.end_headers()
+                    return
+                qs = urllib.parse.parse_qs(parsed.query)
+                code = (qs.get("code") or [None])[0]
+                ret_state = (qs.get("state") or [None])[0]
+                error = (qs.get("error") or [None])[0]
 
-        cli = _find_claude_cli()
-        if not cli:
-            return json.dumps({"token": None, "error": "未找到 claude CLI，请先安装 claude-code"}, ensure_ascii=False)
+                if error:
+                    callback_result["error"] = error
+                elif ret_state != _state:
+                    callback_result["error"] = "state 不匹配，疑似 CSRF"
+                elif code:
+                    callback_result["code"] = code
+                else:
+                    callback_result["error"] = "回调中无授权码"
 
+                body = b"<html><body><h2>Login successful!</h2><p>You can close this tab now.</p></body></html>"
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                callback_event.set()
+
+        server = HTTPServer(("127.0.0.1", port), _CallbackHandler)
+
+        def _serve():
+            server.handle_request()
+            server.server_close()
+
+        threading.Thread(target=_serve, daemon=True).start()
+
+        # 5. 打开浏览器
+        print(f"[OAuth] 打开授权页面: {auth_url}", file=sys.stderr, flush=True)
+        webbrowser.open(auth_url)
+
+        # 6. 等待回调（asyncio 非阻塞）
+        loop = asyncio.get_event_loop()
         try:
-            proc = await asyncio.create_subprocess_exec(
-                cli, "setup-token",
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT,
+            await asyncio.wait_for(
+                loop.run_in_executor(None, lambda: callback_event.wait(TIMEOUT)),
+                timeout=TIMEOUT + 5,
             )
+        except asyncio.TimeoutError:
+            return json.dumps({"token": None, "error": "登录超时（5 分钟），请重试"}, ensure_ascii=False)
 
-            url_opened = False
-            output_lines: list[str] = []
-            assert proc.stdout is not None
-            async for raw in proc.stdout:
-                line = raw.decode("utf-8", errors="replace").strip()
-                output_lines.append(line)
-                print(f"[OAuth] {line}", file=sys.stderr, flush=True)
-                if not url_opened:
-                    urls = re.findall(r"https://[^\s\"']+", line)
-                    for url in urls:
-                        print(f"[OAuth] 打开浏览器: {url}", file=sys.stderr, flush=True)
-                        webbrowser.open(url)
-                        url_opened = True
-                        break
+        if "error" in callback_result:
+            return json.dumps({"token": None, "error": f"OAuth 错误: {callback_result['error']}"}, ensure_ascii=False)
 
-            await proc.wait()
+        code = callback_result.get("code")
+        if not code:
+            return json.dumps({"token": None, "error": "未收到授权码"}, ensure_ascii=False)
 
-            token = _read_token_from_creds()
-            if token:
-                return json.dumps({"token": token, "error": None}, ensure_ascii=False)
+        # 7. 用 code 换 access_token
+        try:
+            import httpx
+            async with httpx.AsyncClient(timeout=30) as client:
+                resp = await client.post(
+                    TOKEN_URL,
+                    json={
+                        "grant_type": "authorization_code",
+                        "code": code,
+                        "redirect_uri": redirect_uri,
+                        "client_id": CLIENT_ID,
+                        "code_verifier": code_verifier,
+                        "state": state,
+                    },
+                    headers={"Content-Type": "application/json"},
+                )
+            if resp.status_code != 200:
+                return json.dumps({
+                    "token": None,
+                    "error": f"Token 交换失败 ({resp.status_code}): {resp.text[:300]}",
+                }, ensure_ascii=False)
 
-            # 从输出中尝试提取 token（某些版本 CLI 会打印出来）
-            for line in output_lines:
-                m = re.search(r"sk-ant-oat01-\S+", line)
-                if m:
-                    return json.dumps({"token": m.group(), "error": None}, ensure_ascii=False)
+            data = resp.json()
+            access_token: Optional[str] = data.get("access_token")
+            if not access_token:
+                return json.dumps({"token": None, "error": f"响应中无 access_token: {str(data)[:300]}"}, ensure_ascii=False)
 
-            return json.dumps({
-                "token": None,
-                "error": "登录流程已完成，但未能读取到 Token，请手动复制 ~/.claude/.credentials.json 中的 accessToken",
-            }, ensure_ascii=False)
+            # 8. 保存到 ~/.claude/.credentials.json
+            creds_path = Path.home() / ".claude" / ".credentials.json"
+            creds_path.parent.mkdir(parents=True, exist_ok=True)
+            creds: dict = {}
+            if creds_path.exists():
+                try:
+                    creds = json.loads(creds_path.read_text(encoding="utf-8"))
+                except Exception:
+                    pass
+            creds["accessToken"] = access_token
+            if "refresh_token" in data:
+                creds["refreshToken"] = data["refresh_token"]
+            if "expires_in" in data:
+                creds["expiresAt"] = int(time.time() * 1000) + int(data["expires_in"]) * 1000
+            creds_path.write_text(json.dumps(creds, ensure_ascii=False, indent=2), encoding="utf-8")
+            print(f"[OAuth] Token 已保存到 {creds_path}", file=sys.stderr, flush=True)
+
+            return json.dumps({"token": access_token, "error": None}, ensure_ascii=False)
 
         except Exception as e:
-            return json.dumps({"token": None, "error": str(e)}, ensure_ascii=False)
+            return json.dumps({"token": None, "error": f"Token 交换异常: {e}"}, ensure_ascii=False)
 
     # ── 权限门控 RPC ─────────────────────────────────────────────
 
