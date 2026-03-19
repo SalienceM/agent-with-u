@@ -55,6 +55,8 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
     apiKey: '',
     env: {},
   });
+  // claude-agent-sdk 认证模式：'oauth'（Claude.ai 账号）| 'apikey'（API Key / 代理）
+  const [sdkAuthMode, setSdkAuthMode] = useState<'oauth' | 'apikey'>('apikey');
   const [backendToDelete, setBackendToDelete] = useState<BackendConfig | null>(null);
   const [dependentSessions, setDependentSessions] = useState<any[]>([]);
 
@@ -76,6 +78,10 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
     setFormData({ ...backend, env: backend.env || {} });
     setEditingBackend(backend);
     setIsEditing(true);
+    // 根据已保存的 env 自动判断认证模式
+    if (backend.type === 'claude-agent-sdk') {
+      setSdkAuthMode(backend.env?.CLAUDE_CODE_OAUTH_TOKEN ? 'oauth' : 'apikey');
+    }
   }, []);
 
   const handleSave = useCallback(() => {
@@ -122,6 +128,22 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
         [key]: value,
       },
     }));
+  }, []);
+
+  const handleSdkAuthModeChange = useCallback((mode: 'oauth' | 'apikey') => {
+    setSdkAuthMode(mode);
+    // 切换时清空另一种认证的 token，避免同时保存两个
+    if (mode === 'oauth') {
+      setFormData((prev) => ({
+        ...prev,
+        env: { ...prev.env, ANTHROPIC_AUTH_TOKEN: '', ANTHROPIC_BASE_URL: '' },
+      }));
+    } else {
+      setFormData((prev) => ({
+        ...prev,
+        env: { ...prev.env, CLAUDE_CODE_OAUTH_TOKEN: '' },
+      }));
+    }
   }, []);
 
   const handleDeleteClick = useCallback((backend: BackendConfig) => {
@@ -283,41 +305,75 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
             {formData.type === 'claude-agent-sdk' && (
               <div style={{ marginBottom: 16, padding: 12, background: 'var(--theme-bg-secondary)', borderRadius: 8 }}>
                 <label style={{ ...labelStyle, marginBottom: 8 }}>Claude Agent SDK 配置</label>
-                <p style={{ fontSize: 11, color: 'var(--theme-text-muted)', margin: '0 0 12px 0' }}>
-                  通过环境变量配置 Claude CLI，留空则使用全局 ~/.claude/settings.json 配置。
-                </p>
 
-                <div style={{ marginBottom: 10 }}>
-                  <label style={{ fontSize: 11, color: 'var(--theme-text)', display: 'block', marginBottom: 4 }}>
-                    CLAUDE_CODE_OAUTH_TOKEN
-                    <span style={{ fontSize: 10, color: 'var(--theme-text-muted)', marginLeft: 6 }}>
-                      （Claude Pro/Max 账号，推荐）
-                    </span>
-                  </label>
-                  <input
-                    type="password"
-                    value={formData.env?.CLAUDE_CODE_OAUTH_TOKEN || ''}
-                    onChange={(e) => handleEnvChange('CLAUDE_CODE_OAUTH_TOKEN', e.target.value)}
-                    style={inputStyle}
-                    placeholder="sk-ant-oat01-... （运行 claude setup-token 获取）"
-                  />
+                {/* 认证方式选择 */}
+                <div style={{ display: 'flex', gap: 8, marginBottom: 14 }}>
+                  {(['apikey', 'oauth'] as const).map((mode) => {
+                    const active = sdkAuthMode === mode;
+                    return (
+                      <button
+                        key={mode}
+                        onClick={() => handleSdkAuthModeChange(mode)}
+                        style={{
+                          flex: 1, padding: '6px 0', fontSize: 12, borderRadius: 6, cursor: 'pointer',
+                          border: `1px solid ${active ? 'var(--theme-accent)' : 'var(--theme-border)'}`,
+                          background: active ? 'var(--theme-accent-bg)' : 'transparent',
+                          color: active ? 'var(--theme-accent)' : 'var(--theme-text-muted)',
+                          fontWeight: active ? 600 : 400,
+                        }}
+                      >
+                        {mode === 'apikey' ? 'API Key / 代理服务' : 'Claude.ai 官方账号'}
+                      </button>
+                    );
+                  })}
                 </div>
 
-                <div style={{ marginBottom: 10 }}>
-                  <label style={{ fontSize: 11, color: 'var(--theme-text)', display: 'block', marginBottom: 4 }}>
-                    ANTHROPIC_AUTH_TOKEN
-                    <span style={{ fontSize: 10, color: 'var(--theme-text-muted)', marginLeft: 6 }}>
-                      （API Key / 代理 Bearer Token）
-                    </span>
-                  </label>
-                  <input
-                    type="password"
-                    value={formData.env?.ANTHROPIC_AUTH_TOKEN || ''}
-                    onChange={(e) => handleEnvChange('ANTHROPIC_AUTH_TOKEN', e.target.value)}
-                    style={inputStyle}
-                    placeholder="sk-ant-... （留空使用全局配置）"
-                  />
-                </div>
+                {/* API Key / 代理服务 */}
+                {sdkAuthMode === 'apikey' && (<>
+                  <div style={{ marginBottom: 10 }}>
+                    <label style={{ fontSize: 11, color: 'var(--theme-text)', display: 'block', marginBottom: 4 }}>
+                      ANTHROPIC_AUTH_TOKEN
+                    </label>
+                    <input
+                      type="password"
+                      value={formData.env?.ANTHROPIC_AUTH_TOKEN || ''}
+                      onChange={(e) => handleEnvChange('ANTHROPIC_AUTH_TOKEN', e.target.value)}
+                      style={inputStyle}
+                      placeholder="sk-ant-... （留空使用全局 ~/.claude 配置）"
+                    />
+                  </div>
+                  <div style={{ marginBottom: 10 }}>
+                    <label style={{ fontSize: 11, color: 'var(--theme-text)', display: 'block', marginBottom: 4 }}>
+                      ANTHROPIC_BASE_URL（代理地址，可选）
+                    </label>
+                    <input
+                      type="text"
+                      value={formData.env?.ANTHROPIC_BASE_URL || ''}
+                      onChange={(e) => handleEnvChange('ANTHROPIC_BASE_URL', e.target.value)}
+                      style={inputStyle}
+                      placeholder="e.g., https://coding.dashscope.aliyuncs.com/apps/anthropic"
+                    />
+                  </div>
+                </>)}
+
+                {/* Claude.ai 官方账号 OAuth */}
+                {sdkAuthMode === 'oauth' && (
+                  <div style={{ marginBottom: 10 }}>
+                    <label style={{ fontSize: 11, color: 'var(--theme-text)', display: 'block', marginBottom: 4 }}>
+                      CLAUDE_CODE_OAUTH_TOKEN
+                    </label>
+                    <input
+                      type="password"
+                      value={formData.env?.CLAUDE_CODE_OAUTH_TOKEN || ''}
+                      onChange={(e) => handleEnvChange('CLAUDE_CODE_OAUTH_TOKEN', e.target.value)}
+                      style={inputStyle}
+                      placeholder="sk-ant-oat01-..."
+                    />
+                    <p style={{ fontSize: 11, color: 'var(--theme-text-muted)', margin: '4px 0 0 0' }}>
+                      在终端运行 <code style={{ background: 'var(--theme-bg-tertiary)', padding: '1px 5px', borderRadius: 3 }}>claude setup-token</code> 登录后获取。
+                    </p>
+                  </div>
+                )}
 
                 <div style={{ marginBottom: 10 }}>
                   <label style={{ fontSize: 11, color: 'var(--theme-text)', display: 'block', marginBottom: 4 }}>
@@ -329,19 +385,6 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
                     onChange={(e) => handleEnvChange('ANTHROPIC_MODEL', e.target.value)}
                     style={inputStyle}
                     placeholder="e.g., claude-sonnet-4-6（留空由 CLI 自动决定）"
-                  />
-                </div>
-
-                <div style={{ marginBottom: 10 }}>
-                  <label style={{ fontSize: 11, color: 'var(--theme-text)', display: 'block', marginBottom: 4 }}>
-                    ANTHROPIC_BASE_URL（代理地址，可选）
-                  </label>
-                  <input
-                    type="text"
-                    value={formData.env?.ANTHROPIC_BASE_URL || ''}
-                    onChange={(e) => handleEnvChange('ANTHROPIC_BASE_URL', e.target.value)}
-                    style={inputStyle}
-                    placeholder="e.g., https://your-proxy.com（留空使用官方 API）"
                   />
                 </div>
 
