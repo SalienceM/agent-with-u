@@ -559,24 +559,30 @@ class BridgeWS:
 
             creds_path = Path.home() / ".claude" / ".credentials.json"
             creds_path.parent.mkdir(parents=True, exist_ok=True)
+            # 读旧文件只保留非 OAuth 字段，清除旧格式的顶层 accessToken/refreshToken/expiresAt
             creds: dict = {}
             if creds_path.exists():
                 try:
-                    creds = json.loads(creds_path.read_text(encoding="utf-8"))
+                    old = json.loads(creds_path.read_text(encoding="utf-8"))
+                    # 保留非 OAuth 顶层字段（如 otelLevel 等），删除旧格式 OAuth 字段
+                    creds = {k: v for k, v in old.items()
+                             if k not in ("accessToken", "refreshToken", "expiresAt", "claudeAiOauth")}
                 except Exception:
                     pass
             creds["claudeAiOauth"] = oauth_data
             creds_path.write_text(json.dumps(creds, ensure_ascii=False, indent=2), encoding="utf-8")
-            print(f"[OAuth] Token 已保存到 {creds_path}", file=sys.stderr, flush=True)
+            print(f"[OAuth] Token 已保存到 {creds_path} (claudeAiOauth 格式)", file=sys.stderr, flush=True)
 
             # CLAUDE_CODE_OAUTH_TOKEN 环境变量期望 JSON 对象字符串（expiresAt 为 ISO 8601）
             from datetime import datetime, timezone
             expires_at_iso = datetime.fromtimestamp(expires_at_ms / 1000, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
-            token_env_json = json.dumps({
+            token_env_value: dict = {
                 "accessToken": access_token,
-                "refreshToken": data.get("refresh_token", ""),
                 "expiresAt": expires_at_iso,
-            }, ensure_ascii=False)
+            }
+            if "refresh_token" in data:
+                token_env_value["refreshToken"] = data["refresh_token"]
+            token_env_json = json.dumps(token_env_value, ensure_ascii=False)
 
             return json.dumps({"token": token_env_json, "error": None}, ensure_ascii=False)
 

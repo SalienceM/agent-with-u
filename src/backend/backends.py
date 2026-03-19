@@ -182,6 +182,13 @@ class ClaudeAgentBackend(ModelBackend):
                 val = self.get_env(key)
                 if val:
                     env_dict[key] = val
+            # 调试：打印认证方式
+            auth_info = (
+                f"OAUTH_TOKEN={'yes(json)' if env_dict.get('CLAUDE_CODE_OAUTH_TOKEN', '').startswith('{') else 'yes(plain)' if 'CLAUDE_CODE_OAUTH_TOKEN' in env_dict else 'no'}"
+                f", API_KEY={'yes' if 'ANTHROPIC_API_KEY' in env_dict else 'no'}"
+                f", AUTH_TOKEN={'yes' if 'ANTHROPIC_AUTH_TOKEN' in env_dict else 'no'}"
+            )
+            print(f"[ClaudeAgent] auth: {auth_info}", file=sys.stderr, flush=True)
 
             # ★ 图片处理：使用 AsyncIterable[dict] 形式的 prompt 原生传递图片
             # SDK 支持通过 yield Anthropic content blocks 的方式直接传递图片
