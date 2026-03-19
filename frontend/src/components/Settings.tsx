@@ -232,10 +232,7 @@ export const Settings: React.FC<SettingsProps> = ({
         </div>
 
         {/* 操作按钮 */}
-        <div style={{ display: 'flex', gap: 8, marginTop: 24 }}>
-          <button onClick={onOpenBackendManager} style={{ ...actionBtnStyle, background: 'rgba(99,102,241,0.15)', borderColor: 'rgba(99,102,241,0.3)' }}>
-            🔌 Backends
-          </button>
+        <div style={{ display: 'flex', gap: 8, marginTop: 8 }}>
           <button onClick={onExportChat} style={actionBtnStyle}>
             📥 Export Chat
           </button>
@@ -245,6 +242,39 @@ export const Settings: React.FC<SettingsProps> = ({
           >
             ↩ Reset Defaults
           </button>
+        </div>
+
+        {/* ---- 分隔线 ---- */}
+        <div style={{ borderTop: '1px solid var(--theme-border)', margin: '20px 0' }} />
+
+        {/* 后端管理 */}
+        <div style={sectionStyle}>
+          <label style={labelStyle}>Model Backends</label>
+          <button
+            onClick={onOpenBackendManager}
+            style={{ ...actionBtnStyle, flex: 'none', width: '100%', background: 'rgba(99,102,241,0.15)', borderColor: 'rgba(99,102,241,0.3)' }}
+          >
+            🔌 Manage Backends
+          </button>
+        </div>
+
+        {/* ---- 分隔线 ---- */}
+        <div style={{ borderTop: '1px solid var(--theme-border)', margin: '20px 0' }} />
+
+        {/* 关于 */}
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+          <div>
+            <span style={{ fontSize: 13, fontWeight: 600, color: 'var(--theme-text)' }}>AgentWithU</span>
+            <span style={{ fontSize: 12, color: 'var(--theme-text-muted)', marginLeft: 8 }}>v0.1.0</span>
+          </div>
+          <a
+            href="https://github.com/SalienceM/agent-with-u"
+            target="_blank"
+            rel="noopener noreferrer"
+            style={{ fontSize: 12, color: 'var(--theme-accent)', textDecoration: 'none' }}
+          >
+            Source ↗
+          </a>
         </div>
       </div>
     </div>
