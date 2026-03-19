@@ -150,10 +150,28 @@ class ClaudeCodeInstance:
             try:
                 print(f"[Instance] Starting subprocess for session {self.session_id}...",
                       file=sys.stderr, flush=True)
+
+                # 构建子进程环境：继承当前进程全部 env，再叠加后端配置里的代理设置
+                proc_env = subprocess.os.environ.copy()
+                if self.config.env:
+                    for proxy_key in ("HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY", "NO_PROXY",
+                                      "https_proxy", "http_proxy", "all_proxy", "no_proxy"):
+                        val = self.config.env.get(proxy_key)
+                        if val is not None:
+                            if val:  # 非空 → 设置；空字符串 → 清除（显式不走代理）
+                                proc_env[proxy_key] = val
+                            else:
+                                proc_env.pop(proxy_key, None)
+                                proc_env.pop(proxy_key.upper(), None)
+                                proc_env.pop(proxy_key.lower(), None)
+                proxy_in_use = proc_env.get("HTTPS_PROXY") or proc_env.get("https_proxy") or "none"
+                print(f"[Instance] proxy={proxy_in_use}", file=sys.stderr, flush=True)
+
                 proc = subprocess.Popen(
                     cmd,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
+                    env=proc_env,
                     cwd=cwd,
                     encoding="utf-8",
                     errors="replace",
