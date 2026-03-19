@@ -133,8 +133,16 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
     try {
       const result = await api.startOAuthFlow();
       if (result.token) {
-        // 把 access_token 直接存入 ANTHROPIC_AUTH_TOKEN，和普通 API key 完全一样
-        handleEnvChange('ANTHROPIC_AUTH_TOKEN', result.token);
+        // OAuth token 存入 ANTHROPIC_AUTH_TOKEN，同时设 BASE_URL 为 api.claude.ai
+        // （claude.ai OAuth token 必须走 api.claude.ai，否则认证失败）
+        setFormData((prev) => ({
+          ...prev,
+          env: {
+            ...prev.env,
+            ANTHROPIC_AUTH_TOKEN: result.token!,
+            ANTHROPIC_BASE_URL: prev.env?.ANTHROPIC_BASE_URL || 'https://api.claude.ai',
+          },
+        }));
       } else {
         setOauthError(result.error || '获取失败');
       }
@@ -461,54 +469,16 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
                 </p>
 
                 <div style={{ marginBottom: 10 }}>
-                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 4 }}>
-                    <label style={{ fontSize: 11, color: 'var(--theme-text)' }}>
-                      API Key <span style={{ color: 'rgba(239,68,68,0.8)' }}>*</span>
-                    </label>
-                    <button
-                      onClick={async () => {
-                        setOauthLoading(true);
-                        setOauthError(null);
-                        try {
-                          const result = await api.startOAuthFlow();
-                          if (result.token) {
-                            setFormData((prev) => ({
-                              ...prev,
-                              apiKey: result.token!,
-                              baseUrl: prev.baseUrl || 'https://api.claude.ai',
-                            }));
-                          } else {
-                            setOauthError(result.error || '获取失败');
-                          }
-                        } catch (e: any) {
-                          setOauthError(e?.message || '获取失败');
-                        } finally {
-                          setOauthLoading(false);
-                        }
-                      }}
-                      disabled={oauthLoading}
-                      style={{
-                        fontSize: 11, padding: '3px 10px', borderRadius: 5, cursor: oauthLoading ? 'wait' : 'pointer',
-                        border: '1px solid var(--theme-accent)',
-                        background: oauthLoading ? 'var(--theme-bg-tertiary)' : 'var(--theme-accent-bg)',
-                        color: 'var(--theme-accent)', fontWeight: 500,
-                      }}
-                    >
-                      {oauthLoading ? '等待浏览器登录...' : '浏览器登录自动填入'}
-                    </button>
-                  </div>
+                  <label style={{ fontSize: 11, color: 'var(--theme-text)', display: 'block', marginBottom: 4 }}>
+                    API Key <span style={{ color: 'rgba(239,68,68,0.8)' }}>*</span>
+                  </label>
                   <input
                     type="password"
                     value={formData.apiKey || ''}
                     onChange={(e) => setFormData({ ...formData, apiKey: e.target.value })}
                     style={inputStyle}
-                    placeholder="sk-ant-... 或点击右侧按钮通过浏览器登录获取"
+                    placeholder="sk-ant-..."
                   />
-                  {oauthError && (
-                    <p style={{ fontSize: 11, color: 'var(--theme-error, #cf222e)', margin: '4px 0 0 0' }}>
-                      {oauthError}
-                    </p>
-                  )}
                 </div>
 
                 <div style={{ marginBottom: 10 }}>
@@ -533,7 +503,7 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
                     value={formData.baseUrl || ''}
                     onChange={(e) => setFormData({ ...formData, baseUrl: e.target.value })}
                     style={inputStyle}
-                    placeholder="API Key 留空→ https://api.anthropic.com；OAuth Token → https://api.claude.ai"
+                    placeholder="留空使用官方 https://api.anthropic.com"
                   />
                 </div>
 
