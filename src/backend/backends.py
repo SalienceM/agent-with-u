@@ -566,23 +566,27 @@ class ClaudeCodeOfficialBackend(ModelBackend):
                     # 显式设置空字符串 = 清除该变量（用于隔离/禁用代理）
                     proc_env.pop(key, None)
 
-        # ── 步骤3：AUTH_TOKEN 兜底——从 claude login 凭证文件读取 ──────────
-        # 优先级：config env > 系统 env > 本地凭证文件
-        if not proc_env.get("ANTHROPIC_AUTH_TOKEN") and not proc_env.get("ANTHROPIC_API_KEY"):
-            local_token = self.read_local_token()
-            if local_token:
-                # ★ OAuth token（sk-ant-oat01-）只放 ANTHROPIC_AUTH_TOKEN
-                # 绝对不能放进 ANTHROPIC_API_KEY —— CLI 会把它当 API key 验证，报 "Invalid external API key"
-                proc_env["ANTHROPIC_AUTH_TOKEN"] = local_token
-                print("[OfficialBackend] 使用本地 claude login 凭证（自动注入）",
-                      file=sys.stderr, flush=True)
+        # ── 步骤3：AUTH_TOKEN 兼容处理 ──────────────────────────────────────
+        # ★ 核心规则：
+        #   - OAuth token（sk-ant-oat01-）只能让 CLI 自己从 ~/.claude/.credentials.json
+        #     读取，手动注入会绕过 CLI 内部的 token 刷新机制，导致
+        #     "Failed to authenticate" 错误。
+        #   - API key（sk-ant-api03-）可以通过 ANTHROPIC_API_KEY 注入。
+        #
+        # 处理流程：
+        #   1. 若 proc_env 里的 ANTHROPIC_AUTH_TOKEN 是 OAuth token → 清除它，让 CLI 自管理
+        #   2. 若 ANTHROPIC_AUTH_TOKEN 是真正的 API key → 同步到 ANTHROPIC_API_KEY
 
-        # AUTH_TOKEN 兼容层：只有真正的 API key（sk-ant-api）才同步给 ANTHROPIC_API_KEY
-        # OAuth token（sk-ant-oat）不做同步，让 CLI 自己走 OAuth 认证路径
-        cfg_token = proc_env.get("ANTHROPIC_AUTH_TOKEN", "")
-        if cfg_token and not proc_env.get("ANTHROPIC_API_KEY"):
-            if cfg_token.startswith("sk-ant-api"):
-                proc_env["ANTHROPIC_API_KEY"] = cfg_token
+        cfg_auth = proc_env.get("ANTHROPIC_AUTH_TOKEN", "")
+        if cfg_auth:
+            if cfg_auth.startswith("sk-ant-oat"):
+                # OAuth token：清除，让 CLI 自己走凭证文件路径
+                proc_env.pop("ANTHROPIC_AUTH_TOKEN", None)
+                print("[OfficialBackend] 使用本地 claude login 凭证（由 CLI 自管理，不手动注入 OAuth token）",
+                      file=sys.stderr, flush=True)
+            elif cfg_auth.startswith("sk-ant-api") and not proc_env.get("ANTHROPIC_API_KEY"):
+                # 真正的 API key：同步给 ANTHROPIC_API_KEY
+                proc_env["ANTHROPIC_API_KEY"] = cfg_auth
 
         return proc_env
 
