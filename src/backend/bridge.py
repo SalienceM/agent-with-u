@@ -43,6 +43,15 @@ DEFAULT_BACKENDS = [
         allowed_tools=["Read", "Edit", "Bash", "Glob", "Grep", "Write"],
         skip_permissions=True,  # ★ 默认跳过确认，高性能模式
     ),
+    ModelBackendConfig(
+        id="claude-code-official-default",
+        type=BackendType.CLAUDE_CODE_OFFICIAL,
+        label="Claude Code (官方账户)",
+        model=None,  # ★ 从 ANTHROPIC_MODEL 读取
+        allowed_tools=["Read", "Edit", "Bash", "Glob", "Grep", "Write"],
+        skip_permissions=True,
+        # ★ 在后端配置的 env 字段中填入 ANTHROPIC_AUTH_TOKEN 即可使用官方账户
+    ),
 ]
 
 

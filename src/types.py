@@ -12,6 +12,7 @@ import uuid
 
 class BackendType(str, Enum):
     CLAUDE_AGENT_SDK = "claude-agent-sdk"
+    CLAUDE_CODE_OFFICIAL = "claude-code-official"   # 官方 Claude.ai 账户（ANTHROPIC_AUTH_TOKEN）
     OPENAI_COMPATIBLE = "openai-compatible"
     ANTHROPIC_API = "anthropic-api"
 

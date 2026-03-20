@@ -5,6 +5,7 @@ import os
 import sys
 import asyncio
 import json
+import subprocess
 from pathlib import Path
 from abc import ABC, abstractmethod
 from typing import Optional, Callable
@@ -405,6 +406,287 @@ class ClaudeAgentBackend(ModelBackend):
             emit("error", error=_exc_msg(e))
             emit("done")
             return {"agentSessionId": agent_sid}
+
+
+# ---------------------------------------------------------------------------
+#  Claude Code Official Backend (官方 Claude.ai 账户，直接调用 claude CLI 子进程)
+#  与 ClaudeAgentBackend 的区别：
+#    - 专门面向 ANTHROPIC_AUTH_TOKEN（Claude.ai Pro/Max 账户 OAuth token）
+#    - 绕过 claude-agent-sdk 的 token 验证层，直接调用 claude CLI 子进程
+#    - 完整继承系统环境变量，不依赖 SDK 的 env 隔离
+# ---------------------------------------------------------------------------
+
+class ClaudeCodeOfficialBackend(ModelBackend):
+    """
+    官方 Claude.ai 账户后端。
+
+    使用 ANTHROPIC_AUTH_TOKEN（Claude.ai Pro/Max 订阅的 OAuth token）
+    直接启动 `claude` CLI 子进程并解析 stream-json 输出。
+
+    与 ClaudeAgentBackend 的核心区别：
+    - 不经过 claude-agent-sdk 的 Python 层，避免 SDK 内部 token 验证失败
+    - 直接 exec claude CLI，环境变量完全透明可控
+    - 适合官方账户（非 API Key 用户）使用 claude code 本地 agent 能力
+    """
+
+    def _resolve_cli(self) -> str:
+        cli = getattr(self.config, "cli_path", None)
+        if cli:
+            return str(cli)
+        import sys as _sys
+        if _sys.platform == "win32":
+            import os as _os
+            appdata = _os.environ.get("APPDATA", "")
+            for name in ("claude.cmd", "claude.exe", "claude"):
+                p = _os.path.join(appdata, "npm", name)
+                if _os.path.exists(p):
+                    return p
+        return "claude"
+
+    def _build_cmd(self, content: str, agent_session_id: Optional[str], cwd: str) -> list[str]:
+        import os as _os
+        cmd = [self._resolve_cli()]
+
+        model = self.get_env("ANTHROPIC_MODEL") or self.config.model
+        if model and model not in ("sonnet", "claude-sonnet", "default"):
+            cmd.extend(["--model", model])
+
+        if agent_session_id:
+            cmd.extend(["--resume", agent_session_id])
+
+        tools: list[str] = getattr(self.config, "allowed_tools", None) or [
+            "Read", "Edit", "Bash", "Glob", "Grep", "Write"
+        ]
+        for tool in tools:
+            cmd.extend(["--allowedTools", tool])
+
+        cmd.extend(["--output-format", "stream-json", "--verbose"])
+
+        skip_permissions = getattr(self.config, "skip_permissions", True)
+        if skip_permissions:
+            cmd.append("--dangerously-skip-permissions")
+
+        cmd.extend(["-p", content])
+        return cmd
+
+    def _build_env(self) -> dict:
+        """构建子进程环境：继承系统 env，再用后端配置覆盖关键变量。"""
+        import os as _os
+        proc_env = _os.environ.copy()
+
+        # 优先用后端配置里的认证 / 代理变量覆盖系统 env
+        for key in (
+            "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY",
+            "ANTHROPIC_BASE_URL", "ANTHROPIC_MODEL",
+            "HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY", "NO_PROXY",
+            "https_proxy", "http_proxy", "all_proxy", "no_proxy",
+        ):
+            val = self.config.get_env(key)
+            if val is not None:
+                if val:
+                    proc_env[key] = val
+                else:
+                    proc_env.pop(key, None)
+
+        # 如果后端配置提供了 AUTH_TOKEN 而没有 API_KEY，确保两个变量都填充
+        auth_token = proc_env.get("ANTHROPIC_AUTH_TOKEN")
+        if auth_token and not proc_env.get("ANTHROPIC_API_KEY"):
+            proc_env["ANTHROPIC_API_KEY"] = auth_token
+
+        return proc_env
+
+    async def send_message(
+        self,
+        messages: list[ChatMessage],
+        content: str,
+        images: Optional[list[ImageAttachment]],
+        session_id: str,
+        message_id: str,
+        on_delta: Callable[[StreamDelta], None],
+        agent_session_id: Optional[str] = None,
+        working_dir: Optional[str] = None,
+        skip_permissions: Optional[bool] = None,
+    ) -> dict:
+        self._cancelled = False
+        _new_agent_sid: Optional[str] = agent_session_id
+
+        def emit(delta_type: str, **kwargs):
+            if not self._cancelled:
+                on_delta(StreamDelta(session_id, message_id, delta_type, **kwargs))
+
+        cwd = working_dir or getattr(self.config, "working_dir", None) or "."
+        cmd = self._build_cmd(content, agent_session_id, cwd)
+        proc_env = self._build_env()
+
+        auth_token = proc_env.get("ANTHROPIC_AUTH_TOKEN", "")
+        api_key = proc_env.get("ANTHROPIC_API_KEY", "")
+        print(
+            f"[OfficialBackend] cwd={cwd}, resume={agent_session_id!r}, "
+            f"AUTH_TOKEN={'set('+str(len(auth_token))+'chars)' if auth_token else 'NONE'}, "
+            f"API_KEY={'set('+str(len(api_key))+'chars)' if api_key else 'NONE'}, "
+            f"cmd={cmd[:6]}",
+            file=sys.stderr, flush=True,
+        )
+
+        loop = asyncio.get_event_loop()
+        msg_queue: asyncio.Queue = asyncio.Queue()
+
+        def _run():
+            try:
+                proc = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    env=proc_env,
+                    cwd=cwd,
+                    encoding="utf-8",
+                    errors="replace",
+                    bufsize=1,
+                )
+                print(f"[OfficialBackend] pid={proc.pid}", file=sys.stderr, flush=True)
+                line_count = 0
+                while True:
+                    raw = proc.stdout.readline()
+                    if not raw:
+                        break
+                    line = raw.strip()
+                    if not line:
+                        continue
+                    line_count += 1
+                    print(f"[OfficialBackend] #{line_count}: {line[:120]}", file=sys.stderr, flush=True)
+                    try:
+                        obj = json.loads(line)
+                        loop.call_soon_threadsafe(msg_queue.put_nowait, ("json", obj))
+                    except json.JSONDecodeError:
+                        loop.call_soon_threadsafe(msg_queue.put_nowait, ("text", line))
+                proc.wait()
+                stderr_out = proc.stderr.read().strip()
+                if stderr_out:
+                    print(f"[OfficialBackend] stderr: {stderr_out[:800]}", file=sys.stderr, flush=True)
+                loop.call_soon_threadsafe(msg_queue.put_nowait, ("proc_done", proc.returncode))
+            except Exception as e:
+                loop.call_soon_threadsafe(msg_queue.put_nowait, ("proc_error", str(e)))
+
+        fut = loop.run_in_executor(None, _run)
+        _done_emitted = False
+        _usage: Optional[dict] = None
+
+        def _process_json_obj(obj: dict):
+            nonlocal _new_agent_sid, _usage
+            msg_type = obj.get("type", "")
+
+            if msg_type == "system" and obj.get("subtype") == "init":
+                _new_agent_sid = obj.get("session_id", _new_agent_sid)
+                print(f"[OfficialBackend] session init: {_new_agent_sid}", file=sys.stderr, flush=True)
+
+            elif msg_type == "assistant":
+                for block in obj.get("message", {}).get("content", []):
+                    btype = block.get("type", "")
+                    if btype == "text":
+                        t = block.get("text", "")
+                        if t:
+                            emit("text_delta", text=t)
+                    elif btype == "thinking":
+                        t = block.get("thinking", "")
+                        if t:
+                            emit("thinking", text=t)
+                    elif btype == "tool_use":
+                        emit("tool_start", tool_call={
+                            "id": block.get("id", ""),
+                            "name": block.get("name", ""),
+                            "input": json.dumps(block.get("input", {}), ensure_ascii=False),
+                            "status": "running",
+                        })
+
+            elif msg_type == "tool":
+                for block in obj.get("content", []):
+                    if block.get("type") == "tool_result":
+                        raw_content = block.get("content", "")
+                        if isinstance(raw_content, list):
+                            raw_content = "\n".join(
+                                p.get("text", json.dumps(p)) if isinstance(p, dict) else str(p)
+                                for p in raw_content
+                            )
+                        output_str = str(raw_content)[:5000]
+                        emit("tool_result", tool_call={
+                            "id": block.get("tool_use_id", ""),
+                            "output": output_str,
+                            "status": "error" if block.get("is_error") else "done",
+                        })
+
+            elif msg_type == "content_block_delta":
+                delta = obj.get("delta", {})
+                dtype = delta.get("type", "")
+                if dtype == "text_delta":
+                    emit("text_delta", text=delta.get("text", ""))
+                elif dtype == "thinking_delta":
+                    emit("thinking", text=delta.get("thinking", ""))
+                elif dtype == "input_json_delta":
+                    emit("tool_input", tool_call={"inputDelta": delta.get("partial_json", "")})
+
+            elif msg_type == "content_block_start":
+                block = obj.get("content_block", {})
+                if block.get("type") == "tool_use":
+                    emit("tool_start", tool_call={
+                        "id": block.get("id", ""),
+                        "name": block.get("name", ""),
+                        "input": "",
+                        "status": "running",
+                    })
+
+            elif msg_type == "result":
+                _new_agent_sid = obj.get("session_id", _new_agent_sid)
+                is_error = obj.get("is_error", False)
+                subtype = obj.get("subtype", "")
+                if is_error or subtype == "error_during_execution":
+                    print(f"[OfficialBackend] result error: subtype={subtype}", file=sys.stderr, flush=True)
+                    emit("resume_failed")
+                usage = obj.get("usage", {})
+                if usage:
+                    _usage = {
+                        "inputTokens": usage.get("input_tokens", 0),
+                        "outputTokens": usage.get("output_tokens", 0),
+                    }
+
+        try:
+            TIMEOUT = 7200
+            waited = 0
+            POLL = 10
+            while True:
+                if self._cancelled:
+                    break
+                try:
+                    tag, payload = await asyncio.wait_for(msg_queue.get(), timeout=POLL)
+                except asyncio.TimeoutError:
+                    waited += POLL
+                    if waited < TIMEOUT:
+                        continue
+                    emit("error", error=f"Timeout after {TIMEOUT//3600}h")
+                    break
+
+                if tag == "json":
+                    _process_json_obj(payload)
+                elif tag == "text":
+                    emit("text_delta", text=payload + "\n")
+                elif tag == "proc_done":
+                    rc = payload
+                    if rc != 0 and not _done_emitted:
+                        emit("error", error=f"claude exited with code {rc}")
+                    break
+                elif tag == "proc_error":
+                    emit("error", error=str(payload))
+                    break
+
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            emit("error", error=_exc_msg(e))
+
+        if not _done_emitted:
+            emit("done", **(_usage and {"usage": _usage} or {}))
+
+        await asyncio.shield(fut)   # 等待线程退出，避免资源泄漏
+        return {"agentSessionId": _new_agent_sid}
 
 
 # ---------------------------------------------------------------------------
@@ -852,6 +1134,8 @@ class AnthropicAPIBackend(ModelBackend):
 def create_backend(config: ModelBackendConfig) -> ModelBackend:
     if config.type == BackendType.CLAUDE_AGENT_SDK:
         return ClaudeAgentBackend(config)
+    elif config.type == BackendType.CLAUDE_CODE_OFFICIAL:
+        return ClaudeCodeOfficialBackend(config)
     elif config.type == BackendType.ANTHROPIC_API:
         return AnthropicAPIBackend(config)
     elif config.type == BackendType.OPENAI_COMPATIBLE:
