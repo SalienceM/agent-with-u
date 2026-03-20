@@ -362,6 +362,16 @@ export const api = {
     try { return JSON.parse(result); } catch { return { status: 'ok' }; }
   },
 
+  async openModelTerminal(backendId: string): Promise<{ status: string; message?: string }> {
+    const result = await call('openModelTerminal', backendId);
+    try { return JSON.parse(result); } catch { return { status: 'ok' }; }
+  },
+
+  async getClaudeSettings(): Promise<{ model: string }> {
+    const result = await call('getClaudeSettings');
+    try { return JSON.parse(result); } catch { return { model: '' }; }
+  },
+
   async grantPermission(sessionId: string, granted: boolean): Promise<void> {
     await send('grantPermission', sessionId, granted);
   },

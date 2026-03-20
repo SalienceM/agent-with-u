@@ -63,6 +63,9 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
   const [oauthError, setOauthError] = useState<string | null>(null);
   const [loginLaunching, setLoginLaunching] = useState(false);
   const [loginMsg, setLoginMsg] = useState<string | null>(null);
+  const [modelLaunching, setModelLaunching] = useState(false);
+  const [modelMsg, setModelMsg] = useState<string | null>(null);
+  const [currentModel, setCurrentModel] = useState<string>('');
   const [backendToDelete, setBackendToDelete] = useState<BackendConfig | null>(null);
   const [dependentSessions, setDependentSessions] = useState<any[]>([]);
 
@@ -83,7 +86,13 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
   const handleEditBackend = useCallback((backend: BackendConfig) => {
     setFormData({ ...backend, env: backend.env || {} });
     setEditingBackend(backend);
+    setLoginMsg(null);
+    setModelMsg(null);
     setIsEditing(true);
+    // 打开官方后端编辑时，读取当前模型
+    if (backend.id === OFFICIAL_BACKEND_ID) {
+      api.getClaudeSettings().then(s => setCurrentModel(s.model || ''));
+    }
   }, []);
 
   const handleSave = useCallback(() => {
@@ -190,6 +199,23 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
       setLoginMsg(e?.message || '打开失败');
     } finally {
       setLoginLaunching(false);
+    }
+  }, [formData.id]);
+
+  const handleOpenModelTerminal = useCallback(async () => {
+    setModelLaunching(true);
+    setModelMsg(null);
+    try {
+      const res = await api.openModelTerminal(formData.id);
+      if (res.status === 'error') {
+        setModelMsg(res.message || '打开失败');
+      } else {
+        setModelMsg('已打开终端，在 claude 中输入 /model <模型名> 切换，重启 AgentWithU 后生效。');
+      }
+    } catch (e: any) {
+      setModelMsg(e?.message || '打开失败');
+    } finally {
+      setModelLaunching(false);
     }
   }, [formData.id]);
 
@@ -494,6 +520,43 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
                     <p style={{ fontSize: 11, margin: '8px 0 0 0', lineHeight: 1.5,
                       color: loginMsg.includes('失败') ? 'rgba(239,68,68,0.9)' : 'rgba(34,197,94,0.9)' }}>
                       {loginMsg}
+                    </p>
+                  )}
+                </div>
+
+                {/* 模型状态 + 换模型卡片 */}
+                <div style={{
+                  marginBottom: 14, padding: 12, borderRadius: 8,
+                  background: 'rgba(16,185,129,0.08)', border: '1px solid rgba(16,185,129,0.25)',
+                }}>
+                  <div style={{ fontSize: 12, fontWeight: 600, color: 'rgba(110,231,183,0.9)', marginBottom: 6 }}>
+                    🤖 当前模型
+                  </div>
+                  <div style={{ fontSize: 13, color: 'var(--theme-text)', marginBottom: 10, fontFamily: 'monospace' }}>
+                    {currentModel || <span style={{ color: 'var(--theme-text-muted)', fontFamily: 'inherit', fontSize: 12 }}>默认（由 CLI 自动决定）</span>}
+                  </div>
+                  <div style={{ fontSize: 11, color: 'var(--theme-text-muted)', marginBottom: 10, lineHeight: 1.6 }}>
+                    点击下方按钮打开终端，在 claude 中输入{' '}
+                    <code style={{ fontSize: 10, background: 'rgba(255,255,255,0.08)', padding: '1px 4px', borderRadius: 3 }}>/model &lt;模型名&gt;</code>{' '}
+                    切换，常用：<code style={{ fontSize: 10 }}>claude-opus-4-6</code> / <code style={{ fontSize: 10 }}>claude-sonnet-4-6</code>
+                  </div>
+                  <button
+                    onClick={handleOpenModelTerminal}
+                    disabled={modelLaunching}
+                    style={{
+                      fontSize: 12, padding: '7px 16px', borderRadius: 6,
+                      border: '1px solid rgba(16,185,129,0.4)',
+                      background: modelLaunching ? 'rgba(16,185,129,0.1)' : 'rgba(16,185,129,0.2)',
+                      color: 'rgba(110,231,183,0.9)', fontWeight: 500,
+                      cursor: modelLaunching ? 'wait' : 'pointer',
+                    }}
+                  >
+                    {modelLaunching ? '正在打开终端...' : '🔀 打开终端换模型'}
+                  </button>
+                  {modelMsg && (
+                    <p style={{ fontSize: 11, margin: '8px 0 0 0', lineHeight: 1.5,
+                      color: modelMsg.includes('失败') ? 'rgba(239,68,68,0.9)' : 'rgba(34,197,94,0.9)' }}>
+                      {modelMsg}
                     </p>
                   )}
                 </div>

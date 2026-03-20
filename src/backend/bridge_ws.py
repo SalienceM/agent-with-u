@@ -366,12 +366,44 @@ class BridgeWS:
 
     def _rpc_openLoginTerminal(self, backend_id: str = "") -> str:
         """打开终端，设好代理，启动 claude 交互模式，提示用户输入 /login。"""
+        return self._open_claude_terminal(
+            backend_id,
+            extra_hint_lines=["echo [AgentWithU] 请输入 /login 并按回车开始登录", "echo."],
+            bat_name="agentwithu_login.bat",
+        )
+
+    def _rpc_getClaudeSettings(self) -> str:
+        """读取 ~/.claude/settings.json，返回 model 等字段供前端显示。"""
+        from pathlib import Path as _Path
+        settings_path = _Path.home() / ".claude" / "settings.json"
+        try:
+            if settings_path.exists():
+                data = json.loads(settings_path.read_text(encoding="utf-8"))
+                return json.dumps({
+                    "model": data.get("model") or "",
+                }, ensure_ascii=False)
+        except Exception as e:
+            print(f"[BridgeWS] getClaudeSettings error: {e}", file=sys.stderr)
+        return json.dumps({"model": ""})
+
+    def _rpc_openModelTerminal(self, backend_id: str = "") -> str:
+        """打开终端，启动 claude，提示用户用 /model 换模型。"""
+        hint_lines = [
+            "echo [AgentWithU] 输入 /model <模型名> 并按回车切换模型",
+            "echo [AgentWithU] 常用: claude-opus-4-6 / claude-sonnet-4-6 / claude-haiku-4-5-20251001",
+            "echo.",
+        ]
+        return self._open_claude_terminal(backend_id, hint_lines, bat_name="agentwithu_model.bat")
+
+    def _open_claude_terminal(self, backend_id: str, extra_hint_lines: list, bat_name: str = "agentwithu_terminal.bat") -> str:
+        """公共方法：设代理 → 打印提示 → 启动 claude 交互模式。"""
         import subprocess as _sp
         import sys as _sys
         import shutil as _shutil
         import urllib.request as _ur
+        import tempfile as _tmp
+        import os as _os
 
-        # 1. 从后端配置读取代理
         https_proxy = ""
         cli_path = "claude"
         config = next((c for c in self._backend_configs if c.id == backend_id), None)
@@ -380,8 +412,6 @@ class BridgeWS:
                 https_proxy = config.env.get("HTTPS_PROXY", "") or config.env.get("https_proxy", "")
             if config.cli_path:
                 cli_path = config.cli_path
-
-        # 2. 兜底：若配置里没有显式代理，尝试读系统代理
         if not https_proxy:
             try:
                 sys_proxies = _ur.getproxies()
@@ -390,40 +420,27 @@ class BridgeWS:
                 pass
 
         if _sys.platform == "win32":
-            import tempfile as _tmp
-            import os as _os
-            # ★ 写临时 .bat 文件，避免 subprocess list 参数对双引号的转义导致 set 命令失效
             bat_lines = ["@echo off"]
             if https_proxy:
-                # 不加引号：代理 URL 不含空格，直接赋值，避免 cmd /K 列表传参时的引号转义问题
                 bat_lines.append(f"set HTTPS_PROXY={https_proxy}")
                 bat_lines.append(f"set HTTP_PROXY={https_proxy}")
                 bat_lines.append(f"echo [AgentWithU] 已设置代理: {https_proxy}")
             else:
                 bat_lines.append("echo [AgentWithU] 未检测到代理，若连接失败请先开启 VPN/代理")
-            bat_lines.append("echo [AgentWithU] 请输入 /login 并按回车开始登录")
-            bat_lines.append("echo.")
+            bat_lines.extend(extra_hint_lines)
             bat_lines.append(cli_path)
 
-            # 固定路径，避免每次产生垃圾临时文件
-            bat_path = _os.path.join(_os.environ.get("TEMP", _tmp.gettempdir()), "agentwithu_login.bat")
+            bat_path = _os.path.join(_os.environ.get("TEMP", _tmp.gettempdir()), bat_name)
             try:
                 with open(bat_path, "w", encoding="gbk", errors="replace") as f:
                     f.write("\r\n".join(bat_lines) + "\r\n")
             except Exception as e:
                 return json.dumps({"status": "error", "message": f"写入脚本失败: {e}"})
-
-            _sp.Popen(
-                ['cmd.exe', '/K', bat_path],
-                creationflags=_sp.CREATE_NEW_CONSOLE,
-            )
+            _sp.Popen(['cmd.exe', '/K', bat_path], creationflags=_sp.CREATE_NEW_CONSOLE)
         else:
-            # macOS / Linux
-            set_proxy = ""
-            if https_proxy:
-                set_proxy = f'export HTTPS_PROXY="{https_proxy}"; export HTTP_PROXY="{https_proxy}"; '
-            hint = "echo '[AgentWithU] 请输入 /login 并按回车开始登录'; echo"
-            cmd_body = f'{set_proxy}{hint}; {cli_path}; exec bash'
+            set_proxy = f'export HTTPS_PROXY="{https_proxy}"; export HTTP_PROXY="{https_proxy}"; ' if https_proxy else ""
+            hints = "; ".join(extra_hint_lines)
+            cmd_body = f'{set_proxy}{hints}; {cli_path}; exec bash'
             launched = False
             for term, args in [
                 ('gnome-terminal', ['--', 'bash', '-c', cmd_body]),
@@ -436,7 +453,7 @@ class BridgeWS:
                     launched = True
                     break
             if not launched:
-                return json.dumps({"status": "error", "message": "未找到可用终端，请手动运行 claude 并输入 /login"})
+                return json.dumps({"status": "error", "message": "未找到可用终端"})
 
         return json.dumps({"status": "ok"})
 
