@@ -96,6 +96,16 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
       });
       if (Object.keys(cleanedEnv).length > 0) saved.env = cleanedEnv;
       saved.skipPermissions = formData.skipPermissions !== false;
+    } else if (formData.type === 'claude-code-official') {
+      // 官方账户：凭证自动从 ~/.claude/.credentials.json 读取
+      // 只需保存代理 env（HTTPS_PROXY / HTTP_PROXY）和可选 model/cli_path
+      const cleanedEnv: Record<string, string> = {};
+      Object.entries(formData.env || {}).forEach(([k, v]) => {
+        if (v && v.trim()) cleanedEnv[k] = v.trim();
+      });
+      if (Object.keys(cleanedEnv).length > 0) saved.env = cleanedEnv;
+      if (formData.model?.trim()) saved.model = formData.model.trim();
+      saved.skipPermissions = formData.skipPermissions !== false;
     } else if (formData.type === 'openai-compatible') {
       // base_url, api_key, model, extra_headers
       if (formData.baseUrl?.trim()) saved.baseUrl = formData.baseUrl.trim();
@@ -224,6 +234,9 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
                         {backend.type === 'claude-agent-sdk' && backend.env?.ANTHROPIC_AUTH_TOKEN && (
                           <span> · Auth</span>
                         )}
+                        {backend.type === 'claude-code-official' && (
+                          <span> · 官方账户{backend.env?.HTTPS_PROXY ? ' · 代理✓' : ' · ⚠️无代理'}</span>
+                        )}
                         {(backend.type === 'openai-compatible' || backend.type === 'anthropic-api') && backend.model && (
                           <span> · {backend.model}</span>
                         )}
@@ -302,6 +315,7 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
                   style={selectStyle}
                 >
                   <option value="claude-agent-sdk">Claude Agent SDK</option>
+                  <option value="claude-code-official">Claude Code (官方账户)</option>
                   <option value="openai-compatible">OpenAI Compatible</option>
                   <option value="anthropic-api">Anthropic API</option>
                 </select>
@@ -400,6 +414,68 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
                   <p style={{ fontSize: 11, color: 'var(--theme-text-muted)', margin: '4px 0 0 22px' }}>
                     启用后 Claude 可直接调用工具，无需逐条确认。
                   </p>
+                </div>
+              </div>
+            )}
+
+            {/* ── Claude Code 官方账户 专属配置 ── */}
+            {formData.type === 'claude-code-official' && (
+              <div style={{ marginBottom: 16, padding: 12, background: 'var(--theme-bg-secondary)', borderRadius: 8 }}>
+                <label style={{ ...labelStyle, marginBottom: 8 }}>Claude Code 官方账户配置</label>
+                <p style={{ fontSize: 11, color: 'var(--theme-text-muted)', margin: '0 0 12px 0', lineHeight: 1.6 }}>
+                  凭证自动从 <code style={{ fontSize: 10, background: 'rgba(255,255,255,0.08)', padding: '1px 4px', borderRadius: 3 }}>~/.claude/.credentials.json</code> 读取（需先运行 <code style={{ fontSize: 10 }}>claude login</code>）。
+                  <br />只需配置代理即可使用。
+                </p>
+
+                <div style={{ marginBottom: 10 }}>
+                  <label style={{ fontSize: 11, color: 'var(--theme-text)', display: 'block', marginBottom: 4 }}>
+                    HTTPS_PROXY <span style={{ color: 'rgba(239,68,68,0.8)' }}>* 必填（Windows 系统代理自动检测不可靠）</span>
+                  </label>
+                  <input
+                    type="text"
+                    value={formData.env?.HTTPS_PROXY || ''}
+                    onChange={(e) => handleEnvChange('HTTPS_PROXY', e.target.value)}
+                    style={inputStyle}
+                    placeholder="http://127.0.0.1:7890（Clash 默认端口）"
+                  />
+                </div>
+
+                <div style={{ marginBottom: 10 }}>
+                  <label style={{ fontSize: 11, color: 'var(--theme-text)', display: 'block', marginBottom: 4 }}>
+                    HTTP_PROXY（与 HTTPS_PROXY 保持一致即可）
+                  </label>
+                  <input
+                    type="text"
+                    value={formData.env?.HTTP_PROXY || ''}
+                    onChange={(e) => handleEnvChange('HTTP_PROXY', e.target.value)}
+                    style={inputStyle}
+                    placeholder="http://127.0.0.1:7890"
+                  />
+                </div>
+
+                <div style={{ marginBottom: 10 }}>
+                  <label style={{ fontSize: 11, color: 'var(--theme-text)', display: 'block', marginBottom: 4 }}>
+                    ANTHROPIC_MODEL（可选，留空由 CLI 自动决定）
+                  </label>
+                  <input
+                    type="text"
+                    value={formData.model || ''}
+                    onChange={(e) => setFormData({ ...formData, model: e.target.value })}
+                    style={inputStyle}
+                    placeholder="e.g., claude-sonnet-4-6"
+                  />
+                </div>
+
+                <div style={{ marginTop: 12 }}>
+                  <label style={{ ...labelStyle, display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer', marginBottom: 0 }}>
+                    <input
+                      type="checkbox"
+                      checked={formData.skipPermissions !== false}
+                      onChange={(e) => setFormData({ ...formData, skipPermissions: e.target.checked })}
+                      style={{ accentColor: 'var(--theme-accent)', width: 14, height: 14, flexShrink: 0 }}
+                    />
+                    Skip Permissions (bypassPermissions 模式)
+                  </label>
                 </div>
               </div>
             )}
