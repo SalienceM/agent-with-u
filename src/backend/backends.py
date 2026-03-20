@@ -470,11 +470,18 @@ class ClaudeCodeOfficialBackend(ModelBackend):
         return cmd
 
     def _build_env(self) -> dict:
-        """构建子进程环境：继承系统 env，再用后端配置覆盖关键变量。"""
+        """构建子进程环境：继承系统 env，再用后端配置覆盖关键变量。
+
+        ★ 认证策略：
+          - 默认不注入 ANTHROPIC_AUTH_TOKEN / ANTHROPIC_API_KEY（依赖 `claude login` 凭证）
+          - 只有当后端配置的 env 字段中显式填写了 token 时才覆盖
+          - 这样官方账户只需 `claude login` 一次，无需在配置里填 token
+        """
         import os as _os
         proc_env = _os.environ.copy()
 
-        # 优先用后端配置里的认证 / 代理变量覆盖系统 env
+        # ★ 优先用后端配置里的变量覆盖（代理、model 等）
+        #   认证相关只在用户显式配置时才覆盖，避免覆盖 claude login 凭证
         for key in (
             "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY",
             "ANTHROPIC_BASE_URL", "ANTHROPIC_MODEL",
@@ -486,12 +493,14 @@ class ClaudeCodeOfficialBackend(ModelBackend):
                 if val:
                     proc_env[key] = val
                 else:
+                    # 显式设置空字符串 = 清除该变量（用于隔离环境）
                     proc_env.pop(key, None)
 
         # 如果后端配置提供了 AUTH_TOKEN 而没有 API_KEY，确保两个变量都填充
-        auth_token = proc_env.get("ANTHROPIC_AUTH_TOKEN")
-        if auth_token and not proc_env.get("ANTHROPIC_API_KEY"):
-            proc_env["ANTHROPIC_API_KEY"] = auth_token
+        # （不影响 claude login 路径：那时两者都不在 config.env 里）
+        cfg_token = self.config.get_env("ANTHROPIC_AUTH_TOKEN")
+        if cfg_token and not self.config.get_env("ANTHROPIC_API_KEY"):
+            proc_env["ANTHROPIC_API_KEY"] = cfg_token
 
         return proc_env
 
