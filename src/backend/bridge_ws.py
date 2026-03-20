@@ -705,7 +705,7 @@ class BridgeWS:
         current_images = images
         success = True
         retry_count = 0
-        max_retry = 1
+        max_retry = 0  # 暂时禁用 resume_failed 重试（逻辑待整理）
 
         for iteration in range(max_continuations + 1):
             iter_text: list[str] = []
@@ -823,9 +823,6 @@ class BridgeWS:
                     retry_count += 1
                     session.agent_session_id = None
                     continue
-                elif retry_state["without_session"]:
-                    self._emit_delta(StreamDelta(session.id, message_id, "error",
-                                                 error="无法恢复对话会话，已尝试压缩历史重试"))
 
                 if stop_reason == "max_tokens" and auto_continue and iteration < max_continuations:
                     # ★ 权限门控：未跳过确认时，auto-continue 前请求用户确认

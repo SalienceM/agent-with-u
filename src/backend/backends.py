@@ -679,6 +679,7 @@ class ClaudeCodeOfficialBackend(ModelBackend):
         fut = loop.run_in_executor(None, _run)
         _done_emitted = False
         _usage: Optional[dict] = None
+        _suppress_exit_error = [False]  # auth 错误时压制 "exited with code 1" 提示
 
         def _process_json_obj(obj: dict):
             nonlocal _new_agent_sid, _usage
@@ -748,8 +749,29 @@ class ClaudeCodeOfficialBackend(ModelBackend):
                 is_error = obj.get("is_error", False)
                 subtype = obj.get("subtype", "")
                 if is_error or subtype == "error_during_execution":
-                    print(f"[OfficialBackend] result error: subtype={subtype}", file=sys.stderr, flush=True)
-                    emit("resume_failed")
+                    result_text = obj.get("result", "")
+                    print(f"[OfficialBackend] result error: subtype={subtype}, text={result_text[:300]}",
+                          file=sys.stderr, flush=True)
+                    # 判断是否为认证/网络错误（区别于 session-resume 失败）
+                    _lower = result_text.lower()
+                    _is_auth_or_network = any(k in _lower for k in (
+                        "failed to auth", "authentication failed", "unauthorized",
+                        "invalid", "login", "credential", "expired",
+                        "failed to fetch", "network", "econnrefused", "enotfound",
+                    ))
+                    if _is_auth_or_network:
+                        # 发送友好提示气泡，压制后续 "exited with code 1"
+                        _suppress_exit_error[0] = True
+                        emit("text_delta", text=(
+                            "\n\n---\n\n"
+                            "💡 **账户或网络问题，请检查：**\n\n"
+                            "- **未登录 / token 已过期**：在终端运行 `claude login` 重新登录后重试\n"
+                            "- **代理未开启**：访问 Claude 服务需要代理（VPN），"
+                            "请确认代理已开启并在后端配置中填写代理地址（如 `HTTPS_PROXY=http://127.0.0.1:7890`）\n"
+                            "- **网络中断**：确认网络连接正常\n"
+                        ))
+                    else:
+                        emit("resume_failed")
                 usage = obj.get("usage", {})
                 if usage:
                     _usage = {
@@ -779,7 +801,7 @@ class ClaudeCodeOfficialBackend(ModelBackend):
                     emit("text_delta", text=payload + "\n")
                 elif tag == "proc_done":
                     rc = payload
-                    if rc != 0 and not _done_emitted:
+                    if rc != 0 and not _done_emitted and not _suppress_exit_error[0]:
                         emit("error", error=f"claude exited with code {rc}")
                     break
                 elif tag == "proc_error":
