@@ -356,21 +356,31 @@ class BridgeWS:
                 pass
 
         if _sys.platform == "win32":
-            # 构建批处理命令：设代理 → 打印提示 → 启动 claude 交互模式
-            lines = []
+            import tempfile as _tmp
+            import os as _os
+            # ★ 写临时 .bat 文件，避免 subprocess list 参数对双引号的转义导致 set 命令失效
+            bat_lines = ["@echo off"]
             if https_proxy:
-                lines.append(f'set "HTTPS_PROXY={https_proxy}"')
-                lines.append(f'set "HTTP_PROXY={https_proxy}"')
-                lines.append(f'echo [AgentWithU] 已设置代理: {https_proxy}')
+                # 不加引号：代理 URL 不含空格，直接赋值，避免 cmd /K 列表传参时的引号转义问题
+                bat_lines.append(f"set HTTPS_PROXY={https_proxy}")
+                bat_lines.append(f"set HTTP_PROXY={https_proxy}")
+                bat_lines.append(f"echo [AgentWithU] 已设置代理: {https_proxy}")
             else:
-                lines.append('echo [AgentWithU] 未检测到代理，若登录失败请先开启 VPN/代理')
-            lines.append('echo [AgentWithU] claude 已启动，请在下方输入 /login 并按回车开始登录')
-            lines.append('echo.')
-            lines.append(cli_path)
-            # 用 & 连接（cmd /K 执行整段命令后保持窗口）
-            cmd_body = ' && '.join(lines)
+                bat_lines.append("echo [AgentWithU] 未检测到代理，若连接失败请先开启 VPN/代理")
+            bat_lines.append("echo [AgentWithU] 请输入 /login 并按回车开始登录")
+            bat_lines.append("echo.")
+            bat_lines.append(cli_path)
+
+            # 固定路径，避免每次产生垃圾临时文件
+            bat_path = _os.path.join(_os.environ.get("TEMP", _tmp.gettempdir()), "agentwithu_login.bat")
+            try:
+                with open(bat_path, "w", encoding="utf-8") as f:
+                    f.write("\r\n".join(bat_lines) + "\r\n")
+            except Exception as e:
+                return json.dumps({"status": "error", "message": f"写入脚本失败: {e}"})
+
             _sp.Popen(
-                ['cmd.exe', '/K', cmd_body],
+                ['cmd.exe', '/K', bat_path],
                 creationflags=_sp.CREATE_NEW_CONSOLE,
             )
         else:
