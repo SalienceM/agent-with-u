@@ -610,6 +610,147 @@ def test8_login_behavior():
 
 
 # ─────────────────────────────────────────────────────────────
+# 测试 9：用 pty 模拟 TTY，探测 claude login 真实 OAuth 输出
+#
+# Test 8 结论：claude login 在 pipe 模式下直接说 "Not logged in"
+# 并以 rc=1 退出，因为它检测到没有 TTY。
+#
+# Test 9 用 Python pty 分配伪 TTY，让 claude login 以为有终端，
+# 观察它真正启动 OAuth 流程时输出什么（URL? 等待提示?）
+#
+# ★ 只运行 12 秒后自动杀进程，不会真正完成登录
+# ─────────────────────────────────────────────────────────────
+
+def test9_login_pty():
+    _sep("TEST 9 - claude login（伪 TTY）OAuth 输出探测")
+
+    if sys.platform == "win32":
+        print("!! pty 模块在 Windows 不可用，跳过")
+        print("   Windows 建议：在新 cmd 窗口里直接运行 `claude login`")
+        return None
+
+    import pty, os, select, time, re
+
+    KILL_AFTER_SECS = 12
+    cli = _resolve_cli()
+    env = _make_env(clean=True, with_proxy=bool(PROXY))
+
+    print(f"cmd: {cli} login")
+    print(f"proxy: {env.get('HTTPS_PROXY', '无')}")
+    print(f"等待 {KILL_AFTER_SECS} 秒，捕获 pty 输出...\n")
+
+    all_output_bytes = b""
+    master_fd, slave_fd = pty.openpty()
+
+    try:
+        proc = subprocess.Popen(
+            [cli, "login"],
+            stdin=slave_fd,
+            stdout=slave_fd,
+            stderr=slave_fd,
+            close_fds=True,
+            env=env,
+            cwd=WORK_DIR,
+        )
+        os.close(slave_fd)
+        slave_fd = -1
+
+        deadline = time.time() + KILL_AFTER_SECS
+        while time.time() < deadline:
+            if proc.poll() is not None:
+                print(f"\n  进程自行退出，rc={proc.returncode}")
+                break
+            try:
+                r, _, _ = select.select([master_fd], [], [], 0.3)
+                if r:
+                    chunk = os.read(master_fd, 4096)
+                    if chunk:
+                        all_output_bytes += chunk
+                        # 实时打印（处理 ANSI 转义只保留可打印部分）
+                        text = chunk.decode("utf-8", errors="replace")
+                        for line in text.splitlines():
+                            line_clean = re.sub(r'\x1b\[[0-9;]*[A-Za-z]', '', line).strip()
+                            if line_clean:
+                                print(f"  [PTY] {line_clean}")
+            except OSError:
+                break
+        else:
+            print(f"\n  {KILL_AFTER_SECS}s 已到，终止进程...")
+            proc.terminate()
+            try:
+                proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+
+        # 读取剩余
+        try:
+            os.set_blocking(master_fd, False)
+            while True:
+                chunk = os.read(master_fd, 4096)
+                if not chunk:
+                    break
+                all_output_bytes += chunk
+        except (OSError, BlockingIOError):
+            pass
+
+    finally:
+        try:
+            os.close(master_fd)
+        except OSError:
+            pass
+        if slave_fd != -1:
+            try:
+                os.close(slave_fd)
+            except OSError:
+                pass
+
+    # 分析输出
+    all_text = all_output_bytes.decode("utf-8", errors="replace")
+    all_clean = re.sub(r'\x1b\[[0-9;]*[A-Za-z]', '', all_text)
+
+    urls = re.findall(r'https?://\S+', all_clean)
+    # 去掉末尾标点
+    urls = [u.rstrip('.,;)"\']') for u in urls]
+
+    print(f"\n{'─'*50}")
+    print(f"总结:")
+    print(f"  原始输出字节数: {len(all_output_bytes)}")
+    print(f"  发现 URL 数量:  {len(urls)}")
+    if urls:
+        print(f"  URL 列表:")
+        for u in urls:
+            print(f"    {u}")
+
+    lower = all_clean.lower()
+    has_oauth_url  = any("oauth" in u.lower() or "claude.ai" in u.lower() or "auth" in u.lower() for u in urls)
+    has_browser    = "browser" in lower or "opening" in lower
+    has_waiting    = "wait" in lower or "callback" in lower or "listen" in lower or "code" in lower
+
+    print(f"\n  OAuth URL:     {'✅ 是' if has_oauth_url else '❌ 否'}")
+    print(f"  打开浏览器:    {'✅ 是' if has_browser else '❌ 否'}")
+    print(f"  等待回调/code: {'✅ 是' if has_waiting else '❌ 否'}")
+
+    print(f"\n  ★ 集成结论:")
+    if has_oauth_url and not has_browser:
+        print("  → 输出 URL 但不自动开浏览器：程序捕获 URL 后调 webbrowser.open() 即可")
+    elif has_oauth_url and has_browser:
+        print("  → 自动开浏览器，同时输出 URL：程序可监控 claude login 完成再继续")
+    elif has_browser and not has_oauth_url:
+        print("  → 只开浏览器不输出 URL：程序无法捕获 URL，只能等进程退出")
+    else:
+        print("  → 既没有 URL 也没有浏览器，仍需要 TTY 交互（方向键/回车选择）")
+        print("  → 建议：在独立终端窗口里让用户手动完成，或用 xterm 启动")
+
+    print(f"\n  完整清洁文本（用于调试）:")
+    for line in all_clean.splitlines():
+        line = line.strip()
+        if line:
+            print(f"    | {line}")
+
+    return True
+
+
+# ─────────────────────────────────────────────────────────────
 # 主入口
 # ─────────────────────────────────────────────────────────────
 
@@ -642,6 +783,9 @@ async def main():
 
     if selected == 8:
         results[8] = test8_login_behavior()
+
+    if selected == 9:
+        results[9] = test9_login_pty()
 
     if run_all:
         _sep("汇总")
