@@ -34,10 +34,17 @@ from pathlib import Path
 from typing import Optional
 
 # ─────────────────────────────────────────────────────────────
-# ★ AUTH_TOKEN：如果你已通过 claude login 登录，可以留空
-#   只有当你想测试 env 变量方式时才填入
+# ★ 配置区：按需修改
 # ─────────────────────────────────────────────────────────────
-AUTH_TOKEN = ""   # 留空 = 使用 claude login 凭证；否则填入 token
+
+# 代理地址（★ 关键）：claude 需要代理才能访问 api.anthropic.com
+# 示例：http://127.0.0.1:7890（Clash）、http://127.0.0.1:10809（v2rayN）
+# 留空 = 不注入代理 env，依赖系统代理（TUN 模式）或直连
+PROXY = "http://127.0.0.1:7890"
+
+# AUTH_TOKEN：如果你已通过 claude login 登录，留空即可
+# 只有当你想测试 env 变量方式时才填入
+AUTH_TOKEN = ""
 
 # 可选：Anthropic API Key（sk-ant-api03-xxx 格式）
 API_KEY = ""
@@ -66,54 +73,59 @@ def _resolve_cli() -> str:
 
 
 def _make_env(use_auth_token: bool = True, use_api_key: bool = False,
-              clean: bool = False) -> dict:
-    """构建子进程环境变量。clean=True 时不注入任何 token（依赖已登录凭证）。"""
+              clean: bool = False, with_proxy: bool = False) -> dict:
+    """构建子进程环境变量。
+    clean=True：不注入任何 token（依赖已登录凭证）
+    with_proxy=True：注入 PROXY 配置里的代理变量
+    """
     env = os.environ.copy()
     if clean:
-        # 移除可能干扰的 token 变量，完全依赖 claude login 存储的凭证
         for k in ("ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY"):
             env.pop(k, None)
-        return env
-    if use_auth_token and AUTH_TOKEN:
-        env["ANTHROPIC_AUTH_TOKEN"] = AUTH_TOKEN
-        env["ANTHROPIC_API_KEY"] = AUTH_TOKEN
-    if use_api_key and API_KEY:
-        env["ANTHROPIC_API_KEY"] = API_KEY
+    else:
+        if use_auth_token and AUTH_TOKEN:
+            env["ANTHROPIC_AUTH_TOKEN"] = AUTH_TOKEN
+            env["ANTHROPIC_API_KEY"] = AUTH_TOKEN
+        if use_api_key and API_KEY:
+            env["ANTHROPIC_API_KEY"] = API_KEY
+    if with_proxy and PROXY:
+        for k in ("HTTPS_PROXY", "HTTP_PROXY", "https_proxy", "http_proxy"):
+            env[k] = PROXY
     return env
 
 
 def _run_cli(cmd: list[str], env: dict, timeout: int = 60) -> tuple[int, str, str]:
-    """运行 CLI，Windows 下强制 UTF-8 避免 GBK 解码错误。"""
-    extra: dict = {}
+    """运行 CLI。
+    Windows: 二进制读取 + utf-8 手动 decode（避免 GBK 崩溃）+ CREATE_NO_WINDOW（不弹黑窗口）
+    """
+    popen_kwargs: dict = dict(
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=env,
+        cwd=WORK_DIR,
+        bufsize=0,
+    )
     if sys.platform == "win32":
-        # Windows: 通过 PYTHONIOENCODING 强制 UTF-8，并用二进制读再手动 decode
-        env = {**env, "PYTHONIOENCODING": "utf-8"}
-        extra = {"encoding": None}   # 二进制模式
+        # 不指定 encoding → 二进制模式，手动 decode utf-8
+        popen_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
     else:
-        extra = {"encoding": "utf-8", "errors": "replace"}
+        popen_kwargs["encoding"] = "utf-8"
+        popen_kwargs["errors"] = "replace"
 
     try:
-        proc = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            env=env,
-            cwd=WORK_DIR,
-            bufsize=0,
-            **extra,
-        )
+        proc = subprocess.Popen(cmd, **popen_kwargs)
         try:
             stdout_b, stderr_b = proc.communicate(timeout=timeout)
         except subprocess.TimeoutExpired:
             proc.kill()
             stdout_b, stderr_b = proc.communicate()
 
-        if isinstance(stdout_b, bytes):
-            stdout = stdout_b.decode("utf-8", errors="replace")
-            stderr = stderr_b.decode("utf-8", errors="replace")
-        else:
-            stdout, stderr = stdout_b or "", stderr_b or ""
-        return proc.returncode, stdout, stderr
+        def _dec(b) -> str:
+            if isinstance(b, bytes):
+                return b.decode("utf-8", errors="replace")
+            return b or ""
+
+        return proc.returncode, _dec(stdout_b), _dec(stderr_b)
     except FileNotFoundError:
         return -1, "", f"FileNotFoundError: {cmd[0]} not found"
     except Exception as e:
@@ -190,8 +202,8 @@ def test7_read_credentials():
 # 测试 6：使用已登录凭证（不注入 token env）★ 最重要的测试
 # ─────────────────────────────────────────────────────────────
 
-def test6_logged_in_credentials():
-    _sep("TEST 6 - claude login 凭证（不传 AUTH_TOKEN env）★")
+def _run_claude_stream(env: dict, label: str) -> bool:
+    """运行 claude stream-json，打印结果，返回是否成功。"""
     cli = _resolve_cli()
     cmd = [
         cli,
@@ -200,15 +212,15 @@ def test6_logged_in_credentials():
         "--dangerously-skip-permissions",
         "-p", TEST_PROMPT,
     ]
-    # 关键：clean=True，完全不注入 token，依赖 claude login
-    env = _make_env(clean=True)
-    print(f"cmd: {' '.join(cmd)}")
-    print(f"ANTHROPIC_AUTH_TOKEN in env: {'yes' if 'ANTHROPIC_AUTH_TOKEN' in env else 'NO（依赖本地凭证）'}")
-    print(f"ANTHROPIC_API_KEY in env: {'yes' if 'ANTHROPIC_API_KEY' in env else 'NO'}")
-    print("等待（最多 60 秒）...\n")
+    proxy_in_env = env.get("HTTPS_PROXY") or env.get("https_proxy") or "无"
+    auth_in_env = env.get("ANTHROPIC_AUTH_TOKEN", "")
+    print(f"\n[{label}]")
+    print(f"  proxy in env: {proxy_in_env}")
+    print(f"  AUTH_TOKEN in env: {'yes('+str(len(auth_in_env))+'chars)' if auth_in_env else 'NO（依赖本地凭证）'}")
+    print(f"  等待（最多 60 秒）...")
 
     rc, stdout, stderr = _run_cli(cmd, env, timeout=60)
-    print(f"returncode: {rc}")
+    print(f"  returncode: {rc}")
 
     success = False
     text_output = []
@@ -219,29 +231,60 @@ def test6_logged_in_credentials():
         try:
             obj = json.loads(line)
             t = obj.get("type", "?")
-            print(f"  [JSON] type={t!r}", end="")
+            print(f"    [JSON] type={t!r}", end="")
             if t == "assistant":
                 for block in obj.get("message", {}).get("content", []):
                     if block.get("type") == "text":
-                        txt = block["text"][:100]
+                        txt = block["text"][:80]
                         text_output.append(txt)
                         print(f" text={txt!r}", end="")
             elif t == "result":
-                sid = obj.get("session_id", "?")
                 is_err = obj.get("is_error", True)
-                print(f" session_id={sid!r} is_error={is_err}", end="")
+                print(f" is_error={is_err}", end="")
                 if not is_err:
                     success = True
             print()
         except json.JSONDecodeError:
-            print(f"  [RAW] {line[:120]}")
+            print(f"    [RAW] {line[:100]}")
 
     if stderr.strip():
-        print(f"\nstderr:\n{stderr[:400]}")
+        print(f"  stderr: {stderr[:300]}")
     if text_output:
-        print(f"\nAI 回复: {''.join(text_output)[:200]}")
-    print(f"\n结论: {'✅ 成功 - claude login 路径可用！' if success else '❌ 失败'}")
+        print(f"  AI 回复: {''.join(text_output)[:200]}")
+    print(f"  结果: {'✅ 成功' if success else '❌ 失败'}")
     return success
+
+
+def test6_logged_in_credentials():
+    _sep("TEST 6 - claude login 凭证（两轮：无代理 / 有代理）★")
+    print("目的：排查 403 是代理问题还是账号权限问题")
+
+    # 轮次 A：不注入代理 env（依赖系统 TUN/全局代理，或直连）
+    env_no_proxy = _make_env(clean=True, with_proxy=False)
+    ok_a = _run_claude_stream(env_no_proxy, "轮次A: 不注入代理 env")
+
+    if ok_a:
+        print("\n✅ 系统代理/直连已可用，无需在 env 里设置代理")
+        return True
+
+    # 轮次 B：显式注入代理 env
+    if PROXY:
+        env_with_proxy = _make_env(clean=True, with_proxy=True)
+        ok_b = _run_claude_stream(env_with_proxy, f"轮次B: 注入 PROXY={PROXY}")
+        if ok_b:
+            print(f"\n✅ 需要在子进程 env 里显式设置代理：{PROXY}")
+            print("   → ClaudeCodeOfficialBackend 后端配置 env 字段填入:")
+            print(f'   {{"HTTPS_PROXY": "{PROXY}", "HTTP_PROXY": "{PROXY}"}}')
+            return True
+        print(f"\n❌ 注入代理后仍然失败")
+        print("   → 这是账号权限问题，不是代理问题")
+        print("   → 检查：Claude.ai 账号是否有 Claude Code 访问权限")
+        print("   → 需要 Claude Pro 或 Max 订阅才能使用 claude CLI API")
+    else:
+        print("\n⚠️  PROXY 未配置，跳过代理轮次")
+        print("   → 如果轮次A失败，请在文件顶部设置 PROXY='http://127.0.0.1:7890'")
+
+    return False
 
 
 # ─────────────────────────────────────────────────────────────

@@ -540,24 +540,34 @@ class ClaudeCodeOfficialBackend(ModelBackend):
         loop = asyncio.get_event_loop()
         msg_queue: asyncio.Queue = asyncio.Queue()
 
+        # Windows: 不显示黑色控制台窗口
+        _popen_kwargs: dict = dict(
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=proc_env,
+            cwd=cwd,
+            bufsize=1,
+        )
+        if sys.platform == "win32":
+            # CREATE_NO_WINDOW 避免弹出 cmd 黑窗口
+            _popen_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+            # Windows 下不指定 encoding，手动 decode 避免 GBK 崩溃
+        else:
+            _popen_kwargs["encoding"] = "utf-8"
+            _popen_kwargs["errors"] = "replace"
+
         def _run():
             try:
-                proc = subprocess.Popen(
-                    cmd,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    env=proc_env,
-                    cwd=cwd,
-                    encoding="utf-8",
-                    errors="replace",
-                    bufsize=1,
-                )
+                proc = subprocess.Popen(cmd, **_popen_kwargs)
                 print(f"[OfficialBackend] pid={proc.pid}", file=sys.stderr, flush=True)
                 line_count = 0
                 while True:
                     raw = proc.stdout.readline()
                     if not raw:
                         break
+                    # Windows 二进制模式：手动 utf-8 解码
+                    if isinstance(raw, bytes):
+                        raw = raw.decode("utf-8", errors="replace")
                     line = raw.strip()
                     if not line:
                         continue
@@ -569,9 +579,13 @@ class ClaudeCodeOfficialBackend(ModelBackend):
                     except json.JSONDecodeError:
                         loop.call_soon_threadsafe(msg_queue.put_nowait, ("text", line))
                 proc.wait()
-                stderr_out = proc.stderr.read().strip()
-                if stderr_out:
-                    print(f"[OfficialBackend] stderr: {stderr_out[:800]}", file=sys.stderr, flush=True)
+                raw_err = proc.stderr.read()
+                if raw_err:
+                    if isinstance(raw_err, bytes):
+                        raw_err = raw_err.decode("utf-8", errors="replace")
+                    stderr_s = raw_err.strip()
+                    if stderr_s:
+                        print(f"[OfficialBackend] stderr: {stderr_s[:800]}", file=sys.stderr, flush=True)
                 loop.call_soon_threadsafe(msg_queue.put_nowait, ("proc_done", proc.returncode))
             except Exception as e:
                 loop.call_soon_threadsafe(msg_queue.put_nowait, ("proc_error", str(e)))
