@@ -330,6 +330,57 @@ class BridgeWS:
         self._backends.pop(config_id, None)
         return None
 
+    def _rpc_openLoginTerminal(self, backend_id: str = "") -> str:
+        """为 claude-code-official 后端打开一个终端窗口执行 claude login。
+        若后端配置了代理，会先 set HTTPS_PROXY 再执行。
+        """
+        import subprocess as _sp
+        import sys as _sys
+        import shutil as _shutil
+
+        # 从后端配置读取代理
+        https_proxy = ""
+        cli_path = "claude"
+        config = next((c for c in self._backend_configs if c.id == backend_id), None)
+        if config:
+            if config.env:
+                https_proxy = config.env.get("HTTPS_PROXY", "") or config.env.get("https_proxy", "")
+            if config.cli_path:
+                cli_path = config.cli_path
+
+        if _sys.platform == "win32":
+            # 构建 cmd 命令行：先设代理（如有），再运行 claude login
+            if https_proxy:
+                cmd_body = f'set "HTTPS_PROXY={https_proxy}" && set "HTTP_PROXY={https_proxy}" && {cli_path} login'
+            else:
+                cmd_body = f'{cli_path} login'
+            # /K 保持窗口打开（让用户看到登录流程）
+            _sp.Popen(
+                ['cmd.exe', '/K', cmd_body],
+                creationflags=_sp.CREATE_NEW_CONSOLE,
+            )
+        else:
+            # macOS / Linux：尝试常见终端
+            if https_proxy:
+                cmd_body = f'export HTTPS_PROXY="{https_proxy}"; export HTTP_PROXY="{https_proxy}"; {cli_path} login; exec bash'
+            else:
+                cmd_body = f'{cli_path} login; exec bash'
+            launched = False
+            for term, args in [
+                ('gnome-terminal', ['--', 'bash', '-c', cmd_body]),
+                ('xterm',          ['-e', f'bash -c \'{cmd_body}\'']),
+                ('konsole',        ['--noclose', '-e', 'bash', '-c', cmd_body]),
+                ('open',           ['-a', 'Terminal', '--args', '-c', cmd_body]),  # macOS fallback
+            ]:
+                if _shutil.which(term):
+                    _sp.Popen([term] + args)
+                    launched = True
+                    break
+            if not launched:
+                return json.dumps({"status": "error", "message": "未找到可用终端，请手动运行 claude login"})
+
+        return json.dumps({"status": "ok"})
+
     # ── RPC: 数据导入导出 ────────────────────────────────────────
 
     async def _rpc_exportData(self, target_path: str) -> str:

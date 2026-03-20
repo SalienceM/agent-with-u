@@ -357,6 +357,11 @@ export const api = {
   },
 
   /** 响应后端发出的 permissionRequest，granted=true 继续，false 取消。 */
+  async openLoginTerminal(backendId: string): Promise<{ status: string; message?: string }> {
+    const result = await call('openLoginTerminal', backendId);
+    try { return JSON.parse(result); } catch { return { status: 'ok' }; }
+  },
+
   async grantPermission(sessionId: string, granted: boolean): Promise<void> {
     await send('grantPermission', sessionId, granted);
   },

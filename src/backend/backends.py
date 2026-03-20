@@ -765,10 +765,11 @@ class ClaudeCodeOfficialBackend(ModelBackend):
                         emit("text_delta", text=(
                             "\n\n---\n\n"
                             "💡 **账户或网络问题，请检查：**\n\n"
-                            "- **未登录 / token 已过期**：在终端运行 `claude login` 重新登录后重试\n"
+                            "- **未登录 / token 已过期**：点击右上角 ⚙️ → 编辑后端 → **一键打开登录终端** 重新登录，"
+                            "或在终端手动运行 `claude login`\n"
                             "- **代理未开启**：访问 Claude 服务需要代理（VPN），"
-                            "请确认代理已开启并在后端配置中填写代理地址（如 `HTTPS_PROXY=http://127.0.0.1:7890`）\n"
-                            "- **网络中断**：确认网络连接正常\n"
+                            "请确认代理已开启并在后端配置 `HTTPS_PROXY` 字段填写代理地址（如 `http://127.0.0.1:7890`）\n"
+                            "- **网络中断**：确认网络连接正常后重新发送消息\n"
                         ))
                     else:
                         emit("resume_failed")

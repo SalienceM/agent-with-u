@@ -1,4 +1,4 @@
-import React, { useState, useCallback, useRef } from 'react';
+import React, { useState, useCallback } from 'react';
 import { api } from '../api';
 
 // Global variable to store selected target backend for migration
@@ -58,6 +58,8 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
   });
   const [oauthLoading, setOauthLoading] = useState(false);
   const [oauthError, setOauthError] = useState<string | null>(null);
+  const [loginLaunching, setLoginLaunching] = useState(false);
+  const [loginMsg, setLoginMsg] = useState<string | null>(null);
   const [backendToDelete, setBackendToDelete] = useState<BackendConfig | null>(null);
   const [dependentSessions, setDependentSessions] = useState<any[]>([]);
 
@@ -162,6 +164,23 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
       setOauthLoading(false);
     }
   }, [handleEnvChange]);
+
+  const handleOpenLoginTerminal = useCallback(async () => {
+    setLoginLaunching(true);
+    setLoginMsg(null);
+    try {
+      const res = await api.openLoginTerminal(formData.id);
+      if (res.status === 'error') {
+        setLoginMsg(res.message || '打开失败');
+      } else {
+        setLoginMsg('已打开终端，请在终端窗口完成登录后关闭该窗口，再回来使用。');
+      }
+    } catch (e: any) {
+      setLoginMsg(e?.message || '打开失败');
+    } finally {
+      setLoginLaunching(false);
+    }
+  }, [formData.id]);
 
   const handleDeleteClick = useCallback((backend: BackendConfig) => {
     // Find sessions that depend on this backend
@@ -426,6 +445,42 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
                   凭证自动从 <code style={{ fontSize: 10, background: 'rgba(255,255,255,0.08)', padding: '1px 4px', borderRadius: 3 }}>~/.claude/.credentials.json</code> 读取（需先运行 <code style={{ fontSize: 10 }}>claude login</code>）。
                   <br />只需配置代理即可使用。
                 </p>
+
+                {/* 一键登录卡片 */}
+                <div style={{
+                  marginBottom: 14, padding: 12, borderRadius: 8,
+                  background: 'rgba(99,102,241,0.1)', border: '1px solid rgba(99,102,241,0.3)',
+                }}>
+                  <div style={{ fontSize: 12, fontWeight: 600, color: 'rgba(165,168,255,0.95)', marginBottom: 6 }}>
+                    🔑 第一步：登录 Claude 账户
+                  </div>
+                  <div style={{ fontSize: 11, color: 'var(--theme-text-muted)', marginBottom: 10, lineHeight: 1.6 }}>
+                    点击下方按钮，将自动打开终端窗口并运行 <code style={{ fontSize: 10, background: 'rgba(255,255,255,0.08)', padding: '1px 4px', borderRadius: 3 }}>claude login</code>。
+                    {formData.env?.HTTPS_PROXY && (
+                      <span>（已检测到代理 <code style={{ fontSize: 10 }}>{formData.env.HTTPS_PROXY}</code>，会自动设置）</span>
+                    )}
+                    <br />在终端中按提示完成登录后，关闭终端即可。
+                  </div>
+                  <button
+                    onClick={handleOpenLoginTerminal}
+                    disabled={loginLaunching}
+                    style={{
+                      fontSize: 12, padding: '7px 16px', borderRadius: 6,
+                      border: '1px solid rgba(99,102,241,0.5)',
+                      background: loginLaunching ? 'rgba(99,102,241,0.2)' : 'rgba(99,102,241,0.35)',
+                      color: 'rgba(200,201,255,0.95)', fontWeight: 500,
+                      cursor: loginLaunching ? 'wait' : 'pointer',
+                    }}
+                  >
+                    {loginLaunching ? '正在打开终端...' : '📂 一键打开登录终端'}
+                  </button>
+                  {loginMsg && (
+                    <p style={{ fontSize: 11, margin: '8px 0 0 0', lineHeight: 1.5,
+                      color: loginMsg.includes('失败') ? 'rgba(239,68,68,0.9)' : 'rgba(34,197,94,0.9)' }}>
+                      {loginMsg}
+                    </p>
+                  )}
+                </div>
 
                 <div style={{ marginBottom: 10 }}>
                   <label style={{ fontSize: 11, color: 'var(--theme-text)', display: 'block', marginBottom: 4 }}>
