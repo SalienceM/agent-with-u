@@ -389,7 +389,7 @@ class BridgeWS:
     def _rpc_openModelTerminal(self, backend_id: str = "") -> str:
         """打开终端，启动 claude，提示用户用 /model 换模型。"""
         hint_lines = [
-            "echo [AgentWithU] 输入 /model <模型名> 并按回车切换模型",
+            "echo [AgentWithU] 输入 /model 【模型名】 并按回车切换模型",
             "echo [AgentWithU] 常用: claude-opus-4-6 / claude-sonnet-4-6 / claude-haiku-4-5-20251001",
             "echo.",
         ]
