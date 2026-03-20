@@ -50,7 +50,11 @@ DEFAULT_BACKENDS = [
         model=None,  # ★ 从 ANTHROPIC_MODEL 读取
         allowed_tools=["Read", "Edit", "Bash", "Glob", "Grep", "Write"],
         skip_permissions=True,
-        # ★ 在后端配置的 env 字段中填入 ANTHROPIC_AUTH_TOKEN 即可使用官方账户
+        # ★ 官方账户凭证自动从 ~/.claude/.credentials.json 读取（claude login 后生效）
+        # ★ 如果网络需要代理，必须在 env 字段显式填入代理：
+        #    {"HTTPS_PROXY": "http://127.0.0.1:7890", "HTTP_PROXY": "http://127.0.0.1:7890"}
+        # ★ 系统代理自动检测在 Windows 下不可靠，必须显式配置
+        env=None,  # 用户可在 UI 的"后端配置"里填入代理 env
     ),
 ]
 
@@ -129,7 +133,9 @@ class Bridge(QObject):
         self._session_store = SessionStore()
         self._backend_store = BackendStore()  # ★ Persistent backend config storage
         self._app_config_store = AppConfigStore()  # ★ App-level config (theme, etc.)
-        self._backends: dict[str, ModelBackend] = {}
+        # ★ Per-session backend instances：每个 session 独占一个 backend 实例
+        # 这样 abort(session_id) 只影响目标 session，不会误杀其他并发 session
+        self._session_backends: dict[str, ModelBackend] = {}
         # Initialize backend configs from store, with defaults if empty
         stored_configs = self._backend_store.list()
         if stored_configs:
@@ -144,14 +150,23 @@ class Bridge(QObject):
     def set_event_loop(self, loop: asyncio.AbstractEventLoop):
         self._loop = loop
 
-    def _get_backend(self, config_id: str) -> ModelBackend:
-        if config_id in self._backends:
-            return self._backends[config_id]
+    def _get_backend(self, session_id: str, config_id: str) -> ModelBackend:
+        """获取（或创建）session 专属的 backend 实例。
+
+        每个 session 持有独立的 backend 实例，这样：
+        - abort(session_id) 只停该 session，不影响其他并发 session
+        - 同一 backend config 可以同时服务多个 session（互不干扰）
+        - session 切换 backend 时，旧实例自动替换
+        """
+        existing = self._session_backends.get(session_id)
+        if existing and getattr(existing, '_config_id', None) == config_id:
+            return existing
         config = next((c for c in self._backend_configs if c.id == config_id), None)
         if not config:
             raise ValueError(f"未找到后端配置: {config_id}")
         backend = create_backend(config)
-        self._backends[config_id] = backend
+        backend._config_id = config_id  # type: ignore[attr-defined]  # 便于切换时检测
+        self._session_backends[session_id] = backend
         return backend
 
     def _emit_delta(self, delta: StreamDelta):
@@ -248,6 +263,8 @@ class Bridge(QObject):
             # 清除旧的 agent_session_id，因为新后端需要新的会话
             # 但保留历史消息，实现跨 Session 支持
             session.agent_session_id = None
+            # ★ 清理旧 backend 实例，下次调用时会重新创建
+            self._session_backends.pop(session_id, None)
 
         # ★ 同步前端偏好到 session
         session.auto_continue = auto_continue
@@ -270,6 +287,7 @@ class Bridge(QObject):
                     session, content, images, backend_id, assistant_id,
                     auto_continue=auto_continue,
                     skip_permissions=skip_permissions,
+                    session_id=session_id,
                 ),
                 self._loop,
             )
@@ -286,8 +304,10 @@ class Bridge(QObject):
         message_id: str,
         auto_continue: bool = True,
         skip_permissions: bool = True,
+        session_id: Optional[str] = None,
     ):
-        backend = self._get_backend(backend_id)
+        sid = session_id or session.id
+        backend = self._get_backend(sid, backend_id)
         assistant_msg = session.messages[-1]
 
         max_continuations = session.max_continuations
@@ -546,10 +566,17 @@ class Bridge(QObject):
         self._session_store.save(session, async_=True)
 
     @Slot(str)
-    def abortMessage(self, backend_id: str):
-        backend = self._backends.get(backend_id)
+    def abortMessage(self, session_id: str):
+        """停止指定 session 的流式响应。
+
+        ★ 参数由 backend_id 改为 session_id：
+        每个 session 独占 backend 实例，精确停止目标 session，
+        不影响其他并发运行的 session（即使它们使用相同的 backend 配置）。
+        """
+        backend = self._session_backends.get(session_id)
         if backend:
             backend.abort()
+            print(f"[Bridge] abortMessage: session={session_id}", file=sys.stderr, flush=True)
 
     # ═══════════════════════════════════════
     #  ★ 新增：后端命令执行
@@ -655,6 +682,8 @@ class Bridge(QObject):
     @Slot(str, result=bool)
     def deleteSession(self, sid: str) -> bool:
         self._active_sessions.pop(sid, None)
+        # ★ 清理 session 专属的 backend 实例
+        self._session_backends.pop(sid, None)
         # ★ Phase 1: Clean up instance
         self._instance_manager.delete(sid)
         return self._session_store.delete(sid)
@@ -768,8 +797,13 @@ class Bridge(QObject):
             self._backend_configs[idx] = config
         else:
             self._backend_configs.append(config)
-        # Clear cached backend instance
-        self._backends.pop(config.id, None)
+        # ★ 清理所有使用该 config 的 session backend 实例（配置已更新，旧实例作废）
+        stale = [
+            sid for sid, b in self._session_backends.items()
+            if getattr(b, '_config_id', None) == config.id
+        ]
+        for sid in stale:
+            self._session_backends.pop(sid, None)
 
     @Slot(str)
     def deleteBackend(self, config_id: str):
@@ -777,7 +811,12 @@ class Bridge(QObject):
         self._backend_store.delete(config_id)
         # Update in-memory cache
         self._backend_configs = [c for c in self._backend_configs if c.id != config_id]
-        self._backends.pop(config_id, None)
+        stale_del = [
+            sid for sid, b in self._session_backends.items()
+            if getattr(b, '_config_id', None) == config_id
+        ]
+        for sid in stale_del:
+            self._session_backends.pop(sid, None)
 
     # ═══════════════════════════════════════
     #  ★ 数据导入导出

@@ -603,9 +603,10 @@ export function useChat(sessionId: string, backendId: string, backends?: any[], 
   );
 
   const abort = useCallback(() => {
-    api.abortMessage(backendId);
+    // ★ 按 sessionId 停止，精确定位到当前 session，不影响其他并发 session
+    api.abortMessage(sessionId);
     setIsStreaming(false);
-  }, [backendId]);
+  }, [sessionId]);
 
   return {
     messages, isStreaming, sendMessage, abort, autoContinue, setAutoContinue,

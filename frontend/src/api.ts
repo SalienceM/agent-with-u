@@ -251,8 +251,8 @@ export const api = {
     await send('sendMessage', JSON.stringify(payload));
   },
 
-  async abortMessage(backendId: string): Promise<void> {
-    await send('abortMessage', backendId);
+  async abortMessage(sessionId: string): Promise<void> {
+    await send('abortMessage', sessionId);
   },
 
   onStreamDelta(callback: StreamDeltaCallback): () => void {
