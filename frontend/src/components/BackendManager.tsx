@@ -524,19 +524,6 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
                   />
                 </div>
 
-                <div style={{ marginBottom: 10 }}>
-                  <label style={{ fontSize: 11, color: 'var(--theme-text)', display: 'block', marginBottom: 4 }}>
-                    ANTHROPIC_MODEL（可选，留空由 CLI 自动决定）
-                  </label>
-                  <input
-                    type="text"
-                    value={formData.model || ''}
-                    onChange={(e) => setFormData({ ...formData, model: e.target.value })}
-                    style={inputStyle}
-                    placeholder="e.g., claude-sonnet-4-6"
-                  />
-                </div>
-
                 <div style={{ marginTop: 12 }}>
                   <label style={{ ...labelStyle, display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer', marginBottom: 0 }}>
                     <input
