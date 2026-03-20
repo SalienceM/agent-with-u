@@ -62,6 +62,9 @@ def _read_clipboard_image_native() -> Optional[dict]:
 
 # ── 默认后端配置（与 bridge.py 保持一致）────────────────────────
 
+# 官方账户后端固定 ID，不可删除
+OFFICIAL_BACKEND_ID = "official-claude"
+
 DEFAULT_BACKENDS = [
     ModelBackendConfig(
         id="claude-agent-sdk-default",
@@ -126,6 +129,17 @@ class BridgeWS:
                 for c in DEFAULT_BACKENDS
             ]
             self._backend_configs = defaults
+
+        # ★ 官方账户后端始终存在，且排在列表第一位
+        if not any(c.id == OFFICIAL_BACKEND_ID for c in self._backend_configs):
+            official = ModelBackendConfig(
+                id=OFFICIAL_BACKEND_ID,
+                type=BackendType.CLAUDE_CODE_OFFICIAL,
+                label="Claude Code 官方账户",
+                skip_permissions=True,
+            )
+            self._backend_configs.insert(0, official)
+            self._backend_store.save(official)
         self._active_sessions: dict[str, Session] = {}
         self._instance_manager = InstanceManager()
         self._clients: set = set()
@@ -305,16 +319,34 @@ class BridgeWS:
     # ── RPC: 后端配置 ────────────────────────────────────────────
 
     def _rpc_getBackends(self) -> str:
-        return json.dumps([c.to_dict() for c in self._backend_configs], ensure_ascii=False)
+        result = []
+        for c in self._backend_configs:
+            d = c.to_dict()
+            if c.id == OFFICIAL_BACKEND_ID:
+                d["pinned"] = True   # 前端用于区分固定后端
+            result.append(d)
+        return json.dumps(result, ensure_ascii=False)
 
     def _rpc_saveBackend(self, config_json: str) -> None:
         data = json.loads(config_json)
-        config = ModelBackendConfig(
-            id=data["id"], type=BackendType(data["type"]), label=data["label"],
-            base_url=data.get("baseUrl"), model=data.get("model"), api_key=data.get("apiKey"),
-            working_dir=data.get("workingDir"), allowed_tools=data.get("allowedTools"),
-            skip_permissions=data.get("skipPermissions", True), env=data.get("env"),
-        )
+        if data["id"] == OFFICIAL_BACKEND_ID:
+            # 官方后端：只允许修改 env（代理）和 skipPermissions，其他字段保持固定
+            existing = next((c for c in self._backend_configs if c.id == OFFICIAL_BACKEND_ID), None)
+            config = ModelBackendConfig(
+                id=OFFICIAL_BACKEND_ID,
+                type=BackendType.CLAUDE_CODE_OFFICIAL,
+                label="Claude Code 官方账户",
+                skip_permissions=data.get("skipPermissions", True),
+                env=data.get("env") or None,
+                cli_path=existing.cli_path if existing else None,
+            )
+        else:
+            config = ModelBackendConfig(
+                id=data["id"], type=BackendType(data["type"]), label=data["label"],
+                base_url=data.get("baseUrl"), model=data.get("model"), api_key=data.get("apiKey"),
+                working_dir=data.get("workingDir"), allowed_tools=data.get("allowedTools"),
+                skip_permissions=data.get("skipPermissions", True), env=data.get("env"),
+            )
         self._backend_store.save(config)
         idx = next((i for i, c in enumerate(self._backend_configs) if c.id == config.id), -1)
         if idx >= 0:
@@ -325,6 +357,8 @@ class BridgeWS:
         return None
 
     def _rpc_deleteBackend(self, config_id: str) -> None:
+        if config_id == OFFICIAL_BACKEND_ID:
+            return None   # 官方后端不可删除
         self._backend_store.delete(config_id)
         self._backend_configs = [c for c in self._backend_configs if c.id != config_id]
         self._backends.pop(config_id, None)
@@ -374,7 +408,7 @@ class BridgeWS:
             # 固定路径，避免每次产生垃圾临时文件
             bat_path = _os.path.join(_os.environ.get("TEMP", _tmp.gettempdir()), "agentwithu_login.bat")
             try:
-                with open(bat_path, "w", encoding="utf-8") as f:
+                with open(bat_path, "w", encoding="gbk", errors="replace") as f:
                     f.write("\r\n".join(bat_lines) + "\r\n")
             except Exception as e:
                 return json.dumps({"status": "error", "message": f"写入脚本失败: {e}"})

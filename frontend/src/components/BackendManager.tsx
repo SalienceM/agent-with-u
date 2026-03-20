@@ -19,7 +19,10 @@ interface BackendConfig {
   skipPermissions?: boolean;
   env?: Record<string, string>;
   extraHeaders?: Record<string, string>;
+  pinned?: boolean;  // 固定后端，不可删除
 }
+
+const OFFICIAL_BACKEND_ID = 'official-claude';
 
 interface BackendManagerProps {
   isOpen: boolean;
@@ -90,7 +93,15 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
       label: formData.label,
     };
 
-    if (formData.type === 'claude-agent-sdk') {
+    if (formData.pinned) {
+      // 固定后端：只保存 env 和 skipPermissions
+      const cleanedEnv: Record<string, string> = {};
+      Object.entries(formData.env || {}).forEach(([k, v]) => {
+        if (v && v.trim()) cleanedEnv[k] = v.trim();
+      });
+      if (Object.keys(cleanedEnv).length > 0) saved.env = cleanedEnv;
+      saved.skipPermissions = formData.skipPermissions !== false;
+    } else if (formData.type === 'claude-agent-sdk') {
       // Only env vars + skipPermissions matter
       const cleanedEnv: Record<string, string> = {};
       Object.entries(formData.env || {}).forEach(([k, v]) => {
@@ -237,16 +248,19 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
                 backends.map((backend) => (
                   <div
                     key={backend.id}
-                    style={backendItemStyle}
+                    style={{
+                      ...backendItemStyle,
+                      ...(backend.pinned ? { borderLeft: '2px solid rgba(99,102,241,0.6)' } : {}),
+                    }}
                     onClick={() => handleEditBackend(backend)}
                   >
                     <div style={{ flex: 1 }}>
-                      <div style={{ fontWeight: 500, color: 'var(--theme-text)', marginBottom: 4 }}>
+                      <div style={{ fontWeight: 500, color: 'var(--theme-text)', marginBottom: 4, display: 'flex', alignItems: 'center', gap: 6 }}>
+                        {backend.pinned && <span style={{ fontSize: 10, color: 'rgba(165,168,255,0.8)' }}>📌</span>}
                         {backend.label}
                       </div>
                       <div style={{ fontSize: 11, color: 'var(--theme-text-muted)' }}>
                         {backend.type}
-                        {/* Show model info per type */}
                         {backend.type === 'claude-agent-sdk' && backend.env?.ANTHROPIC_MODEL && (
                           <span> · {backend.env.ANTHROPIC_MODEL}</span>
                         )}
@@ -267,16 +281,15 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
                         )}
                       </div>
                     </div>
-                    <button
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        handleDeleteClick(backend);
-                      }}
-                      style={deleteBtnStyle}
-                      title="Delete backend"
-                    >
-                      🗑
-                    </button>
+                    {!backend.pinned && (
+                      <button
+                        onClick={(e) => { e.stopPropagation(); handleDeleteClick(backend); }}
+                        style={deleteBtnStyle}
+                        title="Delete backend"
+                      >
+                        🗑
+                      </button>
+                    )}
                   </div>
                 ))
               )}
@@ -289,57 +302,59 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
         ) : (
           // 编辑表单
           <>
-            <div style={{ marginBottom: 16 }}>
-              <label style={labelStyle}>Backend ID</label>
-              <input
-                type="text"
-                value={formData.id}
-                onChange={(e) => setFormData({ ...formData, id: e.target.value })}
-                style={inputStyle}
-                placeholder="backend-id"
-              />
-            </div>
+            {/* 固定后端（官方账户）不显示 ID/Label/Type 字段 */}
+            {!formData.pinned && (
+              <>
+                <div style={{ marginBottom: 16 }}>
+                  <label style={labelStyle}>Backend ID</label>
+                  <input
+                    type="text"
+                    value={formData.id}
+                    onChange={(e) => setFormData({ ...formData, id: e.target.value })}
+                    style={inputStyle}
+                    placeholder="backend-id"
+                  />
+                </div>
 
-            <div style={{ marginBottom: 16 }}>
-              <label style={labelStyle}>Label (Display Name)</label>
-              <input
-                type="text"
-                value={formData.label}
-                onChange={(e) => setFormData({ ...formData, label: e.target.value })}
-                style={inputStyle}
-                placeholder="My Custom Backend"
-              />
-            </div>
+                <div style={{ marginBottom: 16 }}>
+                  <label style={labelStyle}>Label (Display Name)</label>
+                  <input
+                    type="text"
+                    value={formData.label}
+                    onChange={(e) => setFormData({ ...formData, label: e.target.value })}
+                    style={inputStyle}
+                    placeholder="My Custom Backend"
+                  />
+                </div>
 
-            <div style={{ marginBottom: 16 }}>
-              <label style={labelStyle}>Type</label>
-              <div style={selectWrapperStyle}>
-                <select
-                  value={formData.type}
-                  onChange={(e) => {
-                    // Reset type-specific fields when switching types
-                    const newType = e.target.value;
-                    setFormData({
-                      ...formData,
-                      type: newType,
-                      // Clear type-specific fields on switch
-                      model: '',
-                      baseUrl: '',
-                      apiKey: '',
-                      env: {},
-                      extraHeaders: undefined,
-                      skipPermissions: newType === 'claude-agent-sdk' ? true : undefined,
-                    });
-                  }}
-                  style={selectStyle}
-                >
-                  <option value="claude-agent-sdk">Claude Agent SDK</option>
-                  <option value="claude-code-official">Claude Code (官方账户)</option>
-                  <option value="openai-compatible">OpenAI Compatible</option>
-                  <option value="anthropic-api">Anthropic API</option>
-                </select>
-              </div>
-            </div>
+                <div style={{ marginBottom: 16 }}>
+                  <label style={labelStyle}>Type</label>
+                  <div style={selectWrapperStyle}>
+                    <select
+                      value={formData.type}
+                      onChange={(e) => {
+                        const newType = e.target.value;
+                        setFormData({
+                          ...formData,
+                          type: newType,
+                          model: '',
+                          baseUrl: '',
+                          apiKey: '',
+                          env: {},
+                          extraHeaders: undefined,
+                          skipPermissions: newType === 'claude-agent-sdk' ? true : undefined,
+                        });
+                      }}
+                      style={selectStyle}
+                    >
+                      <option value="claude-agent-sdk">Claude Agent SDK</option>
+                      <option value="openai-compatible">OpenAI Compatible</option>
+                      <option value="anthropic-api">Anthropic API</option>
+                    </select>
+                  </div>
+                </div>
+              </>
+            )}
 
             {/* ── Claude Agent SDK 专属配置 ── */}
             {formData.type === 'claude-agent-sdk' && (
