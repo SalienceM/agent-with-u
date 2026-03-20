@@ -571,15 +571,18 @@ class ClaudeCodeOfficialBackend(ModelBackend):
         if not proc_env.get("ANTHROPIC_AUTH_TOKEN") and not proc_env.get("ANTHROPIC_API_KEY"):
             local_token = self.read_local_token()
             if local_token:
+                # ★ OAuth token（sk-ant-oat01-）只放 ANTHROPIC_AUTH_TOKEN
+                # 绝对不能放进 ANTHROPIC_API_KEY —— CLI 会把它当 API key 验证，报 "Invalid external API key"
                 proc_env["ANTHROPIC_AUTH_TOKEN"] = local_token
-                proc_env["ANTHROPIC_API_KEY"] = local_token
                 print("[OfficialBackend] 使用本地 claude login 凭证（自动注入）",
                       file=sys.stderr, flush=True)
 
-        # AUTH_TOKEN 兼容层
-        cfg_token = proc_env.get("ANTHROPIC_AUTH_TOKEN")
+        # AUTH_TOKEN 兼容层：只有真正的 API key（sk-ant-api）才同步给 ANTHROPIC_API_KEY
+        # OAuth token（sk-ant-oat）不做同步，让 CLI 自己走 OAuth 认证路径
+        cfg_token = proc_env.get("ANTHROPIC_AUTH_TOKEN", "")
         if cfg_token and not proc_env.get("ANTHROPIC_API_KEY"):
-            proc_env["ANTHROPIC_API_KEY"] = cfg_token
+            if cfg_token.startswith("sk-ant-api"):
+                proc_env["ANTHROPIC_API_KEY"] = cfg_token
 
         return proc_env
 
