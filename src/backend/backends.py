@@ -439,6 +439,34 @@ class ClaudeCodeOfficialBackend(ModelBackend):
     - 适合官方账户（非 API Key 用户）使用 claude code 本地 agent 能力
     """
 
+    @staticmethod
+    def read_local_token() -> Optional[str]:
+        """从 claude login 存储的凭证文件读取 accessToken。
+
+        文件位置：~/.claude/.credentials.json
+        字段：claudeAiOauth.accessToken（sk-ant-oat01-... 格式）
+
+        返回 None 表示未登录或文件不存在。
+        """
+        cred_file = Path.home() / ".claude" / ".credentials.json"
+        if not cred_file.exists():
+            return None
+        try:
+            data = json.loads(cred_file.read_text(encoding="utf-8"))
+            token = data.get("claudeAiOauth", {}).get("accessToken")
+            if token and isinstance(token, str):
+                # 简单检查过期（expiresAt 是毫秒时间戳）
+                import time
+                expires_at = data.get("claudeAiOauth", {}).get("expiresAt", 0)
+                if expires_at and expires_at < time.time() * 1000:
+                    print("[OfficialBackend] 凭证已过期，请重新运行 claude login",
+                          file=sys.stderr, flush=True)
+                    return None
+                return token
+        except Exception as e:
+            print(f"[OfficialBackend] 读取凭证失败: {e}", file=sys.stderr, flush=True)
+        return None
+
     def _resolve_cli(self) -> str:
         cli = getattr(self.config, "cli_path", None)
         if cli:
@@ -538,9 +566,19 @@ class ClaudeCodeOfficialBackend(ModelBackend):
                     # 显式设置空字符串 = 清除该变量（用于隔离/禁用代理）
                     proc_env.pop(key, None)
 
+        # ── 步骤3：AUTH_TOKEN 兜底——从 claude login 凭证文件读取 ──────────
+        # 优先级：config env > 系统 env > 本地凭证文件
+        if not proc_env.get("ANTHROPIC_AUTH_TOKEN") and not proc_env.get("ANTHROPIC_API_KEY"):
+            local_token = self.read_local_token()
+            if local_token:
+                proc_env["ANTHROPIC_AUTH_TOKEN"] = local_token
+                proc_env["ANTHROPIC_API_KEY"] = local_token
+                print("[OfficialBackend] 使用本地 claude login 凭证（自动注入）",
+                      file=sys.stderr, flush=True)
+
         # AUTH_TOKEN 兼容层
-        cfg_token = self.config.get_env("ANTHROPIC_AUTH_TOKEN")
-        if cfg_token and not self.config.get_env("ANTHROPIC_API_KEY"):
+        cfg_token = proc_env.get("ANTHROPIC_AUTH_TOKEN")
+        if cfg_token and not proc_env.get("ANTHROPIC_API_KEY"):
             proc_env["ANTHROPIC_API_KEY"] = cfg_token
 
         return proc_env
