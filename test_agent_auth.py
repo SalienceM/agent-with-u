@@ -480,6 +480,136 @@ async def test4_sdk_explicit_cli():
 
 
 # ─────────────────────────────────────────────────────────────
+# 测试 8：探测 claude login 的输出行为（★ 为应用内集成做准备）
+#
+# 目的：搞清楚 claude login 以下问题：
+#   A. 已登录状态下运行会输出什么？
+#   B. stdout / stderr 分别输出什么内容？
+#   C. 是否自动打开浏览器？还是打印 URL 让用户手动访问？
+#   D. 进程何时退出？退出码是什么？
+#   E. 非 TTY 环境下行为是否不同？
+#
+# ★ 注意：此测试不会真正执行登录（只读前 5 秒输出然后杀进程）
+#   如果你想完整测试登录，改 KILL_AFTER_SECS = 0 并手动完成浏览器步骤
+# ─────────────────────────────────────────────────────────────
+
+def test8_login_behavior():
+    _sep("TEST 8 - claude login 输出行为探测")
+    KILL_AFTER_SECS = 8   # 等待 N 秒后强制结束，不真正完成登录
+
+    cli = _resolve_cli()
+    cmd = [cli, "login"]
+    env = _make_env(clean=True, with_proxy=bool(PROXY))
+
+    print(f"cmd: {' '.join(cmd)}")
+    print(f"proxy in env: {env.get('HTTPS_PROXY', '无')}")
+    print(f"等待 {KILL_AFTER_SECS} 秒，捕获所有输出...\n")
+
+    stdout_lines: list[str] = []
+    stderr_lines: list[str] = []
+
+    popen_kwargs: dict = dict(
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=env,
+        cwd=WORK_DIR,
+    )
+    if sys.platform == "win32":
+        # 不加 CREATE_NO_WINDOW，让 claude login 正常工作（它可能需要 console）
+        pass
+    else:
+        popen_kwargs["encoding"] = "utf-8"
+        popen_kwargs["errors"] = "replace"
+
+    import threading, time
+
+    try:
+        proc = subprocess.Popen(cmd, **popen_kwargs)
+        print(f"pid={proc.pid}，进程已启动\n")
+
+        def _read_stream(stream, lines: list, tag: str):
+            while True:
+                raw = stream.readline()
+                if not raw:
+                    break
+                if isinstance(raw, bytes):
+                    line = raw.decode("utf-8", errors="replace").rstrip()
+                else:
+                    line = raw.rstrip()
+                lines.append(line)
+                print(f"  [{tag}] {line}")
+
+        t_out = threading.Thread(target=_read_stream,
+                                 args=(proc.stdout, stdout_lines, "STDOUT"), daemon=True)
+        t_err = threading.Thread(target=_read_stream,
+                                 args=(proc.stderr, stderr_lines, "STDERR"), daemon=True)
+        t_out.start()
+        t_err.start()
+
+        # 等待指定秒数，观察输出，然后杀进程
+        deadline = time.time() + KILL_AFTER_SECS
+        while time.time() < deadline:
+            if proc.poll() is not None:
+                print(f"\n  进程已自行退出，rc={proc.returncode}")
+                break
+            time.sleep(0.2)
+        else:
+            print(f"\n  {KILL_AFTER_SECS}s 已到，终止进程（避免真正完成登录）...")
+            proc.terminate()
+            try:
+                proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+
+        t_out.join(timeout=2)
+        t_err.join(timeout=2)
+
+        print(f"\n{'─'*50}")
+        print(f"总结:")
+        print(f"  stdout 行数: {len(stdout_lines)}")
+        print(f"  stderr 行数: {len(stderr_lines)}")
+
+        # 检测关键特征
+        all_output = "\n".join(stdout_lines + stderr_lines).lower()
+        has_url    = "http" in all_output and ("oauth" in all_output or "claude.ai" in all_output or "auth" in all_output)
+        has_browser_open = "browser" in all_output or "浏览器" in all_output or "opening" in all_output
+        has_waiting = "wait" in all_output or "等待" in all_output or "callback" in all_output or "listen" in all_output
+
+        print(f"  检测到 OAuth URL:   {'是' if has_url else '否'}")
+        print(f"  检测到打开浏览器:   {'是' if has_browser_open else '否'}")
+        print(f"  检测到等待回调:     {'是' if has_waiting else '否'}")
+
+        # 提取 URL
+        import re
+        urls = re.findall(r'https?://\S+', "\n".join(stdout_lines + stderr_lines))
+        if urls:
+            print(f"\n  发现的 URL:")
+            for u in urls:
+                print(f"    {u}")
+
+        print(f"\n  ★ 关键结论（用于集成设计）:")
+        if has_url:
+            print("  → claude login 会输出 OAuth URL，程序可以捕获并在 UI 里展示/自动打开")
+        else:
+            print("  → 未发现 URL 输出，可能自动打开了浏览器或需要 TTY 交互")
+        if has_browser_open:
+            print("  → 进程会自动打开浏览器（WebEngine 内嵌可能冲突）")
+        else:
+            print("  → 进程不自动打开浏览器（需要程序主动 webbrowser.open(url)）")
+
+    except FileNotFoundError:
+        print(f"!! claude CLI 未找到: {cli}")
+        return False
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        print(f"!! 异常: {e}")
+        return False
+
+    return True
+
+
+# ─────────────────────────────────────────────────────────────
 # 主入口
 # ─────────────────────────────────────────────────────────────
 
@@ -509,6 +639,9 @@ async def main():
 
     if run_all or selected == 4:
         results[4] = await test4_sdk_explicit_cli()
+
+    if selected == 8:
+        results[8] = test8_login_behavior()
 
     if run_all:
         _sep("汇总")
