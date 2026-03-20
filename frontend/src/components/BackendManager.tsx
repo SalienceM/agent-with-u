@@ -455,11 +455,12 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
                     🔑 第一步：登录 Claude 账户
                   </div>
                   <div style={{ fontSize: 11, color: 'var(--theme-text-muted)', marginBottom: 10, lineHeight: 1.6 }}>
-                    点击下方按钮，将自动打开终端窗口并运行 <code style={{ fontSize: 10, background: 'rgba(255,255,255,0.08)', padding: '1px 4px', borderRadius: 3 }}>claude login</code>。
-                    {formData.env?.HTTPS_PROXY && (
-                      <span>（已检测到代理 <code style={{ fontSize: 10 }}>{formData.env.HTTPS_PROXY}</code>，会自动设置）</span>
-                    )}
-                    <br />在终端中按提示完成登录后，关闭终端即可。
+                    点击下方按钮，将自动打开终端窗口并启动 <code style={{ fontSize: 10, background: 'rgba(255,255,255,0.08)', padding: '1px 4px', borderRadius: 3 }}>claude</code>
+                    {formData.env?.HTTPS_PROXY
+                      ? <span>（代理 <code style={{ fontSize: 10 }}>{formData.env.HTTPS_PROXY}</code> 已自动设置）</span>
+                      : <span>（若需要代理请先在下方填写 HTTPS_PROXY）</span>
+                    }。<br />
+                    终端打开后，在提示下方<strong style={{ color: 'rgba(165,168,255,0.95)' }}>输入 <code style={{ fontSize: 10 }}>/login</code> 并按回车</strong>，按指引完成登录即可。
                   </div>
                   <button
                     onClick={handleOpenLoginTerminal}

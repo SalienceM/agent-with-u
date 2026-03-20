@@ -331,14 +331,13 @@ class BridgeWS:
         return None
 
     def _rpc_openLoginTerminal(self, backend_id: str = "") -> str:
-        """为 claude-code-official 后端打开一个终端窗口执行 claude login。
-        若后端配置了代理，会先 set HTTPS_PROXY 再执行。
-        """
+        """打开终端，设好代理，启动 claude 交互模式，提示用户输入 /login。"""
         import subprocess as _sp
         import sys as _sys
         import shutil as _shutil
+        import urllib.request as _ur
 
-        # 从后端配置读取代理
+        # 1. 从后端配置读取代理
         https_proxy = ""
         cli_path = "claude"
         config = next((c for c in self._backend_configs if c.id == backend_id), None)
@@ -348,36 +347,52 @@ class BridgeWS:
             if config.cli_path:
                 cli_path = config.cli_path
 
+        # 2. 兜底：若配置里没有显式代理，尝试读系统代理
+        if not https_proxy:
+            try:
+                sys_proxies = _ur.getproxies()
+                https_proxy = sys_proxies.get("https") or sys_proxies.get("http") or ""
+            except Exception:
+                pass
+
         if _sys.platform == "win32":
-            # 构建 cmd 命令行：先设代理（如有），再运行 claude login
+            # 构建批处理命令：设代理 → 打印提示 → 启动 claude 交互模式
+            lines = []
             if https_proxy:
-                cmd_body = f'set "HTTPS_PROXY={https_proxy}" && set "HTTP_PROXY={https_proxy}" && {cli_path} login'
+                lines.append(f'set "HTTPS_PROXY={https_proxy}"')
+                lines.append(f'set "HTTP_PROXY={https_proxy}"')
+                lines.append(f'echo [AgentWithU] 已设置代理: {https_proxy}')
             else:
-                cmd_body = f'{cli_path} login'
-            # /K 保持窗口打开（让用户看到登录流程）
+                lines.append('echo [AgentWithU] 未检测到代理，若登录失败请先开启 VPN/代理')
+            lines.append('echo [AgentWithU] claude 已启动，请在下方输入 /login 并按回车开始登录')
+            lines.append('echo.')
+            lines.append(cli_path)
+            # 用 & 连接（cmd /K 执行整段命令后保持窗口）
+            cmd_body = ' && '.join(lines)
             _sp.Popen(
                 ['cmd.exe', '/K', cmd_body],
                 creationflags=_sp.CREATE_NEW_CONSOLE,
             )
         else:
-            # macOS / Linux：尝试常见终端
+            # macOS / Linux
+            set_proxy = ""
             if https_proxy:
-                cmd_body = f'export HTTPS_PROXY="{https_proxy}"; export HTTP_PROXY="{https_proxy}"; {cli_path} login; exec bash'
-            else:
-                cmd_body = f'{cli_path} login; exec bash'
+                set_proxy = f'export HTTPS_PROXY="{https_proxy}"; export HTTP_PROXY="{https_proxy}"; '
+            hint = "echo '[AgentWithU] 请输入 /login 并按回车开始登录'; echo"
+            cmd_body = f'{set_proxy}{hint}; {cli_path}; exec bash'
             launched = False
             for term, args in [
                 ('gnome-terminal', ['--', 'bash', '-c', cmd_body]),
-                ('xterm',          ['-e', f'bash -c \'{cmd_body}\'']),
+                ('xterm',          ['-e', 'bash', '-c', cmd_body]),
                 ('konsole',        ['--noclose', '-e', 'bash', '-c', cmd_body]),
-                ('open',           ['-a', 'Terminal', '--args', '-c', cmd_body]),  # macOS fallback
+                ('open',           ['-a', 'Terminal', '--args', '-c', cmd_body]),
             ]:
                 if _shutil.which(term):
                     _sp.Popen([term] + args)
                     launched = True
                     break
             if not launched:
-                return json.dumps({"status": "error", "message": "未找到可用终端，请手动运行 claude login"})
+                return json.dumps({"status": "error", "message": "未找到可用终端，请手动运行 claude 并输入 /login"})
 
         return json.dumps({"status": "ok"})
 
