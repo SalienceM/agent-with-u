@@ -177,10 +177,20 @@ class ClaudeAgentBackend(ModelBackend):
                 skip_permissions = getattr(self.config, "skip_permissions", True)
 
             # 收集环境变量传给 SDK
+            # ★ 代理：先自动检测系统代理，后端配置可覆盖
+            import urllib.request as _urllib_req
             env_dict: dict[str, str] = {}
+            try:
+                sys_proxies = _urllib_req.getproxies()
+                for scheme, env_keys in [("https", ("HTTPS_PROXY",)), ("http", ("HTTP_PROXY",))]:
+                    url = sys_proxies.get(scheme)
+                    if url:
+                        for k in env_keys:
+                            env_dict.setdefault(k, url)
+            except Exception:
+                pass
             for key in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN",
                         "ANTHROPIC_BASE_URL", "ANTHROPIC_MODEL",
-                        # 代理：后端配置优先，否则从系统环境继承
                         "HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY", "NO_PROXY",
                         "https_proxy", "http_proxy", "all_proxy", "no_proxy"):
                 val = self.get_env(key)
@@ -470,18 +480,50 @@ class ClaudeCodeOfficialBackend(ModelBackend):
         return cmd
 
     def _build_env(self) -> dict:
-        """构建子进程环境：继承系统 env，再用后端配置覆盖关键变量。
+        """构建子进程环境：继承系统 env，自动注入系统代理，再用后端配置覆盖。
+
+        ★ 代理策略（优先级从低到高）：
+          1. urllib.request.getproxies() 读取系统代理
+             （Windows 注册表 / macOS 系统设置 / env 变量，三端通吃）
+          2. 后端配置 env 字段显式设置（可覆盖自动检测）
 
         ★ 认证策略：
           - 默认不注入 ANTHROPIC_AUTH_TOKEN / ANTHROPIC_API_KEY（依赖 `claude login` 凭证）
           - 只有当后端配置的 env 字段中显式填写了 token 时才覆盖
-          - 这样官方账户只需 `claude login` 一次，无需在配置里填 token
         """
         import os as _os
+        import urllib.request as _urllib_req
+
         proc_env = _os.environ.copy()
 
-        # ★ 优先用后端配置里的变量覆盖（代理、model 等）
-        #   认证相关只在用户显式配置时才覆盖，避免覆盖 claude login 凭证
+        # ── 步骤1：自动注入系统代理（仅在 env 里尚无代理时才填充）──────────
+        # getproxies() 会读 Windows 注册表、macOS CFPreferences、以及 *_proxy 环境变量
+        # 只要代理软件开了"系统代理"模式，这里就能自动拿到
+        _already_has_proxy = any(
+            proc_env.get(k)
+            for k in ("HTTPS_PROXY", "HTTP_PROXY", "https_proxy", "http_proxy")
+        )
+        if not _already_has_proxy:
+            try:
+                sys_proxies = _urllib_req.getproxies()
+                # getproxies() 返回形如 {"https": "http://127.0.0.1:7890", "http": "..."}
+                _proxy_map = {
+                    "https": ("HTTPS_PROXY", "https_proxy"),
+                    "http":  ("HTTP_PROXY",  "http_proxy"),
+                }
+                for scheme, env_keys in _proxy_map.items():
+                    url = sys_proxies.get(scheme)
+                    if url:
+                        for k in env_keys:
+                            proc_env.setdefault(k, url)
+                _detected = proc_env.get("HTTPS_PROXY") or proc_env.get("https_proxy") or "none"
+                print(f"[OfficialBackend] 系统代理自动检测: {_detected}",
+                      file=sys.stderr, flush=True)
+            except Exception as _pe:
+                print(f"[OfficialBackend] 代理检测失败（无影响）: {_pe}",
+                      file=sys.stderr, flush=True)
+
+        # ── 步骤2：后端配置 env 字段（优先级最高，可覆盖上面所有）──────────
         for key in (
             "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY",
             "ANTHROPIC_BASE_URL", "ANTHROPIC_MODEL",
@@ -493,11 +535,10 @@ class ClaudeCodeOfficialBackend(ModelBackend):
                 if val:
                     proc_env[key] = val
                 else:
-                    # 显式设置空字符串 = 清除该变量（用于隔离环境）
+                    # 显式设置空字符串 = 清除该变量（用于隔离/禁用代理）
                     proc_env.pop(key, None)
 
-        # 如果后端配置提供了 AUTH_TOKEN 而没有 API_KEY，确保两个变量都填充
-        # （不影响 claude login 路径：那时两者都不在 config.env 里）
+        # AUTH_TOKEN 兼容层
         cfg_token = self.config.get_env("ANTHROPIC_AUTH_TOKEN")
         if cfg_token and not self.config.get_env("ANTHROPIC_API_KEY"):
             proc_env["ANTHROPIC_API_KEY"] = cfg_token
