@@ -13,6 +13,12 @@ export interface ToolCall {
   diff?: { path: string; old: string; new: string };  // ★ Diff data for Edit tools
 }
 
+// ★ 有序内容块：按到达顺序记录 thinking / tool / text 的出现
+export interface ContentBlock {
+  type: 'thinking' | 'tool' | 'text';
+  toolIndex?: number;  // type === 'tool' 时指向 toolCalls 数组的索引
+}
+
 export interface PermissionRequest {
   sessionId: string;
   messageId: string;
@@ -30,6 +36,8 @@ export interface ChatMessage {
   toolCalls?: ToolCall[];
   thinking?: string;
   streaming?: boolean;
+  contentBlocks?: ContentBlock[];  // ★ 有序内容块，按到达顺序排列
+  elapsed?: number;  // ★ 本次回复总耗时（毫秒）
 }
 
 // ═══════════════════════════════════════
@@ -86,7 +94,24 @@ function normalizeMessage(msg: any): ChatMessage {
         tc.status === 'running' ? { ...tc, status: 'done' } : tc
       );
 
-  return { ...msg, thinking, ...(toolCalls !== undefined ? { toolCalls } : {}) };
+  // ★ 为历史消息重建 contentBlocks（加载时没有此字段）
+  let contentBlocks = msg.contentBlocks as ContentBlock[] | undefined;
+  if (!contentBlocks && msg.role === 'assistant') {
+    const blocks: ContentBlock[] = [];
+    if (thinking) blocks.push({ type: 'thinking' });
+    if (toolCalls?.length) {
+      toolCalls.forEach((_: any, i: number) => blocks.push({ type: 'tool', toolIndex: i }));
+    }
+    if (msg.content) blocks.push({ type: 'text' });
+    if (blocks.length > 0) contentBlocks = blocks;
+  }
+
+  return {
+    ...msg,
+    thinking,
+    ...(toolCalls !== undefined ? { toolCalls } : {}),
+    ...(contentBlocks ? { contentBlocks } : {}),
+  };
 }
 
 export function useChat(sessionId: string, backendId: string, backends?: any[], skipPermissions: boolean = true) {
@@ -100,6 +125,8 @@ export function useChat(sessionId: string, backendId: string, backends?: any[], 
   const textRef = useRef('');
   const thinkingRef = useRef('');
   const toolCallsRef = useRef<ToolCall[]>([]);
+  const contentBlocksRef = useRef<ContentBlock[]>([]);  // ★ 有序内容块
+  const streamStartRef = useRef<number>(0);  // ★ 流式开始时间戳
   const msgIdRef = useRef<string | null>(null);
 
   // 稳定引用 refs
@@ -163,28 +190,64 @@ export function useChat(sessionId: string, backendId: string, backends?: any[], 
       if (delta.sessionId !== sessionId) return;
       const mid = delta.messageId;
 
+      // ★ 辅助：将所有 running 工具标记为 done（新内容到来意味着之前的工具已完成）
+      const finishRunningTools = () => {
+        const now = Date.now();
+        let changed = false;
+        const updated = toolCallsRef.current.map((tc) => {
+          if (tc.status === 'running') {
+            changed = true;
+            return { ...tc, status: 'done', duration: tc.startTime ? now - tc.startTime : undefined };
+          }
+          return tc;
+        });
+        if (changed) toolCallsRef.current = updated;
+        return changed ? updated : null;
+      };
+
       switch (delta.type) {
-        case 'text_delta':
+        case 'text_delta': {
           textRef.current += delta.text || '';
+          // ★ 新文本到来意味着之前的 running 工具已完成
+          const completedTools = finishRunningTools();
+          // ★ 只保留一个 text 块：移除旧的 text 块，在末尾重新添加
+          const blocksNoText = contentBlocksRef.current.filter(b => b.type !== 'text');
+          contentBlocksRef.current = [...blocksNoText, { type: 'text' }];
+          const blocks0 = contentBlocksRef.current;
           setMessages((prev) =>
             prev.map((m) =>
-              m.id === mid ? { ...m, content: textRef.current, streaming: true } : m
+              m.id === mid ? {
+                ...m,
+                content: textRef.current,
+                contentBlocks: blocks0,
+                ...(completedTools ? { toolCalls: completedTools } : {}),
+                streaming: true,
+              } : m
             )
           );
           break;
+        }
 
-        case 'thinking':
+        case 'thinking': {
           thinkingRef.current += delta.text || '';
+          // ★ 首次收到 thinking 时记录块顺序
+          if (!contentBlocksRef.current.some(b => b.type === 'thinking')) {
+            contentBlocksRef.current = [...contentBlocksRef.current, { type: 'thinking' }];
+          }
+          const blocks1 = contentBlocksRef.current;
           setMessages((prev) =>
             prev.map((m) =>
               m.id === mid
-                ? { ...m, thinking: thinkingRef.current, streaming: true }
+                ? { ...m, thinking: thinkingRef.current, contentBlocks: blocks1, streaming: true }
                 : m
             )
           );
           break;
+        }
 
         case 'tool_start': {
+          // ★ 新工具到来意味着之前的 running 工具已完成
+          finishRunningTools();
           const tc: ToolCall = {
             id: delta.toolCall?.id || '',
             name: delta.toolCall?.name || 'unknown',
@@ -200,11 +263,19 @@ export function useChat(sessionId: string, backendId: string, backends?: any[], 
               )
             : [...toolCallsRef.current, tc];
           toolCallsRef.current = newToolCalls;
+          // ★ 新 tool 时追加 tool 块到有序列表
+          if (!exists) {
+            contentBlocksRef.current = [
+              ...contentBlocksRef.current,
+              { type: 'tool', toolIndex: newToolCalls.length - 1 },
+            ];
+          }
+          const blocks2 = contentBlocksRef.current;
           console.log('[useChat] tool_start:', { id: tc.id, name: tc.name, exists, toolCallsCount: newToolCalls.length });
           setMessages((prev) =>
             prev.map((m) =>
               m.id === mid
-                ? { ...m, toolCalls: newToolCalls, streaming: true }
+                ? { ...m, toolCalls: newToolCalls, contentBlocks: blocks2, streaming: true }
                 : m
             )
           );
@@ -231,13 +302,15 @@ export function useChat(sessionId: string, backendId: string, backends?: any[], 
           const resultId = delta.toolCall?.id || '';
           const output = delta.toolCall?.output || '';
           const status = delta.toolCall?.status || 'done';
-          console.log('[useChat] tool_result:', { resultId, status, toolCallsCount: toolCallsRef.current.length });
+          // ★ Use duration from backend if available, otherwise calculate locally
+          const durationFromBackend = delta.toolCall?.duration;
+          console.log('[useChat] tool_result:', { resultId, status, toolCallsCount: toolCallsRef.current.length, duration: durationFromBackend });
 
           let matched = false;
           let newToolCalls = toolCallsRef.current.map((tc) => {
             if (resultId && tc.id === resultId) {
               matched = true;
-              const duration = tc.startTime ? Date.now() - tc.startTime : undefined;
+              const duration = durationFromBackend ?? (tc.startTime ? Date.now() - tc.startTime : undefined);
               console.log('[useChat] tool matched by id:', { id: resultId, duration });
               return { ...tc, output, status, duration };
             }
@@ -253,7 +326,7 @@ export function useChat(sessionId: string, backendId: string, backends?: any[], 
             );
             if (lastRunningIdx >= 0) {
               const tc = newToolCalls[lastRunningIdx];
-              const duration = tc.startTime ? Date.now() - tc.startTime : undefined;
+              const duration = durationFromBackend ?? (tc.startTime ? Date.now() - tc.startTime : undefined);
               newToolCalls = [
                 ...newToolCalls.slice(0, lastRunningIdx),
                 { ...tc, output, status, duration },
@@ -291,6 +364,7 @@ export function useChat(sessionId: string, backendId: string, backends?: any[], 
         case 'done': {
           // ★ 捕获快照，避免 setMessages 回调执行时 toolCallsRef 已被清空
           const now = Date.now();
+          const elapsed = streamStartRef.current ? now - streamStartRef.current : undefined;
           const finalToolCalls = toolCallsRef.current.map((tc) => {
             if (tc.status === 'running' && tc.startTime) {
               return {
@@ -320,6 +394,7 @@ export function useChat(sessionId: string, backendId: string, backends?: any[], 
                 streaming: false,
                 toolCalls: resolvedToolCalls.length > 0 ? resolvedToolCalls : m.toolCalls,
                 ...(delta.usage ? { usage: delta.usage } : {}),
+                ...(elapsed ? { elapsed } : {}),
               };
             })
           );
@@ -327,6 +402,7 @@ export function useChat(sessionId: string, backendId: string, backends?: any[], 
           textRef.current = '';
           thinkingRef.current = '';
           toolCallsRef.current = [];
+          contentBlocksRef.current = [];
           msgIdRef.current = null;
           break;
         }
@@ -347,6 +423,7 @@ export function useChat(sessionId: string, backendId: string, backends?: any[], 
           textRef.current = '';
           thinkingRef.current = '';
           toolCallsRef.current = [];
+          contentBlocksRef.current = [];
           break;
       }
     });
@@ -401,6 +478,8 @@ export function useChat(sessionId: string, backendId: string, backends?: any[], 
       textRef.current = '';
       thinkingRef.current = '';
       toolCallsRef.current = [];
+      contentBlocksRef.current = [];
+      streamStartRef.current = Date.now();
       msgIdRef.current = assistantId;
 
       api.sendMessage({

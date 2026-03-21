@@ -8,7 +8,7 @@ import json
 import subprocess
 from pathlib import Path
 from abc import ABC, abstractmethod
-from typing import Optional, Callable
+from typing import Optional, Callable, Awaitable
 
 import httpx
 
@@ -20,6 +20,36 @@ from ..types import (
     ToolCallInfo,
     new_id,
 )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  ★ 权限请求类型：用于工具执行前的权限确认
+# ═══════════════════════════════════════════════════════════════════════════
+
+class PermissionRequest:
+    """工具执行前的权限请求。"""
+
+    def __init__(self, session_id: str, message_id: str, tool_id: str, tool_name: str, tool_input: str):
+        self.session_id = session_id
+        self.message_id = message_id
+        self.tool_id = tool_id
+        self.tool_name = tool_name
+        self.tool_input = tool_input
+        self._event = asyncio.Event()
+        self._granted: Optional[bool] = None
+
+    def grant(self, granted: bool):
+        """设置权限结果并解除等待。"""
+        self._granted = granted
+        self._event.set()
+
+    async def wait_for_decision(self, timeout: float = 300.0) -> bool:
+        """等待用户决策，返回是否授权。"""
+        try:
+            await asyncio.wait_for(self._event.wait(), timeout=timeout)
+            return self._granted or False
+        except asyncio.TimeoutError:
+            return False
 
 
 def _exc_msg(e: Exception) -> str:
@@ -79,7 +109,7 @@ class StreamDelta:
 class ModelBackend(ABC):
     def __init__(self, config: ModelBackendConfig):
         self.config = config
-        self._cancelled = False
+        self._cancelled_sessions: set[str] = set()  # ★ Per-session cancellation
 
     @abstractmethod
     async def send_message(
@@ -93,11 +123,22 @@ class ModelBackend(ABC):
         agent_session_id: Optional[str] = None,
         working_dir: Optional[str] = None,
         skip_permissions: Optional[bool] = None,
+        on_permission_request: Optional[Callable[[PermissionRequest], Awaitable[bool]]] = None,
     ) -> dict:
         ...
 
-    def abort(self):
-            self._cancelled = True
+    def abort(self, session_id: Optional[str] = None):
+        """Cancel a specific session, or all sessions if session_id is None."""
+        if session_id:
+            self._cancelled_sessions.add(session_id)
+        else:
+            self._cancelled_sessions.add("__ALL__")
+
+    def is_cancelled(self, session_id: str) -> bool:
+        return session_id in self._cancelled_sessions or "__ALL__" in self._cancelled_sessions
+
+    def clear_cancelled(self, session_id: str):
+        self._cancelled_sessions.discard(session_id)
 
     def get_env(self, key: str, default: Optional[str] = None) -> Optional[str]:
         """Get environment variable from backend config, with priority order:
@@ -146,11 +187,12 @@ class ClaudeAgentBackend(ModelBackend):
         agent_session_id: Optional[str] = None,
         working_dir: Optional[str] = None,
         skip_permissions: Optional[bool] = None,
+        on_permission_request: Optional[Callable[[PermissionRequest], Awaitable[bool]]] = None,
     ) -> dict:
-        self._cancelled = False
+        self.clear_cancelled(session_id)
 
         def emit(delta_type: str, **kwargs):
-            if not self._cancelled:
+            if not self.is_cancelled(session_id):
                 on_delta(StreamDelta(session_id, message_id, delta_type, **kwargs))
 
         try:
@@ -201,9 +243,52 @@ class ClaudeAgentBackend(ModelBackend):
                   f", proxy={env_dict.get('HTTPS_PROXY') or env_dict.get('https_proxy') or 'none'}",
                   file=sys.stderr, flush=True)
 
+            # ★ 权限敏感的工具列表：这些工具需要用户确认
+PERMISSION_SENSITIVE_TOOLS = {"Bash", "Edit", "Write"}
+
             # ★ 图片处理：使用 AsyncIterable[dict] 形式的 prompt 原生传递图片
             # SDK 支持通过 yield Anthropic content blocks 的方式直接传递图片
             has_images = bool(images)
+
+            # ★ 权限门控状态
+            _permission_event = asyncio.Event()
+            _permission_granted = True
+            _waiting_for_permission = False
+
+            def _set_permission_result(granted: bool):
+                """设置权限结果并解除等待。"""
+                nonlocal _permission_granted
+                _permission_granted = granted
+                _permission_event.set()
+
+            async def _wait_for_permission(tool_id: str, tool_name: str, tool_input: str) -> bool:
+                """等待权限确认，返回是否授权。"""
+                nonlocal _waiting_for_permission
+                if skip_permissions:
+                    return True
+                if tool_name not in PERMISSION_SENSITIVE_TOOLS:
+                    return True
+                if not on_permission_request:
+                    return True
+
+                # 发送权限请求 delta 给前端
+                emit("permission_request", tool_call={
+                    "id": tool_id,
+                    "name": tool_name,
+                    "input": tool_input,
+                })
+
+                # 等待前端响应
+                _waiting_for_permission = True
+                _permission_event.clear()
+                try:
+                    # 创建权限请求对象
+                    req = PermissionRequest(session_id, message_id, tool_id, tool_name, tool_input)
+                    granted = await on_permission_request(req)
+                    _permission_granted = granted
+                    return granted
+                finally:
+                    _waiting_for_permission = False
 
             async def _build_prompt():
                 if not has_images:
@@ -235,7 +320,8 @@ class ClaudeAgentBackend(ModelBackend):
                 allowed_tools=tools,
                 cwd=cwd,
                 env=env_dict,
-                permission_mode="bypassPermissions" if skip_permissions else "default",
+                # ★ 始终使用 bypassPermissions，让后端自己处理权限门控
+                permission_mode="bypassPermissions",
                 include_partial_messages=True,
             )
             if agent_session_id:
@@ -257,7 +343,7 @@ class ClaudeAgentBackend(ModelBackend):
             # SDK 对 async generator yield str 的处理与直接传 str 行为不一致
             prompt_arg = _build_prompt() if has_images else content
             async for message in sdk_query(prompt=prompt_arg, options=options):
-                if self._cancelled:
+                if self.is_cancelled(session_id):
                     break
                 # result 消息已处理完毕，静默耗尽剩余消息避免 anyio cancel scope 错误
                 if _done_emitted:
@@ -294,12 +380,21 @@ class ClaudeAgentBackend(ModelBackend):
                     elif etype == "content_block_start":
                         block = evt.get("content_block", {})
                         if block.get("type") == "tool_use":
+                            tool_id = block.get("id", "")
+                            tool_name = block.get("name", "")
                             emit("tool_start", tool_call={
-                                "id": block.get("id", ""),
-                                "name": block.get("name", ""),
+                                "id": tool_id,
+                                "name": tool_name,
                                 "input": "",
                                 "status": "running",
                             })
+                            # ★ 权限门控：等待用户确认
+                            if not skip_permissions and tool_name in PERMISSION_SENSITIVE_TOOLS:
+                                granted = await _wait_for_permission(tool_id, tool_name, "")
+                                if not granted:
+                                    emit("error", error=f"权限被拒绝：{tool_name} 操作已取消")
+                                    self.abort(session_id)
+                                    break
 
                 elif msg_type == "system":
                     if getattr(message, "subtype", None) == "init":
@@ -601,12 +696,13 @@ class ClaudeCodeOfficialBackend(ModelBackend):
         agent_session_id: Optional[str] = None,
         working_dir: Optional[str] = None,
         skip_permissions: Optional[bool] = None,
+        on_permission_request: Optional[Callable[[PermissionRequest], Awaitable[bool]]] = None,
     ) -> dict:
-        self._cancelled = False
+        self.clear_cancelled(session_id)
         _new_agent_sid: Optional[str] = agent_session_id
 
         def emit(delta_type: str, **kwargs):
-            if not self._cancelled:
+            if not self.is_cancelled(session_id):
                 on_delta(StreamDelta(session_id, message_id, delta_type, **kwargs))
 
         cwd = working_dir or getattr(self.config, "working_dir", None) or "."
@@ -785,7 +881,7 @@ class ClaudeCodeOfficialBackend(ModelBackend):
             waited = 0
             POLL = 10
             while True:
-                if self._cancelled:
+                if self.is_cancelled(session_id):
                     break
                 try:
                     tag, payload = await asyncio.wait_for(msg_queue.get(), timeout=POLL)
@@ -838,10 +934,10 @@ class OpenAICompatibleBackend(ModelBackend):
         skip_permissions: Optional[bool] = None,
         **kwargs,
     ) -> dict:
-        self._cancelled = False
+        self.clear_cancelled(session_id)
 
         def emit(delta_type: str, **kw):
-            if not self._cancelled:
+            if not self.is_cancelled(session_id):
                 on_delta(StreamDelta(session_id, message_id, delta_type, **kw))
 
         try:
@@ -887,7 +983,7 @@ class OpenAICompatibleBackend(ModelBackend):
             last_error: Optional[str] = None
 
             for attempt in range(_MAX_RETRIES + 1):
-                if self._cancelled:
+                if self.is_cancelled(session_id):
                     break
                 if attempt > 0:
                     delay = _RETRY_DELAYS[attempt - 1]
@@ -915,7 +1011,7 @@ class OpenAICompatibleBackend(ModelBackend):
                                 return {}
 
                             async for line in response.aiter_lines():
-                                if self._cancelled:
+                                if self.is_cancelled(session_id):
                                     break
                                 line = line.strip()
                                 if not line.startswith("data: "):
@@ -944,13 +1040,13 @@ class OpenAICompatibleBackend(ModelBackend):
                     print(f"[OpenAI] network error ({last_error}), will retry",
                           file=sys.stderr, flush=True)
 
-            if last_error and not self._cancelled:
+            if last_error and not self.is_cancelled(session_id):
                 emit("error", error=last_error)
             emit("done")
             return {}
 
         except Exception as e:
-            if not self._cancelled:
+            if not self.is_cancelled(session_id):
                 emit("error", error=_exc_msg(e))
             return {}
 
@@ -977,10 +1073,10 @@ class AnthropicAPIBackend(ModelBackend):
         skip_permissions: Optional[bool] = None,
         **kwargs,
     ) -> dict:
-        self._cancelled = False
+        self.clear_cancelled(session_id)
 
         def emit(delta_type: str, **kw):
-            if not self._cancelled:
+            if not self.is_cancelled(session_id):
                 on_delta(StreamDelta(session_id, message_id, delta_type, **kw))
 
         try:
@@ -1110,7 +1206,7 @@ class AnthropicAPIBackend(ModelBackend):
                 _last_err: Optional[str] = None
 
                 for _attempt in range(_MAX_RETRIES + 1):
-                    if self._cancelled:
+                    if self.is_cancelled(session_id):
                         break
                     if _attempt > 0:
                         _d = _RETRY_DELAYS[_attempt - 1]
@@ -1133,7 +1229,7 @@ class AnthropicAPIBackend(ModelBackend):
                                         f"HTTP {resp.status_code}: {body.decode(errors='replace')}"
                                     )
                                 async for line in resp.aiter_lines():
-                                    if self._cancelled:
+                                    if self.is_cancelled(session_id):
                                         break
                                     if not line.startswith("data:"):
                                         continue
@@ -1203,7 +1299,7 @@ class AnthropicAPIBackend(ModelBackend):
                     messages=api_messages,
                 ) as stream:
                     async for event in stream:
-                        if self._cancelled:
+                        if self.is_cancelled(session_id):
                             break
 
                         etype = type(event).__name__
@@ -1239,7 +1335,7 @@ class AnthropicAPIBackend(ModelBackend):
                             if usage:
                                 input_tokens = getattr(usage, "input_tokens", 0)
 
-            if not self._cancelled:
+            if not self.is_cancelled(session_id):
                 usage_dict: Optional[dict] = None
                 if input_tokens or output_tokens:
                     usage_dict = {
@@ -1251,7 +1347,7 @@ class AnthropicAPIBackend(ModelBackend):
             return {}
 
         except Exception as e:
-            if not self._cancelled:
+            if not self.is_cancelled(session_id):
                 import traceback
                 traceback.print_exc()
                 emit("error", error=_exc_msg(e))

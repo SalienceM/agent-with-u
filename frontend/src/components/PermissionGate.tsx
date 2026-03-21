@@ -1,8 +1,8 @@
 /**
  * PermissionGate: 权限确认弹框。
  *
- * 当 skip_permissions=false 且 Claude 触发 auto-continue 时，
- * 后端发出 permissionRequest 事件，前端弹出此弹框请用户决策。
+ * 场景1: 工具执行前的权限确认（tool.status === 'pending'）
+ * 场景2: Auto-continue 时的权限确认（tool.status === 'done'）
  */
 import React from 'react';
 import { api } from '../api';
@@ -35,6 +35,15 @@ const TOOL_ICON: Record<string, string> = {
 };
 
 export const PermissionGate: React.FC<Props> = ({ request, onDismiss, onAllowSession }) => {
+  // ★ 判断场景：是否有 pending 状态的工具（工具执行前）还是 done 状态（auto-continue）
+  const isPreExecution = request.tools.some(t => t.status === 'pending');
+  const title = isPreExecution
+    ? 'Allow this action?'
+    : 'Continue with these actions?';
+  const description = isPreExecution
+    ? 'Claude wants to execute the following tool. Review and approve to continue.'
+    : 'Claude ran the following tools and wants to auto-continue.';
+
   const handleGrant = async (granted: boolean) => {
     await api.grantPermission(request.sessionId, granted);
     onDismiss();
@@ -79,10 +88,10 @@ export const PermissionGate: React.FC<Props> = ({ request, onDismiss, onAllowSes
           <span style={{ fontSize: 20 }}>🔒</span>
           <div>
             <div style={{ color: '#fff', fontWeight: 600, fontSize: 15 }}>
-              Continue with these actions?
+              {title}
             </div>
             <div style={{ color: '#888', fontSize: 12, marginTop: 2 }}>
-              Claude ran the following tools and wants to auto-continue.
+              {description}
             </div>
           </div>
         </div>
@@ -106,10 +115,10 @@ export const PermissionGate: React.FC<Props> = ({ request, onDismiss, onAllowSes
                   fontSize: 11,
                   padding: '1px 6px',
                   borderRadius: 4,
-                  background: tc.status === 'done' ? 'rgba(76,175,80,0.2)' : 'rgba(244,67,54,0.2)',
-                  color: tc.status === 'done' ? '#4caf50' : '#f44336',
+                  background: tc.status === 'done' ? 'rgba(76,175,80,0.2)' : tc.status === 'pending' ? 'rgba(255,193,7,0.2)' : 'rgba(244,67,54,0.2)',
+                  color: tc.status === 'done' ? '#4caf50' : tc.status === 'pending' ? '#ffc107' : '#f44336',
                 }}>
-                  {tc.status}
+                  {tc.status === 'pending' ? 'pending' : tc.status}
                 </span>
               </div>
               {tc.input && (
@@ -153,7 +162,7 @@ export const PermissionGate: React.FC<Props> = ({ request, onDismiss, onAllowSes
               fontSize: 13,
             }}
           >
-            ⛔ Abort
+            ⛔ {isPreExecution ? 'Deny' : 'Abort'}
           </button>
           <button
             onClick={handleAllowSession}
@@ -182,7 +191,7 @@ export const PermissionGate: React.FC<Props> = ({ request, onDismiss, onAllowSes
               fontWeight: 600,
             }}
           >
-            ▶ Continue
+            ▶ {isPreExecution ? 'Allow once' : 'Continue'}
           </button>
         </div>
       </div>

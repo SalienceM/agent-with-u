@@ -32,6 +32,8 @@ export const App: React.FC = () => {
   const [backendConnected, setBackendConnected] = useState<boolean | null>(null);  // ★ null = connecting
   const [toast, setToast] = useState<{ type: 'success' | 'error' | 'info'; message: string } | null>(null);
   const [isImporting, setIsImporting] = useState(false);
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+  const [visibleCount, setVisibleCount] = useState(6);  // ★ 默认显示最近几条（3轮对话）
   const toastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   // ★ Track if initial session check has been done to prevent re-opening dialog
   const initialCheckDoneRef = useRef(false);
@@ -91,6 +93,7 @@ export const App: React.FC = () => {
       setActiveSession(null);
       return;
     }
+    setVisibleCount(6);  // ★ 切换 session 时重置为只显示最近几条
     api.loadSession(activeSessionId).then((session) => {
       setActiveSession(session);
     });
@@ -125,9 +128,15 @@ export const App: React.FC = () => {
   }, [chat.isStreaming, activeSessionId]);
 
   /* ---- 自动滚到底部 ---- */
+  const prevSessionRef = useRef(activeSessionId);
   useEffect(() => {
-    endRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [chat.messages]);
+    const switched = prevSessionRef.current !== activeSessionId;
+    prevSessionRef.current = activeSessionId;
+    // 等待 DOM 布局完成后再滚动，避免发送消息后滚动不到底
+    requestAnimationFrame(() => {
+      endRef.current?.scrollIntoView({ behavior: switched ? 'instant' : 'smooth' });
+    });
+  }, [chat.messages, activeSessionId]);
 
   /* ---- 新建会话 ---- */
   const handleNewSession = useCallback(() => {
@@ -286,6 +295,8 @@ export const App: React.FC = () => {
       '--theme-accent-bg': theme.accentBg,
       '--theme-message-bg': ua < 1 ? hexToRgba(theme.messageBg, ua) : theme.messageBg,
       '--theme-user-message-bg': ua < 1 ? hexToRgba(theme.userMessageBg, ua) : theme.userMessageBg,
+      '--theme-user-bubble-bg': theme.userBubbleBg,
+      '--theme-user-bubble-border': theme.userBubbleBorder,
       '--theme-code-bg': ua < 1 ? hexToRgba(theme.codeBg, ua) : theme.codeBg,
       '--theme-input-bg': ua < 1 ? hexToRgba(theme.inputBg, ua) : theme.inputBg,
       '--theme-sidebar-bg': ua < 1 ? hexToRgba(theme.sidebarBg, ua) : theme.sidebarBg,
@@ -363,7 +374,12 @@ export const App: React.FC = () => {
         activeSessionId={activeSessionId}
         onSelectSession={setActiveSessionId}
         onNewSession={handleNewSession}
+        onDeleteSession={(id) => {
+          if (id === activeSessionId) setActiveSessionId(null);
+        }}
         streamingSessions={streamingSessions}
+        collapsed={sidebarCollapsed}
+        onToggleCollapse={() => setSidebarCollapsed((v) => !v)}
       />
 
       <div style={{ flex: 1, display: 'flex', flexDirection: 'column', minWidth: 0 }}>
@@ -383,10 +399,8 @@ export const App: React.FC = () => {
               ⚠ backend offline
             </span>
           )}
-          {/* ★ 显示当前工作目录 */}
-          <span style={workingDirStyle} title={activeSession?.workingDir || 'Not set'}>
-            {formatWorkingDir(activeSession?.workingDir)}
-          </span>
+          {/* ★ 显示当前工作目录 — 点击复制完整路径 */}
+          <CopyablePath path={activeSession?.workingDir} />
           <span style={{ fontSize: 12, color: 'var(--theme-text-muted, #656d76)' }}>
             {formatBackendLabel(backends.find((b: any) => b.id === activeBackendId))}
           </span>
@@ -425,14 +439,43 @@ export const App: React.FC = () => {
               </div>
             </div>
           )}
-          {chat.messages.map((msg) => (
-            <MessageBubble
-              key={msg.id}
-              message={msg}
-              fontSize={config.fontSize}
-              renderMarkdown={config.renderMarkdown}
-            />
-          ))}
+          {(() => {
+            const total = chat.messages.length;
+            // ★ 流式时自动扩展可见数量，确保新消息不被隐藏
+            const effectiveVisible = Math.max(visibleCount, chat.isStreaming ? total : visibleCount);
+            const hiddenCount = Math.max(0, total - effectiveVisible);
+            const visibleMessages = hiddenCount > 0 ? chat.messages.slice(hiddenCount) : chat.messages;
+            return (
+              <>
+                {hiddenCount > 0 && (
+                  <div style={{ display: 'flex', justifyContent: 'center', padding: '8px 16px' }}>
+                    <button
+                      onClick={() => setVisibleCount(total)}
+                      style={{
+                        padding: '6px 16px',
+                        borderRadius: 16,
+                        border: '1px solid var(--theme-border, rgba(0,0,0,0.12))',
+                        background: 'var(--theme-bg-secondary, #f6f8fa)',
+                        color: 'var(--theme-text-muted, #656d76)',
+                        fontSize: 12,
+                        cursor: 'pointer',
+                      }}
+                    >
+                      ↑ {hiddenCount} earlier messages
+                    </button>
+                  </div>
+                )}
+                {visibleMessages.map((msg) => (
+                  <MessageBubble
+                    key={msg.id}
+                    message={msg}
+                    fontSize={config.fontSize}
+                    renderMarkdown={config.renderMarkdown}
+                  />
+                ))}
+              </>
+            );
+          })()}
           <div ref={endRef} />
         </div>
 
@@ -771,6 +814,35 @@ const confirmBtnStyle: React.CSSProperties = {
   fontWeight: 500,
 };
 
+/* ★ 可点击复制的路径组件 */
+const CopyablePath: React.FC<{ path?: string }> = ({ path }) => {
+  const [copied, setCopied] = useState(false);
+  const fullPath = path || '';
+
+  const handleClick = useCallback(() => {
+    if (!fullPath) return;
+    navigator.clipboard.writeText(fullPath).then(() => {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    });
+  }, [fullPath]);
+
+  return (
+    <span
+      style={{
+        ...workingDirStyle,
+        cursor: fullPath ? 'pointer' : 'default',
+        position: 'relative',
+        userSelect: 'none',
+      }}
+      title={fullPath || 'Not set'}
+      onClick={handleClick}
+    >
+      {copied ? '✓ Copied!' : formatWorkingDir(path)}
+    </span>
+  );
+};
+
 /* ★ Working Directory Display Style */
 const workingDirStyle: React.CSSProperties = {
   fontSize: 11,
@@ -780,6 +852,7 @@ const workingDirStyle: React.CSSProperties = {
   borderRadius: 4,
   fontFamily: 'monospace',
   border: '1px solid var(--theme-success-border, #2da44e33)',
+  transition: 'background 0.15s',
 };
 
 /* Format working directory for display */

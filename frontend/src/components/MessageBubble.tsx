@@ -1,6 +1,6 @@
 import React, { useState, useCallback, useEffect, useRef } from 'react';
 import { markdownToHtml } from '../utils/markdown';
-import type { ChatMessage, ToolCall } from '../hooks/useChat';
+import type { ChatMessage, ToolCall, ContentBlock } from '../hooks/useChat';
 import { DiffView } from './DiffView';
 
 // ── 注入全局动画样式 ──
@@ -24,6 +24,14 @@ if (typeof document !== 'undefined' && !document.getElementById('msg-bubble-css'
       display: block;
       cursor: zoom-in;
       margin: 4px 0;
+    }
+    /* ── 气泡操作按钮 ── */
+    .bubble-action-btn {
+      opacity: 0;
+      transition: opacity 0.15s ease;
+    }
+    .message-bubble-wrapper:hover .bubble-action-btn {
+      opacity: 1;
     }
   `;
   document.head.appendChild(style);
@@ -233,6 +241,127 @@ interface Props {
   renderMarkdown?: boolean;
 }
 
+// 复制气泡内容到剪贴板
+const copyToClipboard = async (content: string) => {
+  try {
+    await navigator.clipboard.writeText(content);
+    return true;
+  } catch {
+    // Fallback: 使用传统的 execCommand 方式
+    const textarea = document.createElement('textarea');
+    textarea.value = content;
+    textarea.style.position = 'fixed';
+    textarea.style.opacity = '0';
+    document.body.appendChild(textarea);
+    textarea.select();
+    try {
+      document.execCommand('copy');
+      return true;
+    } catch {
+      return false;
+    } finally {
+      document.body.removeChild(textarea);
+    }
+  }
+};
+
+// 气泡操作菜单组件
+const BubbleActionMenu: React.FC<{ message: ChatMessage }> = ({ message }) => {
+  const [menuOpen, setMenuOpen] = useState(false);
+  const [copied, setCopied] = useState(false);
+
+  const handleCopy = useCallback(async () => {
+    const success = await copyToClipboard(message.content || '');
+    if (success) {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    }
+    setMenuOpen(false);
+  }, [message.content]);
+
+  // 点击外部关闭菜单
+  useEffect(() => {
+    if (!menuOpen) return;
+    const handleClickOutside = (e: MouseEvent) => {
+      const target = e.target as HTMLElement;
+      if (!target.closest('.bubble-action-menu')) {
+        setMenuOpen(false);
+      }
+    };
+    document.addEventListener('mousedown', handleClickOutside);
+    return () => document.removeEventListener('mousedown', handleClickOutside);
+  }, [menuOpen]);
+
+  return (
+    <div className="bubble-action-menu" style={{
+      position: 'absolute',
+      bottom: 6,
+      right: 6,
+      zIndex: 100,
+    }}>
+      {/* 三点菜单按钮（横向） */}
+      <button
+        onClick={(e) => { e.stopPropagation(); setMenuOpen(!menuOpen); }}
+        title="操作菜单"
+        className="bubble-action-btn"
+        style={{
+          width: 28,
+          height: 20,
+          padding: 0,
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          background: 'var(--theme-bg-tertiary, #fff)',
+          border: '1px solid var(--theme-border, rgba(0,0,0,0.12))',
+          borderRadius: 4,
+          cursor: 'pointer',
+          color: 'var(--theme-text-muted, #656d76)',
+          fontSize: 14,
+          lineHeight: 1,
+        }}
+      >
+        ⋯
+      </button>
+
+      {/* 上弹菜单 */}
+      {menuOpen && (
+        <div style={{
+          position: 'absolute',
+          bottom: '100%',
+          right: 0,
+          marginBottom: 4,
+          minWidth: 120,
+          background: 'var(--theme-bg-tertiary, #fff)',
+          border: '1px solid var(--theme-border, rgba(0,0,0,0.12))',
+          borderRadius: 6,
+          boxShadow: '0 4px 12px rgba(0,0,0,0.15)',
+          overflow: 'hidden',
+        }}>
+          <button
+            onClick={handleCopy}
+            style={{
+              width: '100%',
+              padding: '8px 12px',
+              background: 'none',
+              border: 'none',
+              textAlign: 'left',
+              cursor: 'pointer',
+              fontSize: 12,
+              color: copied ? 'var(--theme-success, #3fb950)' : 'var(--theme-text, #1f2328)',
+              display: 'flex',
+              alignItems: 'center',
+              gap: 8,
+            }}
+          >
+            <span>{copied ? '✓' : '📋'}</span>
+            <span>{copied ? '已复制' : '复制内容'}</span>
+          </button>
+        </div>
+      )}
+    </div>
+  );
+};
+
 export const MessageBubble: React.FC<Props> = ({
   message,
   fontSize = 14,
@@ -276,20 +405,33 @@ export const MessageBubble: React.FC<Props> = ({
         padding: '4px 16px',
       }}
     >
+      {/* ★ 角色标签 */}
+      {!isUser && (
+        <div style={{
+          width: 28, height: 28, borderRadius: '50%', flexShrink: 0,
+          background: 'var(--theme-accent, #7aa2f7)',
+          display: 'flex', alignItems: 'center', justifyContent: 'center',
+          fontSize: 13, color: '#fff', fontWeight: 700, marginRight: 8, marginTop: 2,
+        }}>A</div>
+      )}
       <div
+        className="message-bubble-wrapper"
         style={{
+          position: 'relative',
           maxWidth: '80%',
           minWidth: 60,
           padding: '10px 14px',
-          borderRadius: 12,
-          background: isUser ? 'var(--theme-user-message-bg, #0969da1a)' : 'var(--theme-message-bg, #f6f8fa)',
-          border: `1px solid ${isUser ? 'var(--theme-accent, #0969da4d)' : 'var(--theme-border, rgba(0,0,0,0.12))'}`,
+          borderRadius: isUser ? '12px 12px 4px 12px' : '12px 12px 12px 4px',
+          background: isUser ? 'var(--theme-user-bubble-bg, #ddf4ff)' : 'var(--theme-message-bg, #f6f8fa)',
+          border: `1px solid ${isUser ? 'var(--theme-user-bubble-border, #0969da44)' : 'var(--theme-border, rgba(0,0,0,0.12))'}`,
           fontSize,
           lineHeight: 1.6,
           wordBreak: 'break-word',
-          overflow: 'hidden',
+          overflow: 'visible',
         }}
       >
+        {/* 操作菜单（悬停显示） */}
+        <BubbleActionMenu message={message} />
         {/* 附件图片 */}
         {message.images && message.images.length > 0 && (
           <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, marginBottom: 8 }}>
@@ -319,31 +461,56 @@ export const MessageBubble: React.FC<Props> = ({
           </div>
         )}
 
-        {/* Thinking */}
-        {!isUser && thinkingContent && (
-          <ThinkingBlock content={thinkingContent} isThinking={isThinkingPhase} />
+        {/* ★ 按 contentBlocks 顺序交替渲染 thinking / tool / text */}
+        {!isUser && message.contentBlocks && message.contentBlocks.length > 0 ? (
+          message.contentBlocks.map((block, i) => {
+            if (block.type === 'thinking' && thinkingContent) {
+              return <ThinkingBlock key={`blk-${i}`} content={thinkingContent} isThinking={isThinkingPhase} />;
+            }
+            if (block.type === 'tool' && message.toolCalls && block.toolIndex !== undefined) {
+              const tc = message.toolCalls[block.toolIndex];
+              return tc ? <ToolCallBlock key={`blk-${i}`} tc={tc} /> : null;
+            }
+            if (block.type === 'text') {
+              return contentHtml ? (
+                <div
+                  key={`blk-${i}`}
+                  ref={contentRef}
+                  className="msg-content"
+                  onClick={handleContentClick}
+                  dangerouslySetInnerHTML={{ __html: contentHtml }}
+                />
+              ) : message.content ? (
+                <div key={`blk-${i}`} style={{ whiteSpace: 'pre-wrap' }}>{message.content}</div>
+              ) : null;
+            }
+            return null;
+          })
+        ) : (
+          /* Fallback：历史消息没有 contentBlocks 时保持原有顺序 */
+          <>
+            {!isUser && thinkingContent && (
+              <ThinkingBlock content={thinkingContent} isThinking={isThinkingPhase} />
+            )}
+            {!isUser && message.toolCalls && message.toolCalls.length > 0 && (
+              <div style={{ marginBottom: message.content ? 8 : 0 }}>
+                {message.toolCalls.map((tc, i) => (
+                  <ToolCallBlock key={`${tc.id || tc.name}-${i}`} tc={tc} />
+                ))}
+              </div>
+            )}
+            {contentHtml ? (
+              <div
+                ref={contentRef}
+                className="msg-content"
+                onClick={handleContentClick}
+                dangerouslySetInnerHTML={{ __html: contentHtml }}
+              />
+            ) : message.content ? (
+              <div style={{ whiteSpace: 'pre-wrap' }}>{message.content}</div>
+            ) : null}
+          </>
         )}
-
-        {/* Tool Calls */}
-        {!isUser && message.toolCalls && message.toolCalls.length > 0 && (
-          <div style={{ marginBottom: message.content ? 8 : 0 }}>
-            {message.toolCalls.map((tc, i) => (
-              <ToolCallBlock key={`${tc.id || tc.name}-${i}`} tc={tc} />
-            ))}
-          </div>
-        )}
-
-        {/* 正文 */}
-        {contentHtml ? (
-          <div
-            ref={contentRef}
-            className="msg-content"
-            onClick={handleContentClick}
-            dangerouslySetInnerHTML={{ __html: contentHtml }}
-          />
-        ) : message.content ? (
-          <div style={{ whiteSpace: 'pre-wrap' }}>{message.content}</div>
-        ) : null}
 
         {/* 流式光标 */}
         {message.streaming && (
@@ -361,11 +528,12 @@ export const MessageBubble: React.FC<Props> = ({
           />
         )}
 
-        {/* Token 用量 */}
-        {!isUser && message.usage && !message.streaming && (
+        {/* Token 用量 + 耗时 */}
+        {!isUser && (message.usage || message.elapsed) && !message.streaming && (
           <div style={{ fontSize: 11, color: 'var(--theme-text-muted, #656d76)', marginTop: 4 }}>
-            {message.usage.inputTokens != null && `↑${message.usage.inputTokens.toLocaleString()}`}
-            {message.usage.outputTokens != null && ` ↓${message.usage.outputTokens.toLocaleString()}`}
+            {message.usage?.inputTokens != null && `↑${message.usage.inputTokens.toLocaleString()}`}
+            {message.usage?.outputTokens != null && ` ↓${message.usage.outputTokens.toLocaleString()}`}
+            {message.elapsed != null && ` · ${message.elapsed < 1000 ? `${message.elapsed}ms` : `${(message.elapsed / 1000).toFixed(1)}s`}`}
           </div>
         )}
 
@@ -376,6 +544,15 @@ export const MessageBubble: React.FC<Props> = ({
           </div>
         )}
       </div>
+      {/* ★ 用户头像 */}
+      {isUser && (
+        <div style={{
+          width: 28, height: 28, borderRadius: '50%', flexShrink: 0,
+          background: 'var(--theme-success, #2da44e)',
+          display: 'flex', alignItems: 'center', justifyContent: 'center',
+          fontSize: 13, color: '#fff', fontWeight: 700, marginLeft: 8, marginTop: 2,
+        }}>U</div>
+      )}
     </div>
     </>
   );

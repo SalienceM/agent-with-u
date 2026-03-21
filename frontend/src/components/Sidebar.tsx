@@ -20,11 +20,14 @@ interface Props {
   activeSessionId: string | null;
   onSelectSession: (id: string) => void;
   onNewSession: () => void;
+  onDeleteSession?: (id: string) => void;  // ★ 通知父组件 session 被删除
   streamingSessions: Set<string>;  // ★ Set of session IDs that are streaming
+  collapsed?: boolean;
+  onToggleCollapse?: () => void;
 }
 
 // ★ Wrap with React.memo to prevent unnecessary re-renders when parent updates
-export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession, onNewSession, streamingSessions }) => {
+export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession, onNewSession, onDeleteSession, streamingSessions, collapsed, onToggleCollapse }) => {
   const [sessions, setSessions] = useState<Session[]>([]);
   const [backends, setBackends] = useState<Backend[]>([]);
   const [hoveredSessionId, setHoveredSessionId] = useState<string | null>(null);
@@ -52,10 +55,14 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
 
   const confirmDelete = useCallback(() => {
     if (sessionToDelete) {
-      api.deleteSession(sessionToDelete.id).then(refresh);
+      const deletedId = sessionToDelete.id;
+      api.deleteSession(deletedId).then(() => {
+        refresh();
+        onDeleteSession?.(deletedId);
+      });
       setSessionToDelete(null);
     }
-  }, [sessionToDelete, refresh]);
+  }, [sessionToDelete, refresh, onDeleteSession]);
 
   // ★ Listen for session-created event to refresh list
   useEffect(() => {
@@ -111,6 +118,29 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
     return '.../' + parts.slice(-3).join('/');
   }, []);
 
+  // ★ 折叠状态：只显示窄条 + 展开按钮
+  if (collapsed) {
+    return (
+      <div style={collapsedSidebarStyle}>
+        <button
+          onClick={onToggleCollapse}
+          style={toggleBtnStyle}
+          title="展开侧栏"
+        >
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+            <path d="M9 18l6-6-6-6" />
+          </svg>
+        </button>
+        <button onClick={onNewSession} style={{ ...toggleBtnStyle, marginTop: 4 }} title="New session">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+            <line x1="12" y1="5" x2="12" y2="19" />
+            <line x1="5" y1="12" x2="19" y2="12" />
+          </svg>
+        </button>
+      </div>
+    );
+  }
+
   return (
     <div style={sidebarStyle}>
       <style>{`
@@ -120,10 +150,24 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
         }
       `}</style>
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '16px 12px 8px' }}>
-        <span style={{ fontSize: 13, fontWeight: 600, color: 'var(--theme-text-muted, rgba(255,255,255,0.5))', textTransform: 'uppercase', letterSpacing: 0.5 }}>
+        <button
+          onClick={onToggleCollapse}
+          style={{ ...toggleBtnStyle, marginRight: 6 }}
+          title="收起侧栏"
+        >
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+            <path d="M15 18l-6-6 6-6" />
+          </svg>
+        </button>
+        <span style={{ fontSize: 13, fontWeight: 600, color: 'var(--theme-text-muted, rgba(255,255,255,0.5))', textTransform: 'uppercase', letterSpacing: 0.5, flex: 1 }}>
           Sessions
         </span>
-        <button onClick={onNewSession} style={newBtnStyle} title="New session">+</button>
+        <button onClick={onNewSession} style={newBtnStyle} title="New session">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+            <line x1="12" y1="5" x2="12" y2="19" />
+            <line x1="5" y1="12" x2="19" y2="12" />
+          </svg>
+        </button>
       </div>
       <div style={{ flex: 1, overflow: 'auto', padding: '4px 8px' }}>
         {sessions.map((s: any) => {
@@ -234,8 +278,9 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
     </div>
   );
 }, (prevProps, nextProps) => {
-  // ★ Only re-render when activeSessionId or streamingSessions changes
-  return prevProps.activeSessionId === nextProps.activeSessionId && prevProps.streamingSessions === nextProps.streamingSessions;
+  return prevProps.activeSessionId === nextProps.activeSessionId
+    && prevProps.streamingSessions === nextProps.streamingSessions
+    && prevProps.collapsed === nextProps.collapsed;
 });
 
 // Simple color mapping for backend badges
@@ -255,6 +300,32 @@ const sidebarStyle: React.CSSProperties = {
   flexDirection: 'column',
   background: 'var(--theme-sidebar-bg, #f6f8fa)',
   flexShrink: 0,
+  transition: 'width 0.2s ease',
+};
+
+const collapsedSidebarStyle: React.CSSProperties = {
+  width: 40,
+  borderRight: '1px solid var(--theme-border, rgba(0,0,0,0.12))',
+  display: 'flex',
+  flexDirection: 'column',
+  alignItems: 'center',
+  background: 'var(--theme-sidebar-bg, #f6f8fa)',
+  flexShrink: 0,
+  paddingTop: 12,
+};
+
+const toggleBtnStyle: React.CSSProperties = {
+  width: 28,
+  height: 28,
+  borderRadius: 6,
+  border: '1px solid var(--theme-border, rgba(0,0,0,0.12))',
+  background: 'var(--theme-bg-secondary, #f6f8fa)',
+  color: 'var(--theme-text-muted, #656d76)',
+  cursor: 'pointer',
+  display: 'flex',
+  alignItems: 'center',
+  justifyContent: 'center',
+  transition: 'all 0.15s ease',
 };
 
 const runningDotStyle: React.CSSProperties = {
@@ -271,11 +342,11 @@ const newBtnStyle: React.CSSProperties = {
   border: '1px solid var(--theme-border, rgba(0,0,0,0.12))',
   background: 'var(--theme-bg-secondary, #f6f8fa)',
   color: 'var(--theme-text-muted, #656d76)',
-  fontSize: 18,
   cursor: 'pointer',
   display: 'flex',
   alignItems: 'center',
   justifyContent: 'center',
+  transition: 'all 0.15s ease',
 };
 
 const itemStyle: React.CSSProperties = {

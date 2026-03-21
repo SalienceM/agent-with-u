@@ -341,11 +341,6 @@ export const api = {
     return () => { connectionStatusCallbacks = connectionStatusCallbacks.filter((cb) => cb !== callback); };
   },
 
-  async startOAuthFlow(): Promise<{ token: string | null; error: string | null }> {
-    const result = await call('startOAuthFlow');
-    try { return JSON.parse(result); } catch { return { token: null, error: '解析响应失败' }; }
-  },
-
   async getAppConfig(): Promise<any> {
     const result = await call('getAppConfig');
     try { return JSON.parse(result); } catch { return {}; }

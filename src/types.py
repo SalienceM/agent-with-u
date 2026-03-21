@@ -82,6 +82,9 @@ class ToolCallInfo:
     diff_path: Optional[str] = None
     diff_before: Optional[str] = None
     diff_after: Optional[str] = None
+    # ★ Timing data for duration display
+    start_time: Optional[float] = None  # Unix timestamp in seconds
+    duration: Optional[int] = None  # Duration in milliseconds
 
     def to_dict(self) -> dict:
         d = {
@@ -101,6 +104,8 @@ class ToolCallInfo:
                 "old": self.diff_before or "",
                 "new": self.diff_after or "",
             }
+        if self.duration is not None:
+            d["duration"] = self.duration
         return d
 
 

@@ -59,8 +59,6 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
     apiKey: '',
     env: {},
   });
-  const [oauthLoading, setOauthLoading] = useState(false);
-  const [oauthError, setOauthError] = useState<string | null>(null);
   const [loginLaunching, setLoginLaunching] = useState(false);
   const [loginMsg, setLoginMsg] = useState<string | null>(null);
   const [modelLaunching, setModelLaunching] = useState(false);
@@ -158,32 +156,6 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
       },
     }));
   }, []);
-
-  const handleGetOAuthToken = useCallback(async () => {
-    setOauthLoading(true);
-    setOauthError(null);
-    try {
-      const result = await api.startOAuthFlow();
-      if (result.token) {
-        // OAuth token 存入 ANTHROPIC_AUTH_TOKEN，同时设 BASE_URL 为 api.claude.ai
-        // （claude.ai OAuth token 必须走 api.claude.ai，否则认证失败）
-        setFormData((prev) => ({
-          ...prev,
-          env: {
-            ...prev.env,
-            ANTHROPIC_AUTH_TOKEN: result.token!,
-            ANTHROPIC_BASE_URL: prev.env?.ANTHROPIC_BASE_URL || 'https://api.claude.ai',
-          },
-        }));
-      } else {
-        setOauthError(result.error || '获取失败');
-      }
-    } catch (e: any) {
-      setOauthError(e?.message || '获取失败');
-    } finally {
-      setOauthLoading(false);
-    }
-  }, [handleEnvChange]);
 
   const handleOpenLoginTerminal = useCallback(async () => {
     setLoginLaunching(true);
@@ -296,8 +268,8 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
                         {backend.type === 'claude-code-official' && (
                           <span> · 官方账户{backend.env?.HTTPS_PROXY ? ' · 代理✓' : ' · ⚠️无代理'}</span>
                         )}
-                        {(backend.type === 'openai-compatible' || backend.type === 'anthropic-api') && backend.model && (
-                          <span> · {backend.model}</span>
+                        {(backend.type === 'openai-compatible' || backend.type === 'anthropic-api' || backend.type === 'claude-code-official') && backend.model && (
+                          <span> · 🤖{backend.model}</span>
                         )}
                         {backend.baseUrl && (
                           <span> · {backend.baseUrl.replace(/^https?:\/\//, '').split('/')[0]}</span>
@@ -387,35 +359,21 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
               <div style={{ marginBottom: 16, padding: 12, background: 'var(--theme-bg-secondary)', borderRadius: 8 }}>
                 <label style={{ ...labelStyle, marginBottom: 8 }}>Claude Agent SDK 配置</label>
 
-                {/* ANTHROPIC_AUTH_TOKEN：手动粘贴或浏览器 OAuth 自动填入 */}
+                {/* ANTHROPIC_AUTH_TOKEN：手动填入 */}
                 <div style={{ marginBottom: 10 }}>
-                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 4 }}>
-                    <label style={{ fontSize: 11, color: 'var(--theme-text)' }}>ANTHROPIC_AUTH_TOKEN</label>
-                    <button
-                      onClick={handleGetOAuthToken}
-                      disabled={oauthLoading}
-                      style={{
-                        fontSize: 11, padding: '3px 10px', borderRadius: 5, cursor: oauthLoading ? 'wait' : 'pointer',
-                        border: '1px solid var(--theme-accent)',
-                        background: oauthLoading ? 'var(--theme-bg-tertiary)' : 'var(--theme-accent-bg)',
-                        color: 'var(--theme-accent)', fontWeight: 500,
-                      }}
-                    >
-                      {oauthLoading ? '等待浏览器登录...' : '浏览器登录自动填入'}
-                    </button>
-                  </div>
+                  <label style={{ fontSize: 11, color: 'var(--theme-text)', display: 'block', marginBottom: 4 }}>
+                    ANTHROPIC_AUTH_TOKEN（可选，用于 claude.ai OAuth token）
+                  </label>
                   <input
                     type="password"
                     value={formData.env?.ANTHROPIC_AUTH_TOKEN || ''}
                     onChange={(e) => handleEnvChange('ANTHROPIC_AUTH_TOKEN', e.target.value)}
                     style={inputStyle}
-                    placeholder="sk-ant-... 或点击右侧按钮通过浏览器登录获取"
+                    placeholder="sk-ant-oat01-...（官方账户 OAuth token）"
                   />
-                  {oauthError && (
-                    <p style={{ fontSize: 11, color: 'var(--theme-error, #cf222e)', margin: '4px 0 0 0' }}>
-                      {oauthError}
-                    </p>
-                  )}
+                  <p style={{ fontSize: 10, color: 'var(--theme-text-muted)', margin: '4px 0 0 0' }}>
+                    如需使用官方账户，请运行<code style={{ fontSize: 9 }}>claude login</code>或在终端中输入<code style={{ fontSize: 9 }}>/login</code>。
+                  </p>
                 </div>
 
                 {/* ANTHROPIC_BASE_URL：代理地址（可选） */}
@@ -434,7 +392,7 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
 
                 <div style={{ marginBottom: 10 }}>
                   <label style={{ fontSize: 11, color: 'var(--theme-text)', display: 'block', marginBottom: 4 }}>
-                    ANTHROPIC_MODEL
+                    ANTHROPIC_MODEL（来自上下文/知识配置）
                   </label>
                   <input
                     type="text"
@@ -443,6 +401,9 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
                     style={inputStyle}
                     placeholder="e.g., claude-sonnet-4-6（留空由 CLI 自动决定）"
                   />
+                  <p style={{ fontSize: 10, color: 'var(--theme-text-muted)', margin: '4px 0 0 0' }}>
+                    模型配置将传递给 Claude Agent SDK，留空时使用默认模型。
+                  </p>
                 </div>
 
                 <div style={{ marginBottom: 10 }}>
@@ -530,10 +491,14 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
                   background: 'rgba(16,185,129,0.08)', border: '1px solid rgba(16,185,129,0.25)',
                 }}>
                   <div style={{ fontSize: 12, fontWeight: 600, color: 'rgba(110,231,183,0.9)', marginBottom: 6 }}>
-                    🤖 当前模型
+                    🤖 当前模型（来自上下文/知识配置）
                   </div>
                   <div style={{ fontSize: 13, color: 'var(--theme-text)', marginBottom: 10, fontFamily: 'monospace' }}>
-                    {currentModel || <span style={{ color: 'var(--theme-text-muted)', fontFamily: 'inherit', fontSize: 12 }}>默认（由 CLI 自动决定）</span>}
+                    {currentModel ? (
+                      <span>{currentModel} <span style={{ color: 'rgba(110,231,183,0.6)', fontSize: 11 }}>(来自 ~/.claude/settings.json)</span></span>
+                    ) : (
+                      <span style={{ color: 'var(--theme-text-muted)', fontFamily: 'inherit', fontSize: 12 }}>默认（由 CLI 自动决定）</span>
+                    )}
                   </div>
                   <div style={{ fontSize: 11, color: 'var(--theme-text-muted)', marginBottom: 10, lineHeight: 1.6 }}>
                     点击下方按钮打开终端，在 claude 中输入{' '}

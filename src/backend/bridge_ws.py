@@ -32,7 +32,7 @@ from ..types import (
     new_id,
 )
 from .session_store import SessionStore
-from .backends import create_backend, ModelBackend, StreamDelta
+from .backends import create_backend, ModelBackend, StreamDelta, PermissionRequest
 from .instance_manager import InstanceManager
 from .backend_store import BackendStore
 from .app_config_store import AppConfigStore
@@ -210,10 +210,13 @@ class BridgeWS:
         asyncio.ensure_future(self._handle_send_message(payload_json))
         return None
 
-    def _rpc_abortMessage(self, backend_id: str) -> None:
-        backend = self._backends.get(backend_id)
-        if backend:
-            backend.abort()
+    def _rpc_abortMessage(self, session_id: str) -> None:
+        """按 sessionId 取消流式输出，精确到单个 session，不影响同 backend 的其他 session。"""
+        session = self._active_sessions.get(session_id)
+        if session:
+            backend = self._backends.get(session.backend_id)
+            if backend:
+                backend.abort(session_id)
         return None
 
     # ── RPC: 命令 ────────────────────────────────────────────────
@@ -519,192 +522,8 @@ class BridgeWS:
         except Exception as e:
             return json.dumps({"status": "error", "message": str(e)}, ensure_ascii=False)
 
-    # ── RPC: Claude OAuth Token 获取 ────────────────────────────
-
-    async def _rpc_startOAuthFlow(self) -> str:
-        """
-        自行实现 OAuth PKCE 流程（不依赖 claude CLI setup-token，
-        避免非 TTY 环境下 redirect_uri 缺失的问题）。
-
-        流程:
-          1. 生成 PKCE code_verifier / code_challenge
-          2. 在本地随机端口启动 HTTP 回调服务器
-          3. 构造完整 OAuth URL（含 redirect_uri）并打开浏览器
-          4. 等待浏览器回调（最长 5 分钟）
-          5. 用 authorization_code 换 access_token
-          6. 保存到 ~/.claude/.credentials.json 并返回 token
-
-        返回 JSON: {"token": "sk-ant-oat01-...", "error": null}
-                or {"token": null, "error": "错误信息"}
-        """
-        import secrets
-        import hashlib
-        import base64
-        import socket
-        import time
-        import urllib.parse
-        import webbrowser
-        import threading
-        from pathlib import Path
-        from http.server import HTTPServer, BaseHTTPRequestHandler
-
-        # OAuth 配置（来自 claude CLI 源码 gq8 常量）
-        CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
-        AUTH_URL = "https://claude.ai/oauth/authorize"
-        TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
-        SCOPES = "org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers"
-        TIMEOUT = 300  # 5 分钟
-
-        # 1. 生成 PKCE
-        code_verifier = secrets.token_urlsafe(64)
-        code_challenge = base64.urlsafe_b64encode(
-            hashlib.sha256(code_verifier.encode()).digest()
-        ).rstrip(b"=").decode()
-        state = secrets.token_urlsafe(32)
-
-        # 2. 找可用本地端口
-        with socket.socket() as _s:
-            _s.bind(("127.0.0.1", 0))
-            port = _s.getsockname()[1]
-
-        redirect_uri = f"http://localhost:{port}/callback"
-
-        # 3. 构造完整 OAuth URL
-        auth_url = AUTH_URL + "?" + urllib.parse.urlencode({
-            "client_id": CLIENT_ID,
-            "response_type": "code",
-            "redirect_uri": redirect_uri,
-            "scope": SCOPES,
-            "code_challenge": code_challenge,
-            "code_challenge_method": "S256",
-            "state": state,
-        })
-
-        # 4. 启动本地回调服务器（只接收一个请求）
-        callback_result: dict = {}
-        callback_event = threading.Event()
-        _state = state  # 闭包捕获
-
-        class _CallbackHandler(BaseHTTPRequestHandler):
-            def log_message(self, fmt, *args):  # 静默日志
-                pass
-
-            def do_GET(self):
-                parsed = urllib.parse.urlparse(self.path)
-                if parsed.path != "/callback":
-                    self.send_response(404)
-                    self.end_headers()
-                    return
-                qs = urllib.parse.parse_qs(parsed.query)
-                code = (qs.get("code") or [None])[0]
-                ret_state = (qs.get("state") or [None])[0]
-                error = (qs.get("error") or [None])[0]
-
-                if error:
-                    callback_result["error"] = error
-                elif ret_state != _state:
-                    callback_result["error"] = "state 不匹配，疑似 CSRF"
-                elif code:
-                    callback_result["code"] = code
-                else:
-                    callback_result["error"] = "回调中无授权码"
-
-                body = b"<html><body><h2>Login successful!</h2><p>You can close this tab now.</p></body></html>"
-                self.send_response(200)
-                self.send_header("Content-Type", "text/html; charset=utf-8")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
-                callback_event.set()
-
-        server = HTTPServer(("127.0.0.1", port), _CallbackHandler)
-
-        def _serve():
-            server.handle_request()
-            server.server_close()
-
-        threading.Thread(target=_serve, daemon=True).start()
-
-        # 5. 打开浏览器
-        print(f"[OAuth] 打开授权页面: {auth_url}", file=sys.stderr, flush=True)
-        webbrowser.open(auth_url)
-
-        # 6. 等待回调（asyncio 非阻塞）
-        loop = asyncio.get_event_loop()
-        try:
-            await asyncio.wait_for(
-                loop.run_in_executor(None, lambda: callback_event.wait(TIMEOUT)),
-                timeout=TIMEOUT + 5,
-            )
-        except asyncio.TimeoutError:
-            return json.dumps({"token": None, "error": "登录超时（5 分钟），请重试"}, ensure_ascii=False)
-
-        if "error" in callback_result:
-            return json.dumps({"token": None, "error": f"OAuth 错误: {callback_result['error']}"}, ensure_ascii=False)
-
-        code = callback_result.get("code")
-        if not code:
-            return json.dumps({"token": None, "error": "未收到授权码"}, ensure_ascii=False)
-
-        # 7. 用 code 换 access_token
-        try:
-            import httpx
-            async with httpx.AsyncClient(timeout=30) as client:
-                resp = await client.post(
-                    TOKEN_URL,
-                    json={
-                        "grant_type": "authorization_code",
-                        "code": code,
-                        "redirect_uri": redirect_uri,
-                        "client_id": CLIENT_ID,
-                        "code_verifier": code_verifier,
-                        "state": state,
-                    },
-                    headers={"Content-Type": "application/json"},
-                )
-            if resp.status_code != 200:
-                return json.dumps({
-                    "token": None,
-                    "error": f"Token 交换失败 ({resp.status_code}): {resp.text[:300]}",
-                }, ensure_ascii=False)
-
-            data = resp.json()
-            access_token: Optional[str] = data.get("access_token")
-            if not access_token:
-                return json.dumps({"token": None, "error": f"响应中无 access_token: {str(data)[:300]}"}, ensure_ascii=False)
-
-            # 8. 构造 OAuth 数据并保存到 ~/.claude/.credentials.json
-            # Claude Code CLI 期望格式: {"claudeAiOauth": {"accessToken": ..., "refreshToken": ..., "expiresAt": ms, "scopes": [...]}}
-            expires_at_ms = int(time.time() * 1000) + int(data.get("expires_in", 28800)) * 1000
-            oauth_data: dict = {
-                "accessToken": access_token,
-                "expiresAt": expires_at_ms,
-                "scopes": [s for s in SCOPES.split() if s],
-            }
-            if "refresh_token" in data:
-                oauth_data["refreshToken"] = data["refresh_token"]
-
-            creds_path = Path.home() / ".claude" / ".credentials.json"
-            creds_path.parent.mkdir(parents=True, exist_ok=True)
-            # 读旧文件只保留非 OAuth 字段，清除旧格式的顶层 accessToken/refreshToken/expiresAt
-            creds: dict = {}
-            if creds_path.exists():
-                try:
-                    old = json.loads(creds_path.read_text(encoding="utf-8"))
-                    # 保留非 OAuth 顶层字段（如 otelLevel 等），删除旧格式 OAuth 字段
-                    creds = {k: v for k, v in old.items()
-                             if k not in ("accessToken", "refreshToken", "expiresAt", "claudeAiOauth")}
-                except Exception:
-                    pass
-            creds["claudeAiOauth"] = oauth_data
-            creds_path.write_text(json.dumps(creds, ensure_ascii=False, indent=2), encoding="utf-8")
-            print(f"[OAuth] Token 已保存到 {creds_path} (claudeAiOauth 格式)", file=sys.stderr, flush=True)
-
-            # 返回 plain access_token，前端存入 ANTHROPIC_AUTH_TOKEN，每次调用显式传递
-            return json.dumps({"token": access_token, "error": None}, ensure_ascii=False)
-
-        except Exception as e:
-            return json.dumps({"token": None, "error": f"Token 交换异常: {e}"}, ensure_ascii=False)
+    # ── RPC: Claude OAuth Token 获取（已移除，使用 claude login 替代）────────
+    # 注：已移除 _rpc_startOAuthFlow，用户应使用 claude login 或 /login 命令登录
 
     # ── 权限门控 RPC ─────────────────────────────────────────────
 
@@ -843,6 +662,7 @@ class BridgeWS:
 
             def on_delta(delta: StreamDelta):
                 nonlocal iter_usage
+                import time as _time
                 if delta.type == "done":
                     if delta.usage:
                         iter_usage = delta.usage
@@ -861,6 +681,7 @@ class BridgeWS:
                         input=delta.tool_call.get("input"),
                         output=None,
                         status=delta.tool_call.get("status", "running"),
+                        start_time=_time.time(),  # ★ Record start time
                     )
                     iter_tools.append(tc)
                 elif delta.type == "tool_input" and delta.tool_call:
@@ -873,6 +694,10 @@ class BridgeWS:
                         if tc.id == tc_id:
                             tc.output = delta.tool_call.get("output")
                             tc.status = delta.tool_call.get("status", "done")
+                            # ★ Calculate duration when tool completes
+                            if tc.start_time:
+                                tc.duration = int((_time.time() - tc.start_time) * 1000)
+                                delta.tool_call = {**(delta.tool_call or {}), "duration": tc.duration}
                             # ★ 从 Edit 工具的 input JSON 中提取 diff 数据
                             if tc.name in ("Edit", "MultiEdit") and tc.input:
                                 try:
@@ -888,8 +713,8 @@ class BridgeWS:
                                             **delta.tool_call,
                                             "diff": {
                                                 "path": tc.diff_path,
-                                                "old": old_str,
-                                                "new": new_str,
+                                                "old": tc.diff_before,
+                                                "new": tc.diff_after,
                                             },
                                         }
                                 except Exception:
@@ -923,11 +748,29 @@ class BridgeWS:
                     msgs_for_backend.append(ChatMessage(id=new_id(), role="user", content=current_content))
 
                 use_agent_session = session.agent_session_id
+
+                # ★ 权限回调：用于工具执行前的权限确认
+                async def _on_permission_request(req: PermissionRequest) -> bool:
+                    """处理来自 backend 的权限请求，转发给前端等待确认。"""
+                    # 创建 ToolCallInfo 列表
+                    from ..types import ToolCallInfo
+                    tools = [ToolCallInfo(
+                        id=req.tool_id,
+                        name=req.tool_name,
+                        input=req.tool_input,
+                        output=None,
+                        status="pending",
+                    )]
+                    return await self._await_permission_grant(
+                        req.session_id, req.message_id, tools
+                    )
+
                 result = await backend.send_message(
                     messages=msgs_for_backend, content=send_content,
                     images=current_images, session_id=session.id, message_id=message_id,
                     on_delta=on_delta, agent_session_id=use_agent_session,
                     working_dir=session.working_dir, skip_permissions=skip_permissions,
+                    on_permission_request=_on_permission_request,
                 )
 
                 if use_agent_session and result.get("agentSessionId") != use_agent_session:
