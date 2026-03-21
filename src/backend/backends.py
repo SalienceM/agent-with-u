@@ -244,7 +244,7 @@ class ClaudeAgentBackend(ModelBackend):
                   file=sys.stderr, flush=True)
 
             # ★ 权限敏感的工具列表：这些工具需要用户确认
-PERMISSION_SENSITIVE_TOOLS = {"Bash", "Edit", "Write"}
+            PERMISSION_SENSITIVE_TOOLS = {"Bash", "Edit", "Write"}
 
             # ★ 图片处理：使用 AsyncIterable[dict] 形式的 prompt 原生传递图片
             # SDK 支持通过 yield Anthropic content blocks 的方式直接传递图片
