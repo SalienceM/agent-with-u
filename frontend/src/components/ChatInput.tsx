@@ -118,14 +118,20 @@ const ChatInputInner: React.FC<Props> = ({
       if (showCommandsRef.current && filteredCommandsRef.current.length > 0) {
         if (e.key === 'ArrowUp') {
           e.preventDefault();
-          setSelectedIndex((prev) => Math.max(0, prev - 1));
+          setSelectedIndex((prev) => {
+            const next = Math.max(0, prev - 1);
+            selectedIndexRef.current = next;  // ★ 立即同步 ref，避免后续 Tab/Enter 读到旧值
+            return next;
+          });
           return;
         }
         if (e.key === 'ArrowDown') {
           e.preventDefault();
-          setSelectedIndex((prev) =>
-            Math.min(filteredCommandsRef.current.length - 1, prev + 1)
-          );
+          setSelectedIndex((prev) => {
+            const next = Math.min(filteredCommandsRef.current.length - 1, prev + 1);
+            selectedIndexRef.current = next;  // ★ 立即同步 ref
+            return next;
+          });
           return;
         }
         if (e.key === 'Tab') {

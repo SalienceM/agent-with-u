@@ -270,11 +270,15 @@ const BubbleActionMenu: React.FC<{ message: ChatMessage }> = ({ message }) => {
   const [menuOpen, setMenuOpen] = useState(false);
   const [copied, setCopied] = useState(false);
 
+  const copyTimerRef = useRef<ReturnType<typeof setTimeout>>();
+  useEffect(() => () => { clearTimeout(copyTimerRef.current); }, []);
+
   const handleCopy = useCallback(async () => {
     const success = await copyToClipboard(message.content || '');
     if (success) {
       setCopied(true);
-      setTimeout(() => setCopied(false), 2000);
+      clearTimeout(copyTimerRef.current);
+      copyTimerRef.current = setTimeout(() => setCopied(false), 2000);
     }
     setMenuOpen(false);
   }, [message.content]);

@@ -171,6 +171,10 @@ export function useConfig() {
       // If loading fails, use defaults
       setLoaded(true);
     });
+    // ★ 卸载时清理 debounce timer，防止对已卸载组件 setState
+    return () => {
+      if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
+    };
   }, []);
 
   // Debounced save: sliders may fire many events; wait 400ms after last change.

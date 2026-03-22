@@ -574,6 +574,10 @@ class BridgeWS:
         挂起当前 coroutine 直到前端调用 grantPermission 或超时。
         """
         loop = asyncio.get_event_loop()
+        # ★ 清理前一个未完成的 gate，防止协程永久挂起
+        old_gate = self._permission_gates.get(session_id)
+        if old_gate and not old_gate.done():
+            old_gate.set_result(False)
         gate: "asyncio.Future[bool]" = loop.create_future()
         self._permission_gates[session_id] = gate
 

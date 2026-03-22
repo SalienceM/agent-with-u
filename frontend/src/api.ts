@@ -28,7 +28,7 @@ type ConnectionStatusCallback = (connected: boolean) => void;
 let connectionStatusCallbacks: ConnectionStatusCallback[] = [];
 
 let reqCounter = 0;
-const pending = new Map<string, (result: any) => void>();
+const pending = new Map<string, { resolve: (result: any) => void; reject: (err: Error) => void }>();
 let streamCallbacks: StreamDeltaCallback[] = [];
 let sessionUpdateCallbacks: SessionUpdateCallback[] = [];
 let permissionRequestCallbacks: PermissionRequestCallback[] = [];
@@ -108,9 +108,9 @@ function handleMessage(e: MessageEvent) {
   try {
     const msg = JSON.parse(e.data);
     if (msg.id !== undefined && pending.has(msg.id)) {
-      const cb = pending.get(msg.id)!;
+      const { resolve } = pending.get(msg.id)!;
       pending.delete(msg.id);
-      cb(msg.result ?? null);
+      resolve(msg.result ?? null);
     } else if (msg.event === 'streamDelta') {
       const delta = JSON.parse(msg.data);
       streamCallbacks.forEach((cb) => cb(delta));
@@ -154,8 +154,8 @@ function doConnect(port: number, onSettled?: () => void) {
   socket.onclose = () => {
     if (ws === socket) {
       ws = null;
-      // 立即 resolve 所有挂起请求，避免调用方永久阻塞
-      pending.forEach((resolve) => resolve(null));
+      // ★ 连接断开时 reject 所有挂起请求，让调用方能区分连接错误和正常 null 响应
+      pending.forEach(({ reject }) => reject(new Error('WebSocket connection lost')));
       pending.clear();
       connectionStatusCallbacks.forEach((cb) => cb(false));
     }
@@ -185,11 +185,17 @@ async function call(method: string, ...params: any[]): Promise<any> {
   if (useMock || !ws || ws.readyState !== WebSocket.OPEN) {
     return mockDispatch(method, params);
   }
-  return new Promise((resolve) => {
-    const id = nextId();
-    pending.set(id, resolve);
-    ws!.send(JSON.stringify({ id, method, params }));
-  });
+  try {
+    return await new Promise((resolve, reject) => {
+      const id = nextId();
+      pending.set(id, { resolve, reject });
+      ws!.send(JSON.stringify({ id, method, params }));
+    });
+  } catch (err) {
+    // ★ 连接断开导致的 reject，打印警告并返回 null 保持兼容
+    console.warn(`[api] call "${method}" failed:`, err);
+    return null;
+  }
 }
 
 async function send(method: string, ...params: any[]): Promise<void> {

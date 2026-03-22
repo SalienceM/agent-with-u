@@ -771,6 +771,16 @@ class ClaudeCodeOfficialBackend(ModelBackend):
                 loop.call_soon_threadsafe(msg_queue.put_nowait, ("proc_done", proc.returncode))
             except Exception as e:
                 loop.call_soon_threadsafe(msg_queue.put_nowait, ("proc_error", str(e)))
+            finally:
+                # ★ 显式关闭 pipe，防止 Windows 文件描述符泄漏
+                try:
+                    proc.stdout.close()
+                except Exception:
+                    pass
+                try:
+                    proc.stderr.close()
+                except Exception:
+                    pass
 
         fut = loop.run_in_executor(None, _run)
         _done_emitted = False
