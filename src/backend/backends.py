@@ -1008,6 +1008,7 @@ class OpenAICompatibleBackend(ModelBackend):
                                 continue
                             if response.status_code != 200:
                                 emit("error", error=f"API error: {response.status_code}")
+                                emit("done")
                                 return {}
 
                             async for line in response.aiter_lines():
@@ -1048,6 +1049,7 @@ class OpenAICompatibleBackend(ModelBackend):
         except Exception as e:
             if not self.is_cancelled(session_id):
                 emit("error", error=_exc_msg(e))
+            emit("done")
             return {}
 
 

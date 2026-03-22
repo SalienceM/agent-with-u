@@ -1,6 +1,14 @@
 import { useState, useCallback, useEffect, useRef } from 'react';
 import { api } from '../api';
 import type { ImageAttachment } from './useClipboardImage';
+import {
+  getStreamState,
+  processStreamDelta,
+  resetStreamAccumulators,
+  initStreamMessage,
+  buildStreamingMessage,
+  type StreamState,
+} from './useStreamState';
 
 export interface ToolCall {
   id?: string;
@@ -121,7 +129,7 @@ export function useChat(sessionId: string, backendId: string, backends?: any[], 
   const [needsMigrate, setNeedsMigrate] = useState(false);
   const [pendingPermission, setPendingPermission] = useState<PermissionRequest | null>(null);
 
-  // 累积器 refs
+  // 累积器 refs - 用于本地快速访问，实际状态存储在全局 StreamState
   const textRef = useRef('');
   const thinkingRef = useRef('');
   const toolCallsRef = useRef<ToolCall[]>([]);
@@ -139,6 +147,16 @@ export function useChat(sessionId: string, backendId: string, backends?: any[], 
   const skipPermissionsRef = useRef(skipPermissions);
   skipPermissionsRef.current = skipPermissions;
 
+  // ★ 同步本地 refs 与全局状态
+  const syncFromGlobalState = useCallback((state: StreamState) => {
+    textRef.current = state.text;
+    thinkingRef.current = state.thinking;
+    toolCallsRef.current = state.toolCalls;
+    contentBlocksRef.current = state.contentBlocks;
+    streamStartRef.current = state.streamStart;
+    msgIdRef.current = state.messageId;
+  }, []);
+
   // ── 检查后端是否存在 ──
   useEffect(() => {
     if (!backends || backends.length === 0) return;
@@ -151,17 +169,51 @@ export function useChat(sessionId: string, backendId: string, backends?: any[], 
   // ── 加载 session ──
   useEffect(() => {
     if (!sessionId) return;
+
+    // ★ 先检查全局流式状态
+    const globalState = getStreamState(sessionId);
+    const hasActiveStream = globalState.isStreaming && globalState.messageId;
+
     api.loadSession(sessionId).then((session) => {
       if (session?.messages) {
-        setMessages(session.messages.map(normalizeMessage));
+        // 加载持久化的消息
+        const loadedMessages = session.messages.map(normalizeMessage);
+
+        // ★ 如果有正在进行的流式消息，需要合并
+        if (hasActiveStream && globalState.messageId) {
+          // 检查是否已包含该消息
+          const hasStreamingMsg = loadedMessages.some((m: ChatMessage) => m.id === globalState.messageId);
+          if (!hasStreamingMsg && (globalState.text || globalState.thinking || globalState.toolCalls.length > 0)) {
+            // 添加流式消息
+            const streamingMsg: ChatMessage = {
+              id: globalState.messageId,
+              role: 'assistant',
+              content: globalState.text,
+              timestamp: Date.now() / 1000,
+              streaming: true,
+              thinking: globalState.thinking || undefined,
+              toolCalls: globalState.toolCalls.length > 0 ? globalState.toolCalls : undefined,
+              contentBlocks: globalState.contentBlocks.length > 0 ? globalState.contentBlocks : undefined,
+            };
+            loadedMessages.push(streamingMsg);
+          }
+        }
+
+        setMessages(loadedMessages);
       }
       if (session?.autoContinue !== undefined) {
         setAutoContinue(session.autoContinue);
       }
     });
-    // ★ Reset streaming state when switching sessions
-    setIsStreaming(false);
-  }, [sessionId]);
+
+    // ★ 恢复流式状态
+    if (hasActiveStream) {
+      setIsStreaming(true);
+      syncFromGlobalState(globalState);
+    } else {
+      setIsStreaming(false);
+    }
+  }, [sessionId, syncFromGlobalState]);
 
   // ── sessionUpdated 监听（compact 等后端操作完成后重载）──
   useEffect(() => {
@@ -188,222 +240,69 @@ export function useChat(sessionId: string, backendId: string, backends?: any[], 
   useEffect(() => {
     return api.onStreamDelta((delta) => {
       if (delta.sessionId !== sessionId) return;
+
+      // ★ 使用全局状态处理器
+      const result = processStreamDelta(sessionId, delta);
+      const state = result.state;
+
+      // ★ 同步本地 refs
+      syncFromGlobalState(state);
+
       const mid = delta.messageId;
 
-      // ★ 辅助：将所有 running 工具标记为 done（新内容到来意味着之前的工具已完成）
-      const finishRunningTools = () => {
-        const now = Date.now();
-        let changed = false;
-        const updated = toolCallsRef.current.map((tc) => {
-          if (tc.status === 'running') {
-            changed = true;
-            return { ...tc, status: 'done', duration: tc.startTime ? now - tc.startTime : undefined };
+      // ★ 辅助函数：更新流式消息
+      const updateStreamingMessage = (extra: Partial<ChatMessage> = {}) => {
+        setMessages((prev) => {
+          const existing = prev.find(m => m.id === mid);
+          if (existing) {
+            return prev.map(m =>
+              m.id === mid
+                ? buildStreamingMessage(state, { ...m, ...extra })
+                : m
+            );
+          } else {
+            // 消息不存在时创建新的
+            const newMsg: ChatMessage = {
+              id: mid,
+              role: 'assistant',
+              content: state.text,
+              timestamp: Date.now() / 1000,
+              streaming: state.isStreaming,
+              thinking: state.thinking || undefined,
+              toolCalls: state.toolCalls.length > 0 ? state.toolCalls : undefined,
+              contentBlocks: state.contentBlocks.length > 0 ? state.contentBlocks : undefined,
+              ...extra,
+            };
+            return [...prev, newMsg];
           }
-          return tc;
         });
-        if (changed) toolCallsRef.current = updated;
-        return changed ? updated : null;
       };
 
       switch (delta.type) {
-        case 'text_delta': {
-          textRef.current += delta.text || '';
-          // ★ 新文本到来意味着之前的 running 工具已完成
-          const completedTools = finishRunningTools();
-          // ★ 只保留一个 text 块：移除旧的 text 块，在末尾重新添加
-          const blocksNoText = contentBlocksRef.current.filter(b => b.type !== 'text');
-          contentBlocksRef.current = [...blocksNoText, { type: 'text' }];
-          const blocks0 = contentBlocksRef.current;
-          setMessages((prev) =>
-            prev.map((m) =>
-              m.id === mid ? {
-                ...m,
-                content: textRef.current,
-                contentBlocks: blocks0,
-                ...(completedTools ? { toolCalls: completedTools } : {}),
-                streaming: true,
-              } : m
-            )
-          );
+        case 'text_delta':
+        case 'thinking':
+        case 'tool_start':
+        case 'tool_input':
+        case 'tool_result':
+          updateStreamingMessage();
           break;
-        }
-
-        case 'thinking': {
-          thinkingRef.current += delta.text || '';
-          // ★ 首次收到 thinking 时记录块顺序
-          if (!contentBlocksRef.current.some(b => b.type === 'thinking')) {
-            contentBlocksRef.current = [...contentBlocksRef.current, { type: 'thinking' }];
-          }
-          const blocks1 = contentBlocksRef.current;
-          setMessages((prev) =>
-            prev.map((m) =>
-              m.id === mid
-                ? { ...m, thinking: thinkingRef.current, contentBlocks: blocks1, streaming: true }
-                : m
-            )
-          );
-          break;
-        }
-
-        case 'tool_start': {
-          // ★ 新工具到来意味着之前的 running 工具已完成
-          finishRunningTools();
-          const tc: ToolCall = {
-            id: delta.toolCall?.id || '',
-            name: delta.toolCall?.name || 'unknown',
-            input: delta.toolCall?.input || '',
-            status: 'running',
-            startTime: Date.now(),
-          };
-          // 去重：同一 tool id 可能从 stream_event 和 AssistantMessage 各发一次
-          const exists = tc.id && toolCallsRef.current.some((t) => t.id === tc.id);
-          const newToolCalls = exists
-            ? toolCallsRef.current.map((t) =>
-                t.id === tc.id ? { ...t, input: tc.input || t.input } : t
-              )
-            : [...toolCallsRef.current, tc];
-          toolCallsRef.current = newToolCalls;
-          // ★ 新 tool 时追加 tool 块到有序列表
-          if (!exists) {
-            contentBlocksRef.current = [
-              ...contentBlocksRef.current,
-              { type: 'tool', toolIndex: newToolCalls.length - 1 },
-            ];
-          }
-          const blocks2 = contentBlocksRef.current;
-          console.log('[useChat] tool_start:', { id: tc.id, name: tc.name, exists, toolCallsCount: newToolCalls.length });
-          setMessages((prev) =>
-            prev.map((m) =>
-              m.id === mid
-                ? { ...m, toolCalls: newToolCalls, contentBlocks: blocks2, streaming: true }
-                : m
-            )
-          );
-          break;
-        }
-
-        case 'tool_input': {
-          const inputDelta = delta.toolCall?.inputDelta || '';
-          if (toolCallsRef.current.length > 0 && inputDelta) {
-            const last = toolCallsRef.current[toolCallsRef.current.length - 1];
-            last.input = (last.input || '') + inputDelta;
-            const newToolCalls = [...toolCallsRef.current];
-            toolCallsRef.current = newToolCalls;
-            setMessages((prev) =>
-              prev.map((m) =>
-                m.id === mid ? { ...m, toolCalls: newToolCalls } : m
-              )
-            );
-          }
-          break;
-        }
-
-        case 'tool_result': {
-          const resultId = delta.toolCall?.id || '';
-          const output = delta.toolCall?.output || '';
-          const status = delta.toolCall?.status || 'done';
-          // ★ Use duration from backend if available, otherwise calculate locally
-          const durationFromBackend = delta.toolCall?.duration;
-          console.log('[useChat] tool_result:', { resultId, status, toolCallsCount: toolCallsRef.current.length, duration: durationFromBackend });
-
-          let matched = false;
-          let newToolCalls = toolCallsRef.current.map((tc) => {
-            if (resultId && tc.id === resultId) {
-              matched = true;
-              const duration = durationFromBackend ?? (tc.startTime ? Date.now() - tc.startTime : undefined);
-              console.log('[useChat] tool matched by id:', { id: resultId, duration });
-              return { ...tc, output, status, duration };
-            }
-            return tc;
-          });
-
-          // ★ Fallback：ID 匹配失败时更新最后一个 running 工具（防止 tool_use_id 属性名问题）
-          if (!matched) {
-            console.warn('[useChat] tool_result id not matched, falling back to last running tool');
-            const lastRunningIdx = newToolCalls.reduceRight(
-              (found, tc, i) => (found === -1 && tc.status === 'running' ? i : found),
-              -1
-            );
-            if (lastRunningIdx >= 0) {
-              const tc = newToolCalls[lastRunningIdx];
-              const duration = durationFromBackend ?? (tc.startTime ? Date.now() - tc.startTime : undefined);
-              newToolCalls = [
-                ...newToolCalls.slice(0, lastRunningIdx),
-                { ...tc, output, status, duration },
-                ...newToolCalls.slice(lastRunningIdx + 1),
-              ];
-            }
-          }
-
-          toolCallsRef.current = newToolCalls;
-          setMessages((prev) =>
-            prev.map((m) =>
-              m.id === mid ? { ...m, toolCalls: newToolCalls } : m
-            )
-          );
-          break;
-        }
 
         case 'tool_end':
-          setMessages((prev) =>
-            prev.map((m) =>
-              m.id === mid
-                ? {
-                    ...m,
-                    toolCalls: (m.toolCalls || []).map((tc) =>
-                      tc.name === delta.toolCall?.name
-                        ? { ...tc, ...delta.toolCall }
-                        : tc
-                    ),
-                  }
-                : m
-            )
-          );
+          updateStreamingMessage();
           break;
 
         case 'done': {
-          // ★ 捕获快照，避免 setMessages 回调执行时 toolCallsRef 已被清空
-          const now = Date.now();
-          const elapsed = streamStartRef.current ? now - streamStartRef.current : undefined;
-          const finalToolCalls = toolCallsRef.current.map((tc) => {
-            if (tc.status === 'running' && tc.startTime) {
-              return {
-                ...tc,
-                status: 'done',
-                duration: now - tc.startTime,
-                output: tc.output || '(completed)',
-              };
-            }
-            return tc;
-          });
-
           setMessages((prev) =>
             prev.map((m) => {
               if (m.id !== mid) return m;
-              // ★ 无论哪条路径，都确保 running → done
-              // 当 toolCallsRef 被 error 事件清空时，直接修复 m.toolCalls 中残留的 running 状态
-              const resolvedToolCalls = finalToolCalls.length > 0
-                ? finalToolCalls
-                : (m.toolCalls || []).map((tc) =>
-                    tc.status === 'running'
-                      ? { ...tc, status: 'done', output: tc.output || '(completed)' }
-                      : tc
-                  );
-              return {
+              return buildStreamingMessage(state, {
                 ...m,
-                streaming: false,
-                toolCalls: resolvedToolCalls.length > 0 ? resolvedToolCalls : m.toolCalls,
                 ...(delta.usage ? { usage: delta.usage } : {}),
-                ...(elapsed ? { elapsed } : {}),
-              };
+              });
             })
           );
           setIsStreaming(false);
-          textRef.current = '';
-          thinkingRef.current = '';
-          toolCallsRef.current = [];
-          contentBlocksRef.current = [];
-          msgIdRef.current = null;
+          resetStreamAccumulators(sessionId);
           break;
         }
 
@@ -413,21 +312,18 @@ export function useChat(sessionId: string, backendId: string, backends?: any[], 
               m.id === mid
                 ? {
                     ...m,
-                    content: textRef.current + `\n\n**Error:** ${delta.error}`,
+                    content: state.text + `\n\n**Error:** ${delta.error}`,
                     streaming: false,
                   }
                 : m
             )
           );
           setIsStreaming(false);
-          textRef.current = '';
-          thinkingRef.current = '';
-          toolCallsRef.current = [];
-          contentBlocksRef.current = [];
+          resetStreamAccumulators(sessionId);
           break;
       }
     });
-  }, [sessionId]);
+  }, [sessionId, syncFromGlobalState]);
 
   // ── 添加系统消息（纯前端） ──
   const addSystemMessage = useCallback((content: string) => {
@@ -475,6 +371,11 @@ export function useChat(sessionId: string, backendId: string, backends?: any[], 
 
       setMessages((prev) => [...prev, userMsg, assistantMsg]);
       setIsStreaming(true);
+
+      // ★ 初始化全局流式状态
+      initStreamMessage(sessionId, assistantId);
+
+      // ★ 同步本地 refs
       textRef.current = '';
       thinkingRef.current = '';
       toolCallsRef.current = [];
@@ -540,8 +441,19 @@ export function useChat(sessionId: string, backendId: string, backends?: any[], 
             backendId,
           });
           if (result?.status === 'ok') {
-            // 后端会发 sessionUpdated 信号，useEffect 会自动重载
-            sys(`✅ 已压缩 ${result.removed} 条早期消息。`);
+            // ★ 直接从后端重载消息，不依赖 sessionUpdated 事件
+            const session = await api.loadSession(sessionId);
+            if (session?.messages) {
+              const reloaded = session.messages.map(normalizeMessage);
+              // 追加一条系统消息告知用户
+              const sysMsg: ChatMessage = {
+                id: crypto.randomUUID(),
+                role: 'system' as const,
+                content: `✅ 已压缩 ${result.removed} 条早期消息，保留最近 ${result.remaining} 条。`,
+                timestamp: Date.now() / 1000,
+              };
+              setMessages([...reloaded, sysMsg]);
+            }
           } else {
             sys(`ℹ️ ${result?.message || '压缩未执行'}`);
           }

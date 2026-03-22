@@ -11,15 +11,53 @@ interface Props {
   isStreaming: boolean;
   backends: any[];
   activeBackendId: string;
-  autoContinue?: boolean;
-  onAutoContinueChange?: (enabled: boolean) => void;
+  sessionId?: string;
   skipPermissions?: boolean;
   onSkipPermissionsChange?: (enabled: boolean) => void;
+  onCompact?: () => void;
 }
 
+// ═══════════════════════════════════════
+//  ★ 工具栏按钮组件
+// ═══════════════════════════════════════
+interface ToolbarBtnProps {
+  icon: string;
+  title: string;
+  active?: boolean;
+  onClick?: () => void;
+  loading?: boolean;
+}
+
+const ToolbarBtn: React.FC<ToolbarBtnProps> = ({ icon, title, active, onClick, loading }) => (
+  <button
+    onClick={onClick}
+    disabled={loading}
+    title={title}
+    style={{
+      display: 'inline-flex',
+      alignItems: 'center',
+      justifyContent: 'center',
+      gap: 4,
+      padding: '4px 8px',
+      fontSize: 11,
+      borderRadius: 6,
+      border: active ? '1px solid var(--theme-accent, #0969da)' : '1px solid var(--theme-border, rgba(0,0,0,0.12))',
+      background: active ? 'var(--theme-accent-bg, rgba(9,105,218,0.1))' : 'var(--theme-bg-secondary, #f6f8fa)',
+      color: active ? 'var(--theme-accent, #0969da)' : 'var(--theme-text-muted, #656d76)',
+      cursor: loading ? 'wait' : 'pointer',
+      transition: 'all 0.15s',
+      whiteSpace: 'nowrap',
+      opacity: loading ? 0.6 : 1,
+    }}
+  >
+    <span style={{ fontSize: 12 }}>{icon}</span>
+    <span>{title}</span>
+  </button>
+);
+
 const ChatInputInner: React.FC<Props> = ({
-  onSend, onAbort, isStreaming, backends, activeBackendId, autoContinue,
-  onAutoContinueChange, skipPermissions = true, onSkipPermissionsChange,
+  onSend, onAbort, isStreaming, backends, activeBackendId, sessionId,
+  skipPermissions = true, onSkipPermissionsChange, onCompact,
 }) => {
   const ref = useRef<HTMLTextAreaElement>(null);
   const { images, removeImage, clearImages } = useClipboardImage();
@@ -50,6 +88,11 @@ const ChatInputInner: React.FC<Props> = ({
   filteredCommandsRef.current = filteredCommands;
   const selectedIndexRef = useRef(0);
   selectedIndexRef.current = selectedIndex;
+
+  // ── 清理上下文 ──
+  const handleCompact = useCallback(() => {
+    onCompact?.();
+  }, [onCompact]);
 
   // ── 发送 ──
   const handleSend = useCallback(() => {
@@ -182,22 +225,19 @@ const ChatInputInner: React.FC<Props> = ({
 
   return (
     <div style={{ padding: '8px 16px 12px', borderTop: '1px solid var(--theme-border, rgba(0,0,0,0.12))', background: 'var(--theme-bg, #ffffff)', position: 'relative' }}>
-      {/* 顶部栏：自动续跑指示器 + 权限模式 */}
-      <div style={{ display: 'flex', gap: 8, marginBottom: 6, alignItems: 'center', flexWrap: 'wrap' }}>
-        {autoContinue && (
-          <span style={{ fontSize: 10, color: 'var(--theme-accent, #0969da)', display: 'flex', alignItems: 'center', gap: 3 }}>
-            ⟳ 自动续跑
-          </span>
-        )}
-        <label style={{ fontSize: 10, color: 'var(--theme-text-muted, #656d76)', display: 'flex', alignItems: 'center', gap: 4, cursor: 'pointer' }}>
-          <input
-            type="checkbox"
-            checked={skipPermissions}
-            onChange={(e) => onSkipPermissionsChange?.(e.target.checked)}
-            style={{ accentColor: 'var(--theme-accent, #0969da)', width: 14, height: 14 }}
-          />
-          ⚡ 跳过确认
-        </label>
+      {/* ★ 工具栏：统一的图标按钮 */}
+      <div style={{ display: 'flex', gap: 6, marginBottom: 6, alignItems: 'center', flexWrap: 'wrap' }}>
+        <ToolbarBtn
+          icon="⚡"
+          title="跳过确认"
+          active={skipPermissions}
+          onClick={() => onSkipPermissionsChange?.(!skipPermissions)}
+        />
+        <ToolbarBtn
+          icon="🗜"
+          title="清理上下文"
+          onClick={handleCompact}
+        />
       </div>
 
       <ImagePreview images={images} onRemove={removeImage} />

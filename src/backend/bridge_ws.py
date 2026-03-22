@@ -145,6 +145,8 @@ class BridgeWS:
         self._clients: set = set()
         # ★ Permission gate: session_id → Future[bool]
         self._permission_gates: dict[str, "asyncio.Future[bool]"] = {}
+        # ★ Skip rest flags: session_id → True if user selected "skip rest"
+        self._skip_rest_sessions: set[str] = set()
 
     # ── WebSocket 基础设施 ───────────────────────────────────────
 
@@ -254,7 +256,17 @@ class BridgeWS:
             session = self._active_sessions.get(session_id)
             if session:
                 session.auto_continue = payload.get("args", {}).get("enabled", True)
+                # ★ 同步保存，避免竞态条件
+                self._session_store.save(session, async_=False)
             return json.dumps({"status": "ok", "autoContinue": session.auto_continue if session else True})
+
+        elif command == "set_skip_permissions":
+            session = self._active_sessions.get(session_id)
+            if session:
+                session.skip_permissions = payload.get("args", {}).get("enabled", True)
+                # ★ 同步保存，避免竞态条件
+                self._session_store.save(session, async_=False)
+            return json.dumps({"status": "ok", "skipPermissions": session.skip_permissions if session else True})
 
         return json.dumps({"status": "error", "message": f"未知命令: {command}"})
 
@@ -527,11 +539,28 @@ class BridgeWS:
 
     # ── 权限门控 RPC ─────────────────────────────────────────────
 
-    def _rpc_grantPermission(self, session_id: str, granted: bool) -> None:
-        """前端响应权限请求：granted=True 继续执行，False 取消。"""
+    def _rpc_grantPermission(self, session_id: str, granted: bool, skip_rest: bool = False) -> None:
+        """前端响应权限请求：granted=True 继续执行，False 取消。
+        skip_rest=True 表示后续工具自动授权（用户点击了"跳过后续确认"）。
+        """
         gate = self._permission_gates.get(session_id)
         if gate and not gate.done():
-            gate.set_result(granted)
+            try:
+                gate.set_result(granted)
+            except asyncio.InvalidStateError:
+                pass  # 超时已处理，忽略
+        # ★ 记录 skip_rest 标志，后续权限检查时跳过
+        if skip_rest and granted:
+            self._skip_rest_sessions.add(session_id)
+            print(f"[bridge_ws] Session {session_id} 设置 skip_rest=True", file=sys.stderr, flush=True)
+
+    def _check_skip_permission(self, session_id: str) -> bool:
+        """检查 session 是否已设置跳过权限确认。"""
+        return session_id in self._skip_rest_sessions
+
+    def _clear_skip_permission(self, session_id: str):
+        """清除 session 的跳过权限标志（消息结束时调用）。"""
+        self._skip_rest_sessions.discard(session_id)
 
     async def _await_permission_grant(
         self,
@@ -752,6 +781,11 @@ class BridgeWS:
                 # ★ 权限回调：用于工具执行前的权限确认
                 async def _on_permission_request(req: PermissionRequest) -> bool:
                     """处理来自 backend 的权限请求，转发给前端等待确认。"""
+                    # ★ 检查是否已设置跳过权限确认
+                    if session.id in self._skip_rest_sessions:
+                        print(f"[bridge_ws] Session {session.id} 已设置 skip_rest，自动授权", file=sys.stderr, flush=True)
+                        return True
+
                     # 创建 ToolCallInfo 列表
                     from ..types import ToolCallInfo
                     tools = [ToolCallInfo(
@@ -823,20 +857,24 @@ class BridgeWS:
                 success = False
                 break
 
-        assistant_msg.content = "".join(all_text)
-        assistant_msg.streaming = False
-        if all_tool_calls:
-            assistant_msg.tool_calls = all_tool_calls
-        if all_thinking:
-            assistant_msg.thinking_blocks = [ThinkingBlock(content="".join(all_thinking))]
+        try:
+            assistant_msg.content = "".join(all_text)
+            assistant_msg.streaming = False
+            if all_tool_calls:
+                assistant_msg.tool_calls = all_tool_calls
+            if all_thinking:
+                assistant_msg.thinking_blocks = [ThinkingBlock(content="".join(all_thinking))]
 
-        final_usage = None
-        if total_input_tokens or total_output_tokens:
-            final_usage = {"inputTokens": total_input_tokens, "outputTokens": total_output_tokens}
-            assistant_msg.usage = final_usage
+            final_usage = None
+            if total_input_tokens or total_output_tokens:
+                final_usage = {"inputTokens": total_input_tokens, "outputTokens": total_output_tokens}
+                assistant_msg.usage = final_usage
 
-        if success:
-            self._emit_delta(StreamDelta(session.id, message_id, "done", usage=final_usage))
+            # ★ 无论成功失败都发 done，确保前端不会卡在 streaming 状态
+            self._emit_delta(StreamDelta(session.id, message_id, "done", usage=final_usage if success else None))
+        finally:
+            # ★ 确保 skip_rest 标志始终被清除，即使异常路径也不泄漏
+            self._clear_skip_permission(session.id)
 
         session.updated_at = time.time()
         if session.title in ("新会话", "New session", "") and content:

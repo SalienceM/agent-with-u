@@ -96,19 +96,18 @@ export const App: React.FC = () => {
     setVisibleCount(6);  // ★ 切换 session 时重置为只显示最近几条
     api.loadSession(activeSessionId).then((session) => {
       setActiveSession(session);
+      // ★ 从 session 加载 skipPermissions 状态
+      if (session?.skipPermissions !== undefined) {
+        setSkipPermissions(session.skipPermissions);
+      }
     });
   }, [activeSessionId]);
 
   // Phase 2: 每 Session 独立的模型配置
   const activeBackendId = activeSession?.backendId || backends[0]?.id || '';
 
-  /* ---- 切换 backend 时同步 skipPermissions 默认值 ---- */
-  useEffect(() => {
-    const activeBackend = backends.find((b) => b.id === activeBackendId);
-    if (activeBackend) {
-      setSkipPermissions(activeBackend.skipPermissions !== false);
-    }
-  }, [activeBackendId, backends]);
+  // ★ skipPermissions 现在是 session 级别的设置，完全由 session 控制
+  // 不再从 backend 同步默认值，避免覆盖用户设置
 
   const chat = useChat(activeSessionId || '', activeBackendId, backends, skipPermissions);
 
@@ -244,24 +243,21 @@ export const App: React.FC = () => {
   const handleDeleteBackend = useCallback(async (id: string, dependentSessions: any[] = [], targetBackendId?: string) => {
     // If there are dependent sessions and a target backend is specified, migrate them
     if (dependentSessions.length > 0 && targetBackendId) {
+      let newActiveId: string | null = null;
       // Migrate all dependent sessions to the target backend
       for (const session of dependentSessions) {
-        await api.migrateSession(session.id, targetBackendId);
+        const result = await api.migrateSession(session.id, targetBackendId);
+        // ★ 如果迁移的是当前活跃 session，记住新 session ID
+        if (session.id === activeSessionId && result?.newSessionId) {
+          newActiveId = result.newSessionId;
+        }
       }
       // Refresh sessions after migration
       const sessionList = await api.listSessions();
       setSessions(sessionList);
-      // If active session was affected, switch to the new migrated session
-      if (activeSessionId && dependentSessions.some(s => s.id === activeSessionId)) {
-        // Find the new session ID (migrated one)
-        const newSession = sessionList.find((s: any) =>
-          dependentSessions.some(ds => ds.id === s.id) === false &&
-          s.backendId === targetBackendId &&
-          s.workingDir === dependentSessions.find(ds => ds.id === activeSessionId)?.workingDir
-        );
-        if (newSession) {
-          setActiveSessionId(newSession.id);
-        }
+      // ★ 直接用迁移返回的 newSessionId 切换，避免匹配逻辑错误
+      if (newActiveId) {
+        setActiveSessionId(newActiveId);
       }
     }
 
@@ -473,6 +469,35 @@ export const App: React.FC = () => {
                     renderMarkdown={config.renderMarkdown}
                   />
                 ))}
+                {/* ★ 行内权限确认组件 */}
+                {chat.pendingPermission && (
+                  <div style={{
+                    display: 'flex',
+                    justifyContent: 'flex-start',
+                    padding: '4px 16px',
+                  }}>
+                    <div style={{
+                      width: 28, height: 28, borderRadius: '50%', flexShrink: 0,
+                      background: 'var(--theme-accent, #7aa2f7)',
+                      display: 'flex', alignItems: 'center', justifyContent: 'center',
+                      fontSize: 13, color: '#fff', fontWeight: 700, marginRight: 8, marginTop: 2,
+                    }}>A</div>
+                    <div style={{
+                      maxWidth: '80%',
+                      minWidth: 280,
+                      borderRadius: '12px 12px 12px 4px',
+                      background: 'var(--theme-message-bg, #f6f8fa)',
+                      border: '1px solid var(--theme-border, rgba(0,0,0,0.12))',
+                      overflow: 'hidden',
+                    }}>
+                      <PermissionGate
+                        request={chat.pendingPermission}
+                        onDismiss={chat.clearPermission}
+                        onSkipRest={() => setSkipPermissions(true)}
+                      />
+                    </div>
+                  </div>
+                )}
               </>
             );
           })()}
@@ -486,9 +511,21 @@ export const App: React.FC = () => {
           isStreaming={chat.isStreaming}
           backends={backends}
           activeBackendId={activeBackendId}
-          autoContinue={chat.autoContinue}
+          sessionId={activeSessionId || undefined}
           skipPermissions={skipPermissions}
-          onSkipPermissionsChange={setSkipPermissions}
+          onSkipPermissionsChange={(enabled) => {
+            setSkipPermissions(enabled);
+            // ★ 保存到 session
+            if (activeSessionId) {
+              api.executeCommand({
+                command: 'set_skip_permissions',
+                sessionId: activeSessionId,
+                backendId: activeBackendId,
+                args: { enabled },
+              });
+            }
+          }}
+          onCompact={() => chat.sendMessage('/clear')}
         />
       </div>
 
@@ -558,15 +595,6 @@ export const App: React.FC = () => {
             <div style={{ fontSize: 15, fontWeight: 600, color: 'var(--theme-text, #e6edf3)' }}>导入中，请稍候…</div>
           </div>
         </div>
-      )}
-
-      {/* ---- 权限确认弹框 ---- */}
-      {chat.pendingPermission && (
-        <PermissionGate
-          request={chat.pendingPermission}
-          onDismiss={chat.clearPermission}
-          onAllowSession={() => setSkipPermissions(true)}
-        />
       )}
 
       {/* ---- Toast 通知 ---- */}

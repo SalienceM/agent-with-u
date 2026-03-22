@@ -71,9 +71,11 @@ class SessionStore:
         if self._index_path.exists():
             try:
                 data = json.loads(self._index_path.read_text(encoding="utf-8"))
-                self._index = {item["id"]: item for item in data}
+                with self._lock:
+                    self._index = {item["id"]: item for item in data}
             except Exception:
-                self._index = {}
+                with self._lock:
+                    self._index = {}
 
     def _save_index_sync(self):
         """Synchronously save index (used on shutdown)."""
@@ -97,7 +99,9 @@ class SessionStore:
         return self._dir / f"{sid}.json"
 
     def list(self) -> list[dict]:
-        return sorted(self._index.values(), key=lambda x: x.get("updatedAt", 0), reverse=True)
+        with self._lock:
+            snapshot = list(self._index.values())
+        return sorted(snapshot, key=lambda x: x.get("updatedAt", 0), reverse=True)
 
     def load(self, sid: str) -> Optional[Session]:
         path = self._session_path(sid)
@@ -133,6 +137,8 @@ class SessionStore:
                 backend_id=data["backendId"],
                 agent_session_id=data.get("agentSessionId"),
                 working_dir=data.get("workingDir"),
+                auto_continue=data.get("autoContinue", True),
+                skip_permissions=data.get("skipPermissions", True),
             )
         except Exception as e:
             print(f"Failed to load session {sid}: {e}")
@@ -164,7 +170,8 @@ class SessionStore:
         )
 
         # ★ Update index in memory
-        self._index[session.id] = session.meta_dict()
+        with self._lock:
+            self._index[session.id] = session.meta_dict()
 
         # ★ Debounced index save (reduces I/O from 2 writes → 1 delayed write)
         self._save_index_debounced()
@@ -174,7 +181,8 @@ class SessionStore:
         try:
             if path.exists():
                 path.unlink()
-            self._index.pop(sid, None)
+            with self._lock:
+                self._index.pop(sid, None)
             self._save_index_sync()
             return True
         except Exception:
@@ -232,15 +240,13 @@ class SessionStore:
                         # Copy and merge index
                         index_src = sessions_dir / "index.json"
                         if index_src.exists():
-                            # Load existing index
-                            existing_ids = set(self._index.keys())
                             # Load imported index
                             imported_data = json.loads(index_src.read_text(encoding="utf-8"))
                             imported_index = {item["id"]: item for item in imported_data}
                             # Merge: imported data overwrites existing
-                            self._index.update(imported_index)
-                            # Mark dirty for save
-                            self._index_dirty = True
+                            with self._lock:
+                                self._index.update(imported_index)
+                                self._index_dirty = True
                             self._save_index_sync()
 
                     # Reload index to sync with disk

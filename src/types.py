@@ -163,6 +163,8 @@ class Session:
     agent_session_id: Optional[str] = None
     # Auto-continue on max_tokens
     auto_continue: bool = True
+    # ★ Skip permission confirmation for sensitive tools (Bash/Edit/Write)
+    skip_permissions: bool = True
     # Max continuation attempts
     max_continuations: int = 10
     # Track which backend config was used for each message
@@ -179,6 +181,7 @@ class Session:
             "backendId": self.backend_id,
             "agentSessionId": self.agent_session_id,
             "autoContinue": self.auto_continue,
+            "skipPermissions": self.skip_permissions,
             "maxContinuations": self.max_continuations,
         }
 

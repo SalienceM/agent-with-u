@@ -367,8 +367,8 @@ export const api = {
     try { return JSON.parse(result); } catch { return { model: '' }; }
   },
 
-  async grantPermission(sessionId: string, granted: boolean): Promise<void> {
-    await send('grantPermission', sessionId, granted);
+  async grantPermission(sessionId: string, granted: boolean, skipRest: boolean = false): Promise<void> {
+    await send('grantPermission', sessionId, granted, skipRest);
   },
 
   onPermissionRequest(callback: PermissionRequestCallback): () => void {
