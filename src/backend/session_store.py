@@ -25,12 +25,11 @@ class SessionStore:
         self._dir.mkdir(parents=True, exist_ok=True)
         self._index_path = self._dir / "index.json"
         self._index: dict[str, dict] = {}
-        self._load_index()
-
         # ★ Debounced index save
         self._index_dirty = False
         self._index_save_timer: Optional[threading.Timer] = None
         self._lock = threading.Lock()
+        self._load_index()
 
         # ★ Worker thread for async file I/O
         self._io_queue: list = []
