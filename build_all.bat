@@ -78,11 +78,12 @@ set "CURRENT_VERSION=!CURRENT_VERSION:"=!"
 set "CURRENT_VERSION=!CURRENT_VERSION: =!"
 set "CURRENT_VERSION=!CURRENT_VERSION:,=!"
 echo [INFO] Current version in config: !CURRENT_VERSION!
-:: Use YYYY.MMDD.0 format: each component fits in 16-bit (max 65535) required by MSI/WiX bundler
-:: 0.1.20260323 would exceed 65535 for patch; 2026.323.0 is safe
-for /f %%a in ('powershell -NoProfile -Command "(Get-Date).Year"') do set VER_YEAR=%%a
-for /f %%a in ('powershell -NoProfile -Command "[int](Get-Date -Format MMdd)"') do set VER_MMDD=%%a
-set "NEW_VERSION=!VER_YEAR!.!VER_MMDD!.0"
+:: Use YY.MM.DD format: MSI requires MAJOR<=255, MINOR<=255, PATCH<=65535
+:: e.g. 2026-03-23 → 26.3.23 (all components fit)
+for /f %%a in ('powershell -NoProfile -Command "[int](Get-Date -Format yy)"') do set VER_YY=%%a
+for /f %%a in ('powershell -NoProfile -Command "(Get-Date).Month"') do set VER_MM=%%a
+for /f %%a in ('powershell -NoProfile -Command "(Get-Date).Day"') do set VER_DD=%%a
+set "NEW_VERSION=!VER_YY!.!VER_MM!.!VER_DD!"
 echo [INFO] New version will be: !NEW_VERSION!
 :: Update version in tauri.conf.json using Python (avoids cmd pipe/quoting issues with PowerShell)
 python -c "import json; f='src-tauri/tauri.conf.json'; d=json.load(open(f,encoding='utf-8')); d['version']='!NEW_VERSION!'; open(f,'w',encoding='utf-8').write(json.dumps(d,ensure_ascii=False,indent=2)+'\n')"
