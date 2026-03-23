@@ -1,6 +1,3 @@
-build_all.bat
-build_backend.bat
-build_frontend.bat
 __pycache__/
 *.pyc
 *.pyo
