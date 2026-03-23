@@ -292,13 +292,26 @@ export function useChat(sessionId: string, backendId: string, backends?: any[], 
           break;
 
         case 'done': {
+          // ★ 捕获最终状态快照，防止 resetStreamAccumulators 在 React 批量更新前清空
+          const finalText = state.text;
+          const finalThinking = state.thinking || undefined;
+          const finalToolCalls = state.toolCalls.length > 0 ? [...state.toolCalls] : undefined;
+          const finalBlocks = state.contentBlocks.length > 0 ? [...state.contentBlocks] : undefined;
+          const finalElapsed = state.streamStart ? Date.now() - state.streamStart : undefined;
+
           setMessages((prev) =>
             prev.map((m) => {
               if (m.id !== mid) return m;
-              return buildStreamingMessage(state, {
+              return {
                 ...m,
+                content: finalText,
+                thinking: finalThinking,
+                toolCalls: finalToolCalls,
+                contentBlocks: finalBlocks,
+                streaming: false,
+                elapsed: finalElapsed,
                 ...(delta.usage ? { usage: delta.usage } : {}),
-              });
+              };
             })
           );
           setIsStreaming(false);
@@ -306,13 +319,15 @@ export function useChat(sessionId: string, backendId: string, backends?: any[], 
           break;
         }
 
-        case 'error':
+        case 'error': {
+          // ★ 同样先捕获快照
+          const errText = state.text;
           setMessages((prev) =>
             prev.map((m) =>
               m.id === mid
                 ? {
                     ...m,
-                    content: state.text + `\n\n**Error:** ${delta.error}`,
+                    content: errText + `\n\n**Error:** ${delta.error}`,
                     streaming: false,
                   }
                 : m
@@ -321,6 +336,7 @@ export function useChat(sessionId: string, backendId: string, backends?: any[], 
           setIsStreaming(false);
           resetStreamAccumulators(sessionId);
           break;
+        }
       }
     });
   }, [sessionId, syncFromGlobalState]);
