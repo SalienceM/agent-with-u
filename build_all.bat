@@ -74,16 +74,17 @@ echo.
 for /f "tokens=2 delims=:" %%a in ('findstr /i "^  \"version\"" "src-tauri\tauri.conf.json"') do (
     set "CURRENT_VERSION=%%a"
 )
-set "CURRENT_VERSION=!CURRENT_VERSION:~=!"
 set "CURRENT_VERSION=!CURRENT_VERSION:"=!"
 set "CURRENT_VERSION=!CURRENT_VERSION: =!"
+set "CURRENT_VERSION=!CURRENT_VERSION:,=!"
 echo [INFO] Current version in config: !CURRENT_VERSION!
 :: Use PowerShell for locale-independent date (avoids YYYY/MM/DD vs MM/DD/YYYY issues)
 for /f %%a in ('powershell -NoProfile -Command "Get-Date -Format yyyyMMdd"') do set TODAY=%%a
 set "NEW_VERSION=0.1.!TODAY!"
 echo [INFO] New version will be: !NEW_VERSION!
-:: Update version in tauri.conf.json
-powershell -NoProfile -Command "(Get-Content 'src-tauri\tauri.conf.json' -Raw) -replace '\"version\": \"[^\"]+\"', '\"version\": \"!NEW_VERSION!\"' | Set-Content 'src-tauri\tauri.conf.json'"
+:: Update version in tauri.conf.json using Python (avoids cmd pipe/quoting issues with PowerShell)
+python -c "import json; f='src-tauri/tauri.conf.json'; d=json.load(open(f,encoding='utf-8')); d['version']='!NEW_VERSION!'; open(f,'w',encoding='utf-8').write(json.dumps(d,ensure_ascii=False,indent=2)+'\n')"
+if errorlevel 1 ( echo [WARN] Version update failed, continuing with current version )
 echo [OK] Updated tauri.conf.json version to !NEW_VERSION!
 :: ============================================================
 :: Step 1: PyInstaller - package Python sidecar
