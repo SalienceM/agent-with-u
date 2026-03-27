@@ -576,7 +576,8 @@ class ClaudeCodeOfficialBackend(ModelBackend):
                     return p
         return "claude"
 
-    def _build_cmd(self, content: str, agent_session_id: Optional[str], cwd: str) -> list[str]:
+    def _build_cmd(self, content: str, agent_session_id: Optional[str], cwd: str,
+                   image_paths: Optional[list[str]] = None) -> list[str]:
         import os as _os
         cmd = [self._resolve_cli()]
 
@@ -598,6 +599,10 @@ class ClaudeCodeOfficialBackend(ModelBackend):
         skip_permissions = getattr(self.config, "skip_permissions", True)
         if skip_permissions:
             cmd.append("--dangerously-skip-permissions")
+
+        # ★ 附加图片文件（每张图通过 --image 传给 claude CLI）
+        for img_path in (image_paths or []):
+            cmd.extend(["--image", img_path])
 
         cmd.extend(["-p", content])
         return cmd
@@ -706,7 +711,32 @@ class ClaudeCodeOfficialBackend(ModelBackend):
                 on_delta(StreamDelta(session_id, message_id, delta_type, **kwargs))
 
         cwd = working_dir or getattr(self.config, "working_dir", None) or "."
-        cmd = self._build_cmd(content, agent_session_id, cwd)
+
+        # ★ 将图片解码写入临时文件，通过 --image 传给 claude CLI
+        import base64 as _b64
+        import tempfile as _tempfile
+        _tmp_image_files: list[str] = []
+        if images:
+            for img in images:
+                img_b64 = img.base64
+                if not img_b64 and img.file_path and os.path.exists(img.file_path):
+                    with open(img.file_path, "rb") as f:
+                        img_b64 = _b64.b64encode(f.read()).decode("ascii")
+                if img_b64:
+                    mime = img.mime_type or "image/png"
+                    ext = "." + mime.split("/")[-1]
+                    if ext == ".jpeg":
+                        ext = ".jpg"
+                    fd, tmp_path = _tempfile.mkstemp(suffix=ext)
+                    try:
+                        os.write(fd, _b64.b64decode(img_b64))
+                    finally:
+                        os.close(fd)
+                    _tmp_image_files.append(tmp_path)
+            print(f"[OfficialBackend] images: {len(_tmp_image_files)} temp file(s) written",
+                  file=sys.stderr, flush=True)
+
+        cmd = self._build_cmd(content, agent_session_id, cwd, _tmp_image_files)
         proc_env = self._build_env()
 
         auth_token = proc_env.get("ANTHROPIC_AUTH_TOKEN", "")
@@ -924,6 +954,14 @@ class ClaudeCodeOfficialBackend(ModelBackend):
             emit("done", **(_usage and {"usage": _usage} or {}))
 
         await asyncio.shield(fut)   # 等待线程退出，避免资源泄漏
+
+        # ★ 清理临时图片文件
+        for tmp in _tmp_image_files:
+            try:
+                os.unlink(tmp)
+            except Exception:
+                pass
+
         return {"agentSessionId": _new_agent_sid}
 
 
