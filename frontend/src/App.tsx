@@ -33,7 +33,7 @@ export const App: React.FC = () => {
   const [toast, setToast] = useState<{ type: 'success' | 'error' | 'info'; message: string } | null>(null);
   const [isImporting, setIsImporting] = useState(false);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
-  const [visibleCount, setVisibleCount] = useState(6);  // ★ 默认显示最近几条（3轮对话）
+  const [visibleCount, setVisibleCount] = useState(6);  // ★ 默认显示最近几条（3 轮对话）
   const toastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   // ★ Track if initial session check has been done to prevent re-opening dialog
   const initialCheckDoneRef = useRef(false);
@@ -409,6 +409,14 @@ export const App: React.FC = () => {
           >
             Migrate
           </button>
+          {/* 日志查看器按钮 */}
+          <button
+            onClick={() => api.openLogViewer()}
+            style={logBtnStyle}
+            title="View real-time logs in external window"
+          >
+            📋 Logs
+          </button>
           <button
             onClick={() => setSettingsOpen(true)}
             style={settingsBtnStyle}
@@ -674,6 +682,19 @@ const migrateBtnStyle: React.CSSProperties = {
   borderRadius: 6,
   transition: 'all 0.15s',
   marginRight: 8,
+};
+
+const logBtnStyle: React.CSSProperties = {
+  background: 'var(--theme-success-bg, #2da44e1a)',
+  border: '1px solid var(--theme-success-border, #2da44e33)',
+  color: 'var(--theme-success, #2da44e)',
+  fontSize: 12,
+  cursor: 'pointer',
+  padding: '4px 10px',
+  borderRadius: 6,
+  transition: 'all 0.15s',
+  marginRight: 8,
+  fontWeight: 500,
 };
 
 /* ---- Phase 3: Migrate Dialog Component ---- */

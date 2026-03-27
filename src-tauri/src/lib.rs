@@ -1,10 +1,56 @@
-use tauri_plugin_shell::ShellExt;
-
 const WS_PORT: u16 = 44321;
 
 #[tauri::command]
 fn get_ws_port() -> u16 {
     WS_PORT
+}
+
+#[tauri::command]
+fn open_log_viewer(_app: tauri::AppHandle) -> Result<(), String> {
+    // 获取日志文件路径
+    let log_path = if cfg!(target_os = "windows") {
+        let app_data = std::env::var("APPDATA").unwrap_or_else(|_| {
+            dirs::data_local_dir()
+                .unwrap_or_else(|| dirs::home_dir().unwrap_or_default())
+                .to_string_lossy()
+                .to_string()
+        });
+        format!("{}\\AgentWithU\\logs\\backend.log", app_data)
+    } else {
+        let home = dirs::home_dir().unwrap_or_default();
+        format!("{}/.agent-with-u/logs/backend.log", home.to_string_lossy())
+    };
+
+    // 在外部窗口打开日志文件
+    #[cfg(target_os = "windows")]
+    {
+        // Windows: 使用 cmd 打开 tail -f 类似的功能
+        let _ = std::process::Command::new("cmd")
+            .args(["/C", "start", "AgentWithU Logs", "powershell", "-NoExit", "-Command",
+                   &format!("Get-Content '{}' -Wait -Tail 50", log_path)])
+            .spawn();
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let _ = std::process::Command::new("open")
+            .args(["-a", "Terminal", "tail", "-f", &log_path])
+            .spawn();
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let _ = std::process::Command::new("gnome-terminal")
+            .args(["--", "bash", "-c", &format!("tail -f {}", log_path)])
+            .spawn()
+            .or_else(|_| {
+                std::process::Command::new("xterm")
+                    .args(["-e", "tail", "-f", &log_path])
+                    .spawn()
+            });
+    }
+
+    Ok(())
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -18,9 +64,10 @@ pub fn run() {
             //   python -m src.ws_main
             #[cfg(not(debug_assertions))]
             {
+                use tauri_plugin_shell::ShellExt;
                 match app.shell().sidecar("agent-with-u-backend") {
                     Ok(sidecar) => {
-                        let _ = sidecar.spawn();
+                        sidecar.spawn().ok();
                     }
                     Err(e) => {
                         eprintln!("[tauri] sidecar spawn failed: {e}");
@@ -29,7 +76,7 @@ pub fn run() {
             }
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![get_ws_port])
+        .invoke_handler(tauri::generate_handler![get_ws_port, open_log_viewer])
         .run(tauri::generate_context!())
         .expect("error while running AgentWithU");
 }

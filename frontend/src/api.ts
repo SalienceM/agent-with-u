@@ -381,6 +381,18 @@ export const api = {
     permissionRequestCallbacks.push(callback);
     return () => { permissionRequestCallbacks = permissionRequestCallbacks.filter((cb) => cb !== callback); };
   },
+
+  /** 打开外部 cmd 窗口实时刷日志 */
+  async openLogViewer(): Promise<void> {
+    if (isTauri()) {
+      try {
+        const { invoke } = await import('@tauri-apps/api/core');
+        await invoke('open_log_viewer');
+      } catch (e) {
+        console.error('Failed to open log viewer:', e);
+      }
+    }
+  },
 };
 
 // ═══════════════════════════════════════

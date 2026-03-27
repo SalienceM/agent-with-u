@@ -203,7 +203,18 @@ class BridgeWS:
 
     def _rpc_readClipboardImage(self) -> str:
         img = _read_clipboard_image_native()
-        return json.dumps(img, ensure_ascii=False) if img else "null"
+        if img is None:
+            return "null"
+        # 返回与 ImageAttachment dataclass 字段一致的结构，方便后端直接 ImageAttachment(**img)
+        attachment = {
+            "id": new_id(),
+            "base64": img["data"],
+            "mime_type": img["mimeType"],
+            "size": 0,
+            "width": img.get("width"),
+            "height": img.get("height"),
+        }
+        return json.dumps(attachment, ensure_ascii=False)
 
     # ── RPC: 聊天 ────────────────────────────────────────────────
 

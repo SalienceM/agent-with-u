@@ -221,8 +221,10 @@ def _ensure_single_instance(port: int) -> None:
 
 
 async def main():
+    # 初始化日志系统
     log_file = setup_logging()
     logging.info(f"[ws_main] Log file: {log_file}")
+
     patch_npm_path()
     load_claude_settings()
 
