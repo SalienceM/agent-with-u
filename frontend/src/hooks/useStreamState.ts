@@ -217,6 +217,9 @@ export function processStreamDelta(sessionId: string, delta: any): {
 
     case 'error': {
       state.isStreaming = false;
+      // ★ 保存错误信息到 text，让前端能显示错误
+      const errorMsg = delta.error || '未知错误';
+      state.text = state.text + `\n\n**错误**: ${errorMsg}`;
       break;
     }
   }

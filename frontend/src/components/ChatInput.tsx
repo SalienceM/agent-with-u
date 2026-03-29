@@ -1,9 +1,12 @@
-import React, { useRef, useCallback, useEffect, memo, useState } from 'react';
+import React, { useRef, useCallback, useEffect, memo, useState, useMemo } from 'react';
 import { ImagePreview } from './ImagePreview';
 import { useClipboardImage } from '../hooks/useClipboardImage';
 import type { ImageAttachment } from '../hooks/useClipboardImage';
 import { SLASH_COMMANDS } from '../hooks/useChat';
 import type { SlashCommand } from '../hooks/useChat';
+import { api } from '../api';
+
+type FileEntry = { name: string; path: string; isDir: boolean };
 
 interface Props {
   onSend: (content: string, images?: ImageAttachment[]) => void;
@@ -12,6 +15,7 @@ interface Props {
   backends: any[];
   activeBackendId: string;
   sessionId?: string;
+  workingDir?: string;
   skipPermissions?: boolean;
   onSkipPermissionsChange?: (enabled: boolean) => void;
   onCompact?: () => void;
@@ -56,7 +60,7 @@ const ToolbarBtn: React.FC<ToolbarBtnProps> = ({ icon, title, active, onClick, l
 );
 
 const ChatInputInner: React.FC<Props> = ({
-  onSend, onAbort, isStreaming, backends, activeBackendId, sessionId,
+  onSend, onAbort, isStreaming, backends, activeBackendId, sessionId, workingDir,
   skipPermissions = true, onSkipPermissionsChange, onCompact,
 }) => {
   const ref = useRef<HTMLTextAreaElement>(null);
@@ -89,10 +93,97 @@ const ChatInputInner: React.FC<Props> = ({
   const selectedIndexRef = useRef(0);
   selectedIndexRef.current = selectedIndex;
 
+  // ═══════════════════════════════════════
+  //  ★ @ 文件选择器状态
+  // ═══════════════════════════════════════
+  const [showFilePicker, setShowFilePicker] = useState(false);
+  const [fileEntries, setFileEntries] = useState<FileEntry[]>([]);
+  const [fileSelectedIndex, setFileSelectedIndex] = useState(0);
+  const [currentDir, setCurrentDir] = useState('');
+  const [fileQuery, setFileQuery] = useState('');
+  const filePopupRef = useRef<HTMLDivElement>(null);
+
+  const showFilePickerRef = useRef(false);
+  showFilePickerRef.current = showFilePicker;
+  const fileEntriesRef = useRef<FileEntry[]>([]);
+  fileEntriesRef.current = fileEntries;
+  const fileSelectedIndexRef = useRef(0);
+  fileSelectedIndexRef.current = fileSelectedIndex;
+  const fileQueryRef = useRef('');
+  fileQueryRef.current = fileQuery;
+  const currentDirRef = useRef('');
+  currentDirRef.current = currentDir;
+  const workingDirRef = useRef(workingDir);
+  workingDirRef.current = workingDir;
+
   // ── 清理上下文 ──
   const handleCompact = useCallback(() => {
     onCompact?.();
   }, [onCompact]);
+
+  // ═══════════════════════════════════════
+  //  ★ @ 文件选择器 helpers
+  // ═══════════════════════════════════════
+
+  // 计算父目录（跨平台）
+  const getParentDir = (dirPath: string): string | null => {
+    const normalized = dirPath.replace(/\\/g, '/').replace(/\/$/, '');
+    const lastSep = normalized.lastIndexOf('/');
+    if (lastSep <= 0) return null;
+    const parent = normalized.substring(0, lastSep);
+    if (/^[A-Za-z]:$/.test(parent)) return null; // Windows 驱动器根目录
+    return parent;
+  };
+
+  // 进入子目录
+  const navigateToDir = useCallback((dirPath: string) => {
+    setCurrentDir(dirPath);
+    setFileQuery('');
+    setFileSelectedIndex(0);
+    // 清除光标前 @ 后面的查询词
+    const el = ref.current;
+    if (el) {
+      const cursor = el.selectionStart ?? el.value.length;
+      const before = el.value.substring(0, cursor);
+      const lastAt = before.lastIndexOf('@');
+      if (lastAt >= 0) {
+        const newVal = el.value.substring(0, lastAt + 1) + el.value.substring(cursor);
+        el.value = newVal;
+        el.selectionStart = lastAt + 1;
+        el.selectionEnd = lastAt + 1;
+      }
+    }
+    api.listDirectory(dirPath).then((entries) => {
+      if (Array.isArray(entries)) setFileEntries(entries);
+    });
+  }, []);
+
+  const navigateToDirRef = useRef(navigateToDir);
+  navigateToDirRef.current = navigateToDir;
+
+  // 选中文件：在光标处替换 @query → @path
+  const insertFileRef = useCallback((filePath: string) => {
+    const el = ref.current;
+    if (!el) return;
+    const cursor = el.selectionStart ?? el.value.length;
+    const before = el.value.substring(0, cursor);
+    const lastAt = before.lastIndexOf('@');
+    if (lastAt < 0) { setShowFilePicker(false); return; }
+    const normalized = filePath.replace(/\\/g, '/');
+    const newVal = el.value.substring(0, lastAt) + '@' + normalized + ' ' + el.value.substring(cursor);
+    el.value = newVal;
+    const newCursor = lastAt + 1 + normalized.length + 1;
+    el.selectionStart = newCursor;
+    el.selectionEnd = newCursor;
+    el.focus();
+    el.style.height = 'auto';
+    el.style.height = Math.min(el.scrollHeight, 200) + 'px';
+    setShowFilePicker(false);
+    setFileQuery('');
+  }, []);
+
+  const insertFileRefRef = useRef(insertFileRef);
+  insertFileRefRef.current = insertFileRef;
 
   // ── 发送 ──
   const handleSend = useCallback(() => {
@@ -113,6 +204,55 @@ const ChatInputInner: React.FC<Props> = ({
     (e: React.KeyboardEvent) => {
       if (e.nativeEvent.isComposing || composingRef.current || e.keyCode === 229)
         return;
+
+      // ★ @ 文件选择器键盘导航（优先于斜杠命令）
+      if (showFilePickerRef.current) {
+        const q = fileQueryRef.current.toLowerCase();
+        const filtered = fileEntriesRef.current.filter(
+          (en) => !q || en.name.toLowerCase().includes(q)
+        );
+        if (e.key === 'ArrowUp') {
+          e.preventDefault();
+          setFileSelectedIndex((prev) => {
+            const next = Math.max(0, prev - 1);
+            fileSelectedIndexRef.current = next;
+            return next;
+          });
+          return;
+        }
+        if (e.key === 'ArrowDown') {
+          e.preventDefault();
+          setFileSelectedIndex((prev) => {
+            const next = Math.min(filtered.length - 1, prev + 1);
+            fileSelectedIndexRef.current = next;
+            return next;
+          });
+          return;
+        }
+        if (e.key === 'Enter' && !e.shiftKey) {
+          e.preventDefault();
+          const entry = filtered[fileSelectedIndexRef.current];
+          if (entry) {
+            if (entry.isDir) navigateToDirRef.current(entry.path);
+            else insertFileRefRef.current(entry.path);
+          }
+          return;
+        }
+        if (e.key === 'Tab') {
+          e.preventDefault();
+          const entry = filtered[fileSelectedIndexRef.current];
+          if (entry) {
+            if (entry.isDir) navigateToDirRef.current(entry.path);
+            else insertFileRefRef.current(entry.path);
+          }
+          return;
+        }
+        if (e.key === 'Escape') {
+          e.preventDefault();
+          setShowFilePicker(false);
+          return;
+        }
+      }
 
       // ★ 命令弹窗打开时的键盘导航
       if (showCommandsRef.current && filteredCommandsRef.current.length > 0) {
@@ -160,15 +300,15 @@ const ChatInputInner: React.FC<Props> = ({
             ref.current.value = cmd.name;
           }
           setShowCommands(false);
-          if (!isStreamingRef.current) handleSend();
+          handleSend();
           return;
         }
       }
 
-      // 普通 Enter 发送
+      // 普通 Enter 发送（流式进行中也允许，sendMessage 内部处理中断续发）
       if (e.key === 'Enter' && !e.shiftKey) {
         e.preventDefault();
-        if (!isStreamingRef.current) handleSend();
+        handleSend();
       }
     },
     [handleSend]
@@ -181,7 +321,7 @@ const ChatInputInner: React.FC<Props> = ({
     composingRef.current = false;
   }, []);
 
-  // ── 输入变化：auto-resize + 斜杠命令检测 ──
+  // ── 输入变化：auto-resize + 斜杠命令检测 + @ 文件选择检测 ──
   const handleInput = useCallback(() => {
     const el = ref.current;
     if (!el) return;
@@ -190,8 +330,41 @@ const ChatInputInner: React.FC<Props> = ({
     el.style.height = 'auto';
     el.style.height = Math.min(el.scrollHeight, 200) + 'px';
 
-    // ★ 斜杠命令检测
     const text = el.value;
+    const cursor = el.selectionStart ?? text.length;
+    const beforeCursor = text.substring(0, cursor);
+    const lastAt = beforeCursor.lastIndexOf('@');
+
+    // ★ @ 文件选择器检测（优先于斜杠命令）
+    if (lastAt >= 0) {
+      const afterAt = beforeCursor.substring(lastAt + 1);
+      if (!afterAt.includes(' ') && !afterAt.includes('\n')) {
+        const query = afterAt;
+        setFileQuery(query);
+        setFileSelectedIndex(0);
+        if (!showFilePickerRef.current) {
+          // 首次打开：加载工作目录
+          const dir = workingDirRef.current || '.';
+          setCurrentDir(dir);
+          api.listDirectory(dir).then((entries) => {
+            if (Array.isArray(entries)) {
+              setFileEntries(entries);
+              setShowFilePicker(true);
+            }
+          });
+        }
+        setShowCommands(false);
+        return;
+      }
+    }
+
+    // 没有 @ 触发时，关闭文件选择器
+    if (showFilePickerRef.current) {
+      setShowFilePicker(false);
+      setFileQuery('');
+    }
+
+    // ★ 斜杠命令检测（仅在行首 / 时触发）
     if (text.startsWith('/') && !text.includes(' ') && text.length > 0) {
       const query = text.toLowerCase();
       const matched = SLASH_COMMANDS.filter((cmd) =>
@@ -212,14 +385,14 @@ const ChatInputInner: React.FC<Props> = ({
       ref.current.focus();
     }
     setShowCommands(false);
-    if (!isStreamingRef.current) handleSend();
+    handleSend();
   }, [handleSend]);
 
   useEffect(() => {
     ref.current?.focus();
   }, []);
 
-  // 滚动选中项到可见区域
+  // 滚动选中项到可见区域（斜杠命令）
   useEffect(() => {
     if (showCommands && popupRef.current) {
       const items = popupRef.current.children;
@@ -228,6 +401,25 @@ const ChatInputInner: React.FC<Props> = ({
       }
     }
   }, [selectedIndex, showCommands]);
+
+  // 滚动选中项到可见区域（文件选择器）
+  useEffect(() => {
+    if (showFilePicker && filePopupRef.current) {
+      const items = filePopupRef.current.querySelectorAll<HTMLElement>('[data-file-item]');
+      if (items[fileSelectedIndex]) {
+        items[fileSelectedIndex].scrollIntoView({ block: 'nearest' });
+      }
+    }
+  }, [fileSelectedIndex, showFilePicker]);
+
+  // ── 文件选择器：过滤当前目录条目 ──
+  const filteredEntries = useMemo(() => {
+    const q = fileQuery.toLowerCase();
+    return fileEntries.filter((e) => !q || e.name.toLowerCase().includes(q));
+  }, [fileEntries, fileQuery]);
+
+  // 是否可以返回上级目录
+  const parentDir = showFilePicker ? getParentDir(currentDir) : null;
 
   return (
     <div style={{ padding: '8px 16px 12px', borderTop: '1px solid var(--theme-border, rgba(0,0,0,0.12))', background: 'var(--theme-bg, #ffffff)', position: 'relative' }}>
@@ -247,6 +439,53 @@ const ChatInputInner: React.FC<Props> = ({
       </div>
 
       <ImagePreview images={images} onRemove={removeImage} />
+
+      {/* ★ @ 文件选择器弹窗 */}
+      {showFilePicker && (
+        <div ref={filePopupRef} style={filePickerPopupStyle}>
+          {/* 当前目录路径 */}
+          <div style={filePickerHeaderStyle}>
+            <span style={{ opacity: 0.6, fontSize: 10 }}>📁</span>
+            <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', direction: 'rtl', textAlign: 'left' }}>
+              {currentDir}
+            </span>
+          </div>
+          {/* 上级目录 */}
+          {parentDir && (
+            <div
+              data-file-item
+              style={{ ...fileItemStyle, color: 'var(--theme-text-muted, #656d76)' }}
+              onClick={() => navigateToDirRef.current(parentDir)}
+              onMouseEnter={() => setFileSelectedIndex(-1)}
+            >
+              <span>↩</span>
+              <span>..</span>
+            </div>
+          )}
+          {filteredEntries.length === 0 && (
+            <div style={{ padding: '8px 12px', color: 'var(--theme-text-muted)', fontSize: 12 }}>无匹配文件</div>
+          )}
+          {filteredEntries.map((entry, i) => (
+            <div
+              key={entry.path}
+              data-file-item
+              style={{
+                ...fileItemStyle,
+                background: i === fileSelectedIndex ? 'var(--theme-bg-tertiary, #eaeef2)' : 'transparent',
+              }}
+              onClick={() => entry.isDir ? navigateToDirRef.current(entry.path) : insertFileRefRef.current(entry.path)}
+              onMouseEnter={() => setFileSelectedIndex(i)}
+            >
+              <span>{entry.isDir ? '📁' : '📄'}</span>
+              <span style={{ flex: 1 }}>{entry.name}</span>
+              {entry.isDir && <span style={{ fontSize: 10, opacity: 0.5 }}>▶</span>}
+            </div>
+          ))}
+          <div style={filePickerFooterStyle}>
+            ↑↓ 导航 · Enter/Tab 进入/选择 · Esc 关闭
+          </div>
+        </div>
+      )}
 
       {/* ★ 斜杠命令弹窗 */}
       {showCommands && filteredCommands.length > 0 && (
@@ -278,14 +517,13 @@ const ChatInputInner: React.FC<Props> = ({
       <div style={{ display: 'flex', gap: 8, alignItems: 'flex-end' }}>
         <textarea
           ref={ref}
-          placeholder="输入消息… 输入 / 查看命令 · Ctrl+V 粘贴图片"
+          placeholder={isStreaming ? '输入并按 Enter 可中断当前响应并续发…' : '输入消息… 输入 / 查看命令 · @ 引用文件 · Ctrl+V 粘贴图片'}
           onKeyDown={handleKeyDown}
           onCompositionStart={handleCompositionStart}
           onCompositionEnd={handleCompositionEnd}
           onInput={handleInput}
-          style={textareaStyle}
+          style={{ ...textareaStyle, ...(isStreaming ? { opacity: 0.75 } : {}) }}
           rows={1}
-          disabled={isStreaming}
         />
         {isStreaming ? (
           <button onClick={onAbort} style={abortBtnStyle} title="Stop">■</button>
@@ -361,4 +599,53 @@ const commandItemStyle: React.CSSProperties = {
   fontSize: 13,
   transition: 'background 0.1s',
   borderBottom: '1px solid var(--theme-border, rgba(0,0,0,0.08))',
+};
+
+const filePickerPopupStyle: React.CSSProperties = {
+  position: 'absolute',
+  bottom: '100%',
+  left: 16,
+  right: 16,
+  marginBottom: 4,
+  background: 'var(--theme-bg-secondary, #f6f8fa)',
+  border: '1px solid var(--theme-border, rgba(0,0,0,0.12))',
+  borderRadius: 10,
+  overflow: 'hidden',
+  maxHeight: 300,
+  overflowY: 'auto',
+  zIndex: 100,
+  boxShadow: '0 -4px 20px rgba(0,0,0,0.1)',
+  backdropFilter: 'blur(12px)',
+};
+
+const filePickerHeaderStyle: React.CSSProperties = {
+  padding: '6px 12px',
+  display: 'flex',
+  alignItems: 'center',
+  gap: 6,
+  fontSize: 11,
+  color: 'var(--theme-text-muted, #656d76)',
+  background: 'var(--theme-bg-tertiary, #eaeef2)',
+  borderBottom: '1px solid var(--theme-border, rgba(0,0,0,0.08))',
+  userSelect: 'none' as const,
+};
+
+const fileItemStyle: React.CSSProperties = {
+  padding: '7px 12px',
+  cursor: 'pointer',
+  display: 'flex',
+  alignItems: 'center',
+  gap: 8,
+  fontSize: 13,
+  transition: 'background 0.1s',
+  borderBottom: '1px solid var(--theme-border, rgba(0,0,0,0.05))',
+  color: 'var(--theme-text, #1f2328)',
+};
+
+const filePickerFooterStyle: React.CSSProperties = {
+  padding: '4px 10px',
+  fontSize: 10,
+  color: 'var(--theme-text-muted, #656d76)',
+  borderTop: '1px solid var(--theme-border, rgba(0,0,0,0.08))',
+  userSelect: 'none' as const,
 };

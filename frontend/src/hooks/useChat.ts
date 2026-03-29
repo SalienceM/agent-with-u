@@ -136,6 +136,8 @@ export function useChat(sessionId: string, backendId: string, backends?: any[], 
   const contentBlocksRef = useRef<ContentBlock[]>([]);  // ★ 有序内容块
   const streamStartRef = useRef<number>(0);  // ★ 流式开始时间戳
   const msgIdRef = useRef<string | null>(null);
+  // ★ 流式进行时用户发送的新消息（中断续发队列，最多保留最后一条）
+  const pendingMessageRef = useRef<{ content: string; images?: ImageAttachment[] } | null>(null);
 
   // 稳定引用 refs
   const isStreamingRef = useRef(false);
@@ -351,6 +353,20 @@ export function useChat(sessionId: string, backendId: string, backends?: any[], 
     };
     setMessages((prev) => [...prev, msg]);
   }, []);
+
+  // ★ streaming 结束后自动发送 pending 消息（用户在流式进行中提交的中断续发）
+  useEffect(() => {
+    if (isStreaming) return;
+    if (!pendingMessageRef.current) return;
+    const pending = pendingMessageRef.current;
+    pendingMessageRef.current = null;
+    // 用 setTimeout(0) 确保在当前 React 批次渲染完成后再发，避免和 done 处理竞争
+    setTimeout(() => {
+      if (!isStreamingRef.current) {
+        doSendRef.current(pending.content, pending.images);
+      }
+    }, 0);
+  }, [isStreaming]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // ── 核心发送逻辑（不含斜杠命令判断） ──
   const doSend = useCallback(
@@ -596,7 +612,14 @@ export function useChat(sessionId: string, backendId: string, backends?: any[], 
   const sendMessage = useCallback(
     async (content: string, images?: ImageAttachment[]) => {
       if (!content.trim() && (!images || images.length === 0)) return;
-      if (isStreamingRef.current) return;
+
+      if (isStreamingRef.current) {
+        // ★ 流式进行中：斜杠命令不中断，普通消息入队并中止当前响应
+        if (content.trim().startsWith('/')) return;
+        pendingMessageRef.current = { content, images };
+        api.abortMessage(sessionId);
+        return;
+      }
 
       // ★ 斜杠命令拦截
       if (content.trim().startsWith('/')) {
@@ -606,11 +629,12 @@ export function useChat(sessionId: string, backendId: string, backends?: any[], 
 
       doSend(content, images);
     },
-    [doSend, handleCommand]
+    [doSend, handleCommand, sessionId]
   );
 
   const abort = useCallback(() => {
     // ★ 按 sessionId 停止，精确定位到当前 session，不影响其他并发 session
+    pendingMessageRef.current = null; // 手动停止时清除 pending，不续发
     api.abortMessage(sessionId);
     setIsStreaming(false);
   }, [sessionId]);

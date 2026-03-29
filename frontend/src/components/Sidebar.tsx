@@ -20,14 +20,16 @@ interface Props {
   activeSessionId: string | null;
   onSelectSession: (id: string) => void;
   onNewSession: () => void;
-  onDeleteSession?: (id: string) => void;  // ★ 通知父组件 session 被删除
-  streamingSessions: Set<string>;  // ★ Set of session IDs that are streaming
+  onDeleteSession?: (id: string) => void;
+  onAcknowledgeSession?: (id: string) => void; // ★ 用户明确确认后才消除通知
+  streamingSessions: Set<string>;
+  completedSessions?: Set<string>;  // ★ 后台完成待查看的 session
   collapsed?: boolean;
   onToggleCollapse?: () => void;
 }
 
 // ★ Wrap with React.memo to prevent unnecessary re-renders when parent updates
-export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession, onNewSession, onDeleteSession, streamingSessions, collapsed, onToggleCollapse }) => {
+export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession, onNewSession, onDeleteSession, onAcknowledgeSession, streamingSessions, completedSessions = new Set(), collapsed, onToggleCollapse }) => {
   const [sessions, setSessions] = useState<Session[]>([]);
   const [backends, setBackends] = useState<Backend[]>([]);
   const [hoveredSessionId, setHoveredSessionId] = useState<string | null>(null);
@@ -118,19 +120,35 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
     return '.../' + parts.slice(-3).join('/');
   }, []);
 
-  // ★ 折叠状态：只显示窄条 + 展开按钮
+  const pendingCount = completedSessions.size;
+
+  // ★ 折叠状态：只显示窄条 + 展开按钮，有未确认通知时显示角标
   if (collapsed) {
     return (
       <div style={collapsedSidebarStyle}>
-        <button
-          onClick={onToggleCollapse}
-          style={toggleBtnStyle}
-          title="展开侧栏"
-        >
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-            <path d="M9 18l6-6-6-6" />
-          </svg>
-        </button>
+        <div style={{ position: 'relative', display: 'inline-block' }}>
+          <button
+            onClick={onToggleCollapse}
+            style={toggleBtnStyle}
+            title="展开侧栏"
+          >
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M9 18l6-6-6-6" />
+            </svg>
+          </button>
+          {pendingCount > 0 && (
+            <span style={{
+              position: 'absolute', top: -4, right: -4,
+              minWidth: 14, height: 14, borderRadius: 7,
+              background: '#ef4444', color: '#fff',
+              fontSize: 9, fontWeight: 700, lineHeight: '14px',
+              textAlign: 'center', padding: '0 3px',
+              pointerEvents: 'none',
+            }}>
+              {pendingCount > 9 ? '9+' : pendingCount}
+            </span>
+          )}
+        </div>
         <button onClick={onNewSession} style={{ ...toggleBtnStyle, marginTop: 4 }} title="New session">
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
             <line x1="12" y1="5" x2="12" y2="19" />
@@ -147,6 +165,41 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
         @keyframes pulse {
           0%, 100% { opacity: 1; transform: scale(1); }
           50% { opacity: 0.5; transform: scale(1.2); }
+        }
+        @keyframes badgePulse {
+          0%, 100% { transform: scale(1); }
+          50%       { transform: scale(1.15); }
+        }
+        .session-notify-badge {
+          position: absolute;
+          top: -5px;
+          right: -5px;
+          min-width: 16px;
+          height: 16px;
+          border-radius: 8px;
+          background: #ef4444;
+          color: #fff;
+          font-size: 9px;
+          font-weight: 700;
+          line-height: 16px;
+          text-align: center;
+          padding: 0 4px;
+          cursor: pointer;
+          animation: badgePulse 2s ease-in-out infinite;
+          border: 1.5px solid var(--theme-bg, #1a1a2e);
+          z-index: 10;
+          transition: background 0.15s, transform 0.1s;
+          user-select: none;
+        }
+        .session-notify-badge:hover {
+          background: #dc2626;
+          transform: scale(1.2) !important;
+          animation: none;
+        }
+        .session-notify-badge-wrap {
+          position: absolute;
+          top: 0; right: 0; bottom: 0; left: 0;
+          pointer-events: none;
         }
       `}</style>
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '16px 12px 8px' }}>
@@ -172,7 +225,9 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
       <div style={{ flex: 1, overflow: 'auto', padding: '4px 8px' }}>
         {sessions.map((s: any) => {
           const isRunning = streamingSessions.has(s.id);
+          const isCompleted = !isRunning && completedSessions.has(s.id);
           const isActive = s.id === activeSessionId;
+
           return (
           <div
             key={s.id}
@@ -183,18 +238,33 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
               ...itemStyle,
               ...(isActive ? { background: 'var(--theme-accent-bg, #7aa2f726)' } : {}),
               ...(hoveredSessionId === s.id && !isActive ? { background: 'var(--theme-bg-tertiary, #242536)' } : {}),
-              ...(isRunning ? { border: '1px solid var(--theme-success, #2da44e)' } : {}),
+              ...(isRunning   ? { border: '1px solid #22c55e55', borderLeft: '3px solid #22c55e' } : {}),
+              ...(isCompleted ? { border: '1px solid #ef444455', borderLeft: '3px solid #ef4444' } : {}),
             }}
           >
-            {/* ★ Running indicator */}
+            {/* ★ Running indicator — 绿点 */}
             {isRunning && (
               <div style={{ position: 'absolute', top: 8, left: 8, display: 'flex', alignItems: 'center', gap: 4 }}>
-                <span style={{ width: 6, height: 6, borderRadius: '50%', background: '#22c55e', animation: 'pulse 1.5s infinite' }} />
+                <span style={{ width: 7, height: 7, borderRadius: '50%', background: '#22c55e', animation: 'pulse 1.5s infinite' }} />
               </div>
             )}
 
+            {/* ★ Completed indicator — 右上角红点角标，点击才确认消除 */}
+            {isCompleted && (
+              <span
+                className="session-notify-badge"
+                title="点击确认已查看"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onAcknowledgeSession?.(s.id);
+                }}
+              >
+                !
+              </span>
+            )}
+
             {/* ★ Working directory is PRIMARY - shown first and prominently */}
-            <div style={{ fontSize: 11, color: 'var(--theme-success, #2da44e)', fontFamily: 'monospace', marginBottom: 4, paddingLeft: isRunning ? 16 : 0 }}>
+            <div style={{ fontSize: 11, color: 'var(--theme-success, #2da44e)', fontFamily: 'monospace', marginBottom: 4, paddingLeft: isRunning ? 18 : 0 }}>
               📁 {formatWorkingDir(s.workingDir)}
             </div>
             <div style={{ fontSize: 13, color: isActive ? 'var(--theme-accent, #7aa2f7)' : 'var(--theme-text, #e2e3ea)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', paddingRight: 50 }}>
@@ -280,6 +350,7 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
 }, (prevProps, nextProps) => {
   return prevProps.activeSessionId === nextProps.activeSessionId
     && prevProps.streamingSessions === nextProps.streamingSessions
+    && prevProps.completedSessions === nextProps.completedSessions
     && prevProps.collapsed === nextProps.collapsed;
 });
 

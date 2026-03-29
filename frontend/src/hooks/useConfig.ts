@@ -207,5 +207,15 @@ export function useConfig() {
     api.setAppConfig(DEFAULT_CONFIG).catch(console.error);
   }, []);
 
-  return { config, updateConfig, resetConfig, loaded };
+  const reloadConfig = useCallback(() => {
+    api.getAppConfig().then((savedConfig) => {
+      if (savedConfig && Object.keys(savedConfig).length > 0) {
+        if (savedConfig.theme === 'ocean') savedConfig.theme = 'midnight';
+        setConfig((prev) => ({ ...prev, ...savedConfig }));
+      }
+      setLoaded(true);
+    }).catch(() => setLoaded(true));
+  }, []);
+
+  return { config, updateConfig, resetConfig, reloadConfig, loaded };
 }

@@ -365,6 +365,7 @@ class BridgeWS:
                 skip_permissions=data.get("skipPermissions", True),
                 env=data.get("env") or None,
                 cli_path=existing.cli_path if existing else None,
+                allowed_tools=data.get("allowedTools"),
             )
         else:
             config = ModelBackendConfig(
@@ -411,6 +412,36 @@ class BridgeWS:
         except Exception as e:
             print(f"[BridgeWS] getClaudeSettings error: {e}", file=sys.stderr)
         return json.dumps({"model": ""})
+
+    def _rpc_getMcpServers(self) -> str:
+        """读取 ~/.claude/settings.json 中的 mcpServers 配置。"""
+        from pathlib import Path as _Path
+        settings_path = _Path.home() / ".claude" / "settings.json"
+        try:
+            if settings_path.exists():
+                data = json.loads(settings_path.read_text(encoding="utf-8"))
+                return json.dumps(data.get("mcpServers") or {}, ensure_ascii=False)
+        except Exception as e:
+            print(f"[BridgeWS] getMcpServers error: {e}", file=sys.stderr)
+        return json.dumps({})
+
+    def _rpc_saveMcpServers(self, servers_json: str) -> str:
+        """将 mcpServers 写回 ~/.claude/settings.json（合并，不覆盖其他字段）。"""
+        from pathlib import Path as _Path
+        settings_path = _Path.home() / ".claude" / "settings.json"
+        try:
+            servers = json.loads(servers_json)
+            if settings_path.exists():
+                data = json.loads(settings_path.read_text(encoding="utf-8"))
+            else:
+                data = {}
+                settings_path.parent.mkdir(parents=True, exist_ok=True)
+            data["mcpServers"] = servers
+            settings_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+            return json.dumps({"status": "ok"}, ensure_ascii=False)
+        except Exception as e:
+            print(f"[BridgeWS] saveMcpServers error: {e}", file=sys.stderr)
+            return json.dumps({"status": "error", "message": str(e)}, ensure_ascii=False)
 
     def _rpc_openModelTerminal(self, backend_id: str = "") -> str:
         """打开终端，启动 claude，提示用户用 /model 换模型。"""
@@ -534,6 +565,30 @@ class BridgeWS:
             return json.dumps({"status": "error", "message": str(e)}, ensure_ascii=False)
 
     # ── RPC: 应用配置 ────────────────────────────────────────────
+
+    def _rpc_listDirectory(self, path: str) -> str:
+        """列出目录内容，供前端 @ 文件引用选择器使用。
+        返回 [{name, path, isDir}, ...] 目录优先，字母序排列，跳过隐藏文件。
+        """
+        import os
+        try:
+            entries = []
+            with os.scandir(path) as it:
+                for entry in sorted(it, key=lambda e: (not e.is_dir(), e.name.lower())):
+                    if entry.name.startswith('.'):
+                        continue
+                    entries.append({
+                        "name": entry.name,
+                        "path": entry.path.replace("\\", "/"),
+                        "isDir": entry.is_dir(),
+                    })
+            return json.dumps(entries, ensure_ascii=False)
+        except PermissionError:
+            return json.dumps({"error": "无访问权限"}, ensure_ascii=False)
+        except FileNotFoundError:
+            return json.dumps({"error": "目录不存在"}, ensure_ascii=False)
+        except Exception as e:
+            return json.dumps({"error": str(e)}, ensure_ascii=False)
 
     def _rpc_getAppConfig(self) -> str:
         return json.dumps(self._app_config_store.get_all(), ensure_ascii=False)
@@ -695,7 +750,7 @@ class BridgeWS:
         current_images = images
         success = True
         retry_count = 0
-        max_retry = 0  # 暂时禁用 resume_failed 重试（逻辑待整理）
+        max_retry = 1  # session 失效时重试一次，携带历史创建新 session
 
         for iteration in range(max_continuations + 1):
             iter_text: list[str] = []
@@ -712,7 +767,12 @@ class BridgeWS:
                         iter_usage = delta.usage
                     return
                 if delta.type == "resume_failed":
+                    print(f"[bridge_ws] 收到 resume_failed 事件", file=sys.stderr, flush=True)
                     retry_state["without_session"] = True
+                    return
+                # ★ resume 失败后，压制 error delta（是 SDK 异常的误报，bridge 将重试）
+                if retry_state["without_session"] and delta.type == "error":
+                    print(f"[bridge_ws] 压制 resume 失败引发的 error delta（将重试）", file=sys.stderr, flush=True)
                     return
                 if delta.type == "text_delta" and delta.text:
                     iter_text.append(delta.text)
@@ -780,7 +840,20 @@ class BridgeWS:
                         )
                     msgs_for_backend = session.messages[:-1]
                 else:
-                    if retry_state["without_session"] and need_compress:
+                    if retry_state["without_session"]:
+                        # ★ session 过期重建：无论消息数量，始终把历史注入新 session
+                        # 这样第三方 API（dashscope 等）也能保持多轮对话上下文
+                        prior_msgs = session.messages[:-1]
+                        if prior_msgs:
+                            history_str = compress_messages(prior_msgs, keep_recent=6)
+                            send_content = (
+                                f"以下是之前对话的历史记录，请在此基础上继续：\n\n"
+                                f"{history_str}\n\n"
+                                f"---\n\n{current_content}"
+                            )
+                            print(f"[bridge_ws] Session 过期重建，注入 {len(prior_msgs)} 条历史消息",
+                                  file=sys.stderr, flush=True)
+                    elif need_compress:
                         compressed = compress_messages(session.messages[:-1], keep_recent=6)
                         send_content = (
                             f"以下是之前对话的摘要，供你参考：\n\n{compressed}"
@@ -841,7 +914,16 @@ class BridgeWS:
                 if retry_state["without_session"] and retry_count < max_retry:
                     retry_count += 1
                     session.agent_session_id = None
+                    print(f"[bridge_ws] 准备重试 (retry_count={retry_count})", file=sys.stderr, flush=True)
                     continue
+                elif retry_state["without_session"]:
+                    # 已超过最大重试次数，报告错误
+                    print(f"[bridge_ws] Resume 失败且已达到最大重试次数", file=sys.stderr, flush=True)
+                    self._emit_delta(StreamDelta(
+                        session.id, message_id, "error",
+                        error="无法恢复之前的对话会话，已尝试使用历史记录重试",
+                    ))
+                    success = False
 
                 if stop_reason == "max_tokens" and auto_continue and iteration < max_continuations:
                     # ★ 权限门控：未跳过确认时，auto-continue 前请求用户确认

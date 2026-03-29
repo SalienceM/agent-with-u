@@ -1,4 +1,4 @@
-import React, { useState, useCallback } from 'react';
+import React, { useState, useCallback, useEffect } from 'react';
 import { api } from '../api';
 
 // Global variable to store selected target backend for migration
@@ -23,6 +23,9 @@ interface BackendConfig {
 }
 
 const OFFICIAL_BACKEND_ID = 'official-claude';
+
+const DEFAULT_TOOLS = ['Read', 'Edit', 'Bash', 'Glob', 'Grep', 'Write'];
+const ALL_TOOLS = ['Read', 'Edit', 'Write', 'Bash', 'Glob', 'Grep', 'WebSearch', 'WebFetch'];
 
 interface BackendManagerProps {
   isOpen: boolean;
@@ -67,6 +70,15 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
   const [backendToDelete, setBackendToDelete] = useState<BackendConfig | null>(null);
   const [dependentSessions, setDependentSessions] = useState<any[]>([]);
 
+  // MCP tab state
+  const [activeTab, setActiveTab] = useState<'backends' | 'mcp'>('backends');
+  const [mcpServers, setMcpServers] = useState<Record<string, any>>({});
+  const [mcpLoading, setMcpLoading] = useState(false);
+  const [isEditingMcp, setIsEditingMcp] = useState(false);
+  const [editingMcpName, setEditingMcpName] = useState<string | null>(null);
+  const [mcpForm, setMcpForm] = useState({ name: '', command: 'npx', args: '', env: '' });
+  const [mcpSaveMsg, setMcpSaveMsg] = useState<string | null>(null);
+
   const handleNewBackend = useCallback(() => {
     setFormData({
       id: `backend-${Date.now()}`,
@@ -76,6 +88,7 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
       baseUrl: '',
       apiKey: '',
       env: {},
+      allowedTools: [...DEFAULT_TOOLS],
     });
     setEditingBackend(null);
     setIsEditing(true);
@@ -101,24 +114,23 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
     };
 
     if (formData.pinned) {
-      // 固定后端：只保存 env 和 skipPermissions
+      // 固定后端：只保存 env、skipPermissions、allowedTools
       const cleanedEnv: Record<string, string> = {};
       Object.entries(formData.env || {}).forEach(([k, v]) => {
         if (v && v.trim()) cleanedEnv[k] = v.trim();
       });
       if (Object.keys(cleanedEnv).length > 0) saved.env = cleanedEnv;
       saved.skipPermissions = formData.skipPermissions !== false;
+      if (formData.allowedTools?.length) saved.allowedTools = formData.allowedTools;
     } else if (formData.type === 'claude-agent-sdk') {
-      // Only env vars + skipPermissions matter
       const cleanedEnv: Record<string, string> = {};
       Object.entries(formData.env || {}).forEach(([k, v]) => {
         if (v && v.trim()) cleanedEnv[k] = v.trim();
       });
       if (Object.keys(cleanedEnv).length > 0) saved.env = cleanedEnv;
       saved.skipPermissions = formData.skipPermissions !== false;
+      if (formData.allowedTools?.length) saved.allowedTools = formData.allowedTools;
     } else if (formData.type === 'claude-code-official') {
-      // 官方账户：凭证自动从 ~/.claude/.credentials.json 读取
-      // 只需保存代理 env（HTTPS_PROXY / HTTP_PROXY）和可选 model/cli_path
       const cleanedEnv: Record<string, string> = {};
       Object.entries(formData.env || {}).forEach(([k, v]) => {
         if (v && v.trim()) cleanedEnv[k] = v.trim();
@@ -126,6 +138,7 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
       if (Object.keys(cleanedEnv).length > 0) saved.env = cleanedEnv;
       if (formData.model?.trim()) saved.model = formData.model.trim();
       saved.skipPermissions = formData.skipPermissions !== false;
+      if (formData.allowedTools?.length) saved.allowedTools = formData.allowedTools;
     } else if (formData.type === 'openai-compatible') {
       // base_url, api_key, model, extra_headers
       if (formData.baseUrl?.trim()) saved.baseUrl = formData.baseUrl.trim();
@@ -221,20 +234,98 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
     }
   }, [backendToDelete, dependentSessions, onDeleteBackend]);
 
+  // Load MCP servers when dialog opens
+  useEffect(() => {
+    if (isOpen) {
+      setMcpLoading(true);
+      api.getMcpServers().then(servers => {
+        setMcpServers(servers);
+        setMcpLoading(false);
+      }).catch(() => setMcpLoading(false));
+    }
+  }, [isOpen]);
+
+  const handleNewMcp = useCallback(() => {
+    setMcpForm({ name: '', command: 'npx', args: '', env: '' });
+    setEditingMcpName(null);
+    setIsEditingMcp(true);
+  }, []);
+
+  const handleEditMcp = useCallback((name: string, srv: any) => {
+    const argsStr = (srv.args || []).join('\n');
+    const envStr = Object.entries(srv.env || {}).map(([k, v]) => `${k}=${v}`).join('\n');
+    setMcpForm({ name, command: srv.command || '', args: argsStr, env: envStr });
+    setEditingMcpName(name);
+    setIsEditingMcp(true);
+  }, []);
+
+  const handleSaveMcp = useCallback(async () => {
+    if (!mcpForm.name.trim() || !mcpForm.command.trim()) return;
+    const args = mcpForm.args.split('\n').map(s => s.trim()).filter(Boolean);
+    const env: Record<string, string> = {};
+    mcpForm.env.split('\n').forEach(line => {
+      const idx = line.indexOf('=');
+      if (idx > 0) env[line.slice(0, idx).trim()] = line.slice(idx + 1).trim();
+    });
+    const srv: any = { command: mcpForm.command.trim() };
+    if (args.length > 0) srv.args = args;
+    if (Object.keys(env).length > 0) srv.env = env;
+    const updated = { ...mcpServers, [mcpForm.name.trim()]: srv };
+    const result = await api.saveMcpServers(updated);
+    if (result.status === 'ok') {
+      setMcpServers(updated);
+      setIsEditingMcp(false);
+      setMcpSaveMsg('已保存');
+      setTimeout(() => setMcpSaveMsg(null), 2000);
+    }
+  }, [mcpForm, mcpServers]);
+
+  const handleDeleteMcp = useCallback(async (name: string) => {
+    const updated = { ...mcpServers };
+    delete updated[name];
+    const result = await api.saveMcpServers(updated);
+    if (result.status === 'ok') {
+      setMcpServers(updated);
+      setMcpSaveMsg('已删除');
+      setTimeout(() => setMcpSaveMsg(null), 2000);
+    }
+  }, [mcpServers]);
+
   if (!isOpen) return null;
 
   return (
     <div style={overlayStyle} onClick={onClose}>
       <div style={panelStyle} onClick={(e) => e.stopPropagation()}>
         {/* 标题栏 */}
-        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 20 }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
           <h2 style={{ margin: 0, fontSize: 18, fontWeight: 600, color: 'var(--theme-text)' }}>
-            {editingBackend ? 'Edit Backend' : 'Backend Manager'}
+            {activeTab === 'mcp'
+              ? (isEditingMcp ? (editingMcpName ? `编辑 ${editingMcpName}` : '添加 MCP 服务器') : 'MCP 服务器')
+              : (editingBackend ? 'Edit Backend' : 'Backend Manager')
+            }
           </h2>
           <button onClick={onClose} style={closeBtnStyle}>✕</button>
         </div>
 
-        {!isEditing ? (
+        {/* Tab 导航 */}
+        <div style={{ display: 'flex', gap: 4, marginBottom: 16, borderBottom: '1px solid var(--theme-border)', paddingBottom: 10 }}>
+          {(['backends', 'mcp'] as const).map(tab => (
+            <button
+              key={tab}
+              onClick={() => { setActiveTab(tab); setIsEditing(false); setIsEditingMcp(false); }}
+              style={{
+                padding: '5px 14px', borderRadius: '6px 6px 0 0', fontSize: 13, cursor: 'pointer',
+                border: 'none', background: activeTab === tab ? 'rgba(99,102,241,0.2)' : 'transparent',
+                color: activeTab === tab ? 'rgba(165,168,255,0.95)' : 'var(--theme-text-muted)',
+                fontWeight: activeTab === tab ? 600 : 400, transition: 'all 0.15s',
+              }}
+            >
+              {tab === 'backends' ? '后端' : `MCP 服务器${Object.keys(mcpServers).length > 0 ? ` (${Object.keys(mcpServers).length})` : ''}`}
+            </button>
+          ))}
+        </div>
+
+        {activeTab === 'backends' && (!isEditing ? (
           // Backend 列表视图
           <>
             <div style={{ marginBottom: 16 }}>
@@ -422,6 +513,45 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
                   </p>
                 </div>
 
+                {/* ── 允许的工具 ── */}
+                <div style={{ marginTop: 12 }}>
+                  <label style={{ fontSize: 11, color: 'var(--theme-text)', display: 'block', marginBottom: 6 }}>
+                    允许使用的工具
+                  </label>
+                  <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+                    {ALL_TOOLS.map(tool => {
+                      const checked = (formData.allowedTools ?? DEFAULT_TOOLS).includes(tool);
+                      const isNetwork = tool === 'WebSearch' || tool === 'WebFetch';
+                      return (
+                        <label key={tool} style={{ display: 'flex', alignItems: 'center', gap: 4, cursor: 'pointer',
+                          padding: '3px 8px', borderRadius: 4, fontSize: 11,
+                          background: checked ? (isNetwork ? 'rgba(34,197,94,0.15)' : 'rgba(99,102,241,0.15)') : 'rgba(255,255,255,0.05)',
+                          border: `1px solid ${checked ? (isNetwork ? 'rgba(34,197,94,0.4)' : 'rgba(99,102,241,0.4)') : 'rgba(255,255,255,0.12)'}`,
+                          color: checked ? 'var(--theme-text)' : 'var(--theme-text-muted)',
+                        }}>
+                          <input
+                            type="checkbox"
+                            checked={checked}
+                            onChange={(e) => {
+                              const cur = formData.allowedTools ?? [...DEFAULT_TOOLS];
+                              setFormData({ ...formData, allowedTools: e.target.checked
+                                ? [...cur, tool]
+                                : cur.filter(t => t !== tool)
+                              });
+                            }}
+                            style={{ accentColor: 'var(--theme-accent)', width: 11, height: 11 }}
+                          />
+                          {tool}
+                          {isNetwork && <span style={{ fontSize: 9, opacity: 0.7 }}>🌐</span>}
+                        </label>
+                      );
+                    })}
+                  </div>
+                  <p style={{ fontSize: 10, color: 'var(--theme-text-muted)', margin: '5px 0 0 0' }}>
+                    WebSearch / WebFetch 为网络工具，默认不启用。两个后端均使用 bypassPermissions 模式，无需修改 settings.json。
+                  </p>
+                </div>
+
                 <div style={{ marginTop: 12 }}>
                   <label style={{ ...labelStyle, display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer', marginBottom: 0 }}>
                     <input
@@ -552,6 +682,45 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
                   />
                 </div>
 
+                {/* ── 允许的工具（官方账户） ── */}
+                <div style={{ marginTop: 12 }}>
+                  <label style={{ fontSize: 11, color: 'var(--theme-text)', display: 'block', marginBottom: 6 }}>
+                    允许使用的工具
+                  </label>
+                  <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+                    {ALL_TOOLS.map(tool => {
+                      const checked = (formData.allowedTools ?? DEFAULT_TOOLS).includes(tool);
+                      const isNetwork = tool === 'WebSearch' || tool === 'WebFetch';
+                      return (
+                        <label key={tool} style={{ display: 'flex', alignItems: 'center', gap: 4, cursor: 'pointer',
+                          padding: '3px 8px', borderRadius: 4, fontSize: 11,
+                          background: checked ? (isNetwork ? 'rgba(34,197,94,0.15)' : 'rgba(99,102,241,0.15)') : 'rgba(255,255,255,0.05)',
+                          border: `1px solid ${checked ? (isNetwork ? 'rgba(34,197,94,0.4)' : 'rgba(99,102,241,0.4)') : 'rgba(255,255,255,0.12)'}`,
+                          color: checked ? 'var(--theme-text)' : 'var(--theme-text-muted)',
+                        }}>
+                          <input
+                            type="checkbox"
+                            checked={checked}
+                            onChange={(e) => {
+                              const cur = formData.allowedTools ?? [...DEFAULT_TOOLS];
+                              setFormData({ ...formData, allowedTools: e.target.checked
+                                ? [...cur, tool]
+                                : cur.filter(t => t !== tool)
+                              });
+                            }}
+                            style={{ accentColor: 'var(--theme-accent)', width: 11, height: 11 }}
+                          />
+                          {tool}
+                          {isNetwork && <span style={{ fontSize: 9, opacity: 0.7 }}>🌐</span>}
+                        </label>
+                      );
+                    })}
+                  </div>
+                  <p style={{ fontSize: 10, color: 'var(--theme-text-muted)', margin: '5px 0 0 0' }}>
+                    官方账户使用 --dangerously-skip-permissions，勾选即生效，无需改 settings.json。
+                  </p>
+                </div>
+
                 <div style={{ marginTop: 12 }}>
                   <label style={{ ...labelStyle, display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer', marginBottom: 0 }}>
                     <input
@@ -560,7 +729,7 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
                       onChange={(e) => setFormData({ ...formData, skipPermissions: e.target.checked })}
                       style={{ accentColor: 'var(--theme-accent)', width: 14, height: 14, flexShrink: 0 }}
                     />
-                    Skip Permissions (bypassPermissions 模式)
+                    Skip Permissions (--dangerously-skip-permissions)
                   </label>
                 </div>
               </div>
@@ -717,6 +886,111 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
               <button onClick={() => setIsEditing(false)} style={cancelBtnStyle}>
                 Back
               </button>
+            </div>
+          </>
+        ))}
+
+        {/* MCP 服务器 Tab */}
+        {activeTab === 'mcp' && !isEditingMcp && (
+          <>
+            {mcpLoading ? (
+              <div style={{ textAlign: 'center', color: 'var(--theme-text-muted)', padding: 20, fontSize: 13 }}>加载中...</div>
+            ) : Object.keys(mcpServers).length === 0 ? (
+              <div style={{ color: 'var(--theme-text-muted)', fontSize: 13, textAlign: 'center', padding: '20px 0' }}>
+                尚未配置 MCP 服务器
+                <br />
+                <span style={{ fontSize: 11, display: 'block', marginTop: 6 }}>MCP 服务器可为 Claude 提供额外工具，如 GitHub、数据库、浏览器自动化等</span>
+              </div>
+            ) : (
+              Object.entries(mcpServers).map(([name, srv]: [string, any]) => (
+                <div
+                  key={name}
+                  style={{ ...backendItemStyle }}
+                  onClick={() => handleEditMcp(name, srv)}
+                >
+                  <div style={{ flex: 1 }}>
+                    <div style={{ fontWeight: 500, color: 'var(--theme-text)', marginBottom: 4, display: 'flex', alignItems: 'center', gap: 6 }}>
+                      <span style={{ fontSize: 11 }}>🔧</span>{name}
+                    </div>
+                    <div style={{ fontSize: 11, color: 'var(--theme-text-muted)', fontFamily: 'monospace' }}>
+                      {srv.command} {(srv.args || []).slice(0, 3).join(' ')}{(srv.args?.length ?? 0) > 3 ? ' …' : ''}
+                    </div>
+                  </div>
+                  <button
+                    onClick={(e) => { e.stopPropagation(); handleDeleteMcp(name); }}
+                    style={deleteBtnStyle}
+                    title="删除"
+                  >🗑</button>
+                </div>
+              ))
+            )}
+            <button
+              onClick={handleNewMcp}
+              style={{ ...addBtnStyle, background: 'rgba(99,102,241,0.12)', border: '1px solid rgba(99,102,241,0.3)', color: 'rgba(165,168,255,0.9)', marginTop: 8 }}
+            >
+              + 添加 MCP 服务器
+            </button>
+            {mcpSaveMsg && (
+              <div style={{ marginTop: 8, fontSize: 12, color: 'rgba(34,197,94,0.85)', textAlign: 'center' }}>{mcpSaveMsg}</div>
+            )}
+            <div style={{ marginTop: 14, padding: 10, borderRadius: 8, background: 'rgba(255,255,255,0.03)', border: '1px solid rgba(255,255,255,0.07)', fontSize: 11, color: 'var(--theme-text-muted)', lineHeight: 1.7 }}>
+              💡 推荐：<code style={{ fontSize: 10, background: 'rgba(255,255,255,0.08)', padding: '1px 4px', borderRadius: 3 }}>@modelcontextprotocol/server-github</code>（GitHub 操作）、
+              <code style={{ fontSize: 10, background: 'rgba(255,255,255,0.08)', padding: '1px 4px', borderRadius: 3 }}>@modelcontextprotocol/server-puppeteer</code>（浏览器自动化）。
+              配置后重启应用生效。
+            </div>
+          </>
+        )}
+
+        {activeTab === 'mcp' && isEditingMcp && (
+          <>
+            <div style={{ marginBottom: 16 }}>
+              <label style={labelStyle}>服务器名称（唯一标识符）</label>
+              <input
+                type="text"
+                value={mcpForm.name}
+                onChange={(e) => setMcpForm({ ...mcpForm, name: e.target.value })}
+                style={{ ...inputStyle, ...(editingMcpName !== null ? { opacity: 0.6 } : {}) }}
+                placeholder="e.g., github, puppeteer, sqlite"
+                readOnly={editingMcpName !== null}
+              />
+            </div>
+            <div style={{ marginBottom: 16 }}>
+              <label style={labelStyle}>命令</label>
+              <input
+                type="text"
+                value={mcpForm.command}
+                onChange={(e) => setMcpForm({ ...mcpForm, command: e.target.value })}
+                style={inputStyle}
+                placeholder="e.g., npx, node, python"
+              />
+            </div>
+            <div style={{ marginBottom: 16 }}>
+              <label style={labelStyle}>参数（每行一个）</label>
+              <textarea
+                value={mcpForm.args}
+                onChange={(e) => setMcpForm({ ...mcpForm, args: e.target.value })}
+                style={{ ...inputStyle, height: 90, resize: 'vertical', fontFamily: 'monospace', fontSize: 12 }}
+                placeholder={'-y\n@modelcontextprotocol/server-github'}
+              />
+            </div>
+            <div style={{ marginBottom: 16 }}>
+              <label style={labelStyle}>环境变量（每行 KEY=VALUE，可选）</label>
+              <textarea
+                value={mcpForm.env}
+                onChange={(e) => setMcpForm({ ...mcpForm, env: e.target.value })}
+                style={{ ...inputStyle, height: 70, resize: 'vertical', fontFamily: 'monospace', fontSize: 12 }}
+                placeholder={'GITHUB_TOKEN=ghp_xxx\nANOTHER_KEY=value'}
+              />
+            </div>
+            <div style={{ display: 'flex', gap: 8, marginTop: 8 }}>
+              <button
+                onClick={handleSaveMcp}
+                disabled={!mcpForm.name.trim() || !mcpForm.command.trim()}
+                style={{ ...saveBtnStyle, opacity: (!mcpForm.name.trim() || !mcpForm.command.trim()) ? 0.5 : 1 }}
+              >
+                Save
+              </button>
+              <button onClick={() => setIsEditingMcp(false)} style={cancelBtnStyle}>Back</button>
             </div>
           </>
         )}

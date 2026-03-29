@@ -352,6 +352,12 @@ class Bridge(QObject):
                     retry_state["without_session"] = True
                     return
 
+                # ★ resume 失败后，压制 error delta（是 SDK 异常的误报，bridge 将重试）
+                if retry_state["without_session"] and delta.type == "error":
+                    print(f"[Bridge] 压制 resume 失败引发的 error delta（将重试）",
+                          file=sys.stderr, flush=True)
+                    return
+
                 # 按类型累积
                 if delta.type == "text_delta" and delta.text:
                     iter_text.append(delta.text)
@@ -413,19 +419,25 @@ class Bridge(QObject):
                 if iteration == 0:
                     if need_compress:
                         compressed = compress_messages(session.messages[:-1], keep_recent=6)
-                        # 把压缩历史注入到 prompt 开头
                         send_content = f"以下是之前对话的摘要，供你参考：\n\n{compressed}\n\n---\n\n请继续回答用户的问题：\n{current_content}"
                         print(f"[Bridge] 压缩历史消息并注入 prompt",
                               file=sys.stderr, flush=True)
                     msgs_for_backend = session.messages[:-1]
                 else:
                     # 续跑或重试逻辑
-                    if retry_state["without_session"] and need_compress:
-                        # Retry 且需要压缩，把历史注入到 prompt
-                        compressed = compress_messages(session.messages[:-1], keep_recent=6)
-                        send_content = f"以下是之前对话的摘要，供你参考：\n\n{compressed}\n\n---\n\n请继续回答用户的问题：\n{current_content}"
-                        print(f"[Bridge] Retry 压缩历史消息并注入 prompt",
-                              file=sys.stderr, flush=True)
+                    if retry_state["without_session"]:
+                        # ★ session 过期后重建：无论消息数量，始终把历史注入新 session
+                        # 这样第三方 API（dashscope 等）也能保持多轮对话上下文
+                        prior_msgs = session.messages[:-1]
+                        if prior_msgs:
+                            history_str = compress_messages(prior_msgs, keep_recent=6)
+                            send_content = (
+                                f"以下是之前对话的历史记录，请在此基础上继续：\n\n"
+                                f"{history_str}\n\n"
+                                f"---\n\n{current_content}"
+                            )
+                            print(f"[Bridge] Session 过期重建，注入 {len(prior_msgs)} 条历史消息",
+                                  file=sys.stderr, flush=True)
                     msgs_for_backend = list(session.messages[:-1])
                     if all_text:
                         partial_assistant = ChatMessage(

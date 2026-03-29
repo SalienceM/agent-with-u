@@ -33,6 +33,36 @@ if (typeof document !== 'undefined' && !document.getElementById('msg-bubble-css'
     .message-bubble-wrapper:hover .bubble-action-btn {
       opacity: 1;
     }
+    /* ── 代码块复制按钮 ── */
+    pre.md-pre {
+      position: relative;
+    }
+    .code-copy-btn {
+      position: absolute;
+      bottom: 6px;
+      right: 6px;
+      padding: 2px 8px;
+      font-size: 11px;
+      line-height: 1.6;
+      border-radius: 4px;
+      border: 1px solid rgba(128,128,128,0.35);
+      background: rgba(255,255,255,0.12);
+      color: rgba(200,200,200,0.85);
+      cursor: pointer;
+      opacity: 0;
+      transition: opacity 0.15s ease, background 0.15s ease, color 0.15s ease;
+      font-family: inherit;
+      user-select: none;
+    }
+    pre.md-pre:hover .code-copy-btn {
+      opacity: 1;
+    }
+    .code-copy-btn.copied {
+      color: #3fb950;
+      border-color: #3fb95066;
+      background: rgba(63,185,80,0.12);
+      opacity: 1;
+    }
   `;
   document.head.appendChild(style);
 }
@@ -381,6 +411,36 @@ export const MessageBubble: React.FC<Props> = ({
       setLightboxSrc((target as HTMLImageElement).src);
     }
   }, []);
+
+  // ★ 为 markdown 渲染出的代码块注入复制按钮
+  useEffect(() => {
+    const el = contentRef.current;
+    if (!el) return;
+    const pres = el.querySelectorAll<HTMLElement>('pre.md-pre');
+    pres.forEach(pre => {
+      if (pre.querySelector('.code-copy-btn')) return;
+      const btn = document.createElement('button');
+      btn.className = 'code-copy-btn';
+      btn.textContent = '复制';
+      btn.title = '复制代码';
+      btn.onclick = async (e) => {
+        e.stopPropagation();
+        const code = pre.querySelector('code');
+        if (!code) return;
+        // 克隆后移除语言标签，避免语言名混入复制内容
+        const clone = code.cloneNode(true) as HTMLElement;
+        clone.querySelector('.md-code-lang')?.remove();
+        await copyToClipboard(clone.textContent?.trimEnd() ?? '');
+        btn.textContent = '已复制';
+        btn.classList.add('copied');
+        setTimeout(() => {
+          btn.textContent = '复制';
+          btn.classList.remove('copied');
+        }, 2000);
+      };
+      pre.appendChild(btn);
+    });
+  }, [message.content]);
 
   // ★ system 消息独立渲染
   if (message.role === 'system') {

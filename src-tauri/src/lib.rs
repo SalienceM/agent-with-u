@@ -24,10 +24,15 @@ fn open_log_viewer(_app: tauri::AppHandle) -> Result<(), String> {
     // 在外部窗口打开日志文件
     #[cfg(target_os = "windows")]
     {
-        // Windows: 使用 cmd 打开 tail -f 类似的功能
+        // Windows: 使用 PowerShell 的 Get-Content -Wait 实现 tail -f 效果
+        // 设置 OutputEncoding 为 UTF8 避免中文乱码
+        let ps_command = format!(
+            "$OutputEncoding = [System.Console]::OutputEncoding = [System.Text.Encoding]::UTF8; Get-Content '{}' -Wait -Tail 50 -Encoding UTF8",
+            log_path
+        );
         let _ = std::process::Command::new("cmd")
-            .args(["/C", "start", "AgentWithU Logs", "powershell", "-NoExit", "-Command",
-                   &format!("Get-Content '{}' -Wait -Tail 50", log_path)])
+            .args(["/C", "start", "AgentWithU Logs", "powershell", "-NoExit", "-Command"])
+            .arg(&ps_command)
             .spawn();
     }
 

@@ -29,23 +29,41 @@ export const App: React.FC = () => {
   const [newSessionDialogOpen, setNewSessionDialogOpen] = useState(false);
   const [skipPermissions, setSkipPermissions] = useState(true);  // ★ 权限模式开关
   const [streamingSessions, setStreamingSessions] = useState<Set<string>>(new Set());  // ★ Per-session streaming state
+  const [completedSessions, setCompletedSessions] = useState<Set<string>>(() => {
+    // ★ 持久化：从 localStorage 恢复未确认的完成通知
+    try {
+      const saved = localStorage.getItem('agent-with-u:completed-sessions');
+      return saved ? new Set<string>(JSON.parse(saved)) : new Set<string>();
+    } catch { return new Set<string>(); }
+  });
   const [backendConnected, setBackendConnected] = useState<boolean | null>(null);  // ★ null = connecting
   const [toast, setToast] = useState<{ type: 'success' | 'error' | 'info'; message: string } | null>(null);
   const [isImporting, setIsImporting] = useState(false);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [visibleCount, setVisibleCount] = useState(6);  // ★ 默认显示最近几条（3 轮对话）
   const toastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  // ★ Track if initial session check has been done to prevent re-opening dialog
-  const initialCheckDoneRef = useRef(false);
+  const activeSessionIdRef = useRef(activeSessionId);
+  activeSessionIdRef.current = activeSessionId;
   const endRef = useRef<HTMLDivElement>(null);
+  const scrollContainerRef = useRef<HTMLDivElement>(null);
+  const autoScrollRef = useRef(true);          // ★ 用 ref 避免 onScroll 闭包捕获旧值
+  const [showScrollBtn, setShowScrollBtn] = useState(false);
+  const prevStreamingRef = useRef(false);
 
-  const { config, updateConfig, resetConfig } = useConfig();
+  const { config, updateConfig, resetConfig, reloadConfig } = useConfig();
 
   const showToast = useCallback((type: 'success' | 'error' | 'info', message: string, durationMs = 4000) => {
     setToast({ type, message });
     if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
     toastTimerRef.current = setTimeout(() => setToast(null), durationMs);
   }, []);
+
+  // ★ completedSessions 持久化到 localStorage
+  useEffect(() => {
+    try {
+      localStorage.setItem('agent-with-u:completed-sessions', JSON.stringify([...completedSessions]));
+    } catch {}
+  }, [completedSessions]);
 
   /* ---- 后端连接状态 ---- */
   useEffect(() => {
@@ -54,38 +72,30 @@ export const App: React.FC = () => {
     return unsub;
   }, []);
 
-  /* ---- 加载 backends ---- */
+  /* ---- 连接后加载初始数据（处理 WS 未就绪导致首次加载为空的问题） ---- */
   useEffect(() => {
-    api.getBackends().then((list) => {
-      setBackends(list);
-    });
-  }, []);
+    if (backendConnected !== true) return;
 
-  /* ---- 加载 sessions ---- */
-  useEffect(() => {
+    api.getBackends().then(setBackends);
     api.listSessions().then((list) => {
       setSessions(list);
+      // 仅在没有活跃 session 时执行初始选择，避免重连时打断用户操作
+      setActiveSessionId((current) => {
+        if (current) return current;
+        if (list.length > 0) return list[0].id;
+        // 没有任何 session，打开新建对话框
+        setNewSessionDialogOpen((open) => { if (!open) return true; return open; });
+        return null;
+      });
     });
-  }, [activeSessionId]);  // 当 activeSessionId 变化时刷新
+    reloadConfig();
+  }, [backendConnected]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  /* ---- 初始化 session ---- */
+  /* ---- 切换 session 时刷新侧边栏列表 ---- */
   useEffect(() => {
-    // ★ Skip if already checked or session is already active
-    if (initialCheckDoneRef.current || activeSessionId) return;
-    initialCheckDoneRef.current = true;
-
-    // ★ 只用一次初始化，避免重复触发
-    const initSession = async () => {
-      const sessions = await api.listSessions();
-      if (sessions.length > 0) {
-        setActiveSessionId(sessions[0].id);
-      } else if (!newSessionDialogOpen) {
-        // ★ Only open dialog if not already open (prevents re-opening after user closes)
-        setNewSessionDialogOpen(true);
-      }
-    };
-    initSession();
-  }, [activeSessionId, newSessionDialogOpen]);
+    if (!activeSessionId || backendConnected !== true) return;
+    api.listSessions().then(setSessions);
+  }, [activeSessionId, backendConnected]);
 
   /* ---- 加载当前 session 详情（含 backendId） ---- */
   useEffect(() => {
@@ -111,7 +121,7 @@ export const App: React.FC = () => {
 
   const chat = useChat(activeSessionId || '', activeBackendId, backends, skipPermissions);
 
-  // ★ Sync per-session streaming state
+  // ★ 活跃 session 的流状态同步（开始/结束）
   useEffect(() => {
     if (activeSessionId) {
       setStreamingSessions((prev) => {
@@ -126,16 +136,81 @@ export const App: React.FC = () => {
     }
   }, [chat.isStreaming, activeSessionId]);
 
+  // ★ 全局监听所有 session 的 done/error，修正后台 session 绿点不消失的 bug
+  useEffect(() => {
+    const unsub = api.onStreamDelta((delta: any) => {
+      const sid: string | undefined = delta.sessionId;
+      if (!sid) return;
+      if (delta.type === 'done' || delta.type === 'error') {
+        // 无论哪个 session，都从 streaming 中移除
+        setStreamingSessions((prev) => {
+          if (!prev.has(sid)) return prev;
+          const next = new Set(prev);
+          next.delete(sid);
+          return next;
+        });
+        // 如果完成的是后台 session（非当前活跃），标记为"已完成待查看"
+        if (delta.type === 'done' && sid !== activeSessionIdRef.current) {
+          setCompletedSessions((prev) => {
+            const next = new Set(prev);
+            next.add(sid);
+            return next;
+          });
+        }
+      }
+    });
+    return unsub;
+  }, []);
+
   /* ---- 自动滚到底部 ---- */
   const prevSessionRef = useRef(activeSessionId);
   useEffect(() => {
     const switched = prevSessionRef.current !== activeSessionId;
     prevSessionRef.current = activeSessionId;
-    // 等待 DOM 布局完成后再滚动，避免发送消息后滚动不到底
+    // 切换 session 时始终滚到底并重置跟踪状态
+    if (switched) {
+      autoScrollRef.current = true;
+      setShowScrollBtn(false);
+    }
+    if (!autoScrollRef.current) return;
     requestAnimationFrame(() => {
       endRef.current?.scrollIntoView({ behavior: switched ? 'instant' : 'smooth' });
     });
   }, [chat.messages, activeSessionId]);
+
+  // ★ 每次新交互开始（streaming 启动）时重置跟踪
+  useEffect(() => {
+    if (chat.isStreaming && !prevStreamingRef.current) {
+      autoScrollRef.current = true;
+      setShowScrollBtn(false);
+    }
+    prevStreamingRef.current = chat.isStreaming;
+  }, [chat.isStreaming]);
+
+  // ★ 滚动事件：用户向上滚 → 暂停跟踪；回到底部 → 恢复跟踪
+  const handleScroll = useCallback(() => {
+    const el = scrollContainerRef.current;
+    if (!el) return;
+    const atBottom = el.scrollTop + el.clientHeight >= el.scrollHeight - 80;
+    if (atBottom) {
+      if (!autoScrollRef.current) {
+        autoScrollRef.current = true;
+        setShowScrollBtn(false);
+      }
+    } else {
+      if (autoScrollRef.current) {
+        autoScrollRef.current = false;
+        setShowScrollBtn(true);
+      }
+    }
+  }, []);
+
+  // ★ 点击"跟踪最新"按钮
+  const scrollToBottom = useCallback(() => {
+    autoScrollRef.current = true;
+    setShowScrollBtn(false);
+    endRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, []);
 
   /* ---- 新建会话 ---- */
   const handleNewSession = useCallback(() => {
@@ -274,6 +349,25 @@ export const App: React.FC = () => {
   const hasBg = !!config.bgImage;
   const ua = config.uiOpacity ?? 1;  // panel alpha
 
+  // 首次连接中（null = 尚未收到任何连接状态回调）
+  if (backendConnected === null) {
+    return (
+      <div style={{
+        display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center',
+        height: '100vh', background: theme.bg, color: theme.textMuted, gap: 16,
+        fontFamily: 'system-ui, sans-serif',
+      }}>
+        <div style={{
+          width: 32, height: 32, border: `3px solid ${theme.border}`,
+          borderTopColor: theme.accent, borderRadius: '50%',
+          animation: 'spin 0.8s linear infinite',
+        }} />
+        <style>{`@keyframes spin { to { transform: rotate(360deg); } }`}</style>
+        <span style={{ fontSize: 14 }}>正在连接后端...</span>
+      </div>
+    );
+  }
+
   return (
     <div style={{
       ...rootStyle,
@@ -368,12 +462,24 @@ export const App: React.FC = () => {
 
       <Sidebar
         activeSessionId={activeSessionId}
-        onSelectSession={setActiveSessionId}
+        onSelectSession={(id) => {
+          setActiveSessionId(id);
+          // ★ 不在这里消除通知，必须由用户点击红点明确确认
+        }}
+        onAcknowledgeSession={(id) => {
+          setCompletedSessions((prev) => {
+            if (!prev.has(id)) return prev;
+            const next = new Set(prev);
+            next.delete(id);
+            return next;
+          });
+        }}
         onNewSession={handleNewSession}
         onDeleteSession={(id) => {
           if (id === activeSessionId) setActiveSessionId(null);
         }}
         streamingSessions={streamingSessions}
+        completedSessions={completedSessions}
         collapsed={sidebarCollapsed}
         onToggleCollapse={() => setSidebarCollapsed((v) => !v)}
       />
@@ -427,7 +533,8 @@ export const App: React.FC = () => {
         </div>
 
         {/* ---- 消息列表 ---- */}
-        <div style={{ flex: 1, overflow: 'auto', padding: '16px 0' }}>
+        <div style={{ flex: 1, position: 'relative', overflow: 'hidden' }}>
+        <div ref={scrollContainerRef} onScroll={handleScroll} style={{ height: '100%', overflow: 'auto', padding: '16px 0' }}>
           {chat.messages.length === 0 && (
             <div
               style={{
@@ -512,6 +619,36 @@ export const App: React.FC = () => {
           <div ref={endRef} />
         </div>
 
+        {/* ★ 跟踪暂停时的浮动提示按钮 */}
+        {showScrollBtn && (
+          <div style={{
+            position: 'absolute', bottom: 12, left: '50%',
+            transform: 'translateX(-50%)', zIndex: 50,
+          }}>
+            <button
+              onClick={scrollToBottom}
+              style={{
+                display: 'flex', alignItems: 'center', gap: 6,
+                padding: '6px 14px',
+                borderRadius: 20,
+                border: '1px solid var(--theme-border, rgba(0,0,0,0.18))',
+                background: 'var(--theme-bg-tertiary, #242536)',
+                color: 'var(--theme-text, #e2e3ea)',
+                fontSize: 12, fontWeight: 500,
+                cursor: 'pointer',
+                boxShadow: '0 2px 10px rgba(0,0,0,0.25)',
+                whiteSpace: 'nowrap',
+              }}
+            >
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M12 5v14M5 12l7 7 7-7" />
+              </svg>
+              跟踪最新
+            </button>
+          </div>
+        )}
+        </div>
+
         {/* ---- 输入栏 ---- */}
         <ChatInput
           onSend={chat.sendMessage}
@@ -520,6 +657,7 @@ export const App: React.FC = () => {
           backends={backends}
           activeBackendId={activeBackendId}
           sessionId={activeSessionId || undefined}
+          workingDir={activeSession?.workingDir || undefined}
           skipPermissions={skipPermissions}
           onSkipPermissionsChange={(enabled) => {
             setSkipPermissions(enabled);

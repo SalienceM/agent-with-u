@@ -347,6 +347,15 @@ export const api = {
     return () => { connectionStatusCallbacks = connectionStatusCallbacks.filter((cb) => cb !== callback); };
   },
 
+  async listDirectory(path: string): Promise<{ name: string; path: string; isDir: boolean }[]> {
+    const result = await call('listDirectory', path);
+    try {
+      const data = JSON.parse(result);
+      if (Array.isArray(data)) return data;
+      return [];
+    } catch { return []; }
+  },
+
   async getAppConfig(): Promise<any> {
     const result = await call('getAppConfig');
     try { return JSON.parse(result); } catch { return {}; }
@@ -371,6 +380,16 @@ export const api = {
   async getClaudeSettings(): Promise<{ model: string }> {
     const result = await call('getClaudeSettings');
     try { return JSON.parse(result); } catch { return { model: '' }; }
+  },
+
+  async getMcpServers(): Promise<Record<string, any>> {
+    const result = await call('getMcpServers');
+    try { return JSON.parse(result) || {}; } catch { return {}; }
+  },
+
+  async saveMcpServers(servers: Record<string, any>): Promise<{ status: string; message?: string }> {
+    const result = await call('saveMcpServers', JSON.stringify(servers));
+    try { return JSON.parse(result); } catch { return { status: 'ok' }; }
   },
 
   async grantPermission(sessionId: string, granted: boolean, skipRest: boolean = false): Promise<void> {
