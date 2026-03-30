@@ -211,9 +211,12 @@ class ClaudeAgentBackend(ModelBackend):
 
         try:
             model = self.get_env("ANTHROPIC_MODEL") or self.config.model
-            tools: list[str] = getattr(self.config, "allowed_tools", None) or [
+            tools: list[str] = list(getattr(self.config, "allowed_tools", None) or [
                 "Read", "Edit", "Bash", "Glob", "Grep", "Write"
-            ]
+            ])
+            # ★ 始终确保 Skill 工具可用，使 ~/.claude/skills/ 和 .claude/skills/ 中的 skill 可被调用
+            if "Skill" not in tools:
+                tools.append("Skill")
             cwd = working_dir or getattr(self.config, "working_dir", None) or "."
             if skip_permissions is None:
                 skip_permissions = getattr(self.config, "skip_permissions", True)
@@ -323,6 +326,9 @@ class ClaudeAgentBackend(ModelBackend):
                 # ★ 始终使用 bypassPermissions，让后端自己处理权限门控
                 permission_mode="bypassPermissions",
                 include_partial_messages=True,
+                # ★ 加载用户级和项目级 settings（~/.claude/skills/ 和 .claude/skills/）
+                # 这是 Skills 系统生效的必要条件，默认 SDK 不加载任何 settings
+                setting_sources=["user", "project"],
             )
             if agent_session_id:
                 options_kwargs["resume"] = agent_session_id
@@ -594,9 +600,12 @@ class ClaudeCodeOfficialBackend(ModelBackend):
         if agent_session_id:
             cmd.extend(["--resume", agent_session_id])
 
-        tools: list[str] = getattr(self.config, "allowed_tools", None) or [
+        tools: list[str] = list(getattr(self.config, "allowed_tools", None) or [
             "Read", "Edit", "Bash", "Glob", "Grep", "Write"
-        ]
+        ])
+        # ★ 始终确保 Skill 工具可用
+        if "Skill" not in tools:
+            tools.append("Skill")
         for tool in tools:
             cmd.extend(["--allowedTools", tool])
 
