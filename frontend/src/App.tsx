@@ -6,6 +6,7 @@ import { MessageBubble } from './components/MessageBubble';
 import { ChatInput } from './components/ChatInput';
 import { Settings } from './components/Settings';
 import { BackendManager } from './components/BackendManager';
+import { SkillManager } from './components/SkillManager';
 import { PermissionGate } from './components/PermissionGate';
 import { useChat } from './hooks/useChat';
 import { useConfig } from './hooks/useConfig';
@@ -26,6 +27,7 @@ export const App: React.FC = () => {
   const [activeSession, setActiveSession] = useState<any | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [backendManagerOpen, setBackendManagerOpen] = useState(false);
+  const [skillManagerOpen, setSkillManagerOpen] = useState(false);
   const [migrateDialogOpen, setMigrateDialogOpen] = useState(false);
   const [newSessionDialogOpen, setNewSessionDialogOpen] = useState(false);
   const [skipPermissions, setSkipPermissions] = useState(true);  // ★ 权限模式开关
@@ -536,6 +538,13 @@ export const App: React.FC = () => {
             📋 Logs
           </button>
           <button
+            onClick={() => setSkillManagerOpen(true)}
+            style={settingsBtnStyle}
+            title="Skill 库"
+          >
+            ⚡
+          </button>
+          <button
             onClick={() => setSettingsOpen(true)}
             style={settingsBtnStyle}
             title="Settings"
@@ -711,6 +720,13 @@ export const App: React.FC = () => {
         sessions={sessions}
         onSaveBackend={handleSaveBackend}
         onDeleteBackend={handleDeleteBackend}
+      />
+
+      {/* ---- Skill Manager ---- */}
+      <SkillManager
+        isOpen={skillManagerOpen}
+        onClose={() => setSkillManagerOpen(false)}
+        workingDir={activeSession?.workingDir || ''}
       />
 
       {/* ---- Phase 3: Migrate Dialog ---- */}

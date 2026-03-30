@@ -17,6 +17,14 @@ type StreamDeltaCallback = (delta: any) => void;
 type SessionUpdateCallback = (data: any) => void;
 type PermissionRequestCallback = (data: any) => void;
 
+export interface SkillInfo {
+  name: string;
+  content: string;        // SKILL.md 完整内容
+  isGlobal: boolean;      // 是否已全局激活（~/.claude/skills/）
+  isProject: boolean;     // 是否已在当前工作目录激活
+  projectActivations: string[];  // 所有已激活的工作目录列表
+}
+
 const WS_PORT_DEFAULT = 44321;
 const WS_CONNECT_TIMEOUT_MS = 3000;
 
@@ -389,6 +397,37 @@ export const api = {
 
   async saveMcpServers(servers: Record<string, any>): Promise<{ status: string; message?: string }> {
     const result = await call('saveMcpServers', JSON.stringify(servers));
+    try { return JSON.parse(result); } catch { return { status: 'ok' }; }
+  },
+
+  // ── Skill 孵化库 ──────────────────────────────────────────────────────
+  async listSkills(workingDir: string = ''): Promise<SkillInfo[]> {
+    const result = await call('listSkills', workingDir);
+    try { return JSON.parse(result) || []; } catch { return []; }
+  },
+
+  async saveSkill(name: string, content: string): Promise<{ status: string; message?: string }> {
+    const result = await call('saveSkill', name, content);
+    try { return JSON.parse(result); } catch { return { status: 'ok' }; }
+  },
+
+  async deleteSkill(name: string): Promise<{ status: string; message?: string }> {
+    const result = await call('deleteSkill', name);
+    try { return JSON.parse(result); } catch { return { status: 'ok' }; }
+  },
+
+  async activateSkill(name: string, scope: 'global' | 'project', workingDir: string = ''): Promise<{ status: string; message?: string }> {
+    const result = await call('activateSkill', name, scope, workingDir);
+    try { return JSON.parse(result); } catch { return { status: 'ok' }; }
+  },
+
+  async deactivateSkill(name: string, scope: 'global' | 'project', workingDir: string = ''): Promise<{ status: string; message?: string }> {
+    const result = await call('deactivateSkill', name, scope, workingDir);
+    try { return JSON.parse(result); } catch { return { status: 'ok' }; }
+  },
+
+  async renameSkill(oldName: string, newName: string, newContent: string): Promise<{ status: string; message?: string }> {
+    const result = await call('renameSkill', oldName, newName, newContent);
     try { return JSON.parse(result); } catch { return { status: 'ok' }; }
   },
 

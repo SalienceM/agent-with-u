@@ -36,6 +36,7 @@ from .backends import create_backend, ModelBackend, StreamDelta, PermissionReque
 from .instance_manager import InstanceManager
 from .backend_store import BackendStore
 from .app_config_store import AppConfigStore
+from .skill_store import SkillStore
 
 # ── 剪贴板（非 Qt，Pillow ImageGrab，仅 Windows/macOS）──────────
 
@@ -111,6 +112,7 @@ class BridgeWS:
     def __init__(self, cli_path: Optional[str] = None):
         self._session_store = SessionStore()
         self._backend_store = BackendStore()
+        self._skill_store = SkillStore()
         # ★ 如果检测到内置 claude CLI，注入到默认后端配置
         self._cli_path = cli_path
         self._app_config_store = AppConfigStore()
@@ -443,6 +445,68 @@ class BridgeWS:
             return json.dumps({"status": "ok"}, ensure_ascii=False)
         except Exception as e:
             print(f"[BridgeWS] saveMcpServers error: {e}", file=sys.stderr)
+            return json.dumps({"status": "error", "message": str(e)}, ensure_ascii=False)
+
+    # ══════════════════════════════════════════════════════════════════
+    #  Skill 孵化库 RPC
+    # ══════════════════════════════════════════════════════════════════
+
+    def _rpc_listSkills(self, working_dir: str = "") -> str:
+        """返回孵化库中所有 skill，附带当前工作目录的激活状态。"""
+        try:
+            skills = self._skill_store.list_skills(working_dir)
+            return json.dumps(skills, ensure_ascii=False)
+        except Exception as e:
+            print(f"[BridgeWS] listSkills error: {e}", file=sys.stderr)
+            return json.dumps([])
+
+    def _rpc_saveSkill(self, name: str, content: str) -> str:
+        """保存或更新孵化库中的 skill（同步到已激活位置）。"""
+        try:
+            self._skill_store.save_skill(name.strip(), content)
+            return json.dumps({"status": "ok"}, ensure_ascii=False)
+        except Exception as e:
+            print(f"[BridgeWS] saveSkill error: {e}", file=sys.stderr)
+            return json.dumps({"status": "error", "message": str(e)}, ensure_ascii=False)
+
+    def _rpc_deleteSkill(self, name: str) -> str:
+        """从孵化库删除 skill，撤销所有激活位置。"""
+        try:
+            self._skill_store.delete_skill(name.strip())
+            return json.dumps({"status": "ok"}, ensure_ascii=False)
+        except Exception as e:
+            print(f"[BridgeWS] deleteSkill error: {e}", file=sys.stderr)
+            return json.dumps({"status": "error", "message": str(e)}, ensure_ascii=False)
+
+    def _rpc_activateSkill(self, name: str, scope: str, working_dir: str = "") -> str:
+        """
+        激活 skill。
+          scope: "global"  → ~/.claude/skills/<name>/
+          scope: "project" → <working_dir>/.claude/skills/<name>/
+        """
+        try:
+            self._skill_store.activate(name.strip(), scope, working_dir)
+            return json.dumps({"status": "ok"}, ensure_ascii=False)
+        except Exception as e:
+            print(f"[BridgeWS] activateSkill error: {e}", file=sys.stderr)
+            return json.dumps({"status": "error", "message": str(e)}, ensure_ascii=False)
+
+    def _rpc_deactivateSkill(self, name: str, scope: str, working_dir: str = "") -> str:
+        """停用 skill，删除目标位置的 SKILL.md。"""
+        try:
+            self._skill_store.deactivate(name.strip(), scope, working_dir)
+            return json.dumps({"status": "ok"}, ensure_ascii=False)
+        except Exception as e:
+            print(f"[BridgeWS] deactivateSkill error: {e}", file=sys.stderr)
+            return json.dumps({"status": "error", "message": str(e)}, ensure_ascii=False)
+
+    def _rpc_renameSkill(self, old_name: str, new_name: str, new_content: str) -> str:
+        """重命名 skill（含内容更新，保留所有激活记录迁移到新名称）。"""
+        try:
+            self._skill_store.rename_skill(old_name.strip(), new_name.strip(), new_content)
+            return json.dumps({"status": "ok"}, ensure_ascii=False)
+        except Exception as e:
+            print(f"[BridgeWS] renameSkill error: {e}", file=sys.stderr)
             return json.dumps({"status": "error", "message": str(e)}, ensure_ascii=False)
 
     def _rpc_openModelTerminal(self, backend_id: str = "") -> str:
