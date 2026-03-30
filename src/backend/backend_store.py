@@ -38,6 +38,7 @@ class BackendStore:
                         skip_permissions=item.get("skipPermissions", True),
                         env=item.get("env"),
                         extra_headers=item.get("extraHeaders"),
+                        mcp_servers=item.get("mcpServers"),
                     )
                     self._configs[config.id] = config
                 print(f"[BackendStore] Loaded {len(self._configs)} backend configs", flush=True)
@@ -70,6 +71,7 @@ class BackendStore:
             "skipPermissions": config.skip_permissions,
             "env": config.env,
             "extraHeaders": config.extra_headers,
+            "mcpServers": config.mcp_servers,
         }
 
     def list(self) -> list[ModelBackendConfig]:
@@ -126,6 +128,7 @@ class BackendStore:
                     skip_permissions=item.get("skipPermissions", True),
                     env=item.get("env"),
                     extra_headers=item.get("extraHeaders"),
+                    mcp_servers=item.get("mcpServers"),
                 )
                 self._configs[config.id] = config
             # Save to disk

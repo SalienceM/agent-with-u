@@ -366,6 +366,7 @@ class BridgeWS:
                 env=data.get("env") or None,
                 cli_path=existing.cli_path if existing else None,
                 allowed_tools=data.get("allowedTools"),
+                mcp_servers=data.get("mcpServers") or None,
             )
         else:
             config = ModelBackendConfig(
@@ -373,6 +374,7 @@ class BridgeWS:
                 base_url=data.get("baseUrl"), model=data.get("model"), api_key=data.get("apiKey"),
                 working_dir=data.get("workingDir"), allowed_tools=data.get("allowedTools"),
                 skip_permissions=data.get("skipPermissions", True), env=data.get("env"),
+                mcp_servers=data.get("mcpServers") or None,
             )
         self._backend_store.save(config)
         idx = next((i for i, c in enumerate(self._backend_configs) if c.id == config.id), -1)

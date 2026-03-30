@@ -32,6 +32,7 @@ class ModelBackendConfig:
     env: Optional[dict[str, str]] = None  # {ANTHROPIC_MODEL, ANTHROPIC_BASE_URL, ANTHROPIC_AUTH_TOKEN}
     cli_path: Optional[str] = None  # Override path to claude CLI binary
     extra_headers: Optional[dict[str, str]] = None  # Custom HTTP headers for proxy/relay backends
+    mcp_servers: Optional[dict[str, dict]] = None  # MCP server configurations
 
     def to_dict(self) -> dict:
         return {
@@ -47,6 +48,7 @@ class ModelBackendConfig:
             "env": self.env,
             "cliPath": self.cli_path,
             "extraHeaders": self.extra_headers,
+            "mcpServers": self.mcp_servers,
         }
 
     def get_env(self, key: str, default: Optional[str] = None) -> Optional[str]:

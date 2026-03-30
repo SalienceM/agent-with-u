@@ -332,6 +332,12 @@ class ClaudeAgentBackend(ModelBackend):
             if cli_path:
                 options_kwargs["cli_path"] = cli_path
 
+            mcp_servers = getattr(self.config, "mcp_servers", None)
+            if mcp_servers:
+                options_kwargs["mcp_servers"] = mcp_servers
+                print(f"[ClaudeAgent] MCP servers: {list(mcp_servers.keys())}",
+                      file=sys.stderr, flush=True)
+
             options = ClaudeAgentOptions(**options_kwargs)
 
             print(f"[ClaudeAgent] SDK query: model={model}, resume={agent_session_id!r}, "
@@ -599,6 +605,20 @@ class ClaudeCodeOfficialBackend(ModelBackend):
         skip_permissions = getattr(self.config, "skip_permissions", True)
         if skip_permissions:
             cmd.append("--dangerously-skip-permissions")
+
+        # ★ MCP servers：写入临时配置文件，通过 --mcp-config 传给 CLI
+        mcp_servers = getattr(self.config, "mcp_servers", None)
+        if mcp_servers:
+            mcp_conf_dir = Path.home() / ".agent-with-u"
+            mcp_conf_dir.mkdir(parents=True, exist_ok=True)
+            mcp_conf_path = mcp_conf_dir / f"mcp_{self.config.id}.json"
+            mcp_conf_path.write_text(
+                json.dumps({"mcpServers": mcp_servers}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            cmd.extend(["--mcp-config", str(mcp_conf_path)])
+            print(f"[OfficialBackend] MCP config: {list(mcp_servers.keys())} -> {mcp_conf_path}",
+                  file=sys.stderr, flush=True)
 
         if stdin_mode:
             # ★ 图片模式：通过 stdin 传入 stream-json 格式的多模态消息

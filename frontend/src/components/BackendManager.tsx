@@ -19,6 +19,7 @@ interface BackendConfig {
   skipPermissions?: boolean;
   env?: Record<string, string>;
   extraHeaders?: Record<string, string>;
+  mcpServers?: Record<string, any>;
   pinned?: boolean;  // 固定后端，不可删除
 }
 
@@ -42,6 +43,94 @@ function _cleanHeaders(h: Record<string, string> | undefined): Record<string, st
   Object.entries(h).forEach(([k, v]) => { if (k.trim() && v.trim()) out[k.trim()] = v.trim(); });
   return Object.keys(out).length > 0 ? out : undefined;
 }
+
+const inputStyle: React.CSSProperties = {
+  width: '100%', padding: '10px 12px',
+  background: 'var(--theme-input-bg)',
+  border: '1px solid var(--theme-border)', borderRadius: 6,
+  color: 'var(--theme-text)', fontSize: 13, outline: 'none',
+  boxSizing: 'border-box',
+};
+
+// MCP Servers editor component
+const MCP_PLACEHOLDER = `{
+  "puppeteer": {
+    "command": "npx",
+    "args": ["-y", "@modelcontextprotocol/server-puppeteer"]
+  },
+  "filesystem": {
+    "command": "npx",
+    "args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+  }
+}`;
+
+const McpServersEditor: React.FC<{
+  mcpServers: Record<string, any> | undefined;
+  onChange: (v: Record<string, any> | undefined) => void;
+}> = ({ mcpServers, onChange }) => {
+  const [text, setText] = React.useState(() =>
+    mcpServers && Object.keys(mcpServers).length > 0
+      ? JSON.stringify(mcpServers, null, 2)
+      : ''
+  );
+  const [jsonError, setJsonError] = React.useState<string | null>(null);
+
+  const handleChange = (val: string) => {
+    setText(val);
+    if (!val.trim()) {
+      setJsonError(null);
+      onChange(undefined);
+      return;
+    }
+    try {
+      const parsed = JSON.parse(val);
+      setJsonError(null);
+      onChange(parsed);
+    } catch (e: any) {
+      setJsonError(e.message);
+    }
+  };
+
+  return (
+    <div style={{ marginBottom: 16, padding: 12, background: 'var(--theme-bg-secondary)', borderRadius: 8 }}>
+      <label style={{ fontSize: 12, fontWeight: 600, color: 'var(--theme-text)', display: 'block', marginBottom: 6 }}>
+        MCP Servers（可选）
+      </label>
+      <p style={{ fontSize: 11, color: 'var(--theme-text-muted)', margin: '0 0 10px 0', lineHeight: 1.6 }}>
+        配置 MCP (Model Context Protocol) 工具服务器。
+        Claude 会自动使用这些服务器提供的工具（如 Puppeteer 截图、文件系统访问等）。
+        留空则不启用 MCP。
+      </p>
+      <div style={{ marginBottom: 8 }}>
+        <div style={{ fontSize: 11, color: 'var(--theme-text-muted)', marginBottom: 4 }}>
+          格式：JSON 对象，key 为服务器名称，value 为配置
+        </div>
+        <textarea
+          value={text}
+          onChange={(e) => handleChange(e.target.value)}
+          style={{
+            ...inputStyle,
+            height: 140,
+            resize: 'vertical',
+            fontFamily: 'monospace',
+            fontSize: 12,
+            ...(jsonError ? { borderColor: 'rgba(239,68,68,0.6)' } : {}),
+          }}
+          placeholder={MCP_PLACEHOLDER}
+          spellCheck={false}
+        />
+        {jsonError && (
+          <p style={{ fontSize: 11, color: 'rgba(239,68,68,0.9)', margin: '4px 0 0 0' }}>
+            JSON 格式错误：{jsonError}
+          </p>
+        )}
+      </div>
+      <div style={{ fontSize: 11, color: 'var(--theme-text-muted)', lineHeight: 1.6 }}>
+        示例：Puppeteer 截图 → <code style={{ fontSize: 10, background: 'rgba(255,255,255,0.08)', padding: '1px 4px', borderRadius: 3 }}>npx -y @modelcontextprotocol/server-puppeteer</code>
+      </div>
+    </div>
+  );
+};
 
 export const BackendManager: React.FC<BackendManagerProps> = ({
   isOpen,
@@ -114,7 +203,7 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
     };
 
     if (formData.pinned) {
-      // 固定后端：只保存 env、skipPermissions、allowedTools
+      // 固定后端：只保存 env、skipPermissions、allowedTools、mcpServers
       const cleanedEnv: Record<string, string> = {};
       Object.entries(formData.env || {}).forEach(([k, v]) => {
         if (v && v.trim()) cleanedEnv[k] = v.trim();
@@ -122,7 +211,9 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
       if (Object.keys(cleanedEnv).length > 0) saved.env = cleanedEnv;
       saved.skipPermissions = formData.skipPermissions !== false;
       if (formData.allowedTools?.length) saved.allowedTools = formData.allowedTools;
+      if (formData.mcpServers && Object.keys(formData.mcpServers).length > 0) saved.mcpServers = formData.mcpServers;
     } else if (formData.type === 'claude-agent-sdk') {
+      // Only env vars + skipPermissions + allowedTools + mcpServers matter
       const cleanedEnv: Record<string, string> = {};
       Object.entries(formData.env || {}).forEach(([k, v]) => {
         if (v && v.trim()) cleanedEnv[k] = v.trim();
@@ -130,6 +221,7 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
       if (Object.keys(cleanedEnv).length > 0) saved.env = cleanedEnv;
       saved.skipPermissions = formData.skipPermissions !== false;
       if (formData.allowedTools?.length) saved.allowedTools = formData.allowedTools;
+      if (formData.mcpServers && Object.keys(formData.mcpServers).length > 0) saved.mcpServers = formData.mcpServers;
     } else if (formData.type === 'claude-code-official') {
       const cleanedEnv: Record<string, string> = {};
       Object.entries(formData.env || {}).forEach(([k, v]) => {
@@ -139,6 +231,7 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
       if (formData.model?.trim()) saved.model = formData.model.trim();
       saved.skipPermissions = formData.skipPermissions !== false;
       if (formData.allowedTools?.length) saved.allowedTools = formData.allowedTools;
+      if (formData.mcpServers && Object.keys(formData.mcpServers).length > 0) saved.mcpServers = formData.mcpServers;
     } else if (formData.type === 'openai-compatible') {
       // base_url, api_key, model, extra_headers
       if (formData.baseUrl?.trim()) saved.baseUrl = formData.baseUrl.trim();
@@ -735,6 +828,14 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
               </div>
             )}
 
+            {/* ── MCP Servers 配置（claude-agent-sdk / claude-code-official）── */}
+            {(formData.type === 'claude-agent-sdk' || formData.type === 'claude-code-official' || formData.pinned) && (
+              <McpServersEditor
+                mcpServers={formData.mcpServers}
+                onChange={(v) => setFormData((prev) => ({ ...prev, mcpServers: v }))}
+              />
+            )}
+
             {/* ── OpenAI Compatible 专属配置 ── */}
             {formData.type === 'openai-compatible' && (
               <div style={{ marginBottom: 16, padding: 12, background: 'var(--theme-bg-secondary)', borderRadius: 8 }}>
@@ -1113,14 +1214,6 @@ const addBtnStyle: React.CSSProperties = {
 const labelStyle: React.CSSProperties = {
   fontSize: 12, fontWeight: 500, color: 'var(--theme-text)',
   display: 'block', marginBottom: 6,
-};
-
-const inputStyle: React.CSSProperties = {
-  width: '100%', padding: '10px 12px',
-  background: 'var(--theme-input-bg)',
-  border: '1px solid var(--theme-border)', borderRadius: 6,
-  color: 'var(--theme-text)', fontSize: 13, outline: 'none',
-  boxSizing: 'border-box',
 };
 
 const selectStyle: React.CSSProperties = {
