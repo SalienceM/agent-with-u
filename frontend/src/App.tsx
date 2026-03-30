@@ -1,5 +1,6 @@
 import React, { useState, useCallback, useEffect, useRef } from 'react';
 import { api } from './api';
+import { resetStreamAccumulators } from './hooks/useStreamState';
 import { Sidebar } from './components/Sidebar';
 import { MessageBubble } from './components/MessageBubble';
 import { ChatInput } from './components/ChatInput';
@@ -136,12 +137,17 @@ export const App: React.FC = () => {
     }
   }, [chat.isStreaming, activeSessionId]);
 
-  // ★ 全局监听所有 session 的 done/error，修正后台 session 绿点不消失的 bug
+  // ★ 全局监听所有 session 的 done/error
+  // 修正两个 bug：
+  //   1. 后台 session 绿点不消失：从 streamingSessions 移除
+  //   2. 僵尸 useStreamState：清理全局流式状态，防止切换回来时误以为还在流式
   useEffect(() => {
     const unsub = api.onStreamDelta((delta: any) => {
       const sid: string | undefined = delta.sessionId;
       if (!sid) return;
       if (delta.type === 'done' || delta.type === 'error') {
+        // 无论哪个 session，都清理全局流式状态（避免僵尸状态导致切回来时发送按钮变红）
+        resetStreamAccumulators(sid);
         // 无论哪个 session，都从 streaming 中移除
         setStreamingSessions((prev) => {
           if (!prev.has(sid)) return prev;
@@ -464,7 +470,13 @@ export const App: React.FC = () => {
         activeSessionId={activeSessionId}
         onSelectSession={(id) => {
           setActiveSessionId(id);
-          // ★ 不在这里消除通知，必须由用户点击红点明确确认
+          // ★ 切换到该 session 即视为已查看，自动清除完成通知气泡
+          setCompletedSessions((prev) => {
+            if (!prev.has(id)) return prev;
+            const next = new Set(prev);
+            next.delete(id);
+            return next;
+          });
         }}
         onAcknowledgeSession={(id) => {
           setCompletedSessions((prev) => {
