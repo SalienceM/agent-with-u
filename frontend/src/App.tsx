@@ -411,8 +411,8 @@ export const App: React.FC = () => {
       {/* ★ Markdown 内容样式 + 全局动画 */}
       <style>{`
         @keyframes dialogSlideIn {
-          from { opacity: 0; transform: scale(0.95) translateY(-10px); }
-          to   { opacity: 1; transform: scale(1) translateY(0); }
+          from { opacity: 0; transform: perspective(900px) rotateX(-14deg) scale(0.96) translateY(-8px); }
+          to   { opacity: 1; transform: perspective(900px) rotateX(0deg)   scale(1)    translateY(0); }
         }
         /* ── Markdown 内容 ── */
         .md-content { line-height: 1.6; }
@@ -893,7 +893,7 @@ const MigrateDialog: React.FC<MigrateDialogProps> = ({
         style={{
           ...dialogStyle,
           willChange: 'transform',
-          animation: 'dialogSlideIn 0.15s ease-out',
+          animation: 'dialogSlideIn 0.28s cubic-bezier(0.22,0.61,0.36,1)',
         }}
         onClick={(e) => e.stopPropagation()}
       >
@@ -1130,7 +1130,7 @@ const NewSessionDialog: React.FC<NewSessionDialogProps> = ({
         style={{
           ...dialogStyle,
           willChange: 'transform',
-          animation: 'dialogSlideIn 0.15s ease-out',
+          animation: 'dialogSlideIn 0.28s cubic-bezier(0.22,0.61,0.36,1)',
         }}
         onClick={(e) => e.stopPropagation()}
       >

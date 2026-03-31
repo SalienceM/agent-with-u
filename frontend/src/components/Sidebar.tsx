@@ -172,6 +172,10 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
           0%, 100% { transform: scale(1);    box-shadow: 0 0 0 0px rgba(239,68,68,0.5); }
           50%       { transform: scale(1.12); box-shadow: 0 0 0 5px rgba(239,68,68,0); }
         }
+        @keyframes dialogSlideIn {
+          from { opacity: 0; transform: perspective(900px) rotateX(-14deg) scale(0.96) translateY(-8px); }
+          to   { opacity: 1; transform: perspective(900px) rotateX(0deg)   scale(1)    translateY(0); }
+        }
         @keyframes streamBorderFlow {
           0%   { background-position: 0% 0%; }
           100% { background-position: 0% 200%; }
@@ -355,7 +359,7 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
       {/* 删除确认对话框 */}
       {sessionToDelete && (
         <div style={overlayStyle}>
-          <div style={confirmPanelStyle} onClick={(e) => e.stopPropagation()}>
+          <div style={{ ...confirmPanelStyle, animation: 'dialogSlideIn 0.28s cubic-bezier(0.22,0.61,0.36,1)' }} onClick={(e) => e.stopPropagation()}>
             <h3 style={{ margin: '0 0 12px 0', fontSize: 16, fontWeight: 600, color: 'var(--theme-text, #1f2328)' }}>
               确认删除会话
             </h3>
