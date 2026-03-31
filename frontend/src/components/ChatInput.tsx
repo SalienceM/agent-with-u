@@ -6,6 +6,39 @@ import { SLASH_COMMANDS } from '../hooks/useChat';
 import type { SlashCommand } from '../hooks/useChat';
 import { api } from '../api';
 
+// ── 注入全局样式（focus glow + scan line）──────────────────────────────────
+if (typeof document !== 'undefined' && !document.getElementById('chat-input-css')) {
+  const s = document.createElement('style');
+  s.id = 'chat-input-css';
+  s.textContent = `
+    .chat-textarea {
+      transition: border-color 0.22s ease, box-shadow 0.22s ease;
+    }
+    .chat-textarea:focus {
+      border-color: var(--theme-accent, #0969da) !important;
+      box-shadow: 0 0 0 3px var(--theme-accent-bg, rgba(9,105,218,0.15)),
+                  0 0 14px rgba(122,162,247,0.12) !important;
+    }
+    @keyframes scanLine {
+      0%   { transform: scaleX(0); transform-origin: left center; }
+      48%  { transform: scaleX(1); transform-origin: left center; }
+      52%  { transform: scaleX(1); transform-origin: right center; }
+      100% { transform: scaleX(0); transform-origin: right center; }
+    }
+    .input-scan-line {
+      position: absolute;
+      bottom: 12px; left: 16px; right: 16px;
+      height: 1px;
+      background: linear-gradient(90deg, transparent 0%, var(--theme-accent,#7aa2f7) 50%, transparent 100%);
+      animation: scanLine 2.2s ease-in-out infinite;
+      pointer-events: none;
+      border-radius: 1px;
+      opacity: 0.6;
+    }
+  `;
+  document.head.appendChild(s);
+}
+
 type FileEntry = { name: string; path: string; isDir: boolean };
 
 interface Props {
@@ -423,6 +456,7 @@ const ChatInputInner: React.FC<Props> = ({
 
   return (
     <div style={{ padding: '8px 16px 12px', borderTop: '1px solid var(--theme-border, rgba(0,0,0,0.12))', background: 'var(--theme-bg, #ffffff)', position: 'relative' }}>
+      {isStreaming && <div className="input-scan-line" />}
       {/* ★ 工具栏：统一的图标按钮 */}
       <div style={{ display: 'flex', gap: 6, marginBottom: 6, alignItems: 'center', flexWrap: 'wrap' }}>
         <ToolbarBtn
@@ -517,6 +551,7 @@ const ChatInputInner: React.FC<Props> = ({
       <div style={{ display: 'flex', gap: 8, alignItems: 'flex-end' }}>
         <textarea
           ref={ref}
+          className="chat-textarea"
           placeholder={isStreaming ? '输入并按 Enter 可中断当前响应并续发…' : '输入消息… 输入 / 查看命令 · @ 引用文件 · Ctrl+V 粘贴图片'}
           onKeyDown={handleKeyDown}
           onCompositionStart={handleCompositionStart}

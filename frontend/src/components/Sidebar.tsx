@@ -166,11 +166,30 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
       <style>{`
         @keyframes pulse {
           0%, 100% { opacity: 1; transform: scale(1); }
-          50% { opacity: 0.5; transform: scale(1.2); }
+          50% { opacity: 0.4; transform: scale(1.25); }
         }
         @keyframes badgePulse {
-          0%, 100% { transform: scale(1); }
-          50%       { transform: scale(1.15); }
+          0%, 100% { transform: scale(1);    box-shadow: 0 0 0 0px rgba(239,68,68,0.5); }
+          50%       { transform: scale(1.12); box-shadow: 0 0 0 5px rgba(239,68,68,0); }
+        }
+        @keyframes streamBorderFlow {
+          0%   { background-position: 0% 0%; }
+          100% { background-position: 0% 200%; }
+        }
+        .session-streaming-item {
+          border-left: 3px solid transparent !important;
+          background-clip: padding-box;
+          position: relative;
+        }
+        .session-streaming-item::before {
+          content: '';
+          position: absolute;
+          left: 0; top: 0; bottom: 0;
+          width: 3px;
+          border-radius: 3px 0 0 3px;
+          background: linear-gradient(180deg, #22c55e, #7aa2f7, #22c55e);
+          background-size: 100% 200%;
+          animation: streamBorderFlow 1.8s linear infinite;
         }
         .session-notify-badge {
           position: absolute;
@@ -187,7 +206,7 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
           text-align: center;
           padding: 0 4px;
           cursor: pointer;
-          animation: badgePulse 2s ease-in-out infinite;
+          animation: badgePulse 1.8s ease-in-out infinite;
           border: 1.5px solid var(--theme-bg, #1a1a2e);
           z-index: 10;
           transition: background 0.15s, transform 0.1s;
@@ -236,11 +255,12 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
             onClick={() => onSelectSession(s.id)}
             onMouseEnter={() => setHoveredSessionId(s.id)}
             onMouseLeave={() => setHoveredSessionId(null)}
+            className={isRunning ? 'session-streaming-item' : undefined}
             style={{
               ...itemStyle,
               ...(isActive ? { background: 'var(--theme-accent-bg, #7aa2f726)' } : {}),
               ...(hoveredSessionId === s.id && !isActive ? { background: 'var(--theme-bg-tertiary, #242536)' } : {}),
-              ...(isRunning   ? { border: '1px solid #22c55e55', borderLeft: '3px solid #22c55e' } : {}),
+              ...(isRunning   ? { border: '1px solid #22c55e33' } : {}),
               ...(isCompleted ? { border: '1px solid #ef444455', borderLeft: '3px solid #ef4444' } : {}),
             }}
           >

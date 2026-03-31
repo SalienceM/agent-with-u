@@ -16,6 +16,14 @@ if (typeof document !== 'undefined' && !document.getElementById('msg-bubble-css'
       40% { content: '..'; }
       60%, 100% { content: '...'; }
     }
+    @keyframes msgSlideIn {
+      from { opacity: 0; transform: translateY(10px) scale(0.98); }
+      to   { opacity: 1; transform: translateY(0)    scale(1); }
+    }
+    @keyframes cursorGlow {
+      0%,100% { box-shadow: 0 0 3px var(--theme-accent,rgba(122,162,247,0.8)); opacity: 1; }
+      50%     { box-shadow: 0 0 10px var(--theme-accent,rgba(122,162,247,0.8)), 0 0 20px var(--theme-accent,rgba(122,162,247,0.4)); opacity: 0.35; }
+    }
     /* ── 气泡内图片约束 ── */
     .msg-content img {
       max-width: 100%;
@@ -467,6 +475,7 @@ export const MessageBubble: React.FC<Props> = ({
         display: 'flex',
         justifyContent: isUser ? 'flex-end' : 'flex-start',
         padding: '4px 16px',
+        animation: 'msgSlideIn 0.22s ease-out',
       }}
     >
       {/* ★ 角色标签 */}
@@ -581,13 +590,13 @@ export const MessageBubble: React.FC<Props> = ({
           <span
             style={{
               display: 'inline-block',
-              width: 6,
-              height: 16,
-              background: 'var(--theme-accent, rgba(122,162,247,0.6))',
-              marginLeft: 2,
-              borderRadius: 1,
+              width: 2,
+              height: 15,
+              background: 'var(--theme-accent, rgba(122,162,247,0.9))',
+              marginLeft: 3,
+              borderRadius: 2,
               verticalAlign: 'text-bottom',
-              animation: 'cursor-blink 1s infinite',
+              animation: 'cursorGlow 0.9s ease-in-out infinite',
             }}
           />
         )}

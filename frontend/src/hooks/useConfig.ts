@@ -1,7 +1,7 @@
 import { useState, useCallback, useEffect, useRef } from 'react';
 import { api } from '../api';
 
-export type ThemeType = 'dark' | 'midnight' | 'light' | 'classic';
+export type ThemeType = 'dark' | 'midnight' | 'light' | 'classic' | 'cyber';
 
 export interface AppConfig {
   fontSize: number;
@@ -126,6 +126,30 @@ export const themes: Record<ThemeType, {
     successBg: '#2a7a3b1a',
     successBorder: '#2a7a3b33',
     error: '#cf222e',
+  },
+  cyber: {
+    // 赛博朋克 — 霓虹青 + 深空蓝黑
+    name: 'Cyber',
+    bg: '#070b14',
+    bgSecondary: '#0d1220',
+    bgTertiary: '#111827',
+    border: 'rgba(0,255,247,0.12)',
+    text: '#cff4fc',
+    textMuted: 'rgba(207,244,252,0.42)',
+    accent: '#00fff7',
+    accentHover: '#00d4cc',
+    accentBg: 'rgba(0,255,247,0.08)',
+    messageBg: '#0d1220',
+    userMessageBg: '#111827',
+    userBubbleBg: 'rgba(0,255,247,0.05)',
+    userBubbleBorder: 'rgba(0,255,247,0.3)',
+    codeBg: '#050a10',
+    inputBg: '#050a10',
+    sidebarBg: '#070b14',
+    success: '#00ff88',
+    successBg: 'rgba(0,255,136,0.1)',
+    successBorder: 'rgba(0,255,136,0.22)',
+    error: '#ff3366',
   },
   classic: {
     // 经典亮色 — GitHub Light 风格，清爽中性
