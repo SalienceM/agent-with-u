@@ -476,27 +476,32 @@ export const api = {
 
   async saveSkill(name: string, content: string): Promise<{ status: string; message?: string }> {
     const result = await call('saveSkill', name, content);
-    try { return JSON.parse(result); } catch { return { status: 'ok' }; }
+    if (result === null || result === undefined) return { status: 'error', message: '无法连接到后端' };
+    try { return JSON.parse(result); } catch { return { status: 'error', message: '响应格式错误' }; }
   },
 
   async deleteSkill(name: string): Promise<{ status: string; message?: string }> {
     const result = await call('deleteSkill', name);
-    try { return JSON.parse(result); } catch { return { status: 'ok' }; }
+    if (result === null || result === undefined) return { status: 'error', message: '无法连接到后端' };
+    try { return JSON.parse(result); } catch { return { status: 'error', message: '响应格式错误' }; }
   },
 
   async activateSkill(name: string, scope: 'global' | 'project', workingDir: string = ''): Promise<{ status: string; message?: string }> {
     const result = await call('activateSkill', name, scope, workingDir);
-    try { return JSON.parse(result); } catch { return { status: 'ok' }; }
+    if (result === null || result === undefined) return { status: 'error', message: '无法连接到后端' };
+    try { return JSON.parse(result); } catch { return { status: 'error', message: '响应格式错误' }; }
   },
 
   async deactivateSkill(name: string, scope: 'global' | 'project', workingDir: string = ''): Promise<{ status: string; message?: string }> {
     const result = await call('deactivateSkill', name, scope, workingDir);
-    try { return JSON.parse(result); } catch { return { status: 'ok' }; }
+    if (result === null || result === undefined) return { status: 'error', message: '无法连接到后端' };
+    try { return JSON.parse(result); } catch { return { status: 'error', message: '响应格式错误' }; }
   },
 
   async renameSkill(oldName: string, newName: string, newContent: string): Promise<{ status: string; message?: string }> {
     const result = await call('renameSkill', oldName, newName, newContent);
-    try { return JSON.parse(result); } catch { return { status: 'ok' }; }
+    if (result === null || result === undefined) return { status: 'error', message: '无法连接到后端' };
+    try { return JSON.parse(result); } catch { return { status: 'error', message: '响应格式错误' }; }
   },
 
   async grantPermission(sessionId: string, granted: boolean, skipRest: boolean = false): Promise<void> {
