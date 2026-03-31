@@ -305,6 +305,40 @@ class BridgeWS:
             return json.dumps(session.to_dict(), ensure_ascii=False)
         return "null"
 
+    def _rpc_updateSessionTheme(self, session_id: str, theme_overrides_json: str) -> str:
+        try:
+            theme_overrides = json.loads(theme_overrides_json)
+            if not isinstance(theme_overrides, dict):
+                return json.dumps({"status": "error", "message": "Theme overrides must be an object"})
+            session = self._active_sessions.get(session_id) or self._session_store.load(session_id)
+            if not session:
+                return json.dumps({"status": "error", "message": "Session not found"})
+            session.theme_overrides = theme_overrides
+            self._active_sessions[session_id] = session
+            self._session_store.save(session, async_=True)
+            return json.dumps({"status": "ok"}, ensure_ascii=False)
+        except Exception as e:
+            return json.dumps({"status": "error", "message": str(e)}, ensure_ascii=False)
+
+    def _rpc_updateSessionConstraints(self, session_id: str, constraints_json: str) -> str:
+        try:
+            constraints = json.loads(constraints_json)
+            if isinstance(constraints, str):
+                constraints_text = constraints
+            elif isinstance(constraints, dict):
+                constraints_text = constraints.get("constraints", "")
+            else:
+                constraints_text = ""
+            session = self._active_sessions.get(session_id) or self._session_store.load(session_id)
+            if not session:
+                return json.dumps({"status": "error", "message": "Session not found"})
+            session.constraints = constraints_text
+            self._active_sessions[session_id] = session
+            self._session_store.save(session, async_=True)
+            return json.dumps({"status": "ok"}, ensure_ascii=False)
+        except Exception as e:
+            return json.dumps({"status": "error", "message": str(e)}, ensure_ascii=False)
+
     def _rpc_deleteSession(self, sid: str) -> bool:
         self._active_sessions.pop(sid, None)
         self._instance_manager.delete(sid)
@@ -790,6 +824,7 @@ class BridgeWS:
         await self._async_send(
             session, content, images, backend_id, assistant_id,
             auto_continue=auto_continue, skip_permissions=skip_permissions,
+            constraints=session.constraints,
         )
 
     async def _async_send(
@@ -801,6 +836,7 @@ class BridgeWS:
         message_id: str,
         auto_continue: bool = True,
         skip_permissions: bool = True,
+        constraints: Optional[str] = None,
     ):
         backend = self._get_backend(backend_id)
         assistant_msg = session.messages[-1]
@@ -929,6 +965,10 @@ class BridgeWS:
                     if all_text:
                         msgs_for_backend.append(ChatMessage(id=new_id(), role="assistant", content="".join(all_text)))
                     msgs_for_backend.append(ChatMessage(id=new_id(), role="user", content=current_content))
+
+                # ★ 注入会话约束：将约束作为系统提示前缀发送给 AI（不存入对话记录）
+                if constraints and constraints.strip():
+                    send_content = f"[会话约束/规则]\n{constraints.strip()}\n\n---\n\n{send_content}"
 
                 use_agent_session = session.agent_session_id
 

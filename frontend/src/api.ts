@@ -357,15 +357,10 @@ export const api = {
   },
 
   async updateSessionConstraints(sessionId: string, constraints: string | { constraints: string }): Promise<{ status: string; message?: string }> {
-    // 接受两种格式：纯字符串或对象。直接传递给后端，不额外 stringify
-    let payload: string;
-    if (typeof constraints === 'object') {
-      payload = JSON.stringify(constraints);
-    } else {
-      payload = constraints;
-    }
+    const payload = JSON.stringify(constraints);
     const result = await call('updateSessionConstraints', sessionId, payload);
-    try { return JSON.parse(result); } catch { return { status: 'error', message: 'Failed to update constraints' }; }
+    if (result === null || result === undefined) return { status: 'error', message: '无法连接到后端' };
+    try { return JSON.parse(result); } catch { return { status: 'error', message: '响应格式错误' }; }
   },
 
   async getBackends(): Promise<any[]> {

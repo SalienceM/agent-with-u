@@ -138,6 +138,8 @@ class SessionStore:
                 working_dir=data.get("workingDir"),
                 auto_continue=data.get("autoContinue", True),
                 skip_permissions=data.get("skipPermissions", True),
+                theme_overrides=data.get("themeOverrides"),
+                constraints=data.get("constraints"),
             )
         except Exception as e:
             print(f"Failed to load session {sid}: {e}")

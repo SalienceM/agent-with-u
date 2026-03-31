@@ -59,15 +59,6 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
     setSessions(sessionList);
   }, [activeSessionId]);
 
-  // ★ Handle theme editor close and save
-  const handleThemeSave = useCallback(async (themeOverrides: Record<string, string>) => {
-    if (themeEditorSession) {
-      await api.updateSessionTheme(themeEditorSession.id, themeOverrides);
-      refresh();
-      setThemeEditorSession(null);
-    }
-  }, [themeEditorSession, refresh]);
-
   const handleThemeClose = useCallback(() => {
     refresh();
     setThemeEditorSession(null);
