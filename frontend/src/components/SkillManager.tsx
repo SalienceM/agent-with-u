@@ -123,7 +123,7 @@ export const SkillManager: React.FC<SkillManagerProps> = ({ isOpen, onClose, wor
   if (!isOpen) return null;
 
   return (
-    <div style={overlayStyle} onClick={onClose}>
+    <div style={overlayStyle}>
       <div style={panelStyle} onClick={e => e.stopPropagation()}>
 
         {/* 标题栏 */}
@@ -236,7 +236,7 @@ export const SkillManager: React.FC<SkillManagerProps> = ({ isOpen, onClose, wor
 
         {/* ── 删除确认 ── */}
         {confirmDelete && (
-          <div style={overlayStyle} onClick={() => setConfirmDelete(null)}>
+          <div style={overlayStyle}>
             <div style={{ ...panelStyle, width: 340 }} onClick={e => e.stopPropagation()}>
               <h3 style={{ margin: '0 0 12px', fontSize: 15, color: 'var(--theme-text)' }}>确认删除</h3>
               <p style={{ fontSize: 13, color: 'var(--theme-text)', margin: '0 0 8px' }}>

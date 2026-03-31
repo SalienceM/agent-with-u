@@ -387,7 +387,7 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
   if (!isOpen) return null;
 
   return (
-    <div style={overlayStyle} onClick={onClose}>
+    <div style={overlayStyle}>
       <div style={panelStyle} onClick={(e) => e.stopPropagation()}>
         {/* 标题栏 */}
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
@@ -1098,7 +1098,7 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
 
         {/* 删除确认对话框 - 有依赖的 session 时 */}
         {backendToDelete && dependentSessions.length > 0 && (
-          <div style={overlayStyle} onClick={() => setBackendToDelete(null)}>
+          <div style={overlayStyle}>
             <div style={{ ...panelStyle, width: 'auto', maxWidth: 520 }} onClick={(e) => e.stopPropagation()}>
               <h3 style={{ margin: '0 0 12px 0', fontSize: 16, fontWeight: 600, color: 'var(--theme-text)' }}>
                 删除后端将影响 {dependentSessions.length} 个会话
@@ -1149,7 +1149,7 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
 
         {/* 删除确认对话框 - 没有依赖的 session 时 */}
         {backendToDelete && dependentSessions.length === 0 && (
-          <div style={overlayStyle} onClick={() => setBackendToDelete(null)}>
+          <div style={overlayStyle}>
             <div style={{ ...panelStyle, width: 'auto', maxWidth: 400 }} onClick={(e) => e.stopPropagation()}>
               <h3 style={{ margin: '0 0 12px 0', fontSize: 16, fontWeight: 600, color: 'var(--theme-text)' }}>
                 确认删除后端

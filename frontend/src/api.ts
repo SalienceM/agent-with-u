@@ -1,16 +1,19 @@
 /**
- * api.ts: Bridge between React and Python backend via WebSocket.
+ * api.ts: Bridge between React and Python backend.
  *
- * Protocol:
+ * Supports two modes:
+ * - WebSocket mode (Tauri): Python backend runs as WebSocket server
+ * - QWebChannel mode (Qt): Qt host exposes Python objects via QWebChannel
+ *
+ * Protocol (WebSocket):
  *   Client → Server: {"id": "r1", "method": "listSessions", "params": [...]}
  *   Server → Client: {"id": "r1", "result": "..."}           // response
  *   Server → Client: {"event": "streamDelta",    "data": "..."} // push
  *   Server → Client: {"event": "sessionUpdated", "data": "..."} // push
  *
- * Tauri mode:  Rust sidecar starts Python backend automatically (release).
- *              In dev, run `python -m src.ws_main` separately.
- * Browser mode: Run `python -m src.ws_main` separately, open localhost.
- * Fallback:   Mock bridge if WebSocket unavailable after timeout.
+ * Protocol (QWebChannel):
+ *   Client calls: bridge.methodName(...params)
+ *   Server responds via Slot decorator return value
  */
 
 type StreamDeltaCallback = (delta: any) => void;
@@ -24,6 +27,24 @@ export interface SkillInfo {
   isProject: boolean;     // 是否已在当前工作目录激活
   projectActivations: string[];  // 所有已激活的工作目录列表
 }
+
+// QWebChannel support for Qt mode
+let bridge: any = null;
+let useQWebChannel = false;
+
+// Check if QWebChannel is available (Qt mode)
+function initQWebChannel() {
+  if (typeof QWebChannel !== 'undefined') {
+    new QWebChannel((channel: any) => {
+      bridge = channel.objects.bridge;
+      useQWebChannel = true;
+      console.log('[api] Using QWebChannel mode');
+    });
+  }
+}
+
+// Initialize QWebChannel immediately (if available)
+initQWebChannel();
 
 const WS_PORT_DEFAULT = 44321;
 const WS_CONNECT_TIMEOUT_MS = 3000;
@@ -189,24 +210,54 @@ wsReady = (async () => {
 // ── RPC 调用 ─────────────────────────────────────────────────
 
 async function call(method: string, ...params: any[]): Promise<any> {
+  // QWebChannel mode (Qt) - direct method call
+  if (useQWebChannel && bridge && bridge[method]) {
+    try {
+      const result = bridge[method](...params);
+      console.log(`[api] ${method} (QWebChannel) ->`, result);
+      return result;
+    } catch (e: any) {
+      console.error(`[api] ${method} QWebChannel call failed:`, e);
+      return null;
+    }
+  }
+
+  // WebSocket mode
   await wsReady;
   if (useMock || !ws || ws.readyState !== WebSocket.OPEN) {
-    return mockDispatch(method, params);
+    const mockResult = mockDispatch(method, params);
+    console.log(`[api] ${method} -> mock:`, mockResult);
+    return mockResult;
   }
   try {
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      const mockResult = mockDispatch(method, params);
+      console.log(`[api] ${method} (late check) -> mock:`, mockResult);
+      return mockResult;
+    }
     return await new Promise((resolve, reject) => {
       const id = nextId();
       pending.set(id, { resolve, reject });
       ws!.send(JSON.stringify({ id, method, params }));
     });
   } catch (err) {
-    // ★ 连接断开导致的 reject，打印警告并返回 null 保持兼容
     console.warn(`[api] call "${method}" failed:`, err);
     return null;
   }
 }
 
 async function send(method: string, ...params: any[]): Promise<void> {
+  // QWebChannel mode - no async send, just call
+  if (useQWebChannel && bridge && bridge[method]) {
+    try {
+      bridge[method](...params);
+    } catch (e: any) {
+      console.error(`[api] ${method} QWebChannel send failed:`, e);
+    }
+    return;
+  }
+
+  // WebSocket mode
   await wsReady;
   if (useMock || !ws || ws.readyState !== WebSocket.OPEN) {
     mockDispatch(method, params);
@@ -298,6 +349,23 @@ export const api = {
 
   async deleteSession(id: string): Promise<boolean> {
     return await call('deleteSession', id);
+  },
+
+  async updateSessionTheme(sessionId: string, themeOverrides: any): Promise<{ status: string; message?: string }> {
+    const result = await call('updateSessionTheme', sessionId, JSON.stringify(themeOverrides));
+    try { return JSON.parse(result); } catch { return { status: 'error', message: 'Failed to update theme' }; }
+  },
+
+  async updateSessionConstraints(sessionId: string, constraints: string | { constraints: string }): Promise<{ status: string; message?: string }> {
+    // 接受两种格式：纯字符串或对象。直接传递给后端，不额外 stringify
+    let payload: string;
+    if (typeof constraints === 'object') {
+      payload = JSON.stringify(constraints);
+    } else {
+      payload = constraints;
+    }
+    const result = await call('updateSessionConstraints', sessionId, payload);
+    try { return JSON.parse(result); } catch { return { status: 'error', message: 'Failed to update constraints' }; }
   },
 
   async getBackends(): Promise<any[]> {
@@ -513,6 +581,8 @@ function mockDispatch(method: string, params: any[]): any {
       if (idx >= 0) mockBackends.splice(idx, 1);
       return null;
     }
+    case 'updateSessionTheme': return JSON.stringify({ status: 'ok' });
+    case 'updateSessionConstraints': return JSON.stringify({ status: 'ok' });
     default: return null;
   }
 }

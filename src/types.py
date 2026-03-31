@@ -4,7 +4,7 @@ Shared type definitions and IPC protocol.
 
 from dataclasses import dataclass, field, asdict
 from enum import Enum
-from typing import Optional
+from typing import Optional, Dict, Any
 import json
 import time
 import uuid
@@ -171,6 +171,10 @@ class Session:
     max_continuations: int = 10
     # Track which backend config was used for each message
     backend_config_id: Optional[str] = None  # Alias for backend_id compatibility
+    # ★ Per-session theme overrides (optional custom colors)
+    theme_overrides: Optional[Dict[str, str]] = None  # e.g., {"accent": "#ff0000", "codeBg": "#16161e"}
+    # ★ Constraints/rules/prompts for this session -限定性提示词/规则/约束
+    constraints: Optional[str] = None  # Special system prompts, rules, or constraints for this session
 
     def to_dict(self) -> dict:
         return {
@@ -185,6 +189,8 @@ class Session:
             "autoContinue": self.auto_continue,
             "skipPermissions": self.skip_permissions,
             "maxContinuations": self.max_continuations,
+            "themeOverrides": self.theme_overrides,
+            "constraints": self.constraints,
         }
 
     def meta_dict(self) -> dict:
@@ -197,6 +203,8 @@ class Session:
             "messageCount": len(self.messages),
             "workingDir": self.working_dir,  # ★ Show directory in sidebar
             "backendId": self.backend_id,
+            "themeOverrides": self.theme_overrides,
+            "constraints": self.constraints,
         }
 
 

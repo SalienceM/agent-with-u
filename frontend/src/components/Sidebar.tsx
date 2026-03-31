@@ -1,5 +1,9 @@
 import React, { useEffect, useState, useCallback, memo } from 'react';
 import { api } from '../api';
+import type { ThemeType } from '../hooks/useConfig';
+import { useConfig } from '../hooks/useConfig';
+import { SessionThemeEditor } from './SessionThemeEditor';
+import { ConstraintsEditor } from './ConstraintsEditor';
 
 interface Session {
   id: string;
@@ -8,6 +12,8 @@ interface Session {
   updatedAt: number;
   workingDir: string;  // ★ Working directory is primary
   backendId: string;
+  themeOverrides?: Record<string, string>;  // ★ Per-session theme overrides
+  constraints?: string;  // ★ Per-session constraints/rules/prompts
 }
 
 interface Backend {
@@ -34,10 +40,53 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
   const [backends, setBackends] = useState<Backend[]>([]);
   const [hoveredSessionId, setHoveredSessionId] = useState<string | null>(null);
   const [sessionToDelete, setSessionToDelete] = useState<Session | null>(null);
+  const [themeEditorSession, setThemeEditorSession] = useState<Session | null>(null);
+  const [constraintsEditorSession, setConstraintsEditorSession] = useState<Session | null>(null);
+
+  // Get current theme from config (default to 'dark')
+  const { config } = useConfig();
+  const currentTheme: ThemeType = config.theme || 'dark';
 
   // ★ Memoize refresh function to avoid re-creating it on every render
   const refresh = useCallback(async () => {
-    setSessions(await api.listSessions());
+    const sessionList = await api.listSessions();
+    // Sort sessions: active first, then by updatedAt descending
+    sessionList.sort((a: any, b: any) => {
+      if (a.id === activeSessionId) return -1;
+      if (b.id === activeSessionId) return 1;
+      return (b.updatedAt || 0) - (a.updatedAt || 0);
+    });
+    setSessions(sessionList);
+  }, [activeSessionId]);
+
+  // ★ Handle theme editor close and save
+  const handleThemeSave = useCallback(async (themeOverrides: Record<string, string>) => {
+    if (themeEditorSession) {
+      await api.updateSessionTheme(themeEditorSession.id, themeOverrides);
+      refresh();
+      setThemeEditorSession(null);
+    }
+  }, [themeEditorSession, refresh]);
+
+  const handleThemeClose = useCallback(() => {
+    refresh();
+    setThemeEditorSession(null);
+  }, [refresh]);
+
+  // ★ Open theme editor for a session
+  const handleThemeClick = useCallback((session: Session) => {
+    setThemeEditorSession(session);
+  }, []);
+
+  // ★ Handle constraints editor close
+  const handleConstraintsClose = useCallback(() => {
+    refresh();
+    setConstraintsEditorSession(null);
+  }, [refresh]);
+
+  // ★ Open constraints editor for a session
+  const handleConstraintsClick = useCallback((session: Session) => {
+    setConstraintsEditorSession(session);
   }, []);
 
   useEffect(() => {
@@ -301,6 +350,33 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
                 </span>
               </div>
             </div>
+            {/* ★ Theme editor button */}
+            <div style={{ position: 'absolute', top: 8, right: 48, display: 'flex', gap: 2, opacity: hoveredSessionId === s.id ? 1 : 0, transition: 'opacity 0.15s', zIndex: 5 }}>
+              <button
+                onClick={(e) => {
+                  e.stopPropagation();
+                  handleThemeClick(s);
+                }}
+                style={actionBtnStyle}
+                title="编辑主题颜色"
+              >
+                🎨
+              </button>
+            </div>
+            {/* ★ Constraints editor button */}
+            <div style={{ position: 'absolute', top: 8, right: 28, display: 'flex', gap: 2, opacity: hoveredSessionId === s.id ? 1 : 0, transition: 'opacity 0.15s', zIndex: 5 }}>
+              <button
+                onClick={(e) => {
+                  e.stopPropagation();
+                  handleConstraintsClick(s);
+                }}
+                style={actionBtnStyle}
+                title="编辑约束/提示词"
+              >
+                📋
+              </button>
+            </div>
+
             <div style={{ position: 'absolute', top: 8, right: 8, display: 'flex', gap: 2, opacity: hoveredSessionId === s.id ? 1 : 0, transition: 'opacity 0.15s' }}>
               <button
                 onClick={(e) => handleDeleteClick(s, e)}
@@ -321,9 +397,28 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
         )}
       </div>
 
+      {/* 主题编辑器 */}
+      {themeEditorSession && (
+        <SessionThemeEditor
+          sessionId={themeEditorSession.id}
+          currentTheme={currentTheme}
+          themeOverrides={themeEditorSession.themeOverrides}
+          onClose={handleThemeClose}
+        />
+      )}
+
+      {/* 约束编辑器 */}
+      {constraintsEditorSession && (
+        <ConstraintsEditor
+          sessionId={constraintsEditorSession.id}
+          currentConstraints={constraintsEditorSession.constraints}
+          onClose={handleConstraintsClose}
+        />
+      )}
+
       {/* 删除确认对话框 */}
       {sessionToDelete && (
-        <div style={overlayStyle} onClick={() => setSessionToDelete(null)}>
+        <div style={overlayStyle}>
           <div style={confirmPanelStyle} onClick={(e) => e.stopPropagation()}>
             <h3 style={{ margin: '0 0 12px 0', fontSize: 16, fontWeight: 600, color: 'var(--theme-text, #1f2328)' }}>
               确认删除会话

@@ -5,6 +5,7 @@ import {
   getStreamState,
   processStreamDelta,
   resetStreamAccumulators,
+  clearStreamState,
   initStreamMessage,
   buildStreamingMessage,
   type StreamState,
@@ -215,6 +216,11 @@ export function useChat(sessionId: string, backendId: string, backends?: any[], 
     } else {
       setIsStreaming(false);
     }
+
+    // 清理函数：切换 session 或卸载时清理全局流式状态
+    return () => {
+      clearStreamState(sessionId);
+    };
   }, [sessionId, syncFromGlobalState]);
 
   // ── sessionUpdated 监听（compact 等后端操作完成后重载）──
@@ -294,12 +300,21 @@ export function useChat(sessionId: string, backendId: string, backends?: any[], 
           break;
 
         case 'done': {
-          // ★ 捕获最终状态快照，防止 resetStreamAccumulators 在 React 批量更新前清空
+          // ★ 捕获最终状态快照（使用展开创建新对象，避免引用问题）
           const finalText = state.text;
           const finalThinking = state.thinking || undefined;
           const finalToolCalls = state.toolCalls.length > 0 ? [...state.toolCalls] : undefined;
           const finalBlocks = state.contentBlocks.length > 0 ? [...state.contentBlocks] : undefined;
           const finalElapsed = state.streamStart ? Date.now() - state.streamStart : undefined;
+
+          // ★ 先保存到全局状态（作为备份），再更新 React 状态
+          const sessionState = getStreamState(sessionId);
+          sessionState.text = finalText;
+          sessionState.thinking = finalThinking || '';
+          sessionState.toolCalls = finalToolCalls || [];
+          sessionState.contentBlocks = finalBlocks || [];
+          sessionState.isStreaming = false;
+          sessionState.messageId = null;
 
           setMessages((prev) =>
             prev.map((m) => {
@@ -317,26 +332,42 @@ export function useChat(sessionId: string, backendId: string, backends?: any[], 
             })
           );
           setIsStreaming(false);
-          resetStreamAccumulators(sessionId);
           break;
         }
 
         case 'error': {
-          // ★ 同样先捕获快照
+          // ★ 捕获最终状态快照（使用展开创建新对象，避免引用问题）
           const errText = state.text;
+          const errThinking = state.thinking || undefined;
+          const errToolCalls = state.toolCalls.length > 0 ? [...state.toolCalls] : undefined;
+          const errBlocks = state.contentBlocks.length > 0 ? [...state.contentBlocks] : undefined;
+          const errElapsed = state.streamStart ? Date.now() - state.streamStart : undefined;
+
+          // ★ 先保存到全局状态（作为备份），再更新 React 状态
+          const sessionState = getStreamState(sessionId);
+          sessionState.text = errText;
+          sessionState.thinking = errThinking || '';
+          sessionState.toolCalls = errToolCalls || [];
+          sessionState.contentBlocks = errBlocks || [];
+          sessionState.isStreaming = false;
+          sessionState.messageId = null;
+
           setMessages((prev) =>
             prev.map((m) =>
               m.id === mid
                 ? {
                     ...m,
                     content: errText + `\n\n**Error:** ${delta.error}`,
+                    thinking: errThinking,
+                    toolCalls: errToolCalls,
+                    contentBlocks: errBlocks,
                     streaming: false,
+                    elapsed: errElapsed,
                   }
                 : m
             )
           );
           setIsStreaming(false);
-          resetStreamAccumulators(sessionId);
           break;
         }
       }
@@ -404,7 +435,7 @@ export function useChat(sessionId: string, backendId: string, backends?: any[], 
       setMessages((prev) => [...prev, userMsg, assistantMsg]);
       setIsStreaming(true);
 
-      // ★ 初始化全局流式状态
+      // ★ 初始化全局流式状态（会自动清理之前的错误状态）
       initStreamMessage(sessionId, assistantId);
 
       // ★ 同步本地 refs

@@ -54,6 +54,8 @@ export function clearStreamState(sessionId: string): void {
 }
 
 // 重置流式累积器（消息完成时调用）
+// 注意：此函数已弃用，不再调用。状态会在下一次 initStreamMessage 时自动覆盖。
+// 保留此函数仅用于 session 清理等特殊场景。
 export function resetStreamAccumulators(sessionId: string): void {
   const state = streamStates.get(sessionId);
   if (state) {
@@ -64,6 +66,11 @@ export function resetStreamAccumulators(sessionId: string): void {
     state.messageId = null;
     state.isStreaming = false;
   }
+}
+
+// 清除 session 的流式状态（用于 session 删除等场景）
+export function clearStreamStateForSession(sessionId: string): void {
+  clearStreamState(sessionId);
 }
 
 // 初始化新的流式消息

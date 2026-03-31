@@ -42,7 +42,7 @@ export const Settings: React.FC<SettingsProps> = ({
   if (!isOpen) return null;
 
   return (
-    <div style={overlayStyle} onClick={onClose}>
+    <div style={overlayStyle}>
       <div style={panelStyle} onClick={(e) => e.stopPropagation()}>
         {/* 标题栏 */}
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 20 }}>

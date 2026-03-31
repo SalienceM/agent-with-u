@@ -1,6 +1,5 @@
 import React, { useState, useCallback, useEffect, useRef } from 'react';
 import { api } from './api';
-import { resetStreamAccumulators } from './hooks/useStreamState';
 import { Sidebar } from './components/Sidebar';
 import { MessageBubble } from './components/MessageBubble';
 import { ChatInput } from './components/ChatInput';
@@ -142,14 +141,13 @@ export const App: React.FC = () => {
   // ★ 全局监听所有 session 的 done/error
   // 修正两个 bug：
   //   1. 后台 session 绿点不消失：从 streamingSessions 移除
-  //   2. 僵尸 useStreamState：清理全局流式状态，防止切换回来时误以为还在流式
+  //   2. 僵尸 streamingSessions 状态：清理用于 UI 显示的状态
+  // 注意：不再清理全局流式状态（useStreamState），因为 useChat hook 需要它来恢复消息
   useEffect(() => {
     const unsub = api.onStreamDelta((delta: any) => {
       const sid: string | undefined = delta.sessionId;
       if (!sid) return;
       if (delta.type === 'done' || delta.type === 'error') {
-        // 无论哪个 session，都清理全局流式状态（避免僵尸状态导致切回来时发送按钮变红）
-        resetStreamAccumulators(sid);
         // 无论哪个 session，都从 streaming 中移除
         setStreamingSessions((prev) => {
           if (!prev.has(sid)) return prev;
@@ -168,7 +166,7 @@ export const App: React.FC = () => {
       }
     });
     return unsub;
-  }, []);
+  }, [activeSessionIdRef]);
 
   /* ---- 自动滚到底部 ---- */
   const prevSessionRef = useRef(activeSessionId);
@@ -890,11 +888,6 @@ const MigrateDialog: React.FC<MigrateDialogProps> = ({
   return (
     <div
       style={overlayStyle}
-      onClick={(e) => {
-        e.preventDefault();
-        e.stopPropagation();
-        onClose();
-      }}
     >
       <div
         style={{
@@ -1132,11 +1125,6 @@ const NewSessionDialog: React.FC<NewSessionDialogProps> = ({
   return (
     <div
       style={overlayStyle}
-      onClick={(e) => {
-        e.preventDefault();
-        e.stopPropagation();
-        onClose();
-      }}
     >
       <div
         style={{
