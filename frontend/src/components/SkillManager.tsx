@@ -61,6 +61,7 @@ export const SkillManager: React.FC<SkillManagerProps> = ({ isOpen, onClose, wor
     if (scope === 'project' && !workingDir) return;
     const fn = current ? api.deactivateSkill : api.activateSkill;
     const res = await fn(name, scope, workingDir);
+    if (!res) { showMsg('err', '无法连接到后端'); return; }
     if (res.status === 'ok') {
       await reload();
     } else {
@@ -96,12 +97,13 @@ export const SkillManager: React.FC<SkillManagerProps> = ({ isOpen, onClose, wor
       } else {
         res = await api.saveSkill(name, content);
       }
+      if (!res) { showMsg('err', '保存失败：无法连接到后端'); return; }
       if (res.status === 'ok') {
         showMsg('ok', '已保存');
         await reload();
         setView('list');
       } else {
-        showMsg('err', res.message || '保存失败');
+        showMsg('err', `保存失败：${res.message || '未知错误'}`);
       }
     } finally {
       setSaving(false);
@@ -111,6 +113,7 @@ export const SkillManager: React.FC<SkillManagerProps> = ({ isOpen, onClose, wor
   // ── 删除 ──────────────────────────────────────────────────
   const handleDelete = useCallback(async (name: string) => {
     const res = await api.deleteSkill(name);
+    if (!res) { showMsg('err', '删除失败：无法连接到后端'); return; }
     if (res.status === 'ok') {
       showMsg('ok', '已删除');
       setConfirmDelete(null);
