@@ -21,8 +21,8 @@ if (typeof document !== 'undefined' && !document.getElementById('msg-bubble-css'
       to   { opacity: 1; transform: translateY(0)    scale(1); }
     }
     @keyframes cursorGlow {
-      0%,100% { box-shadow: 0 0 3px var(--theme-accent,rgba(122,162,247,0.8)); opacity: 1; }
-      50%     { box-shadow: 0 0 10px var(--theme-accent,rgba(122,162,247,0.8)), 0 0 20px var(--theme-accent,rgba(122,162,247,0.4)); opacity: 0.35; }
+      0%,100% { opacity: 1; }
+      50%     { opacity: 0.15; }
     }
     /* ── 气泡内图片约束 ── */
     .msg-content img {
@@ -596,6 +596,7 @@ export const MessageBubble: React.FC<Props> = ({
               marginLeft: 3,
               borderRadius: 2,
               verticalAlign: 'text-bottom',
+              willChange: 'opacity',
               animation: 'cursorGlow 0.9s ease-in-out infinite',
             }}
           />

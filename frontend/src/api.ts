@@ -351,6 +351,12 @@ export const api = {
     return await call('deleteSession', id);
   },
 
+  async renameSession(sessionId: string, newTitle: string): Promise<{ status: string; message?: string }> {
+    const result = await call('renameSession', sessionId, newTitle);
+    if (result === null || result === undefined) return { status: 'error', message: '无法连接到后端' };
+    try { return JSON.parse(result); } catch { return { status: 'error', message: '响应格式错误' }; }
+  },
+
   async updateSessionConstraints(sessionId: string, constraints: string | { constraints: string }): Promise<{ status: string; message?: string }> {
     const payload = JSON.stringify(constraints);
     const result = await call('updateSessionConstraints', sessionId, payload);
@@ -576,6 +582,7 @@ function mockDispatch(method: string, params: any[]): any {
       if (idx >= 0) mockBackends.splice(idx, 1);
       return null;
     }
+    case 'renameSession': return JSON.stringify({ status: 'ok' });
     case 'updateSessionConstraints': return JSON.stringify({ status: 'ok' });
     default: return null;
   }

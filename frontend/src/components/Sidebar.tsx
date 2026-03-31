@@ -1,4 +1,4 @@
-import React, { useEffect, useState, useCallback, memo } from 'react';
+import React, { useEffect, useState, useCallback, memo, useRef } from 'react';
 import { api } from '../api';
 import { ConstraintsEditor } from './ConstraintsEditor';
 
@@ -37,6 +37,9 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
   const [hoveredSessionId, setHoveredSessionId] = useState<string | null>(null);
   const [sessionToDelete, setSessionToDelete] = useState<Session | null>(null);
   const [constraintsEditorSession, setConstraintsEditorSession] = useState<Session | null>(null);
+  const [renamingSessionId, setRenamingSessionId] = useState<string | null>(null);
+  const [renameValue, setRenameValue] = useState('');
+  const renameInputRef = useRef<HTMLInputElement>(null);
 
   // ★ Memoize refresh function to avoid re-creating it on every render
   const refresh = useCallback(async () => {
@@ -65,6 +68,28 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
     api.getBackends().then(setBackends);
     refresh();
   }, [refresh]);
+
+  const handleRenameStart = useCallback((s: Session, e: React.MouseEvent) => {
+    e.stopPropagation();
+    setRenamingSessionId(s.id);
+    setRenameValue(s.title);
+    setTimeout(() => { renameInputRef.current?.select(); }, 0);
+  }, []);
+
+  const handleRenameConfirm = useCallback(async () => {
+    if (!renamingSessionId) return;
+    const title = renameValue.trim();
+    setRenamingSessionId(null);
+    if (!title) return;
+    await api.renameSession(renamingSessionId, title);
+    refresh();
+  }, [renamingSessionId, renameValue, refresh]);
+
+  const handleRenameKeyDown = useCallback((e: React.KeyboardEvent) => {
+    if (e.key === 'Enter') { e.preventDefault(); handleRenameConfirm(); }
+    if (e.key === 'Escape') setRenamingSessionId(null);
+    e.stopPropagation();
+  }, [handleRenameConfirm]);
 
   const handleDeleteClick = useCallback((session: Session, e: React.MouseEvent) => {
     e.stopPropagation();
@@ -169,31 +194,32 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
           50% { opacity: 0.4; transform: scale(1.25); }
         }
         @keyframes badgePulse {
-          0%, 100% { transform: scale(1);    box-shadow: 0 0 0 0px rgba(239,68,68,0.5); }
-          50%       { transform: scale(1.12); box-shadow: 0 0 0 5px rgba(239,68,68,0); }
+          0%, 100% { transform: scale(1);    opacity: 1; }
+          50%       { transform: scale(1.15); opacity: 0.82; }
         }
         @keyframes dialogSlideIn {
           from { opacity: 0; transform: perspective(900px) rotateX(-14deg) scale(0.96) translateY(-8px); }
           to   { opacity: 1; transform: perspective(900px) rotateX(0deg)   scale(1)    translateY(0); }
         }
         @keyframes streamBorderFlow {
-          0%   { background-position: 0% 0%; }
-          100% { background-position: 0% 200%; }
+          from { transform: translateY(-66%); }
+          to   { transform: translateY(66%); }
         }
         .session-streaming-item {
           border-left: 3px solid transparent !important;
           background-clip: padding-box;
           position: relative;
+          overflow: hidden;
         }
         .session-streaming-item::before {
           content: '';
           position: absolute;
-          left: 0; top: 0; bottom: 0;
+          left: 0; top: -100%; bottom: -100%;
           width: 3px;
           border-radius: 3px 0 0 3px;
-          background: linear-gradient(180deg, #22c55e, #7aa2f7, #22c55e);
-          background-size: 100% 200%;
-          animation: streamBorderFlow 1.8s linear infinite;
+          background: linear-gradient(180deg, transparent, #22c55e 30%, #7aa2f7 70%, transparent);
+          will-change: transform;
+          animation: streamBorderFlow 1.6s linear infinite;
         }
         .session-notify-badge {
           position: absolute;
@@ -293,9 +319,22 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
             <div style={{ fontSize: 11, color: 'var(--theme-success, #2da44e)', fontFamily: 'monospace', marginBottom: 4, paddingLeft: isRunning ? 18 : 0 }}>
               📁 {formatWorkingDir(s.workingDir)}
             </div>
-            <div style={{ fontSize: 13, color: isActive ? 'var(--theme-accent, #7aa2f7)' : 'var(--theme-text, #e2e3ea)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', paddingRight: 50 }}>
-              {s.title}
-            </div>
+            {renamingSessionId === s.id ? (
+              <input
+                ref={renameInputRef}
+                value={renameValue}
+                onChange={(e) => setRenameValue(e.target.value)}
+                onBlur={handleRenameConfirm}
+                onKeyDown={handleRenameKeyDown}
+                onClick={(e) => e.stopPropagation()}
+                autoFocus
+                style={renameInputStyle}
+              />
+            ) : (
+              <div style={{ fontSize: 13, color: isActive ? 'var(--theme-accent, #7aa2f7)' : 'var(--theme-text, #e2e3ea)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', paddingRight: 68 }}>
+                {s.title}
+              </div>
+            )}
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: 4 }}>
               <span style={{ fontSize: 10, color: 'var(--theme-text-muted, #656d76)' }}>
                 {s.messageCount} msgs
@@ -313,8 +352,15 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
                 </span>
               </div>
             </div>
-            {/* ★ Constraints editor button */}
-            <div style={{ position: 'absolute', top: 8, right: 28, display: 'flex', gap: 2, opacity: hoveredSessionId === s.id ? 1 : 0, transition: 'opacity 0.15s', zIndex: 5 }}>
+            {/* ★ Hover action buttons: rename | constraints | delete */}
+            <div style={{ position: 'absolute', top: 8, right: 8, display: 'flex', gap: 2, opacity: hoveredSessionId === s.id ? 1 : 0, transition: 'opacity 0.15s', zIndex: 5 }}>
+              <button
+                onClick={(e) => handleRenameStart(s, e)}
+                style={actionBtnStyle}
+                title="重命名"
+              >
+                ✎
+              </button>
               <button
                 onClick={(e) => {
                   e.stopPropagation();
@@ -325,9 +371,6 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
               >
                 📋
               </button>
-            </div>
-
-            <div style={{ position: 'absolute', top: 8, right: 8, display: 'flex', gap: 2, opacity: hoveredSessionId === s.id ? 1 : 0, transition: 'opacity 0.15s' }}>
               <button
                 onClick={(e) => handleDeleteClick(s, e)}
                 style={actionBtnStyle}
@@ -476,6 +519,19 @@ const actionBtnStyle: React.CSSProperties = {
   display: 'flex',
   alignItems: 'center',
   justifyContent: 'center',
+};
+
+const renameInputStyle: React.CSSProperties = {
+  width: '100%',
+  fontSize: 13,
+  fontFamily: 'inherit',
+  background: 'var(--theme-input-bg, #ffffff)',
+  border: '1px solid var(--theme-accent, #7aa2f7)',
+  borderRadius: 6,
+  color: 'var(--theme-text, #e2e3ea)',
+  padding: '2px 6px',
+  outline: 'none',
+  boxShadow: '0 0 0 2px var(--theme-accent-bg, rgba(122,162,247,0.15))',
 };
 
 const backendBadgeStyle: React.CSSProperties = {

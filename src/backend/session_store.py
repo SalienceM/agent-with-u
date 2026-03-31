@@ -176,6 +176,15 @@ class SessionStore:
         # ★ Debounced index save (reduces I/O from 2 writes → 1 delayed write)
         self._save_index_debounced()
 
+    def rename(self, sid: str, new_title: str) -> bool:
+        """Rename a session title."""
+        session = self.load(sid)
+        if not session:
+            return False
+        session.title = new_title.strip()
+        self.save(session, async_=False)
+        return True
+
     def delete(self, sid: str) -> bool:
         path = self._session_path(sid)
         try:
