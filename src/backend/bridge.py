@@ -700,39 +700,6 @@ class Bridge(QObject):
         self._instance_manager.delete(sid)
         return self._session_store.delete(sid)
 
-    # ═══════════════════════════════════════
-    #  ★ Per-session theme overrides
-    # ═══════════════════════════════════════
-    @Slot(str, str, result=str)
-    def updateSessionTheme(self, session_id: str, theme_overrides_json: str) -> str:
-        """
-        Update theme overrides for a session.
-
-        Args:
-            session_id: Session ID
-            theme_overrides_json: JSON object with color overrides, e.g., {"accent": "#ff0000", "codeBg": "#16161e"}
-
-        Returns:
-            JSON string: {"status": "ok"|"error", "message"?: string}
-        """
-        try:
-            theme_overrides = json.loads(theme_overrides_json)
-            if not isinstance(theme_overrides, dict):
-                return json.dumps({"status": "error", "message": "Theme overrides must be an object"}, ensure_ascii=False)
-
-            session = self._active_sessions.get(session_id)
-            if not session:
-                session = self._session_store.load(session_id)
-                if not session:
-                    return json.dumps({"status": "error", "message": "Session not found"}, ensure_ascii=False)
-
-            session.theme_overrides = theme_overrides
-            self._active_sessions[session_id] = session
-            self._session_store.save(session, async_=True)
-            return json.dumps({"status": "ok"}, ensure_ascii=False)
-        except Exception as e:
-            return json.dumps({"status": "error", "message": str(e)}, ensure_ascii=False)
-
     @Slot(str, str, result=str)
     def updateSessionConstraints(self, session_id: str, constraints_json: str) -> str:
         """

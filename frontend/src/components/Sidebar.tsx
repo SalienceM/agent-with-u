@@ -1,8 +1,5 @@
 import React, { useEffect, useState, useCallback, memo } from 'react';
 import { api } from '../api';
-import type { ThemeType } from '../hooks/useConfig';
-import { useConfig } from '../hooks/useConfig';
-import { SessionThemeEditor } from './SessionThemeEditor';
 import { ConstraintsEditor } from './ConstraintsEditor';
 
 interface Session {
@@ -12,7 +9,6 @@ interface Session {
   updatedAt: number;
   workingDir: string;  // ★ Working directory is primary
   backendId: string;
-  themeOverrides?: Record<string, string>;  // ★ Per-session theme overrides
   constraints?: string;  // ★ Per-session constraints/rules/prompts
 }
 
@@ -40,12 +36,7 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
   const [backends, setBackends] = useState<Backend[]>([]);
   const [hoveredSessionId, setHoveredSessionId] = useState<string | null>(null);
   const [sessionToDelete, setSessionToDelete] = useState<Session | null>(null);
-  const [themeEditorSession, setThemeEditorSession] = useState<Session | null>(null);
   const [constraintsEditorSession, setConstraintsEditorSession] = useState<Session | null>(null);
-
-  // Get current theme from config (default to 'dark')
-  const { config } = useConfig();
-  const currentTheme: ThemeType = config.theme || 'dark';
 
   // ★ Memoize refresh function to avoid re-creating it on every render
   const refresh = useCallback(async () => {
@@ -58,16 +49,6 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
     });
     setSessions(sessionList);
   }, [activeSessionId]);
-
-  const handleThemeClose = useCallback(() => {
-    refresh();
-    setThemeEditorSession(null);
-  }, [refresh]);
-
-  // ★ Open theme editor for a session
-  const handleThemeClick = useCallback((session: Session) => {
-    setThemeEditorSession(session);
-  }, []);
 
   // ★ Handle constraints editor close
   const handleConstraintsClose = useCallback(() => {
@@ -308,19 +289,6 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
                 </span>
               </div>
             </div>
-            {/* ★ Theme editor button */}
-            <div style={{ position: 'absolute', top: 8, right: 48, display: 'flex', gap: 2, opacity: hoveredSessionId === s.id ? 1 : 0, transition: 'opacity 0.15s', zIndex: 5 }}>
-              <button
-                onClick={(e) => {
-                  e.stopPropagation();
-                  handleThemeClick(s);
-                }}
-                style={actionBtnStyle}
-                title="编辑主题颜色"
-              >
-                🎨
-              </button>
-            </div>
             {/* ★ Constraints editor button */}
             <div style={{ position: 'absolute', top: 8, right: 28, display: 'flex', gap: 2, opacity: hoveredSessionId === s.id ? 1 : 0, transition: 'opacity 0.15s', zIndex: 5 }}>
               <button
@@ -354,16 +322,6 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
           </div>
         )}
       </div>
-
-      {/* 主题编辑器 */}
-      {themeEditorSession && (
-        <SessionThemeEditor
-          sessionId={themeEditorSession.id}
-          currentTheme={currentTheme}
-          themeOverrides={themeEditorSession.themeOverrides}
-          onClose={handleThemeClose}
-        />
-      )}
 
       {/* 约束编辑器 */}
       {constraintsEditorSession && (

@@ -305,21 +305,6 @@ class BridgeWS:
             return json.dumps(session.to_dict(), ensure_ascii=False)
         return "null"
 
-    def _rpc_updateSessionTheme(self, session_id: str, theme_overrides_json: str) -> str:
-        try:
-            theme_overrides = json.loads(theme_overrides_json)
-            if not isinstance(theme_overrides, dict):
-                return json.dumps({"status": "error", "message": "Theme overrides must be an object"})
-            session = self._active_sessions.get(session_id) or self._session_store.load(session_id)
-            if not session:
-                return json.dumps({"status": "error", "message": "Session not found"})
-            session.theme_overrides = theme_overrides
-            self._active_sessions[session_id] = session
-            self._session_store.save(session, async_=True)
-            return json.dumps({"status": "ok"}, ensure_ascii=False)
-        except Exception as e:
-            return json.dumps({"status": "error", "message": str(e)}, ensure_ascii=False)
-
     def _rpc_updateSessionConstraints(self, session_id: str, constraints_json: str) -> str:
         try:
             constraints = json.loads(constraints_json)

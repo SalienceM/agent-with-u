@@ -351,11 +351,6 @@ export const api = {
     return await call('deleteSession', id);
   },
 
-  async updateSessionTheme(sessionId: string, themeOverrides: any): Promise<{ status: string; message?: string }> {
-    const result = await call('updateSessionTheme', sessionId, JSON.stringify(themeOverrides));
-    try { return JSON.parse(result); } catch { return { status: 'error', message: 'Failed to update theme' }; }
-  },
-
   async updateSessionConstraints(sessionId: string, constraints: string | { constraints: string }): Promise<{ status: string; message?: string }> {
     const payload = JSON.stringify(constraints);
     const result = await call('updateSessionConstraints', sessionId, payload);
@@ -581,7 +576,6 @@ function mockDispatch(method: string, params: any[]): any {
       if (idx >= 0) mockBackends.splice(idx, 1);
       return null;
     }
-    case 'updateSessionTheme': return JSON.stringify({ status: 'ok' });
     case 'updateSessionConstraints': return JSON.stringify({ status: 'ok' });
     default: return null;
   }
