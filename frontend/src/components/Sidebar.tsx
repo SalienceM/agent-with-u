@@ -69,20 +69,25 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
     refresh();
   }, [refresh]);
 
+  const renamingRef = useRef(false);  // 防止 Enter+blur 双触发
+
   const handleRenameStart = useCallback((s: Session, e: React.MouseEvent) => {
     e.stopPropagation();
+    renamingRef.current = false;
     setRenamingSessionId(s.id);
     setRenameValue(s.title);
     setTimeout(() => { renameInputRef.current?.select(); }, 0);
   }, []);
 
   const handleRenameConfirm = useCallback(async () => {
-    if (!renamingSessionId) return;
+    if (!renamingSessionId || renamingRef.current) return;
+    renamingRef.current = true;
     const title = renameValue.trim();
     setRenamingSessionId(null);
     if (!title) return;
     await api.renameSession(renamingSessionId, title);
     refresh();
+    renamingRef.current = false;
   }, [renamingSessionId, renameValue, refresh]);
 
   const handleRenameKeyDown = useCallback((e: React.KeyboardEvent) => {

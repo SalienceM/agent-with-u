@@ -324,6 +324,20 @@ class BridgeWS:
         except Exception as e:
             return json.dumps({"status": "error", "message": str(e)}, ensure_ascii=False)
 
+    def _rpc_renameSession(self, session_id: str, new_title: str) -> str:
+        try:
+            if not new_title.strip():
+                return json.dumps({"status": "error", "message": "Title cannot be empty"}, ensure_ascii=False)
+            ok = self._session_store.rename(session_id, new_title)
+            if ok:
+                session = self._active_sessions.get(session_id)
+                if session:
+                    session.title = new_title.strip()
+                return json.dumps({"status": "ok"}, ensure_ascii=False)
+            return json.dumps({"status": "error", "message": "Session not found"}, ensure_ascii=False)
+        except Exception as e:
+            return json.dumps({"status": "error", "message": str(e)}, ensure_ascii=False)
+
     def _rpc_deleteSession(self, sid: str) -> bool:
         self._active_sessions.pop(sid, None)
         self._instance_manager.delete(sid)
