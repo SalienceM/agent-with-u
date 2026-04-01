@@ -54,6 +54,8 @@ export const RepoPanel: React.FC<Props> = ({ open, workingDir, onClose }) => {
   const [editingOrigName, setEditingOrigName] = useState<string | null>(null); // null = 新建
   const [showIconPicker, setShowIconPicker] = useState(false);
   const [saving, setSaving] = useState(false);
+  // 删除二次确认
+  const [deleteConfirm, setDeleteConfirm] = useState<{ type: 'skill' | 'prompt'; name: string } | null>(null);
   const nameRef = useRef<HTMLInputElement>(null);
 
   const refresh = useCallback(async () => {
@@ -122,12 +124,19 @@ export const RepoPanel: React.FC<Props> = ({ open, workingDir, onClose }) => {
     }
   }, [editingType, editingName, editingContent, editingIcon, editingOrigName, refresh, closeEditor]);
 
-  // ── 删除 ──
-  const handleDelete = useCallback(async (type: 'skill' | 'prompt', name: string) => {
+  // ── 删除：先弹确认框 ──
+  const handleDelete = useCallback((type: 'skill' | 'prompt', name: string) => {
+    setDeleteConfirm({ type, name });
+  }, []);
+
+  const confirmDelete = useCallback(async () => {
+    if (!deleteConfirm) return;
+    const { type, name } = deleteConfirm;
     if (type === 'skill') await api.deleteSkill(name);
     else await api.deletePrompt(name);
+    setDeleteConfirm(null);
     await refresh();
-  }, [refresh]);
+  }, [deleteConfirm, refresh]);
 
   if (!open) return null;
 
@@ -237,6 +246,26 @@ export const RepoPanel: React.FC<Props> = ({ open, workingDir, onClose }) => {
           </div>
         </div>
       </div>
+
+      {/* 删除二次确认对话框 */}
+      {deleteConfirm && (
+        <div style={deleteOverlayStyle} onClick={() => setDeleteConfirm(null)}>
+          <div style={deleteDialogStyle} onClick={e => e.stopPropagation()}>
+            <h3 style={{ margin: '0 0 8px 0', fontSize: 14, fontWeight: 600, color: 'var(--theme-text)' }}>
+              确认删除
+            </h3>
+            <p style={{ margin: '0 0 16px 0', fontSize: 13, color: 'var(--theme-text-muted)', lineHeight: 1.5 }}>
+              确定要删除 {deleteConfirm.type === 'skill' ? 'Skill' : 'Prompt'}{' '}
+              <strong style={{ color: 'var(--theme-error, #cf222e)' }}>"{deleteConfirm.name}"</strong> 吗？
+              <br />此操作不可撤销。
+            </p>
+            <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
+              <button onClick={() => setDeleteConfirm(null)} style={deleteCancelBtnStyle}>取消</button>
+              <button onClick={confirmDelete} style={deleteConfirmBtnStyle}>删除</button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 };
@@ -473,4 +502,34 @@ const iconOptionStyle: React.CSSProperties = {
   display: 'flex',
   alignItems: 'center',
   justifyContent: 'center',
+};
+
+const deleteOverlayStyle: React.CSSProperties = {
+  position: 'fixed', inset: 0,
+  background: 'rgba(0,0,0,0.5)',
+  display: 'flex', alignItems: 'center', justifyContent: 'center',
+  zIndex: 2000,
+};
+
+const deleteDialogStyle: React.CSSProperties = {
+  background: 'var(--theme-bg-secondary, #ffffff)',
+  border: '1px solid var(--theme-border, rgba(0,0,0,0.15))',
+  borderRadius: 10,
+  padding: '20px 24px',
+  width: 320,
+  boxShadow: '0 4px 20px rgba(0,0,0,0.2)',
+};
+
+const deleteCancelBtnStyle: React.CSSProperties = {
+  padding: '7px 16px', borderRadius: 6,
+  border: '1px solid var(--theme-border, rgba(0,0,0,0.15))',
+  background: 'transparent',
+  color: 'var(--theme-text)', fontSize: 13, cursor: 'pointer',
+};
+
+const deleteConfirmBtnStyle: React.CSSProperties = {
+  padding: '7px 16px', borderRadius: 6,
+  border: 'none',
+  background: 'var(--theme-error, #cf222e)',
+  color: '#fff', fontSize: 13, fontWeight: 500, cursor: 'pointer',
 };
