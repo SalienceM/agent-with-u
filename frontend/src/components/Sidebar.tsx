@@ -79,6 +79,16 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
   // ★ 预览内容状态
   const [previewContent, setPreviewContent] = useState<string | null>(null);
 
+  // ★ 临时约束本地 state，避免每次 onChange 触发异步 API 导致 IME 组合被打断
+  const [constraintsValue, setConstraintsValue] = useState('');
+
+  // 打开 picker 时同步 constraints 到本地 state
+  useEffect(() => {
+    if (abilityPickerSession) {
+      setConstraintsValue((abilityPickerSession.abilities as any)?.constraints || '');
+    }
+  }, [abilityPickerSession?.id]);
+
   // ★ 显示 Skill 预览
   const show_preview_skill = useCallback(async (skill: any) => {
     setPreviewContent(skill.content || '');
@@ -587,14 +597,8 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
                 </div>
                 <div style={{ flex: 1, display: 'flex', flexDirection: 'column' }}>
                   <textarea
-                    value={(abilityPickerSession.abilities as any)?.constraints || ''}
-                    onChange={(e) => {
-                      const current = abilityPickerSession.abilities || { skills: [], prompts: [] };
-                      const newAbilities = { ...current, constraints: e.target.value };
-                      api.updateSessionAbilities(abilityPickerSession.id, newAbilities).then(() => {
-                        setAbilityPickerSession({ ...abilityPickerSession, abilities: newAbilities });
-                      });
-                    }}
+                    value={constraintsValue}
+                    onChange={(e) => setConstraintsValue(e.target.value)}
                     onClick={(e) => e.stopPropagation()}
                     placeholder="输入临时约束规则（仅本次会话有效）..."
                     style={{
@@ -603,25 +607,23 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
                       borderRadius: 8, padding: '10px 12px', color: 'var(--theme-text)',
                       fontFamily: 'inherit', outline: 'none', boxSizing: 'border-box', minHeight: 160,
                     }}
-                    // 添加 composition events 防止中文输入重复
-                    onCompositionStart={(e) => { e.stopPropagation(); }}
-                    onCompositionEnd={(e) => { e.stopPropagation(); }}
-                    onCompositionUpdate={(e) => { e.stopPropagation(); }}
                   />
                   <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: 8, gap: 8 }}>
                     <button
-                      onClick={() => {
-                        const current = abilityPickerSession.abilities || { skills: [], prompts: [] };
-                        const newAbilities = { ...current, constraints: '' };
-                        api.updateSessionAbilities(abilityPickerSession.id, newAbilities).then(() => {
-                          setAbilityPickerSession({ ...abilityPickerSession, abilities: newAbilities });
-                        });
-                      }}
+                      onClick={() => setConstraintsValue('')}
                       style={{ fontSize: 11, padding: '6px 12px', borderRadius: 6, border: '1px solid var(--theme-border)', background: 'transparent', color: 'var(--theme-text-muted)', cursor: 'pointer' }}
                     >
                       清空约束
                     </button>
-                    <button onClick={() => setAbilityPickerSession(null)} style={{ ...confirmBtnStyle, fontSize: 12, padding: '6px 16px' }}>
+                    <button
+                      onClick={() => {
+                        const current = abilityPickerSession.abilities || { skills: [], prompts: [] };
+                        const newAbilities = { ...current, constraints: constraintsValue };
+                        api.updateSessionAbilities(abilityPickerSession.id, newAbilities);
+                        setAbilityPickerSession(null);
+                      }}
+                      style={{ ...confirmBtnStyle, fontSize: 12, padding: '6px 16px' }}
+                    >
                       保存并关闭
                     </button>
                   </div>
