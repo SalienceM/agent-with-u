@@ -858,9 +858,64 @@ const logBtnStyle: React.CSSProperties = {
   fontWeight: 500,
 };
 
-/* ---- New Session Dialog: Select working directory first ---- */
-interface NewSessionDialogProps {}
+const overlayStyle: React.CSSProperties = {
+  position: 'fixed', inset: 0,
+  background: 'rgba(0,0,0,0.5)',
+  display: 'flex', alignItems: 'center', justifyContent: 'center',
+  zIndex: 1000,
+};
 
+const dialogStyle: React.CSSProperties = {
+  background: 'var(--theme-bg-secondary, #ffffff)',
+  border: '1px solid var(--theme-border, rgba(0,0,0,0.15))',
+  borderRadius: 12,
+  padding: 24,
+  width: '90%',
+  maxWidth: 480,
+  boxShadow: '0 4px 24px rgba(0,0,0,0.18)',
+};
+
+const dialogTitleStyle: React.CSSProperties = {
+  margin: '0 0 8px 0',
+  fontSize: 16,
+  fontWeight: 600,
+  color: 'var(--theme-text, #1f2328)',
+};
+
+const dialogDescStyle: React.CSSProperties = {
+  margin: '0 0 20px 0',
+  fontSize: 13,
+  color: 'var(--theme-text-muted, #656d76)',
+  lineHeight: 1.5,
+};
+
+const labelStyle: React.CSSProperties = {
+  display: 'block',
+  marginBottom: 6,
+  fontSize: 13,
+  fontWeight: 500,
+  color: 'var(--theme-text, #1f2328)',
+};
+
+const selectStyle: React.CSSProperties = {
+  width: '100%',
+  padding: '8px 10px',
+  background: 'var(--theme-input-bg, #ffffff)',
+  border: '1px solid var(--theme-border, rgba(0,0,0,0.12))',
+  borderRadius: 6,
+  color: 'var(--theme-text, #1f2328)',
+  fontSize: 13,
+  outline: 'none',
+};
+
+const dialogActionsStyle: React.CSSProperties = {
+  display: 'flex',
+  gap: 8,
+  justifyContent: 'flex-end',
+  marginTop: 20,
+};
+
+/* ---- New Session Dialog: Select working directory first ---- */
 const selectWrapperStyle: React.CSSProperties = {
   position: 'relative',
 };

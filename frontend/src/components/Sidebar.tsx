@@ -107,6 +107,7 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
   }, [refresh]);
 
   const renamingRef = useRef(false);  // 防止 Enter+blur 双触发
+  const pickerRef = useRef<HTMLDivElement>(null);
 
   const handleRenameStart = useCallback((s: Session, e: React.MouseEvent) => {
     e.stopPropagation();

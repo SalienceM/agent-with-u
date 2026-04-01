@@ -17,15 +17,15 @@ if (typeof document !== 'undefined' && !document.getElementById('repo-panel-css'
 //  Types
 // ═══════════════════════════════════════
 interface SkillItem {
-  id: string;            // 唯一ID，创建后永不变更
-  name: string;          // 名称（可修改）
+  id?: string;
+  name: string;
   content?: string;
   isGlobal?: boolean;
   isProject?: boolean;
 }
 interface PromptItem {
-  id: string;            // 唯一ID，创建后永不变更
-  name: string;          // 名称（可修改）
+  id?: string;
+  name: string;
   content: string;
   icon: string;
   createdAt?: number;
