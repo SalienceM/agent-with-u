@@ -54,6 +54,7 @@ export const App: React.FC = () => {
   const prevStreamingRef = useRef(false);
   const animSessionRef = useRef<string | null>(null); // 记录上次渲染时的 sessionId
   const animMsgCountRef = useRef(0);                  // 记录上次渲染时的消息数
+  const initialCheckDoneRef = useRef(false);          // ★ 防止 NewSessionDialog 重复弹出
 
   const { config, updateConfig, resetConfig, reloadConfig } = useConfig();
 
