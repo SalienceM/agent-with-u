@@ -1443,6 +1443,204 @@ class AnthropicAPIBackend(ModelBackend):
 
 
 # ---------------------------------------------------------------------------
+#  DashScopeImageBackend — 阿里云 DashScope 文生图（万象/Wan 系列）
+# ---------------------------------------------------------------------------
+
+class DashScopeImageBackend(ModelBackend):
+    """
+    接入阿里云 DashScope 文生图 API（wanx / wan 系列）。
+
+    配置字段说明：
+      api_key   — DashScope API Key（必填）
+      model     — 模型名，默认 wanx2.1-t2i-turbo
+      base_url  — 可覆盖 API 根地址，默认 https://dashscope.aliyuncs.com/api/v1
+      env:
+        SIZE            — 图片尺寸，如 1024*1024（默认）
+        NEGATIVE_PROMPT — 反向提示词
+        PROMPT_EXTEND   — "true"/"false"，是否扩展提示词（默认 true）
+        WATERMARK       — "true"/"false"，是否添加水印（默认 false）
+
+    工作流：
+      1. POST /services/aigc/text2image/image-synthesis → 得到 task_id
+      2. 轮询 GET /tasks/{task_id} 直到 SUCCEEDED / FAILED
+      3. 下载图片 URL → base64 → 作为 markdown 图片嵌入 text_delta
+    """
+
+    _DEFAULT_BASE = "https://dashscope.aliyuncs.com/api/v1"
+    _DEFAULT_MODEL = "wanx2.1-t2i-turbo"
+    _POLL_INTERVAL = 3.0   # 秒
+    _MAX_POLLS = 120        # 最多等 6 分钟
+
+    async def send_message(
+        self,
+        messages: list,
+        content: str,
+        images,
+        session_id: str,
+        message_id: str,
+        on_delta,
+        agent_session_id=None,
+        working_dir=None,
+        skip_permissions=None,
+        on_permission_request=None,
+    ) -> dict:
+        import base64
+        import asyncio
+        import httpx
+
+        def emit(dtype: str, **kw):
+            on_delta(StreamDelta(session_id, message_id, dtype, **kw))
+
+        api_key = self.config.api_key or self.config.get_env("DASHSCOPE_API_KEY") or ""
+        if not api_key:
+            emit("error", error="DashScope API Key 未配置，请在 Backend 设置中填写 api_key")
+            emit("done")
+            return {}
+
+        base = (self.config.base_url or self._DEFAULT_BASE).rstrip("/")
+        model = self.config.model or self._DEFAULT_MODEL
+
+        # 构建请求体
+        prompt = content.strip()
+        if not prompt:
+            # 如果用户没有输入，从历史消息中取最后一条 user 消息
+            for m in reversed(messages):
+                if m.role == "user" and m.content:
+                    prompt = m.content.strip()
+                    break
+        if not prompt:
+            emit("error", error="提示词为空，请输入图像描述")
+            emit("done")
+            return {}
+
+        size = self.config.get_env("SIZE", "1024*1024")
+        negative_prompt = self.config.get_env("NEGATIVE_PROMPT", "")
+        prompt_extend = self.config.get_env("PROMPT_EXTEND", "true").lower() != "false"
+        watermark = self.config.get_env("WATERMARK", "false").lower() == "true"
+
+        payload: dict = {
+            "model": model,
+            "input": {
+                "messages": [
+                    {"role": "user", "content": [{"text": prompt}]}
+                ]
+            },
+            "parameters": {
+                "size": size,
+                "prompt_extend": prompt_extend,
+                "watermark": watermark,
+            },
+        }
+        if negative_prompt:
+            payload["parameters"]["negative_prompt"] = negative_prompt
+
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "X-DashScope-Async": "enable",   # 强制异步任务模式
+        }
+
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                # ── Step 1: 提交任务 ──────────────────────────────
+                emit("text_delta", text=f"🎨 正在提交图像生成任务（{model}）…\n")
+                resp = await client.post(
+                    f"{base}/services/aigc/text2image/image-synthesis",
+                    headers=headers,
+                    json=payload,
+                )
+                if resp.status_code != 200:
+                    emit("error", error=f"提交任务失败 HTTP {resp.status_code}: {resp.text[:300]}")
+                    emit("done")
+                    return {}
+
+                data = resp.json()
+                task_id = data.get("output", {}).get("task_id")
+                if not task_id:
+                    emit("error", error=f"未获得 task_id，响应：{data}")
+                    emit("done")
+                    return {}
+
+                emit("text_delta", text=f"⏳ 任务已提交（task_id: `{task_id}`），等待生成…\n")
+
+                # ── Step 2: 轮询结果 ──────────────────────────────
+                poll_headers = {"Authorization": f"Bearer {api_key}"}
+                for i in range(self._MAX_POLLS):
+                    if self.is_cancelled(session_id):
+                        emit("done")
+                        return {}
+
+                    await asyncio.sleep(self._POLL_INTERVAL)
+
+                    poll = await client.get(
+                        f"{base}/tasks/{task_id}",
+                        headers=poll_headers,
+                        timeout=15.0,
+                    )
+                    if poll.status_code != 200:
+                        continue  # 短暂网络波动，继续重试
+
+                    pdata = poll.json()
+                    status = pdata.get("output", {}).get("task_status", "")
+
+                    if status == "FAILED":
+                        err = pdata.get("output", {}).get("message", "Unknown error")
+                        emit("error", error=f"图像生成失败：{err}")
+                        emit("done")
+                        return {}
+
+                    if status == "SUCCEEDED":
+                        results = pdata.get("output", {}).get("results", [])
+                        if not results:
+                            emit("error", error="生成成功但未返回图片结果")
+                            emit("done")
+                            return {}
+
+                        # ── Step 3: 下载图片 → base64 → 嵌入 Markdown ──
+                        img_url = results[0].get("url", "")
+                        if not img_url:
+                            emit("error", error="图片 URL 为空")
+                            emit("done")
+                            return {}
+
+                        emit("text_delta", text="✅ 生成完成，正在下载图片…\n\n")
+
+                        img_resp = await client.get(img_url, timeout=60.0)
+                        if img_resp.status_code != 200:
+                            # URL 下载失败，直接给用户原始链接
+                            emit("text_delta", text=f"![生成图像]({img_url})\n\n")
+                            emit("text_delta", text=f"> 🔗 原始链接（24小时有效）：{img_url}\n")
+                        else:
+                            mime = img_resp.headers.get("content-type", "image/png").split(";")[0]
+                            b64 = base64.b64encode(img_resp.content).decode()
+                            emit("text_delta", text=f"![生成图像](data:{mime};base64,{b64})\n\n")
+
+                        # 使用信息
+                        usage_info = pdata.get("usage", {})
+                        image_tokens = usage_info.get("image_count", len(results))
+                        emit("done", usage={"inputTokens": 0, "outputTokens": image_tokens})
+                        return {}
+
+                    # 仍在排队/生成中，每 5 次轮询显示一次进度点
+                    if i % 5 == 4:
+                        elapsed = int((i + 1) * self._POLL_INTERVAL)
+                        emit("text_delta", text=f"  …已等待 {elapsed}s（状态: {status}）\n")
+
+                # 超时
+                emit("error", error=f"图像生成超时（超过 {int(self._MAX_POLLS * self._POLL_INTERVAL)}s），task_id: {task_id}")
+                emit("done")
+                return {}
+
+        except Exception as e:
+            if not self.is_cancelled(session_id):
+                import traceback
+                traceback.print_exc()
+                emit("error", error=_exc_msg(e))
+                emit("done")
+            return {}
+
+
+# ---------------------------------------------------------------------------
 #  Factory
 # ---------------------------------------------------------------------------
 
@@ -1455,5 +1653,7 @@ def create_backend(config: ModelBackendConfig) -> ModelBackend:
         return AnthropicAPIBackend(config)
     elif config.type == BackendType.OPENAI_COMPATIBLE:
         return OpenAICompatibleBackend(config)
+    elif config.type == BackendType.DASHSCOPE_IMAGE:
+        return DashScopeImageBackend(config)
     else:
         raise ValueError(f"Unknown backend type: {config.type}")

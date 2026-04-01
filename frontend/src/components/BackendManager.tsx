@@ -452,7 +452,7 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
                         {backend.type === 'claude-code-official' && (
                           <span> · 官方账户{backend.env?.HTTPS_PROXY ? ' · 代理✓' : ' · ⚠️无代理'}</span>
                         )}
-                        {(backend.type === 'openai-compatible' || backend.type === 'anthropic-api' || backend.type === 'claude-code-official') && backend.model && (
+                        {(backend.type === 'openai-compatible' || backend.type === 'anthropic-api' || backend.type === 'claude-code-official' || backend.type === 'dashscope-image') && backend.model && (
                           <span> · 🤖{backend.model}</span>
                         )}
                         {backend.baseUrl && (
@@ -532,6 +532,7 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
                       <option value="claude-agent-sdk">Claude Agent SDK</option>
                       <option value="openai-compatible">OpenAI Compatible</option>
                       <option value="anthropic-api">Anthropic API</option>
+                      <option value="dashscope-image">DashScope 文生图（万象/Wan）</option>
                     </select>
                   </div>
                 </div>
@@ -976,6 +977,90 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
                     style={{ ...inputStyle, height: 70, resize: 'vertical', fontFamily: 'monospace', fontSize: 12 }}
                     placeholder={'MM-Group-Id: 123456789\nX-Custom-Header: value'}
                   />
+                </div>
+              </div>
+            )}
+
+            {/* ── DashScope 文生图专属配置 ── */}
+            {formData.type === 'dashscope-image' && (
+              <div style={{ marginBottom: 16, padding: 12, background: 'var(--theme-bg-secondary)', borderRadius: 8 }}>
+                <label style={{ ...labelStyle, marginBottom: 8 }}>DashScope 文生图配置</label>
+                <p style={{ fontSize: 11, color: 'var(--theme-text-muted)', margin: '0 0 12px 0' }}>
+                  阿里云万象（wanx / wan）系列文生图模型，使用异步任务 API。
+                </p>
+
+                <div style={{ marginBottom: 10 }}>
+                  <label style={{ fontSize: 11, color: 'var(--theme-text)', display: 'block', marginBottom: 4 }}>
+                    API Key <span style={{ color: 'rgba(239,68,68,0.8)' }}>*</span>
+                  </label>
+                  <input
+                    type="password"
+                    value={formData.apiKey || ''}
+                    onChange={(e) => setFormData({ ...formData, apiKey: e.target.value })}
+                    style={inputStyle}
+                    placeholder="sk-..."
+                  />
+                </div>
+
+                <div style={{ marginBottom: 10 }}>
+                  <label style={{ fontSize: 11, color: 'var(--theme-text)', display: 'block', marginBottom: 4 }}>
+                    模型
+                  </label>
+                  <input
+                    type="text"
+                    value={formData.model || ''}
+                    onChange={(e) => setFormData({ ...formData, model: e.target.value })}
+                    style={inputStyle}
+                    placeholder="wanx2.1-t2i-turbo（默认）"
+                  />
+                  <span style={{ display: 'block', marginTop: 4, fontSize: 10, color: 'var(--theme-text-muted)' }}>
+                    可选：wanx2.1-t2i-turbo / wanx2.1-t2i-plus / wanx2.0-t2i-turbo / wan2.1-t2i-turbo
+                  </span>
+                </div>
+
+                <div style={{ marginBottom: 10 }}>
+                  <label style={{ fontSize: 11, color: 'var(--theme-text)', display: 'block', marginBottom: 4 }}>
+                    图片尺寸（SIZE）
+                  </label>
+                  <input
+                    type="text"
+                    value={formData.env?.SIZE || ''}
+                    onChange={(e) => handleEnvChange('SIZE', e.target.value)}
+                    style={inputStyle}
+                    placeholder="1024*1024（默认）"
+                  />
+                  <span style={{ display: 'block', marginTop: 4, fontSize: 10, color: 'var(--theme-text-muted)' }}>
+                    常用：1024*1024 / 1280*720 / 720*1280 / 1328*1328 / 2048*2048
+                  </span>
+                </div>
+
+                <div style={{ marginBottom: 10 }}>
+                  <label style={{ fontSize: 11, color: 'var(--theme-text)', display: 'block', marginBottom: 4 }}>
+                    反向提示词（NEGATIVE_PROMPT，可选）
+                  </label>
+                  <input
+                    type="text"
+                    value={formData.env?.NEGATIVE_PROMPT || ''}
+                    onChange={(e) => handleEnvChange('NEGATIVE_PROMPT', e.target.value)}
+                    style={inputStyle}
+                    placeholder="blurry, low quality, watermark..."
+                  />
+                </div>
+
+                <div style={{ marginBottom: 10 }}>
+                  <label style={{ fontSize: 11, color: 'var(--theme-text)', display: 'block', marginBottom: 4 }}>
+                    Base URL（可选，覆盖默认 API 地址）
+                  </label>
+                  <input
+                    type="text"
+                    value={formData.baseUrl || ''}
+                    onChange={(e) => setFormData({ ...formData, baseUrl: e.target.value })}
+                    style={inputStyle}
+                    placeholder="留空使用 https://dashscope.aliyuncs.com/api/v1"
+                  />
+                  <span style={{ display: 'block', marginTop: 4, fontSize: 10, color: 'var(--theme-text-muted)' }}>
+                    新加坡节点：https://dashscope-intl.aliyuncs.com/api/v1
+                  </span>
                 </div>
               </div>
             )}
