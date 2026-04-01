@@ -44,14 +44,9 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
   // ★ Memoize refresh function to avoid re-creating it on every render
   const refresh = useCallback(async () => {
     const sessionList = await api.listSessions();
-    // Sort sessions: active first, then by updatedAt descending
-    sessionList.sort((a: any, b: any) => {
-      if (a.id === activeSessionId) return -1;
-      if (b.id === activeSessionId) return 1;
-      return (b.updatedAt || 0) - (a.updatedAt || 0);
-    });
+    sessionList.sort((a: any, b: any) => (b.updatedAt || 0) - (a.updatedAt || 0));
     setSessions(sessionList);
-  }, [activeSessionId]);
+  }, []);
 
   // ★ Handle constraints editor close
   const handleConstraintsClose = useCallback(() => {
