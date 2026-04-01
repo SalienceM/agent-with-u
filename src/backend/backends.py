@@ -1498,6 +1498,15 @@ class DashScopeImageBackend(ModelBackend):
             return {}
 
         base = (self.config.base_url or self._DEFAULT_BASE).rstrip("/")
+        # 验证 base_url 格式
+        if not base.startswith("http://") and not base.startswith("https://"):
+            emit("error", error=f"Base URL 格式错误，必须以 http:// 或 https:// 开头: {base}")
+            emit("done")
+            return {}
+        if not base.endswith("/api/v1"):
+            emit("error", error=f"Base URL 应该以 /api/v1 结尾 (DashScope API v1): {base}")
+            emit("done")
+            return {}
         model = self.config.model or self._DEFAULT_MODEL
 
         # 构建请求体
@@ -1518,12 +1527,11 @@ class DashScopeImageBackend(ModelBackend):
         prompt_extend = self.config.get_env("PROMPT_EXTEND", "true").lower() != "false"
         watermark = self.config.get_env("WATERMARK", "false").lower() == "true"
 
+        # DashScope 文生图 API v1 使用简单的 prompt 格式，不是 messages 格式
         payload: dict = {
             "model": model,
             "input": {
-                "messages": [
-                    {"role": "user", "content": [{"text": prompt}]}
-                ]
+                "prompt": prompt
             },
             "parameters": {
                 "size": size,
@@ -1540,17 +1548,25 @@ class DashScopeImageBackend(ModelBackend):
             "X-DashScope-Async": "enable",   # 强制异步任务模式
         }
 
+        # 调试日志
+        print(f"[DashScope] Base URL: {base}", file=sys.stderr)
+        print(f"[DashScope] Model: {model}", file=sys.stderr)
+        print(f"[DashScope] Prompt: {prompt[:50]}{'...' if len(prompt) > 50 else ''}", file=sys.stderr)
+
         try:
             async with httpx.AsyncClient(timeout=30.0) as client:
                 # ── Step 1: 提交任务 ──────────────────────────────
                 emit("text_delta", text=f"🎨 正在提交图像生成任务（{model}）…\n")
+                endpoint = f"{base}/services/aigc/text2image/image-synthesis"
+                emit("text_delta", text=f"📡 Endpoint: {endpoint}\n")
                 resp = await client.post(
-                    f"{base}/services/aigc/text2image/image-synthesis",
+                    endpoint,
                     headers=headers,
                     json=payload,
                 )
+                emit("text_delta", text=f".HTTP Status: {resp.status_code}\n")
                 if resp.status_code != 200:
-                    emit("error", error=f"提交任务失败 HTTP {resp.status_code}: {resp.text[:300]}")
+                    emit("error", error=f"提交任务失败 HTTP {resp.status_code}: {resp.text[:500]}")
                     emit("done")
                     return {}
 

@@ -246,6 +246,16 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
       if (formData.baseUrl?.trim()) saved.baseUrl = formData.baseUrl.trim();
       const headers = _cleanHeaders(formData.extraHeaders);
       if (headers) saved.extraHeaders = headers;
+    } else if (formData.type === 'dashscope-image') {
+      // api_key, base_url, model, env
+      if (formData.apiKey?.trim()) saved.apiKey = formData.apiKey.trim();
+      if (formData.model?.trim()) saved.model = formData.model.trim();
+      if (formData.baseUrl?.trim()) saved.baseUrl = formData.baseUrl.trim();
+      const cleanedEnv: Record<string, string> = {};
+      Object.entries(formData.env || {}).forEach(([k, v]) => {
+        if (v && v.trim()) cleanedEnv[k] = v.trim();
+      });
+      if (Object.keys(cleanedEnv).length > 0) saved.env = cleanedEnv;
     }
 
     onSaveBackend(saved);
