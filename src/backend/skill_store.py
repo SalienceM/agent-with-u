@@ -116,6 +116,7 @@ class SkillStore:
                     activations = valid_activations
 
                 result.append({
+                    "id": name,  # 使用 name 作为 ID（确保唯一性）
                     "name": name,
                     "content": content,
                     "isGlobal": "global" in activations,
@@ -132,6 +133,7 @@ class SkillStore:
             content = skill_file.read_text(encoding="utf-8")
             activations = self._index.get(name, {}).get("activations", [])
             return {
+                "id": name,  # 使用 name 作为 ID（确保唯一性）
                 "name": name,
                 "content": content,
                 "activations": activations,
@@ -145,6 +147,10 @@ class SkillStore:
             skill_dir = LIBRARY_DIR / name
             skill_dir.mkdir(parents=True, exist_ok=True)
             (skill_dir / "SKILL.md").write_text(content, encoding="utf-8")
+            # 确保索引中存在此 skill（为 ID 概念做准备）
+            if name not in self._index:
+                self._index[name] = {"activations": []}
+                self._save_index()
             # 同步所有已激活的位置
             for target_key in self._index.get(name, {}).get("activations", []):
                 try:

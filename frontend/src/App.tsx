@@ -29,7 +29,6 @@ export const App: React.FC = () => {
   const [backendManagerOpen, setBackendManagerOpen] = useState(false);
   const [skillManagerOpen, setSkillManagerOpen] = useState(false);
   const [repoPanelOpen, setRepoPanelOpen] = useState(false);
-  const [migrateDialogOpen, setMigrateDialogOpen] = useState(false);
   const [newSessionDialogOpen, setNewSessionDialogOpen] = useState(false);
   const [skipPermissions, setSkipPermissions] = useState(true);  // ★ 权限模式开关
   const [streamingSessions, setStreamingSessions] = useState<Set<string>>(new Set());  // ★ Per-session streaming state
@@ -121,9 +120,6 @@ export const App: React.FC = () => {
 
   // Phase 2: 每 Session 独立的模型配置
   const activeBackendId = activeSession?.backendId || backends[0]?.id || '';
-
-  // ★ skipPermissions 现在是 session 级别的设置，完全由 session 控制
-  // 不再从 backend 同步默认值，避免覆盖用户设置
 
   const chat = useChat(activeSessionId || '', activeBackendId, backends, skipPermissions);
 
@@ -243,15 +239,6 @@ export const App: React.FC = () => {
     window.dispatchEvent(new CustomEvent('session-created'));
   }, []);
 
-  /* ---- Phase 3: 切换 Session 的模型（跨 Session 支持） ---- */
-  const handleMigrateSession = useCallback(async (targetBackendId: string) => {
-    if (!activeSessionId) return;
-    const result = await api.migrateSession(activeSessionId, targetBackendId);
-    if (result?.status === 'ok') {
-      setActiveSessionId(result.newSessionId);
-      setMigrateDialogOpen(false);
-    }
-  }, [activeSessionId]);
 
   /* ---- 导出聊天记录 ---- */
   const handleExportChat = useCallback(() => {
@@ -523,14 +510,6 @@ export const App: React.FC = () => {
             {formatBackendLabel(backends.find((b: any) => b.id === activeBackendId))}
           </span>
           <div style={{ flex: 1 }} />
-          {/* Phase 3: 跨 Session 按钮 */}
-          <button
-            onClick={() => setMigrateDialogOpen(true)}
-            style={migrateBtnStyle}
-            title="Migrate to different model"
-          >
-            Migrate
-          </button>
           {/* 日志查看器按钮 */}
           <button
             onClick={() => api.openLogViewer()}
@@ -660,6 +639,8 @@ export const App: React.FC = () => {
               </>
             );
           })()}
+
+          {/* 底部占位符 */}
           <div ref={endRef} />
         </div>
 
@@ -751,16 +732,6 @@ export const App: React.FC = () => {
         onClose={() => setSkillManagerOpen(false)}
         workingDir={activeSession?.workingDir || ''}
       />
-
-      {/* ---- Phase 3: Migrate Dialog ---- */}
-      {migrateDialogOpen && (
-        <MigrateDialog
-          currentBackendId={activeBackendId}
-          backends={backends}
-          onClose={() => setMigrateDialogOpen(false)}
-          onMigrate={handleMigrateSession}
-        />
-      )}
 
       {/* ---- New Session Dialog: Select working directory first ---- */}
       {newSessionDialogOpen && (
@@ -886,141 +857,8 @@ const logBtnStyle: React.CSSProperties = {
   fontWeight: 500,
 };
 
-/* ---- Phase 3: Migrate Dialog Component ---- */
-interface MigrateDialogProps {
-  currentBackendId: string;
-  backends: any[];
-  onClose: () => void;
-  onMigrate: (targetBackendId: string) => void;
-}
-
-const MigrateDialog: React.FC<MigrateDialogProps> = ({
-  currentBackendId,
-  backends,
-  onClose,
-  onMigrate,
-}) => {
-  const [selectedBackendId, setSelectedBackendId] = useState(currentBackendId);
-
-  const handleConfirm = useCallback(() => {
-    if (selectedBackendId && selectedBackendId !== currentBackendId) {
-      onMigrate(selectedBackendId);
-    } else {
-      onClose();
-    }
-  }, [selectedBackendId, currentBackendId, onMigrate, onClose]);
-
-  return (
-    <div
-      style={overlayStyle}
-    >
-      <div
-        style={{
-          ...dialogStyle,
-          willChange: 'transform',
-          animation: 'dialogSlideIn 0.28s cubic-bezier(0.22,0.61,0.36,1)',
-        }}
-        onClick={(e) => e.stopPropagation()}
-      >
-        <h3 style={dialogTitleStyle}>Migrate Session to Different Model</h3>
-        <p style={dialogDescStyle}>
-          This creates a new session with the selected model, carrying over all message history.
-          The new model will see the full conversation and can continue seamlessly.
-        </p>
-        <div style={selectContainerStyle}>
-          <label style={labelStyle}>Target Model:</label>
-          <div style={selectWrapperStyle}>
-            <select
-              value={selectedBackendId}
-              onChange={(e) => setSelectedBackendId(e.target.value)}
-              style={selectStyle}
-            >
-              {backends.map((b) => (
-                <option key={b.id} value={b.id}>
-                  {b.label} {b.id === currentBackendId ? ' (current)' : ''}
-                </option>
-              ))}
-            </select>
-          </div>
-        </div>
-        <div style={dialogActionsStyle}>
-          <button onClick={onClose} style={cancelBtnStyle}>Cancel</button>
-          <button onClick={handleConfirm} style={confirmBtnStyle}>
-            Migrate & Create New Session
-          </button>
-        </div>
-      </div>
-    </div>
-  );
-};
-
-const overlayStyle: React.CSSProperties = {
-  position: 'fixed',
-  inset: 0,
-  background: 'rgba(0,0,0,0.7)',
-  display: 'flex',
-  alignItems: 'center',
-  justifyContent: 'center',
-  zIndex: 1000,
-  willChange: 'opacity',
-};
-
-const dialogStyle: React.CSSProperties = {
-  background: 'var(--theme-bg-secondary, #ffffff)',
-  borderRadius: 12,
-  padding: 24,
-  maxWidth: 480,
-  width: '90%',
-  border: '1px solid var(--theme-border, rgba(0,0,0,0.15))',
-  boxShadow: '0 20px 60px rgba(0,0,0,0.2)',
-};
-
-const dialogTitleStyle: React.CSSProperties = {
-  margin: '0 0 8px 0',
-  fontSize: 18,
-  fontWeight: 600,
-  color: 'var(--theme-text, #1f2328)',
-};
-
-const dialogDescStyle: React.CSSProperties = {
-  margin: '0 0 20px 0',
-  fontSize: 13,
-  color: 'var(--theme-text-muted, #656d76)',
-  lineHeight: 1.5,
-};
-
-const selectContainerStyle: React.CSSProperties = {
-  marginBottom: 20,
-};
-
-const labelStyle: React.CSSProperties = {
-  display: 'block',
-  fontSize: 13,
-  color: 'var(--theme-text, #1f2328)',
-  marginBottom: 8,
-};
-
-const selectStyle: React.CSSProperties = {
-  width: '100%',
-  padding: '10px 12px',
-  background: 'var(--theme-input-bg, #ffffff)',
-  border: '1px solid var(--theme-border, rgba(0,0,0,0.15))',
-  borderRadius: 8,
-  color: 'var(--theme-text, #1f2328)',
-  fontSize: 14,
-  outline: 'none',
-  cursor: 'pointer',
-  fontFamily: 'inherit',
-  WebkitAppearance: 'none',
-  MozAppearance: 'none',
-  appearance: 'none',
-};
-
-const dialogActionsStyle: React.CSSProperties = {
-  display: 'flex',
-  justifyContent: 'flex-end',
-  gap: 10,
-};
+/* ---- New Session Dialog: Select working directory first ---- */
+interface NewSessionDialogProps {}
 
 const selectWrapperStyle: React.CSSProperties = {
   position: 'relative',

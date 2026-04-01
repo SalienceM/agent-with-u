@@ -8,6 +8,7 @@ if (typeof document !== 'undefined' && !document.getElementById('repo-panel-css'
   s.textContent = `
     .repo-card:hover { border-color: var(--theme-accent, #7aa2f7) !important; transform: translateY(-2px); box-shadow: 0 4px 12px rgba(0,0,0,0.15); }
     .repo-card:hover .repo-card-actions { opacity: 1 !important; }
+    .repo-column-separator { border-right: 1px solid var(--theme-border); }
   `;
   document.head.appendChild(s);
 }
@@ -16,13 +17,15 @@ if (typeof document !== 'undefined' && !document.getElementById('repo-panel-css'
 //  Types
 // ═══════════════════════════════════════
 interface SkillItem {
-  name: string;
+  id: string;            // 唯一ID，创建后永不变更
+  name: string;          // 名称（可修改）
   content?: string;
   isGlobal?: boolean;
   isProject?: boolean;
 }
 interface PromptItem {
-  name: string;
+  id: string;            // 唯一ID，创建后永不变更
+  name: string;          // 名称（可修改）
   content: string;
   icon: string;
   createdAt?: number;
@@ -187,14 +190,14 @@ export const RepoPanel: React.FC<Props> = ({ open, workingDir, onClose }) => {
     <div style={panelStyle}>
       <div style={{ display: 'flex', gap: 24, flex: 1, overflow: 'hidden' }}>
         {/* ── 左：Skills ── */}
-        <div style={columnStyle}>
-          <div style={columnHeaderStyle}>
+        <div style={{ ...columnStyle, borderRight: '1px solid var(--theme-border)', paddingRight: 24 }}>
+          <div style={{ ...columnHeaderStyle, border: 'none', padding: 0 }}>
             <span>⚡ Skills</span>
             <button onClick={() => openEditor('skill')} style={addBtnStyle} title="新建 Skill">＋</button>
           </div>
           <div style={cardGridStyle}>
             {skills.map(s => (
-              <div key={s.name} className="repo-card" style={cardStyle} onClick={() => openEditor('skill', s)}>
+              <div key={s.id} className="repo-card" style={cardStyle} onClick={() => openEditor('skill', s)}>
                 <div style={cardIconStyle}>⚡</div>
                 <div style={cardNameStyle}>{s.name}</div>
                 <div className="repo-card-actions" style={cardActionsStyle}>
@@ -211,14 +214,14 @@ export const RepoPanel: React.FC<Props> = ({ open, workingDir, onClose }) => {
         </div>
 
         {/* ── 右：Prompts ── */}
-        <div style={columnStyle}>
-          <div style={columnHeaderStyle}>
+        <div style={{ ...columnStyle, paddingLeft: 24 }}>
+          <div style={{ ...columnHeaderStyle, border: 'none', padding: 0 }}>
             <span>📝 Prompts</span>
             <button onClick={() => openEditor('prompt')} style={addBtnStyle} title="新建 Prompt">＋</button>
           </div>
           <div style={cardGridStyle}>
             {prompts.map(p => (
-              <div key={p.name} className="repo-card" style={cardStyle} onClick={() => openEditor('prompt', p)}>
+              <div key={p.id} className="repo-card" style={cardStyle} onClick={() => openEditor('prompt', p)}>
                 <div style={cardIconStyle}>{p.icon || '📝'}</div>
                 <div style={cardNameStyle}>{p.name}</div>
                 <div className="repo-card-actions" style={cardActionsStyle}>
@@ -234,13 +237,6 @@ export const RepoPanel: React.FC<Props> = ({ open, workingDir, onClose }) => {
           </div>
         </div>
       </div>
-
-      {/* 关闭按钮 */}
-      <button onClick={onClose} style={closeBtnStyle} title="收起 Repo">
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-          <polyline points="18 15 12 9 6 15" />
-        </svg>
-      </button>
     </div>
   );
 };

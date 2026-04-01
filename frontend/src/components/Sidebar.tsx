@@ -56,6 +56,37 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
     const [sk, pr] = await Promise.all([api.listSkills(session.workingDir || ''), api.listPrompts()]);
     setAvailableSkills(sk || []);
     setAvailablePrompts(pr || []);
+  }, [api]);
+
+  // ★ 删除技能/提示确认
+  const [itemToDelete, setItemToDelete] = useState<{ type: 'skills' | 'prompts', name: string } | null>(null);
+
+  const confirmDeleteItem = useCallback(async () => {
+    if (!itemToDelete || !abilityPickerSession) return;
+    const { type, name } = itemToDelete;
+    const current = abilityPickerSession.abilities || { skills: [], prompts: [] };
+    const list = [...(current[type] || [])];
+    const idx = list.indexOf(name);
+    if (idx >= 0) {
+      list.splice(idx, 1);
+      const newAbilities = { ...current, [type]: list };
+      await api.updateSessionAbilities(abilityPickerSession.id, newAbilities);
+      setAbilityPickerSession({ ...abilityPickerSession, abilities: newAbilities });
+    }
+    setItemToDelete(null);
+  }, [itemToDelete, abilityPickerSession]);
+
+  // ★ 预览内容状态
+  const [previewContent, setPreviewContent] = useState<string | null>(null);
+
+  // ★ 显示 Skill 预览
+  const show_preview_skill = useCallback(async (skill: any) => {
+    setPreviewContent(skill.content || '');
+  }, []);
+
+  // ★ 显示 Prompt 预览
+  const show_preview_prompt = useCallback(async (prompt: any) => {
+    setPreviewContent(prompt.content || '');
   }, []);
 
   const toggleAbility = useCallback(async (type: 'skills' | 'prompts', name: string) => {
@@ -129,6 +160,10 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
     window.addEventListener('session-created', handleSessionCreated);
     return () => window.removeEventListener('session-created', handleSessionCreated);
   }, [refresh]);
+
+  // ★ 约束输入框聚焦 ref
+  const constraintsRef = useRef<HTMLTextAreaElement>(null);
+  const [showConstraintsInput, setShowConstraintsInput] = useState(false);
 
   // ★ Expose refresh to parent via custom event or ref if needed
   // For now, refresh when window gains focus (user might have created session elsewhere)
@@ -400,74 +435,224 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
 
       {/* 能力绑定面板 */}
       {abilityPickerSession && (
-        <div style={overlayStyle} onClick={() => setAbilityPickerSession(null)}>
-          <div style={{ ...confirmPanelStyle, maxWidth: 360, animation: 'dialogSlideIn 0.28s cubic-bezier(0.22,0.61,0.36,1)' }} onClick={(e) => e.stopPropagation()}>
-            <h3 style={{ margin: '0 0 12px 0', fontSize: 15, fontWeight: 600, color: 'var(--theme-text, #1f2328)' }}>
-              🧩 绑定能力
-            </h3>
-            <p style={{ fontSize: 11, color: 'var(--theme-text-muted)', margin: '0 0 10px 0' }}>
-              选择要绑定到此会话的 Skill 和 Prompt
-            </p>
-            {availableSkills.length > 0 && (
-              <>
-                <div style={{ fontSize: 11, fontWeight: 600, color: 'var(--theme-text-muted)', marginBottom: 4, textTransform: 'uppercase' }}>Skills</div>
-                <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4, marginBottom: 10 }}>
-                  {availableSkills.map((sk: any) => {
-                    const bound = (abilityPickerSession.abilities?.skills || []).includes(sk.name);
-                    return (
-                      <button
-                        key={sk.name}
-                        onClick={() => toggleAbility('skills', sk.name)}
-                        style={{
-                          padding: '3px 10px', borderRadius: 12, fontSize: 11, cursor: 'pointer',
-                          border: bound ? '1px solid var(--theme-accent)' : '1px solid var(--theme-border)',
-                          background: bound ? 'var(--theme-accent-bg)' : 'transparent',
-                          color: bound ? 'var(--theme-accent)' : 'var(--theme-text-muted)',
-                          fontWeight: bound ? 600 : 400,
-                          transition: 'all 0.12s',
-                        }}
-                      >
-                        ⚡ {sk.name}
-                      </button>
-                    );
-                  })}
-                </div>
-              </>
-            )}
-            {availablePrompts.length > 0 && (
-              <>
-                <div style={{ fontSize: 11, fontWeight: 600, color: 'var(--theme-text-muted)', marginBottom: 4, textTransform: 'uppercase' }}>Prompts</div>
-                <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4, marginBottom: 10 }}>
-                  {availablePrompts.map((p: any) => {
-                    const bound = (abilityPickerSession.abilities?.prompts || []).includes(p.name);
-                    return (
-                      <button
-                        key={p.name}
-                        onClick={() => toggleAbility('prompts', p.name)}
-                        style={{
-                          padding: '3px 10px', borderRadius: 12, fontSize: 11, cursor: 'pointer',
-                          border: bound ? '1px solid var(--theme-accent)' : '1px solid var(--theme-border)',
-                          background: bound ? 'var(--theme-accent-bg)' : 'transparent',
-                          color: bound ? 'var(--theme-accent)' : 'var(--theme-text-muted)',
-                          fontWeight: bound ? 600 : 400,
-                          transition: 'all 0.12s',
-                        }}
-                      >
-                        {p.icon || '📝'} {p.name}
-                      </button>
-                    );
-                  })}
-                </div>
-              </>
-            )}
-            {availableSkills.length === 0 && availablePrompts.length === 0 && (
-              <p style={{ fontSize: 12, color: 'var(--theme-text-muted)', textAlign: 'center', padding: '12px 0' }}>
-                暂无可绑定的 Skill 或 Prompt，请先在 Repo 中创建
-              </p>
-            )}
-            <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
-              <button onClick={() => setAbilityPickerSession(null)} style={confirmBtnStyle}>完成</button>
+        <div ref={pickerRef} style={overlayStyle} onClick={() => setAbilityPickerSession(null)}>
+          <div style={{
+            ...confirmPanelStyle,
+            maxWidth: 720,
+            width: '90%',
+            height: '80vh',
+            display: 'flex',
+            flexDirection: 'column',
+            animation: 'dialogSlideIn 0.28s cubic-bezier(0.22,0.61,0.36,1)'
+          }} onClick={(e) => e.stopPropagation()}>
+            {/* 头部：显示会话名称和关闭按钮 */}
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12, paddingBottom: 10, borderBottom: '1px solid var(--theme-border, rgba(0,0,0,0.08))' }}>
+              <span style={{ fontSize: 14, fontWeight: 600, color: 'var(--theme-text)' }}>
+                编辑会话
+                <span style={{ marginLeft: 6, color: 'var(--theme-accent)', fontSize: 13, fontWeight: 500 }}>"{abilityPickerSession.title}"</span>
+              </span>
+              <button onClick={() => setAbilityPickerSession(null)} style={{
+                fontSize: 14, padding: '2px 6px', borderRadius: 4,
+                border: '1px solid var(--theme-border)', background: 'transparent',
+                color: 'var(--theme-text-muted)', cursor: 'pointer', width: 24, height: 24,
+                display: 'flex', alignItems: 'center', justifyContent: 'center'
+              }}>
+                ✕
+              </button>
             </div>
+
+            {/* 主体内容：上下布局 */}
+            <div style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: 16, minHeight: 0 }}>
+              {/* 上方：Skills 和 Prompts 左右分栏 - 占 45% */}
+              <div style={{ flex: '0 0 45%', display: 'flex', gap: 16, minHeight: 0 }}>
+                {/* Skills 列 */}
+                <div style={{ flex: 1, display: 'flex', flexDirection: 'column', minWidth: 0 }}>
+                  <div style={{ fontSize: 11, fontWeight: 600, color: 'var(--theme-text)', marginBottom: 6, textTransform: 'uppercase' }}>⚡ Skills</div>
+                  <div style={{
+                    flex: 1, overflowY: 'auto', border: '1px solid var(--theme-border)',
+                    borderRadius: 8, overflow: 'hidden', padding: '4px'
+                  }}>
+                    {availableSkills.length > 0 ? (
+                      availableSkills.map((sk: any) => {
+                        const bound = (abilityPickerSession.abilities?.skills || []).includes(sk.name);
+                        return (
+                          <div
+                            key={sk.id}
+                            onClick={(e) => { e.stopPropagation(); toggleAbility('skills', sk.name); }}
+                            style={{
+                              padding: '6px 10px', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 8,
+                              background: bound ? 'var(--theme-accent-bg, rgba(122,162,247,0.08))' : 'transparent',
+                              borderBottom: '1px solid var(--theme-border, rgba(0,0,0,0.04))',
+                            }}
+                          >
+                            <div style={{
+                              width: 14, height: 14, borderRadius: 3, borderWidth: 2, borderStyle: 'solid',
+                              display: 'flex', alignItems: 'center', justifyContent: 'center',
+                              background: bound ? 'var(--theme-accent)' : 'transparent',
+                              borderColor: bound ? 'var(--theme-accent)' : 'var(--theme-border)',
+                            }}>
+                              {bound && <div style={{ width: 6, height: 6, background: '#fff', borderRadius: 1 }} />}
+                            </div>
+                            <span style={{ flex: 1, fontSize: 12, color: 'var(--theme-text)' }}>{sk.name}</span>
+                            <div style={{ display: 'flex', gap: 6 }}>
+                              <button
+                                onClick={(e) => { e.stopPropagation(); show_preview_skill(sk); }}
+                                style={{ fontSize: 10, padding: '2px 6px', borderRadius: 4, border: '1px solid var(--theme-border)', background: 'transparent', color: 'var(--theme-text-muted)', cursor: 'pointer' }}
+                              >
+                                预览
+                              </button>
+                              <button
+                                onClick={(e) => { e.stopPropagation(); setItemToDelete({ type: 'skills', name: sk.name }); }}
+                                style={{ fontSize: 10, padding: '2px 6px', borderRadius: 4, border: '1px solid #ef4444', background: 'rgba(239,68,68,0.1)', color: '#ef4444', cursor: 'pointer' }}
+                                title="取消绑定"
+                              >
+                                ✕
+                              </button>
+                            </div>
+                          </div>
+                        );
+                      })
+                    ) : (
+                      <div style={{ padding: 12, textAlign: 'center', color: 'var(--theme-text-muted)', fontSize: 12 }}>
+                        暂无 Skills，请先在 Repo 中创建
+                      </div>
+                    )}
+                  </div>
+                </div>
+
+                {/* Prompts 列 */}
+                <div style={{ flex: 1, display: 'flex', flexDirection: 'column', minWidth: 0 }}>
+                  <div style={{ fontSize: 11, fontWeight: 600, color: 'var(--theme-text)', marginBottom: 6, textTransform: 'uppercase' }}>📝 Prompts</div>
+                  <div style={{
+                    flex: 1, overflowY: 'auto', border: '1px solid var(--theme-border)',
+                    borderRadius: 8, overflow: 'hidden', padding: '4px'
+                  }}>
+                    {availablePrompts.length > 0 ? (
+                      availablePrompts.map((p: any) => {
+                        const bound = (abilityPickerSession.abilities?.prompts || []).includes(p.name);
+                        return (
+                          <div
+                            key={p.id}
+                            onClick={(e) => { e.stopPropagation(); toggleAbility('prompts', p.name); }}
+                            style={{
+                              padding: '6px 10px', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 8,
+                              background: bound ? 'var(--theme-accent-bg, rgba(122,162,247,0.08))' : 'transparent',
+                              borderBottom: '1px solid var(--theme-border, rgba(0,0,0,0.04))',
+                            }}
+                          >
+                            <div style={{
+                              width: 14, height: 14, borderRadius: 3, borderWidth: 2, borderStyle: 'solid',
+                              display: 'flex', alignItems: 'center', justifyContent: 'center',
+                              background: bound ? 'var(--theme-accent)' : 'transparent',
+                              borderColor: bound ? 'var(--theme-accent)' : 'var(--theme-border)',
+                            }}>
+                              {bound && <div style={{ width: 6, height: 6, background: '#fff', borderRadius: 1 }} />}
+                            </div>
+                            <span style={{ flex: 1, fontSize: 12, color: 'var(--theme-text)' }}>{p.icon || '📝'} {p.name}</span>
+                            <div style={{ display: 'flex', gap: 6 }}>
+                              <button
+                                onClick={(e) => { e.stopPropagation(); show_preview_prompt(p); }}
+                                style={{ fontSize: 10, padding: '2px 6px', borderRadius: 4, border: '1px solid var(--theme-border)', background: 'transparent', color: 'var(--theme-text-muted)', cursor: 'pointer' }}
+                              >
+                                预览
+                              </button>
+                              <button
+                                onClick={(e) => { e.stopPropagation(); setItemToDelete({ type: 'prompts', name: p.name }); }}
+                                style={{ fontSize: 10, padding: '2px 6px', borderRadius: 4, border: '1px solid #ef4444', background: 'rgba(239,68,68,0.1)', color: '#ef4444', cursor: 'pointer' }}
+                                title="取消绑定"
+                              >
+                                ✕
+                              </button>
+                            </div>
+                          </div>
+                        );
+                      })
+                    ) : (
+                      <div style={{ padding: 12, textAlign: 'center', color: 'var(--theme-text-muted)', fontSize: 12 }}>
+                        暂无 Prompts，请先在 Repo 中创建
+                      </div>
+                    )}
+                  </div>
+                </div>
+              </div>
+
+              {/* 下方：临时 Session 级约束 - 占 45% */}
+              <div style={{ flex: '0 0 45%', display: 'flex', flexDirection: 'column', minHeight: 0 }}>
+                <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--theme-text)', marginBottom: 6 }}>
+                  临时约束/rule
+                  <span style={{ marginLeft: 6, fontSize: 10, fontWeight: 400, color: 'var(--theme-text-muted)', background: 'var(--theme-accent-bg)', padding: '2px 8px', borderRadius: 4 }}>
+                    Session 级临时生效
+                  </span>
+                </div>
+                <div style={{ flex: 1, display: 'flex', flexDirection: 'column' }}>
+                  <textarea
+                    value={(abilityPickerSession.abilities as any)?.constraints || ''}
+                    onChange={(e) => {
+                      const current = abilityPickerSession.abilities || { skills: [], prompts: [] };
+                      const newAbilities = { ...current, constraints: e.target.value };
+                      api.updateSessionAbilities(abilityPickerSession.id, newAbilities).then(() => {
+                        setAbilityPickerSession({ ...abilityPickerSession, abilities: newAbilities });
+                      });
+                    }}
+                    onClick={(e) => e.stopPropagation()}
+                    placeholder="输入临时约束规则（仅本次会话有效）..."
+                    style={{
+                      flex: 1, fontSize: 12, resize: 'none',
+                      background: 'var(--theme-bg)', border: '1px solid var(--theme-border)',
+                      borderRadius: 8, padding: '10px 12px', color: 'var(--theme-text)',
+                      fontFamily: 'inherit', outline: 'none', boxSizing: 'border-box', minHeight: 160,
+                    }}
+                    // 添加 composition events 防止中文输入重复
+                    onCompositionStart={(e) => { e.stopPropagation(); }}
+                    onCompositionEnd={(e) => { e.stopPropagation(); }}
+                    onCompositionUpdate={(e) => { e.stopPropagation(); }}
+                  />
+                  <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: 8, gap: 8 }}>
+                    <button
+                      onClick={() => {
+                        const current = abilityPickerSession.abilities || { skills: [], prompts: [] };
+                        const newAbilities = { ...current, constraints: '' };
+                        api.updateSessionAbilities(abilityPickerSession.id, newAbilities).then(() => {
+                          setAbilityPickerSession({ ...abilityPickerSession, abilities: newAbilities });
+                        });
+                      }}
+                      style={{ fontSize: 11, padding: '6px 12px', borderRadius: 6, border: '1px solid var(--theme-border)', background: 'transparent', color: 'var(--theme-text-muted)', cursor: 'pointer' }}
+                    >
+                      清空约束
+                    </button>
+                    <button onClick={() => setAbilityPickerSession(null)} style={{ ...confirmBtnStyle, fontSize: 12, padding: '6px 16px' }}>
+                      保存并关闭
+                    </button>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            {/* 预览对话框 */}
+            {previewContent && (
+              <div style={overlayStyle} onClick={() => setPreviewContent(null)}>
+                <div style={{ ...confirmPanelStyle, maxWidth: 520, animation: 'dialogSlideIn 0.28s cubic-bezier(0.22,0.61,0.36,1)' }} onClick={(e) => e.stopPropagation()}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12, paddingBottom: 10, borderBottom: '1px solid var(--theme-border)' }}>
+                    <h3 style={{ margin: 0, fontSize: 14, fontWeight: 600, color: 'var(--theme-text)' }}>预览内容</h3>
+                    <button onClick={() => setPreviewContent(null)} style={{
+                      fontSize: 14, padding: '2px 6px', borderRadius: 4,
+                      border: '1px solid var(--theme-border)', background: 'transparent',
+                      color: 'var(--theme-text-muted)', cursor: 'pointer', width: 24, height: 24
+                    }}>
+                      ✕
+                    </button>
+                  </div>
+                  <div style={{ background: 'var(--theme-bg-secondary)', border: '1px solid var(--theme-border)', borderRadius: 8, padding: 12, maxHeight: 400, overflowY: 'auto' }}>
+                    <pre style={{ margin: 0, whiteSpace: 'pre-wrap', fontFamily: 'monospace', fontSize: 13, lineHeight: 1.6, color: 'var(--theme-text)' }}>
+                      {previewContent}
+                    </pre>
+                  </div>
+                  <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: 12 }}>
+                    <button onClick={() => setPreviewContent(null)} style={confirmBtnStyle}>关闭</button>
+                  </div>
+                </div>
+              </div>
+            )}
           </div>
         </div>
       )}
@@ -490,6 +675,31 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
                 删除
               </button>
               <button onClick={() => setSessionToDelete(null)} style={cancelBtnStyle}>
+                取消
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* 删除技能/提示确认对话框 */}
+      {itemToDelete && (
+        <div style={overlayStyle}>
+          <div style={{ ...confirmPanelStyle, animation: 'dialogSlideIn 0.28s cubic-bezier(0.22,0.61,0.36,1)' }} onClick={(e) => e.stopPropagation()}>
+            <h3 style={{ margin: '0 0 12px 0', fontSize: 16, fontWeight: 600, color: 'var(--theme-text, #1f2328)' }}>
+              确认取消绑定
+            </h3>
+            <p style={{ fontSize: 13, color: 'var(--theme-text-muted, #656d76)', margin: '0 0 16px 0', lineHeight: 1.5 }}>
+              确定要取消绑定 <strong style={{ color: 'var(--theme-error, #cf222e)' }}>{itemToDelete.name}</strong> 吗？
+            </p>
+            <p style={{ fontSize: 12, color: 'var(--theme-text-muted, #656d76)', margin: '0 0 16px 0' }}>
+              此操作将在保存后生效。
+            </p>
+            <div style={{ display: 'flex', gap: 8 }}>
+              <button onClick={confirmDeleteItem} style={confirmBtnStyle}>
+                确认
+              </button>
+              <button onClick={() => setItemToDelete(null)} style={cancelBtnStyle}>
                 取消
               </button>
             </div>

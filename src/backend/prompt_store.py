@@ -23,7 +23,11 @@ class PromptStore:
         if self._index_path.exists():
             try:
                 data = json.loads(self._index_path.read_text(encoding="utf-8"))
-                self._index = {item["name"]: item for item in data}
+                # Migration: convert old list format to dict with ID
+                if isinstance(data, list):
+                    self._index = {item.get("name", item.get("id")): item for item in data}
+                else:
+                    self._index = {item.get("name", item.get("id")): item for item in data.values()}
             except Exception:
                 self._index = {}
 
@@ -38,7 +42,11 @@ class PromptStore:
         for meta in sorted(self._index.values(), key=lambda x: x.get("updatedAt", 0), reverse=True):
             path = self._dir / f"{meta['name']}.md"
             content = path.read_text(encoding="utf-8") if path.exists() else ""
-            result.append({**meta, "content": content})
+            # Ensure ID exists (migrates from name-based to ID-based)
+            entry = {**meta, "content": content}
+            if "id" not in entry:
+                entry["id"] = entry.get("name", "")
+            result.append(entry)
         return result
 
     def get_prompt(self, name: str) -> Optional[dict]:
