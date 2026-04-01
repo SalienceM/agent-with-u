@@ -51,6 +51,8 @@ export const App: React.FC = () => {
   const autoScrollRef = useRef(true);          // ★ 用 ref 避免 onScroll 闭包捕获旧值
   const [showScrollBtn, setShowScrollBtn] = useState(false);
   const prevStreamingRef = useRef(false);
+  const animSessionRef = useRef<string | null>(null); // 记录上次渲染时的 sessionId
+  const animMsgCountRef = useRef(0);                  // 记录上次渲染时的消息数
 
   const { config, updateConfig, resetConfig, reloadConfig } = useConfig();
 
@@ -575,6 +577,13 @@ export const App: React.FC = () => {
             const effectiveVisible = Math.max(visibleCount, chat.isStreaming ? total : visibleCount);
             const hiddenCount = Math.max(0, total - effectiveVisible);
             const visibleMessages = hiddenCount > 0 ? chat.messages.slice(hiddenCount) : chat.messages;
+
+            // 只给真正新增的最后一条消息播入场动画，切换 session 时全部不播
+            const isSameSession = animSessionRef.current === activeSessionId;
+            const prevCount = isSameSession ? animMsgCountRef.current : total;
+            animSessionRef.current = activeSessionId;
+            animMsgCountRef.current = total;
+
             return (
               <>
                 {hiddenCount > 0 && (
@@ -595,12 +604,13 @@ export const App: React.FC = () => {
                     </button>
                   </div>
                 )}
-                {visibleMessages.map((msg) => (
+                {visibleMessages.map((msg, idx) => (
                   <MessageBubble
                     key={msg.id}
                     message={msg}
                     fontSize={config.fontSize}
                     renderMarkdown={config.renderMarkdown}
+                    animateIn={isSameSession && (hiddenCount + idx) >= prevCount}
                   />
                 ))}
                 {/* ★ 行内权限确认组件 */}

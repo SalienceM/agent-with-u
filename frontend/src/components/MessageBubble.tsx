@@ -277,6 +277,7 @@ interface Props {
   message: ChatMessage;
   fontSize?: number;
   renderMarkdown?: boolean;
+  animateIn?: boolean;
 }
 
 // 复制气泡内容到剪贴板
@@ -408,6 +409,7 @@ export const MessageBubble: React.FC<Props> = ({
   message,
   fontSize = 14,
   renderMarkdown = true,
+  animateIn = false,
 }) => {
   const [lightboxSrc, setLightboxSrc] = useState<string | null>(null);
   const contentRef = useRef<HTMLDivElement>(null);
@@ -475,7 +477,7 @@ export const MessageBubble: React.FC<Props> = ({
         display: 'flex',
         justifyContent: isUser ? 'flex-end' : 'flex-start',
         padding: '4px 16px',
-        animation: 'msgSlideIn 0.22s ease-out',
+        animation: animateIn ? 'msgSlideIn 0.22s ease-out' : undefined,
       }}
     >
       {/* ★ 角色标签 */}
