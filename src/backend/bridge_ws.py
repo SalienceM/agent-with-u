@@ -37,6 +37,7 @@ from .instance_manager import InstanceManager
 from .backend_store import BackendStore
 from .app_config_store import AppConfigStore
 from .skill_store import SkillStore
+from .prompt_store import PromptStore
 
 # ── 剪贴板（非 Qt，Pillow ImageGrab，仅 Windows/macOS）──────────
 
@@ -113,6 +114,7 @@ class BridgeWS:
         self._session_store = SessionStore()
         self._backend_store = BackendStore()
         self._skill_store = SkillStore()
+        self._prompt_store = PromptStore()
         # ★ 如果检测到内置 claude CLI，注入到默认后端配置
         self._cli_path = cli_path
         self._app_config_store = AppConfigStore()
@@ -540,6 +542,69 @@ class BridgeWS:
             return json.dumps({"status": "ok"}, ensure_ascii=False)
         except Exception as e:
             print(f"[BridgeWS] renameSkill error: {e}", file=sys.stderr)
+            return json.dumps({"status": "error", "message": str(e)}, ensure_ascii=False)
+
+    # ═══════════════════════════════════════
+    #  Prompt 模板库 CRUD
+    # ═══════════════════════════════════════
+    def _rpc_listPrompts(self) -> str:
+        try:
+            return json.dumps(self._prompt_store.list_prompts(), ensure_ascii=False)
+        except Exception as e:
+            print(f"[BridgeWS] listPrompts error: {e}", file=sys.stderr)
+            return json.dumps([])
+
+    def _rpc_savePrompt(self, name: str, content: str, icon: str = "📝") -> str:
+        try:
+            self._prompt_store.save_prompt(name.strip(), content, icon)
+            return json.dumps({"status": "ok"}, ensure_ascii=False)
+        except Exception as e:
+            return json.dumps({"status": "error", "message": str(e)}, ensure_ascii=False)
+
+    def _rpc_deletePrompt(self, name: str) -> str:
+        try:
+            self._prompt_store.delete_prompt(name.strip())
+            return json.dumps({"status": "ok"}, ensure_ascii=False)
+        except Exception as e:
+            return json.dumps({"status": "error", "message": str(e)}, ensure_ascii=False)
+
+    def _rpc_renamePrompt(self, old_name: str, new_name: str, content: str) -> str:
+        try:
+            self._prompt_store.rename_prompt(old_name.strip(), new_name.strip(), content)
+            return json.dumps({"status": "ok"}, ensure_ascii=False)
+        except Exception as e:
+            return json.dumps({"status": "error", "message": str(e)}, ensure_ascii=False)
+
+    def _rpc_updatePromptIcon(self, name: str, icon: str) -> str:
+        try:
+            self._prompt_store.update_icon(name.strip(), icon)
+            return json.dumps({"status": "ok"}, ensure_ascii=False)
+        except Exception as e:
+            return json.dumps({"status": "error", "message": str(e)}, ensure_ascii=False)
+
+    # ═══════════════════════════════════════
+    #  Session 能力绑定
+    # ═══════════════════════════════════════
+    def _rpc_updateSessionAbilities(self, session_id: str, abilities_json: str) -> str:
+        """绑定/解绑 skill 和 prompt 到 session。"""
+        try:
+            abilities = json.loads(abilities_json)
+            session = self._active_sessions.get(session_id) or self._session_store.load(session_id)
+            if not session:
+                return json.dumps({"status": "error", "message": "Session not found"}, ensure_ascii=False)
+            session.abilities = abilities
+            # 从绑定的 prompts 组装 constraints 文本
+            prompt_names = abilities.get("prompts", [])
+            parts = []
+            for pname in prompt_names:
+                p = self._prompt_store.get_prompt(pname)
+                if p and p.get("content"):
+                    parts.append(p["content"])
+            session.constraints = "\n\n---\n\n".join(parts) if parts else None
+            self._active_sessions[session_id] = session
+            self._session_store.save(session, async_=True)
+            return json.dumps({"status": "ok"}, ensure_ascii=False)
+        except Exception as e:
             return json.dumps({"status": "error", "message": str(e)}, ensure_ascii=False)
 
     def _rpc_openModelTerminal(self, backend_id: str = "") -> str:

@@ -173,6 +173,8 @@ class Session:
     backend_config_id: Optional[str] = None  # Alias for backend_id compatibility
     # ★ Constraints/rules/prompts for this session -限定性提示词/规则/约束
     constraints: Optional[str] = None  # Special system prompts, rules, or constraints for this session
+    # ★ Repo 能力绑定 — 替代 constraints 的新模式
+    abilities: Optional[dict] = None  # {"skills": ["skill-name"], "prompts": ["prompt-name"]}
 
     def to_dict(self) -> dict:
         return {
@@ -188,6 +190,7 @@ class Session:
             "skipPermissions": self.skip_permissions,
             "maxContinuations": self.max_continuations,
             "constraints": self.constraints,
+            "abilities": self.abilities,
         }
 
     def meta_dict(self) -> dict:
@@ -200,7 +203,7 @@ class Session:
             "messageCount": len(self.messages),
             "workingDir": self.working_dir,  # ★ Show directory in sidebar
             "backendId": self.backend_id,
-            "constraints": self.constraints,
+            "abilities": self.abilities,
         }
 
 

@@ -464,6 +464,42 @@ export const api = {
     try { return JSON.parse(result); } catch { return { status: 'ok' }; }
   },
 
+  // ── Prompt 模板库 ─────────────────────────────────────────────────────
+  async listPrompts(): Promise<any[]> {
+    const result = await call('listPrompts');
+    try { return JSON.parse(result) || []; } catch { return []; }
+  },
+
+  async savePrompt(name: string, content: string, icon: string = '📝'): Promise<{ status: string; message?: string }> {
+    const result = await call('savePrompt', name, content, icon);
+    if (result === null || result === undefined) return { status: 'error', message: '无法连接到后端' };
+    try { return JSON.parse(result); } catch { return { status: 'error', message: '响应格式错误' }; }
+  },
+
+  async deletePrompt(name: string): Promise<{ status: string; message?: string }> {
+    const result = await call('deletePrompt', name);
+    if (result === null || result === undefined) return { status: 'error', message: '无法连接到后端' };
+    try { return JSON.parse(result); } catch { return { status: 'error', message: '响应格式错误' }; }
+  },
+
+  async renamePrompt(oldName: string, newName: string, content: string): Promise<{ status: string; message?: string }> {
+    const result = await call('renamePrompt', oldName, newName, content);
+    if (result === null || result === undefined) return { status: 'error', message: '无法连接到后端' };
+    try { return JSON.parse(result); } catch { return { status: 'error', message: '响应格式错误' }; }
+  },
+
+  async updatePromptIcon(name: string, icon: string): Promise<{ status: string; message?: string }> {
+    const result = await call('updatePromptIcon', name, icon);
+    if (result === null || result === undefined) return { status: 'error', message: '无法连接到后端' };
+    try { return JSON.parse(result); } catch { return { status: 'error', message: '响应格式错误' }; }
+  },
+
+  async updateSessionAbilities(sessionId: string, abilities: { skills: string[]; prompts: string[] }): Promise<{ status: string; message?: string }> {
+    const result = await call('updateSessionAbilities', sessionId, JSON.stringify(abilities));
+    if (result === null || result === undefined) return { status: 'error', message: '无法连接到后端' };
+    try { return JSON.parse(result); } catch { return { status: 'error', message: '响应格式错误' }; }
+  },
+
   // ── Skill 孵化库 ──────────────────────────────────────────────────────
   async listSkills(workingDir: string = ''): Promise<SkillInfo[]> {
     const result = await call('listSkills', workingDir);
@@ -583,6 +619,12 @@ function mockDispatch(method: string, params: any[]): any {
       return null;
     }
     case 'renameSession': return JSON.stringify({ status: 'ok' });
+    case 'listPrompts': return JSON.stringify([]);
+    case 'savePrompt': return JSON.stringify({ status: 'ok' });
+    case 'deletePrompt': return JSON.stringify({ status: 'ok' });
+    case 'renamePrompt': return JSON.stringify({ status: 'ok' });
+    case 'updatePromptIcon': return JSON.stringify({ status: 'ok' });
+    case 'updateSessionAbilities': return JSON.stringify({ status: 'ok' });
     case 'updateSessionConstraints': return JSON.stringify({ status: 'ok' });
     default: return null;
   }

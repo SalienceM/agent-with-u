@@ -6,6 +6,7 @@ import { ChatInput } from './components/ChatInput';
 import { Settings } from './components/Settings';
 import { BackendManager } from './components/BackendManager';
 import { SkillManager } from './components/SkillManager';
+import { RepoPanel } from './components/RepoPanel';
 import { PermissionGate } from './components/PermissionGate';
 import { useChat } from './hooks/useChat';
 import { useConfig } from './hooks/useConfig';
@@ -27,6 +28,7 @@ export const App: React.FC = () => {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [backendManagerOpen, setBackendManagerOpen] = useState(false);
   const [skillManagerOpen, setSkillManagerOpen] = useState(false);
+  const [repoPanelOpen, setRepoPanelOpen] = useState(false);
   const [migrateDialogOpen, setMigrateDialogOpen] = useState(false);
   const [newSessionDialogOpen, setNewSessionDialogOpen] = useState(false);
   const [skipPermissions, setSkipPermissions] = useState(true);  // ★ 权限模式开关
@@ -538,11 +540,11 @@ export const App: React.FC = () => {
             📋 Logs
           </button>
           <button
-            onClick={() => setSkillManagerOpen(true)}
-            style={settingsBtnStyle}
-            title="Skill 库"
+            onClick={() => setRepoPanelOpen(!repoPanelOpen)}
+            style={{ ...settingsBtnStyle, ...(repoPanelOpen ? { background: 'var(--theme-accent-bg)', color: 'var(--theme-accent)' } : {}) }}
+            title="Repo — Skills & Prompts"
           >
-            ⚡
+            📦
           </button>
           <button
             onClick={() => setSettingsOpen(true)}
@@ -551,6 +553,19 @@ export const App: React.FC = () => {
           >
             ⚙
           </button>
+        </div>
+
+        {/* ---- Repo 面板（展开区域）---- */}
+        <div style={{
+          maxHeight: repoPanelOpen ? 400 : 0,
+          overflow: 'hidden',
+          transition: 'max-height 0.3s cubic-bezier(0.22,0.61,0.36,1)',
+        }}>
+          <RepoPanel
+            open={repoPanelOpen}
+            workingDir={activeSession?.workingDir || ''}
+            onClose={() => setRepoPanelOpen(false)}
+          />
         </div>
 
         {/* ---- 消息列表 ---- */}

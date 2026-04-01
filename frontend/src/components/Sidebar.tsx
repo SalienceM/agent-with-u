@@ -1,15 +1,14 @@
 import React, { useEffect, useState, useCallback, memo, useRef } from 'react';
 import { api } from '../api';
-import { ConstraintsEditor } from './ConstraintsEditor';
 
 interface Session {
   id: string;
   title: string;
   messageCount: number;
   updatedAt: number;
-  workingDir: string;  // ★ Working directory is primary
+  workingDir: string;
   backendId: string;
-  constraints?: string;  // ★ Per-session constraints/rules/prompts
+  abilities?: { skills: string[]; prompts: string[] };
 }
 
 interface Backend {
@@ -36,7 +35,9 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
   const [backends, setBackends] = useState<Backend[]>([]);
   const [hoveredSessionId, setHoveredSessionId] = useState<string | null>(null);
   const [sessionToDelete, setSessionToDelete] = useState<Session | null>(null);
-  const [constraintsEditorSession, setConstraintsEditorSession] = useState<Session | null>(null);
+  const [abilityPickerSession, setAbilityPickerSession] = useState<Session | null>(null);
+  const [availablePrompts, setAvailablePrompts] = useState<any[]>([]);
+  const [availableSkills, setAvailableSkills] = useState<any[]>([]);
   const [renamingSessionId, setRenamingSessionId] = useState<string | null>(null);
   const [renameValue, setRenameValue] = useState('');
   const renameInputRef = useRef<HTMLInputElement>(null);
@@ -48,16 +49,26 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
     setSessions(sessionList);
   }, []);
 
-  // ★ Handle constraints editor close
-  const handleConstraintsClose = useCallback(() => {
-    refresh();
-    setConstraintsEditorSession(null);
-  }, [refresh]);
-
-  // ★ Open constraints editor for a session
-  const handleConstraintsClick = useCallback((session: Session) => {
-    setConstraintsEditorSession(session);
+  // ★ 能力绑定
+  const openAbilityPicker = useCallback(async (session: Session, e: React.MouseEvent) => {
+    e.stopPropagation();
+    setAbilityPickerSession(session);
+    const [sk, pr] = await Promise.all([api.listSkills(session.workingDir || ''), api.listPrompts()]);
+    setAvailableSkills(sk || []);
+    setAvailablePrompts(pr || []);
   }, []);
+
+  const toggleAbility = useCallback(async (type: 'skills' | 'prompts', name: string) => {
+    if (!abilityPickerSession) return;
+    const current = abilityPickerSession.abilities || { skills: [], prompts: [] };
+    const list = [...(current[type] || [])];
+    const idx = list.indexOf(name);
+    if (idx >= 0) list.splice(idx, 1); else list.push(name);
+    const newAbilities = { ...current, [type]: list };
+    await api.updateSessionAbilities(abilityPickerSession.id, newAbilities);
+    setAbilityPickerSession({ ...abilityPickerSession, abilities: newAbilities });
+    refresh();
+  }, [abilityPickerSession, refresh]);
 
   useEffect(() => {
     api.getBackends().then(setBackends);
@@ -362,14 +373,11 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
                 ✎
               </button>
               <button
-                onClick={(e) => {
-                  e.stopPropagation();
-                  handleConstraintsClick(s);
-                }}
+                onClick={(e) => openAbilityPicker(s, e)}
                 style={actionBtnStyle}
-                title="编辑约束/提示词"
+                title="绑定能力"
               >
-                📋
+                🧩
               </button>
               <button
                 onClick={(e) => handleDeleteClick(s, e)}
@@ -390,13 +398,78 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
         )}
       </div>
 
-      {/* 约束编辑器 */}
-      {constraintsEditorSession && (
-        <ConstraintsEditor
-          sessionId={constraintsEditorSession.id}
-          currentConstraints={constraintsEditorSession.constraints}
-          onClose={handleConstraintsClose}
-        />
+      {/* 能力绑定面板 */}
+      {abilityPickerSession && (
+        <div style={overlayStyle} onClick={() => setAbilityPickerSession(null)}>
+          <div style={{ ...confirmPanelStyle, maxWidth: 360, animation: 'dialogSlideIn 0.28s cubic-bezier(0.22,0.61,0.36,1)' }} onClick={(e) => e.stopPropagation()}>
+            <h3 style={{ margin: '0 0 12px 0', fontSize: 15, fontWeight: 600, color: 'var(--theme-text, #1f2328)' }}>
+              🧩 绑定能力
+            </h3>
+            <p style={{ fontSize: 11, color: 'var(--theme-text-muted)', margin: '0 0 10px 0' }}>
+              选择要绑定到此会话的 Skill 和 Prompt
+            </p>
+            {availableSkills.length > 0 && (
+              <>
+                <div style={{ fontSize: 11, fontWeight: 600, color: 'var(--theme-text-muted)', marginBottom: 4, textTransform: 'uppercase' }}>Skills</div>
+                <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4, marginBottom: 10 }}>
+                  {availableSkills.map((sk: any) => {
+                    const bound = (abilityPickerSession.abilities?.skills || []).includes(sk.name);
+                    return (
+                      <button
+                        key={sk.name}
+                        onClick={() => toggleAbility('skills', sk.name)}
+                        style={{
+                          padding: '3px 10px', borderRadius: 12, fontSize: 11, cursor: 'pointer',
+                          border: bound ? '1px solid var(--theme-accent)' : '1px solid var(--theme-border)',
+                          background: bound ? 'var(--theme-accent-bg)' : 'transparent',
+                          color: bound ? 'var(--theme-accent)' : 'var(--theme-text-muted)',
+                          fontWeight: bound ? 600 : 400,
+                          transition: 'all 0.12s',
+                        }}
+                      >
+                        ⚡ {sk.name}
+                      </button>
+                    );
+                  })}
+                </div>
+              </>
+            )}
+            {availablePrompts.length > 0 && (
+              <>
+                <div style={{ fontSize: 11, fontWeight: 600, color: 'var(--theme-text-muted)', marginBottom: 4, textTransform: 'uppercase' }}>Prompts</div>
+                <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4, marginBottom: 10 }}>
+                  {availablePrompts.map((p: any) => {
+                    const bound = (abilityPickerSession.abilities?.prompts || []).includes(p.name);
+                    return (
+                      <button
+                        key={p.name}
+                        onClick={() => toggleAbility('prompts', p.name)}
+                        style={{
+                          padding: '3px 10px', borderRadius: 12, fontSize: 11, cursor: 'pointer',
+                          border: bound ? '1px solid var(--theme-accent)' : '1px solid var(--theme-border)',
+                          background: bound ? 'var(--theme-accent-bg)' : 'transparent',
+                          color: bound ? 'var(--theme-accent)' : 'var(--theme-text-muted)',
+                          fontWeight: bound ? 600 : 400,
+                          transition: 'all 0.12s',
+                        }}
+                      >
+                        {p.icon || '📝'} {p.name}
+                      </button>
+                    );
+                  })}
+                </div>
+              </>
+            )}
+            {availableSkills.length === 0 && availablePrompts.length === 0 && (
+              <p style={{ fontSize: 12, color: 'var(--theme-text-muted)', textAlign: 'center', padding: '12px 0' }}>
+                暂无可绑定的 Skill 或 Prompt，请先在 Repo 中创建
+              </p>
+            )}
+            <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
+              <button onClick={() => setAbilityPickerSession(null)} style={confirmBtnStyle}>完成</button>
+            </div>
+          </div>
+        </div>
       )}
 
       {/* 删除确认对话框 */}
