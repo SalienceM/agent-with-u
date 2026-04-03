@@ -1,22 +1,27 @@
 """
-DashScopeImageBackend — 阿里云 DashScope 文生图（万象/Wan 系列）
+DashScopeImageBackend — 阿里云 DashScope 文生图（万象/Wan 系列 + Qwen + Z-image）
 
-模型族与 API 差异（均使用异步任务模式）：
+模型族与 API 差异：
 
-  wanx2.1-*   旧 V2 API
+  wanx2.1-*   旧 V2 API（异步任务模式）
     endpoint : /services/aigc/text2image/image-synthesis
     input    : {"prompt": "..."}
-    response : output.results[].url
+    response : output.task_id → 轮询 /tasks/{task_id} 获取结果
 
-  wan2.6-*    新多模态 API（image-generation）
-    endpoint : /services/aigc/image-generation/generation
-    input    : {"messages": [{"role":"user","content":[{"text":"..."}]}]}
-    response : output.choices[].message.content[].image
-
-  wan2.7-*    新多模态 API（multimodal-generation）
+  wan2.6/2.7  新多模态 API（同步模式）
     endpoint : /services/aigc/multimodal-generation/generation
     input    : {"messages": [{"role":"user","content":[{"text":"..."}]}]}
-    response : output.choices[].message.content[].image
+    response : output.choices[].message.content[].image (直接返回)
+
+  qwen-image  通义千问文生图（同步模式）
+    endpoint : /services/aigc/multimodal-generation/generation
+    input    : {"messages": [{"role":"user","content":[{"text":"..."}]}]}
+    response : output.choices[].message.content[].image (直接返回)
+
+  z-image-turbo ZOUKE 图像生成（同步模式）
+    endpoint : /services/aigc/multimodal-generation/generation
+    input    : {"messages": [{"role":"user","content":[{"text":"..."}]}]}
+    response : output.choices[].message.content[].image (直接返回)
 
 所有 endpoint 均相对于 base_url（默认 https://dashscope.aliyuncs.com/api/v1）。
 """
@@ -47,30 +52,37 @@ class DashScopeImageBackend(ModelBackend):
 
     _DEFAULT_BASE  = "https://dashscope.aliyuncs.com/api/v1"
     _DEFAULT_MODEL = "wanx2.1-t2i-turbo"
-    _POLL_INTERVAL = 3.0    # 秒
-    _MAX_POLLS     = 120    # 最多等 6 分钟
+
+    # 最大轮询次数（仅用于异步模式）
+    _MAX_POLLS = 120
+    _POLL_INTERVAL = 3.0
 
     # ── 模型族路由表 ─────────────────────────────────────────────────────────
-    # key: 模型名前缀（lower），value: (endpoint_suffix, input_format)
+    # key: 模型名前缀（lower），value: (endpoint_suffix, input_format, is_async)
     #   input_format: "prompt"   → input.prompt = "..."
     #                 "messages" → input.messages = [{role,content:[{text}]}]
+    #   is_async: True → 使用异步任务模式（轮询 task_id）
+    #              False → 同步模式（直接返回结果）
     _MODEL_ROUTES = [
         # 前缀匹配优先级：越长越精确，放前面
-        ("wan2.7",  "/services/aigc/multimodal-generation/generation", "messages"),
-        ("wan2.6",  "/services/aigc/image-generation/generation",      "messages"),
-        ("wanx",    "/services/aigc/text2image/image-synthesis",       "prompt"),
-        # 未知新模型默认走 image-generation 路径（messages 格式）
-        ("wan",     "/services/aigc/image-generation/generation",      "messages"),
+        # Wan 2.6/2.7、Qwen Image 和 Z-image-turbo 都使用 multimodal-generation 同步 API
+        ("z-image-turbo", "/services/aigc/multimodal-generation/generation", "messages", False),
+        ("qwen-image",    "/services/aigc/multimodal-generation/generation", "messages", False),
+        ("wan2.7",        "/services/aigc/multimodal-generation/generation", "messages", False),
+        ("wan2.6",        "/services/aigc/multimodal-generation/generation", "messages", False),
+        ("wanx",          "/services/aigc/text2image/image-synthesis",       "prompt",     True),
+        # 未知 wan 模型默认走 multimodal-generation 同步路径
+        ("wan",           "/services/aigc/multimodal-generation/generation", "messages", False),
     ]
 
-    def _route(self, model: str) -> tuple[str, str]:
-        """返回 (endpoint_suffix, input_format)。"""
+    def _route(self, model: str) -> tuple[str, str, bool]:
+        """返回 (endpoint_suffix, input_format, is_async)。"""
         ml = model.lower()
-        for prefix, endpoint, fmt in self._MODEL_ROUTES:
+        for prefix, endpoint, fmt, is_async in self._MODEL_ROUTES:
             if ml.startswith(prefix):
-                return endpoint, fmt
-        # 完全未知 → 旧 text2image 端点，prompt 格式
-        return "/services/aigc/text2image/image-synthesis", "prompt"
+                return endpoint, fmt, is_async
+        # 完全未知 → 旧 text2image 端点，prompt 格式，异步模式
+        return "/services/aigc/text2image/image-synthesis", "prompt", True
 
     @staticmethod
     def _extract_image_url(output: dict) -> Optional[str]:
@@ -113,13 +125,8 @@ class DashScopeImageBackend(ModelBackend):
         base  = (self.config.base_url or self._DEFAULT_BASE).rstrip("/")
         model = (self.config.model or self._DEFAULT_MODEL).strip()
 
-        # ── 提示词 ────────────────────────────────────────────────────────
+        # ── 提示词：文生图不使用对话历史，只使用当前 content ────────────────
         prompt = content.strip()
-        if not prompt:
-            for m in reversed(messages):
-                if m.role == "user" and m.content:
-                    prompt = m.content.strip()
-                    break
         if not prompt:
             emit("error", error="提示词为空，请输入图像描述")
             emit("done")
@@ -132,8 +139,16 @@ class DashScopeImageBackend(ModelBackend):
         watermark       = self.config.get_env("WATERMARK",       "false").lower() == "true"
 
         # ── 路由：根据模型名选择端点和 input 格式 ─────────────────────────
-        endpoint_suffix, input_fmt = self._route(model)
+        endpoint_suffix, input_fmt, is_async = self._route(model)
         endpoint = f"{base}{endpoint_suffix}"
+
+        # 同步模式不需要异步头
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type":  "application/json",
+        }
+        if is_async:
+            headers["X-DashScope-Async"] = "enable"
 
         if input_fmt == "prompt":
             input_body: dict = {"prompt": prompt}
@@ -157,16 +172,18 @@ class DashScopeImageBackend(ModelBackend):
 
         payload = {"model": model, "input": input_body, "parameters": parameters}
 
+        # 异步模式需要 X-DashScope-Async 头
         headers = {
             "Authorization": f"Bearer {api_key}",
             "Content-Type":  "application/json",
-            "X-DashScope-Async": "enable",
         }
+        if is_async:
+            headers["X-DashScope-Async"] = "enable"
 
-        print(f"[DashScope] POST {endpoint}  model={model}  fmt={input_fmt}", file=sys.stderr, flush=True)
+        print(f"[DashScope] POST {endpoint}  model={model}  fmt={input_fmt}  async={is_async}", file=sys.stderr, flush=True)
 
         try:
-            async with httpx.AsyncClient(timeout=30.0) as client:
+            async with httpx.AsyncClient(timeout=120.0) as client:
 
                 # ── Step 1: 提交任务 ───────────────────────────────────────
                 emit("text_delta", text=f"🎨 正在提交图像生成任务…\n")
@@ -179,7 +196,35 @@ class DashScopeImageBackend(ModelBackend):
                     emit("done")
                     return {}
 
-                data    = resp.json()
+                data = resp.json()
+
+                # ── 同步模式：直接从响应中提取图片 ─────────────────────────────
+                if not is_async:
+                    img_url = self._extract_image_url(data.get("output", {}))
+                    if not img_url:
+                        emit("error", error=f"生成成功但未找到图片 URL，响应：{data}")
+                        emit("done")
+                        return {}
+
+                    emit("text_delta", text="✅ 生成完成，正在下载图片…\n\n")
+
+                    # 下载图片 → base64 → markdown 嵌入
+                    img_resp = await client.get(img_url, timeout=60.0)
+                    if img_resp.status_code == 200:
+                        mime = img_resp.headers.get("content-type", "image/png").split(";")[0]
+                        b64  = base64.b64encode(img_resp.content).decode()
+                        emit("text_delta", text=f"![生成图像](data:{mime};base64,{b64})\n\n")
+                    else:
+                        emit("text_delta", text=f"![生成图像]({img_url})\n\n")
+                        emit("text_delta", text=f"> 🔗 原始链接（24小时有效）：{img_url}\n")
+
+                    # 尝试从 usage 中获取 token 信息
+                    usage_info = data.get("usage", {})
+                    image_count = usage_info.get("image_count", 1)
+                    emit("done", usage={"inputTokens": 0, "outputTokens": image_count})
+                    return {}
+
+                # ── 异步模式：轮询任务结果 ───────────────────────────────────
                 task_id = data.get("output", {}).get("task_id")
                 if not task_id:
                     emit("error", error=f"未获得 task_id，响应：{data}")
@@ -188,16 +233,15 @@ class DashScopeImageBackend(ModelBackend):
 
                 emit("text_delta", text=f"⏳ 任务已提交，等待生成…\n")
 
-                # ── Step 2: 轮询任务结果 ───────────────────────────────────
                 poll_url     = f"{base}/tasks/{task_id}"
                 poll_headers = {"Authorization": f"Bearer {api_key}"}
 
-                for i in range(self._MAX_POLLS):
+                for i in range(120):
                     if self.is_cancelled(session_id):
                         emit("done")
                         return {}
 
-                    await asyncio.sleep(self._POLL_INTERVAL)
+                    await asyncio.sleep(3.0)
 
                     poll = await client.get(poll_url, headers=poll_headers, timeout=15.0)
                     if poll.status_code != 200:
@@ -243,7 +287,7 @@ class DashScopeImageBackend(ModelBackend):
                         elapsed = int((i + 1) * self._POLL_INTERVAL)
                         emit("text_delta", text=f"  …已等待 {elapsed}s（{status}）\n")
 
-                emit("error", error=f"图像生成超时（>{int(self._MAX_POLLS * self._POLL_INTERVAL)}s），task_id: {task_id}")
+                emit("error", error=f"图像生成超时（>360s），task_id: {task_id}")
                 emit("done")
                 return {}
 

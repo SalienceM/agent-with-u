@@ -52,8 +52,10 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
   // ★ 能力绑定
   const openAbilityPicker = useCallback(async (session: Session, e: React.MouseEvent) => {
     e.stopPropagation();
-    setAbilityPickerSession(session);
-    const [sk, pr] = await Promise.all([api.listSkills(session.workingDir || ''), api.listPrompts()]);
+    // 先从服务器获取会话的最新数据，确保 abilities 是最新的
+    const latestSession = await api.loadSession(session.id);
+    setAbilityPickerSession(latestSession);
+    const [sk, pr] = await Promise.all([api.listSkills(latestSession.workingDir || ''), api.listPrompts()]);
     setAvailableSkills(sk || []);
     setAvailablePrompts(pr || []);
   }, [api]);
