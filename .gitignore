@@ -13,3 +13,4 @@ frontend/dist/
 .DS_Store
 Thumbs.db
 src-tauri/target/
+.claude/worktrees/
