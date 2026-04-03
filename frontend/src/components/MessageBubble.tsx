@@ -33,6 +33,16 @@ if (typeof document !== 'undefined' && !document.getElementById('msg-bubble-css'
       cursor: zoom-in;
       margin: 4px 0;
     }
+    /* ── 懒加载图片样式 ── */
+    .msg-content img.lazy,
+    .msg-content img[loading="lazy"] {
+      opacity: 0;
+      transition: opacity 0.3s ease;
+    }
+    .msg-content img.lazy.loaded,
+    .msg-content img[loading="lazy"].loaded {
+      opacity: 1;
+    }
     /* ── 气泡操作按钮 ── */
     .bubble-action-btn {
       opacity: 0;
@@ -71,6 +81,29 @@ if (typeof document !== 'undefined' && !document.getElementById('msg-bubble-css'
       background: rgba(63,185,80,0.12);
       opacity: 1;
     }
+    /* ── 图片懒加载占位符 ── */
+    .img-lazy-placeholder {
+      background: linear-gradient(135deg, rgba(128,128,128,0.1) 25%, transparent 25%, transparent 50%, rgba(128,128,128,0.1) 50%, rgba(128,128,128,0.1) 75%, transparent 75%, transparent);
+      background-size: 20px 20px;
+      min-height: 80px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      color: rgba(128,128,128,0.5);
+      font-size: 12px;
+    }
+    .img-lazy-placeholder img {
+      max-height: 200px;
+      border-radius: 8px;
+      display: none; /* 隐藏真实图片，等加载后再显示 */
+    }
+    .img-lazy-placeholder.loaded img {
+      display: block;
+      animation: msgSlideIn 0.2s ease-out;
+    }
+    .img-lazy-placeholder img.lazy {
+      display: block;
+    }
   `;
   document.head.appendChild(style);
 }
@@ -79,6 +112,8 @@ if (typeof document !== 'undefined' && !document.getElementById('msg-bubble-css'
 //  ImageLightbox — 点击放大预览
 // ═══════════════════════════════════════
 const ImageLightbox: React.FC<{ src: string; onClose: () => void }> = ({ src, onClose }) => {
+  const [loaded, setLoaded] = useState(false);
+
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose(); };
     document.addEventListener('keydown', onKey);
@@ -95,17 +130,34 @@ const ImageLightbox: React.FC<{ src: string; onClose: () => void }> = ({ src, on
         cursor: 'zoom-out',
       }}
     >
-      <img
-        src={src}
-        alt="preview"
-        onClick={(e) => e.stopPropagation()}
-        style={{
-          maxWidth: '92vw', maxHeight: '92vh',
-          borderRadius: 8,
-          boxShadow: '0 8px 40px rgba(0,0,0,0.6)',
-          cursor: 'default',
-        }}
-      />
+      <div style={{
+        position: 'relative',
+        maxWidth: '92vw', maxHeight: '92vh',
+        display: 'flex', alignItems: 'center', justifyContent: 'center',
+      }}>
+        {!loaded && (
+          <div className="img-lazy-placeholder" style={{
+            width: '200px', height: '200px',
+            background: 'linear-gradient(135deg, rgba(128,128,128,0.1) 25%, transparent 25%, transparent 50%, rgba(128,128,128,0.1) 50%, rgba(128,128,128,0.1) 75%, transparent 75%, transparent)',
+            backgroundSize: '20px 20px',
+          }}>
+            <span>Loading...</span>
+          </div>
+        )}
+        <img
+          src={src}
+          alt="preview"
+          onClick={(e) => e.stopPropagation()}
+          onLoad={() => setLoaded(true)}
+          style={{
+            maxWidth: '92vw', maxHeight: '92vh',
+            borderRadius: 8,
+            boxShadow: '0 8px 40px rgba(0,0,0,0.6)',
+            cursor: 'default',
+            display: loaded ? 'block' : 'none',
+          }}
+        />
+      </div>
       <button
         onClick={onClose}
         style={{
@@ -422,7 +474,7 @@ export const MessageBubble: React.FC<Props> = ({
     }
   }, []);
 
-  // ★ 为 markdown 渲染出的代码块注入复制按钮
+  // ★ 为 markdown 渲染出的代码块注入复制按钮，图片添加 loaded 类
   useEffect(() => {
     const el = contentRef.current;
     if (!el) return;
@@ -449,6 +501,26 @@ export const MessageBubble: React.FC<Props> = ({
         }, 2000);
       };
       pre.appendChild(btn);
+    });
+
+    // ★ 为 markdown 中的图片添加 lazy loading 支持
+    const imgs = el.querySelectorAll<HTMLImageElement>('img');
+    imgs.forEach(img => {
+      // 添加 loading="lazy" 属性
+      if (!img.hasAttribute('loading')) {
+        img.setAttribute('loading', 'lazy');
+      }
+      // 图片加载完成后添加 loaded 类
+      if (img.complete) {
+        img.classList.add('loaded');
+      } else {
+        img.addEventListener('load', () => {
+          img.classList.add('loaded');
+        });
+        img.addEventListener('error', () => {
+          img.classList.add('loaded'); // 加载失败也添加，避免一直透明
+        });
+      }
     });
   }, [message.content]);
 
@@ -516,21 +588,27 @@ export const MessageBubble: React.FC<Props> = ({
                   ? img
                   : `data:${img.mimeType || img.mime_type || 'image/png'};base64,${img.base64}`;
               return (
-                <img
-                  key={i}
-                  src={src}
-                  alt="attachment"
-                  onClick={() => setLightboxSrc(src)}
-                  style={{
-                    maxWidth: '100%',
-                    maxHeight: 300,
-                    height: 'auto',
-                    borderRadius: 8,
-                    border: '1px solid var(--theme-border, rgba(0,0,0,0.12))',
-                    cursor: 'zoom-in',
-                    display: 'block',
-                  }}
-                />
+                <div key={i} className="img-lazy-placeholder" style={{
+                  width: 120, height: 120,
+                  borderRadius: 8,
+                  border: '1px solid var(--theme-border, rgba(0,0,0,0.12))',
+                  overflow: 'hidden',
+                  position: 'relative',
+                  cursor: 'zoom-in',
+                }} onClick={() => setLightboxSrc(src)}>
+                  {/* 小尺寸图片直接显示，大图片懒加载 */}
+                  <img
+                    className="lazy"
+                    src={src}
+                    alt="attachment"
+                    loading="lazy"
+                    style={{
+                      width: '100%', height: '100%',
+                      objectFit: 'contain',
+                      display: 'block',
+                    }}
+                  />
+                </div>
               );
             })}
           </div>

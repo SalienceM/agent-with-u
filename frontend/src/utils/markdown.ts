@@ -46,6 +46,11 @@ const renderer = new Renderer();
   return `<blockquote class="md-blockquote">${quote}</blockquote>\n`;
 };
 
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+(renderer as any).image = function (href: string, _title: string | null, text: string): string {
+  return `<img src="${href}" alt="${text || ''}" loading="lazy" class="md-img" />\n`;
+};
+
 marked.use({
   renderer,
   gfm: true,    // GitHub Flavored Markdown（表格、task list 等）

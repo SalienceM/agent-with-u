@@ -1464,6 +1464,10 @@ class DashScopeImageBackend(ModelBackend):
       1. POST /services/aigc/text2image/image-synthesis → 得到 task_id
       2. 轮询 GET /tasks/{task_id} 直到 SUCCEEDED / FAILED
       3. 下载图片 URL → base64 → 作为 markdown 图片嵌入 text_delta
+
+    Note:
+      - Wanx 2.1 系列 (wanx2.1-*) → /services/aigc/text2image/image-synthesis
+      - Wan 2.x 系列 (wan2.*-image) → /api/v1/components/description-to-image
     """
 
     _DEFAULT_BASE = "https://dashscope.aliyuncs.com/api/v1"
@@ -1487,6 +1491,8 @@ class DashScopeImageBackend(ModelBackend):
         import base64
         import asyncio
         import httpx
+        import tempfile
+        import os
 
         def emit(dtype: str, **kw):
             on_delta(StreamDelta(session_id, message_id, dtype, **kw))
@@ -1503,20 +1509,45 @@ class DashScopeImageBackend(ModelBackend):
             emit("error", error=f"Base URL 格式错误，必须以 http:// 或 https:// 开头: {base}")
             emit("done")
             return {}
-        if not base.endswith("/api/v1"):
-            emit("error", error=f"Base URL 应该以 /api/v1 结尾 (DashScope API v1): {base}")
-            emit("done")
-            return {}
         model = self.config.model or self._DEFAULT_MODEL
+
+        # 根据模型名称选择正确的 endpoint 和 payload 格式
+        # Wan 2.x 系列 (wan2.*-image) 使用 multimodal-generation endpoint
+        # Wanx 2.1 系列 (wanx2.1-*) 使用 text2image/image-synthesis endpoint
+        is_wan2_model = model.startswith("wan2.")
+
+        if is_wan2_model:
+            # Wan 2.x 系列使用 multimodal-generation 异步任务 API
+            endpoint = f"{base}/services/aigc/multimodal-generation/generation"
+        else:
+            # Wanx 2.1 系列使用 text2image/image-synthesis 异步任务 API
+            endpoint = f"{base}/services/aigc/text2image/image-synthesis"
 
         # 构建请求体
         prompt = content.strip()
-        if not prompt:
-            # 如果用户没有输入，从历史消息中取最后一条 user 消息
-            for m in reversed(messages):
-                if m.role == "user" and m.content:
-                    prompt = m.content.strip()
-                    break
+
+        # 提取所有图片 URL（支持文生图 + 图片编辑混合模式）
+        image_urls = []
+
+        # ★ 将前端传入的 images 参数（base64）转换为 DashScope 支持的格式
+        # ★ 仅使用当前请求传入的图片，不从历史消息中提取（图生图场景）
+        if images:
+            for img in images:
+                # ImageAttachment: {id, base64, mime_type, size}
+                img_base64 = getattr(img, 'base64', None) or (img.get('base64') if isinstance(img, dict) else None)
+                mime_type = getattr(img, 'mime_type', None) or (img.get('mime_type') if isinstance(img, dict) else None) or 'image/png'
+                if img_base64:
+                    # 检查是否已经是完整的 data URL 格式
+                    if img_base64.startswith('data:'):
+                        # 已经是 data:{mime};base64,xxx 格式，直接使用
+                        image_urls.append(img_base64)
+                    else:
+                        # 纯 base64 字符串，添加前缀
+                        image_urls.append(f"data:{mime_type};base64,{img_base64}")
+                    print(f"[DashScope] 从 images 参数添加图片: {mime_type}", file=sys.stderr)
+        else:
+            print(f"[DashScope] 未传入图片，纯文生图模式", file=sys.stderr)
+
         if not prompt:
             emit("error", error="提示词为空，请输入图像描述")
             emit("done")
@@ -1527,50 +1558,125 @@ class DashScopeImageBackend(ModelBackend):
         prompt_extend = self.config.get_env("PROMPT_EXTEND", "true").lower() != "false"
         watermark = self.config.get_env("WATERMARK", "false").lower() == "true"
 
-        # DashScope 文生图 API v1 使用简单的 prompt 格式，不是 messages 格式
-        payload: dict = {
-            "model": model,
-            "input": {
-                "prompt": prompt
-            },
-            "parameters": {
-                "size": size,
-                "prompt_extend": prompt_extend,
-                "watermark": watermark,
-            },
-        }
-        if negative_prompt:
+        # Wan 2.x 系列使用 messages 格式，Wanx 2.1 系列使用 prompt 格式
+        if is_wan2_model:
+            # Wan 2.x 系列使用 messages 格式
+            # 构建 content 数组：按顺序放置 image 和 text
+            content_items = []
+            for img_url in image_urls:
+                content_items.append({"image": img_url})
+            content_items.append({"text": prompt})
+
+            payload: dict = {
+                "model": model,
+                "input": {
+                    "messages": [
+                        {"role": "user", "content": content_items}
+                    ]
+                },
+                "parameters": {
+                    "size": size,
+                    "n": 1,
+                    "watermark": watermark,
+                    "thinking_mode": True,
+                },
+            }
+        else:
+            # Wanx 2.1 系列使用简单的 prompt 格式
+            payload: dict = {
+                "model": model,
+                "input": {
+                    "prompt": prompt
+                },
+                "parameters": {
+                    "size": size,
+                    "prompt_extend": prompt_extend,
+                    "watermark": watermark,
+                },
+            }
+        if negative_prompt and not is_wan2_model:
             payload["parameters"]["negative_prompt"] = negative_prompt
 
         headers = {
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
-            "X-DashScope-Async": "enable",   # 强制异步任务模式
         }
 
-        # 调试日志
+        # Wanx 2.1 需要 X-DashScope-Async 头，Wan 2.x 不需要
+        if not is_wan2_model:
+            headers["X-DashScope-Async"] = "enable"
+
+        # 减少调试日志输出，避免打印 base64 等敏感/大量数据
         print(f"[DashScope] Base URL: {base}", file=sys.stderr)
         print(f"[DashScope] Model: {model}", file=sys.stderr)
+        print(f"[DashScope] Endpoint: {endpoint}", file=sys.stderr)
         print(f"[DashScope] Prompt: {prompt[:50]}{'...' if len(prompt) > 50 else ''}", file=sys.stderr)
+        print(f"[DashScope] Image count: {len(image_urls)}", file=sys.stderr)
 
         try:
             async with httpx.AsyncClient(timeout=30.0) as client:
                 # ── Step 1: 提交任务 ──────────────────────────────
                 emit("text_delta", text=f"🎨 正在提交图像生成任务（{model}）…\n")
-                endpoint = f"{base}/services/aigc/text2image/image-synthesis"
                 emit("text_delta", text=f"📡 Endpoint: {endpoint}\n")
                 resp = await client.post(
                     endpoint,
                     headers=headers,
                     json=payload,
                 )
-                emit("text_delta", text=f".HTTP Status: {resp.status_code}\n")
+                emit("text_delta", text=f"HttpStatus: {resp.status_code}\n")
                 if resp.status_code != 200:
                     emit("error", error=f"提交任务失败 HTTP {resp.status_code}: {resp.text[:500]}")
                     emit("done")
                     return {}
 
                 data = resp.json()
+                # 不打印完整响应，避免打印 base64 图片数据
+                print(f"[DashScope] Response status: {resp.status_code}", file=sys.stderr)
+
+                # Wan 2.x 系列（如 wan2.7-image）使用同步 API，直接返回结果
+                if is_wan2_model:
+                    # Wan 2.x 同步 API 直接返回图片，结果在 choices 中
+                    choices = data.get("output", {}).get("choices", [])
+                    if not choices:
+                        emit("error", error=f"生成成功但未返回图片结果: {data}")
+                        emit("done")
+                        return {}
+
+                    # 从 choices 中提取图片 URL
+                    img_url = None
+                    for choice in choices:
+                        message = choice.get("message", {})
+                        content = message.get("content", [])
+                        for item in content:
+                            if item.get("type") == "image":
+                                img_url = item.get("image")
+                                break
+                        if img_url:
+                            break
+
+                    if not img_url:
+                        emit("error", error="未找到图片 URL")
+                        emit("done")
+                        return {}
+
+                    emit("text_delta", text="✅ 生成完成，正在下载图片…\n\n")
+
+                    img_resp = await client.get(img_url, timeout=60.0)
+                    if img_resp.status_code != 200:
+                        emit("text_delta", text=f"![生成图像]({img_url})\n\n")
+                        emit("text_delta", text=f"> 🔗 原始链接：{img_url}\n")
+                    else:
+                        mime = img_resp.headers.get("content-type", "image/png").split(";")[0]
+                        b64 = base64.b64encode(img_resp.content).decode()
+                        emit("text_delta", text=f"![生成图像](data:{mime};base64,{b64})\n\n")
+
+                    # 使用信息
+                    usage_info = data.get("usage", {})
+                    image_tokens = usage_info.get("image_count", 1)
+                    emit("done", usage={"inputTokens": 0, "outputTokens": image_tokens})
+                    return {}
+
+                # Wanx 2.1 系列使用异步任务 API
                 task_id = data.get("output", {}).get("task_id")
                 if not task_id:
                     emit("error", error=f"未获得 task_id，响应：{data}")
