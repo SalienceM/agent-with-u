@@ -247,7 +247,7 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
       const headers = _cleanHeaders(formData.extraHeaders);
       if (headers) saved.extraHeaders = headers;
     } else if (formData.type === 'dashscope-image') {
-      // api_key, base_url, model, env
+      // api_key, model, base_url, env (SIZE, NEGATIVE_PROMPT, etc.)
       if (formData.apiKey?.trim()) saved.apiKey = formData.apiKey.trim();
       if (formData.model?.trim()) saved.model = formData.model.trim();
       if (formData.baseUrl?.trim()) saved.baseUrl = formData.baseUrl.trim();
