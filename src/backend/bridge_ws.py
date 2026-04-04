@@ -752,8 +752,11 @@ class BridgeWS:
             return json.dumps([])
 
     def _rpc_saveSkill(self, name: str, content: str) -> str:
-        """保存或更新孵化库中的 skill（同步到已激活位置）。"""
+        """保存或更新孵化库中的 skill（同步到已激活位置）。
+        如果是 Backend Skill（含 backend: 字段）且 body 中没有执行指令，自动填充。
+        """
         try:
+            content = self._ensure_backend_skill_instructions(name.strip(), content)
             self._skill_store.save_skill(name.strip(), content)
             return json.dumps({"status": "ok"}, ensure_ascii=False)
         except Exception as e:
@@ -794,6 +797,7 @@ class BridgeWS:
     def _rpc_renameSkill(self, old_name: str, new_name: str, new_content: str) -> str:
         """重命名 skill（含内容更新，保留所有激活记录迁移到新名称）。"""
         try:
+            new_content = self._ensure_backend_skill_instructions(new_name.strip(), new_content)
             self._skill_store.rename_skill(old_name.strip(), new_name.strip(), new_content)
             return json.dumps({"status": "ok"}, ensure_ascii=False)
         except Exception as e:
@@ -929,16 +933,35 @@ class BridgeWS:
     # ═══════════════════════════════════════
     #  Session 能力绑定
     # ═══════════════════════════════════════
-    # ── Backend Skill SKILL.md 自动生成 ──────────────────────────────
+    # ── Backend Skill 指令模板 ──────────────────────────────
 
-    def _generate_backend_skill_md(self, skill_name: str, skill_info: dict) -> str:
+    def _ensure_backend_skill_instructions(self, skill_name: str, content: str) -> str:
         """
-        为 Backend Skill 生成可被 Claude CLI 原生发现的 SKILL.md。
-        Claude 通过 Skill 工具读取指令 → 用 Bash 执行 python → 回调 HTTP API 端点。
-        使用 Python 而非 curl，避免 Windows cmd.exe 编码破坏中文 prompt。
+        如果 SKILL.md 含 backend: 字段但 body 中没有执行指令，自动填充。
+        已有指令的不动（用户可能自定义过）。
+        返回处理后的完整 SKILL.md 内容。
         """
-        description = skill_info.get("description", f"Backend Skill: {skill_name}")
-        input_schema = skill_info.get("inputSchema") or {}
+        from .skill_store import parse_skill_frontmatter
+        fm = parse_skill_frontmatter(content)
+        if not fm.get("backend"):
+            return content  # 不是 Backend Skill，不处理
+        if "/api/skill-call" in content:
+            return content  # 已有指令，不覆盖
+        # 需要填充指令模板
+        instructions = self._build_skill_instructions(skill_name, fm)
+        # 在 frontmatter 结束后追加
+        import re
+        fm_match = re.match(r'^---\s*\n[\s\S]*?\n---', content)
+        if fm_match:
+            return content[:fm_match.end()] + "\n\n" + instructions
+        return content + "\n\n" + instructions
+
+    def _build_skill_instructions(self, skill_name: str, frontmatter: dict) -> str:
+        """
+        生成 Backend Skill 的指令 body（不含 frontmatter）。
+        用户保存 SKILL.md 时自动填充到 body 中。
+        """
+        input_schema = frontmatter.get("input_schema") or {}
         port = self._HTTP_API_PORT
 
         # 从 input_schema 提取参数说明
@@ -952,11 +975,6 @@ class BridgeWS:
             param_hints = "参数说明：\n" + "\n".join(lines) + "\n\n"
 
         return f"""\
----
-name: {skill_name}
-description: {description}。也支持基于已有图片进行修改（图生图）。
----
-
 ## Instructions
 
 {param_hints}当需要使用此能力时，用 Bash 工具执行以下 Python 命令。
@@ -1013,14 +1031,16 @@ python3 -c "import urllib.request,json;d=json.dumps({{'skill':'{skill_name}','pr
         abilities = session.abilities or {}
         bound_skills = set(abilities.get("skills", []))
 
-        # 收集当前绑定中的 Backend Skills
+        # 收集当前绑定中的 Backend Skills — 直接拷贝孵化库内容（不再二次生成）
         deployed_backend_skills: set[str] = set()
         for sname in bound_skills:
             info = self._skill_store.get_skill(sname)
             if not info or not info.get("backend"):
-                continue  # 传统 Skill，不管（由用户手动激活）
-            # 生成并部署 Backend Skill SKILL.md
-            content = self._generate_backend_skill_md(sname, info)
+                continue  # 传统 Skill，由用户手动激活
+            # 直接部署孵化库中的 SKILL.md（已在 saveSkill 时填充好指令）
+            content = info.get("content", "")
+            if not content:
+                continue
             target = skills_dir / sname
             target.mkdir(parents=True, exist_ok=True)
             (target / "SKILL.md").write_text(content, encoding="utf-8")
