@@ -279,35 +279,52 @@ class BridgeWS:
 
         result = "".join(result_parts) or "(no output)"
 
-        # ★ 拦截 base64 图片数据：保存到临时文件，返回文件路径
+        # ★ 拦截 base64 图片数据：保存到临时文件，只返回文件路径
         # 避免 2MB+ 的 base64 通过 CLI stdout 撑爆模型上下文
-        b64_pattern = _re.compile(
-            r'!\[([^\]]*)\]\(data:(image/[^;]+);base64,([A-Za-z0-9+/=\s]+)\)'
-        )
-        saved_files: list[str] = []
+        # 用字符串查找代替 regex（regex 对 2MB 数据有回溯/性能问题）
+        import base64 as _b64
+        from pathlib import Path as _Path
 
-        def _save_b64_image(match):
-            alt = match.group(1)
-            mime = match.group(2)
-            b64_data = match.group(3).replace("\n", "").replace(" ", "")
-            ext = mime.split("/")[-1].replace("jpeg", "jpg")
+        _B64_MARKER = ";base64,"
+        while _B64_MARKER in result:
+            marker_pos = result.find(_B64_MARKER)
+            # 往前找 ![
+            img_start = result.rfind("![", 0, marker_pos)
+            if img_start < 0:
+                break
+            # 找 (data:image/xxx
+            paren_open = result.find("(data:", img_start)
+            if paren_open < 0 or paren_open > marker_pos:
+                break
+            # 提取 mime
+            mime_start = paren_open + len("(data:")
+            mime = result[mime_start:marker_pos]
+            # base64 数据起始
+            b64_start = marker_pos + len(_B64_MARKER)
+            # 找闭合 ) — base64 字符只有 A-Za-z0-9+/= 所以第一个 ) 就是结尾
+            b64_end = result.find(")", b64_start)
+            if b64_end < 0:
+                b64_end = len(result)  # 没闭合，取到末尾
+            b64_data = result[b64_start:b64_end]
+            end_pos = min(b64_end + 1, len(result))
+
+            # 保存图片文件
+            ext = mime.split("/")[-1].replace("jpeg", "jpg") if "/" in mime else "png"
             try:
                 img_bytes = _b64.b64decode(b64_data)
-                # 保存到临时目录
                 tmp_dir = _Path.home() / ".agent-with-u" / "skill-images"
                 tmp_dir.mkdir(parents=True, exist_ok=True)
                 img_path = tmp_dir / f"{new_id()}.{ext}"
                 img_path.write_bytes(img_bytes)
-                saved_files.append(str(img_path))
-                return f"[图片已生成] 保存至: {img_path}\n大小: {len(img_bytes)} bytes"
+                replacement = f"[图片已生成并保存]\n文件路径: {img_path}\n大小: {len(img_bytes)} bytes"
+                print(f"[bridge_ws] Saved skill image: {img_path} ({len(img_bytes)} bytes)",
+                      file=sys.stderr, flush=True)
             except Exception as e:
-                return f"[图片保存失败: {e}]"
+                replacement = f"[图片保存失败: {e}]"
+                print(f"[bridge_ws] Failed to save skill image: {e}",
+                      file=sys.stderr, flush=True)
 
-        result = b64_pattern.sub(_save_b64_image, result)
-
-        if saved_files:
-            print(f"[bridge_ws] Skill '{skill_name}' saved {len(saved_files)} images: {saved_files}",
-                  file=sys.stderr, flush=True)
+            result = result[:img_start] + replacement + result[end_pos:]
 
         return 200, result
 
