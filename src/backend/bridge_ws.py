@@ -195,17 +195,24 @@ class BridgeWS:
             if content_length > 0:
                 body = await asyncio.wait_for(reader.readexactly(content_length), timeout=120)
 
-            # 路由
-            status, response_body = await self._route_http_api(method, path, body)
+            # 路由 — 返回 (status, content_type, body_bytes)
+            result = await self._route_http_api(method, path, body)
+            if len(result) == 3:
+                status, content_type, resp_bytes = result
+            else:
+                status, resp_text = result
+                content_type = "text/plain; charset=utf-8"
+                resp_bytes = resp_text.encode("utf-8")
 
             # 发送响应
             response = (
                 f"HTTP/1.1 {status} OK\r\n"
-                f"Content-Type: text/plain; charset=utf-8\r\n"
-                f"Content-Length: {len(response_body.encode('utf-8'))}\r\n"
+                f"Content-Type: {content_type}\r\n"
+                f"Content-Length: {len(resp_bytes)}\r\n"
+                f"Access-Control-Allow-Origin: *\r\n"
                 f"Connection: close\r\n"
                 f"\r\n"
-            ).encode("utf-8") + response_body.encode("utf-8")
+            ).encode("utf-8") + resp_bytes
             writer.write(response)
             await writer.drain()
         except Exception as e:
@@ -234,7 +241,27 @@ class BridgeWS:
             }
             return await self._handle_skill_call(payload)
 
+        # ★ 图片文件 HTTP 服务：/api/skill-images/<filename>
+        if parsed.path.startswith("/api/skill-images/"):
+            return self._serve_skill_image(parsed.path)
+
         return 404, "Not found"
+
+    def _serve_skill_image(self, path: str) -> tuple[int, str, bytes]:
+        """提供图片文件的二进制内容（浏览器 img 标签可直接加载）。"""
+        from pathlib import Path as _Path
+
+        filename = path.split("/api/skill-images/")[-1]
+        if not filename or ".." in filename:
+            return 400, "text/plain", b"Invalid filename"
+        img_path = _Path.home() / ".agent-with-u" / "skill-images" / filename
+        if not img_path.exists():
+            return 404, "text/plain", f"Image not found: {filename}".encode()
+        img_bytes = img_path.read_bytes()
+        ext = img_path.suffix.lstrip(".").lower()
+        mime = {"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg",
+                "gif": "image/gif", "webp": "image/webp"}.get(ext, "image/png")
+        return 200, mime, img_bytes
 
     async def _handle_skill_call(self, payload: dict) -> tuple[int, str]:
         """执行 Backend Skill 调用。"""
@@ -316,7 +343,8 @@ class BridgeWS:
                 tmp_dir.mkdir(parents=True, exist_ok=True)
                 img_path = tmp_dir / f"{new_id()}.{ext}"
                 img_path.write_bytes(img_bytes)
-                replacement = f"[图片已生成并保存]\n文件路径: {img_path}\n大小: {len(img_bytes)} bytes"
+                img_url = f"http://127.0.0.1:{self._HTTP_API_PORT}/api/skill-images/{img_path.name}"
+                replacement = f"![生成图像]({img_url})"
                 print(f"[bridge_ws] Saved skill image: {img_path} ({len(img_bytes)} bytes)",
                       file=sys.stderr, flush=True)
             except Exception as e:
@@ -884,11 +912,11 @@ description: {description}
 curl -s -G http://127.0.0.1:{port}/api/skill-call --data-urlencode "skill={skill_name}" --data-urlencode "prompt=<PROMPT>"
 ```
 
-注意事项：
-- `--data-urlencode` 会自动处理特殊字符，prompt 中可以包含任何文字
-- 命令会返回生成结果的文本描述和文件路径
-- 如果返回包含图片文件路径，使用 Read 工具读取该文件路径来获取图片内容
-- 将结果直接呈现给用户
+重要规则：
+- prompt 用用户原始语言描述即可，`--data-urlencode` 自动处理编码
+- **只调用一次**，不要因为结果不完美而重试
+- 命令输出中如果包含 `![...](http://...)` 格式的图片，直接将该 markdown 原样输出给用户即可
+- 不要尝试用 Read 工具读取图片文件
 """
 
     def _sync_backend_skills_to_directory(self, session: Session):
