@@ -265,13 +265,14 @@ class BridgeWS:
 
     async def _handle_skill_call(self, payload: dict) -> tuple[int, str]:
         """执行 Backend Skill 调用。"""
-        import re as _re
         import base64 as _b64
-        import tempfile as _tempfile
         from pathlib import Path as _Path
 
         skill_name = payload.get("skill", "")
         prompt = payload.get("prompt", "")
+
+        print(f"[bridge_ws] skill-call: skill={skill_name!r}, prompt={prompt!r}",
+              file=sys.stderr, flush=True)
 
         if not skill_name:
             return 400, "Missing 'skill' parameter"
@@ -890,7 +891,8 @@ class BridgeWS:
     def _generate_backend_skill_md(self, skill_name: str, skill_info: dict) -> str:
         """
         为 Backend Skill 生成可被 Claude CLI 原生发现的 SKILL.md。
-        Claude 通过 Skill 工具读取指令 → 用 Bash 执行 curl → 回调 HTTP API 端点。
+        Claude 通过 Skill 工具读取指令 → 用 Bash 执行 python → 回调 HTTP API 端点。
+        使用 Python 而非 curl，避免 Windows cmd.exe 编码破坏中文 prompt。
         """
         description = skill_info.get("description", f"Backend Skill: {skill_name}")
         input_schema = skill_info.get("inputSchema") or {}
@@ -914,14 +916,16 @@ description: {description}
 
 ## Instructions
 
-{param_hints}当需要使用此能力时，用 Bash 工具执行以下 curl 命令，将 `<PROMPT>` 替换为实际的用户请求内容：
+{param_hints}当需要使用此能力时，用 Bash 工具执行以下 Python 命令，将 `<PROMPT>` 替换为实际的用户请求内容：
 
 ```bash
-curl -s -G http://127.0.0.1:{port}/api/skill-call --data-urlencode "skill={skill_name}" --data-urlencode "prompt=<PROMPT>"
+python3 -c "import urllib.request,json;d=json.dumps({{'skill':'{skill_name}','prompt':'<PROMPT>'}}).encode();r=urllib.request.Request('http://127.0.0.1:{port}/api/skill-call',d,{{'Content-Type':'application/json'}});print(urllib.request.urlopen(r,timeout=300).read().decode())"
 ```
 
+注意：如果 python3 不可用，尝试用 python 替代。
+
 重要规则：
-- prompt 用用户原始语言描述即可，`--data-urlencode` 自动处理编码
+- prompt 直接用用户的原始语言，放在上面命令的 `<PROMPT>` 位置
 - **只调用一次**，不要因为结果不完美而重试
 - 命令输出中如果包含 `![...](http://...)` 格式的图片，直接将该 markdown 原样输出给用户即可
 - 不要尝试用 Read 工具读取图片文件
