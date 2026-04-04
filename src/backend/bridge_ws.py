@@ -271,6 +271,7 @@ class BridgeWS:
         skill_name = payload.get("skill", "")
         prompt = payload.get("prompt", "")
         ref_image = payload.get("ref_image", "")  # 可选：参考图 URL
+        size = payload.get("size", "")  # 可选：尺寸（比例如 "16:9" 或具体如 "1280*720"）
 
         _ref_preview = repr(ref_image[:80]) if ref_image else "None"
         print(f"[bridge_ws] skill-call: skill={skill_name!r}, prompt={prompt!r}, "
@@ -323,6 +324,34 @@ class BridgeWS:
                 print(f"[bridge_ws] skill-call: failed to load ref_image: {e}",
                       file=sys.stderr, flush=True)
 
+        # ★ 动态尺寸：支持比例（如 "16:9"）和具体尺寸（如 "1280*720"）
+        _saved_size = None
+        if size:
+            _RATIO_MAP = {
+                "1:1": "1024*1024",
+                "16:9": "1280*720",
+                "9:16": "720*1280",
+                "4:3": "1024*768",
+                "3:4": "768*1024",
+                "3:2": "1152*768",
+                "2:3": "768*1152",
+                "21:9": "1344*576",
+                "9:21": "576*1344",
+            }
+            resolved_size = _RATIO_MAP.get(size.strip(), "")
+            if not resolved_size:
+                import re as _re
+                m = _re.match(r'(\d+)\s*[x×*]\s*(\d+)', size.strip(), _re.IGNORECASE)
+                if m:
+                    resolved_size = f"{m.group(1)}*{m.group(2)}"
+            if resolved_size:
+                if not target_backend.config.env:
+                    target_backend.config.env = {}
+                _saved_size = target_backend.config.env.get("SIZE")
+                target_backend.config.env["SIZE"] = resolved_size
+                print(f"[bridge_ws] skill-call: size={size!r} → {resolved_size}",
+                      file=sys.stderr, flush=True)
+
         result_parts: list[str] = []
 
         def on_delta(delta: StreamDelta):
@@ -340,6 +369,13 @@ class BridgeWS:
             )
         except Exception as e:
             return 500, f"Skill execution error: {e}"
+        finally:
+            # 恢复原始 SIZE，避免污染后续调用
+            if _saved_size is not None and target_backend.config.env:
+                target_backend.config.env["SIZE"] = _saved_size
+            elif size and target_backend.config.env and "SIZE" in target_backend.config.env:
+                if _saved_size is None:
+                    del target_backend.config.env["SIZE"]
 
         result = "".join(result_parts) or "(no output)"
 
@@ -954,28 +990,38 @@ description: {description}。也支持基于已有图片进行修改（图生图
 
 {param_hints}当需要使用此能力时，用 Bash 工具执行以下 Python 命令。
 
-### 纯文本生图（无参考图）
+### 基本用法
 
-将 `<PROMPT>` 替换为实际的描述内容：
+将 `<PROMPT>` 替换为描述内容，构建 JSON 参数调用：
 
 ```bash
 python3 -c "import urllib.request,json;d=json.dumps({{'skill':'{skill_name}','prompt':'<PROMPT>'}}).encode();r=urllib.request.Request('http://127.0.0.1:{port}/api/skill-call',d,{{'Content-Type':'application/json'}});print(urllib.request.urlopen(r,timeout=300).read().decode())"
 ```
 
-### 图生图（基于参考图修改）
+### 可选参数
 
-当用户要求修改已有图片时，在参数中加入 `ref_image` 字段，值为图片的 HTTP URL：
-- 对话中之前生成的图片：使用 `http://127.0.0.1:{port}/api/skill-images/xxx.png` 格式的 URL
-- 用户上传的图片：消息中会标注 `[用户上传图片 URL: http://...]`，使用该 URL
+JSON 中除了 `prompt`（必填），还支持以下可选字段：
 
+- **size** — 图片尺寸。支持两种格式：
+  - 比例：`"1:1"`, `"16:9"`, `"9:16"`, `"4:3"`, `"3:4"`, `"3:2"`, `"2:3"`
+  - 具体尺寸：`"1280*720"`, `"768*1024"` 等
+  - 默认为 `"1:1"`（1024*1024）
+  - 用户说"横屏/landscape" → `"16:9"`；"竖屏/portrait" → `"9:16"`
+
+- **ref_image** — 参考图 URL（图生图模式）。当用户要求修改已有图片时传入：
+  - 对话中之前生成的图：使用 `http://127.0.0.1:{port}/api/skill-images/xxx.png` 格式
+  - 用户上传的图：消息中会标注 `[用户上传图片 URL: http://...]`，使用该 URL
+
+示例（带尺寸 + 参考图）：
 ```bash
-python3 -c "import urllib.request,json;d=json.dumps({{'skill':'{skill_name}','prompt':'<PROMPT>','ref_image':'<IMAGE_URL>'}}).encode();r=urllib.request.Request('http://127.0.0.1:{port}/api/skill-call',d,{{'Content-Type':'application/json'}});print(urllib.request.urlopen(r,timeout=300).read().decode())"
+python3 -c "import urllib.request,json;d=json.dumps({{'skill':'{skill_name}','prompt':'<PROMPT>','size':'16:9','ref_image':'<IMAGE_URL>'}}).encode();r=urllib.request.Request('http://127.0.0.1:{port}/api/skill-call',d,{{'Content-Type':'application/json'}});print(urllib.request.urlopen(r,timeout=300).read().decode())"
 ```
 
 注意：如果 python3 不可用，尝试用 python 替代。
 
 重要规则：
 - prompt 直接用用户的原始语言
+- 根据用户需求判断是否需要 size 和 ref_image，不需要时省略
 - **只调用一次**，不要因为结果不完美而重试
 - 命令输出中包含 `![...](http://...)` 格式的图片，**直接原样输出**给用户
 - **不要**用 Read 工具读取图片文件
