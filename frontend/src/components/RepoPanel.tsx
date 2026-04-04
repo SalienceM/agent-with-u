@@ -56,23 +56,25 @@ function setSkillBackend(content: string, backendId: string): string {
     return content;
   }
   const fmBody = fmMatch[2];
+  const rest = content.slice(fmMatch[0].length);
   const hasBackend = /^backend:\s*.*/m.test(fmBody);
+
   if (backendId) {
     if (hasBackend) {
-      return content.replace(/^(---\s*\n[\s\S]*?)(backend:\s*.*)([\s\S]*?\n---)/, (_, before, _bk, after) => {
-        // 逐行替换
-        const lines = fmBody.split('\n').map(l => /^backend:\s*/.test(l) ? `backend: ${backendId}` : l);
-        return `${fmMatch[1]}${lines.join('\n')}${fmMatch[3]}`;
-      });
+      // 替换已有的 backend 行
+      const newFmBody = fmBody.split('\n').map(l =>
+        /^backend:\s*/.test(l) ? `backend: ${backendId}` : l
+      ).join('\n');
+      return `${fmMatch[1]}${newFmBody}${fmMatch[3]}${rest}`;
     } else {
       // 在 frontmatter 末尾添加
-      return `${fmMatch[1]}${fmBody}\nbackend: ${backendId}${fmMatch[3]}${content.slice(fmMatch[0].length)}`;
+      return `${fmMatch[1]}${fmBody}\nbackend: ${backendId}${fmMatch[3]}${rest}`;
     }
   } else {
     // 移除 backend 行
     if (hasBackend) {
-      const lines = fmBody.split('\n').filter(l => !/^backend:\s*/.test(l));
-      return `${fmMatch[1]}${lines.join('\n')}${fmMatch[3]}${content.slice(fmMatch[0].length)}`;
+      const newFmBody = fmBody.split('\n').filter(l => !/^backend:\s*/.test(l)).join('\n');
+      return `${fmMatch[1]}${newFmBody}${fmMatch[3]}${rest}`;
     }
     return content;
   }
@@ -123,7 +125,8 @@ export const RepoPanel: React.FC<Props> = ({ open, workingDir, onClose }) => {
       setEditingOrigName(item.name);
     } else {
       setEditingName('');
-      setEditingContent('');
+      // 新建 Skill 时提供默认 frontmatter 模板（确保有 frontmatter 可以选择 backend）
+      setEditingContent(type === 'skill' ? '---\nname: \ndescription: \n---\n\n## Instructions\n\n' : '');
       setEditingIcon('📝');
       setEditingOrigName(null);
     }
