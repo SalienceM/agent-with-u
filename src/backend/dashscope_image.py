@@ -57,7 +57,52 @@ class DashScopeImageBackend(ModelBackend):
     _MAX_POLLS = 120
     _POLL_INTERVAL = 3.0
 
-    # ── 模型族路由表 ─────────────────────────────────────────────────────────
+    # ── 比例 → 具体尺寸映射 ──────────────────────────────────────────
+    _RATIO_MAP = {
+        "1:1": "1024*1024",
+        "16:9": "1280*720",
+        "9:16": "720*1280",
+        "4:3": "1024*768",
+        "3:4": "768*1024",
+        "3:2": "1152*768",
+        "2:3": "768*1152",
+        "21:9": "1344*576",
+        "9:21": "576*1344",
+    }
+
+    @staticmethod
+    def _parse_size_from_content(content: str) -> tuple[str, str]:
+        """
+        从 content 中解析尺寸指令，返回 (clean_prompt, size_or_empty)。
+
+        支持格式（在 content 任意位置）：
+          --size 16:9
+          --size 1280*720
+          --size 1280x720
+        """
+        import re
+        m = re.search(r'--size\s+(\S+)', content)
+        if m:
+            size_str = m.group(1).strip()
+            clean = content[:m.start()].rstrip() + " " + content[m.end():].lstrip()
+            return clean.strip(), size_str
+        return content, ""
+
+    def _resolve_size(self, size_str: str) -> str:
+        """将比例或具体尺寸字符串解析为 DashScope 格式 W*H。"""
+        if not size_str:
+            return self.config.get_env("SIZE", "1024*1024")
+        # 比例模式
+        resolved = self._RATIO_MAP.get(size_str)
+        if resolved:
+            return resolved
+        # 具体尺寸 WxH / W*H / W×H
+        import re
+        m = re.match(r'(\d+)\s*[x×*]\s*(\d+)', size_str, re.IGNORECASE)
+        if m:
+            return f"{m.group(1)}*{m.group(2)}"
+        # 无法解析，回退到配置默认值
+        return self.config.get_env("SIZE", "1024*1024")
     # key: 模型名前缀（lower），value: (endpoint_suffix, input_format, is_async)
     #   input_format: "prompt"   → input.prompt = "..."
     #                 "messages" → input.messages = [{role,content:[{text}]}]
@@ -125,15 +170,19 @@ class DashScopeImageBackend(ModelBackend):
         base  = (self.config.base_url or self._DEFAULT_BASE).rstrip("/")
         model = (self.config.model or self._DEFAULT_MODEL).strip()
 
-        # ── 提示词：文生图不使用对话历史，只使用当前 content ────────────────
-        prompt = content.strip()
-        if not prompt:
+        # ── 提示词 + 参数解析 ──────────────────────────────────────────
+        # 从 content 中提取 --size 指令，剩余部分作为 prompt
+        raw_content = content.strip()
+        if not raw_content:
             emit("error", error="提示词为空，请输入图像描述")
             emit("done")
             return {}
+        prompt, size_arg = self._parse_size_from_content(raw_content)
+        if not prompt:
+            prompt = raw_content  # fallback
 
         # ── 参数 ──────────────────────────────────────────────────────────
-        size            = self.config.get_env("SIZE", "1024*1024")
+        size            = self._resolve_size(size_arg)
         negative_prompt = self.config.get_env("NEGATIVE_PROMPT", "")
         prompt_extend   = self.config.get_env("PROMPT_EXTEND", "true").lower() != "false"
         watermark       = self.config.get_env("WATERMARK",       "false").lower() == "true"
@@ -197,7 +246,8 @@ class DashScopeImageBackend(ModelBackend):
             headers["X-DashScope-Async"] = "enable"
 
         _ref_count = len(images) if images else 0
-        print(f"[DashScope] POST {endpoint}  model={model}  fmt={input_fmt}  async={is_async}  ref_images={_ref_count}",
+        print(f"[DashScope] POST {endpoint}  model={model}  fmt={input_fmt}  async={is_async}"
+              f"  size={size}  ref_images={_ref_count}",
               file=sys.stderr, flush=True)
 
         try:

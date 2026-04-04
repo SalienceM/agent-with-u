@@ -324,33 +324,11 @@ class BridgeWS:
                 print(f"[bridge_ws] skill-call: failed to load ref_image: {e}",
                       file=sys.stderr, flush=True)
 
-        # ★ 动态尺寸：支持比例（如 "16:9"）和具体尺寸（如 "1280*720"）
-        _saved_size = None
+        # ★ 动态尺寸：通过 --size 指令注入到 content 中
+        # DashScope backend 会自动解析 --size 并从 prompt 中剥离
+        send_content = prompt or "(empty)"
         if size:
-            _RATIO_MAP = {
-                "1:1": "1024*1024",
-                "16:9": "1280*720",
-                "9:16": "720*1280",
-                "4:3": "1024*768",
-                "3:4": "768*1024",
-                "3:2": "1152*768",
-                "2:3": "768*1152",
-                "21:9": "1344*576",
-                "9:21": "576*1344",
-            }
-            resolved_size = _RATIO_MAP.get(size.strip(), "")
-            if not resolved_size:
-                import re as _re
-                m = _re.match(r'(\d+)\s*[x×*]\s*(\d+)', size.strip(), _re.IGNORECASE)
-                if m:
-                    resolved_size = f"{m.group(1)}*{m.group(2)}"
-            if resolved_size:
-                if not target_backend.config.env:
-                    target_backend.config.env = {}
-                _saved_size = target_backend.config.env.get("SIZE")
-                target_backend.config.env["SIZE"] = resolved_size
-                print(f"[bridge_ws] skill-call: size={size!r} → {resolved_size}",
-                      file=sys.stderr, flush=True)
+            send_content = f"{send_content} --size {size}"
 
         result_parts: list[str] = []
 
@@ -361,7 +339,7 @@ class BridgeWS:
         try:
             await target_backend.send_message(
                 messages=[],
-                content=prompt or "(empty)",
+                content=send_content,
                 images=ref_images,
                 session_id=f"skill-call-{skill_name}",
                 message_id=new_id(),
@@ -369,13 +347,6 @@ class BridgeWS:
             )
         except Exception as e:
             return 500, f"Skill execution error: {e}"
-        finally:
-            # 恢复原始 SIZE，避免污染后续调用
-            if _saved_size is not None and target_backend.config.env:
-                target_backend.config.env["SIZE"] = _saved_size
-            elif size and target_backend.config.env and "SIZE" in target_backend.config.env:
-                if _saved_size is None:
-                    del target_backend.config.env["SIZE"]
 
         result = "".join(result_parts) or "(no output)"
 
