@@ -1158,6 +1158,7 @@ class BridgeWS:
                     )
 
                 # ★ 传递 Backend Skill 工具定义和回调给 API 类 backend
+                # CLI 类 backend（ClaudeAgent/ClaudeCode）不支持 extra_tools 参数
                 _send_kwargs: dict = {
                     "messages": msgs_for_backend,
                     "content": send_content,
@@ -1171,8 +1172,11 @@ class BridgeWS:
                     "on_permission_request": _on_permission_request,
                 }
                 if extra_tools and skill_map:
-                    _send_kwargs["extra_tools"] = extra_tools
-                    _send_kwargs["on_tool_call"] = _on_tool_call
+                    from .anthropic_api import AnthropicAPIBackend
+                    from .openai_compat import OpenAICompatibleBackend
+                    if isinstance(backend, (AnthropicAPIBackend, OpenAICompatibleBackend)):
+                        _send_kwargs["extra_tools"] = extra_tools
+                        _send_kwargs["on_tool_call"] = _on_tool_call
                 result = await backend.send_message(**_send_kwargs)
 
                 if use_agent_session and result.get("agentSessionId") != use_agent_session:
