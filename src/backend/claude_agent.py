@@ -34,6 +34,7 @@ class ClaudeAgentBackend(ModelBackend):
         working_dir: Optional[str] = None,
         skip_permissions: Optional[bool] = None,
         on_permission_request: Optional[Callable[[PermissionRequest], Awaitable[bool]]] = None,
+        extra_mcp_servers: Optional[dict] = None,
     ) -> dict:
         self.clear_cancelled(session_id)
 
@@ -184,7 +185,10 @@ class ClaudeAgentBackend(ModelBackend):
             if cli_path:
                 options_kwargs["cli_path"] = cli_path
 
-            mcp_servers = getattr(self.config, "mcp_servers", None)
+            # ★ MCP servers：合并配置中的和 Backend Skill 动态注入的
+            mcp_servers = dict(getattr(self.config, "mcp_servers", None) or {})
+            if extra_mcp_servers:
+                mcp_servers.update(extra_mcp_servers)
             if mcp_servers:
                 options_kwargs["mcp_servers"] = mcp_servers
                 print(f"[ClaudeAgent] MCP servers: {list(mcp_servers.keys())}",

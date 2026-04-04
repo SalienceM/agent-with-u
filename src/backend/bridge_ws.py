@@ -622,6 +622,54 @@ class BridgeWS:
 
         return extra_tools, skill_map if skill_map else None
 
+    def _build_mcp_skill_server_config(self, extra_tools: list[dict], skill_map: dict) -> dict:
+        """
+        为 CLI 类 backend 构建 MCP server 配置，启动 mcp_skill_server.py。
+        返回 MCP servers dict，可直接合并到 backend 的 mcp_servers 参数中。
+        """
+        import os as _os
+
+        # 构建 skills-json：包含工具定义 + 目标 backend 配置
+        skills_for_mcp: list[dict] = []
+        for tool_def in extra_tools:
+            tool_name = tool_def["name"]
+            mapping = skill_map.get(tool_name)
+            if not mapping:
+                continue
+            target_backend_id = mapping["backend_id"]
+            # 获取目标 backend 的配置并序列化
+            target_config = next((c for c in self._backend_configs if c.id == target_backend_id), None)
+            if not target_config:
+                print(f"[bridge_ws] Backend Skill '{tool_name}' target '{target_backend_id}' not found, skip",
+                      file=sys.stderr, flush=True)
+                continue
+            skills_for_mcp.append({
+                "name": tool_name,
+                "description": tool_def.get("description", ""),
+                "input_schema": tool_def.get("input_schema", {"type": "object", "properties": {}}),
+                "backend_config": target_config.to_dict(),
+            })
+
+        if not skills_for_mcp:
+            return {}
+
+        skills_json = json.dumps(skills_for_mcp, ensure_ascii=False)
+
+        # 定位 mcp_skill_server.py 的绝对路径
+        server_path = _os.path.abspath(
+            _os.path.join(_os.path.dirname(__file__), "mcp_skill_server.py")
+        )
+        # 确保 PYTHONPATH 包含项目根目录（src 的父目录）
+        project_root = _os.path.abspath(_os.path.join(_os.path.dirname(__file__), "..", ".."))
+
+        return {
+            "agent-with-u-backend-skills": {
+                "command": sys.executable,
+                "args": [server_path, "--skills-json", skills_json],
+                "env": {"PYTHONPATH": project_root},
+            }
+        }
+
     async def _execute_backend_skill(
         self, tool_name: str, tool_input: dict,
         skill_map: dict, session: Session, message_id: str,
@@ -1157,8 +1205,7 @@ class BridgeWS:
                         req.session_id, req.message_id, tools
                     )
 
-                # ★ 传递 Backend Skill 工具定义和回调给 API 类 backend
-                # CLI 类 backend（ClaudeAgent/ClaudeCode）不支持 extra_tools 参数
+                # ★ 传递 Backend Skill 工具定义给 backend
                 _send_kwargs: dict = {
                     "messages": msgs_for_backend,
                     "content": send_content,
@@ -1174,9 +1221,19 @@ class BridgeWS:
                 if extra_tools and skill_map:
                     from .anthropic_api import AnthropicAPIBackend
                     from .openai_compat import OpenAICompatibleBackend
+                    from .claude_agent import ClaudeAgentBackend
+                    from .claude_code import ClaudeCodeOfficialBackend
                     if isinstance(backend, (AnthropicAPIBackend, OpenAICompatibleBackend)):
+                        # API 类：注入 tools 参数 + tool_use 回调
                         _send_kwargs["extra_tools"] = extra_tools
                         _send_kwargs["on_tool_call"] = _on_tool_call
+                    elif isinstance(backend, (ClaudeAgentBackend, ClaudeCodeOfficialBackend)):
+                        # CLI 类：通过 MCP server 注入 Backend Skill 工具
+                        mcp_config = self._build_mcp_skill_server_config(extra_tools, skill_map)
+                        if mcp_config:
+                            _send_kwargs["extra_mcp_servers"] = mcp_config
+                            print(f"[bridge_ws] Injecting MCP Backend Skills for CLI backend",
+                                  file=sys.stderr, flush=True)
                 result = await backend.send_message(**_send_kwargs)
 
                 if use_agent_session and result.get("agentSessionId") != use_agent_session:

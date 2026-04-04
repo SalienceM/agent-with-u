@@ -2,33 +2,85 @@
 MCP Skill Server: 为 CLI 类 backend（ClaudeAgent/ClaudeCode）提供 Backend Skill 能力。
 
 工作原理：
-  - 作为 MCP stdio server 运行，由 bridge_ws 动态启动
-  - 监听来自 Claude CLI 的 tool 调用请求
-  - 将请求转发给目标 backend（通过 HTTP 回调到 bridge_ws）
-  - 返回执行结果给 Claude CLI
+  - 作为 MCP stdio server 运行，由 Claude CLI 子进程通过 --mcp-config 启动
+  - 接收 --skills-json 参数，包含各 Backend Skill 的工具定义和目标 backend 配置
+  - 当 Claude 调用 Backend Skill 工具时，实例化目标 backend 并执行
+  - 将执行结果（累积的文本）返回给 Claude
 
-使用方式：
-  python -m src.backend.mcp_skill_server --port <bridge_port> --session <session_id>
-
-协议：MCP over stdio (JSON-RPC)
+使用方式（由 bridge_ws 自动生成 MCP 配置）：
+  python <this_file> --skills-json '<json>'
 """
 
 import asyncio
 import json
 import sys
+import os
 from typing import Optional
 
-import httpx
+
+# ── 全局状态 ──────────────────────────────────────────────────────
+
+_skills: list[dict] = []
+# 格式: [{"name": "...", "description": "...", "input_schema": {...},
+#          "backend_config": {...(ModelBackendConfig 序列化)}}]
 
 
-# ── 配置 ──────────────────────────────────────────────────────────
+def _create_target_backend(backend_config_dict: dict):
+    """从序列化的配置字典创建 backend 实例。"""
+    # 延迟导入，确保 PYTHONPATH 已设置
+    from src.types import ModelBackendConfig, BackendType
+    from src.backend.factory import create_backend
 
-_bridge_port: int = 0
-_session_id: str = ""
-_tools: list[dict] = []
+    config = ModelBackendConfig(
+        id=backend_config_dict["id"],
+        type=BackendType(backend_config_dict["type"]),
+        label=backend_config_dict.get("label", ""),
+        base_url=backend_config_dict.get("baseUrl"),
+        model=backend_config_dict.get("model"),
+        api_key=backend_config_dict.get("apiKey"),
+        working_dir=backend_config_dict.get("workingDir"),
+        allowed_tools=backend_config_dict.get("allowedTools"),
+        skip_permissions=backend_config_dict.get("skipPermissions", True),
+        env=backend_config_dict.get("env"),
+        extra_headers=backend_config_dict.get("extraHeaders"),
+        mcp_servers=backend_config_dict.get("mcpServers"),
+    )
+    return create_backend(config)
 
 
-async def handle_request(req: dict) -> dict:
+async def _execute_skill(skill_def: dict, tool_input: dict) -> str:
+    """执行一个 Backend Skill：实例化目标 backend，发送请求，收集结果。"""
+    from src.backend.base import StreamDelta
+
+    backend_config = skill_def["backend_config"]
+    backend = _create_target_backend(backend_config)
+
+    # 构建发送内容：优先使用 prompt 字段，否则序列化整个 input
+    prompt = tool_input.get("prompt", "") or json.dumps(tool_input, ensure_ascii=False)
+
+    result_parts: list[str] = []
+
+    def on_delta(delta: StreamDelta):
+        if delta.type == "text_delta" and delta.text:
+            result_parts.append(delta.text)
+
+    try:
+        await backend.send_message(
+            messages=[],
+            content=prompt,
+            images=None,
+            session_id="mcp-skill-exec",
+            message_id="mcp-skill-msg",
+            on_delta=on_delta,
+        )
+    except Exception as e:
+        return f"Backend execution error: {e}"
+
+    result = "".join(result_parts)
+    return result if result else "(no output)"
+
+
+async def handle_request(req: dict) -> Optional[dict]:
     """处理 MCP JSON-RPC 请求。"""
     method = req.get("method", "")
     req_id = req.get("id")
@@ -52,11 +104,11 @@ async def handle_request(req: dict) -> dict:
 
     if method == "tools/list":
         mcp_tools = []
-        for t in _tools:
+        for s in _skills:
             mcp_tools.append({
-                "name": t["name"],
-                "description": t.get("description", ""),
-                "inputSchema": t.get("input_schema", {"type": "object", "properties": {}}),
+                "name": s["name"],
+                "description": s.get("description", ""),
+                "inputSchema": s.get("input_schema", {"type": "object", "properties": {}}),
             })
         return {
             "jsonrpc": "2.0",
@@ -69,21 +121,22 @@ async def handle_request(req: dict) -> dict:
         tool_name = params.get("name", "")
         tool_args = params.get("arguments", {})
 
+        # 查找对应的 skill 定义
+        skill_def = next((s for s in _skills if s["name"] == tool_name), None)
+        if not skill_def:
+            return {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "result": {
+                    "content": [{"type": "text", "text": f"Unknown skill: {tool_name}"}],
+                    "isError": True,
+                },
+            }
+
         try:
-            # 回调 bridge_ws 执行 Backend Skill
-            async with httpx.AsyncClient(timeout=120.0) as client:
-                resp = await client.post(
-                    f"http://127.0.0.1:{_bridge_port}/mcp-skill-call",
-                    json={
-                        "sessionId": _session_id,
-                        "toolName": tool_name,
-                        "toolInput": tool_args,
-                    },
-                )
-                result_data = resp.json()
-                result_text = result_data.get("result", "(no output)")
+            result_text = await _execute_skill(skill_def, tool_args)
         except Exception as e:
-            result_text = f"Error executing backend skill: {e}"
+            result_text = f"Error executing backend skill '{tool_name}': {e}"
 
         return {
             "jsonrpc": "2.0",
@@ -93,33 +146,33 @@ async def handle_request(req: dict) -> dict:
             },
         }
 
-    # 未知方法
-    return {
-        "jsonrpc": "2.0",
-        "id": req_id,
-        "error": {"code": -32601, "message": f"Method not found: {method}"},
-    }
+    # 未知方法 — 返回 error
+    if req_id is not None:
+        return {
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "error": {"code": -32601, "message": f"Method not found: {method}"},
+        }
+    return None  # notification
 
 
 async def main():
     """MCP stdio 主循环。"""
-    global _bridge_port, _session_id, _tools
+    global _skills
 
     # 解析命令行参数
     import argparse
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--port", type=int, required=True)
-    parser.add_argument("--session", type=str, required=True)
-    parser.add_argument("--tools-json", type=str, default="[]")
+    parser = argparse.ArgumentParser(description="MCP Backend Skill Server")
+    parser.add_argument("--skills-json", type=str, required=True,
+                        help="JSON array of skill definitions with backend configs")
     args = parser.parse_args()
 
-    _bridge_port = args.port
-    _session_id = args.session
-    _tools = json.loads(args.tools_json)
+    _skills = json.loads(args.skills_json)
 
-    print(f"[MCP Skill Server] Started: port={_bridge_port}, session={_session_id}, "
-          f"tools={[t['name'] for t in _tools]}", file=sys.stderr, flush=True)
+    print(f"[MCP Skill Server] Started with {len(_skills)} skills: "
+          f"{[s['name'] for s in _skills]}", file=sys.stderr, flush=True)
 
+    # MCP stdio 协议：从 stdin 读 JSON-RPC，写到 stdout
     loop = asyncio.get_event_loop()
     reader = asyncio.StreamReader()
     protocol = asyncio.StreamReaderProtocol(reader)
@@ -134,11 +187,11 @@ async def main():
         line = await reader.readline()
         if not line:
             break
-        line = line.decode("utf-8").strip()
-        if not line:
+        line_str = line.decode("utf-8").strip()
+        if not line_str:
             continue
         try:
-            req = json.loads(line)
+            req = json.loads(line_str)
         except json.JSONDecodeError:
             continue
 
