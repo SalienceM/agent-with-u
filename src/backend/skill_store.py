@@ -11,10 +11,13 @@ SkillStore: 管理 Skill 孵化库与激活状态。
 """
 
 import json
+import re
 import shutil
 import threading
 from pathlib import Path
 from typing import Optional
+
+import yaml  # PyYAML — already in requirements (anthropic dep)
 
 LIBRARY_DIR = Path.home() / ".agent-with-u" / "skill-library"
 INDEX_FILE  = LIBRARY_DIR / "index.json"
@@ -23,6 +26,13 @@ DEFAULT_SKILL_TEMPLATE = """\
 ---
 name: {name}
 description: Describe what this skill does and when Claude should use it (max 250 chars)
+# backend: backend-id          # 可选：指定路由到哪个 Backend（Backend Skill 模式）
+# input_schema:                # 可选：Backend Skill 的输入参数定义（JSON Schema）
+#   type: object
+#   properties:
+#     prompt:
+#       type: string
+#       description: 输入描述
 ---
 
 ## Instructions
@@ -33,6 +43,20 @@ Write step-by-step instructions for Claude here.
 
 Describe example prompts that would trigger this skill.
 """
+
+
+def parse_skill_frontmatter(content: str) -> dict:
+    """解析 SKILL.md 的 YAML frontmatter，返回字段字典。
+    支持字段：name, description, backend, input_schema 等。
+    """
+    m = re.match(r'^---\s*\n(.*?)\n---', content, re.DOTALL)
+    if not m:
+        return {}
+    try:
+        data = yaml.safe_load(m.group(1))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
 
 
 class SkillStore:
@@ -115,14 +139,22 @@ class SkillStore:
                     self._save_index()
                     activations = valid_activations
 
-                result.append({
+                fm = parse_skill_frontmatter(content)
+                item: dict = {
                     "id": name,  # 使用 name 作为 ID（确保唯一性）
                     "name": name,
                     "content": content,
                     "isGlobal": "global" in activations,
                     "isProject": bool(working_dir) and working_dir in activations,
                     "projectActivations": [a for a in activations if a != "global"],
-                })
+                    "description": fm.get("description", ""),
+                }
+                # Backend Skill 扩展字段
+                if fm.get("backend"):
+                    item["backend"] = fm["backend"]
+                if fm.get("input_schema"):
+                    item["inputSchema"] = fm["input_schema"]
+                result.append(item)
             return result
 
     def get_skill(self, name: str) -> Optional[dict]:
@@ -132,12 +164,19 @@ class SkillStore:
                 return None
             content = skill_file.read_text(encoding="utf-8")
             activations = self._index.get(name, {}).get("activations", [])
-            return {
-                "id": name,  # 使用 name 作为 ID（确保唯一性）
+            fm = parse_skill_frontmatter(content)
+            result: dict = {
+                "id": name,
                 "name": name,
                 "content": content,
                 "activations": activations,
+                "description": fm.get("description", ""),
             }
+            if fm.get("backend"):
+                result["backend"] = fm["backend"]
+            if fm.get("input_schema"):
+                result["inputSchema"] = fm["input_schema"]
+            return result
 
     def save_skill(self, name: str, content: str) -> None:
         """

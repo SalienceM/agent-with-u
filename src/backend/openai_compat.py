@@ -20,6 +20,8 @@ class OpenAICompatibleBackend(ModelBackend):
         message_id: str,
         on_delta: Callable[[StreamDelta], None],
         skip_permissions: Optional[bool] = None,
+        extra_tools: Optional[list[dict]] = None,
+        on_tool_call: Optional[Callable] = None,
         **kwargs,
     ) -> dict:
         self.clear_cancelled(session_id)
@@ -65,72 +67,185 @@ class OpenAICompatibleBackend(ModelBackend):
             if self.config.api_key:
                 headers["Authorization"] = f"Bearer {self.config.api_key}"
 
+            # 转换 Anthropic 格式 tools 到 OpenAI 格式
+            oai_tools: Optional[list[dict]] = None
+            oai_tool_names: set[str] = set()
+            if extra_tools:
+                oai_tools = []
+                for t in extra_tools:
+                    oai_tools.append({
+                        "type": "function",
+                        "function": {
+                            "name": t["name"],
+                            "description": t.get("description", ""),
+                            "parameters": t.get("input_schema", {"type": "object", "properties": {}}),
+                        },
+                    })
+                    oai_tool_names.add(t["name"])
+
             _RETRY_DELAYS = [1.0, 2.0, 4.0, 8.0, 8.0, 8.0, 8.0, 8.0, 8.0, 8.0]
             _MAX_RETRIES = len(_RETRY_DELAYS)
-            data_emitted = False
-            last_error: Optional[str] = None
+            _MAX_TOOL_ROUNDS = 10
 
-            for attempt in range(_MAX_RETRIES + 1):
-                if self.is_cancelled(session_id):
-                    break
-                if attempt > 0:
-                    delay = _RETRY_DELAYS[attempt - 1]
-                    print(f"[OpenAI] retry {attempt}/{_MAX_RETRIES} in {delay}s ...",
-                          file=sys.stderr, flush=True)
-                    await asyncio.sleep(delay)
-                try:
-                    async with httpx.AsyncClient(timeout=120.0) as client:
-                        async with client.stream(
-                            "POST",
-                            f"{base_url}/chat/completions",
-                            json={
-                                "model": self.config.model or "gpt-4o",
-                                "messages": api_messages,
-                                "stream": True,
-                            },
-                            headers=headers,
-                        ) as response:
-                            if response.status_code == 429 and attempt < _MAX_RETRIES:
-                                last_error = f"API error: 429 (rate limited, retrying {attempt+1}/{_MAX_RETRIES})"
-                                print(f"[OpenAI] 429 rate limit, will retry", file=sys.stderr, flush=True)
-                                continue
-                            if response.status_code != 200:
-                                emit("error", error=f"API error: {response.status_code}")
-                                emit("done")
-                                return {}
+            for _tool_round in range(_MAX_TOOL_ROUNDS + 1):
+                data_emitted = False
+                last_error: Optional[str] = None
+                # 收集本轮 tool_calls
+                _oai_tool_calls: dict[int, dict] = {}  # index → {id, name, arguments}
+                _finish_reason: Optional[str] = None
 
-                            async for line in response.aiter_lines():
-                                if self.is_cancelled(session_id):
-                                    break
-                                line = line.strip()
-                                if not line.startswith("data: "):
-                                    continue
-                                data = line[6:]
-                                if data == "[DONE]":
-                                    break
-                                try:
-                                    parsed = json.loads(data)
-                                    delta = (parsed.get("choices", [{}])[0]
-                                             .get("delta", {}))
-                                    if delta.get("content"):
-                                        emit("text_delta", text=delta["content"])
-                                        data_emitted = True
-                                except (json.JSONDecodeError, IndexError):
-                                    pass
-                    last_error = None
-                    break  # success
+                req_json: dict = {
+                    "model": self.config.model or "gpt-4o",
+                    "messages": api_messages,
+                    "stream": True,
+                }
+                if oai_tools:
+                    req_json["tools"] = oai_tools
 
-                except (httpx.ConnectError, httpx.NetworkError,
-                        httpx.TimeoutException, httpx.RemoteProtocolError) as e:
-                    if data_emitted or attempt >= _MAX_RETRIES:
-                        last_error = _exc_msg(e)
+                for attempt in range(_MAX_RETRIES + 1):
+                    if self.is_cancelled(session_id):
                         break
-                    last_error = _exc_msg(e)
-                    print(f"[OpenAI] network error ({last_error}), will retry",
-                          file=sys.stderr, flush=True)
+                    if attempt > 0:
+                        delay = _RETRY_DELAYS[attempt - 1]
+                        print(f"[OpenAI] retry {attempt}/{_MAX_RETRIES} in {delay}s ...",
+                              file=sys.stderr, flush=True)
+                        await asyncio.sleep(delay)
+                    try:
+                        async with httpx.AsyncClient(timeout=120.0) as client:
+                            async with client.stream(
+                                "POST",
+                                f"{base_url}/chat/completions",
+                                json=req_json,
+                                headers=headers,
+                            ) as response:
+                                if response.status_code == 429 and attempt < _MAX_RETRIES:
+                                    last_error = f"API error: 429 (rate limited, retrying {attempt+1}/{_MAX_RETRIES})"
+                                    print(f"[OpenAI] 429 rate limit, will retry", file=sys.stderr, flush=True)
+                                    continue
+                                if response.status_code != 200:
+                                    emit("error", error=f"API error: {response.status_code}")
+                                    emit("done")
+                                    return {}
 
-            if last_error and not self.is_cancelled(session_id):
-                emit("error", error=last_error)
+                                async for line in response.aiter_lines():
+                                    if self.is_cancelled(session_id):
+                                        break
+                                    line = line.strip()
+                                    if not line.startswith("data: "):
+                                        continue
+                                    data = line[6:]
+                                    if data == "[DONE]":
+                                        break
+                                    try:
+                                        parsed = json.loads(data)
+                                        choice = parsed.get("choices", [{}])[0]
+                                        delta = choice.get("delta", {})
+                                        fr = choice.get("finish_reason")
+                                        if fr:
+                                            _finish_reason = fr
+                                        if delta.get("content"):
+                                            emit("text_delta", text=delta["content"])
+                                            data_emitted = True
+                                        # 收集 tool_calls delta
+                                        for tc_delta in delta.get("tool_calls", []):
+                                            idx = tc_delta.get("index", 0)
+                                            if idx not in _oai_tool_calls:
+                                                _oai_tool_calls[idx] = {
+                                                    "id": tc_delta.get("id", ""),
+                                                    "name": tc_delta.get("function", {}).get("name", ""),
+                                                    "arguments": "",
+                                                }
+                                                # emit tool_start
+                                                emit("tool_start", tool_call={
+                                                    "id": tc_delta.get("id", ""),
+                                                    "name": tc_delta.get("function", {}).get("name", ""),
+                                                    "input": "",
+                                                    "status": "running",
+                                                })
+                                            else:
+                                                if tc_delta.get("id"):
+                                                    _oai_tool_calls[idx]["id"] = tc_delta["id"]
+                                                if tc_delta.get("function", {}).get("name"):
+                                                    _oai_tool_calls[idx]["name"] = tc_delta["function"]["name"]
+                                            arg_delta = tc_delta.get("function", {}).get("arguments", "")
+                                            if arg_delta:
+                                                _oai_tool_calls[idx]["arguments"] += arg_delta
+                                                emit("tool_input", tool_call={"inputDelta": arg_delta})
+                                    except (json.JSONDecodeError, IndexError):
+                                        pass
+                        last_error = None
+                        break  # success
+
+                    except (httpx.ConnectError, httpx.NetworkError,
+                            httpx.TimeoutException, httpx.RemoteProtocolError) as e:
+                        if data_emitted or attempt >= _MAX_RETRIES:
+                            last_error = _exc_msg(e)
+                            break
+                        last_error = _exc_msg(e)
+                        print(f"[OpenAI] network error ({last_error}), will retry",
+                              file=sys.stderr, flush=True)
+
+                if last_error and not self.is_cancelled(session_id):
+                    emit("error", error=last_error)
+                    break
+
+                # ── Backend Skill tool_use 处理 ──
+                if (_finish_reason == "tool_calls" and _oai_tool_calls
+                        and on_tool_call and oai_tool_names):
+                    backend_tcs = {idx: tc for idx, tc in _oai_tool_calls.items()
+                                   if tc["name"] in oai_tool_names}
+                    if not backend_tcs:
+                        break
+
+                    # 构建 assistant 消息
+                    assistant_tc_list = []
+                    for idx in sorted(_oai_tool_calls.keys()):
+                        tc = _oai_tool_calls[idx]
+                        assistant_tc_list.append({
+                            "id": tc["id"],
+                            "type": "function",
+                            "function": {"name": tc["name"], "arguments": tc["arguments"]},
+                        })
+                    api_messages.append({
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": assistant_tc_list,
+                    })
+
+                    # 执行 Backend Skill 工具
+                    for idx in sorted(backend_tcs.keys()):
+                        tc = backend_tcs[idx]
+                        try:
+                            args = json.loads(tc["arguments"]) if tc["arguments"] else {}
+                        except json.JSONDecodeError:
+                            args = {}
+                        try:
+                            result_text = await on_tool_call(tc["name"], args)
+                            emit("tool_result", tool_call={
+                                "id": tc["id"], "output": result_text, "status": "done",
+                            })
+                            api_messages.append({
+                                "role": "tool",
+                                "tool_call_id": tc["id"],
+                                "content": result_text,
+                            })
+                        except Exception as te:
+                            emit("tool_result", tool_call={
+                                "id": tc["id"], "output": f"Error: {te}", "status": "error",
+                            })
+                            api_messages.append({
+                                "role": "tool",
+                                "tool_call_id": tc["id"],
+                                "content": f"Error: {te}",
+                            })
+
+                    print(f"[OpenAI] Backend Skill round {_tool_round + 1}, "
+                          f"tools: {[tc['name'] for tc in backend_tcs.values()]}",
+                          file=sys.stderr, flush=True)
+                    continue
+                else:
+                    break  # 无 tool_use，结束
+
             emit("done")
             return {}
 

@@ -583,6 +583,94 @@ class BridgeWS:
             return json.dumps({"status": "error", "message": str(e)}, ensure_ascii=False)
 
     # ═══════════════════════════════════════
+    #  Backend Skill 收集与执行
+    # ═══════════════════════════════════════
+
+    def _collect_backend_skills(self, session: Session) -> tuple[list[dict], Optional[dict]]:
+        """
+        从 session 绑定的 skills 中收集 Backend Skill（带 backend 字段的）。
+        返回:
+          - extra_tools: Anthropic tool definitions 列表
+          - skill_map: {tool_name: {"backend_id": ..., "skill_name": ...}} 用于路由
+        """
+        abilities = session.abilities or {}
+        skill_names = abilities.get("skills", [])
+        if not skill_names:
+            return [], None
+
+        extra_tools: list[dict] = []
+        skill_map: dict[str, dict] = {}
+
+        for sname in skill_names:
+            info = self._skill_store.get_skill(sname)
+            if not info or not info.get("backend"):
+                continue  # 传统 Skill，跳过
+            backend_id = info["backend"]
+            description = info.get("description", f"Backend Skill: {sname}")
+            input_schema = info.get("inputSchema") or {"type": "object", "properties": {}}
+
+            tool_name = sname.replace("-", "_")  # 标准化工具名（Claude 不允许连字符）
+            extra_tools.append({
+                "name": tool_name,
+                "description": description,
+                "input_schema": input_schema,
+            })
+            skill_map[tool_name] = {
+                "backend_id": backend_id,
+                "skill_name": sname,
+            }
+
+        return extra_tools, skill_map if skill_map else None
+
+    async def _execute_backend_skill(
+        self, tool_name: str, tool_input: dict,
+        skill_map: dict, session: Session, message_id: str,
+    ) -> str:
+        """
+        执行一个 Backend Skill：将请求路由到目标 backend。
+        返回结果文本。
+        """
+        mapping = skill_map.get(tool_name)
+        if not mapping:
+            raise ValueError(f"Unknown backend skill: {tool_name}")
+
+        target_backend_id = mapping["backend_id"]
+        target_backend = self._get_backend(target_backend_id)
+
+        # 构建发给目标 backend 的消息内容
+        prompt = tool_input.get("prompt", "") or json.dumps(tool_input, ensure_ascii=False)
+        result_parts: list[str] = []
+
+        def on_delta(delta: StreamDelta):
+            if delta.type == "text_delta" and delta.text:
+                result_parts.append(delta.text)
+            # 将目标 backend 的流式事件也转发给前端（作为子工具的输出）
+            # 使用原始 session_id 和 message_id
+            if delta.type in ("text_delta", "thinking"):
+                pass  # 文本结果收集后统一返回
+
+        sub_message_id = new_id()
+        try:
+            await target_backend.send_message(
+                messages=[],
+                content=prompt,
+                images=None,
+                session_id=f"{session.id}__skill_{tool_name}",
+                message_id=sub_message_id,
+                on_delta=on_delta,
+                working_dir=session.working_dir,
+            )
+        except Exception as e:
+            raise RuntimeError(f"Backend skill '{tool_name}' execution failed: {e}")
+
+        result = "".join(result_parts)
+        if not result:
+            result = "(no output)"
+        print(f"[bridge_ws] Backend Skill '{tool_name}' → backend '{target_backend_id}', "
+              f"result: {result[:200]}...", file=sys.stderr, flush=True)
+        return result
+
+    # ═══════════════════════════════════════
     #  Session 能力绑定
     # ═══════════════════════════════════════
     def _rpc_updateSessionAbilities(self, session_id: str, abilities_json: str) -> str:
@@ -904,6 +992,18 @@ class BridgeWS:
     ):
         backend = self._get_backend(backend_id)
         assistant_msg = session.messages[-1]
+
+        # ── 收集 Backend Skills（API 类 backend 使用）──
+        extra_tools, skill_map = self._collect_backend_skills(session)
+        if extra_tools:
+            print(f"[bridge_ws] Session {session.id}: {len(extra_tools)} Backend Skills detected: "
+                  f"{[t['name'] for t in extra_tools]}", file=sys.stderr, flush=True)
+
+        async def _on_tool_call(tool_name: str, tool_input: dict) -> str:
+            """Backend Skill 工具调用回调。"""
+            return await self._execute_backend_skill(
+                tool_name, tool_input, skill_map or {}, session, message_id,
+            )
         max_continuations = session.max_continuations
 
         all_text: list[str] = []
@@ -1057,13 +1157,23 @@ class BridgeWS:
                         req.session_id, req.message_id, tools
                     )
 
-                result = await backend.send_message(
-                    messages=msgs_for_backend, content=send_content,
-                    images=current_images, session_id=session.id, message_id=message_id,
-                    on_delta=on_delta, agent_session_id=use_agent_session,
-                    working_dir=session.working_dir, skip_permissions=skip_permissions,
-                    on_permission_request=_on_permission_request,
-                )
+                # ★ 传递 Backend Skill 工具定义和回调给 API 类 backend
+                _send_kwargs: dict = {
+                    "messages": msgs_for_backend,
+                    "content": send_content,
+                    "images": current_images,
+                    "session_id": session.id,
+                    "message_id": message_id,
+                    "on_delta": on_delta,
+                    "agent_session_id": use_agent_session,
+                    "working_dir": session.working_dir,
+                    "skip_permissions": skip_permissions,
+                    "on_permission_request": _on_permission_request,
+                }
+                if extra_tools and skill_map:
+                    _send_kwargs["extra_tools"] = extra_tools
+                    _send_kwargs["on_tool_call"] = _on_tool_call
+                result = await backend.send_message(**_send_kwargs)
 
                 if use_agent_session and result.get("agentSessionId") != use_agent_session:
                     session.agent_session_id = None

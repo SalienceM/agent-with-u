@@ -40,6 +40,44 @@ interface Props {
 // 常用 emoji 列表
 const ICONS = ['📝', '🚀', '🎯', '🔧', '💡', '🛡️', '📊', '🎨', '🔬', '📦', '⚡', '🌐', '🤖', '🧩', '📋', '🔑'];
 
+// 解析 SKILL.md frontmatter 中的 backend 字段
+function parseSkillBackend(content: string): string {
+  const m = content.match(/^---\s*\n([\s\S]*?)\n---/);
+  if (!m) return '';
+  const line = m[1].match(/backend:\s*(.+)/);
+  return line ? line[1].trim().replace(/^["']|["']$/g, '') : '';
+}
+
+// 更新 SKILL.md frontmatter 中的 backend 字段
+function setSkillBackend(content: string, backendId: string): string {
+  const fmMatch = content.match(/^(---\s*\n)([\s\S]*?)(\n---)/);
+  if (!fmMatch) {
+    // 没有 frontmatter，不处理
+    return content;
+  }
+  const fmBody = fmMatch[2];
+  const hasBackend = /^backend:\s*.*/m.test(fmBody);
+  if (backendId) {
+    if (hasBackend) {
+      return content.replace(/^(---\s*\n[\s\S]*?)(backend:\s*.*)([\s\S]*?\n---)/, (_, before, _bk, after) => {
+        // 逐行替换
+        const lines = fmBody.split('\n').map(l => /^backend:\s*/.test(l) ? `backend: ${backendId}` : l);
+        return `${fmMatch[1]}${lines.join('\n')}${fmMatch[3]}`;
+      });
+    } else {
+      // 在 frontmatter 末尾添加
+      return `${fmMatch[1]}${fmBody}\nbackend: ${backendId}${fmMatch[3]}${content.slice(fmMatch[0].length)}`;
+    }
+  } else {
+    // 移除 backend 行
+    if (hasBackend) {
+      const lines = fmBody.split('\n').filter(l => !/^backend:\s*/.test(l));
+      return `${fmMatch[1]}${lines.join('\n')}${fmMatch[3]}${content.slice(fmMatch[0].length)}`;
+    }
+    return content;
+  }
+}
+
 // ═══════════════════════════════════════
 //  RepoPanel — Skill + Prompt 仓库面板
 // ═══════════════════════════════════════
@@ -54,17 +92,21 @@ export const RepoPanel: React.FC<Props> = ({ open, workingDir, onClose }) => {
   const [editingOrigName, setEditingOrigName] = useState<string | null>(null); // null = 新建
   const [showIconPicker, setShowIconPicker] = useState(false);
   const [saving, setSaving] = useState(false);
+  // Backend Skill：后端列表（用于下拉选择）
+  const [backends, setBackends] = useState<{ id: string; label: string }[]>([]);
   // 删除二次确认
   const [deleteConfirm, setDeleteConfirm] = useState<{ type: 'skill' | 'prompt'; name: string } | null>(null);
   const nameRef = useRef<HTMLInputElement>(null);
 
   const refresh = useCallback(async () => {
-    const [sk, pr] = await Promise.all([
+    const [sk, pr, bks] = await Promise.all([
       api.listSkills(workingDir),
       api.listPrompts(),
+      api.getBackends().catch(() => []),
     ]);
     setSkills(sk || []);
     setPrompts(pr || []);
+    setBackends((bks || []).map((b: any) => ({ id: b.id, label: b.label || b.id })));
   }, [workingDir]);
 
   useEffect(() => {
@@ -177,6 +219,27 @@ export const RepoPanel: React.FC<Props> = ({ open, workingDir, onClose }) => {
               {editingType === 'skill' ? 'Skill' : 'Prompt'}
             </span>
           </div>
+          {/* Backend Skill：后端选择下拉框（仅 Skill 类型显示） */}
+          {editingType === 'skill' && backends.length > 0 && (
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 10 }}>
+              <span style={{ fontSize: 12, color: 'var(--theme-text-muted)', whiteSpace: 'nowrap' }}>路由后端</span>
+              <select
+                value={parseSkillBackend(editingContent)}
+                onChange={e => {
+                  setEditingContent(prev => setSkillBackend(prev, e.target.value));
+                }}
+                style={backendSelectStyle}
+              >
+                <option value="">无 (传统 Skill)</option>
+                {backends.map(b => (
+                  <option key={b.id} value={b.id}>{b.label}</option>
+                ))}
+              </select>
+              <span style={{ fontSize: 11, color: 'var(--theme-text-muted)' }}>
+                {parseSkillBackend(editingContent) ? '🔗 Backend Skill' : '📋 指令型 Skill'}
+              </span>
+            </div>
+          )}
           <textarea
             value={editingContent}
             onChange={e => setEditingContent(e.target.value)}
@@ -207,7 +270,7 @@ export const RepoPanel: React.FC<Props> = ({ open, workingDir, onClose }) => {
           <div style={cardGridStyle}>
             {skills.map(s => (
               <div key={s.id} className="repo-card" style={cardStyle} onClick={() => openEditor('skill', s)}>
-                <div style={cardIconStyle}>⚡</div>
+                <div style={cardIconStyle}>{parseSkillBackend(s.content || '') ? '🔗' : '⚡'}</div>
                 <div style={cardNameStyle}>{s.name}</div>
                 <div className="repo-card-actions" style={cardActionsStyle}>
                   <button
@@ -423,6 +486,18 @@ const nameInputStyle: React.CSSProperties = {
   borderRadius: 6,
   color: 'var(--theme-text)',
   padding: '6px 10px',
+  outline: 'none',
+  fontFamily: 'inherit',
+};
+
+const backendSelectStyle: React.CSSProperties = {
+  flex: 1,
+  fontSize: 12,
+  background: 'var(--theme-input-bg)',
+  border: '1px solid var(--theme-border)',
+  borderRadius: 6,
+  color: 'var(--theme-text)',
+  padding: '4px 8px',
   outline: 'none',
   fontFamily: 'inherit',
 };
