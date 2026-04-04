@@ -238,6 +238,11 @@ class BridgeWS:
 
     async def _handle_skill_call(self, payload: dict) -> tuple[int, str]:
         """执行 Backend Skill 调用。"""
+        import re as _re
+        import base64 as _b64
+        import tempfile as _tempfile
+        from pathlib import Path as _Path
+
         skill_name = payload.get("skill", "")
         prompt = payload.get("prompt", "")
 
@@ -273,6 +278,37 @@ class BridgeWS:
             return 500, f"Skill execution error: {e}"
 
         result = "".join(result_parts) or "(no output)"
+
+        # ★ 拦截 base64 图片数据：保存到临时文件，返回文件路径
+        # 避免 2MB+ 的 base64 通过 CLI stdout 撑爆模型上下文
+        b64_pattern = _re.compile(
+            r'!\[([^\]]*)\]\(data:(image/[^;]+);base64,([A-Za-z0-9+/=\s]+)\)'
+        )
+        saved_files: list[str] = []
+
+        def _save_b64_image(match):
+            alt = match.group(1)
+            mime = match.group(2)
+            b64_data = match.group(3).replace("\n", "").replace(" ", "")
+            ext = mime.split("/")[-1].replace("jpeg", "jpg")
+            try:
+                img_bytes = _b64.b64decode(b64_data)
+                # 保存到临时目录
+                tmp_dir = _Path.home() / ".agent-with-u" / "skill-images"
+                tmp_dir.mkdir(parents=True, exist_ok=True)
+                img_path = tmp_dir / f"{new_id()}.{ext}"
+                img_path.write_bytes(img_bytes)
+                saved_files.append(str(img_path))
+                return f"[图片已生成] 保存至: {img_path}\n大小: {len(img_bytes)} bytes"
+            except Exception as e:
+                return f"[图片保存失败: {e}]"
+
+        result = b64_pattern.sub(_save_b64_image, result)
+
+        if saved_files:
+            print(f"[bridge_ws] Skill '{skill_name}' saved {len(saved_files)} images: {saved_files}",
+                  file=sys.stderr, flush=True)
+
         return 200, result
 
     # ── WebSocket 基础设施 ───────────────────────────────────────
@@ -825,15 +861,17 @@ description: {description}
 
 ## Instructions
 
-{param_hints}当需要使用此能力时，用 Bash 工具执行以下 curl 命令（POST JSON），将 `<PROMPT>` 替换为实际的用户请求内容：
+{param_hints}当需要使用此能力时，用 Bash 工具执行以下 curl 命令，将 `<PROMPT>` 替换为实际的用户请求内容：
 
 ```bash
-curl -s -X POST http://127.0.0.1:{port}/api/skill-call \\
-  -H "Content-Type: application/json" \\
-  -d '{{"skill": "{skill_name}", "prompt": "<PROMPT>"}}'
+curl -s -G http://127.0.0.1:{port}/api/skill-call --data-urlencode "skill={skill_name}" --data-urlencode "prompt=<PROMPT>"
 ```
 
-将命令输出的内容直接呈现给用户。如果输出包含 base64 图片数据，使用 markdown 图片语法 `![描述](data:image/png;base64,...)` 展示。
+注意事项：
+- `--data-urlencode` 会自动处理特殊字符，prompt 中可以包含任何文字
+- 命令会返回生成结果的文本描述和文件路径
+- 如果返回包含图片文件路径，使用 Read 工具读取该文件路径来获取图片内容
+- 将结果直接呈现给用户
 """
 
     def _sync_backend_skills_to_directory(self, session: Session):
