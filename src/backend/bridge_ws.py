@@ -306,36 +306,30 @@ class BridgeWS:
 
         result = "".join(result_parts) or "(no output)"
 
-        # ★ 拦截 base64 图片数据：保存到临时文件，只返回文件路径
-        # 避免 2MB+ 的 base64 通过 CLI stdout 撑爆模型上下文
-        # 用字符串查找代替 regex（regex 对 2MB 数据有回溯/性能问题）
+        # ★ 拦截 base64 图片数据：保存到文件，只返回干净的 markdown 图片 URL
         import base64 as _b64
         from pathlib import Path as _Path
 
         _B64_MARKER = ";base64,"
+        saved_urls: list[str] = []
+
         while _B64_MARKER in result:
             marker_pos = result.find(_B64_MARKER)
-            # 往前找 ![
             img_start = result.rfind("![", 0, marker_pos)
             if img_start < 0:
                 break
-            # 找 (data:image/xxx
             paren_open = result.find("(data:", img_start)
             if paren_open < 0 or paren_open > marker_pos:
                 break
-            # 提取 mime
             mime_start = paren_open + len("(data:")
             mime = result[mime_start:marker_pos]
-            # base64 数据起始
             b64_start = marker_pos + len(_B64_MARKER)
-            # 找闭合 ) — base64 字符只有 A-Za-z0-9+/= 所以第一个 ) 就是结尾
             b64_end = result.find(")", b64_start)
             if b64_end < 0:
-                b64_end = len(result)  # 没闭合，取到末尾
+                b64_end = len(result)
             b64_data = result[b64_start:b64_end]
             end_pos = min(b64_end + 1, len(result))
 
-            # 保存图片文件
             ext = mime.split("/")[-1].replace("jpeg", "jpg") if "/" in mime else "png"
             try:
                 img_bytes = _b64.b64decode(b64_data)
@@ -344,15 +338,29 @@ class BridgeWS:
                 img_path = tmp_dir / f"{new_id()}.{ext}"
                 img_path.write_bytes(img_bytes)
                 img_url = f"http://127.0.0.1:{self._HTTP_API_PORT}/api/skill-images/{img_path.name}"
-                replacement = f"![生成图像]({img_url})"
+                saved_urls.append(img_url)
                 print(f"[bridge_ws] Saved skill image: {img_path} ({len(img_bytes)} bytes)",
                       file=sys.stderr, flush=True)
             except Exception as e:
-                replacement = f"[图片保存失败: {e}]"
                 print(f"[bridge_ws] Failed to save skill image: {e}",
                       file=sys.stderr, flush=True)
 
-            result = result[:img_start] + replacement + result[end_pos:]
+            result = result[:img_start] + result[end_pos:]
+
+        # ★ 清洗返回结果：去掉 DashScope 状态文本，只返回最精简的结果
+        # 避免模型从状态信息中推断文件路径或做多余操作
+        if saved_urls:
+            # 有图片生成时，只返回图片 markdown，不返回任何其他信息
+            img_tags = "\n".join(f"![生成图像]({url})" for url in saved_urls)
+            result = img_tags
+        else:
+            # 无图片时，去掉进度条/状态类文本
+            for noise in ["🎨 正在提交图像生成任务…", "✅ 生成完成，正在下载图片…",
+                          "⏳ 任务已提交，等待生成…"]:
+                result = result.replace(noise, "")
+            result = result.strip()
+
+        return 200, result
 
         return 200, result
 
