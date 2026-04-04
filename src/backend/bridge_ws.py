@@ -152,6 +152,129 @@ class BridgeWS:
         # ★ Skip rest flags: session_id → True if user selected "skip rest"
         self._skip_rest_sessions: set[str] = set()
 
+    # ── HTTP API（供 Backend Skill 的 SKILL.md 通过 curl 回调）─────
+
+    _HTTP_API_PORT = 44322  # Backend Skill HTTP 回调端口（WebSocket 端口 + 1）
+
+    async def start_http_api(self):
+        """启动轻量 HTTP server，供 Backend Skill 的 curl 回调。"""
+        server = await asyncio.start_server(
+            self._handle_http_connection, "127.0.0.1", self._HTTP_API_PORT,
+        )
+        print(f"[bridge_ws] HTTP API server started on http://127.0.0.1:{self._HTTP_API_PORT}",
+              file=sys.stderr, flush=True)
+        return server
+
+    async def _handle_http_connection(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+        """处理单个 HTTP 连接（极简 HTTP/1.1 解析）。"""
+        try:
+            # 读取请求行
+            request_line = await asyncio.wait_for(reader.readline(), timeout=30)
+            if not request_line:
+                writer.close()
+                return
+            request_str = request_line.decode("utf-8", errors="replace").strip()
+            parts = request_str.split(" ", 2)
+            if len(parts) < 2:
+                writer.close()
+                return
+            method, path = parts[0], parts[1]
+
+            # 读取 headers
+            content_length = 0
+            while True:
+                line = await asyncio.wait_for(reader.readline(), timeout=10)
+                if not line or line == b"\r\n" or line == b"\n":
+                    break
+                header = line.decode("utf-8", errors="replace").strip().lower()
+                if header.startswith("content-length:"):
+                    content_length = int(header.split(":", 1)[1].strip())
+
+            # 读取 body
+            body = b""
+            if content_length > 0:
+                body = await asyncio.wait_for(reader.readexactly(content_length), timeout=120)
+
+            # 路由
+            status, response_body = await self._route_http_api(method, path, body)
+
+            # 发送响应
+            response = (
+                f"HTTP/1.1 {status} OK\r\n"
+                f"Content-Type: text/plain; charset=utf-8\r\n"
+                f"Content-Length: {len(response_body.encode('utf-8'))}\r\n"
+                f"Connection: close\r\n"
+                f"\r\n"
+            ).encode("utf-8") + response_body.encode("utf-8")
+            writer.write(response)
+            await writer.drain()
+        except Exception as e:
+            print(f"[bridge_ws] HTTP API error: {e}", file=sys.stderr, flush=True)
+        finally:
+            writer.close()
+
+    async def _route_http_api(self, method: str, path: str, body: bytes) -> tuple[int, str]:
+        """路由 HTTP 请求到对应处理函数。"""
+        from urllib.parse import urlparse, parse_qs
+
+        parsed = urlparse(path)
+
+        if parsed.path == "/api/skill-call" and method == "POST":
+            try:
+                payload = json.loads(body.decode("utf-8"))
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                return 400, "Invalid JSON body"
+            return await self._handle_skill_call(payload)
+
+        if parsed.path == "/api/skill-call" and method == "GET":
+            params = parse_qs(parsed.query)
+            payload = {
+                "skill": (params.get("skill") or [""])[0],
+                "prompt": (params.get("prompt") or [""])[0],
+            }
+            return await self._handle_skill_call(payload)
+
+        return 404, "Not found"
+
+    async def _handle_skill_call(self, payload: dict) -> tuple[int, str]:
+        """执行 Backend Skill 调用。"""
+        skill_name = payload.get("skill", "")
+        prompt = payload.get("prompt", "")
+
+        if not skill_name:
+            return 400, "Missing 'skill' parameter"
+
+        skill_info = self._skill_store.get_skill(skill_name)
+        if not skill_info or not skill_info.get("backend"):
+            return 404, f"Backend skill '{skill_name}' not found"
+
+        target_backend_id = skill_info["backend"]
+        try:
+            target_backend = self._get_backend(target_backend_id)
+        except Exception as e:
+            return 500, f"Cannot create backend '{target_backend_id}': {e}"
+
+        result_parts: list[str] = []
+
+        def on_delta(delta: StreamDelta):
+            if delta.type == "text_delta" and delta.text:
+                result_parts.append(delta.text)
+
+        try:
+            await target_backend.send_message(
+                messages=[],
+                content=prompt or "(empty)",
+                images=None,
+                session_id=f"skill-call-{skill_name}",
+                message_id=new_id(),
+                on_delta=on_delta,
+            )
+        except Exception as e:
+            return 500, f"Skill execution error: {e}"
+
+        result = "".join(result_parts) or "(no output)"
+        return 200, result
+
     # ── WebSocket 基础设施 ───────────────────────────────────────
 
     async def _broadcast(self, msg: dict):
@@ -622,54 +745,6 @@ class BridgeWS:
 
         return extra_tools, skill_map if skill_map else None
 
-    def _build_mcp_skill_server_config(self, extra_tools: list[dict], skill_map: dict) -> dict:
-        """
-        为 CLI 类 backend 构建 MCP server 配置，启动 mcp_skill_server.py。
-        返回 MCP servers dict，可直接合并到 backend 的 mcp_servers 参数中。
-        """
-        import os as _os
-
-        # 构建 skills-json：包含工具定义 + 目标 backend 配置
-        skills_for_mcp: list[dict] = []
-        for tool_def in extra_tools:
-            tool_name = tool_def["name"]
-            mapping = skill_map.get(tool_name)
-            if not mapping:
-                continue
-            target_backend_id = mapping["backend_id"]
-            # 获取目标 backend 的配置并序列化
-            target_config = next((c for c in self._backend_configs if c.id == target_backend_id), None)
-            if not target_config:
-                print(f"[bridge_ws] Backend Skill '{tool_name}' target '{target_backend_id}' not found, skip",
-                      file=sys.stderr, flush=True)
-                continue
-            skills_for_mcp.append({
-                "name": tool_name,
-                "description": tool_def.get("description", ""),
-                "input_schema": tool_def.get("input_schema", {"type": "object", "properties": {}}),
-                "backend_config": target_config.to_dict(),
-            })
-
-        if not skills_for_mcp:
-            return {}
-
-        skills_json = json.dumps(skills_for_mcp, ensure_ascii=False)
-
-        # 定位 mcp_skill_server.py 的绝对路径
-        server_path = _os.path.abspath(
-            _os.path.join(_os.path.dirname(__file__), "mcp_skill_server.py")
-        )
-        # 确保 PYTHONPATH 包含项目根目录（src 的父目录）
-        project_root = _os.path.abspath(_os.path.join(_os.path.dirname(__file__), "..", ".."))
-
-        return {
-            "agent-with-u-backend-skills": {
-                "command": sys.executable,
-                "args": [server_path, "--skills-json", skills_json],
-                "env": {"PYTHONPATH": project_root},
-            }
-        }
-
     async def _execute_backend_skill(
         self, tool_name: str, tool_input: dict,
         skill_map: dict, session: Session, message_id: str,
@@ -721,6 +796,99 @@ class BridgeWS:
     # ═══════════════════════════════════════
     #  Session 能力绑定
     # ═══════════════════════════════════════
+    # ── Backend Skill SKILL.md 自动生成 ──────────────────────────────
+
+    def _generate_backend_skill_md(self, skill_name: str, skill_info: dict) -> str:
+        """
+        为 Backend Skill 生成可被 Claude CLI 原生发现的 SKILL.md。
+        Claude 通过 Skill 工具读取指令 → 用 Bash 执行 curl → 回调 HTTP API 端点。
+        """
+        description = skill_info.get("description", f"Backend Skill: {skill_name}")
+        input_schema = skill_info.get("inputSchema") or {}
+        port = self._HTTP_API_PORT
+
+        # 从 input_schema 提取参数说明
+        props = input_schema.get("properties", {})
+        param_hints = ""
+        if props:
+            lines = []
+            for pname, pdef in props.items():
+                pdesc = pdef.get("description", "")
+                lines.append(f"  - {pname}: {pdesc}" if pdesc else f"  - {pname}")
+            param_hints = "参数说明：\n" + "\n".join(lines) + "\n\n"
+
+        return f"""\
+---
+name: {skill_name}
+description: {description}
+---
+
+## Instructions
+
+{param_hints}当需要使用此能力时，用 Bash 工具执行以下 curl 命令（POST JSON），将 `<PROMPT>` 替换为实际的用户请求内容：
+
+```bash
+curl -s -X POST http://127.0.0.1:{port}/api/skill-call \\
+  -H "Content-Type: application/json" \\
+  -d '{{"skill": "{skill_name}", "prompt": "<PROMPT>"}}'
+```
+
+将命令输出的内容直接呈现给用户。如果输出包含 base64 图片数据，使用 markdown 图片语法 `![描述](data:image/png;base64,...)` 展示。
+"""
+
+    def _sync_backend_skills_to_directory(self, session: Session):
+        """
+        将 session 绑定的 Backend Skills 部署到 working_dir/.claude/skills/，
+        同时清理不再绑定的 Backend Skill。
+        """
+        from pathlib import Path as _Path
+
+        working_dir = session.working_dir
+        if not working_dir or working_dir == ".":
+            return
+
+        skills_dir = _Path(working_dir) / ".claude" / "skills"
+        abilities = session.abilities or {}
+        bound_skills = set(abilities.get("skills", []))
+
+        # 收集当前绑定中的 Backend Skills
+        deployed_backend_skills: set[str] = set()
+        for sname in bound_skills:
+            info = self._skill_store.get_skill(sname)
+            if not info or not info.get("backend"):
+                continue  # 传统 Skill，不管（由用户手动激活）
+            # 生成并部署 Backend Skill SKILL.md
+            content = self._generate_backend_skill_md(sname, info)
+            target = skills_dir / sname
+            target.mkdir(parents=True, exist_ok=True)
+            (target / "SKILL.md").write_text(content, encoding="utf-8")
+            deployed_backend_skills.add(sname)
+            print(f"[bridge_ws] Deployed Backend Skill '{sname}' → {target}",
+                  file=sys.stderr, flush=True)
+
+        # 清理不再绑定的 Backend Skill（只清理由系统生成的，通过检测内容中的 /api/skill-call 标记）
+        if skills_dir.exists():
+            for skill_dir in skills_dir.iterdir():
+                if not skill_dir.is_dir():
+                    continue
+                if skill_dir.name in deployed_backend_skills:
+                    continue  # 刚部署的，跳过
+                if skill_dir.name in bound_skills:
+                    continue  # 绑定的传统 Skill，不动
+                md_file = skill_dir / "SKILL.md"
+                if md_file.exists():
+                    content = md_file.read_text(encoding="utf-8")
+                    if "/api/skill-call" in content:
+                        # 是系统生成的 Backend Skill SKILL.md，解绑后清理
+                        md_file.unlink()
+                        try:
+                            if not any(skill_dir.iterdir()):
+                                skill_dir.rmdir()
+                        except Exception:
+                            pass
+                        print(f"[bridge_ws] Cleaned up unbound Backend Skill '{skill_dir.name}'",
+                              file=sys.stderr, flush=True)
+
     def _rpc_updateSessionAbilities(self, session_id: str, abilities_json: str) -> str:
         """绑定/解绑 skill 和 prompt 到 session。"""
         try:
@@ -737,6 +905,8 @@ class BridgeWS:
                 if p and p.get("content"):
                     parts.append(p["content"])
             session.constraints = "\n\n---\n\n".join(parts) if parts else None
+            # ★ Backend Skills：自动部署到 working_dir/.claude/skills/
+            self._sync_backend_skills_to_directory(session)
             self._active_sessions[session_id] = session
             self._session_store.save(session, async_=True)
             return json.dumps({"status": "ok"}, ensure_ascii=False)
@@ -1218,22 +1388,14 @@ class BridgeWS:
                     "skip_permissions": skip_permissions,
                     "on_permission_request": _on_permission_request,
                 }
+                # ★ API 类 backend：注入 Backend Skill 工具定义 + tool_use 回调
+                # CLI 类 backend：不需要注入，走原生 Skill 目录发现 + curl 回调
                 if extra_tools and skill_map:
                     from .anthropic_api import AnthropicAPIBackend
                     from .openai_compat import OpenAICompatibleBackend
-                    from .claude_agent import ClaudeAgentBackend
-                    from .claude_code import ClaudeCodeOfficialBackend
                     if isinstance(backend, (AnthropicAPIBackend, OpenAICompatibleBackend)):
-                        # API 类：注入 tools 参数 + tool_use 回调
                         _send_kwargs["extra_tools"] = extra_tools
                         _send_kwargs["on_tool_call"] = _on_tool_call
-                    elif isinstance(backend, (ClaudeAgentBackend, ClaudeCodeOfficialBackend)):
-                        # CLI 类：通过 MCP server 注入 Backend Skill 工具
-                        mcp_config = self._build_mcp_skill_server_config(extra_tools, skill_map)
-                        if mcp_config:
-                            _send_kwargs["extra_mcp_servers"] = mcp_config
-                            print(f"[bridge_ws] Injecting MCP Backend Skills for CLI backend",
-                                  file=sys.stderr, flush=True)
                 result = await backend.send_message(**_send_kwargs)
 
                 if use_agent_session and result.get("agentSessionId") != use_agent_session:

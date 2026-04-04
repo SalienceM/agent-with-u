@@ -69,7 +69,7 @@ class ClaudeCodeOfficialBackend(ModelBackend):
         return "claude"
 
     def _build_cmd(self, content: str, agent_session_id: Optional[str], cwd: str,
-                   stdin_mode: bool = False, extra_mcp_servers: Optional[dict] = None) -> list[str]:
+                   stdin_mode: bool = False) -> list[str]:
         import os as _os
         cmd = [self._resolve_cli()]
 
@@ -95,10 +95,8 @@ class ClaudeCodeOfficialBackend(ModelBackend):
         if skip_permissions:
             cmd.append("--dangerously-skip-permissions")
 
-        # ★ MCP servers：合并配置中的和 Backend Skill 动态注入的
-        mcp_servers = dict(getattr(self.config, "mcp_servers", None) or {})
-        if extra_mcp_servers:
-            mcp_servers.update(extra_mcp_servers)
+        # ★ MCP servers：写入临时配置文件，通过 --mcp-config 传给 CLI
+        mcp_servers = getattr(self.config, "mcp_servers", None)
         if mcp_servers:
             mcp_conf_dir = Path.home() / ".agent-with-u"
             mcp_conf_dir.mkdir(parents=True, exist_ok=True)
@@ -215,7 +213,6 @@ class ClaudeCodeOfficialBackend(ModelBackend):
         working_dir: Optional[str] = None,
         skip_permissions: Optional[bool] = None,
         on_permission_request: Optional[Callable[[PermissionRequest], Awaitable[bool]]] = None,
-        extra_mcp_servers: Optional[dict] = None,
     ) -> dict:
         self.clear_cancelled(session_id)
         _new_agent_sid: Optional[str] = agent_session_id
@@ -256,9 +253,7 @@ class ClaudeCodeOfficialBackend(ModelBackend):
             print(f"[OfficialBackend] images: {len(content_blocks) - 1} block(s), using stdin stream-json",
                   file=sys.stderr, flush=True)
 
-        cmd = self._build_cmd(content, agent_session_id, cwd,
-                              stdin_mode=bool(_stdin_data),
-                              extra_mcp_servers=extra_mcp_servers)
+        cmd = self._build_cmd(content, agent_session_id, cwd, stdin_mode=bool(_stdin_data))
         proc_env = self._build_env()
 
         auth_token = proc_env.get("ANTHROPIC_AUTH_TOKEN", "")
