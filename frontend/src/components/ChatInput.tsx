@@ -155,6 +155,40 @@ const ChatInputInner: React.FC<Props> = ({
   }, [onCompact]);
 
   // ═══════════════════════════════════════
+  //  ★ 图像尺寸选择器（DashScope 图像 backend）
+  // ═══════════════════════════════════════
+  const activeBackend = useMemo(() => backends.find(b => b.id === activeBackendId), [backends, activeBackendId]);
+  const isImageBackend = activeBackend?.type === 'dashscope-image';
+  const isImageBackendRef = useRef(false);
+  isImageBackendRef.current = isImageBackend;
+  const [imageSize, setImageSize] = useState('1:1');
+  const [showSizePicker, setShowSizePicker] = useState(false);
+  const imageSizeRef = useRef('1:1');
+  imageSizeRef.current = imageSize;
+  const sizePickerRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!showSizePicker) return;
+    const handler = (e: MouseEvent) => {
+      if (sizePickerRef.current && !sizePickerRef.current.contains(e.target as Node)) {
+        setShowSizePicker(false);
+      }
+    };
+    document.addEventListener('mousedown', handler);
+    return () => document.removeEventListener('mousedown', handler);
+  }, [showSizePicker]);
+
+  // 分辨率档位 → 比例 → 具体尺寸的映射
+  const SIZE_PRESETS: Record<string, { label: string; icon: string }> = {
+    '1:1': { label: '1:1', icon: '□' },
+    '16:9': { label: '16:9', icon: '▭' },
+    '9:16': { label: '9:16', icon: '▯' },
+    '4:3': { label: '4:3', icon: '▭' },
+    '3:4': { label: '3:4', icon: '▯' },
+    '3:2': { label: '3:2', icon: '▭' },
+    '2:3': { label: '2:3', icon: '▯' },
+  };
+
+  // ═══════════════════════════════════════
   //  ★ @ 文件选择器 helpers
   // ═══════════════════════════════════════
 
@@ -220,9 +254,13 @@ const ChatInputInner: React.FC<Props> = ({
 
   // ── 发送 ──
   const handleSend = useCallback(() => {
-    const text = ref.current?.value.trim() || '';
+    let text = ref.current?.value.trim() || '';
     const imgs = imagesRef.current;
     if (!text && imgs.length === 0) return;
+    // ★ 图像 backend：自动注入 --size 参数
+    if (isImageBackendRef.current && imageSizeRef.current && imageSizeRef.current !== '1:1' && text) {
+      text = `${text} --size ${imageSizeRef.current}`;
+    }
     onSendRef.current(text, imgs.length > 0 ? imgs : undefined);
     if (ref.current) {
       ref.current.value = '';
@@ -470,6 +508,63 @@ const ChatInputInner: React.FC<Props> = ({
           title="清理上下文"
           onClick={handleCompact}
         />
+        {/* ★ 图像尺寸选择器（仅 DashScope 图像 backend 显示） */}
+        {isImageBackend && (
+          <div ref={sizePickerRef} style={{ position: 'relative', display: 'inline-flex' }}>
+            <button
+              onClick={() => setShowSizePicker(v => !v)}
+              title="图片尺寸"
+              style={{
+                display: 'inline-flex', alignItems: 'center', gap: 4,
+                padding: '4px 10px', fontSize: 11, borderRadius: 6,
+                border: '1px solid var(--theme-border)', cursor: 'pointer',
+                background: 'var(--theme-bg-secondary)', color: 'var(--theme-text-muted)',
+                transition: 'all 0.15s', whiteSpace: 'nowrap',
+              }}
+            >
+              <span style={{ fontSize: 12 }}>{SIZE_PRESETS[imageSize]?.icon || '□'}</span>
+              <span>{imageSize}</span>
+            </button>
+            {showSizePicker && (
+              <div style={{
+                position: 'absolute', bottom: '100%', left: 0, marginBottom: 4,
+                padding: 8, borderRadius: 10,
+                background: 'var(--theme-bg-secondary)', border: '1px solid var(--theme-border)',
+                boxShadow: '0 4px 16px rgba(0,0,0,0.2)', zIndex: 200,
+                display: 'flex', flexDirection: 'column', gap: 6, minWidth: 200,
+              }}>
+                <div style={{ fontSize: 11, color: 'var(--theme-text-muted)', fontWeight: 600, padding: '0 4px' }}>
+                  画面比例
+                </div>
+                <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4 }}>
+                  {Object.entries(SIZE_PRESETS).map(([key, { label, icon }]) => (
+                    <button
+                      key={key}
+                      onClick={() => { setImageSize(key); setShowSizePicker(false); }}
+                      style={{
+                        padding: '5px 12px', fontSize: 12, borderRadius: 6, cursor: 'pointer',
+                        border: key === imageSize
+                          ? '1px solid var(--theme-accent)'
+                          : '1px solid var(--theme-border)',
+                        background: key === imageSize
+                          ? 'var(--theme-accent-bg)'
+                          : 'var(--theme-bg)',
+                        color: key === imageSize
+                          ? 'var(--theme-accent)'
+                          : 'var(--theme-text)',
+                        display: 'flex', alignItems: 'center', gap: 4,
+                        transition: 'all 0.12s',
+                      }}
+                    >
+                      <span style={{ fontSize: 10, opacity: 0.7 }}>{icon}</span>
+                      <span>{label}</span>
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
+        )}
       </div>
 
       <ImagePreview images={images} onRemove={removeImage} />
