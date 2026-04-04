@@ -270,8 +270,11 @@ class BridgeWS:
 
         skill_name = payload.get("skill", "")
         prompt = payload.get("prompt", "")
+        ref_image = payload.get("ref_image", "")  # 可选：参考图 URL
 
-        print(f"[bridge_ws] skill-call: skill={skill_name!r}, prompt={prompt!r}",
+        _ref_preview = repr(ref_image[:80]) if ref_image else "None"
+        print(f"[bridge_ws] skill-call: skill={skill_name!r}, prompt={prompt!r}, "
+              f"ref_image={_ref_preview}",
               file=sys.stderr, flush=True)
 
         if not skill_name:
@@ -287,6 +290,39 @@ class BridgeWS:
         except Exception as e:
             return 500, f"Cannot create backend '{target_backend_id}': {e}"
 
+        # ★ 处理参考图：从 HTTP URL 或本地 skill-images 加载
+        ref_images: Optional[list[ImageAttachment]] = None
+        if ref_image:
+            try:
+                img_b64 = ""
+                mime = "image/png"
+                if ref_image.startswith("http://127.0.0.1"):
+                    # 本地 skill-images URL — 直接读文件
+                    filename = ref_image.split("/api/skill-images/")[-1] if "/api/skill-images/" in ref_image else ""
+                    if filename:
+                        img_path = _Path.home() / ".agent-with-u" / "skill-images" / filename
+                        if img_path.exists():
+                            img_b64 = _b64.b64encode(img_path.read_bytes()).decode("ascii")
+                            ext = img_path.suffix.lstrip(".").lower()
+                            mime = f"image/{'jpeg' if ext == 'jpg' else ext}"
+                if not img_b64 and ref_image.startswith("http"):
+                    # 远程 URL — 下载
+                    import httpx as _httpx
+                    async with _httpx.AsyncClient(timeout=60) as hc:
+                        resp = await hc.get(ref_image)
+                        if resp.status_code == 200:
+                            img_b64 = _b64.b64encode(resp.content).decode("ascii")
+                            mime = resp.headers.get("content-type", "image/png").split(";")[0]
+                if img_b64:
+                    ref_images = [ImageAttachment(
+                        id=new_id(), base64=img_b64, mime_type=mime,
+                    )]
+                    print(f"[bridge_ws] skill-call: loaded ref_image ({len(img_b64)} chars b64)",
+                          file=sys.stderr, flush=True)
+            except Exception as e:
+                print(f"[bridge_ws] skill-call: failed to load ref_image: {e}",
+                      file=sys.stderr, flush=True)
+
         result_parts: list[str] = []
 
         def on_delta(delta: StreamDelta):
@@ -297,7 +333,7 @@ class BridgeWS:
             await target_backend.send_message(
                 messages=[],
                 content=prompt or "(empty)",
-                images=None,
+                images=ref_images,
                 session_id=f"skill-call-{skill_name}",
                 message_id=new_id(),
                 on_delta=on_delta,
@@ -911,24 +947,38 @@ class BridgeWS:
         return f"""\
 ---
 name: {skill_name}
-description: {description}
+description: {description}。也支持基于已有图片进行修改（图生图）。
 ---
 
 ## Instructions
 
-{param_hints}当需要使用此能力时，用 Bash 工具执行以下 Python 命令，将 `<PROMPT>` 替换为实际的用户请求内容：
+{param_hints}当需要使用此能力时，用 Bash 工具执行以下 Python 命令。
+
+### 纯文本生图（无参考图）
+
+将 `<PROMPT>` 替换为实际的描述内容：
 
 ```bash
 python3 -c "import urllib.request,json;d=json.dumps({{'skill':'{skill_name}','prompt':'<PROMPT>'}}).encode();r=urllib.request.Request('http://127.0.0.1:{port}/api/skill-call',d,{{'Content-Type':'application/json'}});print(urllib.request.urlopen(r,timeout=300).read().decode())"
 ```
 
+### 图生图（基于参考图修改）
+
+当用户要求修改已有图片时，在参数中加入 `ref_image` 字段，值为图片的 HTTP URL：
+- 对话中之前生成的图片：使用 `http://127.0.0.1:{port}/api/skill-images/xxx.png` 格式的 URL
+- 用户上传的图片：消息中会标注 `[用户上传图片 URL: http://...]`，使用该 URL
+
+```bash
+python3 -c "import urllib.request,json;d=json.dumps({{'skill':'{skill_name}','prompt':'<PROMPT>','ref_image':'<IMAGE_URL>'}}).encode();r=urllib.request.Request('http://127.0.0.1:{port}/api/skill-call',d,{{'Content-Type':'application/json'}});print(urllib.request.urlopen(r,timeout=300).read().decode())"
+```
+
 注意：如果 python3 不可用，尝试用 python 替代。
 
 重要规则：
-- prompt 直接用用户的原始语言，放在上面命令的 `<PROMPT>` 位置
+- prompt 直接用用户的原始语言
 - **只调用一次**，不要因为结果不完美而重试
-- 命令输出中如果包含 `![...](http://...)` 格式的图片，直接将该 markdown 原样输出给用户即可
-- 不要尝试用 Read 工具读取图片文件
+- 命令输出中包含 `![...](http://...)` 格式的图片，**直接原样输出**给用户
+- **不要**用 Read 工具读取图片文件
 """
 
     def _sync_backend_skills_to_directory(self, session: Session):
@@ -1275,6 +1325,37 @@ python3 -c "import urllib.request,json;d=json.dumps({{'skill':'{skill_name}','pr
             session.agent_session_id = None
 
         session.auto_continue = auto_continue
+
+        # ★ 用户贴图 + session 有 Backend Skill 时：
+        #   保存图片到 skill-images 并在 content 中注入 HTTP URL，
+        #   让模型知道可以把这些 URL 作为 ref_image 传给 skill
+        if images and session.abilities and session.abilities.get("skills"):
+            import base64 as _b64
+            from pathlib import Path as _Path
+            has_backend_skill = any(
+                (self._skill_store.get_skill(s) or {}).get("backend")
+                for s in session.abilities["skills"]
+            )
+            if has_backend_skill:
+                img_urls = []
+                for img in images:
+                    if img.base64:
+                        try:
+                            tmp_dir = _Path.home() / ".agent-with-u" / "skill-images"
+                            tmp_dir.mkdir(parents=True, exist_ok=True)
+                            ext = img.mime_type.split("/")[-1].replace("jpeg", "jpg")
+                            img_path = tmp_dir / f"user-{new_id()}.{ext}"
+                            img_path.write_bytes(_b64.b64decode(img.base64))
+                            url = f"http://127.0.0.1:{self._HTTP_API_PORT}/api/skill-images/{img_path.name}"
+                            img_urls.append(url)
+                        except Exception as e:
+                            print(f"[bridge_ws] Failed to save user image: {e}",
+                                  file=sys.stderr, flush=True)
+                if img_urls:
+                    url_note = "\n".join(f"[用户上传图片 URL: {u}]" for u in img_urls)
+                    content = f"{url_note}\n\n{content}"
+                    print(f"[bridge_ws] Saved {len(img_urls)} user images for Backend Skill",
+                          file=sys.stderr, flush=True)
 
         user_msg = ChatMessage(id=new_id(), role="user", content=content, images=images)
         session.messages.append(user_msg)

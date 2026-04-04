@@ -155,9 +155,25 @@ class DashScopeImageBackend(ModelBackend):
             if negative_prompt:
                 input_body["negative_prompt"] = negative_prompt
         else:  # "messages"
+            # ★ 构建 content blocks：支持参考图（图生图 / image-to-image）
+            content_blocks: list[dict] = []
+            if images:
+                for img in images:
+                    img_b64 = img.base64
+                    if not img_b64 and img.file_path:
+                        import base64 as _b64
+                        try:
+                            with open(img.file_path, "rb") as f:
+                                img_b64 = _b64.b64encode(f.read()).decode("ascii")
+                        except Exception:
+                            pass
+                    if img_b64:
+                        # DashScope 接受 data URI 或纯 URL
+                        content_blocks.append({"image": f"data:{img.mime_type};base64,{img_b64}"})
+            content_blocks.append({"text": prompt})
             input_body = {
                 "messages": [
-                    {"role": "user", "content": [{"text": prompt}]}
+                    {"role": "user", "content": content_blocks}
                 ]
             }
 
@@ -180,7 +196,9 @@ class DashScopeImageBackend(ModelBackend):
         if is_async:
             headers["X-DashScope-Async"] = "enable"
 
-        print(f"[DashScope] POST {endpoint}  model={model}  fmt={input_fmt}  async={is_async}", file=sys.stderr, flush=True)
+        _ref_count = len(images) if images else 0
+        print(f"[DashScope] POST {endpoint}  model={model}  fmt={input_fmt}  async={is_async}  ref_images={_ref_count}",
+              file=sys.stderr, flush=True)
 
         try:
             async with httpx.AsyncClient(timeout=120.0) as client:
