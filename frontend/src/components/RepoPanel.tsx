@@ -81,6 +81,47 @@ function setSkillBackend(content: string, backendId: string): string {
 }
 
 // ═══════════════════════════════════════
+//  内置 Skill 类型注册表
+// ═══════════════════════════════════════
+interface SkillTypePreset {
+  id: string;
+  icon: string;
+  label: string;
+  description: string;
+  backendType: string;  // 匹配 backend.type
+  template: (backendId: string) => { name: string; content: string };
+}
+
+const SKILL_TYPE_PRESETS: SkillTypePreset[] = [
+  {
+    id: 'image-generation',
+    icon: '🎨',
+    label: '图像生成',
+    description: '文生图 / 图生图，支持尺寸和参考图',
+    backendType: 'dashscope-image',
+    template: (backendId) => ({
+      name: 'generate-image',
+      content: [
+        '---',
+        'name: generate-image',
+        'description: 生成图片。当用户要求画图、生成图像、创建插画时调用此 Skill。',
+        `backend: ${backendId}`,
+        'input_schema:',
+        '  type: object',
+        '  properties:',
+        '    prompt:',
+        '      type: string',
+        '      description: 图片内容的详细描述',
+        '  required:',
+        '    - prompt',
+        '---',
+      ].join('\n'),
+    }),
+  },
+  // 未来扩展：语音合成、数据分析等
+];
+
+// ═══════════════════════════════════════
 //  RepoPanel — Skill + Prompt 仓库面板
 // ═══════════════════════════════════════
 export const RepoPanel: React.FC<Props> = ({ open, workingDir, onClose }) => {
@@ -95,7 +136,9 @@ export const RepoPanel: React.FC<Props> = ({ open, workingDir, onClose }) => {
   const [showIconPicker, setShowIconPicker] = useState(false);
   const [saving, setSaving] = useState(false);
   // Backend Skill：后端列表（用于下拉选择）
-  const [backends, setBackends] = useState<{ id: string; label: string }[]>([]);
+  const [backends, setBackends] = useState<{ id: string; label: string; type?: string }[]>([]);
+  // 新建 Skill 时的类型选择
+  const [showSkillTypeSelector, setShowSkillTypeSelector] = useState(false);
   // 删除二次确认
   const [deleteConfirm, setDeleteConfirm] = useState<{ type: 'skill' | 'prompt'; name: string } | null>(null);
   const nameRef = useRef<HTMLInputElement>(null);
@@ -108,7 +151,7 @@ export const RepoPanel: React.FC<Props> = ({ open, workingDir, onClose }) => {
     ]);
     setSkills(sk || []);
     setPrompts(pr || []);
-    setBackends((bks || []).map((b: any) => ({ id: b.id, label: b.label || b.id })));
+    setBackends((bks || []).map((b: any) => ({ id: b.id, label: b.label || b.id, type: b.type })));
   }, [workingDir]);
 
   useEffect(() => {
@@ -268,7 +311,7 @@ export const RepoPanel: React.FC<Props> = ({ open, workingDir, onClose }) => {
         <div style={{ ...columnStyle, borderRight: '1px solid var(--theme-border)', paddingRight: 24 }}>
           <div style={{ ...columnHeaderStyle, border: 'none', padding: 0 }}>
             <span>⚡ Skills</span>
-            <button onClick={() => openEditor('skill')} style={addBtnStyle} title="新建 Skill">＋</button>
+            <button onClick={() => setShowSkillTypeSelector(true)} style={addBtnStyle} title="新建 Skill">＋</button>
           </div>
           <div style={cardGridStyle}>
             {skills.map(s => (
@@ -312,6 +355,84 @@ export const RepoPanel: React.FC<Props> = ({ open, workingDir, onClose }) => {
           </div>
         </div>
       </div>
+
+      {/* ── 新建 Skill 类型选择器 ── */}
+      {showSkillTypeSelector && (
+        <div style={deleteOverlayStyle} onClick={() => setShowSkillTypeSelector(false)}>
+          <div style={{ ...deleteDialogStyle, width: 380 }} onClick={e => e.stopPropagation()}>
+            <h3 style={{ margin: '0 0 12px 0', fontSize: 14, fontWeight: 600, color: 'var(--theme-text)' }}>
+              新建 Skill
+            </h3>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+              {/* 系统增强型：根据可用 backend 显示 */}
+              {SKILL_TYPE_PRESETS.map(preset => {
+                const matchingBackends = backends.filter(b => b.type === preset.backendType);
+                if (matchingBackends.length === 0) return null;
+                return (
+                  <div key={preset.id} style={{
+                    padding: '10px 12px', borderRadius: 8, cursor: 'pointer',
+                    border: '1px solid var(--theme-border)', background: 'var(--theme-bg)',
+                    transition: 'all 0.12s',
+                  }}
+                    onMouseEnter={e => { e.currentTarget.style.borderColor = 'var(--theme-accent)'; }}
+                    onMouseLeave={e => { e.currentTarget.style.borderColor = 'var(--theme-border)'; }}
+                  >
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6 }}>
+                      <span style={{ fontSize: 18 }}>{preset.icon}</span>
+                      <span style={{ fontSize: 13, fontWeight: 600, color: 'var(--theme-text)' }}>{preset.label}</span>
+                      <span style={{ fontSize: 10, padding: '1px 6px', borderRadius: 4, background: 'var(--theme-accent-bg)', color: 'var(--theme-accent)' }}>系统增强</span>
+                    </div>
+                    <div style={{ fontSize: 11, color: 'var(--theme-text-muted)', marginBottom: 8 }}>{preset.description}</div>
+                    <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4 }}>
+                      {matchingBackends.map(b => (
+                        <button
+                          key={b.id}
+                          onClick={() => {
+                            const { name, content } = preset.template(b.id);
+                            setShowSkillTypeSelector(false);
+                            openEditor('skill');
+                            // 延迟设置，确保 editor 已打开
+                            setTimeout(() => { setEditingName(name); setEditingContent(content); }, 0);
+                          }}
+                          style={{
+                            padding: '4px 10px', fontSize: 11, borderRadius: 5, cursor: 'pointer',
+                            border: '1px solid var(--theme-border)', background: 'var(--theme-bg-secondary)',
+                            color: 'var(--theme-text)', transition: 'all 0.12s',
+                          }}
+                        >
+                          {b.label}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                );
+              })}
+              {/* 自定义 Skill */}
+              <div
+                style={{
+                  padding: '10px 12px', borderRadius: 8, cursor: 'pointer',
+                  border: '1px dashed var(--theme-border)', background: 'var(--theme-bg)',
+                  transition: 'all 0.12s',
+                }}
+                onClick={() => { setShowSkillTypeSelector(false); openEditor('skill'); }}
+                onMouseEnter={e => { e.currentTarget.style.borderColor = 'var(--theme-accent)'; }}
+                onMouseLeave={e => { e.currentTarget.style.borderColor = 'var(--theme-border)'; }}
+              >
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                  <span style={{ fontSize: 18 }}>📋</span>
+                  <div>
+                    <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--theme-text)' }}>自定义 Skill</div>
+                    <div style={{ fontSize: 11, color: 'var(--theme-text-muted)' }}>自行编写 SKILL.md 指令内容</div>
+                  </div>
+                </div>
+              </div>
+            </div>
+            <div style={{ marginTop: 12, display: 'flex', justifyContent: 'flex-end' }}>
+              <button onClick={() => setShowSkillTypeSelector(false)} style={cancelBtnStyle}>取消</button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* 删除二次确认对话框 */}
       {deleteConfirm && (
