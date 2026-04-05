@@ -220,6 +220,52 @@ class BridgeWS:
         except Exception as e:
             return 500, f"搜索失败: {e}"
 
+    async def _builtin_web_fetch(self, url: str) -> tuple[int, str]:
+        """内置 URL 内容抓取，替代 Claude 的 WebFetch（第三方模型不兼容）。"""
+        import re as _re
+        if not url or not url.startswith("http"):
+            return 400, "请提供有效的 URL"
+        print(f"[bridge_ws] builtin web-fetch: url={url[:100]}", file=sys.stderr, flush=True)
+        try:
+            import httpx as _httpx
+            import urllib.request as _ur
+            proxy_url = None
+            try:
+                proxy_url = _ur.getproxies().get("https") or _ur.getproxies().get("http")
+            except Exception:
+                pass
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
+            }
+            client_kwargs: dict = {"timeout": 30.0, "follow_redirects": True}
+            if proxy_url:
+                client_kwargs["proxy"] = proxy_url
+            async with _httpx.AsyncClient(**client_kwargs) as client:
+                resp = await client.get(url, headers=headers)
+                if resp.status_code != 200:
+                    return 500, f"抓取失败: HTTP {resp.status_code}"
+                html = resp.text
+            # 提取正文文本：去掉 script/style/nav/header/footer，保留 body 文本
+            # 去除 script 和 style 块
+            text = _re.sub(r'<script[^>]*>.*?</script>', '', html, flags=_re.DOTALL | _re.IGNORECASE)
+            text = _re.sub(r'<style[^>]*>.*?</style>', '', text, flags=_re.DOTALL | _re.IGNORECASE)
+            text = _re.sub(r'<nav[^>]*>.*?</nav>', '', text, flags=_re.DOTALL | _re.IGNORECASE)
+            text = _re.sub(r'<header[^>]*>.*?</header>', '', text, flags=_re.DOTALL | _re.IGNORECASE)
+            text = _re.sub(r'<footer[^>]*>.*?</footer>', '', text, flags=_re.DOTALL | _re.IGNORECASE)
+            # 去除所有 HTML 标签
+            text = _re.sub(r'<[^>]+>', ' ', text)
+            # 清理空白
+            text = _re.sub(r'\s+', ' ', text).strip()
+            # 截断避免过长
+            if len(text) > 8000:
+                text = text[:8000] + "\n\n...(内容已截断)"
+            if not text:
+                return 200, "页面内容为空或无法解析。"
+            print(f"[bridge_ws] web-fetch result: {len(text)} chars", file=sys.stderr, flush=True)
+            return 200, text
+        except Exception as e:
+            return 500, f"抓取失败: {e}"
+
     # ── HTTP API（供 Backend Skill 的 SKILL.md 通过 curl 回调）─────
 
     _HTTP_API_PORT = 44322  # Backend Skill HTTP 回调端口（WebSocket 端口 + 1）
@@ -357,6 +403,9 @@ class BridgeWS:
         skill_type = skill_info.get("type", "")
         if skill_type == "web-search":
             return await self._builtin_web_search(prompt)
+        if skill_type == "web-fetch":
+            url = payload.get("url", "") or prompt
+            return await self._builtin_web_fetch(url)
 
         # Backend Skill：路由到目标 backend
         if not skill_info.get("backend"):
@@ -1018,14 +1067,16 @@ class BridgeWS:
         python = sys.executable.replace("\\", "/")
         call_script = f".claude/skills/{skill_name}/_call.py"
 
-        # 从 input_schema 提取参数列表（prompt 之外的可选参数）
+        # 从 input_schema 提取参数列表
         props = input_schema.get("properties", {})
-        required = set(input_schema.get("required", []))
+        required_list = input_schema.get("required", [])
+        required = set(required_list)
+        primary_field = required_list[0] if required_list else (list(props.keys())[0] if props else "prompt")
         # 构建参数说明和命令示例
         args_doc: list[str] = []
-        args_example: list[str] = ['"<PROMPT>"']
+        args_example: list[str] = [f'"<{primary_field.upper()}>"']
         for pname, pdef in props.items():
-            if pname == "prompt":
+            if pname == primary_field:
                 continue
             pdesc = pdef.get("description", pname)
             is_req = pname in required
@@ -1034,7 +1085,7 @@ class BridgeWS:
             args_example.append(f'"<{pname.upper()}>"')
 
         # 基本命令
-        basic_cmd = f'"{python}" {call_script} "<PROMPT>"'
+        basic_cmd = f'"{python}" {call_script} "<{primary_field.upper()}>"'
         # 完整命令（含可选参数）
         full_cmd = f'"{python}" {call_script} {" ".join(args_example)}'
 
@@ -1065,8 +1116,10 @@ description: {description}
         port = self._HTTP_API_PORT
         input_schema = skill_info.get("inputSchema") or {}
         props = input_schema.get("properties", {})
-        # 按顺序：prompt 是 argv[1]，其他参数依次 argv[2], argv[3]...
-        extra_params = [p for p in props if p != "prompt"]
+        required = input_schema.get("required", [])
+        # 第一个必填参数作为 argv[1]，其他依次 argv[2], argv[3]...
+        primary_field = required[0] if required else (list(props.keys())[0] if props else "prompt")
+        extra_params = [p for p in props if p != primary_field]
 
         extra_lines = ""
         for i, pname in enumerate(extra_params, 2):
@@ -1074,7 +1127,7 @@ description: {description}
 
         return f'''\
 import sys, json, urllib.request
-payload = {{"skill": "{skill_name}", "prompt": sys.argv[1] if len(sys.argv) > 1 else ""}}
+payload = {{"skill": "{skill_name}", "{primary_field}": sys.argv[1] if len(sys.argv) > 1 else ""}}
 {extra_lines}data = json.dumps(payload).encode()
 req = urllib.request.Request("http://127.0.0.1:{port}/api/skill-call", data, {{"Content-Type": "application/json"}})
 result = urllib.request.urlopen(req, timeout=300).read()
@@ -1496,7 +1549,8 @@ sys.stdout.buffer.flush()
         # ── 内置 Skill 类型屏蔽对应的内置工具 ──
         # 避免 Claude 的原生工具（如 WebSearch）抢先于自定义 Skill
         _BUILTIN_TOOL_BLOCKLIST: dict[str, list[str]] = {
-            "web-search": ["WebSearch"],  # 只屏蔽搜索，保留 WebFetch 用于抓取搜索结果内容
+            "web-search": ["WebSearch"],
+            "web-fetch": ["WebFetch"],
         }
         abilities = session.abilities or {}
         blocked_tools: set[str] = set()
@@ -1645,11 +1699,13 @@ sys.stdout.buffer.flush()
 
                 # ★ 内置 Skill 工具屏蔽指令：告诉模型不要使用被替代的原生工具
                 if blocked_tools:
-                    block_instruction = (
-                        f"[工具限制] 禁止使用以下内置工具：{', '.join(blocked_tools)}。"
-                        f"如需搜索网页，必须使用 Skill 工具调用 web-search 技能，按其指令用 Bash 执行命令。"
-                        f"搜索返回结果后，可以使用 WebFetch 工具抓取具体网页内容来获取详细信息。"
-                    )
+                    parts = [f"[工具限制] 禁止使用以下内置工具：{', '.join(blocked_tools)}。"]
+                    if "WebSearch" in blocked_tools:
+                        parts.append("搜索网页请使用 Skill: web-search 技能。")
+                    if "WebFetch" in blocked_tools:
+                        parts.append("抓取网页内容请使用 Skill: web-fetch 技能。")
+                    parts.append("按 Skill 指令用 Bash 执行命令即可。")
+                    block_instruction = "".join(parts)
                     send_content = f"{block_instruction}\n\n{send_content}"
 
                 use_agent_session = session.agent_session_id

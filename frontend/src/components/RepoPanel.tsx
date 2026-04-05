@@ -144,6 +144,31 @@ const SKILL_TYPE_PRESETS: SkillTypePreset[] = [
       ].join('\n'),
     }),
   },
+  {
+    id: 'web-fetch',
+    icon: '📄',
+    label: '网页抓取',
+    description: '抓取 URL 页面内容并提取正文，免费，无需配置',
+    builtin: true,
+    template: () => ({
+      name: 'web-fetch',
+      content: [
+        '---',
+        'name: web-fetch',
+        'description: 当需要获取某个网页URL的具体内容时调用。传入URL，返回页面正文文本。',
+        'type: web-fetch',
+        'input_schema:',
+        '  type: object',
+        '  properties:',
+        '    url:',
+        '      type: string',
+        '      description: 要抓取的网页URL',
+        '  required:',
+        '    - url',
+        '---',
+      ].join('\n'),
+    }),
+  },
 ];
 
 // ═══════════════════════════════════════
