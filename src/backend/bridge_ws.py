@@ -1493,7 +1493,7 @@ print(urllib.request.urlopen(req, timeout=300).read().decode())
         # ── 内置 Skill 类型屏蔽对应的内置工具 ──
         # 避免 Claude 的原生工具（如 WebSearch）抢先于自定义 Skill
         _BUILTIN_TOOL_BLOCKLIST: dict[str, list[str]] = {
-            "web-search": ["WebSearch", "WebFetch"],
+            "web-search": ["WebSearch"],  # 只屏蔽搜索，保留 WebFetch 用于抓取搜索结果内容
         }
         abilities = session.abilities or {}
         blocked_tools: set[str] = set()
@@ -1645,6 +1645,7 @@ print(urllib.request.urlopen(req, timeout=300).read().decode())
                     block_instruction = (
                         f"[工具限制] 禁止使用以下内置工具：{', '.join(blocked_tools)}。"
                         f"如需搜索网页，必须使用 Skill 工具调用 web-search 技能，按其指令用 Bash 执行命令。"
+                        f"搜索返回结果后，可以使用 WebFetch 工具抓取具体网页内容来获取详细信息。"
                     )
                     send_content = f"{block_instruction}\n\n{send_content}"
 
