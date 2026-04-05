@@ -947,7 +947,7 @@ description: {description}
 
 ## Instructions
 
-用 Bash 执行以下命令，将引号内的内容替换为实际值。
+**重要：读完本指令后，必须使用 Bash 工具执行下方命令来完成任务。本 Skill 通过命令行调用后端服务生成结果。**
 
 生成图片：
 ```bash

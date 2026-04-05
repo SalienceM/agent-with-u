@@ -46,7 +46,11 @@ def setup_logging() -> Path:
         datefmt="%Y-%m-%d %H:%M:%S",
     )
     root = logging.getLogger()
-    root.setLevel(logging.DEBUG)
+    root.setLevel(logging.INFO)
+
+    # 第三方库日志降噪
+    for noisy in ("websockets", "httpx", "httpcore", "urllib3", "asyncio"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
 
     fh = RotatingFileHandler(log_file, maxBytes=1_000_000, backupCount=3, encoding="utf-8")
     fh.setFormatter(fmt)
