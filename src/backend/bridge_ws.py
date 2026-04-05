@@ -1479,11 +1479,8 @@ print(urllib.request.urlopen(req, timeout=300).read().decode())
             if info and info.get("type"):
                 for tool in _BUILTIN_TOOL_BLOCKLIST.get(info["type"], []):
                     blocked_tools.add(tool)
-        _original_allowed_tools = None
-        if blocked_tools and hasattr(backend, 'config') and backend.config.allowed_tools:
-            _original_allowed_tools = list(backend.config.allowed_tools)
-            backend.config.allowed_tools = [t for t in _original_allowed_tools if t not in blocked_tools]
-            print(f"[bridge_ws] Blocked native tools: {blocked_tools}", file=sys.stderr, flush=True)
+        if blocked_tools:
+            print(f"[bridge_ws] Skill-blocked native tools: {blocked_tools}", file=sys.stderr, flush=True)
 
         async def _on_tool_call(tool_name: str, tool_input: dict) -> str:
             """Backend Skill 工具调用回调。"""
@@ -1620,6 +1617,14 @@ print(urllib.request.urlopen(req, timeout=300).read().decode())
                 if constraints and constraints.strip():
                     send_content = f"[会话约束/规则]\n{constraints.strip()}\n\n---\n\n{send_content}"
 
+                # ★ 内置 Skill 工具屏蔽指令：告诉模型不要使用被替代的原生工具
+                if blocked_tools:
+                    block_instruction = (
+                        f"[工具限制] 禁止使用以下内置工具：{', '.join(blocked_tools)}。"
+                        f"如需搜索网页，必须使用 Skill 工具调用 web-search 技能，按其指令用 Bash 执行命令。"
+                    )
+                    send_content = f"{block_instruction}\n\n{send_content}"
+
                 use_agent_session = session.agent_session_id
 
                 # ★ 权限回调：用于工具执行前的权限确认
@@ -1743,9 +1748,6 @@ print(urllib.request.urlopen(req, timeout=300).read().decode())
         finally:
             # ★ 确保 skip_rest 标志始终被清除，即使异常路径也不泄漏
             self._clear_skip_permission(session.id)
-            # ★ 恢复被屏蔽的内置工具
-            if _original_allowed_tools is not None:
-                backend.config.allowed_tools = _original_allowed_tools
 
         session.updated_at = time.time()
         if session.title in ("新会话", "New session", "") and content:
