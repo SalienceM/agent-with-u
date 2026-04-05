@@ -1077,7 +1077,10 @@ import sys, json, urllib.request
 payload = {{"skill": "{skill_name}", "prompt": sys.argv[1] if len(sys.argv) > 1 else ""}}
 {extra_lines}data = json.dumps(payload).encode()
 req = urllib.request.Request("http://127.0.0.1:{port}/api/skill-call", data, {{"Content-Type": "application/json"}})
-print(urllib.request.urlopen(req, timeout=300).read().decode())
+result = urllib.request.urlopen(req, timeout=300).read()
+sys.stdout.buffer.write(result)
+sys.stdout.buffer.write(b"\\n")
+sys.stdout.buffer.flush()
 '''
 
     def _sync_backend_skills_to_directory(self, session: Session):
