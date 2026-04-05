@@ -1467,6 +1467,24 @@ print(urllib.request.urlopen(req, timeout=300).read().decode())
             print(f"[bridge_ws] Session {session.id}: {len(extra_tools)} Backend Skills detected: "
                   f"{[t['name'] for t in extra_tools]}", file=sys.stderr, flush=True)
 
+        # ── 内置 Skill 类型屏蔽对应的内置工具 ──
+        # 避免 Claude 的原生工具（如 WebSearch）抢先于自定义 Skill
+        _BUILTIN_TOOL_BLOCKLIST: dict[str, list[str]] = {
+            "web-search": ["WebSearch", "WebFetch"],
+        }
+        abilities = session.abilities or {}
+        blocked_tools: set[str] = set()
+        for sname in abilities.get("skills", []):
+            info = self._skill_store.get_skill(sname)
+            if info and info.get("type"):
+                for tool in _BUILTIN_TOOL_BLOCKLIST.get(info["type"], []):
+                    blocked_tools.add(tool)
+        _original_allowed_tools = None
+        if blocked_tools and hasattr(backend, 'config') and backend.config.allowed_tools:
+            _original_allowed_tools = list(backend.config.allowed_tools)
+            backend.config.allowed_tools = [t for t in _original_allowed_tools if t not in blocked_tools]
+            print(f"[bridge_ws] Blocked native tools: {blocked_tools}", file=sys.stderr, flush=True)
+
         async def _on_tool_call(tool_name: str, tool_input: dict) -> str:
             """Backend Skill 工具调用回调。"""
             return await self._execute_backend_skill(
@@ -1725,6 +1743,9 @@ print(urllib.request.urlopen(req, timeout=300).read().decode())
         finally:
             # ★ 确保 skip_rest 标志始终被清除，即使异常路径也不泄漏
             self._clear_skip_permission(session.id)
+            # ★ 恢复被屏蔽的内置工具
+            if _original_allowed_tools is not None:
+                backend.config.allowed_tools = _original_allowed_tools
 
         session.updated_at = time.time()
         if session.title in ("新会话", "New session", "") and content:
