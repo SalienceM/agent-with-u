@@ -104,7 +104,7 @@ const SKILL_TYPE_PRESETS: SkillTypePreset[] = [
       content: [
         '---',
         'name: generate-image',
-        'description: 生成图片。当用户要求画图、生成图像、创建插画时调用此 Skill。',
+        'description: 仅当用户明确要求画图、生成图像、创建插画时才调用。普通对话、问答、对比分析、写代码等文字类请求绝对不要调用此 Skill。',
         `backend: ${backendId}`,
         'input_schema:',
         '  type: object',
