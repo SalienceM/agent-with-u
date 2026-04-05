@@ -152,6 +152,51 @@ class BridgeWS:
         # ★ Skip rest flags: session_id → True if user selected "skip rest"
         self._skip_rest_sessions: set[str] = set()
 
+    # ── 内置 Skill 处理器 ─────────────────────────────────────────
+
+    async def _builtin_web_search(self, query: str) -> tuple[int, str]:
+        """内置 Bing 搜索，零配置。"""
+        import re as _re
+        if not query:
+            return 400, "搜索关键词为空"
+        print(f"[bridge_ws] builtin web-search: q={query!r}", file=sys.stderr, flush=True)
+        try:
+            import httpx as _httpx
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
+                "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+            }
+            async with _httpx.AsyncClient(timeout=30.0) as client:
+                resp = await client.get(
+                    "https://cn.bing.com/search",
+                    params={"q": query, "count": "8"},
+                    headers=headers,
+                    follow_redirects=True,
+                )
+                if resp.status_code != 200:
+                    return 500, f"Bing 搜索失败: HTTP {resp.status_code}"
+            # 解析搜索结果
+            blocks = _re.findall(r'<li class="b_algo">(.*?)</li>', resp.text, _re.DOTALL)
+            results: list[str] = []
+            for block in blocks[:8]:
+                title_m = _re.search(r'<h2><a[^>]*href="([^"]*)"[^>]*>(.*?)</a></h2>', block, _re.DOTALL)
+                if not title_m:
+                    continue
+                url = title_m.group(1)
+                title = _re.sub(r'<[^>]+>', '', title_m.group(2)).strip()
+                snippet = ""
+                snippet_m = _re.search(r'<p class="[^"]*">(.*?)</p>', block, _re.DOTALL)
+                if not snippet_m:
+                    snippet_m = _re.search(r'<div class="b_caption">\s*<p>(.*?)</p>', block, _re.DOTALL)
+                if snippet_m:
+                    snippet = _re.sub(r'<[^>]+>', '', snippet_m.group(1)).strip()
+                results.append(f"**{title}**\n{snippet}\n🔗 {url}")
+            if not results:
+                return 200, "未找到相关搜索结果。"
+            return 200, "\n\n".join(f"{i}. {r}" for i, r in enumerate(results, 1))
+        except Exception as e:
+            return 500, f"搜索失败: {e}"
+
     # ── HTTP API（供 Backend Skill 的 SKILL.md 通过 curl 回调）─────
 
     _HTTP_API_PORT = 44322  # Backend Skill HTTP 回调端口（WebSocket 端口 + 1）
@@ -282,8 +327,17 @@ class BridgeWS:
             return 400, "Missing 'skill' parameter"
 
         skill_info = self._skill_store.get_skill(skill_name)
-        if not skill_info or not skill_info.get("backend"):
-            return 404, f"Backend skill '{skill_name}' not found"
+        if not skill_info:
+            return 404, f"Skill '{skill_name}' not found"
+
+        # ★ 内置类型：直接处理，不走 backend 路由
+        skill_type = skill_info.get("type", "")
+        if skill_type == "web-search":
+            return await self._builtin_web_search(prompt)
+
+        # Backend Skill：路由到目标 backend
+        if not skill_info.get("backend"):
+            return 404, f"Skill '{skill_name}' has no backend or type"
 
         target_backend_id = skill_info["backend"]
         try:
@@ -1018,11 +1072,13 @@ print(urllib.request.urlopen(req, timeout=300).read().decode())
         abilities = session.abilities or {}
         bound_skills = set(abilities.get("skills", []))
 
-        # 收集当前绑定中的 Backend Skills
+        # 收集当前绑定中的系统增强型 Skills（有 backend 或 type 字段）
         deployed_backend_skills: set[str] = set()
         for sname in bound_skills:
             info = self._skill_store.get_skill(sname)
-            if not info or not info.get("backend"):
+            if not info:
+                continue
+            if not info.get("backend") and not info.get("type"):
                 continue  # 传统 Skill，由用户手动激活
             # 系统增强型：部署 SKILL.md + _call.py
             target = skills_dir / sname

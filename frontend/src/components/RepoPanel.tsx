@@ -88,8 +88,9 @@ interface SkillTypePreset {
   icon: string;
   label: string;
   description: string;
-  backendType: string;  // 匹配 backend.type
-  template: (backendId: string) => { name: string; content: string };
+  backendType?: string;  // 匹配 backend.type（需要选 backend 的类型）
+  builtin?: boolean;     // 内置类型，不需要选 backend
+  template: (backendId?: string) => { name: string; content: string };
 }
 
 const SKILL_TYPE_PRESETS: SkillTypePreset[] = [
@@ -122,15 +123,15 @@ const SKILL_TYPE_PRESETS: SkillTypePreset[] = [
     id: 'web-search',
     icon: '🔍',
     label: '网页搜索',
-    description: 'Bing 搜索，免费，国内可用',
-    backendType: 'web-search',
-    template: (backendId) => ({
+    description: 'Bing 搜索，免费，无需配置',
+    builtin: true,
+    template: () => ({
       name: 'web-search',
       content: [
         '---',
         'name: web-search',
-        'description: 仅当用户明确需要搜索网页、查找资料、获取最新信息时调用。普通对话和已知知识的问答不要调用。',
-        `backend: ${backendId}`,
+        'description: 仅当用户明确需要搜索网页、查找最新资料时调用。普通对话和已知知识的问答不要调用。',
+        'type: web-search',
         'input_schema:',
         '  type: object',
         '  properties:',
@@ -388,13 +389,15 @@ export const RepoPanel: React.FC<Props> = ({ open, workingDir, onClose }) => {
               新建 Skill
             </h3>
             <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-              {/* 系统增强型：根据可用 backend 显示 */}
+              {/* 系统增强型 */}
               {SKILL_TYPE_PRESETS.map(preset => {
-                const matchingBackends = backends.filter(b => b.type === preset.backendType);
-                if (matchingBackends.length === 0) return null;
+                const matchingBackends = preset.backendType
+                  ? backends.filter(b => b.type === preset.backendType) : [];
+                // 需要 backend 的类型：没有匹配 backend 就不显示
+                if (preset.backendType && matchingBackends.length === 0) return null;
                 return (
                   <div key={preset.id} style={{
-                    padding: '10px 12px', borderRadius: 8, cursor: 'pointer',
+                    padding: '10px 12px', borderRadius: 8,
                     border: '1px solid var(--theme-border)', background: 'var(--theme-bg)',
                     transition: 'all 0.12s',
                   }}
@@ -404,18 +407,36 @@ export const RepoPanel: React.FC<Props> = ({ open, workingDir, onClose }) => {
                     <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6 }}>
                       <span style={{ fontSize: 18 }}>{preset.icon}</span>
                       <span style={{ fontSize: 13, fontWeight: 600, color: 'var(--theme-text)' }}>{preset.label}</span>
-                      <span style={{ fontSize: 10, padding: '1px 6px', borderRadius: 4, background: 'var(--theme-accent-bg)', color: 'var(--theme-accent)' }}>系统增强</span>
+                      <span style={{ fontSize: 10, padding: '1px 6px', borderRadius: 4, background: 'var(--theme-accent-bg)', color: 'var(--theme-accent)' }}>
+                        {preset.builtin ? '内置' : '系统增强'}
+                      </span>
                     </div>
                     <div style={{ fontSize: 11, color: 'var(--theme-text-muted)', marginBottom: 8 }}>{preset.description}</div>
                     <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4 }}>
-                      {matchingBackends.map(b => (
+                      {preset.builtin ? (
+                        /* 内置类型：直接创建，不需要选 backend */
+                        <button
+                          onClick={() => {
+                            const { name, content } = preset.template();
+                            setShowSkillTypeSelector(false);
+                            openEditor('skill');
+                            setTimeout(() => { setEditingName(name); setEditingContent(content); }, 0);
+                          }}
+                          style={{
+                            padding: '4px 10px', fontSize: 11, borderRadius: 5, cursor: 'pointer',
+                            border: '1px solid var(--theme-accent)', background: 'var(--theme-accent-bg)',
+                            color: 'var(--theme-accent)', transition: 'all 0.12s',
+                          }}
+                        >
+                          创建
+                        </button>
+                      ) : matchingBackends.map(b => (
                         <button
                           key={b.id}
                           onClick={() => {
                             const { name, content } = preset.template(b.id);
                             setShowSkillTypeSelector(false);
                             openEditor('skill');
-                            // 延迟设置，确保 editor 已打开
                             setTimeout(() => { setEditingName(name); setEditingContent(content); }, 0);
                           }}
                           style={{

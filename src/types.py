@@ -16,7 +16,6 @@ class BackendType(str, Enum):
     OPENAI_COMPATIBLE = "openai-compatible"
     ANTHROPIC_API = "anthropic-api"
     DASHSCOPE_IMAGE = "dashscope-image"             # 阿里云 DashScope 文生图（万象/Wan 系列）
-    WEB_SEARCH = "web-search"                        # 网页搜索（Bing 爬取）
 
 
 @dataclass

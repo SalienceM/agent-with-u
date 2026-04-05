@@ -149,9 +149,11 @@ class SkillStore:
                     "projectActivations": [a for a in activations if a != "global"],
                     "description": fm.get("description", ""),
                 }
-                # Backend Skill 扩展字段
+                # Backend Skill / 内置类型扩展字段
                 if fm.get("backend"):
                     item["backend"] = fm["backend"]
+                if fm.get("type"):
+                    item["type"] = fm["type"]
                 if fm.get("input_schema"):
                     item["inputSchema"] = fm["input_schema"]
                 result.append(item)
@@ -174,6 +176,8 @@ class SkillStore:
             }
             if fm.get("backend"):
                 result["backend"] = fm["backend"]
+            if fm.get("type"):
+                result["type"] = fm["type"]
             if fm.get("input_schema"):
                 result["inputSchema"] = fm["input_schema"]
             return result
