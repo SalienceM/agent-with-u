@@ -155,14 +155,13 @@ class BridgeWS:
     # ── 内置 Skill 处理器 ─────────────────────────────────────────
 
     async def _builtin_web_search(self, query: str) -> tuple[int, str]:
-        """内置 Bing 搜索，零配置。"""
+        """内置网页搜索（DuckDuckGo HTML 版，纯服务端渲染，无 JS 依赖）。"""
         import re as _re
         if not query:
             return 400, "搜索关键词为空"
         print(f"[bridge_ws] builtin web-search: q={query!r}", file=sys.stderr, flush=True)
         try:
             import httpx as _httpx
-            # 检测系统代理
             import urllib.request as _ur
             proxy_url = None
             try:
@@ -172,63 +171,49 @@ class BridgeWS:
                 pass
             headers = {
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
-                "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
             }
             client_kwargs: dict = {"timeout": 30.0, "follow_redirects": True}
             if proxy_url:
                 client_kwargs["proxy"] = proxy_url
             async with _httpx.AsyncClient(**client_kwargs) as client:
-                resp = await client.get(
-                    "https://www.bing.com/search",
-                    params={"q": query},
+                resp = await client.post(
+                    "https://html.duckduckgo.com/html/",
+                    data={"q": query},
                     headers=headers,
                 )
                 if resp.status_code != 200:
-                    return 500, f"Bing 搜索失败: HTTP {resp.status_code}"
+                    return 500, f"搜索失败: HTTP {resp.status_code}"
                 html = resp.text
-            print(f"[bridge_ws] Bing response: {len(html)} chars, "
-                  f"b_algo={html.count('b_algo')}, b_results={html.count('b_results')}",
+            print(f"[bridge_ws] DuckDuckGo response: {len(html)} chars",
                   file=sys.stderr, flush=True)
-            # 定位结果区域
-            results_start = html.find('id="b_results"')
-            if results_start > 0:
-                sample = html[results_start:results_start+3000]
-                print(f"[bridge_ws] b_results section sample: {sample[:2000]}",
-                      file=sys.stderr, flush=True)
-            # 解析搜索结果 — 多种 HTML 结构适配
+            # DuckDuckGo HTML 结构：<div class="result ..."> 内含 <a class="result__a" href="...">标题</a> + <a class="result__snippet">摘要</a>
             results: list[str] = []
-            # 方式1: <li class="b_algo">
-            blocks = _re.findall(r'<li[^>]*class="b_algo"[^>]*>(.*?)</li>', html, _re.DOTALL)
+            blocks = _re.findall(r'<div[^>]*class="[^"]*result [^"]*"[^>]*>(.*?)</div>\s*</div>', html, _re.DOTALL)
             if not blocks:
-                # 方式2: 宽松匹配 — 任何包含 href 和文本的搜索结果块
-                blocks = _re.findall(r'<div class="b_title">(.*?)</div>\s*<div class="b_caption">(.*?)</div>', html, _re.DOTALL)
-                for title_html, caption_html in blocks[:8]:
-                    title_m = _re.search(r'<a[^>]*href="([^"]*)"[^>]*>(.*?)</a>', title_html, _re.DOTALL)
-                    if not title_m:
-                        continue
-                    url = title_m.group(1)
-                    title = _re.sub(r'<[^>]+>', '', title_m.group(2)).strip()
-                    snippet = _re.sub(r'<[^>]+>', '', caption_html).strip()[:200]
-                    if title:
-                        results.append(f"**{title}**\n{snippet}\n🔗 {url}")
-            else:
-                for block in blocks[:8]:
+                blocks = _re.findall(r'class="result__body">(.*?)</div>', html, _re.DOTALL)
+            for block in blocks[:8]:
+                # 标题 + URL
+                title_m = _re.search(r'<a[^>]*class="result__a"[^>]*href="([^"]*)"[^>]*>(.*?)</a>', block, _re.DOTALL)
+                if not title_m:
                     title_m = _re.search(r'<a[^>]*href="([^"]*)"[^>]*>(.*?)</a>', block, _re.DOTALL)
-                    if not title_m:
-                        continue
-                    url = title_m.group(1)
-                    title = _re.sub(r'<[^>]+>', '', title_m.group(2)).strip()
-                    snippet = ""
-                    for pattern in [r'<p[^>]*>(.*?)</p>', r'<span[^>]*>(.*?)</span>']:
-                        snippet_m = _re.search(pattern, block[block.find('</h2>'):] if '</h2>' in block else block, _re.DOTALL)
-                        if snippet_m:
-                            snippet = _re.sub(r'<[^>]+>', '', snippet_m.group(1)).strip()[:200]
-                            break
-                    if title and not url.startswith('javascript'):
-                        results.append(f"**{title}**\n{snippet}\n🔗 {url}")
+                if not title_m:
+                    continue
+                url = title_m.group(1)
+                title = _re.sub(r'<[^>]+>', '', title_m.group(2)).strip()
+                # 摘要
+                snippet = ""
+                snippet_m = _re.search(r'class="result__snippet[^"]*"[^>]*>(.*?)</[as]>', block, _re.DOTALL)
+                if snippet_m:
+                    snippet = _re.sub(r'<[^>]+>', '', snippet_m.group(1)).strip()[:200]
+                if title and url and not url.startswith('javascript'):
+                    # DuckDuckGo URL 可能是重定向格式
+                    if '//duckduckgo.com/l/?' in url:
+                        import urllib.parse as _up
+                        parsed = _up.parse_qs(_up.urlparse(url).query)
+                        url = parsed.get('uddg', [url])[0]
+                    results.append(f"**{title}**\n{snippet}\n🔗 {url}")
             if not results:
-                # 保存 HTML 片段用于调试
-                print(f"[bridge_ws] Bing HTML sample (first 2000 chars): {html[:2000]}",
+                print(f"[bridge_ws] No results found. HTML sample: {html[:1500]}",
                       file=sys.stderr, flush=True)
                 return 200, "未找到相关搜索结果。"
             return 200, "\n\n".join(f"{i}. {r}" for i, r in enumerate(results, 1))
