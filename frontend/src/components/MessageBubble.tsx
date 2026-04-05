@@ -360,9 +360,11 @@ const copyToClipboard = async (content: string) => {
 const BubbleActionMenu: React.FC<{ message: ChatMessage }> = ({ message }) => {
   const [menuOpen, setMenuOpen] = useState(false);
   const [copied, setCopied] = useState(false);
+  const [copiedFull, setCopiedFull] = useState(false);
 
   const copyTimerRef = useRef<ReturnType<typeof setTimeout>>();
-  useEffect(() => () => { clearTimeout(copyTimerRef.current); }, []);
+  const copyFullTimerRef = useRef<ReturnType<typeof setTimeout>>();
+  useEffect(() => () => { clearTimeout(copyTimerRef.current); clearTimeout(copyFullTimerRef.current); }, []);
 
   const handleCopy = useCallback(async () => {
     const success = await copyToClipboard(message.content || '');
@@ -373,6 +375,39 @@ const BubbleActionMenu: React.FC<{ message: ChatMessage }> = ({ message }) => {
     }
     setMenuOpen(false);
   }, [message.content]);
+
+  const handleCopyFull = useCallback(async () => {
+    // 构建完整内容：thinking + tool calls + text
+    const parts: string[] = [];
+    // Thinking
+    const thinking = message.thinking ||
+      (message as any).thinkingBlocks?.map((b: any) => b.content).join('\n\n') || '';
+    if (thinking) {
+      parts.push(`[Thinking]\n${thinking}`);
+    }
+    // Tool calls
+    if ((message as any).toolCalls) {
+      for (const tc of (message as any).toolCalls) {
+        let toolSection = `[Tool: ${tc.name || 'unknown'}]`;
+        if (tc.input) toolSection += `\nINPUT: ${tc.input}`;
+        if (tc.output) toolSection += `\nOUTPUT: ${tc.output}`;
+        if (tc.status) toolSection += `\nSTATUS: ${tc.status}`;
+        parts.push(toolSection);
+      }
+    }
+    // Text content
+    if (message.content) {
+      parts.push(message.content);
+    }
+    const fullText = parts.join('\n\n');
+    const success = await copyToClipboard(fullText);
+    if (success) {
+      setCopiedFull(true);
+      clearTimeout(copyFullTimerRef.current);
+      copyFullTimerRef.current = setTimeout(() => setCopiedFull(false), 2000);
+    }
+    setMenuOpen(false);
+  }, [message]);
 
   // 点击外部关闭菜单
   useEffect(() => {
@@ -439,6 +474,7 @@ const BubbleActionMenu: React.FC<{ message: ChatMessage }> = ({ message }) => {
               padding: '8px 12px',
               background: 'none',
               border: 'none',
+              borderBottom: '1px solid var(--theme-border, rgba(0,0,0,0.08))',
               textAlign: 'left',
               cursor: 'pointer',
               fontSize: 12,
@@ -450,6 +486,25 @@ const BubbleActionMenu: React.FC<{ message: ChatMessage }> = ({ message }) => {
           >
             <span>{copied ? '✓' : '📋'}</span>
             <span>{copied ? '已复制' : '复制内容'}</span>
+          </button>
+          <button
+            onClick={handleCopyFull}
+            style={{
+              width: '100%',
+              padding: '8px 12px',
+              background: 'none',
+              border: 'none',
+              textAlign: 'left',
+              cursor: 'pointer',
+              fontSize: 12,
+              color: copiedFull ? 'var(--theme-success, #3fb950)' : 'var(--theme-text, #1f2328)',
+              display: 'flex',
+              alignItems: 'center',
+              gap: 8,
+            }}
+          >
+            <span>{copiedFull ? '✓' : '📑'}</span>
+            <span>{copiedFull ? '已复制' : '复制完整信息'}</span>
           </button>
         </div>
       )}
