@@ -934,10 +934,37 @@ class BridgeWS:
     def _generate_backend_skill_md(self, skill_name: str, skill_info: dict) -> str:
         """
         根据孵化库中的 Backend Skill 声明，生成部署版 SKILL.md。
-        指令简洁，实际 HTTP 调用逻辑在同目录的 _call.py 中。
+        根据 input_schema 动态生成参数说明，适配不同 skill 类型。
         """
         description = skill_info.get("description", f"Backend Skill: {skill_name}")
+        input_schema = skill_info.get("inputSchema") or {}
         python = sys.executable.replace("\\", "/")
+        call_script = f".claude/skills/{skill_name}/_call.py"
+
+        # 从 input_schema 提取参数列表（prompt 之外的可选参数）
+        props = input_schema.get("properties", {})
+        required = set(input_schema.get("required", []))
+        # 构建参数说明和命令示例
+        args_doc: list[str] = []
+        args_example: list[str] = ['"<PROMPT>"']
+        for pname, pdef in props.items():
+            if pname == "prompt":
+                continue
+            pdesc = pdef.get("description", pname)
+            is_req = pname in required
+            tag = "必填" if is_req else "可选"
+            args_doc.append(f"- {pname}（{tag}）：{pdesc}")
+            args_example.append(f'"<{pname.upper()}>"')
+
+        # 基本命令
+        basic_cmd = f'"{python}" {call_script} "<PROMPT>"'
+        # 完整命令（含可选参数）
+        full_cmd = f'"{python}" {call_script} {" ".join(args_example)}'
+
+        extra_params = ""
+        if args_doc:
+            extra_params = "\n可选参数（按顺序追加）：\n" + "\n".join(args_doc) + "\n"
+            extra_params += f"\n完整示例：\n```bash\n{full_cmd}\n```\n"
 
         return f"""\
 ---
@@ -947,39 +974,31 @@ description: {description}
 
 ## Instructions
 
-**重要：读完本指令后，必须使用 Bash 工具执行下方命令来完成任务。本 Skill 通过命令行调用后端服务生成结果。**
+**必须使用 Bash 工具执行下方命令。**
 
-生成图片：
 ```bash
-"{python}" .claude/skills/{skill_name}/_call.py "<PROMPT>"
+{basic_cmd}
 ```
-
-指定尺寸（可选，默认 1:1）：
-```bash
-"{python}" .claude/skills/{skill_name}/_call.py "<PROMPT>" "<SIZE>"
-```
-SIZE 支持比例（1:1, 16:9, 9:16, 4:3, 3:4, 3:2, 2:3）或具体尺寸（1280*720）。
-
-基于参考图修改（图生图）：
-```bash
-"{python}" .claude/skills/{skill_name}/_call.py "<PROMPT>" "<SIZE>" "<REF_IMAGE_URL>"
-```
-REF_IMAGE_URL 从对话中已生成的图片 URL 或用户上传图片 URL 中获取。
-
-**规则：只执行一次命令，将输出直接原样呈现给用户。不要重试、不要自行判断结果质量、不要额外处理。**
+{extra_params}
+**规则：只执行一次，将输出直接原样呈现给用户。不要重试、不要自行判断结果质量、不要额外处理。**
 """
 
-    def _generate_backend_skill_call_py(self, skill_name: str) -> str:
-        """生成 _call.py 调用脚本，处理 HTTP 请求和 JSON 编码。"""
+    def _generate_backend_skill_call_py(self, skill_name: str, skill_info: dict) -> str:
+        """生成 _call.py 调用脚本，根据 input_schema 动态构建参数映射。"""
         port = self._HTTP_API_PORT
+        input_schema = skill_info.get("inputSchema") or {}
+        props = input_schema.get("properties", {})
+        # 按顺序：prompt 是 argv[1]，其他参数依次 argv[2], argv[3]...
+        extra_params = [p for p in props if p != "prompt"]
+
+        extra_lines = ""
+        for i, pname in enumerate(extra_params, 2):
+            extra_lines += f'if len(sys.argv) > {i} and sys.argv[{i}]:\n    payload["{pname}"] = sys.argv[{i}]\n'
+
         return f'''\
 import sys, json, urllib.request
 payload = {{"skill": "{skill_name}", "prompt": sys.argv[1] if len(sys.argv) > 1 else ""}}
-if len(sys.argv) > 2 and sys.argv[2]:
-    payload["size"] = sys.argv[2]
-if len(sys.argv) > 3 and sys.argv[3]:
-    payload["ref_image"] = sys.argv[3]
-data = json.dumps(payload).encode()
+{extra_lines}data = json.dumps(payload).encode()
 req = urllib.request.Request("http://127.0.0.1:{port}/api/skill-call", data, {{"Content-Type": "application/json"}})
 print(urllib.request.urlopen(req, timeout=300).read().decode())
 '''
@@ -1011,7 +1030,7 @@ print(urllib.request.urlopen(req, timeout=300).read().decode())
             (target / "SKILL.md").write_text(
                 self._generate_backend_skill_md(sname, info), encoding="utf-8")
             (target / "_call.py").write_text(
-                self._generate_backend_skill_call_py(sname), encoding="utf-8")
+                self._generate_backend_skill_call_py(sname, info), encoding="utf-8")
             deployed_backend_skills.add(sname)
             print(f"[bridge_ws] Deployed Backend Skill '{sname}' → {target}",
                   file=sys.stderr, flush=True)

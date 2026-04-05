@@ -8,6 +8,7 @@ All implementation has been split into:
   openai_compat.py  — OpenAICompatibleBackend
   anthropic_api.py  — AnthropicAPIBackend
   dashscope_image.py— DashScopeImageBackend
+  web_search.py     — WebSearchBackend
   factory.py        — create_backend()
 """
 
@@ -17,6 +18,7 @@ from .claude_code import ClaudeCodeOfficialBackend
 from .openai_compat import OpenAICompatibleBackend
 from .anthropic_api import AnthropicAPIBackend
 from .dashscope_image import DashScopeImageBackend
+from .web_search import WebSearchBackend
 from .factory import create_backend
 
 __all__ = [
@@ -29,5 +31,6 @@ __all__ = [
     "OpenAICompatibleBackend",
     "AnthropicAPIBackend",
     "DashScopeImageBackend",
+    "WebSearchBackend",
     "create_backend",
 ]

@@ -6,6 +6,7 @@ from .claude_code import ClaudeCodeOfficialBackend
 from .openai_compat import OpenAICompatibleBackend
 from .anthropic_api import AnthropicAPIBackend
 from .dashscope_image import DashScopeImageBackend
+from .web_search import WebSearchBackend
 
 
 def create_backend(config: ModelBackendConfig) -> ModelBackend:
@@ -20,5 +21,7 @@ def create_backend(config: ModelBackendConfig) -> ModelBackend:
         return OpenAICompatibleBackend(config)
     elif config.type == BackendType.DASHSCOPE_IMAGE:
         return DashScopeImageBackend(config)
+    elif config.type == BackendType.WEB_SEARCH:
+        return WebSearchBackend(config)
     else:
         raise ValueError(f"Unknown backend type: {config.type}")

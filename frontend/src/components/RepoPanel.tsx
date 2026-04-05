@@ -118,7 +118,31 @@ const SKILL_TYPE_PRESETS: SkillTypePreset[] = [
       ].join('\n'),
     }),
   },
-  // 未来扩展：语音合成、数据分析等
+  {
+    id: 'web-search',
+    icon: '🔍',
+    label: '网页搜索',
+    description: 'Bing 搜索，免费，国内可用',
+    backendType: 'web-search',
+    template: (backendId) => ({
+      name: 'web-search',
+      content: [
+        '---',
+        'name: web-search',
+        'description: 仅当用户明确需要搜索网页、查找资料、获取最新信息时调用。普通对话和已知知识的问答不要调用。',
+        `backend: ${backendId}`,
+        'input_schema:',
+        '  type: object',
+        '  properties:',
+        '    prompt:',
+        '      type: string',
+        '      description: 搜索关键词',
+        '  required:',
+        '    - prompt',
+        '---',
+      ].join('\n'),
+    }),
+  },
 ];
 
 // ═══════════════════════════════════════
