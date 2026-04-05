@@ -939,6 +939,8 @@ class BridgeWS:
         description = skill_info.get("description", f"Backend Skill: {skill_name}")
         input_schema = skill_info.get("inputSchema") or {}
         port = self._HTTP_API_PORT
+        # ★ 使用当前进程的 Python 绝对路径，不依赖用户 PATH 中有 python3
+        python = sys.executable.replace("\\", "/")
 
         # 从 input_schema 提取参数说明
         props = input_schema.get("properties", {})
@@ -958,14 +960,14 @@ description: {description}
 
 ## Instructions
 
-{param_hints}当需要使用此能力时，用 Bash 工具执行以下 Python 命令。
+{param_hints}当需要使用此能力时，用 Bash 工具执行以下命令。
 
 ### 基本用法
 
 将 `<PROMPT>` 替换为描述内容，构建 JSON 参数调用：
 
 ```bash
-python3 -c "import urllib.request,json;d=json.dumps({{'skill':'{skill_name}','prompt':'<PROMPT>'}}).encode();r=urllib.request.Request('http://127.0.0.1:{port}/api/skill-call',d,{{'Content-Type':'application/json'}});print(urllib.request.urlopen(r,timeout=300).read().decode())"
+"{python}" -c "import urllib.request,json;d=json.dumps({{'skill':'{skill_name}','prompt':'<PROMPT>'}}).encode();r=urllib.request.Request('http://127.0.0.1:{port}/api/skill-call',d,{{'Content-Type':'application/json'}});print(urllib.request.urlopen(r,timeout=300).read().decode())"
 ```
 
 ### 可选参数
@@ -984,10 +986,8 @@ JSON 中除了 `prompt`（必填），还支持以下可选字段：
 
 示例（带尺寸 + 参考图）：
 ```bash
-python3 -c "import urllib.request,json;d=json.dumps({{'skill':'{skill_name}','prompt':'<PROMPT>','size':'16:9','ref_image':'<IMAGE_URL>'}}).encode();r=urllib.request.Request('http://127.0.0.1:{port}/api/skill-call',d,{{'Content-Type':'application/json'}});print(urllib.request.urlopen(r,timeout=300).read().decode())"
+"{python}" -c "import urllib.request,json;d=json.dumps({{'skill':'{skill_name}','prompt':'<PROMPT>','size':'16:9','ref_image':'<IMAGE_URL>'}}).encode();r=urllib.request.Request('http://127.0.0.1:{port}/api/skill-call',d,{{'Content-Type':'application/json'}});print(urllib.request.urlopen(r,timeout=300).read().decode())"
 ```
-
-注意：如果 python3 不可用，尝试用 python 替代。
 
 重要规则：
 - prompt 直接用用户的原始语言
