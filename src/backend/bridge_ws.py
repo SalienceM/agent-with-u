@@ -189,6 +189,12 @@ class BridgeWS:
             print(f"[bridge_ws] Bing response: {len(html)} chars, "
                   f"b_algo={html.count('b_algo')}, b_results={html.count('b_results')}",
                   file=sys.stderr, flush=True)
+            # 定位结果区域
+            results_start = html.find('id="b_results"')
+            if results_start > 0:
+                sample = html[results_start:results_start+3000]
+                print(f"[bridge_ws] b_results section sample: {sample[:2000]}",
+                      file=sys.stderr, flush=True)
             # 解析搜索结果 — 多种 HTML 结构适配
             results: list[str] = []
             # 方式1: <li class="b_algo">
