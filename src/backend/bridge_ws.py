@@ -162,36 +162,68 @@ class BridgeWS:
         print(f"[bridge_ws] builtin web-search: q={query!r}", file=sys.stderr, flush=True)
         try:
             import httpx as _httpx
+            # 检测系统代理
+            import urllib.request as _ur
+            proxy_url = None
+            try:
+                sys_proxies = _ur.getproxies()
+                proxy_url = sys_proxies.get("https") or sys_proxies.get("http")
+            except Exception:
+                pass
             headers = {
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
                 "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
             }
-            async with _httpx.AsyncClient(timeout=30.0) as client:
+            client_kwargs: dict = {"timeout": 30.0, "follow_redirects": True}
+            if proxy_url:
+                client_kwargs["proxy"] = proxy_url
+            async with _httpx.AsyncClient(**client_kwargs) as client:
                 resp = await client.get(
-                    "https://cn.bing.com/search",
-                    params={"q": query, "count": "8"},
+                    "https://www.bing.com/search",
+                    params={"q": query},
                     headers=headers,
-                    follow_redirects=True,
                 )
                 if resp.status_code != 200:
                     return 500, f"Bing 搜索失败: HTTP {resp.status_code}"
-            # 解析搜索结果
-            blocks = _re.findall(r'<li class="b_algo">(.*?)</li>', resp.text, _re.DOTALL)
+                html = resp.text
+            print(f"[bridge_ws] Bing response: {len(html)} chars, "
+                  f"b_algo={html.count('b_algo')}, b_results={html.count('b_results')}",
+                  file=sys.stderr, flush=True)
+            # 解析搜索结果 — 多种 HTML 结构适配
             results: list[str] = []
-            for block in blocks[:8]:
-                title_m = _re.search(r'<h2><a[^>]*href="([^"]*)"[^>]*>(.*?)</a></h2>', block, _re.DOTALL)
-                if not title_m:
-                    continue
-                url = title_m.group(1)
-                title = _re.sub(r'<[^>]+>', '', title_m.group(2)).strip()
-                snippet = ""
-                snippet_m = _re.search(r'<p class="[^"]*">(.*?)</p>', block, _re.DOTALL)
-                if not snippet_m:
-                    snippet_m = _re.search(r'<div class="b_caption">\s*<p>(.*?)</p>', block, _re.DOTALL)
-                if snippet_m:
-                    snippet = _re.sub(r'<[^>]+>', '', snippet_m.group(1)).strip()
-                results.append(f"**{title}**\n{snippet}\n🔗 {url}")
+            # 方式1: <li class="b_algo">
+            blocks = _re.findall(r'<li[^>]*class="b_algo"[^>]*>(.*?)</li>', html, _re.DOTALL)
+            if not blocks:
+                # 方式2: 宽松匹配 — 任何包含 href 和文本的搜索结果块
+                blocks = _re.findall(r'<div class="b_title">(.*?)</div>\s*<div class="b_caption">(.*?)</div>', html, _re.DOTALL)
+                for title_html, caption_html in blocks[:8]:
+                    title_m = _re.search(r'<a[^>]*href="([^"]*)"[^>]*>(.*?)</a>', title_html, _re.DOTALL)
+                    if not title_m:
+                        continue
+                    url = title_m.group(1)
+                    title = _re.sub(r'<[^>]+>', '', title_m.group(2)).strip()
+                    snippet = _re.sub(r'<[^>]+>', '', caption_html).strip()[:200]
+                    if title:
+                        results.append(f"**{title}**\n{snippet}\n🔗 {url}")
+            else:
+                for block in blocks[:8]:
+                    title_m = _re.search(r'<a[^>]*href="([^"]*)"[^>]*>(.*?)</a>', block, _re.DOTALL)
+                    if not title_m:
+                        continue
+                    url = title_m.group(1)
+                    title = _re.sub(r'<[^>]+>', '', title_m.group(2)).strip()
+                    snippet = ""
+                    for pattern in [r'<p[^>]*>(.*?)</p>', r'<span[^>]*>(.*?)</span>']:
+                        snippet_m = _re.search(pattern, block[block.find('</h2>'):] if '</h2>' in block else block, _re.DOTALL)
+                        if snippet_m:
+                            snippet = _re.sub(r'<[^>]+>', '', snippet_m.group(1)).strip()[:200]
+                            break
+                    if title and not url.startswith('javascript'):
+                        results.append(f"**{title}**\n{snippet}\n🔗 {url}")
             if not results:
+                # 保存 HTML 片段用于调试
+                print(f"[bridge_ws] Bing HTML sample (first 2000 chars): {html[:2000]}",
+                      file=sys.stderr, flush=True)
                 return 200, "未找到相关搜索结果。"
             return 200, "\n\n".join(f"{i}. {r}" for i, r in enumerate(results, 1))
         except Exception as e:
