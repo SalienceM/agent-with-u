@@ -933,24 +933,11 @@ class BridgeWS:
 
     def _generate_backend_skill_md(self, skill_name: str, skill_info: dict) -> str:
         """
-        根据孵化库中的 Backend Skill 声明，生成可被 Claude CLI 原生发现的部署版 SKILL.md。
-        用户的孵化库文件保持干净（仅声明），此方法只在部署时调用。
+        根据孵化库中的 Backend Skill 声明，生成部署版 SKILL.md。
+        指令简洁，实际 HTTP 调用逻辑在同目录的 _call.py 中。
         """
         description = skill_info.get("description", f"Backend Skill: {skill_name}")
-        input_schema = skill_info.get("inputSchema") or {}
-        port = self._HTTP_API_PORT
-        # ★ 使用当前进程的 Python 绝对路径，不依赖用户 PATH 中有 python3
         python = sys.executable.replace("\\", "/")
-
-        # 从 input_schema 提取参数说明
-        props = input_schema.get("properties", {})
-        param_hints = ""
-        if props:
-            lines = []
-            for pname, pdef in props.items():
-                pdesc = pdef.get("description", "")
-                lines.append(f"  - {pname}: {pdesc}" if pdesc else f"  - {pname}")
-            param_hints = "参数说明：\n" + "\n".join(lines) + "\n\n"
 
         return f"""\
 ---
@@ -960,42 +947,42 @@ description: {description}
 
 ## Instructions
 
-{param_hints}当需要使用此能力时，用 Bash 工具执行以下命令。
+用 Bash 执行以下命令，将引号内的内容替换为实际值。
 
-### 基本用法
-
-将 `<PROMPT>` 替换为描述内容，构建 JSON 参数调用：
-
+生成图片：
 ```bash
-"{python}" -c "import urllib.request,json;d=json.dumps({{'skill':'{skill_name}','prompt':'<PROMPT>'}}).encode();r=urllib.request.Request('http://127.0.0.1:{port}/api/skill-call',d,{{'Content-Type':'application/json'}});print(urllib.request.urlopen(r,timeout=300).read().decode())"
+"{python}" .claude/skills/{skill_name}/_call.py "<PROMPT>"
 ```
 
-### 可选参数
-
-JSON 中除了 `prompt`（必填），还支持以下可选字段：
-
-- **size** — 图片尺寸。支持两种格式：
-  - 比例：`"1:1"`, `"16:9"`, `"9:16"`, `"4:3"`, `"3:4"`, `"3:2"`, `"2:3"`
-  - 具体尺寸：`"1280*720"`, `"768*1024"` 等
-  - 默认为 `"1:1"`（1024*1024）
-  - 用户说"横屏/landscape" → `"16:9"`；"竖屏/portrait" → `"9:16"`
-
-- **ref_image** — 参考图 URL（图生图模式）。当用户要求修改已有图片时传入：
-  - 对话中之前生成的图：使用 `http://127.0.0.1:{port}/api/skill-images/xxx.png` 格式
-  - 用户上传的图：消息中会标注 `[用户上传图片 URL: http://...]`，使用该 URL
-
-示例（带尺寸 + 参考图）：
+指定尺寸（可选，默认 1:1）：
 ```bash
-"{python}" -c "import urllib.request,json;d=json.dumps({{'skill':'{skill_name}','prompt':'<PROMPT>','size':'16:9','ref_image':'<IMAGE_URL>'}}).encode();r=urllib.request.Request('http://127.0.0.1:{port}/api/skill-call',d,{{'Content-Type':'application/json'}});print(urllib.request.urlopen(r,timeout=300).read().decode())"
+"{python}" .claude/skills/{skill_name}/_call.py "<PROMPT>" "<SIZE>"
 ```
+SIZE 支持比例（1:1, 16:9, 9:16, 4:3, 3:4, 3:2, 2:3）或具体尺寸（1280*720）。
 
-重要规则：
-- prompt 直接用用户的原始语言
-- 根据用户需求判断是否需要 size 和 ref_image，不需要时省略
-- **只调用一次**，不要因为结果不完美而重试
-- 命令输出中包含 `![...](http://...)` 格式的图片，**直接原样输出**给用户
-- **不要**用 Read 工具读取图片文件
+基于参考图修改（图生图）：
+```bash
+"{python}" .claude/skills/{skill_name}/_call.py "<PROMPT>" "<SIZE>" "<REF_IMAGE_URL>"
+```
+REF_IMAGE_URL 从对话中已生成的图片 URL 或用户上传图片 URL 中获取。
+
+将命令输出直接原样呈现给用户。
 """
+
+    def _generate_backend_skill_call_py(self, skill_name: str) -> str:
+        """生成 _call.py 调用脚本，处理 HTTP 请求和 JSON 编码。"""
+        port = self._HTTP_API_PORT
+        return f'''\
+import sys, json, urllib.request
+payload = {{"skill": "{skill_name}", "prompt": sys.argv[1] if len(sys.argv) > 1 else ""}}
+if len(sys.argv) > 2 and sys.argv[2]:
+    payload["size"] = sys.argv[2]
+if len(sys.argv) > 3 and sys.argv[3]:
+    payload["ref_image"] = sys.argv[3]
+data = json.dumps(payload).encode()
+req = urllib.request.Request("http://127.0.0.1:{port}/api/skill-call", data, {{"Content-Type": "application/json"}})
+print(urllib.request.urlopen(req, timeout=300).read().decode())
+'''
 
     def _sync_backend_skills_to_directory(self, session: Session):
         """
@@ -1018,37 +1005,33 @@ JSON 中除了 `prompt`（必填），还支持以下可选字段：
             info = self._skill_store.get_skill(sname)
             if not info or not info.get("backend"):
                 continue  # 传统 Skill，由用户手动激活
-            # 系统增强型：根据声明自动生成可执行的部署版 SKILL.md
-            content = self._generate_backend_skill_md(sname, info)
+            # 系统增强型：部署 SKILL.md + _call.py
             target = skills_dir / sname
             target.mkdir(parents=True, exist_ok=True)
-            (target / "SKILL.md").write_text(content, encoding="utf-8")
+            (target / "SKILL.md").write_text(
+                self._generate_backend_skill_md(sname, info), encoding="utf-8")
+            (target / "_call.py").write_text(
+                self._generate_backend_skill_call_py(sname), encoding="utf-8")
             deployed_backend_skills.add(sname)
             print(f"[bridge_ws] Deployed Backend Skill '{sname}' → {target}",
                   file=sys.stderr, flush=True)
 
-        # 清理不再绑定的 Backend Skill（只清理由系统生成的，通过检测内容中的 /api/skill-call 标记）
+        # 清理不再绑定的 Backend Skill（通过 _call.py 存在判断是否为系统部署的）
         if skills_dir.exists():
             for skill_dir in skills_dir.iterdir():
                 if not skill_dir.is_dir():
                     continue
                 if skill_dir.name in deployed_backend_skills:
-                    continue  # 刚部署的，跳过
+                    continue
                 if skill_dir.name in bound_skills:
-                    continue  # 绑定的传统 Skill，不动
-                md_file = skill_dir / "SKILL.md"
-                if md_file.exists():
-                    content = md_file.read_text(encoding="utf-8")
-                    if "/api/skill-call" in content:
-                        # 是系统生成的 Backend Skill SKILL.md，解绑后清理
-                        md_file.unlink()
-                        try:
-                            if not any(skill_dir.iterdir()):
-                                skill_dir.rmdir()
-                        except Exception:
-                            pass
-                        print(f"[bridge_ws] Cleaned up unbound Backend Skill '{skill_dir.name}'",
-                              file=sys.stderr, flush=True)
+                    continue
+                call_py = skill_dir / "_call.py"
+                if call_py.exists():
+                    # 系统部署的 Backend Skill，解绑后清理
+                    import shutil as _shutil
+                    _shutil.rmtree(skill_dir, ignore_errors=True)
+                    print(f"[bridge_ws] Cleaned up unbound Backend Skill '{skill_dir.name}'",
+                          file=sys.stderr, flush=True)
 
     def _rpc_updateSessionAbilities(self, session_id: str, abilities_json: str) -> str:
         """绑定/解绑 skill 和 prompt 到 session。"""
