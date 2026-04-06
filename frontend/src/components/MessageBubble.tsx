@@ -1,7 +1,7 @@
 import React, { useState, useCallback, useEffect, useRef } from 'react';
 import { markdownToHtml } from '../utils/markdown';
 import type { ChatMessage, ToolCall, ContentBlock } from '../hooks/useChat';
-import { DiffView } from './DiffView';
+import { DiffView, type DiffData } from './DiffView';
 
 // ── 注入全局动画样式 ──
 if (typeof document !== 'undefined' && !document.getElementById('msg-bubble-css')) {
@@ -220,10 +220,32 @@ const STATUS_ICON: Record<string, string> = {
   error: '❌',
 };
 
+/** 尝试从 Edit/MultiEdit/Write 工具的 input JSON 中解析出 diff 数据 */
+function tryParseDiffFromInput(tc: ToolCall): DiffData | null {
+  if (!tc.input) return null;
+  const isEditTool = /^(Edit|MultiEdit|Write)$/i.test(tc.name || '');
+  if (!isEditTool) return null;
+  try {
+    const inp = JSON.parse(tc.input);
+    const oldStr = inp.old_string ?? inp.oldString ?? '';
+    const newStr = inp.new_string ?? inp.newString ?? '';
+    const filePath = inp.file_path ?? inp.filePath ?? inp.path ?? '';
+    if (oldStr || newStr) {
+      return { path: filePath, old: oldStr, new: newStr };
+    }
+  } catch {
+    // input 不是合法 JSON，跳过
+  }
+  return null;
+}
+
 const ToolCallBlock: React.FC<{ tc: ToolCall }> = ({ tc }) => {
   const [expanded, setExpanded] = useState(false);
   const color = STATUS_COLOR[tc.status] || '#888';
   const isRunning = tc.status === 'running';
+
+  // ★ 优先用后端注入的 diff，否则从 input JSON 中解析
+  const diffData: DiffData | null = tc.diff || tryParseDiffFromInput(tc);
 
   // Format duration for display
   const formatDuration = (ms?: number) => {
@@ -258,9 +280,9 @@ const ToolCallBlock: React.FC<{ tc: ToolCall }> = ({ tc }) => {
       </div>
       {expanded && (
         <div style={sectionBody}>
-          {/* ★ Edit/Write 工具优先展示 Diff 视图 */}
-          {tc.diff ? (
-            <DiffView diff={tc.diff} />
+          {/* ★ Edit/Write 工具优先展示 Diff 视图，支持后端注入和前端解析两种来源 */}
+          {diffData ? (
+            <DiffView diff={diffData} />
           ) : (
             tc.input && (
               <div style={{ marginBottom: 6 }}>
@@ -270,7 +292,7 @@ const ToolCallBlock: React.FC<{ tc: ToolCall }> = ({ tc }) => {
             )
           )}
           {tc.output && (
-            <div style={{ marginTop: tc.diff ? 6 : 0 }}>
+            <div style={{ marginTop: diffData ? 6 : 0 }}>
               <div style={labelStyle}>OUTPUT</div>
               <pre
                 style={{
