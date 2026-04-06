@@ -19,12 +19,10 @@ from typing import Optional
 # ── 读取输入 & 凭据 ──────────────────────────────────────────────────────────
 try:
     raw = sys.stdin.buffer.read()
-    print(f"[debug] raw stdin bytes: {raw[:80]}", file=sys.stderr)
-    # 依次尝试 UTF-8、GBK、UTF-16
-    for enc in ("utf-8", "gbk", "utf-16"):
+    # utf-8-sig 自动去除 PowerShell 管道带来的 UTF-8 BOM (\xef\xbb\xbf)
+    for enc in ("utf-8-sig", "utf-8", "gbk", "utf-16"):
         try:
             payload: dict = json.loads(raw.decode(enc))
-            print(f"[debug] decoded with {enc}: {payload}", file=sys.stderr)
             break
         except (UnicodeDecodeError, json.JSONDecodeError):
             continue
