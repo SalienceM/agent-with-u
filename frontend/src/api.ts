@@ -22,10 +22,18 @@ type PermissionRequestCallback = (data: any) => void;
 
 export interface SkillInfo {
   name: string;
-  content: string;        // SKILL.md 完整内容
-  isGlobal: boolean;      // 是否已全局激活（~/.claude/skills/）
-  isProject: boolean;     // 是否已在当前工作目录激活
+  content: string;               // SKILL.md 完整内容
+  isGlobal: boolean;             // 是否已全局激活（~/.claude/skills/）
+  isProject: boolean;            // 是否已在当前工作目录激活
   projectActivations: string[];  // 所有已激活的工作目录列表
+  description?: string;          // frontmatter description 字段
+  hasCallPy?: boolean;           // 是否有 call.py（python-script 类型）
+  hasSecrets?: boolean;          // 是否已保存凭据
+  hasSecretsSchema?: boolean;    // 是否有 secrets.schema.json
+  manifest?: Record<string, any> | null;  // manifest.json 内容（插件包）
+  backend?: string;
+  type?: string;
+  inputSchema?: Record<string, any>;
 }
 
 // QWebChannel support for Qt mode

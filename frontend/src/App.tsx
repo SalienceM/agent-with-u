@@ -536,6 +536,13 @@ export const App: React.FC = () => {
             📋 Logs
           </button>
           <button
+            onClick={() => setSkillManagerOpen(true)}
+            style={{ ...settingsBtnStyle, ...(skillManagerOpen ? { background: 'var(--theme-accent-bg)', color: 'var(--theme-accent)' } : {}) }}
+            title="Skill 管理器 — 创建、安装、激活 Skills"
+          >
+            ⚡
+          </button>
+          <button
             onClick={() => setRepoPanelOpen(!repoPanelOpen)}
             style={{ ...settingsBtnStyle, ...(repoPanelOpen ? { background: 'var(--theme-accent-bg)', color: 'var(--theme-accent)' } : {}) }}
             title="Repo — Skills & Prompts"
