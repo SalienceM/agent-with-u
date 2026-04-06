@@ -12,7 +12,7 @@
  *   - 跨窗口 localStorage 同步
  *   - 弹出为独立窗口
  */
-import React, { useState, useEffect, useRef, useCallback } from 'react';
+import React, { useState, useEffect, useLayoutEffect, useRef, useCallback } from 'react';
 
 // ── 注入编辑器全局样式（一次即可）──────────────────────────────────────
 if (typeof document !== 'undefined' && !document.getElementById('scratch-editor-style')) {
@@ -90,6 +90,8 @@ const autoResize = (el: HTMLTextAreaElement) => {
 };
 
 // ── 行号 + Textarea（编辑器外观）────────────────────────────────────────
+// 不换行模式下，用隐藏 <pre> 镜像测量内容宽度，再把宽度赋给 textarea，
+// 让 textarea 自身不产生滚动条——滚动条统一由外层容器在底部呈现（VSCode 风格）。
 interface LineNumTAProps {
   value: string;
   startLine: number;
@@ -103,22 +105,40 @@ const LineNumTextarea: React.FC<LineNumTAProps> = ({
   value, startLine, wrapLines, placeholder, taRef, onChange, onPaste,
 }) => {
   const lines = value.split('\n');
+  const selfRef  = useRef<HTMLTextAreaElement>(null);
+  const mirrorRef = useRef<HTMLPreElement>(null);
+
+  // 不换行时：同步镜像宽度 → textarea 宽度（layout 阶段，避免闪烁）
+  useLayoutEffect(() => {
+    const ta = selfRef.current;
+    if (!ta) return;
+    if (wrapLines) {
+      ta.style.width = '';   // 归还给 flex:1
+      return;
+    }
+    const w = mirrorRef.current?.scrollWidth ?? 0;
+    ta.style.width = Math.max(w, 40) + 'px';
+  });
+
+  const combinedRef = useCallback((el: HTMLTextAreaElement | null) => {
+    (selfRef as React.MutableRefObject<HTMLTextAreaElement | null>).current = el;
+    taRef(el);
+  }, [taRef]);
+
   return (
-    <div style={{ display: 'flex', position: 'relative', width: '100%' }}>
-      {/* 行号栏（sticky left，横向滚动时固定不动） */}
+    <div style={{ display: 'flex', position: 'relative', width: wrapLines ? '100%' : undefined }}>
+      {/* 行号栏（sticky，横向滚动时固定在左侧） */}
       <div aria-hidden="true" style={{
         width: GUTTER_W, flexShrink: 0,
         position: 'sticky', left: 0,
-        paddingTop: 0, paddingRight: 8,
-        textAlign: 'right',
+        paddingRight: 8, textAlign: 'right',
         lineHeight: `${EDITOR_LINE_H}px`,
         fontSize: EDITOR_FONT_SZ - 1,
         fontFamily: EDITOR_FONT,
         color: '#4e5568',
-        background: '#0d1117',   // 与编辑区背景一致，遮住横向滚动内容
+        background: '#0d1117',
         zIndex: 1,
-        userSelect: 'none',
-        pointerEvents: 'none',
+        userSelect: 'none', pointerEvents: 'none',
       }}>
         {lines.map((_, i) => (
           <div key={i} style={{ height: EDITOR_LINE_H }}>{startLine + i}</div>
@@ -131,9 +151,9 @@ const LineNumTextarea: React.FC<LineNumTAProps> = ({
         background: 'rgba(255,255,255,0.06)', marginRight: 10,
         zIndex: 1,
       }} />
-      {/* 文本区 */}
+      {/* 文本区：overflow 永远 hidden，宽度由镜像决定（不换行）或 flex:1（换行） */}
       <textarea
-        ref={taRef}
+        ref={combinedRef}
         className="scratch-ta"
         value={value}
         onChange={e => onChange(e.target.value, e.currentTarget)}
@@ -141,25 +161,29 @@ const LineNumTextarea: React.FC<LineNumTAProps> = ({
         placeholder={placeholder}
         spellCheck={false}
         style={{
-          flex: 1,
-          resize: 'none',
-          border: 'none',
-          outline: 'none',
-          background: 'transparent',
-          color: '#cdd6f4',
-          fontSize: EDITOR_FONT_SZ,
-          lineHeight: `${EDITOR_LINE_H}px`,
-          fontFamily: EDITOR_FONT,
-          padding: 0,
-          minHeight: EDITOR_LINE_H,
-          // 换行模式：关闭时 pre = 不换行，横向可滚动；开启时自动换行
+          flex: wrapLines ? 1 : undefined,
+          minWidth: wrapLines ? 0 : 40,
+          resize: 'none', border: 'none', outline: 'none',
+          background: 'transparent', color: '#cdd6f4',
+          fontSize: EDITOR_FONT_SZ, lineHeight: `${EDITOR_LINE_H}px`,
+          fontFamily: EDITOR_FONT, padding: 0,
+          minHeight: EDITOR_LINE_H, overflow: 'hidden',
           whiteSpace: wrapLines ? 'pre-wrap' : 'pre',
-          overflowX: wrapLines ? 'hidden' : 'auto',
-          overflowY: 'hidden',
-          boxSizing: 'border-box',
-          caretColor: '#7aa2f7',
+          boxSizing: 'border-box', caretColor: '#7aa2f7',
         }}
       />
+      {/* 隐藏镜像：用于测量最长行的像素宽度 */}
+      {!wrapLines && (
+        <pre ref={mirrorRef} aria-hidden="true" style={{
+          position: 'absolute', top: 0, left: GUTTER_W + 11,
+          visibility: 'hidden', pointerEvents: 'none',
+          whiteSpace: 'pre', fontFamily: EDITOR_FONT, fontSize: EDITOR_FONT_SZ,
+          lineHeight: `${EDITOR_LINE_H}px`, margin: 0, padding: 0,
+        }}>
+          {/* 末尾加空格确保空内容也有宽度 */}
+          {value || ' '}
+        </pre>
+      )}
     </div>
   );
 };
