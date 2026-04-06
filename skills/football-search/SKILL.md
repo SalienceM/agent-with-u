@@ -21,10 +21,10 @@ input_schema:
 
 ## 使用方法
 
-使用 Bash 工具执行以下命令：
+使用 Bash 工具执行以下命令（Python 路径由安装环境自动填充）：
 
 ```bash
-"C:/Users/Administrator/AppData/Local/Programs/Python/Python312/python.exe" .claude/skills/football-search/_call.py "<QUERY>" "<CATEGORY>"
+"<PYTHON>" .claude/skills/football-search/_call.py "<QUERY>" "<CATEGORY>"
 ```
 
 ## QUERY 构造规则（关键）
