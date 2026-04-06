@@ -393,6 +393,25 @@ const ScratchPadEditor: React.FC<EditorProps> = ({ mode, onClose }) => {
   const groups = groupByDate(entries);
   const isWindow = mode === 'window';
 
+  // 记录选择器下拉
+  const [showPicker, setShowPicker] = useState(false);
+  const pickerRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!showPicker) return;
+    const handler = (e: MouseEvent) => {
+      if (pickerRef.current && !pickerRef.current.contains(e.target as Node)) {
+        setShowPicker(false);
+      }
+    };
+    document.addEventListener('mousedown', handler);
+    return () => document.removeEventListener('mousedown', handler);
+  }, [showPicker]);
+
+  // 当前记录标签
+  const activeLabel = active
+    ? `${fmtDate(active.updatedAt)} ${fmtTime(active.updatedAt)}`
+    : '无记录';
+
   return (
     <div style={{
       display: 'flex', flexDirection: 'column',
@@ -422,74 +441,96 @@ const ScratchPadEditor: React.FC<EditorProps> = ({ mode, onClose }) => {
         </div>
       )}
 
-      {/* 标题栏 */}
+      {/* 标题栏（含记录选择器） */}
       <div style={{
-        display: 'flex', alignItems: 'center', gap: 8,
-        padding: '8px 12px',
+        display: 'flex', alignItems: 'center', gap: 6,
+        padding: '6px 8px',
         borderBottom: '1px solid var(--theme-border, rgba(255,255,255,0.08))',
-        flexShrink: 0,
+        flexShrink: 0, minWidth: 0,
       }}>
-        <span style={{ fontSize: 14 }}>📌</span>
-        <span style={{ fontWeight: 600, fontSize: 13, color: 'var(--theme-text)', flex: 1 }}>便签本</span>
-        <button onClick={handleNew} title="新建记录" style={hdrBtnStyle('#7aa2f7', 'rgba(122,162,247,0.15)')}>
-          + 新建
-        </button>
-        {!isWindow && (
-          <button onClick={() => popout(onClose)} title="弹出为独立窗口（主窗口侧栏自动关闭）" style={hdrBtnStyle('var(--theme-text-muted)', 'transparent')}>
-            ⤢
+        <span style={{ fontSize: 13, flexShrink: 0 }}>📌</span>
+
+        {/* 记录选择器（下拉） */}
+        <div ref={pickerRef} style={{ position: 'relative', flex: 1, minWidth: 0 }}>
+          <button
+            onClick={() => setShowPicker(v => !v)}
+            title="切换记录"
+            style={{
+              display: 'flex', alignItems: 'center', gap: 4, width: '100%',
+              padding: '3px 7px', borderRadius: 5,
+              border: '1px solid var(--theme-border, rgba(255,255,255,0.1))',
+              background: showPicker ? 'rgba(122,162,247,0.12)' : 'rgba(255,255,255,0.04)',
+              color: 'var(--theme-text-muted)', fontSize: 11, cursor: 'pointer',
+              textAlign: 'left', minWidth: 0,
+            }}
+          >
+            <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+              {activeLabel}
+            </span>
+            <span style={{ fontSize: 9, flexShrink: 0, opacity: 0.6 }}>{showPicker ? '▲' : '▼'}</span>
           </button>
+
+          {/* 下拉列表 */}
+          {showPicker && (
+            <div style={{
+              position: 'absolute', top: '100%', left: 0, right: 0, marginTop: 3,
+              background: '#1e2030', border: '1px solid rgba(255,255,255,0.12)',
+              borderRadius: 7, boxShadow: '0 6px 24px rgba(0,0,0,0.4)',
+              zIndex: 200, maxHeight: 280, overflowY: 'auto',
+            }}>
+              {entries.length === 0 ? (
+                <div style={{ padding: '14px 10px', textAlign: 'center', fontSize: 11, color: 'var(--theme-text-muted)' }}>
+                  还没有记录
+                </div>
+              ) : groups.map(({ label, items }) => (
+                <div key={label}>
+                  <div style={{ padding: '5px 10px 2px', fontSize: 10, fontWeight: 700, color: '#4e5568', letterSpacing: 0.4 }}>
+                    {label}
+                  </div>
+                  {items.map(entry => {
+                    const isActive = entry.id === activeId;
+                    const textContent = entry.blocks
+                      .filter(b => b.type === 'text').map(b => (b as any).content).join(' ').trim();
+                    const imgCount = entry.blocks.filter(b => b.type === 'image').length;
+                    const preview = textContent.split('\n')[0] || (imgCount > 0 ? '🖼' : '（空）');
+                    return (
+                      <div
+                        key={entry.id}
+                        onClick={() => { setActiveId(entry.id); setShowPicker(false); }}
+                        style={{
+                          display: 'flex', alignItems: 'center', gap: 6,
+                          padding: '6px 10px', cursor: 'pointer',
+                          background: isActive ? 'rgba(122,162,247,0.15)' : 'transparent',
+                          borderLeft: `2px solid ${isActive ? '#7aa2f7' : 'transparent'}`,
+                        }}
+                      >
+                        <span style={{ fontSize: 10, color: isActive ? '#7aa2f7' : '#4e5568', flexShrink: 0 }}>
+                          {fmtTime(entry.updatedAt)}
+                        </span>
+                        <span style={{ fontSize: 11, color: 'var(--theme-text)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1 }}>
+                          {imgCount > 0 && <span style={{ marginRight: 3, opacity: 0.7 }}>🖼</span>}
+                          {preview}
+                        </span>
+                      </div>
+                    );
+                  })}
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+
+        <button onClick={handleNew} title="新建" style={iconBtnStyle}>＋</button>
+        {!isWindow && (
+          <button onClick={() => popout(onClose)} title="弹出独立窗口" style={iconBtnStyle}>⤢</button>
         )}
         {onClose && (
-          <button onClick={onClose} title="关闭" style={hdrBtnStyle('var(--theme-text-muted)', 'transparent')}>
-            ✕
-          </button>
+          <button onClick={onClose} title="关闭" style={iconBtnStyle}>✕</button>
         )}
       </div>
 
-      {/* 主体 */}
+      {/* 主体：编辑区占满全宽 */}
       <div style={{ flex: 1, display: 'flex', overflow: 'hidden' }}>
-        {/* 时间线 */}
-        <div style={{
-          width: 180, flexShrink: 0,
-          borderRight: '1px solid var(--theme-border, rgba(255,255,255,0.08))',
-          overflowY: 'auto', padding: '6px 0',
-        }}>
-          {entries.length === 0 && (
-            <div style={{ padding: '20px 10px', textAlign: 'center', fontSize: 11, color: 'var(--theme-text-muted)', lineHeight: 1.8 }}>
-              还没有记录<br />点击「新建」开始
-            </div>
-          )}
-          {groups.map(({ label, items }) => (
-            <div key={label}>
-              <div style={{ padding: '6px 10px 2px', fontSize: 10, fontWeight: 700, color: 'var(--theme-text-muted)', textTransform: 'uppercase', letterSpacing: 0.5 }}>
-                {label}
-              </div>
-              {items.map(entry => {
-                const isActive = entry.id === activeId;
-                const textContent = entry.blocks
-                  .filter(b => b.type === 'text').map(b => (b as any).content).join(' ').trim();
-                const imgCount = entry.blocks.filter(b => b.type === 'image').length;
-                const preview = textContent.split('\n')[0] || (imgCount > 0 ? '' : '（空）');
-                return (
-                  <div key={entry.id} onClick={() => setActiveId(entry.id)} style={{
-                    padding: '7px 10px', cursor: 'pointer',
-                    background: isActive ? 'var(--theme-accent-bg, rgba(122,162,247,0.15))' : 'transparent',
-                    borderLeft: `2px solid ${isActive ? 'var(--theme-accent, #7aa2f7)' : 'transparent'}`,
-                  }}>
-                    <div style={{ fontSize: 10, fontWeight: 600, color: isActive ? 'var(--theme-accent, #7aa2f7)' : 'var(--theme-text-muted)', marginBottom: 2 }}>
-                      {fmtTime(entry.updatedAt)}
-                    </div>
-                    <div style={{ fontSize: 11, color: 'var(--theme-text)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                      {imgCount > 0 && <span style={{ marginRight: 3 }}>🖼×{imgCount}</span>}
-                      {preview}
-                    </div>
-                  </div>
-                );
-              })}
-            </div>
-          ))}
-        </div>
-
         {/* 编辑区 */}
         <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden', background: '#0d1117' }}>
           {active ? (
@@ -612,12 +653,14 @@ const ScratchPadEditor: React.FC<EditorProps> = ({ mode, onClose }) => {
   );
 };
 
-const hdrBtnStyle = (color: string, bg: string): React.CSSProperties => ({
-  padding: '3px 10px', borderRadius: 5,
-  border: `1px solid ${color === 'var(--theme-text-muted)' ? 'var(--theme-border, rgba(255,255,255,0.12))' : color}`,
-  background: bg, color,
-  fontSize: 12, fontWeight: 600, cursor: 'pointer', flexShrink: 0,
-});
+// 标题栏图标按钮（＋ ⤢ ✕）
+const iconBtnStyle: React.CSSProperties = {
+  width: 24, height: 24, flexShrink: 0,
+  display: 'flex', alignItems: 'center', justifyContent: 'center',
+  padding: 0, border: 'none', borderRadius: 4,
+  background: 'transparent', color: 'var(--theme-text-muted)',
+  fontSize: 14, cursor: 'pointer', lineHeight: 1,
+};
 
 const metaBtnBase: React.CSSProperties = {
   padding: '2px 7px', borderRadius: 4, border: '1px solid', fontSize: 11, cursor: 'pointer',
