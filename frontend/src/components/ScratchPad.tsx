@@ -72,45 +72,60 @@ const autoResize = (el: HTMLTextAreaElement) => {
   el.style.height = el.scrollHeight + 'px';
 };
 
-// ── 复制全部（含图片 base64 内联 HTML）────────────────────────────────
-async function copyEntryAsHtml(entry: ScratchEntry): Promise<boolean> {
-  const htmlParts: string[] = [];
-  const textParts: string[] = [];
+// ── 复制全部：用 contentEditable + execCommand，Qt WebEngine 和浏览器均兼容 ──
+function copyEntryAsHtml(entry: ScratchEntry): boolean {
+  const container = document.createElement('div');
+  container.setAttribute('contenteditable', 'true');
+  Object.assign(container.style, {
+    position: 'fixed', left: '-9999px', top: '0',
+    whiteSpace: 'pre-wrap', userSelect: 'all', opacity: '0',
+  });
+
   for (const b of entry.blocks) {
     if (b.type === 'text') {
-      const escaped = b.content
-        .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-      htmlParts.push(escaped.split('\n').map(l => `<p>${l || '&nbsp;'}</p>`).join(''));
-      textParts.push(b.content);
+      for (const line of b.content.split('\n')) {
+        const p = document.createElement('p');
+        if (line) p.textContent = line;
+        else p.innerHTML = '<br>';
+        container.appendChild(p);
+      }
     } else {
-      htmlParts.push(`<img src="${b.src}" style="max-width:100%;display:block;margin:8px 0;">`);
-      textParts.push('[图片]');
+      const img = document.createElement('img');
+      img.src = b.src;
+      Object.assign(img.style, { maxWidth: '100%', display: 'block', margin: '8px 0' });
+      container.appendChild(img);
     }
   }
-  const html = `<div>${htmlParts.join('')}</div>`;
-  const text = textParts.join('\n');
+
+  document.body.appendChild(container);
   try {
-    await navigator.clipboard.write([
-      new ClipboardItem({
-        'text/html':  new Blob([html],  { type: 'text/html' }),
-        'text/plain': new Blob([text], { type: 'text/plain' }),
-      }),
-    ]);
-    return true;
+    container.focus();
+    const range = document.createRange();
+    range.selectNodeContents(container);
+    const sel = window.getSelection();
+    sel?.removeAllRanges();
+    sel?.addRange(range);
+    const ok = document.execCommand('copy');
+    sel?.removeAllRanges();
+    return ok;
   } catch {
-    // fallback: text only
-    try { await navigator.clipboard.writeText(text); return true; } catch { return false; }
+    return false;
+  } finally {
+    document.body.removeChild(container);
   }
 }
 
-// ── 弹出为独立窗口 ────────────────────────────────────────────────────
-function popout() {
+// ── 弹出为独立窗口（弹出后关闭侧栏，窗口由自己决定关闭）────────────────
+function popout(onClose?: () => void) {
   const url = `${location.pathname}${location.search ? location.search + '&' : '?'}scratchpad=1`;
   const win = window.open(url, 'agent-scratchpad',
     'width=560,height=800,resizable=yes,scrollbars=yes');
   if (!win) {
     alert('浏览器阻止了弹出窗口，请允许本站弹出窗口后重试');
+    return;
   }
+  // 弹出成功 → 关闭主窗口侧栏，实现"真正分离"
+  onClose?.();
 }
 
 /** 检测是否当前页面就是独立便签窗口 */
@@ -272,9 +287,9 @@ const ScratchPadEditor: React.FC<EditorProps> = ({ mode, onClose }) => {
     reader.readAsDataURL(file);
   }, [insertImageAt]);
 
-  const handleCopyAll = useCallback(async () => {
+  const handleCopyAll = useCallback(() => {
     if (!active) return;
-    const ok = await copyEntryAsHtml(active);
+    const ok = copyEntryAsHtml(active);
     if (ok) {
       setCopyOk(true);
       clearTimeout(copyTimer.current);
@@ -327,7 +342,7 @@ const ScratchPadEditor: React.FC<EditorProps> = ({ mode, onClose }) => {
           + 新建
         </button>
         {!isWindow && (
-          <button onClick={popout} title="在独立窗口打开 (多屏友好)" style={hdrBtnStyle('var(--theme-text-muted)', 'transparent')}>
+          <button onClick={() => popout(onClose)} title="弹出为独立窗口（主窗口侧栏自动关闭）" style={hdrBtnStyle('var(--theme-text-muted)', 'transparent')}>
             ⤢
           </button>
         )}
