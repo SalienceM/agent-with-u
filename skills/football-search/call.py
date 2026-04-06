@@ -19,11 +19,17 @@ from typing import Optional
 # ── 读取输入 & 凭据 ──────────────────────────────────────────────────────────
 try:
     raw = sys.stdin.buffer.read()
-    # 尝试 UTF-8，失败则用系统默认编码
-    try:
-        payload: dict = json.loads(raw.decode("utf-8"))
-    except UnicodeDecodeError:
-        payload: dict = json.loads(raw.decode(sys.getdefaultencoding(), errors="replace"))
+    print(f"[debug] raw stdin bytes: {raw[:80]}", file=sys.stderr)
+    # 依次尝试 UTF-8、GBK、UTF-16
+    for enc in ("utf-8", "gbk", "utf-16"):
+        try:
+            payload: dict = json.loads(raw.decode(enc))
+            print(f"[debug] decoded with {enc}: {payload}", file=sys.stderr)
+            break
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            continue
+    else:
+        raise ValueError("无法解码 stdin")
 except Exception as e:
     print(json.dumps({"ok": False, "error": f"stdin parse error: {e}"}))
     sys.exit(0)
