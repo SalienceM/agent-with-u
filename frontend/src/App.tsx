@@ -8,6 +8,7 @@ import { BackendManager } from './components/BackendManager';
 import { SkillManager } from './components/SkillManager';
 import { RepoPanel } from './components/RepoPanel';
 import { PermissionGate } from './components/PermissionGate';
+import { ScratchPad } from './components/ScratchPad';
 import { useChat } from './hooks/useChat';
 import { useConfig } from './hooks/useConfig';
 import { themes } from './hooks/useConfig';
@@ -43,6 +44,7 @@ export const App: React.FC = () => {
   const [toast, setToast] = useState<{ type: 'success' | 'error' | 'info'; message: string } | null>(null);
   const [isImporting, setIsImporting] = useState(false);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+  const [scratchPadOpen, setScratchPadOpen] = useState(false);
   const [visibleCount, setVisibleCount] = useState(6);  // ★ 默认显示最近几条（3 轮对话）
   const toastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const activeSessionIdRef = useRef(activeSessionId);
@@ -76,6 +78,18 @@ export const App: React.FC = () => {
     // Set initial state after wsReady resolves
     const unsub = api.onConnectionStatus((connected) => setBackendConnected(connected));
     return unsub;
+  }, []);
+
+  // ★ Ctrl+Shift+N → 便签本
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key === 'N') {
+        e.preventDefault();
+        setScratchPadOpen(v => !v);
+      }
+    };
+    window.addEventListener('keydown', handler);
+    return () => window.removeEventListener('keydown', handler);
   }, []);
 
   /* ---- 连接后加载初始数据（处理 WS 未就绪导致首次加载为空的问题） ---- */
@@ -527,6 +541,13 @@ export const App: React.FC = () => {
             📦
           </button>
           <button
+            onClick={() => setScratchPadOpen(v => !v)}
+            style={{ ...settingsBtnStyle, ...(scratchPadOpen ? { background: 'var(--theme-accent-bg)', color: 'var(--theme-accent)' } : {}) }}
+            title="便签本 (Ctrl+Shift+N)"
+          >
+            📌
+          </button>
+          <button
             onClick={() => setSettingsOpen(true)}
             style={settingsBtnStyle}
             title="Settings"
@@ -732,6 +753,12 @@ export const App: React.FC = () => {
         isOpen={skillManagerOpen}
         onClose={() => setSkillManagerOpen(false)}
         workingDir={activeSession?.workingDir || ''}
+      />
+
+      {/* ---- 便签本 ---- */}
+      <ScratchPad
+        open={scratchPadOpen}
+        onClose={() => setScratchPadOpen(false)}
       />
 
       {/* ---- New Session Dialog: Select working directory first ---- */}
