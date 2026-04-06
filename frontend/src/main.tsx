@@ -1,6 +1,7 @@
 import React from 'react';
 import { createRoot } from 'react-dom/client';
 import { App } from './App';
+import { ScratchPadWindow, isScratchPadWindow } from './components/ScratchPad';
 
 // ── Zoom manager (Ctrl+wheel / Ctrl++/-/0) ──────────────────────────────────
 // Uses Tauri v2 webview.setZoom() in Tauri mode; no-op in browser dev mode.
@@ -81,4 +82,6 @@ style.textContent = `
 `;
 document.head.appendChild(style);
 
-createRoot(document.getElementById('root')!).render(<App />);
+createRoot(document.getElementById('root')!).render(
+  isScratchPadWindow ? <ScratchPadWindow /> : <App />,
+);

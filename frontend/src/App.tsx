@@ -45,6 +45,8 @@ export const App: React.FC = () => {
   const [isImporting, setIsImporting] = useState(false);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [scratchPadOpen, setScratchPadOpen] = useState(false);
+  const [scratchPadWidth, setScratchPadWidth] = useState(360);
+  const scratchDragRef = useRef<{ startX: number; startW: number } | null>(null);
   const [visibleCount, setVisibleCount] = useState(6);  // ★ 默认显示最近几条（3 轮对话）
   const toastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const activeSessionIdRef = useRef(activeSessionId);
@@ -722,6 +724,42 @@ export const App: React.FC = () => {
         />
       </div>
 
+      {/* ---- 便签本：右侧列（共屏）---- */}
+      {scratchPadOpen && (
+        <>
+          {/* 拖动分割线 */}
+          <div
+            onMouseDown={e => {
+              scratchDragRef.current = { startX: e.clientX, startW: scratchPadWidth };
+              const onMove = (ev: MouseEvent) => {
+                if (!scratchDragRef.current) return;
+                const delta = scratchDragRef.current.startX - ev.clientX;
+                const next = Math.max(260, Math.min(700, scratchDragRef.current.startW + delta));
+                setScratchPadWidth(next);
+              };
+              const onUp = () => {
+                scratchDragRef.current = null;
+                window.removeEventListener('mousemove', onMove);
+                window.removeEventListener('mouseup', onUp);
+              };
+              window.addEventListener('mousemove', onMove);
+              window.addEventListener('mouseup', onUp);
+            }}
+            style={{
+              width: 4, flexShrink: 0, cursor: 'col-resize',
+              background: 'var(--theme-border, rgba(255,255,255,0.1))',
+              transition: 'background 0.15s',
+            }}
+            onMouseEnter={e => (e.currentTarget.style.background = 'var(--theme-accent, #7aa2f7)')}
+            onMouseLeave={e => (e.currentTarget.style.background = 'var(--theme-border, rgba(255,255,255,0.1))')}
+          />
+          {/* 便签本面板 */}
+          <div style={{ width: scratchPadWidth, flexShrink: 0, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
+            <ScratchPad visible={true} onClose={() => setScratchPadOpen(false)} />
+          </div>
+        </>
+      )}
+
       {/* ---- Settings 弹窗 ---- */}
       <Settings
         isOpen={settingsOpen}
@@ -755,11 +793,7 @@ export const App: React.FC = () => {
         workingDir={activeSession?.workingDir || ''}
       />
 
-      {/* ---- 便签本 ---- */}
-      <ScratchPad
-        open={scratchPadOpen}
-        onClose={() => setScratchPadOpen(false)}
-      />
+      {/* 便签本已移到主布局右侧列 */}
 
       {/* ---- New Session Dialog: Select working directory first ---- */}
       {newSessionDialogOpen && (
