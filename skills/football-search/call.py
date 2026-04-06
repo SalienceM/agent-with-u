@@ -85,6 +85,8 @@ def login(client: httpx.Client) -> bool:
     q_text = q_m.group(1).strip() if q_m else f"{qkey}-4"
     captcha_answer = _solve_captcha(q_text)
 
+    print(f"[debug] qkey={qkey!r} q_text={q_text!r} answer={captcha_answer!r}", file=sys.stderr)
+
     # Step 2: 提交登录表单
     data = {
         "step":     "2",
