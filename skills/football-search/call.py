@@ -18,7 +18,12 @@ from typing import Optional
 
 # ── 读取输入 & 凭据 ──────────────────────────────────────────────────────────
 try:
-    payload: dict = json.loads(sys.stdin.read())
+    raw = sys.stdin.buffer.read()
+    # 尝试 UTF-8，失败则用系统默认编码
+    try:
+        payload: dict = json.loads(raw.decode("utf-8"))
+    except UnicodeDecodeError:
+        payload: dict = json.loads(raw.decode(sys.getdefaultencoding(), errors="replace"))
 except Exception as e:
     print(json.dumps({"ok": False, "error": f"stdin parse error: {e}"}))
     sys.exit(0)
@@ -162,7 +167,19 @@ def search(client: httpx.Client, kw: str, n: int) -> list[dict]:
         "orderway": "lastpost",
         "asc":      "DESC",
     }
-    resp = client.post(f"{BASE}/search.php?", data=data, timeout=20)
+    # 关键词同样需要 GBK 编码（网站 charset=GBK）
+    from urllib.parse import quote
+    body = "&".join(
+        f"{quote(k, safe='')}={quote(str(v).encode('gbk', errors='replace'), safe='')}"
+        for k, v in data.items()
+    ).encode("ascii")
+    print(f"[debug] search body: {body}", file=sys.stderr)
+    resp = client.post(
+        f"{BASE}/search.php?",
+        content=body,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        timeout=20,
+    )
     resp.raise_for_status()
     html = resp.content.decode("gbk", errors="replace")
 
