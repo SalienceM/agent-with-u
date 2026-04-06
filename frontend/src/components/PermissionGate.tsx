@@ -1,16 +1,6 @@
-/**
- * PermissionGate: 行内权限确认组件（嵌入聊天气泡）
- *
- * 场景1: 工具执行前的权限确认（tool.status === 'pending'）
- * 场景2: Auto-continue 时的权限确认（tool.status === 'done'）
- *
- * 特点：
- * - 不使用弹窗，直接嵌入消息流中
- * - 展示工具执行的详细内容，支持展开/收起
- * - Skip rest 点击后即时生效
- */
 import React, { useState } from 'react';
 import { api } from '../api';
+import { DiffView, type DiffData } from './DiffView';
 
 export interface PermissionRequestData {
   sessionId: string;
@@ -27,7 +17,7 @@ export interface PermissionRequestData {
 interface Props {
   request: PermissionRequestData;
   onDismiss: () => void;
-  onSkipRest: () => void; // 允许本次会话跳过后续确认
+  onSkipRest: () => void;
 }
 
 const TOOL_ICON: Record<string, string> = {
@@ -39,37 +29,51 @@ const TOOL_ICON: Record<string, string> = {
   Grep: '🔎',
 };
 
+/** 从 Edit/MultiEdit/Write 工具的 input JSON 中解析 diff 数据 */
+function tryParseDiff(name: string, input?: string): DiffData | null {
+  if (!input) return null;
+  if (!/^(Edit|MultiEdit|Write)$/i.test(name)) return null;
+  try {
+    const inp = JSON.parse(input);
+    const oldStr = inp.old_string ?? inp.oldString ?? '';
+    const newStr = inp.new_string ?? inp.newString ?? '';
+    const filePath = inp.file_path ?? inp.filePath ?? inp.path ?? '';
+    if (oldStr || newStr) return { path: filePath, old: oldStr, new: newStr };
+  } catch { /* not JSON */ }
+  return null;
+}
+
+/** 从 Bash 工具的 input JSON 中提取命令 */
+function tryParseCommand(name: string, input?: string): string | null {
+  if (!input || name !== 'Bash') return null;
+  try {
+    const inp = JSON.parse(input);
+    return inp.command ?? inp.cmd ?? null;
+  } catch { return null; }
+}
+
 export const PermissionGate: React.FC<Props> = ({ request, onDismiss, onSkipRest }) => {
-  const [expandedTool, setExpandedTool] = useState<number | null>(null);
+  const [expandedTool, setExpandedTool] = useState<number | null>(0); // 默认展开第一个
   const [loading, setLoading] = useState(false);
 
-  // 判断场景：是否有 pending 状态的工具（工具执行前）还是 done 状态（auto-continue）
   const isPreExecution = request.tools.some(t => t.status === 'pending');
-  const title = isPreExecution
-    ? '🔒 需要确认执行'
-    : '🔄 继续执行？';
+  const title = isPreExecution ? '🔒 需要确认执行' : '🔄 继续执行？';
   const description = isPreExecution
     ? 'Claude 请求执行以下操作，请确认后继续：'
     : 'Claude 已执行以下操作并希望自动继续：';
 
   const handleGrant = async (granted: boolean) => {
     setLoading(true);
-    try {
-      await api.grantPermission(request.sessionId, granted);
-    } catch (e) {
-      console.error('[PermissionGate] grantPermission error:', e);
-    }
+    try { await api.grantPermission(request.sessionId, granted); }
+    catch (e) { console.error('[PermissionGate] grantPermission error:', e); }
     onDismiss();
   };
 
   const handleSkipRest = async () => {
     setLoading(true);
-    try {
-      await api.grantPermission(request.sessionId, true, true);  // 第三个参数 skipRest=true
-    } catch (e) {
-      console.error('[PermissionGate] grantPermission error:', e);
-    }
-    onSkipRest(); // 即时通知父组件更新 skipPermissions
+    try { await api.grantPermission(request.sessionId, true, true); }
+    catch (e) { console.error('[PermissionGate] grantPermission error:', e); }
+    onSkipRest();
     onDismiss();
   };
 
@@ -79,23 +83,10 @@ export const PermissionGate: React.FC<Props> = ({ request, onDismiss, onSkipRest
       background: 'var(--theme-bg-secondary, #f6f8fa)',
       borderBottom: '1px solid var(--theme-border, rgba(0,0,0,0.08))',
     }}>
-      {/* 标题 */}
-      <div style={{
-        fontSize: 13,
-        fontWeight: 600,
-        color: 'var(--theme-text, #1f2328)',
-        marginBottom: 8,
-        display: 'flex',
-        alignItems: 'center',
-        gap: 6,
-      }}>
+      <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--theme-text, #1f2328)', marginBottom: 8 }}>
         {title}
       </div>
-      <div style={{
-        fontSize: 12,
-        color: 'var(--theme-text-muted, #656d76)',
-        marginBottom: 10,
-      }}>
+      <div style={{ fontSize: 12, color: 'var(--theme-text-muted, #656d76)', marginBottom: 10 }}>
         {description}
       </div>
 
@@ -103,7 +94,13 @@ export const PermissionGate: React.FC<Props> = ({ request, onDismiss, onSkipRest
       <div style={{ marginBottom: 12 }}>
         {request.tools.map((tc, i) => {
           const isExpanded = expandedTool === i;
-          const hasLongInput = tc.input && tc.input.length > 100;
+          const diffData = tryParseDiff(tc.name, tc.input);
+          const command = tryParseCommand(tc.name, tc.input);
+          // 预览文字：Edit 工具显示文件路径，Bash 显示命令，其他截断 input
+          const previewText = diffData
+            ? (diffData.path || '(查看 diff)')
+            : command ?? (tc.input ? tc.input.slice(0, 120) + (tc.input.length > 120 ? '…' : '') : '');
+          const isExpandable = !!(diffData || tc.input);
 
           return (
             <div
@@ -118,79 +115,71 @@ export const PermissionGate: React.FC<Props> = ({ request, onDismiss, onSkipRest
             >
               {/* 工具头部 */}
               <div
-                onClick={() => setExpandedTool(isExpanded ? null : i)}
+                onClick={() => isExpandable && setExpandedTool(isExpanded ? null : i)}
                 style={{
                   padding: '8px 12px',
                   display: 'flex',
                   alignItems: 'center',
                   gap: 8,
-                  cursor: hasLongInput ? 'pointer' : 'default',
+                  cursor: isExpandable ? 'pointer' : 'default',
                   userSelect: 'none',
                 }}
               >
                 <span style={{ fontSize: 16 }}>{TOOL_ICON[tc.name] || '🔧'}</span>
-                <span style={{
-                  fontFamily: 'monospace',
-                  fontWeight: 600,
-                  fontSize: 13,
-                  color: 'var(--theme-accent, #0969da)',
-                }}>
+                <span style={{ fontFamily: 'monospace', fontWeight: 600, fontSize: 13, color: 'var(--theme-accent, #0969da)' }}>
                   {tc.name}
                 </span>
                 <span style={{
-                  fontSize: 10,
-                  padding: '2px 6px',
-                  borderRadius: 4,
+                  fontSize: 10, padding: '2px 6px', borderRadius: 4,
                   background: tc.status === 'done' ? 'rgba(47,129,63,0.15)' : 'rgba(203,132,25,0.15)',
                   color: tc.status === 'done' ? '#1a7f37' : '#9a6700',
                 }}>
                   {tc.status === 'pending' ? '待确认' : tc.status}
                 </span>
-                {hasLongInput && (
+                {/* 预览文字（收起时） */}
+                {!isExpanded && previewText && (
                   <span style={{
-                    marginLeft: 'auto',
-                    fontSize: 10,
-                    color: 'var(--theme-text-muted, #656d76)',
+                    fontSize: 11, color: 'var(--theme-text-muted, #656d76)',
+                    overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1,
                   }}>
-                    {isExpanded ? '收起' : '展开详情'}
+                    {previewText}
+                  </span>
+                )}
+                {isExpandable && (
+                  <span style={{ marginLeft: 'auto', fontSize: 10, color: 'var(--theme-text-muted, #656d76)', flexShrink: 0 }}>
+                    {isExpanded ? '收起 ▲' : '展开 ▼'}
                   </span>
                 )}
               </div>
 
-              {/* 工具输入详情 */}
-              {tc.input && (
-                <div style={{
-                  padding: isExpanded ? '8px 12px' : '0 12px 8px',
-                  borderTop: isExpanded ? '1px solid var(--theme-border, rgba(0,0,0,0.08))' : 'none',
-                }}>
-                  {isExpanded ? (
+              {/* 展开内容 */}
+              {isExpanded && (
+                <div style={{ borderTop: '1px solid var(--theme-border, rgba(0,0,0,0.08))', padding: '8px 12px' }}>
+                  {diffData ? (
+                    <DiffView diff={diffData} />
+                  ) : command ? (
                     <pre style={{
-                      margin: 0,
-                      fontSize: 11,
+                      margin: 0, fontSize: 12,
                       color: 'var(--theme-text, #1f2328)',
                       background: 'var(--theme-code-bg, #f6f8fa)',
-                      borderRadius: 4,
-                      padding: '8px 10px',
-                      whiteSpace: 'pre-wrap',
-                      wordBreak: 'break-all',
-                      maxHeight: 300,
-                      overflow: 'auto',
-                      fontFamily: 'monospace',
+                      borderRadius: 4, padding: '8px 10px',
+                      whiteSpace: 'pre-wrap', wordBreak: 'break-all',
+                      maxHeight: 300, overflow: 'auto', fontFamily: 'monospace',
+                    }}>
+                      {command}
+                    </pre>
+                  ) : tc.input ? (
+                    <pre style={{
+                      margin: 0, fontSize: 11,
+                      color: 'var(--theme-text, #1f2328)',
+                      background: 'var(--theme-code-bg, #f6f8fa)',
+                      borderRadius: 4, padding: '8px 10px',
+                      whiteSpace: 'pre-wrap', wordBreak: 'break-all',
+                      maxHeight: 300, overflow: 'auto', fontFamily: 'monospace',
                     }}>
                       {tc.input}
                     </pre>
-                  ) : (
-                    <div style={{
-                      fontSize: 11,
-                      color: 'var(--theme-text-muted, #656d76)',
-                      overflow: 'hidden',
-                      textOverflow: 'ellipsis',
-                      whiteSpace: 'nowrap',
-                    }}>
-                      {tc.input.slice(0, 100)}
-                      {tc.input.length > 100 ? '…' : ''}
-                    </div>
-                  )}
+                  ) : null}
                 </div>
               )}
             </div>
@@ -199,24 +188,14 @@ export const PermissionGate: React.FC<Props> = ({ request, onDismiss, onSkipRest
       </div>
 
       {/* 操作按钮 */}
-      <div style={{
-        display: 'flex',
-        gap: 8,
-        justifyContent: 'flex-end',
-      }}>
+      <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
         <button
           onClick={() => handleGrant(false)}
           disabled={loading}
           style={{
-            padding: '6px 14px',
-            borderRadius: 6,
-            border: '1px solid rgba(207,34,46,0.4)',
-            background: 'rgba(207,34,46,0.08)',
-            color: '#cf222e',
-            cursor: loading ? 'wait' : 'pointer',
-            fontSize: 12,
-            fontWeight: 500,
-            opacity: loading ? 0.6 : 1,
+            padding: '6px 14px', borderRadius: 6,
+            border: '1px solid rgba(207,34,46,0.4)', background: 'rgba(207,34,46,0.08)',
+            color: '#cf222e', cursor: loading ? 'wait' : 'pointer', fontSize: 12, fontWeight: 500, opacity: loading ? 0.6 : 1,
           }}
         >
           ⛔ {isPreExecution ? '拒绝' : '中止'}
@@ -225,15 +204,9 @@ export const PermissionGate: React.FC<Props> = ({ request, onDismiss, onSkipRest
           onClick={handleSkipRest}
           disabled={loading}
           style={{
-            padding: '6px 14px',
-            borderRadius: 6,
-            border: '1px solid rgba(154,103,0,0.4)',
-            background: 'rgba(203,132,25,0.1)',
-            color: '#9a6700',
-            cursor: loading ? 'wait' : 'pointer',
-            fontSize: 12,
-            fontWeight: 500,
-            opacity: loading ? 0.6 : 1,
+            padding: '6px 14px', borderRadius: 6,
+            border: '1px solid rgba(154,103,0,0.4)', background: 'rgba(203,132,25,0.1)',
+            color: '#9a6700', cursor: loading ? 'wait' : 'pointer', fontSize: 12, fontWeight: 500, opacity: loading ? 0.6 : 1,
           }}
         >
           ✅ 允许并跳过后续
@@ -242,15 +215,9 @@ export const PermissionGate: React.FC<Props> = ({ request, onDismiss, onSkipRest
           onClick={() => handleGrant(true)}
           disabled={loading}
           style={{
-            padding: '6px 14px',
-            borderRadius: 6,
-            border: 'none',
-            background: 'var(--theme-accent, #0969da)',
-            color: '#fff',
-            cursor: loading ? 'wait' : 'pointer',
-            fontSize: 12,
-            fontWeight: 600,
-            opacity: loading ? 0.6 : 1,
+            padding: '6px 14px', borderRadius: 6,
+            border: 'none', background: 'var(--theme-accent, #0969da)',
+            color: '#fff', cursor: loading ? 'wait' : 'pointer', fontSize: 12, fontWeight: 600, opacity: loading ? 0.6 : 1,
           }}
         >
           ▶ {isPreExecution ? '允许一次' : '继续'}
