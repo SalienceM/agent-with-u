@@ -28,6 +28,7 @@ export const App: React.FC = () => {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [backendManagerOpen, setBackendManagerOpen] = useState(false);
   const [repoPanelOpen, setRepoPanelOpen] = useState(false);
+  const [repoPanelEditing, setRepoPanelEditing] = useState(false);
   const [newSessionDialogOpen, setNewSessionDialogOpen] = useState(false);
   const [skipPermissions, setSkipPermissions] = useState(true);  // ★ 权限模式开关
   const [streamingSessions, setStreamingSessions] = useState<Set<string>>(new Set());  // ★ Per-session streaming state
@@ -558,14 +559,15 @@ export const App: React.FC = () => {
 
         {/* ---- Repo 面板（展开区域）---- */}
         <div style={{
-          maxHeight: repoPanelOpen ? 400 : 0,
-          overflow: 'hidden',
-          transition: 'max-height 0.3s cubic-bezier(0.22,0.61,0.36,1)',
+          maxHeight: repoPanelOpen ? (repoPanelEditing ? 'calc(100vh - 160px)' : 400) : 0,
+          overflow: repoPanelEditing ? 'auto' : 'hidden',
+          transition: repoPanelEditing ? 'none' : 'max-height 0.3s cubic-bezier(0.22,0.61,0.36,1)',
         }}>
           <RepoPanel
             open={repoPanelOpen}
             workingDir={activeSession?.workingDir || ''}
             onClose={() => setRepoPanelOpen(false)}
+            onEditingChange={setRepoPanelEditing}
           />
         </div>
 

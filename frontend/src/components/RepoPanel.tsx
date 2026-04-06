@@ -29,6 +29,7 @@ interface Props {
   open: boolean;
   workingDir: string;
   onClose: () => void;
+  onEditingChange?: (editing: boolean) => void;
 }
 
 // 常用 emoji 列表
@@ -201,7 +202,7 @@ const SKILL_TYPE_PRESETS: SkillTypePreset[] = [
 // ═══════════════════════════════════════
 //  RepoPanel — Skill + Prompt 仓库面板
 // ═══════════════════════════════════════
-export const RepoPanel: React.FC<Props> = ({ open, workingDir, onClose }) => {
+export const RepoPanel: React.FC<Props> = ({ open, workingDir, onClose, onEditingChange }) => {
   const [skills, setSkills] = useState<SkillItem[]>([]);
   const [prompts, setPrompts] = useState<PromptItem[]>([]);
   // 编辑状态
@@ -248,6 +249,10 @@ export const RepoPanel: React.FC<Props> = ({ open, workingDir, onClose }) => {
   useEffect(() => {
     if (open) refresh();
   }, [open, refresh]);
+
+  useEffect(() => {
+    onEditingChange?.(editingType !== null);
+  }, [editingType, onEditingChange]);
 
   // ── 打开编辑器 ──
   const openEditor = useCallback((type: 'skill' | 'prompt', item?: SkillItem | PromptItem) => {
