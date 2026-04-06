@@ -124,6 +124,7 @@ class ModelBackend(ABC):
         working_dir: Optional[str] = None,
         skip_permissions: Optional[bool] = None,
         on_permission_request: Optional[Callable[[PermissionRequest], Awaitable[bool]]] = None,
+        constraints: Optional[str] = None,  # ★ Session-level constraints/rules/prompts
     ) -> dict:
         ...
 

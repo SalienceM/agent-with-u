@@ -22,6 +22,7 @@ class OpenAICompatibleBackend(ModelBackend):
         skip_permissions: Optional[bool] = None,
         extra_tools: Optional[list[dict]] = None,
         on_tool_call: Optional[Callable] = None,
+        constraints: Optional[str] = None,  # ★ Session-level constraints/rules/prompts
         **kwargs,
     ) -> dict:
         self.clear_cancelled(session_id)
@@ -31,6 +32,11 @@ class OpenAICompatibleBackend(ModelBackend):
                 on_delta(StreamDelta(session_id, message_id, delta_type, **kw))
 
         try:
+            # ★ 注入约束/提示词到 system message 中
+            final_content = content
+            if constraints:
+                final_content = f"以下是你必须遵守的规则和约束：\n\n{constraints}\n\n---\n\n{content}"
+
             api_messages = []
             for m in messages:
                 if m.role == "system":
@@ -59,7 +65,7 @@ class OpenAICompatibleBackend(ModelBackend):
                                 "url": f"data:{img.mime_type};base64,{img.base64}"
                             },
                         })
-            current_content.append({"type": "text", "text": content})
+            current_content.append({"type": "text", "text": final_content})
             api_messages.append({"role": "user", "content": current_content})
 
             base_url = self.config.base_url or "https://api.openai.com/v1"

@@ -27,6 +27,7 @@ class AnthropicAPIBackend(ModelBackend):
         skip_permissions: Optional[bool] = None,
         extra_tools: Optional[list[dict]] = None,
         on_tool_call: Optional[Callable] = None,
+        constraints: Optional[str] = None,  # ★ Session-level constraints/rules/prompts
         **kwargs,
     ) -> dict:
         """
@@ -50,6 +51,11 @@ class AnthropicAPIBackend(ModelBackend):
             return {}
 
         try:
+            # ★ 注入约束/提示词到 system message 中
+            final_content = content
+            if constraints:
+                final_content = f"以下是你必须遵守的规则和约束：\n\n{constraints}\n\n---\n\n{content}"
+
             api_key = (
                 self.get_env("ANTHROPIC_API_KEY")
                 or self.get_env("ANTHROPIC_AUTH_TOKEN")
@@ -117,14 +123,16 @@ class AnthropicAPIBackend(ModelBackend):
                                 "data": img_b64,
                             },
                         })
-            if content:  # only add text block if non-empty
-                current_blocks.append({"type": "text", "text": content})
+            if final_content:  # only add text block if non-empty
+                current_blocks.append({"type": "text", "text": final_content})
             if not current_blocks:
                 current_blocks.append({"type": "text", "text": "(image)"})
             api_messages.append({"role": "user", "content": current_blocks})
 
-            # System prompt
+            # System prompt - ★ 将约束作为 system message 注入
             system_msgs = [m.content for m in messages if m.role == "system"]
+            if constraints:
+                system_msgs.insert(0, f"以下是你必须遵守的规则和约束：\n\n{constraints}")
             system_str = "\n\n".join(system_msgs) if system_msgs else None
 
             if api_key:

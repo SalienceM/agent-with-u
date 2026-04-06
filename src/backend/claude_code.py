@@ -213,6 +213,7 @@ class ClaudeCodeOfficialBackend(ModelBackend):
         working_dir: Optional[str] = None,
         skip_permissions: Optional[bool] = None,
         on_permission_request: Optional[Callable[[PermissionRequest], Awaitable[bool]]] = None,
+        constraints: Optional[str] = None,  # ★ Session-level constraints/rules/prompts
     ) -> dict:
         self.clear_cancelled(session_id)
         _new_agent_sid: Optional[str] = agent_session_id
@@ -222,6 +223,11 @@ class ClaudeCodeOfficialBackend(ModelBackend):
                 on_delta(StreamDelta(session_id, message_id, delta_type, **kwargs))
 
         cwd = working_dir or getattr(self.config, "working_dir", None) or "."
+
+        # ★ 注入约束/提示词到 prompt 中
+        final_content = content
+        if constraints:
+            final_content = f"以下是你必须遵守的规则和约束：\n\n{constraints}\n\n---\n\n{content}"
 
         # ★ 图片支持：有图时用 stdin stream-json 传递多模态内容块
         # claude CLI 不支持 --image 等独立图片参数，但 --input-format stream-json
@@ -244,7 +250,7 @@ class ClaudeCodeOfficialBackend(ModelBackend):
                             "data": img_b64,
                         },
                     })
-            content_blocks.append({"type": "text", "text": content})
+            content_blocks.append({"type": "text", "text": final_content})
             stdin_msg = json.dumps({
                 "type": "user",
                 "message": {"role": "user", "content": content_blocks},
@@ -253,7 +259,7 @@ class ClaudeCodeOfficialBackend(ModelBackend):
             print(f"[OfficialBackend] images: {len(content_blocks) - 1} block(s), using stdin stream-json",
                   file=sys.stderr, flush=True)
 
-        cmd = self._build_cmd(content, agent_session_id, cwd, stdin_mode=bool(_stdin_data))
+        cmd = self._build_cmd(final_content, agent_session_id, cwd, stdin_mode=bool(_stdin_data))
         proc_env = self._build_env()
 
         auth_token = proc_env.get("ANTHROPIC_AUTH_TOKEN", "")

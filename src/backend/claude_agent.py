@@ -34,6 +34,7 @@ class ClaudeAgentBackend(ModelBackend):
         working_dir: Optional[str] = None,
         skip_permissions: Optional[bool] = None,
         on_permission_request: Optional[Callable[[PermissionRequest], Awaitable[bool]]] = None,
+        constraints: Optional[str] = None,  # ★ Session-level constraints/rules/prompts
     ) -> dict:
         self.clear_cancelled(session_id)
 
@@ -140,8 +141,13 @@ class ClaudeAgentBackend(ModelBackend):
                     _waiting_for_permission = False
 
             async def _build_prompt():
+                # ★ 注入约束/提示词到 prompt 中
+                final_content = content
+                if constraints:
+                    final_content = f"以下是你必须遵守的规则和约束：\n\n{constraints}\n\n---\n\n{content}"
+
                 if not has_images:
-                    yield content
+                    yield final_content
                     return
                 import base64 as _b64
                 content_blocks: list[dict] = []
@@ -159,7 +165,7 @@ class ClaudeAgentBackend(ModelBackend):
                                 "data": img_b64,
                             },
                         })
-                content_blocks.append({"type": "text", "text": content})
+                content_blocks.append({"type": "text", "text": final_content})
                 yield {
                     "type": "user",
                     "message": {"role": "user", "content": content_blocks},
@@ -199,7 +205,13 @@ class ClaudeAgentBackend(ModelBackend):
             _done_emitted = False
             # 无图时直接传字符串，有图时用 async generator 传 content blocks
             # SDK 对 async generator yield str 的处理与直接传 str 行为不一致
-            prompt_arg = _build_prompt() if has_images else content
+            # ★ 注入约束到 prompt 中
+            if has_images:
+                prompt_arg = _build_prompt()
+            elif constraints:
+                prompt_arg = f"以下是你必须遵守的规则和约束：\n\n{constraints}\n\n---\n\n{content}"
+            else:
+                prompt_arg = content
             async for message in sdk_query(prompt=prompt_arg, options=options):
                 if self.is_cancelled(session_id):
                     break

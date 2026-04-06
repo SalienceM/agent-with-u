@@ -155,6 +155,7 @@ class DashScopeImageBackend(ModelBackend):
         working_dir: Optional[str] = None,
         skip_permissions: Optional[bool] = None,
         on_permission_request: Optional[Callable] = None,
+        constraints: Optional[str] = None,  # ★ Session-level constraints/rules/prompts
     ) -> dict:
 
         def emit(dtype: str, **kw):
@@ -171,12 +172,18 @@ class DashScopeImageBackend(ModelBackend):
         model = (self.config.model or self._DEFAULT_MODEL).strip()
 
         # ── 提示词 + 参数解析 ──────────────────────────────────────────
-        # 从 content 中提取 --size 指令，剩余部分作为 prompt
-        raw_content = content.strip()
-        if not raw_content:
+        # ★ 注入约束到提示词中
+        final_prompt_content = content.strip()
+        if not final_prompt_content:
             emit("error", error="提示词为空，请输入图像描述")
             emit("done")
             return {}
+
+        # 如果有约束，将约束前置到提示词前面
+        raw_content = final_prompt_content
+        if constraints:
+            raw_content = f"{constraints}\n\n{content.strip()}"
+
         prompt, size_arg = self._parse_size_from_content(raw_content)
         if not prompt:
             prompt = raw_content  # fallback

@@ -463,6 +463,7 @@ class Bridge(QObject):
                     agent_session_id=use_agent_session,
                     working_dir=session.working_dir,
                     skip_permissions=skip_permissions,
+                    constraints=session.constraints,  # ★ 注入会话约束/提示词
                 )
 
                 # ★ 检测 resume 是否失败（返回的 agentSessionId 与传入的不同，说明 session 无效）
