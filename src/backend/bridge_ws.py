@@ -1089,23 +1089,33 @@ class BridgeWS:
         extra_tools: list[dict] = []
         skill_map: dict[str, dict] = {}
 
+        BUILTIN_TYPES = {"web-search", "web-fetch", "python-script"}
+
         for sname in skill_names:
             info = self._skill_store.get_skill(sname)
-            if not info or not info.get("backend"):
-                continue  # 传统 Skill，跳过
-            backend_id = info["backend"]
-            description = info.get("description", f"Backend Skill: {sname}")
+            if not info:
+                continue
+            skill_type = info.get("type", "")
+            has_backend = bool(info.get("backend"))
+            is_builtin = skill_type in BUILTIN_TYPES or info.get("hasCallPy")
+
+            # 传统指令型 Skill（无 backend、无内置类型）：跳过，走 CLI 原生发现
+            if not has_backend and not is_builtin:
+                continue
+
+            description = info.get("description", f"Skill: {sname}")
             input_schema = info.get("inputSchema") or {"type": "object", "properties": {}}
 
-            tool_name = sname.replace("-", "_")  # 标准化工具名（Claude 不允许连字符）
+            tool_name = sname.replace("-", "_")  # Claude 不允许工具名含连字符
             extra_tools.append({
                 "name": tool_name,
                 "description": description,
                 "input_schema": input_schema,
             })
             skill_map[tool_name] = {
-                "backend_id": backend_id,
+                "backend_id": info.get("backend", ""),
                 "skill_name": sname,
+                "skill_type": skill_type,
             }
 
         return extra_tools, skill_map if skill_map else None
@@ -1669,7 +1679,21 @@ sys.stdout.buffer.flush()
             print(f"[bridge_ws] Skill-blocked native tools: {blocked_tools}", file=sys.stderr, flush=True)
 
         async def _on_tool_call(tool_name: str, tool_input: dict) -> str:
-            """Backend Skill 工具调用回调。"""
+            """Skill 工具调用回调：路由到 Backend Skill 或内置/python-script 类型。"""
+            mapping = (skill_map or {}).get(tool_name, {})
+            skill_type = mapping.get("skill_type", "")
+            sname = mapping.get("skill_name", tool_name.replace("_", "-"))
+            BUILTIN_TYPES = {"web-search", "web-fetch", "python-script"}
+            if skill_type in BUILTIN_TYPES or not mapping.get("backend_id"):
+                # 内置或 python-script：走 HTTP skill-call 路由
+                payload = {"skill": sname, **tool_input}
+                # web-search 用 prompt 字段；其他类型直接透传 tool_input
+                if skill_type == "web-search" and "query" in tool_input:
+                    payload["prompt"] = tool_input["query"]
+                elif skill_type == "web-fetch" and "url" in tool_input:
+                    payload["url"] = tool_input["url"]
+                _, result_text = await self._handle_skill_call(payload)
+                return result_text
             return await self._execute_backend_skill(
                 tool_name, tool_input, skill_map or {}, session, message_id,
             )
