@@ -474,7 +474,7 @@ export const RepoPanel: React.FC<Props> = ({ open, workingDir, onClose }) => {
                   <div
                     onClick={e => { e.stopPropagation(); openSecretsDialog(s.name); }}
                     title={s.hasSecrets ? '已配置凭据，点击修改' : '需要配置凭据'}
-                    style={{ position: 'absolute', top: 4, right: 4, fontSize: 11, cursor: 'pointer',
+                    style={{ position: 'absolute', top: 4, left: 4, fontSize: 11, cursor: 'pointer',
                       color: s.hasSecrets ? 'rgba(234,197,95,0.9)' : 'rgba(255,255,255,0.3)' }}
                   >🔑</div>
                 )}
