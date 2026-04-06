@@ -1307,7 +1307,7 @@ const backendItemStyle: React.CSSProperties = {
 const deleteBtnStyle: React.CSSProperties = {
   background: 'none', border: 'none', fontSize: 15,
   cursor: 'pointer', padding: '4px 8px',
-  color: 'rgba(255,255,255,0.45)',
+  color: 'var(--theme-text-muted, #656d76)',
   transition: 'color 0.15s',
 };
 

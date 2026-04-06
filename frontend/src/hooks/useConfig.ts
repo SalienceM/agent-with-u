@@ -105,23 +105,24 @@ export const themes: Record<ThemeType, {
   // ════════════════════════════════════
   light: {
     // AgentWithU 品牌暖红主题
+    // 三层对比：页面(暖米色) / AI 气泡(浅黄白) / 用户气泡(玫瑰红) — 层次清晰
     name: 'AgentWithU',
-    bg: '#f7f1e8',
-    bgSecondary: '#ede5d6',
-    bgTertiary: '#e3d9c8',
-    border: '#9B2335',
+    bg: '#f5ede0',              // 暖米色页面底色（比原 #f7f1e8 稍深，衬托 AI 气泡）
+    bgSecondary: '#ecdfd0',
+    bgTertiary: '#e1d0bc',
+    border: 'rgba(155,35,53,0.22)',
     text: '#1f1a17',
     textMuted: '#6b5a4e',
     accent: '#8B1C1C',
     accentHover: '#6e1515',
     accentBg: '#8B1C1C1a',
-    messageBg: '#ede5d6',
-    userMessageBg: '#e3d9c8',
-    userBubbleBg: '#f0dcd0',
-    userBubbleBorder: '#9B233588',
-    codeBg: '#ede5d6',
-    inputBg: '#f7f1e8',
-    sidebarBg: '#ede5d6',
+    messageBg: '#fdfaf5',       // AI 气泡近白暖色，在暖米色上清晰突出
+    userMessageBg: '#fad4cc',
+    userBubbleBg: '#fad4cc',    // 用户气泡玫瑰红，与 AI 气泡、页面均明显不同
+    userBubbleBorder: '#9B233566',
+    codeBg: '#ecdfd0',
+    inputBg: '#fdfaf5',
+    sidebarBg: '#ecdfd0',
     success: '#2a7a3b',
     successBg: '#2a7a3b1a',
     successBorder: '#2a7a3b33',
@@ -152,24 +153,25 @@ export const themes: Record<ThemeType, {
     error: '#ff3366',
   },
   classic: {
-    // 经典亮色 — GitHub Light 风格，清爽中性
+    // 经典亮色 — 浅蓝灰底色，白色 AI 气泡清晰浮起，蓝色用户气泡明确区分
+    // 三层对比：页面(灰蓝) / AI 气泡(白) / 用户气泡(蓝) — 互不混淆
     name: 'Classic',
-    bg: '#ffffff',
-    bgSecondary: '#f6f8fa',
-    bgTertiary: '#eaeef2',
-    border: 'rgba(0,0,0,0.12)',
-    text: '#1f2328',
-    textMuted: '#656d76',
+    bg: '#f0f2f5',              // 浅灰蓝，不刺眼且衬托白色气泡
+    bgSecondary: '#e6e9ee',     // 侧栏、卡片背景
+    bgTertiary: '#d8dde5',      // hover、菜单
+    border: 'rgba(0,0,0,0.13)',
+    text: '#1c2128',
+    textMuted: '#57606a',
     accent: '#0969da',
     accentHover: '#0550ae',
-    accentBg: '#0969da1a',
-    messageBg: '#f6f8fa',
-    userMessageBg: '#eaeef2',
-    userBubbleBg: '#ddf4ff',
-    userBubbleBorder: '#0969da66',
-    codeBg: '#f0f2f5',
+    accentBg: '#0969da18',
+    messageBg: '#ffffff',       // AI 气泡纯白，在灰蓝页面上清晰突出
+    userMessageBg: '#dbeafe',
+    userBubbleBg: '#dbeafe',    // 用户气泡中蓝，与 AI 白、页面灰蓝均不同
+    userBubbleBorder: '#0969da55',
+    codeBg: '#eef0f3',
     inputBg: '#ffffff',
-    sidebarBg: '#f6f8fa',
+    sidebarBg: '#e6e9ee',
     success: '#1a7f37',
     successBg: '#1a7f371a',
     successBorder: '#1a7f3733',
