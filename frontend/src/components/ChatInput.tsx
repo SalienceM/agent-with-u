@@ -658,7 +658,7 @@ const ChatInputInner: React.FC<Props> = ({
         {isStreaming ? (
           <button onClick={onAbort} style={abortBtnStyle} title="Stop">■</button>
         ) : (
-          <button onClick={handleSend} style={sendBtnStyle} title="Send (Enter)">↑</button>
+          <button onClick={handleSend} style={sendBtnStyle} title="Send (Enter)">🚀</button>
         )}
       </div>
     </div>
