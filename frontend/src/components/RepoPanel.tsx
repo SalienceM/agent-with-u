@@ -400,7 +400,7 @@ export const RepoPanel: React.FC<Props> = ({ open, workingDir, onClose }) => {
   // 编辑器模式
   if (editingType) {
     return (
-      <div style={panelStyle}>
+      <div style={panelEditorStyle}>
         <div style={editorWrapStyle}>
           <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 12 }}>
             {editingType === 'prompt' && (
@@ -799,6 +799,17 @@ const panelStyle: React.CSSProperties = {
   overflow: 'hidden',
 };
 
+const panelEditorStyle: React.CSSProperties = {
+  display: 'flex',
+  flexDirection: 'column',
+  padding: '12px 16px',
+  background: 'var(--theme-bg-secondary)',
+  borderBottom: '1px solid var(--theme-border)',
+  position: 'relative',
+  overflowY: 'auto',
+  maxHeight: 'calc(100vh - 120px)',
+};
+
 const columnStyle: React.CSSProperties = {
   flex: 1,
   display: 'flex',
@@ -927,7 +938,6 @@ const editorWrapStyle: React.CSSProperties = {
   display: 'flex',
   flexDirection: 'column',
   gap: 8,
-  maxHeight: 350,
 };
 
 const nameInputStyle: React.CSSProperties = {
@@ -957,7 +967,7 @@ const backendSelectStyle: React.CSSProperties = {
 
 const contentTextareaStyle: React.CSSProperties = {
   flex: 1,
-  minHeight: 420,
+  minHeight: 320,
   fontSize: 13,
   lineHeight: 1.6,
   background: 'var(--theme-input-bg)',
