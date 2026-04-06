@@ -54,13 +54,22 @@ BASE = "https://www.txzqw.me"
 _NUM_TO_CN = {0:"零",1:"一",2:"二",3:"三",4:"四",5:"五",6:"六",7:"七",8:"八",9:"九",10:"十"}
 
 def _solve_captcha(question_text: str) -> str:
-    """解算形如 '9-4=?' 的验证问答，返回中文答案如 '五'。"""
-    m = re.search(r'(\d+)\s*([+\-×÷*])\s*(\d+)', question_text)
+    """解算形如 '9-4=?' / '2X8=?' 的验证问答，返回中文答案如 '五'/'十六'。"""
+    m = re.search(r'(\d+)\s*([+\-×÷*xX])\s*(\d+)', question_text)
     if not m:
         return "五"
-    a, op, b = int(m.group(1)), m.group(2), int(m.group(3))
-    result = {"+": a+b, "-": a-b, "×": a*b, "*": a*b, "÷": a//b if b else 0}.get(op, 0)
-    return _NUM_TO_CN.get(result, str(result))
+    a, op, b = int(m.group(1)), m.group(2).upper(), int(m.group(3))
+    result = {"+": a+b, "-": a-b, "×": a*b, "X": a*b, "÷": a//b if b else 0, "*": a*b}.get(op, 0)
+    # 构造中文数字（支持 0-99）
+    if result in _NUM_TO_CN:
+        return _NUM_TO_CN[result]
+    if 11 <= result <= 19:
+        return "十" + _NUM_TO_CN[result - 10]
+    if result == 20:
+        return "二十"
+    if 21 <= result <= 29:
+        return "二十" + _NUM_TO_CN[result - 20]
+    return str(result)
 
 
 # ── 登录 ─────────────────────────────────────────────────────────────────────
@@ -86,6 +95,7 @@ def login(client: httpx.Client) -> bool:
     captcha_answer = _solve_captcha(q_text)
 
     print(f"[debug] qkey={qkey!r} q_text={q_text!r} answer={captcha_answer!r}", file=sys.stderr)
+    print(f"[debug] username={USERNAME!r} password={'*'*len(PASSWORD) if PASSWORD else '(empty)'}", file=sys.stderr)
 
     # Step 2: 提交登录表单
     data = {
