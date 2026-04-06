@@ -225,6 +225,7 @@ export const RepoPanel: React.FC<Props> = ({ open, workingDir, onClose }) => {
   // 安装插件包
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [installing, setInstalling] = useState(false);
+  const [installResult, setInstallResult] = useState<{ name: string; version: string } | null>(null);
   // Secrets 配置
   type SecretsField = { key: string; label: string; type: string; required?: boolean; placeholder?: string };
   const [secretsSkill, setSecretsSkill] = useState<string | null>(null);
@@ -350,6 +351,7 @@ export const RepoPanel: React.FC<Props> = ({ open, workingDir, onClose }) => {
       if (res.status === 'ok') {
         await refresh();
         const m = res.manifest;
+        setInstallResult({ name: m?.name || m?.id || '未知', version: m?.version || '?' });
         if (m?.id) {
           const schema = await api.getSkillSecretsSchema(m.id);
           if (schema?.fields?.length) {
@@ -426,7 +428,8 @@ export const RepoPanel: React.FC<Props> = ({ open, workingDir, onClose }) => {
               value={editingName}
               onChange={e => setEditingName(e.target.value)}
               placeholder={editingType === 'skill' ? 'Skill 名称' : 'Prompt 名称'}
-              style={nameInputStyle}
+              disabled={!!(editingSkillItem?.manifest)}
+              style={{ ...nameInputStyle, ...(editingSkillItem?.manifest ? { opacity: 0.5, cursor: 'not-allowed' } : {}) }}
             />
             <span style={{ fontSize: 11, color: 'var(--theme-text-muted)', textTransform: 'uppercase' }}>
               {editingType === 'skill' ? 'Skill' : 'Prompt'}
@@ -439,9 +442,10 @@ export const RepoPanel: React.FC<Props> = ({ open, workingDir, onClose }) => {
               <select
                 value={parseSkillBackend(editingContent)}
                 onChange={e => {
-                  setEditingContent(prev => setSkillBackend(prev, e.target.value));
+                  if (!editingSkillItem?.manifest) setEditingContent(prev => setSkillBackend(prev, e.target.value));
                 }}
-                style={backendSelectStyle}
+                disabled={!!(editingSkillItem?.manifest)}
+                style={{ ...backendSelectStyle, ...(editingSkillItem?.manifest ? { opacity: 0.5, cursor: 'not-allowed' } : {}) }}
               >
                 <option value="">无 (传统 Skill)</option>
                 {backends.map(b => (
@@ -685,6 +689,21 @@ export const RepoPanel: React.FC<Props> = ({ open, workingDir, onClose }) => {
             <div style={{ marginTop: 12, display: 'flex', justifyContent: 'flex-end' }}>
               <button onClick={() => setShowSkillTypeSelector(false)} style={cancelBtnStyle}>取消</button>
             </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── 安装成功弹窗 ── */}
+      {installResult && (
+        <div style={deleteOverlayStyle} onClick={() => setInstallResult(null)}>
+          <div style={{ ...deleteDialogStyle, width: 320, textAlign: 'center' }} onClick={e => e.stopPropagation()}>
+            <div style={{ fontSize: 36, marginBottom: 8 }}>📦</div>
+            <h3 style={{ margin: '0 0 6px', fontSize: 15, color: 'var(--theme-text)' }}>安装成功</h3>
+            <p style={{ margin: '0 0 16px', fontSize: 13, color: 'var(--theme-text-muted)' }}>
+              <strong style={{ color: 'var(--theme-text)' }}>{installResult.name}</strong>
+              <span style={{ marginLeft: 6, fontSize: 11, color: 'var(--theme-text-muted)' }}>v{installResult.version}</span>
+            </p>
+            <button onClick={() => setInstallResult(null)} style={deleteConfirmBtnStyle}>确定</button>
           </div>
         </div>
       )}
