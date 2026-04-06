@@ -99,21 +99,34 @@ def login(client: httpx.Client) -> bool:
 
     # Step 2: 提交登录表单
     data = {
-        "step":     "2",
-        "lgt":      "0",
-        "pwuser":   USERNAME,
-        "pwpwd":    PASSWORD,
-        "question": "0",
-        "answer":   "",
-        "qanswer":  captcha_answer,
-        "qkey":     qkey,
-        "hideid":   "0",
-        "forward":  "",
-        "jumpurl":  f"{BASE}/",
-        "cktime":   "31536000",
+        "lgt":        "0",
+        "pwuser":     USERNAME,
+        "pwpwd":      PASSWORD,
+        "question":   "0",
+        "customquest": "",
+        "answer":     "",
+        "qanswer":    captcha_answer,
+        "qkey":       qkey,
+        "hideid":     "0",
+        "forward":    "",
+        "jumpurl":    f"{BASE}/search.php?",
+        "step":       "2",
+        "cktime":     "31536000",
     }
-    print(f"[debug] submitting form data: {data}", file=sys.stderr)
-    resp = client.post(f"{BASE}/login.php?", data=data, follow_redirects=True, timeout=15)
+    # 服务器是 GBK 编码，必须用 GBK 对中文字段编码，否则验证码答案会乱码
+    from urllib.parse import quote
+    body = "&".join(
+        f"{quote(k, safe='')}={quote(str(v).encode('gbk', errors='replace'), safe='')}"
+        for k, v in data.items()
+    ).encode("ascii")
+    print(f"[debug] submitting body: {body[:200]}", file=sys.stderr)
+    resp = client.post(
+        f"{BASE}/login.php?",
+        content=body,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        follow_redirects=True,
+        timeout=15,
+    )
     html_after = resp.content.decode("gbk", errors="replace")
     print(f"[debug] login response url={resp.url} status={resp.status_code}", file=sys.stderr)
     print(f"[debug] cookies={dict(client.cookies)}", file=sys.stderr)
