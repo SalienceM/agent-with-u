@@ -112,8 +112,15 @@ def login(client: httpx.Client) -> bool:
         "jumpurl":  f"{BASE}/",
         "cktime":   "31536000",
     }
+    print(f"[debug] submitting form data: {data}", file=sys.stderr)
     resp = client.post(f"{BASE}/login.php?", data=data, follow_redirects=True, timeout=15)
     html_after = resp.content.decode("gbk", errors="replace")
+    print(f"[debug] login response url={resp.url} status={resp.status_code}", file=sys.stderr)
+    print(f"[debug] cookies={dict(client.cookies)}", file=sys.stderr)
+    # 提取页面提示信息
+    msg_m = re.search(r'<ol>(.*?)</ol>', html_after, re.S)
+    if msg_m:
+        print(f"[debug] page msg: {BeautifulSoup(msg_m.group(1), 'html.parser').get_text(strip=True)}", file=sys.stderr)
 
     # 判断登录成功：页面出现"退出"链接，或 cookie 中有 winduser
     logged_in = "退出" in html_after or any("winduser" in k for k in dict(client.cookies))
