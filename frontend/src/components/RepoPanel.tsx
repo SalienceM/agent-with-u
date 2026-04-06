@@ -539,14 +539,20 @@ export const RepoPanel: React.FC<Props> = ({ open, workingDir, onClose }) => {
                   {parseSkillBackend(s.content || '') ? '🔗' : s.type === 'python-script' || s.hasCallPy ? '🐍' : '⚡'}
                 </div>
                 <div style={cardNameStyle}>{s.name}</div>
-                {s.hasSecretsSchema && (
-                  <div
-                    onClick={e => { e.stopPropagation(); openSecretsDialog(s.name); }}
-                    title={s.hasSecrets ? '已配置凭据，点击修改' : '需要配置凭据'}
-                    style={{ position: 'absolute', top: 4, left: 4, fontSize: 11, cursor: 'pointer',
-                      color: s.hasSecrets ? 'rgba(234,197,95,0.9)' : 'rgba(255,255,255,0.3)' }}
-                  >🔑</div>
-                )}
+                <div style={{ position: 'absolute', top: 4, left: 4, display: 'flex', gap: 2 }}>
+                  {s.manifest && (
+                    <span title={`插件包安装 v${s.manifest.version || '?'}`}
+                      style={{ fontSize: 11, lineHeight: 1 }}>📦</span>
+                  )}
+                  {s.hasSecretsSchema && (
+                    <span
+                      onClick={e => { e.stopPropagation(); openSecretsDialog(s.name); }}
+                      title={s.hasSecrets ? '已配置凭据，点击修改' : '需要配置凭据'}
+                      style={{ fontSize: 11, cursor: 'pointer', lineHeight: 1,
+                        color: s.hasSecrets ? 'rgba(234,197,95,0.9)' : 'rgba(255,255,255,0.3)' }}
+                    >🔑</span>
+                  )}
+                </div>
                 <div className="repo-card-actions" style={cardActionsStyle}>
                   <button
                     onClick={e => { e.stopPropagation(); handleDelete('skill', s.name); }}
