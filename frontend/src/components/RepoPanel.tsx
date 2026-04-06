@@ -211,6 +211,8 @@ export const RepoPanel: React.FC<Props> = ({ open, workingDir, onClose }) => {
   const [editingIcon, setEditingIcon] = useState('📝');
   const [editingOrigName, setEditingOrigName] = useState<string | null>(null); // null = 新建
   const [editingSkillItem, setEditingSkillItem] = useState<SkillItem | null>(null); // 原始 skill 对象
+  const [editingLocked, setEditingLocked] = useState(false); // 包安装 skill 的编辑锁
+  const [editingOrigContent, setEditingOrigContent] = useState(''); // 原始内容（用于重置）
   const [showIconPicker, setShowIconPicker] = useState(false);
   const [saving, setSaving] = useState(false);
   // Backend Skill：后端列表（用于下拉选择）
@@ -255,6 +257,9 @@ export const RepoPanel: React.FC<Props> = ({ open, workingDir, onClose }) => {
       setEditingIcon((item as PromptItem).icon || '📝');
       setEditingOrigName(item.name);
       setEditingSkillItem(type === 'skill' ? item as SkillItem : null);
+      const isPackage = type === 'skill' && !!(item as SkillItem).manifest;
+      setEditingLocked(isPackage);
+      setEditingOrigContent(item.content || '');
     } else {
       setEditingName('');
       // 新建 Skill 时提供默认 frontmatter 模板（确保有 frontmatter 可以选择 backend）
@@ -262,6 +267,8 @@ export const RepoPanel: React.FC<Props> = ({ open, workingDir, onClose }) => {
       setEditingIcon('📝');
       setEditingOrigName(null);
       setEditingSkillItem(null);
+      setEditingLocked(false);
+      setEditingOrigContent('');
     }
     setShowIconPicker(false);
     setTimeout(() => nameRef.current?.focus(), 50);
@@ -372,54 +379,6 @@ export const RepoPanel: React.FC<Props> = ({ open, workingDir, onClose }) => {
 
   if (!open) return null;
 
-  // ── 只读模式（来自 .awu 包的 skill）──
-  const isPackageSkill = editingType === 'skill' && editingSkillItem?.manifest;
-  if (isPackageSkill) {
-    const m = editingSkillItem!.manifest!;
-    return (
-      <div style={panelStyle}>
-        <div style={editorWrapStyle}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 14 }}>
-            <span style={{ fontSize: 18 }}>📦</span>
-            <div style={{ flex: 1 }}>
-              <div style={{ fontWeight: 600, fontSize: 14, color: 'var(--theme-text)' }}>{m.name || editingName}</div>
-              <div style={{ fontSize: 11, color: 'var(--theme-text-muted)' }}>
-                v{m.version || '?'} · {m.author || '未知作者'}
-              </div>
-            </div>
-            {editingSkillItem?.hasSecretsSchema && (
-              <button
-                onClick={() => { closeEditor(); openSecretsDialog(editingName); }}
-                style={{ ...saveBtnStyle, background: 'rgba(234,197,95,0.15)', color: 'rgba(234,197,95,0.9)',
-                  border: '1px solid rgba(234,197,95,0.3)' }}
-              >🔑 配置凭据</button>
-            )}
-            <button onClick={closeEditor} style={cancelBtnStyle}>关闭</button>
-          </div>
-          {m.description && (
-            <div style={{ fontSize: 12, color: 'var(--theme-text-muted)', marginBottom: 12,
-              background: 'var(--theme-bg)', border: '1px solid var(--theme-border)',
-              borderRadius: 6, padding: '6px 10px', lineHeight: 1.6 }}>
-              {m.description}
-            </div>
-          )}
-          <div style={{ fontSize: 11, color: 'rgba(99,102,241,0.7)', marginBottom: 8,
-            display: 'flex', alignItems: 'center', gap: 6 }}>
-            <span style={{ background: 'rgba(99,102,241,0.1)', padding: '1px 8px',
-              borderRadius: 4, border: '1px solid rgba(99,102,241,0.2)' }}>只读</span>
-            <span>插件包安装的 Skill，如需修改请重新安装新版本</span>
-          </div>
-          <textarea
-            value={editingContent}
-            readOnly
-            style={{ ...contentTextareaStyle, opacity: 0.65, cursor: 'default',
-              background: 'var(--theme-bg)', color: 'var(--theme-text-muted)' }}
-          />
-        </div>
-      </div>
-    );
-  }
-
   // 编辑器模式
   if (editingType) {
     return (
@@ -478,17 +437,60 @@ export const RepoPanel: React.FC<Props> = ({ open, workingDir, onClose }) => {
               </span>
             </div>
           )}
+          {/* 包安装 skill 的锁状态栏 */}
+          {editingSkillItem?.manifest && (
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8,
+              padding: '5px 10px', borderRadius: 6,
+              background: editingLocked ? 'rgba(99,102,241,0.08)' : 'rgba(234,197,95,0.08)',
+              border: `1px solid ${editingLocked ? 'rgba(99,102,241,0.2)' : 'rgba(234,197,95,0.25)'}` }}>
+              <span style={{ fontSize: 13 }}>{editingLocked ? '🔒' : '🔓'}</span>
+              <span style={{ fontSize: 11, color: 'var(--theme-text-muted)', flex: 1 }}>
+                {editingLocked
+                  ? `📦 插件包 v${editingSkillItem.manifest.version || '?'} · 点击解锁后可编辑`
+                  : '已解锁编辑，修改将覆盖原始内容'}
+              </span>
+              {editingSkillItem?.hasSecretsSchema && (
+                <button
+                  onClick={() => { closeEditor(); openSecretsDialog(editingName); }}
+                  style={{ fontSize: 11, padding: '2px 8px', cursor: 'pointer', borderRadius: 4,
+                    background: 'rgba(234,197,95,0.12)', border: '1px solid rgba(234,197,95,0.3)',
+                    color: 'rgba(234,197,95,0.9)' }}
+                >🔑 凭据</button>
+              )}
+              {!editingLocked && editingContent !== editingOrigContent && (
+                <button
+                  onClick={() => setEditingContent(editingOrigContent)}
+                  style={{ fontSize: 11, padding: '2px 8px', cursor: 'pointer', borderRadius: 4,
+                    background: 'rgba(239,68,68,0.1)', border: '1px solid rgba(239,68,68,0.25)',
+                    color: 'rgba(239,68,68,0.8)' }}
+                  title="恢复原始内容"
+                >↺ 重置</button>
+              )}
+              <button
+                onClick={() => setEditingLocked(l => !l)}
+                style={{ fontSize: 11, padding: '2px 8px', cursor: 'pointer', borderRadius: 4,
+                  background: editingLocked ? 'rgba(99,102,241,0.12)' : 'rgba(255,255,255,0.06)',
+                  border: `1px solid ${editingLocked ? 'rgba(99,102,241,0.3)' : 'rgba(255,255,255,0.12)'}`,
+                  color: editingLocked ? 'rgba(99,102,241,0.9)' : 'var(--theme-text-muted)' }}
+              >{editingLocked ? '解锁' : '锁定'}</button>
+            </div>
+          )}
           <textarea
             value={editingContent}
-            onChange={e => setEditingContent(e.target.value)}
+            onChange={e => !editingLocked && setEditingContent(e.target.value)}
+            readOnly={editingLocked}
             placeholder={editingType === 'skill' ? '# Skill 内容 (SKILL.md 格式)\n---\ntrigger: ...\n---\n\n指令内容...' : '输入 Prompt 模板内容…'}
-            style={contentTextareaStyle}
+            style={{ ...contentTextareaStyle,
+              ...(editingLocked ? { opacity: 0.6, cursor: 'default',
+                background: 'var(--theme-bg)', color: 'var(--theme-text-muted)' } : {}) }}
           />
           <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
             <button onClick={closeEditor} style={cancelBtnStyle}>取消</button>
-            <button onClick={handleSave} disabled={saving || !editingName.trim()} style={saveBtnStyle}>
-              {saving ? '保存中…' : '保存'}
-            </button>
+            {!editingLocked && (
+              <button onClick={handleSave} disabled={saving || !editingName.trim()} style={saveBtnStyle}>
+                {saving ? '保存中…' : '保存'}
+              </button>
+            )}
           </div>
         </div>
       </div>
