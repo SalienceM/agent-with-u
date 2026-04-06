@@ -103,6 +103,8 @@ class ClaudeAgentBackend(ModelBackend):
             # ★ 权限门控状态
             _permission_event = asyncio.Event()
             _permission_granted = True
+            # ★ 追踪当前正在流式输入的 tool_use block，用于在 content_block_stop 时拿到完整 input
+            _pending_perm: dict | None = None   # {"id": str, "name": str, "parts": list[str]}
             _waiting_for_permission = False
 
             def _set_permission_result(granted: bool):
@@ -247,6 +249,9 @@ class ClaudeAgentBackend(ModelBackend):
                             partial = delta.get("partial_json", "")
                             if partial:
                                 emit("tool_input", tool_call={"inputDelta": partial})
+                                # ★ 同步累积到 _pending_perm，以便 content_block_stop 时拿到完整 input
+                                if _pending_perm is not None:
+                                    _pending_perm["parts"].append(partial)
                     elif etype == "content_block_start":
                         block = evt.get("content_block", {})
                         if block.get("type") == "tool_use":
@@ -258,13 +263,22 @@ class ClaudeAgentBackend(ModelBackend):
                                 "input": "",
                                 "status": "running",
                             })
-                            # ★ 权限门控：等待用户确认
+                            # ★ 记录待确认 tool，等 content_block_stop 时输入完整再弹权限门
                             if not skip_permissions and tool_name in PERMISSION_SENSITIVE_TOOLS:
-                                granted = await _wait_for_permission(tool_id, tool_name, "")
-                                if not granted:
-                                    emit("error", error=f"权限被拒绝：{tool_name} 操作已取消")
-                                    self.abort(session_id)
-                                    break
+                                _pending_perm = {"id": tool_id, "name": tool_name, "parts": []}
+                            else:
+                                _pending_perm = None
+                    elif etype == "content_block_stop":
+                        # ★ 工具输入已完整，现在才发起权限确认
+                        if _pending_perm is not None:
+                            perm = _pending_perm
+                            _pending_perm = None
+                            full_input = "".join(perm["parts"])
+                            granted = await _wait_for_permission(perm["id"], perm["name"], full_input)
+                            if not granted:
+                                emit("error", error=f"权限被拒绝：{perm['name']} 操作已取消")
+                                self.abort(session_id)
+                                break
 
                 elif msg_type == "system":
                     if getattr(message, "subtype", None) == "init":
