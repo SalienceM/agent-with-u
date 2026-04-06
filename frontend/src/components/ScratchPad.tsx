@@ -93,26 +93,30 @@ const autoResize = (el: HTMLTextAreaElement) => {
 interface LineNumTAProps {
   value: string;
   startLine: number;
+  wrapLines: boolean;
   placeholder?: string;
   taRef: (el: HTMLTextAreaElement | null) => void;
   onChange: (v: string, el: HTMLTextAreaElement) => void;
   onPaste: (e: React.ClipboardEvent<HTMLTextAreaElement>) => void;
 }
 const LineNumTextarea: React.FC<LineNumTAProps> = ({
-  value, startLine, placeholder, taRef, onChange, onPaste,
+  value, startLine, wrapLines, placeholder, taRef, onChange, onPaste,
 }) => {
   const lines = value.split('\n');
   return (
     <div style={{ display: 'flex', position: 'relative', width: '100%' }}>
-      {/* 行号栏 */}
+      {/* 行号栏（sticky left，横向滚动时固定不动） */}
       <div aria-hidden="true" style={{
         width: GUTTER_W, flexShrink: 0,
+        position: 'sticky', left: 0,
         paddingTop: 0, paddingRight: 8,
         textAlign: 'right',
         lineHeight: `${EDITOR_LINE_H}px`,
         fontSize: EDITOR_FONT_SZ - 1,
         fontFamily: EDITOR_FONT,
         color: '#4e5568',
+        background: '#0d1117',   // 与编辑区背景一致，遮住横向滚动内容
+        zIndex: 1,
         userSelect: 'none',
         pointerEvents: 'none',
       }}>
@@ -120,8 +124,13 @@ const LineNumTextarea: React.FC<LineNumTAProps> = ({
           <div key={i} style={{ height: EDITOR_LINE_H }}>{startLine + i}</div>
         ))}
       </div>
-      {/* 分割线 */}
-      <div style={{ width: 1, flexShrink: 0, background: 'rgba(255,255,255,0.06)', marginRight: 10 }} />
+      {/* 分割线（sticky） */}
+      <div style={{
+        width: 1, flexShrink: 0,
+        position: 'sticky', left: GUTTER_W,
+        background: 'rgba(255,255,255,0.06)', marginRight: 10,
+        zIndex: 1,
+      }} />
       {/* 文本区 */}
       <textarea
         ref={taRef}
@@ -143,7 +152,10 @@ const LineNumTextarea: React.FC<LineNumTAProps> = ({
           fontFamily: EDITOR_FONT,
           padding: 0,
           minHeight: EDITOR_LINE_H,
-          overflow: 'hidden',
+          // 换行模式：关闭时 pre = 不换行，横向可滚动；开启时自动换行
+          whiteSpace: wrapLines ? 'pre-wrap' : 'pre',
+          overflowX: wrapLines ? 'hidden' : 'auto',
+          overflowY: 'hidden',
           boxSizing: 'border-box',
           caretColor: '#7aa2f7',
         }}
@@ -226,6 +238,7 @@ const ScratchPadEditor: React.FC<EditorProps> = ({ mode, onClose }) => {
   const [activeId, setActiveId] = useState<string | null>(null);
   const [lightbox, setLightbox] = useState<string | null>(null);
   const [copyOk, setCopyOk] = useState(false);
+  const [wrapLines, setWrapLines] = useState(false); // 默认不换行，与 Monaco 一致
   const taRefs = useRef<Map<string, HTMLTextAreaElement>>(new Map());
   const focusTarget = useRef<{ blockId: string; pos: number } | null>(null);
   const copyTimer = useRef<ReturnType<typeof setTimeout>>();
@@ -493,6 +506,19 @@ const ScratchPadEditor: React.FC<EditorProps> = ({ mode, onClose }) => {
                   {active.updatedAt !== active.createdAt && <> · 改 {fmtFull(active.updatedAt)}</>}
                 </span>
                 <button
+                  onClick={() => setWrapLines(v => !v)}
+                  title={wrapLines ? '关闭自动换行（横向可滚动）' : '开启自动换行'}
+                  style={{
+                    ...metaBtnBase,
+                    color: wrapLines ? '#7aa2f7' : 'var(--theme-text-muted)',
+                    borderColor: wrapLines ? '#7aa2f766' : 'var(--theme-border, rgba(255,255,255,0.1))',
+                    background: wrapLines ? 'rgba(122,162,247,0.1)' : 'transparent',
+                    fontFamily: EDITOR_FONT, fontSize: 10,
+                  }}
+                >
+                  {wrapLines ? '↵ 换行' : '→ 不换行'}
+                </button>
+                <button
                   onClick={handleCopyAll}
                   title="复制全部内容（含图片，可粘贴到富文本编辑器）"
                   style={{
@@ -515,6 +541,8 @@ const ScratchPadEditor: React.FC<EditorProps> = ({ mode, onClose }) => {
               {/* 内容块（editor 风格） */}
               <div style={{
                 flex: 1, overflowY: 'auto',
+                // 不换行时允许横向滚动；行号栏通过 sticky 固定在左侧
+                overflowX: wrapLines ? 'hidden' : 'auto',
                 padding: '12px 14px 12px 0',
                 background: '#0d1117',
                 fontFamily: EDITOR_FONT,
@@ -531,6 +559,7 @@ const ScratchPadEditor: React.FC<EditorProps> = ({ mode, onClose }) => {
                           key={block.id}
                           value={block.content}
                           startLine={startLine}
+                          wrapLines={wrapLines}
                           placeholder={active.blocks.length === 1
                             ? '在这里写点什么…\nCtrl+V 粘贴图片，图片将出现在光标位置'
                             : ''}
