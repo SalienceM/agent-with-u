@@ -1,6 +1,14 @@
 import React, { useState, useCallback, useEffect } from 'react';
 import { api } from '../api';
 
+// 注入删除按钮 hover 样式（只执行一次）
+if (typeof document !== 'undefined' && !document.getElementById('bm-delete-btn-style')) {
+  const s = document.createElement('style');
+  s.id = 'bm-delete-btn-style';
+  s.textContent = '.bm-delete-btn:hover { color: #f85149 !important; }';
+  document.head.appendChild(s);
+}
+
 // Global variable to store selected target backend for migration
 declare global {
   interface Window {
@@ -475,6 +483,7 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
                     </div>
                     {!backend.pinned && (
                       <button
+                        className="bm-delete-btn"
                         onClick={(e) => { e.stopPropagation(); handleDeleteClick(backend); }}
                         style={deleteBtnStyle}
                         title="Delete backend"
@@ -1113,6 +1122,7 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
                     </div>
                   </div>
                   <button
+                    className="bm-delete-btn"
                     onClick={(e) => { e.stopPropagation(); handleDeleteMcp(name); }}
                     style={deleteBtnStyle}
                     title="删除"
@@ -1295,8 +1305,10 @@ const backendItemStyle: React.CSSProperties = {
 };
 
 const deleteBtnStyle: React.CSSProperties = {
-  background: 'none', border: 'none', fontSize: 16,
-  cursor: 'pointer', padding: '4px 8px', opacity: 0.6,
+  background: 'none', border: 'none', fontSize: 15,
+  cursor: 'pointer', padding: '4px 8px',
+  color: 'rgba(255,255,255,0.45)',
+  transition: 'color 0.15s',
 };
 
 const addBtnStyle: React.CSSProperties = {
