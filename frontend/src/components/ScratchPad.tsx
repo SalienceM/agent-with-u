@@ -441,7 +441,7 @@ const ScratchPadEditor: React.FC<EditorProps> = ({ mode, onClose }) => {
         </div>
       )}
 
-      {/* 标题栏（含记录选择器） */}
+      {/* 标题栏 */}
       <div style={{
         display: 'flex', alignItems: 'center', gap: 6,
         padding: '6px 8px',
@@ -450,75 +450,79 @@ const ScratchPadEditor: React.FC<EditorProps> = ({ mode, onClose }) => {
       }}>
         <span style={{ fontSize: 13, flexShrink: 0 }}>📌</span>
 
-        {/* 记录选择器（下拉） */}
-        <div ref={pickerRef} style={{ position: 'relative', flex: 1, minWidth: 0 }}>
-          <button
-            onClick={() => setShowPicker(v => !v)}
-            title="切换记录"
-            style={{
-              display: 'flex', alignItems: 'center', gap: 4, width: '100%',
-              padding: '3px 7px', borderRadius: 5,
-              border: '1px solid var(--theme-border, rgba(255,255,255,0.1))',
-              background: showPicker ? 'rgba(122,162,247,0.12)' : 'rgba(255,255,255,0.04)',
-              color: 'var(--theme-text-muted)', fontSize: 11, cursor: 'pointer',
-              textAlign: 'left', minWidth: 0,
-            }}
-          >
-            <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-              {activeLabel}
-            </span>
-            <span style={{ fontSize: 9, flexShrink: 0, opacity: 0.6 }}>{showPicker ? '▲' : '▼'}</span>
-          </button>
+        {/* 侧边栏模式：紧凑下拉选择器；独立窗口模式：标题文字（左栏负责导航） */}
+        {isWindow ? (
+          <span style={{ fontWeight: 600, fontSize: 13, color: 'var(--theme-text)', flex: 1 }}>便签本</span>
+        ) : (
+          <div ref={pickerRef} style={{ position: 'relative', flex: 1, minWidth: 0 }}>
+            <button
+              onClick={() => setShowPicker(v => !v)}
+              title="切换记录"
+              style={{
+                display: 'flex', alignItems: 'center', gap: 4, width: '100%',
+                padding: '3px 7px', borderRadius: 5,
+                border: '1px solid var(--theme-border, rgba(255,255,255,0.1))',
+                background: showPicker ? 'rgba(122,162,247,0.12)' : 'rgba(255,255,255,0.04)',
+                color: 'var(--theme-text-muted)', fontSize: 11, cursor: 'pointer',
+                textAlign: 'left', minWidth: 0,
+              }}
+            >
+              <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                {activeLabel}
+              </span>
+              <span style={{ fontSize: 9, flexShrink: 0, opacity: 0.6 }}>{showPicker ? '▲' : '▼'}</span>
+            </button>
 
-          {/* 下拉列表 */}
-          {showPicker && (
-            <div style={{
-              position: 'absolute', top: '100%', left: 0, right: 0, marginTop: 3,
-              background: '#1e2030', border: '1px solid rgba(255,255,255,0.12)',
-              borderRadius: 7, boxShadow: '0 6px 24px rgba(0,0,0,0.4)',
-              zIndex: 200, maxHeight: 280, overflowY: 'auto',
-            }}>
-              {entries.length === 0 ? (
-                <div style={{ padding: '14px 10px', textAlign: 'center', fontSize: 11, color: 'var(--theme-text-muted)' }}>
-                  还没有记录
-                </div>
-              ) : groups.map(({ label, items }) => (
-                <div key={label}>
-                  <div style={{ padding: '5px 10px 2px', fontSize: 10, fontWeight: 700, color: '#4e5568', letterSpacing: 0.4 }}>
-                    {label}
+            {/* 下拉列表 */}
+            {showPicker && (
+              <div style={{
+                position: 'absolute', top: '100%', left: 0, right: 0, marginTop: 3,
+                background: '#1e2030', border: '1px solid rgba(255,255,255,0.12)',
+                borderRadius: 7, boxShadow: '0 6px 24px rgba(0,0,0,0.4)',
+                zIndex: 200, maxHeight: 280, overflowY: 'auto',
+              }}>
+                {entries.length === 0 ? (
+                  <div style={{ padding: '14px 10px', textAlign: 'center', fontSize: 11, color: 'var(--theme-text-muted)' }}>
+                    还没有记录
                   </div>
-                  {items.map(entry => {
-                    const isActive = entry.id === activeId;
-                    const textContent = entry.blocks
-                      .filter(b => b.type === 'text').map(b => (b as any).content).join(' ').trim();
-                    const imgCount = entry.blocks.filter(b => b.type === 'image').length;
-                    const preview = textContent.split('\n')[0] || (imgCount > 0 ? '🖼' : '（空）');
-                    return (
-                      <div
-                        key={entry.id}
-                        onClick={() => { setActiveId(entry.id); setShowPicker(false); }}
-                        style={{
-                          display: 'flex', alignItems: 'center', gap: 6,
-                          padding: '6px 10px', cursor: 'pointer',
-                          background: isActive ? 'rgba(122,162,247,0.15)' : 'transparent',
-                          borderLeft: `2px solid ${isActive ? '#7aa2f7' : 'transparent'}`,
-                        }}
-                      >
-                        <span style={{ fontSize: 10, color: isActive ? '#7aa2f7' : '#4e5568', flexShrink: 0 }}>
-                          {fmtTime(entry.updatedAt)}
-                        </span>
-                        <span style={{ fontSize: 11, color: 'var(--theme-text)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1 }}>
-                          {imgCount > 0 && <span style={{ marginRight: 3, opacity: 0.7 }}>🖼</span>}
-                          {preview}
-                        </span>
-                      </div>
-                    );
-                  })}
-                </div>
-              ))}
-            </div>
-          )}
-        </div>
+                ) : groups.map(({ label, items }) => (
+                  <div key={label}>
+                    <div style={{ padding: '5px 10px 2px', fontSize: 10, fontWeight: 700, color: '#4e5568', letterSpacing: 0.4 }}>
+                      {label}
+                    </div>
+                    {items.map(entry => {
+                      const isAct = entry.id === activeId;
+                      const textContent = entry.blocks
+                        .filter(b => b.type === 'text').map(b => (b as any).content).join(' ').trim();
+                      const imgCount = entry.blocks.filter(b => b.type === 'image').length;
+                      const preview = textContent.split('\n')[0] || (imgCount > 0 ? '🖼' : '（空）');
+                      return (
+                        <div
+                          key={entry.id}
+                          onClick={() => { setActiveId(entry.id); setShowPicker(false); }}
+                          style={{
+                            display: 'flex', alignItems: 'center', gap: 6,
+                            padding: '6px 10px', cursor: 'pointer',
+                            background: isAct ? 'rgba(122,162,247,0.15)' : 'transparent',
+                            borderLeft: `2px solid ${isAct ? '#7aa2f7' : 'transparent'}`,
+                          }}
+                        >
+                          <span style={{ fontSize: 10, color: isAct ? '#7aa2f7' : '#4e5568', flexShrink: 0 }}>
+                            {fmtTime(entry.updatedAt)}
+                          </span>
+                          <span style={{ fontSize: 11, color: 'var(--theme-text)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1 }}>
+                            {imgCount > 0 && <span style={{ marginRight: 3, opacity: 0.7 }}>🖼</span>}
+                            {preview}
+                          </span>
+                        </div>
+                      );
+                    })}
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
 
         <button onClick={handleNew} title="新建" style={iconBtnStyle}>＋</button>
         {!isWindow && (
@@ -529,8 +533,54 @@ const ScratchPadEditor: React.FC<EditorProps> = ({ mode, onClose }) => {
         )}
       </div>
 
-      {/* 主体：编辑区占满全宽 */}
+      {/* 主体 */}
       <div style={{ flex: 1, display: 'flex', overflow: 'hidden' }}>
+
+        {/* 独立窗口模式：左侧可点选记录列（稍窄） */}
+        {isWindow && (
+          <div style={{
+            width: 150, flexShrink: 0,
+            borderRight: '1px solid rgba(255,255,255,0.07)',
+            overflowY: 'auto', padding: '4px 0',
+            background: '#0a0e1a',
+          }}>
+            {entries.length === 0 && (
+              <div style={{ padding: '20px 8px', textAlign: 'center', fontSize: 11, color: '#4e5568', lineHeight: 1.8 }}>
+                还没有记录<br />点击「＋」开始
+              </div>
+            )}
+            {groups.map(({ label, items }) => (
+              <div key={label}>
+                <div style={{ padding: '5px 8px 2px', fontSize: 10, fontWeight: 700, color: '#4e5568', letterSpacing: 0.4 }}>
+                  {label}
+                </div>
+                {items.map(entry => {
+                  const isAct = entry.id === activeId;
+                  const textContent = entry.blocks
+                    .filter(b => b.type === 'text').map(b => (b as any).content).join(' ').trim();
+                  const imgCount = entry.blocks.filter(b => b.type === 'image').length;
+                  const preview = textContent.split('\n')[0] || (imgCount > 0 ? '🖼' : '（空）');
+                  return (
+                    <div key={entry.id} onClick={() => setActiveId(entry.id)} style={{
+                      padding: '6px 8px', cursor: 'pointer',
+                      background: isAct ? 'rgba(122,162,247,0.15)' : 'transparent',
+                      borderLeft: `2px solid ${isAct ? '#7aa2f7' : 'transparent'}`,
+                    }}>
+                      <div style={{ fontSize: 10, fontWeight: 600, color: isAct ? '#7aa2f7' : '#4e5568', marginBottom: 1 }}>
+                        {fmtTime(entry.updatedAt)}
+                      </div>
+                      <div style={{ fontSize: 11, color: '#cdd6f4', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                        {imgCount > 0 && <span style={{ marginRight: 3, opacity: 0.6 }}>🖼</span>}
+                        {preview}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            ))}
+          </div>
+        )}
+
         {/* 编辑区 */}
         <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden', background: '#0d1117' }}>
           {active ? (
