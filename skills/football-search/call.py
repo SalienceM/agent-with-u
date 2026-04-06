@@ -103,8 +103,6 @@ def login(client: httpx.Client) -> bool:
     q_text = q_m.group(1).strip() if q_m else f"{qkey}-4"
     captcha_answer = _solve_captcha(q_text)
 
-    print(f"[debug] qkey={qkey!r} q_text={q_text!r} answer={captcha_answer!r}", file=sys.stderr)
-    print(f"[debug] username={USERNAME!r} password={'*'*len(PASSWORD) if PASSWORD else '(empty)'}", file=sys.stderr)
 
     # Step 2: 提交登录表单
     data = {
@@ -128,7 +126,6 @@ def login(client: httpx.Client) -> bool:
         f"{quote(k, safe='')}={quote(str(v).encode('gbk', errors='replace'), safe='')}"
         for k, v in data.items()
     ).encode("ascii")
-    print(f"[debug] submitting body: {body[:200]}", file=sys.stderr)
     resp = client.post(
         f"{BASE}/login.php?",
         content=body,
@@ -137,13 +134,6 @@ def login(client: httpx.Client) -> bool:
         timeout=15,
     )
     html_after = resp.content.decode("gbk", errors="replace")
-    print(f"[debug] login response url={resp.url} status={resp.status_code}", file=sys.stderr)
-    print(f"[debug] cookies={dict(client.cookies)}", file=sys.stderr)
-    # 提取页面提示信息
-    msg_m = re.search(r'<ol>(.*?)</ol>', html_after, re.S)
-    if msg_m:
-        print(f"[debug] page msg: {BeautifulSoup(msg_m.group(1), 'html.parser').get_text(strip=True)}", file=sys.stderr)
-
     # 判断登录成功：页面出现"退出"链接，或 cookie 中有 winduser
     logged_in = "退出" in html_after or any("winduser" in k for k in dict(client.cookies))
     if not logged_in:
@@ -177,7 +167,6 @@ def search(client: httpx.Client, kw: str, n: int) -> list[dict]:
         f"{quote(k, safe='')}={quote(str(v).encode('gbk', errors='replace'), safe='')}"
         for k, v in data.items()
     ).encode("ascii")
-    print(f"[debug] search body: {body}", file=sys.stderr)
     resp = client.post(
         f"{BASE}/search.php?",
         content=body,
