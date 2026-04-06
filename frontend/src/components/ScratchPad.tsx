@@ -14,6 +14,17 @@
  */
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 
+// ── 注入编辑器全局样式（一次即可）──────────────────────────────────────
+if (typeof document !== 'undefined' && !document.getElementById('scratch-editor-style')) {
+  const s = document.createElement('style');
+  s.id = 'scratch-editor-style';
+  s.textContent = `
+    .scratch-ta::placeholder { color: #3d4455; }
+    .scratch-ta:focus { outline: none; }
+  `;
+  document.head.appendChild(s);
+}
+
 // ── 数据类型 ──────────────────────────────────────────────────────────
 type Block =
   | { type: 'text';  id: string; content: string }
@@ -66,10 +77,79 @@ const groupByDate = (entries: ScratchEntry[]) => {
   return Array.from(map.entries()).map(([label, items]) => ({ label, items }));
 };
 
+// ── 编辑器常量 ────────────────────────────────────────────────────────
+const EDITOR_LINE_H  = 22;   // px — textarea line-height（与行号栏对齐）
+const EDITOR_FONT    = "'JetBrains Mono','Cascadia Code','Fira Code',Consolas,monospace";
+const EDITOR_FONT_SZ = 13;
+const GUTTER_W       = 44;   // px — 行号栏宽度
+
 // ── 自动伸缩 textarea ─────────────────────────────────────────────────
 const autoResize = (el: HTMLTextAreaElement) => {
   el.style.height = 'auto';
   el.style.height = el.scrollHeight + 'px';
+};
+
+// ── 行号 + Textarea（编辑器外观）────────────────────────────────────────
+interface LineNumTAProps {
+  value: string;
+  startLine: number;
+  placeholder?: string;
+  taRef: (el: HTMLTextAreaElement | null) => void;
+  onChange: (v: string, el: HTMLTextAreaElement) => void;
+  onPaste: (e: React.ClipboardEvent<HTMLTextAreaElement>) => void;
+}
+const LineNumTextarea: React.FC<LineNumTAProps> = ({
+  value, startLine, placeholder, taRef, onChange, onPaste,
+}) => {
+  const lines = value.split('\n');
+  return (
+    <div style={{ display: 'flex', position: 'relative', width: '100%' }}>
+      {/* 行号栏 */}
+      <div aria-hidden="true" style={{
+        width: GUTTER_W, flexShrink: 0,
+        paddingTop: 0, paddingRight: 8,
+        textAlign: 'right',
+        lineHeight: `${EDITOR_LINE_H}px`,
+        fontSize: EDITOR_FONT_SZ - 1,
+        fontFamily: EDITOR_FONT,
+        color: '#4e5568',
+        userSelect: 'none',
+        pointerEvents: 'none',
+      }}>
+        {lines.map((_, i) => (
+          <div key={i} style={{ height: EDITOR_LINE_H }}>{startLine + i}</div>
+        ))}
+      </div>
+      {/* 分割线 */}
+      <div style={{ width: 1, flexShrink: 0, background: 'rgba(255,255,255,0.06)', marginRight: 10 }} />
+      {/* 文本区 */}
+      <textarea
+        ref={taRef}
+        className="scratch-ta"
+        value={value}
+        onChange={e => onChange(e.target.value, e.currentTarget)}
+        onPaste={onPaste}
+        placeholder={placeholder}
+        spellCheck={false}
+        style={{
+          flex: 1,
+          resize: 'none',
+          border: 'none',
+          outline: 'none',
+          background: 'transparent',
+          color: '#cdd6f4',
+          fontSize: EDITOR_FONT_SZ,
+          lineHeight: `${EDITOR_LINE_H}px`,
+          fontFamily: EDITOR_FONT,
+          padding: 0,
+          minHeight: EDITOR_LINE_H,
+          overflow: 'hidden',
+          boxSizing: 'border-box',
+          caretColor: '#7aa2f7',
+        }}
+      />
+    </div>
+  );
 };
 
 // ── 复制全部：用 contentEditable + execCommand，Qt WebEngine 和浏览器均兼容 ──
@@ -398,7 +478,7 @@ const ScratchPadEditor: React.FC<EditorProps> = ({ mode, onClose }) => {
         </div>
 
         {/* 编辑区 */}
-        <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
+        <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden', background: '#0d1117' }}>
           {active ? (
             <>
               {/* 元信息栏 */}
@@ -432,56 +512,63 @@ const ScratchPadEditor: React.FC<EditorProps> = ({ mode, onClose }) => {
                 </button>
               </div>
 
-              {/* 内容块 */}
-              <div style={{ flex: 1, overflowY: 'auto', padding: '10px 14px' }}>
-                {active.blocks.map((block) => {
-                  if (block.type === 'text') {
+              {/* 内容块（editor 风格） */}
+              <div style={{
+                flex: 1, overflowY: 'auto',
+                padding: '12px 14px 12px 0',
+                background: '#0d1117',
+                fontFamily: EDITOR_FONT,
+              }}>
+                {(() => {
+                  // 计算每个 text block 的起始行号（跨 image block 连续）
+                  let lineAccum = 1;
+                  return active.blocks.map((block) => {
+                    if (block.type === 'text') {
+                      const startLine = lineAccum;
+                      lineAccum += block.content.split('\n').length;
+                      return (
+                        <LineNumTextarea
+                          key={block.id}
+                          value={block.content}
+                          startLine={startLine}
+                          placeholder={active.blocks.length === 1
+                            ? '在这里写点什么…\nCtrl+V 粘贴图片，图片将出现在光标位置'
+                            : ''}
+                          taRef={el => {
+                            if (el) { taRefs.current.set(block.id, el); autoResize(el); }
+                            else taRefs.current.delete(block.id);
+                          }}
+                          onChange={(v, el) => handleTextChange(active.id, block.id, v, el)}
+                          onPaste={e => handlePaste(e, active.id, block.id)}
+                        />
+                      );
+                    }
+                    // image block（行号栏留空，内容区显示图片）
                     return (
-                      <textarea
-                        key={block.id}
-                        ref={el => {
-                          if (el) { taRefs.current.set(block.id, el); autoResize(el); }
-                          else taRefs.current.delete(block.id);
-                        }}
-                        value={block.content}
-                        onChange={e => handleTextChange(active.id, block.id, e.target.value, e.currentTarget)}
-                        onPaste={e => handlePaste(e, active.id, block.id)}
-                        placeholder={active.blocks.length === 1 ? '在这里写点什么…\nCtrl+V 粘贴图片，图片将出现在光标位置' : ''}
-                        style={{
-                          display: 'block', width: '100%', resize: 'none',
-                          border: 'none', outline: 'none',
-                          background: 'transparent',
-                          color: 'var(--theme-text)',
-                          fontSize: 13, lineHeight: 1.7,
-                          fontFamily: 'inherit',
-                          padding: 0, minHeight: 22,
-                          overflow: 'hidden',
-                          boxSizing: 'border-box',
-                        }}
-                      />
+                      <div key={block.id} style={{ display: 'flex' }}>
+                        <div style={{ width: GUTTER_W + 1 + 10, flexShrink: 0 }} />
+                        <div style={{ position: 'relative', margin: '6px 0', display: 'inline-block', maxWidth: 'calc(100% - 55px)' }}>
+                          <img
+                            src={block.src} alt=""
+                            onClick={() => setLightbox(block.src)}
+                            style={{
+                              maxWidth: '100%', maxHeight: 400, display: 'block',
+                              borderRadius: 6, border: '1px solid rgba(255,255,255,0.12)',
+                              cursor: 'zoom-in',
+                            }}
+                          />
+                          <button onClick={() => removeImageBlock(active.id, block.id)} style={{
+                            position: 'absolute', top: 4, right: 4,
+                            width: 20, height: 20, borderRadius: '50%',
+                            border: 'none', background: 'rgba(248,81,73,0.85)', color: '#fff',
+                            fontSize: 11, cursor: 'pointer', display: 'flex',
+                            alignItems: 'center', justifyContent: 'center',
+                          }}>✕</button>
+                        </div>
+                      </div>
                     );
-                  }
-                  return (
-                    <div key={block.id} style={{ position: 'relative', margin: '6px 0', display: 'inline-block', maxWidth: '100%' }}>
-                      <img
-                        src={block.src} alt=""
-                        onClick={() => setLightbox(block.src)}
-                        style={{
-                          maxWidth: '100%', maxHeight: 400, display: 'block',
-                          borderRadius: 6, border: '1px solid var(--theme-border)',
-                          cursor: 'zoom-in',
-                        }}
-                      />
-                      <button onClick={() => removeImageBlock(active.id, block.id)} style={{
-                        position: 'absolute', top: 4, right: 4,
-                        width: 20, height: 20, borderRadius: '50%',
-                        border: 'none', background: 'rgba(248,81,73,0.85)', color: '#fff',
-                        fontSize: 11, cursor: 'pointer', display: 'flex',
-                        alignItems: 'center', justifyContent: 'center',
-                      }}>✕</button>
-                    </div>
-                  );
-                })}
+                  });
+                })()}
               </div>
             </>
           ) : (
