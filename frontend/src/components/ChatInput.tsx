@@ -65,32 +65,37 @@ interface ToolbarBtnProps {
   loading?: boolean;
 }
 
-const ToolbarBtn: React.FC<ToolbarBtnProps> = ({ icon, title, active, onClick, loading }) => (
-  <button
-    onClick={onClick}
-    disabled={loading}
-    title={title}
-    style={{
-      display: 'inline-flex',
-      alignItems: 'center',
-      justifyContent: 'center',
-      gap: 4,
-      padding: '4px 8px',
-      fontSize: 11,
-      borderRadius: 6,
-      border: active ? '1px solid var(--theme-accent, #0969da)' : '1px solid var(--theme-border, rgba(0,0,0,0.12))',
-      background: active ? 'var(--theme-accent-bg, rgba(9,105,218,0.1))' : 'var(--theme-bg-secondary, #f6f8fa)',
-      color: active ? 'var(--theme-accent, #0969da)' : 'var(--theme-text-muted, #656d76)',
-      cursor: loading ? 'wait' : 'pointer',
-      transition: 'all 0.15s',
-      whiteSpace: 'nowrap',
-      opacity: loading ? 0.6 : 1,
-    }}
-  >
-    <span style={{ fontSize: 12 }}>{icon}</span>
-    <span>{title}</span>
-  </button>
-);
+const ToolbarBtn: React.FC<ToolbarBtnProps> = ({ icon, title, active, onClick, loading }) => {
+  const [isHover, setIsHover] = React.useState(false);
+  return (
+    <button
+      onClick={onClick}
+      disabled={loading}
+      title={title}
+      onMouseEnter={() => setIsHover(true)}
+      onMouseLeave={() => setIsHover(false)}
+      style={{
+        display: 'inline-flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        gap: 4,
+        padding: '4px 8px',
+        fontSize: 11,
+        borderRadius: 6,
+        border: active ? '1px solid var(--theme-accent, #0969da)' : '1px solid var(--theme-border, rgba(0,0,0,0.12))',
+        background: active ? 'var(--theme-accent-bg, rgba(9,105,218,0.1))' : isHover ? 'var(--theme-bg-tertiary, #eaeef2)' : 'var(--theme-bg-secondary, #f6f8fa)',
+        color: active ? 'var(--theme-accent, #0969da)' : isHover ? 'var(--theme-text, #1f2328)' : 'var(--theme-text-muted, #656d76)',
+        cursor: loading ? 'wait' : 'pointer',
+        transition: 'all 0.15s',
+        whiteSpace: 'nowrap',
+        opacity: loading ? 0.6 : 1,
+      }}
+    >
+      <span style={{ fontSize: 12 }}>{icon}</span>
+      <span>{title}</span>
+    </button>
+  );
+};
 
 const ChatInputInner: React.FC<Props> = ({
   onSend, onAbort, isStreaming, backends, activeBackendId, sessionId, workingDir,
