@@ -154,7 +154,7 @@ def search(client: httpx.Client, kw: str, n: int) -> list[dict]:
     data = {
         "step":     "2",
         "keyword":  kw,
-        "method":   "AND",
+        "method":   "OR",
         "sch_area": "0",
         "f_fid":    "all",
         "sch_time": "all",
