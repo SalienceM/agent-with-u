@@ -327,10 +327,26 @@ export const RepoPanel: React.FC<Props> = ({ open, workingDir, onClose }) => {
   const handleInstallFile = useCallback(async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
-    const filePath: string = (file as any).path || (file as any).webkitRelativePath || file.name;
     setInstalling(true);
     try {
-      const res = await api.installSkillPackage(filePath);
+      // Qt 原生环境有 file.path；浏览器没有，改用 FileReader 读取 base64
+      const nativePath: string = (file as any).path || '';
+      let res: any;
+      if (nativePath) {
+        res = await api.installSkillPackage(nativePath);
+      } else {
+        const base64 = await new Promise<string>((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onload = () => {
+            const result = reader.result as string;
+            // data:application/zip;base64,XXXX → 取 XXXX 部分
+            resolve(result.split(',')[1] || '');
+          };
+          reader.onerror = reject;
+          reader.readAsDataURL(file);
+        });
+        res = await api.installSkillPackage('', base64);
+      }
       if (res.status === 'ok') {
         await refresh();
         const m = res.manifest;

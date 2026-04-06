@@ -995,14 +995,35 @@ class BridgeWS:
 
     # ── 插件包安装 + Secrets 管理 RPC ────────────────────────────────────
 
-    def _rpc_installSkillPackage(self, pkg_path: str) -> str:
-        """安装本地 .awu 插件包，返回 manifest 信息。"""
+    def _rpc_installSkillPackage(self, pkg_path: str, pkg_base64: str = "") -> str:
+        """安装本地 .awu 插件包。
+        支持两种方式：
+        - pkg_path: 本地文件完整路径（Qt 原生环境）
+        - pkg_base64: 文件内容的 base64 编码（浏览器环境，path 不可用时）
+        """
+        import tempfile, base64 as _b64
+        tmp_path = None
         try:
-            manifest = self._skill_store.install_package(pkg_path)
+            if pkg_base64:
+                # 浏览器传来的 base64 内容，写到临时文件
+                data = _b64.b64decode(pkg_base64)
+                suffix = ".awu"
+                with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as f:
+                    f.write(data)
+                    tmp_path = f.name
+                actual_path = tmp_path
+            else:
+                actual_path = pkg_path
+            manifest = self._skill_store.install_package(actual_path)
             return json.dumps({"status": "ok", "manifest": manifest}, ensure_ascii=False)
         except Exception as e:
             print(f"[BridgeWS] installSkillPackage error: {e}", file=sys.stderr)
             return json.dumps({"status": "error", "message": str(e)}, ensure_ascii=False)
+        finally:
+            if tmp_path:
+                import os as _os
+                try: _os.unlink(tmp_path)
+                except Exception: pass
 
     def _rpc_getSkillSecretsSchema(self, name: str) -> str:
         """获取 skill 的 secrets.schema.json（字段列表），前端据此渲染填写表单。"""

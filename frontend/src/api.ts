@@ -545,8 +545,8 @@ export const api = {
   },
 
   // ── 插件包安装 ────────────────────────────────────────────────────────
-  async installSkillPackage(pkgPath: string): Promise<{ status: string; manifest?: any; message?: string }> {
-    const result = await call('installSkillPackage', pkgPath);
+  async installSkillPackage(pkgPath: string, pkgBase64: string = ''): Promise<{ status: string; manifest?: any; message?: string }> {
+    const result = await call('installSkillPackage', pkgPath, pkgBase64);
     if (result === null || result === undefined) return { status: 'error', message: '无法连接到后端' };
     try { return JSON.parse(result); } catch { return { status: 'error', message: '响应格式错误' }; }
   },
