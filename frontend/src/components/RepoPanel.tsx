@@ -932,7 +932,7 @@ const backendSelectStyle: React.CSSProperties = {
 
 const contentTextareaStyle: React.CSSProperties = {
   flex: 1,
-  minHeight: 180,
+  minHeight: 420,
   fontSize: 13,
   lineHeight: 1.6,
   background: 'var(--theme-input-bg)',
