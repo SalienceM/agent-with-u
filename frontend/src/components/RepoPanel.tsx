@@ -1,5 +1,5 @@
 import React, { useEffect, useState, useCallback, useRef } from 'react';
-import { api } from '../api';
+import { api, SkillInfo } from '../api';
 
 // 注入卡片悬停样式
 if (typeof document !== 'undefined' && !document.getElementById('repo-panel-css')) {
@@ -16,13 +16,7 @@ if (typeof document !== 'undefined' && !document.getElementById('repo-panel-css'
 // ═══════════════════════════════════════
 //  Types
 // ═══════════════════════════════════════
-interface SkillItem {
-  id?: string;
-  name: string;
-  content?: string;
-  isGlobal?: boolean;
-  isProject?: boolean;
-}
+type SkillItem = SkillInfo;
 interface PromptItem {
   id?: string;
   name: string;
@@ -94,6 +88,39 @@ interface SkillTypePreset {
 }
 
 const SKILL_TYPE_PRESETS: SkillTypePreset[] = [
+  {
+    id: 'python-script',
+    icon: '🐍',
+    label: 'Python 脚本',
+    description: '本地执行 Python 脚本，支持凭据注入，适合爬虫/API 调用等',
+    builtin: true,
+    template: () => ({
+      name: 'my-script',
+      content: [
+        '---',
+        'name: my-script',
+        'description: 描述此脚本的用途和触发时机（最多 250 字符）',
+        'type: python-script',
+        'input_schema:',
+        '  type: object',
+        '  properties:',
+        '    query:',
+        '      type: string',
+        '      description: 输入参数',
+        '  required:',
+        '    - query',
+        '---',
+        '',
+        '## Instructions',
+        '',
+        '描述 Claude 应该在什么情况下调用此 Skill，',
+        '以及调用时需要传入什么参数。',
+        '',
+        '脚本文件路径：`call.py`（与 SKILL.md 同目录）',
+        '凭据通过 `SKILL_SECRETS` 环境变量注入（JSON 格式）。',
+      ].join('\n'),
+    }),
+  },
   {
     id: 'image-generation',
     icon: '🎨',
@@ -192,6 +219,16 @@ export const RepoPanel: React.FC<Props> = ({ open, workingDir, onClose }) => {
   // 删除二次确认
   const [deleteConfirm, setDeleteConfirm] = useState<{ type: 'skill' | 'prompt'; name: string } | null>(null);
   const nameRef = useRef<HTMLInputElement>(null);
+  // 安装插件包
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const [installing, setInstalling] = useState(false);
+  // Secrets 配置
+  type SecretsField = { key: string; label: string; type: string; required?: boolean; placeholder?: string };
+  const [secretsSkill, setSecretsSkill] = useState<string | null>(null);
+  const [secretsSchema, setSecretsSchema] = useState<{ fields: SecretsField[] } | null>(null);
+  const [secretsValues, setSecretsValues] = useState<Record<string, string>>({});
+  const [secretsPresence, setSecretsPresence] = useState<string[]>([]);
+  const [savingSecrets, setSavingSecrets] = useState(false);
 
   const refresh = useCallback(async () => {
     const [sk, pr, bks] = await Promise.all([
@@ -275,6 +312,60 @@ export const RepoPanel: React.FC<Props> = ({ open, workingDir, onClose }) => {
     setDeleteConfirm(null);
     await refresh();
   }, [deleteConfirm, refresh]);
+
+  // ── 安装插件包 ──
+  const handleInstallFile = useCallback(async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const filePath: string = (file as any).path || (file as any).webkitRelativePath || file.name;
+    setInstalling(true);
+    try {
+      const res = await api.installSkillPackage(filePath);
+      if (res.status === 'ok') {
+        await refresh();
+        const m = res.manifest;
+        if (m?.id) {
+          const schema = await api.getSkillSecretsSchema(m.id);
+          if (schema?.fields?.length) {
+            setSecretsSkill(m.id);
+            setSecretsSchema(schema);
+            setSecretsValues({});
+            setSecretsPresence([]);
+          }
+        }
+      }
+    } finally {
+      setInstalling(false);
+      if (fileInputRef.current) fileInputRef.current.value = '';
+    }
+  }, [refresh]);
+
+  // ── 打开 Secrets 对话框 ──
+  const openSecretsDialog = useCallback(async (skillName: string) => {
+    const [schema, presence] = await Promise.all([
+      api.getSkillSecretsSchema(skillName),
+      api.getSkillSecretsPresence(skillName),
+    ]);
+    if (!schema?.fields?.length) return;
+    setSecretsSkill(skillName);
+    setSecretsSchema(schema);
+    setSecretsValues({});
+    setSecretsPresence(presence);
+  }, []);
+
+  const handleSaveSecrets = useCallback(async () => {
+    if (!secretsSkill) return;
+    setSavingSecrets(true);
+    try {
+      const res = await api.setSkillSecrets(secretsSkill, secretsValues);
+      if (res.status === 'ok') {
+        setSecretsSkill(null);
+        await refresh();
+      }
+    } finally {
+      setSavingSecrets(false);
+    }
+  }, [secretsSkill, secretsValues, refresh]);
 
   if (!open) return null;
 
@@ -361,13 +452,32 @@ export const RepoPanel: React.FC<Props> = ({ open, workingDir, onClose }) => {
         <div style={{ ...columnStyle, borderRight: '1px solid var(--theme-border)', paddingRight: 24 }}>
           <div style={{ ...columnHeaderStyle, border: 'none', padding: 0 }}>
             <span>⚡ Skills</span>
-            <button onClick={() => setShowSkillTypeSelector(true)} style={addBtnStyle} title="新建 Skill">＋</button>
+            <div style={{ display: 'flex', gap: 4 }}>
+              <button
+                onClick={() => fileInputRef.current?.click()}
+                disabled={installing}
+                title="从 .awu 文件安装插件 Skill"
+                style={{ ...addBtnStyle, fontSize: 11, padding: '2px 7px' }}
+              >{installing ? '…' : '📦'}</button>
+              <button onClick={() => setShowSkillTypeSelector(true)} style={addBtnStyle} title="新建 Skill">＋</button>
+            </div>
           </div>
+          <input ref={fileInputRef} type="file" accept=".awu,.zip" style={{ display: 'none' }} onChange={handleInstallFile} />
           <div style={cardGridStyle}>
             {skills.map(s => (
-              <div key={s.id} className="repo-card" style={cardStyle} onClick={() => openEditor('skill', s)}>
-                <div style={cardIconStyle}>{parseSkillBackend(s.content || '') ? '🔗' : '⚡'}</div>
+              <div key={s.name} className="repo-card" style={cardStyle} onClick={() => openEditor('skill', s)}>
+                <div style={cardIconStyle}>
+                  {parseSkillBackend(s.content || '') ? '🔗' : s.type === 'python-script' || s.hasCallPy ? '🐍' : '⚡'}
+                </div>
                 <div style={cardNameStyle}>{s.name}</div>
+                {s.hasSecretsSchema && (
+                  <div
+                    onClick={e => { e.stopPropagation(); openSecretsDialog(s.name); }}
+                    title={s.hasSecrets ? '已配置凭据，点击修改' : '需要配置凭据'}
+                    style={{ position: 'absolute', top: 4, right: 4, fontSize: 11, cursor: 'pointer',
+                      color: s.hasSecrets ? 'rgba(234,197,95,0.9)' : 'rgba(255,255,255,0.3)' }}
+                  >🔑</div>
+                )}
                 <div className="repo-card-actions" style={cardActionsStyle}>
                   <button
                     onClick={e => { e.stopPropagation(); handleDelete('skill', s.name); }}
@@ -499,6 +609,61 @@ export const RepoPanel: React.FC<Props> = ({ open, workingDir, onClose }) => {
             </div>
             <div style={{ marginTop: 12, display: 'flex', justifyContent: 'flex-end' }}>
               <button onClick={() => setShowSkillTypeSelector(false)} style={cancelBtnStyle}>取消</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── Secrets 配置对话框 ── */}
+      {secretsSkill && secretsSchema && (
+        <div style={deleteOverlayStyle} onClick={() => setSecretsSkill(null)}>
+          <div style={{ ...deleteDialogStyle, width: 400 }} onClick={e => e.stopPropagation()}>
+            <h3 style={{ margin: '0 0 4px', fontSize: 14, fontWeight: 600, color: 'var(--theme-text)' }}>
+              🔑 凭据配置：{secretsSkill}
+            </h3>
+            <p style={{ fontSize: 11, color: 'var(--theme-text-muted)', margin: '0 0 14px', lineHeight: 1.6 }}>
+              保存在本地 <code>~/.agent-with-u/skill-secrets/</code>（chmod 600），<strong>永不传给大模型</strong>。
+            </p>
+            {secretsPresence.length > 0 && (
+              <div style={{ fontSize: 11, color: 'rgba(34,197,94,0.8)', marginBottom: 12,
+                background: 'rgba(34,197,94,0.08)', padding: '5px 10px', borderRadius: 6 }}>
+                已配置：{secretsPresence.join(', ')}（留空则保留原值）
+              </div>
+            )}
+            {secretsSchema.fields.map(field => (
+              <div key={field.key} style={{ marginBottom: 10 }}>
+                <label style={{ display: 'block', fontSize: 12, color: 'var(--theme-text-muted)', marginBottom: 4 }}>
+                  {field.label}{field.required && <span style={{ color: 'rgba(239,68,68,0.8)', marginLeft: 3 }}>*</span>}
+                </label>
+                {field.type === 'textarea' ? (
+                  <textarea
+                    value={secretsValues[field.key] ?? ''}
+                    onChange={e => setSecretsValues(prev => ({ ...prev, [field.key]: e.target.value }))}
+                    placeholder={field.placeholder || (secretsPresence.includes(field.key) ? '（留空保留原值）' : '')}
+                    style={{ width: '100%', boxSizing: 'border-box', padding: '6px 10px', height: 72,
+                      background: 'var(--theme-bg)', border: '1px solid var(--theme-border)',
+                      borderRadius: 6, color: 'var(--theme-text)', fontSize: 13,
+                      fontFamily: 'monospace', resize: 'vertical' }}
+                  />
+                ) : (
+                  <input
+                    type={field.type === 'password' ? 'password' : 'text'}
+                    value={secretsValues[field.key] ?? ''}
+                    onChange={e => setSecretsValues(prev => ({ ...prev, [field.key]: e.target.value }))}
+                    placeholder={field.placeholder || (secretsPresence.includes(field.key) ? '（留空保留原值）' : '')}
+                    autoComplete="off"
+                    style={{ width: '100%', boxSizing: 'border-box', padding: '6px 10px',
+                      background: 'var(--theme-bg)', border: '1px solid var(--theme-border)',
+                      borderRadius: 6, color: 'var(--theme-text)', fontSize: 13 }}
+                  />
+                )}
+              </div>
+            ))}
+            <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end', marginTop: 4 }}>
+              <button onClick={() => setSecretsSkill(null)} style={deleteCancelBtnStyle}>取消</button>
+              <button onClick={handleSaveSecrets} disabled={savingSecrets} style={deleteConfirmBtnStyle}>
+                {savingSecrets ? '保存中…' : '保存凭据'}
+              </button>
             </div>
           </div>
         </div>

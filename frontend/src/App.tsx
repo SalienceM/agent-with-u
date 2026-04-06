@@ -5,7 +5,6 @@ import { MessageBubble } from './components/MessageBubble';
 import { ChatInput } from './components/ChatInput';
 import { Settings } from './components/Settings';
 import { BackendManager } from './components/BackendManager';
-import { SkillManager } from './components/SkillManager';
 import { RepoPanel } from './components/RepoPanel';
 import { PermissionGate } from './components/PermissionGate';
 import { ScratchPad } from './components/ScratchPad';
@@ -28,7 +27,6 @@ export const App: React.FC = () => {
   const [activeSession, setActiveSession] = useState<any | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [backendManagerOpen, setBackendManagerOpen] = useState(false);
-  const [skillManagerOpen, setSkillManagerOpen] = useState(false);
   const [repoPanelOpen, setRepoPanelOpen] = useState(false);
   const [newSessionDialogOpen, setNewSessionDialogOpen] = useState(false);
   const [skipPermissions, setSkipPermissions] = useState(true);  // ★ 权限模式开关
@@ -536,13 +534,6 @@ export const App: React.FC = () => {
             📋 Logs
           </button>
           <button
-            onClick={() => setSkillManagerOpen(true)}
-            style={{ ...settingsBtnStyle, ...(skillManagerOpen ? { background: 'var(--theme-accent-bg)', color: 'var(--theme-accent)' } : {}) }}
-            title="Skill 管理器 — 创建、安装、激活 Skills"
-          >
-            ⚡
-          </button>
-          <button
             onClick={() => setRepoPanelOpen(!repoPanelOpen)}
             style={{ ...settingsBtnStyle, ...(repoPanelOpen ? { background: 'var(--theme-accent-bg)', color: 'var(--theme-accent)' } : {}) }}
             title="Repo — Skills & Prompts"
@@ -791,13 +782,6 @@ export const App: React.FC = () => {
         sessions={sessions}
         onSaveBackend={handleSaveBackend}
         onDeleteBackend={handleDeleteBackend}
-      />
-
-      {/* ---- Skill Manager ---- */}
-      <SkillManager
-        isOpen={skillManagerOpen}
-        onClose={() => setSkillManagerOpen(false)}
-        workingDir={activeSession?.workingDir || ''}
       />
 
       {/* 便签本已移到主布局右侧列 */}
