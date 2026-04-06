@@ -152,6 +152,69 @@ class BridgeWS:
         # ★ Skip rest flags: session_id → True if user selected "skip rest"
         self._skip_rest_sessions: set[str] = set()
 
+    # ── Python-Script Skill 执行器 ────────────────────────────────────
+
+    async def _execute_python_script_skill(
+        self, skill_name: str, payload: dict
+    ) -> tuple[int, str]:
+        """
+        执行孵化库中 call.py 类型的 Skill。
+
+        安全设计：
+          - 凭据从本地存储读取，通过 SKILL_SECRETS 环境变量注入进程
+          - 凭据不经过 LLM，不写入日志
+          - 调用参数（args/prompt）通过 stdin 以 JSON 传入
+          - 执行结果从 stdout 读取（纯文本或 JSON）
+
+        call.py 协议：
+          stdin:  JSON 行 {"skill": "...", "args": "...", ...}
+          stdout: 结果文本（返回给 LLM）
+          env:    SKILL_SECRETS={"USERNAME":"...","PASSWORD":"..."}
+        """
+        from pathlib import Path as _Path
+        import asyncio as _asyncio
+
+        skill_dir = _Path.home() / ".agent-with-u" / "skill-library" / skill_name
+        call_py = skill_dir / "call.py"
+        if not call_py.exists():
+            return 404, f"Skill '{skill_name}' 缺少 call.py"
+
+        # 从本地安全存储获取凭据（不传给 LLM）
+        secrets = self._skill_store.get_secrets(skill_name)
+        env = {
+            **__import__("os").environ,
+            "SKILL_SECRETS": json.dumps(secrets, ensure_ascii=False),
+            "SKILL_NAME": skill_name,
+            "SKILL_DIR": str(skill_dir),
+        }
+
+        stdin_data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+
+        try:
+            proc = await _asyncio.create_subprocess_exec(
+                __import__("sys").executable, str(call_py),
+                stdin=_asyncio.subprocess.PIPE,
+                stdout=_asyncio.subprocess.PIPE,
+                stderr=_asyncio.subprocess.PIPE,
+                env=env,
+                cwd=str(skill_dir),
+            )
+            stdout, stderr = await _asyncio.wait_for(
+                proc.communicate(stdin_data), timeout=60
+            )
+            if stderr:
+                print(f"[bridge_ws] python-script skill '{skill_name}' stderr: "
+                      f"{stderr.decode('utf-8', errors='replace')[:500]}",
+                      file=sys.stderr, flush=True)
+            if proc.returncode != 0:
+                err = stderr.decode("utf-8", errors="replace")[:300]
+                return 500, f"Skill '{skill_name}' 执行失败（exit {proc.returncode}）: {err}"
+            return 200, stdout.decode("utf-8", errors="replace")
+        except _asyncio.TimeoutError:
+            return 504, f"Skill '{skill_name}' 执行超时（60s）"
+        except Exception as e:
+            return 500, f"Skill '{skill_name}' 执行异常: {e}"
+
     # ── 内置 Skill 处理器 ─────────────────────────────────────────
 
     async def _builtin_web_search(self, query: str) -> tuple[int, str]:
@@ -406,6 +469,10 @@ class BridgeWS:
         if skill_type == "web-fetch":
             url = payload.get("url", "") or prompt
             return await self._builtin_web_fetch(url)
+
+        # ★ python-script 类型：执行孵化库中的 call.py，凭据通过环境变量传入
+        if skill_type == "python-script" or skill_info.get("hasCallPy"):
+            return await self._execute_python_script_skill(skill_name, payload)
 
         # Backend Skill：路由到目标 backend
         if not skill_info.get("backend"):
@@ -925,6 +992,45 @@ class BridgeWS:
         except Exception as e:
             print(f"[BridgeWS] renameSkill error: {e}", file=sys.stderr)
             return json.dumps({"status": "error", "message": str(e)}, ensure_ascii=False)
+
+    # ── 插件包安装 + Secrets 管理 RPC ────────────────────────────────────
+
+    def _rpc_installSkillPackage(self, pkg_path: str) -> str:
+        """安装本地 .awu 插件包，返回 manifest 信息。"""
+        try:
+            manifest = self._skill_store.install_package(pkg_path)
+            return json.dumps({"status": "ok", "manifest": manifest}, ensure_ascii=False)
+        except Exception as e:
+            print(f"[BridgeWS] installSkillPackage error: {e}", file=sys.stderr)
+            return json.dumps({"status": "error", "message": str(e)}, ensure_ascii=False)
+
+    def _rpc_getSkillSecretsSchema(self, name: str) -> str:
+        """获取 skill 的 secrets.schema.json（字段列表），前端据此渲染填写表单。"""
+        try:
+            schema = self._skill_store.get_secrets_schema(name)
+            return json.dumps(schema, ensure_ascii=False)
+        except Exception as e:
+            return json.dumps(None)
+
+    def _rpc_setSkillSecrets(self, name: str, secrets_json: str) -> str:
+        """保存用户填写的 skill 凭据到本地安全存储（不进 LLM context）。"""
+        try:
+            secrets = json.loads(secrets_json)
+            self._skill_store.set_secrets(name, secrets)
+            return json.dumps({"status": "ok"}, ensure_ascii=False)
+        except Exception as e:
+            print(f"[BridgeWS] setSkillSecrets error: {e}", file=sys.stderr)
+            return json.dumps({"status": "error", "message": str(e)}, ensure_ascii=False)
+
+    def _rpc_getSkillSecretsPresence(self, name: str) -> str:
+        """返回已设置的 secrets 字段名列表（不返回值，仅供 UI 展示"已配置"状态）。"""
+        try:
+            secrets = self._skill_store.get_secrets(name)
+            # 只返回已设置（非空）的 key 列表，不暴露值
+            filled = [k for k, v in secrets.items() if v]
+            return json.dumps(filled, ensure_ascii=False)
+        except Exception as e:
+            return json.dumps([])
 
     # ═══════════════════════════════════════
     #  Prompt 模板库 CRUD

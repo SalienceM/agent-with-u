@@ -1,4 +1,4 @@
-import React, { useState, useCallback, useEffect } from 'react';
+import React, { useState, useCallback, useEffect, useRef } from 'react';
 import { api, SkillInfo } from '../api';
 
 interface SkillManagerProps {
@@ -29,12 +29,21 @@ export const SkillManager: React.FC<SkillManagerProps> = ({ isOpen, onClose, wor
   const [skills, setSkills] = useState<SkillInfo[]>([]);
   const [loading, setLoading] = useState(false);
   const [view, setView] = useState<'list' | 'edit'>('list');
-  const [editName, setEditName] = useState('');          // 编辑中的 skill 名（空=新建）
+  const [editName, setEditName] = useState('');
   const [editContent, setEditContent] = useState('');
-  const [nameInput, setNameInput] = useState('');        // 新建时的 name 输入
+  const [nameInput, setNameInput] = useState('');
   const [saving, setSaving] = useState(false);
   const [msg, setMsg] = useState<{ type: 'ok' | 'err'; text: string } | null>(null);
   const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
+  // ── 插件包安装 ──
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const [installing, setInstalling] = useState(false);
+  // ── Secrets 配置 ──
+  const [secretsSkill, setSecretsSkill] = useState<string | null>(null);
+  const [secretsSchema, setSecretsSchema] = useState<{ fields: Array<{ key: string; label: string; type: string; required?: boolean; placeholder?: string }> } | null>(null);
+  const [secretsValues, setSecretsValues] = useState<Record<string, string>>({});
+  const [secretsPresence, setSecretsPresence] = useState<string[]>([]);
+  const [savingSecrets, setSavingSecrets] = useState(false);
 
   const showMsg = (type: 'ok' | 'err', text: string) => {
     setMsg({ type, text });
@@ -123,6 +132,73 @@ export const SkillManager: React.FC<SkillManagerProps> = ({ isOpen, onClose, wor
     }
   }, [reload]);
 
+  // ── 安装插件包 ──────────────────────────────────────────────
+  const handleInstallFile = useCallback(async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    // 将文件路径传给后端（Qt 环境下 file.path 是本地路径；浏览器中用 URL.createObjectURL 不行，
+    // 但 Qt WebEngine 支持通过 webkitRelativePath 或直接文件系统路径）
+    const filePath: string = (file as any).path || (file as any).webkitRelativePath || file.name;
+    setInstalling(true);
+    try {
+      const res = await api.installSkillPackage(filePath);
+      if (res.status === 'ok') {
+        const m = res.manifest;
+        showMsg('ok', `已安装插件 ${m?.name || m?.id} v${m?.version || '?'}`);
+        await reload();
+        // 若有 secrets.schema.json，立即引导配置
+        if (m?.id) {
+          const schema = await api.getSkillSecretsSchema(m.id);
+          if (schema?.fields?.length) {
+            setSecretsSkill(m.id);
+            setSecretsSchema(schema);
+            setSecretsValues({});
+            setSecretsPresence([]);
+          }
+        }
+      } else {
+        showMsg('err', `安装失败：${res.message || '未知错误'}`);
+      }
+    } finally {
+      setInstalling(false);
+      // 清空 input 以便重复安装同一文件
+      if (fileInputRef.current) fileInputRef.current.value = '';
+    }
+  }, [reload]);
+
+  // ── 打开 Secrets 配置 ────────────────────────────────────────
+  const openSecretsDialog = useCallback(async (skillName: string) => {
+    const [schema, presence] = await Promise.all([
+      api.getSkillSecretsSchema(skillName),
+      api.getSkillSecretsPresence(skillName),
+    ]);
+    if (!schema?.fields?.length) {
+      showMsg('err', '该 Skill 没有 secrets.schema.json');
+      return;
+    }
+    setSecretsSkill(skillName);
+    setSecretsSchema(schema);
+    setSecretsValues({});     // 不回显已有值（密码安全）
+    setSecretsPresence(presence);
+  }, []);
+
+  const handleSaveSecrets = useCallback(async () => {
+    if (!secretsSkill) return;
+    setSavingSecrets(true);
+    try {
+      const res = await api.setSkillSecrets(secretsSkill, secretsValues);
+      if (res.status === 'ok') {
+        showMsg('ok', '凭据已安全保存到本地（不传给大模型）');
+        setSecretsSkill(null);
+        await reload();
+      } else {
+        showMsg('err', res.message || '保存失败');
+      }
+    } finally {
+      setSavingSecrets(false);
+    }
+  }, [secretsSkill, secretsValues, reload]);
+
   if (!isOpen) return null;
 
   return (
@@ -182,20 +258,44 @@ export const SkillManager: React.FC<SkillManagerProps> = ({ isOpen, onClose, wor
                     onEdit={() => openEdit(skill)}
                     onToggle={toggleActivation}
                     onDeleteClick={() => setConfirmDelete(skill.name)}
+                    onSecretsClick={() => openSecretsDialog(skill.name)}
                   />
                 ))}
               </div>
             )}
 
-            <button onClick={() => openEdit()} style={addBtnStyle}>
-              + 新建 Skill
-            </button>
+            <div style={{ display: 'flex', gap: 8 }}>
+              <button onClick={() => openEdit()} style={{ ...addBtnStyle, flex: 1 }}>
+                + 新建 Skill
+              </button>
+              {/* 安装插件包 */}
+              <button
+                onClick={() => fileInputRef.current?.click()}
+                disabled={installing}
+                title="从本地 .awu 文件安装插件 Skill"
+                style={{
+                  ...addBtnStyle, flex: 'none', padding: '11px 16px',
+                  background: 'rgba(34,197,94,0.1)', borderColor: 'rgba(34,197,94,0.3)',
+                  color: 'rgba(34,197,94,0.9)',
+                }}
+              >
+                {installing ? '安装中…' : '📦 安装包'}
+              </button>
+              <input
+                ref={fileInputRef}
+                type="file"
+                accept=".awu,.zip"
+                style={{ display: 'none' }}
+                onChange={handleInstallFile}
+              />
+            </div>
 
             {/* 说明 */}
             <div style={{ marginTop: 14, fontSize: 11, color: 'var(--theme-text-muted)', lineHeight: 1.7,
               borderTop: '1px solid var(--theme-border)', paddingTop: 12 }}>
               <strong style={{ color: 'var(--theme-text)' }}>🌐 全局</strong>：激活后对所有 session 生效（~/.claude/skills/）<br />
-              <strong style={{ color: 'var(--theme-text)' }}>📁 此项目</strong>：仅当前目录的 session 生效（.claude/skills/），可提交进 Git
+              <strong style={{ color: 'var(--theme-text)' }}>📁 此项目</strong>：仅当前目录的 session 生效（.claude/skills/），可提交进 Git<br />
+              <strong style={{ color: 'var(--theme-text)' }}>📦 安装包</strong>：从 .awu 文件安装插件 Skill（格式：zip，含 manifest.json + SKILL.md）
             </div>
           </>
         )}
@@ -257,6 +357,58 @@ export const SkillManager: React.FC<SkillManagerProps> = ({ isOpen, onClose, wor
             </div>
           </div>
         )}
+
+        {/* ── Secrets 配置对话框 ── */}
+        {secretsSkill && secretsSchema && (
+          <div style={overlayStyle}>
+            <div style={{ ...panelStyle, width: 420 }} onClick={e => e.stopPropagation()}>
+              <h3 style={{ margin: '0 0 4px', fontSize: 15, color: 'var(--theme-text)' }}>
+                🔑 配置凭据：{secretsSkill}
+              </h3>
+              <p style={{ fontSize: 11, color: 'var(--theme-text-muted)', margin: '0 0 16px', lineHeight: 1.6 }}>
+                凭据保存在本地 <code>~/.agent-with-u/skill-secrets/</code>（chmod 600），<br />
+                <strong>永不传给大模型</strong>，Skill 执行时通过环境变量注入。
+              </p>
+              {secretsPresence.length > 0 && (
+                <div style={{ fontSize: 11, color: 'rgba(34,197,94,0.8)', marginBottom: 12,
+                  background: 'rgba(34,197,94,0.08)', padding: '5px 10px', borderRadius: 6 }}>
+                  已配置字段：{secretsPresence.join(', ')}（留空则保留原值）
+                </div>
+              )}
+              {secretsSchema.fields.map(field => (
+                <div key={field.key} style={{ marginBottom: 12 }}>
+                  <label style={labelStyle}>
+                    {field.label}
+                    {field.required && <span style={{ color: 'rgba(239,68,68,0.8)', marginLeft: 3 }}>*</span>}
+                  </label>
+                  {field.type === 'textarea' ? (
+                    <textarea
+                      value={secretsValues[field.key] ?? ''}
+                      onChange={e => setSecretsValues(prev => ({ ...prev, [field.key]: e.target.value }))}
+                      placeholder={field.placeholder || (secretsPresence.includes(field.key) ? '（留空保留原值）' : '')}
+                      style={{ ...inputStyle, height: 80, fontFamily: 'monospace', fontSize: 12, resize: 'vertical' }}
+                    />
+                  ) : (
+                    <input
+                      type={field.type === 'password' ? 'password' : 'text'}
+                      value={secretsValues[field.key] ?? ''}
+                      onChange={e => setSecretsValues(prev => ({ ...prev, [field.key]: e.target.value }))}
+                      placeholder={field.placeholder || (secretsPresence.includes(field.key) ? '（留空保留原值）' : '')}
+                      style={inputStyle}
+                      autoComplete="off"
+                    />
+                  )}
+                </div>
+              ))}
+              <div style={{ display: 'flex', gap: 8, marginTop: 4 }}>
+                <button onClick={handleSaveSecrets} disabled={savingSecrets} style={saveBtnStyle}>
+                  {savingSecrets ? '保存中…' : '保存凭据'}
+                </button>
+                <button onClick={() => setSecretsSkill(null)} style={cancelBtnStyle}>取消</button>
+              </div>
+            </div>
+          </div>
+        )}
       </div>
     </div>
   );
@@ -269,7 +421,8 @@ const SkillRow: React.FC<{
   onEdit: () => void;
   onToggle: (name: string, scope: 'global' | 'project', current: boolean) => void;
   onDeleteClick: () => void;
-}> = ({ skill, workingDir, onEdit, onToggle, onDeleteClick }) => {
+  onSecretsClick?: () => void;
+}> = ({ skill, workingDir, onEdit, onToggle, onDeleteClick, onSecretsClick }) => {
   const desc = parseDescription(skill.content);
   return (
     <div style={rowStyle}>
@@ -302,6 +455,18 @@ const SkillRow: React.FC<{
             onClick={() => onToggle(skill.name, 'project', skill.isProject)}
             title={skill.isProject ? '已在此项目激活，点击停用' : '点击为此项目激活（.claude/skills/）'}
           />
+        )}
+        {/* 凭据 */}
+        {skill.hasSecretsSchema && (
+          <button
+            onClick={e => { e.stopPropagation(); onSecretsClick?.(); }}
+            style={{ background: 'none', border: 'none',
+              color: skill.hasSecrets ? 'rgba(234,197,95,0.8)' : 'rgba(255,255,255,0.3)',
+              cursor: 'pointer', fontSize: 14, padding: '2px 4px', lineHeight: 1 }}
+            title={skill.hasSecrets ? '已配置凭据，点击修改' : '点击配置凭据'}
+          >
+            🔑
+          </button>
         )}
         {/* 删除 */}
         <button

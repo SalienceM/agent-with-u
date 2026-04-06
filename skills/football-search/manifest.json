@@ -1,0 +1,9 @@
+{
+  "id": "football-search",
+  "name": "足球资源搜索",
+  "version": "1.0.0",
+  "description": "搜索天下足球网的足球视频资源，支持关键词搜索、赛事筛选等",
+  "author": "official",
+  "type": "python-script",
+  "requires_secrets": true
+}

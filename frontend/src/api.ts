@@ -536,6 +536,30 @@ export const api = {
     try { return JSON.parse(result); } catch { return { status: 'error', message: '响应格式错误' }; }
   },
 
+  // ── 插件包安装 ────────────────────────────────────────────────────────
+  async installSkillPackage(pkgPath: string): Promise<{ status: string; manifest?: any; message?: string }> {
+    const result = await call('installSkillPackage', pkgPath);
+    if (result === null || result === undefined) return { status: 'error', message: '无法连接到后端' };
+    try { return JSON.parse(result); } catch { return { status: 'error', message: '响应格式错误' }; }
+  },
+
+  // ── Secrets 管理（凭据不传 LLM）────────────────────────────────────────
+  async getSkillSecretsSchema(name: string): Promise<{ fields: Array<{ key: string; label: string; type: 'text' | 'password' | 'textarea'; required?: boolean; placeholder?: string }> } | null> {
+    const result = await call('getSkillSecretsSchema', name);
+    try { return result ? JSON.parse(result) : null; } catch { return null; }
+  },
+
+  async setSkillSecrets(name: string, secrets: Record<string, string>): Promise<{ status: string; message?: string }> {
+    const result = await call('setSkillSecrets', name, JSON.stringify(secrets));
+    if (result === null || result === undefined) return { status: 'error', message: '无法连接到后端' };
+    try { return JSON.parse(result); } catch { return { status: 'error', message: '响应格式错误' }; }
+  },
+
+  async getSkillSecretsPresence(name: string): Promise<string[]> {
+    const result = await call('getSkillSecretsPresence', name);
+    try { return result ? JSON.parse(result) : []; } catch { return []; }
+  },
+
   async grantPermission(sessionId: string, granted: boolean, skipRest: boolean = false): Promise<void> {
     await send('grantPermission', sessionId, granted, skipRest);
   },
