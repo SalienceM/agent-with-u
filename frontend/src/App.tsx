@@ -357,7 +357,7 @@ export const App: React.FC = () => {
   }, [backends, activeSessionId]);
 
   const theme = themes[config.theme] || themes.dark;
-  const isLightTheme = config.theme === 'light';
+  const isLightTheme = config.theme === 'light' || config.theme === 'classic';
   const hljsCss = isLightTheme ? hljsLightCss : hljsDarkCss;
 
   const hasBg = !!config.bgImage;

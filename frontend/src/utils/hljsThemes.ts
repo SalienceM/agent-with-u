@@ -8,7 +8,7 @@
 export const hljsLightCss = `
 pre code.hljs { display: block; overflow-x: auto; padding: 1em }
 code.hljs { padding: 3px 5px }
-.hljs { color: #24292e; background: #ffffff }
+.hljs { color: #24292e; background: transparent }
 .hljs-doctag,.hljs-keyword,.hljs-meta .hljs-keyword,.hljs-template-tag,
 .hljs-template-variable,.hljs-type,.hljs-variable.language_ { color: #d73a49; font-weight: 600 }
 .hljs-title,.hljs-title.class_,.hljs-title.class_.inherited__,.hljs-title.function_ { color: #6f42c1; font-weight: 600 }
