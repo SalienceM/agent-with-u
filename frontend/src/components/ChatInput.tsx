@@ -19,6 +19,20 @@ if (typeof document !== 'undefined' && !document.getElementById('chat-input-css'
       box-shadow: 0 0 0 3px var(--theme-accent-bg, rgba(9,105,218,0.15)),
                   0 0 14px rgba(122,162,247,0.12) !important;
     }
+    @keyframes stream-border-flow {
+      0%   { transform: translateY(-100%); }
+      100% { transform: translateY(100%); }
+    }
+    .streaming-border {
+      position: absolute;
+      inset: 0;
+      border: 2px solid transparent;
+      border-top-color: var(--theme-success, #22c55e);
+      border-bottom-color: var(--theme-success, #22c55e);
+      border-radius: 10px;
+      animation: stream-border-flow 2s linear infinite;
+      pointer-events: none;
+    }
     @keyframes scanLine {
       0%   { transform: scaleX(0); transform-origin: left center; }
       48%  { transform: scaleX(1); transform-origin: left center; }
@@ -27,13 +41,13 @@ if (typeof document !== 'undefined' && !document.getElementById('chat-input-css'
     }
     .input-scan-line {
       position: absolute;
-      bottom: 12px; left: 16px; right: 16px;
-      height: 1px;
+      bottom: 8px; left: 16px; right: 16px;
+      height: 2px;
       background: linear-gradient(90deg, transparent 0%, var(--theme-accent,#7aa2f7) 50%, transparent 100%);
-      animation: scanLine 2.2s ease-in-out infinite;
+      animation: scanLine 1.6s ease-in-out infinite;
       pointer-events: none;
-      border-radius: 1px;
-      opacity: 0.6;
+      border-radius: 2px;
+      box-shadow: 0 0 8px var(--theme-accent, rgba(122,162,247,0.6));
     }
   `;
   document.head.appendChild(s);
@@ -499,6 +513,8 @@ const ChatInputInner: React.FC<Props> = ({
 
   return (
     <div style={{ padding: '8px 16px 12px', borderTop: '1px solid var(--theme-border, rgba(0,0,0,0.12))', background: 'var(--theme-bg, #ffffff)', position: 'relative' }}>
+      {/* ★ 流式输出时输入框动效 */}
+      {isStreaming && <div className="streaming-border" />}
       {isStreaming && <div className="input-scan-line" />}
       {/* ★ 工具栏：统一的图标按钮 */}
       <div style={{ display: 'flex', gap: 6, marginBottom: 6, alignItems: 'center', flexWrap: 'wrap' }}>
@@ -513,6 +529,28 @@ const ChatInputInner: React.FC<Props> = ({
           title="清理上下文"
           onClick={handleCompact}
         />
+        {/* ★ 流式进度指示器 */}
+        {isStreaming && (
+          <div style={{
+            display: 'inline-flex',
+            alignItems: 'center',
+            gap: 6,
+            padding: '4px 10px',
+            fontSize: 11,
+            borderRadius: 6,
+            background: 'rgba(34,197,94,0.1)',
+            border: '1px solid rgba(34,197,94,0.2)',
+          }}>
+            <div style={{
+              width: 6,
+              height: 6,
+              borderRadius: '50%',
+              background: '#22c55e',
+              animation: 'pulse 1.5s ease-in-out infinite',
+            }} />
+            <span style={{ color: '#22c55e', fontWeight: 500 }}>生成中...</span>
+          </div>
+        )}
         {/* ★ 图像尺寸选择器（仅 DashScope 图像 backend 显示） */}
         {isImageBackend && (
           <div ref={sizePickerRef} style={{ position: 'relative', display: 'inline-flex' }}>
