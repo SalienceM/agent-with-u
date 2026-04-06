@@ -175,13 +175,14 @@ export function processStreamDelta(sessionId: string, delta: any): {
       const output = delta.toolCall?.output || '';
       const status = delta.toolCall?.status || 'done';
       const durationFromBackend = delta.toolCall?.duration;
+      const diffData = delta.toolCall?.diff;
 
       let matched = false;
       state.toolCalls = state.toolCalls.map((tc) => {
         if (resultId && tc.id === resultId) {
           matched = true;
           const duration = durationFromBackend ?? (tc.startTime ? Date.now() - tc.startTime : undefined);
-          return { ...tc, output, status, duration };
+          return { ...tc, output, status, duration, ...(diffData ? { diff: diffData } : {}) };
         }
         return tc;
       });
@@ -197,7 +198,7 @@ export function processStreamDelta(sessionId: string, delta: any): {
           const duration = durationFromBackend ?? (tc.startTime ? Date.now() - tc.startTime : undefined);
           state.toolCalls = [
             ...state.toolCalls.slice(0, lastRunningIdx),
-            { ...tc, output, status, duration },
+            { ...tc, output, status, duration, ...(diffData ? { diff: diffData } : {}) },
             ...state.toolCalls.slice(lastRunningIdx + 1),
           ];
         }

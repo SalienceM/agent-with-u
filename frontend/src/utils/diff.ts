@@ -8,6 +8,8 @@ export type DiffLineType = 'context' | 'added' | 'removed';
 export interface DiffLine {
   type: DiffLineType;
   text: string;
+  oldNum?: number;  // line number in old file (undefined for added)
+  newNum?: number;  // line number in new file (undefined for removed)
 }
 
 /** 计算最长公共子序列（行级），返回 LCS 的行集合。 */
@@ -54,26 +56,25 @@ export function computeDiff(oldText: string, newText: string, context = 3): Diff
   // 如果内容过大（>500行），跳 LCS 直接全量展示避免卡顿
   if (oldLines.length > 500 || newLines.length > 500) {
     const result: DiffLine[] = [];
-    for (const l of oldLines) result.push({ type: 'removed', text: l });
-    for (const l of newLines) result.push({ type: 'added', text: l });
+    for (let i = 0; i < oldLines.length; i++) result.push({ type: 'removed', text: oldLines[i], oldNum: i + 1 });
+    for (let i = 0; i < newLines.length; i++) result.push({ type: 'added', text: newLines[i], newNum: i + 1 });
     return result;
   }
 
   const [inLcsA, inLcsB] = lcs(oldLines, newLines);
 
   // Build raw diff sequence
-  type RawLine = { type: DiffLineType; text: string };
-  const raw: RawLine[] = [];
+  const raw: DiffLine[] = [];
   let ai = 0, bi = 0;
   while (ai < oldLines.length || bi < newLines.length) {
     if (ai < oldLines.length && bi < newLines.length && inLcsA[ai] && inLcsB[bi]) {
-      raw.push({ type: 'context', text: oldLines[ai] });
+      raw.push({ type: 'context', text: oldLines[ai], oldNum: ai + 1, newNum: bi + 1 });
       ai++; bi++;
     } else if (ai < oldLines.length && !inLcsA[ai]) {
-      raw.push({ type: 'removed', text: oldLines[ai] });
+      raw.push({ type: 'removed', text: oldLines[ai], oldNum: ai + 1 });
       ai++;
     } else if (bi < newLines.length && !inLcsB[bi]) {
-      raw.push({ type: 'added', text: newLines[bi] });
+      raw.push({ type: 'added', text: newLines[bi], newNum: bi + 1 });
       bi++;
     } else {
       // Shouldn't happen
