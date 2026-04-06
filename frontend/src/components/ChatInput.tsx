@@ -6,48 +6,21 @@ import { SLASH_COMMANDS } from '../hooks/useChat';
 import type { SlashCommand } from '../hooks/useChat';
 import { api } from '../api';
 
-// ── 注入全局样式（focus glow + scan line）──────────────────────────────────
+// ── 注入全局样式（focus glow）────────────────────────────────────────────────
 if (typeof document !== 'undefined' && !document.getElementById('chat-input-css')) {
   const s = document.createElement('style');
   s.id = 'chat-input-css';
   s.textContent = `
     .chat-textarea {
-      transition: border-color 0.22s ease, box-shadow 0.22s ease;
+      transition: border-color 0.18s ease, box-shadow 0.18s ease;
     }
     .chat-textarea:focus {
       border-color: var(--theme-accent, #0969da) !important;
-      box-shadow: 0 0 0 3px var(--theme-accent-bg, rgba(9,105,218,0.15)),
-                  0 0 14px rgba(122,162,247,0.12) !important;
+      box-shadow: 0 0 0 3px var(--theme-accent-bg, rgba(9,105,218,0.15)) !important;
     }
-    @keyframes stream-border-flow {
-      0%   { transform: translateY(-100%); }
-      100% { transform: translateY(100%); }
-    }
-    .streaming-border {
-      position: absolute;
-      inset: 0;
-      border: 2px solid transparent;
-      border-top-color: var(--theme-success, #22c55e);
-      border-bottom-color: var(--theme-success, #22c55e);
-      border-radius: 10px;
-      animation: stream-border-flow 2s linear infinite;
-      pointer-events: none;
-    }
-    @keyframes scanLine {
-      0%   { transform: scaleX(0); transform-origin: left center; }
-      48%  { transform: scaleX(1); transform-origin: left center; }
-      52%  { transform: scaleX(1); transform-origin: right center; }
-      100% { transform: scaleX(0); transform-origin: right center; }
-    }
-    .input-scan-line {
-      position: absolute;
-      bottom: 8px; left: 16px; right: 16px;
-      height: 2px;
-      background: linear-gradient(90deg, transparent 0%, var(--theme-accent,#7aa2f7) 50%, transparent 100%);
-      animation: scanLine 1.6s ease-in-out infinite;
-      pointer-events: none;
-      border-radius: 2px;
-      box-shadow: 0 0 8px var(--theme-accent, rgba(122,162,247,0.6));
+    @keyframes chat-pulse {
+      0%, 100% { opacity: 1; }
+      50%       { opacity: 0.4; }
     }
   `;
   document.head.appendChild(s);
@@ -512,10 +485,7 @@ const ChatInputInner: React.FC<Props> = ({
   const parentDir = showFilePicker ? getParentDir(currentDir) : null;
 
   return (
-    <div style={{ padding: '8px 16px 12px', borderTop: '1px solid var(--theme-border, rgba(0,0,0,0.12))', background: 'var(--theme-bg, #ffffff)', position: 'relative' }}>
-      {/* ★ 流式输出时输入框动效 */}
-      {isStreaming && <div className="streaming-border" />}
-      {isStreaming && <div className="input-scan-line" />}
+    <div style={{ padding: '8px 16px 12px', borderTop: isStreaming ? '1px solid rgba(34,197,94,0.4)' : '1px solid var(--theme-border, rgba(0,0,0,0.12))', background: 'var(--theme-bg, #ffffff)', position: 'relative', transition: 'border-top-color 0.2s ease' }}>
       {/* ★ 工具栏：统一的图标按钮 */}
       <div style={{ display: 'flex', gap: 6, marginBottom: 6, alignItems: 'center', flexWrap: 'wrap' }}>
         <ToolbarBtn
@@ -546,7 +516,7 @@ const ChatInputInner: React.FC<Props> = ({
               height: 6,
               borderRadius: '50%',
               background: '#22c55e',
-              animation: 'pulse 1.5s ease-in-out infinite',
+              animation: 'chat-pulse 1.5s ease-in-out infinite',
             }} />
             <span style={{ color: '#22c55e', fontWeight: 500 }}>生成中...</span>
           </div>
