@@ -459,7 +459,7 @@ export const RepoPanel: React.FC<Props> = ({ open, workingDir, onClose }) => {
                 title="从 .awu 文件安装插件 Skill"
                 style={{ ...addBtnStyle, fontSize: 11, padding: '2px 7px' }}
               >{installing ? '…' : '📦'}</button>
-              <button onClick={() => setShowSkillTypeSelector(true)} style={addBtnStyle} title="新建 Skill">＋</button>
+              <button onClick={() => setShowSkillTypeSelector(true)} style={addBtnStyle} title="新建 Skill（开发者）">＋</button>
             </div>
           </div>
           <input ref={fileInputRef} type="file" accept=".awu,.zip" style={{ display: 'none' }} onChange={handleInstallFile} />
@@ -521,7 +521,7 @@ export const RepoPanel: React.FC<Props> = ({ open, workingDir, onClose }) => {
         <div style={deleteOverlayStyle} onClick={() => setShowSkillTypeSelector(false)}>
           <div style={{ ...deleteDialogStyle, width: 380 }} onClick={e => e.stopPropagation()}>
             <h3 style={{ margin: '0 0 12px 0', fontSize: 14, fontWeight: 600, color: 'var(--theme-text)' }}>
-              新建 Skill
+              新建 Skill <span style={{ fontSize: 10, fontWeight: 400, color: 'var(--theme-text-muted)', marginLeft: 6 }}>开发者</span>
             </h3>
             <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
               {/* 系统增强型 */}
