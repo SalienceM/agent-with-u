@@ -1,4 +1,4 @@
-import React, { useState, useCallback, useEffect, useRef } from 'react';
+import React, { useState, useCallback, useEffect, useRef, memo } from 'react';
 import { markdownToHtml } from '../utils/markdown';
 import type { ChatMessage, ToolCall, ContentBlock } from '../hooks/useChat';
 import { DiffView, type DiffData } from './DiffView';
@@ -175,7 +175,7 @@ const ImageLightbox: React.FC<{ src: string; onClose: () => void }> = ({ src, on
 // ═══════════════════════════════════════
 //  ThinkingBlock
 // ═══════════════════════════════════════
-const ThinkingBlock: React.FC<{ content: string; isThinking?: boolean }> = ({
+const ThinkingBlock: React.FC<{ content: string; isThinking?: boolean }> = memo(function ThinkingBlock({
   content,
   isThinking,
 }) => {
@@ -204,7 +204,7 @@ const ThinkingBlock: React.FC<{ content: string; isThinking?: boolean }> = ({
       )}
     </div>
   );
-};
+});
 
 // ═══════════════════════════════════════
 //  ToolCallBlock
@@ -239,7 +239,7 @@ function tryParseDiffFromInput(tc: ToolCall): DiffData | null {
   return null;
 }
 
-const ToolCallBlock: React.FC<{ tc: ToolCall }> = ({ tc }) => {
+const ToolCallBlock: React.FC<{ tc: ToolCall }> = memo(function ToolCallBlock({ tc }) {
   const [expanded, setExpanded] = useState(false);
   const color = STATUS_COLOR[tc.status] || '#888';
   const isRunning = tc.status === 'running';
@@ -310,7 +310,7 @@ const ToolCallBlock: React.FC<{ tc: ToolCall }> = ({ tc }) => {
       )}
     </div>
   );
-};
+});
 
 // ═══════════════════════════════════════
 //  ★ SystemMessage — 系统/命令消息

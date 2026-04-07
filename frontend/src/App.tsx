@@ -1,4 +1,4 @@
-import React, { useState, useCallback, useEffect, useRef } from 'react';
+import React, { useState, useCallback, useEffect, useRef, useMemo } from 'react';
 import { api } from './api';
 import { Sidebar } from './components/Sidebar';
 import { MessageBubble } from './components/MessageBubble';
@@ -149,6 +149,51 @@ export const App: React.FC = () => {
   }, [activeSession?.workingDir, activeBackendId]);
 
   const chat = useChat(activeSessionId || '', activeBackendId, backends, skipPermissions, handleQuickNewSession);
+
+  // ── 性能：稳定化传给子组件的回调，避免 ChatInput/MessageList 因父 state 变化而整体重渲染 ──
+  const handleSkipPermissionsChange = useCallback((enabled: boolean) => {
+    setSkipPermissions(enabled);
+    if (activeSessionId) {
+      api.executeCommand({
+        command: 'set_skip_permissions',
+        sessionId: activeSessionId,
+        backendId: activeBackendId,
+        args: { enabled },
+      });
+    }
+  }, [activeSessionId, activeBackendId]);
+
+  const handleCompact = useCallback(() => {
+    chat.sendMessage('/compact');
+  }, [chat.sendMessage]);
+
+  // ── 性能：便签本拖拽 handler，onMouseDown 每次渲染都会重新生成，改为 ref 方案 ──
+  const scratchPadWidthRef = useRef(scratchPadWidth);
+  scratchPadWidthRef.current = scratchPadWidth; // 每次渲染同步，保证拖拽读到最新值
+  const handleScratchDragStart = useCallback((e: React.MouseEvent<HTMLDivElement>) => {
+    scratchDragRef.current = { startX: e.clientX, startW: scratchPadWidthRef.current };
+    const onMove = (ev: MouseEvent) => {
+      if (!scratchDragRef.current) return;
+      const delta = scratchDragRef.current.startX - ev.clientX;
+      const next = Math.max(260, Math.min(700, scratchDragRef.current.startW + delta));
+      setScratchPadWidth(next);
+    };
+    const onUp = () => {
+      scratchDragRef.current = null;
+      window.removeEventListener('mousemove', onMove);
+      window.removeEventListener('mouseup', onUp);
+    };
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', onUp);
+  }, []);
+
+  // ── 性能：可见消息列表，流式时 slice 代价高，memo 避免每帧都创建新数组 ──
+  const visibleMessages = useMemo(() => {
+    const total = chat.messages.length;
+    const effectiveVisible = Math.max(visibleCount, chat.isStreaming ? total : visibleCount);
+    const hiddenCount = Math.max(0, total - effectiveVisible);
+    return { list: hiddenCount > 0 ? chat.messages.slice(hiddenCount) : chat.messages, hiddenCount, total };
+  }, [chat.messages, visibleCount, chat.isStreaming]);
 
   // ★ 活跃 session 的流状态同步（开始/结束）
   useEffect(() => {
@@ -601,13 +646,9 @@ export const App: React.FC = () => {
             </div>
           )}
           {(() => {
-            const total = chat.messages.length;
-            // ★ 流式时自动扩展可见数量，确保新消息不被隐藏
-            const effectiveVisible = Math.max(visibleCount, chat.isStreaming ? total : visibleCount);
-            const hiddenCount = Math.max(0, total - effectiveVisible);
-            const visibleMessages = hiddenCount > 0 ? chat.messages.slice(hiddenCount) : chat.messages;
-
             // 只给真正新增的最后一条消息播入场动画，切换 session 时全部不播
+            // 注意：ref mutation 不能放 useMemo/useEffect 里，保留 IIFE 仅做动画判断
+            const { list: msgList, hiddenCount, total } = visibleMessages;
             const isSameSession = animSessionRef.current === activeSessionId;
             const prevCount = isSameSession ? animMsgCountRef.current : total;
             animSessionRef.current = activeSessionId;
@@ -633,7 +674,7 @@ export const App: React.FC = () => {
                     </button>
                   </div>
                 )}
-                {visibleMessages.map((msg, idx) => (
+                {msgList.map((msg, idx) => (
                   <MessageBubble
                     key={msg.id}
                     message={msg}
@@ -719,19 +760,8 @@ export const App: React.FC = () => {
           sessionId={activeSessionId || undefined}
           workingDir={activeSession?.workingDir || undefined}
           skipPermissions={skipPermissions}
-          onSkipPermissionsChange={(enabled) => {
-            setSkipPermissions(enabled);
-            // ★ 保存到 session
-            if (activeSessionId) {
-              api.executeCommand({
-                command: 'set_skip_permissions',
-                sessionId: activeSessionId,
-                backendId: activeBackendId,
-                args: { enabled },
-              });
-            }
-          }}
-          onCompact={() => chat.sendMessage('/clear')}
+          onSkipPermissionsChange={handleSkipPermissionsChange}
+          onCompact={handleCompact}
         />
       </div>
 
@@ -740,22 +770,7 @@ export const App: React.FC = () => {
         <>
           {/* 拖动分割线 */}
           <div
-            onMouseDown={e => {
-              scratchDragRef.current = { startX: e.clientX, startW: scratchPadWidth };
-              const onMove = (ev: MouseEvent) => {
-                if (!scratchDragRef.current) return;
-                const delta = scratchDragRef.current.startX - ev.clientX;
-                const next = Math.max(260, Math.min(700, scratchDragRef.current.startW + delta));
-                setScratchPadWidth(next);
-              };
-              const onUp = () => {
-                scratchDragRef.current = null;
-                window.removeEventListener('mousemove', onMove);
-                window.removeEventListener('mouseup', onUp);
-              };
-              window.addEventListener('mousemove', onMove);
-              window.addEventListener('mouseup', onUp);
-            }}
+            onMouseDown={handleScratchDragStart}
             style={{
               width: 4, flexShrink: 0, cursor: 'col-resize',
               background: 'var(--theme-border, rgba(255,255,255,0.1))',
