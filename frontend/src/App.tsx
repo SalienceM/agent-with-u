@@ -137,7 +137,18 @@ export const App: React.FC = () => {
   // Phase 2: 每 Session 独立的模型配置
   const activeBackendId = activeSession?.backendId || backends[0]?.id || '';
 
-  const chat = useChat(activeSessionId || '', activeBackendId, backends, skipPermissions);
+  // /new 命令：复用当前 workingDir + backendId，免弹窗静默建 session
+  const handleQuickNewSession = useCallback(async () => {
+    const workingDir = activeSession?.workingDir || '.';
+    const bId = activeBackendId;
+    const session = await api.createSession(workingDir, bId);
+    setActiveSessionId(session.id);
+    const sessionList = await api.listSessions();
+    setSessions(sessionList);
+    window.dispatchEvent(new CustomEvent('session-created'));
+  }, [activeSession?.workingDir, activeBackendId]);
+
+  const chat = useChat(activeSessionId || '', activeBackendId, backends, skipPermissions, handleQuickNewSession);
 
   // ★ 活跃 session 的流状态同步（开始/结束）
   useEffect(() => {

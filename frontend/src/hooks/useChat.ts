@@ -60,6 +60,7 @@ export interface SlashCommand {
 
 export const SLASH_COMMANDS: SlashCommand[] = [
   { name: '/help',          description: '显示可用命令列表',                     shortDesc: '帮助' },
+  { name: '/new',           description: '在当前目录新建一个干净会话（无历史记忆）', shortDesc: '新会话' },
   { name: '/clear',         description: '清空当前对话历史',                     shortDesc: '清空' },
   { name: '/compact',       description: '压缩早期消息以节省上下文窗口',         shortDesc: '压缩' },
   { name: '/cost',          description: '显示本次会话的 Token 用量与估算费用',  shortDesc: '费用' },
@@ -123,7 +124,7 @@ function normalizeMessage(msg: any): ChatMessage {
   };
 }
 
-export function useChat(sessionId: string, backendId: string, backends?: any[], skipPermissions: boolean = true) {
+export function useChat(sessionId: string, backendId: string, backends?: any[], skipPermissions: boolean = true, onNewSession?: () => void) {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [isStreaming, setIsStreaming] = useState(false);
   const [autoContinue, setAutoContinue] = useState(true);
@@ -481,6 +482,15 @@ export function useChat(sessionId: string, backendId: string, backends?: any[], 
         // ── 帮助 ──
         case '/help':
           sys(HELP_TEXT);
+          break;
+
+        // ── 新建会话（同目录） ──
+        case '/new':
+          if (onNewSession) {
+            onNewSession();
+          } else {
+            sys('⚠️ 无法新建会话：未注册 onNewSession 回调。');
+          }
           break;
 
         // ── 清空 ──
