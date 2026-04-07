@@ -10,10 +10,14 @@ env:    SKILL_SECRETS = JSON { USERNAME, PASSWORD }
 依赖: pip install httpx beautifulsoup4
 """
 
+import io
 import json
 import os
 import re
 import sys
+
+# 强制 stdout 使用 UTF-8，避免 Windows 控制台默认 cp936 导致中文乱码
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
 from typing import Optional
 
 # ── 读取输入 & 凭据 ──────────────────────────────────────────────────────────
