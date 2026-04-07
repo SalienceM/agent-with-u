@@ -178,7 +178,7 @@ const ImageLightbox: React.FC<{ src: string; onClose: () => void }> = ({ src, on
 const ThinkingBlock: React.FC<{ content: string; isThinking?: boolean }> = memo(function ThinkingBlock({
   content,
   isThinking,
-}) => {
+}) {
   const [expanded, setExpanded] = useState(false);
   if (!content && !isThinking) return null;
   return (
