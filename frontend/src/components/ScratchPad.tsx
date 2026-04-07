@@ -263,6 +263,7 @@ const ScratchPadEditor: React.FC<EditorProps> = ({ mode, onClose }) => {
   const [lightbox, setLightbox] = useState<string | null>(null);
   const [copyOk, setCopyOk] = useState(false);
   const [wrapLines, setWrapLines] = useState(false); // 默认不换行，与 Monaco 一致
+  const [deleteConfirmId, setDeleteConfirmId] = useState<string | null>(null);
   const taRefs = useRef<Map<string, HTMLTextAreaElement>>(new Map());
   const focusTarget = useRef<{ blockId: string; pos: number } | null>(null);
   const copyTimer = useRef<ReturnType<typeof setTimeout>>();
@@ -444,6 +445,37 @@ const ScratchPadEditor: React.FC<EditorProps> = ({ mode, onClose }) => {
       color: 'var(--theme-text, #e0e0e0)',
       fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif',
     }}>
+      {/* 删除确认 */}
+      {deleteConfirmId && (
+        <div onClick={() => setDeleteConfirmId(null)} style={{
+          position: 'fixed', inset: 0, zIndex: 9998,
+          background: 'rgba(0,0,0,0.55)',
+          display: 'flex', alignItems: 'center', justifyContent: 'center',
+        }}>
+          <div onClick={e => e.stopPropagation()} style={{
+            background: 'var(--theme-bg-secondary, #1e2030)',
+            border: '1px solid var(--theme-border, rgba(255,255,255,0.12))',
+            borderRadius: 10, padding: '20px 24px', minWidth: 260,
+            boxShadow: '0 8px 32px rgba(0,0,0,0.5)',
+          }}>
+            <div style={{ fontSize: 14, fontWeight: 600, color: 'var(--theme-text)', marginBottom: 8 }}>确认删除</div>
+            <div style={{ fontSize: 12, color: 'var(--theme-text-muted)', marginBottom: 20, lineHeight: 1.5 }}>
+              确定要删除这条便签吗？此操作不可撤销。
+            </div>
+            <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
+              <button
+                onClick={() => setDeleteConfirmId(null)}
+                style={{ padding: '6px 14px', borderRadius: 6, border: '1px solid var(--theme-border)', background: 'transparent', color: 'var(--theme-text-muted)', fontSize: 12, cursor: 'pointer' }}
+              >取消</button>
+              <button
+                onClick={() => { handleDelete(deleteConfirmId); setDeleteConfirmId(null); }}
+                style={{ padding: '6px 14px', borderRadius: 6, border: 'none', background: '#f85149', color: '#fff', fontSize: 12, fontWeight: 500, cursor: 'pointer' }}
+              >删除</button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Lightbox */}
       {lightbox && (
         <div onClick={() => setLightbox(null)} style={{
@@ -645,7 +677,7 @@ const ScratchPadEditor: React.FC<EditorProps> = ({ mode, onClose }) => {
                 >
                   {copyOk ? '✓ 已复制' : '📋 复制全部'}
                 </button>
-                <button onClick={() => handleDelete(active.id)} style={{
+                <button onClick={() => setDeleteConfirmId(active.id)} style={{
                   ...metaBtnBase, color: '#f85149',
                   borderColor: 'rgba(248,81,73,0.3)', background: 'rgba(248,81,73,0.06)',
                 }}>
