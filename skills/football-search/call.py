@@ -226,7 +226,7 @@ try:
         "query": query,
         "count": len(results),
         "results": results,
-    }, ensure_ascii=False))
+    }, ensure_ascii=False), flush=True)
 
 except Exception as e:
-    print(json.dumps({"ok": False, "error": str(e)}, ensure_ascii=False))
+    print(json.dumps({"ok": False, "error": str(e)}, ensure_ascii=False), flush=True)
