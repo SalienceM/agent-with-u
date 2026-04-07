@@ -193,7 +193,7 @@ const ThinkingBlock: React.FC<{ content: string; isThinking?: boolean }> = ({
             {content.length > 100 ? '…' : ''}
           </span>
         )}
-        {isThinking && <span style={spinnerStyle}>◌</span>}
+        {isThinking && <span style={spinnerStyle} />}
       </div>
       {expanded && (
         <div style={sectionBody}>
@@ -258,13 +258,9 @@ const ToolCallBlock: React.FC<{ tc: ToolCall }> = ({ tc }) => {
     <div style={sectionBox}>
       <div onClick={() => setExpanded(!expanded)} style={sectionHeader}>
         <span style={{ ...chevron, transform: expanded ? 'rotate(90deg)' : 'none' }}>▶</span>
-        <span style={isRunning ? spinnerStyle : undefined}>{STATUS_ICON[tc.status] || '🔧'}</span>
+        <span>{STATUS_ICON[tc.status] || '🔧'}</span>
         <span style={{ fontFamily: 'monospace', fontWeight: 600 }}>{tc.name}</span>
-        {isRunning && (
-          <span style={{ fontSize: 10, color: 'var(--theme-text, #1f2328)', marginLeft: 4 }}>
-            Executing...
-          </span>
-        )}
+        {isRunning && <span style={spinnerStyle} />}
         <span
           style={{
             fontSize: 10,
@@ -835,8 +831,15 @@ const previewText: React.CSSProperties = {
 
 const spinnerStyle: React.CSSProperties = {
   display: 'inline-block',
-  animation: 'spin 1s linear infinite',
-  marginLeft: 4,
+  width: 12,
+  height: 12,
+  border: '2px solid rgba(255,255,255,0.15)',
+  borderTopColor: 'rgba(255,255,255,0.75)',
+  borderRadius: '50%',
+  animation: 'spin 0.7s linear infinite',
+  marginLeft: 6,
+  verticalAlign: 'middle',
+  flexShrink: 0,
 };
 
 const labelStyle: React.CSSProperties = {
