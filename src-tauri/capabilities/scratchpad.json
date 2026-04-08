@@ -1,0 +1,10 @@
+{
+  "$schema": "https://schema.tauri.app/config/2/capability.json",
+  "identifier": "scratchpad",
+  "description": "Scratchpad popup window — localStorage only, no bridge needed",
+  "platforms": ["macOS", "windows", "linux"],
+  "windows": ["scratchpad"],
+  "permissions": [
+    "core:default"
+  ]
+}
