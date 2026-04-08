@@ -232,15 +232,38 @@ function copyEntryAsHtml(entry: ScratchEntry): boolean {
 }
 
 // ── 弹出为独立窗口（弹出后关闭侧栏，窗口由自己决定关闭）────────────────
-function popout(onClose?: () => void) {
+async function popout(onClose?: () => void) {
   const url = `${location.pathname}${location.search ? location.search + '&' : '?'}scratchpad=1`;
+
+  // Tauri 环境：使用原生 WebviewWindow（window.open 在 Tauri webview 中被拦截）
+  try {
+    const { WebviewWindow } = await import('@tauri-apps/api/webviewWindow');
+    // 若已有便签窗口，聚焦复用
+    const existing = await WebviewWindow.getByLabel('scratchpad').catch(() => null);
+    if (existing) {
+      await existing.setFocus().catch(() => {});
+      onClose?.();
+      return;
+    }
+    new WebviewWindow('scratchpad', {
+      url,
+      title: '便签本 — AgentWithU',
+      width: 560,
+      height: 800,
+      resizable: true,
+    });
+    onClose?.();
+    return;
+  } catch {
+    // 非 Tauri 环境，降级到 window.open
+  }
+
   const win = window.open(url, 'agent-scratchpad',
     'width=560,height=800,resizable=yes,scrollbars=yes');
   if (!win) {
     alert('浏览器阻止了弹出窗口，请允许本站弹出窗口后重试');
     return;
   }
-  // 弹出成功 → 关闭主窗口侧栏，实现"真正分离"
   onClose?.();
 }
 
@@ -583,7 +606,7 @@ const ScratchPadEditor: React.FC<EditorProps> = ({ mode, onClose }) => {
 
         <button onClick={handleNew} title="新建" style={iconBtnStyle}>＋</button>
         {!isWindow && (
-          <button onClick={() => popout(onClose)} title="弹出独立窗口" style={iconBtnStyle}>⤢</button>
+          <button onClick={() => void popout(onClose)} title="弹出独立窗口" style={iconBtnStyle}>⤢</button>
         )}
         {onClose && (
           <button onClick={onClose} title="关闭" style={iconBtnStyle}>✕</button>
