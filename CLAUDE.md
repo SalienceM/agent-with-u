@@ -107,13 +107,42 @@ python -m src.main
 
 ### Build for Distribution
 
+#### Option 1: Use build script (Recommended)
+
+```bash
+# Windows
+build_all.bat
+```
+
+This script will:
+1. Install all Python and Node.js dependencies
+2. Build the frontend with Vite
+3. Package the Python backend with PyInstaller (including claude-agent-sdk)
+4. Build the Tauri desktop application
+
+#### Option 2: Manual PyInstaller build
+
 ```bash
 # Install PyInstaller
 pip install pyinstaller
 
-# Build standalone executable
-pyinstaller --name "AgentWithU" --windowed --add-data "frontend/dist:frontend/dist" src/main.py
+# Build backend sidecar with all required hidden imports
+pyinstaller --name "agent-with-u-backend" --onefile --console ^
+    --hidden-import websockets ^
+    --hidden-import PIL ^
+    --hidden-import claude_agent_sdk ^
+    --noconfirm ws_main_entry.py
+
+# For the Qt frontend application
+pyinstaller --name "AgentWithU" --windowed ^
+    --add-data "frontend/dist:frontend/dist" ^
+    --hidden-import websockets ^
+    --hidden-import PIL ^
+    --hidden-import claude_agent_sdk ^
+    src/main.py
 ```
+
+**Important**: The `claude_agent_sdk` module must be included in `hiddenimports` because it's dynamically imported at runtime. Without this, the packaged executable will show the error: "claude-agent-sdk 未安装".
 
 ## Coding Conventions
 

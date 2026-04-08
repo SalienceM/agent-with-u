@@ -99,7 +99,7 @@ echo [CLEAN] Removing old dist folder...
 rmdir /s /q "dist" 2>nul
 echo [CLEAN] Removing old build folder...
 rmdir /s /q "build" 2>nul
-python -m PyInstaller --name "agent-with-u-backend" --onefile --console --hidden-import websockets --hidden-import PIL --noconfirm ws_main_entry.py
+python -m PyInstaller --name "agent-with-u-backend" --onefile --console --hidden-import websockets --hidden-import PIL --hidden-import claude_agent_sdk --noconfirm ws_main_entry.py
 if errorlevel 1 ( echo [FAILED] PyInstaller build failed & pause & exit /b 1 )
 :: ============================================================
 :: Step 2: Copy sidecar to src-tauri/binaries/
