@@ -19,7 +19,7 @@ if (typeof document !== 'undefined' && !document.getElementById('scratch-editor-
   const s = document.createElement('style');
   s.id = 'scratch-editor-style';
   s.textContent = `
-    .scratch-ta::placeholder { color: #3d4455; }
+    .scratch-ta::placeholder { color: #c4a35a; }
     .scratch-ta:focus { outline: none; }
   `;
   document.head.appendChild(s);
@@ -135,8 +135,8 @@ const LineNumTextarea: React.FC<LineNumTAProps> = ({
         lineHeight: `${EDITOR_LINE_H}px`,
         fontSize: EDITOR_FONT_SZ - 1,
         fontFamily: EDITOR_FONT,
-        color: '#4e5568',
-        background: '#0d1117',
+        color: '#a08050',
+        background: '#fef9e7',
         zIndex: 1,
         userSelect: 'none', pointerEvents: 'none',
       }}>
@@ -148,7 +148,7 @@ const LineNumTextarea: React.FC<LineNumTAProps> = ({
       <div style={{
         width: 1, flexShrink: 0,
         position: 'sticky', left: GUTTER_W,
-        background: 'rgba(255,255,255,0.06)', marginRight: 10,
+        background: 'rgba(180,120,20,0.2)', marginRight: 10,
         zIndex: 1,
       }} />
       {/* 文本区：overflow 永远 hidden，宽度由镜像决定（不换行）或 flex:1（换行） */}
@@ -164,12 +164,12 @@ const LineNumTextarea: React.FC<LineNumTAProps> = ({
           flex: wrapLines ? 1 : undefined,
           minWidth: wrapLines ? 0 : 40,
           resize: 'none', border: 'none', outline: 'none',
-          background: 'transparent', color: '#cdd6f4',
+          background: 'transparent', color: '#1c1917',
           fontSize: EDITOR_FONT_SZ, lineHeight: `${EDITOR_LINE_H}px`,
           fontFamily: EDITOR_FONT, padding: 0,
           minHeight: EDITOR_LINE_H, overflow: 'hidden',
           whiteSpace: wrapLines ? 'pre-wrap' : 'pre',
-          boxSizing: 'border-box', caretColor: '#7aa2f7',
+          boxSizing: 'border-box', caretColor: '#d97706',
         }}
       />
       {/* 隐藏镜像：用于测量最长行的像素宽度 */}
@@ -441,8 +441,8 @@ const ScratchPadEditor: React.FC<EditorProps> = ({ mode, onClose }) => {
     <div style={{
       display: 'flex', flexDirection: 'column',
       height: isWindow ? '100vh' : '100%',
-      background: 'var(--theme-bg, #1a1a2e)',
-      color: 'var(--theme-text, #e0e0e0)',
+      background: '#fff9c4',
+      color: '#1c1917',
       fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif',
     }}>
       {/* 删除确认 */}
@@ -453,19 +453,19 @@ const ScratchPadEditor: React.FC<EditorProps> = ({ mode, onClose }) => {
           display: 'flex', alignItems: 'center', justifyContent: 'center',
         }}>
           <div onClick={e => e.stopPropagation()} style={{
-            background: 'var(--theme-bg-secondary, #1e2030)',
-            border: '1px solid var(--theme-border, rgba(255,255,255,0.12))',
+            background: '#fffde7',
+            border: '1px solid rgba(180,120,20,0.3)',
             borderRadius: 10, padding: '20px 24px', minWidth: 260,
-            boxShadow: '0 8px 32px rgba(0,0,0,0.5)',
+            boxShadow: '0 8px 32px rgba(100,60,0,0.2)',
           }}>
-            <div style={{ fontSize: 14, fontWeight: 600, color: 'var(--theme-text)', marginBottom: 8 }}>确认删除</div>
-            <div style={{ fontSize: 12, color: 'var(--theme-text-muted)', marginBottom: 20, lineHeight: 1.5 }}>
+            <div style={{ fontSize: 14, fontWeight: 600, color: '#1c1917', marginBottom: 8 }}>确认删除</div>
+            <div style={{ fontSize: 12, color: '#78716c', marginBottom: 20, lineHeight: 1.5 }}>
               确定要删除这条便签吗？此操作不可撤销。
             </div>
             <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
               <button
                 onClick={() => setDeleteConfirmId(null)}
-                style={{ padding: '6px 14px', borderRadius: 6, border: '1px solid var(--theme-border)', background: 'transparent', color: 'var(--theme-text-muted)', fontSize: 12, cursor: 'pointer' }}
+                style={{ padding: '6px 14px', borderRadius: 6, border: '1px solid rgba(180,120,20,0.3)', background: 'transparent', color: '#78716c', fontSize: 12, cursor: 'pointer' }}
               >取消</button>
               <button
                 onClick={() => { handleDelete(deleteConfirmId); setDeleteConfirmId(null); }}
@@ -501,14 +501,15 @@ const ScratchPadEditor: React.FC<EditorProps> = ({ mode, onClose }) => {
       <div style={{
         display: 'flex', alignItems: 'center', gap: 6,
         padding: '6px 8px',
-        borderBottom: '1px solid var(--theme-border, rgba(255,255,255,0.08))',
+        borderBottom: '1px solid rgba(180,120,20,0.3)',
+        background: '#fbbf24',
         flexShrink: 0, minWidth: 0,
       }}>
         <span style={{ fontSize: 13, flexShrink: 0 }}>📌</span>
 
         {/* 侧边栏模式：紧凑下拉选择器；独立窗口模式：标题文字（左栏负责导航） */}
         {isWindow ? (
-          <span style={{ fontWeight: 600, fontSize: 13, color: 'var(--theme-text)', flex: 1 }}>便签本</span>
+          <span style={{ fontWeight: 600, fontSize: 13, color: '#1c1917', flex: 1 }}>便签本</span>
         ) : (
           <div ref={pickerRef} style={{ position: 'relative', flex: 1, minWidth: 0 }}>
             <button
@@ -517,9 +518,9 @@ const ScratchPadEditor: React.FC<EditorProps> = ({ mode, onClose }) => {
               style={{
                 display: 'flex', alignItems: 'center', gap: 4, width: '100%',
                 padding: '3px 7px', borderRadius: 5,
-                border: '1px solid var(--theme-border, rgba(255,255,255,0.1))',
-                background: showPicker ? 'rgba(122,162,247,0.12)' : 'rgba(255,255,255,0.04)',
-                color: 'var(--theme-text-muted)', fontSize: 11, cursor: 'pointer',
+                border: '1px solid rgba(180,120,20,0.25)',
+                background: showPicker ? 'rgba(215,119,6,0.18)' : 'rgba(255,255,255,0.35)',
+                color: '#78716c', fontSize: 11, cursor: 'pointer',
                 textAlign: 'left', minWidth: 0,
               }}
             >
@@ -533,17 +534,17 @@ const ScratchPadEditor: React.FC<EditorProps> = ({ mode, onClose }) => {
             {showPicker && (
               <div style={{
                 position: 'absolute', top: '100%', left: 0, right: 0, marginTop: 3,
-                background: '#1e2030', border: '1px solid rgba(255,255,255,0.12)',
-                borderRadius: 7, boxShadow: '0 6px 24px rgba(0,0,0,0.4)',
+                background: '#fef9c3', border: '1px solid rgba(180,120,20,0.25)',
+                borderRadius: 7, boxShadow: '0 6px 24px rgba(100,60,0,0.18)',
                 zIndex: 200, maxHeight: 280, overflowY: 'auto',
               }}>
                 {entries.length === 0 ? (
-                  <div style={{ padding: '14px 10px', textAlign: 'center', fontSize: 11, color: 'var(--theme-text-muted)' }}>
+                  <div style={{ padding: '14px 10px', textAlign: 'center', fontSize: 11, color: '#78716c' }}>
                     还没有记录
                   </div>
                 ) : groups.map(({ label, items }) => (
                   <div key={label}>
-                    <div style={{ padding: '5px 10px 2px', fontSize: 10, fontWeight: 700, color: '#4e5568', letterSpacing: 0.4 }}>
+                    <div style={{ padding: '5px 10px 2px', fontSize: 10, fontWeight: 700, color: '#a08050', letterSpacing: 0.4 }}>
                       {label}
                     </div>
                     {items.map(entry => {
@@ -559,14 +560,14 @@ const ScratchPadEditor: React.FC<EditorProps> = ({ mode, onClose }) => {
                           style={{
                             display: 'flex', alignItems: 'center', gap: 6,
                             padding: '6px 10px', cursor: 'pointer',
-                            background: isAct ? 'rgba(122,162,247,0.15)' : 'transparent',
-                            borderLeft: `2px solid ${isAct ? '#7aa2f7' : 'transparent'}`,
+                            background: isAct ? 'rgba(215,119,6,0.18)' : 'transparent',
+                            borderLeft: `2px solid ${isAct ? '#d97706' : 'transparent'}`,
                           }}
                         >
-                          <span style={{ fontSize: 10, color: isAct ? '#7aa2f7' : '#4e5568', flexShrink: 0 }}>
+                          <span style={{ fontSize: 10, color: isAct ? '#d97706' : '#a08050', flexShrink: 0 }}>
                             {fmtTime(entry.updatedAt)}
                           </span>
-                          <span style={{ fontSize: 11, color: 'var(--theme-text)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1 }}>
+                          <span style={{ fontSize: 11, color: '#1c1917', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1 }}>
                             {imgCount > 0 && <span style={{ marginRight: 3, opacity: 0.7 }}>🖼</span>}
                             {preview}
                           </span>
@@ -596,18 +597,18 @@ const ScratchPadEditor: React.FC<EditorProps> = ({ mode, onClose }) => {
         {isWindow && (
           <div style={{
             width: 150, flexShrink: 0,
-            borderRight: '1px solid rgba(255,255,255,0.07)',
+            borderRight: '1px solid rgba(180,120,20,0.2)',
             overflowY: 'auto', padding: '4px 0',
-            background: '#0a0e1a',
+            background: '#fef3c7',
           }}>
             {entries.length === 0 && (
-              <div style={{ padding: '20px 8px', textAlign: 'center', fontSize: 11, color: '#4e5568', lineHeight: 1.8 }}>
+              <div style={{ padding: '20px 8px', textAlign: 'center', fontSize: 11, color: '#a08050', lineHeight: 1.8 }}>
                 还没有记录<br />点击「＋」开始
               </div>
             )}
             {groups.map(({ label, items }) => (
               <div key={label}>
-                <div style={{ padding: '5px 8px 2px', fontSize: 10, fontWeight: 700, color: '#4e5568', letterSpacing: 0.4 }}>
+                <div style={{ padding: '5px 8px 2px', fontSize: 10, fontWeight: 700, color: '#a08050', letterSpacing: 0.4 }}>
                   {label}
                 </div>
                 {items.map(entry => {
@@ -619,13 +620,13 @@ const ScratchPadEditor: React.FC<EditorProps> = ({ mode, onClose }) => {
                   return (
                     <div key={entry.id} onClick={() => setActiveId(entry.id)} style={{
                       padding: '6px 8px', cursor: 'pointer',
-                      background: isAct ? 'rgba(122,162,247,0.15)' : 'transparent',
-                      borderLeft: `2px solid ${isAct ? '#7aa2f7' : 'transparent'}`,
+                      background: isAct ? 'rgba(215,119,6,0.18)' : 'transparent',
+                      borderLeft: `2px solid ${isAct ? '#d97706' : 'transparent'}`,
                     }}>
-                      <div style={{ fontSize: 10, fontWeight: 600, color: isAct ? '#7aa2f7' : '#4e5568', marginBottom: 1 }}>
+                      <div style={{ fontSize: 10, fontWeight: 600, color: isAct ? '#d97706' : '#a08050', marginBottom: 1 }}>
                         {fmtTime(entry.updatedAt)}
                       </div>
-                      <div style={{ fontSize: 11, color: '#cdd6f4', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                      <div style={{ fontSize: 11, color: '#1c1917', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                         {imgCount > 0 && <span style={{ marginRight: 3, opacity: 0.6 }}>🖼</span>}
                         {preview}
                       </div>
@@ -638,17 +639,17 @@ const ScratchPadEditor: React.FC<EditorProps> = ({ mode, onClose }) => {
         )}
 
         {/* 编辑区 */}
-        <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden', background: '#0d1117' }}>
+        <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden', background: '#fffde7' }}>
           {active ? (
             <>
               {/* 元信息栏 */}
               <div style={{
                 display: 'flex', alignItems: 'center', gap: 6,
                 padding: '4px 12px',
-                borderBottom: '1px solid var(--theme-border, rgba(255,255,255,0.06))',
+                borderBottom: '1px solid rgba(180,120,20,0.2)',
                 flexShrink: 0,
               }}>
-                <span style={{ fontSize: 10, color: 'var(--theme-text-muted)', flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                <span style={{ fontSize: 10, color: '#78716c', flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                   🕐 {fmtFull(active.createdAt)}
                   {active.updatedAt !== active.createdAt && <> · 改 {fmtFull(active.updatedAt)}</>}
                 </span>
@@ -657,9 +658,9 @@ const ScratchPadEditor: React.FC<EditorProps> = ({ mode, onClose }) => {
                   title={wrapLines ? '关闭自动换行（横向可滚动）' : '开启自动换行'}
                   style={{
                     ...metaBtnBase,
-                    color: wrapLines ? '#7aa2f7' : 'var(--theme-text-muted)',
-                    borderColor: wrapLines ? '#7aa2f766' : 'var(--theme-border, rgba(255,255,255,0.1))',
-                    background: wrapLines ? 'rgba(122,162,247,0.1)' : 'transparent',
+                    color: wrapLines ? '#d97706' : '#78716c',
+                    borderColor: wrapLines ? '#d9770666' : 'rgba(180,120,20,0.2)',
+                    background: wrapLines ? 'rgba(215,119,6,0.1)' : 'transparent',
                     fontFamily: EDITOR_FONT, fontSize: 10,
                   }}
                 >
@@ -670,8 +671,8 @@ const ScratchPadEditor: React.FC<EditorProps> = ({ mode, onClose }) => {
                   title="复制全部内容（含图片，可粘贴到富文本编辑器）"
                   style={{
                     ...metaBtnBase,
-                    color: copyOk ? '#3fb950' : 'var(--theme-text-muted)',
-                    borderColor: copyOk ? '#3fb95066' : 'var(--theme-border, rgba(255,255,255,0.1))',
+                    color: copyOk ? '#3fb950' : '#78716c',
+                    borderColor: copyOk ? '#3fb95066' : 'rgba(180,120,20,0.2)',
                     background: copyOk ? 'rgba(63,185,80,0.1)' : 'transparent',
                   }}
                 >
@@ -691,7 +692,7 @@ const ScratchPadEditor: React.FC<EditorProps> = ({ mode, onClose }) => {
                 // 不换行时允许横向滚动；行号栏通过 sticky 固定在左侧
                 overflowX: wrapLines ? 'hidden' : 'auto',
                 padding: '12px 14px 12px 0',
-                background: '#0d1117',
+                background: '#fffde7',
                 fontFamily: EDITOR_FONT,
               }}>
                 {(() => {
@@ -729,7 +730,7 @@ const ScratchPadEditor: React.FC<EditorProps> = ({ mode, onClose }) => {
                             onClick={() => setLightbox(block.src)}
                             style={{
                               maxWidth: '100%', maxHeight: 400, display: 'block',
-                              borderRadius: 6, border: '1px solid rgba(255,255,255,0.12)',
+                              borderRadius: 6, border: '1px solid rgba(180,120,20,0.2)',
                               cursor: 'zoom-in',
                             }}
                           />
@@ -748,7 +749,7 @@ const ScratchPadEditor: React.FC<EditorProps> = ({ mode, onClose }) => {
               </div>
             </>
           ) : (
-            <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', flexDirection: 'column', gap: 12, color: 'var(--theme-text-muted)', fontSize: 13 }}>
+            <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', flexDirection: 'column', gap: 12, color: '#78716c', fontSize: 13 }}>
               <span style={{ fontSize: 32 }}>📌</span>
               <span>选择一条记录或新建</span>
             </div>
@@ -764,7 +765,7 @@ const iconBtnStyle: React.CSSProperties = {
   width: 24, height: 24, flexShrink: 0,
   display: 'flex', alignItems: 'center', justifyContent: 'center',
   padding: 0, border: 'none', borderRadius: 4,
-  background: 'transparent', color: 'var(--theme-text-muted)',
+  background: 'transparent', color: '#92400e',
   fontSize: 14, cursor: 'pointer', lineHeight: 1,
 };
 
@@ -793,17 +794,17 @@ export const ScratchPadWindow: React.FC = () => {
   useEffect(() => {
     document.title = '便签本 — AgentWithU';
     document.body.style.margin = '0';
-    document.body.style.background = '#1a1a2e';
-    // 注入基础 CSS 变量（dark 默认）
-    document.documentElement.style.setProperty('--theme-bg', '#1a1a2e');
-    document.documentElement.style.setProperty('--theme-bg-secondary', '#21262d');
-    document.documentElement.style.setProperty('--theme-bg-tertiary', '#2d333b');
-    document.documentElement.style.setProperty('--theme-border', 'rgba(255,255,255,0.1)');
-    document.documentElement.style.setProperty('--theme-text', '#e0e0e0');
-    document.documentElement.style.setProperty('--theme-text-muted', '#8b949e');
-    document.documentElement.style.setProperty('--theme-accent', '#7aa2f7');
-    document.documentElement.style.setProperty('--theme-accent-bg', 'rgba(122,162,247,0.15)');
-    document.documentElement.style.setProperty('--theme-code-bg', '#161b22');
+    document.body.style.background = '#fff9c4';
+    // 注入便签黄色主题 CSS 变量
+    document.documentElement.style.setProperty('--theme-bg', '#fff9c4');
+    document.documentElement.style.setProperty('--theme-bg-secondary', '#fef3c7');
+    document.documentElement.style.setProperty('--theme-bg-tertiary', '#fde68a');
+    document.documentElement.style.setProperty('--theme-border', 'rgba(180,120,20,0.2)');
+    document.documentElement.style.setProperty('--theme-text', '#1c1917');
+    document.documentElement.style.setProperty('--theme-text-muted', '#78716c');
+    document.documentElement.style.setProperty('--theme-accent', '#d97706');
+    document.documentElement.style.setProperty('--theme-accent-bg', 'rgba(215,119,6,0.15)');
+    document.documentElement.style.setProperty('--theme-code-bg', '#fef9e7');
   }, []);
   return <ScratchPadEditor mode="window" />;
 };
