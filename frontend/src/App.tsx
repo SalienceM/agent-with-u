@@ -164,8 +164,8 @@ export const App: React.FC = () => {
   }, [activeSessionId, activeBackendId]);
 
   const handleCompact = useCallback(() => {
-    chat.sendMessage('/compact');
-  }, [chat.sendMessage]);
+    handleQuickNewSession();
+  }, [handleQuickNewSession]);
 
   // ── 性能：便签本拖拽 handler，onMouseDown 每次渲染都会重新生成，改为 ref 方案 ──
   const scratchPadWidthRef = useRef(scratchPadWidth);

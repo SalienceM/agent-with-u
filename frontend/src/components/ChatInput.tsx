@@ -495,8 +495,8 @@ const ChatInputInner: React.FC<Props> = ({
           onClick={() => onSkipPermissionsChange?.(!skipPermissions)}
         />
         <ToolbarBtn
-          icon="🗜"
-          title="清理上下文"
+          icon="✨"
+          title="新会话（清空上下文，同目录）"
           onClick={handleCompact}
         />
         {/* ★ 流式进度指示器 */}
