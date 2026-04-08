@@ -1194,7 +1194,7 @@ class BridgeWS:
     # ═══════════════════════════════════════
     # ── Backend Skill 部署内容生成 ──────────────────────────
 
-    def _generate_backend_skill_md(self, skill_name: str, skill_info: dict) -> str:
+    def _generate_backend_skill_md(self, skill_name: str, skill_info: dict, *, is_image_backend: bool = False) -> str:
         """
         根据孵化库中的 Backend Skill 声明，生成部署版 SKILL.md。
         根据 input_schema 动态生成参数说明，适配不同 skill 类型。
@@ -1221,6 +1221,11 @@ class BridgeWS:
             args_doc.append(f"- {pname}（{tag}）：{pdesc}")
             args_example.append(f'"<{pname.upper()}>"')
 
+        # 图像生成 backend：注入 ref_image 参数说明
+        if is_image_backend:
+            args_doc.append("- ref_image（可选）：参考图片的 URL（如用户已上传图片，应传入图片地址，用于图生图）")
+            args_example.append('"<REF_IMAGE_URL>"')
+
         # 基本命令
         basic_cmd = f'"{python}" {call_script} "<{primary_field.upper()}>"'
         # 完整命令（含可选参数）
@@ -1230,6 +1235,10 @@ class BridgeWS:
         if args_doc:
             extra_params = "\n可选参数（按顺序追加）：\n" + "\n".join(args_doc) + "\n"
             extra_params += f"\n完整示例：\n```bash\n{full_cmd}\n```\n"
+
+        ref_image_hint = ""
+        if is_image_backend:
+            ref_image_hint = "\n**图生图**：若用户上传了图片或对话中有图片 URL，必须将其 URL 作为最后一个参数传入，实现参考图生图。\n"
 
         return f"""\
 ---
@@ -1244,11 +1253,11 @@ description: {description}
 ```bash
 {basic_cmd}
 ```
-{extra_params}
+{extra_params}{ref_image_hint}
 **规则：只执行一次，将输出直接原样呈现给用户。不要重试、不要自行判断结果质量、不要额外处理。**
 """
 
-    def _generate_backend_skill_call_py(self, skill_name: str, skill_info: dict) -> str:
+    def _generate_backend_skill_call_py(self, skill_name: str, skill_info: dict, *, is_image_backend: bool = False) -> str:
         """生成 _call.py 调用脚本，根据 input_schema 动态构建参数映射。"""
         port = self._HTTP_API_PORT
         input_schema = skill_info.get("inputSchema") or {}
@@ -1262,10 +1271,16 @@ description: {description}
         for i, pname in enumerate(extra_params, 2):
             extra_lines += f'if len(sys.argv) > {i} and sys.argv[{i}]:\n    payload["{pname}"] = sys.argv[{i}]\n'
 
+        # 图像生成 backend：ref_image 作为最后一个可选参数注入
+        ref_image_line = ""
+        if is_image_backend:
+            ref_image_argc = len(extra_params) + 2  # argv[1]=prompt, argv[2..N]=extra_params, argv[N+1]=ref_image
+            ref_image_line = f'if len(sys.argv) > {ref_image_argc} and sys.argv[{ref_image_argc}]:\n    payload["ref_image"] = sys.argv[{ref_image_argc}]\n'
+
         return f'''\
 import sys, json, urllib.request
 payload = {{"skill": "{skill_name}", "{primary_field}": sys.argv[1] if len(sys.argv) > 1 else ""}}
-{extra_lines}data = json.dumps(payload).encode()
+{extra_lines}{ref_image_line}data = json.dumps(payload).encode()
 req = urllib.request.Request("http://127.0.0.1:{port}/api/skill-call", data, {{"Content-Type": "application/json"}})
 result = urllib.request.urlopen(req, timeout=300).read()
 sys.stdout.buffer.write(result)
@@ -1296,13 +1311,20 @@ sys.stdout.buffer.flush()
                 continue
             if not info.get("backend") and not info.get("type"):
                 continue  # 传统 Skill，由用户手动激活
+            # 判断是否为图像生成类 backend（需要注入 ref_image 支持）
+            is_image_backend = False
+            backend_id = info.get("backend", "")
+            if backend_id:
+                bc = next((c for c in self._backend_configs if c.id == backend_id), None)
+                if bc and bc.type.value == "dashscope-image":
+                    is_image_backend = True
             # 系统增强型：部署 SKILL.md + _call.py
             target = skills_dir / sname
             target.mkdir(parents=True, exist_ok=True)
             (target / "SKILL.md").write_text(
-                self._generate_backend_skill_md(sname, info), encoding="utf-8")
+                self._generate_backend_skill_md(sname, info, is_image_backend=is_image_backend), encoding="utf-8")
             (target / "_call.py").write_text(
-                self._generate_backend_skill_call_py(sname, info), encoding="utf-8")
+                self._generate_backend_skill_call_py(sname, info, is_image_backend=is_image_backend), encoding="utf-8")
             deployed_backend_skills.add(sname)
             print(f"[bridge_ws] Deployed Backend Skill '{sname}' → {target}",
                   file=sys.stderr, flush=True)
