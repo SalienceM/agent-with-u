@@ -685,6 +685,24 @@ class BridgeWS:
                 backend.abort(session_id)
         return None
 
+    def _rpc_clearSessionContext(self, session_id: str) -> str:
+        """清空 session 的消息历史和下游 agent session ID，保留 session 本身。
+        用于 /new 命令：用户无感，对话窗口清空，后续对话从零开始。
+        """
+        session = self._active_sessions.get(session_id)
+        if not session:
+            session = self._session_store.load(session_id)
+        if not session:
+            return json.dumps({"success": False, "error": "会话未找到"}, ensure_ascii=False)
+        session.messages = []
+        session.agent_session_id = None
+        session.updated_at = time.time()
+        self._active_sessions[session_id] = session
+        self._session_store.save(session, async_=True)
+        self._emit_session_updated({"type": "context_cleared", "sessionId": session_id})
+        print(f"[bridge_ws] clearSessionContext: {session_id}", file=sys.stderr, flush=True)
+        return json.dumps({"success": True}, ensure_ascii=False)
+
     # ── RPC: 命令 ────────────────────────────────────────────────
 
     def _rpc_executeCommand(self, payload_json: str) -> str:
