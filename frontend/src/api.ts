@@ -399,6 +399,11 @@ export const api = {
     try { return JSON.parse(result); } catch { return null; }
   },
 
+  /** 清空 session 消息历史和 agent session ID，但保留 session 本身（目录/能力不变）。 */
+  async clearSessionContext(sessionId: string): Promise<void> {
+    await call('clearSessionContext', sessionId);
+  },
+
   async selectExportPath(): Promise<string | null> {
     return nativeSaveFile('export.tar.gz');
   },
@@ -629,6 +634,7 @@ function mockDispatch(method: string, params: any[]): any {
       if (p.command === 'compact') return JSON.stringify({ status: 'ok', removed: 5, remaining: 6 });
       return JSON.stringify({ status: 'ok' });
     }
+    case 'clearSessionContext': return JSON.stringify({ success: true });
     case 'createSession':
       return JSON.stringify({
         id: 'mock-' + Date.now(), title: 'Mock session',
