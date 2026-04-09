@@ -1,5 +1,5 @@
 """ClaudeAgentBackend — uses claude_agent_sdk."""
-import os, sys, asyncio, json
+import os, sys, asyncio, json, threading
 from pathlib import Path
 from typing import Optional, Callable, Awaitable
 from ..types import ModelBackendConfig, ChatMessage, ImageAttachment, ToolCallInfo, new_id
@@ -21,11 +21,6 @@ class ClaudeAgentBackend(ModelBackend):
     Image support: images are passed natively via the AsyncIterable[dict] form of
     the prompt parameter using Anthropic content blocks (type: image / source: base64).
     """
-
-    # ★ 类级全局锁：claude_agent_sdk 内部（anyio 运行时、子进程管道）存在共享状态，
-    #   并发调用 sdk_query 会导致不同 session 的流相互串扰（输出/上下文混合）。
-    #   串行化所有 sdk_query 调用保证每个 session 的 cmd 窗口完全隔离。
-    _sdk_lock: asyncio.Lock = asyncio.Lock()
 
     async def send_message(
         self,
@@ -222,183 +217,235 @@ class ClaudeAgentBackend(ModelBackend):
             # ★ 持锁期间独占 SDK 运行时，防止不同 session 并发导致串流
             print(f"[ClaudeAgent] 等待 SDK 锁 session={session_id!r}",
                   file=sys.stderr, flush=True)
-            # ★ 持锁期间独占 SDK 运行时，防止不同 session 并发导致串流
-            async with ClaudeAgentBackend._sdk_lock:
-                print(f"[ClaudeAgent] 获得 SDK 锁 session={session_id!r}",
-                      file=sys.stderr, flush=True)
-                async for message in sdk_query(prompt=prompt_arg, options=options):
-                    if self.is_cancelled(session_id):
-                        break
-                    # result 消息已处理完毕，静默耗尽剩余消息避免 anyio cancel scope 错误
-                    if _done_emitted:
-                        continue
+            # ★ 每次 sdk_query 在独立线程 + 独立 event loop 中运行，
+            #   彻底隔离 anyio 运行时，多个 session 可真正并发且互不串扰。
+            main_loop = asyncio.get_running_loop()
+            _q: asyncio.Queue = asyncio.Queue()
+            _DONE = object()
+            _exc_box: list = [None]
 
-                    _CLASS_TYPE_MAP = {
-                        "SystemMessage": "system",
-                        "StreamEvent": "stream_event",
-                        "AssistantMessage": "assistant",
-                        "TaskStartedMessage": "task_started",
-                        "UserMessage": "user",
-                        "ResultMessage": "result",
-                    }
-                    _class_name = type(message).__name__
-                    msg_type = getattr(message, "type", None) or _CLASS_TYPE_MAP.get(_class_name, _class_name)
+            # 若 prompt_arg 是 async generator（有图片时），先在主循环中收集好，
+            # 然后在子线程里用简单 list → async gen 的方式重新包装传给 SDK。
+            if has_images:
+                _collected_prompt: list = []
+                async for _item in prompt_arg:  # type: ignore[union-attr]
+                    _collected_prompt.append(_item)
+                _prompt_for_thread: object = _collected_prompt
+            else:
+                _prompt_for_thread = prompt_arg  # str
 
-                    # ★ StreamEvent: include_partial_messages=True 时的流式增量事件
-                    if msg_type == "stream_event":
-                        evt = getattr(message, "event", {})
-                        etype = evt.get("type", "")
-                        if etype == "content_block_delta":
-                            delta = evt.get("delta", {})
-                            dtype = delta.get("type", "")
-                            if dtype == "text_delta":
-                                emit("text_delta", text=delta.get("text", ""))
-                            elif dtype == "thinking_delta":
-                                thinking = delta.get("thinking", "")
-                                if thinking:
-                                    emit("thinking", text=thinking)
-                            elif dtype == "input_json_delta":
-                                partial = delta.get("partial_json", "")
-                                if partial:
-                                    emit("tool_input", tool_call={"inputDelta": partial})
-                                    # ★ 同步累积到 _pending_perm，以便 content_block_stop 时拿到完整 input
-                                    if _pending_perm is not None:
-                                        _pending_perm["parts"].append(partial)
-                        elif etype == "content_block_start":
-                            block = evt.get("content_block", {})
-                            if block.get("type") == "tool_use":
-                                tool_id = block.get("id", "")
-                                tool_name = block.get("name", "")
-                                emit("tool_start", tool_call={
-                                    "id": tool_id,
-                                    "name": tool_name,
-                                    "input": "",
-                                    "status": "running",
-                                })
-                                # ★ 记录待确认 tool，等 content_block_stop 时输入完整再弹权限门
-                                if not skip_permissions and tool_name in PERMISSION_SENSITIVE_TOOLS:
-                                    _pending_perm = {"id": tool_id, "name": tool_name, "parts": []}
-                                else:
-                                    _pending_perm = None
-                        elif etype == "content_block_stop":
-                            # ★ 工具输入已完整，现在才发起权限确认
-                            if _pending_perm is not None:
-                                perm = _pending_perm
+            def _sdk_thread():
+                import asyncio as _aio
+                _tloop = _aio.new_event_loop()
+                _aio.set_event_loop(_tloop)
+                try:
+                    async def _run():
+                        if isinstance(_prompt_for_thread, list):
+                            async def _gen():
+                                for _x in _prompt_for_thread:
+                                    yield _x
+                            _p = _gen()
+                        else:
+                            _p = _prompt_for_thread  # type: ignore[assignment]
+                        try:
+                            async for _msg in sdk_query(prompt=_p, options=options):
+                                main_loop.call_soon_threadsafe(_q.put_nowait, _msg)
+                        except Exception as _e:
+                            _exc_box[0] = _e
+                        finally:
+                            main_loop.call_soon_threadsafe(_q.put_nowait, _DONE)
+                    _tloop.run_until_complete(_run())
+                finally:
+                    _tloop.close()
+
+            _t = threading.Thread(target=_sdk_thread, daemon=True,
+                                  name=f"sdk-{session_id[:8]}")
+            _t.start()
+            print(f"[ClaudeAgent] 线程 {_t.name} 已启动", file=sys.stderr, flush=True)
+
+            # 从队列消费消息（线程推送到主循环）
+            while True:
+                _msg = await _q.get()
+                if _msg is _DONE:
+                    break
+                message = _msg
+
+                if self.is_cancelled(session_id):
+                    break
+                if _done_emitted:
+                    continue
+
+                _CLASS_TYPE_MAP = {
+                    "SystemMessage": "system",
+                    "StreamEvent": "stream_event",
+                    "AssistantMessage": "assistant",
+                    "TaskStartedMessage": "task_started",
+                    "UserMessage": "user",
+                    "ResultMessage": "result",
+                }
+                _class_name = type(message).__name__
+                msg_type = getattr(message, "type", None) or _CLASS_TYPE_MAP.get(_class_name, _class_name)
+
+                # ★ StreamEvent: include_partial_messages=True 时的流式增量事件
+                if msg_type == "stream_event":
+                    evt = getattr(message, "event", {})
+                    etype = evt.get("type", "")
+                    if etype == "content_block_delta":
+                        delta = evt.get("delta", {})
+                        dtype = delta.get("type", "")
+                        if dtype == "text_delta":
+                            emit("text_delta", text=delta.get("text", ""))
+                        elif dtype == "thinking_delta":
+                            thinking = delta.get("thinking", "")
+                            if thinking:
+                                emit("thinking", text=thinking)
+                        elif dtype == "input_json_delta":
+                            partial = delta.get("partial_json", "")
+                            if partial:
+                                emit("tool_input", tool_call={"inputDelta": partial})
+                                # ★ 同步累积到 _pending_perm，以便 content_block_stop 时拿到完整 input
+                                if _pending_perm is not None:
+                                    _pending_perm["parts"].append(partial)
+                    elif etype == "content_block_start":
+                        block = evt.get("content_block", {})
+                        if block.get("type") == "tool_use":
+                            tool_id = block.get("id", "")
+                            tool_name = block.get("name", "")
+                            emit("tool_start", tool_call={
+                                "id": tool_id,
+                                "name": tool_name,
+                                "input": "",
+                                "status": "running",
+                            })
+                            # ★ 记录待确认 tool，等 content_block_stop 时输入完整再弹权限门
+                            if not skip_permissions and tool_name in PERMISSION_SENSITIVE_TOOLS:
+                                _pending_perm = {"id": tool_id, "name": tool_name, "parts": []}
+                            else:
                                 _pending_perm = None
-                                full_input = "".join(perm["parts"])
-                                granted = await _wait_for_permission(perm["id"], perm["name"], full_input)
-                                if not granted:
-                                    emit("error", error=f"权限被拒绝：{perm['name']} 操作已取消")
-                                    self.abort(session_id)
-                                    break
+                    elif etype == "content_block_stop":
+                        # ★ 工具输入已完整，现在才发起权限确认
+                        if _pending_perm is not None:
+                            perm = _pending_perm
+                            _pending_perm = None
+                            full_input = "".join(perm["parts"])
+                            granted = await _wait_for_permission(perm["id"], perm["name"], full_input)
+                            if not granted:
+                                emit("error", error=f"权限被拒绝：{perm['name']} 操作已取消")
+                                self.abort(session_id)
+                                break
 
-                    elif msg_type == "system":
-                        if getattr(message, "subtype", None) == "init":
-                            agent_sid = getattr(message, "session_id", agent_sid)
-                            print(f"[ClaudeAgent] session_id={agent_sid}",
-                                  file=sys.stderr, flush=True)
+                elif msg_type == "system":
+                    if getattr(message, "subtype", None) == "init":
+                        agent_sid = getattr(message, "session_id", agent_sid)
+                        print(f"[ClaudeAgent] session_id={agent_sid}",
+                              file=sys.stderr, flush=True)
 
-                    elif msg_type == "assistant":
-                        # include_partial_messages=True 时 assistant 消息是已完成块的汇总
-                        # 流式增量已通过 stream_event 处理，此处只处理 thinking/tool_use
-                        for block in getattr(message, "content", []):
-                            btype = getattr(block, "type", "")
-                            if btype == "thinking":
-                                # thinking 不走增量，完整输出
-                                thinking = getattr(block, "thinking", "")
-                                if thinking:
-                                    emit("thinking", text=thinking)
-                            elif btype == "tool_use":
-                                tool_input = getattr(block, "input", {})
-                                input_str = (
-                                    json.dumps(tool_input, ensure_ascii=False, indent=2)
-                                    if tool_input else ""
-                                )
-                                emit("tool_start", tool_call={
-                                    "id": getattr(block, "id", ""),
-                                    "name": getattr(block, "name", ""),
-                                    "input": input_str,
-                                    "status": "running",
-                                })
+                elif msg_type == "assistant":
+                    # include_partial_messages=True 时 assistant 消息是已完成块的汇总
+                    # 流式增量已通过 stream_event 处理，此处只处理 thinking/tool_use
+                    for block in getattr(message, "content", []):
+                        btype = getattr(block, "type", "")
+                        if btype == "thinking":
+                            # thinking 不走增量，完整输出
+                            thinking = getattr(block, "thinking", "")
+                            if thinking:
+                                emit("thinking", text=thinking)
+                        elif btype == "tool_use":
+                            tool_input = getattr(block, "input", {})
+                            input_str = (
+                                json.dumps(tool_input, ensure_ascii=False, indent=2)
+                                if tool_input else ""
+                            )
+                            emit("tool_start", tool_call={
+                                "id": getattr(block, "id", ""),
+                                "name": getattr(block, "name", ""),
+                                "input": input_str,
+                                "status": "running",
+                            })
 
-                    elif msg_type == "user":
-                        for block in getattr(message, "content", []):
-                            btype = (
-                                getattr(block, "type", None)
-                                or (block.get("type") if isinstance(block, dict) else None)
+                elif msg_type == "user":
+                    for block in getattr(message, "content", []):
+                        btype = (
+                            getattr(block, "type", None)
+                            or (block.get("type") if isinstance(block, dict) else None)
+                            or ""
+                        )
+                        if btype == "tool_result":
+                            result_content = (
+                                getattr(block, "content", None)
+                                or (block.get("content") if isinstance(block, dict) else None)
                                 or ""
                             )
-                            if btype == "tool_result":
-                                result_content = (
-                                    getattr(block, "content", None)
-                                    or (block.get("content") if isinstance(block, dict) else None)
-                                    or ""
+                            if isinstance(result_content, list):
+                                result_content = "\n".join(
+                                    (p.get("text", json.dumps(p, ensure_ascii=False))
+                                     if isinstance(p, dict) else str(p))
+                                    for p in result_content
                                 )
-                                if isinstance(result_content, list):
-                                    result_content = "\n".join(
-                                        (p.get("text", json.dumps(p, ensure_ascii=False))
-                                         if isinstance(p, dict) else str(p))
-                                        for p in result_content
-                                    )
-                                output_str = str(result_content or "")
-                                if len(output_str) > 5000:
-                                    output_str = output_str[:5000] + "\n... (truncated)"
-                                is_error = (
-                                    getattr(block, "is_error", None)
-                                    or (block.get("is_error") if isinstance(block, dict) else None)
-                                    or False
-                                )
-                                # ★ 兼容多种属性名，确保拿到正确的 tool_use_id
-                                tool_id = (
-                                    getattr(block, "tool_use_id", None)
-                                    or (block.get("tool_use_id") if isinstance(block, dict) else None)
-                                    or getattr(block, "tool_call_id", None)
-                                    or (block.get("tool_call_id") if isinstance(block, dict) else None)
-                                    or getattr(block, "id", None)
-                                    or (block.get("id") if isinstance(block, dict) else None)
-                                    or ""
-                                )
-                                print(f"[ClaudeAgent] tool_result: id={tool_id!r}, "
-                                      f"status={'error' if is_error else 'done'}, len={len(output_str)}",
-                                      file=sys.stderr, flush=True)
-                                emit("tool_result", tool_call={
-                                    "id": tool_id,
-                                    "output": output_str,
-                                    "status": "error" if is_error else "done",
-                                })
-
-                    elif msg_type == "result":
-                        agent_sid = getattr(message, "session_id", agent_sid)
-                        print(f"[ClaudeAgent] session(result): {agent_sid}",
-                              file=sys.stderr, flush=True)
-                        is_error = getattr(message, "is_error", False)
-                        subtype = getattr(message, "subtype", "")
-                        if is_error or subtype == "error_during_execution":
-                            print(f"[ClaudeAgent] Resume 失败: subtype={subtype}",
+                            output_str = str(result_content or "")
+                            if len(output_str) > 5000:
+                                output_str = output_str[:5000] + "\n... (truncated)"
+                            is_error = (
+                                getattr(block, "is_error", None)
+                                or (block.get("is_error") if isinstance(block, dict) else None)
+                                or False
+                            )
+                            # ★ 兼容多种属性名，确保拿到正确的 tool_use_id
+                            tool_id = (
+                                getattr(block, "tool_use_id", None)
+                                or (block.get("tool_use_id") if isinstance(block, dict) else None)
+                                or getattr(block, "tool_call_id", None)
+                                or (block.get("tool_call_id") if isinstance(block, dict) else None)
+                                or getattr(block, "id", None)
+                                or (block.get("id") if isinstance(block, dict) else None)
+                                or ""
+                            )
+                            print(f"[ClaudeAgent] tool_result: id={tool_id!r}, "
+                                  f"status={'error' if is_error else 'done'}, len={len(output_str)}",
                                   file=sys.stderr, flush=True)
-                            emit("resume_failed")
-                        usage_dict: Optional[dict] = None
-                        try:
-                            usage = getattr(message, "usage", None)
-                            if usage:
-                                in_tok = getattr(usage, "input_tokens", None)
-                                out_tok = getattr(usage, "output_tokens", None)
-                                if in_tok is not None or out_tok is not None:
-                                    usage_dict = {
-                                        "inputTokens": in_tok or 0,
-                                        "outputTokens": out_tok or 0,
-                                    }
-                        except Exception as ue:
-                            print(f"[ClaudeAgent] usage 读取失败: {ue}",
-                                  file=sys.stderr, flush=True)
-                        emit("done", **({"usage": usage_dict} if usage_dict else {}))
-                        _done_emitted = True  # 不 break，让生成器自然耗尽以避免 anyio cancel scope 错误
+                            emit("tool_result", tool_call={
+                                "id": tool_id,
+                                "output": output_str,
+                                "status": "error" if is_error else "done",
+                            })
 
-                    elif msg_type not in ("task_started",):
-                        print(f"[ClaudeAgent] 未处理的消息类型: {msg_type}",
+                elif msg_type == "result":
+                    agent_sid = getattr(message, "session_id", agent_sid)
+                    print(f"[ClaudeAgent] session(result): {agent_sid}",
+                          file=sys.stderr, flush=True)
+                    is_error = getattr(message, "is_error", False)
+                    subtype = getattr(message, "subtype", "")
+                    if is_error or subtype == "error_during_execution":
+                        print(f"[ClaudeAgent] Resume 失败: subtype={subtype}",
                               file=sys.stderr, flush=True)
-                if not _done_emitted:
-                    emit("done")
+                        emit("resume_failed")
+                    usage_dict: Optional[dict] = None
+                    try:
+                        usage = getattr(message, "usage", None)
+                        if usage:
+                            in_tok = getattr(usage, "input_tokens", None)
+                            out_tok = getattr(usage, "output_tokens", None)
+                            if in_tok is not None or out_tok is not None:
+                                usage_dict = {
+                                    "inputTokens": in_tok or 0,
+                                    "outputTokens": out_tok or 0,
+                                }
+                    except Exception as ue:
+                        print(f"[ClaudeAgent] usage 读取失败: {ue}",
+                              file=sys.stderr, flush=True)
+                    emit("done", **({"usage": usage_dict} if usage_dict else {}))
+                    _done_emitted = True  # 不 break，让生成器自然耗尽（线程会自行结束）
+
+                elif msg_type not in ("task_started",):
+                    print(f"[ClaudeAgent] 未处理的消息类型: {msg_type}",
+                          file=sys.stderr, flush=True)
+
+            # 等待线程结束，传播线程内异常
+            _t.join(timeout=120)
+            if _exc_box[0] is not None:
+                raise _exc_box[0]
+            if not _done_emitted:
+                emit("done")
             return {"agentSessionId": agent_sid}
 
         except Exception as e:
