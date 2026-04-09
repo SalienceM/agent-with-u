@@ -648,6 +648,41 @@ class Bridge(QObject):
 
         return json.dumps({"status": "error", "message": f"未知命令: {command}"})
 
+    # ═══════════════════════════════════════
+    #  ★ 清空 session 上下文（保留 session 本身）
+    # ═══════════════════════════════════════
+    @Slot(str, result=str)
+    def clearSessionContext(self, session_id: str) -> str:
+        """清空 session 的消息历史和 agent session ID，但保留 session 本身。
+
+        设计意图：
+        - 不创建新的应用层 session（session ID/名称/目录/能力不变）
+        - 清空对话消息 + Claude Code 内部 session ID（下游 agent session 重置）
+        - 用于 /new 命令和「清理上下文」按钮：用户无感，对话窗口清空，后续对话从零开始
+        """
+        session = self._active_sessions.get(session_id)
+        if not session:
+            session = self._session_store.load(session_id)
+        if not session:
+            return json.dumps({"success": False, "error": "会话未找到"}, ensure_ascii=False)
+
+        session.messages = []
+        session.agent_session_id = None
+        session.updated_at = time.time()
+
+        # 更新内存缓存
+        self._active_sessions[session_id] = session
+        # 同步持久化
+        self._session_store.save(session)
+
+        self.sessionUpdated.emit(json.dumps({
+            "type": "context_cleared",
+            "sessionId": session_id,
+        }, ensure_ascii=False))
+
+        print(f"[Bridge] clearSessionContext: {session_id}", file=sys.stderr, flush=True)
+        return json.dumps({"success": True}, ensure_ascii=False)
+
     # ── 会话管理 ──
 
     @Slot(str, str, result=str)

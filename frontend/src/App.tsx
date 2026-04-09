@@ -148,7 +148,13 @@ export const App: React.FC = () => {
     window.dispatchEvent(new CustomEvent('session-created'));
   }, [activeSession?.workingDir, activeBackendId]);
 
-  const chat = useChat(activeSessionId || '', activeBackendId, backends, skipPermissions, handleQuickNewSession);
+  const handleClearContext = useCallback(async () => {
+    if (!activeSessionId) return;
+    await api.clearSessionContext(activeSessionId);
+    // sessionUpdated 'context_cleared' 事件会触发 useChat 清空消息列表
+  }, [activeSessionId]);
+
+  const chat = useChat(activeSessionId || '', activeBackendId, backends, skipPermissions, handleQuickNewSession, handleClearContext);
 
   // ── 性能：稳定化传给子组件的回调，避免 ChatInput/MessageList 因父 state 变化而整体重渲染 ──
   const handleSkipPermissionsChange = useCallback((enabled: boolean) => {
@@ -164,8 +170,8 @@ export const App: React.FC = () => {
   }, [activeSessionId, activeBackendId]);
 
   const handleCompact = useCallback(() => {
-    handleQuickNewSession();
-  }, [handleQuickNewSession]);
+    handleClearContext();
+  }, [handleClearContext]);
 
   // ── 性能：便签本拖拽 handler，onMouseDown 每次渲染都会重新生成，改为 ref 方案 ──
   const scratchPadWidthRef = useRef(scratchPadWidth);

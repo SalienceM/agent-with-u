@@ -1,5 +1,5 @@
 """ClaudeAgentBackend — uses claude_agent_sdk."""
-import os, sys, asyncio, json
+import os, sys, asyncio, json, threading
 from pathlib import Path
 from typing import Optional, Callable, Awaitable
 from ..types import ModelBackendConfig, ChatMessage, ImageAttachment, ToolCallInfo, new_id
@@ -214,10 +214,64 @@ class ClaudeAgentBackend(ModelBackend):
                 prompt_arg = f"以下是你必须遵守的规则和约束：\n\n{constraints}\n\n---\n\n{content}"
             else:
                 prompt_arg = content
-            async for message in sdk_query(prompt=prompt_arg, options=options):
+            # ★ 持锁期间独占 SDK 运行时，防止不同 session 并发导致串流
+            print(f"[ClaudeAgent] 等待 SDK 锁 session={session_id!r}",
+                  file=sys.stderr, flush=True)
+            # ★ 每次 sdk_query 在独立线程 + 独立 event loop 中运行，
+            #   彻底隔离 anyio 运行时，多个 session 可真正并发且互不串扰。
+            main_loop = asyncio.get_running_loop()
+            _q: asyncio.Queue = asyncio.Queue()
+            _DONE = object()
+            _exc_box: list = [None]
+
+            # 若 prompt_arg 是 async generator（有图片时），先在主循环中收集好，
+            # 然后在子线程里用简单 list → async gen 的方式重新包装传给 SDK。
+            if has_images:
+                _collected_prompt: list = []
+                async for _item in prompt_arg:  # type: ignore[union-attr]
+                    _collected_prompt.append(_item)
+                _prompt_for_thread: object = _collected_prompt
+            else:
+                _prompt_for_thread = prompt_arg  # str
+
+            def _sdk_thread():
+                import asyncio as _aio
+                _tloop = _aio.new_event_loop()
+                _aio.set_event_loop(_tloop)
+                try:
+                    async def _run():
+                        if isinstance(_prompt_for_thread, list):
+                            async def _gen():
+                                for _x in _prompt_for_thread:
+                                    yield _x
+                            _p = _gen()
+                        else:
+                            _p = _prompt_for_thread  # type: ignore[assignment]
+                        try:
+                            async for _msg in sdk_query(prompt=_p, options=options):
+                                main_loop.call_soon_threadsafe(_q.put_nowait, _msg)
+                        except Exception as _e:
+                            _exc_box[0] = _e
+                        finally:
+                            main_loop.call_soon_threadsafe(_q.put_nowait, _DONE)
+                    _tloop.run_until_complete(_run())
+                finally:
+                    _tloop.close()
+
+            _t = threading.Thread(target=_sdk_thread, daemon=True,
+                                  name=f"sdk-{session_id[:8]}")
+            _t.start()
+            print(f"[ClaudeAgent] 线程 {_t.name} 已启动", file=sys.stderr, flush=True)
+
+            # 从队列消费消息（线程推送到主循环）
+            while True:
+                _msg = await _q.get()
+                if _msg is _DONE:
+                    break
+                message = _msg
+
                 if self.is_cancelled(session_id):
                     break
-                # result 消息已处理完毕，静默耗尽剩余消息避免 anyio cancel scope 错误
                 if _done_emitted:
                     continue
 
@@ -380,11 +434,16 @@ class ClaudeAgentBackend(ModelBackend):
                         print(f"[ClaudeAgent] usage 读取失败: {ue}",
                               file=sys.stderr, flush=True)
                     emit("done", **({"usage": usage_dict} if usage_dict else {}))
-                    _done_emitted = True  # 不 break，让生成器自然耗尽以避免 anyio cancel scope 错误
+                    _done_emitted = True  # 不 break，让生成器自然耗尽（线程会自行结束）
 
                 elif msg_type not in ("task_started",):
                     print(f"[ClaudeAgent] 未处理的消息类型: {msg_type}",
                           file=sys.stderr, flush=True)
+
+            # 等待线程结束，传播线程内异常
+            _t.join(timeout=120)
+            if _exc_box[0] is not None:
+                raise _exc_box[0]
             if not _done_emitted:
                 emit("done")
             return {"agentSessionId": agent_sid}
