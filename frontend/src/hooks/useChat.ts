@@ -1,4 +1,4 @@
-import { useState, useCallback, useEffect, useRef } from 'react';
+import { useState, useCallback, useEffect, useRef, startTransition } from 'react';
 import { api } from '../api';
 import type { ImageAttachment } from './useClipboardImage';
 import {
@@ -263,31 +263,33 @@ export function useChat(sessionId: string, backendId: string, backends?: any[], 
 
       const mid = delta.messageId;
 
-      // ★ 辅助函数：更新流式消息
+      // ★ 辅助函数：更新流式消息（startTransition = 低优先级，不阻塞用户输入）
       const updateStreamingMessage = (extra: Partial<ChatMessage> = {}) => {
-        setMessages((prev) => {
-          const existing = prev.find(m => m.id === mid);
-          if (existing) {
-            return prev.map(m =>
-              m.id === mid
-                ? buildStreamingMessage(state, { ...m, ...extra })
-                : m
-            );
-          } else {
-            // 消息不存在时创建新的
-            const newMsg: ChatMessage = {
-              id: mid,
-              role: 'assistant',
-              content: state.text,
-              timestamp: Date.now() / 1000,
-              streaming: state.isStreaming,
-              thinking: state.thinking || undefined,
-              toolCalls: state.toolCalls.length > 0 ? state.toolCalls : undefined,
-              contentBlocks: state.contentBlocks.length > 0 ? state.contentBlocks : undefined,
-              ...extra,
-            };
-            return [...prev, newMsg];
-          }
+        startTransition(() => {
+          setMessages((prev) => {
+            const existing = prev.find(m => m.id === mid);
+            if (existing) {
+              return prev.map(m =>
+                m.id === mid
+                  ? buildStreamingMessage(state, { ...m, ...extra })
+                  : m
+              );
+            } else {
+              // 消息不存在时创建新的
+              const newMsg: ChatMessage = {
+                id: mid,
+                role: 'assistant',
+                content: state.text,
+                timestamp: Date.now() / 1000,
+                streaming: state.isStreaming,
+                thinking: state.thinking || undefined,
+                toolCalls: state.toolCalls.length > 0 ? state.toolCalls : undefined,
+                contentBlocks: state.contentBlocks.length > 0 ? state.contentBlocks : undefined,
+                ...extra,
+              };
+              return [...prev, newMsg];
+            }
+          });
         });
       };
 
