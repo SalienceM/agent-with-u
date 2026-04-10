@@ -1,4 +1,4 @@
-import { useState, useCallback, useEffect, useRef } from 'react';
+import { useState, useCallback, useEffect, useRef, startTransition } from 'react';
 import { api } from '../api';
 import type { ImageAttachment } from './useClipboardImage';
 import {
@@ -151,6 +151,10 @@ export function useChat(sessionId: string, backendId: string, backends?: any[], 
   const skipPermissionsRef = useRef(skipPermissions);
   skipPermissionsRef.current = skipPermissions;
 
+  // ── RAF 节流 refs（流式渲染限速，不阻塞用户输入）──
+  const rafIdRef = useRef<number | null>(null);
+  const pendingMsgUpdateRef = useRef<(() => void) | null>(null);
+
   // ★ 同步本地 refs 与全局状态
   const syncFromGlobalState = useCallback((state: StreamState) => {
     textRef.current = state.text;
@@ -251,43 +255,76 @@ export function useChat(sessionId: string, backendId: string, backends?: any[], 
 
   // ── 流式 delta 监听 ──
   useEffect(() => {
-    return api.onStreamDelta((delta) => {
+    // 取消挂起的 RAF，立即执行 pendingMsgUpdate（用于终态 done/error）
+    const flushNow = () => {
+      if (rafIdRef.current !== null) {
+        cancelAnimationFrame(rafIdRef.current);
+        rafIdRef.current = null;
+      }
+      const fn = pendingMsgUpdateRef.current;
+      pendingMsgUpdateRef.current = null;
+      if (fn) fn();
+    };
+
+    // 调度一次 RAF 节流渲染：同一帧内多次调用只保留最新的 fn
+    const scheduleUpdate = (fn: () => void) => {
+      pendingMsgUpdateRef.current = fn;
+      if (rafIdRef.current === null) {
+        rafIdRef.current = requestAnimationFrame(() => {
+          rafIdRef.current = null;
+          const flush = pendingMsgUpdateRef.current;
+          pendingMsgUpdateRef.current = null;
+          if (flush) startTransition(flush);
+        });
+      }
+    };
+
+    const unsub = api.onStreamDelta((delta) => {
       if (delta.sessionId !== sessionId) return;
 
       // ★ 使用全局状态处理器
       const result = processStreamDelta(sessionId, delta);
       const state = result.state;
 
-      // ★ 同步本地 refs
+      // ★ 同步本地 refs（不触发渲染）
       syncFromGlobalState(state);
 
       const mid = delta.messageId;
 
-      // ★ 辅助函数：更新流式消息
-      const updateStreamingMessage = (extra: Partial<ChatMessage> = {}) => {
-        setMessages((prev) => {
-          const existing = prev.find(m => m.id === mid);
-          if (existing) {
-            return prev.map(m =>
-              m.id === mid
-                ? buildStreamingMessage(state, { ...m, ...extra })
-                : m
-            );
-          } else {
-            // 消息不存在时创建新的
-            const newMsg: ChatMessage = {
-              id: mid,
-              role: 'assistant',
-              content: state.text,
-              timestamp: Date.now() / 1000,
-              streaming: state.isStreaming,
-              thinking: state.thinking || undefined,
-              toolCalls: state.toolCalls.length > 0 ? state.toolCalls : undefined,
-              contentBlocks: state.contentBlocks.length > 0 ? state.contentBlocks : undefined,
-              ...extra,
-            };
-            return [...prev, newMsg];
-          }
+      // ★ 流式中间帧：快照当前状态，交给 RAF 节流渲染（≤60fps，不阻塞输入）
+      const scheduleStreamingUpdate = (extra: Partial<ChatMessage> = {}) => {
+        // 立即快照，避免异步执行时 state 已被下一个 delta 修改
+        const snap = {
+          text: state.text,
+          thinking: state.thinking,
+          isStreaming: state.isStreaming,
+          toolCalls: [...state.toolCalls],
+          contentBlocks: [...state.contentBlocks],
+        };
+        scheduleUpdate(() => {
+          setMessages((prev) => {
+            const existing = prev.find(m => m.id === mid);
+            if (existing) {
+              return prev.map(m =>
+                m.id === mid
+                  ? buildStreamingMessage(snap as any, { ...m, ...extra })
+                  : m
+              );
+            } else {
+              const newMsg: ChatMessage = {
+                id: mid,
+                role: 'assistant',
+                content: snap.text,
+                timestamp: Date.now() / 1000,
+                streaming: snap.isStreaming,
+                thinking: snap.thinking || undefined,
+                toolCalls: snap.toolCalls.length > 0 ? snap.toolCalls : undefined,
+                contentBlocks: snap.contentBlocks.length > 0 ? snap.contentBlocks : undefined,
+                ...extra,
+              };
+              return [...prev, newMsg];
+            }
+          });
         });
       };
 
@@ -297,22 +334,20 @@ export function useChat(sessionId: string, backendId: string, backends?: any[], 
         case 'tool_start':
         case 'tool_input':
         case 'tool_result':
-          updateStreamingMessage();
-          break;
-
         case 'tool_end':
-          updateStreamingMessage();
+          scheduleStreamingUpdate();
           break;
 
         case 'done': {
-          // ★ 捕获最终状态快照（使用展开创建新对象，避免引用问题）
+          // 终态：先把挂起的中间帧冲掉，再立即渲染最终结果
+          flushNow();
+
           const finalText = state.text;
           const finalThinking = state.thinking || undefined;
           const finalToolCalls = state.toolCalls.length > 0 ? [...state.toolCalls] : undefined;
           const finalBlocks = state.contentBlocks.length > 0 ? [...state.contentBlocks] : undefined;
           const finalElapsed = state.streamStart ? Date.now() - state.streamStart : undefined;
 
-          // ★ 先保存到全局状态（作为备份），再更新 React 状态
           const sessionState = getStreamState(sessionId);
           sessionState.text = finalText;
           sessionState.thinking = finalThinking || '';
@@ -341,14 +376,14 @@ export function useChat(sessionId: string, backendId: string, backends?: any[], 
         }
 
         case 'error': {
-          // ★ 捕获最终状态快照（使用展开创建新对象，避免引用问题）
+          flushNow();
+
           const errText = state.text;
           const errThinking = state.thinking || undefined;
           const errToolCalls = state.toolCalls.length > 0 ? [...state.toolCalls] : undefined;
           const errBlocks = state.contentBlocks.length > 0 ? [...state.contentBlocks] : undefined;
           const errElapsed = state.streamStart ? Date.now() - state.streamStart : undefined;
 
-          // ★ 先保存到全局状态（作为备份），再更新 React 状态
           const sessionState = getStreamState(sessionId);
           sessionState.text = errText;
           sessionState.thinking = errThinking || '';
@@ -377,6 +412,16 @@ export function useChat(sessionId: string, backendId: string, backends?: any[], 
         }
       }
     });
+
+    return () => {
+      unsub();
+      // 组件卸载时取消挂起的 RAF，防止内存泄漏
+      if (rafIdRef.current !== null) {
+        cancelAnimationFrame(rafIdRef.current);
+        rafIdRef.current = null;
+      }
+      pendingMsgUpdateRef.current = null;
+    };
   }, [sessionId, syncFromGlobalState]);
 
   // ── 添加系统消息（纯前端） ──
