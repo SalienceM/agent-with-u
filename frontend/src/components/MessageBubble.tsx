@@ -1,4 +1,4 @@
-import React, { useState, useCallback, useEffect, useRef, memo } from 'react';
+import React, { useState, useCallback, useEffect, useRef, memo, useMemo } from 'react';
 import { markdownToHtml } from '../utils/markdown';
 import type { ChatMessage, ToolCall, ContentBlock } from '../hooks/useChat';
 import { DiffView, type DiffData } from './DiffView';
@@ -530,12 +530,12 @@ const BubbleActionMenu: React.FC<{ message: ChatMessage }> = ({ message }) => {
   );
 };
 
-export const MessageBubble: React.FC<Props> = ({
+function MessageBubbleInner({
   message,
   fontSize = 14,
   renderMarkdown = true,
   animateIn = false,
-}) => {
+}: Props) {
   const [lightboxSrc, setLightboxSrc] = useState<string | null>(null);
   const contentRef = useRef<HTMLDivElement>(null);
 
@@ -611,8 +611,11 @@ export const MessageBubble: React.FC<Props> = ({
 
   const isThinkingPhase = !!message.streaming && !!thinkingContent && !message.content;
 
-  const contentHtml =
-    !isUser && renderMarkdown && message.content ? markdownToHtml(message.content) : null;
+  // ★ useMemo 避免每次渲染重新解析 Markdown（message.content 不变则复用缓存）
+  const contentHtml = useMemo(
+    () => !isUser && renderMarkdown && message.content ? markdownToHtml(message.content) : null,
+    [isUser, renderMarkdown, message.content],
+  );
 
   return (
     <>
@@ -783,7 +786,24 @@ export const MessageBubble: React.FC<Props> = ({
     </div>
     </>
   );
-};
+}
+
+// ★ memo + 自定义比较：streaming 消息不跳过（内容持续变化），已完成消息只在内容实际变化时才重渲染
+function bubblePropsEqual(prev: Props, next: Props): boolean {
+  // 任一处于流式中 → 允许更新
+  if (prev.message.streaming || next.message.streaming) return false;
+  return (
+    prev.message.id        === next.message.id        &&
+    prev.message.content   === next.message.content   &&
+    prev.message.elapsed   === next.message.elapsed   &&
+    prev.message.usage     === next.message.usage     &&
+    prev.fontSize          === next.fontSize          &&
+    prev.renderMarkdown    === next.renderMarkdown    &&
+    prev.animateIn         === next.animateIn
+  );
+}
+
+export const MessageBubble = memo(MessageBubbleInner, bubblePropsEqual);
 
 // ═══════════════════════════════════════
 //  共享样式
