@@ -261,16 +261,12 @@ function extractImagesFromOutput(output: string): { images: Array<{src: string; 
 }
 
 const ToolCallBlock: React.FC<{ tc: ToolCall }> = memo(function ToolCallBlock({ tc }) {
-  const [expanded, setExpanded] = useState(false);
-  const [lightboxSrc, setLightboxSrc] = useState<string | null>(null);
-  const color = STATUS_COLOR[tc.status] || '#888';
-  const isRunning = tc.status === 'running';
-
-  // ★ 优先用后端注入的 diff，否则从 input JSON 中解析
-  const diffData: DiffData | null = tc.diff || tryParseDiffFromInput(tc);
-
   // ★ 从 tool output 中提取 markdown 图片，支持 generate-image 等 skill 结果
   const { images: outputImages, text: outputText } = tc.output ? extractImagesFromOutput(tc.output) : { images: [], text: tc.output || '' };
+
+  // 有图片时默认展开，让用户直接看到结果
+  const [expanded, setExpanded] = useState(outputImages.length > 0);
+  const [lightboxSrc, setLightboxSrc] = useState<string | null>(null);
 
   // Format duration for display
   const formatDuration = (ms?: number) => {
@@ -790,6 +786,38 @@ function MessageBubbleInner({
             ) : null}
           </>
         )}
+
+        {/* ★ 工具输出图片直出：不依赖模型转述，直接在消息体内渲染 */}
+        {!isUser && !message.streaming && message.toolCalls && (() => {
+          const allToolImages: Array<{ src: string; alt: string }> = [];
+          for (const tc of message.toolCalls) {
+            if (tc.output && tc.status !== 'error') {
+              const { images } = extractImagesFromOutput(tc.output);
+              allToolImages.push(...images);
+            }
+          }
+          if (allToolImages.length === 0) return null;
+          return (
+            <div style={{ marginTop: 8, display: 'flex', flexWrap: 'wrap', gap: 8 }}>
+              {allToolImages.map((img, idx) => (
+                <img
+                  key={idx}
+                  src={img.src}
+                  alt={img.alt || 'generated image'}
+                  style={{
+                    maxWidth: '100%',
+                    maxHeight: 480,
+                    borderRadius: 8,
+                    cursor: 'zoom-in',
+                    border: '1px solid var(--theme-border, rgba(0,0,0,0.12))',
+                    display: 'block',
+                  }}
+                  onClick={() => setLightboxSrc(img.src)}
+                />
+              ))}
+            </div>
+          );
+        })()}
 
         {/* 流式光标 */}
         {message.streaming && (
