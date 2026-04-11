@@ -541,7 +541,9 @@ class BridgeWS:
         except Exception as e:
             return 500, f"Skill execution error: {e}"
 
-        result = "".join(result_parts) or "(no output)"
+        result = "".join(result_parts) or ""
+        print(f"[bridge_ws] skill-call raw result ({len(result)} chars): {result[:120]!r}",
+              file=sys.stderr, flush=True)
 
         # ★ 拦截 base64 图片数据：保存到文件，只返回干净的 markdown 图片 URL
         import base64 as _b64
@@ -597,8 +599,39 @@ class BridgeWS:
                 result = result.replace(noise, "")
             result = result.strip()
 
-        return 200, result
+            # ★ 如果结果中有远程图片 URL（非 base64），尝试用 bridge 自身下载并缓存到本地
+            # 这样即使用户浏览器无法直接访问 DashScope CDN，bridge 也可以代理
+            if result and "![" in result and "http" in result:
+                import re as _re
+                import httpx as _httpx
+                _img_match = _re.search(r'!\[[^\]]*\]\((https?://[^)]+)\)', result)
+                if _img_match:
+                    _remote_url = _img_match.group(1)
+                    print(f"[bridge_ws] Trying to cache remote image: {_remote_url[:80]}",
+                          file=sys.stderr, flush=True)
+                    try:
+                        async with _httpx.AsyncClient(timeout=60) as _hc:
+                            _r = await _hc.get(_remote_url)
+                            if _r.status_code == 200:
+                                _ext = _r.headers.get("content-type", "image/png").split("/")[-1].split(";")[0]
+                                _ext = _ext.replace("jpeg", "jpg")
+                                tmp_dir = _Path.home() / ".agent-with-u" / "skill-images"
+                                tmp_dir.mkdir(parents=True, exist_ok=True)
+                                _img_path = tmp_dir / f"{new_id()}.{_ext or 'png'}"
+                                _img_path.write_bytes(_r.content)
+                                _local_url = f"http://127.0.0.1:{self._HTTP_API_PORT}/api/skill-images/{_img_path.name}"
+                                result = f"![生成图像]({_local_url})"
+                                print(f"[bridge_ws] Cached remote image → {_img_path}",
+                                      file=sys.stderr, flush=True)
+                    except Exception as _cache_err:
+                        print(f"[bridge_ws] Failed to cache remote image: {_cache_err}",
+                              file=sys.stderr, flush=True)
+                        # 保留原始远程 URL
 
+        if not result:
+            result = "(no output)"
+        print(f"[bridge_ws] skill-call final result: {result[:120]!r}",
+              file=sys.stderr, flush=True)
         return 200, result
 
     # ── WebSocket 基础设施 ───────────────────────────────────────
@@ -1353,14 +1386,21 @@ description: {description}
             ref_image_line = f'if len(sys.argv) > {ref_image_argc} and sys.argv[{ref_image_argc}]:\n    payload["ref_image"] = sys.argv[{ref_image_argc}]\n'
 
         return f'''\
-import sys, json, urllib.request
+import sys, json, urllib.request, urllib.error
 payload = {{"skill": "{skill_name}", "{primary_field}": sys.argv[1] if len(sys.argv) > 1 else ""}}
 {extra_lines}{ref_image_line}data = json.dumps(payload).encode()
 req = urllib.request.Request("http://127.0.0.1:{port}/api/skill-call", data, {{"Content-Type": "application/json"}})
-result = urllib.request.urlopen(req, timeout=300).read()
-sys.stdout.buffer.write(result)
-sys.stdout.buffer.write(b"\\n")
-sys.stdout.buffer.flush()
+try:
+    result = urllib.request.urlopen(req, timeout=300).read()
+    sys.stdout.buffer.write(result)
+    sys.stdout.buffer.write(b"\\n")
+    sys.stdout.buffer.flush()
+except urllib.error.URLError as e:
+    sys.stderr.write(f"[_call.py] HTTP error calling skill bridge: {{e}}\\n")
+    sys.stderr.flush()
+    sys.stdout.write(f"(skill bridge error: {{e}})\\n")
+    sys.stdout.flush()
+    sys.exit(1)
 '''
 
     def _sync_backend_skills_to_directory(self, session: Session):

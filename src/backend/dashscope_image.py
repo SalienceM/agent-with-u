@@ -284,14 +284,18 @@ class DashScopeImageBackend(ModelBackend):
                     emit("text_delta", text="✅ 生成完成，正在下载图片…\n\n")
 
                     # 下载图片 → base64 → markdown 嵌入
-                    img_resp = await client.get(img_url, timeout=60.0)
-                    if img_resp.status_code == 200:
-                        mime = img_resp.headers.get("content-type", "image/png").split(";")[0]
-                        b64  = base64.b64encode(img_resp.content).decode()
-                        emit("text_delta", text=f"![生成图像](data:{mime};base64,{b64})\n\n")
-                    else:
+                    try:
+                        img_resp = await client.get(img_url, timeout=60.0)
+                        if img_resp.status_code == 200:
+                            mime = img_resp.headers.get("content-type", "image/png").split(";")[0]
+                            b64  = base64.b64encode(img_resp.content).decode()
+                            emit("text_delta", text=f"![生成图像](data:{mime};base64,{b64})\n\n")
+                        else:
+                            emit("text_delta", text=f"![生成图像]({img_url})\n\n")
+                            emit("text_delta", text=f"> 🔗 原始链接（24小时有效）：{img_url}\n")
+                    except Exception as _dl_err:
+                        print(f"[DashScope] 图片下载失败，回退到原始链接: {_dl_err}", file=sys.stderr)
                         emit("text_delta", text=f"![生成图像]({img_url})\n\n")
-                        emit("text_delta", text=f"> 🔗 原始链接（24小时有效）：{img_url}\n")
 
                     # 尝试从 usage 中获取 token 信息
                     usage_info = data.get("usage", {})
@@ -342,15 +346,19 @@ class DashScopeImageBackend(ModelBackend):
                         emit("text_delta", text="✅ 生成完成，正在下载图片…\n\n")
 
                         # ── Step 3: 下载 → base64 → markdown 嵌入 ─────────
-                        img_resp = await client.get(img_url, timeout=60.0)
-                        if img_resp.status_code == 200:
-                            mime = img_resp.headers.get("content-type", "image/png").split(";")[0]
-                            b64  = base64.b64encode(img_resp.content).decode()
-                            emit("text_delta", text=f"![生成图像](data:{mime};base64,{b64})\n\n")
-                        else:
-                            # 下载失败，给原始链接（24h 有效）
+                        try:
+                            img_resp = await client.get(img_url, timeout=60.0)
+                            if img_resp.status_code == 200:
+                                mime = img_resp.headers.get("content-type", "image/png").split(";")[0]
+                                b64  = base64.b64encode(img_resp.content).decode()
+                                emit("text_delta", text=f"![生成图像](data:{mime};base64,{b64})\n\n")
+                            else:
+                                # 下载失败，给原始链接（24h 有效）
+                                emit("text_delta", text=f"![生成图像]({img_url})\n\n")
+                                emit("text_delta", text=f"> 🔗 原始链接（24小时有效）：{img_url}\n")
+                        except Exception as _dl_err:
+                            print(f"[DashScope] 图片下载失败，回退到原始链接: {_dl_err}", file=sys.stderr)
                             emit("text_delta", text=f"![生成图像]({img_url})\n\n")
-                            emit("text_delta", text=f"> 🔗 原始链接（24小时有效）：{img_url}\n")
 
                         usage_info  = pdata.get("usage", {})
                         image_count = usage_info.get("image_count", 1)
