@@ -1181,10 +1181,6 @@ class BridgeWS:
         def on_delta(delta: StreamDelta):
             if delta.type == "text_delta" and delta.text:
                 result_parts.append(delta.text)
-            # 将目标 backend 的流式事件也转发给前端（作为子工具的输出）
-            # 使用原始 session_id 和 message_id
-            if delta.type in ("text_delta", "thinking"):
-                pass  # 文本结果收集后统一返回
 
         sub_message_id = new_id()
         try:
@@ -1203,8 +1199,60 @@ class BridgeWS:
         result = "".join(result_parts)
         if not result:
             result = "(no output)"
-        print(f"[bridge_ws] Backend Skill '{tool_name}' → backend '{target_backend_id}', "
-              f"result: {result[:200]}...", file=sys.stderr, flush=True)
+
+        # ★ 与 _handle_skill_call 相同的图片处理管线：
+        #   base64 inline 图片 → 保存到 skill-images/ → 返回本地 URL markdown
+        import base64 as _b64
+        from pathlib import Path as _Path
+
+        _B64_MARKER = ";base64,"
+        saved_urls: list[str] = []
+
+        while _B64_MARKER in result:
+            marker_pos = result.find(_B64_MARKER)
+            img_start = result.rfind("![", 0, marker_pos)
+            if img_start < 0:
+                break
+            paren_open = result.find("(data:", img_start)
+            if paren_open < 0 or paren_open > marker_pos:
+                break
+            mime_start = paren_open + len("(data:")
+            mime = result[mime_start:marker_pos]
+            b64_start = marker_pos + len(_B64_MARKER)
+            b64_end = result.find(")", b64_start)
+            if b64_end < 0:
+                b64_end = len(result)
+            b64_data = result[b64_start:b64_end]
+            end_pos = min(b64_end + 1, len(result))
+
+            ext = mime.split("/")[-1].replace("jpeg", "jpg") if "/" in mime else "png"
+            try:
+                img_bytes = _b64.b64decode(b64_data)
+                tmp_dir = _Path.home() / ".agent-with-u" / "skill-images"
+                tmp_dir.mkdir(parents=True, exist_ok=True)
+                img_path = tmp_dir / f"{new_id()}.{ext}"
+                img_path.write_bytes(img_bytes)
+                img_url = f"http://127.0.0.1:{self._HTTP_API_PORT}/api/skill-images/{img_path.name}"
+                saved_urls.append(img_url)
+                print(f"[bridge_ws] Backend Skill saved image: {img_path} ({len(img_bytes)} bytes)",
+                      file=sys.stderr, flush=True)
+            except Exception as e:
+                print(f"[bridge_ws] Backend Skill failed to save image: {e}",
+                      file=sys.stderr, flush=True)
+
+            result = result[:img_start] + result[end_pos:]
+
+        if saved_urls:
+            result = "\n".join(f"![生成图像]({url})" for url in saved_urls)
+        else:
+            # 去掉 DashScope 进度状态文本
+            for noise in ["🎨 正在提交图像生成任务…", "✅ 生成完成，正在下载图片…",
+                          "⏳ 任务已提交，等待生成…"]:
+                result = result.replace(noise, "")
+            result = result.strip() or "(no output)"
+
+        print(f"[bridge_ws] Backend Skill '{tool_name}' → '{target_backend_id}': {result[:200]}",
+              file=sys.stderr, flush=True)
         return result
 
     # ═══════════════════════════════════════
