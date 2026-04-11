@@ -1880,24 +1880,38 @@ except urllib.error.URLError as e:
     # ── RPC: 数据导入导出 ────────────────────────────────────────
 
     async def _rpc_exportData(self, target_path: str) -> str:
+        """
+        导出 = Backends 配置 + Repo（Prompts + Skills）。
+        ⚠️ 不再包含 sessions（会话数据保留在本机）。
+        ⚠️ 不包含 skill-secrets（凭据永不外带）。
+        """
         try:
             import tarfile, tempfile
             from pathlib import Path
             with tempfile.TemporaryDirectory() as tmpdir:
                 tmppath = Path(tmpdir)
-                sessions_tar = tmppath / "sessions.tar.gz"
-                if not self._session_store.export_all(str(sessions_tar)):
-                    return json.dumps({"status": "error", "message": "导出会话失败"}, ensure_ascii=False)
                 backends_json = tmppath / "backends.json"
                 self._backend_store.export_config(str(backends_json))
+                prompts_tar = tmppath / "prompt-library.tar.gz"
+                self._prompt_store.export_library(str(prompts_tar))
+                skills_tar = tmppath / "skill-library.tar.gz"
+                self._skill_store.export_library(str(skills_tar))
                 with tarfile.open(target_path, "w:gz") as tar:
-                    tar.add(sessions_tar, arcname="sessions.tar.gz")
-                    tar.add(backends_json, arcname="backends.json")
+                    if backends_json.exists():
+                        tar.add(backends_json, arcname="backends.json")
+                    if prompts_tar.exists():
+                        tar.add(prompts_tar, arcname="prompt-library.tar.gz")
+                    if skills_tar.exists():
+                        tar.add(skills_tar, arcname="skill-library.tar.gz")
             return json.dumps({"status": "ok", "message": "导出成功"}, ensure_ascii=False)
         except Exception as e:
             return json.dumps({"status": "error", "message": str(e)}, ensure_ascii=False)
 
     async def _rpc_importData(self, source_path: str) -> str:
+        """
+        导入 = Backends 配置 + Repo（Prompts + Skills）。
+        ⚠️ 老包里的 sessions.tar.gz 会被安全地忽略。
+        """
         try:
             import tarfile, tempfile
             from pathlib import Path
@@ -1905,12 +1919,6 @@ except urllib.error.URLError as e:
                 tmppath = Path(tmpdir)
                 with tarfile.open(source_path, "r:gz") as tar:
                     tar.extractall(tmpdir)
-                sessions_count = 0
-                sessions_tar = tmppath / "sessions.tar.gz"
-                if sessions_tar.exists():
-                    before = len(self._session_store.list())
-                    if self._session_store.import_all(str(sessions_tar)):
-                        sessions_count = len(self._session_store.list()) - before
                 backends_count = 0
                 backends_json = tmppath / "backends.json"
                 if backends_json.exists():
@@ -1920,9 +1928,19 @@ except urllib.error.URLError as e:
                     stored = self._backend_store.list()
                     if stored:
                         self._backend_configs = list(stored)
+                prompts_count = 0
+                prompts_tar = tmppath / "prompt-library.tar.gz"
+                if prompts_tar.exists():
+                    prompts_count = self._prompt_store.import_library(str(prompts_tar))
+                skills_count = 0
+                skills_tar = tmppath / "skill-library.tar.gz"
+                if skills_tar.exists():
+                    skills_count = self._skill_store.import_library(str(skills_tar))
             return json.dumps({
                 "status": "ok", "message": "导入成功",
-                "sessions": sessions_count, "backends": backends_count,
+                "backends": backends_count,
+                "prompts": prompts_count,
+                "skills": skills_count,
             }, ensure_ascii=False)
         except Exception as e:
             return json.dumps({"status": "error", "message": str(e)}, ensure_ascii=False)

@@ -353,7 +353,8 @@ export const App: React.FC = () => {
   /* ---- 数据导入 ---- */
   const handleImportData = useCallback(async () => {
     const confirmed = window.confirm(
-      '⚠️ 警告：导入将覆盖所有现有的会话和后端配置！\n\n确定要继续吗？'
+      '⚠️ 警告：导入将覆盖现有的 Backends 配置 和 Repo（Prompts + Skills）！\n\n' +
+      '（会话不会被导入／覆盖。）\n\n确定要继续吗？'
     );
     if (!confirmed) return;
 
@@ -365,9 +366,13 @@ export const App: React.FC = () => {
     try {
       const result = await api.importData(sourcePath);
       if (result.status === 'ok') {
-        showToast('success', `导入成功：${result.sessions || 0} 个会话，${result.backends || 0} 个后端配置`);
-        const [sessionList, backendList] = await Promise.all([api.listSessions(), api.getBackends()]);
-        setSessions(sessionList);
+        const parts = [
+          `${result.backends || 0} 个后端`,
+          `${result.prompts || 0} 个 Prompt`,
+          `${result.skills || 0} 个 Skill`,
+        ];
+        showToast('success', `导入成功：${parts.join('，')}`);
+        const backendList = await api.getBackends();
         setBackends(backendList);
       } else {
         showToast('error', `导入失败：${result.message}`);

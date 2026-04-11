@@ -954,39 +954,40 @@ class Bridge(QObject):
     @Slot(str, result=str)
     def exportData(self, target_path: str) -> str:
         """
-        Export all sessions and backend configs to a tar file.
+        Export backend configs + Repo (Prompts + Skills) to a tar.gz file.
 
-        Args:
-            target_path: Path to save the tar file
-
-        Returns:
-            JSON string: { "status": "ok" | "error", "message": string }
+        ⚠️ Sessions are intentionally NOT exported — they stay on the local machine.
+        ⚠️ Skill credentials (skill-secrets/) are NEVER bundled.
         """
         try:
             import tarfile
             import tempfile
             from pathlib import Path
+            from .prompt_store import PromptStore
+            from .skill_store import SkillStore
+
+            prompt_store = PromptStore()
+            skill_store = SkillStore()
 
             with tempfile.TemporaryDirectory() as tmpdir:
                 tmppath = Path(tmpdir)
 
-                # Export sessions to temp file
-                sessions_tar = tmppath / "sessions.tar.gz"
-                sessions_success = self._session_store.export_all(str(sessions_tar))
-
-                # Export backend configs to temp file
                 backends_json = tmppath / "backends.json"
-                backends_success = self._backend_store.export_config(str(backends_json))
+                self._backend_store.export_config(str(backends_json))
 
-                if not sessions_success:
-                    return json.dumps({"status": "error", "message": "导出会话失败"}, ensure_ascii=False)
+                prompts_tar = tmppath / "prompt-library.tar.gz"
+                prompt_store.export_library(str(prompts_tar))
 
-                # Create final tar file
+                skills_tar = tmppath / "skill-library.tar.gz"
+                skill_store.export_library(str(skills_tar))
+
                 with tarfile.open(target_path, "w:gz") as tar:
-                    # Add sessions archive
-                    tar.add(sessions_tar, arcname="sessions.tar.gz")
-                    # Add backends config
-                    tar.add(backends_json, arcname="backends.json")
+                    if backends_json.exists():
+                        tar.add(backends_json, arcname="backends.json")
+                    if prompts_tar.exists():
+                        tar.add(prompts_tar, arcname="prompt-library.tar.gz")
+                    if skills_tar.exists():
+                        tar.add(skills_tar, arcname="skill-library.tar.gz")
 
                 return json.dumps({"status": "ok", "message": "导出成功"}, ensure_ascii=False)
         except Exception as e:
@@ -995,56 +996,52 @@ class Bridge(QObject):
     @Slot(str, result=str)
     def importData(self, source_path: str) -> str:
         """
-        Import sessions and backend configs from a tar file.
-        This will OVERWRITE existing data.
-
-        Args:
-            source_path: Path to the tar file to import
-
-        Returns:
-            JSON string: { "status": "ok" | "error", "message": string, "sessions"?: number, "backends"?: number }
+        Import backend configs + Repo (Prompts + Skills) from a tar.gz file.
+        Any legacy sessions.tar.gz entry inside the archive is silently ignored.
         """
         try:
             import tarfile
             import tempfile
             from pathlib import Path
+            from .prompt_store import PromptStore
+            from .skill_store import SkillStore
+
+            prompt_store = PromptStore()
+            skill_store = SkillStore()
 
             with tempfile.TemporaryDirectory() as tmpdir:
                 tmppath = Path(tmpdir)
 
-                # Extract archive
                 with tarfile.open(source_path, "r:gz") as tar:
                     tar.extractall(tmpdir)
 
-                # Import sessions
-                sessions_tar = tmppath / "sessions.tar.gz"
-                sessions_count = 0
-                if sessions_tar.exists():
-                    # Count sessions before import
-                    before_count = len(self._session_store.list())
-                    if self._session_store.import_all(str(sessions_tar)):
-                        after_count = len(self._session_store.list())
-                        sessions_count = after_count - before_count
-
-                # Import backend configs
-                backends_json = tmppath / "backends.json"
                 backends_count = 0
+                backends_json = tmppath / "backends.json"
                 if backends_json.exists():
                     before_count = len(self._backend_store.list())
                     if self._backend_store.import_config(str(backends_json)):
                         after_count = len(self._backend_store.list())
                         backends_count = after_count - before_count
-
-                    # Update in-memory backend configs in Bridge
                     stored_configs = self._backend_store.list()
                     if stored_configs:
                         self._backend_configs = list(stored_configs)
 
+                prompts_count = 0
+                prompts_tar = tmppath / "prompt-library.tar.gz"
+                if prompts_tar.exists():
+                    prompts_count = prompt_store.import_library(str(prompts_tar))
+
+                skills_count = 0
+                skills_tar = tmppath / "skill-library.tar.gz"
+                if skills_tar.exists():
+                    skills_count = skill_store.import_library(str(skills_tar))
+
                 return json.dumps({
                     "status": "ok",
                     "message": "导入成功",
-                    "sessions": sessions_count,
                     "backends": backends_count,
+                    "prompts": prompts_count,
+                    "skills": skills_count,
                 }, ensure_ascii=False)
         except Exception as e:
             return json.dumps({"status": "error", "message": str(e)}, ensure_ascii=False)

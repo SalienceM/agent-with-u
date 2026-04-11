@@ -116,3 +116,71 @@ class PromptStore:
     def list_default_names(self) -> list[str]:
         """返回所有被标记为默认档的 Prompt 名称列表。"""
         return [name for name, meta in self._index.items() if meta.get("isDefault")]
+
+    # ── 导出 / 导入 ─────────────────────────────────────────────────
+    def export_library(self, target_path: str) -> bool:
+        """把整个 prompt-library 目录打包成 tar.gz。"""
+        import tarfile
+        try:
+            if not self._dir.exists():
+                return True
+            with tarfile.open(target_path, "w:gz") as tar:
+                for item in sorted(self._dir.iterdir()):
+                    tar.add(item, arcname=item.name)
+            return True
+        except Exception as e:
+            print(f"[PromptStore] export failed: {e}")
+            return False
+
+    def import_library(self, source_path: str) -> int:
+        """从 tar.gz 恢复 prompt-library。返回新增/合并的 prompt 数量。
+        策略：文件名冲突时新包覆盖旧包；index.json 做字段级合并（保留本地已有项）。
+        """
+        import tarfile
+        import tempfile
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                with tarfile.open(source_path, "r:gz") as tar:
+                    tar.extractall(tmpdir)
+                src_dir = Path(tmpdir)
+                # 先合并 index.json
+                imported_index: dict[str, dict] = {}
+                src_index = src_dir / "index.json"
+                if src_index.exists():
+                    try:
+                        data = json.loads(src_index.read_text(encoding="utf-8"))
+                        if isinstance(data, list):
+                            imported_index = {
+                                (item.get("name") or item.get("id") or ""): item
+                                for item in data if isinstance(item, dict)
+                            }
+                        elif isinstance(data, dict):
+                            imported_index = {
+                                (v.get("name") or k): v
+                                for k, v in data.items() if isinstance(v, dict)
+                            }
+                    except Exception:
+                        pass
+                # 拷贝所有 .md
+                count = 0
+                for md in src_dir.glob("*.md"):
+                    dest = self._dir / md.name
+                    existed = dest.exists()
+                    dest.write_text(md.read_text(encoding="utf-8"), encoding="utf-8")
+                    if not existed:
+                        count += 1
+                # 合并 index 到内存
+                for name, meta in imported_index.items():
+                    if not name:
+                        continue
+                    existing = self._index.get(name, {})
+                    merged = {**existing, **meta, "name": name}
+                    # 保留 updatedAt 较新的
+                    if existing.get("updatedAt", 0) > meta.get("updatedAt", 0):
+                        merged["updatedAt"] = existing["updatedAt"]
+                    self._index[name] = merged
+                self._save_index()
+            return count
+        except Exception as e:
+            print(f"[PromptStore] import failed: {e}")
+            return 0

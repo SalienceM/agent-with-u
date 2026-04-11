@@ -413,3 +413,78 @@ class SkillStore:
             path.chmod(0o600)
         except Exception:
             pass
+
+    # ── 导出 / 导入 ─────────────────────────────────────────────────
+    def export_library(self, target_path: str) -> bool:
+        """把整个 skill-library 目录打包成 tar.gz。
+        ⚠️ 凭据（skill-secrets/）永远不打包，跟随机器保留。
+        """
+        import tarfile
+        try:
+            if not LIBRARY_DIR.exists():
+                return True
+            with tarfile.open(target_path, "w:gz") as tar:
+                for item in sorted(LIBRARY_DIR.iterdir()):
+                    tar.add(item, arcname=item.name)
+            return True
+        except Exception as e:
+            print(f"[SkillStore] export failed: {e}")
+            return False
+
+    def import_library(self, source_path: str) -> int:
+        """从 tar.gz 恢复 skill-library。返回新增 skill 数量。
+        策略：同名 skill 目录直接覆盖；index.json 做合并
+        （activations 并集，isDefault 取或）。
+        """
+        import tarfile
+        import tempfile
+        try:
+            with self._lock:
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    with tarfile.open(source_path, "r:gz") as tar:
+                        tar.extractall(tmpdir)
+                    src = Path(tmpdir)
+                    # 合并 index.json
+                    imported_index: dict = {}
+                    src_index = src / "index.json"
+                    if src_index.exists():
+                        try:
+                            imported_index = json.loads(src_index.read_text(encoding="utf-8"))
+                            if not isinstance(imported_index, dict):
+                                imported_index = {}
+                        except Exception:
+                            imported_index = {}
+                    # 复制 skill 目录
+                    count = 0
+                    for entry in src.iterdir():
+                        if not entry.is_dir():
+                            continue
+                        dest = LIBRARY_DIR / entry.name
+                        existed = dest.exists()
+                        if existed:
+                            shutil.rmtree(dest, ignore_errors=True)
+                        dest.mkdir(parents=True, exist_ok=True)
+                        # 白名单拷贝，防止非法文件
+                        for f in entry.iterdir():
+                            if f.is_file() and f.name in self._PKG_ALLOWED:
+                                (dest / f.name).write_bytes(f.read_bytes())
+                        if not existed:
+                            count += 1
+                    # 合并 index（activations 取并集，isDefault 取或）
+                    for name, meta in imported_index.items():
+                        if not isinstance(meta, dict):
+                            continue
+                        existing = self._index.get(name, {"activations": []})
+                        merged_acts = list({
+                            *existing.get("activations", []),
+                            *meta.get("activations", []),
+                        })
+                        merged: dict = {"activations": merged_acts}
+                        if existing.get("isDefault") or meta.get("isDefault"):
+                            merged["isDefault"] = True
+                        self._index[name] = merged
+                    self._save_index()
+                return count
+        except Exception as e:
+            print(f"[SkillStore] import failed: {e}")
+            return 0

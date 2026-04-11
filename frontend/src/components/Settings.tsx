@@ -137,7 +137,7 @@ export const Settings: React.FC<SettingsProps> = ({
                 background: 'rgba(34,197,94,0.15)',
                 borderColor: 'rgba(34,197,94,0.3)',
               }}
-              title="Export all sessions and backend configs"
+              title="Export backends + Repo (Prompts + Skills). Sessions are NOT included."
             >
               📤 Export Data
             </button>
@@ -148,13 +148,15 @@ export const Settings: React.FC<SettingsProps> = ({
                 background: 'rgba(239,68,68,0.15)',
                 borderColor: 'rgba(239,68,68,0.3)',
               }}
-              title="Import sessions and backend configs (will overwrite existing)"
+              title="Import backends + Repo (overwrites existing). Sessions are untouched."
             >
               📥 Import Data
             </button>
           </div>
           <p style={{ fontSize: 11, color: 'var(--theme-text-muted)', marginTop: 6, margin: '6px 0 0 0' }}>
-            ⚠️ Import will overwrite all existing sessions and backend configs
+            Includes: Backends config + Repo (Prompts + Skills). Sessions are NOT included.
+            <br />
+            ⚠️ Import will overwrite matching entries. Skill credentials stay local.
           </p>
         </div>
 
