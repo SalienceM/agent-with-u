@@ -787,11 +787,62 @@ class BridgeWS:
 
     # ── RPC: 会话管理 ────────────────────────────────────────────
 
+    @staticmethod
+    def _default_workspace_root() -> "Path":  # type: ignore[name-defined]
+        """Return the base dir that mirrors the log location (platform-aware)."""
+        import os as _os
+        from pathlib import Path as _Path
+        if sys.platform == "win32":
+            base = _Path(_os.environ.get("APPDATA", _Path.home())) / "AgentWithU"
+        else:
+            base = _Path.home() / ".agent-with-u"
+        return base / "workspaces"
+
+    def _resolve_working_dir(self, working_dir: str) -> str:
+        """
+        未显式指定目录时（空串 / '.' / './'）按时间生成一个工作目录，
+        位置与日志目录同级（~/.agent-with-u/workspaces/session-YYYY-MM-DD_HH-MM-SS）。
+        显式指定的路径原样返回。
+        """
+        from datetime import datetime
+        from pathlib import Path as _Path
+
+        raw = (working_dir or "").strip()
+        if raw and raw not in (".", "./", ".\\"):
+            return raw
+
+        ts = datetime.now().strftime("session-%Y-%m-%d_%H-%M-%S")
+        workspace_root = self._default_workspace_root()
+        target = workspace_root / ts
+
+        # 同一秒内重复创建时补上短后缀，避免冲突
+        if target.exists():
+            suffix = 1
+            while True:
+                candidate = workspace_root / f"{ts}-{suffix}"
+                if not candidate.exists():
+                    target = candidate
+                    break
+                suffix += 1
+
+        try:
+            target.mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            print(f"[BridgeWS] Failed to create default workspace {target}: {e}",
+                  file=sys.stderr, flush=True)
+            # 兜底：返回原始值，让下游自己处理
+            return raw or "."
+
+        print(f"[BridgeWS] Auto-created default workspace: {target}",
+              file=sys.stderr, flush=True)
+        return str(target)
+
     def _rpc_createSession(self, working_dir: str, backend_id: str) -> str:
+        resolved_dir = self._resolve_working_dir(working_dir)
         session = Session(
             id=new_id(), title="新会话",
             created_at=time.time(), updated_at=time.time(),
-            messages=[], working_dir=working_dir, backend_id=backend_id,
+            messages=[], working_dir=resolved_dir, backend_id=backend_id,
         )
         # ★ 默认档自动绑定：新建 session 时把被标记为 isDefault 的 Prompt/Skill 全部挂上去
         try:

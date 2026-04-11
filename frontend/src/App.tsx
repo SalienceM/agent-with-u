@@ -1110,22 +1110,25 @@ const NewSessionDialog: React.FC<NewSessionDialogProps> = ({
   onClose,
   onCreate,
 }) => {
-  const [workingDir, setWorkingDir] = useState('.');
+  // 留空 = 后端自动生成按时间命名的默认目录（放在日志目录同级）
+  const [workingDir, setWorkingDir] = useState('');
   const [selectedBackendId, setSelectedBackendId] = useState(
     backends[0]?.id || 'claude-agent-sdk-default'
   );
+  const isAutoDir = !workingDir.trim() || workingDir.trim() === '.';
 
   const handleCreate = useCallback(async () => {
-    await onCreate(workingDir, selectedBackendId);
+    // 空值交给后端补一个时间戳目录
+    await onCreate(workingDir.trim() || '', selectedBackendId);
   }, [workingDir, selectedBackendId, onCreate]);
 
   const handleBrowse = useCallback(async () => {
     // Use system native directory picker
-    const path = await api.selectDirectory(workingDir !== '.' ? workingDir : undefined);
+    const path = await api.selectDirectory(isAutoDir ? undefined : workingDir);
     if (path) {
       setWorkingDir(path);
     }
-  }, [workingDir]);
+  }, [workingDir, isAutoDir]);
 
   return (
     <div
@@ -1153,14 +1156,16 @@ const NewSessionDialog: React.FC<NewSessionDialogProps> = ({
               value={workingDir}
               onChange={(e) => setWorkingDir(e.target.value)}
               style={inputStyle}
-              placeholder="e.g., ./my-project or C:\Users\...\project"
+              placeholder="留空 = 自动按时间命名（放在日志目录旁）"
             />
             <button onClick={handleBrowse} style={browseBtnStyle} title="Select directory with file picker">
               📁 Browse
             </button>
           </div>
           <span style={helpTextStyle}>
-            The directory where Claude will read/write files and run commands
+            {isAutoDir
+              ? '留空将自动在 ~/.agent-with-u/workspaces/session-时间戳/ 下新建目录（与日志目录同级）'
+              : 'The directory where Claude will read/write files and run commands'}
           </span>
         </div>
 
