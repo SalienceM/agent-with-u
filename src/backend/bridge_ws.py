@@ -2016,8 +2016,15 @@ except urllib.error.URLError as e:
                     msgs_for_backend.append(ChatMessage(id=new_id(), role="user", content=current_content))
 
                 # ★ 注入会话约束：将约束作为系统提示前缀发送给 AI（不存入对话记录）
+                print(f"[bridge_ws] constraints为: {repr(constraints[:200]) if constraints else None}",
+                      file=sys.stderr, flush=True)
                 if constraints and constraints.strip():
                     send_content = f"[会话约束/规则]\n{constraints.strip()}\n\n---\n\n{send_content}"
+                    print(f"[bridge_ws] 已注入约束，send_content前100字: {send_content[:100]!r}",
+                          file=sys.stderr, flush=True)
+                else:
+                    print(f"[bridge_ws] 无约束，send_content前100字: {send_content[:100]!r}",
+                          file=sys.stderr, flush=True)
 
                 # ★ 内置 Skill 工具屏蔽指令：告诉模型不要使用被替代的原生工具
                 if blocked_tools:

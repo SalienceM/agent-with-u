@@ -108,6 +108,26 @@ class OpenAICompatibleBackend(ModelBackend):
                 if oai_tools:
                     req_json["tools"] = oai_tools
 
+                # ★ DEBUG：打印实际发给模型的完整消息（含约束/提示词），方便排查
+                print(f"\n[OpenAI DEBUG] ===== 发送给模型的消息 (round={_tool_round}) =====",
+                      file=sys.stderr, flush=True)
+                for _i, _m in enumerate(api_messages):
+                    _role = _m.get("role", "?")
+                    _c = _m.get("content", "")
+                    if isinstance(_c, list):
+                        # multimodal content
+                        _text_parts = [p.get("text", "") for p in _c if p.get("type") == "text"]
+                        _c_preview = " ".join(_text_parts)
+                    else:
+                        _c_preview = str(_c) if _c else ""
+                    # 截断太长的内容，只显示前500字
+                    if len(_c_preview) > 500:
+                        _c_preview = _c_preview[:500] + f"... (共{len(_c_preview)}字)"
+                    print(f"[OpenAI DEBUG] [{_i}] role={_role}: {_c_preview!r}",
+                          file=sys.stderr, flush=True)
+                print(f"[OpenAI DEBUG] ===================================================\n",
+                      file=sys.stderr, flush=True)
+
                 for attempt in range(_MAX_RETRIES + 1):
                     if self.is_cancelled(session_id):
                         break
