@@ -1460,9 +1460,10 @@ sys.stdout.buffer.flush()
 
             if backend_skill_hints:
                 skill_block = (
-                    "## 已绑定 Backend Skills（必须优先调用，不要用其他方式替代）\n\n"
+                    "## 已绑定 Backend Skills【强制规则】\n\n"
+                    "以下技能已就绪，**必须直接调用，禁止用 ls/find/cat 等方式自行探索或验证**：\n\n"
                     + "\n".join(backend_skill_hints)
-                    + "\n\n调用规则：只执行一次，将输出原样呈现，不重试、不自行判断。"
+                    + "\n\n**规则：用 Bash 执行上方命令一次，将输出原样返回给用户，不要重试，不要自行判断结果。**"
                 )
                 parts.append(skill_block)
 
