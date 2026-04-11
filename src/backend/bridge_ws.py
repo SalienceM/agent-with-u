@@ -1507,6 +1507,11 @@ except urllib.error.URLError as e:
                 )
                 parts.append(skill_block)
 
+            # ★ 临时约束/rule（用户在"编辑会话"对话框中直接填写的文本）
+            user_constraints = (abilities.get("constraints") or "").strip()
+            if user_constraints:
+                parts.insert(0, user_constraints)  # 置于最前，优先级最高
+
             session.constraints = "\n\n---\n\n".join(parts) if parts else None
             # ★ Backend Skills：自动部署到 working_dir/.claude/skills/
             self._sync_backend_skills_to_directory(session)
