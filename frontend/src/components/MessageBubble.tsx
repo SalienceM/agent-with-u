@@ -266,6 +266,11 @@ const ToolCallBlock: React.FC<{ tc: ToolCall }> = memo(function ToolCallBlock({ 
 
   // 有图片时默认展开，让用户直接看到结果
   const [expanded, setExpanded] = useState(outputImages.length > 0);
+
+  // ★ 流式阶段：tc.output 到达时（从空变为含图片）自动展开
+  useEffect(() => {
+    if (outputImages.length > 0 && !expanded) setExpanded(true);
+  }, [outputImages.length]); // eslint-disable-line react-hooks/exhaustive-deps
   const [lightboxSrc, setLightboxSrc] = useState<string | null>(null);
   const color = STATUS_COLOR[tc.status] || '#888';
   const isRunning = tc.status === 'running';

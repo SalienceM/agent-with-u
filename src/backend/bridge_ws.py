@@ -1362,7 +1362,7 @@ description: {description}
 {basic_cmd}
 ```
 {extra_params}{ref_image_hint}
-**规则：只执行一次，将输出直接原样呈现给用户。不要重试、不要自行判断结果质量、不要额外处理。**
+**规则：只执行一次，将命令的完整输出原文粘贴到你的回复中——包括任何 `![alt](url)` 格式的图片 markdown，必须按原样包含，不得删改、不得替换为描述文字。禁止重试、禁止评价质量、禁止额外处理。**
 """
 
     def _generate_backend_skill_call_py(self, skill_name: str, skill_info: dict, *, is_image_backend: bool = False) -> str:
@@ -1824,6 +1824,9 @@ except urllib.error.URLError as e:
             backend_id=backend_id, streaming=True,
         )
         session.messages.append(assistant_msg)
+
+        # ★ 每次发消息前重新部署 Backend Skill 文件，确保 SKILL.md 始终是最新模板
+        self._sync_backend_skills_to_directory(session)
 
         await self._async_send(
             session, content, images, backend_id, assistant_id,
