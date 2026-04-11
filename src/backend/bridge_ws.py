@@ -1436,6 +1436,36 @@ sys.stdout.buffer.flush()
                 p = self._prompt_store.get_prompt(pname)
                 if p and p.get("content"):
                     parts.append(p["content"])
+
+            # ★ Backend Skills：注入 Bash 调用提示，兼容不支持原生 Skill 工具的模型（如 Qwen 系列）
+            # 这样模型即使绕过 Skill 工具也能从 constraints 里知道怎么调用
+            backend_skill_hints: list[str] = []
+            for sname in abilities.get("skills", []):
+                info = self._skill_store.get_skill(sname)
+                if not info:
+                    continue
+                if not info.get("backend") and not info.get("type"):
+                    continue  # 传统指令型 Skill，无需注入
+                desc = info.get("description", sname)
+                python_exe = sys.executable.replace("\\", "/")
+                call_script = f".claude/skills/{sname}/_call.py"
+                input_schema = info.get("inputSchema") or {}
+                required_list = (input_schema.get("required") or
+                                 list((input_schema.get("properties") or {}).keys()))
+                primary_field = required_list[0] if required_list else "prompt"
+                backend_skill_hints.append(
+                    f'- **{sname}**：{desc}\n'
+                    f'  → Bash: `"{python_exe}" {call_script} "<{primary_field.upper()}>"`'
+                )
+
+            if backend_skill_hints:
+                skill_block = (
+                    "## 已绑定 Backend Skills（必须优先调用，不要用其他方式替代）\n\n"
+                    + "\n".join(backend_skill_hints)
+                    + "\n\n调用规则：只执行一次，将输出原样呈现，不重试、不自行判断。"
+                )
+                parts.append(skill_block)
+
             session.constraints = "\n\n---\n\n".join(parts) if parts else None
             # ★ Backend Skills：自动部署到 working_dir/.claude/skills/
             self._sync_backend_skills_to_directory(session)
