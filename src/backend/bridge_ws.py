@@ -1176,7 +1176,57 @@ class BridgeWS:
                 continue
 
             description = info.get("description", f"Skill: {sname}")
-            input_schema = info.get("inputSchema") or {"type": "object", "properties": {}}
+            # 深拷贝 input_schema，避免后续 mutation 污染 skill_store 中的原对象
+            raw_schema = info.get("inputSchema") or {"type": "object", "properties": {}}
+            import copy as _copy
+            input_schema = _copy.deepcopy(raw_schema)
+            input_schema.setdefault("type", "object")
+            input_schema.setdefault("properties", {})
+
+            # ── 判断是否为图像生成 backend（需要注入 ref_image 支持） ──
+            is_image_backend = False
+            backend_id = info.get("backend", "")
+            if backend_id:
+                bc = next((c for c in self._backend_configs if c.id == backend_id), None)
+                if bc and bc.type.value == "dashscope-image":
+                    is_image_backend = True
+
+            # ★ 图像生成 backend：强制在 tool schema 中注入 ref_image 字段，
+            #   否则兼容 OpenAI function-calling 的模型（Qwen 系列）根本没有字段
+            #   可以表达"传入参考图 URL"的意图。并在 description 中强化规则，
+            #   让 Qwen 3.6+ 等对参数描述更严格的模型不会遗漏。
+            if is_image_backend:
+                props = input_schema["properties"]
+                if "ref_image" not in props:
+                    props["ref_image"] = {
+                        "type": "string",
+                        "description": (
+                            "参考图片的 URL，用于图生图 / image-to-image 模式。"
+                            "【强制规则】以下任一情况都必须把 URL 填入本字段，"
+                            "不得留空、不得只在 prompt 里描述："
+                            "(1) 本轮用户消息里含 `[用户上传图片 URL: http://127.0.0.1:...]` 标记；"
+                            "(2) 用户提到『基于上图 / 在这张图上 / 改这张图 / "
+                            "在上一张图基础上 / 以这张为参考 / 用这个图 / 引用上图』等；"
+                            "(3) 对话历史（最近 assistant 输出）里出现过 "
+                            "`http://127.0.0.1:` 开头的 `/api/skill-images/` 图片 URL。"
+                            "查找顺序：先用本轮用户消息里最新的上传 URL，"
+                            "找不到时回退到对话历史中最近一条 `http://127.0.0.1:` 图片 URL。"
+                            "找到就原样传入本字段，不要改写、不要省略、不要截断。"
+                        ),
+                    }
+                # 在工具描述前缀追加强制规则，OpenAI function-calling 下 description
+                # 对 Qwen 的约束力比单独的参数 description 更强
+                description = (
+                    f"{description}\n\n"
+                    "【图生图强制规则】调用本工具前必须检查是否需要携带参考图：\n"
+                    "• 若本轮用户消息含 `[用户上传图片 URL: http://127.0.0.1:...]`，"
+                    "必须把该 URL 作为 ref_image 参数传入。\n"
+                    "• 若用户说『基于上图 / 在这张图上 / 改这张图 / 上一张基础上 / "
+                    "以这张为参考』等，必须回查对话历史，取最近一条 "
+                    "`http://127.0.0.1:` 开头的 `/api/skill-images/` 图片 URL 作为 ref_image。\n"
+                    "• 只有用户明确表示『不参考任何图、重新画一张』时才可省略 ref_image。\n"
+                    "• 严禁只把 URL 写进 prompt 文本里——必须通过 ref_image 结构化参数传入。"
+                )
 
             tool_name = sname.replace("-", "_")  # Claude 不允许工具名含连字符
             extra_tools.append({
@@ -1188,6 +1238,7 @@ class BridgeWS:
                 "backend_id": info.get("backend", ""),
                 "skill_name": sname,
                 "skill_type": skill_type,
+                "is_image_backend": is_image_backend,
             }
 
         return extra_tools, skill_map if skill_map else None
@@ -1206,9 +1257,77 @@ class BridgeWS:
 
         target_backend_id = mapping["backend_id"]
         target_backend = self._get_backend(target_backend_id)
+        is_image_backend = mapping.get("is_image_backend", False)
 
         # 构建发给目标 backend 的消息内容
-        prompt = tool_input.get("prompt", "") or json.dumps(tool_input, ensure_ascii=False)
+        prompt = tool_input.get("prompt", "")
+        if not prompt:
+            # 保底：如果模型没传 prompt，就把整个 tool_input（剥去 ref_image）塞进去
+            _dump_input = {k: v for k, v in tool_input.items() if k != "ref_image"}
+            prompt = json.dumps(_dump_input, ensure_ascii=False) if _dump_input else ""
+
+        # ── 处理参考图参数（图生图） ──
+        # OpenAI function-calling 的 Qwen 系模型会通过 ref_image 字段传入 URL。
+        # 这里从 tool_input 取出，回退：prompt 里嵌入的 http://127.0.0.1:.../skill-images/ URL
+        # 也会被识别为隐式参考图，避免模型不按约定填字段时完全丢失上下文。
+        ref_images: Optional[list[ImageAttachment]] = None
+        ref_image_url = (tool_input.get("ref_image") or "").strip()
+        if is_image_backend and not ref_image_url and prompt:
+            # fallback: 从 prompt 里扫描出本地图片 URL
+            import re as _re
+            m = _re.search(r'http://127\.0\.0\.1[^\s)\]\'"]*?/api/skill-images/[^\s)\]\'"]+', prompt)
+            if m:
+                ref_image_url = m.group(0)
+                print(f"[bridge_ws] Backend Skill '{tool_name}': "
+                      f"ref_image not in tool_input, recovered from prompt: {ref_image_url}",
+                      file=sys.stderr, flush=True)
+
+        if is_image_backend and ref_image_url:
+            try:
+                import base64 as _b64
+                from pathlib import Path as _Path
+                img_b64 = ""
+                mime = "image/png"
+                if ref_image_url.startswith("http://127.0.0.1") and "/api/skill-images/" in ref_image_url:
+                    filename = ref_image_url.split("/api/skill-images/")[-1].split("?", 1)[0]
+                    img_path = _Path.home() / ".agent-with-u" / "skill-images" / filename
+                    if img_path.exists():
+                        img_b64 = _b64.b64encode(img_path.read_bytes()).decode("ascii")
+                        ext = img_path.suffix.lstrip(".").lower()
+                        mime = f"image/{'jpeg' if ext == 'jpg' else ext}"
+                if not img_b64 and ref_image_url.startswith("http"):
+                    import httpx as _httpx
+                    async with _httpx.AsyncClient(timeout=60) as hc:
+                        resp = await hc.get(ref_image_url)
+                        if resp.status_code == 200:
+                            img_b64 = _b64.b64encode(resp.content).decode("ascii")
+                            mime = resp.headers.get("content-type", "image/png").split(";")[0]
+                if img_b64:
+                    ref_images = [ImageAttachment(
+                        id=new_id(), base64=img_b64, mime_type=mime,
+                    )]
+                    print(f"[bridge_ws] Backend Skill '{tool_name}': loaded ref_image "
+                          f"({len(img_b64)} chars b64) from {ref_image_url[:80]}",
+                          file=sys.stderr, flush=True)
+                else:
+                    print(f"[bridge_ws] Backend Skill '{tool_name}': ref_image URL given but "
+                          f"failed to load: {ref_image_url[:120]}",
+                          file=sys.stderr, flush=True)
+            except Exception as _e:
+                print(f"[bridge_ws] Backend Skill '{tool_name}': ref_image load error: {_e}",
+                      file=sys.stderr, flush=True)
+
+        # 把 ref_image URL 从 prompt 文本里剔除，避免 DashScope 把 URL 当成描述词
+        if is_image_backend and prompt:
+            import re as _re
+            prompt = _re.sub(
+                r'http://127\.0\.0\.1[^\s)\]\'"]*?/api/skill-images/[^\s)\]\'"]+',
+                '',
+                prompt,
+            ).strip()
+        if not prompt:
+            prompt = "(empty)"
+
         result_parts: list[str] = []
 
         def on_delta(delta: StreamDelta):
@@ -1220,7 +1339,7 @@ class BridgeWS:
             await target_backend.send_message(
                 messages=[],
                 content=prompt,
-                images=None,
+                images=ref_images,
                 session_id=f"{session.id}__skill_{tool_name}",
                 message_id=sub_message_id,
                 on_delta=on_delta,
@@ -1480,6 +1599,7 @@ except urllib.error.URLError as e:
             # ★ Backend Skills：注入 Bash 调用提示，兼容不支持原生 Skill 工具的模型（如 Qwen 系列）
             # 这样模型即使绕过 Skill 工具也能从 constraints 里知道怎么调用
             backend_skill_hints: list[str] = []
+            has_image_backend_skill = False
             for sname in abilities.get("skills", []):
                 info = self._skill_store.get_skill(sname)
                 if not info:
@@ -1493,10 +1613,28 @@ except urllib.error.URLError as e:
                 required_list = (input_schema.get("required") or
                                  list((input_schema.get("properties") or {}).keys()))
                 primary_field = required_list[0] if required_list else "prompt"
-                backend_skill_hints.append(
+
+                # 判断该 skill 是否绑定到图像生成 backend
+                sk_backend_id = info.get("backend", "")
+                sk_is_image = False
+                if sk_backend_id:
+                    bc = next((c for c in self._backend_configs if c.id == sk_backend_id), None)
+                    if bc and bc.type.value == "dashscope-image":
+                        sk_is_image = True
+                        has_image_backend_skill = True
+
+                hint = (
                     f'- **{sname}**：{desc}\n'
                     f'  → Bash: `"{python_exe}" {call_script} "<{primary_field.upper()}>"`'
                 )
+                if sk_is_image:
+                    hint += (
+                        f'\n  → 图生图（参考图）Bash: '
+                        f'`"{python_exe}" {call_script} "<{primary_field.upper()}>" "<REF_IMAGE_URL>"`'
+                        f'\n  → 原生工具调用时必须把参考图 URL 填入 `ref_image` 参数'
+                        f'（不要只写在 prompt 里）'
+                    )
+                backend_skill_hints.append(hint)
 
             if backend_skill_hints:
                 skill_block = (
@@ -1505,6 +1643,32 @@ except urllib.error.URLError as e:
                     + "\n".join(backend_skill_hints)
                     + "\n\n**规则：用 Bash 执行上方命令一次，将输出原样返回给用户，不要重试，不要自行判断结果。**"
                 )
+                if has_image_backend_skill:
+                    skill_block += (
+                        "\n\n### 图生图（image-to-image）强制约束\n\n"
+                        "当图像生成类 Skill 被调用时，**必须**遵守以下规则，违反视为错误调用：\n\n"
+                        "1. **触发条件**（任一满足即必须传参考图）：\n"
+                        "   - 本轮用户消息里含 `[用户上传图片 URL: http://127.0.0.1:...]` 标记；\n"
+                        "   - 用户表达：『基于上图 / 基于上一张 / 在这张图上 / 改这张图 / "
+                        "改改这个 / 以这张为参考 / 引用上图 / 用这个图 / 上一张基础上 / "
+                        "based on the previous image』等；\n"
+                        "   - 对话历史中最近一条 assistant 消息里出现过 "
+                        "`http://127.0.0.1:` 开头的 `/api/skill-images/xxx` 图片 URL。\n\n"
+                        "2. **传参方式**（按调用路径二选一）：\n"
+                        "   - **原生 Skill/Function-calling 路径**：必须把 URL 填入 `ref_image` "
+                        "结构化参数。**禁止**只把 URL 混入 prompt 字符串里交差。\n"
+                        "   - **Bash 调用路径**：作为第二个位置参数传入（见上方"
+                        "『图生图 Bash』示例）。\n\n"
+                        "3. **URL 选取规则**：\n"
+                        "   - 优先用本轮用户消息里最新的上传 URL；\n"
+                        "   - 找不到时回查对话历史，取最近一条 `http://127.0.0.1:` 开头的 "
+                        "`/api/skill-images/xxx` URL；\n"
+                        "   - 原样复制整段 URL，不要改写、不要省略协议、不要截断路径。\n\n"
+                        "4. **唯一例外**：用户明确表示『不参考任何图 / 重新画一张 / "
+                        "不要用之前的图』时，才可省略参考图。\n\n"
+                        "⚠️ 若存在参考图场景却没有通过结构化参数 / 位置参数传入，"
+                        "生成结果会和『文生图』毫无区别，用户会把这视为严重 bug。"
+                    )
                 parts.append(skill_block)
 
             # ★ 临时约束/rule（用户在"编辑会话"对话框中直接填写的文本）
