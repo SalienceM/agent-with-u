@@ -339,14 +339,29 @@ export const App: React.FC = () => {
 
   /* ---- 数据导出 ---- */
   const handleExportData = useCallback(async () => {
-    const targetPath = await api.selectExportPath();
-    if (!targetPath) return;
-
-    const result = await api.exportData(targetPath);
-    if (result.status === 'ok') {
-      showToast('success', `导出成功 → ${targetPath}`);
-    } else {
-      showToast('error', `导出失败：${result.message}`);
+    let targetPath: string | null = null;
+    try {
+      targetPath = await api.selectExportPath();
+    } catch (e: any) {
+      console.error('[export] selectExportPath failed:', e);
+      showToast('error', `打开保存对话框失败：${e?.message ?? e}`);
+      return;
+    }
+    if (!targetPath) {
+      // 用户取消
+      return;
+    }
+    showToast('info', '导出中，请稍候…', 60000);
+    try {
+      const result = await api.exportData(targetPath);
+      if (result.status === 'ok') {
+        showToast('success', `导出成功 → ${targetPath}`);
+      } else {
+        showToast('error', `导出失败：${result.message}`);
+      }
+    } catch (e: any) {
+      console.error('[export] exportData failed:', e);
+      showToast('error', `导出异常：${e?.message ?? e}`);
     }
   }, [showToast]);
 
@@ -358,7 +373,14 @@ export const App: React.FC = () => {
     );
     if (!confirmed) return;
 
-    const sourcePath = await api.selectImportPath();
+    let sourcePath: string | null = null;
+    try {
+      sourcePath = await api.selectImportPath();
+    } catch (e: any) {
+      console.error('[import] selectImportPath failed:', e);
+      showToast('error', `打开文件对话框失败：${e?.message ?? e}`);
+      return;
+    }
     if (!sourcePath) return;
 
     setIsImporting(true);
@@ -378,6 +400,7 @@ export const App: React.FC = () => {
         showToast('error', `导入失败：${result.message}`);
       }
     } catch (e: any) {
+      console.error('[import] importData failed:', e);
       showToast('error', `导入异常：${e?.message ?? e}`);
     } finally {
       setIsImporting(false);

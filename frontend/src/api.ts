@@ -96,26 +96,18 @@ async function tauriOpenDialog(opts: {
   defaultPath?: string;
   filters?: { name: string; extensions: string[] }[];
 }): Promise<string | null> {
-  try {
-    const { open } = await import('@tauri-apps/plugin-dialog');
-    const result = await open(opts as any);
-    return typeof result === 'string' ? result : null;
-  } catch {
-    return null;
-  }
+  const { open } = await import('@tauri-apps/plugin-dialog');
+  const result = await open(opts as any);
+  return typeof result === 'string' ? result : null;
 }
 
 async function tauriSaveDialog(opts: {
   defaultPath?: string;
   filters?: { name: string; extensions: string[] }[];
 }): Promise<string | null> {
-  try {
-    const { save } = await import('@tauri-apps/plugin-dialog');
-    const result = await save(opts as any);
-    return result ?? null;
-  } catch {
-    return null;
-  }
+  const { save } = await import('@tauri-apps/plugin-dialog');
+  const result = await save(opts as any);
+  return result ?? null;
 }
 
 // ── WebSocket 初始化 + 自动重连 ───────────────────────────────
@@ -146,9 +138,13 @@ function handleMessage(e: MessageEvent) {
   try {
     const msg = JSON.parse(e.data);
     if (msg.id !== undefined && pending.has(msg.id)) {
-      const { resolve } = pending.get(msg.id)!;
+      const { resolve, reject } = pending.get(msg.id)!;
       pending.delete(msg.id);
-      resolve(msg.result ?? null);
+      if (msg.error !== undefined) {
+        reject(new Error(typeof msg.error === 'string' ? msg.error : JSON.stringify(msg.error)));
+      } else {
+        resolve(msg.result ?? null);
+      }
     } else if (msg.event === 'streamDelta') {
       const delta = JSON.parse(msg.data);
       streamCallbacks.forEach((cb) => cb(delta));
@@ -285,31 +281,46 @@ async function nativeOpenDirectory(initialPath?: string): Promise<string | null>
   return null;
 }
 
-async function nativeSaveFile(defaultPath?: string): Promise<string | null> {
-  if (isTauri()) {
-    return tauriSaveDialog({
-      defaultPath,
-      // Windows file dialogs don't support multi-part extensions like 'tar.gz';
-      // use 'gz' to match compressed archives, plus a catch-all fallback.
-      filters: [
-        { name: 'Tar Archive (*.tar.gz)', extensions: ['gz'] },
-        { name: 'All Files', extensions: ['*'] },
-      ],
-    });
+// Tauri v2 + GTK/XDG 在 defaultPath 是纯文件名时有时不弹出对话框。
+// 这里把文件名 join 到下载目录再传入，避免调用失败。
+async function resolveDefaultSavePath(filename?: string): Promise<string | undefined> {
+  if (!filename) return undefined;
+  try {
+    const { downloadDir, join } = await import('@tauri-apps/api/path');
+    const dir = await downloadDir();
+    return await join(dir, filename);
+  } catch (e) {
+    console.warn('[api] resolveDefaultSavePath fallback:', e);
+    return filename;
   }
-  return null;
+}
+
+async function nativeSaveFile(defaultFilename?: string): Promise<string | null> {
+  if (!isTauri()) {
+    throw new Error('文件对话框仅在桌面应用中可用');
+  }
+  const defaultPath = await resolveDefaultSavePath(defaultFilename);
+  return tauriSaveDialog({
+    defaultPath,
+    // 注意：Tauri 的 filters.extensions 只支持单段扩展，写 'tar.gz' 会被拆错。
+    // 保留一个通配 filter 以防平台校验严格。
+    filters: [
+      { name: 'Tar Archive', extensions: ['gz', 'tgz'] },
+      { name: 'All Files', extensions: ['*'] },
+    ],
+  });
 }
 
 async function nativeOpenFile(): Promise<string | null> {
-  if (isTauri()) {
-    return tauriOpenDialog({
-      filters: [
-        { name: 'Tar Archive (*.tar.gz)', extensions: ['gz'] },
-        { name: 'All Files', extensions: ['*'] },
-      ],
-    });
+  if (!isTauri()) {
+    throw new Error('文件对话框仅在桌面应用中可用');
   }
-  return null;
+  return tauriOpenDialog({
+    filters: [
+      { name: 'Tar Archive', extensions: ['gz', 'tgz'] },
+      { name: 'All Files', extensions: ['*'] },
+    ],
+  });
 }
 
 // ═══════════════════════════════════════
@@ -415,12 +426,20 @@ export const api = {
 
   async exportData(targetPath: string): Promise<any> {
     const result = await call('exportData', targetPath);
-    try { return JSON.parse(result); } catch { return { status: 'error', message: '导出失败' }; }
+    if (result == null) {
+      return { status: 'error', message: 'backend 无响应（exportData 返回为空）' };
+    }
+    try { return JSON.parse(result); }
+    catch { return { status: 'error', message: `返回值解析失败: ${String(result).slice(0, 120)}` }; }
   },
 
   async importData(sourcePath: string): Promise<any> {
     const result = await call('importData', sourcePath);
-    try { return JSON.parse(result); } catch { return { status: 'error', message: '导入失败' }; }
+    if (result == null) {
+      return { status: 'error', message: 'backend 无响应（importData 返回为空）' };
+    }
+    try { return JSON.parse(result); }
+    catch { return { status: 'error', message: `返回值解析失败: ${String(result).slice(0, 120)}` }; }
   },
 
   /** Returns true if connected to the real backend, false if in mock mode. */
