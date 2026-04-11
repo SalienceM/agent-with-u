@@ -267,6 +267,11 @@ const ToolCallBlock: React.FC<{ tc: ToolCall }> = memo(function ToolCallBlock({ 
   // 有图片时默认展开，让用户直接看到结果
   const [expanded, setExpanded] = useState(outputImages.length > 0);
   const [lightboxSrc, setLightboxSrc] = useState<string | null>(null);
+  const color = STATUS_COLOR[tc.status] || '#888';
+  const isRunning = tc.status === 'running';
+
+  // ★ 优先用后端注入的 diff，否则从 input JSON 中解析
+  const diffData: DiffData | null = tc.diff || tryParseDiffFromInput(tc);
 
   // Format duration for display
   const formatDuration = (ms?: number) => {
