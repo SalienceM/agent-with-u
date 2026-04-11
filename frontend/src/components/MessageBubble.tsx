@@ -239,13 +239,38 @@ function tryParseDiffFromInput(tc: ToolCall): DiffData | null {
   return null;
 }
 
+/** 从 tool output 中提取 markdown 图片（返回 {images, text}） */
+function extractImagesFromOutput(output: string): { images: Array<{src: string; alt: string}>; text: string } {
+  const images: Array<{src: string; alt: string}> = [];
+  // Match markdown image: ![alt](url)
+  const regex = /!\[([^\]]*)\]\(([^)]+)\)/g;
+  let match;
+  let lastEnd = 0;
+  const textParts: string[] = [];
+  while ((match = regex.exec(output)) !== null) {
+    if (match.index > lastEnd) {
+      textParts.push(output.slice(lastEnd, match.index));
+    }
+    images.push({ alt: match[1], src: match[2] });
+    lastEnd = match.index + match[0].length;
+  }
+  if (lastEnd < output.length) {
+    textParts.push(output.slice(lastEnd));
+  }
+  return { images, text: textParts.join('\n').trim() };
+}
+
 const ToolCallBlock: React.FC<{ tc: ToolCall }> = memo(function ToolCallBlock({ tc }) {
   const [expanded, setExpanded] = useState(false);
+  const [lightboxSrc, setLightboxSrc] = useState<string | null>(null);
   const color = STATUS_COLOR[tc.status] || '#888';
   const isRunning = tc.status === 'running';
 
   // ★ 优先用后端注入的 diff，否则从 input JSON 中解析
   const diffData: DiffData | null = tc.diff || tryParseDiffFromInput(tc);
+
+  // ★ 从 tool output 中提取 markdown 图片，支持 generate-image 等 skill 结果
+  const { images: outputImages, text: outputText } = tc.output ? extractImagesFromOutput(tc.output) : { images: [], text: tc.output || '' };
 
   // Format duration for display
   const formatDuration = (ms?: number) => {
@@ -290,15 +315,38 @@ const ToolCallBlock: React.FC<{ tc: ToolCall }> = memo(function ToolCallBlock({ 
           {tc.output && (
             <div style={{ marginTop: diffData ? 6 : 0 }}>
               <div style={labelStyle}>OUTPUT</div>
-              <pre
-                style={{
-                  ...codeBlock,
-                  color: tc.status === 'error' ? 'var(--theme-error, #cf222e)' : 'var(--theme-text, #1f2328)',
-                  maxHeight: 300,
-                }}
-              >
-                {tc.output}
-              </pre>
+              {/* ★ 如果 output 中包含 markdown 图片（如 generate-image skill 结果），优先渲染图片 */}
+              {outputImages.length > 0 && (
+                <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, marginBottom: outputText ? 6 : 0 }}>
+                  {outputImages.map((img, idx) => (
+                    <img
+                      key={idx}
+                      src={img.src}
+                      alt={img.alt || 'generated image'}
+                      style={{
+                        maxWidth: '100%',
+                        maxHeight: 400,
+                        borderRadius: 8,
+                        cursor: 'zoom-in',
+                        border: '1px solid var(--theme-border, rgba(0,0,0,0.12))',
+                      }}
+                      onClick={() => setLightboxSrc(img.src)}
+                    />
+                  ))}
+                </div>
+              )}
+              {/* 剩余文本（进度提示等非图片内容） */}
+              {outputText && (
+                <pre
+                  style={{
+                    ...codeBlock,
+                    color: tc.status === 'error' ? 'var(--theme-error, #cf222e)' : 'var(--theme-text, #1f2328)',
+                    maxHeight: 300,
+                  }}
+                >
+                  {outputText}
+                </pre>
+              )}
             </div>
           )}
           {isRunning && !tc.output && (
@@ -308,6 +356,8 @@ const ToolCallBlock: React.FC<{ tc: ToolCall }> = memo(function ToolCallBlock({ 
           )}
         </div>
       )}
+      {/* Lightbox for tool output images */}
+      {lightboxSrc && <ImageLightbox src={lightboxSrc} onClose={() => setLightboxSrc(null)} />}
     </div>
   );
 });
