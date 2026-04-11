@@ -8,6 +8,9 @@ if (typeof document !== 'undefined' && !document.getElementById('repo-panel-css'
   s.textContent = `
     .repo-card:hover { border-color: var(--theme-accent, #7aa2f7) !important; transform: translateY(-2px); box-shadow: 0 4px 12px rgba(0,0,0,0.15); }
     .repo-card:hover .repo-card-actions { opacity: 1 !important; }
+    .repo-card:hover .repo-card-star { opacity: 1 !important; }
+    .repo-card.repo-card-default { border-color: rgba(234,197,95,0.55) !important; box-shadow: 0 0 0 1px rgba(234,197,95,0.18) inset; }
+    .repo-card.repo-card-default .repo-card-star { opacity: 1 !important; }
     .repo-column-separator { border-right: 1px solid var(--theme-border); }
   `;
   document.head.appendChild(s);
@@ -24,6 +27,7 @@ interface PromptItem {
   icon: string;
   createdAt?: number;
   updatedAt?: number;
+  isDefault?: boolean;
 }
 interface Props {
   open: boolean;
@@ -315,6 +319,27 @@ export const RepoPanel: React.FC<Props> = ({ open, workingDir, onClose, onEditin
     }
   }, [editingType, editingName, editingContent, editingIcon, editingOrigName, refresh, closeEditor]);
 
+  // ── 切换默认档 ──
+  // 默认档在新建 session 时会被自动绑定；这里做乐观更新 + 后台持久化
+  const toggleDefault = useCallback(async (type: 'skill' | 'prompt', name: string, next: boolean) => {
+    if (type === 'skill') {
+      setSkills(prev => prev.map(s => s.name === name ? { ...s, isDefault: next } : s));
+      const res = await api.setSkillDefault(name, next);
+      if (res.status !== 'ok') {
+        // 回滚 + 刷新
+        setSkills(prev => prev.map(s => s.name === name ? { ...s, isDefault: !next } : s));
+        await refresh();
+      }
+    } else {
+      setPrompts(prev => prev.map(p => p.name === name ? { ...p, isDefault: next } : p));
+      const res = await api.setPromptDefault(name, next);
+      if (res.status !== 'ok') {
+        setPrompts(prev => prev.map(p => p.name === name ? { ...p, isDefault: !next } : p));
+        await refresh();
+      }
+    }
+  }, [refresh]);
+
   // ── 删除：先弹确认框 ──
   const handleDelete = useCallback((type: 'skill' | 'prompt', name: string) => {
     setDeleteConfirm({ type, name });
@@ -543,7 +568,12 @@ export const RepoPanel: React.FC<Props> = ({ open, workingDir, onClose, onEditin
           <input ref={fileInputRef} type="file" accept=".awu,.zip" style={{ display: 'none' }} onChange={handleInstallFile} />
           <div style={cardGridStyle}>
             {skills.map(s => (
-              <div key={s.name} className="repo-card" style={cardStyle} onClick={() => openEditor('skill', s)}>
+              <div
+                key={s.name}
+                className={`repo-card${s.isDefault ? ' repo-card-default' : ''}`}
+                style={cardStyle}
+                onClick={() => openEditor('skill', s)}
+              >
                 <div style={cardIconStyle}>
                   {parseSkillBackend(s.content || '') ? '🔗' : s.type === 'python-script' || s.hasCallPy ? '🐍' : '⚡'}
                 </div>
@@ -562,6 +592,16 @@ export const RepoPanel: React.FC<Props> = ({ open, workingDir, onClose, onEditin
                     >🔑</span>
                   )}
                 </div>
+                <span
+                  className="repo-card-star"
+                  onClick={e => { e.stopPropagation(); toggleDefault('skill', s.name, !s.isDefault); }}
+                  title={s.isDefault ? '取消默认档（新 session 不再自动绑定）' : '设为默认档（每个新 session 自动绑定）'}
+                  style={{
+                    ...cardStarStyle,
+                    opacity: s.isDefault ? 1 : 0,
+                    color: s.isDefault ? 'rgba(234,197,95,0.95)' : 'rgba(255,255,255,0.4)',
+                  }}
+                >{s.isDefault ? '★' : '☆'}</span>
                 <div className="repo-card-actions" style={cardActionsStyle}>
                   <button
                     onClick={e => { e.stopPropagation(); handleDelete('skill', s.name); }}
@@ -583,9 +623,24 @@ export const RepoPanel: React.FC<Props> = ({ open, workingDir, onClose, onEditin
           </div>
           <div style={cardGridStyle}>
             {prompts.map(p => (
-              <div key={p.id} className="repo-card" style={cardStyle} onClick={() => openEditor('prompt', p)}>
+              <div
+                key={p.id}
+                className={`repo-card${p.isDefault ? ' repo-card-default' : ''}`}
+                style={cardStyle}
+                onClick={() => openEditor('prompt', p)}
+              >
                 <div style={cardIconStyle}>{p.icon || '📝'}</div>
                 <div style={cardNameStyle}>{p.name}</div>
+                <span
+                  className="repo-card-star"
+                  onClick={e => { e.stopPropagation(); toggleDefault('prompt', p.name, !p.isDefault); }}
+                  title={p.isDefault ? '取消默认档（新 session 不再自动绑定）' : '设为默认档（每个新 session 自动绑定）'}
+                  style={{
+                    ...cardStarStyle,
+                    opacity: p.isDefault ? 1 : 0,
+                    color: p.isDefault ? 'rgba(234,197,95,0.95)' : 'rgba(255,255,255,0.4)',
+                  }}
+                >{p.isDefault ? '★' : '☆'}</span>
                 <div className="repo-card-actions" style={cardActionsStyle}>
                   <button
                     onClick={e => { e.stopPropagation(); handleDelete('prompt', p.name); }}
@@ -879,6 +934,17 @@ const cardActionsStyle: React.CSSProperties = {
   right: 2,
   opacity: 0,
   transition: 'opacity 0.12s',
+};
+
+const cardStarStyle: React.CSSProperties = {
+  position: 'absolute',
+  bottom: 3,
+  right: 5,
+  fontSize: 13,
+  lineHeight: 1,
+  cursor: 'pointer',
+  transition: 'opacity 0.12s, transform 0.12s',
+  userSelect: 'none',
 };
 
 const cardDelBtnStyle: React.CSSProperties = {

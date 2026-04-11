@@ -27,6 +27,7 @@ export interface SkillInfo {
   isProject: boolean;            // 是否已在当前工作目录激活
   projectActivations: string[];  // 所有已激活的工作目录列表
   description?: string;          // frontmatter description 字段
+  isDefault?: boolean;           // ★ 默认档：新建 session 时自动绑定
   hasCallPy?: boolean;           // 是否有 call.py（python-script 类型）
   hasSecrets?: boolean;          // 是否已保存凭据
   hasSecretsSchema?: boolean;    // 是否有 secrets.schema.json
@@ -513,6 +514,24 @@ export const api = {
     try { return JSON.parse(result); } catch { return { status: 'error', message: '响应格式错误' }; }
   },
 
+  async setPromptDefault(name: string, isDefault: boolean): Promise<{ status: string; message?: string }> {
+    const result = await call('setPromptDefault', name, isDefault);
+    if (result === null || result === undefined) return { status: 'error', message: '无法连接到后端' };
+    try { return JSON.parse(result); } catch { return { status: 'error', message: '响应格式错误' }; }
+  },
+
+  async setSkillDefault(name: string, isDefault: boolean): Promise<{ status: string; message?: string }> {
+    const result = await call('setSkillDefault', name, isDefault);
+    if (result === null || result === undefined) return { status: 'error', message: '无法连接到后端' };
+    try { return JSON.parse(result); } catch { return { status: 'error', message: '响应格式错误' }; }
+  },
+
+  async getDefaultAbilities(): Promise<{ skills: string[]; prompts: string[] }> {
+    const result = await call('getDefaultAbilities');
+    try { return JSON.parse(result) || { skills: [], prompts: [] }; }
+    catch { return { skills: [], prompts: [] }; }
+  },
+
   // ── Skill 孵化库 ──────────────────────────────────────────────────────
   async listSkills(workingDir: string = ''): Promise<SkillInfo[]> {
     const result = await call('listSkills', workingDir);
@@ -664,6 +683,9 @@ function mockDispatch(method: string, params: any[]): any {
     case 'updatePromptIcon': return JSON.stringify({ status: 'ok' });
     case 'updateSessionAbilities': return JSON.stringify({ status: 'ok' });
     case 'updateSessionConstraints': return JSON.stringify({ status: 'ok' });
+    case 'setPromptDefault': return JSON.stringify({ status: 'ok' });
+    case 'setSkillDefault': return JSON.stringify({ status: 'ok' });
+    case 'getDefaultAbilities': return JSON.stringify({ skills: [], prompts: [] });
     default: return null;
   }
 }

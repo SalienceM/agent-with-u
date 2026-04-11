@@ -158,6 +158,7 @@ class SkillStore:
                     "isProject": bool(working_dir) and working_dir in activations,
                     "projectActivations": [a for a in activations if a != "global"],
                     "description": fm.get("description", ""),
+                    "isDefault": bool(self._index.get(name, {}).get("isDefault", False)),
                     # 插件包扩展字段
                     "hasCallPy": (skill_dir / "call.py").exists(),
                     "hasSecrets": (SECRETS_DIR / f"{name}.json").exists(),
@@ -188,6 +189,7 @@ class SkillStore:
                 "content": content,
                 "activations": activations,
                 "description": fm.get("description", ""),
+                "isDefault": bool(self._index.get(name, {}).get("isDefault", False)),
                 "hasCallPy": (skill_dir / "call.py").exists(),
                 "hasSecretsSchema": (skill_dir / "secrets.schema.json").exists(),
                 "manifest": self._read_manifest(skill_dir),
@@ -274,7 +276,9 @@ class SkillStore:
                     except Exception:
                         pass
                 return
-            old_activations = self._index.get(old_name, {}).get("activations", [])
+            old_entry = self._index.get(old_name, {}) or {}
+            old_activations = old_entry.get("activations", [])
+            old_is_default = bool(old_entry.get("isDefault", False))
             for target_key in old_activations:
                 try:
                     self._undeploy(old_name, target_key)
@@ -286,6 +290,8 @@ class SkillStore:
             new_dir.mkdir(parents=True, exist_ok=True)
             (new_dir / "SKILL.md").write_text(new_content, encoding="utf-8")
             entry = self._index.setdefault(new_name, {"activations": []})
+            if old_is_default:
+                entry["isDefault"] = True
             for target_key in old_activations:
                 try:
                     self._deploy(new_name, new_content, target_key)
@@ -294,6 +300,25 @@ class SkillStore:
                 except Exception:
                     pass
             self._save_index()
+
+    def set_default(self, name: str, is_default: bool) -> bool:
+        """标记/取消某个 Skill 为默认档。默认档会在新建 session 时自动绑定。"""
+        with self._lock:
+            skill_file = LIBRARY_DIR / name / "SKILL.md"
+            if not skill_file.exists():
+                return False
+            entry = self._index.setdefault(name, {"activations": []})
+            entry["isDefault"] = bool(is_default)
+            self._save_index()
+            return True
+
+    def list_default_names(self) -> list[str]:
+        """返回所有被标记为默认档的 Skill 名称列表。"""
+        with self._lock:
+            return [
+                name for name, entry in self._index.items()
+                if entry.get("isDefault") and (LIBRARY_DIR / name / "SKILL.md").exists()
+            ]
 
     # ── 插件包安装 ────────────────────────────────────────────────────
 

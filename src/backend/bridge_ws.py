@@ -793,6 +793,16 @@ class BridgeWS:
             created_at=time.time(), updated_at=time.time(),
             messages=[], working_dir=working_dir, backend_id=backend_id,
         )
+        # ★ 默认档自动绑定：新建 session 时把被标记为 isDefault 的 Prompt/Skill 全部挂上去
+        try:
+            defaults = self._default_abilities()
+            if defaults.get("skills") or defaults.get("prompts"):
+                self._apply_session_abilities(session, defaults)
+                print(f"[BridgeWS] Auto-bound defaults to new session {session.id}: "
+                      f"skills={defaults.get('skills')} prompts={defaults.get('prompts')}",
+                      file=sys.stderr, flush=True)
+        except Exception as e:
+            print(f"[BridgeWS] Failed to auto-bind defaults: {e}", file=sys.stderr)
         self._active_sessions[session.id] = session
         self._session_store.save(session, async_=True)
         return json.dumps(session.to_dict(), ensure_ascii=False)
@@ -1580,6 +1590,122 @@ except urllib.error.URLError as e:
                     print(f"[bridge_ws] Cleaned up unbound Backend Skill '{skill_dir.name}'",
                           file=sys.stderr, flush=True)
 
+    def _apply_session_abilities(self, session: Session, abilities: dict) -> None:
+        """
+        把 abilities 绑定到 session：
+          - 更新 session.abilities
+          - 从绑定的 prompts + backend skills 组装 session.constraints
+          - 同步部署 backend skill 文件到 working_dir/.claude/skills/
+
+        被 _rpc_updateSessionAbilities 和 _rpc_createSession（默认档自动绑定）共用。
+        """
+        session.abilities = abilities
+        # 从绑定的 prompts 组装 constraints 文本
+        prompt_names = abilities.get("prompts", [])
+        parts = []
+        for pname in prompt_names:
+            p = self._prompt_store.get_prompt(pname)
+            if p and p.get("content"):
+                parts.append(p["content"])
+
+        # ★ Backend Skills：注入 Bash 调用提示，兼容不支持原生 Skill 工具的模型（如 Qwen 系列）
+        # 这样模型即使绕过 Skill 工具也能从 constraints 里知道怎么调用
+        backend_skill_hints: list[str] = []
+        has_image_backend_skill = False
+        for sname in abilities.get("skills", []):
+            info = self._skill_store.get_skill(sname)
+            if not info:
+                continue
+            if not info.get("backend") and not info.get("type"):
+                continue  # 传统指令型 Skill，无需注入
+            desc = info.get("description", sname)
+            python_exe = sys.executable.replace("\\", "/")
+            call_script = f".claude/skills/{sname}/_call.py"
+            input_schema = info.get("inputSchema") or {}
+            required_list = (input_schema.get("required") or
+                             list((input_schema.get("properties") or {}).keys()))
+            primary_field = required_list[0] if required_list else "prompt"
+
+            # 判断该 skill 是否绑定到图像生成 backend
+            sk_backend_id = info.get("backend", "")
+            sk_is_image = False
+            if sk_backend_id:
+                bc = next((c for c in self._backend_configs if c.id == sk_backend_id), None)
+                if bc and bc.type.value == "dashscope-image":
+                    sk_is_image = True
+                    has_image_backend_skill = True
+
+            hint = (
+                f'- **{sname}**：{desc}\n'
+                f'  → Bash: `"{python_exe}" {call_script} "<{primary_field.upper()}>"`'
+            )
+            if sk_is_image:
+                hint += (
+                    f'\n  → 图生图（参考图）Bash: '
+                    f'`"{python_exe}" {call_script} "<{primary_field.upper()}>" "<REF_IMAGE_URL>"`'
+                    f'\n  → 原生工具调用时必须把参考图 URL 填入 `ref_image` 参数'
+                    f'（不要只写在 prompt 里）'
+                )
+            backend_skill_hints.append(hint)
+
+        if backend_skill_hints:
+            skill_block = (
+                "## 已绑定 Backend Skills【强制规则】\n\n"
+                "以下技能已就绪，**必须直接调用，禁止用 ls/find/cat 等方式自行探索或验证**：\n\n"
+                + "\n".join(backend_skill_hints)
+                + "\n\n**规则：用 Bash 执行上方命令一次，将输出原样返回给用户，不要重试，不要自行判断结果。**"
+            )
+            if has_image_backend_skill:
+                skill_block += (
+                    "\n\n### 图生图（image-to-image）强制约束\n\n"
+                    "当图像生成类 Skill 被调用时，**必须**遵守以下规则，违反视为错误调用：\n\n"
+                    "1. **触发条件**（任一满足即必须传参考图）：\n"
+                    "   - 本轮用户消息里含 `[用户上传图片 URL: http://127.0.0.1:...]` 标记；\n"
+                    "   - 用户表达：『基于上图 / 基于上一张 / 在这张图上 / 改这张图 / "
+                    "改改这个 / 以这张为参考 / 引用上图 / 用这个图 / 上一张基础上 / "
+                    "based on the previous image』等；\n"
+                    "   - 对话历史中最近一条 assistant 消息里出现过 "
+                    "`http://127.0.0.1:` 开头的 `/api/skill-images/xxx` 图片 URL。\n\n"
+                    "2. **传参方式**（按调用路径二选一）：\n"
+                    "   - **原生 Skill/Function-calling 路径**：必须把 URL 填入 `ref_image` "
+                    "结构化参数。**禁止**只把 URL 混入 prompt 字符串里交差。\n"
+                    "   - **Bash 调用路径**：作为第二个位置参数传入（见上方"
+                    "『图生图 Bash』示例）。\n\n"
+                    "3. **URL 选取规则**：\n"
+                    "   - 优先用本轮用户消息里最新的上传 URL；\n"
+                    "   - 找不到时回查对话历史，取最近一条 `http://127.0.0.1:` 开头的 "
+                    "`/api/skill-images/xxx` URL；\n"
+                    "   - 原样复制整段 URL，不要改写、不要省略协议、不要截断路径。\n\n"
+                    "4. **唯一例外**：用户明确表示『不参考任何图 / 重新画一张 / "
+                    "不要用之前的图』时，才可省略参考图。\n\n"
+                    "⚠️ 若存在参考图场景却没有通过结构化参数 / 位置参数传入，"
+                    "生成结果会和『文生图』毫无区别，用户会把这视为严重 bug。"
+                )
+            parts.append(skill_block)
+
+        # ★ 临时约束/rule（用户在"编辑会话"对话框中直接填写的文本）
+        user_constraints = (abilities.get("constraints") or "").strip()
+        if user_constraints:
+            parts.insert(0, user_constraints)  # 置于最前，优先级最高
+
+        session.constraints = "\n\n---\n\n".join(parts) if parts else None
+        # ★ Backend Skills：自动部署到 working_dir/.claude/skills/
+        self._sync_backend_skills_to_directory(session)
+
+    def _default_abilities(self) -> dict:
+        """收集当前 PromptStore/SkillStore 中所有被标记为默认档的条目。"""
+        try:
+            default_prompts = list(self._prompt_store.list_default_names())
+        except Exception as e:
+            print(f"[BridgeWS] list_default_names (prompts) failed: {e}", file=sys.stderr)
+            default_prompts = []
+        try:
+            default_skills = list(self._skill_store.list_default_names())
+        except Exception as e:
+            print(f"[BridgeWS] list_default_names (skills) failed: {e}", file=sys.stderr)
+            default_skills = []
+        return {"skills": default_skills, "prompts": default_prompts}
+
     def _rpc_updateSessionAbilities(self, session_id: str, abilities_json: str) -> str:
         """绑定/解绑 skill 和 prompt 到 session。"""
         try:
@@ -1587,103 +1713,47 @@ except urllib.error.URLError as e:
             session = self._active_sessions.get(session_id) or self._session_store.load(session_id)
             if not session:
                 return json.dumps({"status": "error", "message": "Session not found"}, ensure_ascii=False)
-            session.abilities = abilities
-            # 从绑定的 prompts 组装 constraints 文本
-            prompt_names = abilities.get("prompts", [])
-            parts = []
-            for pname in prompt_names:
-                p = self._prompt_store.get_prompt(pname)
-                if p and p.get("content"):
-                    parts.append(p["content"])
-
-            # ★ Backend Skills：注入 Bash 调用提示，兼容不支持原生 Skill 工具的模型（如 Qwen 系列）
-            # 这样模型即使绕过 Skill 工具也能从 constraints 里知道怎么调用
-            backend_skill_hints: list[str] = []
-            has_image_backend_skill = False
-            for sname in abilities.get("skills", []):
-                info = self._skill_store.get_skill(sname)
-                if not info:
-                    continue
-                if not info.get("backend") and not info.get("type"):
-                    continue  # 传统指令型 Skill，无需注入
-                desc = info.get("description", sname)
-                python_exe = sys.executable.replace("\\", "/")
-                call_script = f".claude/skills/{sname}/_call.py"
-                input_schema = info.get("inputSchema") or {}
-                required_list = (input_schema.get("required") or
-                                 list((input_schema.get("properties") or {}).keys()))
-                primary_field = required_list[0] if required_list else "prompt"
-
-                # 判断该 skill 是否绑定到图像生成 backend
-                sk_backend_id = info.get("backend", "")
-                sk_is_image = False
-                if sk_backend_id:
-                    bc = next((c for c in self._backend_configs if c.id == sk_backend_id), None)
-                    if bc and bc.type.value == "dashscope-image":
-                        sk_is_image = True
-                        has_image_backend_skill = True
-
-                hint = (
-                    f'- **{sname}**：{desc}\n'
-                    f'  → Bash: `"{python_exe}" {call_script} "<{primary_field.upper()}>"`'
-                )
-                if sk_is_image:
-                    hint += (
-                        f'\n  → 图生图（参考图）Bash: '
-                        f'`"{python_exe}" {call_script} "<{primary_field.upper()}>" "<REF_IMAGE_URL>"`'
-                        f'\n  → 原生工具调用时必须把参考图 URL 填入 `ref_image` 参数'
-                        f'（不要只写在 prompt 里）'
-                    )
-                backend_skill_hints.append(hint)
-
-            if backend_skill_hints:
-                skill_block = (
-                    "## 已绑定 Backend Skills【强制规则】\n\n"
-                    "以下技能已就绪，**必须直接调用，禁止用 ls/find/cat 等方式自行探索或验证**：\n\n"
-                    + "\n".join(backend_skill_hints)
-                    + "\n\n**规则：用 Bash 执行上方命令一次，将输出原样返回给用户，不要重试，不要自行判断结果。**"
-                )
-                if has_image_backend_skill:
-                    skill_block += (
-                        "\n\n### 图生图（image-to-image）强制约束\n\n"
-                        "当图像生成类 Skill 被调用时，**必须**遵守以下规则，违反视为错误调用：\n\n"
-                        "1. **触发条件**（任一满足即必须传参考图）：\n"
-                        "   - 本轮用户消息里含 `[用户上传图片 URL: http://127.0.0.1:...]` 标记；\n"
-                        "   - 用户表达：『基于上图 / 基于上一张 / 在这张图上 / 改这张图 / "
-                        "改改这个 / 以这张为参考 / 引用上图 / 用这个图 / 上一张基础上 / "
-                        "based on the previous image』等；\n"
-                        "   - 对话历史中最近一条 assistant 消息里出现过 "
-                        "`http://127.0.0.1:` 开头的 `/api/skill-images/xxx` 图片 URL。\n\n"
-                        "2. **传参方式**（按调用路径二选一）：\n"
-                        "   - **原生 Skill/Function-calling 路径**：必须把 URL 填入 `ref_image` "
-                        "结构化参数。**禁止**只把 URL 混入 prompt 字符串里交差。\n"
-                        "   - **Bash 调用路径**：作为第二个位置参数传入（见上方"
-                        "『图生图 Bash』示例）。\n\n"
-                        "3. **URL 选取规则**：\n"
-                        "   - 优先用本轮用户消息里最新的上传 URL；\n"
-                        "   - 找不到时回查对话历史，取最近一条 `http://127.0.0.1:` 开头的 "
-                        "`/api/skill-images/xxx` URL；\n"
-                        "   - 原样复制整段 URL，不要改写、不要省略协议、不要截断路径。\n\n"
-                        "4. **唯一例外**：用户明确表示『不参考任何图 / 重新画一张 / "
-                        "不要用之前的图』时，才可省略参考图。\n\n"
-                        "⚠️ 若存在参考图场景却没有通过结构化参数 / 位置参数传入，"
-                        "生成结果会和『文生图』毫无区别，用户会把这视为严重 bug。"
-                    )
-                parts.append(skill_block)
-
-            # ★ 临时约束/rule（用户在"编辑会话"对话框中直接填写的文本）
-            user_constraints = (abilities.get("constraints") or "").strip()
-            if user_constraints:
-                parts.insert(0, user_constraints)  # 置于最前，优先级最高
-
-            session.constraints = "\n\n---\n\n".join(parts) if parts else None
-            # ★ Backend Skills：自动部署到 working_dir/.claude/skills/
-            self._sync_backend_skills_to_directory(session)
+            self._apply_session_abilities(session, abilities)
             self._active_sessions[session_id] = session
             self._session_store.save(session, async_=True)
             return json.dumps({"status": "ok"}, ensure_ascii=False)
         except Exception as e:
             return json.dumps({"status": "error", "message": str(e)}, ensure_ascii=False)
+
+    def _rpc_setPromptDefault(self, name: str, is_default: bool = True) -> str:
+        """将 Prompt 标记为默认档 / 取消默认档。"""
+        try:
+            ok = self._prompt_store.set_default(name.strip(), bool(is_default))
+            if not ok:
+                return json.dumps(
+                    {"status": "error", "message": f"Prompt '{name}' not found"},
+                    ensure_ascii=False,
+                )
+            return json.dumps({"status": "ok"}, ensure_ascii=False)
+        except Exception as e:
+            print(f"[BridgeWS] setPromptDefault error: {e}", file=sys.stderr)
+            return json.dumps({"status": "error", "message": str(e)}, ensure_ascii=False)
+
+    def _rpc_setSkillDefault(self, name: str, is_default: bool = True) -> str:
+        """将 Skill 标记为默认档 / 取消默认档。"""
+        try:
+            ok = self._skill_store.set_default(name.strip(), bool(is_default))
+            if not ok:
+                return json.dumps(
+                    {"status": "error", "message": f"Skill '{name}' not found"},
+                    ensure_ascii=False,
+                )
+            return json.dumps({"status": "ok"}, ensure_ascii=False)
+        except Exception as e:
+            print(f"[BridgeWS] setSkillDefault error: {e}", file=sys.stderr)
+            return json.dumps({"status": "error", "message": str(e)}, ensure_ascii=False)
+
+    def _rpc_getDefaultAbilities(self) -> str:
+        """返回当前默认档集合，前端可用于预览/提示。"""
+        try:
+            return json.dumps(self._default_abilities(), ensure_ascii=False)
+        except Exception as e:
+            return json.dumps({"skills": [], "prompts": []})
 
     def _rpc_openModelTerminal(self, backend_id: str = "") -> str:
         """打开终端，启动 claude，提示用户用 /model 换模型。"""

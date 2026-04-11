@@ -46,6 +46,7 @@ class PromptStore:
             entry = {**meta, "content": content}
             if "id" not in entry:
                 entry["id"] = entry.get("name", "")
+            entry["isDefault"] = bool(meta.get("isDefault", False))
             result.append(entry)
         return result
 
@@ -55,7 +56,7 @@ class PromptStore:
             return None
         path = self._dir / f"{name}.md"
         content = path.read_text(encoding="utf-8") if path.exists() else ""
-        return {**meta, "content": content}
+        return {**meta, "content": content, "isDefault": bool(meta.get("isDefault", False))}
 
     def save_prompt(self, name: str, content: str, icon: str = "📝"):
         now = time.time()
@@ -65,6 +66,7 @@ class PromptStore:
             "icon": icon or (existing or {}).get("icon", "📝"),
             "createdAt": (existing or {}).get("createdAt", now),
             "updatedAt": now,
+            "isDefault": bool((existing or {}).get("isDefault", False)),
         }
         self._index[name] = meta
         (self._dir / f"{name}.md").write_text(content, encoding="utf-8")
@@ -100,3 +102,17 @@ class PromptStore:
             meta["icon"] = icon
             meta["updatedAt"] = time.time()
             self._save_index()
+
+    def set_default(self, name: str, is_default: bool) -> bool:
+        """标记/取消某个 Prompt 为默认档。默认档会在新建 session 时自动绑定。"""
+        meta = self._index.get(name)
+        if not meta:
+            return False
+        meta["isDefault"] = bool(is_default)
+        meta["updatedAt"] = time.time()
+        self._save_index()
+        return True
+
+    def list_default_names(self) -> list[str]:
+        """返回所有被标记为默认档的 Prompt 名称列表。"""
+        return [name for name, meta in self._index.items() if meta.get("isDefault")]
