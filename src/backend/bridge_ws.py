@@ -248,13 +248,72 @@ class BridgeWS:
         return kwargs
 
     async def _builtin_web_search(self, query: str) -> tuple[int, str]:
-        """内置网页搜索（DuckDuckGo HTML 版，纯服务端渲染，无 JS 依赖）。"""
-        import re as _re
+        """内置网页搜索：优先 Tavily（需配 API Key），否则 fallback DuckDuckGo。"""
         if not query:
             return 400, "搜索关键词为空"
         print(f"[bridge_ws] builtin web-search: q={query!r}", file=sys.stderr, flush=True)
+
+        # ★ 优先 Tavily（如果配了 Key）
         try:
-            import httpx as _httpx
+            secrets = self._skill_store.get_secrets("web-search")
+            tavily_key = (secrets.get("TAVILY_API_KEY") or "").strip()
+        except Exception:
+            tavily_key = ""
+        if tavily_key:
+            return await self._tavily_search(query, tavily_key)
+
+        # ★ Fallback: DuckDuckGo HTML
+        return await self._duckduckgo_search(query)
+
+    async def _tavily_search(self, query: str, api_key: str) -> tuple[int, str]:
+        """Tavily AI 搜索 API — 结果为 AI 优化的结构化 JSON，无广告噪音。"""
+        import httpx as _httpx
+        print("[bridge_ws] web-search engine: Tavily", file=sys.stderr, flush=True)
+        try:
+            client_kwargs = self._httpx_client_kwargs(timeout=30.0)
+            async with _httpx.AsyncClient(**client_kwargs) as client:
+                resp = await client.post(
+                    "https://api.tavily.com/search",
+                    json={
+                        "api_key": api_key,
+                        "query": query,
+                        "max_results": 5,
+                        "include_answer": True,
+                    },
+                    headers={"Content-Type": "application/json"},
+                )
+                if resp.status_code == 401:
+                    print("[bridge_ws] Tavily API key invalid, falling back to DuckDuckGo",
+                          file=sys.stderr, flush=True)
+                    return await self._duckduckgo_search(query)
+                if resp.status_code != 200:
+                    return 500, f"Tavily 搜索失败: HTTP {resp.status_code}"
+                data = resp.json()
+            results: list[str] = []
+            if data.get("answer"):
+                results.append(f"**AI 摘要**: {data['answer']}")
+            for item in data.get("results", []):
+                title = item.get("title", "")
+                url = item.get("url", "")
+                content = (item.get("content") or "")[:300]
+                if title and url:
+                    results.append(f"**{title}**\n{content}\n🔗 {url}")
+            if not results:
+                return 200, "未找到相关搜索结果。"
+            print(f"[bridge_ws] Tavily returned {len(results)} results",
+                  file=sys.stderr, flush=True)
+            return 200, "\n\n".join(f"{i}. {r}" for i, r in enumerate(results, 1))
+        except Exception as e:
+            print(f"[bridge_ws] Tavily error: {e}, falling back to DuckDuckGo",
+                  file=sys.stderr, flush=True)
+            return await self._duckduckgo_search(query)
+
+    async def _duckduckgo_search(self, query: str) -> tuple[int, str]:
+        """DuckDuckGo HTML 搜索（免费 fallback，无需 API Key）。"""
+        import re as _re
+        import httpx as _httpx
+        print("[bridge_ws] web-search engine: DuckDuckGo", file=sys.stderr, flush=True)
+        try:
             headers = {
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
             }
@@ -270,13 +329,11 @@ class BridgeWS:
                 html = resp.text
             print(f"[bridge_ws] DuckDuckGo response: {len(html)} chars",
                   file=sys.stderr, flush=True)
-            # DuckDuckGo HTML 结构：<div class="result ..."> 内含 <a class="result__a" href="...">标题</a> + <a class="result__snippet">摘要</a>
             results: list[str] = []
             blocks = _re.findall(r'<div[^>]*class="[^"]*result [^"]*"[^>]*>(.*?)</div>\s*</div>', html, _re.DOTALL)
             if not blocks:
                 blocks = _re.findall(r'class="result__body">(.*?)</div>', html, _re.DOTALL)
             for block in blocks[:8]:
-                # 标题 + URL
                 title_m = _re.search(r'<a[^>]*class="result__a"[^>]*href="([^"]*)"[^>]*>(.*?)</a>', block, _re.DOTALL)
                 if not title_m:
                     title_m = _re.search(r'<a[^>]*href="([^"]*)"[^>]*>(.*?)</a>', block, _re.DOTALL)
@@ -284,13 +341,11 @@ class BridgeWS:
                     continue
                 url = title_m.group(1)
                 title = _re.sub(r'<[^>]+>', '', title_m.group(2)).strip()
-                # 摘要
                 snippet = ""
                 snippet_m = _re.search(r'class="result__snippet[^"]*"[^>]*>(.*?)</[as]>', block, _re.DOTALL)
                 if snippet_m:
                     snippet = _re.sub(r'<[^>]+>', '', snippet_m.group(1)).strip()[:200]
                 if title and url and not url.startswith('javascript'):
-                    # DuckDuckGo URL 可能是重定向格式
                     if '//duckduckgo.com/l/?' in url:
                         import urllib.parse as _up
                         parsed = _up.parse_qs(_up.urlparse(url).query)
@@ -302,7 +357,7 @@ class BridgeWS:
                 return 200, "未找到相关搜索结果。"
             return 200, "\n\n".join(f"{i}. {r}" for i, r in enumerate(results, 1))
         except Exception as e:
-            print(f"[bridge_ws] web-search error: {e}", file=sys.stderr, flush=True)
+            print(f"[bridge_ws] DuckDuckGo error: {e}", file=sys.stderr, flush=True)
             return 500, f"搜索失败: {e}"
 
     async def _builtin_web_fetch(self, url: str) -> tuple[int, str]:
@@ -1152,10 +1207,30 @@ class BridgeWS:
                 try: _os.unlink(tmp_path)
                 except Exception: pass
 
+    # 内置类型的默认 secrets schema（用户在 skill 库中无 secrets.schema.json 时使用）
+    _BUILTIN_SECRETS_SCHEMA: dict[str, dict] = {
+        "web-search": {
+            "fields": [
+                {
+                    "key": "TAVILY_API_KEY",
+                    "label": "Tavily API Key（可选，推荐）",
+                    "type": "password",
+                    "placeholder": "tvly-xxxxx — 免费注册 tavily.com 获取，1000次/月",
+                    "required": False,
+                }
+            ]
+        },
+    }
+
     def _rpc_getSkillSecretsSchema(self, name: str) -> str:
         """获取 skill 的 secrets.schema.json（字段列表），前端据此渲染填写表单。"""
         try:
             schema = self._skill_store.get_secrets_schema(name)
+            if not schema:
+                # 内置类型：返回默认 schema
+                skill_info = self._skill_store.get_skill(name)
+                skill_type = skill_info.get("type", "") if skill_info else ""
+                schema = self._BUILTIN_SECRETS_SCHEMA.get(skill_type)
             return json.dumps(schema, ensure_ascii=False)
         except Exception as e:
             return json.dumps(None)

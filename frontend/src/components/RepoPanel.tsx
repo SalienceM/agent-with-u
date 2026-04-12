@@ -155,7 +155,7 @@ const SKILL_TYPE_PRESETS: SkillTypePreset[] = [
     id: 'web-search',
     icon: '🔍',
     label: '网页搜索',
-    description: 'Bing 搜索，免费，无需配置',
+    description: '支持 Tavily（推荐，配 Key）或 DuckDuckGo（免费 fallback）',
     builtin: true,
     template: () => ({
       name: 'web-search',
