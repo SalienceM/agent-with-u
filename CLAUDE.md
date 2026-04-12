@@ -132,6 +132,8 @@ pyinstaller --name "agent-with-u-backend" --onefile --console ^
     --hidden-import PIL ^
     --hidden-import claude_agent_sdk ^
     --hidden-import certifi --collect-data certifi ^
+    --collect-all pydantic_core ^
+    --hidden-import pydantic --hidden-import mcp ^
     --noconfirm ws_main_entry.py
 
 # For the Qt frontend application
@@ -143,7 +145,7 @@ pyinstaller --name "AgentWithU" --windowed ^
     src/main.py
 ```
 
-**Important**: The `claude_agent_sdk` module must be included in `hiddenimports` because it's dynamically imported at runtime. Without this, the packaged executable will show the error: "claude-agent-sdk 未安装".
+**Important**: The `claude_agent_sdk` module must be included in `hiddenimports` because it's dynamically imported at runtime. Additionally, `--collect-all pydantic_core` is required because `pydantic_core._pydantic_core` is a compiled C extension (`.pyd`) that PyInstaller's static analysis cannot detect. The dependency chain is: `claude_agent_sdk → mcp → pydantic → pydantic_core._pydantic_core`.
 
 ## Coding Conventions
 
