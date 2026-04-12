@@ -452,8 +452,8 @@ export const api = {
     return () => { connectionStatusCallbacks = connectionStatusCallbacks.filter((cb) => cb !== callback); };
   },
 
-  async listDirectory(path: string): Promise<{ name: string; path: string; isDir: boolean }[]> {
-    const result = await call('listDirectory', path);
+  async listDirectory(path: string, workingDir?: string): Promise<{ name: string; path: string; isDir: boolean }[]> {
+    const result = await call('listDirectory', path, workingDir || '');
     try {
       const data = JSON.parse(result);
       if (Array.isArray(data)) return data;

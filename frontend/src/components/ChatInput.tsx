@@ -184,14 +184,13 @@ const ChatInputInner: React.FC<Props> = ({
   //  ★ @ 文件选择器 helpers
   // ═══════════════════════════════════════
 
-  // 计算父目录（跨平台）
+  // 计算父目录（不允许超过 workingDir，全部使用相对路径）
   const getParentDir = (dirPath: string): string | null => {
     const normalized = dirPath.replace(/\\/g, '/').replace(/\/$/, '');
+    if (!normalized || normalized === '.') return null; // 已在根目录
     const lastSep = normalized.lastIndexOf('/');
-    if (lastSep <= 0) return null;
-    const parent = normalized.substring(0, lastSep);
-    if (/^[A-Za-z]:$/.test(parent)) return null; // Windows 驱动器根目录
-    return parent;
+    if (lastSep < 0) return '.'; // 单层子目录 → 回到根
+    return normalized.substring(0, lastSep) || '.';
   };
 
   // 进入子目录
@@ -212,7 +211,7 @@ const ChatInputInner: React.FC<Props> = ({
         el.selectionEnd = lastAt + 1;
       }
     }
-    api.listDirectory(dirPath).then((entries) => {
+    api.listDirectory(dirPath, workingDirRef.current).then((entries) => {
       if (Array.isArray(entries)) setFileEntries(entries);
     });
   }, []);
@@ -407,9 +406,9 @@ const ChatInputInner: React.FC<Props> = ({
         setFileSelectedIndex(0);
         if (!showFilePickerRef.current) {
           // 首次打开：加载工作目录
-          const dir = workingDirRef.current || '.';
-          setCurrentDir(dir);
-          api.listDirectory(dir).then((entries) => {
+          setCurrentDir('.');
+          const wd = workingDirRef.current || '.';
+          api.listDirectory(wd, wd).then((entries) => {
             if (Array.isArray(entries)) {
               setFileEntries(entries);
               setShowFilePicker(true);
@@ -589,7 +588,7 @@ const ChatInputInner: React.FC<Props> = ({
           <div style={filePickerHeaderStyle}>
             <span style={{ opacity: 0.6, fontSize: 10 }}>📁</span>
             <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', direction: 'rtl', textAlign: 'left' }}>
-              {currentDir}
+              {currentDir === '.' ? (workingDir || '.').replace(/\\/g, '/').split('/').pop() || '.' : currentDir}
             </span>
           </div>
           {/* 上级目录 */}

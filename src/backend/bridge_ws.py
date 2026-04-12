@@ -2103,20 +2103,46 @@ except urllib.error.URLError as e:
 
     # ── RPC: 应用配置 ────────────────────────────────────────────
 
-    def _rpc_listDirectory(self, path: str) -> str:
+    def _rpc_listDirectory(self, path: str, working_dir: str = "") -> str:
         """列出目录内容，供前端 @ 文件引用选择器使用。
         返回 [{name, path, isDir}, ...] 目录优先，字母序排列，跳过隐藏文件。
+        path 相对于 working_dir 返回相对路径；不允许越过 working_dir 上级。
         """
         import os
+        from pathlib import Path as _Path
         try:
+            # 如果有工作目录限制，相对路径基于 working_dir 解析
+            if working_dir:
+                abs_root = _Path(working_dir).resolve()
+                p = _Path(path)
+                abs_path = (abs_root / path).resolve() if not p.is_absolute() else p.resolve()
+            else:
+                abs_root = None
+                abs_path = _Path(path).resolve()
+            # 禁止越权
+            if abs_root:
+                # 确保浏览路径在工作目录内（含工作目录本身）
+                try:
+                    abs_path.relative_to(abs_root)
+                except ValueError:
+                    return json.dumps({"error": "不允许浏览工作目录之外的路径"}, ensure_ascii=False)
             entries = []
-            with os.scandir(path) as it:
+            with os.scandir(str(abs_path)) as it:
                 for entry in sorted(it, key=lambda e: (not e.is_dir(), e.name.lower())):
                     if entry.name.startswith('.'):
                         continue
+                    entry_abs = _Path(entry.path).resolve()
+                    if abs_root:
+                        # 返回相对于 working_dir 的路径
+                        try:
+                            rel = str(entry_abs.relative_to(abs_root)).replace("\\", "/")
+                        except ValueError:
+                            continue  # 符号链接指向外部，跳过
+                    else:
+                        rel = entry.path.replace("\\", "/")
                     entries.append({
                         "name": entry.name,
-                        "path": entry.path.replace("\\", "/"),
+                        "path": rel,
                         "isDir": entry.is_dir(),
                     })
             return json.dumps(entries, ensure_ascii=False)
