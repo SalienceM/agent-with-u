@@ -217,6 +217,36 @@ class BridgeWS:
 
     # ── 内置 Skill 处理器 ─────────────────────────────────────────
 
+    @staticmethod
+    def _httpx_client_kwargs(*, timeout: float = 30.0) -> dict:
+        """构建 httpx.AsyncClient 参数，处理 PyInstaller 打包后 SSL 证书缺失。"""
+        import urllib.request as _ur
+        kwargs: dict = {"timeout": timeout, "follow_redirects": True}
+        # 代理
+        try:
+            proxy = _ur.getproxies().get("https") or _ur.getproxies().get("http")
+            if proxy:
+                kwargs["proxy"] = proxy
+        except Exception:
+            pass
+        # PyInstaller frozen build: certifi 的 cacert.pem 可能未打包
+        if getattr(sys, 'frozen', False):
+            try:
+                import certifi
+                import os
+                cert_path = certifi.where()
+                if os.path.exists(cert_path):
+                    kwargs["verify"] = cert_path
+                else:
+                    print(f"[bridge_ws] certifi CA bundle not found at {cert_path}, disabling SSL verify",
+                          file=sys.stderr, flush=True)
+                    kwargs["verify"] = False
+            except ImportError:
+                print("[bridge_ws] certifi not available in frozen build, disabling SSL verify",
+                      file=sys.stderr, flush=True)
+                kwargs["verify"] = False
+        return kwargs
+
     async def _builtin_web_search(self, query: str) -> tuple[int, str]:
         """内置网页搜索（DuckDuckGo HTML 版，纯服务端渲染，无 JS 依赖）。"""
         import re as _re
@@ -225,19 +255,10 @@ class BridgeWS:
         print(f"[bridge_ws] builtin web-search: q={query!r}", file=sys.stderr, flush=True)
         try:
             import httpx as _httpx
-            import urllib.request as _ur
-            proxy_url = None
-            try:
-                sys_proxies = _ur.getproxies()
-                proxy_url = sys_proxies.get("https") or sys_proxies.get("http")
-            except Exception:
-                pass
             headers = {
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
             }
-            client_kwargs: dict = {"timeout": 30.0, "follow_redirects": True}
-            if proxy_url:
-                client_kwargs["proxy"] = proxy_url
+            client_kwargs = self._httpx_client_kwargs(timeout=30.0)
             async with _httpx.AsyncClient(**client_kwargs) as client:
                 resp = await client.post(
                     "https://html.duckduckgo.com/html/",
@@ -292,18 +313,10 @@ class BridgeWS:
         print(f"[bridge_ws] builtin web-fetch: url={url[:100]}", file=sys.stderr, flush=True)
         try:
             import httpx as _httpx
-            import urllib.request as _ur
-            proxy_url = None
-            try:
-                proxy_url = _ur.getproxies().get("https") or _ur.getproxies().get("http")
-            except Exception:
-                pass
             headers = {
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
             }
-            client_kwargs: dict = {"timeout": 30.0, "follow_redirects": True}
-            if proxy_url:
-                client_kwargs["proxy"] = proxy_url
+            client_kwargs = self._httpx_client_kwargs(timeout=30.0)
             async with _httpx.AsyncClient(**client_kwargs) as client:
                 resp = await client.get(url, headers=headers)
                 if resp.status_code != 200:

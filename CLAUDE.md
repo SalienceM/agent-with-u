@@ -131,6 +131,7 @@ pyinstaller --name "agent-with-u-backend" --onefile --console ^
     --hidden-import websockets ^
     --hidden-import PIL ^
     --hidden-import claude_agent_sdk ^
+    --hidden-import certifi --collect-data certifi ^
     --noconfirm ws_main_entry.py
 
 # For the Qt frontend application
