@@ -267,26 +267,39 @@ class BridgeWS:
         """
         from pathlib import Path as _Path
         import asyncio as _asyncio
+        import os as _os
 
         skill_dir = _Path.home() / ".agent-with-u" / "skill-library" / skill_name
         call_py = skill_dir / "call.py"
         if not call_py.exists():
             return 404, f"Skill '{skill_name}' 缺少 call.py"
 
+        # ★ 解析 Python 解释器：冻结环境下 sys.executable 是 .exe，不能用来跑 .py
+        python_exe = self._resolve_python_exe()
+        if not python_exe:
+            return 500, (
+                f"Skill '{skill_name}' 需要 Python 解释器，但在打包环境中未找到系统 Python。\n"
+                f"请安装 Python 3.10+ 并确保 python 在 PATH 中。"
+            )
+
         # 从本地安全存储获取凭据（不传给 LLM）
         secrets = self._skill_store.get_secrets(skill_name)
-        env = {
-            **__import__("os").environ,
+        env = {**_os.environ}
+        # ★ 清除 PyInstaller 冻结环境污染，防止子进程继承错误的 PYTHONHOME/PYTHONPATH
+        if getattr(sys, 'frozen', False):
+            for _key in ("PYTHONHOME", "PYTHONPATH", "_MEIPASS2", "_PYI_SPLASH_IPC"):
+                env.pop(_key, None)
+        env.update({
             "SKILL_SECRETS": json.dumps(secrets, ensure_ascii=False),
             "SKILL_NAME": skill_name,
             "SKILL_DIR": str(skill_dir),
-        }
+        })
 
         stdin_data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
 
         try:
             proc = await _asyncio.create_subprocess_exec(
-                __import__("sys").executable, str(call_py),
+                python_exe, str(call_py),
                 stdin=_asyncio.subprocess.PIPE,
                 stdout=_asyncio.subprocess.PIPE,
                 stderr=_asyncio.subprocess.PIPE,
