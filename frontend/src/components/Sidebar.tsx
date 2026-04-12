@@ -167,9 +167,19 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
     }
   }, [sessionToDelete, refresh, onDeleteSession]);
 
-  // ★ Listen for session-created event to refresh list
+  // ★ Listen for session-created event: optimistic insert + background refresh
   useEffect(() => {
-    const handleSessionCreated = () => refresh();
+    const handleSessionCreated = (e: Event) => {
+      const detail = (e as CustomEvent).detail;
+      if (detail?.id) {
+        // 立即插入新 session 到列表顶部，避免等待 API 往返
+        setSessions(prev => {
+          if (prev.some(s => s.id === detail.id)) return prev;
+          return [detail, ...prev];
+        });
+      }
+      refresh(); // 后台刷新以保证一致性
+    };
     window.addEventListener('session-created', handleSessionCreated);
     return () => window.removeEventListener('session-created', handleSessionCreated);
   }, [refresh]);

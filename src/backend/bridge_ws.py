@@ -281,6 +281,7 @@ class BridgeWS:
                 return 200, "未找到相关搜索结果。"
             return 200, "\n\n".join(f"{i}. {r}" for i, r in enumerate(results, 1))
         except Exception as e:
+            print(f"[bridge_ws] web-search error: {e}", file=sys.stderr, flush=True)
             return 500, f"搜索失败: {e}"
 
     async def _builtin_web_fetch(self, url: str) -> tuple[int, str]:
@@ -382,8 +383,9 @@ class BridgeWS:
                 resp_bytes = resp_text.encode("utf-8")
 
             # 发送响应
+            _REASON = {200: "OK", 400: "Bad Request", 404: "Not Found", 500: "Internal Server Error"}
             response = (
-                f"HTTP/1.1 {status} OK\r\n"
+                f"HTTP/1.1 {status} {_REASON.get(status, 'OK')}\r\n"
                 f"Content-Type: {content_type}\r\n"
                 f"Content-Length: {len(resp_bytes)}\r\n"
                 f"Access-Control-Allow-Origin: *\r\n"
@@ -1616,8 +1618,15 @@ try:
     sys.stdout.buffer.write(result)
     sys.stdout.buffer.write(b"\\n")
     sys.stdout.buffer.flush()
+except urllib.error.HTTPError as e:
+    body = e.read().decode("utf-8", errors="replace")
+    sys.stderr.write(f"[_call.py] HTTP {{e.code}}: {{body[:200]}}\\n")
+    sys.stderr.flush()
+    sys.stdout.write(body + "\\n")
+    sys.stdout.flush()
+    sys.exit(1)
 except urllib.error.URLError as e:
-    sys.stderr.write(f"[_call.py] HTTP error calling skill bridge: {{e}}\\n")
+    sys.stderr.write(f"[_call.py] URLError: {{e}}\\n")
     sys.stderr.flush()
     sys.stdout.write(f"(skill bridge error: {{e}})\\n")
     sys.stdout.flush()

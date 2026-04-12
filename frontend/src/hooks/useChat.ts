@@ -176,7 +176,12 @@ export function useChat(sessionId: string, backendId: string, backends?: any[], 
 
   // ── 加载 session ──
   useEffect(() => {
-    if (!sessionId) return;
+    if (!sessionId) {
+      // session 被删除或未选中 → 清空聊天区
+      setMessages([]);
+      setIsStreaming(false);
+      return;
+    }
 
     // ★ 先检查全局流式状态
     const globalState = getStreamState(sessionId);

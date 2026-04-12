@@ -306,15 +306,13 @@ export const App: React.FC = () => {
     const session = await api.createSession(workingDir, backendId);
     // ★ Set session first, then close dialog in next render cycle to avoid visual tearing
     setActiveSessionId(session.id);
-    // ★ Directly refresh session list to ensure new session appears
-    const sessionList = await api.listSessions();
-    setSessions(sessionList);
-    // Use requestAnimationFrame to ensure visual update after state change
+    // ★ Dispatch with session data → Sidebar optimistically inserts it immediately
+    window.dispatchEvent(new CustomEvent('session-created', { detail: session }));
+    // ★ Also refresh App's own sessions state (for BackendManager etc.)
+    api.listSessions().then(setSessions);
     requestAnimationFrame(() => {
       setNewSessionDialogOpen(false);
     });
-    // ★ Also dispatch event for Sidebar to refresh (redundant but safe)
-    window.dispatchEvent(new CustomEvent('session-created'));
   }, []);
 
 
