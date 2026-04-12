@@ -124,6 +124,8 @@ let wsPort = WS_PORT_DEFAULT;
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 let reconnectDelay = 1000; // 指数退避：1s → 2s → 4s … 最大 30s
 const MAX_RECONNECT_DELAY = 30000;
+let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
+const HEARTBEAT_INTERVAL_MS = 25000; // 每 25 秒发送一次心跳 ping
 
 function scheduleReconnect() {
   if (reconnectTimer !== null) return; // 已有排队，不重复
@@ -177,6 +179,15 @@ function doConnect(port: number, onSettled?: () => void) {
     if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
     console.log(`[api] Connected to ${url}`);
     connectionStatusCallbacks.forEach((cb) => cb(true));
+    // ★ 启动心跳定时器：定期发送 RPC ping 保持连接活跃
+    if (heartbeatTimer) clearInterval(heartbeatTimer);
+    heartbeatTimer = setInterval(() => {
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        const id = nextId();
+        // fire-and-forget ping，不注册 pending（丢失也无所谓）
+        try { ws.send(JSON.stringify({ id, method: 'ping', params: [] })); } catch {}
+      }
+    }, HEARTBEAT_INTERVAL_MS);
     settle();
   };
 
@@ -188,6 +199,8 @@ function doConnect(port: number, onSettled?: () => void) {
   socket.onclose = () => {
     if (ws === socket) {
       ws = null;
+      // ★ 停止心跳
+      if (heartbeatTimer) { clearInterval(heartbeatTimer); heartbeatTimer = null; }
       // ★ 连接断开时 reject 所有挂起请求，让调用方能区分连接错误和正常 null 响应
       pending.forEach(({ reject }) => reject(new Error('WebSocket connection lost')));
       pending.clear();

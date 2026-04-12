@@ -62,6 +62,100 @@ def _read_clipboard_image_native() -> Optional[dict]:
         return None
 
 
+# ── Layer 2 沙盒路径校验 ────────────────────────────────────────
+
+def validate_sandbox_path(file_path: str, working_dir: str) -> tuple[bool, str]:
+    """
+    检查 file_path 是否在 working_dir 范围内。
+    返回 (is_valid, reason)。
+    """
+    import os
+    if not working_dir:
+        return True, ""
+    try:
+        wd = os.path.realpath(os.path.abspath(working_dir))
+        fp = os.path.realpath(os.path.abspath(file_path))
+    except (OSError, ValueError) as e:
+        return False, f"路径解析失败: {e}"
+    # 允许 working_dir 本身及其子目录
+    if fp == wd or fp.startswith(wd + os.sep):
+        return True, ""
+    return False, f"路径 {file_path} 超出工作目录 {working_dir}"
+
+
+def validate_tool_sandbox(tool_name: str, tool_input: str | dict, working_dir: str) -> tuple[bool, str]:
+    """
+    Layer 2 沙盒：校验工具调用是否越界。
+    返回 (is_valid, reason)。
+
+    - Read/Write/Edit/Glob: 检查 file_path / path
+    - Bash: 基础检查（无法完美解析所有命令，但捕捉明显越界）
+    """
+    import os, json as _json
+    if not working_dir:
+        return True, ""
+    # 解析 tool_input
+    if isinstance(tool_input, str):
+        try:
+            inp = _json.loads(tool_input)
+        except (ValueError, TypeError):
+            inp = {}
+    else:
+        inp = tool_input or {}
+    if not isinstance(inp, dict):
+        return True, ""
+
+    FILE_PATH_TOOLS = {"Read", "Write", "Edit", "NotebookEdit"}
+    PATH_TOOLS = {"Glob", "Grep"}
+    SENSITIVE_PATHS = {
+        ".ssh", ".gnupg", ".aws", ".config/gcloud",
+        ".env", ".npmrc", ".pypirc",
+    }
+
+    def _check_path(p: str) -> tuple[bool, str]:
+        if not p:
+            return True, ""
+        # 相对路径：相对于 working_dir
+        if not os.path.isabs(p):
+            p = os.path.join(working_dir, p)
+        # 检查敏感路径
+        home = os.path.expanduser("~")
+        for sp in SENSITIVE_PATHS:
+            sensitive = os.path.join(home, sp)
+            rp = os.path.realpath(os.path.abspath(p))
+            rs = os.path.realpath(os.path.abspath(sensitive))
+            if rp == rs or rp.startswith(rs + os.sep):
+                return False, f"禁止访问敏感路径: {sp}"
+        return validate_sandbox_path(p, working_dir)
+
+    if tool_name in FILE_PATH_TOOLS:
+        fp = inp.get("file_path", "")
+        return _check_path(fp)
+
+    if tool_name in PATH_TOOLS:
+        p = inp.get("path", "")
+        if p:
+            return _check_path(p)
+        return True, ""  # path 为空时默认 cwd
+
+    if tool_name == "Bash":
+        cmd = inp.get("command", "")
+        if not cmd:
+            return True, ""
+        # 检查明显的敏感路径访问
+        home = os.path.expanduser("~")
+        for sp in SENSITIVE_PATHS:
+            if f"{home}/{sp}" in cmd or f"{home}\\{sp}" in cmd:
+                return False, f"Bash 命令访问敏感路径: ~/{sp}"
+        # 检查明显的破坏性命令
+        _dangerous = ["rm -rf /", "rm -rf ~", "mkfs", "dd if=", "> /dev/"]
+        for d in _dangerous:
+            if d in cmd:
+                return False, f"Bash 命令包含危险操作: {d}"
+
+    return True, ""
+
+
 # ── 默认后端配置（与 bridge.py 保持一致）────────────────────────
 
 # 官方账户后端固定 ID，不可删除
@@ -754,6 +848,12 @@ class BridgeWS:
         if asyncio.iscoroutinefunction(handler):
             return await handler(*params)
         return handler(*params)
+
+    # ── RPC: 心跳 ─────────────────────────────────────────────
+
+    def _rpc_ping(self) -> str:
+        """前端心跳探针，保持 WebSocket 活跃 + 快速检测连接是否存活。"""
+        return "pong"
 
     # ── RPC: 剪贴板 ─────────────────────────────────────────────
 
@@ -1785,6 +1885,44 @@ except urllib.error.URLError as e:
                     print(f"[bridge_ws] Cleaned up unbound Backend Skill '{skill_dir.name}'",
                           file=sys.stderr, flush=True)
 
+    @staticmethod
+    def _build_sandbox_constraints(session: "Session") -> str | None:
+        """
+        Layer 1 沙盒：根据 session.working_dir 生成文件系统边界约束文本。
+        此约束会被注入到每次发送给 LLM 的 constraints 前缀中。
+        """
+        wd = getattr(session, "working_dir", None)
+        if not wd:
+            return None
+        import os
+        wd_abs = os.path.abspath(wd).replace("\\", "/")
+        # 敏感路径列表（相对用户 home 目录的通配 + 绝对系统路径）
+        home = os.path.expanduser("~").replace("\\", "/")
+        sensitive = [
+            f"{home}/.ssh",
+            f"{home}/.gnupg",
+            f"{home}/.aws",
+            f"{home}/.config/gcloud",
+            "/etc/shadow",
+            "/etc/passwd",
+        ]
+        sensitive_str = ", ".join(f"`{p}`" for p in sensitive)
+        return (
+            "## 🔒 沙盒约束（Sandbox — 强制执行，不可覆盖）\n\n"
+            f"当前工作目录（working_dir）: `{wd_abs}`\n\n"
+            "### 文件系统边界\n"
+            f"1. **所有文件读写操作必须限制在 `{wd_abs}` 及其子目录内**。\n"
+            "   - Read / Write / Edit 的 `file_path` 参数必须解析后位于 working_dir 之下。\n"
+            "   - 禁止使用 `..` 跳出工作目录。\n"
+            "2. **Bash 命令**中 `cd`、重定向 `>`、`>>` 目标路径也必须在 working_dir 范围内。\n"
+            "3. **禁止访问敏感路径**：" + sensitive_str + " 等。\n\n"
+            "### 禁止操作\n"
+            "- `rm -rf /`、`rm -rf ~`、格式化磁盘等破坏性命令。\n"
+            "- 读取或写入用户密钥、凭证文件。\n"
+            "- 启动网络监听（`nc -l`、`python -m http.server` 等）——除非用户明确要求。\n\n"
+            "违反沙盒约束的请求应拒绝并说明原因。"
+        )
+
     def _apply_session_abilities(self, session: Session, abilities: dict) -> None:
         """
         把 abilities 绑定到 session：
@@ -1894,6 +2032,11 @@ except urllib.error.URLError as e:
         user_constraints = (abilities.get("constraints") or "").strip()
         if user_constraints:
             parts.insert(0, user_constraints)  # 置于最前，优先级最高
+
+        # ★ Layer 1 沙盒约束：自动注入工作目录边界规则
+        sandbox_block = self._build_sandbox_constraints(session)
+        if sandbox_block:
+            parts.append(sandbox_block)
 
         session.constraints = "\n\n---\n\n".join(parts) if parts else None
         # ★ Backend Skills：自动部署到 working_dir/.claude/skills/
@@ -2532,6 +2675,14 @@ except urllib.error.URLError as e:
                 # ★ 权限回调：用于工具执行前的权限确认
                 async def _on_permission_request(req: PermissionRequest) -> bool:
                     """处理来自 backend 的权限请求，转发给前端等待确认。"""
+                    # ★ Layer 2 沙盒校验（在权限检查之前，不受 skip 影响）
+                    if session.working_dir:
+                        _ok, _reason = validate_tool_sandbox(req.tool_name, req.tool_input, session.working_dir)
+                        if not _ok:
+                            print(f"[bridge_ws] 🔒 沙盒拦截: {req.tool_name} — {_reason}",
+                                  file=sys.stderr, flush=True)
+                            return False
+
                     # ★ 检查是否已设置跳过权限确认
                     if session.id in self._skip_rest_sessions:
                         print(f"[bridge_ws] Session {session.id} 已设置 skip_rest，自动授权", file=sys.stderr, flush=True)

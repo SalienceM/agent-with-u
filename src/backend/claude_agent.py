@@ -44,9 +44,12 @@ class ClaudeAgentBackend(ModelBackend):
 
         try:
             from claude_agent_sdk import query as sdk_query, ClaudeAgentOptions
-        except ImportError:
+        except ImportError as _imp_err:
+            import traceback as _tb
+            _detail = str(_imp_err)
+            print(f"[ClaudeAgent] ImportError: {_detail}\n{_tb.format_exc()}", file=sys.stderr, flush=True)
             emit("error", error=(
-                "claude-agent-sdk 未安装，请运行: pip install claude-agent-sdk"
+                f"claude-agent-sdk 加载失败: {_detail}\n请确认: pip install claude-agent-sdk"
             ))
             emit("done")
             return {}
@@ -95,6 +98,8 @@ class ClaudeAgentBackend(ModelBackend):
 
             # ★ 权限敏感的工具列表：这些工具需要用户确认
             PERMISSION_SENSITIVE_TOOLS = {"Bash", "Edit", "Write"}
+            # ★ Layer 2 沙盒：需要路径校验的工具
+            SANDBOX_TOOLS = {"Read", "Write", "Edit", "Bash", "Glob", "Grep", "NotebookEdit"}
 
             # ★ 图片处理：使用 AsyncIterable[dict] 形式的 prompt 原生传递图片
             # SDK 支持通过 yield Anthropic content blocks 的方式直接传递图片
@@ -104,6 +109,7 @@ class ClaudeAgentBackend(ModelBackend):
             _permission_event = asyncio.Event()
             _permission_granted = True
             # ★ 追踪当前正在流式输入的 tool_use block，用于在 content_block_stop 时拿到完整 input
+            # 现在同时用于权限门控和沙盒校验
             _pending_perm: dict | None = None   # {"id": str, "name": str, "parts": list[str]}
             _waiting_for_permission = False
 
@@ -116,6 +122,15 @@ class ClaudeAgentBackend(ModelBackend):
             async def _wait_for_permission(tool_id: str, tool_name: str, tool_input: str) -> bool:
                 """等待权限确认，返回是否授权。"""
                 nonlocal _waiting_for_permission
+                # ★ Layer 2 沙盒校验：在权限检查之前执行，不受 skip_permissions 影响
+                if cwd and tool_name in SANDBOX_TOOLS:
+                    from .bridge_ws import validate_tool_sandbox
+                    is_valid, reason = validate_tool_sandbox(tool_name, tool_input, cwd)
+                    if not is_valid:
+                        print(f"[ClaudeAgent] 🔒 沙盒拦截: {tool_name} — {reason}",
+                              file=sys.stderr, flush=True)
+                        emit("error", error=f"🔒 沙盒拦截: {reason}")
+                        return False
                 if skip_permissions:
                     return True
                 if tool_name not in PERMISSION_SENSITIVE_TOOLS:
@@ -317,8 +332,12 @@ class ClaudeAgentBackend(ModelBackend):
                                 "input": "",
                                 "status": "running",
                             })
-                            # ★ 记录待确认 tool，等 content_block_stop 时输入完整再弹权限门
-                            if not skip_permissions and tool_name in PERMISSION_SENSITIVE_TOOLS:
+                            # ★ 记录待确认 tool，等 content_block_stop 时输入完整再弹权限门 / 沙盒校验
+                            _need_track = (
+                                (not skip_permissions and tool_name in PERMISSION_SENSITIVE_TOOLS)
+                                or tool_name in SANDBOX_TOOLS
+                            )
+                            if _need_track:
                                 _pending_perm = {"id": tool_id, "name": tool_name, "parts": []}
                             else:
                                 _pending_perm = None

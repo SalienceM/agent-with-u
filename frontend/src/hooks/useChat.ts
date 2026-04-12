@@ -258,6 +258,30 @@ export function useChat(sessionId: string, backendId: string, backends?: any[], 
     });
   }, [sessionId]);
 
+  // ── ★ WebSocket 重连后重置卡死的流式状态 ──
+  useEffect(() => {
+    let wasDisconnected = false;
+    return api.onConnectionStatus((connected) => {
+      if (!connected) {
+        wasDisconnected = true;
+        return;
+      }
+      // 重连成功：如果当前仍在 streaming 状态，说明流式被中断，需要重置
+      if (wasDisconnected && isStreamingRef.current) {
+        console.warn('[useChat] WS reconnected while streaming — resetting stuck state');
+        setIsStreaming(false);
+        clearStreamState(sessionId);
+        // 重新加载 session 消息以恢复最新持久化状态
+        api.loadSession(sessionId).then((session) => {
+          if (session?.messages) {
+            setMessages(session.messages.map(normalizeMessage));
+          }
+        });
+      }
+      wasDisconnected = false;
+    });
+  }, [sessionId]);
+
   // ── 流式 delta 监听 ──
   useEffect(() => {
     // 取消挂起的 RAF，立即执行 pendingMsgUpdate（用于终态 done/error）

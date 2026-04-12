@@ -368,12 +368,23 @@ class ClaudeCodeOfficialBackend(ModelBackend):
                         if t:
                             emit("thinking", text=t)
                     elif btype == "tool_use":
+                        _tool_name = block.get("name", "")
+                        _tool_input = block.get("input", {})
                         emit("tool_start", tool_call={
                             "id": block.get("id", ""),
-                            "name": block.get("name", ""),
-                            "input": json.dumps(block.get("input", {}), ensure_ascii=False),
+                            "name": _tool_name,
+                            "input": json.dumps(_tool_input, ensure_ascii=False),
                             "status": "running",
                         })
+                        # ★ Layer 2 沙盒检测：工具已执行，但可阻止后续操作
+                        if cwd:
+                            from .bridge_ws import validate_tool_sandbox
+                            _ok, _reason = validate_tool_sandbox(_tool_name, _tool_input, cwd)
+                            if not _ok:
+                                print(f"[OfficialBackend] 🔒 沙盒违规检测: {_tool_name} — {_reason}",
+                                      file=sys.stderr, flush=True)
+                                emit("error", error=f"🔒 沙盒违规: {_reason}（操作可能已执行，已终止后续操作）")
+                                self.abort(session_id)
 
             elif msg_type == "tool":
                 for block in obj.get("content", []):

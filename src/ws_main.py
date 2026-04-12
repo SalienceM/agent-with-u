@@ -242,7 +242,12 @@ async def main():
 
     logging.info(f"[ws_main] Starting WebSocket server on ws://{WS_HOST}:{WS_PORT}")
     try:
-        server = await websockets.serve(bridge.handle_client, WS_HOST, WS_PORT, max_size=50 * 1024 * 1024)  # 50MB，支持大图片 base64
+        server = await websockets.serve(
+            bridge.handle_client, WS_HOST, WS_PORT,
+            max_size=50 * 1024 * 1024,   # 50MB，支持大图片 base64
+            ping_interval=30,             # 每 30 秒发送 ping
+            ping_timeout=300,             # 允许 5 分钟无 pong（系统休眠/后台标签页节流）
+        )
         # ★ Backend Skill HTTP API（供 SKILL.md 通过 curl 回调）
         http_server = await bridge.start_http_api()
     except OSError as e:
