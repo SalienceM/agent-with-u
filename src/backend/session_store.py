@@ -138,6 +138,7 @@ class SessionStore:
                 working_dir=data.get("workingDir"),
                 auto_continue=data.get("autoContinue", True),
                 skip_permissions=data.get("skipPermissions", True),
+                sandbox_enabled=data.get("sandboxEnabled", True),
                 constraints=data.get("constraints"),
                 abilities=data.get("abilities"),
             )

@@ -38,6 +38,8 @@ interface Props {
   workingDir?: string;
   skipPermissions?: boolean;
   onSkipPermissionsChange?: (enabled: boolean) => void;
+  sandboxEnabled?: boolean;
+  onSandboxChange?: (enabled: boolean) => void;
   onCompact?: () => void;
 }
 
@@ -86,7 +88,9 @@ const ToolbarBtn: React.FC<ToolbarBtnProps> = ({ icon, title, active, onClick, l
 
 const ChatInputInner: React.FC<Props> = ({
   onSend, onAbort, isStreaming, backends, activeBackendId, sessionId, workingDir,
-  skipPermissions = true, onSkipPermissionsChange, onCompact,
+  skipPermissions = true, onSkipPermissionsChange,
+  sandboxEnabled = true, onSandboxChange,
+  onCompact,
 }) => {
   const ref = useRef<HTMLTextAreaElement>(null);
   const { images, removeImage, clearImages } = useClipboardImage();
@@ -492,6 +496,12 @@ const ChatInputInner: React.FC<Props> = ({
           title="跳过确认"
           active={skipPermissions}
           onClick={() => onSkipPermissionsChange?.(!skipPermissions)}
+        />
+        <ToolbarBtn
+          icon="🔒"
+          title={sandboxEnabled ? "沙盒模式（已启用）— 文件操作限制在工作目录内" : "沙盒模式（已关闭）— 无路径限制"}
+          active={sandboxEnabled}
+          onClick={() => onSandboxChange?.(!sandboxEnabled)}
         />
         <ToolbarBtn
           icon="✨"

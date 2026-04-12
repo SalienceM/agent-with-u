@@ -156,6 +156,7 @@ class DashScopeImageBackend(ModelBackend):
         skip_permissions: Optional[bool] = None,
         on_permission_request: Optional[Callable] = None,
         constraints: Optional[str] = None,  # ★ Session-level constraints/rules/prompts
+        sandbox_enabled: bool = True,  # ★ 沙盒开关（图像后端不涉及文件操作，忽略）
     ) -> dict:
 
         def emit(dtype: str, **kw):

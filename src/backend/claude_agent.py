@@ -35,6 +35,7 @@ class ClaudeAgentBackend(ModelBackend):
         skip_permissions: Optional[bool] = None,
         on_permission_request: Optional[Callable[[PermissionRequest], Awaitable[bool]]] = None,
         constraints: Optional[str] = None,  # ★ Session-level constraints/rules/prompts
+        sandbox_enabled: bool = True,  # ★ 沙盒开关
     ) -> dict:
         self.clear_cancelled(session_id)
 
@@ -122,8 +123,8 @@ class ClaudeAgentBackend(ModelBackend):
             async def _wait_for_permission(tool_id: str, tool_name: str, tool_input: str) -> bool:
                 """等待权限确认，返回是否授权。"""
                 nonlocal _waiting_for_permission
-                # ★ Layer 2 沙盒校验：在权限检查之前执行，不受 skip_permissions 影响
-                if cwd and tool_name in SANDBOX_TOOLS:
+                # ★ Layer 2 沙盒校验：在权限检查之前执行，不受 skip_permissions 影响，受 sandbox_enabled 控制
+                if sandbox_enabled and cwd and tool_name in SANDBOX_TOOLS:
                     from .bridge_ws import validate_tool_sandbox
                     is_valid, reason = validate_tool_sandbox(tool_name, tool_input, cwd)
                     if not is_valid:
@@ -335,7 +336,7 @@ class ClaudeAgentBackend(ModelBackend):
                             # ★ 记录待确认 tool，等 content_block_stop 时输入完整再弹权限门 / 沙盒校验
                             _need_track = (
                                 (not skip_permissions and tool_name in PERMISSION_SENSITIVE_TOOLS)
-                                or tool_name in SANDBOX_TOOLS
+                                or (sandbox_enabled and tool_name in SANDBOX_TOOLS)
                             )
                             if _need_track:
                                 _pending_perm = {"id": tool_id, "name": tool_name, "parts": []}

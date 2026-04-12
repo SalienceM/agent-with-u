@@ -125,6 +125,7 @@ class ModelBackend(ABC):
         skip_permissions: Optional[bool] = None,
         on_permission_request: Optional[Callable[[PermissionRequest], Awaitable[bool]]] = None,
         constraints: Optional[str] = None,  # ★ Session-level constraints/rules/prompts
+        sandbox_enabled: bool = True,  # ★ 沙盒开关
     ) -> dict:
         ...
 

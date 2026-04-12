@@ -168,6 +168,8 @@ class Session:
     auto_continue: bool = True
     # ★ Skip permission confirmation for sensitive tools (Bash/Edit/Write)
     skip_permissions: bool = True
+    # ★ 沙盒模式：限制文件操作在 working_dir 范围内
+    sandbox_enabled: bool = True
     # Max continuation attempts
     max_continuations: int = 10
     # Track which backend config was used for each message
@@ -189,6 +191,7 @@ class Session:
             "agentSessionId": self.agent_session_id,
             "autoContinue": self.auto_continue,
             "skipPermissions": self.skip_permissions,
+            "sandboxEnabled": self.sandbox_enabled,
             "maxContinuations": self.max_continuations,
             "constraints": self.constraints,
             "abilities": self.abilities,

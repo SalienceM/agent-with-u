@@ -31,6 +31,7 @@ export const App: React.FC = () => {
   const [repoPanelEditing, setRepoPanelEditing] = useState(false);
   const [newSessionDialogOpen, setNewSessionDialogOpen] = useState(false);
   const [skipPermissions, setSkipPermissions] = useState(true);  // ★ 权限模式开关
+  const [sandboxEnabled, setSandboxEnabled] = useState(true);   // ★ 沙盒模式开关
   const [streamingSessions, setStreamingSessions] = useState<Set<string>>(new Set());  // ★ Per-session streaming state
   const [completedSessions, setCompletedSessions] = useState<Set<string>>(() => {
     // ★ 持久化：从 localStorage 恢复未确认的完成通知
@@ -127,9 +128,12 @@ export const App: React.FC = () => {
     setVisibleCount(6);  // ★ 切换 session 时重置为只显示最近几条
     api.loadSession(activeSessionId).then((session) => {
       setActiveSession(session);
-      // ★ 从 session 加载 skipPermissions 状态
+      // ★ 从 session 加载 skipPermissions / sandboxEnabled 状态
       if (session?.skipPermissions !== undefined) {
         setSkipPermissions(session.skipPermissions);
+      }
+      if (session?.sandboxEnabled !== undefined) {
+        setSandboxEnabled(session.sandboxEnabled);
       }
     });
   }, [activeSessionId]);
@@ -162,6 +166,18 @@ export const App: React.FC = () => {
     if (activeSessionId) {
       api.executeCommand({
         command: 'set_skip_permissions',
+        sessionId: activeSessionId,
+        backendId: activeBackendId,
+        args: { enabled },
+      });
+    }
+  }, [activeSessionId, activeBackendId]);
+
+  const handleSandboxChange = useCallback((enabled: boolean) => {
+    setSandboxEnabled(enabled);
+    if (activeSessionId) {
+      api.executeCommand({
+        command: 'set_sandbox_enabled',
         sessionId: activeSessionId,
         backendId: activeBackendId,
         args: { enabled },
@@ -793,6 +809,8 @@ export const App: React.FC = () => {
           workingDir={activeSession?.workingDir || undefined}
           skipPermissions={skipPermissions}
           onSkipPermissionsChange={handleSkipPermissionsChange}
+          sandboxEnabled={sandboxEnabled}
+          onSandboxChange={handleSandboxChange}
           onCompact={handleCompact}
         />
       </div>

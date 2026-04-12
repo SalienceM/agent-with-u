@@ -214,6 +214,7 @@ class ClaudeCodeOfficialBackend(ModelBackend):
         skip_permissions: Optional[bool] = None,
         on_permission_request: Optional[Callable[[PermissionRequest], Awaitable[bool]]] = None,
         constraints: Optional[str] = None,  # ★ Session-level constraints/rules/prompts
+        sandbox_enabled: bool = True,  # ★ 沙盒开关
     ) -> dict:
         self.clear_cancelled(session_id)
         _new_agent_sid: Optional[str] = agent_session_id
@@ -376,8 +377,8 @@ class ClaudeCodeOfficialBackend(ModelBackend):
                             "input": json.dumps(_tool_input, ensure_ascii=False),
                             "status": "running",
                         })
-                        # ★ Layer 2 沙盒检测：工具已执行，但可阻止后续操作
-                        if cwd:
+                        # ★ Layer 2 沙盒检测：工具已执行，但可阻止后续操作（受 sandbox_enabled 控制）
+                        if sandbox_enabled and cwd:
                             from .bridge_ws import validate_tool_sandbox
                             _ok, _reason = validate_tool_sandbox(_tool_name, _tool_input, cwd)
                             if not _ok:

@@ -953,6 +953,16 @@ class BridgeWS:
                 self._session_store.save(session, async_=False)
             return json.dumps({"status": "ok", "skipPermissions": session.skip_permissions if session else True})
 
+        elif command == "set_sandbox_enabled":
+            session = self._active_sessions.get(session_id)
+            if session:
+                session.sandbox_enabled = payload.get("args", {}).get("enabled", True)
+                # 沙盒状态变更后重新组装 constraints（开启时注入沙盒约束，关闭时移除）
+                abilities = session.abilities or {}
+                self._apply_session_abilities(session, abilities)
+                self._session_store.save(session, async_=False)
+            return json.dumps({"status": "ok", "sandboxEnabled": session.sandbox_enabled if session else True})
+
         return json.dumps({"status": "error", "message": f"未知命令: {command}"})
 
     # ── RPC: 会话管理 ────────────────────────────────────────────
@@ -1891,6 +1901,8 @@ except urllib.error.URLError as e:
         Layer 1 沙盒：根据 session.working_dir 生成文件系统边界约束文本。
         此约束会被注入到每次发送给 LLM 的 constraints 前缀中。
         """
+        if not getattr(session, "sandbox_enabled", True):
+            return None  # 沙盒已关闭
         wd = getattr(session, "working_dir", None)
         if not wd:
             return None
@@ -2675,8 +2687,8 @@ except urllib.error.URLError as e:
                 # ★ 权限回调：用于工具执行前的权限确认
                 async def _on_permission_request(req: PermissionRequest) -> bool:
                     """处理来自 backend 的权限请求，转发给前端等待确认。"""
-                    # ★ Layer 2 沙盒校验（在权限检查之前，不受 skip 影响）
-                    if session.working_dir:
+                    # ★ Layer 2 沙盒校验（在权限检查之前，不受 skip 影响；受 sandbox_enabled 控制）
+                    if session.sandbox_enabled and session.working_dir:
                         _ok, _reason = validate_tool_sandbox(req.tool_name, req.tool_input, session.working_dir)
                         if not _ok:
                             print(f"[bridge_ws] 🔒 沙盒拦截: {req.tool_name} — {_reason}",
@@ -2712,6 +2724,7 @@ except urllib.error.URLError as e:
                     "agent_session_id": use_agent_session,
                     "working_dir": session.working_dir,
                     "skip_permissions": skip_permissions,
+                    "sandbox_enabled": session.sandbox_enabled,
                     "on_permission_request": _on_permission_request,
                 }
                 # ★ API 类 backend：注入 Backend Skill 工具定义 + tool_use 回调
