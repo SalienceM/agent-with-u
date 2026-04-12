@@ -1121,6 +1121,12 @@ class BridgeWS:
         """返回孵化库中所有 skill，附带当前工作目录的激活状态。"""
         try:
             skills = self._skill_store.list_skills(working_dir)
+            # ★ 内置类型如 web-search 有动态 secrets schema，补充标记
+            for s in skills:
+                if not s.get("hasSecretsSchema"):
+                    skill_type = s.get("type", "")
+                    if skill_type in self._BUILTIN_SECRETS_SCHEMA:
+                        s["hasSecretsSchema"] = True
             return json.dumps(skills, ensure_ascii=False)
         except Exception as e:
             print(f"[BridgeWS] listSkills error: {e}", file=sys.stderr)
