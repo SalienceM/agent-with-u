@@ -1473,6 +1473,35 @@ class BridgeWS:
     # ═══════════════════════════════════════
     # ── Backend Skill 部署内容生成 ──────────────────────────
 
+    @staticmethod
+    def _resolve_python_exe() -> str | None:
+        """返回可用的 Python 解释器路径。
+        - 正常开发模式：直接用 sys.executable
+        - PyInstaller 打包模式：sys.executable 是 .exe，需要从 PATH 找系统 Python
+        - 都找不到时返回 None（调用方应改用 curl fallback）
+        """
+        if not getattr(sys, 'frozen', False):
+            return sys.executable.replace("\\", "/")
+        import shutil as _shutil
+        for name in ("python3", "python"):
+            found = _shutil.which(name)
+            if found:
+                return found.replace("\\", "/")
+        return None
+
+    def _build_skill_curl_cmd(self, skill_name: str, params: dict[str, str]) -> str:
+        """当系统无 Python 时，生成 curl 命令直接调用 skill HTTP API。"""
+        port = self._HTTP_API_PORT
+        payload_parts = [f'"skill":"{skill_name}"']
+        for key, placeholder in params.items():
+            payload_parts.append(f'"{key}":"{placeholder}"')
+        payload = '{' + ', '.join(payload_parts) + '}'
+        return (
+            f'curl -s -X POST http://127.0.0.1:{port}/api/skill-call '
+            f'-H "Content-Type: application/json" '
+            f"-d '{payload}'"
+        )
+
     def _generate_backend_skill_md(self, skill_name: str, skill_info: dict, *, is_image_backend: bool = False) -> str:
         """
         根据孵化库中的 Backend Skill 声明，生成部署版 SKILL.md。
@@ -1480,7 +1509,7 @@ class BridgeWS:
         """
         description = skill_info.get("description", f"Backend Skill: {skill_name}")
         input_schema = skill_info.get("inputSchema") or {}
-        python = sys.executable.replace("\\", "/")
+        python = self._resolve_python_exe()
         call_script = f".claude/skills/{skill_name}/_call.py"
 
         # 从 input_schema 提取参数列表
@@ -1505,14 +1534,26 @@ class BridgeWS:
             args_doc.append("- ref_image（可选）：参考图片的 URL（如用户已上传图片，应传入图片地址，用于图生图）")
             args_example.append('"<REF_IMAGE_URL>"')
 
-        # 基本命令
-        basic_cmd = f'"{python}" {call_script} "<{primary_field.upper()}>"'
-        # 完整命令（含可选参数）
-        full_cmd = f'"{python}" {call_script} {" ".join(args_example)}'
+        # 基本命令 & 完整命令（Python 模式 vs curl fallback）
+        if python:
+            basic_cmd = f'"{python}" {call_script} "<{primary_field.upper()}>"'
+            full_cmd = f'"{python}" {call_script} {" ".join(args_example)}'
+        else:
+            # PyInstaller 打包且系统无 Python —— 用 curl 直接调 HTTP API
+            basic_cmd = self._build_skill_curl_cmd(
+                skill_name, {primary_field: f"<{primary_field.upper()}>"})
+            full_params: dict[str, str] = {primary_field: f"<{primary_field.upper()}>"}
+            for pname in props:
+                if pname != primary_field:
+                    full_params[pname] = f"<{pname.upper()}>"
+            if is_image_backend:
+                full_params["ref_image"] = "<REF_IMAGE_URL>"
+            full_cmd = self._build_skill_curl_cmd(skill_name, full_params)
 
         extra_params = ""
         if args_doc:
-            extra_params = "\n可选参数（按顺序追加）：\n" + "\n".join(args_doc) + "\n"
+            params_label = "可选参数（按顺序追加）：" if python else "可选参数（在 JSON payload 中添加对应字段）："
+            extra_params = f"\n{params_label}\n" + "\n".join(args_doc) + "\n"
             extra_params += f"\n完整示例：\n```bash\n{full_cmd}\n```\n"
 
         ref_image_hint = ""
@@ -1670,7 +1711,7 @@ except urllib.error.URLError as e:
             if not info.get("backend") and not info.get("type"):
                 continue  # 传统指令型 Skill，无需注入
             desc = info.get("description", sname)
-            python_exe = sys.executable.replace("\\", "/")
+            python_exe = self._resolve_python_exe()
             call_script = f".claude/skills/{sname}/_call.py"
             input_schema = info.get("inputSchema") or {}
             required_list = (input_schema.get("required") or
@@ -1686,14 +1727,26 @@ except urllib.error.URLError as e:
                     sk_is_image = True
                     has_image_backend_skill = True
 
+            # 根据是否有 Python 解释器选择 Bash 命令格式
+            if python_exe:
+                bash_cmd = f'"{python_exe}" {call_script} "<{primary_field.upper()}>"'
+            else:
+                bash_cmd = self._build_skill_curl_cmd(
+                    sname, {primary_field: f"<{primary_field.upper()}>"})
+
             hint = (
                 f'- **{sname}**：{desc}\n'
-                f'  → Bash: `"{python_exe}" {call_script} "<{primary_field.upper()}>"`'
+                f'  → Bash: `{bash_cmd}`'
             )
             if sk_is_image:
+                if python_exe:
+                    img_cmd = f'"{python_exe}" {call_script} "<{primary_field.upper()}>" "<REF_IMAGE_URL>"'
+                else:
+                    img_cmd = self._build_skill_curl_cmd(
+                        sname, {primary_field: f"<{primary_field.upper()}>", "ref_image": "<REF_IMAGE_URL>"})
                 hint += (
                     f'\n  → 图生图（参考图）Bash: '
-                    f'`"{python_exe}" {call_script} "<{primary_field.upper()}>" "<REF_IMAGE_URL>"`'
+                    f'`{img_cmd}`'
                     f'\n  → 原生工具调用时必须把参考图 URL 填入 `ref_image` 参数'
                     f'（不要只写在 prompt 里）'
                 )
