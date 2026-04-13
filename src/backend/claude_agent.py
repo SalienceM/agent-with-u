@@ -296,6 +296,8 @@ class ClaudeAgentBackend(ModelBackend):
                     "StreamEvent": "stream_event",
                     "AssistantMessage": "assistant",
                     "TaskStartedMessage": "task_started",
+                    "TaskProgressMessage": "task_progress",
+                    "TaskNotificationMessage": "task_notification",
                     "UserMessage": "user",
                     "ResultMessage": "result",
                 }
@@ -456,7 +458,7 @@ class ClaudeAgentBackend(ModelBackend):
                     emit("done", **({"usage": usage_dict} if usage_dict else {}))
                     _done_emitted = True  # 不 break，让生成器自然耗尽（线程会自行结束）
 
-                elif msg_type not in ("task_started",):
+                elif msg_type not in ("task_started", "task_progress", "task_notification"):
                     print(f"[ClaudeAgent] 未处理的消息类型: {msg_type}",
                           file=sys.stderr, flush=True)
 
