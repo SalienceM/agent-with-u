@@ -868,6 +868,14 @@ class BridgeWS:
         """前端心跳探针，保持 WebSocket 活跃 + 快速检测连接是否存活。"""
         return "pong"
 
+    def _rpc_getAppVersion(self) -> str:
+        """返回应用版本号（格式 YY.MM.DD），由 build_all.bat 在构建时写入 src/_version.py。"""
+        try:
+            from .._version import __version__
+            return str(__version__)
+        except Exception:
+            return "0.0.0-dev"
+
     # ── RPC: 剪贴板 ─────────────────────────────────────────────
 
     def _rpc_readClipboardImage(self) -> str:

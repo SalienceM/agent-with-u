@@ -633,6 +633,12 @@ export const api = {
     return () => { permissionRequestCallbacks = permissionRequestCallbacks.filter((cb) => cb !== callback); };
   },
 
+  /** 获取应用版本号（格式 YY.MM.DD，由 build_all.bat 构建时写入）。 */
+  async getAppVersion(): Promise<string> {
+    const result = await call('getAppVersion');
+    return typeof result === 'string' && result ? result : '0.0.0-dev';
+  },
+
   /** 打开外部 cmd 窗口实时刷日志 */
   async openLogViewer(): Promise<void> {
     if (isTauri()) {
@@ -718,6 +724,7 @@ function mockDispatch(method: string, params: any[]): any {
     case 'setPromptDefault': return JSON.stringify({ status: 'ok' });
     case 'setSkillDefault': return JSON.stringify({ status: 'ok' });
     case 'getDefaultAbilities': return JSON.stringify({ skills: [], prompts: [] });
+    case 'getAppVersion': return '0.0.0-dev';
     default: return null;
   }
 }

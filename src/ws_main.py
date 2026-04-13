@@ -20,6 +20,11 @@ import websockets
 from .backend.bridge_ws import BridgeWS
 from .backend.clipboard import ClipboardHandler
 
+try:
+    from ._version import __version__ as APP_VERSION
+except Exception:
+    APP_VERSION = "0.0.0-dev"
+
 WS_HOST = "127.0.0.1"
 WS_PORT = 44321
 
@@ -227,6 +232,7 @@ def _ensure_single_instance(port: int) -> None:
 async def main():
     # 初始化日志系统
     log_file = setup_logging()
+    logging.info(f"[ws_main] AgentWithU backend v{APP_VERSION} starting")
     logging.info(f"[ws_main] Log file: {log_file}")
 
     patch_npm_path()

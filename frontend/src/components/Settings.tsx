@@ -1,6 +1,7 @@
-import React, { useRef, useCallback } from 'react';
+import React, { useRef, useCallback, useEffect, useState } from 'react';
 import type { AppConfig, ThemeType } from '../hooks/useConfig';
 import { themes } from '../hooks/useConfig';
+import { api } from '../api';
 
 interface SettingsProps {
   isOpen: boolean;
@@ -26,6 +27,14 @@ export const Settings: React.FC<SettingsProps> = ({
   onImportData,
 }) => {
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const [appVersion, setAppVersion] = useState<string>('');
+
+  useEffect(() => {
+    if (!isOpen) return;
+    let cancelled = false;
+    api.getAppVersion().then((v) => { if (!cancelled) setAppVersion(v); }).catch(() => {});
+    return () => { cancelled = true; };
+  }, [isOpen]);
 
   const handleFileChange = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -267,7 +276,9 @@ export const Settings: React.FC<SettingsProps> = ({
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
           <div>
             <span style={{ fontSize: 13, fontWeight: 600, color: 'var(--theme-text)' }}>AgentWithU</span>
-            <span style={{ fontSize: 12, color: 'var(--theme-text-muted)', marginLeft: 8 }}>v0.1.0</span>
+            <span style={{ fontSize: 12, color: 'var(--theme-text-muted)', marginLeft: 8 }}>
+              v{appVersion || '…'}
+            </span>
           </div>
           <a
             href="https://github.com/SalienceM/agent-with-u"

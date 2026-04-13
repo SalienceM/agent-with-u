@@ -89,6 +89,10 @@ echo [INFO] New version will be: !NEW_VERSION!
 python -c "import json; f='src-tauri/tauri.conf.json'; d=json.load(open(f,encoding='utf-8')); d['version']='!NEW_VERSION!'; open(f,'w',encoding='utf-8').write(json.dumps(d,ensure_ascii=False,indent=2)+'\n')"
 if errorlevel 1 ( echo [WARN] Version update failed, continuing with current version )
 echo [OK] Updated tauri.conf.json version to !NEW_VERSION!
+:: Sync version into Python package so the backend can log / expose it at runtime
+python -c "open('src/_version.py','w',encoding='utf-8').write('# auto-written by build_all.bat' + chr(10) + '__version__ = ' + chr(34) + '!NEW_VERSION!' + chr(34) + chr(10))"
+if errorlevel 1 ( echo [WARN] src/_version.py update failed )
+echo [OK] Updated src/_version.py to !NEW_VERSION!
 :: ============================================================
 :: Step 1: PyInstaller - package Python sidecar
 :: ============================================================
