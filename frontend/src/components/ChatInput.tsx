@@ -22,6 +22,10 @@ if (typeof document !== 'undefined' && !document.getElementById('chat-input-css'
       0%, 100% { opacity: 1; }
       50%       { opacity: 0.4; }
     }
+    @keyframes dialogSlideIn {
+      from { opacity: 0; transform: perspective(900px) rotateX(-14deg) scale(0.96) translateY(-8px); }
+      to   { opacity: 1; transform: perspective(900px) rotateX(0deg)   scale(1)    translateY(0); }
+    }
   `;
   document.head.appendChild(s);
 }
@@ -146,11 +150,13 @@ const ChatInputInner: React.FC<Props> = ({
   workingDirRef.current = workingDir;
 
   // ── 清理上下文 ──
+  const [showNewSessionConfirm, setShowNewSessionConfirm] = useState(false);
   const handleCompact = useCallback(() => {
     // ★ 二次确认：新会话会清空上下文，误触代价很大
-    if (!window.confirm('确定要开始新会话吗？\n\n当前对话的上下文将被清空（历史消息在侧边栏仍可访问）。')) {
-      return;
-    }
+    setShowNewSessionConfirm(true);
+  }, []);
+  const confirmNewSession = useCallback(() => {
+    setShowNewSessionConfirm(false);
     onCompact?.();
   }, [onCompact]);
 
@@ -687,6 +693,34 @@ const ChatInputInner: React.FC<Props> = ({
           <button onClick={handleSend} style={sendBtnStyle} title="Send (Enter)">🚀</button>
         )}
       </div>
+
+      {/* 新会话确认对话框（风格与 Sidebar 删除会话保持一致） */}
+      {showNewSessionConfirm && (
+        <div style={confirmOverlayStyle} onClick={() => setShowNewSessionConfirm(false)}>
+          <div
+            style={{ ...confirmPanelStyle, animation: 'dialogSlideIn 0.28s cubic-bezier(0.22,0.61,0.36,1)' }}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <h3 style={{ margin: '0 0 12px 0', fontSize: 16, fontWeight: 600, color: 'var(--theme-text, #1f2328)' }}>
+              开启新会话
+            </h3>
+            <p style={{ fontSize: 13, color: 'var(--theme-text-muted, #656d76)', margin: '0 0 16px 0', lineHeight: 1.5 }}>
+              当前会话的上下文将被清空，Claude 不再记得之前的对话内容。
+            </p>
+            <p style={{ fontSize: 12, color: 'var(--theme-text-muted, #656d76)', margin: '0 0 16px 0' }}>
+              历史消息仍保留在侧边栏，可随时回看。
+            </p>
+            <div style={{ display: 'flex', gap: 8 }}>
+              <button onClick={confirmNewSession} style={confirmBtnStyle}>
+                开始
+              </button>
+              <button onClick={() => setShowNewSessionConfirm(false)} style={cancelBtnStyle}>
+                取消
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 };
@@ -804,4 +838,30 @@ const filePickerFooterStyle: React.CSSProperties = {
   color: 'var(--theme-text-muted, #656d76)',
   borderTop: '1px solid var(--theme-border, rgba(0,0,0,0.08))',
   userSelect: 'none' as const,
+};
+
+// ── 确认对话框样式（与 Sidebar 删除会话保持一致）────────────────────────────
+const confirmOverlayStyle: React.CSSProperties = {
+  position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.5)',
+  display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 1000,
+};
+
+const confirmPanelStyle: React.CSSProperties = {
+  background: 'var(--theme-bg-secondary, #ffffff)',
+  border: '1px solid var(--theme-border, rgba(0,0,0,0.15))',
+  borderRadius: 12,
+  padding: 24, width: '90%', maxWidth: 400,
+  boxShadow: '0 4px 20px rgba(0,0,0,0.15)',
+};
+
+const confirmBtnStyle: React.CSSProperties = {
+  flex: 1, padding: 10, borderRadius: 8,
+  background: 'var(--theme-accent, #0969da)', border: 'none',
+  color: '#fff', fontSize: 14, fontWeight: 500, cursor: 'pointer',
+};
+
+const cancelBtnStyle: React.CSSProperties = {
+  flex: 1, padding: 10, borderRadius: 8,
+  background: 'var(--theme-bg-secondary, #f6f8fa)', border: '1px solid var(--theme-border, rgba(0,0,0,0.15))',
+  color: 'var(--theme-text, #1f2328)', fontSize: 14, cursor: 'pointer',
 };
