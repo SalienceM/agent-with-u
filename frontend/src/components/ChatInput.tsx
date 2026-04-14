@@ -147,6 +147,10 @@ const ChatInputInner: React.FC<Props> = ({
 
   // ── 清理上下文 ──
   const handleCompact = useCallback(() => {
+    // ★ 二次确认：新会话会清空上下文，误触代价很大
+    if (!window.confirm('确定要开始新会话吗？\n\n当前对话的上下文将被清空（历史消息在侧边栏仍可访问）。')) {
+      return;
+    }
     onCompact?.();
   }, [onCompact]);
 
