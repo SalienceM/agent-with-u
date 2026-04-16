@@ -12,6 +12,46 @@ from .base import ModelBackend, StreamDelta, PermissionRequest, _exc_msg
 STREAM_CHUNK_SIZE = 4        # characters per chunk
 STREAM_CHUNK_DELAY = 0.015   # seconds between chunks (~266 chars/s)
 
+# ★ Phase-1 诊断：SDK 把 Task 工具产生的事件包装成 TaskStartedMessage /
+# TaskProgressMessage / TaskNotificationMessage，但具体字段没有稳定文档。
+# 为了反推 schema，前 _TASK_DIAG_MAX 次遇到每种消息时，把完整 repr + 属性表
+# 打到日志；达到次数后自动沉默，避免刷屏。
+_TASK_DIAG_COUNT: dict[str, int] = {}
+_TASK_DIAG_MAX = 3
+
+
+def _diag_log_task_msg(msg_type: str, message) -> None:
+    """Dump a task_* message's repr + attribute table to stderr, at most _TASK_DIAG_MAX times per type."""
+    n = _TASK_DIAG_COUNT.get(msg_type, 0)
+    if n >= _TASK_DIAG_MAX:
+        return
+    _TASK_DIAG_COUNT[msg_type] = n + 1
+    try:
+        attrs = {}
+        for k in dir(message):
+            if k.startswith("_"):
+                continue
+            try:
+                v = getattr(message, k, None)
+            except Exception:
+                continue
+            if callable(v):
+                continue
+            attrs[k] = repr(v)[:200]
+    except Exception as e:
+        attrs = {"<attr_dump_failed>": str(e)}
+    try:
+        attrs_json = json.dumps(attrs, ensure_ascii=False, default=str)[:800]
+    except Exception:
+        attrs_json = str(attrs)[:800]
+    print(
+        f"[ClaudeAgent][diag] {msg_type} #{n+1}/{_TASK_DIAG_MAX} "
+        f"class={type(message).__name__} "
+        f"repr={repr(message)[:400]} "
+        f"attrs={attrs_json}",
+        file=sys.stderr, flush=True,
+    )
+
 
 class ClaudeAgentBackend(ModelBackend):
     """
@@ -68,6 +108,11 @@ class ClaudeAgentBackend(ModelBackend):
             # ★ 始终确保 Skill 工具可用，使 ~/.claude/skills/ 和 .claude/skills/ 中的 skill 可被调用
             if "Skill" not in tools:
                 tools.append("Skill")
+            # ★ Phase-1：开启 Task 工具（subagent 派发），让日志中观察到的
+            # TaskStartedMessage / TaskProgressMessage / TaskNotificationMessage
+            # 成为"合法路径"。字段 schema 由 _diag_log_task_msg 反推。
+            if "Task" not in tools:
+                tools.append("Task")
             cwd = working_dir or getattr(self.config, "working_dir", None) or "."
             if skip_permissions is None:
                 skip_permissions = getattr(self.config, "skip_permissions", True)
@@ -458,7 +503,12 @@ class ClaudeAgentBackend(ModelBackend):
                     emit("done", **({"usage": usage_dict} if usage_dict else {}))
                     _done_emitted = True  # 不 break，让生成器自然耗尽（线程会自行结束）
 
-                elif msg_type not in ("task_started", "task_progress", "task_notification"):
+                elif msg_type in ("task_started", "task_progress", "task_notification"):
+                    # ★ Phase-1：仅反推 schema，暂不转发到前端。Phase-2 会基于
+                    # 这里收集到的字段生成 subagent_* StreamDelta。
+                    _diag_log_task_msg(msg_type, message)
+
+                else:
                     print(f"[ClaudeAgent] 未处理的消息类型: {msg_type}",
                           file=sys.stderr, flush=True)
 
