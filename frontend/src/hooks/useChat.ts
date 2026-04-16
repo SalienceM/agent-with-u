@@ -11,6 +11,17 @@ import {
   type StreamState,
 } from './useStreamState';
 
+export interface SubagentInfo {
+  taskId?: string;
+  description?: string;
+  taskType?: string | null;
+  status?: 'running' | 'completed' | 'failed' | 'stopped' | string;
+  lastToolName?: string | null;
+  summary?: string | null;
+  outputFile?: string | null;
+  usage?: { totalTokens?: number; toolUses?: number; durationMs?: number };
+}
+
 export interface ToolCall {
   id?: string;
   name: string;
@@ -20,6 +31,8 @@ export interface ToolCall {
   startTime?: number;  // ★ Track start time for duration calculation
   duration?: number;   // ★ Duration in milliseconds
   diff?: { path: string; old: string; new: string };  // ★ Diff data for Edit tools
+  parentToolUseId?: string;  // ★ 父 Task tool_use.id（当此工具由子 agent 触发时）
+  subagent?: SubagentInfo;   // ★ 仅父级 Task tool 才携带：子 agent 的生命周期元数据
 }
 
 // ★ 有序内容块：按到达顺序记录 thinking / tool / text 的出现

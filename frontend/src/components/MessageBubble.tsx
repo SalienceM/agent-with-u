@@ -260,12 +260,19 @@ function extractImagesFromOutput(output: string): { images: Array<{src: string; 
   return { images, text: textParts.join('\n').trim() };
 }
 
-const ToolCallBlock: React.FC<{ tc: ToolCall }> = memo(function ToolCallBlock({ tc }) {
+const ToolCallBlock: React.FC<{ tc: ToolCall; allTools?: ToolCall[] }> = memo(function ToolCallBlock({ tc, allTools }) {
   // ★ 从 tool output 中提取 markdown 图片，支持 generate-image 等 skill 结果
   const { images: outputImages, text: outputText } = tc.output ? extractImagesFromOutput(tc.output) : { images: [], text: tc.output || '' };
 
-  // 有图片时默认展开，让用户直接看到结果
-  const [expanded, setExpanded] = useState(outputImages.length > 0);
+  // ★ Task（子 agent 派发器）默认展开，让用户看到子 agent 正在干什么
+  const isTask = tc.name === 'Task';
+  const subagent = tc.subagent;
+  const childTools = (isTask && tc.id && allTools)
+    ? allTools.filter((t) => t.parentToolUseId === tc.id)
+    : [];
+
+  // 有图片、是 Task、或有子工具时默认展开
+  const [expanded, setExpanded] = useState(outputImages.length > 0 || isTask || childTools.length > 0);
 
   // ★ 流式阶段：tc.output 到达时（从空变为含图片）自动展开
   useEffect(() => {
@@ -307,6 +314,60 @@ const ToolCallBlock: React.FC<{ tc: ToolCall }> = memo(function ToolCallBlock({ 
       </div>
       {expanded && (
         <div style={sectionBody}>
+          {/* ★ Task 子 agent 元信息条：description / last tool / usage */}
+          {isTask && subagent && (
+            <div
+              style={{
+                marginBottom: 8,
+                padding: '6px 8px',
+                borderRadius: 6,
+                background: 'var(--theme-bg-muted, rgba(175,184,193,0.12))',
+                border: '1px solid var(--theme-border, rgba(0,0,0,0.08))',
+                fontSize: 11,
+                display: 'flex',
+                flexWrap: 'wrap',
+                gap: '4px 10px',
+                alignItems: 'center',
+              }}
+            >
+              <span style={{ fontWeight: 600, color: 'var(--theme-text, #1f2328)' }}>
+                🤖 subagent
+              </span>
+              {subagent.description && (
+                <span style={{ color: 'var(--theme-text, #1f2328)' }}>
+                  {subagent.description}
+                </span>
+              )}
+              {subagent.taskType && (
+                <span style={{ color: 'var(--theme-text-muted, #656d76)' }}>
+                  · {subagent.taskType}
+                </span>
+              )}
+              {subagent.lastToolName && subagent.status === 'running' && (
+                <span style={{ color: 'var(--theme-text-muted, #656d76)' }}>
+                  · 正在: <code style={{ fontSize: 10 }}>{subagent.lastToolName}</code>
+                </span>
+              )}
+              {subagent.usage && (
+                <span style={{ color: 'var(--theme-text-muted, #656d76)', marginLeft: 'auto' }}>
+                  {subagent.usage.toolUses !== undefined && `🔧 ${subagent.usage.toolUses}`}
+                  {subagent.usage.totalTokens !== undefined && ` · ${subagent.usage.totalTokens} tok`}
+                  {subagent.usage.durationMs !== undefined && ` · ${formatDuration(subagent.usage.durationMs)}`}
+                </span>
+              )}
+              {subagent.summary && (
+                <div style={{ width: '100%', marginTop: 4, color: 'var(--theme-text, #1f2328)' }}>
+                  <span style={{ fontWeight: 600 }}>小结: </span>{subagent.summary}
+                </div>
+              )}
+              {subagent.outputFile && (
+                <div style={{ width: '100%', color: 'var(--theme-text-muted, #656d76)' }}>
+                  <span style={{ fontWeight: 600 }}>output: </span>
+                  <code style={{ fontSize: 10 }}>{subagent.outputFile}</code>
+                </div>
+              )}
+            </div>
+          )}
           {/* ★ Edit/Write 工具优先展示 Diff 视图，支持后端注入和前端解析两种来源 */}
           {diffData ? (
             <DiffView diff={diffData} />
@@ -317,6 +378,21 @@ const ToolCallBlock: React.FC<{ tc: ToolCall }> = memo(function ToolCallBlock({ 
                 <pre style={codeBlock}>{tc.input}</pre>
               </div>
             )
+          )}
+          {/* ★ 子 agent 内部工具：以缩进的嵌套卡片渲染 */}
+          {childTools.length > 0 && (
+            <div
+              style={{
+                marginTop: 6,
+                paddingLeft: 12,
+                borderLeft: '2px solid var(--theme-accent, #58a6ff)',
+              }}
+            >
+              <div style={{ ...labelStyle, marginBottom: 4 }}>SUBAGENT TOOLS ({childTools.length})</div>
+              {childTools.map((child, i) => (
+                <ToolCallBlock key={`child-${child.id || child.name}-${i}`} tc={child} allTools={allTools} />
+              ))}
+            </div>
           )}
           {tc.output && (
             <div style={{ marginTop: diffData ? 6 : 0 }}>
@@ -754,7 +830,7 @@ function MessageBubbleInner({
             }
             if (block.type === 'tool' && message.toolCalls && block.toolIndex !== undefined) {
               const tc = message.toolCalls[block.toolIndex];
-              return tc ? <ToolCallBlock key={`blk-${i}`} tc={tc} /> : null;
+              return tc ? <ToolCallBlock key={`blk-${i}`} tc={tc} allTools={message.toolCalls} /> : null;
             }
             if (block.type === 'text') {
               return contentHtml ? (
@@ -779,9 +855,11 @@ function MessageBubbleInner({
             )}
             {!isUser && message.toolCalls && message.toolCalls.length > 0 && (
               <div style={{ marginBottom: message.content ? 8 : 0 }}>
-                {message.toolCalls.map((tc, i) => (
-                  <ToolCallBlock key={`${tc.id || tc.name}-${i}`} tc={tc} />
-                ))}
+                {message.toolCalls
+                  .filter((tc) => !tc.parentToolUseId)
+                  .map((tc, i) => (
+                    <ToolCallBlock key={`${tc.id || tc.name}-${i}`} tc={tc} allTools={message.toolCalls} />
+                  ))}
               </div>
             )}
             {contentHtml ? (

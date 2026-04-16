@@ -138,13 +138,17 @@ export function processStreamDelta(sessionId: string, delta: any): {
     }
 
     case 'tool_start': {
+      // ★ 仅把"顶层"工具（无 parentToolUseId）计入 finishRunningTools 的判断；
+      // 子 agent 内部工具不会阻塞父工具显示，因为父 Task 工具仍然 running。
       finishRunningTools();
+      const parentToolUseId = delta.toolCall?.parentToolUseId || undefined;
       const tc: ToolCall = {
         id: delta.toolCall?.id || '',
         name: delta.toolCall?.name || 'unknown',
         input: delta.toolCall?.input || '',
         status: 'running',
         startTime: Date.now(),
+        ...(parentToolUseId ? { parentToolUseId } : {}),
       };
       const exists = tc.id && state.toolCalls.some((t) => t.id === tc.id);
       state.toolCalls = exists
@@ -152,7 +156,8 @@ export function processStreamDelta(sessionId: string, delta: any): {
             t.id === tc.id ? { ...t, input: tc.input || t.input } : t
           )
         : [...state.toolCalls, tc];
-      if (!exists) {
+      // ★ 只有顶层工具才进 contentBlocks；子 agent 内部工具通过 parentToolUseId 挂到父 Task 节点下
+      if (!exists && !parentToolUseId) {
         state.contentBlocks = [
           ...state.contentBlocks,
           { type: 'tool', toolIndex: state.toolCalls.length - 1 },
@@ -163,9 +168,42 @@ export function processStreamDelta(sessionId: string, delta: any): {
 
     case 'tool_input': {
       const inputDelta = delta.toolCall?.inputDelta || '';
-      if (state.toolCalls.length > 0 && inputDelta) {
-        const last = state.toolCalls[state.toolCalls.length - 1];
-        last.input = (last.input || '') + inputDelta;
+      const tid = delta.toolCall?.id || '';
+      if (inputDelta) {
+        // ★ 按 id 精确定位；父/子 agent 交织时不能用数组末尾
+        let target: ToolCall | undefined;
+        if (tid) target = state.toolCalls.find((t) => t.id === tid);
+        if (!target && state.toolCalls.length > 0) {
+          target = state.toolCalls[state.toolCalls.length - 1];
+        }
+        if (target) {
+          target.input = (target.input || '') + inputDelta;
+        }
+      }
+      break;
+    }
+
+    case 'subagent_start':
+    case 'subagent_progress':
+    case 'subagent_done': {
+      const sub = delta.subagent || {};
+      const parentId = sub.parentToolUseId;
+      if (parentId) {
+        state.toolCalls = state.toolCalls.map((tc) => {
+          if (tc.id !== parentId) return tc;
+          const merged = { ...(tc.subagent || {}), ...sub };
+          // 从 payload 中剥离 parentToolUseId，它已经在 ToolCall 本身用不到
+          delete (merged as any).parentToolUseId;
+          let next: ToolCall = { ...tc, subagent: merged };
+          if (delta.type === 'subagent_done') {
+            const subStatus = sub.status || 'completed';
+            next.status = subStatus === 'failed' ? 'error' : 'done';
+            if (tc.startTime && next.duration === undefined) {
+              next.duration = Date.now() - tc.startTime;
+            }
+          }
+          return next;
+        });
       }
       break;
     }
