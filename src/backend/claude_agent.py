@@ -151,23 +151,19 @@ class ClaudeAgentBackend(ModelBackend):
             # SDK 支持通过 yield Anthropic content blocks 的方式直接传递图片
             has_images = bool(images)
 
-            # ★ 权限门控状态
-            _permission_event = asyncio.Event()
-            _permission_granted = True
-            # ★ 追踪当前正在流式输入的 tool_use block，用于在 content_block_stop 时拿到完整 input
-            # 现在同时用于权限门控和沙盒校验
-            _pending_perm: dict | None = None   # {"id": str, "name": str, "parts": list[str]}
-            _waiting_for_permission = False
+            # ★ 权限门控状态 —— Phase-2：按 tool_id 隔离，防止父/子 agent tool_use 交织时互相覆盖
+            # 每个正在"流式累积输入"的 tool_use 都拥有自己的 pending 条目：
+            #   tool_id → {"name", "parts": list[str], "parentToolUseId": str | None}
+            _pending_perms: dict[str, dict] = {}
+            # ★ 用于把 content_block_delta（只带 index / uuid）路由回正确的 tool_id
+            #   (message_uuid, block_index) → tool_id
+            _block_idx_to_tool: dict[tuple[str, int], str] = {}
+            # ★ Task tool_use.id → subagent task_id（由 TaskStartedMessage 建立）
+            _tool_use_to_task: dict[str, str] = {}
 
-            def _set_permission_result(granted: bool):
-                """设置权限结果并解除等待。"""
-                nonlocal _permission_granted
-                _permission_granted = granted
-                _permission_event.set()
-
-            async def _wait_for_permission(tool_id: str, tool_name: str, tool_input: str) -> bool:
-                """等待权限确认，返回是否授权。"""
-                nonlocal _waiting_for_permission
+            async def _wait_for_permission(tool_id: str, tool_name: str, tool_input: str,
+                                           parent_tool_use_id: Optional[str] = None) -> bool:
+                """等待权限确认，返回是否授权。每次调用拥有独立的 PermissionRequest，天然支持并发。"""
                 # ★ Layer 2 沙盒校验：在权限检查之前执行，不受 skip_permissions 影响，受 sandbox_enabled 控制
                 if sandbox_enabled and cwd and tool_name in SANDBOX_TOOLS:
                     from .bridge_ws import validate_tool_sandbox
@@ -184,24 +180,18 @@ class ClaudeAgentBackend(ModelBackend):
                 if not on_permission_request:
                     return True
 
-                # 发送权限请求 delta 给前端
-                emit("permission_request", tool_call={
+                # 发送权限请求 delta 给前端（带 parentToolUseId，方便 UI 归属到子 agent）
+                perm_payload: dict = {
                     "id": tool_id,
                     "name": tool_name,
                     "input": tool_input,
-                })
+                }
+                if parent_tool_use_id:
+                    perm_payload["parentToolUseId"] = parent_tool_use_id
+                emit("permission_request", tool_call=perm_payload)
 
-                # 等待前端响应
-                _waiting_for_permission = True
-                _permission_event.clear()
-                try:
-                    # 创建权限请求对象
-                    req = PermissionRequest(session_id, message_id, tool_id, tool_name, tool_input)
-                    granted = await on_permission_request(req)
-                    _permission_granted = granted
-                    return granted
-                finally:
-                    _waiting_for_permission = False
+                req = PermissionRequest(session_id, message_id, tool_id, tool_name, tool_input)
+                return await on_permission_request(req)
 
             async def _build_prompt():
                 # ★ 注入约束/提示词到 prompt 中
@@ -353,9 +343,12 @@ class ClaudeAgentBackend(ModelBackend):
                 if msg_type == "stream_event":
                     evt = getattr(message, "event", {})
                     etype = evt.get("type", "")
+                    _msg_uuid = getattr(message, "uuid", "") or ""
+                    _parent_tool_use_id = getattr(message, "parent_tool_use_id", None)
                     if etype == "content_block_delta":
                         delta = evt.get("delta", {})
                         dtype = delta.get("type", "")
+                        idx = evt.get("index", -1)
                         if dtype == "text_delta":
                             emit("text_delta", text=delta.get("text", ""))
                         elif dtype == "thinking_delta":
@@ -365,37 +358,57 @@ class ClaudeAgentBackend(ModelBackend):
                         elif dtype == "input_json_delta":
                             partial = delta.get("partial_json", "")
                             if partial:
-                                emit("tool_input", tool_call={"inputDelta": partial})
-                                # ★ 同步累积到 _pending_perm，以便 content_block_stop 时拿到完整 input
-                                if _pending_perm is not None:
-                                    _pending_perm["parts"].append(partial)
+                                # ★ 通过 (uuid, block_index) 路由回对应的 tool_id，避免父/子 agent 交织时错配
+                                _tid = _block_idx_to_tool.get((_msg_uuid, idx))
+                                tc_payload: dict = {"inputDelta": partial}
+                                if _tid:
+                                    tc_payload["id"] = _tid
+                                if _parent_tool_use_id:
+                                    tc_payload["parentToolUseId"] = _parent_tool_use_id
+                                emit("tool_input", tool_call=tc_payload)
+                                # ★ 同步累积到对应 tool_id 的 pending 条目，以便 content_block_stop 时拿到完整 input
+                                if _tid and _tid in _pending_perms:
+                                    _pending_perms[_tid]["parts"].append(partial)
                     elif etype == "content_block_start":
                         block = evt.get("content_block", {})
+                        idx = evt.get("index", -1)
                         if block.get("type") == "tool_use":
                             tool_id = block.get("id", "")
                             tool_name = block.get("name", "")
-                            emit("tool_start", tool_call={
+                            # ★ 建立 (uuid, index) → tool_id 映射，供后续 delta / stop 路由
+                            if tool_id and idx >= 0:
+                                _block_idx_to_tool[(_msg_uuid, idx)] = tool_id
+                            start_payload: dict = {
                                 "id": tool_id,
                                 "name": tool_name,
                                 "input": "",
                                 "status": "running",
-                            })
+                            }
+                            if _parent_tool_use_id:
+                                start_payload["parentToolUseId"] = _parent_tool_use_id
+                            emit("tool_start", tool_call=start_payload)
                             # ★ 记录待确认 tool，等 content_block_stop 时输入完整再弹权限门 / 沙盒校验
                             _need_track = (
                                 (not skip_permissions and tool_name in PERMISSION_SENSITIVE_TOOLS)
                                 or (sandbox_enabled and tool_name in SANDBOX_TOOLS)
                             )
-                            if _need_track:
-                                _pending_perm = {"id": tool_id, "name": tool_name, "parts": []}
-                            else:
-                                _pending_perm = None
+                            if _need_track and tool_id:
+                                _pending_perms[tool_id] = {
+                                    "name": tool_name,
+                                    "parts": [],
+                                    "parent_tool_use_id": _parent_tool_use_id,
+                                }
                     elif etype == "content_block_stop":
                         # ★ 工具输入已完整，现在才发起权限确认
-                        if _pending_perm is not None:
-                            perm = _pending_perm
-                            _pending_perm = None
+                        idx = evt.get("index", -1)
+                        _tid = _block_idx_to_tool.pop((_msg_uuid, idx), None) if idx >= 0 else None
+                        if _tid and _tid in _pending_perms:
+                            perm = _pending_perms.pop(_tid)
                             full_input = "".join(perm["parts"])
-                            granted = await _wait_for_permission(perm["id"], perm["name"], full_input)
+                            granted = await _wait_for_permission(
+                                _tid, perm["name"], full_input,
+                                parent_tool_use_id=perm.get("parent_tool_use_id"),
+                            )
                             if not granted:
                                 emit("error", error=f"权限被拒绝：{perm['name']} 操作已取消")
                                 self.abort(session_id)
@@ -410,6 +423,7 @@ class ClaudeAgentBackend(ModelBackend):
                 elif msg_type == "assistant":
                     # include_partial_messages=True 时 assistant 消息是已完成块的汇总
                     # 流式增量已通过 stream_event 处理，此处只处理 thinking/tool_use
+                    _parent_tool_use_id = getattr(message, "parent_tool_use_id", None)
                     for block in getattr(message, "content", []):
                         btype = getattr(block, "type", "")
                         if btype == "thinking":
@@ -423,14 +437,18 @@ class ClaudeAgentBackend(ModelBackend):
                                 json.dumps(tool_input, ensure_ascii=False, indent=2)
                                 if tool_input else ""
                             )
-                            emit("tool_start", tool_call={
+                            tc_payload: dict = {
                                 "id": getattr(block, "id", ""),
                                 "name": getattr(block, "name", ""),
                                 "input": input_str,
                                 "status": "running",
-                            })
+                            }
+                            if _parent_tool_use_id:
+                                tc_payload["parentToolUseId"] = _parent_tool_use_id
+                            emit("tool_start", tool_call=tc_payload)
 
                 elif msg_type == "user":
+                    _parent_tool_use_id = getattr(message, "parent_tool_use_id", None)
                     for block in getattr(message, "content", []):
                         btype = (
                             getattr(block, "type", None)
@@ -470,11 +488,14 @@ class ClaudeAgentBackend(ModelBackend):
                             print(f"[ClaudeAgent] tool_result: id={tool_id!r}, "
                                   f"status={'error' if is_error else 'done'}, len={len(output_str)}",
                                   file=sys.stderr, flush=True)
-                            emit("tool_result", tool_call={
+                            tr_payload: dict = {
                                 "id": tool_id,
                                 "output": output_str,
                                 "status": "error" if is_error else "done",
-                            })
+                            }
+                            if _parent_tool_use_id:
+                                tr_payload["parentToolUseId"] = _parent_tool_use_id
+                            emit("tool_result", tool_call=tr_payload)
 
                 elif msg_type == "result":
                     agent_sid = getattr(message, "session_id", agent_sid)
@@ -504,9 +525,73 @@ class ClaudeAgentBackend(ModelBackend):
                     _done_emitted = True  # 不 break，让生成器自然耗尽（线程会自行结束）
 
                 elif msg_type in ("task_started", "task_progress", "task_notification"):
-                    # ★ Phase-1：仅反推 schema，暂不转发到前端。Phase-2 会基于
-                    # 这里收集到的字段生成 subagent_* StreamDelta。
+                    # ★ Phase-2：把 Task 子 agent 的生命周期转发成 subagent_* StreamDelta，
+                    # 前端可据此把子 agent 的进度/结果挂到父级 Task tool_use 节点下。
                     _diag_log_task_msg(msg_type, message)
+                    _task_id = getattr(message, "task_id", "") or ""
+                    _tool_use_id = getattr(message, "tool_use_id", None)
+                    _description = getattr(message, "description", "") or ""
+                    _task_type = getattr(message, "task_type", None)
+
+                    if msg_type == "task_started":
+                        if _tool_use_id and _task_id:
+                            _tool_use_to_task[_tool_use_id] = _task_id
+                        payload = {
+                            "taskId": _task_id,
+                            "description": _description,
+                            "taskType": _task_type,
+                            "parentToolUseId": _tool_use_id,
+                            "status": "running",
+                        }
+                        emit("subagent_start", subagent=payload)
+
+                    elif msg_type == "task_progress":
+                        _last_tool = getattr(message, "last_tool_name", None)
+                        _usage_obj = getattr(message, "usage", None)
+                        _usage_dict: Optional[dict] = None
+                        if _usage_obj is not None:
+                            try:
+                                _usage_dict = {
+                                    "totalTokens": getattr(_usage_obj, "total_tokens", 0) or 0,
+                                    "toolUses": getattr(_usage_obj, "tool_uses", 0) or 0,
+                                    "durationMs": getattr(_usage_obj, "duration_ms", 0) or 0,
+                                }
+                            except Exception:
+                                _usage_dict = None
+                        payload = {
+                            "taskId": _task_id,
+                            "description": _description,
+                            "parentToolUseId": _tool_use_id,
+                            "status": "running",
+                            "lastToolName": _last_tool,
+                            "usage": _usage_dict,
+                        }
+                        emit("subagent_progress", subagent=payload)
+
+                    elif msg_type == "task_notification":
+                        _status = getattr(message, "status", "") or ""
+                        _summary = getattr(message, "summary", None)
+                        _output_file = getattr(message, "output_file", None)
+                        _usage_obj = getattr(message, "usage", None)
+                        _usage_dict = None
+                        if _usage_obj is not None:
+                            try:
+                                _usage_dict = {
+                                    "totalTokens": getattr(_usage_obj, "total_tokens", 0) or 0,
+                                    "toolUses": getattr(_usage_obj, "tool_uses", 0) or 0,
+                                    "durationMs": getattr(_usage_obj, "duration_ms", 0) or 0,
+                                }
+                            except Exception:
+                                _usage_dict = None
+                        payload = {
+                            "taskId": _task_id,
+                            "parentToolUseId": _tool_use_id,
+                            "status": _status or "completed",
+                            "summary": _summary,
+                            "outputFile": _output_file,
+                            "usage": _usage_dict,
+                        }
+                        emit("subagent_done", subagent=payload)
 
                 else:
                     print(f"[ClaudeAgent] 未处理的消息类型: {msg_type}",

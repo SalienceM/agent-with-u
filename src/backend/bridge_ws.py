@@ -2603,12 +2603,40 @@ except urllib.error.URLError as e:
                         output=None,
                         status=delta.tool_call.get("status", "running"),
                         start_time=_time.time(),  # ★ Record start time
+                        parent_tool_use_id=delta.tool_call.get("parentToolUseId"),
                     )
                     iter_tools.append(tc)
                 elif delta.type == "tool_input" and delta.tool_call:
                     input_delta = delta.tool_call.get("inputDelta", "")
-                    if iter_tools and input_delta:
-                        iter_tools[-1].input = (iter_tools[-1].input or "") + input_delta
+                    tc_id = delta.tool_call.get("id", "")
+                    if input_delta:
+                        # ★ 按 id 精确定位目标 tool；父/子 agent tool_use 交织时不能用 [-1]
+                        target = None
+                        if tc_id:
+                            for tc in iter_tools:
+                                if tc.id == tc_id:
+                                    target = tc
+                                    break
+                        if target is None and iter_tools:
+                            target = iter_tools[-1]
+                        if target is not None:
+                            target.input = (target.input or "") + input_delta
+                elif delta.type in ("subagent_start", "subagent_progress", "subagent_done") and delta.subagent:
+                    # ★ 把子 agent 生命周期挂到父级 Task tool_use 的 ToolCallInfo 上
+                    parent_id = delta.subagent.get("parentToolUseId")
+                    if parent_id:
+                        for tc in iter_tools:
+                            if tc.id == parent_id:
+                                existing = tc.subagent or {}
+                                merged = {**existing, **{k: v for k, v in delta.subagent.items() if v is not None}}
+                                tc.subagent = merged
+                                if delta.type == "subagent_done":
+                                    # ★ 子 agent 结束时更新父 Task 的状态
+                                    _sub_status = delta.subagent.get("status", "completed")
+                                    tc.status = "error" if _sub_status == "failed" else "done"
+                                    if tc.start_time:
+                                        tc.duration = int((_time.time() - tc.start_time) * 1000)
+                                break
                 elif delta.type == "tool_result" and delta.tool_call:
                     tc_id = delta.tool_call.get("id", "")
                     for tc in iter_tools:

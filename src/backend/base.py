@@ -63,13 +63,29 @@ class StreamDelta:
     A single streaming event pushed to the frontend.
 
     ★ delta_type 说明：
-      text_delta   - 正文文本增量
-      thinking     - 思考内容增量（新增）
-      tool_start   - 工具调用开始（含名称、输入）
-      tool_input   - 工具输入增量（增量式场景）
-      tool_result  - 工具执行结果（含输出、状态）
-      done         - 流结束
-      error        - 错误
+      text_delta           - 正文文本增量
+      thinking             - 思考内容增量
+      tool_start           - 工具调用开始（含名称、输入、可选 parentToolUseId）
+      tool_input           - 工具输入增量（含 id / 可选 parentToolUseId）
+      tool_result          - 工具执行结果（含 id / 输出 / 状态 / 可选 parentToolUseId）
+      subagent_start       - Task 工具派发了一个子 agent（携带 subagent 字段）
+      subagent_progress    - 子 agent 进度刷新
+      subagent_done        - 子 agent 结束（completed / failed / stopped）
+      done                 - 本轮流结束
+      error                - 错误
+
+    subagent 字段结构（与 claude_agent_sdk.types.Task*Message 对齐）：
+      {
+        taskId: str,
+        description: str,
+        taskType: str | None,
+        parentToolUseId: str | None,  // 关联父级 Task tool_use.id
+        status: "running" | "completed" | "failed" | "stopped",
+        lastToolName: str | None,     // progress 时携带
+        summary: str | None,          // done 时携带
+        outputFile: str | None,       // done 时携带
+        usage: { totalTokens, toolUses, durationMs } | None,
+      }
     """
     def __init__(
         self,
@@ -80,6 +96,7 @@ class StreamDelta:
         tool_call: Optional[dict] = None,
         error: Optional[str] = None,
         usage: Optional[dict] = None,
+        subagent: Optional[dict] = None,
     ):
         self.session_id = session_id
         self.message_id = message_id
@@ -88,6 +105,7 @@ class StreamDelta:
         self.tool_call = tool_call
         self.error = error
         self.usage = usage
+        self.subagent = subagent
 
     def to_dict(self) -> dict:
         d = {
@@ -103,6 +121,8 @@ class StreamDelta:
             d["error"] = self.error
         if self.usage is not None:
             d["usage"] = self.usage
+        if self.subagent is not None:
+            d["subagent"] = self.subagent
         return d
 
 

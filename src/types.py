@@ -88,6 +88,12 @@ class ToolCallInfo:
     # ★ Timing data for duration display
     start_time: Optional[float] = None  # Unix timestamp in seconds
     duration: Optional[int] = None  # Duration in milliseconds
+    # ★ Subagent linkage: set when this tool is invoked inside a Task subagent.
+    # 平铺存储 + parent_tool_use_id 反向引用，前端渲染时自行建树。
+    parent_tool_use_id: Optional[str] = None
+    # ★ Subagent metadata: only populated on the parent "Task" tool call.
+    # Shape: { taskId, description, taskType, status, lastToolName, summary, outputFile, usage }
+    subagent: Optional[dict] = None
 
     def to_dict(self) -> dict:
         d = {
@@ -109,6 +115,10 @@ class ToolCallInfo:
             }
         if self.duration is not None:
             d["duration"] = self.duration
+        if self.parent_tool_use_id is not None:
+            d["parentToolUseId"] = self.parent_tool_use_id
+        if self.subagent is not None:
+            d["subagent"] = self.subagent
         return d
 
 
