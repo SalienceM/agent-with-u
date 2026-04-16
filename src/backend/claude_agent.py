@@ -85,6 +85,10 @@ class ClaudeAgentBackend(ModelBackend):
 
         try:
             from claude_agent_sdk import query as sdk_query, ClaudeAgentOptions
+            try:
+                from claude_agent_sdk import AgentDefinition  # type: ignore
+            except Exception:
+                AgentDefinition = None  # type: ignore
         except ImportError as _imp_err:
             import traceback as _tb
             _detail = str(_imp_err)
@@ -249,6 +253,29 @@ class ClaudeAgentBackend(ModelBackend):
                 print(f"[ClaudeAgent] MCP servers: {list(mcp_servers.keys())}",
                       file=sys.stderr, flush=True)
 
+            # ★ Phase-2 诊断增强：显式注册一个通用型 subagent，
+            # 否则某些 SDK/CLI 版本在没有 agents 定义时 Task 工具会直接拒派。
+            if AgentDefinition is not None:
+                options_kwargs["agents"] = {
+                    "general-purpose": AgentDefinition(
+                        description=(
+                            "通用型子 agent：可并行处理独立的探索/分析/搜索任务。"
+                            "当主任务可以拆成互不依赖的子查询时，优先使用 Task 工具派发。"
+                        ),
+                        prompt=(
+                            "你是主 agent 派发的子 agent。专注完成分配给你的子任务，"
+                            "不要反问、不要主动扩展范围。完成后用简短的小结返回关键发现。"
+                        ),
+                        tools=["Read", "Glob", "Grep", "Bash"],
+                        model="inherit",
+                    ),
+                }
+                print(f"[ClaudeAgent] agents registered: {list(options_kwargs['agents'].keys())}",
+                      file=sys.stderr, flush=True)
+            else:
+                print(f"[ClaudeAgent] AgentDefinition 不可用，跳过 agents 注册（Task 工具可能无法派发）",
+                      file=sys.stderr, flush=True)
+
             options = ClaudeAgentOptions(**options_kwargs)
 
             print(f"[ClaudeAgent] SDK query: model={model}, resume={agent_session_id!r}, "
@@ -338,6 +365,11 @@ class ClaudeAgentBackend(ModelBackend):
                 }
                 _class_name = type(message).__name__
                 msg_type = getattr(message, "type", None) or _CLASS_TYPE_MAP.get(_class_name, _class_name)
+                # ★ Phase-2 诊断：无条件打印每条 SDK 消息的类别，排查 Task 为什么没被派发
+                _ptid = getattr(message, "parent_tool_use_id", None)
+                print(f"[ClaudeAgent][msg] class={_class_name} type={msg_type}"
+                      f"{' parent=' + _ptid if _ptid else ''}",
+                      file=sys.stderr, flush=True)
 
                 # ★ StreamEvent: include_partial_messages=True 时的流式增量事件
                 if msg_type == "stream_event":
