@@ -364,7 +364,9 @@ class ClaudeAgentBackend(ModelBackend):
                     "ResultMessage": "result",
                 }
                 _class_name = type(message).__name__
-                msg_type = getattr(message, "type", None) or _CLASS_TYPE_MAP.get(_class_name, _class_name)
+                # ★ 优先用类名映射，因为 Task*Message 的 .type 属性返回的是类名本身（如 "TaskProgressMessage"），
+                #   不是我们期望的短名称（"task_progress"）。映射表不命中时才读 .type 属性。
+                msg_type = _CLASS_TYPE_MAP.get(_class_name) or getattr(message, "type", None) or _class_name
                 # ★ Phase-2 诊断：无条件打印每条 SDK 消息的类别，排查 Task 为什么没被派发
                 _ptid = getattr(message, "parent_tool_use_id", None)
                 print(f"[ClaudeAgent][msg] class={_class_name} type={msg_type}"
