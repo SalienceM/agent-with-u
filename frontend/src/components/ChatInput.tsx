@@ -1,5 +1,6 @@
 import React, { useRef, useCallback, useEffect, memo, useState, useMemo } from 'react';
 import { ImagePreview } from './ImagePreview';
+import VoiceInput from './VoiceInput';
 import { useClipboardImage } from '../hooks/useClipboardImage';
 import type { ImageAttachment } from '../hooks/useClipboardImage';
 import { SLASH_COMMANDS } from '../hooks/useChat';
@@ -151,6 +152,7 @@ const ChatInputInner: React.FC<Props> = ({
 
   // ── 清理上下文 ──
   const [showNewSessionConfirm, setShowNewSessionConfirm] = useState(false);
+  const [showVoiceInput, setShowVoiceInput] = useState(false);
   const handleCompact = useCallback(() => {
     // ★ 二次确认：新会话会清空上下文，误触代价很大
     setShowNewSessionConfirm(true);
@@ -692,6 +694,14 @@ const ChatInputInner: React.FC<Props> = ({
         ) : (
           <button onClick={handleSend} style={sendBtnStyle} title="Send (Enter)">🚀</button>
         )}
+        <button
+          onClick={() => setShowVoiceInput(true)}
+          style={micBtnStyle}
+          title="语音输入"
+          disabled={isStreaming}
+        >
+          🎙️
+        </button>
       </div>
 
       {/* 新会话确认对话框（风格与 Sidebar 删除会话保持一致） */}
@@ -720,6 +730,23 @@ const ChatInputInner: React.FC<Props> = ({
             </div>
           </div>
         </div>
+      )}
+
+      {/* 语音输入面板 */}
+      {showVoiceInput && (
+        <VoiceInput
+          sessionId={sessionId}
+          onInsert={(text) => {
+            if (ref.current) {
+              const cur = ref.current.value;
+              ref.current.value = cur ? cur + '\n' + text : text;
+              ref.current.style.height = 'auto';
+              ref.current.style.height = ref.current.scrollHeight + 'px';
+              ref.current.focus();
+            }
+          }}
+          onClose={() => setShowVoiceInput(false)}
+        />
       )}
     </div>
   );
@@ -763,6 +790,12 @@ const btnBase: React.CSSProperties = {
 
 const sendBtnStyle: React.CSSProperties = { ...btnBase, background: 'var(--theme-accent, #0969da)' };
 const abortBtnStyle: React.CSSProperties = { ...btnBase, background: 'var(--theme-error, #cf222e)', fontSize: 14 };
+const micBtnStyle: React.CSSProperties = {
+  ...btnBase,
+  background: 'var(--theme-bg-tertiary, #eaeef2)',
+  fontSize: 16,
+  padding: '0 8px',
+};
 
 const commandPopupStyle: React.CSSProperties = {
   position: 'absolute',

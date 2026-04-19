@@ -639,6 +639,31 @@ export const api = {
     return typeof result === 'string' && result ? result : '0.0.0-dev';
   },
 
+  // ── STT 语音转文字 ──────────────────────────────────────────
+
+  async getSttConfig(): Promise<any> {
+    const r = await call('getSttConfig');
+    try { return typeof r === 'string' ? JSON.parse(r) : r; } catch { return {}; }
+  },
+
+  async saveSttConfig(config: any): Promise<boolean> {
+    const r = await call('saveSttConfig', JSON.stringify(config));
+    try {
+      const d = typeof r === 'string' ? JSON.parse(r) : r;
+      return !!d?.ok;
+    } catch { return false; }
+  },
+
+  async sttTranscribe(audioBase64: string, configOverride?: any): Promise<{ ok: boolean; text?: string; error?: string }> {
+    const r = await call('sttTranscribe', audioBase64, JSON.stringify(configOverride || {}));
+    try { return typeof r === 'string' ? JSON.parse(r) : r; } catch { return { ok: false, error: 'parse error' }; }
+  },
+
+  async sttRefine(text: string, sessionId?: string): Promise<{ ok: boolean; text?: string; error?: string }> {
+    const r = await call('sttRefine', text, sessionId || '');
+    try { return typeof r === 'string' ? JSON.parse(r) : r; } catch { return { ok: false, error: 'parse error' }; }
+  },
+
   /** 打开外部 cmd 窗口实时刷日志 */
   async openLogViewer(): Promise<void> {
     if (isTauri()) {
@@ -725,6 +750,10 @@ function mockDispatch(method: string, params: any[]): any {
     case 'setSkillDefault': return JSON.stringify({ status: 'ok' });
     case 'getDefaultAbilities': return JSON.stringify({ skills: [], prompts: [] });
     case 'getAppVersion': return '0.0.0-dev';
+    case 'getSttConfig': return JSON.stringify({ mode: 'api', language: 'zh', localModel: 'base', apiBaseUrl: '', apiKey: '', apiModel: 'whisper-1' });
+    case 'saveSttConfig': return JSON.stringify({ ok: true });
+    case 'sttTranscribe': return JSON.stringify({ ok: false, error: 'mock mode' });
+    case 'sttRefine': return JSON.stringify({ ok: false, error: 'mock mode' });
     default: return null;
   }
 }

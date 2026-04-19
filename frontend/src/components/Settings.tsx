@@ -28,13 +28,27 @@ export const Settings: React.FC<SettingsProps> = ({
 }) => {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [appVersion, setAppVersion] = useState<string>('');
+  const [sttCfg, setSttCfg] = useState<any>(null);
+  const [sttSaving, setSttSaving] = useState(false);
 
   useEffect(() => {
     if (!isOpen) return;
     let cancelled = false;
     api.getAppVersion().then((v) => { if (!cancelled) setAppVersion(v); }).catch(() => {});
+    api.getSttConfig().then((c) => { if (!cancelled) setSttCfg(c); }).catch(() => {});
     return () => { cancelled = true; };
   }, [isOpen]);
+
+  const handleSttChange = useCallback((field: string, value: string) => {
+    setSttCfg((prev: any) => prev ? { ...prev, [field]: value } : prev);
+  }, []);
+
+  const handleSttSave = useCallback(async () => {
+    if (!sttCfg) return;
+    setSttSaving(true);
+    await api.saveSttConfig(sttCfg);
+    setSttSaving(false);
+  }, [sttCfg]);
 
   const handleFileChange = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -134,6 +148,87 @@ export const Settings: React.FC<SettingsProps> = ({
             ))}
           </div>
         </div>
+
+        {/* 语音转文字 (STT) 设置 */}
+        {sttCfg && (
+          <div style={sectionStyle}>
+            <label style={labelStyle}>🎙️ Voice-to-Text (STT)</label>
+            <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+              <select
+                value={sttCfg.mode || 'api'}
+                onChange={(e) => handleSttChange('mode', e.target.value)}
+                style={{ ...inputStyle, flex: '0 0 auto', width: 100 }}
+              >
+                <option value="api">API</option>
+                <option value="local">Local</option>
+              </select>
+              <select
+                value={sttCfg.language || 'zh'}
+                onChange={(e) => handleSttChange('language', e.target.value)}
+                style={{ ...inputStyle, flex: '0 0 auto', width: 80 }}
+              >
+                <option value="zh">中文</option>
+                <option value="en">English</option>
+                <option value="ja">日本語</option>
+                <option value="ko">한국어</option>
+                <option value="">Auto</option>
+              </select>
+            </div>
+            {sttCfg.mode === 'local' && (
+              <div style={{ marginTop: 8, display: 'flex', gap: 8, alignItems: 'center' }}>
+                <span style={{ fontSize: 12, color: 'var(--theme-text-muted)', whiteSpace: 'nowrap' }}>Model:</span>
+                <select
+                  value={sttCfg.localModel || 'base'}
+                  onChange={(e) => handleSttChange('localModel', e.target.value)}
+                  style={{ ...inputStyle, flex: '0 0 auto', width: 110 }}
+                >
+                  <option value="tiny">tiny (最快)</option>
+                  <option value="base">base (推荐)</option>
+                  <option value="small">small</option>
+                  <option value="medium">medium</option>
+                  <option value="large-v3">large-v3 (最佳)</option>
+                </select>
+                <span style={{ fontSize: 11, color: 'var(--theme-text-muted)' }}>需 pip install faster-whisper</span>
+              </div>
+            )}
+            {sttCfg.mode === 'api' && (
+              <div style={{ marginTop: 8, display: 'flex', flexDirection: 'column', gap: 6 }}>
+                <input
+                  placeholder="API Base URL (e.g. https://api.openai.com/v1)"
+                  value={sttCfg.apiBaseUrl || ''}
+                  onChange={(e) => handleSttChange('apiBaseUrl', e.target.value)}
+                  style={inputStyle}
+                />
+                <input
+                  placeholder="API Key"
+                  type="password"
+                  value={sttCfg.apiKey || ''}
+                  onChange={(e) => handleSttChange('apiKey', e.target.value)}
+                  style={inputStyle}
+                />
+                <input
+                  placeholder="Model (default: whisper-1)"
+                  value={sttCfg.apiModel || ''}
+                  onChange={(e) => handleSttChange('apiModel', e.target.value)}
+                  style={inputStyle}
+                />
+              </div>
+            )}
+            <button
+              onClick={handleSttSave}
+              disabled={sttSaving}
+              style={{
+                ...actionBtnStyle,
+                marginTop: 8,
+                alignSelf: 'flex-start',
+                background: 'rgba(9,105,218,0.15)',
+                borderColor: 'rgba(9,105,218,0.3)',
+              }}
+            >
+              {sttSaving ? '保存中...' : '💾 Save STT Config'}
+            </button>
+          </div>
+        )}
 
         {/* 数据导入导出 */}
         <div style={sectionStyle}>
@@ -321,6 +416,13 @@ const formatBtnStyle: React.CSSProperties = {
   fontWeight: 600, cursor: 'pointer',
   color: 'var(--theme-text, #e0e0e0)',
   transition: 'all 0.15s',
+};
+const inputStyle: React.CSSProperties = {
+  padding: '6px 10px', borderRadius: 6,
+  border: '1px solid var(--theme-border, rgba(0,0,0,0.12))',
+  background: 'var(--theme-input-bg, #fff)',
+  color: 'var(--theme-text, #1f2328)',
+  fontSize: 12, outline: 'none', fontFamily: 'inherit',
 };
 const actionBtnStyle: React.CSSProperties = {
   flex: 1, padding: '8px 12px', borderRadius: 8,

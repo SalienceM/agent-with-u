@@ -876,6 +876,75 @@ class BridgeWS:
         except Exception:
             return "0.0.0-dev"
 
+    # ── RPC: 语音转文字 (STT) ────────────────────────────────────────
+
+    def _rpc_getSttConfig(self) -> str:
+        """返回当前 STT 配置。"""
+        from .stt_service import load_stt_config
+        return json.dumps(load_stt_config().to_dict(), ensure_ascii=False)
+
+    def _rpc_saveSttConfig(self, config_json: str) -> str:
+        """保存 STT 配置。"""
+        from .stt_service import save_stt_config, SttConfig
+        try:
+            d = json.loads(config_json) if isinstance(config_json, str) else config_json
+            save_stt_config(SttConfig.from_dict(d))
+            return json.dumps({"ok": True}, ensure_ascii=False)
+        except Exception as e:
+            return json.dumps({"ok": False, "error": str(e)}, ensure_ascii=False)
+
+    async def _rpc_sttTranscribe(self, audio_base64: str, config_json: str = "{}") -> str:
+        """转写音频（base64 编码）。config_json 可覆盖默认配置。"""
+        import base64 as _b64
+        from .stt_service import transcribe, SttConfig, load_stt_config
+        try:
+            audio_bytes = _b64.b64decode(audio_base64)
+            cfg_override = json.loads(config_json) if config_json and config_json != "{}" else {}
+            cfg = load_stt_config()
+            if cfg_override:
+                cfg = SttConfig.from_dict({**cfg.to_dict(), **cfg_override})
+            text = await transcribe(audio_bytes, cfg)
+            return json.dumps({"ok": True, "text": text}, ensure_ascii=False)
+        except Exception as e:
+            print(f"[STT] 转写失败: {e}", file=sys.stderr, flush=True)
+            return json.dumps({"ok": False, "error": str(e)}, ensure_ascii=False)
+
+    async def _rpc_sttRefine(self, text: str, session_id: str = "") -> str:
+        """用 LLM 润色语音转写文本。优先使用会话绑定的后端配置。"""
+        from .stt_service import refine_with_llm
+        try:
+            # 从 session 或全局获取 API 配置
+            api_key = ""
+            base_url = ""
+            model = ""
+            if session_id:
+                session = self._session_store.get(session_id)
+                if session:
+                    backend_cfg = self._backend_store.get(session.backend_id)
+                    if backend_cfg:
+                        api_key = (backend_cfg.get_env("ANTHROPIC_API_KEY")
+                                   or backend_cfg.api_key or "")
+                        base_url = (backend_cfg.get_env("ANTHROPIC_BASE_URL")
+                                    or backend_cfg.base_url or "")
+                        model = (backend_cfg.get_env("ANTHROPIC_MODEL")
+                                 or backend_cfg.model or "")
+            # Fallback: 环境变量
+            if not api_key:
+                api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+            if not base_url:
+                base_url = os.environ.get("ANTHROPIC_BASE_URL", "https://api.anthropic.com/v1")
+            if not model:
+                model = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-20250514")
+
+            if not api_key:
+                return json.dumps({"ok": False, "error": "未配置 API Key，无法进行 LLM 润色"}, ensure_ascii=False)
+
+            refined = await refine_with_llm(text, api_key, base_url, model)
+            return json.dumps({"ok": True, "text": refined}, ensure_ascii=False)
+        except Exception as e:
+            print(f"[STT] 润色失败: {e}", file=sys.stderr, flush=True)
+            return json.dumps({"ok": False, "error": str(e)}, ensure_ascii=False)
+
     # ── RPC: 剪贴板 ─────────────────────────────────────────────
 
     def _rpc_readClipboardImage(self) -> str:
