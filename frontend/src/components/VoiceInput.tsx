@@ -158,19 +158,43 @@ const VoiceInput: React.FC<VoiceInputProps> = memo(function VoiceInput({
   const [installing, setInstalling] = useState(false);
   const [installLog, setInstallLog] = useState('');
   const [pythonPath, setPythonPath] = useState('');
+  const [audioDevices, setAudioDevices] = useState<MediaDeviceInfo[]>([]);
+  const [selectedDeviceId, setSelectedDeviceId] = useState<string>('');
+  const [sttMode, setSttMode] = useState<string>('api');
 
-  // ── 打开时检测 local 依赖 ────────────────────
+  // ── 打开时：枚举麦克风 + 检测 local 依赖 ────────
   useEffect(() => {
     let cancelled = false;
-    api.getSttConfig().then(async (cfg) => {
-      if (cancelled) return;
-      if (cfg?.mode === 'local') {
-        const chk = await api.sttCheckLocal();
-        if (cancelled) return;
-        if (chk.pythonPath) setPythonPath(chk.pythonPath);
-        if (!chk.installed) setLocalMissing(true);
+    // 枚举音频输入设备
+    (async () => {
+      try {
+        // 先请求一次权限，否则 enumerateDevices 返回的 label 为空
+        const tmpStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        tmpStream.getTracks().forEach((t) => t.stop());
+        const devices = await navigator.mediaDevices.enumerateDevices();
+        if (!cancelled) {
+          const inputs = devices.filter((d) => d.kind === 'audioinput');
+          setAudioDevices(inputs);
+          // 从 config 恢复上次选择
+          const cfg = await api.getSttConfig();
+          if (!cancelled && cfg) {
+            setSttMode(cfg.mode || 'api');
+            if (cfg.deviceId && inputs.some((d) => d.deviceId === cfg.deviceId)) {
+              setSelectedDeviceId(cfg.deviceId);
+            }
+            if (cfg.mode === 'local') {
+              const chk = await api.sttCheckLocal();
+              if (!cancelled) {
+                if (chk.pythonPath) setPythonPath(chk.pythonPath);
+                if (!chk.installed) setLocalMissing(true);
+              }
+            }
+          }
+        }
+      } catch (e: any) {
+        if (!cancelled) setError(`麦克风枚举失败: ${e.message || e}`);
       }
-    }).catch(() => {});
+    })();
     return () => { cancelled = true; };
   }, []);
 
@@ -240,7 +264,10 @@ const VoiceInput: React.FC<VoiceInputProps> = memo(function VoiceInput({
     setError('');
     setTranscript('');
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const audioConstraints: MediaTrackConstraints = selectedDeviceId
+        ? { deviceId: { exact: selectedDeviceId } }
+        : true;
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: audioConstraints });
       streamRef.current = stream;
       const mr = new MediaRecorder(stream, { mimeType: 'audio/webm;codecs=opus' });
       chunksRef.current = [];
@@ -263,7 +290,7 @@ const VoiceInput: React.FC<VoiceInputProps> = memo(function VoiceInput({
     } catch (e: any) {
       setError(`麦克风访问失败: ${e.message || e}`);
     }
-  }, [startLevelMeter]);
+  }, [startLevelMeter, selectedDeviceId]);
 
   // ── 停止录音 ─────────────────────────────────
   const stopRecording = useCallback(() => {
@@ -420,6 +447,41 @@ const VoiceInput: React.FC<VoiceInputProps> = memo(function VoiceInput({
         {/* ── 空闲 / 录音阶段 ── */}
         {(phase === 'idle' || phase === 'recording') && (
           <>
+            {/* 麦克风选择 + 模式标签 */}
+            {phase === 'idle' && audioDevices.length > 0 && (
+              <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+                <select
+                  value={selectedDeviceId}
+                  onChange={(e) => {
+                    setSelectedDeviceId(e.target.value);
+                    api.getSttConfig().then((cfg) => {
+                      api.saveSttConfig({ ...cfg, deviceId: e.target.value });
+                    }).catch(() => {});
+                  }}
+                  style={{
+                    flex: 1,
+                    padding: '5px 8px',
+                    borderRadius: 6,
+                    border: '1px solid var(--theme-border, rgba(0,0,0,0.12))',
+                    background: 'var(--theme-input-bg, #fff)',
+                    color: 'var(--theme-text, #1f2328)',
+                    fontSize: 12,
+                    outline: 'none',
+                  }}
+                >
+                  <option value="">默认麦克风</option>
+                  {audioDevices.map((d) => (
+                    <option key={d.deviceId} value={d.deviceId}>
+                      {d.label || `麦克风 (${d.deviceId.slice(0, 8)})`}
+                    </option>
+                  ))}
+                </select>
+                <span style={{ fontSize: 11, color: 'var(--theme-text-muted, #656d76)', whiteSpace: 'nowrap' }}>
+                  模式: {sttMode === 'local' ? '🖥 本地' : '☁️ API'}
+                </span>
+              </div>
+            )}
+
             {/* 音量条 */}
             <div style={levelBarContainer}>
               {levels.map((v, i) => (

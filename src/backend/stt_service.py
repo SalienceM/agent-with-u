@@ -26,6 +26,7 @@ class SttConfig:
     api_base_url: str = ""               # OpenAI-compatible base URL
     api_key: str = ""                    # API key
     api_model: str = "whisper-1"         # 模型名
+    device_id: str = ""                  # 前端麦克风 deviceId（持久化）
 
     def to_dict(self) -> dict:
         return {
@@ -35,6 +36,7 @@ class SttConfig:
             "apiBaseUrl": self.api_base_url,
             "apiKey": self.api_key,
             "apiModel": self.api_model,
+            "deviceId": self.device_id,
         }
 
     @staticmethod
@@ -46,6 +48,7 @@ class SttConfig:
             api_base_url=d.get("apiBaseUrl", ""),
             api_key=d.get("apiKey", ""),
             api_model=d.get("apiModel", "whisper-1"),
+            device_id=d.get("deviceId", ""),
         )
 
 
