@@ -256,6 +256,7 @@ async def transcribe_api(
 # ═══════════════════════════════════════════════════════════════════════════
 
 _DASHSCOPE_COMPAT_MODELS = {"sensevoice-v1", "paraformer-v2", "paraformer-realtime-v2"}
+_DASHSCOPE_ALL_MODELS = _DASHSCOPE_COMPAT_MODELS | {"fun-asr"}
 
 
 async def transcribe_dashscope(
@@ -427,12 +428,24 @@ async def _transcribe_dashscope_native(
 #  统一入口
 # ═══════════════════════════════════════════════════════════════════════════
 
+def _is_dashscope_config(cfg: SttConfig) -> bool:
+    """检测配置是否实际指向 DashScope（即使 mode 设为 api）。"""
+    if cfg.api_model in _DASHSCOPE_ALL_MODELS:
+        return True
+    if cfg.api_base_url and "dashscope" in cfg.api_base_url.lower():
+        return True
+    return False
+
+
 async def transcribe(audio_bytes: bytes, config: Optional[SttConfig] = None) -> str:
     """根据配置选择本地 / API / DashScope 转写。"""
     cfg = config or load_stt_config()
     if cfg.mode == "local":
         return await transcribe_local(audio_bytes, cfg.language, cfg.local_model)
-    elif cfg.mode == "dashscope":
+    elif cfg.mode == "dashscope" or _is_dashscope_config(cfg):
+        if cfg.mode != "dashscope":
+            print(f"[STT] 自动检测到 DashScope 配置 (model={cfg.api_model}), 切换到 dashscope 模式",
+                  file=sys.stderr, flush=True)
         return await transcribe_dashscope(
             audio_bytes, cfg.language,
             cfg.api_base_url, cfg.api_key, cfg.api_model or "sensevoice-v1",
