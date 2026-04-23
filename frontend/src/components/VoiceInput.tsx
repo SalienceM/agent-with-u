@@ -365,15 +365,24 @@ const VoiceInput: React.FC<VoiceInputProps> = memo(function VoiceInput({
               ⚠️ 本地模式需要安装 <code style={{ fontSize: 12 }}>faster-whisper</code>
             </div>
             <div style={{ fontSize: 12, color: 'var(--theme-text-muted, #656d76)' }}>
-              点击下方按钮自动安装，或手动执行：
-              <code style={{ display: 'block', marginTop: 4, fontSize: 11, padding: '4px 8px', borderRadius: 4, background: 'rgba(0,0,0,0.06)' }}>
-                {pythonPath ? `"${pythonPath}" -m pip install faster-whisper` : 'pip install faster-whisper'}
-              </code>
-              {pythonPath && (
-                <span style={{ display: 'block', marginTop: 4, fontSize: 11 }}>
-                  ⚠️ 后端 Python 路径: <code>{pythonPath}</code>
-                  <br />请确保用这个 Python 的 pip 安装，否则后端找不到。
-                </span>
+              {pythonPath && !pythonPath.startsWith('(') ? (
+                <>
+                  点击下方按钮自动安装，或手动执行：
+                  <code style={{ display: 'block', marginTop: 4, fontSize: 11, padding: '4px 8px', borderRadius: 4, background: 'rgba(0,0,0,0.06)' }}>
+                    "{pythonPath}" -m pip install faster-whisper
+                  </code>
+                  <span style={{ display: 'block', marginTop: 4, fontSize: 11 }}>
+                    系统 Python: <code>{pythonPath}</code>
+                  </span>
+                </>
+              ) : (
+                <>
+                  <span style={{ color: '#f85149', fontWeight: 600 }}>
+                    未找到系统 Python！
+                  </span>
+                  <br />请先安装 Python 3.10+，确保 <code>python</code> 在 PATH 中，然后重试。
+                  <br />或在 Settings 中切换为 API 模式。
+                </>
               )}
             </div>
             <button

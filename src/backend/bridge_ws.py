@@ -41,6 +41,35 @@ from .prompt_store import PromptStore
 
 # ── 剪贴板（非 Qt，Pillow ImageGrab，仅 Windows/macOS）──────────
 
+def _find_system_python() -> Optional[str]:
+    """找到系统可用的 Python 解释器路径（跳过 PyInstaller 冻结的 .exe）。"""
+    import shutil, subprocess as _sp
+    # 非冻结环境直接用当前 Python
+    if not getattr(sys, 'frozen', False):
+        return sys.executable
+    # 冻结环境：搜索系统 Python
+    for name in ("python3", "python", "py"):
+        path = shutil.which(name)
+        if path:
+            try:
+                r = _sp.run([path, "--version"], capture_output=True, text=True, timeout=5)
+                if r.returncode == 0:
+                    return path
+            except Exception:
+                continue
+    # Windows: 尝试常见安装路径
+    if sys.platform == "win32":
+        import glob
+        for pattern in [
+            r"C:\Python3*\python.exe",
+            os.path.expandvars(r"%LOCALAPPDATA%\Programs\Python\Python3*\python.exe"),
+            os.path.expandvars(r"%APPDATA%\..\Local\Programs\Python\Python3*\python.exe"),
+        ]:
+            for p in sorted(glob.glob(pattern), reverse=True):
+                if os.path.isfile(p):
+                    return p
+    return None
+
 def _read_clipboard_image_native() -> Optional[dict]:
     try:
         from PIL import ImageGrab
@@ -879,18 +908,43 @@ class BridgeWS:
     # ── RPC: 语音转文字 (STT) ────────────────────────────────────────
 
     def _rpc_sttCheckLocal(self) -> str:
-        """检查本地 STT 依赖是否已安装，同时返回后端使用的 Python 路径。"""
-        python_path = sys.executable
-        try:
-            import faster_whisper  # type: ignore  # noqa: F401
-            return json.dumps({"installed": True, "pythonPath": python_path}, ensure_ascii=False)
-        except ImportError:
-            return json.dumps({"installed": False, "pythonPath": python_path}, ensure_ascii=False)
+        """检查本地 STT 依赖是否已安装，同时返回可用的 Python 路径。"""
+        python_path = _find_system_python()
+        # 先试本进程直接 import（非冻结时最快）
+        installed = False
+        if not getattr(sys, 'frozen', False):
+            try:
+                import faster_whisper  # type: ignore  # noqa: F401
+                installed = True
+            except ImportError:
+                pass
+        # 冻结环境或本进程 import 失败：用系统 Python 探测
+        if not installed and python_path:
+            import subprocess as _sp
+            try:
+                r = _sp.run(
+                    [python_path, "-c", "import faster_whisper; print('ok')"],
+                    capture_output=True, text=True, timeout=10,
+                )
+                installed = r.returncode == 0
+            except Exception:
+                pass
+        return json.dumps({
+            "installed": installed,
+            "pythonPath": python_path or "(未找到系统 Python)",
+            "frozen": getattr(sys, 'frozen', False),
+        }, ensure_ascii=False)
 
     async def _rpc_sttInstallLocal(self) -> str:
-        """自动安装 faster-whisper，使用后端自身的 Python 确保装到正确环境。"""
+        """自动安装 faster-whisper，使用系统 Python 确保装到正确环境。"""
         import subprocess as _sp
-        python_path = sys.executable
+        python_path = _find_system_python()
+        if not python_path:
+            return json.dumps({
+                "ok": False,
+                "output": "未找到系统 Python。请手动安装 Python 后重试。",
+                "pythonPath": "",
+            }, ensure_ascii=False)
         loop = asyncio.get_running_loop()
         def _run():
             cmd = [python_path, "-m", "pip", "install", "faster-whisper"]

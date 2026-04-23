@@ -93,28 +93,79 @@ def _get_local_model(model_size: str):
     return model
 
 
+def _find_system_python() -> Optional[str]:
+    """在冻结环境中找到系统 Python（复用 bridge_ws 里的同名函数逻辑）。"""
+    import shutil, subprocess as _sp
+    if not getattr(sys, 'frozen', False):
+        return sys.executable
+    for name in ("python3", "python", "py"):
+        path = shutil.which(name)
+        if path:
+            try:
+                r = _sp.run([path, "--version"], capture_output=True, text=True, timeout=5)
+                if r.returncode == 0:
+                    return path
+            except Exception:
+                continue
+    return None
+
+
+# ★ 冻结环境下通过子进程调用系统 Python 执行 whisper 转写的内联脚本
+_SUBPROCESS_SCRIPT = '''
+import sys, json
+audio_path = sys.argv[1]
+language = sys.argv[2] if len(sys.argv) > 2 and sys.argv[2] else None
+model_size = sys.argv[3] if len(sys.argv) > 3 else "base"
+from faster_whisper import WhisperModel
+model = WhisperModel(model_size, device="auto", compute_type="auto")
+segments, _ = model.transcribe(audio_path, language=language, beam_size=5, vad_filter=True)
+text = "".join(seg.text for seg in segments).strip()
+print(json.dumps({"text": text}))
+'''
+
+
 async def transcribe_local(
     audio_bytes: bytes,
     language: str = "zh",
     model_size: str = "base",
 ) -> str:
-    """用 faster-whisper 本地模型转写音频。"""
+    """用 faster-whisper 本地模型转写音频。冻结环境自动走子进程。"""
     loop = asyncio.get_running_loop()
 
+    # 写临时音频文件
+    with tempfile.NamedTemporaryFile(suffix=".webm", delete=False) as tmp:
+        tmp.write(audio_bytes)
+        tmp_path = tmp.name
+
+    is_frozen = getattr(sys, 'frozen', False)
+
     def _run():
-        model = _get_local_model(model_size)
-        # 写临时文件供 faster-whisper 读取
-        with tempfile.NamedTemporaryFile(suffix=".webm", delete=False) as tmp:
-            tmp.write(audio_bytes)
-            tmp_path = tmp.name
         try:
-            segments, _ = model.transcribe(
-                tmp_path,
-                language=language if language else None,
-                beam_size=5,
-                vad_filter=True,
-            )
-            return "".join(seg.text for seg in segments).strip()
+            if is_frozen:
+                # ★ 冻结环境：通过系统 Python 子进程执行
+                python = _find_system_python()
+                if not python:
+                    raise RuntimeError("未找到系统 Python，无法执行本地语音识别")
+                import subprocess as _sp
+                r = _sp.run(
+                    [python, "-c", _SUBPROCESS_SCRIPT, tmp_path, language or "", model_size],
+                    capture_output=True, text=True, timeout=120,
+                )
+                if r.returncode != 0:
+                    raise RuntimeError(f"转写进程失败:\n{r.stderr or r.stdout}")
+                import json as _json
+                result = _json.loads(r.stdout.strip().split('\n')[-1])
+                return result.get("text", "")
+            else:
+                # ★ 非冻结：直接 import 使用
+                model = _get_local_model(model_size)
+                segments, _ = model.transcribe(
+                    tmp_path,
+                    language=language if language else None,
+                    beam_size=5,
+                    vad_filter=True,
+                )
+                return "".join(seg.text for seg in segments).strip()
         finally:
             try:
                 os.unlink(tmp_path)
