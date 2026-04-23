@@ -219,6 +219,8 @@ async def transcribe_api(
     api_base_url: str = "",
     api_key: str = "",
     api_model: str = "whisper-1",
+    *,
+    skip_language: bool = False,
 ) -> str:
     """调用 OpenAI-compatible Whisper API 转写音频。"""
     if not api_base_url:
@@ -232,13 +234,19 @@ async def transcribe_api(
     async with httpx.AsyncClient(timeout=120.0) as client:
         files = {"file": ("audio.webm", audio_bytes, "audio/webm")}
         data: dict = {"model": api_model}
-        if language:
+        if language and not skip_language:
             data["language"] = language
 
-        print(f"[STT] API 请求: {url}, model={api_model}, lang={language}",
+        print(f"[STT] API 请求: {url}, model={api_model}, lang={language}, size={len(audio_bytes)}",
               file=sys.stderr, flush=True)
         resp = await client.post(url, headers=headers, files=files, data=data)
-        resp.raise_for_status()
+        if resp.status_code != 200:
+            body = resp.text[:500]
+            print(f"[STT] API 错误: status={resp.status_code}, body={body}",
+                  file=sys.stderr, flush=True)
+            raise RuntimeError(
+                f"STT API 返回 {resp.status_code}: {body}"
+            )
         result = resp.json()
         return result.get("text", "").strip()
 
@@ -266,7 +274,6 @@ async def transcribe_dashscope(
         raise ValueError("DashScope 需要配置 apiKey")
 
     if api_model in _DASHSCOPE_COMPAT_MODELS:
-        # 从用户 URL 提取 host（支持北京 / 新加坡地域），始终用 /compatible-mode/v1
         host = "https://dashscope.aliyuncs.com"
         if api_base_url:
             from urllib.parse import urlparse
@@ -274,8 +281,13 @@ async def transcribe_dashscope(
             if parsed.scheme and parsed.netloc:
                 host = f"{parsed.scheme}://{parsed.netloc}"
         compat_base = f"{host}/compatible-mode/v1"
+        print(f"[STT] DashScope compat: model={api_model}, base={compat_base}",
+              file=sys.stderr, flush=True)
+        # SenseVoice 自动检测语言，不传 language 参数
+        skip_lang = api_model == "sensevoice-v1"
         return await transcribe_api(
             audio_bytes, language, compat_base, api_key, api_model,
+            skip_language=skip_lang,
         )
 
     return await _transcribe_dashscope_native(
@@ -341,8 +353,14 @@ async def _transcribe_dashscope_native(
 
     def _run():
         try:
-            import dashscope
-            from dashscope.audio.asr import Transcription
+            try:
+                import dashscope
+                from dashscope.audio.asr import Transcription
+            except ImportError:
+                raise RuntimeError(
+                    "fun-asr 需要安装 dashscope SDK: pip install dashscope\n"
+                    "或改用 sensevoice-v1 / paraformer-v2 (走兼容接口，无需额外安装)"
+                )
 
             dashscope.api_key = api_key
             dashscope.base_http_api_url = (

@@ -985,10 +985,15 @@ class BridgeWS:
             cfg = load_stt_config()
             if cfg_override:
                 cfg = SttConfig.from_dict({**cfg.to_dict(), **cfg_override})
+            print(f"[STT] 开始转写: mode={cfg.mode}, model={cfg.api_model}, "
+                  f"base_url={cfg.api_base_url or '(default)'}, audio_size={len(audio_bytes)}",
+                  file=sys.stderr, flush=True)
             text = await transcribe(audio_bytes, cfg)
             return json.dumps({"ok": True, "text": text}, ensure_ascii=False)
         except Exception as e:
-            print(f"[STT] 转写失败: {e}", file=sys.stderr, flush=True)
+            import traceback
+            print(f"[STT] 转写失败: {e}\n{traceback.format_exc()}",
+                  file=sys.stderr, flush=True)
             return json.dumps({"ok": False, "error": str(e)}, ensure_ascii=False)
 
     async def _rpc_sttRefine(self, text: str, session_id: str = "") -> str:
