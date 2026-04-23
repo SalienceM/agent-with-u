@@ -244,14 +244,174 @@ async def transcribe_api(
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+#  DashScope 转写 (阿里云百炼)
+# ═══════════════════════════════════════════════════════════════════════════
+
+_DASHSCOPE_COMPAT_MODELS = {"sensevoice-v1", "paraformer-v2", "paraformer-realtime-v2"}
+
+
+async def transcribe_dashscope(
+    audio_bytes: bytes,
+    language: str = "zh",
+    api_base_url: str = "",
+    api_key: str = "",
+    api_model: str = "sensevoice-v1",
+) -> str:
+    """调用阿里云 DashScope 语音识别。
+
+    sensevoice / paraformer 走 OpenAI 兼容接口（推荐，短音频直传）；
+    fun-asr 等原生模型走 DashScope SDK（需 pip install dashscope）。
+    """
+    if not api_key:
+        raise ValueError("DashScope 需要配置 apiKey")
+
+    if api_model in _DASHSCOPE_COMPAT_MODELS:
+        compat_base = api_base_url or "https://dashscope.aliyuncs.com/compatible-mode/v1"
+        return await transcribe_api(
+            audio_bytes, language, compat_base, api_key, api_model,
+        )
+
+    return await _transcribe_dashscope_native(
+        audio_bytes, language, api_base_url, api_key, api_model,
+    )
+
+
+def _upload_to_dashscope(file_path: str, model: str, api_key: str) -> str:
+    """上传本地文件到 DashScope，返回可访问 URL。"""
+    try:
+        import dashscope
+        if hasattr(dashscope, 'Uploader'):
+            url = dashscope.Uploader.upload(file_path=file_path, model=model)
+            if isinstance(url, str) and url.startswith('http'):
+                return url
+        if hasattr(dashscope, 'Upload'):
+            resp = dashscope.Upload.upload(file_path=file_path, model=model)
+            if hasattr(resp, 'output'):
+                url = (getattr(resp.output, 'uploaded_url', None)
+                       or (resp.output.get('uploaded_url', '')
+                           if isinstance(resp.output, dict) else ''))
+                if url:
+                    return url
+    except Exception as e:
+        print(f"[STT] DashScope SDK 上传失败 ({e})，尝试 REST",
+              file=sys.stderr, flush=True)
+
+    upload_url = "https://dashscope.aliyuncs.com/api/v1/uploads"
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "X-DashScope-OssResourceResolve": "enable",
+    }
+    with open(file_path, 'rb') as f:
+        files = {"file": (os.path.basename(file_path), f, "audio/webm")}
+        data = {"model": model}
+        resp = httpx.post(upload_url, headers=headers,
+                          files=files, data=data, timeout=60.0)
+        resp.raise_for_status()
+        result = resp.json()
+
+    url = (result.get("output", {}).get("uploaded_url")
+           or result.get("data", {}).get("uploaded_url")
+           or "")
+    if not url:
+        raise RuntimeError(
+            f"DashScope 文件上传失败: {json.dumps(result, ensure_ascii=False)[:200]}")
+    return url
+
+
+async def _transcribe_dashscope_native(
+    audio_bytes: bytes,
+    language: str,
+    api_base_url: str,
+    api_key: str,
+    api_model: str,
+) -> str:
+    """通过 DashScope 原生 SDK 调用 fun-asr 等模型（异步任务模式）。"""
+    loop = asyncio.get_running_loop()
+
+    with tempfile.NamedTemporaryFile(suffix=".webm", delete=False) as tmp:
+        tmp.write(audio_bytes)
+        tmp_path = tmp.name
+
+    def _run():
+        try:
+            import dashscope
+            from dashscope.audio.asr import Transcription
+
+            dashscope.api_key = api_key
+            dashscope.base_http_api_url = (
+                api_base_url.rstrip('/') if api_base_url
+                else 'https://dashscope.aliyuncs.com/api/v1'
+            )
+
+            file_url = _upload_to_dashscope(tmp_path, api_model, api_key)
+            print(f"[STT] DashScope 上传完成: {file_url[:80]}...",
+                  file=sys.stderr, flush=True)
+
+            task_resp = Transcription.async_call(
+                model=api_model,
+                file_urls=[file_url],
+                language_hints=[language] if language else None,
+            )
+
+            task_id = (task_resp.output.get('task_id')
+                       if hasattr(task_resp, 'output')
+                       and isinstance(task_resp.output, dict)
+                       else None)
+            if not task_id:
+                raise RuntimeError(f"DashScope 任务提交失败: {task_resp}")
+            print(f"[STT] DashScope task={task_id}",
+                  file=sys.stderr, flush=True)
+
+            result = Transcription.wait(task=task_id)
+
+            status_code = getattr(result, 'status_code', 0)
+            if status_code != 200:
+                msg = ''
+                if hasattr(result, 'output') and isinstance(result.output, dict):
+                    msg = result.output.get('message', '')
+                raise RuntimeError(
+                    f"DashScope 转写失败 (code={status_code}): {msg}")
+
+            from urllib import request as _request
+            for trans in result.output.get('results', []):
+                if trans.get('subtask_status') == 'SUCCEEDED':
+                    trans_url = trans.get('transcription_url', '')
+                    if not trans_url:
+                        continue
+                    data = json.loads(
+                        _request.urlopen(trans_url).read().decode('utf8'))
+                    texts = []
+                    for t in data.get('transcripts', []):
+                        text = t.get('text', '')
+                        if text:
+                            texts.append(text)
+                    if texts:
+                        return ''.join(texts).strip()
+
+            raise RuntimeError("DashScope 转写无结果")
+        finally:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+    return await loop.run_in_executor(None, _run)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 #  统一入口
 # ═══════════════════════════════════════════════════════════════════════════
 
 async def transcribe(audio_bytes: bytes, config: Optional[SttConfig] = None) -> str:
-    """根据配置选择本地或 API 转写。"""
+    """根据配置选择本地 / API / DashScope 转写。"""
     cfg = config or load_stt_config()
     if cfg.mode == "local":
         return await transcribe_local(audio_bytes, cfg.language, cfg.local_model)
+    elif cfg.mode == "dashscope":
+        return await transcribe_dashscope(
+            audio_bytes, cfg.language,
+            cfg.api_base_url, cfg.api_key, cfg.api_model or "sensevoice-v1",
+        )
     else:
         return await transcribe_api(
             audio_bytes, cfg.language,

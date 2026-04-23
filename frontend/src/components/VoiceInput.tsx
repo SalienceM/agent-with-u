@@ -14,12 +14,22 @@ interface VoiceInputProps {
 
 type Phase = 'recording' | 'transcribing' | 'editing' | 'refining';
 
+const SPEECH_LANG_MAP: Record<string, string> = {
+  zh: 'zh-CN', en: 'en-US', ja: 'ja-JP', ko: 'ko-KR',
+};
+
+const SpeechRecognitionCtor: (new () => any) | null =
+  typeof window !== 'undefined'
+    ? (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition
+    : null;
+
 const VoiceInput = forwardRef<VoiceInputHandle, VoiceInputProps>(function VoiceInput(
   { sessionId, onInsert, onClose, onPhaseChange },
   ref,
 ) {
   const [phase, setPhaseRaw] = useState<Phase>('recording');
   const [transcript, setTranscript] = useState('');
+  const [interimText, setInterimText] = useState('');
   const [error, setError] = useState('');
   const [elapsed, setElapsed] = useState(0);
   const [levels, setLevels] = useState<number[]>(Array(16).fill(0));
@@ -31,6 +41,9 @@ const VoiceInput = forwardRef<VoiceInputHandle, VoiceInputProps>(function VoiceI
   const streamRef = useRef<MediaStream | null>(null);
   const audioCtxRef = useRef<AudioContext | null>(null);
   const mountedRef = useRef(true);
+  const recognitionRef = useRef<any>(null);
+  const speechFinalRef = useRef('');
+  const speechInterimRef = useRef('');
 
   const onPhaseChangeRef = useRef(onPhaseChange);
   onPhaseChangeRef.current = onPhaseChange;
@@ -48,6 +61,7 @@ const VoiceInput = forwardRef<VoiceInputHandle, VoiceInputProps>(function VoiceI
       cancelAnimationFrame(animRef.current);
       streamRef.current?.getTracks().forEach(t => t.stop());
       audioCtxRef.current?.close().catch(() => {});
+      try { recognitionRef.current?.abort(); } catch {}
       onPhaseChangeRef.current?.(null);
     };
   }, []);
@@ -75,6 +89,41 @@ const VoiceInput = forwardRef<VoiceInputHandle, VoiceInputProps>(function VoiceI
     } catch {}
   }, []);
 
+  // ── Web Speech API for real-time interim text ──
+  const startSpeechRecognition = useCallback((lang: string) => {
+    if (!SpeechRecognitionCtor) return;
+    try {
+      const recognition = new SpeechRecognitionCtor();
+      recognition.continuous = true;
+      recognition.interimResults = true;
+      recognition.lang = SPEECH_LANG_MAP[lang] || lang || 'zh-CN';
+
+      recognition.onresult = (event: any) => {
+        if (!mountedRef.current) return;
+        let finalAccum = '';
+        let interim = '';
+        for (let i = 0; i < event.results.length; i++) {
+          if (event.results[i].isFinal) {
+            finalAccum += event.results[i][0].transcript;
+          } else {
+            interim += event.results[i][0].transcript;
+          }
+        }
+        speechFinalRef.current = finalAccum;
+        speechInterimRef.current = interim;
+        setInterimText(finalAccum + interim);
+      };
+      recognition.onerror = () => {};
+      recognition.onend = () => {
+        if (mountedRef.current && mediaRecorderRef.current?.state === 'recording') {
+          try { recognition.start(); } catch {}
+        }
+      };
+      recognition.start();
+      recognitionRef.current = recognition;
+    } catch {}
+  }, []);
+
   const doTranscribe = useCallback(async () => {
     setPhase('transcribing');
     setError('');
@@ -93,13 +142,26 @@ const VoiceInput = forwardRef<VoiceInputHandle, VoiceInputProps>(function VoiceI
         setTranscript(res.text);
         setPhase('editing');
       } else {
-        setError(res.error || '转写失败');
-        setPhase('editing');
+        // Backend failed — use Web Speech API result as fallback
+        const fallback = (speechFinalRef.current + speechInterimRef.current).trim();
+        if (fallback) {
+          setTranscript(fallback);
+          setPhase('editing');
+        } else {
+          setError(res.error || '转写失败');
+          setPhase('editing');
+        }
       }
     } catch (e: any) {
       if (!mountedRef.current) return;
-      setError(e.message || '转写异常');
-      setPhase('editing');
+      const fallback = (speechFinalRef.current + speechInterimRef.current).trim();
+      if (fallback) {
+        setTranscript(fallback);
+        setPhase('editing');
+      } else {
+        setError(e.message || '转写异常');
+        setPhase('editing');
+      }
     }
   }, [setPhase]);
 
@@ -109,6 +171,9 @@ const VoiceInput = forwardRef<VoiceInputHandle, VoiceInputProps>(function VoiceI
   const startRecording = useCallback(async () => {
     setError('');
     setTranscript('');
+    setInterimText('');
+    speechFinalRef.current = '';
+    speechInterimRef.current = '';
     try {
       const cfg = await api.getSttConfig();
       if (!mountedRef.current) return;
@@ -128,6 +193,7 @@ const VoiceInput = forwardRef<VoiceInputHandle, VoiceInputProps>(function VoiceI
         stream.getTracks().forEach(t => t.stop());
         audioCtxRef.current?.close().catch(() => {});
         audioCtxRef.current = null;
+        try { recognitionRef.current?.stop(); } catch {}
         doTranscribeRef.current();
       };
       mr.start(250);
@@ -136,11 +202,12 @@ const VoiceInput = forwardRef<VoiceInputHandle, VoiceInputProps>(function VoiceI
       setElapsed(0);
       timerRef.current = setInterval(() => setElapsed(v => v + 1), 1000);
       startLevelMeter(stream);
+      startSpeechRecognition(cfg?.language || 'zh');
     } catch (e: any) {
       if (!mountedRef.current) return;
       setError(`麦克风访问失败: ${e.message || e}`);
     }
-  }, [startLevelMeter, setPhase]);
+  }, [startLevelMeter, setPhase, startSpeechRecognition]);
 
   const stopRecording = useCallback(() => {
     if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
@@ -175,7 +242,6 @@ const VoiceInput = forwardRef<VoiceInputHandle, VoiceInputProps>(function VoiceI
   const fmt = (s: number) =>
     `${String(Math.floor(s / 60)).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}`;
 
-  // Auto-start recording on mount
   useEffect(() => { startRecording(); }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   return (
@@ -199,6 +265,11 @@ const VoiceInput = forwardRef<VoiceInputHandle, VoiceInputProps>(function VoiceI
             ⏹ 停止
           </button>
         </div>
+      )}
+
+      {/* Live interim text from Web Speech API — visible during recording & transcribing */}
+      {(phase === 'recording' || phase === 'transcribing') && interimText && (
+        <div style={interimStyle}>{interimText}</div>
       )}
 
       {phase === 'transcribing' && (
@@ -266,6 +337,13 @@ const inlineStopBtn: React.CSSProperties = {
   marginLeft: 'auto', padding: '3px 10px', borderRadius: 6,
   border: '1px solid rgba(248,81,73,0.3)', background: 'rgba(248,81,73,0.1)',
   color: '#f85149', fontSize: 12, cursor: 'pointer', fontWeight: 500,
+};
+
+const interimStyle: React.CSSProperties = {
+  padding: '4px 12px', fontSize: 13, lineHeight: 1.5,
+  color: 'var(--theme-text-muted, #656d76)', fontStyle: 'italic',
+  maxHeight: 80, overflow: 'auto',
+  borderLeft: '2px solid rgba(248,81,73,0.3)',
 };
 
 const editPanelStyle: React.CSSProperties = {

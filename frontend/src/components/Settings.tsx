@@ -198,9 +198,10 @@ export const Settings: React.FC<SettingsProps> = ({
               <select
                 value={sttCfg.mode || 'api'}
                 onChange={(e) => handleSttChange('mode', e.target.value)}
-                style={{ ...inputStyle, flex: '0 0 auto', width: 100 }}
+                style={{ ...inputStyle, flex: '0 0 auto', width: 120 }}
               >
-                <option value="api">API</option>
+                <option value="api">API (OpenAI)</option>
+                <option value="dashscope">DashScope</option>
                 <option value="local">Local</option>
               </select>
               <select
@@ -284,6 +285,35 @@ export const Settings: React.FC<SettingsProps> = ({
                   onChange={(e) => handleSttChange('apiModel', e.target.value)}
                   style={inputStyle}
                 />
+              </div>
+            )}
+            {sttCfg.mode === 'dashscope' && (
+              <div style={{ marginTop: 8, display: 'flex', flexDirection: 'column', gap: 6 }}>
+                <input
+                  placeholder="DashScope API Key (DASHSCOPE_API_KEY)"
+                  type="password"
+                  value={sttCfg.apiKey || ''}
+                  onChange={(e) => handleSttChange('apiKey', e.target.value)}
+                  style={inputStyle}
+                />
+                <select
+                  value={sttCfg.apiModel || 'sensevoice-v1'}
+                  onChange={(e) => handleSttChange('apiModel', e.target.value)}
+                  style={{ ...inputStyle, flex: '0 0 auto' }}
+                >
+                  <option value="sensevoice-v1">SenseVoice v1 (50+ 语言)</option>
+                  <option value="paraformer-v2">Paraformer v2 (中英)</option>
+                  <option value="fun-asr">FunASR (需 pip install dashscope)</option>
+                </select>
+                <input
+                  placeholder="Base URL (可选, 默认阿里云)"
+                  value={sttCfg.apiBaseUrl || ''}
+                  onChange={(e) => handleSttChange('apiBaseUrl', e.target.value)}
+                  style={inputStyle}
+                />
+                <span style={{ fontSize: 11, color: 'var(--theme-text-muted)' }}>
+                  sensevoice/paraformer 走 OpenAI 兼容接口; fun-asr 走原生 SDK
+                </span>
               </div>
             )}
             <button
