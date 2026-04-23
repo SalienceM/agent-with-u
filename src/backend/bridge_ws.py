@@ -878,6 +878,35 @@ class BridgeWS:
 
     # ── RPC: 语音转文字 (STT) ────────────────────────────────────────
 
+    def _rpc_sttCheckLocal(self) -> str:
+        """检查本地 STT 依赖是否已安装。"""
+        try:
+            import faster_whisper  # type: ignore  # noqa: F401
+            return json.dumps({"installed": True}, ensure_ascii=False)
+        except ImportError:
+            return json.dumps({"installed": False}, ensure_ascii=False)
+
+    async def _rpc_sttInstallLocal(self) -> str:
+        """自动安装 faster-whisper（pip install faster-whisper）。"""
+        import subprocess as _sp
+        loop = asyncio.get_running_loop()
+        def _run():
+            try:
+                r = _sp.run(
+                    [sys.executable, "-m", "pip", "install", "faster-whisper"],
+                    capture_output=True, text=True, timeout=300,
+                )
+                ok = r.returncode == 0
+                output = (r.stdout or "") + (r.stderr or "")
+                # 截断，避免前端 JSON 过大
+                if len(output) > 2000:
+                    output = output[-2000:]
+                return {"ok": ok, "output": output}
+            except Exception as e:
+                return {"ok": False, "output": str(e)}
+        result = await loop.run_in_executor(None, _run)
+        return json.dumps(result, ensure_ascii=False)
+
     def _rpc_getSttConfig(self) -> str:
         """返回当前 STT 配置。"""
         from .stt_service import load_stt_config

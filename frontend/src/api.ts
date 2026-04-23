@@ -641,6 +641,16 @@ export const api = {
 
   // ── STT 语音转文字 ──────────────────────────────────────────
 
+  async sttCheckLocal(): Promise<{ installed: boolean }> {
+    const r = await call('sttCheckLocal');
+    try { return typeof r === 'string' ? JSON.parse(r) : r; } catch { return { installed: false }; }
+  },
+
+  async sttInstallLocal(): Promise<{ ok: boolean; output?: string }> {
+    const r = await call('sttInstallLocal');
+    try { return typeof r === 'string' ? JSON.parse(r) : r; } catch { return { ok: false, output: 'parse error' }; }
+  },
+
   async getSttConfig(): Promise<any> {
     const r = await call('getSttConfig');
     try { return typeof r === 'string' ? JSON.parse(r) : r; } catch { return {}; }
@@ -750,6 +760,8 @@ function mockDispatch(method: string, params: any[]): any {
     case 'setSkillDefault': return JSON.stringify({ status: 'ok' });
     case 'getDefaultAbilities': return JSON.stringify({ skills: [], prompts: [] });
     case 'getAppVersion': return '0.0.0-dev';
+    case 'sttCheckLocal': return JSON.stringify({ installed: false });
+    case 'sttInstallLocal': return JSON.stringify({ ok: false, output: 'mock mode' });
     case 'getSttConfig': return JSON.stringify({ mode: 'api', language: 'zh', localModel: 'base', apiBaseUrl: '', apiKey: '', apiModel: 'whisper-1' });
     case 'saveSttConfig': return JSON.stringify({ ok: true });
     case 'sttTranscribe': return JSON.stringify({ ok: false, error: 'mock mode' });

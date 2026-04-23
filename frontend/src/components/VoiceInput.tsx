@@ -154,6 +154,41 @@ const VoiceInput: React.FC<VoiceInputProps> = memo(function VoiceInput({
   const [error, setError] = useState('');
   const [elapsed, setElapsed] = useState(0);
   const [levels, setLevels] = useState<number[]>(Array(16).fill(0));
+  const [localMissing, setLocalMissing] = useState(false);
+  const [installing, setInstalling] = useState(false);
+  const [installLog, setInstallLog] = useState('');
+
+  // ── 打开时检测 local 依赖 ────────────────────
+  useEffect(() => {
+    let cancelled = false;
+    api.getSttConfig().then(async (cfg) => {
+      if (cancelled) return;
+      if (cfg?.mode === 'local') {
+        const chk = await api.sttCheckLocal();
+        if (!cancelled && !chk.installed) setLocalMissing(true);
+      }
+    }).catch(() => {});
+    return () => { cancelled = true; };
+  }, []);
+
+  const handleInstall = useCallback(async () => {
+    setInstalling(true);
+    setInstallLog('正在安装 faster-whisper，请稍候...\n');
+    try {
+      const res = await api.sttInstallLocal();
+      setInstallLog((prev) => prev + (res.output || '') + '\n');
+      if (res.ok) {
+        setLocalMissing(false);
+        setInstallLog((prev) => prev + '\n✅ 安装成功！可以开始录音了。');
+      } else {
+        setInstallLog((prev) => prev + '\n❌ 安装失败，请手动执行: pip install faster-whisper');
+      }
+    } catch (e: any) {
+      setInstallLog((prev) => prev + '\n❌ ' + (e.message || '安装异常'));
+    } finally {
+      setInstalling(false);
+    }
+  }, []);
 
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const chunksRef = useRef<Blob[]>([]);
@@ -309,6 +344,60 @@ const VoiceInput: React.FC<VoiceInputProps> = memo(function VoiceInput({
             <span style={{ fontSize: 12, color: '#f85149', fontWeight: 400 }}>● 录音中</span>
           )}
         </h3>
+
+        {/* ── 依赖缺失提示 ── */}
+        {localMissing && (
+          <div
+            style={{
+              padding: '14px 16px',
+              borderRadius: 10,
+              background: 'rgba(234,179,8,0.1)',
+              border: '1px solid rgba(234,179,8,0.3)',
+              display: 'flex',
+              flexDirection: 'column',
+              gap: 10,
+            }}
+          >
+            <div style={{ fontSize: 13, color: 'var(--theme-text, #1f2328)', fontWeight: 600 }}>
+              ⚠️ 本地模式需要安装 <code style={{ fontSize: 12 }}>faster-whisper</code>
+            </div>
+            <div style={{ fontSize: 12, color: 'var(--theme-text-muted, #656d76)' }}>
+              点击下方按钮自动安装，或手动执行：
+              <code style={{ display: 'block', marginTop: 4, fontSize: 11, padding: '4px 8px', borderRadius: 4, background: 'rgba(0,0,0,0.06)' }}>
+                pip install faster-whisper
+              </code>
+            </div>
+            <button
+              onClick={handleInstall}
+              disabled={installing}
+              style={{
+                ...primaryBtn,
+                alignSelf: 'flex-start',
+                opacity: installing ? 0.6 : 1,
+              }}
+            >
+              {installing ? '⏳ 安装中...' : '📦 一键安装'}
+            </button>
+            {installLog && (
+              <pre
+                style={{
+                  margin: 0,
+                  padding: 8,
+                  borderRadius: 6,
+                  background: 'rgba(0,0,0,0.05)',
+                  color: 'var(--theme-text, #1f2328)',
+                  fontSize: 11,
+                  maxHeight: 160,
+                  overflow: 'auto',
+                  whiteSpace: 'pre-wrap',
+                  wordBreak: 'break-all',
+                }}
+              >
+                {installLog}
+              </pre>
+            )}
+          </div>
+        )}
 
         {/* ── 空闲 / 录音阶段 ── */}
         {(phase === 'idle' || phase === 'recording') && (
