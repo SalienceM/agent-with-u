@@ -266,7 +266,14 @@ async def transcribe_dashscope(
         raise ValueError("DashScope 需要配置 apiKey")
 
     if api_model in _DASHSCOPE_COMPAT_MODELS:
-        compat_base = api_base_url or "https://dashscope.aliyuncs.com/compatible-mode/v1"
+        # 从用户 URL 提取 host（支持北京 / 新加坡地域），始终用 /compatible-mode/v1
+        host = "https://dashscope.aliyuncs.com"
+        if api_base_url:
+            from urllib.parse import urlparse
+            parsed = urlparse(api_base_url)
+            if parsed.scheme and parsed.netloc:
+                host = f"{parsed.scheme}://{parsed.netloc}"
+        compat_base = f"{host}/compatible-mode/v1"
         return await transcribe_api(
             audio_bytes, language, compat_base, api_key, api_model,
         )
