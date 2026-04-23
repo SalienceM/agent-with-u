@@ -30,17 +30,39 @@ export const Settings: React.FC<SettingsProps> = ({
   const [appVersion, setAppVersion] = useState<string>('');
   const [sttCfg, setSttCfg] = useState<any>(null);
   const [sttSaving, setSttSaving] = useState(false);
+  const [audioDevices, setAudioDevices] = useState<MediaDeviceInfo[]>([]);
+  const [localInstalled, setLocalInstalled] = useState<boolean | null>(null);
+  const [installing, setInstalling] = useState(false);
+  const [installLog, setInstallLog] = useState('');
 
   useEffect(() => {
     if (!isOpen) return;
     let cancelled = false;
     api.getAppVersion().then((v) => { if (!cancelled) setAppVersion(v); }).catch(() => {});
-    api.getSttConfig().then((c) => { if (!cancelled) setSttCfg(c); }).catch(() => {});
+    api.getSttConfig().then((c) => {
+      if (cancelled) return;
+      setSttCfg(c);
+      if (c?.mode === 'local') {
+        api.sttCheckLocal().then((r) => { if (!cancelled) setLocalInstalled(r.installed); }).catch(() => {});
+      }
+    }).catch(() => {});
+    navigator.mediaDevices.getUserMedia({ audio: true })
+      .then((stream) => {
+        stream.getTracks().forEach(t => t.stop());
+        return navigator.mediaDevices.enumerateDevices();
+      })
+      .then((devices) => {
+        if (!cancelled) setAudioDevices(devices.filter(d => d.kind === 'audioinput'));
+      })
+      .catch(() => {});
     return () => { cancelled = true; };
   }, [isOpen]);
 
   const handleSttChange = useCallback((field: string, value: string) => {
     setSttCfg((prev: any) => prev ? { ...prev, [field]: value } : prev);
+    if (field === 'mode' && value === 'local') {
+      api.sttCheckLocal().then((r) => setLocalInstalled(r.installed)).catch(() => {});
+    }
   }, []);
 
   const handleSttSave = useCallback(async () => {
@@ -49,6 +71,25 @@ export const Settings: React.FC<SettingsProps> = ({
     await api.saveSttConfig(sttCfg);
     setSttSaving(false);
   }, [sttCfg]);
+
+  const handleSttInstall = useCallback(async () => {
+    setInstalling(true);
+    setInstallLog('正在安装 faster-whisper...\n');
+    try {
+      const res = await api.sttInstallLocal();
+      setInstallLog(prev => prev + (res.output || '') + '\n');
+      if (res.ok) {
+        setLocalInstalled(true);
+        setInstallLog(prev => prev + '✅ 安装成功！');
+      } else {
+        setInstallLog(prev => prev + '❌ 安装失败');
+      }
+    } catch (e: any) {
+      setInstallLog(prev => prev + '❌ ' + (e.message || '安装异常'));
+    } finally {
+      setInstalling(false);
+    }
+  }, []);
 
   const handleFileChange = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -174,6 +215,38 @@ export const Settings: React.FC<SettingsProps> = ({
                 <option value="">Auto</option>
               </select>
             </div>
+            {audioDevices.length > 0 && (
+              <div style={{ marginTop: 8, display: 'flex', gap: 8, alignItems: 'center' }}>
+                <span style={{ fontSize: 12, color: 'var(--theme-text-muted)', whiteSpace: 'nowrap' }}>Mic:</span>
+                <select
+                  value={sttCfg.deviceId || ''}
+                  onChange={(e) => handleSttChange('deviceId', e.target.value)}
+                  style={{ ...inputStyle, flex: 1 }}
+                >
+                  <option value="">默认麦克风</option>
+                  {audioDevices.map((d) => (
+                    <option key={d.deviceId} value={d.deviceId}>
+                      {d.label || `Mic (${d.deviceId.slice(0, 8)})`}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            )}
+            {sttCfg.mode === 'local' && localInstalled === false && (
+              <div style={{ marginTop: 8, padding: '8px 12px', borderRadius: 8, background: 'rgba(234,179,8,0.08)', border: '1px solid rgba(234,179,8,0.2)' }}>
+                <div style={{ fontSize: 12, color: 'var(--theme-text)', marginBottom: 6 }}>⚠️ faster-whisper 未安装</div>
+                <button
+                  onClick={handleSttInstall}
+                  disabled={installing}
+                  style={{ ...actionBtnStyle, flex: 'none', opacity: installing ? 0.6 : 1 }}
+                >
+                  {installing ? '⏳ 安装中...' : '📦 一键安装'}
+                </button>
+                {installLog && (
+                  <pre style={{ margin: '6px 0 0', padding: 6, borderRadius: 4, background: 'rgba(0,0,0,0.05)', color: 'var(--theme-text)', fontSize: 10, maxHeight: 120, overflow: 'auto', whiteSpace: 'pre-wrap', wordBreak: 'break-all' as const }}>{installLog}</pre>
+                )}
+              </div>
+            )}
             {sttCfg.mode === 'local' && (
               <div style={{ marginTop: 8, display: 'flex', gap: 8, alignItems: 'center' }}>
                 <span style={{ fontSize: 12, color: 'var(--theme-text-muted)', whiteSpace: 'nowrap' }}>Model:</span>
@@ -188,7 +261,6 @@ export const Settings: React.FC<SettingsProps> = ({
                   <option value="medium">medium</option>
                   <option value="large-v3">large-v3 (最佳)</option>
                 </select>
-                <span style={{ fontSize: 11, color: 'var(--theme-text-muted)' }}>需 pip install faster-whisper</span>
               </div>
             )}
             {sttCfg.mode === 'api' && (

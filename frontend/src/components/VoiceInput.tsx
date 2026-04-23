@@ -1,250 +1,68 @@
-/**
- * VoiceInput — 语音输入组件
- *
- * 功能：录音 → 转写 → 编辑 → AI 润色 → 插入到输入框
- */
-import React, { useState, useRef, useCallback, useEffect, memo } from 'react';
+import React, { useState, useRef, useCallback, useEffect, useImperativeHandle, forwardRef } from 'react';
 import { api } from '../api';
 
-// ═══════════════════════════════════════
-//  Types
-// ═══════════════════════════════════════
+export interface VoiceInputHandle {
+  stopRecording: () => void;
+}
 
 interface VoiceInputProps {
   sessionId?: string;
   onInsert: (text: string) => void;
   onClose: () => void;
+  onPhaseChange?: (phase: string | null) => void;
 }
 
-type Phase = 'idle' | 'recording' | 'transcribing' | 'editing' | 'refining';
+type Phase = 'recording' | 'transcribing' | 'editing' | 'refining';
 
-// ═══════════════════════════════════════
-//  Styles
-// ═══════════════════════════════════════
-
-const overlayStyle: React.CSSProperties = {
-  position: 'fixed',
-  inset: 0,
-  background: 'rgba(0,0,0,0.45)',
-  zIndex: 9000,
-  display: 'flex',
-  alignItems: 'center',
-  justifyContent: 'center',
-};
-
-const panelStyle: React.CSSProperties = {
-  background: 'var(--theme-bg-secondary, #f6f8fa)',
-  borderRadius: 16,
-  padding: 24,
-  width: 520,
-  maxWidth: '92vw',
-  maxHeight: '80vh',
-  display: 'flex',
-  flexDirection: 'column',
-  gap: 16,
-  boxShadow: '0 20px 60px rgba(0,0,0,0.3)',
-  animation: 'dialogSlideIn 0.28s cubic-bezier(0.22,0.61,0.36,1)',
-};
-
-const titleStyle: React.CSSProperties = {
-  margin: 0,
-  fontSize: 16,
-  fontWeight: 700,
-  color: 'var(--theme-text, #1f2328)',
-  display: 'flex',
-  alignItems: 'center',
-  gap: 8,
-};
-
-const recBtnStyle: React.CSSProperties = {
-  width: 80,
-  height: 80,
-  borderRadius: '50%',
-  border: 'none',
-  cursor: 'pointer',
-  fontSize: 32,
-  display: 'flex',
-  alignItems: 'center',
-  justifyContent: 'center',
-  transition: 'transform 0.15s, box-shadow 0.15s',
-  alignSelf: 'center',
-};
-
-const textareaStyle: React.CSSProperties = {
-  width: '100%',
-  minHeight: 120,
-  maxHeight: 300,
-  padding: 12,
-  borderRadius: 8,
-  border: '1px solid var(--theme-border, rgba(0,0,0,0.12))',
-  background: 'var(--theme-input-bg, #fff)',
-  color: 'var(--theme-text, #1f2328)',
-  fontSize: 14,
-  lineHeight: 1.6,
-  resize: 'vertical',
-  fontFamily: 'inherit',
-  outline: 'none',
-  boxSizing: 'border-box',
-};
-
-const toolbarStyle: React.CSSProperties = {
-  display: 'flex',
-  gap: 8,
-  flexWrap: 'wrap',
-  justifyContent: 'flex-end',
-};
-
-const btnBase: React.CSSProperties = {
-  padding: '6px 16px',
-  borderRadius: 8,
-  border: '1px solid var(--theme-border, rgba(0,0,0,0.12))',
-  background: 'var(--theme-bg, #fff)',
-  color: 'var(--theme-text, #1f2328)',
-  fontSize: 13,
-  cursor: 'pointer',
-  fontWeight: 500,
-  transition: 'opacity 0.15s',
-};
-
-const primaryBtn: React.CSSProperties = {
-  ...btnBase,
-  background: 'var(--theme-accent, #0969da)',
-  color: '#fff',
-  border: 'none',
-};
-
-const dangerBtn: React.CSSProperties = {
-  ...btnBase,
-  color: 'var(--theme-error, #cf222e)',
-};
-
-const statusStyle: React.CSSProperties = {
-  fontSize: 12,
-  color: 'var(--theme-text-muted, #656d76)',
-  textAlign: 'center',
-};
-
-const timerStyle: React.CSSProperties = {
-  fontSize: 24,
-  fontFamily: 'monospace',
-  fontWeight: 600,
-  color: 'var(--theme-text, #1f2328)',
-  textAlign: 'center',
-};
-
-const levelBarContainer: React.CSSProperties = {
-  display: 'flex',
-  gap: 3,
-  justifyContent: 'center',
-  alignItems: 'flex-end',
-  height: 40,
-};
-
-// ═══════════════════════════════════════
-//  Component
-// ═══════════════════════════════════════
-
-const VoiceInput: React.FC<VoiceInputProps> = memo(function VoiceInput({
-  sessionId,
-  onInsert,
-  onClose,
-}) {
-  const [phase, setPhase] = useState<Phase>('idle');
+const VoiceInput = forwardRef<VoiceInputHandle, VoiceInputProps>(function VoiceInput(
+  { sessionId, onInsert, onClose, onPhaseChange },
+  ref,
+) {
+  const [phase, setPhaseRaw] = useState<Phase>('recording');
   const [transcript, setTranscript] = useState('');
   const [error, setError] = useState('');
   const [elapsed, setElapsed] = useState(0);
   const [levels, setLevels] = useState<number[]>(Array(16).fill(0));
-  const [localMissing, setLocalMissing] = useState(false);
-  const [installing, setInstalling] = useState(false);
-  const [installLog, setInstallLog] = useState('');
-  const [pythonPath, setPythonPath] = useState('');
-  const [audioDevices, setAudioDevices] = useState<MediaDeviceInfo[]>([]);
-  const [selectedDeviceId, setSelectedDeviceId] = useState<string>('');
-  const [sttMode, setSttMode] = useState<string>('api');
-
-  // ── 打开时：枚举麦克风 + 检测 local 依赖 ────────
-  useEffect(() => {
-    let cancelled = false;
-    // 枚举音频输入设备
-    (async () => {
-      try {
-        // 先请求一次权限，否则 enumerateDevices 返回的 label 为空
-        const tmpStream = await navigator.mediaDevices.getUserMedia({ audio: true });
-        tmpStream.getTracks().forEach((t) => t.stop());
-        const devices = await navigator.mediaDevices.enumerateDevices();
-        if (!cancelled) {
-          const inputs = devices.filter((d) => d.kind === 'audioinput');
-          setAudioDevices(inputs);
-          // 从 config 恢复上次选择
-          const cfg = await api.getSttConfig();
-          if (!cancelled && cfg) {
-            setSttMode(cfg.mode || 'api');
-            if (cfg.deviceId && inputs.some((d) => d.deviceId === cfg.deviceId)) {
-              setSelectedDeviceId(cfg.deviceId);
-            }
-            if (cfg.mode === 'local') {
-              const chk = await api.sttCheckLocal();
-              if (!cancelled) {
-                if (chk.pythonPath) setPythonPath(chk.pythonPath);
-                if (!chk.installed) setLocalMissing(true);
-              }
-            }
-          }
-        }
-      } catch (e: any) {
-        if (!cancelled) setError(`麦克风枚举失败: ${e.message || e}`);
-      }
-    })();
-    return () => { cancelled = true; };
-  }, []);
-
-  const handleInstall = useCallback(async () => {
-    setInstalling(true);
-    setInstallLog('正在安装 faster-whisper，请稍候...\n');
-    try {
-      const res = await api.sttInstallLocal();
-      setInstallLog((prev) => prev + (res.output || '') + '\n');
-      if (res.ok) {
-        setLocalMissing(false);
-        setInstallLog((prev) => prev + '\n✅ 安装成功！可以开始录音了。');
-      } else {
-        setInstallLog((prev) => prev + '\n❌ 安装失败，请手动执行: pip install faster-whisper');
-      }
-    } catch (e: any) {
-      setInstallLog((prev) => prev + '\n❌ ' + (e.message || '安装异常'));
-    } finally {
-      setInstalling(false);
-    }
-  }, []);
 
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const chunksRef = useRef<Blob[]>([]);
   const timerRef = useRef<ReturnType<typeof setInterval>>();
-  const analyserRef = useRef<AnalyserNode | null>(null);
   const animRef = useRef<number>(0);
   const streamRef = useRef<MediaStream | null>(null);
+  const audioCtxRef = useRef<AudioContext | null>(null);
+  const mountedRef = useRef(true);
 
-  // ── 清理 ────────────────────────────────────
+  const onPhaseChangeRef = useRef(onPhaseChange);
+  onPhaseChangeRef.current = onPhaseChange;
+
+  const setPhase = useCallback((p: Phase) => {
+    setPhaseRaw(p);
+    onPhaseChangeRef.current?.(p);
+  }, []);
+
   useEffect(() => {
+    mountedRef.current = true;
     return () => {
+      mountedRef.current = false;
       clearInterval(timerRef.current);
       cancelAnimationFrame(animRef.current);
-      streamRef.current?.getTracks().forEach((t) => t.stop());
+      streamRef.current?.getTracks().forEach(t => t.stop());
+      audioCtxRef.current?.close().catch(() => {});
+      onPhaseChangeRef.current?.(null);
     };
   }, []);
 
-  // ── 音量可视化 ────────────────────────────────
   const startLevelMeter = useCallback((stream: MediaStream) => {
     try {
       const ctx = new AudioContext();
+      audioCtxRef.current = ctx;
       const src = ctx.createMediaStreamSource(stream);
       const analyser = ctx.createAnalyser();
       analyser.fftSize = 64;
       src.connect(analyser);
-      analyserRef.current = analyser;
-
       const buf = new Uint8Array(analyser.frequencyBinCount);
       const tick = () => {
+        if (!mountedRef.current) return;
         analyser.getByteFrequencyData(buf);
         const bars = Array.from({ length: 16 }, (_, i) => {
           const idx = Math.floor((i / 16) * buf.length);
@@ -254,53 +72,10 @@ const VoiceInput: React.FC<VoiceInputProps> = memo(function VoiceInput({
         animRef.current = requestAnimationFrame(tick);
       };
       tick();
-    } catch {
-      // AudioContext not supported — ignore
-    }
+    } catch {}
   }, []);
 
-  // ── 开始录音 ─────────────────────────────────
-  const startRecording = useCallback(async () => {
-    setError('');
-    setTranscript('');
-    try {
-      const audioConstraints: MediaTrackConstraints = selectedDeviceId
-        ? { deviceId: { exact: selectedDeviceId } }
-        : true;
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: audioConstraints });
-      streamRef.current = stream;
-      const mr = new MediaRecorder(stream, { mimeType: 'audio/webm;codecs=opus' });
-      chunksRef.current = [];
-      mr.ondataavailable = (e) => {
-        if (e.data.size > 0) chunksRef.current.push(e.data);
-      };
-      mr.onstop = () => {
-        clearInterval(timerRef.current);
-        cancelAnimationFrame(animRef.current);
-        setLevels(Array(16).fill(0));
-        stream.getTracks().forEach((t) => t.stop());
-        handleTranscribe();
-      };
-      mr.start(250);
-      mediaRecorderRef.current = mr;
-      setPhase('recording');
-      setElapsed(0);
-      timerRef.current = setInterval(() => setElapsed((v) => v + 1), 1000);
-      startLevelMeter(stream);
-    } catch (e: any) {
-      setError(`麦克风访问失败: ${e.message || e}`);
-    }
-  }, [startLevelMeter, selectedDeviceId]);
-
-  // ── 停止录音 ─────────────────────────────────
-  const stopRecording = useCallback(() => {
-    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
-      mediaRecorderRef.current.stop();
-    }
-  }, []);
-
-  // ── 转写 ─────────────────────────────────────
-  const handleTranscribe = useCallback(async () => {
+  const doTranscribe = useCallback(async () => {
     setPhase('transcribing');
     setError('');
     try {
@@ -313,286 +88,205 @@ const VoiceInput: React.FC<VoiceInputProps> = memo(function VoiceInput({
       }
       const b64 = btoa(binary);
       const res = await api.sttTranscribe(b64);
+      if (!mountedRef.current) return;
       if (res.ok && res.text) {
         setTranscript(res.text);
         setPhase('editing');
       } else {
         setError(res.error || '转写失败');
-        setPhase('idle');
+        setPhase('editing');
       }
     } catch (e: any) {
+      if (!mountedRef.current) return;
       setError(e.message || '转写异常');
-      setPhase('idle');
+      setPhase('editing');
+    }
+  }, [setPhase]);
+
+  const doTranscribeRef = useRef(doTranscribe);
+  doTranscribeRef.current = doTranscribe;
+
+  const startRecording = useCallback(async () => {
+    setError('');
+    setTranscript('');
+    try {
+      const cfg = await api.getSttConfig();
+      if (!mountedRef.current) return;
+      const deviceId = cfg?.deviceId || '';
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: deviceId ? { deviceId: { exact: deviceId } } : true,
+      });
+      if (!mountedRef.current) { stream.getTracks().forEach(t => t.stop()); return; }
+      streamRef.current = stream;
+      const mr = new MediaRecorder(stream, { mimeType: 'audio/webm;codecs=opus' });
+      chunksRef.current = [];
+      mr.ondataavailable = (e) => { if (e.data.size > 0) chunksRef.current.push(e.data); };
+      mr.onstop = () => {
+        clearInterval(timerRef.current);
+        cancelAnimationFrame(animRef.current);
+        setLevels(Array(16).fill(0));
+        stream.getTracks().forEach(t => t.stop());
+        audioCtxRef.current?.close().catch(() => {});
+        audioCtxRef.current = null;
+        doTranscribeRef.current();
+      };
+      mr.start(250);
+      mediaRecorderRef.current = mr;
+      setPhase('recording');
+      setElapsed(0);
+      timerRef.current = setInterval(() => setElapsed(v => v + 1), 1000);
+      startLevelMeter(stream);
+    } catch (e: any) {
+      if (!mountedRef.current) return;
+      setError(`麦克风访问失败: ${e.message || e}`);
+    }
+  }, [startLevelMeter, setPhase]);
+
+  const stopRecording = useCallback(() => {
+    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
+      mediaRecorderRef.current.stop();
     }
   }, []);
 
-  // ── AI 润色 ──────────────────────────────────
+  useImperativeHandle(ref, () => ({ stopRecording }), [stopRecording]);
+
   const handleRefine = useCallback(async () => {
     if (!transcript.trim()) return;
     setPhase('refining');
     setError('');
     try {
       const res = await api.sttRefine(transcript, sessionId);
-      if (res.ok && res.text) {
-        setTranscript(res.text);
-      } else {
-        setError(res.error || '润色失败');
-      }
+      if (!mountedRef.current) return;
+      if (res.ok && res.text) setTranscript(res.text);
+      else setError(res.error || '润色失败');
     } catch (e: any) {
+      if (!mountedRef.current) return;
       setError(e.message || '润色异常');
     } finally {
-      setPhase('editing');
+      if (mountedRef.current) setPhase('editing');
     }
-  }, [transcript, sessionId]);
+  }, [transcript, sessionId, setPhase]);
 
-  // ── 插入到输入框 ──────────────────────────────
   const handleInsert = useCallback(() => {
-    if (transcript.trim()) {
-      onInsert(transcript.trim());
-    }
+    if (transcript.trim()) onInsert(transcript.trim());
     onClose();
   }, [transcript, onInsert, onClose]);
 
-  // ── 重新录音 ──────────────────────────────────
-  const handleReRecord = useCallback(() => {
-    setTranscript('');
-    setError('');
-    setPhase('idle');
-  }, []);
-
-  // ── 格式化时间 ────────────────────────────────
   const fmt = (s: number) =>
     `${String(Math.floor(s / 60)).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}`;
 
-  // ── Render ───────────────────────────────────
+  // Auto-start recording on mount
+  useEffect(() => { startRecording(); }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
   return (
-    <div style={overlayStyle} onClick={onClose}>
-      <div style={panelStyle} onClick={(e) => e.stopPropagation()}>
-        <h3 style={titleStyle}>
-          🎙️ 语音输入
-          {phase === 'recording' && (
-            <span style={{ fontSize: 12, color: '#f85149', fontWeight: 400 }}>● 录音中</span>
-          )}
-        </h3>
-
-        {/* ── 依赖缺失提示 ── */}
-        {localMissing && (
-          <div
-            style={{
-              padding: '14px 16px',
-              borderRadius: 10,
-              background: 'rgba(234,179,8,0.1)',
-              border: '1px solid rgba(234,179,8,0.3)',
-              display: 'flex',
-              flexDirection: 'column',
-              gap: 10,
-            }}
-          >
-            <div style={{ fontSize: 13, color: 'var(--theme-text, #1f2328)', fontWeight: 600 }}>
-              ⚠️ 本地模式需要安装 <code style={{ fontSize: 12 }}>faster-whisper</code>
-            </div>
-            <div style={{ fontSize: 12, color: 'var(--theme-text-muted, #656d76)' }}>
-              {pythonPath && !pythonPath.startsWith('(') ? (
-                <>
-                  点击下方按钮自动安装，或手动执行：
-                  <code style={{ display: 'block', marginTop: 4, fontSize: 11, padding: '4px 8px', borderRadius: 4, background: 'rgba(0,0,0,0.06)' }}>
-                    "{pythonPath}" -m pip install faster-whisper
-                  </code>
-                  <span style={{ display: 'block', marginTop: 4, fontSize: 11 }}>
-                    系统 Python: <code>{pythonPath}</code>
-                  </span>
-                </>
-              ) : (
-                <>
-                  <span style={{ color: '#f85149', fontWeight: 600 }}>
-                    未找到系统 Python！
-                  </span>
-                  <br />请先安装 Python 3.10+，确保 <code>python</code> 在 PATH 中，然后重试。
-                  <br />或在 Settings 中切换为 API 模式。
-                </>
-              )}
-            </div>
-            <button
-              onClick={handleInstall}
-              disabled={installing}
-              style={{
-                ...primaryBtn,
-                alignSelf: 'flex-start',
-                opacity: installing ? 0.6 : 1,
-              }}
-            >
-              {installing ? '⏳ 安装中...' : '📦 一键安装'}
-            </button>
-            {installLog && (
-              <pre
-                style={{
-                  margin: 0,
-                  padding: 8,
-                  borderRadius: 6,
-                  background: 'rgba(0,0,0,0.05)',
-                  color: 'var(--theme-text, #1f2328)',
-                  fontSize: 11,
-                  maxHeight: 160,
-                  overflow: 'auto',
-                  whiteSpace: 'pre-wrap',
-                  wordBreak: 'break-all',
-                }}
-              >
-                {installLog}
-              </pre>
-            )}
+    <div style={panelStyle}>
+      {phase === 'recording' && (
+        <div style={recordBarStyle}>
+          <div style={{ display: 'flex', gap: 2, alignItems: 'flex-end', height: 20 }}>
+            {levels.map((v, i) => (
+              <div key={i} style={{
+                width: 2.5, borderRadius: 1,
+                background: `rgba(248,81,73,${0.4 + v * 0.6})`,
+                height: `${Math.max(2, v * 18)}px`,
+                transition: 'height 0.08s',
+              }} />
+            ))}
           </div>
-        )}
-
-        {/* ── 空闲 / 录音阶段 ── */}
-        {(phase === 'idle' || phase === 'recording') && (
-          <>
-            {/* 麦克风选择 + 模式标签 */}
-            {phase === 'idle' && audioDevices.length > 0 && (
-              <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
-                <select
-                  value={selectedDeviceId}
-                  onChange={(e) => {
-                    setSelectedDeviceId(e.target.value);
-                    api.getSttConfig().then((cfg) => {
-                      api.saveSttConfig({ ...cfg, deviceId: e.target.value });
-                    }).catch(() => {});
-                  }}
-                  style={{
-                    flex: 1,
-                    padding: '5px 8px',
-                    borderRadius: 6,
-                    border: '1px solid var(--theme-border, rgba(0,0,0,0.12))',
-                    background: 'var(--theme-input-bg, #fff)',
-                    color: 'var(--theme-text, #1f2328)',
-                    fontSize: 12,
-                    outline: 'none',
-                  }}
-                >
-                  <option value="">默认麦克风</option>
-                  {audioDevices.map((d) => (
-                    <option key={d.deviceId} value={d.deviceId}>
-                      {d.label || `麦克风 (${d.deviceId.slice(0, 8)})`}
-                    </option>
-                  ))}
-                </select>
-                <span style={{ fontSize: 11, color: 'var(--theme-text-muted, #656d76)', whiteSpace: 'nowrap' }}>
-                  模式: {sttMode === 'local' ? '🖥 本地' : '☁️ API'}
-                </span>
-              </div>
-            )}
-
-            {/* 音量条 */}
-            <div style={levelBarContainer}>
-              {levels.map((v, i) => (
-                <div
-                  key={i}
-                  style={{
-                    width: 4,
-                    borderRadius: 2,
-                    background: phase === 'recording'
-                      ? `rgba(248,81,73,${0.4 + v * 0.6})`
-                      : 'var(--theme-border, rgba(0,0,0,0.12))',
-                    height: `${Math.max(4, v * 36)}px`,
-                    transition: 'height 0.08s',
-                  }}
-                />
-              ))}
-            </div>
-
-            {/* 计时器 */}
-            {phase === 'recording' && <div style={timerStyle}>{fmt(elapsed)}</div>}
-
-            {/* 录音按钮 */}
-            <button
-              style={{
-                ...recBtnStyle,
-                background: phase === 'recording' ? '#f85149' : 'var(--theme-accent, #0969da)',
-                color: '#fff',
-                boxShadow: phase === 'recording'
-                  ? '0 0 0 6px rgba(248,81,73,0.25)'
-                  : '0 0 0 4px rgba(9,105,218,0.15)',
-              }}
-              onClick={phase === 'recording' ? stopRecording : startRecording}
-              title={phase === 'recording' ? '停止录音' : '开始录音'}
-            >
-              {phase === 'recording' ? '⏹' : '🎤'}
-            </button>
-
-            <div style={statusStyle}>
-              {phase === 'idle' ? '点击开始录音' : '再次点击停止，将自动转写'}
-            </div>
-          </>
-        )}
-
-        {/* ── 转写中 ── */}
-        {phase === 'transcribing' && (
-          <div style={{ textAlign: 'center', padding: '32px 0' }}>
-            <div style={{ fontSize: 36, marginBottom: 12 }}>⏳</div>
-            <div style={statusStyle}>正在转写语音...</div>
-          </div>
-        )}
-
-        {/* ── 编辑 / 润色 阶段 ── */}
-        {(phase === 'editing' || phase === 'refining') && (
-          <>
-            <textarea
-              style={textareaStyle}
-              value={transcript}
-              onChange={(e) => setTranscript(e.target.value)}
-              placeholder="转写结果将显示在这里..."
-              disabled={phase === 'refining'}
-            />
-            {phase === 'refining' && (
-              <div style={statusStyle}>AI 正在润色...</div>
-            )}
-            <div style={toolbarStyle}>
-              <button style={dangerBtn} onClick={handleReRecord}>
-                🔄 重新录音
-              </button>
-              <button
-                style={btnBase}
-                onClick={handleRefine}
-                disabled={phase === 'refining' || !transcript.trim()}
-                title="用 AI 整理口语化文本，去除语气词、补全标点、合并零散想法"
-              >
-                ✨ AI 润色
-              </button>
-              <button
-                style={primaryBtn}
-                onClick={handleInsert}
-                disabled={!transcript.trim()}
-              >
-                📝 插入输入框
-              </button>
-            </div>
-          </>
-        )}
-
-        {/* ── 错误提示 ── */}
-        {error && (
-          <div
-            style={{
-              padding: '8px 12px',
-              borderRadius: 8,
-              background: 'rgba(248,81,73,0.1)',
-              color: '#f85149',
-              fontSize: 12,
-            }}
-          >
-            {error}
-          </div>
-        )}
-
-        {/* ── 底部关闭 ── */}
-        <div style={{ textAlign: 'center' }}>
-          <button style={{ ...btnBase, fontSize: 12 }} onClick={onClose}>
-            关闭
+          <span style={{ fontSize: 13, fontFamily: 'monospace', fontWeight: 600, color: 'var(--theme-text, #1f2328)' }}>
+            {fmt(elapsed)}
+          </span>
+          <button onClick={stopRecording} style={inlineStopBtn} title="停止录音">
+            ⏹ 停止
           </button>
         </div>
-      </div>
+      )}
+
+      {phase === 'transcribing' && (
+        <div style={recordBarStyle}>
+          <span style={{ fontSize: 14, animation: 'chat-pulse 1.5s infinite' }}>⏳</span>
+          <span style={{ fontSize: 12, color: 'var(--theme-text-muted, #656d76)' }}>转写中...</span>
+        </div>
+      )}
+
+      {(phase === 'editing' || phase === 'refining') && (
+        <div style={editPanelStyle}>
+          <textarea
+            style={editTextareaStyle}
+            value={transcript}
+            onChange={(e) => setTranscript(e.target.value)}
+            disabled={phase === 'refining'}
+            rows={2}
+            autoFocus
+          />
+          <div style={{ display: 'flex', gap: 4, alignItems: 'center' }}>
+            {phase === 'refining' && (
+              <span style={{ fontSize: 11, color: 'var(--theme-text-muted)' }}>润色中...</span>
+            )}
+            <div style={{ flex: 1 }} />
+            <button style={tinyBtnStyle} onClick={onClose} title="取消">✕</button>
+            <button
+              style={tinyBtnStyle}
+              onClick={handleRefine}
+              disabled={phase === 'refining' || !transcript.trim()}
+              title="AI 润色"
+            >✨</button>
+            <button
+              style={{ ...tinyBtnStyle, background: 'var(--theme-accent, #0969da)', color: '#fff', border: 'none' }}
+              onClick={handleInsert}
+              disabled={!transcript.trim()}
+              title="插入到输入框"
+            >↵ 插入</button>
+          </div>
+        </div>
+      )}
+
+      {error && (
+        <div style={{ padding: '4px 8px', fontSize: 11, color: '#f85149', background: 'rgba(248,81,73,0.08)', borderRadius: 6 }}>
+          {error}
+        </div>
+      )}
     </div>
   );
 });
 
 export default VoiceInput;
+
+const panelStyle: React.CSSProperties = {
+  display: 'flex', flexDirection: 'column', gap: 6, marginBottom: 6,
+};
+
+const recordBarStyle: React.CSSProperties = {
+  display: 'flex', alignItems: 'center', gap: 10,
+  padding: '6px 12px', borderRadius: 8,
+  background: 'rgba(248,81,73,0.06)',
+  border: '1px solid rgba(248,81,73,0.15)',
+};
+
+const inlineStopBtn: React.CSSProperties = {
+  marginLeft: 'auto', padding: '3px 10px', borderRadius: 6,
+  border: '1px solid rgba(248,81,73,0.3)', background: 'rgba(248,81,73,0.1)',
+  color: '#f85149', fontSize: 12, cursor: 'pointer', fontWeight: 500,
+};
+
+const editPanelStyle: React.CSSProperties = {
+  display: 'flex', flexDirection: 'column', gap: 6,
+  padding: '8px 12px', borderRadius: 8,
+  background: 'var(--theme-bg-secondary, #f6f8fa)',
+  border: '1px solid var(--theme-border, rgba(0,0,0,0.12))',
+};
+
+const editTextareaStyle: React.CSSProperties = {
+  width: '100%', padding: '6px 8px', borderRadius: 6,
+  border: '1px solid var(--theme-border, rgba(0,0,0,0.12))',
+  background: 'var(--theme-input-bg, #fff)', color: 'var(--theme-text, #1f2328)',
+  fontSize: 13, lineHeight: 1.5, resize: 'vertical', fontFamily: 'inherit',
+  outline: 'none', boxSizing: 'border-box' as const, maxHeight: 120,
+};
+
+const tinyBtnStyle: React.CSSProperties = {
+  padding: '4px 10px', borderRadius: 6,
+  border: '1px solid var(--theme-border, rgba(0,0,0,0.12))',
+  background: 'var(--theme-bg, #fff)', color: 'var(--theme-text, #1f2328)',
+  fontSize: 12, cursor: 'pointer', fontWeight: 500,
+  transition: 'opacity 0.15s', whiteSpace: 'nowrap' as const,
+};

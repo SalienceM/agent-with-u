@@ -1,6 +1,6 @@
 import React, { useRef, useCallback, useEffect, memo, useState, useMemo } from 'react';
 import { ImagePreview } from './ImagePreview';
-import VoiceInput from './VoiceInput';
+import VoiceInput, { type VoiceInputHandle } from './VoiceInput';
 import { useClipboardImage } from '../hooks/useClipboardImage';
 import type { ImageAttachment } from '../hooks/useClipboardImage';
 import { SLASH_COMMANDS } from '../hooks/useChat';
@@ -26,6 +26,10 @@ if (typeof document !== 'undefined' && !document.getElementById('chat-input-css'
     @keyframes dialogSlideIn {
       from { opacity: 0; transform: perspective(900px) rotateX(-14deg) scale(0.96) translateY(-8px); }
       to   { opacity: 1; transform: perspective(900px) rotateX(0deg)   scale(1)    translateY(0); }
+    }
+    @keyframes mic-pulse {
+      0%, 100% { box-shadow: 0 0 0 0 rgba(248,81,73,0.5); }
+      50% { box-shadow: 0 0 0 10px rgba(248,81,73,0); }
     }
   `;
   document.head.appendChild(s);
@@ -153,6 +157,8 @@ const ChatInputInner: React.FC<Props> = ({
   // ── 清理上下文 ──
   const [showNewSessionConfirm, setShowNewSessionConfirm] = useState(false);
   const [showVoiceInput, setShowVoiceInput] = useState(false);
+  const [voicePhase, setVoicePhase] = useState<string | null>(null);
+  const voiceRef = useRef<VoiceInputHandle>(null);
   const handleCompact = useCallback(() => {
     // ★ 二次确认：新会话会清空上下文，误触代价很大
     setShowNewSessionConfirm(true);
@@ -677,6 +683,25 @@ const ChatInputInner: React.FC<Props> = ({
         </div>
       )}
 
+      {/* 语音输入内联面板 */}
+      {showVoiceInput && (
+        <VoiceInput
+          ref={voiceRef}
+          sessionId={sessionId}
+          onInsert={(text) => {
+            if (ref.current) {
+              const cur = ref.current.value;
+              ref.current.value = cur ? cur + '\n' + text : text;
+              ref.current.style.height = 'auto';
+              ref.current.style.height = ref.current.scrollHeight + 'px';
+              ref.current.focus();
+            }
+          }}
+          onClose={() => { setShowVoiceInput(false); setVoicePhase(null); }}
+          onPhaseChange={setVoicePhase}
+        />
+      )}
+
       <div style={{ display: 'flex', gap: 8, alignItems: 'flex-end' }}>
         <textarea
           ref={ref}
@@ -695,10 +720,15 @@ const ChatInputInner: React.FC<Props> = ({
           <button onClick={handleSend} style={sendBtnStyle} title="Send (Enter)">🚀</button>
         )}
         <button
-          onClick={() => setShowVoiceInput(true)}
-          style={micBtnStyle}
-          title="语音输入"
-          disabled={isStreaming}
+          onClick={() => {
+            if (!showVoiceInput) {
+              setShowVoiceInput(true);
+            } else if (voicePhase === 'recording') {
+              voiceRef.current?.stopRecording();
+            }
+          }}
+          style={voicePhase === 'recording' ? micRecordingStyle : micBtnStyle}
+          title={voicePhase === 'recording' ? '停止录音' : '语音输入'}
         >
           🎙️
         </button>
@@ -732,22 +762,7 @@ const ChatInputInner: React.FC<Props> = ({
         </div>
       )}
 
-      {/* 语音输入面板 */}
-      {showVoiceInput && (
-        <VoiceInput
-          sessionId={sessionId}
-          onInsert={(text) => {
-            if (ref.current) {
-              const cur = ref.current.value;
-              ref.current.value = cur ? cur + '\n' + text : text;
-              ref.current.style.height = 'auto';
-              ref.current.style.height = ref.current.scrollHeight + 'px';
-              ref.current.focus();
-            }
-          }}
-          onClose={() => setShowVoiceInput(false)}
-        />
-      )}
+      {/* (voice input rendered inline above textarea) */}
     </div>
   );
 };
@@ -795,6 +810,15 @@ const micBtnStyle: React.CSSProperties = {
   background: 'var(--theme-bg-tertiary, #eaeef2)',
   fontSize: 16,
   padding: '0 8px',
+};
+
+const micRecordingStyle: React.CSSProperties = {
+  ...btnBase,
+  background: '#f85149',
+  color: '#fff',
+  fontSize: 16,
+  padding: '0 8px',
+  animation: 'mic-pulse 1.5s ease-in-out infinite',
 };
 
 const commandPopupStyle: React.CSSProperties = {
