@@ -157,6 +157,7 @@ const VoiceInput: React.FC<VoiceInputProps> = memo(function VoiceInput({
   const [localMissing, setLocalMissing] = useState(false);
   const [installing, setInstalling] = useState(false);
   const [installLog, setInstallLog] = useState('');
+  const [pythonPath, setPythonPath] = useState('');
 
   // ── 打开时检测 local 依赖 ────────────────────
   useEffect(() => {
@@ -165,7 +166,9 @@ const VoiceInput: React.FC<VoiceInputProps> = memo(function VoiceInput({
       if (cancelled) return;
       if (cfg?.mode === 'local') {
         const chk = await api.sttCheckLocal();
-        if (!cancelled && !chk.installed) setLocalMissing(true);
+        if (cancelled) return;
+        if (chk.pythonPath) setPythonPath(chk.pythonPath);
+        if (!chk.installed) setLocalMissing(true);
       }
     }).catch(() => {});
     return () => { cancelled = true; };
@@ -364,8 +367,14 @@ const VoiceInput: React.FC<VoiceInputProps> = memo(function VoiceInput({
             <div style={{ fontSize: 12, color: 'var(--theme-text-muted, #656d76)' }}>
               点击下方按钮自动安装，或手动执行：
               <code style={{ display: 'block', marginTop: 4, fontSize: 11, padding: '4px 8px', borderRadius: 4, background: 'rgba(0,0,0,0.06)' }}>
-                pip install faster-whisper
+                {pythonPath ? `"${pythonPath}" -m pip install faster-whisper` : 'pip install faster-whisper'}
               </code>
+              {pythonPath && (
+                <span style={{ display: 'block', marginTop: 4, fontSize: 11 }}>
+                  ⚠️ 后端 Python 路径: <code>{pythonPath}</code>
+                  <br />请确保用这个 Python 的 pip 安装，否则后端找不到。
+                </span>
+              )}
             </div>
             <button
               onClick={handleInstall}

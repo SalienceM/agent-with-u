@@ -879,31 +879,30 @@ class BridgeWS:
     # ── RPC: 语音转文字 (STT) ────────────────────────────────────────
 
     def _rpc_sttCheckLocal(self) -> str:
-        """检查本地 STT 依赖是否已安装。"""
+        """检查本地 STT 依赖是否已安装，同时返回后端使用的 Python 路径。"""
+        python_path = sys.executable
         try:
             import faster_whisper  # type: ignore  # noqa: F401
-            return json.dumps({"installed": True}, ensure_ascii=False)
+            return json.dumps({"installed": True, "pythonPath": python_path}, ensure_ascii=False)
         except ImportError:
-            return json.dumps({"installed": False}, ensure_ascii=False)
+            return json.dumps({"installed": False, "pythonPath": python_path}, ensure_ascii=False)
 
     async def _rpc_sttInstallLocal(self) -> str:
-        """自动安装 faster-whisper（pip install faster-whisper）。"""
+        """自动安装 faster-whisper，使用后端自身的 Python 确保装到正确环境。"""
         import subprocess as _sp
+        python_path = sys.executable
         loop = asyncio.get_running_loop()
         def _run():
+            cmd = [python_path, "-m", "pip", "install", "faster-whisper"]
             try:
-                r = _sp.run(
-                    [sys.executable, "-m", "pip", "install", "faster-whisper"],
-                    capture_output=True, text=True, timeout=300,
-                )
+                r = _sp.run(cmd, capture_output=True, text=True, timeout=300)
                 ok = r.returncode == 0
-                output = (r.stdout or "") + (r.stderr or "")
-                # 截断，避免前端 JSON 过大
-                if len(output) > 2000:
-                    output = output[-2000:]
-                return {"ok": ok, "output": output}
+                output = f"$ {' '.join(cmd)}\n\n" + (r.stdout or "") + (r.stderr or "")
+                if len(output) > 3000:
+                    output = output[:500] + "\n...(truncated)...\n" + output[-2000:]
+                return {"ok": ok, "output": output, "pythonPath": python_path}
             except Exception as e:
-                return {"ok": False, "output": str(e)}
+                return {"ok": False, "output": str(e), "pythonPath": python_path}
         result = await loop.run_in_executor(None, _run)
         return json.dumps(result, ensure_ascii=False)
 
