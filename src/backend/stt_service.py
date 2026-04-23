@@ -77,10 +77,12 @@ def save_stt_config(cfg: SttConfig) -> None:
 # ═══════════════════════════════════════════════════════════════════════════
 
 _local_model_cache: dict = {}
+_local_force_cpu: bool = False  # 一旦 GPU 失败过，后续直接走 CPU
 
 
 def _get_local_model(model_size: str):
-    """懒加载 faster-whisper 模型，缓存复用。"""
+    """懒加载 faster-whisper 模型，缓存复用。GPU 失败过则永久降级 CPU。"""
+    global _local_force_cpu
     if model_size in _local_model_cache:
         return _local_model_cache[model_size]
     try:
@@ -89,15 +91,40 @@ def _get_local_model(model_size: str):
         raise RuntimeError(
             "本地语音识别需要安装 faster-whisper: pip install faster-whisper"
         )
-    print(f"[STT] 加载本地模型: {model_size} ...", file=sys.stderr, flush=True)
-    try:
-        model = WhisperModel(model_size, device="auto", compute_type="auto")
-    except Exception as e:
-        print(f"[STT] GPU 加载失败 ({e})，降级 CPU", file=sys.stderr, flush=True)
-        model = WhisperModel(model_size, device="cpu", compute_type="int8")
+    if _local_force_cpu:
+        device, ctype = "cpu", "int8"
+    else:
+        device, ctype = "auto", "auto"
+    print(f"[STT] 加载本地模型: {model_size} (device={device}) ...",
+          file=sys.stderr, flush=True)
+    model = WhisperModel(model_size, device=device, compute_type=ctype)
     _local_model_cache[model_size] = model
     print(f"[STT] 模型加载完成: {model_size}", file=sys.stderr, flush=True)
     return model
+
+
+def _transcribe_with_fallback(audio_path: str, language: str, model_size: str) -> str:
+    """转写音频，GPU 出错时自动降级 CPU 并标记后续直接走 CPU。"""
+    global _local_force_cpu
+    model = _get_local_model(model_size)
+    try:
+        segments, _ = model.transcribe(
+            audio_path, language=language if language else None,
+            beam_size=5, vad_filter=True,
+        )
+        return "".join(seg.text for seg in segments).strip()
+    except RuntimeError as e:
+        if _local_force_cpu:
+            raise
+        print(f"[STT] GPU 转写失败 ({e})，降级 CPU 重试", file=sys.stderr, flush=True)
+        _local_force_cpu = True
+        _local_model_cache.pop(model_size, None)
+        model = _get_local_model(model_size)
+        segments, _ = model.transcribe(
+            audio_path, language=language if language else None,
+            beam_size=5, vad_filter=True,
+        )
+        return "".join(seg.text for seg in segments).strip()
 
 
 def _find_system_python() -> Optional[str]:
@@ -124,12 +151,16 @@ audio_path = sys.argv[1]
 language = sys.argv[2] if len(sys.argv) > 2 and sys.argv[2] else None
 model_size = sys.argv[3] if len(sys.argv) > 3 else "base"
 from faster_whisper import WhisperModel
+
+def run(device, compute_type):
+    model = WhisperModel(model_size, device=device, compute_type=compute_type)
+    segs, _ = model.transcribe(audio_path, language=language, beam_size=5, vad_filter=True)
+    return "".join(s.text for s in segs).strip()
+
 try:
-    model = WhisperModel(model_size, device="auto", compute_type="auto")
+    text = run("auto", "auto")
 except Exception:
-    model = WhisperModel(model_size, device="cpu", compute_type="int8")
-segments, _ = model.transcribe(audio_path, language=language, beam_size=5, vad_filter=True)
-text = "".join(seg.text for seg in segments).strip()
+    text = run("cpu", "int8")
 print(json.dumps({"text": text}))
 '''
 
@@ -167,15 +198,8 @@ async def transcribe_local(
                 result = _json.loads(r.stdout.strip().split('\n')[-1])
                 return result.get("text", "")
             else:
-                # ★ 非冻结：直接 import 使用
-                model = _get_local_model(model_size)
-                segments, _ = model.transcribe(
-                    tmp_path,
-                    language=language if language else None,
-                    beam_size=5,
-                    vad_filter=True,
-                )
-                return "".join(seg.text for seg in segments).strip()
+                # ★ 非冻结：直接 import，GPU 失败自动降级 CPU
+                return _transcribe_with_fallback(tmp_path, language, model_size)
         finally:
             try:
                 os.unlink(tmp_path)
