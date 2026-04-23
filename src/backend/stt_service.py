@@ -90,7 +90,11 @@ def _get_local_model(model_size: str):
             "本地语音识别需要安装 faster-whisper: pip install faster-whisper"
         )
     print(f"[STT] 加载本地模型: {model_size} ...", file=sys.stderr, flush=True)
-    model = WhisperModel(model_size, device="auto", compute_type="auto")
+    try:
+        model = WhisperModel(model_size, device="auto", compute_type="auto")
+    except Exception as e:
+        print(f"[STT] GPU 加载失败 ({e})，降级 CPU", file=sys.stderr, flush=True)
+        model = WhisperModel(model_size, device="cpu", compute_type="int8")
     _local_model_cache[model_size] = model
     print(f"[STT] 模型加载完成: {model_size}", file=sys.stderr, flush=True)
     return model
@@ -120,7 +124,10 @@ audio_path = sys.argv[1]
 language = sys.argv[2] if len(sys.argv) > 2 and sys.argv[2] else None
 model_size = sys.argv[3] if len(sys.argv) > 3 else "base"
 from faster_whisper import WhisperModel
-model = WhisperModel(model_size, device="auto", compute_type="auto")
+try:
+    model = WhisperModel(model_size, device="auto", compute_type="auto")
+except Exception:
+    model = WhisperModel(model_size, device="cpu", compute_type="int8")
 segments, _ = model.transcribe(audio_path, language=language, beam_size=5, vad_filter=True)
 text = "".join(seg.text for seg in segments).strip()
 print(json.dumps({"text": text}))
