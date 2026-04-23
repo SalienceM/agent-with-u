@@ -241,7 +241,12 @@ const VoiceInput: React.FC<VoiceInputProps> = memo(function VoiceInput({
     try {
       const blob = new Blob(chunksRef.current, { type: 'audio/webm' });
       const buf = await blob.arrayBuffer();
-      const b64 = btoa(String.fromCharCode(...new Uint8Array(buf)));
+      const bytes = new Uint8Array(buf);
+      let binary = '';
+      for (let i = 0; i < bytes.length; i += 8192) {
+        binary += String.fromCharCode(...bytes.subarray(i, Math.min(i + 8192, bytes.length)));
+      }
+      const b64 = btoa(binary);
       const res = await api.sttTranscribe(b64);
       if (res.ok && res.text) {
         setTranscript(res.text);
