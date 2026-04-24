@@ -268,8 +268,9 @@ async def transcribe_dashscope(
 ) -> str:
     """调用阿里云 DashScope 语音识别。
 
-    sensevoice / paraformer 走 OpenAI 兼容接口（推荐，短音频直传）；
-    fun-asr 等原生模型走 DashScope SDK（需 pip install dashscope）。
+    sensevoice / paraformer 走 OpenAI 兼容接口（短音频直传）；
+    fun-asr 等原生模型走 DashScope REST API（上传→异步任务→轮询）。
+    全部使用 httpx，无需 pip install dashscope。
     """
     if not api_key:
         raise ValueError("DashScope 需要配置 apiKey")
@@ -296,37 +297,23 @@ async def transcribe_dashscope(
     )
 
 
-def _upload_to_dashscope(file_path: str, model: str, api_key: str) -> str:
-    """上传本地文件到 DashScope，返回可访问 URL。"""
-    try:
-        import dashscope
-        if hasattr(dashscope, 'Uploader'):
-            url = dashscope.Uploader.upload(file_path=file_path, model=model)
-            if isinstance(url, str) and url.startswith('http'):
-                return url
-        if hasattr(dashscope, 'Upload'):
-            resp = dashscope.Upload.upload(file_path=file_path, model=model)
-            if hasattr(resp, 'output'):
-                url = (getattr(resp.output, 'uploaded_url', None)
-                       or (resp.output.get('uploaded_url', '')
-                           if isinstance(resp.output, dict) else ''))
-                if url:
-                    return url
-    except Exception as e:
-        print(f"[STT] DashScope SDK 上传失败 ({e})，尝试 REST",
-              file=sys.stderr, flush=True)
-
-    upload_url = "https://dashscope.aliyuncs.com/api/v1/uploads"
+async def _upload_to_dashscope(
+    audio_bytes: bytes, model: str, api_key: str, api_base: str,
+) -> str:
+    """上传音频到 DashScope OSS，返回可访问 URL（纯 httpx，无 SDK 依赖）。"""
+    upload_url = f"{api_base.rstrip('/')}/uploads"
     headers = {
         "Authorization": f"Bearer {api_key}",
         "X-DashScope-OssResourceResolve": "enable",
     }
-    with open(file_path, 'rb') as f:
-        files = {"file": (os.path.basename(file_path), f, "audio/webm")}
-        data = {"model": model}
-        resp = httpx.post(upload_url, headers=headers,
-                          files=files, data=data, timeout=60.0)
-        resp.raise_for_status()
+    files = {"file": ("audio.webm", audio_bytes, "audio/webm")}
+    data = {"model": model}
+
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        resp = await client.post(upload_url, headers=headers, files=files, data=data)
+        if resp.status_code != 200:
+            raise RuntimeError(
+                f"DashScope 文件上传失败 (HTTP {resp.status_code}): {resp.text[:300]}")
         result = resp.json()
 
     url = (result.get("output", {}).get("uploaded_url")
@@ -334,7 +321,7 @@ def _upload_to_dashscope(file_path: str, model: str, api_key: str) -> str:
            or "")
     if not url:
         raise RuntimeError(
-            f"DashScope 文件上传失败: {json.dumps(result, ensure_ascii=False)[:200]}")
+            f"DashScope 文件上传无 URL: {json.dumps(result, ensure_ascii=False)[:200]}")
     return url
 
 
@@ -345,83 +332,83 @@ async def _transcribe_dashscope_native(
     api_key: str,
     api_model: str,
 ) -> str:
-    """通过 DashScope 原生 SDK 调用 fun-asr 等模型（异步任务模式）。"""
-    loop = asyncio.get_running_loop()
+    """通过 DashScope REST API 调用 fun-asr 等模型（异步任务模式，纯 httpx 无 SDK）。
 
-    with tempfile.NamedTemporaryFile(suffix=".webm", delete=False) as tmp:
-        tmp.write(audio_bytes)
-        tmp_path = tmp.name
+    流程: 上传文件 → 提交异步转写任务 → 轮询任务状态 → 获取结果
+    """
+    api_base = api_base_url.rstrip('/') if api_base_url else "https://dashscope.aliyuncs.com/api/v1"
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
 
-    def _run():
-        try:
-            try:
-                import dashscope
-                from dashscope.audio.asr import Transcription
-            except ImportError:
+    # ① 上传音频文件
+    file_url = await _upload_to_dashscope(audio_bytes, api_model, api_key, api_base)
+    print(f"[STT] DashScope 上传完成: {file_url[:80]}...",
+          file=sys.stderr, flush=True)
+
+    # ② 提交异步转写任务
+    task_url = f"{api_base}/services/audio/asr/transcription"
+    task_body: dict = {
+        "model": api_model,
+        "input": {"file_urls": [file_url]},
+    }
+    if language:
+        task_body["parameters"] = {"language_hints": [language]}
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        task_headers = {**headers, "X-DashScope-Async": "enable"}
+        resp = await client.post(task_url, headers=task_headers, json=task_body)
+        if resp.status_code != 200:
+            raise RuntimeError(
+                f"DashScope 任务提交失败 (HTTP {resp.status_code}): {resp.text[:300]}")
+        task_result = resp.json()
+
+    task_id = task_result.get("output", {}).get("task_id", "")
+    if not task_id:
+        raise RuntimeError(
+            f"DashScope 任务无 task_id: {json.dumps(task_result, ensure_ascii=False)[:200]}")
+    print(f"[STT] DashScope task={task_id}", file=sys.stderr, flush=True)
+
+    # ③ 轮询任务状态
+    poll_url = f"{api_base}/tasks/{task_id}"
+    import time as _time
+    max_wait = 120  # 最多等 2 分钟
+    start = _time.monotonic()
+
+    while True:
+        await asyncio.sleep(1.0)
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.get(poll_url, headers={"Authorization": f"Bearer {api_key}"})
+            if resp.status_code != 200:
                 raise RuntimeError(
-                    "fun-asr 需要安装 dashscope SDK: pip install dashscope\n"
-                    "或改用 sensevoice-v1 / paraformer-v2 (走兼容接口，无需额外安装)"
-                )
+                    f"DashScope 任务查询失败 (HTTP {resp.status_code}): {resp.text[:300]}")
+            poll_result = resp.json()
 
-            dashscope.api_key = api_key
-            dashscope.base_http_api_url = (
-                api_base_url.rstrip('/') if api_base_url
-                else 'https://dashscope.aliyuncs.com/api/v1'
-            )
+        status = poll_result.get("output", {}).get("task_status", "")
+        if status == "SUCCEEDED":
+            break
+        elif status in ("FAILED", "CANCELED"):
+            msg = poll_result.get("output", {}).get("message", "")
+            raise RuntimeError(f"DashScope 转写失败 ({status}): {msg}")
+        elif _time.monotonic() - start > max_wait:
+            raise RuntimeError(f"DashScope 转写超时 (>{max_wait}s), task_status={status}")
+        # PENDING / RUNNING → 继续等
 
-            file_url = _upload_to_dashscope(tmp_path, api_model, api_key)
-            print(f"[STT] DashScope 上传完成: {file_url[:80]}...",
-                  file=sys.stderr, flush=True)
+    # ④ 解析结果
+    for trans in poll_result.get("output", {}).get("results", []):
+        if trans.get("subtask_status") == "SUCCEEDED":
+            trans_url = trans.get("transcription_url", "")
+            if not trans_url:
+                continue
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                r = await client.get(trans_url)
+                data = r.json()
+            texts = [t.get("text", "") for t in data.get("transcripts", []) if t.get("text")]
+            if texts:
+                return "".join(texts).strip()
 
-            task_resp = Transcription.async_call(
-                model=api_model,
-                file_urls=[file_url],
-                language_hints=[language] if language else None,
-            )
-
-            task_id = (task_resp.output.get('task_id')
-                       if hasattr(task_resp, 'output')
-                       and isinstance(task_resp.output, dict)
-                       else None)
-            if not task_id:
-                raise RuntimeError(f"DashScope 任务提交失败: {task_resp}")
-            print(f"[STT] DashScope task={task_id}",
-                  file=sys.stderr, flush=True)
-
-            result = Transcription.wait(task=task_id)
-
-            status_code = getattr(result, 'status_code', 0)
-            if status_code != 200:
-                msg = ''
-                if hasattr(result, 'output') and isinstance(result.output, dict):
-                    msg = result.output.get('message', '')
-                raise RuntimeError(
-                    f"DashScope 转写失败 (code={status_code}): {msg}")
-
-            from urllib import request as _request
-            for trans in result.output.get('results', []):
-                if trans.get('subtask_status') == 'SUCCEEDED':
-                    trans_url = trans.get('transcription_url', '')
-                    if not trans_url:
-                        continue
-                    data = json.loads(
-                        _request.urlopen(trans_url).read().decode('utf8'))
-                    texts = []
-                    for t in data.get('transcripts', []):
-                        text = t.get('text', '')
-                        if text:
-                            texts.append(text)
-                    if texts:
-                        return ''.join(texts).strip()
-
-            raise RuntimeError("DashScope 转写无结果")
-        finally:
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
-
-    return await loop.run_in_executor(None, _run)
+    raise RuntimeError("DashScope 转写无结果")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
