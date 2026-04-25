@@ -134,6 +134,7 @@ pyinstaller --name "agent-with-u-backend" --onefile --console ^
     --hidden-import certifi --collect-data certifi ^
     --collect-all pydantic_core ^
     --hidden-import pydantic --hidden-import mcp ^
+    --hidden-import dashscope --collect-all dashscope ^
     --noconfirm ws_main_entry.py
 
 # For the Qt frontend application
