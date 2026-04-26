@@ -332,8 +332,24 @@ async def _transcribe_dashscope_native(
                 else 'https://dashscope.aliyuncs.com/api/v1'
             )
 
-            # ① SDK 上传（走内部 OSS 签名流程）
-            file_url = dashscope.Uploader.upload(
+            # ① SDK 上传（走内部 OSS 签名流程，兼容不同 SDK 版本）
+            _uploader = None
+            for _attr in ('Uploader', 'Upload'):
+                _uploader = getattr(dashscope, _attr, None)
+                if _uploader is not None:
+                    break
+            if _uploader is None:
+                try:
+                    from dashscope.common.upload import Uploader as _uploader
+                except ImportError:
+                    pass
+            if _uploader is None:
+                raise RuntimeError(
+                    f"dashscope {getattr(dashscope, '__version__', '?')} 无 Uploader, "
+                    f"可用属性: {[a for a in dir(dashscope) if not a.startswith('_')]}"
+                )
+
+            file_url = _uploader.upload(
                 file_path=tmp_path, model=api_model,
             )
             if not file_url or not isinstance(file_url, str):
