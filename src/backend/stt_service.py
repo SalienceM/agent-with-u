@@ -332,35 +332,30 @@ async def _transcribe_dashscope_native(
                 else 'https://dashscope.aliyuncs.com/api/v1'
             )
 
-            # ① SDK 上传（走内部 OSS 签名流程，兼容不同 SDK 版本）
-            _uploader = None
-            for _attr in ('Uploader', 'Upload'):
-                _uploader = getattr(dashscope, _attr, None)
-                if _uploader is not None:
-                    break
+            # ① 上传文件：优先用 SDK Uploader，否则用 Files API，
+            #    都没有则直接把本地路径传给 async_call（新版 SDK 支持）
+            file_ref = None
+            _uploader = getattr(dashscope, 'Uploader', None) or getattr(dashscope, 'Upload', None)
             if _uploader is None:
                 try:
                     from dashscope.common.upload import Uploader as _uploader
                 except ImportError:
                     pass
-            if _uploader is None:
-                raise RuntimeError(
-                    f"dashscope {getattr(dashscope, '__version__', '?')} 无 Uploader, "
-                    f"可用属性: {[a for a in dir(dashscope) if not a.startswith('_')]}"
-                )
 
-            file_url = _uploader.upload(
-                file_path=tmp_path, model=api_model,
-            )
-            if not file_url or not isinstance(file_url, str):
-                raise RuntimeError(f"DashScope 文件上传失败: {file_url}")
-            print(f"[STT] DashScope 上传完成: {file_url[:80]}...",
-                  file=sys.stderr, flush=True)
+            if _uploader is not None:
+                file_ref = _uploader.upload(file_path=tmp_path, model=api_model)
+                print(f"[STT] DashScope Uploader 上传完成: {str(file_ref)[:80]}",
+                      file=sys.stderr, flush=True)
+            else:
+                # 新版 SDK 没有 Uploader — 直接传本地路径，SDK 内部处理
+                file_ref = f"file://{tmp_path}"
+                print(f"[STT] DashScope: 无 Uploader, 尝试直接传路径",
+                      file=sys.stderr, flush=True)
 
             # ② 提交异步转写任务
             task_resp = Transcription.async_call(
                 model=api_model,
-                file_urls=[file_url],
+                file_urls=[file_ref],
                 language_hints=[language] if language else None,
             )
 
