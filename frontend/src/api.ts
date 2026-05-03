@@ -71,6 +71,9 @@ let streamCallbacks: StreamDeltaCallback[] = [];
 let sessionUpdateCallbacks: SessionUpdateCallback[] = [];
 let permissionRequestCallbacks: PermissionRequestCallback[] = [];
 
+type SttStreamTextCallback = (data: { text: string; isFinal: boolean }) => void;
+let sttStreamCallbacks: SttStreamTextCallback[] = [];
+
 function nextId() {
   return `r${++reqCounter}`;
 }
@@ -156,6 +159,9 @@ function handleMessage(e: MessageEvent) {
     } else if (msg.event === 'permissionRequest') {
       const data = JSON.parse(msg.data);
       permissionRequestCallbacks.forEach((cb) => cb(data));
+    } else if (msg.event === 'sttStreamText') {
+      const data = JSON.parse(msg.data);
+      sttStreamCallbacks.forEach((cb) => cb(data));
     }
   } catch (err) {
     console.error('[api] message parse error:', err);
@@ -674,6 +680,27 @@ export const api = {
     try { return typeof r === 'string' ? JSON.parse(r) : r; } catch { return { ok: false, error: 'parse error' }; }
   },
 
+  async sttStreamStart(configOverride?: any): Promise<{ ok: boolean; error?: string }> {
+    const r = await call('sttStreamStart', JSON.stringify(configOverride || {}));
+    try { return typeof r === 'string' ? JSON.parse(r) : r; } catch { return { ok: false, error: 'parse error' }; }
+  },
+
+  sttStreamAudio(audioB64: string): void {
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ id: nextId(), method: 'sttStreamAudio', params: [audioB64] }));
+    }
+  },
+
+  async sttStreamStop(): Promise<{ ok: boolean; text?: string; error?: string }> {
+    const r = await call('sttStreamStop');
+    try { return typeof r === 'string' ? JSON.parse(r) : r; } catch { return { ok: false, error: 'parse error' }; }
+  },
+
+  onSttStreamText(cb: SttStreamTextCallback): () => void {
+    sttStreamCallbacks.push(cb);
+    return () => { sttStreamCallbacks = sttStreamCallbacks.filter((c) => c !== cb); };
+  },
+
   /** 打开外部 cmd 窗口实时刷日志 */
   async openLogViewer(): Promise<void> {
     if (isTauri()) {
@@ -766,6 +793,9 @@ function mockDispatch(method: string, params: any[]): any {
     case 'saveSttConfig': return JSON.stringify({ ok: true });
     case 'sttTranscribe': return JSON.stringify({ ok: false, error: 'mock mode' });
     case 'sttRefine': return JSON.stringify({ ok: false, error: 'mock mode' });
+    case 'sttStreamStart': return JSON.stringify({ ok: false, error: 'mock mode' });
+    case 'sttStreamAudio': return JSON.stringify({ ok: true });
+    case 'sttStreamStop': return JSON.stringify({ ok: false, error: 'mock mode' });
     default: return null;
   }
 }

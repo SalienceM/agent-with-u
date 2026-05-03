@@ -1,10 +1,28 @@
 import React, { useState, useRef, useCallback, useEffect, useImperativeHandle, forwardRef } from 'react';
 import { api } from '../api';
 
-/** Convert a webm audio Blob to 16kHz 16-bit mono WAV, return as base64 string. */
+const REALTIME_MODELS = new Set([
+  'qwen3-asr-flash-realtime',
+  'qwen3-asr-flash-realtime-2026-02-10',
+  'qwen3-asr-flash-realtime-2025-10-27',
+]);
+
+function float32ToB64(floats: Float32Array): string {
+  const pcm = new Int16Array(floats.length);
+  for (let i = 0; i < floats.length; i++) {
+    const s = Math.max(-1, Math.min(1, floats[i]));
+    pcm[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+  }
+  const bytes = new Uint8Array(pcm.buffer);
+  let binary = '';
+  for (let i = 0; i < bytes.length; i += 8192) {
+    binary += String.fromCharCode(...bytes.subarray(i, Math.min(i + 8192, bytes.length)));
+  }
+  return btoa(binary);
+}
+
 async function convertToWavBase64(blob: Blob): Promise<string> {
   const arrayBuf = await blob.arrayBuffer();
-  // Decode webm/opus using browser's built-in decoder
   const tempCtx = new AudioContext();
   let decoded: AudioBuffer;
   try {
@@ -13,7 +31,6 @@ async function convertToWavBase64(blob: Blob): Promise<string> {
     await tempCtx.close().catch(() => {});
   }
 
-  // Resample to 16kHz mono via OfflineAudioContext
   const targetRate = 16000;
   const numSamples = Math.ceil(decoded.duration * targetRate);
   const offlineCtx = new OfflineAudioContext(1, numSamples, targetRate);
@@ -24,14 +41,12 @@ async function convertToWavBase64(blob: Blob): Promise<string> {
   const rendered = await offlineCtx.startRendering();
   const floats = rendered.getChannelData(0);
 
-  // Float32 → Int16
   const pcm = new Int16Array(floats.length);
   for (let i = 0; i < floats.length; i++) {
     const s = Math.max(-1, Math.min(1, floats[i]));
     pcm[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
   }
 
-  // Build WAV container
   const wavBuf = new ArrayBuffer(44 + pcm.byteLength);
   const dv = new DataView(wavBuf);
   const writeStr = (off: number, s: string) => { for (let i = 0; i < s.length; i++) dv.setUint8(off + i, s.charCodeAt(i)); };
@@ -40,17 +55,16 @@ async function convertToWavBase64(blob: Blob): Promise<string> {
   writeStr(8, 'WAVE');
   writeStr(12, 'fmt ');
   dv.setUint32(16, 16, true);
-  dv.setUint16(20, 1, true);          // PCM
-  dv.setUint16(22, 1, true);          // mono
-  dv.setUint32(24, targetRate, true);  // sample rate
-  dv.setUint32(28, targetRate * 2, true); // byte rate
-  dv.setUint16(32, 2, true);          // block align
-  dv.setUint16(34, 16, true);         // bits per sample
+  dv.setUint16(20, 1, true);
+  dv.setUint16(22, 1, true);
+  dv.setUint32(24, targetRate, true);
+  dv.setUint32(28, targetRate * 2, true);
+  dv.setUint16(32, 2, true);
+  dv.setUint16(34, 16, true);
   writeStr(36, 'data');
   dv.setUint32(40, pcm.byteLength, true);
   new Uint8Array(wavBuf, 44).set(new Uint8Array(pcm.buffer));
 
-  // Base64 encode
   const bytes = new Uint8Array(wavBuf);
   let binary = '';
   for (let i = 0; i < bytes.length; i += 8192) {
@@ -64,49 +78,40 @@ export interface VoiceInputHandle {
 }
 
 interface VoiceInputProps {
-  sessionId?: string;
   onInsert: (text: string) => void;
   onClose: () => void;
   onPhaseChange?: (phase: string | null) => void;
 }
 
-type Phase = 'recording' | 'transcribing' | 'editing' | 'refining';
-
-const SPEECH_LANG_MAP: Record<string, string> = {
-  zh: 'zh-CN', en: 'en-US', ja: 'ja-JP', ko: 'ko-KR',
-};
-
-const SpeechRecognitionCtor: (new () => any) | null =
-  typeof window !== 'undefined'
-    ? (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition
-    : null;
-
 const VoiceInput = forwardRef<VoiceInputHandle, VoiceInputProps>(function VoiceInput(
-  { sessionId, onInsert, onClose, onPhaseChange },
+  { onInsert, onClose, onPhaseChange },
   ref,
 ) {
-  const [phase, setPhaseRaw] = useState<Phase>('recording');
-  const [transcript, setTranscript] = useState('');
-  const [interimText, setInterimText] = useState('');
+  const [phase, setPhaseRaw] = useState<'recording' | 'transcribing'>('recording');
+  const [liveText, setLiveText] = useState('');
   const [error, setError] = useState('');
   const [elapsed, setElapsed] = useState(0);
   const [levels, setLevels] = useState<number[]>(Array(16).fill(0));
 
-  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
-  const chunksRef = useRef<Blob[]>([]);
   const timerRef = useRef<ReturnType<typeof setInterval>>();
   const animRef = useRef<number>(0);
   const streamRef = useRef<MediaStream | null>(null);
   const audioCtxRef = useRef<AudioContext | null>(null);
   const mountedRef = useRef(true);
-  const recognitionRef = useRef<any>(null);
-  const speechFinalRef = useRef('');
-  const speechInterimRef = useRef('');
+  const isRealtimeRef = useRef(false);
+  const stoppedRef = useRef(false);
+  const unsubRef = useRef<(() => void) | null>(null);
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const chunksRef = useRef<Blob[]>([]);
 
   const onPhaseChangeRef = useRef(onPhaseChange);
   onPhaseChangeRef.current = onPhaseChange;
+  const onInsertRef = useRef(onInsert);
+  onInsertRef.current = onInsert;
+  const onCloseRef = useRef(onClose);
+  onCloseRef.current = onClose;
 
-  const setPhase = useCallback((p: Phase) => {
+  const setPhase = useCallback((p: 'recording' | 'transcribing') => {
     setPhaseRaw(p);
     onPhaseChangeRef.current?.(p);
   }, []);
@@ -119,117 +124,112 @@ const VoiceInput = forwardRef<VoiceInputHandle, VoiceInputProps>(function VoiceI
       cancelAnimationFrame(animRef.current);
       streamRef.current?.getTracks().forEach(t => t.stop());
       audioCtxRef.current?.close().catch(() => {});
-      try { recognitionRef.current?.abort(); } catch {}
+      unsubRef.current?.();
       onPhaseChangeRef.current?.(null);
     };
   }, []);
 
-  const startLevelMeter = useCallback((stream: MediaStream) => {
-    try {
-      const ctx = new AudioContext();
-      audioCtxRef.current = ctx;
-      const src = ctx.createMediaStreamSource(stream);
-      const analyser = ctx.createAnalyser();
-      analyser.fftSize = 64;
-      src.connect(analyser);
-      const buf = new Uint8Array(analyser.frequencyBinCount);
-      const tick = () => {
-        if (!mountedRef.current) return;
-        analyser.getByteFrequencyData(buf);
-        const bars = Array.from({ length: 16 }, (_, i) => {
-          const idx = Math.floor((i / 16) * buf.length);
-          return buf[idx] / 255;
-        });
-        setLevels(bars);
-        animRef.current = requestAnimationFrame(tick);
-      };
-      tick();
-    } catch {}
-  }, []);
-
-  // ── Web Speech API for real-time interim text ──
-  const startSpeechRecognition = useCallback((lang: string) => {
-    if (!SpeechRecognitionCtor) return;
-    try {
-      const recognition = new SpeechRecognitionCtor();
-      recognition.continuous = true;
-      recognition.interimResults = true;
-      recognition.lang = SPEECH_LANG_MAP[lang] || lang || 'zh-CN';
-
-      recognition.onresult = (event: any) => {
-        if (!mountedRef.current) return;
-        let finalAccum = '';
-        let interim = '';
-        for (let i = 0; i < event.results.length; i++) {
-          if (event.results[i].isFinal) {
-            finalAccum += event.results[i][0].transcript;
-          } else {
-            interim += event.results[i][0].transcript;
-          }
-        }
-        speechFinalRef.current = finalAccum;
-        speechInterimRef.current = interim;
-        setInterimText(finalAccum + interim);
-      };
-      recognition.onerror = () => {};
-      recognition.onend = () => {
-        if (mountedRef.current && mediaRecorderRef.current?.state === 'recording') {
-          try { recognition.start(); } catch {}
-        }
-      };
-      recognition.start();
-      recognitionRef.current = recognition;
-    } catch {}
-  }, []);
-
-  const doTranscribe = useCallback(async () => {
-    setPhase('transcribing');
-    setError('');
-    try {
-      const blob = new Blob(chunksRef.current, { type: 'audio/webm' });
-      const b64 = await convertToWavBase64(blob);
-      const res = await api.sttTranscribe(b64);
+  // ── Level meter (shared for both paths) ──
+  const startLevelMeter = useCallback((analyser: AnalyserNode) => {
+    const buf = new Uint8Array(analyser.frequencyBinCount);
+    const tick = () => {
       if (!mountedRef.current) return;
-      if (res.ok && res.text) {
-        setTranscript(res.text);
-        setPhase('editing');
-      } else {
-        // Backend failed — use Web Speech API result as fallback
-        const fallback = (speechFinalRef.current + speechInterimRef.current).trim();
-        if (fallback) {
-          setTranscript(fallback);
-          setPhase('editing');
+      analyser.getByteFrequencyData(buf);
+      const bars = Array.from({ length: 16 }, (_, i) => {
+        const idx = Math.floor((i / 16) * buf.length);
+        return buf[idx] / 255;
+      });
+      setLevels(bars);
+      animRef.current = requestAnimationFrame(tick);
+    };
+    tick();
+  }, []);
+
+  // ── Realtime streaming path ──
+  const startRealtimeStream = useCallback(async (stream: MediaStream) => {
+    const res = await api.sttStreamStart();
+    if (!res.ok) throw new Error(res.error || 'STT stream start failed');
+
+    const unsub = api.onSttStreamText((data) => {
+      if (!mountedRef.current) return;
+      setLiveText(data.text);
+      onInsertRef.current(data.text);
+    });
+    unsubRef.current = unsub;
+
+    const audioCtx = new AudioContext({ sampleRate: 16000 });
+    audioCtxRef.current = audioCtx;
+    const source = audioCtx.createMediaStreamSource(stream);
+
+    const analyser = audioCtx.createAnalyser();
+    analyser.fftSize = 64;
+    source.connect(analyser);
+
+    const processor = audioCtx.createScriptProcessor(4096, 1, 1);
+    processor.onaudioprocess = (e) => {
+      if (stoppedRef.current) return;
+      api.sttStreamAudio(float32ToB64(e.inputBuffer.getChannelData(0)));
+    };
+    analyser.connect(processor);
+    const gain = audioCtx.createGain();
+    gain.gain.value = 0;
+    processor.connect(gain);
+    gain.connect(audioCtx.destination);
+
+    startLevelMeter(analyser);
+  }, [startLevelMeter]);
+
+  // ── Non-realtime MediaRecorder path ──
+  const startMediaRecorder = useCallback((stream: MediaStream) => {
+    const audioCtx = new AudioContext();
+    audioCtxRef.current = audioCtx;
+    const source = audioCtx.createMediaStreamSource(stream);
+    const analyser = audioCtx.createAnalyser();
+    analyser.fftSize = 64;
+    source.connect(analyser);
+    startLevelMeter(analyser);
+
+    const mr = new MediaRecorder(stream, { mimeType: 'audio/webm;codecs=opus' });
+    chunksRef.current = [];
+    mr.ondataavailable = (e) => { if (e.data.size > 0) chunksRef.current.push(e.data); };
+    mr.onstop = async () => {
+      if (!mountedRef.current) return;
+      setPhaseRaw('transcribing');
+      onPhaseChangeRef.current?.('transcribing');
+      try {
+        const blob = new Blob(chunksRef.current, { type: 'audio/webm' });
+        const b64 = await convertToWavBase64(blob);
+        const res = await api.sttTranscribe(b64);
+        if (!mountedRef.current) return;
+        if (res.ok && res.text) {
+          onInsertRef.current(res.text);
         } else {
           setError(res.error || '转写失败');
-          setPhase('editing');
+          return;
         }
-      }
-    } catch (e: any) {
-      if (!mountedRef.current) return;
-      const fallback = (speechFinalRef.current + speechInterimRef.current).trim();
-      if (fallback) {
-        setTranscript(fallback);
-        setPhase('editing');
-      } else {
+      } catch (e: any) {
+        if (!mountedRef.current) return;
         setError(e.message || '转写异常');
-        setPhase('editing');
+        return;
       }
-    }
-  }, [setPhase]);
+      if (mountedRef.current) onCloseRef.current();
+    };
+    mr.start(250);
+    mediaRecorderRef.current = mr;
+  }, [startLevelMeter]);
 
-  const doTranscribeRef = useRef(doTranscribe);
-  doTranscribeRef.current = doTranscribe;
-
+  // ── Entry point ──
   const startRecording = useCallback(async () => {
     setError('');
-    setTranscript('');
-    setInterimText('');
-    speechFinalRef.current = '';
-    speechInterimRef.current = '';
+    setLiveText('');
+    stoppedRef.current = false;
     try {
       const cfg = await api.getSttConfig();
       if (!mountedRef.current) return;
       const deviceId = cfg?.deviceId || '';
+      const isRealtime = REALTIME_MODELS.has(cfg?.apiModel || '');
+      isRealtimeRef.current = isRealtime;
+
       let stream: MediaStream;
       try {
         stream = await navigator.mediaDevices.getUserMedia({
@@ -244,61 +244,54 @@ const VoiceInput = forwardRef<VoiceInputHandle, VoiceInputProps>(function VoiceI
       }
       if (!mountedRef.current) { stream.getTracks().forEach(t => t.stop()); return; }
       streamRef.current = stream;
-      const mr = new MediaRecorder(stream, { mimeType: 'audio/webm;codecs=opus' });
-      chunksRef.current = [];
-      mr.ondataavailable = (e) => { if (e.data.size > 0) chunksRef.current.push(e.data); };
-      mr.onstop = () => {
-        clearInterval(timerRef.current);
-        cancelAnimationFrame(animRef.current);
-        setLevels(Array(16).fill(0));
-        stream.getTracks().forEach(t => t.stop());
-        audioCtxRef.current?.close().catch(() => {});
-        audioCtxRef.current = null;
-        try { recognitionRef.current?.stop(); } catch {}
-        doTranscribeRef.current();
-      };
-      mr.start(250);
-      mediaRecorderRef.current = mr;
+
+      if (isRealtime) {
+        await startRealtimeStream(stream);
+      } else {
+        startMediaRecorder(stream);
+      }
+
       setPhase('recording');
       setElapsed(0);
       timerRef.current = setInterval(() => setElapsed(v => v + 1), 1000);
-      startLevelMeter(stream);
-      startSpeechRecognition(cfg?.language || 'zh');
     } catch (e: any) {
       if (!mountedRef.current) return;
       setError(`麦克风访问失败: ${e.message || e}`);
     }
-  }, [startLevelMeter, setPhase, startSpeechRecognition]);
+  }, [startRealtimeStream, startMediaRecorder, setPhase]);
 
-  const stopRecording = useCallback(() => {
-    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
-      mediaRecorderRef.current.stop();
+  const stopRecording = useCallback(async () => {
+    if (stoppedRef.current) return;
+    stoppedRef.current = true;
+    clearInterval(timerRef.current);
+    cancelAnimationFrame(animRef.current);
+    setLevels(Array(16).fill(0));
+
+    if (isRealtimeRef.current) {
+      setPhase('transcribing');
+      unsubRef.current?.();
+      unsubRef.current = null;
+      streamRef.current?.getTracks().forEach(t => t.stop());
+      audioCtxRef.current?.close().catch(() => {});
+      audioCtxRef.current = null;
+      try {
+        const res = await api.sttStreamStop();
+        if (mountedRef.current && res.ok && res.text) {
+          onInsertRef.current(res.text);
+        }
+      } catch {}
+      if (mountedRef.current) onCloseRef.current();
+    } else {
+      streamRef.current?.getTracks().forEach(t => t.stop());
+      audioCtxRef.current?.close().catch(() => {});
+      audioCtxRef.current = null;
+      if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
+        mediaRecorderRef.current.stop();
+      }
     }
-  }, []);
+  }, [setPhase]);
 
   useImperativeHandle(ref, () => ({ stopRecording }), [stopRecording]);
-
-  const handleRefine = useCallback(async () => {
-    if (!transcript.trim()) return;
-    setPhase('refining');
-    setError('');
-    try {
-      const res = await api.sttRefine(transcript, sessionId);
-      if (!mountedRef.current) return;
-      if (res.ok && res.text) setTranscript(res.text);
-      else setError(res.error || '润色失败');
-    } catch (e: any) {
-      if (!mountedRef.current) return;
-      setError(e.message || '润色异常');
-    } finally {
-      if (mountedRef.current) setPhase('editing');
-    }
-  }, [transcript, sessionId, setPhase]);
-
-  const handleInsert = useCallback(() => {
-    if (transcript.trim()) onInsert(transcript.trim());
-    onClose();
-  }, [transcript, onInsert, onClose]);
 
   const fmt = (s: number) =>
     `${String(Math.floor(s / 60)).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}`;
@@ -307,69 +300,32 @@ const VoiceInput = forwardRef<VoiceInputHandle, VoiceInputProps>(function VoiceI
 
   return (
     <div style={panelStyle}>
-      {phase === 'recording' && (
-        <div style={recordBarStyle}>
-          <div style={{ display: 'flex', gap: 2, alignItems: 'flex-end', height: 20 }}>
-            {levels.map((v, i) => (
-              <div key={i} style={{
-                width: 2.5, borderRadius: 1,
-                background: `rgba(248,81,73,${0.4 + v * 0.6})`,
-                height: `${Math.max(2, v * 18)}px`,
-                transition: 'height 0.08s',
-              }} />
-            ))}
-          </div>
-          <span style={{ fontSize: 13, fontFamily: 'monospace', fontWeight: 600, color: 'var(--theme-text, #1f2328)' }}>
-            {fmt(elapsed)}
-          </span>
+      <div style={recordBarStyle}>
+        <div style={{ display: 'flex', gap: 2, alignItems: 'flex-end', height: 20 }}>
+          {levels.map((v, i) => (
+            <div key={i} style={{
+              width: 2.5, borderRadius: 1,
+              background: `rgba(248,81,73,${0.4 + v * 0.6})`,
+              height: `${Math.max(2, v * 18)}px`,
+              transition: 'height 0.08s',
+            }} />
+          ))}
+        </div>
+        <span style={{ fontSize: 13, fontFamily: 'monospace', fontWeight: 600, color: 'var(--theme-text, #1f2328)' }}>
+          {fmt(elapsed)}
+        </span>
+        {phase === 'transcribing' && (
+          <span style={{ fontSize: 12, color: 'var(--theme-text-muted, #656d76)' }}>转写中...</span>
+        )}
+        {phase === 'recording' && (
           <button onClick={stopRecording} style={inlineStopBtn} title="停止录音">
             ⏹ 停止
           </button>
-        </div>
-      )}
+        )}
+      </div>
 
-      {/* Live interim text from Web Speech API — visible during recording & transcribing */}
-      {(phase === 'recording' || phase === 'transcribing') && interimText && (
-        <div style={interimStyle}>{interimText}</div>
-      )}
-
-      {phase === 'transcribing' && (
-        <div style={recordBarStyle}>
-          <span style={{ fontSize: 14, animation: 'chat-pulse 1.5s infinite' }}>⏳</span>
-          <span style={{ fontSize: 12, color: 'var(--theme-text-muted, #656d76)' }}>转写中...</span>
-        </div>
-      )}
-
-      {(phase === 'editing' || phase === 'refining') && (
-        <div style={editPanelStyle}>
-          <textarea
-            style={editTextareaStyle}
-            value={transcript}
-            onChange={(e) => setTranscript(e.target.value)}
-            disabled={phase === 'refining'}
-            rows={2}
-            autoFocus
-          />
-          <div style={{ display: 'flex', gap: 4, alignItems: 'center' }}>
-            {phase === 'refining' && (
-              <span style={{ fontSize: 11, color: 'var(--theme-text-muted)' }}>润色中...</span>
-            )}
-            <div style={{ flex: 1 }} />
-            <button style={tinyBtnStyle} onClick={onClose} title="取消">✕</button>
-            <button
-              style={tinyBtnStyle}
-              onClick={handleRefine}
-              disabled={phase === 'refining' || !transcript.trim()}
-              title="AI 润色"
-            >✨</button>
-            <button
-              style={{ ...tinyBtnStyle, background: 'var(--theme-accent, #0969da)', color: '#fff', border: 'none' }}
-              onClick={handleInsert}
-              disabled={!transcript.trim()}
-              title="插入到输入框"
-            >↵ 插入</button>
-          </div>
-        </div>
+      {liveText && (
+        <div style={interimStyle}>{liveText}</div>
       )}
 
       {error && (
@@ -405,27 +361,4 @@ const interimStyle: React.CSSProperties = {
   color: 'var(--theme-text-muted, #656d76)', fontStyle: 'italic',
   maxHeight: 80, overflow: 'auto',
   borderLeft: '2px solid rgba(248,81,73,0.3)',
-};
-
-const editPanelStyle: React.CSSProperties = {
-  display: 'flex', flexDirection: 'column', gap: 6,
-  padding: '8px 12px', borderRadius: 8,
-  background: 'var(--theme-bg-secondary, #f6f8fa)',
-  border: '1px solid var(--theme-border, rgba(0,0,0,0.12))',
-};
-
-const editTextareaStyle: React.CSSProperties = {
-  width: '100%', padding: '6px 8px', borderRadius: 6,
-  border: '1px solid var(--theme-border, rgba(0,0,0,0.12))',
-  background: 'var(--theme-input-bg, #fff)', color: 'var(--theme-text, #1f2328)',
-  fontSize: 13, lineHeight: 1.5, resize: 'vertical', fontFamily: 'inherit',
-  outline: 'none', boxSizing: 'border-box' as const, maxHeight: 120,
-};
-
-const tinyBtnStyle: React.CSSProperties = {
-  padding: '4px 10px', borderRadius: 6,
-  border: '1px solid var(--theme-border, rgba(0,0,0,0.12))',
-  background: 'var(--theme-bg, #fff)', color: 'var(--theme-text, #1f2328)',
-  fontSize: 12, cursor: 'pointer', fontWeight: 500,
-  transition: 'opacity 0.15s', whiteSpace: 'nowrap' as const,
 };

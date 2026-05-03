@@ -159,6 +159,7 @@ const ChatInputInner: React.FC<Props> = ({
   const [showVoiceInput, setShowVoiceInput] = useState(false);
   const [voicePhase, setVoicePhase] = useState<string | null>(null);
   const voiceRef = useRef<VoiceInputHandle>(null);
+  const voicePrefixRef = useRef<string | null>(null);
   const handleCompact = useCallback(() => {
     // ★ 二次确认：新会话会清空上下文，误触代价很大
     setShowNewSessionConfirm(true);
@@ -687,17 +688,23 @@ const ChatInputInner: React.FC<Props> = ({
       {showVoiceInput && (
         <VoiceInput
           ref={voiceRef}
-          sessionId={sessionId}
           onInsert={(text) => {
             if (ref.current) {
-              const cur = ref.current.value;
-              ref.current.value = cur ? cur + '\n' + text : text;
+              if (voicePrefixRef.current === null) {
+                voicePrefixRef.current = ref.current.value;
+              }
+              const prefix = voicePrefixRef.current;
+              ref.current.value = prefix ? prefix + '\n' + text : text;
               ref.current.style.height = 'auto';
               ref.current.style.height = ref.current.scrollHeight + 'px';
-              ref.current.focus();
             }
           }}
-          onClose={() => { setShowVoiceInput(false); setVoicePhase(null); }}
+          onClose={() => {
+            voicePrefixRef.current = null;
+            setShowVoiceInput(false);
+            setVoicePhase(null);
+            ref.current?.focus();
+          }}
           onPhaseChange={setVoicePhase}
         />
       )}

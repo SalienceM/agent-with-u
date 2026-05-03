@@ -569,6 +569,124 @@ async def transcribe_dashscope_realtime(
     return result
 
 
+class SttRealtimeSession:
+    """管理与 DashScope 实时 ASR 的 WebSocket 长连接，支持流式音频推送。"""
+
+    def __init__(
+        self,
+        api_key: str,
+        model: str,
+        language: str,
+        on_text,  # (text: str, is_final: bool) -> None
+    ):
+        self._api_key = api_key
+        self._model = model
+        self._language = language
+        self._on_text = on_text
+        self._ws = None
+        self._listener_task: Optional[asyncio.Task] = None
+        self._final_text = ""
+        self._done = asyncio.Event()
+
+    async def start(self):
+        import websockets
+
+        url = f"wss://dashscope.aliyuncs.com/api-ws/v1/realtime?model={self._model}"
+        headers = {
+            "Authorization": f"Bearer {self._api_key}",
+            "OpenAI-Beta": "realtime=v1",
+        }
+        print(f"[STT] 流式会话启动: model={self._model}", file=sys.stderr, flush=True)
+        self._ws = await websockets.connect(url, additional_headers=headers)
+
+        await self._ws.send(json.dumps({
+            "event_id": "evt_session",
+            "type": "session.update",
+            "session": {
+                "modalities": ["text"],
+                "input_audio_format": "pcm",
+                "sample_rate": 16000,
+                "input_audio_transcription": {"language": self._language or "zh"},
+                "turn_detection": {
+                    "type": "server_vad",
+                    "threshold": 0.0,
+                    "silence_duration_ms": 400,
+                },
+            },
+        }))
+
+        while True:
+            msg = json.loads(await asyncio.wait_for(self._ws.recv(), timeout=10))
+            t = msg.get("type", "")
+            if t in ("session.created", "session.updated"):
+                break
+            if t == "error":
+                raise RuntimeError(f"DashScope session 错误: {msg}")
+
+        self._listener_task = asyncio.create_task(self._listen())
+
+    async def send_audio(self, pcm_chunk: bytes):
+        if self._ws and self._ws.open:
+            await self._ws.send(json.dumps({
+                "type": "input_audio_buffer.append",
+                "audio": base64.b64encode(pcm_chunk).decode("ascii"),
+            }))
+
+    async def stop(self) -> str:
+        if self._ws and self._ws.open:
+            try:
+                await self._ws.send(json.dumps({
+                    "event_id": "evt_finish",
+                    "type": "session.finish",
+                }))
+                await asyncio.wait_for(self._done.wait(), timeout=15)
+            except (asyncio.TimeoutError, Exception) as e:
+                print(f"[STT] 流式结束异常: {e}", file=sys.stderr, flush=True)
+            try:
+                await self._ws.close()
+            except Exception:
+                pass
+            self._ws = None
+        if self._listener_task:
+            self._listener_task.cancel()
+            try:
+                await self._listener_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        print(f"[STT] 流式会话结束: {self._final_text[:80]}", file=sys.stderr, flush=True)
+        return self._final_text
+
+    async def _listen(self):
+        try:
+            async for raw in self._ws:
+                msg = json.loads(raw)
+                t = msg.get("type", "")
+                if t == "conversation.item.input_audio_transcription.text":
+                    text = msg.get("text", "") + msg.get("stash", "")
+                    if text:
+                        self._on_text(self._final_text + text, False)
+                elif t == "conversation.item.input_audio_transcription.completed":
+                    text = msg.get("transcript", "")
+                    if text:
+                        self._final_text += text
+                        self._on_text(self._final_text, True)
+                elif t == "session.finished":
+                    final = msg.get("transcript", "")
+                    if final:
+                        self._final_text = final
+                    self._done.set()
+                    break
+                elif t == "error":
+                    print(f"[STT] 流式错误: {msg}", file=sys.stderr, flush=True)
+                    self._done.set()
+                    break
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            print(f"[STT] 流式监听异常: {e}", file=sys.stderr, flush=True)
+            self._done.set()
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 #  统一入口
 # ═══════════════════════════════════════════════════════════════════════════

@@ -996,6 +996,70 @@ class BridgeWS:
                   file=sys.stderr, flush=True)
             return json.dumps({"ok": False, "error": str(e)}, ensure_ascii=False)
 
+    # ── STT 实时流式 ──────────────────────────────────────────
+
+    _stt_stream = None  # type: ignore
+
+    async def _rpc_sttStreamStart(self, config_json: str = "{}") -> str:
+        """启动实时流式语音识别会话。"""
+        import base64 as _b64
+        from .stt_service import SttRealtimeSession, SttConfig, load_stt_config
+        try:
+            if self._stt_stream:
+                try:
+                    await self._stt_stream.stop()
+                except Exception:
+                    pass
+                self._stt_stream = None
+
+            cfg_override = json.loads(config_json) if config_json and config_json != "{}" else {}
+            cfg = load_stt_config()
+            if cfg_override:
+                cfg = SttConfig.from_dict({**cfg.to_dict(), **cfg_override})
+
+            def on_text(text: str, is_final: bool):
+                asyncio.ensure_future(self._broadcast({
+                    "event": "sttStreamText",
+                    "data": json.dumps({"text": text, "isFinal": is_final}, ensure_ascii=False),
+                }))
+
+            session = SttRealtimeSession(cfg.api_key, cfg.api_model, cfg.language, on_text)
+            await session.start()
+            self._stt_stream = session
+            return json.dumps({"ok": True}, ensure_ascii=False)
+        except Exception as e:
+            import traceback
+            print(f"[STT] 流式启动失败: {e}\n{traceback.format_exc()}",
+                  file=sys.stderr, flush=True)
+            return json.dumps({"ok": False, "error": str(e)}, ensure_ascii=False)
+
+    async def _rpc_sttStreamAudio(self, audio_b64: str) -> str:
+        """发送一帧 PCM 音频到实时流式会话。"""
+        import base64 as _b64
+        if not self._stt_stream:
+            return json.dumps({"ok": False, "error": "No active STT stream"}, ensure_ascii=False)
+        try:
+            pcm = _b64.b64decode(audio_b64)
+            await self._stt_stream.send_audio(pcm)
+            return json.dumps({"ok": True}, ensure_ascii=False)
+        except Exception as e:
+            return json.dumps({"ok": False, "error": str(e)}, ensure_ascii=False)
+
+    async def _rpc_sttStreamStop(self) -> str:
+        """停止实时流式语音识别，返回最终文本。"""
+        if not self._stt_stream:
+            return json.dumps({"ok": False, "error": "No active STT stream"}, ensure_ascii=False)
+        try:
+            text = await self._stt_stream.stop()
+            self._stt_stream = None
+            return json.dumps({"ok": True, "text": text}, ensure_ascii=False)
+        except Exception as e:
+            self._stt_stream = None
+            import traceback
+            print(f"[STT] 流式停止失败: {e}\n{traceback.format_exc()}",
+                  file=sys.stderr, flush=True)
+            return json.dumps({"ok": False, "error": str(e)}, ensure_ascii=False)
+
     async def _rpc_sttRefine(self, text: str, session_id: str = "") -> str:
         """用 LLM 润色语音转写文本。优先使用会话绑定的后端配置。"""
         from .stt_service import refine_with_llm
