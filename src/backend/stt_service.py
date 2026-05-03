@@ -348,11 +348,13 @@ async def _transcribe_dashscope_native(
                 api_base_url.rstrip('/') if api_base_url
                 else 'https://dashscope.aliyuncs.com/api/v1'
             )
+            print(f"[STT] dashscope version={getattr(dashscope, 'version', '?')}",
+                  file=sys.stderr, flush=True)
 
-            # ① 上传文件到 OSS（兼容不同 SDK 版本）
-            file_ref = None
+            # ① 上传文件到 DashScope OSS（兼容不同 SDK 版本）
+            file_url = None
 
-            # 方式 A: 旧版 SDK — dashscope.Uploader
+            # 方式 A: dashscope.Uploader（旧版 SDK）
             _uploader = getattr(dashscope, 'Uploader', None) or getattr(dashscope, 'Upload', None)
             if _uploader is None:
                 try:
@@ -360,51 +362,54 @@ async def _transcribe_dashscope_native(
                 except ImportError:
                     pass
             if _uploader is not None:
-                file_ref = _uploader.upload(file_path=tmp_path, model=api_model)
-                print(f"[STT] DashScope Uploader: {str(file_ref)[:80]}",
-                      file=sys.stderr, flush=True)
+                try:
+                    file_url = _uploader.upload(file_path=tmp_path, model=api_model)
+                    print(f"[STT] Uploader 上传成功: {str(file_url)[:80]}",
+                          file=sys.stderr, flush=True)
+                except Exception as e:
+                    print(f"[STT] Uploader 上传失败: {e}", file=sys.stderr, flush=True)
 
-            # 方式 B: 新版 SDK — dashscope.Transcription.call 直接传本地路径
-            #    Transcription.async_call 的 file_urls 只接受 http/oss URL，
-            #    但 Transcription.call (同步) 支持本地路径自动上传
-            if not file_ref or not str(file_ref).startswith(('http', 'oss')):
-                print(f"[STT] DashScope: 尝试 Transcription.call 直传本地文件",
-                      file=sys.stderr, flush=True)
-                result = Transcription.call(
-                    model=api_model,
-                    file_urls=[tmp_path],
-                    language_hints=[language] if language else None,
-                )
-                print(f"[STT] DashScope call 返回: status={getattr(result, 'status_code', '?')}, "
-                      f"output={repr(getattr(result, 'output', None))[:200]}",
-                      file=sys.stderr, flush=True)
+            # 方式 B: dashscope.Files（新版 SDK）
+            if not file_url:
+                _files = getattr(dashscope, 'Files', None)
+                if _files is not None:
+                    for purpose in ('file-extract', 'transcription', 'audio'):
+                        try:
+                            fo = _files.upload(file_path=tmp_path, purpose=purpose)
+                            print(f"[STT] Files.upload(purpose={purpose}) 返回: {repr(fo)[:200]}",
+                                  file=sys.stderr, flush=True)
+                            # 提取 URL 或 file_id
+                            if hasattr(fo, 'file_id'):
+                                file_url = f"fileid://{fo.file_id}"
+                            elif isinstance(fo, str) and fo.startswith(('http', 'oss')):
+                                file_url = fo
+                            elif hasattr(fo, 'url'):
+                                file_url = fo.url
+                            if file_url:
+                                break
+                        except Exception as e:
+                            print(f"[STT] Files.upload(purpose={purpose}) 失败: {e}",
+                                  file=sys.stderr, flush=True)
+                            continue
 
-                status_code = getattr(result, 'status_code', 0)
-                if status_code != 200:
-                    msg = ''
-                    if hasattr(result, 'output') and isinstance(result.output, dict):
-                        msg = result.output.get('message', '')
-                    raise RuntimeError(
-                        f"DashScope 转写失败 (code={status_code}): {msg}")
-
-                # call() 返回的结果可能直接包含转写文本
-                if hasattr(result, 'output') and isinstance(result.output, dict):
-                    # 尝试直接从 output 取文本
-                    results = result.output.get('results', [])
-                    if results:
-                        return _parse_transcription_results(results)
-                    # 某些版本直接在 output.text 或 output.sentence 里
-                    text = result.output.get('text', '') or result.output.get('sentence', '')
-                    if text:
-                        return text.strip()
-
+            if not file_url or not str(file_url).startswith(('http', 'oss')):
+                # 打印可用模块帮助调试
+                common_attrs = []
+                try:
+                    import dashscope.common as _c
+                    common_attrs = [a for a in dir(_c) if not a.startswith('_')]
+                except Exception:
+                    pass
                 raise RuntimeError(
-                    f"DashScope call 无结果: {repr(getattr(result, 'output', None))[:300]}")
+                    f"无法上传文件到 DashScope (SDK {getattr(dashscope, 'version', '?')})\n"
+                    f"dashscope.common 可用: {common_attrs}\n"
+                    f"请尝试: pip install dashscope==1.20.14"
+                )
 
-            # ② 提交异步转写任务（有 OSS URL 的情况）
+            # ② 提交异步转写任务（官方标准流程）
             task_resp = Transcription.async_call(
                 model=api_model,
-                file_urls=[file_ref],
+                file_urls=[file_url],
                 language_hints=[language] if language else None,
             )
 
@@ -413,26 +418,28 @@ async def _transcribe_dashscope_native(
                        and isinstance(task_resp.output, dict)
                        else None)
             if not task_id:
-                raise RuntimeError(f"DashScope 任务提交失败: {task_resp}")
-            print(f"[STT] DashScope task={task_id}",
-                  file=sys.stderr, flush=True)
+                # output 可能是 TranscriptionOutput 对象
+                task_id = getattr(getattr(task_resp, 'output', None), 'task_id', None)
+            if not task_id:
+                raise RuntimeError(f"DashScope 任务提交失败: {repr(task_resp)[:300]}")
+            print(f"[STT] DashScope task={task_id}", file=sys.stderr, flush=True)
 
             # ③ 轮询等待结果
             result = Transcription.wait(task=task_id)
-            print(f"[STT] DashScope wait 返回: status={getattr(result, 'status_code', '?')}, "
-                  f"output={repr(getattr(result, 'output', None))[:200]}",
+            print(f"[STT] DashScope wait: status={getattr(result, 'status_code', '?')}",
                   file=sys.stderr, flush=True)
 
             status_code = getattr(result, 'status_code', 0)
             if status_code != 200:
-                msg = ''
-                if hasattr(result, 'output') and isinstance(result.output, dict):
+                msg = getattr(getattr(result, 'output', None), 'message', '') or ''
+                if not msg and hasattr(result, 'output') and isinstance(result.output, dict):
                     msg = result.output.get('message', '')
-                raise RuntimeError(
-                    f"DashScope 转写失败 (code={status_code}): {msg}")
+                raise RuntimeError(f"DashScope 转写失败 (code={status_code}): {msg}")
 
             # ④ 解析转写结果
-            return _parse_transcription_results(result.output.get('results', []))
+            output = result.output
+            results = output.get('results', []) if isinstance(output, dict) else getattr(output, 'results', [])
+            return _parse_transcription_results(results)
         finally:
             try:
                 os.unlink(tmp_path)
