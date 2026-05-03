@@ -373,26 +373,22 @@ async def _transcribe_dashscope_native(
             if not file_url:
                 _files = getattr(dashscope, 'Files', None)
                 if _files is not None:
-                    for purpose in ('file-extract', 'transcription', 'audio'):
-                        try:
-                            fo = _files.upload(file_path=tmp_path, purpose=purpose)
-                            print(f"[STT] Files.upload(purpose={purpose}) 返回: {repr(fo)[:200]}",
-                                  file=sys.stderr, flush=True)
-                            # 提取 URL 或 file_id
-                            if hasattr(fo, 'file_id'):
-                                file_url = f"fileid://{fo.file_id}"
-                            elif isinstance(fo, str) and fo.startswith(('http', 'oss')):
-                                file_url = fo
-                            elif hasattr(fo, 'url'):
-                                file_url = fo.url
-                            if file_url:
-                                break
-                        except Exception as e:
-                            print(f"[STT] Files.upload(purpose={purpose}) 失败: {e}",
-                                  file=sys.stderr, flush=True)
-                            continue
+                    try:
+                        fo = _files.upload(file_path=tmp_path, purpose='file-extract')
+                        print(f"[STT] Files.upload 返回: {repr(fo)[:300]}",
+                              file=sys.stderr, flush=True)
+                        # 从 response.output.uploaded_files[0] 提取 file_id
+                        _output = getattr(fo, 'output', None) or {}
+                        if isinstance(_output, dict):
+                            _files_list = _output.get('uploaded_files', [])
+                            if _files_list and isinstance(_files_list[0], dict):
+                                file_url = _files_list[0].get('file_id', '')
+                                print(f"[STT] 提取到 file_id: {file_url}",
+                                      file=sys.stderr, flush=True)
+                    except Exception as e:
+                        print(f"[STT] Files.upload 失败: {e}", file=sys.stderr, flush=True)
 
-            if not file_url or not str(file_url).startswith(('http', 'oss')):
+            if not file_url:
                 # 打印可用模块帮助调试
                 common_attrs = []
                 try:
@@ -407,6 +403,8 @@ async def _transcribe_dashscope_native(
                 )
 
             # ② 提交异步转写任务（官方标准流程）
+            print(f"[STT] DashScope async_call: model={api_model}, file_url={file_url[:80]}",
+                  file=sys.stderr, flush=True)
             task_resp = Transcription.async_call(
                 model=api_model,
                 file_urls=[file_url],
