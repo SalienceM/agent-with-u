@@ -178,9 +178,18 @@ const VoiceInput = forwardRef<VoiceInputHandle, VoiceInputProps>(function VoiceI
       const cfg = await api.getSttConfig();
       if (!mountedRef.current) return;
       const deviceId = cfg?.deviceId || '';
-      const stream = await navigator.mediaDevices.getUserMedia({
-        audio: deviceId ? { deviceId: { exact: deviceId } } : true,
-      });
+      let stream: MediaStream;
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({
+          audio: deviceId ? { deviceId: { exact: deviceId } } : true,
+        });
+      } catch (devErr) {
+        if (deviceId) {
+          stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        } else {
+          throw devErr;
+        }
+      }
       if (!mountedRef.current) { stream.getTracks().forEach(t => t.stop()); return; }
       streamRef.current = stream;
       const mr = new MediaRecorder(stream, { mimeType: 'audio/webm;codecs=opus' });
