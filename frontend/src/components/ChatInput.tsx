@@ -1,6 +1,5 @@
 import React, { useRef, useCallback, useEffect, memo, useState, useMemo } from 'react';
 import { ImagePreview } from './ImagePreview';
-import VoiceInput, { type VoiceInputHandle } from './VoiceInput';
 import { useClipboardImage } from '../hooks/useClipboardImage';
 import type { ImageAttachment } from '../hooks/useClipboardImage';
 import { SLASH_COMMANDS } from '../hooks/useChat';
@@ -156,10 +155,128 @@ const ChatInputInner: React.FC<Props> = ({
 
   // ── 清理上下文 ──
   const [showNewSessionConfirm, setShowNewSessionConfirm] = useState(false);
-  const [showVoiceInput, setShowVoiceInput] = useState(false);
-  const [voicePhase, setVoicePhase] = useState<string | null>(null);
-  const voiceRef = useRef<VoiceInputHandle>(null);
-  const voicePrefixRef = useRef<string | null>(null);
+  // ── 语音流式转写 ──
+  const [micActive, setMicActive] = useState(false);
+  const micStreamRef = useRef<MediaStream | null>(null);
+  const micAudioCtxRef = useRef<AudioContext | null>(null);
+  const micUnsubRef = useRef<(() => void) | null>(null);
+  const micPrefixRef = useRef<string | null>(null);
+  const micStoppedRef = useRef(false);
+
+  const float32ToB64 = useCallback((floats: Float32Array): string => {
+    const pcm = new Int16Array(floats.length);
+    for (let i = 0; i < floats.length; i++) {
+      const s = Math.max(-1, Math.min(1, floats[i]));
+      pcm[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+    }
+    const bytes = new Uint8Array(pcm.buffer);
+    let binary = '';
+    for (let i = 0; i < bytes.length; i += 8192) {
+      binary += String.fromCharCode(...bytes.subarray(i, Math.min(i + 8192, bytes.length)));
+    }
+    return btoa(binary);
+  }, []);
+
+  const micStop = useCallback(async () => {
+    if (micStoppedRef.current) return;
+    micStoppedRef.current = true;
+    micUnsubRef.current?.();
+    micUnsubRef.current = null;
+    micStreamRef.current?.getTracks().forEach(t => t.stop());
+    micStreamRef.current = null;
+    micAudioCtxRef.current?.close().catch(() => {});
+    micAudioCtxRef.current = null;
+    try {
+      const res = await api.sttStreamStop();
+      if (res.ok && res.text && ref.current) {
+        const prefix = micPrefixRef.current ?? '';
+        ref.current.value = prefix ? prefix + '\n' + res.text : res.text;
+        ref.current.style.height = 'auto';
+        ref.current.style.height = ref.current.scrollHeight + 'px';
+      }
+    } catch {}
+    micPrefixRef.current = null;
+    setMicActive(false);
+    ref.current?.focus();
+  }, []);
+
+  const micStart = useCallback(async () => {
+    micStoppedRef.current = false;
+    try {
+      const cfg = await api.getSttConfig();
+      const deviceId = cfg?.deviceId || '';
+
+      let stream: MediaStream;
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({
+          audio: deviceId ? { deviceId: { exact: deviceId } } : true,
+        });
+      } catch (devErr) {
+        if (deviceId) {
+          stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        } else {
+          throw devErr;
+        }
+      }
+      micStreamRef.current = stream;
+
+      const res = await api.sttStreamStart();
+      if (!res.ok) {
+        stream.getTracks().forEach(t => t.stop());
+        throw new Error(res.error || 'STT stream start failed');
+      }
+
+      micPrefixRef.current = ref.current?.value ?? '';
+
+      const unsub = api.onSttStreamText((data) => {
+        if (!ref.current) return;
+        const prefix = micPrefixRef.current ?? '';
+        ref.current.value = prefix ? prefix + '\n' + data.text : data.text;
+        ref.current.style.height = 'auto';
+        ref.current.style.height = ref.current.scrollHeight + 'px';
+      });
+      micUnsubRef.current = unsub;
+
+      const audioCtx = new AudioContext({ sampleRate: 16000 });
+      micAudioCtxRef.current = audioCtx;
+      const source = audioCtx.createMediaStreamSource(stream);
+      const processor = audioCtx.createScriptProcessor(4096, 1, 1);
+      processor.onaudioprocess = (e) => {
+        if (micStoppedRef.current) return;
+        api.sttStreamAudio(float32ToB64(e.inputBuffer.getChannelData(0)));
+      };
+      source.connect(processor);
+      const gain = audioCtx.createGain();
+      gain.gain.value = 0;
+      processor.connect(gain);
+      gain.connect(audioCtx.destination);
+
+      setMicActive(true);
+    } catch (e: any) {
+      console.error('[mic]', e);
+      setMicActive(false);
+    }
+  }, [float32ToB64]);
+
+  const toggleMic = useCallback(() => {
+    if (micActive) {
+      micStop();
+    } else {
+      micStart();
+    }
+  }, [micActive, micStart, micStop]);
+
+  useEffect(() => {
+    return () => {
+      if (micStreamRef.current) {
+        micStoppedRef.current = true;
+        micUnsubRef.current?.();
+        micStreamRef.current.getTracks().forEach(t => t.stop());
+        micAudioCtxRef.current?.close().catch(() => {});
+      }
+    };
+  }, []);
+
   const handleCompact = useCallback(() => {
     // ★ 二次确认：新会话会清空上下文，误触代价很大
     setShowNewSessionConfirm(true);
@@ -684,31 +801,6 @@ const ChatInputInner: React.FC<Props> = ({
         </div>
       )}
 
-      {/* 语音输入内联面板 */}
-      {showVoiceInput && (
-        <VoiceInput
-          ref={voiceRef}
-          onInsert={(text) => {
-            if (ref.current) {
-              if (voicePrefixRef.current === null) {
-                voicePrefixRef.current = ref.current.value;
-              }
-              const prefix = voicePrefixRef.current;
-              ref.current.value = prefix ? prefix + '\n' + text : text;
-              ref.current.style.height = 'auto';
-              ref.current.style.height = ref.current.scrollHeight + 'px';
-            }
-          }}
-          onClose={() => {
-            voicePrefixRef.current = null;
-            setShowVoiceInput(false);
-            setVoicePhase(null);
-            ref.current?.focus();
-          }}
-          onPhaseChange={setVoicePhase}
-        />
-      )}
-
       <div style={{ display: 'flex', gap: 8, alignItems: 'flex-end' }}>
         <textarea
           ref={ref}
@@ -727,15 +819,9 @@ const ChatInputInner: React.FC<Props> = ({
           <button onClick={handleSend} style={sendBtnStyle} title="Send (Enter)">🚀</button>
         )}
         <button
-          onClick={() => {
-            if (!showVoiceInput) {
-              setShowVoiceInput(true);
-            } else if (voicePhase === 'recording') {
-              voiceRef.current?.stopRecording();
-            }
-          }}
-          style={voicePhase === 'recording' ? micRecordingStyle : micBtnStyle}
-          title={voicePhase === 'recording' ? '停止录音' : '语音输入'}
+          onClick={toggleMic}
+          style={micActive ? micRecordingStyle : micBtnStyle}
+          title={micActive ? '停止语音输入' : '语音输入'}
         >
           🎙️
         </button>
@@ -769,7 +855,6 @@ const ChatInputInner: React.FC<Props> = ({
         </div>
       )}
 
-      {/* (voice input rendered inline above textarea) */}
     </div>
   );
 };
