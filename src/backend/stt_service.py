@@ -348,63 +348,28 @@ async def _transcribe_dashscope_native(
                 api_base_url.rstrip('/') if api_base_url
                 else 'https://dashscope.aliyuncs.com/api/v1'
             )
-            print(f"[STT] dashscope version={getattr(dashscope, 'version', '?')}",
-                  file=sys.stderr, flush=True)
 
-            # ① 上传文件到 DashScope OSS（兼容不同 SDK 版本）
-            file_url = None
-
-            # 方式 A: dashscope.Uploader（旧版 SDK）
+            # ① 上传文件到 OSS
             _uploader = getattr(dashscope, 'Uploader', None) or getattr(dashscope, 'Upload', None)
             if _uploader is None:
                 try:
                     from dashscope.common.upload import Uploader as _uploader
                 except ImportError:
                     pass
-            if _uploader is not None:
-                try:
-                    file_url = _uploader.upload(file_path=tmp_path, model=api_model)
-                    print(f"[STT] Uploader 上传成功: {str(file_url)[:80]}",
-                          file=sys.stderr, flush=True)
-                except Exception as e:
-                    print(f"[STT] Uploader 上传失败: {e}", file=sys.stderr, flush=True)
-
-            # 方式 B: dashscope.Files（新版 SDK）
-            if not file_url:
-                _files = getattr(dashscope, 'Files', None)
-                if _files is not None:
-                    try:
-                        fo = _files.upload(file_path=tmp_path, purpose='file-extract')
-                        print(f"[STT] Files.upload 返回: {repr(fo)[:300]}",
-                              file=sys.stderr, flush=True)
-                        # 从 response.output.uploaded_files[0] 提取 file_id
-                        _output = getattr(fo, 'output', None) or {}
-                        if isinstance(_output, dict):
-                            _files_list = _output.get('uploaded_files', [])
-                            if _files_list and isinstance(_files_list[0], dict):
-                                file_url = _files_list[0].get('file_id', '')
-                                print(f"[STT] 提取到 file_id: {file_url}",
-                                      file=sys.stderr, flush=True)
-                    except Exception as e:
-                        print(f"[STT] Files.upload 失败: {e}", file=sys.stderr, flush=True)
-
-            if not file_url:
-                # 打印可用模块帮助调试
-                common_attrs = []
-                try:
-                    import dashscope.common as _c
-                    common_attrs = [a for a in dir(_c) if not a.startswith('_')]
-                except Exception:
-                    pass
+            if _uploader is None:
+                _ver = getattr(dashscope, '__version__', '?')
                 raise RuntimeError(
-                    f"无法上传文件到 DashScope (SDK {getattr(dashscope, 'version', '?')})\n"
-                    f"dashscope.common 可用: {common_attrs}\n"
-                    f"请尝试: pip install dashscope==1.20.14"
+                    f"dashscope {_ver} 无 Uploader。"
+                    f"请安装: pip install \"dashscope>=1.14.0,<1.22.0\""
                 )
 
-            # ② 提交异步转写任务（官方标准流程）
-            print(f"[STT] DashScope async_call: model={api_model}, file_url={file_url[:80]}",
+            file_url = _uploader.upload(file_path=tmp_path, model=api_model)
+            if not file_url or not isinstance(file_url, str):
+                raise RuntimeError(f"DashScope 文件上传失败: {file_url}")
+            print(f"[STT] DashScope 上传完成: {file_url[:80]}",
                   file=sys.stderr, flush=True)
+
+            # ② 提交异步转写任务（官方标准流程）
             task_resp = Transcription.async_call(
                 model=api_model,
                 file_urls=[file_url],
@@ -416,7 +381,6 @@ async def _transcribe_dashscope_native(
                        and isinstance(task_resp.output, dict)
                        else None)
             if not task_id:
-                # output 可能是 TranscriptionOutput 对象
                 task_id = getattr(getattr(task_resp, 'output', None), 'task_id', None)
             if not task_id:
                 raise RuntimeError(f"DashScope 任务提交失败: {repr(task_resp)[:300]}")
@@ -424,24 +388,19 @@ async def _transcribe_dashscope_native(
 
             # ③ 轮询等待结果
             result = Transcription.wait(task=task_id)
-            output = result.output
-            # 打印完整 output 帮助调试
-            if isinstance(output, dict):
-                _out_debug = json.dumps(output, ensure_ascii=False, default=str)[:500]
-            else:
-                _out_debug = repr(output)[:500]
-            print(f"[STT] DashScope wait: status={getattr(result, 'status_code', '?')}, "
-                  f"output={_out_debug}",
-                  file=sys.stderr, flush=True)
 
             status_code = getattr(result, 'status_code', 0)
             if status_code != 200:
-                msg = getattr(getattr(result, 'output', None), 'message', '') or ''
-                if not msg and isinstance(output, dict):
+                output = getattr(result, 'output', None)
+                msg = ''
+                if isinstance(output, dict):
                     msg = output.get('message', '')
+                else:
+                    msg = getattr(output, 'message', '')
                 raise RuntimeError(f"DashScope 转写失败 (code={status_code}): {msg}")
 
             # ④ 解析转写结果
+            output = result.output
             results = output.get('results', []) if isinstance(output, dict) else getattr(output, 'results', [])
             return _parse_transcription_results(results)
         finally:
