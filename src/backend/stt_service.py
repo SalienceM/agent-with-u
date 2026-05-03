@@ -174,7 +174,8 @@ async def transcribe_local(
     loop = asyncio.get_running_loop()
 
     # 写临时音频文件
-    with tempfile.NamedTemporaryFile(suffix=".webm", delete=False) as tmp:
+    suffix = ".wav" if audio_bytes[:4] == b'RIFF' else ".webm"
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
         tmp.write(audio_bytes)
         tmp_path = tmp.name
 
@@ -232,7 +233,10 @@ async def transcribe_api(
     headers = {"Authorization": f"Bearer {api_key}"}
 
     async with httpx.AsyncClient(timeout=120.0) as client:
-        files = {"file": ("audio.webm", audio_bytes, "audio/webm")}
+        is_wav = audio_bytes[:4] == b'RIFF'
+        fname = "audio.wav" if is_wav else "audio.webm"
+        mime = "audio/wav" if is_wav else "audio/webm"
+        files = {"file": (fname, audio_bytes, mime)}
         data: dict = {"model": api_model}
         if language and not skip_language:
             data["language"] = language
@@ -256,7 +260,12 @@ async def transcribe_api(
 # ═══════════════════════════════════════════════════════════════════════════
 
 _DASHSCOPE_COMPAT_MODELS = {"sensevoice-v1", "paraformer-v2", "paraformer-realtime-v2"}
-_DASHSCOPE_ALL_MODELS = _DASHSCOPE_COMPAT_MODELS | {"fun-asr"}
+_DASHSCOPE_REALTIME_MODELS = {
+    "qwen3-asr-flash-realtime",
+    "qwen3-asr-flash-realtime-2026-02-10",
+    "qwen3-asr-flash-realtime-2025-10-27",
+}
+_DASHSCOPE_ALL_MODELS = _DASHSCOPE_COMPAT_MODELS | {"fun-asr"} | _DASHSCOPE_REALTIME_MODELS
 
 
 async def transcribe_dashscope(
@@ -274,6 +283,11 @@ async def transcribe_dashscope(
     """
     if not api_key:
         raise ValueError("DashScope 需要配置 apiKey")
+
+    if api_model in _DASHSCOPE_REALTIME_MODELS:
+        return await transcribe_dashscope_realtime(
+            audio_bytes, language, api_key, api_model,
+        )
 
     if api_model in _DASHSCOPE_COMPAT_MODELS:
         host = "https://dashscope.aliyuncs.com"
@@ -337,7 +351,8 @@ async def _transcribe_dashscope_native(
 
     loop = asyncio.get_running_loop()
 
-    with tempfile.NamedTemporaryFile(suffix=".webm", delete=False) as tmp:
+    suffix = ".wav" if audio_bytes[:4] == b'RIFF' else ".webm"
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
         tmp.write(audio_bytes)
         tmp_path = tmp.name
 
@@ -430,6 +445,128 @@ async def _transcribe_dashscope_native(
                 pass
 
     return await loop.run_in_executor(None, _run)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  DashScope 实时转写 (WebSocket)
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _extract_pcm(audio_bytes: bytes) -> bytes:
+    """从 WAV 中提取 PCM 数据；如果非 WAV 则原样返回。"""
+    if audio_bytes[:4] == b'RIFF' and audio_bytes[8:12] == b'WAVE':
+        import struct
+        offset = 12
+        while offset < len(audio_bytes) - 8:
+            chunk_id = audio_bytes[offset:offset + 4]
+            chunk_size = struct.unpack_from('<I', audio_bytes, offset + 4)[0]
+            if chunk_id == b'data':
+                return audio_bytes[offset + 8:offset + 8 + chunk_size]
+            offset += 8 + chunk_size
+    return audio_bytes
+
+
+async def transcribe_dashscope_realtime(
+    audio_bytes: bytes,
+    language: str = "zh",
+    api_key: str = "",
+    api_model: str = "qwen3-asr-flash-realtime",
+) -> str:
+    """通过 WebSocket 调用 DashScope 千问实时语音识别。
+
+    audio_bytes: WAV (PCM 16kHz 16bit mono) 或裸 PCM 数据。
+    """
+    try:
+        import websockets
+    except ImportError:
+        raise RuntimeError("实时语音识别需要 websockets: pip install websockets")
+
+    if not api_key:
+        raise ValueError("实时语音识别需要配置 apiKey")
+
+    pcm = _extract_pcm(audio_bytes)
+    if not pcm:
+        raise ValueError("音频数据为空")
+
+    url = f"wss://dashscope.aliyuncs.com/api-ws/v1/realtime?model={api_model}"
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "OpenAI-Beta": "realtime=v1",
+    }
+
+    transcripts: list[str] = []
+
+    print(f"[STT] 实时转写: model={api_model}, pcm_size={len(pcm)}",
+          file=sys.stderr, flush=True)
+
+    async with websockets.connect(url, additional_headers=headers) as ws:
+        # ① session.update
+        await ws.send(json.dumps({
+            "event_id": "evt_session",
+            "type": "session.update",
+            "session": {
+                "modalities": ["text"],
+                "input_audio_format": "pcm",
+                "sample_rate": 16000,
+                "input_audio_transcription": {
+                    "language": language or "zh",
+                },
+                "turn_detection": {
+                    "type": "server_vad",
+                    "threshold": 0.0,
+                    "silence_duration_ms": 400,
+                },
+            },
+        }))
+
+        # 等待 session 就绪
+        while True:
+            msg = json.loads(await asyncio.wait_for(ws.recv(), timeout=10))
+            t = msg.get("type", "")
+            if t in ("session.created", "session.updated"):
+                break
+            if t == "error":
+                raise RuntimeError(f"DashScope session 错误: {msg}")
+
+        # ② 流式发送音频
+        CHUNK = 3200  # ~0.1s at 16kHz 16-bit mono
+        for offset in range(0, len(pcm), CHUNK):
+            chunk = pcm[offset:offset + CHUNK]
+            await ws.send(json.dumps({
+                "type": "input_audio_buffer.append",
+                "audio": base64.b64encode(chunk).decode("ascii"),
+            }))
+            await asyncio.sleep(0.02)
+
+        # ③ 结束会话
+        await ws.send(json.dumps({
+            "event_id": "evt_finish",
+            "type": "session.finish",
+        }))
+
+        # ④ 收集结果
+        while True:
+            try:
+                raw = await asyncio.wait_for(ws.recv(), timeout=30)
+            except asyncio.TimeoutError:
+                print("[STT] 实时转写超时", file=sys.stderr, flush=True)
+                break
+            msg = json.loads(raw)
+            t = msg.get("type", "")
+            if t == "conversation.item.input_audio_transcription.completed":
+                text = msg.get("transcript", "")
+                if text:
+                    transcripts.append(text)
+            elif t == "session.finished":
+                final = msg.get("transcript", "")
+                if final:
+                    transcripts.append(final)
+                break
+            elif t == "error":
+                raise RuntimeError(f"DashScope 实时转写错误: {msg}")
+
+    result = "".join(transcripts).strip()
+    print(f"[STT] 实时转写完成: {result[:80]}", file=sys.stderr, flush=True)
+    return result
 
 
 # ═══════════════════════════════════════════════════════════════════════════

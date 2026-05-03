@@ -1,6 +1,64 @@
 import React, { useState, useRef, useCallback, useEffect, useImperativeHandle, forwardRef } from 'react';
 import { api } from '../api';
 
+/** Convert a webm audio Blob to 16kHz 16-bit mono WAV, return as base64 string. */
+async function convertToWavBase64(blob: Blob): Promise<string> {
+  const arrayBuf = await blob.arrayBuffer();
+  // Decode webm/opus using browser's built-in decoder
+  const tempCtx = new AudioContext();
+  let decoded: AudioBuffer;
+  try {
+    decoded = await tempCtx.decodeAudioData(arrayBuf);
+  } finally {
+    await tempCtx.close().catch(() => {});
+  }
+
+  // Resample to 16kHz mono via OfflineAudioContext
+  const targetRate = 16000;
+  const numSamples = Math.ceil(decoded.duration * targetRate);
+  const offlineCtx = new OfflineAudioContext(1, numSamples, targetRate);
+  const src = offlineCtx.createBufferSource();
+  src.buffer = decoded;
+  src.connect(offlineCtx.destination);
+  src.start(0);
+  const rendered = await offlineCtx.startRendering();
+  const floats = rendered.getChannelData(0);
+
+  // Float32 → Int16
+  const pcm = new Int16Array(floats.length);
+  for (let i = 0; i < floats.length; i++) {
+    const s = Math.max(-1, Math.min(1, floats[i]));
+    pcm[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+  }
+
+  // Build WAV container
+  const wavBuf = new ArrayBuffer(44 + pcm.byteLength);
+  const dv = new DataView(wavBuf);
+  const writeStr = (off: number, s: string) => { for (let i = 0; i < s.length; i++) dv.setUint8(off + i, s.charCodeAt(i)); };
+  writeStr(0, 'RIFF');
+  dv.setUint32(4, 36 + pcm.byteLength, true);
+  writeStr(8, 'WAVE');
+  writeStr(12, 'fmt ');
+  dv.setUint32(16, 16, true);
+  dv.setUint16(20, 1, true);          // PCM
+  dv.setUint16(22, 1, true);          // mono
+  dv.setUint32(24, targetRate, true);  // sample rate
+  dv.setUint32(28, targetRate * 2, true); // byte rate
+  dv.setUint16(32, 2, true);          // block align
+  dv.setUint16(34, 16, true);         // bits per sample
+  writeStr(36, 'data');
+  dv.setUint32(40, pcm.byteLength, true);
+  new Uint8Array(wavBuf, 44).set(new Uint8Array(pcm.buffer));
+
+  // Base64 encode
+  const bytes = new Uint8Array(wavBuf);
+  let binary = '';
+  for (let i = 0; i < bytes.length; i += 8192) {
+    binary += String.fromCharCode(...bytes.subarray(i, Math.min(i + 8192, bytes.length)));
+  }
+  return btoa(binary);
+}
+
 export interface VoiceInputHandle {
   stopRecording: () => void;
 }
@@ -129,13 +187,7 @@ const VoiceInput = forwardRef<VoiceInputHandle, VoiceInputProps>(function VoiceI
     setError('');
     try {
       const blob = new Blob(chunksRef.current, { type: 'audio/webm' });
-      const buf = await blob.arrayBuffer();
-      const bytes = new Uint8Array(buf);
-      let binary = '';
-      for (let i = 0; i < bytes.length; i += 8192) {
-        binary += String.fromCharCode(...bytes.subarray(i, Math.min(i + 8192, bytes.length)));
-      }
-      const b64 = btoa(binary);
+      const b64 = await convertToWavBase64(blob);
       const res = await api.sttTranscribe(b64);
       if (!mountedRef.current) return;
       if (res.ok && res.text) {
