@@ -424,18 +424,24 @@ async def _transcribe_dashscope_native(
 
             # ③ 轮询等待结果
             result = Transcription.wait(task=task_id)
-            print(f"[STT] DashScope wait: status={getattr(result, 'status_code', '?')}",
+            output = result.output
+            # 打印完整 output 帮助调试
+            if isinstance(output, dict):
+                _out_debug = json.dumps(output, ensure_ascii=False, default=str)[:500]
+            else:
+                _out_debug = repr(output)[:500]
+            print(f"[STT] DashScope wait: status={getattr(result, 'status_code', '?')}, "
+                  f"output={_out_debug}",
                   file=sys.stderr, flush=True)
 
             status_code = getattr(result, 'status_code', 0)
             if status_code != 200:
                 msg = getattr(getattr(result, 'output', None), 'message', '') or ''
-                if not msg and hasattr(result, 'output') and isinstance(result.output, dict):
-                    msg = result.output.get('message', '')
+                if not msg and isinstance(output, dict):
+                    msg = output.get('message', '')
                 raise RuntimeError(f"DashScope 转写失败 (code={status_code}): {msg}")
 
             # ④ 解析转写结果
-            output = result.output
             results = output.get('results', []) if isinstance(output, dict) else getattr(output, 'results', [])
             return _parse_transcription_results(results)
         finally:
