@@ -350,30 +350,50 @@ async def _transcribe_dashscope_native(
             )
 
             # ① 上传文件到 OSS
-            _uploader = getattr(dashscope, 'Uploader', None) or getattr(dashscope, 'Upload', None)
-            if _uploader is None:
-                try:
-                    from dashscope.common.upload import Uploader as _uploader
-                except ImportError:
-                    pass
-            if _uploader is None:
-                _ver = getattr(dashscope, '__version__', '?')
-                raise RuntimeError(
-                    f"dashscope {_ver} 无 Uploader。"
-                    f"请安装: pip install \"dashscope>=1.14.0,<1.22.0\""
-                )
+            file_url = None
+            _oss_mode = False
 
-            file_url = _uploader.upload(file_path=tmp_path, model=api_model)
+            # 新版 SDK (1.17+): dashscope.utils.oss_utils.OssUtils
+            try:
+                from dashscope.utils.oss_utils import OssUtils
+                file_url = OssUtils.upload(
+                    model=api_model,
+                    file_path=tmp_path,
+                    api_key=api_key,
+                )
+                _oss_mode = True
+            except (ImportError, AttributeError):
+                pass
+
+            # 旧版 SDK: dashscope.Uploader
+            if not file_url:
+                _uploader = getattr(dashscope, 'Uploader', None)
+                if _uploader is None:
+                    try:
+                        from dashscope.common.upload import Uploader as _uploader
+                    except ImportError:
+                        pass
+                if _uploader is not None:
+                    file_url = _uploader.upload(file_path=tmp_path, model=api_model)
+
             if not file_url or not isinstance(file_url, str):
-                raise RuntimeError(f"DashScope 文件上传失败: {file_url}")
+                raise RuntimeError(
+                    f"DashScope 文件上传失败，SDK 无可用上传接口。"
+                    f"请确认 dashscope 已正确安装。"
+                )
             print(f"[STT] DashScope 上传完成: {file_url[:80]}",
                   file=sys.stderr, flush=True)
 
             # ② 提交异步转写任务（官方标准流程）
+            # OssUtils 返回 oss:// 前缀 URL，需要带 header 让服务端解析
+            _extra = {}
+            if _oss_mode and file_url.startswith('oss://'):
+                _extra['headers'] = {'X-DashScope-OssResourceResolve': 'enable'}
             task_resp = Transcription.async_call(
                 model=api_model,
                 file_urls=[file_url],
                 language_hints=[language] if language else None,
+                **_extra,
             )
 
             task_id = (task_resp.output.get('task_id')
