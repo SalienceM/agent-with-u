@@ -303,6 +303,7 @@ export const Settings: React.FC<SettingsProps> = ({
                 >
                   <option value="sensevoice-v1">SenseVoice v1 (50+ 语言)</option>
                   <option value="paraformer-v2">Paraformer v2 (中英)</option>
+                  <option value="qwen3-asr-flash-realtime">Qwen3 ASR Flash Realtime (实时流式)</option>
                   <option value="fun-asr">FunASR (需 pip install dashscope)</option>
                 </select>
                 <input
@@ -312,7 +313,7 @@ export const Settings: React.FC<SettingsProps> = ({
                   style={inputStyle}
                 />
                 <span style={{ fontSize: 11, color: 'var(--theme-text-muted)' }}>
-                  sensevoice/paraformer 走 OpenAI 兼容接口; fun-asr 走原生 SDK
+                  sensevoice/paraformer 走兼容接口; qwen3-asr 走 WebSocket 实时流式; fun-asr 走原生 SDK
                 </span>
               </div>
             )}
