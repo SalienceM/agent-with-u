@@ -581,7 +581,9 @@ def _ws_is_open(ws) -> bool:
 
 
 class SttRealtimeSession:
-    """管理与 DashScope 实时 ASR 的 WebSocket 长连接，支持流式音频推送。"""
+    """管理与 DashScope 实时 ASR 的 WebSocket 长连接，支持流式音频推送和主动轮转。"""
+
+    ROTATE_INTERVAL = 55  # 在超时前主动轮转（秒）
 
     def __init__(
         self,
@@ -598,22 +600,21 @@ class SttRealtimeSession:
         self._on_end = on_end
         self._ws = None
         self._listener_task: Optional[asyncio.Task] = None
+        self._rotate_task: Optional[asyncio.Task] = None
         self._final_text = ""
         self._done = asyncio.Event()
         self._stopped_by_user = False
+        self._rotating = False
 
-    async def start(self):
+    async def _connect_ws(self):
         import websockets
-
         url = f"wss://dashscope.aliyuncs.com/api-ws/v1/realtime?model={self._model}"
         headers = {
             "Authorization": f"Bearer {self._api_key}",
             "OpenAI-Beta": "realtime=v1",
         }
-        print(f"[STT] 流式会话启动: model={self._model}", file=sys.stderr, flush=True)
-        self._ws = await websockets.connect(url, additional_headers=headers)
-
-        await self._ws.send(json.dumps({
+        ws = await websockets.connect(url, additional_headers=headers)
+        await ws.send(json.dumps({
             "event_id": "evt_session",
             "type": "session.update",
             "session": {
@@ -628,26 +629,38 @@ class SttRealtimeSession:
                 },
             },
         }))
-
         while True:
-            msg = json.loads(await asyncio.wait_for(self._ws.recv(), timeout=10))
+            msg = json.loads(await asyncio.wait_for(ws.recv(), timeout=10))
             t = msg.get("type", "")
             if t in ("session.created", "session.updated"):
                 break
             if t == "error":
                 raise RuntimeError(f"DashScope session 错误: {msg}")
+        return ws
 
+    async def start(self):
+        print(f"[STT] 流式会话启动: model={self._model}", file=sys.stderr, flush=True)
+        self._ws = await self._connect_ws()
         self._listener_task = asyncio.create_task(self._listen())
+        self._rotate_task = asyncio.create_task(self._auto_rotate())
 
     async def send_audio(self, pcm_chunk: bytes):
-        if self._ws and _ws_is_open(self._ws):
-            await self._ws.send(json.dumps({
+        ws = self._ws
+        if ws and _ws_is_open(ws):
+            await ws.send(json.dumps({
                 "type": "input_audio_buffer.append",
                 "audio": base64.b64encode(pcm_chunk).decode("ascii"),
             }))
 
     async def stop(self) -> str:
         self._stopped_by_user = True
+        if self._rotate_task:
+            self._rotate_task.cancel()
+            try:
+                await self._rotate_task
+            except (asyncio.CancelledError, Exception):
+                pass
+            self._rotate_task = None
         if self._ws and _ws_is_open(self._ws):
             try:
                 await self._ws.send(json.dumps({
@@ -671,9 +684,52 @@ class SttRealtimeSession:
         print(f"[STT] 流式会话结束: {self._final_text[:80]}", file=sys.stderr, flush=True)
         return self._final_text
 
-    async def _listen(self):
+    async def _auto_rotate(self):
+        """定时主动轮转 WebSocket 连接，避免超时断开。"""
         try:
-            async for raw in self._ws:
+            while True:
+                await asyncio.sleep(self.ROTATE_INTERVAL)
+                if self._stopped_by_user:
+                    break
+                await self._rotate()
+        except asyncio.CancelledError:
+            pass
+
+    async def _rotate(self):
+        """无缝切换到新 WebSocket 连接。"""
+        self._rotating = True
+        old_ws = self._ws
+        old_listener = self._listener_task
+        try:
+            print("[STT] 主动轮转会话...", file=sys.stderr, flush=True)
+            new_ws = await self._connect_ws()
+            self._ws = new_ws
+            self._done = asyncio.Event()
+            self._listener_task = asyncio.create_task(self._listen())
+            print("[STT] 轮转成功，关闭旧连接", file=sys.stderr, flush=True)
+        except Exception as e:
+            print(f"[STT] 轮转失败, 保持旧连接: {e}", file=sys.stderr, flush=True)
+            self._rotating = False
+            return
+        self._rotating = False
+        if old_ws:
+            try:
+                await old_ws.close()
+            except Exception:
+                pass
+        if old_listener:
+            old_listener.cancel()
+            try:
+                await old_listener
+            except (asyncio.CancelledError, Exception):
+                pass
+
+    async def _listen(self):
+        ws = self._ws
+        try:
+            async for raw in ws:
+                if isinstance(raw, bytes):
+                    continue
                 msg = json.loads(raw)
                 t = msg.get("type", "")
                 if t == "conversation.item.input_audio_transcription.text":
@@ -700,7 +756,7 @@ class SttRealtimeSession:
         except Exception as e:
             print(f"[STT] 流式监听异常: {e}", file=sys.stderr, flush=True)
             self._done.set()
-        if not self._stopped_by_user and self._on_end:
+        if not self._stopped_by_user and not self._rotating and self._on_end:
             try:
                 self._on_end()
             except Exception:

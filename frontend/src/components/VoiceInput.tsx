@@ -168,7 +168,7 @@ const VoiceInput = forwardRef<VoiceInputHandle, VoiceInputProps>(function VoiceI
     const processor = audioCtx.createScriptProcessor(4096, 1, 1);
     processor.onaudioprocess = (e) => {
       if (stoppedRef.current) return;
-      api.sttStreamAudio(float32ToB64(e.inputBuffer.getChannelData(0)));
+      api.sttStreamAudioBinary(float32ToB64(e.inputBuffer.getChannelData(0)) as any);
     };
     analyser.connect(processor);
     const gain = audioCtx.createGain();

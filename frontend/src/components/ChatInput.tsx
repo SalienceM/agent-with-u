@@ -163,25 +163,18 @@ const ChatInputInner: React.FC<Props> = ({
   const micPrefixRef = useRef<string | null>(null);
   const micStoppedRef = useRef(false);
 
-  const float32ToB64 = useCallback((floats: Float32Array): string => {
-    const pcm = new Int16Array(floats.length);
-    for (let i = 0; i < floats.length; i++) {
-      const s = Math.max(-1, Math.min(1, floats[i]));
-      pcm[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
-    }
-    const bytes = new Uint8Array(pcm.buffer);
-    let binary = '';
-    for (let i = 0; i < bytes.length; i += 8192) {
-      binary += String.fromCharCode(...bytes.subarray(i, Math.min(i + 8192, bytes.length)));
-    }
-    return btoa(binary);
-  }, []);
+  const micWorkletRef = useRef<AudioWorkletNode | null>(null);
 
   const micStop = useCallback(async () => {
     if (micStoppedRef.current) return;
     micStoppedRef.current = true;
     micUnsubRef.current?.();
     micUnsubRef.current = null;
+    if (micWorkletRef.current) {
+      micWorkletRef.current.port.close();
+      micWorkletRef.current.disconnect();
+      micWorkletRef.current = null;
+    }
     micStreamRef.current?.getTracks().forEach(t => t.stop());
     micStreamRef.current = null;
     micAudioCtxRef.current?.close().catch(() => {});
@@ -239,24 +232,22 @@ const ChatInputInner: React.FC<Props> = ({
 
       const audioCtx = new AudioContext({ sampleRate: 16000 });
       micAudioCtxRef.current = audioCtx;
+      await audioCtx.audioWorklet.addModule('./pcm-worklet.js');
       const source = audioCtx.createMediaStreamSource(stream);
-      const processor = audioCtx.createScriptProcessor(4096, 1, 1);
-      processor.onaudioprocess = (e) => {
+      const worklet = new AudioWorkletNode(audioCtx, 'pcm-processor');
+      micWorkletRef.current = worklet;
+      worklet.port.onmessage = (e: MessageEvent<ArrayBuffer>) => {
         if (micStoppedRef.current) return;
-        api.sttStreamAudio(float32ToB64(e.inputBuffer.getChannelData(0)));
+        api.sttStreamAudioBinary(e.data);
       };
-      source.connect(processor);
-      const gain = audioCtx.createGain();
-      gain.gain.value = 0;
-      processor.connect(gain);
-      gain.connect(audioCtx.destination);
+      source.connect(worklet);
 
       setMicActive(true);
     } catch (e: any) {
       console.error('[mic]', e);
       setMicActive(false);
     }
-  }, [float32ToB64]);
+  }, []);
 
   const toggleMic = useCallback(() => {
     if (micActive) {
@@ -285,6 +276,11 @@ const ChatInputInner: React.FC<Props> = ({
       micUnsubRef.current = unsub;
     } catch {
       micStoppedRef.current = true;
+      if (micWorkletRef.current) {
+        micWorkletRef.current.port.close();
+        micWorkletRef.current.disconnect();
+        micWorkletRef.current = null;
+      }
       micStreamRef.current?.getTracks().forEach(t => t.stop());
       micStreamRef.current = null;
       micAudioCtxRef.current?.close().catch(() => {});
@@ -305,6 +301,11 @@ const ChatInputInner: React.FC<Props> = ({
       if (micStreamRef.current) {
         micStoppedRef.current = true;
         micUnsubRef.current?.();
+        if (micWorkletRef.current) {
+          micWorkletRef.current.port.close();
+          micWorkletRef.current.disconnect();
+          micWorkletRef.current = null;
+        }
         micStreamRef.current.getTracks().forEach(t => t.stop());
         micAudioCtxRef.current?.close().catch(() => {});
       }

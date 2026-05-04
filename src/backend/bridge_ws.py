@@ -865,6 +865,13 @@ class BridgeWS:
         print(f"[bridge_ws] client connected (total={len(self._clients)})", file=sys.stderr, flush=True)
         try:
             async for raw in websocket:
+                if isinstance(raw, bytes):
+                    if self._stt_stream:
+                        try:
+                            await self._stt_stream.send_audio(raw)
+                        except Exception:
+                            pass
+                    continue
                 req_id = None
                 try:
                     req = json.loads(raw)
@@ -1039,18 +1046,6 @@ class BridgeWS:
             import traceback
             print(f"[STT] 流式启动失败: {e}\n{traceback.format_exc()}",
                   file=sys.stderr, flush=True)
-            return json.dumps({"ok": False, "error": str(e)}, ensure_ascii=False)
-
-    async def _rpc_sttStreamAudio(self, audio_b64: str) -> str:
-        """发送一帧 PCM 音频到实时流式会话。"""
-        import base64 as _b64
-        if not self._stt_stream:
-            return json.dumps({"ok": False, "error": "No active STT stream"}, ensure_ascii=False)
-        try:
-            pcm = _b64.b64decode(audio_b64)
-            await self._stt_stream.send_audio(pcm)
-            return json.dumps({"ok": True}, ensure_ascii=False)
-        except Exception as e:
             return json.dumps({"ok": False, "error": str(e)}, ensure_ascii=False)
 
     async def _rpc_sttStreamStop(self) -> str:

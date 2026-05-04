@@ -143,6 +143,7 @@ function scheduleReconnect() {
 }
 
 function handleMessage(e: MessageEvent) {
+  if (typeof e.data !== 'string') return;
   try {
     const msg = JSON.parse(e.data);
     if (msg.id !== undefined && pending.has(msg.id)) {
@@ -691,9 +692,9 @@ export const api = {
     try { return typeof r === 'string' ? JSON.parse(r) : r; } catch { return { ok: false, error: 'parse error' }; }
   },
 
-  sttStreamAudio(audioB64: string): void {
+  sttStreamAudioBinary(pcmBuffer: ArrayBuffer): void {
     if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({ id: nextId(), method: 'sttStreamAudio', params: [audioB64] }));
+      ws.send(pcmBuffer);
     }
   },
 
@@ -805,7 +806,6 @@ function mockDispatch(method: string, params: any[]): any {
     case 'sttTranscribe': return JSON.stringify({ ok: false, error: 'mock mode' });
     case 'sttRefine': return JSON.stringify({ ok: false, error: 'mock mode' });
     case 'sttStreamStart': return JSON.stringify({ ok: false, error: 'mock mode' });
-    case 'sttStreamAudio': return JSON.stringify({ ok: true });
     case 'sttStreamStop': return JSON.stringify({ ok: false, error: 'mock mode' });
     default: return null;
   }
