@@ -589,15 +589,18 @@ class SttRealtimeSession:
         model: str,
         language: str,
         on_text,  # (text: str, is_final: bool) -> None
+        on_end=None,  # Optional[() -> None] — 连接意外断开时回调
     ):
         self._api_key = api_key
         self._model = model
         self._language = language
         self._on_text = on_text
+        self._on_end = on_end
         self._ws = None
         self._listener_task: Optional[asyncio.Task] = None
         self._final_text = ""
         self._done = asyncio.Event()
+        self._stopped_by_user = False
 
     async def start(self):
         import websockets
@@ -644,6 +647,7 @@ class SttRealtimeSession:
             }))
 
     async def stop(self) -> str:
+        self._stopped_by_user = True
         if self._ws and _ws_is_open(self._ws):
             try:
                 await self._ws.send(json.dumps({
@@ -692,10 +696,15 @@ class SttRealtimeSession:
                     self._done.set()
                     break
         except asyncio.CancelledError:
-            pass
+            return
         except Exception as e:
             print(f"[STT] 流式监听异常: {e}", file=sys.stderr, flush=True)
             self._done.set()
+        if not self._stopped_by_user and self._on_end:
+            try:
+                self._on_end()
+            except Exception:
+                pass
 
 
 # ═══════════════════════════════════════════════════════════════════════════

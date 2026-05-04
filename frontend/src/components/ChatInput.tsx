@@ -266,8 +266,42 @@ const ChatInputInner: React.FC<Props> = ({
     }
   }, [micActive, micStart, micStop]);
 
+  const micReconnect = useCallback(async () => {
+    if (micStoppedRef.current) return;
+    micUnsubRef.current?.();
+    micUnsubRef.current = null;
+    // 保存当前文本作为新前缀，避免重连后丢失已转写内容
+    if (ref.current) micPrefixRef.current = ref.current.value;
+    try {
+      const res = await api.sttStreamStart();
+      if (!res.ok) throw new Error(res.error);
+      const unsub = api.onSttStreamText((data) => {
+        if (!ref.current) return;
+        const prefix = micPrefixRef.current ?? '';
+        ref.current.value = prefix ? prefix + '\n' + data.text : data.text;
+        ref.current.style.height = 'auto';
+        ref.current.style.height = ref.current.scrollHeight + 'px';
+      });
+      micUnsubRef.current = unsub;
+    } catch {
+      micStoppedRef.current = true;
+      micStreamRef.current?.getTracks().forEach(t => t.stop());
+      micStreamRef.current = null;
+      micAudioCtxRef.current?.close().catch(() => {});
+      micAudioCtxRef.current = null;
+      micPrefixRef.current = null;
+      setMicActive(false);
+    }
+  }, []);
+
   useEffect(() => {
+    const unsub = api.onSttStreamEnd(() => {
+      if (!micStoppedRef.current) {
+        micReconnect();
+      }
+    });
     return () => {
+      unsub();
       if (micStreamRef.current) {
         micStoppedRef.current = true;
         micUnsubRef.current?.();
@@ -275,7 +309,7 @@ const ChatInputInner: React.FC<Props> = ({
         micAudioCtxRef.current?.close().catch(() => {});
       }
     };
-  }, []);
+  }, [micReconnect]);
 
   const handleCompact = useCallback(() => {
     // ★ 二次确认：新会话会清空上下文，误触代价很大

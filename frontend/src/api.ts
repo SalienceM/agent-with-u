@@ -74,6 +74,9 @@ let permissionRequestCallbacks: PermissionRequestCallback[] = [];
 type SttStreamTextCallback = (data: { text: string; isFinal: boolean }) => void;
 let sttStreamCallbacks: SttStreamTextCallback[] = [];
 
+type SttStreamEndCallback = (data: { reason: string }) => void;
+let sttStreamEndCallbacks: SttStreamEndCallback[] = [];
+
 function nextId() {
   return `r${++reqCounter}`;
 }
@@ -162,6 +165,9 @@ function handleMessage(e: MessageEvent) {
     } else if (msg.event === 'sttStreamText') {
       const data = JSON.parse(msg.data);
       sttStreamCallbacks.forEach((cb) => cb(data));
+    } else if (msg.event === 'sttStreamEnd') {
+      const data = JSON.parse(msg.data);
+      sttStreamEndCallbacks.forEach((cb) => cb(data));
     }
   } catch (err) {
     console.error('[api] message parse error:', err);
@@ -699,6 +705,11 @@ export const api = {
   onSttStreamText(cb: SttStreamTextCallback): () => void {
     sttStreamCallbacks.push(cb);
     return () => { sttStreamCallbacks = sttStreamCallbacks.filter((c) => c !== cb); };
+  },
+
+  onSttStreamEnd(cb: SttStreamEndCallback): () => void {
+    sttStreamEndCallbacks.push(cb);
+    return () => { sttStreamEndCallbacks = sttStreamEndCallbacks.filter((c) => c !== cb); };
   },
 
   /** 打开外部 cmd 窗口实时刷日志 */

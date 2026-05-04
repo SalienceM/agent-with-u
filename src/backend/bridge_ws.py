@@ -1023,8 +1023,15 @@ class BridgeWS:
                     "data": json.dumps({"text": text, "isFinal": is_final}, ensure_ascii=False),
                 }))
 
+            def on_end():
+                self._stt_stream = None
+                asyncio.ensure_future(self._broadcast({
+                    "event": "sttStreamEnd",
+                    "data": json.dumps({"reason": "disconnected"}, ensure_ascii=False),
+                }))
+
             model = cfg.api_model if cfg.api_model in _DASHSCOPE_REALTIME_MODELS else "qwen3-asr-flash-realtime"
-            session = SttRealtimeSession(cfg.api_key, model, cfg.language, on_text)
+            session = SttRealtimeSession(cfg.api_key, model, cfg.language, on_text, on_end)
             await session.start()
             self._stt_stream = session
             return json.dumps({"ok": True}, ensure_ascii=False)
