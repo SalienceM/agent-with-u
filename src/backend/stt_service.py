@@ -569,6 +569,17 @@ async def transcribe_dashscope_realtime(
     return result
 
 
+def _ws_is_open(ws) -> bool:
+    """兼容 websockets v10~v16 的连接状态检查。"""
+    if hasattr(ws, 'open'):
+        return ws.open
+    try:
+        from websockets.protocol import State
+        return ws.state == State.OPEN
+    except Exception:
+        return False
+
+
 class SttRealtimeSession:
     """管理与 DashScope 实时 ASR 的 WebSocket 长连接，支持流式音频推送。"""
 
@@ -626,14 +637,14 @@ class SttRealtimeSession:
         self._listener_task = asyncio.create_task(self._listen())
 
     async def send_audio(self, pcm_chunk: bytes):
-        if self._ws and self._ws.open:
+        if self._ws and _ws_is_open(self._ws):
             await self._ws.send(json.dumps({
                 "type": "input_audio_buffer.append",
                 "audio": base64.b64encode(pcm_chunk).decode("ascii"),
             }))
 
     async def stop(self) -> str:
-        if self._ws and self._ws.open:
+        if self._ws and _ws_is_open(self._ws):
             try:
                 await self._ws.send(json.dumps({
                     "event_id": "evt_finish",

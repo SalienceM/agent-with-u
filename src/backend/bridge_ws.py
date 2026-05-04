@@ -1003,7 +1003,7 @@ class BridgeWS:
     async def _rpc_sttStreamStart(self, config_json: str = "{}") -> str:
         """启动实时流式语音识别会话。"""
         import base64 as _b64
-        from .stt_service import SttRealtimeSession, SttConfig, load_stt_config
+        from .stt_service import SttRealtimeSession, SttConfig, load_stt_config, _DASHSCOPE_REALTIME_MODELS
         try:
             if self._stt_stream:
                 try:
@@ -1023,7 +1023,8 @@ class BridgeWS:
                     "data": json.dumps({"text": text, "isFinal": is_final}, ensure_ascii=False),
                 }))
 
-            session = SttRealtimeSession(cfg.api_key, cfg.api_model, cfg.language, on_text)
+            model = cfg.api_model if cfg.api_model in _DASHSCOPE_REALTIME_MODELS else "qwen3-asr-flash-realtime"
+            session = SttRealtimeSession(cfg.api_key, model, cfg.language, on_text)
             await session.start()
             self._stt_stream = session
             return json.dumps({"ok": True}, ensure_ascii=False)
