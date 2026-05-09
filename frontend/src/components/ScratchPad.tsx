@@ -49,8 +49,91 @@ const load = (): ScratchEntry[] => {
   try { return JSON.parse(localStorage.getItem(STORAGE_KEY) || '[]'); } catch { return []; }
 };
 const persist = (entries: ScratchEntry[]) => {
-  try { localStorage.setItem(STORAGE_KEY, JSON.stringify(entries)); } catch {}
+  // Strip image data (stored in IndexedDB) to keep localStorage small
+  const stripped = entries.map(e => ({
+    ...e,
+    blocks: e.blocks.map(b =>
+      b.type === 'image' ? { ...b, src: '' } : b
+    ),
+  }));
+  try { localStorage.setItem(STORAGE_KEY, JSON.stringify(stripped)); } catch {}
 };
+
+// ── IndexedDB 图片存储（突破 localStorage 5MB 限制）──────────────────
+const IDB_NAME = 'agent-with-u-scratch-images';
+const IDB_STORE = 'images';
+
+function openImageDB(): Promise<IDBDatabase> {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(IDB_NAME, 1);
+    req.onupgradeneeded = () => req.result.createObjectStore(IDB_STORE);
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+async function idbPut(id: string, src: string): Promise<void> {
+  const db = await openImageDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(IDB_STORE, 'readwrite');
+    tx.objectStore(IDB_STORE).put(src, id);
+    tx.oncomplete = () => { db.close(); resolve(); };
+    tx.onerror = () => { db.close(); reject(tx.error); };
+  });
+}
+
+async function idbGet(id: string): Promise<string | undefined> {
+  const db = await openImageDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(IDB_STORE, 'readonly');
+    const req = tx.objectStore(IDB_STORE).get(id);
+    req.onsuccess = () => { db.close(); resolve(req.result); };
+    req.onerror = () => { db.close(); reject(req.error); };
+  });
+}
+
+async function idbDelete(id: string): Promise<void> {
+  const db = await openImageDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(IDB_STORE, 'readwrite');
+    tx.objectStore(IDB_STORE).delete(id);
+    tx.oncomplete = () => { db.close(); resolve(); };
+    tx.onerror = () => { db.close(); reject(tx.error); };
+  });
+}
+
+async function hydrateImages(entries: ScratchEntry[]): Promise<ScratchEntry[]> {
+  const result: ScratchEntry[] = [];
+  for (const e of entries) {
+    const blocks: Block[] = [];
+    for (const b of e.blocks) {
+      if (b.type === 'image') {
+        if (b.src) {
+          // Legacy: full data URL in localStorage — migrate to IndexedDB
+          await idbPut(b.id, b.src).catch(() => {});
+          blocks.push(b);
+        } else {
+          const src = await idbGet(b.id).catch(() => undefined);
+          if (src) blocks.push({ ...b, src });
+        }
+      } else {
+        blocks.push(b);
+      }
+    }
+    const merged: Block[] = [];
+    for (const b of blocks) {
+      const last = merged[merged.length - 1];
+      if (last?.type === 'text' && b.type === 'text') {
+        merged[merged.length - 1] = { ...last, content: last.content + b.content };
+      } else {
+        merged.push(b);
+      }
+    }
+    if (merged.length === 0) merged.push({ type: 'text', id: bid(), content: '' });
+    result.push({ ...e, blocks: merged });
+  }
+  return result;
+}
 
 // ── 时间格式 ─────────────────────────────────────────────────────────
 const fmtTime = (ts: number) =>
@@ -302,17 +385,19 @@ const ScratchPadEditor: React.FC<EditorProps> = ({ mode, onClose }) => {
       if (e.key !== STORAGE_KEY) return;
       const fresh = load();
       setEntries(fresh);
+      hydrateImages(fresh).then(hydrated => setEntries(hydrated));
     };
     window.addEventListener('storage', handler);
     return () => window.removeEventListener('storage', handler);
   }, []);
 
-  // 初始化：选中最近一条，没有则新建
+  // 初始化：选中最近一条，没有则新建；异步从 IndexedDB 恢复图片
   useEffect(() => {
     const fresh = load();
-    setEntries(fresh);
     if (fresh.length > 0) {
+      setEntries(fresh);
       setActiveId([...fresh].sort((a, b) => b.updatedAt - a.updatedAt)[0].id);
+      hydrateImages(fresh).then(hydrated => setEntries(hydrated));
     } else {
       const e = emptyEntry();
       setEntries([e]);
@@ -340,6 +425,12 @@ const ScratchPadEditor: React.FC<EditorProps> = ({ mode, onClose }) => {
 
   const handleDelete = useCallback((id: string) => {
     setEntries(prev => {
+      const entry = prev.find(e => e.id === id);
+      if (entry) {
+        for (const b of entry.blocks) {
+          if (b.type === 'image') idbDelete(b.id).catch(() => {});
+        }
+      }
       const next = prev.filter(e => e.id !== id);
       if (id === activeId) {
         setActiveId([...next].sort((a, b) => b.updatedAt - a.updatedAt)[0]?.id ?? null);
@@ -365,6 +456,9 @@ const ScratchPadEditor: React.FC<EditorProps> = ({ mode, onClose }) => {
   const insertImageAt = useCallback((
     entryId: string, blockId: string, cursorPos: number, src: string,
   ) => {
+    const imgId = bid();
+    const afterId = bid();
+    idbPut(imgId, src).catch(() => {});
     setEntries(prev => prev.map(e => {
       if (e.id !== entryId) return e;
       const idx = e.blocks.findIndex(b => b.id === blockId);
@@ -373,8 +467,8 @@ const ScratchPadEditor: React.FC<EditorProps> = ({ mode, onClose }) => {
       if (block.type !== 'text') return e;
       const before = block.content.slice(0, cursorPos);
       const after  = block.content.slice(cursorPos);
-      const imgBlock: Block  = { type: 'image', id: bid(), src };
-      const afterBlock: Block = { type: 'text',  id: bid(), content: after };
+      const imgBlock: Block  = { type: 'image', id: imgId, src };
+      const afterBlock: Block = { type: 'text',  id: afterId, content: after };
       focusTarget.current = { blockId: afterBlock.id, pos: 0 };
       return {
         ...e, updatedAt: Date.now(),
@@ -390,6 +484,7 @@ const ScratchPadEditor: React.FC<EditorProps> = ({ mode, onClose }) => {
   }, []);
 
   const removeImageBlock = useCallback((entryId: string, blockId: string) => {
+    idbDelete(blockId).catch(() => {});
     setEntries(prev => prev.map(e => {
       if (e.id !== entryId) return e;
       const idx = e.blocks.findIndex(b => b.id === blockId);
