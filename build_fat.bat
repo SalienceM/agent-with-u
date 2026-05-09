@@ -141,10 +141,41 @@ copy /y "src-tauri\target\release\WebView2Loader.dll" "%STAGING%\" >nul 2>nul
 echo [OK] Artifacts staged
 
 :: ============================================================
-::  Step 3: 编译 NSIS 安装包
+::  Step 3: 验证 claude-env 内容完整性
 :: ============================================================
 echo.
-echo [STEP 3] Compiling NSIS installer ...
+echo [STEP 3] Verifying claude-env contents ...
+
+:: 检查关键文件是否存在
+set "CE_OK=1"
+if not exist "%CLAUDE_ENV%\node\node.exe" (
+    echo [ERROR] node.exe not found in claude-env\node\
+    set "CE_OK=0"
+)
+if not exist "%CLAUDE_ENV%\npm-global\node_modules\@anthropic-ai\claude-code" (
+    echo [ERROR] claude-code package not found in claude-env\npm-global\
+    set "CE_OK=0"
+)
+if not exist "%CLAUDE_ENV%\claude.cmd" (
+    echo [ERROR] claude.cmd not found in claude-env\
+    set "CE_OK=0"
+)
+if "!CE_OK!"=="0" (
+    echo.
+    echo [FAILED] claude-env is incomplete. Cannot build fat installer.
+    echo          Delete installer\claude-env and re-run this script.
+    pause & exit /b 1
+)
+
+:: 显示 claude-env 大小
+for /f %%s in ('powershell -NoProfile -Command "(Get-ChildItem -Recurse '%CLAUDE_ENV%' | Measure-Object -Property Length -Sum).Sum / 1MB" 2^>nul') do set CE_SIZE_MB=%%s
+echo [OK] claude-env verified (approx !CE_SIZE_MB! MB)
+
+:: ============================================================
+::  Step 4: 编译 NSIS 安装包
+:: ============================================================
+echo.
+echo [STEP 4] Compiling NSIS installer ...
 
 :: 检查 makensis
 where makensis >nul 2>&1
@@ -167,7 +198,7 @@ if not exist "dist" mkdir "dist"
 
 "%MAKENSIS%" /V3 ^
     /DVERSION=!VERSION! ^
-    /DTAURI_BUNDLE_DIR=..\_staging ^
+    /DTAURI_BUNDLE_DIR=_staging ^
     /DFAT_MODE=1 ^
     /DCLAUDE_ENV_DIR=claude-env ^
     installer\installer.nsi
@@ -180,10 +211,29 @@ if errorlevel 1 (
 :: 清理临时文件
 rmdir /s /q "%STAGING%" 2>nul
 
+:: ============================================================
+::  Step 5: 验证输出安装包大小
+:: ============================================================
+set "OUTPUT_EXE=dist\AgentWithU-!VERSION!-setup.exe"
+if exist "!OUTPUT_EXE!" (
+    for /f %%s in ('powershell -NoProfile -Command "(Get-Item '!OUTPUT_EXE!').Length / 1MB"') do set OUT_SIZE_MB=%%s
+    echo.
+    echo [INFO] Installer size: !OUT_SIZE_MB! MB
+    :: Fat installer should be at least 50MB (Node.js + claude-code)
+    for /f %%c in ('powershell -NoProfile -Command "if ([double]'!OUT_SIZE_MB!' -lt 50) { 'SMALL' } else { 'OK' }"') do set SIZE_CHECK=%%c
+    if "!SIZE_CHECK!"=="SMALL" (
+        echo [WARN] Installer seems too small for a fat build!
+        echo        Expected 50+ MB with Node.js + Claude Code.
+        echo        Claude Code may not have been included correctly.
+        echo        Check NSIS output above for missing file warnings.
+    )
+)
+
 echo.
 echo  =============================================
 echo   Done! Fat installer:
 echo   dist\AgentWithU-!VERSION!-setup.exe
+echo   Size: !OUT_SIZE_MB! MB
 echo  =============================================
 echo.
 echo  Lite installer (Tauri MSI):

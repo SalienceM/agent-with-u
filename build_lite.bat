@@ -59,7 +59,7 @@ if not exist "dist" mkdir "dist"
 
 "%MAKENSIS%" /V3 ^
     /DVERSION=!VERSION! ^
-    /DTAURI_BUNDLE_DIR=..\_staging ^
+    /DTAURI_BUNDLE_DIR=_staging ^
     installer\installer.nsi
 
 if errorlevel 1 ( echo [FAILED] NSIS compile failed & pause & exit /b 1 )

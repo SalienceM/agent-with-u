@@ -88,7 +88,7 @@ SectionEnd
 ;  Section 2: Claude Code CLI (可选)
 ; =====================================================================
 !ifdef FAT_MODE
-Section /o "Claude Code CLI (含 Node.js 运行时)" SEC_CLAUDE
+Section "Claude Code CLI (含 Node.js 运行时)" SEC_CLAUDE
   SetOutPath "$INSTDIR\claude-env"
 
   ; portable Node.js
