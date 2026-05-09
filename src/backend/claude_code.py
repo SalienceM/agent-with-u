@@ -61,6 +61,21 @@ class ClaudeCodeOfficialBackend(ModelBackend):
         import sys as _sys
         if _sys.platform == "win32":
             import os as _os
+            # 优先检查内置 claude-env（fat 安装包）
+            if getattr(_sys, 'frozen', False):
+                exe_dir = _os.path.dirname(_sys.executable)
+            else:
+                exe_dir = _os.path.dirname(_os.path.abspath(__file__))
+            bundled = _os.path.join(exe_dir, "claude-env", "claude.cmd")
+            if not _os.path.exists(bundled):
+                bundled = _os.path.join(exe_dir, "..", "claude-env", "claude.cmd")
+            if not _os.path.exists(bundled):
+                # Tauri 安装目录结构: $INSTDIR/agent-with-u-backend.exe + $INSTDIR/claude-env/
+                parent = _os.path.dirname(exe_dir) if not getattr(_sys, 'frozen', False) else exe_dir
+                bundled = _os.path.join(parent, "claude-env", "claude.cmd")
+            if _os.path.exists(bundled):
+                return bundled
+            # 回退：系统 npm 全局
             appdata = _os.environ.get("APPDATA", "")
             for name in ("claude.cmd", "claude.exe", "claude"):
                 p = _os.path.join(appdata, "npm", name)

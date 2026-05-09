@@ -1,0 +1,71 @@
+@echo off
+setlocal EnableDelayedExpansion
+chcp 65001 >nul
+title Build Lite Installer - AgentWithU
+cd /d "%~dp0"
+
+echo.
+echo  =============================================
+echo   AgentWithU -- Lite Installer Build
+echo   (不含 Claude Code，需用户自行安装)
+echo  =============================================
+echo.
+
+:: ── 版本号 ──────────────────
+for /f %%a in ('powershell -NoProfile -Command "[int](Get-Date -Format yy)"') do set VER_YY=%%a
+for /f %%a in ('powershell -NoProfile -Command "(Get-Date).Month"') do set VER_MM=%%a
+for /f %%a in ('powershell -NoProfile -Command "(Get-Date).Day"') do set VER_DD=%%a
+set "VERSION=!VER_YY!.!VER_MM!.!VER_DD!"
+
+for /f "tokens=2" %%T in ('rustc -Vv ^| findstr /i "host"') do set TARGET_TRIPLE=%%T
+if "%TARGET_TRIPLE%"=="" set TARGET_TRIPLE=x86_64-pc-windows-msvc
+
+:: 确保 Tauri 已构建
+set "TAURI_EXE=src-tauri\target\release\AgentWithU.exe"
+if not exist "!TAURI_EXE!" (
+    echo [INFO] Running build_all.bat first ...
+    call build_all.bat
+    if errorlevel 1 ( echo [FAILED] & pause & exit /b 1 )
+)
+
+:: 收集产物
+set "STAGING=installer\_staging"
+if exist "%STAGING%" rmdir /s /q "%STAGING%"
+mkdir "%STAGING%"
+copy /y "src-tauri\target\release\AgentWithU.exe" "%STAGING%\" >nul
+if exist "src-tauri\binaries\agent-with-u-backend-%TARGET_TRIPLE%.exe" (
+    copy /y "src-tauri\binaries\agent-with-u-backend-%TARGET_TRIPLE%.exe" "%STAGING%\agent-with-u-backend.exe" >nul
+) else if exist "dist\agent-with-u-backend.exe" (
+    copy /y "dist\agent-with-u-backend.exe" "%STAGING%\agent-with-u-backend.exe" >nul
+)
+copy /y "src-tauri\target\release\WebView2Loader.dll" "%STAGING%\" >nul 2>nul
+
+:: NSIS（不传 FAT_MODE）
+where makensis >nul 2>&1
+if errorlevel 1 (
+    if exist "C:\Program Files (x86)\NSIS\makensis.exe" (
+        set "MAKENSIS=C:\Program Files (x86)\NSIS\makensis.exe"
+    ) else if exist "C:\Program Files\NSIS\makensis.exe" (
+        set "MAKENSIS=C:\Program Files\NSIS\makensis.exe"
+    ) else (
+        echo [ERROR] NSIS not found! Install from https://nsis.sourceforge.io/
+        pause & exit /b 1
+    )
+) else (
+    set "MAKENSIS=makensis"
+)
+
+if not exist "dist" mkdir "dist"
+
+"%MAKENSIS%" /V3 ^
+    /DVERSION=!VERSION! ^
+    /DTAURI_BUNDLE_DIR=..\_staging ^
+    installer\installer.nsi
+
+if errorlevel 1 ( echo [FAILED] NSIS compile failed & pause & exit /b 1 )
+rmdir /s /q "%STAGING%" 2>nul
+
+echo.
+echo  Done! Lite installer: dist\AgentWithU-!VERSION!-setup.exe
+echo.
+pause

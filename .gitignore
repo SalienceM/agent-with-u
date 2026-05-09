@@ -13,4 +13,7 @@ frontend/dist/
 .DS_Store
 Thumbs.db
 src-tauri/target/
+src-tauri/binaries/
+installer/claude-env/
+installer/_staging/
 .claude/worktrees/
