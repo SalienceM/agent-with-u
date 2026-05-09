@@ -112,7 +112,11 @@ class SessionStore:
             for m in data.get("messages", []):
                 images = None
                 if m.get("images"):
-                    images = [ImageAttachment(**img) for img in m["images"]]
+                    _valid_keys = {"id", "base64", "mime_type", "size", "width", "height", "file_path"}
+                    images = [
+                        ImageAttachment(**{k: v for k, v in img.items() if k in _valid_keys})
+                        for img in m["images"]
+                    ]
                 tool_calls = None
                 if m.get("toolCalls"):
                     tool_calls = [ToolCallInfo(**tc) for tc in m["toolCalls"]]

@@ -2640,88 +2640,115 @@ except urllib.error.URLError as e:
         return backend
 
     async def _handle_send_message(self, payload_json: str):
-        payload = json.loads(payload_json)
-        session_id = payload["sessionId"]
-        content = payload["content"]
-        backend_id = payload["backendId"]
-        raw_images = payload.get("images")
-        auto_continue = payload.get("autoContinue", True)
-        # skip_permissions 优先级：前端 payload 显式值 > backend 配置 > 默认 True
-        if "skipPermissions" in payload:
-            skip_permissions = bool(payload["skipPermissions"])
-        else:
-            backend_cfg = next((c for c in self._backend_configs if c.id == backend_id), None)
-            skip_permissions = getattr(backend_cfg, "skip_permissions", True)
-        working_dir = payload.get("workingDir")
+        try:
+            payload = json.loads(payload_json)
+            session_id = payload["sessionId"]
+            content = payload["content"]
+            backend_id = payload["backendId"]
+            raw_images = payload.get("images")
+            auto_continue = payload.get("autoContinue", True)
+            # skip_permissions 优先级：前端 payload 显式值 > backend 配置 > 默认 True
+            if "skipPermissions" in payload:
+                skip_permissions = bool(payload["skipPermissions"])
+            else:
+                backend_cfg = next((c for c in self._backend_configs if c.id == backend_id), None)
+                skip_permissions = getattr(backend_cfg, "skip_permissions", True)
+            working_dir = payload.get("workingDir")
 
-        images = [ImageAttachment(**img) for img in raw_images] if raw_images else None
-
-        session = self._active_sessions.get(session_id)
-        if not session:
-            session = self._session_store.load(session_id)
-            if not session:
-                session = Session(
-                    id=session_id, title=content[:50] or "新会话",
-                    created_at=time.time(), updated_at=time.time(),
-                    messages=[], working_dir=working_dir or ".", backend_id=backend_id,
-                )
-            self._active_sessions[session_id] = session
-
-        if backend_id and backend_id != session.backend_id:
-            session.backend_id = backend_id
-            session.agent_session_id = None
-
-        session.auto_continue = auto_continue
-
-        # ★ 用户贴图 + session 有 Backend Skill 时：
-        #   保存图片到 skill-images 并在 content 中注入 HTTP URL，
-        #   让模型知道可以把这些 URL 作为 ref_image 传给 skill
-        if images and session.abilities and session.abilities.get("skills"):
-            import base64 as _b64
-            from pathlib import Path as _Path
-            has_backend_skill = any(
-                (self._skill_store.get_skill(s) or {}).get("backend")
-                for s in session.abilities["skills"]
-            )
-            if has_backend_skill:
-                img_urls = []
-                for img in images:
-                    if img.base64:
-                        try:
-                            tmp_dir = _Path.home() / ".agent-with-u" / "skill-images"
-                            tmp_dir.mkdir(parents=True, exist_ok=True)
-                            ext = img.mime_type.split("/")[-1].replace("jpeg", "jpg")
-                            img_path = tmp_dir / f"user-{new_id()}.{ext}"
-                            img_path.write_bytes(_b64.b64decode(img.base64))
-                            url = f"http://127.0.0.1:{self._HTTP_API_PORT}/api/skill-images/{img_path.name}"
-                            img_urls.append(url)
-                        except Exception as e:
-                            print(f"[bridge_ws] Failed to save user image: {e}",
-                                  file=sys.stderr, flush=True)
-                if img_urls:
-                    url_note = "\n".join(f"[用户上传图片 URL: {u}]" for u in img_urls)
-                    content = f"{url_note}\n\n{content}"
-                    print(f"[bridge_ws] Saved {len(img_urls)} user images for Backend Skill",
+            images = None
+            if raw_images:
+                images = []
+                for i, img in enumerate(raw_images):
+                    try:
+                        filtered = {k: v for k, v in img.items()
+                                    if k in ("id", "base64", "mime_type", "size", "width", "height", "file_path")}
+                        images.append(ImageAttachment(**filtered))
+                    except Exception as e:
+                        print(f"[bridge_ws] 图片 #{i} 解析失败 (keys={list(img.keys())}): {e}",
+                              file=sys.stderr, flush=True)
+                if not images:
+                    images = None
+                else:
+                    print(f"[bridge_ws] 收到 {len(images)} 张图片",
                           file=sys.stderr, flush=True)
 
-        user_msg = ChatMessage(id=new_id(), role="user", content=content, images=images)
-        session.messages.append(user_msg)
+            session = self._active_sessions.get(session_id)
+            if not session:
+                session = self._session_store.load(session_id)
+                if not session:
+                    session = Session(
+                        id=session_id, title=content[:50] or "新会话",
+                        created_at=time.time(), updated_at=time.time(),
+                        messages=[], working_dir=working_dir or ".", backend_id=backend_id,
+                    )
+                self._active_sessions[session_id] = session
 
-        assistant_id = payload.get("messageId") or new_id()
-        assistant_msg = ChatMessage(
-            id=assistant_id, role="assistant", content="",
-            backend_id=backend_id, streaming=True,
-        )
-        session.messages.append(assistant_msg)
+            if backend_id and backend_id != session.backend_id:
+                session.backend_id = backend_id
+                session.agent_session_id = None
 
-        # ★ 每次发消息前重新部署 Backend Skill 文件，确保 SKILL.md 始终是最新模板
-        self._sync_backend_skills_to_directory(session)
+            session.auto_continue = auto_continue
 
-        await self._async_send(
-            session, content, images, backend_id, assistant_id,
-            auto_continue=auto_continue, skip_permissions=skip_permissions,
-            constraints=session.constraints,
-        )
+            # ★ 用户贴图 + session 有 Backend Skill 时：
+            #   保存图片到 skill-images 并在 content 中注入 HTTP URL，
+            #   让模型知道可以把这些 URL 作为 ref_image 传给 skill
+            if images and session.abilities and session.abilities.get("skills"):
+                import base64 as _b64
+                from pathlib import Path as _Path
+                has_backend_skill = any(
+                    (self._skill_store.get_skill(s) or {}).get("backend")
+                    for s in session.abilities["skills"]
+                )
+                if has_backend_skill:
+                    img_urls = []
+                    for img in images:
+                        if img.base64:
+                            try:
+                                tmp_dir = _Path.home() / ".agent-with-u" / "skill-images"
+                                tmp_dir.mkdir(parents=True, exist_ok=True)
+                                ext = img.mime_type.split("/")[-1].replace("jpeg", "jpg")
+                                img_path = tmp_dir / f"user-{new_id()}.{ext}"
+                                img_path.write_bytes(_b64.b64decode(img.base64))
+                                url = f"http://127.0.0.1:{self._HTTP_API_PORT}/api/skill-images/{img_path.name}"
+                                img_urls.append(url)
+                            except Exception as e:
+                                print(f"[bridge_ws] Failed to save user image: {e}",
+                                      file=sys.stderr, flush=True)
+                    if img_urls:
+                        url_note = "\n".join(f"[用户上传图片 URL: {u}]" for u in img_urls)
+                        content = f"{url_note}\n\n{content}"
+                        print(f"[bridge_ws] Saved {len(img_urls)} user images for Backend Skill",
+                              file=sys.stderr, flush=True)
+
+            user_msg = ChatMessage(id=new_id(), role="user", content=content, images=images)
+            session.messages.append(user_msg)
+
+            assistant_id = payload.get("messageId") or new_id()
+            assistant_msg = ChatMessage(
+                id=assistant_id, role="assistant", content="",
+                backend_id=backend_id, streaming=True,
+            )
+            session.messages.append(assistant_msg)
+
+            # ★ 每次发消息前重新部署 Backend Skill 文件，确保 SKILL.md 始终是最新模板
+            self._sync_backend_skills_to_directory(session)
+
+            await self._async_send(
+                session, content, images, backend_id, assistant_id,
+                auto_continue=auto_continue, skip_permissions=skip_permissions,
+                constraints=session.constraints,
+            )
+        except Exception as e:
+            import traceback
+            print(f"[bridge_ws] _handle_send_message 异常: {e}\n{traceback.format_exc()}",
+                  file=sys.stderr, flush=True)
+            try:
+                message_id = payload.get("messageId", "")
+                if message_id and session_id:
+                    self._emit_delta(StreamDelta(session_id, message_id, "error", error=str(e)))
+                    self._emit_delta(StreamDelta(session_id, message_id, "done"))
+            except Exception:
+                pass
 
     async def _async_send(
         self,
