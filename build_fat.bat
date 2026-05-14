@@ -150,13 +150,27 @@ if exist "%STAGING%" rmdir /s /q "%STAGING%"
 mkdir "%STAGING%"
 
 :: 主程序
-copy /y "src-tauri\target\release\AgentWithU.exe" "%STAGING%\" >nul
+set "TAURI_EXE_SRC=src-tauri\target\release\AgentWithU.exe"
+if not exist "!TAURI_EXE_SRC!" (
+    echo [ERROR] AgentWithU.exe not found at: !TAURI_EXE_SRC!
+    echo         Run build_all.bat first to build the Tauri application.
+    pause & exit /b 1
+)
+copy /y "!TAURI_EXE_SRC!" "%STAGING%\"
+if errorlevel 1 (
+    echo [ERROR] Failed to copy AgentWithU.exe to staging
+    pause & exit /b 1
+)
+
 :: Python sidecar — 带 target triple 后缀的是 Tauri 用的，我们拷原名
 if exist "src-tauri\binaries\agent-with-u-backend-%TARGET_TRIPLE%.exe" (
-    copy /y "src-tauri\binaries\agent-with-u-backend-%TARGET_TRIPLE%.exe" "%STAGING%\agent-with-u-backend.exe" >nul
+    copy /y "src-tauri\binaries\agent-with-u-backend-%TARGET_TRIPLE%.exe" "%STAGING%\agent-with-u-backend.exe"
 ) else if exist "dist\agent-with-u-backend.exe" (
-    copy /y "dist\agent-with-u-backend.exe" "%STAGING%\agent-with-u-backend.exe" >nul
+    copy /y "dist\agent-with-u-backend.exe" "%STAGING%\agent-with-u-backend.exe"
+) else (
+    echo [WARN] Backend sidecar not found! Installer will be incomplete.
 )
+
 :: WebView2Loader
 copy /y "src-tauri\target\release\WebView2Loader.dll" "%STAGING%\" >nul 2>nul
 echo [OK] Artifacts staged

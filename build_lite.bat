@@ -32,11 +32,17 @@ if not exist "!TAURI_EXE!" (
 set "STAGING=installer\_staging"
 if exist "%STAGING%" rmdir /s /q "%STAGING%"
 mkdir "%STAGING%"
-copy /y "src-tauri\target\release\AgentWithU.exe" "%STAGING%\" >nul
+if not exist "src-tauri\target\release\AgentWithU.exe" (
+    echo [ERROR] AgentWithU.exe not found. Run build_all.bat first.
+    pause & exit /b 1
+)
+copy /y "src-tauri\target\release\AgentWithU.exe" "%STAGING%\"
 if exist "src-tauri\binaries\agent-with-u-backend-%TARGET_TRIPLE%.exe" (
-    copy /y "src-tauri\binaries\agent-with-u-backend-%TARGET_TRIPLE%.exe" "%STAGING%\agent-with-u-backend.exe" >nul
+    copy /y "src-tauri\binaries\agent-with-u-backend-%TARGET_TRIPLE%.exe" "%STAGING%\agent-with-u-backend.exe"
 ) else if exist "dist\agent-with-u-backend.exe" (
-    copy /y "dist\agent-with-u-backend.exe" "%STAGING%\agent-with-u-backend.exe" >nul
+    copy /y "dist\agent-with-u-backend.exe" "%STAGING%\agent-with-u-backend.exe"
+) else (
+    echo [WARN] Backend sidecar not found!
 )
 copy /y "src-tauri\target\release\WebView2Loader.dll" "%STAGING%\" >nul 2>nul
 
