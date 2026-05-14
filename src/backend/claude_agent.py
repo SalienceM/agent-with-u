@@ -228,6 +228,14 @@ class ClaudeAgentBackend(ModelBackend):
                     "message": {"role": "user", "content": content_blocks},
                 }
 
+            # ★ stderr 回调：捕获 CLI 子进程的 stderr 输出，用于排查启动失败
+            _stderr_lines: list[str] = []
+            def _on_stderr(line: str):
+                line = line.rstrip()
+                if line:
+                    _stderr_lines.append(line)
+                    print(f"[ClaudeAgent][CLI stderr] {line}", file=sys.stderr, flush=True)
+
             options_kwargs: dict = dict(
                 allowed_tools=tools,
                 cwd=cwd,
@@ -238,6 +246,7 @@ class ClaudeAgentBackend(ModelBackend):
                 # ★ 加载用户级和项目级 settings（~/.claude/skills/ 和 .claude/skills/）
                 # 这是 Skills 系统生效的必要条件，默认 SDK 不加载任何 settings
                 setting_sources=["user", "project"],
+                stderr=_on_stderr,
             )
             if agent_session_id:
                 options_kwargs["resume"] = agent_session_id
@@ -644,7 +653,13 @@ class ClaudeAgentBackend(ModelBackend):
         except Exception as e:
             import traceback
             traceback.print_exc()
-            emit("error", error=_exc_msg(e))
+            err_msg = _exc_msg(e)
+            if _stderr_lines:
+                stderr_tail = "\n".join(_stderr_lines[-20:])
+                err_msg = f"{err_msg}\n\nCLI stderr:\n{stderr_tail}"
+                print(f"[ClaudeAgent] CLI stderr captured ({len(_stderr_lines)} lines):\n{stderr_tail}",
+                      file=sys.stderr, flush=True)
+            emit("error", error=err_msg)
             emit("done")
             return {"agentSessionId": agent_sid}
 
