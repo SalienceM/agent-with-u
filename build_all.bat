@@ -140,6 +140,11 @@ if exist "%WIX_CACHE%\candle.exe" ( echo [OK] WiX ready ) else ( echo [WARN] WiX
 echo.
 echo [3/3] Tauri build (includes frontend build)...
 echo.
+:: 限制 Rust 并行编译数，防止内存不足导致 OOM
+if not defined CARGO_BUILD_JOBS (
+    set "CARGO_BUILD_JOBS=2"
+    echo [INFO] Set CARGO_BUILD_JOBS=2 to reduce memory usage
+)
 :: Clean previous Tauri build artifacts to ensure fresh build
 echo [CLEAN] Removing old Tauri build artifacts...
 rmdir /s /q "src-tauri\target\release\bundle" 2>nul

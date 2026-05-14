@@ -27,6 +27,7 @@ if "%TARGET_TRIPLE%"=="" set TARGET_TRIPLE=x86_64-pc-windows-msvc
 set "TAURI_EXE=src-tauri\target\release\agent-with-u.exe"
 if not exist "!TAURI_EXE!" (
     echo [STEP 0] Tauri 尚未构建，先运行 build_all.bat ...
+    if not defined CARGO_BUILD_JOBS set "CARGO_BUILD_JOBS=2"
     call build_all.bat
     if errorlevel 1 ( echo [FAILED] build_all.bat failed & pause & exit /b 1 )
 )
