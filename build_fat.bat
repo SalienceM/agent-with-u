@@ -171,6 +171,26 @@ if "!CE_OK!"=="0" (
 for /f %%s in ('powershell -NoProfile -Command "(Get-ChildItem -Recurse '%CLAUDE_ENV%' | Measure-Object -Property Length -Sum).Sum / 1MB" 2^>nul') do set CE_SIZE_MB=%%s
 echo [OK] claude-env verified (approx !CE_SIZE_MB! MB)
 
+:: 列出 NSIS 将读取的文件（方便排查）
+echo.
+echo [DIAG] Files in staging (_staging):
+dir /b "%STAGING%" 2>nul || echo   (empty or not found!)
+echo.
+echo [DIAG] Files in claude-env (top level):
+dir /b "%CLAUDE_ENV%" 2>nul || echo   (empty or not found!)
+echo [DIAG] claude-env\node\node.exe size:
+if exist "%CLAUDE_ENV%\node\node.exe" (
+    for %%F in ("%CLAUDE_ENV%\node\node.exe") do echo   %%~zF bytes
+) else (
+    echo   NOT FOUND
+)
+echo [DIAG] claude-code package location:
+if exist "%CLAUDE_ENV%\npm-global\node_modules\@anthropic-ai\claude-code\cli.js" (
+    echo   OK: cli.js found
+) else (
+    echo   NOT FOUND: npm-global\node_modules\@anthropic-ai\claude-code\cli.js
+)
+
 :: ============================================================
 ::  Step 4: 编译 NSIS 安装包
 :: ============================================================
@@ -196,17 +216,26 @@ if errorlevel 1 (
 
 if not exist "dist" mkdir "dist"
 
-"%MAKENSIS%" /V3 ^
+set "NSIS_LOG=dist\nsis-build.log"
+echo [INFO] NSIS log will be saved to: !NSIS_LOG!
+
+"%MAKENSIS%" /V4 ^
     /DVERSION=!VERSION! ^
     /DTAURI_BUNDLE_DIR=_staging ^
     /DFAT_MODE=1 ^
     /DCLAUDE_ENV_DIR=claude-env ^
-    installer\installer.nsi
+    installer\installer.nsi > "!NSIS_LOG!" 2>&1
 
 if errorlevel 1 (
-    echo [FAILED] NSIS compile failed
+    echo [FAILED] NSIS compile failed. Check log: !NSIS_LOG!
+    echo.
+    echo === Last 30 lines of NSIS log ===
+    powershell -NoProfile -Command "Get-Content '!NSIS_LOG!' -Tail 30"
     pause & exit /b 1
 )
+echo [OK] NSIS compile succeeded
+echo === NSIS summary ===
+powershell -NoProfile -Command "Get-Content '!NSIS_LOG!' | Select-String 'Total size|Section|Output'"
 
 :: 清理临时文件
 rmdir /s /q "%STAGING%" 2>nul
