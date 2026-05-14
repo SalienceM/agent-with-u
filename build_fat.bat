@@ -243,7 +243,7 @@ if "!MAKENSIS!"=="" (
 if "!MAKENSIS!"=="" if exist "C:\Program Files (x86)\NSIS\makensis.exe" set "MAKENSIS=C:\Program Files (x86)\NSIS\makensis.exe"
 if "!MAKENSIS!"=="" if exist "C:\Program Files\NSIS\makensis.exe" set "MAKENSIS=C:\Program Files\NSIS\makensis.exe"
 if "!MAKENSIS!"=="" (
-    echo [ERROR] NSIS (makensis.exe) not found!
+    echo [ERROR] NSIS makensis.exe not found!
     echo         Searched: PATH, %%LOCALAPPDATA%%\tauri\, Program Files
     echo.
     echo         Install NSIS: https://nsis.sourceforge.io/Download
