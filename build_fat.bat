@@ -24,7 +24,7 @@ echo [INFO] Version: !VERSION!
 for /f "tokens=2" %%T in ('rustc -Vv ^| findstr /i "host"') do set TARGET_TRIPLE=%%T
 if "%TARGET_TRIPLE%"=="" set TARGET_TRIPLE=x86_64-pc-windows-msvc
 
-set "TAURI_EXE=src-tauri\target\release\AgentWithU.exe"
+set "TAURI_EXE=src-tauri\target\release\agent-with-u.exe"
 if not exist "!TAURI_EXE!" (
     echo [STEP 0] Tauri 尚未构建，先运行 build_all.bat ...
     call build_all.bat
@@ -150,15 +150,16 @@ if exist "%STAGING%" rmdir /s /q "%STAGING%"
 mkdir "%STAGING%"
 
 :: 主程序
-set "TAURI_EXE_SRC=src-tauri\target\release\AgentWithU.exe"
+:: Tauri productName=AgentWithU, 但 Cargo 编译出的 exe 是 kebab-case
+set "TAURI_EXE_SRC=src-tauri\target\release\agent-with-u.exe"
 if not exist "!TAURI_EXE_SRC!" (
-    echo [ERROR] AgentWithU.exe not found at: !TAURI_EXE_SRC!
+    echo [ERROR] agent-with-u.exe not found at: !TAURI_EXE_SRC!
     echo         Run build_all.bat first to build the Tauri application.
     pause & exit /b 1
 )
-copy /y "!TAURI_EXE_SRC!" "%STAGING%\"
+copy /y "!TAURI_EXE_SRC!" "%STAGING%\AgentWithU.exe"
 if errorlevel 1 (
-    echo [ERROR] Failed to copy AgentWithU.exe to staging
+    echo [ERROR] Failed to copy agent-with-u.exe to staging
     pause & exit /b 1
 )
 
@@ -233,22 +234,33 @@ if exist "%CLAUDE_ENV%\npm-global\node_modules\@anthropic-ai\claude-code\package
 echo.
 echo [STEP 4] Compiling NSIS installer ...
 
-:: 检查 makensis
+:: 检查 makensis（按优先级查找：PATH → Tauri 缓存 → 常见安装路径）
+set "MAKENSIS="
 where makensis >nul 2>&1
-if errorlevel 1 (
-    :: 尝试常见安装路径
-    if exist "C:\Program Files (x86)\NSIS\makensis.exe" (
-        set "MAKENSIS=C:\Program Files (x86)\NSIS\makensis.exe"
-    ) else if exist "C:\Program Files\NSIS\makensis.exe" (
-        set "MAKENSIS=C:\Program Files\NSIS\makensis.exe"
-    ) else (
-        echo [ERROR] NSIS not found! Install from https://nsis.sourceforge.io/
-        echo         or: winget install NSIS.NSIS
-        pause & exit /b 1
-    )
-) else (
+if not errorlevel 1 (
     set "MAKENSIS=makensis"
+    goto :nsis_found
 )
+:: Tauri 构建时会下载 NSIS 到 %LOCALAPPDATA%\tauri\
+for /f "delims=" %%F in ('dir /s /b "%LOCALAPPDATA%\tauri\makensis.exe" 2^>nul') do (
+    set "MAKENSIS=%%F"
+    goto :nsis_found
+)
+:: 常见系统安装路径
+if exist "C:\Program Files (x86)\NSIS\makensis.exe" (
+    set "MAKENSIS=C:\Program Files (x86)\NSIS\makensis.exe"
+) else if exist "C:\Program Files\NSIS\makensis.exe" (
+    set "MAKENSIS=C:\Program Files\NSIS\makensis.exe"
+)
+:nsis_found
+if "!MAKENSIS!"=="" (
+    echo [ERROR] NSIS (makensis.exe) not found!
+    echo         Searched: PATH, %%LOCALAPPDATA%%\tauri\, Program Files
+    echo.
+    echo         Install NSIS: https://nsis.sourceforge.io/Download
+    pause & exit /b 1
+)
+echo [OK] Found NSIS: !MAKENSIS!
 
 if not exist "dist" mkdir "dist"
 
