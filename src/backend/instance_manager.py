@@ -60,13 +60,10 @@ class ClaudeCodeInstance:
         if cli:
             return str(cli)
 
-        if sys.platform == "win32":
-            appdata = subprocess.os.environ.get("APPDATA", "")
-            for name in ("claude.cmd", "claude.exe", "claude"):
-                p = subprocess.os.path.join(appdata, "npm", name)
-                if subprocess.os.path.exists(p):
-                    return p
-        return "claude"
+        # Delegate to the shared resolver so bundled `claude-env\claude.cmd`
+        # (FAT installer layout) is honoured here too.
+        from .base import resolve_claude_cli
+        return resolve_claude_cli(None)
 
     def _build_command(self, content: str) -> list[str]:
         """Build claude CLI command with current config."""

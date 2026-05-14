@@ -59,7 +59,14 @@ def _exc_msg(e: Exception) -> str:
 
 
 def resolve_claude_cli(config_cli_path: Optional[str] = None) -> str:
-    """Resolve the claude CLI path: config → bundled claude-env → system PATH."""
+    """Resolve the claude CLI path: config → bundled claude-env → system PATH.
+
+    Windows note: never return a ``claude.exe`` path. ``claude-agent-sdk``
+    runs the CLI via ``node <path>``; Node refuses to load a ``.exe`` as an
+    ES module and crashes with ``ERR_UNKNOWN_FILE_EXTENSION``. Prefer the
+    ``claude.cmd`` shim (which dispatches via Node itself) or the package's
+    JS entry point (``cli.js`` / ``cli.cjs``).
+    """
     if config_cli_path:
         return str(config_cli_path)
     if sys.platform == "win32":
@@ -67,15 +74,50 @@ def resolve_claude_cli(config_cli_path: Optional[str] = None) -> str:
             exe_dir = os.path.dirname(sys.executable)
         else:
             exe_dir = os.path.dirname(os.path.abspath(__file__))
-        for base in (exe_dir, os.path.join(exe_dir, ".."), exe_dir if getattr(sys, 'frozen', False) else os.path.dirname(exe_dir)):
-            bundled = os.path.join(base, "claude-env", "claude.cmd")
-            if os.path.exists(bundled):
-                return bundled
+
+        bases: list[str] = []
+        seen: set[str] = set()
+        for candidate in (
+            exe_dir,
+            os.path.join(exe_dir, ".."),
+            os.path.join(exe_dir, "..", ".."),
+            os.path.dirname(exe_dir),
+            os.path.dirname(os.path.dirname(exe_dir)),
+        ):
+            ap = os.path.abspath(candidate)
+            if ap not in seen:
+                seen.add(ap)
+                bases.append(ap)
+
+        for base in bases:
+            cmd_path = os.path.join(base, "claude-env", "claude.cmd")
+            if os.path.exists(cmd_path):
+                return cmd_path
+            npm_cmd = os.path.join(base, "claude-env", "npm-global", "claude.cmd")
+            if os.path.exists(npm_cmd):
+                return npm_cmd
+            pkg_root = os.path.join(
+                base, "claude-env", "npm-global", "node_modules",
+                "@anthropic-ai", "claude-code",
+            )
+            for entry in ("cli.js", "cli.cjs", "cli-wrapper.cjs"):
+                cli_js = os.path.join(pkg_root, entry)
+                if os.path.exists(cli_js):
+                    return cli_js
+
         appdata = os.environ.get("APPDATA", "")
-        for name in ("claude.cmd", "claude.exe", "claude"):
-            p = os.path.join(appdata, "npm", name)
-            if os.path.exists(p):
-                return p
+        if appdata:
+            for name in ("claude.cmd", "claude.ps1"):
+                p = os.path.join(appdata, "npm", name)
+                if os.path.exists(p):
+                    return p
+            for entry in ("cli.js", "cli.cjs"):
+                p = os.path.join(
+                    appdata, "npm", "node_modules",
+                    "@anthropic-ai", "claude-code", entry,
+                )
+                if os.path.exists(p):
+                    return p
     return "claude"
 
 
