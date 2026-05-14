@@ -236,23 +236,12 @@ echo [STEP 4] Compiling NSIS installer ...
 
 :: 检查 makensis（按优先级查找：PATH → Tauri 缓存 → 常见安装路径）
 set "MAKENSIS="
-where makensis >nul 2>&1
-if not errorlevel 1 (
-    set "MAKENSIS=makensis"
-    goto :nsis_found
+where makensis >nul 2>&1 && set "MAKENSIS=makensis"
+if "!MAKENSIS!"=="" (
+    for /f "delims=" %%F in ('dir /s /b "%LOCALAPPDATA%\tauri\makensis.exe" 2^>nul') do if "!MAKENSIS!"=="" set "MAKENSIS=%%F"
 )
-:: Tauri 构建时会下载 NSIS 到 %LOCALAPPDATA%\tauri\
-for /f "delims=" %%F in ('dir /s /b "%LOCALAPPDATA%\tauri\makensis.exe" 2^>nul') do (
-    set "MAKENSIS=%%F"
-    goto :nsis_found
-)
-:: 常见系统安装路径
-if exist "C:\Program Files (x86)\NSIS\makensis.exe" (
-    set "MAKENSIS=C:\Program Files (x86)\NSIS\makensis.exe"
-) else if exist "C:\Program Files\NSIS\makensis.exe" (
-    set "MAKENSIS=C:\Program Files\NSIS\makensis.exe"
-)
-:nsis_found
+if "!MAKENSIS!"=="" if exist "C:\Program Files (x86)\NSIS\makensis.exe" set "MAKENSIS=C:\Program Files (x86)\NSIS\makensis.exe"
+if "!MAKENSIS!"=="" if exist "C:\Program Files\NSIS\makensis.exe" set "MAKENSIS=C:\Program Files\NSIS\makensis.exe"
 if "!MAKENSIS!"=="" (
     echo [ERROR] NSIS (makensis.exe) not found!
     echo         Searched: PATH, %%LOCALAPPDATA%%\tauri\, Program Files

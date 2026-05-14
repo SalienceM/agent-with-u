@@ -48,21 +48,12 @@ copy /y "src-tauri\target\release\WebView2Loader.dll" "%STAGING%\" >nul 2>nul
 
 :: NSIS（不传 FAT_MODE）— 按优先级查找：PATH → Tauri 缓存 → 常见安装路径
 set "MAKENSIS="
-where makensis >nul 2>&1
-if not errorlevel 1 (
-    set "MAKENSIS=makensis"
-    goto :nsis_found
+where makensis >nul 2>&1 && set "MAKENSIS=makensis"
+if "!MAKENSIS!"=="" (
+    for /f "delims=" %%F in ('dir /s /b "%LOCALAPPDATA%\tauri\makensis.exe" 2^>nul') do if "!MAKENSIS!"=="" set "MAKENSIS=%%F"
 )
-for /f "delims=" %%F in ('dir /s /b "%LOCALAPPDATA%\tauri\makensis.exe" 2^>nul') do (
-    set "MAKENSIS=%%F"
-    goto :nsis_found
-)
-if exist "C:\Program Files (x86)\NSIS\makensis.exe" (
-    set "MAKENSIS=C:\Program Files (x86)\NSIS\makensis.exe"
-) else if exist "C:\Program Files\NSIS\makensis.exe" (
-    set "MAKENSIS=C:\Program Files\NSIS\makensis.exe"
-)
-:nsis_found
+if "!MAKENSIS!"=="" if exist "C:\Program Files (x86)\NSIS\makensis.exe" set "MAKENSIS=C:\Program Files (x86)\NSIS\makensis.exe"
+if "!MAKENSIS!"=="" if exist "C:\Program Files\NSIS\makensis.exe" set "MAKENSIS=C:\Program Files\NSIS\makensis.exe"
 if "!MAKENSIS!"=="" (
     echo [ERROR] NSIS not found! Install from https://nsis.sourceforge.io/Download
     pause & exit /b 1
