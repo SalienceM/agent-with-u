@@ -58,6 +58,27 @@ def _exc_msg(e: Exception) -> str:
     return msg if msg else f"{type(e).__name__}"
 
 
+def resolve_claude_cli(config_cli_path: Optional[str] = None) -> str:
+    """Resolve the claude CLI path: config → bundled claude-env → system PATH."""
+    if config_cli_path:
+        return str(config_cli_path)
+    if sys.platform == "win32":
+        if getattr(sys, 'frozen', False):
+            exe_dir = os.path.dirname(sys.executable)
+        else:
+            exe_dir = os.path.dirname(os.path.abspath(__file__))
+        for base in (exe_dir, os.path.join(exe_dir, ".."), exe_dir if getattr(sys, 'frozen', False) else os.path.dirname(exe_dir)):
+            bundled = os.path.join(base, "claude-env", "claude.cmd")
+            if os.path.exists(bundled):
+                return bundled
+        appdata = os.environ.get("APPDATA", "")
+        for name in ("claude.cmd", "claude.exe", "claude"):
+            p = os.path.join(appdata, "npm", name)
+            if os.path.exists(p):
+                return p
+    return "claude"
+
+
 class StreamDelta:
     """
     A single streaming event pushed to the frontend.

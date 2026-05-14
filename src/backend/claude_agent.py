@@ -3,7 +3,7 @@ import os, sys, asyncio, json, threading
 from pathlib import Path
 from typing import Optional, Callable, Awaitable
 from ..types import ModelBackendConfig, ChatMessage, ImageAttachment, ToolCallInfo, new_id
-from .base import ModelBackend, StreamDelta, PermissionRequest, _exc_msg
+from .base import ModelBackend, StreamDelta, PermissionRequest, _exc_msg, resolve_claude_cli
 
 # ---------------------------------------------------------------------------
 #  Claude Agent Backend
@@ -243,9 +243,11 @@ class ClaudeAgentBackend(ModelBackend):
                 options_kwargs["resume"] = agent_session_id
             if model and model not in ("sonnet", "claude-sonnet", "default"):
                 options_kwargs["model"] = model
-            cli_path = getattr(self.config, "cli_path", None)
-            if cli_path:
-                options_kwargs["cli_path"] = cli_path
+            resolved_cli = resolve_claude_cli(getattr(self.config, "cli_path", None))
+            if resolved_cli and resolved_cli != "claude":
+                options_kwargs["cli_path"] = resolved_cli
+                print(f"[ClaudeAgent] Using CLI: {resolved_cli}",
+                      file=sys.stderr, flush=True)
 
             mcp_servers = getattr(self.config, "mcp_servers", None)
             if mcp_servers:
