@@ -106,14 +106,35 @@ echo [OK] Claude Code installed
 
 :claude_ready
 
-:: ── 1c: 生成 claude.cmd 启动器 ──────────────────────
+:: ── 1c: 检测 CLI 入口并生成 claude.cmd ──────────────────────
+set "CLAUDE_PKG=%cd%\%CLAUDE_ENV%\npm-global\node_modules\@anthropic-ai\claude-code"
+set "CLAUDE_ENTRY="
+
+:: 从 package.json 的 bin.claude 字段自动检测入口
+for /f "usebackq tokens=*" %%a in (`powershell -NoProfile -Command "try { $p=(Get-Content '%CLAUDE_PKG%\package.json' -Raw | ConvertFrom-Json).bin.claude; if($p){$p -replace '^\./',''}else{''}  } catch {''}"`) do set "CLAUDE_ENTRY=%%a"
+
+:: 如果 package.json 读取失败，按优先级尝试常见入口
+if "!CLAUDE_ENTRY!"=="" (
+    if exist "%CLAUDE_PKG%\cli-wrapper.cjs" ( set "CLAUDE_ENTRY=cli-wrapper.cjs"
+    ) else if exist "%CLAUDE_PKG%\cli.js" ( set "CLAUDE_ENTRY=cli.js"
+    ) else if exist "%CLAUDE_PKG%\cli.cjs" ( set "CLAUDE_ENTRY=cli.cjs"
+    )
+)
+if "!CLAUDE_ENTRY!"=="" (
+    echo [ERROR] Cannot detect claude-code CLI entry point in: %CLAUDE_PKG%
+    echo         Contents:
+    dir /b "%CLAUDE_PKG%" 2>nul
+    pause & exit /b 1
+)
+echo [OK] Detected CLI entry: !CLAUDE_ENTRY!
+
 echo [GEN] Creating claude.cmd wrapper ...
 (
 echo @echo off
 echo setlocal
 echo set "SCRIPT_DIR=%%~dp0"
 echo set "NODE_EXE=%%SCRIPT_DIR%%node\node.exe"
-echo set "CLAUDE_MAIN=%%SCRIPT_DIR%%npm-global\node_modules\@anthropic-ai\claude-code\cli.js"
+echo set "CLAUDE_MAIN=%%SCRIPT_DIR%%npm-global\node_modules\@anthropic-ai\claude-code\!CLAUDE_ENTRY!"
 echo "%%NODE_EXE%%" "%%CLAUDE_MAIN%%" %%*
 ) > "%CLAUDE_ENV%\claude.cmd"
 echo [OK] claude.cmd created
@@ -184,11 +205,12 @@ if exist "%CLAUDE_ENV%\node\node.exe" (
 ) else (
     echo   NOT FOUND
 )
-echo [DIAG] claude-code package location:
-if exist "%CLAUDE_ENV%\npm-global\node_modules\@anthropic-ai\claude-code\cli.js" (
-    echo   OK: cli.js found
+echo [DIAG] claude-code package:
+if exist "%CLAUDE_ENV%\npm-global\node_modules\@anthropic-ai\claude-code\package.json" (
+    echo   OK: package found
+    dir /b "%CLAUDE_ENV%\npm-global\node_modules\@anthropic-ai\claude-code\*.cjs" "%CLAUDE_ENV%\npm-global\node_modules\@anthropic-ai\claude-code\*.js" 2>nul
 ) else (
-    echo   NOT FOUND: npm-global\node_modules\@anthropic-ai\claude-code\cli.js
+    echo   NOT FOUND
 )
 
 :: ============================================================
