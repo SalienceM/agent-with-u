@@ -154,29 +154,55 @@ echo [OK] Claude Code installed
 set "CLAUDE_PKG=%cd%\%CLAUDE_ENV%\npm-global\node_modules\@anthropic-ai\claude-code"
 set "CLAUDE_ENTRY="
 
-for /f "usebackq tokens=*" %%a in (`powershell -NoProfile -Command "try { $p=(Get-Content '%CLAUDE_PKG%\package.json' -Raw | ConvertFrom-Json).bin.claude; if($p){$p -replace '^\./',''}else{''}  } catch {''}"`) do set "CLAUDE_ENTRY=%%a"
+:: ★ 优先选 JS 入口 —— 我们用 node 启动，绝不能选 .exe / 无后缀脚本
+if exist "%CLAUDE_PKG%\cli.js" ( set "CLAUDE_ENTRY=cli.js"
+) else if exist "%CLAUDE_PKG%\cli.cjs" ( set "CLAUDE_ENTRY=cli.cjs"
+) else if exist "%CLAUDE_PKG%\cli-wrapper.cjs" ( set "CLAUDE_ENTRY=cli-wrapper.cjs"
+)
 
 if "!CLAUDE_ENTRY!"=="" (
-    if exist "%CLAUDE_PKG%\cli-wrapper.cjs" ( set "CLAUDE_ENTRY=cli-wrapper.cjs"
-    ) else if exist "%CLAUDE_PKG%\cli.js" ( set "CLAUDE_ENTRY=cli.js"
-    ) else if exist "%CLAUDE_PKG%\cli.cjs" ( set "CLAUDE_ENTRY=cli.cjs"
+    for /f "usebackq tokens=*" %%a in (`powershell -NoProfile -Command "try { $p=(Get-Content '%CLAUDE_PKG%\package.json' -Raw | ConvertFrom-Json).bin.claude; if($p){$p -replace '^\./',''}else{''}  } catch {''}"`) do (
+        set "_CAND=%%a"
+        echo !_CAND! | findstr /i /e ".js .cjs .mjs" >nul && set "CLAUDE_ENTRY=!_CAND!"
     )
 )
+
+set "CLAUDE_ENTRY_EXE="
 if "!CLAUDE_ENTRY!"=="" (
-    echo [ERROR] Cannot detect claude-code CLI entry point
+    if exist "%CLAUDE_PKG%\bin\claude.exe" ( set "CLAUDE_ENTRY_EXE=bin\claude.exe"
+    ) else if exist "%CLAUDE_PKG%\claude.exe" ( set "CLAUDE_ENTRY_EXE=claude.exe"
+    )
+)
+
+if "!CLAUDE_ENTRY!"=="" if "!CLAUDE_ENTRY_EXE!"=="" (
+    echo [ERROR] Cannot detect a JS or .exe entry point for claude-code in:
+    echo         %CLAUDE_PKG%
+    dir /b "%CLAUDE_PKG%" 2>nul
     pause & exit /b 1
 )
-echo [OK] Detected CLI entry: !CLAUDE_ENTRY!
 
-echo [GEN] Creating claude.cmd wrapper ...
-(
-echo @echo off
-echo setlocal
-echo set "SCRIPT_DIR=%%~dp0"
-echo set "NODE_EXE=%%SCRIPT_DIR%%node\node.exe"
-echo set "CLAUDE_MAIN=%%SCRIPT_DIR%%npm-global\node_modules\@anthropic-ai\claude-code\!CLAUDE_ENTRY!"
-echo "%%NODE_EXE%%" "%%CLAUDE_MAIN%%" %%*
-) > "%CLAUDE_ENV%\claude.cmd"
+if not "!CLAUDE_ENTRY!"=="" (
+    echo [OK] Detected JS entry: !CLAUDE_ENTRY!
+    echo [GEN] Creating claude.cmd wrapper ^(node + JS^) ...
+    (
+        echo @echo off
+        echo setlocal
+        echo set "SCRIPT_DIR=%%~dp0"
+        echo set "NODE_EXE=%%SCRIPT_DIR%%node\node.exe"
+        echo set "CLAUDE_MAIN=%%SCRIPT_DIR%%npm-global\node_modules\@anthropic-ai\claude-code\!CLAUDE_ENTRY!"
+        echo "%%NODE_EXE%%" "%%CLAUDE_MAIN%%" %%*
+    ) > "%CLAUDE_ENV%\claude.cmd"
+) else (
+    echo [OK] Detected SEA entry: !CLAUDE_ENTRY_EXE!
+    echo [GEN] Creating claude.cmd wrapper ^(direct exec^) ...
+    (
+        echo @echo off
+        echo setlocal
+        echo set "SCRIPT_DIR=%%~dp0"
+        echo set "CLAUDE_BIN=%%SCRIPT_DIR%%npm-global\node_modules\@anthropic-ai\claude-code\!CLAUDE_ENTRY_EXE!"
+        echo "%%CLAUDE_BIN%%" %%*
+    ) > "%CLAUDE_ENV%\claude.cmd"
+)
 echo [OK] claude.cmd created
 
 :: ============================================================
