@@ -282,3 +282,29 @@ class AssetPool:
             "max_items": MAX_ITEMS,
             "max_bytes": MAX_BYTES,
         }
+
+    def file_path(self, asset_id: str) -> Optional[Path]:
+        """返回素材原始文件的绝对路径（供 Agent 用 Read 工具读取）。"""
+        with self._lock:
+            meta = next((m for m in self._index if m["id"] == asset_id), None)
+        if meta is None:
+            return None
+        return (self._dir / meta["filename"]).resolve()
+
+    def for_context(self, max_recent: int = 8) -> list[dict]:
+        """
+        返回注入 LLM 上下文用的素材清单：所有 pinned + 最近 max_recent 条
+        （去重，最新在前），每条附带绝对路径，便于 Agent 寻址。
+        """
+        with self._lock:
+            items = list(reversed(self._index))  # 最新在前
+            pinned = [m for m in items if m.get("pinned")]
+            recent = [m for m in items if not m.get("pinned")][:max_recent]
+            chosen = pinned + recent
+            out: list[dict] = []
+            for m in chosen:
+                d = dict(m)
+                d["path"] = str((self._dir / m["filename"]).resolve())
+                out.append(d)
+        return out
+

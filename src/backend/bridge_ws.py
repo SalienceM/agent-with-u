@@ -2751,6 +2751,48 @@ except urllib.error.URLError as e:
         self._backends[config_id] = backend
         return backend
 
+    def _build_asset_context_block(self) -> Optional[str]:
+        """
+        把素材池中 pinned + 最近若干条素材组装成一段简短上下文，
+        让 Agent 知道有哪些素材可用、如何寻址（本地路径 / HTTP URL）。
+        池为空时返回 None。
+        """
+        try:
+            assets = self._asset_pool.for_context(max_recent=8)
+        except Exception:
+            return None
+        if not assets:
+            return None
+        port = getattr(self, "_HTTP_API_PORT", 0)
+        lines = [
+            "[素材池 / Asset Pool]",
+            "以下素材已暂存在素材池中，可用 Read 工具读取本地文件路径，"
+            "或把 url 交给支持视觉的模型直接查看；处理产生的新文件可写回同目录供后续引用。",
+        ]
+        for a in assets:
+            dims = ""
+            if a.get("width") and a.get("height"):
+                dims = f" {a['width']}x{a['height']}"
+            label = a.get("desc") or a.get("source") or ""
+            tags = ",".join(a.get("tags", []))
+            pin = " [pinned]" if a.get("pinned") else ""
+            head = f"- {a['id']} · {a.get('mime', '')}{dims}"
+            if label:
+                head += f" · {label}"
+            if tags:
+                head += f" · tags={tags}"
+            head += pin
+            lines.append(head)
+            lines.append(f"  file: {a.get('path', '')}")
+            if port:
+                lines.append(f"  url:  http://127.0.0.1:{port}/api/assets/{a['id']}")
+        return "\n".join(lines)
+
+    def _compose_constraints(self, session: "Session") -> Optional[str]:
+        """会话约束 + 素材池上下文块（后者不写入持久化的 session.constraints）。"""
+        parts = [p for p in (session.constraints, self._build_asset_context_block()) if p]
+        return "\n\n---\n\n".join(parts) if parts else None
+
     async def _handle_send_message(self, payload_json: str):
         try:
             payload = json.loads(payload_json)
@@ -2848,7 +2890,7 @@ except urllib.error.URLError as e:
             await self._async_send(
                 session, content, images, backend_id, assistant_id,
                 auto_continue=auto_continue, skip_permissions=skip_permissions,
-                constraints=session.constraints,
+                constraints=self._compose_constraints(session),
             )
         except Exception as e:
             import traceback
