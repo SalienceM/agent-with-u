@@ -49,6 +49,7 @@ python -m src.ws_main --bind 127.0.0.1 --port 44321
 |------|------|
 | `docker-compose.example.yml`     | **推荐**：后端 + web 容器一把起 |
 | `Dockerfile`                     | 后端镜像 |
+| `Dockerfile.web`                 | web 镜像（多阶段：构建前端 + nginx） |
 | `web-nginx.conf`                 | web 容器内的路径分流配置 |
 | `nginx.conf.example`             | 裸 nginx + `auth_request` 接 Authelia |
 | `Caddyfile.example`              | Caddy + 原生 `forward_auth` |
@@ -91,19 +92,25 @@ NPM 用户推荐用 `docker-compose.example.yml` 起两个容器，对 NPM 只�
 
 **步骤：**
 
-1. 构建前端：`cd frontend && npm run build`（产出 `frontend/dist`）。
-2. 起容器：`docker compose -f deploy/docker-compose.example.yml up -d`。
+1. 起容器（在仓库根目录，一次性构建前端 + 后端两个镜像）：
+
+   ```bash
+   docker compose -f deploy/docker-compose.example.yml up -d --build
+   ```
+
+   前端在 `awu-web` 镜像里多阶段构建——NAS 上**不需要装 node、不需要
+   手动 `npm install` / `npm run build`、不挂任何源码目录**。
    `proxy` 网络需是 NPM 所在的 docker 网络（`networks.proxy.external: true`）。
-3. NPM 新建一个 **Proxy Host**：
+2. NPM 新建一个 **Proxy Host**：
    - Domain Names：`awu.example.com`
    - Forward Hostname / Port：`awu-web` / `80`
    - **打开 Websockets Support 开关**（否则 `/ws` 连不上）。
    - SSL 标签页：选你的证书，强制 HTTPS。
-4. Authelia：在 NPM 该 Proxy Host 的 **Advanced** 标签里加 Authelia 的
+3. Authelia：在 NPM 该 Proxy Host 的 **Advanced** 标签里加 Authelia 的
    `auth_request` 片段（NPM 社区通用做法，参考 Authelia 官方
    “nginx-proxy-manager” 集成文档）。确保 `auth_request` 同时覆盖
    `/` 与 `/ws` —— WS 握手也要过 Authelia。
-5. Authelia `access_control.rules` 加 `awu.example.com`，见
+4. Authelia `access_control.rules` 加 `awu.example.com`，见
    `authelia-access-control.yml.example`。
 
 > 只对外暴露 `awu.example.com` 这**一个**域名（你的 `:8443` 端口即可）。

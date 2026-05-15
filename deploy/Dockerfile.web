@@ -1,0 +1,29 @@
+# AgentWithU — web 容器镜像（多阶段构建）
+#
+# Stage 1：用 node 镜像构建前端，产出 frontend/dist
+# Stage 2：把 dist + 路径分流配置烤进 nginx 镜像
+#
+# 构建产物完全自包含——NAS 上不需要装 node、不需要 npm install、
+# 不需要挂载任何源码目录。
+#
+# 构建上下文必须是仓库根目录（docker-compose 里 context: ..）。
+
+# ── Stage 1：构建前端 ────────────────────────────────────────────────
+FROM node:20-alpine AS build
+WORKDIR /app/frontend
+
+# 先只拷依赖清单，命中 Docker 层缓存（依赖没变就不重装）
+COPY frontend/package.json frontend/package-lock.json ./
+RUN npm ci
+
+# 再拷源码并构建
+COPY frontend/ ./
+RUN npm run build
+
+# ── Stage 2：nginx 托管 ──────────────────────────────────────────────
+FROM nginx:alpine
+# 容器内路径分流配置（/ → 静态，/ws → 后端，/api/ → 后端）
+COPY deploy/web-nginx.conf /etc/nginx/conf.d/default.conf
+# 构建好的静态产物
+COPY --from=build /app/frontend/dist /usr/share/nginx/html
+EXPOSE 80
