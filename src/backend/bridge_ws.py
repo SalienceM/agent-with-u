@@ -39,6 +39,7 @@ from .app_config_store import AppConfigStore
 from .skill_store import SkillStore
 from .prompt_store import PromptStore
 from .auth import AuthGuard
+from . import paths
 
 # ── 剪贴板（非 Qt，Pillow ImageGrab，仅 Windows/macOS）──────────
 
@@ -300,7 +301,7 @@ class BridgeWS:
         import asyncio as _asyncio
         import os as _os
 
-        skill_dir = _Path.home() / ".agent-with-u" / "skill-library" / skill_name
+        skill_dir = paths.sub("skill-library", skill_name)
         call_py = skill_dir / "call.py"
         if not call_py.exists():
             return 404, f"Skill '{skill_name}' 缺少 call.py"
@@ -639,7 +640,7 @@ class BridgeWS:
         filename = path.split("/api/skill-images/")[-1]
         if not filename or ".." in filename:
             return 400, "text/plain", b"Invalid filename"
-        img_path = _Path.home() / ".agent-with-u" / "skill-images" / filename
+        img_path = paths.sub("skill-images", filename)
         if not img_path.exists():
             return 404, "text/plain", f"Image not found: {filename}".encode()
         img_bytes = img_path.read_bytes()
@@ -702,7 +703,7 @@ class BridgeWS:
                     # 本地 skill-images URL — 直接读文件
                     filename = ref_image.split("/api/skill-images/")[-1] if "/api/skill-images/" in ref_image else ""
                     if filename:
-                        img_path = _Path.home() / ".agent-with-u" / "skill-images" / filename
+                        img_path = paths.sub("skill-images", filename)
                         if img_path.exists():
                             img_b64 = _b64.b64encode(img_path.read_bytes()).decode("ascii")
                             ext = img_path.suffix.lstrip(".").lower()
@@ -780,7 +781,7 @@ class BridgeWS:
             ext = mime.split("/")[-1].replace("jpeg", "jpg") if "/" in mime else "png"
             try:
                 img_bytes = _b64.b64decode(b64_data)
-                tmp_dir = _Path.home() / ".agent-with-u" / "skill-images"
+                tmp_dir = paths.sub("skill-images")
                 tmp_dir.mkdir(parents=True, exist_ok=True)
                 img_path = tmp_dir / f"{new_id()}.{ext}"
                 img_path.write_bytes(img_bytes)
@@ -823,7 +824,7 @@ class BridgeWS:
                             if _r.status_code == 200:
                                 _ext = _r.headers.get("content-type", "image/png").split("/")[-1].split(";")[0]
                                 _ext = _ext.replace("jpeg", "jpg")
-                                tmp_dir = _Path.home() / ".agent-with-u" / "skill-images"
+                                tmp_dir = paths.sub("skill-images")
                                 tmp_dir.mkdir(parents=True, exist_ok=True)
                                 _img_path = tmp_dir / f"{new_id()}.{_ext or 'png'}"
                                 _img_path.write_bytes(_r.content)
@@ -1813,7 +1814,7 @@ class BridgeWS:
                 mime = "image/png"
                 if ref_image_url.startswith("http://127.0.0.1") and "/api/skill-images/" in ref_image_url:
                     filename = ref_image_url.split("/api/skill-images/")[-1].split("?", 1)[0]
-                    img_path = _Path.home() / ".agent-with-u" / "skill-images" / filename
+                    img_path = paths.sub("skill-images", filename)
                     if img_path.exists():
                         img_b64 = _b64.b64encode(img_path.read_bytes()).decode("ascii")
                         ext = img_path.suffix.lstrip(".").lower()
@@ -1903,7 +1904,7 @@ class BridgeWS:
             ext = mime.split("/")[-1].replace("jpeg", "jpg") if "/" in mime else "png"
             try:
                 img_bytes = _b64.b64decode(b64_data)
-                tmp_dir = _Path.home() / ".agent-with-u" / "skill-images"
+                tmp_dir = paths.sub("skill-images")
                 tmp_dir.mkdir(parents=True, exist_ok=True)
                 img_path = tmp_dir / f"{new_id()}.{ext}"
                 img_path.write_bytes(img_bytes)
@@ -2716,7 +2717,7 @@ except urllib.error.URLError as e:
                     for img in images:
                         if img.base64:
                             try:
-                                tmp_dir = _Path.home() / ".agent-with-u" / "skill-images"
+                                tmp_dir = paths.sub("skill-images")
                                 tmp_dir.mkdir(parents=True, exist_ok=True)
                                 ext = img.mime_type.split("/")[-1].replace("jpeg", "jpg")
                                 img_path = tmp_dir / f"user-{new_id()}.{ext}"

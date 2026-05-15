@@ -10,10 +10,12 @@ import time
 from pathlib import Path
 from typing import Optional
 
+from . import paths
+
 
 class PromptStore:
     def __init__(self):
-        self._dir = Path.home() / ".agent-with-u" / "prompt-library"
+        self._dir = paths.sub("prompt-library")
         self._dir.mkdir(parents=True, exist_ok=True)
         self._index_path = self._dir / "index.json"
         self._index: dict[str, dict] = {}

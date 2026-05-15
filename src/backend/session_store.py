@@ -17,11 +17,12 @@ from pathlib import Path
 from typing import Optional
 
 from ..types import Session, ChatMessage, ImageAttachment, ToolCallInfo
+from . import paths
 
 
 class SessionStore:
     def __init__(self):
-        self._dir = Path.home() / ".agent-with-u" / "sessions"
+        self._dir = paths.sub("sessions")
         self._dir.mkdir(parents=True, exist_ok=True)
         self._index_path = self._dir / "index.json"
         self._index: dict[str, dict] = {}

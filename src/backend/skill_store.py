@@ -26,9 +26,11 @@ from typing import Optional
 
 import yaml  # PyYAML — already in requirements (anthropic dep)
 
-LIBRARY_DIR  = Path.home() / ".agent-with-u" / "skill-library"
+from . import paths
+
+LIBRARY_DIR  = paths.sub("skill-library")
 INDEX_FILE   = LIBRARY_DIR / "index.json"
-SECRETS_DIR  = Path.home() / ".agent-with-u" / "skill-secrets"
+SECRETS_DIR  = paths.sub("skill-secrets")
 
 DEFAULT_SKILL_TEMPLATE = """\
 ---

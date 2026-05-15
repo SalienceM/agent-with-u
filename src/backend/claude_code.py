@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Optional, Callable, Awaitable
 from ..types import ModelBackendConfig, ChatMessage, ImageAttachment, ToolCallInfo, new_id
 from .base import ModelBackend, StreamDelta, PermissionRequest, _exc_msg, resolve_claude_cli
+from . import paths
 
 # ---------------------------------------------------------------------------
 #  Claude Code Official Backend (官方 Claude.ai 账户，直接调用 claude CLI 子进程)
@@ -87,7 +88,7 @@ class ClaudeCodeOfficialBackend(ModelBackend):
         # ★ MCP servers：写入临时配置文件，通过 --mcp-config 传给 CLI
         mcp_servers = getattr(self.config, "mcp_servers", None)
         if mcp_servers:
-            mcp_conf_dir = Path.home() / ".agent-with-u"
+            mcp_conf_dir = paths.data_root()
             mcp_conf_dir.mkdir(parents=True, exist_ok=True)
             mcp_conf_path = mcp_conf_dir / f"mcp_{self.config.id}.json"
             mcp_conf_path.write_text(

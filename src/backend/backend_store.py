@@ -10,11 +10,12 @@ from pathlib import Path
 from typing import Optional
 
 from ..types import ModelBackendConfig, BackendType
+from . import paths
 
 
 class BackendStore:
     def __init__(self):
-        self._dir = Path.home() / ".agent-with-u" / "backends"
+        self._dir = paths.sub("backends")
         self._dir.mkdir(parents=True, exist_ok=True)
         self._config_path = self._dir / "config.json"
         self._configs: dict[str, ModelBackendConfig] = {}

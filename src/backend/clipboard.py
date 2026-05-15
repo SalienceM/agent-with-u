@@ -27,10 +27,11 @@ except ImportError:
     _HAS_PYSIDE6 = False
 
 from ..types import ImageAttachment, new_id
+from . import paths
 
 
 # ★ 临时目录：与 session 存储同级
-TEMP_DIR = Path.home() / ".agent-with-u" / "tmp"
+TEMP_DIR = paths.sub("tmp")
 
 
 def _ensure_temp_dir() -> Path:

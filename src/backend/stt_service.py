@@ -13,6 +13,8 @@ import base64
 
 import httpx
 
+from . import paths
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  配置
@@ -52,7 +54,7 @@ class SttConfig:
         )
 
 
-_CONFIG_DIR = Path.home() / ".agent-with-u"
+_CONFIG_DIR = paths.data_root()
 _CONFIG_FILE = _CONFIG_DIR / "stt_config.json"
 
 

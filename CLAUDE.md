@@ -247,6 +247,26 @@ Environment variables loaded from `~/.claude/settings.json`:
 - `ANTHROPIC_MODEL`
 - `ANTHROPIC_API_KEY` (auto-copied from AUTH_TOKEN if not set)
 
+#### Server / deployment env vars (v2.1)
+
+The WS backend (`src/ws_main.py`) reads these for self-hosted deployment:
+
+- `AGENT_WITH_U_BIND` — bind address (default `127.0.0.1`)
+- `AGENT_WITH_U_PORT` — WS port (default `44321`)
+- `AGENT_WITH_U_AUTH_TOKEN` — enables token auth mode
+- `AGENT_WITH_U_TRUST_FORWARD_AUTH` — `1` to trust reverse-proxy `Remote-*`
+  headers (Authelia / authentik / oauth2-proxy)
+- `AGENT_WITH_U_TRUSTED_PROXIES` — comma-separated CIDRs allowed to set
+  `Remote-*` headers (default `127.0.0.0/8,::1/128`)
+- `AGENT_WITH_U_DATA_ROOT` — redirect the entire data directory (sessions,
+  skills, backends, prompts, tmp, …). Default `~/.agent-with-u`. Must be set
+  **before** the process starts (read at import time). Per-user isolation =
+  one backend process per user, each with its own `AGENT_WITH_U_DATA_ROOT`.
+
+CLI flags (`--bind`, `--port`, `--auth-token`, `--trust-forward-auth`,
+`--trusted-proxies`) override the matching env vars. All data-dir paths are
+resolved through `src/backend/paths.py` — the single source of truth.
+
 ### Known Patterns
 
 1. **Auto-Continue Feature**: When model hits `max_tokens`, can automatically continue with "Continue exactly where you left off" prompt

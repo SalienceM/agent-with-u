@@ -8,6 +8,8 @@ bgImage stored separately in ~/.agent-with-u/bg-image.dat (can be MB-sized base6
 import json
 from pathlib import Path
 
+from . import paths
+
 
 _BG_IMAGE_SENTINEL = "__bg_image_file__"
 
@@ -16,7 +18,7 @@ class AppConfigStore:
     """Application configuration store with persistence."""
 
     def __init__(self):
-        self._dir = Path.home() / ".agent-with-u"
+        self._dir = paths.data_root()
         self._config_path = self._dir / "app-config.json"
         self._bg_image_path = self._dir / "bg-image.dat"
         self._config: dict = {}
