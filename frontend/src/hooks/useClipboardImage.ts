@@ -13,14 +13,25 @@ export interface ImageAttachment {
 export function useClipboardImage() {
   const [images, setImages] = useState<ImageAttachment[]>([]);
 
+  // 新增一张图片：既加入待发送列表，又异步存入素材中转池。
+  // 入池失败不影响聊天发送。
+  const addImage = useCallback((img: ImageAttachment) => {
+    setImages((prev) => [...prev, img]);
+    api.assetPush({
+      base64: img.base64,
+      mime: img.mime_type,
+      source: 'clipboard',
+    }).catch(() => {});
+  }, []);
+
   const readFromClipboard = useCallback(async () => {
     const img = await api.readClipboardImage();
     if (img) {
-      setImages((prev) => [...prev, img]);
+      addImage(img);
       return img;
     }
     return null;
-  }, []);
+  }, [addImage]);
 
   const removeImage = useCallback((id: string) => {
     setImages((prev) => prev.filter((img) => img.id !== id));
@@ -58,15 +69,12 @@ export function useClipboardImage() {
           for (const img of b64Imgs) {
             const m = img.src.match(/^data:(image\/[\w+]+);base64,(.+)/);
             if (m) {
-              setImages((prev) => [
-                ...prev,
-                {
-                  id: crypto.randomUUID(),
-                  base64: m[2],
-                  mime_type: m[1],
-                  size: Math.ceil(m[2].length * 0.75),
-                },
-              ]);
+              addImage({
+                id: crypto.randomUUID(),
+                base64: m[2],
+                mime_type: m[1],
+                size: Math.ceil(m[2].length * 0.75),
+              });
             }
           }
           return;
@@ -81,15 +89,12 @@ export function useClipboardImage() {
           const reader = new FileReader();
           reader.onload = () => {
             const b64 = (reader.result as string).split(',')[1];
-            setImages((prev) => [
-              ...prev,
-              {
-                id: crypto.randomUUID(),
-                base64: b64,
-                mime_type: file.type,
-                size: file.size,
-              },
-            ]);
+            addImage({
+              id: crypto.randomUUID(),
+              base64: b64,
+              mime_type: file.type,
+              size: file.size,
+            });
           };
           reader.readAsDataURL(file);
           return;
@@ -103,7 +108,7 @@ export function useClipboardImage() {
     };
     document.addEventListener('paste', handler);
     return () => document.removeEventListener('paste', handler);
-  }, [readFromClipboard]);
+  }, [readFromClipboard, addImage]);
 
   return { images, removeImage, clearImages, readFromClipboard };
 }
