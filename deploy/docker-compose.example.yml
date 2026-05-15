@@ -4,8 +4,8 @@
 #   awu-backend  Python 后端（WS 44321 + HTTP API 44322），不直接对外
 #   awu-web      多阶段构建：node 构建前端 → nginx 托管 + 路径分流
 #
-# 对外只暴露 awu-web 一个口。最外层由 nginx-proxy-manager (NPM) + Authelia
-# 负责 TLS 和认证 —— NPM 加一个 Proxy Host 指向 awu-web 即可。
+# awu-web 映射一个【宿主端口】，NPM 通过「NAS局域网IP : 该端口」路由进来。
+# 最外层由 nginx-proxy-manager (NPM) + Authelia 负责 TLS 和认证。
 #
 # 用法（在仓库根目录）：
 #   docker compose -f deploy/docker-compose.example.yml up -d --build
@@ -32,6 +32,7 @@ services:
       - awu-data:/data                   # sessions / skills / asset-pool / backends
       - ~/.claude:/root/.claude:ro       # Claude 凭据（按需）
 
+    # 不映射宿主端口：后端只在 docker 内网，由 awu-web 访问
     expose:
       - "44321"
       - "44322"
@@ -48,11 +49,14 @@ services:
     depends_on:
       - awu-backend
 
-    expose:
-      - "80"
+    # ★ 映射到宿主端口，NPM 用「NAS局域网IP : 44380」路由进来。
+    #   把 44380 改成你 NAS 上【空闲】的端口（80 被占就别用 80）。
+    #   只暴露给局域网即可，无需公网。
+    ports:
+      - "44380:80"
+
     networks:
       - awu-internal      # 访问 awu-backend
-      - proxy             # 被 NPM 访问
 
 volumes:
   awu-data:
@@ -60,5 +64,3 @@ volumes:
 networks:
   awu-internal:
     driver: bridge
-  proxy:
-    external: true        # 复用 nginx-proxy-manager 所在的 docker 网络

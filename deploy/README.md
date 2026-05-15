@@ -75,14 +75,14 @@ python -m src.ws_main --bind 127.0.0.1 --port 44321
 
 ## 2b. nginx-proxy-manager (NPM) + Authelia 接入
 
-NPM 用户推荐用 `docker-compose.example.yml` 起两个容器，对 NPM 只暴露
-**一个上游**（`awu-web`），架构：
+NPM 用户推荐用 `docker-compose.example.yml` 起两个容器。`awu-web` 映射一个
+**宿主端口**，NPM 按「NAS 局域网 IP : 该端口」路由进来：
 
 ```
 手机 → NPM(:443/:8443, awu.example.com, TLS + Authelia)
-          │  唯一上游
+          │  转发到 NAS局域网IP:44380
           ▼
-   awu-web 容器 (nginx, :80)
+   awu-web 容器 (nginx, 宿主端口 44380 → 容器 80)
           ├─ /        静态前端 frontend/dist
           ├─ /ws      → awu-backend:44321
           └─ /api/    → awu-backend:44322
@@ -100,10 +100,11 @@ NPM 用户推荐用 `docker-compose.example.yml` 起两个容器，对 NPM 只�
 
    前端在 `awu-web` 镜像里多阶段构建——NAS 上**不需要装 node、不需要
    手动 `npm install` / `npm run build`、不挂任何源码目录**。
-   `proxy` 网络需是 NPM 所在的 docker 网络（`networks.proxy.external: true`）。
+   `awu-web` 默认映射宿主端口 `44380`（在 compose 里改成你 NAS 上空闲的端口）。
 2. NPM 新建一个 **Proxy Host**：
    - Domain Names：`awu.example.com`
-   - Forward Hostname / Port：`awu-web` / `80`
+   - Forward Hostname / Port：**`<NAS 的局域网 IP>`** / **`44380`**
+     （即 compose 里 `awu-web` 映射的宿主端口）
    - **打开 Websockets Support 开关**（否则 `/ws` 连不上）。
    - SSL 标签页：选你的证书，强制 HTTPS。
 3. Authelia：在 NPM 该 Proxy Host 的 **Advanced** 标签里加 Authelia 的
@@ -113,8 +114,13 @@ NPM 用户推荐用 `docker-compose.example.yml` 起两个容器，对 NPM 只�
 4. Authelia `access_control.rules` 加 `awu.example.com`，见
    `authelia-access-control.yml.example`。
 
-> 只对外暴露 `awu.example.com` 这**一个**域名（你的 `:8443` 端口即可）。
-> 后端的 44321 / 44322 只在 docker 内部网络存在，永远不直接对外。
+> 对外只暴露 `awu.example.com` 这**一个**域名。`awu-web` 的宿主端口
+> （`44380`）只需局域网可达，给 NPM 用；后端 44321 / 44322 只在 docker
+> 内网，永远不映射宿主、不直接对外。
+>
+> 若你的 NPM 与本栈在**同一个 docker 网络**，也可以不映射宿主端口、
+> 直接让 NPM 转发到容器名 `awu-web:80`——把 `ports:` 换回 `expose:` 并
+> 让两边共用同一个 external 网络即可。
 
 ---
 
