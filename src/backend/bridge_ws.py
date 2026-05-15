@@ -1197,7 +1197,11 @@ class BridgeWS:
 
     def _rpc_assetList(self, limit: int = 50, offset: int = 0, tag: str = "") -> str:
         items = self._asset_pool.list(limit=int(limit), offset=int(offset), tag=tag or None)
-        return json.dumps({"items": items, "stats": self._asset_pool.stats()}, ensure_ascii=False)
+        return json.dumps({
+            "items": items,
+            "stats": self._asset_pool.stats(),
+            "httpPort": getattr(self, "_HTTP_API_PORT", 0),
+        }, ensure_ascii=False)
 
     def _rpc_assetPin(self, asset_id: str, pinned: bool = True) -> str:
         meta = self._asset_pool.pin(asset_id, bool(pinned))

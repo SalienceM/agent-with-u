@@ -8,6 +8,7 @@ import { BackendManager } from './components/BackendManager';
 import { RepoPanel } from './components/RepoPanel';
 import { PermissionGate } from './components/PermissionGate';
 import { ScratchPad } from './components/ScratchPad';
+import { AssetPanel } from './components/AssetPanel';
 import { useChat } from './hooks/useChat';
 import { useConfig } from './hooks/useConfig';
 import { themes } from './hooks/useConfig';
@@ -46,6 +47,7 @@ export const App: React.FC = () => {
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [scratchPadOpen, setScratchPadOpen] = useState(false);
   const [scratchPadWidth, setScratchPadWidth] = useState(360);
+  const [assetPanelOpen, setAssetPanelOpen] = useState(false);
   const scratchDragRef = useRef<{ startX: number; startW: number } | null>(null);
   const [visibleCount, setVisibleCount] = useState(6);  // ★ 默认显示最近几条（3 轮对话）
   const toastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -653,6 +655,13 @@ export const App: React.FC = () => {
             📌
           </button>
           <button
+            onClick={() => setAssetPanelOpen(v => !v)}
+            style={{ ...settingsBtnStyle, ...(assetPanelOpen ? { background: 'var(--theme-accent-bg)', color: 'var(--theme-accent)' } : {}) }}
+            title="素材池 / Asset Pool"
+          >
+            🗂
+          </button>
+          <button
             onClick={() => setSettingsOpen(true)}
             style={settingsBtnStyle}
             title="Settings"
@@ -832,6 +841,19 @@ export const App: React.FC = () => {
           {/* 便签本面板 */}
           <div style={{ width: scratchPadWidth, flexShrink: 0, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
             <ScratchPad visible={true} onClose={() => setScratchPadOpen(false)} />
+          </div>
+        </>
+      )}
+
+      {/* ---- 素材池：右侧列（共屏）---- */}
+      {assetPanelOpen && (
+        <>
+          <div style={{
+            width: 4, flexShrink: 0,
+            background: 'var(--theme-border, rgba(255,255,255,0.1))',
+          }} />
+          <div style={{ width: 320, flexShrink: 0, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
+            <AssetPanel visible={true} onClose={() => setAssetPanelOpen(false)} />
           </div>
         </>
       )}

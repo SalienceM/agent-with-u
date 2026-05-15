@@ -19,6 +19,7 @@
 type StreamDeltaCallback = (delta: any) => void;
 type SessionUpdateCallback = (data: any) => void;
 type PermissionRequestCallback = (data: any) => void;
+type AssetChangedCallback = (stats: any) => void;
 
 export interface SkillInfo {
   name: string;
@@ -70,6 +71,7 @@ const pending = new Map<string, { resolve: (result: any) => void; reject: (err: 
 let streamCallbacks: StreamDeltaCallback[] = [];
 let sessionUpdateCallbacks: SessionUpdateCallback[] = [];
 let permissionRequestCallbacks: PermissionRequestCallback[] = [];
+let assetChangedCallbacks: AssetChangedCallback[] = [];
 
 type SttStreamTextCallback = (data: { text: string; isFinal: boolean }) => void;
 let sttStreamCallbacks: SttStreamTextCallback[] = [];
@@ -163,6 +165,9 @@ function handleMessage(e: MessageEvent) {
     } else if (msg.event === 'permissionRequest') {
       const data = JSON.parse(msg.data);
       permissionRequestCallbacks.forEach((cb) => cb(data));
+    } else if (msg.event === 'assetChanged') {
+      const data = msg.data ? JSON.parse(msg.data) : {};
+      assetChangedCallbacks.forEach((cb) => cb(data));
     } else if (msg.event === 'sttStreamText') {
       const data = JSON.parse(msg.data);
       sttStreamCallbacks.forEach((cb) => cb(data));
@@ -713,6 +718,41 @@ export const api = {
     return () => { sttStreamEndCallbacks = sttStreamEndCallbacks.filter((c) => c !== cb); };
   },
 
+  // ── 素材中转池（Asset Pool）──────────────────────────────────
+
+  async assetList(limit = 50, offset = 0, tag = ''): Promise<{ items: any[]; stats: any; httpPort: number }> {
+    const r = await call('assetList', limit, offset, tag);
+    try {
+      const d = typeof r === 'string' ? JSON.parse(r) : r;
+      return { items: d?.items || [], stats: d?.stats || {}, httpPort: d?.httpPort || 0 };
+    } catch { return { items: [], stats: {}, httpPort: 0 }; }
+  },
+
+  async assetPush(payload: { base64: string; mime: string; source?: string; tags?: string[]; desc?: string; ttl?: number }): Promise<{ ok: boolean; asset?: any; error?: string }> {
+    const r = await call('assetPush', JSON.stringify(payload));
+    try { return typeof r === 'string' ? JSON.parse(r) : r; } catch { return { ok: false, error: 'parse error' }; }
+  },
+
+  async assetPin(id: string, pinned: boolean): Promise<{ ok: boolean; asset?: any; error?: string }> {
+    const r = await call('assetPin', id, pinned);
+    try { return typeof r === 'string' ? JSON.parse(r) : r; } catch { return { ok: false, error: 'parse error' }; }
+  },
+
+  async assetUpdateMeta(payload: { id: string; desc?: string; tags?: string[] }): Promise<{ ok: boolean; asset?: any; error?: string }> {
+    const r = await call('assetUpdateMeta', JSON.stringify(payload));
+    try { return typeof r === 'string' ? JSON.parse(r) : r; } catch { return { ok: false, error: 'parse error' }; }
+  },
+
+  async assetDelete(id: string): Promise<{ ok: boolean }> {
+    const r = await call('assetDelete', id);
+    try { return typeof r === 'string' ? JSON.parse(r) : r; } catch { return { ok: false }; }
+  },
+
+  onAssetChanged(cb: AssetChangedCallback): () => void {
+    assetChangedCallbacks.push(cb);
+    return () => { assetChangedCallbacks = assetChangedCallbacks.filter((c) => c !== cb); };
+  },
+
   /** 打开外部 cmd 窗口实时刷日志 */
   async openLogViewer(): Promise<void> {
     if (isTauri()) {
@@ -799,6 +839,11 @@ function mockDispatch(method: string, params: any[]): any {
     case 'setSkillDefault': return JSON.stringify({ status: 'ok' });
     case 'getDefaultAbilities': return JSON.stringify({ skills: [], prompts: [] });
     case 'getAppVersion': return '0.0.0-dev';
+    case 'assetList': return JSON.stringify({ items: [], stats: { count: 0, pinned: 0, bytes: 0 }, httpPort: 0 });
+    case 'assetPush': return JSON.stringify({ ok: false, error: 'mock mode' });
+    case 'assetPin': return JSON.stringify({ ok: false, error: 'mock mode' });
+    case 'assetUpdateMeta': return JSON.stringify({ ok: false, error: 'mock mode' });
+    case 'assetDelete': return JSON.stringify({ ok: false });
     case 'sttCheckLocal': return JSON.stringify({ installed: false });
     case 'sttInstallLocal': return JSON.stringify({ ok: false, output: 'mock mode' });
     case 'getSttConfig': return JSON.stringify({ mode: 'api', language: 'zh', localModel: 'base', apiBaseUrl: '', apiKey: '', apiModel: 'whisper-1' });
