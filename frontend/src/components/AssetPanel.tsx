@@ -10,7 +10,7 @@
  * 共屏右侧列模式，由 App.tsx 控制显隐。
  */
 import React, { useState, useEffect, useCallback } from 'react';
-import { api } from '../api';
+import { api, httpApiBase } from '../api';
 
 interface AssetMeta {
   id: string;
@@ -86,9 +86,10 @@ export const AssetPanel: React.FC<AssetPanelProps> = ({ visible, onClose }) => {
     await api.assetDelete(a.id);
   }, []);
 
+  // items 与 httpPort 由 refresh() 同步设置，渲染列表时 httpPort 必已就绪
   const thumbUrl = (a: AssetMeta): string | null => {
-    if (!httpPort || !a.mime?.startsWith('image/')) return null;
-    return `http://127.0.0.1:${httpPort}/api/assets/${a.id}/thumb`;
+    if (!a.mime?.startsWith('image/')) return null;
+    return `${httpApiBase(httpPort)}/api/assets/${a.id}/thumb`;
   };
 
   if (!visible) return null;

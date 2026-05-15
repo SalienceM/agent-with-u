@@ -128,7 +128,36 @@ async function getWsPort(): Promise<number> {
   return WS_PORT_DEFAULT;
 }
 
-let wsPort = WS_PORT_DEFAULT;
+/**
+ * 解析 WebSocket 连接地址，区分三种部署形态：
+ *   - Tauri 桌面：连本机 sidecar，ws://127.0.0.1:<port>
+ *   - Vite dev：前端 dev server 与后端分离，连 ws://127.0.0.1:44321
+ *   - 生产 Web（反代后）：连 wss?://<当前host>/ws，由反代转发到后端
+ */
+async function getWsUrl(): Promise<string> {
+  if (isTauri()) {
+    const port = await getWsPort();
+    return `ws://127.0.0.1:${port}`;
+  }
+  if (import.meta.env.DEV) {
+    return `ws://127.0.0.1:${WS_PORT_DEFAULT}`;
+  }
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  return `${proto}://${location.host}/ws`;
+}
+
+/**
+ * 解析 HTTP API（素材服务 / Skill 回调）的基地址。
+ * Tauri / dev 直连本机端口；生产 Web 用相对路径，由反代转发。
+ */
+export function httpApiBase(httpPort: number): string {
+  if (isTauri() || import.meta.env.DEV) {
+    return `http://127.0.0.1:${httpPort}`;
+  }
+  return ''; // 相对当前 origin，反代把 /api/ 转发到后端
+}
+
+let wsUrl = `ws://127.0.0.1:${WS_PORT_DEFAULT}`;
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 let reconnectDelay = 1000; // 指数退避：1s → 2s → 4s … 最大 30s
 const MAX_RECONNECT_DELAY = 30000;
@@ -139,7 +168,7 @@ function scheduleReconnect() {
   if (reconnectTimer !== null) return; // 已有排队，不重复
   reconnectTimer = setTimeout(() => {
     reconnectTimer = null;
-    doConnect(wsPort);
+    doConnect(wsUrl);
   }, reconnectDelay);
   reconnectDelay = Math.min(reconnectDelay * 2, MAX_RECONNECT_DELAY);
 }
@@ -184,8 +213,7 @@ function handleMessage(e: MessageEvent) {
  * 建立一次 WebSocket 连接。
  * onSettled 在首次 open/close/error 时回调一次（用于 wsReady 的 resolve）。
  */
-function doConnect(port: number, onSettled?: () => void) {
-  const url = `ws://127.0.0.1:${port}`;
+function doConnect(url: string, onSettled?: () => void) {
   const socket = new WebSocket(url);
   let settled = false;
   const settle = () => { if (!settled) { settled = true; onSettled?.(); } };
@@ -230,7 +258,7 @@ function doConnect(port: number, onSettled?: () => void) {
 }
 
 wsReady = (async () => {
-  wsPort = await getWsPort();
+  wsUrl = await getWsUrl();
   await new Promise<void>((resolve) => {
     // 首次连接超时：不进 mock 模式，继续重试
     const timer = setTimeout(() => {
@@ -239,7 +267,7 @@ wsReady = (async () => {
       scheduleReconnect();
       resolve();
     }, WS_CONNECT_TIMEOUT_MS);
-    doConnect(wsPort, () => { clearTimeout(timer); resolve(); });
+    doConnect(wsUrl, () => { clearTimeout(timer); resolve(); });
   });
 })();
 
