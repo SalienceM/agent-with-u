@@ -1,12 +1,27 @@
 """
-AgentWithU — WebSocket server 入口（Tauri sidecar 模式）。
+AgentWithU — WebSocket server 入口。
 
-Tauri 启动时自动拉起此进程，前端通过 ws://127.0.0.1:44321 连接。
+两种部署形态：
+  1. Tauri sidecar（桌面）—— 默认 loopback 模式，与本机 Tauri 客户端互连。
+  2. 自托管远端服务（v2.1+）—— 配合 nginx/Traefik/Caddy + Authelia 反代，
+     启用 --trust-forward-auth，后端只信反代盖章过的 Remote-User 头。
+
+CLI / 环境变量同义：
+  --bind / AGENT_WITH_U_BIND                 默认 127.0.0.1
+  --port / AGENT_WITH_U_PORT                 默认 44321
+  --auth-token / AGENT_WITH_U_AUTH_TOKEN     启用 token 模式
+  --trust-forward-auth / AGENT_WITH_U_TRUST_FORWARD_AUTH=1
+                                             启用 Authelia 反代信任模式
+  --trusted-proxies / AGENT_WITH_U_TRUSTED_PROXIES
+                                             逗号分隔 CIDR 列表，默认 127.0.0.0/8,::1/128
 
 独立运行（开发调试）：
     python -m src.ws_main
+反代模式（生产）：
+    python -m src.ws_main --bind 127.0.0.1 --trust-forward-auth
 """
 
+import argparse
 import asyncio
 import json
 import logging
@@ -17,6 +32,7 @@ from typing import Optional
 
 import websockets
 
+from .backend.auth import AuthConfig, AuthGuard
 from .backend.bridge_ws import BridgeWS
 from .backend.clipboard import ClipboardHandler
 
@@ -25,8 +41,8 @@ try:
 except Exception:
     APP_VERSION = "0.0.0-dev"
 
-WS_HOST = "127.0.0.1"
-WS_PORT = 44321
+DEFAULT_HOST = "127.0.0.1"
+DEFAULT_PORT = 44321
 
 
 def setup_logging() -> Path:
@@ -229,27 +245,82 @@ def _ensure_single_instance(port: int) -> None:
     logging.info(f"[ws_main] Single-instance lock acquired (PID={os.getpid()}, port={port})")
 
 
+def _envbool(name: str) -> bool:
+    return (os.environ.get(name, "") or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
+    """CLI 参数；任何参数缺省时回落到 AGENT_WITH_U_* 环境变量，再回落到内置默认。"""
+    p = argparse.ArgumentParser(prog="agent-with-u-backend", add_help=True)
+    p.add_argument("--bind", default=os.environ.get("AGENT_WITH_U_BIND", DEFAULT_HOST),
+                   help=f"bind address (default {DEFAULT_HOST}; use 0.0.0.0 for remote, only with --auth-token or --trust-forward-auth)")
+    p.add_argument("--port", type=int,
+                   default=int(os.environ.get("AGENT_WITH_U_PORT", str(DEFAULT_PORT))),
+                   help=f"WebSocket port (default {DEFAULT_PORT})")
+    p.add_argument("--auth-token", default=os.environ.get("AGENT_WITH_U_AUTH_TOKEN") or None,
+                   help="enable token mode; clients must send Authorization: Bearer <token> or ?token=…")
+    p.add_argument("--trust-forward-auth", action="store_true",
+                   default=_envbool("AGENT_WITH_U_TRUST_FORWARD_AUTH"),
+                   help="trust upstream reverse proxy headers (Remote-User/-Email/-Groups)")
+    p.add_argument("--trusted-proxies",
+                   default=os.environ.get("AGENT_WITH_U_TRUSTED_PROXIES", ""),
+                   help="comma-separated CIDRs allowed to set Remote-* headers (default: 127.0.0.0/8,::1/128)")
+    return p.parse_args(argv)
+
+
+def build_auth_config(args: argparse.Namespace) -> AuthConfig:
+    proxies: list[str] = []
+    if args.trusted_proxies:
+        proxies = [s.strip() for s in args.trusted_proxies.split(",") if s.strip()]
+    return AuthConfig(
+        bind_host=args.bind,
+        auth_token=args.auth_token,
+        trust_forward_auth=bool(args.trust_forward_auth),
+        trusted_proxies=proxies,
+    )
+
+
+def _validate_auth_for_bind(cfg: AuthConfig) -> None:
+    """非 loopback 绑定 + 无认证 = 拒绝启动，避免裸跑暴露到局域网。"""
+    is_loopback_bind = cfg.bind_host in ("127.0.0.1", "::1", "localhost")
+    if not is_loopback_bind and cfg.mode() == "loopback":
+        logging.error(
+            "[ws_main] refusing to bind on %s without auth. "
+            "Pass --auth-token or --trust-forward-auth, or bind on 127.0.0.1.",
+            cfg.bind_host,
+        )
+        sys.exit(2)
+
+
 async def main():
+    args = parse_args()
+    auth_cfg = build_auth_config(args)
+
     # 初始化日志系统
     log_file = setup_logging()
     logging.info(f"[ws_main] AgentWithU backend v{APP_VERSION} starting")
     logging.info(f"[ws_main] Log file: {log_file}")
+    logging.info(f"[ws_main] Auth mode: {auth_cfg.describe()}")
+
+    _validate_auth_for_bind(auth_cfg)
 
     patch_npm_path()
     load_claude_settings()
 
     # 单实例保证：杀旧实例 → 写 PID → 绑定端口
-    _ensure_single_instance(WS_PORT)
+    _ensure_single_instance(args.port)
 
     ClipboardHandler.cleanup_old_temp_files()
 
     cli_path = find_bundled_claude()
-    bridge = BridgeWS(cli_path=cli_path)
+    auth_guard = AuthGuard(auth_cfg)
+    bridge = BridgeWS(cli_path=cli_path, auth_guard=auth_guard)
 
-    logging.info(f"[ws_main] Starting WebSocket server on ws://{WS_HOST}:{WS_PORT}")
+    logging.info(f"[ws_main] Starting WebSocket server on ws://{args.bind}:{args.port}")
     try:
         server = await websockets.serve(
-            bridge.handle_client, WS_HOST, WS_PORT,
+            bridge.handle_client, args.bind, args.port,
+            process_request=bridge.process_request,
             max_size=50 * 1024 * 1024,   # 50MB，支持大图片 base64
             ping_interval=30,             # 每 30 秒发送 ping
             ping_timeout=300,             # 允许 5 分钟无 pong（系统休眠/后台标签页节流）
@@ -257,7 +328,7 @@ async def main():
         # ★ Backend Skill HTTP API（供 SKILL.md 通过 curl 回调）
         http_server = await bridge.start_http_api()
     except OSError as e:
-        logging.error(f"[ws_main] Cannot bind port {WS_PORT} even after clearing old instance: {e}")
+        logging.error(f"[ws_main] Cannot bind {args.bind}:{args.port} even after clearing old instance: {e}")
         sys.exit(1)
 
     logging.info("[ws_main] Ready.")

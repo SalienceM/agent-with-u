@@ -38,6 +38,7 @@ from .backend_store import BackendStore
 from .app_config_store import AppConfigStore
 from .skill_store import SkillStore
 from .prompt_store import PromptStore
+from .auth import AuthGuard
 
 # ── 剪贴板（非 Qt，Pillow ImageGrab，仅 Windows/macOS）──────────
 
@@ -233,7 +234,8 @@ def compress_messages(messages: list[ChatMessage], keep_recent: int = 6) -> str:
 class BridgeWS:
     """WebSocket bridge，业务逻辑与 Bridge（Qt）完全相同，去掉 Qt 依赖。"""
 
-    def __init__(self, cli_path: Optional[str] = None):
+    def __init__(self, cli_path: Optional[str] = None, auth_guard: Optional["AuthGuard"] = None):
+        self._auth_guard = auth_guard  # 可为 None（兼容旧调用 / 测试）
         self._session_store = SessionStore()
         self._backend_store = BackendStore()
         self._skill_store = SkillStore()
@@ -860,9 +862,18 @@ class BridgeWS:
             "data": json.dumps(data, ensure_ascii=False),
         }))
 
+    def process_request(self, connection, request):
+        """websockets.serve 握手钩子；委托给 AuthGuard 做认证。"""
+        if self._auth_guard is None:
+            return None
+        return self._auth_guard.process_request(connection, request)
+
     async def handle_client(self, websocket):
         self._clients.add(websocket)
-        print(f"[bridge_ws] client connected (total={len(self._clients)})", file=sys.stderr, flush=True)
+        ident = getattr(websocket, "identity", "?")
+        ident_src = getattr(websocket, "identity_src", "none")
+        print(f"[bridge_ws] client connected user={ident} via={ident_src} (total={len(self._clients)})",
+              file=sys.stderr, flush=True)
         try:
             async for raw in websocket:
                 if isinstance(raw, bytes):
@@ -888,7 +899,8 @@ class BridgeWS:
             pass
         finally:
             self._clients.discard(websocket)
-            print(f"[bridge_ws] client disconnected (total={len(self._clients)})", file=sys.stderr, flush=True)
+            print(f"[bridge_ws] client disconnected user={ident} (total={len(self._clients)})",
+                  file=sys.stderr, flush=True)
 
     async def _dispatch(self, method: str, params: list):
         handler = getattr(self, f"_rpc_{method}", None)
