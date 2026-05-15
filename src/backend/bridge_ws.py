@@ -39,6 +39,7 @@ from .app_config_store import AppConfigStore
 from .skill_store import SkillStore
 from .prompt_store import PromptStore
 from .auth import AuthGuard
+from .asset_pool import AssetPool
 from . import paths
 
 # ── 剪贴板（非 Qt，Pillow ImageGrab，仅 Windows/macOS）──────────
@@ -241,6 +242,9 @@ class BridgeWS:
         self._backend_store = BackendStore()
         self._skill_store = SkillStore()
         self._prompt_store = PromptStore()
+        # ★ 素材中转池：客户端图片/附件在交给 Agent 前先落到这里
+        self._asset_pool = AssetPool()
+        self._asset_pool.purge_expired()
         # ★ 如果检测到内置 claude CLI，注入到默认后端配置
         self._cli_path = cli_path
         self._app_config_store = AppConfigStore()
@@ -631,7 +635,38 @@ class BridgeWS:
         if parsed.path.startswith("/api/skill-images/"):
             return self._serve_skill_image(parsed.path)
 
+        # ★ 素材池 HTTP 服务：/api/assets/<id> 与 /api/assets/<id>/thumb
+        if parsed.path.startswith("/api/assets/"):
+            return self._serve_asset(parsed.path)
+
         return 404, "Not found"
+
+    def _serve_asset(self, path: str) -> tuple[int, str, bytes]:
+        """提供素材池字节内容；/thumb 后缀返回 256px 缩略图（仅图片）。"""
+        rest = path.split("/api/assets/", 1)[-1].strip("/")
+        if not rest or ".." in rest:
+            return 400, "text/plain", b"Invalid asset id"
+        want_thumb = rest.endswith("/thumb")
+        asset_id = rest[:-len("/thumb")] if want_thumb else rest
+
+        got = self._asset_pool.get(asset_id)
+        if got is None:
+            return 404, "text/plain", f"Asset not found: {asset_id}".encode()
+        data, meta = got
+        mime = meta.get("mime", "application/octet-stream")
+
+        if want_thumb and mime.startswith("image/"):
+            try:
+                import io as _io
+                from PIL import Image
+                with Image.open(_io.BytesIO(data)) as im:
+                    im.thumbnail((256, 256))
+                    buf = _io.BytesIO()
+                    im.convert("RGB").save(buf, format="JPEG", quality=82)
+                    return 200, "image/jpeg", buf.getvalue()
+            except Exception:
+                pass  # 缩略图失败 → 回落到原图
+        return 200, mime, data
 
     def _serve_skill_image(self, path: str) -> tuple[int, str, bytes]:
         """提供图片文件的二进制内容（浏览器 img 标签可直接加载）。"""
@@ -861,6 +896,13 @@ class BridgeWS:
         asyncio.ensure_future(self._broadcast({
             "event": "sessionUpdated",
             "data": json.dumps(data, ensure_ascii=False),
+        }))
+
+    def _emit_asset_changed(self):
+        """素材池发生变化（push/pin/delete/update）时通知所有客户端刷新。"""
+        asyncio.ensure_future(self._broadcast({
+            "event": "assetChanged",
+            "data": json.dumps(self._asset_pool.stats(), ensure_ascii=False),
         }))
 
     def process_request(self, connection, request):
@@ -1128,6 +1170,63 @@ class BridgeWS:
             "height": img.get("height"),
         }
         return json.dumps(attachment, ensure_ascii=False)
+
+    # ── RPC: 素材中转池 ──────────────────────────────────────────
+
+    def _rpc_assetPush(self, payload_json: str) -> str:
+        """
+        写入一个素材。payload: {base64, mime, source, tags, desc, ttl}。
+        返回元数据 JSON（含 id，可据此拼 /api/assets/<id> URL）。
+        """
+        import base64 as _b64
+        try:
+            p = json.loads(payload_json)
+            data = _b64.b64decode(p.get("base64", ""))
+            meta = self._asset_pool.push(
+                data,
+                mime=p.get("mime", "application/octet-stream"),
+                source=p.get("source", ""),
+                tags=p.get("tags") or [],
+                desc=p.get("desc", ""),
+                ttl=p.get("ttl"),
+            )
+            self._emit_asset_changed()
+            return json.dumps({"ok": True, "asset": meta}, ensure_ascii=False)
+        except Exception as e:
+            return json.dumps({"ok": False, "error": str(e)}, ensure_ascii=False)
+
+    def _rpc_assetList(self, limit: int = 50, offset: int = 0, tag: str = "") -> str:
+        items = self._asset_pool.list(limit=int(limit), offset=int(offset), tag=tag or None)
+        return json.dumps({"items": items, "stats": self._asset_pool.stats()}, ensure_ascii=False)
+
+    def _rpc_assetPin(self, asset_id: str, pinned: bool = True) -> str:
+        meta = self._asset_pool.pin(asset_id, bool(pinned))
+        if meta is None:
+            return json.dumps({"ok": False, "error": "not found"}, ensure_ascii=False)
+        self._emit_asset_changed()
+        return json.dumps({"ok": True, "asset": meta}, ensure_ascii=False)
+
+    def _rpc_assetUpdateMeta(self, payload_json: str) -> str:
+        """payload: {id, desc?, tags?}"""
+        try:
+            p = json.loads(payload_json)
+            meta = self._asset_pool.update_meta(
+                p.get("id", ""), desc=p.get("desc"), tags=p.get("tags"))
+            if meta is None:
+                return json.dumps({"ok": False, "error": "not found"}, ensure_ascii=False)
+            self._emit_asset_changed()
+            return json.dumps({"ok": True, "asset": meta}, ensure_ascii=False)
+        except Exception as e:
+            return json.dumps({"ok": False, "error": str(e)}, ensure_ascii=False)
+
+    def _rpc_assetDelete(self, asset_id: str) -> str:
+        ok = self._asset_pool.delete(asset_id)
+        if ok:
+            self._emit_asset_changed()
+        return json.dumps({"ok": ok}, ensure_ascii=False)
+
+    def _rpc_assetStats(self) -> str:
+        return json.dumps(self._asset_pool.stats(), ensure_ascii=False)
 
     # ── RPC: 聊天 ────────────────────────────────────────────────
 
