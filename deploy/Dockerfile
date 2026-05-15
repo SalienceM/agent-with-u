@@ -16,8 +16,10 @@ RUN apt-get update \
 
 WORKDIR /app
 
-COPY requirements.txt ./
-RUN pip install --no-cache-dir -r requirements.txt
+# 用锁定版本清单安装依赖：pip 零回溯，弱网环境下也能稳定解析
+COPY deploy/requirements-docker.txt ./
+RUN pip install --no-cache-dir --upgrade pip \
+    && pip install --no-cache-dir -r requirements-docker.txt
 
 # 后端源码 + 内置 skills
 COPY src ./src

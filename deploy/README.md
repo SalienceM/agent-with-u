@@ -49,6 +49,7 @@ python -m src.ws_main --bind 127.0.0.1 --port 44321
 |------|------|
 | `docker-compose.example.yml`     | **推荐**：后端 + web 容器一把起 |
 | `Dockerfile`                     | 后端镜像 |
+| `requirements-docker.txt`        | 后端锁定依赖（pip 零回溯，弱网可装） |
 | `Dockerfile.web`                 | web 镜像（多阶段：构建前端 + nginx） |
 | `web-nginx.conf`                 | web 容器内的路径分流配置 |
 | `nginx.conf.example`             | 裸 nginx + `auth_request` 接 Authelia |
