@@ -2668,6 +2668,29 @@ except urllib.error.URLError as e:
         except Exception as e:
             return json.dumps({"error": str(e)}, ensure_ascii=False)
 
+    def _rpc_getDirRoots(self) -> str:
+        """
+        返回服务器侧文件系统的浏览起点，供前端目录选择器使用。
+        C/S 部署下，工作目录是「服务器」上的路径，不能用客户端原生对话框。
+        """
+        import os as _os
+        from pathlib import Path as _Path
+        roots: list[str] = []
+        if sys.platform == "win32":
+            import string
+            for letter in string.ascii_uppercase:
+                drive = f"{letter}:\\"
+                if _os.path.exists(drive):
+                    roots.append(drive)
+        else:
+            roots = ["/"]
+        return json.dumps({
+            "home": str(_Path.home()),
+            "cwd": _os.getcwd(),
+            "roots": roots,
+            "sep": _os.sep,
+        }, ensure_ascii=False)
+
     def _rpc_getAppConfig(self) -> str:
         return json.dumps(self._app_config_store.get_all(), ensure_ascii=False)
 

@@ -83,7 +83,7 @@ function nextId() {
   return `r${++reqCounter}`;
 }
 
-function isTauri(): boolean {
+export function isTauri(): boolean {
   return typeof (window as any).__TAURI_INTERNALS__ !== 'undefined';
 }
 
@@ -520,6 +520,16 @@ export const api = {
     } catch { return []; }
   },
 
+  /** 服务器侧文件系统浏览起点（home / cwd / 盘符或根）。供 C/S 模式目录选择器使用。 */
+  async getDirRoots(): Promise<{ home: string; cwd: string; roots: string[]; sep: string }> {
+    const result = await call('getDirRoots');
+    try {
+      return JSON.parse(result);
+    } catch {
+      return { home: '', cwd: '', roots: ['/'], sep: '/' };
+    }
+  },
+
   async getAppConfig(): Promise<any> {
     const result = await call('getAppConfig');
     try { return JSON.parse(result); } catch { return {}; }
@@ -867,6 +877,7 @@ function mockDispatch(method: string, params: any[]): any {
     case 'setSkillDefault': return JSON.stringify({ status: 'ok' });
     case 'getDefaultAbilities': return JSON.stringify({ skills: [], prompts: [] });
     case 'getAppVersion': return '0.0.0-dev';
+    case 'getDirRoots': return JSON.stringify({ home: '', cwd: '', roots: ['/'], sep: '/' });
     case 'assetList': return JSON.stringify({ items: [], stats: { count: 0, pinned: 0, bytes: 0 }, httpPort: 0 });
     case 'assetPush': return JSON.stringify({ ok: false, error: 'mock mode' });
     case 'assetPin': return JSON.stringify({ ok: false, error: 'mock mode' });

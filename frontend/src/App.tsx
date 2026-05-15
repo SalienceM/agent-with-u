@@ -1,5 +1,5 @@
 import React, { useState, useCallback, useEffect, useRef, useMemo } from 'react';
-import { api } from './api';
+import { api, isTauri } from './api';
 import { Sidebar } from './components/Sidebar';
 import { MessageBubble } from './components/MessageBubble';
 import { ChatInput } from './components/ChatInput';
@@ -9,6 +9,7 @@ import { RepoPanel } from './components/RepoPanel';
 import { PermissionGate } from './components/PermissionGate';
 import { ScratchPad } from './components/ScratchPad';
 import { AssetPanel } from './components/AssetPanel';
+import { ServerDirPicker } from './components/ServerDirPicker';
 import { useChat } from './hooks/useChat';
 import { useConfig } from './hooks/useConfig';
 import { themes } from './hooks/useConfig';
@@ -1181,6 +1182,7 @@ const NewSessionDialog: React.FC<NewSessionDialogProps> = ({
   const [selectedBackendId, setSelectedBackendId] = useState(
     backends[0]?.id || 'claude-agent-sdk-default'
   );
+  const [dirPickerOpen, setDirPickerOpen] = useState(false);
   const isAutoDir = !workingDir.trim() || workingDir.trim() === '.';
 
   const handleCreate = useCallback(async () => {
@@ -1189,10 +1191,13 @@ const NewSessionDialog: React.FC<NewSessionDialogProps> = ({
   }, [workingDir, selectedBackendId, onCreate]);
 
   const handleBrowse = useCallback(async () => {
-    // Use system native directory picker
-    const path = await api.selectDirectory(isAutoDir ? undefined : workingDir);
-    if (path) {
-      setWorkingDir(path);
+    // Tauri 桌面端：用系统原生目录对话框（选本机 = 服务器同机）。
+    // 浏览器 / 远程 C/S：必须浏览「服务器」文件系统，用 ServerDirPicker。
+    if (isTauri()) {
+      const path = await api.selectDirectory(isAutoDir ? undefined : workingDir);
+      if (path) setWorkingDir(path);
+    } else {
+      setDirPickerOpen(true);
     }
   }, [workingDir, isAutoDir]);
 
@@ -1259,6 +1264,14 @@ const NewSessionDialog: React.FC<NewSessionDialogProps> = ({
           </button>
         </div>
       </div>
+
+      {dirPickerOpen && (
+        <ServerDirPicker
+          initialPath={isAutoDir ? undefined : workingDir}
+          onSelect={(p) => { setWorkingDir(p); setDirPickerOpen(false); }}
+          onCancel={() => setDirPickerOpen(false)}
+        />
+      )}
     </div>
   );
 };
