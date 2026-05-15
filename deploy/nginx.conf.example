@@ -1,0 +1,89 @@
+# AgentWithU — nginx + Authelia (forward_auth) 反向代理示例
+#
+# 假设：
+#   - Authelia 跑在 https://auth.example.com（或内网 http://127.0.0.1:9091）
+#   - AgentWithU 后端：WS 127.0.0.1:44321，HTTP API 127.0.0.1:44322
+#   - 静态前端构建产物在 /var/www/agent-with-u/dist
+#
+# 把本文件内容并入你的 nginx 配置，按需改域名 / 路径 / Authelia 地址。
+
+server {
+    listen 443 ssl http2;
+    server_name agent.example.com;
+
+    ssl_certificate     /etc/ssl/agent.example.com/fullchain.pem;
+    ssl_certificate_key /etc/ssl/agent.example.com/privkey.pem;
+
+    # ── Authelia forward_auth 内部端点 ──────────────────────────────
+    # 所有需要鉴权的 location 用 `auth_request /authelia` 触发。
+    location = /authelia {
+        internal;
+        proxy_pass http://127.0.0.1:9091/api/verify;
+        proxy_pass_request_body off;
+        proxy_set_header Content-Length "";
+        proxy_set_header X-Original-URL  $scheme://$host$request_uri;
+        proxy_set_header X-Forwarded-Method $request_method;
+        proxy_set_header X-Forwarded-Proto  $scheme;
+        proxy_set_header X-Forwarded-Host   $host;
+        proxy_set_header X-Forwarded-Uri    $request_uri;
+        proxy_set_header X-Forwarded-For    $remote_addr;
+    }
+
+    # 未登录时跳转到 Authelia 登录页
+    location @authelia_redirect {
+        return 302 https://auth.example.com/?rd=$scheme://$host$request_uri;
+    }
+
+    # ── 静态前端 ────────────────────────────────────────────────────
+    location / {
+        auth_request /authelia;
+        error_page 401 = @authelia_redirect;
+
+        root  /var/www/agent-with-u/dist;
+        index index.html;
+        try_files $uri $uri/ /index.html;
+    }
+
+    # ── WebSocket：AgentWithU 后端 ──────────────────────────────────
+    # WS 握手是一个 HTTP GET，auth_request 会在这一步校验会话 Cookie。
+    location /ws {
+        auth_request /authelia;
+        error_page 401 = @authelia_redirect;
+
+        # 把 Authelia 返回的身份头取出，转发给后端
+        auth_request_set $user   $upstream_http_remote_user;
+        auth_request_set $email  $upstream_http_remote_email;
+        auth_request_set $name   $upstream_http_remote_name;
+        auth_request_set $groups $upstream_http_remote_groups;
+
+        proxy_pass http://127.0.0.1:44321;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade    $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host $host;
+
+        proxy_set_header Remote-User   $user;
+        proxy_set_header Remote-Email  $email;
+        proxy_set_header Remote-Name   $name;
+        proxy_set_header Remote-Groups $groups;
+
+        # WS 长连接：放宽读超时，避免空闲被掐
+        proxy_read_timeout  3600s;
+        proxy_send_timeout  3600s;
+    }
+
+    # ── HTTP API：素材服务 / Skill 回调 ─────────────────────────────
+    location /api/ {
+        auth_request /authelia;
+        error_page 401 = @authelia_redirect;
+
+        auth_request_set $user  $upstream_http_remote_user;
+        auth_request_set $email $upstream_http_remote_email;
+
+        # 后端 HTTP API 的路由本身带 /api 前缀，这里不剥前缀
+        proxy_pass http://127.0.0.1:44322;
+        proxy_set_header Host $host;
+        proxy_set_header Remote-User  $user;
+        proxy_set_header Remote-Email $email;
+    }
+}

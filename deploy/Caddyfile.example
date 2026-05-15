@@ -1,0 +1,37 @@
+# AgentWithU — Caddy + Authelia 反向代理示例
+#
+# Caddy 的 forward_auth 指令原生支持 Authelia，配置最简。
+# 假设：
+#   - Authelia 内网地址 127.0.0.1:9091
+#   - AgentWithU 后端：WS 127.0.0.1:44321，HTTP API 127.0.0.1:44322
+#   - 静态前端构建产物在 /var/www/agent-with-u/dist
+#
+# Caddy 会自动签发 / 续期 TLS 证书。
+
+agent.example.com {
+    # ── Authelia forward_auth ───────────────────────────────────────
+    # 校验会话；未登录自动 302 到 Authelia 登录页。
+    # copy_headers 把身份头透传给后续 handler。
+    forward_auth 127.0.0.1:9091 {
+        uri /api/verify?rd=https://auth.example.com/
+        copy_headers Remote-User Remote-Email Remote-Name Remote-Groups
+    }
+
+    # ── WebSocket：AgentWithU 后端 ──────────────────────────────────
+    # Caddy 自动识别并升级 WebSocket，无需额外的 Upgrade 头配置。
+    handle /ws* {
+        reverse_proxy 127.0.0.1:44321
+    }
+
+    # ── HTTP API：素材服务 / Skill 回调 ─────────────────────────────
+    handle /api/* {
+        reverse_proxy 127.0.0.1:44322
+    }
+
+    # ── 静态前端（SPA：未命中文件回退 index.html）──────────────────
+    handle {
+        root * /var/www/agent-with-u/dist
+        try_files {path} /index.html
+        file_server
+    }
+}

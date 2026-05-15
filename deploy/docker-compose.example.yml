@@ -1,0 +1,43 @@
+# AgentWithU 后端 — Docker Compose 示例（可选，非容器可用 systemd 单元代替）
+#
+# 本文件只起 AgentWithU 后端。反向代理 (nginx/Traefik/Caddy) 和 Authelia
+# 沿用你现有的部署，把它们指向本服务暴露的 44321 / 44322 端口即可。
+#
+# 用法：
+#   docker compose -f docker-compose.example.yml up -d
+
+services:
+  agent-with-u:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile      # 需自备；或换成已构建好的镜像
+    container_name: agent-with-u
+    restart: unless-stopped
+
+    environment:
+      AGENT_WITH_U_TRUST_FORWARD_AUTH: "1"
+      AGENT_WITH_U_BIND: "0.0.0.0"        # 容器内绑 0.0.0.0，靠 networks 隔离
+      AGENT_WITH_U_PORT: "44321"
+      AGENT_WITH_U_DATA_ROOT: "/data"
+      # 反代容器与本容器在同一 docker 网络，需把反代所在子网加入信任列表：
+      AGENT_WITH_U_TRUSTED_PROXIES: "172.16.0.0/12"
+
+    volumes:
+      # 数据持久化：sessions / skills / asset-pool / backends …
+      - agent-data:/data
+      # Claude 凭据 / 配置（按需）
+      - ~/.claude:/root/.claude:ro
+
+    # 默认只在内部网络暴露，由反代访问；不要直接 ports 映射到宿主公网
+    expose:
+      - "44321"
+      - "44322"
+    networks:
+      - proxy
+
+volumes:
+  agent-data:
+
+networks:
+  proxy:
+    external: true        # 复用反代所在的 docker 网络

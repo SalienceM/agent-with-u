@@ -1,0 +1,65 @@
+# AgentWithU — Traefik 动态配置示例（file provider）
+#
+# 假设 Authelia 已作为一个 Traefik 服务存在，并配好 forwardAuth 中间件。
+# 若你的 Traefik 里 Authelia 中间件已命名 `authelia@file`，可直接复用。
+#
+# 后端：WS 127.0.0.1:44321，HTTP API 127.0.0.1:44322
+# 静态前端建议单独用一个 file_server 容器 / 服务托管（此处示意为 agent-static）。
+
+http:
+  middlewares:
+    # Authelia forwardAuth —— 若已有同名中间件可删掉这段直接复用
+    authelia:
+      forwardAuth:
+        address: "http://authelia:9091/api/verify?rd=https://auth.example.com/"
+        trustForwardHeader: true
+        authResponseHeaders:
+          - "Remote-User"
+          - "Remote-Email"
+          - "Remote-Name"
+          - "Remote-Groups"
+
+  routers:
+    # WebSocket 后端
+    agent-ws:
+      rule: "Host(`agent.example.com`) && PathPrefix(`/ws`)"
+      entryPoints: ["websecure"]
+      service: agent-ws
+      middlewares: ["authelia"]
+      tls:
+        certResolver: letsencrypt
+
+    # HTTP API（素材 / Skill 回调）
+    agent-api:
+      rule: "Host(`agent.example.com`) && PathPrefix(`/api`)"
+      entryPoints: ["websecure"]
+      service: agent-api
+      middlewares: ["authelia"]
+      tls:
+        certResolver: letsencrypt
+
+    # 静态前端
+    agent-web:
+      rule: "Host(`agent.example.com`)"
+      entryPoints: ["websecure"]
+      service: agent-static
+      middlewares: ["authelia"]
+      priority: 1
+      tls:
+        certResolver: letsencrypt
+
+  services:
+    agent-ws:
+      loadBalancer:
+        servers:
+          - url: "http://127.0.0.1:44321"
+    agent-api:
+      loadBalancer:
+        servers:
+          - url: "http://127.0.0.1:44322"
+    agent-static:
+      loadBalancer:
+        servers:
+          - url: "http://127.0.0.1:8080"   # 托管 frontend/dist 的静态服务
+
+# 说明：Traefik 默认即支持 WebSocket 升级，无需额外配置。

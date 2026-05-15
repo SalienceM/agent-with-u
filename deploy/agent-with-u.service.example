@@ -1,0 +1,36 @@
+# AgentWithU 后端 — systemd 服务单元示例
+#
+# 安装：
+#   sudo cp agent-with-u.service.example /etc/systemd/system/agent-with-u.service
+#   # 按需修改 User / WorkingDirectory / 路径 / 环境变量
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now agent-with-u
+#   journalctl -u agent-with-u -f      # 看日志
+
+[Unit]
+Description=AgentWithU backend (WebSocket server)
+After=network.target
+
+[Service]
+Type=simple
+User=agent
+WorkingDirectory=/opt/agent-with-u
+
+# forward-auth 模式：只绑回环，由反向代理 + Authelia 把关
+Environment=AGENT_WITH_U_TRUST_FORWARD_AUTH=1
+Environment=AGENT_WITH_U_BIND=127.0.0.1
+Environment=AGENT_WITH_U_PORT=44321
+Environment=AGENT_WITH_U_DATA_ROOT=/home/agent/.agent-with-u
+# 反代与后端不同机时，把反代 IP/CIDR 加入信任列表：
+# Environment=AGENT_WITH_U_TRUSTED_PROXIES=10.0.0.0/24
+
+ExecStart=/usr/bin/python3 -m src.ws_main
+Restart=on-failure
+RestartSec=3
+
+# 加固（按需）
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

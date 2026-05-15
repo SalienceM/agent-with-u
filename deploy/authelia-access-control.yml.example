@@ -1,0 +1,26 @@
+# AgentWithU — Authelia 访问规则片段
+#
+# 把下面的规则并入你现有 Authelia 配置的 access_control.rules 列表。
+# 不是一份完整的 Authelia 配置，只是需要新增的那一条（或几条）。
+
+access_control:
+  # default_policy / networks 等沿用你现有配置
+  rules:
+    # AgentWithU：要求二次验证（推荐）
+    - domain: "agent.example.com"
+      policy: two_factor
+      # 仅允许特定用户 / 用户组（按需启用）：
+      # subject:
+      #   - "user:alice"
+      #   - "group:agent-users"
+
+    # 若想让局域网内免 2FA、外网强制 2FA，可拆成两条：
+    # - domain: "agent.example.com"
+    #   policy: one_factor
+    #   networks: ["192.168.0.0/16"]
+    # - domain: "agent.example.com"
+    #   policy: two_factor
+
+# Authelia 校验通过后会向反代返回这些响应头，反代再转发给后端：
+#   Remote-User / Remote-Email / Remote-Name / Remote-Groups
+# AgentWithU 后端在 --trust-forward-auth 模式下读取 Remote-User 作为用户身份。
