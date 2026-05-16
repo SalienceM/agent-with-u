@@ -27,10 +27,16 @@ services:
       AGENT_WITH_U_DATA_ROOT: "/data"
       # 信任来自 docker 网络的连接（awu-web 容器）
       AGENT_WITH_U_TRUSTED_PROXIES: "172.16.0.0/12"
+      # Claude 凭据（可选）：在此直接给，或起来后在应用内 Backend Manager
+      # 配置（配置会持久化进 awu-data 卷）。
+      # ANTHROPIC_BASE_URL: "https://api.anthropic.com"
+      # ANTHROPIC_AUTH_TOKEN: "sk-..."
 
     volumes:
       - awu-data:/data                   # sessions / skills / asset-pool / backends
-      - ~/.claude:/root/.claude:ro       # Claude 凭据（按需）
+      # 可选：挂载宿主上已有的 Claude 配置目录。
+      # 宿主必须确实存在该目录，否则容器起不来。按需取消注释并改成真实路径：
+      # - /volume1/docker/agent-with-u/claude-config:/root/.claude:ro
 
     # 不映射宿主端口：后端只在 docker 内网，由 awu-web 访问
     expose:
