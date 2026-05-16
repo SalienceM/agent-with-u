@@ -24,7 +24,7 @@ import zipfile
 from pathlib import Path
 from typing import Optional
 
-import yaml  # PyYAML — already in requirements (anthropic dep)
+import yaml  # PyYAML — declared in requirements.txt
 
 from . import paths
 
