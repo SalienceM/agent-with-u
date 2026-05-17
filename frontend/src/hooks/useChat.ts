@@ -1,5 +1,6 @@
 import { useState, useCallback, useEffect, useRef, startTransition } from 'react';
 import { api } from '../api';
+import { uuid } from '../utils/uuid';
 import type { ImageAttachment } from './useClipboardImage';
 import {
   getStreamState,
@@ -469,7 +470,7 @@ export function useChat(sessionId: string, backendId: string, backends?: any[], 
   // ── 添加系统消息（纯前端） ──
   const addSystemMessage = useCallback((content: string) => {
     const msg: ChatMessage = {
-      id: crypto.randomUUID(),
+      id: uuid(),
       role: 'system',
       content,
       timestamp: Date.now() / 1000,
@@ -498,7 +499,7 @@ export function useChat(sessionId: string, backendId: string, backends?: any[], 
       if (needsMigrate) {
         // Backend is missing - show migrate prompt
         const sysMsg: ChatMessage = {
-          id: crypto.randomUUID(),
+          id: uuid(),
           role: 'system',
           content: `⚠️ **当前会话的后端已被删除**\n\n请点击右上角的 **Migrate** 按钮，选择一个新的后端继续对话。`,
           timestamp: Date.now() / 1000,
@@ -508,13 +509,13 @@ export function useChat(sessionId: string, backendId: string, backends?: any[], 
       }
 
       const userMsg: ChatMessage = {
-        id: crypto.randomUUID(),
+        id: uuid(),
         role: 'user',
         content,
         images,
         timestamp: Date.now() / 1000,
       };
-      const assistantId = crypto.randomUUID();
+      const assistantId = uuid();
       const assistantMsg: ChatMessage = {
         id: assistantId,
         role: 'assistant',
@@ -613,7 +614,7 @@ export function useChat(sessionId: string, backendId: string, backends?: any[], 
               const reloaded = session.messages.map(normalizeMessage);
               // 追加一条系统消息告知用户
               const sysMsg: ChatMessage = {
-                id: crypto.randomUUID(),
+                id: uuid(),
                 role: 'system' as const,
                 content: `✅ 已压缩 ${result.removed} 条早期消息，保留最近 ${result.remaining} 条。`,
                 timestamp: Date.now() / 1000,

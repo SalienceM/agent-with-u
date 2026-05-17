@@ -1,5 +1,6 @@
 import { useState, useCallback, useEffect } from 'react';
 import { api } from '../api';
+import { uuid } from '../utils/uuid';
 
 export interface ImageAttachment {
   id: string;
@@ -70,7 +71,7 @@ export function useClipboardImage() {
             const m = img.src.match(/^data:(image\/[\w+]+);base64,(.+)/);
             if (m) {
               addImage({
-                id: crypto.randomUUID(),
+                id: uuid(),
                 base64: m[2],
                 mime_type: m[1],
                 size: Math.ceil(m[2].length * 0.75),
@@ -90,7 +91,7 @@ export function useClipboardImage() {
           reader.onload = () => {
             const b64 = (reader.result as string).split(',')[1];
             addImage({
-              id: crypto.randomUUID(),
+              id: uuid(),
               base64: b64,
               mime_type: file.type,
               size: file.size,
