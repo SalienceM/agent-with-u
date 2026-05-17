@@ -45,6 +45,7 @@ export const App: React.FC = () => {
   const [backendConnected, setBackendConnected] = useState<boolean | null>(null);  // ★ null = connecting
   const [toast, setToast] = useState<{ type: 'success' | 'error' | 'info'; message: string } | null>(null);
   const [isImporting, setIsImporting] = useState(false);
+  const [dataPicker, setDataPicker] = useState<'export' | 'import' | null>(null);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [scratchPadOpen, setScratchPadOpen] = useState(false);
   const [scratchPadWidth, setScratchPadWidth] = useState(360);
@@ -355,19 +356,7 @@ export const App: React.FC = () => {
   }, [chat.messages, config.exportFormat]);
 
   /* ---- 数据导出 ---- */
-  const handleExportData = useCallback(async () => {
-    let targetPath: string | null = null;
-    try {
-      targetPath = await api.selectExportPath();
-    } catch (e: any) {
-      console.error('[export] selectExportPath failed:', e);
-      showToast('error', `打开保存对话框失败：${e?.message ?? e}`);
-      return;
-    }
-    if (!targetPath) {
-      // 用户取消
-      return;
-    }
+  const runExport = useCallback(async (targetPath: string) => {
     showToast('info', '导出中，请稍候…', 60000);
     try {
       const result = await api.exportData(targetPath);
@@ -382,24 +371,26 @@ export const App: React.FC = () => {
     }
   }, [showToast]);
 
-  /* ---- 数据导入 ---- */
-  const handleImportData = useCallback(async () => {
-    const confirmed = window.confirm(
-      '⚠️ 警告：导入将覆盖现有的 Backends 配置 和 Repo（Prompts + Skills）！\n\n' +
-      '（会话不会被导入／覆盖。）\n\n确定要继续吗？'
-    );
-    if (!confirmed) return;
-
-    let sourcePath: string | null = null;
-    try {
-      sourcePath = await api.selectImportPath();
-    } catch (e: any) {
-      console.error('[import] selectImportPath failed:', e);
-      showToast('error', `打开文件对话框失败：${e?.message ?? e}`);
+  const handleExportData = useCallback(async () => {
+    // 浏览器 / 远程 C/S：导出文件落在「服务器」上，用 ServerDirPicker。
+    if (!isTauri()) {
+      setDataPicker('export');
       return;
     }
-    if (!sourcePath) return;
+    let targetPath: string | null = null;
+    try {
+      targetPath = await api.selectExportPath();
+    } catch (e: any) {
+      console.error('[export] selectExportPath failed:', e);
+      showToast('error', `打开保存对话框失败：${e?.message ?? e}`);
+      return;
+    }
+    if (!targetPath) return;  // 用户取消
+    await runExport(targetPath);
+  }, [showToast, runExport]);
 
+  /* ---- 数据导入 ---- */
+  const runImport = useCallback(async (sourcePath: string) => {
     setIsImporting(true);
     showToast('info', '导入中，请稍候…', 60000);
     try {
@@ -423,6 +414,30 @@ export const App: React.FC = () => {
       setIsImporting(false);
     }
   }, [showToast]);
+
+  const handleImportData = useCallback(async () => {
+    const confirmed = window.confirm(
+      '⚠️ 警告：导入将覆盖现有的 Backends 配置 和 Repo（Prompts + Skills）！\n\n' +
+      '（会话不会被导入／覆盖。）\n\n确定要继续吗？'
+    );
+    if (!confirmed) return;
+
+    // 浏览器 / 远程 C/S：导入文件来自「服务器」，用 ServerDirPicker。
+    if (!isTauri()) {
+      setDataPicker('import');
+      return;
+    }
+    let sourcePath: string | null = null;
+    try {
+      sourcePath = await api.selectImportPath();
+    } catch (e: any) {
+      console.error('[import] selectImportPath failed:', e);
+      showToast('error', `打开文件对话框失败：${e?.message ?? e}`);
+      return;
+    }
+    if (!sourcePath) return;
+    await runImport(sourcePath);
+  }, [showToast, runImport]);
 
   /* ---- Backend Manager ---- */
   const handleSaveBackend = useCallback(async (config: any) => {
@@ -897,6 +912,23 @@ export const App: React.FC = () => {
             initialCheckDoneRef.current = true;
           }}
           onCreate={handleCreateSession}
+        />
+      )}
+
+      {/* ---- 数据导入/导出：服务器文件选择器（非桌面端） ---- */}
+      {dataPicker === 'export' && (
+        <ServerDirPicker
+          mode="save"
+          saveFilename={`agent-with-u-export-${new Date().toISOString().slice(0, 10)}.tar.gz`}
+          onSelect={(p) => { setDataPicker(null); runExport(p); }}
+          onCancel={() => setDataPicker(null)}
+        />
+      )}
+      {dataPicker === 'import' && (
+        <ServerDirPicker
+          mode="open"
+          onSelect={(p) => { setDataPicker(null); runImport(p); }}
+          onCancel={() => setDataPicker(null)}
         />
       )}
 

@@ -1,43 +1,60 @@
 /**
- * ServerDirPicker — 服务器端目录选择器。
+ * ServerDirPicker — 服务器端文件/目录选择器。
  *
- * C/S 架构下，会话的工作目录是「服务器」上的路径，不能用客户端原生
- * 文件对话框（那会选到手机/浏览器本机的目录）。本组件通过后端
+ * C/S 架构下，会话的工作目录、导入导出的文件都在「服务器」上，不能用客户端
+ * 原生文件对话框（那会选到手机/浏览器本机的目录）。本组件通过后端
  * listDirectory / getDirRoots RPC 浏览服务器文件系统。
+ *
+ * 三种模式：
+ *  - 'dir'  选择一个目录（默认）
+ *  - 'open' 选择一个已存在的文件
+ *  - 'save' 选择目录并输入文件名，返回拼接后的完整路径
  */
 import React, { useState, useEffect, useCallback } from 'react';
 import { api } from '../api';
 
+type PickerMode = 'dir' | 'open' | 'save';
+
 interface Props {
   initialPath?: string;
+  mode?: PickerMode;
+  /** save 模式下预填的文件名 */
+  saveFilename?: string;
   onSelect: (path: string) => void;
   onCancel: () => void;
 }
 
 interface Entry { name: string; path: string; isDir: boolean }
 
-export const ServerDirPicker: React.FC<Props> = ({ initialPath, onSelect, onCancel }) => {
+export const ServerDirPicker: React.FC<Props> = ({
+  initialPath, mode = 'dir', saveFilename, onSelect, onCancel,
+}) => {
   const [sep, setSep] = useState('/');
   const [roots, setRoots] = useState<{ home: string; cwd: string; roots: string[] }>({
     home: '', cwd: '', roots: [],
   });
   const [cur, setCur] = useState(initialPath || '');
   const [entries, setEntries] = useState<Entry[]>([]);
+  const [selectedFile, setSelectedFile] = useState('');
+  const [filename, setFilename] = useState(saveFilename || '');
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
+
+  const showFiles = mode !== 'dir';
 
   const browse = useCallback(async (path: string) => {
     setLoading(true);
     setError('');
+    setSelectedFile('');
     try {
       const list = await api.listDirectory(path, '');
       // listDirectory 出错时返回 []；用 getDirRoots 的路径兜底则不会到这
-      setEntries(list.filter((e) => e.isDir));
+      setEntries(showFiles ? list : list.filter((e) => e.isDir));
       setCur(path);
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [showFiles]);
 
   useEffect(() => {
     (async () => {
@@ -59,11 +76,48 @@ export const ServerDirPicker: React.FC<Props> = ({ initialPath, onSelect, onCanc
     browse(trimmed.slice(0, idx) || sep);
   }, [cur, sep, browse]);
 
+  const joinPath = useCallback((dir: string, name: string) => {
+    return dir.replace(/[/\\]+$/, '') + sep + name;
+  }, [sep]);
+
+  const handleEntryClick = useCallback((e: Entry) => {
+    if (e.isDir) {
+      browse(e.path);
+    } else if (mode === 'open') {
+      setSelectedFile(e.path);
+    } else if (mode === 'save') {
+      setFilename(e.name);
+    }
+  }, [browse, mode]);
+
+  const confirmDisabled =
+    (mode === 'open' && !selectedFile) ||
+    (mode === 'save' && !filename.trim());
+
+  const handleConfirm = useCallback(() => {
+    if (mode === 'open') {
+      if (selectedFile) onSelect(selectedFile);
+    } else if (mode === 'save') {
+      if (filename.trim()) onSelect(joinPath(cur, filename.trim()));
+    } else {
+      onSelect(cur);
+    }
+  }, [mode, selectedFile, filename, cur, joinPath, onSelect]);
+
+  const title =
+    mode === 'open' ? '选择服务器文件'
+      : mode === 'save' ? '保存到服务器'
+        : '选择服务器目录';
+  const confirmLabel =
+    mode === 'open' ? '选择此文件'
+      : mode === 'save' ? '保存'
+        : '选择此目录';
+
   return (
     <div style={overlayStyle} onClick={onCancel}>
       <div style={dialogStyle} onClick={(e) => e.stopPropagation()}>
         <div style={{ fontWeight: 600, fontSize: 14, marginBottom: 8 }}>
-          选择服务器目录
+          {title}
         </div>
 
         {/* 快捷入口 */}
@@ -88,33 +142,56 @@ export const ServerDirPicker: React.FC<Props> = ({ initialPath, onSelect, onCanc
           <button style={btnStyle} onClick={() => browse(cur)}>转到</button>
         </div>
 
-        {/* 子目录列表 */}
+        {/* 目录/文件列表 */}
         <div style={listStyle}>
           {loading && <div style={hintStyle}>加载中…</div>}
           {!loading && error && <div style={{ ...hintStyle, color: '#f85149' }}>{error}</div>}
           {!loading && !error && entries.length === 0 && (
-            <div style={hintStyle}>（无子目录）</div>
+            <div style={hintStyle}>{showFiles ? '（空目录）' : '（无子目录）'}</div>
           )}
           {!loading && entries.map((e) => (
             <div
               key={e.path}
-              style={rowStyle}
-              onClick={() => browse(e.path)}
-              onDoubleClick={() => browse(e.path)}
+              style={{
+                ...rowStyle,
+                ...(e.path === selectedFile ? rowSelectedStyle : {}),
+                ...(!e.isDir && mode === 'dir' ? rowDisabledStyle : {}),
+              }}
+              onClick={() => handleEntryClick(e)}
+              onDoubleClick={() => e.isDir && browse(e.path)}
             >
-              📁 {e.name}
+              {e.isDir ? '📁' : '📄'} {e.name}
             </div>
           ))}
         </div>
+
+        {/* save 模式：文件名输入 */}
+        {mode === 'save' && (
+          <div style={{ display: 'flex', gap: 6, marginTop: 8, alignItems: 'center' }}>
+            <span style={{ fontSize: 12, color: 'var(--theme-text-muted, #aaa)' }}>文件名</span>
+            <input
+              value={filename}
+              onChange={(e) => setFilename(e.target.value)}
+              style={inputStyle}
+              spellCheck={false}
+              placeholder="export.tar.gz"
+            />
+          </div>
+        )}
 
         {/* 操作 */}
         <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8, marginTop: 10 }}>
           <button style={btnStyle} onClick={onCancel}>取消</button>
           <button
-            style={{ ...btnStyle, background: 'var(--theme-accent, #7aa2f7)', color: '#fff', border: 'none' }}
-            onClick={() => onSelect(cur)}
+            style={{
+              ...btnStyle,
+              background: 'var(--theme-accent, #7aa2f7)', color: '#fff', border: 'none',
+              ...(confirmDisabled ? { opacity: 0.5, cursor: 'not-allowed' } : {}),
+            }}
+            disabled={confirmDisabled}
+            onClick={handleConfirm}
           >
-            选择此目录
+            {confirmLabel}
           </button>
         </div>
       </div>
@@ -142,6 +219,12 @@ const listStyle: React.CSSProperties = {
 const rowStyle: React.CSSProperties = {
   padding: '6px 8px', borderRadius: 6, cursor: 'pointer', fontSize: 13,
   whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis',
+};
+const rowSelectedStyle: React.CSSProperties = {
+  background: 'var(--theme-accent, #7aa2f7)', color: '#fff',
+};
+const rowDisabledStyle: React.CSSProperties = {
+  opacity: 0.4, cursor: 'default',
 };
 const hintStyle: React.CSSProperties = {
   padding: '16px 8px', textAlign: 'center', fontSize: 12,
