@@ -189,6 +189,10 @@ class ClaudeCodeOfficialBackend(ModelBackend):
                 # 真正的 API key：同步给 ANTHROPIC_API_KEY
                 proc_env["ANTHROPIC_API_KEY"] = cfg_auth
 
+        # ── 步骤4：root/容器环境允许 --dangerously-skip-permissions ──────────
+        from .base import apply_root_sandbox_env
+        apply_root_sandbox_env(proc_env)
+
         return proc_env
 
     async def send_message(

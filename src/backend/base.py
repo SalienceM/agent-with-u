@@ -121,6 +121,23 @@ def resolve_claude_cli(config_cli_path: Optional[str] = None) -> str:
     return "claude"
 
 
+def apply_root_sandbox_env(env: dict) -> dict:
+    """允许在 root/容器环境下使用 --dangerously-skip-permissions。
+
+    Claude CLI 在以 root 身份运行时会拒绝 ``--dangerously-skip-permissions``
+    （报错 "cannot be used with root/sudo privileges"），除非进程环境里设置了
+    ``IS_SANDBOX``。本应用常运行于沙箱化的容器（root 用户），因此当检测到
+    root 且调用方未显式设置 ``IS_SANDBOX`` 时，自动注入 ``IS_SANDBOX=1``。
+    """
+    try:
+        is_root = hasattr(os, "geteuid") and os.geteuid() == 0
+    except Exception:
+        is_root = False
+    if is_root and not env.get("IS_SANDBOX"):
+        env["IS_SANDBOX"] = "1"
+    return env
+
+
 class StreamDelta:
     """
     A single streaming event pushed to the frontend.

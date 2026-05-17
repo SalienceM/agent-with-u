@@ -146,6 +146,10 @@ class ClaudeAgentBackend(ModelBackend):
                   f", proxy={env_dict.get('HTTPS_PROXY') or env_dict.get('https_proxy') or 'none'}",
                   file=sys.stderr, flush=True)
 
+            # ★ root/容器环境允许 bypassPermissions（SDK 内部传 --dangerously-skip-permissions）
+            from .base import apply_root_sandbox_env
+            apply_root_sandbox_env(env_dict)
+
             # ★ 权限敏感的工具列表：这些工具需要用户确认
             PERMISSION_SENSITIVE_TOOLS = {"Bash", "Edit", "Write"}
             # ★ Layer 2 沙盒：需要路径校验的工具

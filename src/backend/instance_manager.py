@@ -164,6 +164,10 @@ class ClaudeCodeInstance:
                 proxy_in_use = proc_env.get("HTTPS_PROXY") or proc_env.get("https_proxy") or "none"
                 print(f"[Instance] proxy={proxy_in_use}", file=sys.stderr, flush=True)
 
+                # ★ root/容器环境允许 --dangerously-skip-permissions
+                from .base import apply_root_sandbox_env
+                apply_root_sandbox_env(proc_env)
+
                 proc = subprocess.Popen(
                     cmd,
                     stdout=subprocess.PIPE,
