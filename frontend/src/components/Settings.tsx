@@ -46,15 +46,19 @@ export const Settings: React.FC<SettingsProps> = ({
         api.sttCheckLocal().then((r) => { if (!cancelled) setLocalInstalled(r.installed); }).catch(() => {});
       }
     }).catch(() => {});
-    navigator.mediaDevices.getUserMedia({ audio: true })
-      .then((stream) => {
-        stream.getTracks().forEach(t => t.stop());
-        return navigator.mediaDevices.enumerateDevices();
-      })
-      .then((devices) => {
-        if (!cancelled) setAudioDevices(devices.filter(d => d.kind === 'audioinput'));
-      })
-      .catch(() => {});
+    // navigator.mediaDevices 仅在安全上下文（https / localhost）下存在；
+    // 通过明文 http + 局域网 IP 访问时为 undefined，直接取用会抛 TypeError。
+    if (navigator.mediaDevices?.getUserMedia) {
+      navigator.mediaDevices.getUserMedia({ audio: true })
+        .then((stream) => {
+          stream.getTracks().forEach(t => t.stop());
+          return navigator.mediaDevices.enumerateDevices();
+        })
+        .then((devices) => {
+          if (!cancelled) setAudioDevices(devices.filter(d => d.kind === 'audioinput'));
+        })
+        .catch(() => {});
+    }
     return () => { cancelled = true; };
   }, [isOpen]);
 
