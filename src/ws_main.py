@@ -281,12 +281,19 @@ def build_auth_config(args: argparse.Namespace) -> AuthConfig:
 
 
 def _validate_auth_for_bind(cfg: AuthConfig) -> None:
-    """非 loopback 绑定 + 无认证 = 拒绝启动，避免裸跑暴露到局域网。"""
+    """非 loopback 绑定 + 无任何访问控制 = 拒绝启动，避免裸跑暴露到局域网。
+
+    loopback 模式下若显式设置了 trusted_proxies，则 peer-IP 白名单本身就是
+    访问控制（典型：docker 内网部署，只允许 awu-web 容器连入），允许绑定。
+    """
     is_loopback_bind = cfg.bind_host in ("127.0.0.1", "::1", "localhost")
-    if not is_loopback_bind and cfg.mode() == "loopback":
+    if is_loopback_bind:
+        return
+    if cfg.mode() == "loopback" and not cfg.trusted_proxies:
         logging.error(
-            "[ws_main] refusing to bind on %s without auth. "
-            "Pass --auth-token or --trust-forward-auth, or bind on 127.0.0.1.",
+            "[ws_main] refusing to bind on %s without access control. "
+            "Pass --auth-token / --trust-forward-auth, set --trusted-proxies "
+            "to an explicit CIDR list, or bind on 127.0.0.1.",
             cfg.bind_host,
         )
         sys.exit(2)

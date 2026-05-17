@@ -13,9 +13,11 @@ AuthGuard: WebSocket 握手阶段的认证 / 鉴权层。
        连接时携带 Authorization: Bearer <token> 或 ?token=<token> query。
        适用：开发调试 / 临时局域网裸跑。
 
-  3. loopback-only （默认）
-       只接受 127.0.0.1 / ::1 的连接，无需 token。
-       适用：Tauri sidecar 模式 = 桌面客户端本地连本地后端。
+  3. loopback （默认）
+       只接受 trusted_proxies 列表内 IP 的连接（默认仅 127.0.0.1 / ::1），
+       无需 token，身份统一记为 "local"。
+       适用：Tauri sidecar 本地直连；或单用户部署中由 docker 内网/反代
+       做边界——把内网 IP 段加入 trusted_proxies 即整段免鉴权。
 
 每个连接在通过认证后，会在 websocket 对象上挂三个属性：
   websocket.identity     —— 用户标识（Remote-User、token 标识或 "local"）
@@ -65,7 +67,8 @@ class AuthConfig:
             return f"forward-auth (trusted_proxies={self.trusted_proxies or ['127.0.0.1', '::1']})"
         if m == "token":
             return "token (Bearer header or ?token=… query)"
-        return "loopback-only (127.0.0.1 / ::1)"
+        nets = self.trusted_proxies or ["127.0.0.1", "::1"]
+        return f"loopback (trusted peers={nets}, identity=local)"
 
 
 class AuthGuard:
@@ -184,15 +187,16 @@ class AuthGuard:
             log.info("[auth] accept %s via token", peer)
             return None
 
-        # loopback 模式：peer 必须是 127.0.0.1 / ::1
+        # loopback 模式：peer 必须落在 trusted_proxies（默认仅 127.0.0.1 / ::1）
         if not self._peer_in_trusted(peer):
-            log.warning("[auth] reject %s: loopback-only mode, non-local peer", peer)
+            log.warning("[auth] reject %s: peer not in trusted_proxies (loopback mode)", peer)
             return connection.respond(
                 http.HTTPStatus.FORBIDDEN,
-                "forbidden: this server is in loopback-only mode\n",
+                "forbidden: peer is not a trusted address\n",
             )
         connection.identity = "local"
         connection.identity_email = None
         connection.identity_groups = []
         connection.identity_src = "loopback"
+        log.info("[auth] accept %s as user=local via loopback", peer)
         return None

@@ -255,9 +255,16 @@ The WS backend (`src/ws_main.py`) reads these for self-hosted deployment:
 - `AGENT_WITH_U_PORT` — WS port (default `44321`)
 - `AGENT_WITH_U_AUTH_TOKEN` — enables token auth mode
 - `AGENT_WITH_U_TRUST_FORWARD_AUTH` — `1` to trust reverse-proxy `Remote-*`
-  headers (Authelia / authentik / oauth2-proxy)
-- `AGENT_WITH_U_TRUSTED_PROXIES` — comma-separated CIDRs allowed to set
-  `Remote-*` headers (default `127.0.0.0/8,::1/128`)
+  headers (Authelia / authentik / oauth2-proxy). Every request must carry a
+  `Remote-User` header or it is rejected — use for multi-user setups.
+- `AGENT_WITH_U_TRUSTED_PROXIES` — comma-separated CIDRs (default
+  `127.0.0.0/8,::1/128`). In forward-auth mode: proxy IPs allowed to set
+  `Remote-*` headers. In loopback mode (default, when forward-auth/token are
+  off): the peer-IP allowlist — any connection from these CIDRs is accepted
+  unauthenticated with identity `local`. Setting it to a docker/LAN subnet
+  gives single-user internal no-auth access while the edge proxy still gates
+  the public side. With a non-loopback bind, loopback mode requires this to
+  be set explicitly or the process refuses to start.
 - `AGENT_WITH_U_DATA_ROOT` — redirect the entire data directory (sessions,
   skills, backends, prompts, tmp, …). Default `~/.agent-with-u`. Must be set
   **before** the process starts (read at import time). Per-user isolation =

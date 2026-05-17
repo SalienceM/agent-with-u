@@ -20,8 +20,10 @@ services:
     restart: unless-stopped
 
     environment:
-      # forward-auth 模式：信任上游反代盖的 Remote-* 头
-      AGENT_WITH_U_TRUST_FORWARD_AUTH: "1"
+      # loopback 模式 + trusted_proxies：只放行 docker 内网（awu-web 容器）的
+      # 连接，身份统一记为 "local"。单用户部署内网免鉴权，外网由最外层
+      # NPM + Authelia 把关。如需按 Authelia 身份区分多用户，改成设置
+      # AGENT_WITH_U_TRUST_FORWARD_AUTH: "1"（要求每个请求都带 Remote-User 头）。
       AGENT_WITH_U_BIND: "0.0.0.0"        # 容器内绑 0.0.0.0，靠 docker 网络隔离
       AGENT_WITH_U_PORT: "44321"
       AGENT_WITH_U_DATA_ROOT: "/data"
