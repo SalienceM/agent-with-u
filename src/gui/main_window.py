@@ -10,7 +10,8 @@ import os
 import sys
 from pathlib import Path
 
-from PySide6.QtCore import QUrl
+from PySide6.QtCore import QUrl, QEvent, Qt
+from PySide6.QtGui import QKeySequence, QShortcut
 from PySide6.QtWebChannel import QWebChannel
 from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWebEngineCore import QWebEngineProfile, QWebEngineSettings
@@ -68,8 +69,44 @@ class MainWindow(QMainWindow):
                 print("Warning: frontend/dist not found, trying dev server...")
                 self._web.setUrl(QUrl("http://localhost:5173"))
 
+        # ★ Ctrl+滚轮缩放：QWebEngineView 的滚轮事件落在内部渲染子控件上，
+        #   需要在每次加载完成后给 focusProxy 装上事件过滤器
+        self._zoom_min = 0.25
+        self._zoom_max = 5.0
+        self._web.loadFinished.connect(self._install_wheel_filter)
+        self._install_wheel_filter()
+
+        # ★ 键盘缩放快捷键：Ctrl+= / Ctrl+- / Ctrl+0
+        QShortcut(QKeySequence.ZoomIn, self, activated=lambda: self._zoom_by(0.1))
+        QShortcut(QKeySequence("Ctrl+="), self, activated=lambda: self._zoom_by(0.1))
+        QShortcut(QKeySequence.ZoomOut, self, activated=lambda: self._zoom_by(-0.1))
+        QShortcut(QKeySequence("Ctrl+0"), self, activated=lambda: self._set_zoom(1.0))
+
         # Dark title bar on Windows
         self._apply_dark_theme()
+
+    def _install_wheel_filter(self, *args):
+        """给 WebEngine 内部渲染控件装事件过滤器以捕获 Ctrl+滚轮。"""
+        proxy = self._web.focusProxy()
+        if proxy is not None:
+            proxy.installEventFilter(self)
+
+    def eventFilter(self, obj, event):
+        if event.type() == QEvent.Type.Wheel and (
+            event.modifiers() & Qt.KeyboardModifier.ControlModifier
+        ):
+            delta = event.angleDelta().y()
+            if delta != 0:
+                self._zoom_by(0.1 if delta > 0 else -0.1)
+            return True
+        return super().eventFilter(obj, event)
+
+    def _zoom_by(self, step: float):
+        self._set_zoom(self._web.zoomFactor() + step)
+
+    def _set_zoom(self, factor: float):
+        factor = max(self._zoom_min, min(self._zoom_max, factor))
+        self._web.setZoomFactor(factor)
 
     def _apply_dark_theme(self):
         """Apply dark window chrome on Windows."""
