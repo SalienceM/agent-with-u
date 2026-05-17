@@ -46,9 +46,22 @@ const renderer = new Renderer();
   return `<blockquote class="md-blockquote">${quote}</blockquote>\n`;
 };
 
+/**
+ * 后端把 Skill 生成的图片 URL 硬编码为 http://127.0.0.1:<port>/api/skill-images/...
+ * CS（服务器/浏览器）架构下浏览器与后端不同机，访问不到后端的 127.0.0.1。
+ * 生产 Web 下改写成相对路径（由反向代理把 /api/ 转发到后端，与素材缩略图一致）；
+ * Tauri / dev 下浏览器能直连本机 127.0.0.1，保持原样。
+ */
+function rewriteLocalAssetUrl(href: string): string {
+  if (!href) return href;
+  const isTauri = typeof window !== 'undefined' && !!(window as any).__TAURI_INTERNALS__;
+  if (isTauri || import.meta.env.DEV) return href;
+  return href.replace(/^https?:\/\/(?:127\.0\.0\.1|localhost)(?::\d+)?(?=\/api\/)/i, '');
+}
+
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 (renderer as any).image = function (href: string, _title: string | null, text: string): string {
-  return `<img src="${href}" alt="${text || ''}" loading="lazy" class="md-img" />\n`;
+  return `<img src="${rewriteLocalAssetUrl(href)}" alt="${text || ''}" loading="lazy" class="md-img" />\n`;
 };
 
 marked.use({
