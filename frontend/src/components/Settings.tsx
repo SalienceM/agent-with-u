@@ -194,6 +194,39 @@ export const Settings: React.FC<SettingsProps> = ({
           </div>
         </div>
 
+        {/* 网络代理 */}
+        <div style={sectionStyle}>
+          <label style={{ ...labelStyle, display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer' }}>
+            <input
+              type="checkbox"
+              checked={config.proxyEnabled}
+              onChange={(e) => onConfigChange({ proxyEnabled: e.target.checked })}
+              style={{ accentColor: 'var(--theme-accent)' }}
+            />
+            🌐 后端流量走代理 (Proxy)
+          </label>
+          <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginTop: 6 }}>
+            <input
+              type="text"
+              value={config.proxyHost}
+              placeholder="地址 (如 127.0.0.1)"
+              onChange={(e) => onConfigChange({ proxyHost: e.target.value })}
+              style={{ ...inputStyle, flex: 1 }}
+            />
+            <span style={{ color: 'var(--theme-text-muted)' }}>:</span>
+            <input
+              type="text"
+              value={config.proxyPort}
+              placeholder="端口 (如 7890)"
+              onChange={(e) => onConfigChange({ proxyPort: e.target.value.replace(/[^0-9]/g, '') })}
+              style={{ ...inputStyle, width: 110 }}
+            />
+          </div>
+          <div style={{ fontSize: 11, color: 'var(--theme-text-muted)', marginTop: 4 }}>
+            勾选后，Claude CLI 与 API 请求都会经此代理。地址可带 http:// 或 socks5:// 前缀（默认 http）。
+          </div>
+        </div>
+
         {/* 语音转文字 (STT) 设置 */}
         {sttCfg && (
           <div style={sectionStyle}>

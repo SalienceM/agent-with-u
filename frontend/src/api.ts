@@ -791,7 +791,7 @@ export const api = {
     return () => { assetChangedCallbacks = assetChangedCallbacks.filter((c) => c !== cb); };
   },
 
-  /** 打开外部 cmd 窗口实时刷日志 */
+  /** 打开外部 cmd 窗口实时刷日志（仅 Tauri 桌面端可用） */
   async openLogViewer(): Promise<void> {
     if (isTauri()) {
       try {
@@ -800,6 +800,17 @@ export const api = {
       } catch (e) {
         console.error('Failed to open log viewer:', e);
       }
+    }
+  },
+
+  /** 读取后端日志末尾若干行（适用于 CS / WebSocket 架构的应用内日志查看器） */
+  async getBackendLogs(maxLines = 500): Promise<{ ok: boolean; lines: string[]; path?: string; error?: string }> {
+    const r = await call('getBackendLogs', maxLines);
+    try {
+      const d = typeof r === 'string' ? JSON.parse(r) : r;
+      return { ok: !!d?.ok, lines: d?.lines || [], path: d?.path, error: d?.error };
+    } catch {
+      return { ok: false, lines: [], error: 'parse error' };
     }
   },
 };
@@ -816,6 +827,8 @@ let mockAppConfig: any = { fontSize: 14, renderMarkdown: true, exportFormat: 'ma
 function mockDispatch(method: string, params: any[]): any {
   switch (method) {
     case 'readClipboardImage': return 'null';
+    case 'getBackendLogs':
+      return JSON.stringify({ ok: true, lines: ['[mock] backend not connected — run: python -m src.ws_main'] });
     case 'getAppConfig': return JSON.stringify(mockAppConfig);
     case 'setAppConfig':
       mockAppConfig = JSON.parse(params[0]);

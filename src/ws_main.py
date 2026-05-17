@@ -52,13 +52,10 @@ def setup_logging() -> Path:
               ~/.agent-with-u/logs/backend.log（其他平台）
     只保留最近 1 MB，超出后轮转 3 份。
     """
-    if sys.platform == "win32":
-        base = Path(os.environ.get("APPDATA", Path.home())) / "AgentWithU"
-    else:
-        base = Path.home() / ".agent-with-u"
-    log_dir = base / "logs"
-    log_dir.mkdir(parents=True, exist_ok=True)
-    log_file = log_dir / "backend.log"
+    from .backend import paths as _paths
+
+    log_file = _paths.log_file()
+    log_file.parent.mkdir(parents=True, exist_ok=True)
 
     from logging.handlers import RotatingFileHandler
 

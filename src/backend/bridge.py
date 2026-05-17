@@ -133,6 +133,7 @@ class Bridge(QObject):
         self._session_store = SessionStore()
         self._backend_store = BackendStore()  # ★ Persistent backend config storage
         self._app_config_store = AppConfigStore()  # ★ App-level config (theme, etc.)
+        self._apply_proxy_from_config()
         # ★ Per-session backend instances：每个 session 独占一个 backend 实例
         # 这样 abort(session_id) 只影响目标 session，不会误杀其他并发 session
         self._session_backends: dict[str, ModelBackend] = {}
@@ -1062,6 +1063,44 @@ class Bridge(QObject):
         try:
             config = json.loads(config_json)
             self._app_config_store.set_all(config)
+            self._apply_proxy_from_config()
             return json.dumps({"status": "ok"}, ensure_ascii=False)
         except Exception as e:
             return json.dumps({"status": "error", "message": str(e)}, ensure_ascii=False)
+
+    def _apply_proxy_from_config(self):
+        """把 app 配置里的代理设置应用到进程环境变量。"""
+        try:
+            from .base import apply_proxy_env
+            cfg = self._app_config_store.get_all()
+            url = apply_proxy_env(
+                bool(cfg.get("proxyEnabled")),
+                str(cfg.get("proxyHost", "") or ""),
+                str(cfg.get("proxyPort", "") or ""),
+            )
+            print(f"[Proxy] {('enabled -> ' + url) if url else 'disabled'}",
+                  file=sys.stderr, flush=True)
+        except Exception as e:
+            print(f"[Proxy] apply failed: {e}", file=sys.stderr, flush=True)
+
+    @Slot(int, result=str)
+    def getBackendLogs(self, max_lines: int = 500) -> str:
+        """读取后端日志文件末尾若干行，用于应用内日志查看器。"""
+        from . import paths
+        try:
+            max_lines = int(max_lines) if max_lines else 500
+        except Exception:
+            max_lines = 500
+        max_lines = max(1, min(max_lines, 5000))
+        try:
+            lf = paths.log_file()
+            if not lf.exists():
+                return json.dumps({"ok": True, "lines": [], "path": str(lf),
+                                   "note": "log file not found"}, ensure_ascii=False)
+            with lf.open("r", encoding="utf-8", errors="replace") as f:
+                lines = f.readlines()
+            tail = [ln.rstrip("\n") for ln in lines[-max_lines:]]
+            return json.dumps({"ok": True, "lines": tail, "path": str(lf)},
+                              ensure_ascii=False)
+        except Exception as e:
+            return json.dumps({"ok": False, "error": str(e)}, ensure_ascii=False)

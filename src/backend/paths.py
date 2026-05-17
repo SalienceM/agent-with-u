@@ -37,3 +37,18 @@ def data_root() -> Path:
 def sub(*parts: str) -> Path:
     """data_root() 下的子路径，例如 sub('sessions')、sub('skill-images')。"""
     return data_root().joinpath(*parts)
+
+
+def log_file() -> Path:
+    """后端日志文件路径。
+
+    与 ws_main.setup_logging 保持一致：Windows 走 %APPDATA%/AgentWithU/logs，
+    其他平台走 ~/.agent-with-u/logs。刻意不受 AGENT_WITH_U_DATA_ROOT 影响。
+    """
+    import sys
+
+    if sys.platform == "win32":
+        base = Path(os.environ.get("APPDATA", Path.home())) / "AgentWithU"
+    else:
+        base = Path.home() / ".agent-with-u"
+    return base / "logs" / "backend.log"

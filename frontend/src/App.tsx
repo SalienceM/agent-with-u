@@ -10,6 +10,7 @@ import { PermissionGate } from './components/PermissionGate';
 import { ScratchPad } from './components/ScratchPad';
 import { AssetPanel } from './components/AssetPanel';
 import { ServerDirPicker } from './components/ServerDirPicker';
+import { LogViewer } from './components/LogViewer';
 import { useChat } from './hooks/useChat';
 import { useConfig } from './hooks/useConfig';
 import { themes } from './hooks/useConfig';
@@ -30,6 +31,7 @@ export const App: React.FC = () => {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [backendManagerOpen, setBackendManagerOpen] = useState(false);
   const [repoPanelOpen, setRepoPanelOpen] = useState(false);
+  const [logViewerOpen, setLogViewerOpen] = useState(false);
   const [repoPanelEditing, setRepoPanelEditing] = useState(false);
   const [newSessionDialogOpen, setNewSessionDialogOpen] = useState(false);
   const [skipPermissions, setSkipPermissions] = useState(true);  // ★ 权限模式开关
@@ -648,11 +650,28 @@ export const App: React.FC = () => {
             {formatBackendLabel(backends.find((b: any) => b.id === activeBackendId))}
           </span>
           <div style={{ flex: 1 }} />
+          {/* 代理开关：点击切换后端流量是否走代理 */}
+          <button
+            onClick={() => updateConfig({ proxyEnabled: !config.proxyEnabled })}
+            style={{
+              ...logBtnStyle,
+              background: config.proxyEnabled ? 'var(--theme-accent-bg)' : 'rgba(128,128,128,0.12)',
+              borderColor: config.proxyEnabled ? 'var(--theme-accent)' : 'var(--theme-border)',
+              color: config.proxyEnabled ? 'var(--theme-accent)' : 'var(--theme-text-muted)',
+            }}
+            title={
+              config.proxyHost
+                ? `代理 ${config.proxyEnabled ? '已启用' : '已停用'}：${config.proxyHost}:${config.proxyPort || ''}（点击切换，地址在设置中修改）`
+                : '未配置代理地址 — 请在设置中填写'
+            }
+          >
+            🌐 {config.proxyEnabled ? 'Proxy On' : 'Proxy Off'}
+          </button>
           {/* 日志查看器按钮 */}
           <button
-            onClick={() => api.openLogViewer()}
+            onClick={() => setLogViewerOpen(true)}
             style={logBtnStyle}
-            title="View real-time logs in external window"
+            title="View backend logs"
           >
             📋 Logs
           </button>
@@ -889,6 +908,9 @@ export const App: React.FC = () => {
         onExportData={handleExportData}
         onImportData={handleImportData}
       />
+
+      {/* ---- 后端日志查看器 ---- */}
+      <LogViewer isOpen={logViewerOpen} onClose={() => setLogViewerOpen(false)} />
 
       {/* ---- Backend Manager ---- */}
       <BackendManager

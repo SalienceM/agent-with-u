@@ -248,6 +248,7 @@ class BridgeWS:
         # ★ 如果检测到内置 claude CLI，注入到默认后端配置
         self._cli_path = cli_path
         self._app_config_store = AppConfigStore()
+        self._apply_proxy_from_config()
         self._backends: dict[str, ModelBackend] = {}
         stored = self._backend_store.list()
         if stored:
@@ -2697,9 +2698,45 @@ except urllib.error.URLError as e:
     def _rpc_setAppConfig(self, config_json: str) -> str:
         try:
             self._app_config_store.set_all(json.loads(config_json))
+            self._apply_proxy_from_config()
             return json.dumps({"status": "ok"}, ensure_ascii=False)
         except Exception as e:
             return json.dumps({"status": "error", "message": str(e)}, ensure_ascii=False)
+
+    def _apply_proxy_from_config(self):
+        """把 app 配置里的代理设置应用到进程环境变量。"""
+        try:
+            from .base import apply_proxy_env
+            cfg = self._app_config_store.get_all()
+            url = apply_proxy_env(
+                bool(cfg.get("proxyEnabled")),
+                str(cfg.get("proxyHost", "") or ""),
+                str(cfg.get("proxyPort", "") or ""),
+            )
+            print(f"[Proxy] {('enabled -> ' + url) if url else 'disabled'}",
+                  file=sys.stderr, flush=True)
+        except Exception as e:
+            print(f"[Proxy] apply failed: {e}", file=sys.stderr, flush=True)
+
+    def _rpc_getBackendLogs(self, max_lines: int = 500) -> str:
+        """读取后端日志文件末尾若干行，用于 CS 架构下的应用内日志查看器。"""
+        try:
+            max_lines = int(max_lines) if max_lines else 500
+        except Exception:
+            max_lines = 500
+        max_lines = max(1, min(max_lines, 5000))
+        try:
+            lf = paths.log_file()
+            if not lf.exists():
+                return json.dumps({"ok": True, "lines": [], "path": str(lf),
+                                   "note": "log file not found"}, ensure_ascii=False)
+            with lf.open("r", encoding="utf-8", errors="replace") as f:
+                lines = f.readlines()
+            tail = [ln.rstrip("\n") for ln in lines[-max_lines:]]
+            return json.dumps({"ok": True, "lines": tail, "path": str(lf)},
+                              ensure_ascii=False)
+        except Exception as e:
+            return json.dumps({"ok": False, "error": str(e)}, ensure_ascii=False)
 
     # ── RPC: Claude OAuth Token 获取（已移除，使用 claude login 替代）────────
     # 注：已移除 _rpc_startOAuthFlow，用户应使用 claude login 或 /login 命令登录

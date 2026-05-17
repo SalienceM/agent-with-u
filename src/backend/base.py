@@ -138,6 +138,49 @@ def apply_root_sandbox_env(env: dict) -> dict:
     return env
 
 
+_PROXY_ENV_KEYS = (
+    "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
+    "http_proxy", "https_proxy", "all_proxy",
+)
+_original_proxy_env: Optional[dict] = None
+
+
+def apply_proxy_env(enabled: bool, host: str = "", port: str = "") -> Optional[str]:
+    """根据用户配置设置/清除进程级代理环境变量。
+
+    启用时把代理 URL 写入 ``os.environ``——Claude CLI 子进程（继承 env）和
+    httpx（``urllib.request.getproxies()`` 读 env）都会因此走代理。
+    禁用时恢复进程启动时的原始代理变量。返回生效的代理 URL，禁用时返回 None。
+    """
+    global _original_proxy_env
+    if _original_proxy_env is None:
+        _original_proxy_env = {k: os.environ.get(k) for k in _PROXY_ENV_KEYS}
+
+    host = (host or "").strip()
+    port = str(port or "").strip()
+
+    if enabled and host:
+        if "://" in host:
+            url = host
+        else:
+            url = "http://" + host
+        # 仅当 host 自身未带端口时才补端口
+        authority = url.split("://", 1)[1]
+        if port and ":" not in authority:
+            url = f"{url}:{port}"
+        for k in _PROXY_ENV_KEYS:
+            os.environ[k] = url
+        return url
+
+    for k in _PROXY_ENV_KEYS:
+        orig = _original_proxy_env.get(k)
+        if orig is None:
+            os.environ.pop(k, None)
+        else:
+            os.environ[k] = orig
+    return None
+
+
 class StreamDelta:
     """
     A single streaming event pushed to the frontend.
