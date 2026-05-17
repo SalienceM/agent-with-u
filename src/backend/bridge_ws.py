@@ -546,18 +546,49 @@ class BridgeWS:
 
     _HTTP_API_PORT = 44322  # Backend Skill HTTP 回调端口（WebSocket 端口 + 1）
 
-    async def start_http_api(self):
-        """启动轻量 HTTP server，供 Backend Skill 的 curl 回调。"""
+    @staticmethod
+    def _is_loopback(ip: str) -> bool:
+        """判断来源 IP 是否本机回环。"""
+        if not ip:
+            return False
+        if ip in ("127.0.0.1", "::1", "localhost"):
+            return True
+        try:
+            import ipaddress
+            return ipaddress.ip_address(ip).is_loopback
+        except Exception:
+            return False
+
+    async def start_http_api(self, bind_host: str = "127.0.0.1"):
+        """启动轻量 HTTP server，供 Backend Skill 的 curl 回调与图片/素材服务。
+
+        bind_host 与 WebSocket 服务保持一致：CS 架构下反向代理可能与后端
+        不在同一网络命名空间（不同容器/主机），必须能连到该端口，否则
+        ``/api/skill-images/`` 会被反代报 502。出于安全，会触发 Skill 执行的
+        ``/api/skill-call`` 仍只接受 loopback 来源的请求（见 _route_http_api）。
+        """
         server = await asyncio.start_server(
-            self._handle_http_connection, "127.0.0.1", self._HTTP_API_PORT,
+            self._handle_http_connection, bind_host, self._HTTP_API_PORT,
         )
-        print(f"[bridge_ws] HTTP API server started on http://127.0.0.1:{self._HTTP_API_PORT}",
+        print(f"[bridge_ws] HTTP API server started on http://{bind_host}:{self._HTTP_API_PORT}",
               file=sys.stderr, flush=True)
         return server
 
     async def _handle_http_connection(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
-        """处理单个 HTTP 连接（极简 HTTP/1.1 解析）。"""
+        """处理单个 HTTP 连接（极简 HTTP/1.1 解析）。
+
+        无论解析/路由是否抛异常，都保证写回一个完整的 HTTP 响应——
+        否则反向代理只会看到连接被关闭，对外报不可调试的 502。
+        """
+        peer_ip = ""
+        method = path = "?"
+        status = 500
+        content_type = "text/plain; charset=utf-8"
+        resp_bytes = b"Internal Server Error"
         try:
+            peername = writer.get_extra_info("peername")
+            peer_ip = peername[0] if peername else ""
+
             # 读取请求行
             request_line = await asyncio.wait_for(reader.readline(), timeout=30)
             if not request_line:
@@ -585,52 +616,72 @@ class BridgeWS:
             if content_length > 0:
                 body = await asyncio.wait_for(reader.readexactly(content_length), timeout=120)
 
-            # 路由 — 返回 (status, content_type, body_bytes)
-            result = await self._route_http_api(method, path, body)
+            # 路由 — 返回 (status, content_type, body_bytes) 或 (status, text)
+            result = await self._route_http_api(method, path, body, peer_ip)
             if len(result) == 3:
                 status, content_type, resp_bytes = result
             else:
                 status, resp_text = result
                 content_type = "text/plain; charset=utf-8"
                 resp_bytes = resp_text.encode("utf-8")
+        except Exception as e:
+            print(f"[bridge_ws] HTTP API error (peer={peer_ip}, {method} {path}): {e}",
+                  file=sys.stderr, flush=True)
+            status = 500
+            content_type = "text/plain; charset=utf-8"
+            resp_bytes = f"Internal error: {e}".encode("utf-8")
 
-            # 发送响应
-            _REASON = {200: "OK", 400: "Bad Request", 404: "Not Found", 500: "Internal Server Error"}
+        # 发送响应（始终发送，便于反代/客户端拿到明确状态码）
+        try:
+            _REASON = {200: "OK", 400: "Bad Request", 403: "Forbidden",
+                       404: "Not Found", 500: "Internal Server Error"}
             response = (
                 f"HTTP/1.1 {status} {_REASON.get(status, 'OK')}\r\n"
                 f"Content-Type: {content_type}\r\n"
                 f"Content-Length: {len(resp_bytes)}\r\n"
                 f"Access-Control-Allow-Origin: *\r\n"
+                f"Cache-Control: no-cache\r\n"
                 f"Connection: close\r\n"
                 f"\r\n"
             ).encode("utf-8") + resp_bytes
             writer.write(response)
             await writer.drain()
         except Exception as e:
-            print(f"[bridge_ws] HTTP API error: {e}", file=sys.stderr, flush=True)
+            print(f"[bridge_ws] HTTP API write failed (peer={peer_ip}): {e}",
+                  file=sys.stderr, flush=True)
         finally:
-            writer.close()
+            try:
+                writer.close()
+            except Exception:
+                pass
+        print(f"[bridge_ws][http] {method} {path} -> {status} (peer={peer_ip})",
+              file=sys.stderr, flush=True)
 
-    async def _route_http_api(self, method: str, path: str, body: bytes) -> tuple[int, str]:
+    async def _route_http_api(self, method: str, path: str, body: bytes,
+                              peer_ip: str = "") -> tuple:
         """路由 HTTP 请求到对应处理函数。"""
         from urllib.parse import urlparse, parse_qs
 
         parsed = urlparse(path)
 
-        if parsed.path == "/api/skill-call" and method == "POST":
-            try:
-                payload = json.loads(body.decode("utf-8"))
-            except (json.JSONDecodeError, UnicodeDecodeError):
-                return 400, "Invalid JSON body"
-            return await self._handle_skill_call(payload)
-
-        if parsed.path == "/api/skill-call" and method == "GET":
-            params = parse_qs(parsed.query)
-            payload = {
-                "skill": (params.get("skill") or [""])[0],
-                "prompt": (params.get("prompt") or [""])[0],
-            }
-            return await self._handle_skill_call(payload)
+        if parsed.path == "/api/skill-call":
+            # ★ skill-call 会触发 Skill 执行，只允许本机回环来源（Agent 子进程的 curl）
+            if not self._is_loopback(peer_ip):
+                return 403, "Forbidden: /api/skill-call is local-only"
+            if method == "POST":
+                try:
+                    payload = json.loads(body.decode("utf-8"))
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    return 400, "Invalid JSON body"
+                return await self._handle_skill_call(payload)
+            if method == "GET":
+                params = parse_qs(parsed.query)
+                payload = {
+                    "skill": (params.get("skill") or [""])[0],
+                    "prompt": (params.get("prompt") or [""])[0],
+                }
+                return await self._handle_skill_call(payload)
+            return 400, "Unsupported method"
 
         # ★ 图片文件 HTTP 服务：/api/skill-images/<filename>
         if parsed.path.startswith("/api/skill-images/"):

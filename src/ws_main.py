@@ -329,8 +329,9 @@ async def main():
             ping_interval=30,             # 每 30 秒发送 ping
             ping_timeout=300,             # 允许 5 分钟无 pong（系统休眠/后台标签页节流）
         )
-        # ★ Backend Skill HTTP API（供 SKILL.md 通过 curl 回调）
-        http_server = await bridge.start_http_api()
+        # ★ Backend Skill HTTP API（供 SKILL.md 通过 curl 回调、图片/素材服务）
+        # 绑定地址与 WS 一致：反代与后端不同容器/主机时也能连到。
+        http_server = await bridge.start_http_api(args.bind)
     except OSError as e:
         logging.error(f"[ws_main] Cannot bind {args.bind}:{args.port} even after clearing old instance: {e}")
         sys.exit(1)
