@@ -26,16 +26,18 @@ services:
       # AGENT_WITH_U_TRUST_FORWARD_AUTH: "1"（要求每个请求都带 Remote-User 头）。
       AGENT_WITH_U_BIND: "0.0.0.0"        # 容器内绑 0.0.0.0，靠 docker 网络隔离
       AGENT_WITH_U_PORT: "44321"
-      AGENT_WITH_U_DATA_ROOT: "/data"
+      AGENT_WITH_U_DATA_ROOT: "/app/data"
       # 信任来自 docker 网络的连接（awu-web 容器）
       AGENT_WITH_U_TRUSTED_PROXIES: "172.16.0.0/12"
       # Claude 凭据（可选）：在此直接给，或起来后在应用内 Backend Manager
-      # 配置（配置会持久化进 awu-data 卷）。
+      # 配置（配置会持久化进下面 bind-mount 的宿主目录）。
       # ANTHROPIC_BASE_URL: "https://api.anthropic.com"
       # ANTHROPIC_AUTH_TOKEN: "sk-..."
 
     volumes:
-      - awu-data:/data                   # sessions / skills / asset-pool / backends
+      # 数据目录 bind-mount 到宿主：sessions / skills / asset-pool / backends
+      # 都落在 NAS 上，容器重建不丢数据。宿主目录不存在时 Docker 会自动创建。
+      - /volume1/docker/agent-with-u/data:/app/data
       # 可选：挂载宿主上已有的 Claude 配置目录。
       # 宿主必须确实存在该目录，否则容器起不来。按需取消注释并改成真实路径：
       # - /volume1/docker/agent-with-u/claude-config:/root/.claude:ro
@@ -65,9 +67,6 @@ services:
 
     networks:
       - awu-internal      # 访问 awu-backend
-
-volumes:
-  awu-data:
 
 networks:
   awu-internal:

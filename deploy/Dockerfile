@@ -25,9 +25,9 @@ RUN pip install --no-cache-dir --upgrade pip \
 COPY src ./src
 COPY skills ./skills
 
-# 数据目录（compose 里挂 volume 到这里）
-ENV AGENT_WITH_U_DATA_ROOT=/data
-RUN mkdir -p /data
+# 数据目录（compose 里把宿主目录 bind-mount 到这里）
+ENV AGENT_WITH_U_DATA_ROOT=/app/data
+RUN mkdir -p /app/data
 
 EXPOSE 44321 44322
 
