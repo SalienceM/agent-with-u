@@ -27,10 +27,11 @@ interface Props {
   completedSessions?: Set<string>;  // ★ 后台完成待查看的 session
   collapsed?: boolean;
   onToggleCollapse?: () => void;
+  isMobile?: boolean;
 }
 
 // ★ Wrap with React.memo to prevent unnecessary re-renders when parent updates
-export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession, onNewSession, onDeleteSession, onAcknowledgeSession, streamingSessions, completedSessions = new Set(), collapsed, onToggleCollapse }) => {
+export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession, onNewSession, onDeleteSession, onAcknowledgeSession, streamingSessions, completedSessions = new Set(), collapsed, onToggleCollapse, isMobile }) => {
   const [sessions, setSessions] = useState<Session[]>([]);
   const [backends, setBackends] = useState<Backend[]>([]);
   const [hoveredSessionId, setHoveredSessionId] = useState<string | null>(null);
@@ -218,6 +219,11 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
 
   const pendingCount = completedSessions.size;
 
+  // ★ 移动端折叠：完全隐藏，由顶栏的 ☰ 按钮负责唤出抽屉
+  if (collapsed && isMobile) {
+    return null;
+  }
+
   // ★ 折叠状态：只显示窄条 + 展开按钮，有未确认通知时显示角标
   if (collapsed) {
     return (
@@ -256,7 +262,7 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
   }
 
   return (
-    <div style={sidebarStyle}>
+    <div style={isMobile ? mobileSidebarStyle : sidebarStyle}>
       <style>{`
         @keyframes pulse {
           0%, 100% { opacity: 1; transform: scale(1); }
@@ -727,7 +733,8 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
   return prevProps.activeSessionId === nextProps.activeSessionId
     && prevProps.streamingSessions === nextProps.streamingSessions
     && prevProps.completedSessions === nextProps.completedSessions
-    && prevProps.collapsed === nextProps.collapsed;
+    && prevProps.collapsed === nextProps.collapsed
+    && prevProps.isMobile === nextProps.isMobile;
 });
 
 // Simple color mapping for backend badges
@@ -748,6 +755,21 @@ const sidebarStyle: React.CSSProperties = {
   background: 'var(--theme-sidebar-bg, #f6f8fa)',
   flexShrink: 0,
   transition: 'width 0.2s ease',
+};
+
+// ★ 移动端：侧栏改为覆盖式抽屉，不挤占聊天区
+const mobileSidebarStyle: React.CSSProperties = {
+  position: 'fixed',
+  top: 0,
+  bottom: 0,
+  left: 0,
+  width: 'min(280px, 85vw)',
+  zIndex: 1100,
+  borderRight: '1px solid var(--theme-border, rgba(0,0,0,0.12))',
+  display: 'flex',
+  flexDirection: 'column',
+  background: 'var(--theme-sidebar-bg, #f6f8fa)',
+  boxShadow: '2px 0 16px rgba(0,0,0,0.35)',
 };
 
 const collapsedSidebarStyle: React.CSSProperties = {

@@ -15,6 +15,7 @@ import { AuthStatusBanner } from './components/AuthStatusBanner';
 import { useChat } from './hooks/useChat';
 import { useConfig } from './hooks/useConfig';
 import { themes } from './hooks/useConfig';
+import { useIsMobile } from './hooks/useIsMobile';
 import { messagesToMarkdown, messagesToJson } from './utils/markdown';
 import { hljsLightCss, hljsDarkCss } from './utils/hljsThemes';
 
@@ -49,7 +50,9 @@ export const App: React.FC = () => {
   const [toast, setToast] = useState<{ type: 'success' | 'error' | 'info'; message: string } | null>(null);
   const [isImporting, setIsImporting] = useState(false);
   const [dataPicker, setDataPicker] = useState<'export' | 'import' | null>(null);
-  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(
+    () => typeof window !== 'undefined' && window.innerWidth <= 768,
+  );
   const [scratchPadOpen, setScratchPadOpen] = useState(false);
   const [scratchPadWidth, setScratchPadWidth] = useState(360);
   const [assetPanelOpen, setAssetPanelOpen] = useState(false);
@@ -68,6 +71,7 @@ export const App: React.FC = () => {
   const initialCheckDoneRef = useRef(false);          // ★ 防止 NewSessionDialog 重复弹出
 
   const { config, updateConfig, resetConfig, reloadConfig } = useConfig();
+  const isMobile = useIsMobile();
 
   const showToast = useCallback((type: 'success' | 'error' | 'info', message: string, durationMs = 4000) => {
     setToast({ type, message });
@@ -507,7 +511,7 @@ export const App: React.FC = () => {
   }
 
   return (
-    <div style={{
+    <div className="app-root" style={{
       ...rootStyle,
       background: hasBg ? 'transparent' : theme.bg,
       color: theme.text,
@@ -542,6 +546,9 @@ export const App: React.FC = () => {
       <style>{hljsCss}</style>
       {/* ★ Markdown 内容样式 + 全局动画 */}
       <style>{`
+        /* 移动端用 dvh，规避浏览器地址栏让 100vh 把底部输入框顶出可视区；
+           不支持 dvh 的旧 webview 回退到 100vh。inline style 已不设 height。 */
+        .app-root { height: 100vh; height: 100dvh; }
         @keyframes dialogSlideIn {
           from { opacity: 0; transform: perspective(900px) rotateX(-14deg) scale(0.96) translateY(-8px); }
           to   { opacity: 1; transform: perspective(900px) rotateX(0deg)   scale(1)    translateY(0); }
@@ -596,12 +603,32 @@ export const App: React.FC = () => {
         .md-table tr:nth-child(even) td { background: var(--theme-bg-secondary); }
         /* 任务列表 */
         .md-content li input[type="checkbox"] { margin-right: 6px; vertical-align: middle; }
+        /* ── 移动端适配 ── */
+        @media (max-width: 768px) {
+          .message-bubble-wrapper { max-width: 94% !important; }
+          .md-content pre.md-pre { padding: 10px 12px; font-size: 12px; }
+          .md-table th, .md-table td { padding: 4px 8px; }
+        }
       `}</style>
 
+      {/* ★ 移动端侧栏抽屉的半透明遮罩 */}
+      {isMobile && !sidebarCollapsed && (
+        <div
+          onClick={() => setSidebarCollapsed(true)}
+          style={{
+            position: 'fixed', inset: 0, zIndex: 1050,
+            background: 'rgba(0,0,0,0.45)',
+          }}
+        />
+      )}
+
       <Sidebar
+        isMobile={isMobile}
         activeSessionId={activeSessionId}
         onSelectSession={(id) => {
           setActiveSessionId(id);
+          // ★ 移动端：选中会话后自动收起抽屉
+          if (isMobile) setSidebarCollapsed(true);
           // ★ 切换到该 session 即视为已查看，自动清除完成通知气泡
           setCompletedSessions((prev) => {
             if (!prev.has(id)) return prev;
@@ -630,7 +657,17 @@ export const App: React.FC = () => {
 
       <div style={{ flex: 1, display: 'flex', flexDirection: 'column', minWidth: 0 }}>
         {/* ---- 顶部栏 ---- */}
-        <div style={headerStyle}>
+        <div style={isMobile ? { ...headerStyle, padding: '8px 10px', gap: 6, flexWrap: 'wrap' } : headerStyle}>
+          {/* ★ 移动端：唤出侧栏抽屉的汉堡按钮 */}
+          {isMobile && (
+            <button
+              onClick={() => setSidebarCollapsed(false)}
+              style={{ ...settingsBtnStyle, fontSize: 20 }}
+              title="会话列表"
+            >
+              ☰
+            </button>
+          )}
           <span style={{ fontSize: 15, fontWeight: 600, color: 'var(--theme-text, #1f2328)' }}>AgentWithU</span>
           {/* ★ Backend connection indicator */}
           {backendConnected === false && (
@@ -645,11 +682,13 @@ export const App: React.FC = () => {
               ⚠ backend offline
             </span>
           )}
-          {/* ★ 显示当前工作目录 — 点击复制完整路径 */}
-          <CopyablePath path={activeSession?.workingDir} />
-          <span style={{ fontSize: 12, color: 'var(--theme-text-muted, #656d76)' }}>
-            {formatBackendLabel(backends.find((b: any) => b.id === activeBackendId))}
-          </span>
+          {/* ★ 工作目录与后端标签在移动端隐藏，给按钮腾空间 */}
+          {!isMobile && <CopyablePath path={activeSession?.workingDir} />}
+          {!isMobile && (
+            <span style={{ fontSize: 12, color: 'var(--theme-text-muted, #656d76)' }}>
+              {formatBackendLabel(backends.find((b: any) => b.id === activeBackendId))}
+            </span>
+          )}
           <div style={{ flex: 1 }} />
           {/* 代理开关：点击切换后端流量是否走代理 */}
           <button
@@ -666,7 +705,7 @@ export const App: React.FC = () => {
                 : '未配置代理地址 — 请在设置中填写'
             }
           >
-            🌐 {config.proxyEnabled ? 'Proxy On' : 'Proxy Off'}
+            🌐{isMobile ? '' : ` ${config.proxyEnabled ? 'Proxy On' : 'Proxy Off'}`}
           </button>
           {/* 日志查看器按钮 */}
           <button
@@ -674,7 +713,7 @@ export const App: React.FC = () => {
             style={logBtnStyle}
             title="View backend logs"
           >
-            📋 Logs
+            📋{isMobile ? '' : ' Logs'}
           </button>
           <button
             onClick={() => setRepoPanelOpen(!repoPanelOpen)}
@@ -863,38 +902,50 @@ export const App: React.FC = () => {
         />
       </div>
 
-      {/* ---- 便签本：右侧列（共屏）---- */}
+      {/* ---- 便签本：桌面端右侧列 / 移动端全屏覆盖 ---- */}
       {scratchPadOpen && (
-        <>
-          {/* 拖动分割线 */}
-          <div
-            onMouseDown={handleScratchDragStart}
-            style={{
-              width: 4, flexShrink: 0, cursor: 'col-resize',
-              background: 'var(--theme-border, rgba(255,255,255,0.1))',
-              transition: 'background 0.15s',
-            }}
-            onMouseEnter={e => (e.currentTarget.style.background = 'var(--theme-accent, #7aa2f7)')}
-            onMouseLeave={e => (e.currentTarget.style.background = 'var(--theme-border, rgba(255,255,255,0.1))')}
-          />
-          {/* 便签本面板 */}
-          <div style={{ width: scratchPadWidth, flexShrink: 0, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
+        isMobile ? (
+          <div style={mobilePanelOverlayStyle}>
             <ScratchPad visible={true} onClose={() => setScratchPadOpen(false)} />
           </div>
-        </>
+        ) : (
+          <>
+            {/* 拖动分割线 */}
+            <div
+              onMouseDown={handleScratchDragStart}
+              style={{
+                width: 4, flexShrink: 0, cursor: 'col-resize',
+                background: 'var(--theme-border, rgba(255,255,255,0.1))',
+                transition: 'background 0.15s',
+              }}
+              onMouseEnter={e => (e.currentTarget.style.background = 'var(--theme-accent, #7aa2f7)')}
+              onMouseLeave={e => (e.currentTarget.style.background = 'var(--theme-border, rgba(255,255,255,0.1))')}
+            />
+            {/* 便签本面板 */}
+            <div style={{ width: scratchPadWidth, flexShrink: 0, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
+              <ScratchPad visible={true} onClose={() => setScratchPadOpen(false)} />
+            </div>
+          </>
+        )
       )}
 
-      {/* ---- 素材池：右侧列（共屏）---- */}
+      {/* ---- 素材池：桌面端右侧列 / 移动端全屏覆盖 ---- */}
       {assetPanelOpen && (
-        <>
-          <div style={{
-            width: 4, flexShrink: 0,
-            background: 'var(--theme-border, rgba(255,255,255,0.1))',
-          }} />
-          <div style={{ width: 320, flexShrink: 0, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
+        isMobile ? (
+          <div style={mobilePanelOverlayStyle}>
             <AssetPanel visible={true} onClose={() => setAssetPanelOpen(false)} />
           </div>
-        </>
+        ) : (
+          <>
+            <div style={{
+              width: 4, flexShrink: 0,
+              background: 'var(--theme-border, rgba(255,255,255,0.1))',
+            }} />
+            <div style={{ width: 320, flexShrink: 0, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
+              <AssetPanel visible={true} onClose={() => setAssetPanelOpen(false)} />
+            </div>
+          </>
+        )
       )}
 
       {/* ---- Settings 弹窗 ---- */}
@@ -1018,10 +1069,20 @@ export const App: React.FC = () => {
 /* ---- 根样式 ---- */
 const rootStyle: React.CSSProperties = {
   display: 'flex',
-  height: '100vh',
   background: 'var(--theme-bg, #ffffff)',
   color: 'var(--theme-text, #1f2328)',
   fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif',
+};
+
+// ★ 移动端：便签本/素材池改为全屏覆盖，不挤占聊天区
+const mobilePanelOverlayStyle: React.CSSProperties = {
+  position: 'fixed',
+  inset: 0,
+  zIndex: 900,
+  display: 'flex',
+  flexDirection: 'column',
+  overflow: 'hidden',
+  background: 'var(--theme-bg, #ffffff)',
 };
 
 const headerStyle: React.CSSProperties = {
