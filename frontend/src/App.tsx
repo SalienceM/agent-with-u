@@ -11,6 +11,7 @@ import { ScratchPad } from './components/ScratchPad';
 import { AssetPanel } from './components/AssetPanel';
 import { ServerDirPicker } from './components/ServerDirPicker';
 import { LogViewer } from './components/LogViewer';
+import { AuthStatusBanner } from './components/AuthStatusBanner';
 import { useChat } from './hooks/useChat';
 import { useConfig } from './hooks/useConfig';
 import { themes } from './hooks/useConfig';
@@ -704,6 +705,9 @@ export const App: React.FC = () => {
             ⚙
           </button>
         </div>
+
+        {/* ---- Claude 登录状态提示 ---- */}
+        <AuthStatusBanner activeBackend={backends.find((b: any) => b.id === activeBackendId) || null} />
 
         {/* ---- Repo 面板（展开区域）---- */}
         <div style={{

@@ -181,6 +181,45 @@ def apply_proxy_env(enabled: bool, host: str = "", port: str = "") -> Optional[s
     return None
 
 
+def get_claude_auth_status() -> dict:
+    """检查 Claude CLI（claude login）的登录状态。
+
+    先看 ``~/.claude/.credentials.json`` 里的 OAuth token 是否存在/过期，
+    再退而求其次看进程环境里是否有 API key。返回结构供前端展示登录引导。
+    """
+    import time as _time
+
+    cred_path = Path.home() / ".claude" / ".credentials.json"
+    result = {
+        "loggedIn": False,
+        "method": "none",
+        "expiresAt": None,
+        "expired": False,
+        "credentialsPath": str(cred_path),
+    }
+    try:
+        if cred_path.exists():
+            data = json.loads(cred_path.read_text(encoding="utf-8"))
+            oauth = data.get("claudeAiOauth") or {}
+            token = oauth.get("accessToken")
+            expires_at = oauth.get("expiresAt")
+            if token:
+                result["method"] = "oauth"
+                result["expiresAt"] = expires_at
+                if expires_at and _time.time() * 1000 >= float(expires_at):
+                    result["expired"] = True
+                else:
+                    result["loggedIn"] = True
+                return result
+    except Exception as e:
+        print(f"[AuthStatus] read credentials failed: {e}", file=sys.stderr, flush=True)
+
+    if os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_AUTH_TOKEN"):
+        result["method"] = "apiKey"
+        result["loggedIn"] = True
+    return result
+
+
 class StreamDelta:
     """
     A single streaming event pushed to the frontend.

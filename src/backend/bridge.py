@@ -1083,6 +1083,12 @@ class Bridge(QObject):
         except Exception as e:
             print(f"[Proxy] apply failed: {e}", file=sys.stderr, flush=True)
 
+    @Slot(result=str)
+    def getAuthStatus(self) -> str:
+        """返回 Claude CLI 登录状态，供前端展示登录引导。"""
+        from .base import get_claude_auth_status
+        return json.dumps(get_claude_auth_status(), ensure_ascii=False)
+
     @Slot(int, result=str)
     def getBackendLogs(self, max_lines: int = 500) -> str:
         """读取后端日志文件末尾若干行，用于应用内日志查看器。"""

@@ -803,6 +803,29 @@ export const api = {
     }
   },
 
+  /** 查询 Claude CLI 登录状态（OAuth 凭证 / API key） */
+  async getAuthStatus(): Promise<{
+    loggedIn: boolean;
+    method: 'oauth' | 'apiKey' | 'none';
+    expiresAt: number | null;
+    expired: boolean;
+    credentialsPath: string;
+  }> {
+    const r = await call('getAuthStatus');
+    try {
+      const d = typeof r === 'string' ? JSON.parse(r) : r;
+      return {
+        loggedIn: !!d?.loggedIn,
+        method: d?.method || 'none',
+        expiresAt: d?.expiresAt ?? null,
+        expired: !!d?.expired,
+        credentialsPath: d?.credentialsPath || '',
+      };
+    } catch {
+      return { loggedIn: false, method: 'none', expiresAt: null, expired: false, credentialsPath: '' };
+    }
+  },
+
   /** 读取后端日志末尾若干行（适用于 CS / WebSocket 架构的应用内日志查看器） */
   async getBackendLogs(maxLines = 500): Promise<{ ok: boolean; lines: string[]; path?: string; error?: string }> {
     const r = await call('getBackendLogs', maxLines);
@@ -827,6 +850,8 @@ let mockAppConfig: any = { fontSize: 14, renderMarkdown: true, exportFormat: 'ma
 function mockDispatch(method: string, params: any[]): any {
   switch (method) {
     case 'readClipboardImage': return 'null';
+    case 'getAuthStatus':
+      return JSON.stringify({ loggedIn: false, method: 'none', expiresAt: null, expired: false, credentialsPath: '' });
     case 'getBackendLogs':
       return JSON.stringify({ ok: true, lines: ['[mock] backend not connected — run: python -m src.ws_main'] });
     case 'getAppConfig': return JSON.stringify(mockAppConfig);
