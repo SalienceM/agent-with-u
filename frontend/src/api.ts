@@ -1,19 +1,11 @@
 /**
- * api.ts: Bridge between React and Python backend.
+ * api.ts: Bridge between React and the Python backend over WebSocket.
  *
- * Supports two modes:
- * - WebSocket mode (Tauri): Python backend runs as WebSocket server
- * - QWebChannel mode (Qt): Qt host exposes Python objects via QWebChannel
- *
- * Protocol (WebSocket):
+ * Protocol:
  *   Client → Server: {"id": "r1", "method": "listSessions", "params": [...]}
  *   Server → Client: {"id": "r1", "result": "..."}           // response
  *   Server → Client: {"event": "streamDelta",    "data": "..."} // push
  *   Server → Client: {"event": "sessionUpdated", "data": "..."} // push
- *
- * Protocol (QWebChannel):
- *   Client calls: bridge.methodName(...params)
- *   Server responds via Slot decorator return value
  */
 
 type StreamDeltaCallback = (delta: any) => void;
@@ -37,24 +29,6 @@ export interface SkillInfo {
   type?: string;
   inputSchema?: Record<string, any>;
 }
-
-// QWebChannel support for Qt mode
-let bridge: any = null;
-let useQWebChannel = false;
-
-// Check if QWebChannel is available (Qt mode)
-function initQWebChannel() {
-  if (typeof QWebChannel !== 'undefined') {
-    new QWebChannel((channel: any) => {
-      bridge = channel.objects.bridge;
-      useQWebChannel = true;
-      console.log('[api] Using QWebChannel mode');
-    });
-  }
-}
-
-// Initialize QWebChannel immediately (if available)
-initQWebChannel();
 
 const WS_PORT_DEFAULT = 44321;
 const WS_CONNECT_TIMEOUT_MS = 3000;
@@ -363,6 +337,27 @@ export async function setConnectionTarget(t: ConnectionTarget): Promise<void> {
   doConnect(wsUrl);
 }
 
+// ── 桌面端本机角色（仅 Tauri）：执行节点 / 纯客户端 ──────────────────────
+// executor：本机运行执行节点 sidecar，可选发布到中继。
+// client：  只作 UI，不在本机运行执行节点，经中继连接其它执行节点。
+// 由 Rust 在启动时读取（决定是否 spawn sidecar），改动需重启应用生效。
+export interface DesktopConfig {
+  mode: 'executor' | 'client';
+  relayUrl: string;
+  relayToken: string;
+  deviceName: string;
+}
+
+export async function getDesktopConfig(): Promise<DesktopConfig | null> {
+  if (!isTauri()) return null;
+  return tauriInvoke<DesktopConfig>('get_desktop_config');
+}
+
+export async function setDesktopConfig(config: DesktopConfig): Promise<void> {
+  if (!isTauri()) return;
+  await tauriInvoke('set_desktop_config', { config });
+}
+
 wsReady = (async () => {
   wsUrl = await getWsUrl();
   await new Promise<void>((resolve) => {
@@ -380,19 +375,6 @@ wsReady = (async () => {
 // ── RPC 调用 ─────────────────────────────────────────────────
 
 async function call(method: string, ...params: any[]): Promise<any> {
-  // QWebChannel mode (Qt) - direct method call
-  if (useQWebChannel && bridge && bridge[method]) {
-    try {
-      const result = bridge[method](...params);
-      console.log(`[api] ${method} (QWebChannel) ->`, result);
-      return result;
-    } catch (e: any) {
-      console.error(`[api] ${method} QWebChannel call failed:`, e);
-      return null;
-    }
-  }
-
-  // WebSocket mode
   await wsReady;
   if (useMock || !ws || ws.readyState !== WebSocket.OPEN) {
     const mockResult = mockDispatch(method, params);
@@ -417,17 +399,6 @@ async function call(method: string, ...params: any[]): Promise<any> {
 }
 
 async function send(method: string, ...params: any[]): Promise<void> {
-  // QWebChannel mode - no async send, just call
-  if (useQWebChannel && bridge && bridge[method]) {
-    try {
-      bridge[method](...params);
-    } catch (e: any) {
-      console.error(`[api] ${method} QWebChannel send failed:`, e);
-    }
-    return;
-  }
-
-  // WebSocket mode
   await wsReady;
   if (useMock || !ws || ws.readyState !== WebSocket.OPEN) {
     mockDispatch(method, params);
@@ -932,7 +903,7 @@ export const api = {
     }
   },
 
-  /** 按文件名取 skill 生成图片（走数据通道，本地/中继/QWebChannel 通用） */
+  /** 按文件名取 skill 生成图片（走数据通道，本地/中继通用） */
   async getSkillImage(filename: string): Promise<{ ok: boolean; mime?: string; base64?: string; error?: string }> {
     const r = await call('getSkillImage', filename);
     try {

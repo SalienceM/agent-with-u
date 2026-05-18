@@ -16,5 +16,4 @@ dev = [
 ]
 
 [project.scripts]
-agent-with-u = "src.main:main"
 agent-with-u-server = "src.ws_main:main"

@@ -1,5 +1,8 @@
-import React, { useCallback, useState } from 'react';
-import { getConnectionTarget, setConnectionTarget, listRelayDevices } from '../api';
+import React, { useCallback, useEffect, useState } from 'react';
+import {
+  getConnectionTarget, setConnectionTarget, listRelayDevices,
+  isTauri, getDesktopConfig, setDesktopConfig, type DesktopConfig,
+} from '../api';
 
 interface ConnectionPanelProps {
   onClose: () => void;
@@ -18,6 +21,27 @@ export const ConnectionPanel: React.FC<ConnectionPanelProps> = ({ onClose }) => 
   const [devices, setDevices] = useState<{ id: string; name: string }[]>([]);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState('');
+
+  // 桌面端本机角色（仅 Tauri）：执行节点 / 纯客户端，改动需重启生效。
+  const tauri = isTauri();
+  const [role, setRole] = useState<'executor' | 'client'>('executor');
+  const [pubUrl, setPubUrl] = useState('');
+  const [pubToken, setPubToken] = useState('');
+  const [pubDeviceName, setPubDeviceName] = useState('');
+  const [savedDesktop, setSavedDesktop] = useState<DesktopConfig | null>(null);
+  const [restartHint, setRestartHint] = useState(false);
+
+  useEffect(() => {
+    if (!tauri) return;
+    getDesktopConfig().then((c) => {
+      if (!c) return;
+      setSavedDesktop(c);
+      setRole(c.mode === 'client' ? 'client' : 'executor');
+      setPubUrl(c.relayUrl || '');
+      setPubToken(c.relayToken || '');
+      setPubDeviceName(c.deviceName || '');
+    });
+  }, [tauri]);
 
   const handleRefresh = useCallback(async () => {
     if (!url.trim()) { setErr('请先填写中继地址'); return; }
@@ -40,23 +64,44 @@ export const ConnectionPanel: React.FC<ConnectionPanelProps> = ({ onClose }) => 
   }, [url, token, deviceId]);
 
   const handleSave = useCallback(async () => {
+    // 1. 持久化桌面端本机角色（仅 Tauri）。改动需重启应用生效。
+    let needRestart = false;
+    if (tauri) {
+      const next: DesktopConfig = {
+        mode: role,
+        relayUrl: pubUrl.trim(),
+        relayToken: pubToken.trim(),
+        deviceName: pubDeviceName.trim(),
+      };
+      needRestart = !savedDesktop
+        || savedDesktop.mode !== next.mode
+        || savedDesktop.relayUrl !== next.relayUrl
+        || savedDesktop.relayToken !== next.relayToken
+        || savedDesktop.deviceName !== next.deviceName;
+      if (needRestart) {
+        await setDesktopConfig(next);
+        setSavedDesktop(next);
+      }
+    }
+    // 2. 持久化当前 UI 的连接目标。
     if (mode === 'local') {
       await setConnectionTarget({ mode: 'local' });
-      onClose();
-      return;
+    } else {
+      if (!url.trim()) { setErr('请填写中继地址'); return; }
+      if (!deviceId) { setErr('请选择一个执行节点'); return; }
+      const dev = devices.find((d) => d.id === deviceId);
+      await setConnectionTarget({
+        mode: 'relay',
+        url: url.trim(),
+        token: token.trim(),
+        deviceId,
+        deviceName: dev?.name,
+      });
     }
-    if (!url.trim()) { setErr('请填写中继地址'); return; }
-    if (!deviceId) { setErr('请选择一个执行节点'); return; }
-    const dev = devices.find((d) => d.id === deviceId);
-    await setConnectionTarget({
-      mode: 'relay',
-      url: url.trim(),
-      token: token.trim(),
-      deviceId,
-      deviceName: dev?.name,
-    });
-    onClose();
-  }, [mode, url, token, deviceId, devices, onClose]);
+    if (needRestart) setRestartHint(true);
+    else onClose();
+  }, [tauri, role, pubUrl, pubToken, pubDeviceName, savedDesktop,
+      mode, url, token, deviceId, devices, onClose]);
 
   return (
     <div style={overlayStyle} onClick={onClose}>
@@ -72,6 +117,65 @@ export const ConnectionPanel: React.FC<ConnectionPanelProps> = ({ onClose }) => 
         <p style={{ fontSize: 12, color: 'var(--theme-text-muted)', margin: '0 0 14px' }}>
           真实执行永远在执行节点上。这里只决定当前 UI 连到哪个节点。
         </p>
+
+        {/* 本机角色（仅桌面端）：执行节点 / 纯客户端 */}
+        {tauri && (
+          <div style={{
+            marginBottom: 16, paddingBottom: 14,
+            borderBottom: '1px solid var(--theme-border)',
+          }}>
+            <label style={labelStyle}>本机角色（桌面端，重启生效）</label>
+            <div style={{ display: 'flex', gap: 8, margin: '6px 0 8px' }}>
+              {(['executor', 'client'] as const).map((r) => (
+                <button
+                  key={r}
+                  onClick={() => setRole(r)}
+                  style={{
+                    ...modeBtnStyle,
+                    background: role === r ? 'var(--theme-accent-bg)' : 'transparent',
+                    borderColor: role === r ? 'var(--theme-accent)' : 'var(--theme-border)',
+                    color: role === r ? 'var(--theme-accent)' : 'var(--theme-text-muted)',
+                  }}
+                >
+                  {r === 'executor' ? '🖥️ 执行节点' : '📱 纯客户端'}
+                </button>
+              ))}
+            </div>
+            {role === 'executor' && (
+              <div style={{ fontSize: 12, color: 'var(--theme-text-muted)', lineHeight: 1.6 }}>
+                本机运行执行节点。填写中继可让远程 UI 经中继访问本机；留空则仅本地 / 局域网可用。
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 8, marginTop: 8 }}>
+                  <input
+                    type="text"
+                    value={pubUrl}
+                    placeholder="中继地址 wss://relay.example.com（可选）"
+                    onChange={(e) => setPubUrl(e.target.value)}
+                    style={inputStyle}
+                  />
+                  <input
+                    type="password"
+                    value={pubToken}
+                    placeholder="中继 Token（可选）"
+                    onChange={(e) => setPubToken(e.target.value)}
+                    style={inputStyle}
+                  />
+                  <input
+                    type="text"
+                    value={pubDeviceName}
+                    placeholder="本机显示名（远程设备列表里显示）"
+                    onChange={(e) => setPubDeviceName(e.target.value)}
+                    style={inputStyle}
+                  />
+                </div>
+              </div>
+            )}
+            {role === 'client' && (
+              <div style={{ fontSize: 12, color: 'var(--theme-text-muted)', lineHeight: 1.6 }}>
+                本应用只作 UI，不在本机运行执行节点。请在下方选择「远程(经中继)」连接到其它执行节点。
+              </div>
+            )}
+          </div>
+        )}
 
         {/* 模式选择 */}
         <div style={{ display: 'flex', gap: 8, marginBottom: 14 }}>
@@ -151,6 +255,12 @@ export const ConnectionPanel: React.FC<ConnectionPanelProps> = ({ onClose }) => 
         {err && (
           <div style={{ marginTop: 10, fontSize: 12, color: 'var(--theme-error, #f85149)' }}>
             {err}
+          </div>
+        )}
+
+        {restartHint && (
+          <div style={{ marginTop: 10, fontSize: 12, color: 'var(--theme-accent)' }}>
+            本机角色已保存，重启应用后生效。
           </div>
         )}
 

@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-AgentWithU is an enhanced Claude Code frontend application built with PySide6 and React. It provides a rich GUI for interacting with Claude AI, featuring clipboard image paste support, multi-model switching, session management, and streaming responses.
+AgentWithU is an enhanced Claude Code frontend application built with a Python WebSocket backend and a React frontend, shipped either as a Tauri desktop app or a self-hosted web service. It provides a rich GUI for interacting with Claude AI, featuring clipboard image paste support, multi-model switching, session management, and streaming responses.
 
 **Key Features:**
 - Clipboard image paste (solves Snipaste integration pain point)
@@ -16,9 +16,7 @@ AgentWithU is an enhanced Claude Code frontend application built with PySide6 an
 
 ### Backend (Python)
 - **Python 3.10+**
-- **PySide6 6.6+** - Qt6 bindings for Python, hosts QWebEngine
-- **QWebEngine** - Chromium-based browser widget for React frontend
-- **QWebChannel** - IPC bridge between Python and JavaScript
+- **websockets 13+** - WebSocket server; the IPC channel between Python and the frontend
 - **claude-agent-sdk 0.1+** - Official Claude Agent SDK
 - **httpx 0.27+** - Async HTTP client for OpenAI-compatible APIs
 - **Pillow 10+** - Image processing for clipboard handling
@@ -39,24 +37,27 @@ D:\claude-view-tool\
 ├── pyproject.toml            # Python package configuration
 ├── requirements.txt          # Python dependencies
 ├── src/
-│   ├── main.py               # Entry point: Qt app + asyncio event loop
+│   ├── ws_main.py            # Entry point: WebSocket backend server (executor node)
+│   ├── relay_server.py       # Standalone relay server S (C–C/S architecture)
 │   ├── types.py              # Shared type definitions and dataclasses
-│   ├── backend/
-│   │   ├── bridge.py         # QWebChannel Bridge (core IPC layer)
-│   │   ├── backends.py       # ModelBackend interface + implementations
-│   │   ├── clipboard.py      # QClipboard image handling
-│   │   └── session_store.py  # JSON file session persistence
-│   └── gui/
-│       └── main_window.py    # PySide6 MainWindow + QWebEngine setup
+│   └── backend/
+│       ├── bridge_ws.py      # WebSocket bridge (core IPC layer, Qt-free)
+│       ├── relay.py          # Relay link: executor dials out to relay S
+│       ├── backends.py       # ModelBackend interface + implementations
+│       ├── clipboard.py      # Clipboard image handling
+│       ├── paths.py          # Data directory single source of truth
+│       └── session_store.py  # JSON file session persistence
+├── src-tauri/                # Tauri desktop client (Rust shell + webview)
+│   └── src/lib.rs            # Spawns backend sidecar; desktop role config
 └── frontend/
-    ├── index.html            # Entry HTML with QWebChannel bridge script
+    ├── index.html            # Entry HTML
     ├── package.json          # Node.js dependencies
     ├── vite.config.ts        # Vite configuration
     ├── tsconfig.json         # TypeScript configuration
     └── src/
         ├── main.tsx          # React entry point
         ├── App.tsx           # Root component
-        ├── api.ts            # QWebChannel → Python bridge wrapper
+        ├── api.ts            # WebSocket → Python bridge wrapper
         ├── components/
         │   ├── ChatInput.tsx     # Input area + image paste + model switcher
         │   ├── ImagePreview.tsx  # Clipboard image thumbnail preview
@@ -90,8 +91,11 @@ npm install
 cd frontend
 npm run dev
 
-# Terminal 2: Start Python backend in dev mode
-python -m src.main --dev
+# Terminal 2: Start the WebSocket backend
+python -m src.ws_main
+
+# Terminal 3 (optional): Tauri desktop shell in dev mode
+cd src-tauri && cargo tauri dev
 ```
 
 ### Production Mode
@@ -101,8 +105,8 @@ python -m src.main --dev
 cd frontend
 npm run build
 
-# Run Python application
-python -m src.main
+# Run the WebSocket backend
+python -m src.ws_main
 ```
 
 ### Build for Distribution
@@ -136,15 +140,10 @@ pyinstaller --name "agent-with-u-backend" --onefile --console ^
     --hidden-import pydantic --hidden-import mcp ^
     --hidden-import dashscope --collect-all dashscope ^
     --noconfirm ws_main_entry.py
-
-# For the Qt frontend application
-pyinstaller --name "AgentWithU" --windowed ^
-    --add-data "frontend/dist:frontend/dist" ^
-    --hidden-import websockets ^
-    --hidden-import PIL ^
-    --hidden-import claude_agent_sdk ^
-    src/main.py
 ```
+
+The desktop app is the Tauri shell (`src-tauri/`); it bundles the
+PyInstaller backend above as its sidecar (`agent-with-u-backend`).
 
 **Important**: The `claude_agent_sdk` module must be included in `hiddenimports` because it's dynamically imported at runtime. Additionally, `--collect-all pydantic_core` is required because `pydantic_core._pydantic_core` is a compiled C extension (`.pyd`) that PyInstaller's static analysis cannot detect. The dependency chain is: `claude_agent_sdk → mcp → pydantic → pydantic_core._pydantic_core`.
 
@@ -155,11 +154,10 @@ pyinstaller --name "AgentWithU" --windowed ^
 1. **Type Hints**: Use full type annotations for all functions and class attributes
 2. **Dataclasses**: Use `@dataclass` for structured data with `to_dict()` methods
 3. **Async Patterns**:
-   - Run asyncio event loop in background thread for Qt compatibility
-   - Use `asyncio.run_coroutine_threadsafe()` for Qt → async bridging
-4. **QWebChannel Bridge**:
-   - Expose methods with `@Slot` decorators for JS access
-   - Use `Signal` for Python → JS notifications
+   - The backend is fully async; `ws_main` runs the asyncio event loop directly
+4. **WebSocket Bridge** (`bridge_ws.py`):
+   - JSON-RPC over WebSocket: `{"id","method","params"}` → `{"id","result"}`
+   - Push events to the frontend as `{"event","data"}` frames
    - Serialize all cross-language data as JSON strings
 5. **Naming**:
    - Private methods: `_method_name()`
@@ -194,7 +192,7 @@ pyinstaller --name "AgentWithU" --windowed ^
 
 ### Architecture Key Points
 
-1. **QWebChannel is Core IPC**: The `Bridge` QObject is the single source of truth for frontend-backend communication. All cross-language calls go through this layer.
+1. **WebSocket Bridge is Core IPC**: `BridgeWS` (`src/backend/bridge_ws.py`) is the single source of truth for frontend-backend communication. All cross-language calls go through this layer as JSON-RPC over WebSocket.
 
 2. **Clipboard Image Flow**:
    ```
@@ -283,6 +281,21 @@ resolved through `src/backend/paths.py` — the single source of truth.
 
 ### Testing Notes
 
-- Frontend has a mock bridge fallback when QWebChannel is unavailable
-- Dev mode (`--dev`) loads from `localhost:5173` instead of bundled dist
-- Clipboard image reading requires PySide6; returns null in mock mode
+- Frontend has a mock bridge fallback when no WebSocket backend is reachable
+- Vite dev server runs the frontend on `localhost:5173`; the backend on `44321`
+
+### Desktop Roles (Tauri, C–C/S)
+
+The Tauri desktop app (`src-tauri/`) can run in two roles, persisted in
+`~/.agent-with-u/desktop.json` and read by `lib.rs` at startup:
+
+- **executor** (default) — spawns the `agent-with-u-backend` sidecar. If
+  `relayUrl` + `relayToken` are set, they are passed through as
+  `AGENT_WITH_U_RELAY_*` env vars so this machine dials out to a relay and
+  is reachable by remote UI clients.
+- **client** — does not spawn a sidecar; the webview connects to a remote
+  executor via the relay (`ConnectionPanel` relay mode).
+
+The role is edited in the in-app "连接" panel (`ConnectionPanel.tsx`);
+changes take effect on app restart. Tauri commands: `get_desktop_config`,
+`set_desktop_config`.
