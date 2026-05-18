@@ -1,5 +1,6 @@
 import React, { useState, useCallback, useEffect, useRef, memo, useMemo } from 'react';
 import { markdownToHtml } from '../utils/markdown';
+import { loadSkillImageDataUrl } from '../api';
 import type { ChatMessage, ToolCall, ContentBlock } from '../hooks/useChat';
 import { DiffView, type DiffData } from './DiffView';
 
@@ -727,6 +728,25 @@ function MessageBubbleInner({
         });
       }
     });
+
+    // ★ skill 图片走数据通道：占位 <img data-skill-file> 通过 RPC 按需取
+    //   兼容本地直连 / 经中继 / QWebChannel 三种模式
+    let cancelled = false;
+    el.querySelectorAll<HTMLImageElement>('img.skill-img[data-skill-file]').forEach((img) => {
+      if (img.dataset.skillLoaded) return;
+      const file = img.dataset.skillFile;
+      if (!file) return;
+      img.dataset.skillLoaded = '1';
+      loadSkillImageDataUrl(file)
+        .then((url) => { if (!cancelled) { img.src = url; img.classList.add('loaded'); } })
+        .catch(() => {
+          if (!cancelled) {
+            img.alt = (img.alt || '') + ' (图片加载失败)';
+            img.classList.add('loaded');
+          }
+        });
+    });
+    return () => { cancelled = true; };
   }, [message.content]);
 
   // ★ system 消息独立渲染

@@ -1089,6 +1089,28 @@ class Bridge(QObject):
         from .base import get_claude_auth_status
         return json.dumps(get_claude_auth_status(), ensure_ascii=False)
 
+    @Slot(str, result=str)
+    def getSkillImage(self, filename: str) -> str:
+        """按文件名返回 skill 生成图片的 base64（图片走数据通道，不依赖 HTTP）。"""
+        from . import paths
+        try:
+            filename = (filename or "").replace("\\", "/").split("/")[-1].split("?")[0]
+            if not filename or ".." in filename:
+                return json.dumps({"ok": False, "error": "invalid filename"}, ensure_ascii=False)
+            img_path = paths.sub("skill-images", filename)
+            if not img_path.exists():
+                return json.dumps({"ok": False, "error": "not found"}, ensure_ascii=False)
+            import base64 as _b64
+            ext = img_path.suffix.lstrip(".").lower()
+            mime = {"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg",
+                    "gif": "image/gif", "webp": "image/webp"}.get(ext, "image/png")
+            return json.dumps({
+                "ok": True, "mime": mime,
+                "base64": _b64.b64encode(img_path.read_bytes()).decode("ascii"),
+            }, ensure_ascii=False)
+        except Exception as e:
+            return json.dumps({"ok": False, "error": str(e)}, ensure_ascii=False)
+
     @Slot(int, result=str)
     def getBackendLogs(self, max_lines: int = 500) -> str:
         """读取后端日志文件末尾若干行，用于应用内日志查看器。"""

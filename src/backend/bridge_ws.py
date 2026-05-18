@@ -2774,6 +2774,30 @@ except urllib.error.URLError as e:
         from .base import get_claude_auth_status
         return json.dumps(get_claude_auth_status(), ensure_ascii=False)
 
+    def _rpc_getSkillImage(self, filename: str) -> str:
+        """按文件名返回 skill 生成图片的 base64。
+
+        C–C/S 架构下没有共享的 /api/ 反代，图片改走数据通道：UI 不论本地
+        直连还是经中继,都用这个 RPC 取图,行为统一。
+        """
+        try:
+            filename = (filename or "").replace("\\", "/").split("/")[-1].split("?")[0]
+            if not filename or ".." in filename:
+                return json.dumps({"ok": False, "error": "invalid filename"}, ensure_ascii=False)
+            img_path = paths.sub("skill-images", filename)
+            if not img_path.exists():
+                return json.dumps({"ok": False, "error": "not found"}, ensure_ascii=False)
+            import base64 as _b64
+            ext = img_path.suffix.lstrip(".").lower()
+            mime = {"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg",
+                    "gif": "image/gif", "webp": "image/webp"}.get(ext, "image/png")
+            return json.dumps({
+                "ok": True, "mime": mime,
+                "base64": _b64.b64encode(img_path.read_bytes()).decode("ascii"),
+            }, ensure_ascii=False)
+        except Exception as e:
+            return json.dumps({"ok": False, "error": str(e)}, ensure_ascii=False)
+
     def _rpc_getBackendLogs(self, max_lines: int = 500) -> str:
         """读取后端日志文件末尾若干行，用于 CS 架构下的应用内日志查看器。"""
         try:

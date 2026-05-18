@@ -932,6 +932,17 @@ export const api = {
     }
   },
 
+  /** 按文件名取 skill 生成图片（走数据通道，本地/中继/QWebChannel 通用） */
+  async getSkillImage(filename: string): Promise<{ ok: boolean; mime?: string; base64?: string; error?: string }> {
+    const r = await call('getSkillImage', filename);
+    try {
+      const d = typeof r === 'string' ? JSON.parse(r) : r;
+      return d && typeof d === 'object' ? d : { ok: false, error: 'bad response' };
+    } catch {
+      return { ok: false, error: 'parse error' };
+    }
+  },
+
   /** 读取后端日志末尾若干行（适用于 CS / WebSocket 架构的应用内日志查看器） */
   async getBackendLogs(maxLines = 500): Promise<{ ok: boolean; lines: string[]; path?: string; error?: string }> {
     const r = await call('getBackendLogs', maxLines);
@@ -943,6 +954,29 @@ export const api = {
     }
   },
 };
+
+// ── Skill 图片：按文件名取一次、缓存为 data URL，供 markdown 渲染按需加载 ──
+const skillImageCache = new Map<string, string>();
+const skillImageInflight = new Map<string, Promise<string>>();
+
+export function loadSkillImageDataUrl(filename: string): Promise<string> {
+  const cached = skillImageCache.get(filename);
+  if (cached) return Promise.resolve(cached);
+  let p = skillImageInflight.get(filename);
+  if (!p) {
+    p = (async () => {
+      const r = await api.getSkillImage(filename);
+      if (!r.ok || !r.base64) throw new Error(r.error || 'load failed');
+      const url = `data:${r.mime || 'image/png'};base64,${r.base64}`;
+      skillImageCache.set(filename, url);
+      return url;
+    })();
+    skillImageInflight.set(filename, p);
+    p.catch(() => { /* keep errors from rejecting unhandled */ })
+      .finally(() => skillImageInflight.delete(filename));
+  }
+  return p;
+}
 
 // ═══════════════════════════════════════
 //  Mock bridge（WebSocket 不可用时的 fallback）
@@ -956,6 +990,7 @@ let mockAppConfig: any = { fontSize: 14, renderMarkdown: true, exportFormat: 'ma
 function mockDispatch(method: string, params: any[]): any {
   switch (method) {
     case 'readClipboardImage': return 'null';
+    case 'getSkillImage': return JSON.stringify({ ok: false, error: 'backend not connected' });
     case 'getAuthStatus':
       return JSON.stringify({ loggedIn: false, method: 'none', expiresAt: null, expired: false, credentialsPath: '' });
     case 'getBackendLogs':
