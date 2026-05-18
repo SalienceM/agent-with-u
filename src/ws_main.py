@@ -262,7 +262,50 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     p.add_argument("--trusted-proxies",
                    default=os.environ.get("AGENT_WITH_U_TRUSTED_PROXIES", ""),
                    help="comma-separated CIDRs allowed to set Remote-* headers (default: 127.0.0.0/8,::1/128)")
+    # ── 中继（C–C/S）：本执行节点主动拨出到公网中继 S，供远程 UI 经 S 访问 ──
+    p.add_argument("--relay-url", default=os.environ.get("AGENT_WITH_U_RELAY_URL") or None,
+                   help="connect out to a relay server (e.g. wss://relay.example.com) "
+                        "so remote UI clients can reach this executor node")
+    p.add_argument("--relay-token", default=os.environ.get("AGENT_WITH_U_RELAY_TOKEN") or None,
+                   help="shared token for the relay server")
+    p.add_argument("--device-id", default=os.environ.get("AGENT_WITH_U_DEVICE_ID") or None,
+                   help="stable id for this executor node (default: auto-generated & persisted)")
+    p.add_argument("--device-name", default=os.environ.get("AGENT_WITH_U_DEVICE_NAME") or None,
+                   help="human-readable name for this executor node shown in the UI device list")
     return p.parse_args(argv)
+
+
+def resolve_device_identity(args: argparse.Namespace) -> tuple[str, str]:
+    """确定本执行节点的设备 ID 与名称。
+
+    device-id 缺省时自动生成并持久化到数据目录，保证重启后 ID 稳定——
+    远程 UI 才能始终认得同一个节点。
+    """
+    import socket
+    from .backend import paths
+
+    device_id = (args.device_id or "").strip()
+    if not device_id:
+        id_file = paths.data_root() / "device-id"
+        try:
+            if id_file.exists():
+                device_id = id_file.read_text(encoding="utf-8").strip()
+            if not device_id:
+                import uuid
+                device_id = uuid.uuid4().hex[:16]
+                id_file.parent.mkdir(parents=True, exist_ok=True)
+                id_file.write_text(device_id, encoding="utf-8")
+        except Exception:
+            import uuid
+            device_id = device_id or uuid.uuid4().hex[:16]
+
+    device_name = (args.device_name or "").strip()
+    if not device_name:
+        try:
+            device_name = socket.gethostname() or device_id
+        except Exception:
+            device_name = device_id
+    return device_id, device_name
 
 
 def build_auth_config(args: argparse.Namespace) -> AuthConfig:
@@ -335,6 +378,23 @@ async def main():
     except OSError as e:
         logging.error(f"[ws_main] Cannot bind {args.bind}:{args.port} even after clearing old instance: {e}")
         sys.exit(1)
+
+    # ★ 中继链路（C–C/S）：若配置了 --relay-url，本执行节点额外拨出一条
+    #   长连接到公网中继 S，让远程 UI 经 S 访问。本地直连不受影响、照常可用。
+    if args.relay_url:
+        if not args.relay_token:
+            logging.error("[ws_main] --relay-url given but no --relay-token; relay disabled")
+        else:
+            from .backend.relay import RelayLink
+            device_id, device_name = resolve_device_identity(args)
+            relay = RelayLink(
+                bridge, args.relay_url, device_id, device_name, args.relay_token,
+            )
+            logging.info(
+                f"[ws_main] Relay enabled: device={device_id} ({device_name}) "
+                f"-> {args.relay_url}"
+            )
+            asyncio.ensure_future(relay.run())
 
     logging.info("[ws_main] Ready.")
     async with server:
