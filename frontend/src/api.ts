@@ -943,6 +943,17 @@ export const api = {
     }
   },
 
+  /** 按 id 取素材池条目（默认缩略图），走数据通道 */
+  async getAsset(id: string, thumb = true): Promise<{ ok: boolean; mime?: string; base64?: string; error?: string }> {
+    const r = await call('getAsset', id, thumb);
+    try {
+      const d = typeof r === 'string' ? JSON.parse(r) : r;
+      return d && typeof d === 'object' ? d : { ok: false, error: 'bad response' };
+    } catch {
+      return { ok: false, error: 'parse error' };
+    }
+  },
+
   /** 读取后端日志末尾若干行（适用于 CS / WebSocket 架构的应用内日志查看器） */
   async getBackendLogs(maxLines = 500): Promise<{ ok: boolean; lines: string[]; path?: string; error?: string }> {
     const r = await call('getBackendLogs', maxLines);
@@ -978,6 +989,30 @@ export function loadSkillImageDataUrl(filename: string): Promise<string> {
   return p;
 }
 
+// ── 素材池图片：同样按需取、缓存为 data URL（id+thumb 为键，内容不可变）──
+const assetImageCache = new Map<string, string>();
+const assetImageInflight = new Map<string, Promise<string>>();
+
+export function loadAssetDataUrl(id: string, thumb = true): Promise<string> {
+  const key = (thumb ? 't:' : 'f:') + id;
+  const cached = assetImageCache.get(key);
+  if (cached) return Promise.resolve(cached);
+  let p = assetImageInflight.get(key);
+  if (!p) {
+    p = (async () => {
+      const r = await api.getAsset(id, thumb);
+      if (!r.ok || !r.base64) throw new Error(r.error || 'load failed');
+      const url = `data:${r.mime || 'image/jpeg'};base64,${r.base64}`;
+      assetImageCache.set(key, url);
+      return url;
+    })();
+    assetImageInflight.set(key, p);
+    p.catch(() => { /* keep errors from rejecting unhandled */ })
+      .finally(() => assetImageInflight.delete(key));
+  }
+  return p;
+}
+
 // ═══════════════════════════════════════
 //  Mock bridge（WebSocket 不可用时的 fallback）
 // ═══════════════════════════════════════
@@ -991,6 +1026,7 @@ function mockDispatch(method: string, params: any[]): any {
   switch (method) {
     case 'readClipboardImage': return 'null';
     case 'getSkillImage': return JSON.stringify({ ok: false, error: 'backend not connected' });
+    case 'getAsset': return JSON.stringify({ ok: false, error: 'backend not connected' });
     case 'getAuthStatus':
       return JSON.stringify({ loggedIn: false, method: 'none', expiresAt: null, expired: false, credentialsPath: '' });
     case 'getBackendLogs':

@@ -2,7 +2,7 @@
  * AssetPanel — 素材中转池面板。
  *
  * 展示后端 Asset Pool 中暂存的图片/文件，支持：
- *   - 缩略图预览（图片走 /api/assets/<id>/thumb）
+ *   - 缩略图预览（走 getAsset 数据通道，本地直连/经中继均可）
  *   - pin / unpin（pinned 不被滚动淘汰）
  *   - 删除
  *   - 跟随后端 assetChanged 事件自动刷新
@@ -10,7 +10,7 @@
  * 共屏右侧列模式，由 App.tsx 控制显隐。
  */
 import React, { useState, useEffect, useCallback } from 'react';
-import { api, httpApiBase } from '../api';
+import { api, loadAssetDataUrl } from '../api';
 
 interface AssetMeta {
   id: string;
@@ -48,10 +48,35 @@ function fmtTime(ts?: number): string {
   return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
 }
 
+/** 缩略图：通过 getAsset RPC 走数据通道按需加载，兼容本地直连 / 经中继。 */
+const AssetThumb: React.FC<{ asset: AssetMeta }> = ({ asset }) => {
+  const isImage = !!asset.mime?.startsWith('image/');
+  const [src, setSrc] = useState<string | null>(null);
+  const [failed, setFailed] = useState(false);
+
+  useEffect(() => {
+    if (!isImage) return;
+    let cancelled = false;
+    loadAssetDataUrl(asset.id, true)
+      .then((url) => { if (!cancelled) setSrc(url); })
+      .catch(() => { if (!cancelled) setFailed(true); });
+    return () => { cancelled = true; };
+  }, [asset.id, isImage]);
+
+  if (!isImage || failed) {
+    return (
+      <span style={{ fontSize: 22, opacity: 0.6 }}>
+        {asset.mime?.includes('pdf') ? '📄' : isImage ? '🖼' : '📎'}
+      </span>
+    );
+  }
+  if (!src) return <span style={{ fontSize: 16, opacity: 0.4 }}>⋯</span>;
+  return <img src={src} alt={asset.desc || asset.id} style={thumbImgStyle} loading="lazy" />;
+};
+
 export const AssetPanel: React.FC<AssetPanelProps> = ({ visible, onClose }) => {
   const [items, setItems] = useState<AssetMeta[]>([]);
   const [stats, setStats] = useState<any>({ count: 0, pinned: 0, bytes: 0, max_items: 0, max_bytes: 0 });
-  const [httpPort, setHttpPort] = useState(0);
   const [loading, setLoading] = useState(false);
 
   const refresh = useCallback(async () => {
@@ -60,7 +85,6 @@ export const AssetPanel: React.FC<AssetPanelProps> = ({ visible, onClose }) => {
       const r = await api.assetList(100, 0, '');
       setItems(r.items);
       setStats(r.stats);
-      setHttpPort(r.httpPort);
     } finally {
       setLoading(false);
     }
@@ -85,12 +109,6 @@ export const AssetPanel: React.FC<AssetPanelProps> = ({ visible, onClose }) => {
   const remove = useCallback(async (a: AssetMeta) => {
     await api.assetDelete(a.id);
   }, []);
-
-  // items 与 httpPort 由 refresh() 同步设置，渲染列表时 httpPort 必已就绪
-  const thumbUrl = (a: AssetMeta): string | null => {
-    if (!a.mime?.startsWith('image/')) return null;
-    return `${httpApiBase(httpPort)}/api/assets/${a.id}/thumb`;
-  };
 
   if (!visible) return null;
 
@@ -119,17 +137,10 @@ export const AssetPanel: React.FC<AssetPanelProps> = ({ visible, onClose }) => {
           </div>
         )}
         {items.map((a) => {
-          const turl = thumbUrl(a);
           return (
             <div key={a.id} style={cardStyle}>
               <div style={thumbBoxStyle}>
-                {turl ? (
-                  <img src={turl} alt={a.desc || a.id} style={thumbImgStyle} loading="lazy" />
-                ) : (
-                  <span style={{ fontSize: 22, opacity: 0.6 }}>
-                    {a.mime?.includes('pdf') ? '📄' : a.mime?.startsWith('image/') ? '🖼' : '📎'}
-                  </span>
-                )}
+                <AssetThumb asset={a} />
               </div>
               <div style={{ flex: 1, minWidth: 0 }}>
                 <div style={titleStyle} title={a.desc || a.source || a.id}>

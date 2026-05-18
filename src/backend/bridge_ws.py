@@ -2774,6 +2774,28 @@ except urllib.error.URLError as e:
         from .base import get_claude_auth_status
         return json.dumps(get_claude_auth_status(), ensure_ascii=False)
 
+    def _rpc_getAsset(self, asset_id: str, thumb: bool = True) -> str:
+        """按 id 返回素材池条目的 base64（默认缩略图）。
+
+        C–C/S 架构下素材缩略图也走数据通道，不再依赖 /api/assets/ HTTP 路由，
+        本地直连 / 经中继行为统一。
+        """
+        try:
+            asset_id = (asset_id or "").strip()
+            if not asset_id or "/" in asset_id or ".." in asset_id:
+                return json.dumps({"ok": False, "error": "invalid asset id"}, ensure_ascii=False)
+            path = f"/api/assets/{asset_id}" + ("/thumb" if thumb else "")
+            status, mime, data = self._serve_asset(path)
+            if status != 200:
+                return json.dumps({"ok": False, "error": f"status {status}"}, ensure_ascii=False)
+            import base64 as _b64
+            return json.dumps({
+                "ok": True, "mime": mime,
+                "base64": _b64.b64encode(data).decode("ascii"),
+            }, ensure_ascii=False)
+        except Exception as e:
+            return json.dumps({"ok": False, "error": str(e)}, ensure_ascii=False)
+
     def _rpc_getSkillImage(self, filename: str) -> str:
         """按文件名返回 skill 生成图片的 base64。
 
