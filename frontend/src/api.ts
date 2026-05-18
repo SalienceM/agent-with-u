@@ -128,6 +128,64 @@ async function getWsPort(): Promise<number> {
   return WS_PORT_DEFAULT;
 }
 
+// ── 连接目标（C–C/S）：本地直连，或经中继 S 访问远程执行节点 ──────────
+export type ConnectionTarget =
+  | { mode: 'local' }
+  | { mode: 'relay'; url: string; token: string; deviceId: string; deviceName?: string };
+
+const CONN_TARGET_KEY = 'awu.connectionTarget';
+
+function loadConnectionTarget(): ConnectionTarget {
+  try {
+    const raw = localStorage.getItem(CONN_TARGET_KEY);
+    if (raw) {
+      const t = JSON.parse(raw);
+      if (t && t.mode === 'relay' && t.url && t.deviceId) return t as ConnectionTarget;
+    }
+  } catch { /* ignore */ }
+  return { mode: 'local' };
+}
+
+let connectionTarget: ConnectionTarget = loadConnectionTarget();
+
+export function getConnectionTarget(): ConnectionTarget {
+  return connectionTarget;
+}
+
+/** 临时连一次中继、拉取在线执行节点列表，然后关闭。 */
+export function listRelayDevices(
+  url: string, token: string,
+): Promise<{ id: string; name: string }[]> {
+  return new Promise((resolve, reject) => {
+    let done = false;
+    let sock: WebSocket;
+    const finish = (fn: () => void) => { if (!done) { done = true; fn(); } };
+    try {
+      sock = new WebSocket(url);
+    } catch (e) {
+      reject(e instanceof Error ? e : new Error('bad relay url'));
+      return;
+    }
+    const timer = setTimeout(
+      () => finish(() => { try { sock.close(); } catch { /* */ } reject(new Error('连接中继超时')); }),
+      8000,
+    );
+    sock.onopen = () => { try { sock.send(JSON.stringify({ t: 'list', token })); } catch { /* */ } };
+    sock.onmessage = (e) => {
+      try {
+        const m = JSON.parse(e.data as string);
+        if (m.t === 'devices') {
+          finish(() => { clearTimeout(timer); try { sock.close(); } catch { /* */ } resolve(m.devices || []); });
+        } else if (m.t === 'error') {
+          finish(() => { clearTimeout(timer); try { sock.close(); } catch { /* */ } reject(new Error(m.message || '中继拒绝')); });
+        }
+      } catch { /* ignore */ }
+    };
+    sock.onerror = () => finish(() => { clearTimeout(timer); reject(new Error('无法连接中继')); });
+    sock.onclose = () => finish(() => { clearTimeout(timer); reject(new Error('中继连接已关闭')); });
+  });
+}
+
 /**
  * 解析 WebSocket 连接地址，区分三种部署形态：
  *   - Tauri 桌面：连本机 sidecar，ws://127.0.0.1:<port>
@@ -135,6 +193,9 @@ async function getWsPort(): Promise<number> {
  *   - 生产 Web（反代后）：连 wss?://<当前host>/ws，由反代转发到后端
  */
 async function getWsUrl(): Promise<string> {
+  if (connectionTarget.mode === 'relay') {
+    return connectionTarget.url;
+  }
   if (isTauri()) {
     const port = await getWsPort();
     return `ws://127.0.0.1:${port}`;
@@ -217,8 +278,11 @@ function doConnect(url: string, onSettled?: () => void) {
   const socket = new WebSocket(url);
   let settled = false;
   const settle = () => { if (!settled) { settled = true; onSettled?.(); } };
+  // ★ 经中继连接时，WS 打开后还要先完成 hello/ready 握手才算连上
+  const target = connectionTarget;
+  let relayHandshake = target.mode === 'relay';
 
-  socket.onopen = () => {
+  const finishConnect = () => {
     ws = socket;
     useMock = false;
     reconnectDelay = 1000; // 成功后重置退避
@@ -231,16 +295,45 @@ function doConnect(url: string, onSettled?: () => void) {
       if (ws && ws.readyState === WebSocket.OPEN) {
         const id = nextId();
         // fire-and-forget ping，不注册 pending（丢失也无所谓）
-        try { ws.send(JSON.stringify({ id, method: 'ping', params: [] })); } catch {}
+        try { ws.send(JSON.stringify({ id, method: 'ping', params: [] })); } catch { /* */ }
       }
     }, HEARTBEAT_INTERVAL_MS);
     settle();
   };
 
+  socket.onopen = () => {
+    if (relayHandshake && target.mode === 'relay') {
+      // 发起中继握手，等待 {t:'ready'} 才算连上
+      try {
+        socket.send(JSON.stringify({
+          t: 'hello', token: target.token, deviceId: target.deviceId,
+        }));
+      } catch { /* */ }
+    } else {
+      finishConnect();
+    }
+  };
+
   // onerror 之后一定会触发 onclose，在 onclose 里统一处理
   socket.onerror = () => settle();
 
-  socket.onmessage = handleMessage;
+  socket.onmessage = (e) => {
+    if (relayHandshake) {
+      if (typeof e.data !== 'string') return;
+      try {
+        const m = JSON.parse(e.data);
+        if (m.t === 'ready') {
+          relayHandshake = false;
+          finishConnect();
+        } else if (m.t === 'error') {
+          console.error('[api] relay rejected:', m.message);
+          try { socket.close(); } catch { /* */ }
+        }
+      } catch { /* ignore non-handshake frames */ }
+      return;
+    }
+    handleMessage(e);
+  };
 
   socket.onclose = () => {
     if (ws === socket) {
@@ -255,6 +348,19 @@ function doConnect(url: string, onSettled?: () => void) {
     settle();
     scheduleReconnect(); // 断线后自动重连
   };
+}
+
+/** 切换连接目标（本地直连 / 中继远程），持久化并立即重连。 */
+export async function setConnectionTarget(t: ConnectionTarget): Promise<void> {
+  connectionTarget = t;
+  try { localStorage.setItem(CONN_TARGET_KEY, JSON.stringify(t)); } catch { /* */ }
+  if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+  reconnectDelay = 1000;
+  wsUrl = await getWsUrl();
+  const old = ws;
+  ws = null; // 置空：旧 socket 的 onclose 不再做客户端清理
+  if (old) { try { old.close(); } catch { /* */ } }
+  doConnect(wsUrl);
 }
 
 wsReady = (async () => {

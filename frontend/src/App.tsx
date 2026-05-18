@@ -12,6 +12,7 @@ import { AssetPanel } from './components/AssetPanel';
 import { ServerDirPicker } from './components/ServerDirPicker';
 import { LogViewer } from './components/LogViewer';
 import { AuthStatusBanner } from './components/AuthStatusBanner';
+import { ConnectionPanel } from './components/ConnectionPanel';
 import { useChat } from './hooks/useChat';
 import { useConfig } from './hooks/useConfig';
 import { themes } from './hooks/useConfig';
@@ -34,6 +35,7 @@ export const App: React.FC = () => {
   const [backendManagerOpen, setBackendManagerOpen] = useState(false);
   const [repoPanelOpen, setRepoPanelOpen] = useState(false);
   const [logViewerOpen, setLogViewerOpen] = useState(false);
+  const [connPanelOpen, setConnPanelOpen] = useState(false);
   const [repoPanelEditing, setRepoPanelEditing] = useState(false);
   const [newSessionDialogOpen, setNewSessionDialogOpen] = useState(false);
   const [skipPermissions, setSkipPermissions] = useState(true);  // ★ 权限模式开关
@@ -715,6 +717,14 @@ export const App: React.FC = () => {
           >
             📋{isMobile ? '' : ' Logs'}
           </button>
+          {/* 连接目标：本地直连 / 经中继访问远程执行节点 */}
+          <button
+            onClick={() => setConnPanelOpen(true)}
+            style={settingsBtnStyle}
+            title="连接目标(本地 / 远程中继)"
+          >
+            📡
+          </button>
           <button
             onClick={() => setRepoPanelOpen(!repoPanelOpen)}
             style={{ ...settingsBtnStyle, ...(repoPanelOpen ? { background: 'var(--theme-accent-bg)', color: 'var(--theme-accent)' } : {}) }}
@@ -966,6 +976,9 @@ export const App: React.FC = () => {
 
       {/* ---- 后端日志查看器 ---- */}
       <LogViewer isOpen={logViewerOpen} onClose={() => setLogViewerOpen(false)} />
+
+      {/* ---- 连接目标设置 ---- */}
+      {connPanelOpen && <ConnectionPanel onClose={() => setConnPanelOpen(false)} />}
 
       {/* ---- Backend Manager ---- */}
       <BackendManager
