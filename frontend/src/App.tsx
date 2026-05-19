@@ -132,6 +132,25 @@ export const App: React.FC = () => {
     api.listSessions().then(setSessions);
   }, [activeSessionId, backendConnected]);
 
+  /* ---- 多端同步：其它客户端增删改 session 时刷新侧边栏 ---- */
+  useEffect(() => {
+    if (backendConnected !== true) return;
+    return api.onSessionUpdated((data: any) => {
+      const t = data?.type;
+      if (t !== 'session_created' && t !== 'session_deleted' && t !== 'session_renamed') {
+        return;
+      }
+      api.listSessions().then((list) => {
+        setSessions(list);
+        // 当前正在查看的 session 被其它客户端删除：切到剩余的第一个。
+        if (t === 'session_deleted') {
+          setActiveSessionId((current) =>
+            current === data.sessionId ? (list[0]?.id ?? null) : current);
+        }
+      });
+    });
+  }, [backendConnected]);
+
   /* ---- 加载当前 session 详情（含 backendId） ---- */
   useEffect(() => {
     if (!activeSessionId) {

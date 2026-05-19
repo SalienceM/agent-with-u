@@ -1448,6 +1448,7 @@ class BridgeWS:
             print(f"[BridgeWS] Failed to auto-bind defaults: {e}", file=sys.stderr)
         self._active_sessions[session.id] = session
         self._session_store.save(session, async_=True)
+        self._emit_session_updated({"type": "session_created", "sessionId": session.id})
         return json.dumps(session.to_dict(), ensure_ascii=False)
 
     def _rpc_listSessions(self) -> str:
@@ -1488,6 +1489,11 @@ class BridgeWS:
                 session = self._active_sessions.get(session_id)
                 if session:
                     session.title = new_title.strip()
+                self._emit_session_updated({
+                    "type": "session_renamed",
+                    "sessionId": session_id,
+                    "title": new_title.strip(),
+                })
                 return json.dumps({"status": "ok"}, ensure_ascii=False)
             return json.dumps({"status": "error", "message": "Session not found"}, ensure_ascii=False)
         except Exception as e:
@@ -1496,7 +1502,10 @@ class BridgeWS:
     def _rpc_deleteSession(self, sid: str) -> bool:
         self._active_sessions.pop(sid, None)
         self._instance_manager.delete(sid)
-        return self._session_store.delete(sid)
+        ok = self._session_store.delete(sid)
+        if ok:
+            self._emit_session_updated({"type": "session_deleted", "sessionId": sid})
+        return ok
 
     def _rpc_migrateSession(self, payload_json: str) -> str:
         payload = json.loads(payload_json)
