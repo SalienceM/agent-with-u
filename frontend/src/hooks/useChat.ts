@@ -419,20 +419,31 @@ export function useChat(sessionId: string, backendId: string, backends?: any[], 
                   ? buildStreamingMessage(snap as any, { ...m, ...extra })
                   : m
               );
-            } else {
-              const newMsg: ChatMessage = {
-                id: mid,
-                role: 'assistant',
-                content: snap.text,
-                timestamp: Date.now() / 1000,
-                streaming: snap.isStreaming,
-                thinking: snap.thinking || undefined,
-                toolCalls: snap.toolCalls.length > 0 ? snap.toolCalls : undefined,
-                contentBlocks: snap.contentBlocks.length > 0 ? snap.contentBlocks : undefined,
-                ...extra,
-              };
-              return [...prev, newMsg];
             }
+            // ★ 新气泡:snap 里啥可展示的东西都没有(text/thinking/tools/blocks
+            //    全空)就别 push,会被渲染成「content='' + streaming=true」的
+            //    空插入符幽灵。下一个 delta 进来会再调一次本函数,届时通常
+            //    snap 已经有内容,再 push 就不闪了。
+            //    这关闭的是「消息切换/瞬切刚好碰上模型起新一条」的那个空窗。
+            const hasContent = !!(
+              snap.text ||
+              snap.thinking ||
+              snap.toolCalls.length > 0 ||
+              snap.contentBlocks.length > 0
+            );
+            if (!hasContent) return prev;
+            const newMsg: ChatMessage = {
+              id: mid,
+              role: 'assistant',
+              content: snap.text,
+              timestamp: Date.now() / 1000,
+              streaming: snap.isStreaming,
+              thinking: snap.thinking || undefined,
+              toolCalls: snap.toolCalls.length > 0 ? snap.toolCalls : undefined,
+              contentBlocks: snap.contentBlocks.length > 0 ? snap.contentBlocks : undefined,
+              ...extra,
+            };
+            return [...prev, newMsg];
           });
         });
       };
