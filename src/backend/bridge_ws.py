@@ -278,6 +278,8 @@ class BridgeWS:
         self._active_sessions: dict[str, Session] = {}
         self._instance_manager = InstanceManager()
         self._clients: set = set()
+        # ★ 每个客户端的接入时间戳（ISO 字符串），用于 listConnectedClients
+        self._client_meta: dict = {}
         # ★ Permission gate: session_id → Future[bool]
         self._permission_gates: dict[str, "asyncio.Future[bool]"] = {}
         # ★ Skip rest flags: session_id → True if user selected "skip rest"
@@ -957,6 +959,40 @@ class BridgeWS:
             "data": json.dumps(self._asset_pool.stats(), ensure_ascii=False),
         }))
 
+    def _client_info(self, ws) -> dict:
+        """提取一个客户端连接的展示信息（身份、来源、IP、接入时间）。"""
+        identity = getattr(ws, "identity", "?")
+        identity_src = getattr(ws, "identity_src", "none")
+        # 中继来的会话在 RelayClientTransport 上有 peer 属性；本地直连的
+        # websocket 暴露 remote_address。
+        peer = getattr(ws, "peer", None)
+        if not peer:
+            addr = getattr(ws, "remote_address", None)
+            if addr:
+                try:
+                    peer = f"{addr[0]}:{addr[1]}"
+                except Exception:
+                    peer = ""
+        via = "relay" if identity_src == "relay" else "local"
+        return {
+            "identity": str(identity),
+            "identity_src": str(identity_src),
+            "peer": str(peer or ""),
+            "via": via,
+            "since": self._client_meta.get(ws, {}).get("since", ""),
+        }
+
+    def _emit_clients_changed(self):
+        """客户端接入 / 断开后广播,前端连接面板据此刷新。"""
+        try:
+            data = [self._client_info(ws) for ws in self._clients]
+        except Exception:
+            data = []
+        asyncio.ensure_future(self._broadcast({
+            "event": "clientsChanged",
+            "data": json.dumps(data, ensure_ascii=False),
+        }))
+
     def process_request(self, connection, request):
         """websockets.serve 握手钩子；委托给 AuthGuard 做认证。"""
         if self._auth_guard is None:
@@ -964,11 +1000,16 @@ class BridgeWS:
         return self._auth_guard.process_request(connection, request)
 
     async def handle_client(self, websocket):
+        from datetime import datetime, timezone
         self._clients.add(websocket)
+        self._client_meta[websocket] = {
+            "since": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        }
         ident = getattr(websocket, "identity", "?")
         ident_src = getattr(websocket, "identity_src", "none")
         print(f"[bridge_ws] client connected user={ident} via={ident_src} (total={len(self._clients)})",
               file=sys.stderr, flush=True)
+        self._emit_clients_changed()
         try:
             async for raw in websocket:
                 if isinstance(raw, bytes):
@@ -994,8 +1035,10 @@ class BridgeWS:
             pass
         finally:
             self._clients.discard(websocket)
+            self._client_meta.pop(websocket, None)
             print(f"[bridge_ws] client disconnected user={ident} (total={len(self._clients)})",
                   file=sys.stderr, flush=True)
+            self._emit_clients_changed()
 
     async def _dispatch(self, method: str, params: list):
         handler = getattr(self, f"_rpc_{method}", None)
@@ -1018,6 +1061,12 @@ class BridgeWS:
             return str(__version__)
         except Exception:
             return "0.0.0-dev"
+
+    def _rpc_listConnectedClients(self) -> str:
+        """返回当前连接到本执行节点的所有 UI 客户端列表（本地 + 经中继）。
+        前端「连接」面板用来展示「正在连接本机的 UI」分区。"""
+        infos = [self._client_info(ws) for ws in list(self._clients)]
+        return json.dumps(infos, ensure_ascii=False)
 
     # ── RPC: 语音转文字 (STT) ────────────────────────────────────────
 

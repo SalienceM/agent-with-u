@@ -13,6 +13,16 @@ type SessionUpdateCallback = (data: any) => void;
 type PermissionRequestCallback = (data: any) => void;
 type AssetChangedCallback = (stats: any) => void;
 
+/** 已连接到本执行节点的一个 UI 客户端的展示信息。 */
+export interface ConnectedClient {
+  identity: string;       // Remote-User / token:xxx / "local" / "relay"
+  identity_src: string;   // "loopback" | "forward-auth" | "token" | "relay" | "none"
+  peer: string;           // "ip:port"，可能为空字符串
+  via: 'local' | 'relay'; // 直连本机 sidecar，还是经中继来
+  since: string;          // ISO timestamp（UTC）
+}
+type ClientsChangedCallback = (clients: ConnectedClient[]) => void;
+
 export interface SkillInfo {
   name: string;
   content: string;               // SKILL.md 完整内容
@@ -46,6 +56,7 @@ let streamCallbacks: StreamDeltaCallback[] = [];
 let sessionUpdateCallbacks: SessionUpdateCallback[] = [];
 let permissionRequestCallbacks: PermissionRequestCallback[] = [];
 let assetChangedCallbacks: AssetChangedCallback[] = [];
+let clientsChangedCallbacks: ClientsChangedCallback[] = [];
 
 type SttStreamTextCallback = (data: { text: string; isFinal: boolean }) => void;
 let sttStreamCallbacks: SttStreamTextCallback[] = [];
@@ -232,6 +243,9 @@ function handleMessage(e: MessageEvent) {
     } else if (msg.event === 'assetChanged') {
       const data = msg.data ? JSON.parse(msg.data) : {};
       assetChangedCallbacks.forEach((cb) => cb(data));
+    } else if (msg.event === 'clientsChanged') {
+      const data: ConnectedClient[] = msg.data ? JSON.parse(msg.data) : [];
+      clientsChangedCallbacks.forEach((cb) => cb(data));
     } else if (msg.event === 'sttStreamText') {
       const data = JSON.parse(msg.data);
       sttStreamCallbacks.forEach((cb) => cb(data));
@@ -874,6 +888,21 @@ export const api = {
     return () => { assetChangedCallbacks = assetChangedCallbacks.filter((c) => c !== cb); };
   },
 
+  /** 列出当前连接到本执行节点的所有 UI 客户端（本地直连 + 经中继）。 */
+  async listConnectedClients(): Promise<ConnectedClient[]> {
+    const r = await call('listConnectedClients');
+    try {
+      const parsed = typeof r === 'string' ? JSON.parse(r) : r;
+      return Array.isArray(parsed) ? parsed : [];
+    } catch { return []; }
+  },
+
+  /** 订阅「在线 UI 列表」变化事件,接入/断开都会触发。 */
+  onClientsChanged(cb: ClientsChangedCallback): () => void {
+    clientsChangedCallbacks.push(cb);
+    return () => { clientsChangedCallbacks = clientsChangedCallbacks.filter((c) => c !== cb); };
+  },
+
   /** 打开外部 cmd 窗口实时刷日志（仅 Tauri 桌面端可用） */
   async openLogViewer(): Promise<void> {
     if (isTauri()) {
@@ -1043,6 +1072,7 @@ function mockDispatch(method: string, params: any[]): any {
         messages: [], backendId: params[1], autoContinue: true,
       });
     case 'listSessions': return '[]';
+    case 'listConnectedClients': return '[]';
     case 'loadSession': return 'null';
     case 'deleteSession': return true;
     case 'getBackends': return JSON.stringify(mockBackends);

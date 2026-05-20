@@ -49,10 +49,14 @@ class RelayClientTransport:
     """
 
     def __init__(self, cid: str, link: "RelayLink",
-                 identity: str = "relay", identity_src: str = "relay"):
+                 identity: str = "relay", identity_src: str = "relay",
+                 peer: str = ""):
         self.cid = cid
         self.identity = identity
         self.identity_src = identity_src
+        # peer: 远程 UI 的 IP:port，由中继在 open 帧里告知。BridgeWS 用它在
+        # 「正在连接本机的 UI」列表里展示来源。
+        self.peer = peer
         self._link = link
         self._queue: asyncio.Queue = asyncio.Queue()
         self._closed = False
@@ -145,7 +149,8 @@ class RelayLink:
         cid = frame.get("cid")
         if t == "open":
             transport = RelayClientTransport(
-                cid, self, identity=frame.get("user") or "relay")
+                cid, self, identity=frame.get("user") or "relay",
+                peer=str(frame.get("peer") or ""))
             self._transports[cid] = transport
             self._tasks[cid] = asyncio.ensure_future(
                 self._run_session(cid, transport))

@@ -173,9 +173,20 @@ class RelayServer:
         cid = uuid.uuid4().hex[:16]
         self._sessions[cid] = ws
         conn.cids.add(cid)
-        await conn.send({"t": "open", "cid": cid, "user": hello.get("user") or "relay"})
+        peer = ""
+        try:
+            addr = getattr(ws, "remote_address", None)
+            if addr:
+                peer = f"{addr[0]}:{addr[1]}"
+        except Exception:
+            pass
+        await conn.send({
+            "t": "open", "cid": cid,
+            "user": hello.get("user") or "relay",
+            "peer": peer,
+        })
         await ws.send(json.dumps({"t": "ready"}, ensure_ascii=False))
-        _log(f"ui session {cid} -> device {device_id!r}")
+        _log(f"ui session {cid} -> device {device_id!r} from {peer or '?'}")
 
         try:
             async for raw in ws:
