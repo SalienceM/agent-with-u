@@ -211,14 +211,10 @@ export function useChat(sessionId: string, backendId: string, backends?: any[], 
 
     // ★ 同步水合策略:目标是切到 B 的瞬间就给一个「合理画面」,而不是先空
     //    一刀再分两次刷出来。但绝不能渲染「content='' + streaming=true」的
-    //    幽灵 tail,那会变成空插入符闪。
+    //    幽灵 tail——那会变成空插入符闪。
     //
-    //    判定:
-    //      a) 有缓存历史 → 立刻铺历史(如果还在流,带上 tail——content 取
-    //         state.text,可能仍为空,但有历史做衬底就不会只看到光标)
-    //      b) 无缓存但流已经有内容 → 只渲染 tail(用户能立刻看到当前进度)
-    //      c) 其它(无缓存 + 流也没内容) → 直接 setMessages([]),让用户看到
-    //         一个空白等加载,胜过看到 stale 的 A 内容或闪烁光标
+    //    所以 tail 只在「state 真的有内容可展示」时才构造;两条 setMessages
+    //    分支都只决定「底下铺什么历史」。
     const cachedHistory = sessionHistoryCache.get(sessionId);
     const hasStreamContent = !!(
       globalState.text ||
@@ -227,28 +223,31 @@ export function useChat(sessionId: string, backendId: string, backends?: any[], 
       globalState.contentBlocks.length > 0
     );
 
-    const makeTail = (state: StreamState): ChatMessage => buildStreamingMessage(state, {
-      id: state.messageId!,
-      role: 'assistant',
-      content: '',
-      timestamp: Date.now() / 1000,
-      streaming: true,
-    });
+    const tail: ChatMessage | null =
+      hasActiveStream && globalState.messageId && hasStreamContent
+        ? buildStreamingMessage(globalState, {
+            id: globalState.messageId,
+            role: 'assistant',
+            content: '',
+            timestamp: Date.now() / 1000,
+            streaming: true,
+          })
+        : null;
 
     if (cachedHistory && cachedHistory.length > 0) {
-      // (a) 有缓存历史
+      // 有缓存历史:铺历史,有 tail 就拼上去
       const msgs = [...cachedHistory];
-      if (hasActiveStream && globalState.messageId) {
-        const idx = msgs.findIndex((m) => m.id === globalState.messageId);
-        const tail = makeTail(globalState);
-        if (idx >= 0) msgs[idx] = tail; else msgs.push(tail);
+      if (tail) {
+        const idx = msgs.findIndex((m) => m.id === tail.id);
+        if (idx >= 0) msgs[idx] = tail;
+        else msgs.push(tail);
       }
       setMessages(msgs);
-    } else if (hasActiveStream && globalState.messageId && hasStreamContent) {
-      // (b) 无历史但流已经有内容
-      setMessages([makeTail(globalState)]);
+    } else if (tail) {
+      // 无历史但流已有内容:只铺 tail
+      setMessages([tail]);
     } else {
-      // (c) 都没有 → 空,等 loadSession。避免空插入符闪。
+      // 啥都没:空,等 loadSession。绝不渲染幽灵 tail。
       setMessages([]);
     }
     setIsStreaming(hasActiveStream);
