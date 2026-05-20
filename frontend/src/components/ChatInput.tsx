@@ -101,7 +101,9 @@ const ChatInputInner: React.FC<Props> = ({
   onCompact,
 }) => {
   const ref = useRef<HTMLTextAreaElement>(null);
-  const { images, removeImage, clearImages } = useClipboardImage();
+  // 把 textarea ref 传给 useClipboardImage,这样多 pane 场景下只有聚焦
+  // 的输入框对应的 hook 会处理粘贴,避免一张图被所有 pane 同时吃下。
+  const { images, removeImage, clearImages } = useClipboardImage(ref);
 
   // ── 稳定 refs ──
   const onSendRef = useRef(onSend);

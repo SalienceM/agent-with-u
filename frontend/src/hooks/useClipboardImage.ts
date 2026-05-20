@@ -1,4 +1,5 @@
 import { useState, useCallback, useEffect } from 'react';
+import type { RefObject } from 'react';
 import { api } from '../api';
 import { uuid } from '../utils/uuid';
 
@@ -11,7 +12,15 @@ export interface ImageAttachment {
   height?: number;
 }
 
-export function useClipboardImage() {
+/**
+ * 监听 document 粘贴事件,把图片塞进待发送列表。
+ *
+ * @param scopeRef  可选:把生效范围限制在这个元素(及其子元素)拥有焦点时。
+ *                  多 pane 场景下每个 ChatInput 把自己 textarea 的 ref 传进来,
+ *                  这样只有当前聚焦 pane 的 useClipboardImage 会处理粘贴,
+ *                  否则所有 pane 都会同时吃到这张图。
+ */
+export function useClipboardImage(scopeRef?: RefObject<HTMLElement | null>) {
   const [images, setImages] = useState<ImageAttachment[]>([]);
 
   // 新增一张图片：既加入待发送列表，又异步存入素材中转池。
@@ -42,6 +51,16 @@ export function useClipboardImage() {
 
   useEffect(() => {
     const handler = async (e: ClipboardEvent) => {
+      // ★ 多 pane 场景下用 scopeRef 限制生效范围:只有当前聚焦的 textarea
+      //    对应的 hook 处理粘贴,其它 pane 一律放行。否则一次粘贴会让所有
+      //    pane 都拿到同一张图。
+      if (scopeRef) {
+        const el = scopeRef.current;
+        const active = document.activeElement;
+        if (!el || !active || !(el === active || el.contains(active))) {
+          return;
+        }
+      }
       // ★ HTML paste with embedded base64 images（e.g. from ScratchPad copy-all）
       const html = e.clipboardData?.getData('text/html');
       if (html) {
@@ -109,7 +128,7 @@ export function useClipboardImage() {
     };
     document.addEventListener('paste', handler);
     return () => document.removeEventListener('paste', handler);
-  }, [readFromClipboard, addImage]);
+  }, [readFromClipboard, addImage, scopeRef]);
 
   return { images, removeImage, clearImages, readFromClipboard };
 }
