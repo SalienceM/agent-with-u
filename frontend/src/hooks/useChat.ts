@@ -476,8 +476,29 @@ export function useChat(sessionId: string, backendId: string, backends?: any[], 
           sessionState.isStreaming = false;
           sessionState.messageId = null;
 
-          setMessages((prev) =>
-            prev.map((m) => {
+          setMessages((prev) => {
+            // 兜底:assistant 气泡不再有占位 push,如果整个流程没产生任何
+            // 有内容的 delta 就到 done,prev 里找不到这条消息,需要在这里
+            // 把它补上,否则 final 内容会丢。
+            if (!prev.some((m) => m.id === mid)) {
+              return [
+                ...prev,
+                {
+                  id: mid,
+                  role: 'assistant',
+                  content: finalText,
+                  thinking: finalThinking,
+                  toolCalls: finalToolCalls,
+                  contentBlocks: finalBlocks,
+                  streaming: false,
+                  elapsed: finalElapsed,
+                  timestamp: Date.now() / 1000,
+                  backendId,
+                  ...(delta.usage ? { usage: delta.usage } : {}),
+                },
+              ];
+            }
+            return prev.map((m) => {
               if (m.id !== mid) return m;
               return {
                 ...m,
@@ -489,8 +510,8 @@ export function useChat(sessionId: string, backendId: string, backends?: any[], 
                 elapsed: finalElapsed,
                 ...(delta.usage ? { usage: delta.usage } : {}),
               };
-            })
-          );
+            });
+          });
           setIsStreaming(false);
           break;
         }
@@ -512,8 +533,26 @@ export function useChat(sessionId: string, backendId: string, backends?: any[], 
           sessionState.isStreaming = false;
           sessionState.messageId = null;
 
-          setMessages((prev) =>
-            prev.map((m) =>
+          setMessages((prev) => {
+            // 同上,error 也要兜底
+            if (!prev.some((m) => m.id === mid)) {
+              return [
+                ...prev,
+                {
+                  id: mid,
+                  role: 'assistant',
+                  content: errText + `\n\n**Error:** ${delta.error}`,
+                  thinking: errThinking,
+                  toolCalls: errToolCalls,
+                  contentBlocks: errBlocks,
+                  streaming: false,
+                  elapsed: errElapsed,
+                  timestamp: Date.now() / 1000,
+                  backendId,
+                },
+              ];
+            }
+            return prev.map((m) =>
               m.id === mid
                 ? {
                     ...m,
@@ -525,8 +564,8 @@ export function useChat(sessionId: string, backendId: string, backends?: any[], 
                     elapsed: errElapsed,
                   }
                 : m
-            )
-          );
+            );
+          });
           setIsStreaming(false);
           break;
         }
@@ -593,16 +632,19 @@ export function useChat(sessionId: string, backendId: string, backends?: any[], 
         timestamp: Date.now() / 1000,
       };
       const assistantId = uuid();
-      const assistantMsg: ChatMessage = {
-        id: assistantId,
-        role: 'assistant',
-        content: '',
-        timestamp: Date.now() / 1000,
-        backendId,
-        streaming: true,
-      };
 
-      setMessages((prev) => [...prev, userMsg, assistantMsg]);
+      // ★ 只 push 用户消息,不 push 占位 assistant 气泡。
+      //    之前这里会立刻 push 一个 content='' + streaming=true 的 assistant
+      //    placeholder——backend 第一个 delta 飞过来之前(过中继可能 1 秒以
+      //    上),用户看到的就是个孤零零空插入符气泡。瞬切时这个占位会一直
+      //    挂在那里,造成「闪空光标」体感。
+      //    现在等第一个有内容的 delta 到达时,scheduleStreamingUpdate 的 push
+      //    分支(gate 在 hasContent 上)会自动创建 assistant 气泡。期间用户
+      //    通过 ChatInput 的边框变绿 / 发送按钮变中止按钮 拿到「正在响应」
+      //    的反馈。
+      //    边界:如果 backend 直接发 done 没有任何内容 delta(理论上少见,
+      //    比如模型空回复),'done' / 'error' 分支会兜底创建气泡。
+      setMessages((prev) => [...prev, userMsg]);
       setIsStreaming(true);
 
       // ★ 初始化全局流式状态（会自动清理之前的错误状态）
