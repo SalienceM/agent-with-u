@@ -253,14 +253,27 @@ export function useChat(sessionId: string, backendId: string, backends?: any[], 
     setIsStreaming(hasActiveStream);
     if (hasActiveStream) syncFromGlobalState(globalState);
 
+    // ★ 防 race:快速切换时旧 session 的 loadSession Promise 可能比新 session
+    //   先 resolve,如果不拦,旧的 setMessages 会把当前 session 的 UI 改成
+    //   旧的内容(可能还是个 content='' 的幽灵)。Effect cleanup 把 cancelled
+    //   翻成 true,异步回调就直接吐回去。
+    let cancelled = false;
+
     api.loadSession(sessionId).then((session) => {
+      if (cancelled) return;
       if (session?.messages) {
         const loadedMessages = session.messages.map(normalizeMessage);
 
         // ★ 重新读一次 state——RPC 往返期间流可能又推进了好几个 delta。
         const latest = getStreamState(sessionId);
         const stillStreaming = !!(latest.isStreaming && latest.messageId);
-        if (stillStreaming && latest.messageId) {
+        const latestHasContent = !!(
+          latest.text ||
+          latest.thinking ||
+          latest.toolCalls.length > 0 ||
+          latest.contentBlocks.length > 0
+        );
+        if (stillStreaming && latest.messageId && latestHasContent) {
           const hasStreamingMsg = loadedMessages.some(
             (m: ChatMessage) => m.id === latest.messageId,
           );
@@ -294,6 +307,9 @@ export function useChat(sessionId: string, backendId: string, backends?: any[], 
     //   切回来时由上面的「水合」逻辑读出来。
     //   仅在 session 删除(useStreamState.clearStreamStateForSession)
     //   和 WS 重连时(下面 isStreamingRef 卡死分支)主动清理。
+    return () => {
+      cancelled = true;
+    };
   }, [sessionId, syncFromGlobalState]);
 
   // ── sessionUpdated 监听（compact 等后端操作完成后重载）──
