@@ -251,6 +251,7 @@ function handleMessage(e: MessageEvent) {
 function doConnect(url: string, onSettled?: () => void) {
   const socket = new WebSocket(url);
   let settled = false;
+  let wasCurrent = false; // 本 socket 是否曾被设为 ws（即握手成功过）
   const settle = () => { if (!settled) { settled = true; onSettled?.(); } };
   // ★ 经中继连接时，WS 打开后还要先完成 hello/ready 握手才算连上
   const target = connectionTarget;
@@ -258,6 +259,7 @@ function doConnect(url: string, onSettled?: () => void) {
 
   const finishConnect = () => {
     ws = socket;
+    wasCurrent = true;
     useMock = false;
     reconnectDelay = 1000; // 成功后重置退避
     if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
@@ -310,13 +312,17 @@ function doConnect(url: string, onSettled?: () => void) {
   };
 
   socket.onclose = () => {
-    if (ws === socket) {
+    if (wasCurrent && ws === socket) {
       ws = null;
       // ★ 停止心跳
       if (heartbeatTimer) { clearInterval(heartbeatTimer); heartbeatTimer = null; }
       // ★ 连接断开时 reject 所有挂起请求，让调用方能区分连接错误和正常 null 响应
       pending.forEach(({ reject }) => reject(new Error('WebSocket connection lost')));
       pending.clear();
+      connectionStatusCallbacks.forEach((cb) => cb(false));
+    } else if (!wasCurrent) {
+      // 本 socket 从未握手成功（例如首次连接就 502）。通知 UI 进入未连接状态，
+      // 否则 App 的「正在连接后端...」加载页会一直卡住，用户无法进入「连接」面板。
       connectionStatusCallbacks.forEach((cb) => cb(false));
     }
     settle();
