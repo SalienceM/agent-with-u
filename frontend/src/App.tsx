@@ -13,7 +13,7 @@ import { ServerDirPicker } from './components/ServerDirPicker';
 import { LogViewer } from './components/LogViewer';
 import { AuthStatusBanner } from './components/AuthStatusBanner';
 import { ConnectionPanel } from './components/ConnectionPanel';
-import { useChat } from './hooks/useChat';
+import { useChat, clearSessionHistoryCache } from './hooks/useChat';
 import { clearStreamStateForSession } from './hooks/useStreamState';
 import { useConfig } from './hooks/useConfig';
 import { themes } from './hooks/useConfig';
@@ -669,9 +669,10 @@ export const App: React.FC = () => {
         }}
         onNewSession={handleNewSession}
         onDeleteSession={(id) => {
-          // session 被删后顺手把它在 streamStates Map 里的累积数据也清掉,
-          // 防止「删而不洗」的内存泄漏。
+          // session 被删后顺手把它在 streamStates Map 和历史缓存里的数据也
+          // 清掉,防止「删而不洗」的内存泄漏。
           clearStreamStateForSession(id);
+          clearSessionHistoryCache(id);
           if (id === activeSessionId) setActiveSessionId(null);
         }}
         streamingSessions={streamingSessions}

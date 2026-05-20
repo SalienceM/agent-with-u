@@ -137,6 +137,15 @@ function normalizeMessage(msg: any): ChatMessage {
   };
 }
 
+// 模块级历史缓存:loadSession RPC 比较慢(尤其经中继),切换 session 时如果
+// 同步可以从缓存里立刻拿出历史 + 当前流式 tail,就不会出现「先一条流再几条
+// 历史」的跳变。loadSession 回来后用最新结果覆盖缓存。
+const sessionHistoryCache = new Map<string, ChatMessage[]>();
+
+export function clearSessionHistoryCache(sessionId: string): void {
+  sessionHistoryCache.delete(sessionId);
+}
+
 export function useChat(sessionId: string, backendId: string, backends?: any[], skipPermissions: boolean = true, onNewSession?: () => void, onClearContext?: () => void) {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [isStreaming, setIsStreaming] = useState(false);
@@ -198,47 +207,72 @@ export function useChat(sessionId: string, backendId: string, backends?: any[], 
 
     // ★ 先检查全局流式状态
     const globalState = getStreamState(sessionId);
-    const hasActiveStream = globalState.isStreaming && globalState.messageId;
+    const hasActiveStream = !!(globalState.isStreaming && globalState.messageId);
+
+    // ★ 同步水合:如果切到的 session 正在流,立刻把(历史缓存 +)当前累积的
+    //    streaming 消息渲染出来,不等 loadSession 的 RPC 往返。否则切换瞬间
+    //    到 RPC 返回之间会看到 stale 的 A 内容,或者一个空 messages → 闪动
+    //    插入符。loadSession 异步回来后下面再 setMessages 一次,用最新历史
+    //    替换缓存。
+    const cachedHistory = sessionHistoryCache.get(sessionId);
+    if (hasActiveStream && globalState.messageId) {
+      const tail = buildStreamingMessage(globalState, {
+        id: globalState.messageId,
+        role: 'assistant',
+        content: '',
+        timestamp: Date.now() / 1000,
+        streaming: true,
+      });
+      // 缓存里如果已经有该 streaming 消息,替换;否则直接 push 在末尾。
+      const base = cachedHistory ? [...cachedHistory] : [];
+      const idx = base.findIndex((m) => m.id === tail.id);
+      if (idx >= 0) base[idx] = tail;
+      else base.push(tail);
+      setMessages(base);
+      setIsStreaming(true);
+      syncFromGlobalState(globalState);
+    } else if (cachedHistory) {
+      // 无流式但有缓存:立刻显示缓存,loadSession 回来后覆盖。
+      setMessages(cachedHistory);
+      setIsStreaming(false);
+    } else {
+      setIsStreaming(false);
+    }
 
     api.loadSession(sessionId).then((session) => {
       if (session?.messages) {
-        // 加载持久化的消息
         const loadedMessages = session.messages.map(normalizeMessage);
 
-        // ★ 如果有正在进行的流式消息，需要合并
-        if (hasActiveStream && globalState.messageId) {
-          // 检查是否已包含该消息
-          const hasStreamingMsg = loadedMessages.some((m: ChatMessage) => m.id === globalState.messageId);
-          if (!hasStreamingMsg && (globalState.text || globalState.thinking || globalState.toolCalls.length > 0)) {
-            // 添加流式消息
-            const streamingMsg: ChatMessage = {
-              id: globalState.messageId,
+        // ★ 重新读一次 state——RPC 往返期间流可能又推进了好几个 delta。
+        const latest = getStreamState(sessionId);
+        const stillStreaming = !!(latest.isStreaming && latest.messageId);
+        if (stillStreaming && latest.messageId) {
+          const hasStreamingMsg = loadedMessages.some(
+            (m: ChatMessage) => m.id === latest.messageId,
+          );
+          if (!hasStreamingMsg) {
+            const tail = buildStreamingMessage(latest, {
+              id: latest.messageId,
               role: 'assistant',
-              content: globalState.text,
+              content: '',
               timestamp: Date.now() / 1000,
               streaming: true,
-              thinking: globalState.thinking || undefined,
-              toolCalls: globalState.toolCalls.length > 0 ? globalState.toolCalls : undefined,
-              contentBlocks: globalState.contentBlocks.length > 0 ? globalState.contentBlocks : undefined,
-            };
-            loadedMessages.push(streamingMsg);
+            });
+            loadedMessages.push(tail);
           }
         }
-
+        // ★ 更新历史缓存(只缓存非 streaming 的「定稿」消息,避免下次切回来
+        //    看到一个错位的 stale 流式版本)。
+        sessionHistoryCache.set(
+          sessionId,
+          loadedMessages.filter((m: ChatMessage) => !m.streaming),
+        );
         setMessages(loadedMessages);
       }
       if (session?.autoContinue !== undefined) {
         setAutoContinue(session.autoContinue);
       }
     });
-
-    // ★ 恢复流式状态
-    if (hasActiveStream) {
-      setIsStreaming(true);
-      syncFromGlobalState(globalState);
-    } else {
-      setIsStreaming(false);
-    }
 
     // ⚠ 不要在 cleanup 里清流式状态。
     //   切换 session 时旧 session 可能还在后台流,清掉会丢中间内容。
