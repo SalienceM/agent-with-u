@@ -1,25 +1,23 @@
-import React, { useState, useCallback, useEffect, useRef, useMemo } from 'react';
+import React, { useState, useCallback, useEffect, useRef } from 'react';
 import { api, isTauri } from './api';
 import { Sidebar } from './components/Sidebar';
-import { MessageBubble } from './components/MessageBubble';
-import { ChatInput } from './components/ChatInput';
 import { Settings } from './components/Settings';
 import { BackendManager } from './components/BackendManager';
 import { RepoPanel } from './components/RepoPanel';
-import { PermissionGate } from './components/PermissionGate';
 import { ScratchPad } from './components/ScratchPad';
 import { AssetPanel } from './components/AssetPanel';
 import { ServerDirPicker } from './components/ServerDirPicker';
 import { LogViewer } from './components/LogViewer';
 import { AuthStatusBanner } from './components/AuthStatusBanner';
 import { ConnectionPanel } from './components/ConnectionPanel';
-import { useChat, clearSessionHistoryCache } from './hooks/useChat';
+import { ChatPane } from './components/ChatPane';
+import { clearSessionHistoryCache } from './hooks/useChat';
 import { clearStreamStateForSession } from './hooks/useStreamState';
 import { useConfig } from './hooks/useConfig';
 import { themes } from './hooks/useConfig';
 import { useIsMobile } from './hooks/useIsMobile';
-import { messagesToMarkdown, messagesToJson } from './utils/markdown';
 import { hljsLightCss, hljsDarkCss } from './utils/hljsThemes';
+import { messagesToMarkdown, messagesToJson } from './utils/markdown';
 
 function hexToRgba(color: string, alpha: number): string {
   const m = color.match(/^#([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})/i);
@@ -27,11 +25,15 @@ function hexToRgba(color: string, alpha: number): string {
   return `rgba(${parseInt(m[1], 16)},${parseInt(m[2], 16)},${parseInt(m[3], 16)},${alpha.toFixed(2)})`;
 }
 
+type Layout = '1x1' | '1x2' | '2x2';
+
+const LAYOUT_SLOTS: Record<Layout, number> = { '1x1': 1, '1x2': 2, '2x2': 4 };
+const LAYOUT_CYCLE: Layout[] = ['1x1', '1x2', '2x2'];
+const LAYOUT_LABEL: Record<Layout, string> = { '1x1': '1×1', '1x2': '1×2', '2x2': '2×2' };
+
 export const App: React.FC = () => {
   const [backends, setBackends] = useState<any[]>([]);
   const [sessions, setSessions] = useState<any[]>([]);
-  const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
-  const [activeSession, setActiveSession] = useState<any | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [backendManagerOpen, setBackendManagerOpen] = useState(false);
   const [repoPanelOpen, setRepoPanelOpen] = useState(false);
@@ -39,8 +41,6 @@ export const App: React.FC = () => {
   const [connPanelOpen, setConnPanelOpen] = useState(false);
   const [repoPanelEditing, setRepoPanelEditing] = useState(false);
   const [newSessionDialogOpen, setNewSessionDialogOpen] = useState(false);
-  const [skipPermissions, setSkipPermissions] = useState(true);  // ★ 权限模式开关
-  const [sandboxEnabled, setSandboxEnabled] = useState(true);   // ★ 沙盒模式开关
   const [streamingSessions, setStreamingSessions] = useState<Set<string>>(new Set());  // ★ Per-session streaming state
   const [completedSessions, setCompletedSessions] = useState<Set<string>>(() => {
     // ★ 持久化：从 localStorage 恢复未确认的完成通知
@@ -60,18 +60,49 @@ export const App: React.FC = () => {
   const [scratchPadWidth, setScratchPadWidth] = useState(360);
   const [assetPanelOpen, setAssetPanelOpen] = useState(false);
   const scratchDragRef = useRef<{ startX: number; startW: number } | null>(null);
-  const [visibleCount, setVisibleCount] = useState(6);  // ★ 默认显示最近几条（3 轮对话）
   const toastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const initialCheckDoneRef = useRef(false);          // ★ 防止 NewSessionDialog 重复弹出
+
+  // ── 分屏布局状态(localStorage 持久化) ────────────────────────────────
+  // layout: 当前几宫格;paneSessions: 每个 pane 对应的 sessionId;
+  // focusedPaneIdx: 当前焦点 pane,新建 / 侧边栏选中 / 顶栏元数据都跟随它走。
+  const [layout, setLayout] = useState<Layout>(() => {
+    try {
+      const saved = localStorage.getItem('agent-with-u:layout');
+      if (saved === '1x1' || saved === '1x2' || saved === '2x2') return saved;
+    } catch {}
+    return '1x1';
+  });
+  const [paneSessions, setPaneSessions] = useState<(string | null)[]>(() => {
+    try {
+      const saved = localStorage.getItem('agent-with-u:pane-sessions');
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        if (Array.isArray(parsed) && parsed.length === 4) return parsed;
+      }
+    } catch {}
+    return [null, null, null, null];
+  });
+  const [focusedPaneIdx, setFocusedPaneIdx] = useState(0);
+
+  // 当前焦点 pane 对应的 sessionId(派生,不再是独立 state)
+  const activeSessionId = paneSessions[focusedPaneIdx] ?? null;
   const activeSessionIdRef = useRef(activeSessionId);
   activeSessionIdRef.current = activeSessionId;
-  const endRef = useRef<HTMLDivElement>(null);
-  const scrollContainerRef = useRef<HTMLDivElement>(null);
-  const autoScrollRef = useRef(true);          // ★ 用 ref 避免 onScroll 闭包捕获旧值
-  const [showScrollBtn, setShowScrollBtn] = useState(false);
-  const prevStreamingRef = useRef(false);
-  const animSessionRef = useRef<string | null>(null); // 记录上次渲染时的 sessionId
-  const animMsgCountRef = useRef(0);                  // 记录上次渲染时的消息数
-  const initialCheckDoneRef = useRef(false);          // ★ 防止 NewSessionDialog 重复弹出
+
+  // 焦点 pane 的 session 详情(顶栏展示 workingDir / backendId 用)
+  const [activeSession, setActiveSession] = useState<any | null>(null);
+
+  // 把 sessionId 写入指定 pane(默认焦点 pane)的小工具
+  const setSessionInPane = useCallback((id: string | null, paneIdx?: number) => {
+    setPaneSessions((prev) => {
+      const idx = paneIdx ?? focusedPaneIdx;
+      if (prev[idx] === id) return prev;
+      const next = [...prev];
+      next[idx] = id;
+      return next;
+    });
+  }, [focusedPaneIdx]);
 
   const { config, updateConfig, resetConfig, reloadConfig } = useConfig();
   const isMobile = useIsMobile();
@@ -88,6 +119,20 @@ export const App: React.FC = () => {
       localStorage.setItem('agent-with-u:completed-sessions', JSON.stringify([...completedSessions]));
     } catch {}
   }, [completedSessions]);
+
+  // ★ layout / paneSessions 持久化到 localStorage
+  useEffect(() => {
+    try { localStorage.setItem('agent-with-u:layout', layout); } catch {}
+  }, [layout]);
+  useEffect(() => {
+    try { localStorage.setItem('agent-with-u:pane-sessions', JSON.stringify(paneSessions)); } catch {}
+  }, [paneSessions]);
+
+  // 焦点 pane 索引超出当前布局时,回落到 0,防止顶栏读到隐藏 pane 的 session
+  useEffect(() => {
+    const slots = LAYOUT_SLOTS[layout];
+    if (focusedPaneIdx >= slots) setFocusedPaneIdx(0);
+  }, [layout, focusedPaneIdx]);
 
   /* ---- 后端连接状态 ---- */
   useEffect(() => {
@@ -115,19 +160,24 @@ export const App: React.FC = () => {
     api.getBackends().then(setBackends);
     api.listSessions().then((list) => {
       setSessions(list);
-      // 仅在没有活跃 session 时执行初始选择，避免重连时打断用户操作
-      setActiveSessionId((current) => {
-        if (current) return current;
-        if (list.length > 0) return list[0].id;
+      // 仅在焦点 pane 还没绑 session 时执行初始选择,避免重连打断用户。
+      setPaneSessions((prev) => {
+        const idx = focusedPaneIdx;
+        if (prev[idx]) return prev;
+        if (list.length > 0) {
+          const next = [...prev];
+          next[idx] = list[0].id;
+          return next;
+        }
         // 没有任何 session，打开新建对话框
         setNewSessionDialogOpen((open) => { if (!open) return true; return open; });
-        return null;
+        return prev;
       });
     });
     reloadConfig();
   }, [backendConnected]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  /* ---- 切换 session 时刷新侧边栏列表 ---- */
+  /* ---- 切换焦点 session 时刷新侧边栏列表 ---- */
   useEffect(() => {
     if (!activeSessionId || backendConnected !== true) return;
     api.listSessions().then(setSessions);
@@ -143,84 +193,30 @@ export const App: React.FC = () => {
       }
       api.listSessions().then((list) => {
         setSessions(list);
-        // 当前正在查看的 session 被其它客户端删除：切到剩余的第一个。
+        // 当前正在查看的 session 被其它客户端删除:把任何 pane 里指向它的位置清掉
         if (t === 'session_deleted') {
-          setActiveSessionId((current) =>
-            current === data.sessionId ? (list[0]?.id ?? null) : current);
+          setPaneSessions((prev) => prev.map((s) => (s === data.sessionId ? null : s)));
         }
       });
     });
   }, [backendConnected]);
 
-  /* ---- 加载当前 session 详情（含 backendId） ---- */
+  /* ---- 加载焦点 pane 的 session 详情(用于顶栏 workingDir / backend 展示) ---- */
   useEffect(() => {
     if (!activeSessionId) {
       setActiveSession(null);
       return;
     }
-    setVisibleCount(6);  // ★ 切换 session 时重置为只显示最近几条
+    let cancelled = false;
     api.loadSession(activeSessionId).then((session) => {
+      if (cancelled) return;
       setActiveSession(session);
-      // ★ 从 session 加载 skipPermissions / sandboxEnabled 状态
-      if (session?.skipPermissions !== undefined) {
-        setSkipPermissions(session.skipPermissions);
-      }
-      if (session?.sandboxEnabled !== undefined) {
-        setSandboxEnabled(session.sandboxEnabled);
-      }
     });
+    return () => { cancelled = true; };
   }, [activeSessionId]);
 
-  // Phase 2: 每 Session 独立的模型配置
+  // Phase 2: 每 Session 独立的模型配置(顶栏标签用)
   const activeBackendId = activeSession?.backendId || backends[0]?.id || '';
-
-  // /new 命令：复用当前 workingDir + backendId，免弹窗静默建 session
-  const handleQuickNewSession = useCallback(async () => {
-    const workingDir = activeSession?.workingDir || '.';
-    const bId = activeBackendId;
-    const session = await api.createSession(workingDir, bId);
-    setActiveSessionId(session.id);
-    const sessionList = await api.listSessions();
-    setSessions(sessionList);
-    window.dispatchEvent(new CustomEvent('session-created'));
-  }, [activeSession?.workingDir, activeBackendId]);
-
-  const handleClearContext = useCallback(async () => {
-    if (!activeSessionId) return;
-    await api.clearSessionContext(activeSessionId);
-    // sessionUpdated 'context_cleared' 事件会触发 useChat 清空消息列表
-  }, [activeSessionId]);
-
-  const chat = useChat(activeSessionId || '', activeBackendId, backends, skipPermissions, handleQuickNewSession, handleClearContext);
-
-  // ── 性能：稳定化传给子组件的回调，避免 ChatInput/MessageList 因父 state 变化而整体重渲染 ──
-  const handleSkipPermissionsChange = useCallback((enabled: boolean) => {
-    setSkipPermissions(enabled);
-    if (activeSessionId) {
-      api.executeCommand({
-        command: 'set_skip_permissions',
-        sessionId: activeSessionId,
-        backendId: activeBackendId,
-        args: { enabled },
-      });
-    }
-  }, [activeSessionId, activeBackendId]);
-
-  const handleSandboxChange = useCallback((enabled: boolean) => {
-    setSandboxEnabled(enabled);
-    if (activeSessionId) {
-      api.executeCommand({
-        command: 'set_sandbox_enabled',
-        sessionId: activeSessionId,
-        backendId: activeBackendId,
-        args: { enabled },
-      });
-    }
-  }, [activeSessionId, activeBackendId]);
-
-  const handleCompact = useCallback(() => {
-    handleClearContext();
-  }, [handleClearContext]);
 
   // ── 性能：便签本拖拽 handler，onMouseDown 每次渲染都会重新生成，改为 ref 方案 ──
   const scratchPadWidthRef = useRef(scratchPadWidth);
@@ -242,28 +238,17 @@ export const App: React.FC = () => {
     window.addEventListener('mouseup', onUp);
   }, []);
 
-  // ── 性能：可见消息列表，流式时 slice 代价高，memo 避免每帧都创建新数组 ──
-  const visibleMessages = useMemo(() => {
-    const total = chat.messages.length;
-    const effectiveVisible = Math.max(visibleCount, chat.isStreaming ? total : visibleCount);
-    const hiddenCount = Math.max(0, total - effectiveVisible);
-    return { list: hiddenCount > 0 ? chat.messages.slice(hiddenCount) : chat.messages, hiddenCount, total };
-  }, [chat.messages, visibleCount, chat.isStreaming]);
-
-  // ★ 活跃 session 的流状态同步（开始/结束）
-  useEffect(() => {
-    if (activeSessionId) {
-      setStreamingSessions((prev) => {
-        const next = new Set(prev);
-        if (chat.isStreaming) {
-          next.add(activeSessionId);
-        } else {
-          next.delete(activeSessionId);
-        }
-        return next;
-      });
-    }
-  }, [chat.isStreaming, activeSessionId]);
+  // ★ ChatPane 把自己的 isStreaming 状态上报到这里聚合,用于侧边栏指示灯。
+  //   多个 pane 同时跑各自的 session 时,App 用这个 Set 决定哪些 session 在跑。
+  const handleStreamingChange = useCallback((sid: string, streaming: boolean) => {
+    setStreamingSessions((prev) => {
+      const has = prev.has(sid);
+      if (streaming === has) return prev;
+      const next = new Set(prev);
+      if (streaming) next.add(sid); else next.delete(sid);
+      return next;
+    });
+  }, []);
 
   // ★ 全局监听所有 session 的 done/error
   // 修正两个 bug：
@@ -295,55 +280,8 @@ export const App: React.FC = () => {
     return unsub;
   }, [activeSessionIdRef]);
 
-  /* ---- 自动滚到底部 ---- */
-  const prevSessionRef = useRef(activeSessionId);
-  useEffect(() => {
-    const switched = prevSessionRef.current !== activeSessionId;
-    prevSessionRef.current = activeSessionId;
-    // 切换 session 时始终滚到底并重置跟踪状态
-    if (switched) {
-      autoScrollRef.current = true;
-      setShowScrollBtn(false);
-    }
-    if (!autoScrollRef.current) return;
-    requestAnimationFrame(() => {
-      endRef.current?.scrollIntoView({ behavior: switched ? 'instant' : 'smooth' });
-    });
-  }, [chat.messages, activeSessionId]);
-
-  // ★ 每次新交互开始（streaming 启动）时重置跟踪
-  useEffect(() => {
-    if (chat.isStreaming && !prevStreamingRef.current) {
-      autoScrollRef.current = true;
-      setShowScrollBtn(false);
-    }
-    prevStreamingRef.current = chat.isStreaming;
-  }, [chat.isStreaming]);
-
-  // ★ 滚动事件：用户向上滚 → 暂停跟踪；回到底部 → 恢复跟踪
-  const handleScroll = useCallback(() => {
-    const el = scrollContainerRef.current;
-    if (!el) return;
-    const atBottom = el.scrollTop + el.clientHeight >= el.scrollHeight - 80;
-    if (atBottom) {
-      if (!autoScrollRef.current) {
-        autoScrollRef.current = true;
-        setShowScrollBtn(false);
-      }
-    } else {
-      if (autoScrollRef.current) {
-        autoScrollRef.current = false;
-        setShowScrollBtn(true);
-      }
-    }
-  }, []);
-
-  // ★ 点击"跟踪最新"按钮
-  const scrollToBottom = useCallback(() => {
-    autoScrollRef.current = true;
-    setShowScrollBtn(false);
-    endRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, []);
+  // 自动滚动 / 跟踪最新 / 滚动事件全部下沉到 ChatPane 内部 ——
+  // 每个 pane 维护自己的 endRef / scrollContainerRef / autoScrollRef。
 
   /* ---- 新建会话 ---- */
   const handleNewSession = useCallback(() => {
@@ -354,7 +292,8 @@ export const App: React.FC = () => {
   const handleCreateSession = useCallback(async (workingDir: string, backendId: string) => {
     const session = await api.createSession(workingDir, backendId);
     // ★ Set session first, then close dialog in next render cycle to avoid visual tearing
-    setActiveSessionId(session.id);
+    // 分屏架构下:把新 session 放进焦点 pane,activeSessionId 自动派生过去。
+    setSessionInPane(session.id);
     // ★ Dispatch with session data → Sidebar optimistically inserts it immediately
     window.dispatchEvent(new CustomEvent('session-created', { detail: session }));
     // ★ Also refresh App's own sessions state (for BackendManager etc.)
@@ -362,27 +301,41 @@ export const App: React.FC = () => {
     requestAnimationFrame(() => {
       setNewSessionDialogOpen(false);
     });
-  }, []);
+  }, [setSessionInPane]);
 
 
-  /* ---- 导出聊天记录 ---- */
-  const handleExportChat = useCallback(() => {
-    if (chat.messages.length === 0) return;
-
-    const text =
-      config.exportFormat === 'markdown'
-        ? messagesToMarkdown(chat.messages)
-        : messagesToJson(chat.messages);
-
-    const ext = config.exportFormat === 'markdown' ? 'md' : 'json';
-    const blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `chat-export-${new Date().toISOString().slice(0, 10)}.${ext}`;
-    a.click();
-    URL.revokeObjectURL(url);
-  }, [chat.messages, config.exportFormat]);
+  /* ---- 导出聊天记录(导出焦点 pane 的会话) ----
+   * 分屏后 App 不再持有 chat.messages,按需从后端拉焦点 session 再导出。
+   * 流式中的中间内容没持久化会被忽略——导出本就是「定稿」用途。
+   */
+  const handleExportChat = useCallback(async () => {
+    if (!activeSessionId) {
+      showToast('info', '请先选中一个会话');
+      return;
+    }
+    try {
+      const session = await api.loadSession(activeSessionId);
+      const msgs = session?.messages ?? [];
+      if (msgs.length === 0) {
+        showToast('info', '当前会话还没有消息可导出');
+        return;
+      }
+      const text =
+        config.exportFormat === 'markdown'
+          ? messagesToMarkdown(msgs)
+          : messagesToJson(msgs);
+      const ext = config.exportFormat === 'markdown' ? 'md' : 'json';
+      const blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `chat-export-${new Date().toISOString().slice(0, 10)}.${ext}`;
+      a.click();
+      URL.revokeObjectURL(url);
+    } catch (e: any) {
+      showToast('error', `导出失败:${e?.message ?? e}`);
+    }
+  }, [activeSessionId, config.exportFormat, showToast]);
 
   /* ---- 数据导出 ---- */
   const runExport = useCallback(async (targetPath: string) => {
@@ -482,21 +435,20 @@ export const App: React.FC = () => {
   const handleDeleteBackend = useCallback(async (id: string, dependentSessions: any[] = [], targetBackendId?: string) => {
     // If there are dependent sessions and a target backend is specified, migrate them
     if (dependentSessions.length > 0 && targetBackendId) {
-      let newActiveId: string | null = null;
-      // Migrate all dependent sessions to the target backend
+      // 记录每个旧 session 迁移后对应的新 session id,后面统一替换 paneSessions
+      const idMap = new Map<string, string>();
       for (const session of dependentSessions) {
         const result = await api.migrateSession(session.id, targetBackendId);
-        // ★ 如果迁移的是当前活跃 session，记住新 session ID
-        if (session.id === activeSessionId && result?.newSessionId) {
-          newActiveId = result.newSessionId;
+        if (result?.newSessionId) {
+          idMap.set(session.id, result.newSessionId);
         }
       }
       // Refresh sessions after migration
       const sessionList = await api.listSessions();
       setSessions(sessionList);
-      // ★ 直接用迁移返回的 newSessionId 切换，避免匹配逻辑错误
-      if (newActiveId) {
-        setActiveSessionId(newActiveId);
+      // 把所有 pane 上指向已迁移 session 的位置一并替换为新 session id
+      if (idMap.size > 0) {
+        setPaneSessions((prev) => prev.map((s) => (s && idMap.has(s) ? idMap.get(s)! : s)));
       }
     }
 
@@ -504,7 +456,7 @@ export const App: React.FC = () => {
     // Refresh backend list
     const list = await api.getBackends();
     setBackends(list);
-  }, [backends, activeSessionId]);
+  }, [backends]);
 
   const theme = themes[config.theme] || themes.dark;
   const isLightTheme = config.theme === 'light' || config.theme === 'classic';
@@ -648,7 +600,8 @@ export const App: React.FC = () => {
         isMobile={isMobile}
         activeSessionId={activeSessionId}
         onSelectSession={(id) => {
-          setActiveSessionId(id);
+          // 分屏架构:把选中的 session 放到当前焦点 pane,activeSessionId 自动派生过去
+          setSessionInPane(id);
           // ★ 移动端：选中会话后自动收起抽屉
           if (isMobile) setSidebarCollapsed(true);
           // ★ 切换到该 session 即视为已查看，自动清除完成通知气泡
@@ -673,7 +626,8 @@ export const App: React.FC = () => {
           // 清掉,防止「删而不洗」的内存泄漏。
           clearStreamStateForSession(id);
           clearSessionHistoryCache(id);
-          if (id === activeSessionId) setActiveSessionId(null);
+          // 任何 pane 里指向已删除 session 的位置都置空
+          setPaneSessions((prev) => prev.map((s) => (s === id ? null : s)));
         }}
         streamingSessions={streamingSessions}
         completedSessions={completedSessions}
@@ -723,6 +677,19 @@ export const App: React.FC = () => {
             title="View backend logs"
           >
             📋{isMobile ? '' : ' Logs'}
+          </button>
+          {/* 分屏布局切换:1×1 → 1×2 → 2×2 循环 */}
+          <button
+            onClick={() => {
+              setLayout((cur) => {
+                const idx = LAYOUT_CYCLE.indexOf(cur);
+                return LAYOUT_CYCLE[(idx + 1) % LAYOUT_CYCLE.length];
+              });
+            }}
+            style={layoutBtnStyle}
+            title="分屏布局 (1×1 / 1×2 / 2×2)"
+          >
+            ▦ {LAYOUT_LABEL[layout]}
           </button>
           {/* 连接目标：本地直连 / 经中继访问远程执行节点 */}
           <button
@@ -779,144 +746,46 @@ export const App: React.FC = () => {
           />
         </div>
 
-        {/* ---- 消息列表 ---- */}
-        <div style={{ flex: 1, position: 'relative', overflow: 'hidden' }}>
-        <div ref={scrollContainerRef} onScroll={handleScroll} style={{ height: '100%', overflow: 'auto', padding: '16px 0' }}>
-          {chat.messages.length === 0 && (
-            <div
-              style={{
-                display: 'flex', flexDirection: 'column', alignItems: 'center',
-                justifyContent: 'center', height: '100%', gap: 8,
-              }}
-            >
-              <div style={{ fontSize: 24, fontWeight: 600, color: 'var(--theme-text-muted, #8c959f)' }}>
-                AgentWithU
-              </div>
-              <div style={{ fontSize: 14, color: 'var(--theme-text-muted, #8c959f)' }}>
-                Paste screenshots with Ctrl+V, switch models, save sessions.
-              </div>
+        {/* ---- 分屏布局:1×1 / 1×2 / 2×2 ---- *
+         * 每个 ChatPane 内部独立 useChat,有自己的消息流、滚动、权限气泡和 ChatInput。
+         * App 仅负责派发焦点和聚合 streamingSessions(用于侧边栏指示灯)。
+         */}
+        {(() => {
+          const slotCount = LAYOUT_SLOTS[layout];
+          const gridCols = layout === '2x2' ? '1fr 1fr' : layout === '1x2' ? '1fr 1fr' : '1fr';
+          const gridRows = layout === '2x2' ? '1fr 1fr' : '1fr';
+          return (
+            <div style={{
+              flex: 1,
+              display: 'grid',
+              gridTemplateColumns: gridCols,
+              gridTemplateRows: gridRows,
+              gap: 4,
+              overflow: 'hidden',
+              minHeight: 0,
+              background: 'var(--theme-border)',
+            }}>
+              {Array.from({ length: slotCount }).map((_, idx) => (
+                <ChatPane
+                  key={idx}
+                  paneId={idx}
+                  sessionId={paneSessions[idx]}
+                  isFocused={focusedPaneIdx === idx}
+                  onFocus={() => setFocusedPaneIdx(idx)}
+                  backends={backends}
+                  config={config}
+                  themeBorderFocused="var(--theme-accent)"
+                  isMobile={isMobile}
+                  onRequestNewSession={handleNewSession}
+                  onSessionDeleted={(sid) => {
+                    setPaneSessions((prev) => prev.map((s) => (s === sid ? null : s)));
+                  }}
+                  onStreamingChange={handleStreamingChange}
+                />
+              ))}
             </div>
-          )}
-          {(() => {
-            // 只给真正新增的最后一条消息播入场动画，切换 session 时全部不播
-            // 注意：ref mutation 不能放 useMemo/useEffect 里，保留 IIFE 仅做动画判断
-            const { list: msgList, hiddenCount, total } = visibleMessages;
-            const isSameSession = animSessionRef.current === activeSessionId;
-            const prevCount = isSameSession ? animMsgCountRef.current : total;
-            animSessionRef.current = activeSessionId;
-            animMsgCountRef.current = total;
-
-            return (
-              <>
-                {hiddenCount > 0 && (
-                  <div style={{ display: 'flex', justifyContent: 'center', padding: '8px 16px' }}>
-                    <button
-                      onClick={() => setVisibleCount(total)}
-                      style={{
-                        padding: '6px 16px',
-                        borderRadius: 16,
-                        border: '1px solid var(--theme-border, rgba(0,0,0,0.12))',
-                        background: 'var(--theme-bg-secondary, #f6f8fa)',
-                        color: 'var(--theme-text-muted, #656d76)',
-                        fontSize: 12,
-                        cursor: 'pointer',
-                      }}
-                    >
-                      ↑ {hiddenCount} earlier messages
-                    </button>
-                  </div>
-                )}
-                {msgList.map((msg, idx) => (
-                  <MessageBubble
-                    key={msg.id}
-                    message={msg}
-                    fontSize={config.fontSize}
-                    renderMarkdown={config.renderMarkdown}
-                    animateIn={isSameSession && (hiddenCount + idx) >= prevCount}
-                  />
-                ))}
-                {/* ★ 行内权限确认组件 */}
-                {chat.pendingPermission && (
-                  <div style={{
-                    display: 'flex',
-                    justifyContent: 'flex-start',
-                    padding: '4px 16px',
-                  }}>
-                    <div style={{
-                      width: 28, height: 28, borderRadius: '50%', flexShrink: 0,
-                      background: 'var(--theme-accent, #7aa2f7)',
-                      display: 'flex', alignItems: 'center', justifyContent: 'center',
-                      fontSize: 13, color: '#fff', fontWeight: 700, marginRight: 8, marginTop: 2,
-                    }}>A</div>
-                    <div style={{
-                      maxWidth: '80%',
-                      minWidth: 280,
-                      borderRadius: '12px 12px 12px 4px',
-                      background: 'var(--theme-message-bg, #f6f8fa)',
-                      border: '1px solid var(--theme-border, rgba(0,0,0,0.12))',
-                      overflow: 'hidden',
-                    }}>
-                      <PermissionGate
-                        request={chat.pendingPermission}
-                        onDismiss={chat.clearPermission}
-                        onSkipRest={() => setSkipPermissions(true)}
-                      />
-                    </div>
-                  </div>
-                )}
-              </>
-            );
-          })()}
-
-          {/* 底部占位符 */}
-          <div ref={endRef} />
-        </div>
-
-        {/* ★ 跟踪暂停时的浮动提示按钮 */}
-        {showScrollBtn && (
-          <div style={{
-            position: 'absolute', bottom: 12, left: '50%',
-            transform: 'translateX(-50%)', zIndex: 50,
-          }}>
-            <button
-              onClick={scrollToBottom}
-              style={{
-                display: 'flex', alignItems: 'center', gap: 6,
-                padding: '6px 14px',
-                borderRadius: 20,
-                border: '1px solid var(--theme-border, rgba(0,0,0,0.18))',
-                background: 'var(--theme-bg-tertiary, #242536)',
-                color: 'var(--theme-text, #e2e3ea)',
-                fontSize: 12, fontWeight: 500,
-                cursor: 'pointer',
-                boxShadow: '0 2px 10px rgba(0,0,0,0.25)',
-                whiteSpace: 'nowrap',
-              }}
-            >
-              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
-                <path d="M12 5v14M5 12l7 7 7-7" />
-              </svg>
-              跟踪最新
-            </button>
-          </div>
-        )}
-        </div>
-
-        {/* ---- 输入栏 ---- */}
-        <ChatInput
-          onSend={chat.sendMessage}
-          onAbort={chat.abort}
-          isStreaming={chat.isStreaming}
-          backends={backends}
-          activeBackendId={activeBackendId}
-          sessionId={activeSessionId || undefined}
-          workingDir={activeSession?.workingDir || undefined}
-          skipPermissions={skipPermissions}
-          onSkipPermissionsChange={handleSkipPermissionsChange}
-          sandboxEnabled={sandboxEnabled}
-          onSandboxChange={handleSandboxChange}
-          onCompact={handleCompact}
-        />
+          );
+        })()}
       </div>
 
       {/* ---- 便签本：桌面端右侧列 / 移动端全屏覆盖 ---- */}
@@ -1125,7 +994,8 @@ const settingsBtnStyle: React.CSSProperties = {
   transition: 'color 0.15s',
 };
 
-const migrateBtnStyle: React.CSSProperties = {
+// 分屏布局切换按钮样式
+const layoutBtnStyle: React.CSSProperties = {
   background: 'var(--theme-bg-tertiary, #eaeef2)',
   border: '1px solid var(--theme-border, rgba(0,0,0,0.15))',
   color: 'var(--theme-text, #1f2328)',
@@ -1135,6 +1005,8 @@ const migrateBtnStyle: React.CSSProperties = {
   borderRadius: 6,
   transition: 'all 0.15s',
   marginRight: 8,
+  fontWeight: 500,
+  whiteSpace: 'nowrap',
 };
 
 const logBtnStyle: React.CSSProperties = {

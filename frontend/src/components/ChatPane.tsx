@@ -1,0 +1,450 @@
+import React, { useState, useCallback, useEffect, useRef, useMemo } from 'react';
+import { api } from '../api';
+import { MessageBubble } from './MessageBubble';
+import { ChatInput } from './ChatInput';
+import { PermissionGate } from './PermissionGate';
+import { useChat } from '../hooks/useChat';
+import type { AppConfig } from '../hooks/useConfig';
+
+// ChatPane: 自给自足的单 session 工作区。
+// 每个 pane 内部:
+//   1. 调用 useChat —— 独立的流式状态、消息列表、权限气泡
+//   2. 维护自己的滚动状态(autoScroll / 跟踪最新按钮)
+//   3. 维护自己的 visibleCount (只看最近几条 + 展开按钮)
+//   4. 维护自己的 activeSession 详情 (workingDir / backendId / skipPermissions / sandboxEnabled)
+//   5. 渲染消息列表 + 权限气泡 + ChatInput
+//
+// 多 pane 之间不直接通信;App 通过 onStreamingChange 回调聚合
+// "哪些 session 在流式" 状态,用于侧边栏指示灯。
+
+export interface ChatPaneProps {
+  paneId: number;                           // 0/1/2/3, 用于 React key
+  sessionId: string | null;                 // null = 空 pane
+  isFocused: boolean;                       // 是否当前焦点 pane
+  onFocus: () => void;                      // 点击 pane 时调用
+  backends: any[];                          // 共享 backends 列表
+  config: AppConfig;                        // 共享配置(fontSize, renderMarkdown)
+  themeBorderFocused: string;               // 焦点边框色
+  isMobile: boolean;
+  onRequestNewSession: () => void;          // 用户在这个 pane 想新建 session 时
+  onSessionDeleted?: (id: string) => void;  // 删除 session 后回调,清掉这个 pane
+  // 系统级 toast / 错误提示(预留, 当前未使用)
+  onToast?: (type: 'success' | 'error' | 'info', message: string) => void;
+  // 流式状态变化回调,App 用来聚合所有 pane 的 streaming 状态
+  onStreamingChange?: (sessionId: string, streaming: boolean) => void;
+}
+
+export const ChatPane: React.FC<ChatPaneProps> = ({
+  paneId,
+  sessionId,
+  isFocused,
+  onFocus,
+  backends,
+  config,
+  themeBorderFocused,
+  isMobile,
+  onRequestNewSession,
+  onStreamingChange,
+}) => {
+  // ── pane 自己的 session 详情(workingDir / backendId / skip / sandbox) ──
+  const [activeSession, setActiveSession] = useState<any | null>(null);
+  // 权限/沙盒 state: 初值从 session 读,变化时持久化
+  const [skipPermissions, setSkipPermissions] = useState(true);
+  const [sandboxEnabled, setSandboxEnabled] = useState(true);
+  // 可见消息条数(切换 session / 切回历史时只显示最近几条)
+  const [visibleCount, setVisibleCount] = useState(6);
+
+  // 滚动相关 refs (与 App 原有一致)
+  const endRef = useRef<HTMLDivElement>(null);
+  const scrollContainerRef = useRef<HTMLDivElement>(null);
+  const autoScrollRef = useRef(true);
+  const [showScrollBtn, setShowScrollBtn] = useState(false);
+  const prevStreamingRef = useRef(false);
+  const animSessionRef = useRef<string | null>(null);
+  const animMsgCountRef = useRef(0);
+  const prevSessionRef = useRef<string | null>(sessionId);
+
+  // 加载 session 详情(切换 sessionId 时重新拉)
+  useEffect(() => {
+    if (!sessionId) {
+      setActiveSession(null);
+      return;
+    }
+    // ★ 切换 session 时重置「只看最近几条」
+    setVisibleCount(6);
+    let cancelled = false;
+    api.loadSession(sessionId).then((session) => {
+      if (cancelled) return;
+      setActiveSession(session);
+      if (session?.skipPermissions !== undefined) {
+        setSkipPermissions(session.skipPermissions);
+      }
+      if (session?.sandboxEnabled !== undefined) {
+        setSandboxEnabled(session.sandboxEnabled);
+      }
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [sessionId]);
+
+  // 后端 ID:从 session 拿,fallback 到 backends[0]
+  const activeBackendId = activeSession?.backendId || backends[0]?.id || '';
+
+  // ── /new 命令处理:复用 workingDir + backendId,免弹窗静默新建 ──
+  // 注意:静默新建会切换当前 pane 的 session,需要走 onRequestNewSession 上抛
+  // 让 App 决定如何处理。这里简化处理:直接打开新建对话框。
+  const handleQuickNewSession = useCallback(async () => {
+    onRequestNewSession();
+  }, [onRequestNewSession]);
+
+  const handleClearContext = useCallback(async () => {
+    if (!sessionId) return;
+    await api.clearSessionContext(sessionId);
+  }, [sessionId]);
+
+  // ── 核心 useChat 调用 ──
+  const chat = useChat(
+    sessionId || '',
+    activeBackendId,
+    backends,
+    skipPermissions,
+    handleQuickNewSession,
+    handleClearContext,
+  );
+
+  // ── 向 App 上报流式状态,用于侧边栏指示灯 ──
+  useEffect(() => {
+    if (!sessionId) return;
+    onStreamingChange?.(sessionId, chat.isStreaming);
+  }, [sessionId, chat.isStreaming, onStreamingChange]);
+
+  // ── 持久化 skipPermissions ──
+  const handleSkipPermissionsChange = useCallback(
+    (enabled: boolean) => {
+      setSkipPermissions(enabled);
+      if (sessionId) {
+        api.executeCommand({
+          command: 'set_skip_permissions',
+          sessionId,
+          backendId: activeBackendId,
+          args: { enabled },
+        });
+      }
+    },
+    [sessionId, activeBackendId],
+  );
+
+  // ── 持久化 sandboxEnabled ──
+  const handleSandboxChange = useCallback(
+    (enabled: boolean) => {
+      setSandboxEnabled(enabled);
+      if (sessionId) {
+        api.executeCommand({
+          command: 'set_sandbox_enabled',
+          sessionId,
+          backendId: activeBackendId,
+          args: { enabled },
+        });
+      }
+    },
+    [sessionId, activeBackendId],
+  );
+
+  const handleCompact = useCallback(() => {
+    handleClearContext();
+  }, [handleClearContext]);
+
+  // ── 可见消息列表 memo ──
+  const visibleMessages = useMemo(() => {
+    const total = chat.messages.length;
+    // 流式中:全展开避免新消息被折叠
+    const effectiveVisible = Math.max(visibleCount, chat.isStreaming ? total : visibleCount);
+    const hiddenCount = Math.max(0, total - effectiveVisible);
+    return {
+      list: hiddenCount > 0 ? chat.messages.slice(hiddenCount) : chat.messages,
+      hiddenCount,
+      total,
+    };
+  }, [chat.messages, visibleCount, chat.isStreaming]);
+
+  // ── 自动滚到底部 ──
+  useEffect(() => {
+    const switched = prevSessionRef.current !== sessionId;
+    prevSessionRef.current = sessionId;
+    if (switched) {
+      autoScrollRef.current = true;
+      setShowScrollBtn(false);
+    }
+    if (!autoScrollRef.current) return;
+    requestAnimationFrame(() => {
+      endRef.current?.scrollIntoView({ behavior: switched ? 'instant' : 'smooth' });
+    });
+  }, [chat.messages, sessionId]);
+
+  // ── 新交互开始时重置跟踪 ──
+  useEffect(() => {
+    if (chat.isStreaming && !prevStreamingRef.current) {
+      autoScrollRef.current = true;
+      setShowScrollBtn(false);
+    }
+    prevStreamingRef.current = chat.isStreaming;
+  }, [chat.isStreaming]);
+
+  // ── 滚动事件:用户向上滚则暂停跟踪 ──
+  const handleScroll = useCallback(() => {
+    const el = scrollContainerRef.current;
+    if (!el) return;
+    const atBottom = el.scrollTop + el.clientHeight >= el.scrollHeight - 80;
+    if (atBottom) {
+      if (!autoScrollRef.current) {
+        autoScrollRef.current = true;
+        setShowScrollBtn(false);
+      }
+    } else {
+      if (autoScrollRef.current) {
+        autoScrollRef.current = false;
+        setShowScrollBtn(true);
+      }
+    }
+  }, []);
+
+  const scrollToBottom = useCallback(() => {
+    autoScrollRef.current = true;
+    setShowScrollBtn(false);
+    endRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, []);
+
+  // 空 pane 占位
+  if (!sessionId) {
+    return (
+      <div
+        onClick={onFocus}
+        style={{
+          ...paneRootStyle,
+          border: isFocused ? `2px solid ${themeBorderFocused}` : '2px solid var(--theme-border)',
+          background: 'var(--theme-bg)',
+          cursor: 'pointer',
+        }}
+      >
+        <div
+          style={{
+            display: 'flex',
+            flexDirection: 'column',
+            alignItems: 'center',
+            justifyContent: 'center',
+            height: '100%',
+            gap: 8,
+            color: 'var(--theme-text-muted)',
+            fontSize: 13,
+            userSelect: 'none',
+          }}
+        >
+          <div style={{ fontSize: 28, opacity: 0.5 }}>＋</div>
+          <div>点击侧边栏选择会话</div>
+          <div style={{ fontSize: 11, opacity: 0.7 }}>Pane #{paneId + 1}</div>
+        </div>
+      </div>
+    );
+  }
+
+  // 入场动画:只给真正新增的最后一条消息播,切换 session 时全部不播
+  const { list: msgList, hiddenCount, total } = visibleMessages;
+  const isSameSession = animSessionRef.current === sessionId;
+  const prevCount = isSameSession ? animMsgCountRef.current : total;
+  animSessionRef.current = sessionId;
+  animMsgCountRef.current = total;
+
+  return (
+    <div
+      onClick={onFocus}
+      style={{
+        ...paneRootStyle,
+        border: isFocused ? `2px solid ${themeBorderFocused}` : '2px solid var(--theme-border)',
+        background: 'var(--theme-bg)',
+      }}
+    >
+      {/* ---- 消息列表 ---- */}
+      <div style={{ flex: 1, position: 'relative', overflow: 'hidden' }}>
+        <div
+          ref={scrollContainerRef}
+          onScroll={handleScroll}
+          style={{ height: '100%', overflow: 'auto', padding: '12px 0' }}
+        >
+          {chat.messages.length === 0 && (
+            <div
+              style={{
+                display: 'flex',
+                flexDirection: 'column',
+                alignItems: 'center',
+                justifyContent: 'center',
+                height: '100%',
+                gap: 8,
+              }}
+            >
+              <div style={{ fontSize: 18, fontWeight: 600, color: 'var(--theme-text-muted, #8c959f)' }}>
+                {activeSession?.title || `Pane #${paneId + 1}`}
+              </div>
+              <div style={{ fontSize: 12, color: 'var(--theme-text-muted, #8c959f)' }}>
+                Ctrl+V 粘贴图片 · 输入消息开始
+              </div>
+            </div>
+          )}
+
+          {hiddenCount > 0 && (
+            <div style={{ display: 'flex', justifyContent: 'center', padding: '8px 16px' }}>
+              <button
+                onClick={() => setVisibleCount(total)}
+                style={{
+                  padding: '6px 16px',
+                  borderRadius: 16,
+                  border: '1px solid var(--theme-border, rgba(0,0,0,0.12))',
+                  background: 'var(--theme-bg-secondary, #f6f8fa)',
+                  color: 'var(--theme-text-muted, #656d76)',
+                  fontSize: 12,
+                  cursor: 'pointer',
+                }}
+              >
+                ↑ {hiddenCount} earlier messages
+              </button>
+            </div>
+          )}
+
+          {msgList.map((msg, idx) => (
+            <MessageBubble
+              key={msg.id}
+              message={msg}
+              fontSize={config.fontSize}
+              renderMarkdown={config.renderMarkdown}
+              animateIn={isSameSession && hiddenCount + idx >= prevCount}
+            />
+          ))}
+
+          {/* ★ 行内权限确认组件 */}
+          {chat.pendingPermission && (
+            <div
+              style={{
+                display: 'flex',
+                justifyContent: 'flex-start',
+                padding: '4px 16px',
+              }}
+            >
+              <div
+                style={{
+                  width: 28,
+                  height: 28,
+                  borderRadius: '50%',
+                  flexShrink: 0,
+                  background: 'var(--theme-accent, #7aa2f7)',
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  fontSize: 13,
+                  color: '#fff',
+                  fontWeight: 700,
+                  marginRight: 8,
+                  marginTop: 2,
+                }}
+              >
+                A
+              </div>
+              <div
+                style={{
+                  maxWidth: '80%',
+                  minWidth: 280,
+                  borderRadius: '12px 12px 12px 4px',
+                  background: 'var(--theme-message-bg, #f6f8fa)',
+                  border: '1px solid var(--theme-border, rgba(0,0,0,0.12))',
+                  overflow: 'hidden',
+                }}
+              >
+                <PermissionGate
+                  request={chat.pendingPermission}
+                  onDismiss={chat.clearPermission}
+                  onSkipRest={() => setSkipPermissions(true)}
+                />
+              </div>
+            </div>
+          )}
+
+          {/* 底部占位符 */}
+          <div ref={endRef} />
+        </div>
+
+        {/* ★ 跟踪暂停时的浮动提示按钮 */}
+        {showScrollBtn && (
+          <div
+            style={{
+              position: 'absolute',
+              bottom: 12,
+              left: '50%',
+              transform: 'translateX(-50%)',
+              zIndex: 50,
+            }}
+          >
+            <button
+              onClick={scrollToBottom}
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                gap: 6,
+                padding: '6px 14px',
+                borderRadius: 20,
+                border: '1px solid var(--theme-border, rgba(0,0,0,0.18))',
+                background: 'var(--theme-bg-tertiary, #242536)',
+                color: 'var(--theme-text, #e2e3ea)',
+                fontSize: 12,
+                fontWeight: 500,
+                cursor: 'pointer',
+                boxShadow: '0 2px 10px rgba(0,0,0,0.25)',
+                whiteSpace: 'nowrap',
+              }}
+            >
+              <svg
+                width="13"
+                height="13"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="2.5"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              >
+                <path d="M12 5v14M5 12l7 7 7-7" />
+              </svg>
+              跟踪最新
+            </button>
+          </div>
+        )}
+      </div>
+
+      {/* ---- 输入栏 ---- */}
+      <ChatInput
+        onSend={chat.sendMessage}
+        onAbort={chat.abort}
+        isStreaming={chat.isStreaming}
+        backends={backends}
+        activeBackendId={activeBackendId}
+        sessionId={sessionId || undefined}
+        workingDir={activeSession?.workingDir || undefined}
+        skipPermissions={skipPermissions}
+        onSkipPermissionsChange={handleSkipPermissionsChange}
+        sandboxEnabled={sandboxEnabled}
+        onSandboxChange={handleSandboxChange}
+        onCompact={handleCompact}
+      />
+    </div>
+  );
+};
+// isMobile 当前未在 pane 内特殊处理(响应式由内部子组件自己处理),保留 prop 备用
+
+const paneRootStyle: React.CSSProperties = {
+  display: 'flex',
+  flexDirection: 'column',
+  height: '100%',
+  width: '100%',
+  minWidth: 0,
+  minHeight: 0,
+  overflow: 'hidden',
+  boxSizing: 'border-box',
+};
