@@ -248,7 +248,6 @@ class BridgeWS:
         # ★ 如果检测到内置 claude CLI，注入到默认后端配置
         self._cli_path = cli_path
         self._app_config_store = AppConfigStore()
-        self._apply_proxy_from_config()
         self._backends: dict[str, ModelBackend] = {}
         stored = self._backend_store.list()
         if stored:
@@ -2807,25 +2806,9 @@ except urllib.error.URLError as e:
     def _rpc_setAppConfig(self, config_json: str) -> str:
         try:
             self._app_config_store.set_all(json.loads(config_json))
-            self._apply_proxy_from_config()
             return json.dumps({"status": "ok"}, ensure_ascii=False)
         except Exception as e:
             return json.dumps({"status": "error", "message": str(e)}, ensure_ascii=False)
-
-    def _apply_proxy_from_config(self):
-        """把 app 配置里的代理设置应用到进程环境变量。"""
-        try:
-            from .base import apply_proxy_env
-            cfg = self._app_config_store.get_all()
-            url = apply_proxy_env(
-                bool(cfg.get("proxyEnabled")),
-                str(cfg.get("proxyHost", "") or ""),
-                str(cfg.get("proxyPort", "") or ""),
-            )
-            print(f"[Proxy] {('enabled -> ' + url) if url else 'disabled'}",
-                  file=sys.stderr, flush=True)
-        except Exception as e:
-            print(f"[Proxy] apply failed: {e}", file=sys.stderr, flush=True)
 
     def _rpc_getAuthStatus(self) -> str:
         """返回 Claude CLI 登录状态，供前端展示登录引导。"""

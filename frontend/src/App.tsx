@@ -711,23 +711,6 @@ export const App: React.FC = () => {
             </span>
           )}
           <div style={{ flex: 1 }} />
-          {/* 代理开关：点击切换后端流量是否走代理 */}
-          <button
-            onClick={() => updateConfig({ proxyEnabled: !config.proxyEnabled })}
-            style={{
-              ...logBtnStyle,
-              background: config.proxyEnabled ? 'var(--theme-accent-bg)' : 'rgba(128,128,128,0.12)',
-              borderColor: config.proxyEnabled ? 'var(--theme-accent)' : 'var(--theme-border)',
-              color: config.proxyEnabled ? 'var(--theme-accent)' : 'var(--theme-text-muted)',
-            }}
-            title={
-              config.proxyHost
-                ? `代理 ${config.proxyEnabled ? '已启用' : '已停用'}：${config.proxyHost}:${config.proxyPort || ''}（点击切换，地址在设置中修改）`
-                : '未配置代理地址 — 请在设置中填写'
-            }
-          >
-            🌐{isMobile ? '' : ` ${config.proxyEnabled ? 'Proxy On' : 'Proxy Off'}`}
-          </button>
           {/* 日志查看器按钮 */}
           <button
             onClick={() => setLogViewerOpen(true)}

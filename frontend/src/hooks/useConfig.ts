@@ -11,9 +11,6 @@ export interface AppConfig {
   bgImage: string;
   bgOpacity: number;
   uiOpacity: number;
-  proxyEnabled: boolean;
-  proxyHost: string;
-  proxyPort: string;
 }
 
 const DEFAULT_CONFIG: AppConfig = {
@@ -24,9 +21,6 @@ const DEFAULT_CONFIG: AppConfig = {
   bgImage: '',
   bgOpacity: 0.3,
   uiOpacity: 1.0,
-  proxyEnabled: false,
-  proxyHost: '',
-  proxyPort: '',
 };
 
 // Theme color schemes
