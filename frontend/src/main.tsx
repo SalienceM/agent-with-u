@@ -2,6 +2,13 @@ import React from 'react';
 import { createRoot } from 'react-dom/client';
 import { App } from './App';
 import { ScratchPadWindow, isScratchPadWindow } from './components/ScratchPad';
+import { api } from './api';
+import { installGlobalStreamRouter } from './hooks/useStreamState';
+
+// 全局流路由：所有 session 的 streamDelta 都进 streamStates Map,不论 UI 当前
+// 看的是哪个 session。必须在 React 挂载之前装,确保它的订阅者排在 useChat
+// 的订阅者之前(forEach 按 push 顺序触发)。
+installGlobalStreamRouter(api);
 
 // ── Zoom manager (Ctrl+wheel / Ctrl++/-/0) ──────────────────────────────────
 // Uses Tauri v2 webview.setZoom() in Tauri mode; no-op in browser dev mode.

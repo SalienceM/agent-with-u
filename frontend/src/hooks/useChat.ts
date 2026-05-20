@@ -4,7 +4,6 @@ import { uuid } from '../utils/uuid';
 import type { ImageAttachment } from './useClipboardImage';
 import {
   getStreamState,
-  processStreamDelta,
   resetStreamAccumulators,
   clearStreamState,
   initStreamMessage,
@@ -241,10 +240,12 @@ export function useChat(sessionId: string, backendId: string, backends?: any[], 
       setIsStreaming(false);
     }
 
-    // 清理函数：切换 session 或卸载时清理全局流式状态
-    return () => {
-      clearStreamState(sessionId);
-    };
+    // ⚠ 不要在 cleanup 里清流式状态。
+    //   切换 session 时旧 session 可能还在后台流,清掉会丢中间内容。
+    //   全局 streamStates Map 由 installGlobalStreamRouter 持续维护,
+    //   切回来时由上面的「水合」逻辑读出来。
+    //   仅在 session 删除(useStreamState.clearStreamStateForSession)
+    //   和 WS 重连时(下面 isStreamingRef 卡死分支)主动清理。
   }, [sessionId, syncFromGlobalState]);
 
   // ── sessionUpdated 监听（compact 等后端操作完成后重载）──
@@ -323,11 +324,12 @@ export function useChat(sessionId: string, backendId: string, backends?: any[], 
     };
 
     const unsub = api.onStreamDelta((delta) => {
+      // 注意:全局累积已经在 main.tsx 安装的 installGlobalStreamRouter 里完成,
+      //      这里只负责把「属于当前活动 session 的」delta 渲染出来。
       if (delta.sessionId !== sessionId) return;
 
-      // ★ 使用全局状态处理器
-      const result = processStreamDelta(sessionId, delta);
-      const state = result.state;
+      // ★ 从全局 Map 读最新状态(此刻已被全局路由更新好)
+      const state = getStreamState(sessionId);
 
       // ★ 同步本地 refs（不触发渲染）
       syncFromGlobalState(state);

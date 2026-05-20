@@ -53,6 +53,32 @@ export function clearStreamState(sessionId: string): void {
   streamStates.delete(sessionId);
 }
 
+/**
+ * 全局 stream 路由：把所有 streamDelta 无差别灌进 streamStates Map。
+ *
+ * 这是「多 session 并发流」能工作的前提——之前只有当前活动 session 的
+ * useChat hook 在订阅,非活动 session 的 text_delta/tool_* 全被丢弃,
+ * 切回去就只剩个空壳。装一个全局订阅者后:无论 UI 显示的是哪个 session,
+ * 后台所有 session 的流都会持续累积进 Map,切回去能从 Map 水合恢复。
+ *
+ * 注意调用时机:必须在任何 useChat hook 挂载之前注册(在 main.tsx 里 createRoot 之前调用),
+ * 否则 useChat 的订阅者先注册,callback 先被调用,会读到尚未更新的旧状态。
+ *
+ * 传 api 进来是为了避免 useStreamState ← api ← useChat ← useStreamState 的循环 import。
+ */
+let _routerInstalled = false;
+export function installGlobalStreamRouter(
+  api: { onStreamDelta: (cb: (delta: any) => void) => () => void },
+): void {
+  if (_routerInstalled) return;
+  _routerInstalled = true;
+  api.onStreamDelta((delta: any) => {
+    if (delta && typeof delta.sessionId === 'string' && delta.sessionId) {
+      processStreamDelta(delta.sessionId, delta);
+    }
+  });
+}
+
 // 重置流式累积器（消息完成时调用）
 // 注意：此函数已弃用，不再调用。状态会在下一次 initStreamMessage 时自动覆盖。
 // 保留此函数仅用于 session 清理等特殊场景。
