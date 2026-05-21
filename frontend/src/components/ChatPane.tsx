@@ -479,6 +479,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
         sandboxEnabled={sandboxEnabled}
         onSandboxChange={handleSandboxChange}
         onCompact={handleCompact}
+        isFocused={isFocused}
       />
     </div>
   );

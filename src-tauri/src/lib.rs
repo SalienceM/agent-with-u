@@ -170,6 +170,7 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .setup(|app| {
             // Release builds only: spawn the compiled Python sidecar automatically.
             // In dev mode (cargo tauri dev), start Python manually:

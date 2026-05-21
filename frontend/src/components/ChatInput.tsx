@@ -49,6 +49,9 @@ interface Props {
   sandboxEnabled?: boolean;
   onSandboxChange?: (enabled: boolean) => void;
   onCompact?: () => void;
+  // 多 pane 场景:用来决定全局快捷键(截图等)归哪个输入框处理。
+  // 单 pane / 浏览器单实例下不传也行,默认 true。
+  isFocused?: boolean;
 }
 
 // ═══════════════════════════════════════
@@ -99,6 +102,7 @@ const ChatInputInner: React.FC<Props> = ({
   skipPermissions = true, onSkipPermissionsChange,
   sandboxEnabled = true, onSandboxChange,
   onCompact,
+  isFocused = true,
 }) => {
   const ref = useRef<HTMLTextAreaElement>(null);
   // 把 textarea ref 传给 useClipboardImage,这样多 pane 场景下只有聚焦
@@ -151,6 +155,22 @@ const ChatInputInner: React.FC<Props> = ({
     }
     setScreenshotBusy(false);
   }, [addImage, screenshotBusy]);
+
+  // 全局快捷键(App.tsx 注册 Ctrl+Shift+A)触发时,每个 pane 的 ChatInput
+  // 都会收到事件,只有焦点 pane 那一个真正去截图——其它静默。用 ref 拿最新
+  // 的 isFocused / handleScreenshot,避免闭包问题。
+  const focusedRef = useRef(isFocused);
+  focusedRef.current = isFocused;
+  const screenshotFnRef = useRef(handleScreenshot);
+  screenshotFnRef.current = handleScreenshot;
+  useEffect(() => {
+    if (!isTauri()) return;
+    const onHotkey = () => {
+      if (focusedRef.current) screenshotFnRef.current();
+    };
+    window.addEventListener('awu:screenshot-hotkey', onHotkey);
+    return () => window.removeEventListener('awu:screenshot-hotkey', onHotkey);
+  }, []);
 
   // ── 稳定 refs ──
   const onSendRef = useRef(onSend);
