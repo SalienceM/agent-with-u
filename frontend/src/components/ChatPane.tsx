@@ -223,7 +223,9 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
         style={{
           ...paneRootStyle,
           border: isFocused ? `2px solid ${themeBorderFocused}` : '2px solid var(--theme-border)',
-          background: 'var(--theme-bg)',
+          // 不设 bg:分屏前 chat 区域没这层 wrapper,背景图能直接透到消息气泡那层。
+          // 加个实色就等于盖一层遮罩,把用户的壁纸糊死。focus 边框已经够明显了。
+          background: 'transparent',
           cursor: 'pointer',
         }}
       >
@@ -261,7 +263,8 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
       style={{
         ...paneRootStyle,
         border: isFocused ? `2px solid ${themeBorderFocused}` : '2px solid var(--theme-border)',
-        background: 'var(--theme-bg)',
+        // 同上,透明,不挡背景图
+        background: 'transparent',
       }}
     >
       {/* ---- 消息列表 ---- */}
