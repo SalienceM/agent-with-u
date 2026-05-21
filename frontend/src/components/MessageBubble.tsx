@@ -292,8 +292,9 @@ const SubagentCard: React.FC<{
         marginBottom: 10,
         padding: '10px 12px',
         borderRadius: 8,
-        background: `${accent}10`,
-        border: `1px solid ${accent}40`,
+        // 透明内部,只靠左侧 accent 竖条做视觉锚点,不挡背景图
+        background: 'transparent',
+        borderLeft: `3px solid ${accent}`,
         fontSize: 12,
         color: 'var(--theme-text, #1f2328)',
       }}
@@ -402,8 +403,8 @@ const SubagentCard: React.FC<{
           marginTop: 8,
           padding: '8px 10px',
           borderRadius: 6,
-          background: 'var(--theme-bg-secondary, #f6f8fa)',
-          border: '1px solid var(--theme-border, rgba(0,0,0,0.1))',
+          background: 'transparent',
+          border: `1px solid ${accent}55`,
           lineHeight: 1.5,
         }}>
           <div style={{
@@ -485,10 +486,10 @@ const ToolCallBlock: React.FC<{ tc: ToolCall; allTools?: ToolCall[] }> = memo(fu
   const taskAccent = tc.status === 'error' ? STATUS_COLOR.error
     : tc.status === 'done' ? STATUS_COLOR.done
     : STATUS_COLOR.running;
+  // Task 卡片只换边框颜色 + 加粗,不加任何底色/渐变,避免把背景图盖掉。
   const taskBoxStyle: React.CSSProperties = isTask ? {
     ...sectionBox,
-    border: `1px solid ${taskAccent}66`,
-    background: `linear-gradient(180deg, ${taskAccent}10, var(--theme-bg-secondary, #f6f8fa))`,
+    border: `1.5px solid ${taskAccent}88`,
   } : sectionBox;
 
   return (
@@ -1179,7 +1180,10 @@ export const MessageBubble = memo(MessageBubbleInner, bubblePropsEqual);
 const sectionBox: React.CSSProperties = {
   marginBottom: 6,
   borderRadius: 8,
-  background: 'var(--theme-bg-secondary, #f6f8fa)',
+  // ★ 不再用实色 bg。用户开了背景图时,sectionBox 是个内嵌容器,实色会把
+  //    背景图盖掉变成灰蒙蒙。只靠 border 做区分,内部 code/diff 块如果需要
+  //    底色,它们自己有 var(--theme-code-bg)。
+  background: 'transparent',
   border: '1px solid var(--theme-border, rgba(0,0,0,0.12))',
   overflow: 'hidden',
 };
