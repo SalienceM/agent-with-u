@@ -484,6 +484,32 @@ async function nativeOpenFile(): Promise<string | null> {
 // ═══════════════════════════════════════
 export const api = {
   async readClipboardImage(): Promise<any | null> {
+    // Tauri 桌面端:先读**本机**剪贴板。
+    // 关键在客户端模式 —— 此时 WS bridge 指向远端执行节点,走 bridge 会
+    // 读远端剪贴板,本地截图取不回来。本机读优先,失败再回落到 bridge
+    // (覆盖 Wayland / 无 X server / arboard 取不到的边角情况)。
+    if (isTauri()) {
+      try {
+        const { invoke } = await import('@tauri-apps/api/core');
+        const r = await invoke<null | {
+          base64: string;
+          mime_type: string;
+          width: number;
+          height: number;
+          size: number;
+        }>('read_local_clipboard_image');
+        if (r && r.base64) {
+          const { uuid } = await import('./utils/uuid');
+          return { id: uuid(), ...r };
+        }
+        // 本机剪贴板里就是没图,直接返回 null —— 不要再去远端找,
+        // 否则会拿到远端机器的剪贴板误判成新截图。
+        return null;
+      } catch (e) {
+        console.warn('[clipboard] local read failed, falling back to bridge:', e);
+        // 落到下面的 bridge 调用
+      }
+    }
     const result = await call('readClipboardImage');
     try { return JSON.parse(result); } catch { return null; }
   },

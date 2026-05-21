@@ -1,7 +1,15 @@
 import React, { useRef, useCallback, useEffect, useState } from 'react';
 import type { AppConfig, ThemeType } from '../hooks/useConfig';
 import { themes } from '../hooks/useConfig';
-import { api } from '../api';
+import { api, isTauri } from '../api';
+import {
+  SCREENSHOT_HOTKEY_DEFAULT,
+  buildAccelerator,
+  displayAccelerator,
+  isModifierOnly,
+  readScreenshotHotkey,
+  writeScreenshotHotkey,
+} from '../utils/hotkey';
 
 interface SettingsProps {
   isOpen: boolean;
@@ -371,6 +379,18 @@ export const Settings: React.FC<SettingsProps> = ({
           </p>
         </div>
 
+        {/* 截图全局快捷键(Tauri only) */}
+        {isTauri() && (
+          <div style={sectionStyle}>
+            <label style={labelStyle}>Screenshot Hotkey</label>
+            <ScreenshotHotkeySetting />
+            <p style={{ fontSize: 11, color: 'var(--theme-text-muted)', marginTop: 6, margin: '6px 0 0 0' }}>
+              Triggers the system snip tool while AgentWithU is in the background.
+              Picked image lands in the focused pane's attachments.
+            </p>
+          </div>
+        )}
+
         {/* 界面透明度 */}
         <div style={sectionStyle}>
           <label style={labelStyle}>Panel Transparency</label>
@@ -542,4 +562,91 @@ const themeBtnStyle: React.CSSProperties = {
   flex: 1, padding: '10px 12px', borderRadius: 8, border: '2px solid', fontSize: 12,
   fontWeight: 600, cursor: 'pointer', transition: 'all 0.15s',
   boxShadow: '0 2px 8px rgba(0,0,0,0.2)',
+};
+
+// 截图全局快捷键的配置 UI:
+//   - 显示当前 accelerator(人类友好形态);
+//   - 点「Change」进入捕获模式,任意键盘组合 → 立即写入;Esc 取消;
+//   - 「Disable」清空 → 禁用快捷键;
+//   - 「Default」一键回 CtrlOrCmd+Shift+A。
+const ScreenshotHotkeySetting: React.FC = () => {
+  const [hotkey, setHotkey] = useState(() => readScreenshotHotkey());
+  const [capturing, setCapturing] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  // 监听 App 端注册失败 → 把错误信息回显到这里。
+  useEffect(() => {
+    const onErr = (e: Event) => {
+      const detail = (e as CustomEvent).detail as { key?: string; message?: string } | undefined;
+      if (detail?.key === 'screenshot') setError(detail.message || 'failed');
+    };
+    window.addEventListener('awu:hotkey-error', onErr);
+    return () => window.removeEventListener('awu:hotkey-error', onErr);
+  }, []);
+
+  // 捕获键盘组合。useCapture 拿到 keydown,阻止冒泡到 textarea / 全局
+  // 处理器,免得 Esc 触发 close / 字母进输入框之类。
+  useEffect(() => {
+    if (!capturing) return;
+    const onKey = (e: KeyboardEvent) => {
+      e.preventDefault();
+      e.stopPropagation();
+      if (e.key === 'Escape') { setCapturing(false); return; }
+      if (isModifierOnly(e)) return; // 等用户继续按
+      const accel = buildAccelerator(e);
+      if (!accel) return; // 不是合法组合(单键无修饰),继续等
+      writeScreenshotHotkey(accel);
+      setHotkey(accel);
+      setError(null);
+      setCapturing(false);
+    };
+    document.addEventListener('keydown', onKey, true);
+    return () => document.removeEventListener('keydown', onKey, true);
+  }, [capturing]);
+
+  const onDisable = () => {
+    writeScreenshotHotkey('');
+    setHotkey('');
+    setError(null);
+  };
+  const onDefault = () => {
+    writeScreenshotHotkey(SCREENSHOT_HOTKEY_DEFAULT);
+    setHotkey(SCREENSHOT_HOTKEY_DEFAULT);
+    setError(null);
+  };
+
+  const keyCapStyle: React.CSSProperties = {
+    minWidth: 140, padding: '6px 12px', borderRadius: 6,
+    border: '1px solid var(--theme-border, rgba(0,0,0,0.12))',
+    background: capturing ? 'rgba(99,102,241,0.25)' : 'var(--theme-input-bg, #fff)',
+    color: 'var(--theme-text, #1f2328)',
+    fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
+    fontSize: 13, fontWeight: 600,
+    cursor: 'pointer', textAlign: 'center',
+    transition: 'all 0.15s',
+  };
+
+  return (
+    <div>
+      <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+        <button
+          style={keyCapStyle}
+          onClick={() => setCapturing((v) => !v)}
+          title={capturing ? 'Press the key combination to set, or Esc to cancel' : 'Click then press your key combination'}
+        >
+          {capturing ? 'Press keys…' : displayAccelerator(hotkey)}
+        </button>
+        <button onClick={onDisable} style={actionBtnStyle} disabled={!hotkey}>Disable</button>
+        <button onClick={onDefault} style={actionBtnStyle}>Default</button>
+      </div>
+      {error && (
+        <div style={{
+          marginTop: 6, fontSize: 11,
+          color: 'rgba(239,68,68,0.95)',
+        }}>
+          Could not register this combo (likely taken by another app or the OS). Pick another.
+        </div>
+      )}
+    </div>
+  );
 };

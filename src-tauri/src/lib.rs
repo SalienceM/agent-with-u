@@ -1,3 +1,4 @@
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -75,13 +76,10 @@ fn set_desktop_config(config: DesktopConfig) -> Result<(), String> {
 ///             截图放进剪贴板。
 ///   Linux   : 优先 `flameshot gui`,回退 `gnome-screenshot -a -c`。
 ///
-/// 本函数只负责「调起」,不读剪贴板——读剪贴板靠前端轮询既有的
-/// readClipboardImage RPC,把结果当作普通粘贴图处理。这样能复用一整套
-/// 已有的图片上传/素材池/preview 逻辑,不用 Rust 端再装 clipboard 依赖。
-///
-/// 注意:在 Tauri「纯客户端」模式下,readClipboardImage 是远程执行节点的
-/// 剪贴板,本机截图丢进本地剪贴板,远程读不到。所以这个按钮只在
-/// executor 模式(=本机跑后端)下有意义,前端会做相应的提示。
+/// 本函数只负责「调起」,不读剪贴板——读剪贴板由前端轮询完成。Tauri 桌面
+/// 端走 `read_local_clipboard_image` 命令直接读**本机**剪贴板(executor /
+/// client 模式都一样,因为截图永远落在本机);浏览器模式回落到 bridge 的
+/// readClipboardImage。这样能复用既有的图片上传 / 素材池 / preview 逻辑。
 #[tauri::command]
 fn open_screenshot_tool() -> Result<(), String> {
     use std::process::Command;
@@ -110,6 +108,55 @@ fn open_screenshot_tool() -> Result<(), String> {
     }
     #[allow(unreachable_code)]
     Err("unsupported platform".into())
+}
+
+/// 读本机剪贴板里的图片(Tauri 客户端模式下的关键能力)。
+///
+/// 既有的 `api.readClipboardImage()` 走 WebSocket bridge → Python 后端,
+/// 在 client 模式下后端在远端机器,读到的是远端剪贴板,本地截图丢进本地
+/// 剪贴板它根本看不到。本命令用 arboard 直接读**本机**剪贴板,把 RGBA
+/// 像素 PNG 编码后 base64 返回,字段与 `ImageAttachment` 对齐。
+///
+/// 返回 `Ok(None)` 表示剪贴板里没有图像内容,不算错误。
+#[tauri::command]
+fn read_local_clipboard_image() -> Result<Option<ClipboardImage>, String> {
+    let mut cb = arboard::Clipboard::new().map_err(|e| e.to_string())?;
+    let img = match cb.get_image() {
+        Ok(i) => i,
+        Err(arboard::Error::ContentNotAvailable) => return Ok(None),
+        Err(e) => return Err(e.to_string()),
+    };
+    let width = img.width as u32;
+    let height = img.height as u32;
+    let mut png_bytes: Vec<u8> = Vec::new();
+    {
+        let mut encoder = png::Encoder::new(&mut png_bytes, width, height);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder.write_header().map_err(|e| e.to_string())?;
+        // arboard::ImageData::bytes 是 Cow<'_, [u8]>,显式 deref 到 &[u8]
+        writer
+            .write_image_data(img.bytes.as_ref())
+            .map_err(|e| e.to_string())?;
+    }
+    let size = png_bytes.len() as u64;
+    Ok(Some(ClipboardImage {
+        base64: BASE64.encode(&png_bytes),
+        mime_type: "image/png".to_string(),
+        width,
+        height,
+        size,
+    }))
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case")]
+struct ClipboardImage {
+    base64: String,
+    mime_type: String,
+    width: u32,
+    height: u32,
+    size: u64,
 }
 
 #[tauri::command]
@@ -213,6 +260,7 @@ pub fn run() {
             get_ws_port,
             open_log_viewer,
             open_screenshot_tool,
+            read_local_clipboard_image,
             get_desktop_config,
             set_desktop_config
         ])

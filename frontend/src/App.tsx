@@ -1,5 +1,9 @@
 import React, { useState, useCallback, useEffect, useRef } from 'react';
 import { api, isTauri } from './api';
+import {
+  HOTKEY_CHANGED_EVENT,
+  readScreenshotHotkey,
+} from './utils/hotkey';
 import { Sidebar } from './components/Sidebar';
 import { Settings } from './components/Settings';
 import { BackendManager } from './components/BackendManager';
@@ -154,17 +158,28 @@ export const App: React.FC = () => {
   }, []);
 
   // ★ 全局截图快捷键(仅 Tauri):App 不在前台也能响应。默认 Ctrl+Shift+A,
-  //   触发时往 window 派发 'awu:screenshot-hotkey' 自定义事件,焦点 pane
-  //   的 ChatInput 接收事件后走它本地的 handleScreenshot 流程(用 isFocused
-  //   做选举,避免多 pane 同时反应)。
+  //   可在 Settings 改键位 / 禁用。触发时往 window 派发
+  //   'awu:screenshot-hotkey' 自定义事件,焦点 pane 的 ChatInput 接收事件
+  //   后走它本地的 handleScreenshot 流程(用 isFocused 做选举,避免多 pane
+  //   同时反应)。
+  const [screenshotHotkey, setScreenshotHotkey] = useState<string>(() => readScreenshotHotkey());
+  useEffect(() => {
+    const onChange = (e: Event) => {
+      const detail = (e as CustomEvent).detail as { key?: string; value?: string } | undefined;
+      if (detail?.key === 'screenshot') setScreenshotHotkey(detail.value ?? '');
+    };
+    window.addEventListener(HOTKEY_CHANGED_EVENT, onChange);
+    return () => window.removeEventListener(HOTKEY_CHANGED_EVENT, onChange);
+  }, []);
   useEffect(() => {
     if (!isTauri()) return;
+    const accelerator = screenshotHotkey.trim();
+    if (!accelerator) return; // 空 = 用户主动禁用
     let unregister: null | (() => Promise<void>) = null;
     let cancelled = false;
     (async () => {
       try {
         const mod = await import('@tauri-apps/plugin-global-shortcut');
-        const accelerator = 'CmdOrCtrl+Shift+A';
         await mod.register(accelerator, (event) => {
           // event 有 pressed/released 两次触发,只取 pressed 那一下
           if (event.state !== 'Pressed') return;
@@ -173,18 +188,20 @@ export const App: React.FC = () => {
         if (!cancelled) {
           unregister = async () => { try { await mod.unregister(accelerator); } catch { /* */ } };
         } else {
-          // 已经被卸载了,立即清理
           try { await mod.unregister(accelerator); } catch { /* */ }
         }
       } catch (e) {
-        console.warn('[hotkey] register screenshot shortcut failed:', e);
+        console.warn('[hotkey] register screenshot shortcut failed:', accelerator, e);
+        window.dispatchEvent(new CustomEvent('awu:hotkey-error', {
+          detail: { key: 'screenshot', value: accelerator, message: String(e) },
+        }));
       }
     })();
     return () => {
       cancelled = true;
       if (unregister) unregister();
     };
-  }, []);
+  }, [screenshotHotkey]);
 
   /* ---- 连接后加载初始数据（处理 WS 未就绪导致首次加载为空的问题） ---- */
   useEffect(() => {
