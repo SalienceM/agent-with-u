@@ -283,15 +283,54 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
                 alignItems: 'center',
                 justifyContent: 'center',
                 height: '100%',
-                gap: 8,
+                gap: 10,
               }}
             >
-              <div style={{ fontSize: 18, fontWeight: 600, color: 'var(--theme-text-muted, #8c959f)' }}>
-                {activeSession?.title || `Pane #${paneId + 1}`}
-              </div>
-              <div style={{ fontSize: 12, color: 'var(--theme-text-muted, #8c959f)' }}>
-                Ctrl+V 粘贴图片 · 输入消息开始
-              </div>
+              {chat.isLoadingSession ? (
+                <>
+                  <div style={{
+                    width: 24, height: 24,
+                    border: '2px solid var(--theme-border, rgba(255,255,255,0.15))',
+                    borderTopColor: 'var(--theme-accent, #58a6ff)',
+                    borderRadius: '50%',
+                    animation: 'spin 0.8s linear infinite',
+                  }} />
+                  <div style={{ fontSize: 12, color: 'var(--theme-text-muted, #8c959f)' }}>
+                    加载会话中…
+                  </div>
+                </>
+              ) : (
+                <>
+                  <div style={{ fontSize: 18, fontWeight: 600, color: 'var(--theme-text-muted, #8c959f)' }}>
+                    {activeSession?.title || `Pane #${paneId + 1}`}
+                  </div>
+                  <div style={{ fontSize: 12, color: 'var(--theme-text-muted, #8c959f)' }}>
+                    Ctrl+V 粘贴图片 · 输入消息开始
+                  </div>
+                </>
+              )}
+            </div>
+          )}
+
+          {/* 顶部「正在刷新」细条:加载完成前/有缓存先铺底的场景,给用户一个
+              「不是卡死,后台在拉」的视觉反馈 */}
+          {chat.isLoadingSession && chat.messages.length > 0 && (
+            <div
+              style={{
+                display: 'flex', alignItems: 'center', justifyContent: 'center',
+                gap: 8, padding: '6px 12px', fontSize: 11,
+                color: 'var(--theme-text-muted, #8c959f)',
+              }}
+            >
+              <span style={{
+                width: 12, height: 12,
+                border: '2px solid var(--theme-border, rgba(255,255,255,0.15))',
+                borderTopColor: 'var(--theme-accent, #58a6ff)',
+                borderRadius: '50%',
+                animation: 'spin 0.8s linear infinite',
+                display: 'inline-block',
+              }} />
+              <span>加载历史中…</span>
             </div>
           )}
 

@@ -163,6 +163,9 @@ export function useChat(sessionId: string, backendId: string, backends?: any[], 
   const [messagesTotal, setMessagesTotal] = useState(0);
   const [hasMore, setHasMore] = useState(false);
   const [loadingEarlier, setLoadingEarlier] = useState(false);
+  // ★ 首次加载 session 是否还在飞:UI 据此显示加载提示,避免「点了 session
+  //   但页面没动」的卡顿感。区别于 loadingEarlier(那个是翻页加载更老消息)。
+  const [isLoadingSession, setIsLoadingSession] = useState(false);
 
   // 累积器 refs - 用于本地快速访问，实际状态存储在全局 StreamState
   const textRef = useRef('');
@@ -216,12 +219,14 @@ export function useChat(sessionId: string, backendId: string, backends?: any[], 
       setMessagesTotal(0);
       setHasMore(false);
       setLoadingEarlier(false);
+      setIsLoadingSession(false);
       return;
     }
 
     // 每次切到新 session 都先把分页状态置空,等 loadSession 回来再更新
     setHasMore(false);
     setLoadingEarlier(false);
+    setIsLoadingSession(true);
 
     // ★ 先检查全局流式状态
     const globalState = getStreamState(sessionId);
@@ -325,6 +330,8 @@ export function useChat(sessionId: string, backendId: string, backends?: any[], 
       if (session?.autoContinue !== undefined) {
         setAutoContinue(session.autoContinue);
       }
+    }).finally(() => {
+      if (!cancelled) setIsLoadingSession(false);
     });
 
     // ⚠ 不要在 cleanup 里清流式状态。
@@ -970,5 +977,6 @@ export function useChat(sessionId: string, backendId: string, backends?: any[], 
     needsMigrate,
     // 历史分页
     messagesTotal, hasMore, loadingEarlier, loadEarlier,
+    isLoadingSession,
   };
 }
