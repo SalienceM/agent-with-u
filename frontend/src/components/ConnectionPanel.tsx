@@ -4,6 +4,10 @@ import {
   isTauri, getDesktopConfig, setDesktopConfig, type DesktopConfig,
   api, type ConnectedClient,
 } from '../api';
+import {
+  listRelayProfiles, saveRelayProfile, deleteRelayProfile,
+  type RelayProfile,
+} from '../utils/relayProfiles';
 
 interface ConnectionPanelProps {
   onClose: () => void;
@@ -48,6 +52,51 @@ export const ConnectionPanel: React.FC<ConnectionPanelProps> = ({ onClose }) => 
 
   // 「正在连接本机的 UI」实时列表
   const [clients, setClients] = useState<ConnectedClient[]>([]);
+
+  // ── Relay 预设列表(localStorage 持久化) ──
+  const [profiles, setProfiles] = useState<RelayProfile[]>(() => listRelayProfiles());
+  const [activeProfileId, setActiveProfileId] = useState<string | null>(() => {
+    // 启动时如果当前 url+token 命中某个预设,自动高亮它
+    const c = getConnectionTarget();
+    if (c.mode !== 'relay') return null;
+    const hit = listRelayProfiles().find((p) => p.url === c.url && p.token === c.token);
+    return hit?.id ?? null;
+  });
+  const refreshProfiles = useCallback(() => setProfiles(listRelayProfiles()), []);
+
+  const selectProfile = useCallback((p: RelayProfile) => {
+    setUrl(p.url);
+    setToken(p.token);
+    setActiveProfileId(p.id);
+    setErr('');
+    // 选了新的中继 → 设备列表清空,让用户重新刷一遍
+    setDevices([]);
+    setDeviceId('');
+  }, []);
+
+  const saveCurrentAsProfile = useCallback(() => {
+    const u = url.trim();
+    const t = token.trim();
+    if (!u) { setErr('请先填写中继地址'); return; }
+    const defaultLabel = (() => {
+      try {
+        const host = new URL(u.replace(/^ws/, 'http')).host;
+        return host || u;
+      } catch { return u; }
+    })();
+    const label = window.prompt('为这个中继取个名字', defaultLabel);
+    if (!label) return;  // 用户取消
+    const saved = saveRelayProfile({ id: activeProfileId ?? undefined, label, url: u, token: t });
+    refreshProfiles();
+    setActiveProfileId(saved.id);
+  }, [url, token, activeProfileId, refreshProfiles]);
+
+  const removeProfile = useCallback((id: string) => {
+    if (!window.confirm('删除这个中继预设?')) return;
+    deleteRelayProfile(id);
+    refreshProfiles();
+    if (activeProfileId === id) setActiveProfileId(null);
+  }, [activeProfileId, refreshProfiles]);
 
   useEffect(() => {
     if (!tauri) return;
@@ -134,6 +183,23 @@ export const ConnectionPanel: React.FC<ConnectionPanelProps> = ({ onClose }) => 
         deviceId,
         deviceName: dev?.name,
       });
+      // 顺手把当前 url+token 落进 profile 列表(同 url+token 已存在会去重,
+      // 不会产生重复条目)。这样用户「保存并连接」一次,下次就能从预设列表
+      // 一键回来,不用再输 url 和 token。
+      try {
+        const defaultLabel = (() => {
+          try { return new URL(url.trim().replace(/^ws/, 'http')).host || url.trim(); }
+          catch { return url.trim(); }
+        })();
+        const saved = saveRelayProfile({
+          id: activeProfileId ?? undefined,
+          label: profiles.find((p) => p.id === activeProfileId)?.label || defaultLabel,
+          url: url.trim(),
+          token: token.trim(),
+        });
+        refreshProfiles();
+        setActiveProfileId(saved.id);
+      } catch { /* 静默忽略,profile 持久化失败不影响连接 */ }
     }
     if (needRestart) setRestartHint(true);
     else onClose();
@@ -275,6 +341,46 @@ export const ConnectionPanel: React.FC<ConnectionPanelProps> = ({ onClose }) => 
                   ↑ 使用卡片 A 里填的中继地址 / Token
                 </button>
               )}
+
+              {/* 已保存的中继预设(点选即填入 url+token) */}
+              {profiles.length > 0 && (
+                <div style={{ marginBottom: 8 }}>
+                  <label style={labelStyle}>已保存的中继</label>
+                  <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+                    {profiles.map((p) => {
+                      const active = activeProfileId === p.id;
+                      return (
+                        <span
+                          key={p.id}
+                          style={{
+                            display: 'inline-flex', alignItems: 'center', gap: 4,
+                            padding: '4px 8px',
+                            borderRadius: 14,
+                            border: `1px solid ${active ? 'var(--theme-accent)' : 'var(--theme-border)'}`,
+                            background: active ? 'var(--theme-accent-bg)' : 'transparent',
+                            color: active ? 'var(--theme-accent)' : 'var(--theme-text)',
+                            fontSize: 11,
+                            cursor: 'pointer',
+                          }}
+                          onClick={() => selectProfile(p)}
+                          title={p.url}
+                        >
+                          <span>{p.label}</span>
+                          <span
+                            onClick={(e) => { e.stopPropagation(); removeProfile(p.id); }}
+                            style={{
+                              opacity: 0.6, fontSize: 12, marginLeft: 2,
+                              cursor: 'pointer',
+                            }}
+                            title="删除"
+                          >×</span>
+                        </span>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
+
               <div style={{ display: 'flex', flexDirection: 'column', gap: 8, marginTop: 4 }}>
                 <div>
                   <label style={labelStyle}>中继地址</label>
@@ -282,7 +388,7 @@ export const ConnectionPanel: React.FC<ConnectionPanelProps> = ({ onClose }) => 
                     type="text"
                     value={url}
                     placeholder="ws://relay.example.com:44360"
-                    onChange={(e) => setUrl(e.target.value)}
+                    onChange={(e) => { setUrl(e.target.value); setActiveProfileId(null); }}
                     style={inputStyle}
                   />
                 </div>
@@ -292,9 +398,14 @@ export const ConnectionPanel: React.FC<ConnectionPanelProps> = ({ onClose }) => 
                     type="password"
                     value={token}
                     placeholder="与中继服务器一致的共享 token"
-                    onChange={(e) => setToken(e.target.value)}
+                    onChange={(e) => { setToken(e.target.value); setActiveProfileId(null); }}
                     style={inputStyle}
                   />
+                </div>
+                <div style={{ display: 'flex', gap: 6 }}>
+                  <button onClick={saveCurrentAsProfile} style={{ ...refreshBtnStyle, flex: '0 0 auto' }}>
+                    💾 {activeProfileId ? '更新预设' : '保存为预设'}
+                  </button>
                 </div>
                 <button onClick={handleRefresh} disabled={busy} style={refreshBtnStyle}>
                   {busy ? '获取中…' : '刷新执行节点列表'}
