@@ -4,7 +4,7 @@ import { useClipboardImage } from '../hooks/useClipboardImage';
 import type { ImageAttachment } from '../hooks/useClipboardImage';
 import { SLASH_COMMANDS } from '../hooks/useChat';
 import type { SlashCommand } from '../hooks/useChat';
-import { api } from '../api';
+import { api, isTauri } from '../api';
 
 // ── 注入全局样式（focus glow）────────────────────────────────────────────────
 if (typeof document !== 'undefined' && !document.getElementById('chat-input-css')) {
@@ -103,7 +103,54 @@ const ChatInputInner: React.FC<Props> = ({
   const ref = useRef<HTMLTextAreaElement>(null);
   // 把 textarea ref 传给 useClipboardImage,这样多 pane 场景下只有聚焦
   // 的输入框对应的 hook 会处理粘贴,避免一张图被所有 pane 同时吃下。
-  const { images, removeImage, clearImages } = useClipboardImage(ref);
+  const { images, removeImage, clearImages, addImage } = useClipboardImage(ref);
+
+  // 截图按钮状态:正在等待用户选区域 / 已超时
+  const [screenshotBusy, setScreenshotBusy] = useState(false);
+
+  // 调起系统截图工具 → 等图片落进剪贴板 → 走既有粘贴流程加入附件。
+  // 桌面端独占——浏览器无法触发系统截图工具。
+  const handleScreenshot = useCallback(async () => {
+    if (!isTauri()) return;
+    if (screenshotBusy) return;
+    let invoke: ((cmd: string) => Promise<unknown>) | null = null;
+    try {
+      const mod = await import('@tauri-apps/api/core');
+      invoke = mod.invoke;
+    } catch {
+      return;
+    }
+    // 记一下点击前剪贴板里现成的那张图(如果有),用 base64 前缀做去重
+    // key,避免后面把「旧图」误认成新截图加入附件。
+    let beforeKey = '';
+    try {
+      const before = await api.readClipboardImage();
+      if (before?.base64) beforeKey = before.base64.slice(0, 200);
+    } catch { /* 没装 PIL 或失败:无所谓,beforeKey 留空 */ }
+    setScreenshotBusy(true);
+    try {
+      await invoke('open_screenshot_tool');
+    } catch (e) {
+      console.error('[screenshot] open tool failed:', e);
+      setScreenshotBusy(false);
+      return;
+    }
+    // 轮询剪贴板,最长 60 秒
+    const start = Date.now();
+    const POLL_INTERVAL = 500;
+    const TIMEOUT = 60_000;
+    while (Date.now() - start < TIMEOUT) {
+      await new Promise((r) => setTimeout(r, POLL_INTERVAL));
+      try {
+        const img = await api.readClipboardImage();
+        if (img && img.base64 && img.base64.slice(0, 200) !== beforeKey) {
+          addImage(img);
+          break;
+        }
+      } catch { /* 单次失败继续轮询 */ }
+    }
+    setScreenshotBusy(false);
+  }, [addImage, screenshotBusy]);
 
   // ── 稳定 refs ──
   const onSendRef = useRef(onSend);
@@ -681,6 +728,16 @@ const ChatInputInner: React.FC<Props> = ({
           title="新会话（清空上下文，同目录）"
           onClick={handleCompact}
         />
+        {/* 截图按钮:桌面端独有,浏览器无法调起系统截图工具 */}
+        {isTauri() && (
+          <ToolbarBtn
+            icon="📷"
+            title={screenshotBusy ? "等待截图…(选完区域自动加入附件)" : "截图(系统截图工具)"}
+            active={screenshotBusy}
+            onClick={handleScreenshot}
+            loading={screenshotBusy}
+          />
+        )}
         {/* ★ 流式进度指示器 */}
         {isStreaming && (
           <div style={{

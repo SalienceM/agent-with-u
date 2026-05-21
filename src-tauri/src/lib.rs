@@ -66,6 +66,52 @@ fn set_desktop_config(config: DesktopConfig) -> Result<(), String> {
     std::fs::write(&path, json).map_err(|e| e.to_string())
 }
 
+/// 调起系统截图工具,让用户选区域。
+///
+/// 各平台行为:
+///   Windows : `explorer.exe ms-screenclip:` —— 触发 Win+Shift+S 的截图浮层。
+///             进程**立即返回**,用户选完区域后,截图会被系统放进剪贴板。
+///   macOS   : `screencapture -i -c` —— 阻塞到用户选完(或 Esc 取消),
+///             截图放进剪贴板。
+///   Linux   : 优先 `flameshot gui`,回退 `gnome-screenshot -a -c`。
+///
+/// 本函数只负责「调起」,不读剪贴板——读剪贴板靠前端轮询既有的
+/// readClipboardImage RPC,把结果当作普通粘贴图处理。这样能复用一整套
+/// 已有的图片上传/素材池/preview 逻辑,不用 Rust 端再装 clipboard 依赖。
+///
+/// 注意:在 Tauri「纯客户端」模式下,readClipboardImage 是远程执行节点的
+/// 剪贴板,本机截图丢进本地剪贴板,远程读不到。所以这个按钮只在
+/// executor 模式(=本机跑后端)下有意义,前端会做相应的提示。
+#[tauri::command]
+fn open_screenshot_tool() -> Result<(), String> {
+    use std::process::Command;
+    #[cfg(target_os = "windows")]
+    {
+        // 注意:用 cmd /C start 触发 URI 协议处理器,不要直接 Command::new("explorer"),
+        // 后者在某些版本下会忽略 URI 参数。
+        let r = Command::new("cmd")
+            .args(["/C", "start", "", "ms-screenclip:"])
+            .spawn();
+        return r.map(|_| ()).map_err(|e| e.to_string());
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let r = Command::new("screencapture").args(["-i", "-c"]).spawn();
+        return r.map(|_| ()).map_err(|e| e.to_string());
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let r = Command::new("flameshot")
+            .arg("gui")
+            .spawn()
+            .or_else(|_| Command::new("gnome-screenshot").args(["-a", "-c"]).spawn())
+            .or_else(|_| Command::new("spectacle").args(["-r", "-c", "-b"]).spawn());
+        return r.map(|_| ()).map_err(|e| e.to_string());
+    }
+    #[allow(unreachable_code)]
+    Err("unsupported platform".into())
+}
+
 #[tauri::command]
 fn open_log_viewer(_app: tauri::AppHandle) -> Result<(), String> {
     // 获取日志文件路径
@@ -165,6 +211,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_ws_port,
             open_log_viewer,
+            open_screenshot_tool,
             get_desktop_config,
             set_desktop_config
         ])

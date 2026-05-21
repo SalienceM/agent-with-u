@@ -130,5 +130,5 @@ export function useClipboardImage(scopeRef?: RefObject<HTMLElement | null>) {
     return () => document.removeEventListener('paste', handler);
   }, [readFromClipboard, addImage, scopeRef]);
 
-  return { images, removeImage, clearImages, readFromClipboard };
+  return { images, removeImage, clearImages, readFromClipboard, addImage };
 }
