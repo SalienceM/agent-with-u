@@ -518,8 +518,24 @@ export const api = {
     try { return JSON.parse(result); } catch { return []; }
   },
 
-  async loadSession(id: string): Promise<any | null> {
-    const result = await call('loadSession', id);
+  /**
+   * 加载 session。limit 可选:
+   *   - undefined / 0: 返回全部消息(向后兼容,小 session OK,大 session 经中继会卡)
+   *   - >0          : 只返回最末 limit 条,响应里附 `messagesTotal` + `hasMore`,
+   *                   前端可以先渲染最近的,然后按需 loadSessionMessages 拉更老的
+   */
+  async loadSession(id: string, limit?: number): Promise<any | null> {
+    const result = limit !== undefined && limit > 0
+      ? await call('loadSession', id, limit)
+      : await call('loadSession', id);
+    try { return JSON.parse(result); } catch { return null; }
+  },
+
+  /** 翻页加载 session 的更老消息。等价于 messages[offset : offset+limit]。 */
+  async loadSessionMessages(id: string, offset: number, limit: number): Promise<{
+    messages: any[]; offset: number; limit: number; total: number;
+  } | null> {
+    const result = await call('loadSessionMessages', id, offset, limit);
     try { return JSON.parse(result); } catch { return null; }
   },
 
@@ -1074,6 +1090,7 @@ function mockDispatch(method: string, params: any[]): any {
     case 'listSessions': return '[]';
     case 'listConnectedClients': return '[]';
     case 'loadSession': return 'null';
+    case 'loadSessionMessages': return 'null';
     case 'deleteSession': return true;
     case 'getBackends': return JSON.stringify(mockBackends);
     case 'saveBackend': {

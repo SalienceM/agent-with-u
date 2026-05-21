@@ -142,6 +142,11 @@ function normalizeMessage(msg: any): ChatMessage {
 // 历史」的跳变。loadSession 回来后用最新结果覆盖缓存。
 const sessionHistoryCache = new Map<string, ChatMessage[]>();
 
+// 首次加载只取最近 N 条,远程过中继时几十兆 base64 一次性砸过来会卡几秒到
+// 十几秒。后续按需 loadEarlier(),每次再拉 EARLIER_CHUNK 条往前 prepend。
+const INITIAL_LOAD_LIMIT = 20;
+const EARLIER_CHUNK = 30;
+
 export function clearSessionHistoryCache(sessionId: string): void {
   sessionHistoryCache.delete(sessionId);
 }
@@ -152,6 +157,12 @@ export function useChat(sessionId: string, backendId: string, backends?: any[], 
   const [autoContinue, setAutoContinue] = useState(true);
   const [needsMigrate, setNeedsMigrate] = useState(false);
   const [pendingPermission, setPendingPermission] = useState<PermissionRequest | null>(null);
+  // ★ 历史分页:首次 loadSession 时只取最近 INITIAL_LOAD_LIMIT 条,加快远程
+  //   首屏。messagesTotal 是 session 在磁盘上的总数,hasMore 表示还有更老的
+  //   可拉。loadEarlier() 拉下一批往前面 prepend。
+  const [messagesTotal, setMessagesTotal] = useState(0);
+  const [hasMore, setHasMore] = useState(false);
+  const [loadingEarlier, setLoadingEarlier] = useState(false);
 
   // 累积器 refs - 用于本地快速访问，实际状态存储在全局 StreamState
   const textRef = useRef('');
@@ -202,8 +213,15 @@ export function useChat(sessionId: string, backendId: string, backends?: any[], 
       // session 被删除或未选中 → 清空聊天区
       setMessages([]);
       setIsStreaming(false);
+      setMessagesTotal(0);
+      setHasMore(false);
+      setLoadingEarlier(false);
       return;
     }
+
+    // 每次切到新 session 都先把分页状态置空,等 loadSession 回来再更新
+    setHasMore(false);
+    setLoadingEarlier(false);
 
     // ★ 先检查全局流式状态
     const globalState = getStreamState(sessionId);
@@ -259,10 +277,17 @@ export function useChat(sessionId: string, backendId: string, backends?: any[], 
     //   翻成 true,异步回调就直接吐回去。
     let cancelled = false;
 
-    api.loadSession(sessionId).then((session) => {
+    // 有缓存时按缓存大小拉,避免切走→切回把已经翻页加载过的历史又缩回 20 条
+    const initialLimit = Math.max(INITIAL_LOAD_LIMIT, cachedHistory?.length ?? 0);
+    api.loadSession(sessionId, initialLimit).then((session) => {
       if (cancelled) return;
       if (session?.messages) {
         const loadedMessages = session.messages.map(normalizeMessage);
+        const total = typeof session.messagesTotal === 'number'
+          ? session.messagesTotal
+          : loadedMessages.length;
+        setMessagesTotal(total);
+        setHasMore(!!session.hasMore || loadedMessages.length < total);
 
         // ★ 重新读一次 state——RPC 往返期间流可能又推进了好几个 delta。
         const latest = getStreamState(sessionId);
@@ -289,7 +314,8 @@ export function useChat(sessionId: string, backendId: string, backends?: any[], 
           }
         }
         // ★ 更新历史缓存(只缓存非 streaming 的「定稿」消息,避免下次切回来
-        //    看到一个错位的 stale 流式版本)。
+        //    看到一个错位的 stale 流式版本)。注意:这里缓存的是「已加载的最近
+        //    N 条」,不是全部历史。下次切回来仍然以 N 条起步。
         sessionHistoryCache.set(
           sessionId,
           loadedMessages.filter((m: ChatMessage) => !m.streaming),
@@ -893,9 +919,56 @@ export function useChat(sessionId: string, backendId: string, backends?: any[], 
     setIsStreaming(false);
   }, [sessionId]);
 
+  // ── 翻页:拉一批更老的消息往 messages 前面 prepend ──
+  //   chunk: 这次想拉多少条;默认 EARLIER_CHUNK。
+  //   offset 自动算: total - 当前已加载条数 - chunk(向 0 截断)。
+  //   注意只算「定稿」消息——流式 tail 不计入已加载数,否则刚好 send 一条新
+  //   消息后 loadEarlier 会少算 1,造成重复。
+  const loadEarlier = useCallback(
+    async (chunk: number = EARLIER_CHUNK): Promise<void> => {
+      if (!sessionId || !hasMore || loadingEarlier) return;
+      // 当前 messages 里非 streaming 的数量 = 已经从磁盘加载的「定稿」数
+      const loadedCount = messages.filter((m) => !m.streaming).length;
+      const total = messagesTotal;
+      const remaining = total - loadedCount;
+      if (remaining <= 0) {
+        setHasMore(false);
+        return;
+      }
+      const take = Math.min(chunk, remaining);
+      const offset = Math.max(0, total - loadedCount - take);
+      setLoadingEarlier(true);
+      try {
+        const resp = await api.loadSessionMessages(sessionId, offset, take);
+        if (!resp || !Array.isArray(resp.messages)) return;
+        const olderNormalized = resp.messages.map(normalizeMessage);
+        setMessages((prev) => {
+          // 去重:已加载的消息 id 集合
+          const have = new Set(prev.map((m) => m.id));
+          const fresh = olderNormalized.filter((m: ChatMessage) => !have.has(m.id));
+          const next = [...fresh, ...prev];
+          // 同步更新缓存,下次切回来就能秒出
+          sessionHistoryCache.set(
+            sessionId,
+            next.filter((m: ChatMessage) => !m.streaming),
+          );
+          return next;
+        });
+        const newLoadedCount = loadedCount + olderNormalized.length;
+        const newRemaining = total - newLoadedCount;
+        setHasMore(newRemaining > 0);
+      } finally {
+        setLoadingEarlier(false);
+      }
+    },
+    [sessionId, hasMore, loadingEarlier, messages, messagesTotal],
+  );
+
   return {
     messages, isStreaming, sendMessage, abort, autoContinue, setAutoContinue,
     pendingPermission, clearPermission: () => setPendingPermission(null),
     needsMigrate,
+    // 历史分页
+    messagesTotal, hasMore, loadingEarlier, loadEarlier,
   };
 }

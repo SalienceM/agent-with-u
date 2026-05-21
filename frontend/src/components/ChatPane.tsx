@@ -10,7 +10,7 @@ import type { AppConfig } from '../hooks/useConfig';
 // 每个 pane 内部:
 //   1. 调用 useChat —— 独立的流式状态、消息列表、权限气泡
 //   2. 维护自己的滚动状态(autoScroll / 跟踪最新按钮)
-//   3. 维护自己的 visibleCount (只看最近几条 + 展开按钮)
+//   3. 历史分页:首次只加载最近若干条,顶部「↑ load earlier」按需翻页
 //   4. 维护自己的 activeSession 详情 (workingDir / backendId / skipPermissions / sandboxEnabled)
 //   5. 渲染消息列表 + 权限气泡 + ChatInput
 //
@@ -52,7 +52,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
   const [skipPermissions, setSkipPermissions] = useState(true);
   const [sandboxEnabled, setSandboxEnabled] = useState(true);
   // 可见消息条数(切换 session / 切回历史时只显示最近几条)
-  const [visibleCount, setVisibleCount] = useState(6);
+  // visibleCount 已废:历史分页由后端 + chat.loadEarlier() 控制,前端不再折叠
 
   // 滚动相关 refs (与 App 原有一致)
   const endRef = useRef<HTMLDivElement>(null);
@@ -70,10 +70,11 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
       setActiveSession(null);
       return;
     }
-    // ★ 切换 session 时重置「只看最近几条」
-    setVisibleCount(6);
+    // 切换 session 时仅拉元数据(workingDir / backendId / skipPermissions 等),
+    // 历史消息由内部 useChat 走 INITIAL_LOAD_LIMIT 分页加载,不要在这再拉一次
+    // 全量,否则等于白费一次大 RPC。
     let cancelled = false;
-    api.loadSession(sessionId).then((session) => {
+    api.loadSession(sessionId, 1).then((session) => {
       if (cancelled) return;
       setActiveSession(session);
       if (session?.skipPermissions !== undefined) {
@@ -155,18 +156,18 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
     handleClearContext();
   }, [handleClearContext]);
 
-  // ── 可见消息列表 memo ──
+  // ── 全部消息直接渲染。
+  //   早先版本用 visibleCount 在前端折叠成最近 N 条,但那只是「不渲染」,
+  //   loadSession 仍然把全部消息塞过来——session 大 + 远程经中继时,首屏延迟
+  //   完全没解。现在改成后端分页:首次只拉 INITIAL_LOAD_LIMIT 条,UI 上靠
+  //   chat.hasMore + chat.loadEarlier() 按需翻页加载更老的内容。
   const visibleMessages = useMemo(() => {
-    const total = chat.messages.length;
-    // 流式中:全展开避免新消息被折叠
-    const effectiveVisible = Math.max(visibleCount, chat.isStreaming ? total : visibleCount);
-    const hiddenCount = Math.max(0, total - effectiveVisible);
     return {
-      list: hiddenCount > 0 ? chat.messages.slice(hiddenCount) : chat.messages,
-      hiddenCount,
-      total,
+      list: chat.messages,
+      hiddenCount: 0,
+      total: chat.messages.length,
     };
-  }, [chat.messages, visibleCount, chat.isStreaming]);
+  }, [chat.messages]);
 
   // ── 自动滚到底部 ──
   useEffect(() => {
@@ -294,10 +295,11 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
             </div>
           )}
 
-          {hiddenCount > 0 && (
+          {chat.hasMore && (
             <div style={{ display: 'flex', justifyContent: 'center', padding: '8px 16px' }}>
               <button
-                onClick={() => setVisibleCount(total)}
+                onClick={() => chat.loadEarlier()}
+                disabled={chat.loadingEarlier}
                 style={{
                   padding: '6px 16px',
                   borderRadius: 16,
@@ -305,10 +307,13 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
                   background: 'var(--theme-bg-secondary, #f6f8fa)',
                   color: 'var(--theme-text-muted, #656d76)',
                   fontSize: 12,
-                  cursor: 'pointer',
+                  cursor: chat.loadingEarlier ? 'wait' : 'pointer',
+                  opacity: chat.loadingEarlier ? 0.6 : 1,
                 }}
               >
-                ↑ {hiddenCount} earlier messages
+                {chat.loadingEarlier
+                  ? '加载中…'
+                  : `↑ 加载更早的消息 (剩余 ${Math.max(0, chat.messagesTotal - chat.messages.filter((m) => !m.streaming).length)} 条)`}
               </button>
             </div>
           )}

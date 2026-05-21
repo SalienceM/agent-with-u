@@ -1502,12 +1502,50 @@ class BridgeWS:
     def _rpc_listSessions(self) -> str:
         return json.dumps(self._session_store.list(), ensure_ascii=False)
 
-    def _rpc_loadSession(self, sid: str) -> str:
+    def _rpc_loadSession(self, sid: str, limit: int = 0) -> str:
+        """加载 session 元数据 + 最近 N 条消息。
+
+        limit=0(默认): 返回全部消息, hasMore=false(向后兼容旧调用)。
+        limit>0    : 只返回最末 ``limit`` 条;hasMore 指示是否还有更老的消息可拉。
+                     无论是否截断,都附 ``messagesTotal``。
+
+        前端可以先用小 limit 快速拉出最近对话渲染,再按需调用 loadSessionMessages
+        分页加载更老的内容——session 几十兆图片附件时,这能把首屏延迟从十几秒压
+        到几百毫秒,远程过中继时尤其明显。
+        """
         session = self._active_sessions.get(sid) or self._session_store.load(sid)
-        if session:
-            self._active_sessions[sid] = session
-            return json.dumps(session.to_dict(), ensure_ascii=False)
-        return "null"
+        if not session:
+            return "null"
+        self._active_sessions[sid] = session
+        data = session.to_dict()
+        total = len(data.get("messages", []))
+        truncated = bool(limit and limit > 0 and total > limit)
+        if truncated:
+            data["messages"] = data["messages"][-limit:]
+        data["messagesTotal"] = total
+        data["hasMore"] = truncated
+        return json.dumps(data, ensure_ascii=False)
+
+    def _rpc_loadSessionMessages(self, sid: str, offset: int, limit: int) -> str:
+        """按区间拉取 session 的历史消息,用于「向前翻页加载更老内容」。
+
+        参数语义和 Python list 切片一致:返回 messages[offset : offset+limit]。
+        前端通常传 offset = total - 已加载条数 - chunk, limit = chunk。
+        """
+        session = self._active_sessions.get(sid) or self._session_store.load(sid)
+        if not session:
+            return "null"
+        self._active_sessions[sid] = session
+        msgs = [m.to_dict() for m in session.messages]
+        total = len(msgs)
+        o = max(0, int(offset))
+        L = max(1, int(limit))
+        return json.dumps({
+            "messages": msgs[o:o + L],
+            "offset": o,
+            "limit": L,
+            "total": total,
+        }, ensure_ascii=False)
 
     def _rpc_updateSessionConstraints(self, session_id: str, constraints_json: str) -> str:
         try:
