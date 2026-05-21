@@ -44,20 +44,34 @@ if errorlevel 1 (
 )
 for /f "tokens=*" %%V in ('node --version 2^>^&1') do echo [OK] Node %%V
 ::  Root node_modules (includes @tauri-apps/cli)
-if exist "node_modules\.bin\tauri.cmd" goto tauri_ok
-echo [INSTALL] Installing root dependencies (npmmirror)...
-call npm install --registry https://registry.npmmirror.com
-if errorlevel 1 ( echo [ERROR] npm install failed & pause & exit /b 1 )
-:tauri_ok
+:: Re-install when package.json is newer than node_modules — otherwise newly
+:: added deps stay missing on machines where node_modules pre-dated the change.
+set "ROOT_NEEDS_INSTALL=0"
+if not exist "node_modules\.bin\tauri.cmd" set "ROOT_NEEDS_INSTALL=1"
+if not exist "node_modules\.package-lock.json" set "ROOT_NEEDS_INSTALL=1"
+if "!ROOT_NEEDS_INSTALL!"=="0" (
+    for /f %%i in ('powershell -NoProfile -Command "$pkg=(Get-Item 'package.json').LastWriteTime; $lock=if(Test-Path 'package-lock.json'){(Get-Item 'package-lock.json').LastWriteTime}else{$pkg}; $marker=(Get-Item 'node_modules/.package-lock.json').LastWriteTime; if($pkg -gt $marker -or $lock -gt $marker){'1'}else{'0'}"') do set "ROOT_NEEDS_INSTALL=%%i"
+)
+if "!ROOT_NEEDS_INSTALL!"=="1" (
+    echo [INSTALL] Installing root dependencies (npmmirror)...
+    call npm install --registry https://registry.npmmirror.com
+    if errorlevel 1 ( echo [ERROR] npm install failed & pause & exit /b 1 )
+)
 echo [OK] Tauri CLI ready
 ::  Frontend node_modules
-if exist "frontend\node_modules" goto frontend_deps_ok
-echo [INSTALL] Installing frontend dependencies (npmmirror)...
-pushd frontend
-call npm install --registry https://registry.npmmirror.com
-if errorlevel 1 ( popd & echo [ERROR] npm install failed & pause & exit /b 1 )
-popd
-:frontend_deps_ok
+set "FRONTEND_NEEDS_INSTALL=0"
+if not exist "frontend\node_modules" set "FRONTEND_NEEDS_INSTALL=1"
+if not exist "frontend\node_modules\.package-lock.json" set "FRONTEND_NEEDS_INSTALL=1"
+if "!FRONTEND_NEEDS_INSTALL!"=="0" (
+    for /f %%i in ('powershell -NoProfile -Command "$pkg=(Get-Item 'frontend/package.json').LastWriteTime; $lock=if(Test-Path 'frontend/package-lock.json'){(Get-Item 'frontend/package-lock.json').LastWriteTime}else{$pkg}; $marker=(Get-Item 'frontend/node_modules/.package-lock.json').LastWriteTime; if($pkg -gt $marker -or $lock -gt $marker){'1'}else{'0'}"') do set "FRONTEND_NEEDS_INSTALL=%%i"
+)
+if "!FRONTEND_NEEDS_INSTALL!"=="1" (
+    echo [INSTALL] Installing frontend dependencies (npmmirror)...
+    pushd frontend
+    call npm install --registry https://registry.npmmirror.com
+    if errorlevel 1 ( popd & echo [ERROR] npm install failed & pause & exit /b 1 )
+    popd
+)
 echo [OK] Frontend deps ready
 ::  Rust / rustc
 echo.
