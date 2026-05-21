@@ -1,7 +1,7 @@
 import React, { useState, useCallback, useEffect, useRef, memo, useMemo } from 'react';
 import { markdownToHtml } from '../utils/markdown';
 import { loadSkillImageDataUrl } from '../api';
-import type { ChatMessage, ToolCall, ContentBlock } from '../hooks/useChat';
+import type { ChatMessage, ToolCall, ContentBlock, SubagentInfo } from '../hooks/useChat';
 import { DiffView, type DiffData } from './DiffView';
 
 // ── 注入全局动画样式 ──
@@ -240,6 +240,192 @@ function tryParseDiffFromInput(tc: ToolCall): DiffData | null {
   return null;
 }
 
+// ── Subagent 卡片 ─────────────────────────────────────────────────
+//   把零散的 description / 状态 / usage / lastToolName / summary 等字段
+//   组织成两行 + 时间线的卡片,让用户一眼看清楚子 agent 在干什么、跑得怎么样。
+
+const chipPillStyle = (accent: string): React.CSSProperties => ({
+  fontSize: 10,
+  padding: '1px 7px',
+  borderRadius: 10,
+  background: `${accent}1c`,
+  color: accent,
+  fontWeight: 600,
+  letterSpacing: 0.2,
+});
+
+/** 工具名 → 短图标。匹配不到就回退到通用扳手。 */
+function toolIcon(name: string): string {
+  const n = (name || '').toLowerCase();
+  if (n === 'read' || n === 'glob' || n === 'grep') return '🔍';
+  if (n === 'edit' || n === 'multiedit' || n === 'write') return '✏️';
+  if (n === 'bash') return '💻';
+  if (n.startsWith('web')) return '🌐';
+  if (n === 'task') return '🤖';
+  if (n.startsWith('notebook')) return '📓';
+  if (n.startsWith('mcp__')) return '🔌';
+  return '🔧';
+}
+
+const SubagentCard: React.FC<{
+  subagent: SubagentInfo;
+  childTools: ToolCall[];
+  accent: string;
+  formatDuration: (ms?: number) => string | null;
+}> = memo(function SubagentCard({ subagent, childTools, accent, formatDuration }) {
+  const isRunning = subagent.status === 'running' || !subagent.status;
+  const isFailed = subagent.status === 'failed' || subagent.status === 'stopped';
+  const doneCount = childTools.filter((t) => t.status === 'done').length;
+  const totalCount = childTools.length;
+  const progressPct = totalCount > 0 ? Math.round((doneCount / totalCount) * 100) : 0;
+
+  const usage = subagent.usage;
+  const usageItems: string[] = [];
+  if (usage?.toolUses !== undefined) usageItems.push(`🔧 ${usage.toolUses}`);
+  else if (totalCount > 0) usageItems.push(`🔧 ${totalCount}`);
+  if (usage?.totalTokens !== undefined) usageItems.push(`${usage.totalTokens.toLocaleString()} tok`);
+  if (usage?.durationMs !== undefined) usageItems.push(`⏱ ${formatDuration(usage.durationMs)}`);
+
+  return (
+    <div
+      style={{
+        marginBottom: 10,
+        padding: '10px 12px',
+        borderRadius: 8,
+        background: `${accent}10`,
+        border: `1px solid ${accent}40`,
+        fontSize: 12,
+        color: 'var(--theme-text, #1f2328)',
+      }}
+    >
+      {/* 标题行 */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+        <span style={{ fontWeight: 700, color: accent, fontSize: 11, letterSpacing: 0.4 }}>
+          {isFailed ? 'SUBAGENT · 失败' : isRunning ? 'SUBAGENT · 运行中' : 'SUBAGENT · 完成'}
+        </span>
+        {subagent.taskType && (
+          <span style={chipPillStyle(accent)}>{subagent.taskType}</span>
+        )}
+        {usageItems.length > 0 && (
+          <span style={{
+            marginLeft: 'auto',
+            display: 'flex', gap: 8,
+            color: 'var(--theme-text-muted, #656d76)',
+            fontSize: 11,
+            fontFamily: 'monospace',
+          }}>
+            {usageItems.map((it, i) => <span key={i}>{it}</span>)}
+          </span>
+        )}
+      </div>
+      {/* 描述行 */}
+      {subagent.description && (
+        <div style={{ marginTop: 6, fontWeight: 500, lineHeight: 1.5 }}>
+          {subagent.description}
+        </div>
+      )}
+      {/* 进度条:有 child tools 才显示 */}
+      {totalCount > 0 && (
+        <div style={{ marginTop: 8 }}>
+          <div style={{
+            display: 'flex', justifyContent: 'space-between',
+            fontSize: 10, color: 'var(--theme-text-muted, #656d76)',
+            marginBottom: 3,
+          }}>
+            <span>进度</span>
+            <span>{doneCount}/{totalCount}</span>
+          </div>
+          <div style={{
+            height: 4,
+            background: 'var(--theme-bg, rgba(0,0,0,0.05))',
+            borderRadius: 2,
+            overflow: 'hidden',
+          }}>
+            <div style={{
+              width: `${progressPct}%`,
+              height: '100%',
+              background: accent,
+              transition: 'width 0.3s ease',
+            }} />
+          </div>
+        </div>
+      )}
+      {/* 工具时间线(chip 行) */}
+      {totalCount > 0 && (
+        <div style={{
+          marginTop: 8,
+          display: 'flex', flexWrap: 'wrap', gap: 4,
+        }}>
+          {childTools.map((t, i) => {
+            const c = STATUS_COLOR[t.status] || '#888';
+            return (
+              <span
+                key={`chip-${t.id || t.name}-${i}`}
+                title={`${t.name}${t.status ? ' · ' + t.status : ''}${t.duration !== undefined ? ' · ' + formatDuration(t.duration) : ''}`}
+                style={{
+                  fontSize: 10,
+                  padding: '2px 6px',
+                  borderRadius: 4,
+                  background: `${c}15`,
+                  border: `1px solid ${c}40`,
+                  color: 'var(--theme-text, #1f2328)',
+                  fontFamily: 'monospace',
+                  display: 'inline-flex', alignItems: 'center', gap: 3,
+                  maxWidth: 160,
+                  overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+                }}
+              >
+                <span>{toolIcon(t.name)}</span>
+                <span>{t.name}</span>
+              </span>
+            );
+          })}
+        </div>
+      )}
+      {/* 「正在:xxx」运行中的活动指示 */}
+      {isRunning && subagent.lastToolName && (
+        <div style={{
+          marginTop: 6, fontSize: 11,
+          color: 'var(--theme-text-muted, #656d76)',
+          display: 'flex', alignItems: 'center', gap: 4,
+        }}>
+          <span style={{
+            display: 'inline-block', width: 6, height: 6, borderRadius: '50%',
+            background: accent, animation: 'cursorGlow 1s ease-in-out infinite',
+          }} />
+          正在执行: <code style={{ fontSize: 11 }}>{subagent.lastToolName}</code>
+        </div>
+      )}
+      {/* 小结(done) */}
+      {subagent.summary && (
+        <div style={{
+          marginTop: 8,
+          padding: '8px 10px',
+          borderRadius: 6,
+          background: 'var(--theme-bg-secondary, #f6f8fa)',
+          border: '1px solid var(--theme-border, rgba(0,0,0,0.1))',
+          lineHeight: 1.5,
+        }}>
+          <div style={{
+            fontSize: 10, fontWeight: 700, color: accent,
+            letterSpacing: 0.3, marginBottom: 4,
+          }}>📝 小结</div>
+          {subagent.summary}
+        </div>
+      )}
+      {/* 输出文件 */}
+      {subagent.outputFile && (
+        <div style={{
+          marginTop: 6, fontSize: 11,
+          color: 'var(--theme-text-muted, #656d76)',
+        }}>
+          📂 output: <code style={{ fontSize: 11 }}>{subagent.outputFile}</code>
+        </div>
+      )}
+    </div>
+  );
+});
+
 /** 从 tool output 中提取 markdown 图片（返回 {images, text}） */
 function extractImagesFromOutput(output: string): { images: Array<{src: string; alt: string}>; text: string } {
   const images: Array<{src: string; alt: string}> = [];
@@ -293,12 +479,53 @@ const ToolCallBlock: React.FC<{ tc: ToolCall; allTools?: ToolCall[] }> = memo(fu
     return `${(ms / 1000).toFixed(1)}s`;
   };
 
+  // Task 工具:子 agent 派发器。这种情况下整个卡片要做得更醒目,head/body 都
+  // 走专门的路径,让用户一眼看出「这是一个子 agent 工作流,不是一次普通工具调用」。
+  // 普通工具仍走原渲染。
+  const taskAccent = tc.status === 'error' ? STATUS_COLOR.error
+    : tc.status === 'done' ? STATUS_COLOR.done
+    : STATUS_COLOR.running;
+  const taskBoxStyle: React.CSSProperties = isTask ? {
+    ...sectionBox,
+    border: `1px solid ${taskAccent}66`,
+    background: `linear-gradient(180deg, ${taskAccent}10, var(--theme-bg-secondary, #f6f8fa))`,
+  } : sectionBox;
+
   return (
-    <div style={sectionBox}>
+    <div style={taskBoxStyle}>
       <div onClick={() => setExpanded(!expanded)} style={sectionHeader}>
         <span style={{ ...chevron, transform: expanded ? 'rotate(90deg)' : 'none' }}>▶</span>
-        <span>{STATUS_ICON[tc.status] || '🔧'}</span>
-        <span style={{ fontFamily: 'monospace', fontWeight: 600 }}>{tc.name}</span>
+        {isTask ? (
+          <>
+            <span style={{ fontSize: 14 }}>🤖</span>
+            <span style={{ fontWeight: 700, color: taskAccent, letterSpacing: 0.3 }}>SUBAGENT</span>
+            {subagent?.description && (
+              <span
+                style={{
+                  color: 'var(--theme-text, #1f2328)',
+                  fontWeight: 500,
+                  overflow: 'hidden',
+                  textOverflow: 'ellipsis',
+                  whiteSpace: 'nowrap',
+                  maxWidth: 360,
+                }}
+                title={subagent.description}
+              >
+                {subagent.description}
+              </span>
+            )}
+            {childTools.length > 0 && (
+              <span style={chipPillStyle(taskAccent)}>
+                {childTools.length} tools
+              </span>
+            )}
+          </>
+        ) : (
+          <>
+            <span>{STATUS_ICON[tc.status] || '🔧'}</span>
+            <span style={{ fontFamily: 'monospace', fontWeight: 600 }}>{tc.name}</span>
+          </>
+        )}
         {isRunning && <span style={spinnerStyle} />}
         <span
           style={{
@@ -315,81 +542,36 @@ const ToolCallBlock: React.FC<{ tc: ToolCall; allTools?: ToolCall[] }> = memo(fu
       </div>
       {expanded && (
         <div style={sectionBody}>
-          {/* ★ Task 子 agent 元信息条：description / last tool / usage */}
+          {/* ★ Task 子 agent:富信息卡片(描述 / 状态 / 工具时间线 / 小结) */}
           {isTask && subagent && (
-            <div
-              style={{
-                marginBottom: 8,
-                padding: '6px 8px',
-                borderRadius: 6,
-                background: 'var(--theme-bg-muted, rgba(175,184,193,0.12))',
-                border: '1px solid var(--theme-border, rgba(0,0,0,0.08))',
-                fontSize: 11,
-                display: 'flex',
-                flexWrap: 'wrap',
-                gap: '4px 10px',
-                alignItems: 'center',
-              }}
-            >
-              <span style={{ fontWeight: 600, color: 'var(--theme-text, #1f2328)' }}>
-                🤖 subagent
-              </span>
-              {subagent.description && (
-                <span style={{ color: 'var(--theme-text, #1f2328)' }}>
-                  {subagent.description}
-                </span>
-              )}
-              {subagent.taskType && (
-                <span style={{ color: 'var(--theme-text-muted, #656d76)' }}>
-                  · {subagent.taskType}
-                </span>
-              )}
-              {subagent.lastToolName && subagent.status === 'running' && (
-                <span style={{ color: 'var(--theme-text-muted, #656d76)' }}>
-                  · 正在: <code style={{ fontSize: 10 }}>{subagent.lastToolName}</code>
-                </span>
-              )}
-              {subagent.usage && (
-                <span style={{ color: 'var(--theme-text-muted, #656d76)', marginLeft: 'auto' }}>
-                  {subagent.usage.toolUses !== undefined && `🔧 ${subagent.usage.toolUses}`}
-                  {subagent.usage.totalTokens !== undefined && ` · ${subagent.usage.totalTokens} tok`}
-                  {subagent.usage.durationMs !== undefined && ` · ${formatDuration(subagent.usage.durationMs)}`}
-                </span>
-              )}
-              {subagent.summary && (
-                <div style={{ width: '100%', marginTop: 4, color: 'var(--theme-text, #1f2328)' }}>
-                  <span style={{ fontWeight: 600 }}>小结: </span>{subagent.summary}
-                </div>
-              )}
-              {subagent.outputFile && (
-                <div style={{ width: '100%', color: 'var(--theme-text-muted, #656d76)' }}>
-                  <span style={{ fontWeight: 600 }}>output: </span>
-                  <code style={{ fontSize: 10 }}>{subagent.outputFile}</code>
-                </div>
-              )}
-            </div>
+            <SubagentCard
+              subagent={subagent}
+              childTools={childTools}
+              accent={taskAccent}
+              formatDuration={formatDuration}
+            />
           )}
           {/* ★ Edit/Write 工具优先展示 Diff 视图，支持后端注入和前端解析两种来源 */}
           {diffData ? (
             <DiffView diff={diffData} />
           ) : (
-            tc.input && (
+            tc.input && !isTask && (
               <div style={{ marginBottom: 6 }}>
                 <div style={labelStyle}>INPUT</div>
                 <pre style={codeBlock}>{tc.input}</pre>
               </div>
             )
           )}
-          {/* ★ 子 agent 内部工具：以缩进的嵌套卡片渲染 */}
+          {/* ★ 子 agent 内部工具:缩进嵌套卡片;时间线 chip 行由 SubagentCard 渲染 */}
           {childTools.length > 0 && (
             <div
               style={{
                 marginTop: 6,
                 paddingLeft: 12,
-                borderLeft: '2px solid var(--theme-accent, #58a6ff)',
+                borderLeft: `2px solid ${taskAccent}66`,
               }}
             >
-              <div style={{ ...labelStyle, marginBottom: 4 }}>SUBAGENT TOOLS ({childTools.length})</div>
+              <div style={{ ...labelStyle, marginBottom: 4 }}>展开 ({childTools.length})</div>
               {childTools.map((child, i) => (
                 <ToolCallBlock key={`child-${child.id || child.name}-${i}`} tc={child} allTools={allTools} />
               ))}
