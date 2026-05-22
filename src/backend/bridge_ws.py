@@ -2848,6 +2848,174 @@ except urllib.error.URLError as e:
         except Exception as e:
             return json.dumps({"status": "error", "message": str(e)}, ensure_ascii=False)
 
+    # ── RPC: 工作目录同步 ─────────────────────────────────────────
+    # 远程执行模式下，会话工作目录在服务器磁盘上，本地端看不见也够不着。
+    # 这组 RPC 只提供「无状态」的同步原语（清单 / 读 / 写 / 删）；三向
+    # 增量比对与冲突判定全部由客户端完成，服务器不保存任何同步状态。
+
+    # 默认忽略清单：仅在 app-config 未配置 syncIgnore 时使用
+    _SYNC_DEFAULT_IGNORE = [
+        ".git", ".hg", ".svn", "node_modules", "__pycache__",
+        ".venv", "venv", "dist", "build", "target",
+        ".idea", ".vscode", ".awu-sync", ".DS_Store",
+        "*.pyc", "*.pyo", "*.log",
+    ]
+    # 单文件传输上限：base64 膨胀 ~33% 后须远小于 WS max_size(50MB)
+    _SYNC_MAX_FILE = 32 * 1024 * 1024
+
+    def _sync_ignore_patterns(self) -> list:
+        """忽略清单从 app-config 读取（key=syncIgnore），未配置则用默认值。"""
+        pats = self._app_config_store.get("syncIgnore", None)
+        if isinstance(pats, list):
+            cleaned = [str(p).strip() for p in pats if str(p).strip()]
+            if cleaned:
+                return cleaned
+        return list(self._SYNC_DEFAULT_IGNORE)
+
+    @staticmethod
+    def _sync_is_ignored(rel: str, patterns: list) -> bool:
+        """gitignore 风格的简化匹配：任一路径段或整条相对路径命中即忽略。"""
+        import fnmatch
+        rel = rel.replace("\\", "/")
+        segs = [s for s in rel.split("/") if s]
+        for pat in patterns:
+            p = pat.strip().rstrip("/")
+            if not p:
+                continue
+            if fnmatch.fnmatch(rel, p):
+                return True
+            for seg in segs:
+                if fnmatch.fnmatch(seg, p):
+                    return True
+        return False
+
+    @staticmethod
+    def _sync_safe_path(working_dir: str, rel: str):
+        """把相对路径解析到工作目录内，越权（.. / 绝对路径）一律抛 ValueError。"""
+        from pathlib import Path as _P
+        root = _P(working_dir).resolve()
+        parts = [p for p in rel.replace("\\", "/").split("/") if p and p != "."]
+        if not parts or any(p == ".." for p in parts):
+            raise ValueError("非法路径")
+        target = root.joinpath(*parts).resolve()
+        target.relative_to(root)  # 不在 root 内会抛 ValueError
+        return root, target
+
+    def _rpc_syncManifest(self, working_dir: str) -> str:
+        """扫描服务器工作目录，返回 {status, sep, root, files:{rel:{hash,size}}}。
+        供客户端做三向增量比对。受 app-config.syncIgnore 控制忽略清单。"""
+        import os, hashlib
+        from pathlib import Path as _P
+        try:
+            root = _P(working_dir).resolve()
+            if not root.is_dir():
+                return json.dumps({"status": "error", "message": "工作目录不存在"},
+                                  ensure_ascii=False)
+            patterns = self._sync_ignore_patterns()
+            files: dict = {}
+            for dirpath, dirnames, filenames in os.walk(root):
+                relbase = os.path.relpath(dirpath, root).replace("\\", "/")
+                if relbase == ".":
+                    relbase = ""
+                # 原地剪枝：被忽略的目录不再深入
+                dirnames[:] = [
+                    d for d in dirnames
+                    if not self._sync_is_ignored(f"{relbase}/{d}" if relbase else d, patterns)
+                ]
+                for fn in filenames:
+                    rel = f"{relbase}/{fn}" if relbase else fn
+                    if self._sync_is_ignored(rel, patterns):
+                        continue
+                    fp = _P(dirpath) / fn
+                    try:
+                        if fp.is_symlink():
+                            continue
+                        st = fp.stat()
+                        h = hashlib.sha256()
+                        with open(fp, "rb") as f:
+                            for chunk in iter(lambda: f.read(1 << 20), b""):
+                                h.update(chunk)
+                        files[rel] = {"hash": h.hexdigest(), "size": st.st_size}
+                    except Exception:
+                        continue
+            return json.dumps({"status": "ok", "sep": os.sep,
+                               "root": str(root), "files": files}, ensure_ascii=False)
+        except Exception as e:
+            return json.dumps({"status": "error", "message": str(e)}, ensure_ascii=False)
+
+    def _rpc_syncReadFile(self, working_dir: str, rel: str) -> str:
+        """读取工作目录内单个文件，返回 {status, hash, data(base64)}。"""
+        import base64, hashlib
+        try:
+            _root, target = self._sync_safe_path(working_dir, rel)
+            if not target.is_file():
+                return json.dumps({"status": "error", "message": "文件不存在"},
+                                  ensure_ascii=False)
+            data = target.read_bytes()
+            if len(data) > self._SYNC_MAX_FILE:
+                return json.dumps({"status": "error", "message": "文件过大，已跳过",
+                                   "tooLarge": True, "size": len(data)}, ensure_ascii=False)
+            return json.dumps({
+                "status": "ok",
+                "hash": hashlib.sha256(data).hexdigest(),
+                "data": base64.b64encode(data).decode("ascii"),
+            }, ensure_ascii=False)
+        except ValueError as e:
+            return json.dumps({"status": "error", "message": str(e)}, ensure_ascii=False)
+        except Exception as e:
+            return json.dumps({"status": "error", "message": str(e)}, ensure_ascii=False)
+
+    def _rpc_syncWriteFile(self, working_dir: str, rel: str, data_base64: str) -> str:
+        """把 base64 内容写入工作目录内单个文件（必要时创建父目录）。"""
+        import base64
+        try:
+            _root, target = self._sync_safe_path(working_dir, rel)
+            data = base64.b64decode(data_base64)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(data)
+            return json.dumps({"status": "ok"}, ensure_ascii=False)
+        except ValueError as e:
+            return json.dumps({"status": "error", "message": str(e)}, ensure_ascii=False)
+        except Exception as e:
+            return json.dumps({"status": "error", "message": str(e)}, ensure_ascii=False)
+
+    def _rpc_syncDeleteFile(self, working_dir: str, rel: str) -> str:
+        """删除工作目录内单个文件，并向上清理因此变空的目录（不越过 root）。"""
+        try:
+            root, target = self._sync_safe_path(working_dir, rel)
+            if target.is_file() or target.is_symlink():
+                target.unlink()
+                parent = target.parent
+                while parent != root and parent.is_dir() and not any(parent.iterdir()):
+                    parent.rmdir()
+                    parent = parent.parent
+            return json.dumps({"status": "ok"}, ensure_ascii=False)
+        except ValueError as e:
+            return json.dumps({"status": "error", "message": str(e)}, ensure_ascii=False)
+        except Exception as e:
+            return json.dumps({"status": "error", "message": str(e)}, ensure_ascii=False)
+
+    def _rpc_getSyncConfig(self) -> str:
+        """返回当前忽略清单与默认值，供同步面板编辑。"""
+        return json.dumps({
+            "ignore": self._sync_ignore_patterns(),
+            "defaultIgnore": list(self._SYNC_DEFAULT_IGNORE),
+        }, ensure_ascii=False)
+
+    def _rpc_setSyncConfig(self, config_json: str) -> str:
+        """保存忽略清单到 app-config（key=syncIgnore）。"""
+        try:
+            cfg = json.loads(config_json) if config_json else {}
+            ignore = cfg.get("ignore", [])
+            if isinstance(ignore, list):
+                self._app_config_store.set(
+                    "syncIgnore",
+                    [str(p).strip() for p in ignore if str(p).strip()],
+                )
+            return json.dumps({"status": "ok"}, ensure_ascii=False)
+        except Exception as e:
+            return json.dumps({"status": "error", "message": str(e)}, ensure_ascii=False)
+
     def _rpc_getAuthStatus(self) -> str:
         """返回 Claude CLI 登录状态，供前端展示登录引导。"""
         from .base import get_claude_auth_status
