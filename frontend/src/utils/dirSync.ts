@@ -1,0 +1,490 @@
+/**
+ * dirSync.ts — 远程工作目录 ↔ 本机副本目录的增量同步引擎。
+ *
+ * 远程执行模式下会话工作目录在执行节点磁盘上，本地端够不着。本模块在
+ * 「本机副本目录」与「远端工作目录」之间做三向增量比对：
+ *
+ *   B 基线（上次同步快照） / L 本地清单 / R 远端清单
+ *
+ * 只有相对基线发生变化的文件才传输；两端都相对基线改过同一文件 → 冲突，
+ * 不自动覆盖，交由用户决定。服务器侧完全无状态，基线存在客户端。
+ *
+ * 本地副本目录的文件系统访问有两套实现：
+ *   - Tauri 桌面端：Rust 命令 dir_sync_*（真实文件系统）
+ *   - 浏览器：File System Access API（仅 Chromium 内核）
+ */
+import { api, isTauri } from '../api';
+
+export interface FileMeta {
+  hash: string;
+  size: number;
+}
+/** relpath → 文件元信息 */
+export type Manifest = Record<string, FileMeta>;
+
+export type SyncDirection = 'pull' | 'push';
+
+/** 单文件传输上限：须与后端 _SYNC_MAX_FILE 一致，避免 base64 后撑爆 WS 帧。 */
+export const SYNC_MAX_FILE = 32 * 1024 * 1024;
+
+export interface DiffEntry {
+  rel: string;
+  /** 对「目标端」执行的动作 */
+  action: 'add' | 'update' | 'delete';
+  /** 两端都相对基线改动过 —— 应用前需用户确认 */
+  conflict: boolean;
+  /** 传输字节数（delete 为 0） */
+  size: number;
+}
+
+export interface DiffResult {
+  direction: SyncDirection;
+  entries: DiffEntry[];
+  /** entries 中 conflict 为 true 的子集（同一对象引用） */
+  conflicts: DiffEntry[];
+}
+
+export interface PreparedSync {
+  direction: SyncDirection;
+  diff: DiffResult;
+  local: Manifest;
+  remote: Manifest;
+}
+
+export interface ApplyProgress {
+  done: number;
+  total: number;
+  rel: string;
+}
+
+export interface ApplyResult {
+  applied: number;
+  failed: { rel: string; error: string }[];
+}
+
+// ── 通配匹配（与后端 Python fnmatch 语义对齐）──────────────────
+
+function wildcardToRegExp(pat: string): RegExp {
+  const body = pat
+    .split('')
+    .map((c) => {
+      if (c === '*') return '.*';
+      if (c === '?') return '.';
+      return c.replace(/[.+^${}()|[\]\\]/g, '\\$&');
+    })
+    .join('');
+  return new RegExp(`^${body}$`);
+}
+
+/** gitignore 风格的简化匹配：任一路径段或整条相对路径命中即忽略。 */
+export function isIgnored(rel: string, patterns: string[]): boolean {
+  const r = rel.replace(/\\/g, '/');
+  const segs = r.split('/').filter(Boolean);
+  for (const pat of patterns) {
+    const p = pat.trim().replace(/\/+$/, '');
+    if (!p) continue;
+    const re = wildcardToRegExp(p);
+    if (re.test(r)) return true;
+    for (const s of segs) if (re.test(s)) return true;
+  }
+  return false;
+}
+
+// ── base64 / 哈希 工具 ────────────────────────────────────────
+
+function arrayBufferToBase64(buf: ArrayBuffer): string {
+  const bytes = new Uint8Array(buf);
+  let bin = '';
+  const chunk = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunk) {
+    bin += String.fromCharCode(...bytes.subarray(i, i + chunk));
+  }
+  return btoa(bin);
+}
+
+function base64ToUint8Array(b64: string): Uint8Array {
+  const bin = atob(b64);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return bytes;
+}
+
+async function sha256Hex(buf: ArrayBuffer): Promise<string> {
+  const digest = await crypto.subtle.digest('SHA-256', buf);
+  return Array.from(new Uint8Array(digest))
+    .map((b) => b.toString(16).padStart(2, '0'))
+    .join('');
+}
+
+// ── 本地副本目录的文件系统抽象 ─────────────────────────────────
+
+export interface LocalFs {
+  readonly kind: 'tauri' | 'browser';
+  /** 人类可读的副本目录标识（用于界面展示） */
+  label(): string;
+  /** 跨会话稳定的标识，用于给基线做 key */
+  id(): string;
+  scan(ignore: string[]): Promise<Manifest>;
+  readFile(rel: string): Promise<string>; // base64
+  writeFile(rel: string, base64: string): Promise<void>;
+  deleteFile(rel: string): Promise<void>;
+}
+
+async function tauriInvoke<T>(cmd: string, args: Record<string, unknown>): Promise<T> {
+  const { invoke } = await import('@tauri-apps/api/core');
+  return invoke<T>(cmd, args);
+}
+
+/** Tauri 桌面端：副本目录是本机一个真实路径。 */
+export class TauriLocalFs implements LocalFs {
+  readonly kind = 'tauri' as const;
+  constructor(private dir: string) {}
+  label(): string {
+    return this.dir;
+  }
+  id(): string {
+    return `tauri:${this.dir}`;
+  }
+  async scan(ignore: string[]): Promise<Manifest> {
+    const r = await tauriInvoke<{ files: Manifest }>('dir_sync_scan', {
+      dir: this.dir,
+      ignore,
+    });
+    return r.files || {};
+  }
+  readFile(rel: string): Promise<string> {
+    return tauriInvoke<string>('dir_sync_read_file', { dir: this.dir, rel });
+  }
+  writeFile(rel: string, base64: string): Promise<void> {
+    return tauriInvoke<void>('dir_sync_write_file', { dir: this.dir, rel, data: base64 });
+  }
+  deleteFile(rel: string): Promise<void> {
+    return tauriInvoke<void>('dir_sync_delete_file', { dir: this.dir, rel });
+  }
+}
+
+/** 浏览器：副本目录是 File System Access API 的目录句柄。 */
+export class BrowserLocalFs implements LocalFs {
+  readonly kind = 'browser' as const;
+  // handle 类型依赖 lib.dom 版本，统一用 any 规避版本差异
+  constructor(private handle: any) {}
+  label(): string {
+    return this.handle?.name || '(已选目录)';
+  }
+  id(): string {
+    return `browser:${this.handle?.name || ''}`;
+  }
+  async scan(ignore: string[]): Promise<Manifest> {
+    const out: Manifest = {};
+    await this._walk(this.handle, '', ignore, out);
+    return out;
+  }
+  private async _walk(dir: any, base: string, ignore: string[], out: Manifest): Promise<void> {
+    for await (const [name, h] of dir.entries()) {
+      const rel = base ? `${base}/${name}` : name;
+      if (isIgnored(rel, ignore)) continue;
+      if (h.kind === 'directory') {
+        await this._walk(h, rel, ignore, out);
+      } else {
+        const file = await h.getFile();
+        const buf = await file.arrayBuffer();
+        out[rel] = { hash: await sha256Hex(buf), size: file.size };
+      }
+    }
+  }
+  private async _fileHandle(rel: string, create: boolean): Promise<any> {
+    const parts = rel.split('/').filter(Boolean);
+    const name = parts.pop();
+    if (!name) throw new Error(`非法路径: ${rel}`);
+    let dir = this.handle;
+    for (const p of parts) dir = await dir.getDirectoryHandle(p, { create });
+    return dir.getFileHandle(name, { create });
+  }
+  async readFile(rel: string): Promise<string> {
+    const fh = await this._fileHandle(rel, false);
+    const file = await fh.getFile();
+    return arrayBufferToBase64(await file.arrayBuffer());
+  }
+  async writeFile(rel: string, base64: string): Promise<void> {
+    const fh = await this._fileHandle(rel, true);
+    const w = await fh.createWritable();
+    await w.write(base64ToUint8Array(base64));
+    await w.close();
+  }
+  async deleteFile(rel: string): Promise<void> {
+    const parts = rel.split('/').filter(Boolean);
+    const name = parts.pop();
+    if (!name) return;
+    let dir = this.handle;
+    for (const p of parts) dir = await dir.getDirectoryHandle(p);
+    await dir.removeEntry(name);
+  }
+}
+
+// ── 副本目录的选择与持久化 ─────────────────────────────────────
+
+const COPYDIR_TAURI_KEY = 'awu-dirsync-copydir-tauri';
+const IDB_DB = 'awu-dirsync';
+const IDB_STORE = 'handles';
+const IDB_HANDLE_KEY = 'copydir';
+
+function idbOpen(): Promise<IDBDatabase> {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(IDB_DB, 1);
+    req.onupgradeneeded = () => req.result.createObjectStore(IDB_STORE);
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+function idbPut(key: string, val: unknown): Promise<void> {
+  return idbOpen().then(
+    (db) =>
+      new Promise((resolve, reject) => {
+        const tx = db.transaction(IDB_STORE, 'readwrite');
+        tx.objectStore(IDB_STORE).put(val, key);
+        tx.oncomplete = () => resolve();
+        tx.onerror = () => reject(tx.error);
+      }),
+  );
+}
+
+function idbGet(key: string): Promise<any> {
+  return idbOpen().then(
+    (db) =>
+      new Promise((resolve, reject) => {
+        const tx = db.transaction(IDB_STORE, 'readonly');
+        const r = tx.objectStore(IDB_STORE).get(key);
+        r.onsuccess = () => resolve(r.result);
+        r.onerror = () => reject(r.error);
+      }),
+  );
+}
+
+/** 让用户选择本机副本目录。须在用户手势（点击）回调中调用。 */
+export async function pickLocalDir(initialPath?: string): Promise<LocalFs | null> {
+  if (isTauri()) {
+    const path = await api.selectDirectory(initialPath);
+    if (!path) return null;
+    try {
+      localStorage.setItem(COPYDIR_TAURI_KEY, path);
+    } catch {
+      /* 忽略持久化失败 */
+    }
+    return new TauriLocalFs(path);
+  }
+  const w = window as any;
+  if (typeof w.showDirectoryPicker !== 'function') {
+    throw new Error('当前浏览器不支持目录访问（需 Chromium 内核），请改用桌面客户端');
+  }
+  const handle = await w.showDirectoryPicker({ mode: 'readwrite' });
+  try {
+    await idbPut(IDB_HANDLE_KEY, handle);
+  } catch {
+    /* 忽略持久化失败 */
+  }
+  return new BrowserLocalFs(handle);
+}
+
+/** 启动时尝试恢复上次选择的副本目录（浏览器侧可能需要用户重新授权）。 */
+export async function restoreLocalDir(): Promise<LocalFs | null> {
+  if (isTauri()) {
+    try {
+      const path = localStorage.getItem(COPYDIR_TAURI_KEY);
+      return path ? new TauriLocalFs(path) : null;
+    } catch {
+      return null;
+    }
+  }
+  try {
+    const handle = await idbGet(IDB_HANDLE_KEY);
+    if (!handle) return null;
+    // 浏览器重启后权限通常回落到 prompt，须经用户手势重新授权；
+    // 此处只在仍为 granted 时复用，否则让用户重新选择目录（即重新授权）。
+    const perm = await handle.queryPermission?.({ mode: 'readwrite' });
+    if (perm !== 'granted') return null;
+    return new BrowserLocalFs(handle);
+  } catch {
+    return null;
+  }
+}
+
+// ── 基线快照（localStorage）────────────────────────────────────
+
+function baselineKey(localId: string, workingDir: string): string {
+  return `awu-dirsync-baseline:${localId}::${workingDir}`;
+}
+
+export function loadBaseline(localId: string, workingDir: string): Manifest {
+  try {
+    const raw = localStorage.getItem(baselineKey(localId, workingDir));
+    return raw ? (JSON.parse(raw) as Manifest) : {};
+  } catch {
+    return {};
+  }
+}
+
+export function saveBaseline(localId: string, workingDir: string, manifest: Manifest): void {
+  try {
+    localStorage.setItem(baselineKey(localId, workingDir), JSON.stringify(manifest));
+  } catch (e) {
+    console.warn('[dirSync] 基线保存失败', e);
+  }
+}
+
+// ── 三向比对 ──────────────────────────────────────────────────
+
+/**
+ * 计算从 source 端同步到 dest 端需要的变更。
+ * pull：source=远端, dest=本地；push：source=本地, dest=远端。
+ */
+export function computeDiff(
+  direction: SyncDirection,
+  baseline: Manifest,
+  local: Manifest,
+  remote: Manifest,
+): DiffResult {
+  const [src, dst] = direction === 'pull' ? [remote, local] : [local, remote];
+  const entries: DiffEntry[] = [];
+  const all = new Set([...Object.keys(local), ...Object.keys(remote)]);
+
+  for (const rel of all) {
+    const s = src[rel];
+    const d = dst[rel];
+    const b = baseline[rel];
+
+    if (s && d) {
+      if (s.hash === d.hash) continue; // 两端一致
+      // 更新 dest；dest 与 source 都相对基线改过 → 冲突
+      const dstChanged = !b || d.hash !== b.hash;
+      const srcChanged = !b || s.hash !== b.hash;
+      entries.push({ rel, action: 'update', size: s.size, conflict: dstChanged && srcChanged });
+    } else if (s && !d) {
+      if (b) {
+        // dest 删除过它；source 若也改过 → 冲突，否则补回
+        entries.push({ rel, action: 'add', size: s.size, conflict: s.hash !== b.hash });
+      } else {
+        // 基线没有 → source 端新增 → 直接补
+        entries.push({ rel, action: 'add', size: s.size, conflict: false });
+      }
+    } else if (!s && d) {
+      if (b) {
+        // source 删除过它；dest 若改过 → 冲突，否则删除
+        entries.push({ rel, action: 'delete', size: 0, conflict: d.hash !== b.hash });
+      }
+      // 基线没有 → dest 端独有的新文件，尚未同步过去 → 保留，不产生条目
+    }
+  }
+
+  entries.sort((a, b) => a.rel.localeCompare(b.rel));
+  return { direction, entries, conflicts: entries.filter((e) => e.conflict) };
+}
+
+// ── 同步会话 ──────────────────────────────────────────────────
+
+interface Endpoint {
+  scan(): Promise<Manifest>;
+  readFile(rel: string): Promise<string>;
+  writeFile(rel: string, base64: string): Promise<void>;
+  deleteFile(rel: string): Promise<void>;
+}
+
+function remoteEndpoint(workingDir: string): Endpoint {
+  return {
+    async scan() {
+      const r = await api.syncManifest(workingDir);
+      if (r.status !== 'ok' || !r.files) throw new Error(r.message || '远端清单获取失败');
+      return r.files;
+    },
+    async readFile(rel) {
+      const r = await api.syncReadFile(workingDir, rel);
+      if (r.status !== 'ok' || r.data == null) {
+        throw new Error(r.message || `读取远端文件失败: ${rel}`);
+      }
+      return r.data;
+    },
+    async writeFile(rel, base64) {
+      const r = await api.syncWriteFile(workingDir, rel, base64);
+      if (r.status !== 'ok') throw new Error(r.message || `写入远端文件失败: ${rel}`);
+    },
+    async deleteFile(rel) {
+      const r = await api.syncDeleteFile(workingDir, rel);
+      if (r.status !== 'ok') throw new Error(r.message || `删除远端文件失败: ${rel}`);
+    },
+  };
+}
+
+function localEndpoint(fs: LocalFs, ignore: string[]): Endpoint {
+  return {
+    scan: () => fs.scan(ignore),
+    readFile: (rel) => fs.readFile(rel),
+    writeFile: (rel, b64) => fs.writeFile(rel, b64),
+    deleteFile: (rel) => fs.deleteFile(rel),
+  };
+}
+
+export class DirSyncSession {
+  constructor(
+    private fs: LocalFs,
+    private workingDir: string,
+    private ignore: string[],
+  ) {}
+
+  /** 扫描两端 + 三向比对，得到待应用的变更（不落盘）。 */
+  async prepare(direction: SyncDirection): Promise<PreparedSync> {
+    const localEp = localEndpoint(this.fs, this.ignore);
+    const remoteEp = remoteEndpoint(this.workingDir);
+    const [local, remote] = await Promise.all([localEp.scan(), remoteEp.scan()]);
+    const baseline = loadBaseline(this.fs.id(), this.workingDir);
+    const diff = computeDiff(direction, baseline, local, remote);
+    return { direction, diff, local, remote };
+  }
+
+  /** 应用选中的变更条目，逐文件传输，结束后刷新基线。 */
+  async apply(
+    prepared: PreparedSync,
+    selected: DiffEntry[],
+    onProgress?: (p: ApplyProgress) => void,
+  ): Promise<ApplyResult> {
+    const localEp = localEndpoint(this.fs, this.ignore);
+    const remoteEp = remoteEndpoint(this.workingDir);
+    const [src, dst] = prepared.direction === 'pull' ? [remoteEp, localEp] : [localEp, remoteEp];
+
+    const failed: ApplyResult['failed'] = [];
+    let applied = 0;
+    let done = 0;
+    for (const e of selected) {
+      done++;
+      onProgress?.({ done, total: selected.length, rel: e.rel });
+      try {
+        if (e.action === 'delete') {
+          await dst.deleteFile(e.rel);
+        } else {
+          if (e.size > SYNC_MAX_FILE) {
+            throw new Error(`文件过大，已跳过（>${Math.floor(SYNC_MAX_FILE / 1024 / 1024)}MB）`);
+          }
+          await dst.writeFile(e.rel, await src.readFile(e.rel));
+        }
+        applied++;
+      } catch (err) {
+        failed.push({ rel: e.rel, error: err instanceof Error ? err.message : String(err) });
+      }
+    }
+
+    // 刷新基线：重扫两端，取哈希一致的部分作为新的共同祖先
+    try {
+      const [local2, remote2] = await Promise.all([localEp.scan(), remoteEp.scan()]);
+      const baseline: Manifest = {};
+      for (const rel of Object.keys(local2)) {
+        if (remote2[rel] && remote2[rel].hash === local2[rel].hash) {
+          baseline[rel] = local2[rel];
+        }
+      }
+      saveBaseline(this.fs.id(), this.workingDir, baseline);
+    } catch (e) {
+      console.warn('[dirSync] 基线刷新失败', e);
+    }
+
+    return { applied, failed };
+  }
+}

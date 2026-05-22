@@ -212,6 +212,203 @@ fn open_log_viewer(_app: tauri::AppHandle) -> Result<(), String> {
     Ok(())
 }
 
+// ════════════════════════════════════════════════════════════════
+//  目录同步：本机「副本目录」的文件系统原语
+//
+//  远程执行模式下，会话工作目录在远端执行节点上。客户端要 pull/push
+//  就得在本机选一个「副本目录」。这组命令提供对该副本目录的扫描 / 读 /
+//  写 / 删，与后端 syncManifest/syncReadFile/... 对称；三向增量比对在
+//  前端 dirSync.ts 里完成。哈希用 sha2（纯 Rust，编译进二进制）。
+// ════════════════════════════════════════════════════════════════
+
+use sha2::{Digest, Sha256};
+use std::collections::HashMap;
+use std::path::Path;
+
+#[derive(Serialize)]
+struct SyncFileInfo {
+    hash: String,
+    size: u64,
+}
+
+#[derive(Serialize)]
+struct SyncScanResult {
+    files: HashMap<String, SyncFileInfo>,
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        s.push_str(&format!("{:02x}", b));
+    }
+    s
+}
+
+/// 极简通配匹配：`*` 匹配任意长度（含空），`?` 匹配单字符，其余精确。
+/// 语义须与后端 Python fnmatch 保持一致（默认忽略清单只用到 `*`）。
+fn wildcard_match(pat: &str, text: &str) -> bool {
+    let p: Vec<char> = pat.chars().collect();
+    let t: Vec<char> = text.chars().collect();
+    let (np, nt) = (p.len(), t.len());
+    let mut dp = vec![vec![false; nt + 1]; np + 1];
+    dp[0][0] = true;
+    for i in 1..=np {
+        if p[i - 1] == '*' {
+            dp[i][0] = dp[i - 1][0];
+        }
+    }
+    for i in 1..=np {
+        for j in 1..=nt {
+            dp[i][j] = if p[i - 1] == '*' {
+                dp[i - 1][j] || dp[i][j - 1]
+            } else if p[i - 1] == '?' || p[i - 1] == t[j - 1] {
+                dp[i - 1][j - 1]
+            } else {
+                false
+            };
+        }
+    }
+    dp[np][nt]
+}
+
+fn sync_is_ignored(rel: &str, patterns: &[String]) -> bool {
+    let rel = rel.replace('\\', "/");
+    let segs: Vec<&str> = rel.split('/').filter(|s| !s.is_empty()).collect();
+    for pat in patterns {
+        let p = pat.trim().trim_end_matches('/');
+        if p.is_empty() {
+            continue;
+        }
+        if wildcard_match(p, &rel) {
+            return true;
+        }
+        for seg in &segs {
+            if wildcard_match(p, seg) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// 把相对路径解析到副本目录内；越权（.. / 绝对路径）一律报错。
+/// 写入场景下目标文件可能尚不存在，因此不能 canonicalize 目标本身，
+/// 改为「从规范化的 root 逐段 push」+ 拒绝 `..` 段来保证不越界。
+fn sync_resolve(dir: &str, rel: &str) -> Result<(std::path::PathBuf, std::path::PathBuf), String> {
+    let root = std::fs::canonicalize(dir).map_err(|e| format!("副本目录无效: {e}"))?;
+    let parts: Vec<String> = rel
+        .replace('\\', "/")
+        .split('/')
+        .filter(|s| !s.is_empty() && *s != ".")
+        .map(|s| s.to_string())
+        .collect();
+    if parts.is_empty() || parts.iter().any(|s| s == "..") {
+        return Err("非法路径".into());
+    }
+    let mut target = root.clone();
+    for p in &parts {
+        target.push(p);
+    }
+    Ok((root, target))
+}
+
+fn scan_dir(root: &Path, cur: &Path, ignore: &[String], out: &mut HashMap<String, SyncFileInfo>) {
+    let entries = match std::fs::read_dir(cur) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let ft = match entry.file_type() {
+            Ok(f) => f,
+            Err(_) => continue,
+        };
+        if ft.is_symlink() {
+            continue;
+        }
+        let path = entry.path();
+        let rel = match path.strip_prefix(root) {
+            Ok(r) => r.to_string_lossy().replace('\\', "/"),
+            Err(_) => continue,
+        };
+        if sync_is_ignored(&rel, ignore) {
+            continue;
+        }
+        if ft.is_dir() {
+            scan_dir(root, &path, ignore, out);
+        } else if ft.is_file() {
+            if let Ok(data) = std::fs::read(&path) {
+                let mut hasher = Sha256::new();
+                hasher.update(&data);
+                out.insert(
+                    rel,
+                    SyncFileInfo {
+                        hash: hex_encode(&hasher.finalize()),
+                        size: data.len() as u64,
+                    },
+                );
+            }
+        }
+    }
+}
+
+#[tauri::command]
+fn dir_sync_scan(dir: String, ignore: Vec<String>) -> Result<SyncScanResult, String> {
+    let root = std::fs::canonicalize(&dir).map_err(|e| format!("副本目录无效: {e}"))?;
+    if !root.is_dir() {
+        return Err("副本目录不存在".into());
+    }
+    let mut files = HashMap::new();
+    scan_dir(&root, &root, &ignore, &mut files);
+    Ok(SyncScanResult { files })
+}
+
+#[tauri::command]
+fn dir_sync_read_file(dir: String, rel: String) -> Result<String, String> {
+    let (_root, target) = sync_resolve(&dir, &rel)?;
+    let data = std::fs::read(&target).map_err(|e| e.to_string())?;
+    Ok(BASE64.encode(&data))
+}
+
+#[tauri::command]
+fn dir_sync_write_file(dir: String, rel: String, data: String) -> Result<(), String> {
+    let (_root, target) = sync_resolve(&dir, &rel)?;
+    let bytes = BASE64
+        .decode(data.as_bytes())
+        .map_err(|e| format!("base64 解码失败: {e}"))?;
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    std::fs::write(&target, bytes).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn dir_sync_delete_file(dir: String, rel: String) -> Result<(), String> {
+    let (root, target) = sync_resolve(&dir, &rel)?;
+    if target.is_file() || target.is_symlink() {
+        std::fs::remove_file(&target).map_err(|e| e.to_string())?;
+        // 向上清理因此变空的目录，但不越过 root
+        let mut parent = target.parent().map(|p| p.to_path_buf());
+        while let Some(p) = parent {
+            if p == root {
+                break;
+            }
+            match std::fs::read_dir(&p) {
+                Ok(mut it) => {
+                    if it.next().is_some() {
+                        break;
+                    }
+                    if std::fs::remove_dir(&p).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+            parent = p.parent().map(|x| x.to_path_buf());
+        }
+    }
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -262,7 +459,11 @@ pub fn run() {
             open_screenshot_tool,
             read_local_clipboard_image,
             get_desktop_config,
-            set_desktop_config
+            set_desktop_config,
+            dir_sync_scan,
+            dir_sync_read_file,
+            dir_sync_write_file,
+            dir_sync_delete_file
         ])
         .run(tauri::generate_context!())
         .expect("error while running AgentWithU");

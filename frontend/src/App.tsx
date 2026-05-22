@@ -14,6 +14,7 @@ import { ServerDirPicker } from './components/ServerDirPicker';
 import { LogViewer } from './components/LogViewer';
 import { AuthStatusBanner } from './components/AuthStatusBanner';
 import { ConnectionPanel } from './components/ConnectionPanel';
+import { DirSyncPanel } from './components/DirSyncPanel';
 import { ChatPane } from './components/ChatPane';
 import { clearSessionHistoryCache } from './hooks/useChat';
 import { clearStreamStateForSession } from './hooks/useStreamState';
@@ -43,6 +44,7 @@ export const App: React.FC = () => {
   const [repoPanelOpen, setRepoPanelOpen] = useState(false);
   const [logViewerOpen, setLogViewerOpen] = useState(false);
   const [connPanelOpen, setConnPanelOpen] = useState(false);
+  const [syncPanelOpen, setSyncPanelOpen] = useState(false);
   const [repoPanelEditing, setRepoPanelEditing] = useState(false);
   const [newSessionDialogOpen, setNewSessionDialogOpen] = useState(false);
   const [streamingSessions, setStreamingSessions] = useState<Set<string>>(new Set());  // ★ Per-session streaming state
@@ -749,6 +751,14 @@ export const App: React.FC = () => {
           >
             📡
           </button>
+          {/* 目录同步：远端工作目录 ↔ 本机副本目录 */}
+          <button
+            onClick={() => setSyncPanelOpen(true)}
+            style={settingsBtnStyle}
+            title="目录同步(拉取 / 推送远端工作目录)"
+          >
+            🔄
+          </button>
           <button
             onClick={() => setRepoPanelOpen(!repoPanelOpen)}
             style={{ ...settingsBtnStyle, ...(repoPanelOpen ? { background: 'var(--theme-accent-bg)', color: 'var(--theme-accent)' } : {}) }}
@@ -905,6 +915,14 @@ export const App: React.FC = () => {
 
       {/* ---- 连接目标设置 ---- */}
       {connPanelOpen && <ConnectionPanel onClose={() => setConnPanelOpen(false)} />}
+
+      {/* ---- 目录同步 ---- */}
+      {syncPanelOpen && (
+        <DirSyncPanel
+          workingDir={activeSession?.workingDir || ''}
+          onClose={() => setSyncPanelOpen(false)}
+        />
+      )}
 
       {/* ---- Backend Manager ---- */}
       <BackendManager

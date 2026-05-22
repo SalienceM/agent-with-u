@@ -679,6 +679,44 @@ export const api = {
     try { return JSON.parse(result); } catch { return { status: 'error', message: '保存配置失败' }; }
   },
 
+  // ── 目录同步：远端工作目录 ↔ 本机副本目录 ──────────────────
+  /** 服务器工作目录清单：relpath → {hash, size}，供客户端做三向增量比对。 */
+  async syncManifest(workingDir: string): Promise<{
+    status: string; message?: string; root?: string;
+    files?: Record<string, { hash: string; size: number }>;
+  }> {
+    const result = await call('syncManifest', workingDir);
+    try { return JSON.parse(result); } catch { return { status: 'error', message: 'syncManifest 无响应' }; }
+  },
+
+  async syncReadFile(workingDir: string, rel: string): Promise<{
+    status: string; message?: string; hash?: string; data?: string; tooLarge?: boolean;
+  }> {
+    const result = await call('syncReadFile', workingDir, rel);
+    try { return JSON.parse(result); } catch { return { status: 'error', message: 'syncReadFile 无响应' }; }
+  },
+
+  async syncWriteFile(workingDir: string, rel: string, dataBase64: string): Promise<{ status: string; message?: string }> {
+    const result = await call('syncWriteFile', workingDir, rel, dataBase64);
+    try { return JSON.parse(result); } catch { return { status: 'error', message: 'syncWriteFile 无响应' }; }
+  },
+
+  async syncDeleteFile(workingDir: string, rel: string): Promise<{ status: string; message?: string }> {
+    const result = await call('syncDeleteFile', workingDir, rel);
+    try { return JSON.parse(result); } catch { return { status: 'error', message: 'syncDeleteFile 无响应' }; }
+  },
+
+  /** 读取同步忽略清单（来自 app-config.syncIgnore）。 */
+  async getSyncConfig(): Promise<{ ignore: string[]; defaultIgnore: string[] }> {
+    const result = await call('getSyncConfig');
+    try { return JSON.parse(result); } catch { return { ignore: [], defaultIgnore: [] }; }
+  },
+
+  async setSyncConfig(ignore: string[]): Promise<{ status: string; message?: string }> {
+    const result = await call('setSyncConfig', JSON.stringify({ ignore }));
+    try { return JSON.parse(result); } catch { return { status: 'error', message: '保存忽略清单失败' }; }
+  },
+
   /** 响应后端发出的 permissionRequest，granted=true 继续，false 取消。 */
   async openLoginTerminal(backendId: string): Promise<{ status: string; message?: string }> {
     const result = await call('openLoginTerminal', backendId);
