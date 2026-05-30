@@ -110,6 +110,12 @@ export const ConnectionPanel: React.FC<ConnectionPanelProps> = ({ onClose }) => 
     });
   }, [tauri]);
 
+  // 纯客户端不在本机起 sidecar，本地直连必然连不上 127.0.0.1:44321 → 自动切到中继。
+  // 处理两种情况：用户在本会话切到「纯客户端」；以及上一次错存了 client+local 的组合。
+  useEffect(() => {
+    if (role === 'client' && mode === 'local') setMode('relay');
+  }, [role, mode]);
+
   // 拉取一次并订阅在线 UI 列表（执行节点视角下才有意义；纯客户端列表里就一个自己）
   useEffect(() => {
     let cancelled = false;
@@ -310,20 +316,26 @@ export const ConnectionPanel: React.FC<ConnectionPanelProps> = ({ onClose }) => 
           </div>
 
           <div style={{ display: 'flex', gap: 8, marginBottom: 10 }}>
-            {(['local', 'relay'] as const).map((m) => (
-              <button
-                key={m}
-                onClick={() => { setMode(m); setErr(''); }}
-                style={{
-                  ...modeBtnStyle,
-                  background: mode === m ? 'var(--theme-accent-bg)' : 'transparent',
-                  borderColor: mode === m ? 'var(--theme-accent)' : 'var(--theme-border)',
-                  color: mode === m ? 'var(--theme-accent)' : 'var(--theme-text-muted)',
-                }}
-              >
-                {m === 'local' ? '🏠 本地直连' : '🌐 远程(经中继)'}
-              </button>
-            ))}
+            {(['local', 'relay'] as const).map((m) => {
+              const blocked = m === 'local' && role === 'client';
+              return (
+                <button
+                  key={m}
+                  onClick={() => { if (blocked) return; setMode(m); setErr(''); }}
+                  disabled={blocked}
+                  title={blocked ? '纯客户端模式本机不跑 sidecar，本地直连必然连不上' : undefined}
+                  style={{
+                    ...modeBtnStyle,
+                    background: mode === m ? 'var(--theme-accent-bg)' : 'transparent',
+                    borderColor: mode === m ? 'var(--theme-accent)' : 'var(--theme-border)',
+                    color: mode === m ? 'var(--theme-accent)' : 'var(--theme-text-muted)',
+                    ...(blocked ? { opacity: 0.4, cursor: 'not-allowed' } : {}),
+                  }}
+                >
+                  {m === 'local' ? '🏠 本地直连' : '🌐 远程(经中继)'}
+                </button>
+              );
+            })}
           </div>
 
           {mode === 'local' && (
