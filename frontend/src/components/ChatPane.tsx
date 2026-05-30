@@ -32,6 +32,10 @@ export interface ChatPaneProps {
   onToast?: (type: 'success' | 'error' | 'info', message: string) => void;
   // 流式状态变化回调,App 用来聚合所有 pane 的 streaming 状态
   onStreamingChange?: (sessionId: string, streaming: boolean) => void;
+  // 全局工具(由 App 注入,放在输入框正上方,避免顶栏拥挤)
+  layoutLabel?: string;
+  onCycleLayout?: () => void;
+  onOpenSync?: () => void;
 }
 
 export const ChatPane: React.FC<ChatPaneProps> = ({
@@ -45,6 +49,9 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
   isMobile,
   onRequestNewSession,
   onStreamingChange,
+  layoutLabel,
+  onCycleLayout,
+  onOpenSync,
 }) => {
   // ── pane 自己的 session 详情(workingDir / backendId / skip / sandbox) ──
   const [activeSession, setActiveSession] = useState<any | null>(null);
@@ -465,6 +472,35 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
         )}
       </div>
 
+      {/* ---- 全局工具栏(输入框正上方,被 App 从顶栏挪下来,避免那一排太挤) ---- */}
+      {(onCycleLayout || onOpenSync) && (
+        <div style={{
+          display: 'flex',
+          gap: 6,
+          padding: '4px 10px 0',
+          justifyContent: 'flex-end',
+        }}>
+          {onCycleLayout && (
+            <button
+              onClick={onCycleLayout}
+              title="分屏布局 (1×1 / 1×2 / 2×2)"
+              style={paneToolBtnStyle}
+            >
+              ▦ {layoutLabel || ''}
+            </button>
+          )}
+          {onOpenSync && (
+            <button
+              onClick={onOpenSync}
+              title="目录同步(拉取 / 推送远端工作目录)"
+              style={paneToolBtnStyle}
+            >
+              🔄
+            </button>
+          )}
+        </div>
+      )}
+
       {/* ---- 输入栏 ---- */}
       <ChatInput
         onSend={chat.sendMessage}
@@ -495,4 +531,14 @@ const paneRootStyle: React.CSSProperties = {
   minHeight: 0,
   overflow: 'hidden',
   boxSizing: 'border-box',
+};
+
+const paneToolBtnStyle: React.CSSProperties = {
+  padding: '3px 9px',
+  borderRadius: 6,
+  fontSize: 12,
+  cursor: 'pointer',
+  background: 'var(--theme-bg, rgba(255,255,255,0.06))',
+  color: 'var(--theme-text-muted, #aaa)',
+  border: '1px solid var(--theme-border, rgba(255,255,255,0.12))',
 };

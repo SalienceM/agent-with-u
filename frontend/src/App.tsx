@@ -730,19 +730,6 @@ export const App: React.FC = () => {
           >
             📋{isMobile ? '' : ' Logs'}
           </button>
-          {/* 分屏布局切换:1×1 → 1×2 → 2×2 循环 */}
-          <button
-            onClick={() => {
-              setLayout((cur) => {
-                const idx = LAYOUT_CYCLE.indexOf(cur);
-                return LAYOUT_CYCLE[(idx + 1) % LAYOUT_CYCLE.length];
-              });
-            }}
-            style={layoutBtnStyle}
-            title="分屏布局 (1×1 / 1×2 / 2×2)"
-          >
-            ▦ {LAYOUT_LABEL[layout]}
-          </button>
           {/* 连接目标：本地直连 / 经中继访问远程执行节点 */}
           <button
             onClick={() => setConnPanelOpen(true)}
@@ -750,14 +737,6 @@ export const App: React.FC = () => {
             title="连接目标(本地 / 远程中继)"
           >
             📡
-          </button>
-          {/* 目录同步：远端工作目录 ↔ 本机副本目录 */}
-          <button
-            onClick={() => setSyncPanelOpen(true)}
-            style={settingsBtnStyle}
-            title="目录同步(拉取 / 推送远端工作目录)"
-          >
-            🔄
           </button>
           <button
             onClick={() => setRepoPanelOpen(!repoPanelOpen)}
@@ -841,6 +820,9 @@ export const App: React.FC = () => {
                     setPaneSessions((prev) => prev.map((s) => (s === sid ? null : s)));
                   }}
                   onStreamingChange={handleStreamingChange}
+                  layoutLabel={LAYOUT_LABEL[layout]}
+                  onCycleLayout={() => setLayout((cur) => LAYOUT_CYCLE[(LAYOUT_CYCLE.indexOf(cur) + 1) % LAYOUT_CYCLE.length])}
+                  onOpenSync={() => setSyncPanelOpen(true)}
                 />
               ))}
             </div>
@@ -1060,21 +1042,6 @@ const settingsBtnStyle: React.CSSProperties = {
   padding: '2px 6px',
   borderRadius: 4,
   transition: 'color 0.15s',
-};
-
-// 分屏布局切换按钮样式
-const layoutBtnStyle: React.CSSProperties = {
-  background: 'var(--theme-bg-tertiary, #eaeef2)',
-  border: '1px solid var(--theme-border, rgba(0,0,0,0.15))',
-  color: 'var(--theme-text, #1f2328)',
-  fontSize: 12,
-  cursor: 'pointer',
-  padding: '4px 10px',
-  borderRadius: 6,
-  transition: 'all 0.15s',
-  marginRight: 8,
-  fontWeight: 500,
-  whiteSpace: 'nowrap',
 };
 
 const logBtnStyle: React.CSSProperties = {
