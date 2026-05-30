@@ -6,6 +6,39 @@ import { PermissionGate } from './PermissionGate';
 import { useChat } from '../hooks/useChat';
 import type { AppConfig } from '../hooks/useConfig';
 
+// 注入「等待气泡」用的脉冲点动画(一次性)。请求发出后到首个 delta 之间,
+// 旧版只靠底部「生成中」chip,聊天区空白让人怀疑后端是不是没收到;这里
+// 在消息列表里挂一个占位气泡兜底反馈。
+if (typeof document !== 'undefined' && !document.getElementById('awu-pending-bubble-css')) {
+  const s = document.createElement('style');
+  s.id = 'awu-pending-bubble-css';
+  s.textContent = `
+    @keyframes awu-pending-dot { 0%,80%,100% { opacity: 0.25; } 40% { opacity: 1; } }
+    .awu-pending-dot { display: inline-block; width: 6px; height: 6px; margin: 0 2px;
+                       border-radius: 50%; background: currentColor;
+                       animation: awu-pending-dot 1.4s infinite ease-in-out both; }
+    .awu-pending-dot:nth-child(2) { animation-delay: 0.18s; }
+    .awu-pending-dot:nth-child(3) { animation-delay: 0.36s; }
+  `;
+  document.head.appendChild(s);
+}
+
+const PendingAssistantBubble: React.FC = () => (
+  <div style={{ display: 'flex', justifyContent: 'flex-start', padding: '4px 16px' }}>
+    <div style={{
+      maxWidth: '70%', padding: '10px 14px', borderRadius: 12,
+      background: 'var(--theme-bg-secondary, rgba(255,255,255,0.04))',
+      color: 'var(--theme-text-muted, #8b8b9b)',
+      fontSize: 13, display: 'flex', alignItems: 'center', gap: 4,
+    }}>
+      <span style={{ marginRight: 4 }}>已收到，等待响应</span>
+      <span className="awu-pending-dot"></span>
+      <span className="awu-pending-dot"></span>
+      <span className="awu-pending-dot"></span>
+    </div>
+  </div>
+);
+
 // ChatPane: 自给自足的单 session 工作区。
 // 每个 pane 内部:
 //   1. 调用 useChat —— 独立的流式状态、消息列表、权限气泡
@@ -373,6 +406,12 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
               animateIn={isSameSession && hiddenCount + idx >= prevCount}
             />
           ))}
+
+          {/* 已发出但首个 delta 还没到 —— 在消息流里给个占位气泡,
+              否则只看底部「生成中」chip,容易以为后端没收到。 */}
+          {chat.isStreaming && !chat.messages.some((m: any) => m.role === 'assistant' && m.streaming) && (
+            <PendingAssistantBubble />
+          )}
 
           {/* ★ 行内权限确认组件 */}
           {chat.pendingPermission && (
