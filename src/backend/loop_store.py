@@ -185,6 +185,44 @@ class IdeaEntry:
 
 
 @dataclass
+class AsideTurn:
+    """一条 "by the way" 旁路问答（独立 agent session，不污染 loop 主线）。"""
+    id: str
+    question: str
+    answer: str = ""
+    status: str = "answering"   # answering | done | error
+    stage: str = ""             # 提问时的 loop 阶段快照
+    seq: int = 0                # 提问时正在跑的 loop（0 表示无）
+    created_at: float = field(default_factory=_now)
+    updated_at: float = field(default_factory=_now)
+
+    def to_dict(self) -> dict:
+        return {
+            "id": self.id,
+            "question": self.question,
+            "answer": self.answer,
+            "status": self.status,
+            "stage": self.stage,
+            "seq": self.seq,
+            "createdAt": self.created_at,
+            "updatedAt": self.updated_at,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "AsideTurn":
+        return cls(
+            id=d.get("id", ""),
+            question=d.get("question", ""),
+            answer=d.get("answer", ""),
+            status=d.get("status", "done"),
+            stage=d.get("stage", ""),
+            seq=int(d.get("seq", 0)),
+            created_at=d.get("createdAt", _now()),
+            updated_at=d.get("updatedAt", _now()),
+        )
+
+
+@dataclass
 class LoopState:
     """单个 loop session 的完整 stage 文件。"""
     session_id: str
@@ -196,6 +234,7 @@ class LoopState:
     max_loops: int = 8                  # 基础最大 loop 约束
     status: str = "active"              # active | delivered | output | aborted
     stop_reason: str = ""               # 触发 loopout / 终止的原因
+    asides: list[AsideTurn] = field(default_factory=list)  # by the way 旁路问答
     created_at: float = field(default_factory=_now)
     updated_at: float = field(default_factory=_now)
 
@@ -224,6 +263,7 @@ class LoopState:
             "effectiveMaxLoops": self.effective_max_loops(),
             "status": self.status,
             "stopReason": self.stop_reason,
+            "asides": [a.to_dict() for a in self.asides],
             "bestScore": self.best_score(),
             "latestScore": self.latest_score(),
             "createdAt": self.created_at,
@@ -242,6 +282,7 @@ class LoopState:
             max_loops=int(d.get("maxLoops", 8)),
             status=d.get("status", "active"),
             stop_reason=d.get("stopReason", ""),
+            asides=[AsideTurn.from_dict(a) for a in d.get("asides", [])],
             created_at=d.get("createdAt", _now()),
             updated_at=d.get("updatedAt", _now()),
         )

@@ -39,7 +39,7 @@ from .app_config_store import AppConfigStore
 from .skill_store import SkillStore
 from .prompt_store import PromptStore
 from .loop_store import (
-    LoopStore, LoopState, LoopRecord, LoopStep, LoopAnalysis, IdeaEntry,
+    LoopStore, LoopState, LoopRecord, LoopStep, LoopAnalysis, IdeaEntry, AsideTurn,
     STAGE_IDEA, STAGE_EXECUTE, STAGE_OUT,
     SUB_PREPARE, SUB_EXECUTE, SUB_ANALYSIS, SUB_DONE,
     DELIVERABLE_SCORE, OUTPUTTABLE_SCORE,
@@ -252,6 +252,10 @@ class BridgeWS:
         self._loop_store = LoopStore()
         self._idea_semaphore = asyncio.Semaphore(3)  # loopidea 阶段最多 3 并发
         self._loop_running: set[str] = set()         # 正在跑 iteration 的 session
+        self._aside_running: set[str] = set()        # 正在回答 by-the-way 的 session
+        # ★ 进程内 LoopState 单例缓存：iteration（反复整文件覆写）与旁路问答
+        #   （追加 asides）共享同一对象，避免一方的保存覆盖另一方的写入。
+        self._loop_states: dict[str, LoopState] = {}
         # ★ 素材中转池：客户端图片/附件在交给 Agent 前先落到这里
         self._asset_pool = AssetPool()
         self._asset_pool.purge_expired()
@@ -1499,7 +1503,7 @@ class BridgeWS:
         )
         # ★ loop 会话：建会话时即落一个 stage 文件（起始阶段 loopidea）
         if is_loop:
-            self._loop_store.create(session.id)
+            self._loop_create(session.id)
         # ★ 默认档自动绑定：新建 session 时把被标记为 isDefault 的 Prompt/Skill 全部挂上去
         try:
             defaults = self._default_abilities()
@@ -1605,6 +1609,8 @@ class BridgeWS:
         self._active_sessions.pop(sid, None)
         self._instance_manager.delete(sid)
         self._loop_running.discard(sid)
+        self._aside_running.discard(sid)
+        self._loop_states.pop(sid, None)
         self._loop_store.delete(sid)
         ok = self._session_store.delete(sid)
         if ok:
@@ -1646,6 +1652,31 @@ class BridgeWS:
         }, ensure_ascii=False)
 
     # ── RPC: 可视化 Loop 集成 ────────────────────────────────────
+
+    def _loop_state(self, sid: str) -> Optional["LoopState"]:
+        """读 LoopState：优先进程内单例缓存，未命中再读盘并缓存。"""
+        st = self._loop_states.get(sid)
+        if st is None:
+            store = self._loop_store
+            st = store.load(sid)
+            if st is not None:
+                self._loop_states[sid] = st
+        return st
+
+    def _loop_save(self, st: "LoopState") -> None:
+        """写盘并刷新缓存，保证后续读到同一对象。"""
+        self._loop_states[st.session_id] = st
+        store = self._loop_store
+        store.save(st)
+
+    def _loop_get_or_create(self, sid: str) -> "LoopState":
+        return self._loop_state(sid) or self._loop_create(sid)
+
+    def _loop_create(self, sid: str) -> "LoopState":
+        store = self._loop_store
+        st = store.create(sid)
+        self._loop_states[sid] = st
+        return st
 
     def _emit_loop_updated(self, state: "LoopState") -> None:
         """整份 stage 状态变更后广播给所有客户端。"""
@@ -1743,12 +1774,12 @@ class BridgeWS:
         return "".join(parts)
 
     def _rpc_loopGetState(self, session_id: str) -> str:
-        state = self._loop_store.load(session_id)
+        state = self._loop_state(session_id)
         if not state:
             # 兼容：老 loop 会话或刚切换类型时按需补建
             session = self._active_sessions.get(session_id) or self._session_store.load(session_id)
             if session and session.session_type == "loop":
-                state = self._loop_store.create(session_id)
+                state = self._loop_create(session_id)
             else:
                 return "null"
         return json.dumps(state.to_dict(), ensure_ascii=False)
@@ -1757,12 +1788,12 @@ class BridgeWS:
 
     def _rpc_loopSubmitIdea(self, session_id: str, prompt: str) -> str:
         """投递一条想法（非阻塞）。立即返回 idea，后台并发跑（最多 3）。"""
-        state = self._loop_store.get_or_create(session_id)
+        state = self._loop_get_or_create(session_id)
         if state.stage != STAGE_IDEA:
             return json.dumps({"status": "error", "message": "已离开 loopidea 阶段"}, ensure_ascii=False)
         idea = IdeaEntry(id=new_id(), prompt=prompt.strip(), status="pending")
         state.ideas.append(idea)
-        self._loop_store.save(state)
+        self._loop_save(state)
         self._emit_loop_updated(state)
         asyncio.ensure_future(self._run_idea_task(session_id, idea.id))
         return json.dumps({"status": "ok", "ideaId": idea.id}, ensure_ascii=False)
@@ -1772,7 +1803,7 @@ class BridgeWS:
         if not session:
             return
         async with self._idea_semaphore:
-            state = self._loop_store.load(session_id)
+            state = self._loop_state(session_id)
             if not state:
                 return
             idea = next((i for i in state.ideas if i.id == idea_id), None)
@@ -1780,7 +1811,7 @@ class BridgeWS:
                 return
             idea.status = "running"
             idea.updated_at = time.time()
-            self._loop_store.save(state)
+            self._loop_save(state)
             self._emit_loop_updated(state)
 
             prompt = (
@@ -1795,7 +1826,7 @@ class BridgeWS:
                 resume=False, indep_session_id=f"{session_id}:idea:{idea_id}",
             )
             # 重新载入，避免并发覆盖
-            state = self._loop_store.load(session_id) or state
+            state = self._loop_state(session_id) or state
             idea = next((i for i in state.ideas if i.id == idea_id), None)
             if not idea:
                 return
@@ -1806,28 +1837,28 @@ class BridgeWS:
                 idea.status = "error"
                 idea.error = "模型无输出"
             idea.updated_at = time.time()
-            self._loop_store.save(state)
+            self._loop_save(state)
             self._emit_loop_updated(state)
 
     def _rpc_loopRemoveIdea(self, session_id: str, idea_id: str) -> str:
-        state = self._loop_store.load(session_id)
+        state = self._loop_state(session_id)
         if not state:
             return json.dumps({"status": "error", "message": "no loop state"}, ensure_ascii=False)
         state.ideas = [i for i in state.ideas if i.id != idea_id]
-        self._loop_store.save(state)
+        self._loop_save(state)
         self._emit_loop_updated(state)
         return json.dumps({"status": "ok"}, ensure_ascii=False)
 
     def _rpc_loopSealIdea(self, session_id: str, goal: str = "") -> str:
         """封口 loopidea，形成全局目标，单向切到 loopexecute。"""
-        state = self._loop_store.load(session_id)
+        state = self._loop_state(session_id)
         if not state:
             return json.dumps({"status": "error", "message": "no loop state"}, ensure_ascii=False)
         if state.stage != STAGE_IDEA:
             return json.dumps({"status": "error", "message": "阶段已推进，无法重复封口"}, ensure_ascii=False)
         state.goal = (goal or "").strip()
         state.stage = STAGE_EXECUTE
-        self._loop_store.save(state)
+        self._loop_save(state)
         self._emit_loop_updated(state)
         # 没有显式目标时，异步让模型把想法池汇总成一个全局目标
         if not state.goal:
@@ -1836,7 +1867,7 @@ class BridgeWS:
 
     async def _synthesize_goal(self, session_id: str) -> None:
         session = self._active_sessions.get(session_id) or self._session_store.load(session_id)
-        state = self._loop_store.load(session_id)
+        state = self._loop_state(session_id)
         if not session or not state:
             return
         ideas_text = "\n".join(
@@ -1850,18 +1881,18 @@ class BridgeWS:
         )
         text = await self._loop_run_agent(session, prompt, sub_stage="goal", seq=-1, resume=False,
                                            indep_session_id=f"{session_id}:goal")
-        state = self._loop_store.load(session_id) or state
+        state = self._loop_state(session_id) or state
         if text.strip() and not state.goal:
             state.goal = text.strip()
-            self._loop_store.save(state)
+            self._loop_save(state)
             self._emit_loop_updated(state)
 
     def _rpc_loopSetGoal(self, session_id: str, goal: str) -> str:
-        state = self._loop_store.load(session_id)
+        state = self._loop_state(session_id)
         if not state:
             return json.dumps({"status": "error", "message": "no loop state"}, ensure_ascii=False)
         state.goal = (goal or "").strip()
-        self._loop_store.save(state)
+        self._loop_save(state)
         self._emit_loop_updated(state)
         return json.dumps({"status": "ok"}, ensure_ascii=False)
 
@@ -1869,7 +1900,7 @@ class BridgeWS:
 
     def _rpc_loopRunIteration(self, session_id: str) -> str:
         """跑下一次 loop（非阻塞，三个子阶段顺序执行）。"""
-        state = self._loop_store.load(session_id)
+        state = self._loop_state(session_id)
         if not state:
             return json.dumps({"status": "error", "message": "no loop state"}, ensure_ascii=False)
         if state.stage != STAGE_EXECUTE:
@@ -1881,14 +1912,14 @@ class BridgeWS:
 
     async def _run_loop_iteration(self, session_id: str) -> None:
         session = self._active_sessions.get(session_id) or self._session_store.load(session_id)
-        state = self._loop_store.load(session_id)
+        state = self._loop_state(session_id)
         if not session or not state:
             return
         self._loop_running.add(session_id)
         seq = len(state.loops) + 1
         record = LoopRecord(seq=seq, sub_stage=SUB_PREPARE)
         state.loops.append(record)
-        self._loop_store.save(state)
+        self._loop_save(state)
         self._emit_loop_updated(state)
 
         history = self._loop_history_brief(state, exclude_seq=seq)
@@ -1916,7 +1947,7 @@ class BridgeWS:
             ]
             record.sub_stage = SUB_EXECUTE
             record.updated_at = time.time()
-            self._loop_store.save(state)
+            self._loop_save(state)
             self._emit_loop_updated(state)
 
             # ── stage 2: execute ──
@@ -1934,7 +1965,7 @@ class BridgeWS:
             record.result = etext.strip()
             record.sub_stage = SUB_ANALYSIS
             record.updated_at = time.time()
-            self._loop_store.save(state)
+            self._loop_save(state)
             self._emit_loop_updated(state)
 
             # ── stage 3: analysis ──
@@ -1977,7 +2008,7 @@ class BridgeWS:
                 state.stop_reason = reason
                 state.status = "output" if analysis.outputtable else (
                     "delivered" if analysis.deliverable else "aborted")
-            self._loop_store.save(state)
+            self._loop_save(state)
             self._emit_loop_updated(state)
         except Exception as e:
             import traceback
@@ -1985,7 +2016,7 @@ class BridgeWS:
                   file=sys.stderr, flush=True)
             record.error = str(e)
             record.sub_stage = SUB_DONE
-            self._loop_store.save(state)
+            self._loop_save(state)
             self._emit_loop_updated(state)
         finally:
             self._loop_running.discard(session_id)
@@ -2041,7 +2072,7 @@ class BridgeWS:
 
     def _rpc_loopAdvanceToOut(self, session_id: str) -> str:
         """手动单向推进到 loopout。"""
-        state = self._loop_store.load(session_id)
+        state = self._loop_state(session_id)
         if not state:
             return json.dumps({"status": "error", "message": "no loop state"}, ensure_ascii=False)
         if state.stage == STAGE_IDEA:
@@ -2053,9 +2084,141 @@ class BridgeWS:
                 "delivered" if best >= DELIVERABLE_SCORE else "aborted")
         if not state.stop_reason:
             state.stop_reason = "手动进入 loopout"
-        self._loop_store.save(state)
+        self._loop_save(state)
         self._emit_loop_updated(state)
         return json.dumps({"status": "ok", "stage": state.stage}, ensure_ascii=False)
+
+    # ── by the way：旁路问答（不污染 loop 主线上下文）──────────────
+
+    def _emit_aside_delta(self, session_id: str, turn_id: str, text: str) -> None:
+        asyncio.ensure_future(self._broadcast({
+            "event": "loopAsideDelta",
+            "data": json.dumps({
+                "sessionId": session_id, "turnId": turn_id, "text": text,
+            }, ensure_ascii=False),
+        }))
+
+    def _loop_context_digest(self, state: "LoopState") -> str:
+        """把当前 loop 持久化状态压成一段只读摘要，喂给旁路问答用。"""
+        lines = [
+            f"阶段(stage): {state.stage}",
+            f"全局目标(goal): {state.goal or '(未定)'}",
+            f"风险系数: {state.risk_coefficient:.2f}　已跑 loop: {len(state.loops)}/{state.effective_max_loops()}",
+            f"最佳分数: {state.best_score():.0f}　最近分数: {state.latest_score():.0f}　状态: {state.status}",
+        ]
+        if state.stage == STAGE_IDEA and state.ideas:
+            lines.append("想法池:")
+            for i in state.ideas:
+                lines.append(f"  - [{i.status}] {i.prompt}")
+        for l in state.loops:
+            sc = f"{l.analysis.score:.0f}" if l.analysis else "?"
+            head = f"Loop #{l.seq} [{l.sub_stage}] 分数={sc} 目标={l.goal[:60]}"
+            lines.append(head)
+            if l.orchestration:
+                lines.append("  编排: " + "；".join(
+                    f"{s.index}.({s.mode}){s.desc[:40]}" for s in l.orchestration))
+            if l.result:
+                lines.append(f"  结果: {l.result[:300]}")
+            if l.analysis:
+                if l.analysis.notes:
+                    lines.append(f"  分析: {l.analysis.notes[:300]}")
+                if l.analysis.challenges:
+                    lines.append(f"  约束: {l.analysis.challenges[:200]}")
+            if l.error:
+                lines.append(f"  错误: {l.error[:200]}")
+        return "\n".join(lines)
+
+    def _rpc_loopAsk(self, session_id: str, question: str) -> str:
+        """By the way 旁路提问：基于当前 loop 状态对话，独立 agent session，
+        不 resume loop 主线 agent_session_id，不污染 prepare/execute/analysis 上下文。
+        loop 正在 run 时也可随时使用。"""
+        q = (question or "").strip()
+        if not q:
+            return json.dumps({"status": "error", "message": "问题为空"}, ensure_ascii=False)
+        state = self._loop_state(session_id)
+        if not state:
+            return json.dumps({"status": "error", "message": "no loop state"}, ensure_ascii=False)
+        if session_id in self._aside_running:
+            return json.dumps({"status": "error", "message": "上一条 by-the-way 仍在回答"}, ensure_ascii=False)
+        running_seq = next((l.seq for l in state.loops if not l.completed and not l.error), 0)
+        turn = AsideTurn(id=new_id(), question=q, status="answering",
+                         stage=state.stage, seq=running_seq)
+        state.asides.append(turn)
+        self._loop_save(state)
+        self._emit_loop_updated(state)
+        asyncio.ensure_future(self._run_aside(session_id, turn.id))
+        return json.dumps({"status": "ok", "turnId": turn.id}, ensure_ascii=False)
+
+    async def _run_aside(self, session_id: str, turn_id: str) -> None:
+        session = self._active_sessions.get(session_id) or self._session_store.load(session_id)
+        state = self._loop_state(session_id)
+        if not session or not state:
+            return
+        turn = next((t for t in state.asides if t.id == turn_id), None)
+        if not turn:
+            return
+        self._aside_running.add(session_id)
+        try:
+            digest = self._loop_context_digest(state)
+            # 仅带最近几轮旁路历史，保证多轮连贯但不喧宾夺主
+            history = "\n".join(
+                f"问：{t.question}\n答：{t.answer}"
+                for t in state.asides[:-1][-4:] if t.status == "done" and t.answer
+            )
+            prompt = (
+                "你是这个 Loop 任务的旁路助手（by the way）。下面是该任务**当前**的只读状态快照，"
+                "请仅基于它和常识来回答用户的随手提问——不要去执行 loop、不要改动任务、"
+                "不要使用工具修改文件，只做解读、答疑和建议。\n\n"
+                f"===== Loop 状态快照 =====\n{digest}\n========================\n\n"
+                + (f"【最近的旁路问答】\n{history}\n\n" if history else "")
+                + f"【用户的问题】\n{turn.question}"
+            )
+            parts: list[str] = []
+
+            def on_delta(delta: StreamDelta):
+                if delta.type == "text_delta" and delta.text:
+                    parts.append(delta.text)
+                    self._emit_aside_delta(session_id, turn_id, delta.text)
+                elif delta.type == "error" and delta.error:
+                    self._emit_aside_delta(session_id, turn_id, f"\n❌ {delta.error}\n")
+
+            backend = self._get_backend(session.backend_id)
+            aside_sid = f"{session_id}:aside"
+            try:
+                await backend.send_message(
+                    messages=[], content=prompt, images=None,
+                    session_id=aside_sid, message_id=new_id(), on_delta=on_delta,
+                    agent_session_id=None,          # ★ 独立上下文，绝不 resume loop 主线
+                    working_dir=session.working_dir,
+                    skip_permissions=True,
+                    sandbox_enabled=session.sandbox_enabled,
+                )
+            finally:
+                backend.clear_cancelled(aside_sid)
+
+            # 共享缓存对象，重新取一遍 turn 即可
+            state = self._loop_state(session_id) or state
+            turn = next((t for t in state.asides if t.id == turn_id), None)
+            if not turn:
+                return
+            answer = "".join(parts).strip()
+            turn.answer = answer or "(无输出)"
+            turn.status = "done" if answer else "error"
+            turn.updated_at = time.time()
+            self._loop_save(state)
+            self._emit_loop_updated(state)
+        except Exception as e:
+            import traceback
+            print(f"[loop] aside failed: {e}\n{traceback.format_exc()}",
+                  file=sys.stderr, flush=True)
+            t = next((t for t in (state.asides if state else []) if t.id == turn_id), None)
+            if t:
+                t.status = "error"
+                t.answer = (t.answer or "") + f"\n❌ {e}"
+                self._loop_save(state)
+                self._emit_loop_updated(state)
+        finally:
+            self._aside_running.discard(session_id)
 
     # ── RPC: 后端配置 ────────────────────────────────────────────
 

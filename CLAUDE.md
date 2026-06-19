@@ -250,9 +250,22 @@ full-screen overlay (🔁 button in the header for loop sessions; auto-opens on
 select) with a visualized stage rail / loop timeline / detail panels, plus a
 toggleable terminal-style "Hack" view.
 
+**By the way (旁路问答).** The LoopPanel header has a session-level "💬 By the
+way" toggle opening a side drawer. Questions go through `loopAsk` →
+`_run_aside`, which feeds the model a read-only digest of the current loop state
+(`_loop_context_digest`) on an **independent** agent session (never resumes the
+loop's `agent_session_id`), so it never pollutes / interrupts the loop's main
+context — usable even while a loop is running. Answers stream via
+`loopAsideDelta` (per `turnId`) and persist as `asides` on the stage file.
+
+Loop state is read/written through a process-level singleton cache
+(`_loop_state` / `_loop_save` / `_loop_create`) so a running iteration's
+whole-file overwrites and concurrent aside appends share one object and don't
+clobber each other.
+
 Loop RPCs: `loopGetState`, `loopSubmitIdea`, `loopRemoveIdea`, `loopSealIdea`,
-`loopSetGoal`, `loopRunIteration`, `loopAdvanceToOut`. `createSession` takes an
-optional third `session_type` argument.
+`loopSetGoal`, `loopRunIteration`, `loopAdvanceToOut`, `loopAsk`. `createSession`
+takes an optional third `session_type` argument.
 
 ### Slash Commands
 

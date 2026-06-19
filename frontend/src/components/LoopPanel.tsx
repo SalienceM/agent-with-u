@@ -24,11 +24,13 @@ interface LoopRecord {
   completed: boolean; result: string; analysis: LoopAnalysis | null; error: string;
 }
 interface IdeaEntry { id: string; prompt: string; status: string; result: string; error: string; }
+interface AsideTurn { id: string; question: string; answer: string; status: string; stage: string; seq: number; }
 interface LoopStateT {
   sessionId: string; stage: string; goal: string;
   ideas: IdeaEntry[]; loops: LoopRecord[];
   riskCoefficient: number; maxLoops: number; effectiveMaxLoops: number;
   status: string; stopReason: string; bestScore: number; latestScore: number;
+  asides: AsideTurn[];
 }
 
 const SUB_LABEL: Record<string, string> = {
@@ -48,6 +50,11 @@ export const LoopPanel: React.FC<LoopPanelProps> = ({ sessionId, onClose }) => {
   const [ideaInput, setIdeaInput] = useState('');
   const [goalDraft, setGoalDraft] = useState('');
   const [busy, setBusy] = useState(false);
+
+  // By the way 旁路问答抽屉
+  const [asideOpen, setAsideOpen] = useState(false);
+  const [asideInput, setAsideInput] = useState('');
+  const [asideLive, setAsideLive] = useState<Record<string, string>>({});
 
   // 子阶段实时流式文本：key = `${seq}:${subStage}`
   const [progress, setProgress] = useState<Record<string, string>>({});
@@ -71,8 +78,21 @@ export const LoopPanel: React.FC<LoopPanelProps> = ({ sessionId, onClose }) => {
       const key = `${d.seq}:${d.subStage}`;
       setProgress((prev) => ({ ...prev, [key]: (prev[key] || '') + d.text }));
     });
-    return () => { un1(); un2(); };
+    const un3 = api.onLoopAsideDelta((d) => {
+      if (d.sessionId !== sessionId) return;
+      setAsideLive((prev) => ({ ...prev, [d.turnId]: (prev[d.turnId] || '') + d.text }));
+    });
+    return () => { un1(); un2(); un3(); };
   }, [sessionId]);
+
+  const asideAnswering = state?.asides?.some((a) => a.status === 'answering') ?? false;
+  const submitAside = useCallback(async () => {
+    const text = asideInput.trim();
+    if (!text || asideAnswering) return;
+    setAsideInput('');
+    const r = await api.loopAsk(sessionId, text);
+    if (r.status !== 'ok' && r.message) alert(r.message);
+  }, [asideInput, asideAnswering, sessionId]);
 
   const running = state?.loops?.some((l) => !l.completed && !l.error) ?? false;
 
@@ -113,7 +133,8 @@ export const LoopPanel: React.FC<LoopPanelProps> = ({ sessionId, onClose }) => {
     return (
       <div style={overlay}>
         <div style={shell}>
-          <Header stage="…" hackMode={hackMode} setHackMode={setHackMode} onClose={onClose} />
+          <Header stage="…" hackMode={hackMode} setHackMode={setHackMode}
+            asideOpen={false} setAsideOpen={() => {}} asideCount={0} onClose={onClose} />
           <div style={{ padding: 40, textAlign: 'center', color: 'var(--theme-text-muted)' }}>
             正在加载 Loop 状态…
           </div>
@@ -125,44 +146,62 @@ export const LoopPanel: React.FC<LoopPanelProps> = ({ sessionId, onClose }) => {
   return (
     <div style={overlay}>
       <div style={shell}>
-        <Header stage={state.stage} hackMode={hackMode} setHackMode={setHackMode} onClose={onClose} />
+        <Header stage={state.stage} hackMode={hackMode} setHackMode={setHackMode}
+          asideOpen={asideOpen} setAsideOpen={setAsideOpen} asideCount={state.asides?.length || 0}
+          onClose={onClose} />
         <StageRail stage={state.stage} />
 
-        {hackMode ? (
-          <HackView state={state} progress={progress} />
-        ) : (
-          <div style={{ flex: 1, overflow: 'auto', padding: '12px 18px 24px' }}>
-            {/* 全局指标条 */}
-            {state.stage !== 'loopidea' && <MetricBar state={state} />}
+        <div style={{ flex: 1, display: 'flex', minHeight: 0 }}>
+          <div style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
+            {hackMode ? (
+              <HackView state={state} progress={progress} />
+            ) : (
+              <div style={{ flex: 1, overflow: 'auto', padding: '12px 18px 24px' }}>
+                {/* 全局指标条 */}
+                {state.stage !== 'loopidea' && <MetricBar state={state} />}
 
-            {state.stage === 'loopidea' && (
-              <IdeaStage
-                state={state} ideaInput={ideaInput} setIdeaInput={setIdeaInput}
-                goalDraft={goalDraft} setGoalDraft={setGoalDraft}
-                onSubmit={submitIdea} onSeal={sealIdea} busy={busy}
-                onRemove={(id) => api.loopRemoveIdea(sessionId, id)}
-              />
-            )}
+                {state.stage === 'loopidea' && (
+                  <IdeaStage
+                    state={state} ideaInput={ideaInput} setIdeaInput={setIdeaInput}
+                    goalDraft={goalDraft} setGoalDraft={setGoalDraft}
+                    onSubmit={submitIdea} onSeal={sealIdea} busy={busy}
+                    onRemove={(id) => api.loopRemoveIdea(sessionId, id)}
+                  />
+                )}
 
-            {(state.stage === 'loopexecute' || state.stage === 'loopout') && (
-              <ExecuteStage
-                state={state} progress={progress}
-                selectedSeq={selectedSeq} setSelectedSeq={setSelectedSeq}
-                onRun={runIteration} onAdvanceOut={advanceOut}
-                running={running} busy={busy}
-                goalDraft={goalDraft} setGoalDraft={setGoalDraft} onSaveGoal={saveGoal}
-              />
+                {(state.stage === 'loopexecute' || state.stage === 'loopout') && (
+                  <ExecuteStage
+                    state={state} progress={progress}
+                    selectedSeq={selectedSeq} setSelectedSeq={setSelectedSeq}
+                    onRun={runIteration} onAdvanceOut={advanceOut}
+                    running={running} busy={busy}
+                    goalDraft={goalDraft} setGoalDraft={setGoalDraft} onSaveGoal={saveGoal}
+                  />
+                )}
+              </div>
             )}
           </div>
-        )}
+
+          {asideOpen && (
+            <AsideDrawer
+              asides={state.asides || []} live={asideLive}
+              input={asideInput} setInput={setAsideInput}
+              onSend={submitAside} answering={asideAnswering}
+              onClose={() => setAsideOpen(false)}
+            />
+          )}
+        </div>
       </div>
     </div>
   );
 };
 
 // ══ Header ════════════════════════════════════════════════════
-const Header: React.FC<{ stage: string; hackMode: boolean; setHackMode: (v: boolean) => void; onClose: () => void; }> =
-  ({ stage, hackMode, setHackMode, onClose }) => (
+const Header: React.FC<{
+  stage: string; hackMode: boolean; setHackMode: (v: boolean) => void;
+  asideOpen: boolean; setAsideOpen: (v: boolean) => void; asideCount: number;
+  onClose: () => void;
+}> = ({ stage, hackMode, setHackMode, asideOpen, setAsideOpen, asideCount, onClose }) => (
     <div style={{
       display: 'flex', alignItems: 'center', gap: 12, padding: '12px 18px',
       borderBottom: '1px solid var(--theme-border)',
@@ -171,6 +210,14 @@ const Header: React.FC<{ stage: string; hackMode: boolean; setHackMode: (v: bool
       <span style={{ fontSize: 15, fontWeight: 700, color: 'var(--theme-text)' }}>可视化 Loop</span>
       <span style={{ fontSize: 12, color: 'var(--theme-accent)', fontFamily: 'monospace' }}>{stage}</span>
       <div style={{ flex: 1 }} />
+      {/* ★ session 级 By the way 激活按钮：旁路问答，不污染 loop 主线 */}
+      <button
+        onClick={() => setAsideOpen(!asideOpen)}
+        style={{ ...btn, ...(asideOpen ? btnActive : {}) }}
+        title="By the way — 基于当前 loop 状态旁路问答，不影响 loop 上下文"
+      >
+        💬 By the way{asideCount > 0 ? ` (${asideCount})` : ''}
+      </button>
       <button
         onClick={() => setHackMode(!hackMode)}
         style={{ ...btn, ...(hackMode ? btnActive : {}) }}
@@ -181,6 +228,71 @@ const Header: React.FC<{ stage: string; hackMode: boolean; setHackMode: (v: bool
       <button onClick={onClose} style={btn}>✕ 关闭</button>
     </div>
   );
+
+// ══ By the way 旁路问答抽屉 ════════════════════════════════════
+const AsideDrawer: React.FC<{
+  asides: AsideTurn[]; live: Record<string, string>;
+  input: string; setInput: (v: string) => void;
+  onSend: () => void; answering: boolean; onClose: () => void;
+}> = ({ asides, live, input, setInput, onSend, answering, onClose }) => {
+  const endRef = useRef<HTMLDivElement>(null);
+  useEffect(() => { endRef.current?.scrollIntoView({ behavior: 'smooth' }); }, [asides, live]);
+  return (
+    <div style={{
+      width: 340, flexShrink: 0, display: 'flex', flexDirection: 'column',
+      borderLeft: '1px solid var(--theme-border)', background: 'var(--theme-bg-secondary)',
+    }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '10px 14px', borderBottom: '1px solid var(--theme-border)' }}>
+        <span style={{ fontSize: 13, fontWeight: 700, color: 'var(--theme-text)' }}>💬 By the way</span>
+        <div style={{ flex: 1 }} />
+        <button onClick={onClose} style={miniX}>✕</button>
+      </div>
+      <div style={{ padding: '8px 14px', fontSize: 11, color: 'var(--theme-text-muted)', borderBottom: '1px solid var(--theme-border)', lineHeight: 1.5 }}>
+        随手问。模型只读当前 loop 状态快照作答，用独立上下文，<b>不影响 / 不打断</b> loop 主线。
+      </div>
+
+      <div style={{ flex: 1, overflow: 'auto', padding: 12, display: 'flex', flexDirection: 'column', gap: 12 }}>
+        {asides.length === 0 && (
+          <div style={{ color: 'var(--theme-text-muted)', fontSize: 12 }}>例如：“第 3 次 loop 为什么分数低？”、“现在卡在哪？”、“下一步该往哪个方向调？”</div>
+        )}
+        {asides.map((t) => {
+          const liveText = live[t.id];
+          const answer = t.status === 'answering' ? (liveText ?? t.answer) : t.answer;
+          return (
+            <div key={t.id}>
+              <div style={{ display: 'flex', justifyContent: 'flex-end', marginBottom: 6 }}>
+                <div style={{ maxWidth: '85%', padding: '7px 11px', borderRadius: '12px 12px 2px 12px', background: 'var(--theme-accent)', color: '#fff', fontSize: 12.5, lineHeight: 1.5, whiteSpace: 'pre-wrap' }}>
+                  {t.question}
+                </div>
+              </div>
+              <div style={{ display: 'flex', justifyContent: 'flex-start' }}>
+                <div style={{ maxWidth: '90%', padding: '7px 11px', borderRadius: '12px 12px 12px 2px', background: 'var(--theme-bg-tertiary)', color: 'var(--theme-text)', fontSize: 12.5, lineHeight: 1.55, whiteSpace: 'pre-wrap', border: '1px solid var(--theme-border)' }}>
+                  {t.seq > 0 && <span style={{ fontSize: 10, color: 'var(--theme-text-muted)', display: 'block', marginBottom: 3 }}>↳ 提问时：Loop #{t.seq} · {t.stage}</span>}
+                  {answer || (t.status === 'answering' ? '思考中…' : '—')}
+                  {t.status === 'answering' && <span style={{ animation: 'awu-loop-pulse 1s infinite' }}>▋</span>}
+                  {t.status === 'error' && !answer && <span style={{ color: '#f87171' }}>回答失败</span>}
+                </div>
+              </div>
+            </div>
+          );
+        })}
+        <div ref={endRef} />
+      </div>
+
+      <div style={{ padding: 10, borderTop: '1px solid var(--theme-border)', display: 'flex', gap: 6 }}>
+        <textarea
+          value={input}
+          onChange={(e) => setInput(e.target.value)}
+          onKeyDown={(e) => { if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') onSend(); }}
+          placeholder={answering ? '上一条回答中…' : '顺便问一句…（Ctrl/Cmd+Enter）'}
+          disabled={answering}
+          style={{ ...inputBase, flex: 1, minHeight: 40, maxHeight: 120, resize: 'vertical', opacity: answering ? 0.6 : 1 }}
+        />
+        <button onClick={onSend} disabled={answering || !input.trim()} style={{ ...primaryBtn, padding: '8px 12px', opacity: (answering || !input.trim()) ? 0.5 : 1 }}>发送</button>
+      </div>
+    </div>
+  );
+};
 
 // ══ Stage rail ════════════════════════════════════════════════
 const StageRail: React.FC<{ stage: string }> = ({ stage }) => {
@@ -534,6 +646,14 @@ function renderHack(s: LoopStateT, progress: Record<string, string>): string {
     } else if (liveA) { L.push('  ana~:'); liveA.split('\n').slice(-8).forEach((r) => L.push(`    ${r}`)); }
     if (l.error) L.push(`  ! ${l.error}`);
   });
+  if (s.asides && s.asides.length) {
+    L.push('');
+    L.push('# BY THE WAY (旁路，不污染主线)');
+    s.asides.forEach((a) => {
+      L.push(`  Q: ${a.question}`);
+      (a.answer || '...').split('\n').forEach((r) => L.push(`     ${r}`));
+    });
+  }
   L.push('');
   L.push('▋');
   return L.join('\n');

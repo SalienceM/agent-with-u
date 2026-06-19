@@ -66,6 +66,8 @@ type LoopUpdatedCallback = (state: any) => void;
 let loopUpdatedCallbacks: LoopUpdatedCallback[] = [];
 type LoopProgressCallback = (data: { sessionId: string; seq: number; subStage: string; text: string }) => void;
 let loopProgressCallbacks: LoopProgressCallback[] = [];
+type LoopAsideDeltaCallback = (data: { sessionId: string; turnId: string; text: string }) => void;
+let loopAsideDeltaCallbacks: LoopAsideDeltaCallback[] = [];
 
 type SttStreamEndCallback = (data: { reason: string }) => void;
 let sttStreamEndCallbacks: SttStreamEndCallback[] = [];
@@ -258,6 +260,9 @@ function handleMessage(e: MessageEvent) {
     } else if (msg.event === 'loopProgress') {
       const data = JSON.parse(msg.data);
       loopProgressCallbacks.forEach((cb) => cb(data));
+    } else if (msg.event === 'loopAsideDelta') {
+      const data = JSON.parse(msg.data);
+      loopAsideDeltaCallbacks.forEach((cb) => cb(data));
     } else if (msg.event === 'sttStreamText') {
       const data = JSON.parse(msg.data);
       sttStreamCallbacks.forEach((cb) => cb(data));
@@ -655,6 +660,17 @@ export const api = {
   async loopAdvanceToOut(sessionId: string): Promise<{ status: string; stage?: string; message?: string }> {
     const result = await call('loopAdvanceToOut', sessionId);
     try { return JSON.parse(result); } catch { return { status: 'error', message: '响应解析失败' }; }
+  },
+
+  /** By the way 旁路提问：基于当前 loop 状态对话，不污染 loop 主线上下文。 */
+  async loopAsk(sessionId: string, question: string): Promise<{ status: string; turnId?: string; message?: string }> {
+    const result = await call('loopAsk', sessionId, question);
+    try { return JSON.parse(result); } catch { return { status: 'error', message: '响应解析失败' }; }
+  },
+
+  onLoopAsideDelta(cb: LoopAsideDeltaCallback): () => void {
+    loopAsideDeltaCallbacks.push(cb);
+    return () => { loopAsideDeltaCallbacks = loopAsideDeltaCallbacks.filter((c) => c !== cb); };
   },
 
   onLoopUpdated(cb: LoopUpdatedCallback): () => void {
@@ -1217,6 +1233,7 @@ function mockDispatch(method: string, params: any[]): any {
     case 'loopSetGoal': return JSON.stringify({ status: 'ok' });
     case 'loopRunIteration': return JSON.stringify({ status: 'error', message: 'mock mode' });
     case 'loopAdvanceToOut': return JSON.stringify({ status: 'error', message: 'mock mode' });
+    case 'loopAsk': return JSON.stringify({ status: 'error', message: 'mock mode' });
     case 'listSessions': return '[]';
     case 'listConnectedClients': return '[]';
     case 'loadSession': return 'null';
