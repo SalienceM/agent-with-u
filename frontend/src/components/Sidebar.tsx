@@ -407,6 +407,7 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
               />
             ) : (
               <div style={{ fontSize: 13, color: isActive ? 'var(--theme-accent, #7aa2f7)' : 'var(--theme-text, #e2e3ea)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', paddingRight: 68 }}>
+                {s.sessionType === 'loop' && <span title="Loop 会话" style={{ marginRight: 4 }}>🔁</span>}
                 {s.title}
               </div>
             )}

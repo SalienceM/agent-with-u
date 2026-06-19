@@ -146,6 +146,7 @@ class SessionStore:
                 sandbox_enabled=data.get("sandboxEnabled", True),
                 constraints=data.get("constraints"),
                 abilities=data.get("abilities"),
+                session_type=data.get("sessionType", "normal"),
             )
         except Exception as e:
             print(f"Failed to load session {sid}: {e}")

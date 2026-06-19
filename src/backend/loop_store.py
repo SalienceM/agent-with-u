@@ -1,0 +1,298 @@
+"""
+LoopStore: 可视化 Loop 集成的状态持久化（"stage 文件"）。
+
+每个 loop session 在 ~/.agent-with-u/loops/<session_id>.json 留存一个 stage 文件。
+全局阶段（stage）单向推进：
+
+    loopidea  →  loopexecute  →  loopout
+
+- loopidea：前台非阻塞地投递多条想法（idea），后端用并发池（默认 3）逐条让
+  模型展开。封口（seal）后形成全局目标 goal，单向切到 loopexecute。
+- loopexecute：按次（seq）执行 loop，每次 loop 分三个子阶段：
+    prepare  —— 编排本次 loop 的分步（顺次 / 并发）、本次目标
+    execute  —— 按编排执行，落地执行结果（未必成功）
+    analysis —— 评估执行结果与全局目标的差距，给出分数与趋势分析
+- loopout：全局产出阶段（可交付 / 可输出）。
+
+评分心智模型（0–100）：
+  >= 70 → 可交付（deliverable），进入优化阶段
+  >= 85 → 可输出（outputtable），分析后续 loop 的优化空间与趋势
+风险系数（risk_coefficient，0–1）：综合"最大 loop 约束"与"完不成的风险因子"，
+用于避免为无法完成的任务做无谓 loop。
+"""
+
+from __future__ import annotations
+
+import json
+import threading
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Optional
+
+from . import paths
+
+
+# ── 阶段常量 ──────────────────────────────────────────────────────
+STAGE_IDEA = "loopidea"
+STAGE_EXECUTE = "loopexecute"
+STAGE_OUT = "loopout"
+
+SUB_PREPARE = "prepare"
+SUB_EXECUTE = "execute"
+SUB_ANALYSIS = "analysis"
+SUB_DONE = "done"
+
+DELIVERABLE_SCORE = 70.0   # 可交付门槛
+OUTPUTTABLE_SCORE = 85.0   # 可输出门槛
+
+
+def _now() -> float:
+    return time.time()
+
+
+@dataclass
+class LoopStep:
+    """本次 loop 编排中的一个分步。"""
+    index: int
+    mode: str = "sequential"   # "sequential" | "concurrent"
+    desc: str = ""
+
+    def to_dict(self) -> dict:
+        return {"index": self.index, "mode": self.mode, "desc": self.desc}
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "LoopStep":
+        return cls(
+            index=int(d.get("index", 0)),
+            mode=d.get("mode", "sequential"),
+            desc=d.get("desc", ""),
+        )
+
+
+@dataclass
+class LoopAnalysis:
+    """execute analysis 结果。"""
+    score: float = 0.0                  # 0..100
+    notes: str = ""                     # 分析正文
+    trend: str = ""                     # 历史趋势评估
+    optimization_potential: float = 0.0  # 0..1，下一次 loop 估计还能提升多少
+    challenges: str = ""                # 环境/系统/网络等可触达性挑战
+    deliverable: bool = False           # score >= 70
+    outputtable: bool = False           # score >= 85
+
+    def to_dict(self) -> dict:
+        return {
+            "score": self.score,
+            "notes": self.notes,
+            "trend": self.trend,
+            "optimizationPotential": self.optimization_potential,
+            "challenges": self.challenges,
+            "deliverable": self.deliverable,
+            "outputtable": self.outputtable,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "LoopAnalysis":
+        return cls(
+            score=float(d.get("score", 0.0)),
+            notes=d.get("notes", ""),
+            trend=d.get("trend", ""),
+            optimization_potential=float(d.get("optimizationPotential", 0.0)),
+            challenges=d.get("challenges", ""),
+            deliverable=bool(d.get("deliverable", False)),
+            outputtable=bool(d.get("outputtable", False)),
+        )
+
+
+@dataclass
+class LoopRecord:
+    """一次 loopexecute 的完整记录。"""
+    seq: int
+    sub_stage: str = SUB_PREPARE        # prepare | execute | analysis | done
+    goal: str = ""                      # 本次 loop 的计划目标
+    orchestration: list[LoopStep] = field(default_factory=list)
+    completed: bool = False             # 是否按步骤执行完成（含 analysis 完成）
+    result: str = ""                    # 本次 loop 执行完成的结果信息
+    analysis: Optional[LoopAnalysis] = None
+    error: str = ""
+    created_at: float = field(default_factory=_now)
+    updated_at: float = field(default_factory=_now)
+
+    def to_dict(self) -> dict:
+        return {
+            "seq": self.seq,
+            "subStage": self.sub_stage,
+            "goal": self.goal,
+            "orchestration": [s.to_dict() for s in self.orchestration],
+            "completed": self.completed,
+            "result": self.result,
+            "analysis": self.analysis.to_dict() if self.analysis else None,
+            "error": self.error,
+            "createdAt": self.created_at,
+            "updatedAt": self.updated_at,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "LoopRecord":
+        return cls(
+            seq=int(d.get("seq", 0)),
+            sub_stage=d.get("subStage", SUB_PREPARE),
+            goal=d.get("goal", ""),
+            orchestration=[LoopStep.from_dict(s) for s in d.get("orchestration", [])],
+            completed=bool(d.get("completed", False)),
+            result=d.get("result", ""),
+            analysis=LoopAnalysis.from_dict(d["analysis"]) if d.get("analysis") else None,
+            error=d.get("error", ""),
+            created_at=d.get("createdAt", _now()),
+            updated_at=d.get("updatedAt", _now()),
+        )
+
+
+@dataclass
+class IdeaEntry:
+    """loopidea 阶段的一条想法（并发池中的一个任务）。"""
+    id: str
+    prompt: str
+    status: str = "pending"   # pending | running | done | error
+    result: str = ""
+    error: str = ""
+    created_at: float = field(default_factory=_now)
+    updated_at: float = field(default_factory=_now)
+
+    def to_dict(self) -> dict:
+        return {
+            "id": self.id,
+            "prompt": self.prompt,
+            "status": self.status,
+            "result": self.result,
+            "error": self.error,
+            "createdAt": self.created_at,
+            "updatedAt": self.updated_at,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "IdeaEntry":
+        return cls(
+            id=d.get("id", ""),
+            prompt=d.get("prompt", ""),
+            status=d.get("status", "pending"),
+            result=d.get("result", ""),
+            error=d.get("error", ""),
+            created_at=d.get("createdAt", _now()),
+            updated_at=d.get("updatedAt", _now()),
+        )
+
+
+@dataclass
+class LoopState:
+    """单个 loop session 的完整 stage 文件。"""
+    session_id: str
+    stage: str = STAGE_IDEA             # loopidea | loopexecute | loopout
+    goal: str = ""                      # 全局目标（idea 封口后形成）
+    ideas: list[IdeaEntry] = field(default_factory=list)
+    loops: list[LoopRecord] = field(default_factory=list)
+    risk_coefficient: float = 0.3       # 0..1 综合风险系数
+    max_loops: int = 8                  # 基础最大 loop 约束
+    status: str = "active"              # active | delivered | output | aborted
+    stop_reason: str = ""               # 触发 loopout / 终止的原因
+    created_at: float = field(default_factory=_now)
+    updated_at: float = field(default_factory=_now)
+
+    # ── 派生指标 ────────────────────────────────────────────────
+    def best_score(self) -> float:
+        scores = [l.analysis.score for l in self.loops if l.analysis]
+        return max(scores) if scores else 0.0
+
+    def latest_score(self) -> float:
+        done = [l for l in self.loops if l.analysis]
+        return done[-1].analysis.score if done else 0.0
+
+    def effective_max_loops(self) -> int:
+        """风险越高，允许的 loop 上限越低（避免无谓 loop）。"""
+        return max(1, round(self.max_loops * (1.0 - 0.5 * self.risk_coefficient)))
+
+    def to_dict(self) -> dict:
+        return {
+            "sessionId": self.session_id,
+            "stage": self.stage,
+            "goal": self.goal,
+            "ideas": [i.to_dict() for i in self.ideas],
+            "loops": [l.to_dict() for l in self.loops],
+            "riskCoefficient": self.risk_coefficient,
+            "maxLoops": self.max_loops,
+            "effectiveMaxLoops": self.effective_max_loops(),
+            "status": self.status,
+            "stopReason": self.stop_reason,
+            "bestScore": self.best_score(),
+            "latestScore": self.latest_score(),
+            "createdAt": self.created_at,
+            "updatedAt": self.updated_at,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "LoopState":
+        return cls(
+            session_id=d.get("sessionId", ""),
+            stage=d.get("stage", STAGE_IDEA),
+            goal=d.get("goal", ""),
+            ideas=[IdeaEntry.from_dict(i) for i in d.get("ideas", [])],
+            loops=[LoopRecord.from_dict(l) for l in d.get("loops", [])],
+            risk_coefficient=float(d.get("riskCoefficient", 0.3)),
+            max_loops=int(d.get("maxLoops", 8)),
+            status=d.get("status", "active"),
+            stop_reason=d.get("stopReason", ""),
+            created_at=d.get("createdAt", _now()),
+            updated_at=d.get("updatedAt", _now()),
+        )
+
+
+class LoopStore:
+    """Loop stage 文件的读写。线程安全（与 SessionStore 同进程）。"""
+
+    def __init__(self):
+        self._dir = paths.sub("loops")
+        self._dir.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.Lock()
+
+    def _path(self, sid: str) -> Path:
+        return self._dir / f"{sid}.json"
+
+    def exists(self, sid: str) -> bool:
+        return self._path(sid).exists()
+
+    def load(self, sid: str) -> Optional[LoopState]:
+        path = self._path(sid)
+        if not path.exists():
+            return None
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            return LoopState.from_dict(data)
+        except Exception as e:
+            print(f"[LoopStore] failed to load {sid}: {e}")
+            return None
+
+    def save(self, state: LoopState) -> None:
+        state.updated_at = _now()
+        with self._lock:
+            self._path(state.session_id).write_text(
+                json.dumps(state.to_dict(), ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+
+    def create(self, sid: str) -> LoopState:
+        state = LoopState(session_id=sid)
+        self.save(state)
+        return state
+
+    def get_or_create(self, sid: str) -> LoopState:
+        return self.load(sid) or self.create(sid)
+
+    def delete(self, sid: str) -> bool:
+        try:
+            p = self._path(sid)
+            if p.exists():
+                p.unlink()
+            return True
+        except Exception:
+            return False

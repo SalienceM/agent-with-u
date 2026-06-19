@@ -188,6 +188,8 @@ class Session:
     constraints: Optional[str] = None  # Special system prompts, rules, or constraints for this session
     # ★ Repo 能力绑定 — 替代 constraints 的新模式
     abilities: Optional[dict] = None  # {"skills": ["skill-name"], "prompts": ["prompt-name"]}
+    # ★ 会话类型：普通会话 / 可视化 loop 会话（loop 状态另存于 loops/<id>.json）
+    session_type: str = "normal"  # "normal" | "loop"
 
     def to_dict(self) -> dict:
         return {
@@ -205,6 +207,7 @@ class Session:
             "maxContinuations": self.max_continuations,
             "constraints": self.constraints,
             "abilities": self.abilities,
+            "sessionType": self.session_type,
         }
 
     def meta_dict(self) -> dict:
@@ -218,6 +221,7 @@ class Session:
             "workingDir": self.working_dir,  # ★ Show directory in sidebar
             "backendId": self.backend_id,
             "abilities": self.abilities,
+            "sessionType": self.session_type,
         }
 
 

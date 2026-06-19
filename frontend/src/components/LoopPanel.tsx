@@ -1,0 +1,621 @@
+import React, { useState, useEffect, useCallback, useRef, useMemo } from 'react';
+import { api } from '../api';
+
+/**
+ * LoopPanel — 可视化 Loop 集成的全屏面板。
+ *
+ * 阶段（单向）：loopidea → loopexecute → loopout
+ *  - loopidea ：非阻塞投递多条想法（后端并发池跑），封口后形成全局目标
+ *  - loopexecute：每次 loop 走 prepare → execute → analysis，时间轴可视化 +
+ *    点击查看任意 loop 的详情；带分数环、风险系数、可交付/可输出徽标
+ *  - loopout ：全局产出
+ *
+ * 右上角可切换「Hack 模式」——整份状态以 terminal 风格的等宽文本呈现。
+ */
+
+interface LoopStep { index: number; mode: string; desc: string; }
+interface LoopAnalysis {
+  score: number; notes: string; trend: string;
+  optimizationPotential: number; challenges: string;
+  deliverable: boolean; outputtable: boolean;
+}
+interface LoopRecord {
+  seq: number; subStage: string; goal: string; orchestration: LoopStep[];
+  completed: boolean; result: string; analysis: LoopAnalysis | null; error: string;
+}
+interface IdeaEntry { id: string; prompt: string; status: string; result: string; error: string; }
+interface LoopStateT {
+  sessionId: string; stage: string; goal: string;
+  ideas: IdeaEntry[]; loops: LoopRecord[];
+  riskCoefficient: number; maxLoops: number; effectiveMaxLoops: number;
+  status: string; stopReason: string; bestScore: number; latestScore: number;
+}
+
+const SUB_LABEL: Record<string, string> = {
+  prepare: 'Prepare', execute: 'Execute', analysis: 'Analysis', done: 'Done',
+};
+const SUB_ORDER = ['prepare', 'execute', 'analysis', 'done'];
+
+export interface LoopPanelProps {
+  sessionId: string;
+  onClose: () => void;
+}
+
+export const LoopPanel: React.FC<LoopPanelProps> = ({ sessionId, onClose }) => {
+  const [state, setState] = useState<LoopStateT | null>(null);
+  const [hackMode, setHackMode] = useState(false);
+  const [selectedSeq, setSelectedSeq] = useState<number | null>(null);
+  const [ideaInput, setIdeaInput] = useState('');
+  const [goalDraft, setGoalDraft] = useState('');
+  const [busy, setBusy] = useState(false);
+
+  // 子阶段实时流式文本：key = `${seq}:${subStage}`
+  const [progress, setProgress] = useState<Record<string, string>>({});
+  const progressRef = useRef(progress);
+  progressRef.current = progress;
+
+  const refresh = useCallback(async () => {
+    const s = await api.loopGetState(sessionId);
+    if (s) setState(s);
+  }, [sessionId]);
+
+  useEffect(() => { refresh(); }, [refresh]);
+
+  // 订阅整份状态更新 + 子阶段流式文本（仅本 session）
+  useEffect(() => {
+    const un1 = api.onLoopUpdated((s: LoopStateT) => {
+      if (s.sessionId === sessionId) setState(s);
+    });
+    const un2 = api.onLoopProgress((d) => {
+      if (d.sessionId !== sessionId) return;
+      const key = `${d.seq}:${d.subStage}`;
+      setProgress((prev) => ({ ...prev, [key]: (prev[key] || '') + d.text }));
+    });
+    return () => { un1(); un2(); };
+  }, [sessionId]);
+
+  const running = state?.loops?.some((l) => !l.completed && !l.error) ?? false;
+
+  const submitIdea = useCallback(async () => {
+    const text = ideaInput.trim();
+    if (!text) return;
+    setIdeaInput('');
+    await api.loopSubmitIdea(sessionId, text);
+  }, [ideaInput, sessionId]);
+
+  const sealIdea = useCallback(async () => {
+    if (!window.confirm('封口 loopidea 后将单向进入 loopexecute，无法回退。继续？')) return;
+    setBusy(true);
+    await api.loopSealIdea(sessionId, goalDraft.trim());
+    setGoalDraft('');
+    setBusy(false);
+  }, [sessionId, goalDraft]);
+
+  const runIteration = useCallback(async () => {
+    setBusy(true);
+    const r = await api.loopRunIteration(sessionId);
+    if (r.status !== 'ok' && r.message) alert(r.message);
+    setBusy(false);
+  }, [sessionId]);
+
+  const advanceOut = useCallback(async () => {
+    if (!window.confirm('进入 loopout 全局产出阶段（单向）。继续？')) return;
+    setBusy(true);
+    await api.loopAdvanceToOut(sessionId);
+    setBusy(false);
+  }, [sessionId]);
+
+  const saveGoal = useCallback(async () => {
+    await api.loopSetGoal(sessionId, goalDraft.trim());
+  }, [sessionId, goalDraft]);
+
+  if (!state) {
+    return (
+      <div style={overlay}>
+        <div style={shell}>
+          <Header stage="…" hackMode={hackMode} setHackMode={setHackMode} onClose={onClose} />
+          <div style={{ padding: 40, textAlign: 'center', color: 'var(--theme-text-muted)' }}>
+            正在加载 Loop 状态…
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div style={overlay}>
+      <div style={shell}>
+        <Header stage={state.stage} hackMode={hackMode} setHackMode={setHackMode} onClose={onClose} />
+        <StageRail stage={state.stage} />
+
+        {hackMode ? (
+          <HackView state={state} progress={progress} />
+        ) : (
+          <div style={{ flex: 1, overflow: 'auto', padding: '12px 18px 24px' }}>
+            {/* 全局指标条 */}
+            {state.stage !== 'loopidea' && <MetricBar state={state} />}
+
+            {state.stage === 'loopidea' && (
+              <IdeaStage
+                state={state} ideaInput={ideaInput} setIdeaInput={setIdeaInput}
+                goalDraft={goalDraft} setGoalDraft={setGoalDraft}
+                onSubmit={submitIdea} onSeal={sealIdea} busy={busy}
+                onRemove={(id) => api.loopRemoveIdea(sessionId, id)}
+              />
+            )}
+
+            {(state.stage === 'loopexecute' || state.stage === 'loopout') && (
+              <ExecuteStage
+                state={state} progress={progress}
+                selectedSeq={selectedSeq} setSelectedSeq={setSelectedSeq}
+                onRun={runIteration} onAdvanceOut={advanceOut}
+                running={running} busy={busy}
+                goalDraft={goalDraft} setGoalDraft={setGoalDraft} onSaveGoal={saveGoal}
+              />
+            )}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+};
+
+// ══ Header ════════════════════════════════════════════════════
+const Header: React.FC<{ stage: string; hackMode: boolean; setHackMode: (v: boolean) => void; onClose: () => void; }> =
+  ({ stage, hackMode, setHackMode, onClose }) => (
+    <div style={{
+      display: 'flex', alignItems: 'center', gap: 12, padding: '12px 18px',
+      borderBottom: '1px solid var(--theme-border)',
+    }}>
+      <span style={{ fontSize: 18 }}>🔁</span>
+      <span style={{ fontSize: 15, fontWeight: 700, color: 'var(--theme-text)' }}>可视化 Loop</span>
+      <span style={{ fontSize: 12, color: 'var(--theme-accent)', fontFamily: 'monospace' }}>{stage}</span>
+      <div style={{ flex: 1 }} />
+      <button
+        onClick={() => setHackMode(!hackMode)}
+        style={{ ...btn, ...(hackMode ? btnActive : {}) }}
+        title="切换 terminal / 可视化视图"
+      >
+        {hackMode ? '🎛 可视化' : '⌨ Hack'}
+      </button>
+      <button onClick={onClose} style={btn}>✕ 关闭</button>
+    </div>
+  );
+
+// ══ Stage rail ════════════════════════════════════════════════
+const StageRail: React.FC<{ stage: string }> = ({ stage }) => {
+  const stages = ['loopidea', 'loopexecute', 'loopout'];
+  const cur = stages.indexOf(stage);
+  return (
+    <div style={{ display: 'flex', alignItems: 'center', gap: 0, padding: '10px 18px', borderBottom: '1px solid var(--theme-border)' }}>
+      {stages.map((s, i) => (
+        <React.Fragment key={s}>
+          <div style={{
+            display: 'flex', alignItems: 'center', gap: 6,
+            opacity: i <= cur ? 1 : 0.4,
+          }}>
+            <span style={{
+              width: 22, height: 22, borderRadius: '50%', flexShrink: 0,
+              display: 'flex', alignItems: 'center', justifyContent: 'center',
+              fontSize: 11, fontWeight: 700,
+              background: i < cur ? 'var(--theme-accent)' : i === cur ? 'var(--theme-accent-bg)' : 'var(--theme-bg-tertiary)',
+              color: i < cur ? '#fff' : 'var(--theme-accent)',
+              border: `1px solid ${i <= cur ? 'var(--theme-accent)' : 'var(--theme-border)'}`,
+            }}>{i < cur ? '✓' : i + 1}</span>
+            <span style={{ fontSize: 13, fontWeight: i === cur ? 700 : 500, color: i === cur ? 'var(--theme-text)' : 'var(--theme-text-muted)' }}>{s}</span>
+          </div>
+          {i < stages.length - 1 && (
+            <div style={{ flex: 1, height: 2, margin: '0 10px', background: i < cur ? 'var(--theme-accent)' : 'var(--theme-border)' }} />
+          )}
+        </React.Fragment>
+      ))}
+    </div>
+  );
+};
+
+// ══ Metric bar ════════════════════════════════════════════════
+const MetricBar: React.FC<{ state: LoopStateT }> = ({ state }) => (
+  <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', marginBottom: 16 }}>
+    <Metric label="最佳分数" value={state.bestScore.toFixed(0)} accent={scoreColor(state.bestScore)} />
+    <Metric label="最近分数" value={state.latestScore.toFixed(0)} accent={scoreColor(state.latestScore)} />
+    <Metric label="已跑 Loop" value={`${state.loops.length} / ${state.effectiveMaxLoops}`} />
+    <RiskMetric risk={state.riskCoefficient} />
+    {state.bestScore >= 70 && <Badge text="可交付" color="#2da44e" />}
+    {state.bestScore >= 85 && <Badge text="可输出" color="#8957e5" />}
+    {state.status !== 'active' && <Badge text={state.status} color="#bf8700" />}
+  </div>
+);
+
+const Metric: React.FC<{ label: string; value: string; accent?: string }> = ({ label, value, accent }) => (
+  <div style={metricBox}>
+    <div style={{ fontSize: 11, color: 'var(--theme-text-muted)' }}>{label}</div>
+    <div style={{ fontSize: 20, fontWeight: 700, color: accent || 'var(--theme-text)', fontFamily: 'monospace' }}>{value}</div>
+  </div>
+);
+
+const RiskMetric: React.FC<{ risk: number }> = ({ risk }) => (
+  <div style={metricBox}>
+    <div style={{ fontSize: 11, color: 'var(--theme-text-muted)' }}>风险系数</div>
+    <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+      <div style={{ fontSize: 20, fontWeight: 700, fontFamily: 'monospace', color: riskColor(risk) }}>{risk.toFixed(2)}</div>
+      <div style={{ width: 50, height: 6, borderRadius: 3, background: 'var(--theme-bg-tertiary)', overflow: 'hidden' }}>
+        <div style={{ width: `${risk * 100}%`, height: '100%', background: riskColor(risk) }} />
+      </div>
+    </div>
+  </div>
+);
+
+const Badge: React.FC<{ text: string; color: string }> = ({ text, color }) => (
+  <div style={{
+    alignSelf: 'center', padding: '4px 12px', borderRadius: 14, fontSize: 12, fontWeight: 600,
+    color, background: `${color}1f`, border: `1px solid ${color}55`,
+  }}>{text}</div>
+);
+
+// ══ Idea stage ════════════════════════════════════════════════
+const IdeaStage: React.FC<{
+  state: LoopStateT; ideaInput: string; setIdeaInput: (v: string) => void;
+  goalDraft: string; setGoalDraft: (v: string) => void;
+  onSubmit: () => void; onSeal: () => void; busy: boolean;
+  onRemove: (id: string) => void;
+}> = ({ state, ideaInput, setIdeaInput, goalDraft, setGoalDraft, onSubmit, onSeal, busy, onRemove }) => {
+  const runningCount = state.ideas.filter((i) => i.status === 'running').length;
+  return (
+    <div>
+      <p style={{ fontSize: 13, color: 'var(--theme-text-muted)', margin: '0 0 12px' }}>
+        头脑风暴阶段 · 非阻塞投递想法，后端最多 3 个并发展开。封口后形成全局目标并单向进入 loopexecute。
+        {runningCount > 0 && <span style={{ color: 'var(--theme-accent)' }}> · {runningCount} 个进行中</span>}
+      </p>
+
+      <div style={{ display: 'flex', gap: 8, marginBottom: 16 }}>
+        <textarea
+          value={ideaInput}
+          onChange={(e) => setIdeaInput(e.target.value)}
+          onKeyDown={(e) => { if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') onSubmit(); }}
+          placeholder="一条想法/方向…（Ctrl/Cmd+Enter 投递）"
+          style={{ ...inputBase, minHeight: 56, resize: 'vertical', flex: 1 }}
+        />
+        <button onClick={onSubmit} disabled={!ideaInput.trim()} style={{ ...primaryBtn, opacity: ideaInput.trim() ? 1 : 0.5 }}>投递</button>
+      </div>
+
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(220px, 1fr))', gap: 10, marginBottom: 24 }}>
+        {state.ideas.length === 0 && (
+          <div style={{ color: 'var(--theme-text-muted)', fontSize: 13 }}>还没有想法，先投递几条吧。</div>
+        )}
+        {state.ideas.map((idea) => (
+          <div key={idea.id} style={ideaCard}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 6 }}>
+              <StatusDot status={idea.status} />
+              <span style={{ fontSize: 11, color: 'var(--theme-text-muted)' }}>{idea.status}</span>
+              <div style={{ flex: 1 }} />
+              <button onClick={() => onRemove(idea.id)} style={miniX} title="删除">✕</button>
+            </div>
+            <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--theme-text)', marginBottom: 4 }}>{idea.prompt}</div>
+            {idea.result && <div style={{ fontSize: 12, color: 'var(--theme-text-muted)', lineHeight: 1.5, whiteSpace: 'pre-wrap', maxHeight: 160, overflow: 'auto' }}>{idea.result}</div>}
+            {idea.error && <div style={{ fontSize: 12, color: '#f87171' }}>{idea.error}</div>}
+          </div>
+        ))}
+      </div>
+
+      <div style={sealBox}>
+        <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--theme-text)', marginBottom: 8 }}>封口 → 形成全局目标</div>
+        <textarea
+          value={goalDraft}
+          onChange={(e) => setGoalDraft(e.target.value)}
+          placeholder="可选：直接写全局目标。留空则封口后由模型把想法收敛成目标。"
+          style={{ ...inputBase, minHeight: 60, resize: 'vertical', width: '100%', marginBottom: 10 }}
+        />
+        <button onClick={onSeal} disabled={busy} style={{ ...primaryBtn, background: '#bf8700' }}>
+          🔒 封口并进入 loopexecute
+        </button>
+      </div>
+    </div>
+  );
+};
+
+// ══ Execute stage ═════════════════════════════════════════════
+const ExecuteStage: React.FC<{
+  state: LoopStateT; progress: Record<string, string>;
+  selectedSeq: number | null; setSelectedSeq: (v: number | null) => void;
+  onRun: () => void; onAdvanceOut: () => void; running: boolean; busy: boolean;
+  goalDraft: string; setGoalDraft: (v: string) => void; onSaveGoal: () => void;
+}> = ({ state, progress, selectedSeq, setSelectedSeq, onRun, onAdvanceOut, running, busy, goalDraft, setGoalDraft, onSaveGoal }) => {
+  const isOut = state.stage === 'loopout';
+  const selected = state.loops.find((l) => l.seq === selectedSeq) || null;
+  const [editGoal, setEditGoal] = useState(false);
+
+  return (
+    <div>
+      {/* 全局目标 */}
+      <div style={{ ...sealBox, marginBottom: 16 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6 }}>
+          <span style={{ fontSize: 13, fontWeight: 700, color: 'var(--theme-text)' }}>🎯 全局目标</span>
+          <div style={{ flex: 1 }} />
+          {!isOut && (
+            <button onClick={() => { setEditGoal(!editGoal); setGoalDraft(state.goal); }} style={btn}>
+              {editGoal ? '取消' : '编辑'}
+            </button>
+          )}
+        </div>
+        {editGoal ? (
+          <div style={{ display: 'flex', gap: 8 }}>
+            <textarea value={goalDraft} onChange={(e) => setGoalDraft(e.target.value)} style={{ ...inputBase, flex: 1, minHeight: 54 }} />
+            <button onClick={() => { onSaveGoal(); setEditGoal(false); }} style={primaryBtn}>保存</button>
+          </div>
+        ) : (
+          <div style={{ fontSize: 13, color: state.goal ? 'var(--theme-text)' : 'var(--theme-text-muted)', lineHeight: 1.6, whiteSpace: 'pre-wrap' }}>
+            {state.goal || '（封口后由模型收敛中…刷新可见）'}
+          </div>
+        )}
+      </div>
+
+      {/* 操作 */}
+      {!isOut && (
+        <div style={{ display: 'flex', gap: 10, marginBottom: 18 }}>
+          <button onClick={onRun} disabled={busy || running} style={{ ...primaryBtn, opacity: (busy || running) ? 0.5 : 1 }}>
+            {running ? '⏳ Loop 进行中…' : `▶ 运行第 ${state.loops.length + 1} 次 Loop`}
+          </button>
+          <button onClick={onAdvanceOut} disabled={busy} style={btn}>⏹ 进入 loopout</button>
+        </div>
+      )}
+      {isOut && state.stopReason && (
+        <div style={{ marginBottom: 16, fontSize: 13, color: 'var(--theme-text-muted)' }}>
+          ⏹ 收口原因：{state.stopReason}
+        </div>
+      )}
+
+      {/* Loop 时间轴 */}
+      <div style={{ display: 'flex', gap: 10, overflowX: 'auto', paddingBottom: 12, marginBottom: 8 }}>
+        {state.loops.length === 0 && <div style={{ color: 'var(--theme-text-muted)', fontSize: 13 }}>还没有 loop，点击上方按钮开始第 1 次。</div>}
+        {state.loops.map((l) => (
+          <LoopNode key={l.seq} loop={l} selected={l.seq === selectedSeq} onClick={() => setSelectedSeq(l.seq === selectedSeq ? null : l.seq)} />
+        ))}
+      </div>
+
+      {/* 详情面板 */}
+      {selected && <LoopDetail loop={selected} progress={progress} onClose={() => setSelectedSeq(null)} />}
+    </div>
+  );
+};
+
+const LoopNode: React.FC<{ loop: LoopRecord; selected: boolean; onClick: () => void }> = ({ loop, selected, onClick }) => {
+  const score = loop.analysis?.score ?? null;
+  const subIdx = SUB_ORDER.indexOf(loop.subStage);
+  return (
+    <div
+      onClick={onClick}
+      style={{
+        flexShrink: 0, width: 150, cursor: 'pointer', padding: 12, borderRadius: 12,
+        background: selected ? 'var(--theme-accent-bg)' : 'var(--theme-bg-secondary)',
+        border: `1px solid ${selected ? 'var(--theme-accent)' : 'var(--theme-border)'}`,
+        transition: 'all 0.15s',
+      }}
+    >
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 8 }}>
+        <span style={{ fontSize: 12, fontWeight: 700, color: 'var(--theme-text)' }}>Loop #{loop.seq}</span>
+        <ScoreRing score={score} pending={!loop.completed} />
+      </div>
+      {/* 子阶段进度 */}
+      <div style={{ display: 'flex', gap: 4, marginBottom: 8 }}>
+        {SUB_ORDER.slice(0, 3).map((s, i) => (
+          <div key={s} style={{
+            flex: 1, height: 4, borderRadius: 2,
+            background: loop.error ? '#f87171' : i < subIdx ? 'var(--theme-accent)' : i === subIdx && !loop.completed ? 'var(--theme-accent)' : i < subIdx || loop.completed ? 'var(--theme-accent)' : 'var(--theme-bg-tertiary)',
+            opacity: i === subIdx && !loop.completed ? 0.6 : 1,
+            animation: i === subIdx && !loop.completed ? 'awu-loop-pulse 1.2s infinite' : 'none',
+          }} />
+        ))}
+      </div>
+      <div style={{ fontSize: 11, color: 'var(--theme-text-muted)' }}>
+        {loop.error ? '❌ 失败' : loop.completed ? '✓ 完成' : `${SUB_LABEL[loop.subStage] || loop.subStage}…`}
+      </div>
+      {loop.goal && <div style={{ fontSize: 11, color: 'var(--theme-text-muted)', marginTop: 4, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{loop.goal}</div>}
+    </div>
+  );
+};
+
+const LoopDetail: React.FC<{ loop: LoopRecord; progress: Record<string, string>; onClose: () => void }> = ({ loop, progress, onClose }) => {
+  const liveExec = progress[`${loop.seq}:execute`];
+  const livePrep = progress[`${loop.seq}:prepare`];
+  const liveAna = progress[`${loop.seq}:analysis`];
+  return (
+    <div style={{ ...sealBox, marginTop: 4 }}>
+      <div style={{ display: 'flex', alignItems: 'center', marginBottom: 10 }}>
+        <span style={{ fontSize: 14, fontWeight: 700, color: 'var(--theme-text)' }}>Loop #{loop.seq} 详情</span>
+        <div style={{ flex: 1 }} />
+        <button onClick={onClose} style={miniX}>✕</button>
+      </div>
+
+      <Section title="本次目标">{loop.goal || '—'}</Section>
+
+      <Section title="编排（顺次 / 并发）">
+        {loop.orchestration.length === 0 ? (livePrep ? <Live text={livePrep} /> : '—') : (
+          <ol style={{ margin: 0, paddingLeft: 18 }}>
+            {loop.orchestration.map((s) => (
+              <li key={s.index} style={{ fontSize: 13, marginBottom: 4, color: 'var(--theme-text)' }}>
+                <span style={{
+                  fontSize: 10, padding: '1px 6px', borderRadius: 8, marginRight: 6,
+                  background: s.mode === 'concurrent' ? '#8957e51f' : '#2da44e1f',
+                  color: s.mode === 'concurrent' ? '#8957e5' : '#2da44e',
+                  border: `1px solid ${s.mode === 'concurrent' ? '#8957e555' : '#2da44e55'}`,
+                }}>{s.mode === 'concurrent' ? '并发' : '顺次'}</span>
+                {s.desc}
+              </li>
+            ))}
+          </ol>
+        )}
+      </Section>
+
+      <Section title="执行结果">
+        {loop.result ? <div style={{ whiteSpace: 'pre-wrap', fontSize: 13, lineHeight: 1.6, color: 'var(--theme-text)' }}>{loop.result}</div>
+          : liveExec ? <Live text={liveExec} /> : '—'}
+      </Section>
+
+      {loop.analysis ? (
+        <Section title={`Execute Analysis · 分数 ${loop.analysis.score.toFixed(0)}`}>
+          <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginBottom: 8 }}>
+            {loop.analysis.deliverable && <Badge text="可交付" color="#2da44e" />}
+            {loop.analysis.outputtable && <Badge text="可输出" color="#8957e5" />}
+            <span style={{ fontSize: 12, color: 'var(--theme-text-muted)', alignSelf: 'center' }}>
+              优化空间 {(loop.analysis.optimizationPotential * 100).toFixed(0)}% · 趋势 {loop.analysis.trend || '—'}
+            </span>
+          </div>
+          {loop.analysis.notes && <div style={{ fontSize: 13, lineHeight: 1.6, color: 'var(--theme-text)', whiteSpace: 'pre-wrap' }}>{loop.analysis.notes}</div>}
+          {loop.analysis.challenges && <div style={{ fontSize: 12, color: '#bf8700', marginTop: 6 }}>⚠ 约束：{loop.analysis.challenges}</div>}
+        </Section>
+      ) : liveAna ? <Section title="Execute Analysis（进行中）"><Live text={liveAna} /></Section> : null}
+
+      {loop.error && <Section title="错误"><span style={{ color: '#f87171' }}>{loop.error}</span></Section>}
+    </div>
+  );
+};
+
+const Section: React.FC<{ title: string; children: React.ReactNode }> = ({ title, children }) => (
+  <div style={{ marginBottom: 12 }}>
+    <div style={{ fontSize: 11, fontWeight: 700, color: 'var(--theme-text-muted)', textTransform: 'uppercase', letterSpacing: 0.5, marginBottom: 4 }}>{title}</div>
+    <div style={{ fontSize: 13, color: 'var(--theme-text)' }}>{children}</div>
+  </div>
+);
+
+const Live: React.FC<{ text: string }> = ({ text }) => (
+  <div style={{
+    whiteSpace: 'pre-wrap', fontSize: 12.5, lineHeight: 1.5, fontFamily: 'monospace',
+    color: 'var(--theme-text-muted)', maxHeight: 200, overflow: 'auto',
+    background: 'var(--theme-code-bg)', borderRadius: 6, padding: 8,
+  }}>{text}<span style={{ animation: 'awu-loop-pulse 1s infinite' }}>▋</span></div>
+);
+
+// ══ Hack / terminal view ══════════════════════════════════════
+const HackView: React.FC<{ state: LoopStateT; progress: Record<string, string> }> = ({ state, progress }) => {
+  const text = useMemo(() => renderHack(state, progress), [state, progress]);
+  const ref = useRef<HTMLPreElement>(null);
+  useEffect(() => { if (ref.current) ref.current.scrollTop = ref.current.scrollHeight; }, [text]);
+  return (
+    <pre ref={ref} style={{
+      flex: 1, overflow: 'auto', margin: 0, padding: 18,
+      fontFamily: 'ui-monospace, Menlo, Consolas, monospace', fontSize: 12.5, lineHeight: 1.55,
+      background: '#0b0e14', color: '#9ece6a', whiteSpace: 'pre-wrap',
+    }}>{text}</pre>
+  );
+};
+
+function renderHack(s: LoopStateT, progress: Record<string, string>): string {
+  const L: string[] = [];
+  L.push('┌─ LOOP SESSION ───────────────────────────────');
+  L.push(`│ stage   : ${s.stage}`);
+  L.push(`│ status  : ${s.status}${s.stopReason ? `  (${s.stopReason})` : ''}`);
+  L.push(`│ goal    : ${s.goal || '(none)'}`);
+  L.push(`│ risk    : ${s.riskCoefficient.toFixed(2)}   loops ${s.loops.length}/${s.effectiveMaxLoops}   best ${s.bestScore.toFixed(0)}  latest ${s.latestScore.toFixed(0)}`);
+  L.push('└──────────────────────────────────────────────');
+  if (s.stage === 'loopidea') {
+    L.push('');
+    L.push('# IDEAS');
+    s.ideas.forEach((i) => {
+      L.push(`  [${i.status.padEnd(7)}] ${i.prompt}`);
+      if (i.result) i.result.split('\n').forEach((r) => L.push(`            ${r}`));
+      if (i.error) L.push(`            ! ${i.error}`);
+    });
+  }
+  s.loops.forEach((l) => {
+    L.push('');
+    L.push(`# LOOP #${l.seq}  [${l.subStage}]  ${l.analysis ? 'score=' + l.analysis.score.toFixed(0) : (l.error ? 'ERROR' : '...')}`);
+    L.push(`  goal: ${l.goal || '—'}`);
+    l.orchestration.forEach((o) => L.push(`   ${o.index}. (${o.mode}) ${o.desc}`));
+    const liveP = progress[`${l.seq}:prepare`];
+    const liveE = progress[`${l.seq}:execute`];
+    const liveA = progress[`${l.seq}:analysis`];
+    if (l.result) { L.push('  result:'); l.result.split('\n').forEach((r) => L.push(`    ${r}`)); }
+    else if (liveE) { L.push('  exec~:'); liveE.split('\n').slice(-12).forEach((r) => L.push(`    ${r}`)); }
+    else if (liveP) { L.push('  prep~:'); liveP.split('\n').slice(-6).forEach((r) => L.push(`    ${r}`)); }
+    if (l.analysis) {
+      L.push(`  analysis: opt=${(l.analysis.optimizationPotential * 100).toFixed(0)}% trend=${l.analysis.trend} deliverable=${l.analysis.deliverable} output=${l.analysis.outputtable}`);
+      if (l.analysis.notes) l.analysis.notes.split('\n').forEach((r) => L.push(`    ${r}`));
+      if (l.analysis.challenges) L.push(`    ! ${l.analysis.challenges}`);
+    } else if (liveA) { L.push('  ana~:'); liveA.split('\n').slice(-8).forEach((r) => L.push(`    ${r}`)); }
+    if (l.error) L.push(`  ! ${l.error}`);
+  });
+  L.push('');
+  L.push('▋');
+  return L.join('\n');
+}
+
+// ══ small bits ════════════════════════════════════════════════
+const StatusDot: React.FC<{ status: string }> = ({ status }) => {
+  const c = status === 'done' ? '#2da44e' : status === 'running' ? '#0969da' : status === 'error' ? '#f87171' : '#bf8700';
+  return <span style={{ width: 8, height: 8, borderRadius: '50%', background: c, animation: status === 'running' ? 'awu-loop-pulse 1.2s infinite' : 'none' }} />;
+};
+
+const ScoreRing: React.FC<{ score: number | null; pending: boolean }> = ({ score, pending }) => {
+  if (score === null) {
+    return <span style={{ fontSize: 11, color: 'var(--theme-text-muted)' }}>{pending ? '…' : '—'}</span>;
+  }
+  const col = scoreColor(score);
+  return (
+    <div style={{
+      width: 30, height: 30, borderRadius: '50%', display: 'flex', alignItems: 'center', justifyContent: 'center',
+      fontSize: 11, fontWeight: 700, color: col,
+      background: `conic-gradient(${col} ${score * 3.6}deg, var(--theme-bg-tertiary) 0deg)`,
+    }}>
+      <div style={{ width: 23, height: 23, borderRadius: '50%', background: 'var(--theme-bg-secondary)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+        {score.toFixed(0)}
+      </div>
+    </div>
+  );
+};
+
+function scoreColor(s: number): string {
+  if (s >= 85) return '#8957e5';
+  if (s >= 70) return '#2da44e';
+  if (s >= 40) return '#bf8700';
+  return '#f87171';
+}
+function riskColor(r: number): string {
+  if (r >= 0.7) return '#f87171';
+  if (r >= 0.4) return '#bf8700';
+  return '#2da44e';
+}
+
+// ══ styles ════════════════════════════════════════════════════
+const overlay: React.CSSProperties = {
+  position: 'fixed', inset: 0, zIndex: 1200,
+  background: 'rgba(0,0,0,0.5)', display: 'flex', alignItems: 'center', justifyContent: 'center',
+};
+const shell: React.CSSProperties = {
+  width: '92%', maxWidth: 1000, height: '88vh', display: 'flex', flexDirection: 'column',
+  background: 'var(--theme-bg-secondary, #fff)', border: '1px solid var(--theme-border)',
+  borderRadius: 14, overflow: 'hidden', boxShadow: '0 12px 48px rgba(0,0,0,0.4)',
+};
+const btn: React.CSSProperties = {
+  background: 'var(--theme-bg-tertiary)', border: '1px solid var(--theme-border)',
+  color: 'var(--theme-text)', fontSize: 12, padding: '5px 10px', borderRadius: 6, cursor: 'pointer',
+};
+const btnActive: React.CSSProperties = { background: 'var(--theme-accent-bg)', color: 'var(--theme-accent)', borderColor: 'var(--theme-accent)' };
+const primaryBtn: React.CSSProperties = {
+  background: 'var(--theme-accent)', border: 'none', color: '#fff',
+  fontSize: 13, fontWeight: 600, padding: '8px 16px', borderRadius: 8, cursor: 'pointer', whiteSpace: 'nowrap',
+};
+const inputBase: React.CSSProperties = {
+  background: 'var(--theme-input-bg)', border: '1px solid var(--theme-border)',
+  color: 'var(--theme-text)', borderRadius: 8, padding: '8px 10px', fontSize: 13, outline: 'none', fontFamily: 'inherit',
+};
+const metricBox: React.CSSProperties = {
+  padding: '8px 14px', borderRadius: 10, background: 'var(--theme-bg-secondary)',
+  border: '1px solid var(--theme-border)', minWidth: 90,
+};
+const ideaCard: React.CSSProperties = {
+  padding: 12, borderRadius: 10, background: 'var(--theme-bg-secondary)', border: '1px solid var(--theme-border)',
+};
+const sealBox: React.CSSProperties = {
+  padding: 14, borderRadius: 12, background: 'var(--theme-bg-tertiary)', border: '1px solid var(--theme-border)',
+};
+const miniX: React.CSSProperties = {
+  background: 'none', border: 'none', color: 'var(--theme-text-muted)', cursor: 'pointer', fontSize: 12, padding: 2,
+};
+
+// 注入脉冲动画（一次性）
+if (typeof document !== 'undefined' && !document.getElementById('awu-loop-css')) {
+  const s = document.createElement('style');
+  s.id = 'awu-loop-css';
+  s.textContent = `@keyframes awu-loop-pulse { 0%,100% { opacity: 0.35; } 50% { opacity: 1; } }`;
+  document.head.appendChild(s);
+}

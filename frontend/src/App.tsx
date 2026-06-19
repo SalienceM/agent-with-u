@@ -16,6 +16,7 @@ import { AuthStatusBanner } from './components/AuthStatusBanner';
 import { ConnectionPanel } from './components/ConnectionPanel';
 import { DirSyncPanel } from './components/DirSyncPanel';
 import { ChatPane } from './components/ChatPane';
+import { LoopPanel } from './components/LoopPanel';
 import { clearSessionHistoryCache } from './hooks/useChat';
 import { clearStreamStateForSession } from './hooks/useStreamState';
 import { useConfig } from './hooks/useConfig';
@@ -63,6 +64,8 @@ export const App: React.FC = () => {
     () => typeof window !== 'undefined' && window.innerWidth <= 768,
   );
   const [scratchPadOpen, setScratchPadOpen] = useState(false);
+  const [loopPanelOpen, setLoopPanelOpen] = useState(false);
+  const loopAutoOpenedRef = useRef<Set<string>>(new Set());  // 记录已自动弹出过的 loop 会话
   const [scratchPadWidth, setScratchPadWidth] = useState(360);
   const [assetPanelOpen, setAssetPanelOpen] = useState(false);
   const scratchDragRef = useRef<{ startX: number; startW: number } | null>(null);
@@ -267,6 +270,20 @@ export const App: React.FC = () => {
     return () => { cancelled = true; };
   }, [activeSessionId]);
 
+  // ★ Loop 会话：选中时自动弹出可视化面板（每个会话只自动弹一次；手动关闭后
+  //   切走再切回不重弹，切到另一个 loop 会话则会弹）。非 loop 会话则关闭面板。
+  useEffect(() => {
+    if (!activeSession) return;
+    if (activeSession.sessionType === 'loop') {
+      if (!loopAutoOpenedRef.current.has(activeSession.id)) {
+        loopAutoOpenedRef.current.add(activeSession.id);
+        setLoopPanelOpen(true);
+      }
+    } else {
+      setLoopPanelOpen(false);
+    }
+  }, [activeSession]);
+
   // Phase 2: 每 Session 独立的模型配置(顶栏标签用)
   const activeBackendId = activeSession?.backendId || backends[0]?.id || '';
 
@@ -341,8 +358,8 @@ export const App: React.FC = () => {
     setNewSessionDialogOpen(true);
   }, []);
 
-  const handleCreateSession = useCallback(async (workingDir: string, backendId: string) => {
-    const session = await api.createSession(workingDir, backendId);
+  const handleCreateSession = useCallback(async (workingDir: string, backendId: string, sessionType: 'normal' | 'loop' = 'normal') => {
+    const session = await api.createSession(workingDir, backendId, sessionType);
     // ★ Set session first, then close dialog in next render cycle to avoid visual tearing
     // 分屏架构下:把新 session 放进焦点 pane,activeSessionId 自动派生过去。
     setSessionInPane(session.id);
@@ -722,6 +739,21 @@ export const App: React.FC = () => {
             </span>
           )}
           <div style={{ flex: 1 }} />
+          {/* ★ Loop 会话：打开可视化 Loop 面板 */}
+          {activeSession?.sessionType === 'loop' && (
+            <button
+              onClick={() => setLoopPanelOpen(true)}
+              style={{
+                ...logBtnStyle,
+                background: 'var(--theme-accent-bg, #0969da1a)',
+                border: '1px solid var(--theme-accent, #0969da)55',
+                color: 'var(--theme-accent, #0969da)',
+              }}
+              title="可视化 Loop 面板"
+            >
+              🔁{isMobile ? '' : ' Loop'}
+            </button>
+          )}
           {/* 日志查看器按钮 */}
           <button
             onClick={() => setLogViewerOpen(true)}
@@ -897,6 +929,11 @@ export const App: React.FC = () => {
 
       {/* ---- 连接目标设置 ---- */}
       {connPanelOpen && <ConnectionPanel onClose={() => setConnPanelOpen(false)} />}
+
+      {/* ---- 可视化 Loop 面板（loop 会话） ---- */}
+      {loopPanelOpen && activeSessionId && activeSession?.sessionType === 'loop' && (
+        <LoopPanel sessionId={activeSessionId} onClose={() => setLoopPanelOpen(false)} />
+      )}
 
       {/* ---- 目录同步 ---- */}
       {syncPanelOpen && (
@@ -1215,7 +1252,7 @@ function formatBackendLabel(backend: any): string {
 interface NewSessionDialogProps {
   backends: any[];
   onClose: () => void;
-  onCreate: (workingDir: string, backendId: string) => void;
+  onCreate: (workingDir: string, backendId: string, sessionType: 'normal' | 'loop') => void;
 }
 
 const NewSessionDialog: React.FC<NewSessionDialogProps> = ({
@@ -1228,13 +1265,14 @@ const NewSessionDialog: React.FC<NewSessionDialogProps> = ({
   const [selectedBackendId, setSelectedBackendId] = useState(
     backends[0]?.id || 'claude-agent-sdk-default'
   );
+  const [sessionType, setSessionType] = useState<'normal' | 'loop'>('normal');
   const [dirPickerOpen, setDirPickerOpen] = useState(false);
   const isAutoDir = !workingDir.trim() || workingDir.trim() === '.';
 
   const handleCreate = useCallback(async () => {
     // 空值交给后端补一个时间戳目录
-    await onCreate(workingDir.trim() || '', selectedBackendId);
-  }, [workingDir, selectedBackendId, onCreate]);
+    await onCreate(workingDir.trim() || '', selectedBackendId, sessionType);
+  }, [workingDir, selectedBackendId, sessionType, onCreate]);
 
   const handleBrowse = useCallback(async () => {
     // Tauri 桌面端：用系统原生目录对话框（选本机 = 服务器同机）。
@@ -1264,6 +1302,31 @@ const NewSessionDialog: React.FC<NewSessionDialogProps> = ({
           Each session is tied to a working directory. Claude will operate within this directory,
           with full access to read, edit, and run commands here.
         </p>
+
+        {/* ★ 会话类型：普通 / Loop（可视化迭代任务） */}
+        <div style={formGroupStyle}>
+          <label style={labelStyle}>会话类型 / Type:</label>
+          <div style={{ display: 'flex', gap: 8 }}>
+            {([
+              { v: 'normal', icon: '💬', title: '普通会话', desc: '常规对话工作区' },
+              { v: 'loop', icon: '🔁', title: 'Loop 会话', desc: '想法→迭代执行→产出，可视化' },
+            ] as const).map((opt) => (
+              <button
+                key={opt.v}
+                onClick={() => setSessionType(opt.v)}
+                style={{
+                  flex: 1, textAlign: 'left', padding: '10px 12px', borderRadius: 8, cursor: 'pointer',
+                  background: sessionType === opt.v ? 'var(--theme-accent-bg, #0969da1a)' : 'var(--theme-bg-tertiary, #f6f8fa)',
+                  border: `1px solid ${sessionType === opt.v ? 'var(--theme-accent, #0969da)' : 'var(--theme-border, rgba(0,0,0,0.12))'}`,
+                  color: 'var(--theme-text, #1f2328)',
+                }}
+              >
+                <div style={{ fontSize: 13, fontWeight: 600 }}>{opt.icon} {opt.title}</div>
+                <div style={{ fontSize: 11, color: 'var(--theme-text-muted, #656d76)', marginTop: 2 }}>{opt.desc}</div>
+              </button>
+            ))}
+          </div>
+        </div>
 
         <div style={formGroupStyle}>
           <label style={labelStyle}>Working Directory:</label>

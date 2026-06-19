@@ -61,6 +61,12 @@ let clientsChangedCallbacks: ClientsChangedCallback[] = [];
 type SttStreamTextCallback = (data: { text: string; isFinal: boolean }) => void;
 let sttStreamCallbacks: SttStreamTextCallback[] = [];
 
+// ── 可视化 Loop 集成 ──────────────────────────────────────────
+type LoopUpdatedCallback = (state: any) => void;
+let loopUpdatedCallbacks: LoopUpdatedCallback[] = [];
+type LoopProgressCallback = (data: { sessionId: string; seq: number; subStage: string; text: string }) => void;
+let loopProgressCallbacks: LoopProgressCallback[] = [];
+
 type SttStreamEndCallback = (data: { reason: string }) => void;
 let sttStreamEndCallbacks: SttStreamEndCallback[] = [];
 
@@ -246,6 +252,12 @@ function handleMessage(e: MessageEvent) {
     } else if (msg.event === 'clientsChanged') {
       const data: ConnectedClient[] = msg.data ? JSON.parse(msg.data) : [];
       clientsChangedCallbacks.forEach((cb) => cb(data));
+    } else if (msg.event === 'loopUpdated') {
+      const data = JSON.parse(msg.data);
+      loopUpdatedCallbacks.forEach((cb) => cb(data));
+    } else if (msg.event === 'loopProgress') {
+      const data = JSON.parse(msg.data);
+      loopProgressCallbacks.forEach((cb) => cb(data));
     } else if (msg.event === 'sttStreamText') {
       const data = JSON.parse(msg.data);
       sttStreamCallbacks.forEach((cb) => cb(data));
@@ -604,9 +616,55 @@ export const api = {
     try { return JSON.parse(result); } catch { return null; }
   },
 
-  async createSession(workingDir: string, backendId: string): Promise<any> {
-    const result = await call('createSession', workingDir, backendId);
+  async createSession(workingDir: string, backendId: string, sessionType: 'normal' | 'loop' = 'normal'): Promise<any> {
+    const result = await call('createSession', workingDir, backendId, sessionType);
     try { return JSON.parse(result); } catch { return null; }
+  },
+
+  // ── 可视化 Loop 集成 ────────────────────────────────────────
+  async loopGetState(sessionId: string): Promise<any | null> {
+    const result = await call('loopGetState', sessionId);
+    try { return JSON.parse(result); } catch { return null; }
+  },
+
+  async loopSubmitIdea(sessionId: string, prompt: string): Promise<{ status: string; ideaId?: string; message?: string }> {
+    const result = await call('loopSubmitIdea', sessionId, prompt);
+    try { return JSON.parse(result); } catch { return { status: 'error', message: '响应解析失败' }; }
+  },
+
+  async loopRemoveIdea(sessionId: string, ideaId: string): Promise<{ status: string }> {
+    const result = await call('loopRemoveIdea', sessionId, ideaId);
+    try { return JSON.parse(result); } catch { return { status: 'error' }; }
+  },
+
+  async loopSealIdea(sessionId: string, goal: string = ''): Promise<{ status: string; stage?: string; message?: string }> {
+    const result = await call('loopSealIdea', sessionId, goal);
+    try { return JSON.parse(result); } catch { return { status: 'error', message: '响应解析失败' }; }
+  },
+
+  async loopSetGoal(sessionId: string, goal: string): Promise<{ status: string }> {
+    const result = await call('loopSetGoal', sessionId, goal);
+    try { return JSON.parse(result); } catch { return { status: 'error' }; }
+  },
+
+  async loopRunIteration(sessionId: string): Promise<{ status: string; message?: string }> {
+    const result = await call('loopRunIteration', sessionId);
+    try { return JSON.parse(result); } catch { return { status: 'error', message: '响应解析失败' }; }
+  },
+
+  async loopAdvanceToOut(sessionId: string): Promise<{ status: string; stage?: string; message?: string }> {
+    const result = await call('loopAdvanceToOut', sessionId);
+    try { return JSON.parse(result); } catch { return { status: 'error', message: '响应解析失败' }; }
+  },
+
+  onLoopUpdated(cb: LoopUpdatedCallback): () => void {
+    loopUpdatedCallbacks.push(cb);
+    return () => { loopUpdatedCallbacks = loopUpdatedCallbacks.filter((c) => c !== cb); };
+  },
+
+  onLoopProgress(cb: LoopProgressCallback): () => void {
+    loopProgressCallbacks.push(cb);
+    return () => { loopProgressCallbacks = loopProgressCallbacks.filter((c) => c !== cb); };
   },
 
   /** 清空 session 消息历史和 agent session ID，但保留 session 本身（目录/能力不变）。 */
@@ -1150,7 +1208,15 @@ function mockDispatch(method: string, params: any[]): any {
         id: 'mock-' + Date.now(), title: 'Mock session',
         createdAt: Date.now() / 1000, updatedAt: Date.now() / 1000,
         messages: [], backendId: params[1], autoContinue: true,
+        sessionType: params[2] || 'normal',
       });
+    case 'loopGetState': return 'null';
+    case 'loopSubmitIdea': return JSON.stringify({ status: 'error', message: 'mock mode' });
+    case 'loopRemoveIdea': return JSON.stringify({ status: 'ok' });
+    case 'loopSealIdea': return JSON.stringify({ status: 'error', message: 'mock mode' });
+    case 'loopSetGoal': return JSON.stringify({ status: 'ok' });
+    case 'loopRunIteration': return JSON.stringify({ status: 'error', message: 'mock mode' });
+    case 'loopAdvanceToOut': return JSON.stringify({ status: 'error', message: 'mock mode' });
     case 'listSessions': return '[]';
     case 'listConnectedClients': return '[]';
     case 'loadSession': return 'null';

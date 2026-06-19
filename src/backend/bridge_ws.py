@@ -38,6 +38,12 @@ from .backend_store import BackendStore
 from .app_config_store import AppConfigStore
 from .skill_store import SkillStore
 from .prompt_store import PromptStore
+from .loop_store import (
+    LoopStore, LoopState, LoopRecord, LoopStep, LoopAnalysis, IdeaEntry,
+    STAGE_IDEA, STAGE_EXECUTE, STAGE_OUT,
+    SUB_PREPARE, SUB_EXECUTE, SUB_ANALYSIS, SUB_DONE,
+    DELIVERABLE_SCORE, OUTPUTTABLE_SCORE,
+)
 from .auth import AuthGuard
 from .asset_pool import AssetPool
 from . import paths
@@ -242,6 +248,10 @@ class BridgeWS:
         self._backend_store = BackendStore()
         self._skill_store = SkillStore()
         self._prompt_store = PromptStore()
+        # ★ 可视化 Loop 集成：stage 文件存储 + 并发想法池 + 运行去重
+        self._loop_store = LoopStore()
+        self._idea_semaphore = asyncio.Semaphore(3)  # loopidea 阶段最多 3 并发
+        self._loop_running: set[str] = set()         # 正在跑 iteration 的 session
         # ★ 素材中转池：客户端图片/附件在交给 Agent 前先落到这里
         self._asset_pool = AssetPool()
         self._asset_pool.purge_expired()
@@ -1477,13 +1487,19 @@ class BridgeWS:
               file=sys.stderr, flush=True)
         return str(target)
 
-    def _rpc_createSession(self, working_dir: str, backend_id: str) -> str:
+    def _rpc_createSession(self, working_dir: str, backend_id: str,
+                           session_type: str = "normal") -> str:
         resolved_dir = self._resolve_working_dir(working_dir)
+        is_loop = session_type == "loop"
         session = Session(
-            id=new_id(), title="新会话",
+            id=new_id(), title="Loop 会话" if is_loop else "新会话",
             created_at=time.time(), updated_at=time.time(),
             messages=[], working_dir=resolved_dir, backend_id=backend_id,
+            session_type="loop" if is_loop else "normal",
         )
+        # ★ loop 会话：建会话时即落一个 stage 文件（起始阶段 loopidea）
+        if is_loop:
+            self._loop_store.create(session.id)
         # ★ 默认档自动绑定：新建 session 时把被标记为 isDefault 的 Prompt/Skill 全部挂上去
         try:
             defaults = self._default_abilities()
@@ -1588,6 +1604,8 @@ class BridgeWS:
     def _rpc_deleteSession(self, sid: str) -> bool:
         self._active_sessions.pop(sid, None)
         self._instance_manager.delete(sid)
+        self._loop_running.discard(sid)
+        self._loop_store.delete(sid)
         ok = self._session_store.delete(sid)
         if ok:
             self._emit_session_updated({"type": "session_deleted", "sessionId": sid})
@@ -1626,6 +1644,418 @@ class BridgeWS:
             "messageCount": len(new_session.messages),
             "compressedHistory": compressed is not None,
         }, ensure_ascii=False)
+
+    # ── RPC: 可视化 Loop 集成 ────────────────────────────────────
+
+    def _emit_loop_updated(self, state: "LoopState") -> None:
+        """整份 stage 状态变更后广播给所有客户端。"""
+        asyncio.ensure_future(self._broadcast({
+            "event": "loopUpdated",
+            "data": json.dumps(state.to_dict(), ensure_ascii=False),
+        }))
+
+    def _emit_loop_progress(self, session_id: str, seq: int, sub_stage: str,
+                            text: str) -> None:
+        """子阶段流式文本增量，供前端 LoopPanel 实时滚动展示。"""
+        asyncio.ensure_future(self._broadcast({
+            "event": "loopProgress",
+            "data": json.dumps({
+                "sessionId": session_id, "seq": seq,
+                "subStage": sub_stage, "text": text,
+            }, ensure_ascii=False),
+        }))
+
+    @staticmethod
+    def _extract_json_block(text: str) -> Optional[dict]:
+        """从模型回复中抽取最后一个 ```json``` 围栏块（或裸 JSON 对象）。"""
+        import re as _re
+        if not text:
+            return None
+        candidates: list[str] = []
+        # 1) ```json ... ``` 或 ``` ... ``` 围栏
+        for m in _re.finditer(r"```(?:json)?\s*(\{.*?\})\s*```", text, _re.DOTALL):
+            candidates.append(m.group(1))
+        # 2) 兜底：从第一个 { 到最后一个 } 的裸对象
+        if not candidates:
+            start = text.find("{")
+            end = text.rfind("}")
+            if start >= 0 and end > start:
+                candidates.append(text[start:end + 1])
+        for raw in reversed(candidates):
+            try:
+                obj = json.loads(raw)
+                if isinstance(obj, dict):
+                    return obj
+            except Exception:
+                continue
+        return None
+
+    async def _loop_run_agent(self, session: "Session", prompt: str,
+                              sub_stage: str, seq: int,
+                              resume: bool = True,
+                              indep_session_id: Optional[str] = None) -> str:
+        """让会话绑定的 backend 跑一轮，收集全文，并把增量推给 LoopPanel。
+
+        resume=True 时复用 session.agent_session_id 维持 loop 间记忆；
+        indep_session_id 用于 loopidea 阶段的独立一次性想法探索。
+        """
+        backend = self._get_backend(session.backend_id)
+        mid = new_id()
+        sid_for_backend = indep_session_id or session.id
+        parts: list[str] = []
+
+        def on_delta(delta: StreamDelta):
+            if delta.type == "text_delta" and delta.text:
+                parts.append(delta.text)
+                self._emit_loop_progress(session.id, seq, sub_stage, delta.text)
+            elif delta.type == "tool_start" and delta.tool_call:
+                self._emit_loop_progress(
+                    session.id, seq, sub_stage,
+                    f"\n⚙️ {delta.tool_call.get('name', 'tool')}\n",
+                )
+            elif delta.type == "error" and delta.error:
+                self._emit_loop_progress(session.id, seq, sub_stage,
+                                         f"\n❌ {delta.error}\n")
+
+        try:
+            result = await backend.send_message(
+                messages=[], content=prompt, images=None,
+                session_id=sid_for_backend, message_id=mid, on_delta=on_delta,
+                agent_session_id=session.agent_session_id if resume else None,
+                working_dir=session.working_dir,
+                skip_permissions=True,
+                sandbox_enabled=session.sandbox_enabled,
+            )
+            # 真实 backend 返回 camelCase "agentSessionId"；instance_manager 用 snake
+            new_sid = None
+            if isinstance(result, dict):
+                new_sid = result.get("agentSessionId") or result.get("agent_session_id")
+            if resume and new_sid:
+                session.agent_session_id = new_sid
+                self._session_store.save(session, async_=True)
+        except Exception as e:
+            import traceback
+            print(f"[loop] agent turn failed ({sub_stage}): {e}\n{traceback.format_exc()}",
+                  file=sys.stderr, flush=True)
+            self._emit_loop_progress(session.id, seq, sub_stage, f"\n❌ {e}\n")
+        finally:
+            backend.clear_cancelled(sid_for_backend)
+        return "".join(parts)
+
+    def _rpc_loopGetState(self, session_id: str) -> str:
+        state = self._loop_store.load(session_id)
+        if not state:
+            # 兼容：老 loop 会话或刚切换类型时按需补建
+            session = self._active_sessions.get(session_id) or self._session_store.load(session_id)
+            if session and session.session_type == "loop":
+                state = self._loop_store.create(session_id)
+            else:
+                return "null"
+        return json.dumps(state.to_dict(), ensure_ascii=False)
+
+    # ── loopidea：非阻塞想法池 ────────────────────────────────────
+
+    def _rpc_loopSubmitIdea(self, session_id: str, prompt: str) -> str:
+        """投递一条想法（非阻塞）。立即返回 idea，后台并发跑（最多 3）。"""
+        state = self._loop_store.get_or_create(session_id)
+        if state.stage != STAGE_IDEA:
+            return json.dumps({"status": "error", "message": "已离开 loopidea 阶段"}, ensure_ascii=False)
+        idea = IdeaEntry(id=new_id(), prompt=prompt.strip(), status="pending")
+        state.ideas.append(idea)
+        self._loop_store.save(state)
+        self._emit_loop_updated(state)
+        asyncio.ensure_future(self._run_idea_task(session_id, idea.id))
+        return json.dumps({"status": "ok", "ideaId": idea.id}, ensure_ascii=False)
+
+    async def _run_idea_task(self, session_id: str, idea_id: str) -> None:
+        session = self._active_sessions.get(session_id) or self._session_store.load(session_id)
+        if not session:
+            return
+        async with self._idea_semaphore:
+            state = self._loop_store.load(session_id)
+            if not state:
+                return
+            idea = next((i for i in state.ideas if i.id == idea_id), None)
+            if not idea or idea.status not in ("pending",):
+                return
+            idea.status = "running"
+            idea.updated_at = time.time()
+            self._loop_store.save(state)
+            self._emit_loop_updated(state)
+
+            prompt = (
+                "你正在参与一个「Loop 任务」的头脑风暴（loopidea）阶段。"
+                "请围绕下面这条想法做快速、聚焦的可行性展开：给出它要解决的核心问题、"
+                "大致实现路径、潜在风险与可触达性约束，并以一句话给出一个可执行的目标候选。"
+                "保持精炼（200 字以内）。\n\n"
+                f"想法：{idea.prompt}"
+            )
+            text = await self._loop_run_agent(
+                session, prompt, sub_stage="idea", seq=-1,
+                resume=False, indep_session_id=f"{session_id}:idea:{idea_id}",
+            )
+            # 重新载入，避免并发覆盖
+            state = self._loop_store.load(session_id) or state
+            idea = next((i for i in state.ideas if i.id == idea_id), None)
+            if not idea:
+                return
+            if text.strip():
+                idea.status = "done"
+                idea.result = text.strip()
+            else:
+                idea.status = "error"
+                idea.error = "模型无输出"
+            idea.updated_at = time.time()
+            self._loop_store.save(state)
+            self._emit_loop_updated(state)
+
+    def _rpc_loopRemoveIdea(self, session_id: str, idea_id: str) -> str:
+        state = self._loop_store.load(session_id)
+        if not state:
+            return json.dumps({"status": "error", "message": "no loop state"}, ensure_ascii=False)
+        state.ideas = [i for i in state.ideas if i.id != idea_id]
+        self._loop_store.save(state)
+        self._emit_loop_updated(state)
+        return json.dumps({"status": "ok"}, ensure_ascii=False)
+
+    def _rpc_loopSealIdea(self, session_id: str, goal: str = "") -> str:
+        """封口 loopidea，形成全局目标，单向切到 loopexecute。"""
+        state = self._loop_store.load(session_id)
+        if not state:
+            return json.dumps({"status": "error", "message": "no loop state"}, ensure_ascii=False)
+        if state.stage != STAGE_IDEA:
+            return json.dumps({"status": "error", "message": "阶段已推进，无法重复封口"}, ensure_ascii=False)
+        state.goal = (goal or "").strip()
+        state.stage = STAGE_EXECUTE
+        self._loop_store.save(state)
+        self._emit_loop_updated(state)
+        # 没有显式目标时，异步让模型把想法池汇总成一个全局目标
+        if not state.goal:
+            asyncio.ensure_future(self._synthesize_goal(session_id))
+        return json.dumps({"status": "ok", "stage": state.stage}, ensure_ascii=False)
+
+    async def _synthesize_goal(self, session_id: str) -> None:
+        session = self._active_sessions.get(session_id) or self._session_store.load(session_id)
+        state = self._loop_store.load(session_id)
+        if not session or not state:
+            return
+        ideas_text = "\n".join(
+            f"- {i.prompt}" + (f" → {i.result}" if i.result else "")
+            for i in state.ideas if i.status == "done"
+        ) or "\n".join(f"- {i.prompt}" for i in state.ideas)
+        prompt = (
+            "把下面这些头脑风暴想法收敛成一个清晰、可验收的【全局目标】，"
+            "一段话描述最终要交付什么、判断成功的标准是什么。只输出目标本身，不要解释。\n\n"
+            f"{ideas_text}"
+        )
+        text = await self._loop_run_agent(session, prompt, sub_stage="goal", seq=-1, resume=False,
+                                           indep_session_id=f"{session_id}:goal")
+        state = self._loop_store.load(session_id) or state
+        if text.strip() and not state.goal:
+            state.goal = text.strip()
+            self._loop_store.save(state)
+            self._emit_loop_updated(state)
+
+    def _rpc_loopSetGoal(self, session_id: str, goal: str) -> str:
+        state = self._loop_store.load(session_id)
+        if not state:
+            return json.dumps({"status": "error", "message": "no loop state"}, ensure_ascii=False)
+        state.goal = (goal or "").strip()
+        self._loop_store.save(state)
+        self._emit_loop_updated(state)
+        return json.dumps({"status": "ok"}, ensure_ascii=False)
+
+    # ── loopexecute：prepare → execute → analysis ─────────────────
+
+    def _rpc_loopRunIteration(self, session_id: str) -> str:
+        """跑下一次 loop（非阻塞，三个子阶段顺序执行）。"""
+        state = self._loop_store.load(session_id)
+        if not state:
+            return json.dumps({"status": "error", "message": "no loop state"}, ensure_ascii=False)
+        if state.stage != STAGE_EXECUTE:
+            return json.dumps({"status": "error", "message": "当前不在 loopexecute 阶段"}, ensure_ascii=False)
+        if session_id in self._loop_running:
+            return json.dumps({"status": "error", "message": "上一次 loop 仍在进行"}, ensure_ascii=False)
+        asyncio.ensure_future(self._run_loop_iteration(session_id))
+        return json.dumps({"status": "ok"}, ensure_ascii=False)
+
+    async def _run_loop_iteration(self, session_id: str) -> None:
+        session = self._active_sessions.get(session_id) or self._session_store.load(session_id)
+        state = self._loop_store.load(session_id)
+        if not session or not state:
+            return
+        self._loop_running.add(session_id)
+        seq = len(state.loops) + 1
+        record = LoopRecord(seq=seq, sub_stage=SUB_PREPARE)
+        state.loops.append(record)
+        self._loop_store.save(state)
+        self._emit_loop_updated(state)
+
+        history = self._loop_history_brief(state, exclude_seq=seq)
+        try:
+            # ── stage 1: prepare ──
+            prepare_prompt = (
+                f"【全局目标】\n{state.goal or '(未显式给出，自行从上下文推断)'}\n\n"
+                f"【已完成的 loop 简报】\n{history or '（这是第 1 次 loop）'}\n\n"
+                f"现在准备第 {seq} 次 loop。请规划本次 loop：要达成的阶段目标，"
+                "以及把它拆成有序分步（标注每步是顺次 sequential 还是可并发 concurrent，"
+                "明确先做什么后做什么）。最后用如下 JSON 围栏输出（只输出一个 JSON）：\n"
+                "```json\n"
+                '{"goal": "本次loop目标", "orchestration": '
+                '[{"mode": "sequential", "desc": "第一步…"}, {"mode": "concurrent", "desc": "可并发的一步…"}]}\n'
+                "```"
+            )
+            ptext = await self._loop_run_agent(session, prepare_prompt, SUB_PREPARE, seq)
+            pj = self._extract_json_block(ptext) or {}
+            record.goal = (pj.get("goal") or "").strip() or state.goal
+            orch = pj.get("orchestration") or []
+            record.orchestration = [
+                LoopStep(index=i + 1, mode=(s.get("mode") or "sequential"),
+                         desc=(s.get("desc") or "").strip())
+                for i, s in enumerate(orch) if isinstance(s, dict)
+            ]
+            record.sub_stage = SUB_EXECUTE
+            record.updated_at = time.time()
+            self._loop_store.save(state)
+            self._emit_loop_updated(state)
+
+            # ── stage 2: execute ──
+            steps_text = "\n".join(
+                f"{s.index}. [{s.mode}] {s.desc}" for s in record.orchestration
+            ) or "（无显式编排，自行按目标推进）"
+            execute_prompt = (
+                f"现在执行第 {seq} 次 loop。按下面的编排在工作目录内实际推进，"
+                "可以自由使用工具读写文件、运行命令；单步失败由你自行判断如何处理，"
+                "不强制重试。完成后用 2–4 句话总结本次实际做了什么、产出在哪、"
+                "哪些步骤成功 / 失败。\n\n"
+                f"【本次目标】{record.goal}\n【编排】\n{steps_text}"
+            )
+            etext = await self._loop_run_agent(session, execute_prompt, SUB_EXECUTE, seq)
+            record.result = etext.strip()
+            record.sub_stage = SUB_ANALYSIS
+            record.updated_at = time.time()
+            self._loop_store.save(state)
+            self._emit_loop_updated(state)
+
+            # ── stage 3: analysis ──
+            analysis_prompt = (
+                f"对第 {seq} 次 loop 的执行结果做评估，对照【全局目标】：\n{state.goal}\n\n"
+                f"【本次执行结果】\n{record.result or '(无)'}\n\n"
+                "请按以下口径打分与分析，只输出一个 JSON 围栏：\n"
+                "- score: 0–100，完成度（>=70 视为可交付，>=85 视为可输出）\n"
+                "- optimizationPotential: 0–1，下一次 loop 估计还能再提升的空间\n"
+                "- trend: 与历史 loop 相比的趋势（上升 / 平缓 / 受阻）\n"
+                "- challenges: 是否遇到环境/系统/网络可触达性等硬约束\n"
+                "- notes: 简要分析\n"
+                "```json\n"
+                '{"score": 0, "optimizationPotential": 0.0, "trend": "", "challenges": "", "notes": ""}\n'
+                "```"
+            )
+            atext = await self._loop_run_agent(session, analysis_prompt, SUB_ANALYSIS, seq)
+            aj = self._extract_json_block(atext) or {}
+            score = float(aj.get("score", 0) or 0)
+            opt = float(aj.get("optimizationPotential", 0) or 0)
+            analysis = LoopAnalysis(
+                score=score,
+                notes=(aj.get("notes") or "").strip(),
+                trend=(aj.get("trend") or "").strip(),
+                optimization_potential=opt,
+                challenges=(aj.get("challenges") or "").strip(),
+                deliverable=score >= DELIVERABLE_SCORE,
+                outputtable=score >= OUTPUTTABLE_SCORE,
+            )
+            record.analysis = analysis
+            record.completed = True
+            record.sub_stage = SUB_DONE
+            record.updated_at = time.time()
+
+            # ── 风险系数 & 是否进入 loopout ──
+            self._recompute_risk(state)
+            stop, reason = self._loop_should_stop(state)
+            if stop:
+                state.stage = STAGE_OUT
+                state.stop_reason = reason
+                state.status = "output" if analysis.outputtable else (
+                    "delivered" if analysis.deliverable else "aborted")
+            self._loop_store.save(state)
+            self._emit_loop_updated(state)
+        except Exception as e:
+            import traceback
+            print(f"[loop] iteration failed: {e}\n{traceback.format_exc()}",
+                  file=sys.stderr, flush=True)
+            record.error = str(e)
+            record.sub_stage = SUB_DONE
+            self._loop_store.save(state)
+            self._emit_loop_updated(state)
+        finally:
+            self._loop_running.discard(session_id)
+
+    @staticmethod
+    def _loop_history_brief(state: "LoopState", exclude_seq: int) -> str:
+        lines = []
+        for l in state.loops:
+            if l.seq == exclude_seq:
+                continue
+            sc = f"{l.analysis.score:.0f}" if l.analysis else "?"
+            lines.append(f"#{l.seq} 目标:{l.goal[:40]} 分数:{sc} 结果:{(l.result or '')[:60]}")
+        return "\n".join(lines)
+
+    def _recompute_risk(self, state: "LoopState") -> None:
+        """综合风险系数：完成度低 + 遇到硬约束 + 提升乏力 → 升高。"""
+        done = [l for l in state.loops if l.analysis]
+        if not done:
+            return
+        latest = done[-1].analysis
+        risk = state.risk_coefficient
+        # 首次 loop 就低分且有硬约束：显著提升风险（不为不可能任务做无谓 loop）
+        if len(done) == 1 and latest.score < DELIVERABLE_SCORE and latest.challenges:
+            risk += 0.35
+        # 提升空间小：略升（趋于收敛，意义在于进入 out 而非加风险）
+        if latest.optimization_potential < 0.15:
+            risk += 0.05
+        # 趋势上升、分数高：降低风险
+        if latest.score >= DELIVERABLE_SCORE:
+            risk -= 0.1
+        # 历史改进曲线平缓（最近两次提升 < 3 分）：略升
+        if len(done) >= 2 and (done[-1].analysis.score - done[-2].analysis.score) < 3:
+            risk += 0.08
+        state.risk_coefficient = max(0.0, min(1.0, risk))
+
+    def _loop_should_stop(self, state: "LoopState") -> tuple[bool, str]:
+        """是否结束 loopexecute、进入全局 loopout。"""
+        done = [l for l in state.loops if l.analysis]
+        if not done:
+            return False, ""
+        latest = done[-1].analysis
+        # 达到可输出，且后续优化空间小 / 曲线平缓 → 收口
+        flat = len(done) >= 2 and (done[-1].analysis.score - done[-2].analysis.score) < 3
+        if latest.outputtable and (latest.optimization_potential < 0.15 or flat):
+            return True, "已达可输出且优化空间收敛"
+        # 风险过高（任务大概率完不成）→ 止损
+        if state.risk_coefficient >= 0.85:
+            return True, "风险系数过高，停止无谓 loop"
+        # 达到有效最大 loop 上限
+        if len(state.loops) >= state.effective_max_loops():
+            return True, "达到最大 loop 约束"
+        return False, ""
+
+    def _rpc_loopAdvanceToOut(self, session_id: str) -> str:
+        """手动单向推进到 loopout。"""
+        state = self._loop_store.load(session_id)
+        if not state:
+            return json.dumps({"status": "error", "message": "no loop state"}, ensure_ascii=False)
+        if state.stage == STAGE_IDEA:
+            return json.dumps({"status": "error", "message": "请先封口 loopidea"}, ensure_ascii=False)
+        state.stage = STAGE_OUT
+        if state.status == "active":
+            best = state.best_score()
+            state.status = "output" if best >= OUTPUTTABLE_SCORE else (
+                "delivered" if best >= DELIVERABLE_SCORE else "aborted")
+        if not state.stop_reason:
+            state.stop_reason = "手动进入 loopout"
+        self._loop_store.save(state)
+        self._emit_loop_updated(state)
+        return json.dumps({"status": "ok", "stage": state.stage}, ensure_ascii=False)
 
     # ── RPC: 后端配置 ────────────────────────────────────────────
 
