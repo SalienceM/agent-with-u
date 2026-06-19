@@ -1678,11 +1678,24 @@ class BridgeWS:
         self._loop_states[sid] = st
         return st
 
+    def _loop_payload(self, state: "LoopState") -> dict:
+        """序列化 LoopState，并注入运行态字段（to_dict 看不到 _loop_running）。"""
+        d = state.to_dict()
+        running = state.session_id in self._loop_running
+        last = state.loops[-1] if state.loops else None
+        # 可续：最后一条 loop 没跑完、不是错误、当前没在跑、仍在 execute 阶段
+        d["running"] = running
+        d["resumable"] = bool(
+            last and not last.completed and not last.error
+            and not running and state.stage == STAGE_EXECUTE
+        )
+        return d
+
     def _emit_loop_updated(self, state: "LoopState") -> None:
         """整份 stage 状态变更后广播给所有客户端。"""
         asyncio.ensure_future(self._broadcast({
             "event": "loopUpdated",
-            "data": json.dumps(state.to_dict(), ensure_ascii=False),
+            "data": json.dumps(self._loop_payload(state), ensure_ascii=False),
         }))
 
     def _emit_loop_progress(self, session_id: str, seq: int, sub_stage: str,
@@ -1782,7 +1795,7 @@ class BridgeWS:
                 state = self._loop_create(session_id)
             else:
                 return "null"
-        return json.dumps(state.to_dict(), ensure_ascii=False)
+        return json.dumps(self._loop_payload(state), ensure_ascii=False)
 
     # ── loopidea：非阻塞想法池 ────────────────────────────────────
 
@@ -1898,8 +1911,33 @@ class BridgeWS:
 
     # ── loopexecute：prepare → execute → analysis ─────────────────
 
+    @staticmethod
+    def _coerce_bool(v) -> bool:
+        if isinstance(v, bool):
+            return v
+        if isinstance(v, (int, float)):
+            return bool(v)
+        if isinstance(v, str):
+            return v.strip().lower() in ("1", "true", "yes", "on")
+        return False
+
+    def _rpc_loopSetAuto(self, session_id: str, on) -> str:
+        """切换自动连跑。打开后：一次 loop 完成即自动开始下一次，直到收口/取消。"""
+        state = self._loop_state(session_id)
+        if not state:
+            return json.dumps({"status": "error", "message": "no loop state"}, ensure_ascii=False)
+        state.auto = self._coerce_bool(on)
+        self._loop_save(state)
+        self._emit_loop_updated(state)
+        # 打开 auto 且当前空闲、仍在 execute、未到收口 → 立刻续跑
+        if state.auto and state.stage == STAGE_EXECUTE and session_id not in self._loop_running:
+            stop, _ = self._loop_should_stop(state)
+            if not stop:
+                asyncio.ensure_future(self._run_loop_iteration(session_id))
+        return json.dumps({"status": "ok", "auto": state.auto}, ensure_ascii=False)
+
     def _rpc_loopRunIteration(self, session_id: str) -> str:
-        """跑下一次 loop（非阻塞，三个子阶段顺序执行）。"""
+        """跑下一次 loop（非阻塞）；若上一次 loop 未跑完则从断点续跑。"""
         state = self._loop_state(session_id)
         if not state:
             return json.dumps({"status": "error", "message": "no loop state"}, ensure_ascii=False)
@@ -1911,115 +1949,218 @@ class BridgeWS:
         return json.dumps({"status": "ok"}, ensure_ascii=False)
 
     async def _run_loop_iteration(self, session_id: str) -> None:
+        """跑一次完整 loop（resume 断点 or 新开），按 prepare→execute→analysis。
+
+        ★ 每一次 loop 都是冲着全局目标的一次完整尽力执行（不是把任务拆到多个 loop）。
+        ★ 可从中断点续跑（record 未完成则接着它当前 sub_stage 往后做）。
+        """
         session = self._active_sessions.get(session_id) or self._session_store.load(session_id)
         state = self._loop_state(session_id)
         if not session or not state:
             return
+        if session_id in self._loop_running:
+            return
         self._loop_running.add(session_id)
-        seq = len(state.loops) + 1
-        record = LoopRecord(seq=seq, sub_stage=SUB_PREPARE)
-        state.loops.append(record)
-        self._loop_save(state)
-        self._emit_loop_updated(state)
-
-        history = self._loop_history_brief(state, exclude_seq=seq)
+        record: Optional[LoopRecord] = None
         try:
-            # ── stage 1: prepare ──
-            prepare_prompt = (
-                f"【全局目标】\n{state.goal or '(未显式给出，自行从上下文推断)'}\n\n"
-                f"【已完成的 loop 简报】\n{history or '（这是第 1 次 loop）'}\n\n"
-                f"现在准备第 {seq} 次 loop。请规划本次 loop：要达成的阶段目标，"
-                "以及把它拆成有序分步（标注每步是顺次 sequential 还是可并发 concurrent，"
-                "明确先做什么后做什么）。最后用如下 JSON 围栏输出（只输出一个 JSON）：\n"
-                "```json\n"
-                '{"goal": "本次loop目标", "orchestration": '
-                '[{"mode": "sequential", "desc": "第一步…"}, {"mode": "concurrent", "desc": "可并发的一步…"}]}\n'
-                "```"
-            )
-            ptext = await self._loop_run_agent(session, prepare_prompt, SUB_PREPARE, seq)
-            pj = self._extract_json_block(ptext) or {}
-            record.goal = (pj.get("goal") or "").strip() or state.goal
-            orch = pj.get("orchestration") or []
-            record.orchestration = [
-                LoopStep(index=i + 1, mode=(s.get("mode") or "sequential"),
-                         desc=(s.get("desc") or "").strip())
-                for i, s in enumerate(orch) if isinstance(s, dict)
-            ]
-            record.sub_stage = SUB_EXECUTE
-            record.updated_at = time.time()
-            self._loop_save(state)
-            self._emit_loop_updated(state)
+            # resume-or-new：最后一条未完成且非错误 → 续跑它；否则新开
+            last = state.loops[-1] if state.loops else None
+            if last and not last.completed and not last.error:
+                record = last
+            else:
+                record = LoopRecord(seq=len(state.loops) + 1, sub_stage=SUB_PREPARE)
+                state.loops.append(record)
+                self._loop_save(state)
+                self._emit_loop_updated(state)
 
-            # ── stage 2: execute ──
-            steps_text = "\n".join(
-                f"{s.index}. [{s.mode}] {s.desc}" for s in record.orchestration
-            ) or "（无显式编排，自行按目标推进）"
-            execute_prompt = (
-                f"现在执行第 {seq} 次 loop。按下面的编排在工作目录内实际推进，"
-                "可以自由使用工具读写文件、运行命令；单步失败由你自行判断如何处理，"
-                "不强制重试。完成后用 2–4 句话总结本次实际做了什么、产出在哪、"
-                "哪些步骤成功 / 失败。\n\n"
-                f"【本次目标】{record.goal}\n【编排】\n{steps_text}"
-            )
-            etext = await self._loop_run_agent(session, execute_prompt, SUB_EXECUTE, seq)
-            record.result = etext.strip()
-            record.sub_stage = SUB_ANALYSIS
-            record.updated_at = time.time()
-            self._loop_save(state)
-            self._emit_loop_updated(state)
-
-            # ── stage 3: analysis ──
-            analysis_prompt = (
-                f"对第 {seq} 次 loop 的执行结果做评估，对照【全局目标】：\n{state.goal}\n\n"
-                f"【本次执行结果】\n{record.result or '(无)'}\n\n"
-                "请按以下口径打分与分析，只输出一个 JSON 围栏：\n"
-                "- score: 0–100，完成度（>=70 视为可交付，>=85 视为可输出）\n"
-                "- optimizationPotential: 0–1，下一次 loop 估计还能再提升的空间\n"
-                "- trend: 与历史 loop 相比的趋势（上升 / 平缓 / 受阻）\n"
-                "- challenges: 是否遇到环境/系统/网络可触达性等硬约束\n"
-                "- notes: 简要分析\n"
-                "```json\n"
-                '{"score": 0, "optimizationPotential": 0.0, "trend": "", "challenges": "", "notes": ""}\n'
-                "```"
-            )
-            atext = await self._loop_run_agent(session, analysis_prompt, SUB_ANALYSIS, seq)
-            aj = self._extract_json_block(atext) or {}
-            score = float(aj.get("score", 0) or 0)
-            opt = float(aj.get("optimizationPotential", 0) or 0)
-            analysis = LoopAnalysis(
-                score=score,
-                notes=(aj.get("notes") or "").strip(),
-                trend=(aj.get("trend") or "").strip(),
-                optimization_potential=opt,
-                challenges=(aj.get("challenges") or "").strip(),
-                deliverable=score >= DELIVERABLE_SCORE,
-                outputtable=score >= OUTPUTTABLE_SCORE,
-            )
-            record.analysis = analysis
-            record.completed = True
-            record.sub_stage = SUB_DONE
-            record.updated_at = time.time()
-
-            # ── 风险系数 & 是否进入 loopout ──
-            self._recompute_risk(state)
-            stop, reason = self._loop_should_stop(state)
-            if stop:
-                state.stage = STAGE_OUT
-                state.stop_reason = reason
-                state.status = "output" if analysis.outputtable else (
-                    "delivered" if analysis.deliverable else "aborted")
-            self._loop_save(state)
-            self._emit_loop_updated(state)
+            history = self._loop_history_brief(state, exclude_seq=record.seq)
+            order = [SUB_PREPARE, SUB_EXECUTE, SUB_ANALYSIS]
+            start = order.index(record.sub_stage) if record.sub_stage in order else 0
+            for stage in order[start:]:
+                if stage == SUB_PREPARE:
+                    await self._loop_do_prepare(session, state, record, history)
+                elif stage == SUB_EXECUTE:
+                    await self._loop_do_execute(session, state, record)
+                elif stage == SUB_ANALYSIS:
+                    await self._loop_do_analysis(session, state, record)
         except Exception as e:
             import traceback
             print(f"[loop] iteration failed: {e}\n{traceback.format_exc()}",
                   file=sys.stderr, flush=True)
-            record.error = str(e)
-            record.sub_stage = SUB_DONE
-            self._loop_save(state)
-            self._emit_loop_updated(state)
+            if record is not None:
+                record.error = str(e)
+                record.sub_stage = SUB_DONE
+                self._loop_save(state)
+                self._emit_loop_updated(state)
         finally:
             self._loop_running.discard(session_id)
+            self._maybe_autocontinue(session_id)
+
+    async def _loop_do_prepare(self, session, state, record, history) -> None:
+        record.sub_stage = SUB_PREPARE
+        record.updated_at = time.time()
+        self._loop_save(state)
+        self._emit_loop_updated(state)
+        prepare_prompt = (
+            f"【全局目标】\n{state.goal or '(未显式给出，自行从上下文推断)'}\n\n"
+            f"【已完成的 loop 复盘】\n{history or '（这是第 1 次 loop）'}\n\n"
+            f"这是第 {record.seq} 次 loop。**每一次 loop 都是冲着上面这个全局目标的一次完整、"
+            "尽力的执行**（不是把任务切成多个 loop 分阶段做）。请基于历史复盘，规划这一遍"
+            "怎样把全局目标尽可能做到位：把这一遍的工作拆成有序分步，标注每步是顺次"
+            "(sequential) 还是可并发 (concurrent)、先做什么后做什么。goal 字段写这一遍的"
+            "策略/侧重（相对上一遍要改进什么）。只输出一个 JSON 围栏：\n"
+            "```json\n"
+            '{"goal": "这一遍的策略/侧重", "orchestration": '
+            '[{"mode": "sequential", "desc": "第一步…"}, {"mode": "concurrent", "desc": "可并发的一步…"}]}\n'
+            "```"
+        )
+        ptext = await self._loop_run_agent(session, prepare_prompt, SUB_PREPARE, record.seq)
+        pj = self._extract_json_block(ptext) or {}
+        record.goal = (pj.get("goal") or "").strip() or state.goal
+        orch = pj.get("orchestration") or []
+        record.orchestration = [
+            LoopStep(index=i + 1, mode=("concurrent" if (s.get("mode") == "concurrent") else "sequential"),
+                     desc=(s.get("desc") or "").strip())
+            for i, s in enumerate(orch) if isinstance(s, dict)
+        ]
+        record.sub_stage = SUB_EXECUTE
+        record.updated_at = time.time()
+        self._loop_save(state)
+        self._emit_loop_updated(state)
+
+    async def _loop_do_execute(self, session, state, record) -> None:
+        record.sub_stage = SUB_EXECUTE
+        record.updated_at = time.time()
+        self._loop_save(state)
+        self._emit_loop_updated(state)
+        steps = record.orchestration
+        if not steps:
+            # 无显式编排：单轮完整执行
+            prompt = (
+                f"【全局目标】\n{state.goal}\n\n这是第 {record.seq} 次 loop——对全局目标的一次"
+                "完整尽力执行。在工作目录内实际推进（可用工具读写文件、运行命令），单步失败你"
+                "自行判断处理，不强制重试。完成后用 markdown 总结：做了什么、产出/改动在哪、"
+                "哪些成功 / 失败。"
+            )
+            record.result = (await self._loop_run_agent(
+                session, prompt, SUB_EXECUTE, record.seq)).strip()
+        else:
+            # 按编排执行：连续的 concurrent 步并行，sequential 步顺次
+            i = 0
+            while i < len(steps):
+                if steps[i].mode == "concurrent":
+                    j = i
+                    while j < len(steps) and steps[j].mode == "concurrent":
+                        j += 1
+                    batch = [s for s in steps[i:j] if s.status != "done"]
+                    if batch:
+                        await asyncio.gather(*[
+                            self._loop_run_step(session, state, record, s, resume=False)
+                            for s in batch
+                        ])
+                    i = j
+                else:
+                    await self._loop_run_step(session, state, record, steps[i], resume=True)
+                    i += 1
+            # 汇总各步 → 本次执行结果
+            recap = "\n".join(
+                f"{s.index}. [{s.mode}/{s.status}] {s.desc}\n   → {(s.output or '')[:400]}"
+                for s in steps
+            )
+            summary_prompt = (
+                f"以下是第 {record.seq} 次 loop 各分步的执行情况：\n{recap}\n\n"
+                "请把它汇总成一段整体结果说明（整体完成到什么程度、产出/改动在哪、"
+                "哪些步骤成功哪些失败），3–6 句，可用 markdown。"
+            )
+            record.result = (await self._loop_run_agent(
+                session, summary_prompt, SUB_EXECUTE, record.seq)).strip()
+        record.sub_stage = SUB_ANALYSIS
+        record.updated_at = time.time()
+        self._loop_save(state)
+        self._emit_loop_updated(state)
+
+    async def _loop_run_step(self, session, state, record, step, resume: bool) -> None:
+        """执行编排中的一个分步，记录 running→done/error 与产出（持久化以便复盘）。"""
+        if step.status == "done":
+            return
+        step.status = "running"
+        self._loop_save(state)
+        self._emit_loop_updated(state)
+        prompt = (
+            f"【全局目标】\n{state.goal}\n\n这是第 {record.seq} 次完整尝试中的一个分步"
+            f"（模式：{'可并发' if step.mode == 'concurrent' else '顺次'}）。\n"
+            f"【本步任务】{step.desc}\n\n在工作目录内实际执行这一步（可用工具读写文件、"
+            "运行命令）。单步失败你自行判断处理，不强制重试。完成后用 2–4 句话说明："
+            "这一步做了什么、产出/改动在哪、成功还是失败。"
+        )
+        indep = None if resume else f"{session.id}:loop{record.seq}:step{step.index}"
+        text = await self._loop_run_agent(
+            session, prompt, sub_stage=f"step{step.index}", seq=record.seq,
+            resume=resume, indep_session_id=indep,
+        )
+        step.output = text.strip()
+        step.status = "done" if text.strip() else "error"
+        self._loop_save(state)
+        self._emit_loop_updated(state)
+
+    async def _loop_do_analysis(self, session, state, record) -> None:
+        record.sub_stage = SUB_ANALYSIS
+        record.updated_at = time.time()
+        self._loop_save(state)
+        self._emit_loop_updated(state)
+        analysis_prompt = (
+            f"对第 {record.seq} 次 loop（一次冲着全局目标的完整尝试）的执行结果做评估，"
+            f"对照【全局目标】：\n{state.goal}\n\n"
+            f"【本次执行结果】\n{record.result or '(无)'}\n\n"
+            "请按以下口径打分与分析，只输出一个 JSON 围栏：\n"
+            "- score: 0–100，对全局目标的完成度（>=70 可交付，>=85 可输出）\n"
+            "- optimizationPotential: 0–1，再来一遍估计还能提升的空间\n"
+            "- trend: 与历史 loop 相比（上升 / 平缓 / 受阻）\n"
+            "- challenges: 是否遇到环境/系统/网络可触达性等硬约束\n"
+            "- notes: 简要分析（可 markdown）\n"
+            "```json\n"
+            '{"score": 0, "optimizationPotential": 0.0, "trend": "", "challenges": "", "notes": ""}\n'
+            "```"
+        )
+        atext = await self._loop_run_agent(session, analysis_prompt, SUB_ANALYSIS, record.seq)
+        aj = self._extract_json_block(atext) or {}
+        score = float(aj.get("score", 0) or 0)
+        opt = float(aj.get("optimizationPotential", 0) or 0)
+        analysis = LoopAnalysis(
+            score=score,
+            notes=(aj.get("notes") or "").strip(),
+            trend=(aj.get("trend") or "").strip(),
+            optimization_potential=opt,
+            challenges=(aj.get("challenges") or "").strip(),
+            deliverable=score >= DELIVERABLE_SCORE,
+            outputtable=score >= OUTPUTTABLE_SCORE,
+        )
+        record.analysis = analysis
+        record.completed = True
+        record.sub_stage = SUB_DONE
+        record.updated_at = time.time()
+        self._recompute_risk(state)
+        stop, reason = self._loop_should_stop(state)
+        if stop:
+            state.stage = STAGE_OUT
+            state.stop_reason = reason
+            state.status = "output" if analysis.outputtable else (
+                "delivered" if analysis.deliverable else "aborted")
+        self._loop_save(state)
+        self._emit_loop_updated(state)
+
+    def _maybe_autocontinue(self, session_id: str) -> None:
+        """auto 开启且仍在 execute、最后一次 loop 正常完成、未到收口 → 自动续下一次。"""
+        state = self._loop_state(session_id)
+        if not state or not state.auto or state.stage != STAGE_EXECUTE:
+            return
+        last = state.loops[-1] if state.loops else None
+        if not last or not last.completed or last.error:
+            return
+        stop, _ = self._loop_should_stop(state)
+        if stop or session_id in self._loop_running:
+            return
+        asyncio.ensure_future(self._run_loop_iteration(session_id))
 
     @staticmethod
     def _loop_history_brief(state: "LoopState", exclude_seq: int) -> str:

@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import { api } from '../api';
+import { markdownToHtml } from '../utils/markdown';
 
 /**
  * LoopPanel — 可视化 Loop 集成的全屏面板。
@@ -13,7 +14,7 @@ import { api } from '../api';
  * 右上角可切换「Hack 模式」——整份状态以 terminal 风格的等宽文本呈现。
  */
 
-interface LoopStep { index: number; mode: string; desc: string; }
+interface LoopStep { index: number; mode: string; desc: string; status: string; output: string; }
 interface LoopAnalysis {
   score: number; notes: string; trend: string;
   optimizationPotential: number; challenges: string;
@@ -31,6 +32,7 @@ interface LoopStateT {
   riskCoefficient: number; maxLoops: number; effectiveMaxLoops: number;
   status: string; stopReason: string; bestScore: number; latestScore: number;
   asides: AsideTurn[];
+  auto: boolean; running: boolean; resumable: boolean;
 }
 
 const SUB_LABEL: Record<string, string> = {
@@ -94,7 +96,8 @@ export const LoopPanel: React.FC<LoopPanelProps> = ({ sessionId, onClose }) => {
     if (r.status !== 'ok' && r.message) alert(r.message);
   }, [asideInput, asideAnswering, sessionId]);
 
-  const running = state?.loops?.some((l) => !l.completed && !l.error) ?? false;
+  const running = state?.running ?? false;
+  const setAuto = useCallback((on: boolean) => api.loopSetAuto(sessionId, on), [sessionId]);
 
   const submitIdea = useCallback(async () => {
     const text = ideaInput.trim();
@@ -173,7 +176,7 @@ export const LoopPanel: React.FC<LoopPanelProps> = ({ sessionId, onClose }) => {
                   <ExecuteStage
                     state={state} progress={progress}
                     selectedSeq={selectedSeq} setSelectedSeq={setSelectedSeq}
-                    onRun={runIteration} onAdvanceOut={advanceOut}
+                    onRun={runIteration} onAdvanceOut={advanceOut} onSetAuto={setAuto}
                     running={running} busy={busy}
                     goalDraft={goalDraft} setGoalDraft={setGoalDraft} onSaveGoal={saveGoal}
                   />
@@ -429,12 +432,16 @@ const IdeaStage: React.FC<{
 const ExecuteStage: React.FC<{
   state: LoopStateT; progress: Record<string, string>;
   selectedSeq: number | null; setSelectedSeq: (v: number | null) => void;
-  onRun: () => void; onAdvanceOut: () => void; running: boolean; busy: boolean;
+  onRun: () => void; onAdvanceOut: () => void; onSetAuto: (on: boolean) => void;
+  running: boolean; busy: boolean;
   goalDraft: string; setGoalDraft: (v: string) => void; onSaveGoal: () => void;
-}> = ({ state, progress, selectedSeq, setSelectedSeq, onRun, onAdvanceOut, running, busy, goalDraft, setGoalDraft, onSaveGoal }) => {
+}> = ({ state, progress, selectedSeq, setSelectedSeq, onRun, onAdvanceOut, onSetAuto, running, busy, goalDraft, setGoalDraft, onSaveGoal }) => {
   const isOut = state.stage === 'loopout';
   const selected = state.loops.find((l) => l.seq === selectedSeq) || null;
   const [editGoal, setEditGoal] = useState(false);
+  const runLabel = state.resumable
+    ? `▶ 继续未完成的 Loop #${state.loops.length}`
+    : `▶ 运行第 ${state.loops.length + 1} 次 Loop`;
 
   return (
     <div>
@@ -463,11 +470,22 @@ const ExecuteStage: React.FC<{
 
       {/* 操作 */}
       {!isOut && (
-        <div style={{ display: 'flex', gap: 10, marginBottom: 18 }}>
+        <div style={{ display: 'flex', gap: 10, marginBottom: 18, alignItems: 'center', flexWrap: 'wrap' }}>
           <button onClick={onRun} disabled={busy || running} style={{ ...primaryBtn, opacity: (busy || running) ? 0.5 : 1 }}>
-            {running ? '⏳ Loop 进行中…' : `▶ 运行第 ${state.loops.length + 1} 次 Loop`}
+            {running ? '⏳ Loop 进行中…' : runLabel}
+          </button>
+          {/* ★ 自动连跑开关：开则一次 loop 完成自动续下一次，可随时取消 */}
+          <button
+            onClick={() => onSetAuto(!state.auto)}
+            style={{ ...btn, ...(state.auto ? { background: '#2da44e1f', color: '#2da44e', borderColor: '#2da44e55' } : {}) }}
+            title="自动连跑：开启后一次 loop 完成即自动开始下一次，直到收口或你取消"
+          >
+            {state.auto ? '🔄 Auto 连跑中（点此暂停）' : '⏸ Auto 关（点此自动连跑）'}
           </button>
           <button onClick={onAdvanceOut} disabled={busy} style={btn}>⏹ 进入 loopout</button>
+          {state.auto && running && (
+            <span style={{ fontSize: 12, color: 'var(--theme-text-muted)' }}>完成本次后将自动继续…</span>
+          )}
         </div>
       )}
       {isOut && state.stopReason && (
@@ -521,7 +539,58 @@ const LoopNode: React.FC<{ loop: LoopRecord; selected: boolean; onClick: () => v
       <div style={{ fontSize: 11, color: 'var(--theme-text-muted)' }}>
         {loop.error ? '❌ 失败' : loop.completed ? '✓ 完成' : `${SUB_LABEL[loop.subStage] || loop.subStage}…`}
       </div>
+      {loop.orchestration.length > 0 && !loop.completed && (
+        <div style={{ fontSize: 10, color: 'var(--theme-text-muted)', marginTop: 3 }}>
+          步骤 {loop.orchestration.filter((s) => s.status === 'done').length}/{loop.orchestration.length}
+          {loop.orchestration.some((s) => s.status === 'running') && ' · 执行中'}
+        </div>
+      )}
       {loop.goal && <div style={{ fontSize: 11, color: 'var(--theme-text-muted)', marginTop: 4, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{loop.goal}</div>}
+    </div>
+  );
+};
+
+// 把编排步按「连续 concurrent 归并为一个并行组、sequential 各自成组」分组
+function groupSteps(steps: LoopStep[]): LoopStep[][] {
+  const groups: LoopStep[][] = [];
+  let i = 0;
+  while (i < steps.length) {
+    if (steps[i].mode === 'concurrent') {
+      const g: LoopStep[] = [];
+      while (i < steps.length && steps[i].mode === 'concurrent') { g.push(steps[i]); i++; }
+      groups.push(g);
+    } else {
+      groups.push([steps[i]]); i++;
+    }
+  }
+  return groups;
+}
+
+const STEP_ICON: Record<string, string> = { pending: '○', running: '⏳', done: '✓', error: '✗' };
+const STEP_COLOR: Record<string, string> = { pending: 'var(--theme-text-muted)', running: '#0969da', done: '#2da44e', error: '#f87171' };
+
+const StepRow: React.FC<{ step: LoopStep; live?: string }> = ({ step, live }) => {
+  const [open, setOpen] = useState(false);
+  const body = step.status === 'running' && live ? live : step.output;
+  return (
+    <div style={{ marginBottom: 6 }}>
+      <div
+        onClick={() => (body ? setOpen(!open) : undefined)}
+        style={{ display: 'flex', alignItems: 'baseline', gap: 6, cursor: body ? 'pointer' : 'default' }}
+      >
+        <span style={{ color: STEP_COLOR[step.status] || 'var(--theme-text-muted)', fontSize: 13,
+          animation: step.status === 'running' ? 'awu-loop-pulse 1.2s infinite' : 'none' }}>
+          {STEP_ICON[step.status] || '○'}
+        </span>
+        <span style={{ fontSize: 11, color: STEP_COLOR[step.status], minWidth: 42 }}>{step.status}</span>
+        <span style={{ fontSize: 13, color: 'var(--theme-text)', flex: 1 }}>{step.index}. {step.desc}</span>
+        {body && <span style={{ fontSize: 11, color: 'var(--theme-text-muted)' }}>{open ? '收起' : '展开'}</span>}
+      </div>
+      {open && body && (
+        step.status === 'running'
+          ? <div style={{ marginLeft: 22, marginTop: 4 }}><Live text={body} /></div>
+          : <div style={{ marginLeft: 22, marginTop: 4, background: 'var(--theme-code-bg)', borderRadius: 6, padding: '6px 10px' }}><Md text={body} /></div>
+      )}
     </div>
   );
 };
@@ -530,6 +599,7 @@ const LoopDetail: React.FC<{ loop: LoopRecord; progress: Record<string, string>;
   const liveExec = progress[`${loop.seq}:execute`];
   const livePrep = progress[`${loop.seq}:prepare`];
   const liveAna = progress[`${loop.seq}:analysis`];
+  const groups = groupSteps(loop.orchestration);
   return (
     <div style={{ ...sealBox, marginTop: 4 }}>
       <div style={{ display: 'flex', alignItems: 'center', marginBottom: 10 }}>
@@ -538,28 +608,26 @@ const LoopDetail: React.FC<{ loop: LoopRecord; progress: Record<string, string>;
         <button onClick={onClose} style={miniX}>✕</button>
       </div>
 
-      <Section title="本次目标">{loop.goal || '—'}</Section>
+      <Section title="本遍策略 / 侧重">{loop.goal ? <Md text={loop.goal} /> : '—'}</Section>
 
-      <Section title="编排（顺次 / 并发）">
+      <Section title="编排与分步执行（点步可展开产出）">
         {loop.orchestration.length === 0 ? (livePrep ? <Live text={livePrep} /> : '—') : (
-          <ol style={{ margin: 0, paddingLeft: 18 }}>
-            {loop.orchestration.map((s) => (
-              <li key={s.index} style={{ fontSize: 13, marginBottom: 4, color: 'var(--theme-text)' }}>
-                <span style={{
-                  fontSize: 10, padding: '1px 6px', borderRadius: 8, marginRight: 6,
-                  background: s.mode === 'concurrent' ? '#8957e51f' : '#2da44e1f',
-                  color: s.mode === 'concurrent' ? '#8957e5' : '#2da44e',
-                  border: `1px solid ${s.mode === 'concurrent' ? '#8957e555' : '#2da44e55'}`,
-                }}>{s.mode === 'concurrent' ? '并发' : '顺次'}</span>
-                {s.desc}
-              </li>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+            {groups.map((g, gi) => g.length > 1 ? (
+              // 并行组：左侧竖条 + 「并行」标识
+              <div key={gi} style={{ borderLeft: '3px solid #8957e5', paddingLeft: 10, background: '#8957e50d', borderRadius: 6, padding: '6px 10px' }}>
+                <div style={{ fontSize: 11, fontWeight: 700, color: '#8957e5', marginBottom: 4 }}>⚡ 并行执行（{g.length} 步同时）</div>
+                {g.map((s) => <StepRow key={s.index} step={s} live={progress[`${loop.seq}:step${s.index}`]} />)}
+              </div>
+            ) : (
+              <div key={gi}><StepRow step={g[0]} live={progress[`${loop.seq}:step${g[0].index}`]} /></div>
             ))}
-          </ol>
+          </div>
         )}
       </Section>
 
-      <Section title="执行结果">
-        {loop.result ? <div style={{ whiteSpace: 'pre-wrap', fontSize: 13, lineHeight: 1.6, color: 'var(--theme-text)' }}>{loop.result}</div>
+      <Section title="本次执行结果">
+        {loop.result ? <Md text={loop.result} />
           : liveExec ? <Live text={liveExec} /> : '—'}
       </Section>
 
@@ -572,7 +640,7 @@ const LoopDetail: React.FC<{ loop: LoopRecord; progress: Record<string, string>;
               优化空间 {(loop.analysis.optimizationPotential * 100).toFixed(0)}% · 趋势 {loop.analysis.trend || '—'}
             </span>
           </div>
-          {loop.analysis.notes && <div style={{ fontSize: 13, lineHeight: 1.6, color: 'var(--theme-text)', whiteSpace: 'pre-wrap' }}>{loop.analysis.notes}</div>}
+          {loop.analysis.notes && <Md text={loop.analysis.notes} />}
           {loop.analysis.challenges && <div style={{ fontSize: 12, color: '#bf8700', marginTop: 6 }}>⚠ 约束：{loop.analysis.challenges}</div>}
         </Section>
       ) : liveAna ? <Section title="Execute Analysis（进行中）"><Live text={liveAna} /></Section> : null}
@@ -595,6 +663,12 @@ const Live: React.FC<{ text: string }> = ({ text }) => (
     color: 'var(--theme-text-muted)', maxHeight: 200, overflow: 'auto',
     background: 'var(--theme-code-bg)', borderRadius: 6, padding: 8,
   }}>{text}<span style={{ animation: 'awu-loop-pulse 1s infinite' }}>▋</span></div>
+);
+
+// markdown 渲染（复用全站 .md-content 样式 + markdownToHtml）
+const Md: React.FC<{ text: string }> = ({ text }) => (
+  <div className="md-content" style={{ fontSize: 13, lineHeight: 1.6, color: 'var(--theme-text)' }}
+    dangerouslySetInnerHTML={{ __html: markdownToHtml(text) }} />
 );
 
 // ══ Hack / terminal view ══════════════════════════════════════

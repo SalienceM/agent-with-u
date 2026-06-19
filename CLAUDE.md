@@ -232,12 +232,20 @@ The global stage advances one-way: `loopidea → loopexecute → loopout`.
   runs them through a concurrency pool (`asyncio.Semaphore(3)`), each idea an
   independent one-shot agent turn. Sealing forms the **global goal** and switches
   to `loopexecute`.
-- **loopexecute** — each iteration (`LoopRecord`, numbered by `seq`) runs three
-  sub-stages driven by structured prompts: `prepare` (plan + orchestration of
-  sequential/concurrent steps), `execute` (carry out in the working dir, no
-  per-step retry constraint), `analysis` (score 0–100 vs the global goal). Score
-  ≥70 = deliverable, ≥85 = outputtable. A composite **risk coefficient** (0–1)
-  caps the effective max loops to avoid pointless iteration on infeasible tasks.
+- **loopexecute** — each iteration (`LoopRecord`, numbered by `seq`) is **one
+  complete, best-effort attempt at the whole global goal** (NOT a phase/subtask —
+  the task is not split across loops). It runs three sub-stages: `prepare` (plan
+  this pass's strategy + orchestration of steps), `execute` (run the steps —
+  consecutive `concurrent` steps go in parallel via `asyncio.gather`, `sequential`
+  steps in order; each `LoopStep` tracks `status` pending→running→done/error and
+  persists its `output` for replay), `analysis` (score 0–100 vs the global goal).
+  Score ≥70 = deliverable, ≥85 = outputtable. A composite **risk coefficient**
+  (0–1) caps the effective max loops. **Auto-continue** (`loopSetAuto`): when on,
+  a finished loop auto-starts the next until stop/cancel. **Resume**: state is
+  persisted per sub-stage and per step, so an interrupted loop is `resumable` —
+  `loopRunIteration` continues the last unfinished `LoopRecord` from its breakpoint
+  (skipping already-done steps) instead of starting a new one. The serialized
+  payload carries `running` / `resumable` (injected by `_loop_payload`).
 - **loopout** — global output stage (auto-entered when outputtable + optimization
   potential is low / improvement curve flattens / risk too high / max loops hit;
   or manually).
@@ -264,8 +272,8 @@ whole-file overwrites and concurrent aside appends share one object and don't
 clobber each other.
 
 Loop RPCs: `loopGetState`, `loopSubmitIdea`, `loopRemoveIdea`, `loopSealIdea`,
-`loopSetGoal`, `loopRunIteration`, `loopAdvanceToOut`, `loopAsk`. `createSession`
-takes an optional third `session_type` argument.
+`loopSetGoal`, `loopRunIteration`, `loopSetAuto`, `loopAdvanceToOut`, `loopAsk`.
+`createSession` takes an optional third `session_type` argument.
 
 ### Slash Commands
 

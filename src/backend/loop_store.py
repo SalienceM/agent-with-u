@@ -57,9 +57,12 @@ class LoopStep:
     index: int
     mode: str = "sequential"   # "sequential" | "concurrent"
     desc: str = ""
+    status: str = "pending"    # pending | running | done | error
+    output: str = ""           # 该步执行产出（持久化，用于复盘）
 
     def to_dict(self) -> dict:
-        return {"index": self.index, "mode": self.mode, "desc": self.desc}
+        return {"index": self.index, "mode": self.mode, "desc": self.desc,
+                "status": self.status, "output": self.output}
 
     @classmethod
     def from_dict(cls, d: dict) -> "LoopStep":
@@ -67,6 +70,8 @@ class LoopStep:
             index=int(d.get("index", 0)),
             mode=d.get("mode", "sequential"),
             desc=d.get("desc", ""),
+            status=d.get("status", "pending"),
+            output=d.get("output", ""),
         )
 
 
@@ -232,6 +237,7 @@ class LoopState:
     loops: list[LoopRecord] = field(default_factory=list)
     risk_coefficient: float = 0.3       # 0..1 综合风险系数
     max_loops: int = 8                  # 基础最大 loop 约束
+    auto: bool = False                  # 自动连跑：一次 loop 完成后自动开始下一次
     status: str = "active"              # active | delivered | output | aborted
     stop_reason: str = ""               # 触发 loopout / 终止的原因
     asides: list[AsideTurn] = field(default_factory=list)  # by the way 旁路问答
@@ -261,6 +267,7 @@ class LoopState:
             "riskCoefficient": self.risk_coefficient,
             "maxLoops": self.max_loops,
             "effectiveMaxLoops": self.effective_max_loops(),
+            "auto": self.auto,
             "status": self.status,
             "stopReason": self.stop_reason,
             "asides": [a.to_dict() for a in self.asides],
@@ -280,6 +287,7 @@ class LoopState:
             loops=[LoopRecord.from_dict(l) for l in d.get("loops", [])],
             risk_coefficient=float(d.get("riskCoefficient", 0.3)),
             max_loops=int(d.get("maxLoops", 8)),
+            auto=bool(d.get("auto", False)),
             status=d.get("status", "active"),
             stop_reason=d.get("stopReason", ""),
             asides=[AsideTurn.from_dict(a) for a in d.get("asides", [])],

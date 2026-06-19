@@ -657,6 +657,11 @@ export const api = {
     try { return JSON.parse(result); } catch { return { status: 'error', message: '响应解析失败' }; }
   },
 
+  async loopSetAuto(sessionId: string, on: boolean): Promise<{ status: string; auto?: boolean }> {
+    const result = await call('loopSetAuto', sessionId, on);
+    try { return JSON.parse(result); } catch { return { status: 'error' }; }
+  },
+
   async loopAdvanceToOut(sessionId: string): Promise<{ status: string; stage?: string; message?: string }> {
     const result = await call('loopAdvanceToOut', sessionId);
     try { return JSON.parse(result); } catch { return { status: 'error', message: '响应解析失败' }; }
@@ -1232,6 +1237,7 @@ function mockDispatch(method: string, params: any[]): any {
     case 'loopSealIdea': return JSON.stringify({ status: 'error', message: 'mock mode' });
     case 'loopSetGoal': return JSON.stringify({ status: 'ok' });
     case 'loopRunIteration': return JSON.stringify({ status: 'error', message: 'mock mode' });
+    case 'loopSetAuto': return JSON.stringify({ status: 'ok', auto: !!params[1] });
     case 'loopAdvanceToOut': return JSON.stringify({ status: 'error', message: 'mock mode' });
     case 'loopAsk': return JSON.stringify({ status: 'error', message: 'mock mode' });
     case 'listSessions': return '[]';
