@@ -271,9 +271,18 @@ Loop state is read/written through a process-level singleton cache
 whole-file overwrites and concurrent aside appends share one object and don't
 clobber each other.
 
+**Addons (执行中补充).** `loopAddAddon` / `loopRemoveAddon` let the user queue
+supplementary requirements while a loop runs — they do **not** affect the current
+loop. Pending addons are folded into the **next** loop's `analysis` (for trend /
+planning) and `prepare` (where they're consumed: marked `applied` with the
+`seq` that incorporated them). Pending addons are freely add/removable until
+consumed; applied ones remain as struck-through history. Shown in a dedicated
+addon panel in the LoopPanel.
+
 Loop RPCs: `loopGetState`, `loopSubmitIdea`, `loopRemoveIdea`, `loopSealIdea`,
-`loopSetGoal`, `loopRunIteration`, `loopSetAuto`, `loopAdvanceToOut`, `loopAsk`.
-`createSession` takes an optional third `session_type` argument.
+`loopSetGoal`, `loopRunIteration`, `loopSetAuto`, `loopAdvanceToOut`, `loopAsk`,
+`loopAddAddon`, `loopRemoveAddon`. `createSession` takes an optional third
+`session_type` argument.
 
 ### Slash Commands
 

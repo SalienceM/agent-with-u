@@ -673,6 +673,17 @@ export const api = {
     try { return JSON.parse(result); } catch { return { status: 'error', message: '响应解析失败' }; }
   },
 
+  /** 执行中补充要求（addon）：不影响当前 loop，下一次 loop 的 analysis/prepare 纳入。 */
+  async loopAddAddon(sessionId: string, text: string): Promise<{ status: string; addonId?: string; message?: string }> {
+    const result = await call('loopAddAddon', sessionId, text);
+    try { return JSON.parse(result); } catch { return { status: 'error', message: '响应解析失败' }; }
+  },
+
+  async loopRemoveAddon(sessionId: string, addonId: string): Promise<{ status: string }> {
+    const result = await call('loopRemoveAddon', sessionId, addonId);
+    try { return JSON.parse(result); } catch { return { status: 'error' }; }
+  },
+
   onLoopAsideDelta(cb: LoopAsideDeltaCallback): () => void {
     loopAsideDeltaCallbacks.push(cb);
     return () => { loopAsideDeltaCallbacks = loopAsideDeltaCallbacks.filter((c) => c !== cb); };
@@ -1240,6 +1251,8 @@ function mockDispatch(method: string, params: any[]): any {
     case 'loopSetAuto': return JSON.stringify({ status: 'ok', auto: !!params[1] });
     case 'loopAdvanceToOut': return JSON.stringify({ status: 'error', message: 'mock mode' });
     case 'loopAsk': return JSON.stringify({ status: 'error', message: 'mock mode' });
+    case 'loopAddAddon': return JSON.stringify({ status: 'error', message: 'mock mode' });
+    case 'loopRemoveAddon': return JSON.stringify({ status: 'ok' });
     case 'listSessions': return '[]';
     case 'listConnectedClients': return '[]';
     case 'loadSession': return 'null';

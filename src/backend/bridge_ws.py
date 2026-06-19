@@ -39,7 +39,7 @@ from .app_config_store import AppConfigStore
 from .skill_store import SkillStore
 from .prompt_store import PromptStore
 from .loop_store import (
-    LoopStore, LoopState, LoopRecord, LoopStep, LoopAnalysis, IdeaEntry, AsideTurn,
+    LoopStore, LoopState, LoopRecord, LoopStep, LoopAnalysis, IdeaEntry, AsideTurn, Addon,
     STAGE_IDEA, STAGE_EXECUTE, STAGE_OUT,
     SUB_PREPARE, SUB_EXECUTE, SUB_ANALYSIS, SUB_DONE,
     DELIVERABLE_SCORE, OUTPUTTABLE_SCORE,
@@ -1909,6 +1909,42 @@ class BridgeWS:
         self._emit_loop_updated(state)
         return json.dumps({"status": "ok"}, ensure_ascii=False)
 
+    # ── addon：执行中补充要求（不影响当前 loop，下一次 loop 纳入并完成）──
+
+    def _rpc_loopAddAddon(self, session_id: str, text: str) -> str:
+        """随手补充一条要求。不打断当前 loop；下一次 loop 的 analysis / prepare 会带上。"""
+        t = (text or "").strip()
+        if not t:
+            return json.dumps({"status": "error", "message": "内容为空"}, ensure_ascii=False)
+        state = self._loop_state(session_id)
+        if not state:
+            return json.dumps({"status": "error", "message": "no loop state"}, ensure_ascii=False)
+        addon = Addon(id=new_id(), text=t, status="pending")
+        state.addons.append(addon)
+        self._loop_save(state)
+        self._emit_loop_updated(state)
+        return json.dumps({"status": "ok", "addonId": addon.id}, ensure_ascii=False)
+
+    def _rpc_loopRemoveAddon(self, session_id: str, addon_id: str) -> str:
+        """删除补充。仅允许删尚未纳入（pending）的；已纳入的作为历史保留。"""
+        state = self._loop_state(session_id)
+        if not state:
+            return json.dumps({"status": "error", "message": "no loop state"}, ensure_ascii=False)
+        before = len(state.addons)
+        state.addons = [a for a in state.addons
+                        if not (a.id == addon_id and a.status == "pending")]
+        if len(state.addons) != before:
+            self._loop_save(state)
+            self._emit_loop_updated(state)
+        return json.dumps({"status": "ok"}, ensure_ascii=False)
+
+    @staticmethod
+    def _pending_addons_text(state: "LoopState") -> str:
+        pend = [a for a in state.addons if a.status == "pending"]
+        if not pend:
+            return ""
+        return "\n".join(f"- {a.text}" for a in pend)
+
     # ── loopexecute：prepare → execute → analysis ─────────────────
 
     @staticmethod
@@ -2001,9 +2037,18 @@ class BridgeWS:
         record.updated_at = time.time()
         self._loop_save(state)
         self._emit_loop_updated(state)
+        # ★ 纳入执行过程中累积的补充要求（addon），并在 prepare 时消费（标记 applied）
+        pending = [a for a in state.addons if a.status == "pending"]
+        addon_text = "\n".join(f"- {a.text}" for a in pending)
+        addon_block = (
+            f"\n【需要纳入并完成的补充要求 addon】\n{addon_text}\n"
+            "请把这些补充要求一并纳入这一遍的编排并设法完成。\n"
+            if addon_text else ""
+        )
         prepare_prompt = (
             f"【全局目标】\n{state.goal or '(未显式给出，自行从上下文推断)'}\n\n"
-            f"【已完成的 loop 复盘】\n{history or '（这是第 1 次 loop）'}\n\n"
+            f"【已完成的 loop 复盘】\n{history or '（这是第 1 次 loop）'}\n"
+            f"{addon_block}\n"
             f"这是第 {record.seq} 次 loop。**每一次 loop 都是冲着上面这个全局目标的一次完整、"
             "尽力的执行**（不是把任务切成多个 loop 分阶段做）。请基于历史复盘，规划这一遍"
             "怎样把全局目标尽可能做到位：把这一遍的工作拆成有序分步，标注每步是顺次"
@@ -2015,6 +2060,11 @@ class BridgeWS:
             "```"
         )
         ptext = await self._loop_run_agent(session, prepare_prompt, SUB_PREPARE, record.seq)
+        # 消费这些 addon：标记为已纳入本次 loop
+        for a in pending:
+            a.status = "applied"
+            a.applied_seq = record.seq
+            a.updated_at = time.time()
         pj = self._extract_json_block(ptext) or {}
         record.goal = (pj.get("goal") or "").strip() or state.goal
         orch = pj.get("orchestration") or []
@@ -2108,10 +2158,18 @@ class BridgeWS:
         record.updated_at = time.time()
         self._loop_save(state)
         self._emit_loop_updated(state)
+        # ★ analysis 也带上当前待纳入的补充要求（addon），让评分/趋势/后续规划把它们考虑进去
+        addon_text = self._pending_addons_text(state)
+        addon_block = (
+            f"\n【执行过程中新增、尚待纳入的补充要求 addon】\n{addon_text}\n"
+            "评估趋势与后续规划时请把这些补充要求纳入考量（它们将在下一次 loop 完成）。\n"
+            if addon_text else ""
+        )
         analysis_prompt = (
             f"对第 {record.seq} 次 loop（一次冲着全局目标的完整尝试）的执行结果做评估，"
             f"对照【全局目标】：\n{state.goal}\n\n"
-            f"【本次执行结果】\n{record.result or '(无)'}\n\n"
+            f"【本次执行结果】\n{record.result or '(无)'}\n"
+            f"{addon_block}\n"
             "请按以下口径打分与分析，只输出一个 JSON 围栏：\n"
             "- score: 0–100，对全局目标的完成度（>=70 可交付，>=85 可输出）\n"
             "- optimizationPotential: 0–1，再来一遍估计还能提升的空间\n"

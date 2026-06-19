@@ -26,12 +26,14 @@ interface LoopRecord {
 }
 interface IdeaEntry { id: string; prompt: string; status: string; result: string; error: string; }
 interface AsideTurn { id: string; question: string; answer: string; status: string; stage: string; seq: number; }
+interface Addon { id: string; text: string; status: string; appliedSeq: number; }
 interface LoopStateT {
   sessionId: string; stage: string; goal: string;
   ideas: IdeaEntry[]; loops: LoopRecord[];
   riskCoefficient: number; maxLoops: number; effectiveMaxLoops: number;
   status: string; stopReason: string; bestScore: number; latestScore: number;
   asides: AsideTurn[];
+  addons: Addon[];
   auto: boolean; running: boolean; resumable: boolean;
 }
 
@@ -98,6 +100,8 @@ export const LoopPanel: React.FC<LoopPanelProps> = ({ sessionId, onClose }) => {
 
   const running = state?.running ?? false;
   const setAuto = useCallback((on: boolean) => api.loopSetAuto(sessionId, on), [sessionId]);
+  const addAddon = useCallback((text: string) => api.loopAddAddon(sessionId, text), [sessionId]);
+  const removeAddon = useCallback((id: string) => api.loopRemoveAddon(sessionId, id), [sessionId]);
 
   const submitIdea = useCallback(async () => {
     const text = ideaInput.trim();
@@ -177,6 +181,7 @@ export const LoopPanel: React.FC<LoopPanelProps> = ({ sessionId, onClose }) => {
                     state={state} progress={progress}
                     selectedSeq={selectedSeq} setSelectedSeq={setSelectedSeq}
                     onRun={runIteration} onAdvanceOut={advanceOut} onSetAuto={setAuto}
+                    onAddAddon={addAddon} onRemoveAddon={removeAddon}
                     running={running} busy={busy}
                     goalDraft={goalDraft} setGoalDraft={setGoalDraft} onSaveGoal={saveGoal}
                   />
@@ -428,14 +433,66 @@ const IdeaStage: React.FC<{
   );
 };
 
+// ══ Addon 面板（执行中补充要求）═══════════════════════════════
+const AddonPanel: React.FC<{
+  addons: Addon[]; onAdd: (text: string) => void; onRemove: (id: string) => void;
+}> = ({ addons, onAdd, onRemove }) => {
+  const [text, setText] = useState('');
+  const pending = addons.filter((a) => a.status === 'pending');
+  const applied = addons.filter((a) => a.status === 'applied');
+  const submit = () => { const t = text.trim(); if (!t) return; setText(''); onAdd(t); };
+  return (
+    <div style={{ ...sealBox, marginBottom: 16, borderColor: pending.length ? '#bf870055' : 'var(--theme-border)' }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6 }}>
+        <span style={{ fontSize: 13, fontWeight: 700, color: 'var(--theme-text)' }}>📌 执行中补充 (addon)</span>
+        {pending.length > 0 && (
+          <span style={{ fontSize: 11, padding: '1px 8px', borderRadius: 10, background: '#bf87001f', color: '#bf8700', border: '1px solid #bf870055' }}>
+            {pending.length} 条待纳入
+          </span>
+        )}
+      </div>
+      <div style={{ fontSize: 11, color: 'var(--theme-text-muted)', marginBottom: 8, lineHeight: 1.5 }}>
+        随手补充要求 —— <b>不影响当前正在跑的 loop</b>；下一次 loop 的分析与规划会带上并设法完成。纳入前可随时增删。
+      </div>
+      <div style={{ display: 'flex', gap: 8, marginBottom: pending.length || applied.length ? 10 : 0 }}>
+        <input
+          value={text}
+          onChange={(e) => setText(e.target.value)}
+          onKeyDown={(e) => { if (e.key === 'Enter') submit(); }}
+          placeholder="补充一条要求 / 修正…（Enter 添加）"
+          style={{ ...inputBase, flex: 1 }}
+        />
+        <button onClick={submit} disabled={!text.trim()} style={{ ...btn, opacity: text.trim() ? 1 : 0.5 }}>＋ 添加</button>
+      </div>
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+        {pending.map((a) => (
+          <div key={a.id} style={{ display: 'flex', alignItems: 'flex-start', gap: 8, padding: '6px 10px', borderRadius: 8, background: '#bf87000d', border: '1px solid #bf870033' }}>
+            <span style={{ fontSize: 12, color: '#bf8700', marginTop: 1 }}>●</span>
+            <span style={{ flex: 1, fontSize: 13, color: 'var(--theme-text)', whiteSpace: 'pre-wrap' }}>{a.text}</span>
+            <button onClick={() => onRemove(a.id)} style={miniX} title="删除">✕</button>
+          </div>
+        ))}
+        {applied.map((a) => (
+          <div key={a.id} style={{ display: 'flex', alignItems: 'flex-start', gap: 8, padding: '5px 10px', borderRadius: 8, opacity: 0.6 }}>
+            <span style={{ fontSize: 11, color: '#2da44e', marginTop: 1 }}>✓</span>
+            <span style={{ flex: 1, fontSize: 12.5, color: 'var(--theme-text-muted)', textDecoration: 'line-through', whiteSpace: 'pre-wrap' }}>{a.text}</span>
+            <span style={{ fontSize: 10, color: 'var(--theme-text-muted)', whiteSpace: 'nowrap' }}>已纳入 #{a.appliedSeq}</span>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+};
+
 // ══ Execute stage ═════════════════════════════════════════════
 const ExecuteStage: React.FC<{
   state: LoopStateT; progress: Record<string, string>;
   selectedSeq: number | null; setSelectedSeq: (v: number | null) => void;
   onRun: () => void; onAdvanceOut: () => void; onSetAuto: (on: boolean) => void;
+  onAddAddon: (text: string) => void; onRemoveAddon: (id: string) => void;
   running: boolean; busy: boolean;
   goalDraft: string; setGoalDraft: (v: string) => void; onSaveGoal: () => void;
-}> = ({ state, progress, selectedSeq, setSelectedSeq, onRun, onAdvanceOut, onSetAuto, running, busy, goalDraft, setGoalDraft, onSaveGoal }) => {
+}> = ({ state, progress, selectedSeq, setSelectedSeq, onRun, onAdvanceOut, onSetAuto, onAddAddon, onRemoveAddon, running, busy, goalDraft, setGoalDraft, onSaveGoal }) => {
   const isOut = state.stage === 'loopout';
   const selected = state.loops.find((l) => l.seq === selectedSeq) || null;
   const [editGoal, setEditGoal] = useState(false);
@@ -493,6 +550,9 @@ const ExecuteStage: React.FC<{
           ⏹ 收口原因：{state.stopReason}
         </div>
       )}
+
+      {/* ★ 执行中补充（addon）：不影响当前 loop，下一次 loop 纳入并完成 */}
+      {!isOut && <AddonPanel addons={state.addons || []} onAdd={onAddAddon} onRemove={onRemoveAddon} />}
 
       {/* Loop 时间轴 */}
       <div style={{ display: 'flex', gap: 10, overflowX: 'auto', paddingBottom: 12, marginBottom: 8 }}>
@@ -720,6 +780,12 @@ function renderHack(s: LoopStateT, progress: Record<string, string>): string {
     } else if (liveA) { L.push('  ana~:'); liveA.split('\n').slice(-8).forEach((r) => L.push(`    ${r}`)); }
     if (l.error) L.push(`  ! ${l.error}`);
   });
+  const pend = (s.addons || []).filter((a) => a.status === 'pending');
+  if (pend.length) {
+    L.push('');
+    L.push('# ADDON (待纳入下一次 loop)');
+    pend.forEach((a) => L.push(`  + ${a.text}`));
+  }
   if (s.asides && s.asides.length) {
     L.push('');
     L.push('# BY THE WAY (旁路，不污染主线)');

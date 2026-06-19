@@ -228,6 +228,36 @@ class AsideTurn:
 
 
 @dataclass
+class Addon:
+    """执行过程中随手补充的要求（addon）。不影响当前 loop；
+    在 loop 结束的 analysis 与下一次 loop 的 prepare 时带上、并在 prepare 时消费。"""
+    id: str
+    text: str
+    status: str = "pending"     # pending（待纳入）| applied（已纳入某次 loop）
+    applied_seq: int = 0        # 被哪一次 loop 的 prepare 纳入
+    created_at: float = field(default_factory=_now)
+    updated_at: float = field(default_factory=_now)
+
+    def to_dict(self) -> dict:
+        return {
+            "id": self.id, "text": self.text, "status": self.status,
+            "appliedSeq": self.applied_seq,
+            "createdAt": self.created_at, "updatedAt": self.updated_at,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "Addon":
+        return cls(
+            id=d.get("id", ""),
+            text=d.get("text", ""),
+            status=d.get("status", "pending"),
+            applied_seq=int(d.get("appliedSeq", 0)),
+            created_at=d.get("createdAt", _now()),
+            updated_at=d.get("updatedAt", _now()),
+        )
+
+
+@dataclass
 class LoopState:
     """单个 loop session 的完整 stage 文件。"""
     session_id: str
@@ -241,6 +271,7 @@ class LoopState:
     status: str = "active"              # active | delivered | output | aborted
     stop_reason: str = ""               # 触发 loopout / 终止的原因
     asides: list[AsideTurn] = field(default_factory=list)  # by the way 旁路问答
+    addons: list[Addon] = field(default_factory=list)      # 执行中补充的要求
     created_at: float = field(default_factory=_now)
     updated_at: float = field(default_factory=_now)
 
@@ -271,6 +302,7 @@ class LoopState:
             "status": self.status,
             "stopReason": self.stop_reason,
             "asides": [a.to_dict() for a in self.asides],
+            "addons": [a.to_dict() for a in self.addons],
             "bestScore": self.best_score(),
             "latestScore": self.latest_score(),
             "createdAt": self.created_at,
@@ -291,6 +323,7 @@ class LoopState:
             status=d.get("status", "active"),
             stop_reason=d.get("stopReason", ""),
             asides=[AsideTurn.from_dict(a) for a in d.get("asides", [])],
+            addons=[Addon.from_dict(a) for a in d.get("addons", [])],
             created_at=d.get("createdAt", _now()),
             updated_at=d.get("updatedAt", _now()),
         )
