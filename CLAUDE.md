@@ -263,7 +263,7 @@ session the **LoopPanel is rendered inline as the pane's content** (ChatPane
 detects `sessionType === 'loop'` and renders `<LoopPanel embedded />` instead of
 the message list + chat input). This is deliberate: a loop session has **no
 free-form chat box** — all interaction is in the panel (stage rail / loop timeline /
-detail panels / addon / "By the way" / toggleable terminal-style "Hack" view /
+detail panels / addon / "By the way" /
 a 🔒 **sandbox toggle** in the header, since loop sessions have no chat toolbar
 to flip `set_sandbox_enabled` from). Note: the Layer-2 sandbox path check
 (`validate_sandbox_path`) normalizes MSYS/Git-Bash drive paths (`/d/foo` →

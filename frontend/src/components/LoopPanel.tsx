@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback, useRef, useMemo } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { api } from '../api';
 import { markdownToHtml } from '../utils/markdown';
 import { ImagePreview } from './ImagePreview';
@@ -58,7 +58,6 @@ export interface LoopPanelProps {
 
 export const LoopPanel: React.FC<LoopPanelProps> = ({ sessionId, onClose, embedded, sandboxEnabled, onSandboxChange }) => {
   const [state, setState] = useState<LoopStateT | null>(null);
-  const [hackMode, setHackMode] = useState(false);
   const [selectedSeq, setSelectedSeq] = useState<number | null>(null);
   const [ideaInput, setIdeaInput] = useState('');
   const [goalDraft, setGoalDraft] = useState('');
@@ -162,7 +161,7 @@ export const LoopPanel: React.FC<LoopPanelProps> = ({ sessionId, onClose, embedd
   if (!state) {
     return wrap(
       <>
-        <Header stage="…" hackMode={hackMode} setHackMode={setHackMode}
+        <Header stage="…"
           asideOpen={false} setAsideOpen={() => {}} asideCount={0} onClose={onClose} embedded={embedded}
           sandboxEnabled={sandboxEnabled} onSandboxChange={onSandboxChange} />
         <div style={{ padding: 40, textAlign: 'center', color: 'var(--theme-text-muted)' }}>
@@ -174,7 +173,7 @@ export const LoopPanel: React.FC<LoopPanelProps> = ({ sessionId, onClose, embedd
 
   return wrap(
     <>
-      <Header stage={state.stage} hackMode={hackMode} setHackMode={setHackMode}
+      <Header stage={state.stage}
         asideOpen={asideOpen} setAsideOpen={setAsideOpen} asideCount={state.asides?.length || 0}
         onClose={onClose} embedded={embedded}
         sandboxEnabled={sandboxEnabled} onSandboxChange={onSandboxChange} />
@@ -182,35 +181,31 @@ export const LoopPanel: React.FC<LoopPanelProps> = ({ sessionId, onClose, embedd
 
         <div style={{ flex: 1, display: 'flex', minHeight: 0, position: 'relative' }}>
           <div style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
-            {hackMode ? (
-              <HackView state={state} progress={progress} />
-            ) : (
-              <div style={{ flex: 1, overflow: 'auto', padding: '12px 18px 24px' }}>
-                {/* 全局指标条 */}
-                {state.stage !== 'loopidea' && <MetricBar state={state} />}
+            <div style={{ flex: 1, overflow: 'auto', padding: '12px 18px 24px' }}>
+              {/* 全局指标条 */}
+              {state.stage !== 'loopidea' && <MetricBar state={state} />}
 
-                {state.stage === 'loopidea' && (
-                  <IdeaStage
-                    state={state} ideaInput={ideaInput} setIdeaInput={setIdeaInput}
-                    goalDraft={goalDraft} setGoalDraft={setGoalDraft}
-                    onSubmit={submitIdea} onSeal={sealIdea} busy={busy}
-                    onRemove={(id) => api.loopRemoveIdea(sessionId, id)}
-                  />
-                )}
+              {state.stage === 'loopidea' && (
+                <IdeaStage
+                  state={state} ideaInput={ideaInput} setIdeaInput={setIdeaInput}
+                  goalDraft={goalDraft} setGoalDraft={setGoalDraft}
+                  onSubmit={submitIdea} onSeal={sealIdea} busy={busy}
+                  onRemove={(id) => api.loopRemoveIdea(sessionId, id)}
+                />
+              )}
 
-                {(state.stage === 'loopexecute' || state.stage === 'loopout') && (
-                  <ExecuteStage
-                    state={state} progress={progress}
-                    selectedSeq={selectedSeq} setSelectedSeq={setSelectedSeq}
-                    onRun={runIteration} onAdvanceOut={advanceOut} onSetAuto={setAuto}
-                    onAddAddon={addAddon} onRemoveAddon={removeAddon} onContinue={continueRound}
-                    running={running} busy={busy}
-                    goalDraft={goalDraft} setGoalDraft={setGoalDraft} onSaveGoal={saveGoal}
-                    onRefineGoal={refineGoal}
-                  />
-                )}
-              </div>
-            )}
+              {(state.stage === 'loopexecute' || state.stage === 'loopout') && (
+                <ExecuteStage
+                  state={state} progress={progress}
+                  selectedSeq={selectedSeq} setSelectedSeq={setSelectedSeq}
+                  onRun={runIteration} onAdvanceOut={advanceOut} onSetAuto={setAuto}
+                  onAddAddon={addAddon} onRemoveAddon={removeAddon} onContinue={continueRound}
+                  running={running} busy={busy}
+                  goalDraft={goalDraft} setGoalDraft={setGoalDraft} onSaveGoal={saveGoal}
+                  onRefineGoal={refineGoal}
+                />
+              )}
+            </div>
           </div>
 
           {asideOpen && (
@@ -228,11 +223,11 @@ export const LoopPanel: React.FC<LoopPanelProps> = ({ sessionId, onClose, embedd
 
 // ══ Header ════════════════════════════════════════════════════
 const Header: React.FC<{
-  stage: string; hackMode: boolean; setHackMode: (v: boolean) => void;
+  stage: string;
   asideOpen: boolean; setAsideOpen: (v: boolean) => void; asideCount: number;
   onClose?: () => void; embedded?: boolean;
   sandboxEnabled?: boolean; onSandboxChange?: (enabled: boolean) => void;
-}> = ({ stage, hackMode, setHackMode, asideOpen, setAsideOpen, asideCount, onClose, embedded, sandboxEnabled, onSandboxChange }) => (
+}> = ({ stage, asideOpen, setAsideOpen, asideCount, onClose, embedded, sandboxEnabled, onSandboxChange }) => (
     <div style={{
       display: 'flex', alignItems: 'center', gap: 12, padding: '12px 18px',
       borderBottom: '1px solid var(--theme-border)',
@@ -260,13 +255,6 @@ const Header: React.FC<{
         title="By the way — 基于当前 loop 状态旁路问答，不影响 loop 上下文"
       >
         💬 By the way{asideCount > 0 ? ` (${asideCount})` : ''}
-      </button>
-      <button
-        onClick={() => setHackMode(!hackMode)}
-        style={{ ...btn, ...(hackMode ? btnActive : {}) }}
-        title="切换 terminal / 可视化视图"
-      >
-        {hackMode ? '🎛 可视化' : '⌨ Hack'}
       </button>
       {!embedded && onClose && <button onClick={onClose} style={btn}>✕ 关闭</button>}
     </div>
@@ -1034,74 +1022,6 @@ const Md: React.FC<{ text: string }> = ({ text }) => (
   <div className="md-content" style={{ fontSize: 13, lineHeight: 1.6, color: 'var(--theme-text)' }}
     dangerouslySetInnerHTML={{ __html: markdownToHtml(text) }} />
 );
-
-// ══ Hack / terminal view ══════════════════════════════════════
-const HackView: React.FC<{ state: LoopStateT; progress: Record<string, string> }> = ({ state, progress }) => {
-  const text = useMemo(() => renderHack(state, progress), [state, progress]);
-  const ref = useRef<HTMLPreElement>(null);
-  useEffect(() => { if (ref.current) ref.current.scrollTop = ref.current.scrollHeight; }, [text]);
-  return (
-    <pre ref={ref} style={{
-      flex: 1, overflow: 'auto', margin: 0, padding: 18,
-      fontFamily: 'ui-monospace, Menlo, Consolas, monospace', fontSize: 12.5, lineHeight: 1.55,
-      background: '#0b0e14', color: '#9ece6a', whiteSpace: 'pre-wrap',
-    }}>{text}</pre>
-  );
-};
-
-function renderHack(s: LoopStateT, progress: Record<string, string>): string {
-  const L: string[] = [];
-  L.push('┌─ LOOP SESSION ───────────────────────────────');
-  L.push(`│ stage   : ${s.stage}`);
-  L.push(`│ status  : ${s.status}${s.stopReason ? `  (${s.stopReason})` : ''}`);
-  L.push(`│ goal    : ${s.goal || '(none)'}`);
-  L.push(`│ risk    : ${s.riskCoefficient.toFixed(2)}   loops ${s.loops.length}/${s.effectiveMaxLoops}   best ${s.bestScore.toFixed(0)}  latest ${s.latestScore.toFixed(0)}`);
-  L.push('└──────────────────────────────────────────────');
-  if (s.stage === 'loopidea') {
-    L.push('');
-    L.push('# IDEAS');
-    s.ideas.forEach((i) => {
-      L.push(`  [${i.status.padEnd(7)}] ${i.prompt}`);
-      if (i.result) i.result.split('\n').forEach((r) => L.push(`            ${r}`));
-      if (i.error) L.push(`            ! ${i.error}`);
-    });
-  }
-  s.loops.forEach((l) => {
-    L.push('');
-    L.push(`# LOOP #${l.seq}  [${l.subStage}]  ${l.analysis ? 'score=' + l.analysis.score.toFixed(0) : (l.error ? 'ERROR' : '...')}`);
-    L.push(`  goal: ${l.goal || '—'}`);
-    l.orchestration.forEach((o) => L.push(`   ${o.index}. (${o.mode}) ${o.desc}`));
-    const liveP = progress[`${l.seq}:prepare`];
-    const liveE = progress[`${l.seq}:execute`];
-    const liveA = progress[`${l.seq}:analysis`];
-    if (l.result) { L.push('  result:'); l.result.split('\n').forEach((r) => L.push(`    ${r}`)); }
-    else if (liveE) { L.push('  exec~:'); liveE.split('\n').slice(-12).forEach((r) => L.push(`    ${r}`)); }
-    else if (liveP) { L.push('  prep~:'); liveP.split('\n').slice(-6).forEach((r) => L.push(`    ${r}`)); }
-    if (l.analysis) {
-      L.push(`  analysis: opt=${(l.analysis.optimizationPotential * 100).toFixed(0)}% trend=${l.analysis.trend} deliverable=${l.analysis.deliverable} output=${l.analysis.outputtable}`);
-      if (l.analysis.notes) l.analysis.notes.split('\n').forEach((r) => L.push(`    ${r}`));
-      if (l.analysis.challenges) L.push(`    ! ${l.analysis.challenges}`);
-    } else if (liveA) { L.push('  ana~:'); liveA.split('\n').slice(-8).forEach((r) => L.push(`    ${r}`)); }
-    if (l.error) L.push(`  ! ${l.error}`);
-  });
-  const pend = (s.addons || []).filter((a) => a.status === 'pending');
-  if (pend.length) {
-    L.push('');
-    L.push('# ADDON (待纳入下一次 loop)');
-    pend.forEach((a) => L.push(`  + ${a.text}`));
-  }
-  if (s.asides && s.asides.length) {
-    L.push('');
-    L.push('# BY THE WAY (旁路，不污染主线)');
-    s.asides.forEach((a) => {
-      L.push(`  Q: ${a.question}`);
-      (a.answer || '...').split('\n').forEach((r) => L.push(`     ${r}`));
-    });
-  }
-  L.push('');
-  L.push('▋');
-  return L.join('\n');
-}
 
 // ══ small bits ════════════════════════════════════════════════
 const StatusDot: React.FC<{ status: string }> = ({ status }) => {
