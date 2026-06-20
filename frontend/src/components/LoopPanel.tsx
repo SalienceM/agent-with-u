@@ -167,7 +167,7 @@ export const LoopPanel: React.FC<LoopPanelProps> = ({ sessionId, onClose, embedd
         onClose={onClose} embedded={embedded} />
       <StageRail stage={state.stage} />
 
-        <div style={{ flex: 1, display: 'flex', minHeight: 0 }}>
+        <div style={{ flex: 1, display: 'flex', minHeight: 0, position: 'relative' }}>
           <div style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
             {hackMode ? (
               <HackView state={state} progress={progress} />
@@ -251,13 +251,41 @@ const AsideDrawer: React.FC<{
   input: string; setInput: (v: string) => void;
   onSend: () => void; answering: boolean; onClose: () => void;
 }> = ({ asides, live, input, setInput, onSend, answering, onClose }) => {
+  const scrollRef = useRef<HTMLDivElement>(null);
   const endRef = useRef<HTMLDivElement>(null);
-  useEffect(() => { endRef.current?.scrollIntoView({ behavior: 'smooth' }); }, [asides, live]);
+  const autoScrollRef = useRef(true);   // 是否跟随最新(用户停在底部时为 true)
+  const [showJump, setShowJump] = useState(false);
+
+  // 跟踪最新:仅当用户停在底部时才自动滚到底(与普通会话一致)
+  useEffect(() => {
+    if (!autoScrollRef.current) return;
+    endRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, [asides, live]);
+
+  // 滚动事件:用户向上滚则暂停跟随并显示「最新」按钮;回到底部则恢复
+  const handleScroll = useCallback(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    const atBottom = el.scrollTop + el.clientHeight >= el.scrollHeight - 60;
+    if (atBottom) { autoScrollRef.current = true; setShowJump(false); }
+    else { autoScrollRef.current = false; setShowJump(true); }
+  }, []);
+
+  const jumpToLatest = useCallback(() => {
+    autoScrollRef.current = true;
+    setShowJump(false);
+    endRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, []);
+
+  // 发送新问题是显式操作:无论之前滚到哪,都恢复跟随,好看到自己的提问与流式回答
+  const handleSend = useCallback(() => {
+    autoScrollRef.current = true;
+    setShowJump(false);
+    onSend();
+  }, [onSend]);
+
   return (
-    <div style={{
-      width: 340, flexShrink: 0, display: 'flex', flexDirection: 'column',
-      borderLeft: '1px solid var(--theme-border)', background: 'var(--theme-bg-secondary)',
-    }}>
+    <div style={asideDrawerStyle}>
       <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '10px 14px', borderBottom: '1px solid var(--theme-border)' }}>
         <span style={{ fontSize: 13, fontWeight: 700, color: 'var(--theme-text)' }}>💬 By the way</span>
         <div style={{ flex: 1 }} />
@@ -267,7 +295,8 @@ const AsideDrawer: React.FC<{
         随手问。模型只读当前 loop 状态快照作答，用独立上下文，<b>不影响 / 不打断</b> loop 主线。
       </div>
 
-      <div style={{ flex: 1, overflow: 'auto', padding: 12, display: 'flex', flexDirection: 'column', gap: 12 }}>
+      <div style={{ flex: 1, position: 'relative', minHeight: 0, display: 'flex' }}>
+      <div ref={scrollRef} onScroll={handleScroll} style={{ flex: 1, overflow: 'auto', padding: 12, display: 'flex', flexDirection: 'column', gap: 12 }}>
         {asides.length === 0 && (
           <div style={{ color: 'var(--theme-text-muted)', fontSize: 12 }}>例如：“第 3 次 loop 为什么分数低？”、“现在卡在哪？”、“下一步该往哪个方向调？”</div>
         )}
@@ -296,17 +325,25 @@ const AsideDrawer: React.FC<{
         })}
         <div ref={endRef} />
       </div>
+        {showJump && (
+          <button onClick={jumpToLatest} style={asideJumpBtn}>
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+              strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><path d="M12 5v14M5 12l7 7 7-7" /></svg>
+            最新
+          </button>
+        )}
+      </div>
 
       <div style={{ padding: 10, borderTop: '1px solid var(--theme-border)', display: 'flex', gap: 6 }}>
         <textarea
           value={input}
           onChange={(e) => setInput(e.target.value)}
-          onKeyDown={(e) => { if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') onSend(); }}
+          onKeyDown={(e) => { if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') handleSend(); }}
           placeholder={answering ? '上一条回答中…' : '顺便问一句…（Ctrl/Cmd+Enter）'}
           disabled={answering}
           style={{ ...inputBase, flex: 1, minHeight: 40, maxHeight: 120, resize: 'vertical', opacity: answering ? 0.6 : 1 }}
         />
-        <button onClick={onSend} disabled={answering || !input.trim()} style={{ ...primaryBtn, padding: '8px 12px', opacity: (answering || !input.trim()) ? 0.5 : 1 }}>发送</button>
+        <button onClick={handleSend} disabled={answering || !input.trim()} style={{ ...primaryBtn, padding: '8px 12px', opacity: (answering || !input.trim()) ? 0.5 : 1 }}>发送</button>
       </div>
     </div>
   );
@@ -945,6 +982,23 @@ const sealBox: React.CSSProperties = {
 };
 const miniX: React.CSSProperties = {
   background: 'none', border: 'none', color: 'var(--theme-text-muted)', cursor: 'pointer', fontSize: 12, padding: 2,
+};
+// By the way:浮动贴右、约半屏宽,覆盖在主面板之上(不挤压左侧)
+const asideDrawerStyle: React.CSSProperties = {
+  position: 'absolute', top: 0, right: 0, bottom: 0,
+  width: 'clamp(360px, 50%, 640px)',
+  display: 'flex', flexDirection: 'column',
+  borderLeft: '1px solid var(--theme-border)',
+  background: 'var(--theme-panel-bg, var(--theme-bg))',
+  backdropFilter: 'blur(10px)', WebkitBackdropFilter: 'blur(10px)',
+  boxShadow: '-10px 0 40px rgba(0,0,0,0.35)', zIndex: 30,
+};
+const asideJumpBtn: React.CSSProperties = {
+  position: 'absolute', bottom: 10, left: '50%', transform: 'translateX(-50%)',
+  display: 'flex', alignItems: 'center', gap: 4, padding: '5px 12px', borderRadius: 16,
+  border: '1px solid var(--theme-border)', background: 'var(--theme-bg-tertiary)',
+  color: 'var(--theme-text)', fontSize: 11.5, fontWeight: 500, cursor: 'pointer',
+  boxShadow: '0 2px 10px rgba(0,0,0,0.25)', whiteSpace: 'nowrap', zIndex: 5,
 };
 
 // 注入脉冲动画（一次性）
