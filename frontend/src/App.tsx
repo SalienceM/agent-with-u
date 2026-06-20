@@ -16,7 +16,6 @@ import { AuthStatusBanner } from './components/AuthStatusBanner';
 import { ConnectionPanel } from './components/ConnectionPanel';
 import { DirSyncPanel } from './components/DirSyncPanel';
 import { ChatPane } from './components/ChatPane';
-import { LoopPanel } from './components/LoopPanel';
 import { clearSessionHistoryCache } from './hooks/useChat';
 import { clearStreamStateForSession } from './hooks/useStreamState';
 import { useConfig } from './hooks/useConfig';
@@ -64,8 +63,6 @@ export const App: React.FC = () => {
     () => typeof window !== 'undefined' && window.innerWidth <= 768,
   );
   const [scratchPadOpen, setScratchPadOpen] = useState(false);
-  const [loopPanelOpen, setLoopPanelOpen] = useState(false);
-  const loopAutoOpenedRef = useRef<Set<string>>(new Set());  // 记录已自动弹出过的 loop 会话
   const [scratchPadWidth, setScratchPadWidth] = useState(360);
   const [assetPanelOpen, setAssetPanelOpen] = useState(false);
   const scratchDragRef = useRef<{ startX: number; startW: number } | null>(null);
@@ -269,20 +266,6 @@ export const App: React.FC = () => {
     });
     return () => { cancelled = true; };
   }, [activeSessionId]);
-
-  // ★ Loop 会话：选中时自动弹出可视化面板（每个会话只自动弹一次；手动关闭后
-  //   切走再切回不重弹，切到另一个 loop 会话则会弹）。非 loop 会话则关闭面板。
-  useEffect(() => {
-    if (!activeSession) return;
-    if (activeSession.sessionType === 'loop') {
-      if (!loopAutoOpenedRef.current.has(activeSession.id)) {
-        loopAutoOpenedRef.current.add(activeSession.id);
-        setLoopPanelOpen(true);
-      }
-    } else {
-      setLoopPanelOpen(false);
-    }
-  }, [activeSession]);
 
   // Phase 2: 每 Session 独立的模型配置(顶栏标签用)
   const activeBackendId = activeSession?.backendId || backends[0]?.id || '';
@@ -739,21 +722,7 @@ export const App: React.FC = () => {
             </span>
           )}
           <div style={{ flex: 1 }} />
-          {/* ★ Loop 会话：打开可视化 Loop 面板 */}
-          {activeSession?.sessionType === 'loop' && (
-            <button
-              onClick={() => setLoopPanelOpen(true)}
-              style={{
-                ...logBtnStyle,
-                background: 'var(--theme-accent-bg, #0969da1a)',
-                border: '1px solid var(--theme-accent, #0969da)55',
-                color: 'var(--theme-accent, #0969da)',
-              }}
-              title="可视化 Loop 面板"
-            >
-              🔁{isMobile ? '' : ' Loop'}
-            </button>
-          )}
+          {/* Loop 会话的全部交互在 ChatPane 内嵌的 LoopPanel 中进行，顶栏不再放入口 */}
           {/* 日志查看器按钮 */}
           <button
             onClick={() => setLogViewerOpen(true)}
@@ -929,11 +898,6 @@ export const App: React.FC = () => {
 
       {/* ---- 连接目标设置 ---- */}
       {connPanelOpen && <ConnectionPanel onClose={() => setConnPanelOpen(false)} />}
-
-      {/* ---- 可视化 Loop 面板（loop 会话） ---- */}
-      {loopPanelOpen && activeSessionId && activeSession?.sessionType === 'loop' && (
-        <LoopPanel sessionId={activeSessionId} onClose={() => setLoopPanelOpen(false)} />
-      )}
 
       {/* ---- 目录同步 ---- */}
       {syncPanelOpen && (

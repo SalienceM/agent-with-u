@@ -45,10 +45,11 @@ const SUB_ORDER = ['prepare', 'execute', 'analysis', 'done'];
 
 export interface LoopPanelProps {
   sessionId: string;
-  onClose: () => void;
+  onClose?: () => void;
+  embedded?: boolean;   // true = 作为会话内容内嵌渲染（无浮层、无关闭按钮）
 }
 
-export const LoopPanel: React.FC<LoopPanelProps> = ({ sessionId, onClose }) => {
+export const LoopPanel: React.FC<LoopPanelProps> = ({ sessionId, onClose, embedded }) => {
   const [state, setState] = useState<LoopStateT | null>(null);
   const [hackMode, setHackMode] = useState(false);
   const [selectedSeq, setSelectedSeq] = useState<number | null>(null);
@@ -142,27 +143,29 @@ export const LoopPanel: React.FC<LoopPanelProps> = ({ sessionId, onClose }) => {
     await api.loopSetGoal(sessionId, goalDraft.trim());
   }, [sessionId, goalDraft]);
 
+  // embedded = 作为会话内容内嵌（填满 pane，无浮层 backdrop）；否则浮层模式
+  const wrap = (children: React.ReactNode) => embedded
+    ? <div style={embeddedShell}>{children}</div>
+    : <div style={overlay}><div style={shell}>{children}</div></div>;
+
   if (!state) {
-    return (
-      <div style={overlay}>
-        <div style={shell}>
-          <Header stage="…" hackMode={hackMode} setHackMode={setHackMode}
-            asideOpen={false} setAsideOpen={() => {}} asideCount={0} onClose={onClose} />
-          <div style={{ padding: 40, textAlign: 'center', color: 'var(--theme-text-muted)' }}>
-            正在加载 Loop 状态…
-          </div>
+    return wrap(
+      <>
+        <Header stage="…" hackMode={hackMode} setHackMode={setHackMode}
+          asideOpen={false} setAsideOpen={() => {}} asideCount={0} onClose={onClose} embedded={embedded} />
+        <div style={{ padding: 40, textAlign: 'center', color: 'var(--theme-text-muted)' }}>
+          正在加载 Loop 状态…
         </div>
-      </div>
+      </>
     );
   }
 
-  return (
-    <div style={overlay}>
-      <div style={shell}>
-        <Header stage={state.stage} hackMode={hackMode} setHackMode={setHackMode}
-          asideOpen={asideOpen} setAsideOpen={setAsideOpen} asideCount={state.asides?.length || 0}
-          onClose={onClose} />
-        <StageRail stage={state.stage} />
+  return wrap(
+    <>
+      <Header stage={state.stage} hackMode={hackMode} setHackMode={setHackMode}
+        asideOpen={asideOpen} setAsideOpen={setAsideOpen} asideCount={state.asides?.length || 0}
+        onClose={onClose} embedded={embedded} />
+      <StageRail stage={state.stage} />
 
         <div style={{ flex: 1, display: 'flex', minHeight: 0 }}>
           <div style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
@@ -205,8 +208,7 @@ export const LoopPanel: React.FC<LoopPanelProps> = ({ sessionId, onClose }) => {
             />
           )}
         </div>
-      </div>
-    </div>
+    </>
   );
 };
 
@@ -214,8 +216,8 @@ export const LoopPanel: React.FC<LoopPanelProps> = ({ sessionId, onClose }) => {
 const Header: React.FC<{
   stage: string; hackMode: boolean; setHackMode: (v: boolean) => void;
   asideOpen: boolean; setAsideOpen: (v: boolean) => void; asideCount: number;
-  onClose: () => void;
-}> = ({ stage, hackMode, setHackMode, asideOpen, setAsideOpen, asideCount, onClose }) => (
+  onClose?: () => void; embedded?: boolean;
+}> = ({ stage, hackMode, setHackMode, asideOpen, setAsideOpen, asideCount, onClose, embedded }) => (
     <div style={{
       display: 'flex', alignItems: 'center', gap: 12, padding: '12px 18px',
       borderBottom: '1px solid var(--theme-border)',
@@ -239,7 +241,7 @@ const Header: React.FC<{
       >
         {hackMode ? '🎛 可视化' : '⌨ Hack'}
       </button>
-      <button onClick={onClose} style={btn}>✕ 关闭</button>
+      {!embedded && onClose && <button onClick={onClose} style={btn}>✕ 关闭</button>}
     </div>
   );
 
@@ -907,6 +909,11 @@ const shell: React.CSSProperties = {
   width: '92%', maxWidth: 1000, height: '88vh', display: 'flex', flexDirection: 'column',
   background: 'var(--theme-bg-secondary, #fff)', border: '1px solid var(--theme-border)',
   borderRadius: 14, overflow: 'hidden', boxShadow: '0 12px 48px rgba(0,0,0,0.4)',
+};
+// 内嵌模式：填满所在 pane，无浮层 backdrop / 圆角 / 阴影
+const embeddedShell: React.CSSProperties = {
+  width: '100%', height: '100%', display: 'flex', flexDirection: 'column',
+  overflow: 'hidden', background: 'transparent', minHeight: 0,
 };
 const btn: React.CSSProperties = {
   background: 'var(--theme-bg-tertiary)', border: '1px solid var(--theme-border)',

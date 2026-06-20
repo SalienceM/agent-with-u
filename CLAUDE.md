@@ -258,10 +258,16 @@ The global stage advances one-way: `loopidea → loopexecute → loopout`.
 Loop turns run silently against the agent (`_loop_run_agent`); their plans,
 results and scores stream to a dedicated **LoopPanel** (`frontend/src/components/
 LoopPanel.tsx`) via `loopUpdated` (full state) and `loopProgress` (sub-stage text
-deltas) push events — they do **not** pollute the chat transcript. The panel is a
-full-screen overlay (🔁 button in the header for loop sessions; auto-opens on
-select) with a visualized stage rail / loop timeline / detail panels, plus a
-toggleable terminal-style "Hack" view.
+deltas) push events — they do **not** pollute the chat transcript. For a loop
+session the **LoopPanel is rendered inline as the pane's content** (ChatPane
+detects `sessionType === 'loop'` and renders `<LoopPanel embedded />` instead of
+the message list + chat input). This is deliberate: a loop session has **no
+free-form chat box** — all interaction is in the panel (stage rail / loop timeline /
+detail panels / addon / "By the way" / toggleable terminal-style "Hack" view).
+Rationale: the old chat box shared `session.agent_session_id` with the loop's
+prepare/execute/analysis turns (cross-context pollution) and split attention; the
+panel-only design removes both. `LoopPanel` still supports a floating overlay
+mode (`embedded` omitted) but the app uses the inline mode.
 
 **By the way (旁路问答).** The LoopPanel header has a session-level "💬 By the
 way" toggle opening a side drawer. Questions go through `loopAsk` →

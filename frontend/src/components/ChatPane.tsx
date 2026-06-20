@@ -3,6 +3,7 @@ import { api } from '../api';
 import { MessageBubble } from './MessageBubble';
 import { ChatInput } from './ChatInput';
 import { PermissionGate } from './PermissionGate';
+import { LoopPanel } from './LoopPanel';
 import { useChat } from '../hooks/useChat';
 import type { AppConfig } from '../hooks/useConfig';
 
@@ -287,6 +288,24 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
           <div>点击侧边栏选择会话</div>
           <div style={{ fontSize: 11, opacity: 0.7 }}>Pane #{paneId + 1}</div>
         </div>
+      </div>
+    );
+  }
+
+  // ★ Loop 会话：直接把 LoopPanel 作为这个 pane 的内容内嵌渲染（不是浮层，
+  //   也没有自由聊天框）—— loop 的全部交互都在面板内（含 By the way 旁路问答），
+  //   避免「聊天框 vs 面板」双入口、以及聊天与 loop 主线共用 agent 上下文的污染。
+  if (activeSession?.sessionType === 'loop') {
+    return (
+      <div
+        onClick={onFocus}
+        style={{
+          ...paneRootStyle,
+          border: isFocused ? `2px solid ${themeBorderFocused}` : '2px solid var(--theme-border)',
+          background: 'transparent',
+        }}
+      >
+        <LoopPanel sessionId={sessionId} embedded />
       </div>
     );
   }
