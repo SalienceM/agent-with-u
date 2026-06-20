@@ -2388,12 +2388,13 @@ class BridgeWS:
                 lines.append(f"  错误: {l.error[:200]}")
         return "\n".join(lines)
 
-    def _rpc_loopAsk(self, session_id: str, question: str) -> str:
+    def _rpc_loopAsk(self, session_id: str, question: str, images_json: str = "") -> str:
         """By the way 旁路提问：基于当前 loop 状态对话，独立 agent session，
         不 resume loop 主线 agent_session_id，不污染 prepare/execute/analysis 上下文。
-        loop 正在 run 时也可随时使用。"""
+        loop 正在 run 时也可随时使用。可附带图片（images_json：前端图片附件数组）。"""
         q = (question or "").strip()
-        if not q:
+        images = self._parse_images_json(images_json)
+        if not q and not images:
             return json.dumps({"status": "error", "message": "问题为空"}, ensure_ascii=False)
         state = self._loop_state(session_id)
         if not state:
@@ -2401,15 +2402,40 @@ class BridgeWS:
         if session_id in self._aside_running:
             return json.dumps({"status": "error", "message": "上一条 by-the-way 仍在回答"}, ensure_ascii=False)
         running_seq = next((l.seq for l in state.loops if not l.completed and not l.error), 0)
-        turn = AsideTurn(id=new_id(), question=q, status="answering",
-                         stage=state.stage, seq=running_seq)
+        turn = AsideTurn(id=new_id(), question=q or "（图片）", status="answering",
+                         stage=state.stage, seq=running_seq,
+                         image_count=len(images) if images else 0)
         state.asides.append(turn)
         self._loop_save(state)
         self._emit_loop_updated(state)
-        asyncio.ensure_future(self._run_aside(session_id, turn.id))
+        asyncio.ensure_future(self._run_aside(session_id, turn.id, images))
         return json.dumps({"status": "ok", "turnId": turn.id}, ensure_ascii=False)
 
-    async def _run_aside(self, session_id: str, turn_id: str) -> None:
+    @staticmethod
+    def _parse_images_json(images_json: str) -> Optional[list["ImageAttachment"]]:
+        """把前端传来的图片附件 JSON 字符串解析成 ImageAttachment 列表。"""
+        if not images_json:
+            return None
+        try:
+            raw = json.loads(images_json)
+        except Exception:
+            return None
+        if not isinstance(raw, list) or not raw:
+            return None
+        out: list[ImageAttachment] = []
+        for img in raw:
+            if not isinstance(img, dict):
+                continue
+            try:
+                filtered = {k: v for k, v in img.items()
+                            if k in ("id", "base64", "mime_type", "size", "width", "height", "file_path")}
+                out.append(ImageAttachment(**filtered))
+            except Exception:
+                continue
+        return out or None
+
+    async def _run_aside(self, session_id: str, turn_id: str,
+                         images: Optional[list["ImageAttachment"]] = None) -> None:
         session = self._active_sessions.get(session_id) or self._session_store.load(session_id)
         state = self._loop_state(session_id)
         if not session or not state:
@@ -2446,7 +2472,7 @@ class BridgeWS:
             aside_sid = f"{session_id}:aside"
             try:
                 await backend.send_message(
-                    messages=[], content=prompt, images=None,
+                    messages=[], content=prompt, images=images,
                     session_id=aside_sid, message_id=new_id(), on_delta=on_delta,
                     agent_session_id=None,          # ★ 独立上下文，绝不 resume loop 主线
                     working_dir=session.working_dir,

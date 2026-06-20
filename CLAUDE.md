@@ -275,7 +275,12 @@ way" toggle opening a side drawer. Questions go through `loopAsk` →
 (`_loop_context_digest`) on an **independent** agent session (never resumes the
 loop's `agent_session_id`), so it never pollutes / interrupts the loop's main
 context — usable even while a loop is running. Answers stream via
-`loopAsideDelta` (per `turnId`) and persist as `asides` on the stage file.
+`loopAsideDelta` (per `turnId`) and persist as `asides` on the stage file. The
+By-the-way input supports **image attachments** (clipboard paste / Snipaste /
+picker, same `useClipboardImage` flow as the main chat): `loopAsk` takes an
+optional third `images_json` arg parsed by `_parse_images_json` and passed to the
+agent turn; the base64 is **not** persisted (only `image_count` is kept on the
+`AsideTurn` to render a 🖼️ badge in history).
 
 Loop state is read/written through a process-level singleton cache
 (`_loop_state` / `_loop_save` / `_loop_create`) so a running iteration's

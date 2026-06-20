@@ -679,8 +679,9 @@ export const api = {
   },
 
   /** By the way 旁路提问：基于当前 loop 状态对话，不污染 loop 主线上下文。 */
-  async loopAsk(sessionId: string, question: string): Promise<{ status: string; turnId?: string; message?: string }> {
-    const result = await call('loopAsk', sessionId, question);
+  async loopAsk(sessionId: string, question: string, images?: any[]): Promise<{ status: string; turnId?: string; message?: string }> {
+    const imagesJson = images && images.length ? JSON.stringify(images) : '';
+    const result = await call('loopAsk', sessionId, question, imagesJson);
     try { return JSON.parse(result); } catch { return { status: 'error', message: '响应解析失败' }; }
   },
 

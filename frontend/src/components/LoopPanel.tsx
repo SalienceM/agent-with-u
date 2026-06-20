@@ -1,6 +1,9 @@
 import React, { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import { api } from '../api';
 import { markdownToHtml } from '../utils/markdown';
+import { ImagePreview } from './ImagePreview';
+import { useClipboardImage } from './../hooks/useClipboardImage';
+import type { ImageAttachment } from './../hooks/useClipboardImage';
 
 /**
  * LoopPanel — 可视化 Loop 集成的全屏面板。
@@ -26,7 +29,7 @@ interface LoopRecord {
 }
 interface IdeaEntry { id: string; prompt: string; status: string; result: string; error: string; }
 interface GoalRevision { goal: string; hint: string; source: string; createdAt: number; }
-interface AsideTurn { id: string; question: string; answer: string; status: string; stage: string; seq: number; }
+interface AsideTurn { id: string; question: string; answer: string; status: string; stage: string; seq: number; imageCount?: number; }
 interface Addon { id: string; text: string; status: string; appliedSeq: number; }
 interface LoopStateT {
   sessionId: string; stage: string; goal: string;
@@ -94,11 +97,11 @@ export const LoopPanel: React.FC<LoopPanelProps> = ({ sessionId, onClose, embedd
   }, [sessionId]);
 
   const asideAnswering = state?.asides?.some((a) => a.status === 'answering') ?? false;
-  const submitAside = useCallback(async () => {
+  const submitAside = useCallback(async (images?: ImageAttachment[]) => {
     const text = asideInput.trim();
-    if (!text || asideAnswering) return;
+    if ((!text && !(images && images.length)) || asideAnswering) return;
     setAsideInput('');
-    const r = await api.loopAsk(sessionId, text);
+    const r = await api.loopAsk(sessionId, text, images);
     if (r.status !== 'ok' && r.message) alert(r.message);
   }, [asideInput, asideAnswering, sessionId]);
 
@@ -256,12 +259,15 @@ const Header: React.FC<{
 const AsideDrawer: React.FC<{
   asides: AsideTurn[]; live: Record<string, string>;
   input: string; setInput: (v: string) => void;
-  onSend: () => void; answering: boolean; onClose: () => void;
+  onSend: (images?: ImageAttachment[]) => void; answering: boolean; onClose: () => void;
 }> = ({ asides, live, input, setInput, onSend, answering, onClose }) => {
   const scrollRef = useRef<HTMLDivElement>(null);
   const endRef = useRef<HTMLDivElement>(null);
+  const inputRef = useRef<HTMLTextAreaElement>(null);
   const autoScrollRef = useRef(true);   // 是否跟随最新(用户停在底部时为 true)
   const [showJump, setShowJump] = useState(false);
+  // 图片附件:粘贴(含 Snipaste)自动入列,与主聊天框一致,作用域限定本输入框
+  const { images, removeImage, clearImages, addImage } = useClipboardImage(inputRef);
 
   // 跟踪最新:仅当用户停在底部时才自动滚到底(与普通会话一致)
   useEffect(() => {
@@ -286,10 +292,31 @@ const AsideDrawer: React.FC<{
 
   // 发送新问题是显式操作:无论之前滚到哪,都恢复跟随,好看到自己的提问与流式回答
   const handleSend = useCallback(() => {
+    if (answering) return;
+    if (!input.trim() && images.length === 0) return;
     autoScrollRef.current = true;
     setShowJump(false);
-    onSend();
-  }, [onSend]);
+    onSend(images);
+    clearImages();
+  }, [onSend, answering, input, images, clearImages]);
+
+  // 选图按钮:走系统文件框,与粘贴同一条入列逻辑
+  const pickImage = useCallback(() => {
+    const el = document.createElement('input');
+    el.type = 'file'; el.accept = 'image/*'; el.multiple = true;
+    el.onchange = () => {
+      Array.from(el.files || []).forEach((file) => {
+        if (!file.type.startsWith('image/')) return;
+        const reader = new FileReader();
+        reader.onload = () => {
+          const b64 = (reader.result as string).split(',')[1];
+          addImage({ id: `${Date.now()}-${Math.random().toString(36).slice(2)}`, base64: b64, mime_type: file.type, size: file.size });
+        };
+        reader.readAsDataURL(file);
+      });
+    };
+    el.click();
+  }, [addImage]);
 
   return (
     <div style={asideDrawerStyle}>
@@ -314,6 +341,7 @@ const AsideDrawer: React.FC<{
             <div key={t.id}>
               <div style={{ display: 'flex', justifyContent: 'flex-end', marginBottom: 6 }}>
                 <div style={{ maxWidth: '85%', padding: '7px 11px', borderRadius: '12px 12px 2px 12px', background: 'var(--theme-accent)', color: '#fff', fontSize: 12.5, lineHeight: 1.5, whiteSpace: 'pre-wrap' }}>
+                  {!!t.imageCount && <span style={{ display: 'inline-block', marginRight: 5, opacity: 0.85 }}>🖼️{t.imageCount > 1 ? `×${t.imageCount}` : ''}</span>}
                   {t.question}
                 </div>
               </div>
@@ -341,16 +369,22 @@ const AsideDrawer: React.FC<{
         )}
       </div>
 
-      <div style={{ padding: 10, borderTop: '1px solid var(--theme-border)', display: 'flex', gap: 6 }}>
-        <textarea
-          value={input}
-          onChange={(e) => setInput(e.target.value)}
-          onKeyDown={(e) => { if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') handleSend(); }}
-          placeholder={answering ? '上一条回答中…' : '顺便问一句…（Ctrl/Cmd+Enter）'}
-          disabled={answering}
-          style={{ ...inputBase, flex: 1, minHeight: 40, maxHeight: 120, resize: 'vertical', opacity: answering ? 0.6 : 1 }}
-        />
-        <button onClick={handleSend} disabled={answering || !input.trim()} style={{ ...primaryBtn, padding: '8px 12px', opacity: (answering || !input.trim()) ? 0.5 : 1 }}>发送</button>
+      <div style={{ padding: 10, borderTop: '1px solid var(--theme-border)' }}>
+        {images.length > 0 && <ImagePreview images={images} onRemove={removeImage} />}
+        <div style={{ display: 'flex', gap: 6, alignItems: 'flex-end' }}>
+          <button onClick={pickImage} disabled={answering} title="插入图片（也可直接粘贴 / Snipaste）"
+            style={{ ...btn, padding: '8px 10px', opacity: answering ? 0.5 : 1 }}>🖼️</button>
+          <textarea
+            ref={inputRef}
+            value={input}
+            onChange={(e) => setInput(e.target.value)}
+            onKeyDown={(e) => { if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') handleSend(); }}
+            placeholder={answering ? '上一条回答中…' : '顺便问一句…（可粘贴/插入图片，Ctrl/Cmd+Enter）'}
+            disabled={answering}
+            style={{ ...inputBase, flex: 1, minHeight: 40, maxHeight: 120, resize: 'vertical', opacity: answering ? 0.6 : 1 }}
+          />
+          <button onClick={handleSend} disabled={answering || (!input.trim() && images.length === 0)} style={{ ...primaryBtn, padding: '8px 12px', opacity: (answering || (!input.trim() && images.length === 0)) ? 0.5 : 1 }}>发送</button>
+        </div>
       </div>
     </div>
   );

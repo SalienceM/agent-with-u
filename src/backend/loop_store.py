@@ -201,6 +201,7 @@ class AsideTurn:
     status: str = "answering"   # answering | done | error
     stage: str = ""             # 提问时的 loop 阶段快照
     seq: int = 0                # 提问时正在跑的 loop（0 表示无）
+    image_count: int = 0        # 提问时附带的图片数（base64 不落盘，仅记数量）
     created_at: float = field(default_factory=_now)
     updated_at: float = field(default_factory=_now)
 
@@ -212,6 +213,7 @@ class AsideTurn:
             "status": self.status,
             "stage": self.stage,
             "seq": self.seq,
+            "imageCount": self.image_count,
             "createdAt": self.created_at,
             "updatedAt": self.updated_at,
         }
@@ -225,6 +227,7 @@ class AsideTurn:
             status=d.get("status", "done"),
             stage=d.get("stage", ""),
             seq=int(d.get("seq", 0)),
+            image_count=int(d.get("imageCount", 0)),
             created_at=d.get("createdAt", _now()),
             updated_at=d.get("updatedAt", _now()),
         )
