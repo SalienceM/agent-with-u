@@ -246,9 +246,14 @@ The global stage advances one-way: `loopidea → loopexecute → loopout`.
   `loopRunIteration` continues the last unfinished `LoopRecord` from its breakpoint
   (skipping already-done steps) instead of starting a new one. The serialized
   payload carries `running` / `resumable` (injected by `_loop_payload`).
-- **loopout** — global output stage (auto-entered when outputtable + optimization
+- **loopout** — per-round output stage (auto-entered when outputtable + optimization
   potential is low / improvement curve flattens / risk too high / max loops hit;
-  or manually).
+  or manually). It is **not** terminal: `loopContinue` starts a **new round** from
+  loopout (stage → loopexecute, `round`+1, status active, risk reset), reusing the
+  same working dir / agent context, with an optional new/edited goal. Scores, risk,
+  trend, and the effective-max-loops budget are scoped **per round** (`round_loops()`);
+  `seq` stays globally unique. The LoopPanel shows a loopout banner with the
+  new-round box and renders the timeline with per-round dividers.
 
 Loop turns run silently against the agent (`_loop_run_agent`); their plans,
 results and scores stream to a dedicated **LoopPanel** (`frontend/src/components/
@@ -280,9 +285,9 @@ consumed; applied ones remain as struck-through history. Shown in a dedicated
 addon panel in the LoopPanel.
 
 Loop RPCs: `loopGetState`, `loopSubmitIdea`, `loopRemoveIdea`, `loopSealIdea`,
-`loopSetGoal`, `loopRunIteration`, `loopSetAuto`, `loopAdvanceToOut`, `loopAsk`,
-`loopAddAddon`, `loopRemoveAddon`. `createSession` takes an optional third
-`session_type` argument.
+`loopSetGoal`, `loopRunIteration`, `loopSetAuto`, `loopAdvanceToOut`,
+`loopContinue`, `loopAsk`, `loopAddAddon`, `loopRemoveAddon`. `createSession`
+takes an optional third `session_type` argument.
 
 ### Slash Commands
 

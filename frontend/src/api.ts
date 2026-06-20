@@ -667,6 +667,12 @@ export const api = {
     try { return JSON.parse(result); } catch { return { status: 'error', message: '响应解析失败' }; }
   },
 
+  /** loopout 之后开启新一轮（同一工作目录/上下文，轮次 +1）。 */
+  async loopContinue(sessionId: string, goal: string = ''): Promise<{ status: string; stage?: string; round?: number; message?: string }> {
+    const result = await call('loopContinue', sessionId, goal);
+    try { return JSON.parse(result); } catch { return { status: 'error', message: '响应解析失败' }; }
+  },
+
   /** By the way 旁路提问：基于当前 loop 状态对话，不污染 loop 主线上下文。 */
   async loopAsk(sessionId: string, question: string): Promise<{ status: string; turnId?: string; message?: string }> {
     const result = await call('loopAsk', sessionId, question);
@@ -1250,6 +1256,7 @@ function mockDispatch(method: string, params: any[]): any {
     case 'loopRunIteration': return JSON.stringify({ status: 'error', message: 'mock mode' });
     case 'loopSetAuto': return JSON.stringify({ status: 'ok', auto: !!params[1] });
     case 'loopAdvanceToOut': return JSON.stringify({ status: 'error', message: 'mock mode' });
+    case 'loopContinue': return JSON.stringify({ status: 'error', message: 'mock mode' });
     case 'loopAsk': return JSON.stringify({ status: 'error', message: 'mock mode' });
     case 'loopAddAddon': return JSON.stringify({ status: 'error', message: 'mock mode' });
     case 'loopRemoveAddon': return JSON.stringify({ status: 'ok' });

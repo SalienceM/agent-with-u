@@ -2004,7 +2004,8 @@ class BridgeWS:
             if last and not last.completed and not last.error:
                 record = last
             else:
-                record = LoopRecord(seq=len(state.loops) + 1, sub_stage=SUB_PREPARE)
+                record = LoopRecord(seq=len(state.loops) + 1, sub_stage=SUB_PREPARE,
+                                    round=state.round)
                 state.loops.append(record)
                 self._loop_save(state)
                 self._emit_loop_updated(state)
@@ -2223,7 +2224,7 @@ class BridgeWS:
     @staticmethod
     def _loop_history_brief(state: "LoopState", exclude_seq: int) -> str:
         lines = []
-        for l in state.loops:
+        for l in state.round_loops():  # 仅本轮，新一轮从干净的趋势/预算开始
             if l.seq == exclude_seq:
                 continue
             sc = f"{l.analysis.score:.0f}" if l.analysis else "?"
@@ -2231,8 +2232,8 @@ class BridgeWS:
         return "\n".join(lines)
 
     def _recompute_risk(self, state: "LoopState") -> None:
-        """综合风险系数：完成度低 + 遇到硬约束 + 提升乏力 → 升高。"""
-        done = [l for l in state.loops if l.analysis]
+        """综合风险系数：完成度低 + 遇到硬约束 + 提升乏力 → 升高（按当前轮计）。"""
+        done = [l for l in state.round_loops() if l.analysis]
         if not done:
             return
         latest = done[-1].analysis
@@ -2252,8 +2253,8 @@ class BridgeWS:
         state.risk_coefficient = max(0.0, min(1.0, risk))
 
     def _loop_should_stop(self, state: "LoopState") -> tuple[bool, str]:
-        """是否结束 loopexecute、进入全局 loopout。"""
-        done = [l for l in state.loops if l.analysis]
+        """是否结束 loopexecute、进入全局 loopout（按当前轮计）。"""
+        done = [l for l in state.round_loops() if l.analysis]
         if not done:
             return False, ""
         latest = done[-1].analysis
@@ -2265,7 +2266,7 @@ class BridgeWS:
         if state.risk_coefficient >= 0.85:
             return True, "风险系数过高，停止无谓 loop"
         # 达到有效最大 loop 上限
-        if len(state.loops) >= state.effective_max_loops():
+        if len(state.round_loops()) >= state.effective_max_loops():
             return True, "达到最大 loop 约束"
         return False, ""
 
@@ -2286,6 +2287,31 @@ class BridgeWS:
         self._loop_save(state)
         self._emit_loop_updated(state)
         return json.dumps({"status": "ok", "stage": state.stage}, ensure_ascii=False)
+
+    def _rpc_loopContinue(self, session_id: str, goal: str = "") -> str:
+        """loopout 之后开启新一轮：在现有成果（同一工作目录/上下文）基础上设定/沿用
+        任务，stage 从 loopout 回到 loopexecute，轮次 +1，趋势与风险按新轮从头算。
+        若 auto 开启则立即续跑。"""
+        state = self._loop_state(session_id)
+        if not state:
+            return json.dumps({"status": "error", "message": "no loop state"}, ensure_ascii=False)
+        if state.stage != STAGE_OUT:
+            return json.dumps({"status": "error", "message": "仅 loopout 阶段可开启新一轮"}, ensure_ascii=False)
+        if session_id in self._loop_running:
+            return json.dumps({"status": "error", "message": "上一次 loop 仍在进行"}, ensure_ascii=False)
+        g = (goal or "").strip()
+        if g:
+            state.goal = g           # 设新任务；留空则沿用原目标继续打磨
+        state.round += 1
+        state.stage = STAGE_EXECUTE
+        state.status = "active"
+        state.stop_reason = ""
+        state.risk_coefficient = 0.3  # 新一轮从干净的风险基线开始
+        self._loop_save(state)
+        self._emit_loop_updated(state)
+        if state.auto:
+            asyncio.ensure_future(self._run_loop_iteration(session_id))
+        return json.dumps({"status": "ok", "stage": state.stage, "round": state.round}, ensure_ascii=False)
 
     # ── by the way：旁路问答（不污染 loop 主线上下文）──────────────
 

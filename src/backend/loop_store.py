@@ -115,6 +115,7 @@ class LoopRecord:
     """一次 loopexecute 的完整记录。"""
     seq: int
     sub_stage: str = SUB_PREPARE        # prepare | execute | analysis | done
+    round: int = 1                      # 属于第几轮（loopout 后可开启新一轮）
     goal: str = ""                      # 本次 loop 的计划目标
     orchestration: list[LoopStep] = field(default_factory=list)
     completed: bool = False             # 是否按步骤执行完成（含 analysis 完成）
@@ -128,6 +129,7 @@ class LoopRecord:
         return {
             "seq": self.seq,
             "subStage": self.sub_stage,
+            "round": self.round,
             "goal": self.goal,
             "orchestration": [s.to_dict() for s in self.orchestration],
             "completed": self.completed,
@@ -143,6 +145,7 @@ class LoopRecord:
         return cls(
             seq=int(d.get("seq", 0)),
             sub_stage=d.get("subStage", SUB_PREPARE),
+            round=int(d.get("round", 1)),
             goal=d.get("goal", ""),
             orchestration=[LoopStep.from_dict(s) for s in d.get("orchestration", [])],
             completed=bool(d.get("completed", False)),
@@ -267,6 +270,7 @@ class LoopState:
     loops: list[LoopRecord] = field(default_factory=list)
     risk_coefficient: float = 0.3       # 0..1 综合风险系数
     max_loops: int = 8                  # 基础最大 loop 约束
+    round: int = 1                      # 当前轮次（loopout 后可开启新一轮）
     auto: bool = False                  # 自动连跑：一次 loop 完成后自动开始下一次
     status: str = "active"              # active | delivered | output | aborted
     stop_reason: str = ""               # 触发 loopout / 终止的原因
@@ -276,12 +280,16 @@ class LoopState:
     updated_at: float = field(default_factory=_now)
 
     # ── 派生指标 ────────────────────────────────────────────────
+    def round_loops(self) -> list["LoopRecord"]:
+        """当前轮次的 loop（分数/风险/收口都按当前轮计算）。"""
+        return [l for l in self.loops if l.round == self.round]
+
     def best_score(self) -> float:
-        scores = [l.analysis.score for l in self.loops if l.analysis]
+        scores = [l.analysis.score for l in self.round_loops() if l.analysis]
         return max(scores) if scores else 0.0
 
     def latest_score(self) -> float:
-        done = [l for l in self.loops if l.analysis]
+        done = [l for l in self.round_loops() if l.analysis]
         return done[-1].analysis.score if done else 0.0
 
     def effective_max_loops(self) -> int:
@@ -298,6 +306,8 @@ class LoopState:
             "riskCoefficient": self.risk_coefficient,
             "maxLoops": self.max_loops,
             "effectiveMaxLoops": self.effective_max_loops(),
+            "round": self.round,
+            "roundLoopCount": len(self.round_loops()),
             "auto": self.auto,
             "status": self.status,
             "stopReason": self.stop_reason,
@@ -319,6 +329,7 @@ class LoopState:
             loops=[LoopRecord.from_dict(l) for l in d.get("loops", [])],
             risk_coefficient=float(d.get("riskCoefficient", 0.3)),
             max_loops=int(d.get("maxLoops", 8)),
+            round=int(d.get("round", 1)),
             auto=bool(d.get("auto", False)),
             status=d.get("status", "active"),
             stop_reason=d.get("stopReason", ""),

@@ -21,7 +21,7 @@ interface LoopAnalysis {
   deliverable: boolean; outputtable: boolean;
 }
 interface LoopRecord {
-  seq: number; subStage: string; goal: string; orchestration: LoopStep[];
+  seq: number; subStage: string; round: number; goal: string; orchestration: LoopStep[];
   completed: boolean; result: string; analysis: LoopAnalysis | null; error: string;
 }
 interface IdeaEntry { id: string; prompt: string; status: string; result: string; error: string; }
@@ -31,6 +31,7 @@ interface LoopStateT {
   sessionId: string; stage: string; goal: string;
   ideas: IdeaEntry[]; loops: LoopRecord[];
   riskCoefficient: number; maxLoops: number; effectiveMaxLoops: number;
+  round: number; roundLoopCount: number;
   status: string; stopReason: string; bestScore: number; latestScore: number;
   asides: AsideTurn[];
   addons: Addon[];
@@ -102,6 +103,11 @@ export const LoopPanel: React.FC<LoopPanelProps> = ({ sessionId, onClose }) => {
   const setAuto = useCallback((on: boolean) => api.loopSetAuto(sessionId, on), [sessionId]);
   const addAddon = useCallback((text: string) => api.loopAddAddon(sessionId, text), [sessionId]);
   const removeAddon = useCallback((id: string) => api.loopRemoveAddon(sessionId, id), [sessionId]);
+  const continueRound = useCallback(async (goal: string) => {
+    setBusy(true);
+    await api.loopContinue(sessionId, goal);
+    setBusy(false);
+  }, [sessionId]);
 
   const submitIdea = useCallback(async () => {
     const text = ideaInput.trim();
@@ -181,7 +187,7 @@ export const LoopPanel: React.FC<LoopPanelProps> = ({ sessionId, onClose }) => {
                     state={state} progress={progress}
                     selectedSeq={selectedSeq} setSelectedSeq={setSelectedSeq}
                     onRun={runIteration} onAdvanceOut={advanceOut} onSetAuto={setAuto}
-                    onAddAddon={addAddon} onRemoveAddon={removeAddon}
+                    onAddAddon={addAddon} onRemoveAddon={removeAddon} onContinue={continueRound}
                     running={running} busy={busy}
                     goalDraft={goalDraft} setGoalDraft={setGoalDraft} onSaveGoal={saveGoal}
                   />
@@ -338,7 +344,7 @@ const MetricBar: React.FC<{ state: LoopStateT }> = ({ state }) => (
   <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', marginBottom: 16 }}>
     <Metric label="最佳分数" value={state.bestScore.toFixed(0)} accent={scoreColor(state.bestScore)} />
     <Metric label="最近分数" value={state.latestScore.toFixed(0)} accent={scoreColor(state.latestScore)} />
-    <Metric label="已跑 Loop" value={`${state.loops.length} / ${state.effectiveMaxLoops}`} />
+    <Metric label={state.round > 1 ? `本轮 Loop（第${state.round}轮）` : '已跑 Loop'} value={`${state.roundLoopCount} / ${state.effectiveMaxLoops}`} />
     <RiskMetric risk={state.riskCoefficient} />
     {state.bestScore >= 70 && <Badge text="可交付" color="#2da44e" />}
     {state.bestScore >= 85 && <Badge text="可输出" color="#8957e5" />}
@@ -484,21 +490,69 @@ const AddonPanel: React.FC<{
   );
 };
 
+// ══ loopout 引导：本轮产出 + 开启新一轮 ════════════════════════
+const LoopOutBanner: React.FC<{ state: LoopStateT; onContinue: (goal: string) => void; busy: boolean }> =
+  ({ state, onContinue, busy }) => {
+    const [goal, setGoal] = useState(state.goal || '');
+    const [editing, setEditing] = useState(false);
+    return (
+      <div style={{ ...sealBox, marginBottom: 16, borderColor: '#8957e555', background: '#8957e50d' }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6 }}>
+          <span style={{ fontSize: 14, fontWeight: 700, color: 'var(--theme-text)' }}>
+            ✅ loopout · 第 {state.round} 轮已产出
+          </span>
+          <span style={{ fontSize: 12, color: 'var(--theme-text-muted)' }}>最佳分数 {state.bestScore.toFixed(0)}</span>
+        </div>
+        {state.stopReason && (
+          <div style={{ fontSize: 12, color: 'var(--theme-text-muted)', marginBottom: 8 }}>收口原因：{state.stopReason}</div>
+        )}
+        <div style={{ fontSize: 12.5, color: 'var(--theme-text)', lineHeight: 1.6, marginBottom: 10 }}>
+          loopout 是本轮的产出阶段，<b>不是会话终点</b>。你可以在现有成果（同一工作目录与上下文）的
+          基础上 <b>设定 / 修改任务，开启新一轮迭代</b>——相当于一段新的 auto-loop，轮次 +1、趋势与
+          风险从头计。{state.auto && <span style={{ color: '#2da44e' }}> Auto 已开启：开启后将自动连跑。</span>}
+        </div>
+        {editing ? (
+          <textarea
+            value={goal} onChange={(e) => setGoal(e.target.value)}
+            placeholder="新一轮的目标（默认沿用上一轮目标，可在此修改 / 追加新任务）"
+            style={{ ...inputBase, width: '100%', minHeight: 64, resize: 'vertical', marginBottom: 10 }}
+          />
+        ) : (
+          <div
+            onClick={() => setEditing(true)}
+            title="点击修改新一轮目标"
+            style={{ fontSize: 13, color: 'var(--theme-text)', lineHeight: 1.6, marginBottom: 10, padding: '8px 10px', borderRadius: 8, background: 'var(--theme-bg-secondary)', border: '1px dashed var(--theme-border)', cursor: 'text', whiteSpace: 'pre-wrap' }}
+          >
+            🎯 {goal || '（点击设定新一轮目标）'}
+          </div>
+        )}
+        <button
+          onClick={() => onContinue(goal.trim())}
+          disabled={busy}
+          style={{ ...primaryBtn, background: '#8957e5' }}
+        >
+          ▶ 开启新一轮（第 {state.round + 1} 轮 loopexecute）
+        </button>
+      </div>
+    );
+  };
+
 // ══ Execute stage ═════════════════════════════════════════════
 const ExecuteStage: React.FC<{
   state: LoopStateT; progress: Record<string, string>;
   selectedSeq: number | null; setSelectedSeq: (v: number | null) => void;
   onRun: () => void; onAdvanceOut: () => void; onSetAuto: (on: boolean) => void;
   onAddAddon: (text: string) => void; onRemoveAddon: (id: string) => void;
+  onContinue: (goal: string) => void;
   running: boolean; busy: boolean;
   goalDraft: string; setGoalDraft: (v: string) => void; onSaveGoal: () => void;
-}> = ({ state, progress, selectedSeq, setSelectedSeq, onRun, onAdvanceOut, onSetAuto, onAddAddon, onRemoveAddon, running, busy, goalDraft, setGoalDraft, onSaveGoal }) => {
+}> = ({ state, progress, selectedSeq, setSelectedSeq, onRun, onAdvanceOut, onSetAuto, onAddAddon, onRemoveAddon, onContinue, running, busy, goalDraft, setGoalDraft, onSaveGoal }) => {
   const isOut = state.stage === 'loopout';
   const selected = state.loops.find((l) => l.seq === selectedSeq) || null;
   const [editGoal, setEditGoal] = useState(false);
   const runLabel = state.resumable
     ? `▶ 继续未完成的 Loop #${state.loops.length}`
-    : `▶ 运行第 ${state.loops.length + 1} 次 Loop`;
+    : `▶ 运行下一次 Loop${state.round > 1 ? `（第 ${state.round} 轮）` : ''}`;
 
   return (
     <div>
@@ -545,21 +599,30 @@ const ExecuteStage: React.FC<{
           )}
         </div>
       )}
-      {isOut && state.stopReason && (
-        <div style={{ marginBottom: 16, fontSize: 13, color: 'var(--theme-text-muted)' }}>
-          ⏹ 收口原因：{state.stopReason}
-        </div>
-      )}
+      {/* loopout：不是终点 —— 展示本轮产出小结 + 开启新一轮的引导 */}
+      {isOut && <LoopOutBanner state={state} onContinue={onContinue} busy={busy} />}
 
       {/* ★ 执行中补充（addon）：不影响当前 loop，下一次 loop 纳入并完成 */}
       {!isOut && <AddonPanel addons={state.addons || []} onAdd={onAddAddon} onRemove={onRemoveAddon} />}
 
-      {/* Loop 时间轴 */}
-      <div style={{ display: 'flex', gap: 10, overflowX: 'auto', paddingBottom: 12, marginBottom: 8 }}>
+      {/* Loop 时间轴（多轮时按轮分隔） */}
+      <div style={{ display: 'flex', gap: 10, overflowX: 'auto', paddingBottom: 12, marginBottom: 8, alignItems: 'stretch' }}>
         {state.loops.length === 0 && <div style={{ color: 'var(--theme-text-muted)', fontSize: 13 }}>还没有 loop，点击上方按钮开始第 1 次。</div>}
-        {state.loops.map((l) => (
-          <LoopNode key={l.seq} loop={l} selected={l.seq === selectedSeq} onClick={() => setSelectedSeq(l.seq === selectedSeq ? null : l.seq)} />
-        ))}
+        {state.loops.map((l, i) => {
+          const newRound = state.round > 1 && (i === 0 || state.loops[i - 1].round !== l.round);
+          return (
+            <React.Fragment key={l.seq}>
+              {newRound && (
+                <div style={{ display: 'flex', alignItems: 'center', flexShrink: 0 }}>
+                  <span style={{ writingMode: 'vertical-rl', fontSize: 10, fontWeight: 700, color: 'var(--theme-accent)', background: 'var(--theme-accent-bg)', borderRadius: 6, padding: '6px 3px', letterSpacing: 1 }}>
+                    第 {l.round} 轮
+                  </span>
+                </div>
+              )}
+              <LoopNode loop={l} selected={l.seq === selectedSeq} onClick={() => setSelectedSeq(l.seq === selectedSeq ? null : l.seq)} />
+            </React.Fragment>
+          );
+        })}
       </div>
 
       {/* 详情面板 */}
