@@ -545,6 +545,9 @@ export const App: React.FC = () => {
       '--theme-bg': ua < 1 ? hexToRgba(theme.bg, ua) : theme.bg,
       '--theme-bg-secondary': ua < 1 ? hexToRgba(theme.bgSecondary, ua) : theme.bgSecondary,
       '--theme-bg-tertiary': ua < 1 ? hexToRgba(theme.bgTertiary, ua) : theme.bgTertiary,
+      // 密集数据面板(如 Loop 内嵌面板)需要的"实色底"：即便用户把气泡调得很透,
+      // 也保留 ≥0.86 的不透明度,叠在壁纸上仍能看清。配合 backdrop-filter 用。
+      '--theme-panel-bg': hexToRgba(theme.bg, Math.max(ua, 0.86)),
       '--theme-border': theme.border,
       '--theme-text': theme.text,
       '--theme-text-muted': theme.textMuted,

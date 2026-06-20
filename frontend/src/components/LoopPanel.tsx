@@ -282,9 +282,11 @@ const AsideDrawer: React.FC<{
                 </div>
               </div>
               <div style={{ display: 'flex', justifyContent: 'flex-start' }}>
-                <div style={{ maxWidth: '90%', padding: '7px 11px', borderRadius: '12px 12px 12px 2px', background: 'var(--theme-bg-tertiary)', color: 'var(--theme-text)', fontSize: 12.5, lineHeight: 1.55, whiteSpace: 'pre-wrap', border: '1px solid var(--theme-border)' }}>
+                <div style={{ maxWidth: '90%', padding: '7px 11px', borderRadius: '12px 12px 12px 2px', background: 'var(--theme-bg-tertiary)', color: 'var(--theme-text)', fontSize: 12.5, lineHeight: 1.55, border: '1px solid var(--theme-border)', overflowWrap: 'anywhere' }}>
                   {t.seq > 0 && <span style={{ fontSize: 10, color: 'var(--theme-text-muted)', display: 'block', marginBottom: 3 }}>↳ 提问时：Loop #{t.seq} · {t.stage}</span>}
-                  {answer || (t.status === 'answering' ? '思考中…' : '—')}
+                  {answer
+                    ? <Md text={answer} />
+                    : <span style={{ whiteSpace: 'pre-wrap' }}>{t.status === 'answering' ? '思考中…' : '—'}</span>}
                   {t.status === 'answering' && <span style={{ animation: 'awu-loop-pulse 1s infinite' }}>▋</span>}
                   {t.status === 'error' && !answer && <span style={{ color: '#f87171' }}>回答失败</span>}
                 </div>
@@ -913,7 +915,10 @@ const shell: React.CSSProperties = {
 // 内嵌模式：填满所在 pane，无浮层 backdrop / 圆角 / 阴影
 const embeddedShell: React.CSSProperties = {
   width: '100%', height: '100%', display: 'flex', flexDirection: 'column',
-  overflow: 'hidden', background: 'transparent', minHeight: 0,
+  overflow: 'hidden', minHeight: 0,
+  // ★ 不再全透明：给一层近实色磨砂底,保证密集内容在壁纸上可读
+  background: 'var(--theme-panel-bg, var(--theme-bg))',
+  backdropFilter: 'blur(8px)', WebkitBackdropFilter: 'blur(8px)',
 };
 const btn: React.CSSProperties = {
   background: 'var(--theme-bg-tertiary)', border: '1px solid var(--theme-border)',
