@@ -102,6 +102,24 @@ def _read_clipboard_image_native() -> Optional[dict]:
 
 # ── Layer 2 沙盒路径校验 ────────────────────────────────────────
 
+def _to_native_path(p: str) -> str:
+    """把 MSYS/Git-Bash/Cygwin 风格的绝对路径转成原生路径，避免误判。
+
+    claude CLI 在 Git-Bash/MSYS 下常输出 `/d/foo/bar` 这种盘符路径，而工作目录是
+    Windows 原生的 `D:\\foo\\bar`。Windows 上 `os.path.abspath('/d/foo')` 会把它锚到
+    当前盘根（如 `C:\\d\\foo`），导致与工作目录比较时永远「越界」。这里先归一化。
+    """
+    import os, re
+    if not p or os.name != "nt":
+        return p
+    m = re.match(r"^[/\\]([a-zA-Z])([/\\].*)?$", p)
+    if m:
+        drive = m.group(1).upper()
+        rest = (m.group(2) or "").replace("/", "\\")
+        return f"{drive}:{rest or os.sep}"
+    return p
+
+
 def validate_sandbox_path(file_path: str, working_dir: str) -> tuple[bool, str]:
     """
     检查 file_path 是否在 working_dir 范围内。
@@ -111,12 +129,15 @@ def validate_sandbox_path(file_path: str, working_dir: str) -> tuple[bool, str]:
     if not working_dir:
         return True, ""
     try:
-        wd = os.path.realpath(os.path.abspath(working_dir))
-        fp = os.path.realpath(os.path.abspath(file_path))
+        wd = os.path.realpath(os.path.abspath(_to_native_path(working_dir)))
+        fp = os.path.realpath(os.path.abspath(_to_native_path(file_path)))
     except (OSError, ValueError) as e:
         return False, f"路径解析失败: {e}"
+    # Windows 上大小写不敏感、分隔符统一，用 normcase 归一后比较，避免盘符大小写 / 斜杠差异误判
+    wdn = os.path.normcase(wd)
+    fpn = os.path.normcase(fp)
     # 允许 working_dir 本身及其子目录
-    if fp == wd or fp.startswith(wd + os.sep):
+    if fpn == wdn or fpn.startswith(wdn + os.sep):
         return True, ""
     return False, f"路径 {file_path} 超出工作目录 {working_dir}"
 
@@ -153,6 +174,9 @@ def validate_tool_sandbox(tool_name: str, tool_input: str | dict, working_dir: s
     def _check_path(p: str) -> tuple[bool, str]:
         if not p:
             return True, ""
+        # 先把 MSYS/Git-Bash 风格盘符路径（/d/foo）归一成原生（D:\foo），否则下面的
+        # isabs 判断与拼接都会出错，进而误报越界
+        p = _to_native_path(p)
         # 相对路径：相对于 working_dir
         if not os.path.isabs(p):
             p = os.path.join(working_dir, p)

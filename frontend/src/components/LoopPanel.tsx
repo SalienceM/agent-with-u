@@ -52,9 +52,11 @@ export interface LoopPanelProps {
   sessionId: string;
   onClose?: () => void;
   embedded?: boolean;   // true = 作为会话内容内嵌渲染（无浮层、无关闭按钮）
+  sandboxEnabled?: boolean;            // loop 会话没有聊天工具栏，这里提供沙盒开关
+  onSandboxChange?: (enabled: boolean) => void;
 }
 
-export const LoopPanel: React.FC<LoopPanelProps> = ({ sessionId, onClose, embedded }) => {
+export const LoopPanel: React.FC<LoopPanelProps> = ({ sessionId, onClose, embedded, sandboxEnabled, onSandboxChange }) => {
   const [state, setState] = useState<LoopStateT | null>(null);
   const [hackMode, setHackMode] = useState(false);
   const [selectedSeq, setSelectedSeq] = useState<number | null>(null);
@@ -161,7 +163,8 @@ export const LoopPanel: React.FC<LoopPanelProps> = ({ sessionId, onClose, embedd
     return wrap(
       <>
         <Header stage="…" hackMode={hackMode} setHackMode={setHackMode}
-          asideOpen={false} setAsideOpen={() => {}} asideCount={0} onClose={onClose} embedded={embedded} />
+          asideOpen={false} setAsideOpen={() => {}} asideCount={0} onClose={onClose} embedded={embedded}
+          sandboxEnabled={sandboxEnabled} onSandboxChange={onSandboxChange} />
         <div style={{ padding: 40, textAlign: 'center', color: 'var(--theme-text-muted)' }}>
           正在加载 Loop 状态…
         </div>
@@ -173,7 +176,8 @@ export const LoopPanel: React.FC<LoopPanelProps> = ({ sessionId, onClose, embedd
     <>
       <Header stage={state.stage} hackMode={hackMode} setHackMode={setHackMode}
         asideOpen={asideOpen} setAsideOpen={setAsideOpen} asideCount={state.asides?.length || 0}
-        onClose={onClose} embedded={embedded} />
+        onClose={onClose} embedded={embedded}
+        sandboxEnabled={sandboxEnabled} onSandboxChange={onSandboxChange} />
       <StageRail stage={state.stage} />
 
         <div style={{ flex: 1, display: 'flex', minHeight: 0, position: 'relative' }}>
@@ -227,7 +231,8 @@ const Header: React.FC<{
   stage: string; hackMode: boolean; setHackMode: (v: boolean) => void;
   asideOpen: boolean; setAsideOpen: (v: boolean) => void; asideCount: number;
   onClose?: () => void; embedded?: boolean;
-}> = ({ stage, hackMode, setHackMode, asideOpen, setAsideOpen, asideCount, onClose, embedded }) => (
+  sandboxEnabled?: boolean; onSandboxChange?: (enabled: boolean) => void;
+}> = ({ stage, hackMode, setHackMode, asideOpen, setAsideOpen, asideCount, onClose, embedded, sandboxEnabled, onSandboxChange }) => (
     <div style={{
       display: 'flex', alignItems: 'center', gap: 12, padding: '12px 18px',
       borderBottom: '1px solid var(--theme-border)',
@@ -236,6 +241,18 @@ const Header: React.FC<{
       <span style={{ fontSize: 15, fontWeight: 700, color: 'var(--theme-text)' }}>可视化 Loop</span>
       <span style={{ fontSize: 12, color: 'var(--theme-accent)', fontFamily: 'monospace' }}>{stage}</span>
       <div style={{ flex: 1 }} />
+      {/* ★ 沙盒开关：loop 会话没有聊天工具栏，在这里开/关文件操作的工作目录边界限制 */}
+      {onSandboxChange && (
+        <button
+          onClick={() => onSandboxChange(!sandboxEnabled)}
+          style={{ ...btn, ...(sandboxEnabled ? {} : { background: '#bf87001f', color: '#bf8700', borderColor: '#bf870055' }) }}
+          title={sandboxEnabled
+            ? '沙盒已启用：文件操作限制在工作目录内。若误报越界（如 /d/ 这类路径），可在此关闭'
+            : '沙盒已关闭：无路径限制'}
+        >
+          {sandboxEnabled ? '🔒 沙盒' : '🔓 沙盒关'}
+        </button>
+      )}
       {/* ★ session 级 By the way 激活按钮：旁路问答，不污染 loop 主线 */}
       <button
         onClick={() => setAsideOpen(!asideOpen)}

@@ -305,7 +305,8 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
           background: 'transparent',
         }}
       >
-        <LoopPanel sessionId={sessionId} embedded />
+        <LoopPanel sessionId={sessionId} embedded
+          sandboxEnabled={sandboxEnabled} onSandboxChange={handleSandboxChange} />
       </div>
     );
   }
