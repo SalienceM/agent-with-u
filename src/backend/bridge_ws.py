@@ -2243,12 +2243,31 @@ class BridgeWS:
         aj = self._extract_json_block(atext) or {}
         score = float(aj.get("score", 0) or 0)
         opt = float(aj.get("optimizationPotential", 0) or 0)
+        notes = (aj.get("notes") or "").strip()
+        trend = (aj.get("trend") or "").strip()
+        challenges = (aj.get("challenges") or "").strip()
+        # ★ 兜底：非严格 JSON 的后端（qwen / openai 兼容 / claudeoffice 等）常把分数
+        #   写在散文里，或 JSON 带未转义字符导致解析失败 → score 一直为 0。这里用正则
+        #   把分数捞出来，避免最佳/最近分数被卡死在 0。
+        if score <= 0:
+            import re as _re
+            m = (_re.search(r'(?:"?score"?|分数|得分|评分)\s*[:：=]\s*([0-9]{1,3}(?:\.[0-9]+)?)', atext, _re.I)
+                 or _re.search(r'\b([0-9]{1,3})\s*/\s*100\b', atext))
+            if m:
+                try:
+                    score = float(m.group(1))
+                except ValueError:
+                    pass
+        score = max(0.0, min(100.0, score))
+        if not notes:
+            # JSON 没抽到 notes 时，至少把模型原文留下，免得分析栏空白
+            notes = atext.strip()[:1200]
         analysis = LoopAnalysis(
             score=score,
-            notes=(aj.get("notes") or "").strip(),
-            trend=(aj.get("trend") or "").strip(),
-            optimization_potential=opt,
-            challenges=(aj.get("challenges") or "").strip(),
+            notes=notes,
+            trend=trend,
+            optimization_potential=max(0.0, min(1.0, opt)),
+            challenges=challenges,
             deliverable=score >= DELIVERABLE_SCORE,
             outputtable=score >= OUTPUTTABLE_SCORE,
         )
