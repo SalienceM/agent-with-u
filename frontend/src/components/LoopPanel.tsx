@@ -539,10 +539,14 @@ const AddonPanel: React.FC<{
 };
 
 // ══ loopout 引导：本轮产出 + 开启新一轮 ════════════════════════
-const LoopOutBanner: React.FC<{ state: LoopStateT; onContinue: (goal: string) => void; busy: boolean }> =
-  ({ state, onContinue, busy }) => {
+const LoopOutBanner: React.FC<{
+  state: LoopStateT; onContinue: (goal: string) => void; busy: boolean;
+  onRefineGoal: (hint: string) => Promise<{ status: string; goal?: string; message?: string }>;
+}> =
+  ({ state, onContinue, busy, onRefineGoal }) => {
     const [goal, setGoal] = useState(state.goal || '');
     const [editing, setEditing] = useState(false);
+    const [refineOpen, setRefineOpen] = useState(false);
     return (
       <div style={{ ...sealBox, marginBottom: 16, borderColor: '#8957e555', background: '#8957e50d' }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6 }}>
@@ -559,20 +563,30 @@ const LoopOutBanner: React.FC<{ state: LoopStateT; onContinue: (goal: string) =>
           基础上 <b>设定 / 修改任务，开启新一轮迭代</b>——相当于一段新的 auto-loop，轮次 +1、趋势与
           风险从头计。{state.auto && <span style={{ color: '#2da44e' }}> Auto 已开启：开启后将自动连跑。</span>}
         </div>
-        {editing ? (
-          <textarea
-            value={goal} onChange={(e) => setGoal(e.target.value)}
-            placeholder="新一轮的目标（默认沿用上一轮目标，可在此修改 / 追加新任务）"
-            style={{ ...inputBase, width: '100%', minHeight: 64, resize: 'vertical', marginBottom: 10 }}
-          />
+        {refineOpen ? (
+          <RefineBox onRefineGoal={onRefineGoal} onResult={(g) => setGoal(g)} onCancel={() => setRefineOpen(false)} />
         ) : (
-          <div
-            onClick={() => setEditing(true)}
-            title="点击修改新一轮目标"
-            style={{ fontSize: 13, color: 'var(--theme-text)', lineHeight: 1.6, marginBottom: 10, padding: '8px 10px', borderRadius: 8, background: 'var(--theme-bg-secondary)', border: '1px dashed var(--theme-border)', cursor: 'text', whiteSpace: 'pre-wrap' }}
-          >
-            🎯 {goal || '（点击设定新一轮目标）'}
-          </div>
+          <>
+            {editing ? (
+              <textarea
+                value={goal} onChange={(e) => setGoal(e.target.value)}
+                placeholder="新一轮的目标（默认沿用上一轮目标，可在此修改 / 追加新任务）"
+                style={{ ...inputBase, width: '100%', minHeight: 64, resize: 'vertical', marginBottom: 10 }}
+              />
+            ) : (
+              <div
+                onClick={() => setEditing(true)}
+                title="点击修改新一轮目标"
+                style={{ fontSize: 13, color: 'var(--theme-text)', lineHeight: 1.6, marginBottom: 10, padding: '8px 10px', borderRadius: 8, background: 'var(--theme-bg-secondary)', border: '1px dashed var(--theme-border)', cursor: 'text', whiteSpace: 'pre-wrap' }}
+              >
+                🎯 {goal || '（点击设定新一轮目标）'}
+              </div>
+            )}
+            <div style={{ display: 'flex', gap: 8, marginBottom: 12 }}>
+              <button onClick={() => setRefineOpen(true)} style={{ ...btn, ...btnActive }}
+                title="给一句提示，让模型基于当前目标+原始诉求自动改写新一轮目标">✨ 微调目标</button>
+            </div>
+          </>
         )}
         <button
           onClick={() => onContinue(goal.trim())}
@@ -601,28 +615,52 @@ function relTime(ts: number): string {
   return `${Math.floor(s / 86400)} 天前`;
 }
 
-const GoalCard: React.FC<{
-  state: LoopStateT; isOut: boolean;
+// 按提示让模型微调目标的输入框（GoalCard 与 loopout 新一轮共用）
+const RefineBox: React.FC<{
   onRefineGoal: (hint: string) => Promise<{ status: string; goal?: string; message?: string }>;
-  goalDraft: string; setGoalDraft: (v: string) => void; onSaveGoal: () => void;
-}> = ({ state, isOut, onRefineGoal, goalDraft, setGoalDraft, onSaveGoal }) => {
-  const [mode, setMode] = useState<'view' | 'refine' | 'edit'>('view');
+  onResult?: (goal: string) => void;   // 拿到微调结果（loopout 用来同步本地草稿）
+  onCancel: () => void;
+}> = ({ onRefineGoal, onResult, onCancel }) => {
   const [hint, setHint] = useState('');
   const [refining, setRefining] = useState(false);
-  const [showHist, setShowHist] = useState(false);
-  const [showIdeas, setShowIdeas] = useState(false);
-  const history = state.goalHistory || [];
-  const ideas = state.ideas || [];
-
   const doRefine = async () => {
     const h = hint.trim();
     if (!h) return;
     setRefining(true);
     const r = await onRefineGoal(h);
     setRefining(false);
-    if (r.status === 'ok') { setHint(''); setMode('view'); }
+    if (r.status === 'ok') { if (r.goal) onResult?.(r.goal); setHint(''); onCancel(); }
     else if (r.message) alert(r.message);
   };
+  return (
+    <div style={{ marginTop: 10, padding: 10, borderRadius: 8, background: 'var(--theme-bg-secondary)', border: '1px solid var(--theme-accent)' }}>
+      <div style={{ fontSize: 11.5, color: 'var(--theme-text-muted)', marginBottom: 6, lineHeight: 1.5 }}>
+        给一句提示，由模型在「当前目标 + 原始诉求」基础上自动改写。例如「更强调性能」「缩小到只做后端」「把验收标准写细」。每次微调都会留一版历史。
+      </div>
+      <textarea value={hint} onChange={(e) => setHint(e.target.value)} disabled={refining}
+        onKeyDown={(e) => { if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') doRefine(); }}
+        placeholder="微调提示…（Ctrl/Cmd+Enter 提交）"
+        style={{ ...inputBase, width: '100%', minHeight: 50, resize: 'vertical', opacity: refining ? 0.6 : 1 }} />
+      <div style={{ display: 'flex', gap: 8, marginTop: 8 }}>
+        <button onClick={doRefine} disabled={refining || !hint.trim()} style={{ ...primaryBtn, opacity: (refining || !hint.trim()) ? 0.5 : 1 }}>
+          {refining ? '⏳ 微调中…' : '✨ 让模型微调'}
+        </button>
+        <button onClick={onCancel} disabled={refining} style={btn}>取消</button>
+      </div>
+    </div>
+  );
+};
+
+const GoalCard: React.FC<{
+  state: LoopStateT; isOut: boolean;
+  onRefineGoal: (hint: string) => Promise<{ status: string; goal?: string; message?: string }>;
+  goalDraft: string; setGoalDraft: (v: string) => void; onSaveGoal: () => void;
+}> = ({ state, isOut, onRefineGoal, goalDraft, setGoalDraft, onSaveGoal }) => {
+  const [mode, setMode] = useState<'view' | 'refine' | 'edit'>('view');
+  const [showHist, setShowHist] = useState(false);
+  const [showIdeas, setShowIdeas] = useState(false);
+  const history = state.goalHistory || [];
+  const ideas = state.ideas || [];
 
   return (
     <div style={{ ...sealBox, marginBottom: 16 }}>
@@ -645,21 +683,7 @@ const GoalCard: React.FC<{
 
       {/* 按提示微调（引导模型，无需人手编辑） */}
       {mode === 'refine' && (
-        <div style={{ marginTop: 10, padding: 10, borderRadius: 8, background: 'var(--theme-bg-secondary)', border: '1px solid var(--theme-accent)' }}>
-          <div style={{ fontSize: 11.5, color: 'var(--theme-text-muted)', marginBottom: 6, lineHeight: 1.5 }}>
-            给一句提示，由模型在「当前目标 + 原始诉求」基础上自动改写。例如「更强调性能」「缩小到只做后端」「把验收标准写细」。每次微调都会留一版历史。
-          </div>
-          <textarea value={hint} onChange={(e) => setHint(e.target.value)} disabled={refining}
-            onKeyDown={(e) => { if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') doRefine(); }}
-            placeholder="微调提示…（Ctrl/Cmd+Enter 提交）"
-            style={{ ...inputBase, width: '100%', minHeight: 50, resize: 'vertical', opacity: refining ? 0.6 : 1 }} />
-          <div style={{ display: 'flex', gap: 8, marginTop: 8 }}>
-            <button onClick={doRefine} disabled={refining || !hint.trim()} style={{ ...primaryBtn, opacity: (refining || !hint.trim()) ? 0.5 : 1 }}>
-              {refining ? '⏳ 微调中…' : '✨ 让模型微调'}
-            </button>
-            <button onClick={() => { setMode('view'); setHint(''); }} disabled={refining} style={btn}>取消</button>
-          </div>
-        </div>
+        <RefineBox onRefineGoal={onRefineGoal} onCancel={() => setMode('view')} />
       )}
 
       {/* 手动编辑（兜底） */}
@@ -766,7 +790,7 @@ const ExecuteStage: React.FC<{
         </div>
       )}
       {/* loopout：不是终点 —— 展示本轮产出小结 + 开启新一轮的引导 */}
-      {isOut && <LoopOutBanner state={state} onContinue={onContinue} busy={busy} />}
+      {isOut && <LoopOutBanner state={state} onContinue={onContinue} busy={busy} onRefineGoal={onRefineGoal} />}
 
       {/* ★ 执行中补充（addon）：不影响当前 loop，下一次 loop 纳入并完成 */}
       {!isOut && <AddonPanel addons={state.addons || []} onAdd={onAddAddon} onRemove={onRemoveAddon} />}
