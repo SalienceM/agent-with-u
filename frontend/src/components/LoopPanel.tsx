@@ -25,10 +25,12 @@ interface LoopRecord {
   completed: boolean; result: string; analysis: LoopAnalysis | null; error: string;
 }
 interface IdeaEntry { id: string; prompt: string; status: string; result: string; error: string; }
+interface GoalRevision { goal: string; hint: string; source: string; createdAt: number; }
 interface AsideTurn { id: string; question: string; answer: string; status: string; stage: string; seq: number; }
 interface Addon { id: string; text: string; status: string; appliedSeq: number; }
 interface LoopStateT {
   sessionId: string; stage: string; goal: string;
+  goalHistory: GoalRevision[];
   ideas: IdeaEntry[]; loops: LoopRecord[];
   riskCoefficient: number; maxLoops: number; effectiveMaxLoops: number;
   round: number; roundLoopCount: number;
@@ -143,6 +145,10 @@ export const LoopPanel: React.FC<LoopPanelProps> = ({ sessionId, onClose, embedd
     await api.loopSetGoal(sessionId, goalDraft.trim());
   }, [sessionId, goalDraft]);
 
+  const refineGoal = useCallback(async (hint: string) => {
+    return api.loopRefineGoal(sessionId, hint);
+  }, [sessionId]);
+
   // embedded = 作为会话内容内嵌（填满 pane，无浮层 backdrop）；否则浮层模式
   const wrap = (children: React.ReactNode) => embedded
     ? <div style={embeddedShell}>{children}</div>
@@ -193,6 +199,7 @@ export const LoopPanel: React.FC<LoopPanelProps> = ({ sessionId, onClose, embedd
                     onAddAddon={addAddon} onRemoveAddon={removeAddon} onContinue={continueRound}
                     running={running} busy={busy}
                     goalDraft={goalDraft} setGoalDraft={setGoalDraft} onSaveGoal={saveGoal}
+                    onRefineGoal={refineGoal}
                   />
                 )}
               </div>
@@ -578,6 +585,143 @@ const LoopOutBanner: React.FC<{ state: LoopStateT; onContinue: (goal: string) =>
     );
   };
 
+// ══ Goal card：全局目标 + 演变历史 + 按提示微调 + 原始诉求回看 ═══
+const SRC_LABEL: Record<string, { t: string; c: string }> = {
+  seal: { t: '封口汇总', c: '#0969da' },
+  refine: { t: '提示微调', c: '#8957e5' },
+  manual: { t: '手动', c: '#bf8700' },
+};
+
+function relTime(ts: number): string {
+  if (!ts) return '';
+  const s = Math.max(0, Date.now() / 1000 - ts);
+  if (s < 60) return '刚刚';
+  if (s < 3600) return `${Math.floor(s / 60)} 分钟前`;
+  if (s < 86400) return `${Math.floor(s / 3600)} 小时前`;
+  return `${Math.floor(s / 86400)} 天前`;
+}
+
+const GoalCard: React.FC<{
+  state: LoopStateT; isOut: boolean;
+  onRefineGoal: (hint: string) => Promise<{ status: string; goal?: string; message?: string }>;
+  goalDraft: string; setGoalDraft: (v: string) => void; onSaveGoal: () => void;
+}> = ({ state, isOut, onRefineGoal, goalDraft, setGoalDraft, onSaveGoal }) => {
+  const [mode, setMode] = useState<'view' | 'refine' | 'edit'>('view');
+  const [hint, setHint] = useState('');
+  const [refining, setRefining] = useState(false);
+  const [showHist, setShowHist] = useState(false);
+  const [showIdeas, setShowIdeas] = useState(false);
+  const history = state.goalHistory || [];
+  const ideas = state.ideas || [];
+
+  const doRefine = async () => {
+    const h = hint.trim();
+    if (!h) return;
+    setRefining(true);
+    const r = await onRefineGoal(h);
+    setRefining(false);
+    if (r.status === 'ok') { setHint(''); setMode('view'); }
+    else if (r.message) alert(r.message);
+  };
+
+  return (
+    <div style={{ ...sealBox, marginBottom: 16 }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6, flexWrap: 'wrap' }}>
+        <span style={{ fontSize: 13, fontWeight: 700, color: 'var(--theme-text)' }}>🎯 全局目标</span>
+        {history.length > 0 && <span style={{ fontSize: 11, color: 'var(--theme-text-muted)' }}>v{history.length}</span>}
+        <div style={{ flex: 1 }} />
+        {mode === 'view' && (
+          <>
+            <button onClick={() => setMode('refine')} style={{ ...btn, ...btnActive }} title="给一句提示，让模型在当前目标+原始诉求基础上自动微调">✨ 微调目标</button>
+            <button onClick={() => { setMode('edit'); setGoalDraft(state.goal); }} style={btn} title="手动改写">编辑</button>
+          </>
+        )}
+      </div>
+
+      {/* 当前目标 */}
+      <div style={{ fontSize: 13, color: state.goal ? 'var(--theme-text)' : 'var(--theme-text-muted)', lineHeight: 1.6, whiteSpace: 'pre-wrap' }}>
+        {state.goal || '（封口后由模型收敛中…稍候自动出现）'}
+      </div>
+
+      {/* 按提示微调（引导模型，无需人手编辑） */}
+      {mode === 'refine' && (
+        <div style={{ marginTop: 10, padding: 10, borderRadius: 8, background: 'var(--theme-bg-secondary)', border: '1px solid var(--theme-accent)' }}>
+          <div style={{ fontSize: 11.5, color: 'var(--theme-text-muted)', marginBottom: 6, lineHeight: 1.5 }}>
+            给一句提示，由模型在「当前目标 + 原始诉求」基础上自动改写。例如「更强调性能」「缩小到只做后端」「把验收标准写细」。每次微调都会留一版历史。
+          </div>
+          <textarea value={hint} onChange={(e) => setHint(e.target.value)} disabled={refining}
+            onKeyDown={(e) => { if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') doRefine(); }}
+            placeholder="微调提示…（Ctrl/Cmd+Enter 提交）"
+            style={{ ...inputBase, width: '100%', minHeight: 50, resize: 'vertical', opacity: refining ? 0.6 : 1 }} />
+          <div style={{ display: 'flex', gap: 8, marginTop: 8 }}>
+            <button onClick={doRefine} disabled={refining || !hint.trim()} style={{ ...primaryBtn, opacity: (refining || !hint.trim()) ? 0.5 : 1 }}>
+              {refining ? '⏳ 微调中…' : '✨ 让模型微调'}
+            </button>
+            <button onClick={() => { setMode('view'); setHint(''); }} disabled={refining} style={btn}>取消</button>
+          </div>
+        </div>
+      )}
+
+      {/* 手动编辑（兜底） */}
+      {mode === 'edit' && (
+        <div style={{ display: 'flex', gap: 8, marginTop: 10 }}>
+          <textarea value={goalDraft} onChange={(e) => setGoalDraft(e.target.value)} style={{ ...inputBase, flex: 1, minHeight: 54 }} />
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+            <button onClick={() => { onSaveGoal(); setMode('view'); }} style={primaryBtn}>保存</button>
+            <button onClick={() => setMode('view')} style={btn}>取消</button>
+          </div>
+        </div>
+      )}
+
+      {/* 折叠入口：目标演变 + 原始诉求 */}
+      <div style={{ display: 'flex', gap: 16, marginTop: 10, flexWrap: 'wrap' }}>
+        {history.length > 1 && (
+          <button onClick={() => setShowHist(!showHist)} style={linkBtn}>
+            {showHist ? '▾' : '▸'} 目标演变（{history.length} 版）
+          </button>
+        )}
+        {ideas.length > 0 && (
+          <button onClick={() => setShowIdeas(!showIdeas)} style={linkBtn}>
+            {showIdeas ? '▾' : '▸'} 原始诉求（{ideas.length} 条）
+          </button>
+        )}
+      </div>
+
+      {showHist && history.length > 0 && (
+        <div style={{ marginTop: 8, display: 'flex', flexDirection: 'column', gap: 8 }}>
+          {history.map((g, i) => {
+            const sl = SRC_LABEL[g.source] || SRC_LABEL.manual;
+            const cur = i === history.length - 1;
+            return (
+              <div key={i} style={{ padding: '8px 10px', borderRadius: 8, background: cur ? 'var(--theme-accent-bg)' : 'var(--theme-bg-secondary)', border: `1px solid ${cur ? 'var(--theme-accent)' : 'var(--theme-border)'}` }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 4, flexWrap: 'wrap' }}>
+                  <span style={{ fontSize: 10, fontWeight: 700, color: '#fff', background: sl.c, borderRadius: 4, padding: '1px 6px' }}>v{i + 1} · {sl.t}</span>
+                  {cur && <span style={{ fontSize: 10, color: 'var(--theme-accent)', fontWeight: 600 }}>当前</span>}
+                  <span style={{ fontSize: 10, color: 'var(--theme-text-muted)' }}>{relTime(g.createdAt)}</span>
+                </div>
+                {g.hint && <div style={{ fontSize: 11.5, color: 'var(--theme-text-muted)', marginBottom: 4 }}>提示：{g.hint}</div>}
+                <div style={{ fontSize: 12.5, color: 'var(--theme-text)', lineHeight: 1.55, whiteSpace: 'pre-wrap' }}>{g.goal}</div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      {showIdeas && ideas.length > 0 && (
+        <div style={{ marginTop: 8, display: 'flex', flexDirection: 'column', gap: 6 }}>
+          <div style={{ fontSize: 11, color: 'var(--theme-text-muted)' }}>封口前投递的想法 / 原始诉求（全局目标由此收敛而来）：</div>
+          {ideas.map((it) => (
+            <div key={it.id} style={{ padding: '7px 10px', borderRadius: 8, background: 'var(--theme-bg-secondary)', border: '1px solid var(--theme-border)' }}>
+              <div style={{ fontSize: 12.5, color: 'var(--theme-text)', whiteSpace: 'pre-wrap', lineHeight: 1.5 }}>{it.prompt}</div>
+              {it.result && <div style={{ fontSize: 11.5, color: 'var(--theme-text-muted)', marginTop: 4, whiteSpace: 'pre-wrap', lineHeight: 1.5 }}>↳ {it.result}</div>}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+};
+
 // ══ Execute stage ═════════════════════════════════════════════
 const ExecuteStage: React.FC<{
   state: LoopStateT; progress: Record<string, string>;
@@ -587,38 +731,19 @@ const ExecuteStage: React.FC<{
   onContinue: (goal: string) => void;
   running: boolean; busy: boolean;
   goalDraft: string; setGoalDraft: (v: string) => void; onSaveGoal: () => void;
-}> = ({ state, progress, selectedSeq, setSelectedSeq, onRun, onAdvanceOut, onSetAuto, onAddAddon, onRemoveAddon, onContinue, running, busy, goalDraft, setGoalDraft, onSaveGoal }) => {
+  onRefineGoal: (hint: string) => Promise<{ status: string; goal?: string; message?: string }>;
+}> = ({ state, progress, selectedSeq, setSelectedSeq, onRun, onAdvanceOut, onSetAuto, onAddAddon, onRemoveAddon, onContinue, running, busy, goalDraft, setGoalDraft, onSaveGoal, onRefineGoal }) => {
   const isOut = state.stage === 'loopout';
   const selected = state.loops.find((l) => l.seq === selectedSeq) || null;
-  const [editGoal, setEditGoal] = useState(false);
   const runLabel = state.resumable
     ? `▶ 继续未完成的 Loop #${state.loops.length}`
     : `▶ 运行下一次 Loop${state.round > 1 ? `（第 ${state.round} 轮）` : ''}`;
 
   return (
     <div>
-      {/* 全局目标 */}
-      <div style={{ ...sealBox, marginBottom: 16 }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6 }}>
-          <span style={{ fontSize: 13, fontWeight: 700, color: 'var(--theme-text)' }}>🎯 全局目标</span>
-          <div style={{ flex: 1 }} />
-          {!isOut && (
-            <button onClick={() => { setEditGoal(!editGoal); setGoalDraft(state.goal); }} style={btn}>
-              {editGoal ? '取消' : '编辑'}
-            </button>
-          )}
-        </div>
-        {editGoal ? (
-          <div style={{ display: 'flex', gap: 8 }}>
-            <textarea value={goalDraft} onChange={(e) => setGoalDraft(e.target.value)} style={{ ...inputBase, flex: 1, minHeight: 54 }} />
-            <button onClick={() => { onSaveGoal(); setEditGoal(false); }} style={primaryBtn}>保存</button>
-          </div>
-        ) : (
-          <div style={{ fontSize: 13, color: state.goal ? 'var(--theme-text)' : 'var(--theme-text-muted)', lineHeight: 1.6, whiteSpace: 'pre-wrap' }}>
-            {state.goal || '（封口后由模型收敛中…刷新可见）'}
-          </div>
-        )}
-      </div>
+      {/* 全局目标（含演变历史 + 按提示微调 + 原始诉求回看） */}
+      <GoalCard state={state} isOut={isOut} onRefineGoal={onRefineGoal}
+        goalDraft={goalDraft} setGoalDraft={setGoalDraft} onSaveGoal={onSaveGoal} />
 
       {/* 操作 */}
       {!isOut && (
@@ -982,6 +1107,9 @@ const sealBox: React.CSSProperties = {
 };
 const miniX: React.CSSProperties = {
   background: 'none', border: 'none', color: 'var(--theme-text-muted)', cursor: 'pointer', fontSize: 12, padding: 2,
+};
+const linkBtn: React.CSSProperties = {
+  background: 'none', border: 'none', color: 'var(--theme-accent)', cursor: 'pointer', fontSize: 12, padding: 0,
 };
 // By the way:浮动贴右、约半屏宽,覆盖在主面板之上(不挤压左侧)
 const asideDrawerStyle: React.CSSProperties = {

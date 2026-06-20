@@ -261,11 +261,34 @@ class Addon:
 
 
 @dataclass
+class GoalRevision:
+    """全局目标的一个版本。封口初版 / 按提示微调 / 手动改 都各留一版,体现演变。"""
+    goal: str
+    hint: str = ""              # 本次微调的额外提示(初版/手动为空)
+    source: str = "seal"        # seal(封口汇总) | refine(按提示微调) | manual(手动)
+    created_at: float = field(default_factory=_now)
+
+    def to_dict(self) -> dict:
+        return {"goal": self.goal, "hint": self.hint,
+                "source": self.source, "createdAt": self.created_at}
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "GoalRevision":
+        return cls(
+            goal=d.get("goal", ""),
+            hint=d.get("hint", ""),
+            source=d.get("source", "seal"),
+            created_at=d.get("createdAt", _now()),
+        )
+
+
+@dataclass
 class LoopState:
     """单个 loop session 的完整 stage 文件。"""
     session_id: str
     stage: str = STAGE_IDEA             # loopidea | loopexecute | loopout
     goal: str = ""                      # 全局目标（idea 封口后形成）
+    goal_history: list[GoalRevision] = field(default_factory=list)  # 目标版本演变
     ideas: list[IdeaEntry] = field(default_factory=list)
     loops: list[LoopRecord] = field(default_factory=list)
     risk_coefficient: float = 0.3       # 0..1 综合风险系数
@@ -280,6 +303,15 @@ class LoopState:
     updated_at: float = field(default_factory=_now)
 
     # ── 派生指标 ────────────────────────────────────────────────
+    def record_goal(self, goal: str, hint: str = "", source: str = "seal") -> None:
+        """登记一版全局目标(去重:与当前最新版相同则不追加)。"""
+        g = (goal or "").strip()
+        if not g:
+            return
+        if self.goal_history and self.goal_history[-1].goal == g:
+            return
+        self.goal_history.append(GoalRevision(goal=g, hint=hint, source=source))
+
     def round_loops(self) -> list["LoopRecord"]:
         """当前轮次的 loop（分数/风险/收口都按当前轮计算）。"""
         return [l for l in self.loops if l.round == self.round]
@@ -301,6 +333,7 @@ class LoopState:
             "sessionId": self.session_id,
             "stage": self.stage,
             "goal": self.goal,
+            "goalHistory": [g.to_dict() for g in self.goal_history],
             "ideas": [i.to_dict() for i in self.ideas],
             "loops": [l.to_dict() for l in self.loops],
             "riskCoefficient": self.risk_coefficient,
@@ -325,6 +358,7 @@ class LoopState:
             session_id=d.get("sessionId", ""),
             stage=d.get("stage", STAGE_IDEA),
             goal=d.get("goal", ""),
+            goal_history=[GoalRevision.from_dict(g) for g in d.get("goalHistory", [])],
             ideas=[IdeaEntry.from_dict(i) for i in d.get("ideas", [])],
             loops=[LoopRecord.from_dict(l) for l in d.get("loops", [])],
             risk_coefficient=float(d.get("riskCoefficient", 0.3)),

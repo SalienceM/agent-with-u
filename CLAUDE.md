@@ -290,10 +290,20 @@ planning) and `prepare` (where they're consumed: marked `applied` with the
 consumed; applied ones remain as struck-through history. Shown in a dedicated
 addon panel in the LoopPanel.
 
+**Global goal provenance & versioning.** Sealing ideas forms the **global goal**.
+The original ideas (`state.ideas`) are kept and surfaced in the LoopPanel's
+GoalCard ("原始诉求" disclosure) so you can trace where the goal came from. Every
+goal change is recorded as a `GoalRevision` in `state.goal_history`
+(`{goal, hint, source, createdAt}`, `source` = `seal` | `refine` | `manual`),
+rendered as a "目标演变" version timeline. `loopRefineGoal(session_id, hint)` is
+**LLM-guided** (no manual editing): it feeds the model the current goal + original
+ideas + the hint and rewrites the goal, appending a `refine` revision. Manual edit
+(`loopSetGoal`) and seal/synthesis also append revisions.
+
 Loop RPCs: `loopGetState`, `loopSubmitIdea`, `loopRemoveIdea`, `loopSealIdea`,
-`loopSetGoal`, `loopRunIteration`, `loopSetAuto`, `loopAdvanceToOut`,
-`loopContinue`, `loopAsk`, `loopAddAddon`, `loopRemoveAddon`. `createSession`
-takes an optional third `session_type` argument.
+`loopSetGoal`, `loopRefineGoal`, `loopRunIteration`, `loopSetAuto`,
+`loopAdvanceToOut`, `loopContinue`, `loopAsk`, `loopAddAddon`, `loopRemoveAddon`.
+`createSession` takes an optional third `session_type` argument.
 
 ### Slash Commands
 

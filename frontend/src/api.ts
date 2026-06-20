@@ -652,6 +652,11 @@ export const api = {
     try { return JSON.parse(result); } catch { return { status: 'error' }; }
   },
 
+  async loopRefineGoal(sessionId: string, hint: string): Promise<{ status: string; goal?: string; message?: string }> {
+    const result = await call('loopRefineGoal', sessionId, hint);
+    try { return JSON.parse(result); } catch { return { status: 'error', message: '响应解析失败' }; }
+  },
+
   async loopRunIteration(sessionId: string): Promise<{ status: string; message?: string }> {
     const result = await call('loopRunIteration', sessionId);
     try { return JSON.parse(result); } catch { return { status: 'error', message: '响应解析失败' }; }
@@ -1253,6 +1258,7 @@ function mockDispatch(method: string, params: any[]): any {
     case 'loopRemoveIdea': return JSON.stringify({ status: 'ok' });
     case 'loopSealIdea': return JSON.stringify({ status: 'error', message: 'mock mode' });
     case 'loopSetGoal': return JSON.stringify({ status: 'ok' });
+    case 'loopRefineGoal': return JSON.stringify({ status: 'error', message: 'mock mode' });
     case 'loopRunIteration': return JSON.stringify({ status: 'error', message: 'mock mode' });
     case 'loopSetAuto': return JSON.stringify({ status: 'ok', auto: !!params[1] });
     case 'loopAdvanceToOut': return JSON.stringify({ status: 'error', message: 'mock mode' });

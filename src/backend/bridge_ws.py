@@ -1870,6 +1870,8 @@ class BridgeWS:
         if state.stage != STAGE_IDEA:
             return json.dumps({"status": "error", "message": "阶段已推进，无法重复封口"}, ensure_ascii=False)
         state.goal = (goal or "").strip()
+        if state.goal:
+            state.record_goal(state.goal, source="seal")
         state.stage = STAGE_EXECUTE
         self._loop_save(state)
         self._emit_loop_updated(state)
@@ -1897,6 +1899,7 @@ class BridgeWS:
         state = self._loop_state(session_id) or state
         if text.strip() and not state.goal:
             state.goal = text.strip()
+            state.record_goal(state.goal, source="seal")
             self._loop_save(state)
             self._emit_loop_updated(state)
 
@@ -1905,9 +1908,40 @@ class BridgeWS:
         if not state:
             return json.dumps({"status": "error", "message": "no loop state"}, ensure_ascii=False)
         state.goal = (goal or "").strip()
+        state.record_goal(state.goal, source="manual")
         self._loop_save(state)
         self._emit_loop_updated(state)
         return json.dumps({"status": "ok"}, ensure_ascii=False)
+
+    async def _rpc_loopRefineGoal(self, session_id: str, hint: str) -> str:
+        """按额外提示让模型微调全局目标（不需人工手编），并留下一版演变记录。"""
+        h = (hint or "").strip()
+        if not h:
+            return json.dumps({"status": "error", "message": "提示为空"}, ensure_ascii=False)
+        session = self._active_sessions.get(session_id) or self._session_store.load(session_id)
+        state = self._loop_state(session_id)
+        if not session or not state:
+            return json.dumps({"status": "error", "message": "no loop state"}, ensure_ascii=False)
+        ideas_text = "\n".join(f"- {i.prompt}" for i in state.ideas) or "(无)"
+        prompt = (
+            "下面是一个迭代任务的【当前全局目标】，以及最初的原始诉求（想法池）。"
+            "请根据【额外提示】对全局目标做一次微调/改写，保持它清晰、可验收、"
+            "一段话说清最终交付什么与成功标准。只输出微调后的目标本身，不要解释、不要前后缀。\n\n"
+            f"【当前全局目标】\n{state.goal or '(空)'}\n\n"
+            f"【最初的原始诉求】\n{ideas_text}\n\n"
+            f"【额外提示】\n{h}"
+        )
+        text = await self._loop_run_agent(session, prompt, sub_stage="goal", seq=-1,
+                                          resume=False, indep_session_id=f"{session_id}:goal")
+        refined = text.strip()
+        state = self._loop_state(session_id) or state
+        if not refined:
+            return json.dumps({"status": "error", "message": "微调未返回内容"}, ensure_ascii=False)
+        state.goal = refined
+        state.record_goal(refined, hint=h, source="refine")
+        self._loop_save(state)
+        self._emit_loop_updated(state)
+        return json.dumps({"status": "ok", "goal": refined}, ensure_ascii=False)
 
     # ── addon：执行中补充要求（不影响当前 loop，下一次 loop 纳入并完成）──
 
@@ -2302,6 +2336,7 @@ class BridgeWS:
         g = (goal or "").strip()
         if g:
             state.goal = g           # 设新任务；留空则沿用原目标继续打磨
+            state.record_goal(g, hint=f"开启第 {state.round + 1} 轮", source="manual")
         state.round += 1
         state.stage = STAGE_EXECUTE
         state.status = "active"
