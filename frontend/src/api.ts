@@ -668,6 +668,12 @@ export const api = {
     try { return JSON.parse(result); } catch { return { status: 'error', message: '响应解析失败' }; }
   },
 
+  /** 停止并删除一次 loop（误触兜底，当作没发生过；消费过的 addon 退回 pending）。 */
+  async loopDiscard(sessionId: string, seq: number = 0): Promise<{ status: string; stopping?: boolean; seq?: number; revertedAddons?: number; message?: string }> {
+    const result = await call('loopDiscard', sessionId, seq);
+    try { return JSON.parse(result); } catch { return { status: 'error', message: '响应解析失败' }; }
+  },
+
   async loopSetAuto(sessionId: string, on: boolean): Promise<{ status: string; auto?: boolean }> {
     const result = await call('loopSetAuto', sessionId, on);
     try { return JSON.parse(result); } catch { return { status: 'error' }; }
@@ -1269,6 +1275,7 @@ function mockDispatch(method: string, params: any[]): any {
     case 'loopRefineGoal': return JSON.stringify({ status: 'error', message: 'mock mode' });
     case 'loopSetPolicy': return JSON.stringify({ status: 'ok' });
     case 'loopRunIteration': return JSON.stringify({ status: 'error', message: 'mock mode' });
+    case 'loopDiscard': return JSON.stringify({ status: 'ok' });
     case 'loopSetAuto': return JSON.stringify({ status: 'ok', auto: !!params[1] });
     case 'loopAdvanceToOut': return JSON.stringify({ status: 'error', message: 'mock mode' });
     case 'loopContinue': return JSON.stringify({ status: 'error', message: 'mock mode' });

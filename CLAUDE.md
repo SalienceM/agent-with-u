@@ -339,10 +339,19 @@ touch an in-flight loop — they take effect from the next prepare/analysis.
 Legacy stage files without `policy` migrate their old `maxLoops` into the policy.
 The shared editor + defaults live in `frontend/src/components/LoopPolicyEditor.tsx`.
 
+**Stop & discard a loop (`loopDiscard`).** A mis-clicked / unwanted iteration can
+be thrown away as if it never ran: `loopDiscard(session_id, seq=0)` (defaults to
+the last loop). If it's running, a `_loop_cancel` flag + `backend.abort` interrupts
+the in-flight agent turn(s) and the running task's `finally` does the cleanup; if
+idle, the RPC cleans up directly. `_discard_record` removes the `LoopRecord` and
+**reverts any addons it consumed** (`applied` with that `seq` → back to `pending`),
+so a discarded loop's addon consumption is undone. The "🗑 停止并删除本次" button
+shows in the execute ops row while running or resumable.
+
 Loop RPCs: `loopGetState`, `loopSubmitIdea`, `loopRemoveIdea`, `loopSealIdea`,
-`loopSetGoal`, `loopRefineGoal`, `loopSetPolicy`, `loopRunIteration`, `loopSetAuto`,
-`loopAdvanceToOut`, `loopContinue`, `loopAsk`, `loopAddAddon`, `loopRemoveAddon`.
-`createSession` takes an optional third `session_type` argument.
+`loopSetGoal`, `loopRefineGoal`, `loopSetPolicy`, `loopRunIteration`, `loopDiscard`,
+`loopSetAuto`, `loopAdvanceToOut`, `loopContinue`, `loopAsk`, `loopAddAddon`,
+`loopRemoveAddon`. `createSession` takes an optional third `session_type` argument.
 
 ### Slash Commands
 

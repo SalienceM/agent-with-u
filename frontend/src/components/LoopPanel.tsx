@@ -144,6 +144,12 @@ export const LoopPanel: React.FC<LoopPanelProps> = ({ sessionId, onClose, embedd
     setBusy(false);
   }, [sessionId]);
 
+  const discardLoop = useCallback(async () => {
+    if (!window.confirm('停止并删除本次 loop？这次 loop 当作没发生过——结果不保存；它在 prepare 时消费的补充（addon）会退回「待纳入」。')) return;
+    const r = await api.loopDiscard(sessionId);
+    if (r.status !== 'ok' && r.message) alert(r.message);
+  }, [sessionId]);
+
   const advanceOut = useCallback(async () => {
     if (!window.confirm('进入 loopout 全局产出阶段（单向）。继续？')) return;
     setBusy(true);
@@ -217,6 +223,7 @@ export const LoopPanel: React.FC<LoopPanelProps> = ({ sessionId, onClose, embedd
                     selectedSeq={selectedSeq} setSelectedSeq={setSelectedSeq}
                     onRun={runIteration} onAdvanceOut={advanceOut} onSetAuto={setAuto}
                     onAddAddon={addAddon} onRemoveAddon={removeAddon} onContinue={continueRound}
+                    onDiscard={discardLoop}
                     running={running} busy={busy}
                     goalDraft={goalDraft} setGoalDraft={setGoalDraft} onSaveGoal={saveGoal}
                     onRefineGoal={refineGoal}
@@ -925,11 +932,11 @@ const ExecuteStage: React.FC<{
   selectedSeq: number | null; setSelectedSeq: (v: number | null) => void;
   onRun: () => void; onAdvanceOut: () => void; onSetAuto: (on: boolean) => void;
   onAddAddon: (text: string, images?: ImageAttachment[]) => void; onRemoveAddon: (id: string) => void;
-  onContinue: (goal: string) => void;
+  onContinue: (goal: string) => void; onDiscard: () => void;
   running: boolean; busy: boolean;
   goalDraft: string; setGoalDraft: (v: string) => void; onSaveGoal: () => void;
   onRefineGoal: (hint: string) => Promise<{ status: string; goal?: string; message?: string }>;
-}> = ({ state, progress, selectedSeq, setSelectedSeq, onRun, onAdvanceOut, onSetAuto, onAddAddon, onRemoveAddon, onContinue, running, busy, goalDraft, setGoalDraft, onSaveGoal, onRefineGoal }) => {
+}> = ({ state, progress, selectedSeq, setSelectedSeq, onRun, onAdvanceOut, onSetAuto, onAddAddon, onRemoveAddon, onContinue, onDiscard, running, busy, goalDraft, setGoalDraft, onSaveGoal, onRefineGoal }) => {
   const isOut = state.stage === 'loopout';
   const selected = state.loops.find((l) => l.seq === selectedSeq) || null;
   const runLabel = state.resumable
@@ -957,6 +964,14 @@ const ExecuteStage: React.FC<{
             {state.auto ? '🔄 Auto 连跑中（点此暂停）' : '⏸ Auto 关（点此自动连跑）'}
           </button>
           <button onClick={onAdvanceOut} disabled={busy} style={btn}>⏹ 进入 loopout</button>
+          {/* ★ 误触兜底：停止并删除本次 loop（当作没发生过，addon 退回待纳入） */}
+          {(running || state.resumable) && (
+            <button onClick={onDiscard}
+              style={{ ...btn, background: '#f871711f', color: '#f87171', borderColor: '#f8717155', marginLeft: 'auto' }}
+              title="停止并删除本次 loop：不保存结果，已消费的补充(addon)退回待纳入">
+              🗑 停止并删除本次
+            </button>
+          )}
           {state.auto && running && (
             <span style={{ fontSize: 12, color: 'var(--theme-text-muted)' }}>完成本次后将自动继续…</span>
           )}

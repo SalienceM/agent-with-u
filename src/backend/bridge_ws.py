@@ -276,6 +276,7 @@ class BridgeWS:
         self._loop_store = LoopStore()
         self._idea_semaphore = asyncio.Semaphore(3)  # loopidea 阶段最多 3 并发
         self._loop_running: set[str] = set()         # 正在跑 iteration 的 session
+        self._loop_cancel: set[str] = set()           # 请求停止并丢弃当前 loop 的 session
         self._aside_running: set[str] = set()        # 正在回答 by-the-way 的 session
         # ★ 进程内 LoopState 单例缓存：iteration（反复整文件覆写）与旁路问答
         #   （追加 asides）共享同一对象，避免一方的保存覆盖另一方的写入。
@@ -2075,6 +2076,48 @@ class BridgeWS:
         asyncio.ensure_future(self._run_loop_iteration(session_id))
         return json.dumps({"status": "ok"}, ensure_ascii=False)
 
+    def _rpc_loopDiscard(self, session_id: str, seq: int = 0) -> str:
+        """停止并删除一次 loop（误触兜底）：当作没发生过。
+        - 正在跑：发取消信号 + 中断当前 agent 轮次，运行任务在 finally 完成删除/还原。
+        - 未在跑：直接删除该 loop 并把它消费过的 addon 退回 pending。
+        默认作用于最后一次 loop。"""
+        state = self._loop_state(session_id)
+        if not state:
+            return json.dumps({"status": "error", "message": "no loop state"}, ensure_ascii=False)
+        if not state.loops:
+            return json.dumps({"status": "error", "message": "没有可删除的 loop"}, ensure_ascii=False)
+        try:
+            seq = int(seq or 0)
+        except (TypeError, ValueError):
+            seq = 0
+        rec = (next((l for l in state.loops if l.seq == seq), None) if seq
+               else state.loops[-1])
+        if not rec:
+            return json.dumps({"status": "error", "message": "找不到该 loop"}, ensure_ascii=False)
+
+        if session_id in self._loop_running:
+            # 运行中：信号取消并中断当前 agent 轮次；删除在运行任务的 finally 里做
+            self._loop_cancel.add(session_id)
+            session = self._active_sessions.get(session_id) or self._session_store.load(session_id)
+            if session:
+                backend = self._backends.get(session.backend_id)
+                if backend:
+                    try:
+                        backend.abort(session.id)
+                    except Exception:
+                        pass
+                    for s in rec.orchestration:
+                        try:
+                            backend.abort(f"{session.id}:loop{rec.seq}:step{s.index}")
+                        except Exception:
+                            pass
+            return json.dumps({"status": "ok", "stopping": True, "seq": rec.seq}, ensure_ascii=False)
+
+        reverted = self._discard_record(state, rec)
+        self._loop_save(state)
+        self._emit_loop_updated(state)
+        return json.dumps({"status": "ok", "seq": rec.seq, "revertedAddons": reverted}, ensure_ascii=False)
+
     async def _run_loop_iteration(self, session_id: str) -> None:
         """跑一次完整 loop（resume 断点 or 新开），按 prepare→execute→analysis。
 
@@ -2105,6 +2148,8 @@ class BridgeWS:
             order = [SUB_PREPARE, SUB_EXECUTE, SUB_ANALYSIS]
             start = order.index(record.sub_stage) if record.sub_stage in order else 0
             for stage in order[start:]:
+                if session_id in self._loop_cancel:
+                    break
                 if stage == SUB_PREPARE:
                     await self._loop_do_prepare(session, state, record, history)
                 elif stage == SUB_EXECUTE:
@@ -2115,14 +2160,41 @@ class BridgeWS:
             import traceback
             print(f"[loop] iteration failed: {e}\n{traceback.format_exc()}",
                   file=sys.stderr, flush=True)
-            if record is not None:
+            if record is not None and session_id not in self._loop_cancel:
                 record.error = str(e)
                 record.sub_stage = SUB_DONE
                 self._loop_save(state)
                 self._emit_loop_updated(state)
         finally:
             self._loop_running.discard(session_id)
-            self._maybe_autocontinue(session_id)
+            if session_id in self._loop_cancel:
+                # 停止并丢弃：删掉这次 loop，还原它消费过的 addon，当作没发生过
+                self._loop_cancel.discard(session_id)
+                st = self._loop_state(session_id)
+                if st is not None and record is not None:
+                    self._discard_record(st, record)
+                    self._loop_save(st)
+                    self._emit_loop_updated(st)
+            else:
+                self._maybe_autocontinue(session_id)
+
+    def _discard_record(self, state: "LoopState", record: "LoopRecord") -> int:
+        """从 state 移除一次 loop，并把它在 prepare 时消费的 addon 退回 pending。
+        返回退回的 addon 数。"""
+        state.loops = [l for l in state.loops if l.seq != record.seq]
+        reverted = 0
+        for a in state.addons:
+            if a.status == "applied" and a.applied_seq == record.seq:
+                a.status = "pending"
+                a.applied_seq = 0
+                a.updated_at = time.time()
+                reverted += 1
+        # 兜底：若这次 loop 曾把全局阶段推进到 loopout 且本轮已无 loop，则退回 execute
+        if state.stage == STAGE_OUT and not state.round_loops():
+            state.stage = STAGE_EXECUTE
+            state.status = "active"
+            state.stop_reason = ""
+        return reverted
 
     async def _loop_do_prepare(self, session, state, record, history) -> None:
         record.sub_stage = SUB_PREPARE
@@ -2202,6 +2274,8 @@ class BridgeWS:
             # 按编排执行：连续的 concurrent 步并行，sequential 步顺次
             i = 0
             while i < len(steps):
+                if session.id in self._loop_cancel:   # 停止并丢弃：立即中断分步执行
+                    return
                 if steps[i].mode == "concurrent":
                     j = i
                     while j < len(steps) and steps[j].mode == "concurrent":
@@ -2216,6 +2290,8 @@ class BridgeWS:
                 else:
                     await self._loop_run_step(session, state, record, steps[i], resume=True)
                     i += 1
+            if session.id in self._loop_cancel:
+                return
             # 汇总各步 → 本次执行结果
             recap = "\n".join(
                 f"{s.index}. [{s.mode}/{s.status}] {s.desc}\n   → {(s.output or '')[:400]}"
