@@ -4,6 +4,8 @@ import { markdownToHtml } from '../utils/markdown';
 import { ImagePreview } from './ImagePreview';
 import { useClipboardImage } from './../hooks/useClipboardImage';
 import type { ImageAttachment } from './../hooks/useClipboardImage';
+import { LoopPolicyEditor, normalizePolicy } from './LoopPolicyEditor';
+import type { LoopPolicy } from './LoopPolicyEditor';
 
 /**
  * LoopPanel — 可视化 Loop 集成的全屏面板。
@@ -34,6 +36,7 @@ interface Addon { id: string; text: string; status: string; appliedSeq: number; 
 interface LoopStateT {
   sessionId: string; stage: string; goal: string;
   goalHistory: GoalRevision[];
+  policy?: LoopPolicy;
   ideas: IdeaEntry[]; loops: LoopRecord[];
   riskCoefficient: number; maxLoops: number; effectiveMaxLoops: number;
   round: number; roundLoopCount: number;
@@ -184,6 +187,9 @@ export const LoopPanel: React.FC<LoopPanelProps> = ({ sessionId, onClose, embedd
             <div style={{ flex: 1, overflow: 'auto', padding: '12px 18px 24px' }}>
               {/* 全局指标条 */}
               {state.stage !== 'loopidea' && <MetricBar state={state} />}
+
+              {/* 策略与心智：实时查看 / 调整（折叠，默认收起） */}
+              <PolicyCard sessionId={sessionId} policy={state.policy} />
 
               {state.stage === 'loopidea' && (
                 <IdeaStage
@@ -653,6 +659,49 @@ function relTime(ts: number): string {
   if (s < 86400) return `${Math.floor(s / 3600)} 小时前`;
   return `${Math.floor(s / 86400)} 天前`;
 }
+
+// ══ 策略与心智卡片：实时查看 / 调整 ═══════════════════════════
+const PolicyCard: React.FC<{ sessionId: string; policy?: LoopPolicy }> = ({ sessionId, policy }) => {
+  const [open, setOpen] = useState(false);
+  const [draft, setDraft] = useState<LoopPolicy>(() => normalizePolicy(policy));
+  const [dirty, setDirty] = useState(false);
+  const [saving, setSaving] = useState(false);
+  // 外部（loopUpdated）更新 policy 时，未在编辑则同步进草稿
+  useEffect(() => { if (!dirty) setDraft(normalizePolicy(policy)); }, [policy, dirty]);
+  const p = normalizePolicy(policy);
+  const save = async () => {
+    setSaving(true);
+    const r = await api.loopSetPolicy(sessionId, normalizePolicy(draft));
+    setSaving(false);
+    if (r.status === 'ok') setDirty(false);
+    else if (r.message) alert(r.message);
+  };
+  return (
+    <div style={{ ...sealBox, marginBottom: 16 }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+        <button onClick={() => setOpen(!open)}
+          style={{ ...linkBtn, fontWeight: 700, fontSize: 13, color: 'var(--theme-text)' }}>
+          {open ? '▾' : '▸'} ⚙️ 策略与心智
+        </button>
+        <span style={{ fontSize: 11, color: 'var(--theme-text-muted)' }}>
+          可交付≥{p.deliverableScore} · 可输出≥{p.outputtableScore} · 最多 {p.maxLoops} loop · 风险≥{p.riskThreshold.toFixed(2)} 收口
+        </span>
+      </div>
+      {open && (
+        <div style={{ marginTop: 10 }}>
+          <LoopPolicyEditor value={draft} onChange={(v) => { setDraft(v); setDirty(true); }} />
+          <div style={{ display: 'flex', gap: 8, marginTop: 10, alignItems: 'center', flexWrap: 'wrap' }}>
+            <button onClick={save} disabled={saving || !dirty}
+              style={{ ...primaryBtn, opacity: (saving || !dirty) ? 0.5 : 1 }}>
+              {saving ? '保存中…' : '保存策略'}
+            </button>
+            {dirty && <span style={{ fontSize: 11, color: 'var(--theme-text-muted)' }}>改动未保存 · 不影响进行中的 loop，从下一次起生效</span>}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};
 
 // 按提示让模型微调目标的输入框（GoalCard 与 loopout 新一轮共用）
 const RefineBox: React.FC<{

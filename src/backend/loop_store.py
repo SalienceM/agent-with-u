@@ -263,6 +263,57 @@ class Addon:
         )
 
 
+DEFAULT_STRATEGY = (
+    "每一次 loop 都是对【全局目标】的一次完整、尽力的尝试（不是把任务拆到多个 loop 分步完成）。\n"
+    "- prepare：规划这一遍的策略与分步编排（可并发 concurrent / 顺次 sequential）。\n"
+    "- execute：实际执行编排（读写文件、运行命令），如实记录产出与成败。\n"
+    "- analysis：对照全局目标打分（0–100），评估趋势、优化空间与硬约束。\n"
+    "评分心智：优先把每一遍做到尽量完整，而不是保留实力分多次；遇到环境/权限/网络等"
+    "硬约束要在 challenges 里点明，避免为不可能的任务做无谓 loop。"
+)
+
+
+@dataclass
+class LoopPolicy:
+    """Loop 的策略与心智（可在建会话时编辑、运行时实时查看/调整）。"""
+    deliverable_score: float = DELIVERABLE_SCORE   # 可交付门槛
+    outputtable_score: float = OUTPUTTABLE_SCORE   # 可输出门槛
+    max_loops: int = 8                             # 基础最大 loop 约束
+    risk_threshold: float = 0.85                   # 风险止损阈值（≥ 即收口）
+    strategy: str = DEFAULT_STRATEGY               # 注入到 prepare/analysis 的策略心智文本
+
+    def to_dict(self) -> dict:
+        return {
+            "deliverableScore": self.deliverable_score,
+            "outputtableScore": self.outputtable_score,
+            "maxLoops": self.max_loops,
+            "riskThreshold": self.risk_threshold,
+            "strategy": self.strategy,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "LoopPolicy":
+        d = d or {}
+        def _f(key, default):
+            try:
+                return float(d.get(key, default))
+            except (TypeError, ValueError):
+                return default
+        dv = max(0.0, min(100.0, _f("deliverableScore", DELIVERABLE_SCORE)))
+        ov = max(dv, min(100.0, _f("outputtableScore", OUTPUTTABLE_SCORE)))  # 不低于可交付
+        try:
+            ml = int(d.get("maxLoops", 8))
+        except (TypeError, ValueError):
+            ml = 8
+        ml = max(1, min(50, ml))
+        rt = max(0.1, min(1.0, _f("riskThreshold", 0.85)))
+        strat = d.get("strategy")
+        return cls(
+            deliverable_score=dv, outputtable_score=ov, max_loops=ml, risk_threshold=rt,
+            strategy=strat if isinstance(strat, str) and strat.strip() else DEFAULT_STRATEGY,
+        )
+
+
 @dataclass
 class GoalRevision:
     """全局目标的一个版本。封口初版 / 按提示微调 / 手动改 都各留一版,体现演变。"""
@@ -295,7 +346,7 @@ class LoopState:
     ideas: list[IdeaEntry] = field(default_factory=list)
     loops: list[LoopRecord] = field(default_factory=list)
     risk_coefficient: float = 0.3       # 0..1 综合风险系数
-    max_loops: int = 8                  # 基础最大 loop 约束
+    policy: LoopPolicy = field(default_factory=LoopPolicy)  # 策略与心智（可编辑）
     round: int = 1                      # 当前轮次（loopout 后可开启新一轮）
     auto: bool = False                  # 自动连跑：一次 loop 完成后自动开始下一次
     status: str = "active"              # active | delivered | output | aborted
@@ -329,7 +380,7 @@ class LoopState:
 
     def effective_max_loops(self) -> int:
         """风险越高，允许的 loop 上限越低（避免无谓 loop）。"""
-        return max(1, round(self.max_loops * (1.0 - 0.5 * self.risk_coefficient)))
+        return max(1, round(self.policy.max_loops * (1.0 - 0.5 * self.risk_coefficient)))
 
     def to_dict(self) -> dict:
         return {
@@ -340,7 +391,8 @@ class LoopState:
             "ideas": [i.to_dict() for i in self.ideas],
             "loops": [l.to_dict() for l in self.loops],
             "riskCoefficient": self.risk_coefficient,
-            "maxLoops": self.max_loops,
+            "policy": self.policy.to_dict(),
+            "maxLoops": self.policy.max_loops,
             "effectiveMaxLoops": self.effective_max_loops(),
             "round": self.round,
             "roundLoopCount": len(self.round_loops()),
@@ -357,6 +409,11 @@ class LoopState:
 
     @classmethod
     def from_dict(cls, d: dict) -> "LoopState":
+        # 策略：新字段 policy；老存档没有则用旧的 maxLoops 迁移，其余取默认
+        if d.get("policy") is not None:
+            policy = LoopPolicy.from_dict(d["policy"])
+        else:
+            policy = LoopPolicy.from_dict({"maxLoops": d.get("maxLoops", 8)})
         return cls(
             session_id=d.get("sessionId", ""),
             stage=d.get("stage", STAGE_IDEA),
@@ -365,7 +422,7 @@ class LoopState:
             ideas=[IdeaEntry.from_dict(i) for i in d.get("ideas", [])],
             loops=[LoopRecord.from_dict(l) for l in d.get("loops", [])],
             risk_coefficient=float(d.get("riskCoefficient", 0.3)),
-            max_loops=int(d.get("maxLoops", 8)),
+            policy=policy,
             round=int(d.get("round", 1)),
             auto=bool(d.get("auto", False)),
             status=d.get("status", "active"),

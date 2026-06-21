@@ -657,6 +657,12 @@ export const api = {
     try { return JSON.parse(result); } catch { return { status: 'error', message: '响应解析失败' }; }
   },
 
+  /** 设置/更新 loop 策略与心智（建会话时 / 运行时均可）。 */
+  async loopSetPolicy(sessionId: string, policy: any): Promise<{ status: string; policy?: any; message?: string }> {
+    const result = await call('loopSetPolicy', sessionId, JSON.stringify(policy || {}));
+    try { return JSON.parse(result); } catch { return { status: 'error', message: '响应解析失败' }; }
+  },
+
   async loopRunIteration(sessionId: string): Promise<{ status: string; message?: string }> {
     const result = await call('loopRunIteration', sessionId);
     try { return JSON.parse(result); } catch { return { status: 'error', message: '响应解析失败' }; }
@@ -1260,6 +1266,7 @@ function mockDispatch(method: string, params: any[]): any {
     case 'loopSealIdea': return JSON.stringify({ status: 'error', message: 'mock mode' });
     case 'loopSetGoal': return JSON.stringify({ status: 'ok' });
     case 'loopRefineGoal': return JSON.stringify({ status: 'error', message: 'mock mode' });
+    case 'loopSetPolicy': return JSON.stringify({ status: 'ok' });
     case 'loopRunIteration': return JSON.stringify({ status: 'error', message: 'mock mode' });
     case 'loopSetAuto': return JSON.stringify({ status: 'ok', auto: !!params[1] });
     case 'loopAdvanceToOut': return JSON.stringify({ status: 'error', message: 'mock mode' });

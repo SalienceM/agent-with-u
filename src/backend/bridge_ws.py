@@ -40,9 +40,9 @@ from .skill_store import SkillStore
 from .prompt_store import PromptStore
 from .loop_store import (
     LoopStore, LoopState, LoopRecord, LoopStep, LoopAnalysis, IdeaEntry, AsideTurn, Addon,
+    LoopPolicy,
     STAGE_IDEA, STAGE_EXECUTE, STAGE_OUT,
     SUB_PREPARE, SUB_EXECUTE, SUB_ANALYSIS, SUB_DONE,
-    DELIVERABLE_SCORE, OUTPUTTABLE_SCORE,
 )
 from .auth import AuthGuard
 from .asset_pool import AssetPool
@@ -1937,6 +1937,21 @@ class BridgeWS:
         self._emit_loop_updated(state)
         return json.dumps({"status": "ok"}, ensure_ascii=False)
 
+    def _rpc_loopSetPolicy(self, session_id: str, policy_json: str) -> str:
+        """设置/更新 loop 的策略与心智（建会话时可编辑、运行时可实时调整）。
+        会话首次进入 loop 时 stage 文件可能尚未创建，这里 get_or_create。"""
+        try:
+            pd = json.loads(policy_json) if policy_json else {}
+        except Exception:
+            return json.dumps({"status": "error", "message": "策略 JSON 解析失败"}, ensure_ascii=False)
+        if not isinstance(pd, dict):
+            return json.dumps({"status": "error", "message": "策略格式不对"}, ensure_ascii=False)
+        state = self._loop_get_or_create(session_id)
+        state.policy = LoopPolicy.from_dict(pd)
+        self._loop_save(state)
+        self._emit_loop_updated(state)
+        return json.dumps({"status": "ok", "policy": state.policy.to_dict()}, ensure_ascii=False)
+
     async def _rpc_loopRefineGoal(self, session_id: str, hint: str) -> str:
         """按额外提示让模型微调全局目标（不需人工手编），并留下一版演变记录。"""
         h = (hint or "").strip()
@@ -2104,7 +2119,12 @@ class BridgeWS:
             "请把这些补充要求一并纳入这一遍的编排并设法完成。\n"
             if addon_text else ""
         )
+        strategy_block = (
+            f"【策略与心智（须遵循）】\n{state.policy.strategy}\n\n"
+            if state.policy.strategy else ""
+        )
         prepare_prompt = (
+            f"{strategy_block}"
             f"【全局目标】\n{state.goal or '(未显式给出，自行从上下文推断)'}\n\n"
             f"【已完成的 loop 复盘】\n{history or '（这是第 1 次 loop）'}\n"
             f"{addon_block}\n"
@@ -2224,13 +2244,20 @@ class BridgeWS:
             "评估趋势与后续规划时请把这些补充要求纳入考量（它们将在下一次 loop 完成）。\n"
             if addon_text else ""
         )
+        dscore = state.policy.deliverable_score
+        oscore = state.policy.outputtable_score
+        strategy_block = (
+            f"【策略与心智（须遵循）】\n{state.policy.strategy}\n\n"
+            if state.policy.strategy else ""
+        )
         analysis_prompt = (
+            f"{strategy_block}"
             f"对第 {record.seq} 次 loop（一次冲着全局目标的完整尝试）的执行结果做评估，"
             f"对照【全局目标】：\n{state.goal}\n\n"
             f"【本次执行结果】\n{record.result or '(无)'}\n"
             f"{addon_block}\n"
             "请按以下口径打分与分析，只输出一个 JSON 围栏：\n"
-            "- score: 0–100，对全局目标的完成度（>=70 可交付，>=85 可输出）\n"
+            f"- score: 0–100，对全局目标的完成度（>={dscore:.0f} 可交付，>={oscore:.0f} 可输出）\n"
             "- optimizationPotential: 0–1，再来一遍估计还能提升的空间\n"
             "- trend: 与历史 loop 相比（上升 / 平缓 / 受阻）\n"
             "- challenges: 是否遇到环境/系统/网络可触达性等硬约束\n"
@@ -2268,8 +2295,8 @@ class BridgeWS:
             trend=trend,
             optimization_potential=max(0.0, min(1.0, opt)),
             challenges=challenges,
-            deliverable=score >= DELIVERABLE_SCORE,
-            outputtable=score >= OUTPUTTABLE_SCORE,
+            deliverable=score >= state.policy.deliverable_score,
+            outputtable=score >= state.policy.outputtable_score,
         )
         record.analysis = analysis
         record.completed = True
@@ -2316,13 +2343,13 @@ class BridgeWS:
         latest = done[-1].analysis
         risk = state.risk_coefficient
         # 首次 loop 就低分且有硬约束：显著提升风险（不为不可能任务做无谓 loop）
-        if len(done) == 1 and latest.score < DELIVERABLE_SCORE and latest.challenges:
+        if len(done) == 1 and latest.score < state.policy.deliverable_score and latest.challenges:
             risk += 0.35
         # 提升空间小：略升（趋于收敛，意义在于进入 out 而非加风险）
         if latest.optimization_potential < 0.15:
             risk += 0.05
         # 趋势上升、分数高：降低风险
-        if latest.score >= DELIVERABLE_SCORE:
+        if latest.score >= state.policy.deliverable_score:
             risk -= 0.1
         # 历史改进曲线平缓（最近两次提升 < 3 分）：略升
         if len(done) >= 2 and (done[-1].analysis.score - done[-2].analysis.score) < 3:
@@ -2340,7 +2367,7 @@ class BridgeWS:
         if latest.outputtable and (latest.optimization_potential < 0.15 or flat):
             return True, "已达可输出且优化空间收敛"
         # 风险过高（任务大概率完不成）→ 止损
-        if state.risk_coefficient >= 0.85:
+        if state.risk_coefficient >= state.policy.risk_threshold:
             return True, "风险系数过高，停止无谓 loop"
         # 达到有效最大 loop 上限
         if len(state.round_loops()) >= state.effective_max_loops():
@@ -2357,8 +2384,8 @@ class BridgeWS:
         state.stage = STAGE_OUT
         if state.status == "active":
             best = state.best_score()
-            state.status = "output" if best >= OUTPUTTABLE_SCORE else (
-                "delivered" if best >= DELIVERABLE_SCORE else "aborted")
+            state.status = "output" if best >= state.policy.outputtable_score else (
+                "delivered" if best >= state.policy.deliverable_score else "aborted")
         if not state.stop_reason:
             state.stop_reason = "手动进入 loopout"
         self._loop_save(state)

@@ -16,6 +16,8 @@ import { AuthStatusBanner } from './components/AuthStatusBanner';
 import { ConnectionPanel } from './components/ConnectionPanel';
 import { DirSyncPanel } from './components/DirSyncPanel';
 import { ChatPane } from './components/ChatPane';
+import { LoopPolicyEditor, DEFAULT_POLICY, normalizePolicy } from './components/LoopPolicyEditor';
+import type { LoopPolicy } from './components/LoopPolicyEditor';
 import { clearSessionHistoryCache } from './hooks/useChat';
 import { clearStreamStateForSession } from './hooks/useStreamState';
 import { useConfig } from './hooks/useConfig';
@@ -341,8 +343,12 @@ export const App: React.FC = () => {
     setNewSessionDialogOpen(true);
   }, []);
 
-  const handleCreateSession = useCallback(async (workingDir: string, backendId: string, sessionType: 'normal' | 'loop' = 'normal') => {
+  const handleCreateSession = useCallback(async (workingDir: string, backendId: string, sessionType: 'normal' | 'loop' = 'normal', loopPolicy?: any) => {
     const session = await api.createSession(workingDir, backendId, sessionType);
+    // ★ Loop 会话：把建会话时编辑的策略与心智落到 stage 文件
+    if (sessionType === 'loop' && loopPolicy) {
+      api.loopSetPolicy(session.id, loopPolicy).catch(() => {});
+    }
     // ★ Set session first, then close dialog in next render cycle to avoid visual tearing
     // 分屏架构下:把新 session 放进焦点 pane,activeSessionId 自动派生过去。
     setSessionInPane(session.id);
@@ -1219,7 +1225,7 @@ function formatBackendLabel(backend: any): string {
 interface NewSessionDialogProps {
   backends: any[];
   onClose: () => void;
-  onCreate: (workingDir: string, backendId: string, sessionType: 'normal' | 'loop') => void;
+  onCreate: (workingDir: string, backendId: string, sessionType: 'normal' | 'loop', loopPolicy?: LoopPolicy) => void;
 }
 
 const NewSessionDialog: React.FC<NewSessionDialogProps> = ({
@@ -1234,12 +1240,15 @@ const NewSessionDialog: React.FC<NewSessionDialogProps> = ({
   );
   const [sessionType, setSessionType] = useState<'normal' | 'loop'>('normal');
   const [dirPickerOpen, setDirPickerOpen] = useState(false);
+  const [loopPolicy, setLoopPolicy] = useState<LoopPolicy>(DEFAULT_POLICY);
+  const [policyOpen, setPolicyOpen] = useState(false);
   const isAutoDir = !workingDir.trim() || workingDir.trim() === '.';
 
   const handleCreate = useCallback(async () => {
     // 空值交给后端补一个时间戳目录
-    await onCreate(workingDir.trim() || '', selectedBackendId, sessionType);
-  }, [workingDir, selectedBackendId, sessionType, onCreate]);
+    await onCreate(workingDir.trim() || '', selectedBackendId, sessionType,
+      sessionType === 'loop' ? normalizePolicy(loopPolicy) : undefined);
+  }, [workingDir, selectedBackendId, sessionType, loopPolicy, onCreate]);
 
   const handleBrowse = useCallback(async () => {
     // Tauri 桌面端：用系统原生目录对话框（选本机 = 服务器同机）。
@@ -1294,6 +1303,31 @@ const NewSessionDialog: React.FC<NewSessionDialogProps> = ({
             ))}
           </div>
         </div>
+
+        {/* ★ Loop 策略与心智：建会话时可编辑（默认即可，按需展开调整） */}
+        {sessionType === 'loop' && (
+          <div style={formGroupStyle}>
+            <button
+              onClick={() => setPolicyOpen((v) => !v)}
+              style={{
+                display: 'flex', alignItems: 'center', gap: 6, width: '100%', textAlign: 'left',
+                background: 'none', border: 'none', cursor: 'pointer', padding: 0,
+                color: 'var(--theme-text, #1f2328)', fontSize: 13, fontWeight: 600,
+              }}
+            >
+              <span>{policyOpen ? '▾' : '▸'}</span>
+              <span>⚙️ Loop 策略与心智</span>
+              <span style={{ fontSize: 11, fontWeight: 400, color: 'var(--theme-text-muted, #656d76)' }}>
+                （门槛 / 最大 loop / 风险 / 策略文本，可不改用默认；建后也能随时调）
+              </span>
+            </button>
+            {policyOpen && (
+              <div style={{ marginTop: 10 }}>
+                <LoopPolicyEditor value={loopPolicy} onChange={setLoopPolicy} />
+              </div>
+            )}
+          </div>
+        )}
 
         <div style={formGroupStyle}>
           <label style={labelStyle}>Working Directory:</label>

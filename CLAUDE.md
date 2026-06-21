@@ -310,8 +310,23 @@ rendered as a "目标演变" version timeline. `loopRefineGoal(session_id, hint)
 ideas + the hint and rewrites the goal, appending a `refine` revision. Manual edit
 (`loopSetGoal`) and seal/synthesis also append revisions.
 
+**Strategy & mental model (`LoopPolicy`).** The knobs that govern loop behavior
+are a per-session `LoopPolicy` on the stage file (`loop_store.LoopPolicy`):
+`deliverable_score` (70), `outputtable_score` (85), `max_loops` (8),
+`risk_threshold` (0.85 — risk ≥ this seals to loopout), and a free-text
+`strategy` ("心智") that is injected as a "must follow" block into every
+`prepare` and `analysis` prompt. These replace the old hardcoded module
+constants — `effective_max_loops`, `_recompute_risk`, `_loop_should_stop`,
+deliverable/outputtable flags all read the policy. It is **editable at session
+creation** (NewSessionDialog shows `LoopPolicyEditor` for loop sessions, applied
+via `loopSetPolicy` right after `createSession`) and **viewable/adjustable live**
+(a collapsible "⚙️ 策略与心智" PolicyCard in the LoopPanel). Policy changes don't
+touch an in-flight loop — they take effect from the next prepare/analysis.
+Legacy stage files without `policy` migrate their old `maxLoops` into the policy.
+The shared editor + defaults live in `frontend/src/components/LoopPolicyEditor.tsx`.
+
 Loop RPCs: `loopGetState`, `loopSubmitIdea`, `loopRemoveIdea`, `loopSealIdea`,
-`loopSetGoal`, `loopRefineGoal`, `loopRunIteration`, `loopSetAuto`,
+`loopSetGoal`, `loopRefineGoal`, `loopSetPolicy`, `loopRunIteration`, `loopSetAuto`,
 `loopAdvanceToOut`, `loopContinue`, `loopAsk`, `loopAddAddon`, `loopRemoveAddon`.
 `createSession` takes an optional third `session_type` argument.
 
