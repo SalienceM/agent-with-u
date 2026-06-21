@@ -33,7 +33,8 @@ interface LoopRecord {
 interface IdeaEntry { id: string; prompt: string; status: string; result: string; error: string; }
 interface GoalRevision { goal: string; hint: string; source: string; createdAt: number; }
 interface AsideTurn { id: string; question: string; answer: string; status: string; stage: string; seq: number; imageCount?: number; }
-interface Addon { id: string; text: string; status: string; appliedSeq: number; }
+interface AddonImage { id?: string; base64: string; mime_type?: string; }
+interface Addon { id: string; text: string; status: string; appliedSeq: number; images?: AddonImage[]; }
 interface LoopStateT {
   sessionId: string; stage: string; goal: string;
   goalHistory: GoalRevision[];
@@ -113,7 +114,7 @@ export const LoopPanel: React.FC<LoopPanelProps> = ({ sessionId, onClose, embedd
 
   const running = state?.running ?? false;
   const setAuto = useCallback((on: boolean) => api.loopSetAuto(sessionId, on), [sessionId]);
-  const addAddon = useCallback((text: string) => api.loopAddAddon(sessionId, text), [sessionId]);
+  const addAddon = useCallback((text: string, images?: ImageAttachment[]) => api.loopAddAddon(sessionId, text, images), [sessionId]);
   const removeAddon = useCallback((id: string) => api.loopRemoveAddon(sessionId, id), [sessionId]);
   const continueRound = useCallback(async (goal: string) => {
     setBusy(true);
@@ -299,7 +300,7 @@ const AsideDrawer: React.FC<{
   const autoScrollRef = useRef(true);   // 是否跟随最新(用户停在底部时为 true)
   const [showJump, setShowJump] = useState(false);
   // 图片附件:粘贴(含 Snipaste)自动入列,与主聊天框一致,作用域限定本输入框
-  const { images, removeImage, clearImages, addImage } = useClipboardImage(inputRef);
+  const { images, removeImage, clearImages } = useClipboardImage(inputRef);
 
   // 跟踪最新:仅当用户停在底部时才自动滚到底(与普通会话一致)
   useEffect(() => {
@@ -332,23 +333,6 @@ const AsideDrawer: React.FC<{
     clearImages();
   }, [onSend, answering, input, images, clearImages]);
 
-  // 选图按钮:走系统文件框,与粘贴同一条入列逻辑
-  const pickImage = useCallback(() => {
-    const el = document.createElement('input');
-    el.type = 'file'; el.accept = 'image/*'; el.multiple = true;
-    el.onchange = () => {
-      Array.from(el.files || []).forEach((file) => {
-        if (!file.type.startsWith('image/')) return;
-        const reader = new FileReader();
-        reader.onload = () => {
-          const b64 = (reader.result as string).split(',')[1];
-          addImage({ id: `${Date.now()}-${Math.random().toString(36).slice(2)}`, base64: b64, mime_type: file.type, size: file.size });
-        };
-        reader.readAsDataURL(file);
-      });
-    };
-    el.click();
-  }, [addImage]);
 
   return (
     <div style={asideDrawerStyle}>
@@ -404,8 +388,6 @@ const AsideDrawer: React.FC<{
       <div style={{ padding: 10, borderTop: '1px solid var(--theme-border)' }}>
         {images.length > 0 && <ImagePreview images={images} onRemove={removeImage} />}
         <div style={{ display: 'flex', gap: 6, alignItems: 'flex-end' }}>
-          <button onClick={pickImage} disabled={answering} title="插入图片（也可直接粘贴 / Snipaste）"
-            style={{ ...btn, padding: '8px 10px', opacity: answering ? 0.5 : 1 }}>🖼️</button>
           <textarea
             ref={inputRef}
             value={input}
@@ -555,11 +537,17 @@ const IdeaStage: React.FC<{
 
 // ══ Addon 面板（执行中补充要求）═══════════════════════════════
 const AddonPanel: React.FC<{
-  addons: Addon[]; onAdd: (text: string) => void; onRemove: (id: string) => void;
+  addons: Addon[]; onAdd: (text: string, images?: ImageAttachment[]) => void; onRemove: (id: string) => void;
 }> = ({ addons, onAdd, onRemove }) => {
   const [text, setText] = useState('');
+  const inputRef = useRef<HTMLTextAreaElement>(null);
+  const { images, removeImage, clearImages } = useClipboardImage(inputRef);
   const pending = addons.filter((a) => a.status === 'pending');
-  const submit = () => { const t = text.trim(); if (!t) return; setText(''); onAdd(t); };
+  const submit = () => {
+    const t = text.trim();
+    if (!t && images.length === 0) return;
+    setText(''); onAdd(t, images); clearImages();
+  };
   return (
     <div style={{ ...sealBox, marginBottom: 16, borderColor: pending.length ? '#bf870055' : 'var(--theme-border)' }}>
       <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6 }}>
@@ -571,27 +559,57 @@ const AddonPanel: React.FC<{
         )}
       </div>
       <div style={{ fontSize: 11, color: 'var(--theme-text-muted)', marginBottom: 8, lineHeight: 1.5 }}>
-        随手补充要求 —— <b>不影响当前正在跑的 loop</b>；下一次 loop 的分析与规划会带上并设法完成。纳入前可随时增删。已纳入的见下方「Addon 历史」。
+        随手补充要求（可粘贴图片）—— <b>不影响当前正在跑的 loop</b>；下一次 loop 的分析与规划会带上并设法完成。纳入前可随时增删。已纳入的见下方「Addon 历史」。
       </div>
-      <div style={{ display: 'flex', gap: 8, marginBottom: pending.length ? 10 : 0 }}>
-        <input
+      {images.length > 0 && <ImagePreview images={images} onRemove={removeImage} />}
+      <div style={{ display: 'flex', gap: 8, marginBottom: pending.length ? 12 : 0, alignItems: 'flex-end' }}>
+        <textarea
+          ref={inputRef}
           value={text}
           onChange={(e) => setText(e.target.value)}
-          onKeyDown={(e) => { if (e.key === 'Enter') submit(); }}
-          placeholder="补充一条要求 / 修正…（Enter 添加）"
-          style={{ ...inputBase, flex: 1 }}
+          onKeyDown={(e) => { if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') submit(); }}
+          placeholder="补充一条要求 / 修正…（可粘贴图片，Ctrl/Cmd+Enter 添加）"
+          style={{ ...inputBase, flex: 1, minHeight: 56, maxHeight: 160, resize: 'vertical', lineHeight: 1.5 }}
         />
-        <button onClick={submit} disabled={!text.trim()} style={{ ...btn, opacity: text.trim() ? 1 : 0.5 }}>＋ 添加</button>
+        <button onClick={submit} disabled={!text.trim() && images.length === 0}
+          style={{ ...primaryBtn, padding: '8px 14px', opacity: (text.trim() || images.length) ? 1 : 0.5 }}>＋ 添加</button>
       </div>
       <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
         {pending.map((a) => (
-          <div key={a.id} style={{ display: 'flex', alignItems: 'flex-start', gap: 8, padding: '6px 10px', borderRadius: 8, background: '#bf87000d', border: '1px solid #bf870033' }}>
-            <span style={{ fontSize: 12, color: '#bf8700', marginTop: 1 }}>●</span>
-            <span style={{ flex: 1, fontSize: 13, color: 'var(--theme-text)', whiteSpace: 'pre-wrap' }}>{a.text}</span>
-            <button onClick={() => onRemove(a.id)} style={miniX} title="删除">✕</button>
-          </div>
+          <AddonItem key={a.id} addon={a} onRemove={() => onRemove(a.id)} />
         ))}
       </div>
+    </div>
+  );
+};
+
+// 单条待纳入 addon：默认收成 2 行（上行缩略素材 + 下行截断文字），可点开展开
+const AddonItem: React.FC<{ addon: Addon; onRemove: () => void }> = ({ addon, onRemove }) => {
+  const [open, setOpen] = useState(false);
+  const imgs = addon.images || [];
+  return (
+    <div style={{ display: 'flex', alignItems: 'flex-start', gap: 8, padding: '7px 10px', borderRadius: 8, background: '#bf87000d', border: '1px solid #bf870033' }}>
+      <span style={{ fontSize: 12, color: '#bf8700', marginTop: 2 }}>●</span>
+      <div style={{ flex: 1, minWidth: 0, cursor: imgs.length || addon.text.length > 60 ? 'pointer' : 'default' }}
+        onClick={() => setOpen((v) => !v)}>
+        {imgs.length > 0 && (
+          <div style={{ display: 'flex', gap: 4, marginBottom: 4, flexWrap: open ? 'wrap' : 'nowrap', overflow: 'hidden' }}>
+            {imgs.map((im, i) => (
+              <img key={im.id || i} src={`data:${im.mime_type || 'image/png'};base64,${im.base64}`}
+                style={{ width: open ? 56 : 30, height: open ? 56 : 30, objectFit: 'cover', borderRadius: 5, border: '1px solid var(--theme-border)', flexShrink: 0 }} />
+            ))}
+          </div>
+        )}
+        <div style={{
+          fontSize: 13, color: 'var(--theme-text)', lineHeight: 1.5,
+          whiteSpace: open ? 'pre-wrap' : 'nowrap',
+          overflow: open ? 'visible' : 'hidden', textOverflow: open ? 'clip' : 'ellipsis',
+        }}>{addon.text}</div>
+        {!open && (imgs.length > 0 || addon.text.length > 40) && (
+          <span style={{ fontSize: 10, color: 'var(--theme-text-muted)' }}>点开看全部{imgs.length ? ` · 🖼️${imgs.length}` : ''}</span>
+        )}
+      </div>
+      <button onClick={onRemove} style={miniX} title="删除">✕</button>
     </div>
   );
 };
@@ -628,7 +646,17 @@ const AddonHistoryCard: React.FC<{ addons: Addon[]; loops: LoopRecord[] }> = ({ 
                 {groups.get(seq)!.map((a) => (
                   <div key={a.id} style={{ display: 'flex', gap: 8, padding: '6px 10px', borderRadius: 8, background: 'var(--theme-bg-secondary)', border: '1px solid var(--theme-border)' }}>
                     <span style={{ fontSize: 11, color: '#2da44e', marginTop: 1 }}>✓</span>
-                    <span style={{ flex: 1, fontSize: 12.5, color: 'var(--theme-text)', whiteSpace: 'pre-wrap', lineHeight: 1.5 }}>{a.text}</span>
+                    <div style={{ flex: 1, minWidth: 0 }}>
+                      {(a.images || []).length > 0 && (
+                        <div style={{ display: 'flex', gap: 4, marginBottom: 4, flexWrap: 'wrap' }}>
+                          {(a.images || []).map((im, i) => (
+                            <img key={im.id || i} src={`data:${im.mime_type || 'image/png'};base64,${im.base64}`}
+                              style={{ width: 36, height: 36, objectFit: 'cover', borderRadius: 5, border: '1px solid var(--theme-border)' }} />
+                          ))}
+                        </div>
+                      )}
+                      <span style={{ fontSize: 12.5, color: 'var(--theme-text)', whiteSpace: 'pre-wrap', lineHeight: 1.5 }}>{a.text}</span>
+                    </div>
                   </div>
                 ))}
               </div>
@@ -896,7 +924,7 @@ const ExecuteStage: React.FC<{
   state: LoopStateT; progress: Record<string, string>;
   selectedSeq: number | null; setSelectedSeq: (v: number | null) => void;
   onRun: () => void; onAdvanceOut: () => void; onSetAuto: (on: boolean) => void;
-  onAddAddon: (text: string) => void; onRemoveAddon: (id: string) => void;
+  onAddAddon: (text: string, images?: ImageAttachment[]) => void; onRemoveAddon: (id: string) => void;
   onContinue: (goal: string) => void;
   running: boolean; busy: boolean;
   goalDraft: string; setGoalDraft: (v: string) => void; onSaveGoal: () => void;

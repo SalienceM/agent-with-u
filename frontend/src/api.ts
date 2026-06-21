@@ -691,9 +691,10 @@ export const api = {
     try { return JSON.parse(result); } catch { return { status: 'error', message: '响应解析失败' }; }
   },
 
-  /** 执行中补充要求（addon）：不影响当前 loop，下一次 loop 的 analysis/prepare 纳入。 */
-  async loopAddAddon(sessionId: string, text: string): Promise<{ status: string; addonId?: string; message?: string }> {
-    const result = await call('loopAddAddon', sessionId, text);
+  /** 执行中补充要求（addon，可带图片）：不影响当前 loop，下一次 loop 的 analysis/prepare 纳入。 */
+  async loopAddAddon(sessionId: string, text: string, images?: any[]): Promise<{ status: string; addonId?: string; message?: string }> {
+    const imagesJson = images && images.length ? JSON.stringify(images) : '';
+    const result = await call('loopAddAddon', sessionId, text, imagesJson);
     try { return JSON.parse(result); } catch { return { status: 'error', message: '响应解析失败' }; }
   },
 

@@ -1761,7 +1761,8 @@ class BridgeWS:
     async def _loop_run_agent(self, session: "Session", prompt: str,
                               sub_stage: str, seq: int,
                               resume: bool = True,
-                              indep_session_id: Optional[str] = None) -> str:
+                              indep_session_id: Optional[str] = None,
+                              images: Optional[list] = None) -> str:
         """让会话绑定的 backend 跑一轮，收集全文，并把增量推给 LoopPanel。
 
         resume=True 时复用 session.agent_session_id 维持 loop 间记忆；
@@ -1785,9 +1786,24 @@ class BridgeWS:
                 self._emit_loop_progress(session.id, seq, sub_stage,
                                          f"\n❌ {delta.error}\n")
 
+        # images 可能是 ImageAttachment 列表或 dict 列表（addon 持久化成 dict），统一成对象
+        img_objs = None
+        if images:
+            img_objs = []
+            for im in images:
+                if isinstance(im, ImageAttachment):
+                    img_objs.append(im)
+                elif isinstance(im, dict):
+                    filtered = {k: v for k, v in im.items()
+                                if k in ("id", "base64", "mime_type", "size", "width", "height", "file_path")}
+                    try:
+                        img_objs.append(ImageAttachment(**filtered))
+                    except Exception:
+                        pass
+            img_objs = img_objs or None
         try:
             result = await backend.send_message(
-                messages=[], content=prompt, images=None,
+                messages=[], content=prompt, images=img_objs,
                 session_id=sid_for_backend, message_id=mid, on_delta=on_delta,
                 agent_session_id=session.agent_session_id if resume else None,
                 working_dir=session.working_dir,
@@ -1984,15 +2000,17 @@ class BridgeWS:
 
     # ── addon：执行中补充要求（不影响当前 loop，下一次 loop 纳入并完成）──
 
-    def _rpc_loopAddAddon(self, session_id: str, text: str) -> str:
-        """随手补充一条要求。不打断当前 loop；下一次 loop 的 analysis / prepare 会带上。"""
+    def _rpc_loopAddAddon(self, session_id: str, text: str, images_json: str = "") -> str:
+        """随手补充一条要求（可带图片）。不打断当前 loop；下一次 loop 的 analysis / prepare 会带上。"""
         t = (text or "").strip()
-        if not t:
+        imgs = self._parse_images_json(images_json)
+        if not t and not imgs:
             return json.dumps({"status": "error", "message": "内容为空"}, ensure_ascii=False)
         state = self._loop_state(session_id)
         if not state:
             return json.dumps({"status": "error", "message": "no loop state"}, ensure_ascii=False)
-        addon = Addon(id=new_id(), text=t, status="pending")
+        img_dicts = [im.to_dict() for im in imgs] if imgs else []
+        addon = Addon(id=new_id(), text=t or "（图片）", status="pending", images=img_dicts)
         state.addons.append(addon)
         self._loop_save(state)
         self._emit_loop_updated(state)
@@ -2139,7 +2157,12 @@ class BridgeWS:
             '[{"mode": "sequential", "desc": "第一步…"}, {"mode": "concurrent", "desc": "可并发的一步…"}]}\n'
             "```"
         )
-        ptext = await self._loop_run_agent(session, prepare_prompt, SUB_PREPARE, record.seq)
+        # 把待纳入 addon 携带的图片一起带给 prepare（让模型规划时也能看到素材）
+        addon_imgs: list = []
+        for a in pending:
+            addon_imgs.extend(a.images or [])
+        ptext = await self._loop_run_agent(session, prepare_prompt, SUB_PREPARE, record.seq,
+                                           images=addon_imgs or None)
         # 消费这些 addon：标记为已纳入本次 loop
         for a in pending:
             a.status = "applied"

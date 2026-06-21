@@ -255,13 +255,14 @@ class Addon:
     text: str
     status: str = "pending"     # pending（待纳入）| applied（已纳入某次 loop）
     applied_seq: int = 0        # 被哪一次 loop 的 prepare 纳入
+    images: list = field(default_factory=list)  # 附带的图片附件（base64 dict），随补充一起带给下一次 prepare
     created_at: float = field(default_factory=_now)
     updated_at: float = field(default_factory=_now)
 
     def to_dict(self) -> dict:
         return {
             "id": self.id, "text": self.text, "status": self.status,
-            "appliedSeq": self.applied_seq,
+            "appliedSeq": self.applied_seq, "images": self.images,
             "createdAt": self.created_at, "updatedAt": self.updated_at,
         }
 
@@ -272,6 +273,7 @@ class Addon:
             text=d.get("text", ""),
             status=d.get("status", "pending"),
             applied_seq=int(d.get("appliedSeq", 0)),
+            images=list(d.get("images") or []),
             created_at=d.get("createdAt", _now()),
             updated_at=d.get("updatedAt", _now()),
         )

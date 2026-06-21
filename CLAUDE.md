@@ -289,8 +289,8 @@ way" toggle opening a side drawer. Questions go through `loopAsk` →
 loop's `agent_session_id`), so it never pollutes / interrupts the loop's main
 context — usable even while a loop is running. Answers stream via
 `loopAsideDelta` (per `turnId`) and persist as `asides` on the stage file. The
-By-the-way input supports **image attachments** (clipboard paste / Snipaste /
-picker, same `useClipboardImage` flow as the main chat): `loopAsk` takes an
+By-the-way input supports **image attachments** (clipboard paste / Snipaste,
+same `useClipboardImage` flow as the main chat): `loopAsk` takes an
 optional third `images_json` arg parsed by `_parse_images_json` and passed to the
 agent turn; the base64 is **not** persisted (only `image_count` is kept on the
 `AsideTurn` to render a 🖼️ badge in history).
@@ -302,9 +302,13 @@ clobber each other.
 
 **Addons (执行中补充).** `loopAddAddon` / `loopRemoveAddon` let the user queue
 supplementary requirements while a loop runs — they do **not** affect the current
-loop. Pending addons are folded into the **next** loop's `analysis` (for trend /
-planning) and `prepare` (where they're consumed: marked `applied` with the
-`seq` that incorporated them). Pending addons are freely add/removable until
+loop. The add input is a multi-line textarea with **image paste** support;
+`loopAddAddon(session_id, text, images_json)` persists the images (base64) on the
+`Addon` and feeds them into the consuming `prepare` turn (`_loop_run_agent` takes
+an optional `images`). Pending items render as compact 2-line cards (thumbnail
+strip + truncated text) that expand on click. Pending addons are folded into the
+**next** loop's `analysis` (for trend / planning) and `prepare` (where they're
+consumed: marked `applied` with the `seq` that incorporated them). Pending addons are freely add/removable until
 consumed; applied ones remain as history — surfaced in a collapsible **"📌 Addon
 历史" card** (always available, incl. loopout) that groups applied addons by the
 loop (`appliedSeq` → round / `#seq`) that incorporated them. The active add/queue
