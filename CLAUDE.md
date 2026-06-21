@@ -308,8 +308,8 @@ loop. The add input is a multi-line textarea with **image paste** support;
 an optional `images`). Pending items render as compact 2-line cards (thumbnail
 strip + truncated text) that expand on click. Pending addons are folded into the
 **next** loop's `analysis` (for trend / planning) and `prepare` (where they're
-consumed: marked `applied` with the `seq` that incorporated them). Pending addons are freely add/removable until
-consumed; applied ones remain as history — surfaced in a collapsible **"📌 Addon
+consumed: marked `applied` with the `seq` that incorporated them). Pending addons are freely add/edit/removable until
+consumed (`loopEditAddon` edits text + images inline); applied ones remain as history — surfaced in a collapsible **"📌 Addon
 历史" card** (always available, incl. loopout) that groups applied addons by the
 loop (`appliedSeq` → round / `#seq`) that incorporated them. The active add/queue
 UI lives in the addon panel (execute stage only).
@@ -362,7 +362,7 @@ The "🗑 停止并删除本次" button shows in the execute ops row while runni
 Loop RPCs: `loopGetState`, `loopSubmitIdea`, `loopRemoveIdea`, `loopSealIdea`,
 `loopSetGoal`, `loopRefineGoal`, `loopSetPolicy`, `loopRunIteration`, `loopDiscard`,
 `loopSetAuto`, `loopAdvanceToOut`, `loopContinue`, `loopAsk`, `loopAddAddon`,
-`loopRemoveAddon`. `createSession` takes an optional third `session_type` argument.
+`loopRemoveAddon`, `loopEditAddon`. `createSession` takes an optional third `session_type` argument.
 
 ### Slash Commands
 

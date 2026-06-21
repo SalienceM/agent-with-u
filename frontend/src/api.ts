@@ -710,6 +710,13 @@ export const api = {
     try { return JSON.parse(result); } catch { return { status: 'error' }; }
   },
 
+  /** 编辑一条待纳入的补充（文字 + 图片）。 */
+  async loopEditAddon(sessionId: string, addonId: string, text: string, images?: any[]): Promise<{ status: string; message?: string }> {
+    const imagesJson = images && images.length ? JSON.stringify(images) : '';
+    const result = await call('loopEditAddon', sessionId, addonId, text, imagesJson);
+    try { return JSON.parse(result); } catch { return { status: 'error', message: '响应解析失败' }; }
+  },
+
   onLoopAsideDelta(cb: LoopAsideDeltaCallback): () => void {
     loopAsideDeltaCallbacks.push(cb);
     return () => { loopAsideDeltaCallbacks = loopAsideDeltaCallbacks.filter((c) => c !== cb); };
@@ -1283,6 +1290,7 @@ function mockDispatch(method: string, params: any[]): any {
     case 'loopAsk': return JSON.stringify({ status: 'error', message: 'mock mode' });
     case 'loopAddAddon': return JSON.stringify({ status: 'error', message: 'mock mode' });
     case 'loopRemoveAddon': return JSON.stringify({ status: 'ok' });
+    case 'loopEditAddon': return JSON.stringify({ status: 'ok' });
     case 'listSessions': return '[]';
     case 'listConnectedClients': return '[]';
     case 'loadSession': return 'null';

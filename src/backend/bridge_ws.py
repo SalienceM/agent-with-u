@@ -2086,6 +2086,27 @@ class BridgeWS:
         self._emit_loop_updated(state)
         return json.dumps({"status": "ok", "addonId": addon.id}, ensure_ascii=False)
 
+    def _rpc_loopEditAddon(self, session_id: str, addon_id: str, text: str, images_json: str = "") -> str:
+        """编辑一条待纳入（pending）的补充（文字 + 图片）。已纳入的作为历史不可改。"""
+        state = self._loop_state(session_id)
+        if not state:
+            return json.dumps({"status": "error", "message": "no loop state"}, ensure_ascii=False)
+        addon = next((a for a in state.addons if a.id == addon_id), None)
+        if not addon:
+            return json.dumps({"status": "error", "message": "找不到该补充"}, ensure_ascii=False)
+        if addon.status != "pending":
+            return json.dumps({"status": "error", "message": "已纳入的补充不可编辑"}, ensure_ascii=False)
+        t = (text or "").strip()
+        imgs = self._parse_images_json(images_json)
+        if not t and not imgs:
+            return json.dumps({"status": "error", "message": "内容为空"}, ensure_ascii=False)
+        addon.text = t or "（图片）"
+        addon.images = [im.to_dict() for im in imgs] if imgs else []
+        addon.updated_at = time.time()
+        self._loop_save(state)
+        self._emit_loop_updated(state)
+        return json.dumps({"status": "ok"}, ensure_ascii=False)
+
     def _rpc_loopRemoveAddon(self, session_id: str, addon_id: str) -> str:
         """删除补充。仅允许删尚未纳入（pending）的；已纳入的作为历史保留。"""
         state = self._loop_state(session_id)

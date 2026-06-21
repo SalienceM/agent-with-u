@@ -116,6 +116,7 @@ export const LoopPanel: React.FC<LoopPanelProps> = ({ sessionId, onClose, embedd
   const running = state?.running ?? false;
   const setAuto = useCallback((on: boolean) => api.loopSetAuto(sessionId, on), [sessionId]);
   const addAddon = useCallback((text: string, images?: ImageAttachment[]) => api.loopAddAddon(sessionId, text, images), [sessionId]);
+  const editAddon = useCallback((id: string, text: string, images?: any[]) => api.loopEditAddon(sessionId, id, text, images), [sessionId]);
   const removeAddon = useCallback((id: string) => api.loopRemoveAddon(sessionId, id), [sessionId]);
   const continueRound = useCallback(async (goal: string) => {
     setBusy(true);
@@ -240,7 +241,7 @@ export const LoopPanel: React.FC<LoopPanelProps> = ({ sessionId, onClose, embedd
                     state={state} progress={progress}
                     selectedSeq={selectedSeq} setSelectedSeq={setSelectedSeq}
                     onRun={runIteration} onAdvanceOut={advanceOut} onSetAuto={setAuto}
-                    onAddAddon={addAddon} onRemoveAddon={removeAddon} onContinue={continueRound}
+                    onAddAddon={addAddon} onRemoveAddon={removeAddon} onEditAddon={editAddon} onContinue={continueRound}
                     onDiscard={discardLoop}
                     running={running} busy={busy}
                     goalDraft={goalDraft} setGoalDraft={setGoalDraft} onSaveGoal={saveGoal}
@@ -563,7 +564,8 @@ const IdeaStage: React.FC<{
 // ══ Addon 面板（执行中补充要求）═══════════════════════════════
 const AddonPanel: React.FC<{
   addons: Addon[]; onAdd: (text: string, images?: ImageAttachment[]) => void; onRemove: (id: string) => void;
-}> = ({ addons, onAdd, onRemove }) => {
+  onEdit: (id: string, text: string, images?: any[]) => Promise<{ status: string; message?: string }>;
+}> = ({ addons, onAdd, onRemove, onEdit }) => {
   const [text, setText] = useState('');
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const { images, removeImage, clearImages } = useClipboardImage(inputRef);
@@ -601,17 +603,81 @@ const AddonPanel: React.FC<{
       </div>
       <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
         {pending.map((a) => (
-          <AddonItem key={a.id} addon={a} onRemove={() => onRemove(a.id)} />
+          <AddonItem key={a.id} addon={a} onRemove={() => onRemove(a.id)} onEdit={onEdit} />
         ))}
       </div>
     </div>
   );
 };
 
-// 单条待纳入 addon：默认收成 2 行（上行缩略素材 + 下行截断文字），可点开展开
-const AddonItem: React.FC<{ addon: Addon; onRemove: () => void }> = ({ addon, onRemove }) => {
+// 单条待纳入 addon：默认收成 2 行（上行缩略素材 + 下行截断文字），可点开展开 / 编辑
+const AddonItem: React.FC<{
+  addon: Addon; onRemove: () => void;
+  onEdit: (id: string, text: string, images?: any[]) => Promise<{ status: string; message?: string }>;
+}> = ({ addon, onRemove, onEdit }) => {
   const [open, setOpen] = useState(false);
+  const [editing, setEditing] = useState(false);
+  const [text, setText] = useState(addon.text);
+  const [keptImgs, setKeptImgs] = useState<AddonImage[]>(addon.images || []);
+  const [saving, setSaving] = useState(false);
+  const editRef = useRef<HTMLTextAreaElement>(null);
+  const { images: newImgs, removeImage, clearImages } = useClipboardImage(editRef);
   const imgs = addon.images || [];
+
+  const startEdit = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    setText(addon.text === '（图片）' ? '' : addon.text);
+    setKeptImgs(addon.images || []);
+    clearImages();
+    setEditing(true);
+  };
+  const save = async () => {
+    const combined = [
+      ...keptImgs.map((i) => ({ id: i.id, base64: i.base64, mime_type: i.mime_type })),
+      ...newImgs.map((i) => ({ id: i.id, base64: i.base64, mime_type: i.mime_type })),
+    ];
+    if (!text.trim() && combined.length === 0) return;
+    setSaving(true);
+    const r = await onEdit(addon.id, text.trim(), combined);
+    setSaving(false);
+    if (r.status === 'ok') { clearImages(); setEditing(false); }
+    else if (r.message) alert(r.message);
+  };
+
+  if (editing) {
+    return (
+      <div className="awu-reveal" style={{ padding: '8px 10px', borderRadius: 8, background: '#bf87000d', border: '1px solid #bf870055' }}>
+        {(keptImgs.length > 0 || newImgs.length > 0) && (
+          <div style={{ display: 'flex', gap: 4, marginBottom: 6, flexWrap: 'wrap' }}>
+            {keptImgs.map((im, i) => (
+              <div key={im.id || i} style={{ position: 'relative' }}>
+                <img src={`data:${im.mime_type || 'image/png'};base64,${im.base64}`}
+                  style={{ width: 48, height: 48, objectFit: 'cover', borderRadius: 5, border: '1px solid var(--theme-border)' }} />
+                <button onClick={() => setKeptImgs((p) => p.filter((x) => x !== im))}
+                  style={{ position: 'absolute', top: -6, right: -6, width: 16, height: 16, borderRadius: '50%', border: 'none', background: '#f87171', color: '#fff', fontSize: 10, cursor: 'pointer', lineHeight: '16px', padding: 0 }}>✕</button>
+              </div>
+            ))}
+          </div>
+        )}
+        {newImgs.length > 0 && <ImagePreview images={newImgs} onRemove={removeImage} />}
+        <textarea
+          ref={editRef}
+          value={text}
+          onChange={(e) => setText(e.target.value)}
+          onKeyDown={(e) => { if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') save(); }}
+          placeholder="编辑补充内容…（可粘贴图片，Ctrl/Cmd+Enter 保存）"
+          autoFocus
+          style={{ ...inputBase, width: '100%', minHeight: 54, maxHeight: 160, resize: 'vertical', lineHeight: 1.5 }}
+        />
+        <div style={{ display: 'flex', gap: 8, marginTop: 8 }}>
+          <button onClick={save} disabled={saving || (!text.trim() && keptImgs.length === 0 && newImgs.length === 0)}
+            style={{ ...primaryBtn, padding: '6px 14px', opacity: saving ? 0.5 : 1 }}>{saving ? '保存中…' : '保存'}</button>
+          <button onClick={() => { setEditing(false); clearImages(); }} style={btn}>取消</button>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div style={{ display: 'flex', alignItems: 'flex-start', gap: 8, padding: '7px 10px', borderRadius: 8, background: '#bf87000d', border: '1px solid #bf870033' }}>
       <span style={{ fontSize: 12, color: '#bf8700', marginTop: 2 }}>●</span>
@@ -634,6 +700,7 @@ const AddonItem: React.FC<{ addon: Addon; onRemove: () => void }> = ({ addon, on
           <span style={{ fontSize: 10, color: 'var(--theme-text-muted)' }}>点开看全部{imgs.length ? ` · 🖼️${imgs.length}` : ''}</span>
         )}
       </div>
+      <button onClick={startEdit} style={miniX} title="编辑">✎</button>
       <button onClick={onRemove} style={miniX} title="删除">✕</button>
     </div>
   );
@@ -950,11 +1017,12 @@ const ExecuteStage: React.FC<{
   selectedSeq: number | null; setSelectedSeq: (v: number | null) => void;
   onRun: () => void; onAdvanceOut: () => void; onSetAuto: (on: boolean) => void;
   onAddAddon: (text: string, images?: ImageAttachment[]) => void; onRemoveAddon: (id: string) => void;
+  onEditAddon: (id: string, text: string, images?: any[]) => Promise<{ status: string; message?: string }>;
   onContinue: (goal: string) => void; onDiscard: () => void;
   running: boolean; busy: boolean;
   goalDraft: string; setGoalDraft: (v: string) => void; onSaveGoal: () => void;
   onRefineGoal: (hint: string) => Promise<{ status: string; goal?: string; message?: string }>;
-}> = ({ state, progress, selectedSeq, setSelectedSeq, onRun, onAdvanceOut, onSetAuto, onAddAddon, onRemoveAddon, onContinue, onDiscard, running, busy, goalDraft, setGoalDraft, onSaveGoal, onRefineGoal }) => {
+}> = ({ state, progress, selectedSeq, setSelectedSeq, onRun, onAdvanceOut, onSetAuto, onAddAddon, onRemoveAddon, onEditAddon, onContinue, onDiscard, running, busy, goalDraft, setGoalDraft, onSaveGoal, onRefineGoal }) => {
   const isOut = state.stage === 'loopout';
   const selected = state.loops.find((l) => l.seq === selectedSeq) || null;
   const runLabel = state.resumable
@@ -999,7 +1067,7 @@ const ExecuteStage: React.FC<{
       {isOut && <LoopOutBanner state={state} onContinue={onContinue} busy={busy} onRefineGoal={onRefineGoal} />}
 
       {/* ★ 执行中补充（addon）：不影响当前 loop，下一次 loop 纳入并完成 */}
-      {!isOut && <AddonPanel addons={state.addons || []} onAdd={onAddAddon} onRemove={onRemoveAddon} />}
+      {!isOut && <AddonPanel addons={state.addons || []} onAdd={onAddAddon} onRemove={onRemoveAddon} onEdit={onEditAddon} />}
 
       {/* ★ Addon 历史：哪一轮/哪次 loop 纳入了哪些补充（执行中 & loopout 都可看） */}
       <AddonHistoryCard addons={state.addons || []} loops={state.loops} />
