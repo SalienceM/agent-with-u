@@ -297,8 +297,10 @@ supplementary requirements while a loop runs — they do **not** affect the curr
 loop. Pending addons are folded into the **next** loop's `analysis` (for trend /
 planning) and `prepare` (where they're consumed: marked `applied` with the
 `seq` that incorporated them). Pending addons are freely add/removable until
-consumed; applied ones remain as struck-through history. Shown in a dedicated
-addon panel in the LoopPanel.
+consumed; applied ones remain as history — surfaced in a collapsible **"📌 Addon
+历史" card** (always available, incl. loopout) that groups applied addons by the
+loop (`appliedSeq` → round / `#seq`) that incorporated them. The active add/queue
+UI lives in the addon panel (execute stage only).
 
 **Global goal provenance & versioning.** Sealing ideas forms the **global goal**.
 The original ideas (`state.ideas`) are kept and surfaced in the LoopPanel's

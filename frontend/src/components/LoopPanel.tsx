@@ -538,7 +538,6 @@ const AddonPanel: React.FC<{
 }> = ({ addons, onAdd, onRemove }) => {
   const [text, setText] = useState('');
   const pending = addons.filter((a) => a.status === 'pending');
-  const applied = addons.filter((a) => a.status === 'applied');
   const submit = () => { const t = text.trim(); if (!t) return; setText(''); onAdd(t); };
   return (
     <div style={{ ...sealBox, marginBottom: 16, borderColor: pending.length ? '#bf870055' : 'var(--theme-border)' }}>
@@ -551,9 +550,9 @@ const AddonPanel: React.FC<{
         )}
       </div>
       <div style={{ fontSize: 11, color: 'var(--theme-text-muted)', marginBottom: 8, lineHeight: 1.5 }}>
-        随手补充要求 —— <b>不影响当前正在跑的 loop</b>；下一次 loop 的分析与规划会带上并设法完成。纳入前可随时增删。
+        随手补充要求 —— <b>不影响当前正在跑的 loop</b>；下一次 loop 的分析与规划会带上并设法完成。纳入前可随时增删。已纳入的见下方「Addon 历史」。
       </div>
-      <div style={{ display: 'flex', gap: 8, marginBottom: pending.length || applied.length ? 10 : 0 }}>
+      <div style={{ display: 'flex', gap: 8, marginBottom: pending.length ? 10 : 0 }}>
         <input
           value={text}
           onChange={(e) => setText(e.target.value)}
@@ -571,14 +570,51 @@ const AddonPanel: React.FC<{
             <button onClick={() => onRemove(a.id)} style={miniX} title="删除">✕</button>
           </div>
         ))}
-        {applied.map((a) => (
-          <div key={a.id} style={{ display: 'flex', alignItems: 'flex-start', gap: 8, padding: '5px 10px', borderRadius: 8, opacity: 0.6 }}>
-            <span style={{ fontSize: 11, color: '#2da44e', marginTop: 1 }}>✓</span>
-            <span style={{ flex: 1, fontSize: 12.5, color: 'var(--theme-text-muted)', textDecoration: 'line-through', whiteSpace: 'pre-wrap' }}>{a.text}</span>
-            <span style={{ fontSize: 10, color: 'var(--theme-text-muted)', whiteSpace: 'nowrap' }}>已纳入 #{a.appliedSeq}</span>
-          </div>
-        ))}
       </div>
+    </div>
+  );
+};
+
+// ══ Addon 历史：哪一轮(第几轮 / 哪次 loop)纳入了哪些补充，随时可展开 ═══
+const AddonHistoryCard: React.FC<{ addons: Addon[]; loops: LoopRecord[] }> = ({ addons, loops }) => {
+  const [open, setOpen] = useState(false);
+  const applied = addons.filter((a) => a.status === 'applied');
+  if (applied.length === 0) return null;
+  const roundOf = (seq: number) => loops.find((l) => l.seq === seq)?.round ?? 1;
+  const groups = new Map<number, Addon[]>();
+  applied.forEach((a) => {
+    const arr = groups.get(a.appliedSeq) || [];
+    arr.push(a); groups.set(a.appliedSeq, arr);
+  });
+  const seqs = Array.from(groups.keys()).sort((x, y) => y - x);  // 最近纳入的在上
+  return (
+    <div style={{ ...sealBox, marginBottom: 16 }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+        <button onClick={() => setOpen(!open)}
+          style={{ ...linkBtn, fontWeight: 700, fontSize: 13, color: 'var(--theme-text)' }}>
+          {open ? '▾' : '▸'} 📌 Addon 历史
+        </button>
+        <span style={{ fontSize: 11, color: 'var(--theme-text-muted)' }}>{applied.length} 条已纳入 · 跨 {seqs.length} 次 loop</span>
+      </div>
+      {open && (
+        <div style={{ marginTop: 10, display: 'flex', flexDirection: 'column', gap: 10 }}>
+          {seqs.map((seq) => (
+            <div key={seq}>
+              <div style={{ fontSize: 11.5, fontWeight: 600, color: 'var(--theme-accent)', marginBottom: 4 }}>
+                第 {roundOf(seq)} 轮 · 由 Loop #{seq} 纳入（{groups.get(seq)!.length} 条）
+              </div>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 5 }}>
+                {groups.get(seq)!.map((a) => (
+                  <div key={a.id} style={{ display: 'flex', gap: 8, padding: '6px 10px', borderRadius: 8, background: 'var(--theme-bg-secondary)', border: '1px solid var(--theme-border)' }}>
+                    <span style={{ fontSize: 11, color: '#2da44e', marginTop: 1 }}>✓</span>
+                    <span style={{ flex: 1, fontSize: 12.5, color: 'var(--theme-text)', whiteSpace: 'pre-wrap', lineHeight: 1.5 }}>{a.text}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
     </div>
   );
 };
@@ -882,6 +918,9 @@ const ExecuteStage: React.FC<{
 
       {/* ★ 执行中补充（addon）：不影响当前 loop，下一次 loop 纳入并完成 */}
       {!isOut && <AddonPanel addons={state.addons || []} onAdd={onAddAddon} onRemove={onRemoveAddon} />}
+
+      {/* ★ Addon 历史：哪一轮/哪次 loop 纳入了哪些补充（执行中 & loopout 都可看） */}
+      <AddonHistoryCard addons={state.addons || []} loops={state.loops} />
 
       {/* Loop 时间轴（多轮时按轮分隔） */}
       <div style={{ display: 'flex', gap: 10, overflowX: 'auto', paddingBottom: 12, marginBottom: 8, alignItems: 'stretch' }}>
