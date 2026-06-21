@@ -2113,7 +2113,8 @@ class BridgeWS:
                             pass
             return json.dumps({"status": "ok", "stopping": True, "seq": rec.seq}, ensure_ascii=False)
 
-        reverted = self._discard_record(state, rec)
+        session = self._active_sessions.get(session_id) or self._session_store.load(session_id)
+        reverted = self._discard_record(state, rec, session)
         self._loop_save(state)
         self._emit_loop_updated(state)
         return json.dumps({"status": "ok", "seq": rec.seq, "revertedAddons": reverted}, ensure_ascii=False)
@@ -2140,6 +2141,8 @@ class BridgeWS:
             else:
                 record = LoopRecord(seq=len(state.loops) + 1, sub_stage=SUB_PREPARE,
                                     round=state.round)
+                # ★ 版本隔离：开跑前快照 agent 上下文，丢弃本次 loop 时回滚到这里
+                record.agent_checkpoint = session.agent_session_id or ""
                 state.loops.append(record)
                 self._loop_save(state)
                 self._emit_loop_updated(state)
@@ -2168,18 +2171,20 @@ class BridgeWS:
         finally:
             self._loop_running.discard(session_id)
             if session_id in self._loop_cancel:
-                # 停止并丢弃：删掉这次 loop，还原它消费过的 addon，当作没发生过
+                # 停止并丢弃：删掉这次 loop，还原它消费过的 addon，回滚 agent 上下文，当作没发生过
                 self._loop_cancel.discard(session_id)
                 st = self._loop_state(session_id)
                 if st is not None and record is not None:
-                    self._discard_record(st, record)
+                    self._discard_record(st, record, session)
                     self._loop_save(st)
                     self._emit_loop_updated(st)
             else:
                 self._maybe_autocontinue(session_id)
 
-    def _discard_record(self, state: "LoopState", record: "LoopRecord") -> int:
-        """从 state 移除一次 loop，并把它在 prepare 时消费的 addon 退回 pending。
+    def _discard_record(self, state: "LoopState", record: "LoopRecord",
+                        session: Optional["Session"] = None) -> int:
+        """从 state 移除一次 loop，把它在 prepare 时消费的 addon 退回 pending，并把 agent
+        上下文回滚到这次 loop 开跑前的快照（版本隔离，避免被丢弃 loop 的对话污染后续）。
         返回退回的 addon 数。"""
         state.loops = [l for l in state.loops if l.seq != record.seq]
         reverted = 0
@@ -2189,6 +2194,13 @@ class BridgeWS:
                 a.applied_seq = 0
                 a.updated_at = time.time()
                 reverted += 1
+        # ★ 版本隔离回滚：恢复开跑前的 agent_session_id，丢弃这次 loop 产生的对话上下文
+        if session is not None and record.agent_checkpoint is not None:
+            session.agent_session_id = record.agent_checkpoint or None
+            try:
+                self._session_store.save(session, async_=False)
+            except Exception:
+                pass
         # 兜底：若这次 loop 曾把全局阶段推进到 loopout 且本轮已无 loop，则退回 execute
         if state.stage == STAGE_OUT and not state.round_loops():
             state.stage = STAGE_EXECUTE

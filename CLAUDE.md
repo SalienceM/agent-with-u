@@ -343,10 +343,14 @@ The shared editor + defaults live in `frontend/src/components/LoopPolicyEditor.t
 be thrown away as if it never ran: `loopDiscard(session_id, seq=0)` (defaults to
 the last loop). If it's running, a `_loop_cancel` flag + `backend.abort` interrupts
 the in-flight agent turn(s) and the running task's `finally` does the cleanup; if
-idle, the RPC cleans up directly. `_discard_record` removes the `LoopRecord` and
+idle, the RPC cleans up directly. `_discard_record` removes the `LoopRecord`,
 **reverts any addons it consumed** (`applied` with that `seq` → back to `pending`),
-so a discarded loop's addon consumption is undone. The "🗑 停止并删除本次" button
-shows in the execute ops row while running or resumable.
+and **rolls back the agent context**: each iteration snapshots
+`session.agent_session_id` into `LoopRecord.agent_checkpoint` before its first turn
+(version isolation), and discard restores it — so the thrown-away loop's
+conversation doesn't pollute later loops. Disk file changes are **not** auto-reverted
+(surfaced in the confirm dialog). The "🗑 停止并删除本次" button shows in the execute
+ops row while running or resumable.
 
 Loop RPCs: `loopGetState`, `loopSubmitIdea`, `loopRemoveIdea`, `loopSealIdea`,
 `loopSetGoal`, `loopRefineGoal`, `loopSetPolicy`, `loopRunIteration`, `loopDiscard`,

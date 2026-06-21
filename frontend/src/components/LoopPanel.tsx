@@ -145,7 +145,13 @@ export const LoopPanel: React.FC<LoopPanelProps> = ({ sessionId, onClose, embedd
   }, [sessionId]);
 
   const discardLoop = useCallback(async () => {
-    if (!window.confirm('停止并删除本次 loop？这次 loop 当作没发生过——结果不保存；它在 prepare 时消费的补充（addon）会退回「待纳入」。')) return;
+    if (!window.confirm(
+      '停止并删除本次 loop？当作没发生过：\n' +
+      '· 这次 loop 记录与结果不保存\n' +
+      '· 它消费的补充（addon）退回「待纳入」\n' +
+      '· agent 上下文回滚到本次开跑前（不污染后续 loop）\n\n' +
+      '注意：本次已写入磁盘的文件改动不会自动回滚（如工作目录是 git 仓库，可自行 git 还原）。'
+    )) return;
     const r = await api.loopDiscard(sessionId);
     if (r.status !== 'ok' && r.message) alert(r.message);
   }, [sessionId]);
