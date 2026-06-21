@@ -59,10 +59,13 @@ class LoopStep:
     desc: str = ""
     status: str = "pending"    # pending | running | done | error
     output: str = ""           # 该步执行产出（持久化，用于复盘）
+    started_at: float = 0.0    # 开始执行时间戳（0 = 未开始），用于流程视图耗时
+    ended_at: float = 0.0      # 结束时间戳（0 = 未结束）
 
     def to_dict(self) -> dict:
         return {"index": self.index, "mode": self.mode, "desc": self.desc,
-                "status": self.status, "output": self.output}
+                "status": self.status, "output": self.output,
+                "startedAt": self.started_at, "endedAt": self.ended_at}
 
     @classmethod
     def from_dict(cls, d: dict) -> "LoopStep":
@@ -72,6 +75,8 @@ class LoopStep:
             desc=d.get("desc", ""),
             status=d.get("status", "pending"),
             output=d.get("output", ""),
+            started_at=float(d.get("startedAt", 0) or 0),
+            ended_at=float(d.get("endedAt", 0) or 0),
         )
 
 
@@ -122,8 +127,15 @@ class LoopRecord:
     result: str = ""                    # 本次 loop 执行完成的结果信息
     analysis: Optional[LoopAnalysis] = None
     error: str = ""
+    # 各子阶段的开始时间戳（{prepare/execute/analysis/done: ts}），用于流程视图耗时
+    sub_started: dict = field(default_factory=dict)
     created_at: float = field(default_factory=_now)
     updated_at: float = field(default_factory=_now)
+
+    def mark_sub(self, sub: str) -> None:
+        """记录某子阶段的开始时间（已记则不覆盖）。"""
+        if sub and sub not in self.sub_started:
+            self.sub_started[sub] = _now()
 
     def to_dict(self) -> dict:
         return {
@@ -136,6 +148,7 @@ class LoopRecord:
             "result": self.result,
             "analysis": self.analysis.to_dict() if self.analysis else None,
             "error": self.error,
+            "subStarted": self.sub_started,
             "createdAt": self.created_at,
             "updatedAt": self.updated_at,
         }
@@ -152,6 +165,7 @@ class LoopRecord:
             result=d.get("result", ""),
             analysis=LoopAnalysis.from_dict(d["analysis"]) if d.get("analysis") else None,
             error=d.get("error", ""),
+            sub_started=dict(d.get("subStarted") or {}),
             created_at=d.get("createdAt", _now()),
             updated_at=d.get("updatedAt", _now()),
         )

@@ -19,7 +19,7 @@ import type { LoopPolicy } from './LoopPolicyEditor';
  * 右上角可切换「Hack 模式」——整份状态以 terminal 风格的等宽文本呈现。
  */
 
-interface LoopStep { index: number; mode: string; desc: string; status: string; output: string; }
+interface LoopStep { index: number; mode: string; desc: string; status: string; output: string; startedAt?: number; endedAt?: number; }
 interface LoopAnalysis {
   score: number; notes: string; trend: string;
   optimizationPotential: number; challenges: string;
@@ -28,6 +28,7 @@ interface LoopAnalysis {
 interface LoopRecord {
   seq: number; subStage: string; round: number; goal: string; orchestration: LoopStep[];
   completed: boolean; result: string; analysis: LoopAnalysis | null; error: string;
+  subStarted?: Record<string, number>; createdAt?: number; updatedAt?: number;
 }
 interface IdeaEntry { id: string; prompt: string; status: string; result: string; error: string; }
 interface GoalRevision { goal: string; hint: string; source: string; createdAt: number; }
@@ -62,6 +63,7 @@ export interface LoopPanelProps {
 export const LoopPanel: React.FC<LoopPanelProps> = ({ sessionId, onClose, embedded, sandboxEnabled, onSandboxChange }) => {
   const [state, setState] = useState<LoopStateT | null>(null);
   const [selectedSeq, setSelectedSeq] = useState<number | null>(null);
+  const [viewMode, setViewMode] = useState<'panel' | 'flow'>('panel');  // 可切换的执行流程视图
   const [ideaInput, setIdeaInput] = useState('');
   const [goalDraft, setGoalDraft] = useState('');
   const [busy, setBusy] = useState(false);
@@ -179,37 +181,46 @@ export const LoopPanel: React.FC<LoopPanelProps> = ({ sessionId, onClose, embedd
       <Header stage={state.stage}
         asideOpen={asideOpen} setAsideOpen={setAsideOpen} asideCount={state.asides?.length || 0}
         onClose={onClose} embedded={embedded}
-        sandboxEnabled={sandboxEnabled} onSandboxChange={onSandboxChange} />
+        sandboxEnabled={sandboxEnabled} onSandboxChange={onSandboxChange}
+        viewMode={viewMode} setViewMode={setViewMode} canFlow={state.stage !== 'loopidea'} />
       <StageRail stage={state.stage} />
 
         <div style={{ flex: 1, display: 'flex', minHeight: 0, position: 'relative' }}>
           <div style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
             <div style={{ flex: 1, overflow: 'auto', padding: '12px 18px 24px' }}>
-              {/* 全局指标条 */}
-              {state.stage !== 'loopidea' && <MetricBar state={state} />}
-
-              {/* 策略与心智：实时查看 / 调整（折叠，默认收起） */}
-              <PolicyCard sessionId={sessionId} policy={state.policy} />
-
-              {state.stage === 'loopidea' && (
-                <IdeaStage
-                  state={state} ideaInput={ideaInput} setIdeaInput={setIdeaInput}
-                  goalDraft={goalDraft} setGoalDraft={setGoalDraft}
-                  onSubmit={submitIdea} onSeal={sealIdea} busy={busy}
-                  onRemove={(id) => api.loopRemoveIdea(sessionId, id)}
-                />
-              )}
-
-              {(state.stage === 'loopexecute' || state.stage === 'loopout') && (
-                <ExecuteStage
-                  state={state} progress={progress}
-                  selectedSeq={selectedSeq} setSelectedSeq={setSelectedSeq}
-                  onRun={runIteration} onAdvanceOut={advanceOut} onSetAuto={setAuto}
-                  onAddAddon={addAddon} onRemoveAddon={removeAddon} onContinue={continueRound}
-                  running={running} busy={busy}
-                  goalDraft={goalDraft} setGoalDraft={setGoalDraft} onSaveGoal={saveGoal}
-                  onRefineGoal={refineGoal}
-                />
+              {state.stage === 'loopidea' ? (
+                <>
+                  <PolicyCard sessionId={sessionId} policy={state.policy} />
+                  <IdeaStage
+                    state={state} ideaInput={ideaInput} setIdeaInput={setIdeaInput}
+                    goalDraft={goalDraft} setGoalDraft={setGoalDraft}
+                    onSubmit={submitIdea} onSeal={sealIdea} busy={busy}
+                    onRemove={(id) => api.loopRemoveIdea(sessionId, id)}
+                  />
+                </>
+              ) : viewMode === 'flow' ? (
+                /* ★ 流程视图：把执行过程画成可追踪的流程图（当前位置 / 每步耗时 / doing 动线） */
+                <>
+                  <MetricBar state={state} />
+                  <LoopFlowView state={state} selectedSeq={selectedSeq} setSelectedSeq={setSelectedSeq} />
+                  {selectedSeq != null && state.loops.find((l) => l.seq === selectedSeq) && (
+                    <LoopDetail loop={state.loops.find((l) => l.seq === selectedSeq)!} progress={progress} onClose={() => setSelectedSeq(null)} />
+                  )}
+                </>
+              ) : (
+                <>
+                  <MetricBar state={state} />
+                  <PolicyCard sessionId={sessionId} policy={state.policy} />
+                  <ExecuteStage
+                    state={state} progress={progress}
+                    selectedSeq={selectedSeq} setSelectedSeq={setSelectedSeq}
+                    onRun={runIteration} onAdvanceOut={advanceOut} onSetAuto={setAuto}
+                    onAddAddon={addAddon} onRemoveAddon={removeAddon} onContinue={continueRound}
+                    running={running} busy={busy}
+                    goalDraft={goalDraft} setGoalDraft={setGoalDraft} onSaveGoal={saveGoal}
+                    onRefineGoal={refineGoal}
+                  />
+                </>
               )}
             </div>
           </div>
@@ -233,7 +244,8 @@ const Header: React.FC<{
   asideOpen: boolean; setAsideOpen: (v: boolean) => void; asideCount: number;
   onClose?: () => void; embedded?: boolean;
   sandboxEnabled?: boolean; onSandboxChange?: (enabled: boolean) => void;
-}> = ({ stage, asideOpen, setAsideOpen, asideCount, onClose, embedded, sandboxEnabled, onSandboxChange }) => (
+  viewMode?: 'panel' | 'flow'; setViewMode?: (v: 'panel' | 'flow') => void; canFlow?: boolean;
+}> = ({ stage, asideOpen, setAsideOpen, asideCount, onClose, embedded, sandboxEnabled, onSandboxChange, viewMode, setViewMode, canFlow }) => (
     <div style={{
       display: 'flex', alignItems: 'center', gap: 12, padding: '12px 18px',
       borderBottom: '1px solid var(--theme-border)',
@@ -241,6 +253,15 @@ const Header: React.FC<{
       <span style={{ fontSize: 18 }}>🔁</span>
       <span style={{ fontSize: 15, fontWeight: 700, color: 'var(--theme-text)' }}>可视化 Loop</span>
       <span style={{ fontSize: 12, color: 'var(--theme-accent)', fontFamily: 'monospace' }}>{stage}</span>
+      {/* ★ 视图切换：面板（原功能）⇄ 流程（执行追踪），随时切 */}
+      {canFlow && setViewMode && (
+        <div style={{ display: 'flex', gap: 0, border: '1px solid var(--theme-border)', borderRadius: 7, overflow: 'hidden', marginLeft: 4 }}>
+          <button onClick={() => setViewMode('panel')} title="面板视图（原功能）"
+            style={{ ...segBtn, ...(viewMode === 'panel' ? segActive : {}) }}>🗂 面板</button>
+          <button onClick={() => setViewMode('flow')} title="流程视图：执行追踪 / 每步耗时"
+            style={{ ...segBtn, ...(viewMode === 'flow' ? segActive : {}) }}>🔀 流程</button>
+        </div>
+      )}
       <div style={{ flex: 1 }} />
       {/* ★ 沙盒开关：loop 会话没有聊天工具栏，在这里开/关文件操作的工作目录边界限制 */}
       {onSandboxChange && (
@@ -948,6 +969,179 @@ const ExecuteStage: React.FC<{
   );
 };
 
+// ══ 流程视图：把执行过程画成可追踪的流程图 ════════════════════
+//   每个 loop 一条横向泳道：[#seq] → Prepare → Execute(分步) → Analysis
+//   节点按状态着色，当前在跑的节点脉冲 + 入边走「marching ants」动线，
+//   每个节点/分步标注耗时（进行中实时累计）。
+function fmtDur(sec: number): string {
+  if (!isFinite(sec) || sec <= 0) return '';
+  if (sec < 1) return `${Math.round(sec * 1000)}ms`;
+  if (sec < 60) return `${sec < 10 ? sec.toFixed(1) : Math.round(sec)}s`;
+  const m = Math.floor(sec / 60), s = Math.round(sec % 60);
+  return `${m}m${s.toString().padStart(2, '0')}s`;
+}
+
+// 进行中需要实时刷新耗时：active 时每秒 tick
+function useNow(active: boolean): number {
+  const [now, setNow] = useState(() => Date.now() / 1000);
+  useEffect(() => {
+    if (!active) return;
+    setNow(Date.now() / 1000);
+    const id = setInterval(() => setNow(Date.now() / 1000), 1000);
+    return () => clearInterval(id);
+  }, [active]);
+  return now;
+}
+
+const FLOW_STATUS_COLOR: Record<string, string> = {
+  done: '#2da44e', running: '#0969da', error: '#f87171', current: '#bf8700', pending: 'var(--theme-text-muted)',
+};
+
+const LoopFlowView: React.FC<{
+  state: LoopStateT; selectedSeq: number | null; setSelectedSeq: (v: number | null) => void;
+}> = ({ state, selectedSeq, setSelectedSeq }) => {
+  const now = useNow(state.running);
+  const loops = state.loops;
+  // 当前真正在跑的 loop（用于脉冲 / 动线）
+  const activeSeq = state.running
+    ? (loops.find((l) => !l.completed && !l.error)?.seq ?? null)
+    : null;
+
+  if (loops.length === 0) {
+    return <div style={{ color: 'var(--theme-text-muted)', fontSize: 13, padding: '20px 0' }}>还没有 loop —— 切回「面板」点运行开始第 1 次。</div>;
+  }
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 0 }}>
+      <div style={{ fontSize: 12, color: 'var(--theme-text-muted)', marginBottom: 10 }}>
+        每条泳道是一次 loop 的执行流程；颜色表状态，<span style={{ color: '#0969da' }}>蓝色脉冲 = 正在执行</span>，节点下标注耗时。点节点看详情。
+      </div>
+      {loops.map((loop, i) => {
+        const newRound = state.round > 1 && (i === 0 || loops[i - 1].round !== loop.round);
+        return (
+          <React.Fragment key={loop.seq}>
+            {newRound && (
+              <div style={{ fontSize: 11, fontWeight: 700, color: 'var(--theme-accent)', background: 'var(--theme-accent-bg)', borderRadius: 6, padding: '3px 10px', alignSelf: 'flex-start', margin: '6px 0' }}>
+                第 {loop.round} 轮
+              </div>
+            )}
+            {i > 0 && !newRound && (
+              <div style={{ width: 2, height: 14, background: 'var(--theme-border)', marginLeft: 28 }} />
+            )}
+            <FlowLane loop={loop} live={loop.seq === activeSeq} now={now}
+              selected={loop.seq === selectedSeq}
+              onSelect={() => setSelectedSeq(loop.seq === selectedSeq ? null : loop.seq)} />
+          </React.Fragment>
+        );
+      })}
+    </div>
+  );
+};
+
+const FlowLane: React.FC<{
+  loop: LoopRecord; live: boolean; now: number; selected: boolean; onSelect: () => void;
+}> = ({ loop, live, now, selected, onSelect }) => {
+  const order = ['prepare', 'execute', 'analysis'];
+  const sub = loop.subStarted || {};
+  const curName = loop.subStage === 'done' ? 'analysis' : loop.subStage;
+  const curIdx = order.indexOf(curName);
+  const done = loop.completed;
+
+  const nstatus = (i: number): string => {
+    if (loop.error && i === curIdx && !done) return 'error';
+    if (done || i < curIdx) return 'done';
+    if (i === curIdx) return live ? 'running' : 'current';
+    return 'pending';
+  };
+  // 子阶段耗时：start 到下一阶段 start（或进行中到 now / 完成到 done）
+  const subDur = (i: number): number => {
+    const starts = [sub.prepare ?? loop.createdAt, sub.execute, sub.analysis];
+    const st = starts[i];
+    if (!st) return 0;
+    const nextStart = i < 2 ? starts[i + 1] : (sub.done ?? (done ? loop.updatedAt : undefined));
+    const end = nextStart ?? (nstatus(i) === 'running' ? now : undefined);
+    return end ? end - st : 0;
+  };
+
+  const score = loop.analysis?.score ?? null;
+  return (
+    <div onClick={onSelect}
+      style={{
+        display: 'flex', alignItems: 'stretch', gap: 0, padding: '10px 12px', borderRadius: 12, cursor: 'pointer',
+        background: selected ? 'var(--theme-accent-bg)' : 'var(--theme-bg-secondary)',
+        border: `1px solid ${selected ? 'var(--theme-accent)' : 'var(--theme-border)'}`,
+        overflowX: 'auto',
+      }}>
+      {/* loop 头节点 */}
+      <FlowChip title={`Loop #${loop.seq}`} status={done ? 'done' : (loop.error ? 'error' : (live ? 'running' : 'current'))}
+        sub={score != null ? `score ${score.toFixed(0)}` : (loop.round > 1 ? `第${loop.round}轮` : '进行中')} big />
+      <FlowEdge active={nstatus(0) === 'running'} done={nstatus(0) !== 'pending'} />
+      <FlowChip title="Prepare" status={nstatus(0)} dur={fmtDur(subDur(0))} />
+      <FlowEdge active={nstatus(1) === 'running'} done={nstatus(1) !== 'pending'} />
+      {/* Execute：含分步 */}
+      <FlowChip title="Execute" status={nstatus(1)} dur={fmtDur(subDur(1))}
+        sub={loop.orchestration.length ? `${loop.orchestration.filter((s) => s.status === 'done').length}/${loop.orchestration.length} 步` : undefined}
+        steps={loop.orchestration} now={now} />
+      <FlowEdge active={nstatus(2) === 'running'} done={nstatus(2) !== 'pending'} />
+      <FlowChip title="Analysis" status={nstatus(2)} dur={fmtDur(subDur(2))}
+        sub={score != null ? `score ${score.toFixed(0)}` : undefined} />
+    </div>
+  );
+};
+
+const FlowEdge: React.FC<{ active: boolean; done: boolean }> = ({ active, done }) => (
+  <div style={{ alignSelf: 'center', flexShrink: 0, width: 34, height: 2, margin: '0 2px', position: 'relative' }}>
+    <div className={active ? 'awu-flow-dash' : undefined}
+      style={{
+        position: 'absolute', inset: 0,
+        background: active ? undefined : (done ? 'var(--theme-accent)' : 'var(--theme-border)'),
+      }} />
+  </div>
+);
+
+const FlowChip: React.FC<{
+  title: string; status: string; dur?: string; sub?: string; big?: boolean;
+  steps?: LoopStep[]; now?: number;
+}> = ({ title, status, dur, sub, big, steps, now }) => {
+  const col = FLOW_STATUS_COLOR[status] || FLOW_STATUS_COLOR.pending;
+  const pulse = status === 'running';
+  return (
+    <div style={{
+      flexShrink: 0, minWidth: big ? 96 : 110, display: 'flex', flexDirection: 'column', gap: 4,
+      padding: '8px 10px', borderRadius: 10,
+      background: 'var(--theme-bg-tertiary)',
+      border: `1.5px solid ${col === 'var(--theme-text-muted)' ? 'var(--theme-border)' : col}`,
+      boxShadow: pulse ? `0 0 0 0 ${col}` : 'none',
+      animation: pulse ? 'awu-flow-pulse 1.3s infinite' : 'none',
+    }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
+        <span style={{ width: 7, height: 7, borderRadius: '50%', background: col, flexShrink: 0,
+          animation: pulse ? 'awu-loop-pulse 1.2s infinite' : 'none' }} />
+        <span style={{ fontSize: 12, fontWeight: 700, color: 'var(--theme-text)' }}>{title}</span>
+      </div>
+      {sub && <span style={{ fontSize: 10.5, color: 'var(--theme-text-muted)' }}>{sub}</span>}
+      {dur && <span style={{ fontSize: 10.5, color: col, fontFamily: 'monospace', fontWeight: 600 }}>⏱ {dur}</span>}
+      {steps && steps.length > 0 && (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 3, marginTop: 2 }}>
+          {steps.map((s) => {
+            const sc = FLOW_STATUS_COLOR[s.status === 'pending' ? 'pending' : s.status] || FLOW_STATUS_COLOR.pending;
+            const d = s.startedAt ? ((s.endedAt || (s.status === 'running' ? (now || Date.now() / 1000) : 0)) - s.startedAt) : 0;
+            return (
+              <div key={s.index} title={s.desc} style={{ display: 'flex', alignItems: 'center', gap: 4, maxWidth: 200 }}>
+                <span style={{ width: 6, height: 6, borderRadius: '50%', background: sc, flexShrink: 0,
+                  animation: s.status === 'running' ? 'awu-loop-pulse 1.2s infinite' : 'none' }} />
+                <span style={{ fontSize: 10, color: 'var(--theme-text-muted)' }}>{s.mode === 'concurrent' ? '∥' : '→'}{s.index}</span>
+                <span style={{ fontSize: 10, color: 'var(--theme-text)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1 }}>{s.desc}</span>
+                {d > 0 && <span style={{ fontSize: 9.5, color: sc, fontFamily: 'monospace', flexShrink: 0 }}>{fmtDur(d)}</span>}
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+};
+
 const LoopNode: React.FC<{ loop: LoopRecord; selected: boolean; onClick: () => void }> = ({ loop, selected, onClick }) => {
   const score = loop.analysis?.score ?? null;
   const subIdx = SUB_ORDER.indexOf(loop.subStage);
@@ -1211,11 +1405,24 @@ const asideJumpBtn: React.CSSProperties = {
   color: 'var(--theme-text)', fontSize: 11.5, fontWeight: 500, cursor: 'pointer',
   boxShadow: '0 2px 10px rgba(0,0,0,0.25)', whiteSpace: 'nowrap', zIndex: 5,
 };
+// 视图切换分段按钮
+const segBtn: React.CSSProperties = {
+  background: 'var(--theme-bg-tertiary)', border: 'none', color: 'var(--theme-text-muted)',
+  fontSize: 12, padding: '4px 10px', cursor: 'pointer',
+};
+const segActive: React.CSSProperties = {
+  background: 'var(--theme-accent-bg)', color: 'var(--theme-accent)', fontWeight: 600,
+};
 
-// 注入脉冲动画（一次性）
+// 注入脉冲 / 流程动画（一次性）
 if (typeof document !== 'undefined' && !document.getElementById('awu-loop-css')) {
   const s = document.createElement('style');
   s.id = 'awu-loop-css';
-  s.textContent = `@keyframes awu-loop-pulse { 0%,100% { opacity: 0.35; } 50% { opacity: 1; } }`;
+  s.textContent = `
+@keyframes awu-loop-pulse { 0%,100% { opacity: 0.35; } 50% { opacity: 1; } }
+@keyframes awu-flow-pulse { 0%,100% { box-shadow: 0 0 0 0 rgba(9,105,218,0.45); } 50% { box-shadow: 0 0 0 5px rgba(9,105,218,0); } }
+@keyframes awu-flow-dash { to { background-position: 16px 0; } }
+.awu-flow-dash { background-image: repeating-linear-gradient(90deg, var(--theme-accent) 0 8px, transparent 8px 16px); background-size: 16px 100%; animation: awu-flow-dash 0.55s linear infinite; }
+`;
   document.head.appendChild(s);
 }

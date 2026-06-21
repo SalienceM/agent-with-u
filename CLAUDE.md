@@ -239,6 +239,8 @@ The global stage advances one-way: `loopidea → loopexecute → loopout`.
   consecutive `concurrent` steps go in parallel via `asyncio.gather`, `sequential`
   steps in order; each `LoopStep` tracks `status` pending→running→done/error and
   persists its `output` for replay), `analysis` (score 0–100 vs the global goal).
+  Sub-stage and per-step timings are persisted (`LoopRecord.sub_started`,
+  `LoopStep.started_at/ended_at`) to drive the flow view's durations.
   Score ≥70 = deliverable, ≥85 = outputtable. A composite **risk coefficient**
   (0–1) caps the effective max loops. **Auto-continue** (`loopSetAuto`): when on,
   a finished loop auto-starts the next until stop/cancel. **Resume**: state is
@@ -264,6 +266,12 @@ detects `sessionType === 'loop'` and renders `<LoopPanel embedded />` instead of
 the message list + chat input). This is deliberate: a loop session has **no
 free-form chat box** — all interaction is in the panel (stage rail / loop timeline /
 detail panels / addon / "By the way" /
+a header **view toggle 🗂 面板 ⇄ 🔀 流程**: the flow view (`LoopFlowView`, plain
+SVG/CSS — no d3 dep) draws each loop as a horizontal lane
+`#seq → Prepare → Execute(steps) → Analysis` with status colors, a pulsing
+node + marching-ants edge for whatever is currently running, and per-node /
+per-step durations (live-ticking while running). It is a **switchable alternate
+view** over the same state; the panel view is left untouched /
 a 🔒 **sandbox toggle** in the header, since loop sessions have no chat toolbar
 to flip `set_sandbox_enabled` from). Note: the Layer-2 sandbox path check
 (`validate_sandbox_path`) normalizes MSYS/Git-Bash drive paths (`/d/foo` →

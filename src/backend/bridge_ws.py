@@ -2108,6 +2108,7 @@ class BridgeWS:
 
     async def _loop_do_prepare(self, session, state, record, history) -> None:
         record.sub_stage = SUB_PREPARE
+        record.mark_sub(SUB_PREPARE)
         record.updated_at = time.time()
         self._loop_save(state)
         self._emit_loop_updated(state)
@@ -2159,6 +2160,7 @@ class BridgeWS:
 
     async def _loop_do_execute(self, session, state, record) -> None:
         record.sub_stage = SUB_EXECUTE
+        record.mark_sub(SUB_EXECUTE)
         record.updated_at = time.time()
         self._loop_save(state)
         self._emit_loop_updated(state)
@@ -2213,6 +2215,7 @@ class BridgeWS:
         if step.status == "done":
             return
         step.status = "running"
+        step.started_at = time.time()
         self._loop_save(state)
         self._emit_loop_updated(state)
         prompt = (
@@ -2229,11 +2232,13 @@ class BridgeWS:
         )
         step.output = text.strip()
         step.status = "done" if text.strip() else "error"
+        step.ended_at = time.time()
         self._loop_save(state)
         self._emit_loop_updated(state)
 
     async def _loop_do_analysis(self, session, state, record) -> None:
         record.sub_stage = SUB_ANALYSIS
+        record.mark_sub(SUB_ANALYSIS)
         record.updated_at = time.time()
         self._loop_save(state)
         self._emit_loop_updated(state)
@@ -2301,6 +2306,7 @@ class BridgeWS:
         record.analysis = analysis
         record.completed = True
         record.sub_stage = SUB_DONE
+        record.mark_sub(SUB_DONE)
         record.updated_at = time.time()
         self._recompute_risk(state)
         stop, reason = self._loop_should_stop(state)
