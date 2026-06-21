@@ -29,6 +29,7 @@ interface LoopRecord {
   seq: number; subStage: string; round: number; goal: string; orchestration: LoopStep[];
   completed: boolean; result: string; analysis: LoopAnalysis | null; error: string;
   subStarted?: Record<string, number>; createdAt?: number; updatedAt?: number;
+  hasGitCheckpoint?: boolean;
 }
 interface IdeaEntry { id: string; prompt: string; status: string; result: string; error: string; }
 interface GoalRevision { goal: string; hint: string; source: string; createdAt: number; }
@@ -145,16 +146,27 @@ export const LoopPanel: React.FC<LoopPanelProps> = ({ sessionId, onClose, embedd
   }, [sessionId]);
 
   const discardLoop = useCallback(async () => {
+    // 丢弃目标：正在跑的那次（或最后一次）
+    const target = state?.loops.find((l) => !l.completed && !l.error) || state?.loops[state.loops.length - 1];
+    const hasGit = !!target?.hasGitCheckpoint;
     if (!window.confirm(
       '停止并删除本次 loop？当作没发生过：\n' +
       '· 这次 loop 记录与结果不保存\n' +
       '· 它消费的补充（addon）退回「待纳入」\n' +
-      '· agent 上下文回滚到本次开跑前（不污染后续 loop）\n\n' +
-      '注意：本次已写入磁盘的文件改动不会自动回滚（如工作目录是 git 仓库，可自行 git 还原）。'
+      '· agent 上下文回滚到本次开跑前（不污染后续 loop）'
     )) return;
-    const r = await api.loopDiscard(sessionId);
+    let restoreFiles = false;
+    if (hasGit) {
+      restoreFiles = window.confirm(
+        '同时把工作目录文件回滚到本次 loop 开跑前？\n\n' +
+        '确定 = 用开跑前的 git 快照恢复工作树：丢弃本次 loop 的文件改动、删除它新建的文件\n' +
+        '（开跑前你已有的改动/未跟踪文件会保留，.gitignore 忽略的文件不动）。\n\n' +
+        '取消 = 仅丢弃记录/addon/上下文，保留磁盘上的文件改动。'
+      );
+    }
+    const r = await api.loopDiscard(sessionId, 0, restoreFiles);
     if (r.status !== 'ok' && r.message) alert(r.message);
-  }, [sessionId]);
+  }, [sessionId, state]);
 
   const advanceOut = useCallback(async () => {
     if (!window.confirm('进入 loopout 全局产出阶段（单向）。继续？')) return;

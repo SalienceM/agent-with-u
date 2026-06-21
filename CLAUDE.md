@@ -348,9 +348,16 @@ idle, the RPC cleans up directly. `_discard_record` removes the `LoopRecord`,
 and **rolls back the agent context**: each iteration snapshots
 `session.agent_session_id` into `LoopRecord.agent_checkpoint` before its first turn
 (version isolation), and discard restores it — so the thrown-away loop's
-conversation doesn't pollute later loops. Disk file changes are **not** auto-reverted
-(surfaced in the confirm dialog). The "🗑 停止并删除本次" button shows in the execute
-ops row while running or resumable.
+conversation doesn't pollute later loops. **File-level isolation**: if the working
+dir is a git repo, each iteration also takes a *non-destructive* snapshot
+(`git_snapshot` — temp `GIT_INDEX_FILE` + `add -A` + `write-tree` + `commit-tree`,
+captures tracked + untracked, respects `.gitignore`, touches nothing) into
+`LoopRecord.git_checkpoint`. On discard the UI asks a second confirm; if accepted,
+`git_restore_snapshot` (`read-tree -u --reset` + `clean -fd` + `reset`) rolls the
+working tree back to before the loop — reverting the loop's edits and removing the
+files it created, while preserving pre-loop uncommitted/untracked changes. The
+`restore_files` flag rides the `_loop_cancel` dict for the running-discard path.
+The "🗑 停止并删除本次" button shows in the execute ops row while running or resumable.
 
 Loop RPCs: `loopGetState`, `loopSubmitIdea`, `loopRemoveIdea`, `loopSealIdea`,
 `loopSetGoal`, `loopRefineGoal`, `loopSetPolicy`, `loopRunIteration`, `loopDiscard`,

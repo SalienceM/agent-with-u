@@ -133,6 +133,9 @@ class LoopRecord:
     #   None=未快照（老记录）；""=当时无上下文；"X"=具体 id。丢弃本次 loop 时据此回滚，
     #   避免被丢弃 loop 的对话污染后续 loop 的上下文。
     agent_checkpoint: Optional[str] = None
+    # ★ 文件级版本隔离：本次 loop 开跑前对 git 工作目录的非破坏性快照 commit sha。
+    #   None=非 git 仓库/未快照。丢弃时经用户确认可据此把工作树恢复到开跑前。
+    git_checkpoint: Optional[str] = None
     created_at: float = field(default_factory=_now)
     updated_at: float = field(default_factory=_now)
 
@@ -154,6 +157,8 @@ class LoopRecord:
             "error": self.error,
             "subStarted": self.sub_started,
             "agentCheckpoint": self.agent_checkpoint,
+            "gitCheckpoint": self.git_checkpoint,
+            "hasGitCheckpoint": bool(self.git_checkpoint),
             "createdAt": self.created_at,
             "updatedAt": self.updated_at,
         }
@@ -172,6 +177,7 @@ class LoopRecord:
             error=d.get("error", ""),
             sub_started=dict(d.get("subStarted") or {}),
             agent_checkpoint=d.get("agentCheckpoint", None),
+            git_checkpoint=d.get("gitCheckpoint", None),
             created_at=d.get("createdAt", _now()),
             updated_at=d.get("updatedAt", _now()),
         )

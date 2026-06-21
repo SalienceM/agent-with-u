@@ -668,9 +668,10 @@ export const api = {
     try { return JSON.parse(result); } catch { return { status: 'error', message: '响应解析失败' }; }
   },
 
-  /** 停止并删除一次 loop（误触兜底，当作没发生过；消费过的 addon 退回 pending）。 */
-  async loopDiscard(sessionId: string, seq: number = 0): Promise<{ status: string; stopping?: boolean; seq?: number; revertedAddons?: number; message?: string }> {
-    const result = await call('loopDiscard', sessionId, seq);
+  /** 停止并删除一次 loop（误触兜底，当作没发生过；消费过的 addon 退回 pending；
+   *  restoreFiles=true 且有 git 快照时同时回滚工作目录文件到开跑前）。 */
+  async loopDiscard(sessionId: string, seq: number = 0, restoreFiles: boolean = false): Promise<{ status: string; stopping?: boolean; seq?: number; revertedAddons?: number; message?: string }> {
+    const result = await call('loopDiscard', sessionId, seq, restoreFiles);
     try { return JSON.parse(result); } catch { return { status: 'error', message: '响应解析失败' }; }
   },
 

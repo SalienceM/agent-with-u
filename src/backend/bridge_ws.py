@@ -235,6 +235,75 @@ DEFAULT_BACKENDS = [
 ]
 
 
+# ── Loop 文件级版本隔离：git 非破坏性快照 / 恢复 ────────────────
+
+def _git_is_repo(path: str) -> bool:
+    import subprocess
+    try:
+        r = subprocess.run(["git", "rev-parse", "--is-inside-work-tree"],
+                           cwd=path, capture_output=True, text=True, timeout=10)
+        return r.returncode == 0 and r.stdout.strip() == "true"
+    except Exception:
+        return False
+
+
+def git_snapshot(working_dir: Optional[str]) -> Optional[str]:
+    """对工作目录做一次**非破坏性**快照（用临时索引，不动真实索引/HEAD/工作树），
+    捕获已跟踪 + 未跟踪文件（遵循 .gitignore）。返回快照 commit sha；非 git 仓库或失败返回 None。"""
+    import os, subprocess, time as _t
+    if not working_dir or not os.path.isdir(working_dir) or not _git_is_repo(working_dir):
+        return None
+    tmp_index = None
+    try:
+        env = dict(os.environ)
+        tmp_index = os.path.join(working_dir, ".git", f"awu_loop_idx_{int(_t.time() * 1000)}")
+        env["GIT_INDEX_FILE"] = tmp_index
+        head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=working_dir,
+                              capture_output=True, text=True)
+        has_head = head.returncode == 0
+        if has_head:
+            subprocess.run(["git", "read-tree", "HEAD"], cwd=working_dir, env=env,
+                           capture_output=True, text=True, check=True)
+        subprocess.run(["git", "add", "-A"], cwd=working_dir, env=env,
+                       capture_output=True, text=True, check=True)
+        tree = subprocess.run(["git", "write-tree"], cwd=working_dir, env=env,
+                              capture_output=True, text=True, check=True).stdout.strip()
+        args = ["git", "commit-tree", tree, "-m", "awu loop checkpoint"]
+        if has_head:
+            args += ["-p", head.stdout.strip()]
+        snap = subprocess.run(args, cwd=working_dir, capture_output=True, text=True,
+                              check=True).stdout.strip()
+        return snap or None
+    except Exception as e:
+        print(f"[loop] git snapshot failed: {e}", file=sys.stderr, flush=True)
+        return None
+    finally:
+        if tmp_index:
+            try:
+                os.remove(tmp_index)
+            except Exception:
+                pass
+
+
+def git_restore_snapshot(working_dir: Optional[str], snap_sha: Optional[str]) -> bool:
+    """把工作树恢复到 snap_sha 快照：还原被改动的文件、删除快照之后新建的未跟踪文件
+    （遵循 .gitignore，不删忽略文件），索引回到 HEAD（改动显示为未暂存）。"""
+    import subprocess
+    if not working_dir or not snap_sha or not _git_is_repo(working_dir):
+        return False
+    try:
+        subprocess.run(["git", "read-tree", "-u", "--reset", snap_sha], cwd=working_dir,
+                       capture_output=True, text=True, check=True)
+        subprocess.run(["git", "clean", "-fd"], cwd=working_dir,
+                       capture_output=True, text=True, check=True)
+        subprocess.run(["git", "reset", "-q"], cwd=working_dir,
+                       capture_output=True, text=True)
+        return True
+    except Exception as e:
+        print(f"[loop] git restore failed: {e}", file=sys.stderr, flush=True)
+        return False
+
+
 def compress_messages(messages: list[ChatMessage], keep_recent: int = 6) -> str:
     """压缩早期消息，保留最近 keep_recent 条原文。（与 bridge.py 相同逻辑）"""
     if len(messages) <= keep_recent:
@@ -276,7 +345,7 @@ class BridgeWS:
         self._loop_store = LoopStore()
         self._idea_semaphore = asyncio.Semaphore(3)  # loopidea 阶段最多 3 并发
         self._loop_running: set[str] = set()         # 正在跑 iteration 的 session
-        self._loop_cancel: set[str] = set()           # 请求停止并丢弃当前 loop 的 session
+        self._loop_cancel: dict[str, bool] = {}       # 请求停止并丢弃当前 loop：sid → 是否同时回滚文件
         self._aside_running: set[str] = set()        # 正在回答 by-the-way 的 session
         # ★ 进程内 LoopState 单例缓存：iteration（反复整文件覆写）与旁路问答
         #   （追加 asides）共享同一对象，避免一方的保存覆盖另一方的写入。
@@ -2076,11 +2145,13 @@ class BridgeWS:
         asyncio.ensure_future(self._run_loop_iteration(session_id))
         return json.dumps({"status": "ok"}, ensure_ascii=False)
 
-    def _rpc_loopDiscard(self, session_id: str, seq: int = 0) -> str:
+    def _rpc_loopDiscard(self, session_id: str, seq: int = 0, restore_files=False) -> str:
         """停止并删除一次 loop（误触兜底）：当作没发生过。
         - 正在跑：发取消信号 + 中断当前 agent 轮次，运行任务在 finally 完成删除/还原。
         - 未在跑：直接删除该 loop 并把它消费过的 addon 退回 pending。
+        restore_files=True 且该 loop 有 git 快照时，同时把工作目录文件回滚到开跑前。
         默认作用于最后一次 loop。"""
+        restore = self._coerce_bool(restore_files)
         state = self._loop_state(session_id)
         if not state:
             return json.dumps({"status": "error", "message": "no loop state"}, ensure_ascii=False)
@@ -2097,7 +2168,7 @@ class BridgeWS:
 
         if session_id in self._loop_running:
             # 运行中：信号取消并中断当前 agent 轮次；删除在运行任务的 finally 里做
-            self._loop_cancel.add(session_id)
+            self._loop_cancel[session_id] = restore
             session = self._active_sessions.get(session_id) or self._session_store.load(session_id)
             if session:
                 backend = self._backends.get(session.backend_id)
@@ -2114,7 +2185,7 @@ class BridgeWS:
             return json.dumps({"status": "ok", "stopping": True, "seq": rec.seq}, ensure_ascii=False)
 
         session = self._active_sessions.get(session_id) or self._session_store.load(session_id)
-        reverted = self._discard_record(state, rec, session)
+        reverted = self._discard_record(state, rec, session, restore_files=restore)
         self._loop_save(state)
         self._emit_loop_updated(state)
         return json.dumps({"status": "ok", "seq": rec.seq, "revertedAddons": reverted}, ensure_ascii=False)
@@ -2141,8 +2212,9 @@ class BridgeWS:
             else:
                 record = LoopRecord(seq=len(state.loops) + 1, sub_stage=SUB_PREPARE,
                                     round=state.round)
-                # ★ 版本隔离：开跑前快照 agent 上下文，丢弃本次 loop 时回滚到这里
+                # ★ 版本隔离：开跑前快照 agent 上下文 + git 工作树，丢弃本次 loop 时回滚到这里
                 record.agent_checkpoint = session.agent_session_id or ""
+                record.git_checkpoint = git_snapshot(session.working_dir)
                 state.loops.append(record)
                 self._loop_save(state)
                 self._emit_loop_updated(state)
@@ -2171,21 +2243,22 @@ class BridgeWS:
         finally:
             self._loop_running.discard(session_id)
             if session_id in self._loop_cancel:
-                # 停止并丢弃：删掉这次 loop，还原它消费过的 addon，回滚 agent 上下文，当作没发生过
-                self._loop_cancel.discard(session_id)
+                # 停止并丢弃：删掉这次 loop，还原它消费过的 addon，回滚 agent 上下文（+ 可选回滚文件）
+                restore_files = self._loop_cancel.pop(session_id, False)
                 st = self._loop_state(session_id)
                 if st is not None and record is not None:
-                    self._discard_record(st, record, session)
+                    self._discard_record(st, record, session, restore_files=restore_files)
                     self._loop_save(st)
                     self._emit_loop_updated(st)
             else:
                 self._maybe_autocontinue(session_id)
 
     def _discard_record(self, state: "LoopState", record: "LoopRecord",
-                        session: Optional["Session"] = None) -> int:
+                        session: Optional["Session"] = None,
+                        restore_files: bool = False) -> int:
         """从 state 移除一次 loop，把它在 prepare 时消费的 addon 退回 pending，并把 agent
         上下文回滚到这次 loop 开跑前的快照（版本隔离，避免被丢弃 loop 的对话污染后续）。
-        返回退回的 addon 数。"""
+        restore_files=True 且有 git 快照时，还把工作目录文件回滚到开跑前。返回退回的 addon 数。"""
         state.loops = [l for l in state.loops if l.seq != record.seq]
         reverted = 0
         for a in state.addons:
@@ -2201,6 +2274,11 @@ class BridgeWS:
                 self._session_store.save(session, async_=False)
             except Exception:
                 pass
+        # ★ 文件级回滚（仅在用户确认 + 有 git 快照时）：把工作树恢复到开跑前
+        if restore_files and record.git_checkpoint and session is not None:
+            ok = git_restore_snapshot(session.working_dir, record.git_checkpoint)
+            print(f"[loop] discard #{record.seq} file-restore: {'ok' if ok else 'failed/skipped'}",
+                  file=sys.stderr, flush=True)
         # 兜底：若这次 loop 曾把全局阶段推进到 loopout 且本轮已无 loop，则退回 execute
         if state.stage == STAGE_OUT and not state.round_loops():
             state.stage = STAGE_EXECUTE
