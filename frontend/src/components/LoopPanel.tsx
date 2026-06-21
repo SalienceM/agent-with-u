@@ -161,8 +161,8 @@ export const LoopPanel: React.FC<LoopPanelProps> = ({ sessionId, onClose, embedd
 
   // embedded = 作为会话内容内嵌（填满 pane，无浮层 backdrop）；否则浮层模式
   const wrap = (children: React.ReactNode) => embedded
-    ? <div style={embeddedShell}>{children}</div>
-    : <div style={overlay}><div style={shell}>{children}</div></div>;
+    ? <div className="awu-loop" style={embeddedShell}>{children}</div>
+    : <div style={overlay}><div className="awu-loop" style={shell}>{children}</div></div>;
 
   if (!state) {
     return wrap(
@@ -636,7 +636,7 @@ const AddonHistoryCard: React.FC<{ addons: Addon[]; loops: LoopRecord[] }> = ({ 
         <span style={{ fontSize: 11, color: 'var(--theme-text-muted)' }}>{applied.length} 条已纳入 · 跨 {seqs.length} 次 loop</span>
       </div>
       {open && (
-        <div style={{ marginTop: 10, display: 'flex', flexDirection: 'column', gap: 10 }}>
+        <div className="awu-reveal" style={{ marginTop: 10, display: 'flex', flexDirection: 'column', gap: 10 }}>
           {seqs.map((seq) => (
             <div key={seq}>
               <div style={{ fontSize: 11.5, fontWeight: 600, color: 'var(--theme-accent)', marginBottom: 4 }}>
@@ -773,7 +773,7 @@ const PolicyCard: React.FC<{ sessionId: string; policy?: LoopPolicy }> = ({ sess
         </span>
       </div>
       {open && (
-        <div style={{ marginTop: 10 }}>
+        <div className="awu-reveal" style={{ marginTop: 10 }}>
           <LoopPolicyEditor value={draft} onChange={(v) => { setDraft(v); setDirty(true); }} />
           <div style={{ display: 'flex', gap: 8, marginTop: 10, alignItems: 'center', flexWrap: 'wrap' }}>
             <button onClick={save} disabled={saving || !dirty}
@@ -806,7 +806,7 @@ const RefineBox: React.FC<{
     else if (r.message) alert(r.message);
   };
   return (
-    <div style={{ marginTop: 10, padding: 10, borderRadius: 8, background: 'var(--theme-bg-secondary)', border: '1px solid var(--theme-accent)' }}>
+    <div className="awu-reveal" style={{ marginTop: 10, padding: 10, borderRadius: 8, background: 'var(--theme-bg-secondary)', border: '1px solid var(--theme-accent)' }}>
       <div style={{ fontSize: 11.5, color: 'var(--theme-text-muted)', marginBottom: 6, lineHeight: 1.5 }}>
         给一句提示，由模型在「当前目标 + 原始诉求」基础上自动改写。例如「更强调性能」「缩小到只做后端」「把验收标准写细」。每次微调都会留一版历史。
       </div>
@@ -885,7 +885,7 @@ const GoalCard: React.FC<{
       </div>
 
       {showHist && history.length > 0 && (
-        <div style={{ marginTop: 8, display: 'flex', flexDirection: 'column', gap: 8 }}>
+        <div className="awu-reveal" style={{ marginTop: 8, display: 'flex', flexDirection: 'column', gap: 8 }}>
           {history.map((g, i) => {
             const sl = SRC_LABEL[g.source] || SRC_LABEL.manual;
             const cur = i === history.length - 1;
@@ -905,7 +905,7 @@ const GoalCard: React.FC<{
       )}
 
       {showIdeas && ideas.length > 0 && (
-        <div style={{ marginTop: 8, display: 'flex', flexDirection: 'column', gap: 6 }}>
+        <div className="awu-reveal" style={{ marginTop: 8, display: 'flex', flexDirection: 'column', gap: 6 }}>
           <div style={{ fontSize: 11, color: 'var(--theme-text-muted)' }}>封口前投递的想法 / 原始诉求（全局目标由此收敛而来）：</div>
           {ideas.map((it) => (
             <div key={it.id} style={{ padding: '7px 10px', borderRadius: 8, background: 'var(--theme-bg-secondary)', border: '1px solid var(--theme-border)' }}>
@@ -1093,7 +1093,7 @@ const FlowLane: React.FC<{
 
   const score = loop.analysis?.score ?? null;
   return (
-    <div onClick={onSelect}
+    <div onClick={onSelect} className="awu-card"
       style={{
         display: 'flex', alignItems: 'stretch', gap: 0, padding: '10px 12px', borderRadius: 12, cursor: 'pointer',
         background: selected ? 'var(--theme-accent-bg)' : 'var(--theme-bg-secondary)',
@@ -1176,11 +1176,11 @@ const LoopNode: React.FC<{ loop: LoopRecord; selected: boolean; onClick: () => v
   return (
     <div
       onClick={onClick}
+      className="awu-card"
       style={{
         flexShrink: 0, width: 150, cursor: 'pointer', padding: 12, borderRadius: 12,
         background: selected ? 'var(--theme-accent-bg)' : 'var(--theme-bg-secondary)',
         border: `1px solid ${selected ? 'var(--theme-accent)' : 'var(--theme-border)'}`,
-        transition: 'all 0.15s',
       }}
     >
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 8 }}>
@@ -1450,7 +1450,28 @@ if (typeof document !== 'undefined' && !document.getElementById('awu-loop-css'))
 @keyframes awu-loop-pulse { 0%,100% { opacity: 0.35; } 50% { opacity: 1; } }
 @keyframes awu-flow-pulse { 0%,100% { box-shadow: 0 0 0 0 rgba(9,105,218,0.45); } 50% { box-shadow: 0 0 0 5px rgba(9,105,218,0); } }
 @keyframes awu-flow-dash { to { background-position: 16px 0; } }
+@keyframes awu-loop-fade { from { opacity: 0; transform: translateY(-4px); } to { opacity: 1; transform: none; } }
 .awu-flow-dash { background-image: repeating-linear-gradient(90deg, var(--theme-accent) 0 8px, transparent 8px 16px); background-size: 16px 100%; animation: awu-flow-dash 0.55s linear infinite; }
+
+/* ── 优雅交互层：统一过渡 / hover / 聚焦反馈（inline 样式不含 :hover，故此处生效）── */
+.awu-loop button { transition: background-color .16s ease, border-color .16s ease, color .16s ease, box-shadow .16s ease, transform .1s ease, opacity .16s ease; }
+.awu-loop button:not(:disabled) { cursor: pointer; }
+.awu-loop button:not(:disabled):hover { filter: brightness(1.07); }
+.awu-loop button:not(:disabled):active { transform: translateY(1px) scale(0.985); }
+.awu-loop button:disabled { cursor: default; }
+.awu-loop textarea, .awu-loop input { transition: border-color .16s ease, box-shadow .16s ease, background-color .16s ease; }
+.awu-loop textarea:focus, .awu-loop input:focus { border-color: var(--theme-accent) !important; box-shadow: 0 0 0 3px var(--theme-accent-bg); }
+.awu-loop ::placeholder { color: var(--theme-text-muted); opacity: 0.7; }
+/* 细滚动条，统一观感 */
+.awu-loop *::-webkit-scrollbar { width: 9px; height: 9px; }
+.awu-loop *::-webkit-scrollbar-thumb { background: var(--theme-border); border-radius: 6px; border: 2px solid transparent; background-clip: padding-box; }
+.awu-loop *::-webkit-scrollbar-thumb:hover { background: var(--theme-text-muted); background-clip: padding-box; }
+.awu-loop *::-webkit-scrollbar-track { background: transparent; }
+/* 卡片悬停轻微抬升（仅标了 awu-card 的） */
+.awu-loop .awu-card { transition: border-color .18s ease, box-shadow .18s ease, transform .18s ease; }
+.awu-loop .awu-card:hover { border-color: var(--theme-accent); box-shadow: 0 4px 18px rgba(0,0,0,0.10); }
+/* 折叠区域展开的淡入 */
+.awu-loop .awu-reveal { animation: awu-loop-fade .2s ease both; }
 `;
   document.head.appendChild(s);
 }
