@@ -2622,7 +2622,12 @@ class BridgeWS:
         # 达到可输出，且后续优化空间小 / 曲线平缓 → 收口
         flat = len(done) >= 2 and (done[-1].analysis.score - done[-2].analysis.score) < 3
         if latest.outputtable and (latest.optimization_potential < 0.15 or flat):
-            return True, "已达可输出且优化空间收敛"
+            # ★ 防自欺：开启独立评审时，"首轮即达标且收敛"不直接收口——很可能是单次乐观
+            #   自述造成的虚高。安排一次复核 loop（auto 则自动跑），跑满 2 次仍达标再收口。
+            if getattr(state.policy, "independent_eval", True) and len(done) < 2:
+                pass
+            else:
+                return True, "已达可输出且优化空间收敛"
         # 风险过高（任务大概率完不成）→ 止损
         if state.risk_coefficient >= state.policy.risk_threshold:
             return True, "风险系数过高，停止无谓 loop"

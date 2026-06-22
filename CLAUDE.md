@@ -252,7 +252,11 @@ The global stage advances one-way: `loopidea → loopexecute → loopout`.
   payload carries `running` / `resumable` (injected by `_loop_payload`).
 - **loopout** — per-round output stage (auto-entered when outputtable + optimization
   potential is low / improvement curve flattens / risk too high / max loops hit;
-  or manually). It is **not** terminal: `loopContinue` starts a **new round** from
+  or manually). Anti-self-deception guard: with `independent_eval` on, a **first**
+  loop that is already "outputtable + converged" does **not** auto-seal — one
+  re-check loop is required (≥2 analyzed loops) before the convergence seal, so a
+  single optimistic self-report can't end the round prematurely.
+  It is **not** terminal: `loopContinue` starts a **new round** from
   loopout (stage → loopexecute, `round`+1, status active, risk reset), reusing the
   same working dir / agent context, with an optional new/edited goal. Scores, risk,
   trend, and the effective-max-loops budget are scoped **per round** (`round_loops()`);
