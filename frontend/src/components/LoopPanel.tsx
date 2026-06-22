@@ -31,7 +31,7 @@ interface LoopRecord {
   subStarted?: Record<string, number>; createdAt?: number; updatedAt?: number;
   hasGitCheckpoint?: boolean;
 }
-interface IdeaEntry { id: string; prompt: string; status: string; result: string; error: string; }
+interface IdeaEntry { id: string; prompt: string; status: string; result: string; error: string; images?: AddonImage[]; }
 interface GoalRevision { goal: string; hint: string; source: string; createdAt: number; }
 interface AsideTurn { id: string; question: string; answer: string; status: string; stage: string; seq: number; imageCount?: number; }
 interface AddonImage { id?: string; base64: string; mime_type?: string; }
@@ -124,11 +124,11 @@ export const LoopPanel: React.FC<LoopPanelProps> = ({ sessionId, onClose, embedd
     setBusy(false);
   }, [sessionId]);
 
-  const submitIdea = useCallback(async () => {
+  const submitIdea = useCallback(async (images?: ImageAttachment[]) => {
     const text = ideaInput.trim();
-    if (!text) return;
+    if (!text && !(images && images.length)) return;
     setIdeaInput('');
-    await api.loopSubmitIdea(sessionId, text);
+    await api.loopSubmitIdea(sessionId, text, images);
   }, [ideaInput, sessionId]);
 
   const sealIdea = useCallback(async () => {
@@ -504,26 +504,35 @@ const Badge: React.FC<{ text: string; color: string }> = ({ text, color }) => (
 const IdeaStage: React.FC<{
   state: LoopStateT; ideaInput: string; setIdeaInput: (v: string) => void;
   goalDraft: string; setGoalDraft: (v: string) => void;
-  onSubmit: () => void; onSeal: () => void; busy: boolean;
+  onSubmit: (images?: ImageAttachment[]) => void; onSeal: () => void; busy: boolean;
   onRemove: (id: string) => void;
 }> = ({ state, ideaInput, setIdeaInput, goalDraft, setGoalDraft, onSubmit, onSeal, busy, onRemove }) => {
   const runningCount = state.ideas.filter((i) => i.status === 'running').length;
+  const inputRef = useRef<HTMLTextAreaElement>(null);
+  const { images, removeImage, clearImages } = useClipboardImage(inputRef);
+  const submit = () => {
+    if (!ideaInput.trim() && images.length === 0) return;
+    onSubmit(images); clearImages();
+  };
   return (
     <div>
       <p style={{ fontSize: 13, color: 'var(--theme-text-muted)', margin: '0 0 12px' }}>
-        头脑风暴阶段 · 非阻塞投递想法，后端最多 3 个并发展开。封口后形成全局目标并单向进入 loopexecute。
+        头脑风暴阶段 · 非阻塞投递想法（可粘贴图片），后端最多 3 个并发展开。封口后形成全局目标并单向进入 loopexecute。
         {runningCount > 0 && <span style={{ color: 'var(--theme-accent)' }}> · {runningCount} 个进行中</span>}
       </p>
 
-      <div style={{ display: 'flex', gap: 8, marginBottom: 16 }}>
+      {images.length > 0 && <ImagePreview images={images} onRemove={removeImage} />}
+      <div style={{ display: 'flex', gap: 8, marginBottom: 16, alignItems: 'flex-end' }}>
         <textarea
+          ref={inputRef}
           value={ideaInput}
           onChange={(e) => setIdeaInput(e.target.value)}
-          onKeyDown={(e) => { if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') onSubmit(); }}
-          placeholder="一条想法/方向…（Ctrl/Cmd+Enter 投递）"
+          onKeyDown={(e) => { if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') submit(); }}
+          placeholder="一条想法/方向…（可粘贴图片，Ctrl/Cmd+Enter 投递）"
           style={{ ...inputBase, minHeight: 56, resize: 'vertical', flex: 1 }}
         />
-        <button onClick={onSubmit} disabled={!ideaInput.trim()} style={{ ...primaryBtn, opacity: ideaInput.trim() ? 1 : 0.5 }}>投递</button>
+        <button onClick={submit} disabled={!ideaInput.trim() && images.length === 0}
+          style={{ ...primaryBtn, opacity: (ideaInput.trim() || images.length) ? 1 : 0.5 }}>投递</button>
       </div>
 
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(220px, 1fr))', gap: 10, marginBottom: 24 }}>
@@ -538,6 +547,14 @@ const IdeaStage: React.FC<{
               <div style={{ flex: 1 }} />
               <button onClick={() => onRemove(idea.id)} style={miniX} title="删除">✕</button>
             </div>
+            {(idea.images || []).length > 0 && (
+              <div style={{ display: 'flex', gap: 4, marginBottom: 5, flexWrap: 'wrap' }}>
+                {(idea.images || []).map((im, i) => (
+                  <img key={im.id || i} src={`data:${im.mime_type || 'image/png'};base64,${im.base64}`}
+                    style={{ width: 40, height: 40, objectFit: 'cover', borderRadius: 5, border: '1px solid var(--theme-border)' }} />
+                ))}
+              </div>
+            )}
             <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--theme-text)', marginBottom: 4 }}>{idea.prompt}</div>
             {idea.result && <div style={{ fontSize: 12, color: 'var(--theme-text-muted)', lineHeight: 1.5, whiteSpace: 'pre-wrap', maxHeight: 160, overflow: 'auto' }}>{idea.result}</div>}
             {idea.error && <div style={{ fontSize: 12, color: '#f87171' }}>{idea.error}</div>}
@@ -1001,6 +1018,14 @@ const GoalCard: React.FC<{
           <div style={{ fontSize: 11, color: 'var(--theme-text-muted)' }}>封口前投递的想法 / 原始诉求（全局目标由此收敛而来）：</div>
           {ideas.map((it) => (
             <div key={it.id} style={{ padding: '7px 10px', borderRadius: 8, background: 'var(--theme-bg-secondary)', border: '1px solid var(--theme-border)' }}>
+              {(it.images || []).length > 0 && (
+                <div style={{ display: 'flex', gap: 4, marginBottom: 4, flexWrap: 'wrap' }}>
+                  {(it.images || []).map((im, i) => (
+                    <img key={im.id || i} src={`data:${im.mime_type || 'image/png'};base64,${im.base64}`}
+                      style={{ width: 34, height: 34, objectFit: 'cover', borderRadius: 5, border: '1px solid var(--theme-border)' }} />
+                  ))}
+                </div>
+              )}
               <div style={{ fontSize: 12.5, color: 'var(--theme-text)', whiteSpace: 'pre-wrap', lineHeight: 1.5 }}>{it.prompt}</div>
               {it.result && <div style={{ fontSize: 11.5, color: 'var(--theme-text-muted)', marginTop: 4, whiteSpace: 'pre-wrap', lineHeight: 1.5 }}>↳ {it.result}</div>}
             </div>

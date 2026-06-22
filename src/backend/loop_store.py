@@ -191,6 +191,7 @@ class IdeaEntry:
     status: str = "pending"   # pending | running | done | error
     result: str = ""
     error: str = ""
+    images: list = field(default_factory=list)  # 附带图片附件（base64 dict），喂给该想法的展开
     created_at: float = field(default_factory=_now)
     updated_at: float = field(default_factory=_now)
 
@@ -201,6 +202,7 @@ class IdeaEntry:
             "status": self.status,
             "result": self.result,
             "error": self.error,
+            "images": self.images,
             "createdAt": self.created_at,
             "updatedAt": self.updated_at,
         }
@@ -213,6 +215,7 @@ class IdeaEntry:
             status=d.get("status", "pending"),
             result=d.get("result", ""),
             error=d.get("error", ""),
+            images=list(d.get("images") or []),
             created_at=d.get("createdAt", _now()),
             updated_at=d.get("updatedAt", _now()),
         )

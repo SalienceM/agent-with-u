@@ -228,7 +228,9 @@ keep a separate **stage file** at `~/.agent-with-u/loops/<session_id>.json`
 
 The global stage advances one-way: `loopidea → loopexecute → loopout`.
 
-- **loopidea** — non-blocking brainstorm. The frontend posts ideas; the backend
+- **loopidea** — non-blocking brainstorm. The frontend posts ideas (text and/or
+  **image attachments** — `loopSubmitIdea(session_id, prompt, images_json)`, images
+  persisted on `IdeaEntry` and fed into that idea's expansion turn); the backend
   runs them through a concurrency pool (`asyncio.Semaphore(3)`), each idea an
   independent one-shot agent turn. Sealing forms the **global goal** and switches
   to `loopexecute`.

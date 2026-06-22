@@ -632,8 +632,9 @@ export const api = {
     try { return JSON.parse(result); } catch { return null; }
   },
 
-  async loopSubmitIdea(sessionId: string, prompt: string): Promise<{ status: string; ideaId?: string; message?: string }> {
-    const result = await call('loopSubmitIdea', sessionId, prompt);
+  async loopSubmitIdea(sessionId: string, prompt: string, images?: any[]): Promise<{ status: string; ideaId?: string; message?: string }> {
+    const imagesJson = images && images.length ? JSON.stringify(images) : '';
+    const result = await call('loopSubmitIdea', sessionId, prompt, imagesJson);
     try { return JSON.parse(result); } catch { return { status: 'error', message: '响应解析失败' }; }
   },
 

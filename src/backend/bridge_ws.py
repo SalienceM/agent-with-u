@@ -1909,12 +1909,17 @@ class BridgeWS:
 
     # ── loopidea：非阻塞想法池 ────────────────────────────────────
 
-    def _rpc_loopSubmitIdea(self, session_id: str, prompt: str) -> str:
-        """投递一条想法（非阻塞）。立即返回 idea，后台并发跑（最多 3）。"""
+    def _rpc_loopSubmitIdea(self, session_id: str, prompt: str, images_json: str = "") -> str:
+        """投递一条想法（非阻塞，可带图片）。立即返回 idea，后台并发跑（最多 3）。"""
         state = self._loop_get_or_create(session_id)
         if state.stage != STAGE_IDEA:
             return json.dumps({"status": "error", "message": "已离开 loopidea 阶段"}, ensure_ascii=False)
-        idea = IdeaEntry(id=new_id(), prompt=prompt.strip(), status="pending")
+        p = (prompt or "").strip()
+        imgs = self._parse_images_json(images_json)
+        if not p and not imgs:
+            return json.dumps({"status": "error", "message": "内容为空"}, ensure_ascii=False)
+        img_dicts = [im.to_dict() for im in imgs] if imgs else []
+        idea = IdeaEntry(id=new_id(), prompt=p or "（图片）", status="pending", images=img_dicts)
         state.ideas.append(idea)
         self._loop_save(state)
         self._emit_loop_updated(state)
@@ -1947,6 +1952,7 @@ class BridgeWS:
             text = await self._loop_run_agent(
                 session, prompt, sub_stage="idea", seq=-1,
                 resume=False, indep_session_id=f"{session_id}:idea:{idea_id}",
+                images=(idea.images or None),
             )
             # 重新载入，避免并发覆盖
             state = self._loop_state(session_id) or state
