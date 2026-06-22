@@ -664,6 +664,20 @@ export const api = {
     try { return JSON.parse(result); } catch { return { status: 'error', message: '响应解析失败' }; }
   },
 
+  /** 策略预设库：内置 + 用户自存，可直接选用。 */
+  async loopPolicyPresetList(): Promise<{ status: string; presets?: any[] }> {
+    const result = await call('loopPolicyPresetList');
+    try { return JSON.parse(result); } catch { return { status: 'error', presets: [] }; }
+  },
+  async loopPolicyPresetSave(name: string, policy: any, presetId: string = ''): Promise<{ status: string; preset?: any; message?: string }> {
+    const result = await call('loopPolicyPresetSave', name, JSON.stringify(policy || {}), presetId);
+    try { return JSON.parse(result); } catch { return { status: 'error', message: '响应解析失败' }; }
+  },
+  async loopPolicyPresetDelete(presetId: string): Promise<{ status: string; message?: string }> {
+    const result = await call('loopPolicyPresetDelete', presetId);
+    try { return JSON.parse(result); } catch { return { status: 'error' }; }
+  },
+
   async loopRunIteration(sessionId: string): Promise<{ status: string; message?: string }> {
     const result = await call('loopRunIteration', sessionId);
     try { return JSON.parse(result); } catch { return { status: 'error', message: '响应解析失败' }; }
@@ -1283,6 +1297,9 @@ function mockDispatch(method: string, params: any[]): any {
     case 'loopSetGoal': return JSON.stringify({ status: 'ok' });
     case 'loopRefineGoal': return JSON.stringify({ status: 'error', message: 'mock mode' });
     case 'loopSetPolicy': return JSON.stringify({ status: 'ok' });
+    case 'loopPolicyPresetList': return JSON.stringify({ status: 'ok', presets: [] });
+    case 'loopPolicyPresetSave': return JSON.stringify({ status: 'ok' });
+    case 'loopPolicyPresetDelete': return JSON.stringify({ status: 'ok' });
     case 'loopRunIteration': return JSON.stringify({ status: 'error', message: 'mock mode' });
     case 'loopDiscard': return JSON.stringify({ status: 'ok' });
     case 'loopSetAuto': return JSON.stringify({ status: 'ok', auto: !!params[1] });

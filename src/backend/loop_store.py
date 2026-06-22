@@ -299,8 +299,14 @@ DEFAULT_STRATEGY = (
     "- prepare：规划这一遍的策略与分步编排（可并发 concurrent / 顺次 sequential）。\n"
     "- execute：实际执行编排（读写文件、运行命令），如实记录产出与成败。\n"
     "- analysis：对照全局目标打分（0–100），评估趋势、优化空间与硬约束。\n"
-    "评分心智：优先把每一遍做到尽量完整，而不是保留实力分多次；遇到环境/权限/网络等"
-    "硬约束要在 challenges 里点明，避免为不可能的任务做无谓 loop。"
+    "\n"
+    "评分心智（防自欺，必须遵守）：\n"
+    "1. 以**可验证的实际产物**为准——文件是否真存在、代码是否真能跑、命令/测试输出是否真通过；"
+    "**不要轻信**执行阶段的自述总结，能验证就动手验证。\n"
+    "2. **默认未完成**：除非有明确证据满足验收标准，否则不给高分；模糊、未验证、想当然一律压低。\n"
+    "3. 警惕「美好陷阱」：流程跑顺 ≠ 目标达成；高分（≥可输出门槛）必须对应验收标准**逐条**被证据支撑。\n"
+    "4. 趋势判断要看**实质改进**（新增能力/缺陷修复/通过的检查），而非措辞更乐观或换了说法。\n"
+    "5. 宁可保守扣分、点明差距与下一步，也不要为了收口而粉饰；真完不成就如实在 challenges 标注。"
 )
 
 
@@ -311,6 +317,7 @@ class LoopPolicy:
     outputtable_score: float = OUTPUTTABLE_SCORE   # 可输出门槛
     max_loops: int = 8                             # 基础最大 loop 约束
     risk_threshold: float = 0.85                   # 风险止损阈值（≥ 即收口）
+    independent_eval: bool = True                  # analysis 用独立上下文 + 对抗式评审（防自欺）
     strategy: str = DEFAULT_STRATEGY               # 注入到 prepare/analysis 的策略心智文本
 
     def to_dict(self) -> dict:
@@ -319,6 +326,7 @@ class LoopPolicy:
             "outputtableScore": self.outputtable_score,
             "maxLoops": self.max_loops,
             "riskThreshold": self.risk_threshold,
+            "independentEval": self.independent_eval,
             "strategy": self.strategy,
         }
 
@@ -339,8 +347,10 @@ class LoopPolicy:
         ml = max(1, min(50, ml))
         rt = max(0.1, min(1.0, _f("riskThreshold", 0.85)))
         strat = d.get("strategy")
+        ie = d.get("independentEval", True)
         return cls(
             deliverable_score=dv, outputtable_score=ov, max_loops=ml, risk_threshold=rt,
+            independent_eval=bool(ie) if ie is not None else True,
             strategy=strat if isinstance(strat, str) and strat.strip() else DEFAULT_STRATEGY,
         )
 
@@ -514,3 +524,89 @@ class LoopStore:
             return True
         except Exception:
             return False
+
+
+# ── 策略预设库（像 Prompts/Skills 一样可直接选用）──────────────────
+
+def _preset(pid: str, name: str, desc: str, **policy_kw) -> dict:
+    pol = LoopPolicy(**policy_kw)
+    return {"id": f"builtin:{pid}", "name": name, "desc": desc,
+            "builtin": True, "policy": pol.to_dict()}
+
+
+BUILTIN_POLICY_PRESETS: list[dict] = [
+    _preset("balanced", "稳健交付（默认）",
+            "均衡门槛，独立对抗式评审防自欺。"),
+    _preset("mvp", "快速探索 / MVP",
+            "更低门槛、更少轮次，先把可用版本拿出来。",
+            deliverable_score=60, outputtable_score=78, max_loops=5, risk_threshold=0.8,
+            strategy=DEFAULT_STRATEGY + "\n\n额外：优先广度与可用性，先跑通主路径再谈打磨；"
+            "但「可用」仍需实际验证，别把跑顺当跑通。"),
+    _preset("research", "高标准研究",
+            "高门槛、多轮次，强调严谨与证据。",
+            deliverable_score=80, outputtable_score=92, max_loops=12, risk_threshold=0.9,
+            strategy=DEFAULT_STRATEGY + "\n\n额外：每个结论都要有可复现的证据/实验支撑，"
+            "记录方法与反例；高分必须经得起复核。"),
+    _preset("adversarial", "对抗式自检（防自欺）",
+            "强红队心智，默认未完成，逐条找漏洞。",
+            deliverable_score=75, outputtable_score=90, max_loops=10, risk_threshold=0.85,
+            independent_eval=True,
+            strategy=DEFAULT_STRATEGY + "\n\n额外（红队）：每遍 analysis 先扮演挑刺的评审，"
+            "主动构造失败用例与边界、尝试推翻「已完成」的判断；只有在你认真尝试推翻却推翻不了时，"
+            "才给高分。把发现的漏洞写进 challenges 与下一步。"),
+]
+
+
+class LoopPolicyStore:
+    """策略与心智的预设库：内置预设（只读）+ 用户自存预设。单文件 JSON。"""
+
+    def __init__(self):
+        self._dir = paths.sub("loop-policies")
+        self._dir.mkdir(parents=True, exist_ok=True)
+        self._path = self._dir / "presets.json"
+        self._lock = threading.Lock()
+
+    def _load_user(self) -> list[dict]:
+        if not self._path.exists():
+            return []
+        try:
+            data = json.loads(self._path.read_text(encoding="utf-8"))
+            return data if isinstance(data, list) else []
+        except Exception:
+            return []
+
+    def _save_user(self, items: list[dict]) -> None:
+        with self._lock:
+            self._path.write_text(json.dumps(items, ensure_ascii=False, indent=2),
+                                  encoding="utf-8")
+
+    def list(self) -> list[dict]:
+        return [dict(p) for p in BUILTIN_POLICY_PRESETS] + self._load_user()
+
+    def save(self, name: str, policy: dict, pid: str = "") -> dict:
+        items = self._load_user()
+        name = (name or "").strip() or "未命名预设"
+        norm = LoopPolicy.from_dict(policy or {}).to_dict()
+        if pid and not str(pid).startswith("builtin:"):
+            for it in items:
+                if it.get("id") == pid:
+                    it["name"] = name
+                    it["policy"] = norm
+                    it["updatedAt"] = _now()
+                    self._save_user(items)
+                    return it
+        entry = {"id": f"user:{int(_now() * 1000)}", "name": name, "builtin": False,
+                 "policy": norm, "updatedAt": _now()}
+        items.append(entry)
+        self._save_user(items)
+        return entry
+
+    def delete(self, pid: str) -> bool:
+        if not pid or str(pid).startswith("builtin:"):
+            return False
+        items = self._load_user()
+        new = [it for it in items if it.get("id") != pid]
+        if len(new) != len(items):
+            self._save_user(new)
+            return True
+        return False

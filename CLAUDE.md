@@ -329,9 +329,18 @@ ideas + the hint and rewrites the goal, appending a `refine` revision. Manual ed
 **Strategy & mental model (`LoopPolicy`).** The knobs that govern loop behavior
 are a per-session `LoopPolicy` on the stage file (`loop_store.LoopPolicy`):
 `deliverable_score` (70), `outputtable_score` (85), `max_loops` (8),
-`risk_threshold` (0.85 — risk ≥ this seals to loopout), and a free-text
-`strategy` ("心智") that is injected as a "must follow" block into every
-`prepare` and `analysis` prompt. These replace the old hardcoded module
+`risk_threshold` (0.85 — risk ≥ this seals to loopout), `independent_eval` (True),
+and a free-text `strategy` ("心智") that is injected as a "must follow" block into
+every `prepare` and `analysis` prompt. **Anti-self-deception**: the default
+strategy is evidence-first ("default incomplete; verify real artifacts; beware the
+美好陷阱"), and when `independent_eval` is on, `analysis` runs on an **independent
+agent session** (`{sid}:eval:{seq}`, not resuming the executor's optimistic
+context) framed as a skeptical reviewer that must verify against the working dir —
+this breaks the doer↔scorer feedback loop that otherwise inflates scores and
+collapses the loop into a self-congratulatory fixed point. Reusable **presets**
+(`LoopPolicyStore`, built-ins 稳健交付 / 快速探索 / 高标准研究 / 对抗式自检 + user-saved)
+are pickable like Prompts/Skills via `loopPolicyPreset{List,Save,Delete}` and the
+`LoopPolicyEditor`'s preset bar. These replace the old hardcoded module
 constants — `effective_max_loops`, `_recompute_risk`, `_loop_should_stop`,
 deliverable/outputtable flags all read the policy. It is **editable at session
 creation** (NewSessionDialog shows `LoopPolicyEditor` for loop sessions, applied

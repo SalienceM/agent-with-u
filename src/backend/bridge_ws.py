@@ -40,7 +40,7 @@ from .skill_store import SkillStore
 from .prompt_store import PromptStore
 from .loop_store import (
     LoopStore, LoopState, LoopRecord, LoopStep, LoopAnalysis, IdeaEntry, AsideTurn, Addon,
-    LoopPolicy,
+    LoopPolicy, LoopPolicyStore,
     STAGE_IDEA, STAGE_EXECUTE, STAGE_OUT,
     SUB_PREPARE, SUB_EXECUTE, SUB_ANALYSIS, SUB_DONE,
 )
@@ -343,6 +343,7 @@ class BridgeWS:
         self._prompt_store = PromptStore()
         # ★ 可视化 Loop 集成：stage 文件存储 + 并发想法池 + 运行去重
         self._loop_store = LoopStore()
+        self._loop_policy_store = LoopPolicyStore()   # 策略预设库
         self._idea_semaphore = asyncio.Semaphore(3)  # loopidea 阶段最多 3 并发
         self._loop_running: set[str] = set()         # 正在跑 iteration 的 session
         self._loop_cancel: dict[str, bool] = {}       # 请求停止并丢弃当前 loop：sid → 是否同时回滚文件
@@ -2044,6 +2045,25 @@ class BridgeWS:
         self._emit_loop_updated(state)
         return json.dumps({"status": "ok", "policy": state.policy.to_dict()}, ensure_ascii=False)
 
+    # ── 策略预设库（像 Prompts/Skills 一样可直接选用）──
+    def _rpc_loopPolicyPresetList(self) -> str:
+        return json.dumps({"status": "ok", "presets": self._loop_policy_store.list()}, ensure_ascii=False)
+
+    def _rpc_loopPolicyPresetSave(self, name: str, policy_json: str, preset_id: str = "") -> str:
+        try:
+            pd = json.loads(policy_json) if policy_json else {}
+        except Exception:
+            return json.dumps({"status": "error", "message": "策略 JSON 解析失败"}, ensure_ascii=False)
+        if not isinstance(pd, dict):
+            return json.dumps({"status": "error", "message": "策略格式不对"}, ensure_ascii=False)
+        entry = self._loop_policy_store.save(name, pd, preset_id or "")
+        return json.dumps({"status": "ok", "preset": entry}, ensure_ascii=False)
+
+    def _rpc_loopPolicyPresetDelete(self, preset_id: str) -> str:
+        ok = self._loop_policy_store.delete(preset_id)
+        return json.dumps({"status": "ok" if ok else "error",
+                           "message": "" if ok else "内置预设不可删除或不存在"}, ensure_ascii=False)
+
     async def _rpc_loopRefineGoal(self, session_id: str, hint: str) -> str:
         """按额外提示让模型微调全局目标（不需人工手编），并留下一版演变记录。"""
         h = (hint or "").strip()
@@ -2471,23 +2491,38 @@ class BridgeWS:
             f"【策略与心智（须遵循）】\n{state.policy.strategy}\n\n"
             if state.policy.strategy else ""
         )
+        independent = bool(getattr(state.policy, "independent_eval", True))
+        # ★ 防自欺：独立评审用一个不复用执行上下文的会话，避免被执行阶段的乐观自述带偏；
+        #   并以"对抗式、以证据为准、默认未完成"的口径打分。
+        reviewer_block = (
+            "你现在是一名**独立、挑剔的验收评审**，不参与执行、对执行阶段的自述结论持怀疑态度。\n"
+            "评审纪律：① 尽量用工具去**实际核实**（查看工作目录真实产物、运行/构建/测试、检查命令输出），"
+            "不要仅凭【执行结果】的措辞下结论；② **默认未完成**，只有证据充分才认可；③ 警惕「美好陷阱」——"
+            "流程跑顺、措辞乐观都不等于目标达成；④ 高分（≥可输出门槛）必须对应验收标准逐条被证据支撑。\n\n"
+            if independent else ""
+        )
         analysis_prompt = (
-            f"{strategy_block}"
+            f"{strategy_block}{reviewer_block}"
             f"对第 {record.seq} 次 loop（一次冲着全局目标的完整尝试）的执行结果做评估，"
             f"对照【全局目标】：\n{state.goal}\n\n"
-            f"【本次执行结果】\n{record.result or '(无)'}\n"
+            f"【执行阶段的自述结果（仅供参考，需自行核实，勿轻信）】\n{record.result or '(无)'}\n"
             f"{addon_block}\n"
             "请按以下口径打分与分析，只输出一个 JSON 围栏：\n"
-            f"- score: 0–100，对全局目标的完成度（>={dscore:.0f} 可交付，>={oscore:.0f} 可输出）\n"
+            f"- score: 0–100，对全局目标的完成度（>={dscore:.0f} 可交付，>={oscore:.0f} 可输出）；"
+            "证据不足/未验证就按未完成给分，不要凑高分\n"
             "- optimizationPotential: 0–1，再来一遍估计还能提升的空间\n"
-            "- trend: 与历史 loop 相比（上升 / 平缓 / 受阻）\n"
-            "- challenges: 是否遇到环境/系统/网络可触达性等硬约束\n"
-            "- notes: 简要分析（可 markdown）\n"
+            "- trend: 与历史 loop 相比（上升 / 平缓 / 受阻），需以实质改进为据\n"
+            "- challenges: 环境/系统/网络等硬约束，或无法验证的部分\n"
+            "- notes: 简要分析，**列出已核实的证据与仍存疑/未达标处**（可 markdown）\n"
             "```json\n"
             '{"score": 0, "optimizationPotential": 0.0, "trend": "", "challenges": "", "notes": ""}\n'
             "```"
         )
-        atext = await self._loop_run_agent(session, analysis_prompt, SUB_ANALYSIS, record.seq)
+        atext = await self._loop_run_agent(
+            session, analysis_prompt, SUB_ANALYSIS, record.seq,
+            resume=not independent,
+            indep_session_id=(f"{session.id}:eval:{record.seq}" if independent else None),
+        )
         aj = self._extract_json_block(atext) or {}
         score = float(aj.get("score", 0) or 0)
         opt = float(aj.get("optimizationPotential", 0) or 0)
