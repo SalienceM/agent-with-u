@@ -380,7 +380,9 @@ intent (global goal + original ideas). It writes `state.intent_alert`
 (`{aligned, severity low/medium/high, divergence, suggestion, dismissed}`). The UI
 shows a non-blocking `IntentBanner` only on medium/high divergence — it never halts
 execution (respecting "don't over-interrupt"); the user can refine the goal or
-discard. Dismiss via `loopDismissIntent`. Runs once per round (省算力).
+discard. The banner has a one-click **"✨ 采纳建议"** that feeds the
+divergence/suggestion into `loopRefineGoal` (rewrites the goal to realign) and then
+dismisses. Dismiss via `loopDismissIntent`. Runs once per round (省算力).
 
 **Stop & discard a loop (`loopDiscard`).** A mis-clicked / unwanted iteration can
 be thrown away as if it never ran: `loopDiscard(session_id, seq=0)` (defaults to

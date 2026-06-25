@@ -270,9 +270,19 @@ export const LoopPanel: React.FC<LoopPanelProps> = ({ sessionId, onClose, embedd
 // ══ 意图守卫提示横幅（非阻塞）═══════════════════════════════════
 const IntentBanner: React.FC<{ state: LoopStateT; sessionId: string }> = ({ state, sessionId }) => {
   const a = state.intentAlert;
+  const [busy, setBusy] = useState(false);
   if (!a || a.dismissed || a.aligned || !(a.severity === 'medium' || a.severity === 'high')) return null;
   const high = a.severity === 'high';
   const col = high ? '#f87171' : '#bf8700';
+  const adopt = async () => {
+    const hint = [a.suggestion, a.divergence ? `（针对偏差：${a.divergence}）` : ''].filter(Boolean).join(' ').trim();
+    if (!hint) return;
+    setBusy(true);
+    const r = await api.loopRefineGoal(sessionId, hint);
+    setBusy(false);
+    if (r.status === 'ok') api.loopDismissIntent(sessionId);
+    else if (r.message) alert(r.message);
+  };
   return (
     <div className="awu-reveal" style={{ marginBottom: 14, padding: '10px 12px', borderRadius: 10, background: `${col}1a`, border: `1px solid ${col}55` }}>
       <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 4 }}>
@@ -282,8 +292,16 @@ const IntentBanner: React.FC<{ state: LoopStateT; sessionId: string }> = ({ stat
       </div>
       {a.divergence && <div style={{ fontSize: 12.5, color: 'var(--theme-text)', lineHeight: 1.55 }}>{a.divergence}</div>}
       {a.suggestion && <div style={{ fontSize: 12, color: 'var(--theme-text-muted)', marginTop: 4, lineHeight: 1.55 }}>建议：{a.suggestion}</div>}
-      <div style={{ fontSize: 10.5, color: 'var(--theme-text-muted)', marginTop: 6 }}>
-        不打断执行。可在「🎯 全局目标」微调目标，或用「🗑 停止并删除本次」止损后再调整。
+      <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginTop: 8, flexWrap: 'wrap' }}>
+        {a.suggestion && (
+          <button onClick={adopt} disabled={busy}
+            style={{ ...primaryBtn, padding: '6px 12px', background: col, opacity: busy ? 0.6 : 1 }}>
+            {busy ? '⏳ 微调中…' : '✨ 采纳建议（微调目标）'}
+          </button>
+        )}
+        <span style={{ fontSize: 10.5, color: 'var(--theme-text-muted)' }}>
+          不打断执行。采纳=让模型按建议微调全局目标；也可手动改目标或「🗑 停止并删除本次」止损。
+        </span>
       </div>
     </div>
   );
