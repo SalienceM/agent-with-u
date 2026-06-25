@@ -129,6 +129,10 @@ class LoopRecord:
     error: str = ""
     # 各子阶段的开始时间戳（{prepare/execute/analysis/done: ts}），用于流程视图耗时
     sub_started: dict = field(default_factory=dict)
+    # ★ 本次 loop 各阶段实际使用的 backend id（{execute, analysis}）。execute 覆盖
+    #   prepare+execute（恒走会话 backend）；analysis 可能是异构评审 backend。用于在
+    #   结果展示中标出选型，便于追溯"谁执行、谁评审"。
+    backends: dict = field(default_factory=dict)
     # ★ 版本隔离：本次 loop 开跑前的 agent 上下文快照（agent_session_id）。
     #   None=未快照（老记录）；""=当时无上下文；"X"=具体 id。丢弃本次 loop 时据此回滚，
     #   避免被丢弃 loop 的对话污染后续 loop 的上下文。
@@ -156,6 +160,7 @@ class LoopRecord:
             "analysis": self.analysis.to_dict() if self.analysis else None,
             "error": self.error,
             "subStarted": self.sub_started,
+            "backends": dict(self.backends or {}),
             "agentCheckpoint": self.agent_checkpoint,
             "gitCheckpoint": self.git_checkpoint,
             "hasGitCheckpoint": bool(self.git_checkpoint),
@@ -176,6 +181,7 @@ class LoopRecord:
             analysis=LoopAnalysis.from_dict(d["analysis"]) if d.get("analysis") else None,
             error=d.get("error", ""),
             sub_started=dict(d.get("subStarted") or {}),
+            backends=dict(d.get("backends") or {}),
             agent_checkpoint=d.get("agentCheckpoint", None),
             git_checkpoint=d.get("gitCheckpoint", None),
             created_at=d.get("createdAt", _now()),

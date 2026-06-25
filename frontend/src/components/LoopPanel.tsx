@@ -30,6 +30,8 @@ interface LoopRecord {
   completed: boolean; result: string; analysis: LoopAnalysis | null; error: string;
   subStarted?: Record<string, number>; createdAt?: number; updatedAt?: number;
   hasGitCheckpoint?: boolean;
+  backends?: Record<string, string>;          // {execute, analysis} → backend id
+  backendLabels?: Record<string, string>;     // {execute, analysis} → 可读 label
 }
 interface IdeaEntry { id: string; prompt: string; status: string; result: string; error: string; images?: AddonImage[]; }
 interface GoalRevision { goal: string; hint: string; source: string; createdAt: number; }
@@ -1277,10 +1279,12 @@ const FlowLane: React.FC<{
       {/* Execute：含分步 */}
       <FlowChip title="Execute" status={nstatus(1)} dur={fmtDur(subDur(1))}
         sub={loop.orchestration.length ? `${loop.orchestration.filter((s) => s.status === 'done').length}/${loop.orchestration.length} 步` : undefined}
-        steps={loop.orchestration} now={now} />
+        steps={loop.orchestration} now={now}
+        tag={<BackendTag role="execute" label={loop.backendLabels?.execute} />} />
       <FlowEdge active={nstatus(2) === 'running'} done={nstatus(2) !== 'pending'} />
       <FlowChip title="Analysis" status={nstatus(2)} dur={fmtDur(subDur(2))}
-        sub={score != null ? `score ${score.toFixed(0)}` : undefined} />
+        sub={score != null ? `score ${score.toFixed(0)}` : undefined}
+        tag={<BackendTag role="analysis" label={loop.backendLabels?.analysis} />} />
     </div>
   );
 };
@@ -1297,8 +1301,8 @@ const FlowEdge: React.FC<{ active: boolean; done: boolean }> = ({ active, done }
 
 const FlowChip: React.FC<{
   title: string; status: string; dur?: string; sub?: string; big?: boolean;
-  steps?: LoopStep[]; now?: number;
-}> = ({ title, status, dur, sub, big, steps, now }) => {
+  steps?: LoopStep[]; now?: number; tag?: React.ReactNode;
+}> = ({ title, status, dur, sub, big, steps, now, tag }) => {
   const col = FLOW_STATUS_COLOR[status] || FLOW_STATUS_COLOR.pending;
   const pulse = status === 'running';
   return (
@@ -1317,6 +1321,7 @@ const FlowChip: React.FC<{
       </div>
       {sub && <span style={{ fontSize: 10.5, color: 'var(--theme-text-muted)' }}>{sub}</span>}
       {dur && <span style={{ fontSize: 10.5, color: col, fontFamily: 'monospace', fontWeight: 600 }}>⏱ {dur}</span>}
+      {tag && <div style={{ marginTop: 1 }}>{tag}</div>}
       {steps && steps.length > 0 && (
         <div style={{ display: 'flex', flexDirection: 'column', gap: 3, marginTop: 2 }}>
           {steps.map((s) => {
@@ -1456,13 +1461,14 @@ const LoopDetail: React.FC<{ loop: LoopRecord; progress: Record<string, string>;
         )}
       </Section>
 
-      <Section title="本次执行结果">
+      <Section title="本次执行结果" extra={<BackendTag role="execute" label={loop.backendLabels?.execute} />}>
         {loop.result ? <Md text={loop.result} />
           : liveExec ? <Live text={liveExec} /> : '—'}
       </Section>
 
       {loop.analysis ? (
-        <Section title={`Execute Analysis · 分数 ${loop.analysis.score.toFixed(0)}`}>
+        <Section title={`Execute Analysis · 分数 ${loop.analysis.score.toFixed(0)}`}
+          extra={<BackendTag role="analysis" label={loop.backendLabels?.analysis} />}>
           <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginBottom: 8 }}>
             {loop.analysis.deliverable && <Badge text="可交付" color="#2da44e" />}
             {loop.analysis.outputtable && <Badge text="可输出" color="#8957e5" />}
@@ -1473,19 +1479,38 @@ const LoopDetail: React.FC<{ loop: LoopRecord; progress: Record<string, string>;
           {loop.analysis.notes && <Md text={loop.analysis.notes} />}
           {loop.analysis.challenges && <div style={{ fontSize: 12, color: '#bf8700', marginTop: 6 }}>⚠ 约束：{loop.analysis.challenges}</div>}
         </Section>
-      ) : liveAna ? <Section title="Execute Analysis（进行中）"><Live text={liveAna} /></Section> : null}
+      ) : liveAna ? <Section title="Execute Analysis（进行中）"
+          extra={<BackendTag role="analysis" label={loop.backendLabels?.analysis} />}><Live text={liveAna} /></Section> : null}
 
       {loop.error && <Section title="错误"><span style={{ color: '#f87171' }}>{loop.error}</span></Section>}
     </div>
   );
 };
 
-const Section: React.FC<{ title: string; children: React.ReactNode }> = ({ title, children }) => (
+const Section: React.FC<{ title: string; extra?: React.ReactNode; children: React.ReactNode }> = ({ title, extra, children }) => (
   <div style={{ marginBottom: 12 }}>
-    <div style={{ fontSize: 11, fontWeight: 700, color: 'var(--theme-text-muted)', textTransform: 'uppercase', letterSpacing: 0.5, marginBottom: 4 }}>{title}</div>
+    <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 4 }}>
+      <div style={{ fontSize: 11, fontWeight: 700, color: 'var(--theme-text-muted)', textTransform: 'uppercase', letterSpacing: 0.5 }}>{title}</div>
+      {extra}
+    </div>
     <div style={{ fontSize: 13, color: 'var(--theme-text)' }}>{children}</div>
   </div>
 );
+
+// 一个紧凑的 backend 选型标签：标出某阶段实际跑在哪个 backend（执行 / 评审）
+const BackendTag: React.FC<{ role: 'execute' | 'analysis'; label?: string }> = ({ role, label }) => {
+  if (!label) return null;
+  const meta = role === 'analysis'
+    ? { icon: '🔍', tip: '评审 backend', col: '#8957e5' }
+    : { icon: '⚙️', tip: '执行 backend', col: '#0969da' };
+  return (
+    <span title={`${meta.tip}：${label}`} style={{
+      display: 'inline-flex', alignItems: 'center', gap: 4, fontSize: 10.5,
+      padding: '1px 7px', borderRadius: 999, lineHeight: 1.7, whiteSpace: 'nowrap',
+      background: `${meta.col}14`, border: `1px solid ${meta.col}44`, color: meta.col,
+    }}>{meta.icon}{label}</span>
+  );
+};
 
 const Live: React.FC<{ text: string }> = ({ text }) => (
   <div style={{

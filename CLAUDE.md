@@ -339,7 +339,11 @@ a per-position **`backends` map** (`{idea, goal, analysis, aside}` → backend i
 each empty = follow the session) so every "AI analysis/transformation" point can run
 on a **different backend** than the executor for heterogeneous cross-evaluation —
 these all run on independent contexts so cross-backend is safe; execution
-(execute/step) always stays on the session backend. `_loop_run_agent`/`_run_aside`
+(execute/step) always stays on the session backend. The backend actually used per
+loop is persisted on `LoopRecord.backends` (`{execute, analysis}`) and the payload
+resolves them to readable labels (`backendLabels`, injected by `_loop_payload`); the
+LoopPanel result sections and the flow-view Execute/Analysis chips show a compact
+**backend tag** (⚙️ 执行 / 🔍 评审) so you can see who executed vs. who reviewed. `_loop_run_agent`/`_run_aside`
 resolve the override and fall back to the session backend if it's missing; legacy
 `evalBackendId` migrates into `analysis`+`goal`. Plus a free-text `strategy` ("心智")
 injected as a "must follow" block into every `prepare` and `analysis` prompt. **Anti-self-deception**: the default

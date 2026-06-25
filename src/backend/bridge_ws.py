@@ -1786,6 +1786,12 @@ class BridgeWS:
             last and not last.completed and not last.error
             and not running and state.stage == STAGE_EXECUTE
         )
+        # ★ 把每条 loop 实际用到的 backend id 解析成可读 label，供面板/流程视图标出选型
+        for rec in d.get("loops", []):
+            bmap = rec.get("backends") or {}
+            rec["backendLabels"] = {
+                pos: self._backend_label(bid) for pos, bid in bmap.items() if bid
+            }
         return d
 
     def _emit_loop_updated(self, state: "LoopState") -> None:
@@ -2352,6 +2358,8 @@ class BridgeWS:
     async def _loop_do_prepare(self, session, state, record, history) -> None:
         record.sub_stage = SUB_PREPARE
         record.mark_sub(SUB_PREPARE)
+        # prepare + execute 恒走会话 backend；记下来供结果展示标出选型
+        record.backends["execute"] = session.backend_id
         record.updated_at = time.time()
         self._loop_save(state)
         self._emit_loop_updated(state)
@@ -2567,6 +2575,8 @@ class BridgeWS:
             if state.policy.strategy else ""
         )
         eval_backend = state.policy.backend_for("analysis") or None
+        # 记下本次评审实际用的 backend（可能是异构评审 backend），供结果展示标出选型
+        record.backends["analysis"] = eval_backend or session.backend_id
         # 指定了异构评审 backend 时，必须用独立上下文（跨 backend 无法 resume 同一会话）
         independent = bool(getattr(state.policy, "independent_eval", True)) or bool(eval_backend)
         # ★ 防自欺：独立评审用一个不复用执行上下文的会话，避免被执行阶段的乐观自述带偏；
