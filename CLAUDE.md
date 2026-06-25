@@ -360,6 +360,17 @@ touch an in-flight loop — they take effect from the next prepare/analysis.
 Legacy stage files without `policy` migrate their old `maxLoops` into the policy.
 The shared editor + defaults live in `frontend/src/components/LoopPolicyEditor.tsx`.
 
+**Model capability ledger (cross-session, `model_ledger.ModelLedger`).** Foundation
+for agentic allocation: a long-lived ledger at `~/.agent-with-u/model-ledger/ledger.json`
+records, per backend × role (`execute` / `analysis` / …), usage counts and — for
+execution — the analysis score it achieved, accumulated across sessions. Written
+when a loop's analysis completes (executor backend gets the score, eval backend gets
+a participation tick); read via `modelLedgerList` and surfaced in the
+`LoopPolicyEditor` as a "📊 各模型历史表现" reference (execute avg score per backend)
+so allocation can be informed by who actually delivers. (Next stages — a routing
+"brain" that picks N backends per task, multi-party plan + pick-best, and an early
+human↔model intent-divergence guard — build on this.)
+
 **Stop & discard a loop (`loopDiscard`).** A mis-clicked / unwanted iteration can
 be thrown away as if it never ran: `loopDiscard(session_id, seq=0)` (defaults to
 the last loop). If it's running, a `_loop_cancel` flag + `backend.abort` interrupts

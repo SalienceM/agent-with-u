@@ -46,6 +46,7 @@ from .loop_store import (
 )
 from .auth import AuthGuard
 from .asset_pool import AssetPool
+from .model_ledger import ModelLedger
 from . import paths
 
 # ── 剪贴板（非 Qt，Pillow ImageGrab，仅 Windows/macOS）──────────
@@ -344,6 +345,7 @@ class BridgeWS:
         # ★ 可视化 Loop 集成：stage 文件存储 + 并发想法池 + 运行去重
         self._loop_store = LoopStore()
         self._loop_policy_store = LoopPolicyStore()   # 策略预设库
+        self._model_ledger = ModelLedger()            # 跨 session 模型能力台账（大脑记忆）
         self._idea_semaphore = asyncio.Semaphore(3)  # loopidea 阶段最多 3 并发
         self._loop_running: set[str] = set()         # 正在跑 iteration 的 session
         self._loop_cancel: dict[str, bool] = {}       # 请求停止并丢弃当前 loop：sid → 是否同时回滚文件
@@ -2576,6 +2578,14 @@ class BridgeWS:
         record.sub_stage = SUB_DONE
         record.mark_sub(SUB_DONE)
         record.updated_at = time.time()
+        # ★ 跨 session 模型台账：执行 backend 拿到这次评分（衡量"谁更能干"），评审 backend 记参与
+        try:
+            exec_bid = session.backend_id
+            self._model_ledger.record(exec_bid, self._backend_label(exec_bid), "execute", score=score)
+            eval_bid = eval_backend or session.backend_id
+            self._model_ledger.record(eval_bid, self._backend_label(eval_bid), "analysis")
+        except Exception:
+            pass
         self._recompute_risk(state)
         stop, reason = self._loop_should_stop(state)
         if stop:
@@ -4390,6 +4400,14 @@ except urllib.error.URLError as e:
     # ════════════════════════════════════════════════════════════
     #  核心：带自动续跑的流式发送（与 bridge.py _async_send 相同逻辑）
     # ════════════════════════════════════════════════════════════
+
+    def _backend_label(self, bid: str) -> str:
+        c = next((c for c in self._backend_configs if c.id == bid), None)
+        return getattr(c, "label", None) or bid
+
+    def _rpc_modelLedgerList(self) -> str:
+        """跨 session 模型能力台账：各 backend 在执行/评审等角色的表现，供分配参考。"""
+        return json.dumps({"status": "ok", "models": self._model_ledger.list()}, ensure_ascii=False)
 
     def _get_backend(self, config_id: str) -> ModelBackend:
         if config_id in self._backends:

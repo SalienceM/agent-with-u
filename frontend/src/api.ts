@@ -678,6 +678,12 @@ export const api = {
     try { return JSON.parse(result); } catch { return { status: 'error' }; }
   },
 
+  /** 跨 session 模型能力台账：各 backend 历史表现，供分配参考。 */
+  async modelLedgerList(): Promise<{ status: string; models?: any[] }> {
+    const result = await call('modelLedgerList');
+    try { return JSON.parse(result); } catch { return { status: 'error', models: [] }; }
+  },
+
   async loopRunIteration(sessionId: string): Promise<{ status: string; message?: string }> {
     const result = await call('loopRunIteration', sessionId);
     try { return JSON.parse(result); } catch { return { status: 'error', message: '响应解析失败' }; }
@@ -1300,6 +1306,7 @@ function mockDispatch(method: string, params: any[]): any {
     case 'loopPolicyPresetList': return JSON.stringify({ status: 'ok', presets: [] });
     case 'loopPolicyPresetSave': return JSON.stringify({ status: 'ok' });
     case 'loopPolicyPresetDelete': return JSON.stringify({ status: 'ok' });
+    case 'modelLedgerList': return JSON.stringify({ status: 'ok', models: [] });
     case 'loopRunIteration': return JSON.stringify({ status: 'error', message: 'mock mode' });
     case 'loopDiscard': return JSON.stringify({ status: 'ok' });
     case 'loopSetAuto': return JSON.stringify({ status: 'ok', auto: !!params[1] });

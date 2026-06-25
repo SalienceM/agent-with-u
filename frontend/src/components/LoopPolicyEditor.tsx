@@ -80,8 +80,14 @@ export const LoopPolicyEditor: React.FC<{
   const [presets, setPresets] = useState<any[]>([]);
   const [sel, setSel] = useState('');
   const [backends, setBackends] = useState<any[]>([]);
+  const [ledger, setLedger] = useState<any[]>([]);
+  const [showLedger, setShowLedger] = useState(false);
   const reload = () => api.loopPolicyPresetList().then((r) => setPresets(r.presets || [])).catch(() => {});
-  useEffect(() => { reload(); api.getBackends().then((b) => setBackends(b || [])).catch(() => {}); }, []);
+  useEffect(() => {
+    reload();
+    api.getBackends().then((b) => setBackends(b || [])).catch(() => {});
+    api.modelLedgerList().then((r) => setLedger(r.models || [])).catch(() => {});
+  }, []);
 
   const applyPreset = (id: string) => {
     setSel(id);
@@ -171,6 +177,33 @@ export const LoopPolicyEditor: React.FC<{
           这些位置都跑在独立上下文上，可安全换用与执行不同的模型做交叉评审，进一步降低自我欺骗。
           执行（execute/分步）始终走会话本身的 backend。留「跟随会话」即与执行同模型。
         </div>
+        {ledger.length > 0 && (
+          <div style={{ marginTop: 8 }}>
+            <button type="button" onClick={() => setShowLedger((v) => !v)}
+              style={{ background: 'none', border: 'none', color: 'var(--theme-accent)', cursor: 'pointer', fontSize: 11, padding: 0 }}>
+              {showLedger ? '▾' : '▸'} 📊 各模型历史表现（跨 session 积累，供分配参考）
+            </button>
+            {showLedger && (
+              <div style={{ marginTop: 6, display: 'flex', flexDirection: 'column', gap: 4 }}>
+                {ledger.map((m) => {
+                  const ex = m.roles?.execute;
+                  return (
+                    <div key={m.backendId} style={{ display: 'flex', gap: 8, alignItems: 'baseline', fontSize: 11, color: 'var(--theme-text-muted)', flexWrap: 'wrap' }}>
+                      <span style={{ fontWeight: 600, color: 'var(--theme-text)' }}>{m.label}</span>
+                      {ex?.avgScore != null
+                        ? <span>执行均分 <b style={{ color: 'var(--theme-text)' }}>{ex.avgScore.toFixed(0)}</b>（{ex.scored} 次）</span>
+                        : <span>暂无执行评分</span>}
+                      {m.roles?.analysis?.count ? <span>· 评审 {m.roles.analysis.count} 次</span> : null}
+                    </div>
+                  );
+                })}
+                <div style={{ fontSize: 10, color: 'var(--theme-text-muted)', marginTop: 2 }}>
+                  由历次 loop 的真实评分自动积累；执行均分越高代表该模型在这类任务上越能交付。
+                </div>
+              </div>
+            )}
+          </div>
+        )}
       </div>
 
       <div>
