@@ -8,9 +8,17 @@ export interface LoopPolicy {
   maxLoops: number;
   riskThreshold: number;
   independentEval: boolean;
-  evalBackendId: string;
+  backends: Record<string, string>;   // 各分析/转换位置的专用 backend：{idea/goal/analysis/aside}
   strategy: string;
 }
+
+// 可路由的「AI 分析/转换」位置（执行 execute/step 不在此列，留在会话 backend）
+export const BACKEND_POSITIONS: { key: string; label: string; hint: string }[] = [
+  { key: 'idea', label: '想法展开', hint: 'loopidea 阶段' },
+  { key: 'goal', label: '目标汇总 / 微调', hint: 'ideas→目标 / 微调' },
+  { key: 'analysis', label: '评分 / 评审', hint: '关键评审位' },
+  { key: 'aside', label: '旁路问答', hint: 'By the way' },
+];
 
 export const DEFAULT_STRATEGY =
   `每一次 loop 都是对【全局目标】的一次完整、尽力的尝试（不是把任务拆到多个 loop 分步完成）。
@@ -31,7 +39,7 @@ export const DEFAULT_POLICY: LoopPolicy = {
   maxLoops: 8,
   riskThreshold: 0.85,
   independentEval: true,
-  evalBackendId: '',
+  backends: {},
   strategy: DEFAULT_STRATEGY,
 };
 
@@ -43,9 +51,22 @@ export function normalizePolicy(p?: Partial<LoopPolicy> | null): LoopPolicy {
   const ml = Math.round(clamp(num(d.maxLoops, 8), 1, 50));
   const rt = clamp(num(d.riskThreshold, 0.85), 0.1, 1);
   const ie = d.independentEval !== false;
-  const eb = typeof d.evalBackendId === 'string' ? d.evalBackendId : '';
+  const backends: Record<string, string> = {};
+  const rawB: any = (d as any).backends;
+  if (rawB && typeof rawB === 'object') {
+    for (const { key } of BACKEND_POSITIONS) {
+      const v = rawB[key];
+      if (typeof v === 'string' && v.trim()) backends[key] = v;
+    }
+  }
+  // 迁移旧的单一 evalBackendId
+  const oldEb = (d as any).evalBackendId;
+  if (typeof oldEb === 'string' && oldEb.trim()) {
+    if (!backends.analysis) backends.analysis = oldEb;
+    if (!backends.goal) backends.goal = oldEb;
+  }
   const strat = (typeof d.strategy === 'string' && d.strategy.trim()) ? d.strategy : DEFAULT_STRATEGY;
-  return { deliverableScore: del, outputtableScore: out, maxLoops: ml, riskThreshold: rt, independentEval: ie, evalBackendId: eb, strategy: strat };
+  return { deliverableScore: del, outputtableScore: out, maxLoops: ml, riskThreshold: rt, independentEval: ie, backends, strategy: strat };
 }
 
 function num(v: any, fb: number): number { const n = Number(v); return Number.isFinite(n) ? n : fb; }
@@ -129,17 +150,26 @@ export const LoopPolicyEditor: React.FC<{
         </span>
       </label>
 
-      {/* 分析/转换步骤（评分 / 目标汇总 / 微调）专用 backend：异构交叉评审更防自欺 */}
+      {/* 各「AI 分析/转换」位置的专用 backend：可逐点指定异构模型做交叉评审 */}
       <div>
-        <div style={labelText}>分析 / 评审 backend</div>
-        <select value={value.evalBackendId} onChange={(e) => set({ evalBackendId: e.target.value })}
-          style={{ ...inputBase, width: '100%' }}>
-          <option value="">跟随会话（默认，同一模型）</option>
-          {backends.map((b) => <option key={b.id} value={b.id}>{b.label || b.id}</option>)}
-        </select>
-        <div style={{ fontSize: 10.5, color: 'var(--theme-text-muted)', marginTop: 2, lineHeight: 1.5 }}>
-          指定后，每轮涉及「AI 分析/转换」的步骤——analysis 评分、目标汇总、目标微调——改用这个 backend
-          （独立上下文）。用与执行不同的模型交叉评审，进一步降低自我欺骗。
+        <div style={labelText}>分析 / 转换各位置的 backend（可逐点指定）</div>
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(180px, 1fr))', gap: 8 }}>
+          {BACKEND_POSITIONS.map((pos) => (
+            <div key={pos.key}>
+              <div style={{ fontSize: 11, color: 'var(--theme-text)', marginBottom: 3 }}>{pos.label}
+                <span style={{ color: 'var(--theme-text-muted)' }}> · {pos.hint}</span></div>
+              <select value={value.backends?.[pos.key] || ''}
+                onChange={(e) => set({ backends: { ...(value.backends || {}), [pos.key]: e.target.value } })}
+                style={{ ...inputBase, width: '100%' }}>
+                <option value="">跟随会话</option>
+                {backends.map((b) => <option key={b.id} value={b.id}>{b.label || b.id}</option>)}
+              </select>
+            </div>
+          ))}
+        </div>
+        <div style={{ fontSize: 10.5, color: 'var(--theme-text-muted)', marginTop: 4, lineHeight: 1.5 }}>
+          这些位置都跑在独立上下文上，可安全换用与执行不同的模型做交叉评审，进一步降低自我欺骗。
+          执行（execute/分步）始终走会话本身的 backend。留「跟随会话」即与执行同模型。
         </div>
       </div>
 

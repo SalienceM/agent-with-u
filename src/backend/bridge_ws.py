@@ -1965,6 +1965,7 @@ class BridgeWS:
                 session, prompt, sub_stage="idea", seq=-1,
                 resume=False, indep_session_id=f"{session_id}:idea:{idea_id}",
                 images=(idea.images or None),
+                backend_id=(state.policy.backend_for("idea") or None),
             )
             # 重新载入，避免并发覆盖
             state = self._loop_state(session_id) or state
@@ -2024,7 +2025,7 @@ class BridgeWS:
         )
         text = await self._loop_run_agent(session, prompt, sub_stage="goal", seq=-1, resume=False,
                                            indep_session_id=f"{session_id}:goal",
-                                           backend_id=(state.policy.eval_backend_id or None))
+                                           backend_id=(state.policy.backend_for("goal") or None))
         state = self._loop_state(session_id) or state
         if text.strip() and not state.goal:
             state.goal = text.strip()
@@ -2096,7 +2097,7 @@ class BridgeWS:
         )
         text = await self._loop_run_agent(session, prompt, sub_stage="goal", seq=-1,
                                           resume=False, indep_session_id=f"{session_id}:goal",
-                                          backend_id=(state.policy.eval_backend_id or None))
+                                          backend_id=(state.policy.backend_for("goal") or None))
         refined = text.strip()
         state = self._loop_state(session_id) or state
         if not refined:
@@ -2504,7 +2505,7 @@ class BridgeWS:
             f"【策略与心智（须遵循）】\n{state.policy.strategy}\n\n"
             if state.policy.strategy else ""
         )
-        eval_backend = getattr(state.policy, "eval_backend_id", "") or None
+        eval_backend = state.policy.backend_for("analysis") or None
         # 指定了异构评审 backend 时，必须用独立上下文（跨 backend 无法 resume 同一会话）
         independent = bool(getattr(state.policy, "independent_eval", True)) or bool(eval_backend)
         # ★ 防自欺：独立评审用一个不复用执行上下文的会话，避免被执行阶段的乐观自述带偏；
@@ -2816,7 +2817,16 @@ class BridgeWS:
                 elif delta.type == "error" and delta.error:
                     self._emit_aside_delta(session_id, turn_id, f"\n❌ {delta.error}\n")
 
-            backend = self._get_backend(session.backend_id)
+            # 旁路问答也可走专用 backend（独立上下文，安全）
+            aside_backend_id = state.policy.backend_for("aside") if state else ""
+            backend = None
+            if aside_backend_id and aside_backend_id != session.backend_id:
+                try:
+                    backend = self._get_backend(aside_backend_id)
+                except Exception:
+                    backend = None
+            if backend is None:
+                backend = self._get_backend(session.backend_id)
             aside_sid = f"{session_id}:aside"
             try:
                 await backend.send_message(
