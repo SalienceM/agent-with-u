@@ -318,6 +318,7 @@ class LoopPolicy:
     max_loops: int = 8                             # 基础最大 loop 约束
     risk_threshold: float = 0.85                   # 风险止损阈值（≥ 即收口）
     independent_eval: bool = True                  # analysis 用独立上下文 + 对抗式评审（防自欺）
+    intent_guard: bool = True                       # 早期检查人意图 vs 模型计划方向的偏差（非阻塞提示）
     # 各「AI 分析/转换」位置的专用 backend：{idea/goal/analysis/aside: backend_id}，缺省=跟随会话。
     # 这些位置都跑在独立上下文上，可安全换异构模型做交叉评审（执行 execute/step 仍走会话 backend）。
     backends: dict = field(default_factory=dict)
@@ -337,6 +338,7 @@ class LoopPolicy:
             "maxLoops": self.max_loops,
             "riskThreshold": self.risk_threshold,
             "independentEval": self.independent_eval,
+            "intentGuard": self.intent_guard,
             "backends": dict(self.backends or {}),
             "strategy": self.strategy,
         }
@@ -359,6 +361,7 @@ class LoopPolicy:
         rt = max(0.1, min(1.0, _f("riskThreshold", 0.85)))
         strat = d.get("strategy")
         ie = d.get("independentEval", True)
+        ig = d.get("intentGuard", True)
         # 各位置 backend 映射 + 迁移旧的单一 evalBackendId（曾用于 analysis/goal）
         raw_b = d.get("backends")
         backends: dict = {}
@@ -374,6 +377,7 @@ class LoopPolicy:
         return cls(
             deliverable_score=dv, outputtable_score=ov, max_loops=ml, risk_threshold=rt,
             independent_eval=bool(ie) if ie is not None else True,
+            intent_guard=bool(ig) if ig is not None else True,
             backends=backends,
             strategy=strat if isinstance(strat, str) and strat.strip() else DEFAULT_STRATEGY,
         )
@@ -418,6 +422,7 @@ class LoopState:
     stop_reason: str = ""               # 触发 loopout / 终止的原因
     asides: list[AsideTurn] = field(default_factory=list)  # by the way 旁路问答
     addons: list[Addon] = field(default_factory=list)      # 执行中补充的要求
+    intent_alert: dict = field(default_factory=dict)       # 意图守卫：人意图 vs 模型计划偏差提示
     created_at: float = field(default_factory=_now)
     updated_at: float = field(default_factory=_now)
 
@@ -466,6 +471,7 @@ class LoopState:
             "stopReason": self.stop_reason,
             "asides": [a.to_dict() for a in self.asides],
             "addons": [a.to_dict() for a in self.addons],
+            "intentAlert": self.intent_alert or {},
             "bestScore": self.best_score(),
             "latestScore": self.latest_score(),
             "createdAt": self.created_at,
@@ -494,6 +500,7 @@ class LoopState:
             stop_reason=d.get("stopReason", ""),
             asides=[AsideTurn.from_dict(a) for a in d.get("asides", [])],
             addons=[Addon.from_dict(a) for a in d.get("addons", [])],
+            intent_alert=dict(d.get("intentAlert") or {}),
             created_at=d.get("createdAt", _now()),
             updated_at=d.get("updatedAt", _now()),
         )

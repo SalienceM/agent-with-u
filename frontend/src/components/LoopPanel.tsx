@@ -46,6 +46,7 @@ interface LoopStateT {
   status: string; stopReason: string; bestScore: number; latestScore: number;
   asides: AsideTurn[];
   addons: Addon[];
+  intentAlert?: { round?: number; seq?: number; aligned?: boolean; severity?: string; divergence?: string; suggestion?: string; dismissed?: boolean };
   auto: boolean; running: boolean; resumable: boolean;
 }
 
@@ -214,6 +215,7 @@ export const LoopPanel: React.FC<LoopPanelProps> = ({ sessionId, onClose, embedd
         <div style={{ flex: 1, display: 'flex', minHeight: 0, position: 'relative' }}>
           <div style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
             <div style={{ flex: 1, overflow: 'auto', padding: '12px 18px 24px' }}>
+              <IntentBanner state={state} sessionId={sessionId} />
               {state.stage === 'loopidea' ? (
                 <>
                   <PolicyCard sessionId={sessionId} policy={state.policy} />
@@ -262,6 +264,28 @@ export const LoopPanel: React.FC<LoopPanelProps> = ({ sessionId, onClose, embedd
           )}
         </div>
     </>
+  );
+};
+
+// ══ 意图守卫提示横幅（非阻塞）═══════════════════════════════════
+const IntentBanner: React.FC<{ state: LoopStateT; sessionId: string }> = ({ state, sessionId }) => {
+  const a = state.intentAlert;
+  if (!a || a.dismissed || a.aligned || !(a.severity === 'medium' || a.severity === 'high')) return null;
+  const high = a.severity === 'high';
+  const col = high ? '#f87171' : '#bf8700';
+  return (
+    <div className="awu-reveal" style={{ marginBottom: 14, padding: '10px 12px', borderRadius: 10, background: `${col}1a`, border: `1px solid ${col}55` }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 4 }}>
+        <span style={{ fontSize: 13, fontWeight: 700, color: col }}>⚠️ 意图可能跑偏（{high ? '高' : '中'}）</span>
+        <div style={{ flex: 1 }} />
+        <button onClick={() => api.loopDismissIntent(sessionId)} style={miniX} title="知道了，关闭">✕</button>
+      </div>
+      {a.divergence && <div style={{ fontSize: 12.5, color: 'var(--theme-text)', lineHeight: 1.55 }}>{a.divergence}</div>}
+      {a.suggestion && <div style={{ fontSize: 12, color: 'var(--theme-text-muted)', marginTop: 4, lineHeight: 1.55 }}>建议：{a.suggestion}</div>}
+      <div style={{ fontSize: 10.5, color: 'var(--theme-text-muted)', marginTop: 6 }}>
+        不打断执行。可在「🎯 全局目标」微调目标，或用「🗑 停止并删除本次」止损后再调整。
+      </div>
+    </div>
   );
 };
 

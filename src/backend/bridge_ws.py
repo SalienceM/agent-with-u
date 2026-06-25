@@ -2405,6 +2405,65 @@ class BridgeWS:
         record.updated_at = time.time()
         self._loop_save(state)
         self._emit_loop_updated(state)
+        # ★ 意图守卫：本轮第一遍出 plan 后、真正重执行前，检查"人意图 vs 模型计划方向"，
+        #   早暴露偏差、省算力；非阻塞（不打断执行），每轮只查一次。
+        try:
+            if getattr(state.policy, "intent_guard", True) and not session.id in self._loop_cancel:
+                first_in_round = not any(l.seq != record.seq for l in state.round_loops())
+                already = (state.intent_alert or {}).get("round") == state.round
+                if first_in_round and not already:
+                    await self._intent_check(session, state, record)
+        except Exception as e:
+            print(f"[loop] intent guard skipped: {e}", file=sys.stderr, flush=True)
+
+    async def _intent_check(self, session, state, record) -> None:
+        """轻量独立检查：模型这一遍的计划方向是否跑偏了用户真实意图。结果写入 state.intent_alert。"""
+        ideas_text = "\n".join(f"- {i.prompt}" for i in state.ideas) or "(无)"
+        steps_text = "\n".join(f"{s.index}.({s.mode}) {s.desc}" for s in record.orchestration) or "(无显式分步)"
+        prompt = (
+            "你是「意图对齐」检查员。下面是用户的真实意图（全局目标 + 最初的原始诉求），"
+            "以及模型这一遍打算怎么做（计划）。判断计划方向是否跑偏了用户意图——范围是否扩大/缩小、"
+            "重点是否错位、是否在做用户没要的事或漏了用户在意的事。\n"
+            "保守起见：只有确有**实质方向性偏差**才报 medium/high；措辞差异、实现细节不同不算偏差。\n"
+            "只输出一个 JSON 围栏：\n"
+            "- aligned: true/false\n- severity: \"low\" | \"medium\" | \"high\"\n"
+            "- divergence: 一句话说清哪里可能偏了（对齐则空）\n"
+            "- suggestion: 一句话给用户的修正建议（对齐则空）\n\n"
+            f"【全局目标】\n{state.goal or '(未定)'}\n\n【最初的原始诉求】\n{ideas_text}\n\n"
+            f"【模型这一遍的计划】\n本遍策略：{record.goal or '(同全局目标)'}\n分步：\n{steps_text}\n\n"
+            "```json\n{\"aligned\": true, \"severity\": \"low\", \"divergence\": \"\", \"suggestion\": \"\"}\n```"
+        )
+        text = await self._loop_run_agent(
+            session, prompt, sub_stage="intent", seq=record.seq,
+            resume=False, indep_session_id=f"{session.id}:intent:{state.round}",
+            backend_id=(state.policy.backend_for("analysis") or None),
+        )
+        aj = self._extract_json_block(text) or {}
+        sev = str(aj.get("severity", "low")).lower()
+        if sev not in ("low", "medium", "high"):
+            sev = "low"
+        aligned = self._coerce_bool(aj.get("aligned", True))
+        state = self._loop_state(session.id) or state
+        state.intent_alert = {
+            "round": state.round, "seq": record.seq,
+            "aligned": aligned, "severity": sev,
+            "divergence": (aj.get("divergence") or "").strip(),
+            "suggestion": (aj.get("suggestion") or "").strip(),
+            "dismissed": False, "createdAt": time.time(),
+        }
+        self._loop_save(state)
+        self._emit_loop_updated(state)
+
+    def _rpc_loopDismissIntent(self, session_id: str) -> str:
+        """关闭意图守卫提示（用户已知悉/采纳）。"""
+        state = self._loop_state(session_id)
+        if not state:
+            return json.dumps({"status": "error", "message": "no loop state"}, ensure_ascii=False)
+        if state.intent_alert:
+            state.intent_alert["dismissed"] = True
+            self._loop_save(state)
+            self._emit_loop_updated(state)
+        return json.dumps({"status": "ok"}, ensure_ascii=False)
 
     async def _loop_do_execute(self, session, state, record) -> None:
         record.sub_stage = SUB_EXECUTE

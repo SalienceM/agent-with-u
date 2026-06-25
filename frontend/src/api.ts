@@ -684,6 +684,12 @@ export const api = {
     try { return JSON.parse(result); } catch { return { status: 'error', models: [] }; }
   },
 
+  /** 关闭意图守卫提示。 */
+  async loopDismissIntent(sessionId: string): Promise<{ status: string }> {
+    const result = await call('loopDismissIntent', sessionId);
+    try { return JSON.parse(result); } catch { return { status: 'error' }; }
+  },
+
   async loopRunIteration(sessionId: string): Promise<{ status: string; message?: string }> {
     const result = await call('loopRunIteration', sessionId);
     try { return JSON.parse(result); } catch { return { status: 'error', message: '响应解析失败' }; }
@@ -1307,6 +1313,7 @@ function mockDispatch(method: string, params: any[]): any {
     case 'loopPolicyPresetSave': return JSON.stringify({ status: 'ok' });
     case 'loopPolicyPresetDelete': return JSON.stringify({ status: 'ok' });
     case 'modelLedgerList': return JSON.stringify({ status: 'ok', models: [] });
+    case 'loopDismissIntent': return JSON.stringify({ status: 'ok' });
     case 'loopRunIteration': return JSON.stringify({ status: 'error', message: 'mock mode' });
     case 'loopDiscard': return JSON.stringify({ status: 'ok' });
     case 'loopSetAuto': return JSON.stringify({ status: 'ok', auto: !!params[1] });

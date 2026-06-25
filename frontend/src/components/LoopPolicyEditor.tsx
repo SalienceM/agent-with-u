@@ -8,6 +8,7 @@ export interface LoopPolicy {
   maxLoops: number;
   riskThreshold: number;
   independentEval: boolean;
+  intentGuard: boolean;
   backends: Record<string, string>;   // 各分析/转换位置的专用 backend：{idea/goal/analysis/aside}
   strategy: string;
 }
@@ -39,6 +40,7 @@ export const DEFAULT_POLICY: LoopPolicy = {
   maxLoops: 8,
   riskThreshold: 0.85,
   independentEval: true,
+  intentGuard: true,
   backends: {},
   strategy: DEFAULT_STRATEGY,
 };
@@ -51,6 +53,7 @@ export function normalizePolicy(p?: Partial<LoopPolicy> | null): LoopPolicy {
   const ml = Math.round(clamp(num(d.maxLoops, 8), 1, 50));
   const rt = clamp(num(d.riskThreshold, 0.85), 0.1, 1);
   const ie = d.independentEval !== false;
+  const ig = d.intentGuard !== false;
   const backends: Record<string, string> = {};
   const rawB: any = (d as any).backends;
   if (rawB && typeof rawB === 'object') {
@@ -66,7 +69,7 @@ export function normalizePolicy(p?: Partial<LoopPolicy> | null): LoopPolicy {
     if (!backends.goal) backends.goal = oldEb;
   }
   const strat = (typeof d.strategy === 'string' && d.strategy.trim()) ? d.strategy : DEFAULT_STRATEGY;
-  return { deliverableScore: del, outputtableScore: out, maxLoops: ml, riskThreshold: rt, independentEval: ie, backends, strategy: strat };
+  return { deliverableScore: del, outputtableScore: out, maxLoops: ml, riskThreshold: rt, independentEval: ie, intentGuard: ig, backends, strategy: strat };
 }
 
 function num(v: any, fb: number): number { const n = Number(v); return Number.isFinite(n) ? n : fb; }
@@ -152,6 +155,17 @@ export const LoopPolicyEditor: React.FC<{
           <span style={{ fontSize: 12.5, fontWeight: 600, color: 'var(--theme-text)' }}>独立对抗式评审（防自欺）</span>
           <span style={{ display: 'block', fontSize: 11, color: 'var(--theme-text-muted)', marginTop: 2, lineHeight: 1.5 }}>
             评分用独立上下文、不复用执行对话；以实际产物/可运行性为准核实，默认未完成，避免「越跑越自我感觉良好」的失真。建议开启。
+          </span>
+        </span>
+      </label>
+
+      {/* 意图守卫 */}
+      <label style={{ display: 'flex', gap: 8, alignItems: 'flex-start', cursor: 'pointer', padding: '8px 10px', borderRadius: 8, background: 'var(--theme-bg-secondary)', border: '1px solid var(--theme-border)' }}>
+        <input type="checkbox" checked={value.intentGuard} onChange={(e) => set({ intentGuard: e.target.checked })} style={{ marginTop: 2 }} />
+        <span>
+          <span style={{ fontSize: 12.5, fontWeight: 600, color: 'var(--theme-text)' }}>意图守卫（早期偏差提示）</span>
+          <span style={{ display: 'block', fontSize: 11, color: 'var(--theme-text-muted)', marginTop: 2, lineHeight: 1.5 }}>
+            每轮第一遍出 plan 后、真正重执行前，独立检查「计划方向 vs 你的真实意图」是否跑偏；有实质偏差才非阻塞地提示，早暴露、省算力，又不打断执行。
           </span>
         </span>
       </label>

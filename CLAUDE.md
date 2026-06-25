@@ -334,6 +334,7 @@ ideas + the hint and rewrites the goal, appending a `refine` revision. Manual ed
 are a per-session `LoopPolicy` on the stage file (`loop_store.LoopPolicy`):
 `deliverable_score` (70), `outputtable_score` (85), `max_loops` (8),
 `risk_threshold` (0.85 — risk ≥ this seals to loopout), `independent_eval` (True),
+`intent_guard` (True — see below),
 a per-position **`backends` map** (`{idea, goal, analysis, aside}` → backend id;
 each empty = follow the session) so every "AI analysis/transformation" point can run
 on a **different backend** than the executor for heterogeneous cross-evaluation —
@@ -370,6 +371,16 @@ a participation tick); read via `modelLedgerList` and surfaced in the
 so allocation can be informed by who actually delivers. (Next stages — a routing
 "brain" that picks N backends per task, multi-party plan + pick-best, and an early
 human↔model intent-divergence guard — build on this.)
+
+**Intent guard (`intent_guard`, default on).** Early human↔model intent-divergence
+check: after the **first** loop of a round produces its plan (in `_loop_do_prepare`,
+before the heavy execute), `_intent_check` runs one lightweight independent turn
+(on the `analysis` backend) comparing the plan's direction against the user's real
+intent (global goal + original ideas). It writes `state.intent_alert`
+(`{aligned, severity low/medium/high, divergence, suggestion, dismissed}`). The UI
+shows a non-blocking `IntentBanner` only on medium/high divergence — it never halts
+execution (respecting "don't over-interrupt"); the user can refine the goal or
+discard. Dismiss via `loopDismissIntent`. Runs once per round (省算力).
 
 **Stop & discard a loop (`loopDiscard`).** A mis-clicked / unwanted iteration can
 be thrown away as if it never ran: `loopDiscard(session_id, seq=0)` (defaults to
