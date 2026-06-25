@@ -334,8 +334,12 @@ ideas + the hint and rewrites the goal, appending a `refine` revision. Manual ed
 are a per-session `LoopPolicy` on the stage file (`loop_store.LoopPolicy`):
 `deliverable_score` (70), `outputtable_score` (85), `max_loops` (8),
 `risk_threshold` (0.85 — risk ≥ this seals to loopout), `independent_eval` (True),
-and a free-text `strategy` ("心智") that is injected as a "must follow" block into
-every `prepare` and `analysis` prompt. **Anti-self-deception**: the default
+`eval_backend_id` (the analysis/transformation steps — analysis scoring, goal
+synthesis, goal refine — can run on a **different backend** than the executor for
+heterogeneous cross-evaluation; empty = follow the session; `_loop_run_agent` takes
+an optional `backend_id`, used only on independent/non-resume turns, falling back
+to the session backend if missing), and a free-text `strategy` ("心智") that is
+injected as a "must follow" block into every `prepare` and `analysis` prompt. **Anti-self-deception**: the default
 strategy is evidence-first ("default incomplete; verify real artifacts; beware the
 美好陷阱"), and when `independent_eval` is on, `analysis` runs on an **independent
 agent session** (`{sid}:eval:{seq}`, not resuming the executor's optimistic

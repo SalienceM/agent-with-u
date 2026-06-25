@@ -8,6 +8,7 @@ export interface LoopPolicy {
   maxLoops: number;
   riskThreshold: number;
   independentEval: boolean;
+  evalBackendId: string;
   strategy: string;
 }
 
@@ -30,6 +31,7 @@ export const DEFAULT_POLICY: LoopPolicy = {
   maxLoops: 8,
   riskThreshold: 0.85,
   independentEval: true,
+  evalBackendId: '',
   strategy: DEFAULT_STRATEGY,
 };
 
@@ -41,8 +43,9 @@ export function normalizePolicy(p?: Partial<LoopPolicy> | null): LoopPolicy {
   const ml = Math.round(clamp(num(d.maxLoops, 8), 1, 50));
   const rt = clamp(num(d.riskThreshold, 0.85), 0.1, 1);
   const ie = d.independentEval !== false;
+  const eb = typeof d.evalBackendId === 'string' ? d.evalBackendId : '';
   const strat = (typeof d.strategy === 'string' && d.strategy.trim()) ? d.strategy : DEFAULT_STRATEGY;
-  return { deliverableScore: del, outputtableScore: out, maxLoops: ml, riskThreshold: rt, independentEval: ie, strategy: strat };
+  return { deliverableScore: del, outputtableScore: out, maxLoops: ml, riskThreshold: rt, independentEval: ie, evalBackendId: eb, strategy: strat };
 }
 
 function num(v: any, fb: number): number { const n = Number(v); return Number.isFinite(n) ? n : fb; }
@@ -55,8 +58,9 @@ export const LoopPolicyEditor: React.FC<{
   const set = (patch: Partial<LoopPolicy>) => onChange({ ...value, ...patch });
   const [presets, setPresets] = useState<any[]>([]);
   const [sel, setSel] = useState('');
+  const [backends, setBackends] = useState<any[]>([]);
   const reload = () => api.loopPolicyPresetList().then((r) => setPresets(r.presets || [])).catch(() => {});
-  useEffect(() => { reload(); }, []);
+  useEffect(() => { reload(); api.getBackends().then((b) => setBackends(b || [])).catch(() => {}); }, []);
 
   const applyPreset = (id: string) => {
     setSel(id);
@@ -124,6 +128,20 @@ export const LoopPolicyEditor: React.FC<{
           </span>
         </span>
       </label>
+
+      {/* 分析/转换步骤（评分 / 目标汇总 / 微调）专用 backend：异构交叉评审更防自欺 */}
+      <div>
+        <div style={labelText}>分析 / 评审 backend</div>
+        <select value={value.evalBackendId} onChange={(e) => set({ evalBackendId: e.target.value })}
+          style={{ ...inputBase, width: '100%' }}>
+          <option value="">跟随会话（默认，同一模型）</option>
+          {backends.map((b) => <option key={b.id} value={b.id}>{b.label || b.id}</option>)}
+        </select>
+        <div style={{ fontSize: 10.5, color: 'var(--theme-text-muted)', marginTop: 2, lineHeight: 1.5 }}>
+          指定后，每轮涉及「AI 分析/转换」的步骤——analysis 评分、目标汇总、目标微调——改用这个 backend
+          （独立上下文）。用与执行不同的模型交叉评审，进一步降低自我欺骗。
+        </div>
+      </div>
 
       <div>
         <div style={labelRow}>

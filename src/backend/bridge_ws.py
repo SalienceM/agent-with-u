@@ -1833,13 +1833,24 @@ class BridgeWS:
                               sub_stage: str, seq: int,
                               resume: bool = True,
                               indep_session_id: Optional[str] = None,
-                              images: Optional[list] = None) -> str:
+                              images: Optional[list] = None,
+                              backend_id: Optional[str] = None) -> str:
         """让会话绑定的 backend 跑一轮，收集全文，并把增量推给 LoopPanel。
 
         resume=True 时复用 session.agent_session_id 维持 loop 间记忆；
         indep_session_id 用于 loopidea 阶段的独立一次性想法探索。
+        backend_id 可为分析/转换步骤指定异构 backend（仅独立轮次用，找不到则回落会话 backend）。
         """
-        backend = self._get_backend(session.backend_id)
+        backend = None
+        if backend_id and backend_id != session.backend_id:
+            try:
+                backend = self._get_backend(backend_id)
+            except Exception as e:
+                print(f"[loop] eval backend '{backend_id}' 不可用，回落会话 backend：{e}",
+                      file=sys.stderr, flush=True)
+                backend = None
+        if backend is None:
+            backend = self._get_backend(session.backend_id)
         mid = new_id()
         sid_for_backend = indep_session_id or session.id
         parts: list[str] = []
@@ -2012,7 +2023,8 @@ class BridgeWS:
             f"{ideas_text}"
         )
         text = await self._loop_run_agent(session, prompt, sub_stage="goal", seq=-1, resume=False,
-                                           indep_session_id=f"{session_id}:goal")
+                                           indep_session_id=f"{session_id}:goal",
+                                           backend_id=(state.policy.eval_backend_id or None))
         state = self._loop_state(session_id) or state
         if text.strip() and not state.goal:
             state.goal = text.strip()
@@ -2083,7 +2095,8 @@ class BridgeWS:
             f"【额外提示】\n{h}"
         )
         text = await self._loop_run_agent(session, prompt, sub_stage="goal", seq=-1,
-                                          resume=False, indep_session_id=f"{session_id}:goal")
+                                          resume=False, indep_session_id=f"{session_id}:goal",
+                                          backend_id=(state.policy.eval_backend_id or None))
         refined = text.strip()
         state = self._loop_state(session_id) or state
         if not refined:
@@ -2491,7 +2504,9 @@ class BridgeWS:
             f"【策略与心智（须遵循）】\n{state.policy.strategy}\n\n"
             if state.policy.strategy else ""
         )
-        independent = bool(getattr(state.policy, "independent_eval", True))
+        eval_backend = getattr(state.policy, "eval_backend_id", "") or None
+        # 指定了异构评审 backend 时，必须用独立上下文（跨 backend 无法 resume 同一会话）
+        independent = bool(getattr(state.policy, "independent_eval", True)) or bool(eval_backend)
         # ★ 防自欺：独立评审用一个不复用执行上下文的会话，避免被执行阶段的乐观自述带偏；
         #   并以"对抗式、以证据为准、默认未完成"的口径打分。
         reviewer_block = (
@@ -2522,6 +2537,7 @@ class BridgeWS:
             session, analysis_prompt, SUB_ANALYSIS, record.seq,
             resume=not independent,
             indep_session_id=(f"{session.id}:eval:{record.seq}" if independent else None),
+            backend_id=eval_backend,
         )
         aj = self._extract_json_block(atext) or {}
         score = float(aj.get("score", 0) or 0)

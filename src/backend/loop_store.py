@@ -318,6 +318,7 @@ class LoopPolicy:
     max_loops: int = 8                             # 基础最大 loop 约束
     risk_threshold: float = 0.85                   # 风险止损阈值（≥ 即收口）
     independent_eval: bool = True                  # analysis 用独立上下文 + 对抗式评审（防自欺）
+    eval_backend_id: str = ""                       # 分析/转换步骤（评分/目标汇总/微调）专用 backend；空=跟随会话
     strategy: str = DEFAULT_STRATEGY               # 注入到 prepare/analysis 的策略心智文本
 
     def to_dict(self) -> dict:
@@ -327,6 +328,7 @@ class LoopPolicy:
             "maxLoops": self.max_loops,
             "riskThreshold": self.risk_threshold,
             "independentEval": self.independent_eval,
+            "evalBackendId": self.eval_backend_id,
             "strategy": self.strategy,
         }
 
@@ -348,9 +350,11 @@ class LoopPolicy:
         rt = max(0.1, min(1.0, _f("riskThreshold", 0.85)))
         strat = d.get("strategy")
         ie = d.get("independentEval", True)
+        eb = d.get("evalBackendId", "")
         return cls(
             deliverable_score=dv, outputtable_score=ov, max_loops=ml, risk_threshold=rt,
             independent_eval=bool(ie) if ie is not None else True,
+            eval_backend_id=eb if isinstance(eb, str) else "",
             strategy=strat if isinstance(strat, str) and strat.strip() else DEFAULT_STRATEGY,
         )
 

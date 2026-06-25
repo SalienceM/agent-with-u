@@ -878,7 +878,7 @@ const PolicyCard: React.FC<{ sessionId: string; policy?: LoopPolicy }> = ({ sess
           {open ? '▾' : '▸'} ⚙️ 策略与心智
         </button>
         <span style={{ fontSize: 11, color: 'var(--theme-text-muted)' }}>
-          可交付≥{p.deliverableScore} · 可输出≥{p.outputtableScore} · 最多 {p.maxLoops} loop · 风险≥{p.riskThreshold.toFixed(2)} 收口 · 评审{p.independentEval ? '独立防自欺' : '常规'}
+          可交付≥{p.deliverableScore} · 可输出≥{p.outputtableScore} · 最多 {p.maxLoops} loop · 风险≥{p.riskThreshold.toFixed(2)} 收口 · 评审{p.independentEval ? '独立防自欺' : '常规'}{p.evalBackendId ? ' · 异构 backend' : ''}
         </span>
       </div>
       {open && (
