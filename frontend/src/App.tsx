@@ -262,7 +262,10 @@ export const App: React.FC = () => {
       return;
     }
     let cancelled = false;
-    api.loadSession(activeSessionId).then((session) => {
+    // 顶栏只用 workingDir / backendId 等元数据，不需要消息正文。
+    // 用 limit=1 避免在启动时把整个 session（可能几十兆图片）拉过来——这是启动变慢、
+    // "好一会才出东西"的主因之一。ChatPane 会按自己的分页再拉消息。
+    api.loadSession(activeSessionId, 1).then((session) => {
       if (cancelled) return;
       setActiveSession(session);
     });

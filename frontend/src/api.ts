@@ -213,7 +213,8 @@ export function httpApiBase(httpPort: number): string {
 
 let wsUrl = `ws://127.0.0.1:${WS_PORT_DEFAULT}`;
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
-let reconnectDelay = 1000; // 指数退避：1s → 2s → 4s … 最大 30s
+const INITIAL_RECONNECT_DELAY = 300; // 启动/断线后首次重试更快，后端一就绪就尽快连上（少白屏）
+let reconnectDelay = INITIAL_RECONNECT_DELAY; // 指数退避：0.3s → 0.6s → … 最大 30s
 const MAX_RECONNECT_DELAY = 30000;
 let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
 const HEARTBEAT_INTERVAL_MS = 25000; // 每 25 秒发送一次心跳 ping
@@ -292,7 +293,7 @@ function doConnect(url: string, onSettled?: () => void) {
     ws = socket;
     wasCurrent = true;
     useMock = false;
-    reconnectDelay = 1000; // 成功后重置退避
+    reconnectDelay = INITIAL_RECONNECT_DELAY; // 成功后重置退避
     if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
     console.log(`[api] Connected to ${url}`);
     connectionStatusCallbacks.forEach((cb) => cb(true));
@@ -366,7 +367,7 @@ export async function setConnectionTarget(t: ConnectionTarget): Promise<void> {
   connectionTarget = t;
   try { localStorage.setItem(CONN_TARGET_KEY, JSON.stringify(t)); } catch { /* */ }
   if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
-  reconnectDelay = 1000;
+  reconnectDelay = INITIAL_RECONNECT_DELAY;
   wsUrl = await getWsUrl();
   const old = ws;
   ws = null; // 置空：旧 socket 的 onclose 不再做客户端清理
