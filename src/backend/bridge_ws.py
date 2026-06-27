@@ -44,6 +44,7 @@ from .loop_store import (
     STAGE_IDEA, STAGE_EXECUTE, STAGE_OUT,
     SUB_PREPARE, SUB_EXECUTE, SUB_ANALYSIS, SUB_DONE,
 )
+from .chat_extras_store import ChatExtrasStore, ChatExtras, SeqTask, ChatAside
 from .auth import AuthGuard
 from .asset_pool import AssetPool
 from .model_ledger import ModelLedger
@@ -353,6 +354,10 @@ class BridgeWS:
         # ★ 进程内 LoopState 单例缓存：iteration（反复整文件覆写）与旁路问答
         #   （追加 asides）共享同一对象，避免一方的保存覆盖另一方的写入。
         self._loop_states: dict[str, LoopState] = {}
+        # ★ 普通 session 侧挂状态（序列任务队列 + by-the-way），独立 sidecar 文件
+        self._chat_extras_store = ChatExtrasStore()
+        self._chat_extras: dict[str, ChatExtras] = {}   # 进程内单例缓存
+        self._chat_aside_running: set[str] = set()      # 正在回答普通会话 by-the-way 的 session
         # ★ 素材中转池：客户端图片/附件在交给 Agent 前先落到这里
         self._asset_pool = AssetPool()
         self._asset_pool.purge_expired()
@@ -1709,6 +1714,9 @@ class BridgeWS:
         self._aside_running.discard(sid)
         self._loop_states.pop(sid, None)
         self._loop_store.delete(sid)
+        self._chat_aside_running.discard(sid)
+        self._chat_extras.pop(sid, None)
+        self._chat_extras_store.delete(sid)
         ok = self._session_store.delete(sid)
         if ok:
             self._emit_session_updated({"type": "session_deleted", "sessionId": sid})
@@ -2942,6 +2950,243 @@ class BridgeWS:
                 self._emit_loop_updated(state)
         finally:
             self._aside_running.discard(session_id)
+
+    # ══════════════════════════════════════════════════════════════
+    #  普通 session 侧挂：序列任务队列 + by-the-way 旁路问答
+    # ══════════════════════════════════════════════════════════════
+
+    def _chat_extras_get(self, sid: str) -> ChatExtras:
+        """读 ChatExtras：优先进程内单例缓存，未命中读盘，再没有就新建。"""
+        ex = self._chat_extras.get(sid)
+        if ex is None:
+            ex = self._chat_extras_store.load(sid) or ChatExtras(session_id=sid)
+            self._chat_extras[sid] = ex
+        return ex
+
+    def _chat_extras_save(self, ex: ChatExtras) -> None:
+        self._chat_extras[ex.session_id] = ex
+        self._chat_extras_store.save(ex)
+
+    def _emit_seqtask_updated(self, ex: ChatExtras) -> None:
+        """序列任务队列变更广播给所有客户端（多端同步）。"""
+        asyncio.ensure_future(self._broadcast({
+            "event": "seqtaskUpdated",
+            "data": json.dumps({
+                "sessionId": ex.session_id,
+                "seqTasks": [t.to_dict() for t in ex.seq_tasks],
+                "seqAuto": ex.seq_auto,
+            }, ensure_ascii=False),
+        }))
+
+    def _seqtask_payload(self, ex: ChatExtras) -> str:
+        return json.dumps({
+            "status": "ok",
+            "seqTasks": [t.to_dict() for t in ex.seq_tasks],
+            "seqAuto": ex.seq_auto,
+        }, ensure_ascii=False)
+
+    def _rpc_seqtaskGet(self, session_id: str) -> str:
+        return self._seqtask_payload(self._chat_extras_get(session_id))
+
+    def _rpc_seqtaskAdd(self, session_id: str, text: str, images_json: str = "") -> str:
+        t = (text or "").strip()
+        imgs = self._parse_images_json(images_json)
+        if not t and not imgs:
+            return json.dumps({"status": "error", "message": "任务为空"}, ensure_ascii=False)
+        ex = self._chat_extras_get(session_id)
+        ex.seq_tasks.append(SeqTask(
+            id=new_id(), text=t,
+            images=[i.to_dict() for i in imgs] if imgs else [],
+        ))
+        self._chat_extras_save(ex)
+        self._emit_seqtask_updated(ex)
+        return self._seqtask_payload(ex)
+
+    def _rpc_seqtaskEdit(self, session_id: str, task_id: str, text: str, images_json: str = "") -> str:
+        ex = self._chat_extras_get(session_id)
+        t = next((x for x in ex.seq_tasks if x.id == task_id), None)
+        if not t:
+            return json.dumps({"status": "error", "message": "任务不存在"}, ensure_ascii=False)
+        if t.status != "pending":
+            return json.dumps({"status": "error", "message": "已发送的任务不可编辑"}, ensure_ascii=False)
+        t.text = (text or "").strip()
+        if images_json:
+            imgs = self._parse_images_json(images_json)
+            t.images = [i.to_dict() for i in imgs] if imgs else []
+        t.updated_at = time.time()
+        self._chat_extras_save(ex)
+        self._emit_seqtask_updated(ex)
+        return self._seqtask_payload(ex)
+
+    def _rpc_seqtaskRemove(self, session_id: str, task_id: str) -> str:
+        ex = self._chat_extras_get(session_id)
+        ex.seq_tasks = [x for x in ex.seq_tasks if x.id != task_id]
+        self._chat_extras_save(ex)
+        self._emit_seqtask_updated(ex)
+        return self._seqtask_payload(ex)
+
+    def _rpc_seqtaskReorder(self, session_id: str, ids_json: str) -> str:
+        try:
+            ids = json.loads(ids_json) if isinstance(ids_json, str) else list(ids_json)
+        except Exception:
+            ids = []
+        ex = self._chat_extras_get(session_id)
+        order = {tid: i for i, tid in enumerate(ids)}
+        # 只对未发送的重新排序；保持出现顺序的稳定回落
+        ex.seq_tasks.sort(key=lambda t: order.get(t.id, len(order)))
+        self._chat_extras_save(ex)
+        self._emit_seqtask_updated(ex)
+        return self._seqtask_payload(ex)
+
+    def _rpc_seqtaskSetAuto(self, session_id: str, on: bool) -> str:
+        ex = self._chat_extras_get(session_id)
+        ex.seq_auto = bool(on)
+        self._chat_extras_save(ex)
+        self._emit_seqtask_updated(ex)
+        return self._seqtask_payload(ex)
+
+    def _rpc_seqtaskTakeNext(self, session_id: str) -> str:
+        """取出队首待发任务并从队列移除（原子，防多端/自动重发）。前端拿到后发进主对话。"""
+        ex = self._chat_extras_get(session_id)
+        nxt = next((t for t in ex.seq_tasks if t.status == "pending"), None)
+        if not nxt:
+            return json.dumps({"status": "ok", "task": None}, ensure_ascii=False)
+        ex.seq_tasks = [t for t in ex.seq_tasks if t.id != nxt.id]
+        self._chat_extras_save(ex)
+        self._emit_seqtask_updated(ex)
+        return json.dumps({"status": "ok", "task": nxt.to_dict()}, ensure_ascii=False)
+
+    def _rpc_seqtaskClear(self, session_id: str) -> str:
+        ex = self._chat_extras_get(session_id)
+        ex.seq_tasks = []
+        self._chat_extras_save(ex)
+        self._emit_seqtask_updated(ex)
+        return self._seqtask_payload(ex)
+
+    # ── by-the-way 旁路问答（普通 session）──────────────────────────
+
+    def _emit_chat_aside_delta(self, session_id: str, turn_id: str, text: str) -> None:
+        asyncio.ensure_future(self._broadcast({
+            "event": "chatAsideDelta",
+            "data": json.dumps({
+                "sessionId": session_id, "turnId": turn_id, "text": text,
+            }, ensure_ascii=False),
+        }))
+
+    def _emit_chat_aside_updated(self, ex: ChatExtras) -> None:
+        asyncio.ensure_future(self._broadcast({
+            "event": "chatAsideUpdated",
+            "data": json.dumps({
+                "sessionId": ex.session_id,
+                "asides": [a.to_dict() for a in ex.asides],
+            }, ensure_ascii=False),
+        }))
+
+    def _rpc_chatAsideList(self, session_id: str) -> str:
+        ex = self._chat_extras_get(session_id)
+        return json.dumps({"status": "ok", "asides": [a.to_dict() for a in ex.asides]},
+                          ensure_ascii=False)
+
+    def _chat_context_digest(self, session: "Session", max_msgs: int = 8) -> str:
+        """普通会话最近若干条消息的只读摘要，喂给旁路问答（不污染主线）。"""
+        msgs = session.messages[-max_msgs:] if session.messages else []
+        lines = []
+        for m in msgs:
+            who = "用户" if m.role == "user" else ("助手" if m.role == "assistant" else m.role)
+            body = (m.content or "").strip().replace("\n", " ")
+            if len(body) > 400:
+                body = body[:400] + "…"
+            if body:
+                lines.append(f"{who}：{body}")
+        return "\n".join(lines) if lines else "（暂无对话历史）"
+
+    def _rpc_chatAsk(self, session_id: str, question: str, images_json: str = "") -> str:
+        """普通 session 的 by-the-way：独立 agent 上下文，带最近对话摘要，不进 transcript。"""
+        q = (question or "").strip()
+        images = self._parse_images_json(images_json)
+        if not q and not images:
+            return json.dumps({"status": "error", "message": "问题为空"}, ensure_ascii=False)
+        if session_id in self._chat_aside_running:
+            return json.dumps({"status": "error", "message": "上一条 by-the-way 仍在回答"}, ensure_ascii=False)
+        ex = self._chat_extras_get(session_id)
+        turn = ChatAside(id=new_id(), question=q or "（图片）", status="answering",
+                         image_count=len(images) if images else 0)
+        ex.asides.append(turn)
+        self._chat_extras_save(ex)
+        self._emit_chat_aside_updated(ex)
+        asyncio.ensure_future(self._run_chat_aside(session_id, turn.id, images))
+        return json.dumps({"status": "ok", "turnId": turn.id}, ensure_ascii=False)
+
+    async def _run_chat_aside(self, session_id: str, turn_id: str,
+                              images: Optional[list["ImageAttachment"]] = None) -> None:
+        session = self._active_sessions.get(session_id) or self._session_store.load(session_id)
+        ex = self._chat_extras_get(session_id)
+        if not session:
+            return
+        turn = next((t for t in ex.asides if t.id == turn_id), None)
+        if not turn:
+            return
+        self._chat_aside_running.add(session_id)
+        try:
+            digest = self._chat_context_digest(session)
+            history = "\n".join(
+                f"问：{t.question}\n答：{t.answer}"
+                for t in ex.asides[:-1][-4:] if t.status == "done" and t.answer
+            )
+            prompt = (
+                "你是这个对话的旁路助手（by the way）。下面是当前对话**最近几条**的只读摘要，"
+                "用户想随手问一个不打断主线、也不希望写进主对话的问题。"
+                "请基于摘要与常识作答——解读、答疑、建议即可，不要替用户去执行主线任务。\n\n"
+                f"===== 最近对话摘要 =====\n{digest}\n========================\n\n"
+                + (f"【最近的旁路问答】\n{history}\n\n" if history else "")
+                + f"【用户的问题】\n{turn.question}"
+            )
+            parts: list[str] = []
+
+            def on_delta(delta: StreamDelta):
+                if delta.type == "text_delta" and delta.text:
+                    parts.append(delta.text)
+                    self._emit_chat_aside_delta(session_id, turn_id, delta.text)
+                elif delta.type == "error" and delta.error:
+                    self._emit_chat_aside_delta(session_id, turn_id, f"\n❌ {delta.error}\n")
+
+            backend = self._get_backend(session.backend_id)
+            aside_sid = f"{session_id}:chataside"
+            try:
+                await backend.send_message(
+                    messages=[], content=prompt, images=images,
+                    session_id=aside_sid, message_id=new_id(), on_delta=on_delta,
+                    agent_session_id=None,          # ★ 独立上下文，绝不 resume 主线
+                    working_dir=session.working_dir,
+                    skip_permissions=True,
+                    sandbox_enabled=session.sandbox_enabled,
+                )
+            finally:
+                backend.clear_cancelled(aside_sid)
+
+            ex = self._chat_extras_get(session_id)
+            turn = next((t for t in ex.asides if t.id == turn_id), None)
+            if not turn:
+                return
+            answer = "".join(parts).strip()
+            turn.answer = answer or "(无输出)"
+            turn.status = "done" if answer else "error"
+            turn.updated_at = time.time()
+            self._chat_extras_save(ex)
+            self._emit_chat_aside_updated(ex)
+        except Exception as e:
+            import traceback
+            print(f"[chat] aside failed: {e}\n{traceback.format_exc()}",
+                  file=sys.stderr, flush=True)
+            ex = self._chat_extras_get(session_id)
+            t = next((t for t in ex.asides if t.id == turn_id), None)
+            if t:
+                t.status = "error"
+                t.answer = (t.answer or "") + f"\n❌ {e}"
+                self._chat_extras_save(ex)
+                self._emit_chat_aside_updated(ex)
+        finally:
+            self._chat_aside_running.discard(session_id)
 
     # ── RPC: 后端配置 ────────────────────────────────────────────
 

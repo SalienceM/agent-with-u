@@ -69,6 +69,14 @@ let loopProgressCallbacks: LoopProgressCallback[] = [];
 type LoopAsideDeltaCallback = (data: { sessionId: string; turnId: string; text: string }) => void;
 let loopAsideDeltaCallbacks: LoopAsideDeltaCallback[] = [];
 
+// ── 普通 session 侧挂：序列任务 + by-the-way ──────────────────
+type SeqtaskUpdatedCallback = (data: { sessionId: string; seqTasks: any[]; seqAuto: boolean }) => void;
+let seqtaskUpdatedCallbacks: SeqtaskUpdatedCallback[] = [];
+type ChatAsideDeltaCallback = (data: { sessionId: string; turnId: string; text: string }) => void;
+let chatAsideDeltaCallbacks: ChatAsideDeltaCallback[] = [];
+type ChatAsideUpdatedCallback = (data: { sessionId: string; asides: any[] }) => void;
+let chatAsideUpdatedCallbacks: ChatAsideUpdatedCallback[] = [];
+
 type SttStreamEndCallback = (data: { reason: string }) => void;
 let sttStreamEndCallbacks: SttStreamEndCallback[] = [];
 
@@ -264,6 +272,15 @@ function handleMessage(e: MessageEvent) {
     } else if (msg.event === 'loopAsideDelta') {
       const data = JSON.parse(msg.data);
       loopAsideDeltaCallbacks.forEach((cb) => cb(data));
+    } else if (msg.event === 'seqtaskUpdated') {
+      const data = JSON.parse(msg.data);
+      seqtaskUpdatedCallbacks.forEach((cb) => cb(data));
+    } else if (msg.event === 'chatAsideDelta') {
+      const data = JSON.parse(msg.data);
+      chatAsideDeltaCallbacks.forEach((cb) => cb(data));
+    } else if (msg.event === 'chatAsideUpdated') {
+      const data = JSON.parse(msg.data);
+      chatAsideUpdatedCallbacks.forEach((cb) => cb(data));
     } else if (msg.event === 'sttStreamText') {
       const data = JSON.parse(msg.data);
       sttStreamCallbacks.forEach((cb) => cb(data));
@@ -758,6 +775,65 @@ export const api = {
   onLoopProgress(cb: LoopProgressCallback): () => void {
     loopProgressCallbacks.push(cb);
     return () => { loopProgressCallbacks = loopProgressCallbacks.filter((c) => c !== cb); };
+  },
+
+  // ── 序列任务（普通 session）────────────────────────────────
+  async seqtaskGet(sessionId: string): Promise<{ status: string; seqTasks: any[]; seqAuto: boolean }> {
+    const result = await call('seqtaskGet', sessionId);
+    try { return JSON.parse(result); } catch { return { status: 'error', seqTasks: [], seqAuto: false }; }
+  },
+  async seqtaskAdd(sessionId: string, text: string, images?: any[]): Promise<{ status: string; seqTasks?: any[]; message?: string }> {
+    const imagesJson = images && images.length ? JSON.stringify(images) : '';
+    const result = await call('seqtaskAdd', sessionId, text, imagesJson);
+    try { return JSON.parse(result); } catch { return { status: 'error', message: '响应解析失败' }; }
+  },
+  async seqtaskEdit(sessionId: string, taskId: string, text: string, images?: any[]): Promise<{ status: string; message?: string }> {
+    const imagesJson = images && images.length ? JSON.stringify(images) : '';
+    const result = await call('seqtaskEdit', sessionId, taskId, text, imagesJson);
+    try { return JSON.parse(result); } catch { return { status: 'error', message: '响应解析失败' }; }
+  },
+  async seqtaskRemove(sessionId: string, taskId: string): Promise<{ status: string }> {
+    const result = await call('seqtaskRemove', sessionId, taskId);
+    try { return JSON.parse(result); } catch { return { status: 'error' }; }
+  },
+  async seqtaskReorder(sessionId: string, ids: string[]): Promise<{ status: string }> {
+    const result = await call('seqtaskReorder', sessionId, JSON.stringify(ids));
+    try { return JSON.parse(result); } catch { return { status: 'error' }; }
+  },
+  async seqtaskSetAuto(sessionId: string, on: boolean): Promise<{ status: string }> {
+    const result = await call('seqtaskSetAuto', sessionId, on);
+    try { return JSON.parse(result); } catch { return { status: 'error' }; }
+  },
+  async seqtaskTakeNext(sessionId: string): Promise<{ status: string; task: any | null }> {
+    const result = await call('seqtaskTakeNext', sessionId);
+    try { return JSON.parse(result); } catch { return { status: 'error', task: null }; }
+  },
+  async seqtaskClear(sessionId: string): Promise<{ status: string }> {
+    const result = await call('seqtaskClear', sessionId);
+    try { return JSON.parse(result); } catch { return { status: 'error' }; }
+  },
+  onSeqtaskUpdated(cb: SeqtaskUpdatedCallback): () => void {
+    seqtaskUpdatedCallbacks.push(cb);
+    return () => { seqtaskUpdatedCallbacks = seqtaskUpdatedCallbacks.filter((c) => c !== cb); };
+  },
+
+  // ── By the way 旁路问答（普通 session）─────────────────────
+  async chatAsk(sessionId: string, question: string, images?: any[]): Promise<{ status: string; turnId?: string; message?: string }> {
+    const imagesJson = images && images.length ? JSON.stringify(images) : '';
+    const result = await call('chatAsk', sessionId, question, imagesJson);
+    try { return JSON.parse(result); } catch { return { status: 'error', message: '响应解析失败' }; }
+  },
+  async chatAsideList(sessionId: string): Promise<{ status: string; asides: any[] }> {
+    const result = await call('chatAsideList', sessionId);
+    try { return JSON.parse(result); } catch { return { status: 'error', asides: [] }; }
+  },
+  onChatAsideDelta(cb: ChatAsideDeltaCallback): () => void {
+    chatAsideDeltaCallbacks.push(cb);
+    return () => { chatAsideDeltaCallbacks = chatAsideDeltaCallbacks.filter((c) => c !== cb); };
+  },
+  onChatAsideUpdated(cb: ChatAsideUpdatedCallback): () => void {
+    chatAsideUpdatedCallbacks.push(cb);
+    return () => { chatAsideUpdatedCallbacks = chatAsideUpdatedCallbacks.filter((c) => c !== cb); };
   },
 
   /** 清空 session 消息历史和 agent session ID，但保留 session 本身（目录/能力不变）。 */
@@ -1324,6 +1400,13 @@ function mockDispatch(method: string, params: any[]): any {
     case 'loopAddAddon': return JSON.stringify({ status: 'error', message: 'mock mode' });
     case 'loopRemoveAddon': return JSON.stringify({ status: 'ok' });
     case 'loopEditAddon': return JSON.stringify({ status: 'ok' });
+    case 'seqtaskGet': return JSON.stringify({ status: 'ok', seqTasks: [], seqAuto: false });
+    case 'seqtaskAdd': case 'seqtaskEdit': case 'seqtaskReorder':
+    case 'seqtaskClear': return JSON.stringify({ status: 'ok', seqTasks: [], seqAuto: false });
+    case 'seqtaskRemove': case 'seqtaskSetAuto': return JSON.stringify({ status: 'ok' });
+    case 'seqtaskTakeNext': return JSON.stringify({ status: 'ok', task: null });
+    case 'chatAsk': return JSON.stringify({ status: 'error', message: 'mock mode' });
+    case 'chatAsideList': return JSON.stringify({ status: 'ok', asides: [] });
     case 'listSessions': return '[]';
     case 'listConnectedClients': return '[]';
     case 'loadSession': return 'null';

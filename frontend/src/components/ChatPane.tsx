@@ -4,6 +4,9 @@ import { MessageBubble } from './MessageBubble';
 import { ChatInput } from './ChatInput';
 import { PermissionGate } from './PermissionGate';
 import { LoopPanel } from './LoopPanel';
+import { SeqTaskPanel } from './SeqTaskPanel';
+import type { SeqTaskT } from './SeqTaskPanel';
+import { ByTheWayDrawer } from './ByTheWayDrawer';
 import { useChat } from '../hooks/useChat';
 import type { AppConfig } from '../hooks/useConfig';
 
@@ -160,6 +163,47 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
     if (!sessionId) return;
     onStreamingChange?.(sessionId, chat.isStreaming);
   }, [sessionId, chat.isStreaming, onStreamingChange]);
+
+  // ── 序列任务队列 + by-the-way（普通 session 侧挂状态）──
+  const [seqTasks, setSeqTasks] = useState<SeqTaskT[]>([]);
+  const [seqAuto, setSeqAuto] = useState(false);
+  const [byTheWayOpen, setByTheWayOpen] = useState(false);
+  const dispatchingRef = useRef(false);
+
+  useEffect(() => {
+    if (!sessionId) { setSeqTasks([]); setSeqAuto(false); return; }
+    api.seqtaskGet(sessionId).then((r) => {
+      if (r.status === 'ok') { setSeqTasks(r.seqTasks || []); setSeqAuto(!!r.seqAuto); }
+    });
+    return api.onSeqtaskUpdated((data) => {
+      if (data.sessionId !== sessionId) return;
+      setSeqTasks(data.seqTasks || []);
+      setSeqAuto(!!data.seqAuto);
+    });
+  }, [sessionId]);
+
+  // 取队首待发任务，派发进主对话（doSend 跳过斜杠命令拦截 + 自带 isStreaming 守卫）
+  const dispatchNext = useCallback(async () => {
+    if (!sessionId || dispatchingRef.current || chat.isStreaming) return;
+    dispatchingRef.current = true;
+    try {
+      const r = await api.seqtaskTakeNext(sessionId);
+      if (r.status === 'ok' && r.task) {
+        const imgs = r.task.images && r.task.images.length ? r.task.images : undefined;
+        chat.doSend(r.task.text, imgs);
+      }
+    } finally {
+      dispatchingRef.current = false;
+    }
+  }, [sessionId, chat]);
+
+  // 自动连发：非流式 + auto 开 + 有待发任务 → 发下一条（一条答完 effect 再触发下一条）
+  useEffect(() => {
+    if (!seqAuto || chat.isStreaming) return;
+    if (!seqTasks.some((t) => t.status === 'pending')) return;
+    const id = setTimeout(() => { if (!chat.isStreaming) dispatchNext(); }, 80);
+    return () => clearTimeout(id);
+  }, [seqAuto, chat.isStreaming, seqTasks, dispatchNext]);
 
   // ── 持久化 skipPermissions ──
   const handleSkipPermissionsChange = useCallback(
@@ -560,6 +604,17 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
         </div>
       )}
 
+      {/* ---- 序列任务队列 ---- */}
+      {sessionId && (
+        <SeqTaskPanel
+          sessionId={sessionId}
+          tasks={seqTasks}
+          auto={seqAuto}
+          isStreaming={chat.isStreaming}
+          onSendNext={dispatchNext}
+        />
+      )}
+
       {/* ---- 输入栏 ---- */}
       <ChatInput
         onSend={chat.sendMessage}
@@ -576,6 +631,18 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
         onCompact={handleCompact}
         isFocused={isFocused}
       />
+
+      {/* ---- By the way 旁路问答：浮动入口 + 抽屉 ---- */}
+      {sessionId && (
+        <>
+          <button
+            onClick={() => setByTheWayOpen(true)}
+            title="By the way · 旁路问答（独立上下文，不污染主对话）"
+            style={byTheWayFab}
+          >💬</button>
+          <ByTheWayDrawer sessionId={sessionId} open={byTheWayOpen} onClose={() => setByTheWayOpen(false)} />
+        </>
+      )}
     </div>
   );
 };
@@ -590,6 +657,23 @@ const paneRootStyle: React.CSSProperties = {
   minHeight: 0,
   overflow: 'hidden',
   boxSizing: 'border-box',
+  position: 'relative',   // ★ 供 by-the-way 抽屉 overlay 定位
+};
+
+const byTheWayFab: React.CSSProperties = {
+  position: 'absolute',
+  top: 10,
+  right: 12,
+  zIndex: 20,
+  width: 34,
+  height: 34,
+  borderRadius: '50%',
+  border: '1px solid var(--theme-border)',
+  background: 'var(--theme-bg-secondary)',
+  color: 'var(--theme-text)',
+  fontSize: 15,
+  cursor: 'pointer',
+  boxShadow: '0 2px 8px rgba(0,0,0,0.18)',
 };
 
 const paneToolBtnStyle: React.CSSProperties = {

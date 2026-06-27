@@ -413,6 +413,38 @@ Loop RPCs: `loopGetState`, `loopSubmitIdea`, `loopRemoveIdea`, `loopSealIdea`,
 `loopSetAuto`, `loopAdvanceToOut`, `loopContinue`, `loopAsk`, `loopAddAddon`,
 `loopRemoveAddon`, `loopEditAddon`. `createSession` takes an optional third `session_type` argument.
 
+### Normal-session side features (序列任务 + By the way)
+
+Two designs from loop sessions are also available to **normal** chat sessions, backed
+by a sidecar file `~/.agent-with-u/chat-extras/<session_id>.json`
+(`src/backend/chat_extras_store.py`, `ChatExtras` = `{seq_tasks, seq_auto, asides}`),
+kept **separate** from the main session file so it never races with the per-message
+streaming saves. A process-level cache (`_chat_extras` / `_chat_extras_get` /
+`_chat_extras_save`) mirrors the loop singleton pattern.
+
+- **序列任务 (Sequence tasks).** A queue of pre-planned, progressively-detailed prompts
+  the user lines up; they are sent into the main conversation **one at a time** — the
+  next is sent only after the model has **fully finished** answering the previous turn.
+  Persistence + ordering live server-side; **dispatch** is driven in the frontend
+  (`ChatPane`) off `useChat`'s `isStreaming` done-edge: an effect waits for
+  `!isStreaming`, then `seqtaskTakeNext` (atomically pops the head — race-safe across
+  panes/clients) and `chat.doSend`s it (raw, bypassing slash-command interception).
+  **Auto** (`seqtaskSetAuto`) drains the whole queue automatically; **manual** uses a
+  "▶ 发送下一个" button. Unsent tasks are freely editable / removable / reorderable
+  (`seqtaskAdd/Edit/Remove/Reorder/Clear`, images supported). UI: `SeqTaskPanel.tsx`
+  sits above the `ChatInput`. State syncs via the `seqtaskUpdated` push event.
+- **By the way (旁路问答).** A floating 💬 entry on each chat pane opens
+  `ByTheWayDrawer.tsx` — ask a quick side question that runs on an **independent agent
+  context** (`agent_session_id=None`, session `f"{sid}:chataside"`), seeded with a
+  read-only digest of the **last few chat messages** (`_chat_context_digest`), so it
+  has context but never pollutes the main thread or enters the transcript. `chatAsk`
+  streams via `chatAsideDelta` and persists answers as `asides` (full-state
+  `chatAsideUpdated`). Mirrors the loop `loopAsk`/`_run_aside` design.
+
+Side RPCs: `seqtaskGet`, `seqtaskAdd`, `seqtaskEdit`, `seqtaskRemove`,
+`seqtaskReorder`, `seqtaskSetAuto`, `seqtaskTakeNext`, `seqtaskClear`, `chatAsk`,
+`chatAsideList`. The chat-extras file is cleaned up on `deleteSession`.
+
 ### Slash Commands
 
 Frontend handles these slash commands in `useChat.ts`:

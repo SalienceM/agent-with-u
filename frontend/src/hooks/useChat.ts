@@ -978,5 +978,7 @@ export function useChat(sessionId: string, backendId: string, backends?: any[], 
     // 历史分页
     messagesTotal, hasMore, loadingEarlier, loadEarlier,
     isLoadingSession,
+    // ★ 序列任务直接派发用：跳过斜杠命令拦截，仅在非流式时发送（doSend 自带 isStreaming 守卫）
+    doSend,
   };
 }
