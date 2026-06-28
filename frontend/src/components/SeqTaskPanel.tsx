@@ -17,11 +17,12 @@ interface Props {
   sessionId: string;
   tasks: SeqTaskT[];
   auto: boolean;
+  chainActive?: boolean;   // auto 链是否激活（false=auto 开但被你插话暂停了）
   isStreaming: boolean;
   onSendNext: () => void;
 }
 
-export const SeqTaskPanel: React.FC<Props> = ({ sessionId, tasks, auto, isStreaming, onSendNext }) => {
+export const SeqTaskPanel: React.FC<Props> = ({ sessionId, tasks, auto, chainActive, isStreaming, onSendNext }) => {
   const pending = tasks.filter((t) => t.status === 'pending');
   const [open, setOpen] = useState(true);
   const [draft, setDraft] = useState('');
@@ -75,7 +76,9 @@ export const SeqTaskPanel: React.FC<Props> = ({ sessionId, tasks, auto, isStream
         <>
           {auto && pending.length > 0 && (
             <div style={autoHint}>
-              {isStreaming ? '⏳ 正在回答，完成后自动发送下一条…' : '自动连发已开启，将依次发送队列。'}
+              {chainActive === false
+                ? '⏸ 自动连发已暂停（你插了话接管）—— 点「▶ 发送下一个」继续抽队列。'
+                : isStreaming ? '⏳ 正在回答，完成后自动发送下一条…' : '自动连发已开启，将依次发送队列。'}
             </div>
           )}
 

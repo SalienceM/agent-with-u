@@ -169,6 +169,13 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
   const [seqAuto, setSeqAuto] = useState(false);
   const [byTheWayOpen, setByTheWayOpen] = useState(false);
   const dispatchingRef = useRef(false);
+  // ★ auto 连发的「链激活」标志：派发队列任务 / auto 从关→开 时激活；
+  //   用户手插一条消息会让它失效（接管），从而不触发后续自动连发。
+  const seqChainRef = useRef(false);
+  const prevAutoRef = useRef(false);
+  // state 镜像，仅供面板显示「连发中 / 已暂停」；逻辑判定一律读 ref（避免闭包过期）
+  const [seqChainActive, setSeqChainActive] = useState(false);
+  const setChain = useCallback((v: boolean) => { seqChainRef.current = v; setSeqChainActive(v); }, []);
 
   useEffect(() => {
     if (!sessionId) { setSeqTasks([]); setSeqAuto(false); return; }
@@ -185,6 +192,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
   // 取队首待发任务，派发进主对话（doSend 跳过斜杠命令拦截 + 自带 isStreaming 守卫）
   const dispatchNext = useCallback(async () => {
     if (!sessionId || dispatchingRef.current || chat.isStreaming) return;
+    setChain(true);   // 主动派发即激活连发链（▶按钮也走这里，可续上被打断的链）
     dispatchingRef.current = true;
     try {
       const r = await api.seqtaskTakeNext(sessionId);
@@ -201,11 +209,26 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
     }
   }, [sessionId, chat]);
 
-  // 自动连发：非流式 + auto 开 + 有待发任务 → 发下一条（一条答完 effect 再触发下一条）
+  // auto 关→开 时激活连发链（关掉则失活）。auto 已是开的情况下加载/收到同步
+  //   不算「关→开」，链保持失活，需用户点 ▶ 或手动重新开关来启动 —— 避免刷新即自动猛发。
   useEffect(() => {
-    if (!seqAuto || chat.isStreaming) return;
+    const was = prevAutoRef.current;
+    prevAutoRef.current = seqAuto;
+    if (seqAuto && !was) setChain(true);
+    if (!seqAuto) setChain(false);
+  }, [seqAuto]);
+
+  // 用户手动发消息（ChatInput 来的）即接管，断开连发链：这条答完不会自动发下一条。
+  const handleUserSend = useCallback((content: string, images?: any[]) => {
+    setChain(false);
+    return chat.sendMessage(content, images);
+  }, [chat]);
+
+  // 自动连发：链激活 + auto 开 + 非流式 + 有待发任务 → 发下一条（一条答完 effect 再触发下一条）
+  useEffect(() => {
+    if (!seqAuto || chat.isStreaming || !seqChainRef.current) return;
     if (!seqTasks.some((t) => t.status === 'pending')) return;
-    const id = setTimeout(() => { if (!chat.isStreaming) dispatchNext(); }, 80);
+    const id = setTimeout(() => { if (!chat.isStreaming && seqChainRef.current) dispatchNext(); }, 80);
     return () => clearTimeout(id);
   }, [seqAuto, chat.isStreaming, seqTasks, dispatchNext]);
 
@@ -614,6 +637,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
           sessionId={sessionId}
           tasks={seqTasks}
           auto={seqAuto}
+          chainActive={seqChainActive}
           isStreaming={chat.isStreaming}
           onSendNext={dispatchNext}
         />
@@ -621,7 +645,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
 
       {/* ---- 输入栏 ---- */}
       <ChatInput
-        onSend={chat.sendMessage}
+        onSend={handleUserSend}
         onAbort={chat.abort}
         isStreaming={chat.isStreaming}
         backends={backends}

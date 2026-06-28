@@ -430,7 +430,11 @@ streaming saves. A process-level cache (`_chat_extras` / `_chat_extras_get` /
   `!isStreaming`, then `seqtaskTakeNext` (atomically pops the head — race-safe across
   panes/clients) and `chat.doSend`s it (raw, bypassing slash-command interception).
   **Auto** (`seqtaskSetAuto`) drains the whole queue automatically; **manual** uses a
-  "▶ 发送下一个" button. Unsent tasks are freely editable / removable / reorderable
+  "▶ 发送下一个" button. The auto-chain is gated by a "chain active" flag: it activates
+  on auto off→on or on a manual ▶ dispatch, and **deactivates when the user types their
+  own message** (`handleUserSend` → `ChatInput`) — so an interjection takes over and
+  doesn't trigger the next auto-send; ▶ resumes. The panel shows a ⏸ paused hint
+  (mirrored via `seqChainActive` state). Unsent tasks are freely editable / removable / reorderable
   (`seqtaskAdd/Edit/Remove/Reorder/Clear`, images supported). A queued entry starting
   with `/` is dispatched as a **slash command** (so `/compact`, `/clear`, … can be
   lined up between prompts); everything else goes raw. UI: `SeqTaskPanel.tsx`
