@@ -431,7 +431,9 @@ streaming saves. A process-level cache (`_chat_extras` / `_chat_extras_get` /
   panes/clients) and `chat.doSend`s it (raw, bypassing slash-command interception).
   **Auto** (`seqtaskSetAuto`) drains the whole queue automatically; **manual** uses a
   "▶ 发送下一个" button. Unsent tasks are freely editable / removable / reorderable
-  (`seqtaskAdd/Edit/Remove/Reorder/Clear`, images supported). UI: `SeqTaskPanel.tsx`
+  (`seqtaskAdd/Edit/Remove/Reorder/Clear`, images supported). A queued entry starting
+  with `/` is dispatched as a **slash command** (so `/compact`, `/clear`, … can be
+  lined up between prompts); everything else goes raw. UI: `SeqTaskPanel.tsx`
   sits above the `ChatInput`. State syncs via the `seqtaskUpdated` push event.
 - **By the way (旁路问答).** A floating 💬 entry on each chat pane opens
   `ByTheWayDrawer.tsx` — ask a quick side question that runs on an **independent agent
@@ -439,7 +441,10 @@ streaming saves. A process-level cache (`_chat_extras` / `_chat_extras_get` /
   read-only digest of the **last few chat messages** (`_chat_context_digest`), so it
   has context but never pollutes the main thread or enters the transcript. `chatAsk`
   streams via `chatAsideDelta` and persists answers as `asides` (full-state
-  `chatAsideUpdated`). Mirrors the loop `loopAsk`/`_run_aside` design.
+  `chatAsideUpdated`). Mirrors the loop `loopAsk`/`_run_aside` design. Each finished
+  answer carries two one-click actions — **加入序列任务** (`seqtaskAdd`) and **发送到
+  主对话** (`onSendToChat` → main `doSend`) — to bring an aside conclusion back into
+  the main flow.
 
 Side RPCs: `seqtaskGet`, `seqtaskAdd`, `seqtaskEdit`, `seqtaskRemove`,
 `seqtaskReorder`, `seqtaskSetAuto`, `seqtaskTakeNext`, `seqtaskClear`, `chatAsk`,

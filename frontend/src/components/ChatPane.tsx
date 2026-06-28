@@ -190,7 +190,11 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
       const r = await api.seqtaskTakeNext(sessionId);
       if (r.status === 'ok' && r.task) {
         const imgs = r.task.images && r.task.images.length ? r.task.images : undefined;
-        chat.doSend(r.task.text, imgs);
+        const text = r.task.text || '';
+        // 以 / 开头的条目当作斜杠命令处理（/compact、/clear 等可排进队列）；
+        // 其余走原始发送，绕过命令拦截。
+        if (text.trim().startsWith('/')) chat.sendMessage(text, imgs);
+        else chat.doSend(text, imgs);
       }
     } finally {
       dispatchingRef.current = false;
@@ -640,7 +644,8 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
             title="By the way · 旁路问答（独立上下文，不污染主对话）"
             style={byTheWayFab}
           >💬</button>
-          <ByTheWayDrawer sessionId={sessionId} open={byTheWayOpen} onClose={() => setByTheWayOpen(false)} />
+          <ByTheWayDrawer sessionId={sessionId} open={byTheWayOpen} onClose={() => setByTheWayOpen(false)}
+            onSendToChat={(text) => { if (!chat.isStreaming) chat.doSend(text); }} />
         </>
       )}
     </div>

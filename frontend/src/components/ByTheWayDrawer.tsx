@@ -13,9 +13,10 @@ interface Props {
   sessionId: string;
   open: boolean;
   onClose: () => void;
+  onSendToChat?: (text: string) => void;
 }
 
-export const ByTheWayDrawer: React.FC<Props> = ({ sessionId, open, onClose }) => {
+export const ByTheWayDrawer: React.FC<Props> = ({ sessionId, open, onClose, onSendToChat }) => {
   const [asides, setAsides] = useState<AsideT[]>([]);
   const [live, setLive] = useState<Record<string, string>>({});
   const [draft, setDraft] = useState('');
@@ -92,6 +93,17 @@ export const ByTheWayDrawer: React.FC<Props> = ({ sessionId, open, onClose }) =>
                       dangerouslySetInnerHTML={{ __html: markdownToHtml(answering ? (liveText || '') : (a.answer || '')) + (answering ? ' ▋' : '') }} />
                   )}
                 </div>
+                {/* 完成的答案：一键带回主流程 */}
+                {a.status === 'done' && a.answer && (
+                  <div style={actRow}>
+                    <button style={actBtn} title="把这条答案排进序列任务队列"
+                      onClick={async () => { await api.seqtaskAdd(sessionId, a.answer); }}>➕ 加入序列任务</button>
+                    {onSendToChat && (
+                      <button style={actBtn} title="把这条答案作为一条消息发进主对话"
+                        onClick={() => { onSendToChat(a.answer); onClose(); }}>↩ 发送到主对话</button>
+                    )}
+                  </div>
+                )}
               </div>
             );
           })}
@@ -136,6 +148,8 @@ const qRow: React.CSSProperties = { display: 'flex', gap: 7, alignItems: 'flex-s
 const aRow: React.CSSProperties = { display: 'flex', gap: 7, alignItems: 'flex-start' };
 const qTag: React.CSSProperties = { fontSize: 10, fontWeight: 700, color: '#fff', background: 'var(--theme-accent)', borderRadius: 4, padding: '1px 5px', flexShrink: 0, marginTop: 1 };
 const aTag: React.CSSProperties = { fontSize: 10, fontWeight: 700, color: 'var(--theme-text-muted)', background: 'var(--theme-bg-tertiary)', border: '1px solid var(--theme-border)', borderRadius: 4, padding: '1px 5px', flexShrink: 0, marginTop: 1 };
+const actRow: React.CSSProperties = { display: 'flex', gap: 8, marginTop: 2, marginLeft: 24, flexWrap: 'wrap' };
+const actBtn: React.CSSProperties = { fontSize: 10.5, padding: '2px 8px', borderRadius: 6, border: '1px solid var(--theme-border)', background: 'var(--theme-bg-secondary)', color: 'var(--theme-text-muted)', cursor: 'pointer' };
 const inputWrap: React.CSSProperties = { padding: '10px 14px', borderTop: '1px solid var(--theme-border)' };
 const inputArea: React.CSSProperties = { flex: 1, minHeight: 40, maxHeight: 140, fontSize: 12.5, padding: 8, borderRadius: 8, border: '1px solid var(--theme-border)', background: 'var(--theme-bg-secondary)', color: 'var(--theme-text)', resize: 'vertical', fontFamily: 'inherit', boxSizing: 'border-box' };
 const askBtn: React.CSSProperties = { fontSize: 12.5, fontWeight: 600, padding: '9px 16px', borderRadius: 8, border: 'none', background: 'var(--theme-accent)', color: '#fff', cursor: 'pointer' };
