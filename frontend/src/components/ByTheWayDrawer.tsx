@@ -14,23 +14,28 @@ interface Props {
   open: boolean;
   onClose: () => void;
   onSendToChat?: (text: string) => void;
+  backends?: any[];
 }
 
-export const ByTheWayDrawer: React.FC<Props> = ({ sessionId, open, onClose, onSendToChat }) => {
+export const ByTheWayDrawer: React.FC<Props> = ({ sessionId, open, onClose, onSendToChat, backends = [] }) => {
   const [asides, setAsides] = useState<AsideT[]>([]);
   const [live, setLive] = useState<Record<string, string>>({});
   const [draft, setDraft] = useState('');
   const [busy, setBusy] = useState(false);
+  const [asideBackendId, setAsideBackendId] = useState('');
   const boxRef = useRef<HTMLDivElement>(null);
   const { images, removeImage, clearImages, readFromClipboard } = useClipboardImage(boxRef);
 
   // 载入历史 + 订阅更新
   useEffect(() => {
     if (!sessionId) return;
-    api.chatAsideList(sessionId).then((r) => { if (r.status === 'ok') setAsides(r.asides || []); });
+    api.chatAsideList(sessionId).then((r) => {
+      if (r.status === 'ok') { setAsides(r.asides || []); setAsideBackendId(r.asideBackendId || ''); }
+    });
     const un1 = api.onChatAsideUpdated((data) => {
       if (data.sessionId !== sessionId) return;
       setAsides(data.asides || []);
+      if (data.asideBackendId !== undefined) setAsideBackendId(data.asideBackendId || '');
       // 完成的 turn 清掉其 live 缓冲
       setLive((prev) => {
         const next = { ...prev };
@@ -65,7 +70,20 @@ export const ByTheWayDrawer: React.FC<Props> = ({ sessionId, open, onClose, onSe
           <div style={{ flex: 1 }} />
           <button onClick={onClose} style={xBtn}>✕</button>
         </div>
-        <div style={subhead}>独立上下文 · 带最近对话摘要 · 不写入主对话</div>
+        <div style={subhead}>
+          <span>独立上下文 · 带最近对话摘要 · 不写入主对话</span>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginTop: 6 }}>
+            <span style={{ flexShrink: 0 }}>旁路模型</span>
+            <select value={asideBackendId} title="旁路问答用哪个后端（独立上下文，可换异构模型）"
+              onChange={(e) => { setAsideBackendId(e.target.value); api.chatAsideSetBackend(sessionId, e.target.value); }}
+              style={modelSel}>
+              <option value="">跟随会话</option>
+              {backends.map((b) => (
+                <option key={b.id} value={b.id}>{b.label || b.id}</option>
+              ))}
+            </select>
+          </div>
+        </div>
 
         <div style={list}>
           {asides.length === 0 && (
@@ -140,7 +158,8 @@ export const ByTheWayDrawer: React.FC<Props> = ({ sessionId, open, onClose, onSe
 const overlay: React.CSSProperties = { position: 'absolute', inset: 0, background: 'rgba(0,0,0,0.28)', zIndex: 40, display: 'flex', justifyContent: 'flex-end' };
 const drawer: React.CSSProperties = { width: 'min(440px, 92%)', height: '100%', display: 'flex', flexDirection: 'column', background: 'var(--theme-bg)', borderLeft: '1px solid var(--theme-border)', boxShadow: '-8px 0 24px rgba(0,0,0,0.18)' };
 const head: React.CSSProperties = { display: 'flex', alignItems: 'center', padding: '12px 14px 4px' };
-const subhead: React.CSSProperties = { fontSize: 11, color: 'var(--theme-text-muted)', padding: '0 14px 8px', borderBottom: '1px solid var(--theme-border)' };
+const subhead: React.CSSProperties = { fontSize: 11, color: 'var(--theme-text-muted)', padding: '0 14px 10px', borderBottom: '1px solid var(--theme-border)' };
+const modelSel: React.CSSProperties = { flex: 1, fontSize: 11, padding: '3px 6px', borderRadius: 6, border: '1px solid var(--theme-border)', background: 'var(--theme-bg-secondary)', color: 'var(--theme-text)', cursor: 'pointer' };
 const xBtn: React.CSSProperties = { background: 'none', border: 'none', cursor: 'pointer', color: 'var(--theme-text-muted)', fontSize: 14 };
 const list: React.CSSProperties = { flex: 1, overflowY: 'auto', padding: '10px 14px', display: 'flex', flexDirection: 'column', gap: 12 };
 const turn: React.CSSProperties = { display: 'flex', flexDirection: 'column', gap: 6, paddingBottom: 10, borderBottom: '1px dashed var(--theme-border)' };

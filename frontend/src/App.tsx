@@ -833,6 +833,7 @@ export const App: React.FC = () => {
                     setPaneSessions((prev) => prev.map((s) => (s === sid ? null : s)));
                   }}
                   onStreamingChange={handleStreamingChange}
+                  onAdjustFontSize={(delta) => updateConfig({ fontSize: Math.max(11, Math.min(28, config.fontSize + delta)) })}
                   layoutLabel={LAYOUT_LABEL[layout]}
                   onCycleLayout={() => setLayout((cur) => LAYOUT_CYCLE[(LAYOUT_CYCLE.indexOf(cur) + 1) % LAYOUT_CYCLE.length])}
                   onOpenSync={() => setSyncPanelOpen(true)}

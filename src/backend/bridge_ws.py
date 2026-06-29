@@ -3079,13 +3079,22 @@ class BridgeWS:
             "data": json.dumps({
                 "sessionId": ex.session_id,
                 "asides": [a.to_dict() for a in ex.asides],
+                "asideBackendId": ex.aside_backend_id,
             }, ensure_ascii=False),
         }))
 
     def _rpc_chatAsideList(self, session_id: str) -> str:
         ex = self._chat_extras_get(session_id)
-        return json.dumps({"status": "ok", "asides": [a.to_dict() for a in ex.asides]},
-                          ensure_ascii=False)
+        return json.dumps({"status": "ok", "asides": [a.to_dict() for a in ex.asides],
+                           "asideBackendId": ex.aside_backend_id}, ensure_ascii=False)
+
+    def _rpc_chatAsideSetBackend(self, session_id: str, backend_id: str) -> str:
+        """选择 by-the-way 专用 backend（空串=跟随会话 backend）。独立上下文，换异构模型安全。"""
+        ex = self._chat_extras_get(session_id)
+        ex.aside_backend_id = (backend_id or "").strip()
+        self._chat_extras_save(ex)
+        self._emit_chat_aside_updated(ex)
+        return json.dumps({"status": "ok", "asideBackendId": ex.aside_backend_id}, ensure_ascii=False)
 
     def _chat_context_digest(self, session: "Session", max_msgs: int = 8) -> str:
         """普通会话最近若干条消息的只读摘要，喂给旁路问答（不污染主线）。"""
@@ -3150,7 +3159,16 @@ class BridgeWS:
                 elif delta.type == "error" and delta.error:
                     self._emit_chat_aside_delta(session_id, turn_id, f"\n❌ {delta.error}\n")
 
-            backend = self._get_backend(session.backend_id)
+            # 旁路问答可走专用 backend（独立上下文，换异构模型安全）；缺失/不可用回落会话 backend
+            backend = None
+            aside_bid = (ex.aside_backend_id or "").strip()
+            if aside_bid and aside_bid != session.backend_id:
+                try:
+                    backend = self._get_backend(aside_bid)
+                except Exception:
+                    backend = None
+            if backend is None:
+                backend = self._get_backend(session.backend_id)
             aside_sid = f"{session_id}:chataside"
             try:
                 await backend.send_message(

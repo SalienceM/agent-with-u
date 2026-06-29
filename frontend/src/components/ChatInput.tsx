@@ -49,6 +49,8 @@ interface Props {
   sandboxEnabled?: boolean;
   onSandboxChange?: (enabled: boolean) => void;
   onCompact?: () => void;
+  fontSize?: number;                         // 当前对话字号(用于 A−/A+ 显示)
+  onAdjustFontSize?: (delta: number) => void; // 步进对话字号
   // 多 pane 场景:用来决定全局快捷键(截图等)归哪个输入框处理。
   // 单 pane / 浏览器单实例下不传也行,默认 true。
   isFocused?: boolean;
@@ -102,6 +104,7 @@ const ChatInputInner: React.FC<Props> = ({
   skipPermissions = true, onSkipPermissionsChange,
   sandboxEnabled = true, onSandboxChange,
   onCompact,
+  fontSize, onAdjustFontSize,
   isFocused = true,
 }) => {
   const ref = useRef<HTMLTextAreaElement>(null);
@@ -748,6 +751,13 @@ const ChatInputInner: React.FC<Props> = ({
           title="新会话（清空上下文，同目录）"
           onClick={handleCompact}
         />
+        {onAdjustFontSize && (
+          <div style={{ display: 'inline-flex', alignItems: 'center', gap: 2, marginLeft: 2 }}
+            title={`对话字号${fontSize ? ` ${fontSize}px` : ''}（A− / A+ 调整，全局生效）`}>
+            <ToolbarBtn icon="A−" title="缩小对话字号" onClick={() => onAdjustFontSize(-1)} />
+            <ToolbarBtn icon="A+" title="放大对话字号" onClick={() => onAdjustFontSize(1)} />
+          </div>
+        )}
         {/* 截图按钮:桌面端独有,浏览器无法调起系统截图工具 */}
         {isTauri() && (
           <ToolbarBtn

@@ -69,6 +69,8 @@ export interface ChatPaneProps {
   onToast?: (type: 'success' | 'error' | 'info', message: string) => void;
   // 流式状态变化回调,App 用来聚合所有 pane 的 streaming 状态
   onStreamingChange?: (sessionId: string, streaming: boolean) => void;
+  // 对话字号步进(全局 config.fontSize),由 App 注入
+  onAdjustFontSize?: (delta: number) => void;
   // 全局工具(由 App 注入,放在输入框正上方,避免顶栏拥挤)
   layoutLabel?: string;
   onCycleLayout?: () => void;
@@ -86,6 +88,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
   isMobile,
   onRequestNewSession,
   onStreamingChange,
+  onAdjustFontSize,
   layoutLabel,
   onCycleLayout,
   onOpenSync,
@@ -657,6 +660,8 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
         sandboxEnabled={sandboxEnabled}
         onSandboxChange={handleSandboxChange}
         onCompact={handleCompact}
+        fontSize={config.fontSize}
+        onAdjustFontSize={onAdjustFontSize}
         isFocused={isFocused}
       />
 
@@ -669,6 +674,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
             style={byTheWayFab}
           >💬</button>
           <ByTheWayDrawer sessionId={sessionId} open={byTheWayOpen} onClose={() => setByTheWayOpen(false)}
+            backends={backends}
             onSendToChat={(text) => { if (!chat.isStreaming) chat.doSend(text); }} />
         </>
       )}

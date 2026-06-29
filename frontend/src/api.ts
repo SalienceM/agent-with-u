@@ -74,7 +74,7 @@ type SeqtaskUpdatedCallback = (data: { sessionId: string; seqTasks: any[]; seqAu
 let seqtaskUpdatedCallbacks: SeqtaskUpdatedCallback[] = [];
 type ChatAsideDeltaCallback = (data: { sessionId: string; turnId: string; text: string }) => void;
 let chatAsideDeltaCallbacks: ChatAsideDeltaCallback[] = [];
-type ChatAsideUpdatedCallback = (data: { sessionId: string; asides: any[] }) => void;
+type ChatAsideUpdatedCallback = (data: { sessionId: string; asides: any[]; asideBackendId?: string }) => void;
 let chatAsideUpdatedCallbacks: ChatAsideUpdatedCallback[] = [];
 
 type SttStreamEndCallback = (data: { reason: string }) => void;
@@ -823,9 +823,13 @@ export const api = {
     const result = await call('chatAsk', sessionId, question, imagesJson);
     try { return JSON.parse(result); } catch { return { status: 'error', message: '响应解析失败' }; }
   },
-  async chatAsideList(sessionId: string): Promise<{ status: string; asides: any[] }> {
+  async chatAsideList(sessionId: string): Promise<{ status: string; asides: any[]; asideBackendId?: string }> {
     const result = await call('chatAsideList', sessionId);
     try { return JSON.parse(result); } catch { return { status: 'error', asides: [] }; }
+  },
+  async chatAsideSetBackend(sessionId: string, backendId: string): Promise<{ status: string; asideBackendId?: string }> {
+    const result = await call('chatAsideSetBackend', sessionId, backendId || '');
+    try { return JSON.parse(result); } catch { return { status: 'error' }; }
   },
   onChatAsideDelta(cb: ChatAsideDeltaCallback): () => void {
     chatAsideDeltaCallbacks.push(cb);
@@ -1406,7 +1410,8 @@ function mockDispatch(method: string, params: any[]): any {
     case 'seqtaskRemove': case 'seqtaskSetAuto': return JSON.stringify({ status: 'ok' });
     case 'seqtaskTakeNext': return JSON.stringify({ status: 'ok', task: null });
     case 'chatAsk': return JSON.stringify({ status: 'error', message: 'mock mode' });
-    case 'chatAsideList': return JSON.stringify({ status: 'ok', asides: [] });
+    case 'chatAsideList': return JSON.stringify({ status: 'ok', asides: [], asideBackendId: '' });
+    case 'chatAsideSetBackend': return JSON.stringify({ status: 'ok', asideBackendId: params[1] || '' });
     case 'listSessions': return '[]';
     case 'listConnectedClients': return '[]';
     case 'loadSession': return 'null';

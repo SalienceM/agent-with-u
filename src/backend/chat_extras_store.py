@@ -107,6 +107,7 @@ class ChatExtras:
     seq_tasks: list[SeqTask] = field(default_factory=list)
     seq_auto: bool = False
     asides: list[ChatAside] = field(default_factory=list)
+    aside_backend_id: str = ""   # by-the-way 专用 backend（空=跟随会话 backend）
     created_at: float = field(default_factory=_now)
     updated_at: float = field(default_factory=_now)
 
@@ -119,6 +120,7 @@ class ChatExtras:
             "seqTasks": [t.to_dict() for t in self.seq_tasks],
             "seqAuto": self.seq_auto,
             "asides": [a.to_dict() for a in self.asides],
+            "asideBackendId": self.aside_backend_id,
             "createdAt": self.created_at,
             "updatedAt": self.updated_at,
         }
@@ -130,6 +132,7 @@ class ChatExtras:
             seq_tasks=[SeqTask.from_dict(x) for x in d.get("seqTasks", [])],
             seq_auto=bool(d.get("seqAuto", False)),
             asides=[ChatAside.from_dict(x) for x in d.get("asides", [])],
+            aside_backend_id=d.get("asideBackendId", "") or "",
             created_at=d.get("createdAt", _now()),
             updated_at=d.get("updatedAt", _now()),
         )

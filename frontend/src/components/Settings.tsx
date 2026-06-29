@@ -132,8 +132,8 @@ export const Settings: React.FC<SettingsProps> = ({
           <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
             <input
               type="range"
-              min={12}
-              max={20}
+              min={11}
+              max={28}
               value={config.fontSize}
               onChange={(e) => onConfigChange({ fontSize: Number(e.target.value) })}
               style={{ flex: 1, accentColor: 'var(--theme-accent)' }}

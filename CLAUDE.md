@@ -445,14 +445,21 @@ streaming saves. A process-level cache (`_chat_extras` / `_chat_extras_get` /
   read-only digest of the **last few chat messages** (`_chat_context_digest`), so it
   has context but never pollutes the main thread or enters the transcript. `chatAsk`
   streams via `chatAsideDelta` and persists answers as `asides` (full-state
-  `chatAsideUpdated`). Mirrors the loop `loopAsk`/`_run_aside` design. Each finished
+  `chatAsideUpdated`). The drawer has a **旁路模型 selector** (`chatAsideSetBackend`,
+  persisted as `ChatExtras.aside_backend_id`, empty = follow session) so the side Q&A
+  can run on a different / heterogeneous backend than the main chat — safe because it
+  is always an independent context. Mirrors the loop `loopAsk`/`_run_aside` design. Each finished
   answer carries two one-click actions — **加入序列任务** (`seqtaskAdd`) and **发送到
   主对话** (`onSendToChat` → main `doSend`) — to bring an aside conclusion back into
   the main flow.
 
 Side RPCs: `seqtaskGet`, `seqtaskAdd`, `seqtaskEdit`, `seqtaskRemove`,
 `seqtaskReorder`, `seqtaskSetAuto`, `seqtaskTakeNext`, `seqtaskClear`, `chatAsk`,
-`chatAsideList`. The chat-extras file is cleaned up on `deleteSession`.
+`chatAsideList`, `chatAsideSetBackend`. The chat-extras file is cleaned up on `deleteSession`.
+
+**Conversation font size** is a global `config.fontSize` (`useConfig`, applied in
+`MessageBubble`): a Settings slider (11–28px) plus inline **A− / A+** steppers in the
+`ChatInput` toolbar (`onAdjustFontSize` → App `updateConfig`, clamped 11–28).
 
 ### Slash Commands
 
