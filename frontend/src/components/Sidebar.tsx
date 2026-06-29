@@ -9,6 +9,10 @@ interface Session {
   workingDir: string;
   backendId: string;
   abilities?: { skills: string[]; prompts: string[] };
+  // ★ session 级执行节点归属（由 api.listSessions 合并时注入）
+  execLabel?: string;
+  execMode?: 'local' | 'relay';
+  execIsHome?: boolean;
 }
 
 interface Backend {
@@ -416,6 +420,12 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
                 {s.messageCount} msgs
               </span>
               <div style={{ display: 'flex', gap: 4, alignItems: 'center' }}>
+                {/* ★ 远端执行节点标记:本机会话不显示,避免单机用户看到无谓徽标 */}
+                {s.execIsHome === false && s.execLabel && (
+                  <span style={execBadgeStyle} title={`执行节点：${s.execLabel}`}>
+                    🌐 {s.execLabel}
+                  </span>
+                )}
                 {/* Backend name badge */}
                 <span
                   style={{
@@ -853,6 +863,20 @@ const renameInputStyle: React.CSSProperties = {
   padding: '2px 6px',
   outline: 'none',
   boxShadow: '0 0 0 2px var(--theme-accent-bg, rgba(122,162,247,0.15))',
+};
+
+const execBadgeStyle: React.CSSProperties = {
+  fontSize: 9,
+  padding: '2px 6px',
+  borderRadius: 4,
+  fontWeight: 600,
+  color: 'var(--theme-accent, #0969da)',
+  background: 'var(--theme-accent-bg, #0969da1a)',
+  border: '1px solid var(--theme-accent, #0969da)',
+  maxWidth: 96,
+  overflow: 'hidden',
+  textOverflow: 'ellipsis',
+  whiteSpace: 'nowrap',
 };
 
 const backendBadgeStyle: React.CSSProperties = {

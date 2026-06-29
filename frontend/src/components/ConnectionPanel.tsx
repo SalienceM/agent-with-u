@@ -3,6 +3,8 @@ import {
   getConnectionTarget, setConnectionTarget, listRelayDevices,
   isTauri, getDesktopConfig, setDesktopConfig, type DesktopConfig,
   api, type ConnectedClient,
+  getExecutors, addExecRoster, removeExecRoster, onExecStatus,
+  type ExecutorInfo,
 } from '../api';
 import {
   listRelayProfiles, saveRelayProfile, deleteRelayProfile,
@@ -52,6 +54,19 @@ export const ConnectionPanel: React.FC<ConnectionPanelProps> = ({ onClose }) => 
 
   // 「正在连接本机的 UI」实时列表
   const [clients, setClients] = useState<ConnectedClient[]>([]);
+
+  // ── 可分配执行节点（session 级模式）：home + 额外节点，新建会话时可选 ──
+  const [executors, setExecutors] = useState<ExecutorInfo[]>(() => getExecutors());
+  useEffect(() => onExecStatus(() => setExecutors(getExecutors())), []);
+
+  // 把卡片 B 当前填好的中继 + 选中节点加入「可分配执行节点」（不切换 home）。
+  const addSelectedAsExecutor = useCallback(() => {
+    if (!url.trim()) { setErr('请先填写中继地址'); return; }
+    if (!deviceId) { setErr('请先刷新并选择一个执行节点'); return; }
+    const dev = devices.find((d) => d.id === deviceId);
+    addExecRoster({ mode: 'relay', url: url.trim(), token: token.trim(), deviceId, deviceName: dev?.name });
+    setErr('');
+  }, [url, token, deviceId, devices]);
 
   // ── Relay 预设列表(localStorage 持久化) ──
   const [profiles, setProfiles] = useState<RelayProfile[]>(() => listRelayProfiles());
@@ -238,6 +253,55 @@ export const ConnectionPanel: React.FC<ConnectionPanelProps> = ({ onClose }) => 
             </ul>
           )}
         </div>
+
+        {/* ════ 可分配执行节点（session 级模式管理）════════════════════
+            home 节点(下面卡片 B 选的那台)是新建会话的默认落点;在这里额外加入
+            的远端节点会与 home 同时在线,新建会话时可逐会话选择它执行。这样
+            「某些会话本机自执行,某些走远端」就成了每会话的选择,而非整窗口的
+            系统级开关。 */}
+        {executors.length > 1 && (
+          <div style={cardStyle}>
+            <div style={cardTitleStyle}>
+              {tauri && <span style={cardBadgeStyle}>★</span>}
+              <span>可分配执行节点</span>
+              <span style={cardSubtitleStyle}>新建会话时逐个选择</span>
+            </div>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+              {executors.map((ex) => (
+                <div key={ex.key} style={execRowStyle}>
+                  <span style={{
+                    width: 8, height: 8, borderRadius: '50%', flexShrink: 0,
+                    background: ex.connected ? '#22c55e' : '#9ca3af',
+                  }} />
+                  <span style={{ fontWeight: 600, color: 'var(--theme-text)' }}>
+                    {ex.mode === 'local' ? ex.label : `🌐 ${ex.label}`}
+                  </span>
+                  {ex.isHome && (
+                    <span style={{
+                      fontSize: 10, padding: '1px 6px', borderRadius: 8,
+                      background: 'var(--theme-accent-bg)', color: 'var(--theme-accent)',
+                    }}>home · 默认</span>
+                  )}
+                  <span style={{ fontSize: 11, color: 'var(--theme-text-muted)' }}>
+                    {ex.connected ? '在线' : '离线'}
+                  </span>
+                  <div style={{ flex: 1 }} />
+                  {!ex.isHome && (
+                    <button
+                      onClick={() => removeExecRoster(ex.key)}
+                      style={{
+                        fontSize: 11, padding: '2px 8px', borderRadius: 6,
+                        border: '1px solid var(--theme-border)', background: 'transparent',
+                        color: 'var(--theme-text-muted)', cursor: 'pointer',
+                      }}
+                      title="从可分配列表移除（不影响已建会话）"
+                    >移除</button>
+                  )}
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
 
         {/* ════ 卡片 A：本机角色（仅 Tauri） ════════════════════════ */}
         {tauri && (
@@ -443,6 +507,11 @@ export const ConnectionPanel: React.FC<ConnectionPanelProps> = ({ onClose }) => 
                         </button>
                       ))}
                     </div>
+                    {/* 把所选节点加入「可分配执行节点」——不切换 home,只是让新建
+                        会话时多一个可选的执行节点(session 级)。 */}
+                    <button onClick={addSelectedAsExecutor} style={{ ...refreshBtnStyle, marginTop: 8 }}>
+                      ➕ 加入可分配执行节点（新建会话时可选）
+                    </button>
                   </div>
                 )}
               </div>
@@ -590,6 +659,13 @@ const cardSubtitleStyle: React.CSSProperties = {
 
 const hintStyle: React.CSSProperties = {
   fontSize: 12, color: 'var(--theme-text-muted)', lineHeight: 1.6,
+};
+
+const execRowStyle: React.CSSProperties = {
+  display: 'flex', alignItems: 'center', gap: 8,
+  padding: '6px 8px', borderRadius: 6,
+  background: 'var(--theme-bg-tertiary)',
+  fontSize: 12,
 };
 
 const connectedBoxStyle: React.CSSProperties = {

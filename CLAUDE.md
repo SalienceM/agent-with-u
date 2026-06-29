@@ -540,3 +540,56 @@ The Tauri desktop app (`src-tauri/`) can run in two roles, persisted in
 The role is edited in the in-app "连接" panel (`ConnectionPanel.tsx`);
 changes take effect on app restart. Tauri commands: `get_desktop_config`,
 `set_desktop_config`.
+
+### Session-level execution node (连接池, 每会话归属执行节点)
+
+Execution location used to be **system-level**: the whole UI window pointed at
+one executor via a single global `connectionTarget` in `frontend/src/api.ts`
+(`{mode:'local'}` or `{mode:'relay', url, token, deviceId}`), so every session
+ran on that one node. It is now **per-session**: some sessions self-execute on
+the local machine (本机自执行), some run on a remote relay executor (远端) — chosen
+at creation, fixed afterward.
+
+This is a **frontend-only** change — sessions physically live on the executor
+they were created on, so "which connection a session was listed from" *is* its
+ownership; no backend/`session_store` change is needed. The design:
+
+- **Connection pool** (`api.ts`): a `Conn` per executor key (`local` /
+  `relay:<deviceId>`), each self-managing relay handshake + heartbeat + backoff
+  reconnect, all dispatching push events (streamDelta/loop/seqtask/…) to the
+  same shared callbacks (events are `sessionId`-keyed, so multiple nodes coexist).
+  A single global `pending` map (ids globally unique via `nextId`) plus a
+  `pendingConn` side-map so a dropped connection only rejects *its own* in-flight
+  requests.
+- **home node** = `connectionTarget` (本机 or a relay node): the default landing
+  spot for new sessions and the connection that gates App's "backend ready" state
+  (existing behavior preserved). Set via `setConnectionTarget` (ConnectionPanel
+  card B). **Roster** = extra relay nodes the user adds (`addExecRoster` /
+  `removeExecRoster`, persisted at `localStorage['awu.execRoster']`); they stay
+  online alongside home. With an empty roster there is exactly one connection =
+  full backward compatibility.
+- **Routing**: `routeConn(method, params)` resolves a session's node from
+  `sessionExec` (`sessionId → conn.key`, persisted at
+  `localStorage['awu.sessionExec']`). Most session-scoped RPCs take `sessionId`
+  as the first arg (auto-detected: a first-arg string that is a known session id —
+  UUIDs don't collide); the few that bury it in a JSON payload are listed in
+  `JSON_SESSION_METHODS` (`sendMessage`/`executeCommand`/`migrateSession`), plus
+  `sttRefine` (2nd arg). Everything else (registry/global RPCs, STT stream) goes
+  to home.
+- **Session list** (`api.listSessions`) queries every pooled node in parallel,
+  merges, refreshes the routing map, and tags each session with
+  `execKey/execLabel/execMode/execIsHome`. Both App and Sidebar consume the
+  merged list unchanged.
+- **createSession(workingDir, backendId, sessionType, execKey?)** routes creation
+  to the chosen node and records ownership; **getBackends(execKey?)** can fetch a
+  specific node's backend list (the new-session model dropdown follows the picked
+  node).
+
+UI surfaces (config UX kept minimal — invisible to single-node users):
+- `NewSessionDialog` shows an **执行节点 picker** only when `getExecutors()` has
+  >1 entry (defaults to home).
+- `Sidebar` shows a small 🌐 node badge **only on non-home sessions**.
+- `ConnectionPanel` gains a **可分配执行节点** card (online dot + home tag +
+  remove) and an "➕ 加入可分配执行节点" button in the relay device list to add the
+  selected node to the roster without switching home.
+- `getExecutors()` / `onExecStatus()` expose the live node list + status to the UI.

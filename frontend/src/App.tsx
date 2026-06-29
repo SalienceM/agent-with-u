@@ -1,5 +1,5 @@
 import React, { useState, useCallback, useEffect, useRef } from 'react';
-import { api, isTauri } from './api';
+import { api, isTauri, getExecutors, onExecStatus, getHomeExecKey, type ExecutorInfo } from './api';
 import {
   HOTKEY_CHANGED_EVENT,
   readScreenshotHotkey,
@@ -346,8 +346,8 @@ export const App: React.FC = () => {
     setNewSessionDialogOpen(true);
   }, []);
 
-  const handleCreateSession = useCallback(async (workingDir: string, backendId: string, sessionType: 'normal' | 'loop' = 'normal', loopPolicy?: any) => {
-    const session = await api.createSession(workingDir, backendId, sessionType);
+  const handleCreateSession = useCallback(async (workingDir: string, backendId: string, sessionType: 'normal' | 'loop' = 'normal', loopPolicy?: any, execKey?: string) => {
+    const session = await api.createSession(workingDir, backendId, sessionType, execKey);
     // ★ Loop 会话：把建会话时编辑的策略与心智落到 stage 文件
     if (sessionType === 'loop' && loopPolicy) {
       api.loopSetPolicy(session.id, loopPolicy).catch(() => {});
@@ -1229,7 +1229,7 @@ function formatBackendLabel(backend: any): string {
 interface NewSessionDialogProps {
   backends: any[];
   onClose: () => void;
-  onCreate: (workingDir: string, backendId: string, sessionType: 'normal' | 'loop', loopPolicy?: LoopPolicy) => void;
+  onCreate: (workingDir: string, backendId: string, sessionType: 'normal' | 'loop', loopPolicy?: LoopPolicy, execKey?: string) => void;
 }
 
 const NewSessionDialog: React.FC<NewSessionDialogProps> = ({
@@ -1239,20 +1239,42 @@ const NewSessionDialog: React.FC<NewSessionDialogProps> = ({
 }) => {
   // 留空 = 后端自动生成按时间命名的默认目录（放在日志目录同级）
   const [workingDir, setWorkingDir] = useState('');
-  const [selectedBackendId, setSelectedBackendId] = useState(
-    backends[0]?.id || 'claude-agent-sdk-default'
-  );
   const [sessionType, setSessionType] = useState<'normal' | 'loop'>('normal');
   const [dirPickerOpen, setDirPickerOpen] = useState(false);
   const [loopPolicy, setLoopPolicy] = useState<LoopPolicy>(DEFAULT_POLICY);
   const [policyOpen, setPolicyOpen] = useState(false);
   const isAutoDir = !workingDir.trim() || workingDir.trim() === '.';
 
+  // ── 执行节点（session 级模式管理）：默认落在 home;有额外节点时可选 ──
+  const [executors, setExecutors] = useState<ExecutorInfo[]>(() => getExecutors());
+  const [execKey, setExecKey] = useState<string>(() => getHomeExecKey());
+  useEffect(() => onExecStatus(() => setExecutors(getExecutors())), []);
+  const isHomeExec = execKey === getHomeExecKey();
+
+  // 选中的执行节点对应的后端列表:home 直接用上层传入,远端则按需拉取。
+  const [execBackends, setExecBackends] = useState<any[]>(backends);
+  useEffect(() => {
+    let cancelled = false;
+    if (isHomeExec) { setExecBackends(backends); return; }
+    api.getBackends(execKey).then((list) => { if (!cancelled) setExecBackends(list || []); });
+    return () => { cancelled = true; };
+  }, [execKey, isHomeExec, backends]);
+
+  const [selectedBackendId, setSelectedBackendId] = useState(
+    backends[0]?.id || 'claude-agent-sdk-default'
+  );
+  // 切换执行节点后,若原先选的后端在新节点不存在,回退到新节点的第一个。
+  useEffect(() => {
+    if (execBackends.length && !execBackends.some((b) => b.id === selectedBackendId)) {
+      setSelectedBackendId(execBackends[0].id);
+    }
+  }, [execBackends]); // eslint-disable-line react-hooks/exhaustive-deps
+
   const handleCreate = useCallback(async () => {
     // 空值交给后端补一个时间戳目录
     await onCreate(workingDir.trim() || '', selectedBackendId, sessionType,
-      sessionType === 'loop' ? normalizePolicy(loopPolicy) : undefined);
-  }, [workingDir, selectedBackendId, sessionType, loopPolicy, onCreate]);
+      sessionType === 'loop' ? normalizePolicy(loopPolicy) : undefined, execKey);
+  }, [workingDir, selectedBackendId, sessionType, loopPolicy, execKey, onCreate]);
 
   const handleBrowse = useCallback(async () => {
     // Tauri 桌面端：用系统原生目录对话框（选本机 = 服务器同机）。
@@ -1333,6 +1355,47 @@ const NewSessionDialog: React.FC<NewSessionDialogProps> = ({
           </div>
         )}
 
+        {/* ★ 执行节点：本会话在哪台机器上执行(本机自执行 / 远端节点)。
+            只有配置了额外执行节点时才出现,单机用户无感(不臃肿)。 */}
+        {executors.length > 1 && (
+          <div style={formGroupStyle}>
+            <label style={labelStyle}>执行节点 / Runs on:</label>
+            <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+              {executors.map((ex) => {
+                const active = ex.key === execKey;
+                return (
+                  <button
+                    key={ex.key}
+                    onClick={() => setExecKey(ex.key)}
+                    title={ex.connected ? '在线' : '离线 — 该节点暂不可达'}
+                    style={{
+                      flex: '1 1 auto', minWidth: 120, textAlign: 'left',
+                      padding: '8px 10px', borderRadius: 8, cursor: 'pointer',
+                      background: active ? 'var(--theme-accent-bg, #0969da1a)' : 'var(--theme-bg-tertiary, #f6f8fa)',
+                      border: `1px solid ${active ? 'var(--theme-accent, #0969da)' : 'var(--theme-border, rgba(0,0,0,0.12))'}`,
+                      color: 'var(--theme-text, #1f2328)',
+                    }}
+                  >
+                    <div style={{ fontSize: 13, fontWeight: 600, display: 'flex', alignItems: 'center', gap: 6 }}>
+                      <span style={{
+                        width: 7, height: 7, borderRadius: '50%', flexShrink: 0,
+                        background: ex.connected ? '#22c55e' : '#9ca3af',
+                      }} />
+                      {ex.mode === 'local' ? ex.label : `🌐 ${ex.label}`}
+                    </div>
+                    <div style={{ fontSize: 11, color: 'var(--theme-text-muted, #656d76)', marginTop: 2 }}>
+                      {ex.isHome ? '默认 · 本地直连' : '远端执行节点'}
+                    </div>
+                  </button>
+                );
+              })}
+            </div>
+            <span style={helpTextStyle}>
+              会话建好后归属固定。工作目录与模型均取自所选节点。
+            </span>
+          </div>
+        )}
+
         <div style={formGroupStyle}>
           <label style={labelStyle}>Working Directory:</label>
           <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
@@ -1362,7 +1425,7 @@ const NewSessionDialog: React.FC<NewSessionDialogProps> = ({
               onChange={(e) => setSelectedBackendId(e.target.value)}
               style={selectStyle}
             >
-              {backends.map((b) => (
+              {execBackends.map((b) => (
                 <option key={b.id} value={b.id}>
                   {b.label}
                 </option>

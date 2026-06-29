@@ -43,8 +43,6 @@ export interface SkillInfo {
 const WS_PORT_DEFAULT = 44321;
 const WS_CONNECT_TIMEOUT_MS = 3000;
 
-let ws: WebSocket | null = null;
-let wsReady: Promise<void>;
 let useMock = false;
 
 type ConnectionStatusCallback = (connected: boolean) => void;
@@ -153,6 +151,21 @@ export function getConnectionTarget(): ConnectionTarget {
   return connectionTarget;
 }
 
+// ── 执行节点（session 级模式管理）─────────────────────────────────────
+// 一个执行节点就是一个连接目标(ExecTarget == ConnectionTarget)。home 节点由
+// connectionTarget 决定(本机 / 某中继);额外节点存在 execRoster 里。每个 session
+// 归属一个节点,新建时选定、之后固定。
+export type ExecTarget = ConnectionTarget;
+
+/** 供 UI 展示的执行节点摘要。 */
+export interface ExecutorInfo {
+  key: string;          // 稳定键:'local' | `relay:<deviceId>`
+  label: string;        // 人类可读名
+  mode: 'local' | 'relay';
+  isHome: boolean;      // 是否为当前 home(新建会话的默认落点)
+  connected: boolean;   // 连接是否在线
+}
+
 /** 临时连一次中继、拉取在线执行节点列表，然后关闭。 */
 export function listRelayDevices(
   url: string, token: string,
@@ -219,22 +232,12 @@ export function httpApiBase(httpPort: number): string {
   return ''; // 相对当前 origin，反代把 /api/ 转发到后端
 }
 
-let wsUrl = `ws://127.0.0.1:${WS_PORT_DEFAULT}`;
-let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 const INITIAL_RECONNECT_DELAY = 300; // 启动/断线后首次重试更快，后端一就绪就尽快连上（少白屏）
-let reconnectDelay = INITIAL_RECONNECT_DELAY; // 指数退避：0.3s → 0.6s → … 最大 30s
 const MAX_RECONNECT_DELAY = 30000;
-let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
 const HEARTBEAT_INTERVAL_MS = 25000; // 每 25 秒发送一次心跳 ping
 
-function scheduleReconnect() {
-  if (reconnectTimer !== null) return; // 已有排队，不重复
-  reconnectTimer = setTimeout(() => {
-    reconnectTimer = null;
-    doConnect(wsUrl);
-  }, reconnectDelay);
-  reconnectDelay = Math.min(reconnectDelay * 2, MAX_RECONNECT_DELAY);
-}
+// id → 该请求挂在哪条连接上(连接断开时只 reject 属于它的挂起请求,不误伤别的节点)
+const pendingConn = new Map<string, string>();
 
 function handleMessage(e: MessageEvent) {
   if (typeof e.data !== 'string') return;
@@ -243,6 +246,7 @@ function handleMessage(e: MessageEvent) {
     if (msg.id !== undefined && pending.has(msg.id)) {
       const { resolve, reject } = pending.get(msg.id)!;
       pending.delete(msg.id);
+      pendingConn.delete(msg.id);
       if (msg.error !== undefined) {
         reject(new Error(typeof msg.error === 'string' ? msg.error : JSON.stringify(msg.error)));
       } else {
@@ -293,103 +297,354 @@ function handleMessage(e: MessageEvent) {
   }
 }
 
-/**
- * 建立一次 WebSocket 连接。
- * onSettled 在首次 open/close/error 时回调一次（用于 wsReady 的 resolve）。
- */
-function doConnect(url: string, onSettled?: () => void) {
-  const socket = new WebSocket(url);
-  let settled = false;
-  let wasCurrent = false; // 本 socket 是否曾被设为 ws（即握手成功过）
-  const settle = () => { if (!settled) { settled = true; onSettled?.(); } };
-  // ★ 经中继连接时，WS 打开后还要先完成 hello/ready 握手才算连上
-  const target = connectionTarget;
-  let relayHandshake = target.mode === 'relay';
+// ═══════════════════════════════════════════════════════════════════
+//  连接池（session 级执行节点）
+//
+//  原本「本 UI 连接到哪台执行节点」是系统级的单一连接——整窗口所有 session 都
+//  跑在同一台节点上。现在改成 session 级：
+//    · home 节点 = connectionTarget（本机 / 某中继节点）：新建会话的默认落点,
+//      也是 App 启动时判定「后端是否就绪」的那条连接(行为保持不变)。
+//    · 额外节点 = execRoster（用户额外加入的中继节点）,与 home 同时在线。
+//  每条连接 = 一个 Conn;session→节点的归属记在 sessionExec 里,按 sessionId 把
+//  RPC 路由到对应连接。会话物理上就存在于它所在的节点——「它从哪条连接列出来」
+//  即它的归属,所以后端无需任何改动。roster 为空时只有一条 home 连接,完全等价
+//  于改造前的单连接行为(向后兼容)。
+// ═══════════════════════════════════════════════════════════════════
 
-  const finishConnect = () => {
-    ws = socket;
-    wasCurrent = true;
-    useMock = false;
-    reconnectDelay = INITIAL_RECONNECT_DELAY; // 成功后重置退避
-    if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
-    console.log(`[api] Connected to ${url}`);
-    connectionStatusCallbacks.forEach((cb) => cb(true));
-    // ★ 启动心跳定时器：定期发送 RPC ping 保持连接活跃
-    if (heartbeatTimer) clearInterval(heartbeatTimer);
-    heartbeatTimer = setInterval(() => {
-      if (ws && ws.readyState === WebSocket.OPEN) {
-        const id = nextId();
-        // fire-and-forget ping，不注册 pending（丢失也无所谓）
-        try { ws.send(JSON.stringify({ id, method: 'ping', params: [] })); } catch { /* */ }
-      }
-    }, HEARTBEAT_INTERVAL_MS);
-    settle();
-  };
-
-  socket.onopen = () => {
-    if (relayHandshake && target.mode === 'relay') {
-      // 发起中继握手，等待 {t:'ready'} 才算连上
-      try {
-        socket.send(JSON.stringify({
-          t: 'hello', token: target.token, deviceId: target.deviceId,
-        }));
-      } catch { /* */ }
-    } else {
-      finishConnect();
-    }
-  };
-
-  // onerror 之后一定会触发 onclose，在 onclose 里统一处理
-  socket.onerror = () => settle();
-
-  socket.onmessage = (e) => {
-    if (relayHandshake) {
-      if (typeof e.data !== 'string') return;
-      try {
-        const m = JSON.parse(e.data);
-        if (m.t === 'ready') {
-          relayHandshake = false;
-          finishConnect();
-        } else if (m.t === 'error') {
-          console.error('[api] relay rejected:', m.message);
-          try { socket.close(); } catch { /* */ }
-        }
-      } catch { /* ignore non-handshake frames */ }
-      return;
-    }
-    handleMessage(e);
-  };
-
-  socket.onclose = () => {
-    if (wasCurrent && ws === socket) {
-      ws = null;
-      // ★ 停止心跳
-      if (heartbeatTimer) { clearInterval(heartbeatTimer); heartbeatTimer = null; }
-      // ★ 连接断开时 reject 所有挂起请求，让调用方能区分连接错误和正常 null 响应
-      pending.forEach(({ reject }) => reject(new Error('WebSocket connection lost')));
-      pending.clear();
-      connectionStatusCallbacks.forEach((cb) => cb(false));
-    } else if (!wasCurrent) {
-      // 本 socket 从未握手成功（例如首次连接就 502）。通知 UI 进入未连接状态，
-      // 否则 App 的「正在连接后端...」加载页会一直卡住，用户无法进入「连接」面板。
-      connectionStatusCallbacks.forEach((cb) => cb(false));
-    }
-    settle();
-    scheduleReconnect(); // 断线后自动重连
-  };
+function execTargetKey(t: ExecTarget): string {
+  return t.mode === 'local' ? 'local' : `relay:${t.deviceId}`;
 }
 
-/** 切换连接目标（本地直连 / 中继远程），持久化并立即重连。 */
+function execLabelOf(t: ExecTarget): string {
+  if (t.mode === 'local') return '🏠 本机';
+  return (t.deviceName && t.deviceName.trim()) || t.deviceId || '远端节点';
+}
+
+/** 单条到某执行节点的连接：自管握手 / 心跳 / 指数退避重连。 */
+class Conn {
+  readonly key: string;
+  target: ExecTarget;
+  isHome: boolean;
+  ws: WebSocket | null = null;
+  ready: Promise<void>;
+  private settleReady: () => void = () => {};
+  private settled = false;
+  private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  private reconnectDelay = INITIAL_RECONNECT_DELAY;
+  private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
+  private disposed = false;
+
+  constructor(key: string, target: ExecTarget, isHome: boolean) {
+    this.key = key;
+    this.target = target;
+    this.isHome = isHome;
+    this.ready = new Promise<void>((resolve) => {
+      this.settleReady = () => { if (!this.settled) { this.settled = true; resolve(); } };
+    });
+  }
+
+  get label(): string { return execLabelOf(this.target); }
+  get isOpen(): boolean { return !!this.ws && this.ws.readyState === WebSocket.OPEN; }
+
+  private async resolveUrl(): Promise<string> {
+    // 本机节点的地址解析沿用原逻辑(tauri sidecar / dev / 反代);中继节点用自带 url。
+    return this.target.mode === 'relay' ? this.target.url : getWsUrl();
+  }
+
+  connect(): void {
+    if (this.disposed) return;
+    this.resolveUrl().then((url) => this.doConnect(url));
+  }
+
+  dispose(): void {
+    this.disposed = true;
+    if (this.reconnectTimer) { clearTimeout(this.reconnectTimer); this.reconnectTimer = null; }
+    if (this.heartbeatTimer) { clearInterval(this.heartbeatTimer); this.heartbeatTimer = null; }
+    const old = this.ws;
+    this.ws = null;
+    if (old) { try { old.close(); } catch { /* */ } }
+  }
+
+  private scheduleReconnect(): void {
+    if (this.disposed || this.reconnectTimer !== null) return;
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null;
+      this.resolveUrl().then((url) => this.doConnect(url));
+    }, this.reconnectDelay);
+    this.reconnectDelay = Math.min(this.reconnectDelay * 2, MAX_RECONNECT_DELAY);
+  }
+
+  private doConnect(url: string): void {
+    if (this.disposed) return;
+    const socket = new WebSocket(url);
+    let wasCurrent = false;
+    const target = this.target;
+    let relayHandshake = target.mode === 'relay';
+
+    const finishConnect = () => {
+      this.ws = socket;
+      wasCurrent = true;
+      this.reconnectDelay = INITIAL_RECONNECT_DELAY;
+      if (this.reconnectTimer) { clearTimeout(this.reconnectTimer); this.reconnectTimer = null; }
+      console.log(`[api] Connected to ${url} (${this.key})`);
+      if (this.isHome) {
+        useMock = false;
+        connectionStatusCallbacks.forEach((cb) => cb(true));
+      }
+      notifyExecStatus();
+      if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
+      this.heartbeatTimer = setInterval(() => {
+        if (this.isOpen) {
+          const id = nextId();
+          try { this.ws!.send(JSON.stringify({ id, method: 'ping', params: [] })); } catch { /* */ }
+        }
+      }, HEARTBEAT_INTERVAL_MS);
+      this.settleReady();
+    };
+
+    socket.onopen = () => {
+      if (relayHandshake && target.mode === 'relay') {
+        try {
+          socket.send(JSON.stringify({ t: 'hello', token: target.token, deviceId: target.deviceId }));
+        } catch { /* */ }
+      } else {
+        finishConnect();
+      }
+    };
+
+    socket.onerror = () => this.settleReady();
+
+    socket.onmessage = (e) => {
+      if (relayHandshake) {
+        if (typeof e.data !== 'string') return;
+        try {
+          const m = JSON.parse(e.data);
+          if (m.t === 'ready') { relayHandshake = false; finishConnect(); }
+          else if (m.t === 'error') {
+            console.error('[api] relay rejected:', m.message);
+            try { socket.close(); } catch { /* */ }
+          }
+        } catch { /* ignore non-handshake frames */ }
+        return;
+      }
+      handleMessage(e);
+    };
+
+    socket.onclose = () => {
+      if (wasCurrent && this.ws === socket) {
+        this.ws = null;
+        if (this.heartbeatTimer) { clearInterval(this.heartbeatTimer); this.heartbeatTimer = null; }
+        // 只 reject 挂在本连接上的请求,别的节点的请求不受影响。
+        pending.forEach((p, id) => {
+          if (pendingConn.get(id) === this.key) {
+            p.reject(new Error('WebSocket connection lost'));
+            pending.delete(id);
+            pendingConn.delete(id);
+          }
+        });
+        if (this.isHome) connectionStatusCallbacks.forEach((cb) => cb(false));
+      } else if (!wasCurrent && this.isHome) {
+        // home 从未握手成功(例如首次就 502)：通知 UI 进入未连接,避免启动页卡死。
+        connectionStatusCallbacks.forEach((cb) => cb(false));
+      }
+      notifyExecStatus();
+      this.settleReady();
+      this.scheduleReconnect();
+    };
+  }
+
+  /** 发起一次 RPC。home 离线时回落 mock(保持旧行为);其它节点离线则丢弃返回 null。 */
+  async request(method: string, params: any[]): Promise<any> {
+    await this.ready;
+    if (!this.isOpen) {
+      if (this.isHome) return mockDispatch(method, params);
+      console.warn(`[api] exec node ${this.key} offline, "${method}" dropped`);
+      return null;
+    }
+    return await new Promise((resolve, reject) => {
+      const id = nextId();
+      pending.set(id, { resolve, reject });
+      pendingConn.set(id, this.key);
+      try {
+        this.ws!.send(JSON.stringify({ id, method, params }));
+      } catch (e) {
+        pending.delete(id);
+        pendingConn.delete(id);
+        reject(e as Error);
+      }
+    });
+  }
+
+  /** fire-and-forget。 */
+  async sendRaw(method: string, params: any[]): Promise<void> {
+    await this.ready;
+    if (!this.isOpen) {
+      if (this.isHome) mockDispatch(method, params);
+      return;
+    }
+    const id = nextId();
+    try { this.ws!.send(JSON.stringify({ id, method, params })); } catch { /* */ }
+  }
+}
+
+// ── 池 + 路由 ────────────────────────────────────────────────────────
+const pool = new Map<string, Conn>();
+let homeConn!: Conn;  // initPool() 在模块加载时立即赋值
+const sessionExec = new Map<string, string>();   // sessionId → conn.key
+let execStatusCallbacks: (() => void)[] = [];
+
+function notifyExecStatus(): void { execStatusCallbacks.forEach((cb) => cb()); }
+
+const SESSION_EXEC_KEY = 'awu.sessionExec';
+function loadSessionExec(): void {
+  try {
+    const raw = localStorage.getItem(SESSION_EXEC_KEY);
+    if (raw) { const o = JSON.parse(raw); if (o && typeof o === 'object') for (const k of Object.keys(o)) sessionExec.set(k, o[k]); }
+  } catch { /* */ }
+}
+function persistSessionExec(): void {
+  try { localStorage.setItem(SESSION_EXEC_KEY, JSON.stringify(Object.fromEntries(sessionExec))); } catch { /* */ }
+}
+
+const EXEC_ROSTER_KEY = 'awu.execRoster';
+function loadExecRoster(): ExecTarget[] {
+  try {
+    const raw = localStorage.getItem(EXEC_ROSTER_KEY);
+    if (raw) {
+      const a = JSON.parse(raw);
+      if (Array.isArray(a)) return a.filter((t: any) => t && t.mode === 'relay' && t.url && t.deviceId);
+    }
+  } catch { /* */ }
+  return [];
+}
+function saveExecRoster(list: ExecTarget[]): void {
+  try { localStorage.setItem(EXEC_ROSTER_KEY, JSON.stringify(list)); } catch { /* */ }
+}
+
+function ensureConn(target: ExecTarget, isHome: boolean): Conn {
+  const key = execTargetKey(target);
+  let c = pool.get(key);
+  if (!c) {
+    c = new Conn(key, target, isHome);
+    pool.set(key, c);
+    c.connect();
+  } else if (isHome) {
+    c.isHome = true;
+    c.target = target;
+  }
+  return c;
+}
+
+function initPool(): void {
+  loadSessionExec();
+  homeConn = ensureConn(connectionTarget, true);
+  for (const t of loadExecRoster()) {
+    if (execTargetKey(t) !== homeConn.key) ensureConn(t, false);
+  }
+}
+
+// 大多数会话级 RPC 第一个参数就是 sessionId;少数把 sessionId 藏在 JSON 载荷里。
+const JSON_SESSION_METHODS: Record<string, string> = {
+  sendMessage: 'sessionId',
+  executeCommand: 'sessionId',
+  migrateSession: 'sourceSessionId',
+};
+function extractSessionId(method: string, params: any[]): string | null {
+  const field = JSON_SESSION_METHODS[method];
+  if (field) {
+    try { const o = JSON.parse(params[0]); if (o && typeof o[field] === 'string') return o[field]; } catch { /* */ }
+    return null;
+  }
+  if (method === 'sttRefine') return typeof params[1] === 'string' && params[1] ? params[1] : null;
+  // 约定:第一个参数若是已知会话 id,就路由到它的归属节点。session id 是 UUID,
+  // 不会和别的字符串参数撞,因此无需逐一枚举几十个会话级方法。
+  const p0 = params[0];
+  if (typeof p0 === 'string' && sessionExec.has(p0)) return p0;
+  return null;
+}
+
+function routeConn(method: string, params: any[]): Conn {
+  const sid = extractSessionId(method, params);
+  if (sid) {
+    const key = sessionExec.get(sid);
+    if (key) { const c = pool.get(key); if (c) return c; }
+  }
+  return homeConn;
+}
+
+/** 切换 home 执行节点（本地直连 / 中继远程），持久化并立即重连。 */
 export async function setConnectionTarget(t: ConnectionTarget): Promise<void> {
   connectionTarget = t;
   try { localStorage.setItem(CONN_TARGET_KEY, JSON.stringify(t)); } catch { /* */ }
-  if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
-  reconnectDelay = INITIAL_RECONNECT_DELAY;
-  wsUrl = await getWsUrl();
-  const old = ws;
-  ws = null; // 置空：旧 socket 的 onclose 不再做客户端清理
-  if (old) { try { old.close(); } catch { /* */ } }
-  doConnect(wsUrl);
+  const newKey = execTargetKey(t);
+  if (homeConn && homeConn.key === newKey) {
+    homeConn.isHome = true;
+    homeConn.target = t;
+    connectionStatusCallbacks.forEach((cb) => cb(homeConn.isOpen));
+    return;
+  }
+  const oldHome = homeConn;
+  let next = pool.get(newKey);
+  if (!next) {
+    next = new Conn(newKey, t, true);
+    pool.set(newKey, next);
+    next.connect();
+  } else {
+    next.isHome = true;
+    next.target = t;
+  }
+  homeConn = next;
+  if (oldHome && oldHome.key !== newKey) {
+    oldHome.isHome = false;
+    // 旧 home 若不在 roster 里则关闭;在 roster 里则降级为普通额外节点继续保留。
+    const inRoster = loadExecRoster().some((rt) => execTargetKey(rt) === oldHome.key);
+    if (!inRoster) { pool.delete(oldHome.key); oldHome.dispose(); }
+  }
+  connectionStatusCallbacks.forEach((cb) => cb(homeConn.isOpen));
+  notifyExecStatus();
+}
+
+// ── 执行节点 roster（供新建会话选择的可分配节点）────────────────────────
+/** 当前所有执行节点（home + 额外节点）的展示摘要。 */
+export function getExecutors(): ExecutorInfo[] {
+  const out: ExecutorInfo[] = [];
+  const seen = new Set<string>();
+  const push = (c: Conn) => {
+    if (seen.has(c.key)) return;
+    seen.add(c.key);
+    out.push({ key: c.key, label: c.label, mode: c.target.mode, isHome: c.isHome, connected: c.isOpen });
+  };
+  if (homeConn) push(homeConn);
+  for (const c of pool.values()) push(c);
+  return out;
+}
+
+/** 把一个中继执行节点加入 roster（与 home 同时在线，可在新建会话时选）。 */
+export function addExecRoster(t: ExecTarget): void {
+  if (t.mode !== 'relay') return;
+  const key = execTargetKey(t);
+  if (homeConn && key === homeConn.key) return; // 已是 home,无需重复加入
+  const list = loadExecRoster();
+  if (!list.some((x) => execTargetKey(x) === key)) { list.push(t); saveExecRoster(list); }
+  ensureConn(t, false);
+  notifyExecStatus();
+}
+
+/** 从 roster 移除一个额外节点（home 节点不可移除，请改用「连接」切换）。 */
+export function removeExecRoster(key: string): void {
+  saveExecRoster(loadExecRoster().filter((x) => execTargetKey(x) !== key));
+  const c = pool.get(key);
+  if (c && !c.isHome) { pool.delete(key); c.dispose(); }
+  notifyExecStatus();
+}
+
+/** home 节点的 key（新建会话的默认归属）。 */
+export function getHomeExecKey(): string { return homeConn ? homeConn.key : 'local'; }
+
+/** 订阅执行节点在线状态变化（增删 / 上下线）。 */
+export function onExecStatus(cb: () => void): () => void {
+  execStatusCallbacks.push(cb);
+  return () => { execStatusCallbacks = execStatusCallbacks.filter((x) => x !== cb); };
 }
 
 // ── 桌面端本机角色（仅 Tauri）：执行节点 / 纯客户端 ──────────────────────
@@ -413,40 +668,25 @@ export async function setDesktopConfig(config: DesktopConfig): Promise<void> {
   await tauriInvoke('set_desktop_config', { config });
 }
 
-wsReady = (async () => {
-  wsUrl = await getWsUrl();
-  await new Promise<void>((resolve) => {
-    // 首次连接超时：不进 mock 模式，继续重试
-    const timer = setTimeout(() => {
+// 模块加载即建立连接池（home + roster）。首次连接超时仍回调一次未连接状态,
+// 让启动页不会无限卡在「正在连接后端...」。
+initPool();
+(() => {
+  const timer = setTimeout(() => {
+    if (!homeConn.isOpen) {
       console.warn(`[api] Initial connect timeout, will keep retrying…`);
       connectionStatusCallbacks.forEach((cb) => cb(false));
-      scheduleReconnect();
-      resolve();
-    }, WS_CONNECT_TIMEOUT_MS);
-    doConnect(wsUrl, () => { clearTimeout(timer); resolve(); });
-  });
+    }
+  }, WS_CONNECT_TIMEOUT_MS);
+  homeConn.ready.then(() => clearTimeout(timer));
 })();
 
-// ── RPC 调用 ─────────────────────────────────────────────────
+// ── RPC 调用（按 session 归属路由到对应执行节点）──────────────────────
 
 async function call(method: string, ...params: any[]): Promise<any> {
-  await wsReady;
-  if (useMock || !ws || ws.readyState !== WebSocket.OPEN) {
-    const mockResult = mockDispatch(method, params);
-    console.log(`[api] ${method} -> mock:`, mockResult);
-    return mockResult;
-  }
+  await homeConn.ready;
   try {
-    if (!ws || ws.readyState !== WebSocket.OPEN) {
-      const mockResult = mockDispatch(method, params);
-      console.log(`[api] ${method} (late check) -> mock:`, mockResult);
-      return mockResult;
-    }
-    return await new Promise((resolve, reject) => {
-      const id = nextId();
-      pending.set(id, { resolve, reject });
-      ws!.send(JSON.stringify({ id, method, params }));
-    });
+    return await routeConn(method, params).request(method, params);
   } catch (err) {
     console.warn(`[api] call "${method}" failed:`, err);
     return null;
@@ -454,13 +694,8 @@ async function call(method: string, ...params: any[]): Promise<any> {
 }
 
 async function send(method: string, ...params: any[]): Promise<void> {
-  await wsReady;
-  if (useMock || !ws || ws.readyState !== WebSocket.OPEN) {
-    mockDispatch(method, params);
-    return;
-  }
-  const id = nextId();
-  ws.send(JSON.stringify({ id, method, params }));
+  await homeConn.ready;
+  await routeConn(method, params).sendRaw(method, params);
 }
 
 // ── 对话框（Tauri plugin-dialog）────────────────────────────
@@ -574,9 +809,31 @@ export const api = {
     try { return JSON.parse(result); } catch { return null; }
   },
 
+  /**
+   * 列出所有执行节点上的 session 并合并:每条 session 带上它的归属节点
+   * (execKey / execLabel / execMode / execIsHome),并刷新 sessionId→节点 路由表。
+   * roster 为空时即等价于「只列 home 的 session」(向后兼容)。
+   */
   async listSessions(): Promise<any[]> {
-    const result = await call('listSessions');
-    try { return JSON.parse(result); } catch { return []; }
+    const conns = Array.from(pool.values());
+    const results = await Promise.all(conns.map(async (c) => {
+      try {
+        const r = await c.request('listSessions', []);
+        const list = JSON.parse(r) || [];
+        return { c, list: Array.isArray(list) ? list : [] };
+      } catch { return { c, list: [] as any[] }; }
+    }));
+    const merged: any[] = [];
+    for (const { c, list } of results) {
+      for (const s of list) {
+        if (s && s.id) {
+          sessionExec.set(s.id, c.key);
+          merged.push({ ...s, execKey: c.key, execLabel: c.label, execMode: c.target.mode, execIsHome: c.isHome });
+        }
+      }
+    }
+    persistSessionExec();
+    return merged;
   },
 
   /**
@@ -617,8 +874,10 @@ export const api = {
     try { return JSON.parse(result); } catch { return { status: 'error', message: '响应格式错误' }; }
   },
 
-  async getBackends(): Promise<any[]> {
-    const result = await call('getBackends');
+  /** 列出后端配置;execKey 指定时取该执行节点的后端列表(新建会话选远端时用)。 */
+  async getBackends(execKey?: string): Promise<any[]> {
+    const conn = (execKey && pool.get(execKey)) || homeConn;
+    const result = await conn.request('getBackends', []);
     try { return JSON.parse(result); } catch { return []; }
   },
 
@@ -639,9 +898,22 @@ export const api = {
     try { return JSON.parse(result); } catch { return null; }
   },
 
-  async createSession(workingDir: string, backendId: string, sessionType: 'normal' | 'loop' = 'normal'): Promise<any> {
-    const result = await call('createSession', workingDir, backendId, sessionType);
-    try { return JSON.parse(result); } catch { return null; }
+  /** 新建会话。execKey 指定它落在哪个执行节点(默认 home);建后归属即固定。 */
+  async createSession(workingDir: string, backendId: string, sessionType: 'normal' | 'loop' = 'normal', execKey?: string): Promise<any> {
+    const conn = (execKey && pool.get(execKey)) || homeConn;
+    const result = await conn.request('createSession', [workingDir, backendId, sessionType]);
+    try {
+      const s = JSON.parse(result);
+      if (s && s.id) {
+        sessionExec.set(s.id, conn.key);
+        persistSessionExec();
+        s.execKey = conn.key;
+        s.execLabel = conn.label;
+        s.execMode = conn.target.mode;
+        s.execIsHome = conn.isHome;
+      }
+      return s;
+    } catch { return null; }
   },
 
   // ── 可视化 Loop 集成 ────────────────────────────────────────
@@ -873,7 +1145,7 @@ export const api = {
 
   /** Returns true if connected to the real backend, false if in mock mode. */
   isConnected(): boolean {
-    return !useMock && ws !== null && ws.readyState === WebSocket.OPEN;
+    return !useMock && !!homeConn && homeConn.isOpen;
   },
 
   onConnectionStatus(callback: ConnectionStatusCallback): () => void {
@@ -1144,8 +1416,9 @@ export const api = {
   },
 
   sttStreamAudioBinary(pcmBuffer: ArrayBuffer): void {
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(pcmBuffer);
+    // STT 流式音频走 home 节点(sttStreamStart 无 sessionId,固定在 home)。
+    if (homeConn && homeConn.isOpen) {
+      homeConn.ws!.send(pcmBuffer);
     }
   },
 
