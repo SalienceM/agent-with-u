@@ -42,12 +42,6 @@ function relsUnder(manifest: Manifest, rel: string, isDir: boolean): string[] {
   return Object.keys(manifest).filter((r) => !rel || r === rel || r.startsWith(prefix));
 }
 
-function formatBytes(n: number): string {
-  if (n < 1024) return `${n} B`;
-  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
-  return `${(n / 1024 / 1024).toFixed(1)} MB`;
-}
-
 // ── 比对状态（仅在「比对」模式下计算）────────────────────────────────
 type FileStatus = 'synced' | 'differs' | 'conflict' | 'local-only' | 'remote-only';
 type NodeStatus = FileStatus | 'changed';
@@ -303,9 +297,9 @@ export const FileTreePanel: React.FC<Props> = ({ workingDir, execKey, execLabel 
     const key = ck(side, rel);
     const nodes = children[key];
     if (nodes === undefined) {
-      return loading[key] ? <div style={{ ...emptyStyle, paddingLeft: 8 + depth * 14 }}>加载中…</div> : null;
+      return loading[key] ? <div style={{ ...emptyStyle, paddingLeft: 24 + depth * 8 }}>加载中…</div> : null;
     }
-    if (nodes.length === 0 && depth === 0) return <Empty text="（空目录）" />;
+    if (nodes.length === 0 && depth === 0) return <Empty text="（空）" />;
     return nodes.map((n) => {
       const nk = ck(side, n.rel);
       const open = !!expanded[nk];
@@ -313,14 +307,12 @@ export const FileTreePanel: React.FC<Props> = ({ workingDir, execKey, execLabel 
       const hot = st && st !== 'synced' ? st : null;
       return (
         <div key={nk}>
-          <div className="ftp-row" style={{ ...rowStyle, paddingLeft: 8 + depth * 14 }} onClick={() => toggle(side, n)}>
-            <span style={{ width: 12, flexShrink: 0, color: 'var(--theme-text-muted)' }}>
-              {n.isDir ? (open ? '▾' : '▸') : ''}
-            </span>
-            <span style={{ flexShrink: 0 }}>{n.isDir ? (open ? '📂' : '📁') : '📄'}</span>
-            <span style={{ ...nameStyle, ...(hot ? { color: STATUS_COLOR[hot], fontWeight: 600 } : {}) }}>{n.name}</span>
-            {hot && <span title={STATUS_LABEL[hot]} style={{ width: 7, height: 7, borderRadius: '50%', background: STATUS_COLOR[hot], flexShrink: 0 }} />}
-            {!n.isDir && n.size > 0 && <span style={sizeStyle}>{formatBytes(n.size)}</span>}
+          <div className="ftp-row" style={rowStyle} onClick={() => toggle(side, n)} title={n.name}>
+            {Array.from({ length: depth }).map((_, i) => <span key={i} style={guideStyle} />)}
+            <span style={chevronStyle}>{n.isDir ? (open ? '▾' : '▸') : ''}</span>
+            <span style={iconStyle}>{n.isDir ? (open ? '📂' : '📁') : '📄'}</span>
+            <span style={{ ...nameStyle, ...(hot ? { color: STATUS_COLOR[hot] } : {}) }}>{n.name}</span>
+            {hot && <span title={STATUS_LABEL[hot]} style={{ width: 7, height: 7, borderRadius: '50%', background: STATUS_COLOR[hot], flexShrink: 0, marginLeft: 4 }} />}
             <button
               className="ftp-act" style={actBtnStyle}
               title={side === 'local' ? '推送到远端' : '拉取到本地'}
@@ -412,9 +404,9 @@ const SectionHeader: React.FC<{
   onToggle: () => void; onRefresh?: () => void; onPick?: () => void; pickLabel?: string;
 }> = ({ icon, title, sub, open, loading, onToggle, onRefresh, onPick, pickLabel }) => (
   <div style={sectionHeaderStyle} onClick={onToggle}>
-    <span style={{ width: 12, color: 'var(--theme-text-muted)' }}>{open ? '▾' : '▸'}</span>
-    <span style={{ fontSize: 14 }}>{icon}</span>
-    <span style={{ fontWeight: 600, fontSize: 12, color: 'var(--theme-text)' }}>{title}</span>
+    <span style={{ width: 16, textAlign: 'center', fontSize: 10, color: 'var(--theme-text-muted)' }}>{open ? '▾' : '▸'}</span>
+    <span style={{ fontSize: 13 }}>{icon}</span>
+    <span style={{ fontWeight: 700, fontSize: 11, letterSpacing: 0.4, textTransform: 'uppercase', color: 'var(--theme-text)' }}>{title}</span>
     <span style={sectionSubStyle} title={sub}>{sub}</span>
     {loading && <span style={{ fontSize: 10, color: 'var(--theme-text-muted)' }}>…</span>}
     <div style={{ flex: 1 }} />
@@ -452,9 +444,8 @@ const cmpBtnStyle: React.CSSProperties = {
   border: '1px solid var(--theme-accent)', background: 'var(--theme-accent-bg)', color: 'var(--theme-accent)',
 };
 const sectionHeaderStyle: React.CSSProperties = {
-  display: 'flex', alignItems: 'center', gap: 6, padding: '8px 8px', cursor: 'pointer', userSelect: 'none',
-  borderBottom: '1px solid var(--theme-border)', position: 'sticky', top: 0,
-  background: 'var(--theme-sidebar-bg, #f6f8fa)', zIndex: 1,
+  display: 'flex', alignItems: 'center', gap: 4, height: 24, padding: '0 6px', cursor: 'pointer', userSelect: 'none',
+  position: 'sticky', top: 0, background: 'var(--theme-sidebar-bg, #f6f8fa)', zIndex: 1,
 };
 const sectionSubStyle: React.CSSProperties = {
   fontSize: 10, color: 'var(--theme-text-muted)', fontFamily: 'monospace',
@@ -465,16 +456,25 @@ const hdrBtnStyle: React.CSSProperties = {
   border: '1px solid var(--theme-border)', background: 'transparent', color: 'var(--theme-text-muted)',
 };
 const treeBoxStyle: React.CSSProperties = {
-  padding: '2px 0 6px', borderBottom: '1px solid var(--theme-border)',
+  padding: '1px 0 4px',
 };
+// VSCode 资源管理器风格：22px 紧凑行 + 缩进引导线 + 对齐的 ▸ 折叠箭头
 const rowStyle: React.CSSProperties = {
-  display: 'flex', alignItems: 'center', gap: 5, padding: '2px 8px 2px 0', fontSize: 12, color: 'var(--theme-text)',
+  display: 'flex', alignItems: 'center', height: 22, fontSize: 13,
+  color: 'var(--theme-text)', cursor: 'pointer', paddingRight: 6,
+};
+const guideStyle: React.CSSProperties = {
+  width: 8, flexShrink: 0, alignSelf: 'stretch',
+  borderLeft: '1px solid var(--theme-border)', opacity: 0.5,
+};
+const chevronStyle: React.CSSProperties = {
+  width: 16, flexShrink: 0, textAlign: 'center', fontSize: 10, color: 'var(--theme-text-muted)',
+};
+const iconStyle: React.CSSProperties = {
+  width: 18, flexShrink: 0, textAlign: 'center', fontSize: 13, marginRight: 2,
 };
 const nameStyle: React.CSSProperties = {
   flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
-};
-const sizeStyle: React.CSSProperties = {
-  fontSize: 10, color: 'var(--theme-text-muted)', flexShrink: 0,
 };
 const actBtnStyle: React.CSSProperties = {
   flexShrink: 0, width: 20, height: 20, borderRadius: 4, cursor: 'pointer',
