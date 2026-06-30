@@ -1200,8 +1200,11 @@ export const api = {
     return () => { connectionStatusCallbacks = connectionStatusCallbacks.filter((cb) => cb !== callback); };
   },
 
-  async listDirectory(path: string, workingDir?: string): Promise<{ name: string; path: string; isDir: boolean }[]> {
-    const result = await call('listDirectory', path, workingDir || '');
+  async listDirectory(path: string, workingDir?: string, execKey?: string): Promise<{ name: string; path: string; isDir: boolean }[]> {
+    // execKey 指定时发到该会话的执行节点(远端目录懒加载逐层浏览);缺省回落 home。
+    const result = execKey
+      ? await callOn(execKey, 'listDirectory', path, workingDir || '')
+      : await call('listDirectory', path, workingDir || '');
     try {
       const data = JSON.parse(result);
       if (Array.isArray(data)) return data;

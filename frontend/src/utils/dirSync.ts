@@ -125,9 +125,35 @@ export interface LocalFs {
   /** 跨会话稳定的标识，用于给基线做 key */
   id(): string;
   scan(ignore: string[]): Promise<Manifest>;
+  /** 列出某相对目录的直接子项(懒加载逐层浏览用,不递归、不算哈希)。 */
+  listDir(rel: string): Promise<LocalEntry[]>;
   readFile(rel: string): Promise<string>; // base64
   writeFile(rel: string, base64: string): Promise<void>;
   deleteFile(rel: string): Promise<void>;
+}
+
+export interface LocalEntry {
+  name: string;
+  isDir: boolean;
+  size: number;
+}
+
+/** 从扁平清单推导某目录的直接子项(给没有原生逐层列目录能力的实现兜底)。 */
+function levelFromManifest(m: Manifest, rel: string): LocalEntry[] {
+  const prefix = rel ? `${rel}/` : '';
+  const dirs = new Set<string>();
+  const files: LocalEntry[] = [];
+  for (const path of Object.keys(m)) {
+    if (rel && !path.startsWith(prefix)) continue;
+    const rest = rel ? path.slice(prefix.length) : path;
+    const slash = rest.indexOf('/');
+    if (slash === -1) files.push({ name: rest, isDir: false, size: m[path].size });
+    else dirs.add(rest.slice(0, slash));
+  }
+  return [
+    ...[...dirs].sort().map((d) => ({ name: d, isDir: true, size: 0 })),
+    ...files.sort((a, b) => a.name.localeCompare(b.name)),
+  ];
 }
 
 async function tauriInvoke<T>(cmd: string, args: Record<string, unknown>): Promise<T> {
@@ -139,6 +165,7 @@ async function tauriInvoke<T>(cmd: string, args: Record<string, unknown>): Promi
 export class TauriLocalFs implements LocalFs {
   readonly kind = 'tauri' as const;
   constructor(private dir: string) {}
+  private _scanCache: Manifest | null = null;
   label(): string {
     return this.dir;
   }
@@ -150,7 +177,13 @@ export class TauriLocalFs implements LocalFs {
       dir: this.dir,
       ignore,
     });
-    return r.files || {};
+    this._scanCache = r.files || {};
+    return this._scanCache;
+  }
+  // Tauri 无逐层列目录命令,用一次性扫描结果推导层级(本地磁盘,代价可接受)。
+  async listDir(rel: string): Promise<LocalEntry[]> {
+    if (!this._scanCache) await this.scan([]);
+    return levelFromManifest(this._scanCache || {}, rel);
   }
   readFile(rel: string): Promise<string> {
     return tauriInvoke<string>('dir_sync_read_file', { dir: this.dir, rel });
@@ -177,6 +210,18 @@ export class BrowserLocalFs implements LocalFs {
   async scan(ignore: string[]): Promise<Manifest> {
     const out: Manifest = {};
     await this._walk(this.handle, '', ignore, out);
+    return out;
+  }
+  // 浏览器：原生逐层列目录（含空目录），不算哈希,快。
+  async listDir(rel: string): Promise<LocalEntry[]> {
+    let dir = this.handle;
+    for (const p of rel.split('/').filter(Boolean)) dir = await dir.getDirectoryHandle(p);
+    const out: LocalEntry[] = [];
+    for await (const [name, h] of dir.entries()) {
+      if (h.kind === 'directory') out.push({ name, isDir: true, size: 0 });
+      else { const f = await h.getFile(); out.push({ name, isDir: false, size: f.size }); }
+    }
+    out.sort((a, b) => (a.isDir !== b.isDir ? (a.isDir ? -1 : 1) : a.name.localeCompare(b.name)));
     return out;
   }
   private async _walk(dir: any, base: string, ignore: string[], out: Manifest): Promise<void> {
