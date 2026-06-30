@@ -14,7 +14,9 @@
  * 每个文件 / 整个目录都能就地同步：本地节点 ⬆ 推送到远端,远端节点 ⬇ 拉取到本地。
  */
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import hljs from 'highlight.js';
 import { api } from '../api';
+import { markdownToHtml } from '../utils/markdown';
 import {
   pickLocalDir, restoreLocalDir, loadBaseline, saveBaseline,
   type LocalFs, type Manifest,
@@ -79,13 +81,41 @@ function aggregateStatus(rels: string[], statusMap: Record<string, FileStatus>):
   return changed ? 'changed' : 'synced';
 }
 
-// ── 预览 ─────────────────────────────────────────────────────────────
+// ── 预览（复用项目已有的 highlight.js 代码高亮 + marked 渲染，零新增体量）──
 const IMAGE_EXTS = new Set(['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp', 'svg', 'ico', 'avif']);
+const MARKDOWN_EXTS = new Set(['md', 'markdown', 'mdx']);
 const PREVIEW_TEXT_CAP = 200_000;   // 文本预览上限,避免超大文件卡 UI
 
+// 文件扩展名 → highlight.js 语言名（hljs 也认不少别名,这里只补常见的）
+const LANG_ALIAS: Record<string, string> = {
+  js: 'javascript', jsx: 'javascript', mjs: 'javascript', cjs: 'javascript',
+  ts: 'typescript', tsx: 'typescript', py: 'python', rb: 'ruby', rs: 'rust',
+  go: 'go', java: 'java', kt: 'kotlin', c: 'c', h: 'c', cpp: 'cpp', cc: 'cpp',
+  cxx: 'cpp', hpp: 'cpp', cs: 'csharp', php: 'php', sh: 'bash', bash: 'bash',
+  zsh: 'bash', ps1: 'powershell', yml: 'yaml', yaml: 'yaml', json: 'json',
+  jsonc: 'json', xml: 'xml', html: 'xml', htm: 'xml', vue: 'xml', svg: 'xml',
+  css: 'css', scss: 'scss', less: 'less', sql: 'sql', toml: 'ini', ini: 'ini',
+  cfg: 'ini', conf: 'ini', md: 'markdown', markdown: 'markdown', swift: 'swift',
+  dart: 'dart', lua: 'lua', r: 'r', scala: 'scala', pl: 'perl', dockerfile: 'dockerfile',
+};
+
 function extOf(name: string): string {
+  const lower = name.toLowerCase();
+  if (lower === 'dockerfile' || lower === 'makefile') return lower;
   const i = name.lastIndexOf('.');
   return i >= 0 ? name.slice(i + 1).toLowerCase() : '';
+}
+
+function escapeHtml(s: string): string {
+  return s.replace(/[&<>]/g, (c) => (c === '&' ? '&amp;' : c === '<' ? '&lt;' : '&gt;'));
+}
+
+function highlightCode(text: string, ext: string): string {
+  const lang = LANG_ALIAS[ext] || ext;
+  try {
+    if (lang && hljs.getLanguage(lang)) return hljs.highlight(text, { language: lang, ignoreIllegals: true }).value;
+    return text.length > 0 ? hljs.highlightAuto(text).value : '';
+  } catch { return escapeHtml(text); }
 }
 function imageMime(ext: string): string {
   if (ext === 'svg') return 'image/svg+xml';
@@ -99,7 +129,7 @@ function base64ToText(b64: string): string {
 
 interface PreviewState {
   side: Side; rel: string; name: string;
-  loading: boolean; text?: string; dataUrl?: string; isImage?: boolean; error?: string;
+  loading: boolean; text?: string; dataUrl?: string; isImage?: boolean; isMarkdown?: boolean; error?: string;
 }
 
 export const FileTreePanel: React.FC<Props> = ({ workingDir, execKey, execLabel }) => {
@@ -112,6 +142,7 @@ export const FileTreePanel: React.FC<Props> = ({ workingDir, execKey, execLabel 
   const [secOpen, setSecOpen] = useState<Record<Side, boolean>>({ remote: true, local: true });
   const [selected, setSelected] = useState<string | null>(null);  // 选中行 `${side}:${rel}`
   const [preview, setPreview] = useState<PreviewState | null>(null);
+  const [mdRaw, setMdRaw] = useState(false);   // markdown 预览：渲染视图 / 源码
   const [busy, setBusy] = useState('');
   const [msg, setMsg] = useState<{ kind: 'ok' | 'err'; text: string } | null>(null);
 
@@ -350,7 +381,7 @@ export const FileTreePanel: React.FC<Props> = ({ workingDir, execKey, execLabel 
       } else {
         let text = base64ToText(b64 || '');
         if (text.length > PREVIEW_TEXT_CAP) text = text.slice(0, PREVIEW_TEXT_CAP) + '\n\n…（已截断,仅预览前 200KB）';
-        setPreview({ ...base, loading: false, isImage: false, text });
+        setPreview({ ...base, loading: false, isImage: false, isMarkdown: MARKDOWN_EXTS.has(ext), text });
       }
     } catch (e: any) {
       setPreview({ ...base, loading: false, error: e?.message ?? String(e) });
@@ -488,6 +519,12 @@ export const FileTreePanel: React.FC<Props> = ({ workingDir, execKey, execLabel 
                 {preview.side === 'remote' ? '☁️ 远端' : '🖥️ 本地'}
               </span>
               <div style={{ flex: 1 }} />
+              {preview.isMarkdown && !preview.loading && !preview.error && (
+                <div style={{ display: 'flex', border: '1px solid var(--theme-border)', borderRadius: 6, overflow: 'hidden', marginRight: 4 }}>
+                  <button style={{ ...segBtnStyle, ...(!mdRaw ? segActiveStyle : {}) }} onClick={() => setMdRaw(false)}>👁 预览</button>
+                  <button style={{ ...segBtnStyle, ...(mdRaw ? segActiveStyle : {}) }} onClick={() => setMdRaw(true)}>{'</> 源码'}</button>
+                </div>
+              )}
               <button style={hdrBtnStyle} onClick={() => setPreview(null)}>✕</button>
             </div>
             <div style={pvBody}>
@@ -499,8 +536,15 @@ export const FileTreePanel: React.FC<Props> = ({ workingDir, execKey, execLabel 
                 <div style={{ padding: 12, textAlign: 'center', overflow: 'auto' }}>
                   <img src={preview.dataUrl} alt={preview.name} style={{ maxWidth: '100%', maxHeight: '70vh' }} />
                 </div>
+              ) : preview.isMarkdown && !mdRaw ? (
+                <div
+                  style={{ padding: '8px 18px', fontSize: 14 }}
+                  dangerouslySetInnerHTML={{ __html: markdownToHtml(preview.text || '') }}
+                />
               ) : (
-                <pre style={pvPre}>{preview.text || '（空文件）'}</pre>
+                <pre className="md-pre" style={pvPre}>
+                  <code className="hljs" dangerouslySetInnerHTML={{ __html: highlightCode(preview.text || '', extOf(preview.name)) }} />
+                </pre>
               )}
             </div>
           </div>
@@ -622,4 +666,11 @@ const pvBody: React.CSSProperties = {
 const pvPre: React.CSSProperties = {
   margin: 0, padding: '12px 16px', fontSize: 12.5, lineHeight: 1.6, fontFamily: 'monospace',
   whiteSpace: 'pre-wrap', wordBreak: 'break-word', color: 'var(--theme-text)',
+};
+const segBtnStyle: React.CSSProperties = {
+  fontSize: 11, padding: '3px 9px', border: 'none', cursor: 'pointer',
+  background: 'transparent', color: 'var(--theme-text-muted)',
+};
+const segActiveStyle: React.CSSProperties = {
+  background: 'var(--theme-accent-bg)', color: 'var(--theme-accent)',
 };

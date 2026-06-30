@@ -62,6 +62,23 @@ export const App: React.FC = () => {
   const [sidebarCollapsed, setSidebarCollapsed] = useState(
     () => typeof window !== 'undefined' && window.innerWidth <= 768,
   );
+  // 侧栏宽度可拖拽(localStorage 持久化),规避窄侧栏下文件目录树太挤。
+  const [sidebarWidth, setSidebarWidth] = useState<number>(() => {
+    try { const v = parseInt(localStorage.getItem('awu.sidebarWidth') || '', 10); if (v >= 200 && v <= 640) return v; } catch { /* */ }
+    return 260;
+  });
+  const sidebarWidthRef = useRef(sidebarWidth);
+  sidebarWidthRef.current = sidebarWidth;
+  const handleSidebarDragStart = useCallback((e: React.MouseEvent<HTMLDivElement>) => {
+    e.preventDefault();
+    const startX = e.clientX;
+    const startW = sidebarWidthRef.current;
+    const onMove = (ev: MouseEvent) => setSidebarWidth(Math.max(200, Math.min(640, startW + (ev.clientX - startX))));
+    const onUp = () => { window.removeEventListener('mousemove', onMove); window.removeEventListener('mouseup', onUp); };
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', onUp);
+  }, []);
+  useEffect(() => { try { localStorage.setItem('awu.sidebarWidth', String(sidebarWidth)); } catch { /* */ } }, [sidebarWidth]);
   const [scratchPadOpen, setScratchPadOpen] = useState(false);
   const [scratchPadWidth, setScratchPadWidth] = useState(360);
   const [assetPanelOpen, setAssetPanelOpen] = useState(false);
@@ -695,10 +712,25 @@ export const App: React.FC = () => {
         completedSessions={completedSessions}
         collapsed={sidebarCollapsed}
         onToggleCollapse={() => setSidebarCollapsed((v) => !v)}
+        width={sidebarWidth}
         activeWorkingDir={activeSession?.workingDir}
         activeExecKey={activeSession?.execKey}
         activeExecLabel={activeSession?.execLabel}
       />
+
+      {/* 侧栏宽度拖拽手柄(桌面端展开时) */}
+      {!sidebarCollapsed && !isMobile && (
+        <div
+          onMouseDown={handleSidebarDragStart}
+          title="拖拽调整侧栏宽度"
+          style={{
+            width: 4, flexShrink: 0, cursor: 'col-resize',
+            background: 'var(--theme-border, rgba(255,255,255,0.1))', transition: 'background 0.15s',
+          }}
+          onMouseEnter={(e) => (e.currentTarget.style.background = 'var(--theme-accent, #7aa2f7)')}
+          onMouseLeave={(e) => (e.currentTarget.style.background = 'var(--theme-border, rgba(255,255,255,0.1))')}
+        />
+      )}
 
       <div style={{ flex: 1, display: 'flex', flexDirection: 'column', minWidth: 0 }}>
         {/* ---- 顶部栏 ---- */}

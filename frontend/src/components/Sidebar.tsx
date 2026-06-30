@@ -33,6 +33,7 @@ interface Props {
   collapsed?: boolean;
   onToggleCollapse?: () => void;
   isMobile?: boolean;
+  width?: number;   // ★ 可拖拽的侧栏宽度(展开、非移动端时生效)
   // ★ 当前会话的工作目录 / 执行节点 —— 供「文件」视图（本地⇄远端目录树）使用
   activeWorkingDir?: string;
   activeExecKey?: string;
@@ -40,7 +41,7 @@ interface Props {
 }
 
 // ★ Wrap with React.memo to prevent unnecessary re-renders when parent updates
-export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession, onNewSession, onDeleteSession, onAcknowledgeSession, streamingSessions, completedSessions = new Set(), collapsed, onToggleCollapse, isMobile, activeWorkingDir, activeExecKey, activeExecLabel }) => {
+export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession, onNewSession, onDeleteSession, onAcknowledgeSession, streamingSessions, completedSessions = new Set(), collapsed, onToggleCollapse, isMobile, width, activeWorkingDir, activeExecKey, activeExecLabel }) => {
   const [sessions, setSessions] = useState<Session[]>([]);
   // ★ 侧栏视图：会话列表 / 文件目录树（本地 ⇄ 远端），左侧小按钮切换
   const [view, setView] = useState<'sessions' | 'files'>('sessions');
@@ -273,7 +274,7 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
   }
 
   return (
-    <div style={isMobile ? mobileSidebarStyle : sidebarStyle}>
+    <div style={isMobile ? mobileSidebarStyle : { ...sidebarStyle, width: width ?? 260 }}>
       <style>{`
         @keyframes pulse {
           0%, 100% { opacity: 1; transform: scale(1); }
@@ -764,6 +765,7 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
     && prevProps.completedSessions === nextProps.completedSessions
     && prevProps.collapsed === nextProps.collapsed
     && prevProps.isMobile === nextProps.isMobile
+    && prevProps.width === nextProps.width
     && prevProps.activeWorkingDir === nextProps.activeWorkingDir
     && prevProps.activeExecKey === nextProps.activeExecKey
     && prevProps.activeExecLabel === nextProps.activeExecLabel;

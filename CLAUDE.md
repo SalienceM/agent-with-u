@@ -633,9 +633,17 @@ Folder push/pull gathers its file list from the manifest (compare on) or by walk
 `listDirectory`/`listDir` (compare off).
 
 **Preview & layout.** Clicking a file (or its 👁 hover action / double-click) opens a
-centered preview overlay — text via `TextDecoder` (capped at 200KB), images as a
-`data:` URL (read with `syncReadFile`/`LocalFs.readFile`; remote respects the
-`tooLarge` flag). Section headers are kept minimal for the narrow sidebar: the
-working-dir path / node label is the header `title` tooltip only (not rendered
+centered preview overlay — read with `syncReadFile`/`LocalFs.readFile` (remote respects
+the `tooLarge` flag), capped at 200KB. Rendering reuses deps already bundled for chat
+(no new weight): **code** is syntax-highlighted with `highlight.js` (ext→lang via
+`LANG_ALIAS`, else `highlightAuto`) into `.md-pre/.hljs` (globally themed); **markdown**
+(`.md/.markdown/.mdx`) renders through `markdownToHtml` (marked) with a 👁 预览 / `</>` 源码
+toggle; **images** show as a `data:` URL. Section headers stay minimal for the narrow
+sidebar — the working-dir path / node label is the header `title` tooltip only (not
 inline), with hover-revealed ↻ refresh / ⊟ collapse-all icons and a persistent
 row-selection highlight.
+
+**Sidebar width is drag-resizable** (`App` `sidebarWidth`, persisted at
+`localStorage['awu.sidebarWidth']`, clamped 200–640; a 4px col-resize handle sits
+between Sidebar and the main column, desktop + expanded only). `Sidebar` takes a
+`width` prop (in its memo comparator) applied to the expanded root.
