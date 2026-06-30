@@ -538,6 +538,8 @@ function ensureConn(target: ExecTarget, isHome: boolean): Conn {
 function initPool(): void {
   loadSessionExec();
   homeConn = ensureConn(connectionTarget, true);
+  // 本机始终作为一个可选执行节点存在(默认是远端时也能在新建会话里选回本机)。
+  if (homeConn.key !== 'local') ensureConn({ mode: 'local' }, false);
   for (const t of loadExecRoster()) {
     if (execTargetKey(t) !== homeConn.key) ensureConn(t, false);
   }
@@ -596,16 +598,21 @@ export async function setConnectionTarget(t: ConnectionTarget): Promise<void> {
   homeConn = next;
   if (oldHome && oldHome.key !== newKey) {
     oldHome.isHome = false;
-    // 旧 home 若不在 roster 里则关闭;在 roster 里则降级为普通额外节点继续保留。
-    const inRoster = loadExecRoster().some((rt) => execTargetKey(rt) === oldHome.key);
-    if (!inRoster) { pool.delete(oldHome.key); oldHome.dispose(); }
+    // 切换「默认节点」不再是破坏性动作:旧默认保留为普通可分配节点(继续在线、
+    // 仍可在新建会话里选)。远端的话并入 roster,刷新后依旧在。本机始终保留。
+    if (oldHome.target.mode === 'relay') {
+      const list = loadExecRoster();
+      if (!list.some((rt) => execTargetKey(rt) === oldHome.key)) { list.push(oldHome.target); saveExecRoster(list); }
+    }
   }
+  // 本机始终作为可选执行节点存在。
+  if (newKey !== 'local' && !pool.has('local')) ensureConn({ mode: 'local' }, false);
   connectionStatusCallbacks.forEach((cb) => cb(homeConn.isOpen));
   notifyExecStatus();
 }
 
-// ── 执行节点 roster（供新建会话选择的可分配节点）────────────────────────
-/** 当前所有执行节点（home + 额外节点）的展示摘要。 */
+// ── 执行节点列表（统一模型：本机 + 远端节点，某个为默认）──────────────────
+/** 所有执行节点的展示摘要。本机(local)永远在列；按 本机→默认→其余 排序。 */
 export function getExecutors(): ExecutorInfo[] {
   const out: ExecutorInfo[] = [];
   const seen = new Set<string>();
@@ -614,31 +621,49 @@ export function getExecutors(): ExecutorInfo[] {
     seen.add(c.key);
     out.push({ key: c.key, label: c.label, mode: c.target.mode, isHome: c.isHome, connected: c.isOpen });
   };
-  if (homeConn) push(homeConn);
   for (const c of pool.values()) push(c);
+  // 本机始终可见(即便当前没连上,比如桌面纯客户端角色)。
+  if (!seen.has('local')) {
+    out.push({ key: 'local', label: execLabelOf({ mode: 'local' }), mode: 'local', isHome: false, connected: false });
+  }
+  out.sort((a, b) => {
+    if (a.key === 'local') return -1;
+    if (b.key === 'local') return 1;
+    if (a.isHome !== b.isHome) return a.isHome ? -1 : 1;
+    return a.label.localeCompare(b.label);
+  });
   return out;
 }
 
-/** 把一个中继执行节点加入 roster（与 home 同时在线，可在新建会话时选）。 */
+/** 取某节点的完整连接目标(供「设为默认」用)。 */
+export function getExecTarget(key: string): ExecTarget | null {
+  const c = pool.get(key);
+  if (c) return c.target;
+  if (key === 'local') return { mode: 'local' };
+  return loadExecRoster().find((t) => execTargetKey(t) === key) || null;
+}
+
+/** 添加一个远端中继执行节点（与本机/默认同时在线，可在新建会话时选）。 */
 export function addExecRoster(t: ExecTarget): void {
   if (t.mode !== 'relay') return;
   const key = execTargetKey(t);
-  if (homeConn && key === homeConn.key) return; // 已是 home,无需重复加入
   const list = loadExecRoster();
   if (!list.some((x) => execTargetKey(x) === key)) { list.push(t); saveExecRoster(list); }
   ensureConn(t, false);
   notifyExecStatus();
 }
 
-/** 从 roster 移除一个额外节点（home 节点不可移除，请改用「连接」切换）。 */
+/** 移除一个远端节点。本机与当前默认节点不可移除。 */
 export function removeExecRoster(key: string): void {
+  if (key === 'local') return;                       // 本机不可移除
+  if (homeConn && key === homeConn.key) return;      // 当前默认节点不可移除
   saveExecRoster(loadExecRoster().filter((x) => execTargetKey(x) !== key));
   const c = pool.get(key);
-  if (c && !c.isHome) { pool.delete(key); c.dispose(); }
+  if (c) { pool.delete(key); c.dispose(); }
   notifyExecStatus();
 }
 
-/** home 节点的 key（新建会话的默认归属）。 */
+/** 当前默认节点(新建会话的默认落点)的 key。 */
 export function getHomeExecKey(): string { return homeConn ? homeConn.key : 'local'; }
 
 /** 订阅执行节点在线状态变化（增删 / 上下线）。 */
@@ -696,6 +721,20 @@ async function call(method: string, ...params: any[]): Promise<any> {
 async function send(method: string, ...params: any[]): Promise<void> {
   await homeConn.ready;
   await routeConn(method, params).sendRaw(method, params);
+}
+
+/** 指定执行节点发起 RPC（用于按 workingDir 操作、无 sessionId 可路由的场景，如目录同步）。 */
+function connByKey(execKey?: string): Conn {
+  return (execKey && pool.get(execKey)) || homeConn;
+}
+async function callOn(execKey: string | undefined, method: string, ...params: any[]): Promise<any> {
+  await homeConn.ready;
+  try {
+    return await connByKey(execKey).request(method, params);
+  } catch (err) {
+    console.warn(`[api] callOn "${method}" failed:`, err);
+    return null;
+  }
 }
 
 // ── 对话框（Tauri plugin-dialog）────────────────────────────
@@ -846,7 +885,15 @@ export const api = {
     const result = limit !== undefined && limit > 0
       ? await call('loadSession', id, limit)
       : await call('loadSession', id);
-    try { return JSON.parse(result); } catch { return null; }
+    try {
+      const s = JSON.parse(result);
+      // 注入归属执行节点信息(后端的 session 对象本身没有),供目录同步等按节点路由。
+      if (s && s.id) {
+        const c = pool.get(sessionExec.get(s.id) || homeConn.key);
+        if (c) { s.execKey = c.key; s.execLabel = c.label; s.execMode = c.target.mode; s.execIsHome = c.isHome; }
+      }
+      return s;
+    } catch { return null; }
   },
 
   /** 翻页加载 session 的更老消息。等价于 messages[offset : offset+limit]。 */
@@ -1183,29 +1230,32 @@ export const api = {
   },
 
   // ── 目录同步：远端工作目录 ↔ 本机副本目录 ──────────────────
+  // 这些操作的是某个执行节点上的工作目录,而参数是路径(不是 sessionId,无法被
+  // 自动路由)。所以显式带上该会话的 execKey,把请求发到它归属的节点;缺省回落
+  // home(向后兼容)。
   /** 服务器工作目录清单：relpath → {hash, size}，供客户端做三向增量比对。 */
-  async syncManifest(workingDir: string): Promise<{
+  async syncManifest(workingDir: string, execKey?: string): Promise<{
     status: string; message?: string; root?: string;
     files?: Record<string, { hash: string; size: number }>;
   }> {
-    const result = await call('syncManifest', workingDir);
+    const result = await callOn(execKey, 'syncManifest', workingDir);
     try { return JSON.parse(result); } catch { return { status: 'error', message: 'syncManifest 无响应' }; }
   },
 
-  async syncReadFile(workingDir: string, rel: string): Promise<{
+  async syncReadFile(workingDir: string, rel: string, execKey?: string): Promise<{
     status: string; message?: string; hash?: string; data?: string; tooLarge?: boolean;
   }> {
-    const result = await call('syncReadFile', workingDir, rel);
+    const result = await callOn(execKey, 'syncReadFile', workingDir, rel);
     try { return JSON.parse(result); } catch { return { status: 'error', message: 'syncReadFile 无响应' }; }
   },
 
-  async syncWriteFile(workingDir: string, rel: string, dataBase64: string): Promise<{ status: string; message?: string }> {
-    const result = await call('syncWriteFile', workingDir, rel, dataBase64);
+  async syncWriteFile(workingDir: string, rel: string, dataBase64: string, execKey?: string): Promise<{ status: string; message?: string }> {
+    const result = await callOn(execKey, 'syncWriteFile', workingDir, rel, dataBase64);
     try { return JSON.parse(result); } catch { return { status: 'error', message: 'syncWriteFile 无响应' }; }
   },
 
-  async syncDeleteFile(workingDir: string, rel: string): Promise<{ status: string; message?: string }> {
-    const result = await call('syncDeleteFile', workingDir, rel);
+  async syncDeleteFile(workingDir: string, rel: string, execKey?: string): Promise<{ status: string; message?: string }> {
+    const result = await callOn(execKey, 'syncDeleteFile', workingDir, rel);
     try { return JSON.parse(result); } catch { return { status: 'error', message: 'syncDeleteFile 无响应' }; }
   },
 

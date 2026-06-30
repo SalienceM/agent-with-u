@@ -389,26 +389,26 @@ interface Endpoint {
   deleteFile(rel: string): Promise<void>;
 }
 
-function remoteEndpoint(workingDir: string): Endpoint {
+function remoteEndpoint(workingDir: string, execKey?: string): Endpoint {
   return {
     async scan() {
-      const r = await api.syncManifest(workingDir);
+      const r = await api.syncManifest(workingDir, execKey);
       if (r.status !== 'ok' || !r.files) throw new Error(r.message || '远端清单获取失败');
       return r.files;
     },
     async readFile(rel) {
-      const r = await api.syncReadFile(workingDir, rel);
+      const r = await api.syncReadFile(workingDir, rel, execKey);
       if (r.status !== 'ok' || r.data == null) {
         throw new Error(r.message || `读取远端文件失败: ${rel}`);
       }
       return r.data;
     },
     async writeFile(rel, base64) {
-      const r = await api.syncWriteFile(workingDir, rel, base64);
+      const r = await api.syncWriteFile(workingDir, rel, base64, execKey);
       if (r.status !== 'ok') throw new Error(r.message || `写入远端文件失败: ${rel}`);
     },
     async deleteFile(rel) {
-      const r = await api.syncDeleteFile(workingDir, rel);
+      const r = await api.syncDeleteFile(workingDir, rel, execKey);
       if (r.status !== 'ok') throw new Error(r.message || `删除远端文件失败: ${rel}`);
     },
   };
@@ -428,12 +428,13 @@ export class DirSyncSession {
     private fs: LocalFs,
     private workingDir: string,
     private ignore: string[],
+    private execKey?: string,   // 会话归属的执行节点;远端工作目录在它上面
   ) {}
 
   /** 扫描两端 + 三向比对，得到待应用的变更（不落盘）。 */
   async prepare(direction: SyncDirection): Promise<PreparedSync> {
     const localEp = localEndpoint(this.fs, this.ignore);
-    const remoteEp = remoteEndpoint(this.workingDir);
+    const remoteEp = remoteEndpoint(this.workingDir, this.execKey);
     const [local, remote] = await Promise.all([localEp.scan(), remoteEp.scan()]);
     const baseline = loadBaseline(this.fs.id(), this.workingDir);
     const diff = computeDiff(direction, baseline, local, remote);
@@ -447,7 +448,7 @@ export class DirSyncSession {
     onProgress?: (p: ApplyProgress) => void,
   ): Promise<ApplyResult> {
     const localEp = localEndpoint(this.fs, this.ignore);
-    const remoteEp = remoteEndpoint(this.workingDir);
+    const remoteEp = remoteEndpoint(this.workingDir, this.execKey);
     const [src, dst] = prepared.direction === 'pull' ? [remoteEp, localEp] : [localEp, remoteEp];
 
     const failed: ApplyResult['failed'] = [];

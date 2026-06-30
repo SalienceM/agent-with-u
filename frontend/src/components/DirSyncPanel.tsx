@@ -23,6 +23,7 @@ import {
 interface Props {
   workingDir: string;
   onClose: () => void;
+  execKey?: string;   // 会话归属的执行节点;远端工作目录在它上面(不传则发到 home)
 }
 
 type Phase = 'idle' | 'preparing' | 'preview' | 'applying' | 'done';
@@ -39,7 +40,7 @@ const ACTION_META: Record<DiffEntry['action'], { label: string; color: string }>
   delete: { label: '删除', color: '#ef4444' },
 };
 
-export const DirSyncPanel: React.FC<Props> = ({ workingDir, onClose }) => {
+export const DirSyncPanel: React.FC<Props> = ({ workingDir, onClose, execKey }) => {
   const [localFs, setLocalFs] = useState<LocalFs | null>(null);
   const [ignore, setIgnore] = useState<string[]>([]);
   const [ignoreText, setIgnoreText] = useState('');
@@ -108,7 +109,7 @@ export const DirSyncPanel: React.FC<Props> = ({ workingDir, onClose }) => {
       setError('');
       setResult(null);
       setPhase('preparing');
-      const session = new DirSyncSession(localFs, workingDir, ignore);
+      const session = new DirSyncSession(localFs, workingDir, ignore, execKey);
       sessionRef.current = session;
       try {
         const p = await session.prepare(direction);
@@ -120,7 +121,7 @@ export const DirSyncPanel: React.FC<Props> = ({ workingDir, onClose }) => {
         setPhase('idle');
       }
     },
-    [localFs, workingDir, ignore],
+    [localFs, workingDir, ignore, execKey],
   );
 
   const selectedEntries = useMemo<DiffEntry[]>(() => {

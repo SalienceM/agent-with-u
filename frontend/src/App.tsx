@@ -916,6 +916,7 @@ export const App: React.FC = () => {
       {syncPanelOpen && (
         <DirSyncPanel
           workingDir={activeSession?.workingDir || ''}
+          execKey={activeSession?.execKey}
           onClose={() => setSyncPanelOpen(false)}
         />
       )}
