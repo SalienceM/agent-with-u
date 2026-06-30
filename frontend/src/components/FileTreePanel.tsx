@@ -85,6 +85,9 @@ export const FileTreePanel: React.FC<Props> = ({ workingDir, execKey, execLabel 
   const [children, setChildren] = useState<Record<string, TNode[]>>({});
   const [loading, setLoading] = useState<Record<string, boolean>>({});
   const [expanded, setExpanded] = useState<Record<string, boolean>>({});
+  // 两个根区块的展开状态(独立存,避免和名为 "root" 的顶层目录键冲突)
+  const [secOpen, setSecOpen] = useState<Record<Side, boolean>>({ remote: true, local: true });
+  const [selected, setSelected] = useState<string | null>(null);  // 选中行 `${side}:${rel}`
   const [busy, setBusy] = useState('');
   const [msg, setMsg] = useState<{ kind: 'ok' | 'err'; text: string } | null>(null);
 
@@ -165,6 +168,15 @@ export const FileTreePanel: React.FC<Props> = ({ workingDir, execKey, execLabel 
     setExpanded((p) => ({ ...p, [key]: willOpen }));
     if (willOpen && children[key] === undefined) loadChildren(side, node.rel);
   }, [expanded, children, loadChildren]);
+
+  // 折叠该侧所有展开的目录(保留已加载的子项缓存,再展开是瞬时的)。
+  const collapseAll = useCallback((side: Side) => {
+    setExpanded((p) => {
+      const n = { ...p };
+      for (const k of Object.keys(n)) if (k.startsWith(`${side}:`)) n[k] = false;
+      return n;
+    });
+  }, []);
 
   // ── 比对（显式全量）─────────────────────────────────────────────
   const runCompare = useCallback(async () => {
@@ -307,7 +319,12 @@ export const FileTreePanel: React.FC<Props> = ({ workingDir, execKey, execLabel 
       const hot = st && st !== 'synced' ? st : null;
       return (
         <div key={nk}>
-          <div className="ftp-row" style={rowStyle} onClick={() => toggle(side, n)} title={n.name}>
+          <div
+            className={`ftp-row${selected === nk ? ' ftp-sel' : ''}`}
+            style={rowStyle}
+            onClick={() => { setSelected(nk); toggle(side, n); }}
+            title={n.name}
+          >
             {Array.from({ length: depth }).map((_, i) => <span key={i} style={guideStyle} />)}
             <span style={chevronStyle}>{n.isDir ? (open ? '▾' : '▸') : ''}</span>
             <span style={iconStyle}>{n.isDir ? (open ? '📂' : '📁') : '📄'}</span>
@@ -333,8 +350,11 @@ export const FileTreePanel: React.FC<Props> = ({ workingDir, execKey, execLabel 
     <div style={wrapStyle}>
       <style>{`
         .ftp-row:hover { background: var(--theme-bg-tertiary, rgba(255,255,255,0.05)); }
+        .ftp-row.ftp-sel { background: var(--theme-accent-bg, rgba(9,105,218,0.12)); box-shadow: inset 2px 0 0 var(--theme-accent, #0969da); }
         .ftp-act { opacity: 0; }
         .ftp-row:hover .ftp-act { opacity: 1; }
+        .ftp-hbtn { opacity: 0; transition: opacity 0.12s; }
+        .ftp-hdr:hover .ftp-hbtn { opacity: 1; }
       `}</style>
 
       {/* 比对工具条 */}
@@ -364,10 +384,11 @@ export const FileTreePanel: React.FC<Props> = ({ workingDir, execKey, execLabel 
       {/* ☁️ 远端 */}
       <SectionHeader icon="☁️" title={`远端${execLabel ? `（${execLabel}）` : ''}`}
         sub={workingDir ? shortDir(workingDir) : '（未打开会话）'}
-        open={!!expanded['remote:root']} loading={loading[ck('remote', '')]}
-        onToggle={() => setExpanded((p) => ({ ...p, 'remote:root': !p['remote:root'] }))}
-        onRefresh={() => reloadSide('remote')} />
-      {expanded['remote:root'] !== false && (
+        open={secOpen.remote} loading={loading[ck('remote', '')]}
+        onToggle={() => setSecOpen((p) => ({ ...p, remote: !p.remote }))}
+        onRefresh={() => reloadSide('remote')}
+        onCollapseAll={() => collapseAll('remote')} />
+      {secOpen.remote && (
         <div style={treeBoxStyle}>
           {!workingDir ? <Empty text="打开一个会话后显示其远端工作目录" /> : renderDir('remote', '', 0)}
         </div>
@@ -376,11 +397,12 @@ export const FileTreePanel: React.FC<Props> = ({ workingDir, execKey, execLabel 
       {/* 🖥️ 本地 */}
       <SectionHeader icon="🖥️" title="本地"
         sub={localFs ? localFs.label() : '（未选择本机目录）'}
-        open={!!expanded['local:root']} loading={loading[ck('local', '')]}
-        onToggle={() => setExpanded((p) => ({ ...p, 'local:root': !p['local:root'] }))}
+        open={secOpen.local} loading={loading[ck('local', '')]}
+        onToggle={() => setSecOpen((p) => ({ ...p, local: !p.local }))}
         onRefresh={localFs ? () => reloadSide('local') : undefined}
-        onPick={handlePickLocal} pickLabel={localFs ? '更换' : '选择目录'} />
-      {expanded['local:root'] !== false && (
+        onCollapseAll={localFs ? () => collapseAll('local') : undefined}
+        onPick={handlePickLocal} pickLabel={localFs ? '更换' : '选择目录'} pickAlways={!localFs} />
+      {secOpen.local && (
         <div style={treeBoxStyle}>
           {!localFs ? <Empty text="选择一个本机目录作为副本（推送/拉取的落地处）" /> : renderDir('local', '', 0)}
         </div>
@@ -401,17 +423,29 @@ export const FileTreePanel: React.FC<Props> = ({ workingDir, execKey, execLabel 
 
 const SectionHeader: React.FC<{
   icon: string; title: string; sub: string; open: boolean; loading?: boolean;
-  onToggle: () => void; onRefresh?: () => void; onPick?: () => void; pickLabel?: string;
-}> = ({ icon, title, sub, open, loading, onToggle, onRefresh, onPick, pickLabel }) => (
-  <div style={sectionHeaderStyle} onClick={onToggle}>
+  onToggle: () => void; onRefresh?: () => void; onCollapseAll?: () => void;
+  onPick?: () => void; pickLabel?: string; pickAlways?: boolean;
+}> = ({ icon, title, sub, open, loading, onToggle, onRefresh, onCollapseAll, onPick, pickLabel, pickAlways }) => (
+  <div className="ftp-hdr" style={sectionHeaderStyle} onClick={onToggle}>
     <span style={{ width: 16, textAlign: 'center', fontSize: 10, color: 'var(--theme-text-muted)' }}>{open ? '▾' : '▸'}</span>
     <span style={{ fontSize: 13 }}>{icon}</span>
     <span style={{ fontWeight: 700, fontSize: 11, letterSpacing: 0.4, textTransform: 'uppercase', color: 'var(--theme-text)' }}>{title}</span>
     <span style={sectionSubStyle} title={sub}>{sub}</span>
     {loading && <span style={{ fontSize: 10, color: 'var(--theme-text-muted)' }}>…</span>}
     <div style={{ flex: 1 }} />
-    {onPick && <button style={hdrBtnStyle} title="选择/更换本机目录" onClick={(e) => { e.stopPropagation(); onPick(); }}>{pickLabel || '选择'}</button>}
-    {onRefresh && <button style={hdrBtnStyle} title="刷新" onClick={(e) => { e.stopPropagation(); onRefresh(); }}>↻</button>}
+    {/* 动作图标：平时隐藏,hover 区块标题才出现(VSCode 风);「选择目录」空态例外,常显 */}
+    {onPick && (
+      <button className={pickAlways ? undefined : 'ftp-hbtn'} style={hdrBtnStyle} title="选择/更换本机目录"
+        onClick={(e) => { e.stopPropagation(); onPick(); }}>{pickLabel || '选择'}</button>
+    )}
+    {onRefresh && (
+      <button className="ftp-hbtn" style={hdrIconStyle} title="刷新"
+        onClick={(e) => { e.stopPropagation(); onRefresh(); }}>↻</button>
+    )}
+    {onCollapseAll && (
+      <button className="ftp-hbtn" style={hdrIconStyle} title="全部折叠"
+        onClick={(e) => { e.stopPropagation(); onCollapseAll(); }}>⊟</button>
+    )}
   </div>
 );
 
@@ -454,6 +488,11 @@ const sectionSubStyle: React.CSSProperties = {
 const hdrBtnStyle: React.CSSProperties = {
   fontSize: 11, padding: '2px 7px', borderRadius: 5, cursor: 'pointer',
   border: '1px solid var(--theme-border)', background: 'transparent', color: 'var(--theme-text-muted)',
+};
+const hdrIconStyle: React.CSSProperties = {
+  width: 20, height: 18, display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
+  fontSize: 12, borderRadius: 4, cursor: 'pointer',
+  border: 'none', background: 'transparent', color: 'var(--theme-text-muted)',
 };
 const treeBoxStyle: React.CSSProperties = {
   padding: '1px 0 4px',
