@@ -3,7 +3,7 @@ import {
   getConnectionTarget, setConnectionTarget, listRelayDevices,
   isTauri, getDesktopConfig, setDesktopConfig, type DesktopConfig,
   api, type ConnectedClient,
-  getExecutors, addExecRoster, removeExecRoster, onExecStatus,
+  getExecutors, addExecRoster, removeExecRoster, onExecStatus, getHomeExecKey,
   type ExecutorInfo,
 } from '../api';
 import {
@@ -58,14 +58,32 @@ export const ConnectionPanel: React.FC<ConnectionPanelProps> = ({ onClose }) => 
   // ── 可分配执行节点（session 级模式）：home + 额外节点，新建会话时可选 ──
   const [executors, setExecutors] = useState<ExecutorInfo[]>(() => getExecutors());
   useEffect(() => onExecStatus(() => setExecutors(getExecutors())), []);
+  // 「加入可分配节点」的就地反馈（成功 / 已是 home / 提示）——避免「点了没反应」。
+  const [execMsg, setExecMsg] = useState<{ kind: 'ok' | 'warn'; text: string } | null>(null);
 
   // 把卡片 B 当前填好的中继 + 选中节点加入「可分配执行节点」（不切换 home）。
   const addSelectedAsExecutor = useCallback(() => {
+    setExecMsg(null);
     if (!url.trim()) { setErr('请先填写中继地址'); return; }
     if (!deviceId) { setErr('请先刷新并选择一个执行节点'); return; }
     const dev = devices.find((d) => d.id === deviceId);
+    const key = `relay:${deviceId}`;
+    // 若这台正是当前 home,addExecRoster 会静默跳过。明确告诉用户,而不是「没反应」。
+    if (key === getHomeExecKey()) {
+      setExecMsg({
+        kind: 'warn',
+        text: `这台「${dev?.name || deviceId}」正是本窗口当前的 home 节点（默认就连它），无需重复加入。`
+          + `若想「🏠本机 + 它」并存，请先把上面切到「🏠 本地直连」并保存，再回来加入。`,
+      });
+      return;
+    }
     addExecRoster({ mode: 'relay', url: url.trim(), token: token.trim(), deviceId, deviceName: dev?.name });
     setErr('');
+    setExecMsg({
+      kind: 'ok',
+      text: `✓ 已加入「${dev?.name || deviceId}」。向上滚动可见「可分配执行节点」卡片；`
+        + `关闭本面板后，新建会话时即可在「执行节点」里选它。`,
+    });
   }, [url, token, deviceId, devices]);
 
   // ── Relay 预设列表(localStorage 持久化) ──
@@ -512,6 +530,16 @@ export const ConnectionPanel: React.FC<ConnectionPanelProps> = ({ onClose }) => 
                     <button onClick={addSelectedAsExecutor} style={{ ...refreshBtnStyle, marginTop: 8 }}>
                       ➕ 加入可分配执行节点（新建会话时可选）
                     </button>
+                    {execMsg && (
+                      <div style={{
+                        marginTop: 8, fontSize: 11, lineHeight: 1.6, padding: '8px 10px', borderRadius: 6,
+                        background: execMsg.kind === 'ok' ? 'rgba(34,197,94,0.12)' : 'rgba(234,179,8,0.12)',
+                        border: `1px solid ${execMsg.kind === 'ok' ? 'rgba(34,197,94,0.4)' : 'rgba(234,179,8,0.4)'}`,
+                        color: execMsg.kind === 'ok' ? 'var(--theme-success, #2da44e)' : '#b45309',
+                      }}>
+                        {execMsg.text}
+                      </div>
+                    )}
                   </div>
                 )}
               </div>
