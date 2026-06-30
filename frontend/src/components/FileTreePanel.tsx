@@ -13,10 +13,13 @@
  *
  * 每个文件 / 整个目录都能就地同步：本地节点 ⬆ 推送到远端,远端节点 ⬇ 拉取到本地。
  */
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useState, lazy, Suspense } from 'react';
 import hljs from 'highlight.js';
 import { api } from '../api';
 import { markdownToHtml } from '../utils/markdown';
+
+// CodeMirror 编辑器懒加载：只有点「编辑」时才拉它的独立 chunk,不进主包。
+const CodeEditor = lazy(() => import('./CodeEditor'));
 import {
   pickLocalDir, restoreLocalDir, loadBaseline, saveBaseline,
   type LocalFs, type Manifest,
@@ -108,6 +111,25 @@ function extOf(name: string): string {
 
 function escapeHtml(s: string): string {
   return s.replace(/[&<>]/g, (c) => (c === '&' ? '&amp;' : c === '<' ? '&lt;' : '&gt;'));
+}
+
+// 编辑器主题跟随 app：读 .app-root 的 --theme-bg 亮度判定明暗(默认暗)。
+function isDarkTheme(): boolean {
+  try {
+    const el = document.querySelector('.app-root') as HTMLElement | null;
+    const raw = (el ? getComputedStyle(el).getPropertyValue('--theme-bg') : '').trim()
+      || getComputedStyle(document.body).backgroundColor;
+    let r = 20, g = 20, b = 30;
+    const hex = raw.match(/^#([0-9a-f]{3}|[0-9a-f]{6})$/i);
+    if (hex) {
+      const h = hex[1].length === 3 ? hex[1].split('').map((c) => c + c).join('') : hex[1];
+      r = parseInt(h.slice(0, 2), 16); g = parseInt(h.slice(2, 4), 16); b = parseInt(h.slice(4, 6), 16);
+    } else {
+      const m = raw.match(/(\d+)\s*,\s*(\d+)\s*,\s*(\d+)/);
+      if (m) { r = +m[1]; g = +m[2]; b = +m[3]; }
+    }
+    return (0.2126 * r + 0.7152 * g + 0.0722 * b) < 128;
+  } catch { return true; }
 }
 
 function highlightCode(text: string, ext: string): string {
@@ -439,21 +461,6 @@ export const FileTreePanel: React.FC<Props> = ({ workingDir, execKey, execLabel 
     setPreview(null); setEditing(false); setDirty(false);
   }, [editing, dirty]);
 
-  const handleEditorKey = useCallback((e: React.KeyboardEvent<HTMLTextAreaElement>) => {
-    // Tab 缩进 2 空格(简单编辑器手感);Ctrl/Cmd+S 保存
-    if (e.key === 'Tab') {
-      e.preventDefault();
-      const t = e.currentTarget;
-      const s = t.selectionStart, en = t.selectionEnd;
-      const nv = editText.slice(0, s) + '  ' + editText.slice(en);
-      setEditText(nv); setDirty(true);
-      requestAnimationFrame(() => { t.selectionStart = t.selectionEnd = s + 2; });
-    } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 's') {
-      e.preventDefault();
-      if (dirty && !saving) saveEdit();
-    }
-  }, [editText, dirty, saving, saveEdit]);
-
   // ── 渲染 ─────────────────────────────────────────────────────────
   const renderDir = (side: Side, rel: string, depth: number): React.ReactNode => {
     const key = ck(side, rel);
@@ -610,14 +617,16 @@ export const FileTreePanel: React.FC<Props> = ({ workingDir, execKey, execLabel 
               ) : preview.error ? (
                 <div style={{ padding: 24, color: '#f87171', fontSize: 13 }}>⚠ {preview.error}</div>
               ) : editing ? (
-                <textarea
-                  value={editText}
-                  onChange={(e) => { setEditText(e.target.value); setDirty(true); }}
-                  onKeyDown={handleEditorKey}
-                  spellCheck={false}
-                  autoFocus
-                  style={pvEditor}
-                />
+                <Suspense fallback={<div style={{ padding: 24, textAlign: 'center', color: 'var(--theme-text-muted)' }}>编辑器加载中…</div>}>
+                  <CodeEditor
+                    key={preview.rel}
+                    value={editText}
+                    ext={extOf(preview.name)}
+                    dark={isDarkTheme()}
+                    onChange={(v) => { setEditText(v); setDirty(true); }}
+                    onSave={saveEdit}
+                  />
+                </Suspense>
               ) : preview.isImage ? (
                 <div style={{ padding: 12, textAlign: 'center', overflow: 'auto' }}>
                   <img src={preview.dataUrl} alt={preview.name} style={{ maxWidth: '100%', maxHeight: '70vh' }} />
@@ -752,13 +761,6 @@ const pvBody: React.CSSProperties = {
 const pvPre: React.CSSProperties = {
   margin: 0, padding: '12px 16px', fontSize: 12.5, lineHeight: 1.6, fontFamily: 'monospace',
   whiteSpace: 'pre-wrap', wordBreak: 'break-word', color: 'var(--theme-text)',
-};
-const pvEditor: React.CSSProperties = {
-  width: '100%', minHeight: '60vh', boxSizing: 'border-box', resize: 'none',
-  padding: '12px 16px', border: 'none', outline: 'none',
-  fontSize: 12.5, lineHeight: 1.6, fontFamily: 'monospace', tabSize: 2,
-  background: 'var(--theme-input-bg, #0d1117)', color: 'var(--theme-text)',
-  whiteSpace: 'pre', overflowWrap: 'normal', overflowX: 'auto',
 };
 const segBtnStyle: React.CSSProperties = {
   fontSize: 11, padding: '3px 9px', border: 'none', cursor: 'pointer',
