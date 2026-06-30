@@ -638,7 +638,13 @@ the `tooLarge` flag), capped at 200KB. Rendering reuses deps already bundled for
 (no new weight): **code** is syntax-highlighted with `highlight.js` (ext→lang via
 `LANG_ALIAS`, else `highlightAuto`) into `.md-pre/.hljs` (globally themed); **markdown**
 (`.md/.markdown/.mdx`) renders through `markdownToHtml` (marked) with a 👁 预览 / `</>` 源码
-toggle; **images** show as a `data:` URL. Section headers stay minimal for the narrow
+toggle; **images** show as a `data:` URL. Text files are also **editable** in place: an
+✏️ 编辑 toggle swaps the viewer for a textarea editor (Tab = 2-space indent, Ctrl/Cmd+S
+saves, dirty ● indicator, close-guard on unsaved changes); 💾 保存 writes back via
+`syncWriteFile` (remote, with `execKey`) / `LocalFs.writeFile` (local), base64-encoded
+with `textToBase64`, then reloads that side's tree (and re-runs 比对 if active). Edit is
+a plain textarea on purpose — no Monaco/CodeMirror — to keep the bundle weightless.
+Section headers stay minimal for the narrow
 sidebar — the working-dir path / node label is the header `title` tooltip only (not
 inline), with hover-revealed ↻ refresh / ⊟ collapse-all icons and a persistent
 row-selection highlight.

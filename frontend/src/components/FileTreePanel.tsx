@@ -126,6 +126,13 @@ function base64ToText(b64: string): string {
   const bytes = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
   return new TextDecoder('utf-8', { fatal: false }).decode(bytes);
 }
+function textToBase64(text: string): string {
+  const bytes = new TextEncoder().encode(text);
+  let bin = '';
+  const chunk = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunk) bin += String.fromCharCode(...bytes.subarray(i, i + chunk));
+  return btoa(bin);
+}
 
 interface PreviewState {
   side: Side; rel: string; name: string;
@@ -143,6 +150,11 @@ export const FileTreePanel: React.FC<Props> = ({ workingDir, execKey, execLabel 
   const [selected, setSelected] = useState<string | null>(null);  // 选中行 `${side}:${rel}`
   const [preview, setPreview] = useState<PreviewState | null>(null);
   const [mdRaw, setMdRaw] = useState(false);   // markdown 预览：渲染视图 / 源码
+  // 编辑态
+  const [editing, setEditing] = useState(false);
+  const [editText, setEditText] = useState('');
+  const [dirty, setDirty] = useState(false);
+  const [saving, setSaving] = useState(false);
   const [busy, setBusy] = useState('');
   const [msg, setMsg] = useState<{ kind: 'ok' | 'err'; text: string } | null>(null);
 
@@ -363,6 +375,7 @@ export const FileTreePanel: React.FC<Props> = ({ workingDir, execKey, execLabel 
   const openPreview = useCallback(async (side: Side, node: TNode) => {
     const base: PreviewState = { side, rel: node.rel, name: node.name, loading: true };
     setPreview(base);
+    setEditing(false); setDirty(false); setMdRaw(false);
     try {
       let b64: string | null = null;
       if (side === 'remote') {
@@ -387,6 +400,59 @@ export const FileTreePanel: React.FC<Props> = ({ workingDir, execKey, execLabel 
       setPreview({ ...base, loading: false, error: e?.message ?? String(e) });
     }
   }, [workingDir, execKey, localFs]);
+
+  const startEdit = useCallback(() => {
+    if (!preview || preview.isImage) return;
+    setEditText(preview.text || '');
+    setDirty(false);
+    setEditing(true);
+  }, [preview]);
+
+  const saveEdit = useCallback(async () => {
+    if (!preview) return;
+    setSaving(true);
+    try {
+      const b64 = textToBase64(editText);
+      if (preview.side === 'remote') {
+        if (!workingDir) throw new Error('未打开会话');
+        const r = await api.syncWriteFile(workingDir, preview.rel, b64, execKey);
+        if (r.status !== 'ok') throw new Error(r.message || '保存失败');
+      } else {
+        if (!localFs) throw new Error('未选择本地目录');
+        await localFs.writeFile(preview.rel, b64);
+      }
+      setPreview((p) => (p ? { ...p, text: editText } : p));
+      setDirty(false);
+      setEditing(false);
+      setMsg({ kind: 'ok', text: `✓ 已保存 ${preview.name}` });
+      reloadSide(preview.side);
+      if (compareOn) runCompare();
+    } catch (e: any) {
+      setMsg({ kind: 'err', text: `保存失败：${e?.message ?? e}` });
+    } finally {
+      setSaving(false);
+    }
+  }, [preview, editText, workingDir, execKey, localFs, reloadSide, compareOn, runCompare]);
+
+  const closePreview = useCallback(() => {
+    if (editing && dirty && !window.confirm('有未保存的修改，确定关闭？')) return;
+    setPreview(null); setEditing(false); setDirty(false);
+  }, [editing, dirty]);
+
+  const handleEditorKey = useCallback((e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    // Tab 缩进 2 空格(简单编辑器手感);Ctrl/Cmd+S 保存
+    if (e.key === 'Tab') {
+      e.preventDefault();
+      const t = e.currentTarget;
+      const s = t.selectionStart, en = t.selectionEnd;
+      const nv = editText.slice(0, s) + '  ' + editText.slice(en);
+      setEditText(nv); setDirty(true);
+      requestAnimationFrame(() => { t.selectionStart = t.selectionEnd = s + 2; });
+    } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 's') {
+      e.preventDefault();
+      if (dirty && !saving) saveEdit();
+    }
+  }, [editText, dirty, saving, saveEdit]);
 
   // ── 渲染 ─────────────────────────────────────────────────────────
   const renderDir = (side: Side, rel: string, depth: number): React.ReactNode => {
@@ -508,30 +574,50 @@ export const FileTreePanel: React.FC<Props> = ({ workingDir, execKey, execLabel 
       )}
 
       {preview && (
-        <div style={pvOverlay} onClick={() => setPreview(null)}>
+        <div style={pvOverlay} onClick={closePreview}>
           <div style={pvBox} onClick={(e) => e.stopPropagation()}>
             <div style={pvHeader}>
-              <span style={{ fontSize: 13 }}>{preview.isImage ? '🖼️' : '📄'}</span>
+              <span style={{ fontSize: 13 }}>{preview.isImage ? '🖼️' : editing ? '✏️' : '📄'}</span>
               <span style={{ fontWeight: 600, fontSize: 13, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={preview.rel}>
-                {preview.name}
+                {dirty && <span style={{ color: 'var(--theme-accent)' }}>● </span>}{preview.name}
               </span>
               <span style={{ fontSize: 11, color: 'var(--theme-text-muted)', flexShrink: 0 }}>
                 {preview.side === 'remote' ? '☁️ 远端' : '🖥️ 本地'}
               </span>
               <div style={{ flex: 1 }} />
-              {preview.isMarkdown && !preview.loading && !preview.error && (
+              {/* 视图态:markdown 预览/源码切换 + 编辑入口 */}
+              {!editing && preview.isMarkdown && !preview.loading && !preview.error && (
                 <div style={{ display: 'flex', border: '1px solid var(--theme-border)', borderRadius: 6, overflow: 'hidden', marginRight: 4 }}>
                   <button style={{ ...segBtnStyle, ...(!mdRaw ? segActiveStyle : {}) }} onClick={() => setMdRaw(false)}>👁 预览</button>
                   <button style={{ ...segBtnStyle, ...(mdRaw ? segActiveStyle : {}) }} onClick={() => setMdRaw(true)}>{'</> 源码'}</button>
                 </div>
               )}
-              <button style={hdrBtnStyle} onClick={() => setPreview(null)}>✕</button>
+              {!editing && !preview.isImage && !preview.loading && !preview.error && (
+                <button style={hdrBtnStyle} onClick={startEdit}>✏️ 编辑</button>
+              )}
+              {editing && (
+                <>
+                  <button style={{ ...hdrBtnStyle, ...(dirty && !saving ? { borderColor: 'var(--theme-accent)', color: 'var(--theme-accent)', background: 'var(--theme-accent-bg)' } : { opacity: 0.5 }) }}
+                    onClick={saveEdit} disabled={!dirty || saving}>{saving ? '保存中…' : '💾 保存'}</button>
+                  <button style={hdrBtnStyle} onClick={() => { if (!dirty || window.confirm('放弃未保存的修改？')) { setEditing(false); setDirty(false); } }}>取消</button>
+                </>
+              )}
+              <button style={hdrBtnStyle} onClick={closePreview}>✕</button>
             </div>
             <div style={pvBody}>
               {preview.loading ? (
                 <div style={{ padding: 24, textAlign: 'center', color: 'var(--theme-text-muted)' }}>加载中…</div>
               ) : preview.error ? (
                 <div style={{ padding: 24, color: '#f87171', fontSize: 13 }}>⚠ {preview.error}</div>
+              ) : editing ? (
+                <textarea
+                  value={editText}
+                  onChange={(e) => { setEditText(e.target.value); setDirty(true); }}
+                  onKeyDown={handleEditorKey}
+                  spellCheck={false}
+                  autoFocus
+                  style={pvEditor}
+                />
               ) : preview.isImage ? (
                 <div style={{ padding: 12, textAlign: 'center', overflow: 'auto' }}>
                   <img src={preview.dataUrl} alt={preview.name} style={{ maxWidth: '100%', maxHeight: '70vh' }} />
@@ -666,6 +752,13 @@ const pvBody: React.CSSProperties = {
 const pvPre: React.CSSProperties = {
   margin: 0, padding: '12px 16px', fontSize: 12.5, lineHeight: 1.6, fontFamily: 'monospace',
   whiteSpace: 'pre-wrap', wordBreak: 'break-word', color: 'var(--theme-text)',
+};
+const pvEditor: React.CSSProperties = {
+  width: '100%', minHeight: '60vh', boxSizing: 'border-box', resize: 'none',
+  padding: '12px 16px', border: 'none', outline: 'none',
+  fontSize: 12.5, lineHeight: 1.6, fontFamily: 'monospace', tabSize: 2,
+  background: 'var(--theme-input-bg, #0d1117)', color: 'var(--theme-text)',
+  whiteSpace: 'pre', overflowWrap: 'normal', overflowX: 'auto',
 };
 const segBtnStyle: React.CSSProperties = {
   fontSize: 11, padding: '3px 9px', border: 'none', cursor: 'pointer',
