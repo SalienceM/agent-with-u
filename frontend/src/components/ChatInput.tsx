@@ -46,8 +46,6 @@ interface Props {
   workingDir?: string;
   skipPermissions?: boolean;
   onSkipPermissionsChange?: (enabled: boolean) => void;
-  sandboxEnabled?: boolean;
-  onSandboxChange?: (enabled: boolean) => void;
   onCompact?: () => void;
   fontSize?: number;                         // 当前对话字号(用于 A−/A+ 显示)
   onAdjustFontSize?: (delta: number) => void; // 步进对话字号
@@ -102,7 +100,6 @@ const ToolbarBtn: React.FC<ToolbarBtnProps> = ({ icon, title, active, onClick, l
 const ChatInputInner: React.FC<Props> = ({
   onSend, onAbort, isStreaming, backends, activeBackendId, sessionId, workingDir,
   skipPermissions = true, onSkipPermissionsChange,
-  sandboxEnabled = true, onSandboxChange,
   onCompact,
   fontSize, onAdjustFontSize,
   isFocused = true,
@@ -741,13 +738,7 @@ const ChatInputInner: React.FC<Props> = ({
           onClick={() => onSkipPermissionsChange?.(!skipPermissions)}
         />
         <ToolbarBtn
-          icon="🔒"
-          title={sandboxEnabled ? "沙盒模式（已启用）— 文件操作限制在工作目录内" : "沙盒模式（已关闭）— 无路径限制"}
-          active={sandboxEnabled}
-          onClick={() => onSandboxChange?.(!sandboxEnabled)}
-        />
-        <ToolbarBtn
-          icon="✨"
+          icon="🧹"
           title="新会话（清空上下文，同目录）"
           onClick={handleCompact}
         />

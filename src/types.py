@@ -178,8 +178,10 @@ class Session:
     auto_continue: bool = True
     # ★ Skip permission confirmation for sensitive tools (Bash/Edit/Write)
     skip_permissions: bool = True
-    # ★ 沙盒模式：限制文件操作在 working_dir 范围内
-    sandbox_enabled: bool = True
+    # ★ 沙盒模式：限制文件操作在 working_dir 范围内。
+    #   该功能支持不完善（易误报越界），前端开关已下线，默认关闭、不再强制；
+    #   下方 Layer-2 校验代码保留但因本标志为 False 而不生效（便于将来恢复）。
+    sandbox_enabled: bool = False
     # Max continuation attempts
     max_continuations: int = 10
     # Track which backend config was used for each message

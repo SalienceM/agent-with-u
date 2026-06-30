@@ -1,5 +1,6 @@
 import React, { useEffect, useState, useCallback, memo, useRef } from 'react';
 import { api } from '../api';
+import { FileTreePanel } from './FileTreePanel';
 
 interface Session {
   id: string;
@@ -32,11 +33,17 @@ interface Props {
   collapsed?: boolean;
   onToggleCollapse?: () => void;
   isMobile?: boolean;
+  // ★ 当前会话的工作目录 / 执行节点 —— 供「文件」视图（本地⇄远端目录树）使用
+  activeWorkingDir?: string;
+  activeExecKey?: string;
+  activeExecLabel?: string;
 }
 
 // ★ Wrap with React.memo to prevent unnecessary re-renders when parent updates
-export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession, onNewSession, onDeleteSession, onAcknowledgeSession, streamingSessions, completedSessions = new Set(), collapsed, onToggleCollapse, isMobile }) => {
+export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession, onNewSession, onDeleteSession, onAcknowledgeSession, streamingSessions, completedSessions = new Set(), collapsed, onToggleCollapse, isMobile, activeWorkingDir, activeExecKey, activeExecLabel }) => {
   const [sessions, setSessions] = useState<Session[]>([]);
+  // ★ 侧栏视图：会话列表 / 文件目录树（本地 ⇄ 远端），左侧小按钮切换
+  const [view, setView] = useState<'sessions' | 'files'>('sessions');
   const [backends, setBackends] = useState<Backend[]>([]);
   const [hoveredSessionId, setHoveredSessionId] = useState<string | null>(null);
   const [sessionToDelete, setSessionToDelete] = useState<Session | null>(null);
@@ -332,26 +339,36 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
           pointer-events: none;
         }
       `}</style>
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '16px 12px 8px' }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 4, padding: '12px 10px 8px' }}>
         <button
           onClick={onToggleCollapse}
-          style={{ ...toggleBtnStyle, marginRight: 6 }}
+          style={toggleBtnStyle}
           title="收起侧栏"
         >
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
             <path d="M15 18l-6-6 6-6" />
           </svg>
         </button>
-        <span style={{ fontSize: 13, fontWeight: 600, color: 'var(--theme-text-muted, rgba(255,255,255,0.5))', textTransform: 'uppercase', letterSpacing: 0.5, flex: 1 }}>
-          Sessions
-        </span>
-        <button onClick={onNewSession} style={newBtnStyle} title="New session">
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-            <line x1="12" y1="5" x2="12" y2="19" />
-            <line x1="5" y1="12" x2="19" y2="12" />
-          </svg>
-        </button>
+        {/* 视图切换：💬 会话 / 🗂 文件 */}
+        <div style={{ display: 'flex', gap: 0, border: '1px solid var(--theme-border)', borderRadius: 7, overflow: 'hidden' }}>
+          <button onClick={() => setView('sessions')} title="会话列表"
+            style={{ ...viewTabStyle, ...(view === 'sessions' ? viewTabActive : {}) }}>💬</button>
+          <button onClick={() => setView('files')} title="文件目录（本地 ⇄ 远端）"
+            style={{ ...viewTabStyle, ...(view === 'files' ? viewTabActive : {}) }}>🗂</button>
+        </div>
+        <div style={{ flex: 1 }} />
+        {view === 'sessions' && (
+          <button onClick={onNewSession} style={newBtnStyle} title="New session">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <line x1="12" y1="5" x2="12" y2="19" />
+              <line x1="5" y1="12" x2="19" y2="12" />
+            </svg>
+          </button>
+        )}
       </div>
+      {view === 'files' ? (
+        <FileTreePanel workingDir={activeWorkingDir || ''} execKey={activeExecKey} execLabel={activeExecLabel} />
+      ) : (
       <div style={{ flex: 1, overflow: 'auto', padding: '4px 8px' }}>
         {sessions.map((s: any) => {
           const isRunning = streamingSessions.has(s.id);
@@ -472,6 +489,7 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
           </div>
         )}
       </div>
+      )}
 
       {/* 能力绑定面板 */}
       {abilityPickerSession && (
@@ -745,7 +763,10 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
     && prevProps.streamingSessions === nextProps.streamingSessions
     && prevProps.completedSessions === nextProps.completedSessions
     && prevProps.collapsed === nextProps.collapsed
-    && prevProps.isMobile === nextProps.isMobile;
+    && prevProps.isMobile === nextProps.isMobile
+    && prevProps.activeWorkingDir === nextProps.activeWorkingDir
+    && prevProps.activeExecKey === nextProps.activeExecKey
+    && prevProps.activeExecLabel === nextProps.activeExecLabel;
 });
 
 // Simple color mapping for backend badges
@@ -813,6 +834,14 @@ const runningDotStyle: React.CSSProperties = {
   height: 6,
   borderRadius: '50%',
   background: 'var(--theme-success, #2da44e)',
+};
+
+const viewTabStyle: React.CSSProperties = {
+  padding: '4px 9px', fontSize: 13, cursor: 'pointer', border: 'none',
+  background: 'transparent', color: 'var(--theme-text-muted, #656d76)',
+};
+const viewTabActive: React.CSSProperties = {
+  background: 'var(--theme-accent-bg, #0969da1a)', color: 'var(--theme-accent, #0969da)',
 };
 
 const newBtnStyle: React.CSSProperties = {

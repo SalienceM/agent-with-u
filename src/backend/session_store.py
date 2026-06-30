@@ -143,7 +143,8 @@ class SessionStore:
                 working_dir=data.get("workingDir"),
                 auto_continue=data.get("autoContinue", True),
                 skip_permissions=data.get("skipPermissions", True),
-                sandbox_enabled=data.get("sandboxEnabled", True),
+                # 沙盒功能已下线（UI 移除、支持不完善），一律关闭，忽略历史持久值。
+                sandbox_enabled=False,
                 constraints=data.get("constraints"),
                 abilities=data.get("abilities"),
                 session_type=data.get("sessionType", "normal"),

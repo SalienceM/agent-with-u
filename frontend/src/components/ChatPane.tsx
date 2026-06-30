@@ -95,9 +95,8 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
 }) => {
   // ── pane 自己的 session 详情(workingDir / backendId / skip / sandbox) ──
   const [activeSession, setActiveSession] = useState<any | null>(null);
-  // 权限/沙盒 state: 初值从 session 读,变化时持久化
+  // 权限 state: 初值从 session 读,变化时持久化
   const [skipPermissions, setSkipPermissions] = useState(true);
-  const [sandboxEnabled, setSandboxEnabled] = useState(true);
   // 可见消息条数(切换 session / 切回历史时只显示最近几条)
   // visibleCount 已废:历史分页由后端 + chat.loadEarlier() 控制,前端不再折叠
 
@@ -126,9 +125,6 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
       setActiveSession(session);
       if (session?.skipPermissions !== undefined) {
         setSkipPermissions(session.skipPermissions);
-      }
-      if (session?.sandboxEnabled !== undefined) {
-        setSandboxEnabled(session.sandboxEnabled);
       }
     });
     return () => {
@@ -251,21 +247,6 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
     [sessionId, activeBackendId],
   );
 
-  // ── 持久化 sandboxEnabled ──
-  const handleSandboxChange = useCallback(
-    (enabled: boolean) => {
-      setSandboxEnabled(enabled);
-      if (sessionId) {
-        api.executeCommand({
-          command: 'set_sandbox_enabled',
-          sessionId,
-          backendId: activeBackendId,
-          args: { enabled },
-        });
-      }
-    },
-    [sessionId, activeBackendId],
-  );
 
   const handleCompact = useCallback(() => {
     handleClearContext();
@@ -379,8 +360,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
           background: 'transparent',
         }}
       >
-        <LoopPanel sessionId={sessionId} embedded
-          sandboxEnabled={sandboxEnabled} onSandboxChange={handleSandboxChange} />
+        <LoopPanel sessionId={sessionId} embedded />
       </div>
     );
   }
@@ -605,32 +585,22 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
         )}
       </div>
 
-      {/* ---- 全局工具栏(输入框正上方,被 App 从顶栏挪下来,避免那一排太挤) ---- */}
-      {(onCycleLayout || onOpenSync) && (
+      {/* ---- 全局工具栏(输入框正上方,被 App 从顶栏挪下来,避免那一排太挤) ----
+           目录同步已重做为侧栏「🗂 文件」视图(本地 ⇄ 远端目录树),此处不再放入口。 */}
+      {onCycleLayout && (
         <div style={{
           display: 'flex',
           gap: 6,
           padding: '4px 10px 0',
           justifyContent: 'flex-end',
         }}>
-          {onCycleLayout && (
-            <button
-              onClick={onCycleLayout}
-              title="分屏布局 (1×1 / 1×2 / 2×2)"
-              style={paneToolBtnStyle}
-            >
-              ▦ {layoutLabel || ''}
-            </button>
-          )}
-          {onOpenSync && (
-            <button
-              onClick={onOpenSync}
-              title="目录同步(拉取 / 推送远端工作目录)"
-              style={paneToolBtnStyle}
-            >
-              🔄
-            </button>
-          )}
+          <button
+            onClick={onCycleLayout}
+            title="分屏布局 (1×1 / 1×2 / 2×2)"
+            style={paneToolBtnStyle}
+          >
+            ▦ {layoutLabel || ''}
+          </button>
         </div>
       )}
 
@@ -657,8 +627,6 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
         workingDir={activeSession?.workingDir || undefined}
         skipPermissions={skipPermissions}
         onSkipPermissionsChange={handleSkipPermissionsChange}
-        sandboxEnabled={sandboxEnabled}
-        onSandboxChange={handleSandboxChange}
         onCompact={handleCompact}
         fontSize={config.fontSize}
         onAdjustFontSize={onAdjustFontSize}

@@ -277,12 +277,15 @@ SVG/CSS — no d3 dep) draws each loop as a horizontal lane
 `#seq → Prepare → Execute(steps) → Analysis` with status colors, a pulsing
 node + marching-ants edge for whatever is currently running, and per-node /
 per-step durations (live-ticking while running). It is a **switchable alternate
-view** over the same state; the panel view is left untouched /
-a 🔒 **sandbox toggle** in the header, since loop sessions have no chat toolbar
-to flip `set_sandbox_enabled` from). Note: the Layer-2 sandbox path check
-(`validate_sandbox_path`) normalizes MSYS/Git-Bash drive paths (`/d/foo` →
-`D:\foo`) before comparison so the Windows backend doesn't false-positive when
-the agent emits Unix-style absolute paths.
+view** over the same state; the panel view is left untouched).
+
+**Sandbox mode removed (UI + default-off).** The Layer-2 working-dir sandbox
+(`validate_tool_sandbox` / `validate_sandbox_path`) had incomplete, false-positive-prone
+support, so its UI was removed everywhere (chat toolbar 🔒, LoopPanel header 🔒, the
+`set_sandbox_enabled` plumbing in ChatPane) and `Session.sandbox_enabled` now defaults
+**False** (and `session_store` loads it as False regardless of persisted value), so the
+enforcement code stays in the tree but is inert. To revive it, flip those defaults and
+re-add a toggle.
 Rationale: the old chat box shared `session.agent_session_id` with the loop's
 prepare/execute/analysis turns (cross-context pollution) and split attention; the
 panel-only design removes both. `LoopPanel` still supports a floating overlay
@@ -593,3 +596,19 @@ UI surfaces (config UX kept minimal — invisible to single-node users):
   remove) and an "➕ 加入可分配执行节点" button in the relay device list to add the
   selected node to the roster without switching home.
 - `getExecutors()` / `onExecStatus()` expose the live node list + status to the UI.
+
+### Directory sync — sidebar file-tree view (`FileTreePanel`)
+
+The old modal diff/pull/push dialog (`DirSyncPanel`, removed) was reworked into a
+VSCode-explorer-style tree living in the **Sidebar** as a switchable view (a 💬/🗂
+tab toggle in the sidebar header; `view: 'sessions' | 'files'`). `FileTreePanel`
+shows two collapsible roots — ☁️ **远端** (the active session's working dir on its
+execution node, read via `api.syncManifest(workingDir, execKey)`) and 🖥️ **本地**
+(a File-System-Access / Tauri local copy dir, via `dirSync`'s `LocalFs.scan`). Each
+flat manifest is turned into a nested tree (`buildTree`); folders expand, files are
+leaves. Per node, hovering reveals a one-click sync action: ⬆ **push** local→remote
+(`syncWriteFile`) on local nodes, ⬇ **pull** remote→local (`syncReadFile` +
+`LocalFs.writeFile`) on remote nodes; a directory applies to every file under it.
+All remote RPCs carry the session's `execKey` so they hit the owning node. App feeds
+the Sidebar `activeWorkingDir/activeExecKey/activeExecLabel` from the focused
+session (added to the Sidebar memo comparator).

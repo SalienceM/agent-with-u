@@ -14,7 +14,6 @@ import { ServerDirPicker } from './components/ServerDirPicker';
 import { LogViewer } from './components/LogViewer';
 import { AuthStatusBanner } from './components/AuthStatusBanner';
 import { ConnectionPanel } from './components/ConnectionPanel';
-import { DirSyncPanel } from './components/DirSyncPanel';
 import { ChatPane } from './components/ChatPane';
 import { LoopPolicyEditor, DEFAULT_POLICY, normalizePolicy } from './components/LoopPolicyEditor';
 import type { LoopPolicy } from './components/LoopPolicyEditor';
@@ -46,7 +45,6 @@ export const App: React.FC = () => {
   const [repoPanelOpen, setRepoPanelOpen] = useState(false);
   const [logViewerOpen, setLogViewerOpen] = useState(false);
   const [connPanelOpen, setConnPanelOpen] = useState(false);
-  const [syncPanelOpen, setSyncPanelOpen] = useState(false);
   const [repoPanelEditing, setRepoPanelEditing] = useState(false);
   const [newSessionDialogOpen, setNewSessionDialogOpen] = useState(false);
   const [streamingSessions, setStreamingSessions] = useState<Set<string>>(new Set());  // ★ Per-session streaming state
@@ -697,6 +695,9 @@ export const App: React.FC = () => {
         completedSessions={completedSessions}
         collapsed={sidebarCollapsed}
         onToggleCollapse={() => setSidebarCollapsed((v) => !v)}
+        activeWorkingDir={activeSession?.workingDir}
+        activeExecKey={activeSession?.execKey}
+        activeExecLabel={activeSession?.execLabel}
       />
 
       <div style={{ flex: 1, display: 'flex', flexDirection: 'column', minWidth: 0 }}>
@@ -738,10 +739,10 @@ export const App: React.FC = () => {
           {/* 日志查看器按钮 */}
           <button
             onClick={() => setLogViewerOpen(true)}
-            style={logBtnStyle}
-            title="View backend logs"
+            style={settingsBtnStyle}
+            title="后端日志 / Logs"
           >
-            📋{isMobile ? '' : ' Logs'}
+            📋
           </button>
           {/* 连接目标：本地直连 / 经中继访问远程执行节点 */}
           <button
@@ -836,7 +837,6 @@ export const App: React.FC = () => {
                   onAdjustFontSize={(delta) => updateConfig({ fontSize: Math.max(11, Math.min(28, config.fontSize + delta)) })}
                   layoutLabel={LAYOUT_LABEL[layout]}
                   onCycleLayout={() => setLayout((cur) => LAYOUT_CYCLE[(LAYOUT_CYCLE.indexOf(cur) + 1) % LAYOUT_CYCLE.length])}
-                  onOpenSync={() => setSyncPanelOpen(true)}
                 />
               ))}
             </div>
@@ -912,14 +912,7 @@ export const App: React.FC = () => {
       {/* ---- 连接目标设置 ---- */}
       {connPanelOpen && <ConnectionPanel onClose={() => setConnPanelOpen(false)} />}
 
-      {/* ---- 目录同步 ---- */}
-      {syncPanelOpen && (
-        <DirSyncPanel
-          workingDir={activeSession?.workingDir || ''}
-          execKey={activeSession?.execKey}
-          onClose={() => setSyncPanelOpen(false)}
-        />
-      )}
+      {/* 目录同步已重做为侧栏「🗂 文件」视图（本地 ⇄ 远端目录树），不再用弹窗。 */}
 
       {/* ---- Backend Manager ---- */}
       <BackendManager
