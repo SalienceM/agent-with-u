@@ -612,3 +612,14 @@ leaves. Per node, hovering reveals a one-click sync action: ⬆ **push** local�
 All remote RPCs carry the session's `execKey` so they hit the owning node. App feeds
 the Sidebar `activeWorkingDir/activeExecKey/activeExecLabel` from the focused
 session (added to the Sidebar memo comparator).
+
+**Diff / conflict highlighting** (`computeStatus`, three-way vs `dirSync`'s
+`loadBaseline`/`saveBaseline`): each file is classed `synced` / `differs` /
+`conflict` (both sides changed vs the last-synced baseline) / `local-only` /
+`remote-only`; non-synced nodes get a colored dot + name color, folders aggregate
+to the worst descendant (`changed` / `conflict`), and a top summary bar counts
+`冲突/不同/仅本地/仅远端` (shown once both manifests are loaded). A successful
+push/pull folds the transferred files into the baseline (`bumpBaseline`) so they
+flip to `synced` and future conflict detection stays accurate. (Manifests are still
+loaded eagerly — whole-dir `syncManifest`/`scan`; lazy per-folder loading for very
+large trees is a possible future refinement.)

@@ -13,7 +13,8 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { api } from '../api';
 import {
-  pickLocalDir, restoreLocalDir, type LocalFs, type Manifest,
+  pickLocalDir, restoreLocalDir, loadBaseline, saveBaseline,
+  type LocalFs, type Manifest,
 } from '../utils/dirSync';
 
 interface Props {
@@ -72,10 +73,56 @@ function formatBytes(n: number): string {
 
 type Side = 'local' | 'remote';
 
+// 文件级状态：基于 本地/远端 哈希 + 上次同步基线(三向)判定。
+type FileStatus = 'synced' | 'differs' | 'conflict' | 'local-only' | 'remote-only';
+// 目录聚合：synced / changed(内有非冲突变更) / conflict
+type NodeStatus = FileStatus | 'changed';
+
+const STATUS_COLOR: Record<NodeStatus, string> = {
+  synced: '#9ca3af', differs: '#f59e0b', conflict: '#ef4444',
+  'local-only': '#22c55e', 'remote-only': '#3b82f6', changed: '#f59e0b',
+};
+const STATUS_LABEL: Record<NodeStatus, string> = {
+  synced: '已同步', differs: '两端内容不同', conflict: '冲突：两端都改过',
+  'local-only': '仅本地有', 'remote-only': '仅远端有', changed: '内有变更',
+};
+
+function computeStatus(local: Manifest | null, remote: Manifest | null, baseline: Manifest): Record<string, FileStatus> {
+  const out: Record<string, FileStatus> = {};
+  const rels = new Set<string>([...Object.keys(local || {}), ...Object.keys(remote || {})]);
+  for (const rel of rels) {
+    const L = local?.[rel]?.hash;
+    const R = remote?.[rel]?.hash;
+    const B = baseline[rel]?.hash;
+    if (L && R) {
+      if (L === R) { out[rel] = 'synced'; continue; }
+      // 两端都存在但内容不同：若都相对基线改过 → 冲突,否则只是一端较新
+      out[rel] = (L !== B && R !== B) ? 'conflict' : 'differs';
+    } else if (L && !R) {
+      out[rel] = 'local-only';
+    } else if (R && !L) {
+      out[rel] = 'remote-only';
+    }
+  }
+  return out;
+}
+
+// 目录节点状态 = 其下文件里最严重的那个(冲突 > 任意变更 > 已同步)。
+function aggregateStatus(rels: string[], statusMap: Record<string, FileStatus>): NodeStatus {
+  let changed = false;
+  for (const r of rels) {
+    const s = statusMap[r];
+    if (s === 'conflict') return 'conflict';
+    if (s && s !== 'synced') changed = true;
+  }
+  return changed ? 'changed' : 'synced';
+}
+
 export const FileTreePanel: React.FC<Props> = ({ workingDir, execKey, execLabel }) => {
   const [localFs, setLocalFs] = useState<LocalFs | null>(null);
   const [localManifest, setLocalManifest] = useState<Manifest | null>(null);
   const [remoteManifest, setRemoteManifest] = useState<Manifest | null>(null);
+  const [baseline, setBaseline] = useState<Manifest>({});
   const [loadingLocal, setLoadingLocal] = useState(false);
   const [loadingRemote, setLoadingRemote] = useState(false);
   const [expanded, setExpanded] = useState<Record<string, boolean>>({ 'local:': true, 'remote:': true });
@@ -84,6 +131,41 @@ export const FileTreePanel: React.FC<Props> = ({ workingDir, execKey, execLabel 
 
   const localTree = useMemo(() => (localManifest ? buildTree(localManifest) : []), [localManifest]);
   const remoteTree = useMemo(() => (remoteManifest ? buildTree(remoteManifest) : []), [remoteManifest]);
+
+  // 上次同步基线(三向比对用):随 本地目录 + 远端工作目录 变化而载入。
+  useEffect(() => {
+    if (localFs && workingDir) setBaseline(loadBaseline(localFs.id(), workingDir));
+    else setBaseline({});
+  }, [localFs, workingDir]);
+
+  const statusMap = useMemo(
+    () => computeStatus(localManifest, remoteManifest, baseline),
+    [localManifest, remoteManifest, baseline],
+  );
+  const summary = useMemo(() => {
+    const c = { conflict: 0, differs: 0, 'local-only': 0, 'remote-only': 0, synced: 0 } as Record<FileStatus, number>;
+    for (const s of Object.values(statusMap)) c[s]++;
+    return c;
+  }, [statusMap]);
+
+  // 某节点的展示状态(文件直接取;目录聚合其下文件)。
+  const nodeStatus = useCallback((side: Side, n: TNode): NodeStatus | null => {
+    if (!n.isDir) return statusMap[n.rel] ?? null;
+    const m = side === 'local' ? localManifest : remoteManifest;
+    if (!m) return null;
+    return aggregateStatus(relsUnder(m, n), statusMap);
+  }, [statusMap, localManifest, remoteManifest]);
+
+  // 同步成功后,把传输过的文件并入基线 → 状态翻为「已同步」,后续冲突判定也准确。
+  const bumpBaseline = useCallback((rels: string[], src: Manifest | null) => {
+    if (!localFs || !workingDir || !src) return;
+    setBaseline((prev) => {
+      const next = { ...prev };
+      for (const rel of rels) if (src[rel]) next[rel] = src[rel];
+      saveBaseline(localFs.id(), workingDir, next);
+      return next;
+    });
+  }, [localFs, workingDir]);
 
   const refreshLocal = useCallback(async (fs: LocalFs | null) => {
     if (!fs) { setLocalManifest(null); return; }
@@ -145,22 +227,23 @@ export const FileTreePanel: React.FC<Props> = ({ workingDir, execKey, execLabel 
     const rels = relsUnder(localManifest, node);
     if (node.isDir && !window.confirm(`把目录「${node.name || '根'}」下的 ${rels.length} 个文件推送到远端？`)) return;
     setMsg(null);
-    let ok = 0;
+    const okRels: string[] = [];
     try {
       for (let i = 0; i < rels.length; i++) {
         setBusy(`推送 ${i + 1}/${rels.length}：${rels[i]}`);
         const b64 = await localFs.readFile(rels[i]);
         const r = await api.syncWriteFile(workingDir, rels[i], b64, execKey);
-        if (r.status === 'ok') ok++;
+        if (r.status === 'ok') okRels.push(rels[i]);
       }
-      setMsg({ kind: 'ok', text: `✓ 已推送 ${ok}/${rels.length} 个文件到远端` });
+      bumpBaseline(okRels, localManifest);
+      setMsg({ kind: 'ok', text: `✓ 已推送 ${okRels.length}/${rels.length} 个文件到远端` });
       refreshRemote();
     } catch (e: any) {
       setMsg({ kind: 'err', text: `推送失败：${e?.message ?? e}` });
     } finally {
       setBusy('');
     }
-  }, [localFs, localManifest, workingDir, execKey, refreshRemote]);
+  }, [localFs, localManifest, workingDir, execKey, refreshRemote, bumpBaseline]);
 
   // 拉取：远端 → 本地
   const pullNode = useCallback(async (node: TNode) => {
@@ -169,26 +252,29 @@ export const FileTreePanel: React.FC<Props> = ({ workingDir, execKey, execLabel 
     const rels = relsUnder(remoteManifest, node);
     if (node.isDir && !window.confirm(`把远端目录「${node.name || '根'}」下的 ${rels.length} 个文件拉取到本地？`)) return;
     setMsg(null);
-    let ok = 0;
+    const okRels: string[] = [];
     try {
       for (let i = 0; i < rels.length; i++) {
         setBusy(`拉取 ${i + 1}/${rels.length}：${rels[i]}`);
         const r = await api.syncReadFile(workingDir, rels[i], execKey);
-        if (r.status === 'ok' && r.data != null) { await localFs.writeFile(rels[i], r.data); ok++; }
+        if (r.status === 'ok' && r.data != null) { await localFs.writeFile(rels[i], r.data); okRels.push(rels[i]); }
       }
-      setMsg({ kind: 'ok', text: `✓ 已拉取 ${ok}/${rels.length} 个文件到本地` });
+      bumpBaseline(okRels, remoteManifest);
+      setMsg({ kind: 'ok', text: `✓ 已拉取 ${okRels.length}/${rels.length} 个文件到本地` });
       refreshLocal(localFs);
     } catch (e: any) {
       setMsg({ kind: 'err', text: `拉取失败：${e?.message ?? e}` });
     } finally {
       setBusy('');
     }
-  }, [localFs, remoteManifest, workingDir, execKey, refreshLocal]);
+  }, [localFs, remoteManifest, workingDir, execKey, refreshLocal, bumpBaseline]);
 
   const renderNodes = (side: Side, nodes: TNode[], depth: number): React.ReactNode =>
     nodes.map((n) => {
       const key = `${side}:${n.rel}`;
       const open = !!expanded[key];
+      const st = nodeStatus(side, n);
+      const hot = st && st !== 'synced' ? st : null;   // 非「已同步」才高亮
       return (
         <div key={key}>
           <div
@@ -200,7 +286,15 @@ export const FileTreePanel: React.FC<Props> = ({ workingDir, execKey, execLabel 
               {n.isDir ? (open ? '▾' : '▸') : ''}
             </span>
             <span style={{ flexShrink: 0 }}>{n.isDir ? (open ? '📂' : '📁') : '📄'}</span>
-            <span style={nameStyle}>{n.name}</span>
+            <span style={{ ...nameStyle, ...(hot ? { color: STATUS_COLOR[hot], fontWeight: 600 } : {}) }}>
+              {n.name}
+            </span>
+            {hot && (
+              <span
+                title={STATUS_LABEL[hot]}
+                style={{ width: 7, height: 7, borderRadius: '50%', background: STATUS_COLOR[hot], flexShrink: 0 }}
+              />
+            )}
             {!n.isDir && <span style={sizeStyle}>{formatBytes(n.size)}</span>}
             <button
               className="ftp-act"
@@ -224,6 +318,22 @@ export const FileTreePanel: React.FC<Props> = ({ workingDir, execKey, execLabel 
         .ftp-act { opacity: 0; }
         .ftp-row:hover .ftp-act { opacity: 1; }
       `}</style>
+
+      {/* 两端差异概览（需本地+远端都已载入才有意义） */}
+      {localManifest && remoteManifest && (
+        <div style={summaryStyle}>
+          {summary.conflict + summary.differs + summary['local-only'] + summary['remote-only'] === 0 ? (
+            <span style={{ color: 'var(--theme-success, #2da44e)' }}>✓ 两端一致</span>
+          ) : (
+            <>
+              {summary.conflict > 0 && <Chip color={STATUS_COLOR.conflict} text={`冲突 ${summary.conflict}`} />}
+              {summary.differs > 0 && <Chip color={STATUS_COLOR.differs} text={`不同 ${summary.differs}`} />}
+              {summary['local-only'] > 0 && <Chip color={STATUS_COLOR['local-only']} text={`仅本地 ${summary['local-only']}`} />}
+              {summary['remote-only'] > 0 && <Chip color={STATUS_COLOR['remote-only']} text={`仅远端 ${summary['remote-only']}`} />}
+            </>
+          )}
+        </div>
+      )}
 
       {/* ☁️ 远端 */}
       <SectionHeader
@@ -305,6 +415,13 @@ const Empty: React.FC<{ text: string }> = ({ text }) => (
   <div style={{ padding: '10px 12px', fontSize: 11, color: 'var(--theme-text-muted)' }}>{text}</div>
 );
 
+const Chip: React.FC<{ color: string; text: string }> = ({ color, text }) => (
+  <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+    <span style={{ width: 7, height: 7, borderRadius: '50%', background: color }} />
+    <span>{text}</span>
+  </span>
+);
+
 function shortDir(dir: string): string {
   const parts = dir.replace(/\\/g, '/').split('/').filter(Boolean);
   return parts.length <= 2 ? dir : '.../' + parts.slice(-2).join('/');
@@ -312,6 +429,11 @@ function shortDir(dir: string): string {
 
 const wrapStyle: React.CSSProperties = {
   flex: 1, display: 'flex', flexDirection: 'column', overflowY: 'auto', minHeight: 0,
+};
+const summaryStyle: React.CSSProperties = {
+  display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap',
+  padding: '6px 10px', fontSize: 11, color: 'var(--theme-text-muted)',
+  borderBottom: '1px solid var(--theme-border)', background: 'var(--theme-bg-secondary)',
 };
 const sectionHeaderStyle: React.CSSProperties = {
   display: 'flex', alignItems: 'center', gap: 6, padding: '8px 8px',
