@@ -631,3 +631,11 @@ counts `冲突/不同/仅本地/仅远端` (`✕` exits compare). A successful p
 transferred files into the baseline (`bumpBaseline`) so they flip to `synced`.
 Folder push/pull gathers its file list from the manifest (compare on) or by walking
 `listDirectory`/`listDir` (compare off).
+
+**Preview & layout.** Clicking a file (or its 👁 hover action / double-click) opens a
+centered preview overlay — text via `TextDecoder` (capped at 200KB), images as a
+`data:` URL (read with `syncReadFile`/`LocalFs.readFile`; remote respects the
+`tooLarge` flag). Section headers are kept minimal for the narrow sidebar: the
+working-dir path / node label is the header `title` tooltip only (not rendered
+inline), with hover-revealed ↻ refresh / ⊟ collapse-all icons and a persistent
+row-selection highlight.

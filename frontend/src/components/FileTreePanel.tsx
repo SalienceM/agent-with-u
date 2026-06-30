@@ -79,6 +79,29 @@ function aggregateStatus(rels: string[], statusMap: Record<string, FileStatus>):
   return changed ? 'changed' : 'synced';
 }
 
+// ── 预览 ─────────────────────────────────────────────────────────────
+const IMAGE_EXTS = new Set(['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp', 'svg', 'ico', 'avif']);
+const PREVIEW_TEXT_CAP = 200_000;   // 文本预览上限,避免超大文件卡 UI
+
+function extOf(name: string): string {
+  const i = name.lastIndexOf('.');
+  return i >= 0 ? name.slice(i + 1).toLowerCase() : '';
+}
+function imageMime(ext: string): string {
+  if (ext === 'svg') return 'image/svg+xml';
+  if (ext === 'ico') return 'image/x-icon';
+  return `image/${ext === 'jpg' ? 'jpeg' : ext}`;
+}
+function base64ToText(b64: string): string {
+  const bytes = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
+  return new TextDecoder('utf-8', { fatal: false }).decode(bytes);
+}
+
+interface PreviewState {
+  side: Side; rel: string; name: string;
+  loading: boolean; text?: string; dataUrl?: string; isImage?: boolean; error?: string;
+}
+
 export const FileTreePanel: React.FC<Props> = ({ workingDir, execKey, execLabel }) => {
   const [localFs, setLocalFs] = useState<LocalFs | null>(null);
   // 懒加载层级缓存：key=`${side}:${rel}` → 直接子项
@@ -88,6 +111,7 @@ export const FileTreePanel: React.FC<Props> = ({ workingDir, execKey, execLabel 
   // 两个根区块的展开状态(独立存,避免和名为 "root" 的顶层目录键冲突)
   const [secOpen, setSecOpen] = useState<Record<Side, boolean>>({ remote: true, local: true });
   const [selected, setSelected] = useState<string | null>(null);  // 选中行 `${side}:${rel}`
+  const [preview, setPreview] = useState<PreviewState | null>(null);
   const [busy, setBusy] = useState('');
   const [msg, setMsg] = useState<{ kind: 'ok' | 'err'; text: string } | null>(null);
 
@@ -304,6 +328,35 @@ export const FileTreePanel: React.FC<Props> = ({ workingDir, execKey, execLabel 
     } finally { setBusy(''); }
   }, [localFs, workingDir, execKey, collectFiles, bumpBaseline, remoteManifest, reloadSide, compareOn, runCompare]);
 
+  // ── 预览文件内容（文本 / 图片）─────────────────────────────────────
+  const openPreview = useCallback(async (side: Side, node: TNode) => {
+    const base: PreviewState = { side, rel: node.rel, name: node.name, loading: true };
+    setPreview(base);
+    try {
+      let b64: string | null = null;
+      if (side === 'remote') {
+        if (!workingDir) throw new Error('未打开会话');
+        const r = await api.syncReadFile(workingDir, node.rel, execKey);
+        if (r.status !== 'ok') throw new Error(r.message || '读取失败');
+        if (r.tooLarge) { setPreview({ ...base, loading: false, error: '文件过大，不便预览（请直接拉取到本地查看）' }); return; }
+        b64 = r.data ?? '';
+      } else {
+        if (!localFs) throw new Error('未选择本地目录');
+        b64 = await localFs.readFile(node.rel);
+      }
+      const ext = extOf(node.name);
+      if (IMAGE_EXTS.has(ext)) {
+        setPreview({ ...base, loading: false, isImage: true, dataUrl: `data:${imageMime(ext)};base64,${b64}` });
+      } else {
+        let text = base64ToText(b64 || '');
+        if (text.length > PREVIEW_TEXT_CAP) text = text.slice(0, PREVIEW_TEXT_CAP) + '\n\n…（已截断,仅预览前 200KB）';
+        setPreview({ ...base, loading: false, isImage: false, text });
+      }
+    } catch (e: any) {
+      setPreview({ ...base, loading: false, error: e?.message ?? String(e) });
+    }
+  }, [workingDir, execKey, localFs]);
+
   // ── 渲染 ─────────────────────────────────────────────────────────
   const renderDir = (side: Side, rel: string, depth: number): React.ReactNode => {
     const key = ck(side, rel);
@@ -322,7 +375,8 @@ export const FileTreePanel: React.FC<Props> = ({ workingDir, execKey, execLabel 
           <div
             className={`ftp-row${selected === nk ? ' ftp-sel' : ''}`}
             style={rowStyle}
-            onClick={() => { setSelected(nk); toggle(side, n); }}
+            onClick={() => { setSelected(nk); n.isDir ? toggle(side, n) : openPreview(side, n); }}
+            onDoubleClick={() => { if (!n.isDir) openPreview(side, n); }}
             title={n.name}
           >
             {Array.from({ length: depth }).map((_, i) => <span key={i} style={guideStyle} />)}
@@ -330,6 +384,10 @@ export const FileTreePanel: React.FC<Props> = ({ workingDir, execKey, execLabel 
             <span style={iconStyle}>{n.isDir ? (open ? '📂' : '📁') : '📄'}</span>
             <span style={{ ...nameStyle, ...(hot ? { color: STATUS_COLOR[hot] } : {}) }}>{n.name}</span>
             {hot && <span title={STATUS_LABEL[hot]} style={{ width: 7, height: 7, borderRadius: '50%', background: STATUS_COLOR[hot], flexShrink: 0, marginLeft: 4 }} />}
+            {!n.isDir && (
+              <button className="ftp-act" style={actBtnStyle} title="预览"
+                onClick={(e) => { e.stopPropagation(); openPreview(side, n); }}>👁</button>
+            )}
             <button
               className="ftp-act" style={actBtnStyle}
               title={side === 'local' ? '推送到远端' : '拉取到本地'}
@@ -382,8 +440,8 @@ export const FileTreePanel: React.FC<Props> = ({ workingDir, execKey, execLabel 
       </div>
 
       {/* ☁️ 远端 */}
-      <SectionHeader icon="☁️" title={`远端${execLabel ? `（${execLabel}）` : ''}`}
-        sub={workingDir ? shortDir(workingDir) : '（未打开会话）'}
+      <SectionHeader icon="☁️" title="远端"
+        sub={`${execLabel ? execLabel + ' · ' : ''}${workingDir || '（未打开会话）'}`}
         open={secOpen.remote} loading={loading[ck('remote', '')]}
         onToggle={() => setSecOpen((p) => ({ ...p, remote: !p.remote }))}
         onRefresh={() => reloadSide('remote')}
@@ -396,7 +454,7 @@ export const FileTreePanel: React.FC<Props> = ({ workingDir, execKey, execLabel 
 
       {/* 🖥️ 本地 */}
       <SectionHeader icon="🖥️" title="本地"
-        sub={localFs ? localFs.label() : '（未选择本机目录）'}
+        sub={localFs ? localFs.label() : '未选择本机目录'}
         open={secOpen.local} loading={loading[ck('local', '')]}
         onToggle={() => setSecOpen((p) => ({ ...p, local: !p.local }))}
         onRefresh={localFs ? () => reloadSide('local') : undefined}
@@ -417,6 +475,37 @@ export const FileTreePanel: React.FC<Props> = ({ workingDir, execKey, execLabel 
           {busy || msg?.text}
         </div>
       )}
+
+      {preview && (
+        <div style={pvOverlay} onClick={() => setPreview(null)}>
+          <div style={pvBox} onClick={(e) => e.stopPropagation()}>
+            <div style={pvHeader}>
+              <span style={{ fontSize: 13 }}>{preview.isImage ? '🖼️' : '📄'}</span>
+              <span style={{ fontWeight: 600, fontSize: 13, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={preview.rel}>
+                {preview.name}
+              </span>
+              <span style={{ fontSize: 11, color: 'var(--theme-text-muted)', flexShrink: 0 }}>
+                {preview.side === 'remote' ? '☁️ 远端' : '🖥️ 本地'}
+              </span>
+              <div style={{ flex: 1 }} />
+              <button style={hdrBtnStyle} onClick={() => setPreview(null)}>✕</button>
+            </div>
+            <div style={pvBody}>
+              {preview.loading ? (
+                <div style={{ padding: 24, textAlign: 'center', color: 'var(--theme-text-muted)' }}>加载中…</div>
+              ) : preview.error ? (
+                <div style={{ padding: 24, color: '#f87171', fontSize: 13 }}>⚠ {preview.error}</div>
+              ) : preview.isImage ? (
+                <div style={{ padding: 12, textAlign: 'center', overflow: 'auto' }}>
+                  <img src={preview.dataUrl} alt={preview.name} style={{ maxWidth: '100%', maxHeight: '70vh' }} />
+                </div>
+              ) : (
+                <pre style={pvPre}>{preview.text || '（空文件）'}</pre>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 };
@@ -426,13 +515,13 @@ const SectionHeader: React.FC<{
   onToggle: () => void; onRefresh?: () => void; onCollapseAll?: () => void;
   onPick?: () => void; pickLabel?: string; pickAlways?: boolean;
 }> = ({ icon, title, sub, open, loading, onToggle, onRefresh, onCollapseAll, onPick, pickLabel, pickAlways }) => (
-  <div className="ftp-hdr" style={sectionHeaderStyle} onClick={onToggle}>
+  <div className="ftp-hdr" style={sectionHeaderStyle} onClick={onToggle} title={sub}>
     <span style={{ width: 16, textAlign: 'center', fontSize: 10, color: 'var(--theme-text-muted)' }}>{open ? '▾' : '▸'}</span>
     <span style={{ fontSize: 13 }}>{icon}</span>
-    <span style={{ fontWeight: 700, fontSize: 11, letterSpacing: 0.4, textTransform: 'uppercase', color: 'var(--theme-text)' }}>{title}</span>
-    <span style={sectionSubStyle} title={sub}>{sub}</span>
-    {loading && <span style={{ fontSize: 10, color: 'var(--theme-text-muted)' }}>…</span>}
-    <div style={{ flex: 1 }} />
+    <span style={{ fontWeight: 700, fontSize: 11, letterSpacing: 0.4, textTransform: 'uppercase', color: 'var(--theme-text)', flexShrink: 0 }}>{title}</span>
+    {/* 路径/节点只作 header 的 tooltip(title 属性),不挤在标题行 —— 窄侧栏更清爽 */}
+    {loading && <span style={{ fontSize: 10, color: 'var(--theme-text-muted)', flexShrink: 0 }}>…</span>}
+    <div style={{ flex: 1, minWidth: 4 }} />
     {/* 动作图标：平时隐藏,hover 区块标题才出现(VSCode 风);「选择目录」空态例外,常显 */}
     {onPick && (
       <button className={pickAlways ? undefined : 'ftp-hbtn'} style={hdrBtnStyle} title="选择/更换本机目录"
@@ -460,11 +549,6 @@ const Chip: React.FC<{ color: string; text: string }> = ({ color, text }) => (
   </span>
 );
 
-function shortDir(dir: string): string {
-  const parts = dir.replace(/\\/g, '/').split('/').filter(Boolean);
-  return parts.length <= 2 ? dir : '.../' + parts.slice(-2).join('/');
-}
-
 const wrapStyle: React.CSSProperties = {
   flex: 1, display: 'flex', flexDirection: 'column', overflowY: 'auto', minHeight: 0,
 };
@@ -480,10 +564,6 @@ const cmpBtnStyle: React.CSSProperties = {
 const sectionHeaderStyle: React.CSSProperties = {
   display: 'flex', alignItems: 'center', gap: 4, height: 24, padding: '0 6px', cursor: 'pointer', userSelect: 'none',
   position: 'sticky', top: 0, background: 'var(--theme-sidebar-bg, #f6f8fa)', zIndex: 1,
-};
-const sectionSubStyle: React.CSSProperties = {
-  fontSize: 10, color: 'var(--theme-text-muted)', fontFamily: 'monospace',
-  overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: 90,
 };
 const hdrBtnStyle: React.CSSProperties = {
   fontSize: 11, padding: '2px 7px', borderRadius: 5, cursor: 'pointer',
@@ -522,4 +602,24 @@ const actBtnStyle: React.CSSProperties = {
 };
 const emptyStyle: React.CSSProperties = {
   padding: '10px 12px', fontSize: 11, color: 'var(--theme-text-muted)',
+};
+const pvOverlay: React.CSSProperties = {
+  position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.5)', zIndex: 1300,
+  display: 'flex', alignItems: 'center', justifyContent: 'center',
+};
+const pvBox: React.CSSProperties = {
+  width: 'min(820px, 92vw)', maxHeight: '86vh', display: 'flex', flexDirection: 'column',
+  background: 'var(--theme-bg-secondary, #1f2030)', border: '1px solid var(--theme-border)',
+  borderRadius: 12, boxShadow: '0 8px 32px rgba(0,0,0,0.4)', overflow: 'hidden',
+};
+const pvHeader: React.CSSProperties = {
+  display: 'flex', alignItems: 'center', gap: 8, padding: '10px 14px',
+  borderBottom: '1px solid var(--theme-border)', flexShrink: 0,
+};
+const pvBody: React.CSSProperties = {
+  overflow: 'auto', minHeight: 0, background: 'var(--theme-bg, rgba(0,0,0,0.2))',
+};
+const pvPre: React.CSSProperties = {
+  margin: 0, padding: '12px 16px', fontSize: 12.5, lineHeight: 1.6, fontFamily: 'monospace',
+  whiteSpace: 'pre-wrap', wordBreak: 'break-word', color: 'var(--theme-text)',
 };
