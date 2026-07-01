@@ -38,10 +38,11 @@ interface Props {
   activeWorkingDir?: string;
   activeExecKey?: string;
   activeExecLabel?: string;
+  activeExecMode?: 'local' | 'relay';
 }
 
 // ★ Wrap with React.memo to prevent unnecessary re-renders when parent updates
-export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession, onNewSession, onDeleteSession, onAcknowledgeSession, streamingSessions, completedSessions = new Set(), collapsed, onToggleCollapse, isMobile, width, activeWorkingDir, activeExecKey, activeExecLabel }) => {
+export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession, onNewSession, onDeleteSession, onAcknowledgeSession, streamingSessions, completedSessions = new Set(), collapsed, onToggleCollapse, isMobile, width, activeWorkingDir, activeExecKey, activeExecLabel, activeExecMode }) => {
   const [sessions, setSessions] = useState<Session[]>([]);
   // ★ 侧栏视图：会话列表 / 文件目录树（本地 ⇄ 远端），左侧小按钮切换
   const [view, setView] = useState<'sessions' | 'files'>('sessions');
@@ -368,7 +369,7 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
         )}
       </div>
       {view === 'files' ? (
-        <FileTreePanel workingDir={activeWorkingDir || ''} execKey={activeExecKey} execLabel={activeExecLabel} />
+        <FileTreePanel workingDir={activeWorkingDir || ''} execKey={activeExecKey} execLabel={activeExecLabel} execMode={activeExecMode} />
       ) : (
       <div style={{ flex: 1, overflow: 'auto', padding: '4px 8px' }}>
         {sessions.map((s: any) => {
@@ -768,7 +769,8 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
     && prevProps.width === nextProps.width
     && prevProps.activeWorkingDir === nextProps.activeWorkingDir
     && prevProps.activeExecKey === nextProps.activeExecKey
-    && prevProps.activeExecLabel === nextProps.activeExecLabel;
+    && prevProps.activeExecLabel === nextProps.activeExecLabel
+    && prevProps.activeExecMode === nextProps.activeExecMode;
 });
 
 // Simple color mapping for backend badges

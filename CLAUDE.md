@@ -611,16 +611,25 @@ UI surfaces (config UX kept minimal — invisible to single-node users):
 The old modal diff/pull/push dialog (`DirSyncPanel`, removed) was reworked into a
 VSCode-explorer-style tree living in the **Sidebar** as a switchable view (a 💬/🗂
 tab toggle in the sidebar header; `view: 'sessions' | 'files'`). `FileTreePanel`
-shows two collapsible roots — ☁️ **远端** (the active session's working dir on its
-execution node, read via `api.syncManifest(workingDir, execKey)`) and 🖥️ **本地**
-(a File-System-Access / Tauri local copy dir, via `dirSync`'s `LocalFs.scan`). Each
-flat manifest is turned into a nested tree (`buildTree`); folders expand, files are
-leaves. Per node, hovering reveals a one-click sync action: ⬆ **push** local→remote
-(`syncWriteFile`) on local nodes, ⬇ **pull** remote→local (`syncReadFile` +
-`LocalFs.writeFile`) on remote nodes; a directory applies to every file under it.
-All remote RPCs carry the session's `execKey` so they hit the owning node. App feeds
-the Sidebar `activeWorkingDir/activeExecKey/activeExecLabel` from the focused
-session (added to the Sidebar memo comparator).
+shows a **single unified tree** of the focused session's working dir (Synology-Drive
+style — one list, per-file status badge), not two separate 远端/本地 lists. App feeds
+the Sidebar `activeWorkingDir/activeExecKey/activeExecLabel/activeExecMode` from the
+focused session (all in the Sidebar memo comparator).
+
+**View/edit always act on the session's node** (`syncReadFile`/`syncWriteFile`, routed
+by `execKey`) — so it works uniformly for both session kinds and needs no local copy.
+
+**Local vs remote session** (`execMode`): a **local session** (`execMode!=='relay'`,
+runs on 本机) shows a plain working-dir tree — no cloud, no copy dir, click to view/edit
+the real files directly. A **remote session** (`execMode==='relay'`) marks every file
+☁️ **cloud** by default (content lives on the executor node, fetched on demand); an
+optional **本地副本目录** (`选择本地副本目录`, File-System-Access/Tauri `LocalFs`) enables
+offline download + diff + two-way sync. Per-file status (`statusOf`) = `cloud` (not
+downloaded) / `local` (downloaded, presence-only) / `synced` ✓ / `differs` ± / `conflict`
+⚠ (the last two need `🔍 比对`, which loads `syncManifest` hashes + three-way `baseline`).
+Hover actions: 👁 preview/edit, ⬇ download-to-local, ⬆ upload-local-changes (folders
+recurse; a successful transfer `bumpBaseline`s + re-scans). File icon itself is ☁️ for
+cloud, 📄 once local.
 
 **Lazy browsing (nothing heavy / no transfer until you click).** Folders load
 their direct children only on expand — remote via `api.listDirectory(rel,
