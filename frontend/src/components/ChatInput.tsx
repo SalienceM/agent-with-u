@@ -46,6 +46,7 @@ interface Props {
   workingDir?: string;
   skipPermissions?: boolean;
   onSkipPermissionsChange?: (enabled: boolean) => void;
+  isMobile?: boolean;
   onCompact?: () => void;
   fontSize?: number;                         // 当前对话字号(用于 A−/A+ 显示)
   onAdjustFontSize?: (delta: number) => void; // 步进对话字号
@@ -63,9 +64,10 @@ interface ToolbarBtnProps {
   active?: boolean;
   onClick?: () => void;
   loading?: boolean;
+  compact?: boolean;   // 移动端:只显示图标,隐藏文字标签(整排不再撑成好几行)
 }
 
-const ToolbarBtn: React.FC<ToolbarBtnProps> = ({ icon, title, active, onClick, loading }) => {
+const ToolbarBtn: React.FC<ToolbarBtnProps> = ({ icon, title, active, onClick, loading, compact }) => {
   const [isHover, setIsHover] = React.useState(false);
   return (
     <button
@@ -78,8 +80,8 @@ const ToolbarBtn: React.FC<ToolbarBtnProps> = ({ icon, title, active, onClick, l
         display: 'inline-flex',
         alignItems: 'center',
         justifyContent: 'center',
-        gap: 4,
-        padding: '4px 8px',
+        gap: compact ? 0 : 4,
+        padding: compact ? '5px 9px' : '4px 8px',
         fontSize: 11,
         borderRadius: 6,
         border: active ? '1px solid var(--theme-accent, #0969da)' : '1px solid var(--theme-border, rgba(0,0,0,0.12))',
@@ -91,8 +93,8 @@ const ToolbarBtn: React.FC<ToolbarBtnProps> = ({ icon, title, active, onClick, l
         opacity: loading ? 0.6 : 1,
       }}
     >
-      <span style={{ fontSize: 12 }}>{icon}</span>
-      <span>{title}</span>
+      <span style={{ fontSize: compact ? 14 : 12 }}>{icon}</span>
+      {!compact && <span>{title}</span>}
     </button>
   );
 };
@@ -100,6 +102,7 @@ const ToolbarBtn: React.FC<ToolbarBtnProps> = ({ icon, title, active, onClick, l
 const ChatInputInner: React.FC<Props> = ({
   onSend, onAbort, isStreaming, backends, activeBackendId, sessionId, workingDir,
   skipPermissions = true, onSkipPermissionsChange,
+  isMobile = false,
   onCompact,
   fontSize, onAdjustFontSize,
   isFocused = true,
@@ -735,18 +738,20 @@ const ChatInputInner: React.FC<Props> = ({
           icon="⚡"
           title="跳过确认"
           active={skipPermissions}
+          compact={isMobile}
           onClick={() => onSkipPermissionsChange?.(!skipPermissions)}
         />
         <ToolbarBtn
           icon="🧹"
           title="新会话（清空上下文，同目录）"
+          compact={isMobile}
           onClick={handleCompact}
         />
         {onAdjustFontSize && (
           <div style={{ display: 'inline-flex', alignItems: 'center', gap: 2, marginLeft: 2 }}
             title={`对话字号${fontSize ? ` ${fontSize}px` : ''}（A− / A+ 调整，全局生效）`}>
-            <ToolbarBtn icon="A−" title="缩小对话字号" onClick={() => onAdjustFontSize(-1)} />
-            <ToolbarBtn icon="A+" title="放大对话字号" onClick={() => onAdjustFontSize(1)} />
+            <ToolbarBtn icon="A−" title="缩小对话字号" compact={isMobile} onClick={() => onAdjustFontSize(-1)} />
+            <ToolbarBtn icon="A+" title="放大对话字号" compact={isMobile} onClick={() => onAdjustFontSize(1)} />
           </div>
         )}
         {/* 截图按钮:桌面端独有,浏览器无法调起系统截图工具 */}
@@ -755,6 +760,7 @@ const ChatInputInner: React.FC<Props> = ({
             icon="📷"
             title={screenshotBusy ? "等待截图…(选完区域自动加入附件)" : "截图(系统截图工具)"}
             active={screenshotBusy}
+            compact={isMobile}
             onClick={handleScreenshot}
             loading={screenshotBusy}
           />

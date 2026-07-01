@@ -586,8 +586,9 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
       </div>
 
       {/* ---- 全局工具栏(输入框正上方,被 App 从顶栏挪下来,避免那一排太挤) ----
-           目录同步已重做为侧栏「🗂 文件」视图(本地 ⇄ 远端目录树),此处不再放入口。 */}
-      {onCycleLayout && (
+           目录同步已重做为侧栏「🗂 文件」视图(本地 ⇄ 远端目录树),此处不再放入口。
+           移动端隐藏分屏布局按钮(单屏无意义,省下这一排)。 */}
+      {onCycleLayout && !isMobile && (
         <div style={{
           display: 'flex',
           gap: 6,
@@ -627,6 +628,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
         workingDir={activeSession?.workingDir || undefined}
         skipPermissions={skipPermissions}
         onSkipPermissionsChange={handleSkipPermissionsChange}
+        isMobile={isMobile}
         onCompact={handleCompact}
         fontSize={config.fontSize}
         onAdjustFontSize={onAdjustFontSize}
