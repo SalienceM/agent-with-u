@@ -166,6 +166,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
   // ── 序列任务队列 + by-the-way（普通 session 侧挂状态）──
   const [seqTasks, setSeqTasks] = useState<SeqTaskT[]>([]);
   const [seqAuto, setSeqAuto] = useState(false);
+  const [seqMode, setSeqMode] = useState(false);   // 输入框「序列模式」：回车排入队列而非直接发送
   const [byTheWayOpen, setByTheWayOpen] = useState(false);
   const dispatchingRef = useRef(false);
   // ★ auto 连发的「链激活」标志：派发队列任务 / auto 从关→开 时激活；
@@ -222,6 +223,14 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
     setChain(false);
     return chat.sendMessage(content, images);
   }, [chat]);
+
+  // 序列模式：输入框回车把内容排入队列（不进对话）。auto 开时会自动开始连发。
+  const handleQueueTask = useCallback((content: string, images?: any[]) => {
+    if (!sessionId) return;
+    const text = (content || '').trim();
+    if (!text && !(images && images.length)) return;
+    api.seqtaskAdd(sessionId, text, images && images.length ? images : undefined);
+  }, [sessionId]);
 
   // 自动连发：链激活 + auto 开 + 非流式 + 有待发任务 → 发下一条（一条答完 effect 再触发下一条）
   useEffect(() => {
@@ -605,14 +614,15 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
         </div>
       )}
 
-      {/* ---- 序列任务队列 ---- */}
-      {sessionId && (
+      {/* ---- 序列任务队列：仅在「序列模式」或队列非空时显示的一条 slim 条 ---- */}
+      {sessionId && (seqMode || seqTasks.some((t) => t.status === 'pending')) && (
         <SeqTaskPanel
           sessionId={sessionId}
           tasks={seqTasks}
           auto={seqAuto}
           chainActive={seqChainActive}
           isStreaming={chat.isStreaming}
+          seqMode={seqMode}
           onSendNext={dispatchNext}
         />
       )}
@@ -629,6 +639,10 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
         skipPermissions={skipPermissions}
         onSkipPermissionsChange={handleSkipPermissionsChange}
         isMobile={isMobile}
+        seqMode={seqMode}
+        onToggleSeqMode={() => setSeqMode((v) => !v)}
+        onQueueTask={handleQueueTask}
+        seqCount={seqTasks.filter((t) => t.status === 'pending').length}
         onCompact={handleCompact}
         fontSize={config.fontSize}
         onAdjustFontSize={onAdjustFontSize}

@@ -47,6 +47,11 @@ interface Props {
   skipPermissions?: boolean;
   onSkipPermissionsChange?: (enabled: boolean) => void;
   isMobile?: boolean;
+  // ── 序列任务：输入框「序列模式」——激活后回车不直接发送,而是排入队列 ──
+  seqMode?: boolean;
+  onToggleSeqMode?: () => void;
+  onQueueTask?: (content: string, images?: ImageAttachment[]) => void;
+  seqCount?: number;
   onCompact?: () => void;
   fontSize?: number;                         // 当前对话字号(用于 A−/A+ 显示)
   onAdjustFontSize?: (delta: number) => void; // 步进对话字号
@@ -103,6 +108,7 @@ const ChatInputInner: React.FC<Props> = ({
   onSend, onAbort, isStreaming, backends, activeBackendId, sessionId, workingDir,
   skipPermissions = true, onSkipPermissionsChange,
   isMobile = false,
+  seqMode = false, onToggleSeqMode, onQueueTask, seqCount = 0,
   onCompact,
   fontSize, onAdjustFontSize,
   isFocused = true,
@@ -178,6 +184,10 @@ const ChatInputInner: React.FC<Props> = ({
   // ── 稳定 refs ──
   const onSendRef = useRef(onSend);
   onSendRef.current = onSend;
+  const seqModeRef = useRef(seqMode);
+  seqModeRef.current = seqMode;
+  const onQueueTaskRef = useRef(onQueueTask);
+  onQueueTaskRef.current = onQueueTask;
   const imagesRef = useRef(images);
   imagesRef.current = images;
   const clearImagesRef = useRef(clearImages);
@@ -499,10 +509,16 @@ const ChatInputInner: React.FC<Props> = ({
     if (isImageBackendRef.current && imageSizeRef.current && imageSizeRef.current !== '1:1' && text) {
       text = `${text} --size ${imageSizeRef.current}`;
     }
-    onSendRef.current(text, imgs.length > 0 ? imgs : undefined);
+    // 序列模式:回车/发送 → 排入队列(不进对话);否则正常发送。
+    if (seqModeRef.current && onQueueTaskRef.current) {
+      onQueueTaskRef.current(text, imgs.length > 0 ? imgs : undefined);
+    } else {
+      onSendRef.current(text, imgs.length > 0 ? imgs : undefined);
+    }
     if (ref.current) {
       ref.current.value = '';
       ref.current.style.height = 'auto';
+      if (seqModeRef.current) ref.current.focus();   // 连续排入,保持焦点
     }
     clearImagesRef.current();
     setShowCommands(false);
@@ -747,6 +763,17 @@ const ChatInputInner: React.FC<Props> = ({
           compact={isMobile}
           onClick={handleCompact}
         />
+        {onToggleSeqMode && (
+          <ToolbarBtn
+            icon={seqCount > 0 ? `🧬${seqCount}` : '🧬'}
+            title={seqMode
+              ? '序列模式：开 — 回车把内容排入队列（不直接发送）。再点关闭'
+              : '序列模式：开启后回车排入序列队列，可一条条确认或自动连发'}
+            active={seqMode}
+            compact={isMobile}
+            onClick={onToggleSeqMode}
+          />
+        )}
         {onAdjustFontSize && (
           <div style={{ display: 'inline-flex', alignItems: 'center', gap: 2, marginLeft: 2 }}
             title={`对话字号${fontSize ? ` ${fontSize}px` : ''}（A− / A+ 调整，全局生效）`}>
@@ -922,11 +949,23 @@ const ChatInputInner: React.FC<Props> = ({
         </div>
       )}
 
-      <div style={{ display: 'flex', gap: 8, alignItems: 'flex-end' }}>
+      <style>{`
+        @keyframes seqGlow {
+          0%,100% { box-shadow: 0 0 0 1.5px #7aa2f7, 0 0 8px 1px rgba(122,162,247,0.45); }
+          50%     { box-shadow: 0 0 0 1.5px #22d3ee, 0 0 16px 3px rgba(34,211,238,0.75); }
+        }
+        .seq-neon { border-radius: 12px; animation: seqGlow 1.8s ease-in-out infinite; }
+      `}</style>
+      <div
+        className={seqMode ? 'seq-neon' : undefined}
+        style={{ display: 'flex', gap: 8, alignItems: 'flex-end', ...(seqMode ? { padding: 6 } : {}) }}
+      >
         <textarea
           ref={ref}
           className="chat-textarea"
-          placeholder={isStreaming ? '输入并按 Enter 可中断当前响应并续发…' : '输入消息… 输入 / 查看命令 · @ 引用文件 · Ctrl+V 粘贴图片'}
+          placeholder={seqMode
+            ? `🧬 序列模式：回车排入队列（不直接发送）${seqCount ? ` · 已 ${seqCount} 条` : ''}`
+            : isStreaming ? '输入并按 Enter 可中断当前响应并续发…' : '输入消息… 输入 / 查看命令 · @ 引用文件 · Ctrl+V 粘贴图片'}
           onKeyDown={handleKeyDown}
           onCompositionStart={handleCompositionStart}
           onCompositionEnd={handleCompositionEnd}
@@ -937,7 +976,7 @@ const ChatInputInner: React.FC<Props> = ({
         {isStreaming ? (
           <button onClick={onAbort} style={abortBtnStyle} title="Stop">■</button>
         ) : (
-          <button onClick={handleSend} style={sendBtnStyle} title="Send (Enter)">🚀</button>
+          <button onClick={handleSend} style={sendBtnStyle} title={seqMode ? '排入序列队列' : 'Send (Enter)'}>{seqMode ? '＋' : '🚀'}</button>
         )}
         <button
           onClick={toggleMic}

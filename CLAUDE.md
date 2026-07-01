@@ -440,8 +440,17 @@ streaming saves. A process-level cache (`_chat_extras` / `_chat_extras_get` /
   (mirrored via `seqChainActive` state). Unsent tasks are freely editable / removable / reorderable
   (`seqtaskAdd/Edit/Remove/Reorder/Clear`, images supported). A queued entry starting
   with `/` is dispatched as a **slash command** (so `/compact`, `/clear`, … can be
-  lined up between prompts); everything else goes raw. UI: `SeqTaskPanel.tsx`
-  sits above the `ChatInput`. State syncs via the `seqtaskUpdated` push event.
+  lined up between prompts); everything else goes raw. State syncs via the
+  `seqtaskUpdated` push event.
+  **UI is input-box-centric** (redesigned): a 🧬 toolbar toggle puts the `ChatInput`
+  into **序列模式** — the input box gets an animated **neon border** (`.seq-neon`) and
+  Enter/send **queues** the text (`onQueueTask` → `seqtaskAdd`) instead of sending it to
+  chat, staying focused so you can rattle off items; the send button shows ＋. Feeding
+  no longer breaks the auto-chain (only a real `handleUserSend` does). `SeqTaskPanel.tsx`
+  is now a **slim, collapsed-by-default strip** above the input (shown only when 序列模式
+  is on or the queue is non-empty): 🧬 序列队列 + count, 自动连发 toggle, ▶ 下一步 (manual
+  dispatch), 清空; click it to expand the list (edit / remove / ▲▼ reorder). The old
+  in-panel add box is gone — feeding is the input box.
 - **By the way (旁路问答).** A floating 💬 entry on each chat pane opens
   `ByTheWayDrawer.tsx` — ask a quick side question that runs on an **independent agent
   context** (`agent_session_id=None`, session `f"{sid}:chataside"`), seeded with a
