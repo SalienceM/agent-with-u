@@ -1,0 +1,29 @@
+# ---- OS / editor ----
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.vscode/
+.idea/
+
+# ---- Node / frontend ----
+frontend/node_modules/
+frontend/dist/
+
+# ---- Python ----
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# ---- Docker (避免递归) ----
+deploy/docker-compose*.yml
+
+# ---- Git ----
+.git/
+.gitignore
+
+# ---- Docs / misc ----
+*.md
+LICENSE
