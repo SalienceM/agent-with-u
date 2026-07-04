@@ -197,6 +197,42 @@ const ChatInputInner: React.FC<Props> = ({
   const composingRef = useRef(false);
 
   // ═══════════════════════════════════════
+  //  ★ 输入历史（Linux 风格 ↑↓ 浏览，最多 10 条）
+  // ══════════════════════════════════════
+  // 历史条目 & 当前浏览位置（-1 = 未进入浏览模式）
+  const [history, setHistory] = useState<string[]>([]);
+  const [histIdx, setHistIdx] = useState(-1);
+
+  // 进入浏览模式时，暂存用户当时正在输入的草稿，退出时恢复
+  const draftRef = useRef('');
+
+  // 每会话独立：sessionId 变化时自动重置
+  useEffect(() => {
+    setHistory([]);
+    setHistIdx(-1);
+    draftRef.current = '';
+  }, [sessionId]);
+
+  // 稳定 refs，供 keydown 里同步读取
+  const historyRef = useRef<string[]>([]);
+  historyRef.current = history;
+  const histIdxRef = useRef(-1);
+  histIdxRef.current = histIdx;
+
+  // 追加一条到历史（去重 + 最多 10 条，最新的在末尾）
+  const pushHistory = useCallback((text: string) => {
+    const t = text.trim();
+    if (!t) return;
+    setHistory(prev => {
+      // 与最近一条重复则不追加（避免连续发送相同内容撑爆历史）
+      if (prev.length > 0 && prev[prev.length - 1] === t) return prev;
+      const next = [...prev, t];
+      return next.length > 10 ? next.slice(next.length - 10) : next;
+    });
+    setHistIdx(-1); // 发送后退出浏览模式
+  }, []);
+
+  // ═══════════════════════════════════════
   //  ★ 斜杠命令自动补全状态
   // ═══════════════════════════════════════
   const [showCommands, setShowCommands] = useState(false);
@@ -509,6 +545,8 @@ const ChatInputInner: React.FC<Props> = ({
     if (isImageBackendRef.current && imageSizeRef.current && imageSizeRef.current !== '1:1' && text) {
       text = `${text} --size ${imageSizeRef.current}`;
     }
+    // ★ 保存到输入历史（Linux 风格 ↑ 追溯）
+    pushHistory(text);
     // 序列模式:回车/发送 → 排入队列(不进对话);否则正常发送。
     if (seqModeRef.current && onQueueTaskRef.current) {
       onQueueTaskRef.current(text, imgs.length > 0 ? imgs : undefined);
@@ -630,6 +668,70 @@ const ChatInputInner: React.FC<Props> = ({
         }
       }
 
+      // ★ 输入历史浏览（Linux 风格 ↑↓）
+      // 仅在输入框非空且光标在首行（或无多行）时触发，避免干扰多行文本编辑。
+      if (e.key === 'ArrowUp' || e.key === 'ArrowDown') {
+        const el = ref.current;
+        const cursorPos = el ? (el.selectionStart ?? el.value.length) : 0;
+        const text = el?.value ?? '';
+        // 只有光标在第一行（之前没有换行符）时才触发历史浏览
+        const firstLineEnd = text.indexOf('\n');
+        const onFirstLine = firstLineEnd < 0 || cursorPos <= firstLineEnd;
+
+        if (!onFirstLine) {
+          // 光标不在第一行，让浏览器默认行为处理光标移动
+          return;
+        }
+
+        if (e.key === 'ArrowUp') {
+          e.preventDefault();
+          const hist = historyRef.current;
+          if (hist.length === 0) return;
+          const curIdx = histIdxRef.current;
+          // 第一次按 ↑：保存当前草稿，跳到最新一条
+          if (curIdx === -1) {
+            draftRef.current = text;
+            const newIdx = hist.length - 1;
+            setHistIdx(newIdx);
+            if (el) { el.value = hist[newIdx]; el.selectionStart = el.selectionEnd = hist[newIdx].length; }
+          } else if (curIdx > 0) {
+            // 继续往上翻
+            const newIdx = curIdx - 1;
+            setHistIdx(newIdx);
+            if (el) { el.value = hist[newIdx]; el.selectionStart = el.selectionEnd = hist[newIdx].length; }
+          }
+          // 已在最旧的一条，不再上翻
+          return;
+        }
+
+        if (e.key === 'ArrowDown') {
+          e.preventDefault();
+          const curIdx = histIdxRef.current;
+          if (curIdx === -1) return; // 未在浏览历史，不处理
+          const hist = historyRef.current;
+          if (curIdx < hist.length - 1) {
+            // 往下翻
+            const newIdx = curIdx + 1;
+            setHistIdx(newIdx);
+            if (el) { el.value = hist[newIdx]; el.selectionStart = el.selectionEnd = hist[newIdx].length; }
+          } else {
+            // 回到草稿 / 清空
+            setHistIdx(-1);
+            if (el) { el.value = draftRef.current; el.selectionStart = el.selectionEnd = draftRef.current.length; }
+          }
+          return;
+        }
+      }
+
+      // ★ Escape 退出历史浏览模式
+      if (e.key === 'Escape' && histIdxRef.current !== -1) {
+        e.preventDefault();
+        setHistIdx(-1);
+        const el = ref.current;
+        if (el) { el.value = draftRef.current; el.selectionStart = el.selectionEnd = draftRef.current.length; }
+        return;
+      }
+
       // 普通 Enter 发送（流式进行中也允许，sendMessage 内部处理中断续发）
       if (e.key === 'Enter' && !e.shiftKey) {
         e.preventDefault();
@@ -650,6 +752,11 @@ const ChatInputInner: React.FC<Props> = ({
   const handleInput = useCallback(() => {
     const el = ref.current;
     if (!el) return;
+
+    // ★ 用户手动输入时退出历史浏览模式（草稿自动成为新的"当前文本"）
+    if (histIdxRef.current !== -1) {
+      setHistIdx(-1);
+    }
 
     // auto-resize
     el.style.height = 'auto';
