@@ -1212,9 +1212,13 @@ export const api = {
     } catch { return []; }
   },
 
-  /** 服务器侧文件系统浏览起点（home / cwd / 盘符或根）。供 C/S 模式目录选择器使用。 */
-  async getDirRoots(): Promise<{ home: string; cwd: string; roots: string[]; sep: string }> {
-    const result = await call('getDirRoots');
+  /** 服务器侧文件系统浏览起点（home / cwd / 盘符或根）。供 C/S 模式目录选择器使用。
+   *  execKey 指定时查询该执行节点；缺省回落 home。
+   */
+  async getDirRoots(execKey?: string): Promise<{ home: string; cwd: string; roots: string[]; sep: string }> {
+    const result = execKey
+      ? await callOn(execKey, 'getDirRoots')
+      : await call('getDirRoots');
     try {
       return JSON.parse(result);
     } catch {

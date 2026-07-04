@@ -11,13 +11,17 @@
  *  - 'save' 选择目录并输入文件名，返回拼接后的完整路径
  */
 import React, { useState, useEffect, useCallback } from 'react';
-import { api } from '../api';
+import { api, getExecutors } from '../api';
 
 type PickerMode = 'dir' | 'open' | 'save';
 
 interface Props {
   initialPath?: string;
   mode?: PickerMode;
+  /** 指定执行节点：浏览该节点的文件系统；缺省 = home 节点。
+   *  Tauri 远端也用它（替代本机原生目录对话框）。
+   */
+  execKey?: string;
   /** save 模式下预填的文件名 */
   saveFilename?: string;
   onSelect: (path: string) => void;
@@ -27,7 +31,7 @@ interface Props {
 interface Entry { name: string; path: string; isDir: boolean }
 
 export const ServerDirPicker: React.FC<Props> = ({
-  initialPath, mode = 'dir', saveFilename, onSelect, onCancel,
+  initialPath, mode = 'dir', execKey, saveFilename, onSelect, onCancel,
 }) => {
   const [sep, setSep] = useState('/');
   const [roots, setRoots] = useState<{ home: string; cwd: string; roots: string[] }>({
@@ -47,23 +51,23 @@ export const ServerDirPicker: React.FC<Props> = ({
     setError('');
     setSelectedFile('');
     try {
-      const list = await api.listDirectory(path, '');
+      const list = await api.listDirectory(path, '', execKey);
       // listDirectory 出错时返回 []；用 getDirRoots 的路径兜底则不会到这
       setEntries(showFiles ? list : list.filter((e) => e.isDir));
       setCur(path);
     } finally {
       setLoading(false);
     }
-  }, [showFiles]);
+  }, [showFiles, execKey]);
 
   useEffect(() => {
     (async () => {
-      const r = await api.getDirRoots();
+      const r = await api.getDirRoots(execKey);
       setRoots({ home: r.home, cwd: r.cwd, roots: r.roots });
       setSep(r.sep || '/');
       await browse(initialPath || r.cwd || r.home || (r.roots[0] || '/'));
     })();
-  }, [browse, initialPath]);
+  }, [browse, initialPath, execKey]);
 
   const goUp = useCallback(() => {
     const trimmed = cur.replace(/[/\\]+$/, '');
@@ -113,11 +117,18 @@ export const ServerDirPicker: React.FC<Props> = ({
       : mode === 'save' ? '保存'
         : '选择此目录';
 
+  // 远端节点时显示节点标签，让用户知道正在浏览哪台机器
+  const executors = getExecutors();
+  const currentNode = executors.find((ex) => ex.key === execKey);
+  const nodeLabel = currentNode
+    ? (currentNode.isHome ? '' : ` 🌐 ${currentNode.label}`)
+    : '';
+
   return (
     <div style={overlayStyle} onClick={onCancel}>
       <div style={dialogStyle} onClick={(e) => e.stopPropagation()}>
         <div style={{ fontWeight: 600, fontSize: 14, marginBottom: 8 }}>
-          {title}
+          {title}{nodeLabel && <span style={{ fontWeight: 400, fontSize: 12, color: 'var(--theme-text-muted, #aaa)', marginLeft: 8 }}>{nodeLabel}</span>}
         </div>
 
         {/* 快捷入口 */}

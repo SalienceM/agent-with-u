@@ -1277,6 +1277,7 @@ const NewSessionDialog: React.FC<NewSessionDialogProps> = ({
   const [execKey, setExecKey] = useState<string>(() => getHomeExecKey());
   useEffect(() => onExecStatus(() => setExecutors(getExecutors())), []);
   const isHomeExec = execKey === getHomeExecKey();
+  const isLocalExec = execKey === 'local';
 
   // 选中的执行节点对应的后端列表:home 直接用上层传入,远端则按需拉取。
   const [execBackends, setExecBackends] = useState<any[]>(backends);
@@ -1304,15 +1305,15 @@ const NewSessionDialog: React.FC<NewSessionDialogProps> = ({
   }, [workingDir, selectedBackendId, sessionType, loopPolicy, execKey, onCreate]);
 
   const handleBrowse = useCallback(async () => {
-    // Tauri 桌面端：用系统原生目录对话框（选本机 = 服务器同机）。
-    // 浏览器 / 远程 C/S：必须浏览「服务器」文件系统，用 ServerDirPicker。
-    if (isTauri()) {
+    // Tauri 桌面端 + 本机节点：用系统原生目录对话框（本机 = 服务器同机）。
+    // Tauri 桌面端 + 远端节点 / 浏览器模式：必须浏览「目标执行节点」的文件系统，用 ServerDirPicker。
+    if (isTauri() && isLocalExec) {
       const path = await api.selectDirectory(isAutoDir ? undefined : workingDir);
       if (path) setWorkingDir(path);
     } else {
       setDirPickerOpen(true);
     }
-  }, [workingDir, isAutoDir]);
+  }, [workingDir, isAutoDir, isLocalExec]);
 
   return (
     <div
@@ -1471,6 +1472,7 @@ const NewSessionDialog: React.FC<NewSessionDialogProps> = ({
 
       {dirPickerOpen && (
         <ServerDirPicker
+          execKey={execKey}
           initialPath={isAutoDir ? undefined : workingDir}
           onSelect={(p) => { setWorkingDir(p); setDirPickerOpen(false); }}
           onCancel={() => setDirPickerOpen(false)}
