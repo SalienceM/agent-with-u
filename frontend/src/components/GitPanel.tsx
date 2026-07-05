@@ -245,22 +245,30 @@ export const GitPanel: React.FC<Props> = ({
               {/* Left: file list */}
               <div style={fileListStyle}>
                 <div style={sectionHeaderStyle}>
-                  <span>Staged ({stagedFiles.length})</span>
+                  <span>Staged ({stagedFiles.length}){(() => {
+                    const sa = stagedFiles.reduce((s, f) => s + (f.addedLines || 0), 0);
+                    const sd = stagedFiles.reduce((s, f) => s + (f.deletedLines || 0), 0);
+                    return sa || sd ? ` +${sa} -${sd}` : '';
+                  })()}</span>
                   {stagedFiles.length > 0 && <button onClick={handleUnstageAll} style={smallBtnStyle}>Unstage All</button>}
                 </div>
                 {stagedFiles.map((f) => (
                   <FileRow key={f.path} file={f} isSelected={selectedFile === f.path}
                     onClick={() => loadDiff(f.path, true)}
-                    onAction={() => handleUnstage(f.path)} actionLabel="Unstage" />
+                    onToggleStage={() => handleUnstage(f.path)} />
                 ))}
                 <div style={{ ...sectionHeaderStyle, marginTop: 12 }}>
-                  <span>Unstaged ({unstagedFiles.length})</span>
+                  <span>Unstaged ({unstagedFiles.length}){(() => {
+                    const ua = unstagedFiles.reduce((s, f) => s + (f.addedLines || 0), 0);
+                    const ud = unstagedFiles.reduce((s, f) => s + (f.deletedLines || 0), 0);
+                    return ua || ud ? ` +${ua} -${ud}` : '';
+                  })()}</span>
                   {unstagedFiles.length > 0 && <button onClick={handleStageAll} style={smallBtnStyle}>Stage All</button>}
                 </div>
                 {unstagedFiles.map((f) => (
                   <FileRow key={f.path} file={f} isSelected={selectedFile === f.path}
                     onClick={() => loadDiff(f.path, false)}
-                    onAction={() => handleStage(f.path)} actionLabel="Stage" />
+                    onToggleStage={() => handleStage(f.path)} />
                 ))}
                 {files.length === 0 && <div style={emptyStyle}>工作区干净 ✓</div>}
                 {loading && files.length === 0 && <div style={emptyStyle}>加载中…</div>}
@@ -378,24 +386,59 @@ export const GitPanel: React.FC<Props> = ({
   );
 };
 
-// ── 子组件：文件行 ──────────────────────────────────────────────
+// ── 子组件：文件行（TortoiseGit 风格） ──────────────────────────
 const FileRow: React.FC<{
   file: GitFileStatus; isSelected: boolean;
-  onClick: () => void; onAction: () => void; actionLabel: string;
-}> = ({ file, isSelected, onClick, onAction, actionLabel }) => (
-  <div style={{
-    ...fileRowStyle,
-    ...(isSelected ? fileRowSelectedStyle : {}),
-  }} onClick={onClick}>
-    <span style={{
-      width: 18, height: 18, borderRadius: 3, display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
-      fontSize: 10, fontWeight: 700, color: '#fff', flexShrink: 0,
-      background: STATUS_COLORS[file.status],
-    }}>{STATUS_LABELS[file.status]}</span>
-    <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontSize: 12 }}>{file.path}</span>
-    <button onClick={(e) => { e.stopPropagation(); onAction(); }} style={actionBtnSmallStyle}>{actionLabel}</button>
-  </div>
-);
+  onClick: () => void; onToggleStage: () => void;
+}> = ({ file, isSelected, onClick, onToggleStage }) => {
+  // 拆分路径：目录(灰) + 文件名(亮)
+  const lastSlash = file.path.lastIndexOf('/');
+  const dirPart = lastSlash >= 0 ? file.path.slice(0, lastSlash + 1) : '';
+  const namePart = lastSlash >= 0 ? file.path.slice(lastSlash + 1) : file.path;
+
+  return (
+    <div style={{
+      ...fileRowStyle,
+      ...(isSelected ? fileRowSelectedStyle : {}),
+    }} onClick={onClick}>
+      {/* Checkbox: 点击切换 stage/unstage */}
+      <span
+        onClick={(e) => { e.stopPropagation(); onToggleStage(); }}
+        style={{
+          width: 16, height: 16, borderRadius: 3, flexShrink: 0, cursor: 'pointer',
+          border: file.staged ? '2px solid #3fb950' : '2px solid rgba(255,255,255,0.25)',
+          background: file.staged ? 'rgba(63,185,80,0.2)' : 'transparent',
+          display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
+          fontSize: 10, color: '#3fb950', transition: 'all 0.12s',
+        }}
+        title={file.staged ? '取消暂存' : '暂存'}
+      >
+        {file.staged ? '✓' : ''}
+      </span>
+      {/* 状态徽章 */}
+      <span style={{
+        width: 18, height: 18, borderRadius: 3, display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
+        fontSize: 10, fontWeight: 700, color: '#fff', flexShrink: 0,
+        background: STATUS_COLORS[file.status],
+      }}>{STATUS_LABELS[file.status]}</span>
+      {/* 文件路径: 目录灰 + 文件名亮白 */}
+      <span style={{
+        flex: 1, overflow: 'hidden', whiteSpace: 'nowrap', fontSize: 12,
+        display: 'flex', alignItems: 'center', minWidth: 0,
+      }}>
+        {dirPart && <span style={{ color: '#484f58', flexShrink: 0 }}>{dirPart}</span>}
+        <span style={{ color: '#e6edf3', fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis' }}>{namePart}</span>
+      </span>
+      {/* 增删行数 */}
+      {(file.addedLines != null || file.deletedLines != null) && (
+        <span style={{ flexShrink: 0, fontFamily: 'monospace', fontSize: 11, display: 'flex', gap: 4, alignItems: 'center' }}>
+          {file.addedLines != null && file.addedLines > 0 && <span style={{ color: '#3fb950' }}>+{file.addedLines}</span>}
+          {file.deletedLines != null && file.deletedLines > 0 && <span style={{ color: '#f85149' }}>-{file.deletedLines}</span>}
+        </span>
+      )}
+    </div>
+  );
+};
 
 // ── 样式 ────────────────────────────────────────────────────────────
 const overlayStyle: React.CSSProperties = {
@@ -403,7 +446,7 @@ const overlayStyle: React.CSSProperties = {
   display: 'flex', alignItems: 'center', justifyContent: 'center',
 };
 const panelStyle: React.CSSProperties = {
-  width: '92vw', maxWidth: 1100, height: '80vh', maxHeight: 700,
+  width: '92vw', maxWidth: 1260, height: '80vh', maxHeight: 700,
   background: 'var(--theme-bg-secondary, #161b22)',
   borderRadius: 14, border: '1px solid var(--theme-border, rgba(255,255,255,0.1))',
   display: 'flex', flexDirection: 'column', overflow: 'hidden',
@@ -447,14 +490,14 @@ const changesLayoutStyle: React.CSSProperties = {
   display: 'flex', flex: 1, overflow: 'hidden',
 };
 const fileListStyle: React.CSSProperties = {
-  width: 260, borderRight: '1px solid var(--theme-border, rgba(255,255,255,0.08))',
-  overflowY: 'auto', padding: 8, flexShrink: 0,
+  width: 350, borderRight: '1px solid var(--theme-border, rgba(255,255,255,0.08))',
+  overflowY: 'auto', overflowX: 'hidden', padding: 8, flexShrink: 0,
 };
 const diffAreaStyle: React.CSSProperties = {
   flex: 1, overflow: 'auto', padding: 8,
 };
 const commitAreaStyle: React.CSSProperties = {
-  width: 240, borderLeft: '1px solid var(--theme-border, rgba(255,255,255,0.08))',
+  width: 260, borderLeft: '1px solid var(--theme-border, rgba(255,255,255,0.08))',
   padding: 12, overflowY: 'auto', flexShrink: 0,
 };
 const sectionHeaderStyle: React.CSSProperties = {
@@ -462,7 +505,7 @@ const sectionHeaderStyle: React.CSSProperties = {
   fontSize: 11, fontWeight: 600, color: '#8b949e', marginBottom: 6, padding: '0 4px',
 };
 const fileRowStyle: React.CSSProperties = {
-  display: 'flex', alignItems: 'center', gap: 6, padding: '5px 6px',
+  display: 'flex', alignItems: 'center', gap: 8, padding: '5px 6px',
   borderRadius: 6, cursor: 'pointer', transition: 'background 0.1s',
 };
 const fileRowSelectedStyle: React.CSSProperties = {
@@ -472,9 +515,6 @@ const smallBtnStyle: React.CSSProperties = {
   fontSize: 10, padding: '2px 6px', borderRadius: 4, cursor: 'pointer',
   background: 'rgba(255,255,255,0.08)', border: '1px solid rgba(255,255,255,0.1)',
   color: '#8b949e',
-};
-const actionBtnSmallStyle: React.CSSProperties = {
-  ...smallBtnStyle, color: '#58a6ff', borderColor: 'rgba(88,166,255,0.3)',
 };
 const actionBtnStyle: React.CSSProperties = {
   padding: '6px 12px', borderRadius: 6, fontSize: 12, fontWeight: 600,

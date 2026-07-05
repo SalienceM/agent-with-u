@@ -16,6 +16,8 @@ export interface GitFileStatus {
   path: string;
   status: GitFileStatusType;
   staged: boolean;
+  addedLines?: number;
+  deletedLines?: number;
 }
 
 export interface GitStatusResult {
