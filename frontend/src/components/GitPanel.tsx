@@ -421,13 +421,13 @@ const FileRow: React.FC<{
         fontSize: 10, fontWeight: 700, color: '#fff', flexShrink: 0,
         background: STATUS_COLORS[file.status],
       }}>{STATUS_LABELS[file.status]}</span>
-      {/* 文件路径: 目录灰 + 文件名亮白 */}
+      {/* 文件路径: 目录灰 + 文件名亮（CSS变量适配主题） */}
       <span style={{
         flex: 1, overflow: 'hidden', whiteSpace: 'nowrap', fontSize: 12,
         display: 'flex', alignItems: 'center', minWidth: 0,
       }}>
-        {dirPart && <span style={{ color: '#484f58', flexShrink: 0 }}>{dirPart}</span>}
-        <span style={{ color: '#e6edf3', fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis' }}>{namePart}</span>
+        {dirPart && <span style={{ color: 'var(--theme-text-muted, #6e7681)', flexShrink: 0 }}>{dirPart}</span>}
+        <span style={{ color: 'var(--theme-text, #e6edf3)', fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis' }}>{namePart}</span>
       </span>
       {/* 增删行数 */}
       {(file.addedLines != null || file.deletedLines != null) && (

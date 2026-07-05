@@ -5172,10 +5172,9 @@ except urllib.error.URLError as e:
         prompt = (
             "你是一个专业的 Git commit message 生成器。根据以下 git diff 生成一条简洁、准确的 commit message。\n"
             "要求：\n"
-            "- 使用 Conventional Commits 格式（如 feat: / fix: / refactor: / docs: / chore: / test: / style:）\n"
+            "- 使用中文撰写 commit message（Conventional Commits 前缀如 feat:/fix:/refactor: 等保留英文，描述部分用中文）\n"
             "- 第一行简短描述（不超过 72 字符）\n"
             "- 如有必要，空一行后补充详细说明\n"
-            "- 祈使语气（如 'add feature' 而非 'added feature'）\n"
             "- 只返回 commit message 文本，不要任何额外说明、不要 markdown 代码块包裹\n\n"
             f"最近的 commit 风格参考：\n{recent_log.strip()}\n\n"
             f"git diff：\n{diff_text}"

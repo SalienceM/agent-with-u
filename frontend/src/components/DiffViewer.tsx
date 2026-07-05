@@ -16,7 +16,7 @@ export const DiffViewer: React.FC<Props> = ({ diff, filename, binary }) => {
     return diff.split('\n');
   }, [diff]);
 
-  if (binary) {
+  if (binary && diff) {
     return (
       <div style={containerStyle}>
         <div style={binaryStyle}>📦 二进制文件差异（无法文本显示）{filename ? `: ${filename}` : ''}</div>
