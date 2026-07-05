@@ -63,7 +63,8 @@ def _find_system_python() -> Optional[str]:
         path = shutil.which(name)
         if path:
             try:
-                r = _sp.run([path, "--version"], capture_output=True, text=True, timeout=5)
+                r = _sp.run([path, "--version"], capture_output=True, text=True,
+                            encoding="utf-8", errors="replace", timeout=5)
                 if r.returncode == 0:
                     return path
             except Exception:
@@ -243,8 +244,9 @@ def _git_is_repo(path: str) -> bool:
     import subprocess
     try:
         r = subprocess.run(["git", "rev-parse", "--is-inside-work-tree"],
-                           cwd=path, capture_output=True, text=True, timeout=10)
-        return r.returncode == 0 and r.stdout.strip() == "true"
+                           cwd=path, capture_output=True, text=True,
+                           encoding="utf-8", errors="replace", timeout=10)
+        return r.returncode == 0 and (r.stdout or "").strip() == "true"
     except Exception:
         return False
 
@@ -261,19 +263,25 @@ def git_snapshot(working_dir: Optional[str]) -> Optional[str]:
         tmp_index = os.path.join(working_dir, ".git", f"awu_loop_idx_{int(_t.time() * 1000)}")
         env["GIT_INDEX_FILE"] = tmp_index
         head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=working_dir,
-                              capture_output=True, text=True)
+                              capture_output=True, text=True,
+                              encoding="utf-8", errors="replace")
         has_head = head.returncode == 0
         if has_head:
             subprocess.run(["git", "read-tree", "HEAD"], cwd=working_dir, env=env,
-                           capture_output=True, text=True, check=True)
+                           capture_output=True, text=True,
+                           encoding="utf-8", errors="replace", check=True)
         subprocess.run(["git", "add", "-A"], cwd=working_dir, env=env,
-                       capture_output=True, text=True, check=True)
+                       capture_output=True, text=True,
+                       encoding="utf-8", errors="replace", check=True)
         tree = subprocess.run(["git", "write-tree"], cwd=working_dir, env=env,
-                              capture_output=True, text=True, check=True).stdout.strip()
+                              capture_output=True, text=True,
+                              encoding="utf-8", errors="replace",
+                              check=True).stdout.strip()
         args = ["git", "commit-tree", tree, "-m", "awu loop checkpoint"]
         if has_head:
-            args += ["-p", head.stdout.strip()]
+            args += ["-p", (head.stdout or "").strip()]
         snap = subprocess.run(args, cwd=working_dir, capture_output=True, text=True,
+                              encoding="utf-8", errors="replace",
                               check=True).stdout.strip()
         return snap or None
     except Exception as e:
@@ -295,11 +303,14 @@ def git_restore_snapshot(working_dir: Optional[str], snap_sha: Optional[str]) ->
         return False
     try:
         subprocess.run(["git", "read-tree", "-u", "--reset", snap_sha], cwd=working_dir,
-                       capture_output=True, text=True, check=True)
+                       capture_output=True, text=True,
+                       encoding="utf-8", errors="replace", check=True)
         subprocess.run(["git", "clean", "-fd"], cwd=working_dir,
-                       capture_output=True, text=True, check=True)
+                       capture_output=True, text=True,
+                       encoding="utf-8", errors="replace", check=True)
         subprocess.run(["git", "reset", "-q"], cwd=working_dir,
-                       capture_output=True, text=True)
+                       capture_output=True, text=True,
+                       encoding="utf-8", errors="replace")
         return True
     except Exception as e:
         print(f"[loop] git restore failed: {e}", file=sys.stderr, flush=True)
@@ -1074,6 +1085,13 @@ class BridgeWS:
             "data": json.dumps(self._asset_pool.stats(), ensure_ascii=False),
         }))
 
+    def _emit_event(self, event: str, data: dict):
+        """发送自定义 push event 到前端。"""
+        asyncio.ensure_future(self._broadcast({
+            "event": event,
+            "data": json.dumps(data, ensure_ascii=False),
+        }))
+
     def _client_info(self, ws) -> dict:
         """提取一个客户端连接的展示信息（身份、来源、IP、接入时间）。"""
         identity = getattr(ws, "identity", "?")
@@ -1202,7 +1220,8 @@ class BridgeWS:
             try:
                 r = _sp.run(
                     [python_path, "-c", "import faster_whisper; print('ok')"],
-                    capture_output=True, text=True, timeout=10,
+                    capture_output=True, text=True,
+                    encoding="utf-8", errors="replace", timeout=10,
                 )
                 installed = r.returncode == 0
             except Exception:
@@ -1227,7 +1246,8 @@ class BridgeWS:
         def _run():
             cmd = [python_path, "-m", "pip", "install", "faster-whisper"]
             try:
-                r = _sp.run(cmd, capture_output=True, text=True, timeout=300)
+                r = _sp.run(cmd, capture_output=True, text=True,
+                            encoding="utf-8", errors="replace", timeout=300)
                 ok = r.returncode == 0
                 output = f"$ {' '.join(cmd)}\n\n" + (r.stdout or "") + (r.stderr or "")
                 if len(output) > 3000:
@@ -4740,6 +4760,475 @@ except urllib.error.URLError as e:
     def _rpc_modelLedgerList(self) -> str:
         """跨 session 模型能力台账：各 backend 在执行/评审等角色的表现，供分配参考。"""
         return json.dumps({"status": "ok", "models": self._model_ledger.list()}, ensure_ascii=False)
+
+    # ════════════════════════════════════════════════════════════
+    #  Git 集成 RPCs
+    # ════════════════════════════════════════════════════════════
+
+    @staticmethod
+    def _git_run(working_dir: str, args: list[str], timeout: int = 15) -> tuple[int, str, str]:
+        """同步执行 git 命令，返回 (returncode, stdout, stderr)。"""
+        import subprocess
+        try:
+            r = subprocess.run(["git", *args], cwd=working_dir,
+                               capture_output=True, text=True,
+                               encoding="utf-8", errors="replace",
+                               timeout=timeout)
+            return r.returncode, r.stdout or "", r.stderr or ""
+        except subprocess.TimeoutExpired:
+            return -1, "", f"git 命令超时 ({timeout}s)"
+        except FileNotFoundError:
+            return -1, "", "未找到 git 命令，请确认已安装 Git"
+        except Exception as e:
+            return -1, "", str(e)
+
+    @staticmethod
+    async def _git_run_async(working_dir: str, args: list[str], timeout: int = 120) -> tuple[int, str, str]:
+        """异步执行 git 命令（用于 push/pull 等网络操作）。"""
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "git", *args, cwd=working_dir,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+            return proc.returncode or 0, stdout.decode("utf-8", errors="replace"), stderr.decode("utf-8", errors="replace")
+        except asyncio.TimeoutError:
+            proc.kill()
+            return -1, "", f"git 命令超时 ({timeout}s)"
+        except FileNotFoundError:
+            return -1, "", "未找到 git 命令"
+        except Exception as e:
+            return -1, "", str(e)
+
+    def _rpc_gitDetect(self, working_dir: str) -> str:
+        """检测目录是否为 Git 仓库，返回基本信息。"""
+        import os
+        if not working_dir or not os.path.isdir(working_dir):
+            return json.dumps({"isRepo": False, "branch": "", "ahead": 0, "behind": 0, "remote": "", "hasUncommitted": False})
+        if not _git_is_repo(working_dir):
+            return json.dumps({"isRepo": False, "branch": "", "ahead": 0, "behind": 0, "remote": "", "hasUncommitted": False})
+        rc, branch, _ = self._git_run(working_dir, ["rev-parse", "--abbrev-ref", "HEAD"])
+        branch = branch.strip() if rc == 0 else ""
+        # ahead/behind
+        ahead = behind = 0
+        rc2, ab, _ = self._git_run(working_dir, ["rev-list", "--count", "--left-right", "@{upstream}...HEAD"], timeout=5)
+        if rc2 == 0 and ab.strip():
+            parts = ab.strip().split()
+            if len(parts) == 2:
+                behind, ahead = int(parts[0]), int(parts[1])
+        # remote url
+        rc3, remote, _ = self._git_run(working_dir, ["config", "--get", "remote.origin.url"], timeout=5)
+        remote = remote.strip() if rc3 == 0 else ""
+        # has uncommitted
+        rc4, porcelain, _ = self._git_run(working_dir, ["status", "--porcelain", "--untracked-files=no"], timeout=5)
+        has_uncommitted = rc4 == 0 and bool(porcelain.strip())
+        return json.dumps({
+            "isRepo": True, "branch": branch, "ahead": ahead, "behind": behind,
+            "remote": remote, "hasUncommitted": has_uncommitted,
+        }, ensure_ascii=False)
+
+    def _rpc_gitStatus(self, working_dir: str) -> str:
+        """获取 Git 工作区文件状态列表。"""
+        import os, re
+        if not working_dir or not os.path.isdir(working_dir) or not _git_is_repo(working_dir):
+            return json.dumps({"files": [], "branch": "", "upstream": "", "ahead": 0, "behind": 0, "totalChanges": 0, "stagedCount": 0})
+
+        # ─ v2: 仅取 branch 信息（# branch.* 行） ──
+        branch = upstream = ""
+        ahead = behind = 0
+        rc2, out2, _ = self._git_run(working_dir, ["status", "--porcelain=v2", "--branch"], timeout=10)
+        if rc2 == 0:
+            for line in out2.splitlines():
+                if line.startswith("# branch.head"):
+                    branch = line.split(" ", 2)[2] if len(line.split(" ", 2)) > 2 else ""
+                elif line.startswith("# branch.upstream"):
+                    upstream = line.split(" ", 2)[2] if len(line.split(" ", 2)) > 2 else ""
+                elif line.startswith("# branch.ab"):
+                    m = re.match(r"# branch\.ab \+(\d+) -(\d+)", line)
+                    if m:
+                        ahead, behind = int(m.group(1)), int(m.group(2))
+
+        # ── v1: 文件列表（XY path，简单可靠） ──
+        files = []
+        rc, out, _ = self._git_run(working_dir, ["status", "--porcelain", "--untracked-files=all"], timeout=10)
+        if rc == 0:
+            for line in out.splitlines():
+                if len(line) < 4:
+                    continue
+                xy = line[:2]
+                path = line[3:]  # v1: "XY path" (3rd char is space)
+                if not path:
+                    continue
+                # v1 rename: "R  old => new" → 取 new path
+                if xy[0] == "R" and " => " in path:
+                    path = path.split(" => ", 1)[1]
+                x, y = xy[0], xy[1]
+                status = self._xy_to_status(x, y)
+                staged = x != "." and x != " " and x != "?"
+                files.append({"path": path, "status": status, "staged": staged})
+        staged_count = sum(1 for f in files if f["staged"])
+
+        # ── 获取每文件增删行数 (numstat) ──
+        numstat_map: dict[str, tuple[int, int]] = {}
+        # unstaged
+        rc_ns, ns_out, _ = self._git_run(working_dir, ["diff", "--numstat"], timeout=10)
+        if rc_ns == 0:
+            for ns_line in ns_out.splitlines():
+                ns_parts = ns_line.split("\t", 2)
+                if len(ns_parts) == 3 and ns_parts[0] != "-" and ns_parts[1] != "-":
+                    try:
+                        numstat_map[ns_parts[2]] = (int(ns_parts[0]), int(ns_parts[1]))
+                    except ValueError:
+                        pass
+        # staged (合并，优先 staged 数据)
+        rc_ns2, ns2_out, _ = self._git_run(working_dir, ["diff", "--cached", "--numstat"], timeout=10)
+        if rc_ns2 == 0:
+            for ns_line in ns2_out.splitlines():
+                ns_parts = ns_line.split("\t", 2)
+                if len(ns_parts) == 3 and ns_parts[0] != "-" and ns_parts[1] != "-":
+                    try:
+                        numstat_map[ns_parts[2]] = (int(ns_parts[0]), int(ns_parts[1]))
+                    except ValueError:
+                        pass
+        # 合并到 files
+        for f in files:
+            if f["path"] in numstat_map:
+                f["addedLines"] = numstat_map[f["path"]][0]
+                f["deletedLines"] = numstat_map[f["path"]][1]
+
+        return json.dumps({
+            "files": files, "branch": branch, "upstream": upstream,
+            "ahead": ahead, "behind": behind,
+            "totalChanges": len(files), "stagedCount": staged_count,
+        }, ensure_ascii=False)
+
+    @staticmethod
+    def _xy_to_status(x: str, y: str) -> str:
+        """把 git porcelain v2 的 XY 字符映射为可读状态。"""
+        if x == "?" or y == "?":
+            return "untracked"
+        if x in ("U", "A") and y in ("U", "A"):
+            return "conflicted"
+        if x in ("M", "A", "D", "R", "C", "U"):
+            return {"M": "modified", "A": "added", "D": "deleted", "R": "renamed", "C": "copied", "U": "conflicted"}.get(x, "modified")
+        if y in ("M", "A", "D", "R", "C", "U"):
+            return {"M": "modified", "A": "added", "D": "deleted", "R": "renamed", "C": "copied", "U": "conflicted"}.get(y, "modified")
+        return "modified"
+
+    def _rpc_gitDiff(self, working_dir: str, path: str = "", staged: bool = False) -> str:
+        """获取文件或全量 diff。"""
+        import os
+        if not working_dir or not os.path.isdir(working_dir) or not _git_is_repo(working_dir):
+            return json.dumps({"diff": "", "stat": "", "binary": False, "error": "非 Git 仓库"})
+        args = ["diff"]
+        if staged:
+            args.append("--cached")
+        if path:
+            args.extend(["--", path])
+        rc, diff_out, err = self._git_run(working_dir, args, timeout=15)
+        if rc != 0 and not diff_out:
+            return json.dumps({"diff": "", "stat": "", "binary": False, "error": err.strip()})
+        # stat
+        stat_args = ["diff", "--stat"]
+        if staged:
+            stat_args.append("--cached")
+        if path:
+            stat_args.extend(["--", path])
+        _, stat_out, _ = self._git_run(working_dir, stat_args, timeout=10)
+        binary = "Binary files" in diff_out
+        return json.dumps({"diff": diff_out, "stat": stat_out.strip(), "binary": binary}, ensure_ascii=False)
+
+    def _rpc_gitStage(self, working_dir: str, paths_json: str) -> str:
+        """暂存指定文件。paths_json 是 JSON 数组。"""
+        import os, json as _json
+        if not working_dir or not os.path.isdir(working_dir) or not _git_is_repo(working_dir):
+            return json.dumps({"status": "error", "message": "非 Git 仓库"})
+        try:
+            paths = _json.loads(paths_json)
+        except Exception:
+            return json.dumps({"status": "error", "message": "paths_json 格式错误"})
+        if not paths:
+            return json.dumps({"status": "ok", "staged": []})
+        rc, _, err = self._git_run(working_dir, ["add", "--", *paths], timeout=15)
+        if rc != 0:
+            return json.dumps({"status": "error", "message": err.strip()})
+        return json.dumps({"status": "ok", "staged": paths}, ensure_ascii=False)
+
+    def _rpc_gitUnstage(self, working_dir: str, paths_json: str) -> str:
+        """取消暂存指定文件。"""
+        import os, json as _json
+        if not working_dir or not os.path.isdir(working_dir) or not _git_is_repo(working_dir):
+            return json.dumps({"status": "error", "message": "非 Git 仓库"})
+        try:
+            paths = _json.loads(paths_json)
+        except Exception:
+            return json.dumps({"status": "error", "message": "paths_json 格式错误"})
+        if not paths:
+            return json.dumps({"status": "ok"})
+        rc, _, err = self._git_run(working_dir, ["restore", "--staged", "--", *paths], timeout=15)
+        if rc != 0:
+            return json.dumps({"status": "error", "message": err.strip()})
+        return json.dumps({"status": "ok"}, ensure_ascii=False)
+
+    def _rpc_gitCommit(self, working_dir: str, message: str, all: bool = False) -> str:
+        """提交改动。"""
+        import os
+        if not working_dir or not os.path.isdir(working_dir) or not _git_is_repo(working_dir):
+            return json.dumps({"status": "error", "message": "非 Git 仓库", "commitHash": ""})
+        args = ["commit", "-m", message]
+        if all:
+            args.insert(1, "-a")
+        rc, _, err = self._git_run(working_dir, args, timeout=15)
+        if rc != 0:
+            return json.dumps({"status": "error", "message": err.strip(), "commitHash": ""})
+        # 获取提交摘要
+        _, short_hash, _ = self._git_run(working_dir, ["rev-parse", "--short", "HEAD"], timeout=5)
+        _, show_stat, _ = self._git_run(working_dir, ["show", "--stat", "--format=", "HEAD"], timeout=5)
+        files_changed = insertions = deletions = 0
+        stat_line = show_stat.strip().splitlines()[-1] if show_stat.strip() else ""
+        import re
+        m = re.search(r"(\d+) file.*?(\d+) insertion.*?(\d+) deletion", stat_line)
+        if m:
+            files_changed, insertions, deletions = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        else:
+            m2 = re.search(r"(\d+) file", stat_line)
+            if m2:
+                files_changed = int(m2.group(1))
+        return json.dumps({
+            "status": "ok", "commitHash": short_hash.strip(),
+            "filesChanged": files_changed, "insertions": insertions, "deletions": deletions,
+        }, ensure_ascii=False)
+
+    def _rpc_gitLog(self, working_dir: str, max_count: int = 50, offset: int = 0) -> str:
+        """获取提交历史。"""
+        import os
+        if not working_dir or not os.path.isdir(working_dir) or not _git_is_repo(working_dir):
+            return json.dumps({"commits": [], "hasMore": False})
+        count = max_count + 1  # 多取一条判断 hasMore
+        fmt = "%H%n%h%n%an%n%ae%n%aI%n%s%n%b%n---COMMIT_SEP---"
+        rc, out, _ = self._git_run(working_dir, ["log", f"--skip={offset}", f"-n{count}", f"--format={fmt}"], timeout=15)
+        if rc != 0:
+            return json.dumps({"commits": [], "hasMore": False})
+        commits = []
+        blocks = out.split("---COMMIT_SEP---\n")
+        has_more = len(blocks) > max_count
+        for block in blocks[:max_count]:
+            block = block.strip()
+            if not block:
+                continue
+            lines = block.split("\n")
+            if len(lines) < 6:
+                continue
+            commits.append({
+                "hash": lines[0], "shortHash": lines[1],
+                "author": lines[2], "email": lines[3],
+                "date": lines[4], "message": lines[5],
+                "body": "\n".join(lines[6:]).strip() if len(lines) > 6 else "",
+            })
+        return json.dumps({"commits": commits, "hasMore": has_more}, ensure_ascii=False)
+
+    def _rpc_gitBranches(self, working_dir: str) -> str:
+        """获取分支列表。"""
+        import os
+        if not working_dir or not os.path.isdir(working_dir) or not _git_is_repo(working_dir):
+            return json.dumps({"current": "", "local": [], "remote": []})
+        # current
+        _, cur, _ = self._git_run(working_dir, ["rev-parse", "--abbrev-ref", "HEAD"], timeout=5)
+        current = cur.strip()
+        # local branches
+        _, local_out, _ = self._git_run(working_dir, ["branch", "--format=%(refname:short)\t%(upstream:short)\t%(upstream:track)"], timeout=5)
+        local_branches = []
+        for line in local_out.strip().splitlines():
+            parts = line.split("\t")
+            name = parts[0] if parts else ""
+            upstream = parts[1] if len(parts) > 1 else ""
+            track = parts[2] if len(parts) > 2 else ""
+            a = b = 0
+            import re
+            m = re.search(r"ahead (\d+)", track)
+            if m: a = int(m.group(1))
+            m2 = re.search(r"behind (\d+)", track)
+            if m2: b = int(m2.group(1))
+            local_branches.append({"name": name, "upstream": upstream, "ahead": a, "behind": b})
+        # remote branches
+        _, remote_out, _ = self._git_run(working_dir, ["branch", "-r", "--format=%(refname:short)"], timeout=5)
+        remote_branches = [{"name": n.strip()} for n in remote_out.strip().splitlines() if n.strip()]
+        return json.dumps({"current": current, "local": local_branches, "remote": remote_branches}, ensure_ascii=False)
+
+    def _rpc_gitBranchCreate(self, working_dir: str, name: str, checkout: bool = True) -> str:
+        """创建分支。"""
+        import os
+        if not working_dir or not os.path.isdir(working_dir) or not _git_is_repo(working_dir):
+            return json.dumps({"status": "error", "message": "非 Git 仓库"})
+        args = ["checkout", "-b", name] if checkout else ["branch", name]
+        rc, _, err = self._git_run(working_dir, args, timeout=10)
+        if rc != 0:
+            return json.dumps({"status": "error", "message": err.strip()})
+        return json.dumps({"status": "ok", "branch": name}, ensure_ascii=False)
+
+    def _rpc_gitBranchSwitch(self, working_dir: str, name: str) -> str:
+        """切换分支。"""
+        import os
+        if not working_dir or not os.path.isdir(working_dir) or not _git_is_repo(working_dir):
+            return json.dumps({"status": "error", "message": "非 Git 仓库"})
+        rc, _, err = self._git_run(working_dir, ["checkout", name], timeout=30)
+        if rc != 0:
+            return json.dumps({"status": "error", "message": err.strip()})
+        return json.dumps({"status": "ok", "branch": name}, ensure_ascii=False)
+
+    async def _rpc_gitPush(self, working_dir: str, remote: str = "origin", branch: str = "", force: bool = False) -> str:
+        """推送到远端（异步，支持网络超时）。"""
+        import os
+        if not working_dir or not os.path.isdir(working_dir) or not _git_is_repo(working_dir):
+            return json.dumps({"status": "error", "message": "非 Git 仓库"})
+        args = ["push"]
+        if force:
+            args.append("--force")
+        args.append(remote)
+        if branch:
+            args.append(branch)
+        rc, out, err = await self._git_run_async(working_dir, args, timeout=120)
+        output = (out + err).strip()
+        if rc != 0:
+            return json.dumps({"status": "error", "message": output or "push 失败"})
+        return json.dumps({"status": "ok", "output": output}, ensure_ascii=False)
+
+    async def _rpc_gitPull(self, working_dir: str, remote: str = "origin", branch: str = "", rebase: bool = False) -> str:
+        """从远端拉取（异步，支持网络超时）。"""
+        import os
+        if not working_dir or not os.path.isdir(working_dir) or not _git_is_repo(working_dir):
+            return json.dumps({"status": "error", "message": "非 Git 仓库"})
+        args = ["pull"]
+        if rebase:
+            args.append("--rebase")
+        args.append(remote)
+        if branch:
+            args.append(branch)
+        rc, out, err = await self._git_run_async(working_dir, args, timeout=120)
+        output = (out + err).strip()
+        if rc != 0:
+            return json.dumps({"status": "error", "message": output or "pull 失败"})
+        return json.dumps({"status": "ok", "output": output}, ensure_ascii=False)
+
+    def _rpc_gitStashList(self, working_dir: str) -> str:
+        """获取 stash 列表。"""
+        import os
+        if not working_dir or not os.path.isdir(working_dir) or not _git_is_repo(working_dir):
+            return json.dumps({"stashes": []})
+        rc, out, _ = self._git_run(working_dir, ["stash", "list", "--format=%H\t%gs\t%aI"], timeout=10)
+        if rc != 0:
+            return json.dumps({"stashes": []})
+        stashes = []
+        for i, line in enumerate(out.strip().splitlines()):
+            if not line.strip():
+                continue
+            parts = line.split("\t", 2)
+            stashes.append({
+                "index": i, "hash": parts[0] if parts else "",
+                "message": parts[1] if len(parts) > 1 else "",
+                "date": parts[2] if len(parts) > 2 else "",
+            })
+        return json.dumps({"stashes": stashes}, ensure_ascii=False)
+
+    def _rpc_gitStashPush(self, working_dir: str, message: str = "") -> str:
+        """暂存当前改动。"""
+        import os
+        if not working_dir or not os.path.isdir(working_dir) or not _git_is_repo(working_dir):
+            return json.dumps({"status": "error", "message": "非 Git 仓库"})
+        args = ["stash", "push"]
+        if message:
+            args.extend(["-m", message])
+        rc, _, err = self._git_run(working_dir, args, timeout=10)
+        if rc != 0:
+            return json.dumps({"status": "error", "message": err.strip()})
+        return json.dumps({"status": "ok"}, ensure_ascii=False)
+
+    def _rpc_gitStashPop(self, working_dir: str, index: int = 0) -> str:
+        """恢复 stash。"""
+        import os
+        if not working_dir or not os.path.isdir(working_dir) or not _git_is_repo(working_dir):
+            return json.dumps({"status": "error", "message": "非 Git 仓库"})
+        rc, _, err = self._git_run(working_dir, ["stash", "pop", f"stash@{{{index}}}"], timeout=15)
+        if rc != 0:
+            return json.dumps({"status": "error", "message": err.strip()})
+        return json.dumps({"status": "ok"}, ensure_ascii=False)
+
+    async def _rpc_gitGenerateCommitMessage(self, working_dir: str, staged_only: bool = True) -> str:
+        """AI 生成 commit message：获取 diff → 调用独立 agent session → 流式推送。"""
+        import os, re, uuid
+        if not working_dir or not os.path.isdir(working_dir) or not _git_is_repo(working_dir):
+            self._emit_event("gitCommitMsgReady", {"workingDir": working_dir, "message": "", "error": "非 Git 仓库"})
+            return json.dumps({"status": "error", "message": "非 Git 仓库"})
+        # 获取 diff
+        diff_args = ["diff", "--cached"] if staged_only else ["diff"]
+        rc, diff_out, _ = self._git_run(working_dir, diff_args, timeout=15)
+        if rc != 0 or not diff_out.strip():
+            self._emit_event("gitCommitMsgReady", {"workingDir": working_dir, "message": "", "error": "没有可提交的改动"})
+            return json.dumps({"status": "ok", "message": ""})
+        diff_text = diff_out[:50000]
+        # 获取最近 commit 作为风格参考
+        _, recent_log, _ = self._git_run(working_dir, ["log", "--oneline", "-5"], timeout=5)
+        prompt = (
+            "你是一个专业的 Git commit message 生成器。根据以下 git diff 生成一条简洁、准确的 commit message。\n"
+            "要求：\n"
+            "- 使用 Conventional Commits 格式（如 feat: / fix: / refactor: / docs: / chore: / test: / style:）\n"
+            "- 第一行简短描述（不超过 72 字符）\n"
+            "- 如有必要，空一行后补充详细说明\n"
+            "- 祈使语气（如 'add feature' 而非 'added feature'）\n"
+            "- 只返回 commit message 文本，不要任何额外说明、不要 markdown 代码块包裹\n\n"
+            f"最近的 commit 风格参考：\n{recent_log.strip()}\n\n"
+            f"git diff：\n{diff_text}"
+        )
+        # 使用独立 backend session 流式生成（与旁路问答相同模式）
+        msg_id = str(uuid.uuid4())[:8]
+        aside_sid = f"gitcommitmsg:{msg_id}"
+        self._emit_event("gitCommitMsgDelta", {"workingDir": working_dir, "text": ""})
+        try:
+            backend = None
+            # 尝试用当前会话的 backend
+            if hasattr(self, "_current_backend_id") and self._current_backend_id:
+                try:
+                    backend = self._get_backend(self._current_backend_id)
+                except Exception:
+                    backend = None
+            if backend is None and self._backend_configs:
+                try:
+                    backend = self._get_backend(self._backend_configs[0].id)
+                except Exception:
+                    backend = None
+            if backend:
+                parts: list[str] = []
+
+                def on_delta(delta: StreamDelta):
+                    if delta.type == "text_delta" and delta.text:
+                        parts.append(delta.text)
+                        self._emit_event("gitCommitMsgDelta", {"workingDir": working_dir, "text": delta.text})
+                    elif delta.type == "error" and delta.error:
+                        self._emit_event("gitCommitMsgDelta", {"workingDir": working_dir, "text": f"\n❌ {delta.error}\n"})
+
+                await backend.send_message(
+                    messages=[], content=prompt, images=None,
+                    session_id=aside_sid, message_id=msg_id, on_delta=on_delta,
+                    agent_session_id=None,  # 独立上下文
+                    working_dir=working_dir,
+                    skip_permissions=True,
+                    sandbox_enabled=False,
+                )
+                backend.clear_cancelled(aside_sid)
+                message = "".join(parts).strip()
+                # 清理可能的 markdown 代码块
+                message = re.sub(r"^```(?:commit|message)?\s*\n?", "", message)
+                message = re.sub(r"\n?```$", "", message)
+                message = message.strip()
+                self._emit_event("gitCommitMsgReady", {"workingDir": working_dir, "message": message})
+                return json.dumps({"status": "ok", "message": message}, ensure_ascii=False)
+            else:
+                self._emit_event("gitCommitMsgReady", {"workingDir": working_dir, "message": "", "error": "无可用 backend"})
+                return json.dumps({"status": "error", "message": "无可用 backend"})
+        except Exception as e:
+            self._emit_event("gitCommitMsgReady", {"workingDir": working_dir, "message": "", "error": str(e)})
+            return json.dumps({"status": "error", "message": str(e)})
 
     def _get_backend(self, config_id: str) -> ModelBackend:
         if config_id in self._backends:

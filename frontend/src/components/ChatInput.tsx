@@ -58,6 +58,10 @@ interface Props {
   // 多 pane 场景:用来决定全局快捷键(截图等)归哪个输入框处理。
   // 单 pane / 浏览器单实例下不传也行,默认 true。
   isFocused?: boolean;
+  // ── Git 集成 ──
+  execKey?: string;
+  execMode?: 'local' | 'relay';
+  onOpenGitPanel?: () => void;
 }
 
 // ═══════════════════════════════════════
@@ -112,6 +116,7 @@ const ChatInputInner: React.FC<Props> = ({
   onCompact,
   fontSize, onAdjustFontSize,
   isFocused = true,
+  execKey, execMode, onOpenGitPanel,
 }) => {
   const ref = useRef<HTMLTextAreaElement>(null);
   // 把 textarea ref 传给 useClipboardImage,这样多 pane 场景下只有聚焦
@@ -120,6 +125,38 @@ const ChatInputInner: React.FC<Props> = ({
 
   // 截图按钮状态:正在等待用户选区域 / 已超时
   const [screenshotBusy, setScreenshotBusy] = useState(false);
+
+  // ── Git 检测（轻量轮询 10s，仅用于工具栏按钮显隐 + badge）──
+  const [gitAvailable, setGitAvailable] = useState(false);
+  const [gitBranch, setGitBranch] = useState('');
+  const [gitStagedCount, setGitStagedCount] = useState(0);
+  const [gitAhead, setGitAhead] = useState(0);
+  const [gitBehind, setGitBehind] = useState(0);
+  const gitPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  useEffect(() => {
+    if (!workingDir) { setGitAvailable(false); return; }
+    let cancelled = false;
+    const poll = () => {
+      api.gitDetect(workingDir, execKey).then((res) => {
+        if (cancelled) return;
+        setGitAvailable(res.isRepo);
+        if (res.isRepo) {
+          setGitBranch(res.branch || '');
+          // 轻量 status：只拿 staged count + ahead/behind
+          api.gitStatus(workingDir, execKey).then((st) => {
+            if (cancelled) return;
+            setGitStagedCount(st.stagedCount || 0);
+            setGitAhead(st.ahead || 0);
+            setGitBehind(st.behind || 0);
+          }).catch(() => {});
+        }
+      }).catch(() => { if (!cancelled) setGitAvailable(false); });
+    };
+    poll();
+    gitPollRef.current = setInterval(poll, 10000);
+    return () => { cancelled = true; if (gitPollRef.current) clearInterval(gitPollRef.current); };
+  }, [workingDir, execKey]);
 
   // 调起系统截图工具 → 等图片落进剪贴板 → 走既有粘贴流程加入附件。
   // 桌面端独占——浏览器无法触发系统截图工具。
@@ -898,6 +935,33 @@ const ChatInputInner: React.FC<Props> = ({
             onClick={handleScreenshot}
             loading={screenshotBusy}
           />
+        )}
+        {/* ★ Git 工具栏按钮（仅 Git 仓库时显示） */}
+        {gitAvailable && onOpenGitPanel && (
+          <>
+            <ToolbarBtn
+              icon={`📋${gitStagedCount > 0 ? gitStagedCount : ''}`}
+              title={gitBranch ? `Git: ${gitBranch}` : 'Git Status'}
+              compact={isMobile}
+              onClick={onOpenGitPanel}
+            />
+            {gitAhead > 0 && (
+              <ToolbarBtn
+                icon={`⬆${gitAhead}`}
+                title="Push"
+                compact={isMobile}
+                onClick={onOpenGitPanel}
+              />
+            )}
+            {gitBehind > 0 && (
+              <ToolbarBtn
+                icon={`⬇${gitBehind}`}
+                title="Pull"
+                compact={isMobile}
+                onClick={onOpenGitPanel}
+              />
+            )}
+          </>
         )}
         {/* ★ 流式进度指示器 */}
         {isStreaming && (

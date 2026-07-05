@@ -17,3 +17,4 @@ src-tauri/binaries/
 installer/claude-env/
 installer/_staging/
 .claude/worktrees/
+.claude

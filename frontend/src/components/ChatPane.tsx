@@ -7,6 +7,7 @@ import { LoopPanel } from './LoopPanel';
 import { SeqTaskPanel } from './SeqTaskPanel';
 import type { SeqTaskT } from './SeqTaskPanel';
 import { ByTheWayDrawer } from './ByTheWayDrawer';
+import { GitPanel } from './GitPanel';
 import { useChat } from '../hooks/useChat';
 import type { AppConfig } from '../hooks/useConfig';
 
@@ -97,6 +98,8 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
   const [activeSession, setActiveSession] = useState<any | null>(null);
   // 权限 state: 初值从 session 读,变化时持久化
   const [skipPermissions, setSkipPermissions] = useState(true);
+  // Git 面板
+  const [gitPanelOpen, setGitPanelOpen] = useState(false);
   // 可见消息条数(切换 session / 切回历史时只显示最近几条)
   // visibleCount 已废:历史分页由后端 + chat.loadEarlier() 控制,前端不再折叠
 
@@ -190,8 +193,19 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
   }, [sessionId]);
 
   // 取队首待发任务，派发进主对话（doSend 跳过斜杠命令拦截 + 自带 isStreaming 守卫）
+  // ★ 用 ref 持有 chat 方法，避免 chat 对象每 render 换新导致 dispatchNext 被频繁重建、
+  //   auto-dispatch effect 不断清除/重建 timeout 引发的竞态：seqtaskUpdated 事件触发
+  //   re-render 时 dispatchNext 正在 await 中，旧的 chat 闭包可能持有过期的 isStreaming
+  //   或 doSend 引用，造成 setMessages(userMsg) 被跳过或被后续 loadSession 覆盖。
+  const isStreamingRef = useRef(chat.isStreaming);
+  isStreamingRef.current = chat.isStreaming;
+  const doSendRef = useRef(chat.doSend);
+  doSendRef.current = chat.doSend;
+  const sendMessageRef = useRef(chat.sendMessage);
+  sendMessageRef.current = chat.sendMessage;
+
   const dispatchNext = useCallback(async () => {
-    if (!sessionId || dispatchingRef.current || chat.isStreaming) return;
+    if (!sessionId || dispatchingRef.current || isStreamingRef.current) return;
     setChain(true);   // 主动派发即激活连发链（▶按钮也走这里，可续上被打断的链）
     dispatchingRef.current = true;
     try {
@@ -201,13 +215,14 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
         const text = r.task.text || '';
         // 以 / 开头的条目当作斜杠命令处理（/compact、/clear 等可排进队列）；
         // 其余走原始发送，绕过命令拦截。
-        if (text.trim().startsWith('/')) chat.sendMessage(text, imgs);
-        else chat.doSend(text, imgs);
+        // ★ 通过 ref 调用，始终拿到最新的函数引用，不受闭包陈旧影响
+        if (text.trim().startsWith('/')) sendMessageRef.current(text, imgs);
+        else doSendRef.current(text, imgs);
       }
     } finally {
       dispatchingRef.current = false;
     }
-  }, [sessionId, chat]);
+  }, [sessionId]); // ★ 不再依赖 chat 对象，dispatchNext 稳定不变
 
   // auto 关→开 时激活连发链（关掉则失活）。auto 已是开的情况下加载/收到同步
   //   不算「关→开」，链保持失活，需用户点 ▶ 或手动重新开关来启动 —— 避免刷新即自动猛发。
@@ -221,8 +236,8 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
   // 用户手动发消息（ChatInput 来的）即接管，断开连发链：这条答完不会自动发下一条。
   const handleUserSend = useCallback((content: string, images?: any[]) => {
     setChain(false);
-    return chat.sendMessage(content, images);
-  }, [chat]);
+    return sendMessageRef.current(content, images);
+  }, []); // ★ 通过 ref 调用，无需依赖 chat
 
   // 序列模式：输入框回车把内容排入队列（不进对话）。auto 开时会自动开始连发。
   const handleQueueTask = useCallback((content: string, images?: any[]) => {
@@ -233,12 +248,15 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
   }, [sessionId]);
 
   // 自动连发：链激活 + auto 开 + 非流式 + 有待发任务 → 发下一条（一条答完 effect 再触发下一条）
+  // ★ 通过 isStreamingRef 读取最新流式状态，避免 chat.isStreaming 闭包陈旧
+  // ★ v2: 移除 setTimeout，直接调用 dispatchNext。dispatchNext 内部的 await
+  //    会自然让出控制权给 React 处理 pending 的 setSeqTasks 更新，避免 80ms
+  //    延迟在某些时序下导致 setMessages(用户消息) 被后续流式更新覆盖。
   useEffect(() => {
-    if (!seqAuto || chat.isStreaming || !seqChainRef.current) return;
+    if (!seqAuto || isStreamingRef.current || !seqChainRef.current) return;
     if (!seqTasks.some((t) => t.status === 'pending')) return;
-    const id = setTimeout(() => { if (!chat.isStreaming && seqChainRef.current) dispatchNext(); }, 80);
-    return () => clearTimeout(id);
-  }, [seqAuto, chat.isStreaming, seqTasks, dispatchNext]);
+    dispatchNext();
+  }, [seqAuto, seqTasks, dispatchNext]); // ★ 移除 chat.isStreaming，改读 ref
 
   // ── 持久化 skipPermissions ──
   const handleSkipPermissionsChange = useCallback(
@@ -647,6 +665,9 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
         fontSize={config.fontSize}
         onAdjustFontSize={onAdjustFontSize}
         isFocused={isFocused}
+        execKey={activeSession?.execKey}
+        execMode={activeSession?.execMode}
+        onOpenGitPanel={() => setGitPanelOpen(true)}
       />
 
       {/* ---- By the way 旁路问答：浮动入口 + 抽屉 ---- */}
@@ -659,8 +680,20 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
           >💬</button>
           <ByTheWayDrawer sessionId={sessionId} open={byTheWayOpen} onClose={() => setByTheWayOpen(false)}
             backends={backends}
-            onSendToChat={(text) => { if (!chat.isStreaming) chat.doSend(text); }} />
+            onSendToChat={(text) => { if (!isStreamingRef.current) doSendRef.current(text); }} />
         </>
+      )}
+
+      {/* ---- Git 操作面板 ---- */}
+      {sessionId && activeSession?.workingDir && (
+        <GitPanel
+          workingDir={activeSession.workingDir}
+          execKey={activeSession.execKey}
+          execLabel={activeSession.execLabel}
+          execMode={activeSession.execMode}
+          open={gitPanelOpen}
+          onClose={() => setGitPanelOpen(false)}
+        />
       )}
     </div>
   );

@@ -14,10 +14,11 @@
  * 无论哪种,查看/编辑都作用在**会话所在节点**的工作目录上(syncReadFile/syncWriteFile,
  * 按 execKey 路由);本地副本目录只服务于远端会话的"离线下载 + 差异同步"。
  */
-import React, { useCallback, useEffect, useMemo, useState, lazy, Suspense } from 'react';
+import React, { useCallback, useEffect, useMemo, useState, useRef, lazy, Suspense } from 'react';
 import hljs from 'highlight.js';
 import { api } from '../api';
 import { markdownToHtml } from '../utils/markdown';
+import type { GitFileStatus, GitFileStatusType } from '../types/git';
 import {
   pickLocalDir, restoreLocalDir, loadBaseline, saveBaseline,
   type LocalFs, type Manifest,
@@ -42,6 +43,15 @@ const STATUS_COLOR: Record<Exclude<FStatus, 'cloud'>, string> = {
 const STATUS_LABEL: Record<FStatus, string> = {
   cloud: '云端 — 未下载到本地', local: '本地已下载', synced: '本地 · 与远端一致',
   differs: '本地与远端不同', conflict: '冲突 · 两端都改过',
+};
+
+// ── Git 状态角标（TortoiseGit 风格）──
+const GIT_STATUS_COLOR: Record<GitFileStatusType, string> = {
+  modified: '#e3b341', added: '#3fb950', deleted: '#f85149',
+  renamed: '#a371f7', copied: '#a371f7', untracked: '#8b949e', conflicted: '#f85149',
+};
+const GIT_STATUS_LETTER: Record<GitFileStatusType, string> = {
+  modified: 'M', added: 'A', deleted: 'D', renamed: 'R', copied: 'C', untracked: 'U', conflicted: '!',
 };
 
 // ── 预览/高亮/编辑 复用(highlight.js + marked + CodeMirror 懒加载)──
@@ -122,6 +132,12 @@ export const FileTreePanel: React.FC<Props> = ({ workingDir, execKey, execLabel,
   const [baseline, setBaseline] = useState<Manifest>({});
   const [comparing, setComparing] = useState(false);
 
+  // ── Git 集成（检测 .git → 轮询状态 → overlay 角标）──
+  const [gitAvailable, setGitAvailable] = useState(false);
+  const [gitBranch, setGitBranch] = useState('');
+  const [gitFiles, setGitFiles] = useState<Record<string, GitFileStatus>>({});
+  const gitPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
   // 预览 / 编辑
   const [preview, setPreview] = useState<PreviewState | null>(null);
   const [mdRaw, setMdRaw] = useState(false);
@@ -157,6 +173,31 @@ export const FileTreePanel: React.FC<Props> = ({ workingDir, execKey, execLabel,
     setChildren({}); setExpanded({}); setSelected(null);
     if (workingDir) loadChildren('');
     // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [workingDir, execKey]);
+
+  // ── Git 检测 + 轮询 ──
+  useEffect(() => {
+    if (!workingDir) { setGitAvailable(false); setGitBranch(''); setGitFiles({}); return; }
+    let cancelled = false;
+    // 初次检测
+    api.gitDetect(workingDir, execKey).then((res) => {
+      if (cancelled) return;
+      setGitAvailable(res.isRepo);
+      setGitBranch(res.branch || '');
+    }).catch(() => { if (!cancelled) setGitAvailable(false); });
+    // 轮询 git status（5s 间隔）
+    const pollStatus = () => {
+      api.gitStatus(workingDir, execKey).then((res) => {
+        if (cancelled) return;
+        const map: Record<string, GitFileStatus> = {};
+        for (const f of (res.files || [])) map[f.path] = f;
+        setGitFiles(map);
+        setGitBranch(res.branch || '');
+      }).catch(() => {});
+    };
+    pollStatus();
+    gitPollRef.current = setInterval(pollStatus, 5000);
+    return () => { cancelled = true; if (gitPollRef.current) clearInterval(gitPollRef.current); };
   }, [workingDir, execKey]);
 
   // 远端会话:恢复上次的本地副本目录并扫描(得到"已下载"presence + 哈希)
@@ -355,6 +396,30 @@ export const FileTreePanel: React.FC<Props> = ({ workingDir, execKey, execLabel,
       const open = !!expanded[n.rel];
       const st = statusOf(n.rel);
       const dotColor = st && st !== 'cloud' && st !== 'local' && st !== 'synced' ? STATUS_COLOR[st] : null;
+
+      // Git 状态角标：文件直接查表；目录取其子项中最严重的状态
+      let gitBadge: { letter: string; color: string; title: string } | null = null;
+      if (gitAvailable) {
+        if (!n.isDir) {
+          const gf = gitFiles[n.rel];
+          if (gf) gitBadge = { letter: GIT_STATUS_LETTER[gf.status], color: GIT_STATUS_COLOR[gf.status], title: `${gf.status}${gf.staged ? ' (staged)' : ''}` };
+        } else {
+          // 目录：聚合子项中最严重的 Git 状态
+          const prefix = n.rel ? `${n.rel}/` : '';
+          let worst: GitFileStatus | null = null;
+          const priority: GitFileStatusType[] = ['conflicted', 'deleted', 'added', 'renamed', 'modified', 'untracked', 'copied'];
+          for (const p of priority) {
+            for (const [path, gf] of Object.entries(gitFiles)) {
+              if (path === n.rel || path.startsWith(prefix)) {
+                if (gf.status === p) { worst = gf; break; }
+              }
+            }
+            if (worst) break;
+          }
+          if (worst) gitBadge = { letter: GIT_STATUS_LETTER[worst.status], color: GIT_STATUS_COLOR[worst.status], title: worst.status };
+        }
+      }
+
       return (
         <div key={n.rel}>
           <div
@@ -370,6 +435,14 @@ export const FileTreePanel: React.FC<Props> = ({ workingDir, execKey, execLabel,
             <span style={{ ...nameStyle, ...(st === 'cloud' ? { color: 'var(--theme-text-muted)' } : dotColor ? { color: dotColor } : {}) }}>{n.name}</span>
             {dotColor && <span title={STATUS_LABEL[st!]} style={{ width: 7, height: 7, borderRadius: '50%', background: dotColor, flexShrink: 0, marginLeft: 4 }} />}
             {st === 'synced' && <span title={STATUS_LABEL.synced} style={{ fontSize: 10, color: STATUS_COLOR.synced, flexShrink: 0, marginLeft: 4 }}>✓</span>}
+            {/* Git 状态角标（TortoiseGit 风格） */}
+            {gitBadge && (
+              <span title={`Git: ${gitBadge.title}`} style={{
+                width: 16, height: 16, borderRadius: 3, display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
+                fontSize: 9, fontWeight: 700, color: '#fff', flexShrink: 0, marginLeft: 3,
+                background: gitBadge.color,
+              }}>{gitBadge.letter}</span>
+            )}
             {/* 操作(hover) */}
             {!n.isDir && (
               <button className="ftp-act" style={actBtnStyle} title="预览 / 编辑" onClick={(e) => { e.stopPropagation(); openPreview(n); }}>👁</button>
@@ -405,6 +478,9 @@ export const FileTreePanel: React.FC<Props> = ({ workingDir, execKey, execLabel,
           {isRemote ? '远端工作目录' : '工作目录'}
         </span>
         {isRemote && execLabel && <span style={tagStyle} title={workingDir}>{execLabel}</span>}
+        {gitAvailable && gitBranch && (
+          <span style={gitBranchBadgeStyle} title={`Git branch: ${gitBranch}`}>🔀 {gitBranch}</span>
+        )}
         <div style={{ flex: 1 }} />
         <button className="ftp-hbtn" style={hdrIconStyle} title="刷新" onClick={reloadAll}>↻</button>
         <button className="ftp-hbtn" style={hdrIconStyle} title="全部折叠" onClick={() => setExpanded({})}>⊟</button>
@@ -515,6 +591,11 @@ const tagStyle: React.CSSProperties = {
   fontSize: 10, color: 'var(--theme-accent)', background: 'var(--theme-accent-bg)',
   border: '1px solid var(--theme-accent)', borderRadius: 4, padding: '0 6px',
   overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: 90,
+};
+const gitBranchBadgeStyle: React.CSSProperties = {
+  fontSize: 10, color: '#58a6ff', background: 'rgba(88,166,255,0.1)',
+  border: '1px solid rgba(88,166,255,0.3)', borderRadius: 10, padding: '0 6px',
+  overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: 100,
 };
 const localBarStyle: React.CSSProperties = {
   display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap',

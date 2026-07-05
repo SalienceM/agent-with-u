@@ -84,6 +84,8 @@ export const SLASH_COMMANDS: SlashCommand[] = [
   { name: '/init',          description: '让 Claude 分析项目并创建 CLAUDE.md',   shortDesc: '初始化' },
   { name: '/config',        description: '显示当前后端配置',                     shortDesc: '配置' },
   { name: '/migrate',       description: '切换到其他模型（保留对话历史）',        shortDesc: '迁移' },
+  { name: '/commit',        description: 'AI 生成 commit message 并提交所有改动', shortDesc: '提交' },
+  { name: '/git',           description: 'Git 操作：/git status | log | push | pull', shortDesc: 'Git' },
 ];
 
 const HELP_TEXT = `📋 **可用命令：**
@@ -101,6 +103,8 @@ const HELP_TEXT = `📋 **可用命令：**
 | \`/init\` | 创建 CLAUDE.md 项目文件 |
 | \`/config\` | 显示后端配置 |
 | \`/migrate\` | 切换到其他模型（保留历史） |
+| \`/commit\` | AI 生成 commit message 并提交 |
+| \`/git\` | Git: status / log / push / pull |
 
 **快捷键：** Enter 发送 · Shift+Enter 换行 · Ctrl+V 粘贴图片`;
 
@@ -325,7 +329,16 @@ export function useChat(sessionId: string, backendId: string, backends?: any[], 
           sessionId,
           loadedMessages.filter((m: ChatMessage) => !m.streaming),
         );
-        setMessages(loadedMessages);
+        // ★ 防丢消息：loadSession RPC 往返期间，doSend 可能已经通过 setMessages
+        //    追加了用户消息（尚未持久化）。全量替换会把它冲掉——用户看到"只有
+        //    回答没有提问"。用函数式更新拿到最新 prev，把不在 loaded 中的本地
+        //    消息（一般是刚发出去的用户气泡）保留在末尾。
+        setMessages((prev) => {
+          const loadedIds = new Set(loadedMessages.map((m: ChatMessage) => m.id));
+          const locals = prev.filter((m: ChatMessage) => !loadedIds.has(m.id));
+          if (locals.length === 0) return loadedMessages;
+          return [...loadedMessages, ...locals];
+        });
       }
       if (session?.autoContinue !== undefined) {
         setAutoContinue(session.autoContinue);
@@ -352,7 +365,14 @@ export function useChat(sessionId: string, backendId: string, backends?: any[], 
       if (data.type === 'session_compacted') {
         const session = await api.loadSession(sessionId);
         if (session?.messages) {
-          setMessages(session.messages.map(normalizeMessage));
+          const loaded = session.messages.map(normalizeMessage);
+          // ★ 同样防丢：compact 期间 doSend 可能已追加了本地用户消息
+          setMessages((prev) => {
+            const loadedIds = new Set(loaded.map((m: ChatMessage) => m.id));
+            const locals = prev.filter((m: ChatMessage) => !loadedIds.has(m.id));
+            if (locals.length === 0) return loaded;
+            return [...loaded, ...locals];
+          });
         }
       } else if (data.type === 'context_cleared') {
         // ★ clearSessionContext：清空对话窗口，session 本身不变
@@ -386,7 +406,14 @@ export function useChat(sessionId: string, backendId: string, backends?: any[], 
         // 重新加载 session 消息以恢复最新持久化状态
         api.loadSession(sessionId).then((session) => {
           if (session?.messages) {
-            setMessages(session.messages.map(normalizeMessage));
+            const loaded = session.messages.map(normalizeMessage);
+            // ★ 同样防丢：重连期间 doSend 可能已追加了本地用户消息
+            setMessages((prev) => {
+              const loadedIds = new Set(loaded.map((m: ChatMessage) => m.id));
+              const locals = prev.filter((m: ChatMessage) => !loadedIds.has(m.id));
+              if (locals.length === 0) return loaded;
+              return [...loaded, ...locals];
+            });
           }
         });
       }
@@ -883,6 +910,113 @@ export function useChat(sessionId: string, backendId: string, backends?: any[], 
           sys(
             `⚙️ **当前配置**\n\n\`\`\`json\n${JSON.stringify(current || {}, null, 2)}\n\`\`\``
           );
+          break;
+        }
+
+        // ── /commit — AI 生成 commit message 并提交 ──
+        case '/commit': {
+          const session = await api.loadSession(sessionId);
+          const wd = session?.workingDir;
+          const ek = session?.execKey;
+          if (!wd) { sys('⚠️ 当前会话没有工作目录。'); break; }
+          // 检测 Git 仓库
+          const detect = await api.gitDetect(wd, ek).catch(() => null);
+          if (!detect?.isRepo) { sys('⚠️ 工作目录不是 Git 仓库。'); break; }
+          // 检查有无改动
+          const status = await api.gitStatus(wd, ek).catch(() => null);
+          if (!status || status.totalChanges === 0) { sys('✅ 工作区干净，无需提交。'); break; }
+          // 先暂存所有改动
+          const unstaged = status.files.filter((f: any) => !f.staged).map((f: any) => f.path);
+          if (unstaged.length > 0) {
+            await api.gitStage(wd, unstaged, ek);
+          }
+          sys('🔄 正在让 AI 生成 commit message...');
+          // 监听 AI 生成结果
+          let resolved = false;
+          const unsub = api.onGitCommitMsgReady(async (data: any) => {
+            if (resolved || data.workingDir !== wd) return;
+            resolved = true;
+            const msg = data.message || data.error;
+            if (data.error) {
+              sys(`❌ AI 生成失败：${data.error}`);
+              return;
+            }
+            // 自动提交
+            try {
+              const res = await api.gitCommit(wd, msg, false, ek);
+              if (res.status === 'ok') {
+                sys(`✅ **已提交** \`${res.commitHash}\`\n\n${msg}\n\n_${res.filesChanged} files, +${res.insertions} −${res.deletions}_`);
+              } else {
+                sys(`❌ 提交失败：${res.message || 'unknown'}`);
+              }
+            } catch (e: any) {
+              sys(`❌ 提交异常：${e?.message || e}`);
+            }
+          });
+          // 触发 AI 生成
+          await api.gitGenerateCommitMessage(wd, true, ek).catch((e: any) => {
+            if (!resolved) { resolved = true; sys(`❌ AI 生成失败：${e?.message || e}`); }
+          });
+          // 30s 超时
+          setTimeout(() => { unsub(); }, 35000);
+          break;
+        }
+
+        // ── /git — Git 操作 ──
+        case '/git': {
+          const session = await api.loadSession(sessionId);
+          const wd = session?.workingDir;
+          const ek = session?.execKey;
+          if (!wd) { sys('⚠️ 当前会话没有工作目录。'); break; }
+          const detect = await api.gitDetect(wd, ek).catch(() => null);
+          if (!detect?.isRepo) { sys('⚠️ 工作目录不是 Git 仓库。'); break; }
+          const sub = args.toLowerCase();
+
+          if (sub === 'status' || sub === '') {
+            const status = await api.gitStatus(wd, ek).catch(() => null);
+            if (!status) { sys('⚠️ 获取 Git 状态失败。'); break; }
+            const STATUS_ICON: Record<string, string> = {
+              modified: '🟡', added: '🟢', deleted: '🔴', renamed: '🟣', untracked: '⚪', conflicted: '⚠️', copied: '🟣',
+            };
+            let text = `🔀 **Git Status** — \`${status.branch}\``;
+            if (status.ahead > 0) text += ` ⬆${status.ahead}`;
+            if (status.behind > 0) text += ` ⬇${status.behind}`;
+            text += `\n\n共 ${status.totalChanges} 个改动（${status.stagedCount} 已暂存）\n\n`;
+            if (status.files.length === 0) {
+              text += '✅ 工作区干净';
+            } else {
+              text += status.files.map((f: any) => `${f.staged ? '✅' : '⬜'} ${STATUS_ICON[f.status] || '•'} ${f.path}`).join('\n');
+            }
+            sys(text);
+            break;
+          }
+
+          if (sub === 'log') {
+            const res = await api.gitLog(wd, 10, 0, ek).catch(() => null);
+            if (!res || res.commits.length === 0) { sys('📜 无提交记录。'); break; }
+            const lines = res.commits.map((c: any) =>
+              `\`${c.shortHash}\` ${c.message} — *${c.author}*, ${new Date(c.date).toLocaleDateString()}`
+            );
+            sys(`📜 **最近提交**\n\n${lines.join('\n')}`);
+            break;
+          }
+
+          if (sub === 'push') {
+            sys('⏳ 正在 push...');
+            const res = await api.gitPush(wd, 'origin', '', false, ek).catch((e: any) => ({ status: 'error', output: '', message: e?.message || String(e) }));
+            sys(res.status === 'ok' ? '✅ **Push 成功**' : `❌ Push 失败：${res.message || res.output}`);
+            break;
+          }
+
+          if (sub === 'pull') {
+            sys('⏳ 正在 pull...');
+            const res = await api.gitPull(wd, 'origin', '', false, ek).catch((e: any) => ({ status: 'error', output: '', message: e?.message || String(e) }));
+            sys(res.status === 'ok' ? '✅ **Pull 成功**' : `❌ Pull 失败：${res.message || res.output}`);
+            break;
+          }
+
+          // 无参数或未知子命令：显示帮助
+          sys('🔧 **Git 命令**\n\n| 命令 | 说明 |\n|------|------|\n| `/git status` | 查看文件状态 |\n| `/git log` | 查看最近 10 条提交 |\n| `/git push` | 推送到远端 |\n| `/git pull` | 从远端拉取 |\n| `/commit` | AI 生成 commit message 并提交 |');
           break;
         }
 

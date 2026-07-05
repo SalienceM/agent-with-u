@@ -8,6 +8,8 @@
  *   Server → Client: {"event": "sessionUpdated", "data": "..."} // push
  */
 
+import type { GitDetectResult, GitStatusResult, GitDiffResult, GitCommitResult, GitLogResult, GitBranchesResult, GitPushPullResult, GitStashListResult } from './types/git';
+
 type StreamDeltaCallback = (delta: any) => void;
 type SessionUpdateCallback = (data: any) => void;
 type PermissionRequestCallback = (data: any) => void;
@@ -77,6 +79,12 @@ let chatAsideUpdatedCallbacks: ChatAsideUpdatedCallback[] = [];
 
 type SttStreamEndCallback = (data: { reason: string }) => void;
 let sttStreamEndCallbacks: SttStreamEndCallback[] = [];
+
+// ── Git commit message 流式事件 ───────────────────────────────────
+type GitCommitMsgDeltaCallback = (data: { workingDir: string; text: string }) => void;
+type GitCommitMsgReadyCallback = (data: { workingDir: string; message: string; error?: string }) => void;
+let gitCommitMsgDeltaCallbacks: GitCommitMsgDeltaCallback[] = [];
+let gitCommitMsgReadyCallbacks: GitCommitMsgReadyCallback[] = [];
 
 function nextId() {
   return `r${++reqCounter}`;
@@ -291,6 +299,12 @@ function handleMessage(e: MessageEvent) {
     } else if (msg.event === 'sttStreamEnd') {
       const data = JSON.parse(msg.data);
       sttStreamEndCallbacks.forEach((cb) => cb(data));
+    } else if (msg.event === 'gitCommitMsgDelta') {
+      const data = JSON.parse(msg.data);
+      gitCommitMsgDeltaCallbacks.forEach((cb) => cb(data));
+    } else if (msg.event === 'gitCommitMsgReady') {
+      const data = JSON.parse(msg.data);
+      gitCommitMsgReadyCallbacks.forEach((cb) => cb(data));
     }
   } catch (err) {
     console.error('[api] message parse error:', err);
@@ -1234,6 +1248,99 @@ export const api = {
   async setAppConfig(config: any): Promise<any> {
     const result = await call('setAppConfig', JSON.stringify(config));
     try { return JSON.parse(result); } catch { return { status: 'error', message: '保存配置失败' }; }
+  },
+
+  // ── Git 集成：所有操作通过 execKey 路由到执行节点 ─────────────
+
+  async gitDetect(workingDir: string, execKey?: string): Promise<GitDetectResult> {
+    const result = await callOn(execKey, 'gitDetect', workingDir);
+    try { return JSON.parse(result); } catch { return { isRepo: false, branch: '', ahead: 0, behind: 0, remote: '', hasUncommitted: false }; }
+  },
+
+  async gitStatus(workingDir: string, execKey?: string): Promise<GitStatusResult> {
+    const result = await callOn(execKey, 'gitStatus', workingDir);
+    try { return JSON.parse(result); } catch { return { files: [], branch: '', upstream: '', ahead: 0, behind: 0, totalChanges: 0, stagedCount: 0 }; }
+  },
+
+  async gitDiff(workingDir: string, path: string = '', staged: boolean = false, execKey?: string): Promise<GitDiffResult> {
+    const result = await callOn(execKey, 'gitDiff', workingDir, path, staged);
+    try { return JSON.parse(result); } catch { return { diff: '', stat: '', binary: false }; }
+  },
+
+  async gitStage(workingDir: string, paths: string[], execKey?: string): Promise<{ status: string }> {
+    const result = await callOn(execKey, 'gitStage', workingDir, JSON.stringify(paths));
+    try { return JSON.parse(result); } catch { return { status: 'error' }; }
+  },
+
+  async gitUnstage(workingDir: string, paths: string[], execKey?: string): Promise<{ status: string }> {
+    const result = await callOn(execKey, 'gitUnstage', workingDir, JSON.stringify(paths));
+    try { return JSON.parse(result); } catch { return { status: 'error' }; }
+  },
+
+  async gitCommit(workingDir: string, message: string, all: boolean = false, execKey?: string): Promise<GitCommitResult> {
+    const result = await callOn(execKey, 'gitCommit', workingDir, message, all);
+    try { return JSON.parse(result); } catch { return { status: 'error', commitHash: '', filesChanged: 0, insertions: 0, deletions: 0 }; }
+  },
+
+  async gitLog(workingDir: string, maxCount: number = 50, offset: number = 0, execKey?: string): Promise<GitLogResult> {
+    const result = await callOn(execKey, 'gitLog', workingDir, maxCount, offset);
+    try { return JSON.parse(result); } catch { return { commits: [], hasMore: false }; }
+  },
+
+  async gitBranches(workingDir: string, execKey?: string): Promise<GitBranchesResult> {
+    const result = await callOn(execKey, 'gitBranches', workingDir);
+    try { return JSON.parse(result); } catch { return { current: '', local: [], remote: [] }; }
+  },
+
+  async gitBranchCreate(workingDir: string, name: string, checkout: boolean = true, execKey?: string): Promise<{ status: string }> {
+    const result = await callOn(execKey, 'gitBranchCreate', workingDir, name, checkout);
+    try { return JSON.parse(result); } catch { return { status: 'error' }; }
+  },
+
+  async gitBranchSwitch(workingDir: string, name: string, execKey?: string): Promise<{ status: string }> {
+    const result = await callOn(execKey, 'gitBranchSwitch', workingDir, name);
+    try { return JSON.parse(result); } catch { return { status: 'error' }; }
+  },
+
+  async gitPush(workingDir: string, remote: string = 'origin', branch: string = '', force: boolean = false, execKey?: string): Promise<GitPushPullResult> {
+    const result = await callOn(execKey, 'gitPush', workingDir, remote, branch, force);
+    try { return JSON.parse(result); } catch { return { status: 'error', output: '' }; }
+  },
+
+  async gitPull(workingDir: string, remote: string = 'origin', branch: string = '', rebase: boolean = false, execKey?: string): Promise<GitPushPullResult> {
+    const result = await callOn(execKey, 'gitPull', workingDir, remote, branch, rebase);
+    try { return JSON.parse(result); } catch { return { status: 'error', output: '' }; }
+  },
+
+  async gitStashList(workingDir: string, execKey?: string): Promise<GitStashListResult> {
+    const result = await callOn(execKey, 'gitStashList', workingDir);
+    try { return JSON.parse(result); } catch { return { stashes: [] }; }
+  },
+
+  async gitStashPush(workingDir: string, message: string = '', execKey?: string): Promise<{ status: string }> {
+    const result = await callOn(execKey, 'gitStashPush', workingDir, message);
+    try { return JSON.parse(result); } catch { return { status: 'error' }; }
+  },
+
+  async gitStashPop(workingDir: string, index: number = 0, execKey?: string): Promise<{ status: string }> {
+    const result = await callOn(execKey, 'gitStashPop', workingDir, index);
+    try { return JSON.parse(result); } catch { return { status: 'error' }; }
+  },
+
+  async gitGenerateCommitMessage(workingDir: string, stagedOnly: boolean = true, execKey?: string): Promise<{ status: string; message?: string }> {
+    const result = await callOn(execKey, 'gitGenerateCommitMessage', workingDir, stagedOnly);
+    try { return JSON.parse(result); } catch { return { status: 'error' }; }
+  },
+
+  // ─ Git 事件订阅 ─────────────────────────────────────────────
+  onGitCommitMsgDelta(cb: (data: { workingDir: string; text: string }) => void): () => void {
+    gitCommitMsgDeltaCallbacks.push(cb);
+    return () => { gitCommitMsgDeltaCallbacks = gitCommitMsgDeltaCallbacks.filter((c) => c !== cb); };
+  },
+
+  onGitCommitMsgReady(cb: (data: { workingDir: string; message: string; error?: string }) => void): () => void {
+    gitCommitMsgReadyCallbacks.push(cb);
+    return () => { gitCommitMsgReadyCallbacks = gitCommitMsgReadyCallbacks.filter((c) => c !== cb); };
   },
 
   // ── 目录同步：远端工作目录 ↔ 本机副本目录 ──────────────────

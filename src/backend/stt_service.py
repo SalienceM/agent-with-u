@@ -138,7 +138,8 @@ def _find_system_python() -> Optional[str]:
         path = shutil.which(name)
         if path:
             try:
-                r = _sp.run([path, "--version"], capture_output=True, text=True, timeout=5)
+                r = _sp.run([path, "--version"], capture_output=True, text=True,
+                            encoding="utf-8", errors="replace", timeout=5)
                 if r.returncode == 0:
                     return path
             except Exception:
@@ -193,7 +194,8 @@ async def transcribe_local(
                 import subprocess as _sp
                 r = _sp.run(
                     [python, "-c", _SUBPROCESS_SCRIPT, tmp_path, language or "", model_size],
-                    capture_output=True, text=True, timeout=120,
+                    capture_output=True, text=True,
+                    encoding="utf-8", errors="replace", timeout=120,
                 )
                 if r.returncode != 0:
                     raise RuntimeError(f"转写进程失败:\n{r.stderr or r.stdout}")
