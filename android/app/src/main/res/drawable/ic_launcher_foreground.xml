@@ -1,0 +1,20 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- 聊天气泡主体 -->
+    <path
+        android:fillColor="#6C63FF"
+        android:pathData="M34,40 Q34,32 42,32 L66,32 Q74,32 74,40 L74,58 Q74,66 66,66 L50,66 L42,74 L42,66 Q34,66 34,58 Z"/>
+    <!-- 气泡内三条横线（消息符号） -->
+    <path
+        android:fillColor="#E0E0FF"
+        android:pathData="M42,42 L66,42 L66,45 L42,45 Z"/>
+    <path
+        android:fillColor="#E0E0FF"
+        android:pathData="M42,50 L60,50 L60,53 L42,53 Z"/>
+    <path
+        android:fillColor="#E0E0FF"
+        android:pathData="M42,58 L54,58 L54,61 L42,61 Z"/>
+</vector>
