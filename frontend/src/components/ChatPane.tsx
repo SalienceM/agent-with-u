@@ -7,7 +7,6 @@ import { LoopPanel } from './LoopPanel';
 import { SeqTaskPanel } from './SeqTaskPanel';
 import type { SeqTaskT } from './SeqTaskPanel';
 import { ByTheWayDrawer } from './ByTheWayDrawer';
-import { GitPanel } from './GitPanel';
 import { useChat } from '../hooks/useChat';
 import type { AppConfig } from '../hooks/useConfig';
 
@@ -98,8 +97,11 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
   const [activeSession, setActiveSession] = useState<any | null>(null);
   // 权限 state: 初值从 session 读,变化时持久化
   const [skipPermissions, setSkipPermissions] = useState(true);
-  // Git 面板
-  const [gitPanelOpen, setGitPanelOpen] = useState(false);
+  // ★ 自动 AI commit 状态
+  const [autoCommit, setAutoCommit] = useState(false);
+  const [autoCommitPush, setAutoCommitPush] = useState(false);
+  const [autoCommitBackendId, setAutoCommitBackendId] = useState<string>('');
+  const [autoCommitToast, setAutoCommitToast] = useState<{ msg: string; ok: boolean } | null>(null);
   // 可见消息条数(切换 session / 切回历史时只显示最近几条)
   // visibleCount 已废:历史分页由后端 + chat.loadEarlier() 控制,前端不再折叠
 
@@ -129,6 +131,13 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
       if (session?.skipPermissions !== undefined) {
         setSkipPermissions(session.skipPermissions);
       }
+      // ★ 加载自动 commit 设置
+      api.getAutoCommit(sessionId).then((ac) => {
+        if (cancelled) return;
+        setAutoCommit(ac.autoCommit);
+        setAutoCommitPush(ac.autoCommitPush);
+        setAutoCommitBackendId(ac.autoCommitBackendId || '');
+      }).catch(() => {});
     });
     return () => {
       cancelled = true;
@@ -179,6 +188,17 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
   // state 镜像，仅供面板显示「连发中 / 已暂停」；逻辑判定一律读 ref（避免闭包过期）
   const [seqChainActive, setSeqChainActive] = useState(false);
   const setChain = useCallback((v: boolean) => { seqChainRef.current = v; setSeqChainActive(v); }, []);
+
+  // ★ 序列模式下：当前对话完成后（流式→非流式），激活连发链让 auto-dispatch effect 触发
+  const prevStreamingForSeqRef = useRef(chat.isStreaming);
+  useEffect(() => {
+    const wasStreaming = prevStreamingForSeqRef.current;
+    const isStreamingNow = chat.isStreaming;
+    prevStreamingForSeqRef.current = isStreamingNow;
+    if (wasStreaming && !isStreamingNow && seqMode && seqAuto) {
+      setChain(true);
+    }
+  }, [chat.isStreaming, seqMode, seqAuto, setChain]);
 
   useEffect(() => {
     if (!sessionId) { setSeqTasks([]); setSeqAuto(false); return; }
@@ -273,6 +293,50 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
     },
     [sessionId, activeBackendId],
   );
+
+  // ── ★ 自动 AI commit 切换 ──
+  const handleAutoCommitChange = useCallback(
+    (enabled: boolean, push?: boolean, backendId?: string) => {
+      const newPush = push ?? autoCommitPush;
+      const newBackend = backendId ?? autoCommitBackendId;
+      setAutoCommit(enabled);
+      if (push !== undefined) setAutoCommitPush(newPush);
+      if (backendId !== undefined) setAutoCommitBackendId(newBackend);
+      if (sessionId) {
+        api.setAutoCommit(sessionId, enabled, newPush, newBackend);
+      }
+    },
+    [sessionId, autoCommitPush, autoCommitBackendId],
+  );
+
+  // ── ★ 自动 commit 结果通知 ──
+  useEffect(() => {
+    const unsub = api.onAutoCommitResult((data) => {
+      if (data.sessionId !== sessionId) return;
+      let msg = '';
+      let ok = true;
+      if (data.status === 'skipped') {
+        msg = '⏭ 无变更，跳过提交';
+      } else if (data.status === 'notRepo') {
+        msg = '⚠ 非 Git 仓库，跳过自动提交';
+      } else if (data.status === 'pushFailed') {
+        msg = `✅ 已提交，但 push 失败${data.error ? `: ${data.error}` : ''}`;
+        ok = false;
+      } else if (data.status === 'success') {
+        msg = data.pushed
+          ? `✅ 已提交并推送 (${data.files || 0} 文件)`
+          : `✅ 已提交 (${data.files || 0} 文件)`;
+      } else if (data.status === 'error') {
+        msg = `❌ 自动提交失败: ${data.error || '未知错误'}`;
+        ok = false;
+      } else {
+        return;
+      }
+      setAutoCommitToast({ msg, ok });
+      setTimeout(() => setAutoCommitToast(null), 5000);
+    });
+    return unsub;
+  }, [sessionId]);
 
 
   const handleCompact = useCallback(() => {
@@ -658,7 +722,15 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
         onSkipPermissionsChange={handleSkipPermissionsChange}
         isMobile={isMobile}
         seqMode={seqMode}
-        onToggleSeqMode={() => setSeqMode((v) => !v)}
+        onToggleSeqMode={() => {
+          setSeqMode((v) => {
+            const next = !v;
+            // ★ 修复：切换到序列模式时，重置连发链标志
+            // 避免序列模式立即触发自动连发，应该等待当前对话完成后再继续
+            if (next) setChain(false);
+            return next;
+          });
+        }}
         onQueueTask={handleQueueTask}
         seqCount={seqTasks.filter((t) => t.status === 'pending').length}
         onCompact={handleCompact}
@@ -667,7 +739,10 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
         isFocused={isFocused}
         execKey={activeSession?.execKey}
         execMode={activeSession?.execMode}
-        onOpenGitPanel={() => setGitPanelOpen(true)}
+        autoCommit={autoCommit}
+        autoCommitPush={autoCommitPush}
+        autoCommitBackendId={autoCommitBackendId}
+        onAutoCommitChange={handleAutoCommitChange}
       />
 
       {/* ---- By the way 旁路问答：浮动入口 + 抽屉 ---- */}
@@ -684,16 +759,36 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
         </>
       )}
 
-      {/* ---- Git 操作面板 ---- */}
-      {sessionId && activeSession?.workingDir && (
-        <GitPanel
-          workingDir={activeSession.workingDir}
-          execKey={activeSession.execKey}
-          execLabel={activeSession.execLabel}
-          execMode={activeSession.execMode}
-          open={gitPanelOpen}
-          onClose={() => setGitPanelOpen(false)}
-        />
+      {/* ---- ★ 自动 commit 结果通知 ---- */}
+      {autoCommitToast && (
+        <div style={{
+          position: 'absolute',
+          bottom: 80,
+          left: '50%',
+          transform: 'translateX(-50%)',
+          background: autoCommitToast.ok
+            ? 'var(--theme-success-bg, rgba(46,160,67,0.15))'
+            : 'var(--theme-error-bg, rgba(248,81,73,0.15))',
+          color: autoCommitToast.ok
+            ? 'var(--theme-success, #3fb950)'
+            : 'var(--theme-error, #f85149)',
+          border: `1px solid ${autoCommitToast.ok
+            ? 'var(--theme-success, rgba(46,160,67,0.4))'
+            : 'var(--theme-error, rgba(248,81,73,0.4))'}`,
+          borderRadius: 8,
+          padding: '8px 16px',
+          fontSize: 13,
+          fontWeight: 500,
+          zIndex: 100,
+          pointerEvents: 'none',
+          animation: 'dialogSlideIn 0.2s ease',
+          whiteSpace: 'nowrap',
+          maxWidth: '90%',
+          overflow: 'hidden',
+          textOverflow: 'ellipsis',
+        }}>
+          {autoCommitToast.msg}
+        </div>
       )}
     </div>
   );

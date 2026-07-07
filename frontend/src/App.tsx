@@ -1,4 +1,4 @@
-import React, { useState, useCallback, useEffect, useRef } from 'react';
+import React, { useState, useCallback, useEffect, useRef, useMemo } from 'react';
 import { api, isTauri, getExecutors, onExecStatus, getHomeExecKey, type ExecutorInfo } from './api';
 import {
   HOTKEY_CHANGED_EVENT,
@@ -290,6 +290,24 @@ export const App: React.FC = () => {
   // Phase 2: 每 Session 独立的模型配置(顶栏标签用)
   const activeBackendId = activeSession?.backendId || backends[0]?.id || '';
 
+  // ★ 修复：根据 session 的 execKey 获取对应节点的 backend 列表
+  // 多节点环境下，每个节点有独立的 backend 配置，需要按 execKey 区分
+  const [activeExecBackends, setActiveExecBackends] = useState<any[]>(backends);
+  useEffect(() => {
+    let cancelled = false;
+    const execKey = activeSession?.execKey;
+    const isHomeExec = !execKey || execKey === getHomeExecKey();
+    if (isHomeExec) {
+      setActiveExecBackends(backends);
+      return;
+    }
+    // 远端节点：按需拉取该节点的 backend 列表
+    api.getBackends(execKey).then((list) => {
+      if (!cancelled) setActiveExecBackends(list || []);
+    });
+    return () => { cancelled = true; };
+  }, [activeSession?.execKey, backends]);
+
   // ── 性能：便签本拖拽 handler，onMouseDown 每次渲染都会重新生成，改为 ref 方案 ──
   const scratchPadWidthRef = useRef(scratchPadWidth);
   scratchPadWidthRef.current = scratchPadWidth; // 每次渲染同步，保证拖拽读到最新值
@@ -362,7 +380,18 @@ export const App: React.FC = () => {
   }, []);
 
   const handleCreateSession = useCallback(async (workingDir: string, backendId: string, sessionType: 'normal' | 'loop' = 'normal', loopPolicy?: any, execKey?: string) => {
-    const session = await api.createSession(workingDir, backendId, sessionType, execKey);
+    let session;
+    try {
+      session = await api.createSession(workingDir, backendId, sessionType, execKey);
+    } catch (e: any) {
+      // ★ 后端抛出错误（如节点 session 数量已达上限）
+      showToast('error', e?.message || '创建会话失败');
+      return;
+    }
+    if (!session) {
+      showToast('error', '创建会话失败：无法连接到执行节点');
+      return;
+    }
     // ★ Loop 会话：把建会话时编辑的策略与心智落到 stage 文件
     if (sessionType === 'loop' && loopPolicy) {
       api.loopSetPolicy(session.id, loopPolicy).catch(() => {});
@@ -542,6 +571,14 @@ export const App: React.FC = () => {
   const ua = config.uiOpacity ?? 1;  // panel alpha
 
   // 首次连接中（null = 尚未收到任何连接状态回调）
+  // 超过 10 秒仍连接不上，展示诊断提示
+  const [connectHint, setConnectHint] = useState(false);
+  useEffect(() => {
+    if (backendConnected !== null) return;
+    const timer = setTimeout(() => setConnectHint(true), 10000);
+    return () => clearTimeout(timer);
+  }, [backendConnected]);
+
   if (backendConnected === null) {
     return (
       <div style={{
@@ -556,6 +593,18 @@ export const App: React.FC = () => {
         }} />
         <style>{`@keyframes spin { to { transform: rotate(360deg); } }`}</style>
         <span style={{ fontSize: 14 }}>正在连接后端...</span>
+        {connectHint && (
+          <div style={{
+            fontSize: 12, color: '#888', textAlign: 'center', maxWidth: 420,
+            lineHeight: 1.6, marginTop: 8,
+            background: 'rgba(255,255,255,0.04)', borderRadius: 8, padding: '12px 16px',
+          }}>
+            <div style={{ fontWeight: 600, marginBottom: 4 }}>连接超时？请检查：</div>
+            <div>1. 后端进程是否已启动（<code>python -m src.ws_main</code>）</div>
+            <div>2. 端口 44321 是否可达</div>
+            <div>3. 浏览器控制台是否有 WebSocket 错误</div>
+          </div>
+        )}
       </div>
     );
   }

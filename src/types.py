@@ -192,6 +192,10 @@ class Session:
     abilities: Optional[dict] = None  # {"skills": ["skill-name"], "prompts": ["prompt-name"]}
     # ★ 会话类型：普通会话 / 可视化 loop 会话（loop 状态另存于 loops/<id>.json）
     session_type: str = "normal"  # "normal" | "loop"
+    # ★ 自动 AI commit + push：对话/Loop 结束时自动 stage-all → AI 生成 message → commit → push
+    auto_commit: bool = False
+    auto_commit_push: bool = False  # commit 后是否自动 push
+    auto_commit_backend_id: Optional[str] = None  # AI commit 使用的后端（None = 跟随会话主模型）
 
     def to_dict(self) -> dict:
         return {
@@ -210,6 +214,9 @@ class Session:
             "constraints": self.constraints,
             "abilities": self.abilities,
             "sessionType": self.session_type,
+            "autoCommit": self.auto_commit,
+            "autoCommitPush": self.auto_commit_push,
+            "autoCommitBackendId": self.auto_commit_backend_id,
         }
 
     def meta_dict(self) -> dict:
@@ -224,6 +231,9 @@ class Session:
             "backendId": self.backend_id,
             "abilities": self.abilities,
             "sessionType": self.session_type,
+            "autoCommit": self.auto_commit,
+            "autoCommitPush": self.auto_commit_push,
+            "autoCommitBackendId": self.auto_commit_backend_id,
         }
 
 

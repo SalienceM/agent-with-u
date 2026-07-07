@@ -47,11 +47,18 @@ export const GitPanel: React.FC<Props> = ({
   const [aiMsg, setAiMsg] = useState('');
   const [log, setLog] = useState<GitLogCommit[]>([]);
   const [logLoading, setLogLoading] = useState(false);
+  const [logHasMore, setLogHasMore] = useState(false);
+  const [logLoadingMore, setLogLoadingMore] = useState(false);
   const [branches, setBranches] = useState<{ current: string; local: GitBranch[]; remote: { name: string }[] }>({ current: '', local: [], remote: [] });
   const [branchesLoading, setBranchesLoading] = useState(false);
+  const [newBranchName, setNewBranchName] = useState('');
+  const [branchActionBusy, setBranchActionBusy] = useState('');
   const [stashes, setStashes] = useState<GitStashEntry[]>([]);
   const [stashesLoading, setStashesLoading] = useState(false);
   const [toast, setToast] = useState('');
+  const [commitAll, setCommitAll] = useState(false);
+  const [stagedCollapsed, setStagedCollapsed] = useState(false);
+  const [unstagedCollapsed, setUnstagedCollapsed] = useState(false);
   const aiTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
@@ -112,13 +119,30 @@ export const GitPanel: React.FC<Props> = ({
     if (staged.length) { await api.gitUnstage(workingDir, staged, execKey); loadStatus(); }
   }, [files, workingDir, execKey, loadStatus]);
 
+  // Discard — 丢弃文件改动（需确认）
+  const handleDiscard = useCallback(async (path: string) => {
+    if (!window.confirm(`确定丢弃「${path}」的所有改动？此操作不可撤销。`)) return;
+    try {
+      const res = await api.gitDiscard(workingDir, [path], execKey);
+      if (res.status === 'ok' || res.status === 'partial') {
+        showToast(`✅ 已丢弃 ${path}`);
+        if (selectedFile === path) { setSelectedFile(null); setDiff({ diff: '', stat: '', binary: false }); }
+        loadStatus();
+      } else {
+        showToast(`❌ 丢弃失败: ${path}`);
+      }
+    } catch {
+      showToast('❌ 丢弃操作异常');
+    }
+  }, [workingDir, execKey, loadStatus, selectedFile]);
+
   // Commit
   const handleCommit = useCallback(async () => {
     const msg = commitMsg.trim() || aiMsg.trim();
     if (!msg) { showToast('请输入 commit message'); return; }
     setCommitting(true);
     try {
-      const res = await api.gitCommit(workingDir, msg, false, execKey);
+      const res = await api.gitCommit(workingDir, msg, commitAll, execKey);
       if (res.status === 'ok') {
         showToast(`✅ Committed: ${res.commitHash || 'ok'} (${res.filesChanged} files)`);
         setCommitMsg('');
@@ -133,7 +157,7 @@ export const GitPanel: React.FC<Props> = ({
     } finally {
       setCommitting(false);
     }
-  }, [commitMsg, aiMsg, workingDir, execKey, loadStatus, onCommitComplete]);
+  }, [commitMsg, aiMsg, commitAll, workingDir, execKey, loadStatus, onCommitComplete]);
 
   // AI 生成 commit message
   const handleAiGenerate = useCallback(() => {
@@ -185,19 +209,112 @@ export const GitPanel: React.FC<Props> = ({
     } finally { setPulling(false); }
   }, [workingDir, execKey, loadStatus]);
 
-  // Load log
+  // Load log (initial)
+  const loadLog = useCallback(async () => {
+    setLogLoading(true);
+    setLog([]);
+    setLogHasMore(false);
+    try {
+      const res = await api.gitLog(workingDir, 50, 0, execKey);
+      setLog(res.commits || []);
+      setLogHasMore(res.hasMore ?? false);
+    } finally {
+      setLogLoading(false);
+    }
+  }, [workingDir, execKey]);
+
+  // Load more log entries
+  const loadMoreLog = useCallback(async () => {
+    if (logLoadingMore || !logHasMore) return;
+    setLogLoadingMore(true);
+    try {
+      const res = await api.gitLog(workingDir, 50, log.length, execKey);
+      setLog((prev) => [...prev, ...(res.commits || [])]);
+      setLogHasMore(res.hasMore ?? false);
+    } finally {
+      setLogLoadingMore(false);
+    }
+  }, [workingDir, execKey, log.length, logLoadingMore, logHasMore]);
+
   useEffect(() => {
     if (tab !== 'log' || !open) return;
-    setLogLoading(true);
-    api.gitLog(workingDir, 50, 0, execKey).then((res) => setLog(res.commits || [])).finally(() => setLogLoading(false));
-  }, [tab, open, workingDir, execKey]);
+    loadLog();
+  }, [tab, open, loadLog]);
+
+  // Copy hash to clipboard
+  const copyHash = useCallback((hash: string) => {
+    navigator.clipboard.writeText(hash).then(() => showToast(`📋 ${hash.slice(0, 7)} 已复制`));
+  }, []);
 
   // Load branches
+  const loadBranches = useCallback(async () => {
+    setBranchesLoading(true);
+    try {
+      const res = await api.gitBranches(workingDir, execKey);
+      setBranches(res);
+    } finally {
+      setBranchesLoading(false);
+    }
+  }, [workingDir, execKey]);
+
   useEffect(() => {
     if (tab !== 'branches' || !open) return;
-    setBranchesLoading(true);
-    api.gitBranches(workingDir, execKey).then((res) => setBranches(res)).finally(() => setBranchesLoading(false));
-  }, [tab, open, workingDir, execKey]);
+    loadBranches();
+  }, [tab, open, loadBranches]);
+
+  // Branch actions
+  const handleBranchSwitch = useCallback(async (name: string) => {
+    if (name === branches.current) return;
+    setBranchActionBusy(`switch:${name}`);
+    try {
+      const res = await api.gitBranchSwitch(workingDir, name, execKey);
+      if (res.status === 'ok') {
+        showToast(`✅ 已切换到 ${name}`);
+        loadBranches();
+        loadStatus();
+      } else {
+        showToast(`❌ 切换失败: ${name}`);
+      }
+    } finally { setBranchActionBusy(''); }
+  }, [workingDir, execKey, branches.current, loadBranches, loadStatus]);
+
+  const handleBranchDelete = useCallback(async (name: string) => {
+    if (name === branches.current) { showToast('❌ 不能删除当前分支'); return; }
+    if (!window.confirm(`确定删除分支「${name}」？`)) return;
+    setBranchActionBusy(`delete:${name}`);
+    try {
+      const res = await api.gitBranchDelete(workingDir, name, false, execKey);
+      if (res.status === 'ok') {
+        showToast(`✅ 已删除 ${name}`);
+        loadBranches();
+      } else {
+        // 安全删除失败 → 询问强制删除
+        if (window.confirm(`安全删除失败（分支未完全合并）。是否强制删除「${name}」？`)) {
+          const res2 = await api.gitBranchDelete(workingDir, name, true, execKey);
+          if (res2.status === 'ok') { showToast(`✅ 已强制删除 ${name}`); loadBranches(); }
+          else { showToast(`❌ 强制删除失败`); }
+        }
+      }
+    } finally { setBranchActionBusy(''); }
+  }, [workingDir, execKey, branches.current, loadBranches]);
+
+  const handleBranchCreate = useCallback(async () => {
+    const name = newBranchName.trim();
+    if (!name) { showToast('请输入分支名'); return; }
+    if (!/^[a-zA-Z0-9._/\-]+$/.test(name)) { showToast('❌ 分支名包含非法字符'); return; }
+    setBranchActionBusy('create');
+    try {
+      const res = await api.gitBranchCreate(workingDir, name, true, execKey);
+      if (res.status === 'ok') {
+        showToast(`✅ 已创建并切换到 ${name}`);
+        setNewBranchName('');
+        loadBranches();
+        loadStatus();
+      } else {
+        showToast(`❌ 创建失败`);
+      }
+    } finally { setBranchActionBusy(''); }
+  }, [workingDir, execKey, newBranchName, loadBranches, loadStatus]);
 
   // Load stashes
   useEffect(() => {
@@ -216,6 +333,9 @@ export const GitPanel: React.FC<Props> = ({
   return (
     <div style={overlayStyle} onClick={onClose}>
       <div style={panelStyle} onClick={(e) => e.stopPropagation()}>
+        <style>{`
+          .git-file-row:hover .git-file-discard-btn { opacity: 1 !important; }
+        `}</style>
         {/* Header */}
         <div style={headerStyle}>
           <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
@@ -245,30 +365,44 @@ export const GitPanel: React.FC<Props> = ({
               {/* Left: file list */}
               <div style={fileListStyle}>
                 <div style={sectionHeaderStyle}>
-                  <span>Staged ({stagedFiles.length}){(() => {
-                    const sa = stagedFiles.reduce((s, f) => s + (f.addedLines || 0), 0);
-                    const sd = stagedFiles.reduce((s, f) => s + (f.deletedLines || 0), 0);
-                    return sa || sd ? ` +${sa} -${sd}` : '';
-                  })()}</span>
+                  <span
+                    style={{ cursor: stagedFiles.length > 0 ? 'pointer' : 'default', userSelect: 'none', display: 'flex', alignItems: 'center', gap: 4 }}
+                    onClick={() => stagedFiles.length > 0 && setStagedCollapsed((v) => !v)}
+                  >
+                    {stagedFiles.length > 0 && <span style={{ fontSize: 9, transition: 'transform 0.15s', transform: stagedCollapsed ? 'rotate(-90deg)' : 'rotate(0deg)', display: 'inline-block' }}>▾</span>}
+                    Staged ({stagedFiles.length}){(() => {
+                      const sa = stagedFiles.reduce((s, f) => s + (f.addedLines || 0), 0);
+                      const sd = stagedFiles.reduce((s, f) => s + (f.deletedLines || 0), 0);
+                      return sa || sd ? ` +${sa} -${sd}` : '';
+                    })()}
+                  </span>
                   {stagedFiles.length > 0 && <button onClick={handleUnstageAll} style={smallBtnStyle}>Unstage All</button>}
                 </div>
-                {stagedFiles.map((f) => (
+                {!stagedCollapsed && stagedFiles.map((f) => (
                   <FileRow key={f.path} file={f} isSelected={selectedFile === f.path}
                     onClick={() => loadDiff(f.path, true)}
-                    onToggleStage={() => handleUnstage(f.path)} />
+                    onToggleStage={() => handleUnstage(f.path)}
+                    onDiscard={() => handleDiscard(f.path)} />
                 ))}
                 <div style={{ ...sectionHeaderStyle, marginTop: 12 }}>
-                  <span>Unstaged ({unstagedFiles.length}){(() => {
-                    const ua = unstagedFiles.reduce((s, f) => s + (f.addedLines || 0), 0);
-                    const ud = unstagedFiles.reduce((s, f) => s + (f.deletedLines || 0), 0);
-                    return ua || ud ? ` +${ua} -${ud}` : '';
-                  })()}</span>
+                  <span
+                    style={{ cursor: unstagedFiles.length > 0 ? 'pointer' : 'default', userSelect: 'none', display: 'flex', alignItems: 'center', gap: 4 }}
+                    onClick={() => unstagedFiles.length > 0 && setUnstagedCollapsed((v) => !v)}
+                  >
+                    {unstagedFiles.length > 0 && <span style={{ fontSize: 9, transition: 'transform 0.15s', transform: unstagedCollapsed ? 'rotate(-90deg)' : 'rotate(0deg)', display: 'inline-block' }}>▾</span>}
+                    Unstaged ({unstagedFiles.length}){(() => {
+                      const ua = unstagedFiles.reduce((s, f) => s + (f.addedLines || 0), 0);
+                      const ud = unstagedFiles.reduce((s, f) => s + (f.deletedLines || 0), 0);
+                      return ua || ud ? ` +${ua} -${ud}` : '';
+                    })()}
+                  </span>
                   {unstagedFiles.length > 0 && <button onClick={handleStageAll} style={smallBtnStyle}>Stage All</button>}
                 </div>
-                {unstagedFiles.map((f) => (
+                {!unstagedCollapsed && unstagedFiles.map((f) => (
                   <FileRow key={f.path} file={f} isSelected={selectedFile === f.path}
                     onClick={() => loadDiff(f.path, false)}
-                    onToggleStage={() => handleStage(f.path)} />
+                    onToggleStage={() => handleStage(f.path)}
+                    onDiscard={() => handleDiscard(f.path)} />
                 ))}
                 {files.length === 0 && <div style={emptyStyle}>工作区干净 ✓</div>}
                 {loading && files.length === 0 && <div style={emptyStyle}>加载中…</div>}
@@ -294,11 +428,15 @@ export const GitPanel: React.FC<Props> = ({
                 }}>{aiGenerating ? '⏳ AI 生成中…' : '✨ AI 生成'}</button>
                 {aiMsg && (
                   <div style={aiMsgStyle}>
-                    <div style={{ fontSize: 10, color: '#8b949e', marginBottom: 4 }}>AI 建议：</div>
+                    <div style={{ fontSize: 10, color: 'var(--theme-text-muted, #8b949e)', marginBottom: 4 }}>AI 建议：</div>
                     <div style={{ fontSize: 12, whiteSpace: 'pre-wrap', maxHeight: 100, overflow: 'auto' }}>{aiMsg}</div>
                     <button onClick={() => setCommitMsg(aiMsg)} style={{ ...smallBtnStyle, marginTop: 4 }}>采纳</button>
                   </div>
                 )}
+                <label style={{ display: 'flex', alignItems: 'center', gap: 6, marginTop: 8, fontSize: 11, color: 'var(--theme-text-muted, #8b949e)', cursor: 'pointer', userSelect: 'none' }}>
+                  <input type="checkbox" checked={commitAll} onChange={(e) => setCommitAll(e.target.checked)} style={{ cursor: 'pointer', accentColor: '#3fb950' }} />
+                  <span title="自动 stage 所有已跟踪文件的修改（git commit -a），无需手动 stage">Commit All（包含已跟踪文件修改）</span>
+                </label>
                 <div style={{ display: 'flex', gap: 6, marginTop: 8 }}>
                   <button onClick={handleCommit} disabled={committing || (!commitMsg.trim() && !aiMsg.trim())} style={{
                     ...actionBtnStyle, flex: 1, background: '#238636',
@@ -321,17 +459,46 @@ export const GitPanel: React.FC<Props> = ({
             <div style={logStyle}>
               {logLoading ? <div style={emptyStyle}>加载历史…</div> :
                 log.length === 0 ? <div style={emptyStyle}>无提交记录</div> :
-                  log.map((c) => (
-                    <div key={c.hash} style={logItemStyle}>
-                      <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-                        <span style={{ fontFamily: 'monospace', fontSize: 11, color: '#58a6ff', background: 'rgba(88,166,255,0.1)', padding: '1px 6px', borderRadius: 4 }}>{c.shortHash}</span>
-                        <span style={{ fontSize: 12, color: '#8b949e' }}>{c.author}</span>
-                        <span style={{ fontSize: 10, color: '#6e7681' }}>{new Date(c.date).toLocaleString()}</span>
+                  <>
+                    {log.map((c) => (
+                      <div key={c.hash} style={logItemStyle}>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                          <span
+                            onClick={() => copyHash(c.hash)}
+                            style={{
+                              fontFamily: 'monospace', fontSize: 11, color: 'var(--theme-accent, #58a6ff)',
+                              background: 'var(--theme-accent-bg, rgba(88,166,255,0.1))', padding: '1px 6px',
+                              borderRadius: 4, cursor: 'pointer', userSelect: 'all',
+                              transition: 'background 0.15s',
+                            }}
+                            title="点击复制完整 hash"
+                            onMouseEnter={(e) => { (e.currentTarget as HTMLSpanElement).style.background = 'var(--theme-accent-bg, rgba(88,166,255,0.25))'; }}
+                            onMouseLeave={(e) => { (e.currentTarget as HTMLSpanElement).style.background = 'var(--theme-accent-bg, rgba(88,166,255,0.1))'; }}
+                          >{c.shortHash}</span>
+                          <span style={{ fontSize: 12, color: 'var(--theme-text-muted, #8b949e)' }}>{c.author}</span>
+                          <span style={{ fontSize: 10, color: 'var(--theme-text-muted, #6e7681)' }}>{new Date(c.date).toLocaleString()}</span>
+                        </div>
+                        <div style={{ fontSize: 13, marginTop: 4, color: 'var(--theme-text, #c9d1d9)' }}>{c.message}</div>
+                        {c.body && <div style={{ fontSize: 11, color: 'var(--theme-text-muted, #8b949e)', marginTop: 2, whiteSpace: 'pre-wrap' }}>{c.body}</div>}
                       </div>
-                      <div style={{ fontSize: 13, marginTop: 4, color: 'var(--theme-text, #c9d1d9)' }}>{c.message}</div>
-                      {c.body && <div style={{ fontSize: 11, color: '#8b949e', marginTop: 2, whiteSpace: 'pre-wrap' }}>{c.body}</div>}
-                    </div>
-                  ))}
+                    ))}
+                    {logHasMore && (
+                      <div style={{ textAlign: 'center', padding: '12px 0' }}>
+                        <button
+                          onClick={loadMoreLog}
+                          disabled={logLoadingMore}
+                          style={{
+                            padding: '6px 20px', borderRadius: 6, fontSize: 12, fontWeight: 500,
+                            color: 'var(--theme-accent, #58a6ff)', background: 'var(--theme-accent-bg, rgba(88,166,255,0.08))',
+                            border: '1px solid var(--theme-accent-bg, rgba(88,166,255,0.2))', cursor: logLoadingMore ? 'wait' : 'pointer',
+                            opacity: logLoadingMore ? 0.6 : 1, transition: 'all 0.15s',
+                          }}
+                        >
+                          {logLoadingMore ? '⏳ 加载中…' : '📜 加载更多'}
+                        </button>
+                      </div>
+                    )}
+                  </>}
             </div>
           )}
 
@@ -339,22 +506,63 @@ export const GitPanel: React.FC<Props> = ({
             <div style={logStyle}>
               {branchesLoading ? <div style={emptyStyle}>加载分支…</div> : (
                 <>
+                  {/* 创建新分支 */}
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 14 }}>
+                    <input
+                      value={newBranchName}
+                      onChange={(e) => setNewBranchName(e.target.value)}
+                      onKeyDown={(e) => { if (e.key === 'Enter') handleBranchCreate(); }}
+                      placeholder="新分支名（基于当前分支创建并切换）"
+                      style={branchInputStyle}
+                      disabled={!!branchActionBusy}
+                    />
+                    <button
+                      onClick={handleBranchCreate}
+                      disabled={!!branchActionBusy || !newBranchName.trim()}
+                      style={{
+                        ...actionBtnStyle,
+                        background: branchActionBusy === 'create' ? '#555' : '#238636',
+                        opacity: !newBranchName.trim() ? 0.5 : 1,
+                        whiteSpace: 'nowrap',
+                      }}
+                    >
+                      {branchActionBusy === 'create' ? '⏳' : '＋ 创建分支'}
+                    </button>
+                  </div>
+
                   <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 8, color: '#3fb950' }}>本地分支</div>
-                  {branches.local.map((b) => (
-                    <div key={b.name} style={{ ...logItemStyle, ...(b.name === branches.current ? { background: 'rgba(63,185,80,0.1)' } : {}) }}>
-                      <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-                        {b.name === branches.current && <span>✅</span>}
-                        <span style={{ fontSize: 13, fontWeight: b.name === branches.current ? 700 : 400 }}>{b.name}</span>
-                        {b.upstream && <span style={{ fontSize: 10, color: '#8b949e' }}>→ {b.upstream}</span>}
-                        {(b.ahead || 0) > 0 && <span style={{ fontSize: 10, color: '#3fb950' }}>⬆{b.ahead}</span>}
-                        {(b.behind || 0) > 0 && <span style={{ fontSize: 10, color: '#f85149' }}>⬇{b.behind}</span>}
+                  {branches.local.length === 0 && <div style={emptyStyle}>无本地分支</div>}
+                  {branches.local.map((b) => {
+                    const isCurrent = b.name === branches.current;
+                    const busy = branchActionBusy === `switch:${b.name}` || branchActionBusy === `delete:${b.name}`;
+                    return (
+                      <div key={b.name} style={{ ...logItemStyle, ...(isCurrent ? { background: 'rgba(63,185,80,0.1)', borderColor: 'rgba(63,185,80,0.3)' } : {}) }}>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                          {isCurrent && <span title="当前分支">✅</span>}
+                          <span style={{ fontSize: 13, fontWeight: isCurrent ? 700 : 400, flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{b.name}</span>
+                          {b.upstream && <span style={{ fontSize: 10, color: 'var(--theme-text-muted, #8b949e)', flexShrink: 0 }}>→ {b.upstream}</span>}
+                          {(b.ahead || 0) > 0 && <span style={{ fontSize: 10, color: '#3fb950', flexShrink: 0 }}>⬆{b.ahead}</span>}
+                          {(b.behind || 0) > 0 && <span style={{ fontSize: 10, color: '#f85149', flexShrink: 0 }}>⬇{b.behind}</span>}
+                          {!isCurrent && (
+                            <button onClick={() => handleBranchSwitch(b.name)} disabled={busy} style={branchActionBtnStyle} title={`切换到 ${b.name}`}>
+                              {busy && branchActionBusy.startsWith('switch:') ? '⏳' : '🔀 切换'}
+                            </button>
+                          )}
+                          {!isCurrent && (
+                            <button onClick={() => handleBranchDelete(b.name)} disabled={busy}
+                              style={{ ...branchActionBtnStyle, color: '#f85149', borderColor: 'rgba(248,81,73,0.3)' }} title={`删除 ${b.name}`}>
+                              {busy && branchActionBusy.startsWith('delete:') ? '⏳' : '🗑'}
+                            </button>
+                          )}
+                        </div>
                       </div>
-                    </div>
-                  ))}
-                  <div style={{ fontSize: 12, fontWeight: 600, marginTop: 16, marginBottom: 8, color: '#58a6ff' }}>远端分支</div>
+                    );
+                  })}
+                  <div style={{ fontSize: 12, fontWeight: 600, marginTop: 16, marginBottom: 8, color: 'var(--theme-accent, #58a6ff)' }}>远端分支</div>
+                  {branches.remote.length === 0 && <div style={emptyStyle}>无远端分支</div>}
                   {branches.remote.map((b) => (
                     <div key={b.name} style={logItemStyle}>
-                      <span style={{ fontSize: 12, color: '#8b949e' }}>{b.name}</span>
+                      <span style={{ fontSize: 12, color: 'var(--theme-text-muted, #8b949e)' }}>{b.name}</span>
                     </div>
                   ))}
                 </>
@@ -369,8 +577,8 @@ export const GitPanel: React.FC<Props> = ({
                   stashes.map((s) => (
                     <div key={s.index} style={logItemStyle}>
                       <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-                        <span style={{ fontSize: 11, color: '#58a6ff' }}>stash@{'{' + s.index + '}'}</span>
-                        <span style={{ fontSize: 10, color: '#6e7681' }}>{new Date(s.date).toLocaleString()}</span>
+                        <span style={{ fontSize: 11, color: 'var(--theme-accent, #58a6ff)' }}>stash@{'{' + s.index + '}'}</span>
+                        <span style={{ fontSize: 10, color: 'var(--theme-text-muted, #6e7681)' }}>{new Date(s.date).toLocaleString()}</span>
                       </div>
                       <div style={{ fontSize: 12, marginTop: 4 }}>{s.message}</div>
                     </div>
@@ -389,15 +597,15 @@ export const GitPanel: React.FC<Props> = ({
 // ── 子组件：文件行（TortoiseGit 风格） ──────────────────────────
 const FileRow: React.FC<{
   file: GitFileStatus; isSelected: boolean;
-  onClick: () => void; onToggleStage: () => void;
-}> = ({ file, isSelected, onClick, onToggleStage }) => {
+  onClick: () => void; onToggleStage: () => void; onDiscard: () => void;
+}> = ({ file, isSelected, onClick, onToggleStage, onDiscard }) => {
   // 拆分路径：目录(灰) + 文件名(亮)
   const lastSlash = file.path.lastIndexOf('/');
   const dirPart = lastSlash >= 0 ? file.path.slice(0, lastSlash + 1) : '';
   const namePart = lastSlash >= 0 ? file.path.slice(lastSlash + 1) : file.path;
 
   return (
-    <div style={{
+    <div className="git-file-row" style={{
       ...fileRowStyle,
       ...(isSelected ? fileRowSelectedStyle : {}),
     }} onClick={onClick}>
@@ -406,7 +614,7 @@ const FileRow: React.FC<{
         onClick={(e) => { e.stopPropagation(); onToggleStage(); }}
         style={{
           width: 16, height: 16, borderRadius: 3, flexShrink: 0, cursor: 'pointer',
-          border: file.staged ? '2px solid #3fb950' : '2px solid rgba(255,255,255,0.25)',
+          border: file.staged ? '2px solid #3fb950' : '2px solid var(--theme-border, rgba(255,255,255,0.25))',
           background: file.staged ? 'rgba(63,185,80,0.2)' : 'transparent',
           display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
           fontSize: 10, color: '#3fb950', transition: 'all 0.12s',
@@ -436,6 +644,13 @@ const FileRow: React.FC<{
           {file.deletedLines != null && file.deletedLines > 0 && <span style={{ color: '#f85149' }}>-{file.deletedLines}</span>}
         </span>
       )}
+      {/* Discard 按钮 (hover 显示) */}
+      <button
+        className="git-file-discard-btn"
+        onClick={(e) => { e.stopPropagation(); onDiscard(); }}
+        title="丢弃改动 (Discard)"
+        style={discardBtnStyle}
+      >🗑</button>
     </div>
   );
 };
@@ -458,18 +673,18 @@ const headerStyle: React.CSSProperties = {
   padding: '12px 16px', borderBottom: '1px solid var(--theme-border, rgba(255,255,255,0.08))',
 };
 const branchBadgeStyle: React.CSSProperties = {
-  fontSize: 12, color: '#58a6ff', background: 'rgba(88,166,255,0.12)',
+  fontSize: 12, color: 'var(--theme-accent, #58a6ff)', background: 'var(--theme-accent-bg, rgba(88,166,255,0.12))',
   padding: '2px 8px', borderRadius: 10, fontWeight: 500,
 };
 const badgeStyle: React.CSSProperties = {
   fontSize: 11, color: '#fff', padding: '2px 7px', borderRadius: 10, fontWeight: 600,
 };
 const nodeBadgeStyle: React.CSSProperties = {
-  fontSize: 10, color: '#8b949e', background: 'rgba(255,255,255,0.06)',
+  fontSize: 10, color: 'var(--theme-text-muted, #8b949e)', background: 'var(--theme-border, rgba(255,255,255,0.06))',
   padding: '2px 6px', borderRadius: 8,
 };
 const closeBtnStyle: React.CSSProperties = {
-  background: 'none', border: 'none', color: '#8b949e', fontSize: 16, cursor: 'pointer', padding: '4px 8px',
+  background: 'none', border: 'none', color: 'var(--theme-text-muted, #8b949e)', fontSize: 16, cursor: 'pointer', padding: '4px 8px',
 };
 const tabBarStyle: React.CSSProperties = {
   display: 'flex', gap: 0, borderBottom: '1px solid var(--theme-border, rgba(255,255,255,0.08))',
@@ -478,10 +693,10 @@ const tabBarStyle: React.CSSProperties = {
 const tabStyle: React.CSSProperties = {
   padding: '8px 16px', fontSize: 12, fontWeight: 500, cursor: 'pointer',
   background: 'none', border: 'none', borderBottom: '2px solid transparent',
-  color: '#8b949e', transition: 'all 0.15s',
+  color: 'var(--theme-text-muted, #8b949e)', transition: 'all 0.15s',
 };
 const tabActiveStyle: React.CSSProperties = {
-  color: '#58a6ff', borderBottomColor: '#58a6ff',
+  color: 'var(--theme-accent, #58a6ff)', borderBottomColor: 'var(--theme-accent, #58a6ff)',
 };
 const contentStyle: React.CSSProperties = {
   flex: 1, overflow: 'hidden', display: 'flex', flexDirection: 'column',
@@ -502,19 +717,25 @@ const commitAreaStyle: React.CSSProperties = {
 };
 const sectionHeaderStyle: React.CSSProperties = {
   display: 'flex', justifyContent: 'space-between', alignItems: 'center',
-  fontSize: 11, fontWeight: 600, color: '#8b949e', marginBottom: 6, padding: '0 4px',
+  fontSize: 11, fontWeight: 600, color: 'var(--theme-text-muted, #8b949e)', marginBottom: 6, padding: '0 4px',
 };
 const fileRowStyle: React.CSSProperties = {
   display: 'flex', alignItems: 'center', gap: 8, padding: '5px 6px',
   borderRadius: 6, cursor: 'pointer', transition: 'background 0.1s',
 };
+const discardBtnStyle: React.CSSProperties = {
+  flexShrink: 0, width: 22, height: 20, borderRadius: 4, cursor: 'pointer',
+  border: '1px solid rgba(248,81,73,0.3)', background: 'rgba(248,81,73,0.08)',
+  color: '#f85149', fontSize: 12, lineHeight: 1, padding: 0,
+  opacity: 0, transition: 'opacity 0.12s',
+};
 const fileRowSelectedStyle: React.CSSProperties = {
-  background: 'rgba(88,166,255,0.12)',
+  background: 'var(--theme-accent-bg, rgba(88,166,255,0.12))',
 };
 const smallBtnStyle: React.CSSProperties = {
   fontSize: 10, padding: '2px 6px', borderRadius: 4, cursor: 'pointer',
-  background: 'rgba(255,255,255,0.08)', border: '1px solid rgba(255,255,255,0.1)',
-  color: '#8b949e',
+  background: 'var(--theme-border, rgba(255,255,255,0.08))', border: '1px solid var(--theme-border, rgba(255,255,255,0.1))',
+  color: 'var(--theme-text-muted, #8b949e)',
 };
 const actionBtnStyle: React.CSSProperties = {
   padding: '6px 12px', borderRadius: 6, fontSize: 12, fontWeight: 600,
@@ -534,13 +755,25 @@ const aiMsgStyle: React.CSSProperties = {
 const logStyle: React.CSSProperties = {
   padding: 12, overflowY: 'auto', flex: 1,
 };
+const branchInputStyle: React.CSSProperties = {
+  flex: 1, padding: '6px 10px', borderRadius: 6, fontSize: 12,
+  background: 'var(--theme-bg, rgba(0,0,0,0.3))', color: 'var(--theme-text, #c9d1d9)',
+  border: '1px solid var(--theme-border, rgba(255,255,255,0.15))',
+  outline: 'none', fontFamily: 'inherit', boxSizing: 'border-box' as const,
+};
+const branchActionBtnStyle: React.CSSProperties = {
+  padding: '3px 8px', borderRadius: 5, fontSize: 11, fontWeight: 500,
+  color: 'var(--theme-accent, #58a6ff)', background: 'var(--theme-accent-bg, rgba(88,166,255,0.08))',
+  border: '1px solid var(--theme-accent-bg, rgba(88,166,255,0.25))', cursor: 'pointer',
+  whiteSpace: 'nowrap', flexShrink: 0, transition: 'all 0.12s',
+};
 const logItemStyle: React.CSSProperties = {
   padding: '8px 10px', borderRadius: 8, marginBottom: 4,
   background: 'var(--theme-bg, rgba(0,0,0,0.2))',
   border: '1px solid var(--theme-border, rgba(255,255,255,0.06))',
 };
 const emptyStyle: React.CSSProperties = {
-  padding: 24, textAlign: 'center', color: '#8b949e', fontSize: 12,
+  padding: 24, textAlign: 'center', color: 'var(--theme-text-muted, #8b949e)', fontSize: 12,
 };
 const toastStyle: React.CSSProperties = {
   position: 'absolute', bottom: 16, left: '50%', transform: 'translateX(-50%)',

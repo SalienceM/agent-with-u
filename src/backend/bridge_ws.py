@@ -1613,8 +1613,26 @@ class BridgeWS:
               file=sys.stderr, flush=True)
         return str(target)
 
+    # ★ 单节点 session 保留上限（每个执行节点按最近使用保留 MAX_SESSIONS_PER_NODE 个）
+    MAX_SESSIONS_PER_NODE = 10
+
     def _rpc_createSession(self, working_dir: str, backend_id: str,
                            session_type: str = "normal") -> str:
+        # ★ 超出上限时自动淘汰最旧的 session（按 updatedAt 升序 = 最近最少使用）
+        all_sessions = self._session_store.list()  # 已按 updatedAt 降序
+        if len(all_sessions) >= self.MAX_SESSIONS_PER_NODE:
+            # 需要淘汰的 session（列表尾部 = 最旧/最少使用）
+            to_evict = all_sessions[self.MAX_SESSIONS_PER_NODE - 1:]
+            for old in to_evict:
+                sid = old.get("id")
+                if sid:
+                    self._session_store.delete(sid)
+                    # 清理可能存在的 chat-extras 侧挂文件
+                    try:
+                        self._chat_extras_store.delete(sid)
+                    except Exception:
+                        pass
+                    print(f"[BridgeWS] Auto-evicted old session {sid}", file=sys.stderr, flush=True)
         resolved_dir = self._resolve_working_dir(working_dir)
         is_loop = session_type == "loop"
         session = Session(
@@ -1870,11 +1888,13 @@ class BridgeWS:
                               resume: bool = True,
                               indep_session_id: Optional[str] = None,
                               images: Optional[list] = None,
-                              backend_id: Optional[str] = None) -> str:
+                              backend_id: Optional[str] = None,
+                              agent_session_id: Optional[str] = None) -> tuple:
         """让会话绑定的 backend 跑一轮，收集全文，并把增量推给 LoopPanel。
 
-        resume=True 时复用 session.agent_session_id 维持 loop 间记忆；
-        indep_session_id 用于 loopidea 阶段的独立一次性想法探索。
+        resume=True 时复用 agent session 维持记忆；
+        indep_session_id 用于独立的一次性探索或 sub-stage 隔离。
+        agent_session_id 显式传入时优先使用（不写回 session），用于 step 间线程上下文。
         backend_id 可为分析/转换步骤指定异构 backend（仅独立轮次用，找不到则回落会话 backend）。
         """
         backend = None
@@ -1919,20 +1939,27 @@ class BridgeWS:
                     except Exception:
                         pass
             img_objs = img_objs or None
+        new_sid: Optional[str] = None
         try:
+            # ★ agent_session_id 解析：显式传入 > session 绑定 > None
+            effective_agent_sid = agent_session_id if agent_session_id is not None else (
+                session.agent_session_id if resume else None
+            )
             result = await backend.send_message(
                 messages=[], content=prompt, images=img_objs,
                 session_id=sid_for_backend, message_id=mid, on_delta=on_delta,
-                agent_session_id=session.agent_session_id if resume else None,
+                agent_session_id=effective_agent_sid,
                 working_dir=session.working_dir,
                 skip_permissions=True,
                 sandbox_enabled=session.sandbox_enabled,
             )
             # 真实 backend 返回 camelCase "agentSessionId"；instance_manager 用 snake
-            new_sid = None
             if isinstance(result, dict):
                 new_sid = result.get("agentSessionId") or result.get("agent_session_id")
-            if resume and new_sid:
+            if agent_session_id is not None:
+                # 外部线程上下文模式：不回写 session，由调用方自行传递
+                pass
+            elif resume and new_sid:
                 session.agent_session_id = new_sid
                 self._session_store.save(session, async_=True)
         except Exception as e:
@@ -1942,7 +1969,7 @@ class BridgeWS:
             self._emit_loop_progress(session.id, seq, sub_stage, f"\n❌ {e}\n")
         finally:
             backend.clear_cancelled(sid_for_backend)
-        return "".join(parts)
+        return "".join(parts), new_sid if resume or agent_session_id is not None else None
 
     def _rpc_loopGetState(self, session_id: str) -> str:
         state = self._loop_state(session_id)
@@ -1997,7 +2024,7 @@ class BridgeWS:
                 "保持精炼（200 字以内）。\n\n"
                 f"想法：{idea.prompt}"
             )
-            text = await self._loop_run_agent(
+            text, _ = await self._loop_run_agent(
                 session, prompt, sub_stage="idea", seq=-1,
                 resume=False, indep_session_id=f"{session_id}:idea:{idea_id}",
                 images=(idea.images or None),
@@ -2059,7 +2086,7 @@ class BridgeWS:
             "一段话描述最终要交付什么、判断成功的标准是什么。只输出目标本身，不要解释。\n\n"
             f"{ideas_text}"
         )
-        text = await self._loop_run_agent(session, prompt, sub_stage="goal", seq=-1, resume=False,
+        text, _ = await self._loop_run_agent(session, prompt, sub_stage="goal", seq=-1, resume=False,
                                            indep_session_id=f"{session_id}:goal",
                                            backend_id=(state.policy.backend_for("goal") or None))
         state = self._loop_state(session_id) or state
@@ -2131,7 +2158,7 @@ class BridgeWS:
             f"【最初的原始诉求】\n{ideas_text}\n\n"
             f"【额外提示】\n{h}"
         )
-        text = await self._loop_run_agent(session, prompt, sub_stage="goal", seq=-1,
+        text, _ = await self._loop_run_agent(session, prompt, sub_stage="goal", seq=-1,
                                           resume=False, indep_session_id=f"{session_id}:goal",
                                           backend_id=(state.policy.backend_for("goal") or None))
         refined = text.strip()
@@ -2301,6 +2328,8 @@ class BridgeWS:
             return
         self._loop_running.add(session_id)
         record: Optional[LoopRecord] = None
+        # ★ 独立 session 上下文：保存主会话的 agent_session_id，loop 内各 sub-stage 用独立上下文
+        _saved_agent_sid = session.agent_session_id
         try:
             # resume-or-new：最后一条未完成且非错误 → 续跑它；否则新开
             last = state.loops[-1] if state.loops else None
@@ -2338,6 +2367,8 @@ class BridgeWS:
                 self._loop_save(state)
                 self._emit_loop_updated(state)
         finally:
+            # ★ 恢复主会话的 agent_session_id（loop 内的独立上下文不回写到主会话）
+            session.agent_session_id = _saved_agent_sid
             self._loop_running.discard(session_id)
             if session_id in self._loop_cancel:
                 # 停止并丢弃：删掉这次 loop，还原它消费过的 addon，回滚 agent 上下文（+ 可选回滚文件）
@@ -2348,6 +2379,9 @@ class BridgeWS:
                     self._loop_save(st)
                     self._emit_loop_updated(st)
             else:
+                # ★ 自动 AI commit：loop 正常完成后自动 stage-all → commit → push
+                if session.auto_commit:
+                    asyncio.ensure_future(self._try_auto_commit(session, "loop"))
                 self._maybe_autocontinue(session_id)
 
     def _discard_record(self, state: "LoopState", record: "LoopRecord",
@@ -2422,7 +2456,9 @@ class BridgeWS:
         addon_imgs: list = []
         for a in pending:
             addon_imgs.extend(a.images or [])
-        ptext = await self._loop_run_agent(session, prepare_prompt, SUB_PREPARE, record.seq,
+        ptext, _ = await self._loop_run_agent(session, prepare_prompt, SUB_PREPARE, record.seq,
+                                           resume=False,
+                                           indep_session_id=f"{session.id}:loop{record.seq}:prepare",
                                            images=addon_imgs or None)
         # 消费这些 addon：标记为已纳入本次 loop
         for a in pending:
@@ -2437,6 +2473,36 @@ class BridgeWS:
                      desc=(s.get("desc") or "").strip())
             for i, s in enumerate(orch) if isinstance(s, dict)
         ]
+        # ★ JSON 解析重试：模型输出不含有效编排（至少 1 个 step）时，补发一次更强约束的 prompt
+        if not record.orchestration:
+            retry_prompt = (
+                "上一次的输出没有包含有效的编排 JSON。请重新输出，格式必须严格为：\n"
+                "```json\n"
+                '{"goal": "本遍策略", "orchestration": '
+                '[{"mode": "sequential", "desc": "…"}, …]}\n'
+                "```\n"
+                "orchestration 数组至少包含 1 个步骤。只输出 JSON，不要其他文字。\n\n"
+                f"【全局目标】\n{state.goal}\n"
+            )
+            rtext, _ = await self._loop_run_agent(
+                session, retry_prompt, SUB_PREPARE, record.seq,
+                resume=False,
+                indep_session_id=f"{session.id}:loop{record.seq}:prepare:retry",
+            )
+            rj = self._extract_json_block(rtext) or {}
+            r_orch = rj.get("orchestration") or []
+            if r_orch:
+                record.goal = (rj.get("goal") or "").strip() or record.goal
+                record.orchestration = [
+                    LoopStep(index=i + 1, mode=("concurrent" if (s.get("mode") == "concurrent") else "sequential"),
+                             desc=(s.get("desc") or "").strip())
+                    for i, s in enumerate(r_orch) if isinstance(s, dict)
+                ]
+                print(f"[loop] prepare retry succeeded: {len(record.orchestration)} steps",
+                      file=sys.stderr, flush=True)
+            else:
+                print(f"[loop] prepare retry also empty — will re-plan at execute stage",
+                      file=sys.stderr, flush=True)
         record.sub_stage = SUB_EXECUTE
         record.updated_at = time.time()
         self._loop_save(state)
@@ -2469,7 +2535,7 @@ class BridgeWS:
             f"【模型这一遍的计划】\n本遍策略：{record.goal or '(同全局目标)'}\n分步：\n{steps_text}\n\n"
             "```json\n{\"aligned\": true, \"severity\": \"low\", \"divergence\": \"\", \"suggestion\": \"\"}\n```"
         )
-        text = await self._loop_run_agent(
+        text, _ = await self._loop_run_agent(
             session, prompt, sub_stage="intent", seq=record.seq,
             resume=False, indep_session_id=f"{session.id}:intent:{state.round}",
             backend_id=(state.policy.backend_for("analysis") or None),
@@ -2509,7 +2575,38 @@ class BridgeWS:
         self._emit_loop_updated(state)
         steps = record.orchestration
         if not steps:
-            # 无显式编排：单轮完整执行
+            # ★ 轻量 re-plan：prepare 两次都没产出编排时，在 execute 入口再尝试一次精简 prompt
+            replan_prompt = (
+                f"【全局目标】\n{state.goal or '(未设定)'}\n\n"
+                "前面规划阶段未产出有效编排。请快速给出 2–3 步精简执行计划。\n"
+                "只输出 JSON 围栏：\n"
+                "```json\n"
+                '{"orchestration": [{"mode": "sequential", "desc": "…"}, {"mode": "sequential", "desc": "…"}]}\n'
+                "```\n"
+                "orchestration 至少 1 步。只输出 JSON，不要散文。"
+            )
+            rtext, _ = await self._loop_run_agent(
+                session, replan_prompt, SUB_EXECUTE, record.seq,
+                resume=False,
+                indep_session_id=f"{session.id}:loop{record.seq}:replan",
+            )
+            rj = self._extract_json_block(rtext) or {}
+            r_orch = rj.get("orchestration") or []
+            replan_steps = [
+                LoopStep(index=i + 1, mode=("concurrent" if (s.get("mode") == "concurrent") else "sequential"),
+                         desc=(s.get("desc") or "").strip())
+                for i, s in enumerate(r_orch) if isinstance(s, dict)
+            ]
+            if replan_steps:
+                record.orchestration = replan_steps
+                steps = replan_steps
+                record.goal = (rj.get("goal") or "").strip() or record.goal
+                self._loop_save(state)
+                self._emit_loop_updated(state)
+                print(f"[loop] execute re-plan succeeded: {len(replan_steps)} steps",
+                      file=sys.stderr, flush=True)
+        if not steps:
+            # re-plan 也失败 → fallback 到单轮完整执行（独立 session）
             prompt = (
                 f"【全局目标】\n{state.goal}\n\n这是第 {record.seq} 次 loop——对全局目标的一次"
                 "完整尽力执行。在工作目录内实际推进（可用工具读写文件、运行命令），单步失败你"
@@ -2517,9 +2614,14 @@ class BridgeWS:
                 "哪些成功 / 失败。"
             )
             record.result = (await self._loop_run_agent(
-                session, prompt, SUB_EXECUTE, record.seq)).strip()
+                session, prompt, SUB_EXECUTE, record.seq,
+                resume=False,
+                indep_session_id=f"{session.id}:loop{record.seq}:execute",
+            ))[0].strip()
         else:
             # 按编排执行：连续的 concurrent 步并行，sequential 步顺次
+            # ★ 顺次 step 之间共享一个独立 agent session 保持连贯上下文
+            step_agent_sid: Optional[str] = None
             i = 0
             while i < len(steps):
                 if session.id in self._loop_cancel:   # 停止并丢弃：立即中断分步执行
@@ -2531,16 +2633,22 @@ class BridgeWS:
                     batch = [s for s in steps[i:j] if s.status != "done"]
                     if batch:
                         await asyncio.gather(*[
-                            self._loop_run_step(session, state, record, s, resume=False)
+                            self._loop_run_step(session, state, record, s, resume=False,
+                                                indep_session_id=f"{session.id}:loop{record.seq}:c{s.index}")
                             for s in batch
                         ])
+                    step_agent_sid = None  # concurrent batch 后重置
                     i = j
                 else:
-                    await self._loop_run_step(session, state, record, steps[i], resume=True)
+                    step_agent_sid = await self._loop_run_step(
+                        session, state, record, steps[i], resume=True,
+                        indep_session_id=f"{session.id}:loop{record.seq}:steps",
+                        agent_session_id=step_agent_sid,
+                    )
                     i += 1
             if session.id in self._loop_cancel:
                 return
-            # 汇总各步 → 本次执行结果
+            # 汇总各步 → 本次执行结果（独立 session）
             recap = "\n".join(
                 f"{s.index}. [{s.mode}/{s.status}] {s.desc}\n   → {(s.output or '')[:400]}"
                 for s in steps
@@ -2551,37 +2659,60 @@ class BridgeWS:
                 "哪些步骤成功哪些失败），3–6 句，可用 markdown。"
             )
             record.result = (await self._loop_run_agent(
-                session, summary_prompt, SUB_EXECUTE, record.seq)).strip()
+                session, summary_prompt, SUB_EXECUTE, record.seq,
+                resume=False,
+                indep_session_id=f"{session.id}:loop{record.seq}:summary",
+            ))[0].strip()
         record.sub_stage = SUB_ANALYSIS
         record.updated_at = time.time()
         self._loop_save(state)
         self._emit_loop_updated(state)
 
-    async def _loop_run_step(self, session, state, record, step, resume: bool) -> None:
-        """执行编排中的一个分步，记录 running→done/error 与产出（持久化以便复盘）。"""
+    async def _loop_run_step(self, session, state, record, step, resume: bool,
+                             indep_session_id: Optional[str] = None,
+                             agent_session_id: Optional[str] = None) -> Optional[str]:
+        """执行编排中的一个分步，记录 running→done/error 与产出（持久化以便复盘）。
+        返回本次执行后的 agent_session_id（供后续顺次 step 线程上下文用）。"""
         if step.status == "done":
-            return
+            return agent_session_id
         step.status = "running"
         step.started_at = time.time()
         self._loop_save(state)
         self._emit_loop_updated(state)
+        # ★ 让每个 step 看到完整的编排规划，理解全局上下文
+        all_steps_text = "\n".join(
+            f"  {s.index}. [{s.mode}] {s.desc}" + (" ← 当前步" if s.index == step.index else "")
+            for s in record.orchestration
+        )
+        strategy_hint = (
+            f"【本遍策略/侧重】\n{record.goal}\n\n"
+            if record.goal and record.goal != state.goal else ""
+        )
         prompt = (
-            f"【全局目标】\n{state.goal}\n\n这是第 {record.seq} 次完整尝试中的一个分步"
-            f"（模式：{'可并发' if step.mode == 'concurrent' else '顺次'}）。\n"
-            f"【本步任务】{step.desc}\n\n在工作目录内实际执行这一步（可用工具读写文件、"
-            "运行命令）。单步失败你自行判断处理，不强制重试。完成后用 2–4 句话说明："
+            f"【全局目标】\n{state.goal}\n\n"
+            f"{strategy_hint}"
+            f"【本遍完整编排规划】\n{all_steps_text}\n\n"
+            f"你现在执行的是第 {step.index} 步（共 {len(record.orchestration)} 步），"
+            f"模式：{'可并发' if step.mode == 'concurrent' else '顺次'}。\n"
+            f"【本步任务】{step.desc}\n\n"
+            "请结合上面的完整规划来理解本步的上下文和边界，"
+            "在工作目录内实际执行（可用工具读写文件、运行命令）。"
+            "单步失败你自行判断处理，不强制重试。完成后用 2–4 句话说明："
             "这一步做了什么、产出/改动在哪、成功还是失败。"
         )
-        indep = None if resume else f"{session.id}:loop{record.seq}:step{step.index}"
-        text = await self._loop_run_agent(
+        # ★ 使用传入的 indep_session_id 或自动生成
+        _indep = indep_session_id or (None if resume else f"{session.id}:loop{record.seq}:step{step.index}")
+        text, new_sid = await self._loop_run_agent(
             session, prompt, sub_stage=f"step{step.index}", seq=record.seq,
-            resume=resume, indep_session_id=indep,
+            resume=resume, indep_session_id=_indep,
+            agent_session_id=agent_session_id,
         )
         step.output = text.strip()
         step.status = "done" if text.strip() else "error"
         step.ended_at = time.time()
         self._loop_save(state)
         self._emit_loop_updated(state)
+        return new_sid
 
     async def _loop_do_analysis(self, session, state, record) -> None:
         record.sub_stage = SUB_ANALYSIS
@@ -2633,7 +2764,7 @@ class BridgeWS:
             '{"score": 0, "optimizationPotential": 0.0, "trend": "", "challenges": "", "notes": ""}\n'
             "```"
         )
-        atext = await self._loop_run_agent(
+        atext, _ = await self._loop_run_agent(
             session, analysis_prompt, SUB_ANALYSIS, record.seq,
             resume=not independent,
             indep_session_id=(f"{session.id}:eval:{record.seq}" if independent else None),
@@ -3027,12 +3158,19 @@ class BridgeWS:
         t = next((x for x in ex.seq_tasks if x.id == task_id), None)
         if not t:
             return json.dumps({"status": "error", "message": "任务不存在"}, ensure_ascii=False)
-        if t.status != "pending":
-            return json.dumps({"status": "error", "message": "已发送的任务不可编辑"}, ensure_ascii=False)
-        t.text = (text or "").strip()
-        if images_json:
-            imgs = self._parse_images_json(images_json)
-            t.images = [i.to_dict() for i in imgs] if imgs else []
+        if t.status == "pending":
+            # 待发送：文本和图片都可改
+            t.text = (text or "").strip()
+            if images_json:
+                imgs = self._parse_images_json(images_json)
+                t.images = [i.to_dict() for i in imgs] if imgs else []
+        elif t.status == "sent":
+            # 已发送：只允许追加/编辑图片（文本已进对话，不可改）
+            if images_json:
+                imgs = self._parse_images_json(images_json)
+                t.images = [i.to_dict() for i in imgs] if imgs else []
+        else:
+            return json.dumps({"status": "error", "message": "该任务不可编辑"}, ensure_ascii=False)
         t.updated_at = time.time()
         self._chat_extras_save(ex)
         self._emit_seqtask_updated(ex)
@@ -3052,8 +3190,11 @@ class BridgeWS:
             ids = []
         ex = self._chat_extras_get(session_id)
         order = {tid: i for i, tid in enumerate(ids)}
-        # 只对未发送的重新排序；保持出现顺序的稳定回落
-        ex.seq_tasks.sort(key=lambda t: order.get(t.id, len(order)))
+        # 只对未发送的重新排序；已发送的保持出现顺序沉底
+        pending = [t for t in ex.seq_tasks if t.status == "pending"]
+        sent = [t for t in ex.seq_tasks if t.status != "pending"]
+        pending.sort(key=lambda t: order.get(t.id, len(order)))
+        ex.seq_tasks = pending + sent
         self._chat_extras_save(ex)
         self._emit_seqtask_updated(ex)
         return self._seqtask_payload(ex)
@@ -3066,12 +3207,13 @@ class BridgeWS:
         return self._seqtask_payload(ex)
 
     def _rpc_seqtaskTakeNext(self, session_id: str) -> str:
-        """取出队首待发任务并从队列移除（原子，防多端/自动重发）。前端拿到后发进主对话。"""
+        """取出队首待发任务并标记为已发送（保留历史记录）。前端拿到后发进主对话。"""
         ex = self._chat_extras_get(session_id)
         nxt = next((t for t in ex.seq_tasks if t.status == "pending"), None)
         if not nxt:
             return json.dumps({"status": "ok", "task": None}, ensure_ascii=False)
-        ex.seq_tasks = [t for t in ex.seq_tasks if t.id != nxt.id]
+        nxt.status = "sent"
+        nxt.updated_at = time.time()
         self._chat_extras_save(ex)
         self._emit_seqtask_updated(ex)
         return json.dumps({"status": "ok", "task": nxt.to_dict()}, ensure_ascii=False)
@@ -4971,6 +5113,51 @@ except urllib.error.URLError as e:
             return json.dumps({"status": "error", "message": err.strip()})
         return json.dumps({"status": "ok"}, ensure_ascii=False)
 
+    def _rpc_gitDiscard(self, working_dir: str, paths_json: str) -> str:
+        """丢弃指定文件的改动。对已跟踪文件执行 git checkout -- path，对未跟踪文件执行删除。"""
+        import os, json as _json
+        if not working_dir or not os.path.isdir(working_dir) or not _git_is_repo(working_dir):
+            return json.dumps({"status": "error", "message": "非 Git 仓库"})
+        try:
+            paths = _json.loads(paths_json)
+        except Exception:
+            return json.dumps({"status": "error", "message": "paths_json 格式错误"})
+        if not paths:
+            return json.dumps({"status": "ok"})
+        discarded = []
+        failed = []
+        # 先取消暂存（如果已暂存）
+        self._git_run(working_dir, ["restore", "--staged", "--", *paths], timeout=15)
+        # 对每个文件：判断是否 untracked（不在 HEAD 树中）→ 删除；否则 checkout 恢复
+        # 用 git ls-files 判断哪些是 git 跟踪的
+        _, tracked_out, _ = self._git_run(working_dir, ["ls-files", "--", *paths], timeout=10)
+        tracked_set = set(tracked_out.strip().splitlines()) if tracked_out.strip() else set()
+        # 判断哪些文件在 HEAD 中存在（已提交过）
+        _, head_files, _ = self._git_run(working_dir, ["ls-tree", "-r", "--name-only", "HEAD"], timeout=10)
+        head_set = set(head_files.strip().splitlines()) if head_files.strip() else set()
+        to_restore = [p for p in paths if p in tracked_set and p in head_set]
+        to_remove = [p for p in paths if p not in head_set]
+        if to_restore:
+            rc, _, err = self._git_run(working_dir, ["checkout", "--", *to_restore], timeout=15)
+            if rc == 0:
+                discarded.extend(to_restore)
+            else:
+                failed.extend(to_restore)
+        for p in to_remove:
+            full = os.path.join(working_dir, p)
+            try:
+                if os.path.isfile(full):
+                    os.remove(full)
+                    discarded.append(p)
+                elif os.path.isdir(full):
+                    import shutil
+                    shutil.rmtree(full)
+                    discarded.append(p)
+            except Exception:
+                failed.append(p)
+        status = "ok" if not failed else "partial"
+        return json.dumps({"status": status, "discarded": discarded, "failed": failed}, ensure_ascii=False)
+
     def _rpc_gitCommit(self, working_dir: str, message: str, all: bool = False) -> str:
         """提交改动。"""
         import os
@@ -5077,6 +5264,17 @@ except urllib.error.URLError as e:
             return json.dumps({"status": "error", "message": err.strip()})
         return json.dumps({"status": "ok", "branch": name}, ensure_ascii=False)
 
+    def _rpc_gitBranchDelete(self, working_dir: str, name: str, force: bool = False) -> str:
+        """删除本地分支。"""
+        import os
+        if not working_dir or not os.path.isdir(working_dir) or not _git_is_repo(working_dir):
+            return json.dumps({"status": "error", "message": "非 Git 仓库"})
+        args = ["branch", "-D" if force else "-d", name]
+        rc, _, err = self._git_run(working_dir, args, timeout=10)
+        if rc != 0:
+            return json.dumps({"status": "error", "message": err.strip()})
+        return json.dumps({"status": "ok", "branch": name}, ensure_ascii=False)
+
     async def _rpc_gitPush(self, working_dir: str, remote: str = "origin", branch: str = "", force: bool = False) -> str:
         """推送到远端（异步，支持网络超时）。"""
         import os
@@ -5154,6 +5352,16 @@ except urllib.error.URLError as e:
             return json.dumps({"status": "error", "message": err.strip()})
         return json.dumps({"status": "ok"}, ensure_ascii=False)
 
+    def _rpc_gitStashDrop(self, working_dir: str, index: int = 0) -> str:
+        """删除（丢弃）一条 stash，不恢复。"""
+        import os
+        if not working_dir or not os.path.isdir(working_dir) or not _git_is_repo(working_dir):
+            return json.dumps({"status": "error", "message": "非 Git 仓库"})
+        rc, _, err = self._git_run(working_dir, ["stash", "drop", f"stash@{{{index}}}"], timeout=10)
+        if rc != 0:
+            return json.dumps({"status": "error", "message": err.strip()})
+        return json.dumps({"status": "ok"}, ensure_ascii=False)
+
     async def _rpc_gitGenerateCommitMessage(self, working_dir: str, staged_only: bool = True) -> str:
         """AI 生成 commit message：获取 diff → 调用独立 agent session → 流式推送。"""
         import os, re, uuid
@@ -5175,6 +5383,7 @@ except urllib.error.URLError as e:
             "- 使用中文撰写 commit message（Conventional Commits 前缀如 feat:/fix:/refactor: 等保留英文，描述部分用中文）\n"
             "- 第一行简短描述（不超过 72 字符）\n"
             "- 如有必要，空一行后补充详细说明\n"
+            "- 末尾加一行署名：By AgentWithU（不要使用 Co-Authored-By 格式）\n"
             "- 只返回 commit message 文本，不要任何额外说明、不要 markdown 代码块包裹\n\n"
             f"最近的 commit 风格参考：\n{recent_log.strip()}\n\n"
             f"git diff：\n{diff_text}"
@@ -5219,6 +5428,11 @@ except urllib.error.URLError as e:
                 # 清理可能的 markdown 代码块
                 message = re.sub(r"^```(?:commit|message)?\s*\n?", "", message)
                 message = re.sub(r"\n?```$", "", message)
+                # ★ 强制署名：strip 掉 Co-Authored-By 行，统一替换为 By AgentWithU
+                message = re.sub(r"(?m)^Co-Authored-By:.*$", "", message).strip()
+                message = re.sub(r"(?m)^By AgentWithU\s*$", "", message).strip()
+                if message:
+                    message = message.rstrip() + "\n\nBy AgentWithU"
                 message = message.strip()
                 self._emit_event("gitCommitMsgReady", {"workingDir": working_dir, "message": message})
                 return json.dumps({"status": "ok", "message": message}, ensure_ascii=False)
@@ -5228,6 +5442,202 @@ except urllib.error.URLError as e:
         except Exception as e:
             self._emit_event("gitCommitMsgReady", {"workingDir": working_dir, "message": "", "error": str(e)})
             return json.dumps({"status": "error", "message": str(e)})
+
+    # ── 自动 AI commit + push ──────────────────────────────────────
+
+    def _rpc_setAutoCommit(self, session_id: str, enabled: bool, push: bool = False,
+                           backend_id: str = "") -> str:
+        """设置会话的自动提交开关。"""
+        session = self._active_sessions.get(session_id) or self._session_store.load(session_id)
+        if not session:
+            return json.dumps({"status": "error", "message": "会话不存在"})
+        session.auto_commit = enabled
+        session.auto_commit_push = push
+        session.auto_commit_backend_id = backend_id or None
+        self._session_store.save(session, async_=False)
+        return json.dumps({"status": "ok", "autoCommit": session.auto_commit,
+                           "autoCommitPush": session.auto_commit_push,
+                           "autoCommitBackendId": session.auto_commit_backend_id}, ensure_ascii=False)
+
+    def _rpc_getAutoCommit(self, session_id: str) -> str:
+        """获取会话的自动提交设置。"""
+        session = self._active_sessions.get(session_id) or self._session_store.load(session_id)
+        if not session:
+            return json.dumps({"autoCommit": False, "autoCommitPush": False, "autoCommitBackendId": None})
+        return json.dumps({"autoCommit": session.auto_commit,
+                           "autoCommitPush": session.auto_commit_push,
+                           "autoCommitBackendId": session.auto_commit_backend_id}, ensure_ascii=False)
+
+    async def _try_auto_commit(self, session: "Session", trigger: str = "chat") -> None:
+        """自动 AI commit + push 引擎。静默降级：任何异常只 emit 通知，不抛出。
+
+        trigger: 'chat' | 'loop' | 'loop-stop'
+        """
+        wd = session.working_dir
+        sid = session.id
+        try:
+            import os
+            # 1. 检查是否为 git 仓库
+            if not wd or not os.path.isdir(wd) or not _git_is_repo(wd):
+                self._emit_event("autoCommitResult", {
+                    "sessionId": sid, "trigger": trigger,
+                    "status": "notRepo",
+                    "message": "非 Git 仓库，跳过自动提交",
+                })
+                return
+
+            # 2. Stage all（git add -A）
+            rc, _, err = self._git_run(wd, ["add", "-A"], timeout=15)
+            if rc != 0:
+                self._emit_event("autoCommitResult", {
+                    "sessionId": sid, "trigger": trigger,
+                    "status": "error", "error": f"git add 失败: {err.strip()}",
+                })
+                return
+
+            # 3. 检查是否有 staged 变更
+            rc, diff_out, _ = self._git_run(wd, ["diff", "--cached", "--stat"], timeout=10)
+            if rc != 0 or not diff_out.strip():
+                # 无变更，静默跳过
+                self._emit_event("autoCommitResult", {
+                    "sessionId": sid, "trigger": trigger,
+                    "status": "skipped",
+                    "message": "无变更，跳过",
+                })
+                return
+
+            # 4. AI 生成 commit message（同步版本，不推送流式事件）
+            commit_msg = await self._auto_generate_commit_msg(wd, session)
+            if not commit_msg:
+                # AI 生成失败 → 用默认 message
+                commit_msg = f"auto-commit ({trigger})"
+
+            # 5. Commit
+            rc, commit_out, commit_err = self._git_run(
+                wd, ["commit", "-m", commit_msg], timeout=15)
+            if rc != 0:
+                self._emit_event("autoCommitResult", {
+                    "sessionId": sid, "trigger": trigger,
+                    "status": "error", "error": f"git commit 失败: {commit_err.strip()}",
+                })
+                return
+
+            # 获取 commit hash
+            _, short_hash, _ = self._git_run(wd, ["rev-parse", "--short", "HEAD"], timeout=5)
+            commit_hash = short_hash.strip()
+
+            # 统计文件变更数（commit 已完成，需从 HEAD~1 取）
+            rc2, stat_out, _ = self._git_run(wd, ["diff", "HEAD~1", "--numstat"], timeout=10)
+            file_count = len([l for l in stat_out.strip().split("\n") if l.strip()]) if rc2 == 0 else 0
+
+            # 6. 可选 push
+            pushed = False
+            push_failed = False
+            if session.auto_commit_push:
+                rc_p, out_p, err_p = await self._git_run_async(
+                    wd, ["push"], timeout=120)
+                if rc_p != 0:
+                    push_failed = True
+                    # push 失败不阻塞 → 通知但标记成功（commit 已完成）
+                    print(f"[auto-commit] push 失败 (session={sid}): {(out_p + err_p).strip()}",
+                          file=sys.stderr, flush=True)
+                else:
+                    pushed = True
+
+            # 7. 成功通知
+            status = "pushFailed" if push_failed else "success"
+            self._emit_event("autoCommitResult", {
+                "sessionId": sid, "trigger": trigger,
+                "status": status, "committed": True,
+                "message": commit_msg, "commitHash": commit_hash,
+                "pushed": pushed, "files": file_count,
+                **({"error": (out_p + err_p).strip()} if push_failed else {}),
+            })
+            print(f"[auto-commit] ✅ {trigger} → {commit_hash} ({commit_msg[:50]})"
+                  + (" + push" if pushed else (" + push FAILED" if push_failed else "")),
+                  file=sys.stderr, flush=True)
+
+        except Exception as e:
+            # 兜底：任何异常都静默降级
+            print(f"[auto-commit] 异常 (session={sid}, trigger={trigger}): {e}",
+                  file=sys.stderr, flush=True)
+            self._emit_event("autoCommitResult", {
+                "sessionId": sid, "trigger": trigger,
+                "status": "error", "error": str(e),
+            })
+
+    async def _auto_generate_commit_msg(self, working_dir: str, session: "Session") -> Optional[str]:
+        """为自动提交同步生成 commit message（不走流式推送）。
+        使用 session.auto_commit_backend_id 或 session.backend_id 对应的 backend。
+        """
+        import re, uuid
+        # 获取 staged diff
+        rc, diff_out, _ = self._git_run(working_dir, ["diff", "--cached"], timeout=15)
+        if rc != 0 or not diff_out.strip():
+            return None
+        diff_text = diff_out[:50000]
+        # 获取最近 commit 风格参考
+        _, recent_log, _ = self._git_run(working_dir, ["log", "--oneline", "-5"], timeout=5)
+
+        prompt = (
+            "你是一个专业的 Git commit message 生成器。根据以下 git diff 生成一条简洁、准确的 commit message。\n"
+            "要求：\n"
+            "- 使用中文撰写 commit message（Conventional Commits 前缀如 feat:/fix:/refactor: 等保留英文，描述部分用中文）\n"
+            "- 第一行简短描述（不超过 72 字符）\n"
+            "- 如有必要，空一行后补充详细说明\n"
+            "- 末尾加一行署名：By AgentWithU（不要使用 Co-Authored-By 格式）\n"
+            "- 只返回 commit message 文本，不要任何额外说明、不要 markdown 代码块包裹\n\n"
+            f"最近的 commit 风格参考：\n{recent_log.strip()}\n\n"
+            f"git diff：\n{diff_text}"
+        )
+
+        # 选择 backend：auto_commit_backend_id > session.backend_id > 第一个可用
+        backend_id = session.auto_commit_backend_id or session.backend_id
+        backend = None
+        try:
+            backend = self._get_backend(backend_id)
+        except Exception:
+            pass
+        if backend is None and self._backend_configs:
+            try:
+                backend = self._get_backend(self._backend_configs[0].id)
+            except Exception:
+                backend = None
+        if not backend:
+            return None
+
+        msg_id = f"autocommit-{uuid.uuid4().hex[:8]}"
+        aside_sid = f"autocommit:{sid_prefix}" if (sid_prefix := session.id[:8]) else f"autocommit:{msg_id}"
+        parts: list[str] = []
+
+        def on_delta(delta):
+            if delta.type == "text_delta" and delta.text:
+                parts.append(delta.text)
+
+        try:
+            await backend.send_message(
+                messages=[], content=prompt, images=None,
+                session_id=aside_sid, message_id=msg_id, on_delta=on_delta,
+                agent_session_id=None,
+                working_dir=working_dir,
+                skip_permissions=True,
+                sandbox_enabled=False,
+            )
+            backend.clear_cancelled(aside_sid)
+            message = "".join(parts).strip()
+            # 清理可能的 markdown 代码块包裹
+            message = re.sub(r"^```(?:commit|message)?\s*\n?", "", message)
+            message = re.sub(r"\n?```$", "", message)
+            # ★ 强制署名：strip 掉模型自行添加的 Co-Authored-By 行，统一替换为 By AgentWithU
+            message = re.sub(r"(?m)^Co-Authored-By:.*$", "", message).strip()
+            message = re.sub(r"(?m)^By AgentWithU\s*$", "", message).strip()  # 先清除已有的，避免重复
+            if message:
+                message = message.rstrip() + "\n\nBy AgentWithU"
+            return message.strip() or None
+        except Exception as e:
+            print(f"[auto-commit] AI 生成 commit message 失败: {e}",
+                  file=sys.stderr, flush=True)
+            return None
 
     def _get_backend(self, config_id: str) -> ModelBackend:
         if config_id in self._backends:
@@ -5760,3 +6170,7 @@ except urllib.error.URLError as e:
         if session.title in ("新会话", "New session", "") and content:
             session.title = content[:50]
         self._session_store.save(session, async_=True)
+
+        # ★ 自动 AI commit：对话完成后自动 stage-all → AI 生成 message → commit → push
+        if session.auto_commit:
+            asyncio.ensure_future(self._try_auto_commit(session, "chat"))

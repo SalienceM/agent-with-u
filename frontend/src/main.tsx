@@ -4,6 +4,40 @@ import { App } from './App';
 import { ScratchPadWindow, isScratchPadWindow } from './components/ScratchPad';
 import { api } from './api';
 import { installGlobalStreamRouter } from './hooks/useStreamState';
+import { ErrorBoundary } from './components/ErrorBoundary';
+
+// ── 最后防线：全局错误处理，捕获 React 挂载前 / 模块加载时的 JS 崩溃 ──
+// 如果 React 因模块级错误无法渲染，此处理器直接往 DOM 写诊断信息，避免白屏。
+let _reactMounted = false;
+window.addEventListener('error', (ev) => {
+  if (_reactMounted) return; // React 已接管，交给 ErrorBoundary
+  const root = document.getElementById('root');
+  if (!root || root.hasChildNodes()) return;
+  const err = ev.error || ev.message || 'Unknown error';
+  root.innerHTML = `
+    <div style="display:flex;flex-direction:column;align-items:center;justify-content:center;
+      height:100vh;background:#1a1a2e;color:#e0e0e0;font-family:system-ui,sans-serif;gap:12px;padding:24px">
+      <div style="font-size:48px">⚠️</div>
+      <h2 style="font-size:18px;color:#ef4444;margin:0">AgentWithU 启动失败</h2>
+      <p style="font-size:13px;color:#999;text-align:center;max-width:480px">
+        应用初始化时发生错误，请重新加载或检查日志。<br/>
+        日志路径: %APPDATA%\\AgentWithU\\logs\\backend.log
+      </p>
+      <details style="max-width:600px;width:100%;margin-top:8px">
+        <summary style="cursor:pointer;font-size:13px;color:#818cf8">错误详情</summary>
+        <pre style="background:rgba(0,0,0,0.3);border-radius:8px;padding:12px;font-size:12px;
+          color:#ccc;max-height:200px;overflow:auto;white-space:pre-wrap;word-break:break-all"
+        >${String(err).replace(/</g, '&lt;').replace(/>/g, '&gt;')}</pre>
+      </details>
+      <button onclick="location.reload()" style="padding:8px 20px;border-radius:6px;border:none;
+        cursor:pointer;background:#818cf8;color:#fff;font-size:13px;margin-top:8px">
+        🔄 重新加载
+      </button>
+    </div>`;
+});
+window.addEventListener('unhandledrejection', (ev) => {
+  console.error('[main] Unhandled promise rejection:', ev.reason);
+});
 
 // 全局流路由：所有 session 的 streamDelta 都进 streamStates Map,不论 UI 当前
 // 看的是哪个 session。必须在 React 挂载之前装,确保它的订阅者排在 useChat
@@ -90,5 +124,8 @@ style.textContent = `
 document.head.appendChild(style);
 
 createRoot(document.getElementById('root')!).render(
-  isScratchPadWindow ? <ScratchPadWindow /> : <App />,
+  <ErrorBoundary>
+    {isScratchPadWindow ? <ScratchPadWindow /> : <App />}
+  </ErrorBoundary>,
 );
+_reactMounted = true; // React 已接管，后续错误由 ErrorBoundary 处理

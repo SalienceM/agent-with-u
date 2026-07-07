@@ -1127,8 +1127,8 @@ const ExecuteStage: React.FC<{
       {/* Loop 时间轴（多轮时按轮分隔） */}
       <div style={{ display: 'flex', gap: 10, overflowX: 'auto', paddingBottom: 12, marginBottom: 8, alignItems: 'stretch' }}>
         {state.loops.length === 0 && <div style={{ color: 'var(--theme-text-muted)', fontSize: 13 }}>还没有 loop，点击上方按钮开始第 1 次。</div>}
-        {state.loops.map((l, i) => {
-          const newRound = state.round > 1 && (i === 0 || state.loops[i - 1].round !== l.round);
+        {state.loops.slice().reverse().map((l, i, arr) => {
+          const newRound = state.round > 1 && (i === 0 || arr[i - 1].round !== l.round);
           return (
             <React.Fragment key={l.seq}>
               {newRound && (
@@ -1197,8 +1197,8 @@ const LoopFlowView: React.FC<{
       <div style={{ fontSize: 12, color: 'var(--theme-text-muted)', marginBottom: 10 }}>
         每条泳道是一次 loop 的执行流程；颜色表状态，<span style={{ color: '#0969da' }}>蓝色脉冲 = 正在执行</span>，节点下标注耗时。点节点看详情。
       </div>
-      {loops.map((loop, i) => {
-        const newRound = state.round > 1 && (i === 0 || loops[i - 1].round !== loop.round);
+      {loops.slice().reverse().map((loop, i, arr) => {
+        const newRound = state.round > 1 && (i === 0 || arr[i - 1].round !== loop.round);
         return (
           <React.Fragment key={loop.seq}>
             {newRound && (

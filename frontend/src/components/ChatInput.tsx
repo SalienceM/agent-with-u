@@ -58,10 +58,14 @@ interface Props {
   // 多 pane 场景:用来决定全局快捷键(截图等)归哪个输入框处理。
   // 单 pane / 浏览器单实例下不传也行,默认 true。
   isFocused?: boolean;
-  // ── Git 集成 ──
+  // ── Git 集成（execKey/execMode 用于 FileTreePanel 侧 Git 操作）──
   execKey?: string;
   execMode?: 'local' | 'relay';
-  onOpenGitPanel?: () => void;
+  // ── ★ 自动 AI commit ──
+  autoCommit?: boolean;
+  autoCommitPush?: boolean;
+  autoCommitBackendId?: string;
+  onAutoCommitChange?: (enabled: boolean, push?: boolean, backendId?: string) => void;
 }
 
 // ═══════════════════════════════════════
@@ -116,7 +120,7 @@ const ChatInputInner: React.FC<Props> = ({
   onCompact,
   fontSize, onAdjustFontSize,
   isFocused = true,
-  execKey, execMode, onOpenGitPanel,
+  autoCommit = false, autoCommitPush = false, autoCommitBackendId = '', onAutoCommitChange,
 }) => {
   const ref = useRef<HTMLTextAreaElement>(null);
   // 把 textarea ref 传给 useClipboardImage,这样多 pane 场景下只有聚焦
@@ -125,38 +129,6 @@ const ChatInputInner: React.FC<Props> = ({
 
   // 截图按钮状态:正在等待用户选区域 / 已超时
   const [screenshotBusy, setScreenshotBusy] = useState(false);
-
-  // ── Git 检测（轻量轮询 10s，仅用于工具栏按钮显隐 + badge）──
-  const [gitAvailable, setGitAvailable] = useState(false);
-  const [gitBranch, setGitBranch] = useState('');
-  const [gitStagedCount, setGitStagedCount] = useState(0);
-  const [gitAhead, setGitAhead] = useState(0);
-  const [gitBehind, setGitBehind] = useState(0);
-  const gitPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
-
-  useEffect(() => {
-    if (!workingDir) { setGitAvailable(false); return; }
-    let cancelled = false;
-    const poll = () => {
-      api.gitDetect(workingDir, execKey).then((res) => {
-        if (cancelled) return;
-        setGitAvailable(res.isRepo);
-        if (res.isRepo) {
-          setGitBranch(res.branch || '');
-          // 轻量 status：只拿 staged count + ahead/behind
-          api.gitStatus(workingDir, execKey).then((st) => {
-            if (cancelled) return;
-            setGitStagedCount(st.stagedCount || 0);
-            setGitAhead(st.ahead || 0);
-            setGitBehind(st.behind || 0);
-          }).catch(() => {});
-        }
-      }).catch(() => { if (!cancelled) setGitAvailable(false); });
-    };
-    poll();
-    gitPollRef.current = setInterval(poll, 10000);
-    return () => { cancelled = true; if (gitPollRef.current) clearInterval(gitPollRef.current); };
-  }, [workingDir, execKey]);
 
   // 调起系统截图工具 → 等图片落进剪贴板 → 走既有粘贴流程加入附件。
   // 桌面端独占——浏览器无法触发系统截图工具。
@@ -936,32 +908,40 @@ const ChatInputInner: React.FC<Props> = ({
             loading={screenshotBusy}
           />
         )}
-        {/* ★ Git 工具栏按钮（仅 Git 仓库时显示） */}
-        {gitAvailable && onOpenGitPanel && (
-          <>
-            <ToolbarBtn
-              icon={`📋${gitStagedCount > 0 ? gitStagedCount : ''}`}
-              title={gitBranch ? `Git: ${gitBranch}` : 'Git Status'}
-              compact={isMobile}
-              onClick={onOpenGitPanel}
-            />
-            {gitAhead > 0 && (
-              <ToolbarBtn
-                icon={`⬆${gitAhead}`}
-                title="Push"
-                compact={isMobile}
-                onClick={onOpenGitPanel}
-              />
-            )}
-            {gitBehind > 0 && (
-              <ToolbarBtn
-                icon={`⬇${gitBehind}`}
-                title="Pull"
-                compact={isMobile}
-                onClick={onOpenGitPanel}
-              />
-            )}
-          </>
+        {/* ★ 自动 AI commit 开关（点击循环：关→提交→提交+推送→关） */}
+        {onAutoCommitChange && (
+          <ToolbarBtn
+            icon={`🤖${autoCommit ? (autoCommitPush ? '⇧' : '✓') : ''}`}
+            title={autoCommit
+              ? `自动提交${autoCommitPush ? '+推送' : ''}：开（点击${autoCommitPush ? '关闭' : '切换到+推送'}）`
+              : '自动提交：关（点击开启）'}
+            active={autoCommit}
+            compact={isMobile}
+            onClick={() => {
+              if (!autoCommit) {
+                onAutoCommitChange(true, false);
+              } else if (!autoCommitPush) {
+                onAutoCommitChange(true, true);
+              } else {
+                onAutoCommitChange(false);
+              }
+            }}
+          />
+        )}
+        {/* ★ 自动 commit 模型选择（多后端时显示） */}
+        {autoCommit && onAutoCommitChange && backends.length > 1 && (
+          <ToolbarBtn
+            icon="⚙️"
+            title={`AI 提交模型：${autoCommitBackendId ? (backends.find(b => b.id === autoCommitBackendId)?.label || autoCommitBackendId) : '跟随会话'}（点击切换）`}
+            compact={isMobile}
+            onClick={() => {
+              // 循环：会话主模型 → backend[0] → backend[1] → ... → 会话主模型
+              const currentIdx = autoCommitBackendId ? backends.findIndex(b => b.id === autoCommitBackendId) : -1;
+              const nextIdx = (currentIdx + 1) % (backends.length + 1);
+              const bid = nextIdx < backends.length ? backends[nextIdx].id : '';
+              onAutoCommitChange(autoCommit, autoCommitPush, bid);
+            }}
+          />
         )}
         {/* ★ 流式进度指示器 */}
         {isStreaming && (

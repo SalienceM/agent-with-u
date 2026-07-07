@@ -18,7 +18,7 @@ import React, { useCallback, useEffect, useMemo, useState, useRef, lazy, Suspens
 import hljs from 'highlight.js';
 import { api } from '../api';
 import { markdownToHtml } from '../utils/markdown';
-import type { GitFileStatus, GitFileStatusType } from '../types/git';
+import type { GitFileStatus, GitFileStatusType, GitStashEntry } from '../types/git';
 import {
   pickLocalDir, restoreLocalDir, loadBaseline, saveBaseline,
   type LocalFs, type Manifest,
@@ -136,7 +136,25 @@ export const FileTreePanel: React.FC<Props> = ({ workingDir, execKey, execLabel,
   const [gitAvailable, setGitAvailable] = useState(false);
   const [gitBranch, setGitBranch] = useState('');
   const [gitFiles, setGitFiles] = useState<Record<string, GitFileStatus>>({});
+  const [gitStagedCount, setGitStagedCount] = useState(0);
+  const [gitUnstagedCount, setGitUnstagedCount] = useState(0);
+  const [gitAhead, setGitAhead] = useState(0);
+  const [gitBehind, setGitBehind] = useState(0);
   const gitPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  // ── ★ Git 快速操作状态 ──
+  const [gitCommitExpanded, setGitCommitExpanded] = useState(false);
+  const [gitCommitMsg, setGitCommitMsg] = useState('');
+  const [gitCommitting, setGitCommitting] = useState(false);
+  const [gitPushing, setGitPushing] = useState(false);
+  const [gitPulling, setGitPulling] = useState(false);
+  const [gitAiGenerating, setGitAiGenerating] = useState(false);
+
+  // ── Stash 管理 ──
+  const [stashes, setStashes] = useState<GitStashEntry[]>([]);
+  const [stashesLoading, setStashesLoading] = useState(false);
+  const [stashExpanded, setStashExpanded] = useState(false);
+  const [stashOperating, setStashOperating] = useState<number | null>(null); // 正在操作的 stash index
 
   // 预览 / 编辑
   const [preview, setPreview] = useState<PreviewState | null>(null);
@@ -190,14 +208,197 @@ export const FileTreePanel: React.FC<Props> = ({ workingDir, execKey, execLabel,
       api.gitStatus(workingDir, execKey).then((res) => {
         if (cancelled) return;
         const map: Record<string, GitFileStatus> = {};
-        for (const f of (res.files || [])) map[f.path] = f;
+        let staged = 0, unstaged = 0;
+        for (const f of (res.files || [])) {
+          map[f.path] = f;
+          if (f.staged) staged++;
+          else unstaged++;
+        }
         setGitFiles(map);
         setGitBranch(res.branch || '');
+        setGitStagedCount(staged);
+        setGitUnstagedCount(unstaged);
+        setGitAhead(res.ahead || 0);
+        setGitBehind(res.behind || 0);
       }).catch(() => {});
     };
     pollStatus();
     gitPollRef.current = setInterval(pollStatus, 5000);
     return () => { cancelled = true; if (gitPollRef.current) clearInterval(gitPollRef.current); };
+  }, [workingDir, execKey]);
+
+  // ── Stash 操作 ──
+  const loadStashes = useCallback(async () => {
+    if (!workingDir || !gitAvailable) return;
+    setStashesLoading(true);
+    try {
+      const res = await api.gitStashList(workingDir, execKey);
+      setStashes(res.stashes || []);
+    } catch {
+      setStashes([]);
+    } finally {
+      setStashesLoading(false);
+    }
+  }, [workingDir, execKey, gitAvailable]);
+
+  // 当 stash 面板展开且 git 可用时加载列表
+  useEffect(() => {
+    if (stashExpanded && gitAvailable && workingDir) {
+      loadStashes();
+    }
+  }, [stashExpanded, gitAvailable, workingDir, loadStashes]);
+
+  const handleStashPush = useCallback(async () => {
+    if (!workingDir) return;
+    setMsg(null);
+    const message = window.prompt('输入 stash 备注（可留空）：') ?? '';
+    try {
+      const res = await api.gitStashPush(workingDir, message, execKey);
+      if (res.status === 'ok') {
+        setMsg({ kind: 'ok', text: '✓ 已暂存当前改动' });
+        loadStashes();
+        reloadAll(); // 刷新文件状态
+      } else {
+        setMsg({ kind: 'err', text: `Stash 失败：${(res as any).message || '未知错误'}` });
+      }
+    } catch (e: any) {
+      setMsg({ kind: 'err', text: `Stash 失败：${e?.message ?? e}` });
+    }
+  }, [workingDir, execKey, loadStashes, reloadAll]);
+
+  const handleStashPop = useCallback(async (index: number) => {
+    if (!workingDir) return;
+    setMsg(null);
+    setStashOperating(index);
+    try {
+      const res = await api.gitStashPop(workingDir, index, execKey);
+      if (res.status === 'ok') {
+        setMsg({ kind: 'ok', text: `✓ 已恢复 stash@{${index}}` });
+        loadStashes();
+        reloadAll();
+      } else {
+        setMsg({ kind: 'err', text: `恢复失败：${(res as any).message || '未知错误'}` });
+      }
+    } catch (e: any) {
+      setMsg({ kind: 'err', text: `恢复失败：${e?.message ?? e}` });
+    } finally {
+      setStashOperating(null);
+    }
+  }, [workingDir, execKey, loadStashes, reloadAll]);
+
+  const handleStashDrop = useCallback(async (index: number) => {
+    if (!workingDir) return;
+    if (!window.confirm(`确定要删除 stash@{${index}} 吗？此操作不可恢复！`)) return;
+    setMsg(null);
+    setStashOperating(index);
+    try {
+      const res = await api.gitStashDrop(workingDir, index, execKey);
+      if (res.status === 'ok') {
+        setMsg({ kind: 'ok', text: `✓ 已删除 stash@{${index}}` });
+        loadStashes();
+      } else {
+        setMsg({ kind: 'err', text: `删除失败：${(res as any).message || '未知错误'}` });
+      }
+    } catch (e: any) {
+      setMsg({ kind: 'err', text: `删除失败：${e?.message ?? e}` });
+    } finally {
+      setStashOperating(null);
+    }
+  }, [workingDir, execKey, loadStashes]);
+
+  // ── ★ Git 快速操作 handlers ──
+
+  /** Stage all 变更 */
+  const handleStageAll = useCallback(async () => {
+    if (!workingDir) return;
+    try {
+      const res = await api.gitStage(workingDir, ['.'], execKey);
+      if (res.status === 'ok') {
+        setMsg({ kind: 'ok', text: '✓ 已暂存所有变更' });
+      } else {
+        setMsg({ kind: 'err', text: `暂存失败：${(res as any).message || '未知错误'}` });
+      }
+    } catch (e: any) {
+      setMsg({ kind: 'err', text: `暂存失败：${e?.message ?? e}` });
+    }
+  }, [workingDir, execKey]);
+
+  /** AI 生成 commit message */
+  const handleAiGenerateMsg = useCallback(async () => {
+    if (!workingDir) return;
+    setGitAiGenerating(true);
+    try {
+      const res = await api.gitGenerateCommitMessage(workingDir, true, execKey);
+      if (res.status === 'ok' && res.message) {
+        setGitCommitMsg(res.message);
+      } else {
+        setMsg({ kind: 'err', text: 'AI 生成失败，请手动输入' });
+      }
+    } catch (e: any) {
+      setMsg({ kind: 'err', text: `AI 生成失败：${e?.message ?? e}` });
+    } finally {
+      setGitAiGenerating(false);
+    }
+  }, [workingDir, execKey]);
+
+  /** Commit（如果未暂存则先 stage all） */
+  const handleCommit = useCallback(async () => {
+    if (!workingDir || !gitCommitMsg.trim()) return;
+    setGitCommitting(true);
+    try {
+      // 如果有未暂存的变更，先 stage all
+      if (gitUnstagedCount > 0) {
+        await api.gitStage(workingDir, ['.'], execKey);
+      }
+      const res = await api.gitCommit(workingDir, gitCommitMsg.trim(), false, execKey);
+      if (res.status === 'ok') {
+        setMsg({ kind: 'ok', text: `✓ 已提交: ${gitCommitMsg.trim().split('\n')[0]}` });
+        setGitCommitMsg('');
+        setGitCommitExpanded(false);
+      } else {
+        setMsg({ kind: 'err', text: `提交失败：${(res as any).message || '未知错误'}` });
+      }
+    } catch (e: any) {
+      setMsg({ kind: 'err', text: `提交失败：${e?.message ?? e}` });
+    } finally {
+      setGitCommitting(false);
+    }
+  }, [workingDir, execKey, gitCommitMsg, gitUnstagedCount]);
+
+  /** Push */
+  const handlePush = useCallback(async () => {
+    if (!workingDir) return;
+    setGitPushing(true);
+    try {
+      const res = await api.gitPush(workingDir, 'origin', '', false, execKey);
+      if (res.status === 'ok') {
+        setMsg({ kind: 'ok', text: '✓ 已推送' });
+      } else {
+        setMsg({ kind: 'err', text: `推送失败：${res.message || res.output || '未知错误'}` });
+      }
+    } catch (e: any) {
+      setMsg({ kind: 'err', text: `推送失败：${e?.message ?? e}` });
+    } finally {
+      setGitPushing(false);
+    }
+  }, [workingDir, execKey]);
+
+  /** Pull */
+  const handlePull = useCallback(async () => {
+    if (!workingDir) return;
+    setGitPulling(true);
+    try {
+      const res = await api.gitPull(workingDir, 'origin', '', false, execKey);
+      if (res.status === 'ok') {
+        setMsg({ kind: 'ok', text: '✓ 已拉取' });
+      } else {
+        setMsg({ kind: 'err', text: `拉取失败：${res.message || res.output || '未知错误'}` });
+      }
+    } catch (e: any) {
+      setMsg({ kind: 'err', text: `拉取失败：${e?.message ?? e}` });
+    } finally {
+      setGitPulling(false);
+    }
   }, [workingDir, execKey]);
 
   // 远端会话:恢复上次的本地副本目录并扫描(得到"已下载"presence + 哈希)
@@ -481,10 +682,106 @@ export const FileTreePanel: React.FC<Props> = ({ workingDir, execKey, execLabel,
         {gitAvailable && gitBranch && (
           <span style={gitBranchBadgeStyle} title={`Git branch: ${gitBranch}`}>🔀 {gitBranch}</span>
         )}
+        {gitAvailable && (
+          <button
+            className="ftp-hbtn"
+            style={{ ...hdrIconStyle, fontSize: 11, width: 'auto', padding: '0 6px', gap: 3, display: 'inline-flex', alignItems: 'center' }}
+            title="Stash 当前改动"
+            onClick={handleStashPush}
+          >📦 Stash</button>
+        )}
+        {gitAvailable && (
+          <button
+            className="ftp-hbtn"
+            style={{
+              ...hdrIconStyle, fontSize: 11, width: 'auto', padding: '0 6px',
+              ...(stashExpanded ? { background: 'var(--theme-accent-bg)', color: 'var(--theme-accent)' } : {}),
+            }}
+            title="查看 Stash 列表"
+            onClick={() => setStashExpanded((v) => !v)}
+          >📋{stashes.length > 0 && <span style={{ marginLeft: 2, fontSize: 10 }}>({stashes.length})</span>}</button>
+        )}
         <div style={{ flex: 1 }} />
         <button className="ftp-hbtn" style={hdrIconStyle} title="刷新" onClick={reloadAll}>↻</button>
         <button className="ftp-hbtn" style={hdrIconStyle} title="全部折叠" onClick={() => setExpanded({})}>⊟</button>
       </div>
+
+      {/* ★ Git 快速操作工具条 */}
+      {gitAvailable && (
+        <div style={gitToolbarStyle}>
+          {/* 状态摘要行 */}
+          <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
+            {gitUnstagedCount > 0 && (
+              <span style={{ fontSize: 10, color: 'var(--theme-text-muted)' }}
+                title="未暂存变更">{gitUnstagedCount} 未暂存</span>
+            )}
+            {gitStagedCount > 0 && (
+              <span style={{ fontSize: 10, color: '#3fb950' }}
+                title="已暂存变更">{gitStagedCount} 已暂存</span>
+            )}
+            {gitStagedCount === 0 && gitUnstagedCount === 0 && (
+              <span style={{ fontSize: 10, color: 'var(--theme-text-muted)' }}>工作区干净</span>
+            )}
+            <div style={{ flex: 1 }} />
+            {gitAhead > 0 && (
+              <span style={{ fontSize: 10, color: '#58a6ff' }} title="领先远端">⬆{gitAhead}</span>
+            )}
+            {gitBehind > 0 && (
+              <span style={{ fontSize: 10, color: '#d29922' }} title="落后远端">⬇{gitBehind}</span>
+            )}
+            {/* 快速按钮 */}
+            {(gitUnstagedCount > 0 || gitStagedCount > 0) && (
+              <button style={gitMiniBtn} title="暂存所有变更" onClick={handleStageAll}>📥 暂存</button>
+            )}
+            {gitBehind > 0 && (
+              <button style={gitMiniBtn} disabled={gitPulling} onClick={handlePull}
+                title="拉取远端变更">{gitPulling ? '⏳' : '⬇'} 拉取</button>
+            )}
+            {gitAhead > 0 && (
+              <button style={gitMiniBtn} disabled={gitPushing} onClick={handlePush}
+                title="推送到远端">{gitPushing ? '⏳' : '⬆'} 推送</button>
+            )}
+            <button style={{
+              ...gitMiniBtn,
+              ...(gitCommitExpanded ? { background: 'var(--theme-accent-bg)', color: 'var(--theme-accent)' } : {}),
+            }}
+              onClick={() => setGitCommitExpanded((v) => !v)}
+              title="提交变更">
+              ✅ 提交
+            </button>
+          </div>
+          {/* 提交面板（展开时） */}
+          {gitCommitExpanded && (
+            <div style={gitCommitPanelStyle}>
+              <textarea
+                style={gitCommitInputStyle}
+                placeholder="输入 commit message…（可留空由 AI 生成）"
+                value={gitCommitMsg}
+                onChange={(e) => setGitCommitMsg(e.target.value)}
+                rows={2}
+              />
+              <div style={{ display: 'flex', gap: 4, marginTop: 4 }}>
+                <button style={gitCommitActionBtn} disabled={gitAiGenerating} onClick={handleAiGenerateMsg}
+                  title="AI 根据 diff 生成 commit message">
+                  {gitAiGenerating ? '⏳ 生成中…' : '✨ AI 生成'}
+                </button>
+                <div style={{ flex: 1 }} />
+                <button style={{
+                  ...gitCommitActionBtn,
+                  background: gitCommitMsg.trim() ? 'var(--theme-success, #22c55e)' : 'var(--theme-bg-tertiary)',
+                  color: gitCommitMsg.trim() ? '#fff' : 'var(--theme-text-muted)',
+                  cursor: gitCommitMsg.trim() ? 'pointer' : 'not-allowed',
+                }}
+                  disabled={!gitCommitMsg.trim() || gitCommitting}
+                  onClick={handleCommit}
+                  title={gitUnstagedCount > 0 ? '先暂存所有再提交' : '提交已暂存的变更'}>
+                  {gitCommitting ? '⏳' : '✅'} {gitUnstagedCount > 0 ? '暂存并提交' : '提交'}
+                </button>
+              </div>
+            </div>
+          )}
+        </div>
+      )}
 
       {/* 远端会话:本地副本 + 比对 提示条 */}
       {isRemote && (
@@ -518,6 +815,51 @@ export const FileTreePanel: React.FC<Props> = ({ workingDir, execKey, execLabel,
       <div style={{ padding: '2px 0 6px' }}>
         {!workingDir ? <Empty text="打开一个会话后显示其工作目录" /> : renderDir('', 0)}
       </div>
+
+      {/* Stash 列表面板 */}
+      {stashExpanded && gitAvailable && (
+        <div style={stashPanelStyle}>
+          <div style={stashHeaderStyle}>
+            <span style={{ fontSize: 12, fontWeight: 600 }}>📋 Stash 列表</span>
+            <button style={stashRefreshBtnStyle} onClick={loadStashes} disabled={stashesLoading} title="刷新列表">
+              {stashesLoading ? '⏳' : '↻'}
+            </button>
+          </div>
+          {stashes.length === 0 ? (
+            <div style={stashEmptyStyle}>暂无 stash 记录</div>
+          ) : (
+            <div style={stashListStyle}>
+              {stashes.map((s) => (
+                <div key={s.index} style={stashItemStyle}>
+                  <div style={stashItemHeaderStyle}>
+                    <span style={stashIndexStyle}>stash@{'{' + s.index + '}'}</span>
+                    <span style={stashDateStyle}>{s.date ? new Date(s.date).toLocaleString() : ''}</span>
+                  </div>
+                  <div style={stashMsgStyle}>{s.message || '(无备注)'}</div>
+                  <div style={stashActionsStyle}>
+                    <button
+                      style={stashActionBtnStyle}
+                      onClick={() => handleStashPop(s.index)}
+                      disabled={stashOperating === s.index}
+                      title="恢复此 stash 到工作区"
+                    >
+                      {stashOperating === s.index ? '⏳' : '♻'} 恢复 (Pop)
+                    </button>
+                    <button
+                      style={{ ...stashActionBtnStyle, color: '#f87171', borderColor: 'rgba(248,113,113,0.3)' }}
+                      onClick={() => handleStashDrop(s.index)}
+                      disabled={stashOperating === s.index}
+                      title="删除此 stash（不可恢复）"
+                    >
+                      🗑 删除 (Drop)
+                    </button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
 
       {(busy || msg) && (
         <div style={{
@@ -627,3 +969,79 @@ const pvPre: React.CSSProperties = { margin: 0, padding: '12px 16px', fontSize: 
 const segBtnStyle: React.CSSProperties = { fontSize: 11, padding: '3px 9px', border: 'none', cursor: 'pointer', background: 'transparent', color: 'var(--theme-text-muted)' };
 const segActiveStyle: React.CSSProperties = { background: 'var(--theme-accent-bg)', color: 'var(--theme-accent)' };
 const hdrBtnStyle: React.CSSProperties = { fontSize: 11, padding: '2px 7px', borderRadius: 5, cursor: 'pointer', border: '1px solid var(--theme-border)', background: 'transparent', color: 'var(--theme-text-muted)' };
+
+// ── Stash 面板样式 ──
+const stashPanelStyle: React.CSSProperties = {
+  borderTop: '1px solid var(--theme-border)',
+  background: 'var(--theme-bg-secondary, rgba(0,0,0,0.15))',
+  padding: '8px 10px',
+  maxHeight: 240,
+  overflowY: 'auto',
+};
+const stashHeaderStyle: React.CSSProperties = {
+  display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+  marginBottom: 6, color: 'var(--theme-text)',
+};
+const stashRefreshBtnStyle: React.CSSProperties = {
+  width: 22, height: 20, display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
+  fontSize: 12, borderRadius: 4, cursor: 'pointer', border: 'none', background: 'transparent', color: 'var(--theme-text-muted)',
+};
+const stashEmptyStyle: React.CSSProperties = { padding: '8px 0', fontSize: 11, color: 'var(--theme-text-muted)', textAlign: 'center' };
+const stashListStyle: React.CSSProperties = { display: 'flex', flexDirection: 'column', gap: 6 };
+const stashItemStyle: React.CSSProperties = {
+  padding: '6px 8px', borderRadius: 6,
+  background: 'var(--theme-bg, rgba(0,0,0,0.2))',
+  border: '1px solid var(--theme-border, rgba(255,255,255,0.06))',
+};
+const stashItemHeaderStyle: React.CSSProperties = {
+  display: 'flex', alignItems: 'center', gap: 8, marginBottom: 3,
+};
+const stashIndexStyle: React.CSSProperties = {
+  fontSize: 11, fontFamily: 'monospace', color: '#58a6ff',
+  background: 'rgba(88,166,255,0.1)', padding: '1px 5px', borderRadius: 3,
+};
+const stashDateStyle: React.CSSProperties = { fontSize: 10, color: 'var(--theme-text-muted)' };
+const stashMsgStyle: React.CSSProperties = { fontSize: 12, color: 'var(--theme-text)', marginBottom: 4, wordBreak: 'break-word' };
+const stashActionsStyle: React.CSSProperties = { display: 'flex', gap: 6, marginTop: 4 };
+const stashActionBtnStyle: React.CSSProperties = {
+  fontSize: 11, padding: '3px 8px', borderRadius: 4, cursor: 'pointer',
+  border: '1px solid rgba(88,166,255,0.3)', background: 'rgba(88,166,255,0.08)',
+  color: '#58a6ff', display: 'inline-flex', alignItems: 'center', gap: 3,
+};
+
+// ── Git 快速操作工具条样式 ──
+const gitToolbarStyle: React.CSSProperties = {
+  padding: '4px 8px 6px',
+  borderBottom: '1px solid var(--theme-border, rgba(255,255,255,0.06))',
+  background: 'var(--theme-bg-secondary, rgba(0,0,0,0.15))',
+};
+const gitMiniBtn: React.CSSProperties = {
+  fontSize: 10, padding: '2px 6px', borderRadius: 4, cursor: 'pointer',
+  border: '1px solid var(--theme-border, rgba(255,255,255,0.1))',
+  background: 'var(--theme-bg, rgba(0,0,0,0.2))',
+  color: 'var(--theme-text-muted, #8b949e)',
+  display: 'inline-flex', alignItems: 'center', gap: 2,
+  whiteSpace: 'nowrap',
+};
+const gitCommitPanelStyle: React.CSSProperties = {
+  marginTop: 6, padding: 6,
+  background: 'var(--theme-bg, rgba(0,0,0,0.2))',
+  border: '1px solid var(--theme-border, rgba(255,255,255,0.08))',
+  borderRadius: 6,
+};
+const gitCommitInputStyle: React.CSSProperties = {
+  width: '100%', boxSizing: 'border-box',
+  padding: '4px 6px', fontSize: 11, lineHeight: 1.4,
+  background: 'var(--theme-bg-secondary, rgba(0,0,0,0.15))',
+  border: '1px solid var(--theme-border, rgba(255,255,255,0.1))',
+  borderRadius: 4, color: 'var(--theme-text, #c9d1d9)',
+  resize: 'vertical', fontFamily: 'inherit',
+  outline: 'none',
+};
+const gitCommitActionBtn: React.CSSProperties = {
+  fontSize: 10, padding: '3px 8px', borderRadius: 4, cursor: 'pointer',
+  border: '1px solid var(--theme-border, rgba(255,255,255,0.1))',
+  background: 'var(--theme-bg-tertiary, rgba(255,255,255,0.05))',
+  color: 'var(--theme-text-muted, #8b949e)',
+  display: 'inline-flex', alignItems: 'center', gap: 3,
+};

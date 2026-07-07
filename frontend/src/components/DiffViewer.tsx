@@ -115,25 +115,25 @@ const lineRemoveStyle: React.CSSProperties = {
 
 const lineHunkStyle: React.CSSProperties = {
   padding: '0 12px',
-  color: '#58a6ff',
+  color: 'var(--theme-accent, #58a6ff)',
   fontWeight: 600,
 };
 
 const lineDiffHeaderStyle: React.CSSProperties = {
   padding: '0 12px',
-  color: '#d2a8ff',
+  color: 'var(--theme-accent, #d2a8ff)',
   fontWeight: 600,
 };
 
 const lineHeaderStyle: React.CSSProperties = {
   padding: '0 12px',
-  color: '#8b949e',
+  color: 'var(--theme-text-muted, #8b949e)',
   fontWeight: 600,
 };
 
 const lineMetaStyle: React.CSSProperties = {
   padding: '0 12px',
-  color: '#8b949e',
+  color: 'var(--theme-text-muted, #8b949e)',
   fontStyle: 'italic',
 };
 

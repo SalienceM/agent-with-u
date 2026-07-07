@@ -148,6 +148,9 @@ class SessionStore:
                 constraints=data.get("constraints"),
                 abilities=data.get("abilities"),
                 session_type=data.get("sessionType", "normal"),
+                auto_commit=data.get("autoCommit", False),
+                auto_commit_push=data.get("autoCommitPush", False),
+                auto_commit_backend_id=data.get("autoCommitBackendId"),
             )
         except Exception as e:
             print(f"Failed to load session {sid}: {e}")

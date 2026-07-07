@@ -1,4 +1,4 @@
-import React, { useEffect, useState, useCallback, memo, useRef } from 'react';
+import React, { useEffect, useState, useCallback, memo, useRef, useMemo } from 'react';
 import { api } from '../api';
 import { FileTreePanel } from './FileTreePanel';
 
@@ -11,6 +11,7 @@ interface Session {
   backendId: string;
   abilities?: { skills: string[]; prompts: string[] };
   // ★ session 级执行节点归属（由 api.listSessions 合并时注入）
+  execKey?: string;
   execLabel?: string;
   execMode?: 'local' | 'relay';
   execIsHome?: boolean;
@@ -55,6 +56,8 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
   const [renamingSessionId, setRenamingSessionId] = useState<string | null>(null);
   const [renameValue, setRenameValue] = useState('');
   const renameInputRef = useRef<HTMLInputElement>(null);
+  // ★ 分组折叠（全局只保留最近 10 条 session，不再需要「展开更多」）
+  const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(new Set());
 
   // ★ Memoize refresh function to avoid re-creating it on every render
   const refresh = useCallback(async () => {
@@ -232,6 +235,37 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
 
   const pendingCount = completedSessions.size;
 
+  // ★ 按执行节点分组：本机 + 各远端节点（全局只保留最近 10 个 session）
+  const groups = useMemo(() => {
+    const top10 = sessions.slice(0, 10);
+    const map = new Map<string, { key: string; label: string; isHome: boolean; sessions: Session[] }>();
+    for (const s of top10) {
+      const key = s.execKey || 'local';
+      const label = s.execMode === 'relay' ? (s.execLabel || key) : '本机';
+      const isHome = s.execIsHome !== false;
+      if (!map.has(key)) {
+        map.set(key, { key, label, isHome, sessions: [] });
+      }
+      map.get(key)!.sessions.push(s);
+    }
+    // 本机在前，远端按 label 排序
+    const arr = Array.from(map.values());
+    arr.sort((a, b) => {
+      if (a.isHome && !b.isHome) return -1;
+      if (!a.isHome && b.isHome) return 1;
+      return a.label.localeCompare(b.label);
+    });
+    return arr;
+  }, [sessions]);
+
+  const toggleGroup = useCallback((key: string) => {
+    setCollapsedGroups(prev => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key); else next.add(key);
+      return next;
+    });
+  }, []);
+
   // ★ 移动端折叠：完全隐藏，由顶栏的 ☰ 按钮负责唤出抽屉
   if (collapsed && isMobile) {
     return null;
@@ -372,119 +406,141 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
         <FileTreePanel workingDir={activeWorkingDir || ''} execKey={activeExecKey} execLabel={activeExecLabel} execMode={activeExecMode} />
       ) : (
       <div style={{ flex: 1, overflow: 'auto', padding: '4px 8px' }}>
-        {sessions.map((s: any) => {
-          const isRunning = streamingSessions.has(s.id);
-          const isCompleted = !isRunning && completedSessions.has(s.id);
-          const isActive = s.id === activeSessionId;
-
+        {groups.map(group => {
+          const isCollapsed = collapsedGroups.has(group.key);
+          // 多组时显示组头；单组（仅本机）不显示
+          const showGroupHeader = groups.length > 1;
           return (
-          <div
-            key={s.id}
-            onClick={() => onSelectSession(s.id)}
-            onMouseEnter={() => setHoveredSessionId(s.id)}
-            onMouseLeave={() => setHoveredSessionId(null)}
-            className={isRunning ? 'session-streaming-item' : undefined}
-            style={{
-              ...itemStyle,
-              ...(isActive ? { background: 'var(--theme-accent-bg, #7aa2f726)' } : {}),
-              ...(hoveredSessionId === s.id && !isActive ? { background: 'var(--theme-bg-tertiary, #242536)' } : {}),
-              ...(isRunning   ? { border: '1px solid #22c55e33' } : {}),
-              ...(isCompleted ? { border: '1px solid #ef444455', borderLeft: '3px solid #ef4444' } : {}),
-            }}
-          >
-            {/* ★ Running indicator — 绿点 */}
-            {isRunning && (
-              <div style={{ position: 'absolute', top: 8, left: 8, display: 'flex', alignItems: 'center', gap: 4 }}>
-                <span style={{ width: 7, height: 7, borderRadius: '50%', background: '#22c55e', animation: 'pulse 1.5s infinite' }} />
-              </div>
-            )}
-
-            {/* ★ Completed indicator — 右上角红点角标，点击才确认消除 */}
-            {isCompleted && (
-              <span
-                className="session-notify-badge"
-                title="点击确认已查看"
-                onClick={(e) => {
-                  e.stopPropagation();
-                  onAcknowledgeSession?.(s.id);
-                }}
-              >
-                !
-              </span>
-            )}
-
-            {/* ★ Working directory is PRIMARY - shown first and prominently */}
-            <div style={{ fontSize: 11, color: 'var(--theme-success, #2da44e)', fontFamily: 'monospace', marginBottom: 4, paddingLeft: isRunning ? 18 : 0 }}>
-              📁 {formatWorkingDir(s.workingDir)}
-            </div>
-            {renamingSessionId === s.id ? (
-              <input
-                ref={renameInputRef}
-                value={renameValue}
-                onChange={(e) => setRenameValue(e.target.value)}
-                onBlur={handleRenameConfirm}
-                onKeyDown={handleRenameKeyDown}
-                onClick={(e) => e.stopPropagation()}
-                autoFocus
-                style={renameInputStyle}
-              />
-            ) : (
-              <div style={{ fontSize: 13, color: isActive ? 'var(--theme-accent, #7aa2f7)' : 'var(--theme-text, #e2e3ea)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', paddingRight: 68 }}>
-                {s.sessionType === 'loop' && <span title="Loop 会话" style={{ marginRight: 4 }}>🔁</span>}
-                {s.title}
-              </div>
-            )}
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: 4 }}>
-              <span style={{ fontSize: 10, color: 'var(--theme-text-muted, #656d76)' }}>
-                {s.messageCount} msgs
-              </span>
-              <div style={{ display: 'flex', gap: 4, alignItems: 'center' }}>
-                {/* ★ 远端执行节点标记:本机会话不显示,避免单机用户看到无谓徽标 */}
-                {s.execIsHome === false && s.execLabel && (
-                  <span style={execBadgeStyle} title={`执行节点：${s.execLabel}`}>
-                    🌐 {s.execLabel}
-                  </span>
-                )}
-                {/* Backend name badge */}
-                <span
-                  style={{
-                    ...backendBadgeStyle,
-                    background: getBackendBadgeColor(s.backendId),
-                  }}
-                  title={getBackendShortLabel(s.backendId)}
+            <div key={group.key}>
+              {showGroupHeader && (
+                <div
+                  onClick={() => toggleGroup(group.key)}
+                  style={groupHeaderStyle}
+                  title={group.isHome ? '本机执行' : `执行节点：${group.label}`}
                 >
-                  {getBackendShortLabel(s.backendId)}
-                </span>
-              </div>
+                  <span style={{ fontSize: 10, width: 12, textAlign: 'center', flexShrink: 0 }}>{isCollapsed ? '▸' : '▾'}</span>
+                  <span style={{ fontSize: 11, fontWeight: 600 }}>
+                    {group.isHome ? '🏠 本机' : `🌐 ${group.label}`}
+                  </span>
+                  <span style={{ fontSize: 10, color: 'var(--theme-text-muted)', marginLeft: 'auto' }}>{group.sessions.length}</span>
+                </div>
+              )}
+              {!isCollapsed && group.sessions.map((s: any) => {
+                const isRunning = streamingSessions.has(s.id);
+                const isCompleted = !isRunning && completedSessions.has(s.id);
+                const isActive = s.id === activeSessionId;
+
+                return (
+                <div
+                  key={s.id}
+                  onClick={() => onSelectSession(s.id)}
+                  onMouseEnter={() => setHoveredSessionId(s.id)}
+                  onMouseLeave={() => setHoveredSessionId(null)}
+                  className={isRunning ? 'session-streaming-item' : undefined}
+                  style={{
+                    ...itemStyle,
+                    ...(isActive ? { background: 'var(--theme-accent-bg, #7aa2f726)' } : {}),
+                    ...(hoveredSessionId === s.id && !isActive ? { background: 'var(--theme-bg-tertiary, #242536)' } : {}),
+                    ...(isRunning   ? { border: '1px solid #22c55e33' } : {}),
+                    ...(isCompleted ? { border: '1px solid #ef444455', borderLeft: '3px solid #ef4444' } : {}),
+                  }}
+                >
+                  {/* ★ Running indicator — 绿点 */}
+                  {isRunning && (
+                    <div style={{ position: 'absolute', top: 8, left: 8, display: 'flex', alignItems: 'center', gap: 4 }}>
+                      <span style={{ width: 7, height: 7, borderRadius: '50%', background: '#22c55e', animation: 'pulse 1.5s infinite' }} />
+                    </div>
+                  )}
+
+                  {/* ★ Completed indicator — 右上角红点角标，点击才确认消除 */}
+                  {isCompleted && (
+                    <span
+                      className="session-notify-badge"
+                      title="点击确认已查看"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        onAcknowledgeSession?.(s.id);
+                      }}
+                    >
+                      !
+                    </span>
+                  )}
+
+                  {/* ★ Working directory is PRIMARY - shown first and prominently */}
+                  <div style={{ fontSize: 11, color: 'var(--theme-success, #2da44e)', fontFamily: 'monospace', marginBottom: 4, paddingLeft: isRunning ? 18 : 0 }}>
+                    📁 {formatWorkingDir(s.workingDir)}
+                  </div>
+                  {renamingSessionId === s.id ? (
+                    <input
+                      ref={renameInputRef}
+                      value={renameValue}
+                      onChange={(e) => setRenameValue(e.target.value)}
+                      onBlur={handleRenameConfirm}
+                      onKeyDown={handleRenameKeyDown}
+                      onClick={(e) => e.stopPropagation()}
+                      autoFocus
+                      style={renameInputStyle}
+                    />
+                  ) : (
+                    <div style={{ fontSize: 13, color: isActive ? 'var(--theme-accent, #7aa2f7)' : 'var(--theme-text, #e2e3ea)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', paddingRight: 68 }}>
+                      {s.sessionType === 'loop' && <span title="Loop 会话" style={{ marginRight: 4 }}>🔁</span>}
+                      {s.title}
+                    </div>
+                  )}
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: 4 }}>
+                    <span style={{ fontSize: 10, color: 'var(--theme-text-muted, #656d76)' }}>
+                      {s.messageCount} msgs
+                    </span>
+                    <div style={{ display: 'flex', gap: 4, alignItems: 'center' }}>
+                      {/* ★ 远端执行节点标记:本机会话不显示,避免单机用户看到无谓徽标 */}
+                      {s.execIsHome === false && s.execLabel && !showGroupHeader && (
+                        <span style={execBadgeStyle} title={`执行节点：${s.execLabel}`}>
+                          🌐 {s.execLabel}
+                        </span>
+                      )}
+                      {/* Backend name badge */}
+                      <span
+                        style={{
+                          ...backendBadgeStyle,
+                          background: getBackendBadgeColor(s.backendId),
+                        }}
+                        title={getBackendShortLabel(s.backendId)}
+                      >
+                        {getBackendShortLabel(s.backendId)}
+                      </span>
+                    </div>
+                  </div>
+                  {/* ★ Hover action buttons: rename | constraints | delete */}
+                  <div style={{ position: 'absolute', top: 8, right: 8, display: 'flex', gap: 2, opacity: hoveredSessionId === s.id ? 1 : 0, transition: 'opacity 0.15s', zIndex: 5 }}>
+                    <button
+                      onClick={(e) => handleRenameStart(s, e)}
+                      style={actionBtnStyle}
+                      title="重命名"
+                    >
+                      ✎
+                    </button>
+                    <button
+                      onClick={(e) => openAbilityPicker(s, e)}
+                      style={actionBtnStyle}
+                      title="绑定能力"
+                    >
+                      🧩
+                    </button>
+                    <button
+                      onClick={(e) => handleDeleteClick(s, e)}
+                      style={actionBtnStyle}
+                      title="Delete"
+                      disabled={isRunning}
+                    >
+                      ×
+                    </button>
+                  </div>
+                </div>
+              );
+              })}
             </div>
-            {/* ★ Hover action buttons: rename | constraints | delete */}
-            <div style={{ position: 'absolute', top: 8, right: 8, display: 'flex', gap: 2, opacity: hoveredSessionId === s.id ? 1 : 0, transition: 'opacity 0.15s', zIndex: 5 }}>
-              <button
-                onClick={(e) => handleRenameStart(s, e)}
-                style={actionBtnStyle}
-                title="重命名"
-              >
-                ✎
-              </button>
-              <button
-                onClick={(e) => openAbilityPicker(s, e)}
-                style={actionBtnStyle}
-                title="绑定能力"
-              >
-                🧩
-              </button>
-              <button
-                onClick={(e) => handleDeleteClick(s, e)}
-                style={actionBtnStyle}
-                title="Delete"
-                disabled={isRunning}
-              >
-                ×
-              </button>
-            </div>
-          </div>
-        );
-      })}
+          );
+        })}
         {sessions.length === 0 && (
           <div style={{ textAlign: 'center', color: 'var(--theme-text-muted, #656d76)', fontSize: 13, padding: 20 }}>
             No sessions yet
@@ -869,6 +925,34 @@ const itemStyle: React.CSSProperties = {
   marginBottom: 4,
   position: 'relative',
   transition: 'background 0.15s',
+};
+
+const groupHeaderStyle: React.CSSProperties = {
+  display: 'flex',
+  alignItems: 'center',
+  gap: 6,
+  padding: '6px 8px',
+  borderRadius: 6,
+  cursor: 'pointer',
+  color: 'var(--theme-text-muted, #656d76)',
+  background: 'var(--theme-bg-tertiary, #242536)',
+  marginBottom: 4,
+  marginTop: 6,
+  userSelect: 'none',
+  fontSize: 11,
+};
+
+const showMoreBtnStyle: React.CSSProperties = {
+  display: 'block',
+  width: '100%',
+  padding: '4px 0',
+  fontSize: 10.5,
+  color: 'var(--theme-accent, #7aa2f7)',
+  background: 'none',
+  border: 'none',
+  cursor: 'pointer',
+  textAlign: 'center',
+  marginBottom: 6,
 };
 
 const actionBtnStyle: React.CSSProperties = {

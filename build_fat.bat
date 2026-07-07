@@ -200,8 +200,6 @@ if exist "src-tauri\binaries\agent-with-u-backend-%TARGET_TRIPLE%.exe" (
     echo [WARN] Backend sidecar not found! Installer will be incomplete.
 )
 
-:: WebView2Loader
-copy /y "src-tauri\target\release\WebView2Loader.dll" "%STAGING%\" >nul 2>nul
 echo [OK] Artifacts staged
 
 :: ============================================================

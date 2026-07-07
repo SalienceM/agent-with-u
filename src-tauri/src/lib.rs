@@ -443,7 +443,31 @@ pub fn run() {
                                         sidecar.env("AGENT_WITH_U_DEVICE_NAME", device_name);
                                 }
                             }
-                            sidecar.spawn().ok();
+                            match sidecar.spawn() {
+                                Ok(_child) => {
+                                    eprintln!("[tauri] sidecar spawned successfully");
+                                }
+                                Err(e) => {
+                                    eprintln!("[tauri] sidecar spawn FAILED: {e}");
+                                    // 写一份到 backend.log，方便用户排查
+                                    if let Some(log_dir) = dirs::home_dir().map(|h| h.join(".agent-with-u")) {
+                                        let _ = std::fs::create_dir_all(&log_dir);
+                                        let log_path = log_dir.join("backend.log");
+                                        let msg = format!(
+                                            "[tauri] sidecar spawn failed: {e}\n\
+                                             This usually means the backend binary is missing or corrupted.\n\
+                                             Expected location: next to AgentWithU.exe\n\
+                                             Try reinstalling or check antivirus quarantine.\n"
+                                        );
+                                        use std::io::Write;
+                                        if let Ok(mut f) = std::fs::OpenOptions::new()
+                                            .create(true).append(true).open(&log_path)
+                                        {
+                                            let _ = f.write_all(msg.as_bytes());
+                                        }
+                                    }
+                                }
+                            }
                         }
                         Err(e) => {
                             eprintln!("[tauri] sidecar spawn failed: {e}");

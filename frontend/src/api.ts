@@ -86,6 +86,14 @@ type GitCommitMsgReadyCallback = (data: { workingDir: string; message: string; e
 let gitCommitMsgDeltaCallbacks: GitCommitMsgDeltaCallback[] = [];
 let gitCommitMsgReadyCallbacks: GitCommitMsgReadyCallback[] = [];
 
+// ── 自动 AI commit 结果事件 ─────────────────────────────────────
+type AutoCommitResultCallback = (data: {
+  sessionId: string; trigger: string; status: string;
+  message?: string; committed?: boolean; pushed?: boolean;
+  files?: number; error?: string;
+}) => void;
+let autoCommitResultCallbacks: AutoCommitResultCallback[] = [];
+
 function nextId() {
   return `r${++reqCounter}`;
 }
@@ -305,6 +313,9 @@ function handleMessage(e: MessageEvent) {
     } else if (msg.event === 'gitCommitMsgReady') {
       const data = JSON.parse(msg.data);
       gitCommitMsgReadyCallbacks.forEach((cb) => cb(data));
+    } else if (msg.event === 'autoCommitResult') {
+      const data = JSON.parse(msg.data);
+      autoCommitResultCallbacks.forEach((cb) => cb(data));
     }
   } catch (err) {
     console.error('[api] message parse error:', err);
@@ -903,7 +914,25 @@ export const api = {
       const s = JSON.parse(result);
       // 注入归属执行节点信息(后端的 session 对象本身没有),供目录同步等按节点路由。
       if (s && s.id) {
-        const c = pool.get(sessionExec.get(s.id) || homeConn.key);
+        const storedKey = sessionExec.get(s.id);
+        // ★ 修复：检查 storedKey 是否与当前 home 节点一致，避免跨环境切换时路由错误
+        // 例如：之前在远端直连时记录了 'local'（远端的本地），现在通过中继访问，
+        // 连接池中也有 'local'（本机的本地），但 session 实际属于远端节点。
+        let key = homeConn.key;
+        if (storedKey && pool.has(storedKey)) {
+          const storedConn = pool.get(storedKey);
+          // 如果 storedKey 是 'local' 但当前 home 不是本地连接，说明是跨环境残留记录
+          if (storedKey === 'local' && homeConn.key !== 'local') {
+            sessionExec.delete(s.id);
+            persistSessionExec();
+          } else if (storedConn) {
+            key = storedKey;
+          }
+        } else if (storedKey) {
+          sessionExec.delete(s.id);
+          persistSessionExec();
+        }
+        const c = pool.get(key);
         if (c) { s.execKey = c.key; s.execLabel = c.label; s.execMode = c.target.mode; s.execIsHome = c.isHome; }
       }
       return s;
@@ -1277,6 +1306,11 @@ export const api = {
     try { return JSON.parse(result); } catch { return { status: 'error' }; }
   },
 
+  async gitDiscard(workingDir: string, paths: string[], execKey?: string): Promise<{ status: string; discarded?: string[]; failed?: string[] }> {
+    const result = await callOn(execKey, 'gitDiscard', workingDir, JSON.stringify(paths));
+    try { return JSON.parse(result); } catch { return { status: 'error' }; }
+  },
+
   async gitCommit(workingDir: string, message: string, all: boolean = false, execKey?: string): Promise<GitCommitResult> {
     const result = await callOn(execKey, 'gitCommit', workingDir, message, all);
     try { return JSON.parse(result); } catch { return { status: 'error', commitHash: '', filesChanged: 0, insertions: 0, deletions: 0 }; }
@@ -1299,6 +1333,11 @@ export const api = {
 
   async gitBranchSwitch(workingDir: string, name: string, execKey?: string): Promise<{ status: string }> {
     const result = await callOn(execKey, 'gitBranchSwitch', workingDir, name);
+    try { return JSON.parse(result); } catch { return { status: 'error' }; }
+  },
+
+  async gitBranchDelete(workingDir: string, name: string, force: boolean = false, execKey?: string): Promise<{ status: string }> {
+    const result = await callOn(execKey, 'gitBranchDelete', workingDir, name, force);
     try { return JSON.parse(result); } catch { return { status: 'error' }; }
   },
 
@@ -1327,9 +1366,34 @@ export const api = {
     try { return JSON.parse(result); } catch { return { status: 'error' }; }
   },
 
+  async gitStashDrop(workingDir: string, index: number = 0, execKey?: string): Promise<{ status: string }> {
+    const result = await callOn(execKey, 'gitStashDrop', workingDir, index);
+    try { return JSON.parse(result); } catch { return { status: 'error' }; }
+  },
+
   async gitGenerateCommitMessage(workingDir: string, stagedOnly: boolean = true, execKey?: string): Promise<{ status: string; message?: string }> {
     const result = await callOn(execKey, 'gitGenerateCommitMessage', workingDir, stagedOnly);
     try { return JSON.parse(result); } catch { return { status: 'error' }; }
+  },
+
+  // ── 自动 AI commit ────────────────────────────────────────────
+  async setAutoCommit(sessionId: string, enabled: boolean, push: boolean = false, backendId: string = ''): Promise<{
+    status: string; autoCommit?: boolean; autoCommitPush?: boolean; autoCommitBackendId?: string | null;
+  }> {
+    const result = await call('setAutoCommit', sessionId, enabled, push, backendId);
+    try { return JSON.parse(result); } catch { return { status: 'error' }; }
+  },
+
+  async getAutoCommit(sessionId: string): Promise<{
+    autoCommit: boolean; autoCommitPush: boolean; autoCommitBackendId: string | null;
+  }> {
+    const result = await call('getAutoCommit', sessionId);
+    try { return JSON.parse(result); } catch { return { autoCommit: false, autoCommitPush: false, autoCommitBackendId: null }; }
+  },
+
+  onAutoCommitResult(cb: AutoCommitResultCallback): () => void {
+    autoCommitResultCallbacks.push(cb);
+    return () => { autoCommitResultCallbacks = autoCommitResultCallbacks.filter((c) => c !== cb); };
   },
 
   // ─ Git 事件订阅 ─────────────────────────────────────────────
