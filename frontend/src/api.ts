@@ -1322,9 +1322,19 @@ export const api = {
     try { return JSON.parse(result); } catch { return { status: 'error', commitHash: '', filesChanged: 0, insertions: 0, deletions: 0 }; }
   },
 
-  async gitLog(workingDir: string, maxCount: number = 50, offset: number = 0, execKey?: string): Promise<GitLogResult> {
-    const result = await callOn(execKey, 'gitLog', workingDir, maxCount, offset);
+  async gitLog(workingDir: string, maxCount: number = 50, offset: number = 0, execKey?: string, since?: string, until?: string): Promise<GitLogResult> {
+    const result = await callOn(execKey, 'gitLog', workingDir, maxCount, offset, since || '', until || '');
     try { return JSON.parse(result); } catch { return { commits: [], hasMore: false }; }
+  },
+
+  async gitShow(workingDir: string, commitHash: string, execKey?: string): Promise<{ message: string; stat: string; files: { path: string; status: string; added: number; deleted: number }[] }> {
+    const result = await callOn(execKey, 'gitShow', workingDir, commitHash);
+    try { return JSON.parse(result); } catch { return { message: '', stat: '', files: [] }; }
+  },
+
+  async gitCommitFileDiff(workingDir: string, commitHash: string, filePath: string, execKey?: string): Promise<{ diff: string; binary: boolean; error?: string }> {
+    const result = await callOn(execKey, 'gitCommitFileDiff', workingDir, commitHash, filePath);
+    try { return JSON.parse(result); } catch { return { diff: '', binary: false, error: '解析失败' }; }
   },
 
   async gitBranches(workingDir: string, execKey?: string): Promise<GitBranchesResult> {

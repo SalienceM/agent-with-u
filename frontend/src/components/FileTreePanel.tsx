@@ -18,6 +18,7 @@ import React, { useCallback, useEffect, useMemo, useState, useRef, lazy, Suspens
 import hljs from 'highlight.js';
 import { api } from '../api';
 import { markdownToHtml } from '../utils/markdown';
+import { GitPanel } from './GitPanel';
 import type { GitFileStatus, GitFileStatusType, GitStashEntry } from '../types/git';
 import { DiffViewer } from './DiffViewer';
 import {
@@ -164,6 +165,9 @@ export const FileTreePanel: React.FC<Props> = ({ workingDir, execKey, execLabel,
   const [diffPanelDiff, setDiffPanelDiff] = useState('');
   const [diffPanelLoading, setDiffPanelLoading] = useState(false);
   const [diffPanelAllFiles, setDiffPanelAllFiles] = useState<string[]>([]); // 所有变更文件（用于上/下一个切换）
+
+  // ── ★ Git Log 面板 ──
+  const [gitLogOpen, setGitLogOpen] = useState(false);
 
   // ── Stash 管理 ──
   const [stashes, setStashes] = useState<GitStashEntry[]>([]);
@@ -898,7 +902,15 @@ export const FileTreePanel: React.FC<Props> = ({ workingDir, execKey, execLabel,
             }}
             title="查看 Stash 列表"
             onClick={() => setStashExpanded((v) => !v)}
-          >📋{stashes.length > 0 && <span style={{ marginLeft: 2, fontSize: 10 }}>({stashes.length})</span>}</button>
+          >{stashes.length > 0 && <span style={{ marginLeft: 2, fontSize: 10 }}>({stashes.length})</span>}</button>
+        )}
+        {gitAvailable && (
+          <button
+            className="ftp-hbtn"
+            style={{ ...hdrIconStyle, fontSize: 11, width: 'auto', padding: '0 6px', gap: 3, display: 'inline-flex', alignItems: 'center' }}
+            title="查看 Git 提交历史"
+            onClick={() => setGitLogOpen(true)}
+          > Log</button>
         )}
         <div style={{ flex: 1 }} />
         <button className="ftp-hbtn" style={hdrIconStyle} title="刷新" onClick={reloadAll}>↻</button>
@@ -989,6 +1001,20 @@ export const FileTreePanel: React.FC<Props> = ({ workingDir, execKey, execLabel,
         <div style={{ padding: '6px 10px', fontSize: 11, color: 'var(--theme-text-muted)' }}>
           没有 stash
         </div>
+      )}
+
+      {/* ★ Git Log 面板 */}
+      {gitAvailable && (
+        <GitPanel
+          workingDir={workingDir}
+          execKey={execKey}
+          execLabel={execLabel}
+          execMode={execMode}
+          backendId={backendId}
+          open={gitLogOpen}
+          onClose={() => setGitLogOpen(false)}
+          onCommitComplete={() => { reloadAll(); }}
+        />
       )}
 
       {/* ★ Git 提交弹窗 — 变更列表 + 提交 */}
@@ -1268,7 +1294,7 @@ const gitModalOverlayStyle: React.CSSProperties = {
   background: 'rgba(0,0,0,0.55)', display: 'flex', alignItems: 'center', justifyContent: 'center',
 };
 const gitModalBoxStyle: React.CSSProperties = {
-  width: '78vw', maxWidth: 1100, height: '72vh',
+  width: '82vw', maxWidth: 1200, height: '82vh',
   background: '#161b22', borderRadius: 12, border: '1px solid rgba(255,255,255,0.1)',
   display: 'flex', flexDirection: 'column', overflow: 'hidden',
   boxShadow: '0 16px 48px rgba(0,0,0,0.5)',

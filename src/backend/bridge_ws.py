@@ -5472,14 +5472,20 @@ except urllib.error.URLError as e:
             "filesChanged": files_changed, "insertions": insertions, "deletions": deletions,
         }, ensure_ascii=False)
 
-    def _rpc_gitLog(self, working_dir: str, max_count: int = 50, offset: int = 0) -> str:
+    def _rpc_gitLog(self, working_dir: str, max_count: int = 50, offset: int = 0, since: str = "", until: str = "") -> str:
         """获取提交历史。"""
         import os
         if not working_dir or not os.path.isdir(working_dir) or not _git_is_repo(working_dir):
             return json.dumps({"commits": [], "hasMore": False})
         count = max_count + 1  # 多取一条判断 hasMore
         fmt = "%H%n%h%n%an%n%ae%n%aI%n%s%n%b%n---COMMIT_SEP---"
-        rc, out, _ = self._git_run(working_dir, ["log", f"--skip={offset}", f"-n{count}", f"--format={fmt}"], timeout=15)
+        args = ["log", f"--skip={offset}", f"-n{count}"]
+        if since:
+            args.append(f"--since={since}")
+        if until:
+            args.append(f"--until={until}")
+        args.append(f"--format={fmt}")
+        rc, out, _ = self._git_run(working_dir, args, timeout=15)
         if rc != 0:
             return json.dumps({"commits": [], "hasMore": False})
         commits = []
@@ -5499,6 +5505,79 @@ except urllib.error.URLError as e:
                 "body": "\n".join(lines[6:]).strip() if len(lines) > 6 else "",
             })
         return json.dumps({"commits": commits, "hasMore": has_more}, ensure_ascii=False)
+
+    def _rpc_gitShow(self, working_dir: str, commit_hash: str) -> str:
+        """获取 commit 的详细信息和文件变更列表。"""
+        import os, re
+        if not working_dir or not os.path.isdir(working_dir) or not _git_is_repo(working_dir):
+            return json.dumps({"error": "非 Git 仓库", "files": []})
+        # 获取 commit message
+        _, msg_out, _ = self._git_run(working_dir, ["log", "-1", "--format=%B", commit_hash], timeout=10)
+        # 获取 numstat（添加/删除行数）— 用 git show 对 root commit 也兼容
+        _, numstat_out, _ = self._git_run(working_dir, ["show", "--numstat", "--format=", commit_hash], timeout=10)
+
+        files = []
+        if numstat_out.strip():
+            for line in numstat_out.strip().splitlines():
+                # 跳过空行
+                if not line.strip():
+                    continue
+                parts = line.split("\t", 2)
+                if len(parts) == 3:
+                    added = int(parts[0]) if parts[0] != '-' else 0
+                    deleted = int(parts[1]) if parts[1] != '-' else 0
+                    path = parts[2]
+                    # 判断文件状态
+                    status = "modified"
+                    if added > 0 and deleted == 0:
+                        status = "added"
+                    elif added == 0 and deleted > 0:
+                        status = "deleted"
+                    # 处理 rename 路径格式 {old => new}
+                    if "{" in path and "=>" in path and "}" in path:
+                        status = "renamed"
+                        m = re.search(r'\{[^}]*=>\s*([^}]*)\}', path)
+                        if m:
+                            suffix = m.group(1)
+                            prefix = path[:path.index('{')]
+                            path = prefix + suffix if prefix else suffix
+                    files.append({"path": path, "status": status, "added": added, "deleted": deleted})
+
+        return json.dumps({
+            "message": msg_out.strip(),
+            "stat": "",
+            "files": files,
+        }, ensure_ascii=False)
+
+    def _rpc_gitCommitFileDiff(self, working_dir: str, commit_hash: str, file_path: str) -> str:
+        """获取 commit 中某个文件的 diff 内容（unified diff）。"""
+        import os
+        if not working_dir or not os.path.isdir(working_dir) or not _git_is_repo(working_dir):
+            return json.dumps({"diff": "", "binary": False, "error": "非 Git 仓库"})
+        if not file_path:
+            return json.dumps({"diff": "", "binary": False, "error": "未指定文件路径"})
+        # 检查是否为 root commit（无父提交）
+        _, parent_out, _ = self._git_run(
+            working_dir, ["rev-parse", "--verify", commit_hash + "^"],
+            timeout=5,
+        )
+        is_root = not parent_out.strip()
+        if is_root:
+            rc, diff_out, err = self._git_run(
+                working_dir,
+                ["show", "--format=", "--root", "--", file_path],
+                timeout=15,
+            )
+        else:
+            rc, diff_out, err = self._git_run(
+                working_dir,
+                ["diff", f"{commit_hash}^..{commit_hash}", "--", file_path],
+                timeout=15,
+            )
+        if rc != 0:
+            return json.dumps({"diff": "", "binary": False, "error": err.strip()})
+        is_binary = "Binary files" in diff_out
+        return json.dumps({"diff": diff_out, "binary": is_binary}, ensure_ascii=False)
 
     def _rpc_gitBranches(self, working_dir: str) -> str:
         """获取分支列表。"""
