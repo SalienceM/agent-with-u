@@ -12,6 +12,7 @@ interface Props {
   execKey?: string;
   execLabel?: string;
   execMode?: 'local' | 'relay';
+  backendId?: string;
   open: boolean;
   onClose: () => void;
   onCommitComplete?: () => void;
@@ -28,7 +29,7 @@ const STATUS_LABELS: Record<GitFileStatusType, string> = {
 };
 
 export const GitPanel: React.FC<Props> = ({
-  workingDir, execKey, execLabel, execMode, open, onClose, onCommitComplete,
+  workingDir, execKey, execLabel, execMode, backendId, open, onClose, onCommitComplete,
 }) => {
   const [tab, setTab] = useState<TabKey>('changes');
   const [files, setFiles] = useState<GitFileStatus[]>([]);
@@ -176,7 +177,7 @@ export const GitPanel: React.FC<Props> = ({
         setAiGenerating(false);
       }
     });
-    api.gitGenerateCommitMessage(workingDir, true, execKey).catch(() => {
+    api.gitGenerateCommitMessage(workingDir, true, execKey, backendId).catch(() => {
       setAiGenerating(false);
       showToast('AI 生成失败');
     });
@@ -188,7 +189,7 @@ export const GitPanel: React.FC<Props> = ({
     }, 30000);
     // 完成后清理
     setTimeout(() => { unsub1(); unsub2(); }, 35000);
-  }, [workingDir, execKey]);
+  }, [workingDir, execKey, backendId]);
 
   // Push / Pull
   const handlePush = useCallback(async () => {
@@ -364,13 +365,33 @@ export const GitPanel: React.FC<Props> = ({
             <div style={changesLayoutStyle}>
               {/* Left: file list */}
               <div style={fileListStyle}>
+                {/* Ready to Commit Summary Box - TortoiseGit style */}
+                {stagedFiles.length > 0 && (
+                  <div style={readyToCommitStyle}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 6 }}>
+                      <span style={{ fontSize: 14 }}>📦</span>
+                      <span style={{ fontSize: 13, fontWeight: 700, color: '#3fb950' }}>准备提交</span>
+                      <span style={{ fontSize: 11, color: 'var(--theme-text-muted, #8b949e)' }}>
+                        {stagedFiles.length} 个文件，
+                        +{stagedFiles.reduce((s, f) => s + (f.addedLines || 0), 0)} 行增加，
+                        -{stagedFiles.reduce((s, f) => s + (f.deletedLines || 0), 0)} 行删除
+                      </span>
+                    </div>
+                    <div style={{ fontSize: 11, color: 'var(--theme-text-muted, #8b949e)' }}>
+                      {ahead > 0 && <span style={{ color: '#3fb950', marginRight: 12 }}>⬆ {ahead} 个提交待推送</span>}
+                      {behind > 0 && <span style={{ color: '#1f6feb' }}>⬇ {behind} 个提交待拉取</span>}
+                      {ahead === 0 && behind === 0 && <span>与远端同步 ✓</span>}
+                    </div>
+                  </div>
+                )}
+
                 <div style={sectionHeaderStyle}>
                   <span
                     style={{ cursor: stagedFiles.length > 0 ? 'pointer' : 'default', userSelect: 'none', display: 'flex', alignItems: 'center', gap: 4 }}
                     onClick={() => stagedFiles.length > 0 && setStagedCollapsed((v) => !v)}
                   >
                     {stagedFiles.length > 0 && <span style={{ fontSize: 9, transition: 'transform 0.15s', transform: stagedCollapsed ? 'rotate(-90deg)' : 'rotate(0deg)', display: 'inline-block' }}>▾</span>}
-                    Staged ({stagedFiles.length}){(() => {
+                    <span style={{ color: '#3fb950', fontWeight: 700 }}>✓ Staged</span> <span style={{ color: 'var(--theme-text-muted, #8b949e)' }}>({stagedFiles.length})</span>{(() => {
                       const sa = stagedFiles.reduce((s, f) => s + (f.addedLines || 0), 0);
                       const sd = stagedFiles.reduce((s, f) => s + (f.deletedLines || 0), 0);
                       return sa || sd ? ` +${sa} -${sd}` : '';
@@ -384,13 +405,13 @@ export const GitPanel: React.FC<Props> = ({
                     onToggleStage={() => handleUnstage(f.path)}
                     onDiscard={() => handleDiscard(f.path)} />
                 ))}
-                <div style={{ ...sectionHeaderStyle, marginTop: 12 }}>
+                <div style={{ ...sectionHeaderStyle, marginTop: 16, paddingTop: 12, borderTop: '1px dashed var(--theme-border, rgba(255,255,255,0.1))' }}>
                   <span
                     style={{ cursor: unstagedFiles.length > 0 ? 'pointer' : 'default', userSelect: 'none', display: 'flex', alignItems: 'center', gap: 4 }}
                     onClick={() => unstagedFiles.length > 0 && setUnstagedCollapsed((v) => !v)}
                   >
                     {unstagedFiles.length > 0 && <span style={{ fontSize: 9, transition: 'transform 0.15s', transform: unstagedCollapsed ? 'rotate(-90deg)' : 'rotate(0deg)', display: 'inline-block' }}>▾</span>}
-                    Unstaged ({unstagedFiles.length}){(() => {
+                    <span style={{ color: '#e3b341', fontWeight: 700 }}>○ Unstaged</span> <span style={{ color: 'var(--theme-text-muted, #8b949e)' }}>({unstagedFiles.length})</span>{(() => {
                       const ua = unstagedFiles.reduce((s, f) => s + (f.addedLines || 0), 0);
                       const ud = unstagedFiles.reduce((s, f) => s + (f.deletedLines || 0), 0);
                       return ua || ud ? ` +${ua} -${ud}` : '';
@@ -703,6 +724,12 @@ const contentStyle: React.CSSProperties = {
 };
 const changesLayoutStyle: React.CSSProperties = {
   display: 'flex', flex: 1, overflow: 'hidden',
+};
+const readyToCommitStyle: React.CSSProperties = {
+  padding: '10px 12px', marginBottom: 12, borderRadius: 8,
+  background: 'linear-gradient(135deg, rgba(63,185,80,0.12) 0%, rgba(63,185,80,0.06) 100%)',
+  border: '1px solid rgba(63,185,80,0.25)',
+  boxShadow: '0 2px 8px rgba(63,185,80,0.08)',
 };
 const fileListStyle: React.CSSProperties = {
   width: 350, borderRight: '1px solid var(--theme-border, rgba(255,255,255,0.08))',

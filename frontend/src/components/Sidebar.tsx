@@ -40,10 +40,11 @@ interface Props {
   activeExecKey?: string;
   activeExecLabel?: string;
   activeExecMode?: 'local' | 'relay';
+  activeBackendId?: string;
 }
 
 // ★ Wrap with React.memo to prevent unnecessary re-renders when parent updates
-export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession, onNewSession, onDeleteSession, onAcknowledgeSession, streamingSessions, completedSessions = new Set(), collapsed, onToggleCollapse, isMobile, width, activeWorkingDir, activeExecKey, activeExecLabel, activeExecMode }) => {
+export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession, onNewSession, onDeleteSession, onAcknowledgeSession, streamingSessions, completedSessions = new Set(), collapsed, onToggleCollapse, isMobile, width, activeWorkingDir, activeExecKey, activeExecLabel, activeExecMode, activeBackendId }) => {
   const [sessions, setSessions] = useState<Session[]>([]);
   // ★ 侧栏视图：会话列表 / 文件目录树（本地 ⇄ 远端），左侧小按钮切换
   const [view, setView] = useState<'sessions' | 'files'>('sessions');
@@ -235,18 +236,21 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
 
   const pendingCount = completedSessions.size;
 
-  // ★ 按执行节点分组：本机 + 各远端节点（全局只保留最近 10 个 session）
+  // ★ 按执行节点分组：每个节点最多展示 MAX_PER_NODE 个 session（非全局共享配额）
+  const MAX_PER_NODE = 10;
   const groups = useMemo(() => {
-    const top10 = sessions.slice(0, 10);
     const map = new Map<string, { key: string; label: string; isHome: boolean; sessions: Session[] }>();
-    for (const s of top10) {
+    for (const s of sessions) {
       const key = s.execKey || 'local';
       const label = s.execMode === 'relay' ? (s.execLabel || key) : '本机';
       const isHome = s.execIsHome !== false;
       if (!map.has(key)) {
         map.set(key, { key, label, isHome, sessions: [] });
       }
-      map.get(key)!.sessions.push(s);
+      const grp = map.get(key)!;
+      if (grp.sessions.length < MAX_PER_NODE) {
+        grp.sessions.push(s);
+      }
     }
     // 本机在前，远端按 label 排序
     const arr = Array.from(map.values());
@@ -403,7 +407,7 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
         )}
       </div>
       {view === 'files' ? (
-        <FileTreePanel workingDir={activeWorkingDir || ''} execKey={activeExecKey} execLabel={activeExecLabel} execMode={activeExecMode} />
+        <FileTreePanel workingDir={activeWorkingDir || ''} execKey={activeExecKey} execLabel={activeExecLabel} execMode={activeExecMode} backendId={activeBackendId} />
       ) : (
       <div style={{ flex: 1, overflow: 'auto', padding: '4px 8px' }}>
         {groups.map(group => {
@@ -826,7 +830,8 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
     && prevProps.activeWorkingDir === nextProps.activeWorkingDir
     && prevProps.activeExecKey === nextProps.activeExecKey
     && prevProps.activeExecLabel === nextProps.activeExecLabel
-    && prevProps.activeExecMode === nextProps.activeExecMode;
+    && prevProps.activeExecMode === nextProps.activeExecMode
+    && prevProps.activeBackendId === nextProps.activeBackendId;
 });
 
 // Simple color mapping for backend badges

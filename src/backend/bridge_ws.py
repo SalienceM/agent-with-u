@@ -296,24 +296,169 @@ def git_snapshot(working_dir: Optional[str]) -> Optional[str]:
 
 
 def git_restore_snapshot(working_dir: Optional[str], snap_sha: Optional[str]) -> bool:
-    """把工作树恢复到 snap_sha 快照：还原被改动的文件、删除快照之后新建的未跟踪文件
-    （遵循 .gitignore，不删忽略文件），索引回到 HEAD（改动显示为未暂存）。"""
-    import subprocess
+    """把工作目录安全恢复到 snap_sha 快照状态。
+    ★ 改进：不再用 read-tree -u --reset + clean -fd 的危险组合（Windows 下 Vite 等进程
+    锁定文件时会导致 EPERM 文件丢失），改为逐文件提取 + 重试，单文件失败不影响其他文件。"""
+    import subprocess, os, time as _t
     if not working_dir or not snap_sha or not _git_is_repo(working_dir):
         return False
     try:
-        subprocess.run(["git", "read-tree", "-u", "--reset", snap_sha], cwd=working_dir,
-                       capture_output=True, text=True,
-                       encoding="utf-8", errors="replace", check=True)
-        subprocess.run(["git", "clean", "-fd"], cwd=working_dir,
-                       capture_output=True, text=True,
-                       encoding="utf-8", errors="replace", check=True)
+        # 1. 获取快照中的所有文件列表
+        ls_res = subprocess.run(
+            ["git", "ls-tree", "-r", "--name-only", snap_sha],
+            cwd=working_dir, capture_output=True, text=True,
+            encoding="utf-8", errors="replace", check=True,
+        )
+        snap_files = set(ls_res.stdout.strip().split("\n")) if ls_res.stdout.strip() else set()
+
+        # 2. 获取当前工作目录中的所有文件（tracked + untracked，排除 .git）
+        status_res = subprocess.run(
+            ["git", "ls-files", "--cached", "--others", "--exclude-standard"],
+            cwd=working_dir, capture_output=True, text=True,
+            encoding="utf-8", errors="replace",
+        )
+        current_files = set()
+        if status_res.returncode == 0 and status_res.stdout.strip():
+            current_files = set(status_res.stdout.strip().split("\n"))
+
+        # 3. 逐文件恢复：从快照提取内容写入工作目录（带重试，应对 Windows 文件锁）
+        restored = 0
+        failed = 0
+        for fpath in snap_files:
+            full_path = os.path.join(working_dir, fpath)
+            # 提取文件内容
+            show_res = subprocess.run(
+                ["git", "show", f"{snap_sha}:{fpath}"],
+                cwd=working_dir, capture_output=True,
+            )
+            if show_res.returncode != 0:
+                failed += 1
+                continue
+            # 写入文件（带重试，最多 3 次，间隔 0.3s）
+            parent = os.path.dirname(full_path)
+            if parent and not os.path.isdir(parent):
+                os.makedirs(parent, exist_ok=True)
+            for attempt in range(3):
+                try:
+                    with open(full_path, "wb") as fh:
+                        fh.write(show_res.stdout)
+                    restored += 1
+                    break
+                except (PermissionError, OSError):
+                    if attempt < 2:
+                        _t.sleep(0.3)
+                    else:
+                        failed += 1
+                        print(f"[loop] restore failed (locked?): {fpath}", file=sys.stderr, flush=True)
+
+        # 4. 删除快照中不存在的文件（loop 执行期间新建的文件）
+        new_files = current_files - snap_files
+        cleaned = 0
+        for fpath in new_files:
+            full_path = os.path.join(working_dir, fpath)
+            if not os.path.exists(full_path):
+                continue
+            for attempt in range(3):
+                try:
+                    if os.path.isfile(full_path) or os.path.islink(full_path):
+                        os.remove(full_path)
+                    elif os.path.isdir(full_path):
+                        import shutil
+                        shutil.rmtree(full_path, ignore_errors=True)
+                    cleaned += 1
+                    break
+                except (PermissionError, OSError):
+                    if attempt < 2:
+                        _t.sleep(0.3)
+                    else:
+                        print(f"[loop] clean failed (locked?): {fpath}", file=sys.stderr, flush=True)
+
+        # 5. 重置索引到 HEAD（改动显示为未暂存）
         subprocess.run(["git", "reset", "-q"], cwd=working_dir,
                        capture_output=True, text=True,
                        encoding="utf-8", errors="replace")
-        return True
+
+        print(f"[loop] restore: {restored} files restored, {cleaned} new files cleaned, {failed} failed",
+              file=sys.stderr, flush=True)
+        return failed == 0
     except Exception as e:
         print(f"[loop] git restore failed: {e}", file=sys.stderr, flush=True)
+        return False
+
+
+# ── 非 git 目录的文件备份/恢复 ──
+_DIR_SNAP_IGNORE = {"node_modules", "__pycache__", ".git", ".venv", "venv", "dist", ".next"}
+
+def dir_snapshot(working_dir: Optional[str]) -> Optional[str]:
+    """为非 git 工作目录创建文件快照（copytree 到临时目录）。返回备份路径；失败返回 None。"""
+    import shutil, tempfile, os
+    if not working_dir or not os.path.isdir(working_dir):
+        return None
+    try:
+        backup = tempfile.mkdtemp(prefix="awu_dir_snap_")
+        # 在 backup 内创建与 working_dir 同名的子目录，copytree 到此
+        target = os.path.join(backup, "workdir")
+
+        def _ignore(src, names):
+            return [n for n in names if n in _DIR_SNAP_IGNORE]
+
+        shutil.copytree(working_dir, target, ignore=_ignore, dirs_exist_ok=True)
+        return backup
+    except Exception as e:
+        print(f"[loop] dir snapshot failed: {e}", file=sys.stderr, flush=True)
+        return None
+
+
+def dir_restore(working_dir: Optional[str], backup_path: Optional[str]) -> bool:
+    """从 dir_snapshot 的备份恢复工作目录：覆盖已有文件、删除新增文件。"""
+    import shutil, os
+    if not working_dir or not backup_path or not os.path.isdir(backup_path):
+        return False
+    try:
+        source = os.path.join(backup_path, "workdir")
+        if not os.path.isdir(source):
+            return False
+
+        # 1. 从备份覆盖工作目录中的文件
+        for root, dirs, files in os.walk(source):
+            rel_root = os.path.relpath(root, source)
+            dest_root = os.path.join(working_dir, rel_root) if rel_root != "." else working_dir
+            os.makedirs(dest_root, exist_ok=True)
+            for fname in files:
+                src_file = os.path.join(root, fname)
+                dst_file = os.path.join(dest_root, fname)
+                try:
+                    shutil.copy2(src_file, dst_file)
+                except (PermissionError, OSError) as e:
+                    print(f"[loop] dir restore copy failed: {dst_file}: {e}", file=sys.stderr, flush=True)
+
+        # 2. 删除工作目录中备份里不存在的文件（loop 新建的）
+        snap_rel_files = set()
+        for root, dirs, files in os.walk(source):
+            rel_root = os.path.relpath(root, source)
+            for fname in files:
+                rel = os.path.join(rel_root, fname) if rel_root != "." else fname
+                snap_rel_files.add(rel)
+
+        for root, dirs, files in os.walk(working_dir):
+            # 跳过 .git 等目录
+            dirs[:] = [d for d in dirs if d not in _DIR_SNAP_IGNORE]
+            rel_root = os.path.relpath(root, working_dir)
+            for fname in files:
+                rel = os.path.join(rel_root, fname) if rel_root != "." else fname
+                if rel not in snap_rel_files:
+                    fpath = os.path.join(root, fname)
+                    try:
+                        os.remove(fpath)
+                    except (PermissionError, OSError):
+                        pass
+
+        # 3. 清理备份
+        shutil.rmtree(backup_path, ignore_errors=True)
+        print(f"[loop] dir restore: ok", file=sys.stderr, flush=True)
+        return True
+    except Exception as e:
+        print(f"[loop] dir restore failed: {e}", file=sys.stderr, flush=True)
         return False
 
 
@@ -1613,16 +1758,19 @@ class BridgeWS:
               file=sys.stderr, flush=True)
         return str(target)
 
-    # ★ 单节点 session 保留上限（每个执行节点按最近使用保留 MAX_SESSIONS_PER_NODE 个）
-    MAX_SESSIONS_PER_NODE = 10
+    # ★ 单执行节点(execKey) session 保留上限
+    # 每个后端进程 = 一个执行节点，session_store 只包含本节点的 session，
+    # 因此这里的全局上限天然就是 per-execKey 的。
+    MAX_SESSIONS_PER_EXEC_KEY = 10
 
     def _rpc_createSession(self, working_dir: str, backend_id: str,
                            session_type: str = "normal") -> str:
-        # ★ 超出上限时自动淘汰最旧的 session（按 updatedAt 升序 = 最近最少使用）
-        all_sessions = self._session_store.list()  # 已按 updatedAt 降序
-        if len(all_sessions) >= self.MAX_SESSIONS_PER_NODE:
+        # ★ 超出上限时自动淘汰本执行节点最旧的 session（按 updatedAt 升序 = 最近最少使用）
+        # 每个执行节点独立计算，互不影响
+        all_sessions = self._session_store.list()  # 已按 updatedAt 降序，仅含本节点
+        if len(all_sessions) >= self.MAX_SESSIONS_PER_EXEC_KEY:
             # 需要淘汰的 session（列表尾部 = 最旧/最少使用）
-            to_evict = all_sessions[self.MAX_SESSIONS_PER_NODE - 1:]
+            to_evict = all_sessions[self.MAX_SESSIONS_PER_EXEC_KEY - 1:]
             for old in to_evict:
                 sid = old.get("id")
                 if sid:
@@ -2140,10 +2288,11 @@ class BridgeWS:
         return json.dumps({"status": "ok" if ok else "error",
                            "message": "" if ok else "内置预设不可删除或不存在"}, ensure_ascii=False)
 
-    async def _rpc_loopRefineGoal(self, session_id: str, hint: str) -> str:
-        """按额外提示让模型微调全局目标（不需人工手编），并留下一版演变记录。"""
+    async def _rpc_loopRefineGoal(self, session_id: str, hint: str, images_json: str = "") -> str:
+        """按额外提示让模型微调全局目标（不需人工手编），并留下一版演变记录。可附带图片作为参考。"""
         h = (hint or "").strip()
-        if not h:
+        imgs = self._parse_images_json(images_json)
+        if not h and not imgs:
             return json.dumps({"status": "error", "message": "提示为空"}, ensure_ascii=False)
         session = self._active_sessions.get(session_id) or self._session_store.load(session_id)
         state = self._loop_state(session_id)
@@ -2156,10 +2305,11 @@ class BridgeWS:
             "一段话说清最终交付什么与成功标准。只输出微调后的目标本身，不要解释、不要前后缀。\n\n"
             f"【当前全局目标】\n{state.goal or '(空)'}\n\n"
             f"【最初的原始诉求】\n{ideas_text}\n\n"
-            f"【额外提示】\n{h}"
+            f"【额外提示】\n{h or '（用户未附文字，请参考图片）'}"
         )
         text, _ = await self._loop_run_agent(session, prompt, sub_stage="goal", seq=-1,
                                           resume=False, indep_session_id=f"{session_id}:goal",
+                                          images=imgs,
                                           backend_id=(state.policy.backend_for("goal") or None))
         refined = text.strip()
         state = self._loop_state(session_id) or state
@@ -2341,6 +2491,9 @@ class BridgeWS:
                 # ★ 版本隔离：开跑前快照 agent 上下文 + git 工作树，丢弃本次 loop 时回滚到这里
                 record.agent_checkpoint = session.agent_session_id or ""
                 record.git_checkpoint = git_snapshot(session.working_dir)
+                # 非 git 目录：用 Python 文件级备份作为替代
+                if not record.git_checkpoint:
+                    record.dir_checkpoint = dir_snapshot(session.working_dir)
                 state.loops.append(record)
                 self._loop_save(state)
                 self._emit_loop_updated(state)
@@ -2405,9 +2558,13 @@ class BridgeWS:
                 self._session_store.save(session, async_=False)
             except Exception:
                 pass
-        # ★ 文件级回滚（仅在用户确认 + 有 git 快照时）：把工作树恢复到开跑前
-        if restore_files and record.git_checkpoint and session is not None:
-            ok = git_restore_snapshot(session.working_dir, record.git_checkpoint)
+        # ★ 文件级回滚（仅在用户确认 + 有快照时）：把工作目录恢复到开跑前
+        if restore_files and session is not None:
+            ok = False
+            if record.git_checkpoint:
+                ok = git_restore_snapshot(session.working_dir, record.git_checkpoint)
+            elif record.dir_checkpoint:
+                ok = dir_restore(session.working_dir, record.dir_checkpoint)
             print(f"[loop] discard #{record.seq} file-restore: {'ok' if ok else 'failed/skipped'}",
                   file=sys.stderr, flush=True)
         # 兜底：若这次 loop 曾把全局阶段推进到 loopout 且本轮已无 loop，则退回 execute
@@ -5362,18 +5519,28 @@ except urllib.error.URLError as e:
             return json.dumps({"status": "error", "message": err.strip()})
         return json.dumps({"status": "ok"}, ensure_ascii=False)
 
-    async def _rpc_gitGenerateCommitMessage(self, working_dir: str, staged_only: bool = True) -> str:
+    async def _rpc_gitGenerateCommitMessage(self, working_dir: str, staged_only: bool = True, backend_id: str = "") -> str:
         """AI 生成 commit message：获取 diff → 调用独立 agent session → 流式推送。"""
         import os, re, uuid
         if not working_dir or not os.path.isdir(working_dir) or not _git_is_repo(working_dir):
             self._emit_event("gitCommitMsgReady", {"workingDir": working_dir, "message": "", "error": "非 Git 仓库"})
             return json.dumps({"status": "error", "message": "非 Git 仓库"})
-        # 获取 diff
+        # 获取 diff（staged_only 时先尝试 --cached，空则回退到全部改动）
         diff_args = ["diff", "--cached"] if staged_only else ["diff"]
         rc, diff_out, _ = self._git_run(working_dir, diff_args, timeout=15)
+        if staged_only and (rc != 0 or not diff_out.strip()):
+            # 回退：没有已暂存的内容时，用全部未暂存改动生成
+            diff_args = ["diff"]
+            rc, diff_out, _ = self._git_run(working_dir, diff_args, timeout=15)
         if rc != 0 or not diff_out.strip():
-            self._emit_event("gitCommitMsgReady", {"workingDir": working_dir, "message": "", "error": "没有可提交的改动"})
-            return json.dumps({"status": "ok", "message": ""})
+            # 最后尝试：也许所有文件都是 untracked（git diff 不含 untracked）
+            rc2, diff_out2, _ = self._git_run(working_dir, ["status", "--porcelain"], timeout=5)
+            if rc2 == 0 and diff_out2.strip():
+                # 有变更但是 untracked，用 status 作为 AI 参考
+                diff_out = f"新文件（untracked）：\n{diff_out2}"
+            else:
+                self._emit_event("gitCommitMsgReady", {"workingDir": working_dir, "message": "", "error": "没有可提交的改动"})
+                return json.dumps({"status": "ok", "message": ""})
         diff_text = diff_out[:50000]
         # 获取最近 commit 作为风格参考
         _, recent_log, _ = self._git_run(working_dir, ["log", "--oneline", "-5"], timeout=5)
@@ -5394,12 +5561,13 @@ except urllib.error.URLError as e:
         self._emit_event("gitCommitMsgDelta", {"workingDir": working_dir, "text": ""})
         try:
             backend = None
-            # 尝试用当前会话的 backend
-            if hasattr(self, "_current_backend_id") and self._current_backend_id:
+            # 优先使用前端传入的 backend_id（当前会话的 backend）
+            if backend_id:
                 try:
-                    backend = self._get_backend(self._current_backend_id)
+                    backend = self._get_backend(backend_id)
                 except Exception:
                     backend = None
+            # 回退：使用第一个可用 backend
             if backend is None and self._backend_configs:
                 try:
                     backend = self._get_backend(self._backend_configs[0].id)
@@ -5425,6 +5593,10 @@ except urllib.error.URLError as e:
                 )
                 backend.clear_cancelled(aside_sid)
                 message = "".join(parts).strip()
+                if not message:
+                    # AI 调用成功但没有产生任何文本 → 模型/凭证可能有问题
+                    self._emit_event("gitCommitMsgReady", {"workingDir": working_dir, "message": "", "error": "AI 未返回内容"})
+                    return json.dumps({"status": "error", "message": "AI 模型未生成任何内容，请检查模型配置和凭证是否有效"}, ensure_ascii=False)
                 # 清理可能的 markdown 代码块
                 message = re.sub(r"^```(?:commit|message)?\s*\n?", "", message)
                 message = re.sub(r"\n?```$", "", message)

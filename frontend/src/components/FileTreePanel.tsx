@@ -31,6 +31,7 @@ interface Props {
   execKey?: string;
   execLabel?: string;
   execMode?: 'local' | 'relay';   // 会话运行在哪：本机 / 远端中继节点
+  backendId?: string;             // ★ 当前会话的 backendId —— 供 AI 生成 commit message 使用
 }
 
 interface TNode { name: string; rel: string; isDir: boolean; size: number; }
@@ -114,7 +115,7 @@ interface PreviewState {
   loading: boolean; text?: string; dataUrl?: string; isImage?: boolean; isMarkdown?: boolean; error?: string;
 }
 
-export const FileTreePanel: React.FC<Props> = ({ workingDir, execKey, execLabel, execMode }) => {
+export const FileTreePanel: React.FC<Props> = ({ workingDir, execKey, execLabel, execMode, backendId }) => {
   const isRemote = execMode === 'relay';
 
   // 单树的懒加载层级缓存：key=rel → 直接子项
@@ -143,12 +144,18 @@ export const FileTreePanel: React.FC<Props> = ({ workingDir, execKey, execLabel,
   const gitPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   // ── ★ Git 快速操作状态 ──
-  const [gitCommitExpanded, setGitCommitExpanded] = useState(false);
+  // gitCommitExpanded removed — ✅ button now opens the modal dialog
   const [gitCommitMsg, setGitCommitMsg] = useState('');
   const [gitCommitting, setGitCommitting] = useState(false);
   const [gitPushing, setGitPushing] = useState(false);
   const [gitPulling, setGitPulling] = useState(false);
   const [gitAiGenerating, setGitAiGenerating] = useState(false);
+
+  // ── ★ Git 提交弹窗（TortoiseGit 风格宽弹窗）──
+  const [gitModalOpen, setGitModalOpen] = useState(false);
+  const [gitModalFile, setGitModalFile] = useState<string | null>(null);
+  const [gitModalDiff, setGitModalDiff] = useState('');
+  const [gitModalDiffLoading, setGitModalDiffLoading] = useState(false);
 
   // ── Stash 管理 ──
   const [stashes, setStashes] = useState<GitStashEntry[]>([]);
@@ -328,16 +335,39 @@ export const FileTreePanel: React.FC<Props> = ({ workingDir, execKey, execLabel,
     if (!workingDir) return;
     setGitAiGenerating(true);
     try {
-      const res = await api.gitGenerateCommitMessage(workingDir, true, execKey);
-      if (res.status === 'ok' && res.message) {
+      // ★ 传 stagedOnly=false，让后端三级回退（staged→all→untracked）自动选最优
+      const res = await api.gitGenerateCommitMessage(workingDir, false, execKey, backendId);
+      if (!res) {
+        setMsg({ kind: 'err', text: 'AI 生成失败：与后端连接断开，请检查后端是否运行中' });
+      } else if (res.status === 'ok' && res.message) {
         setGitCommitMsg(res.message);
+      } else if (res.status === 'ok') {
+        // 后端返回空消息 = 工作区没有任何可提交的变更
+        setMsg({ kind: 'err', text: '当前工作区没有检测到可提交的变更' });
       } else {
-        setMsg({ kind: 'err', text: 'AI 生成失败，请手动输入' });
+        // status === 'error'
+        setMsg({ kind: 'err', text: `AI 生成失败：${res.message || '未知错误，请检查后端日志'}` });
       }
     } catch (e: any) {
-      setMsg({ kind: 'err', text: `AI 生成失败：${e?.message ?? e}` });
+      setMsg({ kind: 'err', text: `AI 生成失败：${e?.message ?? String(e)}` });
     } finally {
       setGitAiGenerating(false);
+    }
+  }, [workingDir, execKey, backendId]);
+
+  /** ★ 弹窗内点击查看文件 → 加载 diff */
+  const handleModalSelectFile = useCallback(async (path: string, staged: boolean) => {
+    if (!workingDir) return;
+    setGitModalFile(path);
+    setGitModalDiffLoading(true);
+    setGitModalDiff('');
+    try {
+      const res = await api.gitDiff(workingDir, path, staged, execKey);
+      setGitModalDiff(res.diff || res.stat || '(binary file)');
+    } catch (e: any) {
+      setGitModalDiff(`加载失败：${e?.message ?? e}`);
+    } finally {
+      setGitModalDiffLoading(false);
     }
   }, [workingDir, execKey]);
 
@@ -354,7 +384,7 @@ export const FileTreePanel: React.FC<Props> = ({ workingDir, execKey, execLabel,
       if (res.status === 'ok') {
         setMsg({ kind: 'ok', text: `✓ 已提交: ${gitCommitMsg.trim().split('\n')[0]}` });
         setGitCommitMsg('');
-        setGitCommitExpanded(false);
+        setGitModalOpen(false);
       } else {
         setMsg({ kind: 'err', text: `提交失败：${(res as any).message || '未知错误'}` });
       }
@@ -709,25 +739,39 @@ export const FileTreePanel: React.FC<Props> = ({ workingDir, execKey, execLabel,
       {/* ★ Git 快速操作工具条 */}
       {gitAvailable && (
         <div style={gitToolbarStyle}>
-          {/* 状态摘要行 */}
+          {/* 状态摘要行 — TortoiseGit 风格醒目徽章 */}
           <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
-            {gitUnstagedCount > 0 && (
-              <span style={{ fontSize: 10, color: 'var(--theme-text-muted)' }}
-                title="未暂存变更">{gitUnstagedCount} 未暂存</span>
-            )}
             {gitStagedCount > 0 && (
-              <span style={{ fontSize: 10, color: '#3fb950' }}
-                title="已暂存变更">{gitStagedCount} 已暂存</span>
+              <span style={{
+                fontSize: 11, fontWeight: 600, color: '#3fb950',
+                background: 'rgba(63,185,80,0.15)', border: '1px solid rgba(63,185,80,0.3)',
+                padding: '1px 8px', borderRadius: 10,
+              }}
+                title="已暂存变更">✓ {gitStagedCount} 已暂存</span>
+            )}
+            {gitUnstagedCount > 0 && (
+              <span style={{
+                fontSize: 11, fontWeight: 600, color: '#e3b341',
+                background: 'rgba(227,179,65,0.12)', border: '1px solid rgba(227,179,65,0.25)',
+                padding: '1px 8px', borderRadius: 10,
+              }}
+                title="未暂存变更">○ {gitUnstagedCount} 未暂存</span>
             )}
             {gitStagedCount === 0 && gitUnstagedCount === 0 && (
-              <span style={{ fontSize: 10, color: 'var(--theme-text-muted)' }}>工作区干净</span>
+              <span style={{ fontSize: 11, color: 'var(--theme-text-muted)' }}>✓ 工作区干净</span>
             )}
             <div style={{ flex: 1 }} />
             {gitAhead > 0 && (
-              <span style={{ fontSize: 10, color: '#58a6ff' }} title="领先远端">⬆{gitAhead}</span>
+              <span style={{
+                fontSize: 11, fontWeight: 600, color: '#58a6ff',
+                background: 'rgba(88,166,255,0.12)', padding: '1px 6px', borderRadius: 8,
+              }} title="领先远端">⬆ {gitAhead}</span>
             )}
             {gitBehind > 0 && (
-              <span style={{ fontSize: 10, color: '#d29922' }} title="落后远端">⬇{gitBehind}</span>
+              <span style={{
+                fontSize: 11, fontWeight: 600, color: '#d29922',
+                background: 'rgba(210,153,34,0.12)', padding: '1px 6px', borderRadius: 8,
+              }} title="落后远端">⬇ {gitBehind}</span>
             )}
             {/* 快速按钮 */}
             {(gitUnstagedCount > 0 || gitStagedCount > 0) && (
@@ -742,46 +786,165 @@ export const FileTreePanel: React.FC<Props> = ({ workingDir, execKey, execLabel,
                 title="推送到远端">{gitPushing ? '⏳' : '⬆'} 推送</button>
             )}
             <button style={{
-              ...gitMiniBtn,
-              ...(gitCommitExpanded ? { background: 'var(--theme-accent-bg)', color: 'var(--theme-accent)' } : {}),
+              ...gitMiniBtn, fontWeight: 600,
+              ...(gitStagedCount > 0 || gitUnstagedCount > 0) ? { borderColor: 'rgba(63,185,80,0.3)', color: '#3fb950' } : {},
             }}
-              onClick={() => setGitCommitExpanded((v) => !v)}
+              onClick={() => setGitModalOpen(true)}
               title="提交变更">
-              ✅ 提交
+              ✅ 提交{(gitStagedCount + gitUnstagedCount) > 0 ? ` (${gitStagedCount + gitUnstagedCount})` : ''}
             </button>
           </div>
-          {/* 提交面板（展开时） */}
-          {gitCommitExpanded && (
-            <div style={gitCommitPanelStyle}>
-              <textarea
-                style={gitCommitInputStyle}
-                placeholder="输入 commit message…（可留空由 AI 生成）"
-                value={gitCommitMsg}
-                onChange={(e) => setGitCommitMsg(e.target.value)}
-                rows={2}
-              />
-              <div style={{ display: 'flex', gap: 4, marginTop: 4 }}>
-                <button style={gitCommitActionBtn} disabled={gitAiGenerating} onClick={handleAiGenerateMsg}
-                  title="AI 根据 diff 生成 commit message">
-                  {gitAiGenerating ? '⏳ 生成中…' : '✨ AI 生成'}
-                </button>
-                <div style={{ flex: 1 }} />
-                <button style={{
-                  ...gitCommitActionBtn,
-                  background: gitCommitMsg.trim() ? 'var(--theme-success, #22c55e)' : 'var(--theme-bg-tertiary)',
-                  color: gitCommitMsg.trim() ? '#fff' : 'var(--theme-text-muted)',
-                  cursor: gitCommitMsg.trim() ? 'pointer' : 'not-allowed',
-                }}
-                  disabled={!gitCommitMsg.trim() || gitCommitting}
-                  onClick={handleCommit}
-                  title={gitUnstagedCount > 0 ? '先暂存所有再提交' : '提交已暂存的变更'}>
-                  {gitCommitting ? '⏳' : '✅'} {gitUnstagedCount > 0 ? '暂存并提交' : '提交'}
-                </button>
-              </div>
-            </div>
-          )}
         </div>
       )}
+
+      {/* ★ Git 提交弹窗 — TortoiseGit 风格宽大弹窗 */}
+      {gitModalOpen && gitAvailable && (() => {
+        const stagedFiles = Object.entries(gitFiles).filter(([, gf]) => gf.staged);
+        const unstagedFiles = Object.entries(gitFiles).filter(([, gf]) => !gf.staged);
+        return (
+          <div style={gitModalOverlayStyle} onClick={() => setGitModalOpen(false)}>
+            <div style={gitModalBoxStyle} onClick={(e) => e.stopPropagation()}>
+              {/* 顶栏 */}
+              <div style={gitModalHeaderStyle}>
+                <span style={{ fontSize: 15 }}>📦</span>
+                <span style={{ fontSize: 14, fontWeight: 700, color: '#3fb950' }}>准备提交</span>
+                <span style={{ fontSize: 11, color: 'var(--theme-text-muted)', marginLeft: 8 }}>
+                  {stagedFiles.length} 已暂存 · {unstagedFiles.length} 未暂存
+                </span>
+                {gitAhead > 0 && (
+                  <span style={{ fontSize: 11, color: '#58a6ff', marginLeft: 10 }}>⬆ {gitAhead} 待推送</span>
+                )}
+                {gitBehind > 0 && (
+                  <span style={{ fontSize: 11, color: '#d29922', marginLeft: 6 }}>⬇ {gitBehind} 待拉取</span>
+                )}
+                <div style={{ flex: 1 }} />
+                <button style={gitModalCloseBtn} onClick={() => setGitModalOpen(false)}>✕</button>
+              </div>
+
+              {/* 主体：左文件列表 + 右 diff/提交 */}
+              <div style={gitModalBodyStyle}>
+                {/* 左：文件列表 */}
+                <div style={gitModalLeftStyle}>
+                  {/* 已暂存 */}
+                  <div style={{ marginBottom: 8 }}>
+                    <div style={gitModalSectionHeader('#3fb950')}>
+                      <span style={{ fontSize: 10 }}>✓</span> 已暂存 ({stagedFiles.length})
+                      <button style={gitModalStageAllBtn} onClick={async () => {
+                        if (!workingDir) return;
+                        await api.gitStage(workingDir, ['.'], execKey);
+                      }} title="暂存全部">📥+</button>
+                    </div>
+                    <div style={{ overflowY: 'auto', flex: 1 }}>
+                      {stagedFiles.map(([path, gf]) => (
+                        <div key={path}
+                          style={{
+                            ...gitModalFileItem,
+                            ...(gitModalFile === path ? { background: 'rgba(63,185,80,0.15)', borderLeftColor: '#3fb950' } : {}),
+                          }}
+                          onClick={() => handleModalSelectFile(path, true)}
+                          title={path}
+                        >
+                          <span style={gitModalStatusBadge(gf.status)}>{GIT_STATUS_LETTER[gf.status]}</span>
+                          <span style={gitModalFileName}>{path}</span>
+                          <button style={gitModalUnstageBtn} title="取消暂存"
+                            onClick={async (e) => {
+                              e.stopPropagation();
+                              if (!workingDir) return;
+                              await api.gitUnstage(workingDir, [path], execKey);
+                            }}>−</button>
+                        </div>
+                      ))}
+                      {stagedFiles.length === 0 && (
+                        <div style={{ fontSize: 11, color: 'var(--theme-text-muted)', padding: '8px 12px' }}>
+                          暂无已暂存文件
+                        </div>
+                      )}
+                    </div>
+                  </div>
+
+                  {/* 未暂存 */}
+                  <div style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
+                    <div style={gitModalSectionHeader('#e3b341')}>
+                      <span style={{ fontSize: 10 }}>○</span> 未暂存 ({unstagedFiles.length})
+                    </div>
+                    <div style={{ overflowY: 'auto', flex: 1 }}>
+                      {unstagedFiles.map(([path, gf]) => (
+                        <div key={path}
+                          style={{
+                            ...gitModalFileItem,
+                            ...(gitModalFile === path ? { background: 'rgba(227,179,65,0.12)', borderLeftColor: '#e3b341' } : {}),
+                          }}
+                          onClick={() => handleModalSelectFile(path, false)}
+                          title={path}
+                        >
+                          <span style={gitModalStatusBadge(gf.status)}>{GIT_STATUS_LETTER[gf.status]}</span>
+                          <span style={gitModalFileName}>{path}</span>
+                          <button style={gitModalStageBtn} title="暂存此文件"
+                            onClick={async (e) => {
+                              e.stopPropagation();
+                              if (!workingDir) return;
+                              await api.gitStage(workingDir, [path], execKey);
+                            }}>+</button>
+                        </div>
+                      ))}
+                      {unstagedFiles.length === 0 && (
+                        <div style={{ fontSize: 11, color: 'var(--theme-text-muted)', padding: '8px 12px' }}>
+                          暂无未暂存文件
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                </div>
+
+                {/* 右：diff 预览 + 提交区 */}
+                <div style={gitModalRightStyle}>
+                  {/* diff 预览 */}
+                  <div style={gitModalDiffArea}>
+                    {gitModalDiffLoading ? (
+                      <div style={{ fontSize: 12, color: 'var(--theme-text-muted)', padding: 20, textAlign: 'center' }}>加载中…</div>
+                    ) : gitModalDiff ? (
+                      <pre style={gitModalDiffPre}>{gitModalDiff}</pre>
+                    ) : gitModalFile ? (
+                      <div style={{ fontSize: 12, color: 'var(--theme-text-muted)', padding: 20, textAlign: 'center' }}>无差异内容</div>
+                    ) : (
+                      <div style={{ fontSize: 12, color: 'var(--theme-text-muted)', padding: 20, textAlign: 'center' }}>
+                        ← 点击文件查看 diff
+                      </div>
+                    )}
+                  </div>
+
+                  {/* 提交区 */}
+                  <div style={gitModalCommitArea}>
+                    <textarea
+                      style={gitModalTextareaStyle}
+                      placeholder="输入 commit message…（可留空由 AI 生成）"
+                      value={gitCommitMsg}
+                      onChange={(e) => setGitCommitMsg(e.target.value)}
+                      rows={3}
+                    />
+                    <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+                      <button style={gitModalAiBtn} disabled={gitAiGenerating} onClick={handleAiGenerateMsg}
+                        title="AI 根据 diff 生成 commit message">
+                        {gitAiGenerating ? '⏳ 生成中…' : '✨ AI 生成'}
+                      </button>
+                      <div style={{ flex: 1 }} />
+                      <button style={{
+                        ...gitModalCommitBtn,
+                        ...(gitCommitMsg.trim() ? {} : { opacity: 0.5, cursor: 'not-allowed' }),
+                      }}
+                        disabled={!gitCommitMsg.trim() || gitCommitting}
+                        onClick={handleCommit}
+                        title={unstagedFiles.length > 0 ? '自动暂存所有变更并提交' : '提交已暂存的变更'}>
+                        {gitCommitting ? '⏳ 提交中…' : `✅ ${unstagedFiles.length > 0 ? '暂存并提交' : '提交'}`}
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
 
       {/* 远端会话:本地副本 + 比对 提示条 */}
       {isRemote && (
@@ -1011,23 +1174,29 @@ const stashActionBtnStyle: React.CSSProperties = {
 
 // ── Git 快速操作工具条样式 ──
 const gitToolbarStyle: React.CSSProperties = {
-  padding: '4px 8px 6px',
-  borderBottom: '1px solid var(--theme-border, rgba(255,255,255,0.06))',
-  background: 'var(--theme-bg-secondary, rgba(0,0,0,0.15))',
+  padding: '6px 10px 8px',
+  borderBottom: '1px solid var(--theme-border, rgba(255,255,255,0.08))',
+  background: 'var(--theme-bg-secondary, rgba(0,0,0,0.2))',
 };
 const gitMiniBtn: React.CSSProperties = {
-  fontSize: 10, padding: '2px 6px', borderRadius: 4, cursor: 'pointer',
-  border: '1px solid var(--theme-border, rgba(255,255,255,0.1))',
+  fontSize: 11, padding: '3px 8px', borderRadius: 5, cursor: 'pointer',
+  border: '1px solid var(--theme-border, rgba(255,255,255,0.12))',
   background: 'var(--theme-bg, rgba(0,0,0,0.2))',
   color: 'var(--theme-text-muted, #8b949e)',
-  display: 'inline-flex', alignItems: 'center', gap: 2,
-  whiteSpace: 'nowrap',
+  display: 'inline-flex', alignItems: 'center', gap: 3,
+  whiteSpace: 'nowrap', transition: 'all 0.12s',
 };
 const gitCommitPanelStyle: React.CSSProperties = {
-  marginTop: 6, padding: 6,
-  background: 'var(--theme-bg, rgba(0,0,0,0.2))',
-  border: '1px solid var(--theme-border, rgba(255,255,255,0.08))',
-  borderRadius: 6,
+  marginTop: 8, padding: 10,
+  background: 'var(--theme-bg, rgba(0,0,0,0.25))',
+  border: '1px solid var(--theme-border, rgba(255,255,255,0.1))',
+  borderRadius: 8,
+};
+const gitReadyToCommitStyle: React.CSSProperties = {
+  padding: '10px 12px', marginBottom: 8, borderRadius: 8,
+  background: 'linear-gradient(135deg, rgba(63,185,80,0.14) 0%, rgba(63,185,80,0.05) 100%)',
+  border: '1px solid rgba(63,185,80,0.28)',
+  boxShadow: '0 1px 6px rgba(63,185,80,0.06)',
 };
 const gitCommitInputStyle: React.CSSProperties = {
   width: '100%', boxSizing: 'border-box',
@@ -1044,4 +1213,118 @@ const gitCommitActionBtn: React.CSSProperties = {
   background: 'var(--theme-bg-tertiary, rgba(255,255,255,0.05))',
   color: 'var(--theme-text-muted, #8b949e)',
   display: 'inline-flex', alignItems: 'center', gap: 3,
+};
+
+// ── Git 提交弹窗样式（TortoiseGit 风格宽弹窗）──
+const gitModalOverlayStyle: React.CSSProperties = {
+  position: 'fixed', inset: 0, zIndex: 10000,
+  background: 'rgba(0,0,0,0.55)', backdropFilter: 'blur(4px)',
+  display: 'flex', alignItems: 'center', justifyContent: 'center',
+};
+const gitModalBoxStyle: React.CSSProperties = {
+  width: '82vw', maxWidth: 1100, height: '72vh', maxHeight: 750,
+  background: 'var(--theme-bg-primary, #161b22)',
+  border: '1px solid var(--theme-border, rgba(255,255,255,0.12))',
+  borderRadius: 12, boxShadow: '0 8px 32px rgba(0,0,0,0.5)',
+  display: 'flex', flexDirection: 'column', overflow: 'hidden',
+};
+const gitModalHeaderStyle: React.CSSProperties = {
+  padding: '12px 16px',
+  borderBottom: '1px solid var(--theme-border, rgba(255,255,255,0.1))',
+  background: 'linear-gradient(135deg, rgba(63,185,80,0.08) 0%, transparent 60%)',
+  display: 'flex', alignItems: 'center', gap: 8,
+  flexShrink: 0,
+};
+const gitModalCloseBtn: React.CSSProperties = {
+  width: 28, height: 28, borderRadius: 6, border: 'none',
+  background: 'rgba(255,255,255,0.06)', color: 'var(--theme-text-muted, #8b949e)',
+  cursor: 'pointer', fontSize: 14, display: 'flex', alignItems: 'center', justifyContent: 'center',
+};
+const gitModalBodyStyle: React.CSSProperties = {
+  flex: 1, display: 'flex', minHeight: 0, overflow: 'hidden',
+};
+const gitModalLeftStyle: React.CSSProperties = {
+  width: 320, minWidth: 260, flexShrink: 0,
+  borderRight: '1px solid var(--theme-border, rgba(255,255,255,0.1))',
+  display: 'flex', flexDirection: 'column',
+  padding: '8px 0', overflow: 'hidden',
+};
+const gitModalSectionHeader = (color: string): React.CSSProperties => ({
+  fontSize: 11, fontWeight: 700, color,
+  padding: '6px 14px', display: 'flex', alignItems: 'center', gap: 5,
+  borderBottom: `1px solid ${color}22`,
+});
+const gitModalFileItem: React.CSSProperties = {
+  display: 'flex', alignItems: 'center', gap: 6,
+  padding: '5px 14px', cursor: 'pointer',
+  borderLeft: '3px solid transparent',
+  transition: 'background 0.1s',
+  fontSize: 12,
+};
+const gitModalStatusBadge = (status: GitFileStatusType): React.CSSProperties => ({
+  width: 18, height: 18, borderRadius: 4,
+  display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
+  fontSize: 9, fontWeight: 700, color: '#fff', flexShrink: 0,
+  background: GIT_STATUS_COLOR[status],
+});
+const gitModalFileName: React.CSSProperties = {
+  flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+  color: 'var(--theme-text, #c9d1d9)',
+};
+const gitModalStageBtn: React.CSSProperties = {
+  width: 20, height: 20, borderRadius: 4, border: '1px solid rgba(63,185,80,0.3)',
+  background: 'rgba(63,185,80,0.1)', color: '#3fb950',
+  cursor: 'pointer', fontSize: 12, display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
+  flexShrink: 0, padding: 0, lineHeight: 1,
+};
+const gitModalUnstageBtn: React.CSSProperties = {
+  width: 20, height: 20, borderRadius: 4, border: '1px solid rgba(248,81,73,0.3)',
+  background: 'rgba(248,81,73,0.1)', color: '#f85149',
+  cursor: 'pointer', fontSize: 12, display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
+  flexShrink: 0, padding: 0, lineHeight: 1,
+};
+const gitModalStageAllBtn: React.CSSProperties = {
+  marginLeft: 'auto', fontSize: 10, padding: '1px 6px', borderRadius: 4,
+  border: '1px solid rgba(63,185,80,0.3)', background: 'rgba(63,185,80,0.1)',
+  color: '#3fb950', cursor: 'pointer',
+};
+const gitModalRightStyle: React.CSSProperties = {
+  flex: 1, display: 'flex', flexDirection: 'column', minHeight: 0, overflow: 'hidden',
+};
+const gitModalDiffArea: React.CSSProperties = {
+  flex: 1, minHeight: 0, overflow: 'auto',
+  padding: '0', background: 'var(--theme-bg-secondary, rgba(0,0,0,0.2))',
+};
+const gitModalDiffPre: React.CSSProperties = {
+  margin: 0, padding: '12px 16px',
+  fontSize: 11, lineHeight: 1.6, fontFamily: "'Cascadia Code', 'Fira Code', 'JetBrains Mono', monospace",
+  color: 'var(--theme-text, #c9d1d9)',
+  whiteSpace: 'pre-wrap', wordBreak: 'break-all',
+};
+const gitModalCommitArea: React.CSSProperties = {
+  flexShrink: 0, padding: '10px 16px',
+  borderTop: '1px solid var(--theme-border, rgba(255,255,255,0.1))',
+  background: 'var(--theme-bg-primary, #161b22)',
+};
+const gitModalTextareaStyle: React.CSSProperties = {
+  width: '100%', boxSizing: 'border-box',
+  padding: '8px 10px', fontSize: 12, lineHeight: 1.5,
+  background: 'var(--theme-bg-secondary, rgba(0,0,0,0.2))',
+  border: '1px solid var(--theme-border, rgba(255,255,255,0.12))',
+  borderRadius: 6, color: 'var(--theme-text, #c9d1d9)',
+  resize: 'vertical', fontFamily: 'inherit',
+  outline: 'none', marginBottom: 8,
+};
+const gitModalAiBtn: React.CSSProperties = {
+  fontSize: 11, padding: '5px 12px', borderRadius: 6, cursor: 'pointer',
+  border: '1px solid rgba(168,85,247,0.3)',
+  background: 'rgba(168,85,247,0.12)', color: '#a855f7',
+  display: 'inline-flex', alignItems: 'center', gap: 4, fontWeight: 600,
+};
+const gitModalCommitBtn: React.CSSProperties = {
+  fontSize: 12, padding: '6px 18px', borderRadius: 6, cursor: 'pointer',
+  border: '1px solid rgba(63,185,80,0.4)',
+  background: 'linear-gradient(135deg, #22c55e 0%, #16a34a 100%)',
+  color: '#fff', fontWeight: 700,
+  display: 'inline-flex', alignItems: 'center', gap: 5,
 };

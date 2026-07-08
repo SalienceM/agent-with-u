@@ -103,6 +103,9 @@ class ClaudeCodeOfficialBackend(ModelBackend):
             # ★ 图片模式：通过 stdin 传入 stream-json 格式的多模态消息
             # --input-format stream-json 只在 --print/-p 模式下有效
             cmd.extend(["-p", "--input-format", "stream-json"])
+        elif len(content) > 8000:
+            # ★ 长文本（如 AI commit 的大量 diff）：通过 stdin 传递，避免 Windows 命令行长度限制
+            cmd.extend(["-p", "--input-format", "stream-json"])
         else:
             cmd.extend(["-p", content])
 
@@ -252,6 +255,15 @@ class ClaudeCodeOfficialBackend(ModelBackend):
             }) + "\n"
             _stdin_data = stdin_msg.encode("utf-8")
             print(f"[OfficialBackend] images: {len(content_blocks) - 1} block(s), using stdin stream-json",
+                  file=sys.stderr, flush=True)
+        elif len(final_content) > 8000:
+            # ★ 长文本通过 stdin 传递（避免 Windows 命令行 32K 字符限制）
+            stdin_msg = json.dumps({
+                "type": "user",
+                "message": {"role": "user", "content": [{"type": "text", "text": final_content}]},
+            }) + "\n"
+            _stdin_data = stdin_msg.encode("utf-8")
+            print(f"[OfficialBackend] long content ({len(final_content)} chars), using stdin stream-json",
                   file=sys.stderr, flush=True)
 
         cmd = self._build_cmd(final_content, agent_session_id, cwd, stdin_mode=bool(_stdin_data))

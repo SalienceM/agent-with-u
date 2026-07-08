@@ -954,7 +954,7 @@ export function useChat(sessionId: string, backendId: string, backends?: any[], 
             }
           });
           // 触发 AI 生成
-          await api.gitGenerateCommitMessage(wd, true, ek).catch((e: any) => {
+          await api.gitGenerateCommitMessage(wd, true, ek, backendId).catch((e: any) => {
             if (!resolved) { resolved = true; sys(`❌ AI 生成失败：${e?.message || e}`); }
           });
           // 30s 超时

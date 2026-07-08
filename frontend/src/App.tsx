@@ -766,6 +766,7 @@ export const App: React.FC = () => {
         activeExecKey={activeSession?.execKey}
         activeExecLabel={activeSession?.execLabel}
         activeExecMode={activeSession?.execMode}
+        activeBackendId={activeBackendId}
       />
 
       {/* 侧栏宽度拖拽手柄(桌面端展开时) */}

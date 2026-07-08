@@ -181,8 +181,8 @@ export const LoopPanel: React.FC<LoopPanelProps> = ({ sessionId, onClose, embedd
     await api.loopSetGoal(sessionId, goalDraft.trim());
   }, [sessionId, goalDraft]);
 
-  const refineGoal = useCallback(async (hint: string) => {
-    return api.loopRefineGoal(sessionId, hint);
+  const refineGoal = useCallback(async (hint: string, images?: ImageAttachment[]) => {
+    return api.loopRefineGoal(sessionId, hint, images);
   }, [sessionId]);
 
   // embedded = 作为会话内容内嵌（填满 pane，无浮层 backdrop）；否则浮层模式
@@ -807,7 +807,7 @@ const AddonHistoryCard: React.FC<{ addons: Addon[]; loops: LoopRecord[] }> = ({ 
 // ══ loopout 引导：本轮产出 + 开启新一轮 ════════════════════════
 const LoopOutBanner: React.FC<{
   state: LoopStateT; onContinue: (goal: string) => void; busy: boolean;
-  onRefineGoal: (hint: string) => Promise<{ status: string; goal?: string; message?: string }>;
+  onRefineGoal: (hint: string, images?: ImageAttachment[]) => Promise<{ status: string; goal?: string; message?: string }>;
 }> =
   ({ state, onContinue, busy, onRefineGoal }) => {
     const [goal, setGoal] = useState(state.goal || '');
@@ -926,32 +926,35 @@ const PolicyCard: React.FC<{ sessionId: string; policy?: LoopPolicy }> = ({ sess
 
 // 按提示让模型微调目标的输入框（GoalCard 与 loopout 新一轮共用）
 const RefineBox: React.FC<{
-  onRefineGoal: (hint: string) => Promise<{ status: string; goal?: string; message?: string }>;
+  onRefineGoal: (hint: string, images?: ImageAttachment[]) => Promise<{ status: string; goal?: string; message?: string }>;
   onResult?: (goal: string) => void;   // 拿到微调结果（loopout 用来同步本地草稿）
   onCancel: () => void;
 }> = ({ onRefineGoal, onResult, onCancel }) => {
   const [hint, setHint] = useState('');
   const [refining, setRefining] = useState(false);
+  const refineRef = useRef<HTMLTextAreaElement>(null);
+  const { images, removeImage, clearImages } = useClipboardImage(refineRef);
   const doRefine = async () => {
     const h = hint.trim();
-    if (!h) return;
+    if (!h && images.length === 0) return;
     setRefining(true);
-    const r = await onRefineGoal(h);
+    const r = await onRefineGoal(h, images.length ? images : undefined);
     setRefining(false);
-    if (r.status === 'ok') { if (r.goal) onResult?.(r.goal); setHint(''); onCancel(); }
+    if (r.status === 'ok') { if (r.goal) onResult?.(r.goal); setHint(''); clearImages(); onCancel(); }
     else if (r.message) alert(r.message);
   };
   return (
     <div className="awu-reveal" style={{ marginTop: 10, padding: 10, borderRadius: 8, background: 'var(--theme-bg-secondary)', border: '1px solid var(--theme-accent)' }}>
       <div style={{ fontSize: 11.5, color: 'var(--theme-text-muted)', marginBottom: 6, lineHeight: 1.5 }}>
-        给一句提示，由模型在「当前目标 + 原始诉求」基础上自动改写。例如「更强调性能」「缩小到只做后端」「把验收标准写细」。每次微调都会留一版历史。
+        给一句提示，由模型在「当前目标 + 原始诉求」基础上自动改写。支持贴图（Snipaste/粘贴）作为参考。每次微调都会留一版历史。
       </div>
-      <textarea value={hint} onChange={(e) => setHint(e.target.value)} disabled={refining}
+      <textarea ref={refineRef} autoFocus value={hint} onChange={(e) => setHint(e.target.value)} disabled={refining}
         onKeyDown={(e) => { if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') doRefine(); }}
-        placeholder="微调提示…（Ctrl/Cmd+Enter 提交）"
+        placeholder="微调提示…（可贴图，Ctrl/Cmd+Enter 提交）"
         style={{ ...inputBase, width: '100%', minHeight: 50, resize: 'vertical', opacity: refining ? 0.6 : 1 }} />
+      <ImagePreview images={images} onRemove={removeImage} />
       <div style={{ display: 'flex', gap: 8, marginTop: 8 }}>
-        <button onClick={doRefine} disabled={refining || !hint.trim()} style={{ ...primaryBtn, opacity: (refining || !hint.trim()) ? 0.5 : 1 }}>
+        <button onClick={doRefine} disabled={refining || (!hint.trim() && images.length === 0)} style={{ ...primaryBtn, opacity: (refining || (!hint.trim() && images.length === 0)) ? 0.5 : 1 }}>
           {refining ? '⏳ 微调中…' : '✨ 让模型微调'}
         </button>
         <button onClick={onCancel} disabled={refining} style={btn}>取消</button>
@@ -962,7 +965,7 @@ const RefineBox: React.FC<{
 
 const GoalCard: React.FC<{
   state: LoopStateT; isOut: boolean;
-  onRefineGoal: (hint: string) => Promise<{ status: string; goal?: string; message?: string }>;
+  onRefineGoal: (hint: string, images?: ImageAttachment[]) => Promise<{ status: string; goal?: string; message?: string }>;
   goalDraft: string; setGoalDraft: (v: string) => void; onSaveGoal: () => void;
 }> = ({ state, isOut, onRefineGoal, goalDraft, setGoalDraft, onSaveGoal }) => {
   const [mode, setMode] = useState<'view' | 'refine' | 'edit'>('view');
@@ -1073,7 +1076,7 @@ const ExecuteStage: React.FC<{
   onContinue: (goal: string) => void; onDiscard: () => void;
   running: boolean; busy: boolean;
   goalDraft: string; setGoalDraft: (v: string) => void; onSaveGoal: () => void;
-  onRefineGoal: (hint: string) => Promise<{ status: string; goal?: string; message?: string }>;
+  onRefineGoal: (hint: string, images?: ImageAttachment[]) => Promise<{ status: string; goal?: string; message?: string }>;
 }> = ({ state, progress, selectedSeq, setSelectedSeq, onRun, onAdvanceOut, onSetAuto, onAddAddon, onRemoveAddon, onEditAddon, onContinue, onDiscard, running, busy, goalDraft, setGoalDraft, onSaveGoal, onRefineGoal }) => {
   const isOut = state.stage === 'loopout';
   const selected = state.loops.find((l) => l.seq === selectedSeq) || null;

@@ -140,6 +140,9 @@ class LoopRecord:
     # ★ 文件级版本隔离：本次 loop 开跑前对 git 工作目录的非破坏性快照 commit sha。
     #   None=非 git 仓库/未快照。丢弃时经用户确认可据此把工作树恢复到开跑前。
     git_checkpoint: Optional[str] = None
+    # ★ 非 git 目录的文件级备份路径（dir_snapshot 创建的临时目录）。
+    #   None=未备份。丢弃时据此恢复文件。
+    dir_checkpoint: Optional[str] = None
     created_at: float = field(default_factory=_now)
     updated_at: float = field(default_factory=_now)
 
@@ -163,6 +166,7 @@ class LoopRecord:
             "backends": dict(self.backends or {}),
             "agentCheckpoint": self.agent_checkpoint,
             "gitCheckpoint": self.git_checkpoint,
+            "dirCheckpoint": self.dir_checkpoint,
             "hasGitCheckpoint": bool(self.git_checkpoint),
             "createdAt": self.created_at,
             "updatedAt": self.updated_at,
@@ -184,6 +188,7 @@ class LoopRecord:
             backends=dict(d.get("backends") or {}),
             agent_checkpoint=d.get("agentCheckpoint", None),
             git_checkpoint=d.get("gitCheckpoint", None),
+            dir_checkpoint=d.get("dirCheckpoint", None),
             created_at=d.get("createdAt", _now()),
             updated_at=d.get("updatedAt", _now()),
         )

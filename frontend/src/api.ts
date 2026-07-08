@@ -1033,8 +1033,9 @@ export const api = {
     try { return JSON.parse(result); } catch { return { status: 'error' }; }
   },
 
-  async loopRefineGoal(sessionId: string, hint: string): Promise<{ status: string; goal?: string; message?: string }> {
-    const result = await call('loopRefineGoal', sessionId, hint);
+  async loopRefineGoal(sessionId: string, hint: string, images?: any[]): Promise<{ status: string; goal?: string; message?: string }> {
+    const imagesJson = images && images.length ? JSON.stringify(images) : '';
+    const result = await call('loopRefineGoal', sessionId, hint, imagesJson);
     try { return JSON.parse(result); } catch { return { status: 'error', message: '响应解析失败' }; }
   },
 
@@ -1371,9 +1372,10 @@ export const api = {
     try { return JSON.parse(result); } catch { return { status: 'error' }; }
   },
 
-  async gitGenerateCommitMessage(workingDir: string, stagedOnly: boolean = true, execKey?: string): Promise<{ status: string; message?: string }> {
-    const result = await callOn(execKey, 'gitGenerateCommitMessage', workingDir, stagedOnly);
-    try { return JSON.parse(result); } catch { return { status: 'error' }; }
+  async gitGenerateCommitMessage(workingDir: string, stagedOnly: boolean = true, execKey?: string, backendId?: string): Promise<{ status: string; message?: string }> {
+    const result = await callOn(execKey, 'gitGenerateCommitMessage', workingDir, stagedOnly, backendId || '');
+    if (!result) return { status: 'error', message: '与后端连接断开，请确认后端正在运行' };
+    try { return JSON.parse(result); } catch { return { status: 'error', message: '响应解析失败' }; }
   },
 
   // ── 自动 AI commit ────────────────────────────────────────────
