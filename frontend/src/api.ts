@@ -1312,6 +1312,11 @@ export const api = {
     try { return JSON.parse(result); } catch { return { status: 'error' }; }
   },
 
+  async gitIgnore(workingDir: string, paths: string[], execKey?: string): Promise<{ status: string; ignored?: string[]; failed?: string[] }> {
+    const result = await callOn(execKey, 'gitIgnore', workingDir, JSON.stringify(paths));
+    try { return JSON.parse(result); } catch { return { status: 'error' }; }
+  },
+
   async gitCommit(workingDir: string, message: string, all: boolean = false, execKey?: string): Promise<GitCommitResult> {
     const result = await callOn(execKey, 'gitCommit', workingDir, message, all);
     try { return JSON.parse(result); } catch { return { status: 'error', commitHash: '', filesChanged: 0, insertions: 0, deletions: 0 }; }

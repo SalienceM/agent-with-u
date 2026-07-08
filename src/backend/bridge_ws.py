@@ -5315,6 +5315,58 @@ except urllib.error.URLError as e:
         status = "ok" if not failed else "partial"
         return json.dumps({"status": status, "discarded": discarded, "failed": failed}, ensure_ascii=False)
 
+    def _rpc_gitIgnore(self, working_dir: str, paths_json: str) -> str:
+        """将文件加入 .gitignore 并从 git 追踪中移除（如果是已跟踪文件）。"""
+        import os, json as _json
+        if not working_dir or not os.path.isdir(working_dir) or not _git_is_repo(working_dir):
+            return json.dumps({"status": "error", "message": "非 Git 仓库"})
+        try:
+            paths = _json.loads(paths_json)
+        except Exception:
+            return json.dumps({"status": "error", "message": "paths_json 格式错误"})
+        if not paths:
+            return json.dumps({"status": "ok"})
+        ignored = []
+        failed = []
+        # 1. 追加到 .gitignore
+        gitignore_path = os.path.join(working_dir, ".gitignore")
+        existing = set()
+        if os.path.exists(gitignore_path):
+            try:
+                with open(gitignore_path, "r", encoding="utf-8", errors="replace") as f:
+                    existing = {line.strip() for line in f if line.strip() and not line.startswith("#")}
+            except Exception:
+                pass
+        to_add = [p for p in paths if p not in existing]
+        if to_add:
+            try:
+                with open(gitignore_path, "a", encoding="utf-8") as f:
+                    # 确保换行分隔
+                    if existing:
+                        f.write("\n")
+                    for p in to_add:
+                        f.write(p + "\n")
+            except Exception as e:
+                print(f"[git] .gitignore write failed: {e}", file=sys.stderr, flush=True)
+                return json.dumps({"status": "error", "message": f".gitignore 写入失败: {e}"})
+        # 2. 从 git 追踪中移除（如果是已跟踪文件）
+        _, tracked_out, _ = self._git_run(working_dir, ["ls-files", "--", *paths], timeout=10)
+        tracked = [p for p in tracked_out.strip().splitlines() if p] if tracked_out.strip() else []
+        if tracked:
+            rc, _, err = self._git_run(working_dir, ["rm", "--cached", "--", *tracked], timeout=15)
+            if rc != 0:
+                print(f"[git] git rm --cached failed: {err}", file=sys.stderr, flush=True)
+                failed.extend(tracked)
+            else:
+                ignored.extend(tracked)
+        else:
+            ignored.extend(paths)
+        # 把非 tracked 的也算成功
+        for p in paths:
+            if p not in tracked and p not in failed:
+                ignored.append(p)
+        return json.dumps({"status": "ok", "ignored": list(set(ignored)), "failed": failed}, ensure_ascii=False)
+
     def _rpc_gitCommit(self, working_dir: str, message: str, all: bool = False) -> str:
         """提交改动。"""
         import os

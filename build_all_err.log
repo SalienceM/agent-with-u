@@ -1,0 +1,149 @@
+169 INFO: PyInstaller: 6.19.0, contrib hooks: 2026.3
+174 INFO: Python: 3.12.2
+215 INFO: Platform: Windows-2019Server-10.0.17763-SP0
+217 INFO: Python environment: C:\Users\Administrator\AppData\Local\Programs\Python\Python312
+220 INFO: wrote D:\project_agentwithu\agent-with-u-2.2\agent-with-u-backend.spec
+11152 INFO: Module search paths (PYTHONPATH):
+['D:\\project_agentwithu\\agent-with-u-2.2',
+ 'C:\\Users\\Administrator\\AppData\\Local\\Programs\\Python\\Python312\\python312.zip',
+ 'C:\\Users\\Administrator\\AppData\\Local\\Programs\\Python\\Python312\\DLLs',
+ 'C:\\Users\\Administrator\\AppData\\Local\\Programs\\Python\\Python312\\Lib',
+ 'C:\\Users\\Administrator\\AppData\\Local\\Programs\\Python\\Python312',
+ 'C:\\Users\\Administrator\\AppData\\Local\\Programs\\Python\\Python312\\Lib\\site-packages',
+ 'C:\\Users\\Administrator\\AppData\\Local\\Programs\\Python\\Python312\\Lib\\site-packages\\win32',
+ 'C:\\Users\\Administrator\\AppData\\Local\\Programs\\Python\\Python312\\Lib\\site-packages\\win32\\lib',
+ 'C:\\Users\\Administrator\\AppData\\Local\\Programs\\Python\\Python312\\Lib\\site-packages\\Pythonwin',
+ 'D:\\project_agentwithu\\agent-with-u-2.2']
+11846 INFO: Appending 'datas' from .spec
+11858 INFO: checking Analysis
+11860 INFO: Building Analysis because Analysis-00.toc is non existent
+11862 INFO: Looking for Python shared library...
+11865 INFO: Using Python shared library: C:\Users\Administrator\AppData\Local\Programs\Python\Python312\python312.dll
+11867 INFO: Running Analysis Analysis-00.toc
+11868 INFO: Target bytecode optimization level: 0
+11870 INFO: Initializing module dependency graph...
+11873 INFO: Initializing module graph hook caches...
+12065 INFO: Analyzing modules for base_library.zip ...
+13506 INFO: Processing standard module hook 'hook-heapq.py' from 'C:\\Users\\Administrator\\AppData\\Local\\Programs\\Python\\Python312\\Lib\\site-packages\\PyInstaller\\hooks'
+13628 INFO: Processing standard module hook 'hook-encodings.py' from 'C:\\Users\\Administrator\\AppData\\Local\\Programs\\Python\\Python312\\Lib\\site-packages\\PyInstaller\\hooks'
+16186 INFO: Processing standard module hook 'hook-pickle.py' from 'C:\\Users\\Administrator\\AppData\\Local\\Programs\\Python\\Python312\\Lib\\site-packages\\PyInstaller\\hooks'
+18538 INFO: Caching module dependency graph...
+18624 INFO: Analyzing D:\project_agentwithu\agent-with-u-2.2\ws_main_entry.py
+18820 INFO: Processing standard module hook 'hook-multiprocessing.util.py' from 'C:\\Users\\Administrator\\AppData\\Local\\Programs\\Python\\Python312\\Lib\\site-packages\\PyInstaller\\hooks'
+19057 INFO: Processing standard module hook 'hook-xml.py' from 'C:\\Users\\Administrator\\AppData\\Local\\Programs\\Python\\Python312\\Lib\\site-packages\\PyInstaller\\hooks'
+19547 INFO: Processing standard module hook 'hook-_ctypes.py' from 'C:\\Users\\Administrator\\AppData\\Local\\Programs\\Python\\Python312\\Lib\\site-packages\\PyInstaller\\hooks'
+20119 INFO: Processing standard module hook 'hook-websockets.py' from 'C:\\Users\\Administrator\\AppData\\Local\\Programs\\Python\\Python312\\Lib\\site-packages\\_pyinstaller_hooks_contrib\\stdhooks'
+20743 INFO: Processing standard module hook 'hook-platform.py' from 'C:\\Users\\Administrator\\AppData\\Local\\Programs\\Python\\Python312\\Lib\\site-packages\\PyInstaller\\hooks'
+21556 INFO: Processing pre-safe-import-module hook 'hook-typing_extensions.py' from 'C:\\Users\\Administrator\\AppData\\Local\\Programs\\Python\\Python312\\Lib\\site-packages\\PyInstaller\\hooks\\pre_safe_import_module'
+21560 INFO: SetuptoolsInfo: initializing cached setuptools info...
+22981 INFO: Processing standard module hook 'hook-cryptography.py' from 'C:\\Users\\Administrator\\AppData\\Local\\Programs\\Python\\Python312\\Lib\\site-packages\\_pyinstaller_hooks_contrib\\stdhooks'
+24743 INFO: hook-cryptography: cryptography does not seem to be using dynamically linked OpenSSL.
+25466 INFO: Processing standard module hook 'hook-sysconfig.py' from 'C:\\Users\\Administrator\\AppData\\Local\\Programs\\Python\\Python312\\Lib\\site-packages\\PyInstaller\\hooks'
+26328 INFO: Processing standard module hook 'hook-difflib.py' from 'C:\\Users\\Administrator\\AppData\\Local\\Programs\\Python\\Python312\\Lib\\site-packages\\PyInstaller\\hooks'
+27679 INFO: Processing standard module hook 'hook-certifi.py' from 'C:\\Users\\Administrator\\AppData\\Local\\Programs\\Python\\Python312\\Lib\\site-packages\\_pyinstaller_hooks_contrib\\stdhooks'
+27848 INFO: Processing standard module hook 'hook-anyio.py' from 'C:\\Users\\Administrator\\AppData\\Local\\Programs\\Python\\Python312\\Lib\\site-packages\\_pyinstaller_hooks_contrib\\stdhooks'
+29791 INFO: Processing pre-safe-import-module hook 'hook-importlib_metadata.py' from 'C:\\Users\\Administrator\\AppData\\Local\\Programs\\Python\\Python312\\Lib\\site-packages\\PyInstaller\\hooks\\pre_safe_import_module'
+29793 INFO: Setuptools: 'importlib_metadata' appears to be a setuptools-vendored copy - creating alias to 'setuptools._vendor.importlib_metadata'!
+29804 INFO: Processing standard module hook 'hook-setuptools.py' from 'C:\\Users\\Administrator\\AppData\\Local\\Programs\\Python\\Python312\\Lib\\site-packages\\PyInstaller\\hooks'
+29826 INFO: Processing pre-safe-import-module hook 'hook-distutils.py' from 'C:\\Users\\Administrator\\AppData\\Local\\Programs\\Python\\Python312\\Lib\\site-packages\\PyInstaller\\hooks\\pre_safe_import_module'
+29869 INFO: Processing pre-safe-import-module hook 'hook-jaraco.py' from 'C:\\Users\\Administrator\\AppData\\Local\\Programs\\Python\\Python312\\Lib\\site-packages\\PyInstaller\\hooks\\pre_safe_import_module'
+29871 INFO: Setuptools: 'jaraco' appears to be a full setuptools-vendored copy - creating alias to 'setuptools._vendor.jaraco'!
+29888 INFO: Processing pre-safe-import-module hook 'hook-more_itertools.py' from 'C:\\Users\\Administrator\\AppData\\Local\\Programs\\Python\\Python312\\Lib\\site-packages\\PyInstaller\\hooks\\pre_safe_import_module'
+29891 INFO: Setuptools: 'more_itertools' appears to be a setuptools-vendored copy - creating alias to 'setuptools._vendor.more_itertools'!
+30199 INFO: Processing pre-safe-import-module hook 'hook-packaging.py' from 'C:\\Users\\Administrator\\AppData\\Local\\Programs\\Python\\Python312\\Lib\\site-packages\\PyInstaller\\hooks\\pre_safe_import_module'
+30409 INFO: Processing standard module hook 'hook-setuptools._vendor.jaraco.text.py' from 'C:\\Users\\Administrator\\AppData\\Local\\Programs\\Python\\Python312\\Lib\\site-packages\\PyInstaller\\hooks'
+30414 INFO: Processing pre-safe-import-module hook 'hook-importlib_resources.py' from 'C:\\Users\\Administrator\\AppData\\Local\\Programs\\Python\\Python312\\Lib\\site-packages\\PyInstaller\\hooks\\pre_safe_import_module'
+30428 INFO: Processing pre-safe-import-module hook 'hook-backports.py' from 'C:\\Users\\Administrator\\AppData\\Local\\Programs\\Python\\Python312\\Lib\\site-packages\\PyInstaller\\hooks\\pre_safe_import_module'
+30430 INFO: Setuptools: 'backports' appears to be a full setuptools-vendored copy - creating alias to 'setuptools._vendor.backports'!
+31016 INFO: Processing pre-safe-import-module hook 'hook-tomli.py' from 'C:\\Users\\Administrator\\AppData\\Local\\Programs\\Python\\Python312\\Lib\\site-packages\\PyInstaller\\hooks\\pre_safe_import_module'
+31019 INFO: Setuptools: 'tomli' appears to be a setuptools-vendored copy - creating alias to 'setuptools._vendor.tomli'!
+31799 INFO: Processing pre-safe-import-module hook 'hook-wheel.py' from 'C:\\Users\\Administrator\\AppData\\Local\\Programs\\Python\\Python312\\Lib\\site-packages\\PyInstaller\\hooks\\pre_safe_import_module'
+31802 INFO: Setuptools: 'wheel' appears to be a setuptools-vendored copy - creating alias to 'setuptools._vendor.wheel'!
+31888 INFO: Processing standard module hook 'hook-setuptools._vendor.importlib_metadata.py' from 'C:\\Users\\Administrator\\AppData\\Local\\Programs\\Python\\Python312\\Lib\\site-packages\\PyInstaller\\hooks'
+31930 INFO: Processing pre-safe-import-module hook 'hook-zipp.py' from 'C:\\Users\\Administrator\\AppData\\Local\\Programs\\Python\\Python312\\Lib\\site-packages\\PyInstaller\\hooks\\pre_safe_import_module'
+31934 INFO: Setuptools: 'zipp' appears to be a setuptools-vendored copy - creating alias to 'setuptools._vendor.zipp'!
+31989 INFO: Processing standard module hook 'hook-pygments.py' from 'C:\\Users\\Administrator\\AppData\\Local\\Programs\\Python\\Python312\\Lib\\site-packages\\PyInstaller\\hooks'
+33851 INFO: Processing standard module hook 'hook-pydantic.py' from 'C:\\Users\\Administrator\\AppData\\Local\\Programs\\Python\\Python312\\Lib\\site-packages\\_pyinstaller_hooks_contrib\\stdhooks'
+35159 INFO: Processing standard module hook 'hook-zoneinfo.py' from 'C:\\Users\\Administrator\\AppData\\Local\\Programs\\Python\\Python312\\Lib\\site-packages\\_pyinstaller_hooks_contrib\\stdhooks'
+36654 INFO: Processing standard module hook 'hook-jsonschema.py' from 'C:\\Users\\Administrator\\AppData\\Local\\Programs\\Python\\Python312\\Lib\\site-packages\\_pyinstaller_hooks_contrib\\stdhooks'
+37088 INFO: Processing standard module hook 'hook-jsonschema_specifications.py' from 'C:\\Users\\Administrator\\AppData\\Local\\Programs\\Python\\Python312\\Lib\\site-packages\\_pyinstaller_hooks_contrib\\stdhooks'
+37190 INFO: Processing standard module hook 'hook-urllib3.py' from 'C:\\Users\\Administrator\\AppData\\Local\\Programs\\Python\\Python312\\Lib\\site-packages\\_pyinstaller_hooks_contrib\\stdhooks'
+37672 INFO: Processing standard module hook 'hook-charset_normalizer.py' from 'C:\\Users\\Administrator\\AppData\\Local\\Programs\\Python\\Python312\\Lib\\site-packages\\_pyinstaller_hooks_contrib\\stdhooks'
+38208 INFO: Processing standard module hook 'hook-pywintypes.py' from 'C:\\Users\\Administrator\\AppData\\Local\\Programs\\Python\\Python312\\Lib\\site-packages\\_pyinstaller_hooks_contrib\\stdhooks'
+39853 INFO: Processing standard module hook 'hook-uvicorn.py' from 'C:\\Users\\Administrator\\AppData\\Local\\Programs\\Python\\Python312\\Lib\\site-packages\\_pyinstaller_hooks_contrib\\stdhooks'
+44781 INFO: Processing standard module hook 'hook-PIL.py' from 'C:\\Users\\Administrator\\AppData\\Local\\Programs\\Python\\Python312\\Lib\\site-packages\\PyInstaller\\hooks'
+44957 INFO: Processing standard module hook 'hook-PIL.Image.py' from 'C:\\Users\\Administrator\\AppData\\Local\\Programs\\Python\\Python312\\Lib\\site-packages\\PyInstaller\\hooks'
+45585 INFO: Processing standard module hook 'hook-numpy.py' from 'C:\\Users\\Administrator\\AppData\\Local\\Programs\\Python\\Python312\\Lib\\site-packages\\PyInstaller\\hooks'
+48931 INFO: Processing standard module hook 'hook-xml.etree.cElementTree.py' from 'C:\\Users\\Administrator\\AppData\\Local\\Programs\\Python\\Python312\\Lib\\site-packages\\PyInstaller\\hooks'
+49188 INFO: Processing standard module hook 'hook-PIL.ImageFilter.py' from 'C:\\Users\\Administrator\\AppData\\Local\\Programs\\Python\\Python312\\Lib\\site-packages\\PyInstaller\\hooks'
+51574 INFO: Analyzing hidden import 'dashscope.api_entities.aiohttp_request'
+51588 INFO: Analyzing hidden import 'dashscope.assistants.files'
+51595 INFO: Analyzing hidden import 'dashscope.cli'
+51618 INFO: Analyzing hidden import 'dashscope.common.message_manager'
+51623 INFO: Analyzing hidden import 'dashscope.file'
+51629 INFO: Analyzing hidden import 'dashscope.models'
+51634 INFO: Analyzing hidden import 'dashscope.threads.messages.files'
+51640 INFO: Processing module hooks (post-graph stage)...
+52378 WARNING: Hidden import "tzdata" not found!
+52819 INFO: Processing standard module hook 'hook-PIL.SpiderImagePlugin.py' from 'C:\\Users\\Administrator\\AppData\\Local\\Programs\\Python\\Python312\\Lib\\site-packages\\PyInstaller\\hooks'
+56619 INFO: Performing binary vs. data reclassification (143 entries)
+56677 INFO: Looking for ctypes DLLs
+56755 INFO: Analyzing run-time hooks ...
+56771 INFO: Including run-time hook 'pyi_rth_inspect.py' from 'C:\\Users\\Administrator\\AppData\\Local\\Programs\\Python\\Python312\\Lib\\site-packages\\PyInstaller\\hooks\\rthooks'
+56782 INFO: Including run-time hook 'pyi_rth_cryptography_openssl.py' from 'C:\\Users\\Administrator\\AppData\\Local\\Programs\\Python\\Python312\\Lib\\site-packages\\_pyinstaller_hooks_contrib\\rthooks'
+56787 INFO: Including run-time hook 'pyi_rth_pkgutil.py' from 'C:\\Users\\Administrator\\AppData\\Local\\Programs\\Python\\Python312\\Lib\\site-packages\\PyInstaller\\hooks\\rthooks'
+56792 INFO: Including run-time hook 'pyi_rth_multiprocessing.py' from 'C:\\Users\\Administrator\\AppData\\Local\\Programs\\Python\\Python312\\Lib\\site-packages\\PyInstaller\\hooks\\rthooks'
+56798 INFO: Including run-time hook 'pyi_rth_setuptools.py' from 'C:\\Users\\Administrator\\AppData\\Local\\Programs\\Python\\Python312\\Lib\\site-packages\\PyInstaller\\hooks\\rthooks'
+56802 INFO: Including run-time hook 'pyi_rth_pywintypes.py' from 'C:\\Users\\Administrator\\AppData\\Local\\Programs\\Python\\Python312\\Lib\\site-packages\\_pyinstaller_hooks_contrib\\rthooks'
+56864 INFO: Creating base_library.zip...
+56906 INFO: Looking for dynamic libraries
+Could not find an up-to-date installation of `packaging`. License expressions might not be validated. To enforce validation, please install `packaging>=24.2`.
+60992 INFO: Extra DLL search directories (AddDllDirectory): ['C:\\Users\\Administrator\\AppData\\Local\\Programs\\Python\\Python312\\Lib\\site-packages\\numpy.libs']
+61008 INFO: Extra DLL search directories (PATH): []
+62551 INFO: Warnings written to D:\project_agentwithu\agent-with-u-2.2\build\agent-with-u-backend\warn-agent-with-u-backend.txt
+62954 INFO: Graph cross-reference written to D:\project_agentwithu\agent-with-u-2.2\build\agent-with-u-backend\xref-agent-with-u-backend.html
+63073 INFO: checking PYZ
+63076 INFO: Building PYZ because PYZ-00.toc is non existent
+63078 INFO: Building PYZ (ZlibArchive) D:\project_agentwithu\agent-with-u-2.2\build\agent-with-u-backend\PYZ-00.pyz
+65006 INFO: Building PYZ (ZlibArchive) D:\project_agentwithu\agent-with-u-2.2\build\agent-with-u-backend\PYZ-00.pyz completed successfully.
+65098 INFO: checking PKG
+65101 INFO: Building PKG because PKG-00.toc is non existent
+65105 INFO: Building PKG (CArchive) agent-with-u-backend.pkg
+78111 INFO: Building PKG (CArchive) agent-with-u-backend.pkg completed successfully.
+78131 INFO: Bootloader C:\Users\Administrator\AppData\Local\Programs\Python\Python312\Lib\site-packages\PyInstaller\bootloader\Windows-64bit-intel\run.exe
+78133 INFO: checking EXE
+78136 INFO: Building EXE because EXE-00.toc is non existent
+78137 INFO: Building EXE from EXE-00.toc
+78139 INFO: Copying bootloader EXE to D:\project_agentwithu\agent-with-u-2.2\dist\agent-with-u-backend.exe
+78152 INFO: Copying icon to EXE
+78163 INFO: Copying 0 resources to EXE
+78165 INFO: Embedding manifest in EXE
+78171 INFO: Appending PKG archive to EXE
+78214 INFO: Fixing EXE headers
+78915 INFO: Building EXE from EXE-00.toc completed successfully.
+78926 INFO: Build complete! The results are available in: D:\project_agentwithu\agent-with-u-2.2\dist
+        Info Looking up installed tauri packages to check mismatched versions...
+     Running beforeBuildCommand `cd frontend && npm run build`
+[33mThe CJS build of Vite's Node API is deprecated. See https://vite.dev/guide/troubleshooting.html#vite-cjs-node-api-deprecated for more details.[39m
+[1m[33m[plugin:vite:reporter][39m[22m [33m[plugin vite:reporter] 
+(!) D:/project_agentwithu/agent-with-u-2.2/frontend/src/utils/uuid.ts is dynamically imported by D:/project_agentwithu/agent-with-u-2.2/frontend/src/api.ts but also statically imported by D:/project_agentwithu/agent-with-u-2.2/frontend/src/hooks/useChat.ts, D:/project_agentwithu/agent-with-u-2.2/frontend/src/hooks/useClipboardImage.ts, dynamic import will not move module into another chunk.
+[39m
+[33m
+(!) Some chunks are larger than 500 kB after minification. Consider:
+- Using dynamic import() to code-split the application
+- Use build.rollupOptions.output.manualChunks to improve chunking: https://rollupjs.org/configuration-options/#output-manualchunks
+- Adjust chunk size limit for this warning via build.chunkSizeWarningLimit.[39m
+   Compiling agent-with-u v0.1.0 (D:\project_agentwithu\agent-with-u-2.2\src-tauri)
+    Finished `release` profile [optimized] target(s) in 2m 28s
+       Built application at: D:\project_agentwithu\agent-with-u-2.2\src-tauri\target\release\agent-with-u.exe
+        Info Patching D:\project_agentwithu\agent-with-u-2.2\src-tauri\target\release\agent-with-u.exe with bundle type information: msi
+        Info Target: x64
+     Running candle for "D:\\project_agentwithu\\agent-with-u-2.2\\src-tauri\\target\\release\\wix\\x64\\main.wxs"
+     Running light to produce D:\project_agentwithu\agent-with-u-2.2\src-tauri\target\release\bundle\msi\AgentWithU_26.7.7_x64_en-US.msi
+        Info Patching D:\project_agentwithu\agent-with-u-2.2\src-tauri\target\release\agent-with-u.exe with bundle type information: nsis
+        Info Target: x64
+     Running makensis to produce D:\project_agentwithu\agent-with-u-2.2\src-tauri\target\release\bundle\nsis\AgentWithU_26.7.7_x64-setup.exe
+    Finished 2 bundles at:
+        D:\project_agentwithu\agent-with-u-2.2\src-tauri\target\release\bundle\msi\AgentWithU_26.7.7_x64_en-US.msi
+        D:\project_agentwithu\agent-with-u-2.2\src-tauri\target\release\bundle\nsis\AgentWithU_26.7.7_x64-setup.exe
+

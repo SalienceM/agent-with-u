@@ -1,0 +1,80 @@
+
+ =============================================
+  AgentWithU -- Fat Installer Build
+  (含 Claude Code CLI + Node.js 运行时)
+ =============================================
+
+[INFO] Version: 26.7.7
+[OK] Tauri build exists
+
+[STEP 1] Preparing claude-env ...
+[OK] Portable Node.js already exists, skipping download
+[OK] Claude Code already installed, skipping
+[OK] Detected JS entry: cli-wrapper.cjs
+[GEN] Creating claude.cmd wrapper (node + JS) ...
+[OK] claude.cmd created
+
+[STEP 2] Collecting build artifacts ...
+        1 file(s) copied.
+        1 file(s) copied.
+[OK] Artifacts staged
+
+[STEP 3] Verifying claude-env contents ...
+[OK] claude-env verified (approx 554.188487052917 MB)
+
+[DIAG] Files in staging (_staging):
+agent-with-u-backend.exe
+AgentWithU.exe
+
+[DIAG] Files in claude-env (top level):
+claude.cmd
+node
+npm-global
+[DIAG] claude-env\node\node.exe size:
+  84456080 bytes
+[DIAG] claude-code package:
+  OK: package found
+cli-wrapper.cjs
+install.cjs
+
+[STEP 4] Compiling NSIS installer ...
+[OK] Found NSIS: C:\Users\Administrator\AppData\Local\tauri\NSIS\makensis.exe
+[INFO] NSIS log will be saved to: dist\nsis-build.log
+[OK] NSIS compile succeeded
+=== NSIS summary ===
+
+Section: "AgentWithU 主程序" ->(SEC_MAIN)
+SectionIn: [RO] 
+SectionEnd
+Section: "Claude Code CLI (含 Node.js 运行时)" ->(SEC_CLAUDE)
+File: Descending to: "claude-env\node\node_modules\npm\docs\output\"
+File: Descending to: "claude-env\node\node_modules\npm\docs\output\commands\"
+File: Descending to: "claude-env\node\node_modules\npm\docs\output\configuring-npm\"
+File: Descending to: "claude-env\node\node_modules\npm\docs\output\using-npm\"
+File: "output-error.js" 796 bytes
+File: "reify-output.js" 5987 bytes
+SectionEnd
+Section: "Uninstall"
+SectionEnd
+Processed 1 file, writing output (x86-unicode):
+Output: "D:\project_agentwithu\agent-with-u-2.2\dist\AgentWithU-26.7.7-setup.exe"
+Install: 5 pages (320 bytes), 2 sections (1 required) (4144 bytes), 3732 instructions (104496 bytes), 2001 strings (110
+136 bytes), 2 language tables (668 bytes).
+Uninstall: 2 pages (192 bytes), 1 section (2072 bytes), 86 instructions (2408 bytes), 157 strings (4436 bytes), 2 langu
+age tables (508 bytes).
+Total size:                124684611 / 395769546 bytes (31.5%)
+
+
+
+[INFO] Installer size: 118.908511161804 MB
+
+ =============================================
+  Done
+  dist\AgentWithU-26.7.7-setup.exe
+  Size: 118.908511161804 MB
+ =============================================
+
+ Lite installer (Tauri MSI):
+  src-tauri\target\release\bundle\msi\
+
+Press any key to continue . . . 

@@ -1,0 +1,13 @@
+
+ =============================================
+  AgentWithU -- Full Fat Build
+  PyInstaller + Tauri + Claude Code + NSIS
+  完整重建所有组件
+ =============================================
+
+[STEP 1/2] Running build_all.bat ...
+
+[INFO] Set CARGO_BUILD_JOBS=2 to reduce memory usage
+
+[FAILED] build_all.bat failed, aborting fat build
+Press any key to continue . . . 
