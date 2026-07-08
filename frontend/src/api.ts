@@ -1317,8 +1317,8 @@ export const api = {
     try { return JSON.parse(result); } catch { return { status: 'error' }; }
   },
 
-  async gitCommit(workingDir: string, message: string, all: boolean = false, execKey?: string): Promise<GitCommitResult> {
-    const result = await callOn(execKey, 'gitCommit', workingDir, message, all);
+  async gitCommit(workingDir: string, message: string, all: boolean = false, execKey?: string, onlyPaths?: string[]): Promise<GitCommitResult> {
+    const result = await callOn(execKey, 'gitCommit', workingDir, message, all, onlyPaths ? JSON.stringify(onlyPaths) : '');
     try { return JSON.parse(result); } catch { return { status: 'error', commitHash: '', filesChanged: 0, insertions: 0, deletions: 0 }; }
   },
 
@@ -1377,8 +1377,8 @@ export const api = {
     try { return JSON.parse(result); } catch { return { status: 'error' }; }
   },
 
-  async gitGenerateCommitMessage(workingDir: string, stagedOnly: boolean = true, execKey?: string, backendId?: string): Promise<{ status: string; message?: string }> {
-    const result = await callOn(execKey, 'gitGenerateCommitMessage', workingDir, stagedOnly, backendId || '');
+  async gitGenerateCommitMessage(workingDir: string, stagedOnly: boolean = true, execKey?: string, backendId?: string, onlyPaths?: string[]): Promise<{ status: string; message?: string }> {
+    const result = await callOn(execKey, 'gitGenerateCommitMessage', workingDir, stagedOnly, backendId || '', onlyPaths ? JSON.stringify(onlyPaths) : '');
     if (!result) return { status: 'error', message: '与后端连接断开，请确认后端正在运行' };
     try { return JSON.parse(result); } catch { return { status: 'error', message: '响应解析失败' }; }
   },

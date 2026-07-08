@@ -291,7 +291,6 @@ const dividerStyle: React.CSSProperties = {
 const scrollAreaStyle: React.CSSProperties = {
   flex: 1,
   overflow: 'auto',
-  lineHeight: 1.5,
 };
 
 const lineNumStyle: React.CSSProperties = {
@@ -306,8 +305,11 @@ const lineNumStyle: React.CSSProperties = {
   fontSize: 11,
 };
 
+const ROW_H = 18;
+
 const hunkHeaderStyle: React.CSSProperties = {
   display: 'flex',
+  minHeight: ROW_H,
   background: '#264f78',
   color: '#c9d1d9',
 };
@@ -317,10 +319,15 @@ const hunkContentStyle: React.CSSProperties = {
   color: '#6cb6ff',
   fontStyle: 'italic',
   fontSize: 11,
+  overflow: 'hidden',
+  textOverflow: 'ellipsis',
+  whiteSpace: 'pre',
+  flex: 1,
 };
 
 const oldLineStyle: React.CSSProperties = {
   display: 'flex',
+  minHeight: ROW_H,
   background: 'rgba(248, 81, 73, 0.1)',
 };
 
@@ -335,6 +342,7 @@ const oldContentStyle: React.CSSProperties = {
 
 const newLineStyle: React.CSSProperties = {
   display: 'flex',
+  minHeight: ROW_H,
   background: 'rgba(63, 185, 80, 0.1)',
 };
 
@@ -349,6 +357,7 @@ const newContentStyle: React.CSSProperties = {
 
 const sameLineStyle: React.CSSProperties = {
   display: 'flex',
+  minHeight: ROW_H,
   background: 'transparent',
 };
 
@@ -363,8 +372,8 @@ const sameContentStyle: React.CSSProperties = {
 
 const emptyLineStyle: React.CSSProperties = {
   display: 'flex',
+  minHeight: ROW_H,
   background: '#1e1e1e',
-  minHeight: 18,
 };
 
 const binaryContainerStyle: React.CSSProperties = {

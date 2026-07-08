@@ -5216,10 +5216,48 @@ except urllib.error.URLError as e:
         return "modified"
 
     def _rpc_gitDiff(self, working_dir: str, path: str = "", staged: bool = False) -> str:
-        """获取文件或全量 diff。"""
+        """获取文件或全量 diff。对于 untracked 文件使用 --no-index 生成 diff。"""
         import os
         if not working_dir or not os.path.isdir(working_dir) or not _git_is_repo(working_dir):
             return json.dumps({"diff": "", "stat": "", "binary": False, "error": "非 Git 仓库"})
+
+        # 如果是单个文件，先检查是否是 untracked
+        if path:
+            rc_s, out_s, _ = self._git_run(working_dir, ["status", "--porcelain", "--untracked-files=all", "--", path], timeout=10)
+            is_untracked = False
+            if rc_s == 0:
+                for line in out_s.splitlines():
+                    if len(line) >= 4 and line[:2] == "??":
+                        is_untracked = True
+                        break
+
+            if is_untracked:
+                # Untracked 文件：用 --no-index 对比 /dev/null 生成 diff
+                full_path = os.path.join(working_dir, path)
+                if not os.path.exists(full_path):
+                    return json.dumps({"diff": "", "stat": "", "binary": False, "error": "文件不存在"})
+                # 检查是否二进制
+                try:
+                    with open(full_path, 'rb') as f:
+                        chunk = f.read(8192)
+                    is_binary = b'\x00' in chunk
+                except Exception:
+                    is_binary = True
+
+                if is_binary:
+                    return json.dumps({"diff": "", "stat": f" {path} | Bin", "binary": True})
+
+                rc, diff_out, err = self._git_run(working_dir, ["diff", "--no-index", "/dev/null", path], timeout=15)
+                # --no-index 返回 1 表示有差异（正常）
+                if rc not in (0, 1):
+                    return json.dumps({"diff": "", "stat": "", "binary": False, "error": err.strip()})
+                # 生成 stat
+                with open(full_path, 'r', encoding='utf-8', errors='replace') as f:
+                    lines = f.readlines()
+                stat_out = f" {path} | {len(lines)} +"
+                return json.dumps({"diff": diff_out, "stat": stat_out.strip(), "binary": False}, ensure_ascii=False)
+
+        # 普通 diff 逻辑
         args = ["diff"]
         if staged:
             args.append("--cached")
@@ -5367,14 +5405,52 @@ except urllib.error.URLError as e:
                 ignored.append(p)
         return json.dumps({"status": "ok", "ignored": list(set(ignored)), "failed": failed}, ensure_ascii=False)
 
-    def _rpc_gitCommit(self, working_dir: str, message: str, all: bool = False) -> str:
-        """提交改动。"""
-        import os
+    def _rpc_gitCommit(self, working_dir: str, message: str, all: bool = False, only_paths_json: str = '') -> str:
+        """提交改动。only_paths_json 非空时只提交指定文件（先 add/rm 再 commit）。"""
+        import os, json as _json
         if not working_dir or not os.path.isdir(working_dir) or not _git_is_repo(working_dir):
             return json.dumps({"status": "error", "message": "非 Git 仓库", "commitHash": ""})
         args = ["commit", "-m", message]
         if all:
             args.insert(1, "-a")
+        # 指定文件提交：先把 untracked/deleted 文件加入索引，再 commit（指定路径时默认 only 行为）
+        if only_paths_json:
+            try:
+                only_paths = _json.loads(only_paths_json)
+                if only_paths:
+                    # 查询当前工作区状态，区分 untracked / deleted / 其它
+                    rc_s, out_s, _ = self._git_run(working_dir, ["status", "--porcelain", "--untracked-files=all"], timeout=10)
+                    status_map: dict[str, str] = {}
+                    if rc_s == 0:
+                        for line in out_s.splitlines():
+                            if len(line) >= 4:
+                                xy = line[:2]
+                                p  = line[3:]
+                                if xy[0] == "R" and " => " in p:
+                                    p = p.split(" => ", 1)[1]
+                                status_map[p] = self._xy_to_status(xy[0], xy[1])
+
+                    untracked = [p for p in only_paths if status_map.get(p) == "untracked"]
+                    deleted   = [p for p in only_paths if status_map.get(p) == "deleted"]
+                    regular   = [p for p in only_paths if p not in untracked and p not in deleted]
+
+                    # 新文件：git add 加入索引（检查返回值）
+                    if untracked:
+                        rc_add, _, err_add = self._git_run(working_dir, ["add", "--"] + untracked, timeout=15)
+                        if rc_add != 0:
+                            return json.dumps({"status": "error", "message": f"git add 失败：{err_add.strip()}", "commitHash": ""})
+                    # 已删除文件：git rm 记录删除
+                    if deleted:
+                        self._git_run(working_dir, ["rm", "--"] + deleted, timeout=15)
+                    # 其余修改文件：git add 确保最新改动入索引
+                    if regular:
+                        self._git_run(working_dir, ["add", "--"] + regular, timeout=15)
+
+                    # 指定路径时 git commit 默认就是 only 行为，无需 --only
+                    args.append("--")
+                    args.extend(only_paths)
+            except Exception as e:
+                return json.dumps({"status": "error", "message": f"解析文件列表失败：{str(e)}", "commitHash": ""})
         rc, _, err = self._git_run(working_dir, args, timeout=15)
         if rc != 0:
             return json.dumps({"status": "error", "message": err.strip(), "commitHash": ""})
@@ -5571,28 +5647,71 @@ except urllib.error.URLError as e:
             return json.dumps({"status": "error", "message": err.strip()})
         return json.dumps({"status": "ok"}, ensure_ascii=False)
 
-    async def _rpc_gitGenerateCommitMessage(self, working_dir: str, staged_only: bool = True, backend_id: str = "") -> str:
-        """AI 生成 commit message：获取 diff → 调用独立 agent session → 流式推送。"""
+    async def _rpc_gitGenerateCommitMessage(self, working_dir: str, staged_only: bool = True, backend_id: str = "", only_paths_json: str = "") -> str:
+        """AI 生成 commit message：获取 diff → 调用独立 agent session → 流式推送。
+        only_paths_json 非空时只分析勾选的文件。"""
         import os, re, uuid
         if not working_dir or not os.path.isdir(working_dir) or not _git_is_repo(working_dir):
             self._emit_event("gitCommitMsgReady", {"workingDir": working_dir, "message": "", "error": "非 Git 仓库"})
             return json.dumps({"status": "error", "message": "非 Git 仓库"})
-        # 获取 diff（staged_only 时先尝试 --cached，空则回退到全部改动）
-        diff_args = ["diff", "--cached"] if staged_only else ["diff"]
-        rc, diff_out, _ = self._git_run(working_dir, diff_args, timeout=15)
-        if staged_only and (rc != 0 or not diff_out.strip()):
-            # 回退：没有已暂存的内容时，用全部未暂存改动生成
-            diff_args = ["diff"]
-            rc, diff_out, _ = self._git_run(working_dir, diff_args, timeout=15)
-        if rc != 0 or not diff_out.strip():
-            # 最后尝试：也许所有文件都是 untracked（git diff 不含 untracked）
-            rc2, diff_out2, _ = self._git_run(working_dir, ["status", "--porcelain"], timeout=5)
-            if rc2 == 0 and diff_out2.strip():
-                # 有变更但是 untracked，用 status 作为 AI 参考
-                diff_out = f"新文件（untracked）：\n{diff_out2}"
-            else:
-                self._emit_event("gitCommitMsgReady", {"workingDir": working_dir, "message": "", "error": "没有可提交的改动"})
+
+        diff_out = ""
+        only_paths: list[str] = []
+        if only_paths_json:
+            try:
+                only_paths = json.loads(only_paths_json)
+            except Exception:
+                only_paths = []
+
+        if only_paths:
+            # ★ 只获取勾选文件的 diff
+            parts: list[str] = []
+            for path in only_paths:
+                # 检查是否是 untracked
+                rc_s, out_s, _ = self._git_run(working_dir, ["status", "--porcelain", "--untracked-files=all", "--", path], timeout=10)
+                is_untracked = False
+                if rc_s == 0:
+                    for line in out_s.splitlines():
+                        if len(line) >= 4 and line[:2] == "??":
+                            is_untracked = True
+                            break
+
+                if is_untracked:
+                    # Untracked 文件：用 --no-index 对比 /dev/null
+                    rc, d, _ = self._git_run(working_dir, ["diff", "--no-index", "/dev/null", path], timeout=15)
+                    if rc in (0, 1) and d:
+                        parts.append(d)
+                else:
+                    # 已跟踪文件：普通 diff
+                    rc, d, _ = self._git_run(working_dir, ["diff", "--", path], timeout=15)
+                    if rc == 0 and d:
+                        parts.append(d)
+                    else:
+                        # 回退：尝试 --cached
+                        rc2, d2, _ = self._git_run(working_dir, ["diff", "--cached", "--", path], timeout=15)
+                        if rc2 == 0 and d2:
+                            parts.append(d2)
+
+            diff_out = "\n".join(parts)
+            if not diff_out.strip():
+                # 勾选的文件都没有 diff（可能还没保存？）
+                self._emit_event("gitCommitMsgReady", {"workingDir": working_dir, "message": "", "error": "勾选的文件没有检测到变更"})
                 return json.dumps({"status": "ok", "message": ""})
+        else:
+            # 全量 diff（原有逻辑）
+            diff_args = ["diff", "--cached"] if staged_only else ["diff"]
+            rc, diff_out, _ = self._git_run(working_dir, diff_args, timeout=15)
+            if staged_only and (rc != 0 or not diff_out.strip()):
+                diff_args = ["diff"]
+                rc, diff_out, _ = self._git_run(working_dir, diff_args, timeout=15)
+            if rc != 0 or not diff_out.strip():
+                rc2, diff_out2, _ = self._git_run(working_dir, ["status", "--porcelain"], timeout=5)
+                if rc2 == 0 and diff_out2.strip():
+                    diff_out = f"新文件（untracked）：\n{diff_out2}"
+                else:
+                    self._emit_event("gitCommitMsgReady", {"workingDir": working_dir, "message": "", "error": "没有可提交的改动"})
+                    return json.dumps({"status": "ok", "message": ""})
+
         diff_text = diff_out[:50000]
         # 获取最近 commit 作为风格参考
         _, recent_log, _ = self._git_run(working_dir, ["log", "--oneline", "-5"], timeout=5)

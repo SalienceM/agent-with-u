@@ -179,6 +179,13 @@ export const FileTreePanel: React.FC<Props> = ({ workingDir, execKey, execLabel,
   const [dirty, setDirty] = useState(false);
   const [saving, setSaving] = useState(false);
 
+  // ── msg 自动消失（5 秒后清除）──
+  useEffect(() => {
+    if (!msg) return;
+    const t = setTimeout(() => setMsg(null), 5000);
+    return () => clearTimeout(t);
+  }, [msg]);
+
   // ── 懒加载工作目录某层 ──
   const loadChildren = useCallback(async (rel: string): Promise<void> => {
     if (!workingDir) return;
@@ -338,22 +345,21 @@ export const FileTreePanel: React.FC<Props> = ({ workingDir, execKey, execLabel,
     }
   }, [workingDir, execKey]);
 
-  /** AI 生成 commit message */
+  /** AI 生成 commit message（只分析勾选的文件） */
   const handleAiGenerateMsg = useCallback(async () => {
     if (!workingDir) return;
     setGitAiGenerating(true);
     try {
-      // ★ 传 stagedOnly=false，让后端三级回退（staged→all→untracked）自动选最优
-      const res = await api.gitGenerateCommitMessage(workingDir, false, execKey, backendId);
+      // ★ 传递勾选的文件列表，后端只分析这些文件的 diff
+      const selectedPaths = Array.from(gitSelected);
+      const res = await api.gitGenerateCommitMessage(workingDir, false, execKey, backendId, selectedPaths);
       if (!res) {
         setMsg({ kind: 'err', text: 'AI 生成失败：与后端连接断开，请检查后端是否运行中' });
       } else if (res.status === 'ok' && res.message) {
         setGitCommitMsg(res.message);
       } else if (res.status === 'ok') {
-        // 后端返回空消息 = 工作区没有任何可提交的变更
-        setMsg({ kind: 'err', text: '当前工作区没有检测到可提交的变更' });
+        setMsg({ kind: 'err', text: '勾选的文件没有检测到变更，请先选择要提交的文件' });
       } else {
-        // status === 'error'
         setMsg({ kind: 'err', text: `AI 生成失败：${res.message || '未知错误，请检查后端日志'}` });
       }
     } catch (e: any) {
@@ -361,7 +367,7 @@ export const FileTreePanel: React.FC<Props> = ({ workingDir, execKey, execLabel,
     } finally {
       setGitAiGenerating(false);
     }
-  }, [workingDir, execKey, backendId]);
+  }, [workingDir, execKey, backendId, gitSelected]);
 
   /** ★ 打开 Diff 面板（独立弹窗） */
   const openDiffPanel = useCallback(async (path: string, allFiles: string[]) => {
@@ -427,16 +433,18 @@ export const FileTreePanel: React.FC<Props> = ({ workingDir, execKey, execLabel,
     });
   }, [diffPanelFile, diffPanelAllFiles, workingDir, execKey, gitFiles]);
 
-  /** Commit（如果未暂存则先 stage all） */
+  /** Commit（只提交勾选的文件） */
   const handleCommit = useCallback(async () => {
     if (!workingDir || !gitCommitMsg.trim()) return;
     setGitCommitting(true);
     try {
-      // 如果有未暂存的变更，先 stage all
-      if (gitUnstagedCount > 0) {
-        await api.gitStage(workingDir, ['.'], execKey);
+      const selectedPaths = Array.from(gitSelected);
+      if (selectedPaths.length === 0) {
+        setMsg({ kind: 'err', text: '请至少选择一个文件' });
+        setGitCommitting(false);
+        return;
       }
-      const res = await api.gitCommit(workingDir, gitCommitMsg.trim(), false, execKey);
+      const res = await api.gitCommit(workingDir, gitCommitMsg.trim(), false, execKey, selectedPaths);
       if (res.status === 'ok') {
         setMsg({ kind: 'ok', text: `✓ 已提交: ${gitCommitMsg.trim().split('\n')[0]}` });
         setGitCommitMsg('');
@@ -449,18 +457,20 @@ export const FileTreePanel: React.FC<Props> = ({ workingDir, execKey, execLabel,
     } finally {
       setGitCommitting(false);
     }
-  }, [workingDir, execKey, gitCommitMsg, gitUnstagedCount]);
+  }, [workingDir, execKey, gitCommitMsg, gitSelected]);
 
   /** ★ 提交并推送（小乌龟风格一步到位） */
   const handleCommitAndPush = useCallback(async () => {
     if (!workingDir || !gitCommitMsg.trim()) return;
     setGitCommitting(true);
     try {
-      // 先 stage all（如果有未暂存的）
-      if (gitUnstagedCount > 0) {
-        await api.gitStage(workingDir, ['.'], execKey);
+      const selectedPaths = Array.from(gitSelected);
+      if (selectedPaths.length === 0) {
+        setMsg({ kind: 'err', text: '请至少选择一个文件' });
+        setGitCommitting(false);
+        return;
       }
-      const commitRes = await api.gitCommit(workingDir, gitCommitMsg.trim(), false, execKey);
+      const commitRes = await api.gitCommit(workingDir, gitCommitMsg.trim(), false, execKey, selectedPaths);
       if (commitRes.status === 'ok') {
         setMsg({ kind: 'ok', text: `✓ 已提交: ${gitCommitMsg.trim().split('\n')[0]}` });
         setGitCommitMsg('');
@@ -480,7 +490,7 @@ export const FileTreePanel: React.FC<Props> = ({ workingDir, execKey, execLabel,
     } finally {
       setGitCommitting(false);
     }
-  }, [workingDir, execKey, gitCommitMsg, gitUnstagedCount]);
+  }, [workingDir, execKey, gitCommitMsg, gitSelected]);
 
   // ── ★ 多选 + 批量操作 ──
   const toggleFileSelection = useCallback((path: string) => {
@@ -846,6 +856,21 @@ export const FileTreePanel: React.FC<Props> = ({ workingDir, execKey, execLabel,
         .ftp-hdr:hover .ftp-hbtn { opacity: 1; }
       `}</style>
 
+      {/* ★ 消息提示条（面板级） */}
+      {msg && !gitModalOpen && (
+        <div style={{
+          padding: '5px 12px', fontSize: 11, fontWeight: 500,
+          background: msg.kind === 'err' ? 'rgba(248,81,73,0.12)' : 'rgba(63,185,80,0.12)',
+          color: msg.kind === 'err' ? '#f85149' : '#3fb950',
+          display: 'flex', alignItems: 'center', gap: 4, flexShrink: 0,
+        }}>
+          <span>{msg.kind === 'err' ? '❌' : '✅'}</span>
+          <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{msg.text}</span>
+          <button style={{ border: 'none', background: 'transparent', color: 'inherit', cursor: 'pointer', fontSize: 11, padding: 0 }}
+            onClick={() => setMsg(null)}>✕</button>
+        </div>
+      )}
+
       {/* 顶部工具条 */}
       <div className="ftp-hdr" style={topBarStyle}>
         <span style={{ fontSize: 14 }}>{isRemote ? '☁️' : '🗂'}</span>
@@ -941,9 +966,37 @@ export const FileTreePanel: React.FC<Props> = ({ workingDir, execKey, execLabel,
         </div>
       )}
 
+      {/* ★ 文件树滚动区 */}
+      <div style={treeScrollStyle}>
+        {renderDir('', 0)}
+      </div>
+
+      {/* ★ Stash 列表 */}
+      {stashExpanded && stashes.length > 0 && (
+        <div style={stashListStyle}>
+          {stashes.map((s, i) => (
+            <div key={s.hash || i} style={stashItemStyle}>
+              <span style={{ flex: 1, fontSize: 11, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                {s.message || s.hash?.slice(0, 7) || `stash@{${i}}`}
+              </span>
+              <button style={stashBtnStyle} title="应用此 stash (pop)" onClick={() => handleStashPop(i)}>✅</button>
+              <button style={stashBtnStyle} title="删除此 stash (drop)" onClick={() => handleStashDrop(i)}>🗑</button>
+            </div>
+          ))}
+        </div>
+      )}
+      {stashExpanded && stashes.length === 0 && !stashesLoading && (
+        <div style={{ padding: '6px 10px', fontSize: 11, color: 'var(--theme-text-muted)' }}>
+          没有 stash
+        </div>
+      )}
+
       {/* ★ Git 提交弹窗 — 变更列表 + 提交 */}
       {gitModalOpen && gitAvailable && (() => {
         const allFiles = Object.entries(gitFiles).sort(([a], [b]) => a.localeCompare(b));
+        // 分成已跟踪和未跟踪两组
+        const trackedFiles = allFiles.filter(([_, gf]) => gf.status !== 'untracked');
+        const untrackedFiles = allFiles.filter(([_, gf]) => gf.status === 'untracked');
         const totalFiles = allFiles.length;
         const selectedCount = gitSelected.size;
         const allSelected = totalFiles > 0 && selectedCount === totalFiles;
@@ -965,13 +1018,31 @@ export const FileTreePanel: React.FC<Props> = ({ workingDir, execKey, execLabel,
                   <span style={{ fontSize: 11, color: '#d29922', marginLeft: 6 }}> {gitBehind} 待拉取</span>
                 )}
                 <div style={{ flex: 1 }} />
-                {/* 全选/取消全选 */}
-                <button style={gitModalStageAllBtn} onClick={allSelected ? deselectAllFiles : selectAllFiles}
-                  title={allSelected ? '取消全选' : '全选所有文件'}>
-                  {allSelected ? '☑ 取消全选' : '☐ 全选'}
-                </button>
+                {/* 全选/取消全选（有文件时才显示） */}
+                {totalFiles > 0 && (
+                  <button style={gitModalStageAllBtn} onClick={allSelected ? deselectAllFiles : selectAllFiles}
+                    title={allSelected ? '取消全选' : '全选所有文件'}>
+                    {allSelected ? '☑ 取消全选' : '☐ 全选'}
+                  </button>
+                )}
                 <button style={gitModalCloseBtn} onClick={() => { setGitModalOpen(false); deselectAllFiles(); }}>✕</button>
               </div>
+
+              {/* ★ 消息提示条 */}
+              {msg && (
+                <div style={{
+                  padding: '6px 16px', fontSize: 12, fontWeight: 500,
+                  background: msg.kind === 'err' ? 'rgba(248,81,73,0.12)' : 'rgba(63,185,80,0.12)',
+                  color: msg.kind === 'err' ? '#f85149' : '#3fb950',
+                  borderBottom: '1px solid ' + (msg.kind === 'err' ? 'rgba(248,81,73,0.2)' : 'rgba(63,185,80,0.2)'),
+                  display: 'flex', alignItems: 'center', gap: 6,
+                }}>
+                  <span>{msg.kind === 'err' ? '❌' : '✅'}</span>
+                  <span style={{ flex: 1 }}>{msg.text}</span>
+                  <button style={{ border: 'none', background: 'transparent', color: 'inherit', cursor: 'pointer', fontSize: 12, padding: 0 }}
+                    onClick={() => setMsg(null)}>✕</button>
+                </div>
+              )}
 
               {/* ★ 批量操作栏（有选中项时显示） */}
               {selectedCount > 0 && (
@@ -989,69 +1060,101 @@ export const FileTreePanel: React.FC<Props> = ({ workingDir, execKey, execLabel,
 
               {/* 主体：左文件列表 + 右提交区 */}
               <div style={gitModalBodyStyle}>
-                {/* 左：文件列表（单列表，不区分暂存/未暂存） */}
+                {/* 左：文件列表（分已跟踪/未跟踪两组） */}
                 <div style={gitModalLeftStyle}>
-                  <div style={{ fontSize: 11, fontWeight: 700, color: '#c9d1d9', padding: '6px 14px', borderBottom: '1px solid rgba(255,255,255,0.08)' }}>
-                    变更文件 ({totalFiles})
-                    <span style={{ fontSize: 10, color: 'var(--theme-text-muted)', marginLeft: 6, fontWeight: 400 }}>
-                      点击文件名查看 diff
-                    </span>
-                  </div>
-                  <div style={{ overflowY: 'auto', flex: 1 }}>
-                    {allFiles.map(([path, gf]) => (
-                      <div key={path}
-                        style={{
-                          ...gitModalFileItem,
-                          ...(gitSelected.has(path) ? { background: 'rgba(63,185,80,0.06)' } : {}),
-                        }}
-                        title={`${path} — 点击查看 diff`}
-                      >
-                        {/* checkbox */}
-                        <input type="checkbox" checked={gitSelected.has(path)}
-                          onChange={() => toggleFileSelection(path)}
-                          style={gitCheckboxStyle} />
-                        <span style={gitModalStatusBadge(gf.status)}>{GIT_STATUS_LETTER[gf.status]}</span>
-                        {/* 点击文件名打开 diff 面板 */}
-                        <span style={{...gitModalFileName, cursor: 'pointer'}}
-                          onClick={() => openDiffPanel(path, sortedPaths)}
-                          title="点击查看 diff">{path}</span>
-                        {/* 暂存按钮：untracked 文件只有 +（暂存），其他文件有 +/− 切换 */}
-                        {gf.status === 'untracked' ? (
-                          <button style={gitModalStageBtn} title="暂存此文件"
-                            onClick={async (e) => {
-                              e.stopPropagation();
-                              if (!workingDir) return;
-                              await api.gitStage(workingDir, [path], execKey);
-                            }}>+</button>
-                        ) : (
-                          gf.staged
-                            ? <button style={gitModalUnstageBtn} title="取消暂存"
-                                onClick={async (e) => {
-                                  e.stopPropagation();
-                                  if (!workingDir) return;
-                                  await api.gitUnstage(workingDir, [path], execKey);
-                                }}>−</button>
-                            : <button style={gitModalStageBtn} title="暂存此文件"
-                                onClick={async (e) => {
-                                  e.stopPropagation();
-                                  if (!workingDir) return;
-                                  await api.gitStage(workingDir, [path], execKey);
-                                }}>+</button>
-                        )}
-                        <button style={gitModalIgnoreBtn} title="忽略此文件（加入 .gitignore）"
-                          onClick={async (e) => {
-                            e.stopPropagation();
-                            if (!workingDir) return;
-                            await api.gitIgnore(workingDir, [path], execKey);
-                          }}>🚫</button>
+                  {/* 已跟踪文件 */}
+                  {trackedFiles.length > 0 && (
+                    <>
+                      <div style={{ fontSize: 11, fontWeight: 700, color: '#c9d1d9', padding: '6px 14px', borderBottom: '1px solid rgba(255,255,255,0.08)' }}>
+                        已跟踪 ({trackedFiles.length})
                       </div>
-                    ))}
-                    {totalFiles === 0 && (
-                      <div style={{ fontSize: 11, color: 'var(--theme-text-muted)', padding: '16px 14px', textAlign: 'center' }}>
-                        ✓ 工作区干净，没有变更
+                      <div style={{ overflowY: 'auto', flex: 'none', maxHeight: '40%' }}>
+                        {trackedFiles.map(([path, gf]) => (
+                          <div key={path}
+                            style={{
+                              ...gitModalFileItem,
+                              ...(gitSelected.has(path) ? { background: 'rgba(63,185,80,0.06)' } : {}),
+                            }}
+                            title={`${path} — 点击查看 diff`}
+                          >
+                            <input type="checkbox" checked={gitSelected.has(path)}
+                              onChange={() => toggleFileSelection(path)}
+                              style={gitCheckboxStyle} />
+                            <span style={gitModalStatusBadge(gf.status)}>{GIT_STATUS_LETTER[gf.status]}</span>
+                            <span style={{...gitModalFileName, cursor: 'pointer'}}
+                              onClick={() => openDiffPanel(path, sortedPaths)}
+                              title="点击查看 diff">{path}</span>
+                            <button style={gitModalIgnoreBtn} title="忽略此文件（加入 .gitignore）"
+                              onClick={async (e) => {
+                                e.stopPropagation();
+                                if (!workingDir) return;
+                                await api.gitIgnore(workingDir, [path], execKey);
+                              }}>🚫</button>
+                          </div>
+                        ))}
                       </div>
-                    )}
-                  </div>
+                    </>
+                  )}
+
+                  {/* 未跟踪文件 */}
+                  {untrackedFiles.length > 0 && (
+                    <>
+                      <div style={{ fontSize: 11, fontWeight: 700, color: '#8b949e', padding: '6px 14px', borderBottom: '1px solid rgba(255,255,255,0.08)', marginTop: trackedFiles.length > 0 ? '8px' : 0 }}>
+                        未跟踪 ({untrackedFiles.length})
+                        <span style={{ fontSize: 10, color: 'var(--theme-text-muted)', marginLeft: 6, fontWeight: 400 }}>
+                          点击 ✓ 加入版本控制
+                        </span>
+                      </div>
+                      <div style={{ overflowY: 'auto', flex: 1 }}>
+                        {untrackedFiles.map(([path, gf]) => (
+                          <div key={path}
+                            style={{
+                              ...gitModalFileItem,
+                              ...(gitSelected.has(path) ? { background: 'rgba(63,185,80,0.06)' } : {}),
+                            }}
+                            title={`${path} — 点击查看 diff`}
+                          >
+                            <input type="checkbox" checked={gitSelected.has(path)}
+                              onChange={() => toggleFileSelection(path)}
+                              style={gitCheckboxStyle} />
+                            <span style={gitModalStatusBadge(gf.status)}>{GIT_STATUS_LETTER[gf.status]}</span>
+                            <span style={{...gitModalFileName, cursor: 'pointer'}}
+                              onClick={() => openDiffPanel(path, sortedPaths)}
+                              title="点击查看 diff">{path}</span>
+                            {/* 加入版本控制按钮 */}
+                            <button style={{...gitModalIgnoreBtn, color: '#3fb950'}} title="加入版本控制 (git add)"
+                              onClick={async (e) => {
+                                e.stopPropagation();
+                                if (!workingDir) return;
+                                try {
+                                  const res = await api.gitStage(workingDir, [path], execKey);
+                                  if (res.status === 'ok') {
+                                    setMsg({ kind: 'ok', text: `✓ 已加入版本控制：${path}` });
+                                    reloadAll(); // 刷新文件状态
+                                  } else {
+                                    setMsg({ kind: 'err', text: `加入版本控制失败：${(res as any).message || '未知错误'}` });
+                                  }
+                                } catch (err: any) {
+                                  setMsg({ kind: 'err', text: `加入版本控制失败：${err?.message ?? err}` });
+                                }
+                              }}>✓</button>
+                            <button style={gitModalIgnoreBtn} title="忽略此文件（加入 .gitignore）"
+                              onClick={async (e) => {
+                                e.stopPropagation();
+                                if (!workingDir) return;
+                                await api.gitIgnore(workingDir, [path], execKey);
+                              }}>🚫</button>
+                          </div>
+                        ))}
+                      </div>
+                    </>
+                  )}
+
+                  {totalFiles === 0 && (
+                    <div style={{ fontSize: 11, color: 'var(--theme-text-muted)', padding: '16px 14px', textAlign: 'center' }}>
+                      ✓ 工作区干净，没有变更
+                    </div>
+                  )}
                 </div>
 
                 {/* 右：提交区 — commit message 在顶部 */}
@@ -1082,24 +1185,24 @@ export const FileTreePanel: React.FC<Props> = ({ workingDir, execKey, execLabel,
                       </button>
                       <div style={{ flex: 1 }} />
                       {/* 提交（仅 commit） */}
-                      <button style={{
+                      <button type="button" style={{
                         ...gitModalCommitBtn,
-                        ...(gitCommitMsg.trim() ? {} : { opacity: 0.5, cursor: 'not-allowed' }),
+                        ...((gitCommitMsg.trim() && selectedCount > 0) ? {} : { opacity: 0.5, cursor: 'not-allowed' }),
                       }}
-                        disabled={!gitCommitMsg.trim() || gitCommitting}
-                        onClick={handleCommit}
-                        title="提交变更">
+                        disabled={!gitCommitMsg.trim() || selectedCount === 0 || gitCommitting}
+                        onClick={(e) => { e.stopPropagation(); handleCommit(); }}
+                        title={selectedCount === 0 ? '请先选择要提交的文件' : '提交变更'}>
                         {gitCommitting ? '⏳ 提交中…' : '✅ 提交'}
                       </button>
                       {/* 提交并推送（小乌龟风格一步到位） */}
-                      <button style={{
+                      <button type="button" style={{
                         ...gitModalCommitBtn,
-                        background: gitCommitMsg.trim() ? 'linear-gradient(135deg, #238636, #2ea043)' : 'rgba(63,185,80,0.3)',
-                        ...(gitCommitMsg.trim() ? {} : { opacity: 0.5, cursor: 'not-allowed' }),
+                        background: (gitCommitMsg.trim() && selectedCount > 0) ? 'linear-gradient(135deg, #2ea043, #238636)' : 'rgba(46,160,67,0.3)',
+                        ...((gitCommitMsg.trim() && selectedCount > 0) ? {} : { opacity: 0.5, cursor: 'not-allowed' }),
                       }}
-                        disabled={!gitCommitMsg.trim() || gitCommitting}
-                        onClick={handleCommitAndPush}
-                        title="提交后立即推送到远端">
+                        disabled={!gitCommitMsg.trim() || selectedCount === 0 || gitCommitting}
+                        onClick={(e) => { e.stopPropagation(); handleCommitAndPush(); }}
+                        title={selectedCount === 0 ? '请先选择要提交的文件' : '提交后立即推送到远端'}>
                         {gitCommitting ? '' : '🚀'} 提交并推送
                       </button></div>
                     </div>
@@ -1110,8 +1213,8 @@ export const FileTreePanel: React.FC<Props> = ({ workingDir, execKey, execLabel,
                     color: 'var(--theme-text-muted)',
                     fontSize: 10.5, lineHeight: 1.6,
                   }}>
-                    <div>💡 点击左侧文件名可打开 diff 对比面板</div>
-                    <div>💡 + 暂存 · − 取消暂存 ·  忽略</div>
+                    <div>💡 点击文件名可打开 diff 对比面板</div>
+                    <div>💡 勾选要提交的文件 · 🚫 忽略</div>
                   </div>
                 </div>
               </div>
@@ -1239,7 +1342,8 @@ const gitModalTextareaStyle: React.CSSProperties = {
 };
 const gitModalCommitBtn: React.CSSProperties = {
   padding: '6px 14px', fontSize: 12, fontWeight: 600, borderRadius: 6,
-  border: '1px solid rgba(63,185,80,0.3)', color: '#fff', cursor: 'pointer',
+  border: '1px solid rgba(9,105,218,0.5)', background: 'linear-gradient(135deg, #2188ff, #0969da)',
+  color: '#fff', cursor: 'pointer', boxShadow: '0 1px 3px rgba(0,0,0,0.2)',
 };
 const gitModalAiBtn: React.CSSProperties = {
   padding: '4px 10px', fontSize: 11, borderRadius: 4,
@@ -1376,4 +1480,28 @@ const actBtnStyle: React.CSSProperties = {
   width: 20, height: 20, display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
   border: 'none', background: 'transparent', color: 'var(--theme-text-muted, #8b949e)',
   cursor: 'pointer', borderRadius: 3, fontSize: 11, flexShrink: 0, padding: 0,
+};
+
+// ── 文件树容器 & stash 样式 ───────────────────────────────────
+
+const treeScrollStyle: React.CSSProperties = {
+  flex: 1, overflow: 'auto', minHeight: 0,
+  padding: '2px 0',
+};
+
+const stashListStyle: React.CSSProperties = {
+  borderTop: '1px solid var(--theme-border, rgba(255,255,255,0.08))',
+  maxHeight: 160, overflow: 'auto',
+};
+
+const stashItemStyle: React.CSSProperties = {
+  display: 'flex', alignItems: 'center', gap: 4,
+  padding: '4px 10px', borderBottom: '1px solid rgba(255,255,255,0.04)',
+  fontSize: 11,
+};
+
+const stashBtnStyle: React.CSSProperties = {
+  width: 20, height: 20, display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
+  border: 'none', background: 'transparent', cursor: 'pointer',
+  fontSize: 11, borderRadius: 3, flexShrink: 0,
 };
