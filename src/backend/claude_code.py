@@ -3,7 +3,10 @@ import os, sys, asyncio, json, subprocess
 from pathlib import Path
 from typing import Optional, Callable, Awaitable
 from ..types import ModelBackendConfig, ChatMessage, ImageAttachment, ToolCallInfo, new_id
-from .base import ModelBackend, StreamDelta, PermissionRequest, _exc_msg, resolve_claude_cli
+from .base import (
+    ModelBackend, StreamDelta, PermissionRequest, _exc_msg,
+    resolve_claude_cli, cli_available, cli_missing_message,
+)
 from . import paths
 
 # ---------------------------------------------------------------------------
@@ -268,6 +271,16 @@ class ClaudeCodeOfficialBackend(ModelBackend):
 
         cmd = self._build_cmd(final_content, agent_session_id, cwd, stdin_mode=bool(_stdin_data))
         proc_env = self._build_env()
+        claude_cli = cmd[0] if cmd else self._resolve_cli()
+        if not cli_available(claude_cli):
+            emit("error", error=cli_missing_message(
+                "Claude Code",
+                claude_cli,
+                "npm install -g @anthropic-ai/claude-code",
+                "安装后可运行 `claude login` 完成登录，或在 Backend Manager 中配置 Claude CLI 绝对路径。",
+            ))
+            emit("done")
+            return {"agentSessionId": agent_session_id}
 
         auth_token = proc_env.get("ANTHROPIC_AUTH_TOKEN", "")
         api_key = proc_env.get("ANTHROPIC_API_KEY", "")

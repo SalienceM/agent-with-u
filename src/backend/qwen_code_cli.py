@@ -21,7 +21,7 @@ import json
 from typing import Optional, Callable, Awaitable, Any
 
 from ..types import ModelBackendConfig, ChatMessage, ImageAttachment
-from .base import ModelBackend, StreamDelta, PermissionRequest, _exc_msg
+from .base import ModelBackend, StreamDelta, PermissionRequest, _exc_msg, cli_available, cli_missing_message
 
 # ---------------------------------------------------------------------------
 #  CLI path resolution (fallback if SDK needs it)
@@ -305,11 +305,22 @@ class QwenCodeSdkBackend(ModelBackend):
         else:
             prompt = content
 
+        qwen_cli = self._resolve_cli()
+        if not cli_available(qwen_cli):
+            emit("error", error=cli_missing_message(
+                "Qwen Code",
+                qwen_cli,
+                "npm install -g @qwen-code/qwen-code@latest",
+                "Qwen Code 官方文档要求较新的 Node.js；若安装后仍不可用，请确认 npm global bin 已加入 PATH。",
+            ))
+            emit("done")
+            return {"agentSessionId": agent_session_id}
+
         # SDK options
         options = {
             "cwd": cwd,
             "model": model if model and model not in ("default",) else None,
-            "path_to_qwen_executable": self._resolve_cli(),
+            "path_to_qwen_executable": qwen_cli,
             "permission_mode": permission_mode,
             "auth_type": auth_type,
             "include_partial_messages": True,  # Stream partial messages

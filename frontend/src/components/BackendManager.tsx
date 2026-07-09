@@ -727,7 +727,8 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
                 <label style={{ ...labelStyle, marginBottom: 8 }}>Claude Code 官方账户配置</label>
                 <p style={{ fontSize: 11, color: 'var(--theme-text-muted)', margin: '0 0 12px 0', lineHeight: 1.6 }}>
                   凭证自动从 <code style={{ fontSize: 10, background: 'rgba(255,255,255,0.08)', padding: '1px 4px', borderRadius: 3 }}>~/.claude/.credentials.json</code> 读取（需先运行 <code style={{ fontSize: 10 }}>claude login</code>）。
-                  <br />只需配置代理即可使用。
+                  <br />如本机缺少 CLI，请先执行 <code style={{ fontSize: 10 }}>npm install -g @anthropic-ai/claude-code</code>。
+                  <br />通常只需配置代理即可使用。
                 </p>
 
                 {/* 一键登录卡片 */}
@@ -1193,7 +1194,7 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
                 <label style={{ ...labelStyle, marginBottom: 8 }}>Codex Office 配置</label>
                 <p style={{ fontSize: 11, color: 'var(--theme-text-muted)', margin: '0 0 12px 0', lineHeight: 1.6 }}>
                   基于 <code style={{ fontSize: 10, background: 'rgba(255,255,255,0.08)', padding: '1px 4px', borderRadius: 3 }}>codex exec --json</code> 非交互模式。
-                  需先安装 Codex CLI 并完成登录，或填写 OpenAI API Key。
+                  需先安装：<code style={{ fontSize: 10 }}>npm install -g @openai/codex</code>，然后完成 <code style={{ fontSize: 10 }}>codex login</code>，或填写 OpenAI API Key。
                 </p>
 
                 <div style={{ marginBottom: 10 }}>

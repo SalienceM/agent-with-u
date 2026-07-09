@@ -75,6 +75,7 @@ export const AuthStatusBanner: React.FC<AuthStatusBannerProps> = ({ activeBacken
         <div style={{ fontSize: 12, opacity: 0.85, marginTop: 2 }}>
           在运行后端的服务器上执行 <code style={codeStyle}>claude login</code>
           （或启动 <code style={codeStyle}>claude</code> 后输入 <code style={codeStyle}>/login</code>）；
+          如果缺少 CLI，请先执行 <code style={codeStyle}>npm install -g @anthropic-ai/claude-code</code>。
           也可在 Backend Manager 中为该后端填写 API Key 或第三方 Base URL+Token。
           {status.credentialsPath && (
             <span style={{ opacity: 0.7 }}> 凭证路径：{status.credentialsPath}</span>

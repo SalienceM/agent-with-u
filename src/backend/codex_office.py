@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Optional, Callable, Awaitable
 
 from ..types import ModelBackendConfig, ChatMessage, ImageAttachment
-from .base import ModelBackend, StreamDelta, PermissionRequest, _exc_msg
+from .base import ModelBackend, StreamDelta, PermissionRequest, _exc_msg, cli_available, cli_missing_message
 
 
 def resolve_codex_cli(config_cli_path: Optional[str] = None) -> str:
@@ -133,7 +133,17 @@ class CodexOfficeBackend(ModelBackend):
             with tempfile.NamedTemporaryFile("w", delete=False, suffix=".txt", encoding="utf-8") as f:
                 output_path = f.name
 
-            cmd = [resolve_codex_cli(self.config.cli_path)]
+            codex_cli = resolve_codex_cli(self.config.cli_path)
+            if not cli_available(codex_cli):
+                emit("error", error=cli_missing_message(
+                    "Codex",
+                    codex_cli,
+                    "npm install -g @openai/codex",
+                    "安装后可运行 `codex login` 完成登录，或在 Backend Manager 中填写 OpenAI API Key。",
+                ))
+                return {"agentSessionId": new_agent_sid}
+
+            cmd = [codex_cli]
             if agent_session_id:
                 cmd.extend(["exec", "resume", agent_session_id])
             else:
@@ -227,7 +237,12 @@ class CodexOfficeBackend(ModelBackend):
                 emit("text_delta", text=final_text)
 
         except FileNotFoundError:
-            emit("error", error="Codex CLI 未找到。请安装 Codex CLI，或在 Backend Manager 中配置 codex 可执行文件路径。")
+            emit("error", error=cli_missing_message(
+                "Codex",
+                resolve_codex_cli(self.config.cli_path),
+                "npm install -g @openai/codex",
+                "安装后可运行 `codex login` 完成登录，或在 Backend Manager 中填写 OpenAI API Key。",
+            ))
         except Exception as e:
             emit("error", error=_exc_msg(e))
         finally:
