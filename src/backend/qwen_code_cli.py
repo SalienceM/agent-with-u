@@ -461,8 +461,6 @@ class QwenCodeSdkBackend(ModelBackend):
                         msg_dict = dict(message)
                         event = msg_dict.get("event", {})
                         etype = event.get("type", "")
-                        msg_uuid = msg_dict.get("uuid", "")
-
                         if etype == "content_block_delta":
                             delta = event.get("delta", {})
                             dtype = delta.get("type", "")
@@ -537,9 +535,18 @@ class QwenCodeSdkBackend(ModelBackend):
                                 "outputTokens": usage.get("output_tokens", 0),
                             }
 
-            # Stream completed normally
-            _done_emitted = True
-            emit("done", **(_usage and {"usage": _usage} or {}))
+                        # Qwen SDK may keep the underlying process/generator alive briefly
+                        # after the terminal result message.  Emit `done` as soon as the
+                        # result arrives so the UI stops showing the streaming cursor, then
+                        # break and let the context manager clean up in the background path.
+                        _done_emitted = True
+                        emit("done", **(_usage and {"usage": _usage} or {}))
+                        break
+
+            # Stream completed normally without an explicit result message.
+            if not _done_emitted:
+                _done_emitted = True
+                emit("done", **(_usage and {"usage": _usage} or {}))
 
         except Exception as e:
             import traceback
