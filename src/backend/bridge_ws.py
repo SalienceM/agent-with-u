@@ -1093,10 +1093,13 @@ class BridgeWS:
             send_content = f"{send_content} --size {size}"
 
         result_parts: list[str] = []
+        result_errors: list[str] = []
 
         def on_delta(delta: StreamDelta):
             if delta.type == "text_delta" and delta.text:
                 result_parts.append(delta.text)
+            elif delta.type == "error" and delta.error:
+                result_errors.append(delta.error)
 
         try:
             await target_backend.send_message(
@@ -1109,6 +1112,9 @@ class BridgeWS:
             )
         except Exception as e:
             return 500, f"Skill execution error: {e}"
+
+        if result_errors:
+            return 500, "\n".join(result_errors)
 
         result = "".join(result_parts) or ""
         print(f"[bridge_ws] skill-call raw result ({len(result)} chars): {result[:120]!r}",
@@ -4002,10 +4008,13 @@ class BridgeWS:
             prompt = "(empty)"
 
         result_parts: list[str] = []
+        result_errors: list[str] = []
 
         def on_delta(delta: StreamDelta):
             if delta.type == "text_delta" and delta.text:
                 result_parts.append(delta.text)
+            elif delta.type == "error" and delta.error:
+                result_errors.append(delta.error)
 
         sub_message_id = new_id()
         try:
@@ -4020,6 +4029,9 @@ class BridgeWS:
             )
         except Exception as e:
             raise RuntimeError(f"Backend skill '{tool_name}' execution failed: {e}")
+
+        if result_errors:
+            raise RuntimeError("\n".join(result_errors))
 
         result = "".join(result_parts)
         if not result:
@@ -4109,7 +4121,8 @@ class BridgeWS:
             payload_parts.append(f'"{key}":"{placeholder}"')
         payload = '{' + ', '.join(payload_parts) + '}'
         return (
-            f'curl -s -X POST http://127.0.0.1:{port}/api/skill-call '
+            f'curl --noproxy 127.0.0.1,localhost -s -X POST '
+            f'http://127.0.0.1:{port}/api/skill-call '
             f'-H "Content-Type: application/json" '
             f"-d '{payload}'"
         )
@@ -4189,13 +4202,13 @@ description: {description}
 
 ## Instructions
 
-**必须使用 Bash 工具执行下方命令。**
+**必须使用 Bash 工具直接执行下方命令。不要再读取本文件或 `_call.py`，不要用 ls/find/dir 探索技能目录。**
 
 ```bash
 {basic_cmd}
 ```
 {extra_params}{ref_image_hint}
-**规则：只执行一次，将命令的完整输出原文粘贴到你的回复中——包括任何 `![alt](url)` 格式的图片 markdown，必须按原样包含，不得删改、不得替换为描述文字。禁止重试、禁止评价质量、禁止额外处理。**
+**规则：只执行一次，将命令的完整输出原文粘贴到你的回复中——包括任何 `![alt](url)` 格式的图片 markdown，必须按原样包含，不得删改、不得替换为描述文字。禁止重试、禁止评价质量、禁止额外处理，禁止再次读取技能文件。**
 """
 
     def _generate_backend_skill_call_py(self, skill_name: str, skill_info: dict, *, is_image_backend: bool = False) -> str:
@@ -4219,12 +4232,19 @@ description: {description}
             ref_image_line = f'if len(sys.argv) > {ref_image_argc} and sys.argv[{ref_image_argc}]:\n    payload["ref_image"] = sys.argv[{ref_image_argc}]\n'
 
         return f'''\
-import sys, json, urllib.request, urllib.error
+import os, sys, json, urllib.request, urllib.error
+# Local skill bridge calls must never go through HTTP(S)_PROXY. Some model
+# backends inject a proxy into the tool subprocess environment, and urllib would
+# otherwise send http://127.0.0.1:{port} through that proxy, often surfacing as a
+# misleading HTTP 502 from the proxy instead of reaching AgentWithU.
+os.environ.setdefault("NO_PROXY", "127.0.0.1,localhost")
+os.environ.setdefault("no_proxy", "127.0.0.1,localhost")
 payload = {{"skill": "{skill_name}", "{primary_field}": sys.argv[1] if len(sys.argv) > 1 else ""}}
 {extra_lines}{ref_image_line}data = json.dumps(payload).encode()
 req = urllib.request.Request("http://127.0.0.1:{port}/api/skill-call", data, {{"Content-Type": "application/json"}})
+_opener = urllib.request.build_opener(urllib.request.ProxyHandler({{}}))
 try:
-    result = urllib.request.urlopen(req, timeout=300).read()
+    result = _opener.open(req, timeout=300).read()
     sys.stdout.buffer.write(result)
     sys.stdout.buffer.write(b"\\n")
     sys.stdout.buffer.flush()
@@ -4414,9 +4434,18 @@ except urllib.error.URLError as e:
         if backend_skill_hints:
             skill_block = (
                 "## 已绑定 Backend Skills【强制规则】\n\n"
-                "以下技能已就绪，**必须直接调用，禁止用 ls/find/cat 等方式自行探索或验证**：\n\n"
+                "以下技能已就绪，本段就是权威调用说明；即使会话重启、resume 或用户说“再试一次 / 继续”，"
+                "**也必须直接使用这里给出的命令**。\n\n"
+                "### 禁止的低效行为\n"
+                "- 禁止先 Read / cat / type `.claude/skills/**/SKILL.md`。\n"
+                "- 禁止先 Read / cat / type `.claude/skills/**/_call.py`。\n"
+                "- 禁止用 ls/find/dir 等方式自行探索或验证技能文件。\n"
+                "- 禁止在调用前输出“我先查看技能说明 / I need to inspect the skill”等自我确认。\n\n"
+                "### 可用技能与直接调用命令\n\n"
                 + "\n".join(backend_skill_hints)
-                + "\n\n**规则：用 Bash 执行上方命令一次，将输出原样返回给用户，不要重试，不要自行判断结果。**"
+                + "\n\n**规则：根据用户当前请求和已有对话上下文补全参数，"
+                  "立即用 Bash 执行对应命令一次；将输出原样返回给用户。"
+                  "不要重试，不要自行判断结果，不要读取技能文件。**"
             )
             if has_image_backend_skill:
                 skill_block += (
