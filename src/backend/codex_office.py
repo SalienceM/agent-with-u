@@ -143,17 +143,23 @@ class CodexOfficeBackend(ModelBackend):
                 ))
                 return {"agentSessionId": new_agent_sid}
 
+            approval_mode = "never" if skip else "on-request"
+            sandbox_mode = "workspace-write" if sandbox_enabled else "danger-full-access"
+
+            # Codex treats model/approval/sandbox as top-level global options.
+            # Keep them before the `exec` subcommand; older CLIs reject them when
+            # placed after `codex exec` with "unexpected argument".
             cmd = [codex_cli]
+            if model:
+                cmd.extend(["--model", model])
+            cmd.extend(["--ask-for-approval", approval_mode])
+            cmd.extend(["--sandbox", sandbox_mode])
             if agent_session_id:
                 cmd.extend(["exec", "resume", agent_session_id])
             else:
                 cmd.extend(["exec"])
             cmd.extend(["--json", "--color", "never", "--cd", cwd, "--skip-git-repo-check"])
             cmd.extend(["--output-last-message", output_path])
-            cmd.extend(["--ask-for-approval", "never" if skip else "on-request"])
-            cmd.extend(["--sandbox", "workspace-write" if sandbox_enabled else "danger-full-access"])
-            if model:
-                cmd.extend(["--model", model])
 
             if images:
                 image_tmpdir = tempfile.TemporaryDirectory(prefix="awu-codex-images-")
@@ -173,7 +179,8 @@ class CodexOfficeBackend(ModelBackend):
             # Prompt last; '-' lets us avoid command-line length/quoting issues.
             cmd.append("-")
 
-            print(f"[CodexOffice] exec: cwd={cwd!r}, resume={agent_session_id!r}, model={model!r}",
+            print(f"[CodexOffice] exec: cwd={cwd!r}, resume={agent_session_id!r}, "
+                  f"model={model!r}, approval={approval_mode!r}, sandbox={sandbox_mode!r}",
                   file=sys.stderr, flush=True)
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
