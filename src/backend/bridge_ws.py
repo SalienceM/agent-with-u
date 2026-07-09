@@ -225,6 +225,7 @@ def validate_tool_sandbox(tool_name: str, tool_input: str | dict, working_dir: s
 
 # 官方账户后端固定 ID，不可删除
 OFFICIAL_BACKEND_ID = "official-claude"
+OFFICIAL_CODEX_BACKEND_ID = "official-codex"
 
 DEFAULT_BACKENDS = [
     ModelBackendConfig(
@@ -550,6 +551,16 @@ class BridgeWS:
             )
             self._backend_configs.insert(0, official)
             self._backend_store.save(official)
+        if not any(c.id == OFFICIAL_CODEX_BACKEND_ID for c in self._backend_configs):
+            official_codex = ModelBackendConfig(
+                id=OFFICIAL_CODEX_BACKEND_ID,
+                type=BackendType.CODEX_OFFICIAL,
+                label="Codex 官方账户",
+                model="gpt-5.5",
+                skip_permissions=True,
+            )
+            self._backend_configs.insert(1, official_codex)
+            self._backend_store.save(official_codex)
         self._active_sessions: dict[str, Session] = {}
         self._instance_manager = InstanceManager()
         self._clients: set = set()
@@ -3676,7 +3687,7 @@ class BridgeWS:
         result = []
         for c in self._backend_configs:
             d = c.to_dict()
-            if c.id == OFFICIAL_BACKEND_ID:
+            if c.id in (OFFICIAL_BACKEND_ID, OFFICIAL_CODEX_BACKEND_ID):
                 d["pinned"] = True   # 前端用于区分固定后端
             result.append(d)
         return json.dumps(result, ensure_ascii=False)
@@ -3694,6 +3705,20 @@ class BridgeWS:
                 env=data.get("env") or None,
                 cli_path=existing.cli_path if existing else None,
                 allowed_tools=data.get("allowedTools"),
+                mcp_servers=data.get("mcpServers") or None,
+            )
+        elif data["id"] == OFFICIAL_CODEX_BACKEND_ID:
+            existing = next((c for c in self._backend_configs if c.id == OFFICIAL_CODEX_BACKEND_ID), None)
+            config = ModelBackendConfig(
+                id=OFFICIAL_CODEX_BACKEND_ID,
+                type=BackendType.CODEX_OFFICIAL,
+                label="Codex 官方账户",
+                model=data.get("model") or (existing.model if existing else "gpt-5.5"),
+                skip_permissions=data.get("skipPermissions", True),
+                env=data.get("env") or None,
+                api_key=data.get("apiKey") or None,
+                base_url=data.get("baseUrl") or None,
+                cli_path=data.get("cliPath") or (existing.cli_path if existing else None),
                 mcp_servers=data.get("mcpServers") or None,
             )
         else:
@@ -3715,7 +3740,7 @@ class BridgeWS:
         return None
 
     def _rpc_deleteBackend(self, config_id: str) -> None:
-        if config_id == OFFICIAL_BACKEND_ID:
+        if config_id in (OFFICIAL_BACKEND_ID, OFFICIAL_CODEX_BACKEND_ID):
             return None   # 官方后端不可删除
         self._backend_store.delete(config_id)
         self._backend_configs = [c for c in self._backend_configs if c.id != config_id]
@@ -4435,6 +4460,7 @@ except urllib.error.URLError as e:
 
         has_claude_cli = False
         has_qwen_cli = False
+        has_codex_cli = False
         for cfg in candidate_configs:
             if cfg.type in (BackendType.CLAUDE_AGENT_SDK, BackendType.CLAUDE_CODE_OFFICIAL):
                 from .base import resolve_claude_cli as _resolve_claude_cli
@@ -4444,12 +4470,18 @@ except urllib.error.URLError as e:
                 from .qwen_code_cli import resolve_qwen_cli as _resolve_qwen_cli
                 if _cli_available(_resolve_qwen_cli(getattr(cfg, "cli_path", None))):
                     has_qwen_cli = True
+            elif cfg.type == BackendType.CODEX_OFFICIAL:
+                from .codex_office import resolve_codex_cli as _resolve_codex_cli
+                if _cli_available(_resolve_codex_cli(getattr(cfg, "cli_path", None))):
+                    has_codex_cli = True
 
         roots: list[tuple[str, _Path]] = []
         if has_claude_cli:
             roots.append(("claude", _Path(working_dir) / ".claude" / "skills"))
         if has_qwen_cli:
             roots.append(("qwen", _Path(working_dir) / ".qwen" / "skills"))
+        if has_codex_cli:
+            roots.append(("codex", _Path(working_dir) / ".agents" / "skills"))
 
         # Backward-compatible default: existing installations expected .claude.
         if not roots:
@@ -4462,6 +4494,7 @@ except urllib.error.URLError as e:
             BackendType.CLAUDE_AGENT_SDK,
             BackendType.CLAUDE_CODE_OFFICIAL,
             BackendType.QWEN_CODE_CLI,
+            BackendType.CODEX_OFFICIAL,
         })
 
     def _backend_accepts_backend_skill_tools(self, backend_id: str) -> bool:
@@ -4476,6 +4509,7 @@ except urllib.error.URLError as e:
         将 session 绑定的 Backend Skills 部署到本地 agent 原生目录：
         - Claude Code: working_dir/.claude/skills/
         - Qwen Code:   working_dir/.qwen/skills/
+        - Codex CLI:   working_dir/.agents/skills/
 
         同时清理不再绑定的系统部署 Backend Skill。
         """
