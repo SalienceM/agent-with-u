@@ -59,6 +59,54 @@ class QwenCodeSdkBackend(ModelBackend):
     def _resolve_cli(self) -> str:
         return resolve_qwen_cli(getattr(self.config, "cli_path", None))
 
+
+    def _ensure_project_auth_settings(self, cwd: str, auth_type: str, model: Optional[str]) -> None:
+        """Ensure Qwen CLI has a non-interactive auth selection.
+
+        Some Qwen CLI versions still require `security.auth.selectedType` in
+        settings even when the SDK passes `--auth-type`.  Keep this file in the
+        session/project workspace (not the user's home) and only write non-secret
+        routing metadata; API keys remain in the process environment.
+        """
+        if not cwd:
+            return
+        try:
+            from pathlib import Path as _Path
+            settings_dir = _Path(cwd) / ".qwen"
+            settings_path = settings_dir / "settings.json"
+            data: dict[str, Any] = {}
+            if settings_path.exists():
+                try:
+                    loaded = json.loads(settings_path.read_text(encoding="utf-8"))
+                    if isinstance(loaded, dict):
+                        data = loaded
+                except Exception:
+                    data = {}
+
+            security = data.setdefault("security", {})
+            if not isinstance(security, dict):
+                security = {}
+                data["security"] = security
+            auth = security.setdefault("auth", {})
+            if not isinstance(auth, dict):
+                auth = {}
+                security["auth"] = auth
+            auth["selectedType"] = auth_type
+
+            if model and model not in ("default",):
+                model_cfg = data.setdefault("model", {})
+                if not isinstance(model_cfg, dict):
+                    model_cfg = {}
+                    data["model"] = model_cfg
+                model_cfg.setdefault("name", model)
+
+            settings_dir.mkdir(parents=True, exist_ok=True)
+            settings_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+            print(f"[QwenSdk] ensured project auth settings: {settings_path} selectedType={auth_type}",
+                  file=sys.stderr, flush=True)
+        except Exception as e:
+            print(f"[QwenSdk] failed to ensure project auth settings: {e}", file=sys.stderr, flush=True)
+
     def _build_env(self) -> dict:
         """Build environment dict for SDK.
 
@@ -225,6 +273,7 @@ class QwenCodeSdkBackend(ModelBackend):
 
         # Environment
         env_dict = self._build_env()
+        self._ensure_project_auth_settings(cwd, auth_type, model)
         print(f"[QwenSdk] auth: {auth_type}, model={model!r}, permission_mode={permission_mode}",
               file=sys.stderr, flush=True)
 
@@ -312,14 +361,6 @@ class QwenCodeSdkBackend(ModelBackend):
 
         # Permission-sensitive tools
         PERMISSION_SENSITIVE_TOOLS = {"Bash", "Edit", "Write", "run_shell_command", "edit", "write_file"}
-
-        def _tool_input_to_text(tool_input: Any) -> str:
-            if isinstance(tool_input, str):
-                return tool_input
-            try:
-                return json.dumps(tool_input, ensure_ascii=False)
-            except Exception:
-                return str(tool_input)
 
         def _tool_input_to_text(tool_input: Any) -> str:
             if isinstance(tool_input, str):
