@@ -4202,13 +4202,13 @@ description: {description}
 
 ## Instructions
 
-**必须使用 Bash 工具执行下方命令。**
+**必须使用 Bash 工具直接执行下方命令。不要再读取本文件或 `_call.py`，不要用 ls/find/dir 探索技能目录。**
 
 ```bash
 {basic_cmd}
 ```
 {extra_params}{ref_image_hint}
-**规则：只执行一次，将命令的完整输出原文粘贴到你的回复中——包括任何 `![alt](url)` 格式的图片 markdown，必须按原样包含，不得删改、不得替换为描述文字。禁止重试、禁止评价质量、禁止额外处理。**
+**规则：只执行一次，将命令的完整输出原文粘贴到你的回复中——包括任何 `![alt](url)` 格式的图片 markdown，必须按原样包含，不得删改、不得替换为描述文字。禁止重试、禁止评价质量、禁止额外处理，禁止再次读取技能文件。**
 """
 
     def _generate_backend_skill_call_py(self, skill_name: str, skill_info: dict, *, is_image_backend: bool = False) -> str:
@@ -4434,9 +4434,18 @@ except urllib.error.URLError as e:
         if backend_skill_hints:
             skill_block = (
                 "## 已绑定 Backend Skills【强制规则】\n\n"
-                "以下技能已就绪，**必须直接调用，禁止用 ls/find/cat 等方式自行探索或验证**：\n\n"
+                "以下技能已就绪，本段就是权威调用说明；即使会话重启、resume 或用户说“再试一次 / 继续”，"
+                "**也必须直接使用这里给出的命令**。\n\n"
+                "### 禁止的低效行为\n"
+                "- 禁止先 Read / cat / type `.claude/skills/**/SKILL.md`。\n"
+                "- 禁止先 Read / cat / type `.claude/skills/**/_call.py`。\n"
+                "- 禁止用 ls/find/dir 等方式自行探索或验证技能文件。\n"
+                "- 禁止在调用前输出“我先查看技能说明 / I need to inspect the skill”等自我确认。\n\n"
+                "### 可用技能与直接调用命令\n\n"
                 + "\n".join(backend_skill_hints)
-                + "\n\n**规则：用 Bash 执行上方命令一次，将输出原样返回给用户，不要重试，不要自行判断结果。**"
+                + "\n\n**规则：根据用户当前请求和已有对话上下文补全参数，"
+                  "立即用 Bash 执行对应命令一次；将输出原样返回给用户。"
+                  "不要重试，不要自行判断结果，不要读取技能文件。**"
             )
             if has_image_backend_skill:
                 skill_block += (
