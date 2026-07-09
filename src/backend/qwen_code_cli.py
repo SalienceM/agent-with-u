@@ -165,6 +165,7 @@ class QwenCodeSdkBackend(ModelBackend):
         try:
             from qwen_code_sdk import query as sdk_query
             from qwen_code_sdk import (
+                ProcessExitError,
                 is_sdk_assistant_message,
                 is_sdk_result_message,
                 is_sdk_partial_assistant_message,
@@ -184,19 +185,38 @@ class QwenCodeSdkBackend(ModelBackend):
                      or "openai")
 
         # Allowed tools
+        # Qwen Code expects native snake_case tool IDs (for example
+        # `run_shell_command`, `todo_write`, `agent`, `exit_plan_mode`).  Do not
+        # pass Claude-style CamelCase defaults here: the CLI validates tool IDs
+        # during SDK initialization and exits with code 1 for unknown names.  When
+        # no explicit backend allow-list is configured, omit `allowed_tools` so
+        # Qwen enables its full built-in agent surface.
         configured_tools = list(getattr(self.config, "allowed_tools", None) or [])
-        default_agent_tools = [
-            "Read", "Edit", "Bash", "Glob", "Grep", "Write",
-            # Qwen Code official agent capabilities: skills, subagents, planning,
-            # and todos are exposed as normal tools in the SDK/CLI.
-            "Skill", "Task", "TodoWrite", "ExitPlanMode",
-            # Useful built-ins that bring Qwen closer to the Claude agent surface.
-            "WebFetch", "WebSearch", "MultiEdit",
-        ]
-        tools: list[str] = configured_tools or default_agent_tools
-        for required_tool in ("Skill", "Task", "TodoWrite", "ExitPlanMode"):
-            if required_tool not in tools:
-                tools.append(required_tool)
+        tool_aliases = {
+            "Read": "read_file",
+            "Write": "write_file",
+            "Edit": "edit",
+            "Bash": "run_shell_command",
+            "Glob": "glob",
+            "Grep": "grep_search",
+            "TodoWrite": "todo_write",
+            "Task": "agent",
+            "ExitPlanMode": "exit_plan_mode",
+            "WebFetch": "web_fetch",
+            "NotebookEdit": "notebook_edit",
+        }
+        tools: list[str] = []
+        if configured_tools:
+            seen_tools: set[str] = set()
+            for tool in configured_tools:
+                native_tool = tool_aliases.get(tool, tool)
+                if native_tool and native_tool not in seen_tools:
+                    tools.append(native_tool)
+                    seen_tools.add(native_tool)
+            for required_tool in ("todo_write", "agent", "exit_plan_mode"):
+                if required_tool not in seen_tools:
+                    tools.append(required_tool)
+                    seen_tools.add(required_tool)
 
         # Permission mode
         if skip_permissions is None:
@@ -242,11 +262,12 @@ class QwenCodeSdkBackend(ModelBackend):
             "model": model if model and model not in ("default",) else None,
             "path_to_qwen_executable": self._resolve_cli(),
             "permission_mode": permission_mode,
-            "allowed_tools": tools,
             "auth_type": auth_type,
             "include_partial_messages": True,  # Stream partial messages
             "env": env_dict if env_dict else None,
         }
+        if tools:
+            options["allowed_tools"] = tools
 
         # System prompt injection (★ KEY IMPROVEMENT)
         if constraints:
@@ -267,11 +288,38 @@ class QwenCodeSdkBackend(ModelBackend):
                 print(f"[QwenSdk][stderr] {line}", file=sys.stderr, flush=True)
         options["stderr"] = _on_stderr
 
+        def _display_tool_name(tool_name: str) -> str:
+            return {
+                "read_file": "Read",
+                "write_file": "Write",
+                "edit": "Edit",
+                "run_shell_command": "Bash",
+                "glob": "Glob",
+                "grep_search": "Grep",
+                "notebook_edit": "NotebookEdit",
+                "todo_write": "TodoWrite",
+                "agent": "Task",
+                "exit_plan_mode": "ExitPlanMode",
+                "web_fetch": "WebFetch",
+            }.get(tool_name, tool_name)
+
         # Sandbox tools
-        SANDBOX_TOOLS = {"Read", "Write", "Edit", "Bash", "Glob", "Grep", "NotebookEdit"}
+        SANDBOX_TOOLS = {
+            "Read", "Write", "Edit", "Bash", "Glob", "Grep", "NotebookEdit",
+            "read_file", "write_file", "edit", "run_shell_command", "glob",
+            "grep_search", "notebook_edit",
+        }
 
         # Permission-sensitive tools
-        PERMISSION_SENSITIVE_TOOLS = {"Bash", "Edit", "Write"}
+        PERMISSION_SENSITIVE_TOOLS = {"Bash", "Edit", "Write", "run_shell_command", "edit", "write_file"}
+
+        def _tool_input_to_text(tool_input: Any) -> str:
+            if isinstance(tool_input, str):
+                return tool_input
+            try:
+                return json.dumps(tool_input, ensure_ascii=False)
+            except Exception:
+                return str(tool_input)
 
         def _tool_input_to_text(tool_input: Any) -> str:
             if isinstance(tool_input, str):
@@ -287,7 +335,9 @@ class QwenCodeSdkBackend(ModelBackend):
             # Sandbox validation
             if sandbox_enabled and cwd and tool_name in SANDBOX_TOOLS:
                 from .bridge_ws import validate_tool_sandbox
-                _ok, _reason = validate_tool_sandbox(tool_name, _tool_input_to_text(tool_input), cwd)
+                _ok, _reason = validate_tool_sandbox(
+                    _display_tool_name(tool_name), _tool_input_to_text(tool_input), cwd
+                )
                 if not _ok:
                     print(f"[QwenSdk] sandbox violation: {tool_name} — {_reason}",
                           file=sys.stderr, flush=True)
@@ -305,14 +355,14 @@ class QwenCodeSdkBackend(ModelBackend):
             tool_input_str = _tool_input_to_text(tool_input)
             perm_payload = {
                 "id": context.get("tool_use_id", "") if isinstance(context, dict) else "",
-                "name": tool_name,
+                "name": _display_tool_name(tool_name),
                 "input": tool_input_str,
             }
             emit("permission_request", tool_call=perm_payload)
 
             req = PermissionRequest(session_id, message_id,
                                     context.get("tool_use_id", "") if isinstance(context, dict) else "",
-                                    tool_name, tool_input_str)
+                                    _display_tool_name(tool_name), tool_input_str)
             granted = await on_permission_request(req)
             if granted:
                 return {"behavior": "allow"}
@@ -360,7 +410,7 @@ class QwenCodeSdkBackend(ModelBackend):
                                 _tool_input = block.get("input", {})
                                 emit("tool_start", tool_call={
                                     "id": block.get("id", ""),
-                                    "name": _tool_name,
+                                    "name": _display_tool_name(_tool_name),
                                     "input": json.dumps(_tool_input, ensure_ascii=False),
                                     "status": "running",
                                 })
@@ -389,7 +439,7 @@ class QwenCodeSdkBackend(ModelBackend):
                             if block.get("type") == "tool_use":
                                 emit("tool_start", tool_call={
                                     "id": block.get("id", ""),
-                                    "name": block.get("name", ""),
+                                    "name": _display_tool_name(block.get("name", "")),
                                     "input": "",
                                     "status": "running",
                                 })
@@ -455,6 +505,14 @@ class QwenCodeSdkBackend(ModelBackend):
             traceback.print_exc()
             err_msg = _exc_msg(e)
             print(f"[QwenSdk] exception: {err_msg}", file=sys.stderr, flush=True)
+
+            if agent_session_id and isinstance(e, ProcessExitError):
+                print("[QwenSdk] resume process exited; clearing stale session and retrying without resume",
+                      file=sys.stderr, flush=True)
+                emit("resume_failed")
+                if not _done_emitted:
+                    emit("done")
+                return {"agentSessionId": None}
 
             # Check for stderr context
             if _stderr_lines:
