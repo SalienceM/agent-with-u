@@ -1093,10 +1093,13 @@ class BridgeWS:
             send_content = f"{send_content} --size {size}"
 
         result_parts: list[str] = []
+        result_errors: list[str] = []
 
         def on_delta(delta: StreamDelta):
             if delta.type == "text_delta" and delta.text:
                 result_parts.append(delta.text)
+            elif delta.type == "error" and delta.error:
+                result_errors.append(delta.error)
 
         try:
             await target_backend.send_message(
@@ -1109,6 +1112,9 @@ class BridgeWS:
             )
         except Exception as e:
             return 500, f"Skill execution error: {e}"
+
+        if result_errors:
+            return 500, "\n".join(result_errors)
 
         result = "".join(result_parts) or ""
         print(f"[bridge_ws] skill-call raw result ({len(result)} chars): {result[:120]!r}",
@@ -4002,10 +4008,13 @@ class BridgeWS:
             prompt = "(empty)"
 
         result_parts: list[str] = []
+        result_errors: list[str] = []
 
         def on_delta(delta: StreamDelta):
             if delta.type == "text_delta" and delta.text:
                 result_parts.append(delta.text)
+            elif delta.type == "error" and delta.error:
+                result_errors.append(delta.error)
 
         sub_message_id = new_id()
         try:
@@ -4020,6 +4029,9 @@ class BridgeWS:
             )
         except Exception as e:
             raise RuntimeError(f"Backend skill '{tool_name}' execution failed: {e}")
+
+        if result_errors:
+            raise RuntimeError("\n".join(result_errors))
 
         result = "".join(result_parts)
         if not result:
@@ -4109,7 +4121,8 @@ class BridgeWS:
             payload_parts.append(f'"{key}":"{placeholder}"')
         payload = '{' + ', '.join(payload_parts) + '}'
         return (
-            f'curl -s -X POST http://127.0.0.1:{port}/api/skill-call '
+            f'curl --noproxy 127.0.0.1,localhost -s -X POST '
+            f'http://127.0.0.1:{port}/api/skill-call '
             f'-H "Content-Type: application/json" '
             f"-d '{payload}'"
         )
@@ -4219,12 +4232,19 @@ description: {description}
             ref_image_line = f'if len(sys.argv) > {ref_image_argc} and sys.argv[{ref_image_argc}]:\n    payload["ref_image"] = sys.argv[{ref_image_argc}]\n'
 
         return f'''\
-import sys, json, urllib.request, urllib.error
+import os, sys, json, urllib.request, urllib.error
+# Local skill bridge calls must never go through HTTP(S)_PROXY. Some model
+# backends inject a proxy into the tool subprocess environment, and urllib would
+# otherwise send http://127.0.0.1:{port} through that proxy, often surfacing as a
+# misleading HTTP 502 from the proxy instead of reaching AgentWithU.
+os.environ.setdefault("NO_PROXY", "127.0.0.1,localhost")
+os.environ.setdefault("no_proxy", "127.0.0.1,localhost")
 payload = {{"skill": "{skill_name}", "{primary_field}": sys.argv[1] if len(sys.argv) > 1 else ""}}
 {extra_lines}{ref_image_line}data = json.dumps(payload).encode()
 req = urllib.request.Request("http://127.0.0.1:{port}/api/skill-call", data, {{"Content-Type": "application/json"}})
+_opener = urllib.request.build_opener(urllib.request.ProxyHandler({{}}))
 try:
-    result = urllib.request.urlopen(req, timeout=300).read()
+    result = _opener.open(req, timeout=300).read()
     sys.stdout.buffer.write(result)
     sys.stdout.buffer.write(b"\\n")
     sys.stdout.buffer.flush()
