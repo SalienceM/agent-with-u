@@ -521,6 +521,10 @@ class BridgeWS:
         self._cli_path = cli_path
         self._app_config_store = AppConfigStore()
         self._backends: dict[str, ModelBackend] = {}
+        # ★ LOOP 并发隔离：普通 chat 继续复用 backend 配置实例；LOOP/aside 的每次
+        #   agent 调用使用独立 backend 实例，并在这里短暂登记，避免同一 backend
+        #   配置/同类型 CLI 的多个 LOOP 并发时共享 SDK/CLI 运行态而串流、串 session。
+        self._loop_active_backends: dict[str, ModelBackend] = {}
         stored = self._backend_store.list()
         if stored:
             self._backend_configs: list[ModelBackendConfig] = list(stored)
@@ -1757,6 +1761,7 @@ class BridgeWS:
             backend = self._backends.get(session.backend_id)
             if backend:
                 backend.abort(session_id)
+        self._abort_loop_backend_calls(session_id)
         return None
 
     def _rpc_clearSessionContext(self, session_id: str) -> str:
@@ -2176,15 +2181,18 @@ class BridgeWS:
         backend_id 可为分析/转换步骤指定异构 backend（仅独立轮次用，找不到则回落会话 backend）。
         """
         backend = None
+        backend_config_id = backend_id or session.backend_id
         if backend_id and backend_id != session.backend_id:
             try:
-                backend = self._get_backend(backend_id)
+                backend = self._new_backend_instance(backend_id)
             except Exception as e:
                 print(f"[loop] eval backend '{backend_id}' 不可用，回落会话 backend：{e}",
                       file=sys.stderr, flush=True)
                 backend = None
+                backend_config_id = session.backend_id
         if backend is None:
-            backend = self._get_backend(session.backend_id)
+            backend_config_id = session.backend_id
+            backend = self._new_backend_instance(session.backend_id)
         mid = new_id()
         sid_for_backend = indep_session_id or session.id
         parts: list[str] = []
@@ -2219,6 +2227,12 @@ class BridgeWS:
             img_objs = img_objs or None
         new_sid: Optional[str] = None
         try:
+            self._loop_active_backends[sid_for_backend] = backend
+            print(
+                f"[loop] isolated backend call: cfg={backend_config_id!r}, "
+                f"session={session.id!r}, call_sid={sid_for_backend!r}",
+                file=sys.stderr, flush=True,
+            )
             # ★ agent_session_id 解析：显式传入 > session 绑定 > None
             effective_agent_sid = agent_session_id if agent_session_id is not None else (
                 session.agent_session_id if resume else None
@@ -2247,6 +2261,8 @@ class BridgeWS:
             self._emit_loop_progress(session.id, seq, sub_stage, f"\n❌ {e}\n")
         finally:
             backend.clear_cancelled(sid_for_backend)
+            if self._loop_active_backends.get(sid_for_backend) is backend:
+                self._loop_active_backends.pop(sid_for_backend, None)
         return "".join(parts), new_sid if resume or agent_session_id is not None else None
 
     def _rpc_loopGetState(self, session_id: str) -> str:
@@ -2573,19 +2589,7 @@ class BridgeWS:
         if session_id in self._loop_running:
             # 运行中：信号取消并中断当前 agent 轮次；删除在运行任务的 finally 里做
             self._loop_cancel[session_id] = restore
-            session = self._active_sessions.get(session_id) or self._session_store.load(session_id)
-            if session:
-                backend = self._backends.get(session.backend_id)
-                if backend:
-                    try:
-                        backend.abort(session.id)
-                    except Exception:
-                        pass
-                    for s in rec.orchestration:
-                        try:
-                            backend.abort(f"{session.id}:loop{rec.seq}:step{s.index}")
-                        except Exception:
-                            pass
+            self._abort_loop_backend_calls(session_id)
             return json.dumps({"status": "ok", "stopping": True, "seq": rec.seq}, ensure_ascii=False)
 
         session = self._active_sessions.get(session_id) or self._session_store.load(session_id)
@@ -3345,15 +3349,24 @@ class BridgeWS:
             # 旁路问答也可走专用 backend（独立上下文，安全）
             aside_backend_id = state.policy.backend_for("aside") if state else ""
             backend = None
+            backend_config_id = aside_backend_id or session.backend_id
             if aside_backend_id and aside_backend_id != session.backend_id:
                 try:
-                    backend = self._get_backend(aside_backend_id)
+                    backend = self._new_backend_instance(aside_backend_id)
                 except Exception:
                     backend = None
+                    backend_config_id = session.backend_id
             if backend is None:
-                backend = self._get_backend(session.backend_id)
+                backend_config_id = session.backend_id
+                backend = self._new_backend_instance(session.backend_id)
             aside_sid = f"{session_id}:aside"
             try:
+                self._loop_active_backends[aside_sid] = backend
+                print(
+                    f"[loop] isolated aside backend call: cfg={backend_config_id!r}, "
+                    f"session={session.id!r}, call_sid={aside_sid!r}",
+                    file=sys.stderr, flush=True,
+                )
                 await backend.send_message(
                     messages=[], content=prompt, images=images,
                     session_id=aside_sid, message_id=new_id(), on_delta=on_delta,
@@ -3364,6 +3377,8 @@ class BridgeWS:
                 )
             finally:
                 backend.clear_cancelled(aside_sid)
+                if self._loop_active_backends.get(aside_sid) is backend:
+                    self._loop_active_backends.pop(aside_sid, None)
 
             # 共享缓存对象，重新取一遍 turn 即可
             state = self._loop_state(session_id) or state
@@ -6283,6 +6298,30 @@ except urllib.error.URLError as e:
         backend = create_backend(config)
         self._backends[config_id] = backend
         return backend
+
+    def _new_backend_instance(self, config_id: str) -> ModelBackend:
+        """Create an uncached backend instance for concurrency-sensitive side paths.
+
+        Normal chat turns keep using ``_get_backend`` so long-lived backend objects can
+        preserve their usual per-config cache. LOOP turns, loop asides and other
+        side-path agent calls can run concurrently for multiple sessions; using a
+        fresh backend instance keeps SDK/CLI-local state, cancellation flags and
+        stream callbacks isolated even when they target the same configured backend.
+        """
+        config = next((c for c in self._backend_configs if c.id == config_id), None)
+        if not config:
+            raise ValueError(f"未找到后端配置: {config_id}")
+        return create_backend(config)
+
+    def _abort_loop_backend_calls(self, session_id: str) -> None:
+        """Abort active isolated LOOP backend calls for one loop session."""
+        prefix = f"{session_id}:"
+        for call_sid, backend in list(self._loop_active_backends.items()):
+            if call_sid == session_id or call_sid.startswith(prefix):
+                try:
+                    backend.abort(call_sid)
+                except Exception:
+                    pass
 
     def _build_asset_context_block(self) -> Optional[str]:
         """
