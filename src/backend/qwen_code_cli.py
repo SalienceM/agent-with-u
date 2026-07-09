@@ -1,4 +1,4 @@
-"""QwenCodeSdkBackend — uses qwen-code-sdk (official Python SDK).
+"""QwenCodeCliBackend — uses qwen-code-sdk (official Python SDK).
 
 Migration from manual CLI subprocess to official SDK:
   - Old: subprocess.Popen("qwen -p <content> -o stream-json") + manual JSON parsing
@@ -17,14 +17,11 @@ Message format compatibility:
 """
 import os
 import sys
-import asyncio
 import json
-from typing import Optional, Callable, Awaitable
+from typing import Optional, Callable, Awaitable, Any
 
 from ..types import ModelBackendConfig, ChatMessage, ImageAttachment, ToolCallInfo, new_id
 from .base import ModelBackend, StreamDelta, PermissionRequest, _exc_msg
-from . import paths
-
 
 # ---------------------------------------------------------------------------
 #  CLI path resolution (fallback if SDK needs it)
@@ -50,11 +47,13 @@ def resolve_qwen_cli(config_cli_path: Optional[str] = None) -> str:
 #  Backend implementation
 # ---------------------------------------------------------------------------
 
-class QwenCodeSdkBackend(ModelBackend):
+class QwenCodeCliBackend(ModelBackend):
     """Qwen Code SDK backend.
 
     Uses the official `qwen-code-sdk` Python package for proper integration.
-    System prompt injection is handled correctly via `append_system_prompt`.
+    Keeps feature parity with ClaudeAgentBackend by enabling Skill, Task/subagent,
+    TodoWrite, and ExitPlanMode tools when the backend config does not override
+    tool selection. System prompt injection is handled via `append_system_prompt`.
     """
 
     def _resolve_cli(self) -> str:
@@ -185,11 +184,19 @@ class QwenCodeSdkBackend(ModelBackend):
                      or "openai")
 
         # Allowed tools
-        tools: list[str] = list(getattr(self.config, "allowed_tools", None) or [
-            "Read", "Edit", "Bash", "Glob", "Grep", "Write"
-        ])
-        if "Skill" not in tools:
-            tools.append("Skill")
+        configured_tools = list(getattr(self.config, "allowed_tools", None) or [])
+        default_agent_tools = [
+            "Read", "Edit", "Bash", "Glob", "Grep", "Write",
+            # Qwen Code official agent capabilities: skills, subagents, planning,
+            # and todos are exposed as normal tools in the SDK/CLI.
+            "Skill", "Task", "TodoWrite", "ExitPlanMode",
+            # Useful built-ins that bring Qwen closer to the Claude agent surface.
+            "WebFetch", "WebSearch", "MultiEdit",
+        ]
+        tools: list[str] = configured_tools or default_agent_tools
+        for required_tool in ("Skill", "Task", "TodoWrite", "ExitPlanMode"):
+            if required_tool not in tools:
+                tools.append(required_tool)
 
         # Permission mode
         if skip_permissions is None:
@@ -266,13 +273,21 @@ class QwenCodeSdkBackend(ModelBackend):
         # Permission-sensitive tools
         PERMISSION_SENSITIVE_TOOLS = {"Bash", "Edit", "Write"}
 
+        def _tool_input_to_text(tool_input: Any) -> str:
+            if isinstance(tool_input, str):
+                return tool_input
+            try:
+                return json.dumps(tool_input, ensure_ascii=False)
+            except Exception:
+                return str(tool_input)
+
         # Permission callback
         async def _can_use_tool(tool_name: str, tool_input: dict, context) -> dict:
             """SDK permission callback. Returns PermissionAllowResult or PermissionDenyResult."""
             # Sandbox validation
             if sandbox_enabled and cwd and tool_name in SANDBOX_TOOLS:
                 from .bridge_ws import validate_tool_sandbox
-                _ok, _reason = validate_tool_sandbox(tool_name, tool_input, cwd)
+                _ok, _reason = validate_tool_sandbox(tool_name, _tool_input_to_text(tool_input), cwd)
                 if not _ok:
                     print(f"[QwenSdk] sandbox violation: {tool_name} — {_reason}",
                           file=sys.stderr, flush=True)
@@ -287,7 +302,7 @@ class QwenCodeSdkBackend(ModelBackend):
                 return {"behavior": "allow"}
 
             # Send permission request to frontend
-            tool_input_str = json.dumps(tool_input, ensure_ascii=False) if isinstance(tool_input, dict) else str(tool_input)
+            tool_input_str = _tool_input_to_text(tool_input)
             perm_payload = {
                 "id": context.get("tool_use_id", "") if isinstance(context, dict) else "",
                 "name": tool_name,
@@ -310,7 +325,6 @@ class QwenCodeSdkBackend(ModelBackend):
         _new_agent_sid: Optional[str] = agent_session_id
         _done_emitted = False
         _usage: Optional[dict] = None
-        _suppress_exit_error = False
 
         try:
             async with sdk_query(prompt, options) as result:
@@ -331,8 +345,6 @@ class QwenCodeSdkBackend(ModelBackend):
                         # Assistant message: contains content blocks
                         msg_dict = dict(message)
                         msg_content = msg_dict.get("message", {}).get("content", [])
-                        msg_id = msg_dict.get("id", "")
-
                         for block in msg_content:
                             btype = block.get("type", "")
                             if btype == "text":
@@ -412,7 +424,6 @@ class QwenCodeSdkBackend(ModelBackend):
                                 "缺少", "api key", "认证",
                             ))
                             if _is_auth_or_network:
-                                _suppress_exit_error = True
                                 emit("text_delta", text=(
                                     "\n\n---\n\n"
                                     "💡 **认证或网络问题，请检查：**\n\n"
@@ -454,3 +465,7 @@ class QwenCodeSdkBackend(ModelBackend):
                 emit("done")
 
         return {"agentSessionId": _new_agent_sid}
+
+
+# Backward-compatible name used by early integration reports/tests.
+QwenCodeSdkBackend = QwenCodeCliBackend

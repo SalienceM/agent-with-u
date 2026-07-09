@@ -6,7 +6,7 @@ from .claude_code import ClaudeCodeOfficialBackend
 from .openai_compat import OpenAICompatibleBackend
 from .anthropic_api import AnthropicAPIBackend
 from .dashscope_image import DashScopeImageBackend
-from .qwen_code_cli import QwenCodeSdkBackend
+from .qwen_code_cli import QwenCodeCliBackend
 
 
 def create_backend(config: ModelBackendConfig) -> ModelBackend:
@@ -22,6 +22,6 @@ def create_backend(config: ModelBackendConfig) -> ModelBackend:
     elif config.type == BackendType.DASHSCOPE_IMAGE:
         return DashScopeImageBackend(config)
     elif config.type == BackendType.QWEN_CODE_CLI:
-        return QwenCodeSdkBackend(config)
+        return QwenCodeCliBackend(config)
     else:
         raise ValueError(f"Unknown backend type: {config.type}")
