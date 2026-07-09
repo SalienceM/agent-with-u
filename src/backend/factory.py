@@ -7,6 +7,7 @@ from .openai_compat import OpenAICompatibleBackend
 from .anthropic_api import AnthropicAPIBackend
 from .dashscope_image import DashScopeImageBackend
 from .qwen_code_cli import QwenCodeSdkBackend
+from .codex_office import CodexOfficeBackend
 
 
 def create_backend(config: ModelBackendConfig) -> ModelBackend:
@@ -23,5 +24,7 @@ def create_backend(config: ModelBackendConfig) -> ModelBackend:
         return DashScopeImageBackend(config)
     elif config.type == BackendType.QWEN_CODE_CLI:
         return QwenCodeSdkBackend(config)
+    elif config.type == BackendType.CODEX_OFFICIAL:
+        return CodexOfficeBackend(config)
     else:
         raise ValueError(f"Unknown backend type: {config.type}")
