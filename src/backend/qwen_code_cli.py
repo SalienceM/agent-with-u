@@ -416,6 +416,7 @@ class QwenCodeSdkBackend(ModelBackend):
         _new_agent_sid: Optional[str] = agent_session_id
         _done_emitted = False
         _usage: Optional[dict] = None
+        _saw_partial_event = False
 
         try:
             async with sdk_query(prompt, options) as result:
@@ -433,7 +434,12 @@ class QwenCodeSdkBackend(ModelBackend):
                         break
 
                     if is_sdk_assistant_message(message):
-                        # Assistant message: contains content blocks
+                        # Assistant messages contain the completed assistant content.
+                        # When include_partial_messages=True, Qwen also sends stream_event
+                        # deltas for the same content; emitting both causes the final
+                        # answer/thinking/tool transcript to appear twice in the UI.
+                        if _saw_partial_event:
+                            continue
                         msg_dict = dict(message)
                         msg_content = msg_dict.get("message", {}).get("content", [])
                         for block in msg_content:
@@ -457,6 +463,7 @@ class QwenCodeSdkBackend(ModelBackend):
                                 })
 
                     elif is_sdk_partial_assistant_message(message):
+                        _saw_partial_event = True
                         # Partial message: stream_event with content_block_delta/start/stop
                         msg_dict = dict(message)
                         event = msg_dict.get("event", {})
