@@ -17,14 +17,11 @@ Message format compatibility:
 """
 import os
 import sys
-import asyncio
 import json
-from typing import Optional, Callable, Awaitable
+from typing import Optional, Callable, Awaitable, Any
 
-from ..types import ModelBackendConfig, ChatMessage, ImageAttachment, ToolCallInfo, new_id
-from .base import ModelBackend, StreamDelta, PermissionRequest, _exc_msg
-from . import paths
-
+from ..types import ModelBackendConfig, ChatMessage, ImageAttachment
+from .base import ModelBackend, StreamDelta, PermissionRequest, _exc_msg, cli_available, cli_missing_message
 
 # ---------------------------------------------------------------------------
 #  CLI path resolution (fallback if SDK needs it)
@@ -54,11 +51,61 @@ class QwenCodeSdkBackend(ModelBackend):
     """Qwen Code SDK backend.
 
     Uses the official `qwen-code-sdk` Python package for proper integration.
-    System prompt injection is handled correctly via `append_system_prompt`.
+    Keeps feature parity with ClaudeAgentBackend by enabling Skill, Task/subagent,
+    TodoWrite, and ExitPlanMode tools when the backend config does not override
+    tool selection. System prompt injection is handled via `append_system_prompt`.
     """
 
     def _resolve_cli(self) -> str:
         return resolve_qwen_cli(getattr(self.config, "cli_path", None))
+
+
+    def _ensure_project_auth_settings(self, cwd: str, auth_type: str, model: Optional[str]) -> None:
+        """Ensure Qwen CLI has a non-interactive auth selection.
+
+        Some Qwen CLI versions still require `security.auth.selectedType` in
+        settings even when the SDK passes `--auth-type`.  Keep this file in the
+        session/project workspace (not the user's home) and only write non-secret
+        routing metadata; API keys remain in the process environment.
+        """
+        if not cwd:
+            return
+        try:
+            from pathlib import Path as _Path
+            settings_dir = _Path(cwd) / ".qwen"
+            settings_path = settings_dir / "settings.json"
+            data: dict[str, Any] = {}
+            if settings_path.exists():
+                try:
+                    loaded = json.loads(settings_path.read_text(encoding="utf-8"))
+                    if isinstance(loaded, dict):
+                        data = loaded
+                except Exception:
+                    data = {}
+
+            security = data.setdefault("security", {})
+            if not isinstance(security, dict):
+                security = {}
+                data["security"] = security
+            auth = security.setdefault("auth", {})
+            if not isinstance(auth, dict):
+                auth = {}
+                security["auth"] = auth
+            auth["selectedType"] = auth_type
+
+            if model and model not in ("default",):
+                model_cfg = data.setdefault("model", {})
+                if not isinstance(model_cfg, dict):
+                    model_cfg = {}
+                    data["model"] = model_cfg
+                model_cfg.setdefault("name", model)
+
+            settings_dir.mkdir(parents=True, exist_ok=True)
+            settings_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+            print(f"[QwenSdk] ensured project auth settings: {settings_path} selectedType={auth_type}",
+                  file=sys.stderr, flush=True)
+        except Exception as e:
+            print(f"[QwenSdk] failed to ensure project auth settings: {e}", file=sys.stderr, flush=True)
 
     def _build_env(self) -> dict:
         """Build environment dict for SDK.
@@ -166,6 +213,7 @@ class QwenCodeSdkBackend(ModelBackend):
         try:
             from qwen_code_sdk import query as sdk_query
             from qwen_code_sdk import (
+                ProcessExitError,
                 is_sdk_assistant_message,
                 is_sdk_result_message,
                 is_sdk_partial_assistant_message,
@@ -185,11 +233,38 @@ class QwenCodeSdkBackend(ModelBackend):
                      or "openai")
 
         # Allowed tools
-        tools: list[str] = list(getattr(self.config, "allowed_tools", None) or [
-            "Read", "Edit", "Bash", "Glob", "Grep", "Write"
-        ])
-        if "Skill" not in tools:
-            tools.append("Skill")
+        # Qwen Code expects native snake_case tool IDs (for example
+        # `run_shell_command`, `todo_write`, `agent`, `exit_plan_mode`).  Do not
+        # pass Claude-style CamelCase defaults here: the CLI validates tool IDs
+        # during SDK initialization and exits with code 1 for unknown names.  When
+        # no explicit backend allow-list is configured, omit `allowed_tools` so
+        # Qwen enables its full built-in agent surface.
+        configured_tools = list(getattr(self.config, "allowed_tools", None) or [])
+        tool_aliases = {
+            "Read": "read_file",
+            "Write": "write_file",
+            "Edit": "edit",
+            "Bash": "run_shell_command",
+            "Glob": "glob",
+            "Grep": "grep_search",
+            "TodoWrite": "todo_write",
+            "Task": "agent",
+            "ExitPlanMode": "exit_plan_mode",
+            "WebFetch": "web_fetch",
+            "NotebookEdit": "notebook_edit",
+        }
+        tools: list[str] = []
+        if configured_tools:
+            seen_tools: set[str] = set()
+            for tool in configured_tools:
+                native_tool = tool_aliases.get(tool, tool)
+                if native_tool and native_tool not in seen_tools:
+                    tools.append(native_tool)
+                    seen_tools.add(native_tool)
+            for required_tool in ("todo_write", "agent", "exit_plan_mode"):
+                if required_tool not in seen_tools:
+                    tools.append(required_tool)
+                    seen_tools.add(required_tool)
 
         # Permission mode
         if skip_permissions is None:
@@ -198,6 +273,7 @@ class QwenCodeSdkBackend(ModelBackend):
 
         # Environment
         env_dict = self._build_env()
+        self._ensure_project_auth_settings(cwd, auth_type, model)
         print(f"[QwenSdk] auth: {auth_type}, model={model!r}, permission_mode={permission_mode}",
               file=sys.stderr, flush=True)
 
@@ -229,17 +305,29 @@ class QwenCodeSdkBackend(ModelBackend):
         else:
             prompt = content
 
+        qwen_cli = self._resolve_cli()
+        if not cli_available(qwen_cli):
+            emit("error", error=cli_missing_message(
+                "Qwen Code",
+                qwen_cli,
+                "npm install -g @qwen-code/qwen-code@latest",
+                "Qwen Code 官方文档要求较新的 Node.js；若安装后仍不可用，请确认 npm global bin 已加入 PATH。",
+            ))
+            emit("done")
+            return {"agentSessionId": agent_session_id}
+
         # SDK options
         options = {
             "cwd": cwd,
             "model": model if model and model not in ("default",) else None,
-            "path_to_qwen_executable": self._resolve_cli(),
+            "path_to_qwen_executable": qwen_cli,
             "permission_mode": permission_mode,
-            "allowed_tools": tools,
             "auth_type": auth_type,
             "include_partial_messages": True,  # Stream partial messages
             "env": env_dict if env_dict else None,
         }
+        if tools:
+            options["allowed_tools"] = tools
 
         # System prompt injection (★ KEY IMPROVEMENT)
         if constraints:
@@ -260,11 +348,38 @@ class QwenCodeSdkBackend(ModelBackend):
                 print(f"[QwenSdk][stderr] {line}", file=sys.stderr, flush=True)
         options["stderr"] = _on_stderr
 
+        def _display_tool_name(tool_name: str) -> str:
+            return {
+                "read_file": "Read",
+                "write_file": "Write",
+                "edit": "Edit",
+                "run_shell_command": "Bash",
+                "glob": "Glob",
+                "grep_search": "Grep",
+                "notebook_edit": "NotebookEdit",
+                "todo_write": "TodoWrite",
+                "agent": "Task",
+                "exit_plan_mode": "ExitPlanMode",
+                "web_fetch": "WebFetch",
+            }.get(tool_name, tool_name)
+
         # Sandbox tools
-        SANDBOX_TOOLS = {"Read", "Write", "Edit", "Bash", "Glob", "Grep", "NotebookEdit"}
+        SANDBOX_TOOLS = {
+            "Read", "Write", "Edit", "Bash", "Glob", "Grep", "NotebookEdit",
+            "read_file", "write_file", "edit", "run_shell_command", "glob",
+            "grep_search", "notebook_edit",
+        }
 
         # Permission-sensitive tools
-        PERMISSION_SENSITIVE_TOOLS = {"Bash", "Edit", "Write"}
+        PERMISSION_SENSITIVE_TOOLS = {"Bash", "Edit", "Write", "run_shell_command", "edit", "write_file"}
+
+        def _tool_input_to_text(tool_input: Any) -> str:
+            if isinstance(tool_input, str):
+                return tool_input
+            try:
+                return json.dumps(tool_input, ensure_ascii=False)
+            except Exception:
+                return str(tool_input)
 
         # Permission callback
         async def _can_use_tool(tool_name: str, tool_input: dict, context) -> dict:
@@ -272,7 +387,9 @@ class QwenCodeSdkBackend(ModelBackend):
             # Sandbox validation
             if sandbox_enabled and cwd and tool_name in SANDBOX_TOOLS:
                 from .bridge_ws import validate_tool_sandbox
-                _ok, _reason = validate_tool_sandbox(tool_name, tool_input, cwd)
+                _ok, _reason = validate_tool_sandbox(
+                    _display_tool_name(tool_name), _tool_input_to_text(tool_input), cwd
+                )
                 if not _ok:
                     print(f"[QwenSdk] sandbox violation: {tool_name} — {_reason}",
                           file=sys.stderr, flush=True)
@@ -287,17 +404,17 @@ class QwenCodeSdkBackend(ModelBackend):
                 return {"behavior": "allow"}
 
             # Send permission request to frontend
-            tool_input_str = json.dumps(tool_input, ensure_ascii=False) if isinstance(tool_input, dict) else str(tool_input)
+            tool_input_str = _tool_input_to_text(tool_input)
             perm_payload = {
                 "id": context.get("tool_use_id", "") if isinstance(context, dict) else "",
-                "name": tool_name,
+                "name": _display_tool_name(tool_name),
                 "input": tool_input_str,
             }
             emit("permission_request", tool_call=perm_payload)
 
             req = PermissionRequest(session_id, message_id,
                                     context.get("tool_use_id", "") if isinstance(context, dict) else "",
-                                    tool_name, tool_input_str)
+                                    _display_tool_name(tool_name), tool_input_str)
             granted = await on_permission_request(req)
             if granted:
                 return {"behavior": "allow"}
@@ -310,7 +427,7 @@ class QwenCodeSdkBackend(ModelBackend):
         _new_agent_sid: Optional[str] = agent_session_id
         _done_emitted = False
         _usage: Optional[dict] = None
-        _suppress_exit_error = False
+        _saw_partial_event = False
 
         try:
             async with sdk_query(prompt, options) as result:
@@ -328,11 +445,14 @@ class QwenCodeSdkBackend(ModelBackend):
                         break
 
                     if is_sdk_assistant_message(message):
-                        # Assistant message: contains content blocks
+                        # Assistant messages contain the completed assistant content.
+                        # When include_partial_messages=True, Qwen also sends stream_event
+                        # deltas for the same content; emitting both causes the final
+                        # answer/thinking/tool transcript to appear twice in the UI.
+                        if _saw_partial_event:
+                            continue
                         msg_dict = dict(message)
                         msg_content = msg_dict.get("message", {}).get("content", [])
-                        msg_id = msg_dict.get("id", "")
-
                         for block in msg_content:
                             btype = block.get("type", "")
                             if btype == "text":
@@ -348,18 +468,17 @@ class QwenCodeSdkBackend(ModelBackend):
                                 _tool_input = block.get("input", {})
                                 emit("tool_start", tool_call={
                                     "id": block.get("id", ""),
-                                    "name": _tool_name,
+                                    "name": _display_tool_name(_tool_name),
                                     "input": json.dumps(_tool_input, ensure_ascii=False),
                                     "status": "running",
                                 })
 
                     elif is_sdk_partial_assistant_message(message):
+                        _saw_partial_event = True
                         # Partial message: stream_event with content_block_delta/start/stop
                         msg_dict = dict(message)
                         event = msg_dict.get("event", {})
                         etype = event.get("type", "")
-                        msg_uuid = msg_dict.get("uuid", "")
-
                         if etype == "content_block_delta":
                             delta = event.get("delta", {})
                             dtype = delta.get("type", "")
@@ -377,7 +496,7 @@ class QwenCodeSdkBackend(ModelBackend):
                             if block.get("type") == "tool_use":
                                 emit("tool_start", tool_call={
                                     "id": block.get("id", ""),
-                                    "name": block.get("name", ""),
+                                    "name": _display_tool_name(block.get("name", "")),
                                     "input": "",
                                     "status": "running",
                                 })
@@ -412,7 +531,6 @@ class QwenCodeSdkBackend(ModelBackend):
                                 "缺少", "api key", "认证",
                             ))
                             if _is_auth_or_network:
-                                _suppress_exit_error = True
                                 emit("text_delta", text=(
                                     "\n\n---\n\n"
                                     "💡 **认证或网络问题，请检查：**\n\n"
@@ -435,15 +553,32 @@ class QwenCodeSdkBackend(ModelBackend):
                                 "outputTokens": usage.get("output_tokens", 0),
                             }
 
-            # Stream completed normally
-            _done_emitted = True
-            emit("done", **(_usage and {"usage": _usage} or {}))
+                        # Qwen SDK may keep the underlying process/generator alive briefly
+                        # after the terminal result message.  Emit `done` as soon as the
+                        # result arrives so the UI stops showing the streaming cursor, then
+                        # break and let the context manager clean up in the background path.
+                        _done_emitted = True
+                        emit("done", **(_usage and {"usage": _usage} or {}))
+                        break
+
+            # Stream completed normally without an explicit result message.
+            if not _done_emitted:
+                _done_emitted = True
+                emit("done", **(_usage and {"usage": _usage} or {}))
 
         except Exception as e:
             import traceback
             traceback.print_exc()
             err_msg = _exc_msg(e)
             print(f"[QwenSdk] exception: {err_msg}", file=sys.stderr, flush=True)
+
+            if agent_session_id and isinstance(e, ProcessExitError):
+                print("[QwenSdk] resume process exited; clearing stale session and retrying without resume",
+                      file=sys.stderr, flush=True)
+                emit("resume_failed")
+                if not _done_emitted:
+                    emit("done")
+                return {"agentSessionId": None}
 
             # Check for stderr context
             if _stderr_lines:
