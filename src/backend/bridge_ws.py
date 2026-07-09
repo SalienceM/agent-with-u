@@ -4263,23 +4263,55 @@ except urllib.error.URLError as e:
     sys.exit(1)
 '''
 
-    def _sync_backend_skills_to_directory(self, session: Session):
-        """
-        将 session 绑定的 Backend Skills 部署到 working_dir/.claude/skills/，
-        同时清理不再绑定的 Backend Skill。
+    def _skill_deploy_roots_for_session(self, session: Session) -> list[tuple[str, "_Path"]]:
+        """Return agent-native project skill roots for the current runtime.
+
+        Claude Code discovers project skills from `.claude/skills/`; Qwen Code
+        discovers project skills from `.qwen/skills/`.  Loops can route one
+        session through multiple local agent backends, so deploy to every native
+        root whose backend type exists in the current backend configuration.
         """
         from pathlib import Path as _Path
 
         working_dir = session.working_dir
         if not working_dir or working_dir == ".":
+            return []
+
+        backend_types = {cfg.type for cfg in self._backend_configs}
+        active_cfg = next((cfg for cfg in self._backend_configs if cfg.id == session.backend_id), None)
+        if active_cfg:
+            backend_types.add(active_cfg.type)
+
+        roots: list[tuple[str, _Path]] = []
+        if (BackendType.CLAUDE_AGENT_SDK in backend_types
+                or BackendType.CLAUDE_CODE_OFFICIAL in backend_types):
+            roots.append(("claude", _Path(working_dir) / ".claude" / "skills"))
+        if BackendType.QWEN_CODE_CLI in backend_types:
+            roots.append(("qwen", _Path(working_dir) / ".qwen" / "skills"))
+
+        # Backward-compatible default: existing installations expected .claude.
+        if not roots:
+            roots.append(("claude", _Path(working_dir) / ".claude" / "skills"))
+        return roots
+
+    def _sync_backend_skills_to_directory(self, session: Session):
+        """
+        将 session 绑定的 Backend Skills 部署到本地 agent 原生目录：
+        - Claude Code: working_dir/.claude/skills/
+        - Qwen Code:   working_dir/.qwen/skills/
+
+        同时清理不再绑定的系统部署 Backend Skill。
+        """
+        roots = self._skill_deploy_roots_for_session(session)
+        if not roots:
             return
 
-        skills_dir = _Path(working_dir) / ".claude" / "skills"
         abilities = session.abilities or {}
         bound_skills = set(abilities.get("skills", []))
 
         # 收集当前绑定中的系统增强型 Skills（有 backend 或 type 字段）
         deployed_backend_skills: set[str] = set()
+        deploy_payloads: dict[str, tuple[str, str]] = {}
         for sname in bound_skills:
             info = self._skill_store.get_skill(sname)
             if not info:
@@ -4293,33 +4325,37 @@ except urllib.error.URLError as e:
                 bc = next((c for c in self._backend_configs if c.id == backend_id), None)
                 if bc and bc.type.value == "dashscope-image":
                     is_image_backend = True
-            # 系统增强型：部署 SKILL.md + _call.py
-            target = skills_dir / sname
-            target.mkdir(parents=True, exist_ok=True)
-            (target / "SKILL.md").write_text(
-                self._generate_backend_skill_md(sname, info, is_image_backend=is_image_backend), encoding="utf-8")
-            (target / "_call.py").write_text(
-                self._generate_backend_skill_call_py(sname, info, is_image_backend=is_image_backend), encoding="utf-8")
+            deploy_payloads[sname] = (
+                self._generate_backend_skill_md(sname, info, is_image_backend=is_image_backend),
+                self._generate_backend_skill_call_py(sname, info, is_image_backend=is_image_backend),
+            )
             deployed_backend_skills.add(sname)
-            print(f"[bridge_ws] Deployed Backend Skill '{sname}' → {target}",
-                  file=sys.stderr, flush=True)
 
-        # 清理不再绑定的 Backend Skill（通过 _call.py 存在判断是否为系统部署的）
-        if skills_dir.exists():
-            for skill_dir in skills_dir.iterdir():
-                if not skill_dir.is_dir():
-                    continue
-                if skill_dir.name in deployed_backend_skills:
-                    continue
-                if skill_dir.name in bound_skills:
-                    continue
-                call_py = skill_dir / "_call.py"
-                if call_py.exists():
-                    # 系统部署的 Backend Skill，解绑后清理
-                    import shutil as _shutil
-                    _shutil.rmtree(skill_dir, ignore_errors=True)
-                    print(f"[bridge_ws] Cleaned up unbound Backend Skill '{skill_dir.name}'",
-                          file=sys.stderr, flush=True)
+        for agent_name, skills_dir in roots:
+            for sname, (skill_md, call_py) in deploy_payloads.items():
+                target = skills_dir / sname
+                target.mkdir(parents=True, exist_ok=True)
+                (target / "SKILL.md").write_text(skill_md, encoding="utf-8")
+                (target / "_call.py").write_text(call_py, encoding="utf-8")
+                print(f"[bridge_ws] Deployed Backend Skill '{sname}' → {target} ({agent_name})",
+                      file=sys.stderr, flush=True)
+
+            # 清理不再绑定的 Backend Skill（通过 _call.py 存在判断是否为系统部署的）
+            if skills_dir.exists():
+                for skill_dir in skills_dir.iterdir():
+                    if not skill_dir.is_dir():
+                        continue
+                    if skill_dir.name in deployed_backend_skills:
+                        continue
+                    if skill_dir.name in bound_skills:
+                        continue
+                    call_py = skill_dir / "_call.py"
+                    if call_py.exists():
+                        # 系统部署的 Backend Skill，解绑后清理
+                        import shutil as _shutil
+                        _shutil.rmtree(skill_dir, ignore_errors=True)
+                        print(f"[bridge_ws] Cleaned up unbound Backend Skill '{skill_dir.name}' from {skills_dir}",
+                              file=sys.stderr, flush=True)
 
     @staticmethod
     def _build_sandbox_constraints(session: "Session") -> str | None:
