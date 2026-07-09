@@ -39,6 +39,7 @@ class BackendStore:
                         skip_permissions=item.get("skipPermissions", True),
                         env=item.get("env"),
                         extra_headers=item.get("extraHeaders"),
+                        cli_path=item.get("cliPath"),
                         mcp_servers=item.get("mcpServers"),
                     )
                     self._configs[config.id] = config
@@ -72,6 +73,7 @@ class BackendStore:
             "skipPermissions": config.skip_permissions,
             "env": config.env,
             "extraHeaders": config.extra_headers,
+            "cliPath": config.cli_path,
             "mcpServers": config.mcp_servers,
         }
 
@@ -129,6 +131,7 @@ class BackendStore:
                     skip_permissions=item.get("skipPermissions", True),
                     env=item.get("env"),
                     extra_headers=item.get("extraHeaders"),
+                    cli_path=item.get("cliPath"),
                     mcp_servers=item.get("mcpServers"),
                 )
                 self._configs[config.id] = config

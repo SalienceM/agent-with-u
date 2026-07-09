@@ -29,6 +29,7 @@ interface BackendConfig {
   extraHeaders?: Record<string, string>;
   mcpServers?: Record<string, any>;
   pinned?: boolean;  // 固定后端，不可删除
+  cliPath?: string;  // qwen-code-cli: 自定义 CLI 路径
 }
 
 const OFFICIAL_BACKEND_ID = 'official-claude';
@@ -240,6 +241,18 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
       saved.skipPermissions = formData.skipPermissions !== false;
       if (formData.allowedTools?.length) saved.allowedTools = formData.allowedTools;
       if (formData.mcpServers && Object.keys(formData.mcpServers).length > 0) saved.mcpServers = formData.mcpServers;
+    } else if (formData.type === 'qwen-code-cli') {
+      // CLI path, model, env (DASHSCOPE_API_KEY, provider, etc.), allowedTools, skipPermissions
+      const cleanedEnv: Record<string, string> = {};
+      Object.entries(formData.env || {}).forEach(([k, v]) => {
+        if (v && v.trim()) cleanedEnv[k] = v.trim();
+      });
+      if (Object.keys(cleanedEnv).length > 0) saved.env = cleanedEnv;
+      if (formData.model?.trim()) saved.model = formData.model.trim();
+      saved.skipPermissions = formData.skipPermissions !== false;
+      if (formData.allowedTools?.length) saved.allowedTools = formData.allowedTools;
+      // cliPath stored as a top-level field
+      if (formData.cliPath?.trim()) (saved as any).cliPath = formData.cliPath.trim();
     } else if (formData.type === 'openai-compatible') {
       // base_url, api_key, model, extra_headers
       if (formData.baseUrl?.trim()) saved.baseUrl = formData.baseUrl.trim();
@@ -470,6 +483,9 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
                         {backend.type === 'claude-code-official' && (
                           <span> · 官方账户{backend.env?.HTTPS_PROXY ? ' · 代理✓' : ' · ⚠️无代理'}</span>
                         )}
+                        {backend.type === 'qwen-code-cli' && (
+                          <span> · Qwen CLI{backend.model ? ` · 🤖${backend.model}` : ''}{backend.env?.DASHSCOPE_API_KEY ? ' · 🔑' : ' · ⚠️无Key'}</span>
+                        )}
                         {(backend.type === 'openai-compatible' || backend.type === 'anthropic-api' || backend.type === 'claude-code-official' || backend.type === 'dashscope-image') && backend.model && (
                           <span> · 🤖{backend.model}</span>
                         )}
@@ -543,12 +559,13 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
                           apiKey: '',
                           env: {},
                           extraHeaders: undefined,
-                          skipPermissions: newType === 'claude-agent-sdk' ? true : undefined,
+                          skipPermissions: (newType === 'claude-agent-sdk' || newType === 'qwen-code-cli') ? true : undefined,
                         });
                       }}
                       style={selectStyle}
                     >
                       <option value="claude-agent-sdk">Claude Agent SDK</option>
+                      <option value="qwen-code-cli">Qwen Code CLI</option>
                       <option value="openai-compatible">OpenAI Compatible</option>
                       <option value="anthropic-api">Anthropic API</option>
                       <option value="dashscope-image">DashScope 文生图（万象/Wan）</option>
@@ -848,8 +865,308 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
               </div>
             )}
 
-            {/* ── MCP Servers 配置（claude-agent-sdk / claude-code-official）── */}
-            {(formData.type === 'claude-agent-sdk' || formData.type === 'claude-code-official' || formData.pinned) && (
+            {/* ── Qwen Code CLI 专属配置 ── */}
+            {formData.type === 'qwen-code-cli' && (
+              <div style={{ marginBottom: 16, padding: 12, background: 'var(--theme-bg-secondary)', borderRadius: 8 }}>
+                <label style={{ ...labelStyle, marginBottom: 8 }}>Qwen Code CLI 配置</label>
+                <p style={{ fontSize: 11, color: 'var(--theme-text-muted)', margin: '0 0 12px 0', lineHeight: 1.6 }}>
+                  基于 <code style={{ fontSize: 10, background: 'rgba(255,255,255,0.08)', padding: '1px 4px', borderRadius: 3 }}>qwen</code> CLI 子进程 + stream-json 解析。
+                  需先安装：<code style={{ fontSize: 10 }}>npm install -g @qwen-code/qwen-code@latest</code>（要求 Node.js ≥ 22）。
+                </p>
+
+                {/* CLI 路径覆盖 */}
+                <div style={{ marginBottom: 10 }}>
+                  <label style={{ fontSize: 11, color: 'var(--theme-text)', display: 'block', marginBottom: 4 }}>
+                    CLI 路径（可选，留空自动从 PATH / npm global 解析）
+                  </label>
+                  <input
+                    type="text"
+                    value={formData.cliPath || ''}
+                    onChange={(e) => setFormData({ ...formData, cliPath: e.target.value })}
+                    style={inputStyle}
+                    placeholder="e.g., C:\Users\xxx\AppData\Roaming\npm\qwen.cmd（留空自动解析）"
+                  />
+                </div>
+
+                {/* 模型选择 */}
+                <div style={{ marginBottom: 10 }}>
+                  <label style={{ fontSize: 11, color: 'var(--theme-text)', display: 'block', marginBottom: 4 }}>
+                    模型（-m 参数）
+                  </label>
+                  <input
+                    type="text"
+                    value={formData.model || ''}
+                    onChange={(e) => setFormData({ ...formData, model: e.target.value })}
+                    style={inputStyle}
+                    placeholder="qwen-plus / qwen3-coder / qwen-max（留空使用 CLI 默认）"
+                  />
+                </div>
+
+                {/* Provider / auth-type 选择 */}
+                <div style={{ marginBottom: 10 }}>
+                  <label style={{ fontSize: 11, color: 'var(--theme-text)', display: 'block', marginBottom: 4 }}>
+                    Provider / Auth Type（--auth-type）
+                  </label>
+                  <div style={selectWrapperStyle}>
+                    <select
+                      value={formData.env?.QWEN_PROVIDER || 'qwen-oauth'}
+                      onChange={(e) => handleEnvChange('QWEN_PROVIDER', e.target.value)}
+                      style={selectStyle}
+                    >
+                      <option value="qwen-oauth">Qwen OAuth（免费额度已停用，需 Coding Plan）</option>
+                      <option value="openai">OpenAI</option>
+                      <option value="anthropic">Anthropic</option>
+                      <option value="gemini">Gemini</option>
+                      <option value="vertex-ai">Vertex AI</option>
+                    </select>
+                  </div>
+                  <p style={{ fontSize: 10, color: 'var(--theme-text-muted)', margin: '4px 0 0 0' }}>
+                    对应 Qwen CLI 的 --auth-type 参数。合法值：qwen-oauth / openai / anthropic / gemini / vertex-ai。
+                    选择对应 provider 后，CLI 会自动读取相应的认证环境变量。
+                  </p>
+                </div>
+
+                {/* ── 根据 QWEN_PROVIDER 动态展示所需的 Key 字段 ── */}
+                {(() => {
+                  const provider = formData.env?.QWEN_PROVIDER || 'qwen-oauth';
+                  return (
+                    <>
+                      {/* qwen-oauth: DASHSCOPE_API_KEY + OPENAI_API_KEY (fallback) + OPENAI_BASE_URL */}
+                      {provider === 'qwen-oauth' && (
+                        <>
+                          <div style={{ marginBottom: 10 }}>
+                            <label style={{ fontSize: 11, color: 'var(--theme-text)', display: 'block', marginBottom: 4 }}>
+                              DASHSCOPE_API_KEY（DashScope 主 Key）
+                            </label>
+                            <input
+                              type="password"
+                              value={formData.env?.DASHSCOPE_API_KEY || ''}
+                              onChange={(e) => handleEnvChange('DASHSCOPE_API_KEY', e.target.value)}
+                              style={inputStyle}
+                              placeholder="sk-...（阿里云 DashScope API Key）"
+                            />
+                            <p style={{ fontSize: 10, color: 'var(--theme-text-muted)', margin: '4px 0 0 0' }}>
+                              必填。从阿里云 DashScope 控制台获取。后端会自动将其作为 OPENAI_API_KEY 的 fallback。
+                            </p>
+                          </div>
+                          <div style={{ marginBottom: 10 }}>
+                            <label style={{ fontSize: 11, color: 'var(--theme-text)', display: 'block', marginBottom: 4 }}>
+                              OPENAI_API_KEY（可选，覆盖 fallback）
+                            </label>
+                            <input
+                              type="password"
+                              value={formData.env?.OPENAI_API_KEY || ''}
+                              onChange={(e) => handleEnvChange('OPENAI_API_KEY', e.target.value)}
+                              style={inputStyle}
+                              placeholder="留空则自动使用 DASHSCOPE_API_KEY"
+                            />
+                            <p style={{ fontSize: 10, color: 'var(--theme-text-muted)', margin: '4px 0 0 0' }}>
+                              Qwen CLI 的 qwen-oauth 实际走 OpenAI 兼容协议。
+                              通常留空即可（后端会把 DASHSCOPE_API_KEY 映射过去）；
+                              如需独立 Key 可在此覆盖。
+                            </p>
+                          </div>
+                          <div style={{ marginBottom: 10 }}>
+                            <label style={{ fontSize: 11, color: 'var(--theme-text)', display: 'block', marginBottom: 4 }}>
+                              OPENAI_BASE_URL（可选，覆盖默认端点）
+                            </label>
+                            <input
+                              type="text"
+                              value={formData.env?.OPENAI_BASE_URL || ''}
+                              onChange={(e) => handleEnvChange('OPENAI_BASE_URL', e.target.value)}
+                              style={inputStyle}
+                              placeholder="留空默认 https://dashscope.aliyuncs.com/compatible-mode/v1"
+                            />
+                            <p style={{ fontSize: 10, color: 'var(--theme-text-muted)', margin: '4px 0 0 0' }}>
+                              留空即使用 DashScope 的 OpenAI 兼容端点。
+                              若走代理/中转服务，可在此自定义。
+                            </p>
+                          </div>
+                        </>
+                      )}
+
+                      {/* openai: OPENAI_API_KEY + OPENAI_BASE_URL */}
+                      {provider === 'openai' && (
+                        <>
+                          <div style={{ marginBottom: 10 }}>
+                            <label style={{ fontSize: 11, color: 'var(--theme-text)', display: 'block', marginBottom: 4 }}>
+                              OPENAI_API_KEY
+                            </label>
+                            <input
+                              type="password"
+                              value={formData.env?.OPENAI_API_KEY || ''}
+                              onChange={(e) => handleEnvChange('OPENAI_API_KEY', e.target.value)}
+                              style={inputStyle}
+                              placeholder="sk-..."
+                            />
+                          </div>
+                          <div style={{ marginBottom: 10 }}>
+                            <label style={{ fontSize: 11, color: 'var(--theme-text)', display: 'block', marginBottom: 4 }}>
+                              OPENAI_BASE_URL（可选，用于兼容端点 / 中转）
+                            </label>
+                            <input
+                              type="text"
+                              value={formData.env?.OPENAI_BASE_URL || ''}
+                              onChange={(e) => handleEnvChange('OPENAI_BASE_URL', e.target.value)}
+                              style={inputStyle}
+                              placeholder="留空使用 OpenAI 官方端点"
+                            />
+                          </div>
+                        </>
+                      )}
+
+                      {/* anthropic: ANTHROPIC_API_KEY + ANTHROPIC_BASE_URL */}
+                      {provider === 'anthropic' && (
+                        <>
+                          <div style={{ marginBottom: 10 }}>
+                            <label style={{ fontSize: 11, color: 'var(--theme-text)', display: 'block', marginBottom: 4 }}>
+                              ANTHROPIC_API_KEY
+                            </label>
+                            <input
+                              type="password"
+                              value={formData.env?.ANTHROPIC_API_KEY || ''}
+                              onChange={(e) => handleEnvChange('ANTHROPIC_API_KEY', e.target.value)}
+                              style={inputStyle}
+                              placeholder="sk-ant-..."
+                            />
+                          </div>
+                          <div style={{ marginBottom: 10 }}>
+                            <label style={{ fontSize: 11, color: 'var(--theme-text)', display: 'block', marginBottom: 4 }}>
+                              ANTHROPIC_BASE_URL（可选，用于代理）
+                            </label>
+                            <input
+                              type="text"
+                              value={formData.env?.ANTHROPIC_BASE_URL || ''}
+                              onChange={(e) => handleEnvChange('ANTHROPIC_BASE_URL', e.target.value)}
+                              style={inputStyle}
+                              placeholder="留空使用 Anthropic 官方端点"
+                            />
+                          </div>
+                        </>
+                      )}
+
+                      {/* gemini: GEMINI_API_KEY */}
+                      {provider === 'gemini' && (
+                        <div style={{ marginBottom: 10 }}>
+                          <label style={{ fontSize: 11, color: 'var(--theme-text)', display: 'block', marginBottom: 4 }}>
+                            GEMINI_API_KEY
+                          </label>
+                          <input
+                            type="password"
+                            value={formData.env?.GEMINI_API_KEY || ''}
+                            onChange={(e) => handleEnvChange('GEMINI_API_KEY', e.target.value)}
+                            style={inputStyle}
+                            placeholder="AIza..."
+                          />
+                        </div>
+                      )}
+
+                      {/* vertex-ai: 使用 GOOGLE_APPLICATION_CREDENTIALS 或项目配置 */}
+                      {provider === 'vertex-ai' && (
+                        <>
+                          <div style={{ marginBottom: 10 }}>
+                            <label style={{ fontSize: 11, color: 'var(--theme-text)', display: 'block', marginBottom: 4 }}>
+                              GOOGLE_APPLICATION_CREDENTIALS（服务账号 JSON 路径）
+                            </label>
+                            <input
+                              type="text"
+                              value={formData.env?.GOOGLE_APPLICATION_CREDENTIALS || ''}
+                              onChange={(e) => handleEnvChange('GOOGLE_APPLICATION_CREDENTIALS', e.target.value)}
+                              style={inputStyle}
+                              placeholder="C:\path\to\service-account.json"
+                            />
+                            <p style={{ fontSize: 10, color: 'var(--theme-text-muted)', margin: '4px 0 0 0' }}>
+                              Vertex AI 使用 GCP 服务账号认证。填写 JSON Key 文件的绝对路径，
+                              或设置 <code style={{ fontSize: 9 }}>GOOGLE_API_KEY</code> 作为简易替代。
+                            </p>
+                          </div>
+                          <div style={{ marginBottom: 10 }}>
+                            <label style={{ fontSize: 11, color: 'var(--theme-text)', display: 'block', marginBottom: 4 }}>
+                              GOOGLE_API_KEY（可选，简易 API Key）
+                            </label>
+                            <input
+                              type="password"
+                              value={formData.env?.GOOGLE_API_KEY || ''}
+                              onChange={(e) => handleEnvChange('GOOGLE_API_KEY', e.target.value)}
+                              style={inputStyle}
+                              placeholder="AIza..."
+                            />
+                          </div>
+                        </>
+                      )}
+                    </>
+                  );
+                })()}
+
+                {/* HTTPS_PROXY */}
+                <div style={{ marginBottom: 10 }}>
+                  <label style={{ fontSize: 11, color: 'var(--theme-text)', display: 'block', marginBottom: 4 }}>
+                    HTTPS_PROXY（代理，可选）
+                  </label>
+                  <input
+                    type="text"
+                    value={formData.env?.HTTPS_PROXY || ''}
+                    onChange={(e) => handleEnvChange('HTTPS_PROXY', e.target.value)}
+                    style={inputStyle}
+                    placeholder="留空不走代理，e.g., http://127.0.0.1:7890"
+                  />
+                </div>
+
+                {/* ── 允许的工具 ── */}
+                <div style={{ marginTop: 12 }}>
+                  <label style={{ fontSize: 11, color: 'var(--theme-text)', display: 'block', marginBottom: 6 }}>
+                    允许使用的工具（--core-tools）
+                  </label>
+                  <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+                    {ALL_TOOLS.map(tool => {
+                      const checked = (formData.allowedTools ?? DEFAULT_TOOLS).includes(tool);
+                      const isNetwork = tool === 'WebSearch' || tool === 'WebFetch';
+                      return (
+                        <label key={tool} style={{ display: 'flex', alignItems: 'center', gap: 4, cursor: 'pointer',
+                          padding: '3px 8px', borderRadius: 4, fontSize: 11,
+                          background: checked ? (isNetwork ? 'rgba(34,197,94,0.15)' : 'rgba(99,102,241,0.15)') : 'rgba(255,255,255,0.05)',
+                          border: `1px solid ${checked ? (isNetwork ? 'rgba(34,197,94,0.4)' : 'rgba(99,102,241,0.4)') : 'rgba(255,255,255,0.12)'}`,
+                          color: checked ? 'var(--theme-text)' : 'var(--theme-text-muted)',
+                        }}>
+                          <input
+                            type="checkbox"
+                            checked={checked}
+                            onChange={(e) => {
+                              const cur = formData.allowedTools ?? [...DEFAULT_TOOLS];
+                              setFormData({ ...formData, allowedTools: e.target.checked
+                                ? [...cur, tool]
+                                : cur.filter(t => t !== tool)
+                              });
+                            }}
+                            style={{ accentColor: 'var(--theme-accent)', width: 11, height: 11 }}
+                          />
+                          {tool}
+                          {isNetwork && <span style={{ fontSize: 9, opacity: 0.7 }}>🌐</span>}
+                        </label>
+                      );
+                    })}
+                  </div>
+                </div>
+
+                <div style={{ marginTop: 12 }}>
+                  <label style={{ ...labelStyle, display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer', marginBottom: 0 }}>
+                    <input
+                      type="checkbox"
+                      checked={formData.skipPermissions !== false}
+                      onChange={(e) => setFormData({ ...formData, skipPermissions: e.target.checked })}
+                      style={{ accentColor: 'var(--theme-accent)', width: 14, height: 14, flexShrink: 0 }}
+                    />
+                    Skip Permissions (--yolo 模式)
+                  </label>
+                  <p style={{ fontSize: 11, color: 'var(--theme-text-muted)', margin: '4px 0 0 22px' }}>
+                    启用后 Qwen CLI 自动批准工具调用，无需逐条确认。
+                  </p>
+                </div>
+              </div>
+            )}
+
+            {/* ── MCP Servers 配置（claude-agent-sdk / claude-code-official / qwen-code-cli）── */}
+            {(formData.type === 'claude-agent-sdk' || formData.type === 'claude-code-official' || formData.type === 'qwen-code-cli' || formData.pinned) && (
               <McpServersEditor
                 mcpServers={formData.mcpServers}
                 onChange={(v) => setFormData((prev) => ({ ...prev, mcpServers: v }))}

@@ -1,2 +1,2 @@
 # auto-written by build_all.bat
-__version__ = "26.7.8"
+__version__ = "26.7.9"

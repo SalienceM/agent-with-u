@@ -3557,6 +3557,7 @@ class BridgeWS:
                 base_url=data.get("baseUrl"), model=data.get("model"), api_key=data.get("apiKey"),
                 working_dir=data.get("workingDir"), allowed_tools=data.get("allowedTools"),
                 skip_permissions=data.get("skipPermissions", True), env=data.get("env"),
+                cli_path=data.get("cliPath"),
                 mcp_servers=data.get("mcpServers") or None,
             )
         self._backend_store.save(config)
@@ -6433,15 +6434,14 @@ except urllib.error.URLError as e:
                         msgs_for_backend.append(ChatMessage(id=new_id(), role="assistant", content="".join(all_text)))
                     msgs_for_backend.append(ChatMessage(id=new_id(), role="user", content=current_content))
 
-                # ★ 注入会话约束：将约束作为系统提示前缀发送给 AI（不存入对话记录）
-                print(f"[bridge_ws] constraints为: {repr(constraints[:200]) if constraints else None}",
+                # ★ 日志：记录 constraints（实际注入由各个 backend 的 send_message 处理，避免重复注入）
+                print(f"[bridge_ws] constraints 为：{repr(constraints[:200]) if constraints else None}",
                       file=sys.stderr, flush=True)
-                if constraints and constraints.strip():
-                    send_content = f"[会话约束/规则]\n{constraints.strip()}\n\n---\n\n{send_content}"
-                    print(f"[bridge_ws] 已注入约束，send_content前100字: {send_content[:100]!r}",
+                if constraints:
+                    print(f"[bridge_ws] 约束将由 backend 注入，send_content 前 100 字：{send_content[:100]!r}",
                           file=sys.stderr, flush=True)
                 else:
-                    print(f"[bridge_ws] 无约束，send_content前100字: {send_content[:100]!r}",
+                    print(f"[bridge_ws] 无约束，send_content 前 100 字：{send_content[:100]!r}",
                           file=sys.stderr, flush=True)
 
                 # ★ 内置 Skill 工具屏蔽指令：告诉模型不要使用被替代的原生工具
@@ -6499,6 +6499,7 @@ except urllib.error.URLError as e:
                     "skip_permissions": skip_permissions,
                     "sandbox_enabled": session.sandbox_enabled,
                     "on_permission_request": _on_permission_request,
+                    "constraints": constraints,  # ★ 修复：传入 constraints，否则所有 backend 收到的都是 None
                 }
                 # ★ API 类 backend：注入 Backend Skill 工具定义 + tool_use 回调
                 # CLI 类 backend：不需要注入，走原生 Skill 目录发现 + curl 回调
