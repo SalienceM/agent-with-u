@@ -277,6 +277,19 @@ const ChatInputInner: React.FC<Props> = ({
   fileQueryRef.current = fileQuery;
   const currentDirRef = useRef('');
   currentDirRef.current = currentDir;
+
+  // ★ @SESSION: 会话引用选择器状态
+  const [showSessionPicker, setShowSessionPicker] = useState(false);
+  const [sessionRefs, setSessionRefs] = useState<any[]>([]);
+  const [sessionQuery, setSessionQuery] = useState('');
+  const [sessionSelectedIndex, setSessionSelectedIndex] = useState(0);
+  const showSessionPickerRef = useRef(false);
+  showSessionPickerRef.current = showSessionPicker;
+  const sessionRefsRef = useRef<any[]>([]);
+  sessionRefsRef.current = sessionRefs;
+  const sessionSelectedIndexRef = useRef(0);
+  sessionSelectedIndexRef.current = sessionSelectedIndex;
+
   const workingDirRef = useRef(workingDir);
   workingDirRef.current = workingDir;
 
@@ -545,6 +558,29 @@ const ChatInputInner: React.FC<Props> = ({
   const insertFileRefRef = useRef(insertFileRef);
   insertFileRefRef.current = insertFileRef;
 
+  const insertSessionRef = useCallback((session: any) => {
+    const el = ref.current;
+    if (!el || !session?.id) return;
+    const cursor = el.selectionStart ?? el.value.length;
+    const before = el.value.substring(0, cursor);
+    const marker = '@SESSION:';
+    const last = before.lastIndexOf(marker);
+    if (last < 0) { setShowSessionPicker(false); return; }
+    const label = String(session.id);
+    const newVal = el.value.substring(0, last) + `${marker}${label} ` + el.value.substring(cursor);
+    el.value = newVal;
+    const newCursor = last + marker.length + label.length + 1;
+    el.selectionStart = newCursor;
+    el.selectionEnd = newCursor;
+    el.focus();
+    el.style.height = 'auto';
+    el.style.height = Math.min(el.scrollHeight, 200) + 'px';
+    setShowSessionPicker(false);
+    setSessionQuery('');
+  }, []);
+  const insertSessionRefRef = useRef(insertSessionRef);
+  insertSessionRefRef.current = insertSessionRef;
+
   // ── 发送 ──
   const handleSend = useCallback(() => {
     let text = ref.current?.value.trim() || '';
@@ -576,6 +612,32 @@ const ChatInputInner: React.FC<Props> = ({
     (e: React.KeyboardEvent) => {
       if (e.nativeEvent.isComposing || composingRef.current || e.keyCode === 229)
         return;
+
+      // ★ @SESSION: 会话引用选择器键盘导航（优先于文件选择器）
+      if (showSessionPickerRef.current) {
+        const filtered = sessionRefsRef.current;
+        if (e.key === 'ArrowUp') {
+          e.preventDefault();
+          setSessionSelectedIndex((prev) => Math.max(0, prev - 1));
+          return;
+        }
+        if (e.key === 'ArrowDown') {
+          e.preventDefault();
+          setSessionSelectedIndex((prev) => Math.min(filtered.length - 1, prev + 1));
+          return;
+        }
+        if ((e.key === 'Enter' && !e.shiftKey) || e.key === 'Tab') {
+          e.preventDefault();
+          const entry = filtered[sessionSelectedIndexRef.current];
+          if (entry) insertSessionRefRef.current(entry);
+          return;
+        }
+        if (e.key === 'Escape') {
+          e.preventDefault();
+          setShowSessionPicker(false);
+          return;
+        }
+      }
 
       // ★ @ 文件选择器键盘导航（优先于斜杠命令）
       if (showFilePickerRef.current) {
@@ -779,6 +841,20 @@ const ChatInputInner: React.FC<Props> = ({
     // ★ @ 文件选择器检测（优先于斜杠命令）
     if (lastAt >= 0) {
       const afterAt = beforeCursor.substring(lastAt + 1);
+      if (afterAt.toUpperCase().startsWith('SESSION:') && !afterAt.includes('\n')) {
+        const query = afterAt.slice('SESSION:'.length);
+        if (!query.includes(' ')) {
+          setSessionQuery(query);
+          setSessionSelectedIndex(0);
+          api.listSessionRefs(query).then((items) => {
+            setSessionRefs((items || []).filter((s: any) => s.id !== sessionId));
+            setShowSessionPicker(true);
+          });
+          setShowFilePicker(false);
+          setShowCommands(false);
+          return;
+        }
+      }
       if (!afterAt.includes(' ') && !afterAt.includes('\n')) {
         const query = afterAt;
         setFileQuery(query);
@@ -799,7 +875,11 @@ const ChatInputInner: React.FC<Props> = ({
       }
     }
 
-    // 没有 @ 触发时，关闭文件选择器
+    // 没有 @ 触发时，关闭选择器
+    if (showSessionPickerRef.current) {
+      setShowSessionPicker(false);
+      setSessionQuery('');
+    }
     if (showFilePickerRef.current) {
       setShowFilePicker(false);
       setFileQuery('');
@@ -1025,6 +1105,38 @@ const ChatInputInner: React.FC<Props> = ({
       </div>
 
       <ImagePreview images={images} onRemove={removeImage} />
+
+
+      {/* ★ @SESSION: 会话引用选择器弹窗 */}
+      {showSessionPicker && (
+        <div style={filePickerPopupStyle}>
+          <div style={filePickerHeaderStyle}>
+            <span style={{ opacity: 0.6, fontSize: 10 }}>💬</span>
+            <span style={{ flex: 1 }}>引用会话 {sessionQuery ? `· ${sessionQuery}` : ''}</span>
+          </div>
+          {sessionRefs.length === 0 && (
+            <div style={{ padding: '8px 12px', color: 'var(--theme-text-muted)', fontSize: 12 }}>无匹配会话</div>
+          )}
+          {sessionRefs.map((s: any, i: number) => (
+            <div
+              key={s.id}
+              style={{
+                ...fileItemStyle,
+                background: i === sessionSelectedIndex ? 'var(--theme-bg-tertiary, #eaeef2)' : 'transparent',
+              }}
+              onClick={() => insertSessionRefRef.current(s)}
+              onMouseEnter={() => setSessionSelectedIndex(i)}
+            >
+              <span>{s.sessionType === 'loop' ? '🔁' : '💬'}</span>
+              <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{s.title || s.id}</span>
+              <span style={{ fontSize: 10, opacity: 0.55 }}>{String(s.id || '').slice(0, 8)}</span>
+            </div>
+          ))}
+          <div style={filePickerFooterStyle}>
+            ↑↓ 导航 · Enter/Tab 引用 · Esc 关闭
+          </div>
+        </div>
+      )}
 
       {/* ★ @ 文件选择器弹窗 */}
       {showFilePicker && (
