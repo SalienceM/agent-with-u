@@ -4347,7 +4347,7 @@ description: {description}
 {basic_cmd}
 ```
 {extra_params}{ref_image_hint}
-**规则：只执行一次，将命令的完整输出原文粘贴到你的回复中——包括任何 `![alt](url)` 格式的图片 markdown，必须按原样包含，不得删改、不得替换为描述文字。禁止重试、禁止评价质量、禁止额外处理，禁止再次读取技能文件。**
+**规则：只执行一次，将命令的完整输出原文粘贴到你的回复中——包括任何 `![alt](url)` 格式的图片 markdown，必须按原样包含，不得删改、不得替换为描述文字。禁止重试、禁止评价质量、禁止额外处理，禁止再次读取技能文件，禁止为同一用户请求再次调用 Skill 工具或再次执行本命令。**
 """
 
     def _generate_backend_skill_call_py(self, skill_name: str, skill_info: dict, *, is_image_backend: bool = False) -> str:
@@ -4455,6 +4455,21 @@ except urllib.error.URLError as e:
         if not roots:
             roots.append(("claude", _Path(working_dir) / ".claude" / "skills"))
         return roots
+
+    def _backend_has_native_project_skills(self, backend_id: str) -> bool:
+        cfg = next((c for c in self._backend_configs if c.id == backend_id), None)
+        return bool(cfg and cfg.type in {
+            BackendType.CLAUDE_AGENT_SDK,
+            BackendType.CLAUDE_CODE_OFFICIAL,
+            BackendType.QWEN_CODE_CLI,
+        })
+
+    def _backend_accepts_backend_skill_tools(self, backend_id: str) -> bool:
+        cfg = next((c for c in self._backend_configs if c.id == backend_id), None)
+        return bool(cfg and cfg.type in {
+            BackendType.ANTHROPIC_API,
+            BackendType.OPENAI_COMPATIBLE,
+        })
 
     def _sync_backend_skills_to_directory(self, session: Session):
         """
@@ -4577,11 +4592,18 @@ except urllib.error.URLError as e:
             if p and p.get("content"):
                 parts.append(p["content"])
 
-        # ★ Backend Skills：注入 Bash 调用提示，兼容不支持原生 Skill 工具的模型（如 Qwen 系列）
-        # 这样模型即使绕过 Skill 工具也能从 constraints 里知道怎么调用
+        # ★ Backend Skills：只在既没有原生项目 Skill 发现、也没有结构化 tool
+        #   注入能力的 backend 上追加 Bash fallback。Claude/Qwen CLI 会从
+        #   .claude/.qwen skills 原生发现；API backend 走 extra_tools/on_tool_call。
+        #   对这些 backend 再把 Bash 命令塞进 constraints，会诱导模型先调用
+        #   native Skill、再按 fallback Bash 再执行一次，导致图像等副作用型 Skill 重复运行。
+        inject_backend_skill_bash_fallback = (
+            not self._backend_has_native_project_skills(session.backend_id)
+            and not self._backend_accepts_backend_skill_tools(session.backend_id)
+        )
         backend_skill_hints: list[str] = []
         has_image_backend_skill = False
-        for sname in abilities.get("skills", []):
+        for sname in (abilities.get("skills", []) if inject_backend_skill_bash_fallback else []):
             info = self._skill_store.get_skill(sname)
             if not info:
                 continue
@@ -6360,9 +6382,29 @@ except urllib.error.URLError as e:
                 lines.append(f"  url:  http://127.0.0.1:{port}/api/assets/{a['id']}")
         return "\n".join(lines)
 
+    @staticmethod
+    def _strip_generated_backend_skill_block(text: Optional[str]) -> Optional[str]:
+        """Remove legacy generated Backend Skill Bash hints from saved constraints."""
+        if not text:
+            return text
+        marker = "## 已绑定 Backend Skills【强制规则】"
+        if marker not in text:
+            return text
+        import re as _re
+        cleaned = _re.sub(
+            r"(?:\n\n---\n\n)?## 已绑定 Backend Skills【强制规则】[\s\S]*?(?=\n\n---\n\n|$)",
+            "",
+            text,
+        )
+        cleaned = _re.sub(r"(\n\n---\n\n){2,}", "\n\n---\n\n", cleaned).strip()
+        cleaned = _re.sub(r"^(?:---\s*)+", "", cleaned).strip()
+        cleaned = _re.sub(r"(?:\s*---)+$", "", cleaned).strip()
+        return cleaned or None
+
     def _compose_constraints(self, session: "Session") -> Optional[str]:
         """会话约束 + 素材池上下文块（后者不写入持久化的 session.constraints）。"""
-        parts = [p for p in (session.constraints, self._build_asset_context_block()) if p]
+        session_constraints = self._strip_generated_backend_skill_block(session.constraints)
+        parts = [p for p in (session_constraints, self._build_asset_context_block()) if p]
         return "\n\n---\n\n".join(parts) if parts else None
 
     async def _handle_send_message(self, payload_json: str):
