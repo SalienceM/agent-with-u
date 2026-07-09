@@ -1734,13 +1734,15 @@ class BridgeWS:
                         cut = i + 1
                         break
             copied_messages = list(source.messages[:cut])
+            branch_title = f"Clone with {source.title or source.id}"
+            branch_working_dir = self._create_branch_working_dir(source)
             new_session = Session(
                 id=new_id(),
-                title=f"{source.title} · {title_suffix}",
+                title=branch_title if not title_suffix else f"{branch_title} · {title_suffix}",
                 created_at=time.time(), updated_at=time.time(),
                 messages=copied_messages,
                 backend_id=payload.get("backendId") or source.backend_id,
-                working_dir=source.working_dir,
+                working_dir=branch_working_dir,
                 auto_continue=source.auto_continue,
                 skip_permissions=source.skip_permissions,
                 sandbox_enabled=source.sandbox_enabled,
@@ -1903,6 +1905,39 @@ class BridgeWS:
         print(f"[BridgeWS] Auto-created default workspace: {target}",
               file=sys.stderr, flush=True)
         return str(target)
+
+    def _create_branch_working_dir(self, source: "Session") -> str:
+        """Create a fresh default workspace for a branched session.
+
+        Branches inherit conversation context but must not share the original
+        session working directory; otherwise tools in the branch can mutate the
+        source session's files and make the two conversations indistinguishable.
+        """
+        from datetime import datetime
+        import re as _re
+
+        title = (source.title or source.id or "session").strip()
+        safe_title = _re.sub(r"[^\w\u4e00-\u9fff.-]+", "-", title, flags=_re.UNICODE).strip("-")
+        safe_title = (safe_title[:40] or "session").lower()
+        ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        root = self._default_workspace_root()
+        target = root / f"clone-with-{safe_title}-{ts}"
+        if target.exists():
+            suffix = 1
+            while True:
+                candidate = root / f"clone-with-{safe_title}-{ts}-{suffix}"
+                if not candidate.exists():
+                    target = candidate
+                    break
+                suffix += 1
+        try:
+            target.mkdir(parents=True, exist_ok=True)
+            print(f"[BridgeWS] Created branch workspace: {target}", file=sys.stderr, flush=True)
+            return str(target)
+        except Exception as e:
+            print(f"[BridgeWS] Failed to create branch workspace {target}: {e}",
+                  file=sys.stderr, flush=True)
+            return self._resolve_working_dir("")
 
     # ★ 单执行节点(execKey) session 保留上限
     # 每个后端进程 = 一个执行节点，session_store 只包含本节点的 session，
