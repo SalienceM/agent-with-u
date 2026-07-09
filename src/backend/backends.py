@@ -9,6 +9,7 @@ All implementation has been split into:
   anthropic_api.py  — AnthropicAPIBackend
   dashscope_image.py— DashScopeImageBackend
   qwen_code_cli.py  — QwenCodeSdkBackend (uses qwen-code-sdk)
+  codex_office.py   — CodexOfficeBackend
   factory.py        — create_backend()
 """
 
@@ -19,6 +20,7 @@ from .openai_compat import OpenAICompatibleBackend
 from .anthropic_api import AnthropicAPIBackend
 from .dashscope_image import DashScopeImageBackend
 from .qwen_code_cli import QwenCodeSdkBackend
+from .codex_office import CodexOfficeBackend
 from .factory import create_backend
 
 __all__ = [
@@ -32,5 +34,6 @@ __all__ = [
     "AnthropicAPIBackend",
     "DashScopeImageBackend",
     "QwenCodeSdkBackend",
+    "CodexOfficeBackend",
     "create_backend",
 ]
