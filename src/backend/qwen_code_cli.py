@@ -589,3 +589,4 @@ class QwenCodeSdkBackend(ModelBackend):
                 emit("done")
 
         return {"agentSessionId": _new_agent_sid}
+
