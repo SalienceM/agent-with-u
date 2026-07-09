@@ -33,6 +33,7 @@ interface BackendConfig {
 }
 
 const OFFICIAL_BACKEND_ID = 'official-claude';
+const OFFICIAL_CODEX_BACKEND_ID = 'official-codex';
 
 const DEFAULT_TOOLS = ['Read', 'Edit', 'Bash', 'Glob', 'Grep', 'Write'];
 const ALL_TOOLS = ['Read', 'Edit', 'Write', 'Bash', 'Glob', 'Grep', 'WebSearch', 'WebFetch'];
@@ -219,6 +220,12 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
       });
       if (Object.keys(cleanedEnv).length > 0) saved.env = cleanedEnv;
       saved.skipPermissions = formData.skipPermissions !== false;
+      if (formData.type === 'codex-office') {
+        if (formData.model?.trim()) saved.model = formData.model.trim();
+        if (formData.baseUrl?.trim()) saved.baseUrl = formData.baseUrl.trim();
+        if (formData.apiKey?.trim()) saved.apiKey = formData.apiKey.trim();
+        if (formData.cliPath?.trim()) saved.cliPath = formData.cliPath.trim();
+      }
       if (formData.allowedTools?.length) saved.allowedTools = formData.allowedTools;
       if (formData.mcpServers && Object.keys(formData.mcpServers).length > 0) saved.mcpServers = formData.mcpServers;
     } else if (formData.type === 'claude-agent-sdk') {
@@ -253,6 +260,17 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
       if (formData.allowedTools?.length) saved.allowedTools = formData.allowedTools;
       // cliPath stored as a top-level field
       if (formData.cliPath?.trim()) (saved as any).cliPath = formData.cliPath.trim();
+    } else if (formData.type === 'codex-office') {
+      const cleanedEnv: Record<string, string> = {};
+      Object.entries(formData.env || {}).forEach(([k, v]) => {
+        if (v && v.trim()) cleanedEnv[k] = v.trim();
+      });
+      if (Object.keys(cleanedEnv).length > 0) saved.env = cleanedEnv;
+      if (formData.model?.trim()) saved.model = formData.model.trim();
+      if (formData.baseUrl?.trim()) saved.baseUrl = formData.baseUrl.trim();
+      if (formData.apiKey?.trim()) saved.apiKey = formData.apiKey.trim();
+      saved.skipPermissions = formData.skipPermissions !== false;
+      if (formData.cliPath?.trim()) saved.cliPath = formData.cliPath.trim();
     } else if (formData.type === 'openai-compatible') {
       // base_url, api_key, model, extra_headers
       if (formData.baseUrl?.trim()) saved.baseUrl = formData.baseUrl.trim();
@@ -486,6 +504,9 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
                         {backend.type === 'qwen-code-cli' && (
                           <span> · Qwen CLI{backend.model ? ` · 🤖${backend.model}` : ''}{backend.env?.DASHSCOPE_API_KEY ? ' · 🔑' : ' · ⚠️无Key'}</span>
                         )}
+                        {backend.type === 'codex-office' && (
+                          <span> · Codex CLI{backend.model ? ` · 🤖${backend.model}` : ''}{backend.apiKey || backend.env?.OPENAI_API_KEY ? ' · 🔑' : ' · login'}</span>
+                        )}
                         {(backend.type === 'openai-compatible' || backend.type === 'anthropic-api' || backend.type === 'claude-code-official' || backend.type === 'dashscope-image') && backend.model && (
                           <span> · 🤖{backend.model}</span>
                         )}
@@ -559,13 +580,14 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
                           apiKey: '',
                           env: {},
                           extraHeaders: undefined,
-                          skipPermissions: (newType === 'claude-agent-sdk' || newType === 'qwen-code-cli') ? true : undefined,
+                          skipPermissions: (newType === 'claude-agent-sdk' || newType === 'qwen-code-cli' || newType === 'codex-office') ? true : undefined,
                         });
                       }}
                       style={selectStyle}
                     >
                       <option value="claude-agent-sdk">Claude Agent SDK</option>
                       <option value="qwen-code-cli">Qwen Code CLI</option>
+                      <option value="codex-office">Codex Office</option>
                       <option value="openai-compatible">OpenAI Compatible</option>
                       <option value="anthropic-api">Anthropic API</option>
                       <option value="dashscope-image">DashScope 文生图（万象/Wan）</option>
@@ -705,7 +727,8 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
                 <label style={{ ...labelStyle, marginBottom: 8 }}>Claude Code 官方账户配置</label>
                 <p style={{ fontSize: 11, color: 'var(--theme-text-muted)', margin: '0 0 12px 0', lineHeight: 1.6 }}>
                   凭证自动从 <code style={{ fontSize: 10, background: 'rgba(255,255,255,0.08)', padding: '1px 4px', borderRadius: 3 }}>~/.claude/.credentials.json</code> 读取（需先运行 <code style={{ fontSize: 10 }}>claude login</code>）。
-                  <br />只需配置代理即可使用。
+                  <br />如本机缺少 CLI，请先执行 <code style={{ fontSize: 10 }}>npm install -g @anthropic-ai/claude-code</code>。
+                  <br />通常只需配置代理即可使用。
                 </p>
 
                 {/* 一键登录卡片 */}
@@ -1165,8 +1188,112 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
               </div>
             )}
 
+            {/* ── Codex Office 专属配置 ── */}
+            {formData.type === 'codex-office' && (
+              <div style={{ marginBottom: 16, padding: 12, background: 'var(--theme-bg-secondary)', borderRadius: 8 }}>
+                <label style={{ ...labelStyle, marginBottom: 8 }}>Codex Office 配置</label>
+                <p style={{ fontSize: 11, color: 'var(--theme-text-muted)', margin: '0 0 12px 0', lineHeight: 1.6 }}>
+                  基于 <code style={{ fontSize: 10, background: 'rgba(255,255,255,0.08)', padding: '1px 4px', borderRadius: 3 }}>codex exec --json</code> 非交互模式。
+                  需先安装：<code style={{ fontSize: 10 }}>npm install -g @openai/codex</code>，然后完成 <code style={{ fontSize: 10 }}>codex login</code>，或填写 OpenAI API Key。
+                </p>
+
+                <div style={{ marginBottom: 10 }}>
+                  <label style={{ fontSize: 11, color: 'var(--theme-text)', display: 'block', marginBottom: 4 }}>
+                    CLI 路径（可选，留空自动从 PATH / npm global 解析）
+                  </label>
+                  <input
+                    type="text"
+                    value={formData.cliPath || ''}
+                    onChange={(e) => setFormData({ ...formData, cliPath: e.target.value })}
+                    style={inputStyle}
+                    placeholder="e.g., codex 或 C:\\Users\\xxx\\AppData\\Roaming\\npm\\codex.cmd"
+                  />
+                </div>
+
+                <div style={{ marginBottom: 10 }}>
+                  <label style={{ fontSize: 11, color: 'var(--theme-text)', display: 'block', marginBottom: 4 }}>
+                    模型（--model，可选）
+                  </label>
+                  <input
+                    type="text"
+                    value={formData.model || ''}
+                    onChange={(e) => setFormData({ ...formData, model: e.target.value })}
+                    style={inputStyle}
+                    placeholder="gpt-5.5"
+                  />
+                </div>
+
+                <div style={{ marginBottom: 10 }}>
+                  <label style={{ fontSize: 11, color: 'var(--theme-text)', display: 'block', marginBottom: 4 }}>
+                    OpenAI API Key（可选；也可使用 codex login）
+                  </label>
+                  <input
+                    type="password"
+                    value={formData.apiKey || ''}
+                    onChange={(e) => setFormData({ ...formData, apiKey: e.target.value })}
+                    style={inputStyle}
+                    placeholder="sk-..."
+                  />
+                </div>
+
+                <div style={{ marginBottom: 10 }}>
+                  <label style={{ fontSize: 11, color: 'var(--theme-text)', display: 'block', marginBottom: 4 }}>
+                    Base URL（可选，对应 OPENAI_BASE_URL）
+                  </label>
+                  <input
+                    type="text"
+                    value={formData.baseUrl || ''}
+                    onChange={(e) => setFormData({ ...formData, baseUrl: e.target.value })}
+                    style={inputStyle}
+                    placeholder="https://api.openai.com/v1"
+                  />
+                </div>
+
+                <div style={{ marginBottom: 10 }}>
+                  <label style={{ fontSize: 11, color: 'var(--theme-text)', display: 'block', marginBottom: 4 }}>
+                    HTTPS_PROXY（代理，可选）
+                  </label>
+                  <input
+                    type="text"
+                    value={formData.env?.HTTPS_PROXY || ''}
+                    onChange={(e) => handleEnvChange('HTTPS_PROXY', e.target.value)}
+                    style={inputStyle}
+                    placeholder="留空不走代理，e.g., http://127.0.0.1:7890"
+                  />
+                </div>
+
+                <div style={{ marginBottom: 10 }}>
+                  <label style={{ fontSize: 11, color: 'var(--theme-text)', display: 'block', marginBottom: 4 }}>
+                    CODEX_HOME（可选，隔离 Codex 配置/登录缓存）
+                  </label>
+                  <input
+                    type="text"
+                    value={formData.env?.CODEX_HOME || ''}
+                    onChange={(e) => handleEnvChange('CODEX_HOME', e.target.value)}
+                    style={inputStyle}
+                    placeholder="留空使用默认 ~/.codex"
+                  />
+                </div>
+
+                <div style={{ marginTop: 12 }}>
+                  <label style={{ ...labelStyle, display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer', marginBottom: 0 }}>
+                    <input
+                      type="checkbox"
+                      checked={formData.skipPermissions !== false}
+                      onChange={(e) => setFormData({ ...formData, skipPermissions: e.target.checked })}
+                      style={{ accentColor: 'var(--theme-accent)', width: 14, height: 14, flexShrink: 0 }}
+                    />
+                    Skip Permissions (--ask-for-approval never)
+                  </label>
+                  <p style={{ fontSize: 11, color: 'var(--theme-text-muted)', margin: '4px 0 0 22px' }}>
+                    启用后 Codex exec 使用非交互自动批准策略，并在 workspace-write sandbox 中运行。
+                  </p>
+                </div>
+              </div>
+            )}
+
             {/* ── MCP Servers 配置（claude-agent-sdk / claude-code-official / qwen-code-cli）── */}
-            {(formData.type === 'claude-agent-sdk' || formData.type === 'claude-code-official' || formData.type === 'qwen-code-cli' || formData.pinned) && (
+            {(formData.type === 'claude-agent-sdk' || formData.type === 'claude-code-official' || formData.type === 'qwen-code-cli' || formData.type === 'codex-office' || formData.pinned) && (
               <McpServersEditor
                 mcpServers={formData.mcpServers}
                 onChange={(v) => setFormData((prev) => ({ ...prev, mcpServers: v }))}

@@ -1,6 +1,6 @@
 import React, { useState, useCallback, useEffect, useRef, memo, useMemo } from 'react';
 import { markdownToHtml } from '../utils/markdown';
-import { loadSkillImageDataUrl } from '../api';
+import { api, loadSkillImageDataUrl } from '../api';
 import type { ChatMessage, ToolCall, ContentBlock, SubagentInfo } from '../hooks/useChat';
 import { DiffView, type DiffData } from './DiffView';
 
@@ -664,6 +664,8 @@ interface Props {
   fontSize?: number;
   renderMarkdown?: boolean;
   animateIn?: boolean;
+  sessionId?: string;
+  canBranch?: boolean;
 }
 
 // 复制气泡内容到剪贴板
@@ -691,10 +693,11 @@ const copyToClipboard = async (content: string) => {
 };
 
 // 气泡操作菜单组件
-const BubbleActionMenu: React.FC<{ message: ChatMessage }> = ({ message }) => {
+const BubbleActionMenu: React.FC<{ message: ChatMessage; sessionId?: string; canBranch?: boolean }> = ({ message, sessionId, canBranch }) => {
   const [menuOpen, setMenuOpen] = useState(false);
   const [copied, setCopied] = useState(false);
   const [copiedFull, setCopiedFull] = useState(false);
+  const [branching, setBranching] = useState(false);
 
   const copyTimerRef = useRef<ReturnType<typeof setTimeout>>();
   const copyFullTimerRef = useRef<ReturnType<typeof setTimeout>>();
@@ -742,6 +745,26 @@ const BubbleActionMenu: React.FC<{ message: ChatMessage }> = ({ message }) => {
     }
     setMenuOpen(false);
   }, [message]);
+
+
+  const handleBranch = useCallback(async () => {
+    if (!sessionId || message.role !== 'assistant') return;
+    setBranching(true);
+    try {
+      const res = await api.branchSession(sessionId, message.id);
+      if (res?.status === 'ok') {
+        window.dispatchEvent(new CustomEvent('awu-session-branched', { detail: res.session }));
+        alert(`已创建分支会话：${res.session?.title || res.session?.id || ''}`);
+      } else {
+        alert(res?.message || '创建分支失败');
+      }
+    } catch (e: any) {
+      alert(e?.message || String(e));
+    } finally {
+      setBranching(false);
+      setMenuOpen(false);
+    }
+  }, [message.id, message.role, sessionId]);
 
   // 点击外部关闭菜单
   useEffect(() => {
@@ -840,6 +863,29 @@ const BubbleActionMenu: React.FC<{ message: ChatMessage }> = ({ message }) => {
             <span>{copiedFull ? '✓' : '📑'}</span>
             <span>{copiedFull ? '已复制' : '复制完整信息'}</span>
           </button>
+          {canBranch && message.role === 'assistant' && (
+            <button
+              onClick={handleBranch}
+              disabled={branching}
+              style={{
+                width: '100%',
+                padding: '8px 12px',
+                background: 'none',
+                border: 'none',
+                borderTop: '1px solid var(--theme-border, rgba(0,0,0,0.08))',
+                textAlign: 'left',
+                cursor: branching ? 'wait' : 'pointer',
+                fontSize: 12,
+                color: 'var(--theme-text, #1f2328)',
+                display: 'flex',
+                alignItems: 'center',
+                gap: 8,
+              }}
+            >
+              <span>🌿</span>
+              <span>{branching ? '创建中…' : '从此创建分支'}</span>
+            </button>
+          )}
         </div>
       )}
     </div>
@@ -851,6 +897,8 @@ function MessageBubbleInner({
   fontSize = 14,
   renderMarkdown = true,
   animateIn = false,
+  sessionId,
+  canBranch = false,
 }: Props) {
   const [lightboxSrc, setLightboxSrc] = useState<string | null>(null);
   const contentRef = useRef<HTMLDivElement>(null);
@@ -989,7 +1037,7 @@ function MessageBubbleInner({
         }}
       >
         {/* 操作菜单（悬停显示） */}
-        <BubbleActionMenu message={message} />
+        <BubbleActionMenu message={message} sessionId={sessionId} canBranch={canBranch} />
         {/* 附件图片 */}
         {message.images && message.images.length > 0 && (
           <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, marginBottom: 8 }}>
