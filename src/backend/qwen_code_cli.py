@@ -321,6 +321,14 @@ class QwenCodeSdkBackend(ModelBackend):
             except Exception:
                 return str(tool_input)
 
+        def _tool_input_to_text(tool_input: Any) -> str:
+            if isinstance(tool_input, str):
+                return tool_input
+            try:
+                return json.dumps(tool_input, ensure_ascii=False)
+            except Exception:
+                return str(tool_input)
+
         # Permission callback
         async def _can_use_tool(tool_name: str, tool_input: dict, context) -> dict:
             """SDK permission callback. Returns PermissionAllowResult or PermissionDenyResult."""
