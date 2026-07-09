@@ -1093,10 +1093,13 @@ class BridgeWS:
             send_content = f"{send_content} --size {size}"
 
         result_parts: list[str] = []
+        result_errors: list[str] = []
 
         def on_delta(delta: StreamDelta):
             if delta.type == "text_delta" and delta.text:
                 result_parts.append(delta.text)
+            elif delta.type == "error" and delta.error:
+                result_errors.append(delta.error)
 
         try:
             await target_backend.send_message(
@@ -1109,6 +1112,9 @@ class BridgeWS:
             )
         except Exception as e:
             return 500, f"Skill execution error: {e}"
+
+        if result_errors:
+            return 500, "\n".join(result_errors)
 
         result = "".join(result_parts) or ""
         print(f"[bridge_ws] skill-call raw result ({len(result)} chars): {result[:120]!r}",
@@ -4002,10 +4008,13 @@ class BridgeWS:
             prompt = "(empty)"
 
         result_parts: list[str] = []
+        result_errors: list[str] = []
 
         def on_delta(delta: StreamDelta):
             if delta.type == "text_delta" and delta.text:
                 result_parts.append(delta.text)
+            elif delta.type == "error" and delta.error:
+                result_errors.append(delta.error)
 
         sub_message_id = new_id()
         try:
@@ -4020,6 +4029,9 @@ class BridgeWS:
             )
         except Exception as e:
             raise RuntimeError(f"Backend skill '{tool_name}' execution failed: {e}")
+
+        if result_errors:
+            raise RuntimeError("\n".join(result_errors))
 
         result = "".join(result_parts)
         if not result:
@@ -4109,7 +4121,8 @@ class BridgeWS:
             payload_parts.append(f'"{key}":"{placeholder}"')
         payload = '{' + ', '.join(payload_parts) + '}'
         return (
-            f'curl -s -X POST http://127.0.0.1:{port}/api/skill-call '
+            f'curl --noproxy 127.0.0.1,localhost -s -X POST '
+            f'http://127.0.0.1:{port}/api/skill-call '
             f'-H "Content-Type: application/json" '
             f"-d '{payload}'"
         )
@@ -4189,13 +4202,13 @@ description: {description}
 
 ## Instructions
 
-**必须使用 Bash 工具执行下方命令。**
+**必须使用 Bash 工具直接执行下方命令。不要再读取本文件或 `_call.py`，不要用 ls/find/dir 探索技能目录。**
 
 ```bash
 {basic_cmd}
 ```
 {extra_params}{ref_image_hint}
-**规则：只执行一次，将命令的完整输出原文粘贴到你的回复中——包括任何 `![alt](url)` 格式的图片 markdown，必须按原样包含，不得删改、不得替换为描述文字。禁止重试、禁止评价质量、禁止额外处理。**
+**规则：只执行一次，将命令的完整输出原文粘贴到你的回复中——包括任何 `![alt](url)` 格式的图片 markdown，必须按原样包含，不得删改、不得替换为描述文字。禁止重试、禁止评价质量、禁止额外处理，禁止再次读取技能文件。**
 """
 
     def _generate_backend_skill_call_py(self, skill_name: str, skill_info: dict, *, is_image_backend: bool = False) -> str:
@@ -4219,12 +4232,19 @@ description: {description}
             ref_image_line = f'if len(sys.argv) > {ref_image_argc} and sys.argv[{ref_image_argc}]:\n    payload["ref_image"] = sys.argv[{ref_image_argc}]\n'
 
         return f'''\
-import sys, json, urllib.request, urllib.error
+import os, sys, json, urllib.request, urllib.error
+# Local skill bridge calls must never go through HTTP(S)_PROXY. Some model
+# backends inject a proxy into the tool subprocess environment, and urllib would
+# otherwise send http://127.0.0.1:{port} through that proxy, often surfacing as a
+# misleading HTTP 502 from the proxy instead of reaching AgentWithU.
+os.environ.setdefault("NO_PROXY", "127.0.0.1,localhost")
+os.environ.setdefault("no_proxy", "127.0.0.1,localhost")
 payload = {{"skill": "{skill_name}", "{primary_field}": sys.argv[1] if len(sys.argv) > 1 else ""}}
 {extra_lines}{ref_image_line}data = json.dumps(payload).encode()
 req = urllib.request.Request("http://127.0.0.1:{port}/api/skill-call", data, {{"Content-Type": "application/json"}})
+_opener = urllib.request.build_opener(urllib.request.ProxyHandler({{}}))
 try:
-    result = urllib.request.urlopen(req, timeout=300).read()
+    result = _opener.open(req, timeout=300).read()
     sys.stdout.buffer.write(result)
     sys.stdout.buffer.write(b"\\n")
     sys.stdout.buffer.flush()
@@ -4243,23 +4263,78 @@ except urllib.error.URLError as e:
     sys.exit(1)
 '''
 
-    def _sync_backend_skills_to_directory(self, session: Session):
-        """
-        将 session 绑定的 Backend Skills 部署到 working_dir/.claude/skills/，
-        同时清理不再绑定的 Backend Skill。
+    def _skill_deploy_roots_for_session(self, session: Session) -> list[tuple[str, "_Path"]]:
+        """Return agent-native project skill roots for the current runtime.
+
+        Claude Code discovers project skills from `.claude/skills/`; Qwen Code
+        discovers project skills from `.qwen/skills/`.  Loops can route one
+        session through multiple local agent backends, so deploy to every native
+        root whose backend type is configured *and* whose corresponding CLI is
+        available in the current runtime.
         """
         from pathlib import Path as _Path
 
         working_dir = session.working_dir
         if not working_dir or working_dir == ".":
+            return []
+
+        import os as _os
+        import shutil as _shutil
+
+        def _cli_available(path_or_cmd: str) -> bool:
+            if not path_or_cmd:
+                return False
+            # Explicit/bundled paths, including Windows .cmd shims.
+            if _os.path.isabs(path_or_cmd) or _os.sep in path_or_cmd or (_os.altsep and _os.altsep in path_or_cmd):
+                return _os.path.exists(path_or_cmd)
+            return _shutil.which(path_or_cmd) is not None
+
+        active_cfg = next((cfg for cfg in self._backend_configs if cfg.id == session.backend_id), None)
+        candidate_configs = list(self._backend_configs)
+        if active_cfg and all(cfg.id != active_cfg.id for cfg in candidate_configs):
+            candidate_configs.append(active_cfg)
+
+        has_claude_cli = False
+        has_qwen_cli = False
+        for cfg in candidate_configs:
+            if cfg.type in (BackendType.CLAUDE_AGENT_SDK, BackendType.CLAUDE_CODE_OFFICIAL):
+                from .base import resolve_claude_cli as _resolve_claude_cli
+                if _cli_available(_resolve_claude_cli(getattr(cfg, "cli_path", None))):
+                    has_claude_cli = True
+            elif cfg.type == BackendType.QWEN_CODE_CLI:
+                from .qwen_code_cli import resolve_qwen_cli as _resolve_qwen_cli
+                if _cli_available(_resolve_qwen_cli(getattr(cfg, "cli_path", None))):
+                    has_qwen_cli = True
+
+        roots: list[tuple[str, _Path]] = []
+        if has_claude_cli:
+            roots.append(("claude", _Path(working_dir) / ".claude" / "skills"))
+        if has_qwen_cli:
+            roots.append(("qwen", _Path(working_dir) / ".qwen" / "skills"))
+
+        # Backward-compatible default: existing installations expected .claude.
+        if not roots:
+            roots.append(("claude", _Path(working_dir) / ".claude" / "skills"))
+        return roots
+
+    def _sync_backend_skills_to_directory(self, session: Session):
+        """
+        将 session 绑定的 Backend Skills 部署到本地 agent 原生目录：
+        - Claude Code: working_dir/.claude/skills/
+        - Qwen Code:   working_dir/.qwen/skills/
+
+        同时清理不再绑定的系统部署 Backend Skill。
+        """
+        roots = self._skill_deploy_roots_for_session(session)
+        if not roots:
             return
 
-        skills_dir = _Path(working_dir) / ".claude" / "skills"
         abilities = session.abilities or {}
         bound_skills = set(abilities.get("skills", []))
 
         # 收集当前绑定中的系统增强型 Skills（有 backend 或 type 字段）
         deployed_backend_skills: set[str] = set()
+        deploy_payloads: dict[str, tuple[str, str]] = {}
         for sname in bound_skills:
             info = self._skill_store.get_skill(sname)
             if not info:
@@ -4273,33 +4348,37 @@ except urllib.error.URLError as e:
                 bc = next((c for c in self._backend_configs if c.id == backend_id), None)
                 if bc and bc.type.value == "dashscope-image":
                     is_image_backend = True
-            # 系统增强型：部署 SKILL.md + _call.py
-            target = skills_dir / sname
-            target.mkdir(parents=True, exist_ok=True)
-            (target / "SKILL.md").write_text(
-                self._generate_backend_skill_md(sname, info, is_image_backend=is_image_backend), encoding="utf-8")
-            (target / "_call.py").write_text(
-                self._generate_backend_skill_call_py(sname, info, is_image_backend=is_image_backend), encoding="utf-8")
+            deploy_payloads[sname] = (
+                self._generate_backend_skill_md(sname, info, is_image_backend=is_image_backend),
+                self._generate_backend_skill_call_py(sname, info, is_image_backend=is_image_backend),
+            )
             deployed_backend_skills.add(sname)
-            print(f"[bridge_ws] Deployed Backend Skill '{sname}' → {target}",
-                  file=sys.stderr, flush=True)
 
-        # 清理不再绑定的 Backend Skill（通过 _call.py 存在判断是否为系统部署的）
-        if skills_dir.exists():
-            for skill_dir in skills_dir.iterdir():
-                if not skill_dir.is_dir():
-                    continue
-                if skill_dir.name in deployed_backend_skills:
-                    continue
-                if skill_dir.name in bound_skills:
-                    continue
-                call_py = skill_dir / "_call.py"
-                if call_py.exists():
-                    # 系统部署的 Backend Skill，解绑后清理
-                    import shutil as _shutil
-                    _shutil.rmtree(skill_dir, ignore_errors=True)
-                    print(f"[bridge_ws] Cleaned up unbound Backend Skill '{skill_dir.name}'",
-                          file=sys.stderr, flush=True)
+        for agent_name, skills_dir in roots:
+            for sname, (skill_md, call_py) in deploy_payloads.items():
+                target = skills_dir / sname
+                target.mkdir(parents=True, exist_ok=True)
+                (target / "SKILL.md").write_text(skill_md, encoding="utf-8")
+                (target / "_call.py").write_text(call_py, encoding="utf-8")
+                print(f"[bridge_ws] Deployed Backend Skill '{sname}' → {target} ({agent_name})",
+                      file=sys.stderr, flush=True)
+
+            # 清理不再绑定的 Backend Skill（通过 _call.py 存在判断是否为系统部署的）
+            if skills_dir.exists():
+                for skill_dir in skills_dir.iterdir():
+                    if not skill_dir.is_dir():
+                        continue
+                    if skill_dir.name in deployed_backend_skills:
+                        continue
+                    if skill_dir.name in bound_skills:
+                        continue
+                    call_py = skill_dir / "_call.py"
+                    if call_py.exists():
+                        # 系统部署的 Backend Skill，解绑后清理
+                        import shutil as _shutil
+                        _shutil.rmtree(skill_dir, ignore_errors=True)
+                        print(f"[bridge_ws] Cleaned up unbound Backend Skill '{skill_dir.name}' from {skills_dir}",
+                              file=sys.stderr, flush=True)
 
     @staticmethod
     def _build_sandbox_constraints(session: "Session") -> str | None:
@@ -4414,9 +4493,18 @@ except urllib.error.URLError as e:
         if backend_skill_hints:
             skill_block = (
                 "## 已绑定 Backend Skills【强制规则】\n\n"
-                "以下技能已就绪，**必须直接调用，禁止用 ls/find/cat 等方式自行探索或验证**：\n\n"
+                "以下技能已就绪，本段就是权威调用说明；即使会话重启、resume 或用户说“再试一次 / 继续”，"
+                "**也必须直接使用这里给出的命令**。\n\n"
+                "### 禁止的低效行为\n"
+                "- 禁止先 Read / cat / type `.claude/skills/**/SKILL.md`。\n"
+                "- 禁止先 Read / cat / type `.claude/skills/**/_call.py`。\n"
+                "- 禁止用 ls/find/dir 等方式自行探索或验证技能文件。\n"
+                "- 禁止在调用前输出“我先查看技能说明 / I need to inspect the skill”等自我确认。\n\n"
+                "### 可用技能与直接调用命令\n\n"
                 + "\n".join(backend_skill_hints)
-                + "\n\n**规则：用 Bash 执行上方命令一次，将输出原样返回给用户，不要重试，不要自行判断结果。**"
+                + "\n\n**规则：根据用户当前请求和已有对话上下文补全参数，"
+                  "立即用 Bash 执行对应命令一次；将输出原样返回给用户。"
+                  "不要重试，不要自行判断结果，不要读取技能文件。**"
             )
             if has_image_backend_skill:
                 skill_block += (
