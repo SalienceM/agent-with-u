@@ -83,16 +83,21 @@ class CodexOfficeBackend(ModelBackend):
                     else:
                         chunks.append(str(item))
                 return "".join(chunks)
+        item = obj.get("item")
+        if isinstance(item, dict):
+            text = item.get("text") or item.get("content") or item.get("message")
+            if isinstance(text, str):
+                return text
         return ""
 
     @staticmethod
     def _extract_session_id(obj: dict) -> Optional[str]:
-        for key in ("session_id", "sessionId", "conversation_id", "conversationId", "id"):
+        for key in ("session_id", "sessionId", "thread_id", "threadId", "conversation_id", "conversationId", "id"):
             val = obj.get(key)
             if isinstance(val, str) and val:
                 # Avoid treating every event id/tool id as the resumable session id.
                 typ = str(obj.get("type") or obj.get("event") or "").lower()
-                if key == "id" and typ not in {"session", "session_created", "exec_session"}:
+                if key == "id" and typ not in {"session", "session_created", "exec_session", "thread.started"}:
                     continue
                 return val
         return None
@@ -221,7 +226,27 @@ class CodexOfficeBackend(ModelBackend):
                 if sid:
                     new_agent_sid = sid
                 typ = str(obj.get("type") or obj.get("event") or "").lower()
-                if any(k in typ for k in ("delta", "assistant", "message")):
+                item = obj.get("item")
+                item_type = str(item.get("type") or "").lower() if isinstance(item, dict) else ""
+                if item_type == "agent_message":
+                    txt = self._decode_text_payload(obj)
+                    if txt:
+                        collected.append(txt)
+                        emit("text_delta", text=txt)
+                elif item_type in {"command_execution", "tool_call"}:
+                    name = (
+                        item.get("command")
+                        or item.get("name")
+                        or item.get("tool")
+                        or "Codex tool"
+                    ) if isinstance(item, dict) else "Codex tool"
+                    emit("tool_start", tool_call={
+                        "id": str(item.get("id") or obj.get("id") or "") if isinstance(item, dict) else str(obj.get("id") or ""),
+                        "name": str(name),
+                        "input": json.dumps(item if isinstance(item, dict) else obj, ensure_ascii=False),
+                        "status": str(item.get("status") or "running") if isinstance(item, dict) else "running",
+                    })
+                elif any(k in typ for k in ("delta", "assistant", "message")):
                     txt = self._decode_text_payload(obj)
                     if txt:
                         collected.append(txt)
