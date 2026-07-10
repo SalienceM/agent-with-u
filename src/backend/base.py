@@ -6,6 +6,7 @@ import sys
 import asyncio
 import json
 import subprocess
+import shutil
 from pathlib import Path
 from abc import ABC, abstractmethod
 from typing import Optional, Callable, Awaitable
@@ -119,6 +120,27 @@ def resolve_claude_cli(config_cli_path: Optional[str] = None) -> str:
                 if os.path.exists(p):
                     return p
     return "claude"
+
+
+def cli_available(path_or_cmd: str) -> bool:
+    """Return whether a configured CLI path/command appears executable."""
+    if not path_or_cmd:
+        return False
+    if os.path.isabs(path_or_cmd) or os.sep in path_or_cmd or (os.altsep and os.altsep in path_or_cmd):
+        return os.path.exists(path_or_cmd)
+    return shutil.which(path_or_cmd) is not None
+
+
+def cli_missing_message(name: str, executable: str, npm_install_cmd: str, extra: str = "") -> str:
+    """Friendly message shown when a local agent CLI is missing."""
+    detail = f"\n{extra.strip()}" if extra.strip() else ""
+    return (
+        f"{name} CLI 未找到（期望命令/路径：`{executable}`）。\n\n"
+        f"请先安装 Node.js，然后在运行后端的服务器/电脑上执行：\n\n"
+        f"```bash\n{npm_install_cmd}\n```\n\n"
+        "安装完成后，重启 AgentWithU 后端；如果仍找不到，请在 Backend Manager 中填写 CLI 绝对路径。"
+        f"{detail}"
+    )
 
 
 def apply_root_sandbox_env(env: dict) -> dict:
@@ -298,5 +320,4 @@ class ModelBackend(ABC):
     def get_model(self) -> str:
         """Get model name from config or environment."""
         return self.get_env("ANTHROPIC_MODEL") or self.config.model or "default"
-
 
