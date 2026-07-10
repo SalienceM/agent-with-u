@@ -22,9 +22,14 @@ export const AuthStatusBanner: React.FC<AuthStatusBannerProps> = ({ activeBacken
   const [dismissed, setDismissed] = useState(false);
 
   const isClaudeCli = !!activeBackend && CLAUDE_CLI_TYPES.includes(activeBackend.type);
-  // 该后端自带 token（在 Backend Manager 里填了），无需 claude login
+  const dismissKey = activeBackend?.id ? `awu-auth-banner-dismissed:${activeBackend.id}` : '';
+  // 该后端自带 token/API Key（在 Backend Manager 里填了），无需 claude login
   const env = (activeBackend?.env || {}) as Record<string, string>;
-  const hasOwnToken = !!(env.ANTHROPIC_AUTH_TOKEN || env.ANTHROPIC_API_KEY);
+  const hasOwnToken = !!(
+    activeBackend?.apiKey
+    || env.ANTHROPIC_AUTH_TOKEN
+    || env.ANTHROPIC_API_KEY
+  );
 
   const check = useCallback(async () => {
     setChecking(true);
@@ -41,8 +46,19 @@ export const AuthStatusBanner: React.FC<AuthStatusBannerProps> = ({ activeBacken
     if (isClaudeCli && !hasOwnToken) check();
   }, [isClaudeCli, hasOwnToken, check]);
 
-  // 切换后端后重新允许显示
-  useEffect(() => { setDismissed(false); }, [activeBackend?.id]);
+  // 切换后端或刷新页面后，沿用用户对该 backend 的隐藏选择，避免反复提示。
+  useEffect(() => {
+    if (!dismissKey) {
+      setDismissed(false);
+      return;
+    }
+    setDismissed(localStorage.getItem(dismissKey) === '1');
+  }, [dismissKey]);
+
+  const dismiss = useCallback(() => {
+    setDismissed(true);
+    if (dismissKey) localStorage.setItem(dismissKey, '1');
+  }, [dismissKey]);
 
   if (!isClaudeCli || hasOwnToken || dismissed) return null;
   if (!status || status.loggedIn) return null;
@@ -59,6 +75,7 @@ export const AuthStatusBanner: React.FC<AuthStatusBannerProps> = ({ activeBacken
         <div style={{ fontSize: 12, opacity: 0.85, marginTop: 2 }}>
           在运行后端的服务器上执行 <code style={codeStyle}>claude login</code>
           （或启动 <code style={codeStyle}>claude</code> 后输入 <code style={codeStyle}>/login</code>）；
+          如果缺少 CLI，请先执行 <code style={codeStyle}>npm install -g @anthropic-ai/claude-code</code>。
           也可在 Backend Manager 中为该后端填写 API Key 或第三方 Base URL+Token。
           {status.credentialsPath && (
             <span style={{ opacity: 0.7 }}> 凭证路径：{status.credentialsPath}</span>
@@ -68,7 +85,7 @@ export const AuthStatusBanner: React.FC<AuthStatusBannerProps> = ({ activeBacken
       <button onClick={check} style={btnStyle} disabled={checking}>
         {checking ? '检测中…' : '重新检测'}
       </button>
-      <button onClick={() => setDismissed(true)} style={closeBtnStyle} title="隐藏">✕</button>
+      <button onClick={dismiss} style={closeBtnStyle} title="不再提示此后端">✕</button>
     </div>
   );
 };
