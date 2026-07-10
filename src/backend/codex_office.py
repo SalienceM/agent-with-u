@@ -49,11 +49,18 @@ class CodexOfficeBackend(ModelBackend):
         env.setdefault("NO_COLOR", "1")
         return env
 
-    def _build_prompt(self, messages: list[ChatMessage], content: str, constraints: Optional[str]) -> str:
+    def _build_prompt(
+        self,
+        messages: list[ChatMessage],
+        content: str,
+        constraints: Optional[str],
+        *,
+        include_history: bool = True,
+    ) -> str:
         parts: list[str] = []
         if constraints:
             parts.append(f"以下是你必须遵守的规则和约束：\n\n{constraints}")
-        if messages:
+        if include_history and messages:
             history = []
             for m in messages[-12:]:
                 if m.content:
@@ -171,7 +178,15 @@ class CodexOfficeBackend(ModelBackend):
                 on_delta(StreamDelta(session_id, message_id, delta_type, **kwargs))
 
         cwd = working_dir or self.config.working_dir or "."
-        prompt = self._build_prompt(messages, content, constraints)
+        # Like Claude official, resumed CLI sessions should rely on the native
+        # agent thread instead of re-injecting recent AgentWithU history.  This
+        # avoids duplicated context, lowers token use, and reduces self-repeat.
+        prompt = self._build_prompt(
+            messages,
+            content,
+            constraints,
+            include_history=not bool(agent_session_id),
+        )
         model = self.config.model or self.get_env("OPENAI_MODEL") or ""
         skip = self.config.skip_permissions if skip_permissions is None else bool(skip_permissions)
 
@@ -181,6 +196,7 @@ class CodexOfficeBackend(ModelBackend):
         collected: list[str] = []
         new_agent_sid = agent_session_id
         stdin_data: Optional[bytes] = None
+        final_usage: Optional[dict] = None
 
         try:
             codex_cli = resolve_codex_cli(self.config.cli_path)
@@ -274,6 +290,14 @@ class CodexOfficeBackend(ModelBackend):
                 if sid:
                     new_agent_sid = sid
                 typ = str(obj.get("type") or obj.get("event") or "").lower()
+                usage = obj.get("usage")
+                if isinstance(usage, dict):
+                    final_usage = {
+                        "inputTokens": usage.get("input_tokens", 0),
+                        "outputTokens": usage.get("output_tokens", 0),
+                        "cachedInputTokens": usage.get("cached_input_tokens", 0),
+                        "reasoningOutputTokens": usage.get("reasoning_output_tokens", 0),
+                    }
                 item = obj.get("item")
                 item_type = str(item.get("type") or "").lower() if isinstance(item, dict) else ""
                 if item_type == "agent_message":
@@ -338,7 +362,7 @@ class CodexOfficeBackend(ModelBackend):
                     pass
             if image_tmpdir:
                 image_tmpdir.cleanup()
-            emit("done")
+            emit("done", **({"usage": final_usage} if final_usage else {}))
             self.clear_cancelled(session_id)
 
         return {"agentSessionId": new_agent_sid}
