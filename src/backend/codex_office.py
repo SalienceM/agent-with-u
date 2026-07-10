@@ -49,6 +49,22 @@ class CodexOfficeBackend(ModelBackend):
         env.setdefault("NO_COLOR", "1")
         return env
 
+    def _force_https_transport(self) -> bool:
+        """Default to HTTPS/SSE instead of trying WebSocket first.
+
+        Some local Codex CLI setups spend a long time timing out on WebSocket
+        before falling back to HTTPS.  Codex config supports disabling provider
+        WebSocket transport; keep an escape hatch for users who explicitly want
+        to test WebSocket transport.
+        """
+        val = (
+            self.config.get_env("AGENTWITHU_CODEX_FORCE_HTTPS")
+            or self.config.get_env("CODEX_FORCE_HTTPS_TRANSPORT")
+        )
+        if val is None:
+            return True
+        return str(val).strip().lower() not in {"0", "false", "no", "off"}
+
     def _build_prompt(
         self,
         messages: list[ChatMessage],
@@ -82,6 +98,7 @@ class CodexOfficeBackend(ModelBackend):
         output_path: Optional[str],
         image_paths: list[str],
         stdin_mode: bool,
+        force_https_transport: bool,
     ) -> list[str]:
         """Build a Codex CLI command in the same spirit as Claude official.
 
@@ -93,6 +110,8 @@ class CodexOfficeBackend(ModelBackend):
         cmd = [codex_cli]
         if model:
             cmd.extend(["--model", model])
+        if force_https_transport:
+            cmd.extend(["-c", "model_providers.openai.supports_websockets=false"])
         if approval_mode == "never" and sandbox_mode == "danger-full-access":
             # Older Codex builds expose this compatibility flag prominently
             # for `exec resume`; it is equivalent to no approvals + no sandbox.
@@ -245,6 +264,7 @@ class CodexOfficeBackend(ModelBackend):
                 output_path=output_path,
                 image_paths=image_paths,
                 stdin_mode=stdin_mode,
+                force_https_transport=self._force_https_transport(),
             )
 
             print(f"[CodexOffice] exec: cwd={cwd!r}, resume={agent_session_id!r}, "
