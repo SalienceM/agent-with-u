@@ -49,6 +49,21 @@ class CodexOfficeBackend(ModelBackend):
         env.setdefault("NO_COLOR", "1")
         return env
 
+    def _native_resume_enabled(self) -> bool:
+        """Codex native resume is opt-in for now.
+
+        AgentWithU already stores chat history and keeps the same workspace.
+        Fresh `codex exec` calls with AgentWithU-managed context have been more
+        predictable than resuming a Codex CLI thread that may contain earlier
+        malformed prompt/context attempts.
+        """
+        val = (
+            self.config.get_env("AGENTWITHU_CODEX_NATIVE_RESUME")
+            or self.config.get_env("CODEX_USE_NATIVE_RESUME")
+        )
+        return str(val or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
     def _build_prompt(
         self,
         messages: list[ChatMessage],
@@ -193,6 +208,8 @@ class CodexOfficeBackend(ModelBackend):
                 on_delta(StreamDelta(session_id, message_id, delta_type, **kwargs))
 
         cwd = working_dir or self.config.working_dir or "."
+        use_native_resume = self._native_resume_enabled()
+        codex_resume_id = agent_session_id if use_native_resume else None
         # Like Claude official, resumed CLI sessions should rely on the native
         # agent thread instead of re-injecting recent AgentWithU history.  This
         # avoids duplicated context, lowers token use, and reduces self-repeat.
@@ -200,7 +217,7 @@ class CodexOfficeBackend(ModelBackend):
             messages,
             content,
             constraints,
-            include_history=not bool(agent_session_id),
+            include_history=not bool(codex_resume_id),
         )
         model = self.config.model or self.get_env("OPENAI_MODEL") or ""
         skip = self.config.skip_permissions if skip_permissions is None else bool(skip_permissions)
@@ -209,7 +226,7 @@ class CodexOfficeBackend(ModelBackend):
         image_tmpdir = None
         proc: Optional[asyncio.subprocess.Process] = None
         collected: list[str] = []
-        new_agent_sid = agent_session_id
+        new_agent_sid = codex_resume_id
         stdin_data: Optional[bytes] = None
         final_usage: Optional[dict] = None
 
@@ -256,14 +273,15 @@ class CodexOfficeBackend(ModelBackend):
                 model=model,
                 approval_mode=approval_mode,
                 sandbox_mode=sandbox_mode,
-                agent_session_id=agent_session_id,
+                agent_session_id=codex_resume_id,
                 output_path=output_path,
                 image_paths=image_paths,
                 stdin_mode=stdin_mode,
             )
 
-            print(f"[CodexOffice] exec: cwd={cwd!r}, resume={agent_session_id!r}, "
-                  f"model={model!r}, approval={approval_mode!r}, sandbox={sandbox_mode!r}",
+            print(f"[CodexOffice] exec: cwd={cwd!r}, resume={codex_resume_id!r}, "
+                  f"native_resume={use_native_resume}, model={model!r}, "
+                  f"approval={approval_mode!r}, sandbox={sandbox_mode!r}",
                   file=sys.stderr, flush=True)
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
@@ -307,7 +325,7 @@ class CodexOfficeBackend(ModelBackend):
                     emit("text_delta", text=line + "\n")
                     continue
                 sid = self._extract_session_id(obj)
-                if sid:
+                if sid and use_native_resume:
                     new_agent_sid = sid
                 typ = str(obj.get("type") or obj.get("event") or "").lower()
                 usage = obj.get("usage")
@@ -385,4 +403,4 @@ class CodexOfficeBackend(ModelBackend):
             emit("done", **({"usage": final_usage} if final_usage else {}))
             self.clear_cancelled(session_id)
 
-        return {"agentSessionId": new_agent_sid}
+        return {"agentSessionId": new_agent_sid if use_native_resume else None}
