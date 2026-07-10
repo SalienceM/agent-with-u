@@ -34,6 +34,15 @@ interface BackendConfig {
 
 const OFFICIAL_BACKEND_ID = 'official-claude';
 const OFFICIAL_CODEX_BACKEND_ID = 'official-codex';
+const CODEX_DEFAULT_MODEL = 'gpt-5.6-sol';
+const CODEX_RECOMMENDED_MODELS = [
+  { id: 'gpt-5.6-sol', label: 'GPT-5.6 Sol（推荐，复杂编码/推理）' },
+  { id: 'gpt-5.6-terra', label: 'GPT-5.6 Terra（日常工作均衡）' },
+  { id: 'gpt-5.6-luna', label: 'GPT-5.6 Luna（更快/更省）' },
+  { id: 'gpt-5.5', label: 'GPT-5.5（上一代旗舰）' },
+  { id: 'gpt-5.4', label: 'GPT-5.4' },
+  { id: 'gpt-5.4-mini', label: 'GPT-5.4 Mini' },
+];
 
 const DEFAULT_TOOLS = ['Read', 'Edit', 'Bash', 'Glob', 'Grep', 'Write'];
 const ALL_TOOLS = ['Read', 'Edit', 'Write', 'Bash', 'Glob', 'Grep', 'WebSearch', 'WebFetch'];
@@ -1219,8 +1228,20 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
                     value={formData.model || ''}
                     onChange={(e) => setFormData({ ...formData, model: e.target.value })}
                     style={inputStyle}
-                    placeholder="gpt-5.5"
+                    list="codex-recommended-models"
+                    placeholder={CODEX_DEFAULT_MODEL}
                   />
+                  <datalist id="codex-recommended-models">
+                    {CODEX_RECOMMENDED_MODELS.map((m) => (
+                      <option key={m.id} value={m.id}>{m.label}</option>
+                    ))}
+                  </datalist>
+                  <div style={{ fontSize: 11, color: 'var(--theme-text-muted)', marginTop: 5, lineHeight: 1.5 }}>
+                    推荐默认：<code style={{ fontSize: 10 }}>{CODEX_DEFAULT_MODEL}</code>。可手填新模型；官方列表见{' '}
+                    <a href="https://developers.openai.com/codex/models" target="_blank" rel="noreferrer" style={{ color: 'var(--theme-accent)' }}>Codex Models</a>
+                    {' '}；用量/5h 窗口见{' '}
+                    <a href="https://developers.openai.com/codex/pricing" target="_blank" rel="noreferrer" style={{ color: 'var(--theme-accent)' }}>Codex Pricing</a>。
+                  </div>
                 </div>
 
                 <div style={{ marginBottom: 10 }}>

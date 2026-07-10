@@ -556,7 +556,7 @@ class BridgeWS:
                 id=OFFICIAL_CODEX_BACKEND_ID,
                 type=BackendType.CODEX_OFFICIAL,
                 label="Codex 官方账户",
-                model="gpt-5.5",
+                model="gpt-5.6-sol",
                 skip_permissions=True,
             )
             self._backend_configs.insert(1, official_codex)
@@ -3748,7 +3748,7 @@ class BridgeWS:
                 id=OFFICIAL_CODEX_BACKEND_ID,
                 type=BackendType.CODEX_OFFICIAL,
                 label="Codex 官方账户",
-                model=data.get("model") or (existing.model if existing else "gpt-5.5"),
+                model=data.get("model") or (existing.model if existing else "gpt-5.6-sol"),
                 skip_permissions=data.get("skipPermissions", True),
                 env=data.get("env") or None,
                 api_key=data.get("apiKey") or None,
