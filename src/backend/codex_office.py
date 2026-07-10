@@ -254,7 +254,12 @@ class CodexOfficeBackend(ModelBackend):
                 *cmd,
                 cwd=cwd,
                 env=self._build_env(),
-                stdin=asyncio.subprocess.PIPE if stdin_data else asyncio.subprocess.DEVNULL,
+                # Match Claude official: do not attach stdin for normal
+                # positional-prompt runs.  Some Codex CLI builds try to read
+                # extra input whenever stdin is a non-TTY (even /dev/null),
+                # which can trigger slow "Reading additional input from stdin"
+                # and reconnect/timeout behavior.
+                stdin=asyncio.subprocess.PIPE if stdin_data else None,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
