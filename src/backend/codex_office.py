@@ -63,6 +63,53 @@ class CodexOfficeBackend(ModelBackend):
         parts.append(content)
         return "\n\n---\n\n".join(parts)
 
+    def _build_cmd(
+        self,
+        *,
+        codex_cli: str,
+        prompt: str,
+        model: str,
+        approval_mode: str,
+        sandbox_mode: str,
+        agent_session_id: Optional[str],
+        output_path: Optional[str],
+        image_paths: list[str],
+        stdin_mode: bool,
+    ) -> list[str]:
+        """Build a Codex CLI command in the same spirit as Claude official.
+
+        Short prompts are passed as the CLI's positional [PROMPT].  Only long
+        prompts use `-` + stdin to avoid Windows command-line length limits.
+        Resume-specific flags must stay before SESSION_ID; anything after the
+        session id is parsed as prompt text by some Codex CLI versions.
+        """
+        cmd = [codex_cli]
+        if model:
+            cmd.extend(["--model", model])
+        if approval_mode == "never" and sandbox_mode == "danger-full-access":
+            # Older Codex builds expose this compatibility flag prominently
+            # for `exec resume`; it is equivalent to no approvals + no sandbox.
+            cmd.append("--dangerously-bypass-approvals-and-sandbox")
+        else:
+            cmd.extend(["--ask-for-approval", approval_mode])
+            cmd.extend(["--sandbox", sandbox_mode])
+
+        if agent_session_id:
+            cmd.extend(["exec", "resume", "--json"])
+        else:
+            cmd.extend(["exec", "--json"])
+            if output_path:
+                cmd.extend(["--skip-git-repo-check", "--output-last-message", output_path])
+
+        for path in image_paths:
+            cmd.extend(["--image", path])
+
+        if agent_session_id:
+            cmd.append(agent_session_id)
+
+        cmd.append("-" if stdin_mode else prompt)
+        return cmd
+
     @staticmethod
     def _decode_text_payload(obj: dict) -> str:
         """Best-effort extraction from Codex JSON event shapes."""
@@ -133,11 +180,9 @@ class CodexOfficeBackend(ModelBackend):
         proc: Optional[asyncio.subprocess.Process] = None
         collected: list[str] = []
         new_agent_sid = agent_session_id
+        stdin_data: Optional[bytes] = None
 
         try:
-            with tempfile.NamedTemporaryFile("w", delete=False, suffix=".txt", encoding="utf-8") as f:
-                output_path = f.name
-
             codex_cli = resolve_codex_cli(self.config.cli_path)
             if not cli_available(codex_cli):
                 emit("error", error=cli_missing_message(
@@ -151,34 +196,13 @@ class CodexOfficeBackend(ModelBackend):
             approval_mode = "never" if skip else "on-request"
             sandbox_mode = "workspace-write" if sandbox_enabled else "danger-full-access"
 
-            # Codex treats model/approval/sandbox as top-level global options.
-            # Keep them before the `exec` subcommand; older CLIs reject them when
-            # placed after `codex exec` with "unexpected argument".
-            cmd = [codex_cli]
-            if model:
-                cmd.extend(["--model", model])
-            if approval_mode == "never" and sandbox_mode == "danger-full-access":
-                # Older Codex builds expose this compatibility flag prominently
-                # for `exec resume`; it is equivalent to no approvals + no sandbox.
-                cmd.append("--dangerously-bypass-approvals-and-sandbox")
-            else:
-                cmd.extend(["--ask-for-approval", approval_mode])
-                cmd.extend(["--sandbox", sandbox_mode])
-            if agent_session_id:
-                cmd.extend(["exec", "resume"])
-            else:
-                cmd.extend(["exec"])
-
-            # Keep exec/resume options before SESSION_ID/PROMPT.  Some Codex CLI
-            # versions parse everything after SESSION_ID as prompt text and reject
-            # flags like `--color`; JSON mode does not need color control anyway.
-            cmd.append("--json")
             if not agent_session_id:
-                cmd.extend(["--skip-git-repo-check", "--output-last-message", output_path])
+                with tempfile.NamedTemporaryFile("w", delete=False, suffix=".txt", encoding="utf-8") as f:
+                    output_path = f.name
 
+            image_paths: list[str] = []
             if images:
                 image_tmpdir = tempfile.TemporaryDirectory(prefix="awu-codex-images-")
-                image_paths = []
                 for i, img in enumerate(images):
                     if img.file_path and os.path.exists(img.file_path):
                         image_paths.append(img.file_path)
@@ -188,14 +212,24 @@ class CodexOfficeBackend(ModelBackend):
                         path = Path(image_tmpdir.name) / f"image-{i}.{ext}"
                         path.write_bytes(base64.b64decode(img.base64))
                         image_paths.append(str(path))
-                for path in image_paths:
-                    cmd.extend(["--image", path])
 
-            if agent_session_id:
-                cmd.append(agent_session_id)
+            stdin_mode = len(prompt) > 8000
+            if stdin_mode:
+                stdin_data = prompt.encode("utf-8")
+                print(f"[CodexOffice] long prompt ({len(prompt)} chars), using stdin",
+                      file=sys.stderr, flush=True)
 
-            # Prompt last; '-' lets us avoid command-line length/quoting issues.
-            cmd.append("-")
+            cmd = self._build_cmd(
+                codex_cli=codex_cli,
+                prompt=prompt,
+                model=model,
+                approval_mode=approval_mode,
+                sandbox_mode=sandbox_mode,
+                agent_session_id=agent_session_id,
+                output_path=output_path,
+                image_paths=image_paths,
+                stdin_mode=stdin_mode,
+            )
 
             print(f"[CodexOffice] exec: cwd={cwd!r}, resume={agent_session_id!r}, "
                   f"model={model!r}, approval={approval_mode!r}, sandbox={sandbox_mode!r}",
@@ -204,14 +238,15 @@ class CodexOfficeBackend(ModelBackend):
                 *cmd,
                 cwd=cwd,
                 env=self._build_env(),
-                stdin=asyncio.subprocess.PIPE,
+                stdin=asyncio.subprocess.PIPE if stdin_data else asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
-            assert proc.stdin is not None
-            proc.stdin.write(prompt.encode("utf-8"))
-            await proc.stdin.drain()
-            proc.stdin.close()
+            if stdin_data:
+                assert proc.stdin is not None
+                proc.stdin.write(stdin_data)
+                await proc.stdin.drain()
+                proc.stdin.close()
 
             async def read_stderr():
                 assert proc and proc.stderr
