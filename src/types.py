@@ -17,6 +17,7 @@ class BackendType(str, Enum):
     ANTHROPIC_API = "anthropic-api"
     DASHSCOPE_IMAGE = "dashscope-image"             # 阿里云 DashScope 文生图（万象/Wan 系列）
     QWEN_CODE_CLI = "qwen-code-cli"                 # Qwen Code CLI（子进程 stream-json 模式）
+    CODEX_OFFICIAL = "codex-office"                 # OpenAI Codex CLI（本地官方账户 / API key）
 
 
 @dataclass
