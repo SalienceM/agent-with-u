@@ -988,6 +988,16 @@ export const api = {
     try { return JSON.parse(result); } catch { return null; }
   },
 
+  async listSessionRefs(query = ''): Promise<any[]> {
+    const result = await call('listSessionRefs', query);
+    try { return JSON.parse(result) || []; } catch { return []; }
+  },
+
+  async branchSession(sourceSessionId: string, afterMessageId?: string, titleSuffix = '分支'): Promise<any> {
+    const result = await call('branchSession', JSON.stringify({ sourceSessionId, afterMessageId, titleSuffix }));
+    try { return JSON.parse(result); } catch { return null; }
+  },
+
   /** 新建会话。execKey 指定它落在哪个执行节点(默认 home);建后归属即固定。 */
   async createSession(workingDir: string, backendId: string, sessionType: 'normal' | 'loop' = 'normal', execKey?: string): Promise<any> {
     const conn = (execKey && pool.get(execKey)) || homeConn;
