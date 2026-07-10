@@ -40,7 +40,8 @@ def resolve_qwen_cli(config_cli_path: Optional[str] = None) -> str:
                 if os.path.exists(p):
                     return p
 
-    return "qwen"
+    import shutil as _shutil
+    return _shutil.which("qwen") or "qwen"
 
 
 # ---------------------------------------------------------------------------
@@ -118,7 +119,10 @@ class QwenCodeSdkBackend(ModelBackend):
         """
         import urllib.request as _urllib_req
 
-        proc_env: dict[str, str] = {}
+        # The SDK starts the external `qwen` CLI via subprocess.  Keep the
+        # parent environment (especially PATH/PATHEXT/SystemRoot on Windows)
+        # so npm shims such as qwen.cmd can find node.exe and dependencies.
+        proc_env: dict[str, str] = os.environ.copy()
 
         # Auto-detect system proxy
         _already_has_proxy = any(
