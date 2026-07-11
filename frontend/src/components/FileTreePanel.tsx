@@ -149,6 +149,7 @@ export const FileTreePanel: React.FC<Props> = ({ workingDir, execKey, execLabel,
   // gitCommitExpanded removed — ✅ button now opens the modal dialog
   const [gitCommitMsg, setGitCommitMsg] = useState('');
   const [gitCommitting, setGitCommitting] = useState(false);
+  const [gitCommitPendingPush, setGitCommitPendingPush] = useState(false);
   const [gitPushing, setGitPushing] = useState(false);
   const [gitPulling, setGitPulling] = useState(false);
   const [gitAiGenerating, setGitAiGenerating] = useState(false);
@@ -499,37 +500,40 @@ export const FileTreePanel: React.FC<Props> = ({ workingDir, execKey, execLabel,
 
   /** ★ 提交并推送（小乌龟风格一步到位） */
   const handleCommitAndPush = useCallback(async () => {
-    if (!workingDir || !gitCommitMsg.trim()) return;
+    if (!workingDir || (!gitCommitPendingPush && !gitCommitMsg.trim())) return;
     setGitCommitting(true);
     try {
-      const selectedPaths = Array.from(gitSelected);
-      if (selectedPaths.length === 0) {
-        setMsg({ kind: 'err', text: '请至少选择一个文件' });
-        setGitCommitting(false);
-        return;
+      if (!gitCommitPendingPush) {
+        const selectedPaths = Array.from(gitSelected);
+        if (selectedPaths.length === 0) {
+          setMsg({ kind: 'err', text: '请至少选择一个文件' });
+          return;
+        }
+        const commitRes = await api.gitCommit(workingDir, gitCommitMsg.trim(), false, execKey, selectedPaths);
+        if (commitRes.status !== 'ok') {
+          setMsg({ kind: 'err', text: `提交失败：${(commitRes as any).message || '未知错误'}` });
+          return;
+        }
+        setGitCommitPendingPush(true);
+        setMsg({ kind: 'ok', text: `✓ 已提交，正在推送…` });
       }
-      const commitRes = await api.gitCommit(workingDir, gitCommitMsg.trim(), false, execKey, selectedPaths);
-      if (commitRes.status === 'ok') {
-        setMsg({ kind: 'ok', text: `✓ 已提交: ${gitCommitMsg.trim().split('\n')[0]}` });
+
+      const pushRes = await api.gitPush(workingDir, 'origin', '', false, execKey);
+      if (pushRes.status === 'ok') {
+        setMsg({ kind: 'ok', text: '✓ 已提交并推送' });
         setGitCommitMsg('');
         setGitSelected(new Set());
+        setGitCommitPendingPush(false);
         setGitModalOpen(false);
-        // 立即推送
-        const pushRes = await api.gitPush(workingDir, 'origin', '', false, execKey);
-        if (pushRes.status === 'ok') {
-          setMsg({ kind: 'ok', text: `✓ 已提交并推送` });
-        } else {
-          setMsg({ kind: 'ok', text: `✓ 已提交，但推送失败：${pushRes.message || pushRes.output || '未知错误'}` });
-        }
       } else {
-        setMsg({ kind: 'err', text: `提交失败：${(commitRes as any).message || '未知错误'}` });
+        setMsg({ kind: 'err', text: `已提交，但推送失败：${pushRes.message || pushRes.output || '未知错误'}；可直接重试推送` });
       }
     } catch (e: any) {
-      setMsg({ kind: 'err', text: `提交失败：${e?.message ?? e}` });
+      setMsg({ kind: 'err', text: `${gitCommitPendingPush ? '推送' : '提交或推送'}失败：${e?.message ?? e}` });
     } finally {
       setGitCommitting(false);
     }
-  }, [workingDir, execKey, gitCommitMsg, gitSelected]);
+  }, [workingDir, execKey, gitCommitMsg, gitSelected, gitCommitPendingPush]);
 
   // ── ★ 多选 + 批量操作 ──
   const toggleFileSelection = useCallback((path: string) => {
@@ -1093,7 +1097,12 @@ export const FileTreePanel: React.FC<Props> = ({ workingDir, execKey, execLabel,
           );
         };
         return (
-          <div style={gitModalOverlayStyle} onClick={() => setGitModalOpen(false)}>
+          <div style={gitModalOverlayStyle} onClick={() => {
+            if (!gitCommitting) {
+              setGitModalOpen(false);
+              setGitCommitPendingPush(false);
+            }
+          }}>
             <div style={gitModalBoxStyle} onClick={(e) => e.stopPropagation()}>
               {/* 顶栏 */}
               <div style={gitModalHeaderStyle}>
@@ -1116,7 +1125,7 @@ export const FileTreePanel: React.FC<Props> = ({ workingDir, execKey, execLabel,
                     {allSelected ? '☑ 取消全选' : '☐ 全选'}
                   </button>
                 )}
-                <button style={gitModalCloseBtn} onClick={() => { setGitModalOpen(false); deselectAllFiles(); }}>✕</button>
+                <button style={gitModalCloseBtn} disabled={gitCommitting} onClick={() => { setGitModalOpen(false); deselectAllFiles(); setGitCommitPendingPush(false); }}>✕</button>
               </div>
 
               {/* ★ 消息提示条 */}
@@ -1273,7 +1282,7 @@ export const FileTreePanel: React.FC<Props> = ({ workingDir, execKey, execLabel,
                         ...gitModalCommitBtn,
                         ...((gitCommitMsg.trim() && selectedCount > 0) ? {} : { opacity: 0.5, cursor: 'not-allowed' }),
                       }}
-                        disabled={!gitCommitMsg.trim() || selectedCount === 0 || gitCommitting}
+                        disabled={(!gitCommitPendingPush && (!gitCommitMsg.trim() || selectedCount === 0)) || gitCommitting}
                         onClick={(e) => { e.stopPropagation(); handleCommit(); }}
                         title={selectedCount === 0 ? '请先选择要提交的文件' : '提交变更'}>
                         {gitCommitting ? '⏳ 提交中…' : '✅ 提交'}
@@ -1287,7 +1296,7 @@ export const FileTreePanel: React.FC<Props> = ({ workingDir, execKey, execLabel,
                         disabled={!gitCommitMsg.trim() || selectedCount === 0 || gitCommitting}
                         onClick={(e) => { e.stopPropagation(); handleCommitAndPush(); }}
                         title={selectedCount === 0 ? '请先选择要提交的文件' : '提交后立即推送到远端'}>
-                        {gitCommitting ? '' : '🚀'} 提交并推送
+                        {gitCommitting ? '⏳ 处理中…' : gitCommitPendingPush ? '⬆ 重试推送' : '🚀 提交并推送'}
                       </button></div>
                     </div>
 
