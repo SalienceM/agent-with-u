@@ -448,9 +448,48 @@ function extractImagesFromOutput(output: string): { images: Array<{src: string; 
   return { images, text: textParts.join('\n').trim() };
 }
 
+const ToolOutputImage: React.FC<{
+  src: string;
+  alt: string;
+  onOpen: (src: string) => void;
+}> = ({ src, alt, onOpen }) => {
+  const [resolvedSrc, setResolvedSrc] = useState<string>(() =>
+    /\/api\/skill-images\//.test(src) ? '' : src
+  );
+
+  useEffect(() => {
+    const match = src.match(/\/api\/skill-images\/([^/?#"'\s]+)/);
+    if (!match) {
+      setResolvedSrc(src);
+      return;
+    }
+    let cancelled = false;
+    loadSkillImageDataUrl(decodeURIComponent(match[1]))
+      .then((dataUrl) => { if (!cancelled) setResolvedSrc(dataUrl); })
+      .catch(() => { if (!cancelled) setResolvedSrc(''); });
+    return () => { cancelled = true; };
+  }, [src]);
+
+  if (!resolvedSrc) {
+    return <div className="img-lazy-placeholder" style={{ width: 160, height: 90 }}>Loading...</div>;
+  }
+  return (
+    <img
+      src={resolvedSrc}
+      alt={alt || 'generated image'}
+      style={{
+        maxWidth: '100%', maxHeight: 480, borderRadius: 8,
+        cursor: 'zoom-in', border: '1px solid var(--theme-border, rgba(0,0,0,0.12))',
+        display: 'block',
+      }}
+      onClick={() => onOpen(resolvedSrc)}
+    />
+  );
+};
+
 const ToolCallBlock: React.FC<{ tc: ToolCall; allTools?: ToolCall[] }> = memo(function ToolCallBlock({ tc, allTools }) {
   // ★ 从 tool output 中提取 markdown 图片，支持 generate-image 等 skill 结果
-  const { images: outputImages, text: outputText } = tc.output ? extractImagesFromOutput(tc.output) : { images: [], text: tc.output || '' };
+  const { text: outputText } = tc.output ? extractImagesFromOutput(tc.output) : { images: [], text: tc.output || '' };
 
   // ★ Task（子 agent 派发器）默认展开，让用户看到子 agent 正在干什么
   const isTask = tc.name === 'Task';
@@ -460,13 +499,9 @@ const ToolCallBlock: React.FC<{ tc: ToolCall; allTools?: ToolCall[] }> = memo(fu
     : [];
 
   // 有图片、是 Task、或有子工具时默认展开
-  const [expanded, setExpanded] = useState(outputImages.length > 0 || isTask || childTools.length > 0);
+  const [expanded, setExpanded] = useState(isTask || childTools.length > 0);
 
   // ★ 流式阶段：tc.output 到达时（从空变为含图片）自动展开
-  useEffect(() => {
-    if (outputImages.length > 0 && !expanded) setExpanded(true);
-  }, [outputImages.length]); // eslint-disable-line react-hooks/exhaustive-deps
-  const [lightboxSrc, setLightboxSrc] = useState<string | null>(null);
   const color = STATUS_COLOR[tc.status] || '#888';
   const isRunning = tc.status === 'running';
 
@@ -530,6 +565,9 @@ const ToolCallBlock: React.FC<{ tc: ToolCall; allTools?: ToolCall[] }> = memo(fu
         {isRunning && <span style={spinnerStyle} />}
         <span
           style={{
+            marginLeft: 'auto',
+            flexShrink: 0,
+            whiteSpace: 'nowrap',
             fontSize: 10,
             padding: '1px 6px',
             borderRadius: 4,
@@ -578,29 +616,10 @@ const ToolCallBlock: React.FC<{ tc: ToolCall; allTools?: ToolCall[] }> = memo(fu
               ))}
             </div>
           )}
-          {tc.output && (
+          {outputText && (
             <div style={{ marginTop: diffData ? 6 : 0 }}>
               <div style={labelStyle}>OUTPUT</div>
               {/* ★ 如果 output 中包含 markdown 图片（如 generate-image skill 结果），优先渲染图片 */}
-              {outputImages.length > 0 && (
-                <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, marginBottom: outputText ? 6 : 0 }}>
-                  {outputImages.map((img, idx) => (
-                    <img
-                      key={idx}
-                      src={img.src}
-                      alt={img.alt || 'generated image'}
-                      style={{
-                        maxWidth: '100%',
-                        maxHeight: 400,
-                        borderRadius: 8,
-                        cursor: 'zoom-in',
-                        border: '1px solid var(--theme-border, rgba(0,0,0,0.12))',
-                      }}
-                      onClick={() => setLightboxSrc(img.src)}
-                    />
-                  ))}
-                </div>
-              )}
               {/* 剩余文本（进度提示等非图片内容） */}
               {outputText && (
                 <pre
@@ -622,8 +641,6 @@ const ToolCallBlock: React.FC<{ tc: ToolCall; allTools?: ToolCall[] }> = memo(fu
           )}
         </div>
       )}
-      {/* Lightbox for tool output images */}
-      {lightboxSrc && <ImageLightbox src={lightboxSrc} onClose={() => setLightboxSrc(null)} />}
     </div>
   );
 });
@@ -1129,29 +1146,26 @@ function MessageBubbleInner({
         {/* ★ 工具输出图片直出：不依赖模型转述，直接在消息体内渲染 */}
         {!isUser && !message.streaming && message.toolCalls && (() => {
           const allToolImages: Array<{ src: string; alt: string }> = [];
+          const seen = new Set<string>();
           for (const tc of message.toolCalls) {
             if (tc.output && tc.status !== 'error') {
               const { images } = extractImagesFromOutput(tc.output);
-              allToolImages.push(...images);
+              for (const img of images) {
+                if (message.content?.includes(img.src) || seen.has(img.src)) continue;
+                seen.add(img.src);
+                allToolImages.push(img);
+              }
             }
           }
           if (allToolImages.length === 0) return null;
           return (
             <div style={{ marginTop: 8, display: 'flex', flexWrap: 'wrap', gap: 8 }}>
               {allToolImages.map((img, idx) => (
-                <img
+                <ToolOutputImage
                   key={idx}
                   src={img.src}
-                  alt={img.alt || 'generated image'}
-                  style={{
-                    maxWidth: '100%',
-                    maxHeight: 480,
-                    borderRadius: 8,
-                    cursor: 'zoom-in',
-                    border: '1px solid var(--theme-border, rgba(0,0,0,0.12))',
-                    display: 'block',
-                  }}
-                  onClick={() => setLightboxSrc(img.src)}
+                  alt={img.alt}
+                  onOpen={setLightboxSrc}
                 />
               ))}
             </div>
@@ -1245,6 +1259,7 @@ const sectionHeader: React.CSSProperties = {
   fontSize: 12,
   color: 'var(--theme-text, #1f2328)',
   userSelect: 'none',
+  minWidth: 0,
 };
 
 const sectionBody: React.CSSProperties = {

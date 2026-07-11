@@ -24,6 +24,7 @@ LoopStore: 可视化 Loop 集成的状态持久化（"stage 文件"）。
 from __future__ import annotations
 
 import json
+import os
 import threading
 import time
 from dataclasses import dataclass, field
@@ -57,13 +58,14 @@ class LoopStep:
     index: int
     mode: str = "sequential"   # "sequential" | "concurrent"
     desc: str = ""
+    access: str = "write"       # read | write；只有明确只读的步骤允许共享目录并发
     status: str = "pending"    # pending | running | done | error
     output: str = ""           # 该步执行产出（持久化，用于复盘）
     started_at: float = 0.0    # 开始执行时间戳（0 = 未开始），用于流程视图耗时
     ended_at: float = 0.0      # 结束时间戳（0 = 未结束）
 
     def to_dict(self) -> dict:
-        return {"index": self.index, "mode": self.mode, "desc": self.desc,
+        return {"index": self.index, "mode": self.mode, "desc": self.desc, "access": self.access,
                 "status": self.status, "output": self.output,
                 "startedAt": self.started_at, "endedAt": self.ended_at}
 
@@ -73,6 +75,7 @@ class LoopStep:
             index=int(d.get("index", 0)),
             mode=d.get("mode", "sequential"),
             desc=d.get("desc", ""),
+            access=("read" if d.get("access") == "read" else "write"),
             status=d.get("status", "pending"),
             output=d.get("output", ""),
             started_at=float(d.get("startedAt", 0) or 0),
@@ -143,6 +146,8 @@ class LoopRecord:
     # ★ 非 git 目录的文件级备份路径（dir_snapshot 创建的临时目录）。
     #   None=未备份。丢弃时据此恢复文件。
     dir_checkpoint: Optional[str] = None
+    # 本轮分析完成后的 Git 产物快照，用于 loopout 恢复真正的最佳版本。
+    artifact_checkpoint: Optional[str] = None
     created_at: float = field(default_factory=_now)
     updated_at: float = field(default_factory=_now)
 
@@ -167,6 +172,7 @@ class LoopRecord:
             "agentCheckpoint": self.agent_checkpoint,
             "gitCheckpoint": self.git_checkpoint,
             "dirCheckpoint": self.dir_checkpoint,
+            "artifactCheckpoint": self.artifact_checkpoint,
             "hasGitCheckpoint": bool(self.git_checkpoint),
             "createdAt": self.created_at,
             "updatedAt": self.updated_at,
@@ -189,6 +195,7 @@ class LoopRecord:
             agent_checkpoint=d.get("agentCheckpoint", None),
             git_checkpoint=d.get("gitCheckpoint", None),
             dir_checkpoint=d.get("dirCheckpoint", None),
+            artifact_checkpoint=d.get("artifactCheckpoint", None),
             created_at=d.get("createdAt", _now()),
             updated_at=d.get("updatedAt", _now()),
         )
@@ -434,6 +441,8 @@ class LoopState:
     asides: list[AsideTurn] = field(default_factory=list)  # by the way 旁路问答
     addons: list[Addon] = field(default_factory=list)      # 执行中补充的要求
     intent_alert: dict = field(default_factory=dict)       # 意图守卫：人意图 vs 模型计划偏差提示
+    best_seq: int = 0                                      # 当前轮最佳产物对应的 loop seq
+    risk_factors: dict = field(default_factory=dict)       # 可解释风险分量
     created_at: float = field(default_factory=_now)
     updated_at: float = field(default_factory=_now)
 
@@ -483,6 +492,8 @@ class LoopState:
             "asides": [a.to_dict() for a in self.asides],
             "addons": [a.to_dict() for a in self.addons],
             "intentAlert": self.intent_alert or {},
+            "bestSeq": self.best_seq,
+            "riskFactors": dict(self.risk_factors or {}),
             "bestScore": self.best_score(),
             "latestScore": self.latest_score(),
             "createdAt": self.created_at,
@@ -512,6 +523,8 @@ class LoopState:
             asides=[AsideTurn.from_dict(a) for a in d.get("asides", [])],
             addons=[Addon.from_dict(a) for a in d.get("addons", [])],
             intent_alert=dict(d.get("intentAlert") or {}),
+            best_seq=int(d.get("bestSeq", 0) or 0),
+            risk_factors=dict(d.get("riskFactors") or {}),
             created_at=d.get("createdAt", _now()),
             updated_at=d.get("updatedAt", _now()),
         )
@@ -545,10 +558,21 @@ class LoopStore:
     def save(self, state: LoopState) -> None:
         state.updated_at = _now()
         with self._lock:
-            self._path(state.session_id).write_text(
-                json.dumps(state.to_dict(), ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
+            path = self._path(state.session_id)
+            tmp = path.with_suffix(path.suffix + ".tmp")
+            payload = json.dumps(state.to_dict(), ensure_ascii=False, indent=2)
+            try:
+                with tmp.open("w", encoding="utf-8", newline="\n") as f:
+                    f.write(payload)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(tmp, path)
+            finally:
+                try:
+                    if tmp.exists():
+                        tmp.unlink()
+                except OSError:
+                    pass
 
     def create(self, sid: str) -> LoopState:
         state = LoopState(session_id=sid)

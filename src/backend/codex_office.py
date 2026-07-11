@@ -6,6 +6,7 @@ import base64
 import json
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -15,18 +16,48 @@ from ..types import ModelBackendConfig, ChatMessage, ImageAttachment
 from .base import ModelBackend, StreamDelta, PermissionRequest, _exc_msg, cli_available, cli_missing_message
 
 
+def _is_windows_store_codex(path: str) -> bool:
+    """Return whether *path* points into the protected Codex app package."""
+    if sys.platform != "win32" or not path:
+        return False
+    normalized = os.path.normcase(os.path.abspath(os.path.expandvars(path)))
+    windows_apps = os.path.normcase(os.path.join(
+        os.environ.get("ProgramFiles", r"C:\Program Files"), "WindowsApps",
+    ))
+    return normalized == windows_apps or normalized.startswith(windows_apps + os.sep)
+
+
 def resolve_codex_cli(config_cli_path: Optional[str] = None) -> str:
-    """Resolve the Codex CLI executable."""
+    """Resolve an independently installed Codex CLI executable.
+
+    The executable bundled in the Microsoft Store Codex app is an internal app
+    component. External processes cannot execute it, so never select it as a
+    CLI even when the app's resources directory leaked into PATH.
+    """
     if config_cli_path:
-        return str(config_cli_path)
+        configured = os.path.expandvars(os.path.expanduser(str(config_cli_path)))
+        if not _is_windows_store_codex(configured):
+            return configured
     if sys.platform == "win32":
         appdata = os.environ.get("APPDATA", "")
         if appdata:
-            for name in ("codex.cmd", "codex.exe", "codex.ps1"):
+            for name in ("codex.cmd", "codex.exe"):
                 p = os.path.join(appdata, "npm", name)
                 if os.path.exists(p):
                     return p
-    return shutil.which("codex") or "codex"
+    discovered = shutil.which("codex")
+    if discovered and not _is_windows_store_codex(discovered):
+        return discovered
+    return "codex"
+
+
+def _codex_launch_command(codex_cli: str, args: list[str]) -> list[str]:
+    """Build a CreateProcess-compatible command, including npm .cmd shims."""
+    command = [codex_cli, *args]
+    if sys.platform == "win32" and Path(codex_cli).suffix.lower() in {".cmd", ".bat"}:
+        comspec = os.environ.get("COMSPEC") or "cmd.exe"
+        return [comspec, "/d", "/s", "/c", subprocess.list2cmdline(command)]
+    return command
 
 
 class CodexOfficeBackend(ModelBackend):
@@ -50,18 +81,44 @@ class CodexOfficeBackend(ModelBackend):
         return env
 
     def _native_resume_enabled(self) -> bool:
-        """Codex native resume is opt-in for now.
+        """Use Codex native threads unless explicitly disabled.
 
-        AgentWithU already stores chat history and keeps the same workspace.
-        Fresh `codex exec` calls with AgentWithU-managed context have been more
-        predictable than resuming a Codex CLI thread that may contain earlier
-        malformed prompt/context attempts.
+        Native resume preserves the actual agent context and avoids re-sending
+        a large constraints/history prompt on every short conversational turn.
+        The environment switch remains available as an emergency opt-out.
         """
         val = (
             self.config.get_env("AGENTWITHU_CODEX_NATIVE_RESUME")
             or self.config.get_env("CODEX_USE_NATIVE_RESUME")
         )
-        return str(val or "").strip().lower() in {"1", "true", "yes", "on"}
+        if val is None or not str(val).strip():
+            return True
+        return str(val).strip().lower() not in {"0", "false", "no", "off"}
+
+    async def _ensure_cli_usable(self, codex_cli: str) -> Optional[str]:
+        """Probe the selected CLI once before its first real request."""
+        if getattr(self, "_probed_codex_cli", None) == codex_cli:
+            return None
+        if _is_windows_store_codex(codex_cli):
+            return (
+                "检测到的是 Codex Windows App 内部组件，外部程序无权执行。"
+                "请另外安装 Codex CLI：`npm install -g @openai/codex`。"
+            )
+        try:
+            probe = _codex_launch_command(codex_cli, ["--version"])
+            proc = await asyncio.create_subprocess_exec(
+                *probe,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=10)
+        except (OSError, asyncio.TimeoutError) as exc:
+            return f"Codex CLI 启动探测失败：{_exc_msg(exc)}"
+        if proc.returncode != 0:
+            detail = (stderr or stdout).decode("utf-8", errors="replace").strip()
+            return f"Codex CLI 无法运行（退出码 {proc.returncode}）：{detail}"
+        self._probed_codex_cli = codex_cli
+        return None
 
 
     def _build_prompt(
@@ -71,9 +128,10 @@ class CodexOfficeBackend(ModelBackend):
         constraints: Optional[str],
         *,
         include_history: bool = True,
+        include_constraints: bool = True,
     ) -> str:
         parts: list[str] = []
-        if constraints:
+        if include_constraints and constraints:
             parts.append(
                 "<system_constraints>\n"
                 "以下内容是系统/开发者/会话级规则，必须遵守；它不是用户要你补充或改写的任务。\n"
@@ -120,7 +178,7 @@ class CodexOfficeBackend(ModelBackend):
         Resume-specific flags must stay before SESSION_ID; anything after the
         session id is parsed as prompt text by some Codex CLI versions.
         """
-        cmd = [codex_cli]
+        cmd: list[str] = []
         if model:
             cmd.extend(["--model", model])
         if approval_mode == "never" and sandbox_mode == "danger-full-access":
@@ -145,7 +203,7 @@ class CodexOfficeBackend(ModelBackend):
             cmd.append(agent_session_id)
 
         cmd.append("-" if stdin_mode else prompt)
-        return cmd
+        return _codex_launch_command(codex_cli, cmd)
 
     @staticmethod
     def _decode_text_payload(obj: dict) -> str:
@@ -186,6 +244,51 @@ class CodexOfficeBackend(ModelBackend):
                 return val
         return None
 
+    @staticmethod
+    def _command_tool_payload(obj: dict, item: dict) -> dict:
+        """Convert a verbose Codex command event into a compact tool payload."""
+        command = item.get("command") or item.get("input") or ""
+        if isinstance(command, list):
+            command = subprocess.list2cmdline([str(part) for part in command])
+        elif not isinstance(command, str):
+            command = json.dumps(command, ensure_ascii=False)
+
+        lowered = command.lower()
+        if "powershell" in lowered or "pwsh" in lowered:
+            name = "PowerShell"
+        elif "python" in lowered:
+            name = "Python"
+        elif "cmd.exe" in lowered:
+            name = "Command Prompt"
+        else:
+            name = "Command"
+
+        output = item.get("aggregated_output")
+        if output is None:
+            output = item.get("output") or item.get("stdout") or ""
+        if not isinstance(output, str):
+            output = json.dumps(output, ensure_ascii=False)
+
+        item_id = str(item.get("id") or obj.get("id") or "")
+        item_status = str(item.get("status") or "").lower()
+        event_type = str(obj.get("type") or obj.get("event") or "").lower()
+        completed = (
+            "completed" in event_type
+            or item_status in {"completed", "done", "failed", "error"}
+        )
+        exit_code = item.get("exit_code")
+        failed = item_status in {"failed", "error"} or (
+            isinstance(exit_code, int) and exit_code != 0
+        )
+        return {
+            "id": item_id,
+            "name": name,
+            "input": command,
+            "output": output,
+            "completed": completed,
+            "status": "error" if failed else ("done" if completed else "running"),
+        }
+
     async def send_message(
         self,
         messages: list[ChatMessage],
@@ -218,6 +321,7 @@ class CodexOfficeBackend(ModelBackend):
             content,
             constraints,
             include_history=not bool(codex_resume_id),
+            include_constraints=not bool(codex_resume_id),
         )
         model = self.config.model or self.get_env("OPENAI_MODEL") or ""
         skip = self.config.skip_permissions if skip_permissions is None else bool(skip_permissions)
@@ -226,6 +330,7 @@ class CodexOfficeBackend(ModelBackend):
         image_tmpdir = None
         proc: Optional[asyncio.subprocess.Process] = None
         collected: list[str] = []
+        started_tool_ids: set[str] = set()
         new_agent_sid = codex_resume_id
         stdin_data: Optional[bytes] = None
         final_usage: Optional[dict] = None
@@ -241,10 +346,15 @@ class CodexOfficeBackend(ModelBackend):
                 ))
                 return {"agentSessionId": new_agent_sid}
 
+            probe_error = await self._ensure_cli_usable(codex_cli)
+            if probe_error:
+                emit("error", error=probe_error)
+                return {"agentSessionId": new_agent_sid}
+
             approval_mode = "never" if skip else "on-request"
             sandbox_mode = "workspace-write" if sandbox_enabled else "danger-full-access"
 
-            if not agent_session_id:
+            if not codex_resume_id:
                 with tempfile.NamedTemporaryFile("w", delete=False, suffix=".txt", encoding="utf-8") as f:
                     output_path = f.name
 
@@ -261,10 +371,20 @@ class CodexOfficeBackend(ModelBackend):
                         path.write_bytes(base64.b64decode(img.base64))
                         image_paths.append(str(path))
 
-            stdin_mode = len(prompt) > 8000
+            # A multiline prompt cannot safely cross a Windows npm `.cmd`
+            # shim: cmd.exe may split it at a newline and Codex then sees only
+            # the first line (for example, `<system_constraints>`). Always
+            # carry prompts over stdin for batch shims; also do so for long
+            # direct-executable commands to stay below Windows' command limit.
+            is_batch_shim = (
+                sys.platform == "win32"
+                and Path(codex_cli).suffix.lower() in {".cmd", ".bat"}
+            )
+            stdin_mode = is_batch_shim or len(prompt) > 8000
             if stdin_mode:
                 stdin_data = prompt.encode("utf-8")
-                print(f"[CodexOffice] long prompt ({len(prompt)} chars), using stdin",
+                reason = "Windows npm shim" if is_batch_shim else "long prompt"
+                print(f"[CodexOffice] {reason} ({len(prompt)} chars), using stdin",
                       file=sys.stderr, flush=True)
 
             cmd = self._build_cmd(
@@ -301,6 +421,10 @@ class CodexOfficeBackend(ModelBackend):
                 proc.stdin.write(stdin_data)
                 await proc.stdin.drain()
                 proc.stdin.close()
+                try:
+                    await proc.stdin.wait_closed()
+                except (AttributeError, BrokenPipeError, ConnectionResetError):
+                    pass
 
             async def read_stderr():
                 assert proc and proc.stderr
@@ -343,18 +467,37 @@ class CodexOfficeBackend(ModelBackend):
                     if txt:
                         collected.append(txt)
                         emit("text_delta", text=txt)
-                elif item_type in {"command_execution", "tool_call"}:
-                    name = (
-                        item.get("command")
-                        or item.get("name")
-                        or item.get("tool")
-                        or "Codex tool"
-                    ) if isinstance(item, dict) else "Codex tool"
+                elif item_type == "command_execution" and isinstance(item, dict):
+                    tool = self._command_tool_payload(obj, item)
+                    completed = tool.pop("completed")
+                    tool_id = str(tool.get("id") or "")
+                    if completed:
+                        # Some Codex versions emit only item.completed. Create
+                        # the card before resolving it so the UI never drops
+                        # a fast command that had no separate started event.
+                        if tool_id not in started_tool_ids:
+                            emit("tool_start", tool_call={
+                                "id": tool_id,
+                                "name": tool["name"],
+                                "input": tool["input"],
+                                "status": "running",
+                            })
+                            started_tool_ids.add(tool_id)
+                        emit("tool_result", tool_call=tool)
+                    else:
+                        tool.pop("output", None)
+                        emit("tool_start", tool_call=tool)
+                        started_tool_ids.add(tool_id)
+                elif item_type == "tool_call" and isinstance(item, dict):
+                    name = item.get("name") or item.get("tool") or "Codex tool"
+                    tool_input = item.get("input") or item.get("arguments") or ""
+                    if not isinstance(tool_input, str):
+                        tool_input = json.dumps(tool_input, ensure_ascii=False)
                     emit("tool_start", tool_call={
-                        "id": str(item.get("id") or obj.get("id") or "") if isinstance(item, dict) else str(obj.get("id") or ""),
+                        "id": str(item.get("id") or obj.get("id") or ""),
                         "name": str(name),
-                        "input": json.dumps(item if isinstance(item, dict) else obj, ensure_ascii=False),
-                        "status": str(item.get("status") or "running") if isinstance(item, dict) else "running",
+                        "input": tool_input,
+                        "status": "running",
                     })
                 elif any(k in typ for k in ("delta", "assistant", "message")):
                     txt = self._decode_text_payload(obj)

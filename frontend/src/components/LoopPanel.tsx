@@ -19,7 +19,7 @@ import type { LoopPolicy } from './LoopPolicyEditor';
  * 右上角可切换「Hack 模式」——整份状态以 terminal 风格的等宽文本呈现。
  */
 
-interface LoopStep { index: number; mode: string; desc: string; status: string; output: string; startedAt?: number; endedAt?: number; }
+interface LoopStep { index: number; mode: string; access?: 'read' | 'write'; desc: string; status: string; output: string; startedAt?: number; endedAt?: number; }
 interface LoopAnalysis {
   score: number; notes: string; trend: string;
   optimizationPotential: number; challenges: string;
@@ -46,6 +46,8 @@ interface LoopStateT {
   riskCoefficient: number; maxLoops: number; effectiveMaxLoops: number;
   round: number; roundLoopCount: number;
   status: string; stopReason: string; bestScore: number; latestScore: number;
+  bestSeq?: number;
+  riskFactors?: Record<string, number>;
   asides: AsideTurn[];
   addons: Addon[];
   intentAlert?: { round?: number; seq?: number; aligned?: boolean; severity?: string; divergence?: string; suggestion?: string; dismissed?: boolean };
@@ -80,6 +82,8 @@ export const LoopPanel: React.FC<LoopPanelProps> = ({ sessionId, onClose, embedd
   const [progress, setProgress] = useState<Record<string, string>>({});
   const progressRef = useRef(progress);
   progressRef.current = progress;
+  const pendingProgressRef = useRef<Record<string, string>>({});
+  const progressTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const refresh = useCallback(async () => {
     const s = await api.loopGetState(sessionId);
@@ -96,13 +100,33 @@ export const LoopPanel: React.FC<LoopPanelProps> = ({ sessionId, onClose, embedd
     const un2 = api.onLoopProgress((d) => {
       if (d.sessionId !== sessionId) return;
       const key = `${d.seq}:${d.subStage}`;
-      setProgress((prev) => ({ ...prev, [key]: (prev[key] || '') + d.text }));
+      pendingProgressRef.current[key] = (pendingProgressRef.current[key] || '') + d.text;
+      if (!progressTimerRef.current) {
+        progressTimerRef.current = setTimeout(() => {
+          const batch = pendingProgressRef.current;
+          pendingProgressRef.current = {};
+          progressTimerRef.current = null;
+          setProgress((prev) => {
+            const next = { ...prev };
+            for (const [batchKey, text] of Object.entries(batch)) {
+              // 实时窗口只保留尾部 50KB；完整结果以后端持久化状态为准。
+              next[batchKey] = ((next[batchKey] || '') + text).slice(-50_000);
+            }
+            return next;
+          });
+        }, 50);
+      }
     });
     const un3 = api.onLoopAsideDelta((d) => {
       if (d.sessionId !== sessionId) return;
       setAsideLive((prev) => ({ ...prev, [d.turnId]: (prev[d.turnId] || '') + d.text }));
     });
-    return () => { un1(); un2(); un3(); };
+    return () => {
+      un1(); un2(); un3();
+      if (progressTimerRef.current) clearTimeout(progressTimerRef.current);
+      progressTimerRef.current = null;
+      pendingProgressRef.current = {};
+    };
   }, [sessionId]);
 
   const asideAnswering = state?.asides?.some((a) => a.status === 'answering') ?? false;
@@ -494,7 +518,7 @@ const MetricBar: React.FC<{ state: LoopStateT }> = ({ state }) => (
     <Metric label="最佳分数" value={state.bestScore.toFixed(0)} accent={scoreColor(state.bestScore)} />
     <Metric label="最近分数" value={state.latestScore.toFixed(0)} accent={scoreColor(state.latestScore)} />
     <Metric label={state.round > 1 ? `本轮 Loop（第${state.round}轮）` : '已跑 Loop'} value={`${state.roundLoopCount} / ${state.effectiveMaxLoops}`} />
-    <RiskMetric risk={state.riskCoefficient} />
+    <RiskMetric risk={state.riskCoefficient} factors={state.riskFactors} />
     {state.bestScore >= 70 && <Badge text="可交付" color="#2da44e" />}
     {state.bestScore >= 85 && <Badge text="可输出" color="#8957e5" />}
     {state.status !== 'active' && <Badge text={state.status} color="#bf8700" />}
@@ -508,8 +532,8 @@ const Metric: React.FC<{ label: string; value: string; accent?: string }> = ({ l
   </div>
 );
 
-const RiskMetric: React.FC<{ risk: number }> = ({ risk }) => (
-  <div style={metricBox}>
+const RiskMetric: React.FC<{ risk: number; factors?: Record<string, number> }> = ({ risk, factors }) => (
+  <div style={metricBox} title={factors ? Object.entries(factors).map(([k, v]) => `${k}: ${v}`).join('\n') : undefined}>
     <div style={{ fontSize: 11, color: 'var(--theme-text-muted)' }}>风险系数</div>
     <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
       <div style={{ fontSize: 20, fontWeight: 700, fontFamily: 'monospace', color: riskColor(risk) }}>{risk.toFixed(2)}</div>
@@ -1317,7 +1341,10 @@ const FlowChip: React.FC<{
               <div key={s.index} title={s.desc} style={{ display: 'flex', alignItems: 'center', gap: 4, maxWidth: 200 }}>
                 <span style={{ width: 6, height: 6, borderRadius: '50%', background: sc, flexShrink: 0,
                   animation: s.status === 'running' ? 'awu-loop-pulse 1.2s infinite' : 'none' }} />
-                <span style={{ fontSize: 10, color: 'var(--theme-text-muted)' }}>{s.mode === 'concurrent' ? '∥' : '→'}{s.index}</span>
+                <span style={{ fontSize: 10, color: 'var(--theme-text-muted)' }}>
+                  {s.mode === 'concurrent' && s.access === 'read' ? '∥' : '→'}{s.index}
+                  {s.access === 'write' ? ' ✎' : ''}
+                </span>
                 <span style={{ fontSize: 10, color: 'var(--theme-text)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1 }}>{s.desc}</span>
                 {d > 0 && <span style={{ fontSize: 9.5, color: sc, fontFamily: 'monospace', flexShrink: 0 }}>{fmtDur(d)}</span>}
               </div>
@@ -1376,9 +1403,9 @@ function groupSteps(steps: LoopStep[]): LoopStep[][] {
   const groups: LoopStep[][] = [];
   let i = 0;
   while (i < steps.length) {
-    if (steps[i].mode === 'concurrent') {
+    if (steps[i].mode === 'concurrent' && steps[i].access === 'read') {
       const g: LoopStep[] = [];
-      while (i < steps.length && steps[i].mode === 'concurrent') { g.push(steps[i]); i++; }
+      while (i < steps.length && steps[i].mode === 'concurrent' && steps[i].access === 'read') { g.push(steps[i]); i++; }
       groups.push(g);
     } else {
       groups.push([steps[i]]); i++;

@@ -2280,8 +2280,10 @@ class BridgeWS:
                 file=sys.stderr, flush=True,
             )
             # ★ agent_session_id 解析：显式传入 > session 绑定 > None
+            # 独立 call_sid 绝不能隐式恢复主聊天上下文。顺序 step 的第一步
+            # 从空 thread 开始，后续仅通过显式 agent_session_id 延续。
             effective_agent_sid = agent_session_id if agent_session_id is not None else (
-                session.agent_session_id if resume else None
+                session.agent_session_id if resume and indep_session_id is None else None
             )
             result = await backend.send_message(
                 messages=[], content=prompt, images=img_objs,
@@ -2297,7 +2299,7 @@ class BridgeWS:
             if agent_session_id is not None:
                 # 外部线程上下文模式：不回写 session，由调用方自行传递
                 pass
-            elif resume and new_sid:
+            elif resume and new_sid and indep_session_id is None:
                 session.agent_session_id = new_sid
                 self._session_store.save(session, async_=True)
         except Exception as e:
@@ -2724,6 +2726,8 @@ class BridgeWS:
         上下文回滚到这次 loop 开跑前的快照（版本隔离，避免被丢弃 loop 的对话污染后续）。
         restore_files=True 且有 git 快照时，还把工作目录文件回滚到开跑前。返回退回的 addon 数。"""
         state.loops = [l for l in state.loops if l.seq != record.seq]
+        scored = [l for l in state.round_loops() if l.analysis]
+        state.best_seq = max(scored, key=lambda l: l.analysis.score).seq if scored else 0
         reverted = 0
         for a in state.addons:
             if a.status == "applied" and a.applied_seq == record.seq:
@@ -2784,6 +2788,8 @@ class BridgeWS:
             "怎样把全局目标尽可能做到位：把这一遍的工作拆成有序分步，标注每步是顺次"
             "(sequential) 还是可并发 (concurrent)、先做什么后做什么。goal 字段写这一遍的"
             "策略/侧重（相对上一遍要改进什么）。只输出一个 JSON 围栏：\n"
+            "每个步骤必须标注 access：纯读取/分析用 read；任何可能写文件、运行会产生文件的命令或改配置用 write。"
+            "只有 access=read 的步骤允许 concurrent；不确定时必须用 write + sequential。\n"
             "```json\n"
             '{"goal": "这一遍的策略/侧重", "orchestration": '
             '[{"mode": "sequential", "desc": "第一步…"}, {"mode": "concurrent", "desc": "可并发的一步…"}]}\n'
@@ -2807,6 +2813,7 @@ class BridgeWS:
         orch = pj.get("orchestration") or []
         record.orchestration = [
             LoopStep(index=i + 1, mode=("concurrent" if (s.get("mode") == "concurrent") else "sequential"),
+                     access=("read" if s.get("access") == "read" else "write"),
                      desc=(s.get("desc") or "").strip())
             for i, s in enumerate(orch) if isinstance(s, dict)
         ]
@@ -2832,6 +2839,7 @@ class BridgeWS:
                 record.goal = (rj.get("goal") or "").strip() or record.goal
                 record.orchestration = [
                     LoopStep(index=i + 1, mode=("concurrent" if (s.get("mode") == "concurrent") else "sequential"),
+                             access=("read" if s.get("access") == "read" else "write"),
                              desc=(s.get("desc") or "").strip())
                     for i, s in enumerate(r_orch) if isinstance(s, dict)
                 ]
@@ -2931,6 +2939,7 @@ class BridgeWS:
             r_orch = rj.get("orchestration") or []
             replan_steps = [
                 LoopStep(index=i + 1, mode=("concurrent" if (s.get("mode") == "concurrent") else "sequential"),
+                         access=("read" if s.get("access") == "read" else "write"),
                          desc=(s.get("desc") or "").strip())
                 for i, s in enumerate(r_orch) if isinstance(s, dict)
             ]
@@ -2963,9 +2972,10 @@ class BridgeWS:
             while i < len(steps):
                 if session.id in self._loop_cancel:   # 停止并丢弃：立即中断分步执行
                     return
-                if steps[i].mode == "concurrent":
+                if steps[i].mode == "concurrent" and steps[i].access == "read":
                     j = i
-                    while j < len(steps) and steps[j].mode == "concurrent":
+                    while (j < len(steps) and steps[j].mode == "concurrent"
+                           and steps[j].access == "read"):
                         j += 1
                     batch = [s for s in steps[i:j] if s.status != "done"]
                     if batch:
@@ -3018,7 +3028,7 @@ class BridgeWS:
         self._emit_loop_updated(state)
         # ★ 让每个 step 看到完整的编排规划，理解全局上下文
         all_steps_text = "\n".join(
-            f"  {s.index}. [{s.mode}] {s.desc}" + (" ← 当前步" if s.index == step.index else "")
+            f"  {s.index}. [{s.mode}/{s.access}] {s.desc}" + (" ← 当前步" if s.index == step.index else "")
             for s in record.orchestration
         )
         strategy_hint = (
@@ -3143,12 +3153,22 @@ class BridgeWS:
         record.sub_stage = SUB_DONE
         record.mark_sub(SUB_DONE)
         record.updated_at = time.time()
+        record.artifact_checkpoint = git_snapshot(session.working_dir)
+        scored_records = [l for l in state.round_loops() if l.analysis]
+        if scored_records:
+            state.best_seq = max(scored_records, key=lambda l: l.analysis.score).seq
         # ★ 跨 session 模型台账：执行 backend 拿到这次评分（衡量"谁更能干"），评审 backend 记参与
         try:
             exec_bid = session.backend_id
-            self._model_ledger.record(exec_bid, self._backend_label(exec_bid), "execute", score=score)
+            exec_started = float(record.sub_started.get(SUB_EXECUTE, 0) or 0)
+            exec_duration_ms = ((time.time() - exec_started) * 1000) if exec_started else None
+            exec_success = not any(s.status == "error" for s in record.orchestration)
+            self._model_ledger.record(
+                exec_bid, self._backend_label(exec_bid), "execute", score=score,
+                success=exec_success, duration_ms=exec_duration_ms,
+            )
             eval_bid = eval_backend or session.backend_id
-            self._model_ledger.record(eval_bid, self._backend_label(eval_bid), "analysis")
+            self._model_ledger.record(eval_bid, self._backend_label(eval_bid), "analysis", success=True)
         except Exception:
             pass
         self._recompute_risk(state)
@@ -3158,6 +3178,10 @@ class BridgeWS:
             state.stop_reason = reason
             state.status = "output" if analysis.outputtable else (
                 "delivered" if analysis.deliverable else "aborted")
+            best_record = next((l for l in state.round_loops() if l.seq == state.best_seq), None)
+            if (best_record and best_record.seq != record.seq
+                    and best_record.artifact_checkpoint):
+                git_restore_snapshot(session.working_dir, best_record.artifact_checkpoint)
         self._loop_save(state)
         self._emit_loop_updated(state)
 
@@ -3203,6 +3227,36 @@ class BridgeWS:
         # 历史改进曲线平缓（最近两次提升 < 3 分）：略升
         if len(done) >= 2 and (done[-1].analysis.score - done[-2].analysis.score) < 3:
             risk += 0.08
+        state.risk_coefficient = max(0.0, min(1.0, risk))
+        self._recompute_explainable_risk(state, done)
+
+    @staticmethod
+    def _recompute_explainable_risk(state: "LoopState", done: list) -> None:
+        """Overwrite the legacy accumulator with reproducible risk factors."""
+        latest = done[-1].analysis
+        record = done[-1]
+        step_count = len(record.orchestration)
+        step_errors = sum(1 for s in record.orchestration if s.status == "error")
+        error_rate = step_errors / step_count if step_count else (0.0 if record.result else 1.0)
+        score_gap = max(0.0, state.policy.deliverable_score - latest.score) / max(
+            1.0, state.policy.deliverable_score)
+        improvement = (latest.score - done[-2].analysis.score) if len(done) >= 2 else None
+        stagnation = 1.0 if improvement is not None and 0 <= improvement < 3 else 0.0
+        regression = min(1.0, max(0.0, -(improvement or 0.0)) / 20.0)
+        blockers = 1.0 if latest.challenges.strip() else 0.0
+        low_potential = 1.0 if latest.optimization_potential < 0.15 else 0.0
+        state.risk_factors = {
+            "scoreGap": round(score_gap, 4),
+            "stepErrorRate": round(error_rate, 4),
+            "blockers": blockers,
+            "stagnation": stagnation,
+            "regression": round(regression, 4),
+            "lowOptimizationPotential": low_potential,
+        }
+        risk = (0.10 + 0.30 * score_gap + 0.25 * error_rate + 0.15 * blockers
+                + 0.08 * stagnation + 0.17 * regression + 0.05 * low_potential)
+        if latest.score >= state.policy.outputtable_score and error_rate == 0:
+            risk -= 0.12
         state.risk_coefficient = max(0.0, min(1.0, risk))
 
     def _loop_should_stop(self, state: "LoopState") -> tuple[bool, str]:
@@ -3266,6 +3320,8 @@ class BridgeWS:
         state.status = "active"
         state.stop_reason = ""
         state.risk_coefficient = 0.3  # 新一轮从干净的风险基线开始
+        state.risk_factors = {}
+        state.best_seq = 0
         self._loop_save(state)
         self._emit_loop_updated(state)
         if state.auto:

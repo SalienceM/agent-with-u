@@ -40,7 +40,8 @@ class ModelLedger:
                               encoding="utf-8")
 
     def record(self, backend_id: str, label: str, role: str,
-               score: Optional[float] = None) -> None:
+               score: Optional[float] = None, success: Optional[bool] = None,
+               duration_ms: Optional[float] = None, task_type: str = "general") -> None:
         """记一次 backend 在某角色上的使用；score 非空时计入均分（如执行后得到的评分）。"""
         if not backend_id or not role:
             return
@@ -48,7 +49,11 @@ class ModelLedger:
             data = self._load()
             b = data.setdefault(backend_id, {"backendId": backend_id, "label": label or backend_id, "roles": {}})
             b["label"] = label or b.get("label") or backend_id
-            r = b["roles"].setdefault(role, {"count": 0, "scored": 0, "sum": 0.0, "lastAt": 0})
+            r = b["roles"].setdefault(role, {
+                "count": 0, "scored": 0, "sum": 0.0, "lastAt": 0,
+                "successes": 0, "failures": 0, "durationCount": 0,
+                "durationSumMs": 0.0, "taskTypes": {},
+            })
             r["count"] = int(r.get("count", 0)) + 1
             if score is not None:
                 try:
@@ -56,6 +61,18 @@ class ModelLedger:
                     r["scored"] = int(r.get("scored", 0)) + 1
                 except (TypeError, ValueError):
                     pass
+            if success is not None:
+                key = "successes" if success else "failures"
+                r[key] = int(r.get(key, 0)) + 1
+            if duration_ms is not None:
+                try:
+                    r["durationSumMs"] = float(r.get("durationSumMs", 0.0)) + max(0.0, float(duration_ms))
+                    r["durationCount"] = int(r.get("durationCount", 0)) + 1
+                except (TypeError, ValueError):
+                    pass
+            task_types = r.setdefault("taskTypes", {})
+            category = (task_type or "general").strip() or "general"
+            task_types[category] = int(task_types.get(category, 0)) + 1
             r["lastAt"] = time.time()
             self._save(data)
 
@@ -67,8 +84,14 @@ class ModelLedger:
             for role, r in (b.get("roles") or {}).items():
                 scored = int(r.get("scored", 0) or 0)
                 avg = (float(r.get("sum", 0.0)) / scored) if scored else None
+                outcomes = int(r.get("successes", 0)) + int(r.get("failures", 0))
+                duration_count = int(r.get("durationCount", 0) or 0)
                 roles[role] = {"count": int(r.get("count", 0) or 0), "scored": scored,
-                               "avgScore": avg, "lastAt": r.get("lastAt", 0)}
+                               "avgScore": avg, "lastAt": r.get("lastAt", 0),
+                               "successRate": (int(r.get("successes", 0)) / outcomes) if outcomes else None,
+                               "avgDurationMs": (float(r.get("durationSumMs", 0.0)) / duration_count)
+                               if duration_count else None,
+                               "taskTypes": dict(r.get("taskTypes") or {})}
             out.append({"backendId": bid, "label": b.get("label", bid), "roles": roles})
         # 执行均分高的排前面，便于"谁更能干"一眼看到
         out.sort(key=lambda x: (x["roles"].get("execute", {}).get("avgScore") or -1), reverse=True)

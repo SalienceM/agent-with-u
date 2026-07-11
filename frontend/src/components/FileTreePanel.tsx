@@ -158,6 +158,7 @@ export const FileTreePanel: React.FC<Props> = ({ workingDir, execKey, execLabel,
   // ★ 多选（checkbox）
   const [gitSelected, setGitSelected] = useState<Set<string>>(new Set());
   const [gitBatchOperating, setGitBatchOperating] = useState(false);
+  const [gitAddingPaths, setGitAddingPaths] = useState<Set<string>>(new Set());
 
   // ── ★ Git Diff 独立面板 ──
   const [diffPanelOpen, setDiffPanelOpen] = useState(false);
@@ -350,6 +351,38 @@ export const FileTreePanel: React.FC<Props> = ({ workingDir, execKey, execLabel,
   }, [workingDir, execKey]);
 
   /** AI 生成 commit message（只分析勾选的文件） */
+  const handleAddToTracking = useCallback(async (paths: string[]) => {
+    if (!workingDir || paths.length === 0) return;
+    setGitAddingPaths((prev) => new Set([...prev, ...paths]));
+    try {
+      const res = await api.gitStage(workingDir, paths, execKey);
+      if (res.status !== 'ok') {
+        setMsg({ kind: 'err', text: `加入版本控制失败：${(res as any).message || '未知错误'}` });
+        return;
+      }
+      setGitFiles((prev) => {
+        const next = { ...prev };
+        for (const path of paths) {
+          const old = next[path];
+          if (old) next[path] = { ...old, status: 'added', staged: true };
+        }
+        return next;
+      });
+      const newlyStaged = paths.filter((p) => !gitFiles[p]?.staged).length;
+      setGitStagedCount((n) => n + newlyStaged);
+      setGitUnstagedCount((n) => Math.max(0, n - newlyStaged));
+      setMsg({ kind: 'ok', text: `✓ 已加入版本控制：${paths.length} 个文件` });
+    } catch (err: any) {
+      setMsg({ kind: 'err', text: `加入版本控制失败：${err?.message ?? err}` });
+    } finally {
+      setGitAddingPaths((prev) => {
+        const next = new Set(prev);
+        paths.forEach((p) => next.delete(p));
+        return next;
+      });
+    }
+  }, [workingDir, execKey, gitFiles]);
+
   const handleAiGenerateMsg = useCallback(async () => {
     if (!workingDir) return;
     setGitAiGenerating(true);
@@ -1027,6 +1060,28 @@ export const FileTreePanel: React.FC<Props> = ({ workingDir, execKey, execLabel,
         const selectedCount = gitSelected.size;
         const allSelected = totalFiles > 0 && selectedCount === totalFiles;
         const sortedPaths = allFiles.map(([p]) => p);
+        const trackedPaths = trackedFiles.map(([p]) => p);
+        const untrackedPaths = untrackedFiles.map(([p]) => p);
+        const toggleGroupSelection = (paths: string[]) => {
+          const groupAllSelected = paths.length > 0 && paths.every((p) => gitSelected.has(p));
+          setGitSelected((prev) => {
+            const next = new Set(prev);
+            paths.forEach((p) => groupAllSelected ? next.delete(p) : next.add(p));
+            return next;
+          });
+        };
+        const groupCheckbox = (paths: string[], label: string) => {
+          const selectedInGroup = paths.filter((p) => gitSelected.has(p)).length;
+          const checked = paths.length > 0 && selectedInGroup === paths.length;
+          return (
+            <input type="checkbox" aria-label={label}
+              title={checked ? `取消全选${label}` : `全选${label}`}
+              checked={checked}
+              ref={(el) => { if (el) el.indeterminate = selectedInGroup > 0 && !checked; }}
+              onChange={() => toggleGroupSelection(paths)}
+              style={{ ...gitCheckboxStyle, margin: 0 }} />
+          );
+        };
         return (
           <div style={gitModalOverlayStyle} onClick={() => setGitModalOpen(false)}>
             <div style={gitModalBoxStyle} onClick={(e) => e.stopPropagation()}>
@@ -1091,7 +1146,8 @@ export const FileTreePanel: React.FC<Props> = ({ workingDir, execKey, execLabel,
                   {/* 已跟踪文件 */}
                   {trackedFiles.length > 0 && (
                     <>
-                      <div style={{ fontSize: 11, fontWeight: 700, color: '#c9d1d9', padding: '6px 14px', borderBottom: '1px solid rgba(255,255,255,0.08)' }}>
+                      <div style={{ fontSize: 11, fontWeight: 700, color: '#c9d1d9', padding: '6px 14px', borderBottom: '1px solid rgba(255,255,255,0.08)', display: 'flex', alignItems: 'center', gap: 8 }}>
+                        {groupCheckbox(trackedPaths, '已跟踪文件')}
                         已跟踪 ({trackedFiles.length})
                       </div>
                       <div style={{ overflowY: 'auto', flex: 'none', maxHeight: '40%' }}>
@@ -1125,11 +1181,19 @@ export const FileTreePanel: React.FC<Props> = ({ workingDir, execKey, execLabel,
                   {/* 未跟踪文件 */}
                   {untrackedFiles.length > 0 && (
                     <>
-                      <div style={{ fontSize: 11, fontWeight: 700, color: '#8b949e', padding: '6px 14px', borderBottom: '1px solid rgba(255,255,255,0.08)', marginTop: trackedFiles.length > 0 ? '8px' : 0 }}>
+                      <div style={{ fontSize: 11, fontWeight: 700, color: '#8b949e', padding: '6px 14px', borderBottom: '1px solid rgba(255,255,255,0.08)', marginTop: trackedFiles.length > 0 ? '8px' : 0, display: 'flex', alignItems: 'center', gap: 8 }}>
+                        {groupCheckbox(untrackedPaths, '未跟踪文件')}
                         未跟踪 ({untrackedFiles.length})
                         <span style={{ fontSize: 10, color: 'var(--theme-text-muted)', marginLeft: 6, fontWeight: 400 }}>
                           点击 ✓ 加入版本控制
                         </span>
+                        {untrackedPaths.some((p) => gitSelected.has(p)) && (
+                          <button style={{ ...gitModalIgnoreBtn, color: '#3fb950', marginLeft: 'auto', width: 'auto', padding: '2px 8px' }}
+                            disabled={untrackedPaths.some((p) => gitAddingPaths.has(p))}
+                            onClick={() => handleAddToTracking(untrackedPaths.filter((p) => gitSelected.has(p)))}>
+                            ＋ 加入已选
+                          </button>
+                        )}
                       </div>
                       <div style={{ overflowY: 'auto', flex: 1 }}>
                         {untrackedFiles.map(([path, gf]) => (
@@ -1149,21 +1213,11 @@ export const FileTreePanel: React.FC<Props> = ({ workingDir, execKey, execLabel,
                               title="点击查看 diff">{path}</span>
                             {/* 加入版本控制按钮 */}
                             <button style={{...gitModalIgnoreBtn, color: '#3fb950'}} title="加入版本控制 (git add)"
-                              onClick={async (e) => {
+                              disabled={gitAddingPaths.has(path)}
+                              onClick={(e) => {
                                 e.stopPropagation();
-                                if (!workingDir) return;
-                                try {
-                                  const res = await api.gitStage(workingDir, [path], execKey);
-                                  if (res.status === 'ok') {
-                                    setMsg({ kind: 'ok', text: `✓ 已加入版本控制：${path}` });
-                                    reloadAll(); // 刷新文件状态
-                                  } else {
-                                    setMsg({ kind: 'err', text: `加入版本控制失败：${(res as any).message || '未知错误'}` });
-                                  }
-                                } catch (err: any) {
-                                  setMsg({ kind: 'err', text: `加入版本控制失败：${err?.message ?? err}` });
-                                }
-                              }}>✓</button>
+                                handleAddToTracking([path]);
+                              }}>{gitAddingPaths.has(path) ? '…' : '✓'}</button>
                             <button style={gitModalIgnoreBtn} title="忽略此文件（加入 .gitignore）"
                               onClick={async (e) => {
                                 e.stopPropagation();
@@ -1249,6 +1303,62 @@ export const FileTreePanel: React.FC<Props> = ({ workingDir, execKey, execLabel,
         );
       })()}
 
+      {preview && (
+        <div style={pvOverlay} onClick={closePreview}>
+          <div style={pvBox} onClick={(e) => e.stopPropagation()}>
+            <div style={pvHeader}>
+              <span style={{ fontSize: 13 }}>{preview.isImage ? '🖼️' : editing ? '✏️' : '📄'}</span>
+              <span style={{ fontWeight: 600, fontSize: 13, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={preview.rel}>
+                {dirty && <span style={{ color: 'var(--theme-accent)' }}>● </span>}{preview.name}
+              </span>
+              <div style={{ flex: 1 }} />
+              {!editing && preview.isMarkdown && !preview.loading && !preview.error && (
+                <div style={{ display: 'flex', border: '1px solid var(--theme-border)', borderRadius: 6, overflow: 'hidden', marginRight: 4 }}>
+                  <button style={{ ...segBtnStyle, ...(!mdRaw ? segActiveStyle : {}) }} onClick={() => setMdRaw(false)}>👁 预览</button>
+                  <button style={{ ...segBtnStyle, ...(mdRaw ? segActiveStyle : {}) }} onClick={() => setMdRaw(true)}>{'</> 源码'}</button>
+                </div>
+              )}
+              {!editing && !preview.isImage && !preview.loading && !preview.error && (
+                <button style={hdrBtnStyle} onClick={startEdit}>✏️ 编辑</button>
+              )}
+              {editing && (
+                <>
+                  <button style={{ ...hdrBtnStyle, ...(dirty && !saving ? { borderColor: 'var(--theme-accent)', color: 'var(--theme-accent)', background: 'var(--theme-accent-bg)' } : { opacity: 0.5 }) }}
+                    onClick={saveEdit} disabled={!dirty || saving}>{saving ? '保存中…' : '💾 保存'}</button>
+                  <button style={hdrBtnStyle} onClick={() => {
+                    if (!dirty || window.confirm('放弃未保存的修改？')) { setEditing(false); setDirty(false); }
+                  }}>取消</button>
+                </>
+              )}
+              <button style={hdrBtnStyle} onClick={closePreview}>✕</button>
+            </div>
+            <div style={pvBody}>
+              {preview.loading ? (
+                <div style={{ padding: 24, textAlign: 'center', color: 'var(--theme-text-muted)' }}>加载中…</div>
+              ) : preview.error ? (
+                <div style={{ padding: 24, color: '#f87171', fontSize: 13 }}>⚠ {preview.error}</div>
+              ) : editing ? (
+                <Suspense fallback={<div style={{ padding: 24, textAlign: 'center', color: 'var(--theme-text-muted)' }}>编辑器加载中…</div>}>
+                  <CodeEditor key={preview.rel} value={editText} ext={extOf(preview.name)} dark={isDarkTheme()}
+                    onChange={(v) => { setEditText(v); setDirty(true); }} onSave={saveEdit} />
+                </Suspense>
+              ) : preview.isImage ? (
+                <div style={{ padding: 12, textAlign: 'center', overflow: 'auto' }}>
+                  <img src={preview.dataUrl} alt={preview.name} style={{ maxWidth: '100%', maxHeight: '70vh' }} />
+                </div>
+              ) : preview.isMarkdown && !mdRaw ? (
+                <div style={{ padding: '8px 18px', fontSize: 14, overflow: 'auto' }}
+                  dangerouslySetInnerHTML={{ __html: markdownToHtml(preview.text || '') }} />
+              ) : (
+                <pre className="md-pre" style={pvPre}>
+                  <code className="hljs" dangerouslySetInnerHTML={{ __html: highlightCode(preview.text || '', extOf(preview.name)) }} />
+                </pre>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* \u2605 Git Diff \u72ec\u7acb\u9762\u677f */}
       {diffPanelOpen && (
         <div style={diffOverlayStyle} onClick={() => setDiffPanelOpen(false)}>
@@ -1285,6 +1395,41 @@ export const FileTreePanel: React.FC<Props> = ({ workingDir, execKey, execLabel,
       )}
     </div>
   );
+};
+
+const pvOverlay: React.CSSProperties = {
+  position: 'fixed', inset: 0, zIndex: 10020,
+  background: 'rgba(0,0,0,0.58)', display: 'flex', alignItems: 'center', justifyContent: 'center',
+};
+const pvBox: React.CSSProperties = {
+  width: '82vw', maxWidth: 1100, height: '82vh',
+  background: 'var(--theme-bg-secondary, #161b22)', color: 'var(--theme-text, #c9d1d9)',
+  border: '1px solid var(--theme-border, rgba(255,255,255,0.12))', borderRadius: 10,
+  display: 'flex', flexDirection: 'column', overflow: 'hidden',
+  boxShadow: '0 18px 56px rgba(0,0,0,0.55)',
+};
+const pvHeader: React.CSSProperties = {
+  height: 42, padding: '0 12px', display: 'flex', alignItems: 'center', gap: 8,
+  flexShrink: 0, borderBottom: '1px solid var(--theme-border, rgba(255,255,255,0.1))',
+};
+const pvBody: React.CSSProperties = { flex: 1, minHeight: 0, overflow: 'auto' };
+const pvPre: React.CSSProperties = {
+  margin: 0, padding: '14px 18px', minHeight: '100%', boxSizing: 'border-box',
+  whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', fontSize: 12, lineHeight: 1.55,
+  background: 'var(--theme-code-bg, #0d1117)', color: 'var(--theme-text, #c9d1d9)',
+};
+const hdrBtnStyle: React.CSSProperties = {
+  padding: '4px 9px', fontSize: 11, borderRadius: 5,
+  border: '1px solid var(--theme-border, rgba(255,255,255,0.14))',
+  background: 'var(--theme-bg-tertiary, rgba(255,255,255,0.05))',
+  color: 'var(--theme-text, #c9d1d9)', cursor: 'pointer', flexShrink: 0,
+};
+const segBtnStyle: React.CSSProperties = {
+  padding: '3px 8px', fontSize: 10.5, border: 'none', background: 'transparent',
+  color: 'var(--theme-text-muted, #8b949e)', cursor: 'pointer',
+};
+const segActiveStyle: React.CSSProperties = {
+  color: 'var(--theme-accent, #58a6ff)', background: 'var(--theme-accent-bg, rgba(88,166,255,0.12))',
 };
 
 // \u2500\u2500 Git \u5f39\u7a97\u6837\u5f0f \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500

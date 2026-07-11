@@ -18,6 +18,8 @@ Message format compatibility:
 import os
 import sys
 import json
+import asyncio
+import time
 from typing import Optional, Callable, Awaitable, Any
 
 from ..types import ModelBackendConfig, ChatMessage, ImageAttachment
@@ -60,6 +62,29 @@ class QwenCodeSdkBackend(ModelBackend):
     def _resolve_cli(self) -> str:
         return resolve_qwen_cli(getattr(self.config, "cli_path", None))
 
+    def _detach_query_cleanup(self, result: Any) -> None:
+        """Close a terminal SDK query without delaying the completed turn.
+
+        Qwen's transport waits up to five seconds for the CLI process after a
+        terminal result. Starting close here marks Query closed immediately;
+        the surrounding context manager then exits without repeating that wait,
+        while process cleanup finishes in a tracked background task.
+        """
+        task = asyncio.create_task(result.close(), name="qwen-sdk-cleanup")
+        cleanup_tasks = getattr(self, "_cleanup_tasks", None)
+        if cleanup_tasks is None:
+            cleanup_tasks = set()
+            self._cleanup_tasks = cleanup_tasks
+        cleanup_tasks.add(task)
+        def _finished(done_task: asyncio.Task) -> None:
+            cleanup_tasks.discard(done_task)
+            try:
+                done_task.result()
+            except (asyncio.CancelledError, Exception) as exc:
+                print(f"[QwenSdk] background cleanup failed: {exc}",
+                      file=sys.stderr, flush=True)
+        task.add_done_callback(_finished)
+
 
     def _ensure_project_auth_settings(self, cwd: str, auth_type: str, model: Optional[str]) -> None:
         """Ensure Qwen CLI has a non-interactive auth selection.
@@ -70,6 +95,9 @@ class QwenCodeSdkBackend(ModelBackend):
         routing metadata; API keys remain in the process environment.
         """
         if not cwd:
+            return
+        cache_key = (os.path.abspath(cwd), auth_type, model or "")
+        if cache_key in getattr(self, "_auth_settings_cache", set()):
             return
         try:
             from pathlib import Path as _Path
@@ -103,6 +131,11 @@ class QwenCodeSdkBackend(ModelBackend):
 
             settings_dir.mkdir(parents=True, exist_ok=True)
             settings_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+            cache = getattr(self, "_auth_settings_cache", None)
+            if cache is None:
+                cache = set()
+                self._auth_settings_cache = cache
+            cache.add(cache_key)
             print(f"[QwenSdk] ensured project auth settings: {settings_path} selectedType={auth_type}",
                   file=sys.stderr, flush=True)
         except Exception as e:
@@ -334,7 +367,10 @@ class QwenCodeSdkBackend(ModelBackend):
             options["allowed_tools"] = tools
 
         # System prompt injection (★ KEY IMPROVEMENT)
-        if constraints:
+        # A resumed Qwen session already owns the system prompt from its first
+        # turn. Re-appending the full constraints on every request increases
+        # CLI startup/argument parsing time and can duplicate instructions.
+        if constraints and not agent_session_id:
             options["append_system_prompt"] = constraints
             print(f"[QwenSdk] constraints injected via append_system_prompt ({len(constraints)} chars)",
                   file=sys.stderr, flush=True)
@@ -349,6 +385,8 @@ class QwenCodeSdkBackend(ModelBackend):
             line = line.rstrip()
             if line:
                 _stderr_lines.append(line)
+                if len(_stderr_lines) > 50:
+                    del _stderr_lines[:-50]
                 print(f"[QwenSdk][stderr] {line}", file=sys.stderr, flush=True)
         options["stderr"] = _on_stderr
 
@@ -432,6 +470,8 @@ class QwenCodeSdkBackend(ModelBackend):
         _done_emitted = False
         _usage: Optional[dict] = None
         _saw_partial_event = False
+        _query_started_at = time.monotonic()
+        _first_event_at: Optional[float] = None
 
         try:
             async with sdk_query(prompt, options) as result:
@@ -446,7 +486,17 @@ class QwenCodeSdkBackend(ModelBackend):
 
                 async for message in result:
                     if self.is_cancelled(session_id):
+                        self._detach_query_cleanup(result)
+                        await asyncio.sleep(0)
                         break
+
+                    if _first_event_at is None:
+                        _first_event_at = time.monotonic()
+                        print(
+                            f"[QwenSdk] first event in {_first_event_at - _query_started_at:.3f}s",
+                            file=sys.stderr,
+                            flush=True,
+                        )
 
                     if is_sdk_assistant_message(message):
                         # Assistant messages contain the completed assistant content.
@@ -563,6 +613,14 @@ class QwenCodeSdkBackend(ModelBackend):
                         # break and let the context manager clean up in the background path.
                         _done_emitted = True
                         emit("done", **(_usage and {"usage": _usage} or {}))
+                        terminal_elapsed = time.monotonic() - _query_started_at
+                        print(f"[QwenSdk] terminal result in {terminal_elapsed:.3f}s; cleanup detached",
+                              file=sys.stderr, flush=True)
+                        self._detach_query_cleanup(result)
+                        # Let the cleanup task mark Query closed before
+                        # __aexit__ runs; this is a single event-loop yield,
+                        # not a timed delay.
+                        await asyncio.sleep(0)
                         break
 
             # Stream completed normally without an explicit result message.
