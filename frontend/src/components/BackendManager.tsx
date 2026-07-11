@@ -1159,11 +1159,17 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
                     type="text"
                     value={formData.env?.AGENTWITHU_CODEX_PROXY || formData.env?.HTTPS_PROXY || ''}
                     onChange={(e) => handleEnvChange('AGENTWITHU_CODEX_PROXY', e.target.value)}
+                    onBlur={(e) => {
+                      const value = e.target.value.trim();
+                      if (value && !value.includes('://')) {
+                        handleEnvChange('AGENTWITHU_CODEX_PROXY', `http://${value}`);
+                      }
+                    }}
                     style={inputStyle}
                     placeholder="例如 http://127.0.0.1:7890（代理软件的 HTTP / mixed 端口）"
                   />
                   <div style={{ fontSize: 11, color: 'var(--theme-text-muted)', marginTop: 5, lineHeight: 1.5 }}>
-                    仅传给 Codex 及其子进程，并同时设置 HTTP_PROXY、HTTPS_PROXY、ALL_PROXY。
+                    仅传给 Codex 及其子进程，并同时设置 HTTP_PROXY、HTTPS_PROXY、ALL_PROXY。请使用 HTTP / mixed 代理端口；裸 IP:端口会自动补全 http://。
                   </div>
                 </div>
                 )}

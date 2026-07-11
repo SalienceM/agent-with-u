@@ -23,6 +23,19 @@ _PROXY_ENV_KEYS = (
 )
 
 
+def _normalize_proxy_url(value: object) -> str:
+    """Normalize the HTTP proxy URL accepted by Codex's WebSocket client."""
+    proxy = str(value or "").strip()
+    if not proxy:
+        return ""
+    if "://" not in proxy:
+        proxy = f"http://{proxy}"
+    parsed = urlsplit(proxy)
+    if parsed.scheme.lower() != "http" or not parsed.hostname:
+        return ""
+    return proxy
+
+
 def _is_windows_store_codex(path: str) -> bool:
     """Return whether *path* points into the protected Codex app package."""
     if sys.platform != "win32" or not path:
@@ -85,26 +98,31 @@ class CodexOfficeBackend(ModelBackend):
         # 旧配置只有 HTTPS_PROXY 时视为 custom，避免升级后行为突变。
         configured = self.config.env or {}
         mode = str(configured.get("AGENTWITHU_CODEX_PROXY_MODE") or "").strip().lower()
-        proxy = str(
+        raw_proxy = (
             configured.get("AGENTWITHU_CODEX_PROXY")
             or configured.get("HTTPS_PROXY")
             or configured.get("https_proxy")
             or ""
-        ).strip()
+        )
+        proxy = _normalize_proxy_url(raw_proxy)
         if not mode:
             mode = "custom" if proxy else "inherit"
 
         if mode == "direct":
             for key in _PROXY_ENV_KEYS:
                 env.pop(key, None)
-        elif mode == "custom" and proxy:
-            for key in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
-                        "http_proxy", "https_proxy", "all_proxy"):
-                env[key] = proxy
-            no_proxy = str(configured.get("AGENTWITHU_CODEX_NO_PROXY") or "").strip()
-            if no_proxy:
-                env["NO_PROXY"] = no_proxy
-                env["no_proxy"] = no_proxy
+        elif mode == "custom":
+            # custom 模式不应意外继承宿主代理；地址无效时保持无代理，日志会显示 '-'。
+            for key in _PROXY_ENV_KEYS:
+                env.pop(key, None)
+            if proxy:
+                for key in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
+                            "http_proxy", "https_proxy", "all_proxy"):
+                    env[key] = proxy
+                no_proxy = str(configured.get("AGENTWITHU_CODEX_NO_PROXY") or "").strip()
+                if no_proxy:
+                    env["NO_PROXY"] = no_proxy
+                    env["no_proxy"] = no_proxy
 
         for key in (
             "AGENTWITHU_CODEX_PROXY_MODE",
@@ -139,12 +157,12 @@ class CodexOfficeBackend(ModelBackend):
         """Return a credential-free summary for startup diagnostics."""
         configured = self.config.env or {}
         mode = str(configured.get("AGENTWITHU_CODEX_PROXY_MODE") or "").strip().lower()
-        proxy = str(
+        proxy = _normalize_proxy_url(
             configured.get("AGENTWITHU_CODEX_PROXY")
             or configured.get("HTTPS_PROXY")
             or configured.get("https_proxy")
             or ""
-        ).strip()
+        )
         if not mode:
             mode = "custom" if proxy else "inherit"
         endpoint = ""
@@ -154,6 +172,20 @@ class CodexOfficeBackend(ModelBackend):
             if parsed.port:
                 endpoint += f":{parsed.port}"
         return f"proxy_mode={mode!r}, proxy_endpoint={endpoint or '-'}"
+
+    def _proxy_config_error(self) -> Optional[str]:
+        configured = self.config.env or {}
+        mode = str(configured.get("AGENTWITHU_CODEX_PROXY_MODE") or "").strip().lower()
+        if mode != "custom":
+            return None
+        raw = configured.get("AGENTWITHU_CODEX_PROXY") or ""
+        if _normalize_proxy_url(raw):
+            return None
+        return (
+            "Codex 独立代理地址无效。请填写 HTTP / mixed 代理地址，例如 "
+            "http://192.168.1.20:7897；Codex 当前 WebSocket 链路不接受 "
+            "socks5://、https:// 或其他代理协议。"
+        )
 
     async def _ensure_cli_usable(self, codex_cli: str) -> Optional[str]:
         """Probe the selected CLI once before its first real request."""
@@ -396,6 +428,11 @@ class CodexOfficeBackend(ModelBackend):
         final_usage: Optional[dict] = None
 
         try:
+            proxy_error = self._proxy_config_error()
+            if proxy_error:
+                emit("error", error=proxy_error)
+                return {"agentSessionId": new_agent_sid}
+
             codex_cli = resolve_codex_cli(self.config.cli_path)
             if not cli_available(codex_cli):
                 emit("error", error=cli_missing_message(

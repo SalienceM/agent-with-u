@@ -12,6 +12,7 @@ from src.backend.codex_office import (
     CodexOfficeBackend,
     _codex_launch_command,
     _is_windows_store_codex,
+    _normalize_proxy_url,
     resolve_codex_cli,
 )
 from src.types import BackendType, ModelBackendConfig
@@ -58,6 +59,22 @@ class CodexOfficeTests(unittest.TestCase):
         env = self._backend({"HTTPS_PROXY": proxy})._build_env()
         self.assertEqual(env["HTTP_PROXY"], proxy)
         self.assertEqual(env["all_proxy"], proxy)
+
+    def test_bare_proxy_endpoint_gets_http_scheme(self):
+        self.assertEqual(_normalize_proxy_url("10.0.0.8:7897"), "http://10.0.0.8:7897")
+        env = self._backend({
+            "AGENTWITHU_CODEX_PROXY_MODE": "custom",
+            "AGENTWITHU_CODEX_PROXY": "10.0.0.8:7897",
+        })._build_env()
+        self.assertEqual(env["HTTPS_PROXY"], "http://10.0.0.8:7897")
+
+    def test_unsupported_proxy_scheme_is_not_injected(self):
+        self.assertEqual(_normalize_proxy_url("socks5://10.0.0.8:1080"), "")
+        backend = self._backend({
+            "AGENTWITHU_CODEX_PROXY_MODE": "custom",
+            "AGENTWITHU_CODEX_PROXY": "socks5://10.0.0.8:1080",
+        })
+        self.assertIn("HTTP / mixed", backend._proxy_config_error() or "")
 
     def test_network_summary_masks_proxy_credentials(self):
         backend = self._backend({
