@@ -11,6 +11,7 @@ import sys
 import tempfile
 from pathlib import Path
 from typing import Optional, Callable, Awaitable
+from urllib.parse import urlsplit
 
 from ..types import ModelBackendConfig, ChatMessage, ImageAttachment
 from .base import ModelBackend, StreamDelta, PermissionRequest, _exc_msg, cli_available, cli_missing_message
@@ -147,6 +148,29 @@ class CodexOfficeBackend(ModelBackend):
         mode = str(configured.get("AGENTWITHU_CODEX_PROXY_MODE") or "").strip().lower()
         legacy_proxy = configured.get("HTTPS_PROXY") or configured.get("https_proxy")
         return mode == "custom" or (not mode and bool(legacy_proxy))
+
+    def _network_summary(self) -> str:
+        """Return a credential-free summary for startup diagnostics."""
+        configured = self.config.env or {}
+        mode = str(configured.get("AGENTWITHU_CODEX_PROXY_MODE") or "").strip().lower()
+        proxy = str(
+            configured.get("AGENTWITHU_CODEX_PROXY")
+            or configured.get("HTTPS_PROXY")
+            or configured.get("https_proxy")
+            or ""
+        ).strip()
+        if not mode:
+            mode = "custom" if proxy else "inherit"
+        endpoint = ""
+        if proxy:
+            parsed = urlsplit(proxy)
+            endpoint = parsed.hostname or "configured"
+            if parsed.port:
+                endpoint += f":{parsed.port}"
+        return (
+            f"proxy_mode={mode!r}, proxy_endpoint={endpoint or '-'}, "
+            f"force_http={self._force_http_enabled()}"
+        )
 
     async def _ensure_cli_usable(self, codex_cli: str) -> Optional[str]:
         """Probe the selected CLI once before its first real request."""
@@ -458,7 +482,8 @@ class CodexOfficeBackend(ModelBackend):
 
             print(f"[CodexOffice] exec: cwd={cwd!r}, resume={codex_resume_id!r}, "
                   f"native_resume={use_native_resume}, model={model!r}, "
-                  f"approval={approval_mode!r}, sandbox={sandbox_mode!r}",
+                  f"approval={approval_mode!r}, sandbox={sandbox_mode!r}, "
+                  f"{self._network_summary()}",
                   file=sys.stderr, flush=True)
             proc = await asyncio.create_subprocess_exec(
                 *cmd,

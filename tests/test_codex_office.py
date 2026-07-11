@@ -85,6 +85,16 @@ class CodexOfficeTests(unittest.TestCase):
         })
         self.assertFalse(backend._force_http_enabled())
 
+    def test_network_summary_masks_proxy_credentials(self):
+        backend = self._backend({
+            "AGENTWITHU_CODEX_PROXY_MODE": "custom",
+            "AGENTWITHU_CODEX_PROXY": "http://secret:token@127.0.0.1:7897",
+        })
+        summary = backend._network_summary()
+        self.assertIn("127.0.0.1:7897", summary)
+        self.assertNotIn("secret", summary)
+        self.assertNotIn("token", summary)
+
     def test_resume_command_places_session_before_prompt(self):
         command = self._backend()._build_cmd(
             codex_cli="codex",
