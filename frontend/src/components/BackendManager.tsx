@@ -1133,16 +1133,52 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
                 {/* HTTPS_PROXY */}
                 <div style={{ marginBottom: 10 }}>
                   <label style={{ fontSize: 11, color: 'var(--theme-text)', display: 'block', marginBottom: 4 }}>
-                    HTTPS_PROXY（代理，可选）
+                    Codex 网络方式
+                  </label>
+                  <select
+                    value={formData.env?.AGENTWITHU_CODEX_PROXY_MODE || (formData.env?.HTTPS_PROXY ? 'custom' : 'inherit')}
+                    onChange={(e) => handleEnvChange('AGENTWITHU_CODEX_PROXY_MODE', e.target.value)}
+                    style={inputStyle}
+                  >
+                    <option value="inherit">继承 AgentWithU 启动环境</option>
+                    <option value="custom">仅 Codex 使用独立代理</option>
+                    <option value="direct">Codex 强制直连（清除继承代理）</option>
+                  </select>
+                  <div style={{ fontSize: 11, color: 'var(--theme-text-muted)', marginTop: 5, lineHeight: 1.5 }}>
+                    独立代理不会修改 Windows 全局代理，也不需要开启 TUN。
+                  </div>
+                </div>
+
+                {(formData.env?.AGENTWITHU_CODEX_PROXY_MODE === 'custom' ||
+                  (!formData.env?.AGENTWITHU_CODEX_PROXY_MODE && !!formData.env?.HTTPS_PROXY)) && (
+                <div style={{ marginBottom: 10 }}>
+                  <label style={{ fontSize: 11, color: 'var(--theme-text)', display: 'block', marginBottom: 4 }}>
+                    Codex 独立代理地址
                   </label>
                   <input
                     type="text"
-                    value={formData.env?.HTTPS_PROXY || ''}
-                    onChange={(e) => handleEnvChange('HTTPS_PROXY', e.target.value)}
+                    value={formData.env?.AGENTWITHU_CODEX_PROXY || formData.env?.HTTPS_PROXY || ''}
+                    onChange={(e) => handleEnvChange('AGENTWITHU_CODEX_PROXY', e.target.value)}
                     style={inputStyle}
-                    placeholder="留空不走代理，e.g., http://127.0.0.1:7890"
+                    placeholder="例如 http://127.0.0.1:7890（代理软件的 HTTP / mixed 端口）"
                   />
+                  <div style={{ fontSize: 11, color: 'var(--theme-text-muted)', marginTop: 5, lineHeight: 1.5 }}>
+                    仅传给 Codex 及其子进程，并同时设置 HTTP_PROXY、HTTPS_PROXY、ALL_PROXY。
+                  </div>
+                  <label style={{ fontSize: 11, color: 'var(--theme-text)', display: 'flex', alignItems: 'center', gap: 7, marginTop: 9, cursor: 'pointer' }}>
+                    <input
+                      type="checkbox"
+                      checked={formData.env?.AGENTWITHU_CODEX_FORCE_HTTP !== 'false'}
+                      onChange={(e) => handleEnvChange('AGENTWITHU_CODEX_FORCE_HTTP', e.target.checked ? 'true' : 'false')}
+                      style={{ accentColor: 'var(--theme-accent)' }}
+                    />
+                    跳过 WebSocket，直接使用 HTTP 流式响应（推荐）
+                  </label>
+                  <div style={{ fontSize: 11, color: 'var(--theme-text-muted)', margin: '4px 0 0 22px', lineHeight: 1.5 }}>
+                    可避免部分本地代理连接 wss://chatgpt.com 失败后反复等待再回退。
+                  </div>
                 </div>
+                )}
 
                 {/* ── 允许的工具 ── */}
                 <div style={{ marginTop: 12 }}>

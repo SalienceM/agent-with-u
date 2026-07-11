@@ -16,6 +16,12 @@ from ..types import ModelBackendConfig, ChatMessage, ImageAttachment
 from .base import ModelBackend, StreamDelta, PermissionRequest, _exc_msg, cli_available, cli_missing_message
 
 
+_PROXY_ENV_KEYS = (
+    "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
+    "http_proxy", "https_proxy", "all_proxy", "no_proxy",
+)
+
+
 def _is_windows_store_codex(path: str) -> bool:
     """Return whether *path* points into the protected Codex app package."""
     if sys.platform != "win32" or not path:
@@ -73,6 +79,38 @@ class CodexOfficeBackend(ModelBackend):
         env = os.environ.copy()
         if self.config.env:
             env.update({k: str(v) for k, v in self.config.env.items() if v is not None})
+
+        # 代理只作用于 Codex 子进程，不修改 AgentWithU 或 Windows 的全局网络设置。
+        # 旧配置只有 HTTPS_PROXY 时视为 custom，避免升级后行为突变。
+        configured = self.config.env or {}
+        mode = str(configured.get("AGENTWITHU_CODEX_PROXY_MODE") or "").strip().lower()
+        proxy = str(
+            configured.get("AGENTWITHU_CODEX_PROXY")
+            or configured.get("HTTPS_PROXY")
+            or configured.get("https_proxy")
+            or ""
+        ).strip()
+        if not mode:
+            mode = "custom" if proxy else "inherit"
+
+        if mode == "direct":
+            for key in _PROXY_ENV_KEYS:
+                env.pop(key, None)
+        elif mode == "custom" and proxy:
+            for key in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
+                        "http_proxy", "https_proxy", "all_proxy"):
+                env[key] = proxy
+            no_proxy = str(configured.get("AGENTWITHU_CODEX_NO_PROXY") or "").strip()
+            if no_proxy:
+                env["NO_PROXY"] = no_proxy
+                env["no_proxy"] = no_proxy
+
+        for key in (
+            "AGENTWITHU_CODEX_PROXY_MODE",
+            "AGENTWITHU_CODEX_PROXY",
+            "AGENTWITHU_CODEX_NO_PROXY",
+        ):
+            env.pop(key, None)
         if self.config.api_key:
             env.setdefault("OPENAI_API_KEY", self.config.api_key)
         if self.config.base_url:
@@ -94,6 +132,21 @@ class CodexOfficeBackend(ModelBackend):
         if val is None or not str(val).strip():
             return True
         return str(val).strip().lower() not in {"0", "false", "no", "off"}
+
+    def _force_http_enabled(self) -> bool:
+        """Skip Codex's WebSocket-first retries when using a local proxy.
+
+        Many Windows proxy clients accept HTTP CONNECT but do not reliably
+        tunnel the Responses WebSocket endpoint. Codex eventually falls back
+        to HTTP by itself, but only after several slow connection attempts.
+        """
+        configured = self.config.env or {}
+        explicit = configured.get("AGENTWITHU_CODEX_FORCE_HTTP")
+        if explicit is not None and str(explicit).strip():
+            return str(explicit).strip().lower() not in {"0", "false", "no", "off"}
+        mode = str(configured.get("AGENTWITHU_CODEX_PROXY_MODE") or "").strip().lower()
+        legacy_proxy = configured.get("HTTPS_PROXY") or configured.get("https_proxy")
+        return mode == "custom" or (not mode and bool(legacy_proxy))
 
     async def _ensure_cli_usable(self, codex_cli: str) -> Optional[str]:
         """Probe the selected CLI once before its first real request."""
@@ -179,6 +232,10 @@ class CodexOfficeBackend(ModelBackend):
         session id is parsed as prompt text by some Codex CLI versions.
         """
         cmd: list[str] = []
+        if self._force_http_enabled():
+            # Codex CLI 0.144+ removed the old responses_websockets feature
+            # flag; provider capability override is the supported config path.
+            cmd.extend(["--config", "model_providers.openai.supports_websockets=false"])
         if model:
             cmd.extend(["--model", model])
         if approval_mode == "never" and sandbox_mode == "danger-full-access":

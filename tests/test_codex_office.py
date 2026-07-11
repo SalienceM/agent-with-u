@@ -30,6 +30,61 @@ class CodexOfficeTests(unittest.TestCase):
         self.assertTrue(self._backend()._native_resume_enabled())
         self.assertFalse(self._backend({"AGENTWITHU_CODEX_NATIVE_RESUME": "false"})._native_resume_enabled())
 
+    def test_custom_proxy_is_scoped_to_codex_child(self):
+        proxy = "http://127.0.0.1:7890"
+        with patch.dict(os.environ, {"HTTPS_PROXY": "http://system:8080"}, clear=False):
+            env = self._backend({
+                "AGENTWITHU_CODEX_PROXY_MODE": "custom",
+                "AGENTWITHU_CODEX_PROXY": proxy,
+            })._build_env()
+            self.assertEqual(env["HTTPS_PROXY"], proxy)
+            self.assertEqual(env["https_proxy"], proxy)
+            self.assertEqual(env["ALL_PROXY"], proxy)
+            self.assertEqual(os.environ["HTTPS_PROXY"], "http://system:8080")
+            self.assertNotIn("AGENTWITHU_CODEX_PROXY_MODE", env)
+
+    def test_direct_proxy_mode_removes_inherited_proxy(self):
+        inherited = {key: "http://system:8080" for key in (
+            "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
+            "http_proxy", "https_proxy", "all_proxy",
+        )}
+        with patch.dict(os.environ, inherited, clear=False):
+            env = self._backend({"AGENTWITHU_CODEX_PROXY_MODE": "direct"})._build_env()
+            for key in inherited:
+                self.assertNotIn(key, env)
+
+    def test_legacy_https_proxy_remains_supported(self):
+        proxy = "http://127.0.0.1:7890"
+        env = self._backend({"HTTPS_PROXY": proxy})._build_env()
+        self.assertEqual(env["HTTP_PROXY"], proxy)
+        self.assertEqual(env["all_proxy"], proxy)
+
+    def test_custom_proxy_forces_http_transport_by_default(self):
+        backend = self._backend({
+            "AGENTWITHU_CODEX_PROXY_MODE": "custom",
+            "AGENTWITHU_CODEX_PROXY": "http://127.0.0.1:7890",
+        })
+        command = backend._build_cmd(
+            codex_cli="codex",
+            prompt="hello",
+            model="gpt-test",
+            approval_mode="never",
+            sandbox_mode="danger-full-access",
+            agent_session_id=None,
+            output_path=None,
+            image_paths=[],
+            stdin_mode=False,
+        )
+        self.assertIn("model_providers.openai.supports_websockets=false", command)
+
+    def test_force_http_can_be_disabled_for_websocket_capable_proxy(self):
+        backend = self._backend({
+            "AGENTWITHU_CODEX_PROXY_MODE": "custom",
+            "AGENTWITHU_CODEX_PROXY": "http://127.0.0.1:7890",
+            "AGENTWITHU_CODEX_FORCE_HTTP": "false",
+        })
+        self.assertFalse(backend._force_http_enabled())
+
     def test_resume_command_places_session_before_prompt(self):
         command = self._backend()._build_cmd(
             codex_cli="codex",
