@@ -110,6 +110,7 @@ class CodexOfficeBackend(ModelBackend):
             "AGENTWITHU_CODEX_PROXY_MODE",
             "AGENTWITHU_CODEX_PROXY",
             "AGENTWITHU_CODEX_NO_PROXY",
+            "AGENTWITHU_CODEX_FORCE_HTTP",
         ):
             env.pop(key, None)
         if self.config.api_key:
@@ -134,21 +135,6 @@ class CodexOfficeBackend(ModelBackend):
             return True
         return str(val).strip().lower() not in {"0", "false", "no", "off"}
 
-    def _force_http_enabled(self) -> bool:
-        """Skip Codex's WebSocket-first retries when using a local proxy.
-
-        Many Windows proxy clients accept HTTP CONNECT but do not reliably
-        tunnel the Responses WebSocket endpoint. Codex eventually falls back
-        to HTTP by itself, but only after several slow connection attempts.
-        """
-        configured = self.config.env or {}
-        explicit = configured.get("AGENTWITHU_CODEX_FORCE_HTTP")
-        if explicit is not None and str(explicit).strip():
-            return str(explicit).strip().lower() not in {"0", "false", "no", "off"}
-        mode = str(configured.get("AGENTWITHU_CODEX_PROXY_MODE") or "").strip().lower()
-        legacy_proxy = configured.get("HTTPS_PROXY") or configured.get("https_proxy")
-        return mode == "custom" or (not mode and bool(legacy_proxy))
-
     def _network_summary(self) -> str:
         """Return a credential-free summary for startup diagnostics."""
         configured = self.config.env or {}
@@ -167,10 +153,7 @@ class CodexOfficeBackend(ModelBackend):
             endpoint = parsed.hostname or "configured"
             if parsed.port:
                 endpoint += f":{parsed.port}"
-        return (
-            f"proxy_mode={mode!r}, proxy_endpoint={endpoint or '-'}, "
-            f"force_http={self._force_http_enabled()}"
-        )
+        return f"proxy_mode={mode!r}, proxy_endpoint={endpoint or '-'}"
 
     async def _ensure_cli_usable(self, codex_cli: str) -> Optional[str]:
         """Probe the selected CLI once before its first real request."""
@@ -256,10 +239,6 @@ class CodexOfficeBackend(ModelBackend):
         session id is parsed as prompt text by some Codex CLI versions.
         """
         cmd: list[str] = []
-        if self._force_http_enabled():
-            # Codex CLI 0.144+ removed the old responses_websockets feature
-            # flag; provider capability override is the supported config path.
-            cmd.extend(["--config", "model_providers.openai.supports_websockets=false"])
         if model:
             cmd.extend(["--model", model])
         if approval_mode == "never" and sandbox_mode == "danger-full-access":

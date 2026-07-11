@@ -1165,18 +1165,6 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
                   <div style={{ fontSize: 11, color: 'var(--theme-text-muted)', marginTop: 5, lineHeight: 1.5 }}>
                     仅传给 Codex 及其子进程，并同时设置 HTTP_PROXY、HTTPS_PROXY、ALL_PROXY。
                   </div>
-                  <label style={{ fontSize: 11, color: 'var(--theme-text)', display: 'flex', alignItems: 'center', gap: 7, marginTop: 9, cursor: 'pointer' }}>
-                    <input
-                      type="checkbox"
-                      checked={formData.env?.AGENTWITHU_CODEX_FORCE_HTTP !== 'false'}
-                      onChange={(e) => handleEnvChange('AGENTWITHU_CODEX_FORCE_HTTP', e.target.checked ? 'true' : 'false')}
-                      style={{ accentColor: 'var(--theme-accent)' }}
-                    />
-                    跳过 WebSocket，直接使用 HTTP 流式响应（推荐）
-                  </label>
-                  <div style={{ fontSize: 11, color: 'var(--theme-text-muted)', margin: '4px 0 0 22px', lineHeight: 1.5 }}>
-                    可避免部分本地代理连接 wss://chatgpt.com 失败后反复等待再回退。
-                  </div>
                 </div>
                 )}
 

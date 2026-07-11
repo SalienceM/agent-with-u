@@ -59,32 +59,6 @@ class CodexOfficeTests(unittest.TestCase):
         self.assertEqual(env["HTTP_PROXY"], proxy)
         self.assertEqual(env["all_proxy"], proxy)
 
-    def test_custom_proxy_forces_http_transport_by_default(self):
-        backend = self._backend({
-            "AGENTWITHU_CODEX_PROXY_MODE": "custom",
-            "AGENTWITHU_CODEX_PROXY": "http://127.0.0.1:7890",
-        })
-        command = backend._build_cmd(
-            codex_cli="codex",
-            prompt="hello",
-            model="gpt-test",
-            approval_mode="never",
-            sandbox_mode="danger-full-access",
-            agent_session_id=None,
-            output_path=None,
-            image_paths=[],
-            stdin_mode=False,
-        )
-        self.assertIn("model_providers.openai.supports_websockets=false", command)
-
-    def test_force_http_can_be_disabled_for_websocket_capable_proxy(self):
-        backend = self._backend({
-            "AGENTWITHU_CODEX_PROXY_MODE": "custom",
-            "AGENTWITHU_CODEX_PROXY": "http://127.0.0.1:7890",
-            "AGENTWITHU_CODEX_FORCE_HTTP": "false",
-        })
-        self.assertFalse(backend._force_http_enabled())
-
     def test_network_summary_masks_proxy_credentials(self):
         backend = self._backend({
             "AGENTWITHU_CODEX_PROXY_MODE": "custom",
