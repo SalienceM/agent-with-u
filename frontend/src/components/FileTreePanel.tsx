@@ -485,6 +485,7 @@ export const FileTreePanel: React.FC<Props> = ({ workingDir, execKey, execLabel,
       if (res.status === 'ok') {
         setMsg({ kind: 'ok', text: `✓ 已提交: ${gitCommitMsg.trim().split('\n')[0]}` });
         setGitCommitMsg('');
+        setGitSelected(new Set());
         setGitModalOpen(false);
       } else {
         setMsg({ kind: 'err', text: `提交失败：${(res as any).message || '未知错误'}` });
@@ -511,6 +512,7 @@ export const FileTreePanel: React.FC<Props> = ({ workingDir, execKey, execLabel,
       if (commitRes.status === 'ok') {
         setMsg({ kind: 'ok', text: `✓ 已提交: ${gitCommitMsg.trim().split('\n')[0]}` });
         setGitCommitMsg('');
+        setGitSelected(new Set());
         setGitModalOpen(false);
         // 立即推送
         const pushRes = await api.gitPush(workingDir, 'origin', '', false, execKey);
@@ -550,11 +552,19 @@ export const FileTreePanel: React.FC<Props> = ({ workingDir, execKey, execLabel,
   /** 批量忽略选中文件 */
   const handleBatchIgnore = useCallback(async () => {
     if (!workingDir || gitSelected.size === 0) return;
+    const untrackedOnly = Array.from(gitSelected).filter(
+      (path) => gitFiles[path]?.status === 'untracked'
+    );
+    const protectedCount = gitSelected.size - untrackedOnly.length;
+    if (untrackedOnly.length === 0) {
+      setMsg({ kind: 'err', text: '已跟踪文件不能从批量操作中忽略；请通过专门的版本控制操作处理。' });
+      return;
+    }
     setGitBatchOperating(true);
     try {
-      const res = await api.gitIgnore(workingDir, Array.from(gitSelected), execKey);
+      const res = await api.gitIgnore(workingDir, untrackedOnly, execKey);
       if (res.status === 'ok') {
-        setMsg({ kind: 'ok', text: `✓ 已忽略 ${gitSelected.size} 个文件` });
+        setMsg({ kind: 'ok', text: `✓ 已忽略 ${untrackedOnly.length} 个未跟踪文件${protectedCount ? `；已保护 ${protectedCount} 个已跟踪文件` : ''}` });
         setGitSelected(new Set());
       } else {
         setMsg({ kind: 'err', text: `忽略失败` });
@@ -564,7 +574,7 @@ export const FileTreePanel: React.FC<Props> = ({ workingDir, execKey, execLabel,
     } finally {
       setGitBatchOperating(false);
     }
-  }, [workingDir, execKey, gitSelected]);
+  }, [workingDir, execKey, gitSelected, gitFiles]);
 
   /** 批量丢弃选中文件 */
   const handleBatchDiscard = useCallback(async () => {
@@ -1166,12 +1176,6 @@ export const FileTreePanel: React.FC<Props> = ({ workingDir, execKey, execLabel,
                             <span style={{...gitModalFileName, cursor: 'pointer'}}
                               onClick={() => openDiffPanel(path, sortedPaths)}
                               title="点击查看 diff">{path}</span>
-                            <button style={gitModalIgnoreBtn} title="忽略此文件（加入 .gitignore）"
-                              onClick={async (e) => {
-                                e.stopPropagation();
-                                if (!workingDir) return;
-                                await api.gitIgnore(workingDir, [path], execKey);
-                              }}>🚫</button>
                           </div>
                         ))}
                       </div>
