@@ -13,6 +13,7 @@ from src.backend.codex_office import (
     _codex_launch_command,
     _is_windows_store_codex,
     _normalize_proxy_url,
+    _smooth_text_chunks,
     resolve_codex_cli,
 )
 from src.types import BackendType, ModelBackendConfig
@@ -30,6 +31,13 @@ class CodexOfficeTests(unittest.TestCase):
     def test_native_resume_defaults_on_and_can_be_disabled(self):
         self.assertTrue(self._backend()._native_resume_enabled())
         self.assertFalse(self._backend({"AGENTWITHU_CODEX_NATIVE_RESUME": "false"})._native_resume_enabled())
+
+    def test_smooth_text_chunks_preserve_content_and_bound_frames(self):
+        text = "流式输出" * 1000
+        chunks = _smooth_text_chunks(text)
+        self.assertEqual("".join(chunks), text)
+        self.assertLessEqual(len(chunks), 300)
+        self.assertGreater(len(chunks), 1)
 
     def test_custom_proxy_is_scoped_to_codex_child(self):
         proxy = "http://127.0.0.1:7890"

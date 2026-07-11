@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import math
 from pathlib import Path
 from typing import Optional, Callable, Awaitable
 from urllib.parse import urlsplit
@@ -34,6 +35,15 @@ def _normalize_proxy_url(value: object) -> str:
     if parsed.scheme.lower() != "http" or not parsed.hostname:
         return ""
     return proxy
+
+
+def _smooth_text_chunks(text: str) -> list[str]:
+    """Split a completed CLI message into a short, bounded UI stream."""
+    if not text:
+        return []
+    # 大约最多 300 帧：短回答接近逐字，长回答也不会因动画额外等待太久。
+    chunk_size = max(2, math.ceil(len(text) / 300))
+    return [text[i:i + chunk_size] for i in range(0, len(text), chunk_size)]
 
 
 def _is_windows_store_codex(path: str) -> bool:
@@ -415,6 +425,17 @@ class CodexOfficeBackend(ModelBackend):
             if not self.is_cancelled(session_id):
                 on_delta(StreamDelta(session_id, message_id, delta_type, **kwargs))
 
+        async def emit_completed_text(text: str) -> None:
+            """Animate CLI item.completed payloads without altering real deltas."""
+            enabled = str(
+                self.config.get_env("AGENTWITHU_CODEX_SMOOTH_STREAM", "true") or "true"
+            ).strip().lower() not in {"0", "false", "no", "off"}
+            chunks = _smooth_text_chunks(text) if enabled else [text]
+            for index, chunk in enumerate(chunks):
+                emit("text_delta", text=chunk)
+                if enabled and index + 1 < len(chunks):
+                    await asyncio.sleep(0.016)
+
         cwd = working_dir or self.config.working_dir or "."
         use_native_resume = self._native_resume_enabled()
         codex_resume_id = agent_session_id if use_native_resume else None
@@ -577,7 +598,10 @@ class CodexOfficeBackend(ModelBackend):
                     txt = self._decode_text_payload(obj)
                     if txt:
                         collected.append(txt)
-                        emit("text_delta", text=txt)
+                        if "completed" in typ:
+                            await emit_completed_text(txt)
+                        else:
+                            emit("text_delta", text=txt)
                 elif item_type == "command_execution" and isinstance(item, dict):
                     tool = self._command_tool_payload(obj, item)
                     completed = tool.pop("completed")
@@ -630,7 +654,7 @@ class CodexOfficeBackend(ModelBackend):
             if output_path and os.path.exists(output_path):
                 final_text = Path(output_path).read_text(encoding="utf-8", errors="replace").strip()
             if final_text and final_text not in "".join(collected):
-                emit("text_delta", text=final_text)
+                await emit_completed_text(final_text)
 
         except FileNotFoundError:
             emit("error", error=cli_missing_message(
