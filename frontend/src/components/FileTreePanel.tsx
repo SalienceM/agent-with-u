@@ -484,7 +484,8 @@ export const FileTreePanel: React.FC<Props> = ({ workingDir, execKey, execLabel,
       }
       const res = await api.gitCommit(workingDir, gitCommitMsg.trim(), false, execKey, selectedPaths);
       if (res.status === 'ok') {
-        setMsg({ kind: 'ok', text: `✓ 已提交: ${gitCommitMsg.trim().split('\n')[0]}` });
+        // 提交面板内已有完整反馈，关闭后不在工作目录顶部重复提示。
+        setMsg(null);
         setGitCommitMsg('');
         setGitSelected(new Set());
         setGitModalOpen(false);
@@ -520,7 +521,8 @@ export const FileTreePanel: React.FC<Props> = ({ workingDir, execKey, execLabel,
 
       const pushRes = await api.gitPush(workingDir, 'origin', '', false, execKey);
       if (pushRes.status === 'ok') {
-        setMsg({ kind: 'ok', text: '✓ 已提交并推送' });
+        // 推送完成即返回主界面，不再显示重复的顶部成功横幅。
+        setMsg(null);
         setGitCommitMsg('');
         setGitSelected(new Set());
         setGitCommitPendingPush(false);
