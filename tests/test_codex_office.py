@@ -54,6 +54,24 @@ class CodexOfficeTests(unittest.TestCase):
             for key in inherited:
                 self.assertNotIn(key, env)
 
+    def test_system_proxy_mode_clears_env_proxy_and_enables_codex_feature(self):
+        backend = self._backend({"AGENTWITHU_CODEX_PROXY_MODE": "system"})
+        with patch.dict(os.environ, {"HTTPS_PROXY": "http://stale:8080"}, clear=False):
+            self.assertNotIn("HTTPS_PROXY", backend._build_env())
+        command = backend._build_cmd(
+            codex_cli="codex",
+            prompt="hello",
+            model="gpt-test",
+            approval_mode="never",
+            sandbox_mode="danger-full-access",
+            agent_session_id=None,
+            output_path=None,
+            image_paths=[],
+            stdin_mode=False,
+        )
+        idx = command.index("--enable")
+        self.assertEqual(command[idx + 1], "respect_system_proxy")
+
     def test_legacy_https_proxy_remains_supported(self):
         proxy = "http://127.0.0.1:7890"
         env = self._backend({"HTTPS_PROXY": proxy})._build_env()

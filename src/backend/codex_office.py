@@ -111,6 +111,10 @@ class CodexOfficeBackend(ModelBackend):
         if mode == "direct":
             for key in _PROXY_ENV_KEYS:
                 env.pop(key, None)
+        elif mode == "system":
+            # 避免环境变量抢占 Windows 系统代理；系统代理由 Codex 功能开关读取。
+            for key in _PROXY_ENV_KEYS:
+                env.pop(key, None)
         elif mode == "custom":
             # custom 模式不应意外继承宿主代理；地址无效时保持无代理，日志会显示 '-'。
             for key in _PROXY_ENV_KEYS:
@@ -166,12 +170,18 @@ class CodexOfficeBackend(ModelBackend):
         if not mode:
             mode = "custom" if proxy else "inherit"
         endpoint = ""
-        if proxy:
+        if mode == "system":
+            endpoint = "windows-system"
+        elif proxy:
             parsed = urlsplit(proxy)
             endpoint = parsed.hostname or "configured"
             if parsed.port:
                 endpoint += f":{parsed.port}"
         return f"proxy_mode={mode!r}, proxy_endpoint={endpoint or '-'}"
+
+    def _system_proxy_enabled(self) -> bool:
+        configured = self.config.env or {}
+        return str(configured.get("AGENTWITHU_CODEX_PROXY_MODE") or "").strip().lower() == "system"
 
     def _proxy_config_error(self) -> Optional[str]:
         configured = self.config.env or {}
@@ -271,6 +281,9 @@ class CodexOfficeBackend(ModelBackend):
         session id is parsed as prompt text by some Codex CLI versions.
         """
         cmd: list[str] = []
+        if self._system_proxy_enabled():
+            # Codex 0.144+ 可通过该功能读取 Windows/WinINET 系统代理设置。
+            cmd.extend(["--enable", "respect_system_proxy"])
         if model:
             cmd.extend(["--model", model])
         if approval_mode == "never" and sandbox_mode == "danger-full-access":

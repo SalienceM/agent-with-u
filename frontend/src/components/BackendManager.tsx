@@ -1140,12 +1140,13 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
                     onChange={(e) => handleEnvChange('AGENTWITHU_CODEX_PROXY_MODE', e.target.value)}
                     style={inputStyle}
                   >
-                    <option value="inherit">继承 AgentWithU 启动环境</option>
+                    <option value="system">跟随 Windows 系统代理（Clash 规则模式推荐）</option>
+                    <option value="inherit">继承 AgentWithU 的代理环境变量</option>
                     <option value="custom">仅 Codex 使用独立代理</option>
                     <option value="direct">Codex 强制直连（清除继承代理）</option>
                   </select>
                   <div style={{ fontSize: 11, color: 'var(--theme-text-muted)', marginTop: 5, lineHeight: 1.5 }}>
-                    独立代理不会修改 Windows 全局代理，也不需要开启 TUN。
+                    系统代理模式会读取执行节点的 Windows 代理设置；Clash 仍按“规则”分流，不会切换成全局代理，也不需要开启 TUN。
                   </div>
                 </div>
 
