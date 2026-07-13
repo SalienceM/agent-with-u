@@ -31,6 +31,11 @@ import { themes } from './hooks/useConfig';
 import { useIsMobile } from './hooks/useIsMobile';
 import { hljsLightCss, hljsDarkCss } from './utils/hljsThemes';
 import { messagesToMarkdown, messagesToJson } from './utils/markdown';
+import {
+  SMOOTH_GHOST_READY_EVENT,
+  SMOOTH_GHOST_STATE_EVENT,
+  type SmoothGhostState,
+} from './utils/smoothGhost';
 
 function hexToRgba(color: string, alpha: number): string {
   const m = color.match(/^#([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})/i);
@@ -172,6 +177,30 @@ export const App: React.FC = () => {
     return unsub;
   }, []);
 
+  // Do not delay the initial sidebar for executors that are still connecting.
+  // Their sessions are merged as soon as the corresponding node comes online.
+  useEffect(() => {
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    let generation = 0;
+    const unsub = onExecStatus(() => {
+      const homeOnline = getExecutors().some((item) => item.isHome && item.connected);
+      if (!homeOnline) return;
+      if (timer) clearTimeout(timer);
+      const current = ++generation;
+      timer = setTimeout(() => {
+        timer = null;
+        api.listSessions().then((list) => {
+          if (current === generation) setSessions(list);
+        });
+      }, 0);
+    });
+    return () => {
+      generation += 1;
+      if (timer) clearTimeout(timer);
+      unsub();
+    };
+  }, []);
+
   // ★ Ctrl+Shift+N → 便签本
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
@@ -233,6 +262,43 @@ export const App: React.FC = () => {
   // Smooth 模式：Rust 在系统级监听 Ctrl + 双击鼠标，不激活本窗口。
   // 收到触发后后台截屏，再把一次性图片任务派给最后聚焦的 pane。
   const [hackerMode, setHackerMode] = useState<HackerModeConfig>(() => readHackerMode());
+  const ghostSnapshotRef = useRef<SmoothGhostState | null>(null);
+  const ghostEmitRef = useRef<null | ((state: SmoothGhostState) => void)>(null);
+  const ghostFlushTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // Bridge the focused ChatPane into the click-through ghost webview.  The
+  // ready handshake also covers the race where the native window loads after
+  // the first snapshot was produced.
+  useEffect(() => {
+    if (!isTauri()) return;
+    let unlisten: undefined | (() => void);
+    let cancelled = false;
+    (async () => {
+      const { emitTo, listen } = await import('@tauri-apps/api/event');
+      const emitSnapshot = (state: SmoothGhostState) => {
+        void emitTo('smooth-ghost', SMOOTH_GHOST_STATE_EVENT, state).catch(() => {});
+      };
+      ghostEmitRef.current = emitSnapshot;
+      unlisten = await listen(SMOOTH_GHOST_READY_EVENT, () => {
+        if (!cancelled && ghostSnapshotRef.current) emitSnapshot(ghostSnapshotRef.current);
+      });
+    })().catch((error) => console.error('[smooth-ghost] main bridge failed:', error));
+    return () => {
+      cancelled = true;
+      ghostEmitRef.current = null;
+      unlisten?.();
+      if (ghostFlushTimerRef.current) clearTimeout(ghostFlushTimerRef.current);
+    };
+  }, []);
+
+  const handleGhostStateChange = useCallback((state: SmoothGhostState) => {
+    ghostSnapshotRef.current = state;
+    if (ghostFlushTimerRef.current) return;
+    ghostFlushTimerRef.current = setTimeout(() => {
+      ghostFlushTimerRef.current = null;
+      if (ghostSnapshotRef.current) ghostEmitRef.current?.(ghostSnapshotRef.current);
+    }, 50);
+  }, []);
   useEffect(() => {
     const onChange = (event: Event) => {
       const detail = (event as CustomEvent<HackerModeConfig>).detail;
@@ -256,6 +322,10 @@ export const App: React.FC = () => {
             enabled: hackerMode.enabled,
             mouseButton: hackerMode.mouseButton,
             doubleClickMs: hackerMode.doubleClickMs,
+            x: hackerMode.x,
+            y: hackerMode.y,
+            width: hackerMode.width,
+            height: hackerMode.height,
           },
         });
         unlisten = await listen('hacker-trigger', async () => {
@@ -883,7 +953,7 @@ export const App: React.FC = () => {
           {hackerMode.enabled && (
             <button
               onClick={() => setSettingsOpen(true)}
-              title="Smooth 顺滑问答已开启 · Ctrl+双击左键截图 · Ctrl+双击中键最大化/最小化主窗口"
+              title="Smooth 已开启 · Ctrl+双击截图 · Alt+双击左键显示/隐藏幽灵窗口"
               style={{
                 border: '1px solid rgba(34,211,238,.55)', borderRadius: 999,
                 padding: '3px 9px', background: 'rgba(6,182,212,.1)',
@@ -999,6 +1069,7 @@ export const App: React.FC = () => {
                     setPaneSessions((prev) => prev.map((s) => (s === sid ? null : s)));
                   }}
                   onStreamingChange={handleStreamingChange}
+                  onGhostStateChange={handleGhostStateChange}
                   onAdjustFontSize={(delta) => updateConfig({ fontSize: Math.max(11, Math.min(28, config.fontSize + delta)) })}
                   layoutLabel={LAYOUT_LABEL[layout]}
                   onCycleLayout={() => setLayout((cur) => LAYOUT_CYCLE[(LAYOUT_CYCLE.indexOf(cur) + 1) % LAYOUT_CYCLE.length])}

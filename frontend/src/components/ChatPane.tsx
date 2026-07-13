@@ -10,6 +10,7 @@ import { ByTheWayDrawer } from './ByTheWayDrawer';
 import { useChat } from '../hooks/useChat';
 import type { AppConfig } from '../hooks/useConfig';
 import { HACKER_CAPTURE_EVENT } from '../utils/hackerMode';
+import type { SmoothGhostState } from '../utils/smoothGhost';
 
 // 注入「等待气泡」用的脉冲点动画(一次性)。请求发出后到首个 delta 之间,
 // 旧版只靠底部「生成中」chip,聊天区空白让人怀疑后端是不是没收到;这里
@@ -70,6 +71,7 @@ export interface ChatPaneProps {
   onToast?: (type: 'success' | 'error' | 'info', message: string) => void;
   // 流式状态变化回调,App 用来聚合所有 pane 的 streaming 状态
   onStreamingChange?: (sessionId: string, streaming: boolean) => void;
+  onGhostStateChange?: (state: SmoothGhostState) => void;
   // 对话字号步进(全局 config.fontSize),由 App 注入
   onAdjustFontSize?: (delta: number) => void;
   // 全局工具(由 App 注入,放在输入框正上方,避免顶栏拥挤)
@@ -89,6 +91,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
   isMobile,
   onRequestNewSession,
   onStreamingChange,
+  onGhostStateChange,
   onAdjustFontSize,
   layoutLabel,
   onCycleLayout,
@@ -378,6 +381,31 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
       total: chat.messages.length,
     };
   }, [chat.messages]);
+
+  // The ghost window receives only the focused pane's concise latest state.
+  // This callback is throttled by App before crossing the Tauri window boundary.
+  useEffect(() => {
+    if (!isFocused || !sessionId || !onGhostStateChange) return;
+    let lastUserIndex = -1;
+    for (let index = chat.messages.length - 1; index >= 0; index -= 1) {
+      if (chat.messages[index].role === 'user') { lastUserIndex = index; break; }
+    }
+    const lastUser = lastUserIndex >= 0 ? chat.messages[lastUserIndex] : undefined;
+    let lastAssistant;
+    for (let index = chat.messages.length - 1; index > lastUserIndex; index -= 1) {
+      if (chat.messages[index].role === 'assistant') { lastAssistant = chat.messages[index]; break; }
+    }
+    const backend = backends.find((item) => item.id === activeBackendId);
+    onGhostStateChange({
+      sessionId,
+      sessionTitle: activeSession?.title || activeSession?.name || 'AgentWithU',
+      backendLabel: backend?.label || backend?.name || activeBackendId || '',
+      question: lastUser?.content || '',
+      answer: lastAssistant?.content || '',
+      isStreaming: chat.isStreaming,
+      updatedAt: Date.now(),
+    });
+  }, [isFocused, sessionId, chat.messages, chat.isStreaming, activeSession, activeBackendId, backends, onGhostStateChange]);
 
   // ── 自动滚到底部 ──
   useEffect(() => {

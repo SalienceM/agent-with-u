@@ -91,7 +91,7 @@ const SECTIONS: ManualSection[] = [
     id: 'desktop', title: '桌面与个性化', icon: '🖥', intro: '低干扰桌面操作与外观设置。',
     items: [
       { icon: '〰', title: 'Smooth 顺滑问答', summary: '后台监控约定手势，静默截取全屏或预设区域并自动发送到最后聚焦会话。模型忙时自动排队。', entry: '设置 → Smooth 顺滑问答', tips: 'Ctrl+双击左/右键截图；不会记录普通输入。' },
-      { icon: '◫', title: '主窗口快速切换', summary: '无需移动鼠标或切换焦点，通过全局手势快速最大化或最小化主窗口。', entry: 'Ctrl + 双击中键', tips: '该手势独立于 Smooth 开关，桌面端始终可用。' },
+      { icon: '◫', title: '幽灵窗口', summary: '在预设截图区域显示当前会话的半透明镜像，实时查看最新问题、回答和生成状态；窗口置顶、鼠标穿透且不抢焦点。', entry: 'Smooth 开启后 → Alt + 双击左键', tips: '再次触发隐藏；关闭主窗口会归入托盘，托盘菜单可彻底退出。' },
       { icon: '🎨', title: '主题与背景', summary: '切换界面主题、设置背景图、背景透明度和面板透明度。', entry: '设置 → Theme / Background / Transparency' },
       { icon: '📋', title: '日志查看器', summary: '实时查看后端运行日志，排查模型启动、网络、代理、技能和工具执行问题。', entry: '顶栏 📋' },
       { icon: '⬆', title: '数据导入导出', summary: '备份或迁移后端配置、Prompts 与 Skills。会话历史和本机技能凭据不会混入导出包。', entry: '设置 → Data Management' },

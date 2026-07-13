@@ -34,7 +34,7 @@ export function readHackerMode(): HackerModeConfig {
     if (!raw) return { ...DEFAULT_HACKER_MODE };
     const parsed = JSON.parse(raw);
     const merged = { ...DEFAULT_HACKER_MODE, ...parsed };
-    // 中键现在专用于主窗口最小化/恢复，旧的中键截图配置迁移为左键。
+    // 旧版允许中键截图；中键值迁移为左键，避免保留已废弃的选择。
     if (merged.mouseButton === 'middle') merged.mouseButton = 'left';
     return merged;
   } catch {

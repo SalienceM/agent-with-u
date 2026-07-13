@@ -73,7 +73,8 @@ class QwenCodeCliTests(unittest.IsolatedAsyncioTestCase):
             )
             refs, temp_dir = _materialize_qwen_images([image], cwd, "message/1")
             self.assertEqual(len(refs), 1)
-            self.assertTrue(refs[0].startswith(".qwen/attachments/awu-message-1-"))
+            self.assertTrue(refs[0].startswith("awu-qwen-attachments/awu-message-1-"))
+            self.assertNotIn("/.qwen/", f"/{refs[0]}")
             target = os.path.abspath(os.path.join(cwd, refs[0]))
             self.assertEqual(os.path.commonpath((os.path.abspath(cwd), target)), os.path.abspath(cwd))
             with open(target, "rb") as saved:
@@ -81,6 +82,36 @@ class QwenCodeCliTests(unittest.IsolatedAsyncioTestCase):
         finally:
             if temp_dir:
                 shutil.rmtree(temp_dir, ignore_errors=True)
+            shutil.rmtree(cwd, ignore_errors=True)
+
+    async def test_image_turn_enables_qwen_image_modality(self):
+        import json
+        import os
+        import shutil
+        import tempfile
+
+        cwd = tempfile.mkdtemp()
+        try:
+            settings_dir = os.path.join(cwd, ".qwen")
+            os.makedirs(settings_dir, exist_ok=True)
+            with open(os.path.join(settings_dir, "settings.json"), "w", encoding="utf-8") as target:
+                json.dump({
+                    "model": {
+                        "generationConfig": {"timeout": 90000},
+                    },
+                }, target)
+            self.backend._ensure_project_auth_settings(
+                cwd, "openai", "qwen3.7-plus", enable_image_input=True,
+            )
+            settings_path = os.path.join(cwd, ".qwen", "settings.json")
+            with open(settings_path, "r", encoding="utf-8") as source:
+                settings = json.load(source)
+            self.assertEqual(settings["model"]["name"], "qwen3.7-plus")
+            self.assertTrue(
+                settings["model"]["generationConfig"]["modalities"]["image"],
+            )
+            self.assertEqual(settings["model"]["generationConfig"]["timeout"], 90000)
+        finally:
             shutil.rmtree(cwd, ignore_errors=True)
 
 

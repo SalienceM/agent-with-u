@@ -579,6 +579,54 @@ const HackerModeSetting: React.FC = () => {
     const parsed = Number(raw);
     if (Number.isFinite(parsed)) update({ [key]: Math.round(parsed) });
   };
+
+  useEffect(() => {
+    if (!isTauri()) return;
+    let unlisten: undefined | (() => void);
+    (async () => {
+      const { listen } = await import('@tauri-apps/api/event');
+      unlisten = await listen<{ x: number; y: number; width: number; height: number }>(
+        'smooth-region-selected',
+        (event) => setValue(writeHackerMode({ captureMode: 'region', ...event.payload })),
+      );
+    })().catch((error) => console.error('[smooth] region listener failed:', error));
+    return () => unlisten?.();
+  }, []);
+
+  const openRegionSelector = async () => {
+    update({ captureMode: 'region' });
+    if (!isTauri()) return;
+    try {
+      const { invoke } = await import('@tauri-apps/api/core');
+      // Native cleanup first: this also removes an orphan from an earlier
+      // failed selector run before a new transparent window is created.
+      await invoke('finish_smooth_region', { selection: null }).catch(() => {});
+      const { WebviewWindow } = await import('@tauri-apps/api/webviewWindow');
+      const existing = await WebviewWindow.getByLabel('smooth-region').catch(() => null);
+      if (existing) {
+        // Never reuse a potentially stale transparent fullscreen window: an
+        // orphan can remain on top and swallow input even when its DOM is blank.
+        await existing.destroy().catch(() => {});
+      }
+      const query = new URLSearchParams({
+        'smooth-region': '1',
+        x: String(value.x), y: String(value.y),
+        width: String(value.width), height: String(value.height),
+      });
+      new WebviewWindow('smooth-region', {
+        url: `${location.pathname}?${query.toString()}`,
+        title: 'Smooth 截图区域',
+        fullscreen: true,
+        transparent: true,
+        decorations: false,
+        alwaysOnTop: true,
+        skipTaskbar: true,
+        resizable: false,
+      });
+    } catch (error) {
+      console.error('[smooth] open region selector failed:', error);
+    }
+  };
   return (
     <div style={{
       padding: 12, borderRadius: 10,
@@ -612,11 +660,11 @@ const HackerModeSetting: React.FC = () => {
       </div>
       <div style={{ marginTop: 9, display: 'flex', gap: 8 }}>
         {(['full', 'region'] as const).map((mode) => (
-          <button key={mode} onClick={() => update({ captureMode: mode })} style={{
+          <button key={mode} onClick={() => mode === 'region' ? void openRegionSelector() : update({ captureMode: mode })} style={{
             ...actionBtnStyle,
             borderColor: value.captureMode === mode ? '#22d3ee' : 'var(--theme-border)',
             background: value.captureMode === mode ? 'rgba(34,211,238,.12)' : 'rgba(255,255,255,.05)',
-          }}>{mode === 'full' ? '全屏' : '预设区域'}</button>
+          }}>{mode === 'full' ? '全屏' : value.captureMode === 'region' ? '▣ 调整预设区域' : '预设区域'}</button>
         ))}
       </div>
       {value.captureMode === 'region' && (
@@ -636,7 +684,7 @@ const HackerModeSetting: React.FC = () => {
           rows={2} style={{ ...inputStyle, width: '100%', boxSizing: 'border-box', resize: 'vertical', marginTop: 4 }} />
       </label>
       <div style={{ marginTop: 7, fontSize: 11, lineHeight: 1.5, color: 'var(--theme-text-muted)' }}>
-        截图：Ctrl + 双击左/右键。主窗口最大化/最小化：Ctrl + 双击中键。触发点击会被拦截；模型忙碌时截图任务会静默排队。
+        截图：Ctrl + 双击左/右键。幽灵窗口：Smooth 开启后按 Alt + 双击左键，在预设区域显示/隐藏当前问答；窗口置顶、鼠标穿透且不抢焦点。点击“预设区域”可用浮框拖动、缩放；模型忙碌时截图任务会静默排队。
       </div>
     </div>
   );

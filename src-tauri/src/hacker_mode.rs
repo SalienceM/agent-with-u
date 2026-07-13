@@ -8,7 +8,10 @@ use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use serde::{Deserialize, Serialize};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
-use tauri::{AppHandle, Emitter};
+use tauri::{
+    AppHandle, Emitter, Manager, PhysicalPosition, PhysicalSize, Position, Size, WebviewUrl,
+    WebviewWindowBuilder,
+};
 
 #[derive(Clone, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
@@ -16,6 +19,10 @@ pub struct HackerMonitorConfig {
     pub enabled: bool,
     pub mouse_button: String,
     pub double_click_ms: u64,
+    pub x: i32,
+    pub y: i32,
+    pub width: i32,
+    pub height: i32,
 }
 
 impl Default for HackerMonitorConfig {
@@ -24,6 +31,10 @@ impl Default for HackerMonitorConfig {
             enabled: false,
             mouse_button: "left".into(),
             double_click_ms: 450,
+            x: 0,
+            y: 0,
+            width: 1280,
+            height: 720,
         }
     }
 }
@@ -60,6 +71,15 @@ pub struct HackerImage {
     pub size: u64,
 }
 
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SmoothRegionSelection {
+    pub x: i32,
+    pub y: i32,
+    pub width: i32,
+    pub height: i32,
+}
+
 #[cfg(windows)]
 mod platform {
     use super::*;
@@ -71,7 +91,7 @@ mod platform {
         GetDIBits, ReleaseDC, SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, CAPTUREBLT,
         DIB_RGB_COLORS, SRCCOPY,
     };
-    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_CONTROL};
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_CONTROL, VK_MENU};
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         CallNextHookEx, DispatchMessageW, GetMessageW, GetSystemMetrics, SetWindowsHookExW,
         TranslateMessage, MSG, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
@@ -116,11 +136,11 @@ mod platform {
     unsafe extern "system" fn mouse_hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
         if code >= 0 {
             if let Ok(mut guard) = state().lock() {
-                if (GetAsyncKeyState(VK_CONTROL as i32) as u16 & 0x8000) != 0 {
-                    let message = wparam as u32;
-                    // Ctrl + 双击中键固定用于隐藏/恢复主窗口，独立于 Smooth 开关。
-                    if message == WM_MBUTTONDOWN || message == WM_MBUTTONUP {
-                        if message == WM_MBUTTONDOWN {
+                let message = wparam as u32;
+                // Alt + 双击左键切换鼠标穿透的幽灵窗口，仅在 Smooth 开启时生效。
+                if guard.config.enabled && (GetAsyncKeyState(VK_MENU as i32) as u16 & 0x8000) != 0 {
+                    if message == WM_LBUTTONDOWN || message == WM_LBUTTONUP {
+                        if message == WM_LBUTTONDOWN {
                             let now = Instant::now();
                             let triggered = guard
                                 .last_panel_down
@@ -129,13 +149,16 @@ mod platform {
                             guard.last_panel_down = if triggered { None } else { Some(now) };
                             if triggered {
                                 if let Some(app) = guard.app.clone() {
-                                    std::thread::spawn(move || toggle_main_window(app));
+                                    let config = guard.config.clone();
+                                    std::thread::spawn(move || toggle_ghost_window(app, config));
                                 }
                             }
                         }
                         return 1;
                     }
+                }
 
+                if (GetAsyncKeyState(VK_CONTROL as i32) as u16 & 0x8000) != 0 {
                     if !guard.config.enabled {
                         return CallNextHookEx(null_mut(), code, wparam, lparam);
                     }
@@ -166,22 +189,166 @@ mod platform {
         CallNextHookEx(null_mut(), code, wparam, lparam)
     }
 
-    fn toggle_main_window(app: AppHandle) {
-        use tauri::Manager;
-        let Some(window) = app.get_webview_window("main") else {
+    fn apply_no_activate_style(window: &tauri::WebviewWindow) {
+        let _ = window.set_ignore_cursor_events(true);
+        if let Ok(hwnd) = window.hwnd() {
+            unsafe {
+                use windows_sys::Win32::UI::WindowsAndMessaging::{
+                    GetWindowLongW, SetWindowLongW, SetWindowPos, GWL_EXSTYLE, HWND_TOPMOST,
+                    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, WS_EX_LAYERED, WS_EX_NOACTIVATE,
+                    WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT,
+                };
+                let raw = hwnd.0 as *mut core::ffi::c_void;
+                let style = GetWindowLongW(raw, GWL_EXSTYLE);
+                SetWindowLongW(
+                    raw,
+                    GWL_EXSTYLE,
+                    style
+                        | WS_EX_LAYERED as i32
+                        | WS_EX_TRANSPARENT as i32
+                        | WS_EX_NOACTIVATE as i32
+                        | WS_EX_TOOLWINDOW as i32,
+                );
+                SetWindowPos(
+                    raw,
+                    HWND_TOPMOST,
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                );
+            }
+        }
+    }
+
+    /// Show the overlay through Win32's explicit no-activate path.  Tauri's
+    /// cross-platform `show()` may activate a WebView on some Windows builds,
+    /// even when `focused(false)` was used at construction time.
+    fn show_without_activation(window: &tauri::WebviewWindow) {
+        let Ok(hwnd) = window.hwnd() else {
             return;
         };
-        match window.is_minimized() {
-            Ok(true) => {
-                let _ = window.unminimize();
-                let _ = window.maximize();
-                let _ = window.show();
-                let _ = window.set_focus();
+        unsafe {
+            use windows_sys::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
+            use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+                GetFocus, SetActiveWindow, SetFocus,
+            };
+            use windows_sys::Win32::UI::WindowsAndMessaging::{
+                GetForegroundWindow, GetWindowThreadProcessId, SetForegroundWindow, SetWindowPos,
+                PeekMessageW, ShowWindow, HWND_TOPMOST, PM_NOREMOVE, SWP_NOACTIVATE, SWP_NOMOVE,
+                SWP_NOSIZE, SWP_SHOWWINDOW, SW_SHOWNOACTIVATE,
+            };
+
+            let raw = hwnd.0 as *mut core::ffi::c_void;
+            // AttachThreadInput requires both threads to own a message queue.
+            // A fresh worker thread does not have one until its first USER32
+            // queue call, so create it explicitly before attaching.
+            let mut queue_probe: MSG = zeroed();
+            PeekMessageW(&mut queue_probe, core::ptr::null_mut(), 0, 0, PM_NOREMOVE);
+            let foreground = GetForegroundWindow();
+            let foreground_thread = if foreground.is_null() {
+                0
+            } else {
+                GetWindowThreadProcessId(foreground, core::ptr::null_mut())
+            };
+            let current_thread = GetCurrentThreadId();
+            let attached = foreground_thread != 0
+                && foreground_thread != current_thread
+                && AttachThreadInput(current_thread, foreground_thread, 1) != 0;
+            let focused_control = if foreground.is_null() {
+                core::ptr::null_mut()
+            } else {
+                GetFocus()
+            };
+
+            apply_no_activate_style(window);
+            ShowWindow(raw, SW_SHOWNOACTIVATE);
+            SetWindowPos(
+                raw,
+                HWND_TOPMOST,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+            );
+
+            // Defensive restoration: normally SW_SHOWNOACTIVATE keeps the
+            // foreground unchanged.  WebView2 startup and a few shell builds
+            // can still race us, so restore the exact foreground/focused child.
+            if !foreground.is_null() && GetForegroundWindow() != foreground {
+                SetForegroundWindow(foreground);
+                SetActiveWindow(foreground);
             }
-            Ok(false) => {
-                let _ = window.minimize();
+            if !focused_control.is_null() && GetFocus() != focused_control {
+                SetFocus(focused_control);
             }
-            Err(error) => eprintln!("[smooth] cannot read main window state: {error}"),
+            if attached {
+                AttachThreadInput(current_thread, foreground_thread, 0);
+            }
+        }
+    }
+
+    fn place_ghost(window: &tauri::WebviewWindow, config: &HackerMonitorConfig) {
+        let width = config.width.max(320) as u32;
+        let height = config.height.max(180) as u32;
+        let _ = window.set_position(Position::Physical(PhysicalPosition::new(
+            config.x, config.y,
+        )));
+        let _ = window.set_size(Size::Physical(PhysicalSize::new(width, height)));
+        let _ = window.set_always_on_top(true);
+        let _ = window.set_skip_taskbar(true);
+        apply_no_activate_style(window);
+    }
+
+    fn ensure_ghost_window(
+        app: &AppHandle,
+        config: &HackerMonitorConfig,
+    ) -> Result<tauri::WebviewWindow, String> {
+        if let Some(window) = app.get_webview_window("smooth-ghost") {
+            place_ghost(&window, config);
+            return Ok(window);
+        }
+
+        let window = WebviewWindowBuilder::new(
+            app,
+            "smooth-ghost",
+            WebviewUrl::App("index.html?smooth-ghost=1".into()),
+        )
+        .title("AgentWithU · Smooth Ghost")
+        .visible(false)
+        .decorations(false)
+        .transparent(true)
+        .always_on_top(true)
+        .skip_taskbar(true)
+        .shadow(false)
+        .focused(false)
+        .resizable(false)
+        .build()
+        .map_err(|error| error.to_string())?;
+        place_ghost(&window, config);
+        Ok(window)
+    }
+
+    fn toggle_ghost_window(app: AppHandle, config: HackerMonitorConfig) {
+        if let Some(window) = app.get_webview_window("smooth-ghost") {
+            match window.is_visible() {
+                Ok(true) => {
+                    let _ = window.hide();
+                }
+                Ok(false) => {
+                    place_ghost(&window, &config);
+                    show_without_activation(&window);
+                }
+                Err(error) => eprintln!("[smooth] cannot read ghost window state: {error}"),
+            }
+            return;
+        }
+
+        match ensure_ghost_window(&app, &config) {
+            Ok(window) => show_without_activation(&window),
+            Err(error) => eprintln!("[smooth] failed to create ghost window: {error}"),
         }
     }
 
@@ -201,14 +368,25 @@ mod platform {
     }
 
     pub fn configure(app: AppHandle, config: HackerMonitorConfig) -> Result<(), String> {
+        let prepare_config = config.clone();
         let mut guard = state().lock().map_err(|_| "smooth monitor lock poisoned")?;
-        guard.app = Some(app);
+        guard.app = Some(app.clone());
         guard.config = config;
         guard.last_down = None;
         guard.last_panel_down = None;
         if !guard.hook_started {
             guard.hook_started = true;
             spawn_hook_thread();
+        }
+        drop(guard);
+
+        if prepare_config.enabled {
+            // Pre-create while the AgentWithU settings/main window is already
+            // foreground.  The later global gesture only reveals an existing
+            // HWND, eliminating WebView creation as a source of focus theft.
+            ensure_ghost_window(&app, &prepare_config)?;
+        } else if let Some(window) = app.get_webview_window("smooth-ghost") {
+            let _ = window.hide();
         }
         Ok(())
     }
@@ -342,4 +520,32 @@ pub fn configure_hacker_monitor(app: AppHandle, config: HackerMonitorConfig) -> 
 #[tauri::command]
 pub fn capture_hacker_screenshot(config: HackerCaptureConfig) -> Result<HackerImage, String> {
     platform::capture(config)
+}
+
+/// Finish the temporary selector from the native side.
+///
+/// Destroying the window here is deliberate: a transparent fullscreen webview
+/// that only hides its HTML can keep intercepting mouse input.  Native destroy
+/// guarantees the hit-test window is gone after both confirm and cancel.
+#[tauri::command]
+pub fn finish_smooth_region(
+    app: AppHandle,
+    selection: Option<SmoothRegionSelection>,
+) -> Result<(), String> {
+    let mut errors: Vec<String> = Vec::new();
+    if let Some(selected) = selection {
+        if let Err(error) = app.emit_to("main", "smooth-region-selected", selected) {
+            errors.push(format!("emit selection failed: {error}"));
+        }
+    }
+    if let Some(window) = app.get_webview_window("smooth-region") {
+        if let Err(error) = window.destroy() {
+            errors.push(format!("destroy selector failed: {error}"));
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
 }

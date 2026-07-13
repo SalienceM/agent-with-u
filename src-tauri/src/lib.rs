@@ -1,10 +1,50 @@
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Mutex,
+};
+use tauri::Manager;
+use tauri_plugin_shell::process::CommandChild;
 
 mod hacker_mode;
 
 const WS_PORT: u16 = 44321;
+static APP_EXITING: AtomicBool = AtomicBool::new(false);
+
+#[derive(Default)]
+struct BackendProcess(Mutex<Option<CommandChild>>);
+
+fn stop_backend_child(app: &tauri::AppHandle) {
+    let child = app
+        .state::<BackendProcess>()
+        .0
+        .lock()
+        .ok()
+        .and_then(|mut guard| guard.take());
+    let Some(child) = child else { return };
+
+    #[cfg(target_os = "windows")]
+    {
+        // PyInstaller onefile starts a parent bootstrapper plus the actual
+        // Python child. Kill the complete tree or the 9 MB bootstrapper stays
+        // orphaned after every desktop restart.
+        let pid = child.pid().to_string();
+        let killed_tree = std::process::Command::new("taskkill")
+            .args(["/F", "/T", "/PID", &pid])
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false);
+        if !killed_tree {
+            let _ = child.kill();
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = child.kill();
+    }
+}
 
 #[tauri::command]
 fn get_ws_port() -> u16 {
@@ -414,10 +454,69 @@ fn dir_sync_delete_file(dir: String, rel: String) -> Result<(), String> {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        // Register this first: launching the desktop shortcut while the main
+        // window is hidden in the tray must reveal the existing process, not
+        // start a second frontend/backend pair.
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.unminimize();
+                let _ = window.show();
+                let _ = window.set_focus();
+            }
+        }))
+        .manage(BackendProcess::default())
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .setup(|app| {
+            // Close-to-tray keeps Smooth and background answers alive.  The
+            // explicit tray Quit action is the only full application exit.
+            use tauri::menu::{Menu, MenuItem};
+            use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+            use tauri::Manager;
+
+            let show_item = MenuItem::with_id(app, "show-main", "显示 AgentWithU", true, None::<&str>)?;
+            let quit_item = MenuItem::with_id(app, "quit", "彻底退出", true, None::<&str>)?;
+            let tray_menu = Menu::with_items(app, &[&show_item, &quit_item])?;
+            let mut tray_builder = TrayIconBuilder::with_id("agent-with-u-tray")
+                .tooltip("AgentWithU")
+                .menu(&tray_menu)
+                .show_menu_on_left_click(false)
+                .on_menu_event(|app, event| match event.id.as_ref() {
+                    "show-main" => {
+                        if let Some(window) = app.get_webview_window("main") {
+                            let _ = window.unminimize();
+                            let _ = window.show();
+                            let _ = window.set_focus();
+                        }
+                    }
+                    "quit" => {
+                        APP_EXITING.store(true, Ordering::SeqCst);
+                        stop_backend_child(app);
+                        app.exit(0);
+                    }
+                    _ => {}
+                })
+                .on_tray_icon_event(|tray, event| {
+                    if let TrayIconEvent::Click {
+                        button: MouseButton::Left,
+                        button_state: MouseButtonState::Up,
+                        ..
+                    } = event
+                    {
+                        let app = tray.app_handle();
+                        if let Some(window) = app.get_webview_window("main") {
+                            let _ = window.unminimize();
+                            let _ = window.show();
+                            let _ = window.set_focus();
+                        }
+                    }
+                });
+            if let Some(icon) = app.default_window_icon() {
+                tray_builder = tray_builder.icon(icon.clone());
+            }
+            tray_builder.build(app)?;
+
             // Release builds only: spawn the compiled Python sidecar automatically.
             // In dev mode (cargo tauri dev), start Python manually:
             //   python -m src.ws_main
@@ -446,7 +545,16 @@ pub fn run() {
                                 }
                             }
                             match sidecar.spawn() {
-                                Ok(_child) => {
+                                Ok((mut events, child)) => {
+                                    // The shell plugin captures stdout/stderr in a
+                                    // bounded channel. Keep draining it or a chatty
+                                    // backend can eventually block on a full pipe.
+                                    tauri::async_runtime::spawn(async move {
+                                        while events.recv().await.is_some() {}
+                                    });
+                                    if let Ok(mut guard) = app.state::<BackendProcess>().0.lock() {
+                                        *guard = Some(child);
+                                    }
                                     eprintln!("[tauri] sidecar spawned successfully");
                                 }
                                 Err(e) => {
@@ -479,6 +587,16 @@ pub fn run() {
             }
             Ok(())
         })
+        .on_window_event(|window, event| {
+            if window.label() == "main" {
+                if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                    if !APP_EXITING.load(Ordering::SeqCst) {
+                        api.prevent_close();
+                        let _ = window.hide();
+                    }
+                }
+            }
+        })
         .invoke_handler(tauri::generate_handler![
             get_ws_port,
             open_log_viewer,
@@ -486,6 +604,7 @@ pub fn run() {
             read_local_clipboard_image,
             hacker_mode::configure_hacker_monitor,
             hacker_mode::capture_hacker_screenshot,
+            hacker_mode::finish_smooth_region,
             get_desktop_config,
             set_desktop_config,
             dir_sync_scan,

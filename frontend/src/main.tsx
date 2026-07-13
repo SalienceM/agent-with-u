@@ -2,6 +2,8 @@ import React from 'react';
 import { createRoot } from 'react-dom/client';
 import { App } from './App';
 import { ScratchPadWindow, isScratchPadWindow } from './components/ScratchPad';
+import { SmoothRegionSelector, isSmoothRegionSelector } from './components/SmoothRegionSelector';
+import { SmoothGhostWindow, isSmoothGhostWindow } from './components/SmoothGhostWindow';
 import { api } from './api';
 import { installGlobalStreamRouter } from './hooks/useStreamState';
 import { ErrorBoundary } from './components/ErrorBoundary';
@@ -42,7 +44,9 @@ window.addEventListener('unhandledrejection', (ev) => {
 // 全局流路由：所有 session 的 streamDelta 都进 streamStates Map,不论 UI 当前
 // 看的是哪个 session。必须在 React 挂载之前装,确保它的订阅者排在 useChat
 // 的订阅者之前(forEach 按 push 顺序触发)。
-installGlobalStreamRouter(api);
+if (!isSmoothGhostWindow && !isSmoothRegionSelector && !isScratchPadWindow) {
+  installGlobalStreamRouter(api);
+}
 
 // ── Zoom manager (Ctrl+wheel / Ctrl++/-/0) ──────────────────────────────────
 // Uses Tauri v2 webview.setZoom() in Tauri mode; no-op in browser dev mode.
@@ -125,7 +129,7 @@ document.head.appendChild(style);
 
 createRoot(document.getElementById('root')!).render(
   <ErrorBoundary>
-    {isScratchPadWindow ? <ScratchPadWindow /> : <App />}
+    {isSmoothGhostWindow ? <SmoothGhostWindow /> : isSmoothRegionSelector ? <SmoothRegionSelector /> : isScratchPadWindow ? <ScratchPadWindow /> : <App />}
   </ErrorBoundary>,
 );
 _reactMounted = true; // React 已接管，后续错误由 ErrorBoundary 处理

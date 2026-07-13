@@ -72,7 +72,12 @@ def _materialize_qwen_images(
     artifact inside the session working directory.
     """
     root = os.path.abspath(cwd)
-    parent = os.path.join(root, ".qwen", "attachments")
+    # Do not place these under ``.qwen``.  This project intentionally ignores
+    # that directory and Qwen's @file preprocessor respects .gitignore, so an
+    # image stored there is silently skipped before it can become inlineData.
+    # The ordinary workspace directory below exists only for the duration of
+    # the turn and is removed in ``send_message``'s finally block.
+    parent = os.path.join(root, "awu-qwen-attachments")
     os.makedirs(parent, exist_ok=True)
     safe_id = re.sub(r"[^A-Za-z0-9_.-]", "-", message_id or "message")[:64]
     temp_dir = tempfile.mkdtemp(prefix=f"awu-{safe_id}-", dir=parent)
@@ -104,9 +109,17 @@ def _materialize_qwen_images(
             refs.append(os.path.relpath(target, root).replace("\\", "/"))
     except Exception:
         shutil.rmtree(temp_dir, ignore_errors=True)
+        try:
+            os.rmdir(parent)
+        except OSError:
+            pass
         raise
     if not refs:
         shutil.rmtree(temp_dir, ignore_errors=True)
+        try:
+            os.rmdir(parent)
+        except OSError:
+            pass
         return [], None
     return refs, temp_dir
 
@@ -151,7 +164,13 @@ class QwenCodeSdkBackend(ModelBackend):
         task.add_done_callback(_finished)
 
 
-    def _ensure_project_auth_settings(self, cwd: str, auth_type: str, model: Optional[str]) -> None:
+    def _ensure_project_auth_settings(
+        self,
+        cwd: str,
+        auth_type: str,
+        model: Optional[str],
+        enable_image_input: bool = False,
+    ) -> None:
         """Ensure Qwen CLI has a non-interactive auth selection.
 
         Some Qwen CLI versions still require `security.auth.selectedType` in
@@ -161,7 +180,9 @@ class QwenCodeSdkBackend(ModelBackend):
         """
         if not cwd:
             return
-        cache_key = (os.path.abspath(cwd), auth_type, model or "")
+        cache_key = (
+            os.path.abspath(cwd), auth_type, model or "", enable_image_input,
+        )
         if cache_key in getattr(self, "_auth_settings_cache", set()):
             return
         try:
@@ -193,6 +214,24 @@ class QwenCodeSdkBackend(ModelBackend):
                     model_cfg = {}
                     data["model"] = model_cfg
                 model_cfg.setdefault("name", model)
+
+                # Qwen Code uses a built-in name table to decide whether an
+                # @referenced image may be converted to inlineData.  New/custom
+                # visual model IDs (for example qwen3.7-plus) can be absent from
+                # that table and are otherwise downgraded to text with an
+                # "Unsupported image" placeholder.  An actual image attachment
+                # is an explicit capability signal from AgentWithU, so override
+                # only the image modality while preserving all user settings.
+                if enable_image_input:
+                    generation_cfg = model_cfg.setdefault("generationConfig", {})
+                    if not isinstance(generation_cfg, dict):
+                        generation_cfg = {}
+                        model_cfg["generationConfig"] = generation_cfg
+                    modalities = generation_cfg.setdefault("modalities", {})
+                    if not isinstance(modalities, dict):
+                        modalities = {}
+                        generation_cfg["modalities"] = modalities
+                    modalities["image"] = True
 
             settings_dir.mkdir(parents=True, exist_ok=True)
             settings_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -381,7 +420,9 @@ class QwenCodeSdkBackend(ModelBackend):
             # avoid repeating Qwen's headless warning on every request.  An
             # explicit backend env value still wins over this default.
             env_dict.setdefault("QWEN_CODE_SUPPRESS_YOLO_WARNING", "1")
-        self._ensure_project_auth_settings(cwd, auth_type, model)
+        self._ensure_project_auth_settings(
+            cwd, auth_type, model, enable_image_input=bool(images),
+        )
         print(f"[QwenSdk] auth: {auth_type}, model={model!r}, permission_mode={permission_mode}",
               file=sys.stderr, flush=True)
 
@@ -718,6 +759,10 @@ class QwenCodeSdkBackend(ModelBackend):
         finally:
             if _image_temp_dir:
                 shutil.rmtree(_image_temp_dir, ignore_errors=True)
+                try:
+                    os.rmdir(os.path.dirname(_image_temp_dir))
+                except OSError:
+                    pass
 
         return {"agentSessionId": _new_agent_sid}
 

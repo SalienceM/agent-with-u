@@ -378,7 +378,14 @@ class Conn {
 
   connect(): void {
     if (this.disposed) return;
-    this.resolveUrl().then((url) => this.doConnect(url));
+    this.resolveUrl()
+      .then((url) => this.doConnect(url))
+      .catch((error) => {
+        console.warn(`[api] resolve connection URL failed (${this.key}):`, error);
+        this.settleReady();
+        if (this.isHome) connectionStatusCallbacks.forEach((cb) => cb(false));
+        this.scheduleReconnect();
+      });
   }
 
   dispose(): void {
@@ -394,21 +401,37 @@ class Conn {
     if (this.disposed || this.reconnectTimer !== null) return;
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = null;
-      this.resolveUrl().then((url) => this.doConnect(url));
+      this.connect();
     }, this.reconnectDelay);
     this.reconnectDelay = Math.min(this.reconnectDelay * 2, MAX_RECONNECT_DELAY);
   }
 
   private doConnect(url: string): void {
     if (this.disposed) return;
-    const socket = new WebSocket(url);
+    let socket: WebSocket;
+    try {
+      socket = new WebSocket(url);
+    } catch (error) {
+      console.warn(`[api] WebSocket creation failed (${this.key}):`, error);
+      this.settleReady();
+      if (this.isHome) connectionStatusCallbacks.forEach((cb) => cb(false));
+      this.scheduleReconnect();
+      return;
+    }
     let wasCurrent = false;
     const target = this.target;
     let relayHandshake = target.mode === 'relay';
+    const connectTimer = setTimeout(() => {
+      if (socket.readyState === WebSocket.CONNECTING) {
+        console.warn(`[api] WebSocket connect timed out (${this.key}); retrying`);
+        try { socket.close(); } catch { /* */ }
+      }
+    }, WS_CONNECT_TIMEOUT_MS);
 
     const finishConnect = () => {
       this.ws = socket;
       wasCurrent = true;
+      clearTimeout(connectTimer);
       this.reconnectDelay = INITIAL_RECONNECT_DELAY;
       if (this.reconnectTimer) { clearTimeout(this.reconnectTimer); this.reconnectTimer = null; }
       console.log(`[api] Connected to ${url} (${this.key})`);
@@ -437,7 +460,15 @@ class Conn {
       }
     };
 
-    socket.onerror = () => this.settleReady();
+    socket.onerror = () => {
+      this.settleReady();
+      // Browsers normally follow `error` with `close`, but WebView2 has edge
+      // cases where a refused localhost connection remains stuck and no
+      // reconnect is scheduled. Force the close edge that owns retry logic.
+      if (socket.readyState !== WebSocket.CLOSING && socket.readyState !== WebSocket.CLOSED) {
+        try { socket.close(); } catch { /* */ }
+      }
+    };
 
     socket.onmessage = (e) => {
       if (relayHandshake) {
@@ -456,6 +487,7 @@ class Conn {
     };
 
     socket.onclose = () => {
+      clearTimeout(connectTimer);
       if (wasCurrent && this.ws === socket) {
         this.ws = null;
         if (this.heartbeatTimer) { clearInterval(this.heartbeatTimer); this.heartbeatTimer = null; }
@@ -879,7 +911,11 @@ export const api = {
    * roster 为空时即等价于「只列 home 的 session」(向后兼容)。
    */
   async listSessions(): Promise<any[]> {
-    const conns = Array.from(pool.values());
+    // Configured but offline/connecting executors must not hold the sidebar
+    // behind their first-connect timeout. Online nodes are listed immediately;
+    // App refreshes when another executor later comes online.
+    const online = Array.from(pool.values()).filter((c) => c.isOpen);
+    const conns = online.length > 0 ? online : [homeConn];
     const results = await Promise.all(conns.map(async (c) => {
       try {
         const r = await c.request('listSessions', []);
@@ -1251,6 +1287,10 @@ export const api = {
 
   onConnectionStatus(callback: ConnectionStatusCallback): () => void {
     connectionStatusCallbacks.push(callback);
+    // The socket may have connected before React mounted and subscribed.
+    // Only replay a completed connection here; while CONNECTING the existing
+    // timeout/close path owns the first `false` notification.
+    if (homeConn.isOpen) callback(true);
     return () => { connectionStatusCallbacks = connectionStatusCallbacks.filter((cb) => cb !== callback); };
   },
 
