@@ -19,6 +19,10 @@ import os
 import sys
 import json
 import asyncio
+import base64
+import re
+import shutil
+import tempfile
 import time
 from typing import Optional, Callable, Awaitable, Any
 
@@ -44,6 +48,67 @@ def resolve_qwen_cli(config_cli_path: Optional[str] = None) -> str:
 
     import shutil as _shutil
     return _shutil.which("qwen") or "qwen"
+
+
+def _qwen_image_suffix(mime_type: str) -> str:
+    """Return a conservative extension understood by Qwen's @file loader."""
+    return {
+        "image/jpeg": ".jpg",
+        "image/jpg": ".jpg",
+        "image/gif": ".gif",
+        "image/webp": ".webp",
+        "image/bmp": ".bmp",
+    }.get((mime_type or "").lower(), ".png")
+
+
+def _materialize_qwen_images(
+    images: list[ImageAttachment], cwd: str, message_id: str,
+) -> tuple[list[str], Optional[str]]:
+    """Write UI images under cwd for Qwen CLI's native ``@file`` parser.
+
+    qwen-code-sdk's AsyncIterable input currently serializes non-text content
+    blocks as text before invoking the model.  Using Qwen's own file-reference
+    syntax preserves actual multimodal input and also keeps every temporary
+    artifact inside the session working directory.
+    """
+    root = os.path.abspath(cwd)
+    parent = os.path.join(root, ".qwen", "attachments")
+    os.makedirs(parent, exist_ok=True)
+    safe_id = re.sub(r"[^A-Za-z0-9_.-]", "-", message_id or "message")[:64]
+    temp_dir = tempfile.mkdtemp(prefix=f"awu-{safe_id}-", dir=parent)
+    refs: list[str] = []
+    try:
+        for index, image in enumerate(images):
+            raw: Optional[bytes] = None
+            encoded = image.base64 or ""
+            if encoded:
+                if encoded.startswith("data:") and "," in encoded:
+                    encoded = encoded.split(",", 1)[1]
+                raw = base64.b64decode(encoded, validate=False)
+            elif image.file_path:
+                candidate = os.path.abspath(image.file_path)
+                try:
+                    in_workspace = os.path.commonpath((root, candidate)) == root
+                except ValueError:
+                    in_workspace = False
+                if in_workspace and os.path.isfile(candidate):
+                    with open(candidate, "rb") as source:
+                        raw = source.read()
+            if not raw:
+                continue
+            target = os.path.join(
+                temp_dir, f"image-{index + 1}{_qwen_image_suffix(image.mime_type)}",
+            )
+            with open(target, "wb") as output:
+                output.write(raw)
+            refs.append(os.path.relpath(target, root).replace("\\", "/"))
+    except Exception:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        raise
+    if not refs:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        return [], None
+    return refs, temp_dir
 
 
 # ---------------------------------------------------------------------------
@@ -187,6 +252,7 @@ class QwenCodeSdkBackend(ModelBackend):
             "HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY", "NO_PROXY",
             "https_proxy", "http_proxy", "all_proxy", "no_proxy",
             "QWEN_MODEL", "QWEN_AUTH_TYPE", "QWEN_PROVIDER",
+            "QWEN_CODE_SUPPRESS_YOLO_WARNING",
         ):
             val = self.config.get_env(key)
             if val is not None:
@@ -310,37 +376,14 @@ class QwenCodeSdkBackend(ModelBackend):
 
         # Environment
         env_dict = self._build_env()
+        if permission_mode == "yolo":
+            # The application already exposes this permission choice in its UI;
+            # avoid repeating Qwen's headless warning on every request.  An
+            # explicit backend env value still wins over this default.
+            env_dict.setdefault("QWEN_CODE_SUPPRESS_YOLO_WARNING", "1")
         self._ensure_project_auth_settings(cwd, auth_type, model)
         print(f"[QwenSdk] auth: {auth_type}, model={model!r}, permission_mode={permission_mode}",
               file=sys.stderr, flush=True)
-
-        # Build prompt (handle images)
-        has_images = bool(images)
-        if has_images:
-            import base64 as _b64
-            content_blocks: list[dict] = []
-            for img in images:
-                img_b64 = img.base64
-                if not img_b64 and img.file_path and os.path.exists(img.file_path):
-                    with open(img.file_path, "rb") as f:
-                        img_b64 = _b64.b64encode(f.read()).decode("ascii")
-                if img_b64:
-                    content_blocks.append({
-                        "type": "image",
-                        "source": {
-                            "type": "base64",
-                            "media_type": img.mime_type or "image/png",
-                            "data": img_b64,
-                        },
-                    })
-            content_blocks.append({"type": "text", "text": content})
-            prompt = {
-                "type": "user",
-                "message": {"role": "user", "content": content_blocks},
-            }
-            print(f"[QwenSdk] images: {len(content_blocks) - 1} block(s)", file=sys.stderr, flush=True)
-        else:
-            prompt = content
 
         qwen_cli = self._resolve_cli()
         if not cli_available(qwen_cli):
@@ -352,6 +395,28 @@ class QwenCodeSdkBackend(ModelBackend):
             ))
             emit("done")
             return {"agentSessionId": agent_session_id}
+
+        # Qwen's stream-json SDK input currently consumes only text.  Feed
+        # images through the CLI's native @file path instead of passing a dict
+        # (which is neither AsyncIterable nor interpreted as multimodal data).
+        _image_temp_dir: Optional[str] = None
+        image_refs: list[str] = []
+        if images:
+            try:
+                image_refs, _image_temp_dir = _materialize_qwen_images(
+                    images, cwd, message_id,
+                )
+            except Exception as image_error:
+                emit("error", error=f"Qwen 图片附件准备失败: {_exc_msg(image_error)}")
+                emit("done")
+                return {"agentSessionId": agent_session_id}
+        prompt = "\n".join(f"@{path}" for path in image_refs)
+        if prompt:
+            prompt += "\n\n"
+        prompt += content
+        if image_refs:
+            print(f"[QwenSdk] images: {len(image_refs)} @file attachment(s)",
+                  file=sys.stderr, flush=True)
 
         # SDK options
         options = {
@@ -649,6 +714,10 @@ class QwenCodeSdkBackend(ModelBackend):
             emit("error", error=err_msg)
             if not _done_emitted:
                 emit("done")
+
+        finally:
+            if _image_temp_dir:
+                shutil.rmtree(_image_temp_dir, ignore_errors=True)
 
         return {"agentSessionId": _new_agent_sid}
 

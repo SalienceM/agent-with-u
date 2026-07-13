@@ -5,8 +5,8 @@ import unittest
 
 sys.modules.setdefault("httpx", types.ModuleType("httpx"))
 
-from src.backend.qwen_code_cli import QwenCodeSdkBackend
-from src.types import BackendType, ModelBackendConfig
+from src.backend.qwen_code_cli import QwenCodeSdkBackend, _materialize_qwen_images
+from src.types import BackendType, ImageAttachment, ModelBackendConfig
 
 
 class _FakeQuery:
@@ -56,6 +56,32 @@ class QwenCodeCliTests(unittest.IsolatedAsyncioTestCase):
         elapsed = loop.time() - started
         self.assertLess(elapsed, 0.025)
         await query.finished.wait()
+
+    async def test_image_is_materialized_inside_working_dir_for_at_reference(self):
+        import base64
+        import os
+        import shutil
+        import tempfile
+
+        cwd = tempfile.mkdtemp()
+        temp_dir = None
+        try:
+            image = ImageAttachment(
+                id="image-1",
+                base64=base64.b64encode(b"fake-png").decode("ascii"),
+                mime_type="image/png",
+            )
+            refs, temp_dir = _materialize_qwen_images([image], cwd, "message/1")
+            self.assertEqual(len(refs), 1)
+            self.assertTrue(refs[0].startswith(".qwen/attachments/awu-message-1-"))
+            target = os.path.abspath(os.path.join(cwd, refs[0]))
+            self.assertEqual(os.path.commonpath((os.path.abspath(cwd), target)), os.path.abspath(cwd))
+            with open(target, "rb") as saved:
+                self.assertEqual(saved.read(), b"fake-png")
+        finally:
+            if temp_dir:
+                shutil.rmtree(temp_dir, ignore_errors=True)
+            shutil.rmtree(cwd, ignore_errors=True)
 
 
 if __name__ == "__main__":
