@@ -1,0 +1,21 @@
+[Unit]
+Description=AgentWithU Relay Server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=agentwithu
+Group=agentwithu
+EnvironmentFile=/etc/agent-with-u/relay.env
+ExecStart=/opt/agent-with-u-relay/agent-with-u-relay
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target
+

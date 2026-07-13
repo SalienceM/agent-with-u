@@ -1,5 +1,8 @@
 # AgentWithU 自托管部署（v2.1）
 
+> 只部署公网 Relay、且服务器没有 Docker：见
+> [`RELAY_NO_DOCKER.md`](RELAY_NO_DOCKER.md)，支持 Linux/Windows 单文件二进制与 systemd。
+
 把 AgentWithU 后端作为一个**始终在线的服务**部署在你自己的服务器上，
 配合反向代理 + Authelia 做认证。手机 / 平板 / 任意浏览器登录后即可使用，
 计算和数据都留在服务器侧。
