@@ -4,6 +4,13 @@ import {
   HOTKEY_CHANGED_EVENT,
   readScreenshotHotkey,
 } from './utils/hotkey';
+import {
+  HACKER_CAPTURE_EVENT,
+  HACKER_MODE_CHANGED_EVENT,
+  readHackerMode,
+  type HackerModeConfig,
+} from './utils/hackerMode';
+import { uuid } from './utils/uuid';
 import { Sidebar } from './components/Sidebar';
 import { Settings } from './components/Settings';
 import { BackendManager } from './components/BackendManager';
@@ -13,6 +20,7 @@ import { AssetPanel } from './components/AssetPanel';
 import { ServerDirPicker } from './components/ServerDirPicker';
 import { LogViewer } from './components/LogViewer';
 import { ConnectionPanel } from './components/ConnectionPanel';
+import { ManualPanel } from './components/ManualPanel';
 import { ChatPane } from './components/ChatPane';
 import { LoopPolicyEditor, DEFAULT_POLICY, normalizePolicy } from './components/LoopPolicyEditor';
 import type { LoopPolicy } from './components/LoopPolicyEditor';
@@ -44,6 +52,7 @@ export const App: React.FC = () => {
   const [repoPanelOpen, setRepoPanelOpen] = useState(false);
   const [logViewerOpen, setLogViewerOpen] = useState(false);
   const [connPanelOpen, setConnPanelOpen] = useState(false);
+  const [manualPanelOpen, setManualPanelOpen] = useState(false);
   const [repoPanelEditing, setRepoPanelEditing] = useState(false);
   const [newSessionDialogOpen, setNewSessionDialogOpen] = useState(false);
   const [streamingSessions, setStreamingSessions] = useState<Set<string>>(new Set());  // ★ Per-session streaming state
@@ -220,6 +229,60 @@ export const App: React.FC = () => {
       if (unregister) unregister();
     };
   }, [screenshotHotkey]);
+
+  // Smooth 模式：Rust 在系统级监听 Ctrl + 双击鼠标，不激活本窗口。
+  // 收到触发后后台截屏，再把一次性图片任务派给最后聚焦的 pane。
+  const [hackerMode, setHackerMode] = useState<HackerModeConfig>(() => readHackerMode());
+  useEffect(() => {
+    const onChange = (event: Event) => {
+      const detail = (event as CustomEvent<HackerModeConfig>).detail;
+      if (detail) setHackerMode(detail);
+    };
+    window.addEventListener(HACKER_MODE_CHANGED_EVENT, onChange);
+    return () => window.removeEventListener(HACKER_MODE_CHANGED_EVENT, onChange);
+  }, []);
+  useEffect(() => {
+    if (!isTauri()) return;
+    let unlisten: undefined | (() => void);
+    let cancelled = false;
+    (async () => {
+      try {
+        const [{ invoke }, { listen }] = await Promise.all([
+          import('@tauri-apps/api/core'),
+          import('@tauri-apps/api/event'),
+        ]);
+        await invoke('configure_hacker_monitor', {
+          config: {
+            enabled: hackerMode.enabled,
+            mouseButton: hackerMode.mouseButton,
+            doubleClickMs: hackerMode.doubleClickMs,
+          },
+        });
+        unlisten = await listen('hacker-trigger', async () => {
+          try {
+            const image = await invoke<any>('capture_hacker_screenshot', {
+              config: {
+                mode: hackerMode.captureMode,
+                x: hackerMode.x,
+                y: hackerMode.y,
+                width: hackerMode.width,
+                height: hackerMode.height,
+              },
+            });
+            if (cancelled || !image?.base64) return;
+            window.dispatchEvent(new CustomEvent(HACKER_CAPTURE_EVENT, {
+              detail: { prompt: hackerMode.prompt, image: { id: uuid(), ...image } },
+            }));
+          } catch (error) {
+            console.error('[smooth] capture failed:', error);
+          }
+        });
+      } catch (error) {
+        console.error('[smooth] monitor setup failed:', error);
+      }
+    })();
+    return () => { cancelled = true; unlisten?.(); };
+  }, [hackerMode]);
 
   /* ---- 连接后加载初始数据（处理 WS 未就绪导致首次加载为空的问题） ---- */
   useEffect(() => {
@@ -817,7 +880,28 @@ export const App: React.FC = () => {
             </span>
           )}
           <div style={{ flex: 1 }} />
+          {hackerMode.enabled && (
+            <button
+              onClick={() => setSettingsOpen(true)}
+              title="Smooth 顺滑问答已开启 · Ctrl+双击左键截图 · Ctrl+双击中键最大化/最小化主窗口"
+              style={{
+                border: '1px solid rgba(34,211,238,.55)', borderRadius: 999,
+                padding: '3px 9px', background: 'rgba(6,182,212,.1)',
+                color: '#22d3ee', fontSize: 10, fontWeight: 800,
+                letterSpacing: 1.2, cursor: 'pointer', boxShadow: '0 0 12px rgba(34,211,238,.16)',
+              }}
+            >
+              ◉ SMOOTH
+            </button>
+          )}
           {/* Loop 会话的全部交互在 ChatPane 内嵌的 LoopPanel 中进行，顶栏不再放入口 */}
+          <button
+            onClick={() => setManualPanelOpen(true)}
+            style={{ ...settingsBtnStyle, ...(manualPanelOpen ? { background: 'var(--theme-accent-bg)', color: 'var(--theme-accent)' } : {}) }}
+            title="使用手册"
+          >
+            📖
+          </button>
           {/* 日志查看器按钮 */}
           <button
             onClick={() => setLogViewerOpen(true)}
@@ -992,6 +1076,9 @@ export const App: React.FC = () => {
 
       {/* ---- 连接目标设置 ---- */}
       {connPanelOpen && <ConnectionPanel onClose={() => setConnPanelOpen(false)} />}
+
+      {/* ---- 内置使用手册 ---- */}
+      {manualPanelOpen && <ManualPanel onClose={() => setManualPanelOpen(false)} />}
 
       {/* 目录同步已重做为侧栏「🗂 文件」视图（本地 ⇄ 远端目录树），不再用弹窗。 */}
 

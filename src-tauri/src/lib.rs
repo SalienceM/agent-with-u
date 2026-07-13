@@ -2,6 +2,8 @@ use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+mod hacker_mode;
+
 const WS_PORT: u16 = 44321;
 
 #[tauri::command]
@@ -482,6 +484,8 @@ pub fn run() {
             open_log_viewer,
             open_screenshot_tool,
             read_local_clipboard_image,
+            hacker_mode::configure_hacker_monitor,
+            hacker_mode::capture_hacker_screenshot,
             get_desktop_config,
             set_desktop_config,
             dir_sync_scan,

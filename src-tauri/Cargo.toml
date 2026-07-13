@@ -27,3 +27,11 @@ arboard = "3"
 png = "0.17"
 base64 = "0.22"
 sha2 = "0.10"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+] }

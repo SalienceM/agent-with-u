@@ -10,6 +10,7 @@ import {
   readScreenshotHotkey,
   writeScreenshotHotkey,
 } from '../utils/hotkey';
+import { readHackerMode, writeHackerMode, type HackerModeConfig } from '../utils/hackerMode';
 
 interface SettingsProps {
   isOpen: boolean;
@@ -379,6 +380,13 @@ export const Settings: React.FC<SettingsProps> = ({
           </p>
         </div>
 
+        {isTauri() && (
+          <div style={sectionStyle}>
+            <label style={labelStyle}>〰️ Smooth 顺滑问答</label>
+            <HackerModeSetting />
+          </div>
+        )}
+
         {/* 截图全局快捷键(Tauri only) */}
         {isTauri() && (
           <div style={sectionStyle}>
@@ -562,6 +570,76 @@ const themeBtnStyle: React.CSSProperties = {
   flex: 1, padding: '10px 12px', borderRadius: 8, border: '2px solid', fontSize: 12,
   fontWeight: 600, cursor: 'pointer', transition: 'all 0.15s',
   boxShadow: '0 2px 8px rgba(0,0,0,0.2)',
+};
+
+const HackerModeSetting: React.FC = () => {
+  const [value, setValue] = useState<HackerModeConfig>(() => readHackerMode());
+  const update = (patch: Partial<HackerModeConfig>) => setValue(writeHackerMode(patch));
+  const updateNumber = (key: 'doubleClickMs' | 'x' | 'y' | 'width' | 'height', raw: string) => {
+    const parsed = Number(raw);
+    if (Number.isFinite(parsed)) update({ [key]: Math.round(parsed) });
+  };
+  return (
+    <div style={{
+      padding: 12, borderRadius: 10,
+      border: `1px solid ${value.enabled ? 'rgba(34,211,238,.55)' : 'var(--theme-border)'}`,
+      background: value.enabled ? 'rgba(6,182,212,.08)' : 'rgba(255,255,255,.025)',
+    }}>
+      <label style={{ display: 'flex', alignItems: 'center', gap: 9, cursor: 'pointer' }}>
+        <input type="checkbox" checked={value.enabled}
+          onChange={(e) => update({ enabled: e.target.checked })}
+          style={{ accentColor: '#22d3ee' }} />
+        <span style={{ fontSize: 13, fontWeight: 700, color: 'var(--theme-text)' }}>
+          {value.enabled ? 'SMOOTH · 后台待命' : '开启 Smooth 模式'}
+        </span>
+      </label>
+      <div style={{ marginTop: 10, display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
+        <label style={{ fontSize: 11, color: 'var(--theme-text-muted)' }}>
+          触发鼠标键
+          <select value={value.mouseButton}
+            onChange={(e) => update({ mouseButton: e.target.value as HackerModeConfig['mouseButton'] })}
+            style={{ ...inputStyle, width: '100%', marginTop: 4 }}>
+            <option value="left">Ctrl + 双击左键（推荐）</option>
+            <option value="right">Ctrl + 双击右键</option>
+          </select>
+        </label>
+        <label style={{ fontSize: 11, color: 'var(--theme-text-muted)' }}>
+          双击间隔（ms）
+          <input type="number" min={180} max={1000} value={value.doubleClickMs}
+            onChange={(e) => updateNumber('doubleClickMs', e.target.value)}
+            style={{ ...inputStyle, width: '100%', boxSizing: 'border-box', marginTop: 4 }} />
+        </label>
+      </div>
+      <div style={{ marginTop: 9, display: 'flex', gap: 8 }}>
+        {(['full', 'region'] as const).map((mode) => (
+          <button key={mode} onClick={() => update({ captureMode: mode })} style={{
+            ...actionBtnStyle,
+            borderColor: value.captureMode === mode ? '#22d3ee' : 'var(--theme-border)',
+            background: value.captureMode === mode ? 'rgba(34,211,238,.12)' : 'rgba(255,255,255,.05)',
+          }}>{mode === 'full' ? '全屏' : '预设区域'}</button>
+        ))}
+      </div>
+      {value.captureMode === 'region' && (
+        <div style={{ marginTop: 8, display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 6 }}>
+          {(['x', 'y', 'width', 'height'] as const).map((key) => (
+            <label key={key} style={{ fontSize: 10, color: 'var(--theme-text-muted)' }}>
+              {key.toUpperCase()}
+              <input type="number" value={value[key]} onChange={(e) => updateNumber(key, e.target.value)}
+                style={{ ...inputStyle, width: '100%', boxSizing: 'border-box', marginTop: 3 }} />
+            </label>
+          ))}
+        </div>
+      )}
+      <label style={{ display: 'block', marginTop: 9, fontSize: 11, color: 'var(--theme-text-muted)' }}>
+        自动发送的提问词
+        <textarea value={value.prompt} onChange={(e) => update({ prompt: e.target.value })}
+          rows={2} style={{ ...inputStyle, width: '100%', boxSizing: 'border-box', resize: 'vertical', marginTop: 4 }} />
+      </label>
+      <div style={{ marginTop: 7, fontSize: 11, lineHeight: 1.5, color: 'var(--theme-text-muted)' }}>
+        截图：Ctrl + 双击左/右键。主窗口最大化/最小化：Ctrl + 双击中键。触发点击会被拦截；模型忙碌时截图任务会静默排队。
+      </div>
+    </div>
+  );
 };
 
 // 截图全局快捷键的配置 UI:

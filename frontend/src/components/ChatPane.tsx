@@ -9,6 +9,7 @@ import type { SeqTaskT } from './SeqTaskPanel';
 import { ByTheWayDrawer } from './ByTheWayDrawer';
 import { useChat } from '../hooks/useChat';
 import type { AppConfig } from '../hooks/useConfig';
+import { HACKER_CAPTURE_EVENT } from '../utils/hackerMode';
 
 // 注入「等待气泡」用的脉冲点动画(一次性)。请求发出后到首个 delta 之间,
 // 旧版只靠底部「生成中」chip,聊天区空白让人怀疑后端是不是没收到;这里
@@ -223,6 +224,28 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
   doSendRef.current = chat.doSend;
   const sendMessageRef = useRef(chat.sendMessage);
   sendMessageRef.current = chat.sendMessage;
+
+  // Smooth 顺滑问答只投递到最后聚焦的 pane。若当前回答尚未结束，先在
+  // 内存中排队，等 done 边缘再发送，避免打断培训录屏中的现有回答。
+  const hackerPendingRef = useRef<Array<{ prompt: string; image: any }>>([]);
+  useEffect(() => {
+    const onCapture = (event: Event) => {
+      if (!isFocused || !sessionId) return;
+      const detail = (event as CustomEvent<{ prompt?: string; image?: any }>).detail;
+      if (!detail?.image) return;
+      const task = { prompt: detail.prompt?.trim() || '请分析这张截图。', image: detail.image };
+      if (isStreamingRef.current) hackerPendingRef.current.push(task);
+      else doSendRef.current(task.prompt, [task.image]);
+    };
+    window.addEventListener(HACKER_CAPTURE_EVENT, onCapture);
+    return () => window.removeEventListener(HACKER_CAPTURE_EVENT, onCapture);
+  }, [isFocused, sessionId]);
+
+  useEffect(() => {
+    if (chat.isStreaming || !sessionId || !isFocused) return;
+    const next = hackerPendingRef.current.shift();
+    if (next) doSendRef.current(next.prompt, [next.image]);
+  }, [chat.isStreaming, isFocused, sessionId]);
 
   const dispatchNext = useCallback(async () => {
     if (!sessionId || dispatchingRef.current || isStreamingRef.current) return;
