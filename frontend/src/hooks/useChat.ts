@@ -159,7 +159,6 @@ export function useChat(sessionId: string, backendId: string, backends?: any[], 
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [isStreaming, setIsStreaming] = useState(false);
   const [autoContinue, setAutoContinue] = useState(true);
-  const [needsMigrate, setNeedsMigrate] = useState(false);
   const [pendingPermission, setPendingPermission] = useState<PermissionRequest | null>(null);
   // ★ 历史分页:首次 loadSession 时只取最近 INITIAL_LOAD_LIMIT 条,加快远程
   //   首屏。messagesTotal 是 session 在磁盘上的总数,hasMore 表示还有更老的
@@ -204,15 +203,6 @@ export function useChat(sessionId: string, backendId: string, backends?: any[], 
     streamStartRef.current = state.streamStart;
     msgIdRef.current = state.messageId;
   }, []);
-
-  // ── 检查后端是否存在 ──
-  useEffect(() => {
-    if (!backends || backends.length === 0) return;
-    const backendExists = backends.some(b => b.id === backendId);
-    if (!backendExists) {
-      setNeedsMigrate(true);
-    }
-  }, [backendId, backends]);
 
   // ── 加载 session ──
   useEffect(() => {
@@ -672,17 +662,6 @@ export function useChat(sessionId: string, backendId: string, backends?: any[], 
   const doSend = useCallback(
     (content: string, images?: ImageAttachment[]) => {
       if (isStreamingRef.current) return;
-      if (needsMigrate) {
-        // Backend is missing - show migrate prompt
-        const sysMsg: ChatMessage = {
-          id: uuid(),
-          role: 'system',
-          content: `⚠️ **当前会话的后端已被删除**\n\n请点击右上角的 **Migrate** 按钮，选择一个新的后端继续对话。`,
-          timestamp: Date.now() / 1000,
-        };
-        setMessages((prev) => [...prev, sysMsg]);
-        return;
-      }
 
       const userMsg: ChatMessage = {
         id: uuid(),
@@ -728,7 +707,7 @@ export function useChat(sessionId: string, backendId: string, backends?: any[], 
         skipPermissions: skipPermissionsRef.current,
       });
     },
-    [sessionId, backendId, needsMigrate]
+    [sessionId, backendId]
   );
 
   // 稳定 ref 给命令处理器调用
@@ -1108,7 +1087,6 @@ export function useChat(sessionId: string, backendId: string, backends?: any[], 
   return {
     messages, isStreaming, sendMessage, abort, autoContinue, setAutoContinue,
     pendingPermission, clearPermission: () => setPendingPermission(null),
-    needsMigrate,
     // 历史分页
     messagesTotal, hasMore, loadingEarlier, loadEarlier,
     isLoadingSession,

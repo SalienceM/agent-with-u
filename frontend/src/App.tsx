@@ -31,11 +31,7 @@ import { themes } from './hooks/useConfig';
 import { useIsMobile } from './hooks/useIsMobile';
 import { hljsLightCss, hljsDarkCss } from './utils/hljsThemes';
 import { messagesToMarkdown, messagesToJson } from './utils/markdown';
-import {
-  SMOOTH_GHOST_READY_EVENT,
-  SMOOTH_GHOST_STATE_EVENT,
-  type SmoothGhostState,
-} from './utils/smoothGhost';
+import type { SmoothGhostState } from './utils/smoothGhost';
 
 function hexToRgba(color: string, alpha: number): string {
   const m = color.match(/^#([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})/i);
@@ -183,8 +179,11 @@ export const App: React.FC = () => {
     let timer: ReturnType<typeof setTimeout> | null = null;
     let generation = 0;
     const unsub = onExecStatus(() => {
-      const homeOnline = getExecutors().some((item) => item.isHome && item.connected);
-      if (!homeOnline) return;
+      const anyOnline = getExecutors().some((item) => item.connected);
+      // A stale/offline relay selected as home must not hide a healthy local
+      // desktop sidecar behind the full-screen "backend offline" state.
+      setBackendConnected(anyOnline);
+      if (!anyOnline) return;
       if (timer) clearTimeout(timer);
       const current = ++generation;
       timer = setTimeout(() => {
@@ -266,27 +265,24 @@ export const App: React.FC = () => {
   const ghostEmitRef = useRef<null | ((state: SmoothGhostState) => void)>(null);
   const ghostFlushTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  // Bridge the focused ChatPane into the click-through ghost webview.  The
-  // ready handshake also covers the race where the native window loads after
-  // the first snapshot was produced.
+  // Bridge the focused ChatPane into the native click-through ghost overlay.
+  // Native state is retained before the overlay is first shown, so there is no
+  // second WebView startup/ready race on managed Windows machines.
   useEffect(() => {
     if (!isTauri()) return;
-    let unlisten: undefined | (() => void);
     let cancelled = false;
     (async () => {
-      const { emitTo, listen } = await import('@tauri-apps/api/event');
+      const { invoke } = await import('@tauri-apps/api/core');
+      if (cancelled) return;
       const emitSnapshot = (state: SmoothGhostState) => {
-        void emitTo('smooth-ghost', SMOOTH_GHOST_STATE_EVENT, state).catch(() => {});
+        void invoke('update_smooth_ghost_state', { state }).catch(() => {});
       };
       ghostEmitRef.current = emitSnapshot;
-      unlisten = await listen(SMOOTH_GHOST_READY_EVENT, () => {
-        if (!cancelled && ghostSnapshotRef.current) emitSnapshot(ghostSnapshotRef.current);
-      });
+      if (ghostSnapshotRef.current) emitSnapshot(ghostSnapshotRef.current);
     })().catch((error) => console.error('[smooth-ghost] main bridge failed:', error));
     return () => {
       cancelled = true;
       ghostEmitRef.current = null;
-      unlisten?.();
       if (ghostFlushTimerRef.current) clearTimeout(ghostFlushTimerRef.current);
     };
   }, []);
@@ -297,7 +293,7 @@ export const App: React.FC = () => {
     ghostFlushTimerRef.current = setTimeout(() => {
       ghostFlushTimerRef.current = null;
       if (ghostSnapshotRef.current) ghostEmitRef.current?.(ghostSnapshotRef.current);
-    }, 50);
+    }, 120);
   }, []);
   useEffect(() => {
     const onChange = (event: Event) => {
@@ -309,7 +305,8 @@ export const App: React.FC = () => {
   }, []);
   useEffect(() => {
     if (!isTauri()) return;
-    let unlisten: undefined | (() => void);
+    let unlistenTrigger: undefined | (() => void);
+    let unlistenError: undefined | (() => void);
     let cancelled = false;
     (async () => {
       try {
@@ -317,18 +314,12 @@ export const App: React.FC = () => {
           import('@tauri-apps/api/core'),
           import('@tauri-apps/api/event'),
         ]);
-        await invoke('configure_hacker_monitor', {
-          config: {
-            enabled: hackerMode.enabled,
-            mouseButton: hackerMode.mouseButton,
-            doubleClickMs: hackerMode.doubleClickMs,
-            x: hackerMode.x,
-            y: hackerMode.y,
-            width: hackerMode.width,
-            height: hackerMode.height,
-          },
+        // Listen before enabling the native hook so even an immediate gesture
+        // cannot fall into the setup gap.
+        unlistenError = await listen<string>('smooth-error', (event) => {
+          if (!cancelled) showToast('error', event.payload || 'Smooth 幽灵窗口启动失败', 9000);
         });
-        unlisten = await listen('hacker-trigger', async () => {
+        unlistenTrigger = await listen('hacker-trigger', async () => {
           try {
             const image = await invoke<any>('capture_hacker_screenshot', {
               config: {
@@ -345,14 +336,33 @@ export const App: React.FC = () => {
             }));
           } catch (error) {
             console.error('[smooth] capture failed:', error);
+            if (!cancelled) showToast('error', `Smooth 截图失败：${String(error)}`, 7000);
           }
+        });
+        await invoke('configure_hacker_monitor', {
+          config: {
+            enabled: hackerMode.enabled,
+            mouseButton: hackerMode.mouseButton,
+            doubleClickMs: hackerMode.doubleClickMs,
+            x: hackerMode.x,
+            y: hackerMode.y,
+            width: hackerMode.width,
+            height: hackerMode.height,
+          },
         });
       } catch (error) {
         console.error('[smooth] monitor setup failed:', error);
+        if (!cancelled && hackerMode.enabled) {
+          showToast('error', `Smooth 全局鼠标监听启动失败：${String(error)}`, 9000);
+        }
       }
     })();
-    return () => { cancelled = true; unlisten?.(); };
-  }, [hackerMode]);
+    return () => {
+      cancelled = true;
+      unlistenTrigger?.();
+      unlistenError?.();
+    };
+  }, [hackerMode, showToast]);
 
   /* ---- 连接后加载初始数据（处理 WS 未就绪导致首次加载为空的问题） ---- */
   useEffect(() => {
@@ -389,8 +399,16 @@ export const App: React.FC = () => {
     if (backendConnected !== true) return;
     return api.onSessionUpdated((data: any) => {
       const t = data?.type;
-      if (t !== 'session_created' && t !== 'session_deleted' && t !== 'session_renamed') {
+      if (t !== 'session_created' && t !== 'session_deleted' && t !== 'session_renamed' && t !== 'session_changed') {
         return;
+      }
+      if (data?.summary?.id) {
+        setSessions((prev) => prev.map((session) => (
+          session.id === data.summary.id ? { ...session, ...data.summary } : session
+        )).sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0)));
+        setActiveSession((prev: any) => (
+          prev?.id === data.summary.id ? { ...prev, ...data.summary } : prev
+        ));
       }
       api.listSessions().then((list) => {
         setSessions(list);
@@ -946,14 +964,14 @@ export const App: React.FC = () => {
           {!isMobile && <CopyablePath path={activeSession?.workingDir} />}
           {!isMobile && (
             <span style={{ fontSize: 12, color: 'var(--theme-text-muted, #656d76)' }}>
-              {formatBackendLabel(backends.find((b: any) => b.id === activeBackendId))}
+              {formatBackendLabel(activeExecBackends.find((b: any) => b.id === activeBackendId))}
             </span>
           )}
           <div style={{ flex: 1 }} />
           {hackerMode.enabled && (
             <button
               onClick={() => setSettingsOpen(true)}
-              title="Smooth 已开启 · Ctrl+双击截图 · Alt+双击左键显示/隐藏幽灵窗口"
+              title="Smooth 已开启 · Ctrl+双击截图 · 左 Shift+双击左键显示/隐藏幽灵窗口"
               style={{
                 border: '1px solid rgba(34,211,238,.55)', borderRadius: 999,
                 padding: '3px 9px', background: 'rgba(6,182,212,.1)',

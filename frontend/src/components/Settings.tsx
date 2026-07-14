@@ -574,6 +574,8 @@ const themeBtnStyle: React.CSSProperties = {
 
 const HackerModeSetting: React.FC = () => {
   const [value, setValue] = useState<HackerModeConfig>(() => readHackerMode());
+  const [selectorOpening, setSelectorOpening] = useState(false);
+  const [selectorError, setSelectorError] = useState('');
   const update = (patch: Partial<HackerModeConfig>) => setValue(writeHackerMode(patch));
   const updateNumber = (key: 'doubleClickMs' | 'x' | 'y' | 'width' | 'height', raw: string) => {
     const parsed = Number(raw);
@@ -596,35 +598,24 @@ const HackerModeSetting: React.FC = () => {
   const openRegionSelector = async () => {
     update({ captureMode: 'region' });
     if (!isTauri()) return;
+    if (selectorOpening) return;
+    setSelectorOpening(true);
+    setSelectorError('');
     try {
       const { invoke } = await import('@tauri-apps/api/core');
-      // Native cleanup first: this also removes an orphan from an earlier
-      // failed selector run before a new transparent window is created.
-      await invoke('finish_smooth_region', { selection: null }).catch(() => {});
-      const { WebviewWindow } = await import('@tauri-apps/api/webviewWindow');
-      const existing = await WebviewWindow.getByLabel('smooth-region').catch(() => null);
-      if (existing) {
-        // Never reuse a potentially stale transparent fullscreen window: an
-        // orphan can remain on top and swallow input even when its DOM is blank.
-        await existing.destroy().catch(() => {});
-      }
-      const query = new URLSearchParams({
-        'smooth-region': '1',
-        x: String(value.x), y: String(value.y),
-        width: String(value.width), height: String(value.height),
-      });
-      new WebviewWindow('smooth-region', {
-        url: `${location.pathname}?${query.toString()}`,
-        title: 'Smooth 截图区域',
-        fullscreen: true,
-        transparent: true,
-        decorations: false,
-        alwaysOnTop: true,
-        skipTaskbar: true,
-        resizable: false,
+      await invoke('open_smooth_region_selector', {
+        selection: {
+          x: value.x,
+          y: value.y,
+          width: value.width,
+          height: value.height,
+        },
       });
     } catch (error) {
       console.error('[smooth] open region selector failed:', error);
+      setSelectorError(`选区窗口打开失败：${String(error)}`);
+    } finally {
+      setSelectorOpening(false);
     }
   };
   return (
@@ -660,13 +651,20 @@ const HackerModeSetting: React.FC = () => {
       </div>
       <div style={{ marginTop: 9, display: 'flex', gap: 8 }}>
         {(['full', 'region'] as const).map((mode) => (
-          <button key={mode} onClick={() => mode === 'region' ? void openRegionSelector() : update({ captureMode: mode })} style={{
+          <button key={mode} disabled={mode === 'region' && selectorOpening}
+            onClick={() => mode === 'region' ? void openRegionSelector() : update({ captureMode: mode })} style={{
             ...actionBtnStyle,
             borderColor: value.captureMode === mode ? '#22d3ee' : 'var(--theme-border)',
             background: value.captureMode === mode ? 'rgba(34,211,238,.12)' : 'rgba(255,255,255,.05)',
-          }}>{mode === 'full' ? '全屏' : value.captureMode === 'region' ? '▣ 调整预设区域' : '预设区域'}</button>
+            opacity: mode === 'region' && selectorOpening ? .65 : 1,
+          }}>{mode === 'full' ? '全屏' : selectorOpening ? '正在打开选区…' : value.captureMode === 'region' ? '▣ 调整预设区域' : '预设区域'}</button>
         ))}
       </div>
+      {selectorError && (
+        <div style={{ marginTop: 7, color: '#fca5a5', fontSize: 11, lineHeight: 1.45 }}>
+          {selectorError}
+        </div>
+      )}
       {value.captureMode === 'region' && (
         <div style={{ marginTop: 8, display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 6 }}>
           {(['x', 'y', 'width', 'height'] as const).map((key) => (
@@ -684,7 +682,7 @@ const HackerModeSetting: React.FC = () => {
           rows={2} style={{ ...inputStyle, width: '100%', boxSizing: 'border-box', resize: 'vertical', marginTop: 4 }} />
       </label>
       <div style={{ marginTop: 7, fontSize: 11, lineHeight: 1.5, color: 'var(--theme-text-muted)' }}>
-        截图：Ctrl + 双击左/右键。幽灵窗口：Smooth 开启后按 Alt + 双击左键，在预设区域显示/隐藏当前问答；窗口置顶、鼠标穿透且不抢焦点。点击“预设区域”可用浮框拖动、缩放；模型忙碌时截图任务会静默排队。
+        截图：Ctrl + 双击左/右键。幽灵窗口：Smooth 开启后按左 Shift + 双击左键，在预设区域中央显示/隐藏当前问答；面板不会铺满选区，且置顶、鼠标穿透、不抢焦点。点击“预设区域”可用浮框拖动、缩放；模型忙碌时截图任务会静默排队。
       </div>
     </div>
   );

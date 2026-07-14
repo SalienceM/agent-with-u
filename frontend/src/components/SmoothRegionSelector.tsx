@@ -17,6 +17,10 @@ export const SmoothRegionSelector: React.FC = () => {
   const dragRef = useRef<null | { mode: DragMode; sx: number; sy: number; rect: Rect }>(null);
 
   useEffect(() => {
+    void import('@tauri-apps/api/core').then(({ invoke }) => invoke('report_desktop_log', {
+      source: 'smooth-region-webview',
+      message: `React selector mounted; url=${location.href}`,
+    })).catch(() => {});
     document.title = 'Smooth 截图区域';
     document.body.style.background = 'transparent';
     document.documentElement.style.background = 'transparent';

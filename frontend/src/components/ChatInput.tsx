@@ -61,11 +61,6 @@ interface Props {
   // ── Git 集成（execKey/execMode 用于 FileTreePanel 侧 Git 操作）──
   execKey?: string;
   execMode?: 'local' | 'relay';
-  // ── ★ 自动 AI commit ──
-  autoCommit?: boolean;
-  autoCommitPush?: boolean;
-  autoCommitBackendId?: string;
-  onAutoCommitChange?: (enabled: boolean, push?: boolean, backendId?: string) => void;
 }
 
 // ═══════════════════════════════════════
@@ -120,7 +115,6 @@ const ChatInputInner: React.FC<Props> = ({
   onCompact,
   fontSize, onAdjustFontSize,
   isFocused = true,
-  autoCommit = false, autoCommitPush = false, autoCommitBackendId = '', onAutoCommitChange,
 }) => {
   const ref = useRef<HTMLTextAreaElement>(null);
   // 把 textarea ref 传给 useClipboardImage,这样多 pane 场景下只有聚焦
@@ -986,41 +980,6 @@ const ChatInputInner: React.FC<Props> = ({
             compact={isMobile}
             onClick={handleScreenshot}
             loading={screenshotBusy}
-          />
-        )}
-        {/* ★ 自动 AI commit 开关（点击循环：关→提交→提交+推送→关） */}
-        {onAutoCommitChange && (
-          <ToolbarBtn
-            icon={`🤖${autoCommit ? (autoCommitPush ? '⇧' : '✓') : ''}`}
-            title={autoCommit
-              ? `自动提交${autoCommitPush ? '+推送' : ''}：开（点击${autoCommitPush ? '关闭' : '切换到+推送'}）`
-              : '自动提交：关（点击开启）'}
-            active={autoCommit}
-            compact={isMobile}
-            onClick={() => {
-              if (!autoCommit) {
-                onAutoCommitChange(true, false);
-              } else if (!autoCommitPush) {
-                onAutoCommitChange(true, true);
-              } else {
-                onAutoCommitChange(false);
-              }
-            }}
-          />
-        )}
-        {/* ★ 自动 commit 模型选择（多后端时显示） */}
-        {autoCommit && onAutoCommitChange && backends.length > 1 && (
-          <ToolbarBtn
-            icon="⚙️"
-            title={`AI 提交模型：${autoCommitBackendId ? (backends.find(b => b.id === autoCommitBackendId)?.label || autoCommitBackendId) : '跟随会话'}（点击切换）`}
-            compact={isMobile}
-            onClick={() => {
-              // 循环：会话主模型 → backend[0] → backend[1] → ... → 会话主模型
-              const currentIdx = autoCommitBackendId ? backends.findIndex(b => b.id === autoCommitBackendId) : -1;
-              const nextIdx = (currentIdx + 1) % (backends.length + 1);
-              const bid = nextIdx < backends.length ? backends[nextIdx].id : '';
-              onAutoCommitChange(autoCommit, autoCommitPush, bid);
-            }}
           />
         )}
         {/* ★ 流式进度指示器 */}

@@ -6,6 +6,8 @@ venv/
 dist/
 build/
 *.spec
+!agent-with-u-web.spec
+agent-with-u-web-auth.json
 *.egg-info/
 .env
 node_modules/

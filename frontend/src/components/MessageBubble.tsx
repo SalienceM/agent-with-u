@@ -489,7 +489,7 @@ const ToolOutputImage: React.FC<{
 
 const ToolCallBlock: React.FC<{ tc: ToolCall; allTools?: ToolCall[] }> = memo(function ToolCallBlock({ tc, allTools }) {
   // ★ 从 tool output 中提取 markdown 图片，支持 generate-image 等 skill 结果
-  const { text: outputText } = tc.output ? extractImagesFromOutput(tc.output) : { images: [], text: tc.output || '' };
+  const { text: outputText } = tc.output ? extractImagesFromOutput(tc.output) : { text: '' };
 
   // ★ Task（子 agent 派发器）默认展开，让用户看到子 agent 正在干什么
   const isTask = tc.name === 'Task';

@@ -222,10 +222,7 @@ export function listRelayDevices(
  *   - Vite dev：前端 dev server 与后端分离，连 ws://127.0.0.1:44321
  *   - 生产 Web（反代后）：连 wss?://<当前host>/ws，由反代转发到后端
  */
-async function getWsUrl(): Promise<string> {
-  if (connectionTarget.mode === 'relay') {
-    return connectionTarget.url;
-  }
+async function getLocalWsUrl(): Promise<string> {
   if (isTauri()) {
     const port = await getWsPort();
     return `ws://127.0.0.1:${port}`;
@@ -233,6 +230,10 @@ async function getWsUrl(): Promise<string> {
   if (import.meta.env.DEV) {
     return `ws://127.0.0.1:${WS_PORT_DEFAULT}`;
   }
+  const portableUrl = (window as typeof window & {
+    __AGENT_WITH_U_WS_URL__?: string;
+  }).__AGENT_WITH_U_WS_URL__;
+  if (portableUrl) return portableUrl;
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
   return `${proto}://${location.host}/ws`;
 }
@@ -372,8 +373,11 @@ class Conn {
   get isOpen(): boolean { return !!this.ws && this.ws.readyState === WebSocket.OPEN; }
 
   private async resolveUrl(): Promise<string> {
-    // 本机节点的地址解析沿用原逻辑(tauri sidecar / dev / 反代);中继节点用自带 url。
-    return this.target.mode === 'relay' ? this.target.url : getWsUrl();
+    // Resolve from this connection's own target.  Reading the global home
+    // target here made an additional local connection accidentally reuse the
+    // relay URL whenever home was remote, so a healthy desktop sidecar was
+    // never contacted.
+    return this.target.mode === 'relay' ? this.target.url : getLocalWsUrl();
   }
 
   connect(): void {
@@ -951,19 +955,11 @@ export const api = {
       // 注入归属执行节点信息(后端的 session 对象本身没有),供目录同步等按节点路由。
       if (s && s.id) {
         const storedKey = sessionExec.get(s.id);
-        // ★ 修复：检查 storedKey 是否与当前 home 节点一致，避免跨环境切换时路由错误
-        // 例如：之前在远端直连时记录了 'local'（远端的本地），现在通过中继访问，
-        // 连接池中也有 'local'（本机的本地），但 session 实际属于远端节点。
         let key = homeConn.key;
         if (storedKey && pool.has(storedKey)) {
-          const storedConn = pool.get(storedKey);
-          // 如果 storedKey 是 'local' 但当前 home 不是本地连接，说明是跨环境残留记录
-          if (storedKey === 'local' && homeConn.key !== 'local') {
-            sessionExec.delete(s.id);
-            persistSessionExec();
-          } else if (storedConn) {
-            key = storedKey;
-          }
+          // 归属一旦由 listSessions/createSession 确认，就必须信任该执行节点。
+          // home 只是“新会话默认落点”，不能覆盖已有会话的 local/relay 归属。
+          key = storedKey;
         } else if (storedKey) {
           sessionExec.delete(s.id);
           persistSessionExec();
@@ -1847,6 +1843,18 @@ export const api = {
       return { ok: !!d?.ok, lines: d?.lines || [], path: d?.path, error: d?.error };
     } catch {
       return { ok: false, lines: [], error: 'parse error' };
+    }
+  },
+
+  /** 读取本机 Tauri/Rust 桌面日志；不依赖 Python 后端或远端连接。 */
+  async getDesktopLogs(maxLines = 500): Promise<{ ok: boolean; lines: string[]; path?: string; error?: string }> {
+    if (!isTauri()) return { ok: false, lines: [], error: '仅桌面客户端提供本机日志' };
+    try {
+      const { invoke } = await import('@tauri-apps/api/core');
+      const r = await invoke<any>('get_desktop_logs', { maxLines });
+      return { ok: !!r?.ok, lines: r?.lines || [], path: r?.path, error: r?.error };
+    } catch (error) {
+      return { ok: false, lines: [], error: String(error) };
     }
   },
 };

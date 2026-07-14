@@ -1,5 +1,5 @@
 import React, { useEffect, useState, useCallback, memo, useRef, useMemo } from 'react';
-import { api } from '../api';
+import { api, onExecStatus } from '../api';
 import { FileTreePanel } from './FileTreePanel';
 
 interface Session {
@@ -46,6 +46,8 @@ interface Props {
 // ★ Wrap with React.memo to prevent unnecessary re-renders when parent updates
 export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession, onNewSession, onDeleteSession, onAcknowledgeSession, streamingSessions, completedSessions = new Set(), collapsed, onToggleCollapse, isMobile, width, activeWorkingDir, activeExecKey, activeExecLabel, activeExecMode, activeBackendId }) => {
   const [sessions, setSessions] = useState<Session[]>([]);
+  const refreshGenerationRef = useRef(0);
+  const refreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   // ★ 侧栏视图：会话列表 / 文件目录树（本地 ⇄ 远端），左侧小按钮切换
   const [view, setView] = useState<'sessions' | 'files'>('sessions');
   const [backends, setBackends] = useState<Backend[]>([]);
@@ -62,10 +64,24 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
 
   // ★ Memoize refresh function to avoid re-creating it on every render
   const refresh = useCallback(async () => {
-    const sessionList = await api.listSessions();
-    sessionList.sort((a: any, b: any) => (b.updatedAt || 0) - (a.updatedAt || 0));
-    setSessions(sessionList);
+    const generation = ++refreshGenerationRef.current;
+    try {
+      const sessionList = await api.listSessions();
+      if (generation !== refreshGenerationRef.current) return;
+      sessionList.sort((a: any, b: any) => (b.updatedAt || 0) - (a.updatedAt || 0));
+      setSessions(sessionList);
+    } catch (error) {
+      console.warn('[Sidebar] failed to refresh sessions', error);
+    }
   }, []);
+
+  const scheduleRefresh = useCallback((delay = 80) => {
+    if (refreshTimerRef.current) clearTimeout(refreshTimerRef.current);
+    refreshTimerRef.current = setTimeout(() => {
+      refreshTimerRef.current = null;
+      refresh();
+    }, delay);
+  }, [refresh]);
 
   // ★ 能力绑定
   const openAbilityPicker = useCallback(async (session: Session, e: React.MouseEvent) => {
@@ -213,6 +229,42 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
     window.addEventListener('focus', handleFocus);
     return () => window.removeEventListener('focus', handleFocus);
   }, [refresh]);
+
+  // 会话列表跟随服务端事件和执行节点状态即时变化。summary 先乐观更新，
+  // 再短延迟拉取一次索引，兼顾视觉即时性和多节点最终一致性。
+  useEffect(() => {
+    const unsubscribeSession = api.onSessionUpdated((data: any) => {
+      const sessionId = data?.sessionId;
+      if (data?.type === 'session_deleted' && sessionId) {
+        setSessions((prev) => prev.filter((session) => session.id !== sessionId));
+      } else if (data?.type === 'session_renamed' && sessionId) {
+        setSessions((prev) => prev.map((session) => (
+          session.id === sessionId ? { ...session, title: data.title || session.title } : session
+        )));
+      } else if (data?.summary?.id) {
+        setSessions((prev) => {
+          const index = prev.findIndex((session) => session.id === data.summary.id);
+          if (index < 0) return prev;
+          const next = [...prev];
+          next[index] = { ...next[index], ...data.summary };
+          next.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+          return next;
+        });
+      }
+      scheduleRefresh(120);
+    });
+    const unsubscribeStream = api.onStreamDelta((delta: any) => {
+      if (delta?.type === 'done' || delta?.type === 'error') scheduleRefresh(150);
+    });
+    const unsubscribeExec = onExecStatus(() => scheduleRefresh(0));
+    return () => {
+      unsubscribeSession();
+      unsubscribeStream();
+      unsubscribeExec();
+      if (refreshTimerRef.current) clearTimeout(refreshTimerRef.current);
+      refreshTimerRef.current = null;
+    };
+  }, [scheduleRefresh]);
 
   const getBackendShortLabel = useCallback((backendId: string) => {
     const backend = backends.find((b) => b.id === backendId);

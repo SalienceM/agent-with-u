@@ -12,6 +12,10 @@ import { ErrorBoundary } from './components/ErrorBoundary';
 // 如果 React 因模块级错误无法渲染，此处理器直接往 DOM 写诊断信息，避免白屏。
 let _reactMounted = false;
 window.addEventListener('error', (ev) => {
+  void import('@tauri-apps/api/core').then(({ invoke }) => invoke('report_desktop_log', {
+    source: 'frontend-error',
+    message: String(ev.error?.stack || ev.error || ev.message || 'Unknown error'),
+  })).catch(() => {});
   if (_reactMounted) return; // React 已接管，交给 ErrorBoundary
   const root = document.getElementById('root');
   if (!root || root.hasChildNodes()) return;
@@ -39,6 +43,10 @@ window.addEventListener('error', (ev) => {
 });
 window.addEventListener('unhandledrejection', (ev) => {
   console.error('[main] Unhandled promise rejection:', ev.reason);
+  void import('@tauri-apps/api/core').then(({ invoke }) => invoke('report_desktop_log', {
+    source: 'frontend-rejection',
+    message: String(ev.reason?.stack || ev.reason || 'Unknown rejection'),
+  })).catch(() => {});
 });
 
 // 全局流路由：所有 session 的 streamDelta 都进 streamStates Map,不论 UI 当前

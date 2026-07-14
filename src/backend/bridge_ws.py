@@ -6537,6 +6537,7 @@ except urllib.error.URLError as e:
             payload = json.loads(payload_json)
             session_id = payload["sessionId"]
             content = payload["content"]
+            display_content = content
             backend_id = payload["backendId"]
             raw_images = payload.get("images")
             auto_continue = payload.get("autoContinue", True)
@@ -6625,6 +6626,16 @@ except urllib.error.URLError as e:
                 backend_id=backend_id, streaming=True,
             )
             session.messages.append(assistant_msg)
+
+            # 让所有客户端立即更新会话列表，不必等整轮模型响应结束。
+            session.updated_at = time.time()
+            if session.title in ("新会话", "New session", "") and display_content:
+                session.title = display_content[:50]
+            self._emit_session_updated({
+                "type": "session_changed",
+                "sessionId": session.id,
+                "summary": session.meta_dict(),
+            })
 
             # ★ 每次发消息前重新部署 Backend Skill 文件，确保 SKILL.md 始终是最新模板
             self._sync_backend_skills_to_directory(session)
@@ -7014,6 +7025,11 @@ except urllib.error.URLError as e:
         if session.title in ("新会话", "New session", "") and content:
             session.title = content[:50]
         self._session_store.save(session, async_=True)
+        self._emit_session_updated({
+            "type": "session_changed",
+            "sessionId": session.id,
+            "summary": session.meta_dict(),
+        })
 
         # ★ 自动 AI commit：对话完成后自动 stage-all → AI 生成 message → commit → push
         if session.auto_commit:

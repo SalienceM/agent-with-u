@@ -14,6 +14,7 @@ const EMPTY: SmoothGhostState = {
   backendLabel: '',
   question: '',
   answer: '',
+  historyText: '',
   isStreaming: false,
   updatedAt: Date.now(),
 };
@@ -64,7 +65,7 @@ export const SmoothGhostWindow: React.FC = () => {
           </div>
         </section>
       </div>
-      <div style={footerStyle}>SMOOTH GHOST · Alt + 左键双击隐藏</div>
+      <div style={footerStyle}>SMOOTH GHOST · 左 Shift + 左键双击隐藏</div>
     </div>
   );
 };
@@ -89,4 +90,3 @@ const questionStyle: React.CSSProperties = { padding: '9px 11px', borderRadius: 
 const answerStyle: React.CSSProperties = { flex: 1, minHeight: 0, overflow: 'hidden', color: '#e2e8f0', fontSize: 13, lineHeight: 1.62, whiteSpace: 'pre-wrap', wordBreak: 'break-word', maskImage: 'linear-gradient(to bottom, black 88%, transparent 100%)' };
 const cursorStyle: React.CSSProperties = { color: '#22d3ee', marginLeft: 2, animation: 'blink 1s step-end infinite' };
 const footerStyle: React.CSSProperties = { padding: '0 18px 9px', color: 'rgba(148,163,184,.55)', fontSize: 9, letterSpacing: '.11em', textAlign: 'right' };
-

@@ -12,9 +12,142 @@ mod hacker_mode;
 
 const WS_PORT: u16 = 44321;
 static APP_EXITING: AtomicBool = AtomicBool::new(false);
+static DESKTOP_LOG_LOCK: Mutex<()> = Mutex::new(());
+
+fn desktop_log_path() -> PathBuf {
+    if cfg!(target_os = "windows") {
+        std::env::var_os("APPDATA")
+            .map(PathBuf::from)
+            .or_else(dirs::data_local_dir)
+            .or_else(dirs::home_dir)
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("AgentWithU")
+            .join("logs")
+            .join("desktop.log")
+    } else {
+        dirs::home_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join(".agent-with-u")
+            .join("logs")
+            .join("desktop.log")
+    }
+}
+
+pub(crate) fn desktop_log(message: impl AsRef<str>) {
+    use std::io::Write;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let Ok(_guard) = DESKTOP_LOG_LOCK.lock() else {
+        return;
+    };
+    let path = desktop_log_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    // Keep diagnostics bounded because Smooth gestures can run for days.
+    if path
+        .metadata()
+        .map(|meta| meta.len() > 4 * 1024 * 1024)
+        .unwrap_or(false)
+    {
+        let rotated = path.with_extension("log.old");
+        let _ = std::fs::remove_file(&rotated);
+        let _ = std::fs::rename(&path, rotated);
+    }
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or(0);
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let clean = message.as_ref().replace(['\r', '\n'], " ");
+        let _ = writeln!(file, "[{timestamp}] {clean}");
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DesktopLogResponse {
+    ok: bool,
+    lines: Vec<String>,
+    path: String,
+    error: Option<String>,
+}
+
+#[tauri::command]
+fn get_desktop_logs(max_lines: Option<usize>) -> DesktopLogResponse {
+    let path = desktop_log_path();
+    let limit = max_lines.unwrap_or(800).clamp(1, 5000);
+    match std::fs::read_to_string(&path) {
+        Ok(content) => {
+            let mut lines = content
+                .lines()
+                .rev()
+                .take(limit)
+                .map(str::to_owned)
+                .collect::<Vec<_>>();
+            lines.reverse();
+            DesktopLogResponse {
+                ok: true,
+                lines,
+                path: path.to_string_lossy().into_owned(),
+                error: None,
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => DesktopLogResponse {
+            ok: true,
+            lines: Vec::new(),
+            path: path.to_string_lossy().into_owned(),
+            error: None,
+        },
+        Err(error) => DesktopLogResponse {
+            ok: false,
+            lines: Vec::new(),
+            path: path.to_string_lossy().into_owned(),
+            error: Some(error.to_string()),
+        },
+    }
+}
+
+#[tauri::command]
+fn report_desktop_log(source: String, message: String) {
+    let source = source.replace(['\r', '\n'], " ");
+    let message = message.replace(['\r', '\n'], " ");
+    desktop_log(format!(
+        "[{}] {}",
+        source.chars().take(40).collect::<String>(),
+        message.chars().take(2000).collect::<String>()
+    ));
+}
 
 #[derive(Default)]
 struct BackendProcess(Mutex<Option<CommandChild>>);
+
+#[cfg(target_os = "windows")]
+fn kill_windows_process_tree(pid: u32) -> bool {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    std::process::Command::new("taskkill")
+        .args(["/F", "/T", "/PID", &pid.to_string()])
+        .creation_flags(CREATE_NO_WINDOW)
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+#[cfg(target_os = "windows")]
+fn backend_pid_file() -> Option<PathBuf> {
+    std::env::var_os("APPDATA")
+        .map(PathBuf::from)
+        .or_else(dirs::home_dir)
+        .map(|base| {
+            base.join("AgentWithU")
+                .join(format!("backend_{WS_PORT}.pid"))
+        })
+}
 
 fn stop_backend_child(app: &tauri::AppHandle) {
     let child = app
@@ -23,27 +156,53 @@ fn stop_backend_child(app: &tauri::AppHandle) {
         .lock()
         .ok()
         .and_then(|mut guard| guard.take());
-    let Some(child) = child else { return };
-
     #[cfg(target_os = "windows")]
     {
         // PyInstaller onefile starts a parent bootstrapper plus the actual
-        // Python child. Kill the complete tree or the 9 MB bootstrapper stays
-        // orphaned after every desktop restart.
-        let pid = child.pid().to_string();
-        let killed_tree = std::process::Command::new("taskkill")
-            .args(["/F", "/T", "/PID", &pid])
-            .status()
-            .map(|status| status.success())
-            .unwrap_or(false);
-        if !killed_tree {
-            let _ = child.kill();
+        // Python child. Kill both the shell-plugin parent and the runtime PID
+        // recorded by ws_main. The latter is essential when the in-memory
+        // handle was lost or the onefile bootstrapper already changed shape.
+        let child_pid = child.as_ref().map(CommandChild::pid);
+        if let Some(pid) = child_pid {
+            if !kill_windows_process_tree(pid) {
+                if let Some(child) = child {
+                    let _ = child.kill();
+                }
+            }
+        }
+        if let Some(pid_file) = backend_pid_file() {
+            if let Ok(text) = std::fs::read_to_string(&pid_file) {
+                if let Ok(pid) = text.trim().parse::<u32>() {
+                    if Some(pid) != child_pid {
+                        let _ = kill_windows_process_tree(pid);
+                    }
+                }
+            }
+            let _ = std::fs::remove_file(pid_file);
         }
     }
     #[cfg(not(target_os = "windows"))]
     {
-        let _ = child.kill();
+        if let Some(child) = child {
+            let _ = child.kill();
+        }
     }
+}
+
+fn quit_app_completely(app: &tauri::AppHandle) {
+    if APP_EXITING.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    stop_backend_child(app);
+    app.exit(0);
+
+    // The tray action explicitly means force quit.  If a plugin or native
+    // hook keeps Tauri's event loop alive, do not leave an invisible process
+    // behind indefinitely.
+    std::thread::spawn(|| {
+        std::thread::sleep(std::time::Duration::from_millis(800));
+        std::process::exit(0);
+    });
 }
 
 #[tauri::command]
@@ -227,7 +386,14 @@ fn open_log_viewer(_app: tauri::AppHandle) -> Result<(), String> {
             log_path
         );
         let _ = std::process::Command::new("cmd")
-            .args(["/C", "start", "AgentWithU Logs", "powershell", "-NoExit", "-Command"])
+            .args([
+                "/C",
+                "start",
+                "AgentWithU Logs",
+                "powershell",
+                "-NoExit",
+                "-Command",
+            ])
             .arg(&ps_command)
             .spawn();
     }
@@ -469,6 +635,10 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .setup(|app| {
+            desktop_log(format!(
+                "[startup] app setup started; version={}",
+                app.package_info().version
+            ));
             // Close-to-tray keeps Smooth and background answers alive.  The
             // explicit tray Quit action is the only full application exit.
             use tauri::menu::{Menu, MenuItem};
@@ -491,9 +661,7 @@ pub fn run() {
                         }
                     }
                     "quit" => {
-                        APP_EXITING.store(true, Ordering::SeqCst);
-                        stop_backend_child(app);
-                        app.exit(0);
+                        quit_app_completely(app);
                     }
                     _ => {}
                 })
@@ -599,11 +767,15 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             get_ws_port,
+            get_desktop_logs,
+            report_desktop_log,
             open_log_viewer,
             open_screenshot_tool,
             read_local_clipboard_image,
             hacker_mode::configure_hacker_monitor,
             hacker_mode::capture_hacker_screenshot,
+            hacker_mode::update_smooth_ghost_state,
+            hacker_mode::open_smooth_region_selector,
             hacker_mode::finish_smooth_region,
             get_desktop_config,
             set_desktop_config,

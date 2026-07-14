@@ -34,7 +34,9 @@ import ipaddress
 import logging
 import secrets
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Any, Optional
+
+from .device_auth import cookie_value
 
 
 log = logging.getLogger(__name__)
@@ -53,12 +55,15 @@ class AuthConfig:
     auth_token: Optional[str] = None
     trust_forward_auth: bool = False
     trusted_proxies: list[str] = field(default_factory=list)
+    device_auth: Optional[Any] = None
 
     def mode(self) -> str:
         if self.trust_forward_auth:
             return "forward-auth"
         if self.auth_token:
             return "token"
+        if self.device_auth is not None:
+            return "device"
         return "loopback"
 
     def describe(self) -> str:
@@ -67,6 +72,8 @@ class AuthConfig:
             return f"forward-auth (trusted_proxies={self.trusted_proxies or ['127.0.0.1', '::1']})"
         if m == "token":
             return "token (Bearer header or ?token=… query)"
+        if m == "device":
+            return "device-code (HttpOnly browser session, 12h default)"
         nets = self.trusted_proxies or ["127.0.0.1", "::1"]
         return f"loopback (trusted peers={nets}, identity=local)"
 
@@ -188,6 +195,33 @@ class AuthGuard:
             return None
 
         # loopback 模式：peer 必须落在 trusted_proxies（默认仅 127.0.0.1 / ::1）
+        if mode == "device":
+            store = self.config.device_auth
+            peer_text = store.client_ip(
+                str(peer) if peer is not None else "unknown",
+                self._get_header(request, "x-real-ip") or "",
+                self._get_header(request, "x-forwarded-for") or "",
+            )
+            if store.is_blocked(peer_text):
+                log.warning("[auth] reject blocked device-login IP %s", peer_text)
+                return connection.respond(
+                    http.HTTPStatus.FORBIDDEN,
+                    "forbidden: this IP is temporarily blocked\n",
+                )
+            token = cookie_value(self._get_header(request, "cookie"))
+            if not store.validate(peer_text, token, touch=True):
+                log.warning("[auth] reject %s: missing or expired device session", peer_text)
+                return connection.respond(
+                    http.HTTPStatus.UNAUTHORIZED,
+                    "unauthorized: device login required\n",
+                )
+            connection.identity = f"device:{peer_text}"
+            connection.identity_email = None
+            connection.identity_groups = []
+            connection.identity_src = "device"
+            log.info("[auth] accept %s via device session", peer_text)
+            return None
+
         if not self._peer_in_trusted(peer):
             log.warning("[auth] reject %s: peer not in trusted_proxies (loopback mode)", peer)
             return connection.respond(

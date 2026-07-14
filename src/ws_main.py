@@ -293,6 +293,24 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
                    help="stable id for this executor node (default: auto-generated & persisted)")
     p.add_argument("--device-name", default=os.environ.get("AGENT_WITH_U_DEVICE_NAME") or None,
                    help="human-readable name for this executor node shown in the UI device list")
+    p.add_argument("--web", action="store_true", default=_envbool("AGENT_WITH_U_WEB"),
+                   help="serve the bundled browser UI with rotating device-code authentication")
+    p.add_argument("--web-port", type=int,
+                   default=int(os.environ.get("AGENT_WITH_U_WEB_PORT", "44320")),
+                   help="portable web UI port (default 44320)")
+    p.add_argument("--web-root", default=os.environ.get("AGENT_WITH_U_WEB_ROOT") or None,
+                   help="frontend dist directory (normally bundled into the executable)")
+    p.add_argument("--public-ws-url", default=os.environ.get("AGENT_WITH_U_PUBLIC_WS_URL", ""),
+                   help="optional externally visible ws:// or wss:// URL injected into the web UI")
+    p.add_argument("--device-session-hours", type=float,
+                   default=float(os.environ.get("AGENT_WITH_U_DEVICE_SESSION_HOURS", "12")),
+                   help="browser device-login lifetime in hours (default 12)")
+    p.add_argument("--device-block-hours", type=float,
+                   default=float(os.environ.get("AGENT_WITH_U_DEVICE_BLOCK_HOURS", "12")),
+                   help="IP block duration after three failures in hours (default 12)")
+    p.add_argument("--web-trust-loopback-proxy", action="store_true",
+                   default=_envbool("AGENT_WITH_U_WEB_TRUST_LOOPBACK_PROXY"),
+                   help="trust X-Real-IP/X-Forwarded-For only when the direct peer is loopback")
     return p.parse_args(argv)
 
 
@@ -341,6 +359,22 @@ def build_auth_config(args: argparse.Namespace) -> AuthConfig:
     )
 
 
+def _portable_runtime_dir() -> Path:
+    """Directory beside the portable executable; audit JSON lives here."""
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path.cwd().resolve()
+
+
+def _resolve_web_root(explicit: Optional[str]) -> Path:
+    if explicit:
+        return Path(explicit).expanduser().resolve()
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        return (Path(meipass) / "frontend_dist").resolve()
+    return (Path(__file__).resolve().parents[1] / "frontend" / "dist").resolve()
+
+
 def _validate_auth_for_bind(cfg: AuthConfig) -> None:
     """非 loopback 绑定 + 无任何访问控制 = 拒绝启动，避免裸跑暴露到局域网。
 
@@ -362,13 +396,45 @@ def _validate_auth_for_bind(cfg: AuthConfig) -> None:
 
 async def main():
     args = parse_args()
+    device_auth = None
+    if args.web:
+        from .backend.device_auth import DeviceAuthStore
+        device_auth = DeviceAuthStore(
+            _portable_runtime_dir() / "agent-with-u-web-auth.json",
+            session_seconds=int(max(1 / 60, args.device_session_hours) * 3600),
+            max_failures=3,
+            block_seconds=int(max(1 / 60, args.device_block_hours) * 3600),
+            trust_loopback_proxy=bool(args.web_trust_loopback_proxy),
+        )
     auth_cfg = build_auth_config(args)
+    auth_cfg.device_auth = device_auth
 
     # 初始化日志系统
     log_file = setup_logging()
     logging.info(f"[ws_main] AgentWithU backend v{APP_VERSION} starting")
     logging.info(f"[ws_main] Log file: {log_file}")
     logging.info(f"[ws_main] Auth mode: {auth_cfg.describe()}")
+
+    if device_auth is not None:
+        access_host = "127.0.0.1" if args.bind in ("0.0.0.0", "::") else args.bind
+        try:
+            import socket
+            lan_host = socket.gethostbyname(socket.gethostname())
+        except Exception:
+            lan_host = access_host
+        banner = (
+            "\n"
+            "============================================================\n"
+            " AgentWithU Portable Web\n"
+            f" Device code : {device_auth.device_code}\n"
+            f" Local URL   : http://{access_host}:{args.web_port}\n"
+            f" LAN URL     : http://{lan_host}:{args.web_port}\n"
+            f" Session     : {args.device_session_hours:g} hours\n"
+            f" IP guard    : 3 wrong attempts => blocked {args.device_block_hours:g} hours\n"
+            f" Audit JSON  : {device_auth.state_path}\n"
+            "============================================================\n"
+        )
+        print(banner, flush=True)
 
     _validate_auth_for_bind(auth_cfg)
 
@@ -383,6 +449,9 @@ async def main():
     cli_path = find_bundled_claude()
     auth_guard = AuthGuard(auth_cfg)
     bridge = BridgeWS(cli_path=cli_path, auth_guard=auth_guard)
+    # Keep the historical default (44321 -> 44322) while allowing isolated
+    # portable instances and tests to move the complete port triplet together.
+    bridge._HTTP_API_PORT = args.port + 1
 
     logging.info(f"[ws_main] Starting WebSocket server on ws://{args.bind}:{args.port}")
     try:
@@ -395,9 +464,27 @@ async def main():
         )
         # ★ Backend Skill HTTP API（供 SKILL.md 通过 curl 回调、图片/素材服务）
         # 绑定地址与 WS 一致：反代与后端不同容器/主机时也能连到。
-        http_server = await bridge.start_http_api(args.bind)
+        # Portable web mode exposes /api only through the authenticated web
+        # listener. The raw skill callback port remains loopback-only.
+        http_api_bind = "127.0.0.1" if device_auth is not None else args.bind
+        http_server = await bridge.start_http_api(http_api_bind)
+        web_http_server = None
+        if device_auth is not None:
+            from .web_server import PortableWebServer
+            web_http_server = await PortableWebServer(
+                bind_host=args.bind,
+                port=args.web_port,
+                ws_port=args.port,
+                web_root=_resolve_web_root(args.web_root),
+                auth=device_auth,
+                bridge=bridge,
+                public_ws_url=args.public_ws_url,
+            ).start()
     except OSError as e:
         logging.error(f"[ws_main] Cannot bind {args.bind}:{args.port} even after clearing old instance: {e}")
+        sys.exit(1)
+    except RuntimeError as e:
+        logging.error("[ws_main] Web UI startup failed: %s", e)
         sys.exit(1)
 
     # ★ 中继链路（C–C/S）：若配置了 --relay-url，本执行节点额外拨出一条

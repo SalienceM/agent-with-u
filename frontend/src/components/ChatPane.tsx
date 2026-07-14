@@ -99,13 +99,9 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
 }) => {
   // ── pane 自己的 session 详情(workingDir / backendId / skip / sandbox) ──
   const [activeSession, setActiveSession] = useState<any | null>(null);
+  const [nodeBackends, setNodeBackends] = useState<any[]>(backends);
   // 权限 state: 初值从 session 读,变化时持久化
   const [skipPermissions, setSkipPermissions] = useState(true);
-  // ★ 自动 AI commit 状态
-  const [autoCommit, setAutoCommit] = useState(false);
-  const [autoCommitPush, setAutoCommitPush] = useState(false);
-  const [autoCommitBackendId, setAutoCommitBackendId] = useState<string>('');
-  const [autoCommitToast, setAutoCommitToast] = useState<{ msg: string; ok: boolean } | null>(null);
   // 可见消息条数(切换 session / 切回历史时只显示最近几条)
   // visibleCount 已废:历史分页由后端 + chat.loadEarlier() 控制,前端不再折叠
 
@@ -135,21 +131,29 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
       if (session?.skipPermissions !== undefined) {
         setSkipPermissions(session.skipPermissions);
       }
-      // ★ 加载自动 commit 设置
-      api.getAutoCommit(sessionId).then((ac) => {
-        if (cancelled) return;
-        setAutoCommit(ac.autoCommit);
-        setAutoCommitPush(ac.autoCommitPush);
-        setAutoCommitBackendId(ac.autoCommitBackendId || '');
-      }).catch(() => {});
     });
     return () => {
       cancelled = true;
     };
   }, [sessionId]);
 
-  // 后端 ID:从 session 拿,fallback 到 backends[0]
-  const activeBackendId = activeSession?.backendId || backends[0]?.id || '';
+  // Backend configuration belongs to the executor that owns the session.
+  useEffect(() => {
+    const execKey = activeSession?.execKey;
+    if (!execKey) {
+      setNodeBackends(backends);
+      return;
+    }
+    let cancelled = false;
+    setNodeBackends([]);
+    api.getBackends(execKey)
+      .then((list) => { if (!cancelled) setNodeBackends(Array.isArray(list) ? list : []); })
+      .catch(() => { if (!cancelled) setNodeBackends([]); });
+    return () => { cancelled = true; };
+  }, [activeSession?.execKey, backends]);
+
+  const effectiveBackends = activeSession?.execKey ? nodeBackends : backends;
+  const activeBackendId = activeSession?.backendId || effectiveBackends[0]?.id || '';
 
   // ── /new 命令处理:复用 workingDir + backendId,免弹窗静默新建 ──
   // 注意:静默新建会切换当前 pane 的 session,需要走 onRequestNewSession 上抛
@@ -167,7 +171,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
   const chat = useChat(
     sessionId || '',
     activeBackendId,
-    backends,
+    effectiveBackends,
     skipPermissions,
     handleQuickNewSession,
     handleClearContext,
@@ -320,51 +324,6 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
     [sessionId, activeBackendId],
   );
 
-  // ── ★ 自动 AI commit 切换 ──
-  const handleAutoCommitChange = useCallback(
-    (enabled: boolean, push?: boolean, backendId?: string) => {
-      const newPush = push ?? autoCommitPush;
-      const newBackend = backendId ?? autoCommitBackendId;
-      setAutoCommit(enabled);
-      if (push !== undefined) setAutoCommitPush(newPush);
-      if (backendId !== undefined) setAutoCommitBackendId(newBackend);
-      if (sessionId) {
-        api.setAutoCommit(sessionId, enabled, newPush, newBackend);
-      }
-    },
-    [sessionId, autoCommitPush, autoCommitBackendId],
-  );
-
-  // ── ★ 自动 commit 结果通知 ──
-  useEffect(() => {
-    const unsub = api.onAutoCommitResult((data) => {
-      if (data.sessionId !== sessionId) return;
-      let msg = '';
-      let ok = true;
-      if (data.status === 'skipped') {
-        msg = '⏭ 无变更，跳过提交';
-      } else if (data.status === 'notRepo') {
-        msg = '⚠ 非 Git 仓库，跳过自动提交';
-      } else if (data.status === 'pushFailed') {
-        msg = `✅ 已提交，但 push 失败${data.error ? `: ${data.error}` : ''}`;
-        ok = false;
-      } else if (data.status === 'success') {
-        msg = data.pushed
-          ? `✅ 已提交并推送 (${data.files || 0} 文件)`
-          : `✅ 已提交 (${data.files || 0} 文件)`;
-      } else if (data.status === 'error') {
-        msg = `❌ 自动提交失败: ${data.error || '未知错误'}`;
-        ok = false;
-      } else {
-        return;
-      }
-      setAutoCommitToast({ msg, ok });
-      setTimeout(() => setAutoCommitToast(null), 5000);
-    });
-    return unsub;
-  }, [sessionId]);
-
-
   const handleCompact = useCallback(() => {
     handleClearContext();
   }, [handleClearContext]);
@@ -382,6 +341,28 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
     };
   }, [chat.messages]);
 
+  // Native ghost receives a bounded tail of the loaded conversation. Building
+  // from the end keeps the newest turns complete while avoiding oversized IPC
+  // payloads during token streaming.
+  const ghostHistoryText = useMemo(() => {
+    const maxChars = 48_000;
+    const chunks: string[] = [];
+    let used = 0;
+    for (let index = chat.messages.length - 1; index >= 0; index -= 1) {
+      const message = chat.messages[index];
+      if ((message.role !== 'user' && message.role !== 'assistant') || !message.content?.trim()) continue;
+      const label = message.role === 'user' ? '你' : 'AgentWithU';
+      let chunk = `${label}：\n${message.content.trim()}`;
+      const remaining = maxChars - used;
+      if (remaining <= 0) break;
+      if (chunk.length > remaining) chunk = `…${chunk.slice(chunk.length - remaining + 1)}`;
+      chunks.unshift(chunk);
+      used += chunk.length + 2;
+      if (used >= maxChars) break;
+    }
+    return chunks.join('\n\n');
+  }, [chat.messages]);
+
   // The ghost window receives only the focused pane's concise latest state.
   // This callback is throttled by App before crossing the Tauri window boundary.
   useEffect(() => {
@@ -395,17 +376,18 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
     for (let index = chat.messages.length - 1; index > lastUserIndex; index -= 1) {
       if (chat.messages[index].role === 'assistant') { lastAssistant = chat.messages[index]; break; }
     }
-    const backend = backends.find((item) => item.id === activeBackendId);
+    const backend = effectiveBackends.find((item) => item.id === activeBackendId);
     onGhostStateChange({
       sessionId,
       sessionTitle: activeSession?.title || activeSession?.name || 'AgentWithU',
       backendLabel: backend?.label || backend?.name || activeBackendId || '',
       question: lastUser?.content || '',
       answer: lastAssistant?.content || '',
+      historyText: ghostHistoryText,
       isStreaming: chat.isStreaming,
       updatedAt: Date.now(),
     });
-  }, [isFocused, sessionId, chat.messages, chat.isStreaming, activeSession, activeBackendId, backends, onGhostStateChange]);
+  }, [isFocused, sessionId, chat.messages, chat.isStreaming, activeSession, activeBackendId, effectiveBackends, ghostHistoryText, onGhostStateChange]);
 
   // ── 自动滚到底部 ──
   useEffect(() => {
@@ -767,7 +749,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
         onSend={handleUserSend}
         onAbort={chat.abort}
         isStreaming={chat.isStreaming}
-        backends={backends}
+        backends={effectiveBackends}
         activeBackendId={activeBackendId}
         sessionId={sessionId || undefined}
         workingDir={activeSession?.workingDir || undefined}
@@ -792,10 +774,6 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
         isFocused={isFocused}
         execKey={activeSession?.execKey}
         execMode={activeSession?.execMode}
-        autoCommit={autoCommit}
-        autoCommitPush={autoCommitPush}
-        autoCommitBackendId={autoCommitBackendId}
-        onAutoCommitChange={handleAutoCommitChange}
       />
 
       {/* ---- By the way 旁路问答：浮动入口 + 抽屉 ---- */}
@@ -807,42 +785,11 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
             style={byTheWayFab}
           >💬</button>
           <ByTheWayDrawer sessionId={sessionId} open={byTheWayOpen} onClose={() => setByTheWayOpen(false)}
-            backends={backends}
+            backends={effectiveBackends}
             onSendToChat={(text) => { if (!isStreamingRef.current) doSendRef.current(text); }} />
         </>
       )}
 
-      {/* ---- ★ 自动 commit 结果通知 ---- */}
-      {autoCommitToast && (
-        <div style={{
-          position: 'absolute',
-          bottom: 80,
-          left: '50%',
-          transform: 'translateX(-50%)',
-          background: autoCommitToast.ok
-            ? 'var(--theme-success-bg, rgba(46,160,67,0.15))'
-            : 'var(--theme-error-bg, rgba(248,81,73,0.15))',
-          color: autoCommitToast.ok
-            ? 'var(--theme-success, #3fb950)'
-            : 'var(--theme-error, #f85149)',
-          border: `1px solid ${autoCommitToast.ok
-            ? 'var(--theme-success, rgba(46,160,67,0.4))'
-            : 'var(--theme-error, rgba(248,81,73,0.4))'}`,
-          borderRadius: 8,
-          padding: '8px 16px',
-          fontSize: 13,
-          fontWeight: 500,
-          zIndex: 100,
-          pointerEvents: 'none',
-          animation: 'dialogSlideIn 0.2s ease',
-          whiteSpace: 'nowrap',
-          maxWidth: '90%',
-          overflow: 'hidden',
-          textOverflow: 'ellipsis',
-        }}>
-          {autoCommitToast.msg}
-        </div>
-      )}
     </div>
   );
 };

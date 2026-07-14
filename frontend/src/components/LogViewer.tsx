@@ -7,6 +7,7 @@ interface LogViewerProps {
 }
 
 export const LogViewer: React.FC<LogViewerProps> = ({ isOpen, onClose }) => {
+  const [source, setSource] = useState<'desktop' | 'backend'>('desktop');
   const [lines, setLines] = useState<string[]>([]);
   const [path, setPath] = useState<string>('');
   const [error, setError] = useState<string>('');
@@ -17,7 +18,9 @@ export const LogViewer: React.FC<LogViewerProps> = ({ isOpen, onClose }) => {
   const fetchLogs = useCallback(async () => {
     setLoading(true);
     try {
-      const r = await api.getBackendLogs(800);
+      const r = source === 'desktop'
+        ? await api.getDesktopLogs(800)
+        : await api.getBackendLogs(800);
       if (r.ok) {
         setLines(r.lines);
         setPath(r.path || '');
@@ -30,7 +33,7 @@ export const LogViewer: React.FC<LogViewerProps> = ({ isOpen, onClose }) => {
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [source]);
 
   useEffect(() => {
     if (!isOpen) return;
@@ -52,8 +55,14 @@ export const LogViewer: React.FC<LogViewerProps> = ({ isOpen, onClose }) => {
       <div style={panelStyle} onClick={(e) => e.stopPropagation()}>
         <div style={headerStyle}>
           <h2 style={{ margin: 0, fontSize: 16, fontWeight: 600, color: 'var(--theme-text)' }}>
-            📋 Backend Logs
+            📋 运行日志
           </h2>
+          <button onClick={() => setSource('desktop')} style={{ ...btnStyle, opacity: source === 'desktop' ? 1 : .55 }}>
+            桌面 / Smooth
+          </button>
+          <button onClick={() => setSource('backend')} style={{ ...btnStyle, opacity: source === 'backend' ? 1 : .55 }}>
+            Backend
+          </button>
           <div style={{ flex: 1 }} />
           <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12, color: 'var(--theme-text-muted)', cursor: 'pointer' }}>
             <input

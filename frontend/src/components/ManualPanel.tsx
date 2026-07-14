@@ -45,7 +45,6 @@ const SECTIONS: ManualSection[] = [
       { icon: '🗂', title: '素材池', summary: '集中保存粘贴或生成的图片与文件，支持预览、固定、取消固定和删除，可跨后续步骤引用。', entry: '顶栏 🗂' },
       { icon: '✨', title: 'Prompts 提示词', summary: '把常用指令保存成可复用模板，在不同会话快速插入。', entry: '顶栏 📦 Repo → Prompts' },
       { icon: '🧩', title: 'Skills 技能', summary: '为模型提供结构化的专用能力与执行说明，例如网页搜索、图片生成或业务工具。', entry: '顶栏 📦 Repo → Skills', tips: '后端技能会按当前模型部署到会话工作目录。' },
-      { icon: '✓', title: '自动提交', summary: '任务完成后按会话配置自动整理 Git 提交，并可选择继续推送。', entry: '输入框工具栏的自动提交设置' },
     ],
   },
   {
@@ -91,7 +90,7 @@ const SECTIONS: ManualSection[] = [
     id: 'desktop', title: '桌面与个性化', icon: '🖥', intro: '低干扰桌面操作与外观设置。',
     items: [
       { icon: '〰', title: 'Smooth 顺滑问答', summary: '后台监控约定手势，静默截取全屏或预设区域并自动发送到最后聚焦会话。模型忙时自动排队。', entry: '设置 → Smooth 顺滑问答', tips: 'Ctrl+双击左/右键截图；不会记录普通输入。' },
-      { icon: '◫', title: '幽灵窗口', summary: '在预设截图区域显示当前会话的半透明镜像，实时查看最新问题、回答和生成状态；窗口置顶、鼠标穿透且不抢焦点。', entry: 'Smooth 开启后 → Alt + 双击左键', tips: '再次触发隐藏；关闭主窗口会归入托盘，托盘菜单可彻底退出。' },
+      { icon: '◫', title: '幽灵窗口', summary: '在预设截图区域中央显示当前会话的半透明卡片，实时查看问题、回答和生成状态；鼠标停在面板内可用滚轮浏览会话历史，始终不抢焦点。', entry: 'Smooth 开启后 → 左 Shift + 双击左键', tips: '再次触发隐藏；滚轮只在面板范围内滚动历史，不影响当前输入焦点。' },
       { icon: '🎨', title: '主题与背景', summary: '切换界面主题、设置背景图、背景透明度和面板透明度。', entry: '设置 → Theme / Background / Transparency' },
       { icon: '📋', title: '日志查看器', summary: '实时查看后端运行日志，排查模型启动、网络、代理、技能和工具执行问题。', entry: '顶栏 📋' },
       { icon: '⬆', title: '数据导入导出', summary: '备份或迁移后端配置、Prompts 与 Skills。会话历史和本机技能凭据不会混入导出包。', entry: '设置 → Data Management' },
