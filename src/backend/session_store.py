@@ -100,8 +100,15 @@ class SessionStore:
 
     def list(self) -> list[dict]:
         with self._lock:
-            snapshot = list(self._index.values())
+            # 返回副本，避免调用方排序/合并时意外改写内存索引。
+            snapshot = [dict(item) for item in self._index.values()]
         return sorted(snapshot, key=lambda x: x.get("updatedAt", 0), reverse=True)
+
+    def update_meta(self, session: Session) -> None:
+        """立即更新会话列表使用的内存索引，不等待后台磁盘 I/O。"""
+        meta = session.meta_dict()
+        with self._lock:
+            self._index[session.id] = meta
 
     def load(self, sid: str) -> Optional[Session]:
         path = self._session_path(sid)
@@ -164,6 +171,9 @@ class SessionStore:
             async_: If True (default), queue I/O in background thread
         """
         session.updated_at = time.time()
+        # 正文可以异步落盘，但列表摘要必须立即可见。否则紧随事件而来的
+        # listSessions 会读到旧索引，把前端的乐观更新覆盖回去。
+        self.update_meta(session)
 
         if async_:
             # Queue I/O operation for background execution
@@ -181,9 +191,8 @@ class SessionStore:
             encoding="utf-8",
         )
 
-        # ★ Update index in memory
-        with self._lock:
-            self._index[session.id] = session.meta_dict()
+        # 写盘期间 session 仍可能产生新状态，再同步一次最新摘要。
+        self.update_meta(session)
 
         # ★ Debounced index save (reduces I/O from 2 writes → 1 delayed write)
         self._save_index_debounced()

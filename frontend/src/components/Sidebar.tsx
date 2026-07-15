@@ -201,22 +201,28 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
     }
   }, [sessionToDelete, refresh, onDeleteSession]);
 
-  // ★ Listen for session-created event: optimistic insert + background refresh
+  // ★ 本窗口新建会话时直接插入。createSession 返回的是完整且带节点归属的
+  // 最新对象，不再立即整表重拉，避免旧索引把它短暂刷掉。
   useEffect(() => {
     const handleSessionCreated = (e: Event) => {
       const detail = (e as CustomEvent).detail;
       if (detail?.id) {
+        // 使已经在途的旧列表结果失效。
+        refreshGenerationRef.current += 1;
         // 立即插入新 session 到列表顶部，避免等待 API 往返
         setSessions(prev => {
-          if (prev.some(s => s.id === detail.id)) return prev;
-          return [detail, ...prev];
+          const index = prev.findIndex(s => s.id === detail.id);
+          const next = [...prev];
+          if (index >= 0) next[index] = { ...next[index], ...detail };
+          else next.push(detail);
+          next.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+          return next;
         });
       }
-      refresh(); // 后台刷新以保证一致性
     };
     window.addEventListener('session-created', handleSessionCreated);
     return () => window.removeEventListener('session-created', handleSessionCreated);
-  }, [refresh]);
+  }, []);
 
   // ★ 约束输入框聚焦 ref
   const constraintsRef = useRef<HTMLTextAreaElement>(null);
@@ -230,36 +236,37 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
     return () => window.removeEventListener('focus', handleFocus);
   }, [refresh]);
 
-  // 会话列表跟随服务端事件和执行节点状态即时变化。summary 先乐观更新，
-  // 再短延迟拉取一次索引，兼顾视觉即时性和多节点最终一致性。
+  // 会话摘要是服务端的权威增量，直接 upsert，不再用随后的旧列表覆盖它。
+  // 只有旧版/异常事件没有 summary 时才补一次列表刷新。
   useEffect(() => {
     const unsubscribeSession = api.onSessionUpdated((data: any) => {
       const sessionId = data?.sessionId;
+      // 增量事件比任何更早发起的列表请求都新，旧请求完成后不得覆盖它。
+      refreshGenerationRef.current += 1;
+      let needsRefresh = false;
       if (data?.type === 'session_deleted' && sessionId) {
         setSessions((prev) => prev.filter((session) => session.id !== sessionId));
+      } else if (data?.summary?.id) {
+        setSessions((prev) => {
+          const index = prev.findIndex((session) => session.id === data.summary.id);
+          const next = [...prev];
+          if (index >= 0) next[index] = { ...next[index], ...data.summary };
+          else next.push(data.summary);
+          next.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+          return next;
+        });
       } else if (data?.type === 'session_renamed' && sessionId) {
         setSessions((prev) => prev.map((session) => (
           session.id === sessionId ? { ...session, title: data.title || session.title } : session
         )));
-      } else if (data?.summary?.id) {
-        setSessions((prev) => {
-          const index = prev.findIndex((session) => session.id === data.summary.id);
-          if (index < 0) return prev;
-          const next = [...prev];
-          next[index] = { ...next[index], ...data.summary };
-          next.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
-          return next;
-        });
+      } else {
+        needsRefresh = true;
       }
-      scheduleRefresh(120);
-    });
-    const unsubscribeStream = api.onStreamDelta((delta: any) => {
-      if (delta?.type === 'done' || delta?.type === 'error') scheduleRefresh(150);
+      if (needsRefresh) scheduleRefresh(120);
     });
     const unsubscribeExec = onExecStatus(() => scheduleRefresh(0));
     return () => {
       unsubscribeSession();
-      unsubscribeStream();
       unsubscribeExec();
       if (refreshTimerRef.current) clearTimeout(refreshTimerRef.current);
       refreshTimerRef.current = null;

@@ -48,6 +48,18 @@ const LAYOUT_LABEL: Record<Layout, string> = { '1x1': '1×1', '1x2': '1×2', '2x
 export const App: React.FC = () => {
   const [backends, setBackends] = useState<any[]>([]);
   const [sessions, setSessions] = useState<any[]>([]);
+  const sessionRefreshGenerationRef = useRef(0);
+  const refreshSessionList = useCallback(async (): Promise<any[]> => {
+    const generation = ++sessionRefreshGenerationRef.current;
+    try {
+      const list = await api.listSessions();
+      if (generation === sessionRefreshGenerationRef.current) setSessions(list);
+      return list;
+    } catch (error) {
+      console.warn('[App] failed to refresh sessions', error);
+      return [];
+    }
+  }, []);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [backendManagerOpen, setBackendManagerOpen] = useState(false);
   const [repoPanelOpen, setRepoPanelOpen] = useState(false);
@@ -173,31 +185,16 @@ export const App: React.FC = () => {
     return unsub;
   }, []);
 
-  // Do not delay the initial sidebar for executors that are still connecting.
-  // Their sessions are merged as soon as the corresponding node comes online.
+  // 执行节点状态只负责连接状态；实际列表由 Sidebar 自己维护，App 仅在
+  // 初始化/打开 BackendManager/明确变更后按需同步，避免同一事件双重拉取。
   useEffect(() => {
-    let timer: ReturnType<typeof setTimeout> | null = null;
-    let generation = 0;
     const unsub = onExecStatus(() => {
       const anyOnline = getExecutors().some((item) => item.connected);
       // A stale/offline relay selected as home must not hide a healthy local
       // desktop sidecar behind the full-screen "backend offline" state.
       setBackendConnected(anyOnline);
-      if (!anyOnline) return;
-      if (timer) clearTimeout(timer);
-      const current = ++generation;
-      timer = setTimeout(() => {
-        timer = null;
-        api.listSessions().then((list) => {
-          if (current === generation) setSessions(list);
-        });
-      }, 0);
     });
-    return () => {
-      generation += 1;
-      if (timer) clearTimeout(timer);
-      unsub();
-    };
+    return unsub;
   }, []);
 
   // ★ Ctrl+Shift+N → 便签本
@@ -369,8 +366,7 @@ export const App: React.FC = () => {
     if (backendConnected !== true) return;
 
     api.getBackends().then(setBackends);
-    api.listSessions().then((list) => {
-      setSessions(list);
+    refreshSessionList().then((list) => {
       // 仅在焦点 pane 还没绑 session 时执行初始选择,避免重连打断用户。
       setPaneSessions((prev) => {
         const idx = focusedPaneIdx;
@@ -386,13 +382,7 @@ export const App: React.FC = () => {
       });
     });
     reloadConfig();
-  }, [backendConnected]); // eslint-disable-line react-hooks/exhaustive-deps
-
-  /* ---- 切换焦点 session 时刷新侧边栏列表 ---- */
-  useEffect(() => {
-    if (!activeSessionId || backendConnected !== true) return;
-    api.listSessions().then(setSessions);
-  }, [activeSessionId, backendConnected]);
+  }, [backendConnected, refreshSessionList]); // eslint-disable-line react-hooks/exhaustive-deps
 
   /* ---- 多端同步：其它客户端增删改 session 时刷新侧边栏 ---- */
   useEffect(() => {
@@ -402,23 +392,34 @@ export const App: React.FC = () => {
       if (t !== 'session_created' && t !== 'session_deleted' && t !== 'session_renamed' && t !== 'session_changed') {
         return;
       }
+      // 增量事件发生在任何既有列表请求之后；阻止旧请求晚到后覆盖它。
+      sessionRefreshGenerationRef.current += 1;
       if (data?.summary?.id) {
-        setSessions((prev) => prev.map((session) => (
-          session.id === data.summary.id ? { ...session, ...data.summary } : session
-        )).sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0)));
+        setSessions((prev) => {
+          const index = prev.findIndex((session) => session.id === data.summary.id);
+          const next = [...prev];
+          if (index >= 0) next[index] = { ...next[index], ...data.summary };
+          else next.push(data.summary);
+          return next.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+        });
         setActiveSession((prev: any) => (
           prev?.id === data.summary.id ? { ...prev, ...data.summary } : prev
         ));
+      } else if (t === 'session_renamed' && data?.sessionId) {
+        setSessions((prev) => prev.map((session) => (
+          session.id === data.sessionId ? { ...session, title: data.title || session.title } : session
+        )));
+      } else if (t === 'session_created') {
+        // 兼容没有 summary 的旧后端事件。
+        refreshSessionList();
       }
-      api.listSessions().then((list) => {
-        setSessions(list);
+      if (t === 'session_deleted') {
+        setSessions((prev) => prev.filter((session) => session.id !== data.sessionId));
         // 当前正在查看的 session 被其它客户端删除:把任何 pane 里指向它的位置清掉
-        if (t === 'session_deleted') {
-          setPaneSessions((prev) => prev.map((s) => (s === data.sessionId ? null : s)));
-        }
-      });
+        setPaneSessions((prev) => prev.map((s) => (s === data.sessionId ? null : s)));
+      }
     });
-  }, [backendConnected]);
+  }, [backendConnected, refreshSessionList]);
 
   /* ---- 加载焦点 pane 的 session 详情(用于顶栏 workingDir / backend 展示) ---- */
   useEffect(() => {
@@ -551,8 +552,14 @@ export const App: React.FC = () => {
     setSessionInPane(session.id);
     // ★ Dispatch with session data → Sidebar optimistically inserts it immediately
     window.dispatchEvent(new CustomEvent('session-created', { detail: session }));
-    // ★ Also refresh App's own sessions state (for BackendManager etc.)
-    api.listSessions().then(setSessions);
+    // App 自己只为 BackendManager 保留一份摘要，直接 upsert 即可。
+    setSessions((prev) => {
+      const index = prev.findIndex((item) => item.id === session.id);
+      const next = [...prev];
+      if (index >= 0) next[index] = { ...next[index], ...session };
+      else next.push(session);
+      return next.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+    });
     requestAnimationFrame(() => {
       setNewSessionDialogOpen(false);
     });
@@ -683,9 +690,8 @@ export const App: React.FC = () => {
     const list = await api.getBackends();
     setBackends(list);
     // Also refresh sessions to update backend references
-    const sessionList = await api.listSessions();
-    setSessions(sessionList);
-  }, []);
+    await refreshSessionList();
+  }, [refreshSessionList]);
 
   const handleDeleteBackend = useCallback(async (id: string, dependentSessions: any[] = [], targetBackendId?: string) => {
     // If there are dependent sessions and a target backend is specified, migrate them
@@ -699,8 +705,7 @@ export const App: React.FC = () => {
         }
       }
       // Refresh sessions after migration
-      const sessionList = await api.listSessions();
-      setSessions(sessionList);
+      await refreshSessionList();
       // 把所有 pane 上指向已迁移 session 的位置一并替换为新 session id
       if (idMap.size > 0) {
         setPaneSessions((prev) => prev.map((s) => (s && idMap.has(s) ? idMap.get(s)! : s)));
@@ -711,7 +716,7 @@ export const App: React.FC = () => {
     // Refresh backend list
     const list = await api.getBackends();
     setBackends(list);
-  }, [backends]);
+  }, [backends, refreshSessionList]);
 
   const theme = themes[config.theme] || themes.dark;
   const isLightTheme = config.theme === 'light' || config.theme === 'classic';
@@ -1154,6 +1159,7 @@ export const App: React.FC = () => {
         onResetConfig={resetConfig}
         onOpenBackendManager={() => {
           setSettingsOpen(false);
+          refreshSessionList();
           setBackendManagerOpen(true);
         }}
         onExportData={handleExportData}

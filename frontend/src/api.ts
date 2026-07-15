@@ -44,6 +44,7 @@ export interface SkillInfo {
 
 const WS_PORT_DEFAULT = 44321;
 const WS_CONNECT_TIMEOUT_MS = 3000;
+const LIST_SESSIONS_TIMEOUT_MS = 3000;
 
 let useMock = false;
 
@@ -255,8 +256,12 @@ const HEARTBEAT_INTERVAL_MS = 25000; // 每 25 秒发送一次心跳 ping
 
 // id → 该请求挂在哪条连接上(连接断开时只 reject 属于它的挂起请求,不误伤别的节点)
 const pendingConn = new Map<string, string>();
+// 每个执行节点最后一次成功取得的列表。节点短暂断线/假在线时继续展示，
+// 避免整个 session 分组忽隐忽现。
+const sessionListCache = new Map<string, any[]>();
+let listSessionsInFlight: Promise<any[]> | null = null;
 
-function handleMessage(e: MessageEvent) {
+function handleMessage(e: MessageEvent, source?: Conn) {
   if (typeof e.data !== 'string') return;
   try {
     const msg = JSON.parse(e.data);
@@ -273,7 +278,42 @@ function handleMessage(e: MessageEvent) {
       const delta = JSON.parse(msg.data);
       streamCallbacks.forEach((cb) => cb(delta));
     } else if (msg.event === 'sessionUpdated') {
-      const data = JSON.parse(msg.data);
+      const parsed = JSON.parse(msg.data);
+      const execMeta = source ? {
+        execKey: source.key,
+        execLabel: source.label,
+        execMode: source.target.mode,
+        execIsHome: source.isHome,
+      } : {};
+      const data = {
+        ...parsed,
+        ...execMeta,
+        summary: parsed?.summary ? { ...parsed.summary, ...execMeta } : parsed?.summary,
+      };
+      const sessionId = data?.sessionId || data?.summary?.id;
+      if (source && sessionId) {
+        if (data.type === 'session_deleted') {
+          sessionExec.delete(sessionId);
+          persistSessionExec();
+        } else if (sessionExec.get(sessionId) !== source.key) {
+          sessionExec.set(sessionId, source.key);
+          persistSessionExec();
+        }
+        const cached = sessionListCache.get(source.key) || [];
+        if (data.type === 'session_deleted') {
+          sessionListCache.set(source.key, cached.filter((item) => item?.id !== sessionId));
+        } else if (data.summary?.id) {
+          const index = cached.findIndex((item) => item?.id === data.summary.id);
+          const next = [...cached];
+          if (index >= 0) next[index] = { ...next[index], ...data.summary };
+          else next.push(data.summary);
+          sessionListCache.set(source.key, next);
+        } else if (data.type === 'session_renamed') {
+          sessionListCache.set(source.key, cached.map((item) => (
+            item?.id === sessionId ? { ...item, title: data.title || item.title } : item
+          )));
+        }
+      }
       sessionUpdateCallbacks.forEach((cb) => cb(data));
     } else if (msg.event === 'permissionRequest') {
       const data = JSON.parse(msg.data);
@@ -487,7 +527,7 @@ class Conn {
         } catch { /* ignore non-handshake frames */ }
         return;
       }
-      handleMessage(e);
+      handleMessage(e, this);
     };
 
     socket.onclose = () => {
@@ -515,7 +555,7 @@ class Conn {
   }
 
   /** 发起一次 RPC。home 离线时回落 mock(保持旧行为);其它节点离线则丢弃返回 null。 */
-  async request(method: string, params: any[]): Promise<any> {
+  async request(method: string, params: any[], timeoutMs?: number): Promise<any> {
     await this.ready;
     if (!this.isOpen) {
       if (this.isHome) return mockDispatch(method, params);
@@ -524,11 +564,22 @@ class Conn {
     }
     return await new Promise((resolve, reject) => {
       const id = nextId();
-      pending.set(id, { resolve, reject });
+      const timer = timeoutMs && timeoutMs > 0 ? setTimeout(() => {
+          const request = pending.get(id);
+          if (!request) return;
+          pending.delete(id);
+          pendingConn.delete(id);
+          request.reject(new Error(`RPC timeout after ${timeoutMs}ms: ${method}`));
+        }, timeoutMs) : null;
+      pending.set(id, {
+        resolve: (result) => { if (timer) clearTimeout(timer); resolve(result); },
+        reject: (error) => { if (timer) clearTimeout(timer); reject(error); },
+      });
       pendingConn.set(id, this.key);
       try {
         this.ws!.send(JSON.stringify({ id, method, params }));
       } catch (e) {
+        if (timer) clearTimeout(timer);
         pending.delete(id);
         pendingConn.delete(id);
         reject(e as Error);
@@ -915,21 +966,32 @@ export const api = {
    * roster 为空时即等价于「只列 home 的 session」(向后兼容)。
    */
   async listSessions(): Promise<any[]> {
-    // Configured but offline/connecting executors must not hold the sidebar
-    // behind their first-connect timeout. Online nodes are listed immediately;
-    // App refreshes when another executor later comes online.
-    const online = Array.from(pool.values()).filter((c) => c.isOpen);
-    const conns = online.length > 0 ? online : [homeConn];
+    // App 与 Sidebar 在启动时可能同时请求；共享同一轮多节点 RPC，避免双发。
+    if (listSessionsInFlight) return listSessionsInFlight;
+    const request = (async (): Promise<any[]> => {
+    // 所有已配置节点都参与合并；离线节点直接使用最后一次成功结果。
+    // 在线但连接假死的节点最多等待 3 秒，不能无限拖住整条侧栏。
+    const conns = Array.from(pool.values());
     const results = await Promise.all(conns.map(async (c) => {
+      if (!c.isOpen) return { c, list: sessionListCache.get(c.key) || [] };
       try {
-        const r = await c.request('listSessions', []);
+        const r = await c.request('listSessions', [], LIST_SESSIONS_TIMEOUT_MS);
+        if (typeof r !== 'string') throw new Error('invalid listSessions response');
         const list = JSON.parse(r) || [];
-        return { c, list: Array.isArray(list) ? list : [] };
-      } catch { return { c, list: [] as any[] }; }
+        const normalized = Array.isArray(list) ? list : [];
+        sessionListCache.set(c.key, normalized);
+        return { c, list: normalized };
+      } catch (error) {
+        console.warn(`[api] listSessions failed (${c.key}), using cache`, error);
+        return { c, list: sessionListCache.get(c.key) || [] };
+      }
     }));
     const merged: any[] = [];
     for (const { c, list } of results) {
-      for (const s of list) {
+      // 等待其它节点期间可能收到更新事件；事件已把 cache 推到更新版本，
+      // 因此合并时再次取 cache，不能使用本轮早先捕获的旧数组。
+      const latestList = sessionListCache.get(c.key) || list;
+      for (const s of latestList) {
         if (s && s.id) {
           sessionExec.set(s.id, c.key);
           merged.push({ ...s, execKey: c.key, execLabel: c.label, execMode: c.target.mode, execIsHome: c.isHome });
@@ -938,6 +1000,13 @@ export const api = {
     }
     persistSessionExec();
     return merged;
+    })();
+    listSessionsInFlight = request;
+    try {
+      return await request;
+    } finally {
+      if (listSessionsInFlight === request) listSessionsInFlight = null;
+    }
   },
 
   /**

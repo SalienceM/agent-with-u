@@ -1757,7 +1757,11 @@ class BridgeWS:
             self._active_sessions[new_session.id] = new_session
             self._sync_backend_skills_to_directory(new_session)
             self._session_store.save(new_session, async_=True)
-            self._emit_session_updated({"type": "session_created", "sessionId": new_session.id})
+            self._emit_session_updated({
+                "type": "session_created",
+                "sessionId": new_session.id,
+                "summary": new_session.meta_dict(),
+            })
             return json.dumps({"status": "ok", "session": new_session.to_dict()}, ensure_ascii=False)
         except Exception as e:
             return json.dumps({"status": "error", "message": str(e)}, ensure_ascii=False)
@@ -1791,7 +1795,11 @@ class BridgeWS:
         session.updated_at = time.time()
         self._active_sessions[session_id] = session
         self._session_store.save(session, async_=True)
-        self._emit_session_updated({"type": "context_cleared", "sessionId": session_id})
+        self._emit_session_updated({
+            "type": "context_cleared",
+            "sessionId": session_id,
+            "summary": session.meta_dict(),
+        })
         print(f"[bridge_ws] clearSessionContext: {session_id}", file=sys.stderr, flush=True)
         return json.dumps({"success": True}, ensure_ascii=False)
 
@@ -1815,7 +1823,11 @@ class BridgeWS:
             session.messages = [note] + session.messages[-keep_count:]
             session.updated_at = time.time()
             self._session_store.save(session, async_=True)
-            self._emit_session_updated({"type": "session_compacted", "sessionId": session_id})
+            self._emit_session_updated({
+                "type": "session_compacted",
+                "sessionId": session_id,
+                "summary": session.meta_dict(),
+            })
             return json.dumps({"status": "ok", "removed": removed, "remaining": len(session.messages)})
 
         elif command == "clear":
@@ -1985,7 +1997,11 @@ class BridgeWS:
             print(f"[BridgeWS] Failed to auto-bind defaults: {e}", file=sys.stderr)
         self._active_sessions[session.id] = session
         self._session_store.save(session, async_=True)
-        self._emit_session_updated({"type": "session_created", "sessionId": session.id})
+        self._emit_session_updated({
+            "type": "session_created",
+            "sessionId": session.id,
+            "summary": session.meta_dict(),
+        })
         return json.dumps(session.to_dict(), ensure_ascii=False)
 
     def _rpc_listSessions(self) -> str:
@@ -2059,15 +2075,16 @@ class BridgeWS:
         try:
             if not new_title.strip():
                 return json.dumps({"status": "error", "message": "Title cannot be empty"}, ensure_ascii=False)
-            ok = self._session_store.rename(session_id, new_title)
-            if ok:
-                session = self._active_sessions.get(session_id)
-                if session:
-                    session.title = new_title.strip()
+            session = self._active_sessions.get(session_id) or self._session_store.load(session_id)
+            if session:
+                session.title = new_title.strip()
+                self._active_sessions[session_id] = session
+                self._session_store.save(session, async_=False)
                 self._emit_session_updated({
                     "type": "session_renamed",
                     "sessionId": session_id,
                     "title": new_title.strip(),
+                    "summary": session.meta_dict(),
                 })
                 return json.dumps({"status": "ok"}, ensure_ascii=False)
             return json.dumps({"status": "error", "message": "Session not found"}, ensure_ascii=False)
@@ -6631,6 +6648,9 @@ except urllib.error.URLError as e:
             session.updated_at = time.time()
             if session.title in ("新会话", "New session", "") and display_content:
                 session.title = display_content[:50]
+            # 流式响应期间不保存未完成正文，但列表索引必须与下面的 summary
+            # 同步，否则客户端紧接着 listSessions 会把新标题/时间覆盖回旧值。
+            self._session_store.update_meta(session)
             self._emit_session_updated({
                 "type": "session_changed",
                 "sessionId": session.id,
