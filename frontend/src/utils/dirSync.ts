@@ -273,6 +273,10 @@ const IDB_DB = 'awu-dirsync';
 const IDB_STORE = 'handles';
 const IDB_HANDLE_KEY = 'copydir';
 
+function scopedCopyDirKey(base: string, bindingKey?: string): string {
+  return bindingKey ? `${base}:${bindingKey}` : base;
+}
+
 function idbOpen(): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
     const req = indexedDB.open(IDB_DB, 1);
@@ -306,13 +310,13 @@ function idbGet(key: string): Promise<any> {
   );
 }
 
-/** 让用户选择本机副本目录。须在用户手势（点击）回调中调用。 */
-export async function pickLocalDir(initialPath?: string): Promise<LocalFs | null> {
+/** 让用户选择本机副本目录。bindingKey 用于按 session 独立持久化。 */
+export async function pickLocalDir(initialPath?: string, bindingKey?: string): Promise<LocalFs | null> {
   if (isTauri()) {
     const path = await api.selectDirectory(initialPath);
     if (!path) return null;
     try {
-      localStorage.setItem(COPYDIR_TAURI_KEY, path);
+      localStorage.setItem(scopedCopyDirKey(COPYDIR_TAURI_KEY, bindingKey), path);
     } catch {
       /* 忽略持久化失败 */
     }
@@ -324,25 +328,25 @@ export async function pickLocalDir(initialPath?: string): Promise<LocalFs | null
   }
   const handle = await w.showDirectoryPicker({ mode: 'readwrite' });
   try {
-    await idbPut(IDB_HANDLE_KEY, handle);
+    await idbPut(scopedCopyDirKey(IDB_HANDLE_KEY, bindingKey), handle);
   } catch {
     /* 忽略持久化失败 */
   }
   return new BrowserLocalFs(handle);
 }
 
-/** 启动时尝试恢复上次选择的副本目录（浏览器侧可能需要用户重新授权）。 */
-export async function restoreLocalDir(): Promise<LocalFs | null> {
+/** 恢复指定 session 上次选择的副本目录（浏览器侧可能需要用户重新授权）。 */
+export async function restoreLocalDir(bindingKey?: string): Promise<LocalFs | null> {
   if (isTauri()) {
     try {
-      const path = localStorage.getItem(COPYDIR_TAURI_KEY);
+      const path = localStorage.getItem(scopedCopyDirKey(COPYDIR_TAURI_KEY, bindingKey));
       return path ? new TauriLocalFs(path) : null;
     } catch {
       return null;
     }
   }
   try {
-    const handle = await idbGet(IDB_HANDLE_KEY);
+    const handle = await idbGet(scopedCopyDirKey(IDB_HANDLE_KEY, bindingKey));
     if (!handle) return null;
     // 浏览器重启后权限通常回落到 prompt，须经用户手势重新授权；
     // 此处只在仍为 granted 时复用，否则让用户重新选择目录（即重新授权）。

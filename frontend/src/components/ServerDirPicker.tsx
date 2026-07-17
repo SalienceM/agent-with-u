@@ -29,6 +29,7 @@ interface Props {
 }
 
 interface Entry { name: string; path: string; isDir: boolean }
+type DirectoryAction = { kind: 'create' } | { kind: 'rename'; entry: Entry };
 
 export const ServerDirPicker: React.FC<Props> = ({
   initialPath, mode = 'dir', execKey, saveFilename, onSelect, onCancel,
@@ -43,6 +44,9 @@ export const ServerDirPicker: React.FC<Props> = ({
   const [filename, setFilename] = useState(saveFilename || '');
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
+  const [directoryAction, setDirectoryAction] = useState<DirectoryAction | null>(null);
+  const [directoryName, setDirectoryName] = useState('');
+  const [mutating, setMutating] = useState(false);
 
   const showFiles = mode !== 'dir';
 
@@ -50,11 +54,14 @@ export const ServerDirPicker: React.FC<Props> = ({
     setLoading(true);
     setError('');
     setSelectedFile('');
+    setDirectoryAction(null);
     try {
       const list = await api.listDirectory(path, '', execKey);
-      // listDirectory 出错时返回 []；用 getDirRoots 的路径兜底则不会到这
       setEntries(showFiles ? list : list.filter((e) => e.isDir));
       setCur(path);
+    } catch (e: any) {
+      setEntries([]);
+      setError(e?.message || '目录读取失败');
     } finally {
       setLoading(false);
     }
@@ -94,7 +101,51 @@ export const ServerDirPicker: React.FC<Props> = ({
     }
   }, [browse, mode]);
 
-  const confirmDisabled =
+  const beginCreate = useCallback(() => {
+    setError('');
+    setDirectoryName('');
+    setDirectoryAction({ kind: 'create' });
+  }, []);
+
+  const beginRename = useCallback((entry: Entry) => {
+    setError('');
+    setDirectoryName(entry.name);
+    setDirectoryAction({ kind: 'rename', entry });
+  }, []);
+
+  const submitDirectoryAction = useCallback(async () => {
+    const name = directoryName.trim();
+    if (!directoryAction || !name) {
+      setError('请输入目录名');
+      return;
+    }
+    if (name === '.' || name === '..' || /[\\/]/.test(name)) {
+      setError('目录名不能包含路径分隔符');
+      return;
+    }
+    setMutating(true);
+    setError('');
+    try {
+      const result = directoryAction.kind === 'create'
+        ? await api.createDirectory(cur, name, execKey)
+        : await api.renameDirectory(directoryAction.entry.path, name, execKey);
+      if (result.status !== 'ok') throw new Error(result.message || '操作失败');
+      setDirectoryAction(null);
+      setDirectoryName('');
+      if (directoryAction.kind === 'create' && result.path) {
+        // 新建工作目录后直接进入，下一步只需点“选择此目录”。
+        await browse(result.path);
+      } else {
+        await browse(cur);
+      }
+    } catch (e: any) {
+      setError(e?.message || '目录操作失败');
+    } finally {
+      setMutating(false);
+    }
+  }, [directoryAction, directoryName, cur, execKey, browse]);
+
+  const confirmDisabled = loading || !cur.trim() ||
     (mode === 'open' && !selectedFile) ||
     (mode === 'save' && !filename.trim());
 
@@ -111,7 +162,7 @@ export const ServerDirPicker: React.FC<Props> = ({
   const title =
     mode === 'open' ? '选择服务器文件'
       : mode === 'save' ? '保存到服务器'
-        : '选择服务器目录';
+        : '选择工作目录';
   const confirmLabel =
     mode === 'open' ? '选择此文件'
       : mode === 'save' ? '保存'
@@ -151,7 +202,32 @@ export const ServerDirPicker: React.FC<Props> = ({
             spellCheck={false}
           />
           <button style={btnStyle} onClick={() => browse(cur)}>转到</button>
+          <button style={btnStyle} disabled={loading || !cur || mutating} onClick={beginCreate} title="在当前目录中新建文件夹">＋ 新建</button>
         </div>
+
+        {directoryAction && (
+          <div style={directoryEditStyle}>
+            <span style={{ fontSize: 12, whiteSpace: 'nowrap' }}>
+              {directoryAction.kind === 'create' ? '新建目录' : '重命名'}
+            </span>
+            <input
+              autoFocus
+              value={directoryName}
+              onChange={(e) => setDirectoryName(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') { e.preventDefault(); submitDirectoryAction(); }
+                if (e.key === 'Escape') setDirectoryAction(null);
+              }}
+              style={inputStyle}
+              spellCheck={false}
+              placeholder="目录名称"
+            />
+            <button style={btnStyle} disabled={mutating} onClick={submitDirectoryAction}>
+              {mutating ? '处理中…' : '确定'}
+            </button>
+            <button style={btnStyle} disabled={mutating} onClick={() => setDirectoryAction(null)}>取消</button>
+          </div>
+        )}
 
         {/* 目录/文件列表 */}
         <div style={listStyle}>
@@ -171,7 +247,19 @@ export const ServerDirPicker: React.FC<Props> = ({
               onClick={() => handleEntryClick(e)}
               onDoubleClick={() => e.isDir && browse(e.path)}
             >
-              {e.isDir ? '📁' : '📄'} {e.name}
+              <span style={{ flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                {e.isDir ? '📁' : '📄'} {e.name}
+              </span>
+              {e.isDir && (
+                <button
+                  style={rowActionStyle}
+                  title={`重命名 ${e.name}`}
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    beginRename(e);
+                  }}
+                >✎</button>
+              )}
             </div>
           ))}
         </div>
@@ -229,7 +317,17 @@ const listStyle: React.CSSProperties = {
 };
 const rowStyle: React.CSSProperties = {
   padding: '6px 8px', borderRadius: 6, cursor: 'pointer', fontSize: 13,
-  whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis',
+  whiteSpace: 'nowrap', overflow: 'hidden', display: 'flex', alignItems: 'center', gap: 6,
+};
+const rowActionStyle: React.CSSProperties = {
+  width: 24, height: 22, padding: 0, borderRadius: 5, flexShrink: 0,
+  cursor: 'pointer', background: 'transparent', color: 'var(--theme-text-muted, #aaa)',
+  border: '1px solid transparent',
+};
+const directoryEditStyle: React.CSSProperties = {
+  display: 'flex', gap: 6, alignItems: 'center', marginBottom: 8, padding: 8,
+  borderRadius: 8, background: 'var(--theme-accent-bg, rgba(122,162,247,0.1))',
+  border: '1px solid var(--theme-accent-border, rgba(122,162,247,0.25))',
 };
 const rowSelectedStyle: React.CSSProperties = {
   background: 'var(--theme-accent, #7aa2f7)', color: '#fff',

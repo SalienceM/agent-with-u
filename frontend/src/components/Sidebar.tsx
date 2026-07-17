@@ -466,7 +466,7 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
         )}
       </div>
       {view === 'files' ? (
-        <FileTreePanel workingDir={activeWorkingDir || ''} execKey={activeExecKey} execLabel={activeExecLabel} execMode={activeExecMode} backendId={activeBackendId} />
+        <FileTreePanel sessionId={activeSessionId || undefined} workingDir={activeWorkingDir || ''} execKey={activeExecKey} execLabel={activeExecLabel} execMode={activeExecMode} backendId={activeBackendId} />
       ) : (
       <div style={{ flex: 1, overflow: 'auto', padding: '4px 8px' }}>
         {groups.map(group => {

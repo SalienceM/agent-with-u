@@ -968,8 +968,14 @@ export const App: React.FC = () => {
           {/* ★ 工作目录与后端标签在移动端隐藏，给按钮腾空间 */}
           {!isMobile && <CopyablePath path={activeSession?.workingDir} />}
           {!isMobile && (
-            <span style={{ fontSize: 12, color: 'var(--theme-text-muted, #656d76)' }}>
-              {formatBackendLabel(activeExecBackends.find((b: any) => b.id === activeBackendId))}
+            <span
+              title={`当前模型：${formatModelLabel(activeExecBackends.find((b: any) => b.id === activeBackendId))}`}
+              style={{
+                fontSize: 12, color: 'var(--theme-text-muted, #656d76)',
+                maxWidth: 220, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+              }}
+            >
+              🤖 {formatModelLabel(activeExecBackends.find((b: any) => b.id === activeBackendId))}
             </span>
           )}
           <div style={{ flex: 1 }} />
@@ -1416,12 +1422,27 @@ const CopyablePath: React.FC<{ path?: string }> = ({ path }) => {
   const [copied, setCopied] = useState(false);
   const fullPath = path || '';
 
-  const handleClick = useCallback(() => {
+  const handleClick = useCallback(async () => {
     if (!fullPath) return;
-    navigator.clipboard.writeText(fullPath).then(() => {
+    try {
+      await navigator.clipboard.writeText(fullPath);
       setCopied(true);
       setTimeout(() => setCopied(false), 1500);
-    });
+    } catch {
+      // 兼容没有 Clipboard API 权限的旧 WebView。
+      const input = document.createElement('textarea');
+      input.value = fullPath;
+      input.style.position = 'fixed';
+      input.style.opacity = '0';
+      document.body.appendChild(input);
+      input.select();
+      const ok = document.execCommand('copy');
+      input.remove();
+      if (ok) {
+        setCopied(true);
+        setTimeout(() => setCopied(false), 1500);
+      }
+    }
   }, [fullPath]);
 
   return (
@@ -1432,10 +1453,10 @@ const CopyablePath: React.FC<{ path?: string }> = ({ path }) => {
         position: 'relative',
         userSelect: 'none',
       }}
-      title={fullPath || 'Not set'}
+      title={fullPath ? `${fullPath}\n点击复制完整路径` : '未设置工作目录'}
       onClick={handleClick}
     >
-      {copied ? '✓ Copied!' : formatWorkingDir(path)}
+      {copied ? '✓' : <>📁 <span style={{ overflow: 'hidden', textOverflow: 'ellipsis' }}>{pathBasename(path)}</span> ⧉</>}
     </span>
   );
 };
@@ -1450,36 +1471,31 @@ const workingDirStyle: React.CSSProperties = {
   fontFamily: 'monospace',
   border: '1px solid var(--theme-success-border, #2da44e33)',
   transition: 'background 0.15s',
+  display: 'inline-flex',
+  alignItems: 'center',
+  gap: 4,
+  maxWidth: 180,
+  whiteSpace: 'nowrap',
+  overflow: 'hidden',
 };
 
-/* Format working directory for display */
-function formatWorkingDir(dir: string | undefined): string {
-  if (!dir) return 'Not set';
-  if (dir === '.') return '(current dir)';
-  // Show last 2-3 segments of the path
-  const parts = dir.replace(/\\/g, '/').split('/');
-  if (parts.length <= 3) return dir;
-  return '.../' + parts.slice(-3).join('/');
+function pathBasename(dir: string | undefined): string {
+  if (!dir) return '未设置';
+  if (dir === '.') return '当前目录';
+  const normalized = dir.replace(/\\/g, '/').replace(/\/+$/, '');
+  return normalized.split('/').pop() || normalized;
 }
 
-/* Format backend label to show actual model name */
-function formatBackendLabel(backend: any): string {
-  if (!backend) return 'No backend';
-  const label = backend.label || '';
-  const model = backend.model;
-
-  // If model is specified, show it alongside the label
-  if (model && model !== 'default' && model !== 'sonnet') {
-    return `${label} · ${model}`;
+/* 顶栏只展示实际模型参数；backend 名称已在左侧 session 列表展示。 */
+function formatModelLabel(backend: any): string {
+  if (!backend) return 'auto';
+  const env = backend.env || {};
+  if (backend.type === 'qwen-code-cli') return env.QWEN_MODEL || backend.model || 'auto';
+  if (backend.type === 'claude-agent-sdk' || backend.type === 'claude-code-official') {
+    return env.ANTHROPIC_MODEL || backend.model || 'auto';
   }
-
-  // For claude-code without explicit model, show "auto" to indicate
-  // it uses the model from claude-code config
-  if (label.includes('Claude Code') || label.includes('Agent SDK')) {
-    return `${label} · auto`;
-  }
-
-  return label;
+  if (backend.type === 'codex-office') return backend.model || env.OPENAI_MODEL || 'auto';
+  return backend.model || env.OPENAI_MODEL || env.ANTHROPIC_MODEL || env.QWEN_MODEL || 'auto';
 }
 
 /* ---- New Session Dialog: Select working directory first ---- */
@@ -1507,7 +1523,6 @@ const NewSessionDialog: React.FC<NewSessionDialogProps> = ({
   const [execKey, setExecKey] = useState<string>(() => getHomeExecKey());
   useEffect(() => onExecStatus(() => setExecutors(getExecutors())), []);
   const isHomeExec = execKey === getHomeExecKey();
-  const isLocalExec = execKey === 'local';
 
   // 选中的执行节点对应的后端列表:home 直接用上层传入,远端则按需拉取。
   const [execBackends, setExecBackends] = useState<any[]>(backends);
@@ -1534,16 +1549,10 @@ const NewSessionDialog: React.FC<NewSessionDialogProps> = ({
       sessionType === 'loop' ? normalizePolicy(loopPolicy) : undefined, execKey);
   }, [workingDir, selectedBackendId, sessionType, loopPolicy, execKey, onCreate]);
 
-  const handleBrowse = useCallback(async () => {
-    // Tauri 桌面端 + 本机节点：用系统原生目录对话框（本机 = 服务器同机）。
-    // Tauri 桌面端 + 远端节点 / 浏览器模式：必须浏览「目标执行节点」的文件系统，用 ServerDirPicker。
-    if (isTauri() && isLocalExec) {
-      const path = await api.selectDirectory(isAutoDir ? undefined : workingDir);
-      if (path) setWorkingDir(path);
-    } else {
-      setDirPickerOpen(true);
-    }
-  }, [workingDir, isAutoDir, isLocalExec]);
+  const handleBrowse = useCallback(() => {
+    // 本机与远端统一浏览“执行节点”的文件系统，保证两边都支持新建与重命名目录。
+    setDirPickerOpen(true);
+  }, []);
 
   return (
     <div

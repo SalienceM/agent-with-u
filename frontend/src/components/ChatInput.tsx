@@ -47,9 +47,7 @@ interface Props {
   skipPermissions?: boolean;
   onSkipPermissionsChange?: (enabled: boolean) => void;
   isMobile?: boolean;
-  // ── 序列任务：输入框「序列模式」——激活后回车不直接发送,而是排入队列 ──
-  seqMode?: boolean;
-  onToggleSeqMode?: () => void;
+  // ── 序列任务：回答进行中或已有排队时，新输入自动进入队列 ──
   onQueueTask?: (content: string, images?: ImageAttachment[]) => void;
   seqCount?: number;
   onCompact?: () => void;
@@ -82,6 +80,8 @@ const ToolbarBtn: React.FC<ToolbarBtnProps> = ({ icon, title, active, onClick, l
       onClick={onClick}
       disabled={loading}
       title={title}
+      aria-label={title}
+      aria-pressed={active}
       onMouseEnter={() => setIsHover(true)}
       onMouseLeave={() => setIsHover(false)}
       style={{
@@ -102,7 +102,6 @@ const ToolbarBtn: React.FC<ToolbarBtnProps> = ({ icon, title, active, onClick, l
       }}
     >
       <span style={{ fontSize: compact ? 14 : 12 }}>{icon}</span>
-      {!compact && <span>{title}</span>}
     </button>
   );
 };
@@ -111,7 +110,7 @@ const ChatInputInner: React.FC<Props> = ({
   onSend, onAbort, isStreaming, backends, activeBackendId, sessionId, workingDir,
   skipPermissions = true, onSkipPermissionsChange,
   isMobile = false,
-  seqMode = false, onToggleSeqMode, onQueueTask, seqCount = 0,
+  onQueueTask, seqCount = 0,
   onCompact,
   fontSize, onAdjustFontSize,
   isFocused = true,
@@ -187,10 +186,10 @@ const ChatInputInner: React.FC<Props> = ({
   // ── 稳定 refs ──
   const onSendRef = useRef(onSend);
   onSendRef.current = onSend;
-  const seqModeRef = useRef(seqMode);
-  seqModeRef.current = seqMode;
   const onQueueTaskRef = useRef(onQueueTask);
   onQueueTaskRef.current = onQueueTask;
+  const seqCountRef = useRef(seqCount);
+  seqCountRef.current = seqCount;
   const imagesRef = useRef(images);
   imagesRef.current = images;
   const clearImagesRef = useRef(clearImages);
@@ -586,8 +585,9 @@ const ChatInputInner: React.FC<Props> = ({
     }
     // ★ 保存到输入历史（Linux 风格 ↑ 追溯）
     pushHistory(text);
-    // 序列模式:回车/发送 → 排入队列(不进对话);否则正常发送。
-    if (seqModeRef.current && onQueueTaskRef.current) {
+    // 默认序列行为：空闲且没有队列时直接发送；模型忙碌或已有待发项时，
+    // 新输入自动排到队尾，不打断当前回答。
+    if ((isStreamingRef.current || seqCountRef.current > 0) && onQueueTaskRef.current) {
       onQueueTaskRef.current(text, imgs.length > 0 ? imgs : undefined);
     } else {
       onSendRef.current(text, imgs.length > 0 ? imgs : undefined);
@@ -595,7 +595,7 @@ const ChatInputInner: React.FC<Props> = ({
     if (ref.current) {
       ref.current.value = '';
       ref.current.style.height = 'auto';
-      if (seqModeRef.current) ref.current.focus();   // 连续排入,保持焦点
+      ref.current.focus();   // 点击发送按钮后也继续输入，连续任务自然排队
     }
     clearImagesRef.current();
     setShowCommands(false);
@@ -953,17 +953,6 @@ const ChatInputInner: React.FC<Props> = ({
           compact={isMobile}
           onClick={handleCompact}
         />
-        {onToggleSeqMode && (
-          <ToolbarBtn
-            icon={seqCount > 0 ? `🧬${seqCount}` : '🧬'}
-            title={seqMode
-              ? '序列模式：开 — 回车把内容排入队列（不直接发送）。再点关闭'
-              : '序列模式：开启后回车排入序列队列，可一条条确认或自动连发'}
-            active={seqMode}
-            compact={isMobile}
-            onClick={onToggleSeqMode}
-          />
-        )}
         {onAdjustFontSize && (
           <div style={{ display: 'inline-flex', alignItems: 'center', gap: 2, marginLeft: 2 }}
             title={`对话字号${fontSize ? ` ${fontSize}px` : ''}（A− / A+ 调整，全局生效）`}>
@@ -984,11 +973,10 @@ const ChatInputInner: React.FC<Props> = ({
         )}
         {/* ★ 流式进度指示器 */}
         {isStreaming && (
-          <div style={{
+          <div title="模型正在生成；此时继续输入并回车会自动加入序列队列" style={{
             display: 'inline-flex',
             alignItems: 'center',
-            gap: 6,
-            padding: '4px 10px',
+            padding: '7px',
             fontSize: 11,
             borderRadius: 6,
             background: 'rgba(34,197,94,0.1)',
@@ -1001,7 +989,6 @@ const ChatInputInner: React.FC<Props> = ({
               background: '#22c55e',
               animation: 'chat-pulse 1.5s ease-in-out infinite',
             }} />
-            <span style={{ color: '#22c55e', fontWeight: 500 }}>生成中...</span>
           </div>
         )}
         {/* ★ 图像尺寸选择器（仅 DashScope 图像 backend 显示） */}
@@ -1171,35 +1158,27 @@ const ChatInputInner: React.FC<Props> = ({
         </div>
       )}
 
-      <style>{`
-        @keyframes seqGlow {
-          0%,100% { box-shadow: 0 0 0 1.5px #7aa2f7, 0 0 8px 1px rgba(122,162,247,0.45); }
-          50%     { box-shadow: 0 0 0 1.5px #22d3ee, 0 0 16px 3px rgba(34,211,238,0.75); }
-        }
-        .seq-neon { border-radius: 12px; animation: seqGlow 1.8s ease-in-out infinite; }
-      `}</style>
       <div
-        className={seqMode ? 'seq-neon' : undefined}
-        style={{ display: 'flex', gap: 8, alignItems: 'flex-end', ...(seqMode ? { padding: 6 } : {}) }}
+        style={{ display: 'flex', gap: 8, alignItems: 'flex-end' }}
       >
         <textarea
           ref={ref}
           className="chat-textarea"
-          placeholder={seqMode
-            ? `🧬 序列模式：回车排入队列（不直接发送）${seqCount ? ` · 已 ${seqCount} 条` : ''}`
-            : isStreaming ? '输入并按 Enter 可中断当前响应并续发…' : '输入消息… 输入 / 查看命令 · @ 引用文件 · Ctrl+V 粘贴图片'}
+          placeholder={isStreaming || seqCount > 0
+            ? `继续输入，Enter 自动排队${seqCount ? ` · 待发 ${seqCount}` : ''}`
+            : '输入消息… 输入 / 查看命令 · @ 引用文件 · Ctrl+V 粘贴图片'}
           onKeyDown={handleKeyDown}
           onCompositionStart={handleCompositionStart}
           onCompositionEnd={handleCompositionEnd}
           onInput={handleInput}
-          style={{ ...textareaStyle, ...(isStreaming ? { opacity: 0.75 } : {}) }}
+          style={{ ...textareaStyle, ...(isStreaming ? { opacity: 0.9 } : {}) }}
           rows={1}
         />
-        {isStreaming ? (
-          <button onClick={onAbort} style={abortBtnStyle} title="Stop">■</button>
-        ) : (
-          <button onClick={handleSend} style={sendBtnStyle} title={seqMode ? '排入序列队列' : 'Send (Enter)'}>{seqMode ? '＋' : '🚀'}</button>
-        )}
+        <button onClick={handleSend} style={sendBtnStyle}
+          title={isStreaming || seqCount > 0 ? '加入序列队列' : '发送（Enter）'}>
+          {isStreaming || seqCount > 0 ? '＋' : '🚀'}
+        </button>
+        {isStreaming && <button onClick={onAbort} style={abortBtnStyle} title="停止当前回答">■</button>}
         <button
           onClick={toggleMic}
           style={micActive ? micRecordingStyle : micBtnStyle}
@@ -1220,7 +1199,7 @@ const ChatInputInner: React.FC<Props> = ({
               开启新会话
             </h3>
             <p style={{ fontSize: 13, color: 'var(--theme-text-muted, #656d76)', margin: '0 0 16px 0', lineHeight: 1.5 }}>
-              当前会话的上下文将被清空，Claude 不再记得之前的对话内容。
+              当前会话的上下文将被清空，模型不再保留之前的对话内容。
             </p>
             <p style={{ fontSize: 12, color: 'var(--theme-text-muted, #656d76)', margin: '0 0 16px 0' }}>
               历史消息仍保留在侧边栏，可随时回看。

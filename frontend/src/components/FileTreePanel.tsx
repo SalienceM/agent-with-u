@@ -29,6 +29,7 @@ import {
 const CodeEditor = lazy(() => import('./CodeEditor'));
 
 interface Props {
+  sessionId?: string;
   workingDir: string;
   execKey?: string;
   execLabel?: string;
@@ -117,8 +118,12 @@ interface PreviewState {
   loading: boolean; text?: string; dataUrl?: string; isImage?: boolean; isMarkdown?: boolean; error?: string;
 }
 
-export const FileTreePanel: React.FC<Props> = ({ workingDir, execKey, execLabel, execMode, backendId }) => {
+export const FileTreePanel: React.FC<Props> = ({ sessionId, workingDir, execKey, execLabel, execMode, backendId }) => {
   const isRemote = execMode === 'relay';
+  const localBindingKey = useMemo(
+    () => sessionId || `${execKey || 'home'}::${workingDir}`,
+    [sessionId, execKey, workingDir],
+  );
 
   // 单树的懒加载层级缓存：key=rel → 直接子项
   const [children, setChildren] = useState<Record<string, TNode[]>>({});
@@ -638,17 +643,32 @@ export const FileTreePanel: React.FC<Props> = ({ workingDir, execKey, execLabel,
     }
   }, [workingDir, execKey]);
 
-  // 远端会话:恢复上次的本地副本目录并扫描(得到"已下载"presence + 哈希)
+  // 远端会话：按 session 恢复本机目录，避免不同远端 session 错用同一个本地目录。
   const scanLocal = useCallback(async (fs: LocalFs | null) => {
     if (!fs) { setLocalManifest(null); return; }
     try { setLocalManifest(await fs.scan([])); } catch { setLocalManifest({}); }
   }, []);
   useEffect(() => {
-    if (!isRemote) return;
+    if (!isRemote) {
+      setLocalFs(null);
+      setLocalManifest(null);
+      return;
+    }
     let cancelled = false;
-    restoreLocalDir().then((fs) => { if (!cancelled && fs) { setLocalFs(fs); scanLocal(fs); } }).catch(() => {});
+    setLocalFs(null);
+    setLocalManifest(null);
+    setRemoteManifest(null);
+    restoreLocalDir(localBindingKey).then(async (fs) => {
+      if (!fs) return;
+      let manifest: Manifest = {};
+      try { manifest = await fs.scan([]); } catch { /* 保留空清单 */ }
+      if (!cancelled) {
+        setLocalFs(fs);
+        setLocalManifest(manifest);
+      }
+    }).catch(() => {});
     return () => { cancelled = true; };
-  }, [isRemote, scanLocal]);
+  }, [isRemote, localBindingKey]);
   useEffect(() => {
     if (localFs && workingDir) setBaseline(loadBaseline(localFs.id(), workingDir));
     else setBaseline({});
@@ -690,9 +710,13 @@ export const FileTreePanel: React.FC<Props> = ({ workingDir, execKey, execLabel,
   // ── 本地副本操作(远端会话)──
   const chooseLocal = useCallback(async () => {
     setMsg(null);
-    try { const fs = await pickLocalDir(); if (fs) { setLocalFs(fs); scanLocal(fs); } }
+    try {
+      const initialPath = localFs?.kind === 'tauri' ? localFs.label() : undefined;
+      const fs = await pickLocalDir(initialPath, localBindingKey);
+      if (fs) { setLocalFs(fs); await scanLocal(fs); }
+    }
     catch (e: any) { setMsg({ kind: 'err', text: e?.message ?? String(e) }); }
-  }, [scanLocal]);
+  }, [localFs, localBindingKey, scanLocal]);
 
   const runCompare = useCallback(async () => {
     if (!workingDir || !localFs) return;
@@ -965,6 +989,25 @@ export const FileTreePanel: React.FC<Props> = ({ workingDir, execKey, execLabel,
         <button className="ftp-hbtn" style={hdrIconStyle} title="刷新" onClick={reloadAll}>↻</button>
         <button className="ftp-hbtn" style={hdrIconStyle} title="全部折叠" onClick={() => setExpanded({})}>⊟</button>
       </div>
+
+      {/* 远端目录在执行节点上；这里绑定当前 session 对应的本机目录，可随时更换。 */}
+      {isRemote && (
+        <div style={localDirBarStyle}>
+          <span style={{ fontSize: 11, color: 'var(--theme-text-muted)', flexShrink: 0 }}>💻 本机目录</span>
+          <span
+            title={localFs?.label() || '尚未指定本机目录'}
+            style={{
+              flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+              fontSize: 10, fontFamily: 'monospace', color: localFs ? 'var(--theme-text)' : 'var(--theme-text-muted)',
+            }}
+          >
+            {localFs?.label() || '未指定（远端文件仍可在线查看）'}
+          </span>
+          <button style={localDirButtonStyle} onClick={chooseLocal} title={localFs ? '更换此 session 的本机目录' : '指定此 session 的本机目录'}>
+            {localFs ? '更换' : '指定'}
+          </button>
+        </div>
+      )}
 
       {/* ★ Git 快速操作工具条 */}
       {gitAvailable && (
@@ -1595,6 +1638,19 @@ const topBarStyle: React.CSSProperties = {
   display: 'flex', alignItems: 'center', gap: 6,
   padding: '6px 10px', flexShrink: 0,
   borderBottom: '1px solid var(--theme-border, rgba(255,255,255,0.08))',
+};
+
+const localDirBarStyle: React.CSSProperties = {
+  display: 'flex', alignItems: 'center', gap: 6, padding: '5px 10px', flexShrink: 0,
+  background: 'var(--theme-bg-tertiary, rgba(255,255,255,0.025))',
+  borderBottom: '1px solid var(--theme-border, rgba(255,255,255,0.08))',
+};
+
+const localDirButtonStyle: React.CSSProperties = {
+  padding: '2px 7px', borderRadius: 5, flexShrink: 0, cursor: 'pointer', fontSize: 10,
+  background: 'var(--theme-accent-bg, rgba(88,166,255,0.1))',
+  color: 'var(--theme-accent, #58a6ff)',
+  border: '1px solid var(--theme-accent-border, rgba(88,166,255,0.25))',
 };
 
 const tagStyle: React.CSSProperties = {

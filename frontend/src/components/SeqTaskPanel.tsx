@@ -9,9 +9,7 @@ interface EditImage {
 }
 
 // 序列任务：用户预排的一串渐进明细的想法/指令。一条答完再发下一条；
-// 可 auto 自动连发，也可手动一条条触发。喂进队列的方式是输入框的「🧬 序列模式」
-// （回车即排入）；本组件是那条 slim 队列条：显示进度、开关、手动「下一步」，
-// 点开可看/编辑/增删/调序队列里的条目。
+// 模型忙碌时继续输入会自动入队；本组件显示等待状态，并允许编辑、增删、调序。
 export interface SeqTaskT {
   id: string;
   text: string;
@@ -24,14 +22,12 @@ export interface SeqTaskT {
 interface Props {
   sessionId: string;
   tasks: SeqTaskT[];
-  auto: boolean;
-  chainActive?: boolean;   // auto 链是否激活（false=auto 开但被你插话暂停了）
+  chainActive?: boolean;   // false 通常表示应用重启后保留的队列尚未恢复
   isStreaming: boolean;
-  seqMode?: boolean;       // 输入框是否处于序列模式（决定条子的醒目度/文案）
   onSendNext: () => void;
 }
 
-export const SeqTaskPanel: React.FC<Props> = ({ sessionId, tasks, auto, chainActive, isStreaming, seqMode, onSendNext }) => {
+export const SeqTaskPanel: React.FC<Props> = ({ sessionId, tasks, chainActive, isStreaming, onSendNext }) => {
   const pending = tasks.filter((t) => t.status === 'pending');
   const sent = tasks.filter((t) => t.status === 'sent');
   const [open, setOpen] = useState(false);   // 默认收起,只留一条 slim 条
@@ -156,7 +152,7 @@ export const SeqTaskPanel: React.FC<Props> = ({ sessionId, tasks, auto, chainAct
   const canSendNext = pending.length > 0 && !isStreaming;
 
   return (
-    <div style={{ ...wrap, ...(seqMode ? seqActiveWrap : {}) }}>
+    <div style={wrap}>
       <div style={header}>
         <button onClick={() => setOpen(!open)} style={chevBtn} title={open ? '收起' : '展开队列'}>{open ? '▾' : '▸'}</button>
         <span
@@ -167,28 +163,25 @@ export const SeqTaskPanel: React.FC<Props> = ({ sessionId, tasks, auto, chainAct
           🧬 序列队列
           {pending.length > 0 && <span style={countPill}>{pending.length}</span>}
         </span>
-        {seqMode && <span style={modeTag}>模式开 · 回车排入</span>}
         <div style={{ flex: 1 }} />
-        <label style={autoLabel} title="开启后：一条答完自动发送下一条，直到队列清空">
-          <input type="checkbox" checked={auto} onChange={(e) => api.seqtaskSetAuto(sessionId, e.target.checked)} />
-          <span>自动连发</span>
-        </label>
-        <button onClick={onSendNext} disabled={!canSendNext}
-          title={isStreaming ? '当前回答完成后才能发下一条' : '把队首任务发进对话'}
-          style={{ ...sendBtn, opacity: canSendNext ? 1 : 0.45, cursor: canSendNext ? 'pointer' : 'not-allowed' }}>
-          ▶ 下一步
-        </button>
+        {chainActive === false && (
+          <button onClick={onSendNext} disabled={!canSendNext}
+            title={isStreaming ? '当前回答结束后可恢复队列' : '恢复保留的序列队列'}
+            style={{ ...sendBtn, opacity: canSendNext ? 1 : 0.45, cursor: canSendNext ? 'pointer' : 'not-allowed' }}>
+            ▶ 继续
+          </button>
+        )}
         {pending.length > 0 && (
           <button onClick={() => api.seqtaskClear(sessionId)} style={clearBtn} title="清空队列">清空</button>
         )}
       </div>
 
-      {/* auto / 暂停 状态提示（收起时也给一行,避免用户不知道在自动连发） */}
-      {auto && pending.length > 0 && (
+      {/* 收起时也给出自动队列状态，避免用户误以为新输入丢失。 */}
+      {pending.length > 0 && (
         <div style={autoHint}>
           {chainActive === false
-            ? '⏸ 自动连发已暂停（你插了话接管）—— 点「▶ 下一步」继续抽队列。'
-            : isStreaming ? '⏳ 正在回答，完成后自动发送下一条…' : '⚡ 自动连发已开启，将依次发送队列。'}
+            ? '⏸ 已保留上次队列，点「▶ 继续」后恢复。'
+            : isStreaming ? '⏳ 当前回答完成后自动发送下一条。' : '⚡ 正在发送下一条…'}
         </div>
       )}
 
@@ -196,7 +189,7 @@ export const SeqTaskPanel: React.FC<Props> = ({ sessionId, tasks, auto, chainAct
         <div style={{ display: 'flex', flexDirection: 'column', gap: 6, marginTop: 8 }}>
           {pending.length === 0 ? (
             <div style={emptyHint}>
-              队列为空。在下方输入框点亮 <b>🧬 序列模式</b> 后，回车即可把内容一条条排入这里。
+              队列为空。模型回答期间继续输入并回车，内容会自动依次排入这里。
             </div>
           ) : pending.map((t, i) => (
             <div key={t.id} style={card}>
@@ -301,12 +294,9 @@ export const SeqTaskPanel: React.FC<Props> = ({ sessionId, tasks, auto, chainAct
 };
 
 const wrap: React.CSSProperties = { borderTop: '1px solid var(--theme-border)', padding: '7px 12px', background: 'var(--theme-bg-secondary)' };
-const seqActiveWrap: React.CSSProperties = { borderTop: '1px solid #22d3ee', boxShadow: 'inset 0 1px 0 rgba(34,211,238,0.35)' };
 const header: React.CSSProperties = { display: 'flex', alignItems: 'center', gap: 8 };
 const chevBtn: React.CSSProperties = { background: 'none', border: 'none', cursor: 'pointer', color: 'var(--theme-text-muted)', fontSize: 12, padding: 0 };
 const countPill: React.CSSProperties = { fontSize: 10.5, fontWeight: 700, color: '#fff', background: 'var(--theme-accent)', borderRadius: 999, padding: '0 7px', lineHeight: 1.7 };
-const modeTag: React.CSSProperties = { fontSize: 10.5, fontWeight: 600, color: '#0891b2', background: 'rgba(34,211,238,0.15)', border: '1px solid rgba(34,211,238,0.4)', borderRadius: 6, padding: '1px 7px' };
-const autoLabel: React.CSSProperties = { display: 'inline-flex', alignItems: 'center', gap: 4, fontSize: 11.5, color: 'var(--theme-text-muted)', cursor: 'pointer' };
 const sendBtn: React.CSSProperties = { fontSize: 11.5, fontWeight: 600, padding: '4px 10px', borderRadius: 7, border: '1px solid var(--theme-accent)', background: 'var(--theme-accent-bg)', color: 'var(--theme-accent)' };
 const clearBtn: React.CSSProperties = { fontSize: 11, padding: '4px 8px', borderRadius: 7, border: '1px solid var(--theme-border)', background: 'none', color: 'var(--theme-text-muted)', cursor: 'pointer' };
 const autoHint: React.CSSProperties = { fontSize: 11, color: 'var(--theme-text-muted)', marginTop: 6, fontStyle: 'italic' };

@@ -185,40 +185,31 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
 
   // ── 序列任务队列 + by-the-way（普通 session 侧挂状态）──
   const [seqTasks, setSeqTasks] = useState<SeqTaskT[]>([]);
-  const [seqAuto, setSeqAuto] = useState(false);
-  const [seqMode, setSeqMode] = useState(false);   // 输入框「序列模式」：回车排入队列而非直接发送
   const [byTheWayOpen, setByTheWayOpen] = useState(false);
   const dispatchingRef = useRef(false);
-  // ★ auto 连发的「链激活」标志：派发队列任务 / auto 从关→开 时激活；
-  //   用户手插一条消息会让它失效（接管），从而不触发后续自动连发。
-  const seqChainRef = useRef(false);
-  const prevAutoRef = useRef(false);
-  // state 镜像，仅供面板显示「连发中 / 已暂停」；逻辑判定一律读 ref（避免闭包过期）
+  // 新输入在模型忙碌时会自动排队并激活本轮连续派发。应用重启后保留的
+  // 历史队列不会擅自恢复，需要用户在队列条上点一次继续。
   const [seqChainActive, setSeqChainActive] = useState(false);
-  const setChain = useCallback((v: boolean) => { seqChainRef.current = v; setSeqChainActive(v); }, []);
-
-  // ★ 序列模式下：当前对话完成后（流式→非流式），激活连发链让 auto-dispatch effect 触发
-  const prevStreamingForSeqRef = useRef(chat.isStreaming);
-  useEffect(() => {
-    const wasStreaming = prevStreamingForSeqRef.current;
-    const isStreamingNow = chat.isStreaming;
-    prevStreamingForSeqRef.current = isStreamingNow;
-    if (wasStreaming && !isStreamingNow && seqMode && seqAuto) {
-      setChain(true);
-    }
-  }, [chat.isStreaming, seqMode, seqAuto, setChain]);
+  const seqChainSessionRef = useRef<string | null>(null);
+  const setChain = useCallback((v: boolean) => { setSeqChainActive(v); }, []);
 
   useEffect(() => {
-    if (!sessionId) { setSeqTasks([]); setSeqAuto(false); return; }
+    let cancelled = false;
+    seqChainSessionRef.current = null;
+    setChain(false);
+    if (!sessionId) { setSeqTasks([]); return; }
     api.seqtaskGet(sessionId).then((r) => {
-      if (r.status === 'ok') { setSeqTasks(r.seqTasks || []); setSeqAuto(!!r.seqAuto); }
+      if (!cancelled && r.status === 'ok') setSeqTasks(r.seqTasks || []);
     });
-    return api.onSeqtaskUpdated((data) => {
+    const unsubscribe = api.onSeqtaskUpdated((data) => {
       if (data.sessionId !== sessionId) return;
       setSeqTasks(data.seqTasks || []);
-      setSeqAuto(!!data.seqAuto);
     });
-  }, [sessionId]);
+    return () => {
+      cancelled = true;
+      unsubscribe();
+    };
+  }, [sessionId, setChain]);
 
   // 取队首待发任务，派发进主对话（doSend 跳过斜杠命令拦截 + 自带 isStreaming 守卫）
   // ★ 用 ref 持有 chat 方法，避免 chat 对象每 render 换新导致 dispatchNext 被频繁重建、
@@ -256,6 +247,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
 
   const dispatchNext = useCallback(async () => {
     if (!sessionId || dispatchingRef.current || isStreamingRef.current) return;
+    seqChainSessionRef.current = sessionId;
     setChain(true);   // 主动派发即激活连发链（▶按钮也走这里，可续上被打断的链）
     dispatchingRef.current = true;
     try {
@@ -274,39 +266,28 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
     }
   }, [sessionId]); // ★ 不再依赖 chat 对象，dispatchNext 稳定不变
 
-  // auto 关→开 时激活连发链（关掉则失活）。auto 已是开的情况下加载/收到同步
-  //   不算「关→开」，链保持失活，需用户点 ▶ 或手动重新开关来启动 —— 避免刷新即自动猛发。
-  useEffect(() => {
-    const was = prevAutoRef.current;
-    prevAutoRef.current = seqAuto;
-    if (seqAuto && !was) setChain(true);
-    if (!seqAuto) setChain(false);
-  }, [seqAuto]);
-
-  // 用户手动发消息（ChatInput 来的）即接管，断开连发链：这条答完不会自动发下一条。
+  // 空闲时的第一条输入直接发送。
   const handleUserSend = useCallback((content: string, images?: any[]) => {
-    setChain(false);
     return sendMessageRef.current(content, images);
   }, []); // ★ 通过 ref 调用，无需依赖 chat
 
-  // 序列模式：输入框回车把内容排入队列（不进对话）。auto 开时会自动开始连发。
+  // 模型忙碌时 ChatInput 会把后续输入送到这里；无需显式开启模式。
   const handleQueueTask = useCallback((content: string, images?: any[]) => {
     if (!sessionId) return;
     const text = (content || '').trim();
     if (!text && !(images && images.length)) return;
+    seqChainSessionRef.current = sessionId;
+    setChain(true);
     api.seqtaskAdd(sessionId, text, images && images.length ? images : undefined);
-  }, [sessionId]);
+  }, [sessionId, setChain]);
 
-  // 自动连发：链激活 + auto 开 + 非流式 + 有待发任务 → 发下一条（一条答完 effect 再触发下一条）
-  // ★ 通过 isStreamingRef 读取最新流式状态，避免 chat.isStreaming 闭包陈旧
-  // ★ v2: 移除 setTimeout，直接调用 dispatchNext。dispatchNext 内部的 await
-  //    会自然让出控制权给 React 处理 pending 的 setSeqTasks 更新，避免 80ms
-  //    延迟在某些时序下导致 setMessages(用户消息) 被后续流式更新覆盖。
+  // 当前回答结束后自动取队首；dispatchNext 使用稳定 ref，并由 dispatchingRef
+  // 防止流状态与队列事件同时到达造成重复派发。
   useEffect(() => {
-    if (!seqAuto || isStreamingRef.current || !seqChainRef.current) return;
+    if (!seqChainActive || seqChainSessionRef.current !== sessionId || chat.isStreaming || isStreamingRef.current) return;
     if (!seqTasks.some((t) => t.status === 'pending')) return;
     dispatchNext();
-  }, [seqAuto, seqTasks, dispatchNext]); // ★ 移除 chat.isStreaming，改读 ref
+  }, [chat.isStreaming, seqChainActive, seqTasks, dispatchNext, sessionId]);
 
   // ── 持久化 skipPermissions ──
   const handleSkipPermissionsChange = useCallback(
@@ -731,15 +712,13 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
         </div>
       )}
 
-      {/* ---- 序列任务队列：仅在「序列模式」或队列非空时显示的一条 slim 条 ---- */}
-      {sessionId && (seqMode || seqTasks.some((t) => t.status === 'pending')) && (
+      {/* ---- 有待发任务时显示 slim 队列条；输入框无需显式切换模式 ---- */}
+      {sessionId && seqTasks.some((t) => t.status === 'pending') && (
         <SeqTaskPanel
           sessionId={sessionId}
           tasks={seqTasks}
-          auto={seqAuto}
           chainActive={seqChainActive}
           isStreaming={chat.isStreaming}
-          seqMode={seqMode}
           onSendNext={dispatchNext}
         />
       )}
@@ -756,16 +735,6 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
         skipPermissions={skipPermissions}
         onSkipPermissionsChange={handleSkipPermissionsChange}
         isMobile={isMobile}
-        seqMode={seqMode}
-        onToggleSeqMode={() => {
-          setSeqMode((v) => {
-            const next = !v;
-            // ★ 修复：切换到序列模式时，重置连发链标志
-            // 避免序列模式立即触发自动连发，应该等待当前对话完成后再继续
-            if (next) setChain(false);
-            return next;
-          });
-        }}
         onQueueTask={handleQueueTask}
         seqCount={seqTasks.filter((t) => t.status === 'pending').length}
         onCompact={handleCompact}

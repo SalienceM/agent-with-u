@@ -1367,8 +1367,30 @@ export const api = {
     try {
       const data = JSON.parse(result);
       if (Array.isArray(data)) return data;
+      if (data?.error) throw new Error(data.error);
       return [];
-    } catch { return []; }
+    } catch (error) {
+      if (error instanceof Error) throw error;
+      throw new Error('目录列表返回格式无效');
+    }
+  },
+
+  /** 在指定执行节点的 parentPath 下创建目录。 */
+  async createDirectory(parentPath: string, name: string, execKey?: string): Promise<{ status: string; path?: string; name?: string; message?: string }> {
+    const result = execKey
+      ? await callOn(execKey, 'createDirectory', parentPath, name)
+      : await call('createDirectory', parentPath, name);
+    try { return JSON.parse(result); }
+    catch { return { status: 'error', message: '创建目录返回格式无效' }; }
+  },
+
+  /** 重命名指定执行节点上的目录（仅改名，不移动）。 */
+  async renameDirectory(path: string, newName: string, execKey?: string): Promise<{ status: string; path?: string; name?: string; message?: string }> {
+    const result = execKey
+      ? await callOn(execKey, 'renameDirectory', path, newName)
+      : await call('renameDirectory', path, newName);
+    try { return JSON.parse(result); }
+    catch { return { status: 'error', message: '重命名目录返回格式无效' }; }
   },
 
   /** 服务器侧文件系统浏览起点（home / cwd / 盘符或根）。供 C/S 模式目录选择器使用。

@@ -432,25 +432,24 @@ streaming saves. A process-level cache (`_chat_extras` / `_chat_extras_get` /
   (`ChatPane`) off `useChat`'s `isStreaming` done-edge: an effect waits for
   `!isStreaming`, then `seqtaskTakeNext` (atomically pops the head — race-safe across
   panes/clients) and `chat.doSend`s it (raw, bypassing slash-command interception).
-  **Auto** (`seqtaskSetAuto`) drains the whole queue automatically; **manual** uses a
-  "▶ 发送下一个" button. The auto-chain is gated by a "chain active" flag: it activates
-  on auto off→on or on a manual ▶ dispatch, and **deactivates when the user types their
-  own message** (`handleUserSend` → `ChatInput`) — so an interjection takes over and
-  doesn't trigger the next auto-send; ▶ resumes. The panel shows a ⏸ paused hint
-  (mirrored via `seqChainActive` state). Unsent tasks are freely editable / removable / reorderable
+  There is no explicit sequence-mode switch. When the conversation is idle, the first
+  Enter sends normally; while a response is streaming (or a queue already exists),
+  subsequent input is added with `seqtaskAdd` and the active chain drains it automatically.
+  A chain is armed by new input and remains active until the pending queue is empty.
+  Persisted tasks loaded after an app/session restart are deliberately left paused so
+  stale work cannot execute by surprise; the slim panel's "▶ 继续" action re-arms them.
+  Unsent tasks are freely editable / removable / reorderable
   (`seqtaskAdd/Edit/Remove/Reorder/Clear`, images supported). A queued entry starting
   with `/` is dispatched as a **slash command** (so `/compact`, `/clear`, … can be
   lined up between prompts); everything else goes raw. State syncs via the
   `seqtaskUpdated` push event.
-  **UI is input-box-centric** (redesigned): a 🧬 toolbar toggle puts the `ChatInput`
-  into **序列模式** — the input box gets an animated **neon border** (`.seq-neon`) and
-  Enter/send **queues** the text (`onQueueTask` → `seqtaskAdd`) instead of sending it to
-  chat, staying focused so you can rattle off items; the send button shows ＋. Feeding
-  no longer breaks the auto-chain (only a real `handleUserSend` does). `SeqTaskPanel.tsx`
-  is now a **slim, collapsed-by-default strip** above the input (shown only when 序列模式
-  is on or the queue is non-empty): 🧬 序列队列 + count, 自动连发 toggle, ▶ 下一步 (manual
-  dispatch), 清空; click it to expand the list (edit / remove / ▲▼ reorder). The old
-  in-panel add box is gone — feeding is the input box.
+  **UI is input-box-centric**: no activation control is shown. During streaming the
+  textarea remains usable, Enter/＋ queues the next item, and ■ remains available to
+  abort the current response. `SeqTaskPanel.tsx` is a **slim, collapsed-by-default
+  strip** shown only while pending items exist: 🧬 count, current wait/send state,
+  optional restart-resume, and clear; expand it to edit / remove / ▲▼ reorder. The
+  legacy `seq_auto` field and `seqtaskSetAuto` RPC remain readable for compatibility,
+  but the current UI's automatic chain no longer depends on that toggle.
 - **By the way (旁路问答).** A floating 💬 entry on each chat pane opens
   `ByTheWayDrawer.tsx` — ask a quick side question that runs on an **independent agent
   context** (`agent_session_id=None`, session `f"{sid}:chataside"`), seeded with a
@@ -624,7 +623,11 @@ runs on 本机) shows a plain working-dir tree — no cloud, no copy dir, click 
 the real files directly. A **remote session** (`execMode==='relay'`) marks every file
 ☁️ **cloud** by default (content lives on the executor node, fetched on demand); an
 optional **本地副本目录** (`选择本地副本目录`, File-System-Access/Tauri `LocalFs`) enables
-offline download + diff + two-way sync. Per-file status (`statusOf`) = `cloud` (not
+offline download + diff + two-way sync. The binding is persisted **per session**
+(`pickLocalDir` / `restoreLocalDir` receive a session binding key), and the remote
+file view always exposes a compact `本机目录 · 指定/更换` row, so a copy directory can
+be assigned or changed after session creation without changing the remote working
+directory. Per-file status (`statusOf`) = `cloud` (not
 downloaded) / `local` (downloaded, presence-only) / `synced` ✓ / `differs` ± / `conflict`
 ⚠ (the last two need `🔍 比对`, which loads `syncManifest` hashes + three-way `baseline`).
 Hover actions: 👁 preview/edit, ⬇ download-to-local, ⬆ upload-local-changes (folders

@@ -5105,6 +5105,75 @@ except urllib.error.URLError as e:
         except Exception as e:
             return json.dumps({"error": str(e)}, ensure_ascii=False)
 
+    @staticmethod
+    def _directory_child_name(name: str) -> str:
+        """校验目录选择器创建/重命名时使用的单级目录名。"""
+        value = str(name or "").strip()
+        if not value or value in {".", ".."}:
+            raise ValueError("目录名不能为空")
+        if "\x00" in value or "/" in value or "\\" in value:
+            raise ValueError("目录名不能包含路径分隔符")
+        # Windows 会静默处理末尾的空格/句点，提前拒绝可避免界面显示名与实际名不一致。
+        if sys.platform == "win32" and (value.endswith(" ") or value.endswith(".")):
+            raise ValueError("目录名不能以空格或句点结尾")
+        return value
+
+    def _rpc_createDirectory(self, parent_path: str, name: str) -> str:
+        """在目录选择器当前目录下创建一个单级子目录。"""
+        from pathlib import Path as _Path
+        try:
+            if not str(parent_path or "").strip():
+                raise ValueError("父目录不能为空")
+            parent = _Path(parent_path).expanduser().resolve()
+            if not parent.is_dir():
+                return json.dumps({"status": "error", "message": "父目录不存在"}, ensure_ascii=False)
+            child_name = self._directory_child_name(name)
+            target = (parent / child_name).resolve()
+            if target.parent != parent:
+                raise ValueError("目录名无效")
+            target.mkdir(exist_ok=False)
+            return json.dumps({
+                "status": "ok",
+                "path": str(target),
+                "name": target.name,
+            }, ensure_ascii=False)
+        except FileExistsError:
+            return json.dumps({"status": "error", "message": "同名目录已存在"}, ensure_ascii=False)
+        except PermissionError:
+            return json.dumps({"status": "error", "message": "无权限创建目录"}, ensure_ascii=False)
+        except Exception as e:
+            return json.dumps({"status": "error", "message": str(e)}, ensure_ascii=False)
+
+    def _rpc_renameDirectory(self, path: str, new_name: str) -> str:
+        """重命名目录选择器中的目录；只允许修改名称，不允许借此移动目录。"""
+        from pathlib import Path as _Path
+        try:
+            if not str(path or "").strip():
+                raise ValueError("目录路径不能为空")
+            source = _Path(path).expanduser().resolve()
+            if not source.is_dir():
+                return json.dumps({"status": "error", "message": "目录不存在"}, ensure_ascii=False)
+            if source.parent == source:
+                return json.dumps({"status": "error", "message": "不能重命名文件系统根目录"}, ensure_ascii=False)
+            child_name = self._directory_child_name(new_name)
+            target = (source.parent / child_name).resolve()
+            if target.parent != source.parent:
+                raise ValueError("目录名无效")
+            if target == source:
+                return json.dumps({"status": "ok", "path": str(source), "name": source.name}, ensure_ascii=False)
+            if target.exists():
+                return json.dumps({"status": "error", "message": "同名目录已存在"}, ensure_ascii=False)
+            source.rename(target)
+            return json.dumps({
+                "status": "ok",
+                "path": str(target),
+                "name": target.name,
+            }, ensure_ascii=False)
+        except PermissionError:
+            return json.dumps({"status": "error", "message": "无权限重命名目录"}, ensure_ascii=False)
+        except Exception as e:
+            return json.dumps({"status": "error", "message": str(e)}, ensure_ascii=False)
+
     def _rpc_getDirRoots(self) -> str:
         """
         返回服务器侧文件系统的浏览起点，供前端目录选择器使用。
