@@ -4213,9 +4213,11 @@ class BridgeWS:
 
     # ── RPC: 后端配置 ────────────────────────────────────────────
 
-    def _rpc_getBackends(self) -> str:
+    def _rpc_getBackends(self, include_disabled: bool = False) -> str:
         result = []
         for c in self._backend_configs:
+            if not include_disabled and not c.enabled:
+                continue
             d = c.to_dict()
             if c.id in (OFFICIAL_BACKEND_ID, OFFICIAL_CODEX_BACKEND_ID):
                 d["pinned"] = True   # 前端用于区分固定后端
@@ -4285,6 +4287,7 @@ class BridgeWS:
             config = ModelBackendConfig(
                 id=OFFICIAL_BACKEND_ID,
                 type=BackendType.CLAUDE_CODE_OFFICIAL,
+                enabled=data.get("enabled", True) is not False,
                 label="Claude Code 官方账户",
                 skip_permissions=data.get("skipPermissions", True),
                 env=data.get("env") or None,
@@ -4297,6 +4300,7 @@ class BridgeWS:
             config = ModelBackendConfig(
                 id=OFFICIAL_CODEX_BACKEND_ID,
                 type=BackendType.CODEX_OFFICIAL,
+                enabled=data.get("enabled", True) is not False,
                 label="Codex 官方账户",
                 model=data.get("model") or (existing.model if existing else "gpt-5.6-sol"),
                 skip_permissions=data.get("skipPermissions", True),
@@ -4309,6 +4313,7 @@ class BridgeWS:
         else:
             config = ModelBackendConfig(
                 id=data["id"], type=BackendType(data["type"]), label=data["label"],
+                enabled=data.get("enabled", True) is not False,
                 base_url=data.get("baseUrl"), model=data.get("model"), api_key=data.get("apiKey"),
                 working_dir=data.get("workingDir"), allowed_tools=data.get("allowedTools"),
                 skip_permissions=data.get("skipPermissions", True), env=data.get("env"),
@@ -7619,8 +7624,15 @@ except urllib.error.URLError as e:
                     return
                 if delta.type == "text_delta" and delta.text:
                     iter_text.append(delta.text)
+                    # 流式正文同时镜像到内存 Session。切换会话或其他客户端
+                    # 中途接入时，loadSession 才不会返回同 ID 的空 assistant。
+                    assistant_msg.content += delta.text
                 elif delta.type == "thinking" and delta.text:
                     iter_thinking.append(delta.text)
+                    if assistant_msg.thinking_blocks:
+                        assistant_msg.thinking_blocks[0].content += delta.text
+                    else:
+                        assistant_msg.thinking_blocks = [ThinkingBlock(content=delta.text)]
                 elif delta.type == "tool_start" and delta.tool_call:
                     tc = ToolCallInfo(
                         id=delta.tool_call.get("id", ""),
@@ -7632,6 +7644,9 @@ except urllib.error.URLError as e:
                         parent_tool_use_id=delta.tool_call.get("parentToolUseId"),
                     )
                     iter_tools.append(tc)
+                    if assistant_msg.tool_calls is None:
+                        assistant_msg.tool_calls = []
+                    assistant_msg.tool_calls.append(tc)
                 elif delta.type == "tool_input" and delta.tool_call:
                     input_delta = delta.tool_call.get("inputDelta", "")
                     tc_id = delta.tool_call.get("id", "")
@@ -7858,6 +7873,7 @@ except urllib.error.URLError as e:
                     indicator = f"\n\n> ⟳ **Auto-continuing** ({iteration + 2}/{max_continuations + 1})...\n\n"
                     self._emit_delta(StreamDelta(session.id, message_id, "text_delta", text=indicator))
                     all_text.append(indicator)
+                    assistant_msg.content += indicator
                     current_content = "Continue exactly from where you left off. Do not repeat any content you already generated."
                     current_images = None
                     continue

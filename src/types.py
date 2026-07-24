@@ -25,6 +25,7 @@ class ModelBackendConfig:
     id: str
     type: BackendType
     label: str
+    enabled: bool = True
     base_url: Optional[str] = None
     model: Optional[str] = None
     api_key: Optional[str] = None
@@ -42,6 +43,7 @@ class ModelBackendConfig:
             "id": self.id,
             "type": self.type.value,
             "label": self.label,
+            "enabled": self.enabled,
             "baseUrl": self.base_url,
             "model": self.model,
             "apiKey": self.api_key,

@@ -20,6 +20,7 @@ interface BackendConfig {
   id: string;
   type: string;
   label: string;
+  enabled?: boolean;
   model?: string;
   baseUrl?: string;
   apiKey?: string;
@@ -165,6 +166,7 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
     id: '',
     type: 'claude-agent-sdk',
     label: '',
+    enabled: true,
     model: '',
     baseUrl: '',
     apiKey: '',
@@ -192,6 +194,7 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
       id: `backend-${Date.now()}`,
       type: 'claude-agent-sdk',
       label: '',
+      enabled: true,
       model: '',
       baseUrl: '',
       apiKey: '',
@@ -219,6 +222,7 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
       id: formData.id,
       type: formData.type,
       label: formData.label,
+      enabled: formData.enabled !== false,
     };
 
     if (formData.pinned) {
@@ -498,6 +502,15 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
                       <div style={{ fontWeight: 500, color: 'var(--theme-text)', marginBottom: 4, display: 'flex', alignItems: 'center', gap: 6 }}>
                         {backend.pinned && <span style={{ fontSize: 10, color: 'rgba(165,168,255,0.8)' }}>📌</span>}
                         {backend.label}
+                        <span style={{
+                          fontSize: 10,
+                          padding: '1px 6px',
+                          borderRadius: 999,
+                          color: backend.enabled === false ? 'var(--theme-text-muted)' : 'rgba(74,222,128,0.95)',
+                          background: backend.enabled === false ? 'rgba(148,163,184,0.12)' : 'rgba(34,197,94,0.12)',
+                        }}>
+                          {backend.enabled === false ? '已停用' : '已启用'}
+                        </span>
                       </div>
                       <div style={{ fontSize: 11, color: 'var(--theme-text-muted)' }}>
                         {backend.type}
@@ -549,6 +562,38 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
         ) : (
           // 编辑表单
           <>
+            <div style={{
+              marginBottom: 16,
+              padding: '12px 14px',
+              borderRadius: 8,
+              background: formData.enabled === false ? 'rgba(148,163,184,0.08)' : 'rgba(34,197,94,0.08)',
+              border: `1px solid ${formData.enabled === false ? 'rgba(148,163,184,0.2)' : 'rgba(34,197,94,0.22)'}`,
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'space-between',
+              gap: 16,
+            }}>
+              <div>
+                <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--theme-text)', marginBottom: 3 }}>
+                  日常使用
+                </div>
+                <div style={{ fontSize: 11, color: 'var(--theme-text-muted)', lineHeight: 1.5 }}>
+                  停用后保留配置和历史会话，但不再出现在新建会话及日常 Backend 选择中。
+                </div>
+              </div>
+              <label style={{ display: 'inline-flex', alignItems: 'center', gap: 7, cursor: 'pointer', flexShrink: 0 }}>
+                <input
+                  type="checkbox"
+                  checked={formData.enabled !== false}
+                  onChange={(e) => setFormData({ ...formData, enabled: e.target.checked })}
+                  style={{ width: 16, height: 16, accentColor: '#22c55e' }}
+                />
+                <span style={{ fontSize: 12, color: 'var(--theme-text)' }}>
+                  {formData.enabled === false ? '停用' : '启用'}
+                </span>
+              </label>
+            </div>
+
             {/* 固定后端（官方账户）不显示 ID/Label/Type 字段 */}
             {!formData.pinned && (
               <>
@@ -1887,7 +1932,9 @@ const TargetBackendSelector: React.FC<TargetBackendSelectorProps> = ({
   currentBackendId,
   onSelected,
 }) => {
-  const remainingBackends = backends.filter(b => b.id !== currentBackendId);
+  const remainingBackends = backends.filter(
+    b => b.id !== currentBackendId && b.enabled !== false,
+  );
   const [selectedId, setSelectedId] = useState(remainingBackends[0]?.id || '');
 
   const handleChange = useCallback((e: React.ChangeEvent<HTMLSelectElement>) => {

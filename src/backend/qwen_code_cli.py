@@ -576,7 +576,10 @@ class QwenCodeSdkBackend(ModelBackend):
         _new_agent_sid: Optional[str] = agent_session_id
         _done_emitted = False
         _usage: Optional[dict] = None
-        _saw_partial_event = False
+        # 仅在收到真正可展示的增量后，才跳过随后重复的 completed assistant。
+        # message_start/message_stop 也是 stream_event，但本身没有内容；旧逻辑
+        # 会因此误判并吞掉某些 provider 只在 completed 中返回的最终内容。
+        _saw_partial_content = False
         _query_started_at = time.monotonic()
         _first_event_at: Optional[float] = None
 
@@ -610,7 +613,7 @@ class QwenCodeSdkBackend(ModelBackend):
                         # When include_partial_messages=True, Qwen also sends stream_event
                         # deltas for the same content; emitting both causes the final
                         # answer/thinking/tool transcript to appear twice in the UI.
-                        if _saw_partial_event:
+                        if _saw_partial_content:
                             continue
                         msg_dict = dict(message)
                         msg_content = msg_dict.get("message", {}).get("content", [])
@@ -635,7 +638,6 @@ class QwenCodeSdkBackend(ModelBackend):
                                 })
 
                     elif is_sdk_partial_assistant_message(message):
-                        _saw_partial_event = True
                         # Partial message: stream_event with content_block_delta/start/stop
                         msg_dict = dict(message)
                         event = msg_dict.get("event", {})
@@ -644,17 +646,27 @@ class QwenCodeSdkBackend(ModelBackend):
                             delta = event.get("delta", {})
                             dtype = delta.get("type", "")
                             if dtype == "text_delta":
-                                emit("text_delta", text=delta.get("text", ""))
+                                text = delta.get("text", "")
+                                if text:
+                                    _saw_partial_content = True
+                                    emit("text_delta", text=text)
                             elif dtype == "thinking_delta":
-                                emit("thinking", text=delta.get("thinking", ""))
+                                thinking = delta.get("thinking", "")
+                                if thinking:
+                                    _saw_partial_content = True
+                                    emit("thinking", text=thinking)
                             elif dtype == "input_json_delta":
-                                emit("tool_input", tool_call={
-                                    "inputDelta": delta.get("partial_json", ""),
-                                })
+                                partial_json = delta.get("partial_json", "")
+                                if partial_json:
+                                    _saw_partial_content = True
+                                    emit("tool_input", tool_call={
+                                        "inputDelta": partial_json,
+                                    })
 
                         elif etype == "content_block_start":
                             block = event.get("content_block", {})
                             if block.get("type") == "tool_use":
+                                _saw_partial_content = True
                                 emit("tool_start", tool_call={
                                     "id": block.get("id", ""),
                                     "name": _display_tool_name(block.get("name", "")),

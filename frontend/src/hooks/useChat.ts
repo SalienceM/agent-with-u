@@ -58,6 +58,8 @@ export interface ChatMessage {
   toolCalls?: ToolCall[];
   thinking?: string;
   streaming?: boolean;
+  /** 已发送到后端、但尚未收到首个可展示流事件。仅用于瞬时 UI，不持久化。 */
+  waitingForFirstDelta?: boolean;
   contentBlocks?: ContentBlock[];  // ★ 有序内容块，按到达顺序排列
   elapsed?: number;  // ★ 本次回复总耗时（毫秒）
 }
@@ -249,15 +251,26 @@ export function useChat(
       globalState.contentBlocks.length > 0
     );
 
+    // 全局状态也可能保存一条刚在后台完成的消息。即使已经 done，也先用它
+    // 补齐缓存，避免切回来后必须等 loadSession 才能看到刚完成的回答。
     const tail: ChatMessage | null =
-      hasActiveStream && globalState.messageId && hasStreamContent
-        ? buildStreamingMessage(globalState, {
-            id: globalState.messageId,
-            role: 'assistant',
-            content: '',
-            timestamp: Date.now() / 1000,
-            streaming: true,
-          })
+      globalState.messageId && (hasActiveStream || hasStreamContent)
+        ? hasStreamContent
+          ? buildStreamingMessage(globalState, {
+              id: globalState.messageId,
+              role: 'assistant',
+              content: '',
+              timestamp: Date.now() / 1000,
+              streaming: hasActiveStream,
+            })
+          : {
+              id: globalState.messageId,
+              role: 'assistant',
+              content: '',
+              timestamp: Date.now() / 1000,
+              streaming: true,
+              waitingForFirstDelta: true,
+            }
         : null;
 
     if (cachedHistory && cachedHistory.length > 0) {
@@ -307,20 +320,25 @@ export function useChat(
           latest.toolCalls.length > 0 ||
           latest.contentBlocks.length > 0
         );
-        if (stillStreaming && latest.messageId && latestHasContent) {
-          const hasStreamingMsg = loadedMessages.some(
+        if (latest.messageId && latestHasContent) {
+          const existingIndex = loadedMessages.findIndex(
             (m: ChatMessage) => m.id === latest.messageId,
           );
-          if (!hasStreamingMsg) {
-            const tail = buildStreamingMessage(latest, {
-              id: latest.messageId,
-              role: 'assistant',
-              content: '',
-              timestamp: Date.now() / 1000,
-              streaming: true,
-            });
-            loadedMessages.push(tail);
-          }
+          // 后端在 turn 进行中持有的是同 ID 的空 assistant 占位，实时正文只在
+          // StreamState 中。不能因为“ID 已存在”就保留空占位，否则切回 session
+          // 会把刚恢复出的正文再次覆盖成一个只有光标的小气泡。
+          const liveMessage = buildStreamingMessage(latest, {
+            ...(existingIndex >= 0 ? loadedMessages[existingIndex] : {}),
+            id: latest.messageId,
+            role: 'assistant',
+            content: '',
+            timestamp: existingIndex >= 0
+              ? loadedMessages[existingIndex].timestamp
+              : Date.now() / 1000,
+            streaming: stillStreaming,
+          });
+          if (existingIndex >= 0) loadedMessages[existingIndex] = liveMessage;
+          else loadedMessages.push(liveMessage);
         }
         // ★ 更新历史缓存(只缓存非 streaming 的「定稿」消息,避免下次切回来
         //    看到一个错位的 stale 流式版本)。注意:这里缓存的是「已加载的最近
@@ -355,6 +373,12 @@ export function useChat(
     //   和 WS 重连时(下面 isStreamingRef 卡死分支)主动清理。
     return () => {
       cancelled = true;
+      // 切走前立即保留当前已经定稿的 UI 历史。此前缓存只在 loadSession
+      // 返回时更新，新完成的轮次会在切回时短暂消失，直到慢 RPC 再次返回。
+      const finalized = messagesRef.current.filter((m) => !m.streaming);
+      if (finalized.length > 0) {
+        sessionHistoryCache.set(sessionId, finalized);
+      }
     };
   }, [sessionId, syncFromGlobalState]);
 
@@ -530,7 +554,7 @@ export function useChat(
         case 'tool_input':
         case 'tool_result':
         case 'tool_end':
-          scheduleStreamingUpdate();
+          scheduleStreamingUpdate({ waitingForFirstDelta: false });
           break;
 
         case 'done': {
@@ -549,7 +573,6 @@ export function useChat(
           sessionState.toolCalls = finalToolCalls || [];
           sessionState.contentBlocks = finalBlocks || [];
           sessionState.isStreaming = false;
-          sessionState.messageId = null;
 
           setMessages((prev) => {
             // 兜底:assistant 气泡不再有占位 push,如果整个流程没产生任何
@@ -566,6 +589,7 @@ export function useChat(
                   toolCalls: finalToolCalls,
                   contentBlocks: finalBlocks,
                   streaming: false,
+                  waitingForFirstDelta: false,
                   elapsed: finalElapsed,
                   timestamp: Date.now() / 1000,
                   backendId,
@@ -582,6 +606,7 @@ export function useChat(
                 toolCalls: finalToolCalls,
                 contentBlocks: finalBlocks,
                 streaming: false,
+                waitingForFirstDelta: false,
                 elapsed: finalElapsed,
                 ...(delta.usage ? { usage: delta.usage } : {}),
               };
@@ -616,6 +641,7 @@ export function useChat(
                   toolCalls: errToolCalls,
                   contentBlocks: errBlocks,
                   streaming: true,
+                  waitingForFirstDelta: false,
                   elapsed: errElapsed,
                   timestamp: Date.now() / 1000,
                   backendId,
@@ -631,6 +657,7 @@ export function useChat(
                     toolCalls: errToolCalls,
                     contentBlocks: errBlocks,
                     streaming: true,
+                    waitingForFirstDelta: false,
                     elapsed: errElapsed,
                   }
                 : m
@@ -693,18 +720,17 @@ export function useChat(
       };
       const assistantId = uuid();
 
-      // ★ 只 push 用户消息,不 push 占位 assistant 气泡。
-      //    之前这里会立刻 push 一个 content='' + streaming=true 的 assistant
-      //    placeholder——backend 第一个 delta 飞过来之前(过中继可能 1 秒以
-      //    上),用户看到的就是个孤零零空插入符气泡。瞬切时这个占位会一直
-      //    挂在那里,造成「闪空光标」体感。
-      //    现在等第一个有内容的 delta 到达时,scheduleStreamingUpdate 的 push
-      //    分支(gate 在 hasContent 上)会自动创建 assistant 气泡。期间用户
-      //    通过 ChatInput 的边框变绿 / 发送按钮变中止按钮 拿到「正在响应」
-      //    的反馈。
-      //    边界:如果 backend 直接发 done 没有任何内容 delta(理论上少见,
-      //    比如模型空回复),'done' / 'error' 分支会兜底创建气泡。
-      setMessages((prev) => [...prev, userMsg]);
+      // 发送瞬间就展示明确的 Thinking 状态。它不是伪造的思考文本，也不会
+      // 写入历史；首个 thinking / text / tool delta 到达后会原位替换。
+      const waitingMsg: ChatMessage = {
+        id: assistantId,
+        role: 'assistant',
+        content: '',
+        timestamp: Date.now() / 1000,
+        streaming: true,
+        waitingForFirstDelta: true,
+      };
+      setMessages((prev) => [...prev, userMsg, waitingMsg]);
       isStreamingRef.current = true;
       setIsStreaming(true);
 
@@ -770,6 +796,8 @@ export function useChat(
         // ── 清空 ──
         case '/clear':
           setMessages([]);
+          clearStreamState(sessionId);
+          clearSessionHistoryCache(sessionId);
           await api.executeCommand({ command: 'clear', sessionId, backendId });
           sys('🗑️ 对话已清空。');
           break;

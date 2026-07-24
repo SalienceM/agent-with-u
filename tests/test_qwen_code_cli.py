@@ -2,6 +2,7 @@ import asyncio
 import sys
 import types
 import unittest
+from unittest.mock import patch
 
 sys.modules.setdefault("httpx", types.ModuleType("httpx"))
 
@@ -10,9 +11,10 @@ from src.types import BackendType, ImageAttachment, ModelBackendConfig
 
 
 class _FakeQuery:
-    def __init__(self):
+    def __init__(self, messages=None):
         self.closed = False
         self.finished = asyncio.Event()
+        self._messages = iter(messages or [])
 
     async def close(self):
         if self.closed:
@@ -26,6 +28,18 @@ class _FakeQuery:
 
     async def __aexit__(self, exc_type, exc, tb):
         await self.close()
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        try:
+            return next(self._messages)
+        except StopIteration as exc:
+            raise StopAsyncIteration from exc
+
+    def get_session_id(self):
+        return "qwen-session"
 
 
 class QwenCodeCliTests(unittest.IsolatedAsyncioTestCase):
@@ -113,6 +127,91 @@ class QwenCodeCliTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(settings["model"]["generationConfig"]["timeout"], 90000)
         finally:
             shutil.rmtree(cwd, ignore_errors=True)
+
+    async def test_metadata_partial_event_does_not_hide_completed_answer(self):
+        import tempfile
+
+        query = _FakeQuery([
+            {
+                "type": "stream_event",
+                "session_id": "qwen-session",
+                "event": {"type": "message_start", "message": {}},
+            },
+            {
+                "type": "assistant",
+                "session_id": "qwen-session",
+                "message": {"content": [{"type": "text", "text": "fallback answer"}]},
+            },
+            {
+                "type": "result",
+                "subtype": "success",
+                "session_id": "qwen-session",
+                "is_error": False,
+                "usage": {},
+            },
+        ])
+        deltas = []
+        with tempfile.TemporaryDirectory() as cwd, \
+             patch("qwen_code_sdk.query", return_value=query), \
+             patch("src.backend.qwen_code_cli.cli_available", return_value=True), \
+             patch.object(self.backend, "_resolve_cli", return_value="qwen"):
+            await self.backend.send_message(
+                messages=[],
+                content="hello",
+                images=None,
+                session_id="session-1",
+                message_id="message-1",
+                on_delta=deltas.append,
+                working_dir=cwd,
+            )
+
+        await query.finished.wait()
+        text = "".join(delta.text or "" for delta in deltas if delta.type == "text_delta")
+        self.assertEqual(text, "fallback answer")
+
+    async def test_real_partial_content_is_not_duplicated_by_completed_answer(self):
+        import tempfile
+
+        query = _FakeQuery([
+            {
+                "type": "stream_event",
+                "session_id": "qwen-session",
+                "event": {
+                    "type": "content_block_delta",
+                    "delta": {"type": "thinking_delta", "thinking": "checking"},
+                },
+            },
+            {
+                "type": "assistant",
+                "session_id": "qwen-session",
+                "message": {"content": [{"type": "thinking", "thinking": "checking"}]},
+            },
+            {
+                "type": "result",
+                "subtype": "success",
+                "session_id": "qwen-session",
+                "is_error": False,
+                "usage": {},
+            },
+        ])
+        deltas = []
+        with tempfile.TemporaryDirectory() as cwd, \
+             patch("qwen_code_sdk.query", return_value=query), \
+             patch("src.backend.qwen_code_cli.cli_available", return_value=True), \
+             patch.object(self.backend, "_resolve_cli", return_value="qwen"):
+            await self.backend.send_message(
+                messages=[],
+                content="hello",
+                images=None,
+                session_id="session-1",
+                message_id="message-1",
+                on_delta=deltas.append,
+                working_dir=cwd,
+            )
+
+        await query.finished.wait()
+        thinking = "".join(delta.text or "" for delta in deltas if delta.type == "thinking")
+        self.assertEqual(thinking, "checking")
 
 
 if __name__ == "__main__":

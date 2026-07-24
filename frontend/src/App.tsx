@@ -55,6 +55,7 @@ const LAYOUT_LABEL: Record<Layout, string> = { '1x1': '1×1', '1x2': '1×2', '2x
 
 export const App: React.FC = () => {
   const [backends, setBackends] = useState<any[]>([]);
+  const [backendConfigs, setBackendConfigs] = useState<any[]>([]);
   const [sessions, setSessions] = useState<any[]>([]);
   const sessionRefreshGenerationRef = useRef(0);
   const refreshSessionList = useCallback(async (): Promise<any[]> => {
@@ -374,6 +375,7 @@ export const App: React.FC = () => {
     if (backendConnected !== true) return;
 
     api.getBackends().then(setBackends);
+    api.getBackends(undefined, true).then(setBackendConfigs);
     refreshSessionList().then((list) => {
       // 仅在焦点 pane 还没绑 session 时执行初始选择,避免重连打断用户。
       setPaneSessions((prev) => {
@@ -662,8 +664,12 @@ export const App: React.FC = () => {
           `${result.skills || 0} 个 Skill`,
         ];
         showToast('success', `导入成功：${parts.join('，')}`);
-        const backendList = await api.getBackends();
+        const [backendList, allBackendConfigs] = await Promise.all([
+          api.getBackends(),
+          api.getBackends(undefined, true),
+        ]);
         setBackends(backendList);
+        setBackendConfigs(allBackendConfigs);
       } else {
         showToast('error', `导入失败：${result.message}`);
       }
@@ -703,8 +709,12 @@ export const App: React.FC = () => {
   const handleSaveBackend = useCallback(async (config: any) => {
     await api.saveBackend(config);
     // Refresh backend list
-    const list = await api.getBackends();
+    const [list, allBackendConfigs] = await Promise.all([
+      api.getBackends(),
+      api.getBackends(undefined, true),
+    ]);
     setBackends(list);
+    setBackendConfigs(allBackendConfigs);
     // Also refresh sessions to update backend references
     await refreshSessionList();
   }, [refreshSessionList]);
@@ -730,9 +740,13 @@ export const App: React.FC = () => {
 
     await api.deleteBackend(id);
     // Refresh backend list
-    const list = await api.getBackends();
+    const [list, allBackendConfigs] = await Promise.all([
+      api.getBackends(),
+      api.getBackends(undefined, true),
+    ]);
     setBackends(list);
-  }, [backends, refreshSessionList]);
+    setBackendConfigs(allBackendConfigs);
+  }, [refreshSessionList]);
 
   const theme = themes[config.theme] || themes.dark;
   const isLightTheme = config.theme === 'light' || config.theme === 'classic';
@@ -1183,6 +1197,7 @@ export const App: React.FC = () => {
         onOpenBackendManager={() => {
           setSettingsOpen(false);
           refreshSessionList();
+          api.getBackends(undefined, true).then(setBackendConfigs);
           setBackendManagerOpen(true);
         }}
         onExportData={handleExportData}
@@ -1204,7 +1219,7 @@ export const App: React.FC = () => {
       <BackendManager
         isOpen={backendManagerOpen}
         onClose={() => setBackendManagerOpen(false)}
-        backends={backends}
+        backends={backendConfigs}
         sessions={sessions}
         onSaveBackend={handleSaveBackend}
         onDeleteBackend={handleDeleteBackend}

@@ -1087,9 +1087,10 @@ export const api = {
   },
 
   /** 列出后端配置;execKey 指定时取该执行节点的后端列表(新建会话选远端时用)。 */
-  async getBackends(execKey?: string): Promise<any[]> {
+  async getBackends(execKey?: string, includeDisabled = false): Promise<any[]> {
     const conn = (execKey && pool.get(execKey)) || homeConn;
-    const result = await conn.request('getBackends', []);
+    // 默认保持无参数调用，兼容尚未升级的远端执行节点。
+    const result = await conn.request('getBackends', includeDisabled ? [true] : []);
     try { return JSON.parse(result); } catch { return []; }
   },
 

@@ -1051,7 +1051,7 @@ const ChatInputInner: React.FC<Props> = ({
         />
         {runtimeConfigurable && (
           <ToolbarBtn
-            icon="🧠"
+            icon="⚙"
             title={`切换本 Session 模型${activeBackend?.type === 'codex-office' ? ' / 推理档位' : ''}（当前：${formatRuntimeLabel(activeBackend, sessionRuntime)}）`}
             active={showRuntimePicker}
             compact={isMobile}

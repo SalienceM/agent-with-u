@@ -1009,7 +1009,9 @@ function MessageBubbleInner({
     (message as any).thinkingBlocks?.map((b: any) => b.content).join('\n\n') ||
     '';
 
-  const isThinkingPhase = !!message.streaming && !!thinkingContent && !message.content;
+  const isThinkingPhase = !!message.streaming
+    && !message.content
+    && (!!thinkingContent || !!message.waitingForFirstDelta);
 
   // ★ useMemo 避免每次渲染重新解析 Markdown（message.content 不变则复用缓存）
   const contentHtml = useMemo(
@@ -1093,7 +1095,7 @@ function MessageBubbleInner({
         {/* ★ 按 contentBlocks 顺序交替渲染 thinking / tool / text */}
         {!isUser && message.contentBlocks && message.contentBlocks.length > 0 ? (
           message.contentBlocks.map((block, i) => {
-            if (block.type === 'thinking' && thinkingContent) {
+            if (block.type === 'thinking' && (thinkingContent || isThinkingPhase)) {
               return <ThinkingBlock key={`blk-${i}`} content={thinkingContent} isThinking={isThinkingPhase} />;
             }
             if (block.type === 'tool' && message.toolCalls && block.toolIndex !== undefined) {
@@ -1118,7 +1120,7 @@ function MessageBubbleInner({
         ) : (
           /* Fallback：历史消息没有 contentBlocks 时保持原有顺序 */
           <>
-            {!isUser && thinkingContent && (
+            {!isUser && (thinkingContent || isThinkingPhase) && (
               <ThinkingBlock content={thinkingContent} isThinking={isThinkingPhase} />
             )}
             {!isUser && message.toolCalls && message.toolCalls.length > 0 && (

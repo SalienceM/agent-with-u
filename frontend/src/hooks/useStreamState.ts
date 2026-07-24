@@ -310,6 +310,7 @@ export function buildStreamingMessage(state: StreamState, baseMessage: ChatMessa
     toolCalls: state.toolCalls.length > 0 ? state.toolCalls : undefined,
     contentBlocks: state.contentBlocks.length > 0 ? state.contentBlocks : undefined,
     streaming: state.isStreaming,
+    waitingForFirstDelta: false,
     elapsed: state.streamStart ? Date.now() - state.streamStart : undefined,
   };
 }
