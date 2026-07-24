@@ -1,6 +1,7 @@
 import tempfile
 import time
 import unittest
+import json
 from pathlib import Path
 from unittest.mock import patch
 
@@ -9,6 +10,29 @@ from src.types import ChatMessage, Session
 
 
 class SessionStoreRefreshTests(unittest.TestCase):
+    def test_legacy_node_session_is_migrated_as_attached_thread(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "sessions"
+            with patch("src.backend.session_store.paths.sub", return_value=root):
+                store = SessionStore()
+                legacy = Session(
+                    id="legacy-node", title="Legacy", created_at=1.0, updated_at=1.0,
+                    messages=[], working_dir=tmp, backend_id="codex",
+                    agent_session_id="thread-1", codex_connection_mode="node",
+                ).to_dict()
+                legacy.pop("codexThreadAttached", None)
+                (root / "legacy-node.json").write_text(
+                    json.dumps(legacy, ensure_ascii=False), encoding="utf-8",
+                )
+
+                loaded = store.load("legacy-node")
+                self.assertIsNotNone(loaded)
+                self.assertTrue(loaded.codex_thread_attached)
+
+                store._io_running = False
+                if store._io_thread:
+                    store._io_thread.join(timeout=1)
+
     def test_async_save_updates_list_index_immediately(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "sessions"

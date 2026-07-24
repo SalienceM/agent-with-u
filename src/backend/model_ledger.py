@@ -5,7 +5,7 @@ ModelLedger: 跨 session 的「模型能力台账」——大脑的长期记忆�
 等），形成"谁擅长什么"的参考，供下一次任务启动时做能力匹配的分配决策。
 
 存于 ~/.agent-with-u/model-ledger/ledger.json，结构：
-    { "<backend_id>": { "backendId", "label",
+    { "<backend_id>|<model>|<effort>": { "backendId", "model", "reasoningEffort", "label",
         "roles": { "execute"|"analysis"|"idea"|...: {count, scored, sum, lastAt} } } }
 """
 
@@ -41,14 +41,29 @@ class ModelLedger:
 
     def record(self, backend_id: str, label: str, role: str,
                score: Optional[float] = None, success: Optional[bool] = None,
-               duration_ms: Optional[float] = None, task_type: str = "general") -> None:
-        """记一次 backend 在某角色上的使用；score 非空时计入均分（如执行后得到的评分）。"""
+               duration_ms: Optional[float] = None, task_type: str = "general",
+               model: str = "", reasoning_effort: str = "") -> None:
+        """记一次 backend × 模型 × 档位使用；score 非空时计入均分。"""
         if not backend_id or not role:
             return
+        model = str(model or "").strip()
+        reasoning_effort = str(reasoning_effort or "").strip().lower()
+        ledger_key = backend_id
+        if model or reasoning_effort:
+            ledger_key = f"{backend_id}|{model or 'default'}|{reasoning_effort or 'default'}"
+        runtime_suffix = " · ".join(x for x in (model, reasoning_effort) if x)
+        runtime_label = f"{label or backend_id} · {runtime_suffix}" if runtime_suffix else (label or backend_id)
         with self._lock:
             data = self._load()
-            b = data.setdefault(backend_id, {"backendId": backend_id, "label": label or backend_id, "roles": {}})
-            b["label"] = label or b.get("label") or backend_id
+            b = data.setdefault(ledger_key, {
+                "backendId": backend_id, "model": model,
+                "reasoningEffort": reasoning_effort,
+                "label": runtime_label, "roles": {},
+            })
+            b["backendId"] = backend_id
+            b["model"] = model
+            b["reasoningEffort"] = reasoning_effort
+            b["label"] = runtime_label
             r = b["roles"].setdefault(role, {
                 "count": 0, "scored": 0, "sum": 0.0, "lastAt": 0,
                 "successes": 0, "failures": 0, "durationCount": 0,
@@ -92,7 +107,14 @@ class ModelLedger:
                                "avgDurationMs": (float(r.get("durationSumMs", 0.0)) / duration_count)
                                if duration_count else None,
                                "taskTypes": dict(r.get("taskTypes") or {})}
-            out.append({"backendId": bid, "label": b.get("label", bid), "roles": roles})
+            out.append({
+                "runtimeKey": bid,
+                "backendId": b.get("backendId", bid),
+                "model": b.get("model", ""),
+                "reasoningEffort": b.get("reasoningEffort", ""),
+                "label": b.get("label", bid),
+                "roles": roles,
+            })
         # 执行均分高的排前面，便于"谁更能干"一眼看到
         out.sort(key=lambda x: (x["roles"].get("execute", {}).get("avgScore") or -1), reverse=True)
         return out

@@ -7,7 +7,7 @@ from unittest.mock import patch
 
 sys.modules.setdefault("httpx", types.ModuleType("httpx"))
 
-from src.backend.loop_store import LoopState, LoopStep, LoopStore
+from src.backend.loop_store import LoopRecord, LoopState, LoopStep, LoopStore
 from src.backend.model_ledger import ModelLedger
 
 
@@ -19,6 +19,31 @@ class LoopCoreTests(unittest.TestCase):
     def test_read_access_round_trips(self):
         step = LoopStep(index=1, mode="concurrent", access="read", desc="inspect")
         self.assertEqual(LoopStep.from_dict(step.to_dict()).access, "read")
+
+    def test_manual_takeover_state_and_transcript_round_trip(self):
+        record = LoopRecord(
+            seq=2,
+            kind="manual",
+            goal="人工接管",
+            manual_start_index=4,
+            manual_messages=[{
+                "id": "m1", "role": "assistant", "content": "done",
+                "toolCalls": [{"name": "shell", "status": "done"}],
+            }],
+        )
+        state = LoopState(session_id="session-manual", control_mode="manual", loops=[record])
+
+        restored = LoopState.from_dict(state.to_dict())
+
+        self.assertEqual(restored.control_mode, "manual")
+        self.assertEqual(restored.loops[0].kind, "manual")
+        self.assertEqual(restored.loops[0].manual_start_index, 4)
+        self.assertEqual(restored.loops[0].manual_messages[0]["toolCalls"][0]["name"], "shell")
+
+    def test_legacy_loop_state_defaults_to_automated_control(self):
+        restored = LoopState.from_dict({"sessionId": "legacy", "loops": [{"seq": 1}]})
+        self.assertEqual(restored.control_mode, "loop")
+        self.assertEqual(restored.loops[0].kind, "agent")
 
     def test_loop_store_uses_atomic_replace_and_leaves_no_temp_file(self):
         with tempfile.TemporaryDirectory() as tmp:

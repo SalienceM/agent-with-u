@@ -15,6 +15,9 @@ interface Session {
   execLabel?: string;
   execMode?: 'local' | 'relay';
   execIsHome?: boolean;
+  codexConnectionMode?: 'node' | 'ssh';
+  codexRemoteHost?: string;
+  codexThreadAttached?: boolean;
 }
 
 interface Backend {
@@ -41,10 +44,11 @@ interface Props {
   activeExecLabel?: string;
   activeExecMode?: 'local' | 'relay';
   activeBackendId?: string;
+  activeCodexRemoteHost?: string;
 }
 
 // ★ Wrap with React.memo to prevent unnecessary re-renders when parent updates
-export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession, onNewSession, onDeleteSession, onAcknowledgeSession, streamingSessions, completedSessions = new Set(), collapsed, onToggleCollapse, isMobile, width, activeWorkingDir, activeExecKey, activeExecLabel, activeExecMode, activeBackendId }) => {
+export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession, onNewSession, onDeleteSession, onAcknowledgeSession, streamingSessions, completedSessions = new Set(), collapsed, onToggleCollapse, isMobile, width, activeWorkingDir, activeExecKey, activeExecLabel, activeExecMode, activeBackendId, activeCodexRemoteHost }) => {
   const [sessions, setSessions] = useState<Session[]>([]);
   const refreshGenerationRef = useRef(0);
   const refreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -466,7 +470,12 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
         )}
       </div>
       {view === 'files' ? (
-        <FileTreePanel sessionId={activeSessionId || undefined} workingDir={activeWorkingDir || ''} execKey={activeExecKey} execLabel={activeExecLabel} execMode={activeExecMode} backendId={activeBackendId} />
+        activeCodexRemoteHost ? (
+          <div style={{ margin: 12, padding: 14, border: '1px solid var(--theme-border)', borderRadius: 8, color: 'var(--theme-text-muted)', fontSize: 12, lineHeight: 1.65 }}>
+            <div style={{ color: 'var(--theme-text)', fontWeight: 600, marginBottom: 5 }}>🌐 Codex SSH Remote · {activeCodexRemoteHost}</div>
+            当前会话的文件与命令位于 SSH 主机上，由远端 Codex 工具操作。为避免误操作本机同名目录，这里不展示本机文件树。
+          </div>
+        ) : <FileTreePanel sessionId={activeSessionId || undefined} workingDir={activeWorkingDir || ''} execKey={activeExecKey} execLabel={activeExecLabel} execMode={activeExecMode} backendId={activeBackendId} />
       ) : (
       <div style={{ flex: 1, overflow: 'auto', padding: '4px 8px' }}>
         {groups.map(group => {
@@ -492,6 +501,10 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
                 const isRunning = streamingSessions.has(s.id);
                 const isCompleted = !isRunning && completedSessions.has(s.id);
                 const isActive = s.id === activeSessionId;
+                // “接管既有 thread”是来源，“SSH Codex”是执行位置；两者可同时成立。
+                const isCodexAttached = s.codexThreadAttached === true
+                  || (s.codexThreadAttached === undefined && s.codexConnectionMode === 'node');
+                const isCodexSsh = s.codexConnectionMode === 'ssh';
 
                 return (
                 <div
@@ -554,11 +567,27 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
                     <span style={{ fontSize: 10, color: 'var(--theme-text-muted, #656d76)' }}>
                       {s.messageCount} msgs
                     </span>
-                    <div style={{ display: 'flex', gap: 4, alignItems: 'center' }}>
+                    <div style={{ display: 'flex', gap: 4, alignItems: 'center', justifyContent: 'flex-end', flexWrap: 'wrap' }}>
                       {/* ★ 远端执行节点标记:本机会话不显示,避免单机用户看到无谓徽标 */}
                       {s.execIsHome === false && s.execLabel && !showGroupHeader && (
                         <span style={execBadgeStyle} title={`执行节点：${s.execLabel}`}>
                           🌐 {s.execLabel}
+                        </span>
+                      )}
+                      {isCodexAttached && (
+                        <span
+                          style={codexAttachedBadgeStyle}
+                          title="接管已有 Codex thread，继续其原生上下文"
+                        >
+                          🧲 接管
+                        </span>
+                      )}
+                      {isCodexSsh && (
+                        <span
+                          style={codexSshBadgeStyle}
+                          title={`Codex 命令通过 SSH 在 ${s.codexRemoteHost || '远端主机'} 执行`}
+                        >
+                          ⌁ SSH Codex
                         </span>
                       )}
                       {/* Backend name badge */}
@@ -890,7 +919,8 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
     && prevProps.activeExecKey === nextProps.activeExecKey
     && prevProps.activeExecLabel === nextProps.activeExecLabel
     && prevProps.activeExecMode === nextProps.activeExecMode
-    && prevProps.activeBackendId === nextProps.activeBackendId;
+    && prevProps.activeBackendId === nextProps.activeBackendId
+    && prevProps.activeCodexRemoteHost === nextProps.activeCodexRemoteHost;
 });
 
 // Simple color mapping for backend badges
@@ -1068,6 +1098,20 @@ const backendBadgeStyle: React.CSSProperties = {
   color: 'var(--theme-text, #1f2328)',
   background: 'var(--theme-bg-tertiary, #eaeef2)',
   border: '1px solid var(--theme-border, rgba(0,0,0,0.12))',
+};
+
+const codexAttachedBadgeStyle: React.CSSProperties = {
+  ...backendBadgeStyle,
+  color: '#d8b4fe',
+  background: 'rgba(168, 85, 247, 0.14)',
+  border: '1px solid rgba(168, 85, 247, 0.48)',
+};
+
+const codexSshBadgeStyle: React.CSSProperties = {
+  ...backendBadgeStyle,
+  color: '#67e8f9',
+  background: 'rgba(6, 182, 212, 0.14)',
+  border: '1px solid rgba(6, 182, 212, 0.48)',
 };
 
 const overlayStyle: React.CSSProperties = {

@@ -218,7 +218,47 @@ The `ModelBackend` abstract class supports multiple implementations:
 | `ClaudeAgentBackend` | `Codex-agent-sdk` | Spawns `Codex` CLI with `--output-format stream-json` |
 | `OpenAICompatibleBackend` | `openai-compatible` | Direct HTTP API calls to OpenAI-compatible endpoints |
 
-Backend selection is runtime-configurable via the UI dropdown.
+Backend selection is runtime-configurable via the UI dropdown. A backend is the
+account/connection/runner, not necessarily a single model. `Session` therefore
+persists optional `model_override` + `reasoning_effort` runtime knobs separately.
+For `codex-office`, these become Codex CLI `--model` and
+`model_reasoning_effort` overrides; an empty value keeps the backend/Codex default.
+
+### Codex native threads and SSH Remote
+
+Codex sessions may persist `Session.codex_connection_mode`: empty means the
+regular `codex exec` path, `node` means a local app-server on the selected
+AgentWithU executor, and `ssh` means an app-server transported over SSH.
+`node` is the normal way to take over existing Codex threads on a home executor
+reached through AgentWithU Relay; it does not require SSH or a public home IP.
+
+App-server sessions do not spawn `codex exec`. `CodexOfficeBackend` starts
+`codex app-server --listen stdio://` locally on the executor or through OpenSSH,
+then talks JSON-RPC over the process's stdin/stdout (directly for `node`, through SSH for
+`ssh`). `session.agent_session_id` is the native Codex
+thread id, so a newly created thread or an attached existing thread can be resumed.
+Because `thread/read`, reasoning and command-output events can each arrive as one
+large JSONL line, both the app-server reader and ordinary `codex exec --json`
+reader share a 128MiB line limit instead of asyncio's small default. AgentWithU
+mirrors only the latest 200 visible user/assistant messages and at most roughly
+4 million characters into its own session/Relay response; this does not truncate
+the native Codex thread or its resumed context.
+
+The New Session dialog exposes only normal creation and takeover of a thread on
+the selected AgentWithU executor. `codexLocalThreads` lists those threads. The
+earlier direct SSH-host creation UI was removed; persisted SSH sessions and the
+backend transport remain readable for compatibility, but new clients do not
+discover SSH aliases or create this session kind.
+The takeover inventory explicitly requests user-level source kinds (`cli`,
+`vscode`, `exec`, `appServer`, `unknown`); an empty `sourceKinds` is not “all” in
+app-server and would omit `exec`/`appServer` threads. Internal `subAgent*` threads
+stay hidden.
+
+Thread provenance and execution transport are separate. `Session.codex_thread_attached`
+records that the AgentWithU session was created by attaching an existing native Codex
+thread; `codex_connection_mode="ssh"` records that Codex commands execute through SSH.
+Both may be true at once. The Sidebar therefore renders independent `🧲 接管` and
+`⌁ SSH Codex` badges instead of deriving one meaning from the other.
 
 ### Visualized Loop Integration (loop sessions)
 
@@ -342,9 +382,15 @@ a per-position **`backends` map** (`{idea, goal, analysis, aside}` → backend i
 each empty = follow the session) so every "AI analysis/transformation" point can run
 on a **different backend** than the executor for heterogeneous cross-evaluation —
 these all run on independent contexts so cross-backend is safe; execution
-(execute/step) always stays on the session backend. The backend actually used per
+(execute/step) always stays on the session backend. A separate per-position
+**`runtimes` map** (`{execute, idea, goal, analysis, aside}` →
+`{model, reasoningEffort}`) lets one Codex backend use different models/effort by
+role; non-execute roles inherit the execute profile unless overridden. Thus a
+typical policy can execute with Terra/medium and independently review with
+Sol/max without cloning backend configs. The backend and resolved runtime actually used per
 loop is persisted on `LoopRecord.backends` (`{execute, analysis}`) and the payload
-resolves them to readable labels (`backendLabels`, injected by `_loop_payload`); the
+also stores `LoopRecord.runtimes`; `_loop_payload` resolves both into readable
+labels (`backendLabels`). The
 LoopPanel result sections and the flow-view Execute/Analysis chips show a compact
 **backend tag** (⚙️ 执行 / 🔍 评审) so you can see who executed vs. who reviewed. `_loop_run_agent`/`_run_aside`
 resolve the override and fall back to the session backend if it's missing; legacy
@@ -370,11 +416,11 @@ The shared editor + defaults live in `frontend/src/components/LoopPolicyEditor.t
 
 **Model capability ledger (cross-session, `model_ledger.ModelLedger`).** Foundation
 for agentic allocation: a long-lived ledger at `~/.agent-with-u/model-ledger/ledger.json`
-records, per backend × role (`execute` / `analysis` / …), usage counts and — for
+records, per backend × model × reasoning effort × role (`execute` / `analysis` / …), usage counts and — for
 execution — the analysis score it achieved, accumulated across sessions. Written
 when a loop's analysis completes (executor backend gets the score, eval backend gets
 a participation tick); read via `modelLedgerList` and surfaced in the
-`LoopPolicyEditor` as a "📊 各模型历史表现" reference (execute avg score per backend)
+`LoopPolicyEditor` as a "📊 各模型历史表现" reference (execute average per concrete runtime profile)
 so allocation can be informed by who actually delivers. (Next stages — a routing
 "brain" that picks N backends per task, multi-party plan + pick-best, and an early
 human↔model intent-divergence guard — build on this.)
@@ -411,9 +457,22 @@ files it created, while preserving pre-loop uncommitted/untracked changes. The
 `restore_files` flag rides the `_loop_cancel` dict for the running-discard path.
 The "🗑 停止并删除本次" button shows in the execute ops row while running or resumable.
 
+**Manual takeover (`control_mode`).** A loop session keeps `session_type="loop"`
+but can switch its persisted `LoopState.control_mode` between `loop` and `manual`.
+Only an idle `loopexecute` session with no resumable half-finished pass can call
+`loopTakeover`; takeover disables auto-run and appends a `LoopRecord(kind="manual")`.
+`ChatPane` then renders the ordinary chat surface for the same session. Each completed
+user/assistant exchange is mirrored into `manual_messages` (including tool calls and
+thinking metadata) and into sequential `LoopStep` entries. The record also freezes a
+read-only `manual_context` digest of the goal and earlier loop results, which is injected
+into the first manual turn and remains inspectable in LoopPanel. `loopRelease` is allowed
+only after the chat response stops; it seals the manual record without inventing an
+analysis score and returns ownership to LOOP. The next automated prepare sees the manual
+record through loop history. Opening and immediately releasing creates no empty pass.
+
 Loop RPCs: `loopGetState`, `loopSubmitIdea`, `loopRemoveIdea`, `loopSealIdea`,
 `loopSetGoal`, `loopRefineGoal`, `loopSetPolicy`, `loopRunIteration`, `loopDiscard`,
-`loopSetAuto`, `loopAdvanceToOut`, `loopContinue`, `loopAsk`, `loopAddAddon`,
+`loopTakeover`, `loopRelease`, `loopSetAuto`, `loopAdvanceToOut`, `loopContinue`, `loopAsk`, `loopAddAddon`,
 `loopRemoveAddon`, `loopEditAddon`. `createSession` takes an optional third `session_type` argument.
 
 ### Normal-session side features (序列任务 + By the way)
@@ -429,9 +488,11 @@ streaming saves. A process-level cache (`_chat_extras` / `_chat_extras_get` /
   the user lines up; they are sent into the main conversation **one at a time** — the
   next is sent only after the model has **fully finished** answering the previous turn.
   Persistence + ordering live server-side; **dispatch** is driven in the frontend
-  (`ChatPane`) off `useChat`'s `isStreaming` done-edge: an effect waits for
-  `!isStreaming`, then `seqtaskTakeNext` (atomically pops the head — race-safe across
-  panes/clients) and `chat.doSend`s it (raw, bypassing slash-command interception).
+  (`ChatPane`) only after an explicit `done` edge. `error` is a diagnostic frame, not
+  a completion signal. `seqtaskTakeNext` also checks the executor's authoritative
+  main-turn registry and uses a short dispatch reservation, so Relay reconnects and
+  multiple clients cannot pop the next item while the prior turn is still alive;
+  then `chat.doSend` sends it raw (bypassing slash-command interception).
   There is no explicit sequence-mode switch. When the conversation is idle, the first
   Enter sends normally; while a response is streaming (or a queue already exists),
   subsequent input is added with `seqtaskAdd` and the active chain drains it automatically.
@@ -611,7 +672,12 @@ The old modal diff/pull/push dialog (`DirSyncPanel`, removed) was reworked into 
 VSCode-explorer-style tree living in the **Sidebar** as a switchable view (a 💬/🗂
 tab toggle in the sidebar header; `view: 'sessions' | 'files'`). `FileTreePanel`
 shows a **single unified tree** of the focused session's working dir (Synology-Drive
-style — one list, per-file status badge), not two separate 远端/本地 lists. App feeds
+style — one list, per-file status badge), not two separate 远端/本地 lists. For remote
+sessions its visible nodes are the **union** of lazy-loaded remote directory entries
+and a pre-indexed local manifest tree: local-only files/directories appear with a 💻
+state and upload action, remote-only entries with ☁️ and download, while matching
+paths merge into one node. Local-only files preview/edit from `LocalFs`; matching or
+remote-only files preview/edit from the executor. App feeds
 the Sidebar `activeWorkingDir/activeExecKey/activeExecLabel/activeExecMode` from the
 focused session (all in the Sidebar memo comparator).
 
@@ -654,9 +720,27 @@ Folder push/pull gathers its file list from the manifest (compare on) or by walk
 `listDirectory`/`listDir` (compare off).
 
 **Preview & layout.** Clicking a file (or its 👁 hover action / double-click) opens a
-centered preview overlay — read with `syncReadFile`/`LocalFs.readFile` (remote respects
-the `tooLarge` flag), capped at 200KB. Rendering reuses deps already bundled for chat
-(no new weight): **code** is syntax-highlighted with `highlight.js` (ext→lang via
+centered preview overlay. Text/images use `syncReadFile`/`LocalFs.readFile` (remote
+respects the `tooLarge` flag) and text is capped at 200KB. Larger rich formats are read
+in 512KiB chunks (`syncReadChunk`/`LocalFs.readChunk`) with a visible percentage and a
+bounded preview cap (PDF 64MiB; ZIP/XML documents 32MiB), so there is no oversized WS
+frame. **PDF** uses a locally bundled PDF.js worker with offline CMaps, standard fonts
+and the worker's bundled image decoders; it renders one page at a time with paging/zoom to bound memory.
+**DOCX** uses lazy-loaded `docx-preview` (no Office/LibreOffice process) and falls back
+automatically to the stdlib OOXML semantic parser if layout rendering fails. **Draw.io**
+uses the official pinned `viewer-static.min.js` in a network-blocked sandboxed iframe,
+with a manual switch to the existing simplified SVG parser. The app parses Draw.io
+`<diagram id/name>` metadata itself, so both modes share an explicit Sheet tab row;
+both support zoom/fit/1:1 and left-button pan (plus wheel zoom), while the compatibility
+SVG uses a bounded transform canvas instead of a clipped `<img>`. The whole preview
+overlay has a viewport-maximize/restore toggle (Escape restores before closing).
+**XLSX/XLSM/PPTX** retain
+the deterministic structured table/slide preview; legacy `.doc/.xls/.ppt` report that
+conversion is unsupported rather than requiring a heavyweight office suite. All rich
+engines are lazy chunks; PDF.js build assets are copied from the locked npm package by
+`scripts/copy-preview-assets.mjs`, while the Draw.io viewer is vendored at a fixed commit.
+
+For ordinary files, **code** is syntax-highlighted with `highlight.js` (ext→lang via
 `LANG_ALIAS`, else `highlightAuto`) into `.md-pre/.hljs` (globally themed); **markdown**
 (`.md/.markdown/.mdx`) renders through `markdownToHtml` (marked) with a 👁 预览 / `</>` 源码
 toggle; **images** show as a `data:` URL. Text files are also **editable** in place: an

@@ -120,7 +120,7 @@ export function processStreamDelta(sessionId: string, delta: any): {
   const mid = delta.messageId;
 
   // 如果是新消息，初始化状态
-  if (state.messageId !== mid && delta.type !== 'done' && delta.type !== 'error') {
+  if (state.messageId !== mid && delta.type !== 'done') {
     state.messageId = mid;
     state.text = '';
     state.thinking = '';
@@ -288,8 +288,10 @@ export function processStreamDelta(sessionId: string, delta: any): {
     }
 
     case 'error': {
-      state.isStreaming = false;
-      // ★ 保存错误信息到 text，让前端能显示错误
+      // error 是诊断帧，不是生命周期终态。CLI / app-server 可能先报告一次
+      // 可恢复的网络错误，随后仍在同一 turn 中继续输出；只有显式 done 才能
+      // 释放主链路并触发下一条序列任务。
+      state.isStreaming = true;
       const errorMsg = delta.error || '未知错误';
       state.text = state.text + `\n\n**错误**: ${errorMsg}`;
       break;

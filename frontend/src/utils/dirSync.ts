@@ -129,6 +129,14 @@ export interface LocalFs {
   listDir(rel: string): Promise<LocalEntry[]>;
   readFile(rel: string): Promise<string>; // base64
   writeFile(rel: string, base64: string): Promise<void>;
+  fileSize(rel: string): Promise<number>;
+  readChunk(rel: string, offset: number, size: number): Promise<string>;
+  writeStart(rel: string, transferId: string): Promise<void>;
+  writeChunk(rel: string, transferId: string, offset: number, base64: string): Promise<void>;
+  writeFinish(rel: string, transferId: string, expectedSize: number): Promise<void>;
+  writeAbort(rel: string, transferId: string): Promise<void>;
+  /** 桌面端在资源管理器中定位；浏览器安全模型不允许时抛出明确错误。 */
+  reveal(rel: string): Promise<void>;
   deleteFile(rel: string): Promise<void>;
 }
 
@@ -191,6 +199,27 @@ export class TauriLocalFs implements LocalFs {
   writeFile(rel: string, base64: string): Promise<void> {
     return tauriInvoke<void>('dir_sync_write_file', { dir: this.dir, rel, data: base64 });
   }
+  fileSize(rel: string): Promise<number> {
+    return tauriInvoke<number>('dir_sync_file_size', { dir: this.dir, rel });
+  }
+  readChunk(rel: string, offset: number, size: number): Promise<string> {
+    return tauriInvoke<string>('dir_sync_read_chunk', { dir: this.dir, rel, offset, size });
+  }
+  writeStart(rel: string, transferId: string): Promise<void> {
+    return tauriInvoke<void>('dir_sync_write_start', { dir: this.dir, rel, transferId });
+  }
+  writeChunk(rel: string, transferId: string, offset: number, base64: string): Promise<void> {
+    return tauriInvoke<void>('dir_sync_write_chunk', { dir: this.dir, rel, transferId, offset, data: base64 });
+  }
+  writeFinish(rel: string, transferId: string, expectedSize: number): Promise<void> {
+    return tauriInvoke<void>('dir_sync_write_finish', { dir: this.dir, rel, transferId, expectedSize });
+  }
+  writeAbort(rel: string, transferId: string): Promise<void> {
+    return tauriInvoke<void>('dir_sync_write_abort', { dir: this.dir, rel, transferId });
+  }
+  reveal(rel: string): Promise<void> {
+    return tauriInvoke<void>('dir_sync_reveal', { dir: this.dir, rel });
+  }
   deleteFile(rel: string): Promise<void> {
     return tauriInvoke<void>('dir_sync_delete_file', { dir: this.dir, rel });
   }
@@ -199,6 +228,7 @@ export class TauriLocalFs implements LocalFs {
 /** 浏览器：副本目录是 File System Access API 的目录句柄。 */
 export class BrowserLocalFs implements LocalFs {
   readonly kind = 'browser' as const;
+  private writers = new Map<string, any>();
   // handle 类型依赖 lib.dom 版本，统一用 any 规避版本差异
   constructor(private handle: any) {}
   label(): string {
@@ -255,6 +285,39 @@ export class BrowserLocalFs implements LocalFs {
     const w = await fh.createWritable();
     await w.write(base64ToUint8Array(base64));
     await w.close();
+  }
+  async fileSize(rel: string): Promise<number> {
+    const fh = await this._fileHandle(rel, false);
+    return (await fh.getFile()).size;
+  }
+  async readChunk(rel: string, offset: number, size: number): Promise<string> {
+    const fh = await this._fileHandle(rel, false);
+    const file = await fh.getFile();
+    return arrayBufferToBase64(await file.slice(offset, offset + size).arrayBuffer());
+  }
+  async writeStart(rel: string, transferId: string): Promise<void> {
+    if (this.writers.has(transferId)) throw new Error('传输标识重复');
+    const fh = await this._fileHandle(rel, true);
+    this.writers.set(transferId, await fh.createWritable());
+  }
+  async writeChunk(_rel: string, transferId: string, offset: number, base64: string): Promise<void> {
+    const writer = this.writers.get(transferId);
+    if (!writer) throw new Error('写入会话不存在');
+    await writer.write({ type: 'write', position: offset, data: base64ToUint8Array(base64) });
+  }
+  async writeFinish(_rel: string, transferId: string, _expectedSize: number): Promise<void> {
+    const writer = this.writers.get(transferId);
+    if (!writer) throw new Error('写入会话不存在');
+    this.writers.delete(transferId);
+    await writer.close();
+  }
+  async writeAbort(_rel: string, transferId: string): Promise<void> {
+    const writer = this.writers.get(transferId);
+    this.writers.delete(transferId);
+    if (writer?.abort) await writer.abort();
+  }
+  async reveal(_rel: string): Promise<void> {
+    throw new Error('浏览器安全限制不允许直接打开系统文件管理器，请使用桌面客户端');
   }
   async deleteFile(rel: string): Promise<void> {
     const parts = rel.split('/').filter(Boolean);

@@ -146,6 +146,38 @@ API Key:   ollama                      # 任意非空字符串
 
 DeepSeek、Moonshot、零一万物等 OpenAI 兼容接口同理。
 
+### 接管执行节点上的已有 Codex 会话
+
+如果 Codex 运行在家里的电脑，而当前 AgentWithU 通过 Relay 使用那台电脑作为
+执行节点，新建会话时选择：
+
+1. 家里的 AgentWithU 执行节点；
+2. Codex Office backend；
+3. **接管已有**；
+4. 目标 Codex thread。
+
+thread 的枚举、历史读取、文件操作和后续回答都在家里的执行节点完成，客户端
+只走既有 AgentWithU Relay，因此不需要家庭公网 IP、端口映射或 SSH 配置。
+家里的执行节点需以拥有这些 Codex 会话的同一系统用户运行，并能调用独立安装的
+Codex CLI。
+
+### 接入 Codex SSH Remote（可选）
+
+新建 Codex 会话时，可以把运行位置切换为 **SSH Remote**。AgentWithU 会读取
+`~/.ssh/config` 中的主机别名，通过 SSH 在目标机器启动
+`codex app-server --listen stdio://`，无需额外暴露 Codex 端口。
+
+远端机器需要先安装 Codex CLI 并完成登录，且本机执行 `ssh <别名>` 能正常连接。
+创建时可选择：
+
+- 新建远端 Codex thread；
+- 接入已有 thread，导入其可见对话并继续原生上下文。
+
+远端会话的工作目录是目标机器上的路径。为避免把远端路径误当成本机路径，
+当前文件树不直接浏览该目录；Codex 的读写与命令工具仍在远端工作目录执行。
+项目级 Skills 也以远端机器该目录中已安装的内容为准，AgentWithU 不会把本机
+Skill 文件误写到同名的本地路径。
+
 ---
 
 ## Slash 命令

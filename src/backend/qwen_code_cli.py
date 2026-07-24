@@ -344,6 +344,7 @@ class QwenCodeSdkBackend(ModelBackend):
         on_permission_request: Optional[Callable[[PermissionRequest], Awaitable[bool]]] = None,
         constraints: Optional[str] = None,
         sandbox_enabled: bool = True,
+        model_override: Optional[str] = None,
     ) -> dict:
         self.clear_cancelled(session_id)
 
@@ -369,7 +370,7 @@ class QwenCodeSdkBackend(ModelBackend):
             return {}
 
         cwd = working_dir or getattr(self.config, "working_dir", None) or "."
-        model = self.get_env("QWEN_MODEL") or self.config.model
+        model = (model_override or "").strip() or self.get_env("QWEN_MODEL") or self.config.model
         auth_type = (self.get_env("QWEN_PROVIDER")
                      or self.get_env("QWEN_AUTH_TYPE")
                      or "openai")

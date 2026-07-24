@@ -3,8 +3,9 @@
   "private": true,
   "version": "0.1.0",
   "scripts": {
-    "dev": "vite",
-    "build": "tsc --noEmit && vite build",
+    "prepare:preview-assets": "node scripts/copy-preview-assets.mjs",
+    "dev": "npm run prepare:preview-assets && vite",
+    "build": "npm run prepare:preview-assets && tsc --noEmit && vite build",
     "preview": "vite preview"
   },
   "dependencies": {
@@ -31,8 +32,10 @@
     "@tauri-apps/plugin-dialog": "^2.6.0",
     "@tauri-apps/plugin-global-shortcut": "^2.3.1",
     "codemirror": "^6.0.1",
+    "docx-preview": "^0.4.0",
     "highlight.js": "^11.11.1",
     "marked": "^9.1.6",
+    "pdfjs-dist": "^4.8.69",
     "react": "^18.2.0",
     "react-dom": "^18.2.0"
   },

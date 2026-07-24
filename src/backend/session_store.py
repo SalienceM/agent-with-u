@@ -146,7 +146,15 @@ class SessionStore:
                 updated_at=data["updatedAt"],
                 messages=messages,
                 backend_id=data["backendId"],
+                model_override=data.get("modelOverride"),
+                reasoning_effort=data.get("reasoningEffort"),
                 agent_session_id=data.get("agentSessionId"),
+                codex_connection_mode=data.get("codexConnectionMode"),
+                codex_remote_host=data.get("codexRemoteHost"),
+                # 旧版 node 模式只允许选择既有 thread，可安全迁移为 attached。
+                codex_thread_attached=bool(data.get(
+                    "codexThreadAttached", data.get("codexConnectionMode") == "node",
+                )),
                 working_dir=data.get("workingDir"),
                 auto_continue=data.get("autoContinue", True),
                 skip_permissions=data.get("skipPermissions", True),

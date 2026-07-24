@@ -1150,6 +1150,25 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
                   </div>
                 </div>
 
+                {(formData.env?.AGENTWITHU_CODEX_PROXY_MODE === 'system' ||
+                  formData.env?.AGENTWITHU_CODEX_PROXY_MODE === 'custom' ||
+                  (!formData.env?.AGENTWITHU_CODEX_PROXY_MODE && !!formData.env?.HTTPS_PROXY)) && (
+                  <div style={{ marginBottom: 10 }}>
+                    <label style={{ fontSize: 11, color: 'var(--theme-text)', display: 'flex', alignItems: 'center', gap: 7, cursor: 'pointer' }}>
+                      <input
+                        type="checkbox"
+                        checked={formData.env?.AGENTWITHU_CODEX_FORCE_HTTP !== 'false'}
+                        onChange={(e) => handleEnvChange('AGENTWITHU_CODEX_FORCE_HTTP', e.target.checked ? 'true' : 'false')}
+                        style={{ accentColor: 'var(--theme-accent)' }}
+                      />
+                      HTTP 兼容传输（代理环境推荐）
+                    </label>
+                    <div style={{ fontSize: 11, color: 'var(--theme-text-muted)', margin: '4px 0 0 22px', lineHeight: 1.5 }}>
+                      跳过容易断开的 Codex WebSocket 上游，直接使用 HTTP/SSE；不影响 AgentWithU 自身的实时输出。
+                    </div>
+                  </div>
+                )}
+
                 {(formData.env?.AGENTWITHU_CODEX_PROXY_MODE === 'custom' ||
                   (!formData.env?.AGENTWITHU_CODEX_PROXY_MODE && !!formData.env?.HTTPS_PROXY)) && (
                 <div style={{ marginBottom: 10 }}>
@@ -1252,7 +1271,7 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
 
                 <div style={{ marginBottom: 10 }}>
                   <label style={{ fontSize: 11, color: 'var(--theme-text)', display: 'block', marginBottom: 4 }}>
-                    模型（--model，可选）
+                    默认模型（可选；会话 / Loop 角色可覆盖）
                   </label>
                   <input
                     type="text"
@@ -1268,7 +1287,7 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
                     ))}
                   </datalist>
                   <div style={{ fontSize: 11, color: 'var(--theme-text-muted)', marginTop: 5, lineHeight: 1.5 }}>
-                    推荐默认：<code style={{ fontSize: 10 }}>{CODEX_DEFAULT_MODEL}</code>。可手填新模型；官方列表见{' '}
+                    这里只设置该 Backend 的兜底模型，不需要为 Sol / Terra 重复建 Backend。推荐默认：<code style={{ fontSize: 10 }}>{CODEX_DEFAULT_MODEL}</code>。可手填新模型；官方列表见{' '}
                     <a href="https://developers.openai.com/codex/models" target="_blank" rel="noreferrer" style={{ color: 'var(--theme-accent)' }}>Codex Models</a>
                     {' '}；用量/5h 窗口见{' '}
                     <a href="https://developers.openai.com/codex/pricing" target="_blank" rel="noreferrer" style={{ color: 'var(--theme-accent)' }}>Codex Pricing</a>。
@@ -1781,11 +1800,14 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
 const overlayStyle: React.CSSProperties = {
   position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.6)',
   display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 1000,
+  padding: 16, boxSizing: 'border-box', overflowY: 'auto',
 };
 
 const panelStyle: React.CSSProperties = {
   background: 'var(--theme-bg-tertiary)', border: '1px solid var(--theme-border)', borderRadius: 12,
-  padding: 24, width: '90%', maxWidth: 520, maxHeight: '85vh', overflowY: 'auto',
+  padding: 24, width: '90%', maxWidth: 520,
+  maxHeight: 'calc(100dvh - 32px)', overflowY: 'auto',
+  overscrollBehavior: 'contain', boxSizing: 'border-box',
 };
 
 const closeBtnStyle: React.CSSProperties = {

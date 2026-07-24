@@ -52,6 +52,7 @@ const SECTIONS: ManualSection[] = [
     items: [
       { icon: '💡', title: 'Idea 构想阶段', summary: '并行扩展多个想法，支持文字和图片。封存后综合成全局目标，原始诉求仍保留可追溯。', entry: '新建 Loop 会话 → Idea' },
       { icon: '▶', title: 'Execute 迭代', summary: '每轮都是对完整目标的一次最佳尝试，依次进行 Prepare、Execute、Analysis；步骤可串行或并行。', entry: 'Loop 面板 → 开始本轮' },
+      { icon: '✋', title: '人工接管', summary: 'LOOP 完全停止且没有待恢复的半截任务时，可切到普通会话亲自接管。人工对话、工具调用和操作步骤会保存为一轮 Manual LOOP，回答结束后可交还自动 LOOP。', entry: 'Loop Execute 操作区 → 人工接管', tips: '运行中不能切换；先暂停 Auto，等待本轮完成。' },
       { icon: '◎', title: '独立评审', summary: '可用不同模型独立评分执行结果，降低执行者自评过高的问题；得分、风险和趋势决定是否继续。', entry: 'Loop → 策略与心智' },
       { icon: '⚙', title: '策略与心智', summary: '设置交付分、输出分、最大轮数、风险阈值、执行/评审模型和强制遵循的策略。支持预设。', entry: 'Loop 面板 → ⚙ 策略与心智' },
       { icon: '📎', title: 'Addon 执行中补充', summary: '运行期间追加文字或图片要求，不影响当前轮，从下一轮 Prepare 开始吸收；已应用内容保留历史。', entry: 'Loop Execute 阶段 → Addon' },
@@ -66,19 +67,20 @@ const SECTIONS: ManualSection[] = [
     id: 'project', title: '项目与版本', icon: '📦', intro: '查看文件、比较改动并完成 Git 工作流。',
     items: [
       { icon: '🌳', title: '工作目录树', summary: '浏览项目文件和目录，查看已暂存/未暂存计数，打开文本文件预览或编辑。', entry: '左侧栏「文件」视图' },
-      { icon: '👁', title: '文件预览与编辑', summary: '点击文件查看内容；支持代码编辑、保存及 Diff 对比。二进制文件使用相应预览方式。', entry: '文件行的预览图标 / 点击文件名' },
+      { icon: '👁', title: '文件预览与编辑', summary: '点击文件查看内容；预览窗可一键最大化。PDF、DOCX 与 Draw.io 使用完全离线的专用渲染器，Excel/PPT 使用快速结构化预览；文本和代码可直接编辑保存。', entry: '文件行的预览图标 / 点击文件名', tips: 'DOCX 版式渲染失败会自动切换兼容预览；Draw.io 支持 Sheet 切换、滚轮缩放、左键拖动画布及官方 / 兼容渲染切换。' },
       { icon: '±', title: 'Diff 变更对比', summary: '查看文件相对版本库的新增、删除和修改，辅助确认提交范围。', entry: '提交变更面板 → 点击文件名' },
       { icon: '＋', title: '加入版本追踪', summary: '将未跟踪文件执行 Git add，支持逐项操作和分组全选。', entry: '提交变更 → 未跟踪文件' },
       { icon: '✅', title: '提交与推送', summary: '选择要提交的文件，填写或让 AI 生成提交说明；提交推送会等待推送真正完成后再返回主界面。', entry: '左侧栏「提交」' },
       { icon: '📥', title: 'Stash 暂存工作区', summary: '临时收起尚未提交的修改，让工作区恢复干净；之后需要 Apply/Pop 拉回才能继续提交。', entry: 'Git 操作区', tips: 'Stash 不是提交，也不会自动进入其他分支。' },
-      { icon: '⇄', title: '本机 / 远端目录同步', summary: '远程 session 可单独指定一个本机目录，与执行节点目录进行比对、推送或拉取；每个 session 独立保存，建好后也能随时更换。', entry: '左侧「文件」视图 → 本机目录「指定 / 更换」' },
+      { icon: '⇄', title: '本机 / 远端双向同步', summary: '文件树合并展示两端内容：💻 本机独有可上传，☁ 远端独有可下载；比对后显示一致、不同或冲突。每个远程 session 独立保存本机目录，建好后也能随时更换。', entry: '左侧「文件」视图 → 本机目录「指定 / 更换 / 比对」' },
     ],
   },
   {
     id: 'models', title: '模型与连接', icon: '🌐', intro: '选择模型、代理方式和任务实际运行的机器。',
     items: [
-      { icon: '🤖', title: '多模型后端', summary: '支持 Codex CLI、Claude Code、Qwen Code、OpenAI 兼容接口等后端，每个后端可独立设置模型和环境。', entry: '设置 → Backend Manager / 新建会话' },
-      { icon: '🔀', title: '当前模型', summary: '顶栏只显示当前实际模型参数，不重复 backend 名称；backend 归属已在左侧会话列表展示。Loop 可为构想、目标、评审和旁路分别指定模型。', entry: '顶栏 🤖 模型参数 / Loop 策略' },
+      { icon: '🤖', title: 'Backend 与运行参数', summary: 'Backend 负责账号、连接、CLI 和默认值；新建 Codex 会话时再选具体模型与推理档位，不必为 Sol / Terra 复制 Backend。', entry: '设置 → Backend Manager / 新建会话' },
+      { icon: '🧲', title: '接管已有 Codex 会话', summary: '从当前所选 AgentWithU 执行节点读取原生 Codex threads，导入可见历史并继续同一上下文。家里执行节点通过 Relay 连接时，不需要家庭公网 IP 或 SSH。', entry: '新建会话 → 选择执行节点 → Codex → 接管已有', tips: '执行节点应以拥有这些 Codex 会话的同一系统用户运行，并已安装独立 Codex CLI。' },
+      { icon: '🔀', title: 'Loop 分角色模型', summary: '任务执行、想法、目标、评审和旁路可分别覆盖模型与档位。例如执行用 Terra / medium，评审用 Sol / max；每次结果会记录实际选型。', entry: 'Loop → 策略与心智 → 角色运行配置' },
       { icon: '🛡', title: '权限确认', summary: '控制模型执行写文件和命令时是否逐次确认。跳过确认更流畅，但会按当前进程权限直接执行。', entry: '输入工具栏 ⚡（悬浮查看说明）' },
       { icon: '🧭', title: '代理与网络', summary: '为 Codex/Qwen 等 CLI 配置系统代理或自定义 HTTP 代理，不要求系统全局代理或 TUN。', entry: 'Backend Manager → 环境/代理配置' },
       { icon: '📡', title: '连接池与执行节点', summary: '同一界面可连接本机或多个远端执行节点；新建会话时选择归属节点，之后任务固定在该节点执行。', entry: '顶栏 📡 → 可分配执行节点' },

@@ -528,12 +528,15 @@ export const Settings: React.FC<SettingsProps> = ({
 const overlayStyle: React.CSSProperties = {
   position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.6)',
   display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 1000,
+  padding: 16, boxSizing: 'border-box', overflowY: 'auto',
 };
 const panelStyle: React.CSSProperties = {
   background: 'var(--theme-bg-tertiary, #1e1e36)',
   border: '1px solid var(--theme-border, rgba(255,255,255,0.1))',
   borderRadius: 12,
-  padding: 24, width: '90%', maxWidth: 440, maxHeight: '80vh', overflowY: 'auto',
+  padding: 24, width: '90%', maxWidth: 440,
+  maxHeight: 'calc(100dvh - 32px)', overflowY: 'auto',
+  overscrollBehavior: 'contain', boxSizing: 'border-box',
 };
 const closeBtnStyle: React.CSSProperties = {
   background: 'none', border: 'none',

@@ -175,7 +175,21 @@ class Session:
     messages: list[ChatMessage]
     working_dir: str  # ★ Primary: Working directory is the identity of a session
     backend_id: str  # Backend config ID for this session
+    # ★ 运行参数与 Backend 解耦。Backend 表示账号/连接/运行器；同一个 Codex
+    #   Backend 可按会话选择不同模型与 reasoning effort。None 表示沿用 Backend/
+    #   Codex 自身默认配置，非 Codex Backend 会安全忽略这两个字段。
+    model_override: Optional[str] = None
+    reasoning_effort: Optional[str] = None
     agent_session_id: Optional[str] = None
+    # Codex transport: empty = regular local CLI, "node" = app-server on the
+    # selected AgentWithU executor, "ssh" = app-server reached through SSH.
+    codex_connection_mode: Optional[str] = None
+    # Codex SSH Remote host alias from ~/.ssh/config (only for mode="ssh").
+    codex_remote_host: Optional[str] = None
+    # Whether this AgentWithU session originated by attaching an existing
+    # native Codex thread. This is independent from the execution transport:
+    # an SSH session may be both remote and attached.
+    codex_thread_attached: bool = False
     # Auto-continue on max_tokens
     auto_continue: bool = True
     # ★ Skip permission confirmation for sensitive tools (Bash/Edit/Write)
@@ -208,7 +222,12 @@ class Session:
             "messages": [m.to_dict() for m in self.messages],
             "workingDir": self.working_dir,  # ★ Prominent: directory is primary
             "backendId": self.backend_id,
+            "modelOverride": self.model_override,
+            "reasoningEffort": self.reasoning_effort,
             "agentSessionId": self.agent_session_id,
+            "codexConnectionMode": self.codex_connection_mode,
+            "codexRemoteHost": self.codex_remote_host,
+            "codexThreadAttached": self.codex_thread_attached,
             "autoContinue": self.auto_continue,
             "skipPermissions": self.skip_permissions,
             "sandboxEnabled": self.sandbox_enabled,
@@ -231,6 +250,11 @@ class Session:
             "messageCount": len(self.messages),
             "workingDir": self.working_dir,  # ★ Show directory in sidebar
             "backendId": self.backend_id,
+            "modelOverride": self.model_override,
+            "reasoningEffort": self.reasoning_effort,
+            "codexConnectionMode": self.codex_connection_mode,
+            "codexRemoteHost": self.codex_remote_host,
+            "codexThreadAttached": self.codex_thread_attached,
             "abilities": self.abilities,
             "sessionType": self.session_type,
             "autoCommit": self.auto_commit,

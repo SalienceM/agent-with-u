@@ -155,7 +155,15 @@ export function clearSessionHistoryCache(sessionId: string): void {
   sessionHistoryCache.delete(sessionId);
 }
 
-export function useChat(sessionId: string, backendId: string, backends?: any[], skipPermissions: boolean = true, onNewSession?: () => void, onClearContext?: () => void) {
+export function useChat(
+  sessionId: string,
+  backendId: string,
+  backends?: any[],
+  skipPermissions: boolean = true,
+  onNewSession?: () => void,
+  onClearContext?: () => void,
+  sessionRuntime?: { modelOverride?: string; reasoningEffort?: string },
+) {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [isStreaming, setIsStreaming] = useState(false);
   const [autoContinue, setAutoContinue] = useState(true);
@@ -209,6 +217,7 @@ export function useChat(sessionId: string, backendId: string, backends?: any[], 
     if (!sessionId) {
       // session 被删除或未选中 → 清空聊天区
       setMessages([]);
+      isStreamingRef.current = false;
       setIsStreaming(false);
       setMessagesTotal(0);
       setHasMore(false);
@@ -267,6 +276,7 @@ export function useChat(sessionId: string, backendId: string, backends?: any[], 
       // 啥都没:空,等 loadSession。绝不渲染幽灵 tail。
       setMessages([]);
     }
+    isStreamingRef.current = hasActiveStream;
     setIsStreaming(hasActiveStream);
     if (hasActiveStream) syncFromGlobalState(globalState);
 
@@ -367,6 +377,7 @@ export function useChat(sessionId: string, backendId: string, backends?: any[], 
       } else if (data.type === 'context_cleared') {
         // ★ clearSessionContext：清空对话窗口，session 本身不变
         setMessages([]);
+        isStreamingRef.current = false;
         setIsStreaming(false);
       }
     });
@@ -380,24 +391,31 @@ export function useChat(sessionId: string, backendId: string, backends?: any[], 
     });
   }, [sessionId]);
 
-  // ── ★ WebSocket 重连后重置卡死的流式状态 ──
+  // ── ★ WebSocket 重连后向执行节点核对权威运行态 ──
   useEffect(() => {
     let wasDisconnected = false;
-    return api.onConnectionStatus((connected) => {
+    let cancelled = false;
+    const unsubscribe = api.onSessionConnectionStatus(sessionId, (connected) => {
       if (!connected) {
         wasDisconnected = true;
         return;
       }
-      // 重连成功：如果当前仍在 streaming 状态，说明流式被中断，需要重置
+      // Relay 断开只代表 UI 暂时收不到帧，执行节点上的 CLI 可能仍在继续。
+      // 过去这里无条件清成 idle，会直接触发序列队列的下一题，形成双回答。
       if (wasDisconnected && isStreamingRef.current) {
-        console.warn('[useChat] WS reconnected while streaming — resetting stuck state');
-        setIsStreaming(false);
-        clearStreamState(sessionId);
-        // 重新加载 session 消息以恢复最新持久化状态
-        api.loadSession(sessionId).then((session) => {
+        void (async () => {
+          const runState = await api.getSessionRunState(sessionId);
+          if (cancelled) return;
+          if (runState.status !== 'ok' || runState.busy) {
+            console.info('[useChat] reconnected; remote turn is still running');
+            return;
+          }
+
+          console.info('[useChat] reconnected; remote turn already finished, reloading session');
+          const session = await api.loadSession(sessionId);
+          if (cancelled) return;
           if (session?.messages) {
             const loaded = session.messages.map(normalizeMessage);
-            // ★ 同样防丢：重连期间 doSend 可能已追加了本地用户消息
             setMessages((prev) => {
               const loadedIds = new Set(loaded.map((m: ChatMessage) => m.id));
               const locals = prev.filter((m: ChatMessage) => !loadedIds.has(m.id));
@@ -405,10 +423,17 @@ export function useChat(sessionId: string, backendId: string, backends?: any[], 
               return [...loaded, ...locals];
             });
           }
-        });
+          clearStreamState(sessionId);
+          isStreamingRef.current = false;
+          setIsStreaming(false);
+        })();
       }
       wasDisconnected = false;
     });
+    return () => {
+      cancelled = true;
+      unsubscribe();
+    };
   }, [sessionId]);
 
   // ── 流式 delta 监听 ──
@@ -562,6 +587,7 @@ export function useChat(sessionId: string, backendId: string, backends?: any[], 
               };
             });
           });
+          isStreamingRef.current = false;
           setIsStreaming(false);
           break;
         }
@@ -569,33 +595,27 @@ export function useChat(sessionId: string, backendId: string, backends?: any[], 
         case 'error': {
           flushNow();
 
+          // error 只是本轮中的诊断帧。远端 Codex / Relay 可能报告一次可恢复
+          // 的传输错误后继续同一个 turn；只有随后明确到达的 done 才是终态。
           const errText = state.text;
           const errThinking = state.thinking || undefined;
           const errToolCalls = state.toolCalls.length > 0 ? [...state.toolCalls] : undefined;
           const errBlocks = state.contentBlocks.length > 0 ? [...state.contentBlocks] : undefined;
           const errElapsed = state.streamStart ? Date.now() - state.streamStart : undefined;
 
-          const sessionState = getStreamState(sessionId);
-          sessionState.text = errText;
-          sessionState.thinking = errThinking || '';
-          sessionState.toolCalls = errToolCalls || [];
-          sessionState.contentBlocks = errBlocks || [];
-          sessionState.isStreaming = false;
-          sessionState.messageId = null;
-
           setMessages((prev) => {
-            // 同上,error 也要兜底
+            // error 可能是本轮第一帧，仍需创建气泡，但保持 streaming。
             if (!prev.some((m) => m.id === mid)) {
               return [
                 ...prev,
                 {
                   id: mid,
                   role: 'assistant',
-                  content: errText + `\n\n**Error:** ${delta.error}`,
+                  content: errText,
                   thinking: errThinking,
                   toolCalls: errToolCalls,
                   contentBlocks: errBlocks,
-                  streaming: false,
+                  streaming: true,
                   elapsed: errElapsed,
                   timestamp: Date.now() / 1000,
                   backendId,
@@ -606,17 +626,18 @@ export function useChat(sessionId: string, backendId: string, backends?: any[], 
               m.id === mid
                 ? {
                     ...m,
-                    content: errText + `\n\n**Error:** ${delta.error}`,
+                    content: errText,
                     thinking: errThinking,
                     toolCalls: errToolCalls,
                     contentBlocks: errBlocks,
-                    streaming: false,
+                    streaming: true,
                     elapsed: errElapsed,
                   }
                 : m
             );
           });
-          setIsStreaming(false);
+          isStreamingRef.current = true;
+          setIsStreaming(true);
           break;
         }
       }
@@ -684,6 +705,7 @@ export function useChat(sessionId: string, backendId: string, backends?: any[], 
       //    边界:如果 backend 直接发 done 没有任何内容 delta(理论上少见,
       //    比如模型空回复),'done' / 'error' 分支会兜底创建气泡。
       setMessages((prev) => [...prev, userMsg]);
+      isStreamingRef.current = true;
       setIsStreaming(true);
 
       // ★ 初始化全局流式状态（会自动清理之前的错误状态）
@@ -852,13 +874,16 @@ export function useChat(sessionId: string, backendId: string, backends?: any[], 
 
         // ── 模型信息 ──
         case '/model': {
-          const backends = await api.getBackends();
-          const current = backends.find((b: any) => b.id === backendId);
+          const available = backends || await api.getBackends();
+          const current = available.find((b: any) => b.id === backendId);
           if (current) {
+            const model = sessionRuntime?.modelOverride || current.model || current.env?.OPENAI_MODEL || '默认';
+            const effort = sessionRuntime?.reasoningEffort || '默认';
             sys(
               `🤖 **当前模型**\n\n` +
               `- 后端: ${current.label}\n` +
-              `- 模型: ${current.model || '默认'}\n` +
+              `- 模型: ${model}\n` +
+              (current.type === 'codex-office' ? `- 推理档位: ${effort}\n` : '') +
               `- 类型: ${current.type}`
             );
           } else {
@@ -1005,7 +1030,7 @@ export function useChat(sessionId: string, backendId: string, backends?: any[], 
           break;
       }
     },
-    [sessionId, backendId]
+    [sessionId, backendId, backends, sessionRuntime?.modelOverride, sessionRuntime?.reasoningEffort]
   );
 
   // ── 公开的 sendMessage（含斜杠命令拦截）──
@@ -1036,6 +1061,7 @@ export function useChat(sessionId: string, backendId: string, backends?: any[], 
     // ★ 按 sessionId 停止，精确定位到当前 session，不影响其他并发 session
     pendingMessageRef.current = null; // 手动停止时清除 pending，不续发
     api.abortMessage(sessionId);
+    isStreamingRef.current = false;
     setIsStreaming(false);
   }, [sessionId]);
 

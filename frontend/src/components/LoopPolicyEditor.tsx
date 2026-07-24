@@ -1,5 +1,11 @@
 import React, { useEffect, useState } from 'react';
 import { api } from '../api';
+import {
+  CodexRuntimeFields,
+  isCodexBackend,
+  normalizeModelRuntime,
+  type ModelRuntime,
+} from './CodexRuntimeFields';
 
 /** Loop 策略与心智（与后端 LoopPolicy 对齐，camelCase）。 */
 export interface LoopPolicy {
@@ -10,6 +16,7 @@ export interface LoopPolicy {
   independentEval: boolean;
   intentGuard: boolean;
   backends: Record<string, string>;   // 各分析/转换位置的专用 backend：{idea/goal/analysis/aside}
+  runtimes: Record<string, ModelRuntime>; // 各角色的模型/推理档位覆盖
   strategy: string;
 }
 
@@ -19,6 +26,11 @@ export const BACKEND_POSITIONS: { key: string; label: string; hint: string }[] =
   { key: 'goal', label: '目标汇总 / 微调', hint: 'ideas→目标 / 微调' },
   { key: 'analysis', label: '评分 / 评审', hint: '关键评审位' },
   { key: 'aside', label: '旁路问答', hint: 'By the way' },
+];
+
+export const RUNTIME_POSITIONS: { key: string; label: string; hint: string }[] = [
+  { key: 'execute', label: '任务执行', hint: 'Prepare / Execute / 分步' },
+  ...BACKEND_POSITIONS,
 ];
 
 export const DEFAULT_STRATEGY =
@@ -42,6 +54,7 @@ export const DEFAULT_POLICY: LoopPolicy = {
   independentEval: true,
   intentGuard: true,
   backends: {},
+  runtimes: {},
   strategy: DEFAULT_STRATEGY,
 };
 
@@ -68,8 +81,16 @@ export function normalizePolicy(p?: Partial<LoopPolicy> | null): LoopPolicy {
     if (!backends.analysis) backends.analysis = oldEb;
     if (!backends.goal) backends.goal = oldEb;
   }
+  const runtimes: Record<string, ModelRuntime> = {};
+  const rawR: any = (d as any).runtimes;
+  if (rawR && typeof rawR === 'object') {
+    for (const { key } of RUNTIME_POSITIONS) {
+      const runtime = normalizeModelRuntime(rawR[key]);
+      if (runtime.model || runtime.reasoningEffort) runtimes[key] = runtime;
+    }
+  }
   const strat = (typeof d.strategy === 'string' && d.strategy.trim()) ? d.strategy : DEFAULT_STRATEGY;
-  return { deliverableScore: del, outputtableScore: out, maxLoops: ml, riskThreshold: rt, independentEval: ie, intentGuard: ig, backends, strategy: strat };
+  return { deliverableScore: del, outputtableScore: out, maxLoops: ml, riskThreshold: rt, independentEval: ie, intentGuard: ig, backends, runtimes, strategy: strat };
 }
 
 function num(v: any, fb: number): number { const n = Number(v); return Number.isFinite(n) ? n : fb; }
@@ -78,19 +99,23 @@ function clamp(n: number, lo: number, hi: number): number { return Math.max(lo, 
 export const LoopPolicyEditor: React.FC<{
   value: LoopPolicy;
   onChange: (p: LoopPolicy) => void;
-}> = ({ value, onChange }) => {
+  availableBackends?: any[];
+  sessionBackendId?: string;
+  sessionRuntime?: ModelRuntime;
+}> = ({ value, onChange, availableBackends, sessionBackendId, sessionRuntime }) => {
   const set = (patch: Partial<LoopPolicy>) => onChange({ ...value, ...patch });
   const [presets, setPresets] = useState<any[]>([]);
   const [sel, setSel] = useState('');
-  const [backends, setBackends] = useState<any[]>([]);
+  const [loadedBackends, setLoadedBackends] = useState<any[]>([]);
+  const backends = availableBackends ?? loadedBackends;
   const [ledger, setLedger] = useState<any[]>([]);
   const [showLedger, setShowLedger] = useState(false);
   const reload = () => api.loopPolicyPresetList().then((r) => setPresets(r.presets || [])).catch(() => {});
   useEffect(() => {
     reload();
-    api.getBackends().then((b) => setBackends(b || [])).catch(() => {});
+    if (!availableBackends) api.getBackends().then((b) => setLoadedBackends(b || [])).catch(() => {});
     api.modelLedgerList().then((r) => setLedger(r.models || [])).catch(() => {});
-  }, []);
+  }, [availableBackends]);
 
   const applyPreset = (id: string) => {
     setSel(id);
@@ -113,6 +138,17 @@ export const LoopPolicyEditor: React.FC<{
     else if (r.message) alert(r.message);
   };
   const selPreset = presets.find((x) => x.id === sel);
+  const sessionBackend = backends.find((b) => b.id === sessionBackendId);
+  const codexBackend = isCodexBackend(sessionBackend) ? sessionBackend : undefined;
+  const applyCodexSplit = () => {
+    set({
+      runtimes: {
+        ...(value.runtimes || {}),
+        execute: { model: 'gpt-5.6-terra', reasoningEffort: 'medium' },
+        analysis: { model: 'gpt-5.6-sol', reasoningEffort: 'max' },
+      },
+    });
+  };
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
@@ -170,26 +206,68 @@ export const LoopPolicyEditor: React.FC<{
         </span>
       </label>
 
-      {/* 各「AI 分析/转换」位置的专用 backend：可逐点指定异构模型做交叉评审 */}
+      {/* Backend 是连接/账号；同一 Codex backend 下，各角色可独立选模型与推理档位。 */}
       <div>
-        <div style={labelText}>分析 / 转换各位置的 backend（可逐点指定）</div>
-        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(180px, 1fr))', gap: 8 }}>
-          {BACKEND_POSITIONS.map((pos) => (
-            <div key={pos.key}>
-              <div style={{ fontSize: 11, color: 'var(--theme-text)', marginBottom: 3 }}>{pos.label}
-                <span style={{ color: 'var(--theme-text-muted)' }}> · {pos.hint}</span></div>
-              <select value={value.backends?.[pos.key] || ''}
-                onChange={(e) => set({ backends: { ...(value.backends || {}), [pos.key]: e.target.value } })}
-                style={{ ...inputBase, width: '100%' }}>
-                <option value="">跟随会话</option>
-                {backends.map((b) => <option key={b.id} value={b.id}>{b.label || b.id}</option>)}
-              </select>
-            </div>
-          ))}
+        <div style={{ ...labelRow, marginBottom: 7 }}>
+          <span style={{ ...labelText, marginBottom: 0 }}>角色运行配置（Backend / 模型 / 推理档位）</span>
+          {codexBackend && (
+            <button type="button" onClick={applyCodexSplit} style={{ ...smallBtn, marginLeft: 'auto', padding: '4px 8px', fontSize: 11 }}
+              title="执行使用 Terra / medium；独立评审使用 Sol / max">
+              ⚡ Terra 中档执行 / Sol 顶格评审
+            </button>
+          )}
+        </div>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+          {RUNTIME_POSITIONS.map((pos) => {
+            const backendOverride = pos.key === 'execute' ? '' : (value.backends?.[pos.key] || '');
+            const roleBackendId = backendOverride || sessionBackendId || '';
+            const roleBackend = backends.find((b) => b.id === roleBackendId);
+            const executeRuntime = normalizeModelRuntime(value.runtimes?.execute);
+            const inheritedRuntime = pos.key === 'execute'
+              ? normalizeModelRuntime(sessionRuntime)
+              : normalizeModelRuntime({ ...sessionRuntime, ...executeRuntime });
+            const roleRuntime = normalizeModelRuntime(value.runtimes?.[pos.key]);
+            return (
+              <div key={pos.key} style={{
+                padding: '9px 10px', border: '1px solid var(--theme-border)', borderRadius: 9,
+                background: 'var(--theme-bg-secondary)',
+              }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 7, flexWrap: 'wrap' }}>
+                  <span style={{ fontSize: 12, color: 'var(--theme-text)', fontWeight: 650 }}>{pos.label}</span>
+                  <span style={{ fontSize: 10.5, color: 'var(--theme-text-muted)' }}>{pos.hint}</span>
+                  {roleBackend && (
+                    <span style={{ marginLeft: 'auto', fontSize: 10, color: isCodexBackend(roleBackend) ? '#22c55e' : 'var(--theme-text-muted)' }}>
+                      {isCodexBackend(roleBackend) ? 'Codex · 可分档' : roleBackend.type}
+                    </span>
+                  )}
+                </div>
+                {pos.key !== 'execute' && (
+                  <select value={backendOverride}
+                    onChange={(e) => set({ backends: { ...(value.backends || {}), [pos.key]: e.target.value } })}
+                    style={{ ...inputBase, width: '100%', marginBottom: isCodexBackend(roleBackend) ? 8 : 0 }}>
+                    <option value="">跟随会话 Backend</option>
+                    {backends.map((b) => <option key={b.id} value={b.id}>{b.label || b.id}</option>)}
+                  </select>
+                )}
+                {roleBackend && isCodexBackend(roleBackend) && (
+                  <CodexRuntimeFields
+                    backend={roleBackend}
+                    value={roleRuntime}
+                    inherited={inheritedRuntime}
+                    compact
+                    inheritLabel={pos.key === 'execute' ? '跟随会话默认' : '跟随任务执行配置'}
+                    onChange={(runtime) => set({
+                      runtimes: { ...(value.runtimes || {}), [pos.key]: runtime },
+                    })}
+                  />
+                )}
+              </div>
+            );
+          })}
         </div>
         <div style={{ fontSize: 10.5, color: 'var(--theme-text-muted)', marginTop: 4, lineHeight: 1.5 }}>
-          这些位置都跑在独立上下文上，可安全换用与执行不同的模型做交叉评审，进一步降低自我欺骗。
-          执行（execute/分步）始终走会话本身的 backend。留「跟随会话」即与执行同模型。
+          执行始终使用会话 Backend，但可在同一个 Codex 账号下换模型/档位；分析位置还能切换异构 Backend。
+          例如执行用 Terra / medium，评审用 Sol / max，无需复制两份 Codex Backend。
         </div>
         {ledger.length > 0 && (
           <div style={{ marginTop: 8 }}>
@@ -202,7 +280,7 @@ export const LoopPolicyEditor: React.FC<{
                 {ledger.map((m) => {
                   const ex = m.roles?.execute;
                   return (
-                    <div key={m.backendId} style={{ display: 'flex', gap: 8, alignItems: 'baseline', fontSize: 11, color: 'var(--theme-text-muted)', flexWrap: 'wrap' }}>
+                    <div key={m.runtimeKey || m.backendId} style={{ display: 'flex', gap: 8, alignItems: 'baseline', fontSize: 11, color: 'var(--theme-text-muted)', flexWrap: 'wrap' }}>
                       <span style={{ fontWeight: 600, color: 'var(--theme-text)' }}>{m.label}</span>
                       {ex?.avgScore != null
                         ? <span>执行均分 <b style={{ color: 'var(--theme-text)' }}>{ex.avgScore.toFixed(0)}</b>（{ex.scored} 次）</span>

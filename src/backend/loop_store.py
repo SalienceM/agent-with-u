@@ -122,6 +122,9 @@ class LoopAnalysis:
 class LoopRecord:
     """一次 loopexecute 的完整记录。"""
     seq: int
+    # agent = automated prepare/execute/analysis pass; manual = a temporary
+    # human-controlled normal-chat pass over the same loop session.
+    kind: str = "agent"
     sub_stage: str = SUB_PREPARE        # prepare | execute | analysis | done
     round: int = 1                      # 属于第几轮（loopout 后可开启新一轮）
     goal: str = ""                      # 本次 loop 的计划目标
@@ -136,6 +139,9 @@ class LoopRecord:
     #   prepare+execute（恒走会话 backend）；analysis 可能是异构评审 backend。用于在
     #   结果展示中标出选型，便于追溯"谁执行、谁评审"。
     backends: dict = field(default_factory=dict)
+    # ★ 各阶段实际使用的运行参数（{execute/analysis: {model, reasoningEffort}}）。
+    #   与 backend id 分开记录，避免同一个 Codex backend 下的 Sol/Terra/档位混在一起。
+    runtimes: dict = field(default_factory=dict)
     # ★ 版本隔离：本次 loop 开跑前的 agent 上下文快照（agent_session_id）。
     #   None=未快照（老记录）；""=当时无上下文；"X"=具体 id。丢弃本次 loop 时据此回滚，
     #   避免被丢弃 loop 的对话污染后续 loop 的上下文。
@@ -148,6 +154,12 @@ class LoopRecord:
     dir_checkpoint: Optional[str] = None
     # 本轮分析完成后的 Git 产物快照，用于 loopout 恢复真正的最佳版本。
     artifact_checkpoint: Optional[str] = None
+    # Manual takeover keeps a self-contained transcript snapshot so the pass is
+    # inspectable from LoopPanel even though the same messages also live in the
+    # normal session transcript. Tool calls/thinking blocks are retained here.
+    manual_messages: list[dict] = field(default_factory=list)
+    manual_start_index: int = 0
+    manual_context: str = ""
     created_at: float = field(default_factory=_now)
     updated_at: float = field(default_factory=_now)
 
@@ -159,6 +171,7 @@ class LoopRecord:
     def to_dict(self) -> dict:
         return {
             "seq": self.seq,
+            "kind": self.kind,
             "subStage": self.sub_stage,
             "round": self.round,
             "goal": self.goal,
@@ -169,10 +182,15 @@ class LoopRecord:
             "error": self.error,
             "subStarted": self.sub_started,
             "backends": dict(self.backends or {}),
+            "runtimes": {k: dict(v) for k, v in (self.runtimes or {}).items()
+                         if isinstance(v, dict)},
             "agentCheckpoint": self.agent_checkpoint,
             "gitCheckpoint": self.git_checkpoint,
             "dirCheckpoint": self.dir_checkpoint,
             "artifactCheckpoint": self.artifact_checkpoint,
+            "manualMessages": list(self.manual_messages or []),
+            "manualStartIndex": self.manual_start_index,
+            "manualContext": self.manual_context,
             "hasGitCheckpoint": bool(self.git_checkpoint),
             "createdAt": self.created_at,
             "updatedAt": self.updated_at,
@@ -182,6 +200,7 @@ class LoopRecord:
     def from_dict(cls, d: dict) -> "LoopRecord":
         return cls(
             seq=int(d.get("seq", 0)),
+            kind=("manual" if d.get("kind") == "manual" else "agent"),
             sub_stage=d.get("subStage", SUB_PREPARE),
             round=int(d.get("round", 1)),
             goal=d.get("goal", ""),
@@ -192,10 +211,15 @@ class LoopRecord:
             error=d.get("error", ""),
             sub_started=dict(d.get("subStarted") or {}),
             backends=dict(d.get("backends") or {}),
+            runtimes={k: dict(v) for k, v in (d.get("runtimes") or {}).items()
+                      if isinstance(v, dict)},
             agent_checkpoint=d.get("agentCheckpoint", None),
             git_checkpoint=d.get("gitCheckpoint", None),
             dir_checkpoint=d.get("dirCheckpoint", None),
             artifact_checkpoint=d.get("artifactCheckpoint", None),
+            manual_messages=list(d.get("manualMessages") or []),
+            manual_start_index=int(d.get("manualStartIndex", 0) or 0),
+            manual_context=d.get("manualContext", ""),
             created_at=d.get("createdAt", _now()),
             updated_at=d.get("updatedAt", _now()),
         )
@@ -340,14 +364,41 @@ class LoopPolicy:
     # 各「AI 分析/转换」位置的专用 backend：{idea/goal/analysis/aside: backend_id}，缺省=跟随会话。
     # 这些位置都跑在独立上下文上，可安全换异构模型做交叉评审（执行 execute/step 仍走会话 backend）。
     backends: dict = field(default_factory=dict)
+    # 各角色的运行参数覆盖：{execute/idea/goal/analysis/aside: {model, reasoningEffort}}。
+    # execute 缺省跟随 Session；其他角色缺省先跟随 execute，再跟随 Session。
+    # 参数仅在目标 backend 支持时生效（当前 Codex CLI 支持）。
+    runtimes: dict = field(default_factory=dict)
     strategy: str = DEFAULT_STRATEGY               # 注入到 prepare/analysis 的策略心智文本
 
     # 可路由的分析/转换位置
     BACKEND_POSITIONS = ("idea", "goal", "analysis", "aside")
+    RUNTIME_POSITIONS = ("execute", "idea", "goal", "analysis", "aside")
+    REASONING_EFFORTS = {"none", "minimal", "low", "medium", "high", "xhigh", "max"}
 
     def backend_for(self, pos: str) -> str:
         b = (self.backends or {}).get(pos)
         return b if isinstance(b, str) and b.strip() else ""
+
+    @classmethod
+    def _clean_runtime(cls, raw: object) -> dict:
+        if not isinstance(raw, dict):
+            return {}
+        out: dict = {}
+        model = raw.get("model")
+        if isinstance(model, str) and model.strip():
+            out["model"] = model.strip()
+        effort = raw.get("reasoningEffort", raw.get("reasoning_effort"))
+        if isinstance(effort, str) and effort.strip().lower() in cls.REASONING_EFFORTS:
+            out["reasoningEffort"] = effort.strip().lower()
+        return out
+
+    def runtime_for(self, pos: str, inherit_execute: bool = True) -> dict:
+        """Return the role runtime, optionally inheriting the execute profile."""
+        out: dict = {}
+        if inherit_execute and pos != "execute":
+            out.update(self._clean_runtime((self.runtimes or {}).get("execute")))
+        out.update(self._clean_runtime((self.runtimes or {}).get(pos)))
+        return out
 
     def to_dict(self) -> dict:
         return {
@@ -358,6 +409,8 @@ class LoopPolicy:
             "independentEval": self.independent_eval,
             "intentGuard": self.intent_guard,
             "backends": dict(self.backends or {}),
+            "runtimes": {k: self._clean_runtime(v) for k, v in (self.runtimes or {}).items()
+                         if k in self.RUNTIME_POSITIONS and self._clean_runtime(v)},
             "strategy": self.strategy,
         }
 
@@ -392,11 +445,19 @@ class LoopPolicy:
         if isinstance(old_eb, str) and old_eb.strip():
             backends.setdefault("analysis", old_eb)
             backends.setdefault("goal", old_eb)
+        raw_r = d.get("runtimes")
+        runtimes: dict = {}
+        if isinstance(raw_r, dict):
+            for k in cls.RUNTIME_POSITIONS:
+                cleaned = cls._clean_runtime(raw_r.get(k))
+                if cleaned:
+                    runtimes[k] = cleaned
         return cls(
             deliverable_score=dv, outputtable_score=ov, max_loops=ml, risk_threshold=rt,
             independent_eval=bool(ie) if ie is not None else True,
             intent_guard=bool(ig) if ig is not None else True,
             backends=backends,
+            runtimes=runtimes,
             strategy=strat if isinstance(strat, str) and strat.strip() else DEFAULT_STRATEGY,
         )
 
@@ -437,6 +498,9 @@ class LoopState:
     round: int = 1                      # 当前轮次（loopout 后可开启新一轮）
     auto: bool = False                  # 自动连跑：一次 loop 完成后自动开始下一次
     status: str = "active"              # active | delivered | output | aborted
+    # loop | manual. Session type stays "loop"; this only selects which surface
+    # currently owns the stopped session.
+    control_mode: str = "loop"
     stop_reason: str = ""               # 触发 loopout / 终止的原因
     asides: list[AsideTurn] = field(default_factory=list)  # by the way 旁路问答
     addons: list[Addon] = field(default_factory=list)      # 执行中补充的要求
@@ -488,6 +552,7 @@ class LoopState:
             "roundLoopCount": len(self.round_loops()),
             "auto": self.auto,
             "status": self.status,
+            "controlMode": self.control_mode,
             "stopReason": self.stop_reason,
             "asides": [a.to_dict() for a in self.asides],
             "addons": [a.to_dict() for a in self.addons],
@@ -519,6 +584,7 @@ class LoopState:
             round=int(d.get("round", 1)),
             auto=bool(d.get("auto", False)),
             status=d.get("status", "active"),
+            control_mode=("manual" if d.get("controlMode") == "manual" else "loop"),
             stop_reason=d.get("stopReason", ""),
             asides=[AsideTurn.from_dict(a) for a in d.get("asides", [])],
             addons=[Addon.from_dict(a) for a in d.get("addons", [])],

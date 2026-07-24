@@ -5,6 +5,13 @@ import type { ImageAttachment } from '../hooks/useClipboardImage';
 import { SLASH_COMMANDS } from '../hooks/useChat';
 import type { SlashCommand } from '../hooks/useChat';
 import { api, isTauri } from '../api';
+import {
+  BackendRuntimeFields,
+  formatRuntimeLabel,
+  isRuntimeConfigurableBackend,
+  normalizeModelRuntime,
+  type ModelRuntime,
+} from './CodexRuntimeFields';
 
 // ── 注入全局样式（focus glow）────────────────────────────────────────────────
 if (typeof document !== 'undefined' && !document.getElementById('chat-input-css')) {
@@ -59,6 +66,8 @@ interface Props {
   // ── Git 集成（execKey/execMode 用于 FileTreePanel 侧 Git 操作）──
   execKey?: string;
   execMode?: 'local' | 'relay';
+  sessionRuntime?: ModelRuntime;
+  onSessionRuntimeChange?: (runtime: ModelRuntime) => Promise<{ status: string; message?: string }>;
 }
 
 // ═══════════════════════════════════════
@@ -114,6 +123,8 @@ const ChatInputInner: React.FC<Props> = ({
   onCompact,
   fontSize, onAdjustFontSize,
   isFocused = true,
+  sessionRuntime,
+  onSessionRuntimeChange,
 }) => {
   const ref = useRef<HTMLTextAreaElement>(null);
   // 把 textarea ref 传给 useClipboardImage,这样多 pane 场景下只有聚焦
@@ -459,6 +470,42 @@ const ChatInputInner: React.FC<Props> = ({
   // ═══════════════════════════════════════
   const activeBackend = useMemo(() => backends.find(b => b.id === activeBackendId), [backends, activeBackendId]);
   const isImageBackend = activeBackend?.type === 'dashscope-image';
+  const runtimeConfigurable = isRuntimeConfigurableBackend(activeBackend);
+  const [showRuntimePicker, setShowRuntimePicker] = useState(false);
+  const [runtimeDraft, setRuntimeDraft] = useState<ModelRuntime>(() => normalizeModelRuntime(sessionRuntime));
+  const [runtimeSaving, setRuntimeSaving] = useState(false);
+  const [runtimeError, setRuntimeError] = useState('');
+  const runtimePickerRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    setRuntimeDraft(normalizeModelRuntime(sessionRuntime));
+    setRuntimeError('');
+  }, [sessionRuntime?.model, sessionRuntime?.reasoningEffort, activeBackendId]);
+
+  useEffect(() => {
+    if (!showRuntimePicker) return;
+    const close = (event: MouseEvent) => {
+      if (runtimePickerRef.current && !runtimePickerRef.current.contains(event.target as Node)) {
+        setShowRuntimePicker(false);
+      }
+    };
+    document.addEventListener('mousedown', close);
+    return () => document.removeEventListener('mousedown', close);
+  }, [showRuntimePicker]);
+
+  const saveRuntime = useCallback(async () => {
+    if (!onSessionRuntimeChange || runtimeSaving) return;
+    setRuntimeSaving(true);
+    setRuntimeError('');
+    const result = await onSessionRuntimeChange(normalizeModelRuntime(runtimeDraft));
+    setRuntimeSaving(false);
+    if (result.status === 'ok') {
+      setShowRuntimePicker(false);
+    } else {
+      setRuntimeError(result.message || '保存失败');
+    }
+  }, [onSessionRuntimeChange, runtimeDraft, runtimeSaving]);
+
   const isImageBackendRef = useRef(false);
   isImageBackendRef.current = isImageBackend;
   const [imageSize, setImageSize] = useState('1:1');
@@ -938,6 +985,55 @@ const ChatInputInner: React.FC<Props> = ({
 
   return (
     <div style={{ padding: '8px 16px 12px', borderTop: isStreaming ? '1px solid rgba(34,197,94,0.4)' : '1px solid var(--theme-border, rgba(0,0,0,0.12))', background: 'var(--theme-bg, #ffffff)', position: 'relative', transition: 'border-top-color 0.2s ease' }}>
+      {runtimeConfigurable && showRuntimePicker && (
+        <div
+          ref={runtimePickerRef}
+          style={{
+            position: 'absolute', left: 16, bottom: 'calc(100% - 2px)', zIndex: 180,
+            width: 'min(460px, calc(100% - 32px))', maxHeight: 'min(320px, 60dvh)',
+            overflowY: 'auto', boxSizing: 'border-box', padding: 14,
+            border: '1px solid var(--theme-border)', borderRadius: 10,
+            background: 'var(--theme-bg-secondary)', color: 'var(--theme-text)',
+            boxShadow: '0 12px 32px rgba(0,0,0,.28)',
+          }}
+          onMouseDown={(event) => event.stopPropagation()}
+        >
+          <div style={{ display: 'flex', alignItems: 'flex-start', gap: 10, marginBottom: 12 }}>
+            <div>
+              <div style={{ fontSize: 13, fontWeight: 650 }}>本 Session 的模型运行参数</div>
+              <div style={{ marginTop: 3, fontSize: 10.5, color: 'var(--theme-text-muted)', lineHeight: 1.45 }}>
+                保存后从下一个 turn 生效；原生 thread、接管关系和已有上下文保持不变。
+              </div>
+            </div>
+            <button
+              onClick={() => setShowRuntimePicker(false)}
+              style={{ marginLeft: 'auto', border: 0, background: 'none', color: 'var(--theme-text-muted)', cursor: 'pointer', fontSize: 16 }}
+              aria-label="关闭模型设置"
+            >×</button>
+          </div>
+          <BackendRuntimeFields
+            backend={activeBackend}
+            value={runtimeDraft}
+            onChange={setRuntimeDraft}
+          />
+          {runtimeError && <div style={{ marginTop: 8, fontSize: 11, color: '#f87171' }}>{runtimeError}</div>}
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10, marginTop: 12, flexWrap: 'wrap' }}>
+            <span style={{ fontSize: 10.5, color: 'var(--theme-text-muted)' }}>
+              当前：{formatRuntimeLabel(activeBackend, sessionRuntime)}
+            </span>
+            <div style={{ display: 'flex', gap: 7 }}>
+              <button onClick={() => setRuntimeDraft({})} disabled={runtimeSaving} style={runtimeSecondaryBtnStyle}>
+                跟随后端默认
+              </button>
+              <button
+                onClick={saveRuntime}
+                disabled={runtimeSaving}
+                style={{ ...runtimePrimaryBtnStyle, opacity: runtimeSaving ? 0.6 : 1 }}
+              >{runtimeSaving ? '保存中…' : '应用到后续 turn'}</button>
+            </div>
+          </div>
+        </div>
+      )}
       {/* ★ 工具栏：统一的图标按钮 */}
       <div style={{ display: 'flex', gap: 6, marginBottom: 6, alignItems: 'center', flexWrap: 'wrap' }}>
         <ToolbarBtn
@@ -953,6 +1049,15 @@ const ChatInputInner: React.FC<Props> = ({
           compact={isMobile}
           onClick={handleCompact}
         />
+        {runtimeConfigurable && (
+          <ToolbarBtn
+            icon="🧠"
+            title={`切换本 Session 模型${activeBackend?.type === 'codex-office' ? ' / 推理档位' : ''}（当前：${formatRuntimeLabel(activeBackend, sessionRuntime)}）`}
+            active={showRuntimePicker}
+            compact={isMobile}
+            onClick={() => setShowRuntimePicker((value) => !value)}
+          />
+        )}
         {onAdjustFontSize && (
           <div style={{ display: 'inline-flex', alignItems: 'center', gap: 2, marginLeft: 2 }}
             title={`对话字号${fontSize ? ` ${fontSize}px` : ''}（A− / A+ 调整，全局生效）`}>
@@ -1374,4 +1479,16 @@ const cancelBtnStyle: React.CSSProperties = {
   flex: 1, padding: 10, borderRadius: 8,
   background: 'var(--theme-bg-secondary, #f6f8fa)', border: '1px solid var(--theme-border, rgba(0,0,0,0.15))',
   color: 'var(--theme-text, #1f2328)', fontSize: 14, cursor: 'pointer',
+};
+
+const runtimeSecondaryBtnStyle: React.CSSProperties = {
+  padding: '6px 9px', borderRadius: 7, cursor: 'pointer', fontSize: 11,
+  border: '1px solid var(--theme-border)', background: 'var(--theme-bg-tertiary)',
+  color: 'var(--theme-text-muted)',
+};
+
+const runtimePrimaryBtnStyle: React.CSSProperties = {
+  padding: '6px 10px', borderRadius: 7, cursor: 'pointer', fontSize: 11,
+  border: '1px solid var(--theme-accent)', background: 'var(--theme-accent)',
+  color: '#fff', fontWeight: 600,
 };

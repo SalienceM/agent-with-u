@@ -21,12 +21,16 @@ import { markdownToHtml } from '../utils/markdown';
 import { GitPanel } from './GitPanel';
 import type { GitFileStatus, GitFileStatusType, GitStashEntry } from '../types/git';
 import { DiffViewer } from './DiffViewer';
+import { StructuredFilePreview, type StructuredPreviewPayload } from './StructuredFilePreview';
 import {
   pickLocalDir, restoreLocalDir, loadBaseline, saveBaseline,
   type LocalFs, type Manifest,
 } from '../utils/dirSync';
 
 const CodeEditor = lazy(() => import('./CodeEditor'));
+const PdfPreview = lazy(() => import('./PdfPreview'));
+const DocxPreview = lazy(() => import('./DocxPreview'));
+const DrawioPreview = lazy(() => import('./DrawioPreview'));
 
 interface Props {
   sessionId?: string;
@@ -37,17 +41,54 @@ interface Props {
   backendId?: string;             // ★ 当前会话的 backendId —— 供 AI 生成 commit message 使用
 }
 
-interface TNode { name: string; rel: string; isDir: boolean; size: number; }
+interface TNode {
+  name: string;
+  rel: string;
+  isDir: boolean;
+  size: number;
+  /** 该条目实际存在于哪一端；合并树会把同路径的两端标记合在一个节点上。 */
+  remote?: boolean;
+  local?: boolean;
+  typeConflict?: boolean;
+}
 
 // 文件同步状态(群晖式)。远端会话才有;本地会话恒为 null(不显示角标)。
-type FStatus = 'cloud' | 'local' | 'synced' | 'differs' | 'conflict';
+type FStatus = 'cloud' | 'local' | 'localOnly' | 'synced' | 'differs' | 'conflict';
 const STATUS_COLOR: Record<Exclude<FStatus, 'cloud'>, string> = {
-  local: '#22c55e', synced: '#22c55e', differs: '#f59e0b', conflict: '#ef4444',
+  local: '#22c55e', localOnly: '#38bdf8', synced: '#22c55e', differs: '#f59e0b', conflict: '#ef4444',
 };
 const STATUS_LABEL: Record<FStatus, string> = {
-  cloud: '云端 — 未下载到本地', local: '本地已下载', synced: '本地 · 与远端一致',
+  cloud: '仅远端 — 可下载到本机', local: '两端均有 · 尚未比对', localOnly: '仅本机 — 可上传到远端', synced: '本机 · 与远端一致',
   differs: '本地与远端不同', conflict: '冲突 · 两端都改过',
 };
+
+/** 把本机完整文件清单一次性索引成逐级目录树，避免每次展开都全表扫描。 */
+function buildLocalManifestTree(manifest: Manifest | null): Record<string, TNode[]> {
+  const levels = new Map<string, Map<string, TNode>>();
+  if (!manifest) return {};
+  for (const [path, meta] of Object.entries(manifest)) {
+    const parts = path.replace(/\\/g, '/').split('/').filter(Boolean);
+    for (let i = 0; i < parts.length; i++) {
+      const parent = parts.slice(0, i).join('/');
+      const childRel = parts.slice(0, i + 1).join('/');
+      const isDir = i < parts.length - 1;
+      let level = levels.get(parent);
+      if (!level) { level = new Map(); levels.set(parent, level); }
+      level.set(childRel, {
+        name: parts[i], rel: childRel, isDir,
+        size: isDir ? 0 : meta.size,
+        local: true, remote: false,
+      });
+    }
+  }
+  const tree: Record<string, TNode[]> = {};
+  for (const [parent, nodes] of levels) {
+    tree[parent] = [...nodes.values()].sort((a, b) => (
+      a.isDir !== b.isDir ? (a.isDir ? -1 : 1) : a.name.localeCompare(b.name)
+    ));
+  }
+  return tree;
+}
 
 // ── Git 状态角标（TortoiseGit 风格）──
 const GIT_STATUS_COLOR: Record<GitFileStatusType, string> = {
@@ -61,7 +102,11 @@ const GIT_STATUS_LETTER: Record<GitFileStatusType, string> = {
 // ── 预览/高亮/编辑 复用(highlight.js + marked + CodeMirror 懒加载)──
 const IMAGE_EXTS = new Set(['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp', 'svg', 'ico', 'avif']);
 const MARKDOWN_EXTS = new Set(['md', 'markdown', 'mdx']);
+const STRUCTURED_PREVIEW_EXTS = new Set(['doc', 'xlsx', 'xlsm', 'xls', 'pptx', 'ppt']);
 const PREVIEW_TEXT_CAP = 200_000;
+const PREVIEW_ARCHIVE_CAP = 32 * 1024 * 1024;
+const PREVIEW_PDF_CAP = 64 * 1024 * 1024;
+const TRANSFER_CHUNK_SIZE = 512 * 1024;
 const LANG_ALIAS: Record<string, string> = {
   js: 'javascript', jsx: 'javascript', mjs: 'javascript', cjs: 'javascript', ts: 'typescript',
   tsx: 'typescript', py: 'python', rb: 'ruby', rs: 'rust', go: 'go', java: 'java', kt: 'kotlin',
@@ -91,7 +136,18 @@ function imageMime(ext: string): string {
   return `image/${ext === 'jpg' ? 'jpeg' : ext}`;
 }
 function base64ToText(b64: string): string {
-  return new TextDecoder('utf-8', { fatal: false }).decode(Uint8Array.from(atob(b64), (c) => c.charCodeAt(0)));
+  return new TextDecoder('utf-8', { fatal: false }).decode(base64ToBytes(b64));
+}
+function base64ToBytes(b64: string): Uint8Array {
+  const binary = atob(b64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes;
+}
+function bytesToBase64(bytes: Uint8Array): string {
+  let binary = '';
+  for (let i = 0; i < bytes.length; i += 0x8000) binary += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+  return btoa(binary);
 }
 function textToBase64(text: string): string {
   const bytes = new TextEncoder().encode(text);
@@ -115,7 +171,39 @@ function isDarkTheme(): boolean {
 
 interface PreviewState {
   rel: string; name: string;
-  loading: boolean; text?: string; dataUrl?: string; isImage?: boolean; isMarkdown?: boolean; error?: string;
+  source: 'remote' | 'local';
+  loading: boolean; text?: string; dataUrl?: string; isImage?: boolean; isMarkdown?: boolean;
+  renderer?: 'pdf' | 'docx' | 'drawio'; bytes?: Uint8Array; drawioXml?: string;
+  loadingText?: string; structured?: StructuredPreviewPayload; error?: string;
+}
+
+interface TransferProgress {
+  direction: 'pull' | 'push';
+  rel: string;
+  fileIndex: number;
+  fileCount: number;
+  fileBytes: number;
+  fileSize: number;
+  doneBytes: number;
+  totalBytes: number;
+}
+
+interface FileContextMenu {
+  x: number;
+  y: number;
+  node: TNode;
+}
+
+function transferId(): string {
+  try { return crypto.randomUUID().replace(/-/g, ''); }
+  catch { return `${Date.now()}_${Math.random().toString(36).slice(2)}`; }
+}
+
+function formatBytes(value: number): string {
+  if (value < 1024) return `${value} B`;
+  if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB`;
+  if (value < 1024 * 1024 * 1024) return `${(value / 1024 / 1024).toFixed(1)} MB`;
+  return `${(value / 1024 / 1024 / 1024).toFixed(2)} GB`;
 }
 
 export const FileTreePanel: React.FC<Props> = ({ sessionId, workingDir, execKey, execLabel, execMode, backendId }) => {
@@ -184,11 +272,31 @@ export const FileTreePanel: React.FC<Props> = ({ sessionId, workingDir, execKey,
 
   // 预览 / 编辑
   const [preview, setPreview] = useState<PreviewState | null>(null);
+  const [previewMaximized, setPreviewMaximized] = useState(false);
   const [mdRaw, setMdRaw] = useState(false);
   const [editing, setEditing] = useState(false);
   const [editText, setEditText] = useState('');
   const [dirty, setDirty] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [transfer, setTransfer] = useState<TransferProgress | null>(null);
+  const transferAbortRef = useRef(false);
+  const [contextMenu, setContextMenu] = useState<FileContextMenu | null>(null);
+
+  useEffect(() => {
+    if (!contextMenu) return;
+    const close = () => setContextMenu(null);
+    const key = (event: KeyboardEvent) => { if (event.key === 'Escape') close(); };
+    window.addEventListener('pointerdown', close);
+    window.addEventListener('blur', close);
+    window.addEventListener('keydown', key);
+    window.addEventListener('scroll', close, true);
+    return () => {
+      window.removeEventListener('pointerdown', close);
+      window.removeEventListener('blur', close);
+      window.removeEventListener('keydown', key);
+      window.removeEventListener('scroll', close, true);
+    };
+  }, [contextMenu]);
 
   // ── msg 自动消失（5 秒后清除）──
   useEffect(() => {
@@ -203,7 +311,10 @@ export const FileTreePanel: React.FC<Props> = ({ sessionId, workingDir, execKey,
     setLoading((p) => ({ ...p, [rel]: true }));
     try {
       const ents = await api.listDirectory(rel, workingDir, execKey);
-      const nodes: TNode[] = ents.map((e) => ({ name: e.name, rel: e.path, isDir: e.isDir, size: 0 }));
+      const nodes: TNode[] = ents.map((e) => ({
+        name: e.name, rel: e.path, isDir: e.isDir, size: 0,
+        remote: true, local: false,
+      }));
       nodes.sort((a, b) => (a.isDir !== b.isDir ? (a.isDir ? -1 : 1) : a.name.localeCompare(b.name)));
       setChildren((p) => ({ ...p, [rel]: nodes }));
     } catch (e: any) {
@@ -215,9 +326,9 @@ export const FileTreePanel: React.FC<Props> = ({ sessionId, workingDir, execKey,
   }, [workingDir, execKey]);
 
   const reloadAll = useCallback(async () => {
-    const keys = Object.keys(children);
-    await Promise.all((keys.length ? keys : ['']).map((k) => loadChildren(k)));
-  }, [children, loadChildren]);
+    const keys = new Set(['', ...Object.keys(children), ...Object.keys(expanded).filter((k) => expanded[k])]);
+    await Promise.all([...keys].map((k) => loadChildren(k)));
+  }, [children, expanded, loadChildren]);
 
   // 会话切换 → 重载根
   useEffect(() => {
@@ -648,6 +759,12 @@ export const FileTreePanel: React.FC<Props> = ({ sessionId, workingDir, execKey,
     if (!fs) { setLocalManifest(null); return; }
     try { setLocalManifest(await fs.scan([])); } catch { setLocalManifest({}); }
   }, []);
+  const refreshAll = useCallback(async () => {
+    await Promise.all([
+      reloadAll(),
+      localFs ? scanLocal(localFs) : Promise.resolve(),
+    ]);
+  }, [reloadAll, localFs, scanLocal]);
   useEffect(() => {
     if (!isRemote) {
       setLocalFs(null);
@@ -674,38 +791,98 @@ export const FileTreePanel: React.FC<Props> = ({ sessionId, workingDir, execKey,
     else setBaseline({});
   }, [localFs, workingDir]);
 
+  const localTree = useMemo(() => buildLocalManifestTree(localManifest), [localManifest]);
+  const remoteManifestDirs = useMemo(() => {
+    const dirs = new Set<string>();
+    for (const rel of Object.keys(remoteManifest || {})) {
+      const parts = rel.split('/').filter(Boolean);
+      for (let i = 1; i < parts.length; i++) dirs.add(parts.slice(0, i).join('/'));
+    }
+    return dirs;
+  }, [remoteManifest]);
+
   const toggle = useCallback((node: TNode) => {
     if (!node.isDir) return;
     const willOpen = !expanded[node.rel];
     setExpanded((p) => ({ ...p, [node.rel]: willOpen }));
-    if (willOpen && children[node.rel] === undefined) loadChildren(node.rel);
+    // 本机独有目录没有对应远端路径，直接由本机清单展开，避免无意义的远端 404。
+    if (willOpen && node.remote && children[node.rel] === undefined) loadChildren(node.rel);
   }, [expanded, children, loadChildren]);
 
+  /** 统一目录 = 已加载远端子项 ∪ 本机清单子项。 */
+  const mergedChildren = useCallback((rel: string): TNode[] => {
+    const merged = new Map<string, TNode>();
+    for (const node of children[rel] || []) {
+      merged.set(node.rel, { ...node, remote: true });
+    }
+    if (isRemote) {
+      for (const localNode of localTree[rel] || []) {
+        const remoteNode = merged.get(localNode.rel);
+        if (remoteNode) {
+          merged.set(localNode.rel, {
+            ...remoteNode,
+            local: true,
+            // 同一路径一端是文件、一端是目录时按冲突展示，保留远端类型避免误操作。
+            typeConflict: remoteNode.isDir !== localNode.isDir,
+          });
+        } else {
+          const typeConflict = localNode.isDir
+            ? !!remoteManifest?.[localNode.rel]
+            : remoteManifestDirs.has(localNode.rel);
+          const existsRemotely = localNode.isDir
+            ? remoteManifestDirs.has(localNode.rel)
+            : !!remoteManifest?.[localNode.rel];
+          merged.set(localNode.rel, { ...localNode, remote: existsRemotely || typeConflict, typeConflict });
+        }
+      }
+    }
+    return [...merged.values()].sort((a, b) => (
+      a.isDir !== b.isDir ? (a.isDir ? -1 : 1) : a.name.localeCompare(b.name)
+    ));
+  }, [children, isRemote, localTree, remoteManifest, remoteManifestDirs]);
+
+  // 比对后可能发现“原以为仅本机”的已展开目录其实远端也存在，立即补拉远端子项。
+  useEffect(() => {
+    if (!isRemote || !remoteManifest) return;
+    for (const [rel, open] of Object.entries(expanded)) {
+      if (open && remoteManifestDirs.has(rel) && children[rel] === undefined) loadChildren(rel);
+    }
+  }, [isRemote, remoteManifest, remoteManifestDirs, expanded, children, loadChildren]);
+
   // ── 文件状态(仅远端会话)──
-  const statusOf = useCallback((rel: string): FStatus | null => {
+  const statusOf = useCallback((node: TNode): FStatus | null => {
     if (!isRemote) return null;
-    const L = localManifest?.[rel];
+    if (node.typeConflict) return 'conflict';
+    if (node.local && !node.remote) return 'localOnly';
+    if (node.remote && !node.local) return 'cloud';
+    if (node.isDir) return node.local ? 'local' : 'cloud';
+    const L = localManifest?.[node.rel];
     if (!L) return 'cloud';
-    const R = remoteManifest?.[rel];
+    const R = remoteManifest?.[node.rel];
     if (R) {
       if (L.hash === R.hash) return 'synced';
-      const B = baseline[rel]?.hash;
-      return (L.hash !== B && R.hash !== B) ? 'conflict' : 'differs';
+      const B = baseline[node.rel]?.hash;
+      return (B && L.hash !== B && R.hash !== B) ? 'conflict' : 'differs';
     }
     return 'local';
   }, [isRemote, localManifest, remoteManifest, baseline]);
 
   const summary = useMemo(() => {
-    if (!isRemote || !localManifest) return null;
-    let cloud = 0, local = 0, differs = 0, conflict = 0;
-    // 只对已加载出来的节点统计(懒加载,统计可见部分)
-    for (const list of Object.values(children)) for (const n of list) {
-      if (n.isDir) continue;
-      const s = statusOf(n.rel);
-      if (s === 'cloud') cloud++; else if (s === 'differs') differs++; else if (s === 'conflict') conflict++; else local++;
+    if (!isRemote || !localManifest || !remoteManifest) return null;
+    let cloud = 0, local = 0, localOnly = 0, differs = 0, conflict = 0;
+    const paths = new Set([...Object.keys(localManifest), ...Object.keys(remoteManifest)]);
+    for (const rel of paths) {
+      const L = localManifest[rel];
+      const R = remoteManifest[rel];
+      if (!L) { cloud++; continue; }
+      if (!R) { localOnly++; continue; }
+      if (L.hash === R.hash) { local++; continue; }
+      const B = baseline[rel]?.hash;
+      if (B && L.hash !== B && R.hash !== B) conflict++;
+      else differs++;
     }
-    return { cloud, local, differs, conflict };
-  }, [isRemote, localManifest, children, statusOf]);
+    return { cloud, local, localOnly, differs, conflict };
+  }, [isRemote, localManifest, remoteManifest, baseline]);
 
   // ── 本地副本操作(远端会话)──
   const chooseLocal = useCallback(async () => {
@@ -765,56 +942,217 @@ export const FileTreePanel: React.FC<Props> = ({ sessionId, workingDir, execKey,
   // ⬇ 下载到本地副本(云端→本地)
   const pull = useCallback(async (node: TNode) => {
     if (!localFs || !workingDir) { setMsg({ kind: 'err', text: '请先选择「本地副本目录」' }); return; }
+    if (transfer) return;
     setMsg(null); setBusy('准备下载…');
+    transferAbortRef.current = false;
     try {
       const rels = await collectFiles(node);
       if (node.isDir && !window.confirm(`下载「${node.name || '根'}」下的 ${rels.length} 个文件到本地？`)) { setBusy(''); return; }
+      const sizes: Record<string, number> = {};
+      for (const rel of rels) {
+        const known = remoteManifest?.[rel]?.size;
+        if (typeof known === 'number') sizes[rel] = known;
+        else {
+          const stat = await api.syncFileStat(workingDir, rel, execKey);
+          if (stat.status !== 'ok' || typeof stat.size !== 'number') throw new Error(stat.message || `无法读取文件大小：${rel}`);
+          sizes[rel] = stat.size;
+        }
+      }
+      const totalBytes = rels.reduce((sum, rel) => sum + sizes[rel], 0);
       const ok: string[] = [];
+      let doneBytes = 0;
       for (let i = 0; i < rels.length; i++) {
-        setBusy(`下载 ${i + 1}/${rels.length}：${rels[i]}`);
-        const r = await api.syncReadFile(workingDir, rels[i], execKey);
-        if (r.status === 'ok' && r.data != null) { await localFs.writeFile(rels[i], r.data); ok.push(rels[i]); }
+        const rel = rels[i];
+        const size = sizes[rel];
+        const id = transferId();
+        setBusy(`下载 ${i + 1}/${rels.length}：${rel}`);
+        setTransfer({ direction: 'pull', rel, fileIndex: i + 1, fileCount: rels.length, fileBytes: 0, fileSize: size, doneBytes, totalBytes });
+        await localFs.writeStart(rel, id);
+        let offset = 0;
+        try {
+          while (offset < size) {
+            if (transferAbortRef.current) throw new Error('__TRANSFER_CANCELLED__');
+            const result = await api.syncReadChunk(workingDir, rel, offset, Math.min(TRANSFER_CHUNK_SIZE, size - offset), execKey);
+            if (result.status !== 'ok' || result.data == null) throw new Error(result.message || `下载失败：${rel}`);
+            const chunkBytes = result.size ?? 0;
+            if (chunkBytes <= 0 && offset < size) throw new Error(`下载返回空分块：${rel}`);
+            await localFs.writeChunk(rel, id, offset, result.data);
+            offset += chunkBytes;
+            setTransfer({ direction: 'pull', rel, fileIndex: i + 1, fileCount: rels.length, fileBytes: offset, fileSize: size, doneBytes: doneBytes + offset, totalBytes });
+          }
+          await localFs.writeFinish(rel, id, size);
+          doneBytes += size;
+          ok.push(rel);
+        } catch (error) {
+          await localFs.writeAbort(rel, id).catch(() => {});
+          throw error;
+        }
       }
       bumpBaseline(ok, remoteManifest);
       setMsg({ kind: 'ok', text: `✓ 已下载 ${ok.length}/${rels.length} 个文件到本地` });
       await scanLocal(localFs);
-    } catch (e: any) { setMsg({ kind: 'err', text: `下载失败：${e?.message ?? e}` }); }
-    finally { setBusy(''); }
-  }, [localFs, workingDir, execKey, collectFiles, bumpBaseline, remoteManifest, scanLocal]);
+    } catch (e: any) {
+      setMsg({ kind: 'err', text: e?.message === '__TRANSFER_CANCELLED__' ? '下载已取消，未完成文件不会覆盖本地原文件' : `下载失败：${e?.message ?? e}` });
+    }
+    finally { setBusy(''); setTransfer(null); transferAbortRef.current = false; }
+  }, [localFs, workingDir, execKey, collectFiles, bumpBaseline, remoteManifest, scanLocal, transfer]);
 
   // ⬆ 上传本地改动(本地→云端)
   const push = useCallback(async (node: TNode) => {
     if (!localFs || !workingDir || !localManifest) return;
+    if (transfer) return;
     setMsg(null); setBusy('准备上传…');
+    transferAbortRef.current = false;
     try {
       const prefix = node.rel ? `${node.rel}/` : '';
       const rels = node.isDir ? Object.keys(localManifest).filter((r) => !node.rel || r === node.rel || r.startsWith(prefix)) : [node.rel];
       if (node.isDir && !window.confirm(`把本地「${node.name || '根'}」下的 ${rels.length} 个文件上传到远端？`)) { setBusy(''); return; }
+      const sizes: Record<string, number> = {};
+      for (const rel of rels) sizes[rel] = localManifest[rel]?.size ?? await localFs.fileSize(rel);
+      const totalBytes = rels.reduce((sum, rel) => sum + sizes[rel], 0);
       const ok: string[] = [];
+      let doneBytes = 0;
       for (let i = 0; i < rels.length; i++) {
-        setBusy(`上传 ${i + 1}/${rels.length}：${rels[i]}`);
-        const b64 = await localFs.readFile(rels[i]);
-        const r = await api.syncWriteFile(workingDir, rels[i], b64, execKey);
-        if (r.status === 'ok') ok.push(rels[i]);
+        const rel = rels[i];
+        const size = sizes[rel];
+        const id = transferId();
+        setBusy(`上传 ${i + 1}/${rels.length}：${rel}`);
+        setTransfer({ direction: 'push', rel, fileIndex: i + 1, fileCount: rels.length, fileBytes: 0, fileSize: size, doneBytes, totalBytes });
+        const start = await api.syncWriteStart(workingDir, rel, id, execKey);
+        if (start.status !== 'ok') throw new Error(start.message || `无法开始上传：${rel}`);
+        let offset = 0;
+        try {
+          while (offset < size) {
+            if (transferAbortRef.current) throw new Error('__TRANSFER_CANCELLED__');
+            const data = await localFs.readChunk(rel, offset, Math.min(TRANSFER_CHUNK_SIZE, size - offset));
+            const result = await api.syncWriteChunk(workingDir, rel, id, offset, data, execKey);
+            if (result.status !== 'ok') throw new Error(result.message || `上传失败：${rel}`);
+            const chunkBytes = result.written ?? Math.min(TRANSFER_CHUNK_SIZE, size - offset);
+            if (chunkBytes <= 0) throw new Error(`上传返回空分块：${rel}`);
+            offset += chunkBytes;
+            setTransfer({ direction: 'push', rel, fileIndex: i + 1, fileCount: rels.length, fileBytes: offset, fileSize: size, doneBytes: doneBytes + offset, totalBytes });
+          }
+          const finish = await api.syncWriteFinish(workingDir, rel, id, size, execKey);
+          if (finish.status !== 'ok') throw new Error(finish.message || `上传完成校验失败：${rel}`);
+          doneBytes += size;
+          ok.push(rel);
+        } catch (error) {
+          await api.syncWriteAbort(workingDir, rel, id, execKey).catch(() => {});
+          throw error;
+        }
       }
       bumpBaseline(ok, localManifest);
+      setRemoteManifest((prev) => {
+        if (!prev) return prev;
+        const next = { ...prev };
+        for (const rel of ok) if (localManifest[rel]) next[rel] = localManifest[rel];
+        return next;
+      });
       setMsg({ kind: 'ok', text: `✓ 已上传 ${ok.length}/${rels.length} 个文件到远端` });
-      reloadAll();
-    } catch (e: any) { setMsg({ kind: 'err', text: `上传失败：${e?.message ?? e}` }); }
-    finally { setBusy(''); }
-  }, [localFs, workingDir, execKey, localManifest, bumpBaseline, reloadAll]);
+      await reloadAll();
+    } catch (e: any) {
+      setMsg({ kind: 'err', text: e?.message === '__TRANSFER_CANCELLED__' ? '上传已取消，未完成文件不会覆盖远端原文件' : `上传失败：${e?.message ?? e}` });
+    }
+    finally { setBusy(''); setTransfer(null); transferAbortRef.current = false; }
+  }, [localFs, workingDir, execKey, localManifest, bumpBaseline, reloadAll, transfer]);
 
-  // ── 预览 / 编辑(始终作用在会话节点的工作目录上)──
+  /** 为浏览器预览分块取回二进制，绕开旧的 32 MiB 整文件 WS 帧并实时反馈读取进度。 */
+  const readPreviewBytes = useCallback(async (
+    node: TNode,
+    source: PreviewState['source'],
+    maxBytes: number,
+  ): Promise<Uint8Array> => {
+    let size = 0;
+    if (source === 'local') {
+      if (!localFs) throw new Error('本机目录未连接');
+      size = await localFs.fileSize(node.rel);
+    } else {
+      const stat = await api.syncFileStat(workingDir, node.rel, execKey);
+      if (stat.status !== 'ok' || typeof stat.size !== 'number') throw new Error(stat.message || '无法读取文件大小');
+      size = stat.size;
+    }
+    if (size > maxBytes) throw new Error(`文件过大（${formatBytes(size)}），当前预览上限为 ${formatBytes(maxBytes)}`);
+
+    const output = new Uint8Array(size);
+    let offset = 0;
+    while (offset < size) {
+      const requestSize = Math.min(TRANSFER_CHUNK_SIZE, size - offset);
+      let encoded = '';
+      if (source === 'local') {
+        encoded = await localFs!.readChunk(node.rel, offset, requestSize);
+      } else {
+        const result = await api.syncReadChunk(workingDir, node.rel, offset, requestSize, execKey);
+        if (result.status !== 'ok' || result.data == null) throw new Error(result.message || '读取预览分块失败');
+        encoded = result.data;
+      }
+      const chunk = base64ToBytes(encoded);
+      if (chunk.length === 0) throw new Error('读取预览时收到空分块');
+      output.set(chunk, offset);
+      offset += chunk.length;
+      const percent = size > 0 ? Math.min(100, Math.round(offset / size * 100)) : 100;
+      setPreview((current) => current?.rel === node.rel && current.source === source
+        ? { ...current, loadingText: `读取文件… ${percent}%（${formatBytes(offset)} / ${formatBytes(size)}）` }
+        : current);
+    }
+    return output;
+  }, [localFs, workingDir, execKey]);
+
+  const structuredPreviewFor = useCallback(async (
+    node: TNode,
+    source: PreviewState['source'],
+    bytes?: Uint8Array,
+  ): Promise<StructuredPreviewPayload> => {
+    if (source === 'remote') return api.filePreview(workingDir, node.rel, execKey) as Promise<StructuredPreviewPayload>;
+    if (!localFs) throw new Error('本机目录未连接');
+    const encoded = bytes ? bytesToBase64(bytes) : await localFs.readFile(node.rel);
+    return api.filePreviewData(node.name, encoded, execKey) as Promise<StructuredPreviewPayload>;
+  }, [workingDir, execKey, localFs]);
+
+  // ── 预览 / 编辑：两端均有时查看远端；仅本机条目直接查看/编辑本机文件。──
   const openPreview = useCallback(async (node: TNode) => {
-    const base: PreviewState = { rel: node.rel, name: node.name, loading: true };
-    setPreview(base); setEditing(false); setDirty(false); setMdRaw(false);
+    const source: PreviewState['source'] = node.local && !node.remote ? 'local' : 'remote';
+    const base: PreviewState = { rel: node.rel, name: node.name, source, loading: true, loadingText: '正在准备预览…' };
+    setPreview(base); setPreviewMaximized(false); setEditing(false); setDirty(false); setMdRaw(false);
     try {
       if (!workingDir) throw new Error('未打开会话');
-      const r = await api.syncReadFile(workingDir, node.rel, execKey);
-      if (r.status !== 'ok') throw new Error(r.message || '读取失败');
-      if (r.tooLarge) { setPreview({ ...base, loading: false, error: '文件过大，不便预览' }); return; }
-      const b64 = r.data ?? '';
       const ext = extOf(node.name);
+
+      if (ext === 'pdf') {
+        const bytes = await readPreviewBytes(node, source, PREVIEW_PDF_CAP);
+        setPreview({ ...base, loading: false, loadingText: undefined, renderer: 'pdf', bytes });
+        return;
+      }
+
+      if (ext === 'docx') {
+        const bytes = await readPreviewBytes(node, source, PREVIEW_ARCHIVE_CAP);
+        setPreview({ ...base, loading: false, loadingText: undefined, renderer: 'docx', bytes });
+        return;
+      }
+
+      if (ext === 'drawio' || ext === 'dio') {
+        const bytes = await readPreviewBytes(node, source, PREVIEW_ARCHIVE_CAP);
+        setPreview((current) => current?.rel === node.rel ? { ...current, loadingText: '正在准备 Draw.io 兼容预览…' } : current);
+        const structured = await structuredPreviewFor(node, source, bytes);
+        const xml = new TextDecoder('utf-8', { fatal: false }).decode(bytes);
+        setPreview({ ...base, loading: false, loadingText: undefined, renderer: 'drawio', drawioXml: xml, structured });
+        return;
+      }
+
+      if (STRUCTURED_PREVIEW_EXTS.has(ext)) {
+        const result = await structuredPreviewFor(node, source);
+        setPreview({ ...base, loading: false, structured: result as StructuredPreviewPayload });
+        return;
+      }
+      let b64 = '';
+      if (source === 'local') {
+        if (!localFs) throw new Error('本机目录未连接');
+        b64 = await localFs.readFile(node.rel);
+      } else {
+        const r = await api.syncReadFile(workingDir, node.rel, execKey);
+        if (r.status !== 'ok') throw new Error(r.message || '读取失败');
+        if (r.tooLarge) { setPreview({ ...base, loading: false, error: '文件过大，不便预览' }); return; }
+        b64 = r.data ?? '';
+      }
       if (IMAGE_EXTS.has(ext)) setPreview({ ...base, loading: false, isImage: true, dataUrl: `data:${imageMime(ext)};base64,${b64}` });
       else {
         let text = base64ToText(b64);
@@ -822,41 +1160,96 @@ export const FileTreePanel: React.FC<Props> = ({ sessionId, workingDir, execKey,
         setPreview({ ...base, loading: false, isImage: false, isMarkdown: MARKDOWN_EXTS.has(ext), text });
       }
     } catch (e: any) { setPreview({ ...base, loading: false, error: e?.message ?? String(e) }); }
-  }, [workingDir, execKey]);
+  }, [workingDir, execKey, localFs, readPreviewBytes, structuredPreviewFor]);
 
-  const startEdit = useCallback(() => { if (preview && !preview.isImage) { setEditText(preview.text || ''); setDirty(false); setEditing(true); } }, [preview]);
+  const fallbackDocxPreview = useCallback((_renderError: string) => {
+    const current = preview;
+    if (!current || current.renderer !== 'docx' || !current.bytes) return;
+    const node: TNode = { name: current.name, rel: current.rel, isDir: false, size: current.bytes.length };
+    void structuredPreviewFor(node, current.source, current.bytes).then((structured) => {
+      setPreview((latest) => latest?.rel === current.rel && latest.renderer === 'docx'
+        ? { ...latest, renderer: undefined, bytes: undefined, structured }
+        : latest);
+    }).catch((reason: unknown) => {
+      const message = reason instanceof Error ? reason.message : String(reason);
+      setPreview((latest) => latest?.rel === current.rel ? { ...latest, error: `Word 兼容预览也失败：${message}` } : latest);
+    });
+  }, [preview, structuredPreviewFor]);
+
+  const revealNode = useCallback(async (node: TNode, source: 'local' | 'remote') => {
+    setContextMenu(null);
+    try {
+      if (source === 'local') {
+        if (!localFs) throw new Error('尚未指定本机目录');
+        await localFs.reveal(node.rel);
+      } else {
+        if (!workingDir) throw new Error('未打开工作目录');
+        const result = await api.revealFile(workingDir, node.rel, execKey);
+        if (result.status !== 'ok') throw new Error(result.message || '无法打开文件管理器');
+      }
+    } catch (e: any) {
+      setMsg({ kind: 'err', text: `定位失败：${e?.message ?? e}` });
+    }
+  }, [localFs, workingDir, execKey]);
+
+  const revealPreview = useCallback(() => {
+    if (!preview) return;
+    void revealNode({ name: preview.name, rel: preview.rel, isDir: false, size: 0 }, preview.source);
+  }, [preview, revealNode]);
+
+  const startEdit = useCallback(() => { if (preview && !preview.isImage && !preview.structured && !preview.renderer) { setEditText(preview.text || ''); setDirty(false); setEditing(true); } }, [preview]);
   const saveEdit = useCallback(async () => {
     if (!preview || !workingDir) return;
     setSaving(true);
     try {
-      const r = await api.syncWriteFile(workingDir, preview.rel, textToBase64(editText), execKey);
-      if (r.status !== 'ok') throw new Error(r.message || '保存失败');
+      if (preview.source === 'local') {
+        if (!localFs) throw new Error('本机目录未连接');
+        await localFs.writeFile(preview.rel, textToBase64(editText));
+      } else {
+        const r = await api.syncWriteFile(workingDir, preview.rel, textToBase64(editText), execKey);
+        if (r.status !== 'ok') throw new Error(r.message || '保存失败');
+      }
       setPreview((p) => (p ? { ...p, text: editText } : p));
       setDirty(false); setEditing(false);
-      setMsg({ kind: 'ok', text: `✓ 已保存 ${preview.name}` });
+      setMsg({ kind: 'ok', text: `✓ 已保存 ${preview.name}${preview.source === 'local' ? '（本机）' : ''}` });
       if (localFs) scanLocal(localFs);
     } catch (e: any) { setMsg({ kind: 'err', text: `保存失败：${e?.message ?? e}` }); }
     finally { setSaving(false); }
   }, [preview, workingDir, execKey, editText, localFs, scanLocal]);
   const closePreview = useCallback(() => {
     if (editing && dirty && !window.confirm('有未保存的修改，确定关闭？')) return;
-    setPreview(null); setEditing(false); setDirty(false);
+    setPreview(null); setPreviewMaximized(false); setEditing(false); setDirty(false);
   }, [editing, dirty]);
+
+  useEffect(() => {
+    if (!preview) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape') return;
+      event.preventDefault();
+      if (previewMaximized) setPreviewMaximized(false);
+      else closePreview();
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [preview, previewMaximized, closePreview]);
 
   // ── 渲染 ──
   const fileIcon = (n: TNode, st: FStatus | null): string => {
     if (n.isDir) return expanded[n.rel] ? '📂' : '📁';
     if (st === 'cloud') return '☁️';
+    if (st === 'localOnly') return '💻';
     return '📄';
   };
 
   const renderDir = (rel: string, depth: number): React.ReactNode => {
-    const nodes = children[rel];
-    if (nodes === undefined) return loading[rel] ? <div style={{ ...emptyStyle, paddingLeft: 24 + depth * 8 }}>加载中…</div> : null;
+    const nodes = mergedChildren(rel);
+    if (children[rel] === undefined && nodes.length === 0) {
+      return loading[rel] ? <div style={{ ...emptyStyle, paddingLeft: 24 + depth * 8 }}>加载中…</div> : null;
+    }
     if (nodes.length === 0 && depth === 0) return <Empty text="（空目录）" />;
     return nodes.map((n) => {
       const open = !!expanded[n.rel];
-      const st = statusOf(n.rel);
+      const st = statusOf(n);
       const dotColor = st && st !== 'cloud' && st !== 'local' && st !== 'synced' ? STATUS_COLOR[st] : null;
 
       // Git 状态角标：文件直接查表；目录取其子项中最严重的状态
@@ -887,8 +1280,25 @@ export const FileTreePanel: React.FC<Props> = ({ sessionId, workingDir, execKey,
           <div
             className={`ftp-row${selected === n.rel ? ' ftp-sel' : ''}`}
             style={rowStyle}
-            onClick={() => { setSelected(n.rel); n.isDir ? toggle(n) : openPreview(n); }}
-            onDoubleClick={() => { if (!n.isDir) openPreview(n); }}
+            onClick={() => {
+              setSelected(n.rel);
+              if (n.typeConflict) {
+                setMsg({ kind: 'err', text: `${n.rel} 在一端是文件、另一端是目录，请先手动处理类型冲突` });
+              } else {
+                n.isDir ? toggle(n) : openPreview(n);
+              }
+            }}
+            onDoubleClick={() => { if (!n.isDir && !n.typeConflict) openPreview(n); }}
+            onContextMenu={(event) => {
+              event.preventDefault();
+              event.stopPropagation();
+              setSelected(n.rel);
+              setContextMenu({
+                x: Math.min(event.clientX, window.innerWidth - 230),
+                y: Math.min(event.clientY, window.innerHeight - 260),
+                node: n,
+              });
+            }}
             title={st ? `${n.name} · ${STATUS_LABEL[st]}` : n.name}
           >
             {Array.from({ length: depth }).map((_, i) => <span key={i} style={guideStyle} />)}
@@ -906,14 +1316,14 @@ export const FileTreePanel: React.FC<Props> = ({ sessionId, workingDir, execKey,
               }}>{gitBadge.letter}</span>
             )}
             {/* 操作(hover) */}
-            {!n.isDir && (
+            {!n.isDir && !n.typeConflict && (
               <button className="ftp-act" style={actBtnStyle} title="预览 / 编辑" onClick={(e) => { e.stopPropagation(); openPreview(n); }}>👁</button>
             )}
-            {isRemote && localFs && (st === 'cloud' || n.isDir || st === 'differs' || st === 'conflict') && (
-              <button className="ftp-act" style={actBtnStyle} title="下载到本地" onClick={(e) => { e.stopPropagation(); pull(n); }}>⬇</button>
+            {isRemote && localFs && !n.typeConflict && n.remote && (!n.local || n.isDir || st === 'differs' || st === 'conflict') && (
+              <button className="ftp-act" style={actBtnStyle} disabled={!!transfer} title="下载到本地" onClick={(e) => { e.stopPropagation(); pull(n); }}>⬇</button>
             )}
-            {isRemote && localFs && (n.isDir || (st && st !== 'cloud')) && (
-              <button className="ftp-act" style={actBtnStyle} title="上传本地改动到远端" onClick={(e) => { e.stopPropagation(); push(n); }}>⬆</button>
+            {isRemote && localFs && !n.typeConflict && n.local && (n.isDir || st !== 'synced') && (
+              <button className="ftp-act" style={actBtnStyle} disabled={!!transfer} title="上传本地改动到远端" onClick={(e) => { e.stopPropagation(); push(n); }}>⬆</button>
             )}
           </div>
           {n.isDir && open && renderDir(n.rel, depth + 1)}
@@ -929,6 +1339,7 @@ export const FileTreePanel: React.FC<Props> = ({ sessionId, workingDir, execKey,
         .ftp-row.ftp-sel { background: var(--theme-accent-bg, rgba(9,105,218,0.12)); box-shadow: inset 2px 0 0 var(--theme-accent, #0969da); }
         .ftp-act { opacity: 0; }
         .ftp-row:hover .ftp-act { opacity: 1; }
+        .ftp-act:disabled { opacity: .35 !important; cursor: not-allowed !important; }
         .ftp-hbtn { opacity: 0; transition: opacity 0.12s; }
         .ftp-hdr:hover .ftp-hbtn { opacity: 1; }
       `}</style>
@@ -986,7 +1397,7 @@ export const FileTreePanel: React.FC<Props> = ({ sessionId, workingDir, execKey,
           > Log</button>
         )}
         <div style={{ flex: 1 }} />
-        <button className="ftp-hbtn" style={hdrIconStyle} title="刷新" onClick={reloadAll}>↻</button>
+        <button className="ftp-hbtn" style={hdrIconStyle} title="刷新本机与远端目录" onClick={refreshAll}>↻</button>
         <button className="ftp-hbtn" style={hdrIconStyle} title="全部折叠" onClick={() => setExpanded({})}>⊟</button>
       </div>
 
@@ -1003,11 +1414,46 @@ export const FileTreePanel: React.FC<Props> = ({ sessionId, workingDir, execKey,
           >
             {localFs?.label() || '未指定（远端文件仍可在线查看）'}
           </span>
-          <button style={localDirButtonStyle} onClick={chooseLocal} title={localFs ? '更换此 session 的本机目录' : '指定此 session 的本机目录'}>
+          {localFs && remoteManifest && summary && (
+            <span
+              title={`仅本机 ${summary.localOnly} · 仅远端 ${summary.cloud} · 不同 ${summary.differs} · 冲突 ${summary.conflict}`}
+              style={{ fontSize: 9, color: 'var(--theme-text-muted)', whiteSpace: 'nowrap', flexShrink: 0 }}
+            >
+              💻{summary.localOnly} ☁{summary.cloud} ±{summary.differs} ⚠{summary.conflict}
+            </span>
+          )}
+          {localFs && (
+            <button style={localDirButtonStyle} disabled={comparing || !!transfer} onClick={runCompare} title="扫描两端并比较文件状态">
+              {comparing ? '比对中…' : '↔ 比对'}
+            </button>
+          )}
+          <button style={localDirButtonStyle} disabled={!!transfer} onClick={chooseLocal} title={localFs ? '更换此 session 的本机目录' : '指定此 session 的本机目录'}>
             {localFs ? '更换' : '指定'}
           </button>
         </div>
       )}
+
+      {transfer && (() => {
+        const overall = transfer.totalBytes > 0 ? Math.min(100, transfer.doneBytes / transfer.totalBytes * 100) : 100;
+        const current = transfer.fileSize > 0 ? Math.min(100, transfer.fileBytes / transfer.fileSize * 100) : 100;
+        return (
+          <div style={transferBoxStyle}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 7, minWidth: 0 }}>
+              <span>{transfer.direction === 'pull' ? '⬇' : '⬆'}</span>
+              <span style={{ flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={transfer.rel}>
+                {transfer.direction === 'pull' ? '下载' : '上传'} {transfer.fileIndex}/{transfer.fileCount} · {transfer.rel}
+              </span>
+              <span style={{ color: 'var(--theme-text-muted)', fontVariantNumeric: 'tabular-nums', whiteSpace: 'nowrap' }}>
+                {formatBytes(transfer.fileBytes)} / {formatBytes(transfer.fileSize)}
+              </span>
+              <button style={transferCancelStyle} onClick={() => { transferAbortRef.current = true; }}>取消</button>
+            </div>
+            <div style={transferTrackStyle} title={`当前文件 ${current.toFixed(1)}% · 总进度 ${overall.toFixed(1)}%`}>
+              <div style={{ ...transferFillStyle, width: `${overall}%` }} />
+            </div>
+          </div>
+        );
+      })()}
 
       {/* ★ Git 快速操作工具条 */}
       {gitAvailable && (
@@ -1074,6 +1520,46 @@ export const FileTreePanel: React.FC<Props> = ({ sessionId, workingDir, execKey,
       <div style={treeScrollStyle}>
         {renderDir('', 0)}
       </div>
+
+      {contextMenu && (() => {
+        const n = contextMenu.node;
+        const st = statusOf(n);
+        return (
+          <div
+            style={{ ...contextMenuStyle, left: contextMenu.x, top: contextMenu.y }}
+            onPointerDown={(event) => event.stopPropagation()}
+            onContextMenu={(event) => event.preventDefault()}
+          >
+            {!n.isDir && !n.typeConflict && (
+              <button style={contextItemStyle} onClick={() => { setContextMenu(null); openPreview(n); }}>👁️ 预览 / 编辑</button>
+            )}
+            {n.remote && (
+              <button style={contextItemStyle} onClick={() => revealNode(n, 'remote')}>
+                📂 {isRemote ? '在执行端文件夹中显示' : '在文件夹中显示'}
+              </button>
+            )}
+            {isRemote && n.local && localFs && (
+              <button style={contextItemStyle} onClick={() => revealNode(n, 'local')}>💻 在本机文件夹中显示</button>
+            )}
+            {isRemote && localFs && n.remote && !n.typeConflict && (!n.local || n.isDir || st === 'differs' || st === 'conflict') && (
+              <button style={{ ...contextItemStyle, ...(transfer ? contextDisabledStyle : {}) }} disabled={!!transfer}
+                onClick={() => { setContextMenu(null); pull(n); }}>⬇️ 下载到本机</button>
+            )}
+            {isRemote && localFs && n.local && !n.typeConflict && (n.isDir || st !== 'synced') && (
+              <button style={{ ...contextItemStyle, ...(transfer ? contextDisabledStyle : {}) }} disabled={!!transfer}
+                onClick={() => { setContextMenu(null); push(n); }}>⬆️ 上传到执行端</button>
+            )}
+            <div style={contextSeparatorStyle} />
+            <button style={contextItemStyle} onClick={async () => {
+              setContextMenu(null);
+              try {
+                await navigator.clipboard.writeText(n.rel);
+                setMsg({ kind: 'ok', text: `✓ 已复制相对路径：${n.rel}` });
+              } catch { setMsg({ kind: 'err', text: '复制路径失败' }); }
+            }}>📋 复制相对路径</button>
+          </div>
+        );
+      })()}
 
       {/* ★ Stash 列表 */}
       {stashExpanded && stashes.length > 0 && (
@@ -1363,20 +1849,26 @@ export const FileTreePanel: React.FC<Props> = ({ sessionId, workingDir, execKey,
 
       {preview && (
         <div style={pvOverlay} onClick={closePreview}>
-          <div style={pvBox} onClick={(e) => e.stopPropagation()}>
+          <div style={{ ...pvBox, ...(previewMaximized ? pvBoxMaximized : {}) }} onClick={(e) => e.stopPropagation()}>
             <div style={pvHeader}>
-              <span style={{ fontSize: 13 }}>{preview.isImage ? '🖼️' : editing ? '✏️' : '📄'}</span>
+              <span style={{ fontSize: 13 }}>{preview.isImage ? '🖼️' : preview.renderer === 'pdf' ? '📕' : preview.renderer === 'docx' ? '📘' : preview.renderer === 'drawio' ? '🧩' : preview.structured ? '📊' : editing ? '✏️' : '📄'}</span>
               <span style={{ fontWeight: 600, fontSize: 13, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={preview.rel}>
                 {dirty && <span style={{ color: 'var(--theme-accent)' }}>● </span>}{preview.name}
               </span>
+              <span style={{ ...tagStyle, marginLeft: 0 }}>
+                {preview.source === 'local' ? '💻 本机' : '☁️ 远端'}
+              </span>
               <div style={{ flex: 1 }} />
+              {!preview.loading && (
+                <button style={hdrBtnStyle} onClick={revealPreview} title="在系统文件管理器中定位">📂 定位</button>
+              )}
               {!editing && preview.isMarkdown && !preview.loading && !preview.error && (
                 <div style={{ display: 'flex', border: '1px solid var(--theme-border)', borderRadius: 6, overflow: 'hidden', marginRight: 4 }}>
                   <button style={{ ...segBtnStyle, ...(!mdRaw ? segActiveStyle : {}) }} onClick={() => setMdRaw(false)}>👁 预览</button>
                   <button style={{ ...segBtnStyle, ...(mdRaw ? segActiveStyle : {}) }} onClick={() => setMdRaw(true)}>{'</> 源码'}</button>
                 </div>
               )}
-              {!editing && !preview.isImage && !preview.loading && !preview.error && (
+              {!editing && !preview.isImage && !preview.structured && !preview.renderer && !preview.loading && !preview.error && (
                 <button style={hdrBtnStyle} onClick={startEdit}>✏️ 编辑</button>
               )}
               {editing && (
@@ -1388,11 +1880,14 @@ export const FileTreePanel: React.FC<Props> = ({ sessionId, workingDir, execKey,
                   }}>取消</button>
                 </>
               )}
+              <button style={hdrBtnStyle} onClick={() => setPreviewMaximized((value) => !value)} title={previewMaximized ? '退出最大化（Esc）' : '最大化预览'}>
+                {previewMaximized ? '🗗 还原' : '⛶ 最大化'}
+              </button>
               <button style={hdrBtnStyle} onClick={closePreview}>✕</button>
             </div>
             <div style={pvBody}>
               {preview.loading ? (
-                <div style={{ padding: 24, textAlign: 'center', color: 'var(--theme-text-muted)' }}>加载中…</div>
+                <div style={{ padding: 24, textAlign: 'center', color: 'var(--theme-text-muted)' }}>{preview.loadingText || '加载中…'}</div>
               ) : preview.error ? (
                 <div style={{ padding: 24, color: '#f87171', fontSize: 13 }}>⚠ {preview.error}</div>
               ) : editing ? (
@@ -1404,6 +1899,20 @@ export const FileTreePanel: React.FC<Props> = ({ sessionId, workingDir, execKey,
                 <div style={{ padding: 12, textAlign: 'center', overflow: 'auto' }}>
                   <img src={preview.dataUrl} alt={preview.name} style={{ maxWidth: '100%', maxHeight: '70vh' }} />
                 </div>
+              ) : preview.renderer === 'pdf' && preview.bytes ? (
+                <Suspense fallback={<div style={{ padding: 24, textAlign: 'center', color: 'var(--theme-text-muted)' }}>PDF.js 加载中…</div>}>
+                  <PdfPreview data={preview.bytes} />
+                </Suspense>
+              ) : preview.renderer === 'docx' && preview.bytes ? (
+                <Suspense fallback={<div style={{ padding: 24, textAlign: 'center', color: 'var(--theme-text-muted)' }}>Word 渲染器加载中…</div>}>
+                  <DocxPreview data={preview.bytes} onFallback={fallbackDocxPreview} />
+                </Suspense>
+              ) : preview.renderer === 'drawio' && preview.drawioXml ? (
+                <Suspense fallback={<div style={{ padding: 24, textAlign: 'center', color: 'var(--theme-text-muted)' }}>Draw.io Viewer 加载中…</div>}>
+                  <DrawioPreview xml={preview.drawioXml} fallback={preview.structured} onReveal={revealPreview} />
+                </Suspense>
+              ) : preview.structured ? (
+                <StructuredFilePreview preview={preview.structured} onReveal={revealPreview} />
               ) : preview.isMarkdown && !mdRaw ? (
                 <div style={{ padding: '8px 18px', fontSize: 14, overflow: 'auto' }}
                   dangerouslySetInnerHTML={{ __html: markdownToHtml(preview.text || '') }} />
@@ -1465,6 +1974,10 @@ const pvBox: React.CSSProperties = {
   border: '1px solid var(--theme-border, rgba(255,255,255,0.12))', borderRadius: 10,
   display: 'flex', flexDirection: 'column', overflow: 'hidden',
   boxShadow: '0 18px 56px rgba(0,0,0,0.55)',
+};
+const pvBoxMaximized: React.CSSProperties = {
+  width: '100vw', maxWidth: 'none', height: '100vh',
+  border: 'none', borderRadius: 0, boxShadow: 'none',
 };
 const pvHeader: React.CSSProperties = {
   height: 42, padding: '0 12px', display: 'flex', alignItems: 'center', gap: 8,
@@ -1645,6 +2158,38 @@ const localDirBarStyle: React.CSSProperties = {
   background: 'var(--theme-bg-tertiary, rgba(255,255,255,0.025))',
   borderBottom: '1px solid var(--theme-border, rgba(255,255,255,0.08))',
 };
+
+const transferBoxStyle: React.CSSProperties = {
+  display: 'flex', flexDirection: 'column', gap: 5, padding: '6px 10px', flexShrink: 0,
+  background: 'var(--theme-accent-bg, rgba(88,166,255,0.08))',
+  borderBottom: '1px solid var(--theme-accent-border, rgba(88,166,255,0.22))',
+  color: 'var(--theme-text)', fontSize: 10.5,
+};
+const transferTrackStyle: React.CSSProperties = {
+  height: 5, overflow: 'hidden', borderRadius: 6, background: 'rgba(127,127,127,.22)',
+};
+const transferFillStyle: React.CSSProperties = {
+  height: '100%', borderRadius: 6, background: 'linear-gradient(90deg, #0969da, #58a6ff)',
+  transition: 'width .12s linear',
+};
+const transferCancelStyle: React.CSSProperties = {
+  border: '1px solid rgba(248,81,73,.35)', borderRadius: 5, background: 'rgba(248,81,73,.1)',
+  color: '#f85149', fontSize: 10, padding: '2px 7px', cursor: 'pointer',
+};
+
+const contextMenuStyle: React.CSSProperties = {
+  position: 'fixed', zIndex: 10100, width: 215, padding: 5,
+  background: 'var(--theme-bg-secondary, #1b2028)', color: 'var(--theme-text, #c9d1d9)',
+  border: '1px solid var(--theme-border, rgba(255,255,255,.14))', borderRadius: 8,
+  boxShadow: '0 10px 30px rgba(0,0,0,.45)',
+};
+const contextItemStyle: React.CSSProperties = {
+  display: 'flex', width: '100%', alignItems: 'center', gap: 8, padding: '7px 9px',
+  border: 'none', borderRadius: 5, background: 'transparent', color: 'inherit',
+  fontSize: 11.5, textAlign: 'left', cursor: 'pointer',
+};
+const contextDisabledStyle: React.CSSProperties = { opacity: .4, cursor: 'not-allowed' };
+const contextSeparatorStyle: React.CSSProperties = { height: 1, margin: '4px 5px', background: 'var(--theme-border, rgba(255,255,255,.1))' };
 
 const localDirButtonStyle: React.CSSProperties = {
   padding: '2px 7px', borderRadius: 5, flexShrink: 0, cursor: 'pointer', fontSize: 10,

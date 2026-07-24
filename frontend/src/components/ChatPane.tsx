@@ -11,6 +11,7 @@ import { useChat } from '../hooks/useChat';
 import type { AppConfig } from '../hooks/useConfig';
 import { HACKER_CAPTURE_EVENT } from '../utils/hackerMode';
 import type { SmoothGhostState } from '../utils/smoothGhost';
+import { normalizeModelRuntime, type ModelRuntime } from './CodexRuntimeFields';
 
 // 注入「等待气泡」用的脉冲点动画(一次性)。请求发出后到首个 delta 之间,
 // 旧版只靠底部「生成中」chip,聊天区空白让人怀疑后端是不是没收到;这里
@@ -100,6 +101,8 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
   // ── pane 自己的 session 详情(workingDir / backendId / skip / sandbox) ──
   const [activeSession, setActiveSession] = useState<any | null>(null);
   const [nodeBackends, setNodeBackends] = useState<any[]>(backends);
+  const [loopControlMode, setLoopControlMode] = useState<'loop' | 'manual'>('loop');
+  const [loopSwitchBusy, setLoopSwitchBusy] = useState(false);
   // 权限 state: 初值从 session 读,变化时持久化
   const [skipPermissions, setSkipPermissions] = useState(true);
   // 可见消息条数(切换 session / 切回历史时只显示最近几条)
@@ -137,6 +140,25 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
     };
   }, [sessionId]);
 
+  // A LOOP session keeps its identity; only its current owner changes between
+  // the automated panel and the ordinary-chat manual takeover surface.
+  useEffect(() => {
+    if (!sessionId || activeSession?.sessionType !== 'loop') {
+      setLoopControlMode('loop');
+      return;
+    }
+    let cancelled = false;
+    api.loopGetState(sessionId).then((state) => {
+      if (!cancelled) setLoopControlMode(state?.controlMode === 'manual' ? 'manual' : 'loop');
+    });
+    const unsubscribe = api.onLoopUpdated((state: any) => {
+      if (state?.sessionId === sessionId) {
+        setLoopControlMode(state.controlMode === 'manual' ? 'manual' : 'loop');
+      }
+    });
+    return () => { cancelled = true; unsubscribe(); };
+  }, [sessionId, activeSession?.sessionType]);
+
   // Backend configuration belongs to the executor that owns the session.
   useEffect(() => {
     const execKey = activeSession?.execKey;
@@ -154,6 +176,21 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
 
   const effectiveBackends = activeSession?.execKey ? nodeBackends : backends;
   const activeBackendId = activeSession?.backendId || effectiveBackends[0]?.id || '';
+
+  const handleSessionRuntimeChange = useCallback(async (runtime: ModelRuntime) => {
+    if (!sessionId) return { status: 'error', message: 'Session 不存在' };
+    const normalized = normalizeModelRuntime(runtime);
+    const result = await api.updateSessionRuntime(sessionId, normalized);
+    if (result.status === 'ok') {
+      const applied = result.runtime || normalized;
+      setActiveSession((current: any) => current ? {
+        ...current,
+        modelOverride: applied.model,
+        reasoningEffort: applied.reasoningEffort,
+      } : current);
+    }
+    return result;
+  }, [sessionId]);
 
   // ── /new 命令处理:复用 workingDir + backendId,免弹窗静默新建 ──
   // 注意:静默新建会切换当前 pane 的 session,需要走 onRequestNewSession 上抛
@@ -175,6 +212,10 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
     skipPermissions,
     handleQuickNewSession,
     handleClearContext,
+    {
+      modelOverride: activeSession?.modelOverride,
+      reasoningEffort: activeSession?.reasoningEffort,
+    },
   );
 
   // ── 向 App 上报流式状态,用于侧边栏指示灯 ──
@@ -187,6 +228,9 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
   const [seqTasks, setSeqTasks] = useState<SeqTaskT[]>([]);
   const [byTheWayOpen, setByTheWayOpen] = useState(false);
   const dispatchingRef = useRef(false);
+  const seqRetryTimerRef = useRef<number | null>(null);
+  const dispatchNextRef = useRef<() => void>(() => {});
+  const seqPendingRef = useRef(false);
   // 新输入在模型忙碌时会自动排队并激活本轮连续派发。应用重启后保留的
   // 历史队列不会擅自恢复，需要用户在队列条上点一次继续。
   const [seqChainActive, setSeqChainActive] = useState(false);
@@ -195,6 +239,10 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
 
   useEffect(() => {
     let cancelled = false;
+    if (seqRetryTimerRef.current !== null) {
+      window.clearTimeout(seqRetryTimerRef.current);
+      seqRetryTimerRef.current = null;
+    }
     seqChainSessionRef.current = null;
     setChain(false);
     if (!sessionId) { setSeqTasks([]); return; }
@@ -207,6 +255,10 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
     });
     return () => {
       cancelled = true;
+      if (seqRetryTimerRef.current !== null) {
+        window.clearTimeout(seqRetryTimerRef.current);
+        seqRetryTimerRef.current = null;
+      }
       unsubscribe();
     };
   }, [sessionId, setChain]);
@@ -222,6 +274,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
   doSendRef.current = chat.doSend;
   const sendMessageRef = useRef(chat.sendMessage);
   sendMessageRef.current = chat.sendMessage;
+  seqPendingRef.current = seqTasks.some((task) => task.status === 'pending');
 
   // Smooth 顺滑问答只投递到最后聚焦的 pane。若当前回答尚未结束，先在
   // 内存中排队，等 done 边缘再发送，避免打断培训录屏中的现有回答。
@@ -258,13 +311,32 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
         // 以 / 开头的条目当作斜杠命令处理（/compact、/clear 等可排进队列）；
         // 其余走原始发送，绕过命令拦截。
         // ★ 通过 ref 调用，始终拿到最新的函数引用，不受闭包陈旧影响
-        if (text.trim().startsWith('/')) sendMessageRef.current(text, imgs);
-        else doSendRef.current(text, imgs);
+        if (text.trim().startsWith('/')) {
+          await sendMessageRef.current(text, imgs);
+        } else {
+          // React state 要到下一次 render 才会回写这个 ref；先同步占位，封住
+          // seqtaskUpdated 与 setIsStreaming(true) 之间的同帧二次派发窗口。
+          isStreamingRef.current = true;
+          doSendRef.current(text, imgs);
+        }
+      } else if (seqPendingRef.current) {
+        // done 帧会略早于后端任务清理/落盘；Relay 断线时 RPC 也可能暂不可用。
+        // 队首保持 pending，短暂轮询权威 busy 状态，不把“取不到”当成已完成。
+        const delay = Math.max(250, Math.min(Number(r.retryAfterMs) || 1000, 3000));
+        if (seqRetryTimerRef.current === null) {
+          seqRetryTimerRef.current = window.setTimeout(() => {
+            seqRetryTimerRef.current = null;
+            if (seqChainSessionRef.current === sessionId && seqPendingRef.current) {
+              dispatchNextRef.current();
+            }
+          }, delay);
+        }
       }
     } finally {
       dispatchingRef.current = false;
     }
   }, [sessionId]); // ★ 不再依赖 chat 对象，dispatchNext 稳定不变
+  dispatchNextRef.current = dispatchNext;
 
   // 空闲时的第一条输入直接发送。
   const handleUserSend = useCallback((content: string, images?: any[]) => {
@@ -455,7 +527,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
   // ★ Loop 会话：直接把 LoopPanel 作为这个 pane 的内容内嵌渲染（不是浮层，
   //   也没有自由聊天框）—— loop 的全部交互都在面板内（含 By the way 旁路问答），
   //   避免「聊天框 vs 面板」双入口、以及聊天与 loop 主线共用 agent 上下文的污染。
-  if (activeSession?.sessionType === 'loop') {
+  if (activeSession?.sessionType === 'loop' && loopControlMode !== 'manual') {
     return (
       <div
         onClick={onFocus}
@@ -465,7 +537,16 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
           background: 'transparent',
         }}
       >
-        <LoopPanel sessionId={sessionId} embedded />
+        <LoopPanel
+          sessionId={sessionId}
+          embedded
+          sessionBackendId={activeBackendId}
+          sessionRuntime={{
+            model: activeSession?.modelOverride,
+            reasoningEffort: activeSession?.reasoningEffort,
+          }}
+          backends={effectiveBackends}
+        />
       </div>
     );
   }
@@ -487,6 +568,36 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
         background: 'transparent',
       }}
     >
+      {activeSession?.sessionType === 'loop' && loopControlMode === 'manual' && (
+        <div style={{
+          flexShrink: 0, display: 'flex', alignItems: 'center', gap: 10,
+          padding: '8px 12px', background: '#d2992218', borderBottom: '1px solid #d2992255',
+          color: 'var(--theme-text)', fontSize: 12,
+        }}>
+          <span style={{ color: '#d29922', fontWeight: 700 }}>✋ Manual LOOP · 人工接管中</span>
+          <span style={{ color: 'var(--theme-text-muted)' }}>对话、工具调用和文件操作会记录为一轮人工 LOOP。</span>
+          <div style={{ flex: 1 }} />
+          <button
+            disabled={chat.isStreaming || loopSwitchBusy || seqTasks.some((task) => task.status === 'pending')}
+            onClick={async () => {
+              if (chat.isStreaming || loopSwitchBusy) return;
+              setLoopSwitchBusy(true);
+              const result = await api.loopRelease(sessionId);
+              setLoopSwitchBusy(false);
+              if (result.status !== 'ok' && result.message) alert(result.message);
+            }}
+            style={{
+              border: '1px solid #d2992266', borderRadius: 7, padding: '5px 10px',
+              background: '#d2992222', color: '#d29922',
+              cursor: chat.isStreaming ? 'not-allowed' : 'pointer',
+              opacity: (chat.isStreaming || loopSwitchBusy || seqTasks.some((task) => task.status === 'pending')) ? 0.55 : 1, whiteSpace: 'nowrap',
+            }}
+            title={chat.isStreaming ? '回答结束后才能交还 LOOP' : seqTasks.some((task) => task.status === 'pending') ? '请先执行完或清空序列任务' : '封存人工操作并返回 LOOP 面板'}
+          >
+            {loopSwitchBusy ? '交还中…' : '↩ 交还 LOOP'}
+          </button>
+        </div>
+      )}
       {/* ---- 消息列表 ---- */}
       <div style={{ flex: 1, position: 'relative', overflow: 'hidden' }}>
         <div
@@ -743,6 +854,11 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
         isFocused={isFocused}
         execKey={activeSession?.execKey}
         execMode={activeSession?.execMode}
+        sessionRuntime={{
+          model: activeSession?.modelOverride,
+          reasoningEffort: activeSession?.reasoningEffort,
+        }}
+        onSessionRuntimeChange={handleSessionRuntimeChange}
       />
 
       {/* ---- By the way 旁路问答：浮动入口 + 抽屉 ---- */}

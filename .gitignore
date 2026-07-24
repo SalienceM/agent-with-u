@@ -12,6 +12,8 @@ agent-with-u-web-auth.json
 .env
 node_modules/
 frontend/dist/
+frontend/public/vendor/pdfjs/
+frontend/public/vendor/docx-preview/
 .DS_Store
 Thumbs.db
 src-tauri/target/

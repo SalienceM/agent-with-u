@@ -943,6 +943,27 @@ export const api = {
     await send('abortMessage', sessionId);
   },
 
+  async getSessionRunState(sessionId: string): Promise<{
+    status: string; busy: boolean; activeCount?: number; dispatchReserved?: boolean;
+  }> {
+    const conn = routeConn('getSessionRunState', [sessionId]);
+    await conn.ready;
+    // 断线不能等价为空闲。尤其经 Relay 时，执行节点上的 CLI 很可能仍在运行。
+    if (!conn.isOpen) return { status: 'offline', busy: true };
+    try {
+      const result = await conn.request('getSessionRunState', [sessionId], 5000);
+      const parsed = JSON.parse(result);
+      return {
+        status: parsed?.status || 'error',
+        busy: parsed?.status === 'ok' ? !!parsed.busy : true,
+        activeCount: parsed?.activeCount,
+        dispatchReserved: parsed?.dispatchReserved,
+      };
+    } catch {
+      return { status: 'offline', busy: true };
+    }
+  },
+
   onStreamDelta(callback: StreamDeltaCallback): () => void {
     streamCallbacks.push(callback);
     return () => { streamCallbacks = streamCallbacks.filter((cb) => cb !== callback); };
@@ -1100,9 +1121,18 @@ export const api = {
   },
 
   /** 新建会话。execKey 指定它落在哪个执行节点(默认 home);建后归属即固定。 */
-  async createSession(workingDir: string, backendId: string, sessionType: 'normal' | 'loop' = 'normal', execKey?: string): Promise<any> {
+  async createSession(
+    workingDir: string,
+    backendId: string,
+    sessionType: 'normal' | 'loop' = 'normal',
+    runtime: { model?: string; reasoningEffort?: string } = {},
+    execKey?: string,
+    codexRemote: { mode?: 'node'; threadId?: string; title?: string } = {},
+  ): Promise<any> {
     const conn = (execKey && pool.get(execKey)) || homeConn;
-    const result = await conn.request('createSession', [workingDir, backendId, sessionType]);
+    const result = await conn.request('createSession', [
+      workingDir, backendId, sessionType, JSON.stringify(runtime || {}), JSON.stringify(codexRemote || {}),
+    ]);
     try {
       const s = JSON.parse(result);
       if (s && s.id) {
@@ -1278,9 +1308,19 @@ export const api = {
     const result = await call('seqtaskSetAuto', sessionId, on);
     try { return JSON.parse(result); } catch { return { status: 'error' }; }
   },
-  async seqtaskTakeNext(sessionId: string): Promise<{ status: string; task: any | null }> {
-    const result = await call('seqtaskTakeNext', sessionId);
-    try { return JSON.parse(result); } catch { return { status: 'error', task: null }; }
+  async seqtaskTakeNext(sessionId: string): Promise<{
+    status: string; task: any | null; retryAfterMs?: number;
+  }> {
+    const conn = routeConn('seqtaskTakeNext', [sessionId]);
+    await conn.ready;
+    // 不走 home 的 mock fallback：离线时返回空任务会让自动链误以为队列结束。
+    if (!conn.isOpen) return { status: 'offline', task: null, retryAfterMs: 1000 };
+    try {
+      const result = await conn.request('seqtaskTakeNext', [sessionId], 5000);
+      return JSON.parse(result);
+    } catch {
+      return { status: 'offline', task: null, retryAfterMs: 1000 };
+    }
   },
   async seqtaskClear(sessionId: string): Promise<{ status: string }> {
     const result = await call('seqtaskClear', sessionId);
@@ -1357,6 +1397,45 @@ export const api = {
     // timeout/close path owns the first `false` notification.
     if (homeConn.isOpen) callback(true);
     return () => { connectionStatusCallbacks = connectionStatusCallbacks.filter((cb) => cb !== callback); };
+  },
+
+  async updateSessionRuntime(
+    sessionId: string,
+    runtime: { model?: string; reasoningEffort?: string },
+  ): Promise<{ status: string; runtime?: { model?: string; reasoningEffort?: string }; agentSessionId?: string; message?: string }> {
+    const result = await call('updateSessionRuntime', sessionId, JSON.stringify(runtime || {}));
+    if (result === null || result === undefined) return { status: 'error', message: '无法连接到后端' };
+    try { return JSON.parse(result); } catch { return { status: 'error', message: '响应格式错误' }; }
+  },
+
+  onSessionConnectionStatus(sessionId: string, callback: ConnectionStatusCallback): () => void {
+    let previous = routeConn('getSessionRunState', [sessionId]).isOpen;
+    callback(previous);
+    const unsubscribe = onExecStatus(() => {
+      const connected = routeConn('getSessionRunState', [sessionId]).isOpen;
+      if (connected === previous) return;
+      previous = connected;
+      callback(connected);
+    });
+    return unsubscribe;
+  },
+
+  async codexLocalThreads(backendId: string, execKey?: string): Promise<{ status: string; threads: any[]; message?: string }> {
+    const conn = (execKey && pool.get(execKey)) || homeConn;
+    const result = await conn.request('codexLocalThreads', [backendId], 45000);
+    try { return JSON.parse(result); } catch { return { status: 'error', threads: [], message: '响应格式错误' }; }
+  },
+
+  /** Idle LOOP -> ordinary chat. Starts one persisted manual loop pass. */
+  async loopTakeover(sessionId: string): Promise<{ status: string; controlMode?: string; seq?: number; message?: string }> {
+    const result = await call('loopTakeover', sessionId);
+    try { return JSON.parse(result); } catch { return { status: 'error', message: '响应解析失败' }; }
+  },
+
+  /** Finish the current manual pass and return the session to LOOP control. */
+  async loopRelease(sessionId: string): Promise<{ status: string; controlMode?: string; message?: string }> {
+    const result = await call('loopRelease', sessionId);
+    try { return JSON.parse(result); } catch { return { status: 'error', message: '响应解析失败' }; }
   },
 
   async listDirectory(path: string, workingDir?: string, execKey?: string): Promise<{ name: string; path: string; isDir: boolean }[]> {
@@ -1581,6 +1660,40 @@ export const api = {
     try { return JSON.parse(result); } catch { return { status: 'error', message: 'syncReadFile 无响应' }; }
   },
 
+  async syncFileStat(workingDir: string, rel: string, execKey?: string): Promise<{
+    status: string; message?: string; size?: number;
+  }> {
+    const result = await callOn(execKey, 'syncFileStat', workingDir, rel);
+    try { return JSON.parse(result); } catch { return { status: 'error', message: 'syncFileStat 无响应' }; }
+  },
+
+  async syncReadChunk(workingDir: string, rel: string, offset: number, size: number, execKey?: string): Promise<{
+    status: string; message?: string; offset?: number; size?: number; total?: number; eof?: boolean; data?: string;
+  }> {
+    const result = await callOn(execKey, 'syncReadChunk', workingDir, rel, offset, size);
+    try { return JSON.parse(result); } catch { return { status: 'error', message: 'syncReadChunk 无响应' }; }
+  },
+
+  async syncWriteStart(workingDir: string, rel: string, transferId: string, execKey?: string): Promise<{ status: string; message?: string }> {
+    const result = await callOn(execKey, 'syncWriteStart', workingDir, rel, transferId);
+    try { return JSON.parse(result); } catch { return { status: 'error', message: 'syncWriteStart 无响应' }; }
+  },
+
+  async syncWriteChunk(workingDir: string, rel: string, transferId: string, offset: number, dataBase64: string, execKey?: string): Promise<{ status: string; message?: string; written?: number }> {
+    const result = await callOn(execKey, 'syncWriteChunk', workingDir, rel, transferId, offset, dataBase64);
+    try { return JSON.parse(result); } catch { return { status: 'error', message: 'syncWriteChunk 无响应' }; }
+  },
+
+  async syncWriteFinish(workingDir: string, rel: string, transferId: string, expectedSize: number, execKey?: string): Promise<{ status: string; message?: string; size?: number }> {
+    const result = await callOn(execKey, 'syncWriteFinish', workingDir, rel, transferId, expectedSize);
+    try { return JSON.parse(result); } catch { return { status: 'error', message: 'syncWriteFinish 无响应' }; }
+  },
+
+  async syncWriteAbort(workingDir: string, rel: string, transferId: string, execKey?: string): Promise<{ status: string; message?: string }> {
+    const result = await callOn(execKey, 'syncWriteAbort', workingDir, rel, transferId);
+    try { return JSON.parse(result); } catch { return { status: 'error', message: 'syncWriteAbort 无响应' }; }
+  },
+
   async syncWriteFile(workingDir: string, rel: string, dataBase64: string, execKey?: string): Promise<{ status: string; message?: string }> {
     const result = await callOn(execKey, 'syncWriteFile', workingDir, rel, dataBase64);
     try { return JSON.parse(result); } catch { return { status: 'error', message: 'syncWriteFile 无响应' }; }
@@ -1589,6 +1702,21 @@ export const api = {
   async syncDeleteFile(workingDir: string, rel: string, execKey?: string): Promise<{ status: string; message?: string }> {
     const result = await callOn(execKey, 'syncDeleteFile', workingDir, rel);
     try { return JSON.parse(result); } catch { return { status: 'error', message: 'syncDeleteFile 无响应' }; }
+  },
+
+  async filePreview(workingDir: string, rel: string, execKey?: string): Promise<any> {
+    const result = await callOn(execKey, 'filePreview', workingDir, rel);
+    try { return JSON.parse(result); } catch { return { status: 'error', message: '预览服务无响应' }; }
+  },
+
+  async filePreviewData(name: string, dataBase64: string, execKey?: string): Promise<any> {
+    const result = await callOn(execKey, 'filePreviewData', name, dataBase64);
+    try { return JSON.parse(result); } catch { return { status: 'error', message: '预览服务无响应' }; }
+  },
+
+  async revealFile(workingDir: string, rel: string, execKey?: string): Promise<{ status: string; message?: string }> {
+    const result = await callOn(execKey, 'revealFile', workingDir, rel);
+    try { return JSON.parse(result); } catch { return { status: 'error', message: '无法打开文件管理器' }; }
   },
 
   /** 读取同步忽略清单（来自 app-config.syncIgnore）。 */
@@ -2037,19 +2165,25 @@ function mockDispatch(method: string, params: any[]): any {
       return null;
     }
     case 'abortMessage': return null;
+    case 'getSessionRunState': return JSON.stringify({ status: 'ok', busy: false, activeCount: 0 });
     case 'executeCommand': {
       const p = JSON.parse(params[0]);
       if (p.command === 'compact') return JSON.stringify({ status: 'ok', removed: 5, remaining: 6 });
       return JSON.stringify({ status: 'ok' });
     }
     case 'clearSessionContext': return JSON.stringify({ success: true });
-    case 'createSession':
+    case 'createSession': {
+      let runtime: any = {};
+      try { runtime = JSON.parse(params[3] || '{}'); } catch { runtime = {}; }
       return JSON.stringify({
         id: 'mock-' + Date.now(), title: 'Mock session',
         createdAt: Date.now() / 1000, updatedAt: Date.now() / 1000,
         messages: [], backendId: params[1], autoContinue: true,
+        modelOverride: runtime.model,
+        reasoningEffort: runtime.reasoningEffort,
         sessionType: params[2] || 'normal',
       });
+    }
     case 'loopGetState': return 'null';
     case 'loopSubmitIdea': return JSON.stringify({ status: 'error', message: 'mock mode' });
     case 'loopRemoveIdea': return JSON.stringify({ status: 'ok' });
@@ -2063,6 +2197,8 @@ function mockDispatch(method: string, params: any[]): any {
     case 'modelLedgerList': return JSON.stringify({ status: 'ok', models: [] });
     case 'loopDismissIntent': return JSON.stringify({ status: 'ok' });
     case 'loopRunIteration': return JSON.stringify({ status: 'error', message: 'mock mode' });
+    case 'loopTakeover': return JSON.stringify({ status: 'error', message: 'mock mode' });
+    case 'loopRelease': return JSON.stringify({ status: 'error', message: 'mock mode' });
     case 'loopDiscard': return JSON.stringify({ status: 'ok' });
     case 'loopSetAuto': return JSON.stringify({ status: 'ok', auto: !!params[1] });
     case 'loopAdvanceToOut': return JSON.stringify({ status: 'error', message: 'mock mode' });
@@ -2104,6 +2240,10 @@ function mockDispatch(method: string, params: any[]): any {
     case 'updatePromptIcon': return JSON.stringify({ status: 'ok' });
     case 'updateSessionAbilities': return JSON.stringify({ status: 'ok' });
     case 'updateSessionConstraints': return JSON.stringify({ status: 'ok' });
+    case 'updateSessionRuntime': {
+      const runtime = JSON.parse(params[1] || '{}');
+      return JSON.stringify({ status: 'ok', runtime });
+    }
     case 'setPromptDefault': return JSON.stringify({ status: 'ok' });
     case 'setSkillDefault': return JSON.stringify({ status: 'ok' });
     case 'getDefaultAbilities': return JSON.stringify({ skills: [], prompts: [] });

@@ -32,7 +32,15 @@ from ..types import (
     new_id,
 )
 from .session_store import SessionStore
-from .backends import create_backend, ModelBackend, StreamDelta, PermissionRequest
+from .backends import (
+    create_backend, ModelBackend, StreamDelta, PermissionRequest,
+    CodexOfficeBackend, QwenCodeSdkBackend,
+)
+from .codex_app_server import (
+    list_ssh_hosts, list_remote_threads, read_remote_thread,
+    list_local_threads, read_local_thread, validate_ssh_host,
+)
+from .codex_office import resolve_codex_cli
 from .instance_manager import InstanceManager
 from .backend_store import BackendStore
 from .app_config_store import AppConfigStore
@@ -515,6 +523,14 @@ class BridgeWS:
         self._chat_extras_store = ChatExtrasStore()
         self._chat_extras: dict[str, ChatExtras] = {}   # 进程内单例缓存
         self._chat_aside_running: set[str] = set()      # 正在回答普通会话 by-the-way 的 session
+        # 普通会话主链路的权威运行态。前端的 isStreaming 只是渲染状态；经 Relay
+        # 短暂断线时它可能丢失 done 帧或发生重连，不能拿它单独决定是否派发序列任务。
+        # 一个 session 理论上只有一个任务；这里仍用 set 兜住历史竞态，直到所有
+        # 已启动任务真正退出前都保持 busy。
+        self._chat_turn_tasks: dict[str, set[asyncio.Task]] = {}
+        # seqtaskTakeNext 与随后的 sendMessage 是两次 RPC。短暂保留一个领取租约，
+        # 防止两个 UI 客户端在 sendMessage 到达前同时取走两条队列任务。
+        self._seq_dispatch_reservations: dict[str, float] = {}
         # ★ 素材中转池：客户端图片/附件在交给 Agent 前先落到这里
         self._asset_pool = AssetPool()
         self._asset_pool.purge_expired()
@@ -1735,13 +1751,20 @@ class BridgeWS:
                         break
             copied_messages = list(source.messages[:cut])
             branch_title = f"Clone with {source.title or source.id}"
-            branch_working_dir = self._create_branch_working_dir(source)
+            branch_working_dir = (
+                source.working_dir if source.codex_remote_host
+                else self._create_branch_working_dir(source)
+            )
+            branch_backend_id = payload.get("backendId") or source.backend_id
+            same_backend = branch_backend_id == source.backend_id
             new_session = Session(
                 id=new_id(),
                 title=branch_title if not title_suffix else f"{branch_title} · {title_suffix}",
                 created_at=time.time(), updated_at=time.time(),
                 messages=copied_messages,
-                backend_id=payload.get("backendId") or source.backend_id,
+                backend_id=branch_backend_id,
+                model_override=source.model_override if same_backend else None,
+                reasoning_effort=source.reasoning_effort if same_backend else None,
                 working_dir=branch_working_dir,
                 auto_continue=source.auto_continue,
                 skip_permissions=source.skip_permissions,
@@ -1750,6 +1773,8 @@ class BridgeWS:
                 abilities=source.abilities,
                 session_type="normal",
                 agent_session_id=None,
+                codex_connection_mode=source.codex_connection_mode if same_backend else None,
+                codex_remote_host=source.codex_remote_host if same_backend else None,
                 auto_commit=source.auto_commit,
                 auto_commit_push=source.auto_commit_push,
                 auto_commit_backend_id=source.auto_commit_backend_id,
@@ -1766,9 +1791,70 @@ class BridgeWS:
         except Exception as e:
             return json.dumps({"status": "error", "message": str(e)}, ensure_ascii=False)
 
+    def _active_chat_turn_tasks(self, session_id: str) -> set[asyncio.Task]:
+        """返回仍在运行的普通会话任务，并顺手清理已经结束的引用。"""
+        registry = getattr(self, "_chat_turn_tasks", None)
+        if registry is None:
+            registry = self._chat_turn_tasks = {}
+        active = {task for task in registry.get(session_id, set()) if not task.done()}
+        if active:
+            registry[session_id] = active
+        else:
+            registry.pop(session_id, None)
+        return active
+
+    def _has_seq_dispatch_reservation(self, session_id: str) -> bool:
+        reservations = getattr(self, "_seq_dispatch_reservations", None)
+        if reservations is None:
+            reservations = self._seq_dispatch_reservations = {}
+        deadline = float(reservations.get(session_id, 0) or 0)
+        if deadline > time.time():
+            return True
+        reservations.pop(session_id, None)
+        return False
+
+    def _rpc_getSessionRunState(self, session_id: str) -> str:
+        """返回主对话的后端权威运行态；供 Relay 重连与序列派发校验。"""
+        active_count = len(self._active_chat_turn_tasks(session_id))
+        reserved = self._has_seq_dispatch_reservation(session_id)
+        return json.dumps({
+            "status": "ok",
+            "busy": bool(active_count or reserved),
+            "activeCount": active_count,
+            "dispatchReserved": reserved,
+        }, ensure_ascii=False)
+
     def _rpc_sendMessage(self, payload_json: str) -> None:
         """Fire-and-forget：立即返回 null，后台异步推送 streamDelta。"""
-        asyncio.ensure_future(self._handle_send_message(payload_json))
+        session_id = ""
+        try:
+            payload = json.loads(payload_json)
+            session_id = str(payload.get("sessionId") or "")
+        except Exception:
+            # 仍交给统一处理函数生成可见错误，保持原有协议行为。
+            pass
+
+        if session_id:
+            reservations = getattr(self, "_seq_dispatch_reservations", None)
+            if reservations is not None:
+                reservations.pop(session_id, None)
+
+        task = asyncio.ensure_future(self._handle_send_message(payload_json))
+        if session_id:
+            registry = getattr(self, "_chat_turn_tasks", None)
+            if registry is None:
+                registry = self._chat_turn_tasks = {}
+            registry.setdefault(session_id, set()).add(task)
+
+            def _forget(completed: asyncio.Task, sid: str = session_id) -> None:
+                tasks = registry.get(sid)
+                if not tasks:
+                    return
+                tasks.discard(completed)
+                if not tasks:
+                    registry.pop(sid, None)
+
+            task.add_done_callback(_forget)
         return None
 
     def _rpc_abortMessage(self, session_id: str) -> None:
@@ -1956,8 +2042,9 @@ class BridgeWS:
     # 因此这里的全局上限天然就是 per-execKey 的。
     MAX_SESSIONS_PER_EXEC_KEY = 10
 
-    def _rpc_createSession(self, working_dir: str, backend_id: str,
-                           session_type: str = "normal") -> str:
+    async def _rpc_createSession(self, working_dir: str, backend_id: str,
+                                 session_type: str = "normal", runtime_json: str = "",
+                                 remote_json: str = "") -> str:
         # ★ 超出上限时自动淘汰本执行节点最旧的 session（按 updatedAt 升序 = 最近最少使用）
         # 每个执行节点独立计算，互不影响
         all_sessions = self._session_store.list()  # 已按 updatedAt 降序，仅含本节点
@@ -1974,12 +2061,121 @@ class BridgeWS:
                     except Exception:
                         pass
                     print(f"[BridgeWS] Auto-evicted old session {sid}", file=sys.stderr, flush=True)
-        resolved_dir = self._resolve_working_dir(working_dir)
         is_loop = session_type == "loop"
+        try:
+            raw_runtime = json.loads(runtime_json) if isinstance(runtime_json, str) and runtime_json else runtime_json
+        except (TypeError, json.JSONDecodeError):
+            raw_runtime = {}
+        runtime = LoopPolicy._clean_runtime(raw_runtime)
+        try:
+            raw_remote = json.loads(remote_json) if isinstance(remote_json, str) and remote_json else remote_json
+        except (TypeError, json.JSONDecodeError):
+            raw_remote = {}
+        raw_remote = raw_remote if isinstance(raw_remote, dict) else {}
+        connection_mode = str(raw_remote.get("mode") or "").strip().lower()
+        codex_remote_host = str(raw_remote.get("host") or "").strip() or None
+        if not connection_mode and codex_remote_host:
+            connection_mode = "ssh"  # 兼容本轮开发早期产生的调用
+        if connection_mode not in {"", "node", "ssh"}:
+            raise ValueError("无效的 Codex 连接方式")
+        remote_thread_id = str(raw_remote.get("threadId") or "").strip() or None
+        remote_title = str(raw_remote.get("title") or "").strip()
+        cfg = next((item for item in self._backend_configs if item.id == backend_id), None)
+        if connection_mode in {"node", "ssh"}:
+            if not cfg or cfg.type != BackendType.CODEX_OFFICIAL:
+                raise ValueError("Codex 原生 thread 只能用于 Codex Office backend")
+        if connection_mode == "node":
+            if not remote_thread_id:
+                raise ValueError("请选择要接管的本节点 Codex thread")
+            # 实际目录以 thread/read 返回值为准；此处不创建任何目录。
+            resolved_dir = str(working_dir or "").strip() or "."
+        elif connection_mode == "ssh":
+            if not codex_remote_host:
+                raise ValueError("请选择或填写 SSH Remote 主机")
+            validate_ssh_host(codex_remote_host)
+            resolved_dir = str(working_dir or "").strip()
+            if not resolved_dir:
+                raise ValueError("新建 Codex Remote 会话时必须填写远端工作目录")
+        else:
+            resolved_dir = self._resolve_working_dir(working_dir)
+        imported_messages: list[ChatMessage] = []
+        if connection_mode in {"node", "ssh"} and remote_thread_id:
+            if connection_mode == "ssh":
+                command = cfg.get_env("AGENTWITHU_CODEX_REMOTE_COMMAND") or "codex app-server --listen stdio://"
+                remote_thread = await read_remote_thread(codex_remote_host or "", remote_thread_id, command)
+            else:
+                backend = self._get_backend(backend_id)
+                assert isinstance(backend, CodexOfficeBackend)
+                remote_thread = await read_local_thread(
+                    resolve_codex_cli(cfg.cli_path), remote_thread_id, backend._build_env(),
+                )
+            remote_title = remote_title or str(remote_thread.get("name") or remote_thread.get("preview") or "Codex Remote")
+            resolved_dir = str(remote_thread.get("cwd") or resolved_dir)
+            stamp = float(remote_thread.get("createdAt") or time.time())
+            for turn in remote_thread.get("turns") or []:
+                if not isinstance(turn, dict):
+                    continue
+                for item in turn.get("items") or []:
+                    if not isinstance(item, dict):
+                        continue
+                    typ = str(item.get("type") or "")
+                    text = ""
+                    role = ""
+                    if typ == "userMessage":
+                        role = "user"
+                        chunks = []
+                        for part in item.get("content") or []:
+                            if isinstance(part, dict) and part.get("type") == "text":
+                                chunks.append(str(part.get("text") or ""))
+                            elif isinstance(part, dict) and part.get("type") in {"image", "localImage"}:
+                                chunks.append("[图片]")
+                        text = "\n".join(part for part in chunks if part)
+                    elif typ == "agentMessage":
+                        role, text = "assistant", str(item.get("text") or "")
+                    if role and text:
+                        imported_messages.append(ChatMessage(
+                            id=str(item.get("id") or new_id()), role=role,
+                            content=text, timestamp=stamp,
+                        ))
+                        stamp += 0.001
+            # thread/read 是完整原生上下文，但 createSession 还要经 WS/Relay 返回。
+            # 只镜像最近的可见历史；Codex 原生 thread 本身没有被裁剪，后续 resume
+            # 仍拥有完整上下文。限制字符而不只限制条数，防止单条超长输出撑爆 WS。
+            original_count = len(imported_messages)
+            max_visible_messages = 200
+            remaining_chars = 4_000_000
+            visible_reversed: list[ChatMessage] = []
+            history_truncated = False
+            for message in reversed(imported_messages):
+                if len(visible_reversed) >= max_visible_messages or remaining_chars <= 0:
+                    history_truncated = True
+                    break
+                if len(message.content) > remaining_chars:
+                    message.content = "[较早内容已省略]\n" + message.content[-remaining_chars:]
+                    history_truncated = True
+                remaining_chars -= len(message.content)
+                visible_reversed.append(message)
+            imported_messages = list(reversed(visible_reversed))
+            if history_truncated or len(imported_messages) < original_count:
+                imported_messages.insert(0, ChatMessage(
+                    id=new_id(), role="assistant",
+                    content=(
+                        "ℹ️ AgentWithU 仅镜像了该 Codex thread 最近的可见历史，"
+                        "以保证 Relay 和界面稳定；Codex 原生上下文仍完整保留。"
+                    ),
+                    timestamp=(imported_messages[0].timestamp - 0.001
+                               if imported_messages else time.time()),
+                ))
         session = Session(
-            id=new_id(), title="Loop 会话" if is_loop else "新会话",
+            id=new_id(), title=remote_title or ("Loop 会话" if is_loop else "新会话"),
             created_at=time.time(), updated_at=time.time(),
-            messages=[], working_dir=resolved_dir, backend_id=backend_id,
+            messages=imported_messages, working_dir=resolved_dir, backend_id=backend_id,
+            model_override=runtime.get("model"),
+            reasoning_effort=runtime.get("reasoningEffort"),
+            agent_session_id=remote_thread_id,
+            codex_connection_mode=connection_mode or None,
+            codex_remote_host=codex_remote_host,
+            codex_thread_attached=bool(remote_thread_id),
             session_type="loop" if is_loop else "normal",
         )
         # ★ loop 会话：建会话时即落一个 stage 文件（起始阶段 loopidea）
@@ -2101,6 +2297,7 @@ class BridgeWS:
         self._chat_aside_running.discard(sid)
         self._chat_extras.pop(sid, None)
         self._chat_extras_store.delete(sid)
+        self._seq_dispatch_reservations.pop(sid, None)
         ok = self._session_store.delete(sid)
         if ok:
             self._emit_session_updated({"type": "session_deleted", "sessionId": sid})
@@ -2129,6 +2326,7 @@ class BridgeWS:
             id=new_id(), title=source.title,
             created_at=time.time(), updated_at=time.time(),
             messages=list(source.messages), backend_id=target_backend_id,
+            model_override=None, reasoning_effort=None,
             working_dir=source.working_dir, auto_continue=source.auto_continue,
             max_continuations=source.max_continuations, agent_session_id=None,
         )
@@ -2175,16 +2373,163 @@ class BridgeWS:
         # 可续：最后一条 loop 没跑完、不是错误、当前没在跑、仍在 execute 阶段
         d["running"] = running
         d["resumable"] = bool(
-            last and not last.completed and not last.error
+            last and last.kind != "manual" and not last.completed and not last.error
             and not running and state.stage == STAGE_EXECUTE
         )
-        # ★ 把每条 loop 实际用到的 backend id 解析成可读 label，供面板/流程视图标出选型
+        d["canTakeover"] = bool(
+            state.control_mode == "loop"
+            and state.stage == STAGE_EXECUTE
+            and not running
+            and not d["resumable"]
+        )
+        # ★ 把每条 loop 实际用到的 backend + model + reasoning effort 解析成可读 label，
+        #   供面板/流程视图准确追溯「谁以什么档位执行、谁评审」。
         for rec in d.get("loops", []):
             bmap = rec.get("backends") or {}
+            rmap = rec.get("runtimes") or {}
             rec["backendLabels"] = {
-                pos: self._backend_label(bid) for pos, bid in bmap.items() if bid
+                pos: self._runtime_label(bid, rmap.get(pos))
+                for pos, bid in bmap.items() if bid
             }
         return d
+
+    @staticmethod
+    def _loop_manual_record(state: "LoopState") -> Optional["LoopRecord"]:
+        """Return the open manual pass, if this state is currently taken over."""
+        if state.control_mode != "manual" or not state.loops:
+            return None
+        record = state.loops[-1]
+        return record if record.kind == "manual" and not record.completed else None
+
+    @staticmethod
+    def _session_is_streaming(session: "Session") -> bool:
+        return any(bool(m.streaming) for m in session.messages)
+
+    def _sync_manual_loop_record(self, session: "Session", *, finalize: bool = False) -> None:
+        """Mirror normal-chat turns into the active manual LoopRecord.
+
+        The regular session transcript remains the rendering source while takeover is
+        active. This snapshot makes the pass independently inspectable in LoopPanel and
+        converts each user/assistant exchange into a visible sequential step.
+        """
+        state = self._loop_state(session.id)
+        if not state:
+            return
+        record = self._loop_manual_record(state)
+        if not record:
+            return
+
+        start = max(0, min(record.manual_start_index, len(session.messages)))
+        messages = session.messages[start:]
+        record.manual_messages = [m.to_dict() for m in messages]
+        steps: list[LoopStep] = []
+        pending_user: Optional[ChatMessage] = None
+        for message in messages:
+            if message.role == "user":
+                pending_user = message
+                continue
+            if message.role != "assistant" or pending_user is None:
+                continue
+            tool_lines = []
+            for tool in message.tool_calls or []:
+                status = getattr(tool, "status", "") or "done"
+                tool_lines.append(f"- {tool.name} [{status}]")
+            output = message.content or ""
+            if tool_lines:
+                output = f"{output}\n\n工具动作：\n" + "\n".join(tool_lines)
+            steps.append(LoopStep(
+                index=len(steps) + 1,
+                mode="sequential",
+                access=("write" if tool_lines else "read"),
+                desc=(pending_user.content or "（图片/附件指令）")[:1000],
+                status=("running" if message.streaming else "done"),
+                output=output,
+                started_at=float(pending_user.timestamp or 0),
+                ended_at=(0.0 if message.streaming else time.time()),
+            ))
+            pending_user = None
+        record.orchestration = steps
+        record.backends["execute"] = session.backend_id
+        record.runtimes["execute"] = self._resolved_runtime(
+            session.backend_id, self._session_runtime(session))
+        assistant_results = [m.content.strip() for m in messages
+                             if m.role == "assistant" and m.content.strip()]
+        record.result = "\n\n---\n\n".join(assistant_results[-4:])[-12000:]
+        record.updated_at = time.time()
+        if finalize:
+            record.completed = True
+            record.sub_stage = SUB_DONE
+            record.mark_sub(SUB_DONE)
+            record.artifact_checkpoint = git_snapshot(session.working_dir)
+        self._loop_save(state)
+        self._emit_loop_updated(state)
+
+    def _rpc_loopTakeover(self, session_id: str) -> str:
+        """Switch an idle loop session to ordinary chat and start a manual pass."""
+        state = self._loop_state(session_id)
+        session = self._active_sessions.get(session_id) or self._session_store.load(session_id)
+        if not state or not session or session.session_type != "loop":
+            return json.dumps({"status": "error", "message": "找不到 LOOP 会话"}, ensure_ascii=False)
+        payload = self._loop_payload(state)
+        if state.control_mode == "manual":
+            return json.dumps({"status": "ok", "controlMode": "manual"}, ensure_ascii=False)
+        if state.stage != STAGE_EXECUTE:
+            return json.dumps({"status": "error", "message": "只有执行阶段可以人工接管"}, ensure_ascii=False)
+        if payload.get("running"):
+            return json.dumps({"status": "error", "message": "LOOP 正在运行，停止后才能接管"}, ensure_ascii=False)
+        if payload.get("resumable"):
+            return json.dumps({"status": "error", "message": "存在未完成的 LOOP，请先继续完成或丢弃"}, ensure_ascii=False)
+        if self._session_is_streaming(session):
+            return json.dumps({"status": "error", "message": "当前回答尚未结束"}, ensure_ascii=False)
+
+        state.auto = False
+        seq = max((item.seq for item in state.loops), default=0) + 1
+        record = LoopRecord(
+            seq=seq,
+            kind="manual",
+            sub_stage=SUB_EXECUTE,
+            round=state.round,
+            goal="人工接管",
+            manual_start_index=len(session.messages),
+            manual_context=self._loop_context_digest(state),
+            agent_checkpoint=session.agent_session_id or "",
+            git_checkpoint=git_snapshot(session.working_dir),
+        )
+        if not record.git_checkpoint:
+            record.dir_checkpoint = dir_snapshot(session.working_dir)
+        record.mark_sub(SUB_EXECUTE)
+        record.backends["execute"] = session.backend_id
+        record.runtimes["execute"] = self._resolved_runtime(
+            session.backend_id, self._session_runtime(session))
+        state.loops.append(record)
+        state.control_mode = "manual"
+        self._loop_save(state)
+        self._emit_loop_updated(state)
+        return json.dumps({"status": "ok", "controlMode": "manual", "seq": seq}, ensure_ascii=False)
+
+    def _rpc_loopRelease(self, session_id: str) -> str:
+        """Seal the manual pass and return ownership to the LOOP panel."""
+        state = self._loop_state(session_id)
+        session = self._active_sessions.get(session_id) or self._session_store.load(session_id)
+        if not state or not session:
+            return json.dumps({"status": "error", "message": "找不到 LOOP 会话"}, ensure_ascii=False)
+        if state.control_mode != "manual":
+            return json.dumps({"status": "ok", "controlMode": "loop"}, ensure_ascii=False)
+        if self._session_is_streaming(session):
+            return json.dumps({"status": "error", "message": "回答仍在生成，结束后才能交还 LOOP"}, ensure_ascii=False)
+        if self._chat_extras_get(session_id).pending():
+            return json.dumps({"status": "error", "message": "仍有待发送的序列任务，请先执行完或清空"}, ensure_ascii=False)
+        record = self._loop_manual_record(state)
+        if record:
+            self._sync_manual_loop_record(session, finalize=True)
+            state = self._loop_state(session_id) or state
+            # Opening and immediately returning should not consume a fake pass.
+            if not record.manual_messages:
+                state.loops = [item for item in state.loops if item is not record]
+        state.control_mode = "loop"
+        self._loop_save(state)
+        self._emit_loop_updated(state)
+        return json.dumps({"status": "ok", "controlMode": "loop"}, ensure_ascii=False)
 
     def _emit_loop_updated(self, state: "LoopState") -> None:
         """整份 stage 状态变更后广播给所有客户端。"""
@@ -2235,7 +2580,8 @@ class BridgeWS:
                               indep_session_id: Optional[str] = None,
                               images: Optional[list] = None,
                               backend_id: Optional[str] = None,
-                              agent_session_id: Optional[str] = None) -> tuple:
+                              agent_session_id: Optional[str] = None,
+                              runtime: Optional[dict] = None) -> tuple:
         """让会话绑定的 backend 跑一轮，收集全文，并把增量推给 LoopPanel。
 
         resume=True 时复用 agent session 维持记忆；
@@ -2302,14 +2648,16 @@ class BridgeWS:
             effective_agent_sid = agent_session_id if agent_session_id is not None else (
                 session.agent_session_id if resume and indep_session_id is None else None
             )
-            result = await backend.send_message(
-                messages=[], content=prompt, images=img_objs,
-                session_id=sid_for_backend, message_id=mid, on_delta=on_delta,
-                agent_session_id=effective_agent_sid,
-                working_dir=session.working_dir,
-                skip_permissions=True,
-                sandbox_enabled=session.sandbox_enabled,
-            )
+            send_kwargs = {
+                "messages": [], "content": prompt, "images": img_objs,
+                "session_id": sid_for_backend, "message_id": mid, "on_delta": on_delta,
+                "agent_session_id": effective_agent_sid,
+                "working_dir": session.working_dir,
+                "skip_permissions": True,
+                "sandbox_enabled": session.sandbox_enabled,
+            }
+            self._add_runtime_kwargs(backend, send_kwargs, runtime, session)
+            result = await backend.send_message(**send_kwargs)
             # 真实 backend 返回 camelCase "agentSessionId"；instance_manager 用 snake
             if isinstance(result, dict):
                 new_sid = result.get("agentSessionId") or result.get("agent_session_id")
@@ -2388,6 +2736,7 @@ class BridgeWS:
                 resume=False, indep_session_id=f"{session_id}:idea:{idea_id}",
                 images=(idea.images or None),
                 backend_id=(state.policy.backend_for("idea") or None),
+                runtime=self._loop_runtime(session, state, "idea"),
             )
             # 重新载入，避免并发覆盖
             state = self._loop_state(session_id) or state
@@ -2436,6 +2785,8 @@ class BridgeWS:
         state = self._loop_state(session_id)
         if not session or not state:
             return
+        if state.control_mode != "loop":
+            return
         ideas_text = "\n".join(
             f"- {i.prompt}" + (f" → {i.result}" if i.result else "")
             for i in state.ideas if i.status == "done"
@@ -2447,7 +2798,8 @@ class BridgeWS:
         )
         text, _ = await self._loop_run_agent(session, prompt, sub_stage="goal", seq=-1, resume=False,
                                            indep_session_id=f"{session_id}:goal",
-                                           backend_id=(state.policy.backend_for("goal") or None))
+                                           backend_id=(state.policy.backend_for("goal") or None),
+                                           runtime=self._loop_runtime(session, state, "goal"))
         state = self._loop_state(session_id) or state
         if text.strip() and not state.goal:
             state.goal = text.strip()
@@ -2521,7 +2873,8 @@ class BridgeWS:
         text, _ = await self._loop_run_agent(session, prompt, sub_stage="goal", seq=-1,
                                           resume=False, indep_session_id=f"{session_id}:goal",
                                           images=imgs,
-                                          backend_id=(state.policy.backend_for("goal") or None))
+                                          backend_id=(state.policy.backend_for("goal") or None),
+                                          runtime=self._loop_runtime(session, state, "goal"))
         refined = text.strip()
         state = self._loop_state(session_id) or state
         if not refined:
@@ -2608,6 +2961,8 @@ class BridgeWS:
         state = self._loop_state(session_id)
         if not state:
             return json.dumps({"status": "error", "message": "no loop state"}, ensure_ascii=False)
+        if state.control_mode == "manual" and self._coerce_bool(on):
+            return json.dumps({"status": "error", "message": "人工接管期间不能启动 Auto LOOP"}, ensure_ascii=False)
         state.auto = self._coerce_bool(on)
         self._loop_save(state)
         self._emit_loop_updated(state)
@@ -2623,6 +2978,8 @@ class BridgeWS:
         state = self._loop_state(session_id)
         if not state:
             return json.dumps({"status": "error", "message": "no loop state"}, ensure_ascii=False)
+        if state.control_mode == "manual":
+            return json.dumps({"status": "error", "message": "请先将会话交还 LOOP"}, ensure_ascii=False)
         if state.stage != STAGE_EXECUTE:
             return json.dumps({"status": "error", "message": "当前不在 loopexecute 阶段"}, ensure_ascii=False)
         if session_id in self._loop_running:
@@ -2640,6 +2997,8 @@ class BridgeWS:
         state = self._loop_state(session_id)
         if not state:
             return json.dumps({"status": "error", "message": "no loop state"}, ensure_ascii=False)
+        if state.control_mode == "manual":
+            return json.dumps({"status": "error", "message": "人工接管期间请先交还 LOOP"}, ensure_ascii=False)
         if not state.loops:
             return json.dumps({"status": "error", "message": "没有可删除的 loop"}, ensure_ascii=False)
         try:
@@ -2673,6 +3032,8 @@ class BridgeWS:
         state = self._loop_state(session_id)
         if not session or not state:
             return
+        if state.control_mode != "loop":
+            return
         if session_id in self._loop_running:
             return
         self._loop_running.add(session_id)
@@ -2685,7 +3046,8 @@ class BridgeWS:
             if last and not last.completed and not last.error:
                 record = last
             else:
-                record = LoopRecord(seq=len(state.loops) + 1, sub_stage=SUB_PREPARE,
+                record = LoopRecord(seq=max((item.seq for item in state.loops), default=0) + 1,
+                                    sub_stage=SUB_PREPARE,
                                     round=state.round)
                 # ★ 版本隔离：开跑前快照 agent 上下文 + git 工作树，丢弃本次 loop 时回滚到这里
                 record.agent_checkpoint = session.agent_session_id or ""
@@ -2780,6 +3142,16 @@ class BridgeWS:
         record.mark_sub(SUB_PREPARE)
         # prepare + execute 恒走会话 backend；记下来供结果展示标出选型
         record.backends["execute"] = session.backend_id
+        execute_runtime = self._loop_runtime(session, state, "execute")
+        record.runtimes["execute"] = self._resolved_runtime(session.backend_id, execute_runtime)
+        requested_analysis_backend = state.policy.backend_for("analysis") or session.backend_id
+        if not any(c.id == requested_analysis_backend for c in self._backend_configs):
+            requested_analysis_backend = session.backend_id
+        record.backends["analysis"] = requested_analysis_backend
+        record.runtimes["analysis"] = self._resolved_runtime(
+            requested_analysis_backend,
+            self._loop_runtime(session, state, "analysis"),
+        )
         record.updated_at = time.time()
         self._loop_save(state)
         self._emit_loop_updated(state)
@@ -2819,7 +3191,8 @@ class BridgeWS:
         ptext, _ = await self._loop_run_agent(session, prepare_prompt, SUB_PREPARE, record.seq,
                                            resume=False,
                                            indep_session_id=f"{session.id}:loop{record.seq}:prepare",
-                                           images=addon_imgs or None)
+                                           images=addon_imgs or None,
+                                           runtime=execute_runtime)
         # 消费这些 addon：标记为已纳入本次 loop
         for a in pending:
             a.status = "applied"
@@ -2849,6 +3222,7 @@ class BridgeWS:
                 session, retry_prompt, SUB_PREPARE, record.seq,
                 resume=False,
                 indep_session_id=f"{session.id}:loop{record.seq}:prepare:retry",
+                runtime=execute_runtime,
             )
             rj = self._extract_json_block(rtext) or {}
             r_orch = rj.get("orchestration") or []
@@ -2900,7 +3274,8 @@ class BridgeWS:
         text, _ = await self._loop_run_agent(
             session, prompt, sub_stage="intent", seq=record.seq,
             resume=False, indep_session_id=f"{session.id}:intent:{state.round}",
-            backend_id=(state.policy.backend_for("analysis") or None),
+            backend_id=(record.backends.get("analysis") or session.backend_id),
+            runtime=(record.runtimes.get("analysis") or {}),
         )
         aj = self._extract_json_block(text) or {}
         sev = str(aj.get("severity", "low")).lower()
@@ -2932,6 +3307,12 @@ class BridgeWS:
     async def _loop_do_execute(self, session, state, record) -> None:
         record.sub_stage = SUB_EXECUTE
         record.mark_sub(SUB_EXECUTE)
+        record.backends.setdefault("execute", session.backend_id)
+        if not record.runtimes.get("execute"):
+            record.runtimes["execute"] = self._resolved_runtime(
+                session.backend_id, self._loop_runtime(session, state, "execute"),
+            )
+        execute_runtime = record.runtimes.get("execute") or {}
         record.updated_at = time.time()
         self._loop_save(state)
         self._emit_loop_updated(state)
@@ -2951,6 +3332,7 @@ class BridgeWS:
                 session, replan_prompt, SUB_EXECUTE, record.seq,
                 resume=False,
                 indep_session_id=f"{session.id}:loop{record.seq}:replan",
+                runtime=execute_runtime,
             )
             rj = self._extract_json_block(rtext) or {}
             r_orch = rj.get("orchestration") or []
@@ -2980,6 +3362,7 @@ class BridgeWS:
                 session, prompt, SUB_EXECUTE, record.seq,
                 resume=False,
                 indep_session_id=f"{session.id}:loop{record.seq}:execute",
+                runtime=execute_runtime,
             ))[0].strip()
         else:
             # 按编排执行：连续的 concurrent 步并行，sequential 步顺次
@@ -3026,6 +3409,7 @@ class BridgeWS:
                 session, summary_prompt, SUB_EXECUTE, record.seq,
                 resume=False,
                 indep_session_id=f"{session.id}:loop{record.seq}:summary",
+                runtime=execute_runtime,
             ))[0].strip()
         record.sub_stage = SUB_ANALYSIS
         record.updated_at = time.time()
@@ -3070,6 +3454,7 @@ class BridgeWS:
             session, prompt, sub_stage=f"step{step.index}", seq=record.seq,
             resume=resume, indep_session_id=_indep,
             agent_session_id=agent_session_id,
+            runtime=(record.runtimes.get("execute") or {}),
         )
         step.output = text.strip()
         step.status = "done" if text.strip() else "error"
@@ -3097,11 +3482,17 @@ class BridgeWS:
             f"【策略与心智（须遵循）】\n{state.policy.strategy}\n\n"
             if state.policy.strategy else ""
         )
-        eval_backend = state.policy.backend_for("analysis") or None
+        eval_backend = record.backends.get("analysis") or state.policy.backend_for("analysis") or session.backend_id
+        if not any(c.id == eval_backend for c in self._backend_configs):
+            eval_backend = session.backend_id
         # 记下本次评审实际用的 backend（可能是异构评审 backend），供结果展示标出选型
-        record.backends["analysis"] = eval_backend or session.backend_id
+        record.backends["analysis"] = eval_backend
+        analysis_runtime = record.runtimes.get("analysis") or self._resolved_runtime(
+            eval_backend, self._loop_runtime(session, state, "analysis"),
+        )
+        record.runtimes["analysis"] = analysis_runtime
         # 指定了异构评审 backend 时，必须用独立上下文（跨 backend 无法 resume 同一会话）
-        independent = bool(getattr(state.policy, "independent_eval", True)) or bool(eval_backend)
+        independent = bool(getattr(state.policy, "independent_eval", True)) or eval_backend != session.backend_id
         # ★ 防自欺：独立评审用一个不复用执行上下文的会话，避免被执行阶段的乐观自述带偏；
         #   并以"对抗式、以证据为准、默认未完成"的口径打分。
         reviewer_block = (
@@ -3133,6 +3524,7 @@ class BridgeWS:
             resume=not independent,
             indep_session_id=(f"{session.id}:eval:{record.seq}" if independent else None),
             backend_id=eval_backend,
+            runtime=analysis_runtime,
         )
         aj = self._extract_json_block(atext) or {}
         score = float(aj.get("score", 0) or 0)
@@ -3180,12 +3572,20 @@ class BridgeWS:
             exec_started = float(record.sub_started.get(SUB_EXECUTE, 0) or 0)
             exec_duration_ms = ((time.time() - exec_started) * 1000) if exec_started else None
             exec_success = not any(s.status == "error" for s in record.orchestration)
+            exec_runtime = record.runtimes.get("execute") or {}
             self._model_ledger.record(
                 exec_bid, self._backend_label(exec_bid), "execute", score=score,
                 success=exec_success, duration_ms=exec_duration_ms,
+                model=exec_runtime.get("model", ""),
+                reasoning_effort=exec_runtime.get("reasoningEffort", ""),
             )
             eval_bid = eval_backend or session.backend_id
-            self._model_ledger.record(eval_bid, self._backend_label(eval_bid), "analysis", success=True)
+            eval_runtime = record.runtimes.get("analysis") or {}
+            self._model_ledger.record(
+                eval_bid, self._backend_label(eval_bid), "analysis", success=True,
+                model=eval_runtime.get("model", ""),
+                reasoning_effort=eval_runtime.get("reasoningEffort", ""),
+            )
         except Exception:
             pass
         self._recompute_risk(state)
@@ -3205,7 +3605,8 @@ class BridgeWS:
     def _maybe_autocontinue(self, session_id: str) -> None:
         """auto 开启且仍在 execute、最后一次 loop 正常完成、未到收口 → 自动续下一次。"""
         state = self._loop_state(session_id)
-        if not state or not state.auto or state.stage != STAGE_EXECUTE:
+        if (not state or state.control_mode != "loop" or not state.auto
+                or state.stage != STAGE_EXECUTE):
             return
         last = state.loops[-1] if state.loops else None
         if not last or not last.completed or last.error:
@@ -3221,8 +3622,9 @@ class BridgeWS:
         for l in state.round_loops():  # 仅本轮，新一轮从干净的趋势/预算开始
             if l.seq == exclude_seq:
                 continue
-            sc = f"{l.analysis.score:.0f}" if l.analysis else "?"
-            lines.append(f"#{l.seq} 目标:{l.goal[:40]} 分数:{sc} 结果:{(l.result or '')[:60]}")
+            sc = f"{l.analysis.score:.0f}" if l.analysis else ("人工" if l.kind == "manual" else "?")
+            label = "manual" if l.kind == "manual" else "agent"
+            lines.append(f"#{l.seq} [{label}] 目标:{l.goal[:80]} 分数:{sc} 结果:{(l.result or '')[:800]}")
         return "\n".join(lines)
 
     def _recompute_risk(self, state: "LoopState") -> None:
@@ -3304,6 +3706,8 @@ class BridgeWS:
         state = self._loop_state(session_id)
         if not state:
             return json.dumps({"status": "error", "message": "no loop state"}, ensure_ascii=False)
+        if state.control_mode == "manual":
+            return json.dumps({"status": "error", "message": "人工接管期间请先交还 LOOP"}, ensure_ascii=False)
         if state.stage == STAGE_IDEA:
             return json.dumps({"status": "error", "message": "请先封口 loopidea"}, ensure_ascii=False)
         state.stage = STAGE_OUT
@@ -3486,14 +3890,18 @@ class BridgeWS:
                     f"session={session.id!r}, call_sid={aside_sid!r}",
                     file=sys.stderr, flush=True,
                 )
-                await backend.send_message(
-                    messages=[], content=prompt, images=images,
-                    session_id=aside_sid, message_id=new_id(), on_delta=on_delta,
-                    agent_session_id=None,          # ★ 独立上下文，绝不 resume loop 主线
-                    working_dir=session.working_dir,
-                    skip_permissions=True,
-                    sandbox_enabled=session.sandbox_enabled,
+                aside_kwargs = {
+                    "messages": [], "content": prompt, "images": images,
+                    "session_id": aside_sid, "message_id": new_id(), "on_delta": on_delta,
+                    "agent_session_id": None,       # ★ 独立上下文，绝不 resume loop 主线
+                    "working_dir": session.working_dir,
+                    "skip_permissions": True,
+                    "sandbox_enabled": session.sandbox_enabled,
+                }
+                self._add_runtime_kwargs(
+                    backend, aside_kwargs, self._loop_runtime(session, state, "aside"), session,
                 )
+                await backend.send_message(**aside_kwargs)
             finally:
                 backend.clear_cancelled(aside_sid)
                 if self._loop_active_backends.get(aside_sid) is backend:
@@ -3628,13 +4036,25 @@ class BridgeWS:
         return self._seqtask_payload(ex)
 
     def _rpc_seqtaskTakeNext(self, session_id: str) -> str:
-        """取出队首待发任务并标记为已发送（保留历史记录）。前端拿到后发进主对话。"""
+        """仅在主链路真正空闲时取队首，避免 Relay 重连造成双回答。"""
+        active_count = len(self._active_chat_turn_tasks(session_id))
+        if active_count or self._has_seq_dispatch_reservation(session_id):
+            return json.dumps({
+                "status": "busy",
+                "task": None,
+                "activeCount": active_count,
+                "retryAfterMs": 350,
+            }, ensure_ascii=False)
+
         ex = self._chat_extras_get(session_id)
         nxt = next((t for t in ex.seq_tasks if t.status == "pending"), None)
         if not nxt:
             return json.dumps({"status": "ok", "task": None}, ensure_ascii=False)
         nxt.status = "sent"
         nxt.updated_at = time.time()
+        # 领取与 sendMessage 分属两个 WebSocket RPC；租约覆盖这段窗口，防止
+        # 多个客户端同时领取相邻任务。sendMessage 到达时会立即释放。
+        self._seq_dispatch_reservations[session_id] = time.time() + 10.0
         self._chat_extras_save(ex)
         self._emit_seqtask_updated(ex)
         return json.dumps({"status": "ok", "task": nxt.to_dict()}, ensure_ascii=False)
@@ -3754,14 +4174,16 @@ class BridgeWS:
                 backend = self._get_backend(session.backend_id)
             aside_sid = f"{session_id}:chataside"
             try:
-                await backend.send_message(
-                    messages=[], content=prompt, images=images,
-                    session_id=aside_sid, message_id=new_id(), on_delta=on_delta,
-                    agent_session_id=None,          # ★ 独立上下文，绝不 resume 主线
-                    working_dir=session.working_dir,
-                    skip_permissions=True,
-                    sandbox_enabled=session.sandbox_enabled,
-                )
+                aside_kwargs = {
+                    "messages": [], "content": prompt, "images": images,
+                    "session_id": aside_sid, "message_id": new_id(), "on_delta": on_delta,
+                    "agent_session_id": None,       # ★ 独立上下文，绝不 resume 主线
+                    "working_dir": session.working_dir,
+                    "skip_permissions": True,
+                    "sandbox_enabled": session.sandbox_enabled,
+                }
+                self._add_runtime_kwargs(backend, aside_kwargs, self._session_runtime(session), session)
+                await backend.send_message(**aside_kwargs)
             finally:
                 backend.clear_cancelled(aside_sid)
 
@@ -3799,6 +4221,61 @@ class BridgeWS:
                 d["pinned"] = True   # 前端用于区分固定后端
             result.append(d)
         return json.dumps(result, ensure_ascii=False)
+
+    def _rpc_codexRemoteHosts(self, backend_id: str = "") -> str:
+        """列出与 Codex Desktop 相同来源的 OpenSSH Host 别名。"""
+        cfg = next((item for item in self._backend_configs if item.id == backend_id), None)
+        if not cfg or cfg.type != BackendType.CODEX_OFFICIAL:
+            return json.dumps({"status": "error", "message": "请选择 Codex Office backend", "hosts": []}, ensure_ascii=False)
+        return json.dumps({"status": "ok", "hosts": list_ssh_hosts()}, ensure_ascii=False)
+
+    async def _rpc_codexLocalThreads(self, backend_id: str) -> str:
+        """列出当前 AgentWithU 执行节点本机已有的原生 Codex threads。"""
+        cfg = next((item for item in self._backend_configs if item.id == backend_id), None)
+        if not cfg or cfg.type != BackendType.CODEX_OFFICIAL:
+            return json.dumps({"status": "error", "message": "请选择 Codex Office backend", "threads": []}, ensure_ascii=False)
+        try:
+            backend = self._get_backend(backend_id)
+            assert isinstance(backend, CodexOfficeBackend)
+            rows = await list_local_threads(
+                resolve_codex_cli(cfg.cli_path), backend._build_env(), 100,
+            )
+            threads = [{
+                "id": str(item.get("id") or ""),
+                "title": str(item.get("name") or item.get("preview") or "未命名 Codex thread"),
+                "preview": str(item.get("preview") or ""),
+                "cwd": str(item.get("cwd") or ""),
+                "createdAt": item.get("createdAt", 0),
+                "updatedAt": item.get("updatedAt", 0),
+                "source": item.get("source"),
+                "status": item.get("status"),
+            } for item in rows]
+            return json.dumps({"status": "ok", "threads": threads}, ensure_ascii=False)
+        except Exception as exc:
+            return json.dumps({"status": "error", "message": str(exc), "threads": []}, ensure_ascii=False)
+
+    async def _rpc_codexRemoteThreads(self, backend_id: str, host: str) -> str:
+        """通过 SSH 启动远端 app-server 并列出可恢复的 Codex threads。"""
+        cfg = next((item for item in self._backend_configs if item.id == backend_id), None)
+        if not cfg or cfg.type != BackendType.CODEX_OFFICIAL:
+            return json.dumps({"status": "error", "message": "请选择 Codex Office backend", "threads": []}, ensure_ascii=False)
+        try:
+            host = validate_ssh_host(host)
+            command = cfg.get_env("AGENTWITHU_CODEX_REMOTE_COMMAND") or "codex app-server --listen stdio://"
+            rows = await list_remote_threads(host, command, 100)
+            threads = [{
+                "id": str(item.get("id") or ""),
+                "title": str(item.get("name") or item.get("preview") or "未命名 Codex thread"),
+                "preview": str(item.get("preview") or ""),
+                "cwd": str(item.get("cwd") or ""),
+                "createdAt": item.get("createdAt", 0),
+                "updatedAt": item.get("updatedAt", 0),
+                "source": item.get("source"),
+                "status": item.get("status"),
+            } for item in rows]
+            return json.dumps({"status": "ok", "threads": threads}, ensure_ascii=False)
+        except Exception as exc:
+            return json.dumps({"status": "error", "message": str(exc), "threads": []}, ensure_ascii=False)
 
     def _rpc_saveBackend(self, config_json: str) -> None:
         data = json.loads(config_json)
@@ -4549,6 +5026,11 @@ except urllib.error.URLError as e:
         working_dir = session.working_dir
         if not working_dir or working_dir == ".":
             return []
+        # SSH Remote 的 working_dir 属于目标主机。绝不能用 pathlib 在本机
+        # 拼接/创建这些目录（例如把 /srv/project 误写到 Windows 当前盘符）。
+        # 远端 Codex 自己负责发现目标机上已有的 project skills。
+        if session.codex_remote_host:
+            return []
 
         import os as _os
         import shutil as _shutil
@@ -4688,7 +5170,11 @@ except urllib.error.URLError as e:
         if not wd:
             return None
         import os
-        wd_abs = os.path.abspath(wd).replace("\\", "/")
+        wd_abs = (
+            str(wd).replace("\\", "/")
+            if getattr(session, "codex_remote_host", None)
+            else os.path.abspath(wd).replace("\\", "/")
+        )
         # 敏感路径列表（相对用户 home 目录的通配 + 绝对系统路径）
         home = os.path.expanduser("~").replace("\\", "/")
         sensitive = [
@@ -5144,6 +5630,43 @@ except urllib.error.URLError as e:
         except Exception as e:
             return json.dumps({"status": "error", "message": str(e)}, ensure_ascii=False)
 
+    def _rpc_updateSessionRuntime(self, session_id: str, runtime_json: str) -> str:
+        """更新后续 turn 的模型参数，不重建或清空下游原生会话上下文。"""
+        try:
+            raw = json.loads(runtime_json) if isinstance(runtime_json, str) else runtime_json
+            runtime = LoopPolicy._clean_runtime(raw)
+            session = self._active_sessions.get(session_id) or self._session_store.load(session_id)
+            if not session:
+                return json.dumps({"status": "error", "message": "Session not found"}, ensure_ascii=False)
+            cfg = next((item for item in self._backend_configs if item.id == session.backend_id), None)
+            if not cfg or cfg.type not in {BackendType.CODEX_OFFICIAL, BackendType.QWEN_CODE_CLI}:
+                return json.dumps({
+                    "status": "error",
+                    "message": "当前 Backend 不支持 Session 级模型切换",
+                }, ensure_ascii=False)
+
+            # Qwen SDK 支持逐 turn 选模型，但没有与 Codex 等价的 reasoning effort 参数。
+            session.model_override = runtime.get("model")
+            session.reasoning_effort = (
+                runtime.get("reasoningEffort")
+                if cfg.type == BackendType.CODEX_OFFICIAL else None
+            )
+            session.updated_at = time.time()
+            self._active_sessions[session_id] = session
+            self._session_store.save(session, async_=True)
+            self._emit_session_updated({
+                "type": "session_runtime_updated",
+                "sessionId": session.id,
+                "summary": session.meta_dict(),
+            })
+            return json.dumps({
+                "status": "ok",
+                "runtime": self._session_runtime(session),
+                "agentSessionId": session.agent_session_id,
+            }, ensure_ascii=False)
+        except Exception as e:
+            return json.dumps({"status": "error", "message": str(e)}, ensure_ascii=False)
+
     def _rpc_renameDirectory(self, path: str, new_name: str) -> str:
         """重命名目录选择器中的目录；只允许修改名称，不允许借此移动目录。"""
         from pathlib import Path as _Path
@@ -5324,6 +5847,119 @@ except urllib.error.URLError as e:
         except Exception as e:
             return json.dumps({"status": "error", "message": str(e)}, ensure_ascii=False)
 
+    def _rpc_syncFileStat(self, working_dir: str, rel: str) -> str:
+        """返回单文件大小。分块传输先取 size，前端才能显示真实字节进度。"""
+        try:
+            _root, target = self._sync_safe_path(working_dir, rel)
+            if not target.is_file():
+                return json.dumps({"status": "error", "message": "文件不存在"}, ensure_ascii=False)
+            return json.dumps({"status": "ok", "size": target.stat().st_size}, ensure_ascii=False)
+        except ValueError as e:
+            return json.dumps({"status": "error", "message": str(e)}, ensure_ascii=False)
+        except Exception as e:
+            return json.dumps({"status": "error", "message": str(e)}, ensure_ascii=False)
+
+    def _rpc_syncReadChunk(self, working_dir: str, rel: str, offset: int, size: int) -> str:
+        """分块读取文件；单块上限 1 MiB，避免一个 WS JSON 帧占用过多内存。"""
+        import base64
+        try:
+            _root, target = self._sync_safe_path(working_dir, rel)
+            if not target.is_file():
+                return json.dumps({"status": "error", "message": "文件不存在"}, ensure_ascii=False)
+            offset = int(offset)
+            size = int(size)
+            if offset < 0 or size <= 0 or size > 1024 * 1024:
+                raise ValueError("分块范围无效")
+            total = target.stat().st_size
+            with target.open("rb") as stream:
+                stream.seek(offset)
+                data = stream.read(size)
+            return json.dumps({
+                "status": "ok", "offset": offset, "size": len(data), "total": total,
+                "eof": offset + len(data) >= total,
+                "data": base64.b64encode(data).decode("ascii"),
+            }, ensure_ascii=False)
+        except ValueError as e:
+            return json.dumps({"status": "error", "message": str(e)}, ensure_ascii=False)
+        except Exception as e:
+            return json.dumps({"status": "error", "message": str(e)}, ensure_ascii=False)
+
+    @staticmethod
+    def _sync_transfer_id(value: str) -> str:
+        """传输 ID 只允许 URL-safe 短标识，防止临时文件名注入。"""
+        import re
+        value = str(value or "")
+        if not re.fullmatch(r"[A-Za-z0-9_-]{8,80}", value):
+            raise ValueError("传输标识无效")
+        return value
+
+    def _sync_upload_path(self, working_dir: str, rel: str, transfer_id: str):
+        _root, target = self._sync_safe_path(working_dir, rel)
+        token = self._sync_transfer_id(transfer_id)
+        return target, target.with_name(f".{target.name}.awu-{token}.part")
+
+    def _rpc_syncWriteStart(self, working_dir: str, rel: str, transfer_id: str) -> str:
+        """开始原子分块上传：先写同目录临时文件，完成后再 replace 到目标。"""
+        try:
+            target, temp = self._sync_upload_path(working_dir, rel, transfer_id)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with temp.open("wb"):
+                pass
+            return json.dumps({"status": "ok"}, ensure_ascii=False)
+        except ValueError as e:
+            return json.dumps({"status": "error", "message": str(e)}, ensure_ascii=False)
+        except Exception as e:
+            return json.dumps({"status": "error", "message": str(e)}, ensure_ascii=False)
+
+    def _rpc_syncWriteChunk(
+        self, working_dir: str, rel: str, transfer_id: str, offset: int, data_base64: str
+    ) -> str:
+        import base64
+        try:
+            _target, temp = self._sync_upload_path(working_dir, rel, transfer_id)
+            if not temp.is_file():
+                raise ValueError("上传会话不存在或已过期")
+            offset = int(offset)
+            if offset < 0 or temp.stat().st_size != offset:
+                raise ValueError("上传分块顺序不一致，请重试")
+            data = base64.b64decode(data_base64, validate=True)
+            if len(data) > 1024 * 1024:
+                raise ValueError("上传分块超过 1 MiB")
+            with temp.open("ab") as stream:
+                stream.write(data)
+            return json.dumps({"status": "ok", "written": len(data)}, ensure_ascii=False)
+        except ValueError as e:
+            return json.dumps({"status": "error", "message": str(e)}, ensure_ascii=False)
+        except Exception as e:
+            return json.dumps({"status": "error", "message": str(e)}, ensure_ascii=False)
+
+    def _rpc_syncWriteFinish(
+        self, working_dir: str, rel: str, transfer_id: str, expected_size: int
+    ) -> str:
+        import os
+        try:
+            target, temp = self._sync_upload_path(working_dir, rel, transfer_id)
+            if not temp.is_file():
+                raise ValueError("上传会话不存在或已过期")
+            actual = temp.stat().st_size
+            if actual != int(expected_size):
+                raise ValueError(f"上传大小校验失败：期望 {expected_size}，实际 {actual}")
+            os.replace(temp, target)
+            return json.dumps({"status": "ok", "size": actual}, ensure_ascii=False)
+        except ValueError as e:
+            return json.dumps({"status": "error", "message": str(e)}, ensure_ascii=False)
+        except Exception as e:
+            return json.dumps({"status": "error", "message": str(e)}, ensure_ascii=False)
+
+    def _rpc_syncWriteAbort(self, working_dir: str, rel: str, transfer_id: str) -> str:
+        try:
+            _target, temp = self._sync_upload_path(working_dir, rel, transfer_id)
+            if temp.exists():
+                temp.unlink()
+            return json.dumps({"status": "ok"}, ensure_ascii=False)
+        except Exception as e:
+            return json.dumps({"status": "error", "message": str(e)}, ensure_ascii=False)
+
     def _rpc_syncWriteFile(self, working_dir: str, rel: str, data_base64: str) -> str:
         """把 base64 内容写入工作目录内单个文件（必要时创建父目录）。"""
         import base64
@@ -5332,6 +5968,57 @@ except urllib.error.URLError as e:
             data = base64.b64decode(data_base64)
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(data)
+            return json.dumps({"status": "ok"}, ensure_ascii=False)
+        except ValueError as e:
+            return json.dumps({"status": "error", "message": str(e)}, ensure_ascii=False)
+        except Exception as e:
+            return json.dumps({"status": "error", "message": str(e)}, ensure_ascii=False)
+
+    async def _rpc_filePreview(self, working_dir: str, rel: str) -> str:
+        """离线解析 Draw.io / Office Open XML 文件；CPU/解压工作不阻塞 WS 事件循环。"""
+        try:
+            from .file_preview import preview_path
+            _root, target = self._sync_safe_path(working_dir, rel)
+            result = await asyncio.to_thread(preview_path, target)
+            return json.dumps(result, ensure_ascii=False)
+        except ValueError as e:
+            return json.dumps({"status": "error", "message": str(e)}, ensure_ascii=False)
+        except Exception as e:
+            return json.dumps({"status": "error", "message": f"预览失败：{e}"}, ensure_ascii=False)
+
+    async def _rpc_filePreviewData(self, name: str, data_base64: str) -> str:
+        """解析客户端本机副本中的文档；仅用于预览，不会落盘。"""
+        import base64
+        try:
+            from .file_preview import preview_bytes
+            def _parse() -> dict:
+                data = base64.b64decode(data_base64, validate=True)
+                return preview_bytes(name, data)
+            result = await asyncio.to_thread(_parse)
+            return json.dumps(result, ensure_ascii=False)
+        except Exception as e:
+            return json.dumps({"status": "error", "message": f"预览失败：{e}"}, ensure_ascii=False)
+
+    def _rpc_revealFile(self, working_dir: str, rel: str) -> str:
+        """在执行节点的文件管理器中定位文件；无桌面环境时返回明确错误。"""
+        import os
+        import subprocess
+        try:
+            _root, target = self._sync_safe_path(working_dir, rel)
+            if not target.exists():
+                return json.dumps({"status": "error", "message": "文件或目录不存在"}, ensure_ascii=False)
+            if sys.platform == "win32":
+                args = ["explorer.exe", str(target)] if target.is_dir() else ["explorer.exe", "/select,", str(target)]
+                flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                subprocess.Popen(args, creationflags=flags)
+            elif sys.platform == "darwin":
+                args = ["open", str(target)] if target.is_dir() else ["open", "-R", str(target)]
+                subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            else:
+                if not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
+                    raise RuntimeError("执行节点没有桌面环境，无法打开文件管理器")
+                folder = target if target.is_dir() else target.parent
+                subprocess.Popen(["xdg-open", str(folder)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             return json.dumps({"status": "ok"}, ensure_ascii=False)
         except ValueError as e:
             return json.dumps({"status": "error", "message": str(e)}, ensure_ascii=False)
@@ -5516,6 +6203,68 @@ except urllib.error.URLError as e:
     def _backend_label(self, bid: str) -> str:
         c = next((c for c in self._backend_configs if c.id == bid), None)
         return getattr(c, "label", None) or bid
+
+    @staticmethod
+    def _session_runtime(session: "Session") -> dict:
+        runtime: dict = {}
+        if isinstance(session.model_override, str) and session.model_override.strip():
+            runtime["model"] = session.model_override.strip()
+        effort = str(session.reasoning_effort or "").strip().lower()
+        if effort in LoopPolicy.REASONING_EFFORTS:
+            runtime["reasoningEffort"] = effort
+        return runtime
+
+    def _loop_runtime(self, session: "Session", state: "LoopState", pos: str) -> dict:
+        """Resolve Session defaults plus the Loop role-specific runtime profile."""
+        runtime = self._session_runtime(session)
+        runtime.update(state.policy.runtime_for(pos))
+        return runtime
+
+    def _resolved_runtime(self, backend_id: str, runtime: Optional[dict] = None) -> dict:
+        """Resolve the runtime actually visible to a backend for trace/ledger UI."""
+        cfg = next((c for c in self._backend_configs if c.id == backend_id), None)
+        if not cfg or cfg.type not in {BackendType.CODEX_OFFICIAL, BackendType.QWEN_CODE_CLI}:
+            return {}
+        raw = LoopPolicy._clean_runtime(runtime or {})
+        env = cfg.env or {}
+        model = (
+            raw.get("model") or cfg.model
+            or env.get("OPENAI_MODEL") or env.get("QWEN_MODEL") or ""
+        )
+        # 未显式覆盖时 Codex 可能从自己的 config.toml 取值；这里不猜测，
+        # 只记录 AgentWithU 确实传给 CLI 的档位。
+        effort = raw.get("reasoningEffort") if cfg.type == BackendType.CODEX_OFFICIAL else ""
+        effort = effort if effort in LoopPolicy.REASONING_EFFORTS else ""
+        out: dict = {}
+        if model:
+            out["model"] = model
+        if effort:
+            out["reasoningEffort"] = effort
+        return out
+
+    @staticmethod
+    def _add_runtime_kwargs(backend: ModelBackend, kwargs: dict, runtime: Optional[dict],
+                            session: Optional["Session"] = None) -> None:
+        """Pass per-turn model knobs only to backends that explicitly support them."""
+        if not isinstance(backend, (CodexOfficeBackend, QwenCodeSdkBackend)):
+            return
+        cleaned = LoopPolicy._clean_runtime(runtime or {})
+        kwargs["model_override"] = cleaned.get("model")
+        if isinstance(backend, CodexOfficeBackend):
+            kwargs["reasoning_effort"] = cleaned.get("reasoningEffort")
+        if session and session.codex_remote_host:
+            kwargs["remote_host"] = session.codex_remote_host
+        elif session and session.codex_connection_mode == "node":
+            kwargs["app_server_local"] = True
+
+    def _runtime_label(self, backend_id: str, runtime: Optional[dict] = None) -> str:
+        resolved = self._resolved_runtime(backend_id, runtime)
+        parts = [self._backend_label(backend_id)]
+        if resolved.get("model"):
+            parts.append(resolved["model"])
+        if resolved.get("reasoningEffort"):
+            parts.append(resolved["reasoningEffort"])
+        return " · ".join(parts)
 
     def _rpc_modelLedgerList(self) -> str:
         """跨 session 模型能力台账：各 backend 在执行/评审等角色的表现，供分配参考。"""
@@ -6498,14 +7247,17 @@ except urllib.error.URLError as e:
                 parts.append(delta.text)
 
         try:
-            await backend.send_message(
-                messages=[], content=prompt, images=None,
-                session_id=aside_sid, message_id=msg_id, on_delta=on_delta,
-                agent_session_id=None,
-                working_dir=working_dir,
-                skip_permissions=True,
-                sandbox_enabled=False,
-            )
+            send_kwargs = {
+                "messages": [], "content": prompt, "images": None,
+                "session_id": aside_sid, "message_id": msg_id, "on_delta": on_delta,
+                "agent_session_id": None,
+                "working_dir": working_dir,
+                "skip_permissions": True,
+                "sandbox_enabled": False,
+            }
+            if backend_id == session.backend_id:
+                self._add_runtime_kwargs(backend, send_kwargs, self._session_runtime(session), session)
+            await backend.send_message(**send_kwargs)
             backend.clear_cancelled(aside_sid)
             message = "".join(parts).strip()
             # 清理可能的 markdown 代码块包裹
@@ -6666,8 +7418,31 @@ except urllib.error.URLError as e:
             if backend_id and backend_id != session.backend_id:
                 session.backend_id = backend_id
                 session.agent_session_id = None
+                session.codex_connection_mode = None
+                session.codex_remote_host = None
+                session.codex_thread_attached = False
 
             session.auto_continue = auto_continue
+            # 冻结本轮运行参数。用户可在生成过程中安排下一轮切模，但不能让当前
+            # 已经入队的 turn 在准备/发起之间被异步配置更新改变。
+            turn_runtime = self._session_runtime(session)
+
+            manual_context = ""
+            if session.session_type == "loop":
+                loop_state = self._loop_state(session.id)
+                manual_record = self._loop_manual_record(loop_state) if loop_state else None
+                if not loop_state or loop_state.control_mode != "manual" or not manual_record:
+                    raise RuntimeError("该 LOOP 会话尚未进入人工接管，不能从普通聊天入口发送")
+                # Every takeover starts with an explicit read-only digest. It gives the
+                # normal agent the stopped LOOP's goal/results without exposing the
+                # injected text as a fake user message in the visible transcript.
+                if not manual_record.manual_messages:
+                    manual_context = (
+                        "【LOOP 人工接管上下文】\n"
+                        "你正在人工接管同一个 LOOP session。继续在当前工作目录推进，"
+                        "不要重新开始，也不要忽略已完成成果。\n\n"
+                        + (manual_record.manual_context or self._loop_context_digest(loop_state))
+                    )
 
             # ★ @SESSION: 引用：在进入模型前注入被引用 session 的上下文。
             content = self._build_session_reference_context(content, session.id)
@@ -6729,10 +7504,14 @@ except urllib.error.URLError as e:
             # ★ 每次发消息前重新部署 Backend Skill 文件，确保 SKILL.md 始终是最新模板
             self._sync_backend_skills_to_directory(session)
 
+            constraints = self._compose_constraints(session)
+            if manual_context:
+                constraints = "\n\n---\n\n".join(
+                    part for part in (constraints, manual_context) if part)
             await self._async_send(
                 session, content, images, backend_id, assistant_id,
                 auto_continue=auto_continue, skip_permissions=skip_permissions,
-                constraints=self._compose_constraints(session),
+                constraints=constraints, runtime=turn_runtime,
             )
         except Exception as e:
             import traceback
@@ -6756,6 +7535,7 @@ except urllib.error.URLError as e:
         auto_continue: bool = True,
         skip_permissions: bool = True,
         constraints: Optional[str] = None,
+        runtime: Optional[dict] = None,
     ):
         backend = self._get_backend(backend_id)
         assistant_msg = session.messages[-1]
@@ -7030,6 +7810,7 @@ except urllib.error.URLError as e:
                     if isinstance(backend, (AnthropicAPIBackend, OpenAICompatibleBackend)):
                         _send_kwargs["extra_tools"] = extra_tools
                         _send_kwargs["on_tool_call"] = _on_tool_call
+                self._add_runtime_kwargs(backend, _send_kwargs, runtime, session)
                 result = await backend.send_message(**_send_kwargs)
 
                 if use_agent_session and result.get("agentSessionId") != use_agent_session:
@@ -7119,6 +7900,9 @@ except urllib.error.URLError as e:
             "sessionId": session.id,
             "summary": session.meta_dict(),
         })
+
+        if session.session_type == "loop":
+            self._sync_manual_loop_record(session)
 
         # ★ 自动 AI commit：对话完成后自动 stage-all → AI 生成 message → commit → push
         if session.auto_commit:

@@ -24,6 +24,14 @@ import { ManualPanel } from './components/ManualPanel';
 import { ChatPane } from './components/ChatPane';
 import { LoopPolicyEditor, DEFAULT_POLICY, normalizePolicy } from './components/LoopPolicyEditor';
 import type { LoopPolicy } from './components/LoopPolicyEditor';
+import {
+  BackendRuntimeFields,
+  formatRuntimeLabel,
+  isCodexBackend,
+  isRuntimeConfigurableBackend,
+  normalizeModelRuntime,
+  type ModelRuntime,
+} from './components/CodexRuntimeFields';
 import { clearSessionHistoryCache } from './hooks/useChat';
 import { clearStreamStateForSession } from './hooks/useStreamState';
 import { useConfig } from './hooks/useConfig';
@@ -491,7 +499,7 @@ export const App: React.FC = () => {
     });
   }, []);
 
-  // ★ 全局监听所有 session 的 done/error
+  // ★ 全局监听所有 session 的显式 done
   // 修正两个 bug：
   //   1. 后台 session 绿点不消失：从 streamingSessions 移除
   //   2. 僵尸 streamingSessions 状态：清理用于 UI 显示的状态
@@ -500,8 +508,8 @@ export const App: React.FC = () => {
     const unsub = api.onStreamDelta((delta: any) => {
       const sid: string | undefined = delta.sessionId;
       if (!sid) return;
-      if (delta.type === 'done' || delta.type === 'error') {
-        // 无论哪个 session，都从 streaming 中移除
+      if (delta.type === 'done') {
+        // error 可能只是 CLI 的可恢复诊断；只有 done 才能释放运行指示。
         setStreamingSessions((prev) => {
           if (!prev.has(sid)) return prev;
           const next = new Set(prev);
@@ -509,7 +517,7 @@ export const App: React.FC = () => {
           return next;
         });
         // 如果完成的是后台 session（非当前活跃），标记为"已完成待查看"
-        if (delta.type === 'done' && sid !== activeSessionIdRef.current) {
+        if (sid !== activeSessionIdRef.current) {
           setCompletedSessions((prev) => {
             const next = new Set(prev);
             next.add(sid);
@@ -530,10 +538,18 @@ export const App: React.FC = () => {
     setNewSessionDialogOpen(true);
   }, []);
 
-  const handleCreateSession = useCallback(async (workingDir: string, backendId: string, sessionType: 'normal' | 'loop' = 'normal', loopPolicy?: any, execKey?: string) => {
+  const handleCreateSession = useCallback(async (
+    workingDir: string,
+    backendId: string,
+    sessionType: 'normal' | 'loop' = 'normal',
+    loopPolicy?: any,
+    runtime: ModelRuntime = {},
+    execKey?: string,
+    codexRemote: { mode?: 'node'; threadId?: string; title?: string } = {},
+  ) => {
     let session;
     try {
-      session = await api.createSession(workingDir, backendId, sessionType, execKey);
+      session = await api.createSession(workingDir, backendId, sessionType, runtime, execKey, codexRemote);
     } catch (e: any) {
       // ★ 后端抛出错误（如节点 session 数量已达上限）
       showToast('error', e?.message || '创建会话失败');
@@ -922,6 +938,7 @@ export const App: React.FC = () => {
         activeExecLabel={activeSession?.execLabel}
         activeExecMode={activeSession?.execMode}
         activeBackendId={activeBackendId}
+        activeCodexRemoteHost={activeSession?.codexRemoteHost}
       />
 
       {/* 侧栏宽度拖拽手柄(桌面端展开时) */}
@@ -969,13 +986,13 @@ export const App: React.FC = () => {
           {!isMobile && <CopyablePath path={activeSession?.workingDir} />}
           {!isMobile && (
             <span
-              title={`当前模型：${formatModelLabel(activeExecBackends.find((b: any) => b.id === activeBackendId))}`}
+              title={`当前模型：${formatModelLabel(activeExecBackends.find((b: any) => b.id === activeBackendId), activeSession)}`}
               style={{
                 fontSize: 12, color: 'var(--theme-text-muted, #656d76)',
                 maxWidth: 220, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
               }}
             >
-              🤖 {formatModelLabel(activeExecBackends.find((b: any) => b.id === activeBackendId))}
+              🤖 {formatModelLabel(activeExecBackends.find((b: any) => b.id === activeBackendId), activeSession)}
             </span>
           )}
           <div style={{ flex: 1 }} />
@@ -1338,6 +1355,9 @@ const overlayStyle: React.CSSProperties = {
   position: 'fixed', inset: 0,
   background: 'rgba(0,0,0,0.5)',
   display: 'flex', alignItems: 'center', justifyContent: 'center',
+  padding: 16,
+  boxSizing: 'border-box',
+  overflowY: 'auto',
   zIndex: 1000,
 };
 
@@ -1348,6 +1368,10 @@ const dialogStyle: React.CSSProperties = {
   padding: 24,
   width: '90%',
   maxWidth: 480,
+  maxHeight: 'calc(100dvh - 32px)',
+  overflowY: 'auto',
+  overscrollBehavior: 'contain',
+  boxSizing: 'border-box',
   boxShadow: '0 4px 24px rgba(0,0,0,0.18)',
 };
 
@@ -1487,14 +1511,19 @@ function pathBasename(dir: string | undefined): string {
 }
 
 /* 顶栏只展示实际模型参数；backend 名称已在左侧 session 列表展示。 */
-function formatModelLabel(backend: any): string {
+function formatModelLabel(backend: any, session?: any): string {
   if (!backend) return 'auto';
   const env = backend.env || {};
-  if (backend.type === 'qwen-code-cli') return env.QWEN_MODEL || backend.model || 'auto';
+  if (backend.type === 'qwen-code-cli') return formatRuntimeLabel(backend, {
+    model: session?.modelOverride,
+  });
   if (backend.type === 'claude-agent-sdk' || backend.type === 'claude-code-official') {
     return env.ANTHROPIC_MODEL || backend.model || 'auto';
   }
-  if (backend.type === 'codex-office') return backend.model || env.OPENAI_MODEL || 'auto';
+  if (backend.type === 'codex-office') return formatRuntimeLabel(backend, {
+    model: session?.modelOverride,
+    reasoningEffort: session?.reasoningEffort,
+  });
   return backend.model || env.OPENAI_MODEL || env.ANTHROPIC_MODEL || env.QWEN_MODEL || 'auto';
 }
 
@@ -1502,7 +1531,15 @@ function formatModelLabel(backend: any): string {
 interface NewSessionDialogProps {
   backends: any[];
   onClose: () => void;
-  onCreate: (workingDir: string, backendId: string, sessionType: 'normal' | 'loop', loopPolicy?: LoopPolicy, execKey?: string) => void;
+  onCreate: (
+    workingDir: string,
+    backendId: string,
+    sessionType: 'normal' | 'loop',
+    loopPolicy?: LoopPolicy,
+    runtime?: ModelRuntime,
+    execKey?: string,
+    codexRemote?: { mode?: 'node'; threadId?: string; title?: string },
+  ) => void;
 }
 
 const NewSessionDialog: React.FC<NewSessionDialogProps> = ({
@@ -1515,6 +1552,7 @@ const NewSessionDialog: React.FC<NewSessionDialogProps> = ({
   const [sessionType, setSessionType] = useState<'normal' | 'loop'>('normal');
   const [dirPickerOpen, setDirPickerOpen] = useState(false);
   const [loopPolicy, setLoopPolicy] = useState<LoopPolicy>(DEFAULT_POLICY);
+  const [sessionRuntime, setSessionRuntime] = useState<ModelRuntime>({});
   const [policyOpen, setPolicyOpen] = useState(false);
   const isAutoDir = !workingDir.trim() || workingDir.trim() === '.';
 
@@ -1536,6 +1574,22 @@ const NewSessionDialog: React.FC<NewSessionDialogProps> = ({
   const [selectedBackendId, setSelectedBackendId] = useState(
     backends[0]?.id || 'claude-agent-sdk-default'
   );
+  const runtimeBackendRef = useRef(selectedBackendId);
+  useEffect(() => {
+    if (runtimeBackendRef.current !== selectedBackendId) {
+      runtimeBackendRef.current = selectedBackendId;
+      // 模型名属于具体 Backend；切换账号/CLI 时不要把旧模型误带到新 Backend。
+      setSessionRuntime({});
+    }
+  }, [selectedBackendId]);
+  const selectedBackend = execBackends.find((item) => item.id === selectedBackendId);
+  const isCodex = isCodexBackend(selectedBackend);
+  const runtimeConfigurable = isRuntimeConfigurableBackend(selectedBackend);
+  const [codexLocation, setCodexLocation] = useState<'local' | 'node'>('local');
+  const [remoteThreads, setRemoteThreads] = useState<any[]>([]);
+  const [remoteThreadId, setRemoteThreadId] = useState('');
+  const [remoteLoading, setRemoteLoading] = useState(false);
+  const [remoteError, setRemoteError] = useState('');
   // 切换执行节点后,若原先选的后端在新节点不存在,回退到新节点的第一个。
   useEffect(() => {
     if (execBackends.length && !execBackends.some((b) => b.id === selectedBackendId)) {
@@ -1543,16 +1597,75 @@ const NewSessionDialog: React.FC<NewSessionDialogProps> = ({
     }
   }, [execBackends]); // eslint-disable-line react-hooks/exhaustive-deps
 
+  useEffect(() => {
+    if (!isCodex) {
+      setCodexLocation('local');
+      setRemoteThreads([]);
+      setRemoteThreadId('');
+    }
+  }, [isCodex]);
+
+  useEffect(() => {
+    setRemoteThreads([]);
+    setRemoteThreadId('');
+    setRemoteError('');
+    setRemoteLoading(false);
+  }, [codexLocation, selectedBackendId, execKey]);
+
+  useEffect(() => {
+    let cancelled = false;
+    if (!isCodex || codexLocation === 'local') {
+      setRemoteThreads([]);
+      setRemoteThreadId('');
+      setRemoteError('');
+      return;
+    }
+    // 节点本机枚举稍作合并，避免切换 backend/执行节点时启动重复 app-server 进程。
+    const timer = window.setTimeout(() => {
+      if (cancelled) return;
+      setRemoteLoading(true);
+      setRemoteError('');
+      api.codexLocalThreads(selectedBackendId, execKey).then((result) => {
+        if (cancelled) return;
+        setRemoteThreads(result.threads || []);
+        if (result.status !== 'ok') setRemoteError(result.message || '无法读取 Codex threads');
+      }).catch((error: any) => {
+        if (!cancelled) setRemoteError(error?.message || '无法连接 Codex app-server');
+      }).finally(() => { if (!cancelled) setRemoteLoading(false); });
+    }, 120);
+    return () => { cancelled = true; window.clearTimeout(timer); };
+  }, [isCodex, codexLocation, selectedBackendId, execKey]);
+
+  useEffect(() => {
+    if (!remoteThreadId) return;
+    const thread = remoteThreads.find((item) => item.id === remoteThreadId);
+    if (thread?.cwd) setWorkingDir(String(thread.cwd));
+  }, [remoteThreadId, remoteThreads]);
+
   const handleCreate = useCallback(async () => {
     // 空值交给后端补一个时间戳目录
+    const backend = execBackends.find((item) => item.id === selectedBackendId);
+    const runtime = isRuntimeConfigurableBackend(backend) ? normalizeModelRuntime(sessionRuntime) : {};
+    const selectedThread = remoteThreads.find((item) => item.id === remoteThreadId);
+    const codexRemote = isCodexBackend(backend) && codexLocation !== 'local'
+      ? {
+          mode: codexLocation,
+          threadId: remoteThreadId || undefined,
+          title: selectedThread?.title || undefined,
+        }
+      : {};
     await onCreate(workingDir.trim() || '', selectedBackendId, sessionType,
-      sessionType === 'loop' ? normalizePolicy(loopPolicy) : undefined, execKey);
-  }, [workingDir, selectedBackendId, sessionType, loopPolicy, execKey, onCreate]);
+      sessionType === 'loop' ? normalizePolicy(loopPolicy) : undefined, runtime, execKey, codexRemote);
+  }, [workingDir, selectedBackendId, sessionType, loopPolicy, sessionRuntime, execKey, execBackends, onCreate, codexLocation, remoteThreadId, remoteThreads]);
 
   const handleBrowse = useCallback(() => {
     // 本机与远端统一浏览“执行节点”的文件系统，保证两边都支持新建与重命名目录。
     setDirPickerOpen(true);
   }, []);
+
+  const codexCreateBlocked = isCodex && codexLocation === 'node'
+    ? (remoteLoading || !remoteThreadId)
+    : false;
 
   return (
     <div
@@ -1616,7 +1729,13 @@ const NewSessionDialog: React.FC<NewSessionDialogProps> = ({
             </button>
             {policyOpen && (
               <div style={{ marginTop: 10 }}>
-                <LoopPolicyEditor value={loopPolicy} onChange={setLoopPolicy} />
+                <LoopPolicyEditor
+                  value={loopPolicy}
+                  onChange={setLoopPolicy}
+                  availableBackends={execBackends}
+                  sessionBackendId={selectedBackendId}
+                  sessionRuntime={sessionRuntime}
+                />
               </div>
             )}
           </div>
@@ -1678,14 +1797,16 @@ const NewSessionDialog: React.FC<NewSessionDialogProps> = ({
             </button>
           </div>
           <span style={helpTextStyle}>
-            {isAutoDir
+            {isCodex && codexLocation === 'node'
+              ? '接管已有 Codex thread 后会自动带出它在所选执行节点上的工作目录。'
+              : isAutoDir
               ? '留空将自动在 ~/.agent-with-u/workspaces/session-时间戳/ 下新建目录（与日志目录同级）'
               : 'The directory where Claude will read/write files and run commands'}
           </span>
         </div>
 
         <div style={formGroupStyle}>
-          <label style={labelStyle}>Model:</label>
+          <label style={labelStyle}>Backend:</label>
           <div style={selectWrapperStyle}>
             <select
               value={selectedBackendId}
@@ -1699,11 +1820,61 @@ const NewSessionDialog: React.FC<NewSessionDialogProps> = ({
               ))}
             </select>
           </div>
+          <span style={helpTextStyle}>Backend 负责账号、连接和 CLI；支持的模型与推理档位在下方按 Session 单独选择。</span>
         </div>
+
+        {runtimeConfigurable && (
+          <div style={formGroupStyle}>
+            <BackendRuntimeFields
+              backend={execBackends.find((b) => b.id === selectedBackendId)}
+              value={sessionRuntime}
+              onChange={setSessionRuntime}
+            />
+          </div>
+        )}
+
+        {isCodex && (
+          <div style={{ ...formGroupStyle, padding: 12, border: '1px solid var(--theme-border)', borderRadius: 8 }}>
+            <label style={labelStyle}>Codex 会话来源:</label>
+            <div style={{ display: 'flex', gap: 8, marginBottom: codexLocation === 'local' ? 0 : 10 }}>
+              <button onClick={() => setCodexLocation('local')} style={{ ...browseBtnStyle, flex: 1, justifyContent: 'center', opacity: codexLocation === 'local' ? 1 : 0.55 }}>＋ 新建会话</button>
+              <button onClick={() => setCodexLocation('node')} style={{ ...browseBtnStyle, flex: 1, justifyContent: 'center', opacity: codexLocation === 'node' ? 1 : 0.55 }}>🧲 接管已有</button>
+            </div>
+            {codexLocation === 'node' && (
+              <>
+                <label style={{ ...labelStyle, fontSize: 11 }}>所选执行节点上的 Codex thread</label>
+                <select
+                  value={remoteThreadId}
+                  onChange={(e) => setRemoteThreadId(e.target.value)}
+                  style={{ ...selectStyle, width: '100%' }}
+                  disabled={remoteLoading}
+                >
+                  <option value="">请选择已有 thread…</option>
+                  {remoteThreads.map((thread) => (
+                    <option key={thread.id} value={thread.id}>
+                      {(thread.title || thread.preview || thread.id).slice(0, 72)} · {thread.cwd || '未知目录'}
+                    </option>
+                  ))}
+                </select>
+                <span style={{ ...helpTextStyle, color: remoteError ? '#f87171' : undefined }}>
+                  {remoteLoading
+                    ? '正在读取所选执行节点的 Codex threads…'
+                    : remoteError || (remoteThreads.length
+                      ? '接管后继续原生上下文；如果执行节点是家里电脑，通信仍走 AgentWithU Relay。'
+                      : '该执行节点暂未发现可接管的 Codex thread。')}
+                </span>
+              </>
+            )}
+          </div>
+        )}
 
         <div style={dialogActionsStyle}>
           <button onClick={onClose} style={cancelBtnStyle}>Cancel</button>
-          <button onClick={handleCreate} style={confirmBtnStyle}>
+          <button
+            onClick={handleCreate}
+            disabled={codexCreateBlocked}
+            style={{ ...confirmBtnStyle, opacity: codexCreateBlocked ? 0.5 : 1 }}
+          >
             Create Session
           </button>
         </div>

@@ -578,6 +578,161 @@ fn dir_sync_read_file(dir: String, rel: String) -> Result<String, String> {
 }
 
 #[tauri::command]
+fn dir_sync_file_size(dir: String, rel: String) -> Result<u64, String> {
+    let (_root, target) = sync_resolve(&dir, &rel)?;
+    let meta = std::fs::metadata(&target).map_err(|e| e.to_string())?;
+    if !meta.is_file() {
+        return Err("不是文件".into());
+    }
+    Ok(meta.len())
+}
+
+#[tauri::command]
+fn dir_sync_read_chunk(dir: String, rel: String, offset: u64, size: usize) -> Result<String, String> {
+    use std::io::{Read, Seek, SeekFrom};
+    if size == 0 || size > 1024 * 1024 {
+        return Err("分块大小无效".into());
+    }
+    let (_root, target) = sync_resolve(&dir, &rel)?;
+    let mut file = std::fs::File::open(&target).map_err(|e| e.to_string())?;
+    file.seek(SeekFrom::Start(offset)).map_err(|e| e.to_string())?;
+    let mut data = vec![0u8; size];
+    let read = file.read(&mut data).map_err(|e| e.to_string())?;
+    data.truncate(read);
+    Ok(BASE64.encode(&data))
+}
+
+fn sync_transfer_token(value: &str) -> Result<&str, String> {
+    if value.len() < 8 || value.len() > 80
+        || !value.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        return Err("传输标识无效".into());
+    }
+    Ok(value)
+}
+
+fn sync_temp_path(target: &Path, transfer_id: &str) -> Result<PathBuf, String> {
+    let token = sync_transfer_token(transfer_id)?;
+    let name = target.file_name().and_then(|v| v.to_str()).ok_or("文件名无效")?;
+    Ok(target.with_file_name(format!(".{name}.awu-{token}.part")))
+}
+
+#[cfg(target_os = "windows")]
+fn sync_atomic_replace(temp: &Path, target: &Path) -> Result<(), String> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
+    let from: Vec<u16> = temp.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    let to: Vec<u16> = target.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    let ok = unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) };
+    if ok == 0 {
+        Err(std::io::Error::last_os_error().to_string())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn sync_atomic_replace(temp: &Path, target: &Path) -> Result<(), String> {
+    std::fs::rename(temp, target).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn dir_sync_write_start(dir: String, rel: String, transfer_id: String) -> Result<(), String> {
+    let (_root, target) = sync_resolve(&dir, &rel)?;
+    let temp = sync_temp_path(&target, &transfer_id)?;
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    std::fs::File::create(temp).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+fn dir_sync_write_chunk(
+    dir: String,
+    rel: String,
+    transfer_id: String,
+    offset: u64,
+    data: String,
+) -> Result<u64, String> {
+    use std::io::Write;
+    let (_root, target) = sync_resolve(&dir, &rel)?;
+    let temp = sync_temp_path(&target, &transfer_id)?;
+    let bytes = BASE64.decode(data.as_bytes()).map_err(|e| format!("base64 解码失败: {e}"))?;
+    if bytes.len() > 1024 * 1024 {
+        return Err("上传分块超过 1 MiB".into());
+    }
+    let actual = std::fs::metadata(&temp).map_err(|_| "上传会话不存在或已过期".to_string())?.len();
+    if actual != offset {
+        return Err("上传分块顺序不一致，请重试".into());
+    }
+    let mut file = std::fs::OpenOptions::new().append(true).open(&temp).map_err(|e| e.to_string())?;
+    file.write_all(&bytes).map_err(|e| e.to_string())?;
+    Ok(bytes.len() as u64)
+}
+
+#[tauri::command]
+fn dir_sync_write_finish(
+    dir: String,
+    rel: String,
+    transfer_id: String,
+    expected_size: u64,
+) -> Result<(), String> {
+    let (_root, target) = sync_resolve(&dir, &rel)?;
+    let temp = sync_temp_path(&target, &transfer_id)?;
+    let actual = std::fs::metadata(&temp).map_err(|_| "上传会话不存在或已过期".to_string())?.len();
+    if actual != expected_size {
+        return Err(format!("上传大小校验失败：期望 {expected_size}，实际 {actual}"));
+    }
+    // 仅在临时文件完整校验后原子替换，失败时原文件仍然保留。
+    sync_atomic_replace(&temp, &target)
+}
+
+#[tauri::command]
+fn dir_sync_write_abort(dir: String, rel: String, transfer_id: String) -> Result<(), String> {
+    let (_root, target) = sync_resolve(&dir, &rel)?;
+    let temp = sync_temp_path(&target, &transfer_id)?;
+    if temp.exists() {
+        std::fs::remove_file(temp).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn dir_sync_reveal(dir: String, rel: String) -> Result<(), String> {
+    let (_root, target) = sync_resolve(&dir, &rel)?;
+    if !target.exists() {
+        return Err("文件或目录不存在".into());
+    }
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        let mut command = std::process::Command::new("explorer.exe");
+        if target.is_dir() {
+            command.arg(&target);
+        } else {
+            command.arg(format!("/select,{}", target.display()));
+        }
+        command.creation_flags(CREATE_NO_WINDOW).spawn().map_err(|e| e.to_string())?;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let mut command = std::process::Command::new("open");
+        if target.is_file() { command.arg("-R"); }
+        command.arg(&target).spawn().map_err(|e| e.to_string())?;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let folder = if target.is_dir() { target } else { target.parent().unwrap_or(&target).to_path_buf() };
+        std::process::Command::new("xdg-open").arg(folder).spawn().map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
 fn dir_sync_write_file(dir: String, rel: String, data: String) -> Result<(), String> {
     let (_root, target) = sync_resolve(&dir, &rel)?;
     let bytes = BASE64
@@ -781,7 +936,14 @@ pub fn run() {
             set_desktop_config,
             dir_sync_scan,
             dir_sync_read_file,
+            dir_sync_file_size,
+            dir_sync_read_chunk,
             dir_sync_write_file,
+            dir_sync_write_start,
+            dir_sync_write_chunk,
+            dir_sync_write_finish,
+            dir_sync_write_abort,
+            dir_sync_reveal,
             dir_sync_delete_file
         ])
         .run(tauri::generate_context!())
