@@ -3,6 +3,12 @@ import { markdownToHtml } from '../utils/markdown';
 import { api, loadSkillImageDataUrl } from '../api';
 import type { ChatMessage, ToolCall, ContentBlock, SubagentInfo } from '../hooks/useChat';
 import { DiffView, type DiffData } from './DiffView';
+import {
+  TTS_STATE_EVENT,
+  toggleSpeech,
+  type SpeechState,
+  type SpeechStatus,
+} from '../utils/tts';
 
 // ── 注入全局动画样式 ──
 if (typeof document !== 'undefined' && !document.getElementById('msg-bubble-css')) {
@@ -683,6 +689,8 @@ interface Props {
   animateIn?: boolean;
   sessionId?: string;
   canBranch?: boolean;
+  ttsVoice?: string;
+  ttsRate?: number;
 }
 
 // 复制气泡内容到剪贴板
@@ -710,15 +718,51 @@ const copyToClipboard = async (content: string) => {
 };
 
 // 气泡操作菜单组件
-const BubbleActionMenu: React.FC<{ message: ChatMessage; sessionId?: string; canBranch?: boolean }> = ({ message, sessionId, canBranch }) => {
+const BubbleActionMenu: React.FC<{
+  message: ChatMessage;
+  sessionId?: string;
+  canBranch?: boolean;
+  ttsVoice?: string;
+  ttsRate?: number;
+}> = ({ message, sessionId, canBranch, ttsVoice, ttsRate }) => {
   const [menuOpen, setMenuOpen] = useState(false);
   const [copied, setCopied] = useState(false);
   const [copiedFull, setCopiedFull] = useState(false);
   const [branching, setBranching] = useState(false);
+  const [speechStatus, setSpeechStatus] = useState<SpeechStatus>('idle');
+  const [speechError, setSpeechError] = useState('');
 
   const copyTimerRef = useRef<ReturnType<typeof setTimeout>>();
   const copyFullTimerRef = useRef<ReturnType<typeof setTimeout>>();
   useEffect(() => () => { clearTimeout(copyTimerRef.current); clearTimeout(copyFullTimerRef.current); }, []);
+
+  useEffect(() => {
+    const handleState = (event: Event) => {
+      const state = (event as CustomEvent<SpeechState>).detail;
+      if (state.messageId !== message.id) {
+        if (state.status === 'playing' || state.status === 'loading') {
+          setSpeechStatus('idle');
+          setSpeechError('');
+        }
+        return;
+      }
+      setSpeechStatus(state.status);
+      setSpeechError(state.error || '');
+    };
+    window.addEventListener(TTS_STATE_EVENT, handleState);
+    return () => window.removeEventListener(TTS_STATE_EVENT, handleState);
+  }, [message.id]);
+
+  const handleSpeech = useCallback(async (event: React.MouseEvent) => {
+    event.stopPropagation();
+    setSpeechError('');
+    await toggleSpeech(
+      message.id,
+      message.content || '',
+      ttsVoice || 'zh-CN-XiaoxiaoNeural',
+      ttsRate ?? 0,
+    );
+  }, [message.id, message.content, ttsVoice, ttsRate]);
 
   const handleCopy = useCallback(async () => {
     const success = await copyToClipboard(message.content || '');
@@ -802,7 +846,40 @@ const BubbleActionMenu: React.FC<{ message: ChatMessage; sessionId?: string; can
       bottom: 6,
       right: 6,
       zIndex: 100,
+      display: 'flex',
+      gap: 4,
     }}>
+      {message.role === 'assistant' && !message.streaming && !!message.content?.trim() && (
+        <button
+          onClick={handleSpeech}
+          title={
+            speechStatus === 'playing' ? '停止朗读'
+              : speechStatus === 'loading' ? '正在生成语音…'
+                : speechError || '朗读回答'
+          }
+          className="bubble-action-btn"
+          style={{
+            width: 28,
+            height: 20,
+            padding: 0,
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            background: 'var(--theme-bg-tertiary, #fff)',
+            border: '1px solid var(--theme-border, rgba(0,0,0,0.12))',
+            borderRadius: 4,
+            cursor: speechStatus === 'loading' ? 'wait' : 'pointer',
+            color: speechError
+              ? 'var(--theme-error, #f85149)'
+              : 'var(--theme-text-muted, #656d76)',
+            fontSize: 12,
+            lineHeight: 1,
+            opacity: speechStatus === 'idle' && !speechError ? undefined : 1,
+          }}
+        >
+          {speechStatus === 'loading' ? '…' : speechStatus === 'playing' ? '■' : speechError ? '⚠' : '🔊'}
+        </button>
+      )}
       {/* 三点菜单按钮（横向） */}
       <button
         onClick={(e) => { e.stopPropagation(); setMenuOpen(!menuOpen); }}
@@ -916,6 +993,8 @@ function MessageBubbleInner({
   animateIn = false,
   sessionId,
   canBranch = false,
+  ttsVoice,
+  ttsRate,
 }: Props) {
   const [lightboxSrc, setLightboxSrc] = useState<string | null>(null);
   const contentRef = useRef<HTMLDivElement>(null);
@@ -1056,7 +1135,13 @@ function MessageBubbleInner({
         }}
       >
         {/* 操作菜单（悬停显示） */}
-        <BubbleActionMenu message={message} sessionId={sessionId} canBranch={canBranch} />
+        <BubbleActionMenu
+          message={message}
+          sessionId={sessionId}
+          canBranch={canBranch}
+          ttsVoice={ttsVoice}
+          ttsRate={ttsRate}
+        />
         {/* 附件图片 */}
         {message.images && message.images.length > 0 && (
           <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, marginBottom: 8 }}>
@@ -1232,7 +1317,9 @@ function bubblePropsEqual(prev: Props, next: Props): boolean {
     prev.message.usage     === next.message.usage     &&
     prev.fontSize          === next.fontSize          &&
     prev.renderMarkdown    === next.renderMarkdown    &&
-    prev.animateIn         === next.animateIn
+    prev.animateIn         === next.animateIn         &&
+    prev.ttsVoice          === next.ttsVoice          &&
+    prev.ttsRate           === next.ttsRate
   );
 }
 

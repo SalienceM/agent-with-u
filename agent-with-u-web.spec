@@ -4,12 +4,14 @@ from PyInstaller.utils.hooks import collect_all, collect_data_files
 datas = [("frontend/dist", "frontend_dist")]
 binaries = []
 hiddenimports = [
-    "websockets", "PIL", "claude_agent_sdk", "certifi", "pydantic", "mcp", "dashscope",
+    "websockets", "PIL", "claude_agent_sdk", "certifi", "pydantic", "mcp", "dashscope", "edge_tts",
 ]
 datas += collect_data_files("certifi")
 tmp_ret = collect_all("pydantic_core")
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 tmp_ret = collect_all("dashscope")
+datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+tmp_ret = collect_all("edge_tts")
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 
 a = Analysis(

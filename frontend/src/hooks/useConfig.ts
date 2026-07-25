@@ -11,6 +11,8 @@ export interface AppConfig {
   bgImage: string;
   bgOpacity: number;
   uiOpacity: number;
+  ttsVoice: string;
+  ttsRate: number;
 }
 
 const DEFAULT_CONFIG: AppConfig = {
@@ -21,6 +23,8 @@ const DEFAULT_CONFIG: AppConfig = {
   bgImage: '',
   bgOpacity: 0.3,
   uiOpacity: 1.0,
+  ttsVoice: 'zh-CN-XiaoxiaoNeural',
+  ttsRate: 0,
 };
 
 // Theme color schemes

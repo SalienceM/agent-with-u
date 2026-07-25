@@ -1919,6 +1919,27 @@ export const api = {
     try { return typeof r === 'string' ? JSON.parse(r) : r; } catch { return { ok: false, error: 'parse error' }; }
   },
 
+  async ttsSynthesize(
+    text: string,
+    voice: string,
+    rate: number,
+  ): Promise<{
+    ok: boolean;
+    mime?: string;
+    base64?: string;
+    voice?: string;
+    rate?: number;
+    truncated?: boolean;
+    error?: string;
+  }> {
+    const result = await call('ttsSynthesize', text, voice, rate);
+    try {
+      return typeof result === 'string' ? JSON.parse(result) : result;
+    } catch {
+      return { ok: false, error: '语音响应格式错误' };
+    }
+  },
+
   async sttRefine(text: string, sessionId?: string): Promise<{ ok: boolean; text?: string; error?: string }> {
     const r = await call('sttRefine', text, sessionId || '');
     try { return typeof r === 'string' ? JSON.parse(r) : r; } catch { return { ok: false, error: 'parse error' }; }
@@ -2263,6 +2284,7 @@ function mockDispatch(method: string, params: any[]): any {
     case 'getSttConfig': return JSON.stringify({ mode: 'api', language: 'zh', localModel: 'base', apiBaseUrl: '', apiKey: '', apiModel: 'whisper-1' });
     case 'saveSttConfig': return JSON.stringify({ ok: true });
     case 'sttTranscribe': return JSON.stringify({ ok: false, error: 'mock mode' });
+    case 'ttsSynthesize': return JSON.stringify({ ok: false, error: 'backend not connected' });
     case 'sttRefine': return JSON.stringify({ ok: false, error: 'mock mode' });
     case 'sttStreamStart': return JSON.stringify({ ok: false, error: 'mock mode' });
     case 'sttStreamStop': return JSON.stringify({ ok: false, error: 'mock mode' });

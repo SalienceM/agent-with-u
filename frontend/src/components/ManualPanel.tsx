@@ -31,6 +31,7 @@ const SECTIONS: ManualSection[] = [
       { icon: '🖼', title: '图片粘贴', summary: '支持 Snipaste、系统剪贴板和本地图片。图片会先显示为附件缩略图，再随消息发送给支持视觉的模型。', entry: 'Ctrl+V 或输入框图片按钮' },
       { icon: '✂', title: '区域截图', summary: '调用系统选区工具，选择完成后自动把截图加入当前输入框附件。', entry: '输入框截图按钮 / 可配置全局快捷键' },
       { icon: '🎙', title: '语音转文字', summary: '支持 OpenAI 兼容接口、DashScope 与本地 faster-whisper，将语音转成输入文字。', entry: '输入框麦克风；设置 → Voice-to-Text' },
+      { icon: '🔊', title: '回答朗读', summary: '使用 Edge 神经语音朗读已经完成的助手回答。只提取正文，自动清理 Markdown、链接并略过代码块；不会读取思考过程或工具日志。', entry: '悬停助手消息 → 🔊；设置 → Assistant Voice', tips: '默认不会自动播放；朗读生成发生在会话所属执行节点，因此本机、Web 和 Relay 会话的操作方式一致。' },
       { icon: '▣', title: 'Markdown 与代码', summary: '回复支持标题、列表、表格、引用、代码高亮、链接和图片。工具调用可折叠查看输入与输出。', entry: '消息气泡；设置 → Render Markdown' },
       { icon: 'A±', title: '对话字号', summary: '全局调整消息字号，可用滑块或输入工具栏上的 A− / A+ 快速步进。输入工具栏默认只显示图标，含义可悬浮查看。', entry: '设置 → Font Size / 输入框工具栏' },
       { icon: '↥', title: '自动续写', summary: '模型因长度限制停止时，可自动发送继续指令，从上次位置接着输出。', entry: '输入工具栏 / /autocontinue' },

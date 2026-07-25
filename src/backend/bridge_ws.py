@@ -1476,6 +1476,30 @@ class BridgeWS:
                   file=sys.stderr, flush=True)
             return json.dumps({"ok": False, "error": str(e)}, ensure_ascii=False)
 
+    async def _rpc_ttsSynthesize(
+        self,
+        text: str,
+        voice: str = "",
+        rate: int = 0,
+    ) -> str:
+        """生成 Edge 神经语音；base64 数据可透明穿过本地 WS 与 Relay。"""
+        import base64 as _b64
+        try:
+            from .tts import synthesize
+
+            result = await synthesize(text, voice, rate)
+            return json.dumps({
+                "ok": True,
+                "mime": "audio/mpeg",
+                "base64": _b64.b64encode(result.audio).decode("ascii"),
+                "voice": result.voice,
+                "rate": result.rate,
+                "truncated": result.truncated,
+            }, ensure_ascii=False)
+        except Exception as exc:
+            print(f"[TTS] synthesize failed: {exc}", file=sys.stderr, flush=True)
+            return json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False)
+
     # ── STT 实时流式 ──────────────────────────────────────────
 
     _stt_stream = None  # type: ignore

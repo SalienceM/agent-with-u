@@ -61,6 +61,7 @@ python -m PyInstaller --name "agent-with-u-backend" --onefile --console ^
     --collect-all pydantic_core ^
     --hidden-import pydantic --hidden-import mcp ^
     --hidden-import dashscope --collect-all dashscope ^
+    --collect-all edge_tts ^
     --noconfirm ws_main_entry.py
 if errorlevel 1 (
     echo [FAILED] PyInstaller build failed

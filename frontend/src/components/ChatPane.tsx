@@ -696,6 +696,8 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
               animateIn={isSameSession && hiddenCount + idx >= prevCount}
               sessionId={sessionId}
               canBranch={activeSession?.sessionType !== 'loop'}
+              ttsVoice={config.ttsVoice}
+              ttsRate={config.ttsRate}
             />
           ))}
 

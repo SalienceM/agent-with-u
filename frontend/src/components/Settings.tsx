@@ -346,6 +346,41 @@ export const Settings: React.FC<SettingsProps> = ({
           </div>
         )}
 
+        {/* 文字转语音 (TTS) 设置 */}
+        <div style={sectionStyle}>
+          <label style={labelStyle}>🔊 Assistant Voice (Edge TTS)</label>
+          <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+            <select
+              value={config.ttsVoice || 'zh-CN-XiaoxiaoNeural'}
+              onChange={(e) => onConfigChange({ ttsVoice: e.target.value })}
+              style={{ ...inputStyle, flex: '1 1 220px' }}
+            >
+              <option value="zh-CN-XiaoxiaoNeural">晓晓 · 女声，温柔自然</option>
+              <option value="zh-CN-YunxiNeural">云希 · 男声，年轻活力</option>
+              <option value="zh-CN-YunjianNeural">云健 · 男声，沉稳播报</option>
+              <option value="zh-CN-XiaoyiNeural">晓伊 · 女声，明快活泼</option>
+            </select>
+          </div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginTop: 10 }}>
+            <span style={{ fontSize: 12, color: 'var(--theme-text-muted)', whiteSpace: 'nowrap' }}>语速</span>
+            <input
+              type="range"
+              min={-50}
+              max={50}
+              step={5}
+              value={config.ttsRate ?? 0}
+              onChange={(e) => onConfigChange({ ttsRate: Number(e.target.value) })}
+              style={{ flex: 1, accentColor: 'var(--theme-accent)' }}
+            />
+            <span style={{ fontSize: 12, color: 'var(--theme-text-muted)', minWidth: 42, textAlign: 'right' }}>
+              {(config.ttsRate ?? 0) > 0 ? '+' : ''}{config.ttsRate ?? 0}%
+            </span>
+          </div>
+          <p style={{ fontSize: 11, color: 'var(--theme-text-muted)', margin: '7px 0 0', lineHeight: 1.5 }}>
+            助手消息悬停后点击 🔊 即可朗读，再点一次停止。代码块和 Markdown 标记会自动略过。
+          </p>
+        </div>
+
         {/* 数据导入导出 */}
         <div style={sectionStyle}>
           <label style={labelStyle}>Data Management</label>
