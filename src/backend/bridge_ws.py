@@ -7507,7 +7507,10 @@ except urllib.error.URLError as e:
                         print(f"[bridge_ws] Saved {len(img_urls)} user images for Backend Skill",
                               file=sys.stderr, flush=True)
 
-            user_msg = ChatMessage(id=new_id(), role="user", content=content, images=images)
+            # 前后端共用同一 user message ID，切换 session 后才能把内存气泡
+            # 与已落盘消息准确对齐。旧客户端未传时继续兼容后端生成 ID。
+            user_id = payload.get("userMessageId") or new_id()
+            user_msg = ChatMessage(id=user_id, role="user", content=content, images=images)
             session.messages.append(user_msg)
 
             assistant_id = payload.get("messageId") or new_id()

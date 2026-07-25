@@ -143,6 +143,31 @@ function normalizeMessage(msg: any): ChatMessage {
   };
 }
 
+/**
+ * 以后端返回的数组顺序为权威顺序，只保留尚未落盘的本地消息。
+ *
+ * 旧链路只把 assistant messageId 发给后端，user 消息会由前后端各生成一个
+ * 不同 ID。若该本地 user 后面紧跟的 assistant 已经出现在 loaded 中，说明
+ * 这一整轮其实已经落盘，不能再把 user 当成 local 追加到末尾。
+ */
+function mergeLoadedWithLocal(
+  loaded: ChatMessage[],
+  current: ChatMessage[],
+): ChatMessage[] {
+  const loadedIds = new Set(loaded.map((message) => message.id));
+  const locals = current.filter((message, index) => {
+    if (loadedIds.has(message.id)) return false;
+    if (message.role === 'user') {
+      const following = current[index + 1];
+      if (following?.role === 'assistant' && loadedIds.has(following.id)) {
+        return false;
+      }
+    }
+    return true;
+  });
+  return locals.length > 0 ? [...loaded, ...locals] : loaded;
+}
+
 // 模块级历史缓存:loadSession RPC 比较慢(尤其经中继),切换 session 时如果
 // 同步可以从缓存里立刻拿出历史 + 当前流式 tail,就不会出现「先一条流再几条
 // 历史」的跳变。loadSession 回来后用最新结果覆盖缓存。
@@ -352,10 +377,7 @@ export function useChat(
         //    回答没有提问"。用函数式更新拿到最新 prev，把不在 loaded 中的本地
         //    消息（一般是刚发出去的用户气泡）保留在末尾。
         setMessages((prev) => {
-          const loadedIds = new Set(loadedMessages.map((m: ChatMessage) => m.id));
-          const locals = prev.filter((m: ChatMessage) => !loadedIds.has(m.id));
-          if (locals.length === 0) return loadedMessages;
-          return [...loadedMessages, ...locals];
+          return mergeLoadedWithLocal(loadedMessages, prev);
         });
       }
       if (session?.autoContinue !== undefined) {
@@ -392,10 +414,7 @@ export function useChat(
           const loaded = session.messages.map(normalizeMessage);
           // ★ 同样防丢：compact 期间 doSend 可能已追加了本地用户消息
           setMessages((prev) => {
-            const loadedIds = new Set(loaded.map((m: ChatMessage) => m.id));
-            const locals = prev.filter((m: ChatMessage) => !loadedIds.has(m.id));
-            if (locals.length === 0) return loaded;
-            return [...loaded, ...locals];
+            return mergeLoadedWithLocal(loaded, prev);
           });
         }
       } else if (data.type === 'context_cleared') {
@@ -441,10 +460,7 @@ export function useChat(
           if (session?.messages) {
             const loaded = session.messages.map(normalizeMessage);
             setMessages((prev) => {
-              const loadedIds = new Set(loaded.map((m: ChatMessage) => m.id));
-              const locals = prev.filter((m: ChatMessage) => !loadedIds.has(m.id));
-              if (locals.length === 0) return loaded;
-              return [...loaded, ...locals];
+              return mergeLoadedWithLocal(loaded, prev);
             });
           }
           clearStreamState(sessionId);
@@ -750,6 +766,7 @@ export function useChat(
         content,
         images,
         backendId,
+        userMessageId: userMsg.id,
         messageId: assistantId,
         autoContinue: autoContinueRef.current,
         skipPermissions: skipPermissionsRef.current,

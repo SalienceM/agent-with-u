@@ -293,6 +293,10 @@ const ChatInputInner: React.FC<Props> = ({
   sessionRefsRef.current = sessionRefs;
   const sessionSelectedIndexRef = useRef(0);
   sessionSelectedIndexRef.current = sessionSelectedIndex;
+  const sessionLookupVersionRef = useRef(0);
+  const filePickerLoadVersionRef = useRef(0);
+  const sessionIdRef = useRef(sessionId);
+  sessionIdRef.current = sessionId;
 
   const workingDirRef = useRef(workingDir);
   workingDirRef.current = workingDir;
@@ -874,21 +878,42 @@ const ChatInputInner: React.FC<Props> = ({
     el.style.height = 'auto';
     el.style.height = Math.min(el.scrollHeight, 200) + 'px';
 
-    const text = el.value;
-    const cursor = el.selectionStart ?? text.length;
-    const beforeCursor = text.substring(0, cursor);
+    let text = el.value;
+    let cursor = el.selectionStart ?? text.length;
+    let beforeCursor = text.substring(0, cursor);
     const lastAt = beforeCursor.lastIndexOf('@');
 
     // ★ @ 文件选择器检测（优先于斜杠命令）
     if (lastAt >= 0) {
-      const afterAt = beforeCursor.substring(lastAt + 1);
+      let afterAt = beforeCursor.substring(lastAt + 1);
+
+      // 输入到 @SE 即明确视为会话引用，立即补全固定前缀并展示会话。
+      // 同时避免输入 @S 时已经发出的文件目录请求稍后反抢弹窗。
+      if (/^SE$/i.test(afterAt)) {
+        const marker = 'SESSION:';
+        text = text.substring(0, lastAt + 1) + marker + text.substring(cursor);
+        cursor = lastAt + 1 + marker.length;
+        el.value = text;
+        el.selectionStart = cursor;
+        el.selectionEnd = cursor;
+        beforeCursor = text.substring(0, cursor);
+        afterAt = marker;
+      }
+
       if (afterAt.toUpperCase().startsWith('SESSION:') && !afterAt.includes('\n')) {
         const query = afterAt.slice('SESSION:'.length);
         if (!query.includes(' ')) {
+          filePickerLoadVersionRef.current += 1;
+          const lookupVersion = ++sessionLookupVersionRef.current;
           setSessionQuery(query);
           setSessionSelectedIndex(0);
           api.listSessionRefs(query).then((items) => {
-            setSessionRefs((items || []).filter((s: any) => s.id !== sessionId));
+            if (lookupVersion !== sessionLookupVersionRef.current) return;
+            setSessionRefs((items || []).filter((s: any) => s.id !== sessionIdRef.current));
+            setShowSessionPicker(true);
+          }).catch(() => {
+            if (lookupVersion !== sessionLookupVersionRef.current) return;
+            setSessionRefs([]);
             setShowSessionPicker(true);
           });
           setShowFilePicker(false);
@@ -897,6 +922,7 @@ const ChatInputInner: React.FC<Props> = ({
         }
       }
       if (!afterAt.includes(' ') && !afterAt.includes('\n')) {
+        sessionLookupVersionRef.current += 1;
         const query = afterAt;
         setFileQuery(query);
         setFileSelectedIndex(0);
@@ -904,7 +930,9 @@ const ChatInputInner: React.FC<Props> = ({
           // 首次打开：加载工作目录
           setCurrentDir('.');
           const wd = workingDirRef.current || '.';
+          const loadVersion = ++filePickerLoadVersionRef.current;
           api.listDirectory(wd, wd).then((entries) => {
+            if (loadVersion !== filePickerLoadVersionRef.current) return;
             if (Array.isArray(entries)) {
               setFileEntries(entries);
               setShowFilePicker(true);
@@ -917,6 +945,8 @@ const ChatInputInner: React.FC<Props> = ({
     }
 
     // 没有 @ 触发时，关闭选择器
+    sessionLookupVersionRef.current += 1;
+    filePickerLoadVersionRef.current += 1;
     if (showSessionPickerRef.current) {
       setShowSessionPicker(false);
       setSessionQuery('');

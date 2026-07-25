@@ -1,4 +1,4 @@
-import React, { useState, useCallback, useEffect, useRef, useMemo } from 'react';
+import React, { useState, useCallback, useEffect, useLayoutEffect, useRef, useMemo } from 'react';
 import { api } from '../api';
 import { MessageBubble } from './MessageBubble';
 import { ChatInput } from './ChatInput';
@@ -443,7 +443,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
   }, [isFocused, sessionId, chat.messages, chat.isStreaming, activeSession, activeBackendId, effectiveBackends, ghostHistoryText, onGhostStateChange]);
 
   // ── 自动滚到底部 ──
-  useEffect(() => {
+  useLayoutEffect(() => {
     const switched = prevSessionRef.current !== sessionId;
     prevSessionRef.current = sessionId;
     if (switched) {
@@ -451,9 +451,9 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
       setShowScrollBtn(false);
     }
     if (!autoScrollRef.current) return;
-    requestAnimationFrame(() => {
-      endRef.current?.scrollIntoView({ behavior: switched ? 'instant' : 'smooth' });
-    });
+    const container = scrollContainerRef.current;
+    if (container) container.scrollTop = container.scrollHeight;
+    else endRef.current?.scrollIntoView({ behavior: 'auto', block: 'end' });
   }, [chat.messages, sessionId]);
 
   // ── 新交互开始时重置跟踪 ──
@@ -486,7 +486,9 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
   const scrollToBottom = useCallback(() => {
     autoScrollRef.current = true;
     setShowScrollBtn(false);
-    endRef.current?.scrollIntoView({ behavior: 'smooth' });
+    const container = scrollContainerRef.current;
+    if (container) container.scrollTop = container.scrollHeight;
+    else endRef.current?.scrollIntoView({ behavior: 'auto', block: 'end' });
   }, []);
 
   // 空 pane 占位
