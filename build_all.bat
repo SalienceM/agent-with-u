@@ -86,13 +86,10 @@ for /f "tokens=*" %%V in ('rustc --version 2^>^&1') do echo [OK] %%V
 echo.
 echo  -- Environment OK, starting build --
 echo.
-:: Auto-increment version based on date (format: 0.1.YYYYMMDD)
-for /f "tokens=2 delims=:" %%a in ('findstr /i "^  \"version\"" "src-tauri\tauri.conf.json"') do (
-    set "CURRENT_VERSION=%%a"
-)
-set "CURRENT_VERSION=!CURRENT_VERSION:"=!"
-set "CURRENT_VERSION=!CURRENT_VERSION: =!"
-set "CURRENT_VERSION=!CURRENT_VERSION:,=!"
+:: Read JSON with Python. findstr + quoted JSON keys is fragile under cmd.exe
+:: and previously parsed the opening "[" instead of the version value.
+set "CURRENT_VERSION=unknown"
+for /f "delims=" %%a in ('python -c "import json; print(json.load(open('src-tauri/tauri.conf.json',encoding='utf-8-sig')).get('version','unknown'))"') do set "CURRENT_VERSION=%%a"
 echo [INFO] Current version in config: !CURRENT_VERSION!
 :: Use YY.MM.DD format: MSI requires MAJOR<=255, MINOR<=255, PATCH<=65535
 :: e.g. 2026-03-23 → 26.3.23 (all components fit)
