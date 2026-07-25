@@ -1,0 +1,18 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "CommonJS",
+    "moduleResolution": "Node",
+    "lib": ["ES2022", "DOM"],
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "rootDir": "src",
+    "outDir": ".home-test-dist"
+  },
+  "include": [
+    "src/home/dashboardModel.ts",
+    "src/home/dashboardPerformance.ts",
+    "src/home/dashboardPreferences.ts"
+  ]
+}
