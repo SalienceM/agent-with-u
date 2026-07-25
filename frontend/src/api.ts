@@ -42,7 +42,10 @@ export interface SkillInfo {
   inputSchema?: Record<string, any>;
 }
 
-const WS_PORT_DEFAULT = 44321;
+const configuredWsPort = Number(import.meta.env.VITE_AGENT_WITH_U_WS_PORT);
+const WS_PORT_DEFAULT = Number.isInteger(configuredWsPort) && configuredWsPort > 0
+  ? configuredWsPort
+  : 44321;
 const WS_CONNECT_TIMEOUT_MS = 3000;
 const LIST_SESSIONS_TIMEOUT_MS = 3000;
 

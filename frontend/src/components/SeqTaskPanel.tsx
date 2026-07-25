@@ -1,4 +1,4 @@
-import React, { useState, useCallback, useRef } from 'react';
+import React, { useState, useCallback, useEffect, useRef } from 'react';
 import { api } from '../api';
 
 interface EditImage {
@@ -38,6 +38,25 @@ export const SeqTaskPanel: React.FC<Props> = ({ sessionId, tasks, chainActive, i
   const [editingHistoryId, setEditingHistoryId] = useState<string | null>(null);  // ★ 历史图片编辑
   const [historyImages, setHistoryImages] = useState<EditImage[]>([]);
   const editPasteRef = useRef<HTMLTextAreaElement>(null);
+
+  // 首页“处理待办”直接落到目标会话并展开队列，避免用户再点第二次。
+  useEffect(() => {
+    try {
+      if (sessionStorage.getItem('awu:open-seq-task-session') === sessionId) {
+        setOpen(true);
+        sessionStorage.removeItem('awu:open-seq-task-session');
+      }
+    } catch { /* */ }
+    const openFromDashboard = (event: Event) => {
+      const targetSessionId = (event as CustomEvent<{ sessionId?: string }>).detail?.sessionId;
+      if (targetSessionId === sessionId) {
+        setOpen(true);
+        try { sessionStorage.removeItem('awu:open-seq-task-session'); } catch { /* */ }
+      }
+    };
+    window.addEventListener('awu:open-seq-tasks', openFromDashboard);
+    return () => window.removeEventListener('awu:open-seq-tasks', openFromDashboard);
+  }, [sessionId]);
 
   const startEdit = useCallback((t: SeqTaskT) => {
     setEditingId(t.id);

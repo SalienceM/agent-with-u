@@ -60,7 +60,8 @@ export const themes: Record<ThemeType, {
     bgTertiary: '#242536',
     border: 'rgba(255,255,255,0.08)',
     text: '#e2e3ea',
-    textMuted: 'rgba(226,227,234,0.5)',
+    // 在 bg / bgSecondary 两层上均保持 WCAG AA 小字号文本对比度（最低 4.71:1）。
+    textMuted: '#898a96',
     accent: '#7aa2f7',
     accentHover: '#5d87e5',
     accentBg: '#7aa2f726',

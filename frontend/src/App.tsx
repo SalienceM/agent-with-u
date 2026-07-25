@@ -22,6 +22,8 @@ import { LogViewer } from './components/LogViewer';
 import { ConnectionPanel } from './components/ConnectionPanel';
 import { ManualPanel } from './components/ManualPanel';
 import { ChatPane } from './components/ChatPane';
+import { HomeDashboard } from './home/HomeDashboard';
+import type { DashboardDestination } from './home/dashboardModel';
 import { LoopPolicyEditor, DEFAULT_POLICY, normalizePolicy } from './components/LoopPolicyEditor';
 import type { LoopPolicy } from './components/LoopPolicyEditor';
 import {
@@ -77,6 +79,7 @@ export const App: React.FC = () => {
   const [manualPanelOpen, setManualPanelOpen] = useState(false);
   const [repoPanelEditing, setRepoPanelEditing] = useState(false);
   const [newSessionDialogOpen, setNewSessionDialogOpen] = useState(false);
+  const [newSessionInitialType, setNewSessionInitialType] = useState<'normal' | 'loop'>('normal');
   const [streamingSessions, setStreamingSessions] = useState<Set<string>>(new Set());  // ★ Per-session streaming state
   const [completedSessions, setCompletedSessions] = useState<Set<string>>(() => {
     // ★ 持久化：从 localStorage 恢复未确认的完成通知
@@ -115,6 +118,7 @@ export const App: React.FC = () => {
   const scratchDragRef = useRef<{ startX: number; startW: number } | null>(null);
   const toastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const initialCheckDoneRef = useRef(false);          // ★ 防止 NewSessionDialog 重复弹出
+  const hasConnectedOnceRef = useRef(false);
 
   // ── 分屏布局状态(localStorage 持久化) ────────────────────────────────
   // layout: 当前几宫格;paneSessions: 每个 pane 对应的 sessionId;
@@ -376,22 +380,13 @@ export const App: React.FC = () => {
 
     api.getBackends().then(setBackends);
     api.getBackends(undefined, true).then(setBackendConfigs);
-    refreshSessionList().then((list) => {
-      // 仅在焦点 pane 还没绑 session 时执行初始选择,避免重连打断用户。
-      setPaneSessions((prev) => {
-        const idx = focusedPaneIdx;
-        if (prev[idx]) return prev;
-        if (list.length > 0) {
-          const next = [...prev];
-          next[idx] = list[0].id;
-          return next;
-        }
-        // 没有任何 session，打开新建对话框
-        setNewSessionDialogOpen((open) => { if (!open) return true; return open; });
-        return prev;
-      });
-    });
-    reloadConfig();
+    // 首页是明确的应用入口：连接完成后刷新真实数据，但不自动跳入最近会话，
+    // 也不在空数据时强制弹出新建窗口。
+    refreshSessionList();
+    // useConfig 已在挂载时读取一次；仅在真正的断线重连后重新同步，
+    // 避免首次连接对 getAppConfig 产生固定重复请求。
+    if (hasConnectedOnceRef.current) reloadConfig();
+    else hasConnectedOnceRef.current = true;
   }, [backendConnected, refreshSessionList]); // eslint-disable-line react-hooks/exhaustive-deps
 
   /* ---- 多端同步：其它客户端增删改 session 时刷新侧边栏 ---- */
@@ -537,8 +532,45 @@ export const App: React.FC = () => {
   /* ---- 新建会话 ---- */
   const handleNewSession = useCallback(() => {
     // Open dialog to select working directory first
+    setNewSessionInitialType('normal');
     setNewSessionDialogOpen(true);
   }, []);
+
+  const handleDashboardNavigate = useCallback((destination: DashboardDestination) => {
+    if (destination.kind === 'session' || destination.kind === 'loop' || destination.kind === 'tasks') {
+      setSessionInPane(destination.sessionId);
+      setCompletedSessions((previous) => {
+        if (!previous.has(destination.sessionId)) return previous;
+        const next = new Set(previous);
+        next.delete(destination.sessionId);
+        return next;
+      });
+      if (isMobile) setSidebarCollapsed(true);
+      if (destination.kind === 'tasks') {
+        try { sessionStorage.setItem('awu:open-seq-task-session', destination.sessionId); } catch { /* */ }
+        window.setTimeout(() => {
+          window.dispatchEvent(new CustomEvent('awu:open-seq-tasks', {
+            detail: { sessionId: destination.sessionId },
+          }));
+        }, 0);
+      }
+      return;
+    }
+    if (destination.kind === 'new-session') {
+      setNewSessionInitialType(destination.sessionType || 'normal');
+      setNewSessionDialogOpen(true);
+      return;
+    }
+    if (destination.section === 'models') {
+      refreshSessionList();
+      api.getBackends(undefined, true).then(setBackendConfigs);
+      setBackendManagerOpen(true);
+    } else if (destination.section === 'connections') {
+      setConnPanelOpen(true);
+    } else {
+      setSettingsOpen(true);
+    }
+  }, [isMobile, refreshSessionList, setSessionInPane]);
 
   const handleCreateSession = useCallback(async (
     workingDir: string,
@@ -794,6 +826,10 @@ export const App: React.FC = () => {
     );
   }
 
+  const firstHomePaneIdx = paneSessions
+    .slice(0, LAYOUT_SLOTS[layout])
+    .findIndex((sessionId) => !sessionId);
+
   return (
     <div className="app-root" style={{
       ...rootStyle,
@@ -820,6 +856,11 @@ export const App: React.FC = () => {
       '--theme-input-bg': ua < 1 ? hexToRgba(theme.inputBg, ua) : theme.inputBg,
       '--theme-sidebar-bg': ua < 1 ? hexToRgba(theme.sidebarBg, ua) : theme.sidebarBg,
     } as React.CSSProperties}>
+      {firstHomePaneIdx >= 0 && (
+        <a className="app-skip-link" href={`#home-dashboard-content-${firstHomePaneIdx}`}>
+          跳到首页主要内容
+        </a>
+      )}
       {/* ★ 背景图层：图片本身控制透明度，面板背景保持实色 */}
       {hasBg && (
         <div style={{
@@ -836,6 +877,26 @@ export const App: React.FC = () => {
         /* 移动端用 dvh，规避浏览器地址栏让 100vh 把底部输入框顶出可视区；
            不支持 dvh 的旧 webview 回退到 100vh。inline style 已不设 height。 */
         .app-root { height: 100vh; height: 100dvh; }
+        .app-skip-link {
+          position: fixed; z-index: 10000; top: 8px; left: 8px; padding: 10px 14px;
+          border: 2px solid var(--theme-accent); border-radius: 8px;
+          color: var(--theme-text); background: var(--theme-bg);
+          transform: translateY(-160%);
+        }
+        .app-skip-link:focus { transform: translateY(0); }
+        .app-root button:focus-visible, .app-root a:focus-visible, .app-root input:focus-visible,
+        .app-root textarea:focus-visible, .app-root select:focus-visible {
+          outline: 3px solid var(--theme-accent);
+          outline-offset: 2px;
+        }
+        @media (prefers-reduced-motion: reduce) {
+          .app-root *, .app-root *::before, .app-root *::after {
+            animation-duration: 0.01ms !important;
+            animation-iteration-count: 1 !important;
+            transition-duration: 0.01ms !important;
+            scroll-behavior: auto !important;
+          }
+        }
         @keyframes dialogSlideIn {
           from { opacity: 0; transform: perspective(900px) rotateX(-14deg) scale(0.96) translateY(-8px); }
           to   { opacity: 1; transform: perspective(900px) rotateX(0deg)   scale(1)    translateY(0); }
@@ -971,23 +1032,37 @@ export const App: React.FC = () => {
 
       <div style={{ flex: 1, display: 'flex', flexDirection: 'column', minWidth: 0 }}>
         {/* ---- 顶部栏 ---- */}
-        <div style={isMobile ? { ...headerStyle, padding: '8px 10px', gap: 6, flexWrap: 'wrap' } : headerStyle}>
+        <div style={isMobile ? { ...headerStyle, padding: '4px 8px', gap: 2, flexWrap: 'nowrap', alignItems: 'center' } : headerStyle}>
           {/* ★ 移动端：唤出侧栏抽屉的汉堡按钮 */}
           {isMobile && (
             <button
               onClick={() => setSidebarCollapsed(false)}
-              style={{ ...settingsBtnStyle, fontSize: 20 }}
+              aria-label="打开会话列表"
+              style={{ ...settingsBtnStyle, fontSize: 20, minWidth: 44, minHeight: 44 }}
               title="会话列表"
             >
               ☰
             </button>
           )}
-          <span style={{ fontSize: 15, fontWeight: 600, color: 'var(--theme-text, #1f2328)' }}>AgentWithU</span>
+          <button
+            type="button"
+            onClick={() => setSessionInPane(null)}
+            aria-label="返回工作总览"
+            title="返回工作总览"
+            style={{
+              border: 0, padding: '4px 2px', minHeight: isMobile ? 44 : undefined,
+              background: 'transparent', cursor: 'pointer',
+              fontSize: 15, fontWeight: 600, color: 'var(--theme-text, #1f2328)',
+            }}
+          >
+            {isMobile ? 'AWU' : 'AgentWithU'}
+          </button>
           {/* ★ Backend connection indicator */}
           {backendConnected === false && (
             <span
               style={{
                 fontSize: 11, padding: '2px 8px', borderRadius: 4, fontWeight: 500,
+                maxWidth: isMobile ? 72 : undefined, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
                 background: 'rgba(239,68,68,0.15)', border: '1px solid rgba(239,68,68,0.3)',
                 color: '#ef4444',
               }}
@@ -1019,6 +1094,7 @@ export const App: React.FC = () => {
                 padding: '3px 9px', background: 'rgba(6,182,212,.1)',
                 color: '#22d3ee', fontSize: 10, fontWeight: 800,
                 letterSpacing: 1.2, cursor: 'pointer', boxShadow: '0 0 12px rgba(34,211,238,.16)',
+                ...(isMobile ? { display: 'none' } : {}),
               }}
             >
               ◉ SMOOTH
@@ -1027,7 +1103,7 @@ export const App: React.FC = () => {
           {/* Loop 会话的全部交互在 ChatPane 内嵌的 LoopPanel 中进行，顶栏不再放入口 */}
           <button
             onClick={() => setManualPanelOpen(true)}
-            style={{ ...settingsBtnStyle, ...(manualPanelOpen ? { background: 'var(--theme-accent-bg)', color: 'var(--theme-accent)' } : {}) }}
+            style={{ ...settingsBtnStyle, ...(isMobile ? { display: 'none' } : {}), ...(manualPanelOpen ? { background: 'var(--theme-accent-bg)', color: 'var(--theme-accent)' } : {}) }}
             title="使用手册"
           >
             📖
@@ -1035,7 +1111,7 @@ export const App: React.FC = () => {
           {/* 日志查看器按钮 */}
           <button
             onClick={() => setLogViewerOpen(true)}
-            style={settingsBtnStyle}
+            style={{ ...settingsBtnStyle, ...(isMobile ? { display: 'none' } : {}) }}
             title="后端日志 / Logs"
           >
             📋
@@ -1043,35 +1119,37 @@ export const App: React.FC = () => {
           {/* 连接目标：本地直连 / 经中继访问远程执行节点 */}
           <button
             onClick={() => setConnPanelOpen(true)}
-            style={settingsBtnStyle}
+            aria-label="打开连接设置"
+            style={{ ...settingsBtnStyle, ...(isMobile ? { minWidth: 44, minHeight: 44 } : {}) }}
             title="连接目标(本地 / 远程中继)"
           >
             📡
           </button>
           <button
             onClick={() => setRepoPanelOpen(!repoPanelOpen)}
-            style={{ ...settingsBtnStyle, ...(repoPanelOpen ? { background: 'var(--theme-accent-bg)', color: 'var(--theme-accent)' } : {}) }}
+            style={{ ...settingsBtnStyle, ...(isMobile ? { display: 'none' } : {}), ...(repoPanelOpen ? { background: 'var(--theme-accent-bg)', color: 'var(--theme-accent)' } : {}) }}
             title="Repo — Skills & Prompts"
           >
             📦
           </button>
           <button
             onClick={() => setScratchPadOpen(v => !v)}
-            style={{ ...settingsBtnStyle, ...(scratchPadOpen ? { background: 'var(--theme-accent-bg)', color: 'var(--theme-accent)' } : {}) }}
+            style={{ ...settingsBtnStyle, ...(isMobile ? { display: 'none' } : {}), ...(scratchPadOpen ? { background: 'var(--theme-accent-bg)', color: 'var(--theme-accent)' } : {}) }}
             title="便签本 (Ctrl+Shift+N)"
           >
             📌
           </button>
           <button
             onClick={() => setAssetPanelOpen(v => !v)}
-            style={{ ...settingsBtnStyle, ...(assetPanelOpen ? { background: 'var(--theme-accent-bg)', color: 'var(--theme-accent)' } : {}) }}
+            style={{ ...settingsBtnStyle, ...(isMobile ? { display: 'none' } : {}), ...(assetPanelOpen ? { background: 'var(--theme-accent-bg)', color: 'var(--theme-accent)' } : {}) }}
             title="素材池 / Asset Pool"
           >
             🗂
           </button>
           <button
             onClick={() => setSettingsOpen(true)}
-            style={settingsBtnStyle}
+            aria-label="打开应用设置"
+            style={{ ...settingsBtnStyle, ...(isMobile ? { minWidth: 44, minHeight: 44 } : {}) }}
             title="Settings"
           >
             ⚙
@@ -1114,26 +1192,62 @@ export const App: React.FC = () => {
               background: 'var(--theme-border)',
             }}>
               {Array.from({ length: slotCount }).map((_, idx) => (
-                <ChatPane
-                  key={idx}
-                  paneId={idx}
-                  sessionId={paneSessions[idx]}
-                  isFocused={focusedPaneIdx === idx}
-                  onFocus={() => setFocusedPaneIdx(idx)}
-                  backends={backends}
-                  config={config}
-                  themeBorderFocused="var(--theme-accent)"
-                  isMobile={isMobile}
-                  onRequestNewSession={handleNewSession}
-                  onSessionDeleted={(sid) => {
-                    setPaneSessions((prev) => prev.map((s) => (s === sid ? null : s)));
-                  }}
-                  onStreamingChange={handleStreamingChange}
-                  onGhostStateChange={handleGhostStateChange}
-                  onAdjustFontSize={(delta) => updateConfig({ fontSize: Math.max(11, Math.min(28, config.fontSize + delta)) })}
-                  layoutLabel={LAYOUT_LABEL[layout]}
-                  onCycleLayout={() => setLayout((cur) => LAYOUT_CYCLE[(LAYOUT_CYCLE.indexOf(cur) + 1) % LAYOUT_CYCLE.length])}
-                />
+                paneSessions[idx] ? (
+                  <ChatPane
+                    key={idx}
+                    paneId={idx}
+                    sessionId={paneSessions[idx]}
+                    isFocused={focusedPaneIdx === idx}
+                    onFocus={() => setFocusedPaneIdx(idx)}
+                    backends={backends}
+                    config={config}
+                    themeBorderFocused="var(--theme-accent)"
+                    isMobile={isMobile}
+                    onRequestNewSession={handleNewSession}
+                    onSessionDeleted={(sid) => {
+                      setPaneSessions((prev) => prev.map((s) => (s === sid ? null : s)));
+                    }}
+                    onStreamingChange={handleStreamingChange}
+                    onGhostStateChange={handleGhostStateChange}
+                    onAdjustFontSize={(delta) => updateConfig({ fontSize: Math.max(11, Math.min(28, config.fontSize + delta)) })}
+                    layoutLabel={LAYOUT_LABEL[layout]}
+                    onCycleLayout={() => setLayout((cur) => LAYOUT_CYCLE[(LAYOUT_CYCLE.indexOf(cur) + 1) % LAYOUT_CYCLE.length])}
+                  />
+                ) : idx === firstHomePaneIdx ? (
+                  <HomeDashboard
+                    key={`home-${idx}`}
+                    contentId={`home-dashboard-content-${idx}`}
+                    showSkipLink={false}
+                    sessions={sessions}
+                    backends={backends}
+                    activeBackendId={backends[0]?.id}
+                    connected={backendConnected}
+                    streamingSessionIds={streamingSessions}
+                    completedSessionIds={completedSessions}
+                    onNavigate={handleDashboardNavigate}
+                  />
+                ) : (
+                  <section
+                    key={`empty-${idx}`}
+                    className="home-empty-pane"
+                    aria-label={`空白工作区 ${idx + 1}`}
+                    style={{
+                      display: 'grid', placeItems: 'center', minWidth: 0,
+                      color: 'var(--theme-text-muted)', background: 'var(--theme-bg)',
+                    }}
+                  >
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setFocusedPaneIdx(idx);
+                        handleNewSession();
+                      }}
+                      style={{ ...settingsBtnStyle, minWidth: 44, minHeight: 44 }}
+                    >
+                      ＋ 在此窗格新建会话
+                    </button>
+                  </section>
+                )
               ))}
             </div>
           );
@@ -1231,6 +1345,7 @@ export const App: React.FC = () => {
       {newSessionDialogOpen && (
         <NewSessionDialog
           backends={backends}
+          initialSessionType={newSessionInitialType}
           onClose={() => {
             // ★ User manually closed - mark as done to prevent re-opening
             setNewSessionDialogOpen(false);
@@ -1545,6 +1660,7 @@ function formatModelLabel(backend: any, session?: any): string {
 /* ---- New Session Dialog: Select working directory first ---- */
 interface NewSessionDialogProps {
   backends: any[];
+  initialSessionType?: 'normal' | 'loop';
   onClose: () => void;
   onCreate: (
     workingDir: string,
@@ -1559,12 +1675,13 @@ interface NewSessionDialogProps {
 
 const NewSessionDialog: React.FC<NewSessionDialogProps> = ({
   backends,
+  initialSessionType = 'normal',
   onClose,
   onCreate,
 }) => {
   // 留空 = 后端自动生成按时间命名的默认目录（放在日志目录同级）
   const [workingDir, setWorkingDir] = useState('');
-  const [sessionType, setSessionType] = useState<'normal' | 'loop'>('normal');
+  const [sessionType, setSessionType] = useState<'normal' | 'loop'>(initialSessionType);
   const [dirPickerOpen, setDirPickerOpen] = useState(false);
   const [loopPolicy, setLoopPolicy] = useState<LoopPolicy>(DEFAULT_POLICY);
   const [sessionRuntime, setSessionRuntime] = useState<ModelRuntime>({});

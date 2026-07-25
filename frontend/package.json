@@ -6,6 +6,16 @@
     "prepare:preview-assets": "node scripts/copy-preview-assets.mjs",
     "dev": "npm run prepare:preview-assets && vite",
     "build": "npm run prepare:preview-assets && tsc --noEmit && vite build",
+    "test:home": "tsc -p tsconfig.home-tests.json && node --test tests/home/*.test.cjs",
+    "qa:fixture": "python ../scripts/home_qa_fixture.py --profile typical",
+    "qa:fixture:stress": "python ../scripts/home_qa_fixture.py --profile stress",
+    "test:home:browser": "playwright test -c playwright.home.config.ts",
+    "test:home:desktop": "playwright test -c playwright.home.config.ts --project=desktop-chromium --project=web-chromium tests/acceptance/home.desktop.spec.ts",
+    "test:home:mobile": "playwright test -c playwright.home.config.ts --project=mobile-chromium --project=narrow-mobile-chromium tests/acceptance/home.mobile.spec.ts",
+    "test:home:a11y": "playwright test -c playwright.home.config.ts --project=desktop-chromium tests/acceptance/home.accessibility.spec.ts",
+    "test:home:performance": "playwright test -c playwright.home.config.ts --project=desktop-chromium tests/acceptance/home.performance.spec.ts",
+    "test:home:performance:stress": "cross-env HOME_QA_PROFILE=stress playwright test -c playwright.home.config.ts --project=desktop-chromium tests/acceptance/home.performance.spec.ts",
+    "test:home:browser:stress": "cross-env HOME_QA_PROFILE=stress playwright test -c playwright.home.config.ts",
     "preview": "vite preview"
   },
   "dependencies": {
@@ -40,9 +50,12 @@
     "react-dom": "^18.2.0"
   },
   "devDependencies": {
+    "@axe-core/playwright": "^4.12.1",
+    "@playwright/test": "^1.54.1",
     "@types/react": "^18.2.48",
     "@types/react-dom": "^18.2.18",
     "@vitejs/plugin-react": "^4.2.1",
+    "cross-env": "^7.0.3",
     "typescript": "^5.3.3",
     "vite": "^5.0.12"
   }

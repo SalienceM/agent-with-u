@@ -11,7 +11,9 @@ agent-with-u-web-auth.json
 *.egg-info/
 .env
 node_modules/
+frontend/.home-test-dist/
 frontend/dist/
+.qa/
 frontend/public/vendor/pdfjs/
 frontend/public/vendor/docx-preview/
 .DS_Store
