@@ -28,7 +28,7 @@ type ClientsChangedCallback = (clients: ConnectedClient[]) => void;
 export interface SkillInfo {
   name: string;
   content: string;               // SKILL.md 完整内容
-  isGlobal: boolean;             // 是否已全局激活（~/.claude/skills/）
+  isGlobal: boolean;             // 是否已激活到各 Agent 的全局 Skill 目录
   isProject: boolean;            // 是否已在当前工作目录激活
   projectActivations: string[];  // 所有已激活的工作目录列表
   description?: string;          // frontmatter description 字段
@@ -1290,14 +1290,38 @@ export const api = {
     const result = await call('seqtaskGet', sessionId);
     try { return JSON.parse(result); } catch { return { status: 'error', seqTasks: [], seqAuto: false }; }
   },
-  async seqtaskAdd(sessionId: string, text: string, images?: any[]): Promise<{ status: string; seqTasks?: any[]; message?: string }> {
+  async seqtaskAdd(
+    sessionId: string,
+    text: string,
+    images?: any[],
+    textAttachments?: any[],
+  ): Promise<{ status: string; seqTasks?: any[]; message?: string }> {
     const imagesJson = images && images.length ? JSON.stringify(images) : '';
-    const result = await call('seqtaskAdd', sessionId, text, imagesJson);
+    const textAttachmentsJson = textAttachments && textAttachments.length
+      ? JSON.stringify(textAttachments)
+      : '';
+    const result = await call('seqtaskAdd', sessionId, text, imagesJson, textAttachmentsJson);
     try { return JSON.parse(result); } catch { return { status: 'error', message: '响应解析失败' }; }
   },
-  async seqtaskEdit(sessionId: string, taskId: string, text: string, images?: any[]): Promise<{ status: string; message?: string }> {
+  async seqtaskEdit(
+    sessionId: string,
+    taskId: string,
+    text: string,
+    images?: any[],
+    textAttachments?: any[],
+  ): Promise<{ status: string; message?: string }> {
     const imagesJson = images && images.length ? JSON.stringify(images) : '';
-    const result = await call('seqtaskEdit', sessionId, taskId, text, imagesJson);
+    const textAttachmentsJson = textAttachments && textAttachments.length
+      ? JSON.stringify(textAttachments)
+      : '';
+    const result = await call(
+      'seqtaskEdit',
+      sessionId,
+      taskId,
+      text,
+      imagesJson,
+      textAttachmentsJson,
+    );
     try { return JSON.parse(result); } catch { return { status: 'error', message: '响应解析失败' }; }
   },
   async seqtaskRemove(sessionId: string, taskId: string): Promise<{ status: string }> {
@@ -1945,7 +1969,14 @@ export const api = {
     try { return typeof r === 'string' ? JSON.parse(r) : r; } catch { return { ok: false, error: 'parse error' }; }
   },
 
-  async sttStreamStart(configOverride?: any): Promise<{ ok: boolean; error?: string }> {
+  async sttStreamStart(configOverride?: any): Promise<{
+    ok: boolean;
+    model?: string;
+    realtime?: boolean;
+    flashRefineEnabled?: boolean;
+    flashModel?: string;
+    error?: string;
+  }> {
     const r = await call('sttStreamStart', JSON.stringify(configOverride || {}));
     try { return typeof r === 'string' ? JSON.parse(r) : r; } catch { return { ok: false, error: 'parse error' }; }
   },
@@ -1957,7 +1988,15 @@ export const api = {
     }
   },
 
-  async sttStreamStop(): Promise<{ ok: boolean; text?: string; error?: string }> {
+  async sttStreamStop(): Promise<{
+    ok: boolean;
+    text?: string;
+    refinedByFlash?: boolean;
+    refineSkipped?: string;
+    refineError?: string;
+    realtimeError?: string;
+    error?: string;
+  }> {
     const r = await call('sttStreamStop');
     try { return typeof r === 'string' ? JSON.parse(r) : r; } catch { return { ok: false, error: 'parse error' }; }
   },

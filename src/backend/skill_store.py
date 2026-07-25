@@ -3,9 +3,9 @@ SkillStore: 管理 Skill 孵化库与激活状态。
 
 设计原则：
   - 孵化库：~/.agent-with-u/skill-library/<name>/SKILL.md  （全局积累）
-  - 激活 = 将 SKILL.md 复制到目标位置
-  - 项目级激活 → <working_dir>/.claude/skills/<name>/SKILL.md
-  - 全局激活  → ~/.claude/skills/<name>/SKILL.md
+  - 激活 = 按 Agent 框架渲染并复制 SKILL.md 到各自原生目录
+  - 项目级 → .claude/skills、.qwen/skills、.agents/skills
+  - 全局级 → ~/.claude/skills、~/.qwen/skills、~/.codex/skills
   - 停用 = 删除目标位置的文件
   - 激活记录存在 index.json 中，key 为 "global" 或工作目录绝对路径
 
@@ -27,6 +27,7 @@ from typing import Optional
 import yaml  # PyYAML — declared in requirements.txt
 
 from . import paths
+from .skill_paths import deployment_targets, render_skill_markdown
 
 LIBRARY_DIR  = paths.sub("skill-library")
 INDEX_FILE   = LIBRARY_DIR / "index.json"
@@ -35,7 +36,7 @@ SECRETS_DIR  = paths.sub("skill-secrets")
 DEFAULT_SKILL_TEMPLATE = """\
 ---
 name: {name}
-description: Describe what this skill does and when Claude should use it (max 250 chars)
+description: Describe what this skill does and when an agent should use it (max 250 chars)
 # backend: backend-id          # 可选：指定路由到哪个 Backend（Backend Skill 模式）
 # input_schema:                # 可选：Backend Skill 的输入参数定义（JSON Schema）
 #   type: object
@@ -47,7 +48,10 @@ description: Describe what this skill does and when Claude should use it (max 25
 
 ## Instructions
 
-Write step-by-step instructions for Claude here.
+Write step-by-step instructions for the active agent here.
+
+If a command needs a file bundled beside SKILL.md, use `{{SKILL_DIR}}/file-name`.
+AgentWithU resolves this placeholder to the active framework's native directory.
 
 ## Example Usage
 
@@ -92,28 +96,40 @@ class SkillStore:
     # ── 目标路径计算 ────────────────────────────────────────────────
 
     @staticmethod
-    def _target_dir(name: str, target_key: str) -> Path:
-        if target_key == "global":
-            return Path.home() / ".claude" / "skills" / name
-        return Path(target_key) / ".claude" / "skills" / name
+    def _target_dirs(name: str, target_key: str) -> list[tuple[str, Path, str]]:
+        return deployment_targets(name, target_key)
+
+    @classmethod
+    def _target_dir(cls, name: str, target_key: str) -> Path:
+        """Return the Claude target for compatibility with older callers."""
+        targets = cls._target_dirs(name, target_key)
+        return next(
+            target for agent_name, target, _reference in targets
+            if agent_name == "claude"
+        )
 
     # ── 部署/撤销 ────────────────────────────────────────────────────
 
     def _deploy(self, name: str, content: str, target_key: str):
-        target = self._target_dir(name, target_key)
-        target.mkdir(parents=True, exist_ok=True)
-        (target / "SKILL.md").write_text(content, encoding="utf-8")
+        for _agent_name, target, reference in self._target_dirs(name, target_key):
+            target.mkdir(parents=True, exist_ok=True)
+            rendered = render_skill_markdown(
+                content,
+                skill_name=name,
+                skill_dir_reference=reference,
+            )
+            (target / "SKILL.md").write_text(rendered, encoding="utf-8")
 
     def _undeploy(self, name: str, target_key: str):
-        target = self._target_dir(name, target_key)
-        skill_file = target / "SKILL.md"
-        if skill_file.exists():
-            skill_file.unlink()
-        try:
-            if target.exists() and not any(target.iterdir()):
-                target.rmdir()
-        except Exception:
-            pass
+        for _agent_name, target, _reference in self._target_dirs(name, target_key):
+            skill_file = target / "SKILL.md"
+            if skill_file.exists():
+                skill_file.unlink()
+            try:
+                if target.exists() and not any(target.iterdir()):
+                    target.rmdir()
+            except Exception:
+                pass
 
     # ── 辅助 ─────────────────────────────────────────────────────────
 
@@ -144,7 +160,11 @@ class SkillStore:
                 activations: list[str] = self._index.get(name, {}).get("activations", [])
                 valid_activations = [
                     ak for ak in activations
-                    if (self._target_dir(name, ak) / "SKILL.md").exists()
+                    if any(
+                        (target / "SKILL.md").exists()
+                        for _agent_name, target, _reference
+                        in self._target_dirs(name, ak)
+                    )
                 ]
                 if set(valid_activations) != set(activations):
                     self._index.setdefault(name, {})["activations"] = valid_activations

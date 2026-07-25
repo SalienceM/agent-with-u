@@ -3,6 +3,7 @@ import { markdownToHtml } from '../utils/markdown';
 import { api, loadSkillImageDataUrl } from '../api';
 import type { ChatMessage, ToolCall, ContentBlock, SubagentInfo } from '../hooks/useChat';
 import { DiffView, type DiffData } from './DiffView';
+import { TextAttachmentPreview } from './TextAttachmentPreview';
 import {
   TTS_STATE_EVENT,
   toggleSpeech,
@@ -793,6 +794,13 @@ const BubbleActionMenu: React.FC<{
         parts.push(toolSection);
       }
     }
+    if (message.textAttachments?.length) {
+      for (const attachment of message.textAttachments) {
+        parts.push(
+          `[文本附件: ${attachment.name}]\n${attachment.content}`,
+        );
+      }
+    }
     // Text content
     if (message.content) {
       parts.push(message.content);
@@ -1142,6 +1150,12 @@ function MessageBubbleInner({
           ttsVoice={ttsVoice}
           ttsRate={ttsRate}
         />
+        {message.textAttachments && message.textAttachments.length > 0 && (
+          <TextAttachmentPreview
+            attachments={message.textAttachments}
+            compact
+          />
+        )}
         {/* 附件图片 */}
         {message.images && message.images.length > 0 && (
           <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, marginBottom: 8 }}>
@@ -1313,6 +1327,8 @@ function bubblePropsEqual(prev: Props, next: Props): boolean {
   return (
     prev.message.id        === next.message.id        &&
     prev.message.content   === next.message.content   &&
+    prev.message.images    === next.message.images    &&
+    prev.message.textAttachments === next.message.textAttachments &&
     prev.message.elapsed   === next.message.elapsed   &&
     prev.message.usage     === next.message.usage     &&
     prev.fontSize          === next.fontSize          &&

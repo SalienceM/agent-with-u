@@ -34,10 +34,11 @@ def _nid() -> str:
 
 @dataclass
 class SeqTask:
-    """序列任务队列里的一条。images 为前端图片附件 dict 列表（base64 落盘，喂给该条的发送）。"""
+    """序列任务队列里的一条。附件以 dict 列表落盘，派发时原样送回主消息链路。"""
     id: str
     text: str = ""
     images: list = field(default_factory=list)
+    text_attachments: list = field(default_factory=list)
     status: str = "pending"   # pending | sent
     created_at: float = field(default_factory=_now)
     updated_at: float = field(default_factory=_now)
@@ -48,6 +49,8 @@ class SeqTask:
             "text": self.text,
             "images": list(self.images or []),
             "imageCount": len(self.images or []),
+            "textAttachments": list(self.text_attachments or []),
+            "textAttachmentCount": len(self.text_attachments or []),
             "status": self.status,
             "createdAt": self.created_at,
             "updatedAt": self.updated_at,
@@ -59,6 +62,7 @@ class SeqTask:
             id=d.get("id") or _nid(),
             text=d.get("text", ""),
             images=list(d.get("images") or []),
+            text_attachments=list(d.get("textAttachments") or []),
             status=d.get("status", "pending"),
             created_at=d.get("createdAt", _now()),
             updated_at=d.get("updatedAt", _now()),

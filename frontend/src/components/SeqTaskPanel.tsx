@@ -1,5 +1,7 @@
 import React, { useState, useCallback, useEffect, useRef } from 'react';
 import { api } from '../api';
+import { TextAttachmentPreview } from './TextAttachmentPreview';
+import type { TextAttachment } from '../types/attachments';
 
 interface EditImage {
   id: string;
@@ -15,6 +17,8 @@ export interface SeqTaskT {
   text: string;
   images?: any[];
   imageCount?: number;
+  textAttachments?: any[];
+  textAttachmentCount?: number;
   status: string;
   createdAt?: number;
 }
@@ -239,9 +243,20 @@ export const SeqTaskPanel: React.FC<Props> = ({ sessionId, tasks, chainActive, i
               ) : (
                 <div style={{ flex: 1, minWidth: 0 }}
                   onClick={() => startEdit(t)} title="点击编辑">
-                  <div style={taskText}>{t.text || <span style={{ color: 'var(--theme-text-muted)' }}>（仅图片）</span>}</div>
+                  <div style={taskText}>{t.text || <span style={{ color: 'var(--theme-text-muted)' }}>（仅附件）</span>}</div>
                   {!!(t.imageCount || t.images?.length) && (
                     <span style={imgBadge}>🖼️ {t.imageCount ?? t.images?.length}</span>
+                  )}
+                  {!!(t.textAttachmentCount || t.textAttachments?.length) && (
+                    <span style={imgBadge}>📄 {t.textAttachmentCount ?? t.textAttachments?.length}</span>
+                  )}
+                  {!!t.textAttachments?.length && (
+                    <div onClick={(event) => event.stopPropagation()} style={{ marginTop: 5 }}>
+                      <TextAttachmentPreview
+                        attachments={t.textAttachments as TextAttachment[]}
+                        compact
+                      />
+                    </div>
                   )}
                 </div>
               )}
@@ -294,9 +309,20 @@ export const SeqTaskPanel: React.FC<Props> = ({ sessionId, tasks, chainActive, i
                   ) : (
                     <>
                       <div style={{ flex: 1, minWidth: 0 }} onClick={() => startHistoryEdit(t)} title="点击编辑图片">
-                        <div style={historyText}>{t.text || <span style={{ color: 'var(--theme-text-muted)' }}>（仅图片）</span>}</div>
+                        <div style={historyText}>{t.text || <span style={{ color: 'var(--theme-text-muted)' }}>（仅附件）</span>}</div>
                         {!!(t.imageCount || t.images?.length) && (
                           <span style={imgBadge}>🖼️ {t.imageCount ?? t.images?.length}</span>
+                        )}
+                        {!!(t.textAttachmentCount || t.textAttachments?.length) && (
+                          <span style={imgBadge}>📄 {t.textAttachmentCount ?? t.textAttachments?.length}</span>
+                        )}
+                        {!!t.textAttachments?.length && (
+                          <div onClick={(event) => event.stopPropagation()} style={{ marginTop: 5 }}>
+                            <TextAttachmentPreview
+                              attachments={t.textAttachments as TextAttachment[]}
+                              compact
+                            />
+                          </div>
                         )}
                       </div>
                       <button onClick={() => startHistoryEdit(t)} style={histEditBtn} title="编辑图片">🖼️</button>

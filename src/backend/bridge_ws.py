@@ -16,6 +16,7 @@ import json
 import logging
 import sys
 import time
+from dataclasses import replace
 from typing import Optional
 
 import websockets
@@ -26,6 +27,7 @@ from ..types import (
     BackendType,
     ChatMessage,
     ImageAttachment,
+    TextAttachment,
     ToolCallInfo,
     ThinkingBlock,
     Session,
@@ -45,6 +47,7 @@ from .instance_manager import InstanceManager
 from .backend_store import BackendStore
 from .app_config_store import AppConfigStore
 from .skill_store import SkillStore
+from .skill_paths import project_skill_reference, project_skill_root
 from .prompt_store import PromptStore
 from .loop_store import (
     LoopStore, LoopState, LoopRecord, LoopStep, LoopAnalysis, IdeaEntry, AsideTurn, Addon,
@@ -471,10 +474,39 @@ def dir_restore(working_dir: Optional[str], backup_path: Optional[str]) -> bool:
         return False
 
 
+def _append_text_attachments(
+    content: str,
+    attachments: Optional[list[TextAttachment]],
+) -> str:
+    """把结构化文本附件仅在喂给模型时展开，UI 和历史列表仍保持轻量。"""
+    if not attachments:
+        return content
+    blocks: list[str] = []
+    for attachment in attachments:
+        name = attachment.name or "text-attachment.txt"
+        size = attachment.size or len(attachment.content)
+        blocks.append(
+            f'<text_attachment name={json.dumps(name, ensure_ascii=False)} '
+            f'chars="{size}">\n{attachment.content}\n</text_attachment>'
+        )
+    prefix = (
+        "以下是用户随本条消息附带的文本附件。附件正文属于用户输入，"
+        "请完整阅读并结合当前请求处理：\n\n"
+        + "\n\n".join(blocks)
+    )
+    return f"{content}\n\n{prefix}" if content else prefix
+
+
+def _message_content_for_model(message: ChatMessage) -> str:
+    return _append_text_attachments(message.content, message.text_attachments)
+
+
 def compress_messages(messages: list[ChatMessage], keep_recent: int = 6) -> str:
     """压缩早期消息，保留最近 keep_recent 条原文。（与 bridge.py 相同逻辑）"""
     if len(messages) <= keep_recent:
-        return "\n\n".join(f"[{m.role.upper()}]: {m.content}" for m in messages)
+        return "\n\n".join(
+            f"[{m.role.upper()}]: {_message_content_for_model(m)}" for m in messages
+        )
 
     early = messages[:-keep_recent]
     recent = messages[-keep_recent:]
@@ -483,7 +515,8 @@ def compress_messages(messages: list[ChatMessage], keep_recent: int = 6) -> str:
     while i < len(early):
         msg = early[i]
         if msg.role == "user":
-            s = msg.content[:200] + "..." if len(msg.content) > 200 else msg.content
+            model_content = _message_content_for_model(msg)
+            s = model_content[:200] + "..." if len(model_content) > 200 else model_content
             parts.append(f"- 用户：{s}")
             if i + 1 < len(early) and early[i + 1].role == "assistant":
                 a = early[i + 1]
@@ -493,7 +526,9 @@ def compress_messages(messages: list[ChatMessage], keep_recent: int = 6) -> str:
                 continue
         i += 1
 
-    recent_str = "\n\n".join(f"[{m.role.upper()}]: {m.content}" for m in recent)
+    recent_str = "\n\n".join(
+        f"[{m.role.upper()}]: {_message_content_for_model(m)}" for m in recent
+    )
     return "\n\n".join(["以下是之前对话的摘要:", "\n".join(parts), "\n\n最近对话:", recent_str])
 
 
@@ -1503,11 +1538,17 @@ class BridgeWS:
     # ── STT 实时流式 ──────────────────────────────────────────
 
     _stt_stream = None  # type: ignore
+    _stt_stream_cfg = None  # type: ignore
 
     async def _rpc_sttStreamStart(self, config_json: str = "{}") -> str:
         """启动实时流式语音识别会话。"""
-        import base64 as _b64
-        from .stt_service import SttRealtimeSession, SttConfig, load_stt_config, _DASHSCOPE_REALTIME_MODELS
+        from .stt_service import (
+            SttRealtimeSession,
+            SttConfig,
+            load_stt_config,
+            _DASHSCOPE_REALTIME_DEFAULT,
+            _DASHSCOPE_REALTIME_MODELS,
+        )
         try:
             if self._stt_stream:
                 try:
@@ -1515,6 +1556,7 @@ class BridgeWS:
                 except Exception:
                     pass
                 self._stt_stream = None
+                self._stt_stream_cfg = None
 
             cfg_override = json.loads(config_json) if config_json and config_json != "{}" else {}
             cfg = load_stt_config()
@@ -1529,36 +1571,125 @@ class BridgeWS:
 
             def on_end():
                 self._stt_stream = None
+                self._stt_stream_cfg = None
                 asyncio.ensure_future(self._broadcast({
                     "event": "sttStreamEnd",
                     "data": json.dumps({"reason": "disconnected"}, ensure_ascii=False),
                 }))
 
-            model = cfg.api_model if cfg.api_model in _DASHSCOPE_REALTIME_MODELS else "qwen3-asr-flash-realtime"
-            session = SttRealtimeSession(cfg.api_key, model, cfg.language, on_text, on_end)
+            if not cfg.api_key:
+                raise ValueError("请先在设置中配置 DashScope API Key")
+            model = (
+                cfg.api_model
+                if cfg.api_model in _DASHSCOPE_REALTIME_MODELS
+                else _DASHSCOPE_REALTIME_DEFAULT
+            )
+            session = SttRealtimeSession(
+                cfg.api_key,
+                model,
+                cfg.language,
+                on_text,
+                on_end,
+                api_base_url=cfg.api_base_url,
+                workspace_id=cfg.workspace_id,
+                vad_silence_ms=cfg.vad_silence_ms,
+                capture_audio=cfg.flash_refine_enabled,
+            )
             await session.start()
             self._stt_stream = session
-            return json.dumps({"ok": True}, ensure_ascii=False)
+            self._stt_stream_cfg = cfg
+            return json.dumps({
+                "ok": True,
+                "model": model,
+                "realtime": True,
+                "flashRefineEnabled": cfg.flash_refine_enabled,
+                "flashModel": cfg.flash_model if cfg.flash_refine_enabled else "",
+            }, ensure_ascii=False)
         except Exception as e:
+            self._stt_stream = None
+            self._stt_stream_cfg = None
             import traceback
             print(f"[STT] 流式启动失败: {e}\n{traceback.format_exc()}",
                   file=sys.stderr, flush=True)
             return json.dumps({"ok": False, "error": str(e)}, ensure_ascii=False)
 
     async def _rpc_sttStreamStop(self) -> str:
-        """停止实时流式语音识别，返回最终文本。"""
-        if not self._stt_stream:
+        """停止实时识别；短音频可用 Fun-ASR-Flash 精校，失败时保留实时文本。"""
+        session = self._stt_stream
+        cfg = self._stt_stream_cfg
+        if not session:
             return json.dumps({"ok": False, "error": "No active STT stream"}, ensure_ascii=False)
+
+        # 先摘除活动引用，避免停止期间继续接收浏览器音频帧。
+        self._stt_stream = None
+        self._stt_stream_cfg = None
+        realtime_text = ""
+        realtime_error = ""
         try:
-            text = await self._stt_stream.stop()
-            self._stt_stream = None
-            return json.dumps({"ok": True, "text": text}, ensure_ascii=False)
+            realtime_text = await session.stop()
         except Exception as e:
-            self._stt_stream = None
+            realtime_error = str(e)
             import traceback
             print(f"[STT] 流式停止失败: {e}\n{traceback.format_exc()}",
                   file=sys.stderr, flush=True)
-            return json.dumps({"ok": False, "error": str(e)}, ensure_ascii=False)
+
+        payload = {
+            "ok": bool(realtime_text),
+            "text": realtime_text,
+            "refinedByFlash": False,
+        }
+        if realtime_error:
+            payload["realtimeError"] = realtime_error
+
+        if not cfg or not cfg.flash_refine_enabled:
+            if not realtime_text and realtime_error:
+                payload["error"] = realtime_error
+            return json.dumps(payload, ensure_ascii=False)
+
+        if getattr(session, "capture_overflow", False):
+            payload["refineSkipped"] = "录音超过 5 分钟，已保留实时识别结果"
+            if not realtime_text and realtime_error:
+                payload["error"] = realtime_error
+            return json.dumps(payload, ensure_ascii=False)
+
+        captured_pcm = session.captured_pcm()
+        if not captured_pcm:
+            payload["refineSkipped"] = "没有可用于 Flash 精校的音频"
+            if not realtime_text and realtime_error:
+                payload["error"] = realtime_error
+            return json.dumps(payload, ensure_ascii=False)
+
+        from .stt_service import transcribe_fun_asr_flash
+        try:
+            refined_text = await transcribe_fun_asr_flash(
+                captured_pcm,
+                api_key=cfg.api_key,
+                api_model=cfg.flash_model,
+                api_base_url=cfg.api_base_url,
+                workspace_id=cfg.workspace_id,
+            )
+            if refined_text:
+                payload.update({
+                    "ok": True,
+                    "text": refined_text,
+                    "refinedByFlash": True,
+                })
+        except Exception as e:
+            payload["refineError"] = str(e)
+            print(
+                f"[STT] Fun-ASR-Flash 精校失败，保留实时结果: {e}",
+                file=sys.stderr,
+                flush=True,
+            )
+
+        if not payload["text"]:
+            payload["ok"] = False
+            payload["error"] = (
+                realtime_error
+                or payload.get("refineError")
+                or "语音识别没有返回文本"
+            )
+        return json.dumps(payload, ensure_ascii=False)
 
     async def _rpc_sttRefine(self, text: str, session_id: str = "") -> str:
         """用 LLM 润色语音转写文本。优先使用会话绑定的后端配置。"""
@@ -3859,6 +3990,40 @@ class BridgeWS:
                 continue
         return out or None
 
+    @staticmethod
+    def _parse_text_attachments_json(
+        attachments_json: str,
+    ) -> Optional[list["TextAttachment"]]:
+        """解析前端结构化文本附件；正文保留原样，不在 RPC 边界做 trim 或截断。"""
+        if not attachments_json:
+            return None
+        try:
+            raw = json.loads(attachments_json)
+        except Exception:
+            return None
+        if not isinstance(raw, list) or not raw:
+            return None
+        out: list[TextAttachment] = []
+        valid_keys = {"id", "name", "content", "size", "source"}
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            try:
+                filtered = {key: value for key, value in item.items() if key in valid_keys}
+                content = filtered.get("content")
+                if not isinstance(content, str):
+                    continue
+                filtered["id"] = str(filtered.get("id") or new_id())
+                filtered["name"] = str(filtered.get("name") or "text-attachment.txt")
+                filtered["size"] = len(content)
+                source = filtered.get("source")
+                if source not in ("paste", "input", "voice"):
+                    filtered["source"] = None
+                out.append(TextAttachment(**filtered))
+            except Exception:
+                continue
+        return out or None
+
     async def _run_aside(self, session_id: str, turn_id: str,
                          images: Optional[list["ImageAttachment"]] = None) -> None:
         session = self._active_sessions.get(session_id) or self._session_store.load(session_id)
@@ -3992,21 +4157,38 @@ class BridgeWS:
     def _rpc_seqtaskGet(self, session_id: str) -> str:
         return self._seqtask_payload(self._chat_extras_get(session_id))
 
-    def _rpc_seqtaskAdd(self, session_id: str, text: str, images_json: str = "") -> str:
+    def _rpc_seqtaskAdd(
+        self,
+        session_id: str,
+        text: str,
+        images_json: str = "",
+        text_attachments_json: str = "",
+    ) -> str:
         t = (text or "").strip()
         imgs = self._parse_images_json(images_json)
-        if not t and not imgs:
+        text_attachments = self._parse_text_attachments_json(text_attachments_json)
+        if not t and not imgs and not text_attachments:
             return json.dumps({"status": "error", "message": "任务为空"}, ensure_ascii=False)
         ex = self._chat_extras_get(session_id)
         ex.seq_tasks.append(SeqTask(
             id=new_id(), text=t,
             images=[i.to_dict() for i in imgs] if imgs else [],
+            text_attachments=[
+                attachment.to_dict() for attachment in text_attachments
+            ] if text_attachments else [],
         ))
         self._chat_extras_save(ex)
         self._emit_seqtask_updated(ex)
         return self._seqtask_payload(ex)
 
-    def _rpc_seqtaskEdit(self, session_id: str, task_id: str, text: str, images_json: str = "") -> str:
+    def _rpc_seqtaskEdit(
+        self,
+        session_id: str,
+        task_id: str,
+        text: str,
+        images_json: str = "",
+        text_attachments_json: str = "",
+    ) -> str:
         ex = self._chat_extras_get(session_id)
         t = next((x for x in ex.seq_tasks if x.id == task_id), None)
         if not t:
@@ -4017,6 +4199,11 @@ class BridgeWS:
             if images_json:
                 imgs = self._parse_images_json(images_json)
                 t.images = [i.to_dict() for i in imgs] if imgs else []
+            if text_attachments_json:
+                attachments = self._parse_text_attachments_json(text_attachments_json)
+                t.text_attachments = [
+                    attachment.to_dict() for attachment in attachments
+                ] if attachments else []
         elif t.status == "sent":
             # 已发送：只允许追加/编辑图片（文本已进对话，不可改）
             if images_json:
@@ -4453,8 +4640,8 @@ class BridgeWS:
     def _rpc_activateSkill(self, name: str, scope: str, working_dir: str = "") -> str:
         """
         激活 skill。
-          scope: "global"  → ~/.claude/skills/<name>/
-          scope: "project" → <working_dir>/.claude/skills/<name>/
+          scope: "global"  → 各 Agent 的用户级原生 Skill 目录
+          scope: "project" → 各 Agent 的项目级原生 Skill 目录
         """
         try:
             self._skill_store.activate(name.strip(), scope, working_dir)
@@ -4905,15 +5092,22 @@ class BridgeWS:
             f"-d '{payload}'"
         )
 
-    def _generate_backend_skill_md(self, skill_name: str, skill_info: dict, *, is_image_backend: bool = False) -> str:
+    def _generate_backend_skill_md(
+        self,
+        skill_name: str,
+        skill_info: dict,
+        *,
+        agent_name: str = "claude",
+        is_image_backend: bool = False,
+    ) -> str:
         """
         根据孵化库中的 Backend Skill 声明，生成部署版 SKILL.md。
-        根据 input_schema 动态生成参数说明，适配不同 skill 类型。
+        根据 input_schema 动态生成参数说明，并使用当前 Agent 的原生 Skill 目录。
         """
         description = skill_info.get("description", f"Backend Skill: {skill_name}")
         input_schema = skill_info.get("inputSchema") or {}
         python = self._resolve_python_exe()
-        call_script = f".claude/skills/{skill_name}/_call.py"
+        call_script = f"{project_skill_reference(agent_name, skill_name)}/_call.py"
 
         # 从 input_schema 提取参数列表
         props = input_schema.get("properties", {})
@@ -5096,15 +5290,15 @@ except urllib.error.URLError as e:
 
         roots: list[tuple[str, _Path]] = []
         if has_claude_cli:
-            roots.append(("claude", _Path(working_dir) / ".claude" / "skills"))
+            roots.append(("claude", project_skill_root(working_dir, "claude")))
         if has_qwen_cli:
-            roots.append(("qwen", _Path(working_dir) / ".qwen" / "skills"))
+            roots.append(("qwen", project_skill_root(working_dir, "qwen")))
         if has_codex_cli:
-            roots.append(("codex", _Path(working_dir) / ".agents" / "skills"))
+            roots.append(("codex", project_skill_root(working_dir, "codex")))
 
         # Backward-compatible default: existing installations expected .claude.
         if not roots:
-            roots.append(("claude", _Path(working_dir) / ".claude" / "skills"))
+            roots.append(("claude", project_skill_root(working_dir, "claude")))
         return roots
 
     def _backend_has_native_project_skills(self, backend_id: str) -> bool:
@@ -5141,7 +5335,7 @@ except urllib.error.URLError as e:
 
         # 收集当前绑定中的系统增强型 Skills（有 backend 或 type 字段）
         deployed_backend_skills: set[str] = set()
-        deploy_payloads: dict[str, tuple[str, str]] = {}
+        deploy_payloads: dict[str, tuple[dict, bool, str]] = {}
         for sname in bound_skills:
             info = self._skill_store.get_skill(sname)
             if not info:
@@ -5156,13 +5350,24 @@ except urllib.error.URLError as e:
                 if bc and bc.type.value == "dashscope-image":
                     is_image_backend = True
             deploy_payloads[sname] = (
-                self._generate_backend_skill_md(sname, info, is_image_backend=is_image_backend),
-                self._generate_backend_skill_call_py(sname, info, is_image_backend=is_image_backend),
+                info,
+                is_image_backend,
+                self._generate_backend_skill_call_py(
+                    sname,
+                    info,
+                    is_image_backend=is_image_backend,
+                ),
             )
             deployed_backend_skills.add(sname)
 
         for agent_name, skills_dir in roots:
-            for sname, (skill_md, call_py) in deploy_payloads.items():
+            for sname, (info, is_image_backend, call_py) in deploy_payloads.items():
+                skill_md = self._generate_backend_skill_md(
+                    sname,
+                    info,
+                    agent_name=agent_name,
+                    is_image_backend=is_image_backend,
+                )
                 target = skills_dir / sname
                 target.mkdir(parents=True, exist_ok=True)
                 (target / "SKILL.md").write_text(skill_md, encoding="utf-8")
@@ -5236,7 +5441,7 @@ except urllib.error.URLError as e:
         把 abilities 绑定到 session：
           - 更新 session.abilities
           - 从绑定的 prompts + backend skills 组装 session.constraints
-          - 同步部署 backend skill 文件到 working_dir/.claude/skills/
+          - 同步部署 backend skill 文件到当前 Agent 的原生 Skill 目录
 
         被 _rpc_updateSessionAbilities 和 _rpc_createSession（默认档自动绑定）共用。
         """
@@ -5258,6 +5463,12 @@ except urllib.error.URLError as e:
             not self._backend_has_native_project_skills(session.backend_id)
             and not self._backend_accepts_backend_skill_tools(session.backend_id)
         )
+        fallback_roots = (
+            self._skill_deploy_roots_for_session(session)
+            if inject_backend_skill_bash_fallback
+            else []
+        )
+        fallback_agent = fallback_roots[0][0] if fallback_roots else "claude"
         backend_skill_hints: list[str] = []
         has_image_backend_skill = False
         for sname in (abilities.get("skills", []) if inject_backend_skill_bash_fallback else []):
@@ -5268,7 +5479,7 @@ except urllib.error.URLError as e:
                 continue  # 传统指令型 Skill，无需注入
             desc = info.get("description", sname)
             python_exe = self._resolve_python_exe()
-            call_script = f".claude/skills/{sname}/_call.py"
+            call_script = f"{project_skill_reference(fallback_agent, sname)}/_call.py"
             input_schema = info.get("inputSchema") or {}
             required_list = (input_schema.get("required") or
                              list((input_schema.get("properties") or {}).keys()))
@@ -5314,8 +5525,8 @@ except urllib.error.URLError as e:
                 "以下技能已就绪，本段就是权威调用说明；即使会话重启、resume 或用户说“再试一次 / 继续”，"
                 "**也必须直接使用这里给出的命令**。\n\n"
                 "### 禁止的低效行为\n"
-                "- 禁止先 Read / cat / type `.claude/skills/**/SKILL.md`。\n"
-                "- 禁止先 Read / cat / type `.claude/skills/**/_call.py`。\n"
+                "- 禁止先 Read / cat / type 任意 Agent Skill 目录中的 `SKILL.md`。\n"
+                "- 禁止先 Read / cat / type 任意 Agent Skill 目录中的 `_call.py`。\n"
                 "- 禁止用 ls/find/dir 等方式自行探索或验证技能文件。\n"
                 "- 禁止在调用前输出“我先查看技能说明 / I need to inspect the skill”等自我确认。\n\n"
                 "### 可用技能与直接调用命令\n\n"
@@ -5363,7 +5574,7 @@ except urllib.error.URLError as e:
             parts.append(sandbox_block)
 
         session.constraints = "\n\n---\n\n".join(parts) if parts else None
-        # ★ Backend Skills：自动部署到 working_dir/.claude/skills/
+        # ★ Backend Skills：自动部署到当前 Agent 的原生项目 Skill 目录
         self._sync_backend_skills_to_directory(session)
 
     def _default_abilities(self) -> dict:
@@ -7403,10 +7614,11 @@ except urllib.error.URLError as e:
         try:
             payload = json.loads(payload_json)
             session_id = payload["sessionId"]
-            content = payload["content"]
+            content = payload.get("content", "")
             display_content = content
             backend_id = payload["backendId"]
             raw_images = payload.get("images")
+            raw_text_attachments = payload.get("textAttachments")
             auto_continue = payload.get("autoContinue", True)
             # skip_permissions 优先级：前端 payload 显式值 > backend 配置 > 默认 True
             if "skipPermissions" in payload:
@@ -7432,6 +7644,19 @@ except urllib.error.URLError as e:
                 else:
                     print(f"[bridge_ws] 收到 {len(images)} 张图片",
                           file=sys.stderr, flush=True)
+
+            text_attachments = None
+            if raw_text_attachments:
+                text_attachments = self._parse_text_attachments_json(
+                    json.dumps(raw_text_attachments, ensure_ascii=False)
+                )
+                if text_attachments:
+                    print(
+                        f"[bridge_ws] 收到 {len(text_attachments)} 个文本附件，"
+                        f"共 {sum(item.size for item in text_attachments)} 字符",
+                        file=sys.stderr,
+                        flush=True,
+                    )
 
             session = self._active_sessions.get(session_id)
             if not session:
@@ -7475,6 +7700,7 @@ except urllib.error.URLError as e:
 
             # ★ @SESSION: 引用：在进入模型前注入被引用 session 的上下文。
             content = self._build_session_reference_context(content, session.id)
+            content = _append_text_attachments(content, text_attachments)
 
             # ★ 用户贴图 + session 有 Backend Skill 时：
             #   保存图片到 skill-images 并在 content 中注入 HTTP URL，
@@ -7510,7 +7736,13 @@ except urllib.error.URLError as e:
             # 前后端共用同一 user message ID，切换 session 后才能把内存气泡
             # 与已落盘消息准确对齐。旧客户端未传时继续兼容后端生成 ID。
             user_id = payload.get("userMessageId") or new_id()
-            user_msg = ChatMessage(id=user_id, role="user", content=content, images=images)
+            user_msg = ChatMessage(
+                id=user_id,
+                role="user",
+                content=display_content,
+                images=images,
+                text_attachments=text_attachments,
+            )
             session.messages.append(user_msg)
 
             assistant_id = payload.get("messageId") or new_id()
@@ -7522,8 +7754,12 @@ except urllib.error.URLError as e:
 
             # 让所有客户端立即更新会话列表，不必等整轮模型响应结束。
             session.updated_at = time.time()
-            if session.title in ("新会话", "New session", "") and display_content:
-                session.title = display_content[:50]
+            if session.title in ("新会话", "New session", ""):
+                title_source = display_content or (
+                    text_attachments[0].name if text_attachments else ""
+                )
+                if title_source:
+                    session.title = title_source[:50]
             # 流式响应期间不保存未完成正文，但列表索引必须与下面的 summary
             # 同步，否则客户端紧接着 listSessions 会把新标题/时间覆盖回旧值。
             self._session_store.update_meta(session)
@@ -7776,6 +8012,20 @@ except urllib.error.URLError as e:
                     if all_text:
                         msgs_for_backend.append(ChatMessage(id=new_id(), role="assistant", content="".join(all_text)))
                     msgs_for_backend.append(ChatMessage(id=new_id(), role="user", content=current_content))
+
+                # 历史消息中的文本附件在模型边界展开；当前用户消息已通过
+                # ``send_content`` 展开，跳过它可避免 API backend 重复携带一遍大正文。
+                current_user_id = (
+                    session.messages[-2].id
+                    if len(session.messages) >= 2 and session.messages[-2].role == "user"
+                    else ""
+                )
+                msgs_for_backend = [
+                    replace(message, content=_message_content_for_model(message))
+                    if message.text_attachments and message.id != current_user_id
+                    else message
+                    for message in msgs_for_backend
+                ]
 
                 # ★ 日志：记录 constraints（实际注入由各个 backend 的 send_message 处理，避免重复注入）
                 print(f"[bridge_ws] constraints 为：{repr(constraints[:200]) if constraints else None}",

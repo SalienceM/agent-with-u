@@ -24,7 +24,7 @@ input_schema:
 使用 Bash 工具执行以下命令（Python 路径由安装环境自动填充）：
 
 ```bash
-"<PYTHON>" .claude/skills/football-search/_call.py "<QUERY>" "<CATEGORY>"
+"<PYTHON>" "{{SKILL_DIR}}/_call.py" "<QUERY>" "<CATEGORY>"
 ```
 
 ## QUERY 构造规则（关键）

@@ -118,7 +118,6 @@ export const App: React.FC = () => {
   const scratchDragRef = useRef<{ startX: number; startW: number } | null>(null);
   const toastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const initialCheckDoneRef = useRef(false);          // ★ 防止 NewSessionDialog 重复弹出
-  const hasConnectedOnceRef = useRef(false);
 
   // ── 分屏布局状态(localStorage 持久化) ────────────────────────────────
   // layout: 当前几宫格;paneSessions: 每个 pane 对应的 sessionId;
@@ -161,7 +160,7 @@ export const App: React.FC = () => {
     });
   }, [focusedPaneIdx]);
 
-  const { config, updateConfig, resetConfig, reloadConfig } = useConfig();
+  const { config, updateConfig, resetConfig } = useConfig();
   const isMobile = useIsMobile();
 
   const showToast = useCallback((type: 'success' | 'error' | 'info', message: string, durationMs = 4000) => {
@@ -383,10 +382,6 @@ export const App: React.FC = () => {
     // 首页是明确的应用入口：连接完成后刷新真实数据，但不自动跳入最近会话，
     // 也不在空数据时强制弹出新建窗口。
     refreshSessionList();
-    // useConfig 已在挂载时读取一次；仅在真正的断线重连后重新同步，
-    // 避免首次连接对 getAppConfig 产生固定重复请求。
-    if (hasConnectedOnceRef.current) reloadConfig();
-    else hasConnectedOnceRef.current = true;
   }, [backendConnected, refreshSessionList]); // eslint-disable-line react-hooks/exhaustive-deps
 
   /* ---- 多端同步：其它客户端增删改 session 时刷新侧边栏 ---- */
@@ -521,6 +516,15 @@ export const App: React.FC = () => {
             return next;
           });
         }
+      } else {
+        // 任意非终态流事件都证明该 session 正在运行。这样即使 ChatPane
+        // 切换时经历短暂的 Hook 水合窗口，Sidebar 也不会丢掉 running。
+        setStreamingSessions((prev) => {
+          if (prev.has(sid)) return prev;
+          const next = new Set(prev);
+          next.add(sid);
+          return next;
+        });
       }
     });
     return unsub;

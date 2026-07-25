@@ -225,6 +225,17 @@ input_schema:
 描述 AI 应如何调用此 Skill，以及调用时传入什么参数。
 ```
 
+AgentWithU 会按运行框架部署到原生目录：
+
+- Claude Code：`.claude/skills/<name>/`
+- Qwen Code：`.qwen/skills/<name>/`
+- Codex：`.agents/skills/<name>/`
+
+Skill 内不要硬编码 `.claude/skills/...`。需要引用与 `SKILL.md`
+同目录的脚本或资源时，统一写成 `{{SKILL_DIR}}/call.py`；
+部署时会自动解析为当前 Agent 的实际目录。旧 Skill 中指向自身目录的
+`.claude/.qwen/.agents` 路径也会在部署时自动迁移。
+
 ### 打包分发
 
 ```bash

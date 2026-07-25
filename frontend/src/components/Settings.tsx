@@ -12,6 +12,12 @@ import {
 } from '../utils/hotkey';
 import { readHackerMode, writeHackerMode, type HackerModeConfig } from '../utils/hackerMode';
 
+const DASHSCOPE_REALTIME_DEFAULT = 'fun-asr-realtime-2026-02-28';
+const DASHSCOPE_FLASH_DEFAULT = 'fun-asr-flash-2026-06-15';
+const DASHSCOPE_REALTIME_MODELS = new Set([
+  DASHSCOPE_REALTIME_DEFAULT,
+]);
+
 interface SettingsProps {
   isOpen: boolean;
   onClose: () => void;
@@ -71,8 +77,16 @@ export const Settings: React.FC<SettingsProps> = ({
     return () => { cancelled = true; };
   }, [isOpen]);
 
-  const handleSttChange = useCallback((field: string, value: string) => {
-    setSttCfg((prev: any) => prev ? { ...prev, [field]: value } : prev);
+  const handleSttChange = useCallback((field: string, value: string | boolean) => {
+    setSttCfg((prev: any) => {
+      if (!prev) return prev;
+      const next = { ...prev, [field]: value };
+      if (field === 'mode' && value === 'dashscope' && !DASHSCOPE_REALTIME_MODELS.has(next.apiModel)) {
+        next.apiModel = DASHSCOPE_REALTIME_DEFAULT;
+        next.flashModel = DASHSCOPE_FLASH_DEFAULT;
+      }
+      return next;
+    });
     if (field === 'mode' && value === 'local') {
       api.sttCheckLocal().then((r) => setLocalInstalled(r.installed)).catch(() => {});
     }
@@ -309,24 +323,61 @@ export const Settings: React.FC<SettingsProps> = ({
                   onChange={(e) => handleSttChange('apiKey', e.target.value)}
                   style={inputStyle}
                 />
-                <select
-                  value={sttCfg.apiModel || 'sensevoice-v1'}
-                  onChange={(e) => handleSttChange('apiModel', e.target.value)}
-                  style={{ ...inputStyle, flex: '0 0 auto' }}
-                >
-                  <option value="sensevoice-v1">SenseVoice v1 (50+ 语言)</option>
-                  <option value="paraformer-v2">Paraformer v2 (中英)</option>
-                  <option value="qwen3-asr-flash-realtime">Qwen3 ASR Flash Realtime (实时流式)</option>
-                  <option value="fun-asr">FunASR (需 pip install dashscope)</option>
-                </select>
+                <div style={{
+                  display: 'grid',
+                  gridTemplateColumns: '88px minmax(0, 1fr)',
+                  gap: '6px 8px',
+                  alignItems: 'center',
+                }}>
+                  <span style={{ fontSize: 11, color: 'var(--theme-text-muted)' }}>实时识别</span>
+                  <input
+                    readOnly
+                    value={DASHSCOPE_REALTIME_DEFAULT}
+                    style={{ ...inputStyle, opacity: 0.85 }}
+                  />
+                  <span style={{ fontSize: 11, color: 'var(--theme-text-muted)' }}>短音频精转</span>
+                  <input
+                    readOnly
+                    value={DASHSCOPE_FLASH_DEFAULT}
+                    style={{ ...inputStyle, opacity: 0.85 }}
+                  />
+                </div>
                 <input
-                  placeholder="Base URL (可选, 默认阿里云)"
+                  placeholder="DashScope 端点（可选，支持控制台 Workspace 地址）"
                   value={sttCfg.apiBaseUrl || ''}
                   onChange={(e) => handleSttChange('apiBaseUrl', e.target.value)}
                   style={inputStyle}
                 />
+                <input
+                  placeholder="Workspace ID（可选）"
+                  value={sttCfg.workspaceId || ''}
+                  onChange={(e) => handleSttChange('workspaceId', e.target.value)}
+                  style={inputStyle}
+                />
+                <label style={{
+                  display: 'flex',
+                  alignItems: 'flex-start',
+                  gap: 8,
+                  padding: '7px 8px',
+                  borderRadius: 6,
+                  background: 'var(--theme-bg-hover)',
+                  fontSize: 11,
+                  color: 'var(--theme-text-muted)',
+                  cursor: 'pointer',
+                }}>
+                  <input
+                    type="checkbox"
+                    checked={sttCfg.flashRefineEnabled !== false}
+                    onChange={(e) => handleSttChange('flashRefineEnabled', e.target.checked)}
+                    style={{ marginTop: 1 }}
+                  />
+                  <span>
+                    停止录音后使用 Fun-ASR-Flash 精校（仅限 5 分钟以内）。
+                    精校失败或录音超时会自动保留实时识别结果。
+                  </span>
+                </label>
                 <span style={{ fontSize: 11, color: 'var(--theme-text-muted)' }}>
-                  sensevoice/paraformer 走兼容接口; qwen3-asr 走 WebSocket 实时流式; fun-asr 走原生 SDK
+                  麦克风音频以 16kHz PCM 发送到 Fun-ASR Realtime，识别结果会边说边写入输入框。
                 </span>
               </div>
             )}

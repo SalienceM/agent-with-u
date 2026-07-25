@@ -16,7 +16,7 @@ import threading
 from pathlib import Path
 from typing import Optional
 
-from ..types import Session, ChatMessage, ImageAttachment, ToolCallInfo
+from ..types import Session, ChatMessage, ImageAttachment, TextAttachment, ToolCallInfo
 from . import paths
 
 
@@ -125,6 +125,14 @@ class SessionStore:
                         ImageAttachment(**{k: v for k, v in img.items() if k in _valid_keys})
                         for img in m["images"]
                     ]
+                text_attachments = None
+                if m.get("textAttachments"):
+                    _text_keys = {"id", "name", "content", "size", "source"}
+                    text_attachments = [
+                        TextAttachment(**{k: v for k, v in item.items() if k in _text_keys})
+                        for item in m["textAttachments"]
+                        if isinstance(item, dict)
+                    ]
                 tool_calls = None
                 if m.get("toolCalls"):
                     tool_calls = [ToolCallInfo(**tc) for tc in m["toolCalls"]]
@@ -134,6 +142,7 @@ class SessionStore:
                     content=m["content"],
                     timestamp=m.get("timestamp", 0),
                     images=images,
+                    text_attachments=text_attachments,
                     backend_id=m.get("backendId"),
                     usage=m.get("usage"),
                     tool_calls=tool_calls,

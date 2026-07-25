@@ -188,24 +188,40 @@ export function useConfig() {
   const [config, setConfig] = useState<AppConfig>(DEFAULT_CONFIG);
   const [loaded, setLoaded] = useState(false);
   const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const loadVersionRef = useRef(0);
 
-  // Load config from backend on mount
-  useEffect(() => {
-    api.getAppConfig().then((savedConfig) => {
+  const loadFromBackend = useCallback(async () => {
+    const version = ++loadVersionRef.current;
+    try {
+      const savedConfig = await api.getAppConfig();
+      if (version !== loadVersionRef.current) return;
       if (savedConfig && Object.keys(savedConfig).length > 0) {
         // ★ 迁移已删除的主题名
         if (savedConfig.theme === 'ocean') savedConfig.theme = 'midnight';
         setConfig((prev) => ({ ...prev, ...savedConfig }));
       }
       setLoaded(true);
-    }).catch(() => {
-      // If loading fails, use defaults
+    } catch {
+      if (version !== loadVersionRef.current) return;
       setLoaded(true);
+    }
+  }, []);
+
+  // 配置必须在真实后端连接成功后读取。旧逻辑在连接尚未就绪时先读一次，
+  // 失败后首连又跳过重载，导致背景图要手动刷新才出现。
+  useEffect(() => {
+    const unsubscribe = api.onConnectionStatus((connected) => {
+      if (connected) void loadFromBackend();
     });
-    // ★ 卸载时清理 debounce timer，防止对已卸载组件 setState
     return () => {
-      if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
+      loadVersionRef.current += 1;
+      unsubscribe();
     };
+  }, [loadFromBackend]);
+
+  // ★ 卸载时清理 debounce timer
+  useEffect(() => () => {
+    if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
   }, []);
 
   // Debounced save: sliders may fire many events; wait 400ms after last change.
@@ -239,14 +255,8 @@ export function useConfig() {
   }, []);
 
   const reloadConfig = useCallback(() => {
-    api.getAppConfig().then((savedConfig) => {
-      if (savedConfig && Object.keys(savedConfig).length > 0) {
-        if (savedConfig.theme === 'ocean') savedConfig.theme = 'midnight';
-        setConfig((prev) => ({ ...prev, ...savedConfig }));
-      }
-      setLoaded(true);
-    }).catch(() => setLoaded(true));
-  }, []);
+    void loadFromBackend();
+  }, [loadFromBackend]);
 
   return { config, updateConfig, resetConfig, reloadConfig, loaded };
 }

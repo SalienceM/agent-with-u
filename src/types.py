@@ -78,6 +78,18 @@ class ImageAttachment:
 
 
 @dataclass
+class TextAttachment:
+    id: str
+    name: str
+    content: str
+    size: int = 0
+    source: Optional[str] = None
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+@dataclass
 class ToolCallInfo:
     name: str
     id: str = ""
@@ -141,6 +153,7 @@ class ChatMessage:
     content: str
     timestamp: float = field(default_factory=time.time)
     images: Optional[list[ImageAttachment]] = None
+    text_attachments: Optional[list[TextAttachment]] = None
     backend_id: Optional[str] = None
     usage: Optional[dict] = None
     tool_calls: Optional[list[ToolCallInfo]] = None
@@ -157,6 +170,8 @@ class ChatMessage:
         }
         if self.images:
             d["images"] = [img.to_dict() for img in self.images]
+        if self.text_attachments:
+            d["textAttachments"] = [attachment.to_dict() for attachment in self.text_attachments]
         if self.backend_id:
             d["backendId"] = self.backend_id
         if self.usage:

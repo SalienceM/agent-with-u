@@ -1,10 +1,13 @@
-import React, { useRef, useCallback, useEffect, memo, useState, useMemo } from 'react';
+import React, { useRef, useCallback, useEffect, useLayoutEffect, memo, useState, useMemo } from 'react';
 import { ImagePreview } from './ImagePreview';
+import { TextAttachmentPreview } from './TextAttachmentPreview';
 import { useClipboardImage } from '../hooks/useClipboardImage';
 import type { ImageAttachment } from '../hooks/useClipboardImage';
+import type { TextAttachment, TextAttachmentSource } from '../types/attachments';
 import { SLASH_COMMANDS } from '../hooks/useChat';
 import type { SlashCommand } from '../hooks/useChat';
 import { api, isTauri } from '../api';
+import { uuid } from '../utils/uuid';
 import {
   BackendRuntimeFields,
   formatRuntimeLabel,
@@ -12,6 +15,17 @@ import {
   normalizeModelRuntime,
   type ModelRuntime,
 } from './CodexRuntimeFields';
+
+// Pane 会在不同 session 间复用，且普通对话/Loop 面板切换时输入组件会卸载。
+// 草稿必须以 session 为键独立保存，不能只放在 textarea DOM 或组件 state 中。
+interface InputDraft {
+  text: string;
+  textAttachments: TextAttachment[];
+}
+
+const sessionInputDrafts = new Map<string, InputDraft>();
+const LARGE_PASTE_ATTACHMENT_CHARS = 4_000;
+const LONG_INPUT_ATTACHMENT_CHARS = 6_000;
 
 // ── 注入全局样式（focus glow）────────────────────────────────────────────────
 if (typeof document !== 'undefined' && !document.getElementById('chat-input-css')) {
@@ -44,7 +58,11 @@ if (typeof document !== 'undefined' && !document.getElementById('chat-input-css'
 type FileEntry = { name: string; path: string; isDir: boolean };
 
 interface Props {
-  onSend: (content: string, images?: ImageAttachment[]) => void;
+  onSend: (
+    content: string,
+    images?: ImageAttachment[],
+    textAttachments?: TextAttachment[],
+  ) => void;
   onAbort: () => void;
   isStreaming: boolean;
   backends: any[];
@@ -55,7 +73,11 @@ interface Props {
   onSkipPermissionsChange?: (enabled: boolean) => void;
   isMobile?: boolean;
   // ── 序列任务：回答进行中或已有排队时，新输入自动进入队列 ──
-  onQueueTask?: (content: string, images?: ImageAttachment[]) => void;
+  onQueueTask?: (
+    content: string,
+    images?: ImageAttachment[],
+    textAttachments?: TextAttachment[],
+  ) => void;
   seqCount?: number;
   onCompact?: () => void;
   fontSize?: number;                         // 当前对话字号(用于 A−/A+ 显示)
@@ -130,6 +152,9 @@ const ChatInputInner: React.FC<Props> = ({
   // 把 textarea ref 传给 useClipboardImage,这样多 pane 场景下只有聚焦
   // 的输入框对应的 hook 会处理粘贴,避免一张图被所有 pane 同时吃下。
   const { images, removeImage, clearImages, addImage } = useClipboardImage(ref);
+  const [textAttachments, setTextAttachments] = useState<TextAttachment[]>([]);
+  const textAttachmentsRef = useRef<TextAttachment[]>([]);
+  textAttachmentsRef.current = textAttachments;
 
   // 截图按钮状态:正在等待用户选区域 / 已超时
   const [screenshotBusy, setScreenshotBusy] = useState(false);
@@ -208,6 +233,29 @@ const ChatInputInner: React.FC<Props> = ({
   const isStreamingRef = useRef(isStreaming);
   isStreamingRef.current = isStreaming;
   const composingRef = useRef(false);
+  const resizeFrameRef = useRef<number | null>(null);
+  const textareaHeightCappedRef = useRef(false);
+
+  const scheduleTextareaResize = useCallback((force = false) => {
+    if (!force && textareaHeightCappedRef.current) return;
+    if (resizeFrameRef.current !== null) return;
+    resizeFrameRef.current = window.requestAnimationFrame(() => {
+      resizeFrameRef.current = null;
+      const el = ref.current;
+      if (!el) return;
+      el.style.height = 'auto';
+      const scrollHeight = el.scrollHeight;
+      const nextHeight = Math.min(scrollHeight, 200);
+      el.style.height = `${nextHeight}px`;
+      textareaHeightCappedRef.current = scrollHeight >= 200;
+    });
+  }, []);
+
+  useEffect(() => () => {
+    if (resizeFrameRef.current !== null) {
+      window.cancelAnimationFrame(resizeFrameRef.current);
+    }
+  }, []);
 
   // ═══════════════════════════════════════
   //  ★ 输入历史（Linux 风格 ↑↓ 浏览，最多 10 条）
@@ -298,6 +346,118 @@ const ChatInputInner: React.FC<Props> = ({
   const sessionIdRef = useRef(sessionId);
   sessionIdRef.current = sessionId;
 
+  const saveSessionDraft = useCallback((
+    text: string,
+    attachments: TextAttachment[] = textAttachmentsRef.current,
+  ) => {
+    const sid = sessionIdRef.current;
+    if (!sid) return;
+    if (text || attachments.length) {
+      sessionInputDrafts.set(sid, {
+        text,
+        textAttachments: attachments.map((item) => ({ ...item })),
+      });
+    } else {
+      sessionInputDrafts.delete(sid);
+    }
+  }, []);
+
+  const setTextAttachmentList = useCallback((next: TextAttachment[]) => {
+    textAttachmentsRef.current = next;
+    setTextAttachments(next);
+    saveSessionDraft(ref.current?.value ?? '', next);
+  }, [saveSessionDraft]);
+
+  const addTextAttachment = useCallback((
+    content: string,
+    source: TextAttachmentSource,
+    name?: string,
+  ): TextAttachment | null => {
+    if (!content) return null;
+    const sourceLabel = source === 'voice'
+      ? 'voice-transcript'
+      : source === 'paste'
+        ? 'pasted-text'
+        : 'long-input';
+    const sameSourceCount = textAttachmentsRef.current.filter(
+      (item) => item.source === source,
+    ).length;
+    const attachment: TextAttachment = {
+      id: uuid(),
+      name: name || `${sourceLabel}-${sameSourceCount + 1}.txt`,
+      content,
+      size: content.length,
+      source,
+    };
+    setTextAttachmentList([...textAttachmentsRef.current, attachment]);
+    return attachment;
+  }, [setTextAttachmentList]);
+
+  const updateTextAttachment = useCallback((attachment: TextAttachment) => {
+    const next = textAttachmentsRef.current.map(
+      (item) => item.id === attachment.id
+        ? { ...attachment, size: attachment.content.length }
+        : item,
+    );
+    setTextAttachmentList(next);
+  }, [setTextAttachmentList]);
+
+  const removeTextAttachment = useCallback((id: string) => {
+    setTextAttachmentList(
+      textAttachmentsRef.current.filter((item) => item.id !== id),
+    );
+  }, [setTextAttachmentList]);
+
+  const restoreTextAttachment = useCallback((id: string) => {
+    const attachment = textAttachmentsRef.current.find((item) => item.id === id);
+    const el = ref.current;
+    if (!attachment || !el) return;
+    const prefix = el.value;
+    el.value = prefix
+      ? `${prefix}${prefix.endsWith('\n') ? '' : '\n'}${attachment.content}`
+      : attachment.content;
+    el.selectionStart = el.selectionEnd = el.value.length;
+    const next = textAttachmentsRef.current.filter((item) => item.id !== id);
+    textAttachmentsRef.current = next;
+    setTextAttachments(next);
+    saveSessionDraft(el.value, next);
+    textareaHeightCappedRef.current = false;
+    scheduleTextareaResize(true);
+    el.focus();
+  }, [saveSessionDraft, scheduleTextareaResize]);
+
+  useLayoutEffect(() => {
+    const el = ref.current;
+    if (el) {
+      const saved = sessionId ? sessionInputDrafts.get(sessionId) : undefined;
+      const restored = saved?.text || '';
+      const restoredAttachments = saved?.textAttachments?.map((item) => ({ ...item })) || [];
+      el.value = restored;
+      textAttachmentsRef.current = restoredAttachments;
+      setTextAttachments(restoredAttachments);
+      textareaHeightCappedRef.current = false;
+      scheduleTextareaResize(true);
+      el.selectionStart = el.selectionEnd = restored.length;
+    }
+    setShowCommands(false);
+    setShowFilePicker(false);
+    setShowSessionPicker(false);
+
+    return () => {
+      if (!sessionId || !ref.current) return;
+      const value = ref.current.value;
+      const attachments = textAttachmentsRef.current;
+      if (value || attachments.length) {
+        sessionInputDrafts.set(sessionId, {
+          text: value,
+          textAttachments: attachments.map((item) => ({ ...item })),
+        });
+      } else {
+        sessionInputDrafts.delete(sessionId);
+      }
+    };
+  }, [sessionId, scheduleTextareaResize]);
+
   const workingDirRef = useRef(workingDir);
   workingDirRef.current = workingDir;
 
@@ -305,19 +465,79 @@ const ChatInputInner: React.FC<Props> = ({
   const [showNewSessionConfirm, setShowNewSessionConfirm] = useState(false);
   // ── 语音流式转写 ──
   const [micActive, setMicActive] = useState(false);
+  const [micStatus, setMicStatus] = useState<'idle' | 'connecting' | 'listening' | 'reconnecting' | 'finalizing' | 'error'>('idle');
+  const [micError, setMicError] = useState('');
+  const [micNotice, setMicNotice] = useState('');
   const micStreamRef = useRef<MediaStream | null>(null);
   const micAudioCtxRef = useRef<AudioContext | null>(null);
   const micUnsubRef = useRef<(() => void) | null>(null);
   const micPrefixRef = useRef<string | null>(null);
+  const micAttachmentIdRef = useRef<string | null>(null);
   const micStoppedRef = useRef(false);
+  const micFlushResolveRef = useRef<(() => void) | null>(null);
 
   const micWorkletRef = useRef<AudioWorkletNode | null>(null);
+
+  const applyMicTranscript = useCallback((transcript: string) => {
+    const el = ref.current;
+    if (!el) return;
+    const prefix = micPrefixRef.current ?? '';
+    const combined = prefix ? `${prefix}\n${transcript}` : transcript;
+    const activeAttachmentId = micAttachmentIdRef.current;
+
+    if (activeAttachmentId || combined.length >= LONG_INPUT_ATTACHMENT_CHARS) {
+      if (activeAttachmentId) {
+        const next = textAttachmentsRef.current.map((item) => (
+          item.id === activeAttachmentId
+            ? { ...item, content: transcript, size: transcript.length }
+            : item
+        ));
+        setTextAttachmentList(next);
+      } else if (transcript) {
+        const attachment = addTextAttachment(
+          transcript,
+          'voice',
+          `voice-transcript-${textAttachmentsRef.current.filter((item) => item.source === 'voice').length + 1}.txt`,
+        );
+        micAttachmentIdRef.current = attachment?.id || null;
+      }
+      el.value = prefix;
+    } else {
+      el.value = combined;
+    }
+
+    saveSessionDraft(el.value, textAttachmentsRef.current);
+    textareaHeightCappedRef.current = false;
+    scheduleTextareaResize(true);
+  }, [
+    addTextAttachment,
+    saveSessionDraft,
+    scheduleTextareaResize,
+    setTextAttachmentList,
+  ]);
+
+  const flushMicWorklet = useCallback(async () => {
+    const worklet = micWorkletRef.current;
+    if (!worklet) return;
+    await new Promise<void>((resolve) => {
+      let settled = false;
+      const finish = () => {
+        if (settled) return;
+        settled = true;
+        micFlushResolveRef.current = null;
+        resolve();
+      };
+      micFlushResolveRef.current = finish;
+      worklet.port.postMessage({ type: 'flush' });
+      window.setTimeout(finish, 150);
+    });
+  }, []);
 
   const micStop = useCallback(async () => {
     if (micStoppedRef.current) return;
     micStoppedRef.current = true;
-    micUnsubRef.current?.();
-    micUnsubRef.current = null;
+    setMicStatus('finalizing');
+    await flushMicWorklet();
     if (micWorkletRef.current) {
       micWorkletRef.current.port.close();
       micWorkletRef.current.disconnect();
@@ -330,19 +550,36 @@ const ChatInputInner: React.FC<Props> = ({
     try {
       const res = await api.sttStreamStop();
       if (res.ok && res.text && ref.current) {
-        const prefix = micPrefixRef.current ?? '';
-        ref.current.value = prefix ? prefix + '\n' + res.text : res.text;
-        ref.current.style.height = 'auto';
-        ref.current.style.height = ref.current.scrollHeight + 'px';
+        applyMicTranscript(res.text);
+        if (res.refinedByFlash) {
+          setMicNotice('已使用 Fun-ASR-Flash 完成短音频精校');
+        } else if (res.refineSkipped) {
+          setMicNotice(res.refineSkipped);
+        } else if (res.refineError) {
+          setMicNotice(`Flash 精校失败，已保留实时识别结果：${res.refineError}`);
+        }
+      } else if (!res.ok && res.error !== 'No active STT stream') {
+        setMicError(res.error || '实时语音识别停止失败');
       }
-    } catch {}
+    } catch (e: any) {
+      setMicError(e?.message || '实时语音识别停止失败');
+    }
+    micUnsubRef.current?.();
+    micUnsubRef.current = null;
     micPrefixRef.current = null;
+    micAttachmentIdRef.current = null;
     setMicActive(false);
+    setMicStatus('idle');
     ref.current?.focus();
-  }, []);
+  }, [applyMicTranscript, flushMicWorklet]);
 
   const micStart = useCallback(async () => {
     micStoppedRef.current = false;
+    setMicActive(true);
+    setMicStatus('connecting');
+    setMicError('');
+    setMicNotice('');
+    let serverStarted = false;
     try {
       const cfg = await api.getSttConfig();
       const deviceId = cfg?.deviceId || '';
@@ -350,7 +587,13 @@ const ChatInputInner: React.FC<Props> = ({
       let stream: MediaStream;
       try {
         stream = await navigator.mediaDevices.getUserMedia({
-          audio: deviceId ? { deviceId: { exact: deviceId } } : true,
+          audio: {
+            ...(deviceId ? { deviceId: { exact: deviceId } } : {}),
+            channelCount: 1,
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true,
+          },
         });
       } catch (devErr) {
         if (deviceId) {
@@ -359,6 +602,10 @@ const ChatInputInner: React.FC<Props> = ({
           throw devErr;
         }
       }
+      if (micStoppedRef.current) {
+        stream.getTracks().forEach(t => t.stop());
+        return;
+      }
       micStreamRef.current = stream;
 
       const res = await api.sttStreamStart();
@@ -366,36 +613,65 @@ const ChatInputInner: React.FC<Props> = ({
         stream.getTracks().forEach(t => t.stop());
         throw new Error(res.error || 'STT stream start failed');
       }
+      serverStarted = true;
+      if (micStoppedRef.current) {
+        await api.sttStreamStop().catch(() => {});
+        stream.getTracks().forEach(t => t.stop());
+        return;
+      }
 
       micPrefixRef.current = ref.current?.value ?? '';
+      micAttachmentIdRef.current = null;
 
       const unsub = api.onSttStreamText((data) => {
-        if (!ref.current) return;
-        const prefix = micPrefixRef.current ?? '';
-        ref.current.value = prefix ? prefix + '\n' + data.text : data.text;
-        ref.current.style.height = 'auto';
-        ref.current.style.height = ref.current.scrollHeight + 'px';
+        applyMicTranscript(data.text);
       });
       micUnsubRef.current = unsub;
 
       const audioCtx = new AudioContext({ sampleRate: 16000 });
       micAudioCtxRef.current = audioCtx;
+      await audioCtx.resume();
       await audioCtx.audioWorklet.addModule('./pcm-worklet.js');
       const source = audioCtx.createMediaStreamSource(stream);
       const worklet = new AudioWorkletNode(audioCtx, 'pcm-processor');
       micWorkletRef.current = worklet;
-      worklet.port.onmessage = (e: MessageEvent<ArrayBuffer>) => {
-        if (micStoppedRef.current) return;
+      worklet.port.onmessage = (e: MessageEvent<ArrayBuffer | { type?: string }>) => {
+        if (!(e.data instanceof ArrayBuffer)) {
+          if (e.data?.type === 'flushed') micFlushResolveRef.current?.();
+          return;
+        }
+        // 停止时 Worklet 会先 flush 最后一段不足 100ms 的 PCM；该帧仍需发送。
+        if (micStoppedRef.current && !micFlushResolveRef.current) return;
         api.sttStreamAudioBinary(e.data);
       };
       source.connect(worklet);
+      // AudioWorklet 必须连入活动输出图；0 增益确保不会回放麦克风。
+      const silentSink = audioCtx.createGain();
+      silentSink.gain.value = 0;
+      worklet.connect(silentSink);
+      silentSink.connect(audioCtx.destination);
 
-      setMicActive(true);
+      setMicStatus('listening');
     } catch (e: any) {
       console.error('[mic]', e);
+      micStoppedRef.current = true;
+      micUnsubRef.current?.();
+      micUnsubRef.current = null;
+      if (serverStarted) await api.sttStreamStop().catch(() => {});
+      if (micWorkletRef.current) {
+        micWorkletRef.current.port.close();
+        micWorkletRef.current.disconnect();
+        micWorkletRef.current = null;
+      }
+      micStreamRef.current?.getTracks().forEach(t => t.stop());
+      micStreamRef.current = null;
+      micAudioCtxRef.current?.close().catch(() => {});
+      micAudioCtxRef.current = null;
       setMicActive(false);
+      setMicStatus('error');
+      setMicError(e?.message || '无法启动实时语音识别');
     }
-  }, []);
+  }, [applyMicTranscript]);
 
   const toggleMic = useCallback(() => {
     if (micActive) {
@@ -407,22 +683,21 @@ const ChatInputInner: React.FC<Props> = ({
 
   const micReconnect = useCallback(async () => {
     if (micStoppedRef.current) return;
+    setMicStatus('reconnecting');
     micUnsubRef.current?.();
     micUnsubRef.current = null;
     // 保存当前文本作为新前缀，避免重连后丢失已转写内容
     if (ref.current) micPrefixRef.current = ref.current.value;
+    micAttachmentIdRef.current = null;
     try {
       const res = await api.sttStreamStart();
       if (!res.ok) throw new Error(res.error);
       const unsub = api.onSttStreamText((data) => {
-        if (!ref.current) return;
-        const prefix = micPrefixRef.current ?? '';
-        ref.current.value = prefix ? prefix + '\n' + data.text : data.text;
-        ref.current.style.height = 'auto';
-        ref.current.style.height = ref.current.scrollHeight + 'px';
+        applyMicTranscript(data.text);
       });
       micUnsubRef.current = unsub;
-    } catch {
+      setMicStatus('listening');
+    } catch (e: any) {
       micStoppedRef.current = true;
       if (micWorkletRef.current) {
         micWorkletRef.current.port.close();
@@ -434,9 +709,12 @@ const ChatInputInner: React.FC<Props> = ({
       micAudioCtxRef.current?.close().catch(() => {});
       micAudioCtxRef.current = null;
       micPrefixRef.current = null;
+      micAttachmentIdRef.current = null;
       setMicActive(false);
+      setMicStatus('error');
+      setMicError(e?.message || '实时语音连接已断开');
     }
-  }, []);
+  }, [applyMicTranscript]);
 
   useEffect(() => {
     const unsub = api.onSttStreamEnd(() => {
@@ -456,6 +734,7 @@ const ChatInputInner: React.FC<Props> = ({
         }
         micStreamRef.current.getTracks().forEach(t => t.stop());
         micAudioCtxRef.current?.close().catch(() => {});
+        void api.sttStreamStop().catch(() => {});
       }
     };
   }, [micReconnect]);
@@ -593,11 +872,12 @@ const ChatInputInner: React.FC<Props> = ({
     el.selectionStart = newCursor;
     el.selectionEnd = newCursor;
     el.focus();
-    el.style.height = 'auto';
-    el.style.height = Math.min(el.scrollHeight, 200) + 'px';
+    saveSessionDraft(el.value);
+    textareaHeightCappedRef.current = false;
+    scheduleTextareaResize(true);
     setShowFilePicker(false);
     setFileQuery('');
-  }, []);
+  }, [saveSessionDraft, scheduleTextareaResize]);
 
   const insertFileRefRef = useRef(insertFileRef);
   insertFileRefRef.current = insertFileRef;
@@ -617,11 +897,12 @@ const ChatInputInner: React.FC<Props> = ({
     el.selectionStart = newCursor;
     el.selectionEnd = newCursor;
     el.focus();
-    el.style.height = 'auto';
-    el.style.height = Math.min(el.scrollHeight, 200) + 'px';
+    saveSessionDraft(el.value);
+    textareaHeightCappedRef.current = false;
+    scheduleTextareaResize(true);
     setShowSessionPicker(false);
     setSessionQuery('');
-  }, []);
+  }, [saveSessionDraft, scheduleTextareaResize]);
   const insertSessionRefRef = useRef(insertSessionRef);
   insertSessionRefRef.current = insertSessionRef;
 
@@ -629,28 +910,41 @@ const ChatInputInner: React.FC<Props> = ({
   const handleSend = useCallback(() => {
     let text = ref.current?.value.trim() || '';
     const imgs = imagesRef.current;
-    if (!text && imgs.length === 0) return;
+    const textFiles = textAttachmentsRef.current;
+    if (!text && imgs.length === 0 && textFiles.length === 0) return;
     // ★ 图像 backend：自动注入 --size 参数
     if (isImageBackendRef.current && imageSizeRef.current && imageSizeRef.current !== '1:1' && text) {
       text = `${text} --size ${imageSizeRef.current}`;
     }
     // ★ 保存到输入历史（Linux 风格 ↑ 追溯）
-    pushHistory(text);
+    if (text) pushHistory(text);
     // 默认序列行为：空闲且没有队列时直接发送；模型忙碌或已有待发项时，
     // 新输入自动排到队尾，不打断当前回答。
     if ((isStreamingRef.current || seqCountRef.current > 0) && onQueueTaskRef.current) {
-      onQueueTaskRef.current(text, imgs.length > 0 ? imgs : undefined);
+      onQueueTaskRef.current(
+        text,
+        imgs.length > 0 ? imgs : undefined,
+        textFiles.length > 0 ? textFiles : undefined,
+      );
     } else {
-      onSendRef.current(text, imgs.length > 0 ? imgs : undefined);
+      onSendRef.current(
+        text,
+        imgs.length > 0 ? imgs : undefined,
+        textFiles.length > 0 ? textFiles : undefined,
+      );
     }
     if (ref.current) {
       ref.current.value = '';
-      ref.current.style.height = 'auto';
+      textareaHeightCappedRef.current = false;
+      scheduleTextareaResize(true);
       ref.current.focus();   // 点击发送按钮后也继续输入，连续任务自然排队
     }
+    if (sessionIdRef.current) sessionInputDrafts.delete(sessionIdRef.current);
+    textAttachmentsRef.current = [];
+    setTextAttachments([]);
     clearImagesRef.current();
     setShowCommands(false);
-  }, []);
+  }, [scheduleTextareaResize]);
 
   // ── 键盘事件 ──
   const handleKeyDown = useCallback(
@@ -760,9 +1054,9 @@ const ChatInputInner: React.FC<Props> = ({
           if (cmd && ref.current) {
             ref.current.value = cmd.name + ' ';
             setShowCommands(false);
-            // 触发 auto-resize
-            ref.current.style.height = 'auto';
-            ref.current.style.height = Math.min(ref.current.scrollHeight, 200) + 'px';
+            saveSessionDraft(ref.current.value);
+            textareaHeightCappedRef.current = false;
+            scheduleTextareaResize(true);
           }
           return;
         }
@@ -854,7 +1148,7 @@ const ChatInputInner: React.FC<Props> = ({
         handleSend();
       }
     },
-    [handleSend]
+    [handleSend, saveSessionDraft, scheduleTextareaResize]
   );
 
   const handleCompositionStart = useCallback(() => {
@@ -864,8 +1158,22 @@ const ChatInputInner: React.FC<Props> = ({
     composingRef.current = false;
   }, []);
 
-  // ── 输入变化：auto-resize + 斜杠命令检测 + @ 文件选择检测 ──
-  const handleInput = useCallback(() => {
+  const handleTextPaste = useCallback((event: React.ClipboardEvent<HTMLTextAreaElement>) => {
+    const clipboard = event.clipboardData;
+    if (!clipboard) return;
+    const hasImage = Array.from(clipboard.items || []).some(
+      (item) => item.type.startsWith('image/'),
+    );
+    if (hasImage) return;
+    const text = clipboard.getData('text/plain');
+    if (text.length < LARGE_PASTE_ATTACHMENT_CHARS) return;
+    event.preventDefault();
+    addTextAttachment(text, 'paste');
+    saveSessionDraft(ref.current?.value ?? '', textAttachmentsRef.current);
+  }, [addTextAttachment, saveSessionDraft]);
+
+  // ── 输入变化：自动附件化 + 合帧 auto-resize + 斜杠/@ 检测 ──
+  const handleInput = useCallback((event: React.FormEvent<HTMLTextAreaElement>) => {
     const el = ref.current;
     if (!el) return;
 
@@ -874,11 +1182,26 @@ const ChatInputInner: React.FC<Props> = ({
       setHistIdx(-1);
     }
 
-    // auto-resize
-    el.style.height = 'auto';
-    el.style.height = Math.min(el.scrollHeight, 200) + 'px';
-
     let text = el.value;
+    if (!composingRef.current && text.length >= LONG_INPUT_ATTACHMENT_CHARS) {
+      addTextAttachment(text, 'input');
+      el.value = '';
+      text = '';
+      saveSessionDraft('', textAttachmentsRef.current);
+      textareaHeightCappedRef.current = false;
+      scheduleTextareaResize(true);
+      sessionLookupVersionRef.current += 1;
+      filePickerLoadVersionRef.current += 1;
+      setShowSessionPicker(false);
+      setShowFilePicker(false);
+      setShowCommands(false);
+      return;
+    }
+    saveSessionDraft(text);
+
+    const inputType = (event.nativeEvent as InputEvent).inputType || '';
+    scheduleTextareaResize(inputType.startsWith('delete'));
+
     let cursor = el.selectionStart ?? text.length;
     let beforeCursor = text.substring(0, cursor);
     const lastAt = beforeCursor.lastIndexOf('@');
@@ -896,6 +1219,7 @@ const ChatInputInner: React.FC<Props> = ({
         el.value = text;
         el.selectionStart = cursor;
         el.selectionEnd = cursor;
+        saveSessionDraft(text);
         beforeCursor = text.substring(0, cursor);
         afterAt = marker;
       }
@@ -968,7 +1292,7 @@ const ChatInputInner: React.FC<Props> = ({
     } else {
       setShowCommands(false);
     }
-  }, []);
+  }, [addTextAttachment, saveSessionDraft, scheduleTextareaResize]);
 
   // ── 点击选择命令 ──
   const handleSelectCommand = useCallback((cmd: SlashCommand) => {
@@ -1186,7 +1510,12 @@ const ChatInputInner: React.FC<Props> = ({
       </div>
 
       <ImagePreview images={images} onRemove={removeImage} />
-
+      <TextAttachmentPreview
+        attachments={textAttachments}
+        onRemove={removeTextAttachment}
+        onRestore={restoreTextAttachment}
+        onUpdate={updateTextAttachment}
+      />
 
       {/* ★ @SESSION: 会话引用选择器弹窗 */}
       {showSessionPicker && (
@@ -1301,11 +1630,12 @@ const ChatInputInner: React.FC<Props> = ({
           className="chat-textarea"
           placeholder={isStreaming || seqCount > 0
             ? `继续输入，Enter 自动排队${seqCount ? ` · 待发 ${seqCount}` : ''}`
-            : '输入消息… 输入 / 查看命令 · @ 引用文件 · Ctrl+V 粘贴图片'}
+            : '输入消息… 长文本会自动收纳为附件 · @ 引用文件 · Ctrl+V 粘贴'}
           onKeyDown={handleKeyDown}
           onCompositionStart={handleCompositionStart}
           onCompositionEnd={handleCompositionEnd}
           onInput={handleInput}
+          onPaste={handleTextPaste}
           style={{ ...textareaStyle, ...(isStreaming ? { opacity: 0.9 } : {}) }}
           rows={1}
         />
@@ -1317,11 +1647,41 @@ const ChatInputInner: React.FC<Props> = ({
         <button
           onClick={toggleMic}
           style={micActive ? micRecordingStyle : micBtnStyle}
-          title={micActive ? '停止语音输入' : '语音输入'}
+          title={micStatus === 'connecting'
+            ? '正在连接实时语音识别…'
+            : micStatus === 'reconnecting'
+              ? '实时语音正在重连…'
+              : micStatus === 'finalizing'
+                ? '正在确认最终转写…'
+                : micActive
+                  ? '停止实时语音输入'
+                  : '实时语音输入'}
+          aria-label={micActive ? '停止实时语音输入' : '开始实时语音输入'}
         >
           🎙️
         </button>
       </div>
+      {(micActive || micError || micNotice) && (
+        <div style={{
+          marginTop: 4,
+          paddingLeft: 4,
+          minHeight: 16,
+          fontSize: 11,
+          color: micError
+            ? '#f85149'
+            : micNotice
+              ? '#d29922'
+              : 'var(--theme-text-muted)',
+        }}>
+          {micError || micNotice || (micStatus === 'connecting'
+            ? '正在连接百炼实时语音…'
+            : micStatus === 'reconnecting'
+              ? '连接中断，正在恢复…'
+              : micStatus === 'finalizing'
+                ? '正在确认最后一句…'
+                : '实时识别中，说话内容会立即写入输入框')}
+        </div>
+      )}
 
       {/* 新会话确认对话框（风格与 Sidebar 删除会话保持一致） */}
       {showNewSessionConfirm && (

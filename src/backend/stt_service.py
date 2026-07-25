@@ -5,11 +5,14 @@ import os
 import sys
 import json
 import asyncio
+import io
 import tempfile
-from dataclasses import dataclass, field, asdict
-from pathlib import Path
+import wave
+from dataclasses import dataclass
 from typing import Optional
 import base64
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
+from uuid import uuid4
 
 import httpx
 
@@ -20,15 +23,40 @@ from . import paths
 #  配置
 # ═══════════════════════════════════════════════════════════════════════════
 
+_DASHSCOPE_COMPAT_MODELS = {"sensevoice-v1", "paraformer-v2", "paraformer-realtime-v2"}
+_FUN_ASR_REALTIME_DEFAULT = "fun-asr-realtime-2026-02-28"
+_FUN_ASR_FLASH_DEFAULT = "fun-asr-flash-2026-06-15"
+_DASHSCOPE_REALTIME_MODELS = {
+    _FUN_ASR_REALTIME_DEFAULT,
+}
+_DASHSCOPE_FLASH_MODELS = {_FUN_ASR_FLASH_DEFAULT}
+_LEGACY_DASHSCOPE_REALTIME_MODELS = {
+    "qwen3-asr-flash-realtime",
+    "qwen3-asr-flash-realtime-2026-02-10",
+    "qwen3-asr-flash-realtime-2025-10-27",
+}
+_DASHSCOPE_ALL_MODELS = (
+    _DASHSCOPE_COMPAT_MODELS
+    | {"fun-asr"}
+    | _DASHSCOPE_REALTIME_MODELS
+    | _DASHSCOPE_FLASH_MODELS
+)
+_DASHSCOPE_REALTIME_DEFAULT = _FUN_ASR_REALTIME_DEFAULT
+
+
 @dataclass
 class SttConfig:
-    mode: str = "api"                    # "local" | "api"
+    mode: str = "api"                    # "local" | "api" | "dashscope"
     language: str = "zh"                 # BCP-47 language code
     local_model: str = "base"            # faster-whisper model: tiny/base/small/medium/large-v3
     api_base_url: str = ""               # OpenAI-compatible base URL
     api_key: str = ""                    # API key
     api_model: str = "whisper-1"         # 模型名
     device_id: str = ""                  # 前端麦克风 deviceId（持久化）
+    workspace_id: str = ""               # 百炼 Workspace ID（可选）
+    vad_silence_ms: int = 400             # 旧 Qwen 配置兼容字段（Fun-ASR 不使用）
+    flash_model: str = _FUN_ASR_FLASH_DEFAULT
+    flash_refine_enabled: bool = True     # ≤5 分钟录音停止后用 Flash 精校
 
     def to_dict(self) -> dict:
         return {
@@ -39,18 +67,42 @@ class SttConfig:
             "apiKey": self.api_key,
             "apiModel": self.api_model,
             "deviceId": self.device_id,
+            "workspaceId": self.workspace_id,
+            "vadSilenceMs": self.vad_silence_ms,
+            "flashModel": self.flash_model,
+            "flashRefineEnabled": self.flash_refine_enabled,
         }
 
     @staticmethod
     def from_dict(d: dict) -> "SttConfig":
+        mode = d.get("mode", "api")
+        api_model = d.get("apiModel", "whisper-1")
+        # DashScope 麦克风链路统一迁移到用户选定的 Fun-ASR 快照版。
+        if mode == "dashscope" and (
+            api_model not in _DASHSCOPE_REALTIME_MODELS
+            or api_model in _LEGACY_DASHSCOPE_REALTIME_MODELS
+        ):
+            api_model = _DASHSCOPE_REALTIME_DEFAULT
+        try:
+            vad_silence_ms = int(d.get("vadSilenceMs", 400))
+        except (TypeError, ValueError):
+            vad_silence_ms = 400
         return SttConfig(
-            mode=d.get("mode", "api"),
+            mode=mode,
             language=d.get("language", "zh"),
             local_model=d.get("localModel", "base"),
             api_base_url=d.get("apiBaseUrl", ""),
             api_key=d.get("apiKey", ""),
-            api_model=d.get("apiModel", "whisper-1"),
+            api_model=api_model,
             device_id=d.get("deviceId", ""),
+            workspace_id=d.get("workspaceId", ""),
+            vad_silence_ms=max(200, min(6000, vad_silence_ms)),
+            flash_model=(
+                d.get("flashModel")
+                if d.get("flashModel") in _DASHSCOPE_FLASH_MODELS
+                else _FUN_ASR_FLASH_DEFAULT
+            ),
+            flash_refine_enabled=bool(d.get("flashRefineEnabled", True)),
         )
 
 
@@ -263,21 +315,16 @@ async def transcribe_api(
 #  DashScope 转写 (阿里云百炼)
 # ═══════════════════════════════════════════════════════════════════════════
 
-_DASHSCOPE_COMPAT_MODELS = {"sensevoice-v1", "paraformer-v2", "paraformer-realtime-v2"}
-_DASHSCOPE_REALTIME_MODELS = {
-    "qwen3-asr-flash-realtime",
-    "qwen3-asr-flash-realtime-2026-02-10",
-    "qwen3-asr-flash-realtime-2025-10-27",
-}
-_DASHSCOPE_ALL_MODELS = _DASHSCOPE_COMPAT_MODELS | {"fun-asr"} | _DASHSCOPE_REALTIME_MODELS
-
-
 async def transcribe_dashscope(
     audio_bytes: bytes,
     language: str = "zh",
     api_base_url: str = "",
     api_key: str = "",
     api_model: str = "sensevoice-v1",
+    workspace_id: str = "",
+    vad_silence_ms: int = 400,
+    flash_model: str = _FUN_ASR_FLASH_DEFAULT,
+    prefer_flash: bool = False,
 ) -> str:
     """调用阿里云 DashScope 语音识别。
 
@@ -288,9 +335,26 @@ async def transcribe_dashscope(
     if not api_key:
         raise ValueError("DashScope 需要配置 apiKey")
 
+    if prefer_flash or api_model in _DASHSCOPE_FLASH_MODELS:
+        return await transcribe_fun_asr_flash(
+            audio_bytes,
+            api_key=api_key,
+            api_model=(
+                api_model if api_model in _DASHSCOPE_FLASH_MODELS
+                else flash_model
+            ),
+            api_base_url=api_base_url,
+            workspace_id=workspace_id,
+        )
+
     if api_model in _DASHSCOPE_REALTIME_MODELS:
         return await transcribe_dashscope_realtime(
-            audio_bytes, language, api_key, api_model,
+            audio_bytes,
+            language,
+            api_key,
+            api_model,
+            api_base_url,
+            workspace_id,
         )
 
     if api_model in _DASHSCOPE_COMPAT_MODELS:
@@ -455,6 +519,141 @@ async def _transcribe_dashscope_native(
 #  DashScope 实时转写 (WebSocket)
 # ═══════════════════════════════════════════════════════════════════════════
 
+def _qwen_event_id() -> str:
+    return f"event_{uuid4().hex}"
+
+
+def _qwen_dashscope_realtime_url(api_base_url: str, model: str) -> str:
+    """把控制台中的 HTTP/WS 地址规范成 Qwen-ASR Realtime 端点。"""
+    raw = (api_base_url or "").strip()
+    if not raw:
+        raw = "wss://dashscope.aliyuncs.com/api-ws/v1/realtime"
+    elif "://" not in raw:
+        raw = f"https://{raw}"
+
+    parsed = urlparse(raw)
+    scheme = {"http": "ws", "https": "wss"}.get(parsed.scheme, parsed.scheme)
+    if scheme not in {"ws", "wss"} or not parsed.netloc:
+        raise ValueError(f"无效的 DashScope 实时端点: {api_base_url}")
+
+    path = (parsed.path or "").rstrip("/")
+    legacy_suffixes = ("/api/v1", "/compatible-mode/v1")
+    if not path or path.endswith(legacy_suffixes):
+        for suffix in legacy_suffixes:
+            if path.endswith(suffix):
+                path = path[:-len(suffix)]
+                break
+        path = f"{path}/api-ws/v1/realtime"
+    elif not path.endswith("/realtime"):
+        path = f"{path}/api-ws/v1/realtime"
+
+    query = dict(parse_qsl(parsed.query, keep_blank_values=True))
+    query["model"] = model
+    return urlunparse((scheme, parsed.netloc, path, "", urlencode(query), ""))
+
+
+def _qwen_dashscope_headers(api_key: str, workspace_id: str = "") -> dict[str, str]:
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "OpenAI-Beta": "realtime=v1",
+    }
+    if workspace_id.strip():
+        headers["X-DashScope-WorkSpace"] = workspace_id.strip()
+    return headers
+
+
+async def _open_qwen_dashscope_realtime(
+    api_key: str,
+    model: str,
+    api_base_url: str = "",
+    workspace_id: str = "",
+):
+    import websockets
+
+    url = _qwen_dashscope_realtime_url(api_base_url, model)
+    return await websockets.connect(
+        url,
+        additional_headers=_qwen_dashscope_headers(api_key, workspace_id),
+        open_timeout=10,
+        close_timeout=5,
+        ping_interval=20,
+        ping_timeout=20,
+        max_size=8 * 1024 * 1024,
+    )
+
+
+async def _configure_qwen_dashscope_realtime(
+    ws,
+    language: str,
+    vad_silence_ms: int = 400,
+) -> None:
+    """发送 session.update，并明确等到服务端确认后才允许音频进入。"""
+    await ws.send(json.dumps({
+        "event_id": _qwen_event_id(),
+        "type": "session.update",
+        "session": {
+            "modalities": ["text"],
+            "input_audio_format": "pcm",
+            "sample_rate": 16000,
+            "input_audio_transcription": {
+                "language": language or "zh",
+            },
+            "turn_detection": {
+                "type": "server_vad",
+                "threshold": 0.0,
+                "prefix_padding_ms": 300,
+                "silence_duration_ms": max(200, min(6000, vad_silence_ms)),
+            },
+        },
+    }))
+
+    # 建连后 session.created 可能先于 session.updated 到达。旧实现看到
+    # session.created 就开始发音频，会导致前几帧按服务端默认格式处理。
+    while True:
+        raw = await asyncio.wait_for(ws.recv(), timeout=10)
+        if isinstance(raw, bytes):
+            continue
+        msg = json.loads(raw)
+        event_type = msg.get("type", "")
+        if event_type == "session.updated":
+            return
+        if event_type == "error":
+            raise RuntimeError(_format_qwen_dashscope_error(msg))
+
+
+def _format_qwen_dashscope_error(message: dict) -> str:
+    error = message.get("error", message)
+    if isinstance(error, dict):
+        code = error.get("code", "")
+        detail = error.get("message", "") or error.get("detail", "")
+        return f"DashScope 实时识别错误{f' [{code}]' if code else ''}: {detail or error}"
+    return f"DashScope 实时识别错误: {error}"
+
+
+def _append_transcript(base: str, incoming: str) -> str:
+    """合并最终句，兼容服务端返回单句或全会话累计文本两种形式。"""
+    base = (base or "").strip()
+    incoming = (incoming or "").strip()
+    if not incoming:
+        return base
+    if not base or incoming.startswith(base):
+        return incoming
+    if base.endswith(incoming):
+        return base
+
+    max_overlap = min(len(base), len(incoming))
+    for size in range(max_overlap, 0, -1):
+        if base[-size:] == incoming[:size]:
+            return base + incoming[size:]
+    separator = (
+        " "
+        if base[-1].isascii() and incoming[0].isascii()
+        and base[-1].isalnum() and incoming[0].isalnum()
+        else ""
+    )
+    return base + separator + incoming
+
+
 def _extract_pcm(audio_bytes: bytes) -> bytes:
     """从 WAV 中提取 PCM 数据；如果非 WAV 则原样返回。"""
     if audio_bytes[:4] == b'RIFF' and audio_bytes[8:12] == b'WAVE':
@@ -469,11 +668,14 @@ def _extract_pcm(audio_bytes: bytes) -> bytes:
     return audio_bytes
 
 
-async def transcribe_dashscope_realtime(
+async def _transcribe_qwen_dashscope_realtime(
     audio_bytes: bytes,
     language: str = "zh",
     api_key: str = "",
     api_model: str = "qwen3-asr-flash-realtime",
+    api_base_url: str = "",
+    workspace_id: str = "",
+    vad_silence_ms: int = 400,
 ) -> str:
     """通过 WebSocket 调用 DashScope 千问实时语音识别。
 
@@ -491,45 +693,16 @@ async def transcribe_dashscope_realtime(
     if not pcm:
         raise ValueError("音频数据为空")
 
-    url = f"wss://dashscope.aliyuncs.com/api-ws/v1/realtime?model={api_model}"
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "OpenAI-Beta": "realtime=v1",
-    }
-
     transcripts: list[str] = []
 
     print(f"[STT] 实时转写: model={api_model}, pcm_size={len(pcm)}",
           file=sys.stderr, flush=True)
 
-    async with websockets.connect(url, additional_headers=headers) as ws:
-        # ① session.update
-        await ws.send(json.dumps({
-            "event_id": "evt_session",
-            "type": "session.update",
-            "session": {
-                "modalities": ["text"],
-                "input_audio_format": "pcm",
-                "sample_rate": 16000,
-                "input_audio_transcription": {
-                    "language": language or "zh",
-                },
-                "turn_detection": {
-                    "type": "server_vad",
-                    "threshold": 0.0,
-                    "silence_duration_ms": 400,
-                },
-            },
-        }))
-
-        # 等待 session 就绪
-        while True:
-            msg = json.loads(await asyncio.wait_for(ws.recv(), timeout=10))
-            t = msg.get("type", "")
-            if t in ("session.created", "session.updated"):
-                break
-            if t == "error":
-                raise RuntimeError(f"DashScope session 错误: {msg}")
+    ws = await _open_qwen_dashscope_realtime(
+        api_key, api_model, api_base_url, workspace_id,
+    )
+    try:
+        await _configure_qwen_dashscope_realtime(ws, language, vad_silence_ms)
 
         # ② 流式发送音频
         CHUNK = 3200  # ~0.1s at 16kHz 16-bit mono
@@ -543,7 +716,7 @@ async def transcribe_dashscope_realtime(
 
         # ③ 结束会话
         await ws.send(json.dumps({
-            "event_id": "evt_finish",
+            "event_id": _qwen_event_id(),
             "type": "session.finish",
         }))
 
@@ -566,9 +739,13 @@ async def transcribe_dashscope_realtime(
                     transcripts.append(final)
                 break
             elif t == "error":
-                raise RuntimeError(f"DashScope 实时转写错误: {msg}")
+                raise RuntimeError(_format_qwen_dashscope_error(msg))
+    finally:
+        await ws.close()
 
-    result = "".join(transcripts).strip()
+    result = ""
+    for transcript in transcripts:
+        result = _append_transcript(result, transcript)
     print(f"[STT] 实时转写完成: {result[:80]}", file=sys.stderr, flush=True)
     return result
 
@@ -584,10 +761,8 @@ def _ws_is_open(ws) -> bool:
         return False
 
 
-class SttRealtimeSession:
-    """管理与 DashScope 实时 ASR 的 WebSocket 长连接，支持流式音频推送和主动轮转。"""
-
-    ROTATE_INTERVAL = 55  # 在超时前主动轮转（秒）
+class _LegacyQwenRealtimeSession:
+    """旧 Qwen-ASR WebSocket 实现，仅保留给历史配置迁移排查。"""
 
     def __init__(
         self,
@@ -596,57 +771,47 @@ class SttRealtimeSession:
         language: str,
         on_text,  # (text: str, is_final: bool) -> None
         on_end=None,  # Optional[() -> None] — 连接意外断开时回调
+        api_base_url: str = "",
+        workspace_id: str = "",
+        vad_silence_ms: int = 400,
     ):
         self._api_key = api_key
         self._model = model
         self._language = language
         self._on_text = on_text
         self._on_end = on_end
+        self._api_base_url = api_base_url
+        self._workspace_id = workspace_id
+        self._vad_silence_ms = vad_silence_ms
         self._ws = None
         self._listener_task: Optional[asyncio.Task] = None
-        self._rotate_task: Optional[asyncio.Task] = None
         self._final_text = ""
+        self._partial_text = ""
+        self._completed_items: set[str] = set()
+        self._last_emitted: tuple[str, bool] = ("", False)
         self._done = asyncio.Event()
         self._stopped_by_user = False
-        self._rotating = False
 
     async def _connect_ws(self):
-        import websockets
-        url = f"wss://dashscope.aliyuncs.com/api-ws/v1/realtime?model={self._model}"
-        headers = {
-            "Authorization": f"Bearer {self._api_key}",
-            "OpenAI-Beta": "realtime=v1",
-        }
-        ws = await websockets.connect(url, additional_headers=headers)
-        await ws.send(json.dumps({
-            "event_id": "evt_session",
-            "type": "session.update",
-            "session": {
-                "modalities": ["text"],
-                "input_audio_format": "pcm",
-                "sample_rate": 16000,
-                "input_audio_transcription": {"language": self._language or "zh"},
-                "turn_detection": {
-                    "type": "server_vad",
-                    "threshold": 0.0,
-                    "silence_duration_ms": 400,
-                },
-            },
-        }))
-        while True:
-            msg = json.loads(await asyncio.wait_for(ws.recv(), timeout=10))
-            t = msg.get("type", "")
-            if t in ("session.created", "session.updated"):
-                break
-            if t == "error":
-                raise RuntimeError(f"DashScope session 错误: {msg}")
+        ws = await _open_qwen_dashscope_realtime(
+            self._api_key,
+            self._model,
+            self._api_base_url,
+            self._workspace_id,
+        )
+        try:
+            await _configure_qwen_dashscope_realtime(
+                ws, self._language, self._vad_silence_ms,
+            )
+        except Exception:
+            await ws.close()
+            raise
         return ws
 
     async def start(self):
         print(f"[STT] 流式会话启动: model={self._model}", file=sys.stderr, flush=True)
         self._ws = await self._connect_ws()
         self._listener_task = asyncio.create_task(self._listen())
-        self._rotate_task = asyncio.create_task(self._auto_rotate())
 
     async def send_audio(self, pcm_chunk: bytes):
         ws = self._ws
@@ -658,17 +823,10 @@ class SttRealtimeSession:
 
     async def stop(self) -> str:
         self._stopped_by_user = True
-        if self._rotate_task:
-            self._rotate_task.cancel()
-            try:
-                await self._rotate_task
-            except (asyncio.CancelledError, Exception):
-                pass
-            self._rotate_task = None
         if self._ws and _ws_is_open(self._ws):
             try:
                 await self._ws.send(json.dumps({
-                    "event_id": "evt_finish",
+                    "event_id": _qwen_event_id(),
                     "type": "session.finish",
                 }))
                 await asyncio.wait_for(self._done.wait(), timeout=15)
@@ -688,45 +846,59 @@ class SttRealtimeSession:
         print(f"[STT] 流式会话结束: {self._final_text[:80]}", file=sys.stderr, flush=True)
         return self._final_text
 
-    async def _auto_rotate(self):
-        """定时主动轮转 WebSocket 连接，避免超时断开。"""
-        try:
-            while True:
-                await asyncio.sleep(self.ROTATE_INTERVAL)
-                if self._stopped_by_user:
-                    break
-                await self._rotate()
-        except asyncio.CancelledError:
-            pass
+    def _emit_text(self, text: str, is_final: bool) -> None:
+        update = (text, is_final)
+        if text and update != self._last_emitted:
+            self._last_emitted = update
+            self._on_text(text, is_final)
 
-    async def _rotate(self):
-        """无缝切换到新 WebSocket 连接。"""
-        self._rotating = True
-        old_ws = self._ws
-        old_listener = self._listener_task
-        try:
-            print("[STT] 主动轮转会话...", file=sys.stderr, flush=True)
-            new_ws = await self._connect_ws()
-            self._ws = new_ws
-            self._done = asyncio.Event()
-            self._listener_task = asyncio.create_task(self._listen())
-            print("[STT] 轮转成功，关闭旧连接", file=sys.stderr, flush=True)
-        except Exception as e:
-            print(f"[STT] 轮转失败, 保持旧连接: {e}", file=sys.stderr, flush=True)
-            self._rotating = False
-            return
-        self._rotating = False
-        if old_ws:
-            try:
-                await old_ws.close()
-            except Exception:
-                pass
-        if old_listener:
-            old_listener.cancel()
-            try:
-                await old_listener
-            except (asyncio.CancelledError, Exception):
-                pass
+    def _handle_event(self, msg: dict) -> bool:
+        """处理一个服务端事件；返回 True 表示会话已结束。"""
+        event_type = msg.get("type", "")
+        if event_type in {
+            "conversation.item.input_audio_transcription.text",
+            "conversation.item.input_audio_transcription.delta",
+        }:
+            if event_type.endswith(".delta"):
+                self._partial_text += str(
+                    msg.get("delta", "") or msg.get("text", "")
+                )
+            else:
+                self._partial_text = (
+                    str(msg.get("text", "")) + str(msg.get("stash", ""))
+                )
+            preview = _append_transcript(self._final_text, self._partial_text)
+            if preview:
+                self._emit_text(preview, False)
+        elif event_type == "conversation.item.input_audio_transcription.completed":
+            item_id = str(
+                msg.get("item_id", "")
+                or (msg.get("item") or {}).get("id", "")
+            )
+            if item_id and item_id in self._completed_items:
+                return False
+            if item_id:
+                self._completed_items.add(item_id)
+            transcript = str(msg.get("transcript", "") or msg.get("text", ""))
+            if transcript:
+                self._final_text = _append_transcript(
+                    self._final_text, transcript,
+                )
+                self._partial_text = ""
+                self._emit_text(self._final_text, True)
+        elif event_type == "session.finished":
+            final = str(msg.get("transcript", ""))
+            if final:
+                self._final_text = _append_transcript(self._final_text, final)
+                self._emit_text(self._final_text, True)
+            self._done.set()
+            return True
+        elif event_type == "error":
+            print(f"[STT] {_format_qwen_dashscope_error(msg)}",
+                  file=sys.stderr, flush=True)
+            self._done.set()
+            return True
+        return False
 
     async def _listen(self):
         ws = self._ws
@@ -735,36 +907,438 @@ class SttRealtimeSession:
                 if isinstance(raw, bytes):
                     continue
                 msg = json.loads(raw)
-                t = msg.get("type", "")
-                if t == "conversation.item.input_audio_transcription.text":
-                    text = msg.get("text", "") + msg.get("stash", "")
-                    if text:
-                        self._on_text(self._final_text + text, False)
-                elif t == "conversation.item.input_audio_transcription.completed":
-                    text = msg.get("transcript", "")
-                    if text:
-                        self._final_text += text
-                        self._on_text(self._final_text, True)
-                elif t == "session.finished":
-                    final = msg.get("transcript", "")
-                    if final:
-                        self._final_text = final
-                    self._done.set()
-                    break
-                elif t == "error":
-                    print(f"[STT] 流式错误: {msg}", file=sys.stderr, flush=True)
-                    self._done.set()
+                if self._handle_event(msg):
                     break
         except asyncio.CancelledError:
             return
         except Exception as e:
             print(f"[STT] 流式监听异常: {e}", file=sys.stderr, flush=True)
             self._done.set()
-        if not self._stopped_by_user and not self._rotating and self._on_end:
+        if not self._stopped_by_user and self._on_end:
             try:
                 self._on_end()
             except Exception:
                 pass
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  用户选定模型：Fun-ASR Realtime + Fun-ASR-Flash
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _dashscope_http_base_url(api_base_url: str = "") -> str:
+    """把控制台/WS 地址规范成 DashScope HTTP ``.../api/v1`` 根地址。"""
+    raw = (api_base_url or "").strip() or "https://dashscope.aliyuncs.com/api/v1"
+    if "://" not in raw:
+        raw = f"https://{raw}"
+    parsed = urlparse(raw)
+    scheme = {"ws": "http", "wss": "https"}.get(parsed.scheme, parsed.scheme)
+    if scheme not in {"http", "https"} or not parsed.netloc:
+        raise ValueError(f"无效的 DashScope 地址: {api_base_url}")
+    path = (parsed.path or "").rstrip("/")
+    api_pos = path.find("/api")
+    prefix = path[:api_pos] if api_pos >= 0 else path
+    return urlunparse((scheme, parsed.netloc, f"{prefix}/api/v1", "", "", ""))
+
+
+def _dashscope_inference_url(api_base_url: str = "") -> str:
+    """Fun-ASR Recognition SDK 使用通用 inference WebSocket，而非 Qwen realtime。"""
+    http_base = urlparse(_dashscope_http_base_url(api_base_url))
+    scheme = "wss" if http_base.scheme == "https" else "ws"
+    prefix = http_base.path.split("/api/", 1)[0]
+    return urlunparse((
+        scheme,
+        http_base.netloc,
+        f"{prefix}/api-ws/v1/inference",
+        "",
+        "",
+        "",
+    ))
+
+
+def _pcm_to_wav_bytes(pcm: bytes) -> bytes:
+    output = io.BytesIO()
+    with wave.open(output, "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(16000)
+        wav.writeframes(pcm)
+    return output.getvalue()
+
+
+def _parse_fun_asr_flash_response(payload: dict) -> str:
+    """Fun-ASR-Flash 返回结构没有 choices，兼容文档列出的两个文本位置。"""
+    output = payload.get("output") or {}
+    if not isinstance(output, dict):
+        return ""
+    text = output.get("text")
+    if isinstance(text, str) and text.strip():
+        return text.strip()
+    nested = output.get("output") or {}
+    sentence = nested.get("sentence") if isinstance(nested, dict) else {}
+    text = sentence.get("text") if isinstance(sentence, dict) else ""
+    return text.strip() if isinstance(text, str) else ""
+
+
+async def transcribe_fun_asr_flash(
+    audio_bytes: bytes,
+    *,
+    api_key: str,
+    api_model: str = _FUN_ASR_FLASH_DEFAULT,
+    api_base_url: str = "",
+    workspace_id: str = "",
+) -> str:
+    """用同步 multimodal-generation 接口精转不超过 5 分钟的 16k PCM/WAV。"""
+    if not api_key:
+        raise ValueError("Fun-ASR-Flash 需要配置 DashScope API Key")
+    if api_model not in _DASHSCOPE_FLASH_MODELS:
+        raise ValueError(f"不支持的 Fun-ASR-Flash 模型: {api_model}")
+
+    pcm = _extract_pcm(audio_bytes)
+    if not pcm:
+        raise ValueError("音频数据为空")
+    duration_seconds = len(pcm) / (16000 * 2)
+    if duration_seconds > 300:
+        raise ValueError("Fun-ASR-Flash 仅支持 5 分钟以内的音频")
+
+    wav_bytes = _pcm_to_wav_bytes(pcm)
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+        tmp.write(wav_bytes)
+        tmp_path = tmp.name
+
+    def _upload() -> str:
+        try:
+            import dashscope
+            from dashscope.utils.oss_utils import OssUtils
+        except ImportError as exc:
+            raise RuntimeError(
+                "Fun-ASR-Flash 需要安装 dashscope: pip install -U dashscope"
+            ) from exc
+        dashscope.api_key = api_key
+        dashscope.base_http_api_url = _dashscope_http_base_url(api_base_url)
+        upload_kwargs = {}
+        if workspace_id.strip():
+            upload_kwargs["headers"] = {
+                "X-DashScope-WorkSpace": workspace_id.strip(),
+            }
+        uploaded = OssUtils.upload(
+            model=api_model,
+            file_path=tmp_path,
+            api_key=api_key,
+            **upload_kwargs,
+        )
+        if isinstance(uploaded, tuple):
+            uploaded = uploaded[0]
+        if not isinstance(uploaded, str) or not uploaded:
+            raise RuntimeError("Fun-ASR-Flash 音频上传失败")
+        return uploaded
+
+    try:
+        file_url = await asyncio.to_thread(_upload)
+        endpoint = (
+            _dashscope_http_base_url(api_base_url)
+            + "/services/aigc/multimodal-generation/generation"
+        )
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "X-DashScope-SSE": "disable",
+        }
+        if file_url.startswith("oss://"):
+            headers["X-DashScope-OssResourceResolve"] = "enable"
+        if workspace_id.strip():
+            headers["X-DashScope-WorkSpace"] = workspace_id.strip()
+        body = {
+            "model": api_model,
+            "input": {
+                "messages": [{
+                    "role": "user",
+                    "content": [{
+                        "type": "input_audio",
+                        "input_audio": {"data": file_url},
+                    }],
+                }],
+            },
+            "parameters": {
+                "format": "wav",
+                "sample_rate": "16000",
+            },
+        }
+        print(
+            f"[STT] Fun-ASR-Flash 精转: model={api_model}, "
+            f"duration={duration_seconds:.1f}s",
+            file=sys.stderr,
+            flush=True,
+        )
+        async with httpx.AsyncClient(timeout=180.0) as client:
+            response = await client.post(endpoint, headers=headers, json=body)
+        if response.status_code != 200:
+            raise RuntimeError(
+                f"Fun-ASR-Flash 返回 {response.status_code}: {response.text[:500]}"
+            )
+        payload = response.json()
+        text = _parse_fun_asr_flash_response(payload)
+        if not text:
+            raise RuntimeError(
+                "Fun-ASR-Flash 响应中没有 output.text 或 "
+                "output.output.sentence.text"
+            )
+        return text
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+
+
+class _FunAsrRecognitionCallback:
+    """DashScope SDK callback；SDK 在线程中回调，统一投递回 asyncio loop。"""
+
+    def __init__(self, session: "FunAsrRealtimeSession"):
+        self._session = session
+
+    def on_open(self) -> None:
+        self._session._post(self._session._sdk_opened)
+
+    def on_event(self, result) -> None:
+        self._session._post(self._session._sdk_event, result)
+
+    def on_complete(self) -> None:
+        self._session._post(self._session._sdk_complete)
+
+    def on_error(self, result) -> None:
+        self._session._post(self._session._sdk_error, result)
+
+    def on_close(self) -> None:
+        self._session._post(self._session._sdk_closed)
+
+
+class FunAsrRealtimeSession:
+    """Fun-ASR Realtime SDK 会话；接收浏览器送来的 16kHz PCM16 单声道帧。"""
+
+    _MAX_FLASH_CAPTURE_BYTES = 5 * 60 * 16000 * 2
+
+    def __init__(
+        self,
+        api_key: str,
+        model: str,
+        language: str,
+        on_text,
+        on_end=None,
+        api_base_url: str = "",
+        workspace_id: str = "",
+        vad_silence_ms: int = 400,
+        capture_audio: bool = False,
+    ):
+        del vad_silence_ms  # 仅兼容旧调用；Fun-ASR Recognition 不使用 Qwen VAD 参数。
+        self._api_key = api_key
+        self._model = model
+        self._language = language
+        self._on_text = on_text
+        self._on_end = on_end
+        self._api_base_url = api_base_url
+        self._workspace_id = workspace_id
+        self._capture_audio = capture_audio
+        self._captured_pcm = bytearray()
+        self._capture_overflow = False
+        self._recognizer = None
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._opened: Optional[asyncio.Event] = None
+        self._done: Optional[asyncio.Event] = None
+        self._stopped_by_user = False
+        self._end_notified = False
+        self._error = ""
+        self._final_text = ""
+        self._partial_text = ""
+        self._last_emitted: tuple[str, bool] = ("", False)
+
+    @property
+    def capture_overflow(self) -> bool:
+        return self._capture_overflow
+
+    def captured_pcm(self) -> bytes:
+        return bytes(self._captured_pcm)
+
+    def _post(self, callback, *args) -> None:
+        loop = self._loop
+        if loop and loop.is_running():
+            loop.call_soon_threadsafe(callback, *args)
+        else:
+            callback(*args)
+
+    def _sdk_opened(self) -> None:
+        if self._opened:
+            self._opened.set()
+
+    def _emit_text(self, text: str, is_final: bool) -> None:
+        update = (text, is_final)
+        if text and update != self._last_emitted:
+            self._last_emitted = update
+            self._on_text(text, is_final)
+
+    def _sdk_event(self, result) -> None:
+        sentence = result.get_sentence() if hasattr(result, "get_sentence") else None
+        if isinstance(sentence, list):
+            sentence = sentence[-1] if sentence else None
+        if not isinstance(sentence, dict):
+            output = getattr(result, "output", None)
+            sentence = output.get("sentence") if isinstance(output, dict) else None
+        if not isinstance(sentence, dict):
+            return
+        text = str(sentence.get("text", "") or "")
+        if not text:
+            return
+        is_final = (
+            sentence.get("end_time") is not None
+            or bool(sentence.get("sentence_end"))
+        )
+        if is_final:
+            self._final_text = _append_transcript(self._final_text, text)
+            self._partial_text = ""
+            self._emit_text(self._final_text, True)
+        else:
+            self._partial_text = text
+            self._emit_text(
+                _append_transcript(self._final_text, self._partial_text),
+                False,
+            )
+
+    def _sdk_complete(self) -> None:
+        if self._done:
+            self._done.set()
+
+    def _notify_end(self) -> None:
+        if self._end_notified or self._stopped_by_user or not self._on_end:
+            return
+        self._end_notified = True
+        self._on_end()
+
+    def _sdk_error(self, result) -> None:
+        code = getattr(result, "code", "") or getattr(result, "status_code", "")
+        message = getattr(result, "message", "") or str(result)
+        self._error = f"Fun-ASR Realtime 错误{f' [{code}]' if code else ''}: {message}"
+        if self._done:
+            self._done.set()
+        self._notify_end()
+
+    def _sdk_closed(self) -> None:
+        if self._done:
+            self._done.set()
+        self._notify_end()
+
+    async def start(self) -> None:
+        if not self._api_key:
+            raise ValueError("Fun-ASR Realtime 需要配置 DashScope API Key")
+        if self._model not in _DASHSCOPE_REALTIME_MODELS:
+            raise ValueError(f"不支持的 Fun-ASR Realtime 模型: {self._model}")
+        try:
+            import dashscope
+            from dashscope.audio.asr import Recognition
+        except ImportError as exc:
+            raise RuntimeError(
+                "Fun-ASR Realtime 需要安装 dashscope: pip install -U dashscope"
+            ) from exc
+
+        self._loop = asyncio.get_running_loop()
+        self._opened = asyncio.Event()
+        self._done = asyncio.Event()
+        dashscope.api_key = self._api_key
+        dashscope.base_websocket_api_url = _dashscope_inference_url(
+            self._api_base_url
+        )
+        kwargs = {"heartbeat": True}
+        if self._language:
+            kwargs["language_hints"] = [self._language]
+        self._recognizer = Recognition(
+            model=self._model,
+            callback=_FunAsrRecognitionCallback(self),
+            format="pcm",
+            sample_rate=16000,
+            workspace=self._workspace_id or None,
+            **kwargs,
+        )
+        print(
+            f"[STT] Fun-ASR Realtime 启动: model={self._model}, "
+            f"endpoint={dashscope.base_websocket_api_url}",
+            file=sys.stderr,
+            flush=True,
+        )
+        await asyncio.to_thread(self._recognizer.start)
+        await asyncio.wait_for(self._opened.wait(), timeout=10)
+        if self._error:
+            raise RuntimeError(self._error)
+
+    async def send_audio(self, pcm_chunk: bytes) -> None:
+        if self._capture_audio and not self._capture_overflow:
+            next_size = len(self._captured_pcm) + len(pcm_chunk)
+            if next_size <= self._MAX_FLASH_CAPTURE_BYTES:
+                self._captured_pcm.extend(pcm_chunk)
+            else:
+                self._captured_pcm.clear()
+                self._capture_overflow = True
+        if self._recognizer is not None:
+            self._recognizer.send_audio_frame(bytes(pcm_chunk))
+
+    async def stop(self) -> str:
+        self._stopped_by_user = True
+        recognizer = self._recognizer
+        self._recognizer = None
+        if recognizer is not None:
+            try:
+                await asyncio.to_thread(recognizer.stop)
+            except Exception as exc:
+                if not self._error:
+                    self._error = str(exc)
+        if self._done and not self._done.is_set():
+            try:
+                await asyncio.wait_for(self._done.wait(), timeout=5)
+            except asyncio.TimeoutError:
+                pass
+        text = self._final_text or self._partial_text
+        if self._error and not text:
+            raise RuntimeError(self._error)
+        print(
+            f"[STT] Fun-ASR Realtime 结束: {text[:80]}",
+            file=sys.stderr,
+            flush=True,
+        )
+        return text
+
+
+# 对外名称保持不变，Bridge 不需要知道底层从 Qwen 协议切到了 Recognition SDK。
+SttRealtimeSession = FunAsrRealtimeSession
+
+
+async def transcribe_dashscope_realtime(
+    audio_bytes: bytes,
+    language: str = "zh",
+    api_key: str = "",
+    api_model: str = _FUN_ASR_REALTIME_DEFAULT,
+    api_base_url: str = "",
+    workspace_id: str = "",
+) -> str:
+    pcm = _extract_pcm(audio_bytes)
+    if not pcm:
+        raise ValueError("音频数据为空")
+    session = FunAsrRealtimeSession(
+        api_key,
+        api_model,
+        language,
+        lambda _text, _final: None,
+        api_base_url=api_base_url,
+        workspace_id=workspace_id,
+    )
+    await session.start()
+    try:
+        for offset in range(0, len(pcm), 3200):
+            await session.send_audio(pcm[offset:offset + 3200])
+            await asyncio.sleep(0.01)
+        return await session.stop()
+    except Exception:
+        try:
+            await session.stop()
+        except Exception:
+            pass
+        raise
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -792,6 +1366,8 @@ async def transcribe(audio_bytes: bytes, config: Optional[SttConfig] = None) -> 
         return await transcribe_dashscope(
             audio_bytes, cfg.language,
             cfg.api_base_url, cfg.api_key, cfg.api_model or "sensevoice-v1",
+            cfg.workspace_id, cfg.vad_silence_ms,
+            cfg.flash_model, cfg.flash_refine_enabled,
         )
     else:
         return await transcribe_api(

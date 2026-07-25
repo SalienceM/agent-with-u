@@ -2,6 +2,7 @@ import { useState, useCallback, useEffect, useRef, startTransition } from 'react
 import { api } from '../api';
 import { uuid } from '../utils/uuid';
 import type { ImageAttachment } from './useClipboardImage';
+import type { TextAttachment } from '../types/attachments';
 import {
   getStreamState,
   resetStreamAccumulators,
@@ -53,6 +54,7 @@ export interface ChatMessage {
   content: string;
   timestamp: number;
   images?: ImageAttachment[];
+  textAttachments?: TextAttachment[];
   backendId?: string;
   usage?: { inputTokens?: number; outputTokens?: number };
   toolCalls?: ToolCall[];
@@ -155,13 +157,37 @@ function mergeLoadedWithLocal(
   current: ChatMessage[],
 ): ChatMessage[] {
   const loadedIds = new Set(loaded.map((message) => message.id));
+  const samePersistedUser = (local: ChatMessage): boolean => {
+    return loaded.some((saved) => {
+      if (saved.role !== 'user') return false;
+      const localText = (local.content || '').trim();
+      const savedText = (saved.content || '').trim();
+      const localImages = (local.images || []).map((image) => image.id).filter(Boolean);
+      const savedImages = (saved.images || []).map((image) => image.id).filter(Boolean);
+      const textMatches = localText
+        ? savedText === localText
+          || savedText.endsWith(`\n\n${localText}`)
+          || savedText.endsWith(`当前用户请求：\n${localText}`)
+        : !savedText || localImages.length > 0;
+      if (!textMatches) return false;
+      if (localImages.length === 0 && savedImages.length === 0) return true;
+      return localImages.length === savedImages.length
+        && localImages.every((id, index) => id === savedImages[index]);
+    });
+  };
   const locals = current.filter((message, index) => {
     if (loadedIds.has(message.id)) return false;
     if (message.role === 'user') {
       const following = current[index + 1];
-      if (following?.role === 'assistant' && loadedIds.has(following.id)) {
+      if (following?.role === 'assistant') {
+        // 后续 assistant 尚未落盘，说明这确实是一轮刚发出的本地消息。
+        if (!loadedIds.has(following.id)) return true;
         return false;
       }
+      // 清理已经被旧合并逻辑挪到数组末尾、失去 assistant 邻接关系的重复
+      // user 气泡。Session 引用/技能图片会在后端给正文加前缀，所以允许
+      // savedText 以本地原文结尾。
+      if (samePersistedUser(message)) return false;
     }
     return true;
   });
@@ -204,6 +230,11 @@ export function useChat(
   // ★ 首次加载 session 是否还在飞:UI 据此显示加载提示,避免「点了 session
   //   但页面没动」的卡顿感。区别于 loadingEarlier(那个是翻页加载更老消息)。
   const [isLoadingSession, setIsLoadingSession] = useState(false);
+  // React 会复用同一个 ChatPane Hook 实例。切换 session 的首个 render 仍
+  // 带着上一个 session 的 state；这两个 ID 用于阻止状态串报，并告诉滚动
+  // 层什么时候已经完成目标 session 的权威历史水合。
+  const [resolvedSessionId, setResolvedSessionId] = useState(sessionId);
+  const [hydratedSessionId, setHydratedSessionId] = useState('');
 
   // 累积器 refs - 用于本地快速访问，实际状态存储在全局 StreamState
   const textRef = useRef('');
@@ -213,7 +244,11 @@ export function useChat(
   const streamStartRef = useRef<number>(0);  // ★ 流式开始时间戳
   const msgIdRef = useRef<string | null>(null);
   // ★ 流式进行时用户发送的新消息（中断续发队列，最多保留最后一条）
-  const pendingMessageRef = useRef<{ content: string; images?: ImageAttachment[] } | null>(null);
+  const pendingMessageRef = useRef<{
+    content: string;
+    images?: ImageAttachment[];
+    textAttachments?: TextAttachment[];
+  } | null>(null);
 
   // 稳定引用 refs
   const isStreamingRef = useRef(false);
@@ -250,6 +285,8 @@ export function useChat(
       setHasMore(false);
       setLoadingEarlier(false);
       setIsLoadingSession(false);
+      setResolvedSessionId('');
+      setHydratedSessionId('');
       return;
     }
 
@@ -257,6 +294,7 @@ export function useChat(
     setHasMore(false);
     setLoadingEarlier(false);
     setIsLoadingSession(true);
+    setHydratedSessionId('');
 
     // ★ 先检查全局流式状态
     const globalState = getStreamState(sessionId);
@@ -316,6 +354,7 @@ export function useChat(
     }
     isStreamingRef.current = hasActiveStream;
     setIsStreaming(hasActiveStream);
+    setResolvedSessionId(sessionId);
     if (hasActiveStream) syncFromGlobalState(globalState);
 
     // ★ 防 race:快速切换时旧 session 的 loadSession Promise 可能比新 session
@@ -324,12 +363,44 @@ export function useChat(
     //   翻成 true,异步回调就直接吐回去。
     let cancelled = false;
 
+    // 每次切入 session 都向它所属执行节点核对权威运行态。接管 Codex 的
+    // turn/start / 模型握手阶段可能很久没有 delta，不能据此误判为空闲。
+    void api.getSessionRunState(sessionId).then((runState) => {
+      if (cancelled || runState.status !== 'ok' || !runState.busy) return;
+      const authoritative = getStreamState(sessionId);
+      authoritative.isStreaming = true;
+      isStreamingRef.current = true;
+      setIsStreaming(true);
+      setResolvedSessionId(sessionId);
+    });
+
     // 有缓存时按缓存大小拉,避免切走→切回把已经翻页加载过的历史又缩回 20 条
     const initialLimit = Math.max(INITIAL_LOAD_LIMIT, cachedHistory?.length ?? 0);
     api.loadSession(sessionId, initialLimit).then((session) => {
       if (cancelled) return;
       if (session?.messages) {
         const loadedMessages = session.messages.map(normalizeMessage);
+        const loadedStreaming = [...loadedMessages].reverse().find(
+          (message: ChatMessage) => message.streaming,
+        );
+        if (loadedStreaming) {
+          const restored = getStreamState(sessionId);
+          // 只有前端没有更完整的活跃累积器时才用后端内存快照恢复。
+          if (!restored.isStreaming || restored.messageId !== loadedStreaming.id) {
+            restored.messageId = loadedStreaming.id;
+            restored.text = loadedStreaming.content || '';
+            restored.thinking = loadedStreaming.thinking || '';
+            restored.toolCalls = loadedStreaming.toolCalls ? [...loadedStreaming.toolCalls] : [];
+            restored.contentBlocks = loadedStreaming.contentBlocks ? [...loadedStreaming.contentBlocks] : [];
+            restored.streamStart = loadedStreaming.timestamp
+              ? loadedStreaming.timestamp * 1000
+              : Date.now();
+          }
+          restored.isStreaming = true;
+          isStreamingRef.current = true;
+          setIsStreaming(true);
+          setResolvedSessionId(sessionId);
+        }
         const total = typeof session.messagesTotal === 'number'
           ? session.messagesTotal
           : loadedMessages.length;
@@ -384,7 +455,10 @@ export function useChat(
         setAutoContinue(session.autoContinue);
       }
     }).finally(() => {
-      if (!cancelled) setIsLoadingSession(false);
+      if (!cancelled) {
+        setHydratedSessionId(sessionId);
+        setIsLoadingSession(false);
+      }
     });
 
     // ⚠ 不要在 cleanup 里清流式状态。
@@ -717,14 +791,18 @@ export function useChat(
     // 用 setTimeout(0) 确保在当前 React 批次渲染完成后再发，避免和 done 处理竞争
     setTimeout(() => {
       if (!isStreamingRef.current) {
-        doSendRef.current(pending.content, pending.images);
+        doSendRef.current(pending.content, pending.images, pending.textAttachments);
       }
     }, 0);
   }, [isStreaming]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // ── 核心发送逻辑（不含斜杠命令判断） ──
   const doSend = useCallback(
-    (content: string, images?: ImageAttachment[]) => {
+    (
+      content: string,
+      images?: ImageAttachment[],
+      textAttachments?: TextAttachment[],
+    ) => {
       if (isStreamingRef.current) return;
 
       const userMsg: ChatMessage = {
@@ -732,6 +810,7 @@ export function useChat(
         role: 'user',
         content,
         images,
+        textAttachments,
         timestamp: Date.now() / 1000,
       };
       const assistantId = uuid();
@@ -765,6 +844,7 @@ export function useChat(
         sessionId,
         content,
         images,
+        textAttachments,
         backendId,
         userMessageId: userMsg.id,
         messageId: assistantId,
@@ -1080,24 +1160,32 @@ export function useChat(
 
   // ── 公开的 sendMessage（含斜杠命令拦截）──
   const sendMessage = useCallback(
-    async (content: string, images?: ImageAttachment[]) => {
-      if (!content.trim() && (!images || images.length === 0)) return;
+    async (
+      content: string,
+      images?: ImageAttachment[],
+      textAttachments?: TextAttachment[],
+    ) => {
+      if (
+        !content.trim()
+        && (!images || images.length === 0)
+        && (!textAttachments || textAttachments.length === 0)
+      ) return;
 
       if (isStreamingRef.current) {
         // ★ 流式进行中：斜杠命令不中断，普通消息入队并中止当前响应
-        if (content.trim().startsWith('/')) return;
-        pendingMessageRef.current = { content, images };
+        if (content.trim().startsWith('/') && !textAttachments?.length) return;
+        pendingMessageRef.current = { content, images, textAttachments };
         api.abortMessage(sessionId);
         return;
       }
 
       // ★ 斜杠命令拦截
-      if (content.trim().startsWith('/')) {
+      if (content.trim().startsWith('/') && !textAttachments?.length) {
         await handleCommand(content);
         return;
       }
 
-      doSend(content, images);
+      doSend(content, images, textAttachments);
     },
     [doSend, handleCommand, sessionId]
   );
@@ -1161,6 +1249,8 @@ export function useChat(
     // 历史分页
     messagesTotal, hasMore, loadingEarlier, loadEarlier,
     isLoadingSession,
+    resolvedSessionId,
+    hydratedSessionId,
     // ★ 序列任务直接派发用：跳过斜杠命令拦截，仅在非流式时发送（doSend 自带 isStreaming 守卫）
     doSend,
   };

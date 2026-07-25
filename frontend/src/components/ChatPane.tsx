@@ -12,6 +12,7 @@ import type { AppConfig } from '../hooks/useConfig';
 import { HACKER_CAPTURE_EVENT } from '../utils/hackerMode';
 import type { SmoothGhostState } from '../utils/smoothGhost';
 import { normalizeModelRuntime, type ModelRuntime } from './CodexRuntimeFields';
+import type { TextAttachment } from '../types/attachments';
 
 // 注入「等待气泡」用的脉冲点动画(一次性)。请求发出后到首个 delta 之间,
 // 旧版只靠底部「生成中」chip,聊天区空白让人怀疑后端是不是没收到;这里
@@ -220,9 +221,9 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
 
   // ── 向 App 上报流式状态,用于侧边栏指示灯 ──
   useEffect(() => {
-    if (!sessionId) return;
+    if (!sessionId || chat.resolvedSessionId !== sessionId) return;
     onStreamingChange?.(sessionId, chat.isStreaming);
-  }, [sessionId, chat.isStreaming, onStreamingChange]);
+  }, [sessionId, chat.isStreaming, chat.resolvedSessionId, onStreamingChange]);
 
   // ── 序列任务队列 + by-the-way（普通 session 侧挂状态）──
   const [seqTasks, setSeqTasks] = useState<SeqTaskT[]>([]);
@@ -307,17 +308,20 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
       const r = await api.seqtaskTakeNext(sessionId);
       if (r.status === 'ok' && r.task) {
         const imgs = r.task.images && r.task.images.length ? r.task.images : undefined;
+        const textAttachments = r.task.textAttachments && r.task.textAttachments.length
+          ? r.task.textAttachments
+          : undefined;
         const text = r.task.text || '';
         // 以 / 开头的条目当作斜杠命令处理（/compact、/clear 等可排进队列）；
         // 其余走原始发送，绕过命令拦截。
         // ★ 通过 ref 调用，始终拿到最新的函数引用，不受闭包陈旧影响
-        if (text.trim().startsWith('/')) {
-          await sendMessageRef.current(text, imgs);
+        if (text.trim().startsWith('/') && !textAttachments?.length) {
+          await sendMessageRef.current(text, imgs, textAttachments);
         } else {
           // React state 要到下一次 render 才会回写这个 ref；先同步占位，封住
           // seqtaskUpdated 与 setIsStreaming(true) 之间的同帧二次派发窗口。
           isStreamingRef.current = true;
-          doSendRef.current(text, imgs);
+          doSendRef.current(text, imgs, textAttachments);
         }
       } else if (seqPendingRef.current) {
         // done 帧会略早于后端任务清理/落盘；Relay 断线时 RPC 也可能暂不可用。
@@ -339,18 +343,31 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
   dispatchNextRef.current = dispatchNext;
 
   // 空闲时的第一条输入直接发送。
-  const handleUserSend = useCallback((content: string, images?: any[]) => {
-    return sendMessageRef.current(content, images);
+  const handleUserSend = useCallback((
+    content: string,
+    images?: any[],
+    textAttachments?: TextAttachment[],
+  ) => {
+    return sendMessageRef.current(content, images, textAttachments);
   }, []); // ★ 通过 ref 调用，无需依赖 chat
 
   // 模型忙碌时 ChatInput 会把后续输入送到这里；无需显式开启模式。
-  const handleQueueTask = useCallback((content: string, images?: any[]) => {
+  const handleQueueTask = useCallback((
+    content: string,
+    images?: any[],
+    textAttachments?: TextAttachment[],
+  ) => {
     if (!sessionId) return;
     const text = (content || '').trim();
-    if (!text && !(images && images.length)) return;
+    if (!text && !(images && images.length) && !textAttachments?.length) return;
     seqChainSessionRef.current = sessionId;
     setChain(true);
-    api.seqtaskAdd(sessionId, text, images && images.length ? images : undefined);
+    api.seqtaskAdd(
+      sessionId,
+      text,
+      images && images.length ? images : undefined,
+      textAttachments?.length ? textAttachments : undefined,
+    );
   }, [sessionId, setChain]);
 
   // 当前回答结束后自动取队首；dispatchNext 使用稳定 ref，并由 dispatchingRef
@@ -450,11 +467,12 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
       autoScrollRef.current = true;
       setShowScrollBtn(false);
     }
-    if (!autoScrollRef.current) return;
+    const awaitingHydration = chat.hydratedSessionId !== sessionId;
+    if (!autoScrollRef.current && !awaitingHydration) return;
     const container = scrollContainerRef.current;
     if (container) container.scrollTop = container.scrollHeight;
     else endRef.current?.scrollIntoView({ behavior: 'auto', block: 'end' });
-  }, [chat.messages, sessionId]);
+  }, [chat.messages, chat.hydratedSessionId, sessionId]);
 
   // ── 新交互开始时重置跟踪 ──
   useEffect(() => {
