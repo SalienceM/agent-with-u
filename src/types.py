@@ -207,6 +207,13 @@ class Session:
     # native Codex thread. This is independent from the execution transport:
     # an SSH session may be both remote and attached.
     codex_thread_attached: bool = False
+    # Native Codex mirror cursor. ``codex_sync_last_item_id`` points at the
+    # newest user/agent item already reconciled from thread/read, while
+    # ``codex_sync_local_count`` separates later AgentWithU-local bubbles that
+    # still need to be matched against native items.  They make repeated syncs
+    # incremental without changing the native Codex thread itself.
+    codex_sync_last_item_id: Optional[str] = None
+    codex_sync_local_count: int = 0
     # Auto-continue on max_tokens
     auto_continue: bool = True
     # ★ Skip permission confirmation for sensitive tools (Bash/Edit/Write)
@@ -245,6 +252,8 @@ class Session:
             "codexConnectionMode": self.codex_connection_mode,
             "codexRemoteHost": self.codex_remote_host,
             "codexThreadAttached": self.codex_thread_attached,
+            "codexSyncLastItemId": self.codex_sync_last_item_id,
+            "codexSyncLocalCount": self.codex_sync_local_count,
             "autoContinue": self.auto_continue,
             "skipPermissions": self.skip_permissions,
             "sandboxEnabled": self.sandbox_enabled,

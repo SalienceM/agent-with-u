@@ -496,6 +496,25 @@ export function useChat(
         setMessages([]);
         isStreamingRef.current = false;
         setIsStreaming(false);
+      } else if (data.type === 'codex_thread_synced' && !isStreamingRef.current) {
+        // Native Codex may have continued this attached thread in another
+        // client.  Reload only the already-visible window (at least the normal
+        // first page), not the entire potentially multi-megabyte transcript.
+        const visibleFinalized = messagesRef.current.filter((message) => !message.streaming);
+        const session = await api.loadSession(
+          sessionId,
+          Math.max(INITIAL_LOAD_LIMIT, visibleFinalized.length),
+        );
+        if (session?.messages) {
+          const loaded = session.messages.map(normalizeMessage);
+          const total = typeof session.messagesTotal === 'number'
+            ? session.messagesTotal
+            : loaded.length;
+          setMessagesTotal(total);
+          setHasMore(!!session.hasMore || loaded.length < total);
+          sessionHistoryCache.set(sessionId, loaded);
+          setMessages((prev) => mergeLoadedWithLocal(loaded, prev));
+        }
       }
     });
   }, [sessionId]);

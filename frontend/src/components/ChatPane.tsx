@@ -226,6 +226,63 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
     onStreamingChange?.(sessionId, chat.isStreaming);
   }, [sessionId, chat.isStreaming, chat.resolvedSessionId, onStreamingChange]);
 
+  // Attached Codex sessions are shared native threads, not static imports.
+  // Only the focused, idle pane checks them.  The backend turns the frequent
+  // local case into one cheap mtime/size stat and starts app-server only after
+  // the rollout changed; SSH checks are throttled much more aggressively.
+  useEffect(() => {
+    if (
+      !sessionId
+      || !isFocused
+      || activeSession?.codexThreadAttached !== true
+      || chat.isStreaming
+    ) return;
+
+    let cancelled = false;
+    let checking = false;
+    let retryTimer: number | null = null;
+    const check = async () => {
+      if (cancelled || checking || document.visibilityState === 'hidden') return;
+      checking = true;
+      try {
+        const result = await api.syncAttachedCodexSession(sessionId);
+        if (
+          !cancelled
+          && result.status !== 'error'
+          && result.retryAfterMs
+          && retryTimer === null
+        ) {
+          retryTimer = window.setTimeout(() => {
+            retryTimer = null;
+            void check();
+          }, Math.max(500, Math.min(result.retryAfterMs || 0, 30_000)));
+        }
+      } finally {
+        checking = false;
+      }
+    };
+    const onFocus = () => { void check(); };
+    const onVisibility = () => {
+      if (document.visibilityState === 'visible') void check();
+    };
+    void check();
+    const interval = window.setInterval(() => { void check(); }, 10_000);
+    window.addEventListener('focus', onFocus);
+    document.addEventListener('visibilitychange', onVisibility);
+    return () => {
+      cancelled = true;
+      window.clearInterval(interval);
+      if (retryTimer !== null) window.clearTimeout(retryTimer);
+      window.removeEventListener('focus', onFocus);
+      document.removeEventListener('visibilitychange', onVisibility);
+    };
+  }, [
+    sessionId,
+    isFocused,
+    activeSession?.codexThreadAttached,
+    chat.isStreaming,
+  ]);
+
   // ── 序列任务队列 + by-the-way（普通 session 侧挂状态）──
   const [seqTasks, setSeqTasks] = useState<SeqTaskT[]>([]);
   const [byTheWayOpen, setByTheWayOpen] = useState(false);

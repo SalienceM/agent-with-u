@@ -69,6 +69,33 @@ def _is_retrying_transport_error(text: str) -> bool:
     )
 
 
+def _unavailable_dynamic_tool_response(params: dict) -> tuple[str, dict]:
+    """Build a protocol-valid, recoverable result for a host-owned tool.
+
+    Threads taken over from Codex Desktop/VS Code can retain dynamic tools that
+    belonged to the original client.  AgentWithU must not execute those calls
+    blindly on another executor, but returning JSON-RPC ``method not found``
+    aborts the whole turn.  A normal failed tool result lets Codex choose an
+    executor-local shell/MCP/skill fallback instead.
+    """
+    tool = "dynamic_tool"
+    raw_tool = str(params.get("tool") or "").strip()
+    if raw_tool:
+        tool = " ".join(raw_tool.split())[:160]
+    raw_namespace = str(params.get("namespace") or "").strip()
+    namespace = " ".join(raw_namespace.split())[:120] if raw_namespace else ""
+    label = f"{namespace}.{tool}" if namespace else tool
+    message = (
+        f'AgentWithU 当前接管宿主无法执行原客户端动态工具“{label}”。'
+        "本次调用未执行；请不要重试同一宿主工具，改用当前执行节点可用的 "
+        "shell、MCP 或 skill，或说明缺少该能力。"
+    )
+    return label, {
+        "success": False,
+        "contentItems": [{"type": "inputText", "text": message}],
+    }
+
+
 def _is_windows_store_codex(path: str) -> bool:
     """Return whether *path* points into the protected Codex app package."""
     if sys.platform != "win32" or not path:
@@ -613,6 +640,18 @@ class CodexOfficeBackend(ModelBackend):
 
                 # app-server can ask the client to approve commands or patches.
                 if "id" in msg and method:
+                    if method == "item/tool/call":
+                        tool_label, response = _unavailable_dynamic_tool_response(params)
+                        await conn.respond(msg.get("id"), result=response)
+                        print(
+                            "[CodexOffice][app-server] unavailable host dynamic tool "
+                            f"returned as recoverable failure: transport="
+                            f"{'ssh:' + remote_host if remote_host else 'executor-local'}, "
+                            f"tool={tool_label!r}, call_id={params.get('callId')!r}",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                        continue
                     if "requestApproval" not in method:
                         await conn.respond(msg.get("id"), error={
                             "code": -32601,

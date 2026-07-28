@@ -80,6 +80,24 @@ class SessionRuntimeTests(unittest.TestCase):
         self.assertEqual(codex_kwargs["model_override"], "gpt-next")
         self.assertEqual(codex_kwargs["reasoning_effort"], "high")
 
+    def test_qwen_inside_codex_attached_session_never_gets_codex_transport_kwargs(self):
+        qwen = QwenCodeSdkBackend(self._config(BackendType.QWEN_CODE_CLI))
+        attached = Session(
+            id="attached", title="attached", created_at=1, updated_at=1,
+            messages=[], working_dir=".", backend_id="codex",
+            codex_connection_mode="node", codex_remote_host="devbox",
+            codex_thread_attached=True,
+        )
+        kwargs = {}
+
+        BridgeWS._add_runtime_kwargs(
+            qwen, kwargs, {"model": "qwen-next"}, attached,
+        )
+
+        self.assertEqual(kwargs, {"model_override": "qwen-next"})
+        self.assertNotIn("app_server_local", kwargs)
+        self.assertNotIn("remote_host", kwargs)
+
 
 if __name__ == "__main__":
     unittest.main()

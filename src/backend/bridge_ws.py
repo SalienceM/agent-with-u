@@ -44,7 +44,8 @@ from .backends import (
 )
 from .codex_app_server import (
     list_ssh_hosts, list_remote_threads, read_remote_thread,
-    list_local_threads, read_local_thread, validate_ssh_host,
+    list_local_threads, read_local_thread, local_thread_change_token,
+    validate_ssh_host,
 )
 from .codex_office import resolve_codex_cli
 from .instance_manager import InstanceManager
@@ -549,6 +550,112 @@ def compress_messages(messages: list[ChatMessage], keep_recent: int = 6) -> str:
 
 # ════════════════════════════════════════════════════════════════
 
+def _codex_visible_messages(
+    thread: dict,
+    *,
+    max_messages: int = 200,
+    max_chars: int = 4_000_000,
+) -> tuple[list[ChatMessage], Optional[str], bool]:
+    """Normalize a native Codex thread into the bounded visible chat mirror.
+
+    Only terminal turns are mirrored. An external Codex client may still be
+    writing an agent item while we inspect its rollout; waiting for completion
+    prevents the cursor from advancing over partial text.
+    """
+    try:
+        stamp = float(thread.get("createdAt") or time.time())
+        if stamp > 100_000_000_000:
+            stamp /= 1000.0
+    except (TypeError, ValueError):
+        stamp = time.time()
+
+    normalized: list[ChatMessage] = []
+    latest_item_id: Optional[str] = None
+    terminal_statuses = {
+        "", "completed", "failed", "interrupted", "cancelled", "canceled",
+    }
+    for turn in thread.get("turns") or []:
+        if not isinstance(turn, dict):
+            continue
+        turn_status = str(turn.get("status") or "").strip().lower()
+        if turn_status not in terminal_statuses:
+            continue
+        for item in turn.get("items") or []:
+            if not isinstance(item, dict):
+                continue
+            item_type = str(item.get("type") or "")
+            role = ""
+            text = ""
+            if item_type == "userMessage":
+                role = "user"
+                chunks: list[str] = []
+                content = item.get("content") or []
+                if isinstance(content, str):
+                    chunks.append(content)
+                else:
+                    for part in content:
+                        if isinstance(part, dict) and part.get("type") == "text":
+                            chunks.append(str(part.get("text") or ""))
+                        elif isinstance(part, dict) and part.get("type") in {"image", "localImage"}:
+                            chunks.append("[图片]")
+                text = "\n".join(part for part in chunks if part)
+            elif item_type == "agentMessage":
+                role, text = "assistant", str(item.get("text") or "")
+            if not role or not text:
+                continue
+            item_id = str(item.get("id") or new_id())
+            normalized.append(ChatMessage(
+                id=item_id,
+                role=role,
+                content=text,
+                timestamp=stamp,
+            ))
+            latest_item_id = item_id
+            stamp += 0.001
+
+    original_count = len(normalized)
+    remaining_chars = max(1, int(max_chars))
+    visible_reversed: list[ChatMessage] = []
+    truncated = False
+    for message in reversed(normalized):
+        if len(visible_reversed) >= max(1, int(max_messages)) or remaining_chars <= 0:
+            truncated = True
+            break
+        if len(message.content) > remaining_chars:
+            message.content = "[较早内容已省略]\n" + message.content[-remaining_chars:]
+            truncated = True
+        remaining_chars -= len(message.content)
+        visible_reversed.append(message)
+    visible = list(reversed(visible_reversed))
+    return visible, latest_item_id, truncated or len(visible) < original_count
+
+
+def _codex_message_equivalent(native: ChatMessage, local: ChatMessage) -> bool:
+    """Content identity used to retain richer AgentWithU bubbles on sync."""
+    if native.role != local.role:
+        return False
+    native_text = (native.content or "").replace("\r\n", "\n").strip()
+    local_text = (local.content or "").replace("\r\n", "\n").strip()
+    if native_text == local_text:
+        return True
+    if native.role != "user":
+        return False
+    if local.images:
+        without_image_markers = "\n".join(
+            line for line in native_text.splitlines() if line.strip() != "[图片]"
+        ).strip()
+        if without_image_markers == local_text:
+            return True
+    if (
+        local.text_attachments
+        and local_text
+        and native_text.startswith(local_text)
+        and "<text_attachment " in native_text[len(local_text):]
+    ):
+        return True
+    return False
+
+
 class BridgeWS:
     """WebSocket bridge，业务逻辑与 Bridge（Qt）完全相同，去掉 Qt 依赖。"""
 
@@ -585,6 +692,12 @@ class BridgeWS:
         # 一个 session 理论上只有一个任务；这里仍用 set 兜住历史竞态，直到所有
         # 已启动任务真正退出前都保持 busy。
         self._chat_turn_tasks: dict[str, set[asyncio.Task]] = {}
+        # Attached native Codex thread synchronization.  The frontend may have
+        # several panes/clients asking at once; coalesce them per session and
+        # retain only tiny change tokens between checks.
+        self._codex_sync_tasks: dict[str, asyncio.Task] = {}
+        self._codex_sync_checked_at: dict[str, float] = {}
+        self._codex_sync_change_tokens: dict[str, tuple[int, int]] = {}
         # seqtaskTakeNext 与随后的 sendMessage 是两次 RPC。短暂保留一个领取租约，
         # 防止两个 UI 客户端在 sendMessage 到达前同时取走两条队列任务。
         self._seq_dispatch_reservations: dict[str, float] = {}
@@ -2287,6 +2400,7 @@ class BridgeWS:
         else:
             resolved_dir = self._resolve_working_dir(working_dir)
         imported_messages: list[ChatMessage] = []
+        codex_sync_last_item_id: Optional[str] = None
         if connection_mode in {"node", "ssh"} and remote_thread_id:
             if connection_mode == "ssh":
                 command = cfg.get_env("AGENTWITHU_CODEX_REMOTE_COMMAND") or "codex app-server --listen stdio://"
@@ -2299,54 +2413,14 @@ class BridgeWS:
                 )
             remote_title = remote_title or str(remote_thread.get("name") or remote_thread.get("preview") or "Codex Remote")
             resolved_dir = str(remote_thread.get("cwd") or resolved_dir)
-            stamp = float(remote_thread.get("createdAt") or time.time())
-            for turn in remote_thread.get("turns") or []:
-                if not isinstance(turn, dict):
-                    continue
-                for item in turn.get("items") or []:
-                    if not isinstance(item, dict):
-                        continue
-                    typ = str(item.get("type") or "")
-                    text = ""
-                    role = ""
-                    if typ == "userMessage":
-                        role = "user"
-                        chunks = []
-                        for part in item.get("content") or []:
-                            if isinstance(part, dict) and part.get("type") == "text":
-                                chunks.append(str(part.get("text") or ""))
-                            elif isinstance(part, dict) and part.get("type") in {"image", "localImage"}:
-                                chunks.append("[图片]")
-                        text = "\n".join(part for part in chunks if part)
-                    elif typ == "agentMessage":
-                        role, text = "assistant", str(item.get("text") or "")
-                    if role and text:
-                        imported_messages.append(ChatMessage(
-                            id=str(item.get("id") or new_id()), role=role,
-                            content=text, timestamp=stamp,
-                        ))
-                        stamp += 0.001
+            imported_messages, codex_sync_last_item_id, history_truncated = (
+                _codex_visible_messages(remote_thread)
+            )
             # thread/read 是完整原生上下文，但 createSession 还要经 WS/Relay 返回。
-            # 只镜像最近的可见历史；Codex 原生 thread 本身没有被裁剪，后续 resume
-            # 仍拥有完整上下文。限制字符而不只限制条数，防止单条超长输出撑爆 WS。
-            original_count = len(imported_messages)
-            max_visible_messages = 200
-            remaining_chars = 4_000_000
-            visible_reversed: list[ChatMessage] = []
-            history_truncated = False
-            for message in reversed(imported_messages):
-                if len(visible_reversed) >= max_visible_messages or remaining_chars <= 0:
-                    history_truncated = True
-                    break
-                if len(message.content) > remaining_chars:
-                    message.content = "[较早内容已省略]\n" + message.content[-remaining_chars:]
-                    history_truncated = True
-                remaining_chars -= len(message.content)
-                visible_reversed.append(message)
-            imported_messages = list(reversed(visible_reversed))
-            if history_truncated or len(imported_messages) < original_count:
+            # 只镜像最近的可见历史；Codex 原生 thread 本身没有被裁剪。
+            if history_truncated:
                 imported_messages.insert(0, ChatMessage(
-                    id=new_id(), role="assistant",
+                    id=f"codex-truncated:{remote_thread_id}", role="assistant",
                     content=(
                         "ℹ️ AgentWithU 仅镜像了该 Codex thread 最近的可见历史，"
                         "以保证 Relay 和界面稳定；Codex 原生上下文仍完整保留。"
@@ -2364,6 +2438,8 @@ class BridgeWS:
             codex_connection_mode=connection_mode or None,
             codex_remote_host=codex_remote_host,
             codex_thread_attached=bool(remote_thread_id),
+            codex_sync_last_item_id=codex_sync_last_item_id,
+            codex_sync_local_count=len(imported_messages),
             session_type="loop" if is_loop else "normal",
         )
         # ★ loop 会话：建会话时即落一个 stage 文件（起始阶段 loopidea）
@@ -2436,6 +2512,197 @@ class BridgeWS:
             "total": total,
         }, ensure_ascii=False)
 
+    async def _rpc_syncAttachedCodexSession(self, sid: str, force: bool = False) -> str:
+        """Reconcile outside native-Codex turns into an attached Session.
+
+        Multiple panes and browser clients can request a check simultaneously;
+        they await one shared per-session task.  The local fast path checks the
+        rollout file token before it starts Codex app-server.
+        """
+        tasks = getattr(self, "_codex_sync_tasks", None)
+        if tasks is None:
+            tasks = {}
+            self._codex_sync_tasks = tasks
+        current = tasks.get(sid)
+        if current is not None and not current.done():
+            result = await asyncio.shield(current)
+            return json.dumps(result, ensure_ascii=False)
+
+        task = asyncio.create_task(
+            self._sync_attached_codex_session(sid, bool(force)),
+            name=f"codex-sync:{sid}",
+        )
+        tasks[sid] = task
+        try:
+            result = await asyncio.shield(task)
+            return json.dumps(result, ensure_ascii=False)
+        finally:
+            if tasks.get(sid) is task:
+                tasks.pop(sid, None)
+
+    async def _sync_attached_codex_session(self, sid: str, force: bool = False) -> dict:
+        session = self._active_sessions.get(sid) or self._session_store.load(sid)
+        if not session:
+            return {"status": "error", "message": "Session not found"}
+        self._active_sessions[sid] = session
+        if not session.codex_thread_attached or not session.agent_session_id:
+            return {"status": "ignored", "changed": False, "reason": "not_attached"}
+        if self._active_chat_turn_tasks(sid):
+            return {
+                "status": "busy", "changed": False, "retryAfterMs": 2500,
+            }
+
+        mode = (session.codex_connection_mode or "").strip().lower()
+        if mode not in {"node", "ssh"}:
+            return {"status": "ignored", "changed": False, "reason": "unsupported_transport"}
+
+        now = time.monotonic()
+        checked_at = getattr(self, "_codex_sync_checked_at", None)
+        if checked_at is None:
+            checked_at = {}
+            self._codex_sync_checked_at = checked_at
+        # Collapse duplicate focus/visibility/pane requests before even doing
+        # the cheap stat. SSH has no local token, so keep its floor much wider.
+        min_interval = 1.5 if mode == "node" else 30.0
+        elapsed = now - checked_at.get(sid, 0.0)
+        if not force and elapsed < min_interval:
+            return {
+                "status": "ok", "changed": False, "throttled": True,
+                "retryAfterMs": int((min_interval - elapsed) * 1000) + 1,
+            }
+        checked_at[sid] = now
+
+        change_token: Optional[tuple[int, int]] = None
+        tokens = getattr(self, "_codex_sync_change_tokens", None)
+        if tokens is None:
+            tokens = {}
+            self._codex_sync_change_tokens = tokens
+        if mode == "node":
+            change_token = await asyncio.to_thread(
+                local_thread_change_token, session.agent_session_id,
+            )
+            if not force and change_token is not None:
+                if tokens.get(sid) == change_token:
+                    return {"status": "ok", "changed": False, "sourceUnchanged": True}
+                # Let an actively-written rollout settle.  This avoids launching
+                # app-server repeatedly for partial deltas and means the mirror
+                # only observes stable, terminal turns.
+                age_ns = time.time_ns() - change_token[0]
+                if 0 <= age_ns < 1_500_000_000:
+                    return {
+                        "status": "ok", "changed": False, "deferred": True,
+                        "retryAfterMs": 1600,
+                    }
+
+        try:
+            cfg = next(
+                (item for item in self._backend_configs if item.id == session.backend_id),
+                None,
+            )
+            if not cfg or cfg.type != BackendType.CODEX_OFFICIAL:
+                return {"status": "error", "message": "Session backend is not Codex Office"}
+            if mode == "ssh":
+                command = (
+                    cfg.get_env("AGENTWITHU_CODEX_REMOTE_COMMAND")
+                    or "codex app-server --listen stdio://"
+                )
+                thread = await read_remote_thread(
+                    session.codex_remote_host or "",
+                    session.agent_session_id,
+                    command,
+                )
+            else:
+                backend = self._get_backend(session.backend_id)
+                assert isinstance(backend, CodexOfficeBackend)
+                thread = await read_local_thread(
+                    resolve_codex_cli(cfg.cli_path),
+                    session.agent_session_id,
+                    backend._build_env(),
+                )
+        except Exception as exc:
+            print(f"[codex-sync] {sid}: {exc}", file=sys.stderr, flush=True)
+            return {"status": "error", "changed": False, "message": str(exc)}
+
+        native_messages, latest_item_id, _ = _codex_visible_messages(thread)
+        native_index = {message.id: index for index, message in enumerate(native_messages)}
+        anchor = session.codex_sync_last_item_id
+        local_count = max(0, min(session.codex_sync_local_count, len(session.messages)))
+
+        # Migration for attached sessions created before sync cursors existed:
+        # find the newest native ID already present in the local mirror.
+        if not anchor or anchor not in native_index:
+            local_positions = {
+                message.id: index for index, message in enumerate(session.messages)
+            }
+            common = next(
+                (
+                    message.id for message in reversed(native_messages)
+                    if message.id in local_positions
+                ),
+                None,
+            )
+            if common:
+                anchor = common
+                local_count = local_positions[common] + 1
+
+        start = native_index.get(anchor, -1) + 1 if anchor else 0
+        candidates = native_messages[start:]
+        local_tail = session.messages[local_count:]
+        all_local_ids = {message.id for message in session.messages}
+        tail_cursor = 0
+        additions: list[ChatMessage] = []
+        for native in candidates:
+            if native.id in all_local_ids:
+                continue
+            if (
+                tail_cursor < len(local_tail)
+                and _codex_message_equivalent(native, local_tail[tail_cursor])
+            ):
+                # Preserve AgentWithU's richer bubble (thinking/tool calls), but
+                # account for the corresponding native item exactly once.
+                tail_cursor += 1
+                continue
+            additions.append(native)
+            all_local_ids.add(native.id)
+
+        old_anchor = session.codex_sync_last_item_id
+        old_local_count = session.codex_sync_local_count
+        if additions:
+            session.messages.extend(additions)
+        if latest_item_id:
+            session.codex_sync_last_item_id = latest_item_id
+        # Advance across local bubbles only when native items actually matched
+        # them.  In particular, an in-progress native turn yields no candidates;
+        # consuming the local tail in that state would make the completed turn
+        # appear as a duplicate on the next check.
+        session.codex_sync_local_count = (
+            len(session.messages)
+            if tail_cursor == len(local_tail)
+            else local_count + tail_cursor
+        )
+        cursor_changed = (
+            session.codex_sync_last_item_id != old_anchor
+            or session.codex_sync_local_count != old_local_count
+        )
+        if change_token is not None:
+            tokens[sid] = change_token
+        if additions or cursor_changed:
+            self._session_store.save(session, async_=True)
+        if additions:
+            self._emit_session_updated({
+                "type": "codex_thread_synced",
+                "sessionId": sid,
+                "addedCount": len(additions),
+                "messagesTotal": len(session.messages),
+                "summary": session.meta_dict(),
+            })
+        return {
+            "status": "ok",
+            "changed": bool(additions),
+            "addedCount": len(additions),
+            "messagesTotal": len(session.messages),
+        }
+
     def _rpc_updateSessionConstraints(self, session_id: str, constraints_json: str) -> str:
         try:
             constraints = json.loads(constraints_json)
@@ -2478,6 +2745,11 @@ class BridgeWS:
     def _rpc_deleteSession(self, sid: str) -> bool:
         self._active_sessions.pop(sid, None)
         self._instance_manager.delete(sid)
+        sync_task = getattr(self, "_codex_sync_tasks", {}).pop(sid, None)
+        if sync_task is not None and not sync_task.done():
+            sync_task.cancel()
+        getattr(self, "_codex_sync_checked_at", {}).pop(sid, None)
+        getattr(self, "_codex_sync_change_tokens", {}).pop(sid, None)
         self._loop_running.discard(sid)
         self._aside_running.discard(sid)
         self._loop_states.pop(sid, None)
@@ -7235,10 +7507,13 @@ except urllib.error.URLError as e:
         kwargs["model_override"] = cleaned.get("model")
         if isinstance(backend, CodexOfficeBackend):
             kwargs["reasoning_effort"] = cleaned.get("reasoningEffort")
-        if session and session.codex_remote_host:
-            kwargs["remote_host"] = session.codex_remote_host
-        elif session and session.codex_connection_mode == "node":
-            kwargs["app_server_local"] = True
+            # Transport knobs belong exclusively to CodexOfficeBackend.
+            # A Qwen side/loop backend can run inside a Codex-attached Session,
+            # but its send_message signature intentionally has neither option.
+            if session and session.codex_remote_host:
+                kwargs["remote_host"] = session.codex_remote_host
+            elif session and session.codex_connection_mode == "node":
+                kwargs["app_server_local"] = True
 
     def _runtime_label(self, backend_id: str, runtime: Optional[dict] = None) -> str:
         resolved = self._resolved_runtime(backend_id, runtime)
@@ -8936,6 +9211,24 @@ except urllib.error.URLError as e:
             "sessionId": session.id,
             "summary": session.meta_dict(),
         })
+        if (
+            session.codex_thread_attached
+            and session.codex_connection_mode == "node"
+            and session.agent_session_id
+        ):
+            # This process just produced the native rollout change.  Remember
+            # its cheap file token so the idle-pane watcher does not start a
+            # redundant app-server read immediately after our own turn.  The
+            # cursor intentionally stays put; a later outside change is read
+            # once and reconciles both the local and external turns together.
+            token = await asyncio.to_thread(
+                local_thread_change_token, session.agent_session_id,
+            )
+            if token is not None:
+                tokens = getattr(self, "_codex_sync_change_tokens", None)
+                if tokens is None:
+                    tokens = self._codex_sync_change_tokens = {}
+                tokens[session.id] = token
 
         if session.session_type == "loop":
             self._sync_manual_loop_record(session)

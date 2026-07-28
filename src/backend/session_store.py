@@ -164,6 +164,8 @@ class SessionStore:
                 codex_thread_attached=bool(data.get(
                     "codexThreadAttached", data.get("codexConnectionMode") == "node",
                 )),
+                codex_sync_last_item_id=data.get("codexSyncLastItemId"),
+                codex_sync_local_count=max(0, int(data.get("codexSyncLocalCount") or 0)),
                 working_dir=data.get("workingDir"),
                 auto_continue=data.get("autoContinue", True),
                 skip_permissions=data.get("skipPermissions", True),

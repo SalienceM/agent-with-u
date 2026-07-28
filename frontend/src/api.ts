@@ -1078,6 +1078,24 @@ export const api = {
     try { return JSON.parse(result); } catch { return null; }
   },
 
+  /** Pull newly completed turns from the native Codex thread of an attached session. */
+  async syncAttachedCodexSession(id: string, force = false): Promise<{
+    status: string;
+    changed?: boolean;
+    addedCount?: number;
+    messagesTotal?: number;
+    retryAfterMs?: number;
+    message?: string;
+  }> {
+    const result = await call('syncAttachedCodexSession', id, force);
+    if (result === null || result === undefined) {
+      return { status: 'error', message: '无法连接到后端' };
+    }
+    try { return JSON.parse(result); } catch {
+      return { status: 'error', message: '响应格式错误' };
+    }
+  },
+
   async deleteSession(id: string): Promise<boolean> {
     return await call('deleteSession', id);
   },
@@ -2338,6 +2356,7 @@ function mockDispatch(method: string, params: any[]): any {
     case 'listConnectedClients': return '[]';
     case 'loadSession': return 'null';
     case 'loadSessionMessages': return 'null';
+    case 'syncAttachedCodexSession': return JSON.stringify({ status: 'ok', changed: false });
     case 'deleteSession': return true;
     case 'getBackends': return JSON.stringify(mockBackends);
     case 'saveBackend': {

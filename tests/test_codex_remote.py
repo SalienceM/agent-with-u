@@ -7,11 +7,11 @@ from unittest.mock import AsyncMock, patch
 
 from src.backend.codex_app_server import (
     APP_SERVER_STREAM_LIMIT, ATTACHABLE_THREAD_SOURCE_KINDS, CodexAppServerProcess,
-    list_local_threads, list_ssh_hosts, validate_ssh_host,
+    list_local_threads, list_ssh_hosts, local_thread_change_token, validate_ssh_host,
 )
-from src.backend.bridge_ws import BridgeWS
+from src.backend.bridge_ws import BridgeWS, _codex_visible_messages
 from src.backend.codex_office import CodexOfficeBackend
-from src.types import BackendType, ModelBackendConfig, Session
+from src.types import BackendType, ChatMessage, ModelBackendConfig, Session
 
 
 class SshHostDiscoveryTests(unittest.TestCase):
@@ -28,6 +28,18 @@ class SshHostDiscoveryTests(unittest.TestCase):
     def test_host_validation_rejects_ssh_options(self):
         with self.assertRaises(ValueError):
             validate_ssh_host("-oProxyCommand=bad")
+
+    def test_local_thread_change_token_uses_rollout_stat(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            rollout = root / "2026" / "07" / "rollout-thread-123.jsonl"
+            rollout.parent.mkdir(parents=True)
+            rollout.write_text("{}\n", encoding="utf-8")
+
+            token = local_thread_change_token("thread-123", root)
+
+            self.assertIsNotNone(token)
+            self.assertEqual(token[1], rollout.stat().st_size)
 
     def test_remote_working_dir_is_never_used_as_a_local_skill_root(self):
         bridge = BridgeWS.__new__(BridgeWS)
@@ -74,6 +86,7 @@ class _FakeAppServer:
         self.command = command
         self.launch_command = kwargs.get("launch_command") or []
         self.requests = []
+        self.responses = []
         self.messages = [
             {"method": "item/agentMessage/delta", "params": {"itemId": "a1", "delta": "远端"}},
             {"method": "item/agentMessage/delta", "params": {"itemId": "a1", "delta": "成功"}},
@@ -97,13 +110,259 @@ class _FakeAppServer:
         return self.messages.pop(0)
 
     async def respond(self, request_id, **kwargs):
-        return None
+        self.responses.append((request_id, kwargs))
 
     async def close(self):
         return None
 
 
+class _DynamicToolAppServer(_FakeAppServer):
+    def __init__(self, host="", command="", **kwargs):
+        super().__init__(host, command, **kwargs)
+        self.messages = [
+            {
+                "method": "item/started",
+                "params": {"item": {
+                    "id": "dynamic-1",
+                    "type": "dynamicToolCall",
+                    "tool": "load_workspace_dependencies",
+                    "namespace": "codex_app",
+                    "arguments": {"token": "must-not-leak"},
+                    "status": "inProgress",
+                }},
+            },
+            {
+                "id": 91,
+                "method": "item/tool/call",
+                "params": {
+                    "threadId": "remote-thread-1",
+                    "turnId": "turn-1",
+                    "callId": "dynamic-1",
+                    "tool": "load_workspace_dependencies",
+                    "namespace": "codex_app",
+                    "arguments": {"token": "must-not-leak"},
+                },
+            },
+            {
+                "method": "item/completed",
+                "params": {"item": {
+                    "id": "dynamic-1",
+                    "type": "dynamicToolCall",
+                    "tool": "load_workspace_dependencies",
+                    "namespace": "codex_app",
+                    "status": "failed",
+                    "success": False,
+                    "contentItems": [],
+                }},
+            },
+            {
+                "method": "item/agentMessage/delta",
+                "params": {"itemId": "a1", "delta": "已改用远程节点的 PowerShell。"},
+            },
+            {
+                "method": "turn/completed",
+                "params": {"turn": {"id": "turn-1", "status": "completed"}},
+            },
+        ]
+
+
 class CodexRemoteTurnTests(unittest.IsolatedAsyncioTestCase):
+    def test_visible_mirror_skips_in_progress_turns(self):
+        thread = {
+            "createdAt": 1,
+            "turns": [
+                {
+                    "status": "completed",
+                    "items": [
+                        {"id": "u1", "type": "userMessage",
+                         "content": [{"type": "text", "text": "ready"}]},
+                        {"id": "a1", "type": "agentMessage", "text": "done"},
+                    ],
+                },
+                {
+                    "status": "inProgress",
+                    "items": [
+                        {"id": "u2", "type": "userMessage",
+                         "content": [{"type": "text", "text": "running"}]},
+                        {"id": "a2", "type": "agentMessage", "text": "partial"},
+                    ],
+                },
+            ],
+        }
+
+        messages, latest, truncated = _codex_visible_messages(thread)
+
+        self.assertEqual([message.id for message in messages], ["u1", "a1"])
+        self.assertEqual(latest, "a1")
+        self.assertFalse(truncated)
+
+    async def test_attached_sync_matches_local_turns_and_appends_only_external_turns(self):
+        config = ModelBackendConfig(
+            id="codex", type=BackendType.CODEX_OFFICIAL, label="Codex",
+        )
+        backend = CodexOfficeBackend(config)
+        session = Session(
+            id="attached", title="Attached", created_at=1, updated_at=1,
+            messages=[
+                ChatMessage(id="u0", role="user", content="start", timestamp=1),
+                ChatMessage(id="a0", role="assistant", content="ready", timestamp=2),
+                ChatMessage(id="local-u1", role="user", content="continue", timestamp=3),
+                ChatMessage(id="local-a1", role="assistant", content="local answer", timestamp=4),
+            ],
+            working_dir="C:/repo", backend_id="codex",
+            agent_session_id="thread-1", codex_connection_mode="node",
+            codex_thread_attached=True, codex_sync_last_item_id="a0",
+            codex_sync_local_count=2,
+        )
+        thread = {
+            "createdAt": 1,
+            "turns": [{
+                "status": "completed",
+                "items": [
+                    {"id": "u0", "type": "userMessage",
+                     "content": [{"type": "text", "text": "start"}]},
+                    {"id": "a0", "type": "agentMessage", "text": "ready"},
+                    {"id": "u1", "type": "userMessage",
+                     "content": [{"type": "text", "text": "continue"}]},
+                    {"id": "a1", "type": "agentMessage", "text": "local answer"},
+                    {"id": "u2", "type": "userMessage",
+                     "content": [{"type": "text", "text": "outside work"}]},
+                    {"id": "a2", "type": "agentMessage", "text": "outside result"},
+                ],
+            }],
+        }
+
+        class Store:
+            def __init__(self):
+                self.saved = 0
+
+            def load(self, _sid):
+                return None
+
+            def save(self, _session, async_=True):
+                self.saved += 1
+
+        bridge = BridgeWS.__new__(BridgeWS)
+        bridge._active_sessions = {session.id: session}
+        bridge._session_store = Store()
+        bridge._backend_configs = [config]
+        bridge._backends = {"codex": backend}
+        bridge._chat_turn_tasks = {}
+        bridge._codex_sync_checked_at = {}
+        bridge._codex_sync_change_tokens = {}
+        events = []
+        bridge._emit_session_updated = events.append
+
+        with patch(
+            "src.backend.bridge_ws.local_thread_change_token",
+            return_value=None,
+        ), patch(
+            "src.backend.bridge_ws.read_local_thread",
+            AsyncMock(return_value=thread),
+        ):
+            first = await bridge._sync_attached_codex_session(session.id, True)
+            second = await bridge._sync_attached_codex_session(session.id, True)
+
+        self.assertTrue(first["changed"])
+        self.assertEqual(first["addedCount"], 2)
+        self.assertFalse(second["changed"])
+        self.assertEqual(
+            [(message.role, message.content) for message in session.messages],
+            [
+                ("user", "start"),
+                ("assistant", "ready"),
+                ("user", "continue"),
+                ("assistant", "local answer"),
+                ("user", "outside work"),
+                ("assistant", "outside result"),
+            ],
+        )
+        self.assertEqual(session.codex_sync_last_item_id, "a2")
+        self.assertEqual(session.codex_sync_local_count, 6)
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["type"], "codex_thread_synced")
+
+    async def test_in_progress_sync_does_not_consume_unmatched_local_tail(self):
+        config = ModelBackendConfig(
+            id="codex", type=BackendType.CODEX_OFFICIAL, label="Codex",
+        )
+        backend = CodexOfficeBackend(config)
+        session = Session(
+            id="attached-running", title="Attached", created_at=1, updated_at=1,
+            messages=[
+                ChatMessage(id="u0", role="user", content="start", timestamp=1),
+                ChatMessage(id="a0", role="assistant", content="ready", timestamp=2),
+                ChatMessage(id="local-u", role="user", content="continue", timestamp=3),
+                ChatMessage(id="local-a", role="assistant", content="finished", timestamp=4),
+            ],
+            working_dir="C:/repo", backend_id="codex",
+            agent_session_id="thread-running", codex_connection_mode="node",
+            codex_thread_attached=True, codex_sync_last_item_id="a0",
+            codex_sync_local_count=2,
+        )
+        initial_turn = {
+            "status": "completed",
+            "items": [
+                {"id": "u0", "type": "userMessage",
+                 "content": [{"type": "text", "text": "start"}]},
+                {"id": "a0", "type": "agentMessage", "text": "ready"},
+            ],
+        }
+        running_turn = {
+            "status": "inProgress",
+            "items": [
+                {"id": "u1", "type": "userMessage",
+                 "content": [{"type": "text", "text": "continue"}]},
+                {"id": "a1", "type": "agentMessage", "text": "partial"},
+            ],
+        }
+        completed_turn = {
+            **running_turn,
+            "status": "completed",
+            "items": [
+                running_turn["items"][0],
+                {"id": "a1", "type": "agentMessage", "text": "finished"},
+            ],
+        }
+
+        class Store:
+            def load(self, _sid):
+                return None
+
+            def save(self, _session, async_=True):
+                return None
+
+        bridge = BridgeWS.__new__(BridgeWS)
+        bridge._active_sessions = {session.id: session}
+        bridge._session_store = Store()
+        bridge._backend_configs = [config]
+        bridge._backends = {"codex": backend}
+        bridge._chat_turn_tasks = {}
+        bridge._codex_sync_checked_at = {}
+        bridge._codex_sync_change_tokens = {}
+        bridge._emit_session_updated = lambda _payload: None
+
+        with patch(
+            "src.backend.bridge_ws.local_thread_change_token",
+            return_value=None,
+        ), patch(
+            "src.backend.bridge_ws.read_local_thread",
+            AsyncMock(side_effect=[
+                {"createdAt": 1, "turns": [initial_turn, running_turn]},
+                {"createdAt": 1, "turns": [initial_turn, completed_turn]},
+            ]),
+        ):
+            first = await bridge._sync_attached_codex_session(session.id, True)
+            count_while_running = session.codex_sync_local_count
+            second = await bridge._sync_attached_codex_session(session.id, True)
+
+        self.assertFalse(first["changed"])
+        self.assertEqual(count_while_running, 2)
+        self.assertFalse(second["changed"])
+        self.assertEqual(session.codex_sync_local_count, 4)
+        self.assertEqual(session.codex_sync_last_item_id, "a1")
+        self.assertEqual(len(session.messages), 4)
+
     async def test_attach_listing_includes_all_user_level_thread_sources(self):
         _FakeAppServer.instances.clear()
         with patch("src.backend.codex_app_server.CodexAppServerProcess", _FakeAppServer):
@@ -189,6 +448,39 @@ class CodexRemoteTurnTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(instance.requests[0][0], "thread/resume")
         self.assertEqual(instance.requests[0][1]["sandbox"], "workspace-write")
         self.assertNotIn("sandboxPolicy", instance.requests[1][1])
+
+    async def test_remote_takeover_dynamic_tool_failure_is_recoverable(self):
+        backend = CodexOfficeBackend(ModelBackendConfig(
+            id="codex", type=BackendType.CODEX_OFFICIAL,
+            label="Codex", model="gpt-test", skip_permissions=True,
+        ))
+        deltas = []
+        _DynamicToolAppServer.instances.clear()
+        with patch("src.backend.codex_office.CodexAppServerProcess", _DynamicToolAppServer):
+            result = await backend.send_message(
+                messages=[], content="continue", images=None,
+                session_id="remote-takeover", message_id="m-dynamic",
+                on_delta=deltas.append, agent_session_id="remote-thread-1",
+                working_dir="/srv/project", remote_host="devbox",
+            )
+
+        self.assertEqual(result["agentSessionId"], "remote-thread-1")
+        instance = _DynamicToolAppServer.instances[0]
+        self.assertEqual(len(instance.responses), 1)
+        request_id, envelope = instance.responses[0]
+        self.assertEqual(request_id, 91)
+        response = envelope["result"]
+        self.assertFalse(response["success"])
+        self.assertEqual(response["contentItems"][0]["type"], "inputText")
+        response_text = response["contentItems"][0]["text"]
+        self.assertIn("codex_app.load_workspace_dependencies", response_text)
+        self.assertNotIn("must-not-leak", response_text)
+        self.assertFalse(any(delta.type == "error" for delta in deltas))
+        self.assertIn(
+            "PowerShell",
+            "".join(delta.text or "" for delta in deltas if delta.type == "text_delta"),
+        )
+        self.assertEqual(deltas[-1].type, "done")
 
     async def test_app_server_uses_danger_full_access_mode_string(self):
         backend = CodexOfficeBackend(ModelBackendConfig(

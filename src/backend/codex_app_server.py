@@ -33,6 +33,49 @@ APP_SERVER_STREAM_LIMIT = CODEX_JSONL_STREAM_LIMIT
 # 接管列表应覆盖所有用户级根会话，包括 Codex exec 与 app-server 创建的 thread；
 # subAgent* 是内部编排子线程，展示出来既嘈杂也容易接管错对象。
 ATTACHABLE_THREAD_SOURCE_KINDS = ["cli", "vscode", "exec", "appServer", "unknown"]
+_LOCAL_THREAD_PATH_CACHE: dict[str, Path] = {}
+
+
+def local_thread_change_token(
+    thread_id: str,
+    sessions_root: Optional[Path] = None,
+) -> Optional[tuple[int, int]]:
+    """Return a cheap local change token for one persisted Codex thread.
+
+    ``thread/read`` requires starting an app-server process.  Active attached
+    sessions poll for outside changes, so doing that on every tick would be
+    needlessly expensive.  Codex rollout filenames contain their thread UUID;
+    resolve that path once, cache it, and use mtime + size for the common
+    unchanged case.  ``None`` keeps compatibility with layouts we cannot
+    discover and lets the caller fall back to a throttled app-server read.
+    """
+    tid = str(thread_id or "").strip()
+    if not tid:
+        return None
+    path = _LOCAL_THREAD_PATH_CACHE.get(tid)
+    if path is not None and not path.is_file():
+        _LOCAL_THREAD_PATH_CACHE.pop(tid, None)
+        path = None
+    if path is None:
+        root = sessions_root or (Path.home() / ".codex" / "sessions")
+        if not root.is_dir():
+            return None
+        try:
+            # Current Codex rollout files end in the thread UUID.  Keep a
+            # conservative fallback for compatible older filename prefixes.
+            candidates = root.rglob(f"*{tid}*.jsonl")
+            path = max(candidates, key=lambda item: item.stat().st_mtime_ns, default=None)
+        except OSError:
+            return None
+        if path is None:
+            return None
+        _LOCAL_THREAD_PATH_CACHE[tid] = path
+    try:
+        stat = path.stat()
+        return stat.st_mtime_ns, stat.st_size
+    except OSError:
+        _LOCAL_THREAD_PATH_CACHE.pop(tid, None)
+        return None
 
 
 def list_ssh_hosts(config_path: Optional[Path] = None) -> list[str]:
