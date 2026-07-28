@@ -13,6 +13,7 @@ export interface AppConfig {
   uiOpacity: number;
   ttsVoice: string;
   ttsRate: number;
+  workspaceKitsEnabled: boolean;
 }
 
 const DEFAULT_CONFIG: AppConfig = {
@@ -25,6 +26,7 @@ const DEFAULT_CONFIG: AppConfig = {
   uiOpacity: 1.0,
   ttsVoice: 'zh-CN-XiaoxiaoNeural',
   ttsRate: 0,
+  workspaceKitsEnabled: true,
 };
 
 // Theme color schemes

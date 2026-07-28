@@ -12,11 +12,15 @@ sendMessage / abortMessage 是 fire-and-forget：立即返回 null，
 """
 
 import asyncio
+import base64
 import json
 import logging
+import os
+import shutil
 import sys
 import time
 from dataclasses import replace
+from pathlib import Path
 from typing import Optional
 
 import websockets
@@ -56,6 +60,17 @@ from .loop_store import (
     SUB_PREPARE, SUB_EXECUTE, SUB_ANALYSIS, SUB_DONE,
 )
 from .chat_extras_store import ChatExtrasStore, ChatExtras, SeqTask, ChatAside
+from .workspace_kit_store import (
+    WorkspaceKitStore,
+    WorkspaceKitState,
+    WorkspaceKit,
+    KitRun,
+    FINAL_RUN_STATUSES,
+    render_kit_command,
+    resolve_kit_inputs,
+    evaluate_assertions,
+    build_artifacts,
+)
 from .auth import AuthGuard
 from .asset_pool import AssetPool
 from .model_ledger import ModelLedger
@@ -558,6 +573,13 @@ class BridgeWS:
         self._chat_extras_store = ChatExtrasStore()
         self._chat_extras: dict[str, ChatExtras] = {}   # 进程内单例缓存
         self._chat_aside_running: set[str] = set()      # 正在回答普通会话 by-the-way 的 session
+        # ★ 实验性 Workspace Kits：Session 级标准配件、运行记录和数据市场。
+        self._kit_store = WorkspaceKitStore()
+        self._kit_states: dict[str, WorkspaceKitState] = {}
+        self._kit_tasks: dict[str, asyncio.Task] = {}    # run_id → task
+        self._kit_processes: dict[str, asyncio.subprocess.Process] = {}
+        self._kit_terminals: dict[str, dict] = {}        # session_id:kit_id → 持久 shell
+        self._kit_scheduler_task: Optional[asyncio.Task] = None
         # 普通会话主链路的权威运行态。前端的 isStreaming 只是渲染状态；经 Relay
         # 短暂断线时它可能丢失 done 帧或发生重连，不能拿它单独决定是否派发序列任务。
         # 一个 session 理论上只有一个任务；这里仍用 set 兜住历史竞态，直到所有
@@ -1391,6 +1413,7 @@ class BridgeWS:
             self._emit_clients_changed()
 
     async def _dispatch(self, method: str, params: list):
+        self._ensure_kit_scheduler()
         handler = getattr(self, f"_rpc_{method}", None)
         if handler is None:
             return None
@@ -2215,6 +2238,16 @@ class BridgeWS:
                         self._chat_extras_store.delete(sid)
                     except Exception:
                         pass
+                    try:
+                        self._kit_store.delete(sid)
+                        self._kit_states.pop(sid, None)
+                        for terminal_key, terminal in list(self._kit_terminals.items()):
+                            if terminal.get("session_id") == sid:
+                                asyncio.ensure_future(
+                                    self._close_kit_terminal(terminal_key, emit=False)
+                                )
+                    except Exception:
+                        pass
                     print(f"[BridgeWS] Auto-evicted old session {sid}", file=sys.stderr, flush=True)
         is_loop = session_type == "loop"
         try:
@@ -2453,6 +2486,16 @@ class BridgeWS:
         self._chat_extras.pop(sid, None)
         self._chat_extras_store.delete(sid)
         self._seq_dispatch_reservations.pop(sid, None)
+        for run_id, task in list(self._kit_tasks.items()):
+            state = self._kit_states.get(sid)
+            run = next((r for r in state.runs if r.id == run_id), None) if state else None
+            if run:
+                task.cancel()
+        for terminal_key, terminal in list(self._kit_terminals.items()):
+            if terminal.get("session_id") == sid:
+                asyncio.ensure_future(self._close_kit_terminal(terminal_key, emit=False))
+        self._kit_states.pop(sid, None)
+        self._kit_store.delete(sid)
         ok = self._session_store.delete(sid)
         if ok:
             self._emit_session_updated({"type": "session_deleted", "sessionId": sid})
@@ -3914,6 +3957,31 @@ class BridgeWS:
             }, ensure_ascii=False),
         }))
 
+    def _kit_context_digest(self, session_id: str) -> str:
+        """给 Session 管家/BTW 的只读 Kit 总览；不注入大段日志和数据正文。"""
+        state = self._kit_get(session_id)
+        if not state.kits:
+            return "Workspace Kits：暂无配件"
+        lines = ["Workspace Kits："]
+        for kit in state.kits[:20]:
+            run = next(
+                (item for item in reversed(state.runs) if item.kit_id == kit.id),
+                None,
+            )
+            run_status = run.status if run else "未运行"
+            schedule = (
+                f"每 {kit.schedule.get('intervalSeconds')} 秒"
+                if kit.schedule.get("mode") == "interval" else "手动"
+            )
+            lines.append(
+                f"- {kit.title} [{run_status}] 触发={schedule} 控制={kit.control_mode}"
+            )
+            if run and run.error:
+                lines.append(f"  最近错误：{run.error[:180]}")
+        latest_keys = sorted({item.key for item in state.artifacts})
+        lines.append("数据市场：" + ("、".join(latest_keys) if latest_keys else "暂无数据"))
+        return "\n".join(lines)
+
     def _loop_context_digest(self, state: "LoopState") -> str:
         """把当前 loop 持久化状态压成一段只读摘要，喂给旁路问答用。"""
         lines = [
@@ -3942,6 +4010,7 @@ class BridgeWS:
                     lines.append(f"  约束: {l.analysis.challenges[:200]}")
             if l.error:
                 lines.append(f"  错误: {l.error[:200]}")
+        lines.append(self._kit_context_digest(state.session_id))
         return "\n".join(lines)
 
     def _rpc_loopAsk(self, session_id: str, question: str, images_json: str = "") -> str:
@@ -4277,6 +4346,677 @@ class BridgeWS:
         self._emit_seqtask_updated(ex)
         return self._seqtask_payload(ex)
 
+    # ── Workspace Kits（实验）─────────────────────────────────────
+
+    def _kit_get(self, session_id: str) -> WorkspaceKitState:
+        state = self._kit_states.get(session_id)
+        if state is None:
+            state = self._kit_store.load(session_id) or WorkspaceKitState(session_id=session_id)
+            self._kit_states[session_id] = state
+        return state
+
+    def _kit_save(self, state: WorkspaceKitState, *, emit: bool = True) -> None:
+        self._kit_states[state.session_id] = state
+        self._kit_store.save(state)
+        if emit:
+            self._emit_event("kitUpdated", self._kit_payload(state))
+
+    def _kit_payload(self, state: WorkspaceKitState) -> dict:
+        """给 UI 的有界快照；完整日志和数据仍在本地 sidecar 中留存。"""
+        payload = state.to_dict()
+        last_run_ids = {kit.last_run_id for kit in state.kits if kit.last_run_id}
+        runs: list[dict] = []
+        for run in payload.get("runs", [])[-60:]:
+            item = dict(run)
+            if item.get("id") not in last_run_ids:
+                item["stdout"] = str(item.get("stdout") or "")[:4_000]
+                item["stderr"] = str(item.get("stderr") or "")[:4_000]
+            runs.append(item)
+        payload["runs"] = runs
+        # UI 当前只使用最新数据市场；历史版本仍在 sidecar，避免每次状态推送携带大对象。
+        payload["artifacts"] = []
+        for item in payload.get("dataMarket", []):
+            value = item.get("value")
+            if isinstance(value, str) and len(value) > 50_000:
+                item["value"] = value[:50_000] + "\n…（视图截断，完整值保存在本地）"
+        payload["terminalConnectedKitIds"] = [
+            terminal.get("kit_id")
+            for terminal in self._kit_terminals.values()
+            if terminal.get("session_id") == state.session_id
+            and terminal.get("proc") is not None
+            and terminal["proc"].returncode is None
+        ]
+        return payload
+
+    @staticmethod
+    def _kit_find(state: WorkspaceKitState, kit_id: str) -> Optional[WorkspaceKit]:
+        return next((item for item in state.kits if item.id == kit_id), None)
+
+    def _kit_session(self, session_id: str) -> Optional[Session]:
+        return self._active_sessions.get(session_id) or self._session_store.load(session_id)
+
+    def _ensure_kit_scheduler(self) -> None:
+        if self._kit_scheduler_task and not self._kit_scheduler_task.done():
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._kit_scheduler_task = loop.create_task(
+            self._kit_scheduler_loop(), name="workspace-kit-scheduler",
+        )
+
+    async def _kit_scheduler_loop(self) -> None:
+        """进程存活期间执行 interval Kit；服务重启后从 sidecar 恢复下次执行时间。"""
+        try:
+            while True:
+                now = time.time()
+                session_ids = set(self._kit_store.list_session_ids()) | set(self._kit_states)
+                for session_id in session_ids:
+                    state = self._kit_get(session_id)
+                    changed = False
+                    for kit in state.kits:
+                        schedule = kit.schedule
+                        if not kit.enabled or schedule.get("mode") != "interval":
+                            continue
+                        interval = max(10, int(schedule.get("intervalSeconds") or 300))
+                        next_run = schedule.get("nextRunAt")
+                        if not isinstance(next_run, (int, float)):
+                            schedule["nextRunAt"] = now + interval
+                            changed = True
+                            continue
+                        if next_run <= now:
+                            schedule["nextRunAt"] = now + interval
+                            changed = True
+                            if not any(
+                                run.kit_id == kit.id and run.status not in FINAL_RUN_STATUSES
+                                for run in state.runs
+                            ):
+                                self._queue_workspace_kit_run(
+                                    session_id, kit.id, {}, trigger="schedule", owner="ai",
+                                )
+                    if changed:
+                        self._kit_save(state)
+                await asyncio.sleep(2)
+        except asyncio.CancelledError:
+            return
+        except Exception as exc:
+            print(f"[WorkspaceKit] scheduler stopped: {exc}", file=sys.stderr, flush=True)
+            self._kit_scheduler_task = None
+
+    def _rpc_kitGetState(self, session_id: str) -> str:
+        if not self._kit_session(session_id):
+            return json.dumps({"status": "error", "message": "Session 不存在"}, ensure_ascii=False)
+        return json.dumps({"status": "ok", **self._kit_payload(self._kit_get(session_id))},
+                          ensure_ascii=False)
+
+    def _rpc_kitCreate(self, session_id: str, spec_json: str) -> str:
+        if not self._kit_session(session_id):
+            return json.dumps({"status": "error", "message": "Session 不存在"}, ensure_ascii=False)
+        try:
+            spec = json.loads(spec_json) if isinstance(spec_json, str) else dict(spec_json or {})
+        except (TypeError, json.JSONDecodeError):
+            return json.dumps({"status": "error", "message": "Kit 配置不是有效 JSON"}, ensure_ascii=False)
+        kit = WorkspaceKit.from_dict(spec if isinstance(spec, dict) else {})
+        if not kit.command.strip():
+            return json.dumps({"status": "error", "message": "Kit 执行命令不能为空"}, ensure_ascii=False)
+        if kit.schedule.get("mode") == "interval":
+            kit.schedule["nextRunAt"] = time.time() + int(kit.schedule["intervalSeconds"])
+        state = self._kit_get(session_id)
+        state.kits.append(kit)
+        self._kit_save(state)
+        return json.dumps({"status": "ok", "kit": kit.to_dict()}, ensure_ascii=False)
+
+    def _rpc_kitUpdate(self, session_id: str, kit_id: str, patch_json: str) -> str:
+        state = self._kit_get(session_id)
+        kit = self._kit_find(state, kit_id)
+        if not kit:
+            return json.dumps({"status": "error", "message": "Kit 不存在"}, ensure_ascii=False)
+        try:
+            patch = json.loads(patch_json) if isinstance(patch_json, str) else dict(patch_json or {})
+        except (TypeError, json.JSONDecodeError):
+            return json.dumps({"status": "error", "message": "Kit 配置不是有效 JSON"}, ensure_ascii=False)
+        old_mode = kit.schedule.get("mode")
+        old_interval = kit.schedule.get("intervalSeconds")
+        patch = patch if isinstance(patch, dict) else {}
+        merged = kit.to_dict()
+        for nested in ("schedule", "view"):
+            if isinstance(patch.get(nested), dict):
+                merged[nested] = {**dict(merged.get(nested) or {}), **patch[nested]}
+        merged.update({key: value for key, value in patch.items() if key not in {"schedule", "view"}})
+        merged["id"] = kit.id
+        merged["createdAt"] = kit.created_at
+        candidate = WorkspaceKit.from_dict(merged)
+        if not candidate.command.strip():
+            return json.dumps({"status": "error", "message": "Kit 执行命令不能为空"}, ensure_ascii=False)
+        candidate.updated_at = time.time()
+        if candidate.schedule.get("mode") == "interval":
+            if old_mode != "interval" or old_interval != candidate.schedule.get("intervalSeconds"):
+                candidate.schedule["nextRunAt"] = time.time() + int(candidate.schedule["intervalSeconds"])
+        else:
+            candidate.schedule["nextRunAt"] = None
+        state.kits[state.kits.index(kit)] = candidate
+        self._kit_save(state)
+        return json.dumps({"status": "ok", "kit": candidate.to_dict()}, ensure_ascii=False)
+
+    def _rpc_kitDelete(self, session_id: str, kit_id: str) -> str:
+        state = self._kit_get(session_id)
+        if any(run.kit_id == kit_id and run.status not in FINAL_RUN_STATUSES for run in state.runs):
+            return json.dumps({"status": "error", "message": "Kit 正在运行，请先停止"}, ensure_ascii=False)
+        before = len(state.kits)
+        state.kits = [item for item in state.kits if item.id != kit_id]
+        if len(state.kits) == before:
+            return json.dumps({"status": "error", "message": "Kit 不存在"}, ensure_ascii=False)
+        asyncio.ensure_future(
+            self._close_kit_terminal(self._kit_terminal_key(session_id, kit_id), emit=False)
+        )
+        self._kit_save(state)
+        return json.dumps({"status": "ok"}, ensure_ascii=False)
+
+    def _rpc_kitSetControlMode(self, session_id: str, kit_id: str, mode: str) -> str:
+        state = self._kit_get(session_id)
+        kit = self._kit_find(state, kit_id)
+        if not kit:
+            return json.dumps({"status": "error", "message": "Kit 不存在"}, ensure_ascii=False)
+        requested = (mode or "").lower()
+        if requested not in {"ai", "human", "shared"}:
+            return json.dumps({"status": "error", "message": "控制模式必须是 ai/human/shared"},
+                              ensure_ascii=False)
+        kit.control_mode = requested
+        kit.updated_at = time.time()
+        self._kit_save(state)
+        return json.dumps({"status": "ok", "controlMode": requested}, ensure_ascii=False)
+
+    def _rpc_kitRun(self, session_id: str, kit_id: str, inputs_json: str = "{}",
+                    owner: str = "human") -> str:
+        try:
+            inputs = json.loads(inputs_json) if isinstance(inputs_json, str) else dict(inputs_json or {})
+        except (TypeError, json.JSONDecodeError):
+            return json.dumps({"status": "error", "message": "Kit 输入不是有效 JSON"}, ensure_ascii=False)
+        result = self._queue_workspace_kit_run(
+            session_id, kit_id, inputs if isinstance(inputs, dict) else {},
+            trigger="manual", owner="ai" if owner == "ai" else "human",
+        )
+        return json.dumps(result, ensure_ascii=False)
+
+    def _rpc_kitTerminalCommand(
+        self, session_id: str, kit_id: str, command: str, owner: str = "human",
+    ) -> str:
+        state = self._kit_get(session_id)
+        kit = self._kit_find(state, kit_id)
+        if not kit:
+            return json.dumps({"status": "error", "message": "Kit 不存在"}, ensure_ascii=False)
+        owner = "ai" if owner == "ai" else "human"
+        if kit.control_mode == "ai" and owner == "human":
+            return json.dumps({
+                "status": "error",
+                "message": "当前终端由 AI 接管；切到共享或人工模式后可直接操作",
+            }, ensure_ascii=False)
+        if kit.control_mode == "human" and owner == "ai":
+            return json.dumps({
+                "status": "error",
+                "message": "当前终端由人工接管；AI 不能写入",
+            }, ensure_ascii=False)
+        if not (command or "").strip():
+            return json.dumps({"status": "error", "message": "命令为空"}, ensure_ascii=False)
+        result = self._queue_workspace_terminal_command(
+            session_id, kit_id, command, owner=owner,
+        )
+        return json.dumps(result, ensure_ascii=False)
+
+    async def _rpc_kitTerminalClose(self, session_id: str, kit_id: str) -> str:
+        await self._close_kit_terminal(self._kit_terminal_key(session_id, kit_id))
+        return json.dumps({"status": "ok"}, ensure_ascii=False)
+
+    def _rpc_kitCancel(self, session_id: str, run_id: str) -> str:
+        state = self._kit_get(session_id)
+        run = next((item for item in state.runs if item.id == run_id), None)
+        if not run:
+            return json.dumps({"status": "error", "message": "运行记录不存在"}, ensure_ascii=False)
+        if run.status in FINAL_RUN_STATUSES:
+            return json.dumps({"status": "ok", "statusNow": run.status}, ensure_ascii=False)
+        proc = self._kit_processes.get(run_id)
+        if proc and proc.returncode is None:
+            try:
+                proc.terminate()
+            except ProcessLookupError:
+                pass
+        task = self._kit_tasks.get(run_id)
+        if task and not task.done():
+            task.cancel()
+        return json.dumps({"status": "ok", "statusNow": "cancelling"}, ensure_ascii=False)
+
+    def _queue_workspace_kit_run(
+        self,
+        session_id: str,
+        kit_id: str,
+        supplied_inputs: dict,
+        *,
+        trigger: str,
+        owner: str,
+        command_override: Optional[str] = None,
+    ) -> dict:
+        session = self._kit_session(session_id)
+        if not session:
+            return {"status": "error", "message": "Session 不存在"}
+        state = self._kit_get(session_id)
+        kit = self._kit_find(state, kit_id)
+        if not kit:
+            return {"status": "error", "message": "Kit 不存在"}
+        if not kit.enabled:
+            return {"status": "error", "message": "Kit 已停用"}
+        if any(run.kit_id == kit_id and run.status not in FINAL_RUN_STATUSES for run in state.runs):
+            return {"status": "error", "message": "Kit 已在运行"}
+        resolved, input_errors = resolve_kit_inputs(kit, supplied_inputs, state)
+        if input_errors and command_override is None:
+            return {"status": "error", "message": "；".join(input_errors)}
+        run = KitRun(
+            id=new_id(),
+            kit_id=kit.id,
+            session_id=session_id,
+            trigger=trigger,
+            owner=owner,
+            inputs=resolved,
+            command=command_override or kit.command,
+        )
+        state.runs.append(run)
+        kit.last_run_id = run.id
+        kit.updated_at = time.time()
+        self._kit_save(state)
+        task = asyncio.create_task(
+            self._run_workspace_kit(
+                session_id, kit.id, run.id, command_override=command_override,
+            ),
+            name=f"workspace-kit-{run.id}",
+        )
+        self._kit_tasks[run.id] = task
+        return {"status": "ok", "run": run.to_dict()}
+
+    def _queue_workspace_terminal_command(
+        self, session_id: str, kit_id: str, command: str, *, owner: str,
+    ) -> dict:
+        session = self._kit_session(session_id)
+        if not session:
+            return {"status": "error", "message": "Session 不存在"}
+        state = self._kit_get(session_id)
+        kit = self._kit_find(state, kit_id)
+        if not kit:
+            return {"status": "error", "message": "Kit 不存在"}
+        if not kit.enabled:
+            return {"status": "error", "message": "Kit 已停用"}
+        if any(run.kit_id == kit_id and run.status not in FINAL_RUN_STATUSES for run in state.runs):
+            return {"status": "error", "message": "Kit 已在运行"}
+        run = KitRun(
+            id=new_id(),
+            kit_id=kit.id,
+            session_id=session_id,
+            trigger="terminal",
+            owner=owner,
+            command=command,
+        )
+        state.runs.append(run)
+        kit.last_run_id = run.id
+        kit.updated_at = time.time()
+        self._kit_save(state)
+        task = asyncio.create_task(
+            self._run_workspace_terminal_command(session_id, kit.id, run.id),
+            name=f"workspace-kit-terminal-{run.id}",
+        )
+        self._kit_tasks[run.id] = task
+        return {"status": "ok", "run": run.to_dict()}
+
+    def _kit_working_dir(self, session: Session, kit: WorkspaceKit) -> Path:
+        root = Path(session.working_dir or self._resolve_working_dir("")).expanduser().resolve()
+        root.mkdir(parents=True, exist_ok=True)
+        requested = Path(kit.cwd or ".").expanduser()
+        candidate = requested.resolve() if requested.is_absolute() else (root / requested).resolve()
+        if candidate != root and root not in candidate.parents:
+            raise ValueError("Kit 工作目录不能超出 Session 工作空间")
+        candidate.mkdir(parents=True, exist_ok=True)
+        return candidate
+
+    @staticmethod
+    def _kit_shell_command(shell: str, command: str) -> list[str]:
+        if shell == "cmd":
+            executable = os.environ.get("COMSPEC") or shutil.which("cmd")
+            if not executable:
+                raise RuntimeError("找不到 cmd.exe")
+            return [executable, "/d", "/s", "/c", command]
+        if shell == "bash":
+            executable = shutil.which("bash")
+            if not executable:
+                raise RuntimeError("找不到 bash")
+            return [executable, "-lc", command]
+        executable = shutil.which("pwsh") or shutil.which("powershell")
+        if not executable:
+            raise RuntimeError("找不到 PowerShell")
+        return [executable, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", command]
+
+    @staticmethod
+    def _kit_terminal_key(session_id: str, kit_id: str) -> str:
+        return f"{session_id}:{kit_id}"
+
+    @staticmethod
+    def _kit_terminal_shell(shell: str) -> list[str]:
+        """启动一个通过 stdin/stdout 接管的持久 shell，不弹出系统窗口。"""
+        if shell == "cmd":
+            executable = os.environ.get("COMSPEC") or shutil.which("cmd")
+            if not executable:
+                raise RuntimeError("找不到 cmd.exe")
+            return [executable, "/d", "/q"]
+        if shell == "bash":
+            executable = shutil.which("bash")
+            if not executable:
+                raise RuntimeError("找不到 bash")
+            return [executable, "--noprofile", "--norc"]
+        executable = shutil.which("pwsh") or shutil.which("powershell")
+        if not executable:
+            raise RuntimeError("找不到 PowerShell")
+        # 用一个常驻 host 逐行接收 Base64 脚本：既不会等待 stdin EOF，也不会
+        # 像交互提示符那样把输入命令回显到 stdout。Invoke-Expression 在同一
+        # PowerShell 进程里执行，Set-Location / 环境变量 / 子进程上下文均保留。
+        host = (
+            "[Console]::InputEncoding = New-Object System.Text.UTF8Encoding($false); "
+            "[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false); "
+            "while (($line = [Console]::In.ReadLine()) -ne $null) { "
+            "try { Invoke-Expression "
+            "([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($line))) } "
+            "catch { Write-Error $_ } }"
+        )
+        return [
+            executable, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", host,
+        ]
+
+    async def _ensure_kit_terminal(
+        self, session: Session, kit: WorkspaceKit, state: WorkspaceKitState,
+    ) -> dict:
+        key = self._kit_terminal_key(session.id, kit.id)
+        current = self._kit_terminals.get(key)
+        if current and current.get("proc") and current["proc"].returncode is None:
+            return current
+        if current:
+            await self._close_kit_terminal(key, emit=False)
+        working_dir = self._kit_working_dir(session, kit)
+        env = os.environ.copy()
+        if getattr(sys, "frozen", False):
+            for name in ("PYTHONHOME", "PYTHONPATH", "_MEIPASS2", "_PYI_SPLASH_IPC"):
+                env.pop(name, None)
+        env.update({
+            "KIT_SESSION_ID": session.id,
+            "KIT_ID": kit.id,
+            "KIT_CONTROL_MODE": kit.control_mode,
+        })
+        kwargs: dict = {
+            "cwd": str(working_dir),
+            "env": env,
+            "stdin": asyncio.subprocess.PIPE,
+            "stdout": asyncio.subprocess.PIPE,
+            "stderr": asyncio.subprocess.STDOUT,
+            "limit": 128 * 1024 * 1024,
+        }
+        if os.name == "nt":
+            kwargs["creationflags"] = 0x08000000
+        proc = await asyncio.create_subprocess_exec(
+            *self._kit_terminal_shell(kit.shell), **kwargs,
+        )
+        terminal = {
+            "session_id": session.id,
+            "kit_id": kit.id,
+            "shell": kit.shell,
+            "cwd": str(working_dir),
+            "proc": proc,
+            "lock": asyncio.Lock(),
+        }
+        self._kit_terminals[key] = terminal
+        self._kit_save(state)
+        return terminal
+
+    async def _close_kit_terminal(self, key: str, *, emit: bool = True) -> None:
+        terminal = self._kit_terminals.pop(key, None)
+        if not terminal:
+            return
+        proc = terminal.get("proc")
+        if proc and proc.returncode is None:
+            try:
+                if proc.stdin:
+                    proc.stdin.close()
+                    try:
+                        await proc.stdin.wait_closed()
+                    except (AttributeError, ConnectionError):
+                        pass
+                await asyncio.wait_for(proc.wait(), timeout=1.5)
+            except Exception:
+                try:
+                    proc.kill()
+                    await proc.wait()
+                except Exception:
+                    pass
+        if emit:
+            state = self._kit_states.get(str(terminal.get("session_id") or ""))
+            if state:
+                self._kit_save(state)
+
+    @staticmethod
+    def _kit_terminal_script(shell: str, command: str, marker: str) -> bytes:
+        if shell == "cmd":
+            script = f"{command}\r\necho {marker}%ERRORLEVEL%\r\n"
+        elif shell == "bash":
+            script = (
+                f"{command}\n"
+                f"__awu_code=$?; printf '\\n{marker}%s\\n' \"$__awu_code\"\n"
+            )
+        else:
+            # 独立 scriptblock 避免用户命令中的 return 退出桥；异常转为非零判言。
+            script = (
+                "$global:LASTEXITCODE = 0\n"
+                "try {\n"
+                f"  & {{ {command} }}\n"
+                "  $__awu_code = if ($LASTEXITCODE -is [int]) { $LASTEXITCODE } "
+                "elseif ($?) { 0 } else { 1 }\n"
+                "} catch { Write-Error $_; $__awu_code = 1 }\n"
+                f'Write-Output "{marker}$__awu_code"\n'
+            )
+            return base64.b64encode(script.encode("utf-8")) + b"\n"
+        return script.encode("utf-8")
+
+    async def _run_workspace_terminal_command(
+        self, session_id: str, kit_id: str, run_id: str,
+    ) -> None:
+        state = self._kit_get(session_id)
+        kit = self._kit_find(state, kit_id)
+        run = next((item for item in state.runs if item.id == run_id), None)
+        session = self._kit_session(session_id)
+        if not kit or not run or not session:
+            self._kit_tasks.pop(run_id, None)
+            return
+        terminal_key = self._kit_terminal_key(session_id, kit_id)
+        try:
+            terminal = await self._ensure_kit_terminal(session, kit, state)
+            proc = terminal["proc"]
+            run.cwd = str(terminal["cwd"])
+            run.status = "running"
+            run.started_at = time.time()
+            self._kit_processes[run.id] = proc
+            self._kit_save(state)
+            marker = f"__AWU_KIT_DONE_{run.id.replace('-', '_')}__:"
+
+            async with terminal["lock"]:
+                if proc.returncode is not None or not proc.stdin or not proc.stdout:
+                    raise RuntimeError("持久终端已断开")
+                proc.stdin.write(self._kit_terminal_script(kit.shell, run.command, marker))
+                await proc.stdin.drain()
+
+                async def read_result() -> tuple[str, int]:
+                    chunks: list[str] = []
+                    total = 0
+                    while True:
+                        line = await proc.stdout.readline()
+                        if not line:
+                            raise RuntimeError("持久终端在返回判言前断开")
+                        text = line.decode("utf-8", errors="replace")
+                        if marker in text:
+                            before, after = text.split(marker, 1)
+                            if before and total < 200_000:
+                                chunks.append(before[:200_000 - total])
+                            match = __import__("re").search(r"-?\d+", after)
+                            return "".join(chunks), int(match.group(0)) if match else 1
+                        if total < 200_000:
+                            piece = text[:200_000 - total]
+                            chunks.append(piece)
+                            total += len(piece)
+
+                run.stdout, run.exit_code = await asyncio.wait_for(
+                    read_result(), timeout=kit.timeout_seconds,
+                )
+
+            run.status = "evaluating"
+            self._kit_save(state)
+            run.assertions = evaluate_assertions(
+                [{"type": "exit_code", "expected": 0, "label": "终端命令正常退出"}],
+                exit_code=run.exit_code,
+                stdout=run.stdout,
+                stderr="",
+                working_dir=Path(run.cwd),
+            )
+            passed = all(item.passed for item in run.assertions)
+            run.status = "succeeded" if passed else "failed"
+            run.verdict = "passed" if passed else "failed"
+        except asyncio.CancelledError:
+            run.status = "cancelled"
+            run.verdict = "cancelled"
+            run.error = "用户停止了终端命令；持久终端已断开"
+            await self._close_kit_terminal(terminal_key, emit=False)
+        except asyncio.TimeoutError:
+            run.status = "error"
+            run.verdict = "error"
+            run.error = f"终端命令超过 {kit.timeout_seconds} 秒，持久终端已断开"
+            await self._close_kit_terminal(terminal_key, emit=False)
+        except Exception as exc:
+            run.status = "error"
+            run.verdict = "error"
+            run.error = str(exc)
+            await self._close_kit_terminal(terminal_key, emit=False)
+        finally:
+            run.ended_at = time.time()
+            self._kit_processes.pop(run.id, None)
+            self._kit_tasks.pop(run.id, None)
+            self._kit_save(state)
+
+    async def _run_workspace_kit(
+        self,
+        session_id: str,
+        kit_id: str,
+        run_id: str,
+        *,
+        command_override: Optional[str] = None,
+    ) -> None:
+        state = self._kit_get(session_id)
+        kit = self._kit_find(state, kit_id)
+        run = next((item for item in state.runs if item.id == run_id), None)
+        session = self._kit_session(session_id)
+        if not kit or not run or not session:
+            self._kit_tasks.pop(run_id, None)
+            return
+        proc: Optional[asyncio.subprocess.Process] = None
+        try:
+            working_dir = self._kit_working_dir(session, kit)
+            rendered, input_env = render_kit_command(kit, run.inputs)
+            if command_override is not None:
+                rendered = command_override
+            run.command = rendered
+            run.cwd = str(working_dir)
+            run.status = "running"
+            run.started_at = time.time()
+            self._kit_save(state)
+
+            env = os.environ.copy()
+            if getattr(sys, "frozen", False):
+                for key in ("PYTHONHOME", "PYTHONPATH", "_MEIPASS2", "_PYI_SPLASH_IPC"):
+                    env.pop(key, None)
+            env.update(input_env)
+            env.update({
+                "KIT_SESSION_ID": session_id,
+                "KIT_ID": kit.id,
+                "KIT_RUN_ID": run.id,
+                "KIT_CONTROL_MODE": kit.control_mode,
+            })
+            market = {item.key: item.value for item in state.artifacts[-50:]}
+            market_json = json.dumps(market, ensure_ascii=False, default=str)
+            if len(market_json) <= 20_000:
+                env["KIT_DATA_MARKET_JSON"] = market_json
+
+            kwargs: dict = {
+                "cwd": str(working_dir),
+                "env": env,
+                "stdout": asyncio.subprocess.PIPE,
+                "stderr": asyncio.subprocess.PIPE,
+            }
+            if os.name == "nt":
+                kwargs["creationflags"] = 0x08000000  # CREATE_NO_WINDOW：输出由视图窗接管
+            proc = await asyncio.create_subprocess_exec(
+                *self._kit_shell_command(kit.shell, rendered), **kwargs,
+            )
+            self._kit_processes[run.id] = proc
+            try:
+                stdout_bytes, stderr_bytes = await asyncio.wait_for(
+                    proc.communicate(), timeout=kit.timeout_seconds,
+                )
+            except asyncio.TimeoutError:
+                proc.kill()
+                stdout_bytes, stderr_bytes = await proc.communicate()
+                run.stdout = stdout_bytes.decode("utf-8", errors="replace")[:200_000]
+                run.stderr = stderr_bytes.decode("utf-8", errors="replace")[:200_000]
+                run.status = "error"
+                run.verdict = "error"
+                run.error = f"执行超过 {kit.timeout_seconds} 秒，已终止"
+                return
+
+            run.exit_code = proc.returncode
+            run.stdout = stdout_bytes.decode("utf-8", errors="replace")[:200_000]
+            run.stderr = stderr_bytes.decode("utf-8", errors="replace")[:200_000]
+            run.status = "evaluating"
+            self._kit_save(state)
+            await asyncio.sleep(0)
+
+            assertion_specs = (
+                [{"type": "exit_code", "expected": 0, "label": "终端命令正常退出"}]
+                if command_override is not None else kit.assertions
+            )
+            run.assertions = evaluate_assertions(
+                assertion_specs,
+                exit_code=run.exit_code,
+                stdout=run.stdout,
+                stderr=run.stderr,
+                working_dir=working_dir,
+            )
+            passed = bool(run.assertions) and all(item.passed for item in run.assertions)
+            run.status = "succeeded" if passed else "failed"
+            run.verdict = "passed" if passed else "failed"
+            if passed and command_override is None:
+                artifacts = build_artifacts(kit, run, working_dir=working_dir)
+                state.artifacts.extend(artifacts)
+                run.artifact_ids = [item.id for item in artifacts]
+        except asyncio.CancelledError:
+            if proc and proc.returncode is None:
+                try:
+                    proc.kill()
+                    await proc.wait()
+                except Exception:
+                    pass
+            run.status = "cancelled"
+            run.verdict = "cancelled"
+            run.error = "用户停止了本次运行"
+        except Exception as exc:
+            run.status = "error"
+            run.verdict = "error"
+            run.error = str(exc)
+            print(f"[WorkspaceKit] run {run.id} failed: {exc}", file=sys.stderr, flush=True)
+        finally:
+            run.ended_at = time.time()
+            self._kit_processes.pop(run.id, None)
+            self._kit_tasks.pop(run.id, None)
+            self._kit_save(state)
+
     # ── by-the-way 旁路问答（普通 session）──────────────────────────
 
     def _emit_chat_aside_delta(self, session_id: str, turn_id: str, text: str) -> None:
@@ -4311,7 +5051,7 @@ class BridgeWS:
         return json.dumps({"status": "ok", "asideBackendId": ex.aside_backend_id}, ensure_ascii=False)
 
     def _chat_context_digest(self, session: "Session", max_msgs: int = 8) -> str:
-        """普通会话最近若干条消息的只读摘要，喂给旁路问答（不污染主线）。"""
+        """普通会话与 Workspace Kit 的只读摘要，喂给 Session 管家（不污染主线）。"""
         msgs = session.messages[-max_msgs:] if session.messages else []
         lines = []
         for m in msgs:
@@ -4321,7 +5061,8 @@ class BridgeWS:
                 body = body[:400] + "…"
             if body:
                 lines.append(f"{who}：{body}")
-        return "\n".join(lines) if lines else "（暂无对话历史）"
+        chat = "\n".join(lines) if lines else "（暂无对话历史）"
+        return f"{chat}\n\n{self._kit_context_digest(session.id)}"
 
     def _rpc_chatAsk(self, session_id: str, question: str, images_json: str = "") -> str:
         """普通 session 的 by-the-way：独立 agent 上下文，带最近对话摘要，不进 transcript。"""
@@ -4357,9 +5098,11 @@ class BridgeWS:
                 for t in ex.asides[:-1][-4:] if t.status == "done" and t.answer
             )
             prompt = (
-                "你是这个对话的旁路助手（by the way）。下面是当前对话**最近几条**的只读摘要，"
+                "你是这个综合 Session 工作空间的旁路管家（by the way）。下面是当前对话"
+                "**最近几条**和 Workspace Kits 的只读摘要，"
                 "用户想随手问一个不打断主线、也不希望写进主对话的问题。"
-                "请基于摘要与常识作答——解读、答疑、建议即可，不要替用户去执行主线任务。\n\n"
+                "请基于摘要与常识作答，可解释 Kit 状态、数据依赖和下一步编排；"
+                "这是只读旁路，不要声称已经执行或改动主线任务。\n\n"
                 f"===== 最近对话摘要 =====\n{digest}\n========================\n\n"
                 + (f"【最近的旁路问答】\n{history}\n\n" if history else "")
                 + f"【用户的问题】\n{turn.question}"

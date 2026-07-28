@@ -197,6 +197,22 @@ export const Settings: React.FC<SettingsProps> = ({
           </label>
         </div>
 
+        {/* Workspace Kits 实验特性 */}
+        <div style={sectionStyle}>
+          <label style={{ ...labelStyle, display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer' }}>
+            <input
+              type="checkbox"
+              checked={config.workspaceKitsEnabled}
+              onChange={(e) => onConfigChange({ workspaceKitsEnabled: e.target.checked })}
+              style={{ accentColor: 'var(--theme-accent)' }}
+            />
+            🧰 Workspace Kits（实验）
+          </label>
+          <p style={{ fontSize: 11, color: 'var(--theme-text-muted)', margin: '6px 0 0', lineHeight: 1.5 }}>
+            为每个 Session 启用标准配件、判言、Schedule、结果视图、终端控制与数据市场。
+          </p>
+        </div>
+
         {/* 导出格式 */}
         <div style={sectionStyle}>
           <label style={labelStyle}>Export Format</label>

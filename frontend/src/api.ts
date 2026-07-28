@@ -9,6 +9,7 @@
  */
 
 import type { GitDetectResult, GitStatusResult, GitDiffResult, GitCommitResult, GitLogResult, GitBranchesResult, GitPushPullResult, GitStashListResult } from './types/git';
+import type { WorkspaceKitState, WorkspaceKit, KitRun } from './types/workspaceKits';
 
 type StreamDeltaCallback = (delta: any) => void;
 type SessionUpdateCallback = (data: any) => void;
@@ -80,6 +81,8 @@ type ChatAsideDeltaCallback = (data: { sessionId: string; turnId: string; text: 
 let chatAsideDeltaCallbacks: ChatAsideDeltaCallback[] = [];
 type ChatAsideUpdatedCallback = (data: { sessionId: string; asides: any[]; asideBackendId?: string }) => void;
 let chatAsideUpdatedCallbacks: ChatAsideUpdatedCallback[] = [];
+type KitUpdatedCallback = (data: WorkspaceKitState) => void;
+let kitUpdatedCallbacks: KitUpdatedCallback[] = [];
 
 type SttStreamEndCallback = (data: { reason: string }) => void;
 let sttStreamEndCallbacks: SttStreamEndCallback[] = [];
@@ -345,6 +348,9 @@ function handleMessage(e: MessageEvent, source?: Conn) {
     } else if (msg.event === 'chatAsideUpdated') {
       const data = JSON.parse(msg.data);
       chatAsideUpdatedCallbacks.forEach((cb) => cb(data));
+    } else if (msg.event === 'kitUpdated') {
+      const data = JSON.parse(msg.data);
+      kitUpdatedCallbacks.forEach((cb) => cb(data));
     } else if (msg.event === 'sttStreamText') {
       const data = JSON.parse(msg.data);
       sttStreamCallbacks.forEach((cb) => cb(data));
@@ -1359,6 +1365,48 @@ export const api = {
     return () => { seqtaskUpdatedCallbacks = seqtaskUpdatedCallbacks.filter((c) => c !== cb); };
   },
 
+  // ── Workspace Kits（实验）───────────────────────────────────
+  async kitGetState(sessionId: string): Promise<({ status: string; message?: string } & Partial<WorkspaceKitState>)> {
+    const result = await call('kitGetState', sessionId);
+    try { return JSON.parse(result); } catch { return { status: 'error', message: 'Kit 状态解析失败' }; }
+  },
+  async kitCreate(sessionId: string, spec: Partial<WorkspaceKit>): Promise<{ status: string; kit?: WorkspaceKit; message?: string }> {
+    const result = await call('kitCreate', sessionId, JSON.stringify(spec || {}));
+    try { return JSON.parse(result); } catch { return { status: 'error', message: 'Kit 创建响应解析失败' }; }
+  },
+  async kitUpdate(sessionId: string, kitId: string, patch: Partial<WorkspaceKit>): Promise<{ status: string; kit?: WorkspaceKit; message?: string }> {
+    const result = await call('kitUpdate', sessionId, kitId, JSON.stringify(patch || {}));
+    try { return JSON.parse(result); } catch { return { status: 'error', message: 'Kit 更新响应解析失败' }; }
+  },
+  async kitDelete(sessionId: string, kitId: string): Promise<{ status: string; message?: string }> {
+    const result = await call('kitDelete', sessionId, kitId);
+    try { return JSON.parse(result); } catch { return { status: 'error', message: 'Kit 删除响应解析失败' }; }
+  },
+  async kitRun(sessionId: string, kitId: string, inputs: Record<string, unknown>): Promise<{ status: string; run?: KitRun; message?: string }> {
+    const result = await call('kitRun', sessionId, kitId, JSON.stringify(inputs || {}), 'human');
+    try { return JSON.parse(result); } catch { return { status: 'error', message: 'Kit 运行响应解析失败' }; }
+  },
+  async kitCancel(sessionId: string, runId: string): Promise<{ status: string; statusNow?: string; message?: string }> {
+    const result = await call('kitCancel', sessionId, runId);
+    try { return JSON.parse(result); } catch { return { status: 'error', message: 'Kit 停止响应解析失败' }; }
+  },
+  async kitSetControlMode(sessionId: string, kitId: string, mode: 'ai' | 'human' | 'shared'): Promise<{ status: string; controlMode?: string; message?: string }> {
+    const result = await call('kitSetControlMode', sessionId, kitId, mode);
+    try { return JSON.parse(result); } catch { return { status: 'error', message: '控制模式响应解析失败' }; }
+  },
+  async kitTerminalCommand(sessionId: string, kitId: string, command: string): Promise<{ status: string; run?: KitRun; message?: string }> {
+    const result = await call('kitTerminalCommand', sessionId, kitId, command);
+    try { return JSON.parse(result); } catch { return { status: 'error', message: '终端响应解析失败' }; }
+  },
+  async kitTerminalClose(sessionId: string, kitId: string): Promise<{ status: string; message?: string }> {
+    const result = await call('kitTerminalClose', sessionId, kitId);
+    try { return JSON.parse(result); } catch { return { status: 'error', message: '终端断开响应解析失败' }; }
+  },
+  onKitUpdated(cb: KitUpdatedCallback): () => void {
+    kitUpdatedCallbacks.push(cb);
+    return () => { kitUpdatedCallbacks = kitUpdatedCallbacks.filter((item) => item !== cb); };
+  },
+
   // ── By the way 旁路问答（普通 session）─────────────────────
   async chatAsk(sessionId: string, question: string, images?: any[]): Promise<{ status: string; turnId?: string; message?: string }> {
     const imagesJson = images && images.length ? JSON.stringify(images) : '';
@@ -2276,6 +2324,13 @@ function mockDispatch(method: string, params: any[]): any {
     case 'seqtaskClear': return JSON.stringify({ status: 'ok', seqTasks: [], seqAuto: false });
     case 'seqtaskRemove': case 'seqtaskSetAuto': return JSON.stringify({ status: 'ok' });
     case 'seqtaskTakeNext': return JSON.stringify({ status: 'ok', task: null });
+    case 'kitGetState': return JSON.stringify({
+      status: 'ok', sessionId: params[0], kits: [], runs: [], artifacts: [], dataMarket: [],
+    });
+    case 'kitCreate': case 'kitUpdate': case 'kitDelete':
+    case 'kitRun': case 'kitCancel': case 'kitSetControlMode': case 'kitTerminalCommand':
+    case 'kitTerminalClose':
+      return JSON.stringify({ status: 'error', message: 'mock mode' });
     case 'chatAsk': return JSON.stringify({ status: 'error', message: 'mock mode' });
     case 'chatAsideList': return JSON.stringify({ status: 'ok', asides: [], asideBackendId: '' });
     case 'chatAsideSetBackend': return JSON.stringify({ status: 'ok', asideBackendId: params[1] || '' });

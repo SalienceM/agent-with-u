@@ -7,6 +7,7 @@ import { LoopPanel } from './LoopPanel';
 import { SeqTaskPanel } from './SeqTaskPanel';
 import type { SeqTaskT } from './SeqTaskPanel';
 import { ByTheWayDrawer } from './ByTheWayDrawer';
+import { WorkspaceKitsPanel } from './WorkspaceKitsPanel';
 import { useChat } from '../hooks/useChat';
 import type { AppConfig } from '../hooks/useConfig';
 import { HACKER_CAPTURE_EVENT } from '../utils/hackerMode';
@@ -228,6 +229,10 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
   // ── 序列任务队列 + by-the-way（普通 session 侧挂状态）──
   const [seqTasks, setSeqTasks] = useState<SeqTaskT[]>([]);
   const [byTheWayOpen, setByTheWayOpen] = useState(false);
+  const [workspaceKitsOpen, setWorkspaceKitsOpen] = useState(false);
+  useEffect(() => {
+    if (!config.workspaceKitsEnabled) setWorkspaceKitsOpen(false);
+  }, [config.workspaceKitsEnabled]);
   const dispatchingRef = useRef(false);
   const seqRetryTimerRef = useRef<number | null>(null);
   const dispatchNextRef = useRef<() => void>(() => {});
@@ -567,6 +572,20 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
           }}
           backends={effectiveBackends}
         />
+        {config.workspaceKitsEnabled && (
+          <>
+            <button
+              onClick={() => setWorkspaceKitsOpen(true)}
+              title="Workspace Kits · Session 标准配件（实验）"
+              style={kitFab}
+            >🧰</button>
+            <WorkspaceKitsPanel
+              sessionId={sessionId}
+              open={workspaceKitsOpen}
+              onClose={() => setWorkspaceKitsOpen(false)}
+            />
+          </>
+        )}
       </div>
     );
   }
@@ -886,6 +905,13 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
       {/* ---- By the way 旁路问答：浮动入口 + 抽屉 ---- */}
       {sessionId && (
         <>
+          {config.workspaceKitsEnabled && (
+            <button
+              onClick={() => setWorkspaceKitsOpen(true)}
+              title="Workspace Kits · Session 标准配件（实验）"
+              style={kitFab}
+            >🧰</button>
+          )}
           <button
             onClick={() => setByTheWayOpen(true)}
             title="By the way · 旁路问答（独立上下文，不污染主对话）"
@@ -894,6 +920,13 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
           <ByTheWayDrawer sessionId={sessionId} open={byTheWayOpen} onClose={() => setByTheWayOpen(false)}
             backends={effectiveBackends}
             onSendToChat={(text) => { if (!isStreamingRef.current) doSendRef.current(text); }} />
+          {config.workspaceKitsEnabled && (
+            <WorkspaceKitsPanel
+              sessionId={sessionId}
+              open={workspaceKitsOpen}
+              onClose={() => setWorkspaceKitsOpen(false)}
+            />
+          )}
         </>
       )}
 
@@ -928,6 +961,11 @@ const byTheWayFab: React.CSSProperties = {
   fontSize: 15,
   cursor: 'pointer',
   boxShadow: '0 2px 8px rgba(0,0,0,0.18)',
+};
+
+const kitFab: React.CSSProperties = {
+  ...byTheWayFab,
+  right: 54,
 };
 
 const paneToolBtnStyle: React.CSSProperties = {
