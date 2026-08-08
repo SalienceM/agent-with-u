@@ -2015,48 +2015,56 @@ export const api = {
     files?: Record<string, { hash: string; size: number }>;
   }> {
     const result = await callOn(execKey, 'syncManifest', workingDir);
-    try { return JSON.parse(result); } catch { return { status: 'error', message: 'syncManifest 无响应' }; }
+    return parseRpcObject(result, { status: 'error', message: 'syncManifest 无响应' });
+  },
+
+  /** 快速列出某个远端子树内的文件大小；不算哈希，用于传输规划。 */
+  async syncFileList(workingDir: string, rel = '', execKey?: string): Promise<{
+    status: string; message?: string; files?: Record<string, number>;
+  }> {
+    const result = await callOn(execKey, 'syncFileList', workingDir, rel);
+    return parseRpcObject(result, { status: 'error', message: 'syncFileList 无响应' });
   },
 
   async syncReadFile(workingDir: string, rel: string, execKey?: string): Promise<{
     status: string; message?: string; hash?: string; data?: string; tooLarge?: boolean;
   }> {
     const result = await callOn(execKey, 'syncReadFile', workingDir, rel);
-    try { return JSON.parse(result); } catch { return { status: 'error', message: 'syncReadFile 无响应' }; }
+    return parseRpcObject(result, { status: 'error', message: 'syncReadFile 无响应' });
   },
 
   async syncFileStat(workingDir: string, rel: string, execKey?: string): Promise<{
     status: string; message?: string; size?: number;
   }> {
     const result = await callOn(execKey, 'syncFileStat', workingDir, rel);
-    try { return JSON.parse(result); } catch { return { status: 'error', message: 'syncFileStat 无响应' }; }
+    return parseRpcObject(result, { status: 'error', message: 'syncFileStat 无响应' });
   },
 
   async syncReadChunk(workingDir: string, rel: string, offset: number, size: number, execKey?: string): Promise<{
     status: string; message?: string; offset?: number; size?: number; total?: number; eof?: boolean; data?: string;
   }> {
     const result = await callOn(execKey, 'syncReadChunk', workingDir, rel, offset, size);
-    try { return JSON.parse(result); } catch { return { status: 'error', message: 'syncReadChunk 无响应' }; }
+    return parseRpcObject(result, { status: 'error', message: 'syncReadChunk 无响应' });
   },
 
   async syncWriteStart(workingDir: string, rel: string, transferId: string, execKey?: string): Promise<{ status: string; message?: string }> {
     const result = await callOn(execKey, 'syncWriteStart', workingDir, rel, transferId);
-    try { return JSON.parse(result); } catch { return { status: 'error', message: 'syncWriteStart 无响应' }; }
+    return parseRpcObject(result, { status: 'error', message: 'syncWriteStart 无响应' });
   },
 
   async syncWriteChunk(workingDir: string, rel: string, transferId: string, offset: number, dataBase64: string, execKey?: string): Promise<{ status: string; message?: string; written?: number }> {
     const result = await callOn(execKey, 'syncWriteChunk', workingDir, rel, transferId, offset, dataBase64);
-    try { return JSON.parse(result); } catch { return { status: 'error', message: 'syncWriteChunk 无响应' }; }
+    return parseRpcObject(result, { status: 'error', message: 'syncWriteChunk 无响应' });
   },
 
   async syncWriteFinish(workingDir: string, rel: string, transferId: string, expectedSize: number, execKey?: string): Promise<{ status: string; message?: string; size?: number }> {
     const result = await callOn(execKey, 'syncWriteFinish', workingDir, rel, transferId, expectedSize);
-    try { return JSON.parse(result); } catch { return { status: 'error', message: 'syncWriteFinish 无响应' }; }
+    return parseRpcObject(result, { status: 'error', message: 'syncWriteFinish 无响应' });
   },
 
   async syncWriteAbort(workingDir: string, rel: string, transferId: string, execKey?: string): Promise<{ status: string; message?: string }> {
     const result = await callOn(execKey, 'syncWriteAbort', workingDir, rel, transferId);
-    try { return JSON.parse(result); } catch { return { status: 'error', message: 'syncWriteAbort 无响应' }; }
+    return parseRpcObject(result, { status: 'error', message: 'syncWriteAbort 无响应' });
   },
 
   async syncWriteFile(workingDir: string, rel: string, dataBase64: string, execKey?: string): Promise<{ status: string; message?: string }> {

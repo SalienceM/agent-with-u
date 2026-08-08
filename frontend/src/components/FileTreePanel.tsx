@@ -22,6 +22,7 @@ import { GitPanel } from './GitPanel';
 import type { GitFileStatus, GitFileStatusType, GitStashEntry } from '../types/git';
 import { DiffViewer } from './DiffViewer';
 import { StructuredFilePreview, type StructuredPreviewPayload } from './StructuredFilePreview';
+import { AppModalPortal } from './AppModalPortal';
 import {
   pickLocalDir, restoreLocalDir, loadBaseline, saveBaseline,
   type LocalFs, type Manifest,
@@ -106,7 +107,10 @@ const STRUCTURED_PREVIEW_EXTS = new Set(['doc', 'xlsx', 'xlsm', 'xls', 'pptx', '
 const PREVIEW_TEXT_CAP = 200_000;
 const PREVIEW_ARCHIVE_CAP = 32 * 1024 * 1024;
 const PREVIEW_PDF_CAP = 64 * 1024 * 1024;
-const TRANSFER_CHUNK_SIZE = 512 * 1024;
+// 后端与 Tauri 原语均允许 1 MiB；用满单块可把高延迟中继下的往返次数减半。
+const TRANSFER_CHUNK_SIZE = 1024 * 1024;
+// 不同文件拥有独立临时文件/transferId，可安全并行；限制为 4，兼顾吞吐与内存。
+const TRANSFER_FILE_CONCURRENCY = 4;
 const LANG_ALIAS: Record<string, string> = {
   js: 'javascript', jsx: 'javascript', mjs: 'javascript', cjs: 'javascript', ts: 'typescript',
   tsx: 'typescript', py: 'python', rb: 'ruby', rs: 'rust', go: 'go', java: 'java', kt: 'kotlin',
@@ -186,6 +190,8 @@ interface TransferProgress {
   fileSize: number;
   doneBytes: number;
   totalBytes: number;
+  activeCount: number;
+  startedAt: number;
 }
 
 interface FileContextMenu {
@@ -218,7 +224,6 @@ export const FileTreePanel: React.FC<Props> = ({ sessionId, workingDir, execKey,
   const [loading, setLoading] = useState<Record<string, boolean>>({});
   const [expanded, setExpanded] = useState<Record<string, boolean>>({});
   const [selected, setSelected] = useState<string | null>(null);
-  const [busy, setBusy] = useState('');
   const [msg, setMsg] = useState<{ kind: 'ok' | 'err'; text: string } | null>(null);
 
   // 远端会话的本地副本(离线/比对/同步用)。本地会话不涉及。
@@ -280,6 +285,7 @@ export const FileTreePanel: React.FC<Props> = ({ sessionId, workingDir, execKey,
   const [dirty, setDirty] = useState(false);
   const [saving, setSaving] = useState(false);
   const [transfer, setTransfer] = useState<TransferProgress | null>(null);
+  const transferBusyRef = useRef(false);
   const transferAbortRef = useRef(false);
   const [contextMenu, setContextMenu] = useState<FileContextMenu | null>(null);
 
@@ -982,119 +988,240 @@ export const FileTreePanel: React.FC<Props> = ({ sessionId, workingDir, execKey,
   // ⬇ 下载到本地副本(云端→本地)
   const pull = useCallback(async (node: TNode) => {
     if (!localFs || !workingDir) { setMsg({ kind: 'err', text: '请先选择「本地副本目录」' }); return; }
-    if (transfer) return;
-    setMsg(null); setBusy('准备下载…');
+    if (transfer || transferBusyRef.current) return;
+    transferBusyRef.current = true;
+    setMsg(null);
     transferAbortRef.current = false;
     try {
-      const rels = await collectFiles(node);
-      if (node.isDir && !window.confirm(`下载「${node.name || '根'}」下的 ${rels.length} 个文件到本地？`)) { setBusy(''); return; }
+      let rels: string[];
       const sizes: Record<string, number> = {};
-      for (const rel of rels) {
+      // 未做过哈希比对时，旧逻辑会递归逐层 listDirectory，再为每个文件单独
+      // syncFileStat；经中继时 N 个文件就是大量串行 RTT。改为一次无哈希子树清单。
+      if (node.isDir && !remoteManifest) {
+        const listing = await api.syncFileList(workingDir, node.rel, execKey);
+        if (listing.status !== 'ok' || !listing.files) {
+          throw new Error(listing.message || `无法规划下载目录：${node.rel}`);
+        }
+        rels = Object.keys(listing.files).sort((a, b) => a.localeCompare(b));
+        Object.assign(sizes, listing.files);
+      } else {
+        rels = await collectFiles(node);
+      }
+      if (node.isDir && !window.confirm(`下载「${node.name || '根'}」下的 ${rels.length} 个文件到本地？`)) return;
+      await Promise.all(rels.map(async (rel) => {
+        if (typeof sizes[rel] === 'number') return;
         const known = remoteManifest?.[rel]?.size;
-        if (typeof known === 'number') sizes[rel] = known;
-        else {
+        if (typeof known === 'number') {
+          sizes[rel] = known;
+        } else {
           const stat = await api.syncFileStat(workingDir, rel, execKey);
           if (stat.status !== 'ok' || typeof stat.size !== 'number') throw new Error(stat.message || `无法读取文件大小：${rel}`);
           sizes[rel] = stat.size;
         }
-      }
+      }));
       const totalBytes = rels.reduce((sum, rel) => sum + sizes[rel], 0);
       const ok: string[] = [];
+      const fileProgress = new Map<string, number>();
+      const startedAt = Date.now();
       let doneBytes = 0;
-      for (let i = 0; i < rels.length; i++) {
-        const rel = rels[i];
-        const size = sizes[rel];
-        const id = transferId();
-        setBusy(`下载 ${i + 1}/${rels.length}：${rel}`);
-        setTransfer({ direction: 'pull', rel, fileIndex: i + 1, fileCount: rels.length, fileBytes: 0, fileSize: size, doneBytes, totalBytes });
-        await localFs.writeStart(rel, id);
-        let offset = 0;
-        try {
-          while (offset < size) {
-            if (transferAbortRef.current) throw new Error('__TRANSFER_CANCELLED__');
-            const result = await api.syncReadChunk(workingDir, rel, offset, Math.min(TRANSFER_CHUNK_SIZE, size - offset), execKey);
-            if (result.status !== 'ok' || result.data == null) throw new Error(result.message || `下载失败：${rel}`);
-            const chunkBytes = result.size ?? 0;
-            if (chunkBytes <= 0 && offset < size) throw new Error(`下载返回空分块：${rel}`);
-            await localFs.writeChunk(rel, id, offset, result.data);
-            offset += chunkBytes;
-            setTransfer({ direction: 'pull', rel, fileIndex: i + 1, fileCount: rels.length, fileBytes: offset, fileSize: size, doneBytes: doneBytes + offset, totalBytes });
+      let lastProgressPaint = 0;
+      let latestProgress: { rel: string; index: number; fileBytes: number; activeCount: number } | null = null;
+      const applyCompleted = () => {
+        if (ok.length === 0) return;
+        bumpBaseline(ok, remoteManifest);
+        // 文件已按大小验收并原子落盘；直接增量更新清单，避免完成后再次哈希
+        // 整棵目录（包含 .git 时这段尾部等待尤其明显）。下次“比对”仍会完整复核。
+        setLocalManifest((previous) => {
+          const next = { ...(previous || {}) };
+          for (const rel of ok) {
+            next[rel] = remoteManifest?.[rel] || {
+              size: sizes[rel], hash: `pending-transfer:${startedAt}:${sizes[rel]}`,
+            };
           }
-          await localFs.writeFinish(rel, id, size);
-          doneBytes += size;
-          ok.push(rel);
-        } catch (error) {
-          await localFs.writeAbort(rel, id).catch(() => {});
-          throw error;
+          return next;
+        });
+      };
+      const paintProgress = (force = false) => {
+        if (!latestProgress) return;
+        const now = Date.now();
+        if (!force && now - lastProgressPaint < 80) return;
+        lastProgressPaint = now;
+        const { rel, index, fileBytes, activeCount } = latestProgress;
+        setTransfer({
+          direction: 'pull', rel, fileIndex: index + 1, fileCount: rels.length,
+          fileBytes, fileSize: sizes[rel], doneBytes, totalBytes, activeCount, startedAt,
+        });
+      };
+      const publish = (rel: string, index: number, fileBytes: number, activeCount: number) => {
+        const previous = fileProgress.get(rel) || 0;
+        fileProgress.set(rel, fileBytes);
+        doneBytes += Math.max(0, fileBytes - previous);
+        latestProgress = { rel, index, fileBytes, activeCount };
+        paintProgress();
+      };
+
+      for (let batchStart = 0; batchStart < rels.length; batchStart += TRANSFER_FILE_CONCURRENCY) {
+        const batch = rels.slice(batchStart, batchStart + TRANSFER_FILE_CONCURRENCY);
+        const settled = await Promise.allSettled(batch.map(async (rel, batchIndex) => {
+          const index = batchStart + batchIndex;
+          const size = sizes[rel];
+          const id = transferId();
+          if (transferAbortRef.current) throw new Error('__TRANSFER_CANCELLED__');
+          publish(rel, index, 0, batch.length);
+          await localFs.writeStart(rel, id);
+          let offset = 0;
+          try {
+            while (offset < size) {
+              if (transferAbortRef.current) throw new Error('__TRANSFER_CANCELLED__');
+              const result = await api.syncReadChunk(
+                workingDir, rel, offset,
+                Math.min(TRANSFER_CHUNK_SIZE, size - offset), execKey,
+              );
+              if (result.status !== 'ok' || result.data == null) throw new Error(result.message || `下载失败：${rel}`);
+              const chunkBytes = result.size ?? 0;
+              if (chunkBytes <= 0 && offset < size) throw new Error(`下载返回空分块：${rel}`);
+              await localFs.writeChunk(rel, id, offset, result.data);
+              offset += chunkBytes;
+              publish(rel, index, offset, batch.length);
+            }
+            await localFs.writeFinish(rel, id, size);
+            publish(rel, index, size, batch.length);
+            ok.push(rel);
+          } catch (error) {
+            await localFs.writeAbort(rel, id).catch(() => {});
+            throw error;
+          }
+        }));
+        const failed = settled.find((result): result is PromiseRejectedResult => result.status === 'rejected');
+        if (failed) {
+          applyCompleted();
+          throw failed.reason;
+        }
+        if (transferAbortRef.current) {
+          applyCompleted();
+          throw new Error('__TRANSFER_CANCELLED__');
         }
       }
-      bumpBaseline(ok, remoteManifest);
+
+      paintProgress(true);
+      applyCompleted();
       setMsg({ kind: 'ok', text: `✓ 已下载 ${ok.length}/${rels.length} 个文件到本地` });
-      await scanLocal(localFs);
     } catch (e: any) {
       setMsg({ kind: 'err', text: e?.message === '__TRANSFER_CANCELLED__' ? '下载已取消，未完成文件不会覆盖本地原文件' : `下载失败：${e?.message ?? e}` });
     }
-    finally { setBusy(''); setTransfer(null); transferAbortRef.current = false; }
-  }, [localFs, workingDir, execKey, collectFiles, bumpBaseline, remoteManifest, scanLocal, transfer]);
+    finally { transferBusyRef.current = false; setTransfer(null); transferAbortRef.current = false; }
+  }, [localFs, workingDir, execKey, collectFiles, bumpBaseline, remoteManifest, transfer]);
 
   // ⬆ 上传本地改动(本地→云端)
   const push = useCallback(async (node: TNode) => {
     if (!localFs || !workingDir || !localManifest) return;
-    if (transfer) return;
-    setMsg(null); setBusy('准备上传…');
+    if (transfer || transferBusyRef.current) return;
+    transferBusyRef.current = true;
+    setMsg(null);
     transferAbortRef.current = false;
     try {
       const prefix = node.rel ? `${node.rel}/` : '';
       const rels = node.isDir ? Object.keys(localManifest).filter((r) => !node.rel || r === node.rel || r.startsWith(prefix)) : [node.rel];
-      if (node.isDir && !window.confirm(`把本地「${node.name || '根'}」下的 ${rels.length} 个文件上传到远端？`)) { setBusy(''); return; }
+      if (node.isDir && !window.confirm(`把本地「${node.name || '根'}」下的 ${rels.length} 个文件上传到远端？`)) return;
       const sizes: Record<string, number> = {};
       for (const rel of rels) sizes[rel] = localManifest[rel]?.size ?? await localFs.fileSize(rel);
       const totalBytes = rels.reduce((sum, rel) => sum + sizes[rel], 0);
       const ok: string[] = [];
+      const fileProgress = new Map<string, number>();
+      const startedAt = Date.now();
       let doneBytes = 0;
-      for (let i = 0; i < rels.length; i++) {
-        const rel = rels[i];
-        const size = sizes[rel];
-        const id = transferId();
-        setBusy(`上传 ${i + 1}/${rels.length}：${rel}`);
-        setTransfer({ direction: 'push', rel, fileIndex: i + 1, fileCount: rels.length, fileBytes: 0, fileSize: size, doneBytes, totalBytes });
-        const start = await api.syncWriteStart(workingDir, rel, id, execKey);
-        if (start.status !== 'ok') throw new Error(start.message || `无法开始上传：${rel}`);
-        let offset = 0;
-        try {
-          while (offset < size) {
-            if (transferAbortRef.current) throw new Error('__TRANSFER_CANCELLED__');
-            const data = await localFs.readChunk(rel, offset, Math.min(TRANSFER_CHUNK_SIZE, size - offset));
-            const result = await api.syncWriteChunk(workingDir, rel, id, offset, data, execKey);
-            if (result.status !== 'ok') throw new Error(result.message || `上传失败：${rel}`);
-            const chunkBytes = result.written ?? Math.min(TRANSFER_CHUNK_SIZE, size - offset);
-            if (chunkBytes <= 0) throw new Error(`上传返回空分块：${rel}`);
-            offset += chunkBytes;
-            setTransfer({ direction: 'push', rel, fileIndex: i + 1, fileCount: rels.length, fileBytes: offset, fileSize: size, doneBytes: doneBytes + offset, totalBytes });
+      let lastProgressPaint = 0;
+      let latestProgress: { rel: string; index: number; fileBytes: number; activeCount: number } | null = null;
+      const applyUploaded = async () => {
+        if (ok.length === 0) return;
+        bumpBaseline(ok, localManifest);
+        setRemoteManifest((prev) => {
+          if (!prev) return prev;
+          const next = { ...prev };
+          for (const rel of ok) if (localManifest[rel]) next[rel] = localManifest[rel];
+          return next;
+        });
+
+        // 不重扫所有已展开目录；只刷新本次节点的直接可见层，
+        // 让新上传的文件/目录立即显示，更深层仍由懒加载按需读取。
+        const parts = node.rel.split('/').filter(Boolean);
+        const parent = parts.slice(0, -1).join('/');
+        const visibleLevels = new Set<string>([parent]);
+        if (node.isDir && expanded[node.rel]) visibleLevels.add(node.rel);
+        await Promise.all([...visibleLevels].map((rel) => loadChildren(rel)));
+      };
+      const paintProgress = (force = false) => {
+        if (!latestProgress) return;
+        const now = Date.now();
+        if (!force && now - lastProgressPaint < 80) return;
+        lastProgressPaint = now;
+        const { rel, index, fileBytes, activeCount } = latestProgress;
+        setTransfer({
+          direction: 'push', rel, fileIndex: index + 1, fileCount: rels.length,
+          fileBytes, fileSize: sizes[rel], doneBytes, totalBytes, activeCount, startedAt,
+        });
+      };
+      const publish = (rel: string, index: number, fileBytes: number, activeCount: number) => {
+        const previous = fileProgress.get(rel) || 0;
+        fileProgress.set(rel, fileBytes);
+        doneBytes += Math.max(0, fileBytes - previous);
+        latestProgress = { rel, index, fileBytes, activeCount };
+        paintProgress();
+      };
+
+      for (let batchStart = 0; batchStart < rels.length; batchStart += TRANSFER_FILE_CONCURRENCY) {
+        const batch = rels.slice(batchStart, batchStart + TRANSFER_FILE_CONCURRENCY);
+        const settled = await Promise.allSettled(batch.map(async (rel, batchIndex) => {
+          const index = batchStart + batchIndex;
+          const size = sizes[rel];
+          const id = transferId();
+          if (transferAbortRef.current) throw new Error('__TRANSFER_CANCELLED__');
+          publish(rel, index, 0, batch.length);
+          const start = await api.syncWriteStart(workingDir, rel, id, execKey);
+          if (start.status !== 'ok') throw new Error(start.message || `无法开始上传：${rel}`);
+          let offset = 0;
+          try {
+            while (offset < size) {
+              if (transferAbortRef.current) throw new Error('__TRANSFER_CANCELLED__');
+              const requestSize = Math.min(TRANSFER_CHUNK_SIZE, size - offset);
+              const data = await localFs.readChunk(rel, offset, requestSize);
+              const result = await api.syncWriteChunk(workingDir, rel, id, offset, data, execKey);
+              if (result.status !== 'ok') throw new Error(result.message || `上传失败：${rel}`);
+              const chunkBytes = result.written ?? requestSize;
+              if (chunkBytes <= 0) throw new Error(`上传返回空分块：${rel}`);
+              offset += chunkBytes;
+              publish(rel, index, offset, batch.length);
+            }
+            const finish = await api.syncWriteFinish(workingDir, rel, id, size, execKey);
+            if (finish.status !== 'ok') throw new Error(finish.message || `上传完成校验失败：${rel}`);
+            publish(rel, index, size, batch.length);
+            ok.push(rel);
+          } catch (error) {
+            await api.syncWriteAbort(workingDir, rel, id, execKey).catch(() => {});
+            throw error;
           }
-          const finish = await api.syncWriteFinish(workingDir, rel, id, size, execKey);
-          if (finish.status !== 'ok') throw new Error(finish.message || `上传完成校验失败：${rel}`);
-          doneBytes += size;
-          ok.push(rel);
-        } catch (error) {
-          await api.syncWriteAbort(workingDir, rel, id, execKey).catch(() => {});
-          throw error;
+        }));
+        const failed = settled.find((result): result is PromiseRejectedResult => result.status === 'rejected');
+        if (failed) {
+          await applyUploaded();
+          throw failed.reason;
+        }
+        if (transferAbortRef.current) {
+          await applyUploaded();
+          throw new Error('__TRANSFER_CANCELLED__');
         }
       }
-      bumpBaseline(ok, localManifest);
-      setRemoteManifest((prev) => {
-        if (!prev) return prev;
-        const next = { ...prev };
-        for (const rel of ok) if (localManifest[rel]) next[rel] = localManifest[rel];
-        return next;
-      });
+
+      paintProgress(true);
+      await applyUploaded();
+      // 合并树会依据上面的 remoteManifest 增量立刻更新，无需在传输完成后
+      // 再对所有已展开目录发一轮 listDirectory RPC。
       setMsg({ kind: 'ok', text: `✓ 已上传 ${ok.length}/${rels.length} 个文件到远端` });
-      await reloadAll();
     } catch (e: any) {
       setMsg({ kind: 'err', text: e?.message === '__TRANSFER_CANCELLED__' ? '上传已取消，未完成文件不会覆盖远端原文件' : `上传失败：${e?.message ?? e}` });
     }
-    finally { setBusy(''); setTransfer(null); transferAbortRef.current = false; }
-  }, [localFs, workingDir, execKey, localManifest, bumpBaseline, reloadAll, transfer]);
+    finally { transferBusyRef.current = false; setTransfer(null); transferAbortRef.current = false; }
+  }, [localFs, workingDir, execKey, localManifest, bumpBaseline, transfer, expanded, loadChildren]);
 
   /** 为浏览器预览分块取回二进制，绕开旧的 32 MiB 整文件 WS 帧并实时反馈读取进度。 */
   const readPreviewBytes = useCallback(async (
@@ -1390,8 +1517,8 @@ export const FileTreePanel: React.FC<Props> = ({ sessionId, workingDir, execKey,
         .ftp-act { opacity: 0; }
         .ftp-row:hover .ftp-act { opacity: 1; }
         .ftp-act:disabled { opacity: .35 !important; cursor: not-allowed !important; }
-        .ftp-hbtn { opacity: 0; transition: opacity 0.12s; }
-        .ftp-hdr:hover .ftp-hbtn { opacity: 1; }
+        .ftp-hactions { opacity: 0; pointer-events: none; transition: opacity 0.12s ease; }
+        .ftp-hdr:hover .ftp-hactions, .ftp-hactions:focus-within { opacity: 1; pointer-events: auto; }
       `}</style>
 
       {/* ★ 消息提示条（面板级） */}
@@ -1411,44 +1538,47 @@ export const FileTreePanel: React.FC<Props> = ({ sessionId, workingDir, execKey,
 
       {/* 顶部工具条 */}
       <div className="ftp-hdr" style={topBarStyle}>
-        <span style={{ fontSize: 14 }}>{isRemote ? '☁️' : '🗂'}</span>
-        <span style={{ fontWeight: 700, fontSize: 11, letterSpacing: 0.4, textTransform: 'uppercase', color: 'var(--theme-text)' }}>
-          {isRemote ? '远端工作目录' : '工作目录'}
-        </span>
-        {isRemote && execLabel && <span style={tagStyle} title={workingDir}>{execLabel}</span>}
-        {gitAvailable && gitBranch && (
-          <span style={gitBranchBadgeStyle} title={`Git branch: ${gitBranch}`}>🔀 {gitBranch}</span>
-        )}
-        {gitAvailable && (
-          <button
-            className="ftp-hbtn"
-            style={{ ...hdrIconStyle, fontSize: 11, width: 'auto', padding: '0 6px', gap: 3, display: 'inline-flex', alignItems: 'center' }}
-            title="Stash 当前改动"
-            onClick={handleStashPush}
-          >📦 Stash</button>
-        )}
-        {gitAvailable && (
-          <button
-            className="ftp-hbtn"
-            style={{
-              ...hdrIconStyle, fontSize: 11, width: 'auto', padding: '0 6px',
-              ...(stashExpanded ? { background: 'var(--theme-accent-bg)', color: 'var(--theme-accent)' } : {}),
-            }}
-            title="查看 Stash 列表"
-            onClick={() => setStashExpanded((v) => !v)}
-          >{stashes.length > 0 && <span style={{ marginLeft: 2, fontSize: 10 }}>({stashes.length})</span>}</button>
-        )}
-        {gitAvailable && (
-          <button
-            className="ftp-hbtn"
-            style={{ ...hdrIconStyle, fontSize: 11, width: 'auto', padding: '0 6px', gap: 3, display: 'inline-flex', alignItems: 'center' }}
-            title="查看 Git 提交历史"
-            onClick={() => setGitLogOpen(true)}
-          > Log</button>
-        )}
-        <div style={{ flex: 1 }} />
-        <button className="ftp-hbtn" style={hdrIconStyle} title="刷新本机与远端目录" onClick={refreshAll}>↻</button>
-        <button className="ftp-hbtn" style={hdrIconStyle} title="全部折叠" onClick={() => setExpanded({})}>⊟</button>
+        <div style={headerIdentityStyle}>
+          <span style={{ fontSize: 14, flexShrink: 0 }}>{isRemote ? '☁️' : '🗂'}</span>
+          <span
+            title={isRemote ? '远端工作目录' : '工作目录'}
+            style={headerTitleStyle}
+          >
+            {isRemote ? '远端工作目录' : '工作目录'}
+          </span>
+          {isRemote && execLabel && <span style={tagStyle} title={workingDir}>{execLabel}</span>}
+          {gitAvailable && gitBranch && (
+            <span style={gitBranchBadgeStyle} title={`Git branch: ${gitBranch}`}>🔀 {gitBranch}</span>
+          )}
+        </div>
+        <div className="ftp-hactions" style={headerActionsStyle}>
+          {gitAvailable && (
+            <button
+              style={{ ...hdrIconStyle, fontSize: 11, width: 'auto', padding: '0 6px', gap: 3 }}
+              title="Stash 当前改动"
+              onClick={handleStashPush}
+            >📦 Stash</button>
+          )}
+          {gitAvailable && (
+            <button
+              style={{
+                ...hdrIconStyle, fontSize: 11, width: 'auto', padding: '0 6px',
+                ...(stashExpanded ? { background: 'var(--theme-accent-bg)', color: 'var(--theme-accent)' } : {}),
+              }}
+              title="查看 Stash 列表"
+              onClick={() => setStashExpanded((v) => !v)}
+            >▾{stashes.length > 0 && <span style={{ marginLeft: 2, fontSize: 10 }}>({stashes.length})</span>}</button>
+          )}
+          {gitAvailable && (
+            <button
+              style={{ ...hdrIconStyle, fontSize: 11, width: 'auto', padding: '0 6px', gap: 3 }}
+              title="查看 Git 提交历史"
+              onClick={() => setGitLogOpen(true)}
+            >Log</button>
+          )}
+          <button style={hdrIconStyle} title="刷新本机与远端目录" onClick={refreshAll}>↻</button>
+          <button style={hdrIconStyle} title="全部折叠" onClick={() => setExpanded({})}>⊟</button>
+        </div>
       </div>
 
       {/* 远端目录在执行节点上；这里绑定当前 session 对应的本机目录，可随时更换。 */}
@@ -1503,6 +1633,8 @@ export const FileTreePanel: React.FC<Props> = ({ sessionId, workingDir, execKey,
       {transfer && (() => {
         const overall = transfer.totalBytes > 0 ? Math.min(100, transfer.doneBytes / transfer.totalBytes * 100) : 100;
         const current = transfer.fileSize > 0 ? Math.min(100, transfer.fileBytes / transfer.fileSize * 100) : 100;
+        const elapsedSeconds = Math.max(0.25, (Date.now() - transfer.startedAt) / 1000);
+        const bytesPerSecond = transfer.doneBytes / elapsedSeconds;
         return (
           <div style={transferBoxStyle}>
             <div style={{ display: 'flex', alignItems: 'center', gap: 7, minWidth: 0 }}>
@@ -1512,6 +1644,8 @@ export const FileTreePanel: React.FC<Props> = ({ sessionId, workingDir, execKey,
               </span>
               <span style={{ color: 'var(--theme-text-muted)', fontVariantNumeric: 'tabular-nums', whiteSpace: 'nowrap' }}>
                 {formatBytes(transfer.fileBytes)} / {formatBytes(transfer.fileSize)}
+                {transfer.doneBytes > 0 ? ` · ${formatBytes(bytesPerSecond)}/s` : ''}
+                {transfer.activeCount > 1 ? ` · ×${transfer.activeCount}` : ''}
               </span>
               <button style={transferCancelStyle} onClick={() => { transferAbortRef.current = true; }}>取消</button>
             </div>
@@ -1695,12 +1829,13 @@ export const FileTreePanel: React.FC<Props> = ({ sessionId, workingDir, execKey,
           );
         };
         return (
-          <div style={gitModalOverlayStyle} onClick={() => {
-            if (!gitCommitting) {
-              setGitModalOpen(false);
-              setGitCommitPendingPush(false);
-            }
-          }}>
+          <AppModalPortal>
+            <div style={gitModalOverlayStyle} onClick={() => {
+              if (!gitCommitting) {
+                setGitModalOpen(false);
+                setGitCommitPendingPush(false);
+              }
+            }}>
             <div style={gitModalBoxStyle} onClick={(e) => e.stopPropagation()}>
               {/* 顶栏 */}
               <div style={gitModalHeaderStyle}>
@@ -1910,13 +2045,15 @@ export const FileTreePanel: React.FC<Props> = ({ sessionId, workingDir, execKey,
                 </div>
               </div>
             </div>
-          </div>
+            </div>
+          </AppModalPortal>
         );
       })()}
 
       {preview && (
-        <div style={pvOverlay} onClick={closePreview}>
-          <div style={{ ...pvBox, ...(previewMaximized ? pvBoxMaximized : {}) }} onClick={(e) => e.stopPropagation()}>
+        <AppModalPortal>
+          <div style={pvOverlay} onClick={closePreview}>
+            <div style={{ ...pvBox, ...(previewMaximized ? pvBoxMaximized : {}) }} onClick={(e) => e.stopPropagation()}>
             <div style={pvHeader}>
               <span style={{ fontSize: 13 }}>{preview.isImage ? '🖼️' : preview.renderer === 'pdf' ? '📕' : preview.renderer === 'docx' ? '📘' : preview.renderer === 'drawio' ? '🧩' : preview.structured ? '📊' : editing ? '✏️' : '📄'}</span>
               <span style={{ fontWeight: 600, fontSize: 13, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={preview.rel}>
@@ -1989,14 +2126,16 @@ export const FileTreePanel: React.FC<Props> = ({ sessionId, workingDir, execKey,
                 </pre>
               )}
             </div>
+            </div>
           </div>
-        </div>
+        </AppModalPortal>
       )}
 
       {/* \u2605 Git Diff \u72ec\u7acb\u9762\u677f */}
       {diffPanelOpen && (
-        <div style={diffOverlayStyle} onClick={() => setDiffPanelOpen(false)}>
-          <div style={diffBoxStyle} onClick={(e) => e.stopPropagation()}>
+        <AppModalPortal>
+          <div style={diffOverlayStyle} onClick={() => setDiffPanelOpen(false)}>
+            <div style={diffBoxStyle} onClick={(e) => e.stopPropagation()}>
             {/* \u9876\u680f\uff1a\u6587\u4ef6\u540d + \u4e0a/\u4e0b\u4e00\u4e2a */}
             <div style={diffTopBarStyle}>
               <span style={{ fontSize: 13, fontWeight: 700, color: '#c9d1d9' }}>
@@ -2024,8 +2163,9 @@ export const FileTreePanel: React.FC<Props> = ({ sessionId, workingDir, execKey,
                 <DiffViewer diff={diffPanelDiff} filename={diffPanelFile} />
               )}
             </div>
+            </div>
           </div>
-        </div>
+        </AppModalPortal>
       )}
     </div>
   );
@@ -2215,9 +2355,27 @@ const wrapStyle: React.CSSProperties = {
 };
 
 const topBarStyle: React.CSSProperties = {
-  display: 'flex', alignItems: 'center', gap: 6,
-  padding: '6px 10px', flexShrink: 0,
+  position: 'relative', display: 'flex', alignItems: 'center',
+  minHeight: 34, padding: '5px 10px', flexShrink: 0, overflow: 'hidden',
   borderBottom: '1px solid var(--theme-border, rgba(255,255,255,0.08))',
+};
+
+const headerIdentityStyle: React.CSSProperties = {
+  display: 'flex', alignItems: 'center', gap: 6,
+  flex: 1, minWidth: 0, maxWidth: '100%', overflow: 'hidden',
+};
+
+const headerTitleStyle: React.CSSProperties = {
+  fontWeight: 700, fontSize: 11, letterSpacing: 0.35,
+  textTransform: 'uppercase', color: 'var(--theme-text)',
+  whiteSpace: 'nowrap', flexShrink: 0,
+};
+
+const headerActionsStyle: React.CSSProperties = {
+  position: 'absolute', zIndex: 2, top: 5, right: 6,
+  height: 24, display: 'flex', alignItems: 'center', gap: 1,
+  paddingLeft: 12,
+  background: 'linear-gradient(90deg, transparent 0, var(--theme-bg-secondary, #1e1e1e) 12px)',
 };
 
 const localDirBarStyle: React.CSSProperties = {
@@ -2269,13 +2427,16 @@ const tagStyle: React.CSSProperties = {
   fontSize: 10, padding: '1px 6px', borderRadius: 8,
   background: 'rgba(88,166,255,0.15)', color: '#58a6ff',
   border: '1px solid rgba(88,166,255,0.25)', marginLeft: 4,
-  maxWidth: 100, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+  minWidth: 0, maxWidth: 100, flexShrink: 1,
+  overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
 };
 
 const gitBranchBadgeStyle: React.CSSProperties = {
   fontSize: 10, padding: '1px 6px', borderRadius: 8,
   background: 'rgba(63,185,80,0.12)', color: '#3fb950',
   border: '1px solid rgba(63,185,80,0.25)', marginLeft: 4,
+  minWidth: 0, maxWidth: 110, flexShrink: 1,
+  overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
 };
 
 const hdrIconStyle: React.CSSProperties = {

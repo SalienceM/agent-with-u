@@ -565,12 +565,21 @@ def _codex_visible_messages(
     writing an agent item while we inspect its rollout; waiting for completion
     prevents the cursor from advancing over partial text.
     """
-    try:
-        stamp = float(thread.get("createdAt") or time.time())
-        if stamp > 100_000_000_000:
-            stamp /= 1000.0
-    except (TypeError, ValueError):
-        stamp = time.time()
+    def epoch_seconds(value: object, fallback: float) -> float:
+        try:
+            stamp = float(value) if value is not None else fallback
+            if stamp > 100_000_000_000:
+                stamp /= 1000.0
+            return stamp if stamp > 0 else fallback
+        except (TypeError, ValueError):
+            return fallback
+
+    # thread/read v2 exposes second-resolution ``startedAt`` / ``completedAt``
+    # on every turn.  Older code assigned thread.createdAt to the whole history
+    # and merely added 1 ms per message, so a turn completed today could still
+    # appear as yesterday after a takeover refresh.
+    thread_created_at = epoch_seconds(thread.get("createdAt"), time.time())
+    last_stamp = thread_created_at - 0.001
 
     normalized: list[ChatMessage] = []
     latest_item_id: Optional[str] = None
@@ -583,6 +592,7 @@ def _codex_visible_messages(
         turn_status = str(turn.get("status") or "").strip().lower()
         if turn_status not in terminal_statuses:
             continue
+        visible_items: list[tuple[str, str, str]] = []
         for item in turn.get("items") or []:
             if not isinstance(item, dict):
                 continue
@@ -607,6 +617,21 @@ def _codex_visible_messages(
             if not role or not text:
                 continue
             item_id = str(item.get("id") or new_id())
+            visible_items.append((item_id, role, text))
+
+        if not visible_items:
+            continue
+        turn_start = epoch_seconds(turn.get("startedAt"), last_stamp + 0.001)
+        turn_start = max(turn_start, last_stamp + 0.001)
+        turn_end = epoch_seconds(turn.get("completedAt"), turn_start)
+        turn_end = max(turn_end, turn_start)
+        count = len(visible_items)
+        for index, (item_id, role, text) in enumerate(visible_items):
+            if count > 1 and turn_end > turn_start:
+                stamp = turn_start + ((turn_end - turn_start) * index / (count - 1))
+            else:
+                stamp = turn_start + (index * 0.001)
+            stamp = max(stamp, last_stamp + 0.001)
             normalized.append(ChatMessage(
                 id=item_id,
                 role=role,
@@ -614,7 +639,7 @@ def _codex_visible_messages(
                 timestamp=stamp,
             ))
             latest_item_id = item_id
-            stamp += 0.001
+            last_stamp = stamp
 
     original_count = len(normalized)
     remaining_chars = max(1, int(max_chars))
@@ -2777,6 +2802,17 @@ class BridgeWS:
 
         native_messages, latest_item_id, _ = _codex_visible_messages(thread)
         native_index = {message.id: index for index, message in enumerate(native_messages)}
+        native_by_id = {message.id: message for message in native_messages}
+        timestamped_native_ids = {
+            str(item.get("id"))
+            for turn in (thread.get("turns") or [])
+            if isinstance(turn, dict)
+            and (turn.get("startedAt") is not None or turn.get("completedAt") is not None)
+            for item in (turn.get("items") or [])
+            if isinstance(item, dict)
+            and item.get("id")
+            and item.get("type") in {"userMessage", "agentMessage"}
+        }
         anchor = session.codex_sync_last_item_id
         local_count = max(0, min(session.codex_sync_local_count, len(session.messages)))
 
@@ -2817,6 +2853,30 @@ class BridgeWS:
             additions.append(native)
             all_local_ids.add(native.id)
 
+        # Repair legacy takeover mirrors whose entire history inherited the
+        # thread creation time.  Array position remains authoritative; this only
+        # restores truthful date/time metadata for known native item IDs.
+        timestamp_repairs = 0
+        for local_message in session.messages:
+            native_message = native_by_id.get(local_message.id)
+            if (
+                native_message
+                and local_message.id in timestamped_native_ids
+                and native_message.timestamp > 0
+                and abs(float(local_message.timestamp or 0) - native_message.timestamp) > 0.5
+            ):
+                local_message.timestamp = native_message.timestamp
+                timestamp_repairs += 1
+
+        # Missing timestamps in older app-server payloads fall back to the
+        # thread creation time.  Never let newly appended items move the visible
+        # clock backwards relative to AgentWithU's richer local tail.
+        visible_stamp = float(session.messages[-1].timestamp or 0) if session.messages else 0.0
+        for addition in additions:
+            if addition.timestamp <= visible_stamp:
+                addition.timestamp = visible_stamp + 0.001
+            visible_stamp = addition.timestamp
+
         old_anchor = session.codex_sync_last_item_id
         old_local_count = session.codex_sync_local_count
         if additions:
@@ -2838,20 +2898,22 @@ class BridgeWS:
         )
         if change_token is not None:
             tokens[sid] = change_token
-        if additions or cursor_changed:
+        if additions or cursor_changed or timestamp_repairs:
             self._session_store.save(session, async_=True)
-        if additions:
+        if additions or timestamp_repairs:
             self._emit_session_updated({
                 "type": "codex_thread_synced",
                 "sessionId": sid,
                 "addedCount": len(additions),
+                "timestampRepairs": timestamp_repairs,
                 "messagesTotal": len(session.messages),
                 "summary": session.meta_dict(),
             })
         return {
             "status": "ok",
-            "changed": bool(additions),
+            "changed": bool(additions or timestamp_repairs),
             "addedCount": len(additions),
+            "timestampRepairs": timestamp_repairs,
             "messagesTotal": len(session.messages),
         }
 
@@ -8270,6 +8332,25 @@ Kit 版本账本（版本属于 Kit，不属于 AI）：
             f"-d '{payload}'"
         )
 
+    @staticmethod
+    def _build_skill_python_cmd(call_script: str, args: list[str]) -> str:
+        """Build a Python-backed Skill command that is portable across Bash hosts.
+
+        Agent shells on Windows are not uniform: Git Bash accepts ``C:/...``
+        executables directly, while ``bash.exe`` may actually be WSL and needs
+        the imported ``/mnt/c/...`` executable path.  Resolving the interpreter
+        inside the active Bash avoids leaking a host-specific ``sys.executable``
+        path into SKILL.md.  ``_resolve_python_exe`` still gates whether the
+        Python or curl template is generated at all.
+        """
+        quoted_args = " ".join(json.dumps(arg, ensure_ascii=False) for arg in args)
+        suffix = f" {quoted_args}" if quoted_args else ""
+        return (
+            '_AWU_PYTHON="$(command -v python.exe || command -v python3 || '
+            'command -v python)" && '
+            f'"$_AWU_PYTHON" "{call_script}"{suffix}'
+        )
+
     def _generate_backend_skill_md(
         self,
         skill_name: str,
@@ -8294,7 +8375,7 @@ Kit 版本账本（版本属于 Kit，不属于 AI）：
         primary_field = required_list[0] if required_list else (list(props.keys())[0] if props else "prompt")
         # 构建参数说明和命令示例
         args_doc: list[str] = []
-        args_example: list[str] = [f'"<{primary_field.upper()}>"']
+        args_example: list[str] = [f"<{primary_field.upper()}>"]
         for pname, pdef in props.items():
             if pname == primary_field:
                 continue
@@ -8302,17 +8383,18 @@ Kit 版本账本（版本属于 Kit，不属于 AI）：
             is_req = pname in required
             tag = "必填" if is_req else "可选"
             args_doc.append(f"- {pname}（{tag}）：{pdesc}")
-            args_example.append(f'"<{pname.upper()}>"')
+            args_example.append(f"<{pname.upper()}>")
 
         # 图像生成 backend：注入 ref_image 参数说明
         if is_image_backend:
             args_doc.append("- ref_image（可选）：参考图片的 URL（如用户已上传图片，应传入图片地址，用于图生图）")
-            args_example.append('"<REF_IMAGE_URL>"')
+            args_example.append("<REF_IMAGE_URL>")
 
         # 基本命令 & 完整命令（Python 模式 vs curl fallback）
         if python:
-            basic_cmd = f'"{python}" {call_script} "<{primary_field.upper()}>"'
-            full_cmd = f'"{python}" {call_script} {" ".join(args_example)}'
+            basic_cmd = self._build_skill_python_cmd(
+                call_script, [f"<{primary_field.upper()}>"])
+            full_cmd = self._build_skill_python_cmd(call_script, args_example)
         else:
             # PyInstaller 打包且系统无 Python —— 用 curl 直接调 HTTP API
             basic_cmd = self._build_skill_curl_cmd(
@@ -8674,7 +8756,8 @@ except urllib.error.URLError as e:
 
             # 根据是否有 Python 解释器选择 Bash 命令格式
             if python_exe:
-                bash_cmd = f'"{python_exe}" {call_script} "<{primary_field.upper()}>"'
+                bash_cmd = self._build_skill_python_cmd(
+                    call_script, [f"<{primary_field.upper()}>"])
             else:
                 bash_cmd = self._build_skill_curl_cmd(
                     sname, {primary_field: f"<{primary_field.upper()}>"})
@@ -8685,7 +8768,10 @@ except urllib.error.URLError as e:
             )
             if sk_is_image:
                 if python_exe:
-                    img_cmd = f'"{python_exe}" {call_script} "<{primary_field.upper()}>" "<REF_IMAGE_URL>"'
+                    img_cmd = self._build_skill_python_cmd(
+                        call_script,
+                        [f"<{primary_field.upper()}>", "<REF_IMAGE_URL>"],
+                    )
                 else:
                     img_cmd = self._build_skill_curl_cmd(
                         sname, {primary_field: f"<{primary_field.upper()}>", "ref_image": "<REF_IMAGE_URL>"})
@@ -9251,6 +9337,67 @@ except urllib.error.URLError as e:
                         continue
             return json.dumps({"status": "ok", "sep": os.sep,
                                "root": str(root), "files": files}, ensure_ascii=False)
+        except Exception as e:
+            return json.dumps({"status": "error", "message": str(e)}, ensure_ascii=False)
+
+    def _rpc_syncFileList(self, working_dir: str, rel: str = "") -> str:
+        """一次列出子树内全部普通文件及大小，避免远程目录传输前逐目录、逐文件 RPC。
+
+        这里只做 ``stat``，不读取内容、不计算哈希，因此适合传输前快速规划。
+        与文件面板的显式目录传输语义一致：隐藏目录（包括 ``.git``）也会包含；
+        符号链接仍跳过，路径边界继续由 ``_sync_safe_path`` 保证。
+        """
+        import os
+        from pathlib import Path as _P
+        try:
+            root = _P(working_dir).resolve()
+            if not root.is_dir():
+                return json.dumps(
+                    {"status": "error", "message": "工作目录不存在"},
+                    ensure_ascii=False,
+                )
+            if str(rel or "").strip().strip("/\\"):
+                _root, start = self._sync_safe_path(working_dir, rel)
+            else:
+                start = root
+            if not start.is_dir():
+                return json.dumps(
+                    {"status": "error", "message": "同步目标不是目录"},
+                    ensure_ascii=False,
+                )
+
+            files: dict[str, int] = {}
+            max_files = 200_000
+            root_text = str(root)
+            pending_dirs = [str(start)]
+            # os.walk 只保留名字，后续的 is_file/stat 会对每个文件
+            # 重复查询元数据。直接保留 scandir 的 DirEntry 缓存，对 .git
+            # 这类大量小文件目录的传输规划尤其重要。
+            while pending_dirs:
+                current = pending_dirs.pop()
+                try:
+                    scanner = os.scandir(current)
+                except OSError:
+                    continue
+                with scanner:
+                    for entry in scanner:
+                        try:
+                            if entry.is_symlink():
+                                continue
+                            if entry.is_dir(follow_symlinks=False):
+                                pending_dirs.append(entry.path)
+                                continue
+                            if not entry.is_file(follow_symlinks=False):
+                                continue
+                            file_rel = os.path.relpath(entry.path, root_text).replace("\\", "/")
+                            files[file_rel] = entry.stat(follow_symlinks=False).st_size
+                        except OSError:
+                            continue
+                        if len(files) > max_files:
+                            raise ValueError(f"目录文件数超过安全上限（{max_files}）")
+            return json.dumps({"status": "ok", "files": files}, ensure_ascii=False)
+        except ValueError as e:
+            return json.dumps({"status": "error", "message": str(e)}, ensure_ascii=False)
         except Exception as e:
             return json.dumps({"status": "error", "message": str(e)}, ensure_ascii=False)
 

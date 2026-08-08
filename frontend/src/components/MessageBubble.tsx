@@ -11,6 +11,21 @@ import {
   type SpeechStatus,
 } from '../utils/tts';
 
+function formatMessageTime(timestamp: number): string {
+  const epoch = timestamp > 100_000_000_000 ? timestamp : timestamp * 1000;
+  return new Date(epoch).toLocaleTimeString('zh-CN', {
+    hour: '2-digit', minute: '2-digit', hour12: false,
+  });
+}
+
+function formatMessageDateTime(timestamp: number): string {
+  const epoch = timestamp > 100_000_000_000 ? timestamp : timestamp * 1000;
+  return new Date(epoch).toLocaleString('zh-CN', {
+    year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false,
+  });
+}
+
 // ── 注入全局动画样式 ──
 if (typeof document !== 'undefined' && !document.getElementById('msg-bubble-css')) {
   const style = document.createElement('style');
@@ -50,6 +65,38 @@ if (typeof document !== 'undefined' && !document.getElementById('msg-bubble-css'
     .msg-content img.lazy.loaded,
     .msg-content img[loading="lazy"].loaded {
       opacity: 1;
+    }
+    .md-image-loading,
+    .md-image-error {
+      min-width: 160px;
+      min-height: 54px;
+      width: fit-content;
+      max-width: 100%;
+      margin: 6px 0;
+      padding: 10px 12px;
+      border: 1px solid var(--theme-border, rgba(128,128,128,0.25));
+      border-radius: 6px;
+      background: var(--theme-bg-tertiary, rgba(128,128,128,0.08));
+      color: var(--theme-text-muted, #656d76);
+      font-size: 12px;
+      line-height: 1.45;
+      align-items: center;
+      justify-content: center;
+      box-sizing: border-box;
+    }
+    .md-image-loading {
+      display: inline-flex;
+      animation: pulse 1.4s ease-in-out infinite;
+    }
+    .md-image-error {
+      display: inline-flex;
+    }
+    .md-image-error a {
+      color: var(--theme-accent, #0969da);
+      text-decoration: none;
+    }
+    .md-image-error a:hover {
+      text-decoration: underline;
     }
     /* ── 气泡操作按钮 ── */
     .bubble-action-btn {
@@ -434,7 +481,14 @@ const SubagentCard: React.FC<{
   );
 });
 
-/** 从 tool output 中提取 markdown 图片（返回 {images, text}） */
+/**
+ * 仅把“输出整体就是图片 Markdown”的工具结果识别成图片。
+ *
+ * Shell/搜索工具经常会打印源码、日志或 Session JSON，其中可能只是文本性地
+ * 出现 `![alt](url)`。旧逻辑会把这些历史链接二次渲染到消息末尾，造成凭空
+ * 出现的破损图片。Backend 图片 Skill 的正式结果本来就是一行或多行纯图片
+ * Markdown，因此采用 fail-closed 判定不会影响正常图片直出。
+ */
 function extractImagesFromOutput(output: string): { images: Array<{src: string; alt: string}>; text: string } {
   const images: Array<{src: string; alt: string}> = [];
   // Match markdown image: ![alt](url)
@@ -452,7 +506,14 @@ function extractImagesFromOutput(output: string): { images: Array<{src: string; 
   if (lastEnd < output.length) {
     textParts.push(output.slice(lastEnd));
   }
-  return { images, text: textParts.join('\n').trim() };
+  const remainingText = textParts.join('').trim();
+  const allSourcesRenderable = images.every(({ src }) => (
+    /^(?:https?:\/\/|data:image\/|blob:|\/api\/skill-images\/)/i.test(src.trim())
+  ));
+  if (images.length === 0 || remainingText || !allSourcesRenderable) {
+    return { images: [], text: output };
+  }
+  return { images, text: '' };
 }
 
 const ToolOutputImage: React.FC<{
@@ -460,25 +521,47 @@ const ToolOutputImage: React.FC<{
   alt: string;
   onOpen: (src: string) => void;
 }> = ({ src, alt, onOpen }) => {
-  const [resolvedSrc, setResolvedSrc] = useState<string>(() =>
-    /\/api\/skill-images\//.test(src) ? '' : src
+  const isSkillImage = /\/api\/skill-images\//.test(src);
+  const [imageState, setImageState] = useState<'loading' | 'ready' | 'error'>(
+    isSkillImage ? 'loading' : 'ready',
   );
+  const [resolvedSrc, setResolvedSrc] = useState<string>(isSkillImage ? '' : src);
 
   useEffect(() => {
     const match = src.match(/\/api\/skill-images\/([^/?#"'\s]+)/);
     if (!match) {
       setResolvedSrc(src);
+      setImageState('ready');
       return;
     }
     let cancelled = false;
+    setResolvedSrc('');
+    setImageState('loading');
     loadSkillImageDataUrl(decodeURIComponent(match[1]))
-      .then((dataUrl) => { if (!cancelled) setResolvedSrc(dataUrl); })
-      .catch(() => { if (!cancelled) setResolvedSrc(''); });
+      .then((dataUrl) => {
+        if (!cancelled) {
+          setResolvedSrc(dataUrl);
+          setImageState('ready');
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setResolvedSrc('');
+          setImageState('error');
+        }
+      });
     return () => { cancelled = true; };
   }, [src]);
 
-  if (!resolvedSrc) {
-    return <div className="img-lazy-placeholder" style={{ width: 160, height: 90 }}>Loading...</div>;
+  if (imageState === 'loading') {
+    return <div className="img-lazy-placeholder" style={{ width: 160, height: 90 }}>图片加载中…</div>;
+  }
+  if (imageState === 'error' || !resolvedSrc) {
+    return (
+      <div className="md-image-error" role="status">
+        🖼️ {alt || '图片'}暂不可用
+      </div>
+    );
   }
   return (
     <img
@@ -489,6 +572,7 @@ const ToolOutputImage: React.FC<{
         cursor: 'zoom-in', border: '1px solid var(--theme-border, rgba(0,0,0,0.12))',
         display: 'block',
       }}
+      onError={() => setImageState('error')}
       onClick={() => onOpen(resolvedSrc)}
     />
   );
@@ -671,8 +755,8 @@ const SystemMessage: React.FC<{ message: ChatMessage; renderMarkdown?: boolean }
           <div style={{ whiteSpace: 'pre-wrap' }}>{message.content}</div>
         )}
         {message.timestamp && (
-          <div style={{ fontSize: 10, color: 'var(--theme-text-muted, #656d76)', marginTop: 4, textAlign: 'right' }}>
-            {new Date(message.timestamp * 1000).toLocaleTimeString()}
+          <div title={formatMessageDateTime(message.timestamp)} style={{ fontSize: 10, color: 'var(--theme-text-muted, #656d76)', marginTop: 4, textAlign: 'right' }}>
+            {formatMessageTime(message.timestamp)}
           </div>
         )}
       </div>
@@ -1015,11 +1099,17 @@ function MessageBubbleInner({
     }
   }, []);
 
-  // ★ 为 markdown 渲染出的代码块注入复制按钮，图片添加 loaded 类
+  // ★ 为该消息内所有 markdown 块统一注入复制按钮并处理图片。
+  // contentRef 指向整个气泡而不是某个 text block，避免多块消息只命中最后一块。
   useEffect(() => {
     const el = contentRef.current;
     if (!el) return;
-    const pres = el.querySelectorAll<HTMLElement>('pre.md-pre');
+    const selectAll = <T extends Element,>(root: ParentNode, selector: string): T[] => {
+      const self = root instanceof Element && root.matches(selector) ? [root as T] : [];
+      return [...self, ...Array.from(root.querySelectorAll<T>(selector))];
+    };
+    const hydrate = (root: ParentNode) => {
+    const pres = selectAll<HTMLElement>(root, '.msg-content pre.md-pre');
     pres.forEach(pre => {
       if (pre.querySelector('.code-copy-btn')) return;
       const btn = document.createElement('button');
@@ -1044,45 +1134,100 @@ function MessageBubbleInner({
       pre.appendChild(btn);
     });
 
-    // ★ 为 markdown 中的图片添加 lazy loading 支持
-    const imgs = el.querySelectorAll<HTMLImageElement>('img');
-    imgs.forEach(img => {
-      // 添加 loading="lazy" 属性
-      if (!img.hasAttribute('loading')) {
-        img.setAttribute('loading', 'lazy');
-      }
-      // 图片加载完成后添加 loaded 类
-      if (img.complete) {
-        img.classList.add('loaded');
+    const renderImageError = (img: HTMLImageElement, label: string, href = '') => {
+      if (!img.isConnected || img.dataset.imageFailed === '1') return;
+      img.dataset.imageFailed = '1';
+      img.hidden = true;
+      const fallback = document.createElement('span');
+      fallback.className = 'md-image-error';
+      const safeHref = /^https?:\/\//i.test(href) ? href : '';
+      if (safeHref) {
+        const link = document.createElement('a');
+        link.href = safeHref;
+        link.target = '_blank';
+        link.rel = 'noopener';
+        link.textContent = `🖼️ ${label || '图片'}加载失败，打开原链接`;
+        fallback.appendChild(link);
       } else {
-        img.addEventListener('load', () => {
-          img.classList.add('loaded');
-        });
-        img.addEventListener('error', () => {
-          img.classList.add('loaded'); // 加载失败也添加，避免一直透明
-        });
+        fallback.textContent = `🖼️ ${label || '图片'}暂不可用`;
+      }
+      img.insertAdjacentElement('afterend', fallback);
+    };
+
+    // 普通外链图片：失败后给出稳定文本状态，不暴露浏览器破损图标。
+    selectAll<HTMLImageElement>(root, '.msg-content img:not(.skill-img)').forEach((img) => {
+      if (img.dataset.imageBound === '1') return;
+      img.dataset.imageBound = '1';
+      if (!img.hasAttribute('loading')) img.loading = 'lazy';
+      const markLoaded = () => img.classList.add('loaded');
+      const markFailed = () => renderImageError(img, img.alt, img.currentSrc || img.src);
+      if (img.complete) {
+        if (img.naturalWidth > 0) markLoaded();
+        else markFailed();
+      } else {
+        img.addEventListener('load', markLoaded, { once: true });
+        img.addEventListener('error', markFailed, { once: true });
       }
     });
 
-    // ★ skill 图片走数据通道：占位 <img data-skill-file> 通过 RPC 按需取
-    //   兼容本地直连 / 经中继 / QWebChannel 三种模式
-    let cancelled = false;
-    el.querySelectorAll<HTMLImageElement>('img.skill-img[data-skill-file]').forEach((img) => {
-      if (img.dataset.skillLoaded) return;
+    // Skill 图片走数据通道，兼容本地直连 / 中继 / QWebChannel。加载期间先隐藏
+    // 无 src 的 img，RPC 失败时保留可读占位，避免出现破损图标。
+    selectAll<HTMLImageElement>(root, '.msg-content img.skill-img[data-skill-file]').forEach((img) => {
+      if (img.dataset.skillState) return;
       const file = img.dataset.skillFile;
       if (!file) return;
-      img.dataset.skillLoaded = '1';
+      img.dataset.skillState = 'loading';
+      img.hidden = true;
+      const placeholder = document.createElement('span');
+      placeholder.className = 'md-image-loading';
+      placeholder.textContent = `🖼️ ${img.alt ? `${img.alt} · ` : ''}图片加载中…`;
+      img.insertAdjacentElement('afterend', placeholder);
+
+      const fail = () => {
+        if (!img.isConnected) return;
+        img.dataset.skillState = 'error';
+        placeholder.className = 'md-image-error';
+        placeholder.textContent = `🖼️ ${img.alt || '图片'}暂不可用`;
+      };
+      const reveal = () => {
+        if (!img.isConnected) return;
+        img.dataset.skillState = 'loaded';
+        img.hidden = false;
+        img.classList.add('loaded');
+        placeholder.remove();
+      };
+
       loadSkillImageDataUrl(file)
-        .then((url) => { if (!cancelled) { img.src = url; img.classList.add('loaded'); } })
-        .catch(() => {
-          if (!cancelled) {
-            img.alt = (img.alt || '') + ' (图片加载失败)';
-            img.classList.add('loaded');
+        .then((url) => {
+          if (!img.isConnected) return;
+          img.addEventListener('load', reveal, { once: true });
+          img.addEventListener('error', fail, { once: true });
+          img.src = url;
+          if (img.complete) {
+            if (img.naturalWidth > 0) reveal();
+            else fail();
+          }
+        })
+        .catch(fail);
+    });
+    };
+
+    hydrate(el);
+    const observer = new MutationObserver((records) => {
+      records.forEach((record) => {
+        record.addedNodes.forEach((node) => {
+          if (
+            node.nodeType === Node.ELEMENT_NODE
+            || node.nodeType === Node.DOCUMENT_FRAGMENT_NODE
+          ) {
+            hydrate(node as ParentNode);
           }
         });
+      });
     });
-    return () => { cancelled = true; };
-  }, [message.content]);
+    observer.observe(el, { childList: true, subtree: true });
+    return () => observer.disconnect();
+  }, [message.id, renderMarkdown]);
 
   // ★ system 消息独立渲染
   if (message.role === 'system') {
@@ -1106,6 +1251,36 @@ function MessageBubbleInner({
     [isUser, renderMarkdown, message.content],
   );
 
+  // 新版流式块携带各自 text；旧版块没有 text 时，仅在最后一个 text 块
+  // 渲染完整正文一次，避免一条回复被复制成多份。
+  const orderedTextBlockText = useMemo(() => {
+    const blocks = message.contentBlocks || [];
+    const hasExplicitText = blocks.some(
+      (block) => block.type === 'text' && typeof block.text === 'string',
+    );
+    let legacyFallbackIndex = -1;
+    if (!hasExplicitText) {
+      for (let i = blocks.length - 1; i >= 0; i -= 1) {
+        if (blocks[i].type === 'text') {
+          legacyFallbackIndex = i;
+          break;
+        }
+      }
+    }
+    return blocks.map((block, index) => {
+      if (block.type !== 'text') return '';
+      if (typeof block.text === 'string') return block.text;
+      return index === legacyFallbackIndex ? message.content : '';
+    });
+  }, [message.content, message.contentBlocks]);
+
+  const orderedTextBlockHtml = useMemo(
+    () => orderedTextBlockText.map((text) => (
+      !isUser && renderMarkdown && text ? markdownToHtml(text) : null
+    )),
+    [isUser, orderedTextBlockText, renderMarkdown],
+  );
+
   return (
     <>
       {lightboxSrc && <ImageLightbox src={lightboxSrc} onClose={() => setLightboxSrc(null)} />}
@@ -1113,27 +1288,30 @@ function MessageBubbleInner({
       style={{
         display: 'flex',
         justifyContent: isUser ? 'flex-end' : 'flex-start',
-        padding: '4px 16px',
+        padding: '5px 20px',
         animation: animateIn ? 'msgSlideIn 0.22s ease-out' : undefined,
       }}
     >
       {/* ★ 角色标签 */}
       {!isUser && (
         <div style={{
-          width: 28, height: 28, borderRadius: '50%', flexShrink: 0,
-          background: 'var(--theme-accent, #7aa2f7)',
+          width: 26, height: 26, borderRadius: 5, flexShrink: 0,
+          background: 'var(--theme-accent)',
+          border: '1px solid rgba(255,255,255,.32)',
           display: 'flex', alignItems: 'center', justifyContent: 'center',
-          fontSize: 13, color: '#fff', fontWeight: 700, marginRight: 8, marginTop: 2,
+          fontSize: 11, color: '#fff', fontWeight: 800, marginRight: 9, marginTop: 3,
+          boxShadow: '0 1px 4px rgba(0,0,0,.24)',
         }}>A</div>
       )}
       <div
+        ref={contentRef}
         className="message-bubble-wrapper"
         style={{
           position: 'relative',
-          maxWidth: '80%',
+          maxWidth: '82%',
           minWidth: 60,
-          padding: '10px 14px',
-          borderRadius: isUser ? '12px 12px 4px 12px' : '12px 12px 12px 4px',
+          padding: '11px 14px',
+          borderRadius: isUser ? '8px 8px 3px 8px' : '8px 8px 8px 3px',
           background: isUser ? 'var(--theme-user-bubble-bg, #ddf4ff)' : 'var(--theme-message-bg, #f6f8fa)',
           border: `1px solid ${isUser ? 'var(--theme-user-bubble-border, #0969da44)' : 'var(--theme-border, rgba(0,0,0,0.12))'}`,
           fontSize,
@@ -1156,7 +1334,7 @@ function MessageBubbleInner({
             alignItems: 'center',
             marginBottom: 6,
             padding: '2px 7px',
-            borderRadius: 999,
+            borderRadius: 4,
             fontSize: 10,
             lineHeight: 1.4,
             color: message.deliveryMode === 'steer' ? '#8250df' : '#bc4c00',
@@ -1222,16 +1400,17 @@ function MessageBubbleInner({
               return tc ? <ToolCallBlock key={`blk-${i}`} tc={tc} allTools={message.toolCalls} /> : null;
             }
             if (block.type === 'text') {
-              return contentHtml ? (
+              const blockText = orderedTextBlockText[i] || '';
+              const blockHtml = orderedTextBlockHtml[i];
+              return blockHtml ? (
                 <div
                   key={`blk-${i}`}
-                  ref={contentRef}
                   className="msg-content"
                   onClick={handleContentClick}
-                  dangerouslySetInnerHTML={{ __html: contentHtml }}
+                  dangerouslySetInnerHTML={{ __html: blockHtml }}
                 />
-              ) : message.content ? (
-                <div key={`blk-${i}`} style={{ whiteSpace: 'pre-wrap' }}>{message.content}</div>
+              ) : blockText ? (
+                <div key={`blk-${i}`} style={{ whiteSpace: 'pre-wrap' }}>{blockText}</div>
               ) : null;
             }
             return null;
@@ -1253,7 +1432,6 @@ function MessageBubbleInner({
             )}
             {contentHtml ? (
               <div
-                ref={contentRef}
                 className="msg-content"
                 onClick={handleContentClick}
                 dangerouslySetInnerHTML={{ __html: contentHtml }}
@@ -1321,18 +1499,19 @@ function MessageBubbleInner({
 
         {/* 时间戳 */}
         {message.timestamp && (
-          <div style={{ fontSize: 11, color: 'var(--theme-text-muted, #656d76)', marginTop: 6, textAlign: 'right' }}>
-            {new Date(message.timestamp * 1000).toLocaleTimeString()}
+          <div title={formatMessageDateTime(message.timestamp)} style={{ fontSize: 10.5, color: 'var(--theme-text-muted, #656d76)', marginTop: 7, textAlign: 'right', fontVariantNumeric: 'tabular-nums' }}>
+            {formatMessageTime(message.timestamp)}
           </div>
         )}
       </div>
       {/* ★ 用户头像 */}
       {isUser && (
         <div style={{
-          width: 28, height: 28, borderRadius: '50%', flexShrink: 0,
-          background: 'var(--theme-success, #2da44e)',
+          width: 26, height: 26, borderRadius: 5, flexShrink: 0,
+          background: 'var(--theme-bg-tertiary)',
+          border: '1px solid var(--theme-border)',
           display: 'flex', alignItems: 'center', justifyContent: 'center',
-          fontSize: 13, color: '#fff', fontWeight: 700, marginLeft: 8, marginTop: 2,
+          fontSize: 11, color: 'var(--theme-text-muted)', fontWeight: 750, marginLeft: 9, marginTop: 3,
         }}>U</div>
       )}
     </div>
@@ -1350,6 +1529,7 @@ function bubblePropsEqual(prev: Props, next: Props): boolean {
     prev.message.images    === next.message.images    &&
     prev.message.textAttachments === next.message.textAttachments &&
     prev.message.deliveryMode === next.message.deliveryMode &&
+    prev.message.timestamp  === next.message.timestamp  &&
     prev.message.elapsed   === next.message.elapsed   &&
     prev.message.usage     === next.message.usage     &&
     prev.fontSize          === next.fontSize          &&
@@ -1449,11 +1629,12 @@ const codeBlock: React.CSSProperties = {
 const systemBubbleStyle: React.CSSProperties = {
   maxWidth: '85%',
   padding: '10px 16px',
-  borderRadius: 10,
+  borderRadius: 7,
   background: 'var(--theme-bg-secondary, #f6f8fa)',
   border: '1px solid var(--theme-border, rgba(0,0,0,0.15))',
   fontSize: 13,
   lineHeight: 1.6,
   color: 'var(--theme-text, #1f2328)',
   wordBreak: 'break-word',
+  boxShadow: 'var(--ui-shadow-soft)',
 };

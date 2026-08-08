@@ -1,6 +1,7 @@
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from src.backend.bridge_ws import BridgeWS
 from src.backend.skill_paths import (
@@ -81,6 +82,40 @@ class BackendSkillGenerationTests(unittest.TestCase):
                 for other_script in expected.values():
                     if other_script != call_script:
                         self.assertNotIn(other_script, markdown)
+
+    def test_generated_markdown_resolves_python_inside_active_bash(self):
+        with patch.object(
+            self.bridge,
+            "_resolve_python_exe",
+            return_value="C:/Users/example/Python/python.EXE",
+        ):
+            markdown = self.bridge._generate_backend_skill_md(
+                "web-search",
+                self.info,
+                agent_name="codex",
+            )
+
+        self.assertIn(
+            '_AWU_PYTHON="$(command -v python.exe || command -v python3 || command -v python)"',
+            markdown,
+        )
+        self.assertIn(
+            '"$_AWU_PYTHON" ".agents/skills/web-search/_call.py" "<PROMPT>"',
+            markdown,
+        )
+        self.assertNotIn("C:/Users/example/Python/python.EXE", markdown)
+
+    def test_python_skill_command_quotes_each_argument(self):
+        command = self.bridge._build_skill_python_cmd(
+            ".agents/skills/demo/_call.py",
+            ["<PROMPT>", "<REF_IMAGE_URL>"],
+        )
+
+        self.assertEqual(
+            command,
+            '_AWU_PYTHON="$(command -v python.exe || command -v python3 || command -v python)" && '
+            '"$_AWU_PYTHON" ".agents/skills/demo/_call.py" "<PROMPT>" "<REF_IMAGE_URL>"',
+        )
 
     def test_sync_writes_agent_specific_markdown_to_every_native_root(self):
         class FakeSkillStore:

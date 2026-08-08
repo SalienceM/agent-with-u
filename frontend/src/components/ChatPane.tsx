@@ -16,6 +16,42 @@ import type { SmoothGhostState } from '../utils/smoothGhost';
 import { normalizeModelRuntime, type ModelRuntime } from './CodexRuntimeFields';
 import type { TextAttachment } from '../types/attachments';
 
+function messageEpochMs(timestamp?: number): number {
+  if (!timestamp || !Number.isFinite(timestamp)) return 0;
+  return timestamp > 100_000_000_000 ? timestamp : timestamp * 1000;
+}
+
+function localDateKey(timestamp?: number): string {
+  const epoch = messageEpochMs(timestamp);
+  if (!epoch) return '';
+  const date = new Date(epoch);
+  return `${date.getFullYear()}-${date.getMonth() + 1}-${date.getDate()}`;
+}
+
+function sameLocalDay(left: Date, right: Date): boolean {
+  return left.getFullYear() === right.getFullYear()
+    && left.getMonth() === right.getMonth()
+    && left.getDate() === right.getDate();
+}
+
+const MessageDateDivider: React.FC<{ timestamp: number }> = ({ timestamp }) => {
+  const date = new Date(messageEpochMs(timestamp));
+  const today = new Date();
+  const yesterday = new Date(today);
+  yesterday.setDate(today.getDate() - 1);
+  const relative = sameLocalDay(date, today)
+    ? '今天'
+    : sameLocalDay(date, yesterday) ? '昨天' : '';
+  const full = new Intl.DateTimeFormat('zh-CN', {
+    year: 'numeric', month: 'long', day: 'numeric', weekday: 'short',
+  }).format(date);
+  return (
+    <div className="awu-date-divider" role="separator" aria-label={full}>
+      <span>{relative ? `${relative} · ${full}` : full}</span>
+    </div>
+  );
+};
+
 // 注入「等待气泡」用的脉冲点动画(一次性)。请求发出后到首个 delta 之间,
 // 旧版只靠底部「生成中」chip,聊天区空白让人怀疑后端是不是没收到;这里
 // 在消息列表里挂一个占位气泡兜底反馈。
@@ -36,7 +72,7 @@ if (typeof document !== 'undefined' && !document.getElementById('awu-pending-bub
 const PendingAssistantBubble: React.FC = () => (
   <div style={{ display: 'flex', justifyContent: 'flex-start', padding: '4px 16px' }}>
     <div style={{
-      maxWidth: '70%', padding: '10px 14px', borderRadius: 12,
+      maxWidth: '70%', padding: '10px 14px', borderRadius: 7,
       background: 'var(--theme-bg-secondary, rgba(255,255,255,0.04))',
       color: 'var(--theme-text-muted, #8b8b9b)',
       fontSize: 13, display: 'flex', alignItems: 'center', gap: 4,
@@ -619,10 +655,12 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
   if (!sessionId) {
     return (
       <div
+        className="awu-chat-pane"
         onClick={onFocus}
         style={{
           ...paneRootStyle,
-          border: isFocused ? `2px solid ${themeBorderFocused}` : '2px solid var(--theme-border)',
+          border: '1px solid var(--theme-border)',
+          boxShadow: isFocused ? `inset 0 0 0 1px ${themeBorderFocused}` : 'none',
           // 不设 bg:分屏前 chat 区域没这层 wrapper,背景图能直接透到消息气泡那层。
           // 加个实色就等于盖一层遮罩,把用户的壁纸糊死。focus 边框已经够明显了。
           background: 'transparent',
@@ -656,10 +694,12 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
   if (automatedLoop) {
     return (
       <div
+        className="awu-chat-pane"
         onClick={onFocus}
         style={{
           ...paneRootStyle,
-          border: isFocused ? `2px solid ${themeBorderFocused}` : '2px solid var(--theme-border)',
+          border: '1px solid var(--theme-border)',
+          boxShadow: isFocused ? `inset 0 0 0 1px ${themeBorderFocused}` : 'none',
           background: 'transparent',
         }}
       >
@@ -700,10 +740,12 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
 
   return (
     <div
+      className="awu-chat-pane"
       onClick={onFocus}
       style={{
         ...paneRootStyle,
-        border: isFocused ? `2px solid ${themeBorderFocused}` : '2px solid var(--theme-border)',
+        border: '1px solid var(--theme-border)',
+        boxShadow: isFocused ? `inset 0 0 0 1px ${themeBorderFocused}` : 'none',
         // 同上,透明,不挡背景图
         background: 'transparent',
       }}
@@ -777,9 +819,10 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
       {/* ---- 消息列表 ---- */}
       <div style={{ flex: 1, position: 'relative', overflow: 'hidden' }}>
         <div
+          className="awu-message-scroll"
           ref={scrollContainerRef}
           onScroll={handleScroll}
-          style={{ height: '100%', overflow: 'auto', padding: '12px 0' }}
+          style={{ height: '100%', overflow: 'auto', padding: '14px 0 18px' }}
         >
           {chat.messages.length === 0 && (
             <div
@@ -847,7 +890,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
                 disabled={chat.loadingEarlier}
                 style={{
                   padding: '6px 16px',
-                  borderRadius: 16,
+                  borderRadius: 6,
                   border: '1px solid var(--theme-border, rgba(0,0,0,0.12))',
                   background: 'var(--theme-bg-secondary, #f6f8fa)',
                   color: 'var(--theme-text-muted, #656d76)',
@@ -863,19 +906,27 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
             </div>
           )}
 
-          {msgList.map((msg, idx) => (
-            <MessageBubble
-              key={msg.id}
-              message={msg}
-              fontSize={config.fontSize}
-              renderMarkdown={config.renderMarkdown}
-              animateIn={isSameSession && hiddenCount + idx >= prevCount}
-              sessionId={sessionId}
-              canBranch={activeSession?.sessionType !== 'loop'}
-              ttsVoice={config.ttsVoice}
-              ttsRate={config.ttsRate}
-            />
-          ))}
+          {msgList.map((msg, idx) => {
+            const previous = idx > 0 ? msgList[idx - 1] : undefined;
+            const showDate = !!msg.timestamp && (
+              !previous?.timestamp || localDateKey(previous.timestamp) !== localDateKey(msg.timestamp)
+            );
+            return (
+              <React.Fragment key={msg.id}>
+                {showDate && <MessageDateDivider timestamp={msg.timestamp} />}
+                <MessageBubble
+                  message={msg}
+                  fontSize={config.fontSize}
+                  renderMarkdown={config.renderMarkdown}
+                  animateIn={isSameSession && hiddenCount + idx >= prevCount}
+                  sessionId={sessionId}
+                  canBranch={activeSession?.sessionType !== 'loop'}
+                  ttsVoice={config.ttsVoice}
+                  ttsRate={config.ttsRate}
+                />
+              </React.Fragment>
+            );
+          })}
 
           {/* 已发出但首个 delta 还没到 —— 在消息流里给个占位气泡,
               否则只看底部「生成中」chip,容易以为后端没收到。 */}
@@ -915,7 +966,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
                 style={{
                   maxWidth: '80%',
                   minWidth: 280,
-                  borderRadius: '12px 12px 12px 4px',
+                  borderRadius: '8px 8px 8px 3px',
                   background: 'var(--theme-message-bg, #f6f8fa)',
                   border: '1px solid var(--theme-border, rgba(0,0,0,0.12))',
                   overflow: 'hidden',
@@ -952,7 +1003,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
                 alignItems: 'center',
                 gap: 6,
                 padding: '6px 14px',
-                borderRadius: 20,
+                borderRadius: 6,
                 border: '1px solid var(--theme-border, rgba(0,0,0,0.18))',
                 background: 'var(--theme-bg-tertiary, #242536)',
                 color: 'var(--theme-text, #e2e3ea)',
@@ -1093,13 +1144,13 @@ const byTheWayFab: React.CSSProperties = {
   zIndex: 20,
   width: 34,
   height: 34,
-  borderRadius: '50%',
+  borderRadius: 6,
   border: '1px solid var(--theme-border)',
   background: 'var(--theme-bg-secondary)',
   color: 'var(--theme-text)',
   fontSize: 15,
   cursor: 'pointer',
-  boxShadow: '0 2px 8px rgba(0,0,0,0.18)',
+  boxShadow: 'var(--ui-shadow-soft, 0 2px 8px rgba(0,0,0,0.18))',
 };
 
 const kitFab: React.CSSProperties = {
@@ -1108,8 +1159,8 @@ const kitFab: React.CSSProperties = {
 };
 
 const paneToolBtnStyle: React.CSSProperties = {
-  padding: '3px 9px',
-  borderRadius: 6,
+  padding: '4px 10px',
+  borderRadius: 5,
   fontSize: 12,
   cursor: 'pointer',
   background: 'var(--theme-bg, rgba(255,255,255,0.06))',

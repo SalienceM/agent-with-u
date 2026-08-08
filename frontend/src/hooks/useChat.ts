@@ -40,6 +40,12 @@ export interface ToolCall {
 export interface ContentBlock {
   type: 'thinking' | 'tool' | 'text';
   toolIndex?: number;  // type === 'tool' 时指向 toolCalls 数组的索引
+  /**
+   * 文本块自己的内容。流式消息可能是“文本 → 工具 → 文本”，不能让每个
+   * text 块都回退去渲染整条 message.content，否则会重复并打乱到达顺序。
+   * 旧消息没有该字段，MessageBubble 会兼容地只渲染一次完整正文。
+   */
+  text?: string;
 }
 
 export interface PermissionRequest {

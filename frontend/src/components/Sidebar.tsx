@@ -414,7 +414,7 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
   // ★ 折叠状态：只显示窄条 + 展开按钮，有未确认通知时显示角标
   if (collapsed) {
     return (
-      <div style={collapsedSidebarStyle}>
+      <div className="awu-sidebar" style={collapsedSidebarStyle}>
         <div style={{ position: 'relative', display: 'inline-block' }}>
           <button
             onClick={onToggleCollapse}
@@ -449,7 +449,7 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
   }
 
   return (
-    <div style={isMobile ? mobileSidebarStyle : { ...sidebarStyle, width: width ?? 260 }}>
+    <div className="awu-sidebar" style={isMobile ? mobileSidebarStyle : { ...sidebarStyle, width: width ?? 260 }}>
       <style>{`
         @keyframes awuSidebarRunningPulse {
           0%, 100% { opacity: 1; transform: scale(1); }
@@ -460,8 +460,8 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
           50%       { transform: scale(1.15); opacity: 0.82; }
         }
         @keyframes dialogSlideIn {
-          from { opacity: 0; transform: perspective(900px) rotateX(-14deg) scale(0.96) translateY(-8px); }
-          to   { opacity: 1; transform: perspective(900px) rotateX(0deg)   scale(1)    translateY(0); }
+          from { opacity: 0; transform: translateY(8px) scale(.985); }
+          to   { opacity: 1; transform: translateY(0) scale(1); }
         }
         @keyframes awuSidebarStreamBorderFlow {
           from { transform: translateY(-66%); }
@@ -515,7 +515,7 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
           pointer-events: none;
         }
       `}</style>
-      <div style={{ display: 'flex', alignItems: 'center', gap: 4, padding: '12px 10px 8px' }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 5, padding: '10px 10px 7px' }}>
         <button
           onClick={onToggleCollapse}
           style={toggleBtnStyle}
@@ -526,7 +526,7 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
           </svg>
         </button>
         {/* 视图切换：💬 会话 / 🗂 文件 */}
-        <div style={{ display: 'flex', gap: 0, border: '1px solid var(--theme-border)', borderRadius: 7, overflow: 'hidden' }}>
+        <div style={{ display: 'flex', gap: 0, border: '1px solid var(--theme-border)', borderRadius: 5, overflow: 'hidden', background: 'var(--theme-bg-secondary)' }}>
           <button onClick={() => setView('sessions')} title="会话列表"
             style={{ ...viewTabStyle, ...(view === 'sessions' ? viewTabActive : {}) }}>💬</button>
           <button onClick={() => setView('files')} title="文件目录（本地 ⇄ 远端）"
@@ -575,7 +575,7 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
           </div>
         ) : <FileTreePanel sessionId={activeSessionId || undefined} workingDir={activeWorkingDir || ''} execKey={activeExecKey} execLabel={activeExecLabel} execMode={activeExecMode} backendId={activeBackendId} />
       ) : (
-      <div style={{ flex: 1, overflow: 'auto', padding: '4px 8px' }}>
+      <div style={{ flex: 1, overflow: 'auto', padding: '4px 7px 10px' }}>
         {groups.map(group => {
           const isCollapsed = collapsedGroups.has(group.key);
           // 多组时显示组头；单组（仅本机）不显示
@@ -618,7 +618,7 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
                     ...itemStyle,
                     background: rowBackground,
                     ...(isHovered ? { boxShadow: 'inset 0 0 0 1px var(--theme-border, rgba(122,162,247,.3))' } : {}),
-                    ...(isActive ? { boxShadow: 'inset 0 0 0 1px var(--theme-accent, #7aa2f7)' } : {}),
+                    ...(isActive ? { boxShadow: 'inset 2px 0 0 var(--theme-accent, #7aa2f7)' } : {}),
                     ...(isRunning ? { borderColor: '#22c55e55' } : {}),
                     ...(isCompleted ? { borderColor: '#ef444455' } : {}),
                   }}
@@ -1188,11 +1188,11 @@ const collapsedSidebarStyle: React.CSSProperties = {
 };
 
 const toggleBtnStyle: React.CSSProperties = {
-  width: 28,
-  height: 28,
-  borderRadius: 6,
+  width: 30,
+  height: 30,
+  borderRadius: 5,
   border: '1px solid var(--theme-border, rgba(0,0,0,0.12))',
-  background: 'var(--theme-bg-secondary, #f6f8fa)',
+  background: 'transparent',
   color: 'var(--theme-text-muted, #656d76)',
   cursor: 'pointer',
   display: 'flex',
@@ -1209,7 +1209,7 @@ const runningDotStyle: React.CSSProperties = {
 };
 
 const viewTabStyle: React.CSSProperties = {
-  padding: '4px 9px', fontSize: 13, cursor: 'pointer', border: 'none',
+  minWidth: 32, height: 28, padding: '3px 9px', fontSize: 13, cursor: 'pointer', border: 'none',
   background: 'transparent', color: 'var(--theme-text-muted, #656d76)',
 };
 const viewTabActive: React.CSSProperties = {
@@ -1217,11 +1217,11 @@ const viewTabActive: React.CSSProperties = {
 };
 
 const newBtnStyle: React.CSSProperties = {
-  width: 28,
-  height: 28,
-  borderRadius: 6,
+  width: 30,
+  height: 30,
+  borderRadius: 5,
   border: '1px solid var(--theme-border, rgba(0,0,0,0.12))',
-  background: 'var(--theme-bg-secondary, #f6f8fa)',
+  background: 'transparent',
   color: 'var(--theme-text-muted, #656d76)',
   cursor: 'pointer',
   display: 'flex',
@@ -1231,14 +1231,14 @@ const newBtnStyle: React.CSSProperties = {
 };
 
 const searchWrapStyle: React.CSSProperties = {
-  height: 30,
-  margin: '0 9px 6px',
-  padding: '0 8px',
+  height: 32,
+  margin: '0 9px 7px',
+  padding: '0 9px',
   display: 'flex',
   alignItems: 'center',
   gap: 6,
   border: '1px solid var(--theme-border, rgba(0,0,0,.12))',
-  borderRadius: 7,
+  borderRadius: 6,
   background: 'var(--theme-input-bg, rgba(255,255,255,.04))',
   color: 'var(--theme-text-muted, #656d76)',
 };
@@ -1268,16 +1268,16 @@ const searchClearStyle: React.CSSProperties = {
 
 const itemStyle: React.CSSProperties = {
   minHeight: 36,
-  padding: '5px 6px',
+  padding: '5px 8px',
   border: '1px solid transparent',
-  borderRadius: 7,
+  borderRadius: 5,
   cursor: 'pointer',
-  marginBottom: 2,
+  marginBottom: 1,
   position: 'relative',
   display: 'flex',
   alignItems: 'center',
   gap: 6,
-  transition: 'background 0.15s, box-shadow 0.15s',
+  transition: 'background 0.14s, box-shadow 0.14s, border-color 0.14s',
 };
 
 const sessionTitleStyle: React.CSSProperties = {
@@ -1329,10 +1329,10 @@ const groupHeaderStyle: React.CSSProperties = {
   alignItems: 'center',
   gap: 6,
   padding: '6px 8px',
-  borderRadius: 6,
+  borderRadius: 4,
   cursor: 'pointer',
   color: 'var(--theme-text-muted, #656d76)',
-  background: 'var(--theme-bg-tertiary, #242536)',
+  background: 'transparent',
   marginBottom: 4,
   marginTop: 6,
   userSelect: 'none',
@@ -1426,19 +1426,19 @@ const overlayStyle: React.CSSProperties = {
 const confirmPanelStyle: React.CSSProperties = {
   background: 'var(--theme-bg-secondary, #ffffff)',
   border: '1px solid var(--theme-border, rgba(0,0,0,0.15))',
-  borderRadius: 12,
+  borderRadius: 8,
   padding: 24, width: '90%', maxWidth: 400,
   boxShadow: '0 4px 20px rgba(0,0,0,0.15)',
 };
 
 const confirmBtnStyle: React.CSSProperties = {
-  flex: 1, padding: 10, borderRadius: 8,
+  flex: 1, padding: 10, borderRadius: 5,
   background: 'var(--theme-error, #cf222e)', border: 'none',
   color: '#fff', fontSize: 14, fontWeight: 500, cursor: 'pointer',
 };
 
 const cancelBtnStyle: React.CSSProperties = {
-  flex: 1, padding: 10, borderRadius: 8,
+  flex: 1, padding: 10, borderRadius: 5,
   background: 'var(--theme-bg-secondary, #f6f8fa)', border: '1px solid var(--theme-border, rgba(0,0,0,0.15))',
   color: 'var(--theme-text, #1f2328)', fontSize: 14, cursor: 'pointer',
 };
@@ -1452,13 +1452,13 @@ const colorGridStyle: React.CSSProperties = {
 const colorPresetStyle: React.CSSProperties = {
   height: 44,
   border: '1px solid var(--theme-border, rgba(0,0,0,.15))',
-  borderRadius: 8,
+  borderRadius: 5,
   cursor: 'pointer',
 };
 
 const destroyPathStyle: React.CSSProperties = {
   padding: '9px 10px',
-  borderRadius: 7,
+  borderRadius: 5,
   border: '1px solid rgba(239,68,68,.28)',
   background: 'rgba(239,68,68,.07)',
   color: 'var(--theme-text, #e2e3ea)',

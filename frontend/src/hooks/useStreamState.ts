@@ -145,13 +145,26 @@ export function processStreamDelta(sessionId: string, delta: any): {
     return changed ? updated : null;
   };
 
+  // 保留“文本 → 工具 → 文本”的真实到达顺序。message.content 继续维护
+  // 完整正文（用于持久化/复制），每个 text block 则只保存自己的片段。
+  const appendText = (text: string) => {
+    if (!text) return;
+    state.text += text;
+    const last = state.contentBlocks[state.contentBlocks.length - 1];
+    if (last?.type === 'text') {
+      state.contentBlocks = [
+        ...state.contentBlocks.slice(0, -1),
+        { ...last, text: (last.text || '') + text },
+      ];
+    } else {
+      state.contentBlocks = [...state.contentBlocks, { type: 'text', text }];
+    }
+  };
+
   switch (delta.type) {
     case 'text_delta': {
-      state.text += delta.text || '';
+      appendText(delta.text || '');
       finishRunningTools();
-      // 只保留一个 text 块
-      const blocksNoText = state.contentBlocks.filter(b => b.type !== 'text');
-      state.contentBlocks = [...blocksNoText, { type: 'text' }];
       break;
     }
 
@@ -293,7 +306,7 @@ export function processStreamDelta(sessionId: string, delta: any): {
       // 释放主链路并触发下一条序列任务。
       state.isStreaming = true;
       const errorMsg = delta.error || '未知错误';
-      state.text = state.text + `\n\n**错误**: ${errorMsg}`;
+      appendText(`\n\n**错误**: ${errorMsg}`);
       break;
     }
   }

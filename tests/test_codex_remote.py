@@ -240,6 +240,42 @@ class CodexRemoteTurnTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(latest, "a1")
         self.assertFalse(truncated)
 
+    def test_visible_mirror_uses_turn_dates_across_days(self):
+        day_one = 1_787_000_000
+        day_two = day_one + 86_400
+        thread = {
+            "createdAt": day_one - 60,
+            "turns": [
+                {
+                    "status": "completed", "startedAt": day_one,
+                    "completedAt": day_one + 12,
+                    "items": [
+                        {"id": "u1", "type": "userMessage",
+                         "content": [{"type": "text", "text": "yesterday"}]},
+                        {"id": "a1", "type": "agentMessage", "text": "done yesterday"},
+                    ],
+                },
+                {
+                    "status": "completed", "startedAt": day_two,
+                    "completedAt": day_two + 30,
+                    "items": [
+                        {"id": "u2", "type": "userMessage",
+                         "content": [{"type": "text", "text": "today"}]},
+                        {"id": "a2", "type": "agentMessage", "text": "done today"},
+                    ],
+                },
+            ],
+        }
+
+        messages, latest, truncated = _codex_visible_messages(thread)
+
+        self.assertEqual([message.id for message in messages], ["u1", "a1", "u2", "a2"])
+        self.assertEqual([message.timestamp for message in messages], [
+            day_one, day_one + 12, day_two, day_two + 30,
+        ])
+        self.assertEqual(latest, "a2")
+        self.assertFalse(truncated)
+
     async def test_attached_sync_matches_local_turns_and_appends_only_external_turns(self):
         config = ModelBackendConfig(
             id="codex", type=BackendType.CODEX_OFFICIAL, label="Codex",
@@ -323,6 +359,8 @@ class CodexRemoteTurnTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(session.codex_sync_last_item_id, "a2")
         self.assertEqual(session.codex_sync_local_count, 6)
+        self.assertGreater(session.messages[-2].timestamp, session.messages[3].timestamp)
+        self.assertGreater(session.messages[-1].timestamp, session.messages[-2].timestamp)
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0]["type"], "codex_thread_synced")
 

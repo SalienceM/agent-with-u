@@ -6,6 +6,7 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import { api } from '../api';
 import { DiffViewer } from './DiffViewer';
+import { AppModalPortal } from './AppModalPortal';
 import type { GitLogCommit } from '../types/git';
 
 interface Props {
@@ -145,8 +146,9 @@ export const GitPanel: React.FC<Props> = ({
   if (!open) return null;
 
   return (
-    <div style={overlayStyle} onClick={onClose}>
-      <div style={panelStyle} onClick={(e) => e.stopPropagation()}>
+    <AppModalPortal>
+      <div style={overlayStyle} onClick={onClose}>
+        <div style={panelStyle} onClick={(e) => e.stopPropagation()}>
         {/* 顶栏 */}
         <div style={headerStyle}>
           <span style={{ fontSize: 15 }}>📋</span>
@@ -317,8 +319,9 @@ export const GitPanel: React.FC<Props> = ({
 
         {/* Toast 提示 */}
         {toast && <div style={toastStyle}>{toast}</div>}
+        </div>
       </div>
-    </div>
+    </AppModalPortal>
   );
 };
 

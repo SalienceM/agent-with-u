@@ -97,6 +97,25 @@ class FileTransferTests(unittest.TestCase):
         self.assertIn(".git/config", manifest["files"])
         self.assertNotIn("node_modules/package.js", manifest["files"])
 
+    def test_fast_file_list_returns_subtree_sizes_and_hidden_git_files(self) -> None:
+        (self.root / ".git" / "objects").mkdir(parents=True)
+        (self.root / ".git" / "objects" / "abc").write_bytes(b"git-object")
+        (self.root / "src").mkdir()
+        (self.root / "src" / "main.py").write_bytes(b"print('ok')")
+        (self.root / "outside.txt").write_bytes(b"outside")
+
+        subtree = self.parsed(self.bridge._rpc_syncFileList(str(self.root), ".git"))
+        self.assertEqual("ok", subtree["status"])
+        self.assertEqual({".git/objects/abc": 10}, subtree["files"])
+
+        root_list = self.parsed(self.bridge._rpc_syncFileList(str(self.root), ""))
+        self.assertEqual(11, root_list["files"]["src/main.py"])
+        self.assertIn(".git/objects/abc", root_list["files"])
+
+    def test_fast_file_list_rejects_paths_outside_workspace(self) -> None:
+        result = self.parsed(self.bridge._rpc_syncFileList(str(self.root), "../outside"))
+        self.assertEqual("error", result["status"])
+
 
 if __name__ == "__main__":
     unittest.main()

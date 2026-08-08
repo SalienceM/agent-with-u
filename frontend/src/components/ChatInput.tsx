@@ -122,7 +122,7 @@ const ToolbarBtn: React.FC<ToolbarBtnProps> = ({ icon, title, active, onClick, l
         gap: compact ? 0 : 4,
         padding: compact ? '5px 9px' : '4px 8px',
         fontSize: 11,
-        borderRadius: 6,
+        borderRadius: 5,
         border: active ? '1px solid var(--theme-accent, #0969da)' : '1px solid var(--theme-border, rgba(0,0,0,0.12))',
         background: active ? 'var(--theme-accent-bg, rgba(9,105,218,0.1))' : isHover ? 'var(--theme-bg-tertiary, #eaeef2)' : 'var(--theme-bg-secondary, #f6f8fa)',
         color: active ? 'var(--theme-accent, #0969da)' : isHover ? 'var(--theme-text, #1f2328)' : 'var(--theme-text-muted, #656d76)',
@@ -1338,7 +1338,7 @@ const ChatInputInner: React.FC<Props> = ({
   const parentDir = showFilePicker ? getParentDir(currentDir) : null;
 
   return (
-    <div style={{ padding: '8px 16px 12px', borderTop: isStreaming ? '1px solid rgba(34,197,94,0.4)' : '1px solid var(--theme-border, rgba(0,0,0,0.12))', background: 'var(--theme-bg, #ffffff)', position: 'relative', transition: 'border-top-color 0.2s ease' }}>
+    <div className="awu-composer" style={{ padding: '9px 18px 14px', borderTop: isStreaming ? '1px solid var(--theme-success-border, rgba(50,182,122,.35))' : '1px solid transparent', background: 'var(--theme-bg, #ffffff)', position: 'relative', transition: 'border-top-color 0.2s ease' }}>
       {runtimeConfigurable && showRuntimePicker && (
         <div
           ref={runtimePickerRef}
@@ -1346,7 +1346,7 @@ const ChatInputInner: React.FC<Props> = ({
             position: 'absolute', left: 16, bottom: 'calc(100% - 2px)', zIndex: 180,
             width: 'min(460px, calc(100% - 32px))', maxHeight: 'min(320px, 60dvh)',
             overflowY: 'auto', boxSizing: 'border-box', padding: 14,
-            border: '1px solid var(--theme-border)', borderRadius: 10,
+            border: '1px solid var(--theme-border)', borderRadius: 6,
             background: 'var(--theme-bg-secondary)', color: 'var(--theme-text)',
             boxShadow: '0 12px 32px rgba(0,0,0,.28)',
           }}
@@ -1470,7 +1470,7 @@ const ChatInputInner: React.FC<Props> = ({
             {showSizePicker && (
               <div style={{
                 position: 'absolute', bottom: '100%', left: 0, marginBottom: 4,
-                padding: 8, borderRadius: 10,
+                padding: 8, borderRadius: 6,
                 background: 'var(--theme-bg-secondary)', border: '1px solid var(--theme-border)',
                 boxShadow: '0 4px 16px rgba(0,0,0,0.2)', zIndex: 200,
                 display: 'flex', flexDirection: 'column', gap: 6, minWidth: 200,
@@ -1727,9 +1727,9 @@ const textareaStyle: React.CSSProperties = {
   flex: 1,
   background: 'var(--theme-input-bg, #ffffff)',
   border: '1px solid var(--theme-border, rgba(0,0,0,0.12))',
-  borderRadius: 10,
+  borderRadius: 7,
   color: 'var(--theme-text, #1f2328)',
-  padding: '10px 14px',
+  padding: '11px 14px',
   fontSize: 14,
   lineHeight: 1.5,
   resize: 'none',
@@ -1737,13 +1737,14 @@ const textareaStyle: React.CSSProperties = {
   fontFamily: 'inherit',
   maxHeight: 200,
   overflow: 'auto',
+  boxShadow: 'inset 0 1px 1px rgba(0,0,0,.025)',
 };
 
 const btnBase: React.CSSProperties = {
-  width: 36,
-  height: 36,
-  borderRadius: '50%',
-  border: 'none',
+  width: 38,
+  height: 38,
+  borderRadius: 6,
+  border: '1px solid transparent',
   color: '#fff',
   fontSize: 18,
   cursor: 'pointer',
@@ -1753,11 +1754,13 @@ const btnBase: React.CSSProperties = {
   flexShrink: 0,
 };
 
-const sendBtnStyle: React.CSSProperties = { ...btnBase, background: 'var(--theme-accent, #0969da)' };
+const sendBtnStyle: React.CSSProperties = { ...btnBase, background: 'var(--theme-accent, #0969da)', boxShadow: '0 5px 16px var(--theme-accent-bg)' };
 const abortBtnStyle: React.CSSProperties = { ...btnBase, background: 'var(--theme-error, #cf222e)', fontSize: 14 };
 const micBtnStyle: React.CSSProperties = {
   ...btnBase,
   background: 'var(--theme-bg-tertiary, #eaeef2)',
+  borderColor: 'var(--theme-border)',
+  color: 'var(--theme-text-muted)',
   fontSize: 16,
   padding: '0 8px',
 };
@@ -1779,11 +1782,11 @@ const commandPopupStyle: React.CSSProperties = {
   marginBottom: 4,
   background: 'var(--theme-bg-secondary, #ffffff)',
   border: '1px solid var(--theme-border, rgba(0,0,0,0.15))',
-  borderRadius: 10,
+  borderRadius: 7,
   maxHeight: 280,
   overflowY: 'auto',
   zIndex: 100,
-  boxShadow: '0 -4px 20px rgba(0,0,0,0.1)',
+  boxShadow: 'var(--ui-shadow-float, 0 -4px 20px rgba(0,0,0,0.18))',
   backdropFilter: 'blur(12px)',
 };
 
@@ -1806,12 +1809,12 @@ const filePickerPopupStyle: React.CSSProperties = {
   marginBottom: 4,
   background: 'var(--theme-bg-secondary, #f6f8fa)',
   border: '1px solid var(--theme-border, rgba(0,0,0,0.12))',
-  borderRadius: 10,
+  borderRadius: 7,
   overflow: 'hidden',
   maxHeight: 300,
   overflowY: 'auto',
   zIndex: 100,
-  boxShadow: '0 -4px 20px rgba(0,0,0,0.1)',
+  boxShadow: 'var(--ui-shadow-float, 0 -4px 20px rgba(0,0,0,0.18))',
   backdropFilter: 'blur(12px)',
 };
 
@@ -1856,31 +1859,31 @@ const confirmOverlayStyle: React.CSSProperties = {
 const confirmPanelStyle: React.CSSProperties = {
   background: 'var(--theme-bg-secondary, #ffffff)',
   border: '1px solid var(--theme-border, rgba(0,0,0,0.15))',
-  borderRadius: 12,
+  borderRadius: 8,
   padding: 24, width: '90%', maxWidth: 400,
   boxShadow: '0 4px 20px rgba(0,0,0,0.15)',
 };
 
 const confirmBtnStyle: React.CSSProperties = {
-  flex: 1, padding: 10, borderRadius: 8,
+  flex: 1, padding: 10, borderRadius: 5,
   background: 'var(--theme-accent, #0969da)', border: 'none',
   color: '#fff', fontSize: 14, fontWeight: 500, cursor: 'pointer',
 };
 
 const cancelBtnStyle: React.CSSProperties = {
-  flex: 1, padding: 10, borderRadius: 8,
+  flex: 1, padding: 10, borderRadius: 5,
   background: 'var(--theme-bg-secondary, #f6f8fa)', border: '1px solid var(--theme-border, rgba(0,0,0,0.15))',
   color: 'var(--theme-text, #1f2328)', fontSize: 14, cursor: 'pointer',
 };
 
 const runtimeSecondaryBtnStyle: React.CSSProperties = {
-  padding: '6px 9px', borderRadius: 7, cursor: 'pointer', fontSize: 11,
+  padding: '6px 9px', borderRadius: 5, cursor: 'pointer', fontSize: 11,
   border: '1px solid var(--theme-border)', background: 'var(--theme-bg-tertiary)',
   color: 'var(--theme-text-muted)',
 };
 
 const runtimePrimaryBtnStyle: React.CSSProperties = {
-  padding: '6px 10px', borderRadius: 7, cursor: 'pointer', fontSize: 11,
+  padding: '6px 10px', borderRadius: 5, cursor: 'pointer', fontSize: 11,
   border: '1px solid var(--theme-accent)', background: 'var(--theme-accent)',
   color: '#fff', fontWeight: 600,
 };

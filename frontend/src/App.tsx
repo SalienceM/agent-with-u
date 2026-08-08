@@ -867,6 +867,22 @@ export const App: React.FC = () => {
       '--theme-code-bg': ua < 1 ? hexToRgba(theme.codeBg, ua) : theme.codeBg,
       '--theme-input-bg': ua < 1 ? hexToRgba(theme.inputBg, ua) : theme.inputBg,
       '--theme-sidebar-bg': ua < 1 ? hexToRgba(theme.sidebarBg, ua) : theme.sidebarBg,
+      '--theme-success': theme.success,
+      '--theme-success-bg': theme.successBg,
+      '--theme-success-border': theme.successBorder,
+      '--theme-error': theme.error,
+      '--ui-font': '-apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI Variable Text", "Segoe UI", "Alibaba PuHuiTi 3.0", sans-serif',
+      '--ui-radius-sm': '4px',
+      '--ui-radius-md': '6px',
+      '--ui-radius-lg': '8px',
+      '--ui-radius-xl': '10px',
+      '--ui-shadow-soft': isLightTheme
+        ? '0 1px 2px rgba(23,43,77,.06), 0 8px 24px rgba(23,43,77,.05)'
+        : '0 1px 2px rgba(0,0,0,.24), 0 10px 28px rgba(0,0,0,.14)',
+      '--ui-shadow-float': isLightTheme
+        ? '0 14px 44px rgba(23,43,77,.14)'
+        : '0 18px 48px rgba(0,0,0,.38)',
+      '--ui-surface-hover': isLightTheme ? 'rgba(22,119,255,.055)' : 'rgba(148,163,184,.055)',
     } as React.CSSProperties}>
       {firstHomePaneIdx >= 0 && (
         <a className="app-skip-link" href={`#home-dashboard-content-${firstHomePaneIdx}`}>
@@ -888,7 +904,64 @@ export const App: React.FC = () => {
       <style>{`
         /* 移动端用 dvh，规避浏览器地址栏让 100vh 把底部输入框顶出可视区；
            不支持 dvh 的旧 webview 回退到 100vh。inline style 已不设 height。 */
-        .app-root { height: 100vh; height: 100dvh; }
+        .app-root {
+          height: 100vh; height: 100dvh;
+          font-family: var(--ui-font);
+          font-feature-settings: "kern" 1, "liga" 1, "tnum" 1;
+          -webkit-font-smoothing: antialiased;
+          text-rendering: optimizeLegibility;
+        }
+        .app-root button, .app-root input, .app-root textarea, .app-root select { font-family: inherit; }
+        .app-root button {
+          transition: color .14s ease, background-color .14s ease,
+            border-color .14s ease, opacity .14s ease, transform .1s ease;
+        }
+        .app-root button:not(:disabled):active { transform: scale(.975); }
+        .app-root ::selection { background: var(--theme-accent-bg); color: var(--theme-text); }
+        .chat-textarea:focus {
+          border-color: var(--theme-accent) !important;
+          box-shadow: 0 0 0 3px var(--theme-accent-bg), inset 0 1px 1px rgba(0,0,0,.025) !important;
+        }
+        .awu-topbar button:hover, .awu-sidebar button:hover { filter: brightness(1.08); }
+        .awu-topbar {
+          backdrop-filter: saturate(125%) blur(18px);
+          -webkit-backdrop-filter: saturate(125%) blur(18px);
+          box-shadow: 0 1px 0 var(--theme-border);
+        }
+        .awu-sidebar {
+          box-shadow: inset -1px 0 0 rgba(255,255,255,.015);
+          backdrop-filter: saturate(115%) blur(16px);
+          -webkit-backdrop-filter: saturate(115%) blur(16px);
+        }
+        .awu-chat-pane { transition: box-shadow .16s ease, border-color .16s ease; }
+        .awu-message-scroll {
+          scrollbar-gutter: stable;
+          background:
+            radial-gradient(circle at 50% -15%, var(--theme-accent-bg), transparent 34%),
+            linear-gradient(180deg, transparent 0%, rgba(0,0,0,.008) 100%);
+        }
+        .awu-composer {
+          background: var(--theme-panel-bg) !important;
+          backdrop-filter: saturate(125%) blur(20px);
+          -webkit-backdrop-filter: saturate(125%) blur(20px);
+          box-shadow: 0 -1px 0 var(--theme-border), 0 -10px 32px rgba(0,0,0,.035);
+        }
+        .message-bubble-wrapper {
+          box-shadow: var(--ui-shadow-soft);
+          transition: border-color .16s ease, box-shadow .16s ease, transform .16s ease;
+        }
+        .message-bubble-wrapper:hover { box-shadow: var(--ui-shadow-float); }
+        .awu-date-divider {
+          display: flex; align-items: center; gap: 12px;
+          margin: 16px 20px 12px;
+          color: var(--theme-text-muted); font-size: 10.5px; font-weight: 600;
+          letter-spacing: .035em; white-space: nowrap;
+        }
+        .awu-date-divider::before, .awu-date-divider::after {
+          content: ""; height: 1px; flex: 1;
+          background: linear-gradient(90deg, transparent, var(--theme-border));
+        }
+        .awu-date-divider::after { background: linear-gradient(90deg, var(--theme-border), transparent); }
         .app-skip-link {
           position: fixed; z-index: 10000; top: 8px; left: 8px; padding: 10px 14px;
           border: 2px solid var(--theme-accent); border-radius: 8px;
@@ -898,7 +971,7 @@ export const App: React.FC = () => {
         .app-skip-link:focus { transform: translateY(0); }
         .app-root button:focus-visible, .app-root a:focus-visible, .app-root input:focus-visible,
         .app-root textarea:focus-visible, .app-root select:focus-visible {
-          outline: 3px solid var(--theme-accent);
+          outline: 2px solid var(--theme-accent);
           outline-offset: 2px;
         }
         @media (prefers-reduced-motion: reduce) {
@@ -910,8 +983,8 @@ export const App: React.FC = () => {
           }
         }
         @keyframes dialogSlideIn {
-          from { opacity: 0; transform: perspective(900px) rotateX(-14deg) scale(0.96) translateY(-8px); }
-          to   { opacity: 1; transform: perspective(900px) rotateX(0deg)   scale(1)    translateY(0); }
+          from { opacity: 0; transform: translateY(8px) scale(.985); }
+          to   { opacity: 1; transform: translateY(0) scale(1); }
         }
         /* ── Markdown 内容 ── */
         .md-content { line-height: 1.6; }
@@ -1035,17 +1108,17 @@ export const App: React.FC = () => {
           onMouseDown={handleSidebarDragStart}
           title="拖拽调整侧栏宽度"
           style={{
-            width: 4, flexShrink: 0, cursor: 'col-resize',
-            background: 'var(--theme-border, rgba(255,255,255,0.1))', transition: 'background 0.15s',
+            width: 3, flexShrink: 0, cursor: 'col-resize',
+            background: 'transparent', transition: 'background 0.15s',
           }}
           onMouseEnter={(e) => (e.currentTarget.style.background = 'var(--theme-accent, #7aa2f7)')}
-          onMouseLeave={(e) => (e.currentTarget.style.background = 'var(--theme-border, rgba(255,255,255,0.1))')}
+          onMouseLeave={(e) => (e.currentTarget.style.background = 'transparent')}
         />
       )}
 
       <div style={{ flex: 1, display: 'flex', flexDirection: 'column', minWidth: 0 }}>
         {/* ---- 顶部栏 ---- */}
-        <div style={isMobile ? { ...headerStyle, padding: '4px 8px', gap: 2, flexWrap: 'nowrap', alignItems: 'center' } : headerStyle}>
+        <div className="awu-topbar" style={isMobile ? { ...headerStyle, padding: '4px 8px', gap: 2, flexWrap: 'nowrap', alignItems: 'center' } : headerStyle}>
           {/* ★ 移动端：唤出侧栏抽屉的汉堡按钮 */}
           {isMobile && (
             <button
@@ -1199,7 +1272,7 @@ export const App: React.FC = () => {
               display: 'grid',
               gridTemplateColumns: gridCols,
               gridTemplateRows: gridRows,
-              gap: 4,
+              gap: 1,
               overflow: 'hidden',
               minHeight: 0,
               background: 'var(--theme-border)',
@@ -1447,7 +1520,7 @@ const rootStyle: React.CSSProperties = {
   display: 'flex',
   background: 'var(--theme-bg, #ffffff)',
   color: 'var(--theme-text, #1f2328)',
-  fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif',
+  fontFamily: 'var(--ui-font, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif)',
 };
 
 // ★ 移动端：便签本/素材池改为全屏覆盖，不挤占聊天区
@@ -1462,22 +1535,28 @@ const mobilePanelOverlayStyle: React.CSSProperties = {
 };
 
 const headerStyle: React.CSSProperties = {
-  padding: '12px 16px',
+  minHeight: 48,
+  padding: '8px 14px',
   borderBottom: '1px solid var(--theme-border, rgba(0,0,0,0.12))',
   display: 'flex',
-  alignItems: 'baseline',
-  gap: 12,
-  background: 'var(--theme-bg, #ffffff)',
+  alignItems: 'center',
+  gap: 10,
+  background: 'var(--theme-panel-bg, var(--theme-bg, #ffffff))',
 };
 
 const settingsBtnStyle: React.CSSProperties = {
-  background: 'none',
-  border: 'none',
+  width: 30,
+  height: 30,
+  background: 'transparent',
+  border: '1px solid transparent',
   color: 'var(--theme-text-muted, #656d76)',
   fontSize: 18,
   cursor: 'pointer',
-  padding: '2px 6px',
-  borderRadius: 4,
+  padding: 0,
+  borderRadius: 5,
+  display: 'inline-flex',
+  alignItems: 'center',
+  justifyContent: 'center',
   transition: 'color 0.15s',
 };
 
@@ -1507,7 +1586,7 @@ const overlayStyle: React.CSSProperties = {
 const dialogStyle: React.CSSProperties = {
   background: 'var(--theme-bg-secondary, #ffffff)',
   border: '1px solid var(--theme-border, rgba(0,0,0,0.15))',
-  borderRadius: 12,
+  borderRadius: 8,
   padding: 24,
   width: '90%',
   maxWidth: 480,
