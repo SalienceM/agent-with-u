@@ -213,6 +213,35 @@ export const Settings: React.FC<SettingsProps> = ({
           </p>
         </div>
 
+        {/* Session 列表密度 */}
+        <div style={sectionStyle}>
+          <label style={labelStyle}>左侧 Session 展示数量</label>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+            <input
+              type="number"
+              min={5}
+              max={500}
+              step={5}
+              value={config.sidebarSessionLimit}
+              onChange={(e) => {
+                const value = Number(e.target.value);
+                if (Number.isFinite(value) && value > 0) {
+                  onConfigChange({ sidebarSessionLimit: Math.min(500, Math.trunc(value)) });
+                }
+              }}
+              onBlur={() => {
+                if (!Number.isFinite(config.sidebarSessionLimit) || config.sidebarSessionLimit < 5) {
+                  onConfigChange({ sidebarSessionLimit: 25 });
+                }
+              }}
+              style={{ ...inputStyle, width: 100, flex: '0 0 auto' }}
+            />
+            <span style={{ fontSize: 11, color: 'var(--theme-text-muted)', lineHeight: 1.5 }}>
+              每个执行节点最近展示的普通 Session 数；收藏项始终显示。默认 25，搜索不受限制。
+            </span>
+          </div>
+        </div>
+
         {/* 导出格式 */}
         <div style={sectionStyle}>
           <label style={labelStyle}>Export Format</label>

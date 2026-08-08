@@ -19,11 +19,18 @@ from . import paths
 
 
 RUN_STATUSES = {
-    "queued", "running", "evaluating", "succeeded", "failed", "error", "cancelled",
+    "queued", "running", "waiting_client", "evaluating",
+    "succeeded", "failed", "error", "cancelled",
 }
 FINAL_RUN_STATUSES = {"succeeded", "failed", "error", "cancelled"}
 CONTROL_MODES = {"ai", "human", "shared"}
 SHELLS = {"powershell", "cmd", "bash"}
+EXECUTION_TARGETS = {"executor", "client"}
+KIT_STEP_TYPES = {"command", "file_push", "kit_call"}
+KIT_STEP_STATUSES = {
+    "pending", "running", "waiting_client", "succeeded", "failed",
+    "error", "cancelled", "skipped",
+}
 
 
 def _now() -> float:
@@ -47,11 +54,127 @@ def _normalized_env_key(value: str) -> str:
     return key or "VALUE"
 
 
+KIT_IMPLEMENTATION_FIELDS = (
+    "implementationSummary", "generationWarnings", "generatedByAi",
+    "executionTarget", "steps", "command", "shell", "cwd", "timeoutSeconds",
+    "inputs", "assertions", "outputs", "dependencies", "schedule", "view",
+)
+
+
+def _json_copy(value: Any) -> Any:
+    """Kit DSL 只含 JSON 数据；序列化复制可同时切断可变对象引用。"""
+    return json.loads(json.dumps(value, ensure_ascii=False))
+
+
+@dataclass
+class KitVersion:
+    id: str
+    version: str = "1.0"
+    snapshot: dict = field(default_factory=dict)
+    source: str = "create"
+    note: str = ""
+    created_at: float = field(default_factory=_now)
+
+    def to_dict(self, *, include_snapshot: bool = True) -> dict:
+        payload = {
+            "id": self.id,
+            "version": self.version,
+            "source": self.source,
+            "note": self.note,
+            "createdAt": self.created_at,
+        }
+        if include_snapshot:
+            payload["snapshot"] = self.snapshot
+        return payload
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "KitVersion":
+        return cls(
+            id=str(data.get("id") or _id()),
+            version=_safe_text(data.get("version") or "1.0", 40),
+            snapshot=dict(data.get("snapshot") or {}),
+            source=_safe_text(data.get("source") or "create", 40),
+            note=_safe_text(data.get("note"), 4_000),
+            created_at=float(data.get("createdAt") or _now()),
+        )
+
+
+@dataclass
+class KitOptimizationMessage:
+    id: str
+    role: str
+    content: str = ""
+    backend_id: str = ""
+    status: str = "done"
+    proposal: Optional[dict] = None
+    warnings: list[str] = field(default_factory=list)
+    questions: list[str] = field(default_factory=list)
+    ready: bool = False
+    base_version_id: str = ""
+    finalized_version_id: str = ""
+    created_at: float = field(default_factory=_now)
+
+    def to_dict(self, *, include_proposal: bool = True) -> dict:
+        payload = {
+            "id": self.id,
+            "role": self.role,
+            "content": self.content,
+            "backendId": self.backend_id,
+            "status": self.status,
+            "warnings": self.warnings,
+            "questions": self.questions,
+            "ready": self.ready,
+            "baseVersionId": self.base_version_id,
+            "finalizedVersionId": self.finalized_version_id,
+            "createdAt": self.created_at,
+        }
+        if include_proposal:
+            payload["proposal"] = self.proposal
+        return payload
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "KitOptimizationMessage":
+        role = str(data.get("role") or "assistant")
+        if role not in {"user", "assistant"}:
+            role = "assistant"
+        status = str(data.get("status") or "done")
+        if status not in {"answering", "done", "error"}:
+            status = "done"
+        proposal = data.get("proposal")
+        return cls(
+            id=str(data.get("id") or _id()),
+            role=role,
+            content=_safe_text(data.get("content"), 100_000),
+            backend_id=_safe_text(data.get("backendId"), 200),
+            status=status,
+            proposal=dict(proposal) if isinstance(proposal, dict) else None,
+            warnings=[_safe_text(x, 2_000) for x in (data.get("warnings") or [])][:50],
+            questions=[_safe_text(x, 2_000) for x in (data.get("questions") or [])][:20],
+            ready=bool(data.get("ready", False)),
+            base_version_id=_safe_text(data.get("baseVersionId"), 200),
+            finalized_version_id=_safe_text(data.get("finalizedVersionId"), 200),
+            created_at=float(data.get("createdAt") or _now()),
+        )
+
+
 @dataclass
 class WorkspaceKit:
     id: str
     title: str = "未命名 Kit"
     description: str = ""
+    # 人定义“做什么 / 怎样算成功 / 不能碰什么”，AI 再把它编译为下面的
+    # command + assertions。保留原始自然语言，避免实现细节反客为主。
+    objective: str = ""
+    success_criteria: str = ""
+    safety_constraints: str = ""
+    references: list[str] = field(default_factory=list)
+    implementation_summary: str = ""
+    generation_warnings: list[str] = field(default_factory=list)
+    generated_by_ai: bool = False
+    # executor 是 Session 所属执行节点；client 是当前 AgentWithU 桌面客户端。
+    execution_target: str = "executor"
+    # 新 Kit 使用结构化步骤。空列表表示兼容旧版 command 单步骤 Kit。
+    steps: list[dict] = field(default_factory=list)
     command: str = ""
     shell: str = "powershell"
     cwd: str = "."
@@ -71,6 +194,11 @@ class WorkspaceKit:
     enabled: bool = True
     control_mode: str = "shared"
     last_run_id: str = ""
+    # 版本属于 Kit 本身。AI 只是其中一种产生版本的来源。
+    versions: list[KitVersion] = field(default_factory=list)
+    active_version_id: str = ""
+    optimization_messages: list[KitOptimizationMessage] = field(default_factory=list)
+    optimization_backend_id: str = ""
     created_at: float = field(default_factory=_now)
     updated_at: float = field(default_factory=_now)
 
@@ -79,6 +207,15 @@ class WorkspaceKit:
             "id": self.id,
             "title": self.title,
             "description": self.description,
+            "objective": self.objective,
+            "successCriteria": self.success_criteria,
+            "safetyConstraints": self.safety_constraints,
+            "references": self.references,
+            "implementationSummary": self.implementation_summary,
+            "generationWarnings": self.generation_warnings,
+            "generatedByAi": self.generated_by_ai,
+            "executionTarget": self.execution_target,
+            "steps": self.steps,
             "command": self.command,
             "shell": self.shell,
             "cwd": self.cwd,
@@ -92,6 +229,10 @@ class WorkspaceKit:
             "enabled": self.enabled,
             "controlMode": self.control_mode,
             "lastRunId": self.last_run_id,
+            "versions": [item.to_dict() for item in self.versions],
+            "activeVersionId": self.active_version_id,
+            "optimizationMessages": [item.to_dict() for item in self.optimization_messages],
+            "optimizationBackendId": self.optimization_backend_id,
             "createdAt": self.created_at,
             "updatedAt": self.updated_at,
         }
@@ -128,10 +269,28 @@ class WorkspaceKit:
             timeout = min(86_400, max(1, int(data.get("timeoutSeconds") or 300)))
         except (TypeError, ValueError):
             timeout = 300
-        return cls(
+        execution_target = str(data.get("executionTarget") or "executor").lower()
+        if execution_target not in EXECUTION_TARGETS:
+            execution_target = "executor"
+        kit = cls(
             id=str(data.get("id") or _id()),
             title=_safe_text(data.get("title") or "未命名 Kit", 160),
             description=_safe_text(data.get("description"), 4_000),
+            objective=_safe_text(data.get("objective") or data.get("description"), 12_000),
+            success_criteria=_safe_text(data.get("successCriteria"), 12_000),
+            safety_constraints=_safe_text(data.get("safetyConstraints"), 12_000),
+            references=[
+                _safe_text(item, 2_000) for item in (data.get("references") or [])
+                if str(item).strip()
+            ][:100],
+            implementation_summary=_safe_text(data.get("implementationSummary"), 12_000),
+            generation_warnings=[
+                _safe_text(item, 2_000) for item in (data.get("generationWarnings") or [])
+                if str(item).strip()
+            ][:50],
+            generated_by_ai=bool(data.get("generatedByAi", False)),
+            execution_target=execution_target,
+            steps=_dict_list(data.get("steps")),
             command=_safe_text(data.get("command"), 100_000),
             shell=shell,
             cwd=_safe_text(data.get("cwd") or ".", 2_000),
@@ -145,9 +304,21 @@ class WorkspaceKit:
             enabled=bool(data.get("enabled", True)),
             control_mode=control_mode,
             last_run_id=str(data.get("lastRunId") or ""),
+            versions=[KitVersion.from_dict(x) for x in _dict_list(data.get("versions"))],
+            active_version_id=str(data.get("activeVersionId") or ""),
+            optimization_messages=[
+                KitOptimizationMessage.from_dict(x)
+                for x in _dict_list(data.get("optimizationMessages"))
+            ][-200:],
+            optimization_backend_id=_safe_text(data.get("optimizationBackendId"), 200),
             created_at=float(data.get("createdAt") or _now()),
             updated_at=float(data.get("updatedAt") or _now()),
         )
+        # 旧 sidecar 懒迁移为 1.0。迁移只写入内存，下次正常保存时原子落盘。
+        kit.ensure_initial_version("legacy")
+        if not any(item.id == kit.active_version_id for item in kit.versions):
+            kit.active_version_id = kit.versions[-1].id
+        return kit
 
     def apply_patch(self, patch: dict) -> None:
         merged = self.to_dict()
@@ -156,6 +327,63 @@ class WorkspaceKit:
         merged["createdAt"] = self.created_at
         updated = WorkspaceKit.from_dict(merged)
         self.__dict__.update(updated.__dict__)
+        self.updated_at = _now()
+
+    def implementation_snapshot(self) -> dict:
+        current = self.to_dict()
+        snapshot = {key: current.get(key) for key in KIT_IMPLEMENTATION_FIELDS}
+        schedule = dict(snapshot.get("schedule") or {})
+        # nextRunAt 是运行时游标，不属于可移植的编排版本。
+        schedule["nextRunAt"] = None
+        snapshot["schedule"] = schedule
+        return _json_copy(snapshot)
+
+    def ensure_initial_version(self, source: str = "create") -> KitVersion:
+        if self.versions:
+            return self.versions[0]
+        version = KitVersion(
+            id=_id(), version="1.0", snapshot=self.implementation_snapshot(), source=source,
+            note="初始版本" if source != "legacy" else "从旧版 Kit 自动迁移",
+        )
+        self.versions.append(version)
+        self.active_version_id = version.id
+        return version
+
+    def append_version(
+        self, source: str, note: str = "", snapshot: Optional[dict] = None,
+    ) -> KitVersion:
+        self.ensure_initial_version("legacy")
+        highest_minor = 0
+        for item in self.versions:
+            match = re.fullmatch(r"1\.(\d+)", item.version)
+            if match:
+                highest_minor = max(highest_minor, int(match.group(1)))
+        version = KitVersion(
+            id=_id(), version=f"1.{highest_minor + 1}",
+            snapshot=_json_copy(snapshot if snapshot is not None else self.implementation_snapshot()),
+            source=source, note=_safe_text(note, 4_000),
+        )
+        self.versions.append(version)
+        self.active_version_id = version.id
+        self.updated_at = _now()
+        return version
+
+    def apply_version(self, version: KitVersion) -> None:
+        current = self.to_dict()
+        current.update(_json_copy(version.snapshot))
+        current["id"] = self.id
+        current["createdAt"] = self.created_at
+        # 账本和优化对话永远不由快照反向覆盖。
+        current["versions"] = [item.to_dict() for item in self.versions]
+        current["activeVersionId"] = version.id
+        current["optimizationMessages"] = [item.to_dict() for item in self.optimization_messages]
+        current["optimizationBackendId"] = self.optimization_backend_id
+        current["enabled"] = False
+        updated = WorkspaceKit.from_dict(current)
+        self.__dict__.update(updated.__dict__)
+        self.active_version_id = version.id
+        self.enabled = False
+        self.schedule["nextRunAt"] = None
         self.updated_at = _now()
 
 
@@ -180,6 +408,102 @@ class KitAssertionResult:
 
 
 @dataclass
+class KitStepRun:
+    id: str
+    type: str = "command"
+    target: str = "executor"
+    title: str = "执行步骤"
+    source_kit_id: str = ""
+    status: str = "pending"
+    shell: str = "powershell"
+    command: str = ""
+    cwd: str = "."
+    timeout_seconds: int = 300
+    config: dict = field(default_factory=dict)
+    inputs: dict = field(default_factory=dict)
+    exit_code: Optional[int] = None
+    stdout: str = ""
+    stderr: str = ""
+    assertions: list[KitAssertionResult] = field(default_factory=list)
+    error: str = ""
+    started_at: Optional[float] = None
+    ended_at: Optional[float] = None
+
+    def to_dict(self) -> dict:
+        return {
+            "id": self.id,
+            "type": self.type,
+            "target": self.target,
+            "title": self.title,
+            "sourceKitId": self.source_kit_id,
+            "status": self.status,
+            "shell": self.shell,
+            "command": self.command,
+            "cwd": self.cwd,
+            "timeoutSeconds": self.timeout_seconds,
+            "config": self.config,
+            "inputs": self.inputs,
+            "exitCode": self.exit_code,
+            "stdout": self.stdout,
+            "stderr": self.stderr,
+            "assertions": [item.to_dict() for item in self.assertions],
+            "error": self.error,
+            "startedAt": self.started_at,
+            "endedAt": self.ended_at,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "KitStepRun":
+        step_type = str(data.get("type") or "command").lower()
+        if step_type not in KIT_STEP_TYPES:
+            step_type = "command"
+        target = str(data.get("target") or "executor").lower()
+        if target not in EXECUTION_TARGETS:
+            target = "executor"
+        shell = str(data.get("shell") or "powershell").lower()
+        if shell not in SHELLS:
+            shell = "powershell"
+        status = str(data.get("status") or "pending")
+        if status not in KIT_STEP_STATUSES:
+            status = "error"
+        try:
+            timeout = min(86_400, max(1, int(data.get("timeoutSeconds") or 300)))
+        except (TypeError, ValueError):
+            timeout = 300
+        return cls(
+            id=str(data.get("id") or _id()),
+            type=step_type,
+            target=target,
+            title=_safe_text(data.get("title") or "执行步骤", 300),
+            source_kit_id=str(data.get("sourceKitId") or ""),
+            status=status,
+            shell=shell,
+            command=_safe_text(data.get("command"), 100_000),
+            cwd=_safe_text(data.get("cwd") or ".", 2_000),
+            timeout_seconds=timeout,
+            config=dict(data.get("config") or {}),
+            inputs=dict(data.get("inputs") or {}),
+            exit_code=data.get("exitCode"),
+            stdout=_safe_text(data.get("stdout")),
+            stderr=_safe_text(data.get("stderr")),
+            assertions=[
+                KitAssertionResult(
+                    type=str(x.get("type") or ""),
+                    label=str(x.get("label") or x.get("type") or "判言"),
+                    passed=bool(x.get("passed")),
+                    expected=x.get("expected"),
+                    actual=x.get("actual"),
+                    message=str(x.get("message") or ""),
+                )
+                for x in _dict_list(data.get("assertions"))
+            ],
+            error=_safe_text(data.get("error"), 20_000),
+            started_at=data.get("startedAt"),
+            ended_at=data.get("endedAt"),
+        )
+
+
+@dataclass
 class KitRun:
     id: str
     kit_id: str
@@ -195,6 +519,8 @@ class KitRun:
     stdout: str = ""
     stderr: str = ""
     assertions: list[KitAssertionResult] = field(default_factory=list)
+    steps: list[KitStepRun] = field(default_factory=list)
+    current_step: int = 0
     artifact_ids: list[str] = field(default_factory=list)
     error: str = ""
     started_at: Optional[float] = None
@@ -217,6 +543,8 @@ class KitRun:
             "stdout": self.stdout,
             "stderr": self.stderr,
             "assertions": [item.to_dict() for item in self.assertions],
+            "steps": [item.to_dict() for item in self.steps],
+            "currentStep": self.current_step,
             "artifactIds": self.artifact_ids,
             "error": self.error,
             "startedAt": self.started_at,
@@ -229,6 +557,10 @@ class KitRun:
         status = str(data.get("status") or "queued")
         if status not in RUN_STATUSES:
             status = "error"
+        try:
+            current_step = max(0, int(data.get("currentStep") or 0))
+        except (TypeError, ValueError):
+            current_step = 0
         return cls(
             id=str(data.get("id") or _id()),
             kit_id=str(data.get("kitId") or ""),
@@ -254,6 +586,8 @@ class KitRun:
                 )
                 for x in _dict_list(data.get("assertions"))
             ],
+            steps=[KitStepRun.from_dict(x) for x in _dict_list(data.get("steps"))],
+            current_step=current_step,
             artifact_ids=[str(x) for x in (data.get("artifactIds") or [])],
             error=_safe_text(data.get("error"), 20_000),
             started_at=data.get("startedAt"),
@@ -351,6 +685,8 @@ class WorkspaceKitState:
     def compact(self) -> None:
         """限制 sidecar 增长；保留最近运行及每个数据键的近期版本。"""
         self.runs = self.runs[-100:]
+        for kit in self.kits:
+            kit.optimization_messages = kit.optimization_messages[-200:]
         kept: list[KitArtifact] = []
         counts: dict[str, int] = {}
         for item in reversed(self.artifacts):

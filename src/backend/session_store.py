@@ -104,11 +104,37 @@ class SessionStore:
             snapshot = [dict(item) for item in self._index.values()]
         return sorted(snapshot, key=lambda x: x.get("updatedAt", 0), reverse=True)
 
+    def get_meta(self, sid: str) -> Optional[dict]:
+        """从内存索引读取轻量元数据；不解析可能很大的 session 正文文件。"""
+        with self._lock:
+            item = self._index.get(sid)
+            return dict(item) if item else None
+
     def update_meta(self, session: Session) -> None:
         """立即更新会话列表使用的内存索引，不等待后台磁盘 I/O。"""
         meta = session.meta_dict()
         with self._lock:
             self._index[session.id] = meta
+
+    def save_meta(
+        self,
+        session: Session,
+        *,
+        touch_updated: bool = True,
+        immediate: bool = False,
+    ) -> None:
+        """只持久化 index 摘要，不重写可能很大的消息正文文件。
+
+        侧栏收藏/底色不应把会话伪装成“刚完成一次对话”，因此这类调用会
+        touch_updated=False；用户点击后又希望立刻跨重启可靠，使用 immediate=True。
+        """
+        if touch_updated:
+            session.updated_at = time.time()
+        self.update_meta(session)
+        if immediate:
+            self._save_index_sync()
+        else:
+            self._save_index_debounced()
 
     def load(self, sid: str) -> Optional[Session]:
         path = self._session_path(sid)
@@ -116,6 +142,11 @@ class SessionStore:
             return None
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
+            # sidebar 元数据可独立于巨型 Session 正文落盘；索引是其权威来源。
+            # 这样收藏/换色不会为了一次轻量操作重新序列化全部历史消息。
+            meta = {}
+            if hasattr(self, "_lock"):
+                meta = self.get_meta(sid) or {}
             messages = []
             for m in data.get("messages", []):
                 images = None
@@ -147,6 +178,11 @@ class SessionStore:
                     usage=m.get("usage"),
                     tool_calls=tool_calls,
                     streaming=False,
+                    delivery_mode=(
+                        m.get("deliveryMode")
+                        if m.get("deliveryMode") in {"steer", "redirect"}
+                        else None
+                    ),
                 ))
             return Session(
                 id=data["id"],
@@ -174,6 +210,13 @@ class SessionStore:
                 constraints=data.get("constraints"),
                 abilities=data.get("abilities"),
                 session_type=data.get("sessionType", "normal"),
+                loop_control_mode=(
+                    "manual" if data.get("loopControlMode") == "manual"
+                    else "loop" if data.get("loopControlMode") == "loop"
+                    else None
+                ),
+                pinned=bool(meta.get("pinned", data.get("pinned", False))),
+                sidebar_color=str(meta.get("sidebarColor", data.get("sidebarColor", "")) or ""),
                 auto_commit=data.get("autoCommit", False),
                 auto_commit_push=data.get("autoCommitPush", False),
                 auto_commit_backend_id=data.get("autoCommitBackendId"),

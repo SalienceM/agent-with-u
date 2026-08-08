@@ -428,10 +428,8 @@ export const App: React.FC = () => {
       return;
     }
     let cancelled = false;
-    // 顶栏只用 workingDir / backendId 等元数据，不需要消息正文。
-    // 用 limit=1 避免在启动时把整个 session（可能几十兆图片）拉过来——这是启动变慢、
-    // "好一会才出东西"的主因之一。ChatPane 会按自己的分页再拉消息。
-    api.loadSession(activeSessionId, 1).then((session) => {
+    // 顶栏只读 SessionStore index；不再为了元数据解析任意消息正文。
+    api.loadSessionMeta(activeSessionId).then((session) => {
       if (cancelled) return;
       setActiveSession(session);
     });
@@ -490,6 +488,16 @@ export const App: React.FC = () => {
       return next;
     });
   }, []);
+
+  // LOOP 不走普通 chat stream。直接聚合后端 loopUpdated 的权威 running，
+  // 这样即使 LOOP 在后台 pane 中运行，左侧栏也持续显示脉冲/流动边框。
+  useEffect(() => {
+    return api.onLoopUpdated((state: any) => {
+      const sid: string | undefined = state?.sessionId;
+      if (!sid || typeof state.running !== 'boolean') return;
+      handleStreamingChange(sid, state.running);
+    });
+  }, [handleStreamingChange]);
 
   // ★ 全局监听所有 session 的显式 done
   // 修正两个 bug：
@@ -1018,6 +1026,7 @@ export const App: React.FC = () => {
         activeExecMode={activeSession?.execMode}
         activeBackendId={activeBackendId}
         activeCodexRemoteHost={activeSession?.codexRemoteHost}
+        sessionLimit={config.sidebarSessionLimit}
       />
 
       {/* 侧栏宽度拖拽手柄(桌面端展开时) */}

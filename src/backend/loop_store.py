@@ -607,6 +607,91 @@ class LoopStore:
     def _path(self, sid: str) -> Path:
         return self._dir / f"{sid}.json"
 
+    def _meta_path(self, sid: str) -> Path:
+        return self._dir / f"{sid}.meta.json"
+
+    @staticmethod
+    def _meta_dict(state: LoopState) -> dict:
+        return {
+            "sessionId": state.session_id,
+            "stage": state.stage,
+            "controlMode": state.control_mode,
+            "auto": state.auto,
+            "status": state.status,
+            "round": state.round,
+            "updatedAt": state.updated_at,
+        }
+
+    def _write_meta_unlocked(self, state: LoopState) -> None:
+        path = self._meta_path(state.session_id)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        try:
+            tmp.write_text(
+                json.dumps(self._meta_dict(state), ensure_ascii=False, separators=(",", ":")),
+                encoding="utf-8",
+            )
+            os.replace(tmp, path)
+        finally:
+            try:
+                if tmp.exists():
+                    tmp.unlink()
+            except OSError:
+                pass
+
+    def load_meta(self, sid: str) -> Optional[dict]:
+        """读取小型路由元数据；旧 stage 仅做一次逐行扫描并自动生成 sidecar。"""
+        meta_path = self._meta_path(sid)
+        if meta_path.exists():
+            try:
+                data = json.loads(meta_path.read_text(encoding="utf-8"))
+                return data if isinstance(data, dict) else None
+            except Exception:
+                pass
+        stage_path = self._path(sid)
+        if not stage_path.exists():
+            return None
+        stage = STAGE_IDEA
+        control_mode = "loop"
+        auto = False
+        status = "active"
+        round_no = 1
+        try:
+            # controlMode 位于庞大的 loops 之后；逐行扫描避免构建整个 JSON 对象。
+            with stage_path.open("r", encoding="utf-8", errors="replace") as handle:
+                for line in handle:
+                    # LoopStore 固定 indent=2；只读取顶层键，不能把 step/aside 的
+                    # status 等同名字段误当作 stage 元数据。
+                    if not line.startswith('  "') or line.startswith('    "'):
+                        continue
+                    stripped = line.strip().rstrip(",")
+                    if stripped.startswith('"stage"'):
+                        stage = str(json.loads("{" + stripped + "}").get("stage") or stage)
+                    elif stripped.startswith('"controlMode"'):
+                        value = json.loads("{" + stripped + "}").get("controlMode")
+                        control_mode = "manual" if value == "manual" else "loop"
+                    elif stripped.startswith('"auto"'):
+                        auto = bool(json.loads("{" + stripped + "}").get("auto", False))
+                    elif stripped.startswith('"status"'):
+                        status = str(json.loads("{" + stripped + "}").get("status") or status)
+                    elif stripped.startswith('"round"'):
+                        round_no = int(json.loads("{" + stripped + "}").get("round") or 1)
+            meta = {
+                "sessionId": sid, "stage": stage, "controlMode": control_mode,
+                "auto": auto, "status": status, "round": round_no,
+                "updatedAt": stage_path.stat().st_mtime,
+            }
+            # 迁移写入失败不影响本次读取。
+            try:
+                meta_path.write_text(
+                    json.dumps(meta, ensure_ascii=False, separators=(",", ":")), encoding="utf-8",
+                )
+            except Exception:
+                pass
+            return meta
+        except Exception as exc:
+            print(f"[LoopStore] failed to load meta {sid}: {exc}")
+            return None
+
     def exists(self, sid: str) -> bool:
         return self._path(sid).exists()
 
@@ -633,6 +718,7 @@ class LoopStore:
                     f.flush()
                     os.fsync(f.fileno())
                 os.replace(tmp, path)
+                self._write_meta_unlocked(state)
             finally:
                 try:
                     if tmp.exists():
@@ -653,6 +739,9 @@ class LoopStore:
             p = self._path(sid)
             if p.exists():
                 p.unlink()
+            meta = self._meta_path(sid)
+            if meta.exists():
+                meta.unlink()
             return True
         except Exception:
             return False

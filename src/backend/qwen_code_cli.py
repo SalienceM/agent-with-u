@@ -137,6 +137,14 @@ class QwenCodeSdkBackend(ModelBackend):
     tool selection. System prompt injection is handled via `append_system_prompt`.
     """
 
+    def follow_up_capabilities(self) -> dict:
+        return {
+            "queue": True,
+            "nativeSteer": False,
+            "interruptResume": True,
+            "steerAttachments": False,
+        }
+
     def _resolve_cli(self) -> str:
         return resolve_qwen_cli(getattr(self.config, "cli_path", None))
 
@@ -778,4 +786,3 @@ class QwenCodeSdkBackend(ModelBackend):
                     pass
 
         return {"agentSessionId": _new_agent_sid}
-

@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import math
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional, Callable, Awaitable
 from urllib.parse import urlsplit
@@ -29,6 +30,22 @@ _PROXY_ENV_KEYS = (
 )
 
 CODEX_REASONING_EFFORTS = {"none", "minimal", "low", "medium", "high", "xhigh", "max"}
+
+
+@dataclass
+class _SteerRequest:
+    content: str
+    images: Optional[list[ImageAttachment]]
+    client_message_id: str
+    future: asyncio.Future
+
+
+@dataclass
+class _ActiveAppTurn:
+    conn: CodexAppServerProcess
+    thread_id: str
+    turn_id: str
+    control_queue: asyncio.Queue = field(default_factory=asyncio.Queue)
 
 
 def normalize_codex_reasoning_effort(value: object) -> str:
@@ -148,6 +165,117 @@ class CodexOfficeBackend(ModelBackend):
     documented non-interactive mode supports JSON events, workspace selection,
     model override, sandbox policy, image attachments, and exec-session resume.
     """
+
+    def __init__(self, config: ModelBackendConfig):
+        super().__init__(config)
+        # Only the owner coroutine reads app-server stdout.  External steer RPCs
+        # enqueue control requests here; the active turn drains them serially.
+        self._active_app_turns: dict[str, _ActiveAppTurn] = {}
+
+    def app_server_default_enabled(self) -> bool:
+        value = str(self.config.get_env("AGENTWITHU_CODEX_APP_SERVER", "true") or "true")
+        return value.strip().lower() not in {"0", "false", "no", "off"}
+
+    def follow_up_capabilities(self) -> dict:
+        return {
+            "queue": True,
+            "nativeSteer": True,
+            "interruptResume": False,
+            "steerAttachments": True,
+        }
+
+    @staticmethod
+    def _app_server_input(
+        content: str,
+        images: Optional[list[ImageAttachment]],
+    ) -> list[dict]:
+        user_input: list[dict] = []
+        if content:
+            user_input.append({"type": "text", "text": content})
+        for image in images or []:
+            if image.base64:
+                mime = image.mime_type or "image/png"
+                user_input.append({
+                    "type": "image",
+                    "url": f"data:{mime};base64,{image.base64}",
+                })
+            elif image.file_path:
+                try:
+                    raw = Path(image.file_path).read_bytes()
+                    mime = image.mime_type or "image/png"
+                    user_input.append({
+                        "type": "image",
+                        "url": f"data:{mime};base64,{base64.b64encode(raw).decode('ascii')}",
+                    })
+                except OSError:
+                    pass
+        return user_input
+
+    async def steer_message(
+        self,
+        *,
+        session_id: str,
+        content: str,
+        images: Optional[list[ImageAttachment]] = None,
+        client_message_id: str = "",
+    ) -> dict:
+        handle = self._active_app_turns.get(session_id)
+        if not handle:
+            return {"status": "turn_finished", "message": "当前回答已经结束，未执行引导"}
+        loop = asyncio.get_running_loop()
+        future = loop.create_future()
+        await handle.control_queue.put(_SteerRequest(
+            content=content,
+            images=images,
+            client_message_id=client_message_id,
+            future=future,
+        ))
+        try:
+            return await asyncio.wait_for(future, timeout=20)
+        except asyncio.TimeoutError:
+            if not future.done():
+                future.cancel()
+            return {"status": "error", "message": "引导请求等待 Codex 响应超时"}
+
+    async def _drain_steer_requests(self, handle: _ActiveAppTurn) -> None:
+        while True:
+            try:
+                request = handle.control_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                return
+            if request.future.done():
+                continue
+            user_input = self._app_server_input(request.content, request.images)
+            if not user_input:
+                request.future.set_result({"status": "error", "message": "引导内容为空"})
+                continue
+            try:
+                await handle.conn.request("turn/steer", {
+                    "threadId": handle.thread_id,
+                    "expectedTurnId": handle.turn_id,
+                    "clientUserMessageId": request.client_message_id,
+                    "input": user_input,
+                }, timeout=15)
+                request.future.set_result({
+                    "status": "ok",
+                    "threadId": handle.thread_id,
+                    "turnId": handle.turn_id,
+                })
+            except Exception as exc:
+                request.future.set_result({"status": "error", "message": _exc_msg(exc)})
+
+    @staticmethod
+    def _finish_active_turn(handle: _ActiveAppTurn) -> None:
+        while True:
+            try:
+                request = handle.control_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            if not request.future.done():
+                request.future.set_result({
+                    "status": "turn_finished",
+                    "message": "当前回答已经结束，未执行引导",
+                })
 
     def _build_env(self) -> dict[str, str]:
         env = os.environ.copy()
@@ -593,19 +721,7 @@ class CodexOfficeBackend(ModelBackend):
             if not thread_id:
                 raise RuntimeError("远端 Codex 未返回 thread id")
 
-            user_input: list[dict] = [{"type": "text", "text": prompt}]
-            for image in images or []:
-                if image.base64:
-                    mime = image.mime_type or "image/png"
-                    user_input.append({"type": "image", "url": f"data:{mime};base64,{image.base64}"})
-                elif image.file_path:
-                    # 本机路径在 SSH 主机上通常不存在，因此编码后传输。
-                    try:
-                        raw = Path(image.file_path).read_bytes()
-                        mime = image.mime_type or "image/png"
-                        user_input.append({"type": "image", "url": f"data:{mime};base64,{base64.b64encode(raw).decode('ascii')}"})
-                    except OSError:
-                        pass
+            user_input = self._app_server_input(prompt, images)
             turn_params: dict = {
                 "threadId": thread_id,
                 "input": user_input,
@@ -619,8 +735,17 @@ class CodexOfficeBackend(ModelBackend):
             started = await conn.request("turn/start", turn_params, timeout=45)
             turn = started.get("turn", {}) if isinstance(started, dict) else {}
             turn_id = str(turn.get("id") or "")
+            if not turn_id:
+                raise RuntimeError("Codex app-server 未返回 turn id")
+            if session_id in self._active_app_turns:
+                raise RuntimeError("同一 Session 已有一个 Codex app-server turn 在运行")
+            active_turn = _ActiveAppTurn(conn=conn, thread_id=thread_id, turn_id=turn_id)
+            self._active_app_turns[session_id] = active_turn
 
             while True:
+                # turn/steer 必须由本协程串行发起和读取响应，不能让 Bridge RPC
+                # 直接读取同一个 stdout，否则 JSON-RPC response/event 会串线。
+                await self._drain_steer_requests(active_turn)
                 if self.is_cancelled(session_id):
                     if turn_id:
                         try:
@@ -631,7 +756,7 @@ class CodexOfficeBackend(ModelBackend):
                             pass
                     break
                 try:
-                    msg = await conn.next_message(timeout=0.3)
+                    msg = await conn.next_message(timeout=0.1)
                 except asyncio.TimeoutError:
                     continue
 
@@ -747,6 +872,10 @@ class CodexOfficeBackend(ModelBackend):
         except Exception as exc:
             emit("error", error=_exc_msg(exc))
         finally:
+            active_turn = self._active_app_turns.get(session_id)
+            if active_turn and active_turn.conn is conn:
+                self._active_app_turns.pop(session_id, None)
+                self._finish_active_turn(active_turn)
             await conn.close()
             emit("done", **({"usage": final_usage} if final_usage else {}))
             self.clear_cancelled(session_id)

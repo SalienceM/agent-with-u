@@ -57,6 +57,24 @@ class LoopCoreTests(unittest.TestCase):
                 self.assertEqual(store.load("session-1").goal, "second")
                 self.assertFalse((root / "session-1.json.tmp").exists())
 
+    def test_loop_store_keeps_lightweight_control_meta(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with patch("src.backend.loop_store.paths.sub", return_value=root):
+                store = LoopStore()
+                state = LoopState(
+                    session_id="manual-session", stage="loopexecute",
+                    control_mode="manual", round=3,
+                )
+                store.save(state)
+
+                meta = store.load_meta("manual-session")
+
+                self.assertEqual(meta["controlMode"], "manual")
+                self.assertEqual(meta["stage"], "loopexecute")
+                self.assertEqual(meta["round"], 3)
+                self.assertLess((root / "manual-session.meta.json").stat().st_size, 1_000)
+
     def test_model_ledger_reports_success_duration_and_task_mix(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

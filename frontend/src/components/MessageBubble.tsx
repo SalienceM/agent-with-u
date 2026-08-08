@@ -1150,6 +1150,26 @@ function MessageBubbleInner({
           ttsVoice={ttsVoice}
           ttsRate={ttsRate}
         />
+        {isUser && message.deliveryMode && (
+          <div style={{
+            display: 'inline-flex',
+            alignItems: 'center',
+            marginBottom: 6,
+            padding: '2px 7px',
+            borderRadius: 999,
+            fontSize: 10,
+            lineHeight: 1.4,
+            color: message.deliveryMode === 'steer' ? '#8250df' : '#bc4c00',
+            background: message.deliveryMode === 'steer'
+              ? 'rgba(130,80,223,0.10)'
+              : 'rgba(188,76,0,0.10)',
+            border: `1px solid ${message.deliveryMode === 'steer'
+              ? 'rgba(130,80,223,0.28)'
+              : 'rgba(188,76,0,0.28)'}`,
+          }}>
+            {message.deliveryMode === 'steer' ? '↪ 当前轮引导' : '↻ 中断后重新引导'}
+          </div>
+        )}
         {message.textAttachments && message.textAttachments.length > 0 && (
           <TextAttachmentPreview
             attachments={message.textAttachments}
@@ -1329,6 +1349,7 @@ function bubblePropsEqual(prev: Props, next: Props): boolean {
     prev.message.content   === next.message.content   &&
     prev.message.images    === next.message.images    &&
     prev.message.textAttachments === next.message.textAttachments &&
+    prev.message.deliveryMode === next.message.deliveryMode &&
     prev.message.elapsed   === next.message.elapsed   &&
     prev.message.usage     === next.message.usage     &&
     prev.fontSize          === next.fontSize          &&

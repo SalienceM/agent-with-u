@@ -260,6 +260,17 @@ thread; `codex_connection_mode="ssh"` records that Codex commands execute throug
 Both may be true at once. The Sidebar therefore renders independent `🧲 接管` and
 `⌁ SSH Codex` badges instead of deriving one meaning from the other.
 
+**Running-turn follow-up semantics.** Ordinary Codex sessions now use executor-local
+`codex app-server` by default (set `AGENTWITHU_CODEX_APP_SERVER=false` on a Backend to
+retain the legacy `codex exec` path). While a turn is active, `turn/steer` requests are
+queued onto the owning app-server coroutine; no second coroutine may read that process'
+stdout. The UI labels this native same-turn behavior as **引导当前轮**. Qwen Code SDK
+does not expose equivalent steering: its **中断后重引导** action first persists a
+priority `SeqTask`, then aborts the current query and resumes with that task after the
+authoritative chat-turn registry becomes idle. Plain **排到下一轮** remains available
+for every Backend. `ChatMessage.delivery_mode` (`steer` / `redirect`) records the
+visible provenance; the two stronger semantics must never be presented as equivalent.
+
 ### Visualized Loop Integration (loop sessions)
 
 Sessions have a `session_type` of `normal` (default) or `loop`. Loop sessions
@@ -301,7 +312,13 @@ The global stage advances one-way: `loopidea → loopexecute → loopout`.
   same working dir / agent context, with an optional new/edited goal. Scores, risk,
   trend, and the effective-max-loops budget are scoped **per round** (`round_loops()`);
   `seq` stays globally unique. The LoopPanel shows a loopout banner with the
-  new-round box and renders the timeline with per-round dividers.
+  new-round box and renders the timeline with per-round dividers. Top-level iteration
+  tasks are registered in `_loop_tasks`, so a manual transition while a backend step is
+  stuck can cancel both the isolated backend call and its owning asyncio task. Entering
+  loopout while running first seals the partial record as interrupted; starting a new
+  round from a legacy `loopout + running` state does the same and then advances
+  atomically, preventing an orphaned run from blocking `loopContinue`. An unfinished
+  record from an older round is never resumed in the new round.
 
 Loop turns run silently against the agent (`_loop_run_agent`); their plans,
 results and scores stream to a dedicated **LoopPanel** (`frontend/src/components/
@@ -466,14 +483,105 @@ user/assistant exchange is mirrored into `manual_messages` (including tool calls
 thinking metadata) and into sequential `LoopStep` entries. The record also freezes a
 read-only `manual_context` digest of the goal and earlier loop results, which is injected
 into the first manual turn and remains inspectable in LoopPanel. `loopRelease` is allowed
-only after the chat response stops; it seals the manual record without inventing an
-analysis score and returns ownership to LOOP. The next automated prepare sees the manual
-record through loop history. Opening and immediately releasing creates no empty pass.
+only after the executor's authoritative chat-task registry is idle (persisted/local
+`streaming` flags are not trusted); it seals the manual record without inventing an
+analysis score and returns ownership to LOOP. Opening and immediately releasing creates
+no empty pass and is not blocked by a paused sequence queue. During takeover, ChatPane's
+`🗂 LOOP 总览` opens `LoopPanel` in `inspectOnly` mode: the complete metrics, timeline,
+details, and panel/flow toggle remain visible in a read-only overlay while mutation
+controls stay hidden. The next automated prepare sees a non-empty manual record through
+loop history.
+
+**LOOP/session reload performance.** Reopening a LOOP must not transfer the full stage
+merely to decide whether it is automated or manually taken over. `Session.loop_control_mode`
+mirrors ownership into the Session index, while `LoopStore` maintains a tiny
+`loops/<id>.meta.json` sidecar as the authoritative fast fallback (legacy stages migrate
+on first read). `ChatPane` loads `loadSessionMeta` first and renders manual takeover as an
+ordinary chat immediately; it never calls `loopGetState` for ownership. Automated LOOP
+panes pass `hydrationEnabled=false` to `useChat`, so invisible chat history is not loaded.
+`loopGetState` and `loopUpdated` carry compact records with large step outputs, results,
+manual context and manual transcript removed; selecting a timeline record calls
+`loopGetRecord` to fetch just that full detail. Manual transcript snapshots also omit
+base64 attachments and cap tool input/output. Finally, `Session.to_dict(message_limit)`
+and `loadSessionMessages` slice `ChatMessage` objects before calling `to_dict()`, so
+pagination is O(requested messages), not O(full history). Preserve these boundaries when
+adding LOOP fields or new consumers; the dashboard also relies on compact updates.
 
 Loop RPCs: `loopGetState`, `loopSubmitIdea`, `loopRemoveIdea`, `loopSealIdea`,
 `loopSetGoal`, `loopRefineGoal`, `loopSetPolicy`, `loopRunIteration`, `loopDiscard`,
 `loopTakeover`, `loopRelease`, `loopSetAuto`, `loopAdvanceToOut`, `loopContinue`, `loopAsk`, `loopAddAddon`,
-`loopRemoveAddon`, `loopEditAddon`. `createSession` takes an optional third `session_type` argument.
+`loopRemoveAddon`, `loopEditAddon`, `loopGetRecord`. `createSession` takes an optional third `session_type` argument.
+
+### Workspace Kits (experimental)
+
+Workspace Kits are Session-level standard accessories stored separately in
+`~/.agent-with-u/workspace-kits/<session_id>.json` by
+`src/backend/workspace_kit_store.py`. The design boundary is intentional:
+
+- Humans define the **objective**, **success criteria**, **safety constraints**, and
+  optional file/object references in natural language. The primary editor must not
+  require users to author shell code or machine predicates.
+- `kitGenerate` runs an independent, non-resuming AI compiler turn on the Session
+  backend. It may inspect explicitly referenced workspace files read-only, returns a
+  preview, and never saves or executes the Kit automatically. The original NL
+  contract, AI implementation summary, provenance, and warnings persist on the Kit.
+- The AI compiles that contract into a deterministic shell command, typed inputs,
+  machine assertions, outputs, schedule, and view. Shell/command/assertion editing is
+  retained only in the collapsible **Advanced implementation** escape hatch.
+- Normal clicks are **not AI-driven**: they execute the saved deterministic command
+  and derive green/red strictly from `evaluate_assertions`. AI can regenerate or
+  repair the implementation, but cannot self-declare execution success.
+- A Kit has `executionTarget = executor | client` (default `executor`) and may compile
+  to ordered `steps`. `command` steps can run on either side, `file_push` streams a
+  client-local file to the Session executor with bounded chunks + size/SHA-256 check +
+  atomic replace, and `kit_call` reuses another Kit in the same Session. Calls are
+  expanded into a frozen run plan, reject cycles/depth > 8, run strictly in order, and
+  skip everything after the first failed step. The backend owns the authoritative
+  `KitRun`/step verdict; a desktop client only claims and performs explicit client
+  actions. Scheduled runs that require a client fail closed when no client can act.
+- “remote Session” always means the already-connected Session executor, not an SSH
+  destination. Natural-language compilation must map local-file-to-Session requests to
+  the built-in `file_push` primitive and must never ask for host, port, username,
+  protocol or credentials. The creation editor can select a concrete client-local file;
+  otherwise the compiler emits a required typed `file` input so the desktop user chooses
+  the source at run time. An unspecified destination defaults to the same filename in the
+  Session workspace root. The executor verifies size and SHA-256 before atomic replace.
+- The Kits tab opens in a compact list-first mode: every Kit exposes Run/Stop and an
+  optional Details action directly on its card. Details restores the full editor,
+  assertions, logs, terminal, history, and data-dependency surface and can be collapsed
+  back to the list. `KitRun.startedAt/endedAt` and every `KitStepRun.startedAt/endedAt`
+  are rendered as live/final durations; the UI ticker runs only while an active Kit run
+  is visible.
+- Generation is fail-closed. Missing/ambiguous targets produce `needs_input`, cwd must
+  stay inside the Session workspace, and static checks reject global process-name
+  termination (`taskkill /IM`, broad `Stop-Process -Name`, `pkill`/`killall`) and root
+  recursive deletion. Generation never creates the generated cwd.
+
+**Kit-owned DSL versions and AI optimization.** Every Kit owns a unified version ledger
+(`versions` + `active_version_id`) for its deterministic execution DSL. Legacy Kits lazily
+migrate to `1.0`; initial creation, manual advanced edits, one-shot AI compilation, and
+multi-turn AI optimization finalization all append to the same ledger. Version snapshots
+cover execution target/steps, command runtime, typed inputs, assertions, outputs,
+dependencies, schedule and view, but not live enable/run state. Routine `kitUpdated`
+payloads expose metadata only; `kitVersionGet` fetches one full snapshot on demand.
+Activating any version or finalizing an AI candidate requires the Kit to be disabled and
+have no active run, so an interval schedule cannot change orchestration mid-flight.
+
+The compact card and details header expose **Optimize**, opening a BTW-like independent
+conversation with a selectable backend. `kitOptimizeAsk` sees the active DSL, Kit version
+metadata, recent optimization dialogue and explicit file references; it returns a
+normalized, safety-checked candidate but never changes the Kit. Only
+`kitOptimizeFinalize` (the user's “定版并启用” action) appends and activates that candidate.
+Optimization dialogue and candidate provenance persist with the Kit, while versions remain
+a Kit concept independent of which backend produced them. Details always shows the version
+ledger and allows viewing or safely reactivating any historical DSL.
+
+Kit RPCs include `kitGenerate`, `kitGetState`, `kitCreate`, `kitUpdate`, `kitDelete`,
+`kitRun`, `kitCancel`, `kitResume`, `kitClientStepStart`, `kitClientStepComplete`,
+`kitClientFileStart`, `kitClientFileChunk`, `kitClientFileFinish`,
+`kitSetControlMode`, `kitTerminalCommand`, `kitTerminalClose`, `kitVersionList`,
+`kitVersionGet`, `kitVersionActivate`, `kitOptimizeGet`, `kitOptimizeAsk`, and
+`kitOptimizeFinalize`.
 
 ### Normal-session side features (序列任务 + By the way)
 

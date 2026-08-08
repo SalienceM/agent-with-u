@@ -9,12 +9,32 @@
  */
 
 import type { GitDetectResult, GitStatusResult, GitDiffResult, GitCommitResult, GitLogResult, GitBranchesResult, GitPushPullResult, GitStashListResult } from './types/git';
-import type { WorkspaceKitState, WorkspaceKit, KitRun } from './types/workspaceKits';
+import type {
+  WorkspaceKitState, WorkspaceKit, KitRun, KitGenerationRequest, KitGenerationResult,
+  KitVersion, KitOptimizationMessage,
+} from './types/workspaceKits';
 
 type StreamDeltaCallback = (delta: any) => void;
 type SessionUpdateCallback = (data: any) => void;
 type PermissionRequestCallback = (data: any) => void;
 type AssetChangedCallback = (stats: any) => void;
+
+export interface FollowUpCapabilities {
+  status: string;
+  queue: boolean;
+  nativeSteer: boolean;
+  interruptResume: boolean;
+  steerAttachments: boolean;
+  message?: string;
+}
+
+export interface FollowUpResult {
+  status: string;
+  message?: string | Record<string, any>;
+  beforeMessageId?: string;
+  redirecting?: boolean;
+  task?: any;
+}
 
 /** 已连接到本执行节点的一个 UI 客户端的展示信息。 */
 export interface ConnectedClient {
@@ -858,6 +878,36 @@ async function callOn(execKey: string | undefined, method: string, ...params: an
   }
 }
 
+function parseRpcObject<T extends Record<string, any>>(result: any, fallback: T): T {
+  if (result === null || result === undefined || result === '') return fallback;
+  try {
+    const parsed = typeof result === 'string' ? JSON.parse(result) : result;
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed as T : fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+function attachSessionExecutor<T extends Record<string, any> | null>(session: T): T {
+  if (!session?.id) return session;
+  const storedKey = sessionExec.get(session.id);
+  let key = homeConn.key;
+  if (storedKey && pool.has(storedKey)) {
+    key = storedKey;
+  } else if (storedKey) {
+    sessionExec.delete(session.id);
+    persistSessionExec();
+  }
+  const connection = pool.get(key);
+  if (connection) {
+    session.execKey = connection.key;
+    session.execLabel = connection.label;
+    session.execMode = connection.target.mode;
+    session.execIsHome = connection.isHome;
+  }
+  return session;
+}
+
 // ── 对话框（Tauri plugin-dialog）────────────────────────────
 
 async function nativeOpenDirectory(initialPath?: string): Promise<string | null> {
@@ -909,6 +959,13 @@ async function nativeOpenFile(): Promise<string | null> {
   });
 }
 
+async function nativeOpenAnyFile(): Promise<string | null> {
+  if (!isTauri()) {
+    throw new Error('选择客户端本地文件需要 AgentWithU 桌面端');
+  }
+  return tauriOpenDialog({ directory: false, multiple: false });
+}
+
 // ═══════════════════════════════════════
 //  Exported API（接口与旧版完全相同）
 // ═══════════════════════════════════════
@@ -950,6 +1007,50 @@ export const api = {
 
   async abortMessage(sessionId: string): Promise<void> {
     await send('abortMessage', sessionId);
+  },
+
+  async getFollowUpCapabilities(sessionId: string): Promise<FollowUpCapabilities> {
+    const result = await call('getFollowUpCapabilities', sessionId);
+    try {
+      const parsed = JSON.parse(result);
+      if (parsed && typeof parsed === 'object') return parsed;
+      throw new Error('empty capability response');
+    } catch {
+      return {
+        status: 'error', queue: true, nativeSteer: false,
+        interruptResume: false, steerAttachments: false,
+      };
+    }
+  },
+
+  async steerMessage(
+    sessionId: string,
+    text: string,
+    images?: any[],
+    textAttachments?: any[],
+    clientMessageId = '',
+  ): Promise<FollowUpResult> {
+    const result = await call(
+      'steerMessage', sessionId, text,
+      images?.length ? JSON.stringify(images) : '',
+      textAttachments?.length ? JSON.stringify(textAttachments) : '',
+      clientMessageId,
+    );
+    try { return JSON.parse(result); } catch { return { status: 'error', message: '响应解析失败' }; }
+  },
+
+  async redirectMessage(
+    sessionId: string,
+    text: string,
+    images?: any[],
+    textAttachments?: any[],
+  ): Promise<FollowUpResult> {
+    const result = await call(
+      'redirectMessage', sessionId, text,
+      images?.length ? JSON.stringify(images) : '',
+      textAttachments?.length ? JSON.stringify(textAttachments) : '',
+    );
+    try { return JSON.parse(result); } catch { return { status: 'error', message: '响应解析失败' }; }
   },
 
   async getSessionRunState(sessionId: string): Promise<{
@@ -1051,23 +1152,14 @@ export const api = {
       : await call('loadSession', id);
     try {
       const s = JSON.parse(result);
-      // 注入归属执行节点信息(后端的 session 对象本身没有),供目录同步等按节点路由。
-      if (s && s.id) {
-        const storedKey = sessionExec.get(s.id);
-        let key = homeConn.key;
-        if (storedKey && pool.has(storedKey)) {
-          // 归属一旦由 listSessions/createSession 确认，就必须信任该执行节点。
-          // home 只是“新会话默认落点”，不能覆盖已有会话的 local/relay 归属。
-          key = storedKey;
-        } else if (storedKey) {
-          sessionExec.delete(s.id);
-          persistSessionExec();
-        }
-        const c = pool.get(key);
-        if (c) { s.execKey = c.key; s.execLabel = c.label; s.execMode = c.target.mode; s.execIsHome = c.isHome; }
-      }
-      return s;
+      return attachSessionExecutor(s);
     } catch { return null; }
+  },
+
+  /** 只拉 index 元数据，不读取消息正文或 LOOP stage；用于 pane 首屏路由。 */
+  async loadSessionMeta(id: string): Promise<any | null> {
+    const result = await call('loadSessionMeta', id);
+    try { return attachSessionExecutor(JSON.parse(result)); } catch { return null; }
   },
 
   /** 翻页加载 session 的更老消息。等价于 messages[offset : offset+limit]。 */
@@ -1100,9 +1192,26 @@ export const api = {
     return await call('deleteSession', id);
   },
 
+  async destroySession(id: string, confirmation: 'DESTROY'): Promise<{
+    status: string; directory?: string; directoryDeleted?: boolean; message?: string;
+  }> {
+    const result = await call('destroySession', id, confirmation);
+    if (result === null || result === undefined) return { status: 'error', message: '无法连接到执行端' };
+    try { return JSON.parse(result); } catch { return { status: 'error', message: '销毁响应格式错误' }; }
+  },
+
   async renameSession(sessionId: string, newTitle: string): Promise<{ status: string; message?: string }> {
     const result = await call('renameSession', sessionId, newTitle);
     if (result === null || result === undefined) return { status: 'error', message: '无法连接到后端' };
+    try { return JSON.parse(result); } catch { return { status: 'error', message: '响应格式错误' }; }
+  },
+
+  async updateSessionAppearance(
+    sessionId: string,
+    patch: { pinned?: boolean; sidebarColor?: string },
+  ): Promise<{ status: string; pinned?: boolean; sidebarColor?: string; message?: string }> {
+    const result = await call('updateSessionAppearance', sessionId, JSON.stringify(patch || {}));
+    if (result === null || result === undefined) return { status: 'error', message: '无法连接到执行端' };
     try { return JSON.parse(result); } catch { return { status: 'error', message: '响应格式错误' }; }
   },
 
@@ -1121,6 +1230,19 @@ export const api = {
     try { return JSON.parse(result); } catch { return []; }
   },
 
+  /** 获取 Session 所属执行端的 Backend，而不是客户端当前 home 节点的 Backend。 */
+  async getSessionBackends(sessionId: string, includeDisabled = false): Promise<any[]> {
+    await homeConn.ready;
+    const conn = routeConn('kitGetState', [sessionId]);
+    try {
+      const result = await conn.request('getBackends', includeDisabled ? [true] : []);
+      const parsed = JSON.parse(result);
+      return Array.isArray(parsed) ? parsed : [];
+    } catch {
+      return [];
+    }
+  },
+
   async saveBackend(config: any): Promise<void> {
     await send('saveBackend', JSON.stringify(config));
   },
@@ -1131,6 +1253,11 @@ export const api = {
 
   async selectDirectory(initialPath?: string): Promise<string | null> {
     return nativeOpenDirectory(initialPath);
+  },
+
+  /** 选择一个由当前桌面客户端读取、随后通过 file_push 发往 Session 执行端的文件。 */
+  async selectKitLocalFile(): Promise<string | null> {
+    return nativeOpenAnyFile();
   },
 
   async migrateSession(sourceSessionId: string, targetBackendId: string): Promise<any> {
@@ -1177,8 +1304,13 @@ export const api = {
 
   // ── 可视化 Loop 集成 ────────────────────────────────────────
   async loopGetState(sessionId: string): Promise<any | null> {
-    const result = await call('loopGetState', sessionId);
+    const result = await call('loopGetState', sessionId, true);
     try { return JSON.parse(result); } catch { return null; }
+  },
+
+  async loopGetRecord(sessionId: string, seq: number): Promise<{ status: string; record?: any; message?: string }> {
+    const result = await call('loopGetRecord', sessionId, seq);
+    try { return JSON.parse(result); } catch { return { status: 'error', message: 'Loop 详情解析失败' }; }
   },
 
   async loopSubmitIdea(sessionId: string, prompt: string, images?: any[]): Promise<{ status: string; ideaId?: string; message?: string }> {
@@ -1257,13 +1389,13 @@ export const api = {
     try { return JSON.parse(result); } catch { return { status: 'error' }; }
   },
 
-  async loopAdvanceToOut(sessionId: string): Promise<{ status: string; stage?: string; message?: string }> {
+  async loopAdvanceToOut(sessionId: string): Promise<{ status: string; stage?: string; stopping?: boolean; message?: string }> {
     const result = await call('loopAdvanceToOut', sessionId);
     try { return JSON.parse(result); } catch { return { status: 'error', message: '响应解析失败' }; }
   },
 
   /** loopout 之后开启新一轮（同一工作目录/上下文，轮次 +1）。 */
-  async loopContinue(sessionId: string, goal: string = ''): Promise<{ status: string; stage?: string; round?: number; message?: string }> {
+  async loopContinue(sessionId: string, goal: string = ''): Promise<{ status: string; stage?: string; round?: number; stopping?: boolean; message?: string }> {
     const result = await call('loopContinue', sessionId, goal);
     try { return JSON.parse(result); } catch { return { status: 'error', message: '响应解析失败' }; }
   },
@@ -1273,6 +1405,11 @@ export const api = {
     const imagesJson = images && images.length ? JSON.stringify(images) : '';
     const result = await call('loopAsk', sessionId, question, imagesJson);
     try { return JSON.parse(result); } catch { return { status: 'error', message: '响应解析失败' }; }
+  },
+
+  async loopAsideClear(sessionId: string): Promise<{ status: string; cleared?: number; message?: string }> {
+    const result = await call('loopAsideClear', sessionId);
+    try { return JSON.parse(result); } catch { return { status: 'error', message: '清空响应解析失败' }; }
   },
 
   /** 执行中补充要求（addon，可带图片）：不影响当前 loop，下一次 loop 的 analysis/prepare 纳入。 */
@@ -1352,6 +1489,13 @@ export const api = {
     const result = await call('seqtaskRemove', sessionId, taskId);
     try { return JSON.parse(result); } catch { return { status: 'error' }; }
   },
+  async steerSeqTask(
+    sessionId: string,
+    taskId: string,
+  ): Promise<{ status: string; message?: string }> {
+    const result = await call('steerSeqTask', sessionId, taskId);
+    try { return JSON.parse(result); } catch { return { status: 'error', message: '响应解析失败' }; }
+  },
   async seqtaskReorder(sessionId: string, ids: string[]): Promise<{ status: string }> {
     const result = await call('seqtaskReorder', sessionId, JSON.stringify(ids));
     try { return JSON.parse(result); } catch { return { status: 'error' }; }
@@ -1392,9 +1536,68 @@ export const api = {
     const result = await call('kitCreate', sessionId, JSON.stringify(spec || {}));
     try { return JSON.parse(result); } catch { return { status: 'error', message: 'Kit 创建响应解析失败' }; }
   },
+  async kitGenerate(sessionId: string, request: KitGenerationRequest): Promise<KitGenerationResult> {
+    const result = await call('kitGenerate', sessionId, JSON.stringify(request || {}));
+    try {
+      const parsed = JSON.parse(result);
+      if (!parsed || typeof parsed !== 'object') {
+        return { status: 'error', ready: false, message: '执行端版本过旧或连接失败：未返回 Kit 编译结果' };
+      }
+      return parsed;
+    } catch { return { status: 'error', ready: false, message: 'AI Kit 编译响应解析失败' }; }
+  },
   async kitUpdate(sessionId: string, kitId: string, patch: Partial<WorkspaceKit>): Promise<{ status: string; kit?: WorkspaceKit; message?: string }> {
     const result = await call('kitUpdate', sessionId, kitId, JSON.stringify(patch || {}));
     try { return JSON.parse(result); } catch { return { status: 'error', message: 'Kit 更新响应解析失败' }; }
+  },
+  async kitVersionList(sessionId: string, kitId: string): Promise<{
+    status: string; activeVersionId?: string; versions?: KitVersion[]; message?: string;
+  }> {
+    const result = await call('kitVersionList', sessionId, kitId);
+    return parseRpcObject(result, {
+      status: 'error', message: '执行端未响应 Kit 版本接口，请更新并重启该 Session 所属执行端',
+    });
+  },
+  async kitVersionGet(sessionId: string, kitId: string, versionId: string): Promise<{
+    status: string; version?: KitVersion; message?: string;
+  }> {
+    const result = await call('kitVersionGet', sessionId, kitId, versionId);
+    return parseRpcObject(result, {
+      status: 'error', message: '执行端未响应 Kit 版本接口，请更新并重启该 Session 所属执行端',
+    });
+  },
+  async kitVersionActivate(sessionId: string, kitId: string, versionId: string): Promise<{
+    status: string; kit?: WorkspaceKit; activeVersionId?: string; message?: string;
+  }> {
+    const result = await call('kitVersionActivate', sessionId, kitId, versionId);
+    return parseRpcObject(result, {
+      status: 'error', message: '执行端未响应 Kit 版本接口，请更新并重启该 Session 所属执行端',
+    });
+  },
+  async kitOptimizeGet(sessionId: string, kitId: string): Promise<{
+    status: string; backendId?: string; activeVersionId?: string; versions?: KitVersion[];
+    messages?: KitOptimizationMessage[]; message?: string;
+  }> {
+    const result = await call('kitOptimizeGet', sessionId, kitId);
+    return parseRpcObject(result, {
+      status: 'error', message: '执行端未响应 Kit 优化接口，请更新并重启该 Session 所属执行端',
+    });
+  },
+  async kitOptimizeAsk(sessionId: string, kitId: string, prompt: string, backendId = ''): Promise<{
+    status: string; message?: KitOptimizationMessage | string; messages?: KitOptimizationMessage[];
+  }> {
+    const result = await call('kitOptimizeAsk', sessionId, kitId, prompt, backendId);
+    return parseRpcObject(result, {
+      status: 'error', message: '执行端未响应 Kit 优化接口，请更新并重启该 Session 所属执行端',
+    });
+  },
+  async kitOptimizeFinalize(sessionId: string, kitId: string, messageId: string, note = ''): Promise<{
+    status: string; version?: KitVersion; kit?: WorkspaceKit; message?: string;
+  }> {
+    const result = await call('kitOptimizeFinalize', sessionId, kitId, messageId, note);
+    return parseRpcObject(result, {
+      status: 'error', message: '执行端未响应 Kit 优化接口，请更新并重启该 Session 所属执行端',
+    });
   },
   async kitDelete(sessionId: string, kitId: string): Promise<{ status: string; message?: string }> {
     const result = await call('kitDelete', sessionId, kitId);
@@ -1407,6 +1610,65 @@ export const api = {
   async kitCancel(sessionId: string, runId: string): Promise<{ status: string; statusNow?: string; message?: string }> {
     const result = await call('kitCancel', sessionId, runId);
     try { return JSON.parse(result); } catch { return { status: 'error', message: 'Kit 停止响应解析失败' }; }
+  },
+  async kitResume(sessionId: string, runId: string): Promise<{ status: string; run?: KitRun; message?: string }> {
+    const result = await call('kitResume', sessionId, runId);
+    try { return JSON.parse(result); } catch { return { status: 'error', message: 'Kit 恢复响应解析失败' }; }
+  },
+  async kitClientStepComplete(
+    sessionId: string, runId: string, stepId: string,
+    resultData: { exitCode?: number; stdout?: string; stderr?: string; error?: string },
+  ): Promise<{ status: string; message?: string }> {
+    const result = await call('kitClientStepComplete', sessionId, runId, stepId, JSON.stringify(resultData || {}));
+    try { return JSON.parse(result); } catch { return { status: 'error', message: '客户端步骤回执解析失败' }; }
+  },
+  async kitClientStepStart(
+    sessionId: string, runId: string, stepId: string,
+  ): Promise<{ status: string; step?: any; message?: string }> {
+    const result = await call('kitClientStepStart', sessionId, runId, stepId);
+    try { return JSON.parse(result); } catch { return { status: 'error', message: '客户端步骤领取响应解析失败' }; }
+  },
+  async kitClientFileStart(
+    sessionId: string, runId: string, stepId: string, transferId: string,
+    expectedSize: number, expectedSha256: string,
+  ): Promise<{ status: string; message?: string }> {
+    const result = await call(
+      'kitClientFileStart', sessionId, runId, stepId, transferId, expectedSize, expectedSha256,
+    );
+    try { return JSON.parse(result); } catch { return { status: 'error', message: '文件推送启动响应解析失败' }; }
+  },
+  async kitClientFileChunk(
+    sessionId: string, runId: string, stepId: string, transferId: string,
+    offset: number, dataBase64: string,
+  ): Promise<{ status: string; written?: number; message?: string }> {
+    const result = await call(
+      'kitClientFileChunk', sessionId, runId, stepId, transferId, offset, dataBase64,
+    );
+    try { return JSON.parse(result); } catch { return { status: 'error', message: '文件推送分块响应解析失败' }; }
+  },
+  async kitClientFileFinish(
+    sessionId: string, runId: string, stepId: string, transferId: string,
+  ): Promise<{ status: string; message?: string }> {
+    const result = await call('kitClientFileFinish', sessionId, runId, stepId, transferId);
+    try { return JSON.parse(result); } catch { return { status: 'error', message: '文件推送完成响应解析失败' }; }
+  },
+  async kitClientLocalFileInfo(path: string): Promise<{ size: number; sha256: string }> {
+    if (!isTauri()) throw new Error('浏览器客户端不能直接读取本地路径；请使用 AgentWithU 桌面端');
+    const { invoke } = await import('@tauri-apps/api/core');
+    return invoke<{ size: number; sha256: string }>('kit_client_file_info', { path });
+  },
+  async kitClientLocalFileChunk(path: string, offset: number, size: number): Promise<string> {
+    if (!isTauri()) throw new Error('浏览器客户端不能直接读取本地路径；请使用 AgentWithU 桌面端');
+    const { invoke } = await import('@tauri-apps/api/core');
+    return invoke<string>('kit_client_read_chunk', { path, offset, size });
+  },
+  async kitClientLocalCommand(spec: {
+    shell: 'powershell' | 'cmd' | 'bash'; command: string; cwd: string;
+    timeoutSeconds: number; env?: Record<string, string>;
+  }): Promise<{ exitCode: number; stdout: string; stderr: string }> {
+    if (!isTauri()) throw new Error('浏览器客户端不支持本地 Shell 步骤；请使用 AgentWithU 桌面端');
+    const { invoke } = await import('@tauri-apps/api/core');
+    return invoke('kit_client_command', { spec });
   },
   async kitSetControlMode(sessionId: string, kitId: string, mode: 'ai' | 'human' | 'shared'): Promise<{ status: string; controlMode?: string; message?: string }> {
     const result = await call('kitSetControlMode', sessionId, kitId, mode);
@@ -1434,6 +1696,10 @@ export const api = {
   async chatAsideList(sessionId: string): Promise<{ status: string; asides: any[]; asideBackendId?: string }> {
     const result = await call('chatAsideList', sessionId);
     try { return JSON.parse(result); } catch { return { status: 'error', asides: [] }; }
+  },
+  async chatAsideClear(sessionId: string): Promise<{ status: string; cleared?: number; message?: string }> {
+    const result = await call('chatAsideClear', sessionId);
+    try { return JSON.parse(result); } catch { return { status: 'error', message: '清空响应解析失败' }; }
   },
   async chatAsideSetBackend(sessionId: string, backendId: string): Promise<{ status: string; asideBackendId?: string }> {
     const result = await call('chatAsideSetBackend', sessionId, backendId || '');
@@ -1532,11 +1798,16 @@ export const api = {
     try { return JSON.parse(result); } catch { return { status: 'error', message: '响应解析失败' }; }
   },
 
-  async listDirectory(path: string, workingDir?: string, execKey?: string): Promise<{ name: string; path: string; isDir: boolean }[]> {
+  async listDirectory(
+    path: string,
+    workingDir?: string,
+    execKey?: string,
+    includeHidden = false,
+  ): Promise<{ name: string; path: string; isDir: boolean }[]> {
     // execKey 指定时发到该会话的执行节点(远端目录懒加载逐层浏览);缺省回落 home。
     const result = execKey
-      ? await callOn(execKey, 'listDirectory', path, workingDir || '')
-      : await call('listDirectory', path, workingDir || '');
+      ? await callOn(execKey, 'listDirectory', path, workingDir || '', includeHidden)
+      : await call('listDirectory', path, workingDir || '', includeHidden);
     try {
       const data = JSON.parse(result);
       if (Array.isArray(data)) return data;
@@ -2262,7 +2533,7 @@ export function loadAssetDataUrl(id: string, thumb = true): Promise<string> {
 const mockBackends: any[] = [
   { id: 'claude-agent-sdk-default', type: 'claude-agent-sdk', label: 'Claude Code (Agent SDK)', model: 'sonnet', env: {} },
 ];
-let mockAppConfig: any = { fontSize: 14, renderMarkdown: true, exportFormat: 'markdown', theme: 'dark' };
+let mockAppConfig: any = { fontSize: 14, renderMarkdown: true, exportFormat: 'markdown', theme: 'dark', sidebarSessionLimit: 25 };
 
 function mockDispatch(method: string, params: any[]): any {
   switch (method) {
@@ -2296,6 +2567,12 @@ function mockDispatch(method: string, params: any[]): any {
     }
     case 'abortMessage': return null;
     case 'getSessionRunState': return JSON.stringify({ status: 'ok', busy: false, activeCount: 0 });
+    case 'getFollowUpCapabilities': return JSON.stringify({
+      status: 'ok', queue: true, nativeSteer: false,
+      interruptResume: false, steerAttachments: false,
+    });
+    case 'steerMessage': case 'redirectMessage':
+      return JSON.stringify({ status: 'unsupported', message: 'mock mode' });
     case 'executeCommand': {
       const p = JSON.parse(params[0]);
       if (p.command === 'compact') return JSON.stringify({ status: 'ok', removed: 5, remaining: 6 });
@@ -2315,6 +2592,7 @@ function mockDispatch(method: string, params: any[]): any {
       });
     }
     case 'loopGetState': return 'null';
+    case 'loopGetRecord': return JSON.stringify({ status: 'error', message: 'mock mode' });
     case 'loopSubmitIdea': return JSON.stringify({ status: 'error', message: 'mock mode' });
     case 'loopRemoveIdea': return JSON.stringify({ status: 'ok' });
     case 'loopSealIdea': return JSON.stringify({ status: 'error', message: 'mock mode' });
@@ -2334,6 +2612,7 @@ function mockDispatch(method: string, params: any[]): any {
     case 'loopAdvanceToOut': return JSON.stringify({ status: 'error', message: 'mock mode' });
     case 'loopContinue': return JSON.stringify({ status: 'error', message: 'mock mode' });
     case 'loopAsk': return JSON.stringify({ status: 'error', message: 'mock mode' });
+    case 'loopAsideClear': return JSON.stringify({ status: 'ok', cleared: 0 });
     case 'loopAddAddon': return JSON.stringify({ status: 'error', message: 'mock mode' });
     case 'loopRemoveAddon': return JSON.stringify({ status: 'ok' });
     case 'loopEditAddon': return JSON.stringify({ status: 'ok' });
@@ -2341,23 +2620,33 @@ function mockDispatch(method: string, params: any[]): any {
     case 'seqtaskAdd': case 'seqtaskEdit': case 'seqtaskReorder':
     case 'seqtaskClear': return JSON.stringify({ status: 'ok', seqTasks: [], seqAuto: false });
     case 'seqtaskRemove': case 'seqtaskSetAuto': return JSON.stringify({ status: 'ok' });
+    case 'steerSeqTask': return JSON.stringify({ status: 'error', message: 'mock mode 不支持当前轮引导' });
     case 'seqtaskTakeNext': return JSON.stringify({ status: 'ok', task: null });
     case 'kitGetState': return JSON.stringify({
       status: 'ok', sessionId: params[0], kits: [], runs: [], artifacts: [], dataMarket: [],
     });
+    case 'kitGenerate':
+      return JSON.stringify({ status: 'error', message: 'mock mode 不支持 AI Kit 编译' });
     case 'kitCreate': case 'kitUpdate': case 'kitDelete':
-    case 'kitRun': case 'kitCancel': case 'kitSetControlMode': case 'kitTerminalCommand':
+    case 'kitVersionList': case 'kitVersionGet': case 'kitVersionActivate':
+    case 'kitOptimizeGet': case 'kitOptimizeAsk': case 'kitOptimizeFinalize':
+    case 'kitRun': case 'kitCancel': case 'kitResume': case 'kitClientStepStart': case 'kitClientStepComplete':
+    case 'kitClientFileStart': case 'kitClientFileChunk': case 'kitClientFileFinish':
+    case 'kitSetControlMode': case 'kitTerminalCommand':
     case 'kitTerminalClose':
       return JSON.stringify({ status: 'error', message: 'mock mode' });
     case 'chatAsk': return JSON.stringify({ status: 'error', message: 'mock mode' });
     case 'chatAsideList': return JSON.stringify({ status: 'ok', asides: [], asideBackendId: '' });
+    case 'chatAsideClear': return JSON.stringify({ status: 'ok', cleared: 0 });
     case 'chatAsideSetBackend': return JSON.stringify({ status: 'ok', asideBackendId: params[1] || '' });
     case 'listSessions': return '[]';
     case 'listConnectedClients': return '[]';
     case 'loadSession': return 'null';
+    case 'loadSessionMeta': return 'null';
     case 'loadSessionMessages': return 'null';
     case 'syncAttachedCodexSession': return JSON.stringify({ status: 'ok', changed: false });
     case 'deleteSession': return true;
+    case 'destroySession': return JSON.stringify({ status: 'error', message: 'mock mode 不执行目录销毁' });
     case 'getBackends': return JSON.stringify(mockBackends);
     case 'saveBackend': {
       const cfg = JSON.parse(params[0]);
@@ -2371,6 +2660,7 @@ function mockDispatch(method: string, params: any[]): any {
       return null;
     }
     case 'renameSession': return JSON.stringify({ status: 'ok' });
+    case 'updateSessionAppearance': return JSON.stringify({ status: 'ok', ...JSON.parse(params[1] || '{}') });
     case 'listPrompts': return JSON.stringify([]);
     case 'savePrompt': return JSON.stringify({ status: 'ok' });
     case 'deletePrompt': return JSON.stringify({ status: 'ok' });

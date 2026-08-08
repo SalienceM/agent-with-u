@@ -297,6 +297,31 @@ class ModelBackend(ABC):
         else:
             self._cancelled_sessions.add("__ALL__")
 
+    def follow_up_capabilities(self) -> dict:
+        """Describe how this backend can accept input while a turn is running.
+
+        Queueing is implemented by the Bridge and is therefore available for
+        every backend.  Backends opt in to stronger semantics explicitly so the
+        UI never presents an interrupt/restart as native same-turn steering.
+        """
+        return {
+            "queue": True,
+            "nativeSteer": False,
+            "interruptResume": False,
+            "steerAttachments": False,
+        }
+
+    async def steer_message(
+        self,
+        *,
+        session_id: str,
+        content: str,
+        images: Optional[list[ImageAttachment]] = None,
+        client_message_id: str = "",
+    ) -> dict:
+        """Append input to an active turn when the backend supports it."""
+        return {"status": "unsupported", "message": "当前后端不支持引导正在运行的回答"}
+
     def is_cancelled(self, session_id: str) -> bool:
         return session_id in self._cancelled_sessions or "__ALL__" in self._cancelled_sessions
 
@@ -320,4 +345,3 @@ class ModelBackend(ABC):
     def get_model(self) -> str:
         """Get model name from config or environment."""
         return self.get_env("ANTHROPIC_MODEL") or self.config.model or "default"
-

@@ -41,6 +41,8 @@ interface LoopRecord {
     thinkingBlocks?: Array<{ content: string }>;
   }>;
   manualContext?: string;
+  detailLoaded?: boolean;
+  manualMessageCount?: number;
 }
 interface IdeaEntry { id: string; prompt: string; status: string; result: string; error: string; images?: AddonImage[]; }
 interface GoalRevision { goal: string; hint: string; source: string; createdAt: number; }
@@ -65,6 +67,40 @@ interface LoopStateT {
   canTakeover?: boolean;
 }
 
+/**
+ * 完整详情只提供大字段，compact 摘要持续提供权威实时状态。合并时不能让
+ * 旧详情快照覆盖新的 subStage / step.status，否则运行节点会停止动画。
+ */
+function mergeLoopRecordDetail(summary: LoopRecord, detail?: LoopRecord): LoopRecord {
+  if (!detail) return summary;
+  const detailSteps = new Map((detail.orchestration || []).map((step) => [step.index, step]));
+  const orchestration = (summary.orchestration || []).map((step) => {
+    const full = detailSteps.get(step.index);
+    return full ? {
+      ...full,
+      ...step,
+      output: full.output || step.output,
+    } : step;
+  });
+  const analysis = summary.analysis && detail.analysis ? {
+    ...detail.analysis,
+    ...summary.analysis,
+    notes: detail.analysis.notes || summary.analysis.notes,
+    trend: detail.analysis.trend || summary.analysis.trend,
+    challenges: detail.analysis.challenges || summary.analysis.challenges,
+  } : (summary.analysis || detail.analysis);
+  return {
+    ...detail,
+    ...summary,
+    result: detail.result || summary.result,
+    manualMessages: detail.manualMessages || summary.manualMessages,
+    manualContext: detail.manualContext || summary.manualContext,
+    analysis,
+    orchestration,
+    detailLoaded: true,
+  };
+}
+
 const SUB_LABEL: Record<string, string> = {
   prepare: 'Prepare', execute: 'Execute', analysis: 'Analysis', done: 'Done',
 };
@@ -74,16 +110,18 @@ export interface LoopPanelProps {
   sessionId: string;
   onClose?: () => void;
   embedded?: boolean;   // true = 作为会话内容内嵌渲染（无浮层、无关闭按钮）
+  inspectOnly?: boolean; // true = 人工接管期间的只读总览（保留面板/流程，不暴露状态变更操作）
   sessionBackendId?: string;
   sessionRuntime?: ModelRuntime;
   backends?: any[];
 }
 
 export const LoopPanel: React.FC<LoopPanelProps> = ({
-  sessionId, onClose, embedded, sessionBackendId, sessionRuntime, backends,
+  sessionId, onClose, embedded, inspectOnly = false, sessionBackendId, sessionRuntime, backends,
 }) => {
   const [state, setState] = useState<LoopStateT | null>(null);
   const [selectedSeq, setSelectedSeq] = useState<number | null>(null);
+  const [recordDetails, setRecordDetails] = useState<Record<number, LoopRecord>>({});
   const [viewMode, setViewMode] = useState<'panel' | 'flow'>('panel');  // 可切换的执行流程视图
   const [ideaInput, setIdeaInput] = useState('');
   const [goalDraft, setGoalDraft] = useState('');
@@ -106,12 +144,36 @@ export const LoopPanel: React.FC<LoopPanelProps> = ({
     if (s) setState(s);
   }, [sessionId]);
 
+  const selectLoop = useCallback((seq: number | null) => {
+    setSelectedSeq(seq);
+    if (seq == null || recordDetails[seq]?.detailLoaded) return;
+    void api.loopGetRecord(sessionId, seq).then((result) => {
+      if (result.status === 'ok' && result.record) {
+        setRecordDetails((previous) => ({ ...previous, [seq]: result.record as LoopRecord }));
+      }
+    });
+  }, [sessionId, recordDetails]);
+
   useEffect(() => { refresh(); }, [refresh]);
+
+  useEffect(() => {
+    setSelectedSeq(null);
+    setRecordDetails({});
+  }, [sessionId]);
 
   // 订阅整份状态更新 + 子阶段流式文本（仅本 session）
   useEffect(() => {
     const un1 = api.onLoopUpdated((s: LoopStateT) => {
-      if (s.sessionId === sessionId) setState(s);
+      if (s.sessionId !== sessionId) return;
+      setState(s);
+      setAsideLive((previous) => {
+        const answeringIds = new Set(
+          (s.asides || []).filter((aside) => aside.status === 'answering').map((aside) => aside.id),
+        );
+        const next = { ...previous };
+        for (const id of Object.keys(next)) if (!answeringIds.has(id)) delete next[id];
+        return next;
+      });
     });
     const un2 = api.onLoopProgress((d) => {
       if (d.sessionId !== sessionId) return;
@@ -154,6 +216,19 @@ export const LoopPanel: React.FC<LoopPanelProps> = ({
     if (r.status !== 'ok' && r.message) alert(r.message);
   }, [asideInput, asideAnswering, sessionId]);
 
+  const clearAsideHistory = useCallback(async () => {
+    const count = state?.asides?.length || 0;
+    if (!count || asideAnswering) return;
+    if (!window.confirm(`确认清空这 ${count} 条 BTW 旁路问答历史？\nLOOP 主线和结果不会受影响。`)) return;
+    const result = await api.loopAsideClear(sessionId);
+    if (result.status !== 'ok') {
+      alert(result.message || 'BTW 历史清空失败');
+      return;
+    }
+    setAsideLive({});
+    setState((previous) => previous ? { ...previous, asides: [] } : previous);
+  }, [state?.asides?.length, asideAnswering, sessionId]);
+
   const running = state?.running ?? false;
   const setAuto = useCallback((on: boolean) => api.loopSetAuto(sessionId, on), [sessionId]);
   const addAddon = useCallback((text: string, images?: ImageAttachment[]) => api.loopAddAddon(sessionId, text, images), [sessionId]);
@@ -161,8 +236,12 @@ export const LoopPanel: React.FC<LoopPanelProps> = ({
   const removeAddon = useCallback((id: string) => api.loopRemoveAddon(sessionId, id), [sessionId]);
   const continueRound = useCallback(async (goal: string) => {
     setBusy(true);
-    await api.loopContinue(sessionId, goal);
-    setBusy(false);
+    try {
+      const r = await api.loopContinue(sessionId, goal);
+      if (r.status !== 'ok' && r.message) alert(r.message);
+    } finally {
+      setBusy(false);
+    }
   }, [sessionId]);
 
   const submitIdea = useCallback(async (images?: ImageAttachment[]) => {
@@ -221,11 +300,18 @@ export const LoopPanel: React.FC<LoopPanelProps> = ({
   }, [sessionId, state]);
 
   const advanceOut = useCallback(async () => {
-    if (!window.confirm('进入 loopout 全局产出阶段（单向）。继续？')) return;
+    const prompt = running
+      ? '当前 Loop 仍在执行。停止它、保留已完成步骤的结果并进入 loopout？'
+      : '进入 loopout 全局产出阶段（单向）。继续？';
+    if (!window.confirm(prompt)) return;
     setBusy(true);
-    await api.loopAdvanceToOut(sessionId);
-    setBusy(false);
-  }, [sessionId]);
+    try {
+      const r = await api.loopAdvanceToOut(sessionId);
+      if (r.status !== 'ok' && r.message) alert(r.message);
+    } finally {
+      setBusy(false);
+    }
+  }, [sessionId, running]);
 
   const saveGoal = useCallback(async () => {
     await api.loopSetGoal(sessionId, goalDraft.trim());
@@ -240,11 +326,17 @@ export const LoopPanel: React.FC<LoopPanelProps> = ({
     ? <div className="awu-loop" style={embeddedShell}>{children}</div>
     : <div style={overlay}><div className="awu-loop" style={shell}>{children}</div></div>;
 
-  if (!state) {
+  const stateForView = state ? {
+    ...state,
+    loops: state.loops.map((record) => mergeLoopRecordDetail(record, recordDetails[record.seq])),
+  } : null;
+
+  if (!stateForView) {
     return wrap(
       <>
         <Header stage="…"
-          asideOpen={false} setAsideOpen={() => {}} asideCount={0} onClose={onClose} embedded={embedded} />
+          asideOpen={false} setAsideOpen={() => {}} asideCount={0} onClose={onClose}
+          embedded={embedded} inspectOnly={inspectOnly} />
         <div style={{ padding: 40, textAlign: 'center', color: 'var(--theme-text-muted)' }}>
           正在加载 Loop 状态…
         </div>
@@ -254,22 +346,30 @@ export const LoopPanel: React.FC<LoopPanelProps> = ({
 
   return wrap(
     <>
-      <Header stage={state.stage}
-        asideOpen={asideOpen} setAsideOpen={setAsideOpen} asideCount={state.asides?.length || 0}
-        onClose={onClose} embedded={embedded}
-        viewMode={viewMode} setViewMode={setViewMode} canFlow={state.stage !== 'loopidea'} />
-      <StageRail stage={state.stage} />
+      <Header stage={stateForView.stage}
+        asideOpen={asideOpen} setAsideOpen={setAsideOpen} asideCount={stateForView.asides?.length || 0}
+        onClose={onClose} embedded={embedded} inspectOnly={inspectOnly}
+        viewMode={viewMode} setViewMode={setViewMode} canFlow={stateForView.stage !== 'loopidea'} />
+      <StageRail stage={stateForView.stage} />
+      {inspectOnly && (
+        <div style={{
+          flexShrink: 0, padding: '7px 18px', fontSize: 12,
+          color: '#d29922', background: '#d2992214', borderBottom: '1px solid #d2992244',
+        }}>
+          ✋ 人工接管中 · 当前为只读 LOOP 总览，可切换面板 / 流程；返回聊天后继续人工操作。
+        </div>
+      )}
 
         <div style={{ flex: 1, display: 'flex', minHeight: 0, position: 'relative' }}>
           <div style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
             <div style={{ flex: 1, overflow: 'auto', padding: '12px 18px 24px' }}>
-              <IntentBanner state={state} sessionId={sessionId} />
-              {state.stage === 'loopidea' ? (
+              {!inspectOnly && <IntentBanner state={stateForView} sessionId={sessionId} />}
+              {stateForView.stage === 'loopidea' ? (
                 <>
-                  <PolicyCard sessionId={sessionId} policy={state.policy}
+                  <PolicyCard sessionId={sessionId} policy={stateForView.policy} readOnly={inspectOnly}
                     sessionBackendId={sessionBackendId} sessionRuntime={sessionRuntime} backends={backends} />
                   <IdeaStage
-                    state={state} ideaInput={ideaInput} setIdeaInput={setIdeaInput}
+                    state={stateForView} ideaInput={ideaInput} setIdeaInput={setIdeaInput}
                     goalDraft={goalDraft} setGoalDraft={setGoalDraft}
                     onSubmit={submitIdea} onSeal={sealIdea} busy={busy}
                     onRemove={(id) => api.loopRemoveIdea(sessionId, id)}
@@ -278,34 +378,34 @@ export const LoopPanel: React.FC<LoopPanelProps> = ({
               ) : viewMode === 'flow' ? (
                 /* ★ 流程视图：把执行过程画成可追踪的流程图（当前位置 / 每步耗时 / doing 动线） */
                 <>
-                  <MetricBar state={state} />
-                  {state.stage === 'loopexecute' && (
+                  <MetricBar state={stateForView} />
+                  {stateForView.stage === 'loopexecute' && !inspectOnly && (
                     <div style={{ display: 'flex', justifyContent: 'flex-end', marginBottom: 10 }}>
-                      <button onClick={takeover} disabled={busy || !state.canTakeover}
-                        style={{ ...btn, borderColor: '#d2992255', color: '#d29922', opacity: state.canTakeover ? 1 : 0.5 }}>
+                      <button onClick={takeover} disabled={busy || !stateForView.canTakeover}
+                        style={{ ...btn, borderColor: '#d2992255', color: '#d29922', opacity: stateForView.canTakeover ? 1 : 0.5 }}>
                         ✋ 人工接管
                       </button>
                     </div>
                   )}
-                  <LoopFlowView state={state} selectedSeq={selectedSeq} setSelectedSeq={setSelectedSeq} />
-                  {selectedSeq != null && state.loops.find((l) => l.seq === selectedSeq) && (
-                    <LoopDetail loop={state.loops.find((l) => l.seq === selectedSeq)!} progress={progress} onClose={() => setSelectedSeq(null)} />
+                  <LoopFlowView state={stateForView} selectedSeq={selectedSeq} setSelectedSeq={selectLoop} />
+                  {selectedSeq != null && stateForView.loops.find((l) => l.seq === selectedSeq) && (
+                    <LoopDetail loop={stateForView.loops.find((l) => l.seq === selectedSeq)!} progress={progress} onClose={() => selectLoop(null)} />
                   )}
                 </>
               ) : (
                 <>
-                  <MetricBar state={state} />
-                  <PolicyCard sessionId={sessionId} policy={state.policy}
+                  <MetricBar state={stateForView} />
+                  <PolicyCard sessionId={sessionId} policy={stateForView.policy} readOnly={inspectOnly}
                     sessionBackendId={sessionBackendId} sessionRuntime={sessionRuntime} backends={backends} />
                   <ExecuteStage
-                    state={state} progress={progress}
-                    selectedSeq={selectedSeq} setSelectedSeq={setSelectedSeq}
+                    state={stateForView} progress={progress}
+                    selectedSeq={selectedSeq} setSelectedSeq={selectLoop}
                     onRun={runIteration} onAdvanceOut={advanceOut} onSetAuto={setAuto}
                     onAddAddon={addAddon} onRemoveAddon={removeAddon} onEditAddon={editAddon} onContinue={continueRound}
                     onDiscard={discardLoop} onTakeover={takeover}
                     running={running} busy={busy}
                     goalDraft={goalDraft} setGoalDraft={setGoalDraft} onSaveGoal={saveGoal}
-                    onRefineGoal={refineGoal}
+                    onRefineGoal={refineGoal} inspectOnly={inspectOnly}
                   />
                 </>
               )}
@@ -314,9 +414,10 @@ export const LoopPanel: React.FC<LoopPanelProps> = ({
 
           {asideOpen && (
             <AsideDrawer
-              asides={state.asides || []} live={asideLive}
+              asides={stateForView.asides || []} live={asideLive}
               input={asideInput} setInput={setAsideInput}
               onSend={submitAside} answering={asideAnswering}
+              onClear={clearAsideHistory}
               onClose={() => setAsideOpen(false)}
             />
           )}
@@ -369,9 +470,9 @@ const IntentBanner: React.FC<{ state: LoopStateT; sessionId: string }> = ({ stat
 const Header: React.FC<{
   stage: string;
   asideOpen: boolean; setAsideOpen: (v: boolean) => void; asideCount: number;
-  onClose?: () => void; embedded?: boolean;
+  onClose?: () => void; embedded?: boolean; inspectOnly?: boolean;
   viewMode?: 'panel' | 'flow'; setViewMode?: (v: 'panel' | 'flow') => void; canFlow?: boolean;
-}> = ({ stage, asideOpen, setAsideOpen, asideCount, onClose, embedded, viewMode, setViewMode, canFlow }) => (
+}> = ({ stage, asideOpen, setAsideOpen, asideCount, onClose, embedded, inspectOnly, viewMode, setViewMode, canFlow }) => (
     <div style={{
       display: 'flex', alignItems: 'center', gap: 12, padding: '12px 18px',
       borderBottom: '1px solid var(--theme-border)',
@@ -379,6 +480,11 @@ const Header: React.FC<{
       <span style={{ fontSize: 18 }}>🔁</span>
       <span style={{ fontSize: 15, fontWeight: 700, color: 'var(--theme-text)' }}>可视化 Loop</span>
       <span style={{ fontSize: 12, color: 'var(--theme-accent)', fontFamily: 'monospace' }}>{stage}</span>
+      {inspectOnly && (
+        <span style={{ fontSize: 10.5, color: '#d29922', border: '1px solid #d2992255', borderRadius: 5, padding: '2px 6px' }}>
+          只读
+        </span>
+      )}
       {/* ★ 视图切换：面板（原功能）⇄ 流程（执行追踪），随时切 */}
       {canFlow && setViewMode && (
         <div style={{ display: 'flex', gap: 0, border: '1px solid var(--theme-border)', borderRadius: 7, overflow: 'hidden', marginLeft: 4 }}>
@@ -390,13 +496,15 @@ const Header: React.FC<{
       )}
       <div style={{ flex: 1 }} />
       {/* ★ session 级 By the way 激活按钮：旁路问答，不污染 loop 主线 */}
-      <button
-        onClick={() => setAsideOpen(!asideOpen)}
-        style={{ ...btn, ...(asideOpen ? btnActive : {}) }}
-        title="By the way — 基于当前 loop 状态旁路问答，不影响 loop 上下文"
-      >
-        💬 By the way{asideCount > 0 ? ` (${asideCount})` : ''}
-      </button>
+      {!inspectOnly && (
+        <button
+          onClick={() => setAsideOpen(!asideOpen)}
+          style={{ ...btn, ...(asideOpen ? btnActive : {}) }}
+          title="By the way — 基于当前 loop 状态旁路问答，不影响 loop 上下文"
+        >
+          💬 By the way{asideCount > 0 ? ` (${asideCount})` : ''}
+        </button>
+      )}
       {!embedded && onClose && <button onClick={onClose} style={btn}>✕ 关闭</button>}
     </div>
   );
@@ -405,8 +513,9 @@ const Header: React.FC<{
 const AsideDrawer: React.FC<{
   asides: AsideTurn[]; live: Record<string, string>;
   input: string; setInput: (v: string) => void;
-  onSend: (images?: ImageAttachment[]) => void; answering: boolean; onClose: () => void;
-}> = ({ asides, live, input, setInput, onSend, answering, onClose }) => {
+  onSend: (images?: ImageAttachment[]) => void; answering: boolean;
+  onClear: () => void; onClose: () => void;
+}> = ({ asides, live, input, setInput, onSend, answering, onClear, onClose }) => {
   const scrollRef = useRef<HTMLDivElement>(null);
   const endRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
@@ -452,6 +561,17 @@ const AsideDrawer: React.FC<{
       <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '10px 14px', borderBottom: '1px solid var(--theme-border)' }}>
         <span style={{ fontSize: 13, fontWeight: 700, color: 'var(--theme-text)' }}>💬 By the way</span>
         <div style={{ flex: 1 }} />
+        {asides.length > 0 && (
+          <button onClick={onClear} disabled={answering}
+            style={{
+              ...miniX, width: 'auto', padding: '3px 7px', color: '#f87171',
+              border: '1px solid #f8717155', borderRadius: 5, background: '#f8717112',
+              opacity: answering ? 0.45 : 1, cursor: answering ? 'not-allowed' : 'pointer',
+            }}
+            title={answering ? '回答完成后可清空' : '清空 BTW 历史'}>
+            清空
+          </button>
+        )}
         <button onClick={onClose} style={miniX}>✕</button>
       </div>
       <div style={{ padding: '8px 14px', fontSize: 11, color: 'var(--theme-text-muted)', borderBottom: '1px solid var(--theme-border)', lineHeight: 1.5 }}>
@@ -867,9 +987,10 @@ const AddonHistoryCard: React.FC<{ addons: Addon[]; loops: LoopRecord[] }> = ({ 
 // ══ loopout 引导：本轮产出 + 开启新一轮 ════════════════════════
 const LoopOutBanner: React.FC<{
   state: LoopStateT; onContinue: (goal: string) => void; busy: boolean;
+  onSetAuto: (on: boolean) => void;
   onRefineGoal: (hint: string, images?: ImageAttachment[]) => Promise<{ status: string; goal?: string; message?: string }>;
 }> =
-  ({ state, onContinue, busy, onRefineGoal }) => {
+  ({ state, onContinue, busy, onSetAuto, onRefineGoal }) => {
     const [goal, setGoal] = useState(state.goal || '');
     const [editing, setEditing] = useState(false);
     const [refineOpen, setRefineOpen] = useState(false);
@@ -914,13 +1035,32 @@ const LoopOutBanner: React.FC<{
             </div>
           </>
         )}
-        <button
-          onClick={() => onContinue(goal.trim())}
-          disabled={busy}
-          style={{ ...primaryBtn, background: '#8957e5' }}
-        >
-          ▶ 开启新一轮（第 {state.round + 1} 轮 loopexecute）
-        </button>
+        <div style={{ display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}>
+          {/* 在离开 loopout 前显式展示持久化的 Auto 状态，避免用户在不知情时直接触发连跑。 */}
+          <button
+            onClick={() => onSetAuto(!state.auto)}
+            disabled={busy}
+            style={{
+              ...btn,
+              ...(state.auto ? { background: '#2da44e1f', color: '#2da44e', borderColor: '#2da44e55' } : {}),
+              opacity: busy ? 0.6 : 1,
+            }}
+            title="先设定新一轮是否自动连跑；在 loopout 中切换此项不会启动任务"
+          >
+            {state.auto ? '🔄 Auto 开（新一轮将自动连跑）' : '⏸ Auto 关（新一轮手动逐次运行）'}
+          </button>
+          <button
+            onClick={() => onContinue(goal.trim())}
+            disabled={busy}
+            style={{ ...primaryBtn, background: '#8957e5', opacity: busy ? 0.6 : 1 }}
+            title={state.running ? '先强制结束仍未退出的上一轮，再自动切换到新一轮' : undefined}
+          >
+            {state.running ? '⏹ 停止上一轮并开启新一轮' : `▶ 开启新一轮（第 ${state.round + 1} 轮 loopexecute）`}
+          </button>
+          <span style={{ fontSize: 11.5, color: 'var(--theme-text-muted)' }}>
+            可先确认 Auto，再开启新一轮
+          </span>
+        </div>
       </div>
     );
   };
@@ -945,10 +1085,11 @@ function relTime(ts: number): string {
 const PolicyCard: React.FC<{
   sessionId: string;
   policy?: LoopPolicy;
+  readOnly?: boolean;
   sessionBackendId?: string;
   sessionRuntime?: ModelRuntime;
   backends?: any[];
-}> = ({ sessionId, policy, sessionBackendId, sessionRuntime, backends }) => {
+}> = ({ sessionId, policy, readOnly = false, sessionBackendId, sessionRuntime, backends }) => {
   const [open, setOpen] = useState(false);
   const [draft, setDraft] = useState<LoopPolicy>(() => normalizePolicy(policy));
   const [dirty, setDirty] = useState(false);
@@ -966,15 +1107,19 @@ const PolicyCard: React.FC<{
   return (
     <div style={{ ...sealBox, marginBottom: 16 }}>
       <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
-        <button onClick={() => setOpen(!open)}
-          style={{ ...linkBtn, fontWeight: 700, fontSize: 13, color: 'var(--theme-text)' }}>
-          {open ? '▾' : '▸'} ⚙️ 策略与心智
-        </button>
+        {readOnly ? (
+          <span style={{ fontWeight: 700, fontSize: 13, color: 'var(--theme-text)' }}>⚙️ 策略与心智</span>
+        ) : (
+          <button onClick={() => setOpen(!open)}
+            style={{ ...linkBtn, fontWeight: 700, fontSize: 13, color: 'var(--theme-text)' }}>
+            {open ? '▾' : '▸'} ⚙️ 策略与心智
+          </button>
+        )}
         <span style={{ fontSize: 11, color: 'var(--theme-text-muted)' }}>
           可交付≥{p.deliverableScore} · 可输出≥{p.outputtableScore} · 最多 {p.maxLoops} loop · 风险≥{p.riskThreshold.toFixed(2)} 收口 · 评审{p.independentEval ? '独立防自欺' : '常规'}{Object.values(p.backends || {}).some(Boolean) ? ' · 异构 Backend' : ''}{Object.values(p.runtimes || {}).some((r) => r?.model || r?.reasoningEffort) ? ' · 模型分档' : ''}
         </span>
       </div>
-      {open && (
+      {open && !readOnly && (
         <div className="awu-reveal" style={{ marginTop: 10 }}>
           <LoopPolicyEditor value={draft} onChange={(v) => { setDraft(v); setDirty(true); }}
             availableBackends={backends} sessionBackendId={sessionBackendId} sessionRuntime={sessionRuntime} />
@@ -1032,9 +1177,10 @@ const RefineBox: React.FC<{
 
 const GoalCard: React.FC<{
   state: LoopStateT; isOut: boolean;
+  readOnly?: boolean;
   onRefineGoal: (hint: string, images?: ImageAttachment[]) => Promise<{ status: string; goal?: string; message?: string }>;
   goalDraft: string; setGoalDraft: (v: string) => void; onSaveGoal: () => void;
-}> = ({ state, isOut, onRefineGoal, goalDraft, setGoalDraft, onSaveGoal }) => {
+}> = ({ state, isOut, readOnly = false, onRefineGoal, goalDraft, setGoalDraft, onSaveGoal }) => {
   const [mode, setMode] = useState<'view' | 'refine' | 'edit'>('view');
   const [showHist, setShowHist] = useState(false);
   const [showIdeas, setShowIdeas] = useState(false);
@@ -1047,7 +1193,7 @@ const GoalCard: React.FC<{
         <span style={{ fontSize: 13, fontWeight: 700, color: 'var(--theme-text)' }}>🎯 全局目标</span>
         {history.length > 0 && <span style={{ fontSize: 11, color: 'var(--theme-text-muted)' }}>v{history.length}</span>}
         <div style={{ flex: 1 }} />
-        {mode === 'view' && (
+        {mode === 'view' && !readOnly && (
           <>
             <button onClick={() => setMode('refine')} style={{ ...btn, ...btnActive }} title="给一句提示，让模型在当前目标+原始诉求基础上自动微调">✨ 微调目标</button>
             <button onClick={() => { setMode('edit'); setGoalDraft(state.goal); }} style={btn} title="手动改写">编辑</button>
@@ -1061,12 +1207,12 @@ const GoalCard: React.FC<{
       </div>
 
       {/* 按提示微调（引导模型，无需人手编辑） */}
-      {mode === 'refine' && (
+      {mode === 'refine' && !readOnly && (
         <RefineBox onRefineGoal={onRefineGoal} onCancel={() => setMode('view')} />
       )}
 
       {/* 手动编辑（兜底） */}
-      {mode === 'edit' && (
+      {mode === 'edit' && !readOnly && (
         <div style={{ display: 'flex', gap: 8, marginTop: 10 }}>
           <textarea value={goalDraft} onChange={(e) => setGoalDraft(e.target.value)} style={{ ...inputBase, flex: 1, minHeight: 54 }} />
           <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
@@ -1144,7 +1290,8 @@ const ExecuteStage: React.FC<{
   running: boolean; busy: boolean;
   goalDraft: string; setGoalDraft: (v: string) => void; onSaveGoal: () => void;
   onRefineGoal: (hint: string, images?: ImageAttachment[]) => Promise<{ status: string; goal?: string; message?: string }>;
-}> = ({ state, progress, selectedSeq, setSelectedSeq, onRun, onAdvanceOut, onSetAuto, onAddAddon, onRemoveAddon, onEditAddon, onContinue, onDiscard, onTakeover, running, busy, goalDraft, setGoalDraft, onSaveGoal, onRefineGoal }) => {
+  inspectOnly?: boolean;
+}> = ({ state, progress, selectedSeq, setSelectedSeq, onRun, onAdvanceOut, onSetAuto, onAddAddon, onRemoveAddon, onEditAddon, onContinue, onDiscard, onTakeover, running, busy, goalDraft, setGoalDraft, onSaveGoal, onRefineGoal, inspectOnly = false }) => {
   const isOut = state.stage === 'loopout';
   const selected = state.loops.find((l) => l.seq === selectedSeq) || null;
   const runLabel = state.resumable
@@ -1154,11 +1301,11 @@ const ExecuteStage: React.FC<{
   return (
     <div>
       {/* 全局目标（含演变历史 + 按提示微调 + 原始诉求回看） */}
-      <GoalCard state={state} isOut={isOut} onRefineGoal={onRefineGoal}
+      <GoalCard state={state} isOut={isOut} readOnly={inspectOnly} onRefineGoal={onRefineGoal}
         goalDraft={goalDraft} setGoalDraft={setGoalDraft} onSaveGoal={onSaveGoal} />
 
       {/* 操作 */}
-      {!isOut && (
+      {!isOut && !inspectOnly && (
         <div style={{ display: 'flex', gap: 10, marginBottom: 18, alignItems: 'center', flexWrap: 'wrap' }}>
           <button onClick={onRun} disabled={busy || running} style={{ ...primaryBtn, opacity: (busy || running) ? 0.5 : 1 }}>
             {running ? '⏳ Loop 进行中…' : runLabel}
@@ -1171,7 +1318,9 @@ const ExecuteStage: React.FC<{
           >
             {state.auto ? '🔄 Auto 连跑中（点此暂停）' : '⏸ Auto 关（点此自动连跑）'}
           </button>
-          <button onClick={onAdvanceOut} disabled={busy} style={btn}>⏹ 进入 loopout</button>
+          <button onClick={onAdvanceOut} disabled={busy} style={btn}>
+            {running ? '⏹ 停止并进入 loopout' : '⏹ 进入 loopout'}
+          </button>
           <button
             onClick={onTakeover}
             disabled={busy || !state.canTakeover}
@@ -1194,10 +1343,11 @@ const ExecuteStage: React.FC<{
         </div>
       )}
       {/* loopout：不是终点 —— 展示本轮产出小结 + 开启新一轮的引导 */}
-      {isOut && <LoopOutBanner state={state} onContinue={onContinue} busy={busy} onRefineGoal={onRefineGoal} />}
+      {isOut && !inspectOnly && <LoopOutBanner state={state} onContinue={onContinue} busy={busy}
+        onSetAuto={onSetAuto} onRefineGoal={onRefineGoal} />}
 
       {/* ★ 执行中补充（addon）：不影响当前 loop，下一次 loop 纳入并完成 */}
-      {!isOut && <AddonPanel addons={state.addons || []} onAdd={onAddAddon} onRemove={onRemoveAddon} onEdit={onEditAddon} />}
+      {!isOut && !inspectOnly && <AddonPanel addons={state.addons || []} onAdd={onAddAddon} onRemove={onRemoveAddon} onEdit={onEditAddon} />}
 
       {/* ★ Addon 历史：哪一轮/哪次 loop 纳入了哪些补充（执行中 & loopout 都可看） */}
       <AddonHistoryCard addons={state.addons || []} loops={state.loops} />
@@ -1520,6 +1670,13 @@ const LoopDetail: React.FC<{ loop: LoopRecord; progress: Record<string, string>;
   const livePrep = progress[`${loop.seq}:prepare`];
   const liveAna = progress[`${loop.seq}:analysis`];
   const groups = groupSteps(loop.orchestration);
+  if (loop.detailLoaded === false) {
+    return (
+      <div style={{ ...sealBox, marginTop: 4, color: 'var(--theme-text-muted)', fontSize: 12 }}>
+        正在按需加载 Loop #{loop.seq} 详情…
+      </div>
+    );
+  }
   if (loop.kind === 'manual') {
     return (
       <div style={{ ...sealBox, marginTop: 4, borderColor: '#d2992255' }}>

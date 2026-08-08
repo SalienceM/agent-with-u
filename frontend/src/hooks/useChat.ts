@@ -64,6 +64,7 @@ export interface ChatMessage {
   waitingForFirstDelta?: boolean;
   contentBlocks?: ContentBlock[];  // ★ 有序内容块，按到达顺序排列
   elapsed?: number;  // ★ 本次回复总耗时（毫秒）
+  deliveryMode?: 'steer' | 'redirect';
 }
 
 // ═══════════════════════════════════════
@@ -216,6 +217,7 @@ export function useChat(
   onNewSession?: () => void,
   onClearContext?: () => void,
   sessionRuntime?: { modelOverride?: string; reasoningEffort?: string },
+  hydrationEnabled: boolean = true,
 ) {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [isStreaming, setIsStreaming] = useState(false);
@@ -276,7 +278,7 @@ export function useChat(
 
   // ── 加载 session ──
   useEffect(() => {
-    if (!sessionId) {
+    if (!sessionId || !hydrationEnabled) {
       // session 被删除或未选中 → 清空聊天区
       setMessages([]);
       isStreamingRef.current = false;
@@ -476,7 +478,7 @@ export function useChat(
         sessionHistoryCache.set(sessionId, finalized);
       }
     };
-  }, [sessionId, syncFromGlobalState]);
+  }, [sessionId, hydrationEnabled, syncFromGlobalState]);
 
   // ── sessionUpdated 监听（compact 等后端操作完成后重载）──
   useEffect(() => {
@@ -496,6 +498,20 @@ export function useChat(
         setMessages([]);
         isStreamingRef.current = false;
         setIsStreaming(false);
+      } else if (data.type === 'follow_up_added' && data.message) {
+        const followUp = normalizeMessage(data.message);
+        setMessages((prev) => {
+          if (prev.some((message) => message.id === followUp.id)) return prev;
+          const beforeIndex = data.beforeMessageId
+            ? prev.findIndex((message) => message.id === data.beforeMessageId)
+            : -1;
+          if (beforeIndex < 0) return [...prev, followUp];
+          return [
+            ...prev.slice(0, beforeIndex),
+            followUp,
+            ...prev.slice(beforeIndex),
+          ];
+        });
       } else if (data.type === 'codex_thread_synced' && !isStreamingRef.current) {
         // Native Codex may have continued this attached thread in another
         // client.  Reload only the already-visible window (at least the normal
@@ -821,6 +837,7 @@ export function useChat(
       content: string,
       images?: ImageAttachment[],
       textAttachments?: TextAttachment[],
+      deliveryMode?: 'steer' | 'redirect',
     ) => {
       if (isStreamingRef.current) return;
 
@@ -830,6 +847,7 @@ export function useChat(
         content,
         images,
         textAttachments,
+        deliveryMode,
         timestamp: Date.now() / 1000,
       };
       const assistantId = uuid();
@@ -869,6 +887,7 @@ export function useChat(
         messageId: assistantId,
         autoContinue: autoContinueRef.current,
         skipPermissions: skipPermissionsRef.current,
+        deliveryMode,
       });
     },
     [sessionId, backendId]

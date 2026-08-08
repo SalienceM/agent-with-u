@@ -482,6 +482,11 @@ fn wildcard_match(pat: &str, text: &str) -> bool {
 fn sync_is_ignored(rel: &str, patterns: &[String]) -> bool {
     let rel = rel.replace('\\', "/");
     let segs: Vec<&str> = rel.split('/').filter(|s| !s.is_empty()).collect();
+    // Session 文件传输需要完整保留 Git 元数据，不能让旧忽略配置继续
+    // 静默过滤 `.git`。
+    if segs.contains(&".git") {
+        return false;
+    }
     for pat in patterns {
         let p = pat.trim().trim_end_matches('/');
         if p.is_empty() {
@@ -588,23 +593,199 @@ fn dir_sync_file_size(dir: String, rel: String) -> Result<u64, String> {
 }
 
 #[tauri::command]
-fn dir_sync_read_chunk(dir: String, rel: String, offset: u64, size: usize) -> Result<String, String> {
+fn dir_sync_read_chunk(
+    dir: String,
+    rel: String,
+    offset: u64,
+    size: usize,
+) -> Result<String, String> {
     use std::io::{Read, Seek, SeekFrom};
     if size == 0 || size > 1024 * 1024 {
         return Err("分块大小无效".into());
     }
     let (_root, target) = sync_resolve(&dir, &rel)?;
     let mut file = std::fs::File::open(&target).map_err(|e| e.to_string())?;
-    file.seek(SeekFrom::Start(offset)).map_err(|e| e.to_string())?;
+    file.seek(SeekFrom::Start(offset))
+        .map_err(|e| e.to_string())?;
     let mut data = vec![0u8; size];
     let read = file.read(&mut data).map_err(|e| e.to_string())?;
     data.truncate(read);
     Ok(BASE64.encode(&data))
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct KitClientFileInfo {
+    size: u64,
+    sha256: String,
+}
+
+#[tauri::command]
+fn kit_client_file_info(path: String) -> Result<KitClientFileInfo, String> {
+    use std::io::Read;
+    let target = std::fs::canonicalize(&path).map_err(|e| format!("客户端源文件无效: {e}"))?;
+    if !target.is_file() {
+        return Err("客户端源路径不是文件".into());
+    }
+    let mut file = std::fs::File::open(&target).map_err(|e| e.to_string())?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0u8; 1024 * 1024];
+    loop {
+        let read = file.read(&mut buffer).map_err(|e| e.to_string())?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(KitClientFileInfo {
+        size: target.metadata().map_err(|e| e.to_string())?.len(),
+        sha256: hex_encode(&hasher.finalize()),
+    })
+}
+
+#[tauri::command]
+fn kit_client_read_chunk(path: String, offset: u64, size: usize) -> Result<String, String> {
+    use std::io::{Read, Seek, SeekFrom};
+    if size == 0 || size > 1024 * 1024 {
+        return Err("分块大小无效".into());
+    }
+    let target = std::fs::canonicalize(&path).map_err(|e| format!("客户端源文件无效: {e}"))?;
+    if !target.is_file() {
+        return Err("客户端源路径不是文件".into());
+    }
+    let mut file = std::fs::File::open(target).map_err(|e| e.to_string())?;
+    file.seek(SeekFrom::Start(offset))
+        .map_err(|e| e.to_string())?;
+    let mut data = vec![0u8; size];
+    let read = file.read(&mut data).map_err(|e| e.to_string())?;
+    data.truncate(read);
+    Ok(BASE64.encode(data))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct KitClientCommandSpec {
+    shell: String,
+    command: String,
+    cwd: String,
+    timeout_seconds: u64,
+    #[serde(default)]
+    env: HashMap<String, String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct KitClientCommandResult {
+    exit_code: i32,
+    stdout: String,
+    stderr: String,
+}
+
+#[tauri::command]
+async fn kit_client_command(spec: KitClientCommandSpec) -> Result<KitClientCommandResult, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        use std::io::Read;
+        use std::process::{Command, Stdio};
+        use std::time::{Duration, Instant};
+
+        if spec.command.trim().is_empty() {
+            return Err("客户端命令为空".into());
+        }
+        let timeout = spec.timeout_seconds.clamp(1, 86_400);
+        let mut command = match spec.shell.as_str() {
+            "cmd" => {
+                let mut cmd =
+                    Command::new(std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".into()));
+                cmd.args(["/d", "/s", "/c", &spec.command]);
+                cmd
+            }
+            "bash" => {
+                let mut cmd = Command::new("bash");
+                cmd.args(["-lc", &spec.command]);
+                cmd
+            }
+            "powershell" => {
+                let executable = if cfg!(target_os = "windows") {
+                    "powershell"
+                } else {
+                    "pwsh"
+                };
+                let mut cmd = Command::new(executable);
+                cmd.args([
+                    "-NoLogo",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    &spec.command,
+                ]);
+                cmd
+            }
+            _ => return Err("不支持的客户端 Shell".into()),
+        };
+        if !spec.cwd.trim().is_empty() {
+            let cwd =
+                std::fs::canonicalize(&spec.cwd).map_err(|e| format!("客户端工作目录无效: {e}"))?;
+            if !cwd.is_dir() {
+                return Err("客户端工作目录不存在".into());
+            }
+            command.current_dir(cwd);
+        }
+        command
+            .envs(&spec.env)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::process::CommandExt;
+            command.creation_flags(0x08000000);
+        }
+        let mut child = command
+            .spawn()
+            .map_err(|e| format!("客户端命令启动失败: {e}"))?;
+        let mut stdout = child.stdout.take().ok_or("无法接管客户端 stdout")?;
+        let mut stderr = child.stderr.take().ok_or("无法接管客户端 stderr")?;
+        let out_thread = std::thread::spawn(move || {
+            let mut out = Vec::new();
+            let _ = stdout.read_to_end(&mut out);
+            out
+        });
+        let err_thread = std::thread::spawn(move || {
+            let mut out = Vec::new();
+            let _ = stderr.read_to_end(&mut out);
+            out
+        });
+        let deadline = Instant::now() + Duration::from_secs(timeout);
+        let status = loop {
+            if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("客户端命令超过 {timeout} 秒，已终止"));
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        let mut out = out_thread.join().unwrap_or_default();
+        let mut err = err_thread.join().unwrap_or_default();
+        out.truncate(200_000);
+        err.truncate(200_000);
+        Ok(KitClientCommandResult {
+            exit_code: status.code().unwrap_or(1),
+            stdout: String::from_utf8_lossy(&out).into_owned(),
+            stderr: String::from_utf8_lossy(&err).into_owned(),
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 fn sync_transfer_token(value: &str) -> Result<&str, String> {
-    if value.len() < 8 || value.len() > 80
-        || !value.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    if value.len() < 8
+        || value.len() > 80
+        || !value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
     {
         return Err("传输标识无效".into());
     }
@@ -613,7 +794,10 @@ fn sync_transfer_token(value: &str) -> Result<&str, String> {
 
 fn sync_temp_path(target: &Path, transfer_id: &str) -> Result<PathBuf, String> {
     let token = sync_transfer_token(transfer_id)?;
-    let name = target.file_name().and_then(|v| v.to_str()).ok_or("文件名无效")?;
+    let name = target
+        .file_name()
+        .and_then(|v| v.to_str())
+        .ok_or("文件名无效")?;
     Ok(target.with_file_name(format!(".{name}.awu-{token}.part")))
 }
 
@@ -623,9 +807,23 @@ fn sync_atomic_replace(temp: &Path, target: &Path) -> Result<(), String> {
     use windows_sys::Win32::Storage::FileSystem::{
         MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
     };
-    let from: Vec<u16> = temp.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
-    let to: Vec<u16> = target.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
-    let ok = unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) };
+    let from: Vec<u16> = temp
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let to: Vec<u16> = target
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let ok = unsafe {
+        MoveFileExW(
+            from.as_ptr(),
+            to.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
     if ok == 0 {
         Err(std::io::Error::last_os_error().to_string())
     } else {
@@ -660,15 +858,22 @@ fn dir_sync_write_chunk(
     use std::io::Write;
     let (_root, target) = sync_resolve(&dir, &rel)?;
     let temp = sync_temp_path(&target, &transfer_id)?;
-    let bytes = BASE64.decode(data.as_bytes()).map_err(|e| format!("base64 解码失败: {e}"))?;
+    let bytes = BASE64
+        .decode(data.as_bytes())
+        .map_err(|e| format!("base64 解码失败: {e}"))?;
     if bytes.len() > 1024 * 1024 {
         return Err("上传分块超过 1 MiB".into());
     }
-    let actual = std::fs::metadata(&temp).map_err(|_| "上传会话不存在或已过期".to_string())?.len();
+    let actual = std::fs::metadata(&temp)
+        .map_err(|_| "上传会话不存在或已过期".to_string())?
+        .len();
     if actual != offset {
         return Err("上传分块顺序不一致，请重试".into());
     }
-    let mut file = std::fs::OpenOptions::new().append(true).open(&temp).map_err(|e| e.to_string())?;
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&temp)
+        .map_err(|e| e.to_string())?;
     file.write_all(&bytes).map_err(|e| e.to_string())?;
     Ok(bytes.len() as u64)
 }
@@ -682,9 +887,13 @@ fn dir_sync_write_finish(
 ) -> Result<(), String> {
     let (_root, target) = sync_resolve(&dir, &rel)?;
     let temp = sync_temp_path(&target, &transfer_id)?;
-    let actual = std::fs::metadata(&temp).map_err(|_| "上传会话不存在或已过期".to_string())?.len();
+    let actual = std::fs::metadata(&temp)
+        .map_err(|_| "上传会话不存在或已过期".to_string())?
+        .len();
     if actual != expected_size {
-        return Err(format!("上传大小校验失败：期望 {expected_size}，实际 {actual}"));
+        return Err(format!(
+            "上传大小校验失败：期望 {expected_size}，实际 {actual}"
+        ));
     }
     // 仅在临时文件完整校验后原子替换，失败时原文件仍然保留。
     sync_atomic_replace(&temp, &target)
@@ -716,18 +925,30 @@ fn dir_sync_reveal(dir: String, rel: String) -> Result<(), String> {
         } else {
             command.arg(format!("/select,{}", target.display()));
         }
-        command.creation_flags(CREATE_NO_WINDOW).spawn().map_err(|e| e.to_string())?;
+        command
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn()
+            .map_err(|e| e.to_string())?;
     }
     #[cfg(target_os = "macos")]
     {
         let mut command = std::process::Command::new("open");
-        if target.is_file() { command.arg("-R"); }
+        if target.is_file() {
+            command.arg("-R");
+        }
         command.arg(&target).spawn().map_err(|e| e.to_string())?;
     }
     #[cfg(target_os = "linux")]
     {
-        let folder = if target.is_dir() { target } else { target.parent().unwrap_or(&target).to_path_buf() };
-        std::process::Command::new("xdg-open").arg(folder).spawn().map_err(|e| e.to_string())?;
+        let folder = if target.is_dir() {
+            target
+        } else {
+            target.parent().unwrap_or(&target).to_path_buf()
+        };
+        std::process::Command::new("xdg-open")
+            .arg(folder)
+            .spawn()
+            .map_err(|e| e.to_string())?;
     }
     Ok(())
 }
@@ -938,6 +1159,9 @@ pub fn run() {
             dir_sync_read_file,
             dir_sync_file_size,
             dir_sync_read_chunk,
+            kit_client_file_info,
+            kit_client_read_chunk,
+            kit_client_command,
             dir_sync_write_file,
             dir_sync_write_start,
             dir_sync_write_chunk,

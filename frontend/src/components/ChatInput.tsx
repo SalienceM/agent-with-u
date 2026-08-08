@@ -1145,7 +1145,7 @@ const ChatInputInner: React.FC<Props> = ({
       // 普通 Enter 发送（流式进行中也允许，sendMessage 内部处理中断续发）
       if (e.key === 'Enter' && !e.shiftKey) {
         e.preventDefault();
-        handleSend();
+        void handleSend();
       }
     },
     [handleSend, saveSessionDraft, scheduleTextareaResize]
@@ -1432,7 +1432,7 @@ const ChatInputInner: React.FC<Props> = ({
         )}
         {/* ★ 流式进度指示器 */}
         {isStreaming && (
-          <div title="模型正在生成；此时继续输入并回车会自动加入序列队列" style={{
+          <div title="模型正在生成；可选择排队、当前轮引导或中断后重引导" style={{
             display: 'inline-flex',
             alignItems: 'center',
             padding: '7px',
@@ -1640,7 +1640,9 @@ const ChatInputInner: React.FC<Props> = ({
           rows={1}
         />
         <button onClick={handleSend} style={sendBtnStyle}
-          title={isStreaming || seqCount > 0 ? '加入序列队列' : '发送（Enter）'}>
+          title={isStreaming
+            ? '加入序列队列'
+            : seqCount > 0 ? '加入序列队列' : '发送（Enter）'}>
           {isStreaming || seqCount > 0 ? '＋' : '🚀'}
         </button>
         {isStreaming && <button onClick={onAbort} style={abortBtnStyle} title="停止当前回答">■</button>}

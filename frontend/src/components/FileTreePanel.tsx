@@ -227,6 +227,7 @@ export const FileTreePanel: React.FC<Props> = ({ sessionId, workingDir, execKey,
   const [remoteManifest, setRemoteManifest] = useState<Manifest | null>(null);  // 比对后才有(带哈希)
   const [baseline, setBaseline] = useState<Manifest>({});
   const [comparing, setComparing] = useState(false);
+  const [onlyDifferent, setOnlyDifferent] = useState(false);
 
   // ── Git 集成（检测 .git → 轮询状态 → overlay 角标）──
   const [gitAvailable, setGitAvailable] = useState(false);
@@ -310,7 +311,8 @@ export const FileTreePanel: React.FC<Props> = ({ sessionId, workingDir, execKey,
     if (!workingDir) return;
     setLoading((p) => ({ ...p, [rel]: true }));
     try {
-      const ents = await api.listDirectory(rel, workingDir, execKey);
+      // 文件传输面板必须忠实展示工作空间，包括 .git 等点号目录。
+      const ents = await api.listDirectory(rel, workingDir, execKey, true);
       const nodes: TNode[] = ents.map((e) => ({
         name: e.name, rel: e.path, isDir: e.isDir, size: 0,
         remote: true, local: false,
@@ -801,6 +803,41 @@ export const FileTreePanel: React.FC<Props> = ({ sessionId, workingDir, execKey,
     return dirs;
   }, [remoteManifest]);
 
+  /** 两端都存在、但内容哈希不同的文件；冲突也是内容不同的一种。 */
+  const differentPaths = useMemo(() => {
+    const paths = new Set<string>();
+    if (!localManifest || !remoteManifest) return paths;
+    for (const [rel, local] of Object.entries(localManifest)) {
+      const remote = remoteManifest[rel];
+      if (remote && local.hash !== remote.hash) paths.add(rel);
+    }
+    return paths;
+  }, [localManifest, remoteManifest]);
+
+  const toggleOnlyDifferent = useCallback(() => {
+    setOnlyDifferent((current) => {
+      const next = !current;
+      if (next) {
+        // 自动展开命中文件的祖先目录，切换后直接看到结果，不必逐层翻找。
+        setExpanded((previous) => {
+          const expandedNext = { ...previous };
+          for (const rel of differentPaths) {
+            const parts = rel.split('/').filter(Boolean);
+            for (let i = 1; i < parts.length; i++) {
+              expandedNext[parts.slice(0, i).join('/')] = true;
+            }
+          }
+          return expandedNext;
+        });
+      }
+      return next;
+    });
+  }, [differentPaths]);
+
+  useEffect(() => {
+    if (!localManifest || !remoteManifest) setOnlyDifferent(false);
+  }, [localManifest, remoteManifest]);
+
   const toggle = useCallback((node: TNode) => {
     if (!node.isDir) return;
     const willOpen = !expanded[node.rel];
@@ -924,20 +961,23 @@ export const FileTreePanel: React.FC<Props> = ({ sessionId, workingDir, execKey,
     if (!node.isDir) return [node.rel];
     if (remoteManifest) {
       const prefix = node.rel ? `${node.rel}/` : '';
-      return Object.keys(remoteManifest).filter((r) => !node.rel || r.startsWith(prefix));
+      return Object.keys(remoteManifest).filter((r) => (
+        (!node.rel || r.startsWith(prefix))
+        && (!onlyDifferent || differentPaths.has(r))
+      ));
     }
     const out: string[] = [];
     const walk = async (rel: string) => {
       let kids = children[rel];
       if (kids === undefined) {
-        const ents = workingDir ? await api.listDirectory(rel, workingDir, execKey) : [];
+        const ents = workingDir ? await api.listDirectory(rel, workingDir, execKey, true) : [];
         kids = ents.map((e) => ({ name: e.name, rel: e.path, isDir: e.isDir, size: 0 }));
       }
       for (const k of kids) { if (k.isDir) await walk(k.rel); else out.push(k.rel); }
     };
     await walk(node.rel);
     return out;
-  }, [remoteManifest, children, workingDir, execKey]);
+  }, [remoteManifest, children, workingDir, execKey, onlyDifferent, differentPaths]);
 
   // ⬇ 下载到本地副本(云端→本地)
   const pull = useCallback(async (node: TNode) => {
@@ -1242,11 +1282,21 @@ export const FileTreePanel: React.FC<Props> = ({ sessionId, workingDir, execKey,
   };
 
   const renderDir = (rel: string, depth: number): React.ReactNode => {
-    const nodes = mergedChildren(rel);
+    const nodes = mergedChildren(rel).filter((node) => {
+      if (!onlyDifferent) return true;
+      if (!node.isDir) return differentPaths.has(node.rel);
+      const prefix = node.rel ? `${node.rel}/` : '';
+      for (const path of differentPaths) {
+        if (!node.rel || path.startsWith(prefix)) return true;
+      }
+      return false;
+    });
     if (children[rel] === undefined && nodes.length === 0) {
       return loading[rel] ? <div style={{ ...emptyStyle, paddingLeft: 24 + depth * 8 }}>加载中…</div> : null;
     }
-    if (nodes.length === 0 && depth === 0) return <Empty text="（空目录）" />;
+    if (nodes.length === 0 && depth === 0) {
+      return <Empty text={onlyDifferent ? '没有内容不同的文件' : '（空目录）'} />;
+    }
     return nodes.map((n) => {
       const open = !!expanded[n.rel];
       const st = statusOf(n);
@@ -1421,6 +1471,23 @@ export const FileTreePanel: React.FC<Props> = ({ sessionId, workingDir, execKey,
             >
               💻{summary.localOnly} ☁{summary.cloud} ±{summary.differs} ⚠{summary.conflict}
             </span>
+          )}
+          {localFs && remoteManifest && (
+            <button
+              style={{
+                ...localDirButtonStyle,
+                ...(onlyDifferent ? {
+                  background: 'var(--theme-accent, #58a6ff)',
+                  color: '#fff',
+                  borderColor: 'var(--theme-accent, #58a6ff)',
+                } : {}),
+              }}
+              onClick={toggleOnlyDifferent}
+              title="只显示两端都存在但内容不同的文件（包含冲突），不包含仅本机或仅远端"
+              aria-pressed={onlyDifferent}
+            >
+              {onlyDifferent ? '✓ ' : ''}仅不同 {differentPaths.size}
+            </button>
           )}
           {localFs && (
             <button style={localDirButtonStyle} disabled={comparing || !!transfer} onClick={runCompare} title="扫描两端并比较文件状态">

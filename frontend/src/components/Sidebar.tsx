@@ -18,6 +18,9 @@ interface Session {
   codexConnectionMode?: 'node' | 'ssh';
   codexRemoteHost?: string;
   codexThreadAttached?: boolean;
+  sessionType?: 'normal' | 'loop';
+  pinned?: boolean;
+  sidebarColor?: string;
 }
 
 interface Backend {
@@ -45,10 +48,11 @@ interface Props {
   activeExecMode?: 'local' | 'relay';
   activeBackendId?: string;
   activeCodexRemoteHost?: string;
+  sessionLimit?: number;
 }
 
 // ★ Wrap with React.memo to prevent unnecessary re-renders when parent updates
-export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession, onNewSession, onDeleteSession, onAcknowledgeSession, streamingSessions, completedSessions = new Set(), collapsed, onToggleCollapse, isMobile, width, activeWorkingDir, activeExecKey, activeExecLabel, activeExecMode, activeBackendId, activeCodexRemoteHost }) => {
+export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession, onNewSession, onDeleteSession, onAcknowledgeSession, streamingSessions, completedSessions = new Set(), collapsed, onToggleCollapse, isMobile, width, activeWorkingDir, activeExecKey, activeExecLabel, activeExecMode, activeBackendId, activeCodexRemoteHost, sessionLimit = 25 }) => {
   const [sessions, setSessions] = useState<Session[]>([]);
   const refreshGenerationRef = useRef(0);
   const refreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -57,13 +61,19 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
   const [backends, setBackends] = useState<Backend[]>([]);
   const [hoveredSessionId, setHoveredSessionId] = useState<string | null>(null);
   const [sessionToDelete, setSessionToDelete] = useState<Session | null>(null);
+  const [sessionToDestroy, setSessionToDestroy] = useState<Session | null>(null);
+  const [destroyConfirmValue, setDestroyConfirmValue] = useState('');
+  const [destroyError, setDestroyError] = useState('');
+  const [destroying, setDestroying] = useState(false);
   const [abilityPickerSession, setAbilityPickerSession] = useState<Session | null>(null);
   const [availablePrompts, setAvailablePrompts] = useState<any[]>([]);
   const [availableSkills, setAvailableSkills] = useState<any[]>([]);
   const [renamingSessionId, setRenamingSessionId] = useState<string | null>(null);
   const [renameValue, setRenameValue] = useState('');
+  const [searchQuery, setSearchQuery] = useState('');
+  const [appearancePickerSession, setAppearancePickerSession] = useState<Session | null>(null);
   const renameInputRef = useRef<HTMLInputElement>(null);
-  // ★ 分组折叠（全局只保留最近 10 条 session，不再需要「展开更多」）
+  // ★ 执行节点分组折叠；每组显示数量由应用配置控制。
   const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(new Set());
 
   // ★ Memoize refresh function to avoid re-creating it on every render
@@ -72,7 +82,7 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
     try {
       const sessionList = await api.listSessions();
       if (generation !== refreshGenerationRef.current) return;
-      sessionList.sort((a: any, b: any) => (b.updatedAt || 0) - (a.updatedAt || 0));
+      sessionList.sort(sortSessionsByPriority);
       setSessions(sessionList);
     } catch (error) {
       console.warn('[Sidebar] failed to refresh sessions', error);
@@ -194,6 +204,17 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
     setSessionToDelete(session);
   }, [streamingSessions]);
 
+  const handleDestroyClick = useCallback((session: Session, e: React.MouseEvent) => {
+    e.stopPropagation();
+    if (streamingSessions.has(session.id)) {
+      alert(`会话 "${session.title}" 正在运行，请先停止后再销毁。`);
+      return;
+    }
+    setDestroyConfirmValue('');
+    setDestroyError('');
+    setSessionToDestroy(session);
+  }, [streamingSessions]);
+
   const confirmDelete = useCallback(() => {
     if (sessionToDelete) {
       const deletedId = sessionToDelete.id;
@@ -204,6 +225,26 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
       setSessionToDelete(null);
     }
   }, [sessionToDelete, refresh, onDeleteSession]);
+
+  const confirmDestroy = useCallback(async () => {
+    if (!sessionToDestroy || destroyConfirmValue !== '销毁' || destroying) return;
+    setDestroying(true);
+    setDestroyError('');
+    const targetId = sessionToDestroy.id;
+    try {
+      const result = await api.destroySession(targetId, 'DESTROY');
+      if (result.status !== 'ok') {
+        setDestroyError(result.message || '销毁失败');
+        return;
+      }
+      setSessionToDestroy(null);
+      setDestroyConfirmValue('');
+      await refresh();
+      onDeleteSession?.(targetId);
+    } finally {
+      setDestroying(false);
+    }
+  }, [sessionToDestroy, destroyConfirmValue, destroying, refresh, onDeleteSession]);
 
   // ★ 本窗口新建会话时直接插入。createSession 返回的是完整且带节点归属的
   // 最新对象，不再立即整表重拉，避免旧索引把它短暂刷掉。
@@ -219,7 +260,7 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
           const next = [...prev];
           if (index >= 0) next[index] = { ...next[index], ...detail };
           else next.push(detail);
-          next.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+          next.sort(sortSessionsByPriority);
           return next;
         });
       }
@@ -256,7 +297,7 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
           const next = [...prev];
           if (index >= 0) next[index] = { ...next[index], ...data.summary };
           else next.push(data.summary);
-          next.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+          next.sort(sortSessionsByPriority);
           return next;
         });
       } else if (data?.type === 'session_renamed' && sessionId) {
@@ -288,22 +329,52 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
     return label.split(' ')[0];
   }, [backends]);
 
-  const formatWorkingDir = useCallback((dir: string): string => {
-    if (!dir) return 'Not set';
-    if (dir === '.') return '(current dir)';
-    // Show last 2-3 segments of the path
-    const parts = dir.replace(/\\/g, '/').split('/');
-    if (parts.length <= 3) return dir;
-    return '.../' + parts.slice(-3).join('/');
+  const updateAppearance = useCallback(async (
+    session: Session,
+    patch: { pinned?: boolean; sidebarColor?: string },
+  ) => {
+    const previous = { pinned: !!session.pinned, sidebarColor: session.sidebarColor || '' };
+    const applyLocal = (value: { pinned?: boolean; sidebarColor?: string }) => {
+      setSessions((current) => current.map((item) => (
+        item.id === session.id ? { ...item, ...value } : item
+      )).sort(sortSessionsByPriority));
+    };
+    applyLocal(patch);
+    const result = await api.updateSessionAppearance(session.id, patch);
+    if (result.status !== 'ok') {
+      applyLocal(previous);
+      alert(result.message || '会话外观保存失败');
+    }
   }, []);
+
+  const normalizedSearch = searchQuery.trim().toLocaleLowerCase();
+  const visibleSessions = useMemo(() => {
+    const filtered = normalizedSearch
+      ? sessions.filter((session) => [
+          session.title,
+          session.workingDir,
+          session.backendId,
+          session.execLabel,
+          session.sessionType,
+        ].some((value) => String(value || '').toLocaleLowerCase().includes(normalizedSearch)))
+      : sessions;
+    return [...filtered].sort(sortSessionsByPriority);
+  }, [sessions, normalizedSearch]);
 
   const pendingCount = completedSessions.size;
 
-  // ★ 按执行节点分组：每个节点最多展示 MAX_PER_NODE 个 session（非全局共享配额）
-  const MAX_PER_NODE = 10;
+  // ★ 按执行节点分组：每个节点按配置展示最近 N 条；收藏和搜索不受此限制。
+  const maxPerNode = Math.max(5, Math.min(500, Math.trunc(Number(sessionLimit) || 25)));
   const groups = useMemo(() => {
     const map = new Map<string, { key: string; label: string; isHome: boolean; sessions: Session[] }>();
-    for (const s of sessions) {
+    const pinnedSessions = visibleSessions.filter((session) => session.pinned);
+    if (pinnedSessions.length) {
+      map.set('__pinned__', {
+        key: '__pinned__', label: '收藏', isHome: true, sessions: pinnedSessions,
+      });
+    }
+    for (const s of visibleSessions) {
+      if (s.pinned) continue;
       const key = s.execKey || 'local';
       const label = s.execMode === 'relay' ? (s.execLabel || key) : '本机';
       const isHome = s.execIsHome !== false;
@@ -311,19 +382,21 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
         map.set(key, { key, label, isHome, sessions: [] });
       }
       const grp = map.get(key)!;
-      if (grp.sessions.length < MAX_PER_NODE) {
+      if (normalizedSearch || grp.sessions.length < maxPerNode) {
         grp.sessions.push(s);
       }
     }
     // 本机在前，远端按 label 排序
     const arr = Array.from(map.values());
     arr.sort((a, b) => {
+      if (a.key === '__pinned__') return -1;
+      if (b.key === '__pinned__') return 1;
       if (a.isHome && !b.isHome) return -1;
       if (!a.isHome && b.isHome) return 1;
       return a.label.localeCompare(b.label);
     });
     return arr;
-  }, [sessions]);
+  }, [visibleSessions, normalizedSearch, maxPerNode]);
 
   const toggleGroup = useCallback((key: string) => {
     setCollapsedGroups(prev => {
@@ -378,7 +451,7 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
   return (
     <div style={isMobile ? mobileSidebarStyle : { ...sidebarStyle, width: width ?? 260 }}>
       <style>{`
-        @keyframes pulse {
+        @keyframes awuSidebarRunningPulse {
           0%, 100% { opacity: 1; transform: scale(1); }
           50% { opacity: 0.4; transform: scale(1.25); }
         }
@@ -390,7 +463,7 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
           from { opacity: 0; transform: perspective(900px) rotateX(-14deg) scale(0.96) translateY(-8px); }
           to   { opacity: 1; transform: perspective(900px) rotateX(0deg)   scale(1)    translateY(0); }
         }
-        @keyframes streamBorderFlow {
+        @keyframes awuSidebarStreamBorderFlow {
           from { transform: translateY(-66%); }
           to   { transform: translateY(66%); }
         }
@@ -408,7 +481,7 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
           border-radius: 3px 0 0 3px;
           background: linear-gradient(180deg, transparent, #22c55e 30%, #7aa2f7 70%, transparent);
           will-change: transform;
-          animation: streamBorderFlow 1.6s linear infinite;
+          animation: awuSidebarStreamBorderFlow 1.6s linear infinite;
         }
         .session-notify-badge {
           position: absolute;
@@ -469,6 +542,31 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
           </button>
         )}
       </div>
+      {view === 'sessions' && (
+        <div style={searchWrapStyle}>
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" aria-hidden="true">
+            <circle cx="11" cy="11" r="7" />
+            <path d="m20 20-3.5-3.5" />
+          </svg>
+          <input
+            value={searchQuery}
+            onChange={(event) => setSearchQuery(event.target.value)}
+            placeholder="搜索会话"
+            aria-label="搜索会话"
+            style={searchInputStyle}
+          />
+          {searchQuery && (
+            <button
+              onClick={() => setSearchQuery('')}
+              title="清空搜索"
+              aria-label="清空搜索"
+              style={searchClearStyle}
+            >
+              ×
+            </button>
+          )}
+        </div>
+      )}
       {view === 'files' ? (
         activeCodexRemoteHost ? (
           <div style={{ margin: 12, padding: 14, border: '1px solid var(--theme-border)', borderRadius: 8, color: 'var(--theme-text-muted)', fontSize: 12, lineHeight: 1.65 }}>
@@ -481,30 +579,33 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
         {groups.map(group => {
           const isCollapsed = collapsedGroups.has(group.key);
           // 多组时显示组头；单组（仅本机）不显示
-          const showGroupHeader = groups.length > 1;
+          const isPinnedGroup = group.key === '__pinned__';
+          const showGroupHeader = groups.length > 1 || isPinnedGroup;
           return (
             <div key={group.key}>
               {showGroupHeader && (
                 <div
                   onClick={() => toggleGroup(group.key)}
                   style={groupHeaderStyle}
-                  title={group.isHome ? '本机执行' : `执行节点：${group.label}`}
+                  title={isPinnedGroup ? '收藏并置顶的会话' : group.isHome ? '本机执行' : `执行节点：${group.label}`}
                 >
                   <span style={{ fontSize: 10, width: 12, textAlign: 'center', flexShrink: 0 }}>{isCollapsed ? '▸' : '▾'}</span>
                   <span style={{ fontSize: 11, fontWeight: 600 }}>
-                    {group.isHome ? '🏠 本机' : `🌐 ${group.label}`}
+                    {isPinnedGroup ? '★ 收藏' : group.isHome ? '🏠 本机' : `🌐 ${group.label}`}
                   </span>
                   <span style={{ fontSize: 10, color: 'var(--theme-text-muted)', marginLeft: 'auto' }}>{group.sessions.length}</span>
                 </div>
               )}
-              {!isCollapsed && group.sessions.map((s: any) => {
+              {!isCollapsed && group.sessions.map((s: Session) => {
                 const isRunning = streamingSessions.has(s.id);
                 const isCompleted = !isRunning && completedSessions.has(s.id);
                 const isActive = s.id === activeSessionId;
+                const isHovered = hoveredSessionId === s.id;
                 // “接管既有 thread”是来源，“SSH Codex”是执行位置；两者可同时成立。
                 const isCodexAttached = s.codexThreadAttached === true
                   || (s.codexThreadAttached === undefined && s.codexConnectionMode === 'node');
                 const isCodexSsh = s.codexConnectionMode === 'ssh';
+                const rowBackground = getSessionRowBackground(s.sidebarColor || '', isActive);
 
                 return (
                 <div
@@ -515,37 +616,33 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
                   className={isRunning ? 'session-streaming-item' : undefined}
                   style={{
                     ...itemStyle,
-                    ...(isActive ? { background: 'var(--theme-accent-bg, #7aa2f726)' } : {}),
-                    ...(hoveredSessionId === s.id && !isActive ? { background: 'var(--theme-bg-tertiary, #242536)' } : {}),
-                    ...(isRunning   ? { border: '1px solid #22c55e33' } : {}),
-                    ...(isCompleted ? { border: '1px solid #ef444455', borderLeft: '3px solid #ef4444' } : {}),
+                    background: rowBackground,
+                    ...(isHovered ? { boxShadow: 'inset 0 0 0 1px var(--theme-border, rgba(122,162,247,.3))' } : {}),
+                    ...(isActive ? { boxShadow: 'inset 0 0 0 1px var(--theme-accent, #7aa2f7)' } : {}),
+                    ...(isRunning ? { borderColor: '#22c55e55' } : {}),
+                    ...(isCompleted ? { borderColor: '#ef444455' } : {}),
                   }}
+                  title={[s.title, s.workingDir, getBackendShortLabel(s.backendId)].filter(Boolean).join('\n')}
                 >
-                  {/* ★ Running indicator — 绿点 */}
                   {isRunning && (
-                    <div style={{ position: 'absolute', top: 8, left: 8, display: 'flex', alignItems: 'center', gap: 4 }}>
-                      <span style={{ width: 7, height: 7, borderRadius: '50%', background: '#22c55e', animation: 'pulse 1.5s infinite' }} />
-                    </div>
+                    <span style={{
+                      ...runningDotStyle,
+                      animation: 'awuSidebarRunningPulse 1.5s ease-in-out infinite',
+                      willChange: 'transform, opacity',
+                    }} />
                   )}
-
-                  {/* ★ Completed indicator — 右上角红点角标，点击才确认消除 */}
                   {isCompleted && (
-                    <span
-                      className="session-notify-badge"
+                    <button
                       title="点击确认已查看"
                       onClick={(e) => {
                         e.stopPropagation();
                         onAcknowledgeSession?.(s.id);
                       }}
+                      style={completedDotStyle}
                     >
                       !
-                    </span>
+                    </button>
                   )}
-
-                  {/* ★ Working directory is PRIMARY - shown first and prominently */}
-                  <div style={{ fontSize: 11, color: 'var(--theme-success, #2da44e)', fontFamily: 'monospace', marginBottom: 4, paddingLeft: isRunning ? 18 : 0 }}>
-                    📁 {formatWorkingDir(s.workingDir)}
-                  </div>
                   {renamingSessionId === s.id ? (
                     <input
                       ref={renameInputRef}
@@ -558,74 +655,59 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
                       style={renameInputStyle}
                     />
                   ) : (
-                    <div style={{ fontSize: 13, color: isActive ? 'var(--theme-accent, #7aa2f7)' : 'var(--theme-text, #e2e3ea)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', paddingRight: 68 }}>
-                      {s.sessionType === 'loop' && <span title="Loop 会话" style={{ marginRight: 4 }}>🔁</span>}
-                      {s.title}
+                    <div style={sessionTitleStyle}>
+                      {s.sessionType === 'loop' && <span title="LOOP 会话">🔁</span>}
+                      {s.execIsHome === false && <span title={`远程执行：${s.execLabel || '执行端'}`}>🌐</span>}
+                      {isCodexAttached && <span title="接管已有 Codex thread">🧲</span>}
+                      {isCodexSsh && <span title={`SSH Codex：${s.codexRemoteHost || '远端主机'}`}>⌁</span>}
+                      <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', color: isActive ? 'var(--theme-accent, #7aa2f7)' : 'var(--theme-text, #e2e3ea)' }}>
+                        {s.title}
+                      </span>
                     </div>
                   )}
-                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: 4 }}>
-                    <span style={{ fontSize: 10, color: 'var(--theme-text-muted, #656d76)' }}>
-                      {s.messageCount} msgs
-                    </span>
-                    <div style={{ display: 'flex', gap: 4, alignItems: 'center', justifyContent: 'flex-end', flexWrap: 'wrap' }}>
-                      {/* ★ 远端执行节点标记:本机会话不显示,避免单机用户看到无谓徽标 */}
-                      {s.execIsHome === false && s.execLabel && !showGroupHeader && (
-                        <span style={execBadgeStyle} title={`执行节点：${s.execLabel}`}>
-                          🌐 {s.execLabel}
-                        </span>
-                      )}
-                      {isCodexAttached && (
-                        <span
-                          style={codexAttachedBadgeStyle}
-                          title="接管已有 Codex thread，继续其原生上下文"
+                  <div style={compactActionsStyle}>
+                    {isHovered ? (
+                      <>
+                        <button
+                          onClick={(e) => { e.stopPropagation(); updateAppearance(s, { pinned: !s.pinned }); }}
+                          style={{ ...actionBtnStyle, color: s.pinned ? '#f5c451' : 'var(--theme-text-muted)' }}
+                          title={s.pinned ? '取消置顶' : '收藏并置顶'}
                         >
-                          🧲 接管
-                        </span>
-                      )}
-                      {isCodexSsh && (
-                        <span
-                          style={codexSshBadgeStyle}
-                          title={`Codex 命令通过 SSH 在 ${s.codexRemoteHost || '远端主机'} 执行`}
+                          {s.pinned ? '★' : '☆'}
+                        </button>
+                        <button
+                          onClick={(e) => { e.stopPropagation(); setAppearancePickerSession(s); }}
+                          style={actionBtnStyle}
+                          title="配置底色"
                         >
-                          ⌁ SSH Codex
-                        </span>
-                      )}
-                      {/* Backend name badge */}
+                          ◐
+                        </button>
+                        <button onClick={(e) => handleRenameStart(s, e)} style={actionBtnStyle} title="重命名">✎</button>
+                        <button onClick={(e) => openAbilityPicker(s, e)} style={actionBtnStyle} title="绑定能力">🧩</button>
+                        <button onClick={(e) => handleDeleteClick(s, e)} style={actionBtnStyle} title="删除" disabled={isRunning}>×</button>
+                        <button
+                          onClick={(e) => handleDestroyClick(s, e)}
+                          style={{ ...actionBtnStyle, color: 'var(--theme-error, #ef4444)' }}
+                          title="销毁 Session 与整个工作目录"
+                          disabled={isRunning}
+                        >
+                          ♨
+                        </button>
+                      </>
+                    ) : (
+                      <>
                       <span
                         style={{
-                          ...backendBadgeStyle,
+                          ...compactBackendStyle,
                           background: getBackendBadgeColor(s.backendId),
                         }}
                         title={getBackendShortLabel(s.backendId)}
                       >
                         {getBackendShortLabel(s.backendId)}
                       </span>
-                    </div>
-                  </div>
-                  {/* ★ Hover action buttons: rename | constraints | delete */}
-                  <div style={{ position: 'absolute', top: 8, right: 8, display: 'flex', gap: 2, opacity: hoveredSessionId === s.id ? 1 : 0, transition: 'opacity 0.15s', zIndex: 5 }}>
-                    <button
-                      onClick={(e) => handleRenameStart(s, e)}
-                      style={actionBtnStyle}
-                      title="重命名"
-                    >
-                      ✎
-                    </button>
-                    <button
-                      onClick={(e) => openAbilityPicker(s, e)}
-                      style={actionBtnStyle}
-                      title="绑定能力"
-                    >
-                      🧩
-                    </button>
-                    <button
-                      onClick={(e) => handleDeleteClick(s, e)}
-                      style={actionBtnStyle}
-                      title="Delete"
-                      disabled={isRunning}
-                    >
-                      ×
-                    </button>
+                        {s.pinned && <span style={{ color: '#f5c451', fontSize: 13 }} title="已置顶">★</span>}
+                      </>
+                    )}
                   </div>
                 </div>
               );
@@ -635,7 +717,12 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
         })}
         {sessions.length === 0 && (
           <div style={{ textAlign: 'center', color: 'var(--theme-text-muted, #656d76)', fontSize: 13, padding: 20 }}>
-            No sessions yet
+            还没有会话
+          </div>
+        )}
+        {sessions.length > 0 && visibleSessions.length === 0 && (
+          <div style={{ textAlign: 'center', color: 'var(--theme-text-muted, #656d76)', fontSize: 12, padding: 20 }}>
+            没有匹配的会话
           </div>
         )}
       </div>
@@ -857,6 +944,51 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
         </div>
       )}
 
+      {/* 受控渐变色板：只保存 preset id，不把任意 CSS 写入 Session。 */}
+      {appearancePickerSession && (
+        <div style={overlayStyle} onClick={() => setAppearancePickerSession(null)}>
+          <div style={{ ...confirmPanelStyle, maxWidth: 360, padding: 18 }} onClick={(e) => e.stopPropagation()}>
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 14 }}>
+              <div style={{ minWidth: 0 }}>
+                <div style={{ fontSize: 14, fontWeight: 650, color: 'var(--theme-text)' }}>会话底色</div>
+                <div style={{ fontSize: 11, color: 'var(--theme-text-muted)', marginTop: 3, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                  {appearancePickerSession.title}
+                </div>
+              </div>
+              <button onClick={() => setAppearancePickerSession(null)} style={actionBtnStyle} aria-label="关闭">×</button>
+            </div>
+            <div style={colorGridStyle}>
+              {SESSION_COLOR_PRESETS.map((preset) => {
+                const selected = (appearancePickerSession.sidebarColor || '') === preset.id;
+                return (
+                  <button
+                    key={preset.id || 'none'}
+                    onClick={async () => {
+                      await updateAppearance(appearancePickerSession, { sidebarColor: preset.id });
+                      setAppearancePickerSession(null);
+                    }}
+                    style={{
+                      ...colorPresetStyle,
+                      background: preset.background,
+                      boxShadow: selected ? '0 0 0 2px var(--theme-accent, #7aa2f7)' : 'none',
+                    }}
+                    title={preset.label}
+                  >
+                    <span style={{
+                      fontSize: 10,
+                      color: preset.id ? '#fff' : 'var(--theme-text-muted)',
+                      textShadow: preset.id ? '0 1px 3px rgba(0,0,0,.7)' : 'none',
+                    }}>
+                      {preset.label}
+                    </span>
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* 删除确认对话框 */}
       {sessionToDelete && (
         <div style={overlayStyle}>
@@ -868,13 +1000,65 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
               确定要删除会话 <strong style={{ color: 'var(--theme-error, #cf222e)' }}>{sessionToDelete.title}</strong> 吗？
             </p>
             <p style={{ fontSize: 12, color: 'var(--theme-text-muted, #656d76)', margin: '0 0 16px 0' }}>
-              此操作不可撤销，将删除 {sessionToDelete.messageCount} 条消息。
+              仅删除会话记录及其 {sessionToDelete.messageCount} 条消息，工作目录和文件会保留。
             </p>
             <div style={{ display: 'flex', gap: 8 }}>
               <button onClick={confirmDelete} style={confirmBtnStyle}>
                 删除
               </button>
               <button onClick={() => setSessionToDelete(null)} style={cancelBtnStyle}>
+                取消
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* 销毁与普通删除严格分离：必须输入中文“销毁”后才能触发执行端目录删除。 */}
+      {sessionToDestroy && (
+        <div style={overlayStyle}>
+          <div style={{ ...confirmPanelStyle, maxWidth: 460, border: '1px solid rgba(239,68,68,.48)' }} onClick={(e) => e.stopPropagation()}>
+            <h3 style={{ margin: '0 0 10px', fontSize: 16, color: 'var(--theme-error, #ef4444)' }}>
+              ♨ 销毁 Session 与工作目录
+            </h3>
+            <p style={{ margin: '0 0 10px', fontSize: 12, lineHeight: 1.6, color: 'var(--theme-text-muted)' }}>
+              这不同于普通删除：执行端会永久删除 <strong>{sessionToDestroy.title}</strong> 的工作目录及其中全部文件，然后删除 Session。此操作不可恢复。
+            </p>
+            <div style={destroyPathStyle}>{sessionToDestroy.workingDir || '未设置目录'}</div>
+            <label style={{ display: 'block', margin: '13px 0 6px', fontSize: 11, color: 'var(--theme-text-muted)' }}>
+              输入“销毁”确认
+            </label>
+            <input
+              autoFocus
+              value={destroyConfirmValue}
+              onChange={(e) => { setDestroyConfirmValue(e.target.value); setDestroyError(''); }}
+              onKeyDown={(e) => { if (e.key === 'Enter') void confirmDestroy(); }}
+              disabled={destroying}
+              style={{ ...renameInputStyle, width: '100%', boxSizing: 'border-box' }}
+              placeholder="销毁"
+            />
+            {destroyError && (
+              <div style={{ marginTop: 9, padding: '7px 9px', borderRadius: 6, background: 'rgba(239,68,68,.10)', color: 'var(--theme-error, #ef4444)', fontSize: 11, lineHeight: 1.5 }}>
+                {destroyError}
+              </div>
+            )}
+            <div style={{ display: 'flex', gap: 8, marginTop: 15 }}>
+              <button
+                onClick={() => void confirmDestroy()}
+                disabled={destroyConfirmValue !== '销毁' || destroying}
+                style={{
+                  ...confirmBtnStyle,
+                  opacity: destroyConfirmValue === '销毁' && !destroying ? 1 : 0.45,
+                  cursor: destroyConfirmValue === '销毁' && !destroying ? 'pointer' : 'not-allowed',
+                }}
+              >
+                {destroying ? '正在销毁…' : '永久销毁'}
+              </button>
+              <button
+                onClick={() => { setSessionToDestroy(null); setDestroyError(''); }}
+                disabled={destroying}
+                style={cancelBtnStyle}
+              >
                 取消
               </button>
             </div>
@@ -920,8 +1104,42 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
     && prevProps.activeExecLabel === nextProps.activeExecLabel
     && prevProps.activeExecMode === nextProps.activeExecMode
     && prevProps.activeBackendId === nextProps.activeBackendId
-    && prevProps.activeCodexRemoteHost === nextProps.activeCodexRemoteHost;
+    && prevProps.activeCodexRemoteHost === nextProps.activeCodexRemoteHost
+    && prevProps.sessionLimit === nextProps.sessionLimit;
 });
+
+const SESSION_COLOR_PRESETS = [
+  { id: '', label: '无', background: 'var(--theme-bg-secondary, #f6f8fa)' },
+  { id: 'ocean', label: '海蓝', background: 'linear-gradient(110deg, #0284c7, #2563eb)' },
+  { id: 'violet', label: '星紫', background: 'linear-gradient(110deg, #7c3aed, #c026d3)' },
+  { id: 'sunset', label: '晚霞', background: 'linear-gradient(110deg, #ea580c, #e11d48)' },
+  { id: 'forest', label: '森林', background: 'linear-gradient(110deg, #15803d, #0f766e)' },
+  { id: 'amber', label: '琥珀', background: 'linear-gradient(110deg, #b45309, #ca8a04)' },
+  { id: 'rose', label: '玫瑰', background: 'linear-gradient(110deg, #be123c, #9333ea)' },
+] as const;
+
+const SESSION_ROW_GRADIENTS: Record<string, string> = {
+  ocean: 'linear-gradient(105deg, rgba(2,132,199,.24), rgba(37,99,235,.10))',
+  violet: 'linear-gradient(105deg, rgba(124,58,237,.25), rgba(192,38,211,.10))',
+  sunset: 'linear-gradient(105deg, rgba(234,88,12,.24), rgba(225,29,72,.10))',
+  forest: 'linear-gradient(105deg, rgba(21,128,61,.24), rgba(15,118,110,.10))',
+  amber: 'linear-gradient(105deg, rgba(180,83,9,.25), rgba(202,138,4,.10))',
+  rose: 'linear-gradient(105deg, rgba(190,18,60,.24), rgba(147,51,234,.10))',
+};
+
+function sortSessionsByPriority(a: Session, b: Session): number {
+  const pinnedOrder = Number(!!b.pinned) - Number(!!a.pinned);
+  return pinnedOrder || (Number(b.updatedAt || 0) - Number(a.updatedAt || 0));
+}
+
+function getSessionRowBackground(presetId: string, isActive: boolean): string {
+  const gradient = SESSION_ROW_GRADIENTS[presetId];
+  if (gradient && isActive) {
+    return `linear-gradient(rgba(122,162,247,.13), rgba(122,162,247,.13)), ${gradient}`;
+  }
+  if (gradient) return gradient;
+  return isActive ? 'var(--theme-accent-bg, #7aa2f726)' : 'transparent';
+}
 
 // Simple color mapping for backend badges
 // Using solid colors that work on both light and dark backgrounds
@@ -1012,13 +1230,98 @@ const newBtnStyle: React.CSSProperties = {
   transition: 'all 0.15s ease',
 };
 
-const itemStyle: React.CSSProperties = {
-  padding: '10px 12px',
-  borderRadius: 8,
+const searchWrapStyle: React.CSSProperties = {
+  height: 30,
+  margin: '0 9px 6px',
+  padding: '0 8px',
+  display: 'flex',
+  alignItems: 'center',
+  gap: 6,
+  border: '1px solid var(--theme-border, rgba(0,0,0,.12))',
+  borderRadius: 7,
+  background: 'var(--theme-input-bg, rgba(255,255,255,.04))',
+  color: 'var(--theme-text-muted, #656d76)',
+};
+
+const searchInputStyle: React.CSSProperties = {
+  flex: 1,
+  minWidth: 0,
+  border: 'none',
+  outline: 'none',
+  background: 'transparent',
+  color: 'var(--theme-text, #e2e3ea)',
+  fontSize: 12,
+  fontFamily: 'inherit',
+};
+
+const searchClearStyle: React.CSSProperties = {
+  width: 18,
+  height: 18,
+  padding: 0,
+  border: 'none',
+  borderRadius: 4,
+  background: 'transparent',
+  color: 'var(--theme-text-muted, #656d76)',
   cursor: 'pointer',
-  marginBottom: 4,
+  lineHeight: '16px',
+};
+
+const itemStyle: React.CSSProperties = {
+  minHeight: 36,
+  padding: '5px 6px',
+  border: '1px solid transparent',
+  borderRadius: 7,
+  cursor: 'pointer',
+  marginBottom: 2,
   position: 'relative',
-  transition: 'background 0.15s',
+  display: 'flex',
+  alignItems: 'center',
+  gap: 6,
+  transition: 'background 0.15s, box-shadow 0.15s',
+};
+
+const sessionTitleStyle: React.CSSProperties = {
+  flex: 1,
+  minWidth: 0,
+  display: 'flex',
+  alignItems: 'center',
+  gap: 4,
+  fontSize: 12.5,
+  lineHeight: 1,
+};
+
+const compactActionsStyle: React.CSSProperties = {
+  flexShrink: 0,
+  display: 'flex',
+  alignItems: 'center',
+  justifyContent: 'flex-end',
+  gap: 1,
+};
+
+const compactBackendStyle: React.CSSProperties = {
+  maxWidth: 58,
+  padding: '2px 5px',
+  borderRadius: 4,
+  overflow: 'hidden',
+  textOverflow: 'ellipsis',
+  whiteSpace: 'nowrap',
+  color: 'var(--theme-text-muted, #656d76)',
+  fontSize: 9,
+  lineHeight: '14px',
+};
+
+const completedDotStyle: React.CSSProperties = {
+  width: 16,
+  height: 16,
+  padding: 0,
+  border: 'none',
+  borderRadius: '50%',
+  background: '#ef4444',
+  color: '#fff',
+  cursor: 'pointer',
+  fontSize: 9,
+  fontWeight: 700,
+  flexShrink: 0,
 };
 
 const groupHeaderStyle: React.CSSProperties = {
@@ -1050,8 +1353,8 @@ const showMoreBtnStyle: React.CSSProperties = {
 };
 
 const actionBtnStyle: React.CSSProperties = {
-  width: 22,
-  height: 22,
+  width: 21,
+  height: 21,
   borderRadius: 4,
   border: 'none',
   background: 'transparent',
@@ -1064,7 +1367,8 @@ const actionBtnStyle: React.CSSProperties = {
 };
 
 const renameInputStyle: React.CSSProperties = {
-  width: '100%',
+  flex: 1,
+  minWidth: 0,
   fontSize: 13,
   fontFamily: 'inherit',
   background: 'var(--theme-input-bg, #ffffff)',
@@ -1137,4 +1441,29 @@ const cancelBtnStyle: React.CSSProperties = {
   flex: 1, padding: 10, borderRadius: 8,
   background: 'var(--theme-bg-secondary, #f6f8fa)', border: '1px solid var(--theme-border, rgba(0,0,0,0.15))',
   color: 'var(--theme-text, #1f2328)', fontSize: 14, cursor: 'pointer',
+};
+
+const colorGridStyle: React.CSSProperties = {
+  display: 'grid',
+  gridTemplateColumns: 'repeat(4, minmax(0, 1fr))',
+  gap: 9,
+};
+
+const colorPresetStyle: React.CSSProperties = {
+  height: 44,
+  border: '1px solid var(--theme-border, rgba(0,0,0,.15))',
+  borderRadius: 8,
+  cursor: 'pointer',
+};
+
+const destroyPathStyle: React.CSSProperties = {
+  padding: '9px 10px',
+  borderRadius: 7,
+  border: '1px solid rgba(239,68,68,.28)',
+  background: 'rgba(239,68,68,.07)',
+  color: 'var(--theme-text, #e2e3ea)',
+  fontFamily: 'ui-monospace, SFMono-Regular, Consolas, monospace',
+  fontSize: 11,
+  lineHeight: 1.45,
+  overflowWrap: 'anywhere',
 };

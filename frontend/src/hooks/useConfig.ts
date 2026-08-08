@@ -14,6 +14,7 @@ export interface AppConfig {
   ttsVoice: string;
   ttsRate: number;
   workspaceKitsEnabled: boolean;
+  sidebarSessionLimit: number;
 }
 
 const DEFAULT_CONFIG: AppConfig = {
@@ -27,6 +28,7 @@ const DEFAULT_CONFIG: AppConfig = {
   ttsVoice: 'zh-CN-XiaoxiaoNeural',
   ttsRate: 0,
   workspaceKitsEnabled: true,
+  sidebarSessionLimit: 25,
 };
 
 // Theme color schemes
@@ -200,6 +202,10 @@ export function useConfig() {
       if (savedConfig && Object.keys(savedConfig).length > 0) {
         // ★ 迁移已删除的主题名
         if (savedConfig.theme === 'ocean') savedConfig.theme = 'midnight';
+        const sidebarLimit = Number(savedConfig.sidebarSessionLimit);
+        savedConfig.sidebarSessionLimit = Number.isFinite(sidebarLimit) && sidebarLimit >= 5
+          ? Math.min(500, Math.trunc(sidebarLimit))
+          : 25;
         setConfig((prev) => ({ ...prev, ...savedConfig }));
       }
       setLoaded(true);

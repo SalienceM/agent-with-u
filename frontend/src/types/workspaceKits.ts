@@ -1,11 +1,35 @@
 export type KitRunStatus =
-  | 'queued' | 'running' | 'evaluating'
+  | 'queued' | 'running' | 'waiting_client' | 'evaluating'
   | 'succeeded' | 'failed' | 'error' | 'cancelled';
+
+export type KitExecutionTarget = 'executor' | 'client';
+export type KitStepType = 'command' | 'file_push' | 'kit_call';
+
+export interface KitStepSpec {
+  id: string;
+  type: KitStepType;
+  target: KitExecutionTarget;
+  title: string;
+  shell?: 'powershell' | 'cmd' | 'bash';
+  command?: string;
+  cwd?: string;
+  timeoutSeconds?: number;
+  assertions?: KitAssertionSpec[];
+  config?: {
+    source?: string;
+    destination?: string;
+    overwrite?: boolean;
+    sha256?: string;
+    [key: string]: unknown;
+  };
+  kitId?: string;
+  inputs?: Record<string, unknown>;
+}
 
 export interface KitInputSpec {
   key: string;
   label?: string;
-  type?: 'text' | 'number' | 'boolean' | 'select';
+  type?: 'text' | 'number' | 'boolean' | 'select' | 'file';
   required?: boolean;
   default?: unknown;
   options?: string[];
@@ -30,10 +54,44 @@ export interface KitOutputSpec {
   mediaType?: string;
 }
 
+export interface KitVersion {
+  id: string;
+  version: string;
+  source: 'create' | 'legacy' | 'manual' | 'ai_compile' | 'ai_optimize' | string;
+  note: string;
+  createdAt: number;
+  isActive?: boolean;
+  snapshot?: Record<string, unknown>;
+}
+
+export interface KitOptimizationMessage {
+  id: string;
+  role: 'user' | 'assistant';
+  content: string;
+  backendId: string;
+  status: 'answering' | 'done' | 'error';
+  proposal?: Record<string, unknown> | null;
+  warnings: string[];
+  questions: string[];
+  ready: boolean;
+  baseVersionId: string;
+  finalizedVersionId: string;
+  createdAt: number;
+}
+
 export interface WorkspaceKit {
   id: string;
   title: string;
   description: string;
+  objective: string;
+  successCriteria: string;
+  safetyConstraints: string;
+  references: string[];
+  implementationSummary: string;
+  generationWarnings: string[];
+  generatedByAi: boolean;
+  executionTarget: KitExecutionTarget;
+  steps: KitStepSpec[];
   command: string;
   shell: 'powershell' | 'cmd' | 'bash';
   cwd: string;
@@ -56,8 +114,35 @@ export interface WorkspaceKit {
   enabled: boolean;
   controlMode: 'ai' | 'human' | 'shared';
   lastRunId: string;
+  versions?: KitVersion[];
+  activeVersionId?: string;
+  optimizationMessages?: KitOptimizationMessage[];
+  optimizationMessageCount?: number;
+  optimizationBackendId?: string;
   createdAt: number;
   updatedAt: number;
+}
+
+export interface KitGenerationRequest {
+  objective: string;
+  successCriteria?: string;
+  safetyConstraints?: string;
+  references?: string[];
+  clientSources?: string[];
+  existingKit?: Partial<WorkspaceKit>;
+  backendId?: string;
+}
+
+export interface KitGenerationResult {
+  status: 'ok' | 'needs_input' | 'error';
+  ready?: boolean;
+  kit?: WorkspaceKit;
+  implementationSummary?: string;
+  safetySummary?: string;
+  verificationSummary?: string;
+  warnings?: string[];
+  questions?: string[];
+  message?: string;
 }
 
 export interface KitAssertionResult {
@@ -84,11 +169,36 @@ export interface KitRun {
   stdout: string;
   stderr: string;
   assertions: KitAssertionResult[];
+  steps: KitStepRun[];
+  currentStep: number;
   artifactIds: string[];
   error: string;
   startedAt?: number | null;
   endedAt?: number | null;
   createdAt: number;
+}
+
+export interface KitStepRun {
+  id: string;
+  type: KitStepType;
+  target: KitExecutionTarget;
+  title: string;
+  sourceKitId: string;
+  status: 'pending' | 'running' | 'waiting_client' | 'succeeded' | 'failed'
+    | 'error' | 'cancelled' | 'skipped';
+  shell: 'powershell' | 'cmd' | 'bash';
+  command: string;
+  cwd: string;
+  timeoutSeconds: number;
+  config: Record<string, any>;
+  inputs: Record<string, unknown>;
+  exitCode?: number | null;
+  stdout: string;
+  stderr: string;
+  assertions: KitAssertionResult[];
+  error: string;
+  startedAt?: number | null;
+  endedAt?: number | null;
 }
 
 export interface KitArtifact {

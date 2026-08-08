@@ -30,7 +30,11 @@ export const ByTheWayDrawer: React.FC<Props> = ({ sessionId, open, onClose, onSe
   useEffect(() => {
     if (!sessionId) return;
     api.chatAsideList(sessionId).then((r) => {
-      if (r.status === 'ok') { setAsides(r.asides || []); setAsideBackendId(r.asideBackendId || ''); }
+      if (r.status === 'ok') {
+        setAsides(r.asides || []);
+        setAsideBackendId(r.asideBackendId || '');
+        setBusy((r.asides || []).some((a: AsideT) => a.status === 'answering'));
+      }
     });
     const un1 = api.onChatAsideUpdated((data) => {
       if (data.sessionId !== sessionId) return;
@@ -39,7 +43,10 @@ export const ByTheWayDrawer: React.FC<Props> = ({ sessionId, open, onClose, onSe
       // 完成的 turn 清掉其 live 缓冲
       setLive((prev) => {
         const next = { ...prev };
-        for (const a of (data.asides || [])) if (a.status !== 'answering') delete next[a.id];
+        const answeringIds = new Set(
+          (data.asides || []).filter((a: AsideT) => a.status === 'answering').map((a: AsideT) => a.id),
+        );
+        for (const id of Object.keys(next)) if (!answeringIds.has(id)) delete next[id];
         return next;
       });
       setBusy((data.asides || []).some((a: AsideT) => a.status === 'answering'));
@@ -60,6 +67,18 @@ export const ByTheWayDrawer: React.FC<Props> = ({ sessionId, open, onClose, onSe
     else { setBusy(false); if (r.message) alert(r.message); }
   }, [draft, images, busy, sessionId, clearImages]);
 
+  const clearHistory = useCallback(async () => {
+    if (busy || asides.length === 0) return;
+    if (!window.confirm(`确认清空这 ${asides.length} 条 BTW 旁路问答历史？\n主对话不会受影响。`)) return;
+    const result = await api.chatAsideClear(sessionId);
+    if (result.status !== 'ok') {
+      alert(result.message || 'BTW 历史清空失败');
+      return;
+    }
+    setAsides([]);
+    setLive({});
+  }, [busy, asides.length, sessionId]);
+
   if (!open) return null;
 
   return (
@@ -68,6 +87,13 @@ export const ByTheWayDrawer: React.FC<Props> = ({ sessionId, open, onClose, onSe
         <div style={head}>
           <span style={{ fontSize: 13.5, fontWeight: 700, color: 'var(--theme-text)' }}>💬 By the way · 旁路问答</span>
           <div style={{ flex: 1 }} />
+          {asides.length > 0 && (
+            <button onClick={clearHistory} disabled={busy}
+              style={{ ...clearBtn, opacity: busy ? 0.45 : 1, cursor: busy ? 'not-allowed' : 'pointer' }}
+              title={busy ? '回答完成后可清空' : '清空 BTW 历史'}>
+              清空
+            </button>
+          )}
           <button onClick={onClose} style={xBtn}>✕</button>
         </div>
         <div style={subhead}>
@@ -161,6 +187,7 @@ const head: React.CSSProperties = { display: 'flex', alignItems: 'center', paddi
 const subhead: React.CSSProperties = { fontSize: 11, color: 'var(--theme-text-muted)', padding: '0 14px 10px', borderBottom: '1px solid var(--theme-border)' };
 const modelSel: React.CSSProperties = { flex: 1, fontSize: 11, padding: '3px 6px', borderRadius: 6, border: '1px solid var(--theme-border)', background: 'var(--theme-bg-secondary)', color: 'var(--theme-text)', cursor: 'pointer' };
 const xBtn: React.CSSProperties = { background: 'none', border: 'none', cursor: 'pointer', color: 'var(--theme-text-muted)', fontSize: 14 };
+const clearBtn: React.CSSProperties = { padding: '3px 7px', borderRadius: 5, border: '1px solid rgba(239,68,68,.35)', background: 'rgba(239,68,68,.08)', color: 'var(--theme-error, #ef4444)', fontSize: 10.5 };
 const list: React.CSSProperties = { flex: 1, overflowY: 'auto', padding: '10px 14px', display: 'flex', flexDirection: 'column', gap: 12 };
 const turn: React.CSSProperties = { display: 'flex', flexDirection: 'column', gap: 6, paddingBottom: 10, borderBottom: '1px dashed var(--theme-border)' };
 const qRow: React.CSSProperties = { display: 'flex', gap: 7, alignItems: 'flex-start' };

@@ -19,6 +19,7 @@ export interface SeqTaskT {
   imageCount?: number;
   textAttachments?: any[];
   textAttachmentCount?: number;
+  deliveryMode?: 'redirect';
   status: string;
   createdAt?: number;
 }
@@ -29,10 +30,15 @@ interface Props {
   chainActive?: boolean;   // false 通常表示应用重启后保留的队列尚未恢复
   isStreaming: boolean;
   onSendNext: () => void;
+  canSteer?: boolean;
+  onSteerTask?: (taskId: string) => Promise<{ status: string; message?: string }>;
 }
 
-export const SeqTaskPanel: React.FC<Props> = ({ sessionId, tasks, chainActive, isStreaming, onSendNext }) => {
-  const pending = tasks.filter((t) => t.status === 'pending');
+export const SeqTaskPanel: React.FC<Props> = ({
+  sessionId, tasks, chainActive, isStreaming, onSendNext, canSteer, onSteerTask,
+}) => {
+  const pending = tasks.filter((t) => t.status === 'pending' || t.status === 'steering');
+  const readyPending = pending.filter((t) => t.status === 'pending');
   const sent = tasks.filter((t) => t.status === 'sent');
   const [open, setOpen] = useState(false);   // 默认收起,只留一条 slim 条
   const [editingId, setEditingId] = useState<string | null>(null);
@@ -41,6 +47,8 @@ export const SeqTaskPanel: React.FC<Props> = ({ sessionId, tasks, chainActive, i
   const [historyOpen, setHistoryOpen] = useState(false);  // ★ 历史条目折叠
   const [editingHistoryId, setEditingHistoryId] = useState<string | null>(null);  // ★ 历史图片编辑
   const [historyImages, setHistoryImages] = useState<EditImage[]>([]);
+  const [steeringIds, setSteeringIds] = useState<Set<string>>(() => new Set());
+  const [steerErrors, setSteerErrors] = useState<Record<string, string>>({});
   const editPasteRef = useRef<HTMLTextAreaElement>(null);
 
   // 首页“处理待办”直接落到目标会话并展开队列，避免用户再点第二次。
@@ -172,7 +180,37 @@ export const SeqTaskPanel: React.FC<Props> = ({ sessionId, tasks, chainActive, i
     await api.seqtaskReorder(sessionId, ids);
   }, [pending, sessionId]);
 
-  const canSendNext = pending.length > 0 && !isStreaming;
+  const steerTask = useCallback(async (taskId: string) => {
+    if (!onSteerTask) return;
+    setSteeringIds((previous) => new Set(previous).add(taskId));
+    setSteerErrors((previous) => {
+      const next = { ...previous };
+      delete next[taskId];
+      return next;
+    });
+    try {
+      const result = await onSteerTask(taskId);
+      if (result.status !== 'ok') {
+        setSteerErrors((previous) => ({
+          ...previous,
+          [taskId]: result.message || '引导失败，消息仍保留在队列中',
+        }));
+      }
+    } catch (error) {
+      setSteerErrors((previous) => ({
+        ...previous,
+        [taskId]: String(error) || '引导失败，消息仍保留在队列中',
+      }));
+    } finally {
+      setSteeringIds((previous) => {
+        const next = new Set(previous);
+        next.delete(taskId);
+        return next;
+      });
+    }
+  }, [onSteerTask]);
+
+  const canSendNext = readyPending.length > 0 && !isStreaming;
 
   return (
     <div style={wrap}>
@@ -242,8 +280,29 @@ export const SeqTaskPanel: React.FC<Props> = ({ sessionId, tasks, chainActive, i
                 </div>
               ) : (
                 <div style={{ flex: 1, minWidth: 0 }}
-                  onClick={() => startEdit(t)} title="点击编辑">
-                  <div style={taskText}>{t.text || <span style={{ color: 'var(--theme-text-muted)' }}>（仅附件）</span>}</div>
+                  onClick={() => { if (t.status === 'pending') startEdit(t); }}
+                  title={t.status === 'pending' ? '点击编辑' : '正在引导当前轮'}>
+                  <div style={taskLine}>
+                    <span style={taskText}>{t.text || <span style={{ color: 'var(--theme-text-muted)' }}>（仅附件）</span>}</span>
+                    {(steeringIds.has(t.id) || t.status === 'steering' || (canSteer && t.status === 'pending')) && (
+                      <button
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          void steerTask(t.id);
+                        }}
+                        disabled={steeringIds.has(t.id) || t.status === 'steering'}
+                        style={{
+                          ...steerBtn,
+                          opacity: steeringIds.has(t.id) || t.status === 'steering' ? 0.6 : 1,
+                          cursor: steeringIds.has(t.id) || t.status === 'steering' ? 'wait' : 'pointer',
+                        }}
+                        title="从 Seq 取出这条消息，立即引导当前 Codex 回答"
+                      >
+                        {steeringIds.has(t.id) || t.status === 'steering' ? '引导中…' : '↪ 引导'}
+                      </button>
+                    )}
+                  </div>
+                  {steerErrors[t.id] && <div style={steerError}>{steerErrors[t.id]}</div>}
                   {!!(t.imageCount || t.images?.length) && (
                     <span style={imgBadge}>🖼️ {t.imageCount ?? t.images?.length}</span>
                   )}
@@ -261,10 +320,10 @@ export const SeqTaskPanel: React.FC<Props> = ({ sessionId, tasks, chainActive, i
                 </div>
               )}
               <div style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
-                <button onClick={() => move(i, -1)} disabled={i === 0} style={arrowBtn} title="上移">▲</button>
-                <button onClick={() => move(i, 1)} disabled={i === pending.length - 1} style={arrowBtn} title="下移">▼</button>
+                <button onClick={() => move(i, -1)} disabled={i === 0 || t.status === 'steering'} style={arrowBtn} title="上移">▲</button>
+                <button onClick={() => move(i, 1)} disabled={i === pending.length - 1 || t.status === 'steering'} style={arrowBtn} title="下移">▼</button>
               </div>
-              <button onClick={() => api.seqtaskRemove(sessionId, t.id)} style={removeBtn} title="删除">✕</button>
+              <button onClick={() => api.seqtaskRemove(sessionId, t.id)} disabled={t.status === 'steering'} style={removeBtn} title="删除">✕</button>
             </div>
           ))}
 
@@ -348,7 +407,10 @@ const autoHint: React.CSSProperties = { fontSize: 11, color: 'var(--theme-text-m
 const emptyHint: React.CSSProperties = { fontSize: 11.5, color: 'var(--theme-text-muted)', lineHeight: 1.6, padding: '4px 2px' };
 const card: React.CSSProperties = { display: 'flex', alignItems: 'flex-start', gap: 8, padding: '7px 9px', borderRadius: 8, background: 'var(--theme-bg-tertiary)', border: '1px solid var(--theme-border)' };
 const idxBadge: React.CSSProperties = { fontSize: 10.5, fontWeight: 700, color: 'var(--theme-text-muted)', minWidth: 16, textAlign: 'center', marginTop: 2 };
+const taskLine: React.CSSProperties = { display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 6 };
 const taskText: React.CSSProperties = { fontSize: 12.5, color: 'var(--theme-text)', lineHeight: 1.5, whiteSpace: 'pre-wrap', wordBreak: 'break-word', cursor: 'text' };
+const steerBtn: React.CSSProperties = { flexShrink: 0, fontSize: 10.5, fontWeight: 650, padding: '2px 7px', borderRadius: 999, border: '1px solid var(--theme-accent)', background: 'var(--theme-accent-bg)', color: 'var(--theme-accent)' };
+const steerError: React.CSSProperties = { marginTop: 3, fontSize: 10.5, color: 'var(--theme-error, #cf222e)', lineHeight: 1.35 };
 const imgBadge: React.CSSProperties = { fontSize: 10, color: 'var(--theme-text-muted)', marginTop: 3, display: 'inline-block' };
 const editArea: React.CSSProperties = { width: '100%', minHeight: 48, fontSize: 12.5, padding: 6, borderRadius: 6, border: '1px solid var(--theme-accent)', background: 'var(--theme-bg)', color: 'var(--theme-text)', resize: 'vertical', fontFamily: 'inherit', boxSizing: 'border-box' };
 const arrowBtn: React.CSSProperties = { fontSize: 9, lineHeight: 1, padding: '2px 4px', border: '1px solid var(--theme-border)', borderRadius: 4, background: 'var(--theme-bg)', color: 'var(--theme-text-muted)', cursor: 'pointer' };

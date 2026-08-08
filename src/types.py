@@ -159,6 +159,9 @@ class ChatMessage:
     tool_calls: Optional[list[ToolCallInfo]] = None
     thinking_blocks: Optional[list[ThinkingBlock]] = None
     streaming: bool = False
+    # Follow-up delivery semantics.  Kept on the message (not the backend)
+    # because it is part of the visible Session history.
+    delivery_mode: Optional[str] = None  # steer | redirect
 
     def to_dict(self) -> dict:
         d = {
@@ -180,6 +183,8 @@ class ChatMessage:
             d["toolCalls"] = [tc.to_dict() for tc in self.tool_calls]
         if self.thinking_blocks:
             d["thinkingBlocks"] = [tb.to_dict() for tb in self.thinking_blocks]
+        if self.delivery_mode in {"steer", "redirect"}:
+            d["deliveryMode"] = self.delivery_mode
         return d
 
 
@@ -232,18 +237,33 @@ class Session:
     abilities: Optional[dict] = None  # {"skills": ["skill-name"], "prompts": ["prompt-name"]}
     # ★ 会话类型：普通会话 / 可视化 loop 会话（loop 状态另存于 loops/<id>.json）
     session_type: str = "normal"  # "normal" | "loop"
+    # LOOP 当前所有权的轻量镜像。完整 stage 仍以 LoopState 为准；这个字段只用于
+    # 首屏路由，让人工接管像普通 session 一样直接打开，不必先传完整 stage。
+    loop_control_mode: Optional[str] = None  # None | "loop" | "manual"
+    # 侧栏外观属于 Session 元数据，而非某个浏览器客户端的偏好。
+    # sidebar_color 只保存受控预设 ID，前端负责映射成固定渐变，禁止任意 CSS。
+    pinned: bool = False
+    sidebar_color: str = ""
     # ★ 自动 AI commit + push：对话/Loop 结束时自动 stage-all → AI 生成 message → commit → push
     auto_commit: bool = False
     auto_commit_push: bool = False  # commit 后是否自动 push
     auto_commit_backend_id: Optional[str] = None  # AI commit 使用的后端（None = 跟随会话主模型）
 
-    def to_dict(self) -> dict:
+    def to_dict(self, message_limit: int = 0) -> dict:
+        """序列化 Session；message_limit>0 时只触碰最后 N 条消息。
+
+        旧实现先把全部消息（含 base64 图片/工具输出）转成 dict，再由 RPC 切片，
+        使“分页加载”仍是 O(全量)。这里在对象层先切片，首屏成本才真正与 N 成正比。
+        """
+        selected_messages = self.messages
+        if message_limit and message_limit > 0:
+            selected_messages = self.messages[-message_limit:]
         return {
             "id": self.id,
             "title": self.title,
             "createdAt": self.created_at,
             "updatedAt": self.updated_at,
-            "messages": [m.to_dict() for m in self.messages],
+            "messages": [m.to_dict() for m in selected_messages],
             "workingDir": self.working_dir,  # ★ Prominent: directory is primary
             "backendId": self.backend_id,
             "modelOverride": self.model_override,
@@ -261,6 +281,11 @@ class Session:
             "constraints": self.constraints,
             "abilities": self.abilities,
             "sessionType": self.session_type,
+            "loopControlMode": self.loop_control_mode,
+            "pinned": self.pinned,
+            "sidebarColor": self.sidebar_color,
+            "skipPermissions": self.skip_permissions,
+            "autoContinue": self.auto_continue,
             "autoCommit": self.auto_commit,
             "autoCommitPush": self.auto_commit_push,
             "autoCommitBackendId": self.auto_commit_backend_id,
@@ -283,6 +308,9 @@ class Session:
             "codexThreadAttached": self.codex_thread_attached,
             "abilities": self.abilities,
             "sessionType": self.session_type,
+            "loopControlMode": self.loop_control_mode,
+            "pinned": self.pinned,
+            "sidebarColor": self.sidebar_color,
             "autoCommit": self.auto_commit,
             "autoCommitPush": self.auto_commit_push,
             "autoCommitBackendId": self.auto_commit_backend_id,

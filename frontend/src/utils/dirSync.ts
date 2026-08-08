@@ -80,6 +80,9 @@ function wildcardToRegExp(pat: string): RegExp {
 export function isIgnored(rel: string, patterns: string[]): boolean {
   const r = rel.replace(/\\/g, '/');
   const segs = r.split('/').filter(Boolean);
+  // Session 文件传输需要完整保留 Git 元数据；旧 syncIgnore 配置即便仍含
+  // `.git`（或更宽通配符）也不能把它静默排除。
+  if (segs.includes('.git')) return false;
   for (const pat of patterns) {
     const p = pat.trim().replace(/\/+$/, '');
     if (!p) continue;

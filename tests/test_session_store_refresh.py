@@ -76,6 +76,32 @@ class SessionStoreRefreshTests(unittest.TestCase):
                 if store._index_save_timer:
                     store._index_save_timer.cancel()
 
+    def test_loop_control_meta_update_does_not_rewrite_session_body(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "sessions"
+            with patch("src.backend.session_store.paths.sub", return_value=root):
+                store = SessionStore()
+                session = Session(
+                    id="loop-1", title="Loop", created_at=1.0, updated_at=1.0,
+                    messages=[ChatMessage(id="m1", role="user", content="large body")],
+                    working_dir=tmp, backend_id="backend-1", session_type="loop",
+                    loop_control_mode="loop",
+                )
+                store.save(session, async_=False)
+                session_path = root / "loop-1.json"
+                before = session_path.read_bytes()
+
+                session.loop_control_mode = "manual"
+                store.save_meta(session)
+
+                self.assertEqual(store.get_meta("loop-1")["loopControlMode"], "manual")
+                self.assertEqual(session_path.read_bytes(), before)
+                store._io_running = False
+                if store._io_thread:
+                    store._io_thread.join(timeout=1)
+                if store._index_save_timer:
+                    store._index_save_timer.cancel()
+
 
 if __name__ == "__main__":
     unittest.main()

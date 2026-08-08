@@ -1,5 +1,6 @@
 import React, { useState, useCallback, useEffect, useLayoutEffect, useRef, useMemo } from 'react';
 import { api } from '../api';
+import type { FollowUpCapabilities } from '../api';
 import { MessageBubble } from './MessageBubble';
 import { ChatInput } from './ChatInput';
 import { PermissionGate } from './PermissionGate';
@@ -93,6 +94,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
   themeBorderFocused,
   isMobile,
   onRequestNewSession,
+  onToast,
   onStreamingChange,
   onGhostStateChange,
   onAdjustFontSize,
@@ -104,7 +106,9 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
   const [activeSession, setActiveSession] = useState<any | null>(null);
   const [nodeBackends, setNodeBackends] = useState<any[]>(backends);
   const [loopControlMode, setLoopControlMode] = useState<'loop' | 'manual'>('loop');
+  const [loopRunning, setLoopRunning] = useState(false);
   const [loopSwitchBusy, setLoopSwitchBusy] = useState(false);
+  const [loopInspectorOpen, setLoopInspectorOpen] = useState(false);
   // 权限 state: 初值从 session 读,变化时持久化
   const [skipPermissions, setSkipPermissions] = useState(true);
   // 可见消息条数(切换 session / 切回历史时只显示最近几条)
@@ -122,16 +126,22 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
 
   // 加载 session 详情(切换 sessionId 时重新拉)
   useEffect(() => {
+    setLoopRunning(false);
     if (!sessionId) {
       setActiveSession(null);
       return;
     }
-    // 切换 session 时仅拉元数据(workingDir / backendId / skipPermissions 等),
-    // 历史消息由内部 useChat 走 INITIAL_LOAD_LIMIT 分页加载,不要在这再拉一次
-    // 全量,否则等于白费一次大 RPC。
+    // 只拉 index 元数据：不解析消息正文，也不读取完整 LOOP stage。
     let cancelled = false;
-    api.loadSession(sessionId, 1).then((session) => {
+    api.loadSessionMeta(sessionId).then((session) => {
       if (cancelled) return;
+      if (session?.sessionType === 'loop') {
+        setLoopControlMode(session.loopControlMode === 'manual' ? 'manual' : 'loop');
+        setLoopRunning(session.loopRunning === true);
+      } else {
+        setLoopControlMode('loop');
+        setLoopRunning(false);
+      }
       setActiveSession(session);
       if (session?.skipPermissions !== undefined) {
         setSkipPermissions(session.skipPermissions);
@@ -142,24 +152,26 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
     };
   }, [sessionId]);
 
-  // A LOOP session keeps its identity; only its current owner changes between
-  // the automated panel and the ordinary-chat manual takeover surface.
+  // 所有权首屏直接来自 Session index；这里只订阅后续变化，不再为判断 manual
+  // 拉取 1~10MB 的完整 LOOP stage（LoopPanel 自己按需加载摘要/详情）。
   useEffect(() => {
-    if (!sessionId || activeSession?.sessionType !== 'loop') {
+    if (!sessionId) {
       setLoopControlMode('loop');
+      setLoopRunning(false);
       return;
     }
-    let cancelled = false;
-    api.loopGetState(sessionId).then((state) => {
-      if (!cancelled) setLoopControlMode(state?.controlMode === 'manual' ? 'manual' : 'loop');
-    });
     const unsubscribe = api.onLoopUpdated((state: any) => {
       if (state?.sessionId === sessionId) {
         setLoopControlMode(state.controlMode === 'manual' ? 'manual' : 'loop');
+        setLoopRunning(state.running === true);
       }
     });
-    return () => { cancelled = true; unsubscribe(); };
-  }, [sessionId, activeSession?.sessionType]);
+    return unsubscribe;
+  }, [sessionId]);
+
+  useEffect(() => {
+    setLoopInspectorOpen(false);
+  }, [sessionId, loopControlMode]);
 
   // Backend configuration belongs to the executor that owns the session.
   useEffect(() => {
@@ -178,6 +190,11 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
 
   const effectiveBackends = activeSession?.execKey ? nodeBackends : backends;
   const activeBackendId = activeSession?.backendId || effectiveBackends[0]?.id || '';
+  const sessionMetaReady = !!sessionId && activeSession?.id === sessionId;
+  const automatedLoop = sessionMetaReady
+    && activeSession?.sessionType === 'loop'
+    && loopControlMode !== 'manual';
+  const chatHydrationEnabled = sessionMetaReady && !automatedLoop;
 
   const handleSessionRuntimeChange = useCallback(async (runtime: ModelRuntime) => {
     if (!sessionId) return { status: 'error', message: 'Session 不存在' };
@@ -218,13 +235,16 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
       modelOverride: activeSession?.modelOverride,
       reasoningEffort: activeSession?.reasoningEffort,
     },
+    chatHydrationEnabled,
   );
 
-  // ── 向 App 上报流式状态,用于侧边栏指示灯 ──
+  // ── 向 App 上报权威运行态,用于侧边栏指示灯 ──
+  // 自动 LOOP 为了秒开不会水合 chat，因此不能再只看 chat.isStreaming。
   useEffect(() => {
-    if (!sessionId || chat.resolvedSessionId !== sessionId) return;
-    onStreamingChange?.(sessionId, chat.isStreaming);
-  }, [sessionId, chat.isStreaming, chat.resolvedSessionId, onStreamingChange]);
+    if (!sessionId) return;
+    if (!automatedLoop && chat.resolvedSessionId !== sessionId) return;
+    onStreamingChange?.(sessionId, automatedLoop ? loopRunning : chat.isStreaming);
+  }, [sessionId, automatedLoop, loopRunning, chat.isStreaming, chat.resolvedSessionId, onStreamingChange]);
 
   // Attached Codex sessions are shared native threads, not static imports.
   // Only the focused, idle pane checks them.  The backend turns the frequent
@@ -285,6 +305,10 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
 
   // ── 序列任务队列 + by-the-way（普通 session 侧挂状态）──
   const [seqTasks, setSeqTasks] = useState<SeqTaskT[]>([]);
+  const [followUpCapabilities, setFollowUpCapabilities] = useState<FollowUpCapabilities>({
+    status: 'ok', queue: true, nativeSteer: false,
+    interruptResume: false, steerAttachments: false,
+  });
   const [byTheWayOpen, setByTheWayOpen] = useState(false);
   const [workspaceKitsOpen, setWorkspaceKitsOpen] = useState(false);
   useEffect(() => {
@@ -299,6 +323,19 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
   const [seqChainActive, setSeqChainActive] = useState(false);
   const seqChainSessionRef = useRef<string | null>(null);
   const setChain = useCallback((v: boolean) => { setSeqChainActive(v); }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    setFollowUpCapabilities({
+      status: 'ok', queue: true, nativeSteer: false,
+      interruptResume: false, steerAttachments: false,
+    });
+    if (!sessionId || !activeBackendId) return () => { cancelled = true; };
+    void api.getFollowUpCapabilities(sessionId).then((result) => {
+      if (!cancelled && result.status === 'ok') setFollowUpCapabilities(result);
+    });
+    return () => { cancelled = true; };
+  }, [sessionId, activeBackendId]);
 
   useEffect(() => {
     let cancelled = false;
@@ -383,7 +420,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
           // React state 要到下一次 render 才会回写这个 ref；先同步占位，封住
           // seqtaskUpdated 与 setIsStreaming(true) 之间的同帧二次派发窗口。
           isStreamingRef.current = true;
-          doSendRef.current(text, imgs, textAttachments);
+          doSendRef.current(text, imgs, textAttachments, r.task.deliveryMode || undefined);
         }
       } else if (seqPendingRef.current) {
         // done 帧会略早于后端任务清理/落盘；Relay 断线时 RPC 也可能暂不可用。
@@ -431,6 +468,13 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
       textAttachments?.length ? textAttachments : undefined,
     );
   }, [sessionId, setChain]);
+
+  const handleSteerSeqTask = useCallback(async (
+    taskId: string,
+  ): Promise<{ status: string; message?: string }> => {
+    if (!sessionId) return { status: 'error', message: 'Session 不存在' };
+    return api.steerSeqTask(sessionId, taskId);
+  }, [sessionId]);
 
   // 当前回答结束后自动取队首；dispatchNext 使用稳定 ref，并由 dispatchingRef
   // 防止流状态与队列事件同时到达造成重复派发。
@@ -609,7 +653,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
   // ★ Loop 会话：直接把 LoopPanel 作为这个 pane 的内容内嵌渲染（不是浮层，
   //   也没有自由聊天框）—— loop 的全部交互都在面板内（含 By the way 旁路问答），
   //   避免「聊天框 vs 面板」双入口、以及聊天与 loop 主线共用 agent 上下文的污染。
-  if (activeSession?.sessionType === 'loop' && loopControlMode !== 'manual') {
+  if (automatedLoop) {
     return (
       <div
         onClick={onFocus}
@@ -674,25 +718,61 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
           <span style={{ color: 'var(--theme-text-muted)' }}>对话、工具调用和文件操作会记录为一轮人工 LOOP。</span>
           <div style={{ flex: 1 }} />
           <button
-            disabled={chat.isStreaming || loopSwitchBusy || seqTasks.some((task) => task.status === 'pending')}
+            onClick={() => setLoopInspectorOpen(true)}
+            style={{
+              border: '1px solid var(--theme-border)', borderRadius: 7, padding: '5px 10px',
+              background: 'var(--theme-bg-tertiary)', color: 'var(--theme-text)', cursor: 'pointer',
+              whiteSpace: 'nowrap',
+            }}
+            title="只读查看完整 LOOP 面板，可切换面板/流程视图；不会退出人工接管"
+          >
+            🗂 LOOP 总览
+          </button>
+          <button
+            disabled={loopSwitchBusy}
             onClick={async () => {
-              if (chat.isStreaming || loopSwitchBusy) return;
+              if (loopSwitchBusy) return;
               setLoopSwitchBusy(true);
-              const result = await api.loopRelease(sessionId);
-              setLoopSwitchBusy(false);
-              if (result.status !== 'ok' && result.message) alert(result.message);
+              try {
+                // 本地 isStreaming 可能在中断/重连后残留；交还前以执行节点的
+                // 权威任务注册表为准，后端也会做同样的最终校验。
+                const runState = await api.getSessionRunState(sessionId);
+                if (runState.busy) {
+                  alert(runState.status === 'offline'
+                    ? '执行节点当前离线，暂时无法确认是否可交还 LOOP'
+                    : '回答仍在生成，结束或停止后才能交还 LOOP');
+                  return;
+                }
+                const result = await api.loopRelease(sessionId);
+                if (result.status !== 'ok' && result.message) alert(result.message);
+              } finally {
+                setLoopSwitchBusy(false);
+              }
             }}
             style={{
               border: '1px solid #d2992266', borderRadius: 7, padding: '5px 10px',
               background: '#d2992222', color: '#d29922',
-              cursor: chat.isStreaming ? 'not-allowed' : 'pointer',
-              opacity: (chat.isStreaming || loopSwitchBusy || seqTasks.some((task) => task.status === 'pending')) ? 0.55 : 1, whiteSpace: 'nowrap',
+              cursor: loopSwitchBusy ? 'wait' : 'pointer',
+              opacity: loopSwitchBusy ? 0.55 : 1, whiteSpace: 'nowrap',
             }}
-            title={chat.isStreaming ? '回答结束后才能交还 LOOP' : seqTasks.some((task) => task.status === 'pending') ? '请先执行完或清空序列任务' : '封存人工操作并返回 LOOP 面板'}
+            title="检查真实运行状态后，封存人工操作并返回 LOOP"
           >
             {loopSwitchBusy ? '交还中…' : '↩ 交还 LOOP'}
           </button>
         </div>
+      )}
+      {activeSession?.sessionType === 'loop' && loopControlMode === 'manual' && loopInspectorOpen && (
+        <LoopPanel
+          sessionId={sessionId}
+          onClose={() => setLoopInspectorOpen(false)}
+          inspectOnly
+          sessionBackendId={activeBackendId}
+          sessionRuntime={{
+            model: activeSession?.modelOverride,
+            reasoningEffort: activeSession?.reasoningEffort,
+          }}
+          backends={effectiveBackends}
+        />
       )}
       {/* ---- 消息列表 ---- */}
       <div style={{ flex: 1, position: 'relative', overflow: 'hidden' }}>
@@ -922,13 +1002,15 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
       )}
 
       {/* ---- 有待发任务时显示 slim 队列条；输入框无需显式切换模式 ---- */}
-      {sessionId && seqTasks.some((t) => t.status === 'pending') && (
+      {sessionId && seqTasks.some((t) => t.status === 'pending' || t.status === 'steering') && (
         <SeqTaskPanel
           sessionId={sessionId}
           tasks={seqTasks}
           chainActive={seqChainActive}
           isStreaming={chat.isStreaming}
           onSendNext={dispatchNext}
+          canSteer={chat.isStreaming && followUpCapabilities.nativeSteer}
+          onSteerTask={handleSteerSeqTask}
         />
       )}
 

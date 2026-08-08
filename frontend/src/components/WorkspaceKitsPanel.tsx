@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { api } from '../api';
 import type {
   WorkspaceKitState,
@@ -7,6 +7,9 @@ import type {
   KitInputSpec,
   KitAssertionSpec,
   KitOutputSpec,
+  KitGenerationResult,
+  KitVersion,
+  KitOptimizationMessage,
 } from '../types/workspaceKits';
 
 interface Props {
@@ -28,14 +31,23 @@ const EMPTY_STATE: WorkspaceKitState = {
 };
 
 const newDraft = (): Draft => ({
-  title: '新 Kit',
+  title: '',
   description: '',
-  command: "Write-Output 'hello kit'",
+  objective: '',
+  successCriteria: '',
+  safetyConstraints: '',
+  references: [],
+  implementationSummary: '',
+  generationWarnings: [],
+  generatedByAi: false,
+  executionTarget: 'executor',
+  steps: [],
+  command: '',
   shell: 'powershell',
   cwd: '.',
   timeoutSeconds: 300,
   inputs: [],
-  assertions: [{ type: 'exit_code', expected: 0, label: '进程正常退出' }],
+  assertions: [{ type: 'exit_code', expected: 0, label: '任务已完成并通过验证' }],
   outputs: [{ key: 'result', label: '运行结果', type: 'text', source: 'stdout' }],
   dependencies: [],
   schedule: { mode: 'manual', intervalSeconds: 300, nextRunAt: null },
@@ -47,6 +59,7 @@ const newDraft = (): Draft => ({
 const statusMeta: Record<string, { label: string; color: string }> = {
   queued: { label: '排队', color: '#8b949e' },
   running: { label: '执行中', color: '#d29922' },
+  waiting_client: { label: '等待客户端', color: '#d2a8ff' },
   evaluating: { label: '验收中', color: '#58a6ff' },
   succeeded: { label: '成功', color: '#3fb950' },
   failed: { label: '失败', color: '#f85149' },
@@ -67,6 +80,55 @@ function asDisplay(value: unknown): string {
   try { return JSON.stringify(value, null, 2); } catch { return String(value ?? ''); }
 }
 
+function formatDuration(start?: number | null, end?: number | null, now = Date.now() / 1000): string {
+  if (!start) return '—';
+  const seconds = Math.max(0, (end || now) - start);
+  if (seconds < 0.001) return '<1 ms';
+  if (seconds < 1) return `${Math.round(seconds * 1000)} ms`;
+  if (seconds < 10) return `${seconds.toFixed(1)} s`;
+  if (seconds < 60) return `${Math.round(seconds)} s`;
+  const minutes = Math.floor(seconds / 60);
+  const remain = Math.floor(seconds % 60);
+  if (minutes < 60) return `${minutes}m ${String(remain).padStart(2, '0')}s`;
+  const hours = Math.floor(minutes / 60);
+  return `${hours}h ${String(minutes % 60).padStart(2, '0')}m`;
+}
+
+function defaultInputsOf(kit: WorkspaceKit): Record<string, unknown> {
+  const defaults: Record<string, unknown> = {};
+  kit.inputs.forEach((spec) => {
+    if (spec.default !== undefined) defaults[spec.key] = spec.default;
+  });
+  return defaults;
+}
+
+function isActiveRun(run?: KitRun): boolean {
+  return !!run && ['queued', 'running', 'waiting_client', 'evaluating'].includes(run.status);
+}
+
+function normalizeKitState(sessionId: string, next: Partial<WorkspaceKitState>): WorkspaceKitState {
+  return {
+    sessionId,
+    kits: (next.kits || []).map((kit) => ({
+      ...kit,
+      executionTarget: kit.executionTarget || 'executor',
+      steps: kit.steps || [],
+      versions: kit.versions || [],
+      optimizationMessages: kit.optimizationMessages || [],
+    })),
+    runs: (next.runs || []).map((run) => ({
+      ...run,
+      steps: run.steps || [],
+      currentStep: run.currentStep || 0,
+    })),
+    artifacts: next.artifacts || [],
+    dataMarket: next.dataMarket || [],
+    terminalConnectedKitIds: next.terminalConnectedKitIds || [],
+    createdAt: next.createdAt,
+    updatedAt: next.updatedAt,
+  };
+}
+
 const FieldLabel: React.FC<{ children: React.ReactNode }> = ({ children }) => (
   <div style={{ fontSize: 11, color: 'var(--theme-text-muted)', marginBottom: 5 }}>{children}</div>
 );
@@ -74,12 +136,16 @@ const FieldLabel: React.FC<{ children: React.ReactNode }> = ({ children }) => (
 export const WorkspaceKitsPanel: React.FC<Props> = ({ sessionId, open, onClose }) => {
   const [state, setState] = useState<WorkspaceKitState>({ ...EMPTY_STATE, sessionId });
   const [selectedId, setSelectedId] = useState('');
+  const [detailOpen, setDetailOpen] = useState(false);
+  const [optimizerKitId, setOptimizerKitId] = useState('');
   const [draft, setDraft] = useState<Draft | null>(null);
   const [view, setView] = useState<View>('kits');
   const [inputs, setInputs] = useState<Record<string, unknown>>({});
   const [terminalCommand, setTerminalCommand] = useState('');
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState<{ kind: 'error' | 'ok'; text: string } | null>(null);
+  const [clock, setClock] = useState(() => Date.now() / 1000);
+  const clientClaims = useRef(new Set<string>());
 
   useEffect(() => {
     if (!open) return;
@@ -90,21 +156,12 @@ export const WorkspaceKitsPanel: React.FC<Props> = ({ sessionId, open, onClose }
         return;
       }
       const next = result as WorkspaceKitState & { status: string };
-      setState({
-        sessionId,
-        kits: next.kits || [],
-        runs: next.runs || [],
-        artifacts: next.artifacts || [],
-        dataMarket: next.dataMarket || [],
-        terminalConnectedKitIds: next.terminalConnectedKitIds || [],
-        createdAt: next.createdAt,
-        updatedAt: next.updatedAt,
-      });
+      setState(normalizeKitState(sessionId, next));
       setSelectedId((current) => current || next.kits?.[0]?.id || '');
     });
     const off = api.onKitUpdated((next) => {
       if (next.sessionId !== sessionId) return;
-      setState(next);
+      setState(normalizeKitState(sessionId, next));
       setSelectedId((current) => current || next.kits[0]?.id || '');
     });
     return () => { cancelled = true; off(); };
@@ -113,12 +170,106 @@ export const WorkspaceKitsPanel: React.FC<Props> = ({ sessionId, open, onClose }
   useEffect(() => {
     setState({ ...EMPTY_STATE, sessionId });
     setSelectedId('');
+    setDetailOpen(false);
+    setOptimizerKitId('');
     setDraft(null);
     setInputs({});
     setNotice(null);
   }, [sessionId]);
 
+  useEffect(() => {
+    if (!open || !state.runs.some(isActiveRun)) return;
+    setClock(Date.now() / 1000);
+    const timer = window.setInterval(() => setClock(Date.now() / 1000), 250);
+    return () => window.clearInterval(timer);
+  }, [open, state.runs]);
+
+  useEffect(() => {
+    if (!open) return;
+    const waitingKeys = new Set<string>();
+    for (const run of state.runs) {
+      if (run.status !== 'waiting_client') continue;
+      const step = run.steps?.[run.currentStep];
+      if (!step || !['waiting_client', 'running'].includes(step.status)) continue;
+      const key = `${run.id}:${step.id}`;
+      waitingKeys.add(key);
+      if (clientClaims.current.has(key)) continue;
+      clientClaims.current.add(key);
+      void (async () => {
+        try {
+          const resumed = await api.kitResume(sessionId, run.id);
+          if (resumed.status !== 'ok') throw new Error(resumed.message || '无法恢复 Kit 编排');
+          const resumedStep = resumed.run?.steps?.[resumed.run.currentStep] || step;
+          // 后端任务仍存活且步骤正被别的窗口执行：只观察，不抢占。若租约
+          // 过期，后端会重新发 waiting_client 状态并触发下一次领取。
+          if (resumedStep.status !== 'waiting_client') {
+            clientClaims.current.delete(key);
+            return;
+          }
+          if (resumedStep.type === 'command') {
+            const claimed = await api.kitClientStepStart(sessionId, run.id, resumedStep.id);
+            if (claimed.status !== 'ok') {
+              if (claimed.status !== 'busy') throw new Error(claimed.message || '无法领取客户端步骤');
+              clientClaims.current.delete(key);
+              return;
+            }
+            const active = claimed.step || resumedStep;
+            try {
+              const result = await api.kitClientLocalCommand({
+                shell: active.shell,
+                command: active.command,
+                cwd: active.cwd,
+                timeoutSeconds: active.timeoutSeconds,
+                env: active.config?.env || {},
+              });
+              const completed = await api.kitClientStepComplete(sessionId, run.id, resumedStep.id, result);
+              if (completed.status !== 'ok') throw new Error(completed.message || '客户端命令回执失败');
+            } catch (error) {
+              await api.kitClientStepComplete(sessionId, run.id, resumedStep.id, {
+                error: error instanceof Error ? error.message : String(error),
+              });
+            }
+            return;
+          }
+          if (resumedStep.type === 'file_push') {
+            const source = String(resumedStep.config?.source || '');
+            if (!source) throw new Error('文件推送缺少客户端源路径');
+            const info = await api.kitClientLocalFileInfo(source);
+            const transferId = `kit_${crypto.randomUUID().replace(/-/g, '_')}`;
+            const started = await api.kitClientFileStart(
+              sessionId, run.id, resumedStep.id, transferId, info.size, info.sha256,
+            );
+            if (started.status !== 'ok') {
+              if ((started.message || '').includes('已被其他')) return;
+              throw new Error(started.message || '无法开始文件推送');
+            }
+            const chunkSize = 512 * 1024;
+            for (let offset = 0; offset < info.size; offset += chunkSize) {
+              const data = await api.kitClientLocalFileChunk(
+                source, offset, Math.min(chunkSize, info.size - offset),
+              );
+              const pushed = await api.kitClientFileChunk(
+                sessionId, run.id, resumedStep.id, transferId, offset, data,
+              );
+              if (pushed.status !== 'ok') throw new Error(pushed.message || '文件分块推送失败');
+            }
+            const finished = await api.kitClientFileFinish(sessionId, run.id, resumedStep.id, transferId);
+            if (finished.status !== 'ok') throw new Error(finished.message || '文件推送验收失败');
+          }
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          await api.kitClientStepComplete(sessionId, run.id, step.id, { error: message });
+          setNotice({ kind: 'error', text: `客户端步骤失败：${message}` });
+        }
+      })();
+    }
+    for (const key of clientClaims.current) {
+      if (!waitingKeys.has(key)) clientClaims.current.delete(key);
+    }
+  }, [open, sessionId, state.runs]);
+
   const selected = state.kits.find((kit) => kit.id === selectedId);
+  const optimizerKit = state.kits.find((kit) => kit.id === optimizerKitId);
   const lastRun = selected ? lastRunOf(state, selected) : undefined;
   const selectedRuns = useMemo(
     () => state.runs.filter((run) => run.kitId === selectedId).slice(-12).reverse(),
@@ -127,11 +278,7 @@ export const WorkspaceKitsPanel: React.FC<Props> = ({ sessionId, open, onClose }
 
   useEffect(() => {
     if (!selected) { setInputs({}); return; }
-    const defaults: Record<string, unknown> = {};
-    selected.inputs.forEach((spec) => {
-      if (spec.default !== undefined) defaults[spec.key] = spec.default;
-    });
-    setInputs(defaults);
+    setInputs(defaultInputsOf(selected));
   }, [selectedId]); // eslint-disable-line react-hooks/exhaustive-deps
 
   if (!open) return null;
@@ -150,18 +297,34 @@ export const WorkspaceKitsPanel: React.FC<Props> = ({ sessionId, open, onClose }
     }
     if (result.kit) setSelectedId(result.kit.id);
     setDraft(null);
+    setDetailOpen(true);
     setNotice({ kind: 'ok', text: 'Kit 已保存' });
   };
 
-  const runKit = async () => {
-    if (!selected) return;
+  const runKit = async (kit: WorkspaceKit, runInputs: Record<string, unknown>) => {
     setBusy(true);
     setNotice(null);
-    const result = await api.kitRun(sessionId, selected.id, inputs);
+    const result = await api.kitRun(sessionId, kit.id, runInputs);
     setBusy(false);
     if (result.status !== 'ok') {
       setNotice({ kind: 'error', text: result.message || '启动失败' });
     }
+  };
+
+  const quickRunKit = async (kit: WorkspaceKit) => {
+    const defaults = defaultInputsOf(kit);
+    const missingRequired = kit.inputs.some((spec) => (
+      !!spec.required && defaults[spec.key] === undefined && !spec.sourceKey
+    ));
+    if (missingRequired) {
+      setSelectedId(kit.id);
+      setInputs(defaults);
+      setDraft(null);
+      setDetailOpen(true);
+      setNotice({ kind: 'error', text: '这个 Kit 需要输入；已为你展开运行面板。' });
+      return;
+    }
+    await runKit(kit, defaults);
   };
 
   const terminalRun = async () => {
@@ -200,6 +363,11 @@ export const WorkspaceKitsPanel: React.FC<Props> = ({ sessionId, open, onClose }
             <div style={subtleStyle}>这个 Session 的标准配件、判言、视图窗与数据依赖</div>
           </div>
           <div style={{ display: 'flex', gap: 6 }}>
+            {view === 'kits' && (detailOpen || draft) && (
+              <button style={secondaryButton} onClick={() => { setDraft(null); setDetailOpen(false); }}>
+                ← 收起详情
+              </button>
+            )}
             <button style={tabButton(view === 'kits')} onClick={() => setView('kits')}>配件</button>
             <button style={tabButton(view === 'data')} onClick={() => setView('data')}>
               数据市场 {state.dataMarket.length ? `· ${state.dataMarket.length}` : ''}
@@ -218,12 +386,75 @@ export const WorkspaceKitsPanel: React.FC<Props> = ({ sessionId, open, onClose }
 
         {view === 'data' ? (
           <DataMarket state={state} />
+        ) : !detailOpen && !draft ? (
+          <div style={compactListStyle}>
+            <div style={compactListToolbar}>
+              <div>
+                <div style={sectionTitle}>Kits</div>
+                <div style={subtleStyle}>直接运行；需要输入或审计实现时再展开详情。</div>
+              </div>
+              <button style={primaryButton} onClick={() => { setDraft(newDraft()); setDetailOpen(true); }}>
+                ＋ 新建 Kit
+              </button>
+            </div>
+            {state.kits.length === 0 ? (
+              <div style={emptyMainStyle}>暂无配件。创建一个，把重复工作变成可验收的一键组件。</div>
+            ) : (
+              <div style={compactKitGrid}>
+                {state.kits.map((kit) => {
+                  const run = lastRunOf(state, kit);
+                  const meta = run ? statusMeta[run.status] : null;
+                  const running = isActiveRun(run);
+                  const stepCount = run?.steps?.length || kit.steps.length || 1;
+                  return (
+                    <article key={kit.id} style={compactKitCard}>
+                      <div style={{ display: 'flex', alignItems: 'flex-start', gap: 10 }}>
+                        <span style={{
+                          width: 9, height: 9, marginTop: 5, flex: '0 0 auto', borderRadius: '50%',
+                          background: meta?.color || '#6e7681',
+                          boxShadow: running ? `0 0 9px ${meta?.color}` : 'none',
+                        }} />
+                        <div style={{ flex: 1, minWidth: 0 }}>
+                          <div style={{ display: 'flex', alignItems: 'center', gap: 7, flexWrap: 'wrap' }}>
+                            <strong style={{ fontSize: 14, overflow: 'hidden', textOverflow: 'ellipsis' }}>{kit.title}</strong>
+                            {meta && <span style={{ ...statusPill, color: meta.color, borderColor: `${meta.color}66` }}>● {meta.label}</span>}
+                            {!kit.enabled && <span style={mutedPill}>停用</span>}
+                          </div>
+                          <div style={{ ...subtleStyle, marginTop: 6, lineHeight: 1.5, minHeight: 17 }}>
+                            {kit.description || kit.objective || '标准化 Session 配件'}
+                          </div>
+                          <div style={{ ...subtleStyle, display: 'flex', gap: 12, marginTop: 9, flexWrap: 'wrap' }}>
+                            <span>{stepCount} 个原子步</span>
+                            <span>{kit.executionTarget === 'client' ? '客户端' : '执行端默认'}</span>
+                            <span>{kit.schedule.mode === 'interval' ? `每 ${kit.schedule.intervalSeconds}s` : '手动'}</span>
+                            {run && <span>耗时 {formatDuration(run.startedAt, run.endedAt, clock)}</span>}
+                          </div>
+                        </div>
+                      </div>
+                      <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 7, marginTop: 13 }}>
+                        <button style={secondaryButton} onClick={() => setOptimizerKitId(kit.id)}>✨ 优化</button>
+                        <button style={secondaryButton} onClick={() => {
+                          setSelectedId(kit.id); setInputs(defaultInputsOf(kit)); setDraft(null); setDetailOpen(true);
+                        }}>详情</button>
+                        {running && run ? (
+                          <button style={dangerButton} onClick={() => api.kitCancel(sessionId, run.id)}>■ 停止</button>
+                        ) : (
+                          <button style={primaryButton} disabled={busy || !kit.enabled}
+                            onClick={() => quickRunKit(kit)}>▶ 运行</button>
+                        )}
+                      </div>
+                    </article>
+                  );
+                })}
+              </div>
+            )}
+          </div>
         ) : (
           <div style={bodyStyle}>
             <aside style={sidebarStyle}>
               <button
                 style={{ ...primaryButton, width: '100%', marginBottom: 10 }}
-                onClick={() => setDraft(newDraft())}
+                onClick={() => { setDraft(newDraft()); setDetailOpen(true); }}
               >＋ 新建 Kit</button>
               {state.kits.length === 0 && (
                 <div style={{ ...subtleStyle, padding: '18px 8px', textAlign: 'center' }}>
@@ -236,7 +467,7 @@ export const WorkspaceKitsPanel: React.FC<Props> = ({ sessionId, open, onClose }
                 return (
                   <button
                     key={kit.id}
-                    onClick={() => { setSelectedId(kit.id); setDraft(null); }}
+                    onClick={() => { setSelectedId(kit.id); setDraft(null); setDetailOpen(true); }}
                     style={{
                       ...kitListButton,
                       borderColor: selectedId === kit.id ? 'var(--theme-accent, #58a6ff)' : 'transparent',
@@ -246,7 +477,7 @@ export const WorkspaceKitsPanel: React.FC<Props> = ({ sessionId, open, onClose }
                     <span style={{
                       width: 8, height: 8, flex: '0 0 auto', borderRadius: '50%',
                       background: meta?.color || '#6e7681',
-                      boxShadow: run?.status === 'running' ? `0 0 8px ${meta?.color}` : 'none',
+                      boxShadow: ['running', 'waiting_client', 'evaluating'].includes(run?.status || '') ? `0 0 8px ${meta?.color}` : 'none',
                     }} />
                     <span style={{ minWidth: 0, flex: 1 }}>
                       <span style={{ display: 'block', overflow: 'hidden', textOverflow: 'ellipsis' }}>{kit.title}</span>
@@ -262,16 +493,17 @@ export const WorkspaceKitsPanel: React.FC<Props> = ({ sessionId, open, onClose }
 
             <main style={mainStyle}>
               {draft ? (
-                <KitEditor draft={draft} onChange={setDraft} onSave={saveDraft}
+                <KitEditor sessionId={sessionId} draft={draft} onChange={setDraft} onSave={saveDraft}
                   onCancel={() => setDraft(null)} busy={busy} />
               ) : selected ? (
                 <KitDetail
+                  sessionId={sessionId}
                   kit={selected}
                   run={lastRun}
                   runs={selectedRuns}
                   inputs={inputs}
                   onInputsChange={setInputs}
-                  onRun={runKit}
+                  onRun={() => runKit(selected, inputs)}
                   onCancel={(runId) => api.kitCancel(sessionId, runId)}
                   onEdit={() => setDraft({ ...selected })}
                   onDelete={deleteKit}
@@ -284,6 +516,8 @@ export const WorkspaceKitsPanel: React.FC<Props> = ({ sessionId, open, onClose }
                   onTerminalClose={() => api.kitTerminalClose(sessionId, selected.id)}
                   busy={busy}
                   dataMarket={state.dataMarket}
+                  now={clock}
+                  onOptimize={() => setOptimizerKitId(selected.id)}
                 />
               ) : (
                 <div style={emptyMainStyle}>选择或创建一个 Kit</div>
@@ -292,57 +526,188 @@ export const WorkspaceKitsPanel: React.FC<Props> = ({ sessionId, open, onClose }
           </div>
         )}
       </div>
+      {optimizerKit && (
+        <KitOptimizerPanel
+          sessionId={sessionId}
+          kit={optimizerKit}
+          onClose={() => setOptimizerKitId('')}
+        />
+      )}
     </div>
   );
 };
 
 const KitEditor: React.FC<{
+  sessionId: string;
   draft: Draft;
   onChange: (draft: Draft) => void;
   onSave: () => void;
   onCancel: () => void;
   busy: boolean;
-}> = ({ draft, onChange, onSave, onCancel, busy }) => {
+}> = ({ sessionId, draft, onChange, onSave, onCancel, busy }) => {
+  const [generating, setGenerating] = useState(false);
+  const [advancedOpen, setAdvancedOpen] = useState(false);
+  const [generation, setGeneration] = useState<KitGenerationResult | null>(null);
+  const [clientSources, setClientSources] = useState<string[]>(() => (
+    draft.steps
+      .filter((step) => step.type === 'file_push')
+      .map((step) => String(step.config?.source || ''))
+      .filter((source) => source && !source.includes('{{'))
+  ));
   const patch = (value: Partial<Draft>) => onChange({ ...draft, ...value });
   const setInputs = (inputs: KitInputSpec[]) => patch({ inputs });
   const setAssertions = (assertions: KitAssertionSpec[]) => patch({ assertions });
   const setOutputs = (outputs: KitOutputSpec[]) => patch({ outputs });
 
+  useEffect(() => {
+    setClientSources(
+      draft.steps
+        .filter((step) => step.type === 'file_push')
+        .map((step) => String(step.config?.source || ''))
+        .filter((source) => source && !source.includes('{{')),
+    );
+  }, [draft.id]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const addClientSource = async () => {
+    try {
+      const selected = await api.selectKitLocalFile();
+      if (selected) setClientSources((current) => Array.from(new Set([...current, selected])));
+    } catch (error) {
+      setGeneration({
+        status: 'error', ready: false,
+        message: error instanceof Error ? error.message : '无法选择客户端本地文件',
+      });
+    }
+  };
+
+  const compileWithAi = async () => {
+    if (!draft.objective.trim() || !draft.successCriteria.trim()) return;
+    setGenerating(true);
+    setGeneration(null);
+    try {
+      const result = await api.kitGenerate(sessionId, {
+        objective: draft.objective,
+        successCriteria: draft.successCriteria,
+        safetyConstraints: draft.safetyConstraints,
+        references: draft.references,
+        clientSources,
+        existingKit: draft.id ? draft : undefined,
+      });
+      setGeneration(result);
+      if (result.kit) {
+        const { lastRunId: _lastRunId, createdAt: _createdAt, updatedAt: _updatedAt, ...compiled } = result.kit;
+        onChange({ ...compiled, id: draft.id });
+      }
+      if (result.status !== 'ok') setAdvancedOpen(!!result.kit);
+    } catch (error) {
+      setGeneration({ status: 'error', ready: false, message: error instanceof Error ? error.message : 'AI Kit 编译失败' });
+    } finally {
+      setGenerating(false);
+    }
+  };
+
   return (
     <div style={{ padding: 18, overflow: 'auto', height: '100%', boxSizing: 'border-box' }}>
-      <div style={sectionTitle}>{draft.id ? '编辑 Kit' : '创建标准 Kit'}</div>
-      <div style={twoColumns}>
-        <label><FieldLabel>名称</FieldLabel>
-          <input style={inputStyle} value={draft.title}
-            onChange={(e) => patch({ title: e.target.value })} />
-        </label>
-        <label><FieldLabel>Shell</FieldLabel>
-          <select style={inputStyle} value={draft.shell}
-            onChange={(e) => patch({ shell: e.target.value as Draft['shell'] })}>
-            <option value="powershell">PowerShell</option>
-            <option value="cmd">CMD</option>
-            <option value="bash">Bash</option>
-          </select>
-        </label>
+      <div style={{ ...sectionTitle, marginBottom: 5 }}>{draft.id ? '重新定义 Kit' : '用自然语言创建 Kit'}</div>
+      <div style={{ ...subtleStyle, fontSize: 12, lineHeight: 1.6, marginBottom: 14 }}>
+        你定义任务、成功标准和安全边界；AI 检查当前 Session 工作区并编译实现。保存后每次点击都运行同一套确定性过程，最终状态由机器判言决定。
       </div>
-      <label style={blockLabel}><FieldLabel>说明</FieldLabel>
-        <input style={inputStyle} value={draft.description}
-          onChange={(e) => patch({ description: e.target.value })} />
+
+      <label style={blockLabel}><FieldLabel>任务 · 要完成什么 *</FieldLabel>
+        <textarea autoFocus style={{ ...inputStyle, minHeight: 78, resize: 'vertical', fontSize: 13 }}
+          placeholder="例如：关闭 start-amp.bat 启动的 CMD 窗口及其附属 Java 进程"
+          value={draft.objective}
+          onChange={(e) => patch({ objective: e.target.value })} />
       </label>
       <div style={twoColumns}>
-        <label><FieldLabel>Session 内工作目录</FieldLabel>
-          <input style={inputStyle} value={draft.cwd}
-            onChange={(e) => patch({ cwd: e.target.value })} />
+        <label style={blockLabel}><FieldLabel>成功 / 失败标准 *</FieldLabel>
+          <textarea style={{ ...inputStyle, minHeight: 92, resize: 'vertical' }}
+            placeholder="例如：目标窗口和所属 Java 全部消失为成功；找不到唯一目标或仍有残留为失败"
+            value={draft.successCriteria}
+            onChange={(e) => patch({ successCriteria: e.target.value })} />
         </label>
-        <label><FieldLabel>超时（秒）</FieldLabel>
-          <input style={inputStyle} type="number" min={1} value={draft.timeoutSeconds}
-            onChange={(e) => patch({ timeoutSeconds: Math.max(1, Number(e.target.value) || 300) })} />
+        <label style={blockLabel}><FieldLabel>安全边界 / 禁止事项</FieldLabel>
+          <textarea style={{ ...inputStyle, minHeight: 92, resize: 'vertical' }}
+            placeholder="例如：不得关闭其他 CMD 或 Java；目标不明确时必须拒绝执行"
+            value={draft.safetyConstraints}
+            onChange={(e) => patch({ safetyConstraints: e.target.value })} />
         </label>
       </div>
-      <label style={blockLabel}><FieldLabel>执行过程 · 用 {'{{input_key}}'} 引用标准输入</FieldLabel>
-        <textarea style={{ ...inputStyle, minHeight: 96, fontFamily: 'Consolas, monospace' }}
-          value={draft.command} onChange={(e) => patch({ command: e.target.value })} />
+      <label style={blockLabel}><FieldLabel>Session 执行端已有的文件或对象（可选，每行一个）</FieldLabel>
+        <textarea style={{ ...inputStyle, minHeight: 54, resize: 'vertical' }}
+          placeholder={'start-amp.bat\nlogs/amp.log\n窗口标题 AMP'}
+          value={draft.references.join('\n')}
+          onChange={(e) => patch({
+            references: e.target.value.split(/\r?\n/).map((value) => value.trim()).filter(Boolean),
+          })} />
       </label>
+
+      <section style={{ ...cardStyle, marginTop: 10 }}>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10 }}>
+          <div>
+            <div style={cardTitle}>客户端本地文件 → 当前 Session 执行端</div>
+            <div style={subtleStyle}>使用内建 file_push，不需要填写远程主机、端口、SSH 或密码。</div>
+          </div>
+          <button style={secondaryButton} onClick={addClientSource}>选择本地文件</button>
+        </div>
+        {clientSources.length > 0 ? (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 6, marginTop: 9 }}>
+            {clientSources.map((source) => (
+              <div key={source} style={{ ...versionRowStyle, padding: '5px 0' }}>
+                <code style={{ ...subtleStyle, flex: 1, overflowWrap: 'anywhere' }}>{source}</code>
+                <button style={dangerMini} onClick={() => setClientSources((items) => items.filter((item) => item !== source))}>×</button>
+              </div>
+            ))}
+          </div>
+        ) : (
+          <div style={{ ...subtleStyle, marginTop: 8 }}>
+            也可以不预选：AI 会生成“本地文件”运行输入，执行 Kit 时再选择文件。
+          </div>
+        )}
+      </section>
+
+      <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginTop: 14, flexWrap: 'wrap' }}>
+        <button style={{ ...primaryButton, fontSize: 13, padding: '9px 15px' }}
+          disabled={generating || busy || !draft.objective.trim() || !draft.successCriteria.trim()}
+          onClick={compileWithAi}>
+          {generating ? '✨ AI 正在检查并编译…' : (draft.command || draft.steps.length) ? '✨ AI 重新编译实现' : '✨ AI 生成标准 Kit'}
+        </button>
+        <span style={subtleStyle}>生成阶段不保存、不执行任务；先给你审核。</span>
+      </div>
+
+      {generation && (
+        <section style={{ ...cardStyle, borderColor: generation.ready ? 'rgba(63,185,80,.45)' : 'rgba(210,153,34,.55)' }}>
+          <div style={{ ...cardTitle, color: generation.ready ? '#56d364' : '#e3b341' }}>
+            {generation.ready ? '✓ AI 编译完成，可以保存' : '⚠ 尚未通过安全编译'}
+          </div>
+          {generation.message && <div style={{ fontSize: 12, lineHeight: 1.55 }}>{generation.message}</div>}
+          {!!generation.questions?.length && (
+            <div style={{ marginTop: 8, color: '#e3b341', fontSize: 12 }}>
+              {generation.questions.map((item, index) => <div key={index}>· 需要补充：{item}</div>)}
+            </div>
+          )}
+          {!!generation.warnings?.length && (
+            <div style={{ marginTop: 8, color: '#ff9b93', fontSize: 12 }}>
+              {generation.warnings.map((item, index) => <div key={index}>· 安全检查：{item}</div>)}
+            </div>
+          )}
+          {(generation.safetySummary || generation.verificationSummary) && (
+            <div style={{ ...subtleStyle, marginTop: 8, lineHeight: 1.55 }}>
+              {generation.safetySummary && <div>范围控制：{generation.safetySummary}</div>}
+              {generation.verificationSummary && <div>机器验收：{generation.verificationSummary}</div>}
+            </div>
+          )}
+        </section>
+      )}
+
+      {draft.implementationSummary && (
+        <section style={cardStyle}>
+          <div style={{ ...cardTitle, display: 'flex', alignItems: 'center', gap: 7 }}>
+            AI 实现摘要 {draft.generatedByAi && <span style={experimentBadge}>已编译</span>}
+          </div>
+          <div style={{ fontSize: 12.5, lineHeight: 1.65, whiteSpace: 'pre-wrap' }}>{draft.implementationSummary}</div>
+        </section>
+      )}
 
       <EditorGroup title="预定义输入" action="＋ 输入" onAction={() => setInputs([
         ...draft.inputs, { key: `input_${draft.inputs.length + 1}`, label: '输入', type: 'text' },
@@ -357,6 +722,7 @@ const KitEditor: React.FC<{
               onChange={(e) => setInputs(draft.inputs.map((x, i) => i === index ? { ...x, type: e.target.value as KitInputSpec['type'] } : x))}>
               <option value="text">文本</option><option value="number">数字</option>
               <option value="boolean">开关</option><option value="select">选项</option>
+              <option value="file">客户端本地文件</option>
             </select>
             {item.type === 'select' && (
               <input style={miniInput} placeholder="选项，以逗号分隔" value={(item.options || []).join(',')}
@@ -374,60 +740,22 @@ const KitEditor: React.FC<{
         ))}
       </EditorGroup>
 
-      <EditorGroup title="成功 / 失败判言（至少一条）" action="＋ 判言" onAction={() => setAssertions([
-        ...draft.assertions, { type: 'stdout_contains', expected: '', label: '输出包含' },
-      ])}>
-        {draft.assertions.map((item, index) => (
-          <div key={index} style={editorRow}>
-            <select style={miniInput} value={item.type}
-              onChange={(e) => setAssertions(draft.assertions.map((x, i) => i === index ? { ...x, type: e.target.value as KitAssertionSpec['type'] } : x))}>
-              <option value="exit_code">退出码</option>
-              <option value="stdout_contains">标准输出包含</option>
-              <option value="stdout_regex">标准输出正则</option>
-              <option value="stderr_contains">错误输出包含</option>
-              <option value="stderr_regex">错误输出正则</option>
-              <option value="json_valid">标准输出是 JSON</option>
-              <option value="file_exists">文件存在</option>
-            </select>
-            <input style={{ ...miniInput, flex: 1 }} placeholder="名称" value={item.label || ''}
-              onChange={(e) => setAssertions(draft.assertions.map((x, i) => i === index ? { ...x, label: e.target.value } : x))} />
-            <input style={{ ...miniInput, flex: 1 }} placeholder="期望值 / 相对路径" value={String(item.expected ?? item.path ?? '')}
-              onChange={(e) => setAssertions(draft.assertions.map((x, i) => i === index ? { ...x, expected: e.target.value } : x))} />
-            <button style={dangerMini} disabled={draft.assertions.length <= 1}
-              onClick={() => setAssertions(draft.assertions.filter((_, i) => i !== index))}>×</button>
-          </div>
-        ))}
-      </EditorGroup>
-
-      <EditorGroup title="发布到数据市场" action="＋ 输出" onAction={() => setOutputs([
-        ...draft.outputs, { key: `output_${draft.outputs.length + 1}`, label: '结果', source: 'stdout', type: 'text' },
-      ])}>
-        {draft.outputs.map((item, index) => (
-          <div key={index} style={editorRow}>
-            <input style={miniInput} placeholder="数据 key" value={item.key}
-              onChange={(e) => setOutputs(draft.outputs.map((x, i) => i === index ? { ...x, key: e.target.value } : x))} />
-            <input style={miniInput} placeholder="显示名" value={item.label || ''}
-              onChange={(e) => setOutputs(draft.outputs.map((x, i) => i === index ? { ...x, label: e.target.value } : x))} />
-            <select style={miniInput} value={item.source || 'stdout'}
-              onChange={(e) => setOutputs(draft.outputs.map((x, i) => i === index ? { ...x, source: e.target.value as KitOutputSpec['source'] } : x))}>
-              <option value="stdout">标准输出</option><option value="stderr">错误输出</option>
-              <option value="json">JSON</option><option value="file">文件</option>
-            </select>
-            {item.source === 'file' && <input style={miniInput} placeholder="相对路径" value={item.path || ''}
-              onChange={(e) => setOutputs(draft.outputs.map((x, i) => i === index ? { ...x, path: e.target.value } : x))} />}
-            <button style={dangerMini} onClick={() => setOutputs(draft.outputs.filter((_, i) => i !== index))}>×</button>
-          </div>
-        ))}
-      </EditorGroup>
-
-      <label style={blockLabel}><FieldLabel>硬数据依赖（数据 key，以逗号分隔；缺失时不执行）</FieldLabel>
-        <input style={inputStyle} value={draft.dependencies.join(',')}
-          onChange={(e) => patch({
-            dependencies: e.target.value.split(',').map((value) => value.trim()).filter(Boolean),
-          })} />
-      </label>
-
       <div style={twoColumns}>
+        <label><FieldLabel>默认执行位置</FieldLabel>
+          <select style={inputStyle} value={draft.executionTarget}
+            onChange={(e) => {
+              const target = e.target.value as Draft['executionTarget'];
+              patch({
+                executionTarget: target,
+                steps: draft.steps.map((step) => step.type === 'command'
+                  ? { ...step, target } : step),
+                generatedByAi: false,
+              });
+            }}>
+            <option value="executor">Session 执行端（默认）</option>
+            <option value="client">当前客户端（桌面端）</option>
+          </select>
+        </label>
         <label><FieldLabel>触发方式</FieldLabel>
           <select style={inputStyle} value={draft.schedule.mode}
             onChange={(e) => patch({ schedule: { ...draft.schedule, mode: e.target.value as 'manual' | 'interval' } })}>
@@ -442,9 +770,128 @@ const KitEditor: React.FC<{
           </label>
         )}
       </div>
+
+      <details open={advancedOpen} onToggle={(e) => setAdvancedOpen(e.currentTarget.open)} style={{ ...cardStyle, marginTop: 14 }}>
+        <summary style={{ cursor: 'pointer', fontSize: 12, fontWeight: 650 }}>
+          高级实现 · Shell、命令与机器判言
+        </summary>
+        <div style={{ ...subtleStyle, marginTop: 7, lineHeight: 1.5 }}>
+          通常由 AI 维护。需要审计或手工兜底时再展开修改；这里的代码不会在创建阶段执行。
+        </div>
+        {draft.steps.length > 0 && (
+          <section style={{ ...editorGroup, marginTop: 10 }}>
+            <strong style={{ fontSize: 12 }}>有序编排 · 任一步失败即停止</strong>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 7, marginTop: 8 }}>
+              {draft.steps.map((step, index) => (
+                <div key={step.id || index} style={{ ...editorRow, alignItems: 'flex-start' }}>
+                  <span style={{ ...statusPill, color: '#79c0ff', borderColor: '#58a6ff66' }}>{index + 1}</span>
+                  <div style={{ flex: 1, minWidth: 180 }}>
+                    <div style={{ fontSize: 12 }}>{step.title || `步骤 ${index + 1}`}</div>
+                    <div style={{ ...subtleStyle, marginTop: 3 }}>
+                      {step.type === 'file_push' ? `文件推送：${step.config?.source || '未指定'} → ${step.config?.destination || '未指定'}`
+                        : step.type === 'kit_call' ? `调用 Kit：${step.kitId || '未指定'}`
+                          : `${step.shell || draft.shell} · ${(step.command || '').slice(0, 180)}`}
+                    </div>
+                  </div>
+                  <span style={mutedPill}>{step.target === 'client' ? '客户端' : '执行端'}</span>
+                </div>
+              ))}
+            </div>
+          </section>
+        )}
+        <div style={{ ...twoColumns, marginTop: 12 }}>
+          <label><FieldLabel>名称</FieldLabel>
+            <input style={inputStyle} value={draft.title}
+              onChange={(e) => patch({ title: e.target.value })} />
+          </label>
+          <label><FieldLabel>Shell</FieldLabel>
+            <select style={inputStyle} value={draft.shell}
+              onChange={(e) => patch({ shell: e.target.value as Draft['shell'], generatedByAi: false })}>
+              <option value="powershell">PowerShell</option>
+              <option value="cmd">CMD</option>
+              <option value="bash">Bash</option>
+            </select>
+          </label>
+        </div>
+        <label style={blockLabel}><FieldLabel>说明</FieldLabel>
+          <input style={inputStyle} value={draft.description}
+            onChange={(e) => patch({ description: e.target.value })} />
+        </label>
+        <div style={twoColumns}>
+          <label><FieldLabel>Session 内工作目录</FieldLabel>
+            <input style={inputStyle} value={draft.cwd}
+              onChange={(e) => patch({ cwd: e.target.value, generatedByAi: false })} />
+          </label>
+          <label><FieldLabel>超时（秒）</FieldLabel>
+            <input style={inputStyle} type="number" min={1} value={draft.timeoutSeconds}
+              onChange={(e) => patch({ timeoutSeconds: Math.max(1, Number(e.target.value) || 300), generatedByAi: false })} />
+          </label>
+        </div>
+        <label style={blockLabel}><FieldLabel>执行过程 · 用 {'{{input_key}}'} 引用标准输入</FieldLabel>
+          <textarea style={{ ...inputStyle, minHeight: 120, fontFamily: 'Consolas, monospace' }}
+            value={draft.command} onChange={(e) => patch({ command: e.target.value, generatedByAi: false })} />
+        </label>
+
+        <EditorGroup title="机器判言（至少一条）" action="＋ 判言" onAction={() => setAssertions([
+          ...draft.assertions, { type: 'stdout_contains', expected: '', label: '输出包含' },
+        ])}>
+          {draft.assertions.map((item, index) => (
+            <div key={index} style={editorRow}>
+              <select style={miniInput} value={item.type}
+                onChange={(e) => setAssertions(draft.assertions.map((x, i) => i === index ? { ...x, type: e.target.value as KitAssertionSpec['type'] } : x))}>
+                <option value="exit_code">退出码</option>
+                <option value="stdout_contains">标准输出包含</option>
+                <option value="stdout_regex">标准输出正则</option>
+                <option value="stderr_contains">错误输出包含</option>
+                <option value="stderr_regex">错误输出正则</option>
+                <option value="json_valid">标准输出是 JSON</option>
+                <option value="file_exists">文件存在</option>
+              </select>
+              <input style={{ ...miniInput, flex: 1 }} placeholder="名称" value={item.label || ''}
+                onChange={(e) => setAssertions(draft.assertions.map((x, i) => i === index ? { ...x, label: e.target.value } : x))} />
+              <input style={{ ...miniInput, flex: 1 }} placeholder="期望值 / 相对路径" value={String(item.expected ?? item.path ?? '')}
+                onChange={(e) => setAssertions(draft.assertions.map((x, i) => i === index ? { ...x, expected: e.target.value } : x))} />
+              <button style={dangerMini} disabled={draft.assertions.length <= 1}
+                onClick={() => setAssertions(draft.assertions.filter((_, i) => i !== index))}>×</button>
+            </div>
+          ))}
+        </EditorGroup>
+
+        <EditorGroup title="发布到数据市场" action="＋ 输出" onAction={() => setOutputs([
+          ...draft.outputs, { key: `output_${draft.outputs.length + 1}`, label: '结果', source: 'stdout', type: 'text' },
+        ])}>
+          {draft.outputs.map((item, index) => (
+            <div key={index} style={editorRow}>
+              <input style={miniInput} placeholder="数据 key" value={item.key}
+                onChange={(e) => setOutputs(draft.outputs.map((x, i) => i === index ? { ...x, key: e.target.value } : x))} />
+              <input style={miniInput} placeholder="显示名" value={item.label || ''}
+                onChange={(e) => setOutputs(draft.outputs.map((x, i) => i === index ? { ...x, label: e.target.value } : x))} />
+              <select style={miniInput} value={item.source || 'stdout'}
+                onChange={(e) => setOutputs(draft.outputs.map((x, i) => i === index ? { ...x, source: e.target.value as KitOutputSpec['source'] } : x))}>
+                <option value="stdout">标准输出</option><option value="stderr">错误输出</option>
+                <option value="json">JSON</option><option value="file">文件</option>
+              </select>
+              {item.source === 'file' && <input style={miniInput} placeholder="相对路径" value={item.path || ''}
+                onChange={(e) => setOutputs(draft.outputs.map((x, i) => i === index ? { ...x, path: e.target.value } : x))} />}
+              <button style={dangerMini} onClick={() => setOutputs(draft.outputs.filter((_, i) => i !== index))}>×</button>
+            </div>
+          ))}
+        </EditorGroup>
+
+        <label style={blockLabel}><FieldLabel>硬数据依赖（数据 key，以逗号分隔；缺失时不执行）</FieldLabel>
+          <input style={inputStyle} value={draft.dependencies.join(',')}
+            onChange={(e) => patch({
+              dependencies: e.target.value.split(',').map((value) => value.trim()).filter(Boolean),
+            })} />
+        </label>
+      </details>
+
       <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8, marginTop: 20 }}>
         <button style={secondaryButton} onClick={onCancel}>取消</button>
-        <button style={primaryButton} disabled={busy || !draft.command.trim()} onClick={onSave}>
+        <button style={primaryButton}
+          disabled={busy || generating || !draft.objective.trim() || !draft.successCriteria.trim() || (!draft.command.trim() && !draft.steps.length) || generation?.ready === false}
+          title={generation?.ready === false ? '请先补充信息并重新编译，或修正高级实现后重新编译' : undefined}
+          onClick={onSave}>
           {busy ? '保存中…' : '保存 Kit'}
         </button>
       </div>
@@ -465,6 +912,7 @@ const EditorGroup: React.FC<{
 );
 
 const KitDetail: React.FC<{
+  sessionId: string;
   kit: WorkspaceKit;
   run?: KitRun;
   runs: KitRun[];
@@ -483,30 +931,99 @@ const KitDetail: React.FC<{
   onTerminalClose: () => void;
   busy: boolean;
   dataMarket: WorkspaceKitState['dataMarket'];
+  now: number;
+  onOptimize: () => void;
 }> = ({
-  kit, run, runs, inputs, onInputsChange, onRun, onCancel, onEdit, onDelete,
+  sessionId, kit, run, runs, inputs, onInputsChange, onRun, onCancel, onEdit, onDelete,
   onToggleEnabled, onControlMode, terminalCommand, onTerminalCommand, onTerminalRun,
-  terminalConnected, onTerminalClose, busy, dataMarket,
+  terminalConnected, onTerminalClose, busy, dataMarket, now, onOptimize,
 }) => {
-  const running = !!run && ['queued', 'running', 'evaluating'].includes(run.status);
+  const running = isActiveRun(run);
   const meta = run ? statusMeta[run.status] : null;
+  const selectRuntimeFile = async (spec: KitInputSpec) => {
+    try {
+      const selected = await api.selectKitLocalFile();
+      if (selected) onInputsChange({ ...inputs, [spec.key]: selected });
+    } catch {
+      // 浏览器端没有可交给 Tauri file_push 的绝对路径；按钮提示已说明桌面端要求。
+    }
+  };
   return (
     <div style={{ padding: 18, overflow: 'auto', height: '100%', boxSizing: 'border-box' }}>
       <div style={{ display: 'flex', justifyContent: 'space-between', gap: 12 }}>
         <div style={{ minWidth: 0 }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
             <h3 style={{ margin: 0, fontSize: 17 }}>{kit.title}</h3>
+            {kit.generatedByAi && <span style={experimentBadge}>AI 编译</span>}
+            <span style={mutedPill}>{kit.executionTarget === 'client' ? '客户端' : '执行端默认'}</span>
             {meta && <span style={{ ...statusPill, color: meta.color, borderColor: `${meta.color}66` }}>● {meta.label}</span>}
+            {run?.startedAt && <span style={mutedPill}>⏱ {formatDuration(run.startedAt, run.endedAt, now)}</span>}
             {!kit.enabled && <span style={mutedPill}>停用</span>}
           </div>
           {kit.description && <div style={{ ...subtleStyle, marginTop: 6 }}>{kit.description}</div>}
         </div>
         <div style={{ display: 'flex', gap: 6, flexShrink: 0 }}>
+          <button style={secondaryButton} onClick={onOptimize}>✨ 优化</button>
           <button style={secondaryButton} onClick={onToggleEnabled}>{kit.enabled ? '停用' : '启用'}</button>
           <button style={secondaryButton} onClick={onEdit}>编辑</button>
           <button style={{ ...secondaryButton, color: '#ff7b72' }} onClick={onDelete}>删除</button>
         </div>
       </div>
+
+      <KitVersionsCard sessionId={sessionId} kit={kit} running={running} />
+
+      {(kit.objective || kit.successCriteria || kit.safetyConstraints) && (
+        <section style={cardStyle}>
+          <div style={cardTitle}>人类定义的任务契约</div>
+          {kit.objective && <ContractLine label="任务" text={kit.objective} />}
+          {kit.successCriteria && <ContractLine label="成功标准" text={kit.successCriteria} tone="success" />}
+          {kit.safetyConstraints && <ContractLine label="安全边界" text={kit.safetyConstraints} tone="warning" />}
+          {!!kit.references?.length && <ContractLine label="相关对象" text={kit.references.join('、')} />}
+          {kit.implementationSummary && (
+            <details style={{ marginTop: 9 }}>
+              <summary style={{ cursor: 'pointer', fontSize: 11, color: 'var(--theme-text-muted)' }}>AI 实现摘要</summary>
+              <div style={{ fontSize: 12, lineHeight: 1.6, marginTop: 7, whiteSpace: 'pre-wrap' }}>{kit.implementationSummary}</div>
+            </details>
+          )}
+          {!!kit.generationWarnings?.length && (
+            <div style={{ marginTop: 8, color: '#ff9b93', fontSize: 11.5 }}>
+              {kit.generationWarnings.map((item, index) => <div key={index}>⚠ {item}</div>)}
+            </div>
+          )}
+        </section>
+      )}
+
+      {(kit.steps.length > 0 || !!run?.steps?.length) && (
+        <section style={cardStyle}>
+          <div style={cardTitle}>一键编排 · 严格顺序执行</div>
+          {(run?.steps?.length ? run.steps : kit.steps).map((step, index) => {
+            const stepStatus = 'status' in step ? step.status : 'pending';
+            const duration = 'startedAt' in step
+              ? formatDuration(step.startedAt, step.endedAt, now)
+              : '—';
+            const stepColor = stepStatus === 'succeeded' ? '#56d364'
+              : ['failed', 'error', 'cancelled'].includes(stepStatus) ? '#ff7b72'
+                : ['running', 'waiting_client'].includes(stepStatus) ? '#d2a8ff' : '#8b949e';
+            return (
+              <div key={step.id || index} style={{ ...assertionRow, color: stepColor }}>
+                <span>{index + 1}</span>
+                <span style={{ flex: 1, color: 'var(--theme-text)' }}>{step.title || `步骤 ${index + 1}`}</span>
+                <span style={subtleStyle}>{step.type === 'file_push' ? '文件推送' : step.type === 'kit_call' ? 'Kit 调用' : '命令'}</span>
+                <span style={mutedPill}>{step.target === 'client' ? '客户端' : '执行端'}</span>
+                <span style={{ minWidth: 74 }}>{stepStatus === 'waiting_client' ? '等待客户端' : stepStatus}</span>
+                <span style={{ ...durationPill, color: ['running', 'waiting_client'].includes(stepStatus) ? '#d2a8ff' : '#8b949e' }}>
+                  ⏱ {duration}
+                </span>
+              </div>
+            );
+          })}
+          {run?.status === 'waiting_client' && (
+            <div style={{ ...subtleStyle, marginTop: 8, color: '#d2a8ff' }}>
+              当前客户端正在接管这一步；文件会分块传输并在执行端完成大小与 SHA-256 验收。
+            </div>
+          )}
+        </section>
+      )}
 
       <section style={cardStyle}>
         <div style={cardTitle}>标准输入</div>
@@ -518,7 +1035,14 @@ const KitDetail: React.FC<{
               <label key={spec.key}>
                 <FieldLabel>{spec.label || spec.key}{spec.required ? ' *' : ''}
                   {spec.sourceKey ? ` · 自动来源 ${spec.sourceKey}` : ''}</FieldLabel>
-                {spec.type === 'boolean' ? (
+                {spec.type === 'file' ? (
+                  <div style={{ display: 'flex', gap: 6 }}>
+                    <input style={inputStyle} type="text" placeholder="选择当前客户端上的文件"
+                      value={String(inputs[spec.key] ?? '')}
+                      onChange={(e) => onInputsChange({ ...inputs, [spec.key]: e.target.value })} />
+                    <button type="button" style={secondaryButton} onClick={() => selectRuntimeFile(spec)}>选择…</button>
+                  </div>
+                ) : spec.type === 'boolean' ? (
                   <input type="checkbox" checked={!!inputs[spec.key]}
                     onChange={(e) => onInputsChange({ ...inputs, [spec.key]: e.target.checked })} />
                 ) : spec.type === 'select' ? (
@@ -547,7 +1071,7 @@ const KitDetail: React.FC<{
               : '单次执行'}
           </div>
           {running ? (
-            <button style={dangerButton} onClick={() => onCancel(run.id)}>■ 停止</button>
+            <button style={dangerButton} onClick={() => onCancel(run!.id)}>■ 停止</button>
           ) : (
             <button style={primaryButton} disabled={busy || !kit.enabled} onClick={onRun}>▶ 执行并验收</button>
           )}
@@ -580,6 +1104,8 @@ const KitDetail: React.FC<{
               <span>触发：{run.trigger}</span>
               <span>操作者：{run.owner === 'ai' ? 'AI' : '人工'}</span>
               <span>目录：{run.cwd || kit.cwd}</span>
+              <span>总耗时：{formatDuration(run.startedAt, run.endedAt, now)}</span>
+              <span>原子步：{run.steps?.length || 1}</span>
             </div>
             <LogBlock title="stdout" text={run.stdout} />
             <LogBlock title="stderr" text={run.stderr} tone="error" />
@@ -637,7 +1163,7 @@ const KitDetail: React.FC<{
             return <div key={item.id} style={historyRow}>
               <span style={{ color: itemMeta.color }}>● {itemMeta.label}</span>
               <span>{new Date(item.createdAt * 1000).toLocaleString()}</span>
-              <span>{item.trigger} · {item.owner}</span>
+              <span>{item.trigger} · {formatDuration(item.startedAt, item.endedAt, now)}</span>
             </div>;
           })}
         </section>
@@ -645,6 +1171,265 @@ const KitDetail: React.FC<{
     </div>
   );
 };
+
+const versionSourceLabel: Record<string, string> = {
+  create: '初始创建', legacy: '旧版迁移', manual: '人工编辑',
+  ai_compile: 'AI 编译', ai_optimize: 'AI 优化定版',
+};
+
+const KitVersionsCard: React.FC<{
+  sessionId: string; kit: WorkspaceKit; running: boolean;
+}> = ({ sessionId, kit, running }) => {
+  const versions = kit.versions || [];
+  const [viewed, setViewed] = useState<KitVersion | null>(null);
+  const [busyId, setBusyId] = useState('');
+  const [message, setMessage] = useState('');
+
+  useEffect(() => { setViewed(null); setMessage(''); }, [kit.id]);
+
+  const viewVersion = async (versionId: string) => {
+    setBusyId(versionId);
+    const result = await api.kitVersionGet(sessionId, kit.id, versionId);
+    setBusyId('');
+    if (result.status === 'ok' && result.version) {
+      setViewed(result.version);
+      setMessage('');
+    } else {
+      setMessage(result.message || '读取版本失败');
+    }
+  };
+
+  const activate = async (version: KitVersion) => {
+    if (kit.enabled) {
+      setMessage('先停用 Kit，再切换版本；这样 Schedule 不会在执行中途换编排。');
+      return;
+    }
+    setBusyId(version.id);
+    const result = await api.kitVersionActivate(sessionId, kit.id, version.id);
+    setBusyId('');
+    setMessage(result.status === 'ok' ? `已启用 ${version.version}，Kit 保持停用，确认后可重新开启。` : (result.message || '切换失败'));
+  };
+
+  return (
+    <section style={cardStyle}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 10 }}>
+        <div>
+          <div style={cardTitle}>执行编排版本</div>
+          <div style={subtleStyle}>版本属于 Kit；人工编辑、AI 编译和优化定版都进入同一条历史。</div>
+        </div>
+        <span style={mutedPill}>{versions.length} 个版本</span>
+      </div>
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 6, marginTop: 10 }}>
+        {versions.map((version) => {
+          const active = version.isActive || version.id === kit.activeVersionId;
+          return (
+            <div key={version.id} style={versionRowStyle}>
+              <strong style={{ color: active ? '#56d364' : 'var(--theme-text)' }}>{version.version}</strong>
+              <span style={subtleStyle}>{versionSourceLabel[version.source] || version.source}</span>
+              <span style={{ ...subtleStyle, flex: 1 }}>{version.note || '—'}</span>
+              <span style={subtleStyle}>{new Date(version.createdAt * 1000).toLocaleString()}</span>
+              {active && <span style={{ ...statusPill, color: '#56d364', borderColor: '#3fb95066' }}>当前生效</span>}
+              <button style={linkButton} disabled={busyId === version.id} onClick={() => viewVersion(version.id)}>查看 DSL</button>
+              {!active && (
+                <button style={secondaryButton} disabled={busyId === version.id || running || kit.enabled}
+                  title={kit.enabled ? '先停用 Kit，避免 Schedule 冲突' : running ? 'Kit 正在运行' : '切换为这个执行版本'}
+                  onClick={() => activate(version)}>启用此版</button>
+              )}
+            </div>
+          );
+        })}
+      </div>
+      {message && <div style={{ ...subtleStyle, marginTop: 8, color: message.startsWith('已启用') ? '#56d364' : '#e3b341' }}>{message}</div>}
+      {viewed && (
+        <details open style={{ marginTop: 10 }}>
+          <summary style={{ cursor: 'pointer', fontSize: 11 }}>{viewed.version} · Kit DSL</summary>
+          <pre style={dslPreviewStyle}>{JSON.stringify(viewed.snapshot || {}, null, 2)}</pre>
+        </details>
+      )}
+    </section>
+  );
+};
+
+const KitOptimizerPanel: React.FC<{
+  sessionId: string; kit: WorkspaceKit; onClose: () => void;
+}> = ({ sessionId, kit, onClose }) => {
+  const [messages, setMessages] = useState<KitOptimizationMessage[]>([]);
+  const [backends, setBackends] = useState<any[]>([]);
+  const [backendId, setBackendId] = useState('');
+  const [prompt, setPrompt] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [notice, setNotice] = useState('');
+  const [viewedProposal, setViewedProposal] = useState<Record<string, unknown> | null>(null);
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const activeVersion = (kit.versions || []).find((version) => (
+    version.isActive || version.id === kit.activeVersionId
+  ));
+
+  useEffect(() => {
+    let cancelled = false;
+    setMessages([]); setNotice(''); setViewedProposal(null);
+    Promise.all([api.kitOptimizeGet(sessionId, kit.id), api.getSessionBackends(sessionId)]).then(([history, available]) => {
+      if (cancelled) return;
+      if (history && history.status === 'ok') {
+        setMessages(history.messages || []);
+        setBackendId(history.backendId || '');
+      } else {
+        setNotice(history?.message || '执行端没有返回 Kit 优化状态，请更新并重启执行端');
+      }
+      setBackends(Array.isArray(available) ? available : []);
+    }).catch((error) => {
+      if (!cancelled) setNotice(error instanceof Error ? error.message : String(error));
+    });
+    return () => { cancelled = true; };
+  }, [sessionId, kit.id]);
+
+  useEffect(() => {
+    const node = scrollRef.current;
+    if (node) node.scrollTop = node.scrollHeight;
+  }, [messages, busy]);
+
+  const ask = async () => {
+    const text = prompt.trim();
+    if (!text || busy) return;
+    setBusy(true); setNotice(''); setPrompt('');
+    const optimistic: KitOptimizationMessage = {
+      id: `local-${Date.now()}`, role: 'user', content: text, backendId,
+      status: 'done', warnings: [], questions: [], ready: false,
+      baseVersionId: kit.activeVersionId || '', finalizedVersionId: '', createdAt: Date.now() / 1000,
+    };
+    setMessages((current) => [...current, optimistic]);
+    try {
+      const result = await api.kitOptimizeAsk(sessionId, kit.id, text, backendId);
+      if (!result) {
+        setNotice('执行端没有返回 Kit 优化结果，请更新并重启执行端');
+        return;
+      }
+      if (result.messages) setMessages(result.messages);
+      if (result.status !== 'ok') {
+        setNotice(typeof result.message === 'string' ? result.message : (result.message?.content || 'AI 优化失败'));
+      }
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : String(error));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const finalize = async (message: KitOptimizationMessage) => {
+    if (kit.enabled) {
+      setNotice('请先在 Kit 详情中停用这个 Kit，再定版；避免 Schedule 与版本切换发生竞态。');
+      return;
+    }
+    setBusy(true); setNotice('');
+    const result = await api.kitOptimizeFinalize(sessionId, kit.id, message.id, message.content.slice(0, 500));
+    setBusy(false);
+    if (result.status !== 'ok' || !result.version) {
+      setNotice(result.message || '定版失败');
+      return;
+    }
+    setMessages((current) => current.map((item) => (
+      item.id === message.id ? { ...item, finalizedVersionId: result.version!.id } : item
+    )));
+    setNotice(`${result.version.version} 已定版并成为当前执行版本；Kit 仍保持停用，确认后再开启。`);
+  };
+
+  return (
+    <div style={optimizerOverlayStyle} onMouseDown={(event) => {
+      if (event.target === event.currentTarget) onClose();
+    }}>
+      <section style={optimizerPanelStyle} onMouseDown={(event) => event.stopPropagation()}>
+        <header style={headerStyle}>
+          <div style={{ minWidth: 0 }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+              <strong>✨ 优化 · {kit.title}</strong>
+              <span style={experimentBadge}>独立 AI 对话</span>
+            </div>
+            <div style={{ ...subtleStyle, marginTop: 4 }}>
+              当前 {activeVersion?.version || '—'} · AI 只生成候选，你定版后才进入 Kit 版本账本
+            </div>
+          </div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 7 }}>
+            <select style={{ ...inputStyle, width: 220 }} value={backendId} onChange={(event) => setBackendId(event.target.value)}>
+              <option value="">跟随 Session Backend</option>
+              {backends.map((backend) => <option key={backend.id} value={backend.id}>{backend.label || backend.id}</option>)}
+            </select>
+            <button style={iconButton} onClick={onClose}>×</button>
+          </div>
+        </header>
+
+        <div ref={scrollRef} style={optimizerMessagesStyle}>
+          {messages.length === 0 && (
+            <div style={optimizerEmptyStyle}>
+              <strong>从当前生效 DSL 继续优化</strong>
+              <span>例如：“把停止服务拆成定位 PID、关闭进程树、复核残留三个步骤，并强化不能误杀其他 Java 的判言。”</span>
+            </div>
+          )}
+          {messages.map((message) => (
+            <div key={message.id} style={{
+              ...optimizerBubbleStyle,
+              alignSelf: message.role === 'user' ? 'flex-end' : 'flex-start',
+              background: message.role === 'user' ? 'rgba(88,166,255,.14)' : 'var(--theme-bg-secondary, rgba(255,255,255,.04))',
+            }}>
+              <div style={{ ...subtleStyle, marginBottom: 5 }}>
+                {message.role === 'user' ? '你' : `AI · ${backends.find((item) => item.id === message.backendId)?.label || message.backendId || 'Session Backend'}`}
+              </div>
+              <div style={{ whiteSpace: 'pre-wrap', lineHeight: 1.6, fontSize: 12.5 }}>{message.content}</div>
+              {!!message.questions?.length && <div style={{ color: '#e3b341', marginTop: 8, fontSize: 11 }}>{message.questions.map((item) => <div key={item}>· {item}</div>)}</div>}
+              {!!message.warnings?.length && <div style={{ color: '#ff9b93', marginTop: 8, fontSize: 11 }}>{message.warnings.map((item) => <div key={item}>⚠ {item}</div>)}</div>}
+              {message.role === 'assistant' && message.proposal && (
+                <div style={{ display: 'flex', alignItems: 'center', gap: 7, marginTop: 10, flexWrap: 'wrap' }}>
+                  <button style={secondaryButton} onClick={() => setViewedProposal(message.proposal || null)}>查看候选 DSL</button>
+                  {message.ready && !message.finalizedVersionId && (
+                    <button style={primaryButton} disabled={busy || kit.enabled}
+                      title={kit.enabled ? '先停用 Kit，避免 Schedule 冲突' : '写入版本账本并设为当前版本'}
+                      onClick={() => finalize(message)}>定版并启用</button>
+                  )}
+                  {message.finalizedVersionId && <span style={{ ...statusPill, color: '#56d364', borderColor: '#3fb95066' }}>✓ 已定版</span>}
+                  {!message.ready && <span style={{ ...statusPill, color: '#e3b341', borderColor: '#d2992266' }}>尚不可定版</span>}
+                </div>
+              )}
+            </div>
+          ))}
+          {busy && <div style={{ ...optimizerBubbleStyle, alignSelf: 'flex-start', color: '#d2a8ff' }}>AI 正在检查当前版本并生成候选…</div>}
+        </div>
+
+        {notice && <div style={{ padding: '7px 14px', color: notice.includes('已定版') ? '#56d364' : '#e3b341', fontSize: 11.5 }}>{notice}</div>}
+        <footer style={optimizerComposerStyle}>
+          <textarea style={{ ...inputStyle, minHeight: 66, resize: 'vertical' }} value={prompt}
+            placeholder="继续描述你不满意的地方、希望增加的步骤或更严格的成功标准…"
+            onChange={(event) => setPrompt(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) { event.preventDefault(); void ask(); }
+            }} />
+          <button style={primaryButton} disabled={busy || !prompt.trim()} onClick={ask}>发送并生成候选</button>
+        </footer>
+
+        {viewedProposal && (
+          <div style={dslOverlayStyle} onMouseDown={(event) => {
+            if (event.target === event.currentTarget) setViewedProposal(null);
+          }}>
+            <div style={dslDialogStyle} onMouseDown={(event) => event.stopPropagation()}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                <strong style={{ fontSize: 13 }}>候选 Kit DSL</strong>
+                <button style={iconButton} onClick={() => setViewedProposal(null)}>×</button>
+              </div>
+              <pre style={{ ...dslPreviewStyle, maxHeight: '70vh' }}>{JSON.stringify(viewedProposal, null, 2)}</pre>
+            </div>
+          </div>
+        )}
+      </section>
+    </div>
+  );
+};
+
+const ContractLine: React.FC<{
+  label: string; text: string; tone?: 'success' | 'warning';
+}> = ({ label, text, tone }) => (
+  <div style={{ display: 'grid', gridTemplateColumns: '72px minmax(0, 1fr)', gap: 8, marginTop: 7, fontSize: 12 }}>
+    <span style={{ color: tone === 'success' ? '#56d364' : tone === 'warning' ? '#e3b341' : 'var(--theme-text-muted)' }}>{label}</span>
+    <span style={{ lineHeight: 1.55, whiteSpace: 'pre-wrap' }}>{text}</span>
+  </div>
+);
 
 const LogBlock: React.FC<{ title: string; text: string; tone?: 'error' }> = ({ title, text, tone }) => (
   <details style={{ marginTop: 10 }} open={!!text}>
@@ -707,6 +1492,22 @@ const sidebarStyle: React.CSSProperties = {
   borderRight: '1px solid var(--theme-border)', boxSizing: 'border-box',
 };
 const mainStyle: React.CSSProperties = { flex: 1, minWidth: 0, minHeight: 0 };
+const compactListStyle: React.CSSProperties = {
+  flex: 1, minHeight: 0, overflow: 'auto', padding: 18, boxSizing: 'border-box',
+};
+const compactListToolbar: React.CSSProperties = {
+  display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12,
+  marginBottom: 14,
+};
+const compactKitGrid: React.CSSProperties = {
+  display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(280px, 1fr))',
+  gap: 10, alignContent: 'start',
+};
+const compactKitCard: React.CSSProperties = {
+  border: '1px solid var(--theme-border, rgba(255,255,255,.12))',
+  background: 'var(--theme-bg-secondary, rgba(255,255,255,.025))',
+  borderRadius: 10, padding: 13, minWidth: 0,
+};
 const sectionTitle: React.CSSProperties = { fontSize: 16, fontWeight: 650, marginBottom: 14 };
 const cardTitle: React.CSSProperties = { fontSize: 12, fontWeight: 650, marginBottom: 9 };
 const subtleStyle: React.CSSProperties = { fontSize: 11, color: 'var(--theme-text-muted, #8b949e)' };
@@ -721,6 +1522,10 @@ const experimentBadge: React.CSSProperties = {
 };
 const statusPill: React.CSSProperties = { fontSize: 10, border: '1px solid', padding: '2px 7px', borderRadius: 10 };
 const mutedPill: React.CSSProperties = { ...statusPill, color: '#8b949e', borderColor: '#6e768166' };
+const durationPill: React.CSSProperties = {
+  minWidth: 68, textAlign: 'right', fontSize: 10, fontVariantNumeric: 'tabular-nums',
+  whiteSpace: 'nowrap',
+};
 const inputStyle: React.CSSProperties = {
   width: '100%', boxSizing: 'border-box', borderRadius: 6, padding: '7px 9px',
   color: 'var(--theme-text)', background: 'var(--theme-bg-tertiary, #0d1117)',
@@ -770,6 +1575,49 @@ const runMetaGrid: React.CSSProperties = {
 const historyRow: React.CSSProperties = {
   display: 'grid', gridTemplateColumns: '80px 1fr 110px', gap: 8,
   padding: '6px 0', fontSize: 11, borderBottom: '1px solid var(--theme-border)',
+};
+const versionRowStyle: React.CSSProperties = {
+  display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap',
+  padding: '7px 0', borderBottom: '1px solid var(--theme-border)', fontSize: 11,
+};
+const dslPreviewStyle: React.CSSProperties = {
+  margin: '8px 0 0', padding: 10, maxHeight: 360, overflow: 'auto',
+  borderRadius: 7, background: '#0d1117', color: '#c9d1d9', fontSize: 10.5,
+  whiteSpace: 'pre-wrap', wordBreak: 'break-word', fontFamily: 'Consolas, monospace',
+};
+const optimizerOverlayStyle: React.CSSProperties = {
+  position: 'absolute', inset: 0, zIndex: 4, display: 'flex', justifyContent: 'flex-end',
+  background: 'rgba(0,0,0,.52)',
+};
+const optimizerPanelStyle: React.CSSProperties = {
+  width: 'min(760px, 96%)', height: '100%', display: 'flex', flexDirection: 'column',
+  background: 'var(--theme-bg, #161b22)', color: 'var(--theme-text, #e6edf3)',
+  borderLeft: '1px solid var(--theme-border)', boxShadow: '-12px 0 40px rgba(0,0,0,.35)',
+};
+const optimizerMessagesStyle: React.CSSProperties = {
+  flex: 1, minHeight: 0, overflow: 'auto', display: 'flex', flexDirection: 'column',
+  gap: 10, padding: 16, boxSizing: 'border-box',
+};
+const optimizerBubbleStyle: React.CSSProperties = {
+  maxWidth: '88%', minWidth: 180, padding: '10px 12px', borderRadius: 10,
+  border: '1px solid var(--theme-border)', boxSizing: 'border-box',
+};
+const optimizerEmptyStyle: React.CSSProperties = {
+  margin: 'auto', maxWidth: 480, display: 'flex', flexDirection: 'column', gap: 8,
+  textAlign: 'center', color: 'var(--theme-text-muted)', fontSize: 12, lineHeight: 1.6,
+};
+const optimizerComposerStyle: React.CSSProperties = {
+  padding: 12, borderTop: '1px solid var(--theme-border)', display: 'flex',
+  alignItems: 'flex-end', gap: 8,
+};
+const dslOverlayStyle: React.CSSProperties = {
+  position: 'absolute', inset: 0, zIndex: 6, display: 'flex', alignItems: 'center',
+  justifyContent: 'center', padding: 20, background: 'rgba(0,0,0,.58)', boxSizing: 'border-box',
+};
+const dslDialogStyle: React.CSSProperties = {
+  width: 'min(720px, 96%)', maxHeight: '86%', overflow: 'hidden', padding: 14,
+  borderRadius: 10, border: '1px solid var(--theme-border)',
+  background: 'var(--theme-bg, #161b22)', boxShadow: '0 18px 55px rgba(0,0,0,.45)',
 };
 const dataKeyStyle: React.CSSProperties = {
   fontSize: 10, color: '#79c0ff', background: 'rgba(88,166,255,.1)', padding: '2px 5px', borderRadius: 4,

@@ -62,6 +62,26 @@ class SshHostDiscoveryTests(unittest.TestCase):
         self.assertNotIn("remote_host", kwargs)
         self.assertEqual(session.to_dict()["codexConnectionMode"], "node")
 
+    def test_normal_codex_session_uses_app_server_unless_explicitly_disabled(self):
+        session = Session(
+            id="normal", title="Normal", created_at=1, updated_at=1,
+            messages=[], working_dir="C:/work", backend_id="codex",
+        )
+        enabled = CodexOfficeBackend(ModelBackendConfig(
+            id="codex", type=BackendType.CODEX_OFFICIAL, label="Codex",
+        ))
+        enabled_kwargs = {}
+        BridgeWS._add_runtime_kwargs(enabled, enabled_kwargs, {}, session)
+        self.assertTrue(enabled_kwargs["app_server_local"])
+
+        disabled = CodexOfficeBackend(ModelBackendConfig(
+            id="codex", type=BackendType.CODEX_OFFICIAL, label="Codex",
+            env={"AGENTWITHU_CODEX_APP_SERVER": "false"},
+        ))
+        disabled_kwargs = {}
+        BridgeWS._add_runtime_kwargs(disabled, disabled_kwargs, {}, session)
+        self.assertNotIn("app_server_local", disabled_kwargs)
+
     def test_attached_thread_provenance_is_independent_from_ssh_transport(self):
         session = Session(
             id="ssh-attached", title="Attached", created_at=1, updated_at=1,
@@ -164,6 +184,30 @@ class _DynamicToolAppServer(_FakeAppServer):
                 "params": {"turn": {"id": "turn-1", "status": "completed"}},
             },
         ]
+
+
+class _SteerableAppServer(_FakeAppServer):
+    def __init__(self, host="", command="", **kwargs):
+        super().__init__(host, command, **kwargs)
+        self.messages = []
+        self.release = asyncio.Event()
+        self.completed = False
+
+    async def request(self, method, params, timeout=30):
+        result = await super().request(method, params, timeout)
+        if method == "turn/steer":
+            return {"turnId": "turn-1"}
+        return result
+
+    async def next_message(self, timeout=None):
+        await asyncio.wait_for(self.release.wait(), timeout=timeout)
+        if not self.completed:
+            self.completed = True
+            return {
+                "method": "turn/completed",
+                "params": {"turn": {"id": "turn-1", "status": "completed"}},
+            }
+        await asyncio.Event().wait()
 
 
 class CodexRemoteTurnTests(unittest.IsolatedAsyncioTestCase):
@@ -500,6 +544,51 @@ class CodexRemoteTurnTests(unittest.IsolatedAsyncioTestCase):
         requests = _FakeAppServer.instances[0].requests
         self.assertEqual(requests[0][1]["sandbox"], "danger-full-access")
         self.assertNotIn("sandboxPolicy", requests[1][1])
+
+    async def test_active_app_server_turn_accepts_native_steer_serially(self):
+        backend = CodexOfficeBackend(ModelBackendConfig(
+            id="codex", type=BackendType.CODEX_OFFICIAL,
+            label="Codex", model="gpt-test", skip_permissions=True,
+        ))
+        _SteerableAppServer.instances.clear()
+        with patch("src.backend.codex_office.CodexAppServerProcess", _SteerableAppServer):
+            turn_task = asyncio.create_task(backend.send_message(
+                messages=[], content="start", images=None,
+                session_id="steer-session", message_id="assistant-1",
+                on_delta=lambda _delta: None, working_dir="C:/work",
+                app_server_local=True,
+            ))
+            for _ in range(20):
+                if "steer-session" in backend._active_app_turns:
+                    break
+                await asyncio.sleep(0)
+
+            first, second = await asyncio.gather(
+                backend.steer_message(
+                    session_id="steer-session", content="先检查测试",
+                    client_message_id="follow-1",
+                ),
+                backend.steer_message(
+                    session_id="steer-session", content="再检查性能",
+                    client_message_id="follow-2",
+                ),
+            )
+            instance = _SteerableAppServer.instances[0]
+            instance.release.set()
+            await turn_task
+
+        self.assertEqual(first["status"], "ok")
+        self.assertEqual(second["status"], "ok")
+        steer_requests = [request for request in instance.requests if request[0] == "turn/steer"]
+        self.assertEqual(len(steer_requests), 2)
+        self.assertEqual(steer_requests[0][1]["expectedTurnId"], "turn-1")
+        self.assertEqual(steer_requests[0][1]["clientUserMessageId"], "follow-1")
+        self.assertEqual(steer_requests[1][1]["clientUserMessageId"], "follow-2")
+
+        finished = await backend.steer_message(
+            session_id="steer-session", content="too late", client_message_id="follow-3",
+        )
+        self.assertEqual(finished["status"], "turn_finished")
 
 
 if __name__ == "__main__":

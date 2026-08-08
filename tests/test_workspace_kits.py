@@ -1,5 +1,7 @@
 import json
 import os
+import base64
+import hashlib
 import tempfile
 import time
 import unittest
@@ -18,10 +20,21 @@ from src.backend.workspace_kit_store import (
     resolve_kit_inputs,
 )
 from src.backend.bridge_ws import BridgeWS
+from src.backend.backends import StreamDelta
 from src.types import Session
 
 
 class WorkspaceKitModelTests(unittest.TestCase):
+    def test_legacy_kit_defaults_to_executor(self):
+        kit = WorkspaceKit.from_dict({"title": "legacy", "command": "echo ok"})
+
+        self.assertEqual(kit.execution_target, "executor")
+        self.assertEqual(kit.steps, [])
+        self.assertEqual(WorkspaceKit.from_dict(kit.to_dict()).execution_target, "executor")
+        self.assertEqual(len(kit.versions), 1)
+        self.assertEqual(kit.versions[0].version, "1.0")
+        self.assertEqual(kit.active_version_id, kit.versions[0].id)
+
     def test_every_kit_gets_a_default_verdict(self):
         kit = WorkspaceKit.from_dict({
             "title": "build",
@@ -172,8 +185,419 @@ class WorkspaceKitStoreTests(unittest.TestCase):
             self.assertEqual(market[0]["value"], "new")
             self.assertEqual(store.list_session_ids(), ["session-1"])
 
+    def test_natural_language_contract_and_ai_provenance_round_trip(self):
+        kit = WorkspaceKit.from_dict({
+            "title": "Stop AMP",
+            "description": "Stop the owned process tree",
+            "objective": "关闭 start-amp.bat 启动的服务",
+            "successCriteria": "目标进程全部消失",
+            "safetyConstraints": "不得关闭其他 Java",
+            "references": ["start-amp.bat"],
+            "implementationSummary": "按唯一根 PID 关闭进程树并复核",
+            "generationWarnings": [],
+            "generatedByAi": True,
+            "command": "Write-Output ok",
+        })
+
+        restored = WorkspaceKit.from_dict(kit.to_dict())
+
+        self.assertEqual(restored.objective, "关闭 start-amp.bat 启动的服务")
+        self.assertEqual(restored.success_criteria, "目标进程全部消失")
+        self.assertEqual(restored.safety_constraints, "不得关闭其他 Java")
+        self.assertEqual(restored.references, ["start-amp.bat"])
+        self.assertTrue(restored.generated_by_ai)
+
+
+class _FakeKitCompilerBackend:
+    def __init__(self, response: dict):
+        self.response = response
+        self.prompt = ""
+
+    async def send_message(self, **kwargs):
+        self.prompt = kwargs["content"]
+        kwargs["on_delta"](StreamDelta(
+            kwargs["session_id"], kwargs["message_id"], "text_delta",
+            text=json.dumps(self.response, ensure_ascii=False),
+        ))
+        return {}
+
+    def clear_cancelled(self, _session_id):
+        return None
+
+
+class WorkspaceKitGenerationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_ai_compiler_returns_preview_without_saving_or_running(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(
+            os.environ, {"AGENT_WITH_U_DATA_ROOT": str(Path(tmp) / "data")},
+        ):
+            workspace = Path(tmp) / "workspace"
+            workspace.mkdir()
+            (workspace / "start-amp.bat").write_text("@echo off\njava -jar amp.jar\n", encoding="utf-8")
+            bridge = BridgeWS()
+            session_id = "kit-generation-session"
+            bridge._active_sessions[session_id] = Session(
+                id=session_id, title="Kit generation", created_at=time.time(), updated_at=time.time(),
+                messages=[], working_dir=str(workspace), backend_id="fake",
+            )
+            fake = _FakeKitCompilerBackend({
+                "ready": True,
+                "implementationSummary": "按唯一 PID 关闭 AMP 进程树",
+                "safetySummary": "只处理已证明属于目标 CMD 的后代",
+                "verificationSummary": "关闭后二次检查原 PID",
+                "warnings": [],
+                "questions": [],
+                "kit": {
+                    "title": "停止 AMP",
+                    "description": "关闭 AMP 专属进程树",
+                    "shell": "powershell",
+                    "cwd": ".",
+                    "timeoutSeconds": 30,
+                    "command": "Write-Output 'closed'; exit 0",
+                    "assertions": [{"type": "exit_code", "expected": 0, "label": "AMP 已关闭"}],
+                    "outputs": [{"key": "result", "source": "stdout", "type": "text"}],
+                },
+            })
+            with patch.object(bridge, "_new_backend_instance", return_value=fake):
+                result = json.loads(await bridge._rpc_kitGenerate(session_id, json.dumps({
+                    "objective": "关闭 start-amp.bat 启动的 CMD 和附属 Java",
+                    "successCriteria": "目标进程全部消失；否则失败",
+                    "safetyConstraints": "不得关闭其他 Java",
+                    "references": ["start-amp.bat"],
+                }, ensure_ascii=False)))
+
+            self.assertEqual(result["status"], "ok")
+            self.assertTrue(result["ready"])
+            self.assertTrue(result["kit"]["generatedByAi"])
+            self.assertEqual(result["kit"]["objective"], "关闭 start-amp.bat 启动的 CMD 和附属 Java")
+            self.assertIn("java -jar amp.jar", fake.prompt)
+            self.assertEqual(bridge._kit_get(session_id).kits, [])
+            self.assertEqual(bridge._kit_get(session_id).runs, [])
+
+    async def test_ai_compiler_blocks_global_process_name_kill(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(
+            os.environ, {"AGENT_WITH_U_DATA_ROOT": str(Path(tmp) / "data")},
+        ):
+            workspace = Path(tmp) / "workspace"
+            workspace.mkdir()
+            bridge = BridgeWS()
+            session_id = "unsafe-kit-generation"
+            bridge._active_sessions[session_id] = Session(
+                id=session_id, title="Unsafe generation", created_at=time.time(), updated_at=time.time(),
+                messages=[], working_dir=str(workspace), backend_id="fake",
+            )
+            fake = _FakeKitCompilerBackend({
+                "ready": True,
+                "kit": {
+                    "title": "Unsafe",
+                    "shell": "powershell",
+                    "command": "taskkill.exe /IM java.exe /F",
+                    "assertions": [{"type": "exit_code", "expected": 0}],
+                },
+            })
+            with patch.object(bridge, "_new_backend_instance", return_value=fake):
+                result = json.loads(await bridge._rpc_kitGenerate(session_id, json.dumps({
+                    "objective": "关闭我的 Java 服务",
+                    "successCriteria": "服务进程消失",
+                    "safetyConstraints": "不得影响其他 Java",
+                }, ensure_ascii=False)))
+
+            self.assertEqual(result["status"], "needs_input")
+            self.assertFalse(result["ready"])
+            self.assertTrue(any("全局 taskkill" in item for item in result["warnings"]))
+
+            # 即使绕过前端直接提交，AI provenance 仍会触发同一安全门。
+            created = json.loads(bridge._rpc_kitCreate(session_id, json.dumps(result["kit"], ensure_ascii=False)))
+            self.assertEqual(created["status"], "error")
+            self.assertIn("安全检查", created["message"])
+
+    async def test_remote_session_file_transfer_uses_builtin_file_push_without_ssh(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(
+            os.environ, {"AGENT_WITH_U_DATA_ROOT": str(Path(tmp) / "data")},
+        ):
+            workspace = Path(tmp) / "workspace"
+            workspace.mkdir()
+            bridge = BridgeWS()
+            session_id = "builtin-file-push"
+            bridge._active_sessions[session_id] = Session(
+                id=session_id, title="Remote file push", created_at=time.time(), updated_at=time.time(),
+                messages=[], working_dir=str(workspace), backend_id="fake",
+            )
+            # 模拟模型错误地索要 SSH 拓扑；产品层必须纠正为当前 Session 的
+            # 内建 file_push，并把本地文件留作运行时文件选择输入。
+            fake = _FakeKitCompilerBackend({
+                "ready": False,
+                "questions": [
+                    {"key": "remote_target", "question": "请提供主机、用户名和端口"},
+                    {"key": "auth_method", "question": "请提供 SSH 密钥或密码"},
+                ],
+                "warnings": ["缺少远端连接信息"],
+            })
+            with patch.object(bridge, "_new_backend_instance", return_value=fake):
+                result = json.loads(await bridge._rpc_kitGenerate(session_id, json.dumps({
+                    "objective": "把本地的 amp-1.0-snapshot.jar 文件同步到 remote session 上",
+                    "successCriteria": "传送成功则成功，反之失败",
+                    "safetyConstraints": "只写入当前 Session 工作区",
+                }, ensure_ascii=False)))
+
+            self.assertEqual(result["status"], "ok")
+            self.assertTrue(result["ready"])
+            self.assertEqual(result["questions"], [])
+            self.assertEqual(result["kit"]["inputs"][0]["type"], "file")
+            step = result["kit"]["steps"][0]
+            self.assertEqual(step["type"], "file_push")
+            self.assertEqual(step["config"]["source"], "{{local_file}}")
+            self.assertEqual(step["config"]["destination"], "amp-1.0-snapshot.jar")
+            self.assertNotIn("SSH", result["implementationSummary"])
+            self.assertIn("绝对不要询问", fake.prompt)
+
+    def test_selected_client_file_keeps_exact_local_source_and_same_name_destination(self):
+        candidate = BridgeWS._kit_builtin_file_push_candidate(
+            "把本地文件同步到当前 Session",
+            [r"C:\build\amp-1.0-snapshot.jar"],
+        )
+
+        self.assertIsNotNone(candidate)
+        assert candidate is not None
+        self.assertEqual(candidate["inputs"], [])
+        self.assertEqual(candidate["steps"][0]["config"]["source"], r"C:\build\amp-1.0-snapshot.jar")
+        self.assertEqual(candidate["steps"][0]["config"]["destination"], "amp-1.0-snapshot.jar")
+
+
+class WorkspaceKitVersionTests(unittest.IsolatedAsyncioTestCase):
+    @staticmethod
+    def _session(bridge: BridgeWS, session_id: str, workspace: Path) -> None:
+        bridge._active_sessions[session_id] = Session(
+            id=session_id, title="Kit versions", created_at=time.time(), updated_at=time.time(),
+            messages=[], working_dir=str(workspace), backend_id="fake",
+        )
+
+    async def test_implementation_versions_are_safe_and_switchable(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(
+            os.environ, {"AGENT_WITH_U_DATA_ROOT": str(Path(tmp) / "data")},
+        ):
+            bridge = BridgeWS()
+            workspace = Path(tmp) / "workspace"
+            workspace.mkdir()
+            self._session(bridge, "kit-versions", workspace)
+            created = json.loads(bridge._rpc_kitCreate("kit-versions", json.dumps({
+                "title": "Versioned", "command": "Write-Output one",
+            })))
+            kit_id = created["kit"]["id"]
+            self.assertEqual(created["kit"]["versions"][0]["version"], "1.0")
+
+            title_only = json.loads(bridge._rpc_kitUpdate(
+                "kit-versions", kit_id, json.dumps({"title": "Renamed"}),
+            ))
+            self.assertEqual(len(title_only["kit"]["versions"]), 1)
+
+            blocked = json.loads(bridge._rpc_kitUpdate(
+                "kit-versions", kit_id, json.dumps({"command": "Write-Output two"}),
+            ))
+            self.assertEqual(blocked["status"], "error")
+            self.assertIn("先停用", blocked["message"])
+
+            json.loads(bridge._rpc_kitUpdate("kit-versions", kit_id, json.dumps({"enabled": False})))
+            updated = json.loads(bridge._rpc_kitUpdate(
+                "kit-versions", kit_id, json.dumps({"command": "Write-Output two"}),
+            ))
+            self.assertEqual([v["version"] for v in updated["kit"]["versions"]], ["1.0", "1.1"])
+            first_id = updated["kit"]["versions"][0]["id"]
+            activated = json.loads(bridge._rpc_kitVersionActivate("kit-versions", kit_id, first_id))
+            self.assertEqual(activated["status"], "ok")
+            self.assertEqual(activated["kit"]["command"], "Write-Output one")
+            self.assertFalse(activated["kit"]["enabled"])
+
+    async def test_ai_optimization_is_candidate_until_user_finalizes(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(
+            os.environ, {"AGENT_WITH_U_DATA_ROOT": str(Path(tmp) / "data")},
+        ):
+            bridge = BridgeWS()
+            workspace = Path(tmp) / "workspace"
+            workspace.mkdir()
+            self._session(bridge, "kit-optimize", workspace)
+            created = json.loads(bridge._rpc_kitCreate("kit-optimize", json.dumps({
+                "title": "Optimize me", "command": "Write-Output one", "enabled": False,
+            })))
+            kit_id = created["kit"]["id"]
+            fake = _FakeKitCompilerBackend({
+                "reply": "已把过程拆为执行和复核。",
+                "ready": True,
+                "warnings": [],
+                "questions": [],
+                "proposal": {
+                    "implementationSummary": "执行后复核输出",
+                    "executionTarget": "executor",
+                    "shell": "powershell",
+                    "cwd": ".",
+                    "command": "Write-Output optimized",
+                    "assertions": [{"type": "stdout_contains", "expected": "optimized"}],
+                    "outputs": [{"key": "result", "source": "stdout", "type": "text"}],
+                    "schedule": {"mode": "manual", "intervalSeconds": 300},
+                },
+            })
+            with patch.object(bridge, "_new_backend_instance", return_value=fake) as factory:
+                asked = json.loads(await bridge._rpc_kitOptimizeAsk(
+                    "kit-optimize", kit_id, "增加可靠的执行后复核", "review-backend",
+                ))
+
+            self.assertEqual(asked["status"], "ok")
+            assistant = asked["message"]
+            self.assertTrue(assistant["ready"])
+            factory.assert_called_once_with("review-backend")
+            persisted = bridge._kit_get("kit-optimize").kits[0]
+            self.assertEqual(persisted.command, "Write-Output one")
+            self.assertEqual(len(persisted.versions), 1)
+
+            finalized = json.loads(bridge._rpc_kitOptimizeFinalize(
+                "kit-optimize", kit_id, assistant["id"], "复核版",
+            ))
+            self.assertEqual(finalized["status"], "ok")
+            self.assertEqual(finalized["version"]["version"], "1.1")
+            persisted = bridge._kit_get("kit-optimize").kits[0]
+            self.assertEqual(persisted.command, "Write-Output optimized")
+            self.assertEqual(persisted.active_version_id, finalized["version"]["id"])
+            final_message = next(item for item in persisted.optimization_messages if item.id == assistant["id"])
+            self.assertEqual(final_message.finalized_version_id, finalized["version"]["id"])
+
+            compact = bridge._kit_payload(bridge._kit_get("kit-optimize"))["kits"][0]
+            self.assertNotIn("snapshot", compact["versions"][0])
+            self.assertEqual(compact["optimizationMessages"], [])
+
 
 class WorkspaceKitExecutionTests(unittest.IsolatedAsyncioTestCase):
+    @staticmethod
+    def _session(bridge: BridgeWS, session_id: str, workspace: Path) -> None:
+        bridge._active_sessions[session_id] = Session(
+            id=session_id, title="Kit orchestration", created_at=time.time(), updated_at=time.time(),
+            messages=[], working_dir=str(workspace), backend_id="codex-office",
+        )
+
+    async def test_steps_stop_after_first_failure(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(
+            os.environ, {"AGENT_WITH_U_DATA_ROOT": str(Path(tmp) / "data")},
+        ):
+            bridge = BridgeWS()
+            workspace = Path(tmp) / "workspace"
+            workspace.mkdir()
+            self._session(bridge, "step-failure", workspace)
+            if os.name == "nt":
+                shell, fail, write = "powershell", "Write-Error fail; exit 7", "Set-Content skipped.txt yes"
+            else:
+                shell, fail, write = "bash", "exit 7", "printf yes > skipped.txt"
+            created = json.loads(bridge._rpc_kitCreate("step-failure", json.dumps({
+                "title": "ordered",
+                "steps": [
+                    {"id": "one", "type": "command", "target": "executor", "title": "fail",
+                     "shell": shell, "command": fail, "assertions": [{"type": "exit_code", "expected": 0}]},
+                    {"id": "two", "type": "command", "target": "executor", "title": "must skip",
+                     "shell": shell, "command": write},
+                ],
+            })))
+            started = json.loads(bridge._rpc_kitRun("step-failure", created["kit"]["id"], "{}"))
+
+            await bridge._kit_tasks[started["run"]["id"]]
+            run = bridge._kit_get("step-failure").runs[-1]
+
+            self.assertEqual(run.status, "failed")
+            self.assertEqual(run.steps[0].status, "failed")
+            self.assertEqual(run.steps[1].status, "skipped")
+            self.assertFalse((workspace / "skipped.txt").exists())
+
+    async def test_kit_call_expands_and_runs_in_order(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(
+            os.environ, {"AGENT_WITH_U_DATA_ROOT": str(Path(tmp) / "data")},
+        ):
+            bridge = BridgeWS()
+            workspace = Path(tmp) / "workspace"
+            workspace.mkdir()
+            self._session(bridge, "kit-call", workspace)
+            if os.name == "nt":
+                shell, child_command = "powershell", "Write-Output child"
+            else:
+                shell, child_command = "bash", "printf child"
+            child = json.loads(bridge._rpc_kitCreate("kit-call", json.dumps({
+                "title": "child", "shell": shell, "command": child_command,
+                "assertions": [{"type": "stdout_contains", "expected": "child"}],
+            })))["kit"]
+            parent = json.loads(bridge._rpc_kitCreate("kit-call", json.dumps({
+                "title": "parent",
+                "steps": [{"id": "call", "type": "kit_call", "title": "invoke child", "kitId": child["id"]}],
+                "assertions": [{"type": "stdout_contains", "expected": "child"}],
+            })))["kit"]
+            started = json.loads(bridge._rpc_kitRun("kit-call", parent["id"], "{}"))
+
+            await bridge._kit_tasks[started["run"]["id"]]
+            run = bridge._kit_get("kit-call").runs[-1]
+
+            self.assertEqual(run.status, "succeeded")
+            self.assertEqual([step.type for step in run.steps], ["kit_call", "command"])
+            self.assertTrue(all(step.status == "succeeded" for step in run.steps))
+            self.assertIn("child", run.stdout)
+
+    async def test_kit_call_cycle_is_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(
+            os.environ, {"AGENT_WITH_U_DATA_ROOT": str(Path(tmp) / "data")},
+        ):
+            bridge = BridgeWS()
+            workspace = Path(tmp) / "workspace"
+            workspace.mkdir()
+            self._session(bridge, "kit-cycle", workspace)
+            a = json.loads(bridge._rpc_kitCreate("kit-cycle", json.dumps({
+                "title": "A", "command": "echo A",
+            })))["kit"]
+            b = json.loads(bridge._rpc_kitCreate("kit-cycle", json.dumps({
+                "title": "B", "steps": [{"id": "to-a", "type": "kit_call", "kitId": a["id"]}],
+            })))["kit"]
+
+            updated = json.loads(bridge._rpc_kitUpdate("kit-cycle", a["id"], json.dumps({
+                "command": "", "steps": [{"id": "to-b", "type": "kit_call", "kitId": b["id"]}],
+            })))
+
+            self.assertEqual(updated["status"], "error")
+            self.assertIn("循环", updated["message"])
+
+    async def test_client_file_push_is_atomic_and_hash_checked(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(
+            os.environ, {"AGENT_WITH_U_DATA_ROOT": str(Path(tmp) / "data")},
+        ):
+            bridge = BridgeWS()
+            workspace = Path(tmp) / "workspace"
+            workspace.mkdir()
+            self._session(bridge, "file-push", workspace)
+            created = json.loads(bridge._rpc_kitCreate("file-push", json.dumps({
+                "title": "deploy",
+                "steps": [{
+                    "id": "push", "type": "file_push", "title": "push artifact",
+                    "config": {"source": "C:/client/dist/app.jar", "destination": "deploy/app.jar", "overwrite": True},
+                }],
+            })))["kit"]
+            started = json.loads(bridge._rpc_kitRun("file-push", created["id"], "{}"))
+            run_id = started["run"]["id"]
+            for _ in range(100):
+                run = bridge._kit_get("file-push").runs[-1]
+                if run.status == "waiting_client":
+                    break
+                await __import__("asyncio").sleep(0.01)
+            self.assertEqual(run.status, "waiting_client")
+            content = b"deterministic deployment artifact"
+            digest = hashlib.sha256(content).hexdigest()
+            transfer_id = "kit_test_transfer_1234"
+            self.assertEqual(json.loads(bridge._rpc_kitClientFileStart(
+                "file-push", run_id, run.steps[0].id, transfer_id, len(content), digest,
+            ))["status"], "ok")
+            self.assertEqual(json.loads(bridge._rpc_kitClientFileChunk(
+                "file-push", run_id, run.steps[0].id, transfer_id, 0,
+                base64.b64encode(content).decode("ascii"),
+            ))["status"], "ok")
+            self.assertEqual(json.loads(bridge._rpc_kitClientFileFinish(
+                "file-push", run_id, run.steps[0].id, transfer_id,
+            ))["status"], "ok")
+
+            await bridge._kit_tasks[run_id]
+            run = bridge._kit_get("file-push").runs[-1]
+            self.assertEqual(run.status, "succeeded")
+            self.assertEqual((workspace / "deploy" / "app.jar").read_bytes(), content)
+
     async def test_bridge_executes_verdict_and_publishes_output(self):
         with tempfile.TemporaryDirectory() as tmp, patch.dict(
             os.environ, {"AGENT_WITH_U_DATA_ROOT": str(Path(tmp) / "data")},

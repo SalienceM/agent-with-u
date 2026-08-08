@@ -5,6 +5,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import Mock
 
 from src.backend.bridge_ws import BridgeWS
 
@@ -65,6 +66,36 @@ class FileTransferTests(unittest.TestCase):
         self.assertEqual(error["status"], "error")
         self.assertFalse((self.root / "new.bin").exists())
         self.bridge._rpc_syncWriteAbort(str(self.root), "new.bin", transfer)
+
+    def test_file_panel_can_list_hidden_git_directory(self) -> None:
+        (self.root / ".git").mkdir()
+        (self.root / ".git" / "config").write_text("[core]", encoding="utf-8")
+        (self.root / ".env").write_text("secret=false", encoding="utf-8")
+
+        default_entries = self.parsed(
+            self.bridge._rpc_listDirectory("", str(self.root))
+        )
+        self.assertNotIn(".git", {item["name"] for item in default_entries})
+
+        transfer_entries = self.parsed(
+            self.bridge._rpc_listDirectory("", str(self.root), True)
+        )
+        self.assertIn(".git", {item["name"] for item in transfer_entries})
+        self.assertIn(".env", {item["name"] for item in transfer_entries})
+
+    def test_sync_manifest_never_ignores_git_metadata(self) -> None:
+        (self.root / ".git").mkdir()
+        (self.root / ".git" / "config").write_text("[core]", encoding="utf-8")
+        (self.root / "node_modules").mkdir()
+        (self.root / "node_modules" / "package.js").write_text("ignored", encoding="utf-8")
+        # 模拟旧版本已经把 .git 写入 syncIgnore；迁移后仍必须包含 Git 元数据。
+        self.bridge._app_config_store = Mock()
+        self.bridge._app_config_store.get.return_value = [".git", "node_modules"]
+
+        manifest = self.parsed(self.bridge._rpc_syncManifest(str(self.root)))
+        self.assertEqual("ok", manifest["status"])
+        self.assertIn(".git/config", manifest["files"])
+        self.assertNotIn("node_modules/package.js", manifest["files"])
 
 
 if __name__ == "__main__":

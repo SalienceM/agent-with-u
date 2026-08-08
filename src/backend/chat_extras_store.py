@@ -39,7 +39,8 @@ class SeqTask:
     text: str = ""
     images: list = field(default_factory=list)
     text_attachments: list = field(default_factory=list)
-    status: str = "pending"   # pending | sent
+    delivery_mode: str = ""  # "" | redirect；redirect 表示由中断后重引导产生
+    status: str = "pending"   # pending | steering | sent
     created_at: float = field(default_factory=_now)
     updated_at: float = field(default_factory=_now)
 
@@ -51,6 +52,7 @@ class SeqTask:
             "imageCount": len(self.images or []),
             "textAttachments": list(self.text_attachments or []),
             "textAttachmentCount": len(self.text_attachments or []),
+            "deliveryMode": self.delivery_mode,
             "status": self.status,
             "createdAt": self.created_at,
             "updatedAt": self.updated_at,
@@ -63,7 +65,10 @@ class SeqTask:
             text=d.get("text", ""),
             images=list(d.get("images") or []),
             text_attachments=list(d.get("textAttachments") or []),
-            status=d.get("status", "pending"),
+            delivery_mode=("redirect" if d.get("deliveryMode") == "redirect" else ""),
+            # ``steering`` 是进程内的短暂租约；服务重启说明该 steer 已无法
+            # 完成，必须恢复为 pending，避免消息永久卡死。
+            status=("pending" if d.get("status") == "steering" else d.get("status", "pending")),
             created_at=d.get("createdAt", _now()),
             updated_at=d.get("updatedAt", _now()),
         )
