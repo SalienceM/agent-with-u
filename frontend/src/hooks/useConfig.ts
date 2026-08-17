@@ -2,6 +2,7 @@ import { useState, useCallback, useEffect, useRef } from 'react';
 import { api } from '../api';
 
 export type ThemeType = 'dark' | 'midnight' | 'light' | 'classic' | 'cyber';
+export type RealtimeVoiceTtsEngine = 'system' | 'edge' | 'dashscope';
 
 export interface AppConfig {
   fontSize: number;
@@ -13,8 +14,20 @@ export interface AppConfig {
   uiOpacity: number;
   ttsVoice: string;
   ttsRate: number;
+  /** @deprecated Kept only so older persisted config can still be read. */
+  realtimeVoiceSilenceMs: number;
+  realtimeVoiceTurnEndSilenceMs: number;
+  realtimeVoiceContinuousWindowMs: number;
+  realtimeVoiceWakeWord: string;
+  realtimeVoiceTtsEngine: RealtimeVoiceTtsEngine;
+  realtimeVoiceSystemVoice: string;
+  realtimeVoiceDashScopeModel: string;
+  realtimeVoiceDashScopeVoice: string;
+  realtimeVoiceVadThreshold: number;
+  realtimeVoiceBargeIn: boolean;
   workspaceKitsEnabled: boolean;
   sidebarSessionLimit: number;
+  desktopTaskNotifications: boolean;
 }
 
 const DEFAULT_CONFIG: AppConfig = {
@@ -27,8 +40,19 @@ const DEFAULT_CONFIG: AppConfig = {
   uiOpacity: 1.0,
   ttsVoice: 'zh-CN-XiaoxiaoNeural',
   ttsRate: 0,
+  realtimeVoiceSilenceMs: 700,
+  realtimeVoiceTurnEndSilenceMs: 1500,
+  realtimeVoiceContinuousWindowMs: 30000,
+  realtimeVoiceWakeWord: 'Yuki',
+  realtimeVoiceTtsEngine: 'system',
+  realtimeVoiceSystemVoice: '',
+  realtimeVoiceDashScopeModel: 'cosyvoice-v1',
+  realtimeVoiceDashScopeVoice: 'longxiaochun',
+  realtimeVoiceVadThreshold: 0.018,
+  realtimeVoiceBargeIn: true,
   workspaceKitsEnabled: true,
   sidebarSessionLimit: 25,
+  desktopTaskNotifications: true,
 };
 
 // Theme color schemes
@@ -204,6 +228,55 @@ export function useConfig() {
         savedConfig.sidebarSessionLimit = Number.isFinite(sidebarLimit) && sidebarLimit >= 5
           ? Math.min(500, Math.trunc(sidebarLimit))
           : 25;
+        // Older config files do not contain this field. Keep completion
+        // notifications enabled by default while preserving an explicit opt-out.
+        savedConfig.desktopTaskNotifications = savedConfig.desktopTaskNotifications !== false;
+        const voiceSilenceMs = Number(savedConfig.realtimeVoiceSilenceMs);
+        savedConfig.realtimeVoiceSilenceMs = Number.isFinite(voiceSilenceMs)
+          ? Math.max(350, Math.min(2000, Math.trunc(voiceSilenceMs)))
+          : 700;
+        // 使用新字段，避免旧版本保存的 700ms 继续造成过早断句。
+        const turnEndSilenceMs = Number(savedConfig.realtimeVoiceTurnEndSilenceMs);
+        savedConfig.realtimeVoiceTurnEndSilenceMs = Number.isFinite(turnEndSilenceMs)
+          ? Math.max(900, Math.min(3000, Math.trunc(turnEndSilenceMs)))
+          : 1500;
+        const continuousWindowMs = Number(savedConfig.realtimeVoiceContinuousWindowMs);
+        savedConfig.realtimeVoiceContinuousWindowMs = Number.isFinite(continuousWindowMs)
+          ? Math.max(10_000, Math.min(120_000, Math.trunc(continuousWindowMs)))
+          : 30_000;
+        const savedWakeWord = typeof savedConfig.realtimeVoiceWakeWord === 'string'
+          ? savedConfig.realtimeVoiceWakeWord.slice(0, 24)
+          : 'Yuki';
+        // “小U”是旧版本的内置默认值，不是用户显式选择的版本标记；升级时
+        // 将这一默认值迁移到新的 Yuki，其他自定义唤醒词保持不变。
+        savedConfig.realtimeVoiceWakeWord = /^小\s*[uUＵ]$/.test(savedWakeWord.trim())
+          ? 'Yuki'
+          : savedWakeWord;
+        savedConfig.realtimeVoiceTtsEngine = (
+          savedConfig.realtimeVoiceTtsEngine === 'edge'
+          || savedConfig.realtimeVoiceTtsEngine === 'dashscope'
+        ) ? savedConfig.realtimeVoiceTtsEngine : 'system';
+        savedConfig.realtimeVoiceSystemVoice = typeof savedConfig.realtimeVoiceSystemVoice === 'string'
+          ? savedConfig.realtimeVoiceSystemVoice.slice(0, 180)
+          : '';
+        const savedDashScopeModel = typeof savedConfig.realtimeVoiceDashScopeModel === 'string'
+          ? savedConfig.realtimeVoiceDashScopeModel.slice(0, 128)
+          : 'cosyvoice-v1';
+        const savedDashScopeVoice = typeof savedConfig.realtimeVoiceDashScopeVoice === 'string'
+          ? savedConfig.realtimeVoiceDashScopeVoice.slice(0, 128)
+          : 'longxiaochun';
+        // 早期实验版错误地把 v3-flash + longxiaochun 作为内置默认值；该组合
+        // 在旧域名/默认业务空间会返回 CosyVoice engine 418。只迁移这一个
+        // 曾经发布过的默认组合，用户填写的其他模型/音色保持原样。
+        savedConfig.realtimeVoiceDashScopeModel = (
+          savedDashScopeModel === 'cosyvoice-v3-flash'
+          && savedDashScopeVoice === 'longxiaochun'
+        ) ? 'cosyvoice-v1' : savedDashScopeModel;
+        savedConfig.realtimeVoiceDashScopeVoice = savedDashScopeVoice;
+        const voiceVadThreshold = Number(savedConfig.realtimeVoiceVadThreshold);
+        savedConfig.realtimeVoiceVadThreshold = Number.isFinite(voiceVadThreshold)
+          ? Math.max(0.004, Math.min(0.12, voiceVadThreshold))
+          : 0.018;
         setConfig((prev) => ({ ...prev, ...savedConfig }));
       }
       setLoaded(true);

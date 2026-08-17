@@ -114,10 +114,6 @@ export interface ChatPaneProps {
   onGhostStateChange?: (state: SmoothGhostState) => void;
   // 对话字号步进(全局 config.fontSize),由 App 注入
   onAdjustFontSize?: (delta: number) => void;
-  // 全局工具(由 App 注入,放在输入框正上方,避免顶栏拥挤)
-  layoutLabel?: string;
-  onCycleLayout?: () => void;
-  onOpenSync?: () => void;
 }
 
 export const ChatPane: React.FC<ChatPaneProps> = ({
@@ -134,17 +130,13 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
   onStreamingChange,
   onGhostStateChange,
   onAdjustFontSize,
-  layoutLabel,
-  onCycleLayout,
-  onOpenSync,
 }) => {
   // ── pane 自己的 session 详情(workingDir / backendId / skip / sandbox) ──
   const [activeSession, setActiveSession] = useState<any | null>(null);
   const [nodeBackends, setNodeBackends] = useState<any[]>(backends);
   const [loopControlMode, setLoopControlMode] = useState<'loop' | 'manual'>('loop');
   const [loopRunning, setLoopRunning] = useState(false);
-  const [loopSwitchBusy, setLoopSwitchBusy] = useState(false);
-  const [loopInspectorOpen, setLoopInspectorOpen] = useState(false);
+  const [realtimeVoiceActive, setRealtimeVoiceActive] = useState(false);
   // 权限 state: 初值从 session 读,变化时持久化
   const [skipPermissions, setSkipPermissions] = useState(true);
   // 可见消息条数(切换 session / 切回历史时只显示最近几条)
@@ -205,10 +197,6 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
     return unsubscribe;
   }, [sessionId]);
 
-  useEffect(() => {
-    setLoopInspectorOpen(false);
-  }, [sessionId, loopControlMode]);
-
   // Backend configuration belongs to the executor that owns the session.
   useEffect(() => {
     const execKey = activeSession?.execKey;
@@ -226,6 +214,9 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
 
   const effectiveBackends = activeSession?.execKey ? nodeBackends : backends;
   const activeBackendId = activeSession?.backendId || effectiveBackends[0]?.id || '';
+  const activeBackendLabel = effectiveBackends.find((item) => item.id === activeBackendId)?.label
+    || activeBackendId
+    || '当前 Backend';
   const sessionMetaReady = !!sessionId && activeSession?.id === sessionId;
   const automatedLoop = sessionMetaReady
     && activeSession?.sessionType === 'loop'
@@ -750,72 +741,6 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
         background: 'transparent',
       }}
     >
-      {activeSession?.sessionType === 'loop' && loopControlMode === 'manual' && (
-        <div style={{
-          flexShrink: 0, display: 'flex', alignItems: 'center', gap: 10,
-          padding: '8px 12px', background: '#d2992218', borderBottom: '1px solid #d2992255',
-          color: 'var(--theme-text)', fontSize: 12,
-        }}>
-          <span style={{ color: '#d29922', fontWeight: 700 }}>✋ Manual LOOP · 人工接管中</span>
-          <span style={{ color: 'var(--theme-text-muted)' }}>对话、工具调用和文件操作会记录为一轮人工 LOOP。</span>
-          <div style={{ flex: 1 }} />
-          <button
-            onClick={() => setLoopInspectorOpen(true)}
-            style={{
-              border: '1px solid var(--theme-border)', borderRadius: 7, padding: '5px 10px',
-              background: 'var(--theme-bg-tertiary)', color: 'var(--theme-text)', cursor: 'pointer',
-              whiteSpace: 'nowrap',
-            }}
-            title="只读查看完整 LOOP 面板，可切换面板/流程视图；不会退出人工接管"
-          >
-            🗂 LOOP 总览
-          </button>
-          <button
-            disabled={loopSwitchBusy}
-            onClick={async () => {
-              if (loopSwitchBusy) return;
-              setLoopSwitchBusy(true);
-              try {
-                // 本地 isStreaming 可能在中断/重连后残留；交还前以执行节点的
-                // 权威任务注册表为准，后端也会做同样的最终校验。
-                const runState = await api.getSessionRunState(sessionId);
-                if (runState.busy) {
-                  alert(runState.status === 'offline'
-                    ? '执行节点当前离线，暂时无法确认是否可交还 LOOP'
-                    : '回答仍在生成，结束或停止后才能交还 LOOP');
-                  return;
-                }
-                const result = await api.loopRelease(sessionId);
-                if (result.status !== 'ok' && result.message) alert(result.message);
-              } finally {
-                setLoopSwitchBusy(false);
-              }
-            }}
-            style={{
-              border: '1px solid #d2992266', borderRadius: 7, padding: '5px 10px',
-              background: '#d2992222', color: '#d29922',
-              cursor: loopSwitchBusy ? 'wait' : 'pointer',
-              opacity: loopSwitchBusy ? 0.55 : 1, whiteSpace: 'nowrap',
-            }}
-            title="检查真实运行状态后，封存人工操作并返回 LOOP"
-          >
-            {loopSwitchBusy ? '交还中…' : '↩ 交还 LOOP'}
-          </button>
-        </div>
-      )}
-      {activeSession?.sessionType === 'loop' && loopControlMode === 'manual' && loopInspectorOpen && (
-        <LoopPanel
-          sessionId={sessionId}
-          onClose={() => setLoopInspectorOpen(false)}
-          inspectOnly
-          sessionBackendId={activeBackendId}
-          sessionRuntime={{
-            model: activeSession?.modelOverride,
-            reasoningEffort: activeSession?.reasoningEffort,
-          }}
-          backends={effectiveBackends}
-        />
-      )}
       {/* ---- 消息列表 ---- */}
       <div style={{ flex: 1, position: 'relative', overflow: 'hidden' }}>
         <div
@@ -1032,26 +957,6 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
         )}
       </div>
 
-      {/* ---- 全局工具栏(输入框正上方,被 App 从顶栏挪下来,避免那一排太挤) ----
-           目录同步已重做为侧栏「🗂 文件」视图(本地 ⇄ 远端目录树),此处不再放入口。
-           移动端隐藏分屏布局按钮(单屏无意义,省下这一排)。 */}
-      {onCycleLayout && !isMobile && (
-        <div style={{
-          display: 'flex',
-          gap: 6,
-          padding: '4px 10px 0',
-          justifyContent: 'flex-end',
-        }}>
-          <button
-            onClick={onCycleLayout}
-            title="分屏布局 (1×1 / 1×2 / 2×2)"
-            style={paneToolBtnStyle}
-          >
-            ▦ {layoutLabel || ''}
-          </button>
-        </div>
-      )}
-
       {/* ---- 有待发任务时显示 slim 队列条；输入框无需显式切换模式 ---- */}
       {sessionId && seqTasks.some((t) => t.status === 'pending' || t.status === 'steering') && (
         <SeqTaskPanel
@@ -1090,6 +995,28 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
           reasoningEffort: activeSession?.reasoningEffort,
         }}
         onSessionRuntimeChange={handleSessionRuntimeChange}
+        voiceConversationActive={realtimeVoiceActive}
+        realtimeVoice={{
+          sessionId,
+          backendLabel: activeBackendLabel,
+          voice: config.ttsVoice,
+          rate: config.ttsRate,
+          turnEndSilenceMs: config.realtimeVoiceTurnEndSilenceMs,
+          continuousWindowMs: config.realtimeVoiceContinuousWindowMs,
+          wakeWord: config.realtimeVoiceWakeWord,
+          ttsEngine: config.realtimeVoiceTtsEngine,
+          systemVoice: config.realtimeVoiceSystemVoice,
+          dashscopeModel: config.realtimeVoiceDashScopeModel,
+          dashscopeVoice: config.realtimeVoiceDashScopeVoice,
+          vadThreshold: config.realtimeVoiceVadThreshold,
+          bargeIn: config.realtimeVoiceBargeIn,
+          onSend: (text, interactionMode) => {
+            if (!isStreamingRef.current) {
+              doSendRef.current(text, undefined, undefined, undefined, interactionMode);
+            }
+          },
+          onActiveChange: setRealtimeVoiceActive,
+        }}
       />
 
       {/* ---- By the way 旁路问答：浮动入口 + 抽屉 ---- */}
@@ -1156,14 +1083,4 @@ const byTheWayFab: React.CSSProperties = {
 const kitFab: React.CSSProperties = {
   ...byTheWayFab,
   right: 54,
-};
-
-const paneToolBtnStyle: React.CSSProperties = {
-  padding: '4px 10px',
-  borderRadius: 5,
-  fontSize: 12,
-  cursor: 'pointer',
-  background: 'var(--theme-bg, rgba(255,255,255,0.06))',
-  color: 'var(--theme-text-muted, #aaa)',
-  border: '1px solid var(--theme-border, rgba(255,255,255,0.12))',
 };

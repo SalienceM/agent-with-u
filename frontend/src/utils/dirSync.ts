@@ -14,10 +14,15 @@
  *   - 浏览器：File System Access API（仅 Chromium 内核）
  */
 import { api, isTauri } from '../api';
+import { sha256BlobHex } from './sha256';
+import { isIgnored } from './dirSyncPolicy';
+export { isGitMetadataPath, isIgnored } from './dirSyncPolicy';
 
 export interface FileMeta {
   hash: string;
   size: number;
+  /** Unix 毫秒。仅用于解释哪端更新；内容一致性仍以 hash 为准。 */
+  mtime?: number;
 }
 /** relpath → 文件元信息 */
 export type Manifest = Record<string, FileMeta>;
@@ -62,37 +67,6 @@ export interface ApplyResult {
   failed: { rel: string; error: string }[];
 }
 
-// ── 通配匹配（与后端 Python fnmatch 语义对齐）──────────────────
-
-function wildcardToRegExp(pat: string): RegExp {
-  const body = pat
-    .split('')
-    .map((c) => {
-      if (c === '*') return '.*';
-      if (c === '?') return '.';
-      return c.replace(/[.+^${}()|[\]\\]/g, '\\$&');
-    })
-    .join('');
-  return new RegExp(`^${body}$`);
-}
-
-/** gitignore 风格的简化匹配：任一路径段或整条相对路径命中即忽略。 */
-export function isIgnored(rel: string, patterns: string[]): boolean {
-  const r = rel.replace(/\\/g, '/');
-  const segs = r.split('/').filter(Boolean);
-  // Session 文件传输需要完整保留 Git 元数据；旧 syncIgnore 配置即便仍含
-  // `.git`（或更宽通配符）也不能把它静默排除。
-  if (segs.includes('.git')) return false;
-  for (const pat of patterns) {
-    const p = pat.trim().replace(/\/+$/, '');
-    if (!p) continue;
-    const re = wildcardToRegExp(p);
-    if (re.test(r)) return true;
-    for (const s of segs) if (re.test(s)) return true;
-  }
-  return false;
-}
-
 // ── base64 / 哈希 工具 ────────────────────────────────────────
 
 function arrayBufferToBase64(buf: ArrayBuffer): string {
@@ -112,26 +86,29 @@ function base64ToUint8Array(b64: string): Uint8Array {
   return bytes;
 }
 
-async function sha256Hex(buf: ArrayBuffer): Promise<string> {
-  const digest = await crypto.subtle.digest('SHA-256', buf);
-  return Array.from(new Uint8Array(digest))
-    .map((b) => b.toString(16).padStart(2, '0'))
-    .join('');
+function base64ToBlob(b64: string): Blob {
+  // Uint8Array<ArrayBufferLike> 在新版 TS DOM 类型里不能直接作为 BlobPart；
+  // slice 出独立 ArrayBuffer 同时避免引用额外底层容量。
+  const bytes = base64ToUint8Array(b64);
+  return new Blob([bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer]);
 }
 
 // ── 本地副本目录的文件系统抽象 ─────────────────────────────────
 
 export interface LocalFs {
-  readonly kind: 'tauri' | 'browser';
+  readonly kind: 'tauri' | 'browser' | 'managed';
   /** 人类可读的副本目录标识（用于界面展示） */
   label(): string;
   /** 跨会话稳定的标识，用于给基线做 key */
   id(): string;
-  scan(ignore: string[]): Promise<Manifest>;
+  scan(ignore: string[], includeGit?: boolean): Promise<Manifest>;
   /** 列出某相对目录的直接子项(懒加载逐层浏览用,不递归、不算哈希)。 */
   listDir(rel: string): Promise<LocalEntry[]>;
   readFile(rel: string): Promise<string>; // base64
+  /** 浏览器实现可直接交换 Blob，避免平板导入/导出时做整文件 base64 膨胀。 */
+  readBlob?(rel: string): Promise<Blob>;
   writeFile(rel: string, base64: string): Promise<void>;
+  writeBlob?(rel: string, data: Blob): Promise<void>;
   fileSize(rel: string): Promise<number>;
   readChunk(rel: string, offset: number, size: number): Promise<string>;
   writeStart(rel: string, transferId: string): Promise<void>;
@@ -183,10 +160,11 @@ export class TauriLocalFs implements LocalFs {
   id(): string {
     return `tauri:${this.dir}`;
   }
-  async scan(ignore: string[]): Promise<Manifest> {
+  async scan(ignore: string[], includeGit = false): Promise<Manifest> {
     const r = await tauriInvoke<{ files: Manifest }>('dir_sync_scan', {
       dir: this.dir,
       ignore,
+      includeGit,
     });
     this._scanCache = r.files || {};
     return this._scanCache;
@@ -232,6 +210,7 @@ export class TauriLocalFs implements LocalFs {
 export class BrowserLocalFs implements LocalFs {
   readonly kind = 'browser' as const;
   private writers = new Map<string, any>();
+  private scanCache = new Map<string, { size: number; modified: number; hash: string }>();
   // handle 类型依赖 lib.dom 版本，统一用 any 规避版本差异
   constructor(private handle: any) {}
   label(): string {
@@ -240,9 +219,9 @@ export class BrowserLocalFs implements LocalFs {
   id(): string {
     return `browser:${this.handle?.name || ''}`;
   }
-  async scan(ignore: string[]): Promise<Manifest> {
+  async scan(ignore: string[], includeGit = false): Promise<Manifest> {
     const out: Manifest = {};
-    await this._walk(this.handle, '', ignore, out);
+    await this._walk(this.handle, '', ignore, includeGit, out);
     return out;
   }
   // 浏览器：原生逐层列目录（含空目录），不算哈希,快。
@@ -257,16 +236,26 @@ export class BrowserLocalFs implements LocalFs {
     out.sort((a, b) => (a.isDir !== b.isDir ? (a.isDir ? -1 : 1) : a.name.localeCompare(b.name)));
     return out;
   }
-  private async _walk(dir: any, base: string, ignore: string[], out: Manifest): Promise<void> {
+  private async _walk(
+    dir: any,
+    base: string,
+    ignore: string[],
+    includeGit: boolean,
+    out: Manifest,
+  ): Promise<void> {
     for await (const [name, h] of dir.entries()) {
       const rel = base ? `${base}/${name}` : name;
-      if (isIgnored(rel, ignore)) continue;
+      if (isIgnored(rel, ignore, includeGit)) continue;
       if (h.kind === 'directory') {
-        await this._walk(h, rel, ignore, out);
+        await this._walk(h, rel, ignore, includeGit, out);
       } else {
         const file = await h.getFile();
-        const buf = await file.arrayBuffer();
-        out[rel] = { hash: await sha256Hex(buf), size: file.size };
+        const cached = this.scanCache.get(rel);
+        const hash = cached && cached.size === file.size && cached.modified === file.lastModified
+          ? cached.hash
+          : await sha256BlobHex(file);
+        this.scanCache.set(rel, { size: file.size, modified: file.lastModified, hash });
+        out[rel] = { hash, size: file.size, mtime: file.lastModified };
       }
     }
   }
@@ -283,10 +272,20 @@ export class BrowserLocalFs implements LocalFs {
     const file = await fh.getFile();
     return arrayBufferToBase64(await file.arrayBuffer());
   }
+  async readBlob(rel: string): Promise<Blob> {
+    const fh = await this._fileHandle(rel, false);
+    return fh.getFile();
+  }
   async writeFile(rel: string, base64: string): Promise<void> {
     const fh = await this._fileHandle(rel, true);
     const w = await fh.createWritable();
     await w.write(base64ToUint8Array(base64));
+    await w.close();
+  }
+  async writeBlob(rel: string, data: Blob): Promise<void> {
+    const fh = await this._fileHandle(rel, true);
+    const w = await fh.createWritable();
+    await w.write(data);
     await w.close();
   }
   async fileSize(rel: string): Promise<number> {
@@ -335,9 +334,12 @@ export class BrowserLocalFs implements LocalFs {
 // ── 副本目录的选择与持久化 ─────────────────────────────────────
 
 const COPYDIR_TAURI_KEY = 'awu-dirsync-copydir-tauri';
+const COPYDIR_BROWSER_MODE_KEY = 'awu-dirsync-copydir-browser-mode';
 const IDB_DB = 'awu-dirsync';
 const IDB_STORE = 'handles';
 const IDB_HANDLE_KEY = 'copydir';
+const IDB_FILE_STORE = 'offline-files';
+const IDB_CHUNK_STORE = 'offline-chunks';
 
 function scopedCopyDirKey(base: string, bindingKey?: string): string {
   return bindingKey ? `${base}:${bindingKey}` : base;
@@ -345,8 +347,25 @@ function scopedCopyDirKey(base: string, bindingKey?: string): string {
 
 function idbOpen(): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
-    const req = indexedDB.open(IDB_DB, 1);
-    req.onupgradeneeded = () => req.result.createObjectStore(IDB_STORE);
+    const req = indexedDB.open(IDB_DB, 3);
+    req.onupgradeneeded = () => {
+      if (!req.result.objectStoreNames.contains(IDB_STORE)) req.result.createObjectStore(IDB_STORE);
+      const fileStore = req.result.objectStoreNames.contains(IDB_FILE_STORE)
+        ? req.transaction!.objectStore(IDB_FILE_STORE)
+        : req.result.createObjectStore(IDB_FILE_STORE, { keyPath: 'key' });
+      if (!fileStore.indexNames.contains('workspace')) {
+        fileStore.createIndex('workspace', 'workspace', { unique: false });
+      }
+      const chunkStore = req.result.objectStoreNames.contains(IDB_CHUNK_STORE)
+        ? req.transaction!.objectStore(IDB_CHUNK_STORE)
+        : req.result.createObjectStore(IDB_CHUNK_STORE, { keyPath: 'key' });
+      if (!chunkStore.indexNames.contains('workspace')) {
+        chunkStore.createIndex('workspace', 'workspace', { unique: false });
+      }
+      if (!chunkStore.indexNames.contains('transferKey')) {
+        chunkStore.createIndex('transferKey', 'transferKey', { unique: false });
+      }
+    };
     req.onsuccess = () => resolve(req.result);
     req.onerror = () => reject(req.error);
   });
@@ -376,6 +395,307 @@ function idbGet(key: string): Promise<any> {
   );
 }
 
+function idbStorePut(store: string, val: any): Promise<void> {
+  return idbOpen().then(
+    (db) =>
+      new Promise((resolve, reject) => {
+        const tx = db.transaction(store, 'readwrite');
+        tx.objectStore(store).put(val);
+        tx.oncomplete = () => resolve();
+        tx.onerror = () => reject(tx.error);
+        tx.onabort = () => reject(tx.error || new Error('浏览器离线空间写入已中止'));
+      }),
+  );
+}
+
+function idbStoreGet(store: string, key: string): Promise<any> {
+  return idbOpen().then(
+    (db) =>
+      new Promise((resolve, reject) => {
+        const tx = db.transaction(store, 'readonly');
+        const req = tx.objectStore(store).get(key);
+        req.onsuccess = () => resolve(req.result);
+        req.onerror = () => reject(req.error);
+      }),
+  );
+}
+
+function idbIndexAll(store: string, index: string, value: IDBValidKey): Promise<any[]> {
+  return idbOpen().then(
+    (db) =>
+      new Promise((resolve, reject) => {
+        const tx = db.transaction(store, 'readonly');
+        const req = tx.objectStore(store).index(index).getAll(IDBKeyRange.only(value));
+        req.onsuccess = () => resolve(Array.isArray(req.result) ? req.result : []);
+        req.onerror = () => reject(req.error);
+      }),
+  );
+}
+
+function idbStoreDeleteMany(store: string, keys: string[]): Promise<void> {
+  if (keys.length === 0) return Promise.resolve();
+  return idbOpen().then(
+    (db) =>
+      new Promise((resolve, reject) => {
+        const tx = db.transaction(store, 'readwrite');
+        const target = tx.objectStore(store);
+        for (const key of keys) target.delete(key);
+        tx.oncomplete = () => resolve();
+        tx.onerror = () => reject(tx.error);
+        tx.onabort = () => reject(tx.error || new Error('浏览器离线空间清理已中止'));
+      }),
+  );
+}
+
+interface ManagedFileRecord {
+  key: string;
+  workspace: string;
+  rel: string;
+  data: Blob;
+  size: number;
+  hash?: string;
+  updatedAt: number;
+}
+
+interface ManagedChunkRecord {
+  key: string;
+  workspace: string;
+  transferId: string;
+  transferKey: string;
+  rel: string;
+  offset: number;
+  data: Blob;
+  size: number;
+  createdAt: number;
+}
+
+function managedKey(workspace: string, rel: string): string {
+  return `${encodeURIComponent(workspace)}::${rel}`;
+}
+
+/**
+ * 平板/移动浏览器的应用托管离线空间。
+ *
+ * Safari、移动 Chrome 等通常不提供 showDirectoryPicker，但 IndexedDB 可用。
+ * 文件仅属于当前站点，不依赖桌面客户端；分块先落临时记录，全部验收后才替换
+ * 正式文件，因此中断下载不会破坏已经存在的离线副本。
+ */
+export class ManagedBrowserLocalFs implements LocalFs {
+  readonly kind = 'managed' as const;
+  private activeWrites = new Map<string, string>();
+
+  constructor(private workspace: string) {
+    // 清掉异常退出遗留的一天前临时分块，避免长期占用平板存储。
+    void this.cleanupStaleChunks().catch(() => {});
+  }
+
+  label(): string {
+    return '平板离线空间';
+  }
+
+  id(): string {
+    return `managed:${this.workspace}`;
+  }
+
+  private async files(): Promise<ManagedFileRecord[]> {
+    return idbIndexAll(IDB_FILE_STORE, 'workspace', this.workspace);
+  }
+
+  private async file(rel: string): Promise<ManagedFileRecord> {
+    const record = await idbStoreGet(IDB_FILE_STORE, managedKey(this.workspace, rel));
+    if (!record || record.workspace !== this.workspace) throw new Error(`离线文件不存在：${rel}`);
+    return record as ManagedFileRecord;
+  }
+
+  private async cleanupTransfer(transferId: string): Promise<void> {
+    const chunks = await idbIndexAll(
+      IDB_CHUNK_STORE, 'transferKey', `${this.workspace}::${transferId}`,
+    );
+    await idbStoreDeleteMany(IDB_CHUNK_STORE, chunks.map((item) => item.key));
+  }
+
+  private async cleanupStaleChunks(): Promise<void> {
+    const cutoff = Date.now() - 24 * 60 * 60 * 1000;
+    const chunks = (await idbIndexAll(IDB_CHUNK_STORE, 'workspace', this.workspace))
+      .filter((item) => Number(item?.createdAt || 0) < cutoff);
+    await idbStoreDeleteMany(IDB_CHUNK_STORE, chunks.map((item) => item.key));
+  }
+
+  async scan(ignore: string[], includeGit = false): Promise<Manifest> {
+    const out: Manifest = {};
+    const records = await this.files();
+    // 分批计算哈希，避免大量小文件同时把平板主线程和内存打满。
+    for (let start = 0; start < records.length; start += 8) {
+      await Promise.all(records.slice(start, start + 8).map(async (record) => {
+        if (isIgnored(record.rel, ignore, includeGit)) return;
+        const hash = record.hash || await sha256BlobHex(record.data);
+        out[record.rel] = {
+          hash,
+          size: record.size,
+          mtime: record.updatedAt,
+        };
+        if (!record.hash) await idbStorePut(IDB_FILE_STORE, { ...record, hash });
+      }));
+    }
+    return out;
+  }
+
+  async listDir(rel: string): Promise<LocalEntry[]> {
+    const manifest: Manifest = {};
+    for (const record of await this.files()) manifest[record.rel] = { hash: '', size: record.size };
+    return levelFromManifest(manifest, rel);
+  }
+
+  async readFile(rel: string): Promise<string> {
+    return arrayBufferToBase64(await (await this.file(rel)).data.arrayBuffer());
+  }
+
+  async readBlob(rel: string): Promise<Blob> {
+    return (await this.file(rel)).data;
+  }
+
+  async writeFile(rel: string, base64: string): Promise<void> {
+    const data = base64ToBlob(base64);
+    await this.writeBlob(rel, data);
+  }
+
+  async writeBlob(rel: string, data: Blob): Promise<void> {
+    await idbStorePut(IDB_FILE_STORE, {
+      key: managedKey(this.workspace, rel), workspace: this.workspace, rel,
+      data, size: data.size, hash: undefined, updatedAt: Date.now(),
+    } satisfies ManagedFileRecord);
+  }
+
+  async fileSize(rel: string): Promise<number> {
+    return (await this.file(rel)).size;
+  }
+
+  async readChunk(rel: string, offset: number, size: number): Promise<string> {
+    const record = await this.file(rel);
+    return arrayBufferToBase64(await record.data.slice(offset, offset + size).arrayBuffer());
+  }
+
+  async writeStart(rel: string, transferId: string): Promise<void> {
+    if (this.activeWrites.has(transferId)) throw new Error('传输标识重复');
+    await this.cleanupTransfer(transferId);
+    this.activeWrites.set(transferId, rel);
+  }
+
+  async writeChunk(rel: string, transferId: string, offset: number, base64: string): Promise<void> {
+    if (this.activeWrites.get(transferId) !== rel) throw new Error('写入会话不存在');
+    const data = base64ToBlob(base64);
+    const key = `${managedKey(this.workspace, rel)}::${transferId}::${String(offset).padStart(16, '0')}`;
+    await idbStorePut(IDB_CHUNK_STORE, {
+      key, workspace: this.workspace, transferId,
+      transferKey: `${this.workspace}::${transferId}`, rel, offset,
+      data, size: data.size, createdAt: Date.now(),
+    } satisfies ManagedChunkRecord);
+  }
+
+  async writeFinish(rel: string, transferId: string, expectedSize: number): Promise<void> {
+    if (this.activeWrites.get(transferId) !== rel) throw new Error('写入会话不存在');
+    const chunks = (await idbIndexAll(
+      IDB_CHUNK_STORE, 'transferKey', `${this.workspace}::${transferId}`,
+    ))
+      .sort((a, b) => Number(a.offset) - Number(b.offset)) as ManagedChunkRecord[];
+    let nextOffset = 0;
+    for (const chunk of chunks) {
+      if (chunk.rel !== rel || chunk.offset !== nextOffset) throw new Error(`离线文件分块不连续：${rel}`);
+      nextOffset += chunk.size;
+    }
+    if (nextOffset !== expectedSize) {
+      throw new Error(`离线文件大小校验失败：期望 ${expectedSize}，实际 ${nextOffset}`);
+    }
+    const data = new Blob(chunks.map((chunk) => chunk.data));
+    // 正式记录最后写入：此前任何失败都不会覆盖旧副本。
+    await idbStorePut(IDB_FILE_STORE, {
+      key: managedKey(this.workspace, rel), workspace: this.workspace, rel,
+      data, size: data.size, hash: undefined, updatedAt: Date.now(),
+    } satisfies ManagedFileRecord);
+    this.activeWrites.delete(transferId);
+    await idbStoreDeleteMany(IDB_CHUNK_STORE, chunks.map((chunk) => chunk.key));
+  }
+
+  async writeAbort(_rel: string, transferId: string): Promise<void> {
+    this.activeWrites.delete(transferId);
+    await this.cleanupTransfer(transferId);
+  }
+
+  async reveal(_rel: string): Promise<void> {
+    throw new Error('平板离线空间由浏览器管理，请使用“导出到设备”保存到系统文件夹');
+  }
+
+  async deleteFile(rel: string): Promise<void> {
+    await idbStoreDeleteMany(IDB_FILE_STORE, [managedKey(this.workspace, rel)]);
+  }
+}
+
+export function browserDirectoryPickerSupported(): boolean {
+  return !isTauri() && typeof (window as any).showDirectoryPicker === 'function';
+}
+
+/** 打开不依赖系统目录权限的浏览器持久化空间。 */
+export async function useManagedLocalDir(bindingKey?: string): Promise<LocalFs> {
+  try {
+    await (navigator as any).storage?.persist?.();
+  } catch {
+    /* 浏览器拒绝持久化授权时仍可使用普通 IndexedDB 配额。 */
+  }
+  try {
+    localStorage.setItem(scopedCopyDirKey(COPYDIR_BROWSER_MODE_KEY, bindingKey), 'managed');
+  } catch {
+    /* ignore */
+  }
+  return new ManagedBrowserLocalFs(bindingKey || 'default');
+}
+
+/** 当前 Web 页是否具备缓存应用外壳、重启后离线打开的浏览器条件。 */
+export function offlineAppShellSupported(): boolean {
+  return typeof window !== 'undefined'
+    && window.isSecureContext
+    && 'serviceWorker' in navigator;
+}
+
+/** 将一个设备文件保存进当前浏览器离线副本。 */
+export async function importLocalFile(fs: LocalFs, file: File, rel = file.name): Promise<void> {
+  if (fs.writeBlob) {
+    await fs.writeBlob(rel, file);
+    return;
+  }
+  await fs.writeFile(rel, arrayBufferToBase64(await file.arrayBuffer()));
+}
+
+/** 将离线副本中的文件交给浏览器/系统分享或下载。 */
+export async function exportLocalFile(fs: LocalFs, rel: string, filename?: string): Promise<void> {
+  const blob = fs.readBlob
+    ? await fs.readBlob(rel)
+    : base64ToBlob(await fs.readFile(rel));
+  const safeName = filename || rel.split('/').filter(Boolean).pop() || 'download';
+  const file = new File([blob], safeName, { type: blob.type || 'application/octet-stream' });
+  const nav = navigator as any;
+  if (typeof nav.share === 'function' && (!nav.canShare || nav.canShare({ files: [file] }))) {
+    try {
+      await nav.share({ files: [file], title: safeName });
+      return;
+    } catch (error: any) {
+      if (error?.name === 'AbortError') return;
+      // 分享面板失败时继续回落到浏览器下载。
+    }
+  }
+  const href = URL.createObjectURL(blob);
+  try {
+    const anchor = document.createElement('a');
+    anchor.href = href;
+    anchor.download = safeName;
+    anchor.rel = 'noopener';
+    document.body.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+  } finally {
+    setTimeout(() => URL.revokeObjectURL(href), 30_000);
+  }
+}
+
 /** 让用户选择本机副本目录。bindingKey 用于按 session 独立持久化。 */
 export async function pickLocalDir(initialPath?: string, bindingKey?: string): Promise<LocalFs | null> {
   if (isTauri()) {
@@ -390,11 +710,12 @@ export async function pickLocalDir(initialPath?: string, bindingKey?: string): P
   }
   const w = window as any;
   if (typeof w.showDirectoryPicker !== 'function') {
-    throw new Error('当前浏览器不支持目录访问（需 Chromium 内核），请改用桌面客户端');
+    return useManagedLocalDir(bindingKey);
   }
   const handle = await w.showDirectoryPicker({ mode: 'readwrite' });
   try {
     await idbPut(scopedCopyDirKey(IDB_HANDLE_KEY, bindingKey), handle);
+    localStorage.setItem(scopedCopyDirKey(COPYDIR_BROWSER_MODE_KEY, bindingKey), 'directory');
   } catch {
     /* 忽略持久化失败 */
   }
@@ -412,15 +733,17 @@ export async function restoreLocalDir(bindingKey?: string): Promise<LocalFs | nu
     }
   }
   try {
+    const mode = localStorage.getItem(scopedCopyDirKey(COPYDIR_BROWSER_MODE_KEY, bindingKey));
+    if (mode === 'managed') return useManagedLocalDir(bindingKey);
     const handle = await idbGet(scopedCopyDirKey(IDB_HANDLE_KEY, bindingKey));
-    if (!handle) return null;
+    if (!handle) return useManagedLocalDir(bindingKey);
     // 浏览器重启后权限通常回落到 prompt，须经用户手势重新授权；
     // 此处只在仍为 granted 时复用，否则让用户重新选择目录（即重新授权）。
     const perm = await handle.queryPermission?.({ mode: 'readwrite' });
     if (perm !== 'granted') return null;
     return new BrowserLocalFs(handle);
   } catch {
-    return null;
+    return useManagedLocalDir(bindingKey);
   }
 }
 
@@ -504,10 +827,10 @@ interface Endpoint {
   deleteFile(rel: string): Promise<void>;
 }
 
-function remoteEndpoint(workingDir: string, execKey?: string): Endpoint {
+function remoteEndpoint(workingDir: string, execKey?: string, includeGit = false): Endpoint {
   return {
     async scan() {
-      const r = await api.syncManifest(workingDir, execKey);
+      const r = await api.syncManifest(workingDir, execKey, includeGit);
       if (r.status !== 'ok' || !r.files) throw new Error(r.message || '远端清单获取失败');
       return r.files;
     },
@@ -529,9 +852,9 @@ function remoteEndpoint(workingDir: string, execKey?: string): Endpoint {
   };
 }
 
-function localEndpoint(fs: LocalFs, ignore: string[]): Endpoint {
+function localEndpoint(fs: LocalFs, ignore: string[], includeGit = false): Endpoint {
   return {
-    scan: () => fs.scan(ignore),
+    scan: () => fs.scan(ignore, includeGit),
     readFile: (rel) => fs.readFile(rel),
     writeFile: (rel, b64) => fs.writeFile(rel, b64),
     deleteFile: (rel) => fs.deleteFile(rel),
@@ -544,12 +867,13 @@ export class DirSyncSession {
     private workingDir: string,
     private ignore: string[],
     private execKey?: string,   // 会话归属的执行节点;远端工作目录在它上面
+    private includeGit = false,
   ) {}
 
   /** 扫描两端 + 三向比对，得到待应用的变更（不落盘）。 */
   async prepare(direction: SyncDirection): Promise<PreparedSync> {
-    const localEp = localEndpoint(this.fs, this.ignore);
-    const remoteEp = remoteEndpoint(this.workingDir, this.execKey);
+    const localEp = localEndpoint(this.fs, this.ignore, this.includeGit);
+    const remoteEp = remoteEndpoint(this.workingDir, this.execKey, this.includeGit);
     const [local, remote] = await Promise.all([localEp.scan(), remoteEp.scan()]);
     const baseline = loadBaseline(this.fs.id(), this.workingDir);
     const diff = computeDiff(direction, baseline, local, remote);
@@ -562,8 +886,8 @@ export class DirSyncSession {
     selected: DiffEntry[],
     onProgress?: (p: ApplyProgress) => void,
   ): Promise<ApplyResult> {
-    const localEp = localEndpoint(this.fs, this.ignore);
-    const remoteEp = remoteEndpoint(this.workingDir, this.execKey);
+    const localEp = localEndpoint(this.fs, this.ignore, this.includeGit);
+    const remoteEp = remoteEndpoint(this.workingDir, this.execKey, this.includeGit);
     const [src, dst] = prepared.direction === 'pull' ? [remoteEp, localEp] : [localEp, remoteEp];
 
     const failed: ApplyResult['failed'] = [];

@@ -4,6 +4,10 @@ import { uuid } from '../utils/uuid';
 import type { ImageAttachment } from './useClipboardImage';
 import type { TextAttachment } from '../types/attachments';
 import {
+  hasVisibleMessagePayload,
+  shouldKeepChatMessage,
+} from '../utils/chatMessageVisibility';
+import {
   getStreamState,
   resetStreamAccumulators,
   clearStreamState,
@@ -152,6 +156,10 @@ function normalizeMessage(msg: any): ChatMessage {
   };
 }
 
+function normalizeMessages(messages: any[]): ChatMessage[] {
+  return messages.map(normalizeMessage).filter(shouldKeepChatMessage);
+}
+
 /**
  * 以后端返回的数组顺序为权威顺序，只保留尚未落盘的本地消息。
  *
@@ -183,6 +191,7 @@ function mergeLoadedWithLocal(
     });
   };
   const locals = current.filter((message, index) => {
+    if (!shouldKeepChatMessage(message)) return false;
     if (loadedIds.has(message.id)) return false;
     if (message.role === 'user') {
       const following = current[index + 1];
@@ -315,12 +324,12 @@ export function useChat(
     //    所以 tail 只在「state 真的有内容可展示」时才构造;两条 setMessages
     //    分支都只决定「底下铺什么历史」。
     const cachedHistory = sessionHistoryCache.get(sessionId);
-    const hasStreamContent = !!(
-      globalState.text ||
-      globalState.thinking ||
-      globalState.toolCalls.length > 0 ||
-      globalState.contentBlocks.length > 0
-    );
+    const hasStreamContent = hasVisibleMessagePayload({
+      content: globalState.text,
+      thinking: globalState.thinking,
+      toolCalls: globalState.toolCalls,
+      contentBlocks: globalState.contentBlocks,
+    });
 
     // 全局状态也可能保存一条刚在后台完成的消息。即使已经 done，也先用它
     // 补齐缓存，避免切回来后必须等 loadSession 才能看到刚完成的回答。
@@ -387,7 +396,7 @@ export function useChat(
     api.loadSession(sessionId, initialLimit).then((session) => {
       if (cancelled) return;
       if (session?.messages) {
-        const loadedMessages = session.messages.map(normalizeMessage);
+        const loadedMessages = normalizeMessages(session.messages);
         const loadedStreaming = [...loadedMessages].reverse().find(
           (message: ChatMessage) => message.streaming,
         );
@@ -418,12 +427,12 @@ export function useChat(
         // ★ 重新读一次 state——RPC 往返期间流可能又推进了好几个 delta。
         const latest = getStreamState(sessionId);
         const stillStreaming = !!(latest.isStreaming && latest.messageId);
-        const latestHasContent = !!(
-          latest.text ||
-          latest.thinking ||
-          latest.toolCalls.length > 0 ||
-          latest.contentBlocks.length > 0
-        );
+        const latestHasContent = hasVisibleMessagePayload({
+          content: latest.text,
+          thinking: latest.thinking,
+          toolCalls: latest.toolCalls,
+          contentBlocks: latest.contentBlocks,
+        });
         if (latest.messageId && latestHasContent) {
           const existingIndex = loadedMessages.findIndex(
             (m: ChatMessage) => m.id === latest.messageId,
@@ -479,7 +488,9 @@ export function useChat(
       cancelled = true;
       // 切走前立即保留当前已经定稿的 UI 历史。此前缓存只在 loadSession
       // 返回时更新，新完成的轮次会在切回时短暂消失，直到慢 RPC 再次返回。
-      const finalized = messagesRef.current.filter((m) => !m.streaming);
+      const finalized = messagesRef.current.filter(
+        (m) => !m.streaming && shouldKeepChatMessage(m),
+      );
       if (finalized.length > 0) {
         sessionHistoryCache.set(sessionId, finalized);
       }
@@ -493,7 +504,7 @@ export function useChat(
       if (data.type === 'session_compacted') {
         const session = await api.loadSession(sessionId);
         if (session?.messages) {
-          const loaded = session.messages.map(normalizeMessage);
+          const loaded = normalizeMessages(session.messages);
           // ★ 同样防丢：compact 期间 doSend 可能已追加了本地用户消息
           setMessages((prev) => {
             return mergeLoadedWithLocal(loaded, prev);
@@ -528,7 +539,7 @@ export function useChat(
           Math.max(INITIAL_LOAD_LIMIT, visibleFinalized.length),
         );
         if (session?.messages) {
-          const loaded = session.messages.map(normalizeMessage);
+          const loaded = normalizeMessages(session.messages);
           const total = typeof session.messagesTotal === 'number'
             ? session.messagesTotal
             : loaded.length;
@@ -573,7 +584,7 @@ export function useChat(
           const session = await api.loadSession(sessionId);
           if (cancelled) return;
           if (session?.messages) {
-            const loaded = session.messages.map(normalizeMessage);
+            const loaded = normalizeMessages(session.messages);
             setMessages((prev) => {
               return mergeLoadedWithLocal(loaded, prev);
             });
@@ -655,12 +666,12 @@ export function useChat(
             //    空插入符幽灵。下一个 delta 进来会再调一次本函数,届时通常
             //    snap 已经有内容,再 push 就不闪了。
             //    这关闭的是「消息切换/瞬切刚好碰上模型起新一条」的那个空窗。
-            const hasContent = !!(
-              snap.text ||
-              snap.thinking ||
-              snap.toolCalls.length > 0 ||
-              snap.contentBlocks.length > 0
-            );
+            const hasContent = hasVisibleMessagePayload({
+              content: snap.text,
+              thinking: snap.thinking,
+              toolCalls: snap.toolCalls,
+              contentBlocks: snap.contentBlocks,
+            });
             if (!hasContent) return prev;
             const newMsg: ChatMessage = {
               id: mid,
@@ -697,6 +708,12 @@ export function useChat(
           const finalToolCalls = state.toolCalls.length > 0 ? [...state.toolCalls] : undefined;
           const finalBlocks = state.contentBlocks.length > 0 ? [...state.contentBlocks] : undefined;
           const finalElapsed = state.streamStart ? Date.now() - state.streamStart : undefined;
+          const hasFinalPayload = hasVisibleMessagePayload({
+            content: finalText,
+            thinking: finalThinking,
+            toolCalls: finalToolCalls,
+            contentBlocks: finalBlocks,
+          });
 
           const sessionState = getStreamState(sessionId);
           sessionState.text = finalText;
@@ -706,6 +723,11 @@ export function useChat(
           sessionState.isStreaming = false;
 
           setMessages((prev) => {
+            // 中断、异常或空响应可能只留下等待占位。耗时/时间戳不是回复内容，
+            // 终态没有任何正文、思考或工具时直接移除，不能定稿为空气泡。
+            if (!hasFinalPayload) {
+              return prev.filter((m) => m.id !== mid);
+            }
             // 兜底:assistant 气泡不再有占位 push,如果整个流程没产生任何
             // 有内容的 delta 就到 done,prev 里找不到这条消息,需要在这里
             // 把它补上,否则 final 内容会丢。
@@ -758,9 +780,17 @@ export function useChat(
           const errToolCalls = state.toolCalls.length > 0 ? [...state.toolCalls] : undefined;
           const errBlocks = state.contentBlocks.length > 0 ? [...state.contentBlocks] : undefined;
           const errElapsed = state.streamStart ? Date.now() - state.streamStart : undefined;
+          const hasErrorPayload = hasVisibleMessagePayload({
+            content: errText,
+            thinking: errThinking,
+            toolCalls: errToolCalls,
+            contentBlocks: errBlocks,
+          });
 
           setMessages((prev) => {
-            // error 可能是本轮第一帧，仍需创建气泡，但保持 streaming。
+            // 可恢复 error 不等于终态。如果还没有任何可见内容，保留原来的
+            // “等待首帧”状态即可；不要把它降级成只有光标/耗时的空气泡。
+            if (!hasErrorPayload) return prev;
             if (!prev.some((m) => m.id === mid)) {
               return [
                 ...prev,
@@ -844,6 +874,10 @@ export function useChat(
       images?: ImageAttachment[],
       textAttachments?: TextAttachment[],
       deliveryMode?: 'steer' | 'redirect',
+      interactionMode?:
+        | 'realtime-voice'
+        | 'realtime-voice-foreground'
+        | 'realtime-voice-background',
     ) => {
       if (isStreamingRef.current) return;
 
@@ -894,6 +928,7 @@ export function useChat(
         autoContinue: autoContinueRef.current,
         skipPermissions: skipPermissionsRef.current,
         deliveryMode,
+        interactionMode,
       });
     },
     [sessionId, backendId]
@@ -960,7 +995,7 @@ export function useChat(
             // ★ 直接从后端重载消息，不依赖 sessionUpdated 事件
             const session = await api.loadSession(sessionId);
             if (session?.messages) {
-              const reloaded = session.messages.map(normalizeMessage);
+              const reloaded = normalizeMessages(session.messages);
               // 追加一条系统消息告知用户
               const sysMsg: ChatMessage = {
                 id: uuid(),
@@ -1264,7 +1299,7 @@ export function useChat(
       try {
         const resp = await api.loadSessionMessages(sessionId, offset, take);
         if (!resp || !Array.isArray(resp.messages)) return;
-        const olderNormalized = resp.messages.map(normalizeMessage);
+        const olderNormalized = normalizeMessages(resp.messages);
         setMessages((prev) => {
           // 去重:已加载的消息 id 集合
           const have = new Set(prev.map((m) => m.id));

@@ -18,7 +18,7 @@ for /f "tokens=*" %%V in ('python --version 2^>^&1') do echo [OK] %%V
 ::  pip dependencies
 echo.
 echo [CHECK] Python dependencies...
-python -c "import websockets, PIL, httpx, edge_tts" >nul 2>&1
+python -c "import websockets, PIL, httpx, edge_tts; from dashscope.audio.tts_v2 import SpeechSynthesizer; from importlib.metadata import version; assert tuple(int(x) for x in version('dashscope').split('.')[:3]) >= (1,26,3)" >nul 2>&1
 if not errorlevel 1 goto deps_ok
 echo [INSTALL] Installing Python deps (Tsinghua mirror)...
 python -m pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple --trusted-host pypi.tuna.tsinghua.edu.cn

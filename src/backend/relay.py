@@ -50,10 +50,15 @@ class RelayClientTransport:
 
     def __init__(self, cid: str, link: "RelayLink",
                  identity: str = "relay", identity_src: str = "relay",
-                 peer: str = ""):
+                 peer: str = "", username: str = "", display_name: str = "",
+                 can_claim_legacy: bool = False):
         self.cid = cid
         self.identity = identity
         self.identity_src = identity_src
+        self.username = username
+        self.display_name = display_name
+        # 只能由 Relay 根据“设备主用户”关系注入；UI 自报字段不会到达这里。
+        self.can_claim_legacy = bool(can_claim_legacy)
         # peer: 远程 UI 的 IP:port，由中继在 open 帧里告知。BridgeWS 用它在
         # 「正在连接本机的 UI」列表里展示来源。
         self.peer = peer
@@ -150,7 +155,10 @@ class RelayLink:
         if t == "open":
             transport = RelayClientTransport(
                 cid, self, identity=frame.get("user") or "relay",
-                peer=str(frame.get("peer") or ""))
+                peer=str(frame.get("peer") or ""),
+                username=str(frame.get("username") or ""),
+                display_name=str(frame.get("displayName") or ""),
+                can_claim_legacy=bool(frame.get("canClaimLegacy", False)))
             self._transports[cid] = transport
             self._tasks[cid] = asyncio.ensure_future(
                 self._run_session(cid, transport))

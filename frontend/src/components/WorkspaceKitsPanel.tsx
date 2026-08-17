@@ -143,23 +143,34 @@ export const WorkspaceKitsPanel: React.FC<Props> = ({ sessionId, open, onClose }
   const [inputs, setInputs] = useState<Record<string, unknown>>({});
   const [terminalCommand, setTerminalCommand] = useState('');
   const [busy, setBusy] = useState(false);
+  const [cancellingRunIds, setCancellingRunIds] = useState<Set<string>>(() => new Set());
   const [notice, setNotice] = useState<{ kind: 'error' | 'ok'; text: string } | null>(null);
   const [clock, setClock] = useState(() => Date.now() / 1000);
   const clientClaims = useRef(new Set<string>());
+  const clientCommandRuns = useRef(new Set<string>());
 
   useEffect(() => {
-    if (!open) return;
     let cancelled = false;
-    api.kitGetState(sessionId).then((result) => {
-      if (cancelled || result.status !== 'ok') {
-        if (!cancelled && result.message) setNotice({ kind: 'error', text: result.message });
-        return;
-      }
-      const next = result as WorkspaceKitState & { status: string };
-      setState(normalizeKitState(sessionId, next));
-      setSelectedId((current) => current || next.kits?.[0]?.id || '');
-    });
+    if (open) {
+      api.kitGetState(sessionId).then((result) => {
+        if (cancelled || result.status !== 'ok') {
+          if (!cancelled && result.message) setNotice({ kind: 'error', text: result.message });
+          return;
+        }
+        const next = result as WorkspaceKitState & { status: string };
+        setState(normalizeKitState(sessionId, next));
+        setSelectedId((current) => current || next.kits?.[0]?.id || '');
+      });
+    }
+    // 即便面板被收起也保留轻量状态订阅：客户端命令可能仍在执行，另一个
+    // 窗口发出的停止必须能抵达真正持有本地进程的桌面端。
     const off = api.onKitUpdated((next) => {
+      for (const runId of clientCommandRuns.current) {
+        const live = next.runs.find((run) => run.id === runId);
+        if (live && !isActiveRun(live)) {
+          void api.kitClientLocalCommandCancel(runId).catch(() => {});
+        }
+      }
       if (next.sessionId !== sessionId) return;
       setState(normalizeKitState(sessionId, next));
       setSelectedId((current) => current || next.kits[0]?.id || '');
@@ -174,6 +185,7 @@ export const WorkspaceKitsPanel: React.FC<Props> = ({ sessionId, open, onClose }
     setOptimizerKitId('');
     setDraft(null);
     setInputs({});
+    setCancellingRunIds(new Set());
     setNotice(null);
   }, [sessionId]);
 
@@ -214,8 +226,10 @@ export const WorkspaceKitsPanel: React.FC<Props> = ({ sessionId, open, onClose }
               return;
             }
             const active = claimed.step || resumedStep;
+            clientCommandRuns.current.add(run.id);
             try {
               const result = await api.kitClientLocalCommand({
+                runId: run.id,
                 shell: active.shell,
                 command: active.command,
                 cwd: active.cwd,
@@ -228,6 +242,8 @@ export const WorkspaceKitsPanel: React.FC<Props> = ({ sessionId, open, onClose }
               await api.kitClientStepComplete(sessionId, run.id, resumedStep.id, {
                 error: error instanceof Error ? error.message : String(error),
               });
+            } finally {
+              clientCommandRuns.current.delete(run.id);
             }
             return;
           }
@@ -267,6 +283,17 @@ export const WorkspaceKitsPanel: React.FC<Props> = ({ sessionId, open, onClose }
       if (!waitingKeys.has(key)) clientClaims.current.delete(key);
     }
   }, [open, sessionId, state.runs]);
+
+  useEffect(() => {
+    // 停止可能由另一个窗口发起。权威状态一旦结束，真正执行客户端命令的
+    // 桌面端也必须关闭其本地进程树，不能只让后端记录变灰。
+    for (const runId of clientCommandRuns.current) {
+      const live = state.runs.find((run) => run.id === runId);
+      if (!live || !isActiveRun(live)) {
+        void api.kitClientLocalCommandCancel(runId).catch(() => {});
+      }
+    }
+  }, [sessionId, state.runs]);
 
   const selected = state.kits.find((kit) => kit.id === selectedId);
   const optimizerKit = state.kits.find((kit) => kit.id === optimizerKitId);
@@ -308,6 +335,41 @@ export const WorkspaceKitsPanel: React.FC<Props> = ({ sessionId, open, onClose }
     setBusy(false);
     if (result.status !== 'ok') {
       setNotice({ kind: 'error', text: result.message || '启动失败' });
+    }
+  };
+
+  const cancelRun = async (runId: string) => {
+    if (cancellingRunIds.has(runId)) return;
+    setCancellingRunIds((current) => new Set(current).add(runId));
+    setNotice(null);
+    // 两端并行清理：当前窗口若正代执行 client command，立即终止本地进程；
+    // 执行端同时落盘 cancelled 并停止 executor 进程/编排 Task。
+    const localCancel = api.kitClientLocalCommandCancel(runId).catch(() => false);
+    try {
+      const result = await api.kitCancel(sessionId, runId);
+      await localCancel;
+      if (result.status !== 'ok') {
+        setNotice({ kind: 'error', text: result.message || '停止失败，请重试' });
+        return;
+      }
+      if (result.run) {
+        setState((current) => ({
+          ...current,
+          runs: current.runs.map((run) => run.id === runId ? result.run! : run),
+        }));
+      }
+      setNotice({ kind: 'ok', text: 'Kit 已停止' });
+    } catch (error) {
+      setNotice({
+        kind: 'error',
+        text: `停止失败：${error instanceof Error ? error.message : String(error)}`,
+      });
+    } finally {
+      setCancellingRunIds((current) => {
+        const next = new Set(current);
+        next.delete(runId);
+        return next;
+      });
     }
   };
 
@@ -431,17 +493,29 @@ export const WorkspaceKitsPanel: React.FC<Props> = ({ sessionId, open, onClose }
                           </div>
                         </div>
                       </div>
-                      <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 7, marginTop: 13 }}>
-                        <button style={secondaryButton} onClick={() => setOptimizerKitId(kit.id)}>✨ 优化</button>
-                        <button style={secondaryButton} onClick={() => {
-                          setSelectedId(kit.id); setInputs(defaultInputsOf(kit)); setDraft(null); setDetailOpen(true);
-                        }}>详情</button>
-                        {running && run ? (
-                          <button style={dangerButton} onClick={() => api.kitCancel(sessionId, run.id)}>■ 停止</button>
-                        ) : (
-                          <button style={primaryButton} disabled={busy || !kit.enabled}
-                            onClick={() => quickRunKit(kit)}>▶ 运行</button>
-                        )}
+                      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-end', gap: 8, marginTop: 13, flexWrap: 'wrap' }}>
+                        <KitVersionPicker
+                          sessionId={sessionId}
+                          kit={kit}
+                          running={running}
+                          compact
+                          onFeedback={(text, kind) => setNotice({ kind, text })}
+                        />
+                        <div style={{ display: 'flex', gap: 7 }}>
+                          <button style={secondaryButton} onClick={() => setOptimizerKitId(kit.id)}>✨ 优化</button>
+                          <button style={secondaryButton} onClick={() => {
+                            setSelectedId(kit.id); setInputs(defaultInputsOf(kit)); setDraft(null); setDetailOpen(true);
+                          }}>详情</button>
+                          {running && run ? (
+                            <button style={dangerButton} disabled={cancellingRunIds.has(run.id)}
+                              onClick={() => void cancelRun(run.id)}>
+                              {cancellingRunIds.has(run.id) ? '停止中…' : '■ 停止'}
+                            </button>
+                          ) : (
+                            <button style={primaryButton} disabled={busy || !kit.enabled}
+                              onClick={() => quickRunKit(kit)}>▶ 运行</button>
+                          )}
+                        </div>
                       </div>
                     </article>
                   );
@@ -504,7 +578,7 @@ export const WorkspaceKitsPanel: React.FC<Props> = ({ sessionId, open, onClose }
                   inputs={inputs}
                   onInputsChange={setInputs}
                   onRun={() => runKit(selected, inputs)}
-                  onCancel={(runId) => api.kitCancel(sessionId, runId)}
+                  onCancel={(runId) => void cancelRun(runId)}
                   onEdit={() => setDraft({ ...selected })}
                   onDelete={deleteKit}
                   onToggleEnabled={() => api.kitUpdate(sessionId, selected.id, { enabled: !selected.enabled })}
@@ -515,6 +589,7 @@ export const WorkspaceKitsPanel: React.FC<Props> = ({ sessionId, open, onClose }
                   terminalConnected={state.terminalConnectedKitIds?.includes(selected.id) || false}
                   onTerminalClose={() => api.kitTerminalClose(sessionId, selected.id)}
                   busy={busy}
+                  cancelling={!!lastRun && cancellingRunIds.has(lastRun.id)}
                   dataMarket={state.dataMarket}
                   now={clock}
                   onOptimize={() => setOptimizerKitId(selected.id)}
@@ -530,6 +605,7 @@ export const WorkspaceKitsPanel: React.FC<Props> = ({ sessionId, open, onClose }
         <KitOptimizerPanel
           sessionId={sessionId}
           kit={optimizerKit}
+          running={isActiveRun(lastRunOf(state, optimizerKit))}
           onClose={() => setOptimizerKitId('')}
         />
       )}
@@ -930,6 +1006,7 @@ const KitDetail: React.FC<{
   terminalConnected: boolean;
   onTerminalClose: () => void;
   busy: boolean;
+  cancelling: boolean;
   dataMarket: WorkspaceKitState['dataMarket'];
   now: number;
   onOptimize: () => void;
@@ -937,6 +1014,7 @@ const KitDetail: React.FC<{
   sessionId, kit, run, runs, inputs, onInputsChange, onRun, onCancel, onEdit, onDelete,
   onToggleEnabled, onControlMode, terminalCommand, onTerminalCommand, onTerminalRun,
   terminalConnected, onTerminalClose, busy, dataMarket, now, onOptimize,
+  cancelling,
 }) => {
   const running = isActiveRun(run);
   const meta = run ? statusMeta[run.status] : null;
@@ -962,7 +1040,8 @@ const KitDetail: React.FC<{
           </div>
           {kit.description && <div style={{ ...subtleStyle, marginTop: 6 }}>{kit.description}</div>}
         </div>
-        <div style={{ display: 'flex', gap: 6, flexShrink: 0 }}>
+        <div style={{ display: 'flex', gap: 6, flexShrink: 0, alignItems: 'flex-end', flexWrap: 'wrap', justifyContent: 'flex-end' }}>
+          <KitVersionPicker sessionId={sessionId} kit={kit} running={running} compact />
           <button style={secondaryButton} onClick={onOptimize}>✨ 优化</button>
           <button style={secondaryButton} onClick={onToggleEnabled}>{kit.enabled ? '停用' : '启用'}</button>
           <button style={secondaryButton} onClick={onEdit}>编辑</button>
@@ -1071,7 +1150,9 @@ const KitDetail: React.FC<{
               : '单次执行'}
           </div>
           {running ? (
-            <button style={dangerButton} onClick={() => onCancel(run!.id)}>■ 停止</button>
+            <button style={dangerButton} disabled={cancelling} onClick={() => onCancel(run!.id)}>
+              {cancelling ? '停止中…' : '■ 停止'}
+            </button>
           ) : (
             <button style={primaryButton} disabled={busy || !kit.enabled} onClick={onRun}>▶ 执行并验收</button>
           )}
@@ -1174,7 +1255,94 @@ const KitDetail: React.FC<{
 
 const versionSourceLabel: Record<string, string> = {
   create: '初始创建', legacy: '旧版迁移', manual: '人工编辑',
-  ai_compile: 'AI 编译', ai_optimize: 'AI 优化定版',
+  ai_compile: 'AI 编译', ai_optimize: 'AI 优化',
+};
+
+const KitVersionPicker: React.FC<{
+  sessionId: string;
+  kit: WorkspaceKit;
+  running?: boolean;
+  compact?: boolean;
+  onFeedback?: (text: string, kind: 'ok' | 'error') => void;
+}> = ({ sessionId, kit, running = false, compact = false, onFeedback }) => {
+  const versions = kit.versions || [];
+  const activeId = kit.activeVersionId
+    || versions.find((version) => version.isActive)?.id
+    || versions[versions.length - 1]?.id
+    || '';
+  const [busy, setBusy] = useState(false);
+  const [feedback, setFeedback] = useState<{ text: string; kind: 'ok' | 'error' } | null>(null);
+
+  useEffect(() => { setBusy(false); setFeedback(null); }, [kit.id]);
+
+  const report = (text: string, kind: 'ok' | 'error') => {
+    if (onFeedback) onFeedback(text, kind);
+    else setFeedback({ text, kind });
+  };
+
+  const switchVersion = async (versionId: string) => {
+    if (!versionId || versionId === activeId || busy) return;
+    const target = versions.find((version) => version.id === versionId);
+    if (!target) return;
+    if (running) {
+      report('Kit 正在运行，请先停止后再切换执行版本。', 'error');
+      return;
+    }
+    if (kit.enabled) {
+      const confirmed = window.confirm(
+        `切换到 ${target.version} 需要先停用 Kit，避免 Schedule 在执行中途换编排。是否停用并继续？`,
+      );
+      if (!confirmed) return;
+    }
+    setBusy(true);
+    setFeedback(null);
+    try {
+      if (kit.enabled) {
+        const disabled = await api.kitUpdate(sessionId, kit.id, { enabled: false });
+        if (disabled.status !== 'ok') {
+          report(disabled.message || '停用 Kit 失败，未切换版本。', 'error');
+          return;
+        }
+      }
+      const result = await api.kitVersionActivate(sessionId, kit.id, versionId);
+      if (result.status !== 'ok') {
+        report(result.message || '切换版本失败。', 'error');
+        return;
+      }
+      report(`已切换到 ${target.version}；Kit 保持停用，确认后可重新开启。`, 'ok');
+    } catch (error) {
+      report(error instanceof Error ? error.message : String(error), 'error');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 4, minWidth: compact ? 142 : 180 }}>
+      <label style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+        <span style={{ ...subtleStyle, whiteSpace: 'nowrap' }}>{compact ? '版本' : '执行版本'}</span>
+        <select
+          aria-label={`${kit.title} 执行版本`}
+          style={{ ...inputStyle, width: compact ? 112 : 150, padding: '5px 7px', cursor: versions.length > 1 ? 'pointer' : 'default' }}
+          value={activeId}
+          disabled={busy || versions.length < 2}
+          onChange={(event) => { void switchVersion(event.target.value); }}
+        >
+          {versions.map((version) => (
+            <option key={version.id} value={version.id}>
+              {version.version}{version.id === activeId ? ' · 当前' : ' · 可选'}
+            </option>
+          ))}
+        </select>
+        {busy && <span style={{ ...subtleStyle, color: '#d2a8ff', whiteSpace: 'nowrap' }}>切换中…</span>}
+      </label>
+      {feedback && (
+        <span style={{ ...subtleStyle, color: feedback.kind === 'ok' ? '#56d364' : '#e3b341', maxWidth: 300 }}>
+          {feedback.text}
+        </span>
+      )}
+    </div>
+  );
 };
 
 const KitVersionsCard: React.FC<{
@@ -1214,8 +1382,8 @@ const KitVersionsCard: React.FC<{
     <section style={cardStyle}>
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 10 }}>
         <div>
-          <div style={cardTitle}>执行编排版本</div>
-          <div style={subtleStyle}>版本属于 Kit；人工编辑、AI 编译和优化定版都进入同一条历史。</div>
+          <div style={cardTitle}>版本库</div>
+          <div style={subtleStyle}>AI 候选先保存为版本；当前执行版本可在 Kit 标题旁或下方历史中随时选择。</div>
         </div>
         <span style={mutedPill}>{versions.length} 个版本</span>
       </div>
@@ -1229,6 +1397,7 @@ const KitVersionsCard: React.FC<{
               <span style={{ ...subtleStyle, flex: 1 }}>{version.note || '—'}</span>
               <span style={subtleStyle}>{new Date(version.createdAt * 1000).toLocaleString()}</span>
               {active && <span style={{ ...statusPill, color: '#56d364', borderColor: '#3fb95066' }}>当前生效</span>}
+              {!active && <span style={{ ...statusPill, color: '#79c0ff', borderColor: '#58a6ff66' }}>可选版本</span>}
               <button style={linkButton} disabled={busyId === version.id} onClick={() => viewVersion(version.id)}>查看 DSL</button>
               {!active && (
                 <button style={secondaryButton} disabled={busyId === version.id || running || kit.enabled}
@@ -1251,15 +1420,15 @@ const KitVersionsCard: React.FC<{
 };
 
 const KitOptimizerPanel: React.FC<{
-  sessionId: string; kit: WorkspaceKit; onClose: () => void;
-}> = ({ sessionId, kit, onClose }) => {
+  sessionId: string; kit: WorkspaceKit; running: boolean; onClose: () => void;
+}> = ({ sessionId, kit, running, onClose }) => {
   const [messages, setMessages] = useState<KitOptimizationMessage[]>([]);
   const [backends, setBackends] = useState<any[]>([]);
   const [backendId, setBackendId] = useState('');
   const [prompt, setPrompt] = useState('');
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState('');
-  const [viewedProposal, setViewedProposal] = useState<Record<string, unknown> | null>(null);
+  const [viewedProposal, setViewedProposal] = useState<KitOptimizationMessage | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const activeVersion = (kit.versions || []).find((version) => (
     version.isActive || version.id === kit.activeVersionId
@@ -1294,7 +1463,7 @@ const KitOptimizerPanel: React.FC<{
     setBusy(true); setNotice(''); setPrompt('');
     const optimistic: KitOptimizationMessage = {
       id: `local-${Date.now()}`, role: 'user', content: text, backendId,
-      status: 'done', warnings: [], questions: [], ready: false,
+      status: 'done', warnings: [], blockingIssues: [], questions: [], ready: false, readinessVersion: 2,
       baseVersionId: kit.activeVersionId || '', finalizedVersionId: '', createdAt: Date.now() / 1000,
     };
     setMessages((current) => [...current, optimistic]);
@@ -1316,21 +1485,22 @@ const KitOptimizerPanel: React.FC<{
   };
 
   const finalize = async (message: KitOptimizationMessage) => {
-    if (kit.enabled) {
-      setNotice('请先在 Kit 详情中停用这个 Kit，再定版；避免 Schedule 与版本切换发生竞态。');
-      return;
-    }
     setBusy(true); setNotice('');
-    const result = await api.kitOptimizeFinalize(sessionId, kit.id, message.id, message.content.slice(0, 500));
+    const result = await api.kitOptimizeFinalize(
+      sessionId, kit.id, message.id, message.content.slice(0, 500), false,
+    );
     setBusy(false);
     if (result.status !== 'ok' || !result.version) {
-      setNotice(result.message || '定版失败');
+      setNotice(result.message || '保存候选版本失败');
       return;
     }
     setMessages((current) => current.map((item) => (
       item.id === message.id ? { ...item, finalizedVersionId: result.version!.id } : item
     )));
-    setNotice(`${result.version.version} 已定版并成为当前执行版本；Kit 仍保持停用，确认后再开启。`);
+    setViewedProposal((current) => current?.id === message.id
+      ? { ...current, finalizedVersionId: result.version!.id }
+      : current);
+    setNotice(`${result.version.version} 已保存到版本库；当前执行版本未变化，可从上方版本选择器切换。`);
   };
 
   return (
@@ -1345,7 +1515,7 @@ const KitOptimizerPanel: React.FC<{
               <span style={experimentBadge}>独立 AI 对话</span>
             </div>
             <div style={{ ...subtleStyle, marginTop: 4 }}>
-              当前 {activeVersion?.version || '—'} · AI 只生成候选，你定版后才进入 Kit 版本账本
+              当前执行 {activeVersion?.version || '—'} · AI 生成的 DSL 需要由你保存为候选版本
             </div>
           </div>
           <div style={{ display: 'flex', alignItems: 'center', gap: 7 }}>
@@ -1356,6 +1526,16 @@ const KitOptimizerPanel: React.FC<{
             <button style={iconButton} onClick={onClose}>×</button>
           </div>
         </header>
+
+        <div style={optimizerVersionBarStyle}>
+          <div style={{ minWidth: 0 }}>
+            <strong style={{ fontSize: 11.5 }}>Kit 版本库</strong>
+            <div style={{ ...subtleStyle, marginTop: 3 }}>
+              候选保存后不会自动影响运行；需要时从这里选择执行版本。
+            </div>
+          </div>
+          <KitVersionPicker sessionId={sessionId} kit={kit} running={running} />
+        </div>
 
         <div ref={scrollRef} style={optimizerMessagesStyle}>
           {messages.length === 0 && (
@@ -1374,18 +1554,31 @@ const KitOptimizerPanel: React.FC<{
                 {message.role === 'user' ? '你' : `AI · ${backends.find((item) => item.id === message.backendId)?.label || message.backendId || 'Session Backend'}`}
               </div>
               <div style={{ whiteSpace: 'pre-wrap', lineHeight: 1.6, fontSize: 12.5 }}>{message.content}</div>
-              {!!message.questions?.length && <div style={{ color: '#e3b341', marginTop: 8, fontSize: 11 }}>{message.questions.map((item) => <div key={item}>· {item}</div>)}</div>}
-              {!!message.warnings?.length && <div style={{ color: '#ff9b93', marginTop: 8, fontSize: 11 }}>{message.warnings.map((item) => <div key={item}>⚠ {item}</div>)}</div>}
+              {!!message.blockingIssues?.length && (
+                <div style={{ color: '#ff9b93', marginTop: 8, fontSize: 11 }}>
+                  {message.blockingIssues.map((item) => <div key={item}>⛔ 阻断：{item}</div>)}
+                </div>
+              )}
+              {!!message.questions?.length && <div style={{ color: '#ff9b93', marginTop: 8, fontSize: 11 }}>{message.questions.map((item) => <div key={item}>？ 待确认：{item}</div>)}</div>}
+              {!!message.warnings?.length && <div style={{ color: '#e3b341', marginTop: 8, fontSize: 11 }}>{message.warnings.map((item) => <div key={item}>△ 提示：{item}</div>)}</div>}
               {message.role === 'assistant' && message.proposal && (
                 <div style={{ display: 'flex', alignItems: 'center', gap: 7, marginTop: 10, flexWrap: 'wrap' }}>
-                  <button style={secondaryButton} onClick={() => setViewedProposal(message.proposal || null)}>查看候选 DSL</button>
+                  <button style={secondaryButton} onClick={() => setViewedProposal(message)}>查看候选 DSL</button>
                   {message.ready && !message.finalizedVersionId && (
-                    <button style={primaryButton} disabled={busy || kit.enabled}
-                      title={kit.enabled ? '先停用 Kit，避免 Schedule 冲突' : '写入版本账本并设为当前版本'}
-                      onClick={() => finalize(message)}>定版并启用</button>
+                    <button style={primaryButton} disabled={busy}
+                      title="保存到 Kit 版本库；不会自动切换当前执行版本"
+                      onClick={() => finalize(message)}>＋ 保存为候选版本</button>
                   )}
-                  {message.finalizedVersionId && <span style={{ ...statusPill, color: '#56d364', borderColor: '#3fb95066' }}>✓ 已定版</span>}
-                  {!message.ready && <span style={{ ...statusPill, color: '#e3b341', borderColor: '#d2992266' }}>尚不可定版</span>}
+                  {message.finalizedVersionId && <span style={{ ...statusPill, color: '#56d364', borderColor: '#3fb95066' }}>✓ 已存为版本</span>}
+                  {!message.ready && (
+                    <span style={{ ...statusPill, color: '#ff9b93', borderColor: '#f8514966' }}>
+                      {message.blockingIssues?.length
+                        ? `需处理 ${message.blockingIssues.length} 个阻断项`
+                        : message.questions?.length
+                          ? `需确认 ${message.questions.length} 个问题`
+                          : '尚不可保存'}
+                    </span>
+                  )}
                 </div>
               )}
             </div>
@@ -1393,7 +1586,7 @@ const KitOptimizerPanel: React.FC<{
           {busy && <div style={{ ...optimizerBubbleStyle, alignSelf: 'flex-start', color: '#d2a8ff' }}>AI 正在检查当前版本并生成候选…</div>}
         </div>
 
-        {notice && <div style={{ padding: '7px 14px', color: notice.includes('已定版') ? '#56d364' : '#e3b341', fontSize: 11.5 }}>{notice}</div>}
+        {notice && <div style={{ padding: '7px 14px', color: notice.includes('已保存') ? '#56d364' : '#e3b341', fontSize: 11.5 }}>{notice}</div>}
         <footer style={optimizerComposerStyle}>
           <textarea style={{ ...inputStyle, minHeight: 66, resize: 'vertical' }} value={prompt}
             placeholder="继续描述你不满意的地方、希望增加的步骤或更严格的成功标准…"
@@ -1413,7 +1606,36 @@ const KitOptimizerPanel: React.FC<{
                 <strong style={{ fontSize: 13 }}>候选 Kit DSL</strong>
                 <button style={iconButton} onClick={() => setViewedProposal(null)}>×</button>
               </div>
-              <pre style={{ ...dslPreviewStyle, maxHeight: '70vh' }}>{JSON.stringify(viewedProposal, null, 2)}</pre>
+              <div style={{ ...subtleStyle, marginTop: 7 }}>
+                这是对话生成的候选，还不会参与运行。确认后先保存进版本库，再选择是否切换执行版本。
+              </div>
+              {!!viewedProposal.blockingIssues?.length && (
+                <div style={{ marginTop: 8, color: '#ff9b93', fontSize: 11.5 }}>
+                  {viewedProposal.blockingIssues.map((item) => <div key={item}>⛔ {item}</div>)}
+                </div>
+              )}
+              {!!viewedProposal.warnings?.length && (
+                <div style={{ marginTop: 8, color: '#e3b341', fontSize: 11.5 }}>
+                  {viewedProposal.warnings.map((item) => <div key={item}>△ {item}</div>)}
+                </div>
+              )}
+              <pre style={{ ...dslPreviewStyle, maxHeight: '62vh' }}>{JSON.stringify(viewedProposal.proposal || {}, null, 2)}</pre>
+              <div style={{ display: 'flex', justifyContent: 'flex-end', alignItems: 'center', gap: 8, marginTop: 10 }}>
+                {viewedProposal.finalizedVersionId ? (
+                  <span style={{ ...statusPill, color: '#56d364', borderColor: '#3fb95066' }}>✓ 已保存到版本库</span>
+                ) : viewedProposal.ready ? (
+                  <button style={primaryButton} disabled={busy}
+                    onClick={() => finalize(viewedProposal)}>＋ 保存为候选版本</button>
+                ) : (
+                  <span style={{ ...statusPill, color: '#ff9b93', borderColor: '#f8514966' }}>
+                    {viewedProposal.blockingIssues?.length
+                      ? `存在 ${viewedProposal.blockingIssues.length} 个阻断项`
+                      : viewedProposal.questions?.length
+                        ? `仍有 ${viewedProposal.questions.length} 个问题待确认`
+                        : '候选不完整，暂不可保存'}
+                  </span>
+                )}
+              </div>
             </div>
           </div>
         )}
@@ -1593,6 +1815,11 @@ const optimizerPanelStyle: React.CSSProperties = {
   width: 'min(760px, 96%)', height: '100%', display: 'flex', flexDirection: 'column',
   background: 'var(--theme-bg, #161b22)', color: 'var(--theme-text, #e6edf3)',
   borderLeft: '1px solid var(--theme-border)', boxShadow: '-12px 0 40px rgba(0,0,0,.35)',
+};
+const optimizerVersionBarStyle: React.CSSProperties = {
+  minHeight: 52, padding: '8px 14px', boxSizing: 'border-box',
+  display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12,
+  borderBottom: '1px solid var(--theme-border)', background: 'rgba(88,166,255,.045)',
 };
 const optimizerMessagesStyle: React.CSSProperties = {
   flex: 1, minHeight: 0, overflow: 'auto', display: 'flex', flexDirection: 'column',

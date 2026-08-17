@@ -72,8 +72,10 @@ export interface KitOptimizationMessage {
   status: 'answering' | 'done' | 'error';
   proposal?: Record<string, unknown> | null;
   warnings: string[];
+  blockingIssues?: string[];
   questions: string[];
   ready: boolean;
+  readinessVersion?: number;
   baseVersionId: string;
   finalizedVersionId: string;
   createdAt: number;

@@ -163,6 +163,21 @@ class ChatMessage:
     # because it is part of the visible Session history.
     delivery_mode: Optional[str] = None  # steer | redirect
 
+    def has_visible_payload(self) -> bool:
+        """正文之外，思考、工具和附件也都属于可展示的有效回复。"""
+        if isinstance(self.content, str) and self.content.strip():
+            return True
+        if any(
+            isinstance(block.content, str) and block.content.strip()
+            for block in (self.thinking_blocks or [])
+        ):
+            return True
+        return bool(
+            self.tool_calls
+            or self.images
+            or self.text_attachments
+        )
+
     def to_dict(self) -> dict:
         d = {
             "id": self.id,
@@ -197,6 +212,10 @@ class Session:
     messages: list[ChatMessage]
     working_dir: str  # ★ Primary: Working directory is the identity of a session
     backend_id: str  # Backend config ID for this session
+    # Stable visibility owner.  A Backend process may execute sessions for many
+    # Relay users; ownership belongs to the Session, never to the process.
+    # Legacy sessions without this field are deliberately local-only.
+    owner_id: str = "local"
     # ★ 运行参数与 Backend 解耦。Backend 表示账号/连接/运行器；同一个 Codex
     #   Backend 可按会话选择不同模型与 reasoning effort。None 表示沿用 Backend/
     #   Codex 自身默认配置，非 Codex Backend 会安全忽略这两个字段。
@@ -266,6 +285,7 @@ class Session:
             "messages": [m.to_dict() for m in selected_messages],
             "workingDir": self.working_dir,  # ★ Prominent: directory is primary
             "backendId": self.backend_id,
+            "ownerId": self.owner_id,
             "modelOverride": self.model_override,
             "reasoningEffort": self.reasoning_effort,
             "agentSessionId": self.agent_session_id,
@@ -301,11 +321,13 @@ class Session:
             "messageCount": len(self.messages),
             "workingDir": self.working_dir,  # ★ Show directory in sidebar
             "backendId": self.backend_id,
+            "ownerId": self.owner_id,
             "modelOverride": self.model_override,
             "reasoningEffort": self.reasoning_effort,
             "codexConnectionMode": self.codex_connection_mode,
             "codexRemoteHost": self.codex_remote_host,
             "codexThreadAttached": self.codex_thread_attached,
+            "agentSessionId": self.agent_session_id,
             "abilities": self.abilities,
             "sessionType": self.session_type,
             "loopControlMode": self.loop_control_mode,

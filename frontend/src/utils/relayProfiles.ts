@@ -9,6 +9,8 @@
  * 一份。如果要在多设备共享,后续可考虑挪到后端 store。
  */
 
+import type { RelayUserProfile } from '../api';
+
 const STORAGE_KEY = 'awu.relayProfiles';
 
 export interface RelayProfile {
@@ -16,6 +18,7 @@ export interface RelayProfile {
   label: string;
   url: string;
   token: string;
+  user?: RelayUserProfile;
   createdAt: number;
 }
 
@@ -38,6 +41,7 @@ export function listRelayProfiles(): RelayProfile[] {
         label: String(p.label || p.url),
         url: String(p.url),
         token: String(p.token || ''),
+        user: p.user && typeof p.user === 'object' ? p.user as RelayUserProfile : undefined,
         createdAt: Number(p.createdAt || 0),
       }))
       .sort((a, b) => b.createdAt - a.createdAt);
@@ -61,34 +65,35 @@ function writeAll(list: RelayProfile[]): void {
  * - 带 id  :按 id 更新(改 label / url / token)
  */
 export function saveRelayProfile(
-  input: { id?: string; label: string; url: string; token: string },
+  input: { id?: string; label: string; url: string; token: string; user?: RelayUserProfile },
 ): RelayProfile {
   const all = listRelayProfiles();
   if (input.id) {
     const next = all.map((p) =>
       p.id === input.id
-        ? { ...p, label: input.label, url: input.url, token: input.token }
+        ? { ...p, label: input.label, url: input.url, token: input.token, user: input.user }
         : p,
     );
     writeAll(next);
     return next.find((p) => p.id === input.id) || {
-      id: input.id, label: input.label, url: input.url, token: input.token, createdAt: Date.now(),
+      id: input.id, label: input.label, url: input.url, token: input.token, user: input.user, createdAt: Date.now(),
     };
   }
   // 同 url+token 已存在 → 更新 label,返回原 id
   const dup = all.find((p) => p.url === input.url && p.token === input.token);
   if (dup) {
     const next = all.map((p) =>
-      p.id === dup.id ? { ...p, label: input.label } : p,
+      p.id === dup.id ? { ...p, label: input.label, user: input.user || p.user } : p,
     );
     writeAll(next);
-    return { ...dup, label: input.label };
+    return { ...dup, label: input.label, user: input.user || dup.user };
   }
   const profile: RelayProfile = {
     id: genId(),
     label: input.label || input.url,
     url: input.url,
     token: input.token,
+    user: input.user,
     createdAt: Date.now(),
   };
   writeAll([profile, ...all]);

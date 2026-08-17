@@ -1,3 +1,4 @@
+import asyncio
 import json
 import os
 import base64
@@ -14,6 +15,7 @@ from src.backend.workspace_kit_store import (
     WorkspaceKitStore,
     KitArtifact,
     KitRun,
+    KitStepRun,
     build_artifacts,
     evaluate_assertions,
     render_kit_command,
@@ -463,6 +465,122 @@ class WorkspaceKitVersionTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn("snapshot", compact["versions"][0])
             self.assertEqual(compact["optimizationMessages"], [])
 
+    async def test_ai_candidate_can_be_saved_without_switching_active_version(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(
+            os.environ, {"AGENT_WITH_U_DATA_ROOT": str(Path(tmp) / "data")},
+        ):
+            bridge = BridgeWS()
+            workspace = Path(tmp) / "workspace"
+            workspace.mkdir()
+            self._session(bridge, "kit-candidate", workspace)
+            created = json.loads(bridge._rpc_kitCreate("kit-candidate", json.dumps({
+                "title": "Keep running", "command": "Write-Output current", "enabled": True,
+            })))
+            kit_id = created["kit"]["id"]
+            active_id = created["kit"]["activeVersionId"]
+            fake = _FakeKitCompilerBackend({
+                "reply": "候选已准备好，可先保存到版本库。",
+                # 模型常因存在普通风险提示而保守地返回 ready=false；本地
+                # 分级校验不应因此锁死一个结构和安全检查均通过的候选。
+                "ready": False,
+                "warnings": ["构建日志会保留在工作区", "构建最多运行 6 小时"],
+                "blockingIssues": [],
+                "questions": [],
+                "proposal": {
+                    "executionTarget": "executor",
+                    "shell": "powershell",
+                    "cwd": ".",
+                    "command": "Write-Output candidate",
+                    "assertions": [{"type": "stdout_contains", "expected": "candidate"}],
+                    "schedule": {"mode": "manual", "intervalSeconds": 300},
+                },
+            })
+            with patch.object(bridge, "_new_backend_instance", return_value=fake):
+                asked = json.loads(await bridge._rpc_kitOptimizeAsk(
+                    "kit-candidate", kit_id, "生成下一候选", "review-backend",
+                ))
+
+            self.assertTrue(asked["message"]["ready"])
+            self.assertEqual(len(asked["message"]["warnings"]), 2)
+            self.assertEqual(asked["message"]["blockingIssues"], [])
+
+            # 模拟升级前已保存的“warning 即阻断”旧候选；重新打开优化面板
+            # 应自动按当前规则重验，而不是要求用户重新对话。
+            persisted = bridge._kit_get("kit-candidate").kits[0]
+            old_message = next(
+                item for item in persisted.optimization_messages
+                if item.id == asked["message"]["id"]
+            )
+            old_message.ready = False
+            old_message.readiness_version = 0
+            bridge._kit_save(bridge._kit_get("kit-candidate"), emit=False)
+            refreshed = json.loads(bridge._rpc_kitOptimizeGet("kit-candidate", kit_id))
+            refreshed_message = next(
+                item for item in refreshed["messages"] if item["id"] == asked["message"]["id"]
+            )
+            self.assertTrue(refreshed_message["ready"])
+            self.assertEqual(refreshed_message["readinessVersion"], 2)
+
+            saved = json.loads(bridge._rpc_kitOptimizeFinalize(
+                "kit-candidate", kit_id, asked["message"]["id"], "候选版", False,
+            ))
+
+            self.assertEqual(saved["status"], "ok")
+            self.assertFalse(saved["version"]["isActive"])
+            persisted = bridge._kit_get("kit-candidate").kits[0]
+            self.assertEqual(len(persisted.versions), 2)
+            self.assertEqual(persisted.active_version_id, active_id)
+            self.assertEqual(persisted.command, "Write-Output current")
+            self.assertTrue(persisted.enabled)
+
+            blocked = json.loads(bridge._rpc_kitVersionActivate(
+                "kit-candidate", kit_id, saved["version"]["id"],
+            ))
+            self.assertEqual(blocked["status"], "error")
+            self.assertIn("先停用", blocked["message"])
+
+    async def test_ai_optimization_declared_blocker_prevents_version_save(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(
+            os.environ, {"AGENT_WITH_U_DATA_ROOT": str(Path(tmp) / "data")},
+        ):
+            bridge = BridgeWS()
+            workspace = Path(tmp) / "workspace"
+            workspace.mkdir()
+            self._session(bridge, "kit-blocker", workspace)
+            created = json.loads(bridge._rpc_kitCreate("kit-blocker", json.dumps({
+                "title": "Needs identity", "command": "Write-Output current", "enabled": False,
+            })))
+            kit_id = created["kit"]["id"]
+            fake = _FakeKitCompilerBackend({
+                "reply": "命令结构有效，但目标进程归属仍需确认。",
+                "ready": False,
+                "warnings": ["预计耗时较长"],
+                "blockingIssues": ["尚不能证明目标 PID 属于这个 Kit 启动的进程树"],
+                "questions": [],
+                "proposal": {
+                    "executionTarget": "executor",
+                    "shell": "powershell",
+                    "cwd": ".",
+                    "command": "Write-Output candidate",
+                    "assertions": [{"type": "exit_code", "expected": 0}],
+                    "schedule": {"mode": "manual", "intervalSeconds": 300},
+                },
+            })
+            with patch.object(bridge, "_new_backend_instance", return_value=fake):
+                asked = json.loads(await bridge._rpc_kitOptimizeAsk(
+                    "kit-blocker", kit_id, "优化关闭流程", "review-backend",
+                ))
+
+            assistant = asked["message"]
+            self.assertFalse(assistant["ready"])
+            self.assertEqual(assistant["warnings"], ["预计耗时较长"])
+            self.assertIn("目标 PID", assistant["blockingIssues"][0])
+            rejected = json.loads(bridge._rpc_kitOptimizeFinalize(
+                "kit-blocker", kit_id, assistant["id"], "不应保存", False,
+            ))
+            self.assertEqual(rejected["status"], "error")
+            self.assertIn("目标 PID", rejected["message"])
+
 
 class WorkspaceKitExecutionTests(unittest.IsolatedAsyncioTestCase):
     @staticmethod
@@ -471,6 +589,114 @@ class WorkspaceKitExecutionTests(unittest.IsolatedAsyncioTestCase):
             id=session_id, title="Kit orchestration", created_at=time.time(), updated_at=time.time(),
             messages=[], working_dir=str(workspace), backend_id="codex-office",
         )
+
+    async def test_cancel_stale_run_without_task_is_immediate_and_idempotent(self):
+        """异常/重启丢失内存 Task 后，停止仍须解除 sidecar 的永久 running。"""
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(
+            os.environ, {"AGENT_WITH_U_DATA_ROOT": str(Path(tmp) / "data")},
+        ):
+            bridge = BridgeWS()
+            workspace = Path(tmp) / "workspace"
+            workspace.mkdir()
+            session_id = "kit-stale-cancel"
+            self._session(bridge, session_id, workspace)
+            kit = WorkspaceKit.from_dict({
+                "id": "stale-kit", "title": "stale", "command": "echo ok",
+            })
+            run = KitRun(
+                id="stale-run", kit_id=kit.id, session_id=session_id,
+                status="running", started_at=time.time(),
+                steps=[
+                    KitStepRun(
+                        id="current", type="command", target="executor",
+                        title="current", status="running",
+                    ),
+                    KitStepRun(
+                        id="later", type="command", target="executor",
+                        title="later", status="pending",
+                    ),
+                ],
+            )
+            state = bridge._kit_get(session_id)
+            state.kits.append(kit)
+            state.runs.append(run)
+            bridge._kit_save(state, emit=False)
+
+            stopped = json.loads(bridge._rpc_kitCancel(session_id, run.id))
+            stopped_again = json.loads(bridge._rpc_kitCancel(session_id, run.id))
+
+            self.assertEqual(stopped["statusNow"], "cancelled")
+            self.assertEqual(stopped_again["statusNow"], "cancelled")
+            self.assertEqual(run.status, "cancelled")
+            self.assertEqual(run.steps[0].status, "cancelled")
+            self.assertEqual(run.steps[1].status, "skipped")
+            self.assertIsNotNone(run.ended_at)
+            self.assertNotIn(run.id, bridge._kit_cancel_requests)
+
+    async def test_cancel_before_task_first_runs_cleans_registry(self):
+        """覆盖 create_task 后、协程首次调度前点击停止的竞态。"""
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(
+            os.environ, {"AGENT_WITH_U_DATA_ROOT": str(Path(tmp) / "data")},
+        ):
+            bridge = BridgeWS()
+            workspace = Path(tmp) / "workspace"
+            workspace.mkdir()
+            session_id = "kit-prestart-cancel"
+            self._session(bridge, session_id, workspace)
+            created = json.loads(bridge._rpc_kitCreate(session_id, json.dumps({
+                "title": "prestart", "command": "echo should-not-run",
+            })))
+            started = json.loads(bridge._rpc_kitRun(
+                session_id, created["kit"]["id"], "{}",
+            ))
+            run_id = started["run"]["id"]
+            task = bridge._kit_tasks[run_id]
+
+            stopped = json.loads(bridge._rpc_kitCancel(session_id, run_id))
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+            await asyncio.sleep(0)
+
+            run = bridge._kit_get(session_id).runs[-1]
+            self.assertEqual(stopped["statusNow"], "cancelled")
+            self.assertEqual(run.status, "cancelled")
+            self.assertNotIn(run_id, bridge._kit_tasks)
+            self.assertNotIn(run_id, bridge._kit_cancel_requests)
+
+    async def test_cancel_running_executor_command_stops_process_tree(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(
+            os.environ, {"AGENT_WITH_U_DATA_ROOT": str(Path(tmp) / "data")},
+        ):
+            bridge = BridgeWS()
+            workspace = Path(tmp) / "workspace"
+            workspace.mkdir()
+            session_id = "kit-process-cancel"
+            self._session(bridge, session_id, workspace)
+            shell = "powershell" if os.name == "nt" else "bash"
+            command = "Start-Sleep -Seconds 30" if os.name == "nt" else "sleep 30"
+            created = json.loads(bridge._rpc_kitCreate(session_id, json.dumps({
+                "title": "long", "shell": shell, "command": command,
+                "timeoutSeconds": 60,
+            })))
+            started = json.loads(bridge._rpc_kitRun(
+                session_id, created["kit"]["id"], "{}",
+            ))
+            run_id = started["run"]["id"]
+            task = bridge._kit_tasks[run_id]
+            for _ in range(200):
+                if run_id in bridge._kit_processes:
+                    break
+                await asyncio.sleep(0.01)
+            self.assertIn(run_id, bridge._kit_processes)
+            proc = bridge._kit_processes[run_id]
+
+            stopped = json.loads(bridge._rpc_kitCancel(session_id, run_id))
+            await asyncio.wait_for(task, timeout=8)
+
+            run = bridge._kit_get(session_id).runs[-1]
+            self.assertEqual(stopped["statusNow"], "cancelled")
+            self.assertEqual(run.status, "cancelled")
+            self.assertIsNotNone(proc.returncode)
 
     async def test_steps_stop_after_first_failure(self):
         with tempfile.TemporaryDirectory() as tmp, patch.dict(

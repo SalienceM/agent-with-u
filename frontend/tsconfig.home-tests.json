@@ -13,6 +13,11 @@
   "include": [
     "src/home/dashboardModel.ts",
     "src/home/dashboardPerformance.ts",
-    "src/home/dashboardPreferences.ts"
+    "src/home/dashboardPreferences.ts",
+    "src/utils/realtimeVoice.ts",
+    "src/utils/chatMessageVisibility.ts",
+    "src/utils/dirSyncPolicy.ts",
+    "src/utils/dirSyncFreshness.ts",
+    "src/utils/sha256.ts"
   ]
 }

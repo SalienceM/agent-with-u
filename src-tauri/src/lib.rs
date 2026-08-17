@@ -3,9 +3,10 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    Mutex,
+    Arc, Mutex,
 };
 use tauri::Manager;
+use tauri_plugin_notification::NotificationExt;
 use tauri_plugin_shell::process::CommandChild;
 
 mod hacker_mode;
@@ -121,6 +122,24 @@ fn report_desktop_log(source: String, message: String) {
         source.chars().take(40).collect::<String>(),
         message.chars().take(2000).collect::<String>()
     ));
+}
+
+#[tauri::command]
+fn show_task_completion_notification(
+    app: tauri::AppHandle,
+    title: String,
+    body: String,
+) -> Result<(), String> {
+    // Keep externally supplied text bounded before handing it to the OS toast
+    // implementation. This command deliberately exposes no arbitrary options.
+    let title = title.chars().take(120).collect::<String>();
+    let body = body.chars().take(500).collect::<String>();
+    app.notification()
+        .builder()
+        .title(title)
+        .body(body)
+        .show()
+        .map_err(|error| error.to_string())
 }
 
 #[derive(Default)]
@@ -437,6 +456,8 @@ use std::path::Path;
 struct SyncFileInfo {
     hash: String,
     size: u64,
+    /// Unix 毫秒；前端只用它解释哪端更新，内容一致性仍由 hash 决定。
+    mtime: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -479,13 +500,13 @@ fn wildcard_match(pat: &str, text: &str) -> bool {
     dp[np][nt]
 }
 
-fn sync_is_ignored(rel: &str, patterns: &[String]) -> bool {
+fn sync_is_ignored(rel: &str, patterns: &[String], include_git: bool) -> bool {
     let rel = rel.replace('\\', "/");
     let segs: Vec<&str> = rel.split('/').filter(|s| !s.is_empty()).collect();
-    // Session 文件传输需要完整保留 Git 元数据，不能让旧忽略配置继续
-    // 静默过滤 `.git`。
+    // Git 元数据默认不进入离线副本；只有文件面板的显式高级开关可放行。
+    // 放行后不再让普通 ignore 规则二次拦截，保证迁移模式语义明确。
     if segs.contains(&".git") {
-        return false;
+        return !include_git;
     }
     for pat in patterns {
         let p = pat.trim().trim_end_matches('/');
@@ -525,7 +546,13 @@ fn sync_resolve(dir: &str, rel: &str) -> Result<(std::path::PathBuf, std::path::
     Ok((root, target))
 }
 
-fn scan_dir(root: &Path, cur: &Path, ignore: &[String], out: &mut HashMap<String, SyncFileInfo>) {
+fn scan_dir(
+    root: &Path,
+    cur: &Path,
+    ignore: &[String],
+    include_git: bool,
+    out: &mut HashMap<String, SyncFileInfo>,
+) {
     let entries = match std::fs::read_dir(cur) {
         Ok(e) => e,
         Err(_) => return,
@@ -543,20 +570,27 @@ fn scan_dir(root: &Path, cur: &Path, ignore: &[String], out: &mut HashMap<String
             Ok(r) => r.to_string_lossy().replace('\\', "/"),
             Err(_) => continue,
         };
-        if sync_is_ignored(&rel, ignore) {
+        if sync_is_ignored(&rel, ignore, include_git) {
             continue;
         }
         if ft.is_dir() {
-            scan_dir(root, &path, ignore, out);
+            scan_dir(root, &path, ignore, include_git, out);
         } else if ft.is_file() {
             if let Ok(data) = std::fs::read(&path) {
                 let mut hasher = Sha256::new();
                 hasher.update(&data);
+                let mtime = entry
+                    .metadata()
+                    .ok()
+                    .and_then(|meta| meta.modified().ok())
+                    .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|duration| duration.as_millis() as u64);
                 out.insert(
                     rel,
                     SyncFileInfo {
                         hash: hex_encode(&hasher.finalize()),
                         size: data.len() as u64,
+                        mtime,
                     },
                 );
             }
@@ -565,13 +599,23 @@ fn scan_dir(root: &Path, cur: &Path, ignore: &[String], out: &mut HashMap<String
 }
 
 #[tauri::command]
-fn dir_sync_scan(dir: String, ignore: Vec<String>) -> Result<SyncScanResult, String> {
+fn dir_sync_scan(
+    dir: String,
+    ignore: Vec<String>,
+    include_git: Option<bool>,
+) -> Result<SyncScanResult, String> {
     let root = std::fs::canonicalize(&dir).map_err(|e| format!("副本目录无效: {e}"))?;
     if !root.is_dir() {
         return Err("副本目录不存在".into());
     }
     let mut files = HashMap::new();
-    scan_dir(&root, &root, &ignore, &mut files);
+    scan_dir(
+        &root,
+        &root,
+        &ignore,
+        include_git.unwrap_or(false),
+        &mut files,
+    );
     Ok(SyncScanResult { files })
 }
 
@@ -665,6 +709,7 @@ fn kit_client_read_chunk(path: String, offset: u64, size: usize) -> Result<Strin
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct KitClientCommandSpec {
+    run_id: String,
     shell: String,
     command: String,
     cwd: String,
@@ -681,8 +726,56 @@ struct KitClientCommandResult {
     stderr: String,
 }
 
+#[derive(Clone)]
+struct KitClientCommandHandle {
+    pid: u32,
+    cancelled: Arc<AtomicBool>,
+}
+
+#[derive(Default)]
+struct KitClientCommandRegistry(Arc<Mutex<HashMap<String, KitClientCommandHandle>>>);
+
+#[cfg(target_os = "windows")]
+fn kill_kit_client_process_tree(pid: u32) -> bool {
+    kill_windows_process_tree(pid)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn kill_kit_client_process_tree(pid: u32) -> bool {
+    // 客户端命令启动时会成为独立进程组；负 PID 只影响这一棵 Kit 进程树。
+    std::process::Command::new("kill")
+        .args(["-TERM", &format!("-{pid}")])
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
 #[tauri::command]
-async fn kit_client_command(spec: KitClientCommandSpec) -> Result<KitClientCommandResult, String> {
+fn kit_client_command_cancel(
+    run_id: String,
+    registry: tauri::State<'_, KitClientCommandRegistry>,
+) -> Result<bool, String> {
+    let handle = registry
+        .0
+        .lock()
+        .map_err(|_| "客户端命令注册表不可用".to_string())?
+        .get(&run_id)
+        .cloned();
+    let Some(handle) = handle else {
+        // 幂等：命令已退出或不在当前客户端执行，也视为无需继续清理。
+        return Ok(false);
+    };
+    handle.cancelled.store(true, Ordering::SeqCst);
+    let _ = kill_kit_client_process_tree(handle.pid);
+    Ok(true)
+}
+
+#[tauri::command]
+async fn kit_client_command(
+    spec: KitClientCommandSpec,
+    registry: tauri::State<'_, KitClientCommandRegistry>,
+) -> Result<KitClientCommandResult, String> {
+    let registry = registry.0.clone();
     tauri::async_runtime::spawn_blocking(move || {
         use std::io::Read;
         use std::process::{Command, Stdio};
@@ -690,6 +783,9 @@ async fn kit_client_command(spec: KitClientCommandSpec) -> Result<KitClientComma
 
         if spec.command.trim().is_empty() {
             return Err("客户端命令为空".into());
+        }
+        if spec.run_id.trim().is_empty() {
+            return Err("客户端命令缺少 Kit runId".into());
         }
         let timeout = spec.timeout_seconds.clamp(1, 86_400);
         let mut command = match spec.shell.as_str() {
@@ -737,11 +833,30 @@ async fn kit_client_command(spec: KitClientCommandSpec) -> Result<KitClientComma
         #[cfg(target_os = "windows")]
         {
             use std::os::windows::process::CommandExt;
-            command.creation_flags(0x08000000);
+            command.creation_flags(0x08000000 | 0x00000200);
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            use std::os::unix::process::CommandExt;
+            command.process_group(0);
         }
         let mut child = command
             .spawn()
             .map_err(|e| format!("客户端命令启动失败: {e}"))?;
+        let pid = child.id();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        {
+            let mut active = registry
+                .lock()
+                .map_err(|_| "客户端命令注册表不可用".to_string())?;
+            active.insert(
+                spec.run_id.clone(),
+                KitClientCommandHandle {
+                    pid,
+                    cancelled: cancelled.clone(),
+                },
+            );
+        }
         let mut stdout = child.stdout.take().ok_or("无法接管客户端 stdout")?;
         let mut stderr = child.stderr.take().ok_or("无法接管客户端 stderr")?;
         let out_thread = std::thread::spawn(move || {
@@ -755,26 +870,41 @@ async fn kit_client_command(spec: KitClientCommandSpec) -> Result<KitClientComma
             out
         });
         let deadline = Instant::now() + Duration::from_secs(timeout);
-        let status = loop {
-            if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
-                break status;
+        let result = (|| -> Result<KitClientCommandResult, String> {
+            let status = loop {
+                if cancelled.load(Ordering::SeqCst) {
+                    let _ = kill_kit_client_process_tree(pid);
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err("客户端命令已停止".into());
+                }
+                if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
+                    break status;
+                }
+                if Instant::now() >= deadline {
+                    let _ = kill_kit_client_process_tree(pid);
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(format!("客户端命令超过 {timeout} 秒，已终止"));
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            };
+            let mut out = out_thread.join().unwrap_or_default();
+            let mut err = err_thread.join().unwrap_or_default();
+            out.truncate(200_000);
+            err.truncate(200_000);
+            Ok(KitClientCommandResult {
+                exit_code: status.code().unwrap_or(1),
+                stdout: String::from_utf8_lossy(&out).into_owned(),
+                stderr: String::from_utf8_lossy(&err).into_owned(),
+            })
+        })();
+        if let Ok(mut active) = registry.lock() {
+            if active.get(&spec.run_id).map(|item| item.pid) == Some(pid) {
+                active.remove(&spec.run_id);
             }
-            if Instant::now() >= deadline {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(format!("客户端命令超过 {timeout} 秒，已终止"));
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        };
-        let mut out = out_thread.join().unwrap_or_default();
-        let mut err = err_thread.join().unwrap_or_default();
-        out.truncate(200_000);
-        err.truncate(200_000);
-        Ok(KitClientCommandResult {
-            exit_code: status.code().unwrap_or(1),
-            stdout: String::from_utf8_lossy(&out).into_owned(),
-            stderr: String::from_utf8_lossy(&err).into_owned(),
-        })
+        }
+        result
     })
     .await
     .map_err(|e| e.to_string())?
@@ -1007,9 +1137,11 @@ pub fn run() {
             }
         }))
         .manage(BackendProcess::default())
+        .manage(KitClientCommandRegistry::default())
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
+        .plugin(tauri_plugin_notification::init())
         .setup(|app| {
             desktop_log(format!(
                 "[startup] app setup started; version={}",
@@ -1145,6 +1277,7 @@ pub fn run() {
             get_ws_port,
             get_desktop_logs,
             report_desktop_log,
+            show_task_completion_notification,
             open_log_viewer,
             open_screenshot_tool,
             read_local_clipboard_image,
@@ -1162,6 +1295,7 @@ pub fn run() {
             kit_client_file_info,
             kit_client_read_chunk,
             kit_client_command,
+            kit_client_command_cancel,
             dir_sync_write_file,
             dir_sync_write_start,
             dir_sync_write_chunk,

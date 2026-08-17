@@ -4,7 +4,7 @@
 #   执行节点 C  跑在你自己的机器上(家里/公司/NAS)，真实执行永远在这；
 #               用 --relay-url 主动拨出到本中继注册。
 #   中继 S      就是本服务，公网可达，只转发不执行。
-#   UI 客户端   web/安卓/iOS，在「连接」面板里填本中继地址 + token，选设备。
+#   UI 客户端   web/安卓/iOS，在「连接」面板里填中继地址 + 用户 token，选设备。
 #
 # 本中继与执行节点的 docker-compose.example.yml 是【两套独立部署】：
 # 中继在公网 VPS，执行节点在用户自己的机器。
@@ -27,8 +27,15 @@ services:
     environment:
       AGENT_WITH_U_RELAY_BIND: "0.0.0.0"
       AGENT_WITH_U_RELAY_PORT: "44360"
-      # ★ 必填：执行节点与 UI 共用的共享 token。务必用强随机值。
+      # ★ 必填：Relay 主 token，仅供执行节点注册；启用用户后 UI 不再使用它。
       AGENT_WITH_U_RELAY_TOKEN: "${AGENT_WITH_U_RELAY_TOKEN:?set AGENT_WITH_U_RELAY_TOKEN}"
+      AGENT_WITH_U_RELAY_USERS_FILE: "/data/users.json"
+
+    volumes:
+      - awu-relay-data:/data
 
     ports:
       - "44360:44360"
+
+volumes:
+  awu-relay-data:

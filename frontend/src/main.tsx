@@ -8,6 +8,18 @@ import { api } from './api';
 import { installGlobalStreamRouter } from './hooks/useStreamState';
 import { ErrorBoundary } from './components/ErrorBoundary';
 
+// Web/平板缓存应用外壳；文件正文另存于 IndexedDB。Tauri 不注册，避免与
+// sidecar 的版本更新产生双重缓存。
+if (!isScratchPadWindow && !isSmoothGhostWindow && !isSmoothRegionSelector
+  && typeof navigator !== 'undefined' && 'serviceWorker' in navigator
+  && typeof (window as any).__TAURI_INTERNALS__ === 'undefined') {
+  window.addEventListener('load', () => {
+    void navigator.serviceWorker.register('./service-worker.js').catch((error) => {
+      console.warn('[offline] service worker registration failed', error);
+    });
+  });
+}
+
 // ── 最后防线：全局错误处理，捕获 React 挂载前 / 模块加载时的 JS 崩溃 ──
 // 如果 React 因模块级错误无法渲染，此处理器直接往 DOM 写诊断信息，避免白屏。
 let _reactMounted = false;

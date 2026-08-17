@@ -1,7 +1,11 @@
 import React, { useRef, useCallback, useEffect, useState } from 'react';
 import type { AppConfig, ThemeType } from '../hooks/useConfig';
 import { themes } from '../hooks/useConfig';
-import { api, isTauri } from '../api';
+import {
+  api, isTauri, getConnectionTarget, getRelayUserProfile,
+  updateRelayUserProfile, rememberRelayUserProfile,
+  type RelayUserProfile,
+} from '../api';
 import {
   SCREENSHOT_HOTKEY_DEFAULT,
   buildAccelerator,
@@ -11,12 +15,61 @@ import {
   writeScreenshotHotkey,
 } from '../utils/hotkey';
 import { readHackerMode, writeHackerMode, type HackerModeConfig } from '../utils/hackerMode';
+import { base64ToArrayBuffer, systemSpeechRate } from '../utils/realtimeVoice';
 
 const DASHSCOPE_REALTIME_DEFAULT = 'fun-asr-realtime-2026-02-28';
 const DASHSCOPE_FLASH_DEFAULT = 'fun-asr-flash-2026-06-15';
 const DASHSCOPE_REALTIME_MODELS = new Set([
   DASHSCOPE_REALTIME_DEFAULT,
 ]);
+
+async function resizeAvatar(file: File): Promise<string> {
+  if (!/^image\/(?:png|jpeg|webp)$/i.test(file.type)) {
+    throw new Error('头像仅支持 PNG、JPEG 或 WebP');
+  }
+  if (file.size > 8 * 1024 * 1024) throw new Error('原图不能超过 8 MB');
+  const objectUrl = URL.createObjectURL(file);
+  try {
+    const image = await new Promise<HTMLImageElement>((resolve, reject) => {
+      const element = new Image();
+      element.onload = () => resolve(element);
+      element.onerror = () => reject(new Error('无法读取这张图片'));
+      element.src = objectUrl;
+    });
+    const size = 256;
+    const canvas = document.createElement('canvas');
+    canvas.width = size;
+    canvas.height = size;
+    const context = canvas.getContext('2d');
+    if (!context) throw new Error('浏览器不支持头像处理');
+    const sourceSize = Math.min(image.naturalWidth, image.naturalHeight);
+    const sourceX = (image.naturalWidth - sourceSize) / 2;
+    const sourceY = (image.naturalHeight - sourceSize) / 2;
+    context.drawImage(image, sourceX, sourceY, sourceSize, sourceSize, 0, 0, size, size);
+    const result = canvas.toDataURL('image/webp', 0.82);
+    if (result.length > 520_000) throw new Error('压缩后的头像仍然过大，请换一张图片');
+    return result;
+  } finally {
+    URL.revokeObjectURL(objectUrl);
+  }
+}
+
+type SettingsPage = 'user' | 'general' | 'voice' | 'appearance' | 'desktop' | 'system';
+
+const SETTINGS_PAGES: Array<{
+  id: SettingsPage;
+  icon: string;
+  label: string;
+  description: string;
+  desktopOnly?: boolean;
+}> = [
+  { id: 'user', icon: '●', label: '用户', description: '当前身份、用户名与头像' },
+  { id: 'general', icon: '⌘', label: '常规', description: '对话、Session 与实验功能' },
+  { id: 'voice', icon: '◉', label: '语音', description: '识别、朗读与实时对话' },
+  { id: 'appearance', icon: '◐', label: '外观', description: '主题、透明度与背景' },
+  { id: 'desktop', icon: '⌁', label: '桌面交互', description: 'Smooth 与系统快捷键', desktopOnly: true },
+  { id: 'system', icon: '⇅', label: '数据与系统', description: '备份、Backend 与应用信息' },
+];
 
 interface SettingsProps {
   isOpen: boolean;
@@ -28,6 +81,25 @@ interface SettingsProps {
   onOpenBackendManager: () => void;
   onExportData: () => void;
   onImportData: () => void;
+  onOpenConnectionPanel: () => void;
+}
+
+interface LegacyClaimItem {
+  id: string;
+  title: string;
+  updatedAt: number;
+  workingDir: string;
+  sessionType: string;
+  messageCount: number;
+  busyReason: string;
+}
+
+interface LegacyClaimPreview {
+  status: string;
+  targetOwnerId?: string;
+  eligibleCount?: number;
+  busyCount?: number;
+  items?: LegacyClaimItem[];
 }
 
 export const Settings: React.FC<SettingsProps> = ({
@@ -40,8 +112,11 @@ export const Settings: React.FC<SettingsProps> = ({
   onOpenBackendManager,
   onExportData,
   onImportData,
+  onOpenConnectionPanel,
 }) => {
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const userAvatarInputRef = useRef<HTMLInputElement>(null);
+  const settingsContentRef = useRef<HTMLElement>(null);
   const [appVersion, setAppVersion] = useState<string>('');
   const [sttCfg, setSttCfg] = useState<any>(null);
   const [sttSaving, setSttSaving] = useState(false);
@@ -49,11 +124,213 @@ export const Settings: React.FC<SettingsProps> = ({
   const [localInstalled, setLocalInstalled] = useState<boolean | null>(null);
   const [installing, setInstalling] = useState(false);
   const [installLog, setInstallLog] = useState('');
+  const [activePage, setActivePage] = useState<SettingsPage>('user');
+  const [systemVoices, setSystemVoices] = useState<SpeechSynthesisVoice[]>([]);
+  const [voicePreviewing, setVoicePreviewing] = useState(false);
+  const [voicePreviewError, setVoicePreviewError] = useState('');
+  const [relayUser, setRelayUser] = useState<RelayUserProfile | null>(null);
+  const [userDraft, setUserDraft] = useState<RelayUserProfile | null>(null);
+  const [userLoading, setUserLoading] = useState(false);
+  const [userSaving, setUserSaving] = useState(false);
+  const [userError, setUserError] = useState('');
+  const [userSaved, setUserSaved] = useState(false);
+  const [legacyClaimPreview, setLegacyClaimPreview] = useState<LegacyClaimPreview | null>(null);
+  const [legacyClaimSelected, setLegacyClaimSelected] = useState<string[]>([]);
+  const [legacyClaimLoading, setLegacyClaimLoading] = useState(false);
+  const [legacyClaimRunning, setLegacyClaimRunning] = useState(false);
+  const [legacyClaimError, setLegacyClaimError] = useState('');
+  const [legacyClaimResult, setLegacyClaimResult] = useState<{ count: number; backupPath: string } | null>(null);
+  const voicePreviewVersionRef = useRef(0);
+  const voicePreviewAudioRef = useRef<HTMLAudioElement | null>(null);
+  const voicePreviewUrlRef = useRef('');
+  const voicePreviewUtteranceRef = useRef<SpeechSynthesisUtterance | null>(null);
+  const desktopRuntime = isTauri();
+  const visiblePages = SETTINGS_PAGES.filter((page) => !page.desktopOnly || desktopRuntime);
+  const activePageMeta = SETTINGS_PAGES.find((page) => page.id === activePage)
+    || SETTINGS_PAGES[0];
+
+  const stopVoicePreview = useCallback(() => {
+    voicePreviewVersionRef.current += 1;
+    if (voicePreviewUtteranceRef.current && 'speechSynthesis' in window) {
+      window.speechSynthesis.cancel();
+    }
+    voicePreviewUtteranceRef.current = null;
+    if (voicePreviewAudioRef.current) {
+      voicePreviewAudioRef.current.pause();
+      voicePreviewAudioRef.current.src = '';
+      voicePreviewAudioRef.current = null;
+    }
+    if (voicePreviewUrlRef.current) {
+      URL.revokeObjectURL(voicePreviewUrlRef.current);
+      voicePreviewUrlRef.current = '';
+    }
+    setVoicePreviewing(false);
+  }, []);
+
+  useEffect(() => {
+    if (isOpen && settingsContentRef.current) settingsContentRef.current.scrollTop = 0;
+  }, [activePage, isOpen]);
+
+  useEffect(() => {
+    if (!isOpen || activePage !== 'voice' || !('speechSynthesis' in window)) return;
+    const refreshVoices = () => {
+      const voices = window.speechSynthesis.getVoices().slice().sort((left, right) => {
+        const rank = (lang: string) => /^zh(?:-|_)/i.test(lang) ? 0 : /^en(?:-|_)/i.test(lang) ? 1 : 2;
+        return rank(left.lang) - rank(right.lang)
+          || left.lang.localeCompare(right.lang)
+          || left.name.localeCompare(right.name);
+      });
+      setSystemVoices(voices);
+    };
+    refreshVoices();
+    window.speechSynthesis.addEventListener('voiceschanged', refreshVoices);
+    return () => window.speechSynthesis.removeEventListener('voiceschanged', refreshVoices);
+  }, [activePage, isOpen]);
+
+  useEffect(() => {
+    if (!isOpen || activePage !== 'voice') stopVoicePreview();
+  }, [activePage, isOpen, stopVoicePreview]);
+
+  useEffect(() => () => stopVoicePreview(), [stopVoicePreview]);
 
   useEffect(() => {
     if (!isOpen) return;
     let cancelled = false;
     api.getAppVersion().then((v) => { if (!cancelled) setAppVersion(v); }).catch(() => {});
+    return () => { cancelled = true; };
+  }, [isOpen]);
+
+  useEffect(() => {
+    if (!isOpen || activePage !== 'user') return;
+    const target = getConnectionTarget();
+    setUserError('');
+    setUserSaved(false);
+    setRelayUser(null);
+    setUserDraft(null);
+    if (target.mode === 'local') {
+      const local: RelayUserProfile = {
+        userId: 'local', username: 'local', displayName: '本机用户',
+        avatarData: '', avatarColor: '#64748b', managed: false,
+      };
+      setRelayUser(local);
+      setUserDraft(local);
+      setUserLoading(false);
+      return;
+    }
+    let cancelled = false;
+    if (target.user) {
+      setRelayUser(target.user);
+      setUserDraft(target.user);
+    }
+    setUserLoading(true);
+    getRelayUserProfile(target.url, target.token).then((profile) => {
+      if (cancelled) return;
+      setRelayUser(profile);
+      setUserDraft(profile);
+      rememberRelayUserProfile(profile);
+    }).catch((error: any) => {
+      if (!cancelled) setUserError(
+        target.user
+          ? `当前显示本地缓存身份；在线验证失败：${error?.message || 'Relay 未响应'}`
+          : (error?.message || '当前用户验证失败'),
+      );
+    }).finally(() => {
+      if (!cancelled) setUserLoading(false);
+    });
+    return () => { cancelled = true; };
+  }, [activePage, isOpen]);
+
+  const refreshLegacyClaimPreview = useCallback(async () => {
+    const target = getConnectionTarget();
+    setLegacyClaimPreview(null);
+    setLegacyClaimSelected([]);
+    setLegacyClaimError('');
+    if (target.mode !== 'relay') return;
+    setLegacyClaimLoading(true);
+    try {
+      const preview = await api.legacySessionOwnershipPreview();
+      setLegacyClaimPreview(preview);
+      setLegacyClaimSelected(
+        (preview.items || []).filter((item) => !item.busyReason).map((item) => item.id),
+      );
+    } catch (error: any) {
+      setLegacyClaimError(error?.message || '无法检查历史 Session');
+    } finally {
+      setLegacyClaimLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!isOpen || activePage !== 'user') return;
+    setLegacyClaimResult(null);
+    void refreshLegacyClaimPreview();
+  }, [activePage, isOpen, refreshLegacyClaimPreview]);
+
+  const handleUserSave = useCallback(async () => {
+    const target = getConnectionTarget();
+    if (target.mode !== 'relay' || !userDraft?.managed) return;
+    setUserSaving(true);
+    setUserError('');
+    setUserSaved(false);
+    try {
+      const profile = await updateRelayUserProfile(target.url, target.token, {
+        username: userDraft.username,
+        displayName: userDraft.displayName,
+        avatarData: userDraft.avatarData,
+        avatarColor: userDraft.avatarColor,
+      });
+      setRelayUser(profile);
+      setUserDraft(profile);
+      rememberRelayUserProfile(profile);
+      setUserSaved(true);
+    } catch (error: any) {
+      setUserError(error?.message || '保存用户档案失败');
+    } finally {
+      setUserSaving(false);
+    }
+  }, [userDraft]);
+
+  const handleUserAvatar = useCallback(async (file: File | undefined) => {
+    if (!file) return;
+    setUserError('');
+    try {
+      const avatarData = await resizeAvatar(file);
+      setUserDraft((current) => current ? { ...current, avatarData } : current);
+    } catch (error: any) {
+      setUserError(error?.message || '头像读取失败');
+    }
+  }, []);
+
+  const handleClaimLegacySessions = useCallback(async () => {
+    if (!legacyClaimSelected.length || legacyClaimRunning) return;
+    const confirmed = window.confirm(
+      `将 ${legacyClaimSelected.length} 个历史 Session 归属到当前用户。\n\n`
+      + '执行端会先自动创建完整备份；迁移后，本地直连将不再显示这些 Session。是否继续？',
+    );
+    if (!confirmed) return;
+    setLegacyClaimRunning(true);
+    setLegacyClaimError('');
+    setLegacyClaimResult(null);
+    try {
+      const result = await api.claimLegacySessions(legacyClaimSelected);
+      if (result.status !== 'ok') throw new Error(result.message || '历史 Session 认领失败');
+      setLegacyClaimResult({
+        count: Number(result.count || 0),
+        backupPath: String(result.backupPath || ''),
+      });
+      await refreshLegacyClaimPreview();
+    } catch (error: any) {
+      setLegacyClaimError(error?.message || '历史 Session 认领失败');
+    } finally {
+      setLegacyClaimRunning(false);
+    }
+  }, [legacyClaimRunning, legacyClaimSelected, refreshLegacyClaimPreview]);
+
+  // 语音配置及麦克风权限只在进入“语音”页时加载。分页后不应仅仅打开
+  // 设置就初始化音频设备，也避免其它页面为不可见内容支付启动开销。
+  useEffect(() => {
+    if (!isOpen || activePage !== 'voice') return;
+    let cancelled = false;
     api.getSttConfig().then((c) => {
       if (cancelled) return;
       setSttCfg(c);
@@ -75,7 +352,7 @@ export const Settings: React.FC<SettingsProps> = ({
         .catch(() => {});
     }
     return () => { cancelled = true; };
-  }, [isOpen]);
+  }, [activePage, isOpen]);
 
   const handleSttChange = useCallback((field: string, value: string | boolean) => {
     setSttCfg((prev: any) => {
@@ -118,6 +395,87 @@ export const Settings: React.FC<SettingsProps> = ({
     }
   }, []);
 
+  const handleVoicePreview = useCallback(async () => {
+    if (voicePreviewing) {
+      stopVoicePreview();
+      return;
+    }
+    stopVoicePreview();
+    const version = ++voicePreviewVersionRef.current;
+    setVoicePreviewError('');
+    setVoicePreviewing(true);
+    const sample = '在呢，请说。';
+    try {
+      if (config.realtimeVoiceTtsEngine === 'system') {
+        if (!('speechSynthesis' in window) || typeof SpeechSynthesisUtterance === 'undefined') {
+          throw new Error('当前客户端没有可用的系统语音');
+        }
+        const utterance = new SpeechSynthesisUtterance(sample);
+        const selected = systemVoices.find((item) => (
+          item.voiceURI === config.realtimeVoiceSystemVoice
+          || item.name === config.realtimeVoiceSystemVoice
+        ));
+        if (selected) {
+          utterance.voice = selected;
+          utterance.lang = selected.lang;
+        } else {
+          utterance.lang = 'zh-CN';
+        }
+        utterance.rate = systemSpeechRate(config.ttsRate);
+        voicePreviewUtteranceRef.current = utterance;
+        utterance.onend = () => {
+          if (voicePreviewVersionRef.current === version) stopVoicePreview();
+        };
+        utterance.onerror = () => {
+          if (voicePreviewVersionRef.current !== version) return;
+          setVoicePreviewError('本机语音试听失败');
+          stopVoicePreview();
+        };
+        window.speechSynthesis.speak(utterance);
+        return;
+      }
+
+      const backendEngine = config.realtimeVoiceTtsEngine === 'dashscope'
+        ? 'dashscope'
+        : 'edge';
+      const selectedVoice = backendEngine === 'dashscope'
+        ? config.realtimeVoiceDashScopeVoice
+        : config.ttsVoice;
+      const selectedModel = backendEngine === 'dashscope'
+        ? config.realtimeVoiceDashScopeModel
+        : '';
+      const result = await api.ttsSynthesize(
+        sample,
+        selectedVoice,
+        config.ttsRate,
+        backendEngine,
+        selectedModel,
+      );
+      if (voicePreviewVersionRef.current !== version) return;
+      if (!result.ok || !result.base64) throw new Error(result.error || 'TTS 未返回音频');
+      const blob = new Blob([base64ToArrayBuffer(result.base64)], {
+        type: result.mime || 'audio/mpeg',
+      });
+      const url = URL.createObjectURL(blob);
+      const audio = new Audio(url);
+      voicePreviewUrlRef.current = url;
+      voicePreviewAudioRef.current = audio;
+      audio.onended = () => {
+        if (voicePreviewVersionRef.current === version) stopVoicePreview();
+      };
+      audio.onerror = () => {
+        if (voicePreviewVersionRef.current !== version) return;
+          setVoicePreviewError('TTS 音频播放失败');
+        stopVoicePreview();
+      };
+      await audio.play();
+    } catch (cause: any) {
+      if (voicePreviewVersionRef.current !== version) return;
+      setVoicePreviewError(cause?.message || '语音试听失败');
+      stopVoicePreview();
+    }
+  }, [config, stopVoicePreview, systemVoices, voicePreviewing]);
+
   const handleFileChange = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
@@ -130,19 +488,336 @@ export const Settings: React.FC<SettingsProps> = ({
     e.target.value = '';
   }, [onConfigChange]);
 
+  const userDirty = !!relayUser && !!userDraft && (
+    relayUser.username !== userDraft.username
+    || relayUser.displayName !== userDraft.displayName
+    || relayUser.avatarData !== userDraft.avatarData
+    || relayUser.avatarColor !== userDraft.avatarColor
+  );
+
   if (!isOpen) return null;
 
   return (
     <div style={overlayStyle}>
       <div style={panelStyle} onClick={(e) => e.stopPropagation()}>
         {/* 标题栏 */}
-        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 20 }}>
-          <h2 style={{ margin: 0, fontSize: 18, fontWeight: 600, color: 'var(--theme-text)' }}>⚙ Settings</h2>
+        <div style={settingsHeaderStyle}>
+          <div>
+            <h2 style={{ margin: 0, fontSize: 17, fontWeight: 650, color: 'var(--theme-text)' }}>设置</h2>
+            <div style={{ marginTop: 3, fontSize: 10, color: 'var(--theme-text-muted)' }}>
+              AgentWithU preferences
+            </div>
+          </div>
           <button onClick={onClose} style={closeBtnStyle}>✕</button>
         </div>
 
+        <div style={settingsBodyStyle}>
+          <nav style={settingsNavStyle} aria-label="设置分类">
+            {visiblePages.map((page) => {
+              const selected = activePage === page.id;
+              return (
+                <button
+                  key={page.id}
+                  type="button"
+                  aria-current={selected ? 'page' : undefined}
+                  onClick={() => setActivePage(page.id)}
+                  style={{
+                    ...settingsNavButtonStyle,
+                    color: selected ? 'var(--theme-text)' : 'var(--theme-text-muted)',
+                    background: selected ? 'var(--theme-accent-bg)' : 'transparent',
+                    borderLeftColor: selected ? 'var(--theme-accent)' : 'transparent',
+                  }}
+                >
+                  <span style={{ width: 18, textAlign: 'center', fontSize: 13 }}>{page.icon}</span>
+                  <span style={{ minWidth: 0 }}>
+                    <span style={{ display: 'block', fontSize: 12, fontWeight: selected ? 650 : 520 }}>
+                      {page.label}
+                    </span>
+                    <span style={settingsNavDescriptionStyle}>{page.description}</span>
+                  </span>
+                </button>
+              );
+            })}
+          </nav>
+
+          <main ref={settingsContentRef} style={settingsContentStyle}>
+            <div style={settingsPageHeaderStyle}>
+              <div style={{ fontSize: 16, fontWeight: 650, color: 'var(--theme-text)' }}>
+                {activePageMeta.label}
+              </div>
+              <div style={{ marginTop: 4, fontSize: 11, color: 'var(--theme-text-muted)' }}>
+                {activePageMeta.description}
+              </div>
+            </div>
+
+        {activePage === 'user' && (
+          <div style={sectionStyle}>
+            {userLoading && (
+              <div style={{ color: 'var(--theme-text-muted)', fontSize: 12 }}>正在向 Relay 验证当前用户…</div>
+            )}
+            {!userLoading && userDraft && (
+              <>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 14, marginBottom: 16 }}>
+                  <button
+                    type="button"
+                    disabled={!userDraft.managed}
+                    onClick={() => userAvatarInputRef.current?.click()}
+                    title={userDraft.managed ? '更换头像' : '当前身份不支持修改头像'}
+                    style={{
+                      width: 64, height: 64, padding: 0, flexShrink: 0, overflow: 'hidden',
+                      borderRadius: '50%', border: '1px solid var(--theme-border)', cursor: userDraft.managed ? 'pointer' : 'default',
+                      color: '#fff', background: userDraft.avatarColor, fontSize: 23, fontWeight: 700,
+                    }}
+                  >
+                    {userDraft.avatarData ? (
+                      <img src={userDraft.avatarData} alt="当前头像" style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
+                    ) : (userDraft.displayName || userDraft.username).slice(0, 1).toUpperCase()}
+                  </button>
+                  <input
+                    ref={userAvatarInputRef}
+                    type="file"
+                    accept="image/png,image/jpeg,image/webp"
+                    style={{ display: 'none' }}
+                    onChange={(event) => {
+                      void handleUserAvatar(event.target.files?.[0]);
+                      event.target.value = '';
+                    }}
+                  />
+                  <div style={{ minWidth: 0 }}>
+                    <div style={{ color: 'var(--theme-text)', fontSize: 16, fontWeight: 650 }}>
+                      {userDraft.displayName}
+                    </div>
+                    <div style={{ marginTop: 3, color: 'var(--theme-text-muted)', fontSize: 11 }}>
+                      @{userDraft.username} · {getConnectionTarget().mode === 'local' ? '本机直连' : 'Relay 已验证'}
+                    </div>
+                    {userDraft.managed && userDraft.avatarData && (
+                      <button
+                        type="button"
+                        onClick={() => setUserDraft((current) => current ? { ...current, avatarData: '' } : current)}
+                        style={{ ...closeBtnStyle, fontSize: 11, padding: '5px 0 0' }}
+                      >移除头像</button>
+                    )}
+                  </div>
+                </div>
+
+                <div style={{ display: 'grid', gridTemplateColumns: 'minmax(110px, 1fr) minmax(110px, 1fr)', gap: 10 }}>
+                  <label style={labelStyle}>
+                    用户名
+                    <input
+                      value={userDraft.username}
+                      disabled={!userDraft.managed}
+                      maxLength={40}
+                      onChange={(event) => setUserDraft({ ...userDraft, username: event.target.value })}
+                      style={{ ...inputStyle, width: '100%', boxSizing: 'border-box', marginTop: 5 }}
+                    />
+                  </label>
+                  <label style={labelStyle}>
+                    展示名
+                    <input
+                      value={userDraft.displayName}
+                      disabled={!userDraft.managed}
+                      maxLength={60}
+                      onChange={(event) => setUserDraft({ ...userDraft, displayName: event.target.value })}
+                      style={{ ...inputStyle, width: '100%', boxSizing: 'border-box', marginTop: 5 }}
+                    />
+                  </label>
+                </div>
+                <label style={labelStyle}>
+                  用户 ID（永久不变）
+                  <input
+                    value={userDraft.userId}
+                    readOnly
+                    style={{ ...inputStyle, width: '100%', boxSizing: 'border-box', marginTop: 5, fontFamily: 'monospace', opacity: 0.72 }}
+                  />
+                </label>
+                {userDraft.managed && (
+                  <label style={{ ...labelStyle, display: 'flex', alignItems: 'center', gap: 10, marginTop: 10 }}>
+                    头像底色
+                    <input
+                      type="color"
+                      value={userDraft.avatarColor}
+                      onChange={(event) => setUserDraft({ ...userDraft, avatarColor: event.target.value })}
+                      style={{ width: 42, height: 28, border: '1px solid var(--theme-border)', background: 'transparent' }}
+                    />
+                  </label>
+                )}
+
+                {!userDraft.managed && (
+                  <div style={hintStyle}>
+                    {getConnectionTarget().mode === 'local'
+                      ? '本机直连只显示 local Session。家里的执行端若要查看某位 Relay 用户的 RemoteSession，也需要点击下方按钮验证并切换到该用户。'
+                      : '当前 Relay 仍在旧版单 token 兼容模式；创建 Relay 用户后即可改名和配置头像。'}
+                  </div>
+                )}
+                {userError && <div style={{ marginTop: 10, color: 'var(--theme-error, #f85149)', fontSize: 12 }}>{userError}</div>}
+                {userSaved && <div style={{ marginTop: 10, color: 'var(--theme-success, #2da44e)', fontSize: 12 }}>用户档案已保存，userId 未改变。</div>}
+                <div style={{ display: 'flex', gap: 8, marginTop: 14 }}>
+                  {userDraft.managed && (
+                    <button
+                      type="button"
+                      disabled={!userDirty || userSaving}
+                      onClick={() => void handleUserSave()}
+                      style={{ ...actionBtnStyle, opacity: !userDirty || userSaving ? 0.5 : 1 }}
+                    >{userSaving ? '保存中…' : '保存用户档案'}</button>
+                  )}
+                  <button type="button" onClick={onOpenConnectionPanel} style={actionBtnStyle}>
+                    验证 / 切换用户
+                  </button>
+                </div>
+
+                {getConnectionTarget().mode === 'relay' && userDraft.managed && (
+                  <div style={{
+                    marginTop: 18, paddingTop: 16,
+                    borderTop: '1px solid var(--theme-border)',
+                  }}>
+                    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12 }}>
+                      <div>
+                        <div style={{ color: 'var(--theme-text)', fontSize: 13, fontWeight: 650 }}>
+                          历史 Session 归属
+                        </div>
+                        <div style={{ marginTop: 4, color: 'var(--theme-text-muted)', fontSize: 11, lineHeight: 1.55 }}>
+                          设备主用户可将升级前的 local Session 一次性认领到当前 userId；执行前自动完整备份。
+                        </div>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => void refreshLegacyClaimPreview()}
+                        disabled={legacyClaimLoading || legacyClaimRunning}
+                        style={{ ...actionBtnStyle, flexShrink: 0, opacity: legacyClaimLoading ? 0.55 : 1 }}
+                      >刷新</button>
+                    </div>
+
+                    {legacyClaimLoading && (
+                      <div style={{ marginTop: 12, color: 'var(--theme-text-muted)', fontSize: 12 }}>
+                        正在检查执行端的历史 Session…
+                      </div>
+                    )}
+
+                    {!legacyClaimLoading && legacyClaimPreview && (
+                      <>
+                        <div style={{
+                          marginTop: 12, padding: '9px 10px', display: 'flex', gap: 12, flexWrap: 'wrap',
+                          background: 'var(--theme-input-bg)', border: '1px solid var(--theme-border)',
+                        }}>
+                          <span style={{ color: 'var(--theme-text)', fontSize: 11 }}>
+                            可认领 {legacyClaimPreview.eligibleCount || 0}
+                          </span>
+                          {!!legacyClaimPreview.busyCount && (
+                            <span style={{ color: 'var(--theme-warning, #d29922)', fontSize: 11 }}>
+                              运行中 {legacyClaimPreview.busyCount}
+                            </span>
+                          )}
+                          <span style={{ color: 'var(--theme-text-muted)', fontSize: 11, fontFamily: 'monospace' }}>
+                            → {legacyClaimPreview.targetOwnerId}
+                          </span>
+                        </div>
+
+                        {(legacyClaimPreview.items || []).length > 0 ? (
+                          <div style={{
+                            marginTop: 10, maxHeight: 260, overflowY: 'auto',
+                            border: '1px solid var(--theme-border)', background: 'var(--theme-input-bg)',
+                          }}>
+                            {(legacyClaimPreview.items || []).map((item) => {
+                              const checked = legacyClaimSelected.includes(item.id);
+                              const disabled = !!item.busyReason || legacyClaimRunning;
+                              return (
+                                <label key={item.id} style={{
+                                  display: 'grid', gridTemplateColumns: '18px minmax(0, 1fr)', gap: 9,
+                                  padding: '9px 10px', borderBottom: '1px solid var(--theme-border)',
+                                  cursor: disabled ? 'not-allowed' : 'pointer', opacity: disabled ? 0.55 : 1,
+                                }}>
+                                  <input
+                                    type="checkbox"
+                                    checked={checked}
+                                    disabled={disabled}
+                                    onChange={(event) => setLegacyClaimSelected((current) => (
+                                      event.target.checked
+                                        ? Array.from(new Set([...current, item.id]))
+                                        : current.filter((id) => id !== item.id)
+                                    ))}
+                                    style={{ marginTop: 2, accentColor: 'var(--theme-accent)' }}
+                                  />
+                                  <span style={{ minWidth: 0 }}>
+                                    <span style={{ display: 'block', color: 'var(--theme-text)', fontSize: 12, fontWeight: 600 }}>
+                                      {item.title}
+                                    </span>
+                                    <span style={{
+                                      display: 'block', marginTop: 3, color: 'var(--theme-text-muted)', fontSize: 10,
+                                      whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis',
+                                    }} title={item.workingDir}>
+                                      {new Date(Number(item.updatedAt || 0) * 1000).toLocaleString()} · {item.messageCount} 条
+                                      {item.workingDir ? ` · ${item.workingDir}` : ''}
+                                    </span>
+                                    {item.busyReason && (
+                                      <span style={{ display: 'block', marginTop: 3, color: 'var(--theme-warning, #d29922)', fontSize: 10 }}>
+                                        暂不可迁移：{item.busyReason}
+                                      </span>
+                                    )}
+                                  </span>
+                                </label>
+                              );
+                            })}
+                          </div>
+                        ) : (
+                          <div style={{ marginTop: 12, color: 'var(--theme-success, #2da44e)', fontSize: 12 }}>
+                            没有待认领的历史 Session。
+                          </div>
+                        )}
+
+                        {!!(legacyClaimPreview.eligibleCount || 0) && (
+                          <div style={{ display: 'flex', gap: 8, marginTop: 10, flexWrap: 'wrap' }}>
+                            <button
+                              type="button"
+                              onClick={() => setLegacyClaimSelected(
+                                (legacyClaimPreview.items || []).filter((item) => !item.busyReason).map((item) => item.id),
+                              )}
+                              disabled={legacyClaimRunning}
+                              style={actionBtnStyle}
+                            >全选可迁移项</button>
+                            <button
+                              type="button"
+                              onClick={() => void handleClaimLegacySessions()}
+                              disabled={!legacyClaimSelected.length || legacyClaimRunning}
+                              style={{
+                                ...actionBtnStyle,
+                                color: '#fff', background: 'var(--theme-accent)',
+                                opacity: !legacyClaimSelected.length || legacyClaimRunning ? 0.5 : 1,
+                              }}
+                            >{legacyClaimRunning ? '备份并迁移中…' : `认领所选 ${legacyClaimSelected.length} 项`}</button>
+                          </div>
+                        )}
+                      </>
+                    )}
+
+                    {!legacyClaimLoading && !legacyClaimPreview && legacyClaimError && (
+                      <div style={{ marginTop: 12, color: 'var(--theme-text-muted)', fontSize: 11, lineHeight: 1.55 }}>
+                        当前用户不是该执行端的设备主用户，或 Relay / 执行端尚未升级，因此不能认领历史 Session。
+                        <br/><span style={{ opacity: 0.72 }}>{legacyClaimError}</span>
+                      </div>
+                    )}
+                    {legacyClaimPreview && legacyClaimError && (
+                      <div style={{ marginTop: 10, color: 'var(--theme-error, #f85149)', fontSize: 11 }}>
+                        {legacyClaimError}
+                      </div>
+                    )}
+                    {legacyClaimResult && (
+                      <div style={{ marginTop: 10, color: 'var(--theme-success, #2da44e)', fontSize: 11, lineHeight: 1.55 }}>
+                        已认领 {legacyClaimResult.count} 个 Session。
+                        {legacyClaimResult.backupPath && <><br/>备份：{legacyClaimResult.backupPath}</>}
+                      </div>
+                    )}
+                  </div>
+                )}
+              </>
+            )}
+            {!userLoading && !userDraft && userError && (
+              <div style={{ color: 'var(--theme-error, #f85149)', fontSize: 12 }}>{userError}</div>
+            )}
+          </div>
+        )}
+
         {/* 字号 */}
-        <div style={sectionStyle}>
+        {activePage === 'general' && <div style={sectionStyle}>
           <label style={labelStyle}>Font Size</label>
           <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
             <input
@@ -157,12 +832,12 @@ export const Settings: React.FC<SettingsProps> = ({
               {config.fontSize}px
             </span>
           </div>
-        </div>
+        </div>}
 
         {/* 主题切换 */}
-        <div style={sectionStyle}>
+        {activePage === 'appearance' && <div style={sectionStyle}>
           <label style={labelStyle}>Theme</label>
-          <div style={{ display: 'flex', gap: 8 }}>
+          <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
             {(Object.keys(themes) as ThemeType[]).map((themeKey) => {
               const theme = themes[themeKey];
               return (
@@ -182,10 +857,10 @@ export const Settings: React.FC<SettingsProps> = ({
               );
             })}
           </div>
-        </div>
+        </div>}
 
         {/* Markdown 渲染开关 */}
-        <div style={sectionStyle}>
+        {activePage === 'general' && <div style={sectionStyle}>
           <label style={{ ...labelStyle, display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer' }}>
             <input
               type="checkbox"
@@ -195,10 +870,10 @@ export const Settings: React.FC<SettingsProps> = ({
             />
             Render Markdown in assistant messages
           </label>
-        </div>
+        </div>}
 
         {/* Workspace Kits 实验特性 */}
-        <div style={sectionStyle}>
+        {activePage === 'general' && <div style={sectionStyle}>
           <label style={{ ...labelStyle, display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer' }}>
             <input
               type="checkbox"
@@ -211,10 +886,10 @@ export const Settings: React.FC<SettingsProps> = ({
           <p style={{ fontSize: 11, color: 'var(--theme-text-muted)', margin: '6px 0 0', lineHeight: 1.5 }}>
             为每个 Session 启用标准配件、判言、Schedule、结果视图、终端控制与数据市场。
           </p>
-        </div>
+        </div>}
 
         {/* Session 列表密度 */}
-        <div style={sectionStyle}>
+        {activePage === 'general' && <div style={sectionStyle}>
           <label style={labelStyle}>左侧 Session 展示数量</label>
           <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
             <input
@@ -240,10 +915,10 @@ export const Settings: React.FC<SettingsProps> = ({
               每个执行节点最近展示的普通 Session 数；收藏项始终显示。默认 25，搜索不受限制。
             </span>
           </div>
-        </div>
+        </div>}
 
         {/* 导出格式 */}
-        <div style={sectionStyle}>
+        {activePage === 'general' && <div style={sectionStyle}>
           <label style={labelStyle}>Export Format</label>
           <div style={{ display: 'flex', gap: 8 }}>
             {(['markdown', 'json'] as const).map((fmt) => (
@@ -260,10 +935,10 @@ export const Settings: React.FC<SettingsProps> = ({
               </button>
             ))}
           </div>
-        </div>
+        </div>}
 
         {/* 语音转文字 (STT) 设置 */}
-        {sttCfg && (
+        {activePage === 'voice' && sttCfg && (
           <div style={sectionStyle}>
             <label style={labelStyle}>🎙️ Voice-to-Text (STT)</label>
             <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
@@ -443,13 +1118,80 @@ export const Settings: React.FC<SettingsProps> = ({
         )}
 
         {/* 文字转语音 (TTS) 设置 */}
-        <div style={sectionStyle}>
-          <label style={labelStyle}>🔊 Assistant Voice (Edge TTS)</label>
-          <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+        {activePage === 'voice' && <div style={sectionStyle}>
+          <label style={labelStyle}>🔊 语音与实时播音</label>
+          <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+            <span style={{ width: 78, fontSize: 11, color: 'var(--theme-text-muted)' }}>实时引擎</span>
+            <select
+              value={config.realtimeVoiceTtsEngine ?? 'system'}
+              onChange={(e) => onConfigChange({
+                realtimeVoiceTtsEngine: e.target.value as 'system' | 'edge' | 'dashscope',
+              })}
+              style={{ ...inputStyle, flex: 1, minWidth: 0 }}
+            >
+              <option value="system">客户端 · Windows 系统语音（最低延迟）</option>
+              <option value="dashscope">执行端 · DashScope 流式 TTS（低首包延迟）</option>
+              <option value="edge">执行端 Backend · Edge Neural TTS（音质优先）</option>
+            </select>
+            <button
+              type="button"
+              onClick={() => void handleVoicePreview()}
+              style={{ ...actionBtnStyle, flex: '0 0 auto', padding: '6px 12px', fontSize: 11 }}
+            >
+              {voicePreviewing ? '停止' : '试听'}
+            </button>
+          </div>
+          {config.realtimeVoiceTtsEngine === 'system' && (
+            <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginTop: 8 }}>
+              <span style={{ width: 78, fontSize: 11, color: 'var(--theme-text-muted)' }}>本机音色</span>
+              <select
+                value={config.realtimeVoiceSystemVoice ?? ''}
+                onChange={(e) => onConfigChange({ realtimeVoiceSystemVoice: e.target.value })}
+                style={{ ...inputStyle, flex: 1, minWidth: 0 }}
+              >
+                <option value="">自动选择中文系统音色</option>
+                {systemVoices.map((item) => (
+                  <option key={`${item.voiceURI}:${item.lang}`} value={item.voiceURI}>
+                    {item.name} · {item.lang}{item.localService ? ' · 本机' : ''}
+                  </option>
+                ))}
+              </select>
+            </div>
+          )}
+          {config.realtimeVoiceTtsEngine === 'dashscope' && (
+            <>
+              <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginTop: 8 }}>
+                <span style={{ width: 78, fontSize: 11, color: 'var(--theme-text-muted)' }}>云端模型</span>
+                <input
+                  value={config.realtimeVoiceDashScopeModel || 'cosyvoice-v1'}
+                  maxLength={128}
+                  onChange={(e) => onConfigChange({ realtimeVoiceDashScopeModel: e.target.value })}
+                  placeholder="cosyvoice-v1"
+                  style={{ ...inputStyle, flex: 1, minWidth: 0 }}
+                />
+              </div>
+              <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginTop: 8 }}>
+                <span style={{ width: 78, fontSize: 11, color: 'var(--theme-text-muted)' }}>云端音色</span>
+                <input
+                  value={config.realtimeVoiceDashScopeVoice || 'longxiaochun'}
+                  maxLength={128}
+                  onChange={(e) => onConfigChange({ realtimeVoiceDashScopeVoice: e.target.value })}
+                  placeholder="longxiaochun"
+                  style={{ ...inputStyle, flex: 1, minWidth: 0 }}
+                />
+              </div>
+              <p style={{ fontSize: 10, color: 'var(--theme-text-muted)', margin: '6px 0 0 86px', lineHeight: 1.45 }}>
+                复用执行端“语音识别”页的 DashScope API Key、Workspace ID 与地域地址；
+                默认 cosyvoice-v1 + longxiaochun 已在当前接口验证。v2/v3 请配套使用账号支持的音色。
+              </p>
+            </>
+          )}
+          <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginTop: 8 }}>
+            <span style={{ width: 78, fontSize: 11, color: 'var(--theme-text-muted)' }}>Edge 音色</span>
             <select
               value={config.ttsVoice || 'zh-CN-XiaoxiaoNeural'}
               onChange={(e) => onConfigChange({ ttsVoice: e.target.value })}
-              style={{ ...inputStyle, flex: '1 1 220px' }}
+              style={{ ...inputStyle, flex: 1, minWidth: 0 }}
             >
               <option value="zh-CN-XiaoxiaoNeural">晓晓 · 女声，温柔自然</option>
               <option value="zh-CN-YunxiNeural">云希 · 男声，年轻活力</option>
@@ -457,6 +1199,11 @@ export const Settings: React.FC<SettingsProps> = ({
               <option value="zh-CN-XiaoyiNeural">晓伊 · 女声，明快活泼</option>
             </select>
           </div>
+          {voicePreviewError && (
+            <div style={{ marginTop: 7, fontSize: 11, color: 'var(--theme-error, #ef4444)' }}>
+              {voicePreviewError}
+            </div>
+          )}
           <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginTop: 10 }}>
             <span style={{ fontSize: 12, color: 'var(--theme-text-muted)', whiteSpace: 'nowrap' }}>语速</span>
             <input
@@ -473,12 +1220,94 @@ export const Settings: React.FC<SettingsProps> = ({
             </span>
           </div>
           <p style={{ fontSize: 11, color: 'var(--theme-text-muted)', margin: '7px 0 0', lineHeight: 1.5 }}>
-            助手消息悬停后点击 🔊 即可朗读，再点一次停止。代码块和 Markdown 标记会自动略过。
+            实时对话按所选引擎播音；普通助手消息的 🔊 朗读继续使用 Edge 音色。
+            DashScope 流式 TTS 在 Session 执行端运行，音频以 24kHz PCM 持续回传客户端。
           </p>
-        </div>
+          <div style={{
+            marginTop: 10,
+            paddingTop: 10,
+            borderTop: '1px solid var(--theme-border)',
+            display: 'grid',
+            gap: 8,
+          }}>
+            <div style={{ fontSize: 11, fontWeight: 600, color: 'var(--theme-text)' }}>
+              实时语音对话 · 实验参数
+            </div>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+              <span style={{ width: 78, fontSize: 11, color: 'var(--theme-text-muted)' }}>唤醒词</span>
+              <input
+                value={config.realtimeVoiceWakeWord ?? 'Yuki'}
+                maxLength={24}
+                placeholder="留空则直接开始"
+                onChange={(e) => onConfigChange({ realtimeVoiceWakeWord: e.target.value })}
+                style={{ ...inputStyle, flex: 1, minWidth: 0 }}
+              />
+              <span style={{ width: 54, textAlign: 'right', fontSize: 10, color: 'var(--theme-text-muted)' }}>
+                超时重唤醒
+              </span>
+            </div>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+              <span style={{ width: 78, fontSize: 11, color: 'var(--theme-text-muted)' }}>连续会话</span>
+              <input
+                type="range"
+                min={10_000}
+                max={120_000}
+                step={5_000}
+                value={config.realtimeVoiceContinuousWindowMs ?? 30_000}
+                onChange={(e) => onConfigChange({ realtimeVoiceContinuousWindowMs: Number(e.target.value) })}
+                style={{ flex: 1, accentColor: 'var(--theme-accent)' }}
+              />
+              <span style={{ width: 54, textAlign: 'right', fontSize: 10, color: 'var(--theme-text-muted)' }}>
+                {Math.round((config.realtimeVoiceContinuousWindowMs ?? 30_000) / 1000)} s
+              </span>
+            </div>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+              <span style={{ width: 78, fontSize: 11, color: 'var(--theme-text-muted)' }}>基础停顿</span>
+              <input
+                type="range"
+                min={900}
+                max={3000}
+                step={100}
+                value={config.realtimeVoiceTurnEndSilenceMs ?? 1500}
+                onChange={(e) => onConfigChange({ realtimeVoiceTurnEndSilenceMs: Number(e.target.value) })}
+                style={{ flex: 1, accentColor: 'var(--theme-accent)' }}
+              />
+              <span style={{ width: 54, textAlign: 'right', fontSize: 10, color: 'var(--theme-text-muted)' }}>
+                {((config.realtimeVoiceTurnEndSilenceMs ?? 1500) / 1000).toFixed(1)} s
+              </span>
+            </div>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+              <span style={{ width: 78, fontSize: 11, color: 'var(--theme-text-muted)' }}>收音阈值</span>
+              <input
+                type="range"
+                min={0.006}
+                max={0.06}
+                step={0.002}
+                value={config.realtimeVoiceVadThreshold ?? 0.018}
+                onChange={(e) => onConfigChange({ realtimeVoiceVadThreshold: Number(e.target.value) })}
+                style={{ flex: 1, accentColor: 'var(--theme-accent)' }}
+              />
+              <span style={{ width: 54, textAlign: 'right', fontSize: 10, color: 'var(--theme-text-muted)' }}>
+                {(config.realtimeVoiceVadThreshold ?? 0.018).toFixed(3)}
+              </span>
+            </div>
+            <label style={{ display: 'flex', alignItems: 'center', gap: 7, fontSize: 11, color: 'var(--theme-text-muted)' }}>
+              <input
+                type="checkbox"
+                checked={config.realtimeVoiceBargeIn !== false}
+                onChange={(e) => onConfigChange({ realtimeVoiceBargeIn: e.target.checked })}
+              />
+              允许唤醒词定向打断当前 LLM 与播音（普通人声不会中止回复）
+            </label>
+            <p style={{ fontSize: 10, color: 'var(--theme-text-muted)', margin: 0, lineHeight: 1.5 }}>
+              静默超过连续会话时间后会重新等待唤醒；Agent 回复期间只有“唤醒词 + 指令”才能打断。
+              Yuki 建议读作“You-key”；已兼容常见英文拼写和单独出现的中文近音。听到后会先随机回应“我在 / 在呢 / I'm here”等短句，再继续收音；唤醒词留空会关闭唤醒门控，同时禁用语音打断。
+            </p>
+          </div>
+        </div>}
 
         {/* 数据导入导出 */}
-        <div style={sectionStyle}>
+        {activePage === 'system' && <div style={sectionStyle}>
           <label style={labelStyle}>Data Management</label>
           <div style={{ display: 'flex', gap: 8 }}>
             <button
@@ -509,9 +1338,26 @@ export const Settings: React.FC<SettingsProps> = ({
             <br />
             ⚠️ Import will overwrite matching entries. Skill credentials stay local.
           </p>
-        </div>
+        </div>}
 
-        {isTauri() && (
+        {activePage === 'desktop' && desktopRuntime && (
+          <div style={sectionStyle}>
+            <label style={{ ...labelStyle, display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer' }}>
+              <input
+                type="checkbox"
+                checked={config.desktopTaskNotifications}
+                onChange={(e) => onConfigChange({ desktopTaskNotifications: e.target.checked })}
+                style={{ accentColor: 'var(--theme-accent)' }}
+              />
+              任务完成时显示 Windows 通知
+            </label>
+            <p style={{ fontSize: 11, color: 'var(--theme-text-muted)', margin: '6px 0 0', lineHeight: 1.5 }}>
+              仅在 AgentWithU 最小化、隐藏或未聚焦时提醒，窗口在前台时不打扰。
+            </p>
+          </div>
+        )}
+
+        {activePage === 'desktop' && desktopRuntime && (
           <div style={sectionStyle}>
             <label style={labelStyle}>〰️ Smooth 顺滑问答</label>
             <HackerModeSetting />
@@ -519,7 +1365,7 @@ export const Settings: React.FC<SettingsProps> = ({
         )}
 
         {/* 截图全局快捷键(Tauri only) */}
-        {isTauri() && (
+        {activePage === 'desktop' && desktopRuntime && (
           <div style={sectionStyle}>
             <label style={labelStyle}>Screenshot Hotkey</label>
             <ScreenshotHotkeySetting />
@@ -531,7 +1377,7 @@ export const Settings: React.FC<SettingsProps> = ({
         )}
 
         {/* 界面透明度 */}
-        <div style={sectionStyle}>
+        {activePage === 'appearance' && <div style={sectionStyle}>
           <label style={labelStyle}>Panel Transparency</label>
           <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
             <input
@@ -550,10 +1396,10 @@ export const Settings: React.FC<SettingsProps> = ({
           <span style={{ display: 'block', marginTop: 4, fontSize: 11, color: 'var(--theme-text-muted)' }}>
             Controls bubble / sidebar / header background opacity
           </span>
-        </div>
+        </div>}
 
         {/* 背景图 */}
-        <div style={sectionStyle}>
+        {activePage === 'appearance' && <div style={sectionStyle}>
           <label style={labelStyle}>Background Image</label>
           <input
             ref={fileInputRef}
@@ -601,10 +1447,10 @@ export const Settings: React.FC<SettingsProps> = ({
               </div>
             </div>
           )}
-        </div>
+        </div>}
 
         {/* 操作按钮 */}
-        <div style={{ display: 'flex', gap: 8, marginTop: 8 }}>
+        {activePage === 'system' && <div style={{ display: 'flex', gap: 8, marginTop: 8 }}>
           <button onClick={onExportChat} style={actionBtnStyle}>
             📥 Export Chat
           </button>
@@ -614,13 +1460,13 @@ export const Settings: React.FC<SettingsProps> = ({
           >
             ↩ Reset Defaults
           </button>
-        </div>
+        </div>}
 
         {/* ---- 分隔线 ---- */}
-        <div style={{ borderTop: '1px solid var(--theme-border)', margin: '20px 0' }} />
+        {activePage === 'system' && <div style={{ borderTop: '1px solid var(--theme-border)', margin: '20px 0' }} />}
 
         {/* 后端管理 */}
-        <div style={sectionStyle}>
+        {activePage === 'system' && <div style={sectionStyle}>
           <label style={labelStyle}>Model Backends</label>
           <button
             onClick={onOpenBackendManager}
@@ -628,13 +1474,13 @@ export const Settings: React.FC<SettingsProps> = ({
           >
             🔌 Manage Backends
           </button>
-        </div>
+        </div>}
 
         {/* ---- 分隔线 ---- */}
-        <div style={{ borderTop: '1px solid var(--theme-border)', margin: '20px 0' }} />
+        {activePage === 'system' && <div style={{ borderTop: '1px solid var(--theme-border)', margin: '20px 0' }} />}
 
         {/* 关于 */}
-        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+        {activePage === 'system' && <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
           <div>
             <span style={{ fontSize: 13, fontWeight: 600, color: 'var(--theme-text)' }}>AgentWithU</span>
             <span style={{ fontSize: 12, color: 'var(--theme-text-muted)', marginLeft: 8 }}>
@@ -649,6 +1495,8 @@ export const Settings: React.FC<SettingsProps> = ({
           >
             Source ↗
           </a>
+        </div>}
+          </main>
         </div>
       </div>
     </div>
@@ -659,29 +1507,110 @@ export const Settings: React.FC<SettingsProps> = ({
 const overlayStyle: React.CSSProperties = {
   position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.6)',
   display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 1000,
-  padding: 16, boxSizing: 'border-box', overflowY: 'auto',
+  padding: 16, boxSizing: 'border-box', overflow: 'hidden',
 };
 const panelStyle: React.CSSProperties = {
   background: 'var(--theme-bg-tertiary, #1e1e36)',
   border: '1px solid var(--theme-border, rgba(255,255,255,0.1))',
-  borderRadius: 12,
-  padding: 24, width: '90%', maxWidth: 440,
-  maxHeight: 'calc(100dvh - 32px)', overflowY: 'auto',
-  overscrollBehavior: 'contain', boxSizing: 'border-box',
+  borderRadius: 6,
+  padding: 0,
+  width: 'min(920px, calc(100vw - 32px))',
+  height: 'min(720px, calc(100dvh - 32px))',
+  overflow: 'hidden',
+  display: 'flex',
+  flexDirection: 'column',
+  boxSizing: 'border-box',
+};
+const settingsHeaderStyle: React.CSSProperties = {
+  height: 62,
+  flex: '0 0 62px',
+  display: 'flex',
+  justifyContent: 'space-between',
+  alignItems: 'center',
+  padding: '0 18px 0 20px',
+  borderBottom: '1px solid var(--theme-border)',
+  background: 'var(--theme-bg-secondary)',
+  boxSizing: 'border-box',
+};
+const settingsBodyStyle: React.CSSProperties = {
+  flex: 1,
+  minHeight: 0,
+  display: 'flex',
+  overflow: 'hidden',
+};
+const settingsNavStyle: React.CSSProperties = {
+  flex: '0 0 clamp(118px, 21vw, 178px)',
+  minWidth: 0,
+  padding: '12px 8px',
+  borderRight: '1px solid var(--theme-border)',
+  background: 'var(--theme-bg-secondary)',
+  overflowY: 'auto',
+  boxSizing: 'border-box',
+};
+const settingsNavButtonStyle: React.CSSProperties = {
+  width: '100%',
+  minHeight: 48,
+  display: 'flex',
+  alignItems: 'flex-start',
+  gap: 7,
+  padding: '8px 8px 8px 7px',
+  marginBottom: 3,
+  border: 'none',
+  borderLeft: '2px solid transparent',
+  borderRadius: 2,
+  textAlign: 'left',
+  fontFamily: 'inherit',
+  cursor: 'pointer',
+};
+const settingsNavDescriptionStyle: React.CSSProperties = {
+  display: 'block',
+  marginTop: 3,
+  overflow: 'hidden',
+  color: 'var(--theme-text-muted)',
+  fontSize: 9,
+  lineHeight: 1.3,
+};
+const settingsContentStyle: React.CSSProperties = {
+  flex: 1,
+  minWidth: 0,
+  overflowY: 'auto',
+  overscrollBehavior: 'contain',
+  padding: '20px clamp(14px, 3vw, 26px) 28px',
+  boxSizing: 'border-box',
+};
+const settingsPageHeaderStyle: React.CSSProperties = {
+  marginBottom: 16,
+  paddingBottom: 13,
+  borderBottom: '1px solid var(--theme-border)',
 };
 const closeBtnStyle: React.CSSProperties = {
   background: 'none', border: 'none',
   color: 'var(--theme-text-muted, rgba(255,255,255,0.4))',
   fontSize: 18, cursor: 'pointer', padding: '4px 8px',
 };
-const sectionStyle: React.CSSProperties = { marginBottom: 16 };
+const sectionStyle: React.CSSProperties = {
+  marginBottom: 12,
+  padding: 14,
+  border: '1px solid var(--theme-border)',
+  borderRadius: 5,
+  background: 'color-mix(in srgb, var(--theme-bg-secondary) 74%, transparent)',
+};
 const labelStyle: React.CSSProperties = {
   fontSize: 13, fontWeight: 500,
   color: 'var(--theme-text, rgba(255,255,255,0.7))',
   marginBottom: 6, display: 'block',
 };
+const hintStyle: React.CSSProperties = {
+  marginTop: 10,
+  padding: '9px 10px',
+  borderLeft: '2px solid var(--theme-accent)',
+  background: 'var(--theme-accent-bg)',
+  color: 'var(--theme-text-muted)',
+  fontSize: 11,
+  lineHeight: 1.55,
+};
 const formatBtnStyle: React.CSSProperties = {
-  padding: '6px 16px', borderRadius: 6, border: '1px solid', fontSize: 12,
+  padding: '6px 16px', borderRadius: 4, border: '1px solid', fontSize: 12,
   fontWeight: 600, cursor: 'pointer',
   color: 'var(--theme-text, #e0e0e0)',
   transition: 'all 0.15s',
@@ -694,14 +1623,14 @@ const inputStyle: React.CSSProperties = {
   fontSize: 12, outline: 'none', fontFamily: 'inherit',
 };
 const actionBtnStyle: React.CSSProperties = {
-  flex: 1, padding: '8px 12px', borderRadius: 8,
+  flex: 1, padding: '8px 12px', borderRadius: 5,
   border: '1px solid var(--theme-border, rgba(255,255,255,0.1))',
   background: 'rgba(255,255,255,0.05)',
   color: 'var(--theme-text, #e0e0e0)',
   fontSize: 13, cursor: 'pointer', transition: 'all 0.15s',
 };
 const themeBtnStyle: React.CSSProperties = {
-  flex: 1, padding: '10px 12px', borderRadius: 8, border: '2px solid', fontSize: 12,
+  flex: '1 1 86px', padding: '10px 12px', borderRadius: 5, border: '2px solid', fontSize: 12,
   fontWeight: 600, cursor: 'pointer', transition: 'all 0.15s',
   boxShadow: '0 2px 8px rgba(0,0,0,0.2)',
 };

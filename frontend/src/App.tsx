@@ -1,5 +1,9 @@
 import React, { useState, useCallback, useEffect, useRef, useMemo } from 'react';
-import { api, isTauri, getExecutors, onExecStatus, getHomeExecKey, type ExecutorInfo } from './api';
+import {
+  api, isTauri, getExecutors, onExecStatus, getHomeExecKey,
+  getCurrentUserProfile, onCurrentUserChanged,
+  type ExecutorInfo, type CurrentUserProfile,
+} from './api';
 import {
   HOTKEY_CHANGED_EVENT,
   readScreenshotHotkey,
@@ -22,6 +26,7 @@ import { LogViewer } from './components/LogViewer';
 import { ConnectionPanel } from './components/ConnectionPanel';
 import { ManualPanel } from './components/ManualPanel';
 import { ChatPane } from './components/ChatPane';
+import { LoopPanel } from './components/LoopPanel';
 import { HomeDashboard } from './home/HomeDashboard';
 import type { DashboardDestination } from './home/dashboardModel';
 import { LoopPolicyEditor, DEFAULT_POLICY, normalizePolicy } from './components/LoopPolicyEditor';
@@ -42,6 +47,7 @@ import { useIsMobile } from './hooks/useIsMobile';
 import { hljsLightCss, hljsDarkCss } from './utils/hljsThemes';
 import { messagesToMarkdown, messagesToJson } from './utils/markdown';
 import type { SmoothGhostState } from './utils/smoothGhost';
+import { notifyTaskCompletion } from './utils/desktopNotifications';
 
 function hexToRgba(color: string, alpha: number): string {
   const m = color.match(/^#([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})/i);
@@ -59,6 +65,8 @@ export const App: React.FC = () => {
   const [backends, setBackends] = useState<any[]>([]);
   const [backendConfigs, setBackendConfigs] = useState<any[]>([]);
   const [sessions, setSessions] = useState<any[]>([]);
+  const sessionsRef = useRef<any[]>(sessions);
+  sessionsRef.current = sessions;
   const sessionRefreshGenerationRef = useRef(0);
   const refreshSessionList = useCallback(async (): Promise<any[]> => {
     const generation = ++sessionRefreshGenerationRef.current;
@@ -76,7 +84,12 @@ export const App: React.FC = () => {
   const [repoPanelOpen, setRepoPanelOpen] = useState(false);
   const [logViewerOpen, setLogViewerOpen] = useState(false);
   const [connPanelOpen, setConnPanelOpen] = useState(false);
+  const [currentUser, setCurrentUser] = useState<CurrentUserProfile>(() => getCurrentUserProfile());
   const [manualPanelOpen, setManualPanelOpen] = useState(false);
+  const [manualLoopMenuOpen, setManualLoopMenuOpen] = useState(false);
+  const [manualLoopInspectorOpen, setManualLoopInspectorOpen] = useState(false);
+  const [manualLoopReleaseBusy, setManualLoopReleaseBusy] = useState(false);
+  const [moreMenuOpen, setMoreMenuOpen] = useState(false);
   const [repoPanelEditing, setRepoPanelEditing] = useState(false);
   const [newSessionDialogOpen, setNewSessionDialogOpen] = useState(false);
   const [newSessionInitialType, setNewSessionInitialType] = useState<'normal' | 'loop'>('normal');
@@ -116,6 +129,8 @@ export const App: React.FC = () => {
   const [scratchPadWidth, setScratchPadWidth] = useState(360);
   const [assetPanelOpen, setAssetPanelOpen] = useState(false);
   const scratchDragRef = useRef<{ startX: number; startW: number } | null>(null);
+  const manualLoopMenuRef = useRef<HTMLDivElement>(null);
+  const moreMenuRef = useRef<HTMLDivElement>(null);
   const toastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const initialCheckDoneRef = useRef(false);          // ★ 防止 NewSessionDialog 重复弹出
 
@@ -149,6 +164,20 @@ export const App: React.FC = () => {
   // 焦点 pane 的 session 详情(顶栏展示 workingDir / backendId 用)
   const [activeSession, setActiveSession] = useState<any | null>(null);
 
+  useEffect(() => onCurrentUserChanged((profile, identityChanged) => {
+    setCurrentUser(profile);
+    if (!identityChanged) return;
+    for (const session of sessionsRef.current) {
+      if (session?.id) clearSessionHistoryCache(session.id);
+    }
+    setSessions([]);
+    setPaneSessions((current) => current.map(() => null));
+    setActiveSession(null);
+    setStreamingSessions(new Set());
+    setCompletedSessions(new Set());
+    void refreshSessionList();
+  }), [refreshSessionList]);
+
   // 把 sessionId 写入指定 pane(默认焦点 pane)的小工具
   const setSessionInPane = useCallback((id: string | null, paneIdx?: number) => {
     setPaneSessions((prev) => {
@@ -161,7 +190,45 @@ export const App: React.FC = () => {
   }, [focusedPaneIdx]);
 
   const { config, updateConfig, resetConfig } = useConfig();
+  const configRef = useRef(config);
+  configRef.current = config;
+  const notifiedCompletionKeysRef = useRef<Set<string>>(new Set());
   const isMobile = useIsMobile();
+  const activeManualLoop = activeSession?.id === activeSessionId
+    && activeSession?.sessionType === 'loop'
+    && activeSession?.loopControlMode === 'manual';
+
+  // 顶栏弹层遵循标准菜单交互：切换焦点会话、点击外部或按 Esc 都立即收起。
+  useEffect(() => {
+    setManualLoopMenuOpen(false);
+    setManualLoopInspectorOpen(false);
+    setMoreMenuOpen(false);
+  }, [activeSessionId, activeManualLoop]);
+
+  useEffect(() => {
+    if (!manualLoopMenuOpen && !moreMenuOpen) return;
+    const onPointerDown = (event: PointerEvent) => {
+      const target = event.target as Node;
+      if (manualLoopMenuOpen && !manualLoopMenuRef.current?.contains(target)) {
+        setManualLoopMenuOpen(false);
+      }
+      if (moreMenuOpen && !moreMenuRef.current?.contains(target)) {
+        setMoreMenuOpen(false);
+      }
+    };
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        setManualLoopMenuOpen(false);
+        setMoreMenuOpen(false);
+      }
+    };
+    document.addEventListener('pointerdown', onPointerDown);
+    document.addEventListener('keydown', onKeyDown);
+    return () => {
+      document.removeEventListener('pointerdown', onPointerDown);
+      document.removeEventListener('keydown', onKeyDown);
+    };
+  }, [manualLoopMenuOpen, moreMenuOpen]);
 
   const showToast = useCallback((type: 'success' | 'error' | 'info', message: string, durationMs = 4000) => {
     setToast({ type, message });
@@ -494,10 +561,53 @@ export const App: React.FC = () => {
   useEffect(() => {
     return api.onLoopUpdated((state: any) => {
       const sid: string | undefined = state?.sessionId;
-      if (!sid || typeof state.running !== 'boolean') return;
-      handleStreamingChange(sid, state.running);
+      if (!sid) return;
+      if (typeof state.running === 'boolean') handleStreamingChange(sid, state.running);
+      if (state.controlMode === 'manual' || state.controlMode === 'loop') {
+        const loopControlMode = state.controlMode === 'manual' ? 'manual' : 'loop';
+        setSessions((previous) => previous.map((session) => (
+          session.id === sid ? { ...session, loopControlMode } : session
+        )));
+        setActiveSession((previous: any) => (
+          previous?.id === sid ? { ...previous, loopControlMode } : previous
+        ));
+      }
     });
   }, [handleStreamingChange]);
+
+  const handleReleaseManualLoop = useCallback(async () => {
+    if (!activeSessionId || !activeManualLoop || manualLoopReleaseBusy) return;
+    const releasingSessionId = activeSessionId;
+    setManualLoopReleaseBusy(true);
+    try {
+      // 本地渲染状态可能在异常中断或 Relay 重连后滞后，交还前始终询问执行节点。
+      const runState = await api.getSessionRunState(releasingSessionId);
+      if (runState.busy) {
+        showToast('error', runState.status === 'offline'
+          ? '执行节点当前离线，暂时无法确认是否可交还 LOOP'
+          : '回答仍在生成，结束或停止后才能交还 LOOP');
+        return;
+      }
+      const result = await api.loopRelease(releasingSessionId);
+      if (result.status !== 'ok') {
+        showToast('error', result.message || '交还 LOOP 失败');
+        return;
+      }
+      setActiveSession((previous: any) => (
+        previous?.id === releasingSessionId ? { ...previous, loopControlMode: 'loop' } : previous
+      ));
+      setSessions((previous) => previous.map((session) => (
+        session.id === releasingSessionId ? { ...session, loopControlMode: 'loop' } : session
+      )));
+      if (activeSessionIdRef.current === releasingSessionId) {
+        setManualLoopMenuOpen(false);
+        setManualLoopInspectorOpen(false);
+      }
+      showToast('success', '已交还 LOOP');
+    } finally {
+      setManualLoopReleaseBusy(false);
+    }
+  }, [activeManualLoop, activeSessionId, manualLoopReleaseBusy, showToast]);
 
   // ★ 全局监听所有 session 的显式 done
   // 修正两个 bug：
@@ -523,6 +633,24 @@ export const App: React.FC = () => {
             next.add(sid);
             return next;
           });
+        }
+
+        if (configRef.current.desktopTaskNotifications) {
+          const messageId = typeof delta.messageId === 'string' && delta.messageId
+            ? delta.messageId
+            : 'unknown-message';
+          const completionKey = `${sid}:${messageId}`;
+          const notified = notifiedCompletionKeysRef.current;
+          if (!notified.has(completionKey)) {
+            notified.add(completionKey);
+            // Bound the de-duplication cache for very long-running app instances.
+            if (notified.size > 256) {
+              const oldest = notified.values().next().value as string | undefined;
+              if (oldest) notified.delete(oldest);
+            }
+            const sessionTitle = sessionsRef.current.find((session) => session.id === sid)?.title;
+            void notifyTaskCompletion(sessionTitle || '未命名 Session');
+          }
         }
       } else {
         // 任意非终态流事件都证明该 session 正在运行。这样即使 ChatPane
@@ -799,7 +927,8 @@ export const App: React.FC = () => {
   const hasBg = !!config.bgImage;
   const ua = config.uiOpacity ?? 1;  // panel alpha
 
-  // 首次连接中（null = 尚未收到任何连接状态回调）
+  // 首次连接中（null = 尚未收到任何连接状态回调）。Web/平板允许直接进入
+  // 缓存工作区；否则断网时连文件离线副本都无法打开。
   // 超过 10 秒仍连接不上，展示诊断提示
   const [connectHint, setConnectHint] = useState(false);
   useEffect(() => {
@@ -808,7 +937,7 @@ export const App: React.FC = () => {
     return () => clearTimeout(timer);
   }, [backendConnected]);
 
-  if (backendConnected === null) {
+  if (backendConnected === null && isTauri()) {
     return (
       <div style={{
         display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center',
@@ -854,6 +983,8 @@ export const App: React.FC = () => {
       // 密集数据面板(如 Loop 内嵌面板)需要的"实色底"：即便用户把气泡调得很透,
       // 也保留 ≥0.86 的不透明度,叠在壁纸上仍能看清。配合 backdrop-filter 用。
       '--theme-panel-bg': hexToRgba(theme.bg, Math.max(ua, 0.86)),
+      // 菜单/弹层不能跟随面板透明度，否则会与消息、悬浮按钮叠字。
+      '--theme-popover-bg': theme.bgSecondary,
       '--theme-border': theme.border,
       '--theme-text': theme.text,
       '--theme-text-muted': theme.textMuted,
@@ -923,6 +1054,12 @@ export const App: React.FC = () => {
           box-shadow: 0 0 0 3px var(--theme-accent-bg), inset 0 1px 1px rgba(0,0,0,.025) !important;
         }
         .awu-topbar button:hover, .awu-sidebar button:hover { filter: brightness(1.08); }
+        .awu-topbar [role="menuitem"]:hover,
+        .awu-topbar [role="dialog"] > div > button:hover {
+          background: var(--ui-surface-hover) !important;
+          border-color: var(--theme-border) !important;
+        }
+        .awu-topbar small { display: block; color: var(--theme-text-muted); font-size: 10px; font-weight: 400; }
         .awu-topbar {
           backdrop-filter: saturate(125%) blur(18px);
           -webkit-backdrop-filter: saturate(125%) blur(18px);
@@ -1170,76 +1307,166 @@ export const App: React.FC = () => {
               🤖 {formatModelLabel(activeExecBackends.find((b: any) => b.id === activeBackendId), activeSession)}
             </span>
           )}
-          <div style={{ flex: 1 }} />
-          {hackerMode.enabled && (
-            <button
-              onClick={() => setSettingsOpen(true)}
-              title="Smooth 已开启 · Ctrl+双击截图 · 左 Shift+双击左键显示/隐藏幽灵窗口"
-              style={{
-                border: '1px solid rgba(34,211,238,.55)', borderRadius: 999,
-                padding: '3px 9px', background: 'rgba(6,182,212,.1)',
-                color: '#22d3ee', fontSize: 10, fontWeight: 800,
-                letterSpacing: 1.2, cursor: 'pointer', boxShadow: '0 0 12px rgba(34,211,238,.16)',
-                ...(isMobile ? { display: 'none' } : {}),
-              }}
-            >
-              ◉ SMOOTH
-            </button>
+          {activeManualLoop && (
+            <div ref={manualLoopMenuRef} style={topbarPopoverAnchorStyle}>
+              <button
+                type="button"
+                onClick={() => {
+                  setMoreMenuOpen(false);
+                  setManualLoopMenuOpen((open) => !open);
+                }}
+                aria-haspopup="dialog"
+                aria-expanded={manualLoopMenuOpen}
+                aria-label="Manual LOOP 人工接管中"
+                title="人工接管中 · 点击查看 LOOP 总览或交还控制权"
+                style={{
+                  ...manualLoopTriggerStyle,
+                  ...(manualLoopMenuOpen ? manualLoopTriggerActiveStyle : {}),
+                  ...(isMobile ? { width: 34, padding: 0, justifyContent: 'center' } : {}),
+                }}
+              >
+                <span style={manualLoopDotStyle} />
+                {isMobile && <span aria-hidden="true" style={{ fontSize: 13 }}>✋</span>}
+                {!isMobile && <span>人工接管</span>}
+                {!isMobile && <span style={{ fontSize: 9, opacity: 0.72 }}>⌄</span>}
+              </button>
+              {manualLoopMenuOpen && (
+                <div
+                  role="dialog"
+                  aria-label="Manual LOOP 控制"
+                  style={{
+                    ...manualLoopPopoverStyle,
+                    ...(isMobile ? { position: 'fixed', top: 52, left: 12, right: 12, width: 'auto' } : {}),
+                  }}
+                >
+                  <div style={manualLoopPopoverHeaderStyle}>
+                    <span style={manualLoopLargeDotStyle} />
+                    <div style={{ minWidth: 0 }}>
+                      <div style={{ color: 'var(--theme-text)', fontWeight: 650 }}>Manual LOOP</div>
+                      <div style={manualLoopPopoverHintStyle}>当前对话与工具操作正在记录为人工轮次</div>
+                    </div>
+                  </div>
+                  <div style={manualLoopActionGridStyle}>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setManualLoopMenuOpen(false);
+                        setManualLoopInspectorOpen(true);
+                      }}
+                      style={topbarMenuActionStyle}
+                      title="只读查看完整 LOOP 面板，可切换面板 / 流程视图"
+                    >
+                      <span style={topbarMenuActionIconStyle}>▦</span>
+                      <span style={topbarMenuActionCopyStyle}><strong>LOOP 总览</strong><small>目标、阶段与流程状态</small></span>
+                    </button>
+                    <button
+                      type="button"
+                      disabled={manualLoopReleaseBusy}
+                      onClick={() => void handleReleaseManualLoop()}
+                      style={{
+                        ...topbarMenuActionStyle,
+                        color: '#d9a62e',
+                        cursor: manualLoopReleaseBusy ? 'wait' : 'pointer',
+                        opacity: manualLoopReleaseBusy ? 0.58 : 1,
+                      }}
+                      title="检查真实运行状态后，封存人工操作并返回 LOOP"
+                    >
+                      <span style={topbarMenuActionIconStyle}>↩</span>
+                      <span style={topbarMenuActionCopyStyle}><strong>{manualLoopReleaseBusy ? '交还中…' : '交还 LOOP'}</strong><small>结束人工接管并恢复自动流程</small></span>
+                    </button>
+                  </div>
+                </div>
+              )}
+            </div>
           )}
-          {/* Loop 会话的全部交互在 ChatPane 内嵌的 LoopPanel 中进行，顶栏不再放入口 */}
+          <div style={{ flex: 1 }} />
           <button
-            onClick={() => setManualPanelOpen(true)}
-            style={{ ...settingsBtnStyle, ...(isMobile ? { display: 'none' } : {}), ...(manualPanelOpen ? { background: 'var(--theme-accent-bg)', color: 'var(--theme-accent)' } : {}) }}
-            title="使用手册"
-          >
-            📖
-          </button>
-          {/* 日志查看器按钮 */}
-          <button
-            onClick={() => setLogViewerOpen(true)}
-            style={{ ...settingsBtnStyle, ...(isMobile ? { display: 'none' } : {}) }}
-            title="后端日志 / Logs"
-          >
-            📋
-          </button>
-          {/* 连接目标：本地直连 / 经中继访问远程执行节点 */}
-          <button
-            onClick={() => setConnPanelOpen(true)}
-            aria-label="打开连接设置"
-            style={{ ...settingsBtnStyle, ...(isMobile ? { minWidth: 44, minHeight: 44 } : {}) }}
-            title="连接目标(本地 / 远程中继)"
-          >
-            📡
-          </button>
-          <button
-            onClick={() => setRepoPanelOpen(!repoPanelOpen)}
-            style={{ ...settingsBtnStyle, ...(isMobile ? { display: 'none' } : {}), ...(repoPanelOpen ? { background: 'var(--theme-accent-bg)', color: 'var(--theme-accent)' } : {}) }}
-            title="Repo — Skills & Prompts"
-          >
-            📦
-          </button>
-          <button
-            onClick={() => setScratchPadOpen(v => !v)}
-            style={{ ...settingsBtnStyle, ...(isMobile ? { display: 'none' } : {}), ...(scratchPadOpen ? { background: 'var(--theme-accent-bg)', color: 'var(--theme-accent)' } : {}) }}
+            onClick={() => {
+              setMoreMenuOpen(false);
+              setScratchPadOpen((open) => !open);
+            }}
+            style={{ ...settingsBtnStyle, ...(scratchPadOpen ? { background: 'var(--theme-accent-bg)', color: 'var(--theme-accent)' } : {}), ...(isMobile ? { minWidth: 44, minHeight: 44 } : {}) }}
             title="便签本 (Ctrl+Shift+N)"
+            aria-label="打开便签本"
           >
             📌
           </button>
           <button
-            onClick={() => setAssetPanelOpen(v => !v)}
-            style={{ ...settingsBtnStyle, ...(isMobile ? { display: 'none' } : {}), ...(assetPanelOpen ? { background: 'var(--theme-accent-bg)', color: 'var(--theme-accent)' } : {}) }}
-            title="素材池 / Asset Pool"
+            onClick={() => {
+              setMoreMenuOpen(false);
+              setSettingsOpen(true);
+            }}
+            aria-label={`用户与设置：${currentUser.displayName}`}
+            style={{
+              ...settingsBtnStyle, padding: 0, width: isMobile ? 40 : 32,
+              minWidth: isMobile ? 40 : 32, minHeight: isMobile ? 44 : 32,
+            }}
+            title={`用户与设置 · ${currentUser.displayName} · @${currentUser.username}`}
           >
-            🗂
+            {currentUser.avatarData ? (
+              <img
+                src={currentUser.avatarData}
+                alt=""
+                style={{ width: 25, height: 25, borderRadius: '50%', objectFit: 'cover' }}
+              />
+            ) : (
+              <span style={{
+                width: 25, height: 25, borderRadius: '50%', display: 'grid', placeItems: 'center',
+                background: currentUser.avatarColor, color: '#fff', fontSize: 11, fontWeight: 700,
+              }}>
+                {(currentUser.displayName || currentUser.username).slice(0, 1).toUpperCase()}
+              </span>
+            )}
           </button>
-          <button
-            onClick={() => setSettingsOpen(true)}
-            aria-label="打开应用设置"
-            style={{ ...settingsBtnStyle, ...(isMobile ? { minWidth: 44, minHeight: 44 } : {}) }}
-            title="Settings"
-          >
-            ⚙
-          </button>
+          <div ref={moreMenuRef} style={topbarPopoverAnchorStyle}>
+            <button
+              type="button"
+              onClick={() => {
+                setManualLoopMenuOpen(false);
+                setMoreMenuOpen((open) => !open);
+              }}
+              aria-haspopup="menu"
+              aria-expanded={moreMenuOpen}
+              aria-label="更多功能"
+              style={{ ...settingsBtnStyle, ...(moreMenuOpen ? { background: 'var(--theme-accent-bg)', color: 'var(--theme-accent)' } : {}), ...(isMobile ? { minWidth: 44, minHeight: 44 } : {}) }}
+              title="更多功能"
+            >
+              ⋯
+            </button>
+            {moreMenuOpen && (
+              <div role="menu" aria-label="更多功能" style={moreMenuStyle}>
+                <TopbarMenuItem icon="▦" label={`分屏布局 · ${LAYOUT_LABEL[layout]}`} onClick={() => {
+                  setLayout((current) => LAYOUT_CYCLE[(LAYOUT_CYCLE.indexOf(current) + 1) % LAYOUT_CYCLE.length]);
+                  setMoreMenuOpen(false);
+                }} />
+                <TopbarMenuItem icon="📦" label="Skills 与 Prompts" active={repoPanelOpen} onClick={() => {
+                  setRepoPanelOpen((open) => !open);
+                  setMoreMenuOpen(false);
+                }} />
+                <TopbarMenuItem icon="🗂" label="素材池" active={assetPanelOpen} onClick={() => {
+                  setAssetPanelOpen((open) => !open);
+                  setMoreMenuOpen(false);
+                }} />
+                <TopbarMenuItem icon="◉" label={`Smooth 模式 · ${hackerMode.enabled ? '已开启' : '未开启'}`} active={hackerMode.enabled} onClick={() => {
+                  setSettingsOpen(true);
+                  setMoreMenuOpen(false);
+                }} />
+                <div style={moreMenuDividerStyle} />
+                <TopbarMenuItem icon="📡" label="连接与 Relay" onClick={() => {
+                  setConnPanelOpen(true);
+                  setMoreMenuOpen(false);
+                }} />
+                <TopbarMenuItem icon="📋" label="后端日志" onClick={() => {
+                  setLogViewerOpen(true);
+                  setMoreMenuOpen(false);
+                }} />
+                <TopbarMenuItem icon="📖" label="使用手册" onClick={() => {
+                  setManualPanelOpen(true);
+                  setMoreMenuOpen(false);
+                }} />
+              </div>
+            )}
+          </div>
         </div>
 
         {/* ---- Claude 登录状态提示 ---- */}
@@ -1296,8 +1523,6 @@ export const App: React.FC = () => {
                     onStreamingChange={handleStreamingChange}
                     onGhostStateChange={handleGhostStateChange}
                     onAdjustFontSize={(delta) => updateConfig({ fontSize: Math.max(11, Math.min(28, config.fontSize + delta)) })}
-                    layoutLabel={LAYOUT_LABEL[layout]}
-                    onCycleLayout={() => setLayout((cur) => LAYOUT_CYCLE[(LAYOUT_CYCLE.indexOf(cur) + 1) % LAYOUT_CYCLE.length])}
                   />
                 ) : idx === firstHomePaneIdx ? (
                   <HomeDashboard
@@ -1339,6 +1564,20 @@ export const App: React.FC = () => {
           );
         })()}
       </div>
+
+      {activeManualLoop && activeSessionId && manualLoopInspectorOpen && (
+        <LoopPanel
+          sessionId={activeSessionId}
+          onClose={() => setManualLoopInspectorOpen(false)}
+          inspectOnly
+          sessionBackendId={activeBackendId}
+          sessionRuntime={{
+            model: activeSession?.modelOverride,
+            reasoningEffort: activeSession?.reasoningEffort,
+          }}
+          backends={activeExecBackends}
+        />
+      )}
 
       {/* ---- 便签本：桌面端右侧列 / 移动端全屏覆盖 ---- */}
       {scratchPadOpen && (
@@ -1402,6 +1641,10 @@ export const App: React.FC = () => {
         }}
         onExportData={handleExportData}
         onImportData={handleImportData}
+        onOpenConnectionPanel={() => {
+          setSettingsOpen(false);
+          setConnPanelOpen(true);
+        }}
       />
 
       {/* ---- 后端日志查看器 ---- */}
@@ -1535,6 +1778,9 @@ const mobilePanelOverlayStyle: React.CSSProperties = {
 };
 
 const headerStyle: React.CSSProperties = {
+  position: 'relative',
+  zIndex: 500,
+  isolation: 'isolate',
   minHeight: 48,
   padding: '8px 14px',
   borderBottom: '1px solid var(--theme-border, rgba(0,0,0,0.12))',
@@ -1542,6 +1788,7 @@ const headerStyle: React.CSSProperties = {
   alignItems: 'center',
   gap: 10,
   background: 'var(--theme-panel-bg, var(--theme-bg, #ffffff))',
+  overflow: 'visible',
 };
 
 const settingsBtnStyle: React.CSSProperties = {
@@ -1559,6 +1806,184 @@ const settingsBtnStyle: React.CSSProperties = {
   justifyContent: 'center',
   transition: 'color 0.15s',
 };
+
+const topbarPopoverAnchorStyle: React.CSSProperties = {
+  position: 'relative',
+  display: 'inline-flex',
+  alignItems: 'center',
+  flexShrink: 0,
+};
+
+const manualLoopTriggerStyle: React.CSSProperties = {
+  height: 28,
+  padding: '0 9px',
+  borderRadius: 5,
+  border: '1px solid rgba(210,153,34,0.32)',
+  background: 'rgba(210,153,34,0.08)',
+  color: '#c99826',
+  display: 'inline-flex',
+  alignItems: 'center',
+  gap: 7,
+  fontSize: 11,
+  fontWeight: 650,
+  whiteSpace: 'nowrap',
+  cursor: 'pointer',
+};
+
+const manualLoopTriggerActiveStyle: React.CSSProperties = {
+  borderColor: 'rgba(210,153,34,0.55)',
+  background: 'rgba(210,153,34,0.14)',
+};
+
+const manualLoopDotStyle: React.CSSProperties = {
+  width: 6,
+  height: 6,
+  flexShrink: 0,
+  borderRadius: '50%',
+  background: '#d29922',
+  boxShadow: '0 0 0 3px rgba(210,153,34,0.12)',
+};
+
+const manualLoopLargeDotStyle: React.CSSProperties = {
+  ...manualLoopDotStyle,
+  width: 8,
+  height: 8,
+  boxShadow: '0 0 0 4px rgba(210,153,34,0.12)',
+};
+
+const manualLoopPopoverStyle: React.CSSProperties = {
+  position: 'absolute',
+  zIndex: 2000,
+  top: 'calc(100% + 8px)',
+  right: 0,
+  width: 310,
+  maxWidth: 'calc(100vw - 24px)',
+  padding: 10,
+  borderRadius: 7,
+  border: '1px solid var(--theme-border)',
+  background: 'var(--theme-popover-bg, var(--theme-bg-secondary))',
+  color: 'var(--theme-text)',
+  opacity: 1,
+  backdropFilter: 'none',
+  boxShadow: 'var(--ui-shadow-float, 0 16px 40px rgba(0,0,0,.25))',
+  boxSizing: 'border-box',
+};
+
+const manualLoopPopoverHeaderStyle: React.CSSProperties = {
+  display: 'flex',
+  alignItems: 'flex-start',
+  gap: 10,
+  padding: '5px 6px 10px',
+  fontSize: 12,
+};
+
+const manualLoopPopoverHintStyle: React.CSSProperties = {
+  marginTop: 3,
+  color: 'var(--theme-text-muted)',
+  fontSize: 11,
+  lineHeight: 1.45,
+};
+
+const manualLoopActionGridStyle: React.CSSProperties = {
+  display: 'grid',
+  gap: 4,
+};
+
+const topbarMenuActionStyle: React.CSSProperties = {
+  width: '100%',
+  minHeight: 48,
+  padding: '7px 8px',
+  border: '1px solid transparent',
+  borderRadius: 5,
+  background: 'transparent',
+  color: 'var(--theme-text)',
+  cursor: 'pointer',
+  display: 'flex',
+  alignItems: 'center',
+  gap: 10,
+  textAlign: 'left',
+};
+
+const topbarMenuActionIconStyle: React.CSSProperties = {
+  width: 26,
+  height: 26,
+  borderRadius: 4,
+  border: '1px solid var(--theme-border)',
+  background: 'var(--theme-bg-tertiary)',
+  display: 'grid',
+  placeItems: 'center',
+  flexShrink: 0,
+  fontSize: 13,
+};
+
+const topbarMenuActionCopyStyle: React.CSSProperties = {
+  minWidth: 0,
+  display: 'flex',
+  flexDirection: 'column',
+  gap: 2,
+  lineHeight: 1.25,
+};
+
+const moreMenuStyle: React.CSSProperties = {
+  position: 'absolute',
+  zIndex: 2000,
+  top: 'calc(100% + 8px)',
+  right: 0,
+  width: 220,
+  maxWidth: 'calc(100vw - 24px)',
+  padding: 5,
+  borderRadius: 7,
+  border: '1px solid var(--theme-border)',
+  background: 'var(--theme-popover-bg, var(--theme-bg-secondary))',
+  color: 'var(--theme-text)',
+  opacity: 1,
+  backdropFilter: 'none',
+  boxShadow: 'var(--ui-shadow-float, 0 16px 40px rgba(0,0,0,.25))',
+  boxSizing: 'border-box',
+};
+
+const moreMenuItemStyle: React.CSSProperties = {
+  width: '100%',
+  height: 34,
+  padding: '0 9px',
+  border: '1px solid transparent',
+  borderRadius: 4,
+  background: 'transparent',
+  color: 'var(--theme-text)',
+  display: 'flex',
+  alignItems: 'center',
+  gap: 9,
+  textAlign: 'left',
+  fontSize: 12,
+  cursor: 'pointer',
+};
+
+const moreMenuDividerStyle: React.CSSProperties = {
+  height: 1,
+  margin: '4px 5px',
+  background: 'var(--theme-border)',
+};
+
+const TopbarMenuItem: React.FC<{
+  icon: string;
+  label: string;
+  active?: boolean;
+  onClick: () => void;
+}> = ({ icon, label, active, onClick }) => (
+  <button
+    type="button"
+    role="menuitem"
+    onClick={onClick}
+    style={{
+      ...moreMenuItemStyle,
+      ...(active ? { background: 'var(--theme-accent-bg)', color: 'var(--theme-accent)' } : {}),
+    }}
+  >
+    <span aria-hidden="true" style={{ width: 18, textAlign: 'center', flexShrink: 0 }}>{icon}</span>
+    <span style={{ flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{label}</span>
+    {active && <span aria-label="已打开">•</span>}
+  </button>
+);
 
 const logBtnStyle: React.CSSProperties = {
   background: 'var(--theme-success-bg, #2da44e1a)',

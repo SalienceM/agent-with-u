@@ -8,6 +8,7 @@ Type=simple
 User=agentwithu
 Group=agentwithu
 EnvironmentFile=/etc/agent-with-u/relay.env
+StateDirectory=agent-with-u-relay
 ExecStart=/opt/agent-with-u-relay/agent-with-u-relay
 Restart=always
 RestartSec=3
@@ -18,4 +19,3 @@ ProtectHome=true
 
 [Install]
 WantedBy=multi-user.target
-

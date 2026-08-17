@@ -4,7 +4,7 @@ import unittest
 from types import SimpleNamespace
 
 from src.backend.bridge_ws import BridgeWS
-from src.backend.loop_store import LoopRecord, LoopState, LoopStep, STAGE_EXECUTE
+from src.backend.loop_store import LoopAnalysis, LoopRecord, LoopState, LoopStep, STAGE_EXECUTE
 from src.types import ChatMessage, ImageAttachment, Session, ToolCallInfo
 
 
@@ -70,6 +70,10 @@ class SessionLoadingPerformanceTests(unittest.TestCase):
         record = LoopRecord(
             seq=1, kind="manual", round=1, completed=True,
             result=huge,
+            evolution_basis=huge,
+            analysis=LoopAnalysis(
+                notes=huge, verified=huge, gaps=huge, next_focus=huge,
+            ),
             orchestration=[LoopStep(index=1, desc="step", status="done", output=huge)],
             manual_messages=[{
                 "id": "m1", "role": "assistant", "content": "done",
@@ -92,11 +96,17 @@ class SessionLoadingPerformanceTests(unittest.TestCase):
         self.assertLess(len(serialized), 20_000)
         self.assertEqual(compact["loops"][0]["manualMessages"], [])
         self.assertEqual(compact["loops"][0]["orchestration"][0]["output"], "")
+        self.assertEqual(compact["loops"][0]["evolutionBasis"], "")
+        self.assertEqual(compact["loops"][0]["analysis"]["verified"], "")
+        self.assertEqual(compact["loops"][0]["analysis"]["gaps"], "")
+        self.assertEqual(compact["loops"][0]["analysis"]["nextFocus"], "")
         self.assertFalse(compact["loops"][0]["detailLoaded"])
 
         detail = json.loads(bridge._rpc_loopGetRecord(state.session_id, 1))
         self.assertEqual(detail["status"], "ok")
         self.assertEqual(len(detail["record"]["manualContext"]), len(huge))
+        self.assertEqual(len(detail["record"]["evolutionBasis"]), len(huge))
+        self.assertEqual(len(detail["record"]["analysis"]["verified"]), len(huge))
         self.assertTrue(detail["record"]["detailLoaded"])
 
     def test_manual_loop_snapshot_does_not_duplicate_base64_or_unbounded_tool_output(self):

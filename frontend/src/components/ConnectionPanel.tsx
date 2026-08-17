@@ -1,10 +1,11 @@
 import React, { useCallback, useEffect, useState } from 'react';
 import {
-  getConnectionTarget, setConnectionTarget, listRelayDevices,
+  getConnectionTarget, setConnectionTarget, inspectRelay,
+  rememberRelayUserProfile,
   isTauri, getDesktopConfig, setDesktopConfig, type DesktopConfig,
   api, type ConnectedClient,
   getExecutors, addExecRoster, removeExecRoster, onExecStatus, getHomeExecKey,
-  type ExecutorInfo,
+  type ExecutorInfo, type RelayUserProfile,
 } from '../api';
 import {
   listRelayProfiles, saveRelayProfile, deleteRelayProfile,
@@ -40,6 +41,9 @@ export const ConnectionPanel: React.FC<ConnectionPanelProps> = ({ onClose }) => 
   const [token, setToken] = useState(current.mode === 'relay' ? current.token : '');
   const [deviceId, setDeviceId] = useState(current.mode === 'relay' ? current.deviceId : '');
   const [devices, setDevices] = useState<{ id: string; name: string }[]>([]);
+  const [verifiedUser, setVerifiedUser] = useState<RelayUserProfile | null>(
+    current.mode === 'relay' ? current.user || null : null,
+  );
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState('');
 
@@ -66,25 +70,36 @@ export const ConnectionPanel: React.FC<ConnectionPanelProps> = ({ onClose }) => 
     setExecMsg(null);
     if (!url.trim()) { setErr('请先填写中继地址'); return; }
     if (!deviceId) { setErr('请先刷新并选择一个执行节点'); return; }
+    if (!verifiedUser) { setErr('请先验证当前用户并刷新执行节点'); return; }
+    if (getConnectionTarget().mode !== 'relay') {
+      setErr('当前窗口仍是 local 用户。请先“保存并连接”登录该 Relay 用户，再添加此用户的其他执行节点。');
+      return;
+    }
     const dev = devices.find((d) => d.id === deviceId);
-    const key = `relay:${deviceId}`;
+    const key = `relay:${verifiedUser.userId || 'legacy'}:${deviceId}`;
     // 若这台正是当前 home,addExecRoster 会静默跳过。明确告诉用户,而不是「没反应」。
     if (key === getHomeExecKey()) {
       setExecMsg({
         kind: 'warn',
-        text: `这台「${dev?.name || deviceId}」正是本窗口当前的 home 节点（默认就连它），无需重复加入。`
-          + `若想「🏠本机 + 它」并存，请先把上面切到「🏠 本地直连」并保存，再回来加入。`,
+        text: `这台「${dev?.name || deviceId}」正是本窗口当前的 home 节点（默认就连它），无需重复加入。`,
       });
       return;
     }
-    addExecRoster({ mode: 'relay', url: url.trim(), token: token.trim(), deviceId, deviceName: dev?.name });
+    const added = addExecRoster({
+      mode: 'relay', url: url.trim(), token: token.trim(), deviceId,
+      deviceName: dev?.name, user: verifiedUser,
+    });
+    if (!added) {
+      setErr('只能加入当前已登录 Relay 用户获授权的执行节点；请先“保存并连接”切换用户。');
+      return;
+    }
     setErr('');
     setExecMsg({
       kind: 'ok',
       text: `✓ 已加入「${dev?.name || deviceId}」。向上滚动可见「可分配执行节点」卡片；`
         + `关闭本面板后，新建会话时即可在「执行节点」里选它。`,
     });
-  }, [url, token, deviceId, devices]);
+  }, [url, token, deviceId, devices, verifiedUser]);
 
   // ── Relay 预设列表(localStorage 持久化) ──
   const [profiles, setProfiles] = useState<RelayProfile[]>(() => listRelayProfiles());
@@ -100,6 +115,7 @@ export const ConnectionPanel: React.FC<ConnectionPanelProps> = ({ onClose }) => 
   const selectProfile = useCallback((p: RelayProfile) => {
     setUrl(p.url);
     setToken(p.token);
+    setVerifiedUser(p.user || null);
     setActiveProfileId(p.id);
     setErr('');
     // 选了新的中继 → 设备列表清空,让用户重新刷一遍
@@ -119,10 +135,13 @@ export const ConnectionPanel: React.FC<ConnectionPanelProps> = ({ onClose }) => 
     })();
     const label = window.prompt('为这个中继取个名字', defaultLabel);
     if (!label) return;  // 用户取消
-    const saved = saveRelayProfile({ id: activeProfileId ?? undefined, label, url: u, token: t });
+    const saved = saveRelayProfile({
+      id: activeProfileId ?? undefined, label, url: u, token: t,
+      user: verifiedUser || undefined,
+    });
     refreshProfiles();
     setActiveProfileId(saved.id);
-  }, [url, token, activeProfileId, refreshProfiles]);
+  }, [url, token, verifiedUser, activeProfileId, refreshProfiles]);
 
   const removeProfile = useCallback((id: string) => {
     if (!window.confirm('删除这个中继预设?')) return;
@@ -166,15 +185,22 @@ export const ConnectionPanel: React.FC<ConnectionPanelProps> = ({ onClose }) => 
     setBusy(true);
     setErr('');
     try {
-      const list = await listRelayDevices(url.trim(), token.trim());
-      setDevices(list);
-      if (list.length === 0) {
-        setErr('中继在线,但当前没有执行节点注册');
-      } else if (!list.find((d) => d.id === deviceId)) {
-        setDeviceId(list[0].id);
+      const inspection = await inspectRelay(url.trim(), token.trim());
+      setDevices(inspection.devices);
+      setVerifiedUser(inspection.profile);
+      const active = getConnectionTarget();
+      if (active.mode === 'relay'
+          && active.url === url.trim() && active.token === token.trim()) {
+        rememberRelayUserProfile(inspection.profile);
+      }
+      if (inspection.devices.length === 0) {
+        setErr('用户验证成功，但没有获授权且在线的执行节点');
+      } else if (!inspection.devices.find((d) => d.id === deviceId)) {
+        setDeviceId(inspection.devices[0].id);
       }
     } catch (e: any) {
       setDevices([]);
+      setVerifiedUser(null);
       setErr(e?.message || '获取设备失败');
     } finally {
       setBusy(false);
@@ -184,11 +210,38 @@ export const ConnectionPanel: React.FC<ConnectionPanelProps> = ({ onClose }) => 
   // 把卡片 A 里填好的发布中继配置复制到卡片 B 的「远程(经中继)」字段
   const copyFromPublish = useCallback(() => {
     if (pubUrl.trim()) setUrl(pubUrl.trim());
-    if (pubToken.trim()) setToken(pubToken.trim());
+    setVerifiedUser(null);
+    setDevices([]);
+    setDeviceId('');
     setMode('relay');
-  }, [pubUrl, pubToken]);
+  }, [pubUrl]);
 
   const handleSave = useCallback(async () => {
+    let checkedUser: RelayUserProfile | null = null;
+    let checkedDevices = devices;
+    if (mode === 'relay') {
+      if (!url.trim()) { setErr('请填写中继地址'); return; }
+      if (!token.trim()) { setErr('请填写用户 Token'); return; }
+      setBusy(true);
+      setErr('');
+      try {
+        const inspection = await inspectRelay(url.trim(), token.trim());
+        checkedUser = inspection.profile;
+        checkedDevices = inspection.devices;
+        setVerifiedUser(inspection.profile);
+        setDevices(inspection.devices);
+        if (!deviceId || !inspection.devices.some((device) => device.id === deviceId)) {
+          setErr('请选择当前用户获授权且在线的执行节点');
+          return;
+        }
+      } catch (error: any) {
+        setVerifiedUser(null);
+        setErr(error?.message || '用户验证失败');
+        return;
+      } finally {
+        setBusy(false);
+      }
+    }
     // 1. 持久化桌面端本机角色（仅 Tauri）。改动需重启应用生效。
     let needRestart = false;
     if (tauri) {
@@ -212,15 +265,14 @@ export const ConnectionPanel: React.FC<ConnectionPanelProps> = ({ onClose }) => 
     if (mode === 'local') {
       await setConnectionTarget({ mode: 'local' });
     } else {
-      if (!url.trim()) { setErr('请填写中继地址'); return; }
-      if (!deviceId) { setErr('请选择一个执行节点'); return; }
-      const dev = devices.find((d) => d.id === deviceId);
+      const dev = checkedDevices.find((d) => d.id === deviceId);
       await setConnectionTarget({
         mode: 'relay',
         url: url.trim(),
         token: token.trim(),
         deviceId,
         deviceName: dev?.name,
+        user: checkedUser || undefined,
       });
       // 顺手把当前 url+token 落进 profile 列表(同 url+token 已存在会去重,
       // 不会产生重复条目)。这样用户「保存并连接」一次,下次就能从预设列表
@@ -235,6 +287,7 @@ export const ConnectionPanel: React.FC<ConnectionPanelProps> = ({ onClose }) => 
           label: profiles.find((p) => p.id === activeProfileId)?.label || defaultLabel,
           url: url.trim(),
           token: token.trim(),
+          user: checkedUser || undefined,
         });
         refreshProfiles();
         setActiveProfileId(saved.id);
@@ -243,7 +296,7 @@ export const ConnectionPanel: React.FC<ConnectionPanelProps> = ({ onClose }) => 
     if (needRestart) setRestartHint(true);
     else onClose();
   }, [tauri, role, pubUrl, pubToken, pubDeviceName, savedDesktop,
-      mode, url, token, deviceId, devices, onClose]);
+      mode, url, token, deviceId, devices, profiles, activeProfileId, refreshProfiles, onClose]);
 
   // 卡片 A 已配置好「发布中继」、卡片 B 选了 relay 但还没填地址：提示一键复制
   const canSuggestCopy = tauri && role === 'executor' && mode === 'relay'
@@ -350,7 +403,8 @@ export const ConnectionPanel: React.FC<ConnectionPanelProps> = ({ onClose }) => 
             {role === 'executor' && (
               <>
                 <div style={hintStyle}>
-                  本机在跑 Claude。填写中继可让远程 UI 经中继访问本机；留空则仅本地 / 局域网可用。
+                  本机在跑 Agent。这里填写的是执行端注册用的 Relay 主 Token，不要交给普通用户；
+                  留空则仅本地 / 局域网可用。
                 </div>
                 <div style={{ display: 'flex', flexDirection: 'column', gap: 8, margin: '8px 0 4px' }}>
                   <input
@@ -363,7 +417,7 @@ export const ConnectionPanel: React.FC<ConnectionPanelProps> = ({ onClose }) => 
                   <input
                     type="password"
                     value={pubToken}
-                    placeholder="中继 Token（可选）"
+                    placeholder="Relay 主 Token（仅执行端注册使用）"
                     onChange={(e) => setPubToken(e.target.value)}
                     style={inputStyle}
                   />
@@ -430,9 +484,12 @@ export const ConnectionPanel: React.FC<ConnectionPanelProps> = ({ onClose }) => 
 
           {mode === 'relay' && (
             <>
+              <div style={{ ...hintStyle, marginBottom: 9 }}>
+                这里使用 Relay 为当前用户签发的用户 Token。验证后只会列出该用户获授权的执行节点。
+              </div>
               {canSuggestCopy && (
                 <button onClick={copyFromPublish} style={suggestBtnStyle}>
-                  ↑ 使用卡片 A 里填的中继地址 / Token
+                  ↑ 使用卡片 A 的中继地址（用户 Token 需单独填写）
                 </button>
               )}
 
@@ -482,27 +539,53 @@ export const ConnectionPanel: React.FC<ConnectionPanelProps> = ({ onClose }) => 
                     type="text"
                     value={url}
                     placeholder="ws://relay.example.com:44360"
-                    onChange={(e) => { setUrl(e.target.value); setActiveProfileId(null); }}
+                    onChange={(e) => {
+                      setUrl(e.target.value); setActiveProfileId(null); setVerifiedUser(null);
+                      setDevices([]); setDeviceId('');
+                    }}
                     style={inputStyle}
                   />
                 </div>
                 <div>
-                  <label style={labelStyle}>中继 Token</label>
+                  <label style={labelStyle}>用户 Token</label>
                   <input
                     type="password"
                     value={token}
-                    placeholder="与中继服务器一致的共享 token"
-                    onChange={(e) => { setToken(e.target.value); setActiveProfileId(null); }}
+                    placeholder="Relay 为当前用户签发的 token"
+                    onChange={(e) => {
+                      setToken(e.target.value); setActiveProfileId(null); setVerifiedUser(null);
+                      setDevices([]); setDeviceId('');
+                    }}
                     style={inputStyle}
                   />
                 </div>
+                {verifiedUser && (
+                  <div style={{
+                    display: 'flex', alignItems: 'center', gap: 9, padding: '8px 10px',
+                    border: '1px solid rgba(34,197,94,0.35)', background: 'rgba(34,197,94,0.09)',
+                    color: 'var(--theme-text)', fontSize: 11,
+                  }}>
+                    {verifiedUser.avatarData ? (
+                      <img src={verifiedUser.avatarData} alt="" style={{ width: 28, height: 28, objectFit: 'cover', borderRadius: '50%' }} />
+                    ) : (
+                      <span style={{
+                        width: 28, height: 28, borderRadius: '50%', display: 'grid', placeItems: 'center',
+                        color: '#fff', background: verifiedUser.avatarColor, fontWeight: 700,
+                      }}>{(verifiedUser.displayName || verifiedUser.username).slice(0, 1).toUpperCase()}</span>
+                    )}
+                    <span style={{ minWidth: 0 }}>
+                      <strong style={{ display: 'block' }}>✓ {verifiedUser.displayName}</strong>
+                      <span style={{ color: 'var(--theme-text-muted)' }}>@{verifiedUser.username} · {verifiedUser.userId}</span>
+                    </span>
+                  </div>
+                )}
                 <div style={{ display: 'flex', gap: 6 }}>
                   <button onClick={saveCurrentAsProfile} style={{ ...refreshBtnStyle, flex: '0 0 auto' }}>
                     💾 {activeProfileId ? '更新预设' : '保存为预设'}
                   </button>
                 </div>
                 <button onClick={handleRefresh} disabled={busy} style={refreshBtnStyle}>
-                  {busy ? '获取中…' : '刷新执行节点列表'}
+                  {busy ? '验证中…' : '验证用户并刷新执行节点'}
                 </button>
                 {devices.length > 0 && (
                   <div>
@@ -610,7 +693,12 @@ const ClientRow: React.FC<{ c: ConnectedClient }> = ({ c }) => {
       fontSize: 11,
     }}>
       <span style={{ fontWeight: 600, color: 'var(--theme-text)' }}>{viaTag}</span>
-      <span style={{ color: 'var(--theme-text)' }}>{c.identity || '?'}</span>
+      <span style={{ color: 'var(--theme-text)' }}>
+        {c.display_name || c.username || c.identity || '?'}
+      </span>
+      {c.username && c.identity && c.identity !== c.username && (
+        <span style={{ color: 'var(--theme-text-muted)' }}>@{c.username}</span>
+      )}
       {c.peer && (
         <span style={{ color: 'var(--theme-text-muted)', fontFamily: 'monospace' }}>
           {c.peer}

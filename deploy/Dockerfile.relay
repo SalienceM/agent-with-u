@@ -4,7 +4,7 @@
 # 只在远程 UI 与执行节点之间转发消息。执行永远发生在用户自己机器上的
 # 执行节点(awu-backend)，执行节点主动拨出到本中继注册。
 #
-# 极简镜像：中继只依赖 websockets + src/relay_server.py，与后端/前端无关。
+# 极简镜像：中继只依赖 websockets + Relay 身份模块，与后端/前端无关。
 #
 # 构建(仓库根目录为上下文)：
 #   docker build -f deploy/Dockerfile.relay -t agent-with-u-relay .
@@ -16,8 +16,8 @@ FROM python:3.11-slim
 RUN pip install --no-cache-dir 'websockets>=13.0'
 
 WORKDIR /app
-# 中继只需要这一个文件（relay_server.py 不 import 任何后端模块）
-COPY src/relay_server.py ./src/relay_server.py
+# Relay 不 import 业务 Backend；只复制转发服务与轻量用户存储。
+COPY src/relay_server.py src/relay_users.py ./src/
 
 EXPOSE 44360
 

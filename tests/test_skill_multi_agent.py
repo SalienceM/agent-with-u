@@ -83,7 +83,29 @@ class BackendSkillGenerationTests(unittest.TestCase):
                     if other_script != call_script:
                         self.assertNotIn(other_script, markdown)
 
-    def test_generated_markdown_resolves_python_inside_active_bash(self):
+    def test_generated_markdown_uses_native_powershell_for_codex_on_windows(self):
+        with patch.object(
+            self.bridge,
+            "_resolve_python_exe",
+            return_value="C:/Users/example/Python/python.EXE",
+        ), patch("src.backend.bridge_ws.sys.platform", "win32"):
+            markdown = self.bridge._generate_backend_skill_md(
+                "web-search",
+                self.info,
+                agent_name="codex",
+            )
+
+        self.assertIn("必须使用 shell_command 工具直接执行下方 PowerShell 命令", markdown)
+        self.assertIn("```powershell", markdown)
+        self.assertIn("Get-Command python.exe, python3, python", markdown)
+        self.assertIn(
+            "& $awuPython '.agents/skills/web-search/_call.py' '<PROMPT>'",
+            markdown,
+        )
+        self.assertNotIn("command -v", markdown)
+        self.assertNotIn("C:/Users/example/Python/python.EXE", markdown)
+
+    def test_generated_markdown_keeps_bash_for_claude(self):
         with patch.object(
             self.bridge,
             "_resolve_python_exe",
@@ -92,18 +114,14 @@ class BackendSkillGenerationTests(unittest.TestCase):
             markdown = self.bridge._generate_backend_skill_md(
                 "web-search",
                 self.info,
-                agent_name="codex",
+                agent_name="claude",
             )
 
+        self.assertIn("必须使用 Bash 工具直接执行下方命令", markdown)
         self.assertIn(
             '_AWU_PYTHON="$(command -v python.exe || command -v python3 || command -v python)"',
             markdown,
         )
-        self.assertIn(
-            '"$_AWU_PYTHON" ".agents/skills/web-search/_call.py" "<PROMPT>"',
-            markdown,
-        )
-        self.assertNotIn("C:/Users/example/Python/python.EXE", markdown)
 
     def test_python_skill_command_quotes_each_argument(self):
         command = self.bridge._build_skill_python_cmd(
@@ -116,6 +134,54 @@ class BackendSkillGenerationTests(unittest.TestCase):
             '_AWU_PYTHON="$(command -v python.exe || command -v python3 || command -v python)" && '
             '"$_AWU_PYTHON" ".agents/skills/demo/_call.py" "<PROMPT>" "<REF_IMAGE_URL>"',
         )
+
+    def test_powershell_skill_command_quotes_path_and_arguments(self):
+        command = self.bridge._build_skill_python_cmd(
+            ".agents/skills/demo/_call.py",
+            ["<PROMPT>", "O'Reilly"],
+            shell="powershell",
+        )
+
+        self.assertIn("Get-Command python.exe, python3, python", command)
+        self.assertIn("& $awuPython '.agents/skills/demo/_call.py'", command)
+        self.assertTrue(command.endswith("'<PROMPT>' 'O''Reilly'"))
+
+    def test_powershell_curl_fallback_uses_curl_exe_and_json(self):
+        command = self.bridge._build_skill_curl_cmd(
+            "web-fetch",
+            {"url": "<URL>"},
+            shell="powershell",
+        )
+
+        self.assertIn("ConvertTo-Json -Compress", command)
+        self.assertIn("curl.exe", command)
+        self.assertIn("'url' = '<URL>'", command)
+
+    def test_native_tool_block_does_not_force_codex_back_to_bash(self):
+        instruction = self.bridge._blocked_tool_instruction({"WebFetch", "WebSearch"})
+
+        self.assertIn("Skill: web-search", instruction)
+        self.assertIn("Skill: web-fetch", instruction)
+        self.assertIn("当前 Agent 与操作系统", instruction)
+        self.assertNotIn("用 Bash", instruction)
+
+    def test_loading_session_refreshes_deployed_skill_templates(self):
+        session = type("SessionStub", (), {
+            "id": "session-1",
+            "messages": [],
+            "to_dict": lambda self, message_limit=0: {"id": self.id, "messages": []},
+        })()
+        self.bridge._active_sessions = {"session-1": session}
+        self.bridge._session_store = type("StoreStub", (), {
+            "load": lambda _self, _sid: None,
+        })()
+        refreshed = []
+        self.bridge._sync_backend_skills_to_directory = refreshed.append
+
+        result = self.bridge._rpc_loadSession("session-1", 25)
+
+        self.assertEqual(refreshed, [session])
+        self.assertIn('"id": "session-1"', result)
 
     def test_sync_writes_agent_specific_markdown_to_every_native_root(self):
         class FakeSkillStore:
@@ -131,7 +197,10 @@ class BackendSkillGenerationTests(unittest.TestCase):
         self.bridge._skill_store = FakeSkillStore()
         self.bridge._backend_configs = []
 
-        with tempfile.TemporaryDirectory() as tmp:
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            patch("src.backend.bridge_ws.sys.platform", "win32"),
+        ):
             base = Path(tmp)
             roots = [
                 (agent_name, base / relative_root)
@@ -152,6 +221,13 @@ class BackendSkillGenerationTests(unittest.TestCase):
                 )
                 self.assertIn(expected, markdown)
                 self.assertTrue((skill_dir / "_call.py").exists())
+                if agent_name == "codex":
+                    self.assertIn("```powershell", markdown)
+                    self.assertIn("& $awuPython", markdown)
+                    self.assertNotIn("command -v", markdown)
+                else:
+                    self.assertIn("```bash", markdown)
+                    self.assertIn("command -v", markdown)
 
 
 class TraditionalSkillDeploymentTests(unittest.TestCase):

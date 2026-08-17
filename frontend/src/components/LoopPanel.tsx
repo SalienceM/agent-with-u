@@ -24,11 +24,15 @@ interface LoopStep { index: number; mode: string; access?: 'read' | 'write'; des
 interface LoopAnalysis {
   score: number; notes: string; trend: string;
   optimizationPotential: number; challenges: string;
+  verified: string; gaps: string; nextFocus: string;
   deliverable: boolean; outputtable: boolean;
 }
 interface LoopRecord {
   seq: number; subStage: string; round: number; goal: string; orchestration: LoopStep[];
   kind?: 'agent' | 'manual';
+  iterationMode?: 'baseline' | 'evolution';
+  evolutionBasis?: string;
+  hasEvolutionBasis?: boolean;
   completed: boolean; result: string; analysis: LoopAnalysis | null; error: string;
   subStarted?: Record<string, number>; createdAt?: number; updatedAt?: number;
   hasGitCheckpoint?: boolean;
@@ -88,6 +92,9 @@ function mergeLoopRecordDetail(summary: LoopRecord, detail?: LoopRecord): LoopRe
     notes: detail.analysis.notes || summary.analysis.notes,
     trend: detail.analysis.trend || summary.analysis.trend,
     challenges: detail.analysis.challenges || summary.analysis.challenges,
+    verified: detail.analysis.verified || summary.analysis.verified,
+    gaps: detail.analysis.gaps || summary.analysis.gaps,
+    nextFocus: detail.analysis.nextFocus || summary.analysis.nextFocus,
   } : (summary.analysis || detail.analysis);
   return {
     ...detail,
@@ -95,6 +102,7 @@ function mergeLoopRecordDetail(summary: LoopRecord, detail?: LoopRecord): LoopRe
     result: detail.result || summary.result,
     manualMessages: detail.manualMessages || summary.manualMessages,
     manualContext: detail.manualContext || summary.manualContext,
+    evolutionBasis: detail.evolutionBasis || summary.evolutionBasis,
     analysis,
     orchestration,
     detailLoaded: true,
@@ -1740,7 +1748,20 @@ const LoopDetail: React.FC<{ loop: LoopRecord; progress: Record<string, string>;
         <button onClick={onClose} style={miniX}>✕</button>
       </div>
 
-      <Section title="本遍策略 / 侧重">{loop.goal ? <Md text={loop.goal} /> : '—'}</Section>
+      <Section title="本次增量焦点">
+        <div style={{ display: 'flex', alignItems: 'center', gap: 7, marginBottom: loop.evolutionBasis ? 6 : 0 }}>
+          <Badge text={loop.iterationMode === 'evolution' ? '增量演进' : '基线核实'} color="#2563eb" />
+          <div style={{ flex: 1 }}>{loop.goal ? <Md text={loop.goal} /> : '—'}</div>
+        </div>
+        {loop.evolutionBasis && (
+          <details>
+            <summary style={{ cursor: 'pointer', fontSize: 11, color: 'var(--theme-text-muted)' }}>查看本次冻结的诊断与 Addon</summary>
+            <div style={{ marginTop: 6, padding: '7px 9px', background: 'var(--theme-code-bg)', fontSize: 11 }}>
+              <Md text={loop.evolutionBasis} />
+            </div>
+          </details>
+        )}
+      </Section>
 
       <Section title="编排与分步执行（点步可展开产出）">
         {loop.orchestration.length === 0 ? (livePrep ? <Live text={livePrep} /> : '—') : (
@@ -1764,7 +1785,7 @@ const LoopDetail: React.FC<{ loop: LoopRecord; progress: Record<string, string>;
       </Section>
 
       {loop.analysis ? (
-        <Section title={`Execute Analysis · 分数 ${loop.analysis.score.toFixed(0)}`}
+        <Section title={`累计目标诊断 · 整体分数 ${loop.analysis.score.toFixed(0)}`}
           extra={<BackendTag role="analysis" label={loop.backendLabels?.analysis} />}>
           <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginBottom: 8 }}>
             {loop.analysis.deliverable && <Badge text="可交付" color="#2da44e" />}
@@ -1773,10 +1794,28 @@ const LoopDetail: React.FC<{ loop: LoopRecord; progress: Record<string, string>;
               优化空间 {(loop.analysis.optimizationPotential * 100).toFixed(0)}% · 趋势 {loop.analysis.trend || '—'}
             </span>
           </div>
+          {loop.analysis.verified && (
+            <div style={{ marginBottom: 7, padding: '7px 9px', borderLeft: '3px solid #2da44e', background: '#2da44e0d' }}>
+              <div style={{ fontSize: 11, fontWeight: 700, color: '#2da44e', marginBottom: 3 }}>已核实</div>
+              <Md text={loop.analysis.verified} />
+            </div>
+          )}
+          {loop.analysis.gaps && (
+            <div style={{ marginBottom: 7, padding: '7px 9px', borderLeft: '3px solid #d29922', background: '#d299220d' }}>
+              <div style={{ fontSize: 11, fontWeight: 700, color: '#bf8700', marginBottom: 3 }}>剩余缺口</div>
+              <Md text={loop.analysis.gaps} />
+            </div>
+          )}
+          {loop.analysis.nextFocus && (
+            <div style={{ marginBottom: 7, padding: '7px 9px', borderLeft: '3px solid #2563eb', background: '#2563eb0d' }}>
+              <div style={{ fontSize: 11, fontWeight: 700, color: '#2563eb', marginBottom: 3 }}>下一次优先焦点</div>
+              <Md text={loop.analysis.nextFocus} />
+            </div>
+          )}
           {loop.analysis.notes && <Md text={loop.analysis.notes} />}
           {loop.analysis.challenges && <div style={{ fontSize: 12, color: '#bf8700', marginTop: 6 }}>⚠ 约束：{loop.analysis.challenges}</div>}
         </Section>
-      ) : liveAna ? <Section title="Execute Analysis（进行中）"
+      ) : liveAna ? <Section title="累计目标诊断（进行中）"
           extra={<BackendTag role="analysis" label={loop.backendLabels?.analysis} />}><Live text={liveAna} /></Section> : null}
 
       {loop.error && <Section title="错误"><span style={{ color: '#f87171' }}>{loop.error}</span></Section>}

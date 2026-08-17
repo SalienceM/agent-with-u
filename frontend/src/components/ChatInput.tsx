@@ -7,6 +7,8 @@ import type { TextAttachment, TextAttachmentSource } from '../types/attachments'
 import { SLASH_COMMANDS } from '../hooks/useChat';
 import type { SlashCommand } from '../hooks/useChat';
 import { api, isTauri } from '../api';
+import { RealtimeVoiceBar } from './RealtimeVoiceBar';
+import type { RealtimeVoiceInteractionMode } from '../utils/realtimeVoice';
 import { uuid } from '../utils/uuid';
 import {
   BackendRuntimeFields,
@@ -90,6 +92,25 @@ interface Props {
   execMode?: 'local' | 'relay';
   sessionRuntime?: ModelRuntime;
   onSessionRuntimeChange?: (runtime: ModelRuntime) => Promise<{ status: string; message?: string }>;
+  // 自动实时语音对话占用麦克风/STT 时，关闭这里的单次听写入口。
+  voiceConversationActive?: boolean;
+  realtimeVoice?: {
+    sessionId: string;
+    backendLabel: string;
+    voice: string;
+    rate: number;
+    turnEndSilenceMs?: number;
+    continuousWindowMs?: number;
+    wakeWord?: string;
+    ttsEngine?: 'system' | 'edge' | 'dashscope';
+    systemVoice?: string;
+    dashscopeModel?: string;
+    dashscopeVoice?: string;
+    vadThreshold?: number;
+    bargeIn?: boolean;
+    onSend: (text: string, interactionMode: RealtimeVoiceInteractionMode) => void;
+    onActiveChange?: (active: boolean) => void;
+  };
 }
 
 // ═══════════════════════════════════════
@@ -147,6 +168,8 @@ const ChatInputInner: React.FC<Props> = ({
   isFocused = true,
   sessionRuntime,
   onSessionRuntimeChange,
+  voiceConversationActive = false,
+  realtimeVoice,
 }) => {
   const ref = useRef<HTMLTextAreaElement>(null);
   // 把 textarea ref 传给 useClipboardImage,这样多 pane 场景下只有聚焦
@@ -548,7 +571,7 @@ const ChatInputInner: React.FC<Props> = ({
     micAudioCtxRef.current?.close().catch(() => {});
     micAudioCtxRef.current = null;
     try {
-      const res = await api.sttStreamStop();
+      const res = await api.sttStreamStop(sessionId);
       if (res.ok && res.text && ref.current) {
         applyMicTranscript(res.text);
         if (res.refinedByFlash) {
@@ -571,7 +594,7 @@ const ChatInputInner: React.FC<Props> = ({
     setMicActive(false);
     setMicStatus('idle');
     ref.current?.focus();
-  }, [applyMicTranscript, flushMicWorklet]);
+  }, [applyMicTranscript, flushMicWorklet, sessionId]);
 
   const micStart = useCallback(async () => {
     micStoppedRef.current = false;
@@ -581,7 +604,7 @@ const ChatInputInner: React.FC<Props> = ({
     setMicNotice('');
     let serverStarted = false;
     try {
-      const cfg = await api.getSttConfig();
+      const cfg = await api.getSttConfig(sessionId);
       const deviceId = cfg?.deviceId || '';
 
       let stream: MediaStream;
@@ -608,14 +631,14 @@ const ChatInputInner: React.FC<Props> = ({
       }
       micStreamRef.current = stream;
 
-      const res = await api.sttStreamStart();
+      const res = await api.sttStreamStart(undefined, sessionId);
       if (!res.ok) {
         stream.getTracks().forEach(t => t.stop());
         throw new Error(res.error || 'STT stream start failed');
       }
       serverStarted = true;
       if (micStoppedRef.current) {
-        await api.sttStreamStop().catch(() => {});
+        await api.sttStreamStop(sessionId).catch(() => {});
         stream.getTracks().forEach(t => t.stop());
         return;
       }
@@ -657,7 +680,7 @@ const ChatInputInner: React.FC<Props> = ({
       micStoppedRef.current = true;
       micUnsubRef.current?.();
       micUnsubRef.current = null;
-      if (serverStarted) await api.sttStreamStop().catch(() => {});
+      if (serverStarted) await api.sttStreamStop(sessionId).catch(() => {});
       if (micWorkletRef.current) {
         micWorkletRef.current.port.close();
         micWorkletRef.current.disconnect();
@@ -671,7 +694,7 @@ const ChatInputInner: React.FC<Props> = ({
       setMicStatus('error');
       setMicError(e?.message || '无法启动实时语音识别');
     }
-  }, [applyMicTranscript]);
+  }, [applyMicTranscript, sessionId]);
 
   const toggleMic = useCallback(() => {
     if (micActive) {
@@ -690,7 +713,7 @@ const ChatInputInner: React.FC<Props> = ({
     if (ref.current) micPrefixRef.current = ref.current.value;
     micAttachmentIdRef.current = null;
     try {
-      const res = await api.sttStreamStart();
+      const res = await api.sttStreamStart(undefined, sessionId);
       if (!res.ok) throw new Error(res.error);
       const unsub = api.onSttStreamText((data) => {
         applyMicTranscript(data.text);
@@ -714,7 +737,13 @@ const ChatInputInner: React.FC<Props> = ({
       setMicStatus('error');
       setMicError(e?.message || '实时语音连接已断开');
     }
-  }, [applyMicTranscript]);
+  }, [applyMicTranscript, sessionId]);
+
+  useEffect(() => {
+    if (voiceConversationActive && !micStoppedRef.current) {
+      void micStop();
+    }
+  }, [voiceConversationActive, micStop]);
 
   useEffect(() => {
     const unsub = api.onSttStreamEnd(() => {
@@ -734,10 +763,10 @@ const ChatInputInner: React.FC<Props> = ({
         }
         micStreamRef.current.getTracks().forEach(t => t.stop());
         micAudioCtxRef.current?.close().catch(() => {});
-        void api.sttStreamStop().catch(() => {});
+        void api.sttStreamStop(sessionId).catch(() => {});
       }
     };
-  }, [micReconnect]);
+  }, [micReconnect, sessionId]);
 
   const handleCompact = useCallback(() => {
     // ★ 二次确认：新会话会清空上下文，误触代价很大
@@ -1430,6 +1459,15 @@ const ChatInputInner: React.FC<Props> = ({
             loading={screenshotBusy}
           />
         )}
+        {realtimeVoice && (
+          <RealtimeVoiceBar
+            {...realtimeVoice}
+            isStreaming={isStreaming}
+            isFocused={isFocused}
+            onAbort={onAbort}
+            compact
+          />
+        )}
         {/* ★ 流式进度指示器 */}
         {isStreaming && (
           <div title="模型正在生成；可选择排队、当前轮引导或中断后重引导" style={{
@@ -1648,8 +1686,14 @@ const ChatInputInner: React.FC<Props> = ({
         {isStreaming && <button onClick={onAbort} style={abortBtnStyle} title="停止当前回答">■</button>}
         <button
           onClick={toggleMic}
-          style={micActive ? micRecordingStyle : micBtnStyle}
-          title={micStatus === 'connecting'
+          disabled={voiceConversationActive}
+          style={{
+            ...(micActive ? micRecordingStyle : micBtnStyle),
+            ...(voiceConversationActive ? { opacity: 0.38, cursor: 'not-allowed' } : {}),
+          }}
+          title={voiceConversationActive
+            ? '实时语音对话正在使用麦克风'
+            : micStatus === 'connecting'
             ? '正在连接实时语音识别…'
             : micStatus === 'reconnecting'
               ? '实时语音正在重连…'
@@ -1658,7 +1702,9 @@ const ChatInputInner: React.FC<Props> = ({
                 : micActive
                   ? '停止实时语音输入'
                   : '实时语音输入'}
-          aria-label={micActive ? '停止实时语音输入' : '开始实时语音输入'}
+          aria-label={voiceConversationActive
+            ? '实时语音对话正在使用麦克风'
+            : micActive ? '停止实时语音输入' : '开始实时语音输入'}
         >
           🎙️
         </button>

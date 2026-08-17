@@ -2,6 +2,7 @@ import React, { useState, useCallback, useEffect, useRef, memo, useMemo } from '
 import { markdownToHtml } from '../utils/markdown';
 import { api, loadSkillImageDataUrl } from '../api';
 import type { ChatMessage, ToolCall, ContentBlock, SubagentInfo } from '../hooks/useChat';
+import { shouldKeepChatMessage } from '../utils/chatMessageVisibility';
 import { DiffView, type DiffData } from './DiffView';
 import { TextAttachmentPreview } from './TextAttachmentPreview';
 import {
@@ -1280,6 +1281,10 @@ function MessageBubbleInner({
     )),
     [isUser, orderedTextBlockText, renderMarkdown],
   );
+
+  // 最后一道显示防线：兼容旧版本已经写入的空 Assistant 记录。运行中的
+  // Thinking 占位仍然保留，只有 finalized 且完全无载荷的消息会被隐藏。
+  if (!shouldKeepChatMessage(message)) return null;
 
   return (
     <>

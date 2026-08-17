@@ -108,8 +108,12 @@ class KitOptimizationMessage:
     status: str = "done"
     proposal: Optional[dict] = None
     warnings: list[str] = field(default_factory=list)
+    # 普通 warnings 只提示风险；只有 blocking_issues 才阻止写入版本库。
+    blocking_issues: list[str] = field(default_factory=list)
     questions: list[str] = field(default_factory=list)
     ready: bool = False
+    # 2 表示已按“提示 / 硬阻断”分级校验；旧记录在读取优化历史时重验。
+    readiness_version: int = 0
     base_version_id: str = ""
     finalized_version_id: str = ""
     created_at: float = field(default_factory=_now)
@@ -122,8 +126,10 @@ class KitOptimizationMessage:
             "backendId": self.backend_id,
             "status": self.status,
             "warnings": self.warnings,
+            "blockingIssues": self.blocking_issues,
             "questions": self.questions,
             "ready": self.ready,
+            "readinessVersion": self.readiness_version,
             "baseVersionId": self.base_version_id,
             "finalizedVersionId": self.finalized_version_id,
             "createdAt": self.created_at,
@@ -149,8 +155,12 @@ class KitOptimizationMessage:
             status=status,
             proposal=dict(proposal) if isinstance(proposal, dict) else None,
             warnings=[_safe_text(x, 2_000) for x in (data.get("warnings") or [])][:50],
+            blocking_issues=[
+                _safe_text(x, 2_000) for x in (data.get("blockingIssues") or [])
+            ][:50],
             questions=[_safe_text(x, 2_000) for x in (data.get("questions") or [])][:20],
             ready=bool(data.get("ready", False)),
+            readiness_version=2 if str(data.get("readinessVersion") or "0") == "2" else 0,
             base_version_id=_safe_text(data.get("baseVersionId"), 200),
             finalized_version_id=_safe_text(data.get("finalizedVersionId"), 200),
             created_at=float(data.get("createdAt") or _now()),
@@ -351,6 +361,7 @@ class WorkspaceKit:
 
     def append_version(
         self, source: str, note: str = "", snapshot: Optional[dict] = None,
+        *, activate: bool = True,
     ) -> KitVersion:
         self.ensure_initial_version("legacy")
         highest_minor = 0
@@ -364,7 +375,10 @@ class WorkspaceKit:
             source=source, note=_safe_text(note, 4_000),
         )
         self.versions.append(version)
-        self.active_version_id = version.id
+        # “写入版本库”和“切换当前执行版本”是两个不同动作。优化对话可以
+        # 先保存一份候选，而不打断已启用 Kit / Schedule 正在使用的版本。
+        if activate:
+            self.active_version_id = version.id
         self.updated_at = _now()
         return version
 

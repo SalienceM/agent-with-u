@@ -7,6 +7,7 @@ set "RELAY_TOKEN=CHANGE_ME_TO_A_LONG_RANDOM_TOKEN"
 set "RELAY_BIND=127.0.0.1"
 set "RELAY_PORT=44360"
 set "RELAY_PUBLIC_URL=wss://awu.saliencemc.com/relay"
+set "RELAY_USERS_FILE=%~dp0data\users.json"
 rem ===========================================
 
 if not defined RELAY_TOKEN goto token_error
@@ -27,6 +28,8 @@ echo.
 set "AGENT_WITH_U_RELAY_TOKEN=%RELAY_TOKEN%"
 set "AGENT_WITH_U_RELAY_BIND=%RELAY_BIND%"
 set "AGENT_WITH_U_RELAY_PORT=%RELAY_PORT%"
+if not exist "%~dp0data" mkdir "%~dp0data"
+set "AGENT_WITH_U_RELAY_USERS_FILE=%RELAY_USERS_FILE%"
 "%~dp0agent-with-u-relay.exe"
 set "EXIT_CODE=%ERRORLEVEL%"
 

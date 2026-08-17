@@ -9,6 +9,8 @@ Index kept in ~/.agent-with-u/sessions/index.json for fast listing.
 - Session file writes are still synchronous for data safety
 """
 
+from __future__ import annotations
+
 import json
 import os
 import time
@@ -16,7 +18,9 @@ import threading
 from pathlib import Path
 from typing import Optional
 
-from ..types import Session, ChatMessage, ImageAttachment, TextAttachment, ToolCallInfo
+from ..types import (
+    Session, ChatMessage, ImageAttachment, TextAttachment, ThinkingBlock, ToolCallInfo,
+)
 from . import paths
 
 
@@ -110,6 +114,107 @@ class SessionStore:
             item = self._index.get(sid)
             return dict(item) if item else None
 
+    @staticmethod
+    def _atomic_write_text(path: Path, text: str) -> None:
+        """Write beside the target and replace it so a crash cannot leave half JSON."""
+        import tempfile
+
+        fd, temp_name = tempfile.mkstemp(
+            prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent),
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
+                handle.write(text)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temp_name, path)
+        finally:
+            try:
+                os.unlink(temp_name)
+            except OSError:
+                pass
+
+    def reassign_legacy_sessions(
+        self, session_ids: list[str], target_owner_id: str,
+    ) -> dict:
+        """Atomically claim selected legacy/local Sessions for one stable user.
+
+        Only Sessions whose current owner is ``local`` / ``legacy`` (including
+        files written before ``ownerId`` existed) are eligible. A full archive is
+        written before any mutation.  On an error, both bodies and index are
+        restored from the in-memory originals before the exception escapes.
+        """
+        target = str(target_owner_id or "").strip()
+        if not target or target in {"local", "legacy"}:
+            raise ValueError("A managed Relay userId is required")
+        selected = list(dict.fromkeys(
+            str(session_id or "").strip() for session_id in session_ids
+            if str(session_id or "").strip()
+        ))
+        if not selected:
+            return {"count": 0, "sessionIds": [], "backupPath": ""}
+
+        # Flush the current authoritative index before creating the recovery
+        # archive. Session bodies themselves are always written atomically.
+        self._save_index_sync()
+        with self._lock:
+            index_snapshot = {
+                sid: dict(meta) for sid, meta in self._index.items()
+            }
+
+        original_text: dict[str, str] = {}
+        updated_text: dict[str, str] = {}
+        for sid in selected:
+            meta = index_snapshot.get(sid)
+            if meta is None or str(meta.get("ownerId") or "local") not in {"local", "legacy"}:
+                raise ValueError(f"Session is no longer eligible: {sid}")
+            path = self._session_path(sid)
+            if not path.exists():
+                raise ValueError(f"Session file is missing: {sid}")
+            raw = path.read_text(encoding="utf-8")
+            data = json.loads(raw)
+            if str(data.get("ownerId") or "local") not in {"local", "legacy"}:
+                raise ValueError(f"Session owner changed on disk: {sid}")
+            data["ownerId"] = target
+            original_text[sid] = raw
+            updated_text[sid] = json.dumps(data, ensure_ascii=False, indent=2)
+
+        backup_dir = paths.sub("backups")
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        backup_path = backup_dir / f"sessions-before-owner-claim-{stamp}-{time.time_ns() % 1_000_000:06d}.tar.gz"
+        if not self.export_all(str(backup_path)):
+            raise OSError("Could not create the pre-migration Session backup")
+
+        try:
+            for sid, payload in updated_text.items():
+                self._atomic_write_text(self._session_path(sid), payload)
+            with self._lock:
+                # Revalidate the in-memory index immediately before commit.
+                for sid in selected:
+                    current = self._index.get(sid)
+                    if current is None or str(current.get("ownerId") or "local") not in {"local", "legacy"}:
+                        raise ValueError(f"Session changed during migration: {sid}")
+                for sid in selected:
+                    self._index[sid] = {**self._index[sid], "ownerId": target}
+            self._save_index_sync()
+        except Exception:
+            for sid, payload in original_text.items():
+                try:
+                    self._atomic_write_text(self._session_path(sid), payload)
+                except Exception:
+                    pass
+            with self._lock:
+                self._index = index_snapshot
+            self._save_index_sync()
+            raise
+
+        return {
+            "count": len(selected),
+            "sessionIds": selected,
+            "backupPath": str(backup_path),
+        }
+
     def update_meta(self, session: Session) -> None:
         """立即更新会话列表使用的内存索引，不等待后台磁盘 I/O。"""
         meta = session.meta_dict()
@@ -167,7 +272,14 @@ class SessionStore:
                 tool_calls = None
                 if m.get("toolCalls"):
                     tool_calls = [ToolCallInfo(**tc) for tc in m["toolCalls"]]
-                messages.append(ChatMessage(
+                thinking_blocks = None
+                if m.get("thinkingBlocks"):
+                    thinking_blocks = [
+                        ThinkingBlock(content=str(block.get("content") or ""))
+                        for block in m["thinkingBlocks"]
+                        if isinstance(block, dict)
+                    ]
+                message = ChatMessage(
                     id=m["id"],
                     role=m["role"],
                     content=m["content"],
@@ -177,13 +289,19 @@ class SessionStore:
                     backend_id=m.get("backendId"),
                     usage=m.get("usage"),
                     tool_calls=tool_calls,
+                    thinking_blocks=thinking_blocks,
                     streaming=False,
                     delivery_mode=(
                         m.get("deliveryMode")
                         if m.get("deliveryMode") in {"steer", "redirect"}
                         else None
                     ),
-                ))
+                )
+                # 旧版本会把中断/异常轮次保存成完全空的 Assistant。加载时迁移掉，
+                # 避免它们继续参与历史、分页和模型上下文；工具型/思考型回复保留。
+                if message.role == "assistant" and not message.has_visible_payload():
+                    continue
+                messages.append(message)
             return Session(
                 id=data["id"],
                 title=data["title"],
@@ -191,6 +309,7 @@ class SessionStore:
                 updated_at=data["updatedAt"],
                 messages=messages,
                 backend_id=data["backendId"],
+                owner_id=str(data.get("ownerId") or "local"),
                 model_override=data.get("modelOverride"),
                 reasoning_effort=data.get("reasoningEffort"),
                 agent_session_id=data.get("agentSessionId"),
@@ -201,7 +320,9 @@ class SessionStore:
                     "codexThreadAttached", data.get("codexConnectionMode") == "node",
                 )),
                 codex_sync_last_item_id=data.get("codexSyncLastItemId"),
-                codex_sync_local_count=max(0, int(data.get("codexSyncLocalCount") or 0)),
+                codex_sync_local_count=min(
+                    len(messages), max(0, int(data.get("codexSyncLocalCount") or 0)),
+                ),
                 working_dir=data.get("workingDir"),
                 auto_continue=data.get("autoContinue", True),
                 skip_permissions=data.get("skipPermissions", True),

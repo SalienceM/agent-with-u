@@ -13,6 +13,10 @@ import type {
   WorkspaceKitState, WorkspaceKit, KitRun, KitGenerationRequest, KitGenerationResult,
   KitVersion, KitOptimizationMessage,
 } from './types/workspaceKits';
+import type {
+  ProvDocument, ProvOpenResult, ProvResolveResult, ProvSaveResult,
+} from './types/prov';
+import { filterGitMetadata } from './utils/dirSyncPolicy';
 
 type StreamDeltaCallback = (delta: any) => void;
 type SessionUpdateCallback = (data: any) => void;
@@ -39,6 +43,8 @@ export interface FollowUpResult {
 /** 已连接到本执行节点的一个 UI 客户端的展示信息。 */
 export interface ConnectedClient {
   identity: string;       // Remote-User / token:xxx / "local" / "relay"
+  username?: string;
+  display_name?: string;
   identity_src: string;   // "loopback" | "forward-auth" | "token" | "relay" | "none"
   peer: string;           // "ip:port"，可能为空字符串
   via: 'local' | 'relay'; // 直连本机 sidecar，还是经中继来
@@ -69,6 +75,7 @@ const WS_PORT_DEFAULT = Number.isInteger(configuredWsPort) && configuredWsPort >
   : 44321;
 const WS_CONNECT_TIMEOUT_MS = 3000;
 const LIST_SESSIONS_TIMEOUT_MS = 3000;
+const SYNC_MANIFEST_TIMEOUT_MS = 180_000;
 
 let useMock = false;
 
@@ -85,6 +92,27 @@ let clientsChangedCallbacks: ClientsChangedCallback[] = [];
 
 type SttStreamTextCallback = (data: { text: string; isFinal: boolean }) => void;
 let sttStreamCallbacks: SttStreamTextCallback[] = [];
+
+export interface TtsStreamAudioEvent {
+  streamId: string;
+  seq: number;
+  audioSeq?: number;
+  kind?: 'audio' | 'finished' | 'error';
+  engine?: 'edge' | 'dashscope';
+  ok: boolean;
+  mime?: string;
+  encoding?: 'pcm_s16le';
+  sampleRate?: number;
+  channels?: number;
+  base64?: string;
+  voice?: string;
+  model?: string;
+  rate?: number;
+  elapsedMs?: number;
+  error?: string;
+}
+type TtsStreamAudioCallback = (data: TtsStreamAudioEvent) => void;
+let ttsStreamAudioCallbacks: TtsStreamAudioCallback[] = [];
 
 // ── 可视化 Loop 集成 ──────────────────────────────────────────
 type LoopUpdatedCallback = (state: any) => void;
@@ -106,6 +134,9 @@ let kitUpdatedCallbacks: KitUpdatedCallback[] = [];
 
 type SttStreamEndCallback = (data: { reason: string }) => void;
 let sttStreamEndCallbacks: SttStreamEndCallback[] = [];
+// 当前浏览器麦克风绑定的执行节点。普通语音输入默认走 home；传入 Session
+// 后则跟随 Session，避免远程 Session 的音频误送到另一个 backend 进程。
+let sttStreamExecKey: string | undefined;
 
 // ── Git commit message 流式事件 ───────────────────────────────────
 type GitCommitMsgDeltaCallback = (data: { workingDir: string; text: string }) => void;
@@ -171,9 +202,26 @@ async function getWsPort(): Promise<number> {
 }
 
 // ── 连接目标（C–C/S）：本地直连，或经中继 S 访问远程执行节点 ──────────
+export interface RelayUserProfile {
+  userId: string;
+  username: string;
+  displayName: string;
+  avatarData: string;
+  avatarColor: string;
+  /** false = 兼容旧版单 token Relay，档案不可编辑。 */
+  managed: boolean;
+}
+
 export type ConnectionTarget =
   | { mode: 'local' }
-  | { mode: 'relay'; url: string; token: string; deviceId: string; deviceName?: string };
+  | {
+      mode: 'relay';
+      url: string;
+      token: string;
+      deviceId: string;
+      deviceName?: string;
+      user?: RelayUserProfile;
+    };
 
 const CONN_TARGET_KEY = 'awu.connectionTarget';
 
@@ -194,6 +242,40 @@ export function getConnectionTarget(): ConnectionTarget {
   return connectionTarget;
 }
 
+export type CurrentUserProfile = RelayUserProfile & { mode: 'local' | 'relay' };
+type CurrentUserCallback = (profile: CurrentUserProfile, identityChanged: boolean) => void;
+let currentUserCallbacks: CurrentUserCallback[] = [];
+
+export function getCurrentUserProfile(): CurrentUserProfile {
+  if (connectionTarget.mode === 'relay') {
+    return {
+      ...normalizeRelayProfile(connectionTarget.user),
+      mode: 'relay',
+    };
+  }
+  return {
+    mode: 'local',
+    userId: 'local',
+    username: 'local',
+    displayName: '本机用户',
+    avatarData: '',
+    avatarColor: '#64748b',
+    managed: false,
+  };
+}
+
+export function onCurrentUserChanged(callback: CurrentUserCallback): () => void {
+  currentUserCallbacks.push(callback);
+  return () => {
+    currentUserCallbacks = currentUserCallbacks.filter((item) => item !== callback);
+  };
+}
+
+function notifyCurrentUserChanged(identityChanged: boolean): void {
+  const profile = getCurrentUserProfile();
+  currentUserCallbacks.forEach((callback) => callback(profile, identityChanged));
+}
+
 // ── 执行节点（session 级模式管理）─────────────────────────────────────
 // 一个执行节点就是一个连接目标(ExecTarget == ConnectionTarget)。home 节点由
 // connectionTarget 决定(本机 / 某中继);额外节点存在 execRoster 里。每个 session
@@ -202,17 +284,36 @@ export type ExecTarget = ConnectionTarget;
 
 /** 供 UI 展示的执行节点摘要。 */
 export interface ExecutorInfo {
-  key: string;          // 稳定键:'local' | `relay:<deviceId>`
+  key: string;          // 稳定键:'local' | `relay:<userId>:<deviceId>`
   label: string;        // 人类可读名
   mode: 'local' | 'relay';
   isHome: boolean;      // 是否为当前 home(新建会话的默认落点)
   connected: boolean;   // 连接是否在线
 }
 
-/** 临时连一次中继、拉取在线执行节点列表，然后关闭。 */
-export function listRelayDevices(
-  url: string, token: string,
-): Promise<{ id: string; name: string }[]> {
+interface RelayInspection {
+  devices: { id: string; name: string; isDefaultOwner?: boolean }[];
+  profile: RelayUserProfile;
+}
+
+function normalizeRelayProfile(value: any): RelayUserProfile {
+  return {
+    userId: String(value?.userId || 'legacy'),
+    username: String(value?.username || 'relay'),
+    displayName: String(value?.displayName || value?.username || 'Relay user'),
+    avatarData: String(value?.avatarData || ''),
+    avatarColor: /^#[0-9a-f]{6}$/i.test(String(value?.avatarColor || ''))
+      ? String(value.avatarColor).toLowerCase()
+      : '#64748b',
+    managed: !!value && value.managed !== false,
+  };
+}
+
+function relayControlRequest<T>(
+  url: string,
+  request: Record<string, unknown>,
+  accept: (message: any) => T | undefined,
+): Promise<T> {
   return new Promise((resolve, reject) => {
     let done = false;
     let sock: WebSocket;
@@ -227,20 +328,67 @@ export function listRelayDevices(
       () => finish(() => { try { sock.close(); } catch { /* */ } reject(new Error('连接中继超时')); }),
       8000,
     );
-    sock.onopen = () => { try { sock.send(JSON.stringify({ t: 'list', token })); } catch { /* */ } };
-    sock.onmessage = (e) => {
+    sock.onopen = () => { try { sock.send(JSON.stringify(request)); } catch { /* */ } };
+    sock.onmessage = (event) => {
       try {
-        const m = JSON.parse(e.data as string);
-        if (m.t === 'devices') {
-          finish(() => { clearTimeout(timer); try { sock.close(); } catch { /* */ } resolve(m.devices || []); });
-        } else if (m.t === 'error') {
-          finish(() => { clearTimeout(timer); try { sock.close(); } catch { /* */ } reject(new Error(m.message || '中继拒绝')); });
+        const message = JSON.parse(event.data as string);
+        if (message.t === 'error') {
+          finish(() => {
+            clearTimeout(timer);
+            try { sock.close(); } catch { /* */ }
+            reject(new Error(message.message || '中继拒绝'));
+          });
+          return;
+        }
+        const result = accept(message);
+        if (result !== undefined) {
+          finish(() => {
+            clearTimeout(timer);
+            try { sock.close(); } catch { /* */ }
+            resolve(result);
+          });
         }
       } catch { /* ignore */ }
     };
     sock.onerror = () => finish(() => { clearTimeout(timer); reject(new Error('无法连接中继')); });
     sock.onclose = () => finish(() => { clearTimeout(timer); reject(new Error('中继连接已关闭')); });
   });
+}
+
+/** 验证用户 token，并只拉取该用户获授权的在线执行节点。 */
+export function inspectRelay(
+  url: string, token: string,
+): Promise<RelayInspection> {
+  return relayControlRequest(url, { t: 'list', token }, (message) => {
+    if (message.t !== 'devices') return undefined;
+    return {
+      devices: Array.isArray(message.devices) ? message.devices : [],
+      profile: normalizeRelayProfile(message.profile),
+    };
+  });
+}
+
+/** 向后兼容的设备列表帮助函数。 */
+export async function listRelayDevices(
+  url: string, token: string,
+): Promise<{ id: string; name: string; isDefaultOwner?: boolean }[]> {
+  return (await inspectRelay(url, token)).devices;
+}
+
+export function getRelayUserProfile(url: string, token: string): Promise<RelayUserProfile> {
+  return relayControlRequest(url, { t: 'profile', token }, (message) => (
+    message.t === 'profile' ? normalizeRelayProfile(message.profile) : undefined
+  ));
+}
+
+export function updateRelayUserProfile(
+  url: string,
+  token: string,
+  patch: Pick<RelayUserProfile, 'username' | 'displayName' | 'avatarData' | 'avatarColor'>,
+): Promise<RelayUserProfile> {
+  return relayControlRequest(url, { t: 'profile.update', token, profile: patch }, (message) => (
+    message.t === 'profile.updated' ? normalizeRelayProfile(message.profile) : undefined
+  ));
 }
 
 /**
@@ -286,6 +434,25 @@ const pendingConn = new Map<string, string>();
 // 避免整个 session 分组忽隐忽现。
 const sessionListCache = new Map<string, any[]>();
 let listSessionsInFlight: Promise<any[]> | null = null;
+let relayIdentityEpoch = 0;
+const SESSION_LIST_CACHE_KEY = 'awu.sessionListCache.v1';
+
+function loadSessionListCache(): void {
+  try {
+    const raw = localStorage.getItem(SESSION_LIST_CACHE_KEY);
+    const parsed = raw ? JSON.parse(raw) : null;
+    if (!parsed || typeof parsed !== 'object') return;
+    for (const [key, value] of Object.entries(parsed)) {
+      if (Array.isArray(value)) sessionListCache.set(key, value);
+    }
+  } catch { /* 离线缓存损坏时忽略，在线后会自动重建。 */ }
+}
+
+function persistSessionListCache(): void {
+  try {
+    localStorage.setItem(SESSION_LIST_CACHE_KEY, JSON.stringify(Object.fromEntries(sessionListCache)));
+  } catch { /* 配额不足不影响在线功能。 */ }
+}
 
 function handleMessage(e: MessageEvent, source?: Conn) {
   if (typeof e.data !== 'string') return;
@@ -339,6 +506,7 @@ function handleMessage(e: MessageEvent, source?: Conn) {
             item?.id === sessionId ? { ...item, title: data.title || item.title } : item
           )));
         }
+        persistSessionListCache();
       }
       sessionUpdateCallbacks.forEach((cb) => cb(data));
     } else if (msg.event === 'permissionRequest') {
@@ -376,7 +544,11 @@ function handleMessage(e: MessageEvent, source?: Conn) {
       sttStreamCallbacks.forEach((cb) => cb(data));
     } else if (msg.event === 'sttStreamEnd') {
       const data = JSON.parse(msg.data);
+      sttStreamExecKey = undefined;
       sttStreamEndCallbacks.forEach((cb) => cb(data));
+    } else if (msg.event === 'ttsStreamAudio') {
+      const data: TtsStreamAudioEvent = JSON.parse(msg.data);
+      ttsStreamAudioCallbacks.forEach((cb) => cb(data));
     } else if (msg.event === 'gitCommitMsgDelta') {
       const data = JSON.parse(msg.data);
       gitCommitMsgDeltaCallbacks.forEach((cb) => cb(data));
@@ -400,14 +572,14 @@ function handleMessage(e: MessageEvent, source?: Conn) {
 //    · home 节点 = connectionTarget（本机 / 某中继节点）：新建会话的默认落点,
 //      也是 App 启动时判定「后端是否就绪」的那条连接(行为保持不变)。
 //    · 额外节点 = execRoster（用户额外加入的中继节点）,与 home 同时在线。
-//  每条连接 = 一个 Conn;session→节点的归属记在 sessionExec 里,按 sessionId 把
-//  RPC 路由到对应连接。会话物理上就存在于它所在的节点——「它从哪条连接列出来」
-//  即它的归属,所以后端无需任何改动。roster 为空时只有一条 home 连接,完全等价
-//  于改造前的单连接行为(向后兼容)。
+//  每条连接 = 一个 Conn;session→节点的执行位置记在 sessionExec 里,按 sessionId
+//  路由。执行位置与可视用户是两层边界：Backend 仍会按 Session.ownerId 鉴权。
+//  一个窗口只能连接 local，或同一 Relay 用户获授权的若干节点，不能混合身份。
 // ═══════════════════════════════════════════════════════════════════
 
 function execTargetKey(t: ExecTarget): string {
-  return t.mode === 'local' ? 'local' : `relay:${t.deviceId}`;
+  if (t.mode === 'local') return 'local';
+  return `relay:${t.user?.userId || 'legacy'}:${t.deviceId}`;
 }
 
 function execLabelOf(t: ExecTarget): string {
@@ -544,6 +716,7 @@ class Conn {
     };
 
     socket.onmessage = (e) => {
+      if (this.disposed || (wasCurrent && this.ws !== socket)) return;
       if (relayHandshake) {
         if (typeof e.data !== 'string') return;
         try {
@@ -662,6 +835,54 @@ function saveExecRoster(list: ExecTarget[]): void {
   try { localStorage.setItem(EXEC_ROSTER_KEY, JSON.stringify(list)); } catch { /* */ }
 }
 
+function relayIdentity(target: ExecTarget | null | undefined): string {
+  if (!target || target.mode !== 'relay') return '';
+  const userId = target.user?.userId;
+  return userId && userId !== 'legacy'
+    ? `user:${userId}`
+    : `legacy:${target.url}\u0000${target.token}`;
+}
+
+function currentRelayIdentity(): string {
+  if (connectionTarget.mode === 'relay') return relayIdentity(connectionTarget);
+  return '';
+}
+
+function targetUserIdentity(target: ConnectionTarget): string {
+  return target.mode === 'local' ? 'local' : relayIdentity(target);
+}
+
+function clearRelaySessionCaches(): void {
+  for (const key of [...sessionListCache.keys()]) {
+    if (key.startsWith('relay:')) sessionListCache.delete(key);
+  }
+  for (const [sessionId, key] of [...sessionExec.entries()]) {
+    if (String(key).startsWith('relay:')) sessionExec.delete(sessionId);
+  }
+  persistSessionListCache();
+  persistSessionExec();
+}
+
+/** 身份切换是安全边界：旧用户的全部连接、路由与离线 Session 缓存都丢弃。 */
+function clearRelayIdentityState(): void {
+  relayIdentityEpoch += 1;
+  listSessionsInFlight = null;
+  for (const [key, connection] of [...pool.entries()]) {
+    pool.delete(key);
+    connection.dispose();
+  }
+  saveExecRoster([]);
+  sessionListCache.clear();
+  sessionExec.clear();
+  persistSessionListCache();
+  persistSessionExec();
+}
+
+function relayTransportChanged(left: ExecTarget, right: ExecTarget): boolean {
+  return left.mode === 'relay' && right.mode === 'relay'
+    && (left.url !== right.url || left.token !== right.token || left.deviceId !== right.deviceId);
+}
+
 function ensureConn(target: ExecTarget, isHome: boolean): Conn {
   const key = execTargetKey(target);
   let c = pool.get(key);
@@ -669,27 +890,52 @@ function ensureConn(target: ExecTarget, isHome: boolean): Conn {
     c = new Conn(key, target, isHome);
     pool.set(key, c);
     c.connect();
-  } else if (isHome) {
-    c.isHome = true;
+  } else if (relayTransportChanged(c.target, target)) {
+    const wasHome = c.isHome || isHome;
+    c.dispose();
+    c = new Conn(key, target, wasHome);
+    pool.set(key, c);
+    c.connect();
+  } else {
+    if (isHome) c.isHome = true;
     c.target = target;
   }
   return c;
 }
 
 function initPool(): void {
+  loadSessionListCache();
   loadSessionExec();
   homeConn = ensureConn(connectionTarget, true);
-  // 本机始终作为一个可选执行节点存在(默认是远端时也能在新建会话里选回本机)。
-  if (homeConn.key !== 'local') ensureConn({ mode: 'local' }, false);
-  for (const t of loadExecRoster()) {
+  const homeIdentity = relayIdentity(connectionTarget);
+  const storedRoster = loadExecRoster();
+  // 一个窗口只承载一个当前用户。local 与 Relay、不同 Relay 用户都不能
+  // 同时进入连接池；同一 Relay 用户仍可连接多台获授权执行端。
+  const safeRoster = homeIdentity
+    ? storedRoster.filter((target) => relayIdentity(target) === homeIdentity)
+    : [];
+  if (safeRoster.length !== storedRoster.length) {
+    saveExecRoster(safeRoster);
+    clearRelaySessionCaches();
+  }
+  for (const t of safeRoster) {
     if (execTargetKey(t) !== homeConn.key) ensureConn(t, false);
   }
+  for (const key of [...sessionListCache.keys()]) {
+    if (!pool.has(key)) sessionListCache.delete(key);
+  }
+  for (const [sessionId, key] of [...sessionExec.entries()]) {
+    if (!pool.has(key)) sessionExec.delete(sessionId);
+  }
+  persistSessionListCache();
+  persistSessionExec();
 }
 
 // 大多数会话级 RPC 第一个参数就是 sessionId;少数把 sessionId 藏在 JSON 载荷里。
 const JSON_SESSION_METHODS: Record<string, string> = {
   sendMessage: 'sessionId',
   executeCommand: 'sessionId',
+  branchSession: 'sourceSessionId',
   migrateSession: 'sourceSessionId',
 };
 function extractSessionId(method: string, params: any[]): string | null {
@@ -717,16 +963,28 @@ function routeConn(method: string, params: any[]): Conn {
 
 /** 切换 home 执行节点（本地直连 / 中继远程），持久化并立即重连。 */
 export async function setConnectionTarget(t: ConnectionTarget): Promise<void> {
+  const oldHome = homeConn;
+  const previousIdentity = targetUserIdentity(connectionTarget);
+  const nextIdentity = targetUserIdentity(t);
+  const identityChanged = previousIdentity !== nextIdentity;
+  if (identityChanged) clearRelayIdentityState();
   connectionTarget = t;
   try { localStorage.setItem(CONN_TARGET_KEY, JSON.stringify(t)); } catch { /* */ }
   const newKey = execTargetKey(t);
   if (homeConn && homeConn.key === newKey) {
-    homeConn.isHome = true;
-    homeConn.target = t;
+    if (relayTransportChanged(homeConn.target, t)) {
+      homeConn.dispose();
+      homeConn = new Conn(newKey, t, true);
+      pool.set(newKey, homeConn);
+      homeConn.connect();
+    } else {
+      homeConn.isHome = true;
+      homeConn.target = t;
+    }
     connectionStatusCallbacks.forEach((cb) => cb(homeConn.isOpen));
+    notifyCurrentUserChanged(identityChanged);
     return;
   }
-  const oldHome = homeConn;
   let next = pool.get(newKey);
   if (!next) {
     next = new Conn(newKey, t, true);
@@ -737,18 +995,53 @@ export async function setConnectionTarget(t: ConnectionTarget): Promise<void> {
     next.target = t;
   }
   homeConn = next;
-  if (oldHome && oldHome.key !== newKey) {
+  if (oldHome && oldHome.key !== newKey && pool.get(oldHome.key) === oldHome) {
     oldHome.isHome = false;
-    // 切换「默认节点」不再是破坏性动作:旧默认保留为普通可分配节点(继续在线、
-    // 仍可在新建会话里选)。远端的话并入 roster,刷新后依旧在。本机始终保留。
-    if (oldHome.target.mode === 'relay') {
+    // 同一 Relay 用户切换默认设备时，旧设备保留为可分配节点；跨用户切换
+    // 已在上方清空连接池，因此不会把旧身份带进新窗口。
+    if (oldHome.target.mode === 'relay' && (!nextIdentity || relayIdentity(oldHome.target) === nextIdentity)) {
       const list = loadExecRoster();
       if (!list.some((rt) => execTargetKey(rt) === oldHome.key)) { list.push(oldHome.target); saveExecRoster(list); }
     }
   }
-  // 本机始终作为可选执行节点存在。
-  if (newKey !== 'local' && !pool.has('local')) ensureConn({ mode: 'local' }, false);
   connectionStatusCallbacks.forEach((cb) => cb(homeConn.isOpen));
+  notifyExecStatus();
+  notifyCurrentUserChanged(identityChanged || (
+    (oldHome?.target.mode || 'local') !== t.mode
+  ));
+}
+
+/** 档案更新不改变 userId；同步更新本地展示缓存，不重建 WebSocket。 */
+export function rememberRelayUserProfile(profile: RelayUserProfile): void {
+  if (connectionTarget.mode !== 'relay') return;
+  const currentId = connectionTarget.user?.userId;
+  if (currentId && currentId !== profile.userId) return;
+  const updatedTarget: ConnectionTarget = { ...connectionTarget, user: profile };
+  if (execTargetKey(updatedTarget) !== execTargetKey(connectionTarget)) {
+    void setConnectionTarget(updatedTarget);
+    return;
+  }
+  const url = connectionTarget.url;
+  const token = connectionTarget.token;
+  connectionTarget = updatedTarget;
+  try { localStorage.setItem(CONN_TARGET_KEY, JSON.stringify(connectionTarget)); } catch { /* */ }
+  if (homeConn?.target.mode === 'relay'
+      && homeConn.target.url === url && homeConn.target.token === token) {
+    homeConn.target = { ...homeConn.target, user: profile };
+  }
+  const roster = loadExecRoster().map((target) => (
+    target.mode === 'relay' && target.url === url && target.token === token
+      ? { ...target, user: profile }
+      : target
+  ));
+  saveExecRoster(roster);
+  for (const connection of pool.values()) {
+    if (connection.target.mode === 'relay'
+        && connection.target.url === url && connection.target.token === token) {
+      connection.target = { ...connection.target, user: profile };
+    }
+  }
+  notifyCurrentUserChanged(false);
   notifyExecStatus();
 }
 
@@ -763,10 +1056,6 @@ export function getExecutors(): ExecutorInfo[] {
     out.push({ key: c.key, label: c.label, mode: c.target.mode, isHome: c.isHome, connected: c.isOpen });
   };
   for (const c of pool.values()) push(c);
-  // 本机始终可见(即便当前没连上,比如桌面纯客户端角色)。
-  if (!seen.has('local')) {
-    out.push({ key: 'local', label: execLabelOf({ mode: 'local' }), mode: 'local', isHome: false, connected: false });
-  }
   out.sort((a, b) => {
     if (a.key === 'local') return -1;
     if (b.key === 'local') return 1;
@@ -785,13 +1074,27 @@ export function getExecTarget(key: string): ExecTarget | null {
 }
 
 /** 添加一个远端中继执行节点（与本机/默认同时在线，可在新建会话时选）。 */
-export function addExecRoster(t: ExecTarget): void {
-  if (t.mode !== 'relay') return;
+export function addExecRoster(t: ExecTarget): boolean {
+  if (t.mode !== 'relay') return false;
+  if (connectionTarget.mode !== 'relay') return false;
+  const activeIdentity = currentRelayIdentity();
+  const incomingIdentity = relayIdentity(t);
+  // roster 不能混入另一名用户；身份切换必须走 setConnectionTarget，确保旧状态
+  // 清理和新的 home 连接是同一原子流程。
+  if (activeIdentity && activeIdentity !== incomingIdentity) {
+    const sameCredentialLegacy = activeIdentity === `legacy:${t.url}\u0000${t.token}`;
+    if (!sameCredentialLegacy) return false;
+    clearRelayIdentityState();
+  }
   const key = execTargetKey(t);
   const list = loadExecRoster();
-  if (!list.some((x) => execTargetKey(x) === key)) { list.push(t); saveExecRoster(list); }
+  const index = list.findIndex((x) => execTargetKey(x) === key);
+  if (index < 0) list.push(t);
+  else list[index] = t;
+  saveExecRoster(list);
   ensureConn(t, false);
   notifyExecStatus();
+  return true;
 }
 
 /** 移除一个远端节点。本机与当前默认节点不可移除。 */
@@ -878,6 +1181,29 @@ async function callOn(execKey: string | undefined, method: string, ...params: an
   }
 }
 
+/** 和 callOn 相同，但保留异常给长任务调用者做“离线 / 断线 / 超时”分类。 */
+async function callOnStrict(
+  execKey: string | undefined,
+  method: string,
+  params: any[],
+  timeoutMs?: number,
+): Promise<any> {
+  await homeConn.ready;
+  const connection = connByKey(execKey);
+  if (!connection.isOpen) {
+    throw new Error('执行端离线，请恢复连接后重试');
+  }
+  return connection.request(method, params, timeoutMs);
+}
+
+function syncManifestError(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error || '');
+  if (/timeout/i.test(message)) return '扫描超时（3 分钟），目录可能过大；可缩小范围或检查执行端磁盘状态';
+  if (/connection lost|closed|websocket/i.test(message)) return '比对过程中连接中断，请恢复连接后重试';
+  if (/offline|离线/i.test(message)) return '执行端离线，请恢复连接后重试';
+  return message || '执行端未返回文件清单';
+}
+
 function parseRpcObject<T extends Record<string, any>>(result: any, fallback: T): T {
   if (result === null || result === undefined || result === '') return fallback;
   try {
@@ -906,6 +1232,23 @@ function attachSessionExecutor<T extends Record<string, any> | null>(session: T)
     session.execIsHome = connection.isHome;
   }
   return session;
+}
+
+function cachedSessionMeta(id: string): any | null {
+  for (const [key, list] of sessionListCache) {
+    const summary = list.find((item) => item?.id === id);
+    if (!summary) continue;
+    const connection = pool.get(key);
+    return {
+      ...summary,
+      execKey: connection?.key || key,
+      execLabel: connection?.label || summary.execLabel,
+      execMode: connection?.target.mode || summary.execMode,
+      execIsHome: connection?.isHome ?? summary.execIsHome,
+      offlineCached: true,
+    };
+  }
+  return null;
 }
 
 // ── 对话框（Tauri plugin-dialog）────────────────────────────
@@ -1100,25 +1443,33 @@ export const api = {
     // App 与 Sidebar 在启动时可能同时请求；共享同一轮多节点 RPC，避免双发。
     if (listSessionsInFlight) return listSessionsInFlight;
     const request = (async (): Promise<any[]> => {
+    const requestEpoch = relayIdentityEpoch;
     // 所有已配置节点都参与合并；离线节点直接使用最后一次成功结果。
     // 在线但连接假死的节点最多等待 3 秒，不能无限拖住整条侧栏。
     const conns = Array.from(pool.values());
     const results = await Promise.all(conns.map(async (c) => {
-      if (!c.isOpen) return { c, list: sessionListCache.get(c.key) || [] };
+      if (!c.isOpen) return {
+        c, list: sessionListCache.get(c.key) || [], stale: requestEpoch !== relayIdentityEpoch,
+      };
       try {
         const r = await c.request('listSessions', [], LIST_SESSIONS_TIMEOUT_MS);
+        if (requestEpoch !== relayIdentityEpoch || pool.get(c.key) !== c) {
+          return { c, list: [], stale: true };
+        }
         if (typeof r !== 'string') throw new Error('invalid listSessions response');
         const list = JSON.parse(r) || [];
         const normalized = Array.isArray(list) ? list : [];
         sessionListCache.set(c.key, normalized);
-        return { c, list: normalized };
+        persistSessionListCache();
+        return { c, list: normalized, stale: false };
       } catch (error) {
         console.warn(`[api] listSessions failed (${c.key}), using cache`, error);
-        return { c, list: sessionListCache.get(c.key) || [] };
+        return { c, list: sessionListCache.get(c.key) || [], stale: requestEpoch !== relayIdentityEpoch };
       }
     }));
     const merged: any[] = [];
-    for (const { c, list } of results) {
+    for (const { c, list, stale } of results) {
+      if (stale || requestEpoch !== relayIdentityEpoch || pool.get(c.key) !== c) continue;
       // 等待其它节点期间可能收到更新事件；事件已把 cache 推到更新版本，
       // 因此合并时再次取 cache，不能使用本轮早先捕获的旧数组。
       const latestList = sessionListCache.get(c.key) || list;
@@ -1140,6 +1491,46 @@ export const api = {
     }
   },
 
+  async legacySessionOwnershipPreview(): Promise<{
+    status: string;
+    targetOwnerId?: string;
+    eligibleCount?: number;
+    busyCount?: number;
+    items?: Array<{
+      id: string;
+      title: string;
+      updatedAt: number;
+      workingDir: string;
+      sessionType: string;
+      messageCount: number;
+      busyReason: string;
+    }>;
+    message?: string;
+  }> {
+    const result = await call('legacySessionOwnershipPreview');
+    if (result === null || result === undefined) {
+      throw new Error('无法连接到 Session 执行端');
+    }
+    return JSON.parse(result);
+  },
+
+  async claimLegacySessions(sessionIds: string[]): Promise<{
+    status: string;
+    targetOwnerId?: string;
+    count?: number;
+    sessionIds?: string[];
+    backupPath?: string;
+    message?: string;
+  }> {
+    const result = await call(
+      'claimLegacySessions', JSON.stringify(sessionIds), 'CLAIM_LOCAL_SESSIONS',
+    );
+    if (result === null || result === undefined) {
+      throw new Error('无法连接到 Session 执行端');
+    }
+    return JSON.parse(result);
+  },
+
   /**
    * 加载 session。limit 可选:
    *   - undefined / 0: 返回全部消息(向后兼容,小 session OK,大 session 经中继会卡)
@@ -1158,8 +1549,14 @@ export const api = {
 
   /** 只拉 index 元数据，不读取消息正文或 LOOP stage；用于 pane 首屏路由。 */
   async loadSessionMeta(id: string): Promise<any | null> {
+    const cached = cachedSessionMeta(id);
+    // 冷启动离线时不能等待 WebSocket 超时后才让平板进入文件副本。
+    if (!routeConn('loadSessionMeta', [id]).isOpen && cached) return cached;
     const result = await call('loadSessionMeta', id);
-    try { return attachSessionExecutor(JSON.parse(result)); } catch { return null; }
+    try {
+      const parsed = attachSessionExecutor(JSON.parse(result));
+      return parsed || cached;
+    } catch { return cached; }
   },
 
   /** 翻页加载 session 的更老消息。等价于 messages[offset : offset+limit]。 */
@@ -1591,10 +1988,12 @@ export const api = {
       status: 'error', message: '执行端未响应 Kit 优化接口，请更新并重启该 Session 所属执行端',
     });
   },
-  async kitOptimizeFinalize(sessionId: string, kitId: string, messageId: string, note = ''): Promise<{
+  async kitOptimizeFinalize(
+    sessionId: string, kitId: string, messageId: string, note = '', activate = true,
+  ): Promise<{
     status: string; version?: KitVersion; kit?: WorkspaceKit; message?: string;
   }> {
-    const result = await call('kitOptimizeFinalize', sessionId, kitId, messageId, note);
+    const result = await call('kitOptimizeFinalize', sessionId, kitId, messageId, note, activate);
     return parseRpcObject(result, {
       status: 'error', message: '执行端未响应 Kit 优化接口，请更新并重启该 Session 所属执行端',
     });
@@ -1607,9 +2006,11 @@ export const api = {
     const result = await call('kitRun', sessionId, kitId, JSON.stringify(inputs || {}), 'human');
     try { return JSON.parse(result); } catch { return { status: 'error', message: 'Kit 运行响应解析失败' }; }
   },
-  async kitCancel(sessionId: string, runId: string): Promise<{ status: string; statusNow?: string; message?: string }> {
+  async kitCancel(sessionId: string, runId: string): Promise<{ status: string; statusNow?: string; run?: KitRun; message?: string }> {
     const result = await call('kitCancel', sessionId, runId);
-    try { return JSON.parse(result); } catch { return { status: 'error', message: 'Kit 停止响应解析失败' }; }
+    return parseRpcObject(result, {
+      status: 'error', message: '执行端未响应 Kit 停止请求，请检查连接后重试',
+    });
   },
   async kitResume(sessionId: string, runId: string): Promise<{ status: string; run?: KitRun; message?: string }> {
     const result = await call('kitResume', sessionId, runId);
@@ -1663,12 +2064,18 @@ export const api = {
     return invoke<string>('kit_client_read_chunk', { path, offset, size });
   },
   async kitClientLocalCommand(spec: {
+    runId: string;
     shell: 'powershell' | 'cmd' | 'bash'; command: string; cwd: string;
     timeoutSeconds: number; env?: Record<string, string>;
   }): Promise<{ exitCode: number; stdout: string; stderr: string }> {
     if (!isTauri()) throw new Error('浏览器客户端不支持本地 Shell 步骤；请使用 AgentWithU 桌面端');
     const { invoke } = await import('@tauri-apps/api/core');
     return invoke('kit_client_command', { spec });
+  },
+  async kitClientLocalCommandCancel(runId: string): Promise<boolean> {
+    if (!isTauri()) return false;
+    const { invoke } = await import('@tauri-apps/api/core');
+    return invoke<boolean>('kit_client_command_cancel', { runId });
   },
   async kitSetControlMode(sessionId: string, kitId: string, mode: 'ai' | 'human' | 'shared'): Promise<{ status: string; controlMode?: string; message?: string }> {
     const result = await call('kitSetControlMode', sessionId, kitId, mode);
@@ -1803,7 +2210,7 @@ export const api = {
     workingDir?: string,
     execKey?: string,
     includeHidden = false,
-  ): Promise<{ name: string; path: string; isDir: boolean }[]> {
+  ): Promise<{ name: string; path: string; isDir: boolean; mtime?: number }[]> {
     // execKey 指定时发到该会话的执行节点(远端目录懒加载逐层浏览);缺省回落 home。
     const result = execKey
       ? await callOn(execKey, 'listDirectory', path, workingDir || '', includeHidden)
@@ -2009,21 +2416,60 @@ export const api = {
   // 这些操作的是某个执行节点上的工作目录,而参数是路径(不是 sessionId,无法被
   // 自动路由)。所以显式带上该会话的 execKey,把请求发到它归属的节点;缺省回落
   // home(向后兼容)。
-  /** 服务器工作目录清单：relpath → {hash, size}，供客户端做三向增量比对。 */
-  async syncManifest(workingDir: string, execKey?: string): Promise<{
+  /** 服务器工作目录清单：relpath → {hash, size, mtime}，供客户端做三向增量比对。 */
+  async syncManifest(workingDir: string, execKey?: string, includeGit = false): Promise<{
     status: string; message?: string; root?: string;
-    files?: Record<string, { hash: string; size: number }>;
+    files?: Record<string, { hash: string; size: number; mtime?: number }>;
   }> {
-    const result = await callOn(execKey, 'syncManifest', workingDir);
-    return parseRpcObject(result, { status: 'error', message: 'syncManifest 无响应' });
+    try {
+      const result = await callOnStrict(
+        execKey, 'syncManifest', [workingDir, includeGit], SYNC_MANIFEST_TIMEOUT_MS,
+      );
+      const parsed = parseRpcObject<{
+        status: string; message?: string; root?: string;
+        files?: Record<string, { hash: string; size: number; mtime?: number }>;
+      }>(result, { status: 'error', message: '执行端返回了空的文件清单响应' });
+      return { ...parsed, files: filterGitMetadata(parsed.files, includeGit) };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error || '');
+      // 仅在明确是旧执行端参数数量不兼容时回退一次；超时/断线绝不重扫，避免
+      // 在执行端叠加两份大目录哈希任务。
+      if (!includeGit && /positional argument|takes .* argument|unexpected argument/i.test(message)) {
+        try {
+          const legacy = await callOnStrict(
+            execKey, 'syncManifest', [workingDir], SYNC_MANIFEST_TIMEOUT_MS,
+          );
+          const parsed = parseRpcObject<{
+            status: string; message?: string; root?: string;
+            files?: Record<string, { hash: string; size: number; mtime?: number }>;
+          }>(legacy, { status: 'error', message: '旧执行端返回了空的文件清单响应' });
+          return { ...parsed, files: filterGitMetadata(parsed.files) };
+        } catch (legacyError) {
+          return { status: 'error', message: syncManifestError(legacyError) };
+        }
+      }
+      return { status: 'error', message: syncManifestError(error) };
+    }
   },
 
   /** 快速列出某个远端子树内的文件大小；不算哈希，用于传输规划。 */
-  async syncFileList(workingDir: string, rel = '', execKey?: string): Promise<{
+  async syncFileList(workingDir: string, rel = '', execKey?: string, includeGit = false): Promise<{
     status: string; message?: string; files?: Record<string, number>;
   }> {
-    const result = await callOn(execKey, 'syncFileList', workingDir, rel);
-    return parseRpcObject(result, { status: 'error', message: 'syncFileList 无响应' });
+    try {
+      const result = await callOn(execKey, 'syncFileList', workingDir, rel, includeGit);
+      const parsed = parseRpcObject<{
+        status: string; message?: string; files?: Record<string, number>;
+      }>(result, { status: 'error', message: 'syncFileList 无响应' });
+      return { ...parsed, files: filterGitMetadata(parsed.files, includeGit) };
+    } catch (error) {
+      if (includeGit) throw error;
+      const result = await callOn(execKey, 'syncFileList', workingDir, rel);
+      const parsed = parseRpcObject<{
+        status: string; message?: string; files?: Record<string, number>;
+      }>(result, { status: 'error', message: 'syncFileList 无响应' });
+      return { ...parsed, files: filterGitMetadata(parsed.files) };
+    }
   },
 
   async syncReadFile(workingDir: string, rel: string, execKey?: string): Promise<{
@@ -2085,6 +2531,40 @@ export const api = {
   async filePreviewData(name: string, dataBase64: string, execKey?: string): Promise<any> {
     const result = await callOn(execKey, 'filePreviewData', name, dataBase64);
     try { return JSON.parse(result); } catch { return { status: 'error', message: '预览服务无响应' }; }
+  },
+
+  async provOpen(workingDir: string, rel: string, execKey?: string): Promise<ProvOpenResult> {
+    const result = await callOn(execKey, 'provOpen', workingDir, rel);
+    return parseRpcObject(result, {
+      status: 'error', message: '审阅服务无响应', document: null,
+      provPath: '', existing: false, sourceStatus: 'missing',
+      currentSource: null, sourcePreview: null,
+    } as unknown as ProvOpenResult);
+  },
+
+  async provSave(
+    workingDir: string,
+    provPath: string,
+    document: ProvDocument,
+    expectedRevision: number,
+    rebindSource = false,
+    execKey?: string,
+  ): Promise<ProvSaveResult> {
+    const result = await callOn(
+      execKey,
+      'provSave',
+      workingDir,
+      provPath,
+      JSON.stringify(document),
+      expectedRevision,
+      rebindSource,
+    );
+    return parseRpcObject(result, { status: 'error', message: '保存 Prov 失败' });
+  },
+
+  async provResolve(workingDir: string, provPath: string, execKey?: string): Promise<ProvResolveResult> {
+    const result = await callOn(execKey, 'provResolve', workingDir, provPath);
+    return parseRpcObject(result, { status: 'error', message: '无法生成 Agent 工作单' });
   },
 
   async revealFile(workingDir: string, rel: string, execKey?: string): Promise<{ status: string; message?: string }> {
@@ -2270,8 +2750,9 @@ export const api = {
     try { return typeof r === 'string' ? JSON.parse(r) : r; } catch { return { ok: false, output: 'parse error' }; }
   },
 
-  async getSttConfig(): Promise<any> {
-    const r = await call('getSttConfig');
+  async getSttConfig(sessionId?: string): Promise<any> {
+    const execKey = sessionId ? sessionExec.get(sessionId) : undefined;
+    const r = await callOn(execKey, 'getSttConfig');
     try { return typeof r === 'string' ? JSON.parse(r) : r; } catch { return {}; }
   },
 
@@ -2292,16 +2773,25 @@ export const api = {
     text: string,
     voice: string,
     rate: number,
+    engine: 'edge' | 'dashscope' = 'edge',
+    model = '',
+    sessionId = '',
   ): Promise<{
     ok: boolean;
+    engine?: 'edge' | 'dashscope';
     mime?: string;
     base64?: string;
     voice?: string;
     rate?: number;
+    sampleRate?: number;
+    model?: string;
     truncated?: boolean;
     error?: string;
   }> {
-    const result = await call('ttsSynthesize', text, voice, rate);
+    const result = await callOn(
+      sessionId ? sessionExec.get(sessionId) : undefined,
+      'ttsSynthesize', text, voice, rate, engine, model,
+    );
     try {
       return typeof result === 'string' ? JSON.parse(result) : result;
     } catch {
@@ -2309,12 +2799,86 @@ export const api = {
     }
   },
 
+  async ttsStreamSynthesize(
+    sessionId: string,
+    streamId: string,
+    seq: number,
+    text: string,
+    voice: string,
+    rate: number,
+    engine: 'edge' | 'dashscope' = 'edge',
+    model = '',
+  ): Promise<{
+    ok: boolean;
+    accepted?: boolean;
+    duplicate?: boolean;
+    engine?: 'edge' | 'dashscope';
+    streamId?: string;
+    seq?: number;
+    model?: string;
+    voice?: string;
+    sampleRate?: number;
+    error?: string;
+  }> {
+    const execKey = sessionExec.get(sessionId);
+    const result = await callOn(
+      execKey,
+      'ttsStreamSynthesize', sessionId, streamId, seq, text, voice, rate, engine, model,
+    );
+    try {
+      return typeof result === 'string' ? JSON.parse(result) : result;
+    } catch {
+      return { ok: false, error: '实时语音响应格式错误' };
+    }
+  },
+
+  async ttsStreamFinish(
+    sessionId: string,
+    streamId: string,
+    engine: 'edge' | 'dashscope',
+  ): Promise<{
+    ok: boolean;
+    accepted?: boolean;
+    duplicate?: boolean;
+    empty?: boolean;
+    streamId?: string;
+    error?: string;
+  }> {
+    const execKey = sessionExec.get(sessionId);
+    const result = await callOn(execKey, 'ttsStreamFinish', sessionId, streamId, engine);
+    try {
+      return typeof result === 'string' ? JSON.parse(result) : result;
+    } catch {
+      return { ok: false, error: '实时语音结束响应格式错误' };
+    }
+  },
+
+  async ttsStreamCancel(
+    sessionId: string,
+    streamId: string,
+  ): Promise<{ ok: boolean; cancelled?: number; error?: string }> {
+    const execKey = sessionExec.get(sessionId);
+    const result = await callOn(execKey, 'ttsStreamCancel', sessionId, streamId);
+    try {
+      return typeof result === 'string' ? JSON.parse(result) : result;
+    } catch {
+      return { ok: false, error: '实时语音取消响应格式错误' };
+    }
+  },
+
+  onTtsStreamAudio(cb: TtsStreamAudioCallback): () => void {
+    ttsStreamAudioCallbacks.push(cb);
+    return () => {
+      ttsStreamAudioCallbacks = ttsStreamAudioCallbacks.filter((item) => item !== cb);
+    };
+  },
+
   async sttRefine(text: string, sessionId?: string): Promise<{ ok: boolean; text?: string; error?: string }> {
     const r = await call('sttRefine', text, sessionId || '');
     try { return typeof r === 'string' ? JSON.parse(r) : r; } catch { return { ok: false, error: 'parse error' }; }
   },
 
-  async sttStreamStart(configOverride?: any): Promise<{
+  async sttStreamStart(configOverride?: any, sessionId?: string): Promise<{
     ok: boolean;
     model?: string;
     realtime?: boolean;
@@ -2322,18 +2886,26 @@ export const api = {
     flashModel?: string;
     error?: string;
   }> {
-    const r = await call('sttStreamStart', JSON.stringify(configOverride || {}));
-    try { return typeof r === 'string' ? JSON.parse(r) : r; } catch { return { ok: false, error: 'parse error' }; }
-  },
-
-  sttStreamAudioBinary(pcmBuffer: ArrayBuffer): void {
-    // STT 流式音频走 home 节点(sttStreamStart 无 sessionId,固定在 home)。
-    if (homeConn && homeConn.isOpen) {
-      homeConn.ws!.send(pcmBuffer);
+    const execKey = sessionId ? sessionExec.get(sessionId) : undefined;
+    const r = await callOn(execKey, 'sttStreamStart', JSON.stringify(configOverride || {}));
+    try {
+      const parsed = typeof r === 'string' ? JSON.parse(r) : r;
+      sttStreamExecKey = parsed?.ok ? (execKey || homeConn.key) : undefined;
+      return parsed;
+    } catch {
+      sttStreamExecKey = undefined;
+      return { ok: false, error: 'parse error' };
     }
   },
 
-  async sttStreamStop(): Promise<{
+  sttStreamAudioBinary(pcmBuffer: ArrayBuffer): void {
+    const conn = connByKey(sttStreamExecKey);
+    if (conn?.isOpen) {
+      conn.ws!.send(pcmBuffer);
+    }
+  },
+
+  async sttStreamStop(sessionId?: string): Promise<{
     ok: boolean;
     text?: string;
     refinedByFlash?: boolean;
@@ -2342,7 +2914,10 @@ export const api = {
     realtimeError?: string;
     error?: string;
   }> {
-    const r = await call('sttStreamStop');
+    const execKey = sttStreamExecKey || (sessionId ? sessionExec.get(sessionId) : undefined);
+    const r = await callOn(execKey, 'sttStreamStop');
+    // 只清当前捕获的绑定；并发 stop/start 时不能把新一轮的节点指针抹掉。
+    if (!sttStreamExecKey || sttStreamExecKey === execKey) sttStreamExecKey = undefined;
     try { return typeof r === 'string' ? JSON.parse(r) : r; } catch { return { ok: false, error: 'parse error' }; }
   },
 
@@ -2696,6 +3271,9 @@ function mockDispatch(method: string, params: any[]): any {
     case 'saveSttConfig': return JSON.stringify({ ok: true });
     case 'sttTranscribe': return JSON.stringify({ ok: false, error: 'mock mode' });
     case 'ttsSynthesize': return JSON.stringify({ ok: false, error: 'backend not connected' });
+    case 'ttsStreamSynthesize': return JSON.stringify({ ok: false, error: 'backend not connected' });
+    case 'ttsStreamFinish': return JSON.stringify({ ok: true, accepted: false, empty: true });
+    case 'ttsStreamCancel': return JSON.stringify({ ok: true, cancelled: 0 });
     case 'sttRefine': return JSON.stringify({ ok: false, error: 'mock mode' });
     case 'sttStreamStart': return JSON.stringify({ ok: false, error: 'mock mode' });
     case 'sttStreamStop': return JSON.stringify({ ok: false, error: 'mock mode' });

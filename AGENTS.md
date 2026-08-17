@@ -285,13 +285,18 @@ The global stage advances one-way: `loopidea → loopexecute → loopout`.
   runs them through a concurrency pool (`asyncio.Semaphore(3)`), each idea an
   independent one-shot agent turn. Sealing forms the **global goal** and switches
   to `loopexecute`.
-- **loopexecute** — each iteration (`LoopRecord`, numbered by `seq`) is **one
-  complete, best-effort attempt at the whole global goal** (NOT a phase/subtask —
-  the task is not split across loops). It runs three sub-stages: `prepare` (plan
-  this pass's strategy + orchestration of steps), `execute` (run the steps —
+- **loopexecute** — each iteration (`LoopRecord`, numbered by `seq`) is an
+  **evidence-driven incremental evolution** of the current workspace. Every pass
+  re-anchors on the global goal and original ideas, consumes the latest diagnosis
+  plus Addons pending at pass start, verifies the real artifacts, preserves work
+  already proven correct, and selects only the highest-value remaining gap or
+  regression. It is neither a full restart of the whole goal nor a predetermined
+  phase split across loop numbers. It runs three sub-stages: `prepare` (freeze the
+  diagnostic/Addon basis and plan 1–4 necessary steps), `execute` (run the steps —
   consecutive `concurrent` steps go in parallel via `asyncio.gather`, `sequential`
   steps in order; each `LoopStep` tracks `status` pending→running→done/error and
-  persists its `output` for replay), `analysis` (score 0–100 vs the global goal).
+  persists its `output` for replay), `analysis` (independently verify the cumulative
+  workspace against the global goal and persist `verified`, `gaps`, `next_focus`).
   Sub-stage and per-step timings are persisted (`LoopRecord.sub_started`,
   `LoopStep.started_at/ended_at`) to drive the flow view's durations.
   Score ≥70 = deliverable, ≥85 = outputtable. A composite **risk coefficient**
@@ -539,6 +544,12 @@ Workspace Kits are Session-level standard accessories stored separately in
   skip everything after the first failed step. The backend owns the authoritative
   `KitRun`/step verdict; a desktop client only claims and performs explicit client
   actions. Scheduled runs that require a client fail closed when no client can act.
+- `kitCancel` is immediate and idempotent: it first persists the authoritative
+  `cancelled` run/step state, then cancels any live orchestration task and terminates
+  the exact command process tree by run PID. This also repairs orphaned active records
+  after an executor exception/restart. Client-side commands are registered by `runId`;
+  the desktop that owns the process observes the same state update and terminates its
+  local process tree even if the Kits panel is folded or another client pressed Stop.
 - “remote Session” always means the already-connected Session executor, not an SSH
   destination. Natural-language compilation must map local-file-to-Session requests to
   the built-in `file_push` primitive and must never ask for host, port, username,
@@ -564,14 +575,23 @@ multi-turn AI optimization finalization all append to the same ledger. Version s
 cover execution target/steps, command runtime, typed inputs, assertions, outputs,
 dependencies, schedule and view, but not live enable/run state. Routine `kitUpdated`
 payloads expose metadata only; `kitVersionGet` fetches one full snapshot on demand.
-Activating any version or finalizing an AI candidate requires the Kit to be disabled and
-have no active run, so an interval schedule cannot change orchestration mid-flight.
+Saving an AI candidate appends an inactive version without changing the live DSL, so it
+is safe while the Kit or Schedule remains enabled. Activating any version still requires
+the Kit to be disabled and have no active run, so an interval schedule cannot change
+orchestration mid-flight.
 
 The compact card and details header expose **Optimize**, opening a BTW-like independent
 conversation with a selectable backend. `kitOptimizeAsk` sees the active DSL, Kit version
 metadata, recent optimization dialogue and explicit file references; it returns a
-normalized, safety-checked candidate but never changes the Kit. Only
-`kitOptimizeFinalize` (the user's “定版并启用” action) appends and activates that candidate.
+normalized, safety-checked candidate but never changes the Kit. `kitOptimizeFinalize`
+separates saving from activation: the normal “保存为候选版本” action writes the immutable
+snapshot to the Kit ledger without switching execution, and an explicit version-picker
+action activates it later. Compact cards, the details header, and the optimizer all keep
+that picker in the primary interaction surface. Optimization readiness is two-tiered:
+advisory `warnings` (duration, logs, operational caveats) remain visible but never block
+saving, while `blocking_issues`, unanswered questions, and deterministic backend schema /
+safety validation do. Legacy candidates are revalidated on `kitOptimizeGet`, so an old
+“any warning blocks” result can become saveable without another AI turn.
 Optimization dialogue and candidate provenance persist with the Kit, while versions remain
 a Kit concept independent of which backend produced them. Details always shows the version
 ledger and allows viewing or safely reactivating any historical DSL.
@@ -721,6 +741,46 @@ The role is edited in the in-app "连接" panel (`ConnectionPanel.tsx`);
 changes take effect on app restart. Tauri commands: `get_desktop_config`,
 `set_desktop_config`.
 
+### Relay users and isolation
+
+Relay supports a small multi-user mode backed by
+`AGENT_WITH_U_RELAY_USERS_FILE` (`src/relay_users.py`). The Relay master token is
+only for executor registration. UI clients authenticate with a per-user token;
+Relay ignores any client-supplied `user`, injects the stable `userId`, and only
+lists/opens executor `deviceId`s granted to that user. `username`, display name,
+avatar and avatar color are editable; `userId` is immutable. Tokens are generated
+with `secrets.token_urlsafe()` and only their SHA-256 digest is stored.
+
+One executor may be granted to multiple Relay users. This is the normal home-PC
+topology: one visible AgentWithU desktop and one bundled Backend process execute
+RemoteSessions for several authenticated clients. Isolation is Session-level,
+not process-level: `Session.owner_id` persists the stable `userId`; every
+Session-scoped RPC is checked in `BridgeWS` before its handler runs; filesystem/Git
+RPCs require a workspace owned by that same user; and Session/Loop/Kit/chat/TTS
+events are sent only to clients with the matching identity. The executor UI is
+not an all-user administrator: direct local mode only sees legacy/local Sessions,
+and must authenticate/switch to a Relay user to see that user's Sessions. A
+missing users file retains legacy single-token behavior; once the file exists,
+even an empty user list stays fail-closed. Admin CLI:
+`agent-with-u-relay --users-file PATH user
+add|list|grant|revoke|set-default|clear-default|reset-token|enable|disable|delete ...`.
+
+Each executor can have one **default/primary user** in Relay's
+`deviceDefaults` map. The first user granted a device becomes its default unless
+an administrator changes it with `user set-default USER DEVICE`. Relay injects a
+non-forgeable `canClaimLegacy` capability only for that user on that device.
+`Settings → User → 历史 Session 归属` uses it to preview and selectively claim
+`local` / legacy-single-token Sessions. The Backend rejects busy Sessions and
+partial migration of Sessions sharing one working directory, writes a full
+archive under `~/.agent-with-u/backups/` first, then atomically updates both
+Session bodies and the index. Already-owned Sessions are never eligible.
+
+Frontend relay targets cache the verified public profile. Connection keys include
+the stable user id (`relay:<userId>:<deviceId>`). Switching Relay identity closes
+old-user sockets and clears relay roster, Session routing and offline Session
+caches before the new identity is used; do not weaken this cleanup when adding
+new cached or process-global Relay state.
+
 ### Session-level execution node (连接池, 每会话归属执行节点)
 
 Execution location used to be **system-level**: the whole UI window pointed at
@@ -730,12 +790,13 @@ ran on that one node. It is now **per-session**: some sessions self-execute on
 the local machine (本机自执行), some run on a remote relay executor (远端) — chosen
 at creation, fixed afterward.
 
-This is a **frontend-only** change — sessions physically live on the executor
-they were created on, so "which connection a session was listed from" *is* its
-ownership; no backend/`session_store` change is needed. The design:
+Sessions physically live on the executor where they were created. The frontend
+connection key routes each Session to that executor, while Backend
+`Session.owner_id` independently controls which authenticated user may see or
+operate it. Node routing and user visibility are separate boundaries. The design:
 
 - **Connection pool** (`api.ts`): a `Conn` per executor key (`local` /
-  `relay:<deviceId>`), each self-managing relay handshake + heartbeat + backoff
+  `relay:<userId>:<deviceId>`), each self-managing relay handshake + heartbeat + backoff
   reconnect, all dispatching push events (streamDelta/loop/seqtask/…) to the
   same shared callbacks (events are `sessionId`-keyed, so multiple nodes coexist).
   A single global `pending` map (ids globally unique via `nextId`) plus a
@@ -754,8 +815,10 @@ ownership; no backend/`session_store` change is needed. The design:
   as the first arg (auto-detected: a first-arg string that is a known session id —
   UUIDs don't collide); the few that bury it in a JSON payload are listed in
   `JSON_SESSION_METHODS` (`sendMessage`/`executeCommand`/`migrateSession`), plus
-  `sttRefine` (2nd arg). Everything else (registry/global RPCs, STT stream) goes
-  to home.
+  `sttRefine` (2nd arg). Registry/global RPCs go to home. STT remains home by
+  default, but `sttStreamStart(config, sessionId?)` binds the microphone binary
+  transport to that Session's executor until `sttStreamStop`, so remote Session
+  voice input cannot accidentally run on another node.
 - **Session list** (`api.listSessions`) queries every pooled node in parallel,
   merges, refreshes the routing map, and tags each session with
   `execKey/execLabel/execMode/execIsHome`. Both App and Sidebar consume the
@@ -773,6 +836,39 @@ UI surfaces (config UX kept minimal — invisible to single-node users):
   remove) and an "➕ 加入可分配执行节点" button in the relay device list to add the
   selected node to the roster without switching home.
 - `getExecutors()` / `onExecStatus()` expose the live node list + status to the UI.
+
+### Experimental realtime voice conversation
+
+Ordinary chat panes expose a compact `RealtimeVoiceBar`: persistent browser mic
+capture and client RMS/VAD feed Fun-ASR Realtime (Flash refinement is explicitly
+disabled per turn). A configurable wake phrase (default `小U`, including common
+ASR homophones) gates only the first turn; a phrase plus command keeps the suffix,
+then the conversation remains continuous until explicitly closed. End-of-turn
+detection uses a 1.5s configurable base plus extra thinking time for incomplete,
+filler or comma endings, exposes a live pause countdown, and always offers
+`立即发送`. The transcript is sent to the Session's current LLM Backend, and
+append-only `text_delta` frames go through an adaptive speech chunker (5–12 char
+first phrase, larger later phrases, fenced code/URLs omitted).
+`ttsStreamSynthesize(sessionId, streamId, seq, ...)` accepts each Edge-TTS chunk
+without blocking the WebSocket RPC loop; two backend workers synthesize in
+parallel and push `ttsStreamAudio`, while the browser decodes and plays strictly
+by `seq`. Realtime playback defaults to the local Web Speech engine to remove the
+per-request Edge network handshake; users can select Edge quality mode, and a
+Web-Speech failure automatically falls back to the executor-routed Edge path.
+Realtime turns send a hidden `interactionMode=realtime-voice` constraint telling
+the model not to narrate raw tool names, parameters, commands, logs or output, while
+still allowing short user-facing stage results. `ToolAwareSpeechGate` holds only the
+first prose briefly (up to the 900ms stability window); a `tool_start` flushes that
+Agent prose without cancelling current/queued TTS, and later `text_delta` prose keeps
+playing even while tools run. Only structured `tool_*` / `subagent_*` payloads remain
+silent. The bar shows the active tool with a `工具静默` badge.
+`ttsStreamCancel` plus client queue/source cleanup provides immediate barge-in.
+Playback uses a 650ms echo guard, a louder five-frame interruption threshold and
+a 380ms acoustic-tail quarantine; playback-period mic pre-roll is discarded rather
+than injected into the new ASR stream, while thinking/tool-period pre-roll remains
+available for real user interruption. Settings reuse
+the existing STT API key and TTS voice/rate, with configurable wake phrase,
+adaptive pause, realtime playback engine, RMS threshold, and interruption switch.
 
 ### Directory sync — sidebar file-tree view (`FileTreePanel`)
 

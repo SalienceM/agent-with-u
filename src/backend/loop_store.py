@@ -91,6 +91,9 @@ class LoopAnalysis:
     trend: str = ""                     # 历史趋势评估
     optimization_potential: float = 0.0  # 0..1，下一次 loop 估计还能提升多少
     challenges: str = ""                # 环境/系统/网络等可触达性挑战
+    verified: str = ""                  # 已经用实际产物/检查核实成立的能力与证据
+    gaps: str = ""                      # 对照全局目标仍未满足或发生回归的缺口
+    next_focus: str = ""                # 下一次只应优先处理的最小高价值焦点
     deliverable: bool = False           # score >= 70
     outputtable: bool = False           # score >= 85
 
@@ -101,6 +104,9 @@ class LoopAnalysis:
             "trend": self.trend,
             "optimizationPotential": self.optimization_potential,
             "challenges": self.challenges,
+            "verified": self.verified,
+            "gaps": self.gaps,
+            "nextFocus": self.next_focus,
             "deliverable": self.deliverable,
             "outputtable": self.outputtable,
         }
@@ -113,6 +119,9 @@ class LoopAnalysis:
             trend=d.get("trend", ""),
             optimization_potential=float(d.get("optimizationPotential", 0.0)),
             challenges=d.get("challenges", ""),
+            verified=d.get("verified", ""),
+            gaps=d.get("gaps", ""),
+            next_focus=d.get("nextFocus", d.get("next_focus", "")),
             deliverable=bool(d.get("deliverable", False)),
             outputtable=bool(d.get("outputtable", False)),
         )
@@ -120,14 +129,16 @@ class LoopAnalysis:
 
 @dataclass
 class LoopRecord:
-    """一次 loopexecute 的完整记录。"""
+    """一次 loopexecute 增量演进的完整记录。"""
     seq: int
     # agent = automated prepare/execute/analysis pass; manual = a temporary
     # human-controlled normal-chat pass over the same loop session.
     kind: str = "agent"
     sub_stage: str = SUB_PREPARE        # prepare | execute | analysis | done
     round: int = 1                      # 属于第几轮（loopout 后可开启新一轮）
-    goal: str = ""                      # 本次 loop 的计划目标
+    goal: str = ""                      # 本次 loop 的增量焦点（不是替代全局目标）
+    iteration_mode: str = "baseline"    # baseline | evolution
+    evolution_basis: str = ""           # 本次冻结的上轮诊断 + 起跑时 addon 范围
     orchestration: list[LoopStep] = field(default_factory=list)
     completed: bool = False             # 是否按步骤执行完成（含 analysis 完成）
     result: str = ""                    # 本次 loop 执行完成的结果信息
@@ -175,6 +186,8 @@ class LoopRecord:
             "subStage": self.sub_stage,
             "round": self.round,
             "goal": self.goal,
+            "iterationMode": self.iteration_mode,
+            "evolutionBasis": self.evolution_basis,
             "orchestration": [s.to_dict() for s in self.orchestration],
             "completed": self.completed,
             "result": self.result,
@@ -204,6 +217,8 @@ class LoopRecord:
             sub_stage=d.get("subStage", SUB_PREPARE),
             round=int(d.get("round", 1)),
             goal=d.get("goal", ""),
+            iteration_mode=("evolution" if d.get("iterationMode") == "evolution" else "baseline"),
+            evolution_basis=d.get("evolutionBasis", ""),
             orchestration=[LoopStep.from_dict(s) for s in d.get("orchestration", [])],
             completed=bool(d.get("completed", False)),
             result=d.get("result", ""),
@@ -306,8 +321,8 @@ class AsideTurn:
 
 @dataclass
 class Addon:
-    """执行过程中随手补充的要求（addon）。不影响当前 loop；
-    在 loop 结束的 analysis 与下一次 loop 的 prepare 时带上、并在 prepare 时消费。"""
+    """随手补充的要求（addon）。Prepare 起跑时冻结并消费当时 pending 的项；
+    起跑后新增的项不扩大正在执行的范围，由 analysis 登记并留给下一次增量演进。"""
     id: str
     text: str
     status: str = "pending"     # pending（待纳入）| applied（已纳入某次 loop）
@@ -336,7 +351,7 @@ class Addon:
         )
 
 
-DEFAULT_STRATEGY = (
+LEGACY_DEFAULT_STRATEGY = (
     "每一次 loop 都是对【全局目标】的一次完整、尽力的尝试（不是把任务拆到多个 loop 分步完成）。\n"
     "- prepare：规划这一遍的策略与分步编排（可并发 concurrent / 顺次 sequential）。\n"
     "- execute：实际执行编排（读写文件、运行命令），如实记录产出与成败。\n"
@@ -349,6 +364,45 @@ DEFAULT_STRATEGY = (
     "3. 警惕「美好陷阱」：流程跑顺 ≠ 目标达成；高分（≥可输出门槛）必须对应验收标准**逐条**被证据支撑。\n"
     "4. 趋势判断要看**实质改进**（新增能力/缺陷修复/通过的检查），而非措辞更乐观或换了说法。\n"
     "5. 宁可保守扣分、点明差距与下一步，也不要为了收口而粉饰；真完不成就如实在 challenges 标注。"
+)
+
+
+# 旧前端创建 Session 时会把这个无 Markdown 版本回写到 stage 文件；它与后端旧默认
+# 语义相同但文本不完全一致，因此也必须显式迁移。
+LEGACY_FRONTEND_DEFAULT_STRATEGY = (
+    "每一次 loop 都是对【全局目标】的一次完整、尽力的尝试（不是把任务拆到多个 loop 分步完成）。\n"
+    "- prepare：规划这一遍的策略与分步编排（可并发 concurrent / 顺次 sequential）。\n"
+    "- execute：实际执行编排（读写文件、运行命令），如实记录产出与成败。\n"
+    "- analysis：对照全局目标打分（0–100），评估趋势、优化空间与硬约束。\n"
+    "\n"
+    "评分心智（防自欺，必须遵守）：\n"
+    "1. 以可验证的实际产物为准——文件是否真存在、代码是否真能跑、命令/测试输出是否真通过；"
+    "不要轻信执行阶段的自述总结，能验证就动手验证。\n"
+    "2. 默认未完成：除非有明确证据满足验收标准，否则不给高分；模糊、未验证、想当然一律压低。\n"
+    "3. 警惕「美好陷阱」：流程跑顺 ≠ 目标达成；高分（≥可输出门槛）必须对应验收标准逐条被证据支撑。\n"
+    "4. 趋势判断要看实质改进（新增能力/缺陷修复/通过的检查），而非措辞更乐观。\n"
+    "5. 宁可保守扣分、点明差距与下一步，也不要为了收口而粉饰；真完不成就如实在 challenges 标注。"
+)
+
+
+DEFAULT_STRATEGY = (
+    "LOOP 是围绕【全局目标】和当前真实产物的连续增量演进：既不在每次 loop 重做完整目标，"
+    "也不预先把任务机械切成固定阶段。\n"
+    "- prepare：回顾全局目标、原始诉求、上轮诊断和本次 addon；先核实现状，保留已验证成果，"
+    "只选择当前最高价值的剩余缺口或回归，编排 1–4 个必要步骤。\n"
+    "- execute：针对本次增量焦点实际执行；动手前确认现状，已经满足的工作直接跳过，"
+    "不要重复生成、重写或做无收益的全量检查。\n"
+    "- analysis：独立核实当前工作区的累计状态，并始终对照全局目标评分；明确记录已核实证据、"
+    "剩余缺口和下一次唯一优先焦点。\n"
+    "\n"
+    "评分心智（防自欺，必须遵守）：\n"
+    "1. 以**可验证的实际产物**为准——文件是否真存在、代码是否真能跑、命令/测试输出是否真通过；"
+    "**不要轻信**执行阶段的自述总结，能验证就动手验证。\n"
+    "2. score 衡量的是**当前累计产物对全局目标的完成度**，不是本次做了多少；本次贡献与整体完成度要分开。\n"
+    "3. **默认未完成**：除非有明确证据满足验收标准，否则不给高分；模糊、未验证、想当然一律压低。\n"
+    "4. 警惕「美好陷阱」：流程跑顺 ≠ 目标达成；高分（≥可输出门槛）必须对应验收标准**逐条**被证据支撑。\n"
+    "5. 趋势判断看已核实的净新增价值；禁止把重复执行、重复测试或更乐观的措辞算作进展。\n"
+    "6. 宁可保守扣分、点明差距与下一步，也不要为了收口而粉饰；真完不成就如实在 challenges 标注。"
 )
 
 
@@ -431,6 +485,14 @@ class LoopPolicy:
         ml = max(1, min(50, ml))
         rt = max(0.1, min(1.0, _f("riskThreshold", 0.85)))
         strat = d.get("strategy")
+        # 旧版本把“每次完整重做”固化进了持久化策略。只替换这段已知系统默认前缀，
+        # 后面由用户或内置预设追加的个性化要求原样保留。
+        if isinstance(strat, str):
+            normalized = strat.strip()
+            for legacy_default in (LEGACY_DEFAULT_STRATEGY, LEGACY_FRONTEND_DEFAULT_STRATEGY):
+                if normalized.startswith(legacy_default):
+                    strat = DEFAULT_STRATEGY + normalized[len(legacy_default):]
+                    break
         ie = d.get("independentEval", True)
         ig = d.get("intentGuard", True)
         # 各位置 backend 映射 + 迁移旧的单一 evalBackendId（曾用于 analysis/goal）
