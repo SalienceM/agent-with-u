@@ -6,6 +6,16 @@
 access_control:
   # default_policy / networks 等沿用你现有配置
   rules:
+    # PWA / 手机主屏图标由系统进程单独抓取，通常不携带浏览器登录态。
+    # 仅放行这些不含业务数据的静态元文件；本规则必须放在域名保护规则之前。
+    - domain: "agent.example.com"
+      resources:
+        - '^/favicon\.ico$'
+        - '^/apple-touch-icon\.png$'
+        - '^/manifest\.webmanifest$'
+        - '^/icons/.*$'
+      policy: bypass
+
     # AgentWithU：要求二次验证（推荐）
     - domain: "agent.example.com"
       policy: two_factor
