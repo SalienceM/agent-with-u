@@ -29,6 +29,7 @@ arboard = "3"
 png = "0.17"
 base64 = "0.22"
 sha2 = "0.10"
+uuid = { version = "1", features = ["v4"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [

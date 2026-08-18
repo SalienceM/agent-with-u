@@ -1,6 +1,7 @@
 import React, { useState, useCallback, useEffect, useRef, memo, useMemo } from 'react';
 import { markdownToHtml } from '../utils/markdown';
 import { api, loadSkillImageDataUrl } from '../api';
+import type { CurrentUserProfile } from '../api';
 import type { ChatMessage, ToolCall, ContentBlock, SubagentInfo } from '../hooks/useChat';
 import { shouldKeepChatMessage } from '../utils/chatMessageVisibility';
 import { DiffView, type DiffData } from './DiffView';
@@ -770,6 +771,7 @@ const SystemMessage: React.FC<{ message: ChatMessage; renderMarkdown?: boolean }
 // ═══════════════════════════════════════
 interface Props {
   message: ChatMessage;
+  currentUser?: CurrentUserProfile;
   fontSize?: number;
   renderMarkdown?: boolean;
   animateIn?: boolean;
@@ -1081,6 +1083,7 @@ const BubbleActionMenu: React.FC<{
 
 function MessageBubbleInner({
   message,
+  currentUser,
   fontSize = 14,
   renderMarkdown = true,
   animateIn = false,
@@ -1236,6 +1239,9 @@ function MessageBubbleInner({
   }
 
   const isUser = message.role === 'user';
+  const userInitial = (
+    currentUser?.displayName || currentUser?.username || 'U'
+  ).trim().slice(0, 1).toUpperCase() || 'U';
 
   const thinkingContent =
     message.thinking ||
@@ -1511,13 +1517,25 @@ function MessageBubbleInner({
       </div>
       {/* ★ 用户头像 */}
       {isUser && (
-        <div style={{
+        <div title={currentUser?.displayName || '你'} style={{
           width: 26, height: 26, borderRadius: 5, flexShrink: 0,
-          background: 'var(--theme-bg-tertiary)',
+          overflow: 'hidden',
+          background: currentUser?.avatarData
+            ? 'var(--theme-bg-tertiary)'
+            : (currentUser?.avatarColor || 'var(--theme-bg-tertiary)'),
           border: '1px solid var(--theme-border)',
           display: 'flex', alignItems: 'center', justifyContent: 'center',
-          fontSize: 11, color: 'var(--theme-text-muted)', fontWeight: 750, marginLeft: 9, marginTop: 3,
-        }}>U</div>
+          fontSize: 11, color: currentUser ? '#fff' : 'var(--theme-text-muted)',
+          fontWeight: 750, marginLeft: 9, marginTop: 3,
+        }}>
+          {currentUser?.avatarData ? (
+            <img
+              src={currentUser.avatarData}
+              alt=""
+              style={{ width: '100%', height: '100%', objectFit: 'cover', display: 'block' }}
+            />
+          ) : userInitial}
+        </div>
       )}
     </div>
     </>
@@ -1537,6 +1555,10 @@ function bubblePropsEqual(prev: Props, next: Props): boolean {
     prev.message.timestamp  === next.message.timestamp  &&
     prev.message.elapsed   === next.message.elapsed   &&
     prev.message.usage     === next.message.usage     &&
+    prev.currentUser?.avatarData === next.currentUser?.avatarData &&
+    prev.currentUser?.avatarColor === next.currentUser?.avatarColor &&
+    prev.currentUser?.displayName === next.currentUser?.displayName &&
+    prev.currentUser?.username === next.currentUser?.username &&
     prev.fontSize          === next.fontSize          &&
     prev.renderMarkdown    === next.renderMarkdown    &&
     prev.animateIn         === next.animateIn         &&

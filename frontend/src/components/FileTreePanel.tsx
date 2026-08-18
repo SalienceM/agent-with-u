@@ -2116,6 +2116,8 @@ export const FileTreePanel: React.FC<Props> = ({ sessionId, workingDir, execKey,
         const sortedPaths = allFiles.map(([p]) => p);
         const trackedPaths = trackedFiles.map(([p]) => p);
         const untrackedPaths = untrackedFiles.map(([p]) => p);
+        const selectedUntrackedPaths = untrackedPaths.filter((p) => gitSelected.has(p));
+        const selectedAdding = selectedUntrackedPaths.some((p) => gitAddingPaths.has(p));
         const toggleGroupSelection = (paths: string[]) => {
           const groupAllSelected = paths.length > 0 && paths.every((p) => gitSelected.has(p));
           setGitSelected((prev) => {
@@ -2192,9 +2194,19 @@ export const FileTreePanel: React.FC<Props> = ({ sessionId, workingDir, execKey,
                     已选 {selectedCount} 项
                   </span>
                   <div style={{ flex: 1 }} />
-                  <button style={gitBatchBtn('#8b949e')} disabled={gitBatchOperating}
+                  {selectedUntrackedPaths.length > 0 && (
+                    <button
+                      style={gitBatchBtn('#3fb950')}
+                      disabled={gitBatchOperating || selectedAdding}
+                      onClick={() => handleAddToTracking(selectedUntrackedPaths)}
+                      title={`将选中的 ${selectedUntrackedPaths.length} 个未跟踪文件一起加入版本控制`}
+                    >
+                      {selectedAdding ? '⏳ 加入中…' : `✓ 批量加入 (${selectedUntrackedPaths.length})`}
+                    </button>
+                  )}
+                  <button style={gitBatchBtn('#8b949e')} disabled={gitBatchOperating || gitAddingPaths.size > 0}
                     onClick={handleBatchIgnore} title="将选中文件加入 .gitignore">🚫 忽略</button>
-                  <button style={gitBatchBtn('#f85149')} disabled={gitBatchOperating}
+                  <button style={gitBatchBtn('#f85149')} disabled={gitBatchOperating || gitAddingPaths.size > 0}
                     onClick={handleBatchDiscard} title="丢弃选中文件的改动">🗑 丢弃</button>
                 </div>
               )}
@@ -2239,15 +2251,8 @@ export const FileTreePanel: React.FC<Props> = ({ sessionId, workingDir, execKey,
                         {groupCheckbox(untrackedPaths, '未跟踪文件')}
                         未跟踪 ({untrackedFiles.length})
                         <span style={{ fontSize: 10, color: 'var(--theme-text-muted)', marginLeft: 6, fontWeight: 400 }}>
-                          点击 ✓ 加入版本控制
+                          勾选后可在上方批量加入版本控制
                         </span>
-                        {untrackedPaths.some((p) => gitSelected.has(p)) && (
-                          <button style={{ ...gitModalIgnoreBtn, color: '#3fb950', marginLeft: 'auto', width: 'auto', padding: '2px 8px' }}
-                            disabled={untrackedPaths.some((p) => gitAddingPaths.has(p))}
-                            onClick={() => handleAddToTracking(untrackedPaths.filter((p) => gitSelected.has(p)))}>
-                            ＋ 加入已选
-                          </button>
-                        )}
                       </div>
                       <div style={{ overflowY: 'auto', flex: 1 }}>
                         {untrackedFiles.map(([path, gf]) => (
@@ -2348,7 +2353,7 @@ export const FileTreePanel: React.FC<Props> = ({ sessionId, workingDir, execKey,
                     fontSize: 10.5, lineHeight: 1.6,
                   }}>
                     <div>💡 点击文件名可打开 diff 对比面板</div>
-                    <div>💡 勾选要提交的文件 · 🚫 忽略</div>
+                    <div>💡 左侧多选 · ✓ 批量加入未跟踪文件 · 🚫 忽略</div>
                   </div>
                 </div>
               </div>

@@ -87,7 +87,7 @@ const SECTIONS: ManualSection[] = [
       { icon: '🧭', title: '代理与网络', summary: '为 Codex/Qwen 等 CLI 配置系统代理或自定义 HTTP 代理，不要求系统全局代理或 TUN。', entry: 'Backend Manager → 环境/代理配置' },
       { icon: '📡', title: '连接池与执行节点', summary: '同一界面可连接本机或多个远端执行节点；新建会话时选择归属节点，之后任务固定在该节点执行。', entry: '顶栏 📡 → 可分配执行节点' },
       { icon: '🔗', title: 'Relay 中继', summary: '执行节点主动连接中继，客户端经令牌找到它，无需把执行机直接暴露到公网。支持 Windows/Linux 无 Docker 部署包。', entry: '顶栏 📡 → 本机角色 / 中继连接' },
-      { icon: '🖥', title: '桌面角色', summary: 'Executor 会启动本机后端；Client 只作为界面，通过中继使用其他机器的执行能力。修改角色后重启生效。', entry: '顶栏 📡 → 本机角色' },
+      { icon: '🖥', title: '桌面执行与发布', summary: '完整桌面端始终保留本机执行能力；可选择仅本地使用，或注册到 Relay 成为其他客户端可见的受管执行节点。修改后重启生效。', entry: '顶栏 📡 → 本机能力' },
     ],
   },
   {

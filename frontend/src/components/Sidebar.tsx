@@ -366,33 +366,42 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
   // ★ 按执行节点分组：每个节点按配置展示最近 N 条；收藏和搜索不受此限制。
   const maxPerNode = Math.max(5, Math.min(500, Math.trunc(Number(sessionLimit) || 25)));
   const groups = useMemo(() => {
-    const map = new Map<string, { key: string; label: string; isHome: boolean; sessions: Session[] }>();
+    const map = new Map<string, {
+      key: string;
+      label: string;
+      isLocal: boolean;
+      isDefault: boolean;
+      sessions: Session[];
+    }>();
     const pinnedSessions = visibleSessions.filter((session) => session.pinned);
     if (pinnedSessions.length) {
       map.set('__pinned__', {
-        key: '__pinned__', label: '收藏', isHome: true, sessions: pinnedSessions,
+        key: '__pinned__', label: '收藏', isLocal: false, isDefault: false, sessions: pinnedSessions,
       });
     }
     for (const s of visibleSessions) {
       if (s.pinned) continue;
       const key = s.execKey || 'local';
-      const label = s.execMode === 'relay' ? (s.execLabel || key) : '本机';
-      const isHome = s.execIsHome !== false;
+      const isLocal = s.execMode === 'local' || key === 'local';
+      const label = isLocal ? '本机' : (s.execLabel || key);
+      // “默认节点”只是新建 Session 的默认落点，绝不等于物理本机。
+      const isDefault = s.execIsHome !== false;
       if (!map.has(key)) {
-        map.set(key, { key, label, isHome, sessions: [] });
+        map.set(key, { key, label, isLocal, isDefault, sessions: [] });
       }
       const grp = map.get(key)!;
+      grp.isDefault = grp.isDefault || isDefault;
       if (normalizedSearch || grp.sessions.length < maxPerNode) {
         grp.sessions.push(s);
       }
     }
-    // 本机在前，远端按 label 排序
+    // 物理本机在前，其次是默认远端节点，再按节点名排序。
     const arr = Array.from(map.values());
     arr.sort((a, b) => {
       if (a.key === '__pinned__') return -1;
       if (b.key === '__pinned__') return 1;
-      if (a.isHome && !b.isHome) return -1;
-      if (!a.isHome && b.isHome) return 1;
+      if (a.isLocal !== b.isLocal) return a.isLocal ? -1 : 1;
+      if (a.isDefault !== b.isDefault) return a.isDefault ? -1 : 1;
       return a.label.localeCompare(b.label);
     });
     return arr;
@@ -587,11 +596,11 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
                 <div
                   onClick={() => toggleGroup(group.key)}
                   style={groupHeaderStyle}
-                  title={isPinnedGroup ? '收藏并置顶的会话' : group.isHome ? '本机执行' : `执行节点：${group.label}`}
+                  title={isPinnedGroup ? '收藏并置顶的会话' : group.isLocal ? '本机执行' : `执行节点：${group.label}`}
                 >
                   <span style={{ fontSize: 10, width: 12, textAlign: 'center', flexShrink: 0 }}>{isCollapsed ? '▸' : '▾'}</span>
                   <span style={{ fontSize: 11, fontWeight: 600 }}>
-                    {isPinnedGroup ? '★ 收藏' : group.isHome ? '🏠 本机' : `🌐 ${group.label}`}
+                    {isPinnedGroup ? '★ 收藏' : group.isLocal ? '🏠 本机' : `🌐 ${group.label}`}
                   </span>
                   <span style={{ fontSize: 10, color: 'var(--theme-text-muted)', marginLeft: 'auto' }}>{group.sessions.length}</span>
                 </div>
@@ -657,7 +666,8 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
                   ) : (
                     <div style={sessionTitleStyle}>
                       {s.sessionType === 'loop' && <span title="LOOP 会话">🔁</span>}
-                      {s.execIsHome === false && <span title={`远程执行：${s.execLabel || '执行端'}`}>🌐</span>}
+                      {(s.execMode === 'relay' || String(s.execKey || '').startsWith('relay:'))
+                        && <span title={`远程执行：${s.execLabel || '执行端'}`}>🌐</span>}
                       {isCodexAttached && <span title="接管已有 Codex thread">🧲</span>}
                       {isCodexSsh && <span title={`SSH Codex：${s.codexRemoteHost || '远端主机'}`}>⌁</span>}
                       <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', color: isActive ? 'var(--theme-accent, #7aa2f7)' : 'var(--theme-text, #e2e3ea)' }}>

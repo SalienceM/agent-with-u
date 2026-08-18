@@ -15,13 +15,15 @@ AuthGuard: WebSocket 握手阶段的认证 / 鉴权层。
 
   3. loopback （默认）
        只接受 trusted_proxies 列表内 IP 的连接（默认仅 127.0.0.1 / ::1），
-       无需 token，身份统一记为 "local"。
+       无需 token，身份默认记为 "local"。完整桌面客户端已经通过 Relay
+       验证用户时，可在 loopback 请求中附带稳定 userId，把本机 Session
+       放入同一用户命名空间；该映射还必须通过 Tauri/sidecar 本机密钥校验。
        适用：Tauri sidecar 本地直连；或单用户部署中由 docker 内网/反代
        做边界——把内网 IP 段加入 trusted_proxies 即整段免鉴权。
 
 每个连接在通过认证后，会在 websocket 对象上挂三个属性：
   websocket.identity     —— 用户标识（Remote-User、token 标识或 "local"）
-  websocket.identity_src —— 标识来源："forward-auth" / "token" / "loopback"
+  websocket.identity_src —— 标识来源："forward-auth" / "token" / "loopback" / "local-user"
   websocket.identity_email —— Authelia 模式下的邮箱（其他模式为 None）
 
 握手失败时返回 HTTP 401 / 403（而不是 WS close），方便反代和客户端区分。
@@ -33,6 +35,7 @@ import http
 import ipaddress
 import logging
 import secrets
+import uuid
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -56,6 +59,7 @@ class AuthConfig:
     trust_forward_auth: bool = False
     trusted_proxies: list[str] = field(default_factory=list)
     device_auth: Optional[Any] = None
+    local_identity_token: Optional[str] = None
 
     def mode(self) -> str:
         if self.trust_forward_auth:
@@ -228,6 +232,51 @@ class AuthGuard:
                 http.HTTPStatus.FORBIDDEN,
                 "forbidden: peer is not a trusted address\n",
             )
+
+        local_user_id = self._get_query_param(request, "localUserId")
+        if local_user_id:
+            # localUserId 只用于 Tauri WebView -> 本机 sidecar。即使管理员把
+            # 某段 Docker/LAN 地址加入 trusted_proxies，也不能让这些地址借此
+            # 声明任意 Relay 用户；同时用桌面壳持有的随机密钥证明请求来源。
+            if peer is None or not peer.is_loopback:
+                log.warning("[auth] reject %s: local user mapping requires loopback", peer)
+                return connection.respond(
+                    http.HTTPStatus.FORBIDDEN,
+                    "forbidden: local user mapping requires loopback\n",
+                )
+            configured_token = (self.config.local_identity_token or "").strip()
+            supplied_token = self._get_query_param(request, "localIdentityToken") or ""
+            if not configured_token or not secrets.compare_digest(
+                supplied_token, configured_token
+            ):
+                log.warning("[auth] reject %s: bad/missing local identity token", peer)
+                return connection.respond(
+                    http.HTTPStatus.UNAUTHORIZED,
+                    "unauthorized: bad local identity token\n",
+                )
+            try:
+                # Relay 管理用户的稳定 ID 当前统一为 UUID。拒绝任意字符串，避免
+                # 本机 URL 参数意外制造无穷 owner 命名空间。
+                local_user_id = str(uuid.UUID(local_user_id))
+            except (ValueError, AttributeError, TypeError):
+                log.warning("[auth] reject %s: invalid localUserId", peer)
+                return connection.respond(
+                    http.HTTPStatus.BAD_REQUEST,
+                    "bad request: invalid localUserId\n",
+                )
+            connection.identity = local_user_id
+            connection.username = str(
+                self._get_query_param(request, "localUsername") or ""
+            ).strip()[:128]
+            connection.display_name = str(
+                self._get_query_param(request, "localDisplayName") or ""
+            ).strip()[:128]
+            connection.identity_email = None
+            connection.identity_groups = []
+            connection.identity_src = "local-user"
+            log.info("[auth] accept %s as local user=%s", peer, local_user_id)
+            return None
+
         connection.identity = "local"
         connection.identity_email = None
         connection.identity_groups = []

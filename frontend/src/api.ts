@@ -17,6 +17,7 @@ import type {
   ProvDocument, ProvOpenResult, ProvResolveResult, ProvSaveResult,
 } from './types/prov';
 import { filterGitMetadata } from './utils/dirSyncPolicy';
+import { mergeExecutorSessionBatches } from './utils/executorSessions';
 
 type StreamDeltaCallback = (delta: any) => void;
 type SessionUpdateCallback = (data: any) => void;
@@ -50,7 +51,7 @@ export interface ConnectedClient {
   via: 'local' | 'relay'; // 直连本机 sidecar，还是经中继来
   since: string;          // ISO timestamp（UTC）
 }
-type ClientsChangedCallback = (clients: ConnectedClient[]) => void;
+type ClientsChangedCallback = (clients: ConnectedClient[], execKey: string) => void;
 
 export interface SkillInfo {
   name: string;
@@ -212,8 +213,32 @@ export interface RelayUserProfile {
   managed: boolean;
 }
 
+let localIdentityTokenPromise: Promise<string> | null = null;
+let localDeviceIdPromise: Promise<string> | null = null;
+let localPhysicalDeviceId = '';
+
+async function getLocalDeviceId(): Promise<string> {
+  if (!isTauri()) return '';
+  if (!localDeviceIdPromise) {
+    localDeviceIdPromise = tauriInvoke<string>('get_local_device_id')
+      .then((deviceId) => String(deviceId || '').trim())
+      .catch(() => '');
+  }
+  return localDeviceIdPromise;
+}
+
+async function getLocalIdentityToken(): Promise<string> {
+  if (!isTauri()) return '';
+  if (!localIdentityTokenPromise) {
+    localIdentityTokenPromise = tauriInvoke<string>('get_local_identity_token')
+      .then((token) => String(token || '').trim())
+      .catch(() => '');
+  }
+  return localIdentityTokenPromise;
+}
+
 export type ConnectionTarget =
-  | { mode: 'local' }
+  | { mode: 'local'; user?: RelayUserProfile }
   | {
       mode: 'relay';
       url: string;
@@ -397,20 +422,40 @@ export function updateRelayUserProfile(
  *   - Vite dev：前端 dev server 与后端分离，连 ws://127.0.0.1:44321
  *   - 生产 Web（反代后）：连 wss?://<当前host>/ws，由反代转发到后端
  */
-async function getLocalWsUrl(): Promise<string> {
+async function getLocalWsUrl(user?: RelayUserProfile): Promise<string> {
+  let value: string;
   if (isTauri()) {
     const port = await getWsPort();
-    return `ws://127.0.0.1:${port}`;
+    value = `ws://127.0.0.1:${port}`;
+  } else if (import.meta.env.DEV) {
+    value = `ws://127.0.0.1:${WS_PORT_DEFAULT}`;
+  } else {
+    const portableUrl = (window as typeof window & {
+      __AGENT_WITH_U_WS_URL__?: string;
+    }).__AGENT_WITH_U_WS_URL__;
+    if (portableUrl) value = portableUrl;
+    else {
+      const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+      value = `${proto}://${location.host}/ws`;
+    }
   }
-  if (import.meta.env.DEV) {
-    return `ws://127.0.0.1:${WS_PORT_DEFAULT}`;
+
+  // 完整桌面端即使当前登录了 Relay 用户，也保留一条本机执行连接。
+  // 这里只把 Relay 已验证过的稳定 userId 映射成本机 Session 命名空间；
+  // 不携带用户 Token，也不赋予“认领旧 Session”等 Relay 管理权限。
+  if (isTauri() && user?.managed && user.userId && user.userId !== 'legacy') {
+    const identityToken = await getLocalIdentityToken();
+    // 老桌面壳或本机密钥读取失败时，宁可回落到 legacy local 命名空间，
+    // 也不能发送一个未经 sidecar 认证的用户声明。
+    if (!identityToken) return value;
+    const url = new URL(value);
+    url.searchParams.set('localUserId', user.userId);
+    url.searchParams.set('localIdentityToken', identityToken);
+    if (user.username) url.searchParams.set('localUsername', user.username);
+    if (user.displayName) url.searchParams.set('localDisplayName', user.displayName);
+    return url.toString();
   }
-  const portableUrl = (window as typeof window & {
-    __AGENT_WITH_U_WS_URL__?: string;
-  }).__AGENT_WITH_U_WS_URL__;
-  if (portableUrl) return portableUrl;
-  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-  return `${proto}://${location.host}/ws`;
+  return value;
 }
 
 /**
@@ -458,6 +503,12 @@ function handleMessage(e: MessageEvent, source?: Conn) {
   if (typeof e.data !== 'string') return;
   try {
     const msg = JSON.parse(e.data);
+    // 同一 sidecar 同时经 local 与 Relay 接入时，RPC 响应仍由各自连接处理，
+    // 但 Relay 别名上的广播事件必须丢弃，否则 stream/session 更新会触发两遍。
+    if (msg.event && source && isLocalRelayDuplicate(source)
+        && pool.get('local')?.isOpen) {
+      return;
+    }
     if (msg.id !== undefined && pending.has(msg.id)) {
       const { resolve, reject } = pending.get(msg.id)!;
       pending.delete(msg.id);
@@ -476,7 +527,7 @@ function handleMessage(e: MessageEvent, source?: Conn) {
         execKey: source.key,
         execLabel: source.label,
         execMode: source.target.mode,
-        execIsHome: source.isHome,
+        execIsHome: isEffectiveHome(source),
       } : {};
       const data = {
         ...parsed,
@@ -517,7 +568,7 @@ function handleMessage(e: MessageEvent, source?: Conn) {
       assetChangedCallbacks.forEach((cb) => cb(data));
     } else if (msg.event === 'clientsChanged') {
       const data: ConnectedClient[] = msg.data ? JSON.parse(msg.data) : [];
-      clientsChangedCallbacks.forEach((cb) => cb(data));
+      clientsChangedCallbacks.forEach((cb) => cb(data, source?.key || 'local'));
     } else if (msg.event === 'loopUpdated') {
       const data = JSON.parse(msg.data);
       loopUpdatedCallbacks.forEach((cb) => cb(data));
@@ -574,7 +625,8 @@ function handleMessage(e: MessageEvent, source?: Conn) {
 //    · 额外节点 = execRoster（用户额外加入的中继节点）,与 home 同时在线。
 //  每条连接 = 一个 Conn;session→节点的执行位置记在 sessionExec 里,按 sessionId
 //  路由。执行位置与可视用户是两层边界：Backend 仍会按 Session.ownerId 鉴权。
-//  一个窗口只能连接 local，或同一 Relay 用户获授权的若干节点，不能混合身份。
+//  桌面窗口可同时连接“映射到当前用户的 local”和该 Relay 用户获授权的若干节点；
+//  浏览器窗口没有本机 sidecar。不同 Relay 用户的连接绝不进入同一个池。
 // ═══════════════════════════════════════════════════════════════════
 
 function execTargetKey(t: ExecTarget): string {
@@ -618,7 +670,7 @@ class Conn {
     // target here made an additional local connection accidentally reuse the
     // relay URL whenever home was remote, so a healthy desktop sidecar was
     // never contacted.
-    return this.target.mode === 'relay' ? this.target.url : getLocalWsUrl();
+    return this.target.mode === 'relay' ? this.target.url : getLocalWsUrl(this.target.user);
   }
 
   connect(): void {
@@ -679,7 +731,8 @@ class Conn {
       clearTimeout(connectTimer);
       this.reconnectDelay = INITIAL_RECONNECT_DELAY;
       if (this.reconnectTimer) { clearTimeout(this.reconnectTimer); this.reconnectTimer = null; }
-      console.log(`[api] Connected to ${url} (${this.key})`);
+      // 本机连接 URL 含一次性身份映射密钥，不能写进 DevTools / QA 日志。
+      console.log(`[api] Connected (${this.key})`);
       if (this.isHome) {
         useMock = false;
         connectionStatusCallbacks.forEach((cb) => cb(true));
@@ -721,7 +774,15 @@ class Conn {
         if (typeof e.data !== 'string') return;
         try {
           const m = JSON.parse(e.data);
-          if (m.t === 'ready') { relayHandshake = false; finishConnect(); }
+          if (m.t === 'ready') {
+            relayHandshake = false;
+            finishConnect();
+            // 兼容旧版只保存 URL/token/deviceId 的配置：Relay 握手返回的
+            // 已验证档案会补齐稳定 userId，并据此重建本机用户映射。
+            if (this.isHome && m.profile) {
+              rememberRelayUserProfile(normalizeRelayProfile(m.profile));
+            }
+          }
           else if (m.t === 'error') {
             console.error('[api] relay rejected:', m.message);
             try { socket.close(); } catch { /* */ }
@@ -835,6 +896,69 @@ function saveExecRoster(list: ExecTarget[]): void {
   try { localStorage.setItem(EXEC_ROSTER_KEY, JSON.stringify(list)); } catch { /* */ }
 }
 
+function isLocalRelayDuplicate(connection: Conn | undefined | null): boolean {
+  return !!localPhysicalDeviceId
+    && connection?.target.mode === 'relay'
+    && connection.target.deviceId === localPhysicalDeviceId;
+}
+
+function isEffectiveHome(connection: Conn | undefined | null): boolean {
+  return !!connection && (
+    connection.isHome
+    || (connection.key === 'local' && isLocalRelayDuplicate(homeConn))
+  );
+}
+
+/** 把旧版本留下的本机 Relay 别名缓存/路由归并到 canonical local。 */
+function reconcileLocalRelayDuplicates(): void {
+  if (!localPhysicalDeviceId || !pool.has('local')) return;
+  const duplicateKeys = new Set(
+    Array.from(pool.values())
+      .filter((connection) => isLocalRelayDuplicate(connection))
+      .map((connection) => connection.key),
+  );
+  if (!duplicateKeys.size) return;
+
+  const rows = new Map<string, any>();
+  for (const key of duplicateKeys) {
+    for (const session of sessionListCache.get(key) || []) {
+      if (session?.id) rows.set(session.id, session);
+    }
+    sessionListCache.delete(key);
+  }
+  // 本机缓存优先覆盖同一个 Session 的 Relay 副本。
+  for (const session of sessionListCache.get('local') || []) {
+    if (session?.id) rows.set(session.id, session);
+  }
+  if (rows.size) sessionListCache.set('local', Array.from(rows.values()));
+
+  for (const [sessionId, key] of [...sessionExec.entries()]) {
+    if (duplicateKeys.has(key)) sessionExec.set(sessionId, 'local');
+  }
+  const roster = loadExecRoster();
+  const filteredRoster = roster.filter((target) => (
+    target.mode !== 'relay' || target.deviceId !== localPhysicalDeviceId
+  ));
+  if (filteredRoster.length !== roster.length) saveExecRoster(filteredRoster);
+  // 当前登录/默认连接可能正是这个 Relay 别名，需保留作账户通道；额外的
+  // 同机别名连接则可直接关闭，避免无意义心跳和重复广播。
+  for (const key of duplicateKeys) {
+    const duplicate = pool.get(key);
+    if (duplicate && duplicate !== homeConn) {
+      pool.delete(key);
+      duplicate.dispose();
+    }
+  }
+  persistSessionListCache();
+  persistSessionExec();
+}
+
+function sessionListConnections(): Conn[] {
+  const connections = Array.from(pool.values());
+  if (!localPhysicalDeviceId || !pool.has('local')) return connections;
+  return connections.filter((connection) => !isLocalRelayDuplicate(connection));
+}
+
 function relayIdentity(target: ExecTarget | null | undefined): string {
   if (!target || target.mode !== 'relay') return '';
   const userId = target.user?.userId;
@@ -878,9 +1002,14 @@ function clearRelayIdentityState(): void {
   persistSessionExec();
 }
 
-function relayTransportChanged(left: ExecTarget, right: ExecTarget): boolean {
-  return left.mode === 'relay' && right.mode === 'relay'
-    && (left.url !== right.url || left.token !== right.token || left.deviceId !== right.deviceId);
+function connectionTransportChanged(left: ExecTarget, right: ExecTarget): boolean {
+  if (left.mode === 'relay' && right.mode === 'relay') {
+    return left.url !== right.url || left.token !== right.token || left.deviceId !== right.deviceId;
+  }
+  if (left.mode === 'local' && right.mode === 'local') {
+    return (left.user?.userId || 'local') !== (right.user?.userId || 'local');
+  }
+  return left.mode !== right.mode;
 }
 
 function ensureConn(target: ExecTarget, isHome: boolean): Conn {
@@ -890,7 +1019,7 @@ function ensureConn(target: ExecTarget, isHome: boolean): Conn {
     c = new Conn(key, target, isHome);
     pool.set(key, c);
     c.connect();
-  } else if (relayTransportChanged(c.target, target)) {
+  } else if (connectionTransportChanged(c.target, target)) {
     const wasHome = c.isHome || isHome;
     c.dispose();
     c = new Conn(key, target, wasHome);
@@ -903,14 +1032,49 @@ function ensureConn(target: ExecTarget, isHome: boolean): Conn {
   return c;
 }
 
+function localTargetForCurrentUser(): ExecTarget {
+  if (connectionTarget.mode === 'relay') {
+    const user = normalizeRelayProfile(connectionTarget.user);
+    if (user.managed && user.userId && user.userId !== 'legacy') {
+      return { mode: 'local', user };
+    }
+  }
+  return { mode: 'local' };
+}
+
+function hasLocalExecutor(): boolean {
+  // Tauri 是完整客户端，本机 sidecar 始终存在；Vite 开发模式也有本地后端。
+  // 生产浏览器没有客户端 sidecar，不能凭空展示“本机”。
+  return connectionTarget.mode === 'local' || isTauri() || import.meta.env.DEV;
+}
+
+function ensureLocalExecutorConnection(): void {
+  if (!hasLocalExecutor()) return;
+  const target = localTargetForCurrentUser();
+  const existing = pool.get('local');
+  if (existing && connectionTransportChanged(existing.target, target)) {
+    // local 的 owner 命名空间发生了变化，旧用户的离线列表与 session 路由
+    // 必须先清空，不能在新用户完成首轮刷新前短暂泄露到侧栏。
+    sessionListCache.delete('local');
+    for (const [sessionId, key] of [...sessionExec.entries()]) {
+      if (key === 'local') sessionExec.delete(sessionId);
+    }
+    persistSessionListCache();
+    persistSessionExec();
+  }
+  ensureConn(target, connectionTarget.mode === 'local');
+  if (localPhysicalDeviceId) reconcileLocalRelayDuplicates();
+}
+
 function initPool(): void {
   loadSessionListCache();
   loadSessionExec();
   homeConn = ensureConn(connectionTarget, true);
+  ensureLocalExecutorConnection();
   const homeIdentity = relayIdentity(connectionTarget);
   const storedRoster = loadExecRoster();
-  // 一个窗口只承载一个当前用户。local 与 Relay、不同 Relay 用户都不能
-  // 同时进入连接池；同一 Relay 用户仍可连接多台获授权执行端。
+  // 一个窗口只承载一个当前用户。Tauri 的 local 会映射到这个用户；不同
+  // Relay 用户不能同时进入连接池，同一用户仍可连接多台获授权执行端。
   const safeRoster = homeIdentity
     ? storedRoster.filter((target) => relayIdentity(target) === homeIdentity)
     : [];
@@ -929,6 +1093,14 @@ function initPool(): void {
   }
   persistSessionListCache();
   persistSessionExec();
+  if (isTauri()) {
+    void getLocalDeviceId().then((deviceId) => {
+      if (!deviceId || deviceId === localPhysicalDeviceId) return;
+      localPhysicalDeviceId = deviceId;
+      reconcileLocalRelayDuplicates();
+      notifyExecStatus();
+    });
+  }
 }
 
 // 大多数会话级 RPC 第一个参数就是 sessionId;少数把 sessionId 藏在 JSON 载荷里。
@@ -972,7 +1144,7 @@ export async function setConnectionTarget(t: ConnectionTarget): Promise<void> {
   try { localStorage.setItem(CONN_TARGET_KEY, JSON.stringify(t)); } catch { /* */ }
   const newKey = execTargetKey(t);
   if (homeConn && homeConn.key === newKey) {
-    if (relayTransportChanged(homeConn.target, t)) {
+    if (connectionTransportChanged(homeConn.target, t)) {
       homeConn.dispose();
       homeConn = new Conn(newKey, t, true);
       pool.set(newKey, homeConn);
@@ -981,6 +1153,7 @@ export async function setConnectionTarget(t: ConnectionTarget): Promise<void> {
       homeConn.isHome = true;
       homeConn.target = t;
     }
+    ensureLocalExecutorConnection();
     connectionStatusCallbacks.forEach((cb) => cb(homeConn.isOpen));
     notifyCurrentUserChanged(identityChanged);
     return;
@@ -1004,6 +1177,7 @@ export async function setConnectionTarget(t: ConnectionTarget): Promise<void> {
       if (!list.some((rt) => execTargetKey(rt) === oldHome.key)) { list.push(oldHome.target); saveExecRoster(list); }
     }
   }
+  ensureLocalExecutorConnection();
   connectionStatusCallbacks.forEach((cb) => cb(homeConn.isOpen));
   notifyExecStatus();
   notifyCurrentUserChanged(identityChanged || (
@@ -1041,6 +1215,7 @@ export function rememberRelayUserProfile(profile: RelayUserProfile): void {
       connection.target = { ...connection.target, user: profile };
     }
   }
+  ensureLocalExecutorConnection();
   notifyCurrentUserChanged(false);
   notifyExecStatus();
 }
@@ -1053,9 +1228,17 @@ export function getExecutors(): ExecutorInfo[] {
   const push = (c: Conn) => {
     if (seen.has(c.key)) return;
     seen.add(c.key);
-    out.push({ key: c.key, label: c.label, mode: c.target.mode, isHome: c.isHome, connected: c.isOpen });
+    out.push({
+      key: c.key,
+      label: c.label,
+      mode: c.target.mode,
+      isHome: isEffectiveHome(c),
+      connected: c.isOpen,
+    });
   };
-  for (const c of pool.values()) push(c);
+  for (const c of pool.values()) {
+    if (!isLocalRelayDuplicate(c)) push(c);
+  }
   out.sort((a, b) => {
     if (a.key === 'local') return -1;
     if (b.key === 'local') return 1;
@@ -1069,7 +1252,7 @@ export function getExecutors(): ExecutorInfo[] {
 export function getExecTarget(key: string): ExecTarget | null {
   const c = pool.get(key);
   if (c) return c.target;
-  if (key === 'local') return { mode: 'local' };
+  if (key === 'local') return localTargetForCurrentUser();
   return loadExecRoster().find((t) => execTargetKey(t) === key) || null;
 }
 
@@ -1093,6 +1276,7 @@ export function addExecRoster(t: ExecTarget): boolean {
   else list[index] = t;
   saveExecRoster(list);
   ensureConn(t, false);
+  reconcileLocalRelayDuplicates();
   notifyExecStatus();
   return true;
 }
@@ -1108,7 +1292,11 @@ export function removeExecRoster(key: string): void {
 }
 
 /** 当前默认节点(新建会话的默认落点)的 key。 */
-export function getHomeExecKey(): string { return homeConn ? homeConn.key : 'local'; }
+export function getHomeExecKey(): string {
+  return isLocalRelayDuplicate(homeConn) && pool.has('local')
+    ? 'local'
+    : (homeConn ? homeConn.key : 'local');
+}
 
 /** 订阅执行节点在线状态变化（增删 / 上下线）。 */
 export function onExecStatus(cb: () => void): () => void {
@@ -1116,10 +1304,9 @@ export function onExecStatus(cb: () => void): () => void {
   return () => { execStatusCallbacks = execStatusCallbacks.filter((x) => x !== cb); };
 }
 
-// ── 桌面端本机角色（仅 Tauri）：执行节点 / 纯客户端 ──────────────────────
-// executor：本机运行执行节点 sidecar，可选发布到中继。
-// client：  只作 UI，不在本机运行执行节点，经中继连接其它执行节点。
-// 由 Rust 在启动时读取（决定是否 spawn sidecar），改动需重启应用生效。
+// ── 桌面端本机发布模式（仅 Tauri）──────────────────────────────────────
+// 两种模式都运行本机 sidecar；executor 会额外发布到 Relay，client 仅本机可见。
+// 由 Rust 在启动时读取（决定是否透传 Relay 发布凭据），改动需重启应用生效。
 export interface DesktopConfig {
   mode: 'executor' | 'client';
   relayUrl: string;
@@ -1217,7 +1404,7 @@ function parseRpcObject<T extends Record<string, any>>(result: any, fallback: T)
 function attachSessionExecutor<T extends Record<string, any> | null>(session: T): T {
   if (!session?.id) return session;
   const storedKey = sessionExec.get(session.id);
-  let key = homeConn.key;
+  let key = getHomeExecKey();
   if (storedKey && pool.has(storedKey)) {
     key = storedKey;
   } else if (storedKey) {
@@ -1229,7 +1416,7 @@ function attachSessionExecutor<T extends Record<string, any> | null>(session: T)
     session.execKey = connection.key;
     session.execLabel = connection.label;
     session.execMode = connection.target.mode;
-    session.execIsHome = connection.isHome;
+    session.execIsHome = isEffectiveHome(connection);
   }
   return session;
 }
@@ -1244,7 +1431,7 @@ function cachedSessionMeta(id: string): any | null {
       execKey: connection?.key || key,
       execLabel: connection?.label || summary.execLabel,
       execMode: connection?.target.mode || summary.execMode,
-      execIsHome: connection?.isHome ?? summary.execIsHome,
+      execIsHome: connection ? isEffectiveHome(connection) : summary.execIsHome,
       offlineCached: true,
     };
   }
@@ -1446,7 +1633,7 @@ export const api = {
     const requestEpoch = relayIdentityEpoch;
     // 所有已配置节点都参与合并；离线节点直接使用最后一次成功结果。
     // 在线但连接假死的节点最多等待 3 秒，不能无限拖住整条侧栏。
-    const conns = Array.from(pool.values());
+    const conns = sessionListConnections();
     const results = await Promise.all(conns.map(async (c) => {
       if (!c.isOpen) return {
         c, list: sessionListCache.get(c.key) || [], stale: requestEpoch !== relayIdentityEpoch,
@@ -1467,18 +1654,23 @@ export const api = {
         return { c, list: sessionListCache.get(c.key) || [], stale: requestEpoch !== relayIdentityEpoch };
       }
     }));
-    const merged: any[] = [];
+    const batches: Parameters<typeof mergeExecutorSessionBatches>[0] = [];
     for (const { c, list, stale } of results) {
       if (stale || requestEpoch !== relayIdentityEpoch || pool.get(c.key) !== c) continue;
       // 等待其它节点期间可能收到更新事件；事件已把 cache 推到更新版本，
       // 因此合并时再次取 cache，不能使用本轮早先捕获的旧数组。
       const latestList = sessionListCache.get(c.key) || list;
-      for (const s of latestList) {
-        if (s && s.id) {
-          sessionExec.set(s.id, c.key);
-          merged.push({ ...s, execKey: c.key, execLabel: c.label, execMode: c.target.mode, execIsHome: c.isHome });
-        }
-      }
+      batches.push({
+        execKey: c.key,
+        execLabel: c.label,
+        execMode: c.target.mode,
+        execIsHome: isEffectiveHome(c),
+        sessions: latestList,
+      });
+    }
+    const merged = mergeExecutorSessionBatches(batches);
+    for (const session of merged) {
+      sessionExec.set(session.id, session.execKey);
     }
     persistSessionExec();
     return merged;
@@ -1681,7 +1873,9 @@ export const api = {
     execKey?: string,
     codexRemote: { mode?: 'node'; threadId?: string; title?: string } = {},
   ): Promise<any> {
-    const conn = (execKey && pool.get(execKey)) || homeConn;
+    const conn = (execKey && pool.get(execKey))
+      || pool.get(getHomeExecKey())
+      || homeConn;
     const result = await conn.request('createSession', [
       workingDir, backendId, sessionType, JSON.stringify(runtime || {}), JSON.stringify(codexRemote || {}),
     ]);
@@ -1693,7 +1887,7 @@ export const api = {
         s.execKey = conn.key;
         s.execLabel = conn.label;
         s.execMode = conn.target.mode;
-        s.execIsHome = conn.isHome;
+        s.execIsHome = isEffectiveHome(conn);
       }
       return s;
     } catch { return null; }
@@ -2967,8 +3161,8 @@ export const api = {
   },
 
   /** 列出当前连接到本执行节点的所有 UI 客户端（本地直连 + 经中继）。 */
-  async listConnectedClients(): Promise<ConnectedClient[]> {
-    const r = await call('listConnectedClients');
+  async listConnectedClients(execKey?: string): Promise<ConnectedClient[]> {
+    const r = execKey ? await callOn(execKey, 'listConnectedClients') : await call('listConnectedClients');
     try {
       const parsed = typeof r === 'string' ? JSON.parse(r) : r;
       return Array.isArray(parsed) ? parsed : [];

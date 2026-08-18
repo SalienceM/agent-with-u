@@ -1,6 +1,6 @@
 import React, { useState, useCallback, useEffect, useLayoutEffect, useRef, useMemo } from 'react';
 import { api } from '../api';
-import type { FollowUpCapabilities } from '../api';
+import type { CurrentUserProfile, FollowUpCapabilities } from '../api';
 import { MessageBubble } from './MessageBubble';
 import { ChatInput } from './ChatInput';
 import { PermissionGate } from './PermissionGate';
@@ -103,6 +103,7 @@ export interface ChatPaneProps {
   onFocus: () => void;                      // 点击 pane 时调用
   backends: any[];                          // 共享 backends 列表
   config: AppConfig;                        // 共享配置(fontSize, renderMarkdown)
+  currentUser: CurrentUserProfile;          // 当前已验证用户，用于消息头像
   themeBorderFocused: string;               // 焦点边框色
   isMobile: boolean;
   onRequestNewSession: () => void;          // 用户在这个 pane 想新建 session 时
@@ -123,6 +124,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
   onFocus,
   backends,
   config,
+  currentUser,
   themeBorderFocused,
   isMobile,
   onRequestNewSession,
@@ -841,6 +843,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
                 {showDate && <MessageDateDivider timestamp={msg.timestamp} />}
                 <MessageBubble
                   message={msg}
+                  currentUser={currentUser}
                   fontSize={config.fontSize}
                   renderMarkdown={config.renderMarkdown}
                   animateIn={isSameSession && hiddenCount + idx >= prevCount}

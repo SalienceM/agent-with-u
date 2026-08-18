@@ -54,6 +54,217 @@ async function resizeAvatar(file: File): Promise<string> {
   }
 }
 
+const AVATAR_ZOOM_MIN = 0.1;
+const AVATAR_ZOOM_MAX = 16;
+
+function clampAvatarZoom(value: number): number {
+  return Math.min(AVATAR_ZOOM_MAX, Math.max(AVATAR_ZOOM_MIN, value));
+}
+
+const AvatarPreviewDialog: React.FC<{
+  src: string;
+  displayName: string;
+  onClose: () => void;
+}> = ({ src, displayName, onClose }) => {
+  const viewportRef = useRef<HTMLDivElement>(null);
+  const zoomRef = useRef(1);
+  const dragRef = useRef<{
+    pointerId: number;
+    startX: number;
+    startY: number;
+    offsetX: number;
+    offsetY: number;
+  } | null>(null);
+  const [zoom, setZoom] = useState(1);
+  const [offset, setOffset] = useState({ x: 0, y: 0 });
+  const [dragging, setDragging] = useState(false);
+
+  const resetView = useCallback(() => {
+    zoomRef.current = 1;
+    setZoom(1);
+    setOffset({ x: 0, y: 0 });
+  }, []);
+
+  const applyZoom = useCallback((rawZoom: number, anchor?: { x: number; y: number }) => {
+    const previousZoom = zoomRef.current;
+    const nextZoom = clampAvatarZoom(rawZoom);
+    if (Math.abs(nextZoom - previousZoom) < 0.0001) return;
+
+    const viewport = viewportRef.current;
+    if (viewport && anchor) {
+      const rect = viewport.getBoundingClientRect();
+      const anchorX = anchor.x - rect.left - rect.width / 2;
+      const anchorY = anchor.y - rect.top - rect.height / 2;
+      const ratio = nextZoom / previousZoom;
+      setOffset((current) => ({
+        x: anchorX - (anchorX - current.x) * ratio,
+        y: anchorY - (anchorY - current.y) * ratio,
+      }));
+    }
+
+    zoomRef.current = nextZoom;
+    setZoom(nextZoom);
+  }, []);
+
+  useEffect(() => resetView(), [resetView, src]);
+
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') onClose();
+      if ((event.key === '0' || event.key === 'Home') && !event.ctrlKey && !event.metaKey) {
+        resetView();
+      }
+      if (event.key === '+' || event.key === '=') applyZoom(zoomRef.current * 1.2);
+      if (event.key === '-') applyZoom(zoomRef.current / 1.2);
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [applyZoom, onClose, resetView]);
+
+  const finishDrag = useCallback((event: React.PointerEvent<HTMLDivElement>) => {
+    if (dragRef.current?.pointerId !== event.pointerId) return;
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    }
+    dragRef.current = null;
+    setDragging(false);
+  }, []);
+
+  return (
+    <div
+      role="dialog"
+      aria-modal="true"
+      aria-label={`${displayName} 的头像预览`}
+      onClick={(event) => {
+        if (event.target === event.currentTarget) onClose();
+      }}
+      style={{
+        position: 'fixed', inset: 0, zIndex: 10000,
+        display: 'grid', placeItems: 'center', padding: 12, boxSizing: 'border-box',
+        background: 'rgba(7, 12, 20, 0.88)', backdropFilter: 'blur(6px)',
+      }}
+    >
+      <div style={{
+        width: 'min(1080px, calc(100vw - 24px))',
+        height: 'min(760px, calc(100dvh - 24px))',
+        minHeight: 300,
+        display: 'flex', flexDirection: 'column', overflow: 'hidden',
+        background: 'var(--theme-bg-tertiary, #111827)',
+        border: '1px solid var(--theme-border, rgba(255,255,255,.16))',
+        borderRadius: 5,
+        boxShadow: '0 24px 70px rgba(0,0,0,.52)',
+      }}>
+        <div style={{
+          minHeight: 52, padding: '0 12px 0 16px', display: 'flex', alignItems: 'center', gap: 12,
+          borderBottom: '1px solid var(--theme-border)', background: 'var(--theme-bg-secondary)',
+        }}>
+          <div style={{ minWidth: 0, flex: 1 }}>
+            <div style={{ color: 'var(--theme-text)', fontSize: 13, fontWeight: 650 }}>头像预览</div>
+            <div style={{ color: 'var(--theme-text-muted)', fontSize: 10, marginTop: 2 }}>
+              滚轮或滑杆缩放 · 拖动查看 · 双击复位
+            </div>
+          </div>
+          <button type="button" onClick={onClose} aria-label="关闭头像预览" style={closeBtnStyle}>✕</button>
+        </div>
+
+        <div
+          ref={viewportRef}
+          onWheel={(event) => {
+            event.preventDefault();
+            applyZoom(
+              zoomRef.current * Math.exp(-event.deltaY * 0.0015),
+              { x: event.clientX, y: event.clientY },
+            );
+          }}
+          onDoubleClick={resetView}
+          onPointerDown={(event) => {
+            if (event.button !== 0) return;
+            event.currentTarget.setPointerCapture(event.pointerId);
+            dragRef.current = {
+              pointerId: event.pointerId,
+              startX: event.clientX,
+              startY: event.clientY,
+              offsetX: offset.x,
+              offsetY: offset.y,
+            };
+            setDragging(true);
+            event.preventDefault();
+          }}
+          onPointerMove={(event) => {
+            const drag = dragRef.current;
+            if (!drag || drag.pointerId !== event.pointerId) return;
+            setOffset({
+              x: drag.offsetX + event.clientX - drag.startX,
+              y: drag.offsetY + event.clientY - drag.startY,
+            });
+          }}
+          onPointerUp={finishDrag}
+          onPointerCancel={finishDrag}
+          style={{
+            flex: 1, minHeight: 0, margin: 12, overflow: 'hidden', position: 'relative',
+            display: 'grid', placeItems: 'center', touchAction: 'none', userSelect: 'none',
+            cursor: dragging ? 'grabbing' : 'grab',
+            border: '1px solid color-mix(in srgb, var(--theme-border) 82%, transparent)',
+            borderRadius: 3,
+            background: 'radial-gradient(circle at center, rgba(95,115,140,.12), rgba(4,8,14,.34))',
+          }}
+        >
+          <img
+            src={src}
+            alt={`${displayName} 的头像`}
+            draggable={false}
+            style={{
+              maxWidth: 'calc(100% - 32px)', maxHeight: 'calc(100% - 32px)',
+              objectFit: 'contain', pointerEvents: 'none',
+              transform: `translate3d(${offset.x}px, ${offset.y}px, 0) scale(${zoom})`,
+              transformOrigin: 'center center',
+              boxShadow: '0 12px 34px rgba(0,0,0,.34)',
+              willChange: 'transform',
+            }}
+          />
+        </div>
+
+        <div style={{
+          minHeight: 54, padding: '8px 14px', display: 'flex', alignItems: 'center', gap: 9,
+          flexWrap: 'wrap',
+          borderTop: '1px solid var(--theme-border)', background: 'var(--theme-bg-secondary)',
+          boxSizing: 'border-box',
+        }}>
+          <button
+            type="button"
+            aria-label="缩小头像"
+            onClick={() => applyZoom(zoomRef.current / 1.2)}
+            style={avatarPreviewControlStyle}
+          >−</button>
+          <input
+            type="range"
+            aria-label="头像缩放比例"
+            min={AVATAR_ZOOM_MIN * 100}
+            max={AVATAR_ZOOM_MAX * 100}
+            step={1}
+            value={Math.round(zoom * 100)}
+            onChange={(event) => applyZoom(Number(event.target.value) / 100)}
+            style={{ flex: '1 1 100px', minWidth: 60, accentColor: 'var(--theme-accent)' }}
+          />
+          <button
+            type="button"
+            aria-label="放大头像"
+            onClick={() => applyZoom(zoomRef.current * 1.2)}
+            style={avatarPreviewControlStyle}
+          >＋</button>
+          <span style={{
+            width: 54, textAlign: 'right', color: 'var(--theme-text)',
+            fontSize: 11, fontVariantNumeric: 'tabular-nums',
+          }}>{Math.round(zoom * 100)}%</span>
+          <button type="button" onClick={resetView} style={{ ...avatarPreviewControlStyle, width: 'auto', padding: '0 10px' }}>
+            复位
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+};
+
 type SettingsPage = 'user' | 'general' | 'voice' | 'appearance' | 'desktop' | 'system';
 
 const SETTINGS_PAGES: Array<{
@@ -134,6 +345,7 @@ export const Settings: React.FC<SettingsProps> = ({
   const [userSaving, setUserSaving] = useState(false);
   const [userError, setUserError] = useState('');
   const [userSaved, setUserSaved] = useState(false);
+  const [avatarPreviewOpen, setAvatarPreviewOpen] = useState(false);
   const [legacyClaimPreview, setLegacyClaimPreview] = useState<LegacyClaimPreview | null>(null);
   const [legacyClaimSelected, setLegacyClaimSelected] = useState<string[]>([]);
   const [legacyClaimLoading, setLegacyClaimLoading] = useState(false);
@@ -300,6 +512,10 @@ export const Settings: React.FC<SettingsProps> = ({
       setUserError(error?.message || '头像读取失败');
     }
   }, []);
+
+  useEffect(() => {
+    if (!isOpen || !userDraft?.avatarData) setAvatarPreviewOpen(false);
+  }, [isOpen, userDraft?.avatarData]);
 
   const handleClaimLegacySessions = useCallback(async () => {
     if (!legacyClaimSelected.length || legacyClaimRunning) return;
@@ -560,17 +776,26 @@ export const Settings: React.FC<SettingsProps> = ({
                 <div style={{ display: 'flex', alignItems: 'center', gap: 14, marginBottom: 16 }}>
                   <button
                     type="button"
-                    disabled={!userDraft.managed}
-                    onClick={() => userAvatarInputRef.current?.click()}
-                    title={userDraft.managed ? '更换头像' : '当前身份不支持修改头像'}
+                    disabled={!userDraft.avatarData}
+                    onClick={() => setAvatarPreviewOpen(true)}
+                    aria-label={userDraft.avatarData ? '放大查看当前头像' : '尚未设置头像'}
+                    title={userDraft.avatarData ? '点击放大查看' : '尚未设置头像'}
                     style={{
-                      width: 64, height: 64, padding: 0, flexShrink: 0, overflow: 'hidden',
-                      borderRadius: '50%', border: '1px solid var(--theme-border)', cursor: userDraft.managed ? 'pointer' : 'default',
+                      width: 64, height: 64, padding: 0, flexShrink: 0, overflow: 'hidden', position: 'relative',
+                      borderRadius: '50%', border: '1px solid var(--theme-border)', cursor: userDraft.avatarData ? 'zoom-in' : 'default',
                       color: '#fff', background: userDraft.avatarColor, fontSize: 23, fontWeight: 700,
                     }}
                   >
                     {userDraft.avatarData ? (
-                      <img src={userDraft.avatarData} alt="当前头像" style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
+                      <>
+                        <img src={userDraft.avatarData} alt="当前头像" style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
+                        <span aria-hidden="true" style={{
+                          position: 'absolute', right: 2, bottom: 2, width: 17, height: 17,
+                          display: 'grid', placeItems: 'center', borderRadius: '50%',
+                          background: 'rgba(7,12,20,.74)', border: '1px solid rgba(255,255,255,.5)',
+                          color: '#fff', fontSize: 9, lineHeight: 1,
+                        }}>↗</span>
+                      </>
                     ) : (userDraft.displayName || userDraft.username).slice(0, 1).toUpperCase()}
                   </button>
                   <input
@@ -587,16 +812,29 @@ export const Settings: React.FC<SettingsProps> = ({
                     <div style={{ color: 'var(--theme-text)', fontSize: 16, fontWeight: 650 }}>
                       {userDraft.displayName}
                     </div>
-                    <div style={{ marginTop: 3, color: 'var(--theme-text-muted)', fontSize: 11 }}>
-                      @{userDraft.username} · {getConnectionTarget().mode === 'local' ? '本机直连' : 'Relay 已验证'}
+                    <div style={{
+                      marginTop: 4, display: 'flex', alignItems: 'center', gap: 7, flexWrap: 'wrap',
+                      color: 'var(--theme-text-muted)', fontSize: 11,
+                    }}>
+                      <span>@{userDraft.username} · {getConnectionTarget().mode === 'local' ? '本机直连' : 'Relay 已验证'}</span>
+                      {userDraft.managed && (
+                        <button
+                          type="button"
+                          onClick={() => userAvatarInputRef.current?.click()}
+                          style={profileInlineButtonStyle}
+                        >{userDraft.avatarData ? '更换头像' : '上传头像'}</button>
+                      )}
+                      {userDraft.managed && userDraft.avatarData && (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setAvatarPreviewOpen(false);
+                            setUserDraft((current) => current ? { ...current, avatarData: '' } : current);
+                          }}
+                          style={{ ...profileInlineButtonStyle, color: 'var(--theme-error, #f85149)' }}
+                        >移除</button>
+                      )}
                     </div>
-                    {userDraft.managed && userDraft.avatarData && (
-                      <button
-                        type="button"
-                        onClick={() => setUserDraft((current) => current ? { ...current, avatarData: '' } : current)}
-                        style={{ ...closeBtnStyle, fontSize: 11, padding: '5px 0 0' }}
-                      >移除头像</button>
-                    )}
                   </div>
                 </div>
 
@@ -1499,6 +1737,13 @@ export const Settings: React.FC<SettingsProps> = ({
           </main>
         </div>
       </div>
+      {avatarPreviewOpen && userDraft?.avatarData && (
+        <AvatarPreviewDialog
+          src={userDraft.avatarData}
+          displayName={userDraft.displayName || userDraft.username}
+          onClose={() => setAvatarPreviewOpen(false)}
+        />
+      )}
     </div>
   );
 };
@@ -1599,6 +1844,17 @@ const labelStyle: React.CSSProperties = {
   fontSize: 13, fontWeight: 500,
   color: 'var(--theme-text, rgba(255,255,255,0.7))',
   marginBottom: 6, display: 'block',
+};
+const avatarPreviewControlStyle: React.CSSProperties = {
+  width: 30, height: 30, padding: 0, display: 'grid', placeItems: 'center',
+  border: '1px solid var(--theme-border)', borderRadius: 3,
+  background: 'var(--theme-input-bg)', color: 'var(--theme-text)',
+  fontSize: 14, cursor: 'pointer', fontFamily: 'inherit',
+};
+const profileInlineButtonStyle: React.CSSProperties = {
+  padding: '3px 7px', border: '1px solid var(--theme-border)', borderRadius: 3,
+  background: 'var(--theme-input-bg)', color: 'var(--theme-text)',
+  fontSize: 10, lineHeight: 1.25, cursor: 'pointer', fontFamily: 'inherit',
 };
 const hintStyle: React.CSSProperties = {
   marginTop: 10,

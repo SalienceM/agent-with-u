@@ -1492,6 +1492,11 @@ class BridgeWS:
             # Relay has authenticated the per-user token and replaced any
             # client-supplied identity with the stable UUID.
             return identity or "relay:unauthenticated"
+        if source == "local-user":
+            # 完整桌面端先在 Relay 验证用户，再把同一稳定 UUID 映射到仅
+            # loopback 可达的本机 sidecar；本地执行与 A/B 远端执行因此属于
+            # 同一个用户，但本地连接不获得 Relay 的设备主用户管理能力。
+            return identity or "local"
         if source in {"", "none", "loopback"}:
             return "local"
         # Keep direct hosted-web identities separate from the reserved local

@@ -26,6 +26,7 @@ import asyncio
 import json
 import logging
 import os
+import secrets
 import sys
 from pathlib import Path
 from typing import Optional
@@ -267,6 +268,31 @@ def _envbool(name: str) -> bool:
     return (os.environ.get(name, "") or "").strip().lower() in ("1", "true", "yes", "on")
 
 
+def _default_local_identity_token() -> Optional[str]:
+    """读取或创建本机身份密钥，兼容先启动 Python 的开发顺序。"""
+    explicit = (os.environ.get("AGENT_WITH_U_LOCAL_IDENTITY_TOKEN") or "").strip()
+    if explicit:
+        return explicit
+    path = Path.home() / ".agent-with-u" / "local-identity-token"
+    try:
+        token = path.read_text(encoding="utf-8").strip()
+        if len(token) >= 32:
+            return token
+    except OSError:
+        pass
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        token = secrets.token_urlsafe(48)
+        path.write_text(token, encoding="utf-8")
+        try:
+            path.chmod(0o600)
+        except OSError:
+            pass
+        return token
+    except OSError:
+        return None
+
+
 def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     """CLI 参数；任何参数缺省时回落到 AGENT_WITH_U_* 环境变量，再回落到内置默认。"""
     p = argparse.ArgumentParser(prog="agent-with-u-backend", add_help=True)
@@ -283,6 +309,9 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     p.add_argument("--trusted-proxies",
                    default=os.environ.get("AGENT_WITH_U_TRUSTED_PROXIES", ""),
                    help="comma-separated CIDRs allowed to set Remote-* headers (default: 127.0.0.0/8,::1/128)")
+    p.add_argument("--local-identity-token",
+                   default=_default_local_identity_token(),
+                   help=argparse.SUPPRESS)
     # ── 中继（C–C/S）：本执行节点主动拨出到公网中继 S，供远程 UI 经 S 访问 ──
     p.add_argument("--relay-url", default=os.environ.get("AGENT_WITH_U_RELAY_URL") or None,
                    help="connect out to a relay server (e.g. wss://relay.example.com) "
@@ -356,6 +385,7 @@ def build_auth_config(args: argparse.Namespace) -> AuthConfig:
         auth_token=args.auth_token,
         trust_forward_auth=bool(args.trust_forward_auth),
         trusted_proxies=proxies,
+        local_identity_token=args.local_identity_token,
     )
 
 

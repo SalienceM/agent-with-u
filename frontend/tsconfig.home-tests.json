@@ -18,6 +18,7 @@
     "src/utils/chatMessageVisibility.ts",
     "src/utils/dirSyncPolicy.ts",
     "src/utils/dirSyncFreshness.ts",
+    "src/utils/executorSessions.ts",
     "src/utils/sha256.ts"
   ]
 }

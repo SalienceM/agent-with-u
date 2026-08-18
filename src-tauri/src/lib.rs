@@ -229,14 +229,87 @@ fn get_ws_port() -> u16 {
     WS_PORT
 }
 
+fn local_device_id_path() -> Option<PathBuf> {
+    dirs::home_dir().map(|h| h.join(".agent-with-u").join("device-id"))
+}
+
+/// 返回与 Python sidecar/Relay 注册一致的稳定物理设备 ID。
+fn load_or_create_local_device_id() -> Result<String, String> {
+    if let Ok(explicit) = std::env::var("AGENT_WITH_U_DEVICE_ID") {
+        let value = explicit.trim();
+        if !value.is_empty() {
+            return Ok(value.to_string());
+        }
+    }
+    let path = local_device_id_path().ok_or("cannot resolve home dir")?;
+    if let Ok(existing) = std::fs::read_to_string(&path) {
+        let value = existing.trim();
+        if !value.is_empty() {
+            return Ok(value.to_string());
+        }
+    }
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    }
+    let generated = uuid::Uuid::new_v4().simple().to_string();
+    let device_id = &generated[..16];
+    std::fs::write(&path, device_id).map_err(|e| e.to_string())?;
+    Ok(device_id.to_string())
+}
+
+#[tauri::command]
+fn get_local_device_id() -> Result<String, String> {
+    load_or_create_local_device_id()
+}
+
+fn local_identity_token_path() -> Option<PathBuf> {
+    dirs::home_dir().map(|h| h.join(".agent-with-u").join("local-identity-token"))
+}
+
+/// Tauri WebView 与其本机 sidecar 共享的身份映射密钥。
+///
+/// Relay 用户 UUID 只有在同时携带这枚本机密钥时才会被 sidecar 接受，避免
+/// 普通网页、LAN 客户端或受信反代仅凭 URL 参数冒充另一个用户。
+fn load_or_create_local_identity_token() -> Result<String, String> {
+    let path = local_identity_token_path().ok_or("cannot resolve home dir")?;
+    if let Ok(existing) = std::fs::read_to_string(&path) {
+        let token = existing.trim();
+        if token.len() >= 32 {
+            return Ok(token.to_string());
+        }
+    }
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    }
+    // 两个随机 UUID 提供约 244 bit 随机性；不写入桌面配置或前端存储。
+    let token = format!(
+        "{}{}",
+        uuid::Uuid::new_v4().simple(),
+        uuid::Uuid::new_v4().simple()
+    );
+    std::fs::write(&path, &token).map_err(|e| e.to_string())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let permissions = std::fs::Permissions::from_mode(0o600);
+        std::fs::set_permissions(&path, permissions).map_err(|e| e.to_string())?;
+    }
+    Ok(token)
+}
+
+#[tauri::command]
+fn get_local_identity_token() -> Result<String, String> {
+    load_or_create_local_identity_token()
+}
+
 /// 桌面端本机角色配置。
 ///
-/// C–C/S 架构里同一个 Tauri 应用可以扮演两种角色：
-///   executor — 本机运行执行节点(spawn ws_main sidecar)，可选发布到中继；
-///   client   — 只作 UI，不在本机运行执行节点，经中继连接其它执行节点。
+/// C–C/S 架构里完整 Tauri 客户端始终启动本机 sidecar；配置只决定是否发布：
+///   executor — 本机执行，并可注册到中继成为受管执行节点；
+///   client   — 本机执行但不注册中继，同时仍可查看获授权的远端节点。
 ///
 /// 持久化在 ~/.agent-with-u/desktop.json，由前端「连接」面板读写，
-/// Rust 在启动时读取以决定是否 spawn sidecar、以及透传哪些中继参数。
+/// Rust 在启动时读取，以决定是否向 sidecar 透传中继发布参数。
 #[derive(Serialize, Deserialize, Clone)]
 #[serde(default, rename_all = "camelCase")]
 struct DesktopConfig {
@@ -1200,17 +1273,38 @@ pub fn run() {
             {
                 use tauri_plugin_shell::ShellExt;
                 let cfg = load_desktop_config();
-                if cfg.mode == "client" {
-                    // 纯客户端模式：不在本机运行执行节点，UI 经中继连接其它节点。
-                    eprintln!("[tauri] client mode: backend sidecar not spawned");
-                } else {
-                    match app.shell().sidecar("agent-with-u-backend") {
+                // 完整桌面端始终保留本地执行能力。mode 只控制本机是否作为
+                // 受管执行节点发布到 Relay，不再决定是否启动 sidecar。
+                let publish_to_relay = cfg.mode != "client";
+                match app.shell().sidecar("agent-with-u-backend") {
                         Ok(mut sidecar) => {
-                            // 执行节点模式：若配置了中继，透传中继参数给 sidecar，
-                            // 让本机执行节点拨出注册到中继，供远程 UI 经中继访问。
+                            match load_or_create_local_device_id() {
+                                Ok(device_id) => {
+                                    sidecar = sidecar.env("AGENT_WITH_U_DEVICE_ID", device_id);
+                                }
+                                Err(e) => {
+                                    eprintln!("[tauri] cannot prepare local device id: {e}");
+                                }
+                            }
+                            match load_or_create_local_identity_token() {
+                                Ok(token) => {
+                                    sidecar = sidecar.env(
+                                        "AGENT_WITH_U_LOCAL_IDENTITY_TOKEN",
+                                        token,
+                                    );
+                                }
+                                Err(e) => {
+                                    eprintln!("[tauri] cannot prepare local identity token: {e}");
+                                }
+                            }
+                            // 受管执行节点模式才透传 Relay 主凭据；本地工作站仍
+                            // 启动同一 sidecar，但不会出现在其他客户端的节点列表。
                             let relay_url = cfg.relay_url.trim();
                             let relay_token = cfg.relay_token.trim();
-                            if !relay_url.is_empty() && !relay_token.is_empty() {
+                            if publish_to_relay
+                                && !relay_url.is_empty()
+                                && !relay_token.is_empty()
+                            {
                                 sidecar = sidecar
                                     .env("AGENT_WITH_U_RELAY_URL", relay_url)
                                     .env("AGENT_WITH_U_RELAY_TOKEN", relay_token);
@@ -1259,7 +1353,6 @@ pub fn run() {
                             eprintln!("[tauri] sidecar spawn failed: {e}");
                         }
                     }
-                }
             }
             Ok(())
         })
@@ -1275,6 +1368,8 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             get_ws_port,
+            get_local_device_id,
+            get_local_identity_token,
             get_desktop_logs,
             report_desktop_log,
             show_task_completion_notification,

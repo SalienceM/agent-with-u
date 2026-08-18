@@ -551,8 +551,24 @@ The Tauri desktop app (`src-tauri/`) can run in two roles, persisted in
   `relayUrl` + `relayToken` are set, they are passed through as
   `AGENT_WITH_U_RELAY_*` env vars so this machine dials out to a relay and
   is reachable by remote UI clients.
-- **client** — does not spawn a sidecar; the webview connects to a remote
-  executor via the relay (`ConnectionPanel` relay mode).
+- **client** — also spawns the local sidecar, but never passes Relay publishing
+  credentials to it. This is a full local workstation that can execute local
+  Sessions while simultaneously using authorized remote executors; it is not
+  itself visible as a managed Relay executor.
+
+Physical locality and default routing are separate. A Tauri window always keeps
+the `local` connection in its executor pool; `homeConn` only means the default
+target. When a managed Relay user is active, the loopback connection is scoped
+to that stable user UUID (`identity_src=local-user`) only after proving a
+Tauri/sidecar secret stored at `~/.agent-with-u/local-identity-token`. Thus local
+and remote Sessions share the same owner boundary without allowing a URL
+parameter, LAN peer, or trusted proxy to forge the mapping or gain legacy-claim
+rights.
+UI labels must derive “本机” from `execMode=local`, never from `execIsHome`.
+If this physical desktop is also published to Relay, Tauri exposes the same
+stable `device-id` to the frontend. The executor pool collapses that Relay alias
+into canonical `local`, suppresses duplicate push events, and `listSessions`
+also deduplicates by Session ID with local precedence as a compatibility guard.
 
 The role is edited in the in-app "连接" panel (`ConnectionPanel.tsx`);
 changes take effect on app restart. Tauri commands: `get_desktop_config`,

@@ -21,8 +21,8 @@ interface ConnectionPanelProps {
  *
  * 视觉上分成两张独立卡片，避免「两段中继地址」让人混淆：
  *
- *   ┌─[ 卡片 A · 本机角色 ]──────────  仅 Tauri 桌面端可见
- *   │ 这台机器扮演什么：执行节点 / 纯客户端
+ *   ┌─[ 卡片 A · 本机能力 ]──────────  仅 Tauri 桌面端可见
+ *   │ 本地执行始终可用；这里只决定是否发布为 Relay 受管节点
  *   │ + 发布到中继的配置（让远程 UI 经中继找到本机）
  *   │ + 「正在连接本机的 UI」实时列表 + 计数
  *   └─────────────────────────────────
@@ -47,7 +47,7 @@ export const ConnectionPanel: React.FC<ConnectionPanelProps> = ({ onClose }) => 
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState('');
 
-  // 桌面端本机角色（仅 Tauri）：执行节点 / 纯客户端，改动需重启生效。
+  // 桌面端发布模式（仅 Tauri）：两种模式都有本地 sidecar；executor 额外发布 Relay。
   const tauri = isTauri();
   const [role, setRole] = useState<'executor' | 'client'>('executor');
   const [pubUrl, setPubUrl] = useState('');
@@ -59,13 +59,13 @@ export const ConnectionPanel: React.FC<ConnectionPanelProps> = ({ onClose }) => 
   // 「正在连接本机的 UI」实时列表
   const [clients, setClients] = useState<ConnectedClient[]>([]);
 
-  // ── 可分配执行节点（session 级模式）：home + 额外节点，新建会话时可选 ──
+  // ── 可分配执行节点（session 级模式）：默认 + 本机 + 额外节点，新建会话时可选 ──
   const [executors, setExecutors] = useState<ExecutorInfo[]>(() => getExecutors());
   useEffect(() => onExecStatus(() => setExecutors(getExecutors())), []);
   // 「加入可分配节点」的就地反馈（成功 / 已是 home / 提示）——避免「点了没反应」。
   const [execMsg, setExecMsg] = useState<{ kind: 'ok' | 'warn'; text: string } | null>(null);
 
-  // 把卡片 B 当前填好的中继 + 选中节点加入「可分配执行节点」（不切换 home）。
+  // 把卡片 B 当前填好的中继 + 选中节点加入「可分配执行节点」（不切换默认节点）。
   const addSelectedAsExecutor = useCallback(() => {
     setExecMsg(null);
     if (!url.trim()) { setErr('请先填写中继地址'); return; }
@@ -77,11 +77,11 @@ export const ConnectionPanel: React.FC<ConnectionPanelProps> = ({ onClose }) => 
     }
     const dev = devices.find((d) => d.id === deviceId);
     const key = `relay:${verifiedUser.userId || 'legacy'}:${deviceId}`;
-    // 若这台正是当前 home,addExecRoster 会静默跳过。明确告诉用户,而不是「没反应」。
+    // 若这台正是当前默认节点，addExecRoster 会静默跳过。明确告诉用户，而不是「没反应」。
     if (key === getHomeExecKey()) {
       setExecMsg({
         kind: 'warn',
-        text: `这台「${dev?.name || deviceId}」正是本窗口当前的 home 节点（默认就连它），无需重复加入。`,
+        text: `这台「${dev?.name || deviceId}」正是本窗口当前的默认节点，无需重复加入。`,
       });
       return;
     }
@@ -162,23 +162,18 @@ export const ConnectionPanel: React.FC<ConnectionPanelProps> = ({ onClose }) => 
     });
   }, [tauri]);
 
-  // 纯客户端不在本机起 sidecar，本地直连必然连不上 127.0.0.1:44321 → 自动切到中继。
-  // 处理两种情况：用户在本会话切到「纯客户端」；以及上一次错存了 client+local 的组合。
-  useEffect(() => {
-    if (role === 'client' && mode === 'local') setMode('relay');
-  }, [role, mode]);
-
-  // 拉取一次并订阅在线 UI 列表（执行节点视角下才有意义；纯客户端列表里就一个自己）
+  // 卡片 A 描述物理本机，所以固定查询 local 连接，不能误读当前默认远端节点。
   useEffect(() => {
     let cancelled = false;
-    api.listConnectedClients().then((list) => {
+    const localExecKey = tauri ? 'local' : undefined;
+    api.listConnectedClients(localExecKey).then((list) => {
       if (!cancelled) setClients(list);
     }).catch(() => { /* 后端未连上 / mock 时 list 为空 */ });
-    const unsub = api.onClientsChanged((list) => {
-      if (!cancelled) setClients(list);
+    const unsub = api.onClientsChanged((list, execKey) => {
+      if (!cancelled && (!localExecKey || execKey === localExecKey)) setClients(list);
     });
     return () => { cancelled = true; unsub(); };
-  }, []);
+  }, [tauri]);
 
   const handleRefresh = useCallback(async () => {
     if (!url.trim()) { setErr('请先填写中继地址'); return; }
@@ -242,7 +237,7 @@ export const ConnectionPanel: React.FC<ConnectionPanelProps> = ({ onClose }) => 
         setBusy(false);
       }
     }
-    // 1. 持久化桌面端本机角色（仅 Tauri）。改动需重启应用生效。
+    // 1. 持久化桌面端发布模式（仅 Tauri）。本地执行始终可用；改动需重启生效。
     let needRestart = false;
     if (tauri) {
       const next: DesktopConfig = {
@@ -319,15 +314,15 @@ export const ConnectionPanel: React.FC<ConnectionPanelProps> = ({ onClose }) => 
           {!tauri && <> 选择当前 UI 连到哪台执行节点：</>}
           {tauri && (
             <ul style={{ margin: '4px 0 0 16px', padding: 0 }}>
-              <li><b>本机角色</b> = 我这台机器对外提供什么</li>
-              <li><b>本 UI 连接到</b> = 这个窗口里要看哪台执行节点</li>
+              <li><b>本机能力</b> = 本地始终能执行；可选是否发布给其他客户端</li>
+              <li><b>本 UI 连接到</b> = 当前默认查看哪台节点，不等于物理本机</li>
             </ul>
           )}
         </div>
 
         {/* ════ 可分配执行节点（session 级模式管理）════════════════════
-            home 节点(下面卡片 B 选的那台)是新建会话的默认落点;在这里额外加入
-            的远端节点会与 home 同时在线,新建会话时可逐会话选择它执行。这样
+            默认节点(下面卡片 B 选的那台)是新建会话的默认落点;在这里额外加入
+            的远端节点会与默认节点和物理本机同时在线,新建会话时可逐会话选择。这样
             「某些会话本机自执行,某些走远端」就成了每会话的选择,而非整窗口的
             系统级开关。 */}
         {executors.length > 1 && (
@@ -351,7 +346,7 @@ export const ConnectionPanel: React.FC<ConnectionPanelProps> = ({ onClose }) => 
                     <span style={{
                       fontSize: 10, padding: '1px 6px', borderRadius: 8,
                       background: 'var(--theme-accent-bg)', color: 'var(--theme-accent)',
-                    }}>home · 默认</span>
+                    }}>默认</span>
                   )}
                   <span style={{ fontSize: 11, color: 'var(--theme-text-muted)' }}>
                     {ex.connected ? '在线' : '离线'}
@@ -374,12 +369,12 @@ export const ConnectionPanel: React.FC<ConnectionPanelProps> = ({ onClose }) => 
           </div>
         )}
 
-        {/* ════ 卡片 A：本机角色（仅 Tauri） ════════════════════════ */}
+        {/* ════ 卡片 A：本机能力（仅 Tauri） ════════════════════════ */}
         {tauri && (
           <div style={cardStyle}>
             <div style={cardTitleStyle}>
               <span style={cardBadgeStyle}>A</span>
-              <span>本机角色</span>
+              <span>本机能力</span>
               <span style={cardSubtitleStyle}>桌面端 · 重启生效</span>
             </div>
 
@@ -395,7 +390,7 @@ export const ConnectionPanel: React.FC<ConnectionPanelProps> = ({ onClose }) => 
                     color: role === r ? 'var(--theme-accent)' : 'var(--theme-text-muted)',
                   }}
                 >
-                  {r === 'executor' ? '🖥️ 执行节点' : '📱 纯客户端'}
+                  {r === 'executor' ? '🖥️ 纳管执行节点' : '💻 本地工作站'}
                 </button>
               ))}
             </div>
@@ -403,8 +398,8 @@ export const ConnectionPanel: React.FC<ConnectionPanelProps> = ({ onClose }) => 
             {role === 'executor' && (
               <>
                 <div style={hintStyle}>
-                  本机在跑 Agent。这里填写的是执行端注册用的 Relay 主 Token，不要交给普通用户；
-                  留空则仅本地 / 局域网可用。
+                  本机始终可以运行 Agent；此模式额外把它注册到 Relay，供获授权用户远程选择。
+                  这里使用 Relay 主 Token，不要交给普通用户。
                 </div>
                 <div style={{ display: 'flex', flexDirection: 'column', gap: 8, margin: '8px 0 4px' }}>
                   <input
@@ -437,7 +432,8 @@ export const ConnectionPanel: React.FC<ConnectionPanelProps> = ({ onClose }) => 
 
             {role === 'client' && (
               <div style={hintStyle}>
-                本应用只作 UI，不在本机运行执行节点。请在下方卡片 B 选择「远程(经中继)」连接到其它执行节点。
+                本机仍运行 Agent、可创建本地 Session，但不会注册到 Relay，其他机器看不到这台设备。
+                本窗口仍可同时使用下方已登录用户获授权的远端执行节点。
               </div>
             )}
           </div>
@@ -453,19 +449,15 @@ export const ConnectionPanel: React.FC<ConnectionPanelProps> = ({ onClose }) => 
 
           <div style={{ display: 'flex', gap: 8, marginBottom: 10 }}>
             {(['local', 'relay'] as const).map((m) => {
-              const blocked = m === 'local' && role === 'client';
               return (
                 <button
                   key={m}
-                  onClick={() => { if (blocked) return; setMode(m); setErr(''); }}
-                  disabled={blocked}
-                  title={blocked ? '纯客户端模式本机不跑 sidecar，本地直连必然连不上' : undefined}
+                  onClick={() => { setMode(m); setErr(''); }}
                   style={{
                     ...modeBtnStyle,
                     background: mode === m ? 'var(--theme-accent-bg)' : 'transparent',
                     borderColor: mode === m ? 'var(--theme-accent)' : 'var(--theme-border)',
                     color: mode === m ? 'var(--theme-accent)' : 'var(--theme-text-muted)',
-                    ...(blocked ? { opacity: 0.4, cursor: 'not-allowed' } : {}),
                   }}
                 >
                   {m === 'local' ? '🏠 本地直连' : '🌐 远程(经中继)'}
@@ -477,8 +469,7 @@ export const ConnectionPanel: React.FC<ConnectionPanelProps> = ({ onClose }) => 
           {mode === 'local' && (
             <div style={hintStyle}>
               连本机 / 局域网内的 sidecar，不经中继。延迟最低，流量不出网。
-              {tauri && role === 'executor'
-                && <><br/>👉 这是执行节点自己的 UI 最常用的选项。</>}
+              {tauri && <><br/>👉 完整桌面端无论是否发布为受管节点，都保留此能力。</>}
             </div>
           )}
 

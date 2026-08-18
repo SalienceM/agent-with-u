@@ -1514,6 +1514,7 @@ export const App: React.FC = () => {
                     onFocus={() => setFocusedPaneIdx(idx)}
                     backends={backends}
                     config={config}
+                    currentUser={currentUser}
                     themeBorderFocused="var(--theme-accent)"
                     isMobile={isMobile}
                     onRequestNewSession={handleNewSession}
@@ -2205,13 +2206,19 @@ const NewSessionDialog: React.FC<NewSessionDialogProps> = ({
   const [policyOpen, setPolicyOpen] = useState(false);
   const isAutoDir = !workingDir.trim() || workingDir.trim() === '.';
 
-  // ── 执行节点（session 级模式管理）：默认落在 home;有额外节点时可选 ──
+  // ── 执行节点（session 级模式管理）：默认节点与物理本机是两个独立概念 ──
   const [executors, setExecutors] = useState<ExecutorInfo[]>(() => getExecutors());
   const [execKey, setExecKey] = useState<string>(() => getHomeExecKey());
-  useEffect(() => onExecStatus(() => setExecutors(getExecutors())), []);
+  useEffect(() => onExecStatus(() => {
+    const next = getExecutors();
+    setExecutors(next);
+    setExecKey((current) => (
+      next.some((executor) => executor.key === current) ? current : getHomeExecKey()
+    ));
+  }), []);
   const isHomeExec = execKey === getHomeExecKey();
 
-  // 选中的执行节点对应的后端列表:home 直接用上层传入,远端则按需拉取。
+  // 选中的执行节点对应的后端列表：默认节点直接用上层传入，其余节点按需拉取。
   const [execBackends, setExecBackends] = useState<any[]>(backends);
   useEffect(() => {
     let cancelled = false;
@@ -2419,7 +2426,7 @@ const NewSessionDialog: React.FC<NewSessionDialogProps> = ({
                       {ex.mode === 'local' ? ex.label : `🌐 ${ex.label}`}
                     </div>
                     <div style={{ fontSize: 11, color: 'var(--theme-text-muted, #656d76)', marginTop: 2 }}>
-                      {ex.isHome ? '默认 · 本地直连' : '远端执行节点'}
+                      {`${ex.isHome ? '默认 · ' : ''}${ex.mode === 'local' ? '本机执行' : '远端执行节点'}`}
                     </div>
                   </button>
                 );
