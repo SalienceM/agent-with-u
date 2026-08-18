@@ -18,6 +18,7 @@ import React, { useCallback, useEffect, useMemo, useState, useRef, lazy, Suspens
 import hljs from 'highlight.js';
 import { api, isTauri } from '../api';
 import { markdownToHtml } from '../utils/markdown';
+import { buildStandaloneMarkdownHtml, markdownHtmlFilename } from '../utils/markdownExport';
 import { GitPanel } from './GitPanel';
 import type { GitFileStatus, GitFileStatusType, GitStashEntry } from '../types/git';
 import { DiffViewer } from './DiffViewer';
@@ -222,6 +223,82 @@ function textToBase64(text: string): string {
   for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
   return btoa(bin);
 }
+type GeneratedTextExportResult =
+  | { mode: 'saved'; destination: string }
+  | { mode: 'shared' }
+  | { mode: 'downloaded' }
+  | { mode: 'cancelled' };
+
+async function exportGeneratedText(text: string, filename: string, mime: string): Promise<GeneratedTextExportResult> {
+  const blob = new Blob([text], { type: mime });
+
+  // 桌面应用必须使用原生“另存为”，不能把文件静默丢进默认下载目录。
+  if (isTauri()) {
+    const [{ save }, { downloadDir, join }, { invoke }] = await Promise.all([
+      import('@tauri-apps/plugin-dialog'),
+      import('@tauri-apps/api/path'),
+      import('@tauri-apps/api/core'),
+    ]);
+    const defaultPath = await join(await downloadDir(), filename);
+    const destination = await save({
+      defaultPath,
+      filters: [
+        { name: 'HTML 文档', extensions: ['html', 'htm'] },
+        { name: '所有文件', extensions: ['*'] },
+      ],
+    });
+    if (!destination) return { mode: 'cancelled' };
+    await invoke('write_export_text_file', { path: destination, data: text });
+    return { mode: 'saved', destination };
+  }
+
+  // Chromium/Edge 网页端支持原生文件选择器；用户可以明确选择目录和文件名。
+  const picker = (window as any).showSaveFilePicker as undefined | ((options: any) => Promise<any>);
+  if (typeof picker === 'function') {
+    try {
+      const handle = await picker({
+        suggestedName: filename,
+        types: [{
+          description: 'HTML 文档',
+          accept: { 'text/html': ['.html', '.htm'] },
+        }],
+      });
+      const writable = await handle.createWritable();
+      await writable.write(blob);
+      await writable.close();
+      return { mode: 'saved', destination: String(handle.name || filename) };
+    } catch (error: any) {
+      if (error?.name === 'AbortError') return { mode: 'cancelled' };
+      throw error;
+    }
+  }
+
+  // iOS/Safari 等没有文件选择器的平台优先交给系统分享/“存储到文件”。
+  const file = new File([blob], filename, { type: mime });
+  const nav = navigator as any;
+  if (typeof nav.share === 'function' && (!nav.canShare || nav.canShare({ files: [file] }))) {
+    try {
+      await nav.share({ files: [file], title: filename });
+      return { mode: 'shared' };
+    } catch (error: any) {
+      if (error?.name === 'AbortError') return { mode: 'cancelled' };
+      // 系统分享不可用时继续回落到浏览器下载。
+    }
+  }
+  const href = URL.createObjectURL(blob);
+  try {
+    const anchor = document.createElement('a');
+    anchor.href = href;
+    anchor.download = filename;
+    anchor.rel = 'noopener';
+    document.body.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+    return { mode: 'downloaded' };
+  } finally {
+    setTimeout(() => URL.revokeObjectURL(href), 30_000);
+  }
+}
 function isDarkTheme(): boolean {
   try {
     const el = document.querySelector('.app-root') as HTMLElement | null;
@@ -240,6 +317,7 @@ interface PreviewState {
   rel: string; name: string;
   source: 'remote' | 'local';
   loading: boolean; text?: string; dataUrl?: string; isImage?: boolean; isMarkdown?: boolean;
+  truncated?: boolean;
   renderer?: 'pdf' | 'docx' | 'drawio'; bytes?: Uint8Array; drawioXml?: string;
   loadingText?: string; structured?: StructuredPreviewPayload; error?: string;
 }
@@ -354,6 +432,8 @@ export const FileTreePanel: React.FC<Props> = ({ sessionId, workingDir, execKey,
   const [editText, setEditText] = useState('');
   const [dirty, setDirty] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [htmlExporting, setHtmlExporting] = useState(false);
+  const [htmlExported, setHtmlExported] = useState(false);
   const [review, setReview] = useState<ProvOpenResult | null>(null);
   const [reviewOpening, setReviewOpening] = useState(false);
   const [transfer, setTransfer] = useState<TransferProgress | null>(null);
@@ -391,6 +471,12 @@ export const FileTreePanel: React.FC<Props> = ({ sessionId, workingDir, execKey,
     const t = setTimeout(() => setMsg(null), 5000);
     return () => clearTimeout(t);
   }, [msg]);
+
+  useEffect(() => {
+    if (!htmlExported) return;
+    const timer = setTimeout(() => setHtmlExported(false), 2500);
+    return () => clearTimeout(timer);
+  }, [htmlExported]);
 
   // ── 懒加载工作目录某层 ──
   const loadChildren = useCallback(async (rel: string): Promise<void> => {
@@ -1475,7 +1561,7 @@ export const FileTreePanel: React.FC<Props> = ({ sessionId, workingDir, execKey,
   const openPreview = useCallback(async (node: TNode) => {
     const source: PreviewState['source'] = node.local && (!node.remote || !sessionOnline) ? 'local' : 'remote';
     const base: PreviewState = { rel: node.rel, name: node.name, source, loading: true, loadingText: '正在准备预览…' };
-    setPreview(base); setPreviewMaximized(false); setEditing(false); setDirty(false); setMdRaw(false);
+    setPreview(base); setPreviewMaximized(false); setEditing(false); setDirty(false); setMdRaw(false); setHtmlExported(false);
     try {
       if (!workingDir) throw new Error('未打开会话');
       const ext = extOf(node.name);
@@ -1525,8 +1611,9 @@ export const FileTreePanel: React.FC<Props> = ({ sessionId, workingDir, execKey,
       if (IMAGE_EXTS.has(ext)) setPreview({ ...base, loading: false, isImage: true, dataUrl: `data:${imageMime(ext)};base64,${b64}` });
       else {
         let text = base64ToText(b64);
-        if (text.length > PREVIEW_TEXT_CAP) text = text.slice(0, PREVIEW_TEXT_CAP) + '\n\n…（已截断,仅预览前 200KB）';
-        setPreview({ ...base, loading: false, isImage: false, isMarkdown: MARKDOWN_EXTS.has(ext), text });
+        const truncated = text.length > PREVIEW_TEXT_CAP;
+        if (truncated) text = text.slice(0, PREVIEW_TEXT_CAP) + '\n\n…（已截断,仅预览前 200KB）';
+        setPreview({ ...base, loading: false, isImage: false, isMarkdown: MARKDOWN_EXTS.has(ext), text, truncated });
       }
     } catch (e: any) { setPreview({ ...base, loading: false, error: e?.message ?? String(e) }); }
   }, [workingDir, execKey, localFs, openReview, readPreviewBytes, structuredPreviewFor, sessionOnline]);
@@ -1576,6 +1663,37 @@ export const FileTreePanel: React.FC<Props> = ({ sessionId, workingDir, execKey,
     }
   }, [preview, localFs]);
 
+  const exportPreviewAsHtml = useCallback(async () => {
+    if (!preview?.isMarkdown || preview.loading || preview.error || htmlExporting) return;
+    if (preview.truncated) {
+      setMsg({ kind: 'err', text: '当前 Markdown 预览已截断，已阻止导出不完整的 HTML' });
+      return;
+    }
+    setHtmlExporting(true);
+    setHtmlExported(false);
+    try {
+      const html = buildStandaloneMarkdownHtml(
+        preview.name,
+        markdownToHtml(preview.text || ''),
+      );
+      const filename = markdownHtmlFilename(preview.name);
+      const result = await exportGeneratedText(html, filename, 'text/html;charset=utf-8');
+      if (result.mode !== 'cancelled') {
+        setHtmlExported(true);
+        const detail = result.mode === 'saved'
+          ? `已保存：${result.destination}`
+          : result.mode === 'shared'
+            ? `已交给系统分享：${filename}`
+            : `已下载：${filename}（位置由浏览器下载设置决定）`;
+        setMsg({ kind: 'ok', text: `✓ ${detail}` });
+      }
+    } catch (error: any) {
+      setMsg({ kind: 'err', text: `HTML 导出失败：${error?.message ?? error}` });
+    } finally {
+      setHtmlExporting(false);
+    }
+  }, [htmlExporting, preview]);
+
   const startEdit = useCallback(() => { if (preview && !preview.isImage && !preview.structured && !preview.renderer) { setEditText(preview.text || ''); setDirty(false); setEditing(true); } }, [preview]);
   const saveEdit = useCallback(async () => {
     if (!preview || !workingDir) return;
@@ -1597,7 +1715,7 @@ export const FileTreePanel: React.FC<Props> = ({ sessionId, workingDir, execKey,
   }, [preview, workingDir, execKey, editText, localFs, scanLocal]);
   const closePreview = useCallback(() => {
     if (editing && dirty && !window.confirm('有未保存的修改，确定关闭？')) return;
-    setPreview(null); setPreviewMaximized(false); setEditing(false); setDirty(false);
+    setPreview(null); setPreviewMaximized(false); setEditing(false); setDirty(false); setHtmlExported(false);
   }, [editing, dirty]);
 
   useEffect(() => {
@@ -2391,6 +2509,22 @@ export const FileTreePanel: React.FC<Props> = ({ sessionId, workingDir, execKey,
                   onClick={() => void openReview(preview.rel, preview.source)}
                   title="创建或继续编辑与源文件强关联的 .prov 审阅稿"
                 >{reviewOpening ? '打开中…' : '✦ 审阅'}</button>
+              )}
+              {!editing && preview.isMarkdown && !preview.loading && !preview.error && (
+                <button
+                  style={{
+                    ...hdrBtnStyle,
+                    borderColor: 'rgba(63,185,80,.38)',
+                    color: htmlExported ? '#3fb950' : 'var(--theme-text)',
+                  }}
+                  disabled={htmlExporting || preview.truncated}
+                  onClick={() => void exportPreviewAsHtml()}
+                  title={preview.truncated
+                    ? '当前预览已截断，不能导出不完整的 HTML'
+                    : '将当前 Markdown 转换为带样式的独立 HTML，并选择保存位置'}
+                >
+                  {htmlExporting ? '⏳ 转换中…' : htmlExported ? '✓ 已保存' : '⇩ HTML 另存为'}
+                </button>
               )}
               {!editing && preview.isMarkdown && !preview.loading && !preview.error && (
                 <div style={{ display: 'flex', border: '1px solid var(--theme-border)', borderRadius: 6, overflow: 'hidden', marginRight: 4 }}>

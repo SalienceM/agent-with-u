@@ -19,6 +19,7 @@
     "src/utils/dirSyncPolicy.ts",
     "src/utils/dirSyncFreshness.ts",
     "src/utils/executorSessions.ts",
+    "src/utils/markdownExport.ts",
     "src/utils/sha256.ts"
   ]
 }

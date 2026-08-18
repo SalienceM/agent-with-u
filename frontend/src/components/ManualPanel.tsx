@@ -69,7 +69,7 @@ const SECTIONS: ManualSection[] = [
     id: 'project', title: '项目与版本', icon: '📦', intro: '查看文件、比较改动并完成 Git 工作流。',
     items: [
       { icon: '🌳', title: '工作目录树', summary: '浏览项目文件和目录，查看已暂存/未暂存计数，打开文本文件预览或编辑。', entry: '左侧栏「文件」视图' },
-      { icon: '👁', title: '文件预览与编辑', summary: '点击文件查看内容；预览窗可一键最大化。PDF、DOCX 与 Draw.io 使用完全离线的专用渲染器，Excel/PPT 使用快速结构化预览；文本和代码可直接编辑保存。', entry: '文件行的预览图标 / 点击文件名', tips: 'DOCX 版式渲染失败会自动切换兼容预览；Draw.io 支持 Sheet 切换、滚轮缩放、左键拖动画布及官方 / 兼容渲染切换。' },
+      { icon: '👁', title: '文件预览与编辑', summary: '点击文件查看内容；预览窗可一键最大化。Markdown 可直接转换并导出为独立 HTML；PDF、DOCX 与 Draw.io 使用完全离线的专用渲染器，Excel/PPT 使用快速结构化预览；文本和代码可直接编辑保存。', entry: '文件行的预览图标 / 点击文件名', tips: 'DOCX 版式渲染失败会自动切换兼容预览；Draw.io 支持 Sheet 切换、滚轮缩放、左键拖动画布及官方 / 兼容渲染切换。' },
       { icon: '±', title: 'Diff 变更对比', summary: '查看文件相对版本库的新增、删除和修改，辅助确认提交范围。', entry: '提交变更面板 → 点击文件名' },
       { icon: '＋', title: '加入版本追踪', summary: '将未跟踪文件执行 Git add，支持逐项操作和分组全选。', entry: '提交变更 → 未跟踪文件' },
       { icon: '✅', title: '提交与推送', summary: '选择要提交的文件，填写或让 AI 生成提交说明；提交推送会等待推送真正完成后再返回主界面。', entry: '左侧栏「提交」' },

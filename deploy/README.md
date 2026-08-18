@@ -50,6 +50,7 @@ python -m src.ws_main --bind 127.0.0.1 --port 44321
 
 | 文件 | 用途 |
 |------|------|
+| `WEB_156_INSTALL.md`             | **192.168.50.156:7890 代理环境**下的群晖 Docker 完整安装、更新与排障 |
 | `docker-compose.example.yml`     | **推荐**：后端 + web 容器一把起 |
 | `Dockerfile`                     | 后端镜像 |
 | `requirements-docker.txt`        | 后端锁定依赖（pip 零回溯，弱网可装） |

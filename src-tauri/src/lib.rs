@@ -1168,6 +1168,22 @@ fn dir_sync_write_file(dir: String, rel: String, data: String) -> Result<(), Str
     std::fs::write(&target, bytes).map_err(|e| e.to_string())
 }
 
+/// 写入由系统“另存为”对话框明确选择的文本文件。
+/// 路径来自当前用户的保存选择，因此这里不再套工作目录边界。
+#[tauri::command]
+fn write_export_text_file(path: String, data: String) -> Result<(), String> {
+    if path.trim().is_empty() {
+        return Err("保存路径为空".to_string());
+    }
+    let target = std::path::PathBuf::from(&path);
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("无法创建保存目录 {}：{e}", parent.display()))?;
+    }
+    std::fs::write(&target, data.as_bytes())
+        .map_err(|e| format!("无法写入 {}：{e}", target.display()))
+}
+
 #[tauri::command]
 fn dir_sync_delete_file(dir: String, rel: String) -> Result<(), String> {
     let (root, target) = sync_resolve(&dir, &rel)?;
@@ -1392,6 +1408,7 @@ pub fn run() {
             kit_client_command,
             kit_client_command_cancel,
             dir_sync_write_file,
+            write_export_text_file,
             dir_sync_write_start,
             dir_sync_write_chunk,
             dir_sync_write_finish,
