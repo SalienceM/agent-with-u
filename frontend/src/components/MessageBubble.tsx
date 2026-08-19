@@ -6,6 +6,8 @@ import type { ChatMessage, ToolCall, ContentBlock, SubagentInfo } from '../hooks
 import { shouldKeepChatMessage } from '../utils/chatMessageVisibility';
 import { DiffView, type DiffData } from './DiffView';
 import { TextAttachmentPreview } from './TextAttachmentPreview';
+import { AppModalPortal } from './AppModalPortal';
+import { resolveFileLink } from '../utils/fileFocus';
 import {
   TTS_STATE_EVENT,
   toggleSpeech,
@@ -99,6 +101,34 @@ if (typeof document !== 'undefined' && !document.getElementById('msg-bubble-css'
     }
     .md-image-error a:hover {
       text-decoration: underline;
+    }
+    /* ── 工作目录内文件链接：悬停显示“在文件面板定位”准星 ── */
+    .msg-content a.md-file-link {
+      cursor: pointer;
+      text-decoration-style: dotted;
+      text-underline-offset: 2px;
+    }
+    .msg-content a.md-file-link::after {
+      content: '⌖';
+      display: inline-block;
+      max-width: 0;
+      margin-left: 0;
+      opacity: 0;
+      overflow: hidden;
+      color: var(--theme-text-muted, #656d76);
+      font-size: .82em;
+      line-height: 1;
+      text-decoration: none;
+      vertical-align: .06em;
+      transform: translateX(-3px);
+      transition: opacity .12s ease, max-width .12s ease, margin-left .12s ease, transform .12s ease;
+    }
+    .msg-content a.md-file-link:hover::after,
+    .msg-content a.md-file-link:focus-visible::after {
+      max-width: 1.2em;
+      margin-left: 4px;
+      opacity: 1;
+      transform: translateX(0);
     }
     /* ── 气泡操作按钮 ── */
     .bubble-action-btn {
@@ -779,6 +809,8 @@ interface Props {
   canBranch?: boolean;
   ttsVoice?: string;
   ttsRate?: number;
+  workingDir?: string;
+  onFocusFile?: (relativePath: string) => void;
 }
 
 // 复制气泡内容到剪贴板
@@ -1091,17 +1123,68 @@ function MessageBubbleInner({
   canBranch = false,
   ttsVoice,
   ttsRate,
+  workingDir,
+  onFocusFile,
 }: Props) {
   const [lightboxSrc, setLightboxSrc] = useState<string | null>(null);
+  const [fileLinkMenu, setFileLinkMenu] = useState<{
+    x: number;
+    y: number;
+    relativePath: string;
+    filePath: string;
+  } | null>(null);
   const contentRef = useRef<HTMLDivElement>(null);
 
-  // 委托捕获气泡内 markdown 渲染出的 img 点击
+  // 委托捕获气泡内 Markdown 文件链接和图片点击。
   const handleContentClick = useCallback((e: React.MouseEvent<HTMLDivElement>) => {
     const target = e.target as HTMLElement;
+    const fileLink = target.closest<HTMLAnchorElement>('a.md-file-link[data-file-rel]');
+    if (fileLink && contentRef.current?.contains(fileLink)) {
+      const relativePath = fileLink.dataset.fileRel;
+      if (relativePath && onFocusFile) {
+        e.preventDefault();
+        e.stopPropagation();
+        setFileLinkMenu(null);
+        onFocusFile(relativePath);
+        return;
+      }
+    }
     if (target.tagName === 'IMG') {
       setLightboxSrc((target as HTMLImageElement).src);
     }
-  }, []);
+  }, [onFocusFile]);
+
+  const handleFileLinkContextMenu = useCallback((e: React.MouseEvent<HTMLDivElement>) => {
+    const target = e.target as HTMLElement;
+    const fileLink = target.closest<HTMLAnchorElement>('a.md-file-link[data-file-rel]');
+    if (!fileLink || !contentRef.current?.contains(fileLink)) return;
+    const relativePath = fileLink.dataset.fileRel;
+    if (!relativePath || !onFocusFile) return;
+    e.preventDefault();
+    e.stopPropagation();
+    setFileLinkMenu({
+      x: Math.max(8, Math.min(e.clientX, window.innerWidth - 244)),
+      y: Math.max(8, Math.min(e.clientY, window.innerHeight - 116)),
+      relativePath,
+      filePath: fileLink.dataset.filePath || relativePath,
+    });
+  }, [onFocusFile]);
+
+  useEffect(() => {
+    if (!fileLinkMenu) return;
+    const close = () => setFileLinkMenu(null);
+    const onKeyDown = (event: KeyboardEvent) => { if (event.key === 'Escape') close(); };
+    window.addEventListener('pointerdown', close);
+    window.addEventListener('blur', close);
+    window.addEventListener('scroll', close, true);
+    window.addEventListener('keydown', onKeyDown);
+    return () => {
+      window.removeEventListener('pointerdown', close);
+      window.removeEventListener('blur', close);
+      window.removeEventListener('scroll', close, true);
+      window.removeEventListener('keydown', onKeyDown);
+    };
+  }, [fileLinkMenu]);
 
   // ★ 为该消息内所有 markdown 块统一注入复制按钮并处理图片。
   // contentRef 指向整个气泡而不是某个 text block，避免多块消息只命中最后一块。
@@ -1136,6 +1219,27 @@ function MessageBubbleInner({
         }, 2000);
       };
       pre.appendChild(btn);
+    });
+
+    // 只增强当前 Session 工作目录内的文件链接；网页链接仍按原逻辑新窗口打开。
+    selectAll<HTMLAnchorElement>(root, '.msg-content a.md-link').forEach((anchor) => {
+      anchor.classList.remove('md-file-link');
+      delete anchor.dataset.fileRel;
+      delete anchor.dataset.filePath;
+      anchor.target = '_blank';
+      anchor.rel = 'noopener';
+      anchor.removeAttribute('title');
+      const resolved = resolveFileLink(anchor.getAttribute('href') || '', workingDir || '');
+      if (!resolved || !onFocusFile) return;
+      anchor.classList.add('md-file-link');
+      anchor.dataset.fileRel = resolved.relativePath;
+      anchor.dataset.filePath = resolved.filePath;
+      anchor.removeAttribute('target');
+      anchor.removeAttribute('rel');
+      const position = resolved.line
+        ? `（第 ${resolved.line}${resolved.column ? `:${resolved.column}` : ''} 行）`
+        : '';
+      anchor.title = `点击在文件面板中定位${position}；右键查看更多`;
     });
 
     const renderImageError = (img: HTMLImageElement, label: string, href = '') => {
@@ -1231,7 +1335,7 @@ function MessageBubbleInner({
     });
     observer.observe(el, { childList: true, subtree: true });
     return () => observer.disconnect();
-  }, [message.id, renderMarkdown]);
+  }, [message.id, renderMarkdown, workingDir, onFocusFile]);
 
   // ★ system 消息独立渲染
   if (message.role === 'system') {
@@ -1295,6 +1399,49 @@ function MessageBubbleInner({
   return (
     <>
       {lightboxSrc && <ImageLightbox src={lightboxSrc} onClose={() => setLightboxSrc(null)} />}
+      {fileLinkMenu && (
+        <AppModalPortal>
+          <div
+            role="menu"
+            aria-label="文件链接操作"
+            onPointerDown={(event) => event.stopPropagation()}
+            onContextMenu={(event) => event.preventDefault()}
+            style={{
+              position: 'fixed', left: fileLinkMenu.x, top: fileLinkMenu.y, zIndex: 10030,
+              width: 236, padding: 5, borderRadius: 7,
+              border: '1px solid var(--theme-border, rgba(0,0,0,.16))',
+              background: 'var(--theme-bg-secondary, #fff)',
+              color: 'var(--theme-text, #1f2328)',
+              boxShadow: '0 10px 32px rgba(0,0,0,.28)',
+            }}
+          >
+            <div title={fileLinkMenu.filePath} style={{
+              padding: '4px 8px 6px', fontSize: 10.5, color: 'var(--theme-text-muted)',
+              overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+            }}>
+              {fileLinkMenu.relativePath}
+            </div>
+            <button
+              role="menuitem"
+              style={fileLinkMenuItemStyle}
+              onClick={() => {
+                const relativePath = fileLinkMenu.relativePath;
+                setFileLinkMenu(null);
+                onFocusFile?.(relativePath);
+              }}
+            >⌖ 在文件面板中定位</button>
+            <button
+              role="menuitem"
+              style={fileLinkMenuItemStyle}
+              onClick={() => {
+                const relativePath = fileLinkMenu.relativePath;
+                setFileLinkMenu(null);
+                void copyToClipboard(relativePath);
+              }}
+            >📋 复制相对路径</button>
+          </div>
+        </AppModalPortal>
+      )}
     <div
       style={{
         display: 'flex',
@@ -1317,6 +1464,7 @@ function MessageBubbleInner({
       <div
         ref={contentRef}
         className="message-bubble-wrapper"
+        onContextMenu={handleFileLinkContextMenu}
         style={{
           position: 'relative',
           maxWidth: '82%',
@@ -1563,9 +1711,18 @@ function bubblePropsEqual(prev: Props, next: Props): boolean {
     prev.renderMarkdown    === next.renderMarkdown    &&
     prev.animateIn         === next.animateIn         &&
     prev.ttsVoice          === next.ttsVoice          &&
-    prev.ttsRate           === next.ttsRate
+    prev.ttsRate           === next.ttsRate           &&
+    prev.workingDir        === next.workingDir        &&
+    prev.onFocusFile       === next.onFocusFile
   );
 }
+
+const fileLinkMenuItemStyle: React.CSSProperties = {
+  display: 'flex', width: '100%', alignItems: 'center', gap: 7,
+  padding: '7px 8px', border: 'none', borderRadius: 5,
+  background: 'transparent', color: 'inherit', cursor: 'pointer',
+  font: 'inherit', fontSize: 12, textAlign: 'left',
+};
 
 export const MessageBubble = memo(MessageBubbleInner, bubblePropsEqual);
 

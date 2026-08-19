@@ -15,7 +15,7 @@ class BackendType(str, Enum):
     CLAUDE_CODE_OFFICIAL = "claude-code-official"   # 官方 Claude.ai 账户（ANTHROPIC_AUTH_TOKEN）
     OPENAI_COMPATIBLE = "openai-compatible"
     ANTHROPIC_API = "anthropic-api"
-    DASHSCOPE_IMAGE = "dashscope-image"             # 阿里云 DashScope 文生图（万象/Wan 系列）
+    DASHSCOPE_IMAGE = "dashscope-image"             # DashScope 图像（Wan / Qwen Image 3.0）
     QWEN_CODE_CLI = "qwen-code-cli"                 # Qwen Code CLI（子进程 stream-json 模式）
     CODEX_OFFICIAL = "codex-office"                 # OpenAI Codex CLI（本地官方账户 / API key）
 

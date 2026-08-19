@@ -49,7 +49,7 @@ AgentWithU 用 PySide6 托管 QWebEngine，前端是 React，后端是 Python—
   - `web-search` — Bing 网页搜索，免费，无需配置
   - `web-fetch` — 抓取 URL 页面正文，免费，无需配置
   - `python-script` — 执行本地 Python 脚本，支持凭据（Secrets）注入，适合爬虫/API 集成
-  - `dashscope-image` — 阿里云 DashScope 文生图，支持参考图（图生图）
+  - `dashscope-image` — 阿里云 DashScope 图像生成与编辑，支持 Wan 与 Qwen Image 3.0、1–3 张参考图
 - **Skill 仓库（Repo 面板）** — 可视化创建、编辑、删除 Skill 和 Prompt
 - **插件包安装** — 支持 `.awu` 格式打包分发，一键安装，锁定防误编辑
 - **凭据管理** — Secrets 本地 chmod 600 存储，永不传给大模型
@@ -97,7 +97,17 @@ AgentWithU 用 PySide6 托管 QWebEngine，前端是 React，后端是 Python—
 | `claude-agent-sdk` | 调用本地 Claude Code CLI 驱动 Agent Loop | ✅ 完整 Agent：文件读写、Shell 执行、工具调用 | **需先安装 Claude Code** |
 | `anthropic-api` | 直连 Anthropic API，轻量 Chat 模式 | ❌ 仅对话，无本地工具执行 | Anthropic API Key |
 | `openai-compatible` | 兼容 OpenAI 格式的任意接口 | ❌ 仅对话，无本地工具执行 | 对应服务的 API Key |
-| `dashscope-image` | 阿里云 DashScope 文生图 / 图生图 | — | DashScope API Key |
+| `dashscope-image` | 阿里云 DashScope 文生图 / 图生图；支持 Wan、`qwen-image-3.0`、`qwen-image-3.0-pro` | — | 同地域 DashScope API Key / Workspace |
+
+### Qwen Image 3.0
+
+无需替换现有 Wan Backend：在 Backend Manager 中再创建一个 `DashScope 图像（Wan / Qwen Image 3.0）`，模型选择 `qwen-image-3.0` 或 `qwen-image-3.0-pro` 即可并存切换。
+
+- 文生图尺寸留空时由模型根据提示词自动推荐，也可在聊天输入区按轮选择比例。
+- 图生图支持按顺序传入 1–3 张 JPG/PNG/BMP/TIFF/WEBP/GIF 参考图，单张不超过 10MB。
+- 支持 Direct/Agent 提示词增强、思考增强、1–6 张输出、反向提示词、Seed 与水印；Agent 增强在图生图时会自动降级为 Direct。
+- 调用方式默认设为“自动”：轻量标准版任务使用同步接口；Pro、图生图、多输出、高分辨率、Thinking、Agent 改写或长提示词在提交前直接改走异步任务接口，并按 `task_id` 最长等待 3600 秒（可在 Backend Manager 调整为 60–7200 秒）。同步请求发生读取超时时不会自动重发，避免重复生成和计费。
+- 推荐填写 Workspace ID 与地域，由应用生成业务空间专属 `/api/v1` 地址。模型、Endpoint、API Key 与 Workspace 必须属于同一地域。
 
 > **关于 `claude-agent-sdk` 模式**：底层依赖 [Claude Code](https://claude.ai/code) CLI 实现本地 Agent Loop。使用前须先完成 Claude Code 的安装与鉴权，这是**必选前置项**。
 >

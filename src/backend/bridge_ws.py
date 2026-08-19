@@ -1281,19 +1281,100 @@ class BridgeWS:
                 "gif": "image/gif", "webp": "image/webp"}.get(ext, "image/png")
         return 200, mime, img_bytes
 
+    @staticmethod
+    def _normalize_skill_reference_urls(
+        ref_image: object = "",
+        ref_images: object = None,
+    ) -> list[str]:
+        """兼容单 URL、URL 数组和命令行传入的 JSON 数组，最多保留三张。"""
+        candidates: list[object] = []
+        if isinstance(ref_images, (list, tuple)):
+            candidates.extend(ref_images)
+        elif isinstance(ref_images, str) and ref_images.strip():
+            raw = ref_images.strip()
+            try:
+                parsed = json.loads(raw)
+                if isinstance(parsed, list):
+                    candidates.extend(parsed)
+                else:
+                    candidates.append(raw)
+            except Exception:
+                candidates.extend(part.strip() for part in re.split(r"[\r\n,]+", raw))
+        if ref_image:
+            candidates.append(ref_image)
+
+        urls: list[str] = []
+        seen: set[str] = set()
+        for item in candidates:
+            url = str(item or "").strip()
+            if not url or url in seen:
+                continue
+            seen.add(url)
+            urls.append(url)
+            if len(urls) >= 3:
+                break
+        return urls
+
+    async def _load_skill_reference_images(
+        self,
+        urls: list[str],
+    ) -> Optional[list[ImageAttachment]]:
+        """将 Skill 的 1–3 个参考图 URL 转为 Backend 通用附件。"""
+        import base64 as _b64
+
+        loaded: list[ImageAttachment] = []
+        for ref_url in urls[:3]:
+            try:
+                img_bytes = b""
+                mime = "image/png"
+                if ref_url.startswith("http://127.0.0.1") and "/api/skill-images/" in ref_url:
+                    filename = ref_url.split("/api/skill-images/")[-1].split("?", 1)[0]
+                    img_path = paths.sub("skill-images", filename)
+                    if img_path.exists():
+                        img_bytes = img_path.read_bytes()
+                        ext = img_path.suffix.lstrip(".").lower()
+                        mime = f"image/{'jpeg' if ext in {'jpg', 'jpeg'} else ext or 'png'}"
+                if not img_bytes and ref_url.startswith(("http://", "https://")):
+                    import httpx as _httpx
+                    async with _httpx.AsyncClient(timeout=60) as client:
+                        response = await client.get(ref_url)
+                    if response.status_code == 200:
+                        img_bytes = response.content
+                        mime = response.headers.get("content-type", "image/png").split(";", 1)[0]
+                if not img_bytes:
+                    print(
+                        f"[bridge_ws] failed to load reference image: {ref_url[:120]}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    continue
+                loaded.append(ImageAttachment(
+                    id=new_id(),
+                    base64=_b64.b64encode(img_bytes).decode("ascii"),
+                    mime_type=mime,
+                    size=len(img_bytes),
+                ))
+            except Exception as exc:
+                print(
+                    f"[bridge_ws] reference image load error ({ref_url[:80]}): {exc}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+        return loaded or None
+
     async def _handle_skill_call(self, payload: dict) -> tuple[int, str]:
         """执行 Backend Skill 调用。"""
-        import base64 as _b64
-        from pathlib import Path as _Path
-
         skill_name = payload.get("skill", "")
         prompt = payload.get("prompt", "")
         ref_image = payload.get("ref_image", "")  # 可选：参考图 URL
+        ref_image_urls = self._normalize_skill_reference_urls(
+            ref_image,
+            payload.get("ref_images"),
+        )
         size = payload.get("size", "")  # 可选：尺寸（比例如 "16:9" 或具体如 "1280*720"）
 
-        _ref_preview = repr(ref_image[:80]) if ref_image else "None"
         print(f"[bridge_ws] skill-call: skill={skill_name!r}, prompt={prompt!r}, "
-              f"ref_image={_ref_preview}",
+              f"ref_images={len(ref_image_urls)}",
               file=sys.stderr, flush=True)
 
         if not skill_name:
@@ -1325,38 +1406,8 @@ class BridgeWS:
         except Exception as e:
             return 500, f"Cannot create backend '{target_backend_id}': {e}"
 
-        # ★ 处理参考图：从 HTTP URL 或本地 skill-images 加载
-        ref_images: Optional[list[ImageAttachment]] = None
-        if ref_image:
-            try:
-                img_b64 = ""
-                mime = "image/png"
-                if ref_image.startswith("http://127.0.0.1"):
-                    # 本地 skill-images URL — 直接读文件
-                    filename = ref_image.split("/api/skill-images/")[-1] if "/api/skill-images/" in ref_image else ""
-                    if filename:
-                        img_path = paths.sub("skill-images", filename)
-                        if img_path.exists():
-                            img_b64 = _b64.b64encode(img_path.read_bytes()).decode("ascii")
-                            ext = img_path.suffix.lstrip(".").lower()
-                            mime = f"image/{'jpeg' if ext == 'jpg' else ext}"
-                if not img_b64 and ref_image.startswith("http"):
-                    # 远程 URL — 下载
-                    import httpx as _httpx
-                    async with _httpx.AsyncClient(timeout=60) as hc:
-                        resp = await hc.get(ref_image)
-                        if resp.status_code == 200:
-                            img_b64 = _b64.b64encode(resp.content).decode("ascii")
-                            mime = resp.headers.get("content-type", "image/png").split(";")[0]
-                if img_b64:
-                    ref_images = [ImageAttachment(
-                        id=new_id(), base64=img_b64, mime_type=mime,
-                    )]
-                    print(f"[bridge_ws] skill-call: loaded ref_image ({len(img_b64)} chars b64)",
-                          file=sys.stderr, flush=True)
-            except Exception as e:
-                print(f"[bridge_ws] skill-call: failed to load ref_image: {e}",
-                      file=sys.stderr, flush=True)
+        # ★ 处理 1–3 张参考图：从 HTTP URL 或本地 skill-images 加载。
+        ref_images = await self._load_skill_reference_images(ref_image_urls)
 
         # ★ 动态尺寸：通过 --size 指令注入到 content 中
         # DashScope backend 会自动解析 --size 并从 prompt 中剥离
@@ -9391,7 +9442,7 @@ Kit 版本账本（版本属于 Kit，不属于 AI）：
                 if bc and bc.type.value == "dashscope-image":
                     is_image_backend = True
 
-            # ★ 图像生成 backend：强制在 tool schema 中注入 ref_image 字段，
+            # ★ 图像生成 backend：强制在 tool schema 中注入参考图与尺寸字段，
             #   否则兼容 OpenAI function-calling 的模型（Qwen 系列）根本没有字段
             #   可以表达"传入参考图 URL"的意图。并在 description 中强化规则，
             #   让 Qwen 3.6+ 等对参数描述更严格的模型不会遗漏。
@@ -9401,9 +9452,9 @@ Kit 版本账本（版本属于 Kit，不属于 AI）：
                     props["ref_image"] = {
                         "type": "string",
                         "description": (
-                            "参考图片的 URL，用于图生图 / image-to-image 模式。"
-                            "【强制规则】以下任一情况都必须把 URL 填入本字段，"
-                            "不得留空、不得只在 prompt 里描述："
+                            "单张参考图片 URL（兼容字段）。有多张时改用 ref_images。"
+                            "【强制规则】以下任一情况都必须通过 ref_image 或 ref_images 传入 URL，"
+                            "不得只在 prompt 里描述："
                             "(1) 本轮用户消息里含 `[用户上传图片 URL: http://127.0.0.1:...]` 标记；"
                             "(2) 用户提到『基于上图 / 在这张图上 / 改这张图 / "
                             "在上一张图基础上 / 以这张为参考 / 用这个图 / 引用上图』等；"
@@ -9414,18 +9465,34 @@ Kit 版本账本（版本属于 Kit，不属于 AI）：
                             "找到就原样传入本字段，不要改写、不要省略、不要截断。"
                         ),
                     }
+                if "ref_images" not in props:
+                    props["ref_images"] = {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "maxItems": 3,
+                        "description": (
+                            "参考图片 URL 数组，按输入顺序传入 1–3 张；"
+                            "当用户同时提供多张图片时必须使用本字段完整传递，"
+                            "不得只保留第一张。单张可使用 ref_image 或本字段。"
+                        ),
+                    }
+                if "size" not in props:
+                    props["size"] = {
+                        "type": "string",
+                        "description": "可选输出尺寸或比例，例如 1024*1024、16:9；留空由模型决定。",
+                    }
                 # 在工具描述前缀追加强制规则，OpenAI function-calling 下 description
                 # 对 Qwen 的约束力比单独的参数 description 更强
                 description = (
                     f"{description}\n\n"
                     "【图生图强制规则】调用本工具前必须检查是否需要携带参考图：\n"
-                    "• 若本轮用户消息含 `[用户上传图片 URL: http://127.0.0.1:...]`，"
-                    "必须把该 URL 作为 ref_image 参数传入。\n"
+                    "• 若本轮用户消息含一个或多个 `[用户上传图片 URL: http://127.0.0.1:...]`，"
+                    "必须把全部 URL 通过 ref_image（单张）或 ref_images（1–3 张）传入。\n"
                     "• 若用户说『基于上图 / 在这张图上 / 改这张图 / 上一张基础上 / "
                     "以这张为参考』等，必须回查对话历史，取最近一条 "
                     "`http://127.0.0.1:` 开头的 `/api/skill-images/` 图片 URL 作为 ref_image。\n"
-                    "• 只有用户明确表示『不参考任何图、重新画一张』时才可省略 ref_image。\n"
-                    "• 严禁只把 URL 写进 prompt 文本里——必须通过 ref_image 结构化参数传入。"
+                    "• 只有用户明确表示『不参考任何图、重新画一张』时才可省略参考图。\n"
+                    "• 严禁只把 URL 写进 prompt 文本里——必须通过 ref_image/ref_images 结构化参数传入。"
                 )
 
             tool_name = sname.replace("-", "_")  # Claude 不允许工具名含连字符
@@ -9460,62 +9527,40 @@ Kit 版本账本（版本属于 Kit，不属于 AI）：
         is_image_backend = mapping.get("is_image_backend", False)
 
         # 构建发给目标 backend 的消息内容
-        prompt = tool_input.get("prompt", "")
+        prompt = str(tool_input.get("prompt", "") or "")
         if not prompt:
-            # 保底：如果模型没传 prompt，就把整个 tool_input（剥去 ref_image）塞进去
-            _dump_input = {k: v for k, v in tool_input.items() if k != "ref_image"}
+            # 保底：如果模型没传 prompt，就把非控制参数序列化为描述。
+            _dump_input = {
+                k: v for k, v in tool_input.items()
+                if k not in {"ref_image", "ref_images", "size"}
+            }
             prompt = json.dumps(_dump_input, ensure_ascii=False) if _dump_input else ""
 
         # ── 处理参考图参数（图生图） ──
-        # OpenAI function-calling 的 Qwen 系模型会通过 ref_image 字段传入 URL。
+        # OpenAI function-calling 的模型通过 ref_image/ref_images 传入 URL。
         # 这里从 tool_input 取出，回退：prompt 里嵌入的 http://127.0.0.1:.../skill-images/ URL
         # 也会被识别为隐式参考图，避免模型不按约定填字段时完全丢失上下文。
         ref_images: Optional[list[ImageAttachment]] = None
-        ref_image_url = (tool_input.get("ref_image") or "").strip()
-        if is_image_backend and not ref_image_url and prompt:
-            # fallback: 从 prompt 里扫描出本地图片 URL
-            import re as _re
-            m = _re.search(r'http://127\.0\.0\.1[^\s)\]\'"]*?/api/skill-images/[^\s)\]\'"]+', prompt)
-            if m:
-                ref_image_url = m.group(0)
-                print(f"[bridge_ws] Backend Skill '{tool_name}': "
-                      f"ref_image not in tool_input, recovered from prompt: {ref_image_url}",
-                      file=sys.stderr, flush=True)
-
-        if is_image_backend and ref_image_url:
-            try:
-                import base64 as _b64
-                from pathlib import Path as _Path
-                img_b64 = ""
-                mime = "image/png"
-                if ref_image_url.startswith("http://127.0.0.1") and "/api/skill-images/" in ref_image_url:
-                    filename = ref_image_url.split("/api/skill-images/")[-1].split("?", 1)[0]
-                    img_path = paths.sub("skill-images", filename)
-                    if img_path.exists():
-                        img_b64 = _b64.b64encode(img_path.read_bytes()).decode("ascii")
-                        ext = img_path.suffix.lstrip(".").lower()
-                        mime = f"image/{'jpeg' if ext == 'jpg' else ext}"
-                if not img_b64 and ref_image_url.startswith("http"):
-                    import httpx as _httpx
-                    async with _httpx.AsyncClient(timeout=60) as hc:
-                        resp = await hc.get(ref_image_url)
-                        if resp.status_code == 200:
-                            img_b64 = _b64.b64encode(resp.content).decode("ascii")
-                            mime = resp.headers.get("content-type", "image/png").split(";")[0]
-                if img_b64:
-                    ref_images = [ImageAttachment(
-                        id=new_id(), base64=img_b64, mime_type=mime,
-                    )]
-                    print(f"[bridge_ws] Backend Skill '{tool_name}': loaded ref_image "
-                          f"({len(img_b64)} chars b64) from {ref_image_url[:80]}",
-                          file=sys.stderr, flush=True)
-                else:
-                    print(f"[bridge_ws] Backend Skill '{tool_name}': ref_image URL given but "
-                          f"failed to load: {ref_image_url[:120]}",
-                          file=sys.stderr, flush=True)
-            except Exception as _e:
-                print(f"[bridge_ws] Backend Skill '{tool_name}': ref_image load error: {_e}",
-                      file=sys.stderr, flush=True)
+        ref_image_urls = self._normalize_skill_reference_urls(
+            tool_input.get("ref_image"),
+            tool_input.get("ref_images"),
+        )
+        if is_image_backend and not ref_image_urls and prompt:
+            ref_image_urls = self._normalize_skill_reference_urls(
+                ref_images=re.findall(
+                    r'http://127\.0\.0\.1[^\s)\]\'"]*?/api/skill-images/[^\s)\]\'"]+',
+                    prompt,
+                ),
+            )
+            if ref_image_urls:
+                print(
+                    f"[bridge_ws] Backend Skill '{tool_name}': recovered "
+                    f"{len(ref_image_urls)} reference image(s) from prompt",
+                    file=sys.stderr,
+                    flush=True,
+                )
+        if is_image_backend and ref_image_urls:
+            ref_images = await self._load_skill_reference_images(ref_image_urls)
 
         # 把 ref_image URL 从 prompt 文本里剔除，避免 DashScope 把 URL 当成描述词
         if is_image_backend and prompt:
@@ -9527,6 +9572,9 @@ Kit 版本账本（版本属于 Kit，不属于 AI）：
             ).strip()
         if not prompt:
             prompt = "(empty)"
+        size = str(tool_input.get("size", "") or "").strip()
+        if is_image_backend and size:
+            prompt = f"{prompt} --size {size}"
 
         result_parts: list[str] = []
         result_errors: list[str] = []
@@ -9814,14 +9862,16 @@ Kit 版本账本（版本属于 Kit，不属于 AI）：
         ref_image_hint = ""
         if is_image_backend:
             ref_image_hint = """
-**⚠️ 图生图（强制规则）**：以下任何情况都必须将图片 URL 作为最后一个参数传入：
+**⚠️ 图生图（强制规则）**：以下任何情况都必须传入参考图 URL；单张可用 ref_image，
+多张必须通过 ref_images 传入 JSON URL 数组（最多 3 张）：
 - 用户上传了图片（消息中含图片附件）
 - 用户说到"基于上图"、"引用上图"、"参考这张图"、"在这张图上"、"修改这张图"
 - 用户说到"基于上面的图"、"用这个图"、"以这张为参考"、"改改这个"、"在上一张图基础上"
 - 对话历史中有之前生成的图片 URL（http://127.0.0.1:xxxxx/api/skill-images/... 格式）
 - 任何暗示要在现有图片基础上操作的表达
 
-**图片 URL 查找规则**：优先用用户刚上传的图片 URL；其次用对话中最近出现的 `http://127.0.0.1` 开头的图片地址。找到就传，不要忽略。
+**图片 URL 查找规则**：优先使用用户本轮上传的全部图片 URL（按原顺序，最多 3 张）；
+其次使用对话中最近出现的 `http://127.0.0.1` 图片地址。找到就传，不要忽略。
 """
 
         tool_instruction = (
@@ -9879,7 +9929,12 @@ payload = {{"skill": "{skill_name}", "{primary_field}": sys.argv[1] if len(sys.a
 req = urllib.request.Request("http://127.0.0.1:{port}/api/skill-call", data, {{"Content-Type": "application/json"}})
 _opener = urllib.request.build_opener(urllib.request.ProxyHandler({{}}))
 try:
-    result = _opener.open(req, timeout=300).read()
+    _bridge_timeout = float(os.environ.get("AGENTWITHU_SKILL_CALL_TIMEOUT_SECONDS", "7500"))
+except ValueError:
+    _bridge_timeout = 7500.0
+_bridge_timeout = min(86400.0, max(60.0, _bridge_timeout))
+try:
+    result = _opener.open(req, timeout=_bridge_timeout).read()
     sys.stdout.buffer.write(result)
     sys.stdout.buffer.write(b"\\n")
     sys.stdout.buffer.flush()
@@ -10181,7 +10236,7 @@ except urllib.error.URLError as e:
                 hint += (
                     f'\n  → 图生图（参考图）Bash: '
                     f'`{img_cmd}`'
-                    f'\n  → 原生工具调用时必须把参考图 URL 填入 `ref_image` 参数'
+                    f'\n  → 原生工具调用时必须把参考图 URL 填入 `ref_image`（单张）或 `ref_images`（多张）参数'
                     f'（不要只写在 prompt 里）'
                 )
             backend_skill_hints.append(hint)
@@ -10215,7 +10270,7 @@ except urllib.error.URLError as e:
                     "`http://127.0.0.1:` 开头的 `/api/skill-images/xxx` 图片 URL。\n\n"
                     "2. **传参方式**（按调用路径二选一）：\n"
                     "   - **原生 Skill/Function-calling 路径**：必须把 URL 填入 `ref_image` "
-                    "结构化参数。**禁止**只把 URL 混入 prompt 字符串里交差。\n"
+                    "（单张）或 `ref_images`（1–3 张）结构化参数。**禁止**只把 URL 混入 prompt 字符串里交差。\n"
                     "   - **Bash 调用路径**：作为第二个位置参数传入（见上方"
                     "『图生图 Bash』示例）。\n\n"
                     "3. **URL 选取规则**：\n"

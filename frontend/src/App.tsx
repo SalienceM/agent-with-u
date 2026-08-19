@@ -48,6 +48,7 @@ import { hljsLightCss, hljsDarkCss } from './utils/hljsThemes';
 import { messagesToMarkdown, messagesToJson } from './utils/markdown';
 import type { SmoothGhostState } from './utils/smoothGhost';
 import { notifyTaskCompletion } from './utils/desktopNotifications';
+import type { FileFocusRequest } from './utils/fileFocus';
 
 function hexToRgba(color: string, alpha: number): string {
   const m = color.match(/^#([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})/i);
@@ -115,6 +116,8 @@ export const App: React.FC = () => {
   });
   const sidebarWidthRef = useRef(sidebarWidth);
   sidebarWidthRef.current = sidebarWidth;
+  const [fileFocusRequest, setFileFocusRequest] = useState<FileFocusRequest | null>(null);
+  const fileFocusRequestIdRef = useRef(0);
   const handleSidebarDragStart = useCallback((e: React.MouseEvent<HTMLDivElement>) => {
     e.preventDefault();
     const startX = e.clientX;
@@ -1231,12 +1234,14 @@ export const App: React.FC = () => {
         onToggleCollapse={() => setSidebarCollapsed((v) => !v)}
         width={sidebarWidth}
         activeWorkingDir={activeSession?.workingDir}
+        activeSessionMetaId={activeSession?.id}
         activeExecKey={activeSession?.execKey}
         activeExecLabel={activeSession?.execLabel}
         activeExecMode={activeSession?.execMode}
         activeBackendId={activeBackendId}
         activeCodexRemoteHost={activeSession?.codexRemoteHost}
         sessionLimit={config.sidebarSessionLimit}
+        fileFocusRequest={fileFocusRequest}
       />
 
       {/* 侧栏宽度拖拽手柄(桌面端展开时) */}
@@ -1524,6 +1529,14 @@ export const App: React.FC = () => {
                     onStreamingChange={handleStreamingChange}
                     onGhostStateChange={handleGhostStateChange}
                     onAdjustFontSize={(delta) => updateConfig({ fontSize: Math.max(11, Math.min(28, config.fontSize + delta)) })}
+                    onRequestFileFocus={(request) => {
+                      setFocusedPaneIdx(idx);
+                      setSidebarCollapsed(false);
+                      setFileFocusRequest({
+                        ...request,
+                        requestId: ++fileFocusRequestIdRef.current,
+                      });
+                    }}
                   />
                 ) : idx === firstHomePaneIdx ? (
                   <HomeDashboard

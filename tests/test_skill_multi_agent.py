@@ -10,6 +10,7 @@ from src.backend.skill_paths import (
     render_skill_markdown,
 )
 from src.backend.skill_store import SkillStore
+from src.types import BackendType, ModelBackendConfig
 
 
 class SkillPathTests(unittest.TestCase):
@@ -157,6 +158,18 @@ class BackendSkillGenerationTests(unittest.TestCase):
         self.assertIn("curl.exe", command)
         self.assertIn("'url' = '<URL>'", command)
 
+    def test_generated_call_script_allows_long_running_image_jobs(self):
+        script = self.bridge._generate_backend_skill_call_py(
+            "generate-image",
+            self.info,
+            is_image_backend=True,
+        )
+
+        self.assertIn("AGENTWITHU_SKILL_CALL_TIMEOUT_SECONDS", script)
+        self.assertIn('"7500"', script)
+        self.assertIn("timeout=_bridge_timeout", script)
+        self.assertNotIn("timeout=300", script)
+
     def test_native_tool_block_does_not_force_codex_back_to_bash(self):
         instruction = self.bridge._blocked_tool_instruction({"WebFetch", "WebSearch"})
 
@@ -164,6 +177,54 @@ class BackendSkillGenerationTests(unittest.TestCase):
         self.assertIn("Skill: web-fetch", instruction)
         self.assertIn("当前 Agent 与操作系统", instruction)
         self.assertNotIn("用 Bash", instruction)
+
+    def test_image_backend_tool_schema_supports_three_ordered_references(self):
+        class FakeSkillStore:
+            @staticmethod
+            def get_skill(name):
+                if name != "generate-image":
+                    return None
+                return {
+                    "backend": "qwen-image",
+                    "description": "Generate or edit images",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {"prompt": {"type": "string"}},
+                        "required": ["prompt"],
+                    },
+                }
+
+        self.bridge._skill_store = FakeSkillStore()
+        self.bridge._backend_configs = [ModelBackendConfig(
+            id="qwen-image",
+            type=BackendType.DASHSCOPE_IMAGE,
+            label="Qwen Image 3",
+            model="qwen-image-3.0",
+        )]
+        session = type("SessionStub", (), {
+            "abilities": {"skills": ["generate-image"]},
+        })()
+
+        tools, _mapping = self.bridge._collect_backend_skills(session)
+
+        properties = tools[0]["input_schema"]["properties"]
+        self.assertEqual(properties["ref_images"]["type"], "array")
+        self.assertEqual(properties["ref_images"]["maxItems"], 3)
+        self.assertIn("size", properties)
+        self.assertIn("ref_image", properties)  # 旧 Skill/调用方继续兼容
+
+    def test_reference_url_normalization_accepts_json_deduplicates_and_caps(self):
+        urls = self.bridge._normalize_skill_reference_urls(
+            "https://example.test/a.png",
+            '["https://example.test/a.png", "https://example.test/b.png", '
+            '"https://example.test/c.png", "https://example.test/d.png"]',
+        )
+
+        self.assertEqual(urls, [
+            "https://example.test/a.png",
+            "https://example.test/b.png",
+            "https://example.test/c.png",
+        ])
 
     def test_loading_session_refreshes_deployed_skill_templates(self):
         session = type("SessionStub", (), {

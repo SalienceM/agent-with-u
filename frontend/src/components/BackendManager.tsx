@@ -44,6 +44,16 @@ const CODEX_RECOMMENDED_MODELS = [
   { id: 'gpt-5.4', label: 'GPT-5.4' },
   { id: 'gpt-5.4-mini', label: 'GPT-5.4 Mini' },
 ];
+const DASHSCOPE_IMAGE_MODELS = [
+  { id: 'qwen-image-3.0-pro', label: 'Qwen Image 3.0 Pro（质量优先）' },
+  { id: 'qwen-image-3.0', label: 'Qwen Image 3.0（质量/速度均衡）' },
+  { id: 'wanx2.1-t2i-turbo', label: 'Wanx 2.1 Turbo' },
+  { id: 'wanx2.1-t2i-plus', label: 'Wanx 2.1 Plus' },
+];
+
+function isQwenImage3Model(model: string | undefined): boolean {
+  return String(model || '').trim().toLowerCase().startsWith('qwen-image-3.0');
+}
 
 const DEFAULT_TOOLS = ['Read', 'Edit', 'Bash', 'Glob', 'Grep', 'Write'];
 const ALL_TOOLS = ['Read', 'Edit', 'Write', 'Bash', 'Glob', 'Grep', 'WebSearch', 'WebFetch'];
@@ -644,7 +654,7 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
                       <option value="codex-office">Codex Office</option>
                       <option value="openai-compatible">OpenAI Compatible</option>
                       <option value="anthropic-api">Anthropic API</option>
-                      <option value="dashscope-image">DashScope 文生图（万象/Wan）</option>
+                      <option value="dashscope-image">DashScope 图像（Wan / Qwen Image 3.0）</option>
                     </select>
                   </div>
                 </div>
@@ -1560,12 +1570,14 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
               </div>
             )}
 
-            {/* ── DashScope 文生图专属配置 ── */}
+            {/* ── DashScope 图像生成与编辑专属配置 ── */}
             {formData.type === 'dashscope-image' && (
               <div style={{ marginBottom: 16, padding: 12, background: 'var(--theme-bg-secondary)', borderRadius: 8 }}>
-                <label style={{ ...labelStyle, marginBottom: 8 }}>DashScope 文生图配置</label>
-                <p style={{ fontSize: 11, color: 'var(--theme-text-muted)', margin: '0 0 12px 0' }}>
-                  阿里云万象（wanx / wan）系列文生图模型，使用异步任务 API。
+                <label style={{ ...labelStyle, marginBottom: 8 }}>DashScope 图像生成与编辑配置</label>
+                <p style={{ fontSize: 11, color: 'var(--theme-text-muted)', margin: '0 0 12px 0', lineHeight: 1.6 }}>
+                  同一类型可创建多个独立 Backend：保留现有 Wan 2.7，再新增一个选择
+                  <code style={{ margin: '0 3px' }}>qwen-image-3.0</code> 或
+                  <code style={{ marginLeft: 3 }}>qwen-image-3.0-pro</code>。Qwen 3.0 同时支持文生图与 1–3 张参考图编辑。
                 </p>
 
                 <div style={{ marginBottom: 10 }}>
@@ -1587,13 +1599,34 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
                   </label>
                   <input
                     type="text"
+                    list="dashscope-image-model-options"
                     value={formData.model || ''}
                     onChange={(e) => setFormData({ ...formData, model: e.target.value })}
                     style={inputStyle}
-                    placeholder="wanx2.1-t2i-turbo（默认）"
+                    placeholder="qwen-image-3.0-pro"
                   />
+                  <datalist id="dashscope-image-model-options">
+                    {DASHSCOPE_IMAGE_MODELS.map((item) => (
+                      <option key={item.id} value={item.id}>{item.label}</option>
+                    ))}
+                  </datalist>
+                  <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginTop: 7 }}>
+                    {DASHSCOPE_IMAGE_MODELS.slice(0, 2).map((item) => (
+                      <button
+                        key={item.id}
+                        type="button"
+                        onClick={() => setFormData({ ...formData, model: item.id })}
+                        style={{
+                          padding: '4px 8px', borderRadius: 5, fontSize: 10, cursor: 'pointer',
+                          border: `1px solid ${formData.model === item.id ? 'var(--theme-accent)' : 'var(--theme-border)'}`,
+                          color: formData.model === item.id ? 'var(--theme-accent)' : 'var(--theme-text-muted)',
+                          background: formData.model === item.id ? 'var(--theme-accent-bg)' : 'transparent',
+                        }}
+                      >{item.label}</button>
+                    ))}
+                  </div>
                   <span style={{ display: 'block', marginTop: 4, fontSize: 10, color: 'var(--theme-text-muted)' }}>
-                    可选：wanx2.1-t2i-turbo / wanx2.1-t2i-plus / wanx2.0-t2i-turbo / wan2.1-t2i-turbo
+                    Qwen 3.0 Pro 质量优先；标准版兼顾质量与速度。Wan 模型仍可直接填写原模型名。
                   </span>
                 </div>
 
@@ -1606,10 +1639,10 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
                     value={formData.env?.SIZE || ''}
                     onChange={(e) => handleEnvChange('SIZE', e.target.value)}
                     style={inputStyle}
-                    placeholder="1024*1024（默认）"
+                    placeholder={isQwenImage3Model(formData.model) ? '留空＝由 Qwen 自动推荐' : '1024*1024（默认）'}
                   />
                   <span style={{ display: 'block', marginTop: 4, fontSize: 10, color: 'var(--theme-text-muted)' }}>
-                    常用：1024*1024 / 1280*720 / 720*1280 / 1328*1328 / 2048*2048
+                    可在聊天输入区按轮选择自动、1:1、16:9 等；这里设置的是 Backend 默认值。
                   </span>
                 </div>
 
@@ -1626,19 +1659,181 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
                   />
                 </div>
 
+                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: 10, marginBottom: 10 }}>
+                  <div>
+                    <label style={{ fontSize: 11, color: 'var(--theme-text)', display: 'block', marginBottom: 4 }}>
+                      提示词智能改写
+                    </label>
+                    <select
+                      value={formData.env?.PROMPT_EXTEND || 'true'}
+                      onChange={(e) => handleEnvChange('PROMPT_EXTEND', e.target.value)}
+                      style={selectStyle}
+                    >
+                      <option value="true">开启（推荐）</option>
+                      <option value="false">关闭</option>
+                    </select>
+                  </div>
+                  <div>
+                    <label style={{ fontSize: 11, color: 'var(--theme-text)', display: 'block', marginBottom: 4 }}>
+                      输出水印
+                    </label>
+                    <select
+                      value={formData.env?.WATERMARK || 'false'}
+                      onChange={(e) => handleEnvChange('WATERMARK', e.target.value)}
+                      style={selectStyle}
+                    >
+                      <option value="false">关闭</option>
+                      <option value="true">开启</option>
+                    </select>
+                  </div>
+                </div>
+
+                {isQwenImage3Model(formData.model) && (
+                  <div style={{ margin: '12px 0', padding: 10, border: '1px solid var(--theme-border)', borderRadius: 7 }}>
+                    <div style={{ fontSize: 11, fontWeight: 650, color: 'var(--theme-text)', marginBottom: 9 }}>
+                      Qwen Image 3.0 参数
+                    </div>
+                    <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(155px, 1fr))', gap: 10 }}>
+                      <div>
+                        <label style={{ fontSize: 10, color: 'var(--theme-text-muted)', display: 'block', marginBottom: 4 }}>
+                          改写模式
+                        </label>
+                        <select
+                          value={formData.env?.PROMPT_EXTEND_MODE || 'direct'}
+                          onChange={(e) => handleEnvChange('PROMPT_EXTEND_MODE', e.target.value)}
+                          style={selectStyle}
+                        >
+                          <option value="direct">Direct（文生图/图生图）</option>
+                          <option value="agent">Agent（仅文生图）</option>
+                        </select>
+                      </div>
+                      <div>
+                        <label style={{ fontSize: 10, color: 'var(--theme-text-muted)', display: 'block', marginBottom: 4 }}>
+                          思考增强
+                        </label>
+                        <select
+                          value={formData.env?.ENABLE_THINKING || 'true'}
+                          onChange={(e) => handleEnvChange('ENABLE_THINKING', e.target.value)}
+                          style={selectStyle}
+                        >
+                          <option value="true">开启（质量优先）</option>
+                          <option value="false">关闭（速度优先）</option>
+                        </select>
+                      </div>
+                      <div>
+                        <label style={{ fontSize: 10, color: 'var(--theme-text-muted)', display: 'block', marginBottom: 4 }}>
+                          调用方式
+                        </label>
+                        <select
+                          value={formData.env?.DASHSCOPE_CALL_MODE || 'auto'}
+                          onChange={(e) => handleEnvChange('DASHSCOPE_CALL_MODE', e.target.value)}
+                          style={selectStyle}
+                        >
+                          <option value="auto">自动（推荐）</option>
+                          <option value="async">始终异步</option>
+                          <option value="sync">始终同步</option>
+                        </select>
+                      </div>
+                      <div>
+                        <label style={{ fontSize: 10, color: 'var(--theme-text-muted)', display: 'block', marginBottom: 4 }}>
+                          异步最长等待（秒）
+                        </label>
+                        <input
+                          type="number"
+                          min={60}
+                          max={7200}
+                          step={60}
+                          value={formData.env?.DASHSCOPE_MAX_WAIT_SECONDS || '3600'}
+                          onChange={(e) => handleEnvChange('DASHSCOPE_MAX_WAIT_SECONDS', e.target.value)}
+                          style={inputStyle}
+                        />
+                      </div>
+                      <div>
+                        <label style={{ fontSize: 10, color: 'var(--theme-text-muted)', display: 'block', marginBottom: 4 }}>
+                          输出数量（1–6）
+                        </label>
+                        <input
+                          type="number"
+                          min={1}
+                          max={6}
+                          value={formData.env?.N || '1'}
+                          onChange={(e) => handleEnvChange('N', e.target.value)}
+                          style={inputStyle}
+                        />
+                      </div>
+                      <div>
+                        <label style={{ fontSize: 10, color: 'var(--theme-text-muted)', display: 'block', marginBottom: 4 }}>
+                          Seed（可选）
+                        </label>
+                        <input
+                          type="number"
+                          min={0}
+                          max={2147483647}
+                          value={formData.env?.SEED || ''}
+                          onChange={(e) => handleEnvChange('SEED', e.target.value)}
+                          style={inputStyle}
+                          placeholder="随机"
+                        />
+                      </div>
+                    </div>
+                    <div style={{ marginTop: 7, fontSize: 10, color: 'var(--theme-text-muted)', lineHeight: 1.55 }}>
+                      自动模式会在提交前把 Pro、图生图、多输出、高分辨率、Thinking、Agent 改写和长提示词切到异步，避免长连接读超时。
+                      同步请求若仅发生读取超时不会自动重发，以免重复生成和计费。图生图选择 Agent 时会自动改为 Direct；参考图最多 3 张、每张不超过 10MB。
+                    </div>
+                  </div>
+                )}
+
+                <div style={{ marginBottom: 10, padding: 10, border: '1px solid var(--theme-border)', borderRadius: 7 }}>
+                  <div style={{ fontSize: 11, fontWeight: 650, color: 'var(--theme-text)', marginBottom: 8 }}>
+                    业务空间专属域名（推荐）
+                  </div>
+                  <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(160px, 1fr))', gap: 10 }}>
+                    <div>
+                      <label style={{ fontSize: 10, color: 'var(--theme-text-muted)', display: 'block', marginBottom: 4 }}>
+                        Workspace ID
+                      </label>
+                      <input
+                        type="text"
+                        value={formData.env?.DASHSCOPE_WORKSPACE_ID || ''}
+                        onChange={(e) => handleEnvChange('DASHSCOPE_WORKSPACE_ID', e.target.value)}
+                        style={inputStyle}
+                        placeholder="业务空间 ID"
+                      />
+                    </div>
+                    <div>
+                      <label style={{ fontSize: 10, color: 'var(--theme-text-muted)', display: 'block', marginBottom: 4 }}>
+                        地域
+                      </label>
+                      <select
+                        value={formData.env?.DASHSCOPE_REGION || 'cn-beijing'}
+                        onChange={(e) => handleEnvChange('DASHSCOPE_REGION', e.target.value)}
+                        style={selectStyle}
+                      >
+                        <option value="cn-beijing">北京</option>
+                        <option value="ap-southeast-1">新加坡</option>
+                        <option value="eu-central-1">法兰克福</option>
+                        <option value="ap-northeast-1">东京</option>
+                      </select>
+                    </div>
+                  </div>
+                  <div style={{ marginTop: 6, fontSize: 10, color: 'var(--theme-text-muted)' }}>
+                    模型、API Key、Workspace 与地域必须一致；填写后自动组成对应的 <code>...maas.aliyuncs.com/api/v1</code> 地址。
+                  </div>
+                </div>
+
                 <div style={{ marginBottom: 10 }}>
                   <label style={{ fontSize: 11, color: 'var(--theme-text)', display: 'block', marginBottom: 4 }}>
-                    Base URL（可选，覆盖默认 API 地址）
+                    Base API URL（高级，可选；优先于 Workspace 配置）
                   </label>
                   <input
                     type="text"
                     value={formData.baseUrl || ''}
                     onChange={(e) => setFormData({ ...formData, baseUrl: e.target.value })}
                     style={inputStyle}
-                    placeholder="留空使用 https://dashscope.aliyuncs.com/api/v1"
+                    placeholder="https://{WorkspaceId}.cn-beijing.maas.aliyuncs.com/api/v1"
                   />
                   <span style={{ display: 'block', marginTop: 4, fontSize: 10, color: 'var(--theme-text-muted)' }}>
-                    新加坡节点：https://dashscope-intl.aliyuncs.com/api/v1
+                    应填写到 <code>/api/v1</code> 为止；即使误粘贴完整 generation Endpoint，后端也会自动归一化。
                   </span>
                 </div>
               </div>

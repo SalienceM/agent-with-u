@@ -34,6 +34,11 @@ import {
 import {
   describeSyncFreshness, type SyncFreshness, type SyncFreshnessKind,
 } from '../utils/dirSyncFreshness';
+import {
+  normalizeRelativeFilePath,
+  sameWorkspacePath,
+  type FileFocusRequest,
+} from '../utils/fileFocus';
 
 const CodeEditor = lazy(() => import('./CodeEditor'));
 const PdfPreview = lazy(() => import('./PdfPreview'));
@@ -48,6 +53,7 @@ interface Props {
   execLabel?: string;
   execMode?: 'local' | 'relay';   // 会话运行在哪：本机 / 远端中继节点
   backendId?: string;             // ★ 当前会话的 backendId —— 供 AI 生成 commit message 使用
+  focusRequest?: FileFocusRequest | null;
 }
 
 interface TNode {
@@ -353,7 +359,7 @@ function formatBytes(value: number): string {
   return `${(value / 1024 / 1024 / 1024).toFixed(2)} GB`;
 }
 
-export const FileTreePanel: React.FC<Props> = ({ sessionId, workingDir, execKey, execLabel, execMode, backendId }) => {
+export const FileTreePanel: React.FC<Props> = ({ sessionId, workingDir, execKey, execLabel, execMode, backendId, focusRequest }) => {
   // execMode='local' 表示“在 Backend 所在机器执行”，不代表浏览器拥有那台
   // 机器的文件系统。只有 Tauri 本机执行时可直接视为同一端。
   const isRemote = execMode === 'relay' || !isTauri();
@@ -367,7 +373,11 @@ export const FileTreePanel: React.FC<Props> = ({ sessionId, workingDir, execKey,
   const [loading, setLoading] = useState<Record<string, boolean>>({});
   const [expanded, setExpanded] = useState<Record<string, boolean>>({});
   const [selected, setSelected] = useState<string | null>(null);
+  const [focusFlash, setFocusFlash] = useState<string | null>(null);
   const [msg, setMsg] = useState<{ kind: 'ok' | 'err'; text: string } | null>(null);
+  const rowRefs = useRef<Map<string, HTMLDivElement>>(new Map());
+  const processedFocusRequestRef = useRef(0);
+  const focusFlashTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // 远端会话的本地副本(离线/比对/同步用)。本地会话不涉及。
   const [localFs, setLocalFs] = useState<LocalFs | null>(null);
@@ -479,8 +489,8 @@ export const FileTreePanel: React.FC<Props> = ({ sessionId, workingDir, execKey,
   }, [htmlExported]);
 
   // ── 懒加载工作目录某层 ──
-  const loadChildren = useCallback(async (rel: string): Promise<void> => {
-    if (!workingDir) return;
+  const loadChildren = useCallback(async (rel: string): Promise<TNode[]> => {
+    if (!workingDir) return [];
     setLoading((p) => ({ ...p, [rel]: true }));
     try {
       if (isRemote && !sessionOnline) {
@@ -495,7 +505,7 @@ export const FileTreePanel: React.FC<Props> = ({ sessionId, workingDir, execKey,
           local: true,
         }));
         setChildren((previous) => ({ ...previous, [rel]: nodes }));
-        return;
+        return nodes;
       }
       // 文件传输面板必须忠实展示工作空间，包括 .git 等点号目录。
       const ents = await api.listDirectory(rel, workingDir, execKey, true);
@@ -505,9 +515,11 @@ export const FileTreePanel: React.FC<Props> = ({ sessionId, workingDir, execKey,
       }));
       nodes.sort((a, b) => (a.isDir !== b.isDir ? (a.isDir ? -1 : 1) : a.name.localeCompare(b.name)));
       setChildren((p) => ({ ...p, [rel]: nodes }));
+      return nodes;
     } catch (e: any) {
       setMsg({ kind: 'err', text: `目录读取失败：${e?.message ?? e}` });
       setChildren((p) => ({ ...p, [rel]: [] }));
+      return [];
     } finally {
       setLoading((p) => ({ ...p, [rel]: false }));
     }
@@ -999,6 +1011,75 @@ export const FileTreePanel: React.FC<Props> = ({ sessionId, workingDir, execKey,
     }
     return dirs;
   }, [remoteManifest]);
+
+  // 聊天气泡中的文件链接 → 自动逐层加载、展开、选中并滚动到目标。
+  // 请求同时绑定 Session 和 workingDir，避免分屏/切换节点时定位到同名目录。
+  useEffect(() => {
+    if (!focusRequest
+      || focusRequest.requestId === processedFocusRequestRef.current
+      || focusRequest.sessionId !== sessionId
+      || !sameWorkspacePath(focusRequest.workingDir, workingDir)) return;
+    if (isRemote && !sessionOnline && !localFs) return;
+
+    const relativePath = normalizeRelativeFilePath(focusRequest.relativePath);
+    if (!relativePath) return;
+    processedFocusRequestRef.current = focusRequest.requestId;
+    let cancelled = false;
+    let revealFrame = 0;
+
+    void (async () => {
+      setOnlyDifferent(false);
+      const parts = relativePath.split('/').filter(Boolean);
+      const ancestors: Record<string, boolean> = {};
+      for (let i = 1; i < parts.length; i++) {
+        ancestors[parts.slice(0, i).join('/')] = true;
+      }
+      setExpanded((previous) => ({ ...previous, ...ancestors }));
+
+      for (let i = 0; i < parts.length; i++) {
+        const parent = parts.slice(0, i).join('/');
+        const expected = parts.slice(0, i + 1).join('/');
+        const loaded = await loadChildren(parent);
+        if (cancelled) return;
+        const candidates = [...loaded, ...(localTree[parent] || [])];
+        const node = candidates.find((item) => item.rel.replace(/\\/g, '/') === expected);
+        if (!node || (i < parts.length - 1 && !node.isDir)) {
+          setMsg({ kind: 'err', text: `无法在当前工作目录中定位：${relativePath}` });
+          return;
+        }
+      }
+
+      if (cancelled) return;
+      setSelected(relativePath);
+      setFocusFlash(relativePath);
+      if (focusFlashTimerRef.current) clearTimeout(focusFlashTimerRef.current);
+      focusFlashTimerRef.current = setTimeout(() => setFocusFlash(null), 1800);
+
+      let attempts = 0;
+      const reveal = () => {
+        if (cancelled) return;
+        const row = rowRefs.current.get(relativePath);
+        if (row) {
+          row.scrollIntoView({ behavior: 'smooth', block: 'center', inline: 'nearest' });
+          row.focus({ preventScroll: true });
+          return;
+        }
+        attempts += 1;
+        if (attempts < 16) revealFrame = requestAnimationFrame(reveal);
+        else setMsg({ kind: 'err', text: `文件已加载，但暂时无法显示：${relativePath}` });
+      };
+      revealFrame = requestAnimationFrame(reveal);
+    })();
+
+    return () => {
+      cancelled = true;
+      if (revealFrame) cancelAnimationFrame(revealFrame);
+    };
+  }, [focusRequest, sessionId, workingDir, isRemote, sessionOnline, localFs, localTree, loadChildren]);
+
+  useEffect(() => () => {
+    if (focusFlashTimerRef.current) clearTimeout(focusFlashTimerRef.current);
+  }, []);
 
   /** 两端都存在、但内容哈希不同的文件；冲突也是内容不同的一种。 */
   const differentPaths = useMemo(() => {
@@ -1787,7 +1868,12 @@ export const FileTreePanel: React.FC<Props> = ({ sessionId, workingDir, execKey,
       return (
         <div key={n.rel}>
           <div
-            className={`ftp-row${selected === n.rel ? ' ftp-sel' : ''}`}
+            ref={(element) => {
+              if (element) rowRefs.current.set(n.rel, element);
+              else rowRefs.current.delete(n.rel);
+            }}
+            tabIndex={-1}
+            className={`ftp-row${selected === n.rel ? ' ftp-sel' : ''}${focusFlash === n.rel ? ' ftp-focus-reveal' : ''}`}
             style={rowStyle}
             onClick={() => {
               setSelected(n.rel);
@@ -1820,6 +1906,7 @@ export const FileTreePanel: React.FC<Props> = ({ sessionId, workingDir, execKey,
             <span style={{ ...nameStyle, ...(st === 'cloud' ? { color: 'var(--theme-text-muted)' } : dotColor ? { color: dotColor } : {}) }}>{n.name}</span>
             {freshness && freshness.kind !== 'same' && (
               <span
+                className="ftp-freshness"
                 title={freshnessTooltip(freshness)}
                 style={{
                   ...syncFreshnessBadgeStyle,
@@ -1865,8 +1952,34 @@ export const FileTreePanel: React.FC<Props> = ({ sessionId, workingDir, execKey,
   return (
     <div style={wrapStyle}>
       <style>{`
+        @keyframes ftp-focus-pulse {
+          0%, 100% { box-shadow: inset 2px 0 0 var(--theme-accent, #0969da); }
+          35% { box-shadow: inset 3px 0 0 var(--theme-accent, #0969da), 0 0 0 2px var(--theme-accent-bg, rgba(9,105,218,.18)); }
+        }
         .ftp-row:hover { background: var(--theme-bg-tertiary, rgba(255,255,255,0.05)); }
         .ftp-row.ftp-sel { background: var(--theme-accent-bg, rgba(9,105,218,0.12)); box-shadow: inset 2px 0 0 var(--theme-accent, #0969da); }
+        .ftp-row.ftp-focus-reveal { animation: ftp-focus-pulse .55s ease-in-out 2; }
+        .ftp-row:focus { outline: 1px solid color-mix(in srgb, var(--theme-accent, #0969da) 42%, transparent); outline-offset: -1px; }
+        .ftp-freshness {
+          opacity: 0;
+          visibility: hidden;
+          max-width: 0 !important;
+          padding-left: 0 !important;
+          padding-right: 0 !important;
+          transform: translateX(3px);
+          transition: opacity .12s ease, max-width .12s ease, padding .12s ease, transform .12s ease;
+          pointer-events: none;
+        }
+        .ftp-row:hover .ftp-freshness,
+        .ftp-row:focus .ftp-freshness,
+        .ftp-row:focus-within .ftp-freshness {
+          opacity: 1;
+          visibility: visible;
+          max-width: 230px !important;
+          padding-left: 4px !important;
+          padding-right: 4px !important;
+          transform: translateX(0);
+        }
         .ftp-act { opacity: 0; }
         .ftp-row:hover .ftp-act { opacity: 1; }
         .ftp-act:disabled { opacity: .35 !important; cursor: not-allowed !important; }

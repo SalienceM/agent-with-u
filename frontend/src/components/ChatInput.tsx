@@ -820,9 +820,9 @@ const ChatInputInner: React.FC<Props> = ({
 
   const isImageBackendRef = useRef(false);
   isImageBackendRef.current = isImageBackend;
-  const [imageSize, setImageSize] = useState('1:1');
+  const [imageSize, setImageSize] = useState('auto');
   const [showSizePicker, setShowSizePicker] = useState(false);
-  const imageSizeRef = useRef('1:1');
+  const imageSizeRef = useRef('auto');
   imageSizeRef.current = imageSize;
   const sizePickerRef = useRef<HTMLDivElement>(null);
   useEffect(() => {
@@ -838,6 +838,7 @@ const ChatInputInner: React.FC<Props> = ({
 
   // 分辨率档位 → 比例 → 具体尺寸的映射
   const SIZE_PRESETS: Record<string, { label: string; icon: string }> = {
+    'auto': { label: '自动', icon: '◇' },
     '1:1': { label: '1:1', icon: '□' },
     '16:9': { label: '16:9', icon: '▭' },
     '9:16': { label: '9:16', icon: '▯' },
@@ -942,7 +943,7 @@ const ChatInputInner: React.FC<Props> = ({
     const textFiles = textAttachmentsRef.current;
     if (!text && imgs.length === 0 && textFiles.length === 0) return;
     // ★ 图像 backend：自动注入 --size 参数
-    if (isImageBackendRef.current && imageSizeRef.current && imageSizeRef.current !== '1:1' && text) {
+    if (isImageBackendRef.current && imageSizeRef.current && imageSizeRef.current !== 'auto' && text) {
       text = `${text} --size ${imageSizeRef.current}`;
     }
     // ★ 保存到输入历史（Linux 风格 ↑ 追溯）
@@ -1493,7 +1494,7 @@ const ChatInputInner: React.FC<Props> = ({
           <div ref={sizePickerRef} style={{ position: 'relative', display: 'inline-flex' }}>
             <button
               onClick={() => setShowSizePicker(v => !v)}
-              title="图片尺寸"
+              title="图片尺寸；自动模式由模型根据提示词推荐"
               style={{
                 display: 'inline-flex', alignItems: 'center', gap: 4,
                 padding: '4px 10px', fontSize: 11, borderRadius: 6,
@@ -1503,7 +1504,7 @@ const ChatInputInner: React.FC<Props> = ({
               }}
             >
               <span style={{ fontSize: 12 }}>{SIZE_PRESETS[imageSize]?.icon || '□'}</span>
-              <span>{imageSize}</span>
+              <span>{SIZE_PRESETS[imageSize]?.label || imageSize}</span>
             </button>
             {showSizePicker && (
               <div style={{
@@ -1514,7 +1515,7 @@ const ChatInputInner: React.FC<Props> = ({
                 display: 'flex', flexDirection: 'column', gap: 6, minWidth: 200,
               }}>
                 <div style={{ fontSize: 11, color: 'var(--theme-text-muted)', fontWeight: 600, padding: '0 4px' }}>
-                  画面比例
+                  输出尺寸 / 比例
                 </div>
                 <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4 }}>
                   {Object.entries(SIZE_PRESETS).map(([key, { label, icon }]) => (

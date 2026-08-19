@@ -1,6 +1,7 @@
 import React, { useEffect, useState, useCallback, memo, useRef, useMemo } from 'react';
 import { api, onExecStatus } from '../api';
 import { FileTreePanel } from './FileTreePanel';
+import type { FileFocusRequest } from '../utils/fileFocus';
 
 interface Session {
   id: string;
@@ -43,16 +44,18 @@ interface Props {
   width?: number;   // ★ 可拖拽的侧栏宽度(展开、非移动端时生效)
   // ★ 当前会话的工作目录 / 执行节点 —— 供「文件」视图（本地⇄远端目录树）使用
   activeWorkingDir?: string;
+  activeSessionMetaId?: string;
   activeExecKey?: string;
   activeExecLabel?: string;
   activeExecMode?: 'local' | 'relay';
   activeBackendId?: string;
   activeCodexRemoteHost?: string;
   sessionLimit?: number;
+  fileFocusRequest?: FileFocusRequest | null;
 }
 
 // ★ Wrap with React.memo to prevent unnecessary re-renders when parent updates
-export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession, onNewSession, onDeleteSession, onAcknowledgeSession, streamingSessions, completedSessions = new Set(), collapsed, onToggleCollapse, isMobile, width, activeWorkingDir, activeExecKey, activeExecLabel, activeExecMode, activeBackendId, activeCodexRemoteHost, sessionLimit = 25 }) => {
+export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession, onNewSession, onDeleteSession, onAcknowledgeSession, streamingSessions, completedSessions = new Set(), collapsed, onToggleCollapse, isMobile, width, activeWorkingDir, activeSessionMetaId, activeExecKey, activeExecLabel, activeExecMode, activeBackendId, activeCodexRemoteHost, sessionLimit = 25, fileFocusRequest }) => {
   const [sessions, setSessions] = useState<Session[]>([]);
   const refreshGenerationRef = useRef(0);
   const refreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -75,6 +78,13 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
   const renameInputRef = useRef<HTMLInputElement>(null);
   // ★ 执行节点分组折叠；每组显示数量由应用配置控制。
   const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(new Set());
+
+  // 聊天气泡请求定位文件时，侧栏自动切到文件视图。Session 尚未切换完成
+  // 时先保留请求；activeSessionId 更新后该 effect 会再次命中。
+  useEffect(() => {
+    if (!fileFocusRequest || fileFocusRequest.sessionId !== activeSessionId) return;
+    setView('files');
+  }, [fileFocusRequest, activeSessionId]);
 
   // ★ Memoize refresh function to avoid re-creating it on every render
   const refresh = useCallback(async () => {
@@ -582,7 +592,8 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
             <div style={{ color: 'var(--theme-text)', fontWeight: 600, marginBottom: 5 }}>🌐 Codex SSH Remote · {activeCodexRemoteHost}</div>
             当前会话的文件与命令位于 SSH 主机上，由远端 Codex 工具操作。为避免误操作本机同名目录，这里不展示本机文件树。
           </div>
-        ) : <FileTreePanel sessionId={activeSessionId || undefined} workingDir={activeWorkingDir || ''} execKey={activeExecKey} execLabel={activeExecLabel} execMode={activeExecMode} backendId={activeBackendId} />
+        ) : <FileTreePanel sessionId={activeSessionId || undefined} workingDir={activeWorkingDir || ''} execKey={activeExecKey} execLabel={activeExecLabel} execMode={activeExecMode} backendId={activeBackendId}
+          focusRequest={activeSessionMetaId === activeSessionId && fileFocusRequest?.sessionId === activeSessionId ? fileFocusRequest : null} />
       ) : (
       <div style={{ flex: 1, overflow: 'auto', padding: '4px 7px 10px' }}>
         {groups.map(group => {
@@ -1110,11 +1121,13 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
     && prevProps.isMobile === nextProps.isMobile
     && prevProps.width === nextProps.width
     && prevProps.activeWorkingDir === nextProps.activeWorkingDir
+    && prevProps.activeSessionMetaId === nextProps.activeSessionMetaId
     && prevProps.activeExecKey === nextProps.activeExecKey
     && prevProps.activeExecLabel === nextProps.activeExecLabel
     && prevProps.activeExecMode === nextProps.activeExecMode
     && prevProps.activeBackendId === nextProps.activeBackendId
     && prevProps.activeCodexRemoteHost === nextProps.activeCodexRemoteHost
+    && prevProps.fileFocusRequest?.requestId === nextProps.fileFocusRequest?.requestId
     && prevProps.sessionLimit === nextProps.sessionLimit;
 });
 

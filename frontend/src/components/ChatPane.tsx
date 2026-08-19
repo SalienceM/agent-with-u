@@ -115,6 +115,11 @@ export interface ChatPaneProps {
   onGhostStateChange?: (state: SmoothGhostState) => void;
   // 对话字号步进(全局 config.fontSize),由 App 注入
   onAdjustFontSize?: (delta: number) => void;
+  onRequestFileFocus?: (request: {
+    sessionId: string;
+    workingDir: string;
+    relativePath: string;
+  }) => void;
 }
 
 export const ChatPane: React.FC<ChatPaneProps> = ({
@@ -132,6 +137,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
   onStreamingChange,
   onGhostStateChange,
   onAdjustFontSize,
+  onRequestFileFocus,
 }) => {
   // ── pane 自己的 session 详情(workingDir / backendId / skip / sandbox) ──
   const [activeSession, setActiveSession] = useState<any | null>(null);
@@ -153,6 +159,10 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
   const animSessionRef = useRef<string | null>(null);
   const animMsgCountRef = useRef(0);
   const prevSessionRef = useRef<string | null>(sessionId);
+  const onFocusRef = useRef(onFocus);
+  const onRequestFileFocusRef = useRef(onRequestFileFocus);
+  onFocusRef.current = onFocus;
+  onRequestFileFocusRef.current = onRequestFileFocus;
 
   // 加载 session 详情(切换 sessionId 时重新拉)
   useEffect(() => {
@@ -224,6 +234,13 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
     && activeSession?.sessionType === 'loop'
     && loopControlMode !== 'manual';
   const chatHydrationEnabled = sessionMetaReady && !automatedLoop;
+
+  const handleFocusLinkedFile = useCallback((relativePath: string) => {
+    const workingDir = activeSession?.workingDir;
+    if (!sessionId || activeSession?.id !== sessionId || !workingDir) return;
+    onFocusRef.current();
+    onRequestFileFocusRef.current?.({ sessionId, workingDir, relativePath });
+  }, [sessionId, activeSession?.id, activeSession?.workingDir]);
 
   const handleSessionRuntimeChange = useCallback(async (runtime: ModelRuntime) => {
     if (!sessionId) return { status: 'error', message: 'Session 不存在' };
@@ -851,6 +868,8 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
                   canBranch={activeSession?.sessionType !== 'loop'}
                   ttsVoice={config.ttsVoice}
                   ttsRate={config.ttsRate}
+                  workingDir={activeSession?.workingDir}
+                  onFocusFile={handleFocusLinkedFile}
                 />
               </React.Fragment>
             );
