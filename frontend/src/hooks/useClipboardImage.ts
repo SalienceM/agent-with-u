@@ -25,12 +25,12 @@ export function useClipboardImage(scopeRef?: RefObject<HTMLElement | null>) {
 
   // 新增一张图片：既加入待发送列表，又异步存入素材中转池。
   // 入池失败不影响聊天发送。
-  const addImage = useCallback((img: ImageAttachment) => {
+  const addImage = useCallback((img: ImageAttachment, source = 'clipboard') => {
     setImages((prev) => [...prev, img]);
     api.assetPush({
       base64: img.base64,
       mime: img.mime_type,
-      source: 'clipboard',
+      source,
     }).catch(() => {});
   }, []);
 

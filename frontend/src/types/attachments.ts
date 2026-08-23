@@ -1,4 +1,4 @@
-export type TextAttachmentSource = 'paste' | 'input' | 'voice';
+export type TextAttachmentSource = 'paste' | 'input' | 'voice' | 'file';
 
 export interface TextAttachment {
   id: string;

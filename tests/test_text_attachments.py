@@ -122,6 +122,21 @@ class TextAttachmentTests(unittest.TestCase):
             len("queued body"),
         )
 
+    def test_uploaded_file_source_is_preserved(self):
+        payload = json.dumps([{
+            "id": "text-file-1",
+            "name": "notes.md",
+            "content": "uploaded body",
+            "size": 999,
+            "source": "file",
+        }])
+
+        attachments = BridgeWS._parse_text_attachments_json(payload)
+
+        self.assertIsNotNone(attachments)
+        self.assertEqual(attachments[0].source, "file")
+        self.assertEqual(attachments[0].size, len("uploaded body"))
+
 
 if __name__ == "__main__":
     unittest.main()

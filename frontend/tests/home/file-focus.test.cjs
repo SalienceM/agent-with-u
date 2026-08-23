@@ -21,6 +21,25 @@ test('Windows absolute file links resolve inside the current workspace', () => {
   );
 });
 
+test('browser-prefixed Windows links remain focusable in a Windows workspace', () => {
+  assert.deepEqual(
+    resolveFileLink(
+      '/C:/Users/Test/My%20Repo/src/hooks/useConfig.ts:292',
+      'C:\\Users\\Test\\My Repo',
+    ),
+    {
+      relativePath: 'src/hooks/useConfig.ts',
+      filePath: 'C:/Users/Test/My Repo/src/hooks/useConfig.ts',
+      line: 292,
+      column: undefined,
+    },
+  );
+  assert.equal(
+    resolveFileLink('/D:/Other/file.ts:7', 'C:/Users/Test/My Repo'),
+    null,
+  );
+});
+
 test('POSIX, file URI, and relative links resolve without using client OS rules', () => {
   assert.equal(
     resolveFileLink('/srv/agent/repo/src/main.ts#L18C3', '/srv/agent/repo')?.relativePath,

@@ -6261,7 +6261,7 @@ class BridgeWS:
                 filtered["name"] = str(filtered.get("name") or "text-attachment.txt")
                 filtered["size"] = len(content)
                 source = filtered.get("source")
-                if source not in ("paste", "input", "voice"):
+                if source not in ("paste", "input", "voice", "file"):
                     filtered["source"] = None
                 out.append(TextAttachment(**filtered))
             except Exception:

@@ -28,6 +28,71 @@ interface InputDraft {
 const sessionInputDrafts = new Map<string, InputDraft>();
 const LARGE_PASTE_ATTACHMENT_CHARS = 4_000;
 const LONG_INPUT_ATTACHMENT_CHARS = 6_000;
+const MAX_PICKED_ATTACHMENT_BYTES = 10 * 1024 * 1024;
+const ATTACHMENT_ACCEPT = [
+  'image/*', 'text/*',
+  '.md', '.markdown', '.json', '.jsonl', '.yaml', '.yml', '.toml', '.xml',
+  '.csv', '.tsv', '.log', '.ini', '.cfg', '.conf', '.env',
+  '.py', '.js', '.jsx', '.ts', '.tsx', '.java', '.c', '.cc', '.cpp', '.h', '.hpp',
+  '.go', '.rs', '.sh', '.ps1', '.bat', '.sql', '.graphql', '.gql', '.proto',
+].join(',');
+const TEXT_ATTACHMENT_EXTENSIONS = new Set([
+  'txt', 'md', 'markdown', 'json', 'jsonl', 'yaml', 'yml', 'toml', 'xml',
+  'csv', 'tsv', 'log', 'ini', 'cfg', 'conf', 'env',
+  'py', 'js', 'jsx', 'ts', 'tsx', 'java', 'c', 'cc', 'cpp', 'h', 'hpp',
+  'go', 'rs', 'sh', 'ps1', 'bat', 'sql', 'graphql', 'gql', 'proto',
+]);
+const TEXT_ATTACHMENT_MIME_TYPES = new Set([
+  'application/json', 'application/ld+json', 'application/xml',
+  'application/yaml', 'application/x-yaml', 'application/toml',
+  'application/javascript', 'application/sql', 'application/graphql',
+]);
+const IMAGE_MIME_BY_EXTENSION: Record<string, string> = {
+  jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png', bmp: 'image/bmp',
+  tif: 'image/tiff', tiff: 'image/tiff', webp: 'image/webp', gif: 'image/gif',
+};
+
+function fileExtension(name: string): string {
+  const dot = name.lastIndexOf('.');
+  return dot >= 0 ? name.slice(dot + 1).toLowerCase() : '';
+}
+
+function isImageAttachmentFile(file: File): boolean {
+  return file.type.toLowerCase().startsWith('image/')
+    || Boolean(IMAGE_MIME_BY_EXTENSION[fileExtension(file.name)]);
+}
+
+function isTextAttachmentFile(file: File): boolean {
+  const mime = file.type.toLowerCase().split(';', 1)[0];
+  const name = file.name.toLowerCase();
+  return mime.startsWith('text/')
+    || TEXT_ATTACHMENT_MIME_TYPES.has(mime)
+    || TEXT_ATTACHMENT_EXTENSIONS.has(fileExtension(name))
+    || /^(readme|license|dockerfile|makefile|gemfile|rakefile)(\..*)?$/.test(name);
+}
+
+function readImageAttachment(file: File): Promise<ImageAttachment> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(new Error(`无法读取 ${file.name}`));
+    reader.onload = () => {
+      const dataUrl = typeof reader.result === 'string' ? reader.result : '';
+      const comma = dataUrl.indexOf(',');
+      if (comma < 0) {
+        reject(new Error(`无法读取 ${file.name}`));
+        return;
+      }
+      const extension = fileExtension(file.name);
+      resolve({
+        id: uuid(),
+        base64: dataUrl.slice(comma + 1),
+        mime_type: file.type || IMAGE_MIME_BY_EXTENSION[extension] || 'image/png',
+        size: file.size,
+      });
+    };
+    reader.readAsDataURL(file);
+  });
+}
 
 // ── 注入全局样式（focus glow）────────────────────────────────────────────────
 if (typeof document !== 'undefined' && !document.getElementById('chat-input-css')) {
@@ -172,10 +237,13 @@ const ChatInputInner: React.FC<Props> = ({
   realtimeVoice,
 }) => {
   const ref = useRef<HTMLTextAreaElement>(null);
+  const attachmentInputRef = useRef<HTMLInputElement>(null);
+  const attachmentNoticeTimerRef = useRef<number | null>(null);
   // 把 textarea ref 传给 useClipboardImage,这样多 pane 场景下只有聚焦
   // 的输入框对应的 hook 会处理粘贴,避免一张图被所有 pane 同时吃下。
   const { images, removeImage, clearImages, addImage } = useClipboardImage(ref);
   const [textAttachments, setTextAttachments] = useState<TextAttachment[]>([]);
+  const [attachmentNotice, setAttachmentNotice] = useState('');
   const textAttachmentsRef = useRef<TextAttachment[]>([]);
   textAttachmentsRef.current = textAttachments;
 
@@ -401,7 +469,9 @@ const ChatInputInner: React.FC<Props> = ({
       ? 'voice-transcript'
       : source === 'paste'
         ? 'pasted-text'
-        : 'long-input';
+        : source === 'file'
+          ? 'uploaded-file'
+          : 'long-input';
     const sameSourceCount = textAttachmentsRef.current.filter(
       (item) => item.source === source,
     ).length;
@@ -415,6 +485,64 @@ const ChatInputInner: React.FC<Props> = ({
     setTextAttachmentList([...textAttachmentsRef.current, attachment]);
     return attachment;
   }, [setTextAttachmentList]);
+
+  const showAttachmentNotice = useCallback((message: string) => {
+    if (attachmentNoticeTimerRef.current !== null) {
+      window.clearTimeout(attachmentNoticeTimerRef.current);
+      attachmentNoticeTimerRef.current = null;
+    }
+    setAttachmentNotice(message);
+    if (message) {
+      attachmentNoticeTimerRef.current = window.setTimeout(() => {
+        attachmentNoticeTimerRef.current = null;
+        setAttachmentNotice('');
+      }, 6_000);
+    }
+  }, []);
+
+  useEffect(() => () => {
+    if (attachmentNoticeTimerRef.current !== null) {
+      window.clearTimeout(attachmentNoticeTimerRef.current);
+    }
+  }, []);
+
+  const handleAttachmentFiles = useCallback(async (
+    event: React.ChangeEvent<HTMLInputElement>,
+  ) => {
+    const input = event.currentTarget;
+    const files = Array.from(input.files || []);
+    // 允许用户连续两次选择同一个文件。
+    input.value = '';
+    if (!files.length) return;
+
+    showAttachmentNotice('');
+    const errors: string[] = [];
+    for (const file of files) {
+      if (file.size > MAX_PICKED_ATTACHMENT_BYTES) {
+        errors.push(`${file.name} 超过 10 MB`);
+        continue;
+      }
+      if (file.size === 0) {
+        errors.push(`${file.name} 是空文件`);
+        continue;
+      }
+      try {
+        if (isImageAttachmentFile(file)) {
+          addImage(await readImageAttachment(file), 'file');
+        } else if (isTextAttachmentFile(file)) {
+          const content = await file.text();
+          if (!addTextAttachment(content, 'file', file.name)) {
+            errors.push(`${file.name} 没有可读取的文本`);
+          }
+        } else {
+          errors.push(`${file.name} 不是受支持的图片或文本文件`);
+        }
+      } catch (error) {
+        errors.push(error instanceof Error ? error.message : `无法读取 ${file.name}`);
+      }
+    }
+    if (errors.length) showAttachmentNotice(errors.join('；'));
+  }, [addImage, addTextAttachment, showAttachmentNotice]);
 
   const updateTextAttachment = useCallback((attachment: TextAttachment) => {
     const next = textAttachmentsRef.current.map(
@@ -1369,6 +1497,16 @@ const ChatInputInner: React.FC<Props> = ({
 
   return (
     <div className="awu-composer" style={{ padding: '9px 18px 14px', borderTop: isStreaming ? '1px solid var(--theme-success-border, rgba(50,182,122,.35))' : '1px solid transparent', background: 'var(--theme-bg, #ffffff)', position: 'relative', transition: 'border-top-color 0.2s ease' }}>
+      <input
+        ref={attachmentInputRef}
+        type="file"
+        multiple
+        accept={ATTACHMENT_ACCEPT}
+        tabIndex={-1}
+        aria-hidden="true"
+        onChange={(event) => { void handleAttachmentFiles(event); }}
+        style={{ display: 'none' }}
+      />
       {runtimeConfigurable && showRuntimePicker && (
         <div
           ref={runtimePickerRef}
@@ -1449,6 +1587,12 @@ const ChatInputInner: React.FC<Props> = ({
             <ToolbarBtn icon="A+" title="放大对话字号" compact={isMobile} onClick={() => onAdjustFontSize(1)} />
           </div>
         )}
+        <ToolbarBtn
+          icon="＋"
+          title="添加附件（图片或文本文件）"
+          compact={isMobile}
+          onClick={() => attachmentInputRef.current?.click()}
+        />
         {/* 截图按钮:桌面端独有,浏览器无法调起系统截图工具 */}
         {isTauri() && (
           <ToolbarBtn
@@ -1547,6 +1691,24 @@ const ChatInputInner: React.FC<Props> = ({
           </div>
         )}
       </div>
+
+      {attachmentNotice && (
+        <div
+          role="alert"
+          style={{
+            margin: '-1px 0 6px',
+            padding: '5px 8px',
+            borderRadius: 5,
+            border: '1px solid rgba(248,81,73,.25)',
+            background: 'rgba(248,81,73,.08)',
+            color: 'var(--theme-error, #cf222e)',
+            fontSize: 11,
+            lineHeight: 1.4,
+          }}
+        >
+          {attachmentNotice}
+        </div>
+      )}
 
       <ImagePreview images={images} onRemove={removeImage} />
       <TextAttachmentPreview

@@ -7,7 +7,7 @@ import { shouldKeepChatMessage } from '../utils/chatMessageVisibility';
 import { DiffView, type DiffData } from './DiffView';
 import { TextAttachmentPreview } from './TextAttachmentPreview';
 import { AppModalPortal } from './AppModalPortal';
-import { resolveFileLink } from '../utils/fileFocus';
+import { resolveFileLink, type ResolvedFileLink } from '../utils/fileFocus';
 import {
   TTS_STATE_EVENT,
   toggleSpeech,
@@ -102,33 +102,45 @@ if (typeof document !== 'undefined' && !document.getElementById('msg-bubble-css'
     .md-image-error a:hover {
       text-decoration: underline;
     }
-    /* ── 工作目录内文件链接：悬停显示“在文件面板定位”准星 ── */
+    /* 文件定位提示由 Portal 浮层渲染，不参与行内排版，避免换行时 hover 抖动。 */
     .msg-content a.md-file-link {
       cursor: pointer;
       text-decoration-style: dotted;
       text-underline-offset: 2px;
+      border-radius: 3px;
+      transition: color .12s ease, background .12s ease, text-decoration-color .12s ease;
     }
-    .msg-content a.md-file-link::after {
-      content: '⌖';
-      display: inline-block;
-      max-width: 0;
-      margin-left: 0;
-      opacity: 0;
-      overflow: hidden;
-      color: var(--theme-text-muted, #656d76);
-      font-size: .82em;
-      line-height: 1;
-      text-decoration: none;
-      vertical-align: .06em;
-      transform: translateX(-3px);
-      transition: opacity .12s ease, max-width .12s ease, margin-left .12s ease, transform .12s ease;
+    .msg-content a.md-file-link:hover,
+    .msg-content a.md-file-link:focus-visible {
+      background: var(--theme-accent-bg, rgba(9,105,218,.12));
+      text-decoration-style: solid;
     }
-    .msg-content a.md-file-link:hover::after,
-    .msg-content a.md-file-link:focus-visible::after {
-      max-width: 1.2em;
-      margin-left: 4px;
-      opacity: 1;
-      transform: translateX(0);
+    .file-link-menu-item:hover {
+      background: var(--theme-hover-bg, rgba(128,128,128,.12)) !important;
+    }
+    .file-link-menu-item:focus-visible {
+      outline: 2px solid var(--theme-accent, #0969da);
+      outline-offset: -2px;
+      background: var(--theme-accent-bg, rgba(9,105,218,.12)) !important;
+    }
+    .file-link-menu-icon {
+      width: 34px;
+      height: 34px;
+      flex: 0 0 34px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      border: 1px solid var(--theme-border, rgba(128,128,128,.24));
+      border-radius: 8px;
+      color: var(--theme-accent, #0969da);
+      background: var(--theme-accent-bg, rgba(9,105,218,.10));
+      transition: transform .14s ease, border-color .14s ease, background .14s ease;
+    }
+    .file-link-menu-item:hover .file-link-menu-icon,
+    .file-link-menu-item:focus-visible .file-link-menu-icon {
+      transform: scale(1.06);
+      border-color: var(--theme-accent, #0969da);
+      background: color-mix(in srgb, var(--theme-accent, #0969da) 16%, transparent);
     }
     /* ── 气泡操作按钮 ── */
     .bubble-action-btn {
@@ -1133,42 +1145,121 @@ function MessageBubbleInner({
     relativePath: string;
     filePath: string;
   } | null>(null);
+  const [fileLinkHover, setFileLinkHover] = useState<{
+    x: number;
+    y: number;
+    relativePath: string;
+  } | null>(null);
   const contentRef = useRef<HTMLDivElement>(null);
+
+  // React 流式更新可能在 MutationObserver 两次回调之间替换链接节点。
+  // 这里既供批量 hydrate 使用，也在真实 pointer/focus 事件发生时即时兜底，
+  // 从而不会因为增强时序而偶发漏掉文件链接。
+  const enhanceFileLink = useCallback((anchor: HTMLAnchorElement): ResolvedFileLink | null => {
+    anchor.classList.remove('md-file-link');
+    delete anchor.dataset.fileRel;
+    delete anchor.dataset.filePath;
+    anchor.target = '_blank';
+    anchor.rel = 'noopener';
+    anchor.removeAttribute('title');
+    anchor.removeAttribute('aria-description');
+
+    const resolved = resolveFileLink(anchor.getAttribute('href') || '', workingDir || '');
+    if (!resolved || !onFocusFile) return null;
+
+    anchor.classList.add('md-file-link');
+    anchor.dataset.fileRel = resolved.relativePath;
+    anchor.dataset.filePath = resolved.filePath;
+    anchor.removeAttribute('target');
+    anchor.removeAttribute('rel');
+    const position = resolved.line
+      ? `（第 ${resolved.line}${resolved.column ? `:${resolved.column}` : ''} 行）`
+      : '';
+    anchor.setAttribute('aria-description', `点击在文件面板中定位${position}；右键查看更多操作`);
+    return resolved;
+  }, [onFocusFile, workingDir]);
+
+  const resolveFileLinkHit = useCallback((target: EventTarget | null) => {
+    const node = target instanceof Node ? target : null;
+    const element = node instanceof Element ? node : node?.parentElement;
+    const anchor = element?.closest<HTMLAnchorElement>('a.md-link');
+    if (!anchor || !contentRef.current?.contains(anchor)) return null;
+    const resolved = enhanceFileLink(anchor);
+    return resolved ? { anchor, resolved } : null;
+  }, [enhanceFileLink]);
+
+  const showFileLinkHover = useCallback((anchor: HTMLAnchorElement, resolved: ResolvedFileLink) => {
+    const rect = anchor.getBoundingClientRect();
+    const tooltipWidth = 196;
+    const tooltipHeight = 49;
+    const gap = 7;
+    const x = Math.max(
+      8,
+      Math.min(rect.left + rect.width / 2 - tooltipWidth / 2, window.innerWidth - tooltipWidth - 8),
+    );
+    const below = rect.bottom + gap;
+    const y = below + tooltipHeight <= window.innerHeight - 8
+      ? below
+      : Math.max(8, rect.top - tooltipHeight - gap);
+    setFileLinkHover({ x, y, relativePath: resolved.relativePath });
+  }, []);
 
   // 委托捕获气泡内 Markdown 文件链接和图片点击。
   const handleContentClick = useCallback((e: React.MouseEvent<HTMLDivElement>) => {
     const target = e.target as HTMLElement;
-    const fileLink = target.closest<HTMLAnchorElement>('a.md-file-link[data-file-rel]');
-    if (fileLink && contentRef.current?.contains(fileLink)) {
-      const relativePath = fileLink.dataset.fileRel;
-      if (relativePath && onFocusFile) {
-        e.preventDefault();
-        e.stopPropagation();
-        setFileLinkMenu(null);
-        onFocusFile(relativePath);
-        return;
-      }
+    const hit = resolveFileLinkHit(e.target);
+    if (hit && onFocusFile) {
+      e.preventDefault();
+      e.stopPropagation();
+      setFileLinkHover(null);
+      setFileLinkMenu(null);
+      onFocusFile(hit.resolved.relativePath);
+      return;
     }
     if (target.tagName === 'IMG') {
       setLightboxSrc((target as HTMLImageElement).src);
     }
-  }, [onFocusFile]);
+  }, [onFocusFile, resolveFileLinkHit]);
+
+  const handleFileLinkPointerOver = useCallback((e: React.PointerEvent<HTMLDivElement>) => {
+    const hit = resolveFileLinkHit(e.target);
+    if (!hit) return;
+    if (e.relatedTarget instanceof Node && hit.anchor.contains(e.relatedTarget)) return;
+    showFileLinkHover(hit.anchor, hit.resolved);
+  }, [resolveFileLinkHit, showFileLinkHover]);
+
+  const handleFileLinkPointerOut = useCallback((e: React.PointerEvent<HTMLDivElement>) => {
+    const hit = resolveFileLinkHit(e.target);
+    if (!hit) return;
+    if (e.relatedTarget instanceof Node && hit.anchor.contains(e.relatedTarget)) return;
+    setFileLinkHover(null);
+  }, [resolveFileLinkHit]);
+
+  const handleFileLinkFocus = useCallback((e: React.FocusEvent<HTMLDivElement>) => {
+    const hit = resolveFileLinkHit(e.target);
+    if (hit) showFileLinkHover(hit.anchor, hit.resolved);
+  }, [resolveFileLinkHit, showFileLinkHover]);
+
+  const handleFileLinkBlur = useCallback((e: React.FocusEvent<HTMLDivElement>) => {
+    const hit = resolveFileLinkHit(e.target);
+    if (!hit) return;
+    if (e.relatedTarget instanceof Node && hit.anchor.contains(e.relatedTarget)) return;
+    setFileLinkHover(null);
+  }, [resolveFileLinkHit]);
 
   const handleFileLinkContextMenu = useCallback((e: React.MouseEvent<HTMLDivElement>) => {
-    const target = e.target as HTMLElement;
-    const fileLink = target.closest<HTMLAnchorElement>('a.md-file-link[data-file-rel]');
-    if (!fileLink || !contentRef.current?.contains(fileLink)) return;
-    const relativePath = fileLink.dataset.fileRel;
-    if (!relativePath || !onFocusFile) return;
+    const hit = resolveFileLinkHit(e.target);
+    if (!hit || !onFocusFile) return;
     e.preventDefault();
     e.stopPropagation();
+    setFileLinkHover(null);
     setFileLinkMenu({
-      x: Math.max(8, Math.min(e.clientX, window.innerWidth - 244)),
-      y: Math.max(8, Math.min(e.clientY, window.innerHeight - 116)),
-      relativePath,
-      filePath: fileLink.dataset.filePath || relativePath,
+      x: Math.max(8, Math.min(e.clientX, window.innerWidth - 316)),
+      y: Math.max(8, Math.min(e.clientY, window.innerHeight - 174)),
+      relativePath: hit.resolved.relativePath,
+      filePath: hit.resolved.filePath,
     });
-  }, [onFocusFile]);
+  }, [onFocusFile, resolveFileLinkHit]);
 
   useEffect(() => {
     if (!fileLinkMenu) return;
@@ -1185,6 +1276,17 @@ function MessageBubbleInner({
       window.removeEventListener('keydown', onKeyDown);
     };
   }, [fileLinkMenu]);
+
+  useEffect(() => {
+    if (!fileLinkHover) return;
+    const close = () => setFileLinkHover(null);
+    window.addEventListener('scroll', close, true);
+    window.addEventListener('resize', close);
+    return () => {
+      window.removeEventListener('scroll', close, true);
+      window.removeEventListener('resize', close);
+    };
+  }, [fileLinkHover]);
 
   // ★ 为该消息内所有 markdown 块统一注入复制按钮并处理图片。
   // contentRef 指向整个气泡而不是某个 text block，避免多块消息只命中最后一块。
@@ -1223,23 +1325,7 @@ function MessageBubbleInner({
 
     // 只增强当前 Session 工作目录内的文件链接；网页链接仍按原逻辑新窗口打开。
     selectAll<HTMLAnchorElement>(root, '.msg-content a.md-link').forEach((anchor) => {
-      anchor.classList.remove('md-file-link');
-      delete anchor.dataset.fileRel;
-      delete anchor.dataset.filePath;
-      anchor.target = '_blank';
-      anchor.rel = 'noopener';
-      anchor.removeAttribute('title');
-      const resolved = resolveFileLink(anchor.getAttribute('href') || '', workingDir || '');
-      if (!resolved || !onFocusFile) return;
-      anchor.classList.add('md-file-link');
-      anchor.dataset.fileRel = resolved.relativePath;
-      anchor.dataset.filePath = resolved.filePath;
-      anchor.removeAttribute('target');
-      anchor.removeAttribute('rel');
-      const position = resolved.line
-        ? `（第 ${resolved.line}${resolved.column ? `:${resolved.column}` : ''} 行）`
-        : '';
-      anchor.title = `点击在文件面板中定位${position}；右键查看更多`;
+      enhanceFileLink(anchor);
     });
 
     const renderImageError = (img: HTMLImageElement, label: string, href = '') => {
@@ -1323,6 +1409,10 @@ function MessageBubbleInner({
     hydrate(el);
     const observer = new MutationObserver((records) => {
       records.forEach((record) => {
+        if (record.type === 'attributes' && record.target instanceof Element) {
+          hydrate(record.target);
+          return;
+        }
         record.addedNodes.forEach((node) => {
           if (
             node.nodeType === Node.ELEMENT_NODE
@@ -1333,9 +1423,14 @@ function MessageBubbleInner({
         });
       });
     });
-    observer.observe(el, { childList: true, subtree: true });
+    observer.observe(el, {
+      childList: true,
+      subtree: true,
+      attributes: true,
+      attributeFilter: ['href'],
+    });
     return () => observer.disconnect();
-  }, [message.id, renderMarkdown, workingDir, onFocusFile]);
+  }, [enhanceFileLink, message.id, renderMarkdown]);
 
   // ★ system 消息独立渲染
   if (message.role === 'system') {
@@ -1399,6 +1494,37 @@ function MessageBubbleInner({
   return (
     <>
       {lightboxSrc && <ImageLightbox src={lightboxSrc} onClose={() => setLightboxSrc(null)} />}
+      {fileLinkHover && !fileLinkMenu && (
+        <AppModalPortal>
+          <div
+            role="tooltip"
+            aria-label={`文件树定位：${fileLinkHover.relativePath}`}
+            style={{
+              position: 'fixed', left: fileLinkHover.x, top: fileLinkHover.y, zIndex: 10029,
+              width: 196, minHeight: 44, padding: '7px 9px', boxSizing: 'border-box',
+              display: 'flex', alignItems: 'center', gap: 8, pointerEvents: 'none',
+              border: '1px solid var(--theme-border, rgba(0,0,0,.18))', borderRadius: 8,
+              background: 'var(--theme-bg-secondary, #fff)', color: 'var(--theme-text, #1f2328)',
+              boxShadow: '0 7px 22px rgba(0,0,0,.24)',
+            }}
+          >
+            <span style={{
+              width: 28, height: 28, flex: '0 0 28px', display: 'inline-flex',
+              alignItems: 'center', justifyContent: 'center', borderRadius: 7,
+              color: 'var(--theme-accent, #0969da)',
+              background: 'var(--theme-accent-bg, rgba(9,105,218,.12))',
+            }} aria-hidden="true">
+              <FileTreeLocateIcon />
+            </span>
+            <span style={{ display: 'flex', minWidth: 0, flexDirection: 'column', gap: 1 }}>
+              <span style={{ fontSize: 12.5, lineHeight: 1.25, fontWeight: 700 }}>文件树定位</span>
+              <span style={{ fontSize: 10.5, lineHeight: 1.3, color: 'var(--theme-text-muted)' }}>
+                点击展开目录并选中文件
+              </span>
+            </span>
+          </div>
+        </AppModalPortal>
+      )}
       {fileLinkMenu && (
         <AppModalPortal>
           <div
@@ -1408,7 +1534,7 @@ function MessageBubbleInner({
             onContextMenu={(event) => event.preventDefault()}
             style={{
               position: 'fixed', left: fileLinkMenu.x, top: fileLinkMenu.y, zIndex: 10030,
-              width: 236, padding: 5, borderRadius: 7,
+              width: 300, padding: 7, borderRadius: 10,
               border: '1px solid var(--theme-border, rgba(0,0,0,.16))',
               background: 'var(--theme-bg-secondary, #fff)',
               color: 'var(--theme-text, #1f2328)',
@@ -1416,7 +1542,7 @@ function MessageBubbleInner({
             }}
           >
             <div title={fileLinkMenu.filePath} style={{
-              padding: '4px 8px 6px', fontSize: 10.5, color: 'var(--theme-text-muted)',
+              padding: '4px 9px 7px', fontSize: 11, color: 'var(--theme-text-muted)',
               overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
             }}>
               {fileLinkMenu.relativePath}
@@ -1429,7 +1555,16 @@ function MessageBubbleInner({
                 setFileLinkMenu(null);
                 onFocusFile?.(relativePath);
               }}
-            >⌖ 在文件面板中定位</button>
+              className="file-link-menu-item"
+            >
+              <span className="file-link-menu-icon" aria-hidden="true">
+                <FileTreeLocateIcon />
+              </span>
+              <span style={fileLinkMenuTextStyle}>
+                <span style={fileLinkMenuLabelStyle}>在文件面板中定位</span>
+                <span style={fileLinkMenuHintStyle}>展开深层目录并选中这个文件</span>
+              </span>
+            </button>
             <button
               role="menuitem"
               style={fileLinkMenuItemStyle}
@@ -1438,7 +1573,16 @@ function MessageBubbleInner({
                 setFileLinkMenu(null);
                 void copyToClipboard(relativePath);
               }}
-            >📋 复制相对路径</button>
+              className="file-link-menu-item"
+            >
+              <span className="file-link-menu-icon" aria-hidden="true">
+                <CopyPathIcon />
+              </span>
+              <span style={fileLinkMenuTextStyle}>
+                <span style={fileLinkMenuLabelStyle}>复制相对路径</span>
+                <span style={fileLinkMenuHintStyle}>复制项目内的文件路径</span>
+              </span>
+            </button>
           </div>
         </AppModalPortal>
       )}
@@ -1465,6 +1609,10 @@ function MessageBubbleInner({
         ref={contentRef}
         className="message-bubble-wrapper"
         onContextMenu={handleFileLinkContextMenu}
+        onPointerOver={handleFileLinkPointerOver}
+        onPointerOut={handleFileLinkPointerOut}
+        onFocus={handleFileLinkFocus}
+        onBlur={handleFileLinkBlur}
         style={{
           position: 'relative',
           maxWidth: '82%',
@@ -1717,11 +1865,44 @@ function bubblePropsEqual(prev: Props, next: Props): boolean {
   );
 }
 
+function FileTreeLocateIcon() {
+  return (
+    <svg width="22" height="22" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+      <rect x="2.75" y="3.25" width="18.5" height="17.5" rx="3" stroke="currentColor" strokeWidth="1.6" />
+      <path d="M8.5 3.75v16.5M12 8h5M12 11.5h3" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
+      <circle cx="16.5" cy="16" r="2.2" stroke="currentColor" strokeWidth="1.6" />
+      <path d="M16.5 12.8v1.1m0 4.2v1.1M13.3 16h1.1m4.2 0h1.1" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" />
+    </svg>
+  );
+}
+
+function CopyPathIcon() {
+  return (
+    <svg width="22" height="22" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+      <rect x="8" y="7.5" width="11.5" height="12.5" rx="2.25" stroke="currentColor" strokeWidth="1.7" />
+      <path d="M16 7.5V6.25A2.25 2.25 0 0 0 13.75 4h-7.5A2.25 2.25 0 0 0 4 6.25v8.5A2.25 2.25 0 0 0 6.25 17H8" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" />
+      <path d="M11.5 12h4.5m-4.5 3.5H16" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
+    </svg>
+  );
+}
+
 const fileLinkMenuItemStyle: React.CSSProperties = {
-  display: 'flex', width: '100%', alignItems: 'center', gap: 7,
-  padding: '7px 8px', border: 'none', borderRadius: 5,
+  display: 'flex', width: '100%', alignItems: 'center', gap: 10,
+  minHeight: 52, padding: '7px 9px', border: 'none', borderRadius: 7,
   background: 'transparent', color: 'inherit', cursor: 'pointer',
-  font: 'inherit', fontSize: 12, textAlign: 'left',
+  font: 'inherit', textAlign: 'left', transition: 'background .14s ease',
+};
+
+const fileLinkMenuTextStyle: React.CSSProperties = {
+  display: 'flex', minWidth: 0, flexDirection: 'column', gap: 2,
+};
+
+const fileLinkMenuLabelStyle: React.CSSProperties = {
+  fontSize: 13, lineHeight: 1.3, fontWeight: 650,
+};
+
+const fileLinkMenuHintStyle: React.CSSProperties = {
+  fontSize: 10.5, lineHeight: 1.35, color: 'var(--theme-text-muted)',
 };
 
 export const MessageBubble = memo(MessageBubbleInner, bubblePropsEqual);

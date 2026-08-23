@@ -137,21 +137,29 @@ export function resolveFileLink(rawHref: string, workingDir: string): ResolvedFi
   const root = normalizeFilePath(workingDir).replace(/\/$/, '');
   if (!parsed || !root) return null;
 
+  // Markdown links rendered in a browser/WebView commonly prefix a Windows path
+  // with `/` (for example `/C:/repo/file.ts`). It is the same local absolute path,
+  // not a POSIX path. Only apply this coercion for a Windows workspace so a real
+  // Linux path such as `/c:/data` keeps its original meaning.
+  const linkedPath = isWindowsAbsolute(root) && /^\/[a-z]:\//i.test(parsed.filePath)
+    ? normalizeFilePath(parsed.filePath.slice(1))
+    : parsed.filePath;
+
   let relativePath = '';
-  if (isAbsolute(parsed.filePath)) {
+  if (isAbsolute(linkedPath)) {
     const rootKey = comparablePath(root);
-    const pathKey = comparablePath(parsed.filePath);
+    const pathKey = comparablePath(linkedPath);
     if (!pathKey.startsWith(`${rootKey}/`)) return null;
-    relativePath = parsed.filePath.slice(root.length + 1);
+    relativePath = linkedPath.slice(root.length + 1);
   } else {
-    relativePath = parsed.filePath;
+    relativePath = linkedPath;
   }
 
   const normalizedRelative = normalizeRelativeFilePath(relativePath);
   if (!normalizedRelative) return null;
   return {
     relativePath: normalizedRelative,
-    filePath: parsed.filePath,
+    filePath: linkedPath,
     line: parsed.line,
     column: parsed.column,
   };

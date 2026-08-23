@@ -1,7 +1,22 @@
-import { useState, useCallback, useEffect, useRef } from 'react';
-import { api } from '../api';
+import { useState, useCallback, useEffect, useLayoutEffect, useMemo, useRef } from 'react';
+import { api, getCurrentUserProfile, type CurrentUserProfile } from '../api';
+import {
+  DEFAULT_CLIENT_APPEARANCE,
+  clientAppearanceStorageKey,
+  hasClientAppearancePatch,
+  hasExecutorConfigPatch,
+  loadClientAppearance,
+  normalizeClientAppearance,
+  readClientAppearancePreview,
+  resolveClientAppearance,
+  saveClientAppearance,
+  stripClientAppearance,
+  type ClientAppearance,
+  type ClientAppearanceIdentity,
+  type ThemeType,
+} from '../utils/clientAppearance';
 
-export type ThemeType = 'dark' | 'midnight' | 'light' | 'classic' | 'cyber';
+export type { ThemeType } from '../utils/clientAppearance';
 export type RealtimeVoiceTtsEngine = 'system' | 'edge' | 'dashscope';
 
 export interface AppConfig {
@@ -34,10 +49,7 @@ const DEFAULT_CONFIG: AppConfig = {
   fontSize: 14,
   renderMarkdown: true,
   exportFormat: 'markdown',
-  theme: 'dark',
-  bgImage: '',
-  bgOpacity: 0.3,
-  uiOpacity: 1.0,
+  ...DEFAULT_CLIENT_APPEARANCE,
   ttsVoice: 'zh-CN-XiaoxiaoNeural',
   ttsRate: 0,
   realtimeVoiceSilenceMs: 700,
@@ -210,128 +222,247 @@ export const themes: Record<ThemeType, {
   },
 };
 
-export function useConfig() {
-  const [config, setConfig] = useState<AppConfig>(DEFAULT_CONFIG);
+function normalizeExecutorConfig(value: unknown): Partial<AppConfig> {
+  if (!value || typeof value !== 'object') return {};
+  const savedConfig: any = stripClientAppearance({ ...(value as Record<string, unknown>) });
+  const sidebarLimit = Number(savedConfig.sidebarSessionLimit);
+  savedConfig.sidebarSessionLimit = Number.isFinite(sidebarLimit) && sidebarLimit >= 5
+    ? Math.min(500, Math.trunc(sidebarLimit))
+    : 25;
+  // Older config files do not contain this field. Preserve only an explicit opt-out.
+  savedConfig.desktopTaskNotifications = savedConfig.desktopTaskNotifications !== false;
+  const voiceSilenceMs = Number(savedConfig.realtimeVoiceSilenceMs);
+  savedConfig.realtimeVoiceSilenceMs = Number.isFinite(voiceSilenceMs)
+    ? Math.max(350, Math.min(2000, Math.trunc(voiceSilenceMs)))
+    : 700;
+  const turnEndSilenceMs = Number(savedConfig.realtimeVoiceTurnEndSilenceMs);
+  savedConfig.realtimeVoiceTurnEndSilenceMs = Number.isFinite(turnEndSilenceMs)
+    ? Math.max(900, Math.min(3000, Math.trunc(turnEndSilenceMs)))
+    : 1500;
+  const continuousWindowMs = Number(savedConfig.realtimeVoiceContinuousWindowMs);
+  savedConfig.realtimeVoiceContinuousWindowMs = Number.isFinite(continuousWindowMs)
+    ? Math.max(10_000, Math.min(120_000, Math.trunc(continuousWindowMs)))
+    : 30_000;
+  const savedWakeWord = typeof savedConfig.realtimeVoiceWakeWord === 'string'
+    ? savedConfig.realtimeVoiceWakeWord.slice(0, 24)
+    : 'Yuki';
+  // “小U” was an old built-in default, not an explicit user choice.
+  savedConfig.realtimeVoiceWakeWord = /^小\s*[uUｕＵ]$/.test(savedWakeWord.trim())
+    ? 'Yuki'
+    : savedWakeWord;
+  savedConfig.realtimeVoiceTtsEngine = (
+    savedConfig.realtimeVoiceTtsEngine === 'edge'
+    || savedConfig.realtimeVoiceTtsEngine === 'dashscope'
+  ) ? savedConfig.realtimeVoiceTtsEngine : 'system';
+  savedConfig.realtimeVoiceSystemVoice = typeof savedConfig.realtimeVoiceSystemVoice === 'string'
+    ? savedConfig.realtimeVoiceSystemVoice.slice(0, 180)
+    : '';
+  const savedDashScopeModel = typeof savedConfig.realtimeVoiceDashScopeModel === 'string'
+    ? savedConfig.realtimeVoiceDashScopeModel.slice(0, 128)
+    : 'cosyvoice-v1';
+  const savedDashScopeVoice = typeof savedConfig.realtimeVoiceDashScopeVoice === 'string'
+    ? savedConfig.realtimeVoiceDashScopeVoice.slice(0, 128)
+    : 'longxiaochun';
+  savedConfig.realtimeVoiceDashScopeModel = (
+    savedDashScopeModel === 'cosyvoice-v3-flash'
+    && savedDashScopeVoice === 'longxiaochun'
+  ) ? 'cosyvoice-v1' : savedDashScopeModel;
+  savedConfig.realtimeVoiceDashScopeVoice = savedDashScopeVoice;
+  const voiceVadThreshold = Number(savedConfig.realtimeVoiceVadThreshold);
+  savedConfig.realtimeVoiceVadThreshold = Number.isFinite(voiceVadThreshold)
+    ? Math.max(0.004, Math.min(0.12, voiceVadThreshold))
+    : 0.018;
+  return savedConfig as Partial<AppConfig>;
+}
+
+function toAppearanceIdentity(profile: CurrentUserProfile): ClientAppearanceIdentity {
+  return {
+    mode: profile.mode === 'relay' ? 'relay' : 'local',
+    userId: String(profile.userId || (profile.mode === 'relay' ? 'legacy' : 'local')),
+  };
+}
+
+interface PendingAppearanceSave {
+  identity: ClientAppearanceIdentity;
+  identityKey: string;
+  appearance: ClientAppearance;
+  backgroundChanged: boolean;
+}
+
+export function useConfig(currentUser: CurrentUserProfile = getCurrentUserProfile()) {
+  const identity = useMemo(
+    () => toAppearanceIdentity(currentUser),
+    [currentUser.mode, currentUser.userId],
+  );
+  const identityKey = useMemo(() => clientAppearanceStorageKey(identity), [identity]);
+  const [config, setConfig] = useState<AppConfig>(() => ({
+    ...DEFAULT_CONFIG,
+    ...(readClientAppearancePreview(identity) || DEFAULT_CLIENT_APPEARANCE),
+  }));
+  const configRef = useRef(config);
+  configRef.current = config;
   const [loaded, setLoaded] = useState(false);
-  const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const executorSaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const appearanceSaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const pendingAppearanceRef = useRef<PendingAppearanceSave | null>(null);
   const loadVersionRef = useRef(0);
+  const appearanceRevisionRef = useRef(0);
+
+  const mergeConfig = useCallback((patch: Partial<AppConfig>) => {
+    setConfig((previous) => {
+      const next = { ...previous, ...patch };
+      configRef.current = next;
+      return next;
+    });
+  }, []);
+
+  const flushAppearanceSave = useCallback(() => {
+    if (appearanceSaveTimerRef.current) {
+      clearTimeout(appearanceSaveTimerRef.current);
+      appearanceSaveTimerRef.current = null;
+    }
+    const pending = pendingAppearanceRef.current;
+    pendingAppearanceRef.current = null;
+    if (!pending) return;
+    void saveClientAppearance(pending.identity, pending.appearance, {
+      backgroundChanged: pending.backgroundChanged,
+    }).catch((error) => console.warn('[appearance] failed to save client preference', error));
+  }, []);
+
+  const scheduleAppearanceSave = useCallback((
+    targetIdentity: ClientAppearanceIdentity,
+    nextConfig: AppConfig,
+    backgroundChanged: boolean,
+    immediate: boolean,
+  ) => {
+    const targetKey = clientAppearanceStorageKey(targetIdentity);
+    const previous = pendingAppearanceRef.current;
+    if (previous && previous.identityKey !== targetKey) flushAppearanceSave();
+    const sameUserPending = pendingAppearanceRef.current;
+    pendingAppearanceRef.current = {
+      identity: targetIdentity,
+      identityKey: targetKey,
+      appearance: normalizeClientAppearance(nextConfig),
+      backgroundChanged: backgroundChanged || !!sameUserPending?.backgroundChanged,
+    };
+    if (appearanceSaveTimerRef.current) clearTimeout(appearanceSaveTimerRef.current);
+    if (immediate) {
+      flushAppearanceSave();
+    } else {
+      appearanceSaveTimerRef.current = setTimeout(flushAppearanceSave, 400);
+    }
+  }, [flushAppearanceSave]);
+
+  const scheduleExecutorSave = useCallback((nextConfig: AppConfig) => {
+    if (executorSaveTimerRef.current) clearTimeout(executorSaveTimerRef.current);
+    // This payload is the hard boundary: no user's skin reaches the shared executor.
+    const payload = stripClientAppearance({ ...nextConfig });
+    executorSaveTimerRef.current = setTimeout(() => {
+      executorSaveTimerRef.current = null;
+      void api.setAppConfig(payload).catch(console.error);
+    }, 400);
+  }, []);
 
   const loadFromBackend = useCallback(async () => {
     const version = ++loadVersionRef.current;
+    const appearanceRevision = appearanceRevisionRef.current;
     try {
-      const savedConfig = await api.getAppConfig();
+      const [savedConfig, storedAppearance] = await Promise.all([
+        api.getAppConfig(),
+        loadClientAppearance(identity),
+      ]);
       if (version !== loadVersionRef.current) return;
-      if (savedConfig && Object.keys(savedConfig).length > 0) {
-        // ★ 迁移已删除的主题名
-        if (savedConfig.theme === 'ocean') savedConfig.theme = 'midnight';
-        const sidebarLimit = Number(savedConfig.sidebarSessionLimit);
-        savedConfig.sidebarSessionLimit = Number.isFinite(sidebarLimit) && sidebarLimit >= 5
-          ? Math.min(500, Math.trunc(sidebarLimit))
-          : 25;
-        // Older config files do not contain this field. Keep completion
-        // notifications enabled by default while preserving an explicit opt-out.
-        savedConfig.desktopTaskNotifications = savedConfig.desktopTaskNotifications !== false;
-        const voiceSilenceMs = Number(savedConfig.realtimeVoiceSilenceMs);
-        savedConfig.realtimeVoiceSilenceMs = Number.isFinite(voiceSilenceMs)
-          ? Math.max(350, Math.min(2000, Math.trunc(voiceSilenceMs)))
-          : 700;
-        // 使用新字段，避免旧版本保存的 700ms 继续造成过早断句。
-        const turnEndSilenceMs = Number(savedConfig.realtimeVoiceTurnEndSilenceMs);
-        savedConfig.realtimeVoiceTurnEndSilenceMs = Number.isFinite(turnEndSilenceMs)
-          ? Math.max(900, Math.min(3000, Math.trunc(turnEndSilenceMs)))
-          : 1500;
-        const continuousWindowMs = Number(savedConfig.realtimeVoiceContinuousWindowMs);
-        savedConfig.realtimeVoiceContinuousWindowMs = Number.isFinite(continuousWindowMs)
-          ? Math.max(10_000, Math.min(120_000, Math.trunc(continuousWindowMs)))
-          : 30_000;
-        const savedWakeWord = typeof savedConfig.realtimeVoiceWakeWord === 'string'
-          ? savedConfig.realtimeVoiceWakeWord.slice(0, 24)
-          : 'Yuki';
-        // “小U”是旧版本的内置默认值，不是用户显式选择的版本标记；升级时
-        // 将这一默认值迁移到新的 Yuki，其他自定义唤醒词保持不变。
-        savedConfig.realtimeVoiceWakeWord = /^小\s*[uUＵ]$/.test(savedWakeWord.trim())
-          ? 'Yuki'
-          : savedWakeWord;
-        savedConfig.realtimeVoiceTtsEngine = (
-          savedConfig.realtimeVoiceTtsEngine === 'edge'
-          || savedConfig.realtimeVoiceTtsEngine === 'dashscope'
-        ) ? savedConfig.realtimeVoiceTtsEngine : 'system';
-        savedConfig.realtimeVoiceSystemVoice = typeof savedConfig.realtimeVoiceSystemVoice === 'string'
-          ? savedConfig.realtimeVoiceSystemVoice.slice(0, 180)
-          : '';
-        const savedDashScopeModel = typeof savedConfig.realtimeVoiceDashScopeModel === 'string'
-          ? savedConfig.realtimeVoiceDashScopeModel.slice(0, 128)
-          : 'cosyvoice-v1';
-        const savedDashScopeVoice = typeof savedConfig.realtimeVoiceDashScopeVoice === 'string'
-          ? savedConfig.realtimeVoiceDashScopeVoice.slice(0, 128)
-          : 'longxiaochun';
-        // 早期实验版错误地把 v3-flash + longxiaochun 作为内置默认值；该组合
-        // 在旧域名/默认业务空间会返回 CosyVoice engine 418。只迁移这一个
-        // 曾经发布过的默认组合，用户填写的其他模型/音色保持原样。
-        savedConfig.realtimeVoiceDashScopeModel = (
-          savedDashScopeModel === 'cosyvoice-v3-flash'
-          && savedDashScopeVoice === 'longxiaochun'
-        ) ? 'cosyvoice-v1' : savedDashScopeModel;
-        savedConfig.realtimeVoiceDashScopeVoice = savedDashScopeVoice;
-        const voiceVadThreshold = Number(savedConfig.realtimeVoiceVadThreshold);
-        savedConfig.realtimeVoiceVadThreshold = Number.isFinite(voiceVadThreshold)
-          ? Math.max(0.004, Math.min(0.12, voiceVadThreshold))
-          : 0.018;
-        setConfig((prev) => ({ ...prev, ...savedConfig }));
-      }
+
+      const resolvedAppearance = resolveClientAppearance(storedAppearance, savedConfig);
+      const executorConfig = normalizeExecutorConfig(savedConfig);
+      const appearanceUnchanged = appearanceRevision === appearanceRevisionRef.current;
+      mergeConfig({
+        ...executorConfig,
+        ...(appearanceUnchanged ? resolvedAppearance.appearance : {}),
+      });
       setLoaded(true);
+
+      // One-time upgrade path. The old node-level value is copied to this user's
+      // controller namespace, but is never sent back to the executor.
+      if (resolvedAppearance.migrated && appearanceUnchanged) {
+        void saveClientAppearance(identity, resolvedAppearance.appearance, {
+          backgroundChanged: true,
+        }).catch((error) => console.warn('[appearance] legacy migration failed', error));
+      }
     } catch {
       if (version !== loadVersionRef.current) return;
       setLoaded(true);
     }
-  }, []);
+  }, [identity, mergeConfig]);
 
-  // 配置必须在真实后端连接成功后读取。旧逻辑在连接尚未就绪时先读一次，
-  // 失败后首连又跳过重载，导致背景图要手动刷新才出现。
+  // Switching accounts must remove user A's appearance before user B is painted.
+  // The small metadata is synchronous; a potentially large background hydrates from IDB.
+  useLayoutEffect(() => {
+    const version = ++loadVersionRef.current;
+    const appearanceRevision = ++appearanceRevisionRef.current;
+    if (executorSaveTimerRef.current) {
+      clearTimeout(executorSaveTimerRef.current);
+      executorSaveTimerRef.current = null;
+    }
+    flushAppearanceSave();
+    const preview = readClientAppearancePreview(identity);
+    mergeConfig({
+      ...DEFAULT_CLIENT_APPEARANCE,
+      ...(preview || {}),
+      bgImage: preview?.bgImage || '',
+    });
+    setLoaded(false);
+    void loadClientAppearance(identity).then((storedAppearance) => {
+      if (version !== loadVersionRef.current
+          || appearanceRevision !== appearanceRevisionRef.current) return;
+      if (storedAppearance) mergeConfig(storedAppearance);
+      setLoaded(true);
+    }).catch(() => {
+      if (version === loadVersionRef.current) setLoaded(true);
+    });
+  }, [identity, identityKey, flushAppearanceSave, mergeConfig]);
+
+  // Executor preferences load only after a real connection exists. Appearance is
+  // already available locally and is merely migrated from the executor once if needed.
   useEffect(() => {
     const unsubscribe = api.onConnectionStatus((connected) => {
       if (connected) void loadFromBackend();
     });
-    return () => {
-      loadVersionRef.current += 1;
-      unsubscribe();
-    };
+    return unsubscribe;
   }, [loadFromBackend]);
 
-  // ★ 卸载时清理 debounce timer
   useEffect(() => () => {
-    if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
-  }, []);
-
-  // Debounced save: sliders may fire many events; wait 400ms after last change.
-  // Non-bgImage saves strip bgImage from the payload (backend retains it on disk).
-  const scheduleSave = useCallback((cfg: AppConfig) => {
-    if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
-    saveTimerRef.current = setTimeout(() => {
-      const { bgImage: _omit, ...rest } = cfg;
-      api.setAppConfig(rest).catch(console.error);
-    }, 400);
-  }, []);
+    loadVersionRef.current += 1;
+    if (executorSaveTimerRef.current) clearTimeout(executorSaveTimerRef.current);
+    flushAppearanceSave();
+  }, [flushAppearanceSave]);
 
   const updateConfig = useCallback((patch: Partial<AppConfig>) => {
-    setConfig((prev) => {
-      const newConfig = { ...prev, ...patch };
-      if ('bgImage' in patch) {
-        // bgImage changes: send full config immediately so image is saved
-        if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
-        api.setAppConfig(newConfig).catch(console.error);
-      } else {
-        // Other changes: debounced, and omit bgImage from payload
-        scheduleSave(newConfig);
-      }
-      return newConfig;
-    });
-  }, [scheduleSave]);
+    const nextConfig = { ...configRef.current, ...patch };
+    configRef.current = nextConfig;
+    setConfig(nextConfig);
+    const patchRecord = patch as Record<string, unknown>;
+    if (hasClientAppearancePatch(patchRecord)) {
+      appearanceRevisionRef.current += 1;
+      const backgroundChanged = Object.prototype.hasOwnProperty.call(patch, 'bgImage');
+      scheduleAppearanceSave(identity, nextConfig, backgroundChanged, backgroundChanged);
+    }
+    if (hasExecutorConfigPatch(patchRecord)) scheduleExecutorSave(nextConfig);
+  }, [identity, scheduleAppearanceSave, scheduleExecutorSave]);
 
   const resetConfig = useCallback(() => {
+    if (executorSaveTimerRef.current) {
+      clearTimeout(executorSaveTimerRef.current);
+      executorSaveTimerRef.current = null;
+    }
+    appearanceRevisionRef.current += 1;
+    configRef.current = DEFAULT_CONFIG;
     setConfig(DEFAULT_CONFIG);
-    api.setAppConfig(DEFAULT_CONFIG).catch(console.error);
-  }, []);
+    // Persist defaults as a real per-user record. Clearing it would cause the next
+    // reload to re-import the shared executor's legacy skin.
+    scheduleAppearanceSave(identity, DEFAULT_CONFIG, true, true);
+    void api.setAppConfig(stripClientAppearance({ ...DEFAULT_CONFIG })).catch(console.error);
+  }, [identity, scheduleAppearanceSave]);
 
   const reloadConfig = useCallback(() => {
     void loadFromBackend();

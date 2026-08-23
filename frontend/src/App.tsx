@@ -192,7 +192,7 @@ export const App: React.FC = () => {
     });
   }, [focusedPaneIdx]);
 
-  const { config, updateConfig, resetConfig } = useConfig();
+  const { config, updateConfig, resetConfig } = useConfig(currentUser);
   const configRef = useRef(config);
   configRef.current = config;
   const notifiedCompletionKeysRef = useRef<Set<string>>(new Set());

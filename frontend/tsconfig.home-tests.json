@@ -21,6 +21,7 @@
     "src/utils/fileFocus.ts",
     "src/utils/executorSessions.ts",
     "src/utils/markdownExport.ts",
-    "src/utils/sha256.ts"
+    "src/utils/sha256.ts",
+    "src/utils/clientAppearance.ts"
   ]
 }
