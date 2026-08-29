@@ -143,6 +143,39 @@ class FileTransferTests(unittest.TestCase):
         result = self.parsed(self.bridge._rpc_syncFileList(str(self.root), "../outside"))
         self.assertEqual("error", result["status"])
 
+    def test_file_search_is_recursive_fuzzy_ranked_and_ignores_noise(self) -> None:
+        (self.root / "frontend" / "src" / "components").mkdir(parents=True)
+        (self.root / "frontend" / "src" / "components" / "FileTreePanel.tsx").write_text(
+            "export const FileTreePanel = () => null", encoding="utf-8",
+        )
+        (self.root / "docs").mkdir()
+        (self.root / "docs" / "file-tree-notes.md").write_text("notes", encoding="utf-8")
+        (self.root / "node_modules").mkdir()
+        (self.root / "node_modules" / "FileTreePanel.js").write_text("ignored", encoding="utf-8")
+        self.bridge._app_config_store = Mock()
+        self.bridge._app_config_store.get.return_value = None
+
+        exact = self.parsed(self.bridge._rpc_syncFileSearch(str(self.root), "filetree", 20))
+        fuzzy = self.parsed(self.bridge._rpc_syncFileSearch(str(self.root), "ftrpnl", 20))
+
+        self.assertEqual("ok", exact["status"])
+        self.assertEqual(
+            "frontend/src/components/FileTreePanel.tsx",
+            exact["results"][0]["path"],
+        )
+        self.assertNotIn(
+            "node_modules/FileTreePanel.js",
+            {item["path"] for item in exact["results"]},
+        )
+        self.assertEqual(
+            "frontend/src/components/FileTreePanel.tsx",
+            fuzzy["results"][0]["path"],
+        )
+
+        limited = self.parsed(self.bridge._rpc_syncFileSearch(str(self.root), "filetree", 1))
+        self.assertEqual(1, len(limited["results"]))
+        self.assertTrue(limited["truncated"])
+
     def test_sync_manifest_reuses_hash_when_size_and_mtime_are_unchanged(self) -> None:
         target = self.root / "cached.bin"
         target.write_bytes(b"stable")
@@ -158,31 +191,33 @@ class FileTransferTests(unittest.TestCase):
         self.assertEqual(first["files"]["cached.bin"], second["files"]["cached.bin"])
         self.assertEqual(cached_tuple, cache[cache_key]["cached.bin"])
 
-    def test_dispatch_runs_manifest_scan_off_event_loop(self) -> None:
+    def test_dispatch_runs_workspace_scans_off_event_loop(self) -> None:
         self.bridge._ensure_kit_scheduler = Mock()
-        entered = __import__('threading').Event()
-        release = __import__('threading').Event()
+        for method in ("syncManifest", "syncFileList", "syncFileSearch"):
+            with self.subTest(method=method):
+                entered = __import__('threading').Event()
+                release = __import__('threading').Event()
 
-        def slow_manifest(*_args):
-            entered.set()
-            release.wait(2)
-            return '{"status":"ok","files":{}}'
+                def slow_scan(*_args):
+                    entered.set()
+                    release.wait(2)
+                    return '{"status":"ok","files":{}}'
 
-        self.bridge._rpc_syncManifest = slow_manifest
+                setattr(self.bridge, f"_rpc_{method}", slow_scan)
 
-        async def scenario() -> None:
-            task = asyncio.create_task(self.bridge._dispatch("syncManifest", [str(self.root)]))
-            self.assertTrue(await asyncio.to_thread(entered.wait, 1))
-            # 如果 handler 仍直接跑在事件循环，这个 yield 无法及时返回。
-            await asyncio.wait_for(asyncio.sleep(0), timeout=0.2)
-            release.set()
-            result = await asyncio.wait_for(task, timeout=1)
-            self.assertIn('"status":"ok"', result)
+                async def scenario() -> None:
+                    task = asyncio.create_task(self.bridge._dispatch(method, [str(self.root)]))
+                    self.assertTrue(await asyncio.to_thread(entered.wait, 1))
+                    # 如果 handler 仍直接跑在事件循环，这个 yield 无法及时返回。
+                    await asyncio.wait_for(asyncio.sleep(0), timeout=0.2)
+                    release.set()
+                    result = await asyncio.wait_for(task, timeout=1)
+                    self.assertIn('"status":"ok"', result)
 
-        try:
-            asyncio.run(scenario())
-        finally:
-            release.set()
+                try:
+                    asyncio.run(scenario())
+                finally:
+                    release.set()
 
 
 if __name__ == "__main__":

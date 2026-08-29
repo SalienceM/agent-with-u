@@ -22,6 +22,12 @@ RUN npm run build
 
 # ── Stage 2：nginx 托管 ──────────────────────────────────────────────
 FROM nginx:alpine
+ARG AGENT_WITH_U_BUILD_ID=dev
+ARG AGENT_WITH_U_VERSION=dev
+LABEL io.agentwithu.component="web" \
+      io.agentwithu.updatable="true" \
+      io.agentwithu.build-id="${AGENT_WITH_U_BUILD_ID}" \
+      io.agentwithu.version="${AGENT_WITH_U_VERSION}"
 # 容器内路径分流配置（/ → 静态，/ws → 后端，/api/ → 后端）
 COPY deploy/web-nginx.conf /etc/nginx/conf.d/default.conf
 # 构建好的静态产物

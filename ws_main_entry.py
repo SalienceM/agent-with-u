@@ -10,6 +10,15 @@ import sys
 import os
 from pathlib import Path
 
+# A copied frozen sidecar can act as the detached updater.  Handle this before
+# redirecting logs/importing the long-running WebSocket server.
+if "--agentwithu-update-helper" in sys.argv:
+    from src.backend.update_helper import run_update_helper
+
+    _index = sys.argv.index("--agentwithu-update-helper")
+    _plan = sys.argv[_index + 1] if _index + 1 < len(sys.argv) else ""
+    raise SystemExit(run_update_helper(_plan))
+
 # 将 stderr 输出到日志文件，方便在 Tauri sidecar 模式下排查问题
 # 日志路径：~/.agent-with-u/backend.log
 _log_dir = Path.home() / ".agent-with-u"

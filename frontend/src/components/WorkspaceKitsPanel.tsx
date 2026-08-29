@@ -949,6 +949,16 @@ const KitEditor: React.FC<{
               </select>
               {item.source === 'file' && <input style={miniInput} placeholder="相对路径" value={item.path || ''}
                 onChange={(e) => setOutputs(draft.outputs.map((x, i) => i === index ? { ...x, path: e.target.value } : x))} />}
+              {item.source === 'file' && <label style={{
+                display: 'inline-flex', alignItems: 'center', gap: 5, whiteSpace: 'nowrap',
+                fontSize: 10, color: 'var(--theme-text-muted)',
+              }} title="Kit 成功后只登记为候选构建；仍需在发布工作台预检并明确确认">
+                <input type="checkbox" checked={!!item.releaseCandidate}
+                  onChange={(e) => setOutputs(draft.outputs.map((x, i) => i === index ? {
+                    ...x, releaseCandidate: e.target.checked,
+                  } : x))} />
+                登记发布候选
+              </label>}
               <button style={dangerMini} onClick={() => setOutputs(draft.outputs.filter((_, i) => i !== index))}>×</button>
             </div>
           ))}

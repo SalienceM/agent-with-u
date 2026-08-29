@@ -291,8 +291,8 @@ export const App: React.FC = () => {
     return () => window.removeEventListener('keydown', handler);
   }, []);
 
-  // ★ 全局截图快捷键(仅 Tauri):App 不在前台也能响应。默认 Ctrl+Shift+A,
-  //   可在 Settings 改键位 / 禁用。触发时往 window 派发
+  // ★ 全局截图快捷键(仅 Tauri):App 不在前台也能响应。默认关闭，用户可在
+  //   Settings 显式配置；全屏应用/游戏在前台时自动暂停。触发时往 window 派发
   //   'awu:screenshot-hotkey' 自定义事件,焦点 pane 的 ChatInput 接收事件
   //   后走它本地的 handleScreenshot 流程(用 isFocused 做选举,避免多 pane
   //   同时反应)。
@@ -311,13 +311,28 @@ export const App: React.FC = () => {
     if (!accelerator) return; // 空 = 用户主动禁用
     let unregister: null | (() => Promise<void>) = null;
     let cancelled = false;
+    let checkingForeground = false;
     (async () => {
       try {
-        const mod = await import('@tauri-apps/plugin-global-shortcut');
+        const [mod, { invoke }] = await Promise.all([
+          import('@tauri-apps/plugin-global-shortcut'),
+          import('@tauri-apps/api/core'),
+        ]);
         await mod.register(accelerator, (event) => {
           // event 有 pressed/released 两次触发,只取 pressed 那一下
-          if (event.state !== 'Pressed') return;
-          window.dispatchEvent(new CustomEvent('awu:screenshot-hotkey'));
+          if (event.state !== 'Pressed' || checkingForeground) return;
+          checkingForeground = true;
+          void invoke<boolean>('is_foreground_fullscreen_app')
+            .then((fullscreen) => {
+              if (!cancelled && !fullscreen) {
+                window.dispatchEvent(new CustomEvent('awu:screenshot-hotkey'));
+              }
+            })
+            .catch((error) => {
+              // 安全检查异常时不在后台贸然拉起系统截图浮层。
+              console.warn('[hotkey] foreground guard failed:', error);
+            })
+            .finally(() => { checkingForeground = false; });
         });
         if (!cancelled) {
           unregister = async () => { try { await mod.unregister(accelerator); } catch { /* */ } };
@@ -340,6 +355,8 @@ export const App: React.FC = () => {
   // Smooth 模式：Rust 在系统级监听 Ctrl + 双击鼠标，不激活本窗口。
   // 收到触发后后台截屏，再把一次性图片任务派给最后聚焦的 pane。
   const [hackerMode, setHackerMode] = useState<HackerModeConfig>(() => readHackerMode());
+  const hackerModeEnabledRef = useRef(hackerMode.enabled);
+  hackerModeEnabledRef.current = hackerMode.enabled;
   const ghostSnapshotRef = useRef<SmoothGhostState | null>(null);
   const ghostEmitRef = useRef<null | ((state: SmoothGhostState) => void)>(null);
   const ghostFlushTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -357,7 +374,9 @@ export const App: React.FC = () => {
         void invoke('update_smooth_ghost_state', { state }).catch(() => {});
       };
       ghostEmitRef.current = emitSnapshot;
-      if (ghostSnapshotRef.current) emitSnapshot(ghostSnapshotRef.current);
+      if (hackerModeEnabledRef.current && ghostSnapshotRef.current) {
+        emitSnapshot(ghostSnapshotRef.current);
+      }
     })().catch((error) => console.error('[smooth-ghost] main bridge failed:', error));
     return () => {
       cancelled = true;
@@ -368,10 +387,13 @@ export const App: React.FC = () => {
 
   const handleGhostStateChange = useCallback((state: SmoothGhostState) => {
     ghostSnapshotRef.current = state;
+    if (!hackerModeEnabledRef.current) return;
     if (ghostFlushTimerRef.current) return;
     ghostFlushTimerRef.current = setTimeout(() => {
       ghostFlushTimerRef.current = null;
-      if (ghostSnapshotRef.current) ghostEmitRef.current?.(ghostSnapshotRef.current);
+      if (hackerModeEnabledRef.current && ghostSnapshotRef.current) {
+        ghostEmitRef.current?.(ghostSnapshotRef.current);
+      }
     }, 120);
   }, []);
   useEffect(() => {
@@ -429,6 +451,9 @@ export const App: React.FC = () => {
             height: hackerMode.height,
           },
         });
+        if (hackerMode.enabled && ghostSnapshotRef.current) {
+          ghostEmitRef.current?.(ghostSnapshotRef.current);
+        }
       } catch (error) {
         console.error('[smooth] monitor setup failed:', error);
         if (!cancelled && hackerMode.enabled) {
@@ -1590,6 +1615,8 @@ export const App: React.FC = () => {
             reasoningEffort: activeSession?.reasoningEffort,
           }}
           backends={activeExecBackends}
+          workingDir={activeSession?.workingDir}
+          execKey={activeSession?.execKey}
         />
       )}
 

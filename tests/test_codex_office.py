@@ -56,6 +56,22 @@ class CodexOfficeTests(unittest.TestCase):
             self.assertEqual(os.environ["HTTPS_PROXY"], "http://system:8080")
             self.assertNotIn("AGENTWITHU_CODEX_PROXY_MODE", env)
 
+    def test_container_runtime_proxy_policy_applies_without_backend_copy(self):
+        proxy = "http://192.168.50.156:7890"
+        runtime = {
+            "AGENTWITHU_CODEX_PROXY_MODE": "custom",
+            "AGENTWITHU_CODEX_PROXY": proxy,
+            "AGENTWITHU_CODEX_NO_PROXY": "localhost,awu-backend",
+            "AGENTWITHU_CODEX_FORCE_HTTP": "1",
+        }
+        with patch.dict(os.environ, runtime, clear=False):
+            backend = self._backend()
+            env = backend._build_env()
+            self.assertEqual(proxy, env["HTTPS_PROXY"])
+            self.assertEqual("localhost,awu-backend", env["NO_PROXY"])
+            self.assertTrue(backend._force_http_enabled())
+            self.assertIn("192.168.50.156:7890", backend._network_summary())
+
     def test_direct_proxy_mode_removes_inherited_proxy(self):
         inherited = {key: "http://system:8080" for key in (
             "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",

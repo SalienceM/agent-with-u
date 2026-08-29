@@ -52,6 +52,13 @@ export interface KitOutputSpec {
   source?: 'stdout' | 'stderr' | 'json' | 'file';
   path?: string;
   mediaType?: string;
+  /** 成功运行后只登记到发布中心候选区；绝不会自动执行正式发布。 */
+  releaseCandidate?: boolean;
+  platform?: string;
+  arch?: string;
+  target?: string;
+  kind?: string;
+  install?: Record<string, unknown>;
 }
 
 export interface KitVersion {

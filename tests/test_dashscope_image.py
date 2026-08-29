@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import base64
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import httpx
@@ -81,6 +83,17 @@ def _image(index: int) -> ImageAttachment:
 
 
 class DashScopeImageBackendTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self) -> None:
+        self._image_root = tempfile.TemporaryDirectory()
+        self.addCleanup(self._image_root.cleanup)
+        image_root = Path(self._image_root.name)
+        path_patcher = patch(
+            "src.backend.dashscope_image.paths.sub",
+            side_effect=lambda *parts: image_root.joinpath(*parts),
+        )
+        path_patcher.start()
+        self.addCleanup(path_patcher.stop)
+
     async def test_qwen3_i2i_uses_workspace_sync_api_and_returns_every_image(self) -> None:
         first = "https://result.example/first.png"
         second = "https://result.example/second.png"
@@ -153,7 +166,12 @@ class DashScopeImageBackendTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(content[0]["image"].startswith("data:image/png;base64,"))
 
         rendered = "".join(delta.text or "" for delta in deltas if delta.type == "text_delta")
-        self.assertEqual(rendered.count("![生成图像](data:image/png;base64,"), 2)
+        self.assertEqual(
+            rendered.count("![生成图像](http://127.0.0.1:44322/api/skill-images/"), 2,
+        )
+        self.assertNotIn(";base64,", rendered)
+        saved = list((Path(self._image_root.name) / "skill-images").glob("*.png"))
+        self.assertEqual(sorted(path.read_bytes() for path in saved), [b"first-image", b"second-image"])
         done = next(delta for delta in deltas if delta.type == "done")
         self.assertEqual(done.usage, {"inputTokens": 0, "outputTokens": 2})
 
@@ -207,9 +225,11 @@ class DashScopeImageBackendTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_qwen3_auto_routes_heavy_pro_task_to_async_and_polls_until_success(self) -> None:
         image_url = "https://result.example/async.png"
+        # 8MB 正是 marked v9 会栈溢出的量级；backend 输出必须仍然只是短 URL。
+        large_image = b"\x89PNG\r\n\x1a\n" + (b"A" * (8 * 1024 * 1024))
         client = _Client(
             {"output": {"task_status": "PENDING", "task_id": "task-heavy-1"}},
-            {image_url: b"async-image"},
+            {image_url: large_image},
             task_responses=[
                 {"output": {"task_status": "PENDING", "task_id": "task-heavy-1"}},
                 {"output": {"task_status": "RUNNING", "task_id": "task-heavy-1"}},
@@ -262,7 +282,12 @@ class DashScopeImageBackendTests(unittest.IsolatedAsyncioTestCase):
         rendered = "".join(delta.text or "" for delta in deltas if delta.type == "text_delta")
         self.assertIn("自动判定重任务：Pro 模型", rendered)
         self.assertIn("task-heavy-1", rendered)
-        self.assertIn("![生成图像](data:image/png;base64,", rendered)
+        self.assertIn("![生成图像](http://127.0.0.1:44322/api/skill-images/", rendered)
+        self.assertNotIn(";base64,", rendered)
+        self.assertLess(len(rendered), 2_000)
+        saved = list((Path(self._image_root.name) / "skill-images").glob("*.png"))
+        self.assertEqual(len(saved), 1)
+        self.assertEqual(saved[0].stat().st_size, len(large_image))
         self.assertEqual(deltas[-1].type, "done")
 
     def test_qwen3_auto_keeps_a_light_standard_request_synchronous(self) -> None:

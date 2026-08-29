@@ -823,6 +823,7 @@ interface Props {
   ttsRate?: number;
   workingDir?: string;
   onFocusFile?: (relativePath: string) => void;
+  onRedoMessage?: (message: ChatMessage) => void | Promise<void>;
 }
 
 // 复制气泡内容到剪贴板
@@ -856,7 +857,8 @@ const BubbleActionMenu: React.FC<{
   canBranch?: boolean;
   ttsVoice?: string;
   ttsRate?: number;
-}> = ({ message, sessionId, canBranch, ttsVoice, ttsRate }) => {
+  onRedoMessage?: (message: ChatMessage) => void | Promise<void>;
+}> = ({ message, sessionId, canBranch, ttsVoice, ttsRate, onRedoMessage }) => {
   const [menuOpen, setMenuOpen] = useState(false);
   const [copied, setCopied] = useState(false);
   const [copiedFull, setCopiedFull] = useState(false);
@@ -945,6 +947,13 @@ const BubbleActionMenu: React.FC<{
     }
     setMenuOpen(false);
   }, [message]);
+
+  const handleRedo = useCallback((event: React.MouseEvent) => {
+    event.stopPropagation();
+    setMenuOpen(false);
+    if (message.role !== 'user' || !onRedoMessage) return;
+    void onRedoMessage(message);
+  }, [message, onRedoMessage]);
 
 
   const handleBranch = useCallback(async () => {
@@ -1057,6 +1066,29 @@ const BubbleActionMenu: React.FC<{
           boxShadow: '0 4px 12px rgba(0,0,0,0.15)',
           overflow: 'hidden',
         }}>
+          {message.role === 'user' && onRedoMessage && (
+            <button
+              onClick={handleRedo}
+              title="将这条用户消息作为新消息再发送一次"
+              style={{
+                width: '100%',
+                padding: '8px 12px',
+                background: 'none',
+                border: 'none',
+                borderBottom: '1px solid var(--theme-border, rgba(0,0,0,0.08))',
+                textAlign: 'left',
+                cursor: 'pointer',
+                fontSize: 12,
+                color: 'var(--theme-text, #1f2328)',
+                display: 'flex',
+                alignItems: 'center',
+                gap: 8,
+              }}
+            >
+              <span>↻</span>
+              <span>Redo · 再发一次</span>
+            </button>
+          )}
           <button
             onClick={handleCopy}
             style={{
@@ -1137,6 +1169,7 @@ function MessageBubbleInner({
   ttsRate,
   workingDir,
   onFocusFile,
+  onRedoMessage,
 }: Props) {
   const [lightboxSrc, setLightboxSrc] = useState<string | null>(null);
   const [fileLinkMenu, setFileLinkMenu] = useState<{
@@ -1634,6 +1667,7 @@ function MessageBubbleInner({
           canBranch={canBranch}
           ttsVoice={ttsVoice}
           ttsRate={ttsRate}
+          onRedoMessage={onRedoMessage}
         />
         {isUser && message.deliveryMode && (
           <div style={{
@@ -1860,8 +1894,11 @@ function bubblePropsEqual(prev: Props, next: Props): boolean {
     prev.animateIn         === next.animateIn         &&
     prev.ttsVoice          === next.ttsVoice          &&
     prev.ttsRate           === next.ttsRate           &&
+    prev.sessionId         === next.sessionId         &&
+    prev.canBranch         === next.canBranch         &&
     prev.workingDir        === next.workingDir        &&
-    prev.onFocusFile       === next.onFocusFile
+    prev.onFocusFile       === next.onFocusFile       &&
+    prev.onRedoMessage     === next.onRedoMessage
   );
 }
 

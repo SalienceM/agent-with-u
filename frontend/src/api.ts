@@ -17,7 +17,8 @@ import type {
   ProvDocument, ProvOpenResult, ProvResolveResult, ProvSaveResult,
 } from './types/prov';
 import { filterGitMetadata } from './utils/dirSyncPolicy';
-import { mergeExecutorSessionBatches } from './utils/executorSessions';
+import { rankFileSearchPaths } from './utils/fileSearch';
+import { mergeExecutorSessionBatches, selectExactExecutor } from './utils/executorSessions';
 
 type StreamDeltaCallback = (delta: any) => void;
 type SessionUpdateCallback = (data: any) => void;
@@ -53,6 +54,183 @@ export interface ConnectedClient {
 }
 type ClientsChangedCallback = (clients: ConnectedClient[], execKey: string) => void;
 
+export interface NodeUpdateRelease {
+  version: string;
+  packageVersion?: string;
+  buildId?: string;
+  sequence?: number;
+  publishedAt?: string;
+  notes?: string;
+}
+
+export interface NodeUpdateArtifact {
+  id: string;
+  platform: string;
+  arch: string;
+  target: string;
+  kind: string;
+  fileName: string;
+  url: string;
+  size: number;
+  hasInstaller: boolean;
+}
+
+export interface NodeUpdateStatus {
+  phase: 'idle' | 'checking' | 'current' | 'available' | 'downloading' | 'staged'
+    | 'installing' | 'installed' | 'cancelled' | 'error';
+  busy: boolean;
+  available?: boolean;
+  message?: string;
+  error?: string;
+  platform: string;
+  arch: string;
+  desktop: boolean;
+  runtime?: 'desktop' | 'headless' | 'native' | 'docker' | string;
+  dockerUpdaterAvailable?: boolean;
+  current: NodeUpdateRelease;
+  release?: NodeUpdateRelease;
+  artifact?: NodeUpdateArtifact;
+  downloadedBytes?: number;
+  totalBytes?: number;
+  manifestSigned?: boolean;
+  config: {
+    manifestUrl: string;
+    channel: string;
+    requireSignature: boolean;
+    hasSignatureKey: boolean;
+    hasRequestHeaders: boolean;
+  };
+}
+
+export interface ReleaseArtifact {
+  id: string;
+  path: string;
+  relativePath: string;
+  fileName: string;
+  platform: string;
+  arch: string;
+  target: string;
+  kind: string;
+  size: number;
+  sha256: string;
+  modifiedAt: number;
+  fresh: boolean;
+  key?: string;
+  install?: Record<string, any>;
+}
+
+export interface ReleaseCandidate {
+  id: string;
+  status: 'candidate' | 'published' | 'discarded';
+  version: string;
+  packageVersion: string;
+  buildId: string;
+  sequence: number;
+  commit: string;
+  branch: string;
+  dirty: boolean;
+  dirtyFiles: number;
+  projectRoot: string;
+  source: string;
+  artifacts: ReleaseArtifact[];
+  createdAt: number;
+  updatedAt: number;
+  publishedAt?: number;
+  publishedChannel?: string;
+}
+
+export interface ReleaseCenterConfig {
+  projectRoot: string;
+  scanRoots: string[];
+  channel: string;
+  baseUrl: string;
+  qiniuBucket: string;
+  prefix: string;
+  manifestKey: string;
+  stableManifestUrl: string;
+  qshell: string;
+  requireSignature: boolean;
+  qshellAvailable: boolean;
+  qiniuAccountConfigured: boolean;
+  qiniuAccountMessage: string;
+  signingKeyConfigured: boolean;
+  dataRoot: string;
+}
+
+export interface ReleaseJob {
+  id: string;
+  planId: string;
+  candidateId: string;
+  buildId: string;
+  channel: string;
+  status: 'queued' | 'running' | 'succeeded' | 'failed' | 'cancelled' | 'interrupted';
+  progress: number;
+  step: number;
+  totalSteps: number;
+  message: string;
+  error?: string;
+  log: string[];
+  manifestUrl?: string;
+  createdAt: number;
+  updatedAt: number;
+  startedAt?: number;
+  endedAt?: number;
+}
+
+export interface ReleaseHistoryItem {
+  id: string;
+  jobId: string;
+  planId: string;
+  candidateId: string;
+  buildId: string;
+  version: string;
+  channel: string;
+  manifestUrl: string;
+  artifactCount: number;
+  publishedAt: number;
+}
+
+export interface ReleaseCenterState {
+  status: string;
+  config: ReleaseCenterConfig;
+  candidates: ReleaseCandidate[];
+  history: ReleaseHistoryItem[];
+  jobs: ReleaseJob[];
+  activeJob?: ReleaseJob | null;
+  message?: string;
+}
+
+export interface ReleasePlan {
+  id: string;
+  status: 'ready' | 'blocked';
+  candidateId: string;
+  candidate: Partial<ReleaseCandidate>;
+  channel: string;
+  baseUrl: string;
+  qiniuBucket: string;
+  manifestKey: string;
+  versionedManifestKey: string;
+  manifestUrl: string;
+  uploadJobs: Array<{ key: string; path: string; sha256: string; size: number }>;
+  manifest: Record<string, any>;
+  blockers: string[];
+  warnings: string[];
+  comparison: {
+    available: boolean;
+    release: NodeUpdateRelease & { commit?: string; sequence?: number };
+    versionChanged: boolean;
+    commitChanged: boolean;
+    artifacts: Array<{
+      artifactId: string; previousId: string; previousSize: number;
+      sizeDelta: number | null; hashChanged: boolean; isNew: boolean;
+    }>;
+  };
+  signatureConfigured: boolean;
+  requireSignature: boolean;
+  fingerprint: string;
+  createdAt: number;
+}
+
 export interface SkillInfo {
   name: string;
   content: string;               // SKILL.md 完整内容
@@ -77,6 +255,7 @@ const WS_PORT_DEFAULT = Number.isInteger(configuredWsPort) && configuredWsPort >
 const WS_CONNECT_TIMEOUT_MS = 3000;
 const LIST_SESSIONS_TIMEOUT_MS = 3000;
 const SYNC_MANIFEST_TIMEOUT_MS = 180_000;
+const FILE_SEARCH_TIMEOUT_MS = 60_000;
 
 let useMock = false;
 
@@ -90,6 +269,7 @@ let sessionUpdateCallbacks: SessionUpdateCallback[] = [];
 let permissionRequestCallbacks: PermissionRequestCallback[] = [];
 let assetChangedCallbacks: AssetChangedCallback[] = [];
 let clientsChangedCallbacks: ClientsChangedCallback[] = [];
+let pendingDesktopUpdatePlan = '';
 
 type SttStreamTextCallback = (data: { text: string; isFinal: boolean }) => void;
 let sttStreamCallbacks: SttStreamTextCallback[] = [];
@@ -569,6 +749,24 @@ function handleMessage(e: MessageEvent, source?: Conn) {
     } else if (msg.event === 'clientsChanged') {
       const data: ConnectedClient[] = msg.data ? JSON.parse(msg.data) : [];
       clientsChangedCallbacks.forEach((cb) => cb(data, source?.key || 'local'));
+    } else if (msg.event === 'nodeUpdateInstallRequested') {
+      const data = msg.data ? JSON.parse(msg.data) : {};
+      const planPath = String(data?.planPath || '');
+      // 只有目标节点自己的 canonical local 连接能退出本机 Tauri。远端控制
+      // 连接即便发来同名事件也绝不能让操作者的客户端退出。
+      if (isTauri() && source?.key === 'local' && planPath && pendingDesktopUpdatePlan !== planPath) {
+        pendingDesktopUpdatePlan = planPath;
+        const delay = Math.max(300, Math.min(Number(data?.delayMs || 1500), 10_000));
+        window.setTimeout(() => {
+          void import('@tauri-apps/api/core').then(({ invoke }) => (
+            invoke('install_staged_update', { planPath })
+          )).catch((error) => {
+            pendingDesktopUpdatePlan = '';
+            const message = error instanceof Error ? error.message : String(error || 'desktop updater failed');
+            void callOn('local', 'nodeUpdateInstallFailed', message);
+          });
+        }, delay);
+      }
     } else if (msg.event === 'loopUpdated') {
       const data = JSON.parse(msg.data);
       loopUpdatedCallbacks.forEach((cb) => cb(data));
@@ -1356,12 +1554,15 @@ async function send(method: string, ...params: any[]): Promise<void> {
 
 /** 指定执行节点发起 RPC（用于按 workingDir 操作、无 sessionId 可路由的场景，如目录同步）。 */
 function connByKey(execKey?: string): Conn {
-  return (execKey && pool.get(execKey)) || homeConn;
+  const connection = selectExactExecutor(pool, homeConn, execKey);
+  if (!connection) throw new Error(`找不到指定的执行节点：${execKey}`);
+  return connection;
 }
 async function callOn(execKey: string | undefined, method: string, ...params: any[]): Promise<any> {
-  await homeConn.ready;
   try {
-    return await connByKey(execKey).request(method, params);
+    const connection = connByKey(execKey);
+    await connection.ready;
+    return await connection.request(method, params);
   } catch (err) {
     console.warn(`[api] callOn "${method}" failed:`, err);
     return null;
@@ -1375,8 +1576,8 @@ async function callOnStrict(
   params: any[],
   timeoutMs?: number,
 ): Promise<any> {
-  await homeConn.ready;
   const connection = connByKey(execKey);
+  await connection.ready;
   if (!connection.isOpen) {
     throw new Error('执行端离线，请恢复连接后重试');
   }
@@ -1389,6 +1590,14 @@ function syncManifestError(error: unknown): string {
   if (/connection lost|closed|websocket/i.test(message)) return '比对过程中连接中断，请恢复连接后重试';
   if (/offline|离线/i.test(message)) return '执行端离线，请恢复连接后重试';
   return message || '执行端未返回文件清单';
+}
+
+function fileSearchError(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error || '');
+  if (/timeout/i.test(message)) return '远端文件搜索超时，目录可能过大；请稍后重试或检查执行端磁盘状态';
+  if (/connection lost|closed|websocket/i.test(message)) return '远端搜索过程中连接中断，请恢复连接后重试';
+  if (/offline|离线/i.test(message)) return '执行端离线；已下载到本机的文件仍可搜索';
+  return message || '执行端未返回文件搜索结果';
 }
 
 function parseRpcObject<T extends Record<string, any>>(result: any, fallback: T): T {
@@ -1854,8 +2063,11 @@ export const api = {
     try { return JSON.parse(result); } catch { return null; }
   },
 
-  async listSessionRefs(query = ''): Promise<any[]> {
-    const result = await call('listSessionRefs', query);
+  async listSessionRefs(query = '', execKey?: string): Promise<any[]> {
+    // 引用上下文必须与当前 Session 位于同一执行节点；远端会话不能查询 home 清单。
+    const result = execKey
+      ? await callOn(execKey, 'listSessionRefs', query)
+      : await call('listSessionRefs', query);
     try { return JSON.parse(result) || []; } catch { return []; }
   },
 
@@ -2666,6 +2878,86 @@ export const api = {
     }
   },
 
+  /**
+   * 递归模糊查询工作区文件名/路径。
+   *
+   * 显式 execKey 会精确路由到 Session 执行节点，绝不回落到控制端。新版节点在
+   * 远端建短时索引；尚未升级、没有 syncFileSearch 的节点则用 syncFileList
+   * 获取一次远端清单并在客户端排序，保证滚动升级期间仍能搜索。
+   */
+  async searchFiles(workingDir: string, query: string, execKey?: string, limit = 200, includeGit = false): Promise<{
+    status: string; message?: string; matched?: number; indexed?: number; truncated?: boolean;
+    compatibilityFallback?: boolean;
+    results?: Array<{ path: string; name: string; size: number; mtime?: number }>;
+  }> {
+    const resultLimit = Math.max(1, Math.min(Number(limit || 200), 500));
+    try {
+      const result = await callOnStrict(
+        execKey,
+        'syncFileSearch',
+        [workingDir, query, resultLimit, includeGit],
+        FILE_SEARCH_TIMEOUT_MS,
+      );
+      // 旧执行节点对未知 RPC 返回 null。只有这种明确的“方法不存在”才降级；
+      // 超时/断线时不能再启动一次全目录扫描，否则会在远端叠加重任务。
+      if (result !== null && result !== undefined && result !== '') {
+        return parseRpcObject(result, {
+          status: 'error', message: '执行端返回了无效的文件搜索响应', results: [],
+        });
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error || '');
+      if (!/positional argument|takes .* argument|unexpected argument/i.test(message)) {
+        return { status: 'error', message: fileSearchError(error), results: [] };
+      }
+    }
+
+    try {
+      let result: any;
+      try {
+        result = await callOnStrict(
+          execKey,
+          'syncFileList',
+          [workingDir, '', includeGit],
+          SYNC_MANIFEST_TIMEOUT_MS,
+        );
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error || '');
+        if (includeGit || !/positional argument|takes .* argument|unexpected argument/i.test(message)) {
+          throw error;
+        }
+        result = await callOnStrict(
+          execKey,
+          'syncFileList',
+          [workingDir, ''],
+          SYNC_MANIFEST_TIMEOUT_MS,
+        );
+      }
+      const parsed = parseRpcObject<{
+        status: string; message?: string; files?: Record<string, number>;
+      }>(result, { status: 'error', message: '旧执行端未返回远端文件清单' });
+      const files = filterGitMetadata(parsed.files, includeGit);
+      if (parsed.status !== 'ok' || !files) {
+        return { status: 'error', message: parsed.message || '无法读取远端文件清单', results: [] };
+      }
+      const ranked = rankFileSearchPaths(Object.keys(files), query, resultLimit);
+      return {
+        status: 'ok',
+        results: ranked.results.map(({ path }) => ({
+          path,
+          name: path.slice(path.lastIndexOf('/') + 1),
+          size: Number(files[path] || 0),
+        })),
+        matched: ranked.matched,
+        indexed: Object.keys(files).length,
+        truncated: ranked.truncated,
+        compatibilityFallback: true,
+      };
+    } catch (error) {
+      return { status: 'error', message: fileSearchError(error), results: [] };
+    }
+  },
+
   async syncReadFile(workingDir: string, rel: string, execKey?: string): Promise<{
     status: string; message?: string; hash?: string; data?: string; tooLarge?: boolean;
   }> {
@@ -2926,10 +3218,151 @@ export const api = {
     return () => { permissionRequestCallbacks = permissionRequestCallbacks.filter((cb) => cb !== callback); };
   },
 
-  /** 获取应用版本号（格式 YY.MM.DD，由 build_all.bat 构建时写入）。 */
+  /** 获取应用展示版本号（同一天多次构建也不同）。 */
   async getAppVersion(): Promise<string> {
     const result = await call('getAppVersion');
     return typeof result === 'string' && result ? result : '0.0.0-dev';
+  },
+
+  /** 读取某个物理执行节点的更新状态。 */
+  async nodeUpdateStatus(execKey: string): Promise<NodeUpdateStatus> {
+    const result = await callOnStrict(execKey, 'nodeUpdateStatus', [], 15_000);
+    return parseRpcObject<NodeUpdateStatus>(result, {
+      phase: 'error', busy: false, error: '执行节点未返回更新状态',
+      platform: 'unknown', arch: 'unknown', desktop: false,
+      current: { version: 'unknown' },
+      config: { manifestUrl: '', channel: 'stable', requireSignature: false, hasSignatureKey: false, hasRequestHeaders: false },
+    });
+  },
+
+  async nodeUpdateConfigure(
+    execKey: string,
+    config: { manifestUrl?: string; channel?: string; requireSignature?: boolean; signatureKey?: string; clearSignatureKey?: boolean },
+  ): Promise<{ status: string; config?: NodeUpdateStatus['config']; message?: string }> {
+    const result = await callOnStrict(execKey, 'nodeUpdateConfigure', [JSON.stringify(config || {})], 20_000);
+    return parseRpcObject(result, { status: 'error', message: '更新源配置失败' });
+  },
+
+  async nodeUpdateCheck(execKey: string, manifestUrl = '', artifactId = ''): Promise<NodeUpdateStatus> {
+    const result = await callOnStrict(execKey, 'nodeUpdateCheck', [manifestUrl, artifactId], 90_000);
+    return parseRpcObject<NodeUpdateStatus>(result, {
+      phase: 'error', busy: false, error: '检查更新失败', platform: 'unknown', arch: 'unknown', desktop: false,
+      current: { version: 'unknown' },
+      config: { manifestUrl: '', channel: 'stable', requireSignature: false, hasSignatureKey: false, hasRequestHeaders: false },
+    });
+  },
+
+  /** 开始后台下载；进度通过 nodeUpdateStatus 轮询，不占住同一条 WebSocket。 */
+  async nodeUpdateStage(execKey: string, manifestUrl = '', artifactId = '', force = false): Promise<NodeUpdateStatus> {
+    const result = await callOnStrict(execKey, 'nodeUpdateStage', [manifestUrl, artifactId, force], 90_000);
+    return parseRpcObject<NodeUpdateStatus>(result, {
+      phase: 'error', busy: false, error: '无法开始下载更新', platform: 'unknown', arch: 'unknown', desktop: false,
+      current: { version: 'unknown' },
+      config: { manifestUrl: '', channel: 'stable', requireSignature: false, hasSignatureKey: false, hasRequestHeaders: false },
+    });
+  },
+
+  async nodeUpdateCancel(execKey: string): Promise<NodeUpdateStatus> {
+    const result = await callOnStrict(execKey, 'nodeUpdateCancel', [], 30_000);
+    return parseRpcObject<NodeUpdateStatus>(result, {
+      phase: 'cancelled', busy: false, platform: 'unknown', arch: 'unknown', desktop: false,
+      current: { version: 'unknown' },
+      config: { manifestUrl: '', channel: 'stable', requireSignature: false, hasSignatureKey: false, hasRequestHeaders: false },
+    });
+  },
+
+  async nodeUpdateApply(execKey: string): Promise<{ status: string; requiresDesktop?: boolean; message?: string }> {
+    const result = await callOnStrict(execKey, 'nodeUpdateApply', [], 30_000);
+    return parseRpcObject(result, { status: 'error', message: '无法启动更新安装' });
+  },
+
+  // ── 发布工作台：全局候选构建、冻结计划与后台正式发布 ──────────
+
+  async releaseStatus(execKey: string): Promise<ReleaseCenterState> {
+    const result = await callOnStrict(execKey, 'releaseStatus', [], 20_000);
+    return parseRpcObject<ReleaseCenterState>(result, {
+      status: 'error', message: '执行节点未返回发布中心状态',
+      config: {
+        projectRoot: '', scanRoots: [], channel: 'stable', baseUrl: '', qiniuBucket: '',
+        prefix: 'agentwithu/releases', manifestKey: 'agentwithu/releases/stable/manifest.json',
+        stableManifestUrl: '', qshell: 'qshell', requireSignature: false,
+        qshellAvailable: false, qiniuAccountConfigured: false, qiniuAccountMessage: '',
+        signingKeyConfigured: false, dataRoot: '',
+      },
+      candidates: [], history: [], jobs: [], activeJob: null,
+    });
+  },
+
+  async releaseConfigure(
+    execKey: string, config: Partial<ReleaseCenterConfig>,
+  ): Promise<ReleaseCenterConfig & { status?: string; message?: string }> {
+    const result = await callOnStrict(
+      execKey, 'releaseConfigure', [JSON.stringify(config || {})], 30_000,
+    );
+    return parseRpcObject(result, {
+      status: 'error', message: '发布配置保存失败', projectRoot: '', scanRoots: [],
+      channel: 'stable', baseUrl: '', qiniuBucket: '', prefix: '', manifestKey: '',
+      stableManifestUrl: '', qshell: 'qshell', requireSignature: false,
+      qshellAvailable: false, qiniuAccountConfigured: false, qiniuAccountMessage: '',
+      signingKeyConfigured: false, dataRoot: '',
+    });
+  },
+
+  async releaseConfigureQiniuAccount(
+    execKey: string, accessKey: string, secretKey: string, accountName = 'agentwithu-release',
+  ): Promise<{ status: string; configured?: boolean; accountName?: string; message?: string }> {
+    const result = await callOnStrict(
+      execKey, 'releaseConfigureQiniuAccount', [accessKey, secretKey, accountName], 45_000,
+    );
+    return parseRpcObject(result, { status: 'error', message: '七牛账号配置失败' });
+  },
+
+  async releaseScan(execKey: string, projectRoot = ''): Promise<{ status: string; candidate?: ReleaseCandidate; message?: string }> {
+    const result = await callOnStrict(execKey, 'releaseScan', [projectRoot, 'release-center-ui'], 10 * 60_000);
+    return parseRpcObject(result, { status: 'error', message: '扫描没有返回结果' });
+  },
+
+  async releaseUpdateArtifact(
+    execKey: string, candidateId: string, artifactId: string, patch: Partial<ReleaseArtifact>,
+  ): Promise<{ status: string; candidate?: ReleaseCandidate; message?: string }> {
+    const result = await callOnStrict(
+      execKey, 'releaseUpdateArtifact', [candidateId, artifactId, JSON.stringify(patch || {})], 30_000,
+    );
+    return parseRpcObject(result, { status: 'error', message: '制品设置保存失败' });
+  },
+
+  async releaseDiscard(
+    execKey: string, candidateId: string,
+  ): Promise<{ status: string; candidate?: ReleaseCandidate; message?: string }> {
+    const result = await callOnStrict(execKey, 'releaseDiscard', [candidateId], 30_000);
+    return parseRpcObject(result, { status: 'error', message: '无法废弃候选构建' });
+  },
+
+  async releasePreview(
+    execKey: string,
+    candidateId: string,
+    artifactIds: string[],
+    options: { notes?: string; channel?: string; requireSignature?: boolean },
+  ): Promise<{ status: string; plan?: ReleasePlan; message?: string }> {
+    const result = await callOnStrict(
+      execKey, 'releasePreview', [candidateId, JSON.stringify(artifactIds), JSON.stringify(options || {})],
+      10 * 60_000,
+    );
+    return parseRpcObject(result, { status: 'error', message: '发布预检没有返回结果' });
+  },
+
+  async releasePublish(
+    execKey: string, planId: string,
+  ): Promise<{ status: string; job?: ReleaseJob; message?: string }> {
+    const result = await callOnStrict(execKey, 'releasePublish', [planId], 30_000);
+    return parseRpcObject(result, { status: 'error', message: '无法启动后台发布任务' });
+  },
+
+  async releaseCancel(
+    execKey: string, jobId: string,
+  ): Promise<{ status: string; job?: ReleaseJob; message?: string }> {
+    const result = await callOnStrict(execKey, 'releaseCancel', [jobId], 30_000);
+    return parseRpcObject(result, { status: 'error', message: '无法取消发布任务' });
   },
 
   // ── STT 语音转文字 ──────────────────────────────────────────
@@ -3453,6 +3886,36 @@ function mockDispatch(method: string, params: any[]): any {
     case 'setSkillDefault': return JSON.stringify({ status: 'ok' });
     case 'getDefaultAbilities': return JSON.stringify({ skills: [], prompts: [] });
     case 'getAppVersion': return '0.0.0-dev';
+    case 'nodeUpdateStatus': return JSON.stringify({
+      phase: 'idle', busy: false, platform: 'mock', arch: 'mock', desktop: false,
+      current: { version: '0.0.0-dev' },
+      config: { manifestUrl: '', channel: 'stable', requireSignature: false, hasSignatureKey: false, hasRequestHeaders: false },
+    });
+    case 'nodeUpdateConfigure': return JSON.stringify({ status: 'ok' });
+    case 'nodeUpdateCheck': case 'nodeUpdateStage': case 'nodeUpdateCancel':
+      return JSON.stringify({
+        phase: 'current', busy: false, platform: 'mock', arch: 'mock', desktop: false,
+        current: { version: '0.0.0-dev' }, available: false,
+        config: { manifestUrl: '', channel: 'stable', requireSignature: false, hasSignatureKey: false, hasRequestHeaders: false },
+      });
+    case 'nodeUpdateApply': return JSON.stringify({ status: 'error', message: 'mock mode' });
+    case 'releaseStatus': return JSON.stringify({
+      status: 'ok',
+      config: {
+        projectRoot: '', scanRoots: ['src-tauri/target/release/bundle', 'dist'],
+        channel: 'stable', baseUrl: '', qiniuBucket: '', prefix: 'agentwithu/releases',
+        manifestKey: 'agentwithu/releases/stable/manifest.json', stableManifestUrl: '',
+        qshell: 'qshell', requireSignature: false, qshellAvailable: false,
+        qiniuAccountConfigured: false, qiniuAccountMessage: '尚未配置七牛账号',
+        signingKeyConfigured: false, dataRoot: '',
+      },
+      candidates: [], history: [], jobs: [], activeJob: null,
+    });
+    case 'releaseConfigure': return JSON.stringify({ status: 'ok' });
+    case 'releaseConfigureQiniuAccount': return JSON.stringify({ status: 'error', message: 'mock mode' });
+    case 'releaseScan': case 'releaseUpdateArtifact': case 'releaseDiscard':
+    case 'releasePreview': case 'releasePublish': case 'releaseCancel':
+      return JSON.stringify({ status: 'error', message: 'mock mode' });
     case 'getDirRoots': return JSON.stringify({ home: '', cwd: '', roots: ['/'], sep: '/' });
     case 'assetList': return JSON.stringify({ items: [], stats: { count: 0, pinned: 0, bytes: 0 }, httpPort: 0 });
     case 'assetPush': return JSON.stringify({ ok: false, error: 'mock mode' });

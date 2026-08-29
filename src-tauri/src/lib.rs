@@ -224,6 +224,337 @@ fn quit_app_completely(app: &tauri::AppHandle) {
     });
 }
 
+#[derive(Serialize, Deserialize, Clone, Default)]
+#[serde(default, rename_all = "camelCase")]
+struct UpdateInstallCommand {
+    program: String,
+    args: Vec<String>,
+    cwd: String,
+    timeout_seconds: u64,
+    success_exit_codes: Vec<i32>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Default)]
+#[serde(default, rename_all = "camelCase")]
+struct UpdateRestartCommand {
+    program: String,
+    args: Vec<String>,
+    cwd: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Default)]
+#[serde(default, rename_all = "camelCase")]
+struct UpdateInstallPlan {
+    marker: String,
+    schema_version: u32,
+    version: String,
+    build_id: String,
+    artifact_path: String,
+    artifact_sha256: String,
+    wait_pids: Vec<u32>,
+    wait_timeout_seconds: u64,
+    restart_delay_seconds: f64,
+    install: UpdateInstallCommand,
+    restart: UpdateRestartCommand,
+    result_path: String,
+}
+
+fn update_file_sha256(path: &std::path::Path) -> Result<String, String> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+
+    let mut stream = std::fs::File::open(path).map_err(|error| error.to_string())?;
+    let mut digest = Sha256::new();
+    let mut buffer = vec![0_u8; 1024 * 1024];
+    loop {
+        let read = stream.read(&mut buffer).map_err(|error| error.to_string())?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+    }
+    Ok(format!("{:x}", digest.finalize()))
+}
+
+#[cfg(target_os = "windows")]
+fn update_pid_alive(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::{CloseHandle, WAIT_TIMEOUT};
+    use windows_sys::Win32::System::Threading::{OpenProcess, WaitForSingleObject};
+    const SYNCHRONIZE_ACCESS: u32 = 0x0010_0000;
+    unsafe {
+        let process = OpenProcess(SYNCHRONIZE_ACCESS, 0, pid);
+        if process.is_null() {
+            return false;
+        }
+        let state = WaitForSingleObject(process, 0);
+        let _ = CloseHandle(process);
+        state == WAIT_TIMEOUT
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn update_pid_alive(pid: u32) -> bool {
+    let proc_path = PathBuf::from("/proc").join(pid.to_string());
+    if PathBuf::from("/proc").is_dir() {
+        return proc_path.exists();
+    }
+    std::process::Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+fn write_update_result(plan: &UpdateInstallPlan, ok: bool, error: &str, exit_code: i32) {
+    let path = PathBuf::from(&plan.result_path);
+    if path.as_os_str().is_empty() {
+        return;
+    }
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let payload = serde_json::json!({
+        "schemaVersion": 1,
+        "finishedAt": std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|value| value.as_secs_f64())
+            .unwrap_or(0.0),
+        "version": plan.version,
+        "buildId": plan.build_id,
+        "ok": ok,
+        "error": error,
+        "exitCode": exit_code,
+    });
+    let temporary = path.with_extension("json.tmp");
+    if std::fs::write(
+        &temporary,
+        serde_json::to_vec_pretty(&payload).unwrap_or_default(),
+    )
+    .is_ok()
+    {
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::rename(&temporary, &path);
+    }
+}
+
+/// Entry used by a copied AgentWithU executable before Tauri initializes.
+/// It intentionally performs no shell parsing: the signed/checksummed plan is
+/// an argv vector, so paths and arbitrary installer formats remain unambiguous.
+pub fn run_update_helper(plan_path: &str) -> i32 {
+    let result = (|| -> Result<i32, String> {
+        let raw = std::fs::read_to_string(plan_path).map_err(|error| error.to_string())?;
+        let plan: UpdateInstallPlan =
+            serde_json::from_str(&raw).map_err(|error| error.to_string())?;
+        if plan.marker != "agentwithu-update-plan-v1" || plan.schema_version != 1 {
+            return Err("untrusted update plan marker".into());
+        }
+        let artifact = PathBuf::from(&plan.artifact_path);
+        if !artifact.is_file() {
+            return Err(format!("staged artifact is missing: {}", artifact.display()));
+        }
+        let actual_hash = update_file_sha256(&artifact)?;
+        if plan.artifact_sha256.len() != 64
+            || !actual_hash.eq_ignore_ascii_case(&plan.artifact_sha256)
+        {
+            return Err("staged artifact SHA-256 mismatch".into());
+        }
+
+        let wait_deadline = std::time::Instant::now()
+            + std::time::Duration::from_secs(plan.wait_timeout_seconds.clamp(1, 600));
+        loop {
+            let pending = plan
+                .wait_pids
+                .iter()
+                .copied()
+                .filter(|pid| *pid != std::process::id() && update_pid_alive(*pid))
+                .collect::<Vec<_>>();
+            if pending.is_empty() {
+                break;
+            }
+            if std::time::Instant::now() >= wait_deadline {
+                return Err(format!("timed out waiting for processes: {pending:?}"));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(250));
+        }
+
+        if plan.install.program.trim().is_empty() {
+            return Err("installation program is missing".into());
+        }
+        let mut command = std::process::Command::new(&plan.install.program);
+        command.args(&plan.install.args);
+        if !plan.install.cwd.trim().is_empty() {
+            command.current_dir(&plan.install.cwd);
+        }
+        command
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        let mut child = command.spawn().map_err(|error| error.to_string())?;
+        let install_deadline = std::time::Instant::now()
+            + std::time::Duration::from_secs(plan.install.timeout_seconds.clamp(30, 6 * 3600));
+        let exit_code = loop {
+            match child.try_wait().map_err(|error| error.to_string())? {
+                Some(status) => break status.code().unwrap_or(-1),
+                None if std::time::Instant::now() < install_deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(300));
+                }
+                None => {
+                    let _ = child.kill();
+                    return Err("installer timed out".into());
+                }
+            }
+        };
+        let accepted = if plan.install.success_exit_codes.is_empty() {
+            vec![0]
+        } else {
+            plan.install.success_exit_codes.clone()
+        };
+        if !accepted.contains(&exit_code) {
+            return Err(format!("installer exited with code {exit_code}"));
+        }
+        write_update_result(&plan, true, "", exit_code);
+        std::thread::sleep(std::time::Duration::from_secs_f64(
+            plan.restart_delay_seconds.clamp(0.0, 30.0),
+        ));
+        if !plan.restart.program.trim().is_empty() {
+            let mut restart = std::process::Command::new(&plan.restart.program);
+            restart.args(&plan.restart.args);
+            if !plan.restart.cwd.trim().is_empty() {
+                restart.current_dir(&plan.restart.cwd);
+            }
+            restart
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
+            #[cfg(target_os = "windows")]
+            {
+                use std::os::windows::process::CommandExt;
+                restart.creation_flags(0x0000_0008 | 0x0000_0200 | 0x0800_0000);
+            }
+            let _ = restart.spawn();
+        }
+        Ok(0)
+    })();
+
+    match result {
+        Ok(code) => code,
+        Err(error) => {
+            if let Ok(raw) = std::fs::read_to_string(plan_path) {
+                if let Ok(plan) = serde_json::from_str::<UpdateInstallPlan>(&raw) {
+                    write_update_result(&plan, false, &error, -1);
+                    // Keep the node reachable after a failed installer.  The
+                    // previous application is usually still intact, and the
+                    // persisted result will explain the failure after restart.
+                    if !plan.restart.program.trim().is_empty() {
+                        let mut restart = std::process::Command::new(&plan.restart.program);
+                        restart.args(&plan.restart.args);
+                        if !plan.restart.cwd.trim().is_empty() {
+                            restart.current_dir(&plan.restart.cwd);
+                        }
+                        restart
+                            .stdin(std::process::Stdio::null())
+                            .stdout(std::process::Stdio::null())
+                            .stderr(std::process::Stdio::null());
+                        #[cfg(target_os = "windows")]
+                        {
+                            use std::os::windows::process::CommandExt;
+                            restart.creation_flags(0x0000_0008 | 0x0000_0200 | 0x0800_0000);
+                        }
+                        let _ = restart.spawn();
+                    }
+                }
+            }
+            1
+        }
+    }
+}
+
+fn update_root() -> PathBuf {
+    // Keep this in lockstep with ``src.backend.paths.data_root``: an empty
+    // environment variable means "use the default", not a relative
+    // ``./updates`` directory selected by the mere presence of the variable.
+    if let Some(configured) = std::env::var_os("AGENT_WITH_U_DATA_ROOT") {
+        if !configured.to_string_lossy().trim().is_empty() {
+            return PathBuf::from(configured).join("updates");
+        }
+    }
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".agent-with-u")
+        .join("updates")
+}
+
+#[tauri::command]
+fn install_staged_update(app: tauri::AppHandle, plan_path: String) -> Result<(), String> {
+    let root = update_root();
+    let root = std::fs::canonicalize(&root).map_err(|error| error.to_string())?;
+    let plan_path = std::fs::canonicalize(PathBuf::from(plan_path))
+        .map_err(|error| error.to_string())?;
+    if !plan_path.starts_with(&root) || plan_path.file_name().and_then(|v| v.to_str()) != Some("install-plan.json") {
+        return Err("update plan is outside the managed update directory".into());
+    }
+    let raw = std::fs::read_to_string(&plan_path).map_err(|error| error.to_string())?;
+    let mut plan: UpdateInstallPlan =
+        serde_json::from_str(&raw).map_err(|error| error.to_string())?;
+    if plan.marker != "agentwithu-update-plan-v1" || plan.schema_version != 1 {
+        return Err("untrusted update plan marker".into());
+    }
+    let current_exe = std::env::current_exe().map_err(|error| error.to_string())?;
+    if plan.restart.program.trim().is_empty() {
+        plan.restart.program = current_exe.to_string_lossy().into_owned();
+    }
+    if !plan.wait_pids.contains(&std::process::id()) {
+        plan.wait_pids.push(std::process::id());
+    }
+    std::fs::write(
+        &plan_path,
+        serde_json::to_vec_pretty(&plan).map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| error.to_string())?;
+
+    // Windows locks a running executable, so the helper must be a copy outside
+    // the install directory. Unix permits replacing an executing file; using
+    // current_exe there also keeps AppImage/macOS runtime resources available.
+    #[cfg(target_os = "windows")]
+    let helper = {
+        let path = root.join("desktop-update-helper.exe");
+        std::fs::copy(&current_exe, &path).map_err(|error| error.to_string())?;
+        path
+    };
+    #[cfg(not(target_os = "windows"))]
+    let helper = current_exe.clone();
+    let mut command = std::process::Command::new(&helper);
+    command
+        .args(["--agentwithu-update-helper", &plan_path.to_string_lossy()])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const DETACHED_HELPER_FLAGS: u32 = 0x0000_0008 | 0x0000_0200 | 0x0800_0000;
+        const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
+
+        // Prefer escaping a launcher/job object so stopping the desktop/backend
+        // tree cannot kill the installer helper. Some managed Windows sessions
+        // forbid BREAKAWAY_FROM_JOB and return Access denied; retry without that
+        // optional flag instead of making one-click update unusable there.
+        command.creation_flags(DETACHED_HELPER_FLAGS | CREATE_BREAKAWAY_FROM_JOB);
+        if let Err(first_error) = command.spawn() {
+            command.creation_flags(DETACHED_HELPER_FLAGS);
+            command.spawn().map_err(|retry_error| {
+                format!(
+                    "cannot launch update helper (breakaway: {first_error}; fallback: {retry_error})"
+                )
+            })?;
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    command.spawn().map_err(|error| error.to_string())?;
+    quit_app_completely(&app);
+    Ok(())
+}
+
 #[tauri::command]
 fn get_ws_port() -> u16 {
     WS_PORT
@@ -378,10 +709,14 @@ fn open_screenshot_tool() -> Result<(), String> {
     use std::process::Command;
     #[cfg(target_os = "windows")]
     {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         // 注意:用 cmd /C start 触发 URI 协议处理器,不要直接 Command::new("explorer"),
-        // 后者在某些版本下会忽略 URI 参数。
+        // 后者在某些版本下会忽略 URI 参数。cmd 必须无窗口启动，否则后台
+        // 快捷键触发时会在全屏应用上方闪出一个黑框。
         let r = Command::new("cmd")
             .args(["/C", "start", "", "ms-screenclip:"])
+            .creation_flags(CREATE_NO_WINDOW)
             .spawn();
         return r.map(|_| ()).map_err(|e| e.to_string());
     }
@@ -1313,6 +1648,14 @@ pub fn run() {
                                     eprintln!("[tauri] cannot prepare local identity token: {e}");
                                 }
                             }
+                            sidecar = sidecar
+                                .env("AGENT_WITH_U_DESKTOP_PID", std::process::id().to_string());
+                            if let Ok(executable) = std::env::current_exe() {
+                                sidecar = sidecar.env(
+                                    "AGENT_WITH_U_DESKTOP_EXE",
+                                    executable.to_string_lossy().into_owned(),
+                                );
+                            }
                             // 受管执行节点模式才透传 Relay 主凭据；本地工作站仍
                             // 启动同一 sidecar，但不会出现在其他客户端的节点列表。
                             let relay_url = cfg.relay_url.trim();
@@ -1394,11 +1737,13 @@ pub fn run() {
             read_local_clipboard_image,
             hacker_mode::configure_hacker_monitor,
             hacker_mode::capture_hacker_screenshot,
+            hacker_mode::is_foreground_fullscreen_app,
             hacker_mode::update_smooth_ghost_state,
             hacker_mode::open_smooth_region_selector,
             hacker_mode::finish_smooth_region,
             get_desktop_config,
             set_desktop_config,
+            install_staged_update,
             dir_sync_scan,
             dir_sync_read_file,
             dir_sync_file_size,

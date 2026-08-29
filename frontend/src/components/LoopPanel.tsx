@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback, useRef } from 'react';
+import React, { useState, useEffect, useCallback, useContext, useRef } from 'react';
 import { api } from '../api';
 import { markdownToHtml } from '../utils/markdown';
 import { ImagePreview } from './ImagePreview';
@@ -7,6 +7,10 @@ import type { ImageAttachment } from './../hooks/useClipboardImage';
 import { LoopPolicyEditor, normalizePolicy } from './LoopPolicyEditor';
 import type { LoopPolicy } from './LoopPolicyEditor';
 import type { ModelRuntime } from './CodexRuntimeFields';
+import {
+  AdvancedPromptTextarea,
+  type AdvancedPromptTextareaProps,
+} from './AdvancedPromptTextarea';
 
 /**
  * LoopPanel — 可视化 Loop 集成的全屏面板。
@@ -122,10 +126,30 @@ export interface LoopPanelProps {
   sessionBackendId?: string;
   sessionRuntime?: ModelRuntime;
   backends?: any[];
+  workingDir?: string;
+  execKey?: string;
 }
+
+interface LoopPromptContextValue {
+  sessionId: string;
+  workingDir?: string;
+  execKey?: string;
+}
+
+const LoopPromptContext = React.createContext<LoopPromptContextValue>({ sessionId: '' });
+type LoopPromptTextareaProps = Omit<
+  AdvancedPromptTextareaProps,
+  'sessionId' | 'workingDir' | 'execKey'
+>;
+
+const LoopPromptTextarea: React.FC<LoopPromptTextareaProps> = (props) => {
+  const context = useContext(LoopPromptContext);
+  return <AdvancedPromptTextarea {...context} {...props} />;
+};
 
 export const LoopPanel: React.FC<LoopPanelProps> = ({
   sessionId, onClose, embedded, inspectOnly = false, sessionBackendId, sessionRuntime, backends,
+  workingDir, execKey,
 }) => {
   const [state, setState] = useState<LoopStateT | null>(null);
   const [selectedSeq, setSelectedSeq] = useState<number | null>(null);
@@ -353,20 +377,21 @@ export const LoopPanel: React.FC<LoopPanelProps> = ({
   }
 
   return wrap(
-    <>
-      <Header stage={stateForView.stage}
-        asideOpen={asideOpen} setAsideOpen={setAsideOpen} asideCount={stateForView.asides?.length || 0}
-        onClose={onClose} embedded={embedded} inspectOnly={inspectOnly}
-        viewMode={viewMode} setViewMode={setViewMode} canFlow={stateForView.stage !== 'loopidea'} />
-      <StageRail stage={stateForView.stage} />
-      {inspectOnly && (
-        <div style={{
-          flexShrink: 0, padding: '7px 18px', fontSize: 12,
-          color: '#d29922', background: '#d2992214', borderBottom: '1px solid #d2992244',
-        }}>
-          ✋ 人工接管中 · 当前为只读 LOOP 总览，可切换面板 / 流程；返回聊天后继续人工操作。
-        </div>
-      )}
+    <LoopPromptContext.Provider value={{ sessionId, workingDir, execKey }}>
+      <>
+        <Header stage={stateForView.stage}
+          asideOpen={asideOpen} setAsideOpen={setAsideOpen} asideCount={stateForView.asides?.length || 0}
+          onClose={onClose} embedded={embedded} inspectOnly={inspectOnly}
+          viewMode={viewMode} setViewMode={setViewMode} canFlow={stateForView.stage !== 'loopidea'} />
+        <StageRail stage={stateForView.stage} />
+        {inspectOnly && (
+          <div style={{
+            flexShrink: 0, padding: '7px 18px', fontSize: 12,
+            color: '#d29922', background: '#d2992214', borderBottom: '1px solid #d2992244',
+          }}>
+            ✋ 人工接管中 · 当前为只读 LOOP 总览，可切换面板 / 流程；返回聊天后继续人工操作。
+          </div>
+        )}
 
         <div style={{ flex: 1, display: 'flex', minHeight: 0, position: 'relative' }}>
           <div style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
@@ -430,7 +455,8 @@ export const LoopPanel: React.FC<LoopPanelProps> = ({
             />
           )}
         </div>
-    </>
+      </>
+    </LoopPromptContext.Provider>
   );
 };
 
@@ -629,14 +655,15 @@ const AsideDrawer: React.FC<{
       <div style={{ padding: 10, borderTop: '1px solid var(--theme-border)' }}>
         {images.length > 0 && <ImagePreview images={images} onRemove={removeImage} />}
         <div style={{ display: 'flex', gap: 6, alignItems: 'flex-end' }}>
-          <textarea
-            ref={inputRef}
+          <LoopPromptTextarea
+            textareaRef={inputRef}
             value={input}
-            onChange={(e) => setInput(e.target.value)}
+            onValueChange={setInput}
             onKeyDown={(e) => { if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') handleSend(); }}
-            placeholder={answering ? '上一条回答中…' : '顺便问一句…（可粘贴/插入图片，Ctrl/Cmd+Enter）'}
+            placeholder={answering ? '上一条回答中…' : '顺便问一句…（@ 引用文件/SESSION，可贴图，Ctrl/Cmd+Enter）'}
             disabled={answering}
-            style={{ ...inputBase, flex: 1, minHeight: 40, maxHeight: 120, resize: 'vertical', opacity: answering ? 0.6 : 1 }}
+            containerStyle={{ flex: 1 }}
+            style={{ ...inputBase, width: '100%', minHeight: 40, maxHeight: 120, resize: 'vertical', opacity: answering ? 0.6 : 1 }}
           />
           <button onClick={handleSend} disabled={answering || (!input.trim() && images.length === 0)} style={{ ...primaryBtn, padding: '8px 12px', opacity: (answering || (!input.trim() && images.length === 0)) ? 0.5 : 1 }}>发送</button>
         </div>
@@ -738,13 +765,14 @@ const IdeaStage: React.FC<{
 
       {images.length > 0 && <ImagePreview images={images} onRemove={removeImage} />}
       <div style={{ display: 'flex', gap: 8, marginBottom: 16, alignItems: 'flex-end' }}>
-        <textarea
-          ref={inputRef}
+        <LoopPromptTextarea
+          textareaRef={inputRef}
           value={ideaInput}
-          onChange={(e) => setIdeaInput(e.target.value)}
+          onValueChange={setIdeaInput}
           onKeyDown={(e) => { if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') submit(); }}
-          placeholder="一条想法/方向…（可粘贴图片，Ctrl/Cmd+Enter 投递）"
-          style={{ ...inputBase, minHeight: 56, resize: 'vertical', flex: 1 }}
+          placeholder="一条想法/方向…（@ 引用文件/SESSION，可贴图，Ctrl/Cmd+Enter）"
+          containerStyle={{ flex: 1 }}
+          style={{ ...inputBase, width: '100%', minHeight: 56, resize: 'vertical' }}
         />
         <button onClick={submit} disabled={!ideaInput.trim() && images.length === 0}
           style={{ ...primaryBtn, opacity: (ideaInput.trim() || images.length) ? 1 : 0.5 }}>投递</button>
@@ -779,11 +807,12 @@ const IdeaStage: React.FC<{
 
       <div style={sealBox}>
         <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--theme-text)', marginBottom: 8 }}>封口 → 形成全局目标</div>
-        <textarea
+        <LoopPromptTextarea
           value={goalDraft}
-          onChange={(e) => setGoalDraft(e.target.value)}
-          placeholder="可选：直接写全局目标。留空则封口后由模型把想法收敛成目标。"
-          style={{ ...inputBase, minHeight: 60, resize: 'vertical', width: '100%', marginBottom: 10 }}
+          onValueChange={setGoalDraft}
+          placeholder="可选：直接写全局目标；支持 @ 文件/SESSION。留空则由模型收敛。"
+          containerStyle={{ width: '100%', marginBottom: 10 }}
+          style={{ ...inputBase, minHeight: 60, resize: 'vertical', width: '100%' }}
         />
         <button onClick={onSeal} disabled={busy} style={{ ...primaryBtn, background: '#bf8700' }}>
           🔒 封口并进入 loopexecute
@@ -822,13 +851,14 @@ const AddonPanel: React.FC<{
       </div>
       {images.length > 0 && <ImagePreview images={images} onRemove={removeImage} />}
       <div style={{ display: 'flex', gap: 8, marginBottom: pending.length ? 12 : 0, alignItems: 'flex-end' }}>
-        <textarea
-          ref={inputRef}
+        <LoopPromptTextarea
+          textareaRef={inputRef}
           value={text}
-          onChange={(e) => setText(e.target.value)}
+          onValueChange={setText}
           onKeyDown={(e) => { if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') submit(); }}
-          placeholder="补充一条要求 / 修正…（可粘贴图片，Ctrl/Cmd+Enter 添加）"
-          style={{ ...inputBase, flex: 1, minHeight: 56, maxHeight: 160, resize: 'vertical', lineHeight: 1.5 }}
+          placeholder="补充要求 / 修正…（@ 引用文件/SESSION，可贴图，Ctrl/Cmd+Enter）"
+          containerStyle={{ flex: 1 }}
+          style={{ ...inputBase, width: '100%', minHeight: 56, maxHeight: 160, resize: 'vertical', lineHeight: 1.5 }}
         />
         <button onClick={submit} disabled={!text.trim() && images.length === 0}
           style={{ ...primaryBtn, padding: '8px 14px', opacity: (text.trim() || images.length) ? 1 : 0.5 }}>＋ 添加</button>
@@ -892,13 +922,14 @@ const AddonItem: React.FC<{
           </div>
         )}
         {newImgs.length > 0 && <ImagePreview images={newImgs} onRemove={removeImage} />}
-        <textarea
-          ref={editRef}
+        <LoopPromptTextarea
+          textareaRef={editRef}
           value={text}
-          onChange={(e) => setText(e.target.value)}
+          onValueChange={setText}
           onKeyDown={(e) => { if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') save(); }}
-          placeholder="编辑补充内容…（可粘贴图片，Ctrl/Cmd+Enter 保存）"
+          placeholder="编辑补充…（@ 引用文件/SESSION，可贴图，Ctrl/Cmd+Enter）"
           autoFocus
+          containerStyle={{ width: '100%' }}
           style={{ ...inputBase, width: '100%', minHeight: 54, maxHeight: 160, resize: 'vertical', lineHeight: 1.5 }}
         />
         <div style={{ display: 'flex', gap: 8, marginTop: 8 }}>
@@ -1023,10 +1054,11 @@ const LoopOutBanner: React.FC<{
         ) : (
           <>
             {editing ? (
-              <textarea
-                value={goal} onChange={(e) => setGoal(e.target.value)}
-                placeholder="新一轮的目标（默认沿用上一轮目标，可在此修改 / 追加新任务）"
-                style={{ ...inputBase, width: '100%', minHeight: 64, resize: 'vertical', marginBottom: 10 }}
+              <LoopPromptTextarea
+                value={goal} onValueChange={setGoal}
+                placeholder="新一轮目标（支持 @ 文件/SESSION；默认沿用上一轮，可修改或追加）"
+                containerStyle={{ width: '100%', marginBottom: 10 }}
+                style={{ ...inputBase, width: '100%', minHeight: 64, resize: 'vertical' }}
               />
             ) : (
               <div
@@ -1168,9 +1200,10 @@ const RefineBox: React.FC<{
       <div style={{ fontSize: 11.5, color: 'var(--theme-text-muted)', marginBottom: 6, lineHeight: 1.5 }}>
         给一句提示，由模型在「当前目标 + 原始诉求」基础上自动改写。支持贴图（Snipaste/粘贴）作为参考。每次微调都会留一版历史。
       </div>
-      <textarea ref={refineRef} autoFocus value={hint} onChange={(e) => setHint(e.target.value)} disabled={refining}
+      <LoopPromptTextarea textareaRef={refineRef} autoFocus value={hint} onValueChange={setHint} disabled={refining}
         onKeyDown={(e) => { if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') doRefine(); }}
-        placeholder="微调提示…（可贴图，Ctrl/Cmd+Enter 提交）"
+        placeholder="微调提示…（@ 引用文件/SESSION，可贴图，Ctrl/Cmd+Enter）"
+        containerStyle={{ width: '100%' }}
         style={{ ...inputBase, width: '100%', minHeight: 50, resize: 'vertical', opacity: refining ? 0.6 : 1 }} />
       <ImagePreview images={images} onRemove={removeImage} />
       <div style={{ display: 'flex', gap: 8, marginTop: 8 }}>
@@ -1222,7 +1255,8 @@ const GoalCard: React.FC<{
       {/* 手动编辑（兜底） */}
       {mode === 'edit' && !readOnly && (
         <div style={{ display: 'flex', gap: 8, marginTop: 10 }}>
-          <textarea value={goalDraft} onChange={(e) => setGoalDraft(e.target.value)} style={{ ...inputBase, flex: 1, minHeight: 54 }} />
+          <LoopPromptTextarea value={goalDraft} onValueChange={setGoalDraft}
+            containerStyle={{ flex: 1 }} style={{ ...inputBase, width: '100%', minHeight: 54 }} />
           <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
             <button onClick={() => { onSaveGoal(); setMode('view'); }} style={primaryBtn}>保存</button>
             <button onClick={() => setMode('view')} style={btn}>取消</button>

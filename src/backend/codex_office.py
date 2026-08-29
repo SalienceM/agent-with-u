@@ -284,7 +284,7 @@ class CodexOfficeBackend(ModelBackend):
 
         # 代理只作用于 Codex 子进程，不修改 AgentWithU 或 Windows 的全局网络设置。
         # 旧配置只有 HTTPS_PROXY 时视为 custom，避免升级后行为突变。
-        configured = self.config.env or {}
+        configured = self._configured_runtime_env()
         mode = str(configured.get("AGENTWITHU_CODEX_PROXY_MODE") or "").strip().lower()
         raw_proxy = (
             configured.get("AGENTWITHU_CODEX_PROXY")
@@ -330,6 +330,31 @@ class CodexOfficeBackend(ModelBackend):
         env.setdefault("NO_COLOR", "1")
         return env
 
+    def _configured_runtime_env(self) -> dict[str, str]:
+        """Merge process-level Codex policy with per-Backend overrides.
+
+        Docker deployments set the dedicated ``AGENTWITHU_CODEX_*`` variables
+        at container runtime.  Historically only values copied into each
+        Backend config were inspected, so the CLI inherited generic proxy
+        variables but missed the custom/force-HTTP policy.  Explicit Backend
+        values still win and ordinary host ``HTTP_PROXY`` remains inherit-only.
+        """
+        configured = {
+            key: str(os.environ[key])
+            for key in (
+                "AGENTWITHU_CODEX_PROXY_MODE",
+                "AGENTWITHU_CODEX_PROXY",
+                "AGENTWITHU_CODEX_NO_PROXY",
+                "AGENTWITHU_CODEX_FORCE_HTTP",
+            )
+            if os.environ.get(key) is not None
+        }
+        configured.update({
+            key: str(value) for key, value in (self.config.env or {}).items()
+            if value is not None
+        })
+        return configured
+
     def _native_resume_enabled(self) -> bool:
         """Use Codex native threads unless explicitly disabled.
 
@@ -347,7 +372,7 @@ class CodexOfficeBackend(ModelBackend):
 
     def _network_summary(self) -> str:
         """Return a credential-free summary for startup diagnostics."""
-        configured = self.config.env or {}
+        configured = self._configured_runtime_env()
         mode = str(configured.get("AGENTWITHU_CODEX_PROXY_MODE") or "").strip().lower()
         proxy = _normalize_proxy_url(
             configured.get("AGENTWITHU_CODEX_PROXY")
@@ -372,7 +397,7 @@ class CodexOfficeBackend(ModelBackend):
 
     def _force_http_enabled(self) -> bool:
         """Prefer HTTP/SSE when the selected proxy path is unreliable for WSS."""
-        configured = self.config.env or {}
+        configured = self._configured_runtime_env()
         explicit = configured.get("AGENTWITHU_CODEX_FORCE_HTTP")
         if explicit is not None and str(explicit).strip():
             return str(explicit).strip().lower() not in {"0", "false", "no", "off"}
@@ -384,7 +409,7 @@ class CodexOfficeBackend(ModelBackend):
         """Build one-run config for a non-reserved, HTTP-only Codex provider."""
         if not self._force_http_enabled():
             return []
-        configured = self.config.env or {}
+        configured = self._configured_runtime_env()
         has_api_key = bool(self.config.api_key or configured.get("OPENAI_API_KEY"))
         base_url = str(
             self.config.base_url
@@ -409,11 +434,11 @@ class CodexOfficeBackend(ModelBackend):
         return args
 
     def _system_proxy_enabled(self) -> bool:
-        configured = self.config.env or {}
+        configured = self._configured_runtime_env()
         return str(configured.get("AGENTWITHU_CODEX_PROXY_MODE") or "").strip().lower() == "system"
 
     def _proxy_config_error(self) -> Optional[str]:
-        configured = self.config.env or {}
+        configured = self._configured_runtime_env()
         mode = str(configured.get("AGENTWITHU_CODEX_PROXY_MODE") or "").strip().lower()
         if mode != "custom":
             return None

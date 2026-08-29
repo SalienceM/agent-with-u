@@ -101,11 +101,12 @@ mod platform {
     };
     use windows_sys::Win32::Graphics::Gdi::{
         BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateSolidBrush, DeleteDC,
-        DeleteObject, DrawTextW, EndPaint, FillRect, FrameRect, GetDC, GetDIBits, GetStockObject,
-        IntersectClipRect, InvalidateRect, ReleaseDC, RestoreDC, SaveDC, SelectObject, SetBkMode,
-        SetTextColor, UpdateWindow, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, CAPTUREBLT,
-        DEFAULT_GUI_FONT, DIB_RGB_COLORS, DT_CALCRECT, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX,
-        DT_SINGLELINE, DT_TOP, DT_VCENTER, DT_WORDBREAK, HBRUSH, PAINTSTRUCT, SRCCOPY, TRANSPARENT,
+        DeleteObject, DrawTextW, EndPaint, FillRect, FrameRect, GetDC, GetDIBits, GetMonitorInfoW,
+        GetStockObject, IntersectClipRect, InvalidateRect, MonitorFromWindow, ReleaseDC, RestoreDC,
+        SaveDC, SelectObject, SetBkMode, SetTextColor, UpdateWindow, BITMAPINFO, BITMAPINFOHEADER,
+        BI_RGB, CAPTUREBLT, DEFAULT_GUI_FONT, DIB_RGB_COLORS, DT_CALCRECT, DT_END_ELLIPSIS,
+        DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_TOP, DT_VCENTER, DT_WORDBREAK, HBRUSH, MONITORINFO,
+        MONITOR_DEFAULTTONEAREST, PAINTSTRUCT, SRCCOPY, TRANSPARENT,
     };
     use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
@@ -113,18 +114,18 @@ mod platform {
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         CallNextHookEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
-        GetClientRect, GetMessageW, GetSystemMetrics, GetWindowLongPtrW, GetWindowRect, IsWindow,
-        IsWindowVisible, LoadCursorW, PostQuitMessage, RegisterClassW, SetForegroundWindow,
-        SetLayeredWindowAttributes, SetWindowLongPtrW, SetWindowPos, SetWindowTextW,
-        SetWindowsHookExW, ShowWindow, TranslateMessage, CREATESTRUCTW, GWLP_USERDATA,
-        HTTRANSPARENT, HWND_TOPMOST, IDC_ARROW, IDC_SIZEALL, LWA_ALPHA, MA_NOACTIVATE, MSG,
-        MSLLHOOKSTRUCT, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
-        SM_YVIRTUALSCREEN, SWP_NOACTIVATE, SWP_SHOWWINDOW, SW_HIDE, SW_SHOWNOACTIVATE,
-        SW_SHOWNORMAL, WH_MOUSE_LL, WM_CLOSE, WM_DESTROY, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP,
-        WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEWHEEL, WM_MOVE, WM_NCCREATE,
-        WM_NCHITTEST, WM_PAINT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SIZE, WNDCLASSW, WS_CAPTION,
-        WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT,
-        WS_POPUP, WS_SYSMENU, WS_THICKFRAME,
+        GetClientRect, GetForegroundWindow, GetMessageW, GetSystemMetrics, GetWindowLongPtrW,
+        GetWindowRect, IsIconic, IsWindow, IsWindowVisible, LoadCursorW, PostQuitMessage,
+        RegisterClassW, SetForegroundWindow, SetLayeredWindowAttributes, SetWindowLongPtrW,
+        SetWindowPos, SetWindowTextW, SetWindowsHookExW, ShowWindow, TranslateMessage,
+        CREATESTRUCTW, GWLP_USERDATA, HTTRANSPARENT, HWND_TOPMOST, IDC_ARROW, IDC_SIZEALL,
+        LWA_ALPHA, MA_NOACTIVATE, MSG, MSLLHOOKSTRUCT, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN,
+        SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SWP_NOACTIVATE, SWP_SHOWWINDOW, SW_HIDE,
+        SW_SHOWNOACTIVATE, SW_SHOWNORMAL, WH_MOUSE_LL, WM_CLOSE, WM_DESTROY, WM_KEYDOWN,
+        WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEACTIVATE,
+        WM_MOUSEWHEEL, WM_MOVE, WM_NCCREATE, WM_NCHITTEST, WM_PAINT, WM_RBUTTONDOWN, WM_RBUTTONUP,
+        WM_SIZE, WNDCLASSW, WS_CAPTION, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+        WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP, WS_SYSMENU, WS_THICKFRAME,
     };
 
     struct MonitorState {
@@ -202,6 +203,38 @@ mod platform {
         STATE.get_or_init(|| Mutex::new(MonitorState::default()))
     }
 
+    fn rect_covers_monitor(window: &RECT, monitor: &RECT) -> bool {
+        // Borderless games can extend a couple of pixels beyond the monitor
+        // bounds because of DPI rounding or invisible resize borders.
+        const TOLERANCE: i32 = 3;
+        window.left <= monitor.left + TOLERANCE
+            && window.top <= monitor.top + TOLERANCE
+            && window.right >= monitor.right - TOLERANCE
+            && window.bottom >= monitor.bottom - TOLERANCE
+    }
+
+    pub fn foreground_app_is_fullscreen() -> bool {
+        unsafe {
+            let hwnd = GetForegroundWindow();
+            if hwnd.is_null() || IsWindowVisible(hwnd) == 0 || IsIconic(hwnd) != 0 {
+                return false;
+            }
+            let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+            if monitor.is_null() {
+                return false;
+            }
+            let mut window_rect: RECT = zeroed();
+            let mut monitor_info: MONITORINFO = zeroed();
+            monitor_info.cbSize = size_of::<MONITORINFO>() as u32;
+            if GetWindowRect(hwnd, &mut window_rect) == 0
+                || GetMonitorInfoW(monitor, &mut monitor_info) == 0
+            {
+                return false;
+            }
+            rect_covers_monitor(&window_rect, &monitor_info.rcMonitor)
+        }
+    }
+
     fn button_messages(button: &str) -> (u32, u32) {
         match button {
             "left" => (WM_LBUTTONDOWN, WM_LBUTTONUP),
@@ -273,33 +306,42 @@ mod platform {
         let mut trigger = None;
         if let Ok(mut guard) = state().try_lock() {
             if guard.config.enabled {
-                let now = Instant::now();
+                let (configured_down, configured_up) = button_messages(&guard.config.mouse_button);
                 let left_shift_down = (GetAsyncKeyState(VK_LSHIFT as i32) as u16 & 0x8000) != 0;
                 let ctrl_down = (GetAsyncKeyState(VK_CONTROL as i32) as u16 & 0x8000) != 0;
+                let is_gesture_mouse_event = (left_shift_down
+                    && (message == WM_LBUTTONDOWN || message == WM_LBUTTONUP))
+                    || (ctrl_down && (message == configured_down || message == configured_up));
 
-                if left_shift_down && (message == WM_LBUTTONDOWN || message == WM_LBUTTONUP) {
-                    suppress = true;
-                    if message == WM_LBUTTONDOWN {
-                        diagnostic = Some(SmoothTrigger::LeftShiftClickSeen);
-                        let is_double = guard
-                            .last_panel_down
-                            .map(|last| now.duration_since(last) <= Duration::from_millis(450))
-                            .unwrap_or(false);
-                        guard.last_panel_down = if is_double { None } else { Some(now) };
-                        let cooled = guard
-                            .last_panel_action
-                            .map(|last| now.duration_since(last) >= Duration::from_millis(650))
-                            .unwrap_or(true);
-                        if is_double && cooled {
-                            guard.last_panel_action = Some(now);
-                            trigger = Some(SmoothTrigger::ToggleGhost);
-                        }
-                    }
-                } else if ctrl_down {
-                    let (down, up) = button_messages(&guard.config.mouse_button);
-                    if message == down || message == up {
+                // Smooth is deliberately global, but it must never steal clicks
+                // or open overlays while a game/video/presentation owns a monitor.
+                if is_gesture_mouse_event && foreground_app_is_fullscreen() {
+                    guard.last_down = None;
+                    guard.last_panel_down = None;
+                } else {
+                    let now = Instant::now();
+                    if left_shift_down && (message == WM_LBUTTONDOWN || message == WM_LBUTTONUP) {
                         suppress = true;
-                        if message == down {
+                        if message == WM_LBUTTONDOWN {
+                            diagnostic = Some(SmoothTrigger::LeftShiftClickSeen);
+                            let is_double = guard
+                                .last_panel_down
+                                .map(|last| now.duration_since(last) <= Duration::from_millis(450))
+                                .unwrap_or(false);
+                            guard.last_panel_down = if is_double { None } else { Some(now) };
+                            let cooled = guard
+                                .last_panel_action
+                                .map(|last| now.duration_since(last) >= Duration::from_millis(650))
+                                .unwrap_or(true);
+                            if is_double && cooled {
+                                guard.last_panel_action = Some(now);
+                                trigger = Some(SmoothTrigger::ToggleGhost);
+                            }
+                        }
+                    } else if ctrl_down && (message == configured_down || message == configured_up)
+                    {
+                        suppress = true;
+                        if message == configured_down {
                             diagnostic = Some(SmoothTrigger::CtrlClickSeen);
                             let threshold = Duration::from_millis(
                                 guard.config.double_click_ms.clamp(180, 1000),
@@ -1353,6 +1395,34 @@ mod platform {
         }
 
         #[test]
+        fn fullscreen_guard_accepts_borderless_and_rejects_work_area_windows() {
+            let monitor = RECT {
+                left: 0,
+                top: 0,
+                right: 1920,
+                bottom: 1080,
+            };
+            assert!(rect_covers_monitor(
+                &RECT {
+                    left: -2,
+                    top: 0,
+                    right: 1922,
+                    bottom: 1080,
+                },
+                &monitor,
+            ));
+            assert!(!rect_covers_monitor(
+                &RECT {
+                    left: 0,
+                    top: 0,
+                    right: 1920,
+                    bottom: 1040,
+                },
+                &monitor,
+            ));
+        }
+
+        #[test]
         #[ignore = "opens a real Windows selector window"]
         fn native_selector_window_opens_and_closes() {
             let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
@@ -1473,6 +1543,9 @@ mod platform {
         Err("Smooth 区域选择器目前仅支持 Windows".into())
     }
     pub fn update_ghost_content(_content: SmoothGhostContent) {}
+    pub fn foreground_app_is_fullscreen() -> bool {
+        false
+    }
 }
 
 #[tauri::command]
@@ -1499,6 +1572,11 @@ pub fn capture_hacker_screenshot(config: HackerCaptureConfig) -> Result<HackerIm
             Err(error)
         }
     }
+}
+
+#[tauri::command]
+pub fn is_foreground_fullscreen_app() -> bool {
+    platform::foreground_app_is_fullscreen()
 }
 
 #[tauri::command]

@@ -10,11 +10,13 @@ import type { SeqTaskT } from './SeqTaskPanel';
 import { ByTheWayDrawer } from './ByTheWayDrawer';
 import { WorkspaceKitsPanel } from './WorkspaceKitsPanel';
 import { useChat } from '../hooks/useChat';
+import type { ChatMessage } from '../hooks/useChat';
 import type { AppConfig } from '../hooks/useConfig';
 import { HACKER_CAPTURE_EVENT } from '../utils/hackerMode';
 import type { SmoothGhostState } from '../utils/smoothGhost';
 import { normalizeModelRuntime, type ModelRuntime } from './CodexRuntimeFields';
 import type { TextAttachment } from '../types/attachments';
+import { buildMessageRedoPayload } from '../utils/messageRedo';
 
 function messageEpochMs(timestamp?: number): number {
   if (!timestamp || !Number.isFinite(timestamp)) return 0;
@@ -515,6 +517,18 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
     );
   }, [sessionId, setChain]);
 
+  // Redo 与输入框的默认投递规则保持一致：空闲时立即发送；当前正在回答或已有
+  // 队列时排到下一轮，不能因为点历史消息而意外中断正在生成的内容。
+  const handleRedoMessage = useCallback((message: ChatMessage) => {
+    const payload = buildMessageRedoPayload(message);
+    if (!payload) return;
+    if ((isStreamingRef.current || seqPendingRef.current) && sessionId) {
+      handleQueueTask(payload.content, payload.images, payload.textAttachments);
+      return;
+    }
+    void handleUserSend(payload.content, payload.images, payload.textAttachments);
+  }, [handleQueueTask, handleUserSend, sessionId]);
+
   const handleSteerSeqTask = useCallback(async (
     taskId: string,
   ): Promise<{ status: string; message?: string }> => {
@@ -722,6 +736,8 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
             reasoningEffort: activeSession?.reasoningEffort,
           }}
           backends={effectiveBackends}
+          workingDir={activeSession?.workingDir}
+          execKey={activeSession?.execKey}
         />
         {config.workspaceKitsEnabled && (
           <>
@@ -870,6 +886,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
                   ttsRate={config.ttsRate}
                   workingDir={activeSession?.workingDir}
                   onFocusFile={handleFocusLinkedFile}
+                  onRedoMessage={handleRedoMessage}
                 />
               </React.Fragment>
             );
@@ -1058,6 +1075,8 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
           >💬</button>
           <ByTheWayDrawer sessionId={sessionId} open={byTheWayOpen} onClose={() => setByTheWayOpen(false)}
             backends={effectiveBackends}
+            workingDir={activeSession?.workingDir}
+            execKey={activeSession?.execKey}
             onSendToChat={(text) => { if (!isStreamingRef.current) doSendRef.current(text); }} />
           {config.workspaceKitsEnabled && (
             <WorkspaceKitsPanel

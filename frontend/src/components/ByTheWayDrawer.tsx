@@ -2,6 +2,7 @@ import React, { useState, useRef, useEffect, useCallback } from 'react';
 import { api } from '../api';
 import { useClipboardImage } from '../hooks/useClipboardImage';
 import { markdownToHtml } from '../utils/markdown';
+import { AdvancedPromptTextarea } from './AdvancedPromptTextarea';
 
 // By the way（旁路问答，普通 session 版）：随手问，跑在独立 agent 上下文，
 // 带最近对话的只读摘要，不污染主对话、也不写进 transcript。
@@ -15,9 +16,19 @@ interface Props {
   onClose: () => void;
   onSendToChat?: (text: string) => void;
   backends?: any[];
+  workingDir?: string;
+  execKey?: string;
 }
 
-export const ByTheWayDrawer: React.FC<Props> = ({ sessionId, open, onClose, onSendToChat, backends = [] }) => {
+export const ByTheWayDrawer: React.FC<Props> = ({
+  sessionId,
+  open,
+  onClose,
+  onSendToChat,
+  backends = [],
+  workingDir,
+  execKey,
+}) => {
   const [asides, setAsides] = useState<AsideT[]>([]);
   const [live, setLive] = useState<Record<string, string>>({});
   const [draft, setDraft] = useState('');
@@ -165,11 +176,18 @@ export const ByTheWayDrawer: React.FC<Props> = ({ sessionId, open, onClose, onSe
             </div>
           )}
           <div style={{ display: 'flex', gap: 6, alignItems: 'flex-end' }}>
-            <textarea value={draft} placeholder="随手问… Enter 发送，Shift+Enter 换行，可粘贴图片"
-              onChange={(e) => setDraft(e.target.value)}
+            <AdvancedPromptTextarea
+              value={draft}
+              onValueChange={setDraft}
+              sessionId={sessionId}
+              workingDir={workingDir}
+              execKey={execKey}
+              placeholder="随手问… @ 引用文件/SESSION，Enter 发送，Shift+Enter 换行，可贴图"
               onPaste={readFromClipboard}
               onKeyDown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); ask(); } }}
-              style={inputArea} />
+              containerStyle={{ flex: 1 }}
+              style={{ ...inputArea, width: '100%' }}
+            />
             <button onClick={ask} disabled={busy || (!draft.trim() && images.length === 0)}
               style={{ ...askBtn, opacity: busy || (!draft.trim() && !images.length) ? 0.45 : 1 }}>
               {busy ? '…' : '问'}

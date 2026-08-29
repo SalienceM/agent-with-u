@@ -34,6 +34,9 @@ export async function notifyTaskCompletion(sessionTitle: string): Promise<void> 
   const label = clip(sessionTitle || '未命名 Session', 56);
   try {
     const { invoke } = await import('@tauri-apps/api/core');
+    // 游戏、视频或演示处于全屏时进入免打扰：完成状态仍正常记录，等用户
+    // 回到 AgentWithU 后查看，不在其它应用上方弹 Windows 通知。
+    if (await invoke<boolean>('is_foreground_fullscreen_app')) return;
     await invoke('show_task_completion_notification', {
       title: `任务已完成 · ${label}`,
       body: 'Agent 已完成本轮任务，返回 AgentWithU 查看结果。',

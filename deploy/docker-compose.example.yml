@@ -1,8 +1,9 @@
 # AgentWithU — Docker Compose 部署示例
 #
-# 两个容器，全部在镜像内构建，NAS 上无需装 node / 手动 build / 挂源码：
+# 三个容器，全部在镜像内构建，NAS 上无需装 node / 手动 build / 挂源码：
 #   awu-backend  Python 后端（WS 44321 + HTTP API 44322），不直接对外
 #   awu-web      多阶段构建：node 构建前端 → nginx 托管 + 路径分流
+#   awu-updater  无端口升级伴随容器，仅在受控请求下重建前两个服务
 #
 # awu-web 映射一个【宿主端口】，NPM 通过「NAS局域网IP : 该端口」路由进来。
 # 最外层由 nginx-proxy-manager (NPM) + Authelia 负责 TLS 和认证。
@@ -10,16 +11,41 @@
 # 用法（在仓库根目录）：
 #   docker compose -f deploy/docker-compose.example.yml up -d --build
 
+x-awu-build-proxy: &awu-build-proxy
+  HTTP_PROXY: "${AGENT_WITH_U_BUILD_PROXY-http://192.168.50.156:7890}"
+  HTTPS_PROXY: "${AGENT_WITH_U_BUILD_PROXY-http://192.168.50.156:7890}"
+  http_proxy: "${AGENT_WITH_U_BUILD_PROXY-http://192.168.50.156:7890}"
+  https_proxy: "${AGENT_WITH_U_BUILD_PROXY-http://192.168.50.156:7890}"
+
+x-awu-runtime-proxy: &awu-runtime-proxy
+  # 未设置时使用当前部署网络的默认代理；显式设为空字符串即可关闭。
+  HTTP_PROXY: "${AGENT_WITH_U_RUNTIME_PROXY-http://192.168.50.156:7890}"
+  HTTPS_PROXY: "${AGENT_WITH_U_RUNTIME_PROXY-http://192.168.50.156:7890}"
+  http_proxy: "${AGENT_WITH_U_RUNTIME_PROXY-http://192.168.50.156:7890}"
+  https_proxy: "${AGENT_WITH_U_RUNTIME_PROXY-http://192.168.50.156:7890}"
+  NO_PROXY: "${AGENT_WITH_U_NO_PROXY-localhost,127.0.0.1,::1,awu-backend,awu-web,awu-updater}"
+  no_proxy: "${AGENT_WITH_U_NO_PROXY-localhost,127.0.0.1,::1,awu-backend,awu-web,awu-updater}"
+  # Codex 子进程显式使用同一 HTTP/mixed 代理并避开不稳定的 WSS 路径。
+  AGENTWITHU_CODEX_PROXY_MODE: "${AGENTWITHU_CODEX_PROXY_MODE-custom}"
+  AGENTWITHU_CODEX_PROXY: "${AGENT_WITH_U_RUNTIME_PROXY-http://192.168.50.156:7890}"
+  AGENTWITHU_CODEX_NO_PROXY: "${AGENT_WITH_U_NO_PROXY-localhost,127.0.0.1,::1,awu-backend,awu-web,awu-updater}"
+  AGENTWITHU_CODEX_FORCE_HTTP: "${AGENTWITHU_CODEX_FORCE_HTTP-1}"
+
 services:
   awu-backend:
     build:
       context: ..
       dockerfile: deploy/Dockerfile
+      args:
+        <<: *awu-build-proxy
+        AGENT_WITH_U_BUILD_ID: "${AGENT_WITH_U_BUILD_ID-dev}"
+        AGENT_WITH_U_VERSION: "${AGENT_WITH_U_VERSION-dev}"
     image: agent-with-u-backend:latest
     container_name: awu-backend
     restart: unless-stopped
 
     environment:
+      <<: *awu-runtime-proxy
       # loopback 模式 + trusted_proxies：只放行 docker 内网（awu-web 容器）的
       # 连接，身份统一记为 "local"。单用户部署内网免鉴权，外网由最外层
       # NPM + Authelia 把关。如需按 Authelia 身份区分多用户，改成设置
@@ -27,6 +53,8 @@ services:
       AGENT_WITH_U_BIND: "0.0.0.0"        # 容器内绑 0.0.0.0，靠 docker 网络隔离
       AGENT_WITH_U_PORT: "44321"
       AGENT_WITH_U_DATA_ROOT: "/app/data"
+      AGENT_WITH_U_RUNTIME: "docker"
+      AGENT_WITH_U_DOCKER_UPDATER_DIR: "/app/data/docker-updater"
       # 信任来自 docker 网络的连接（awu-web 容器）
       AGENT_WITH_U_TRUSTED_PROXIES: "172.16.0.0/12"
       # Claude 凭据（可选）：在此直接给，或起来后在应用内 Backend Manager
@@ -38,6 +66,9 @@ services:
       # 数据目录 bind-mount 到宿主：sessions / skills / asset-pool / backends
       # 都落在 NAS 上，容器重建不丢数据。宿主目录不存在时 Docker 会自动创建。
       - /volume1/docker/agent-with-u/data:/app/data
+      # Codex 登录态、原生 thread 与 Claude 登录态随容器重建保留。
+      - /volume1/docker/agent-with-u/codex-config:/root/.codex
+      - /volume1/docker/agent-with-u/claude-config:/root/.claude
       # 可选：挂载宿主上已有的 Claude 配置目录。
       # 宿主必须确实存在该目录，否则容器起不来。按需取消注释并改成真实路径：
       # - /volume1/docker/agent-with-u/claude-config:/root/.claude:ro
@@ -53,6 +84,10 @@ services:
     build:
       context: ..
       dockerfile: deploy/Dockerfile.web
+      args:
+        <<: *awu-build-proxy
+        AGENT_WITH_U_BUILD_ID: "${AGENT_WITH_U_BUILD_ID-dev}"
+        AGENT_WITH_U_VERSION: "${AGENT_WITH_U_VERSION-dev}"
     image: agent-with-u-web:latest
     container_name: awu-web
     restart: unless-stopped
@@ -67,6 +102,38 @@ services:
 
     networks:
       - awu-internal      # 访问 awu-backend
+
+  # 专用 Docker 升级伴随容器：无端口、不运行 Agent，也不接受网络请求。
+  # Docker Socket 只给它；awu-backend 仅通过共享数据卷投递校验后的升级请求。
+  awu-updater:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.updater
+      args:
+        <<: *awu-build-proxy
+    image: agent-with-u-updater:latest
+    container_name: awu-updater
+    restart: unless-stopped
+    environment:
+      AGENT_WITH_U_DATA_ROOT: "/app/data"
+      AGENT_WITH_U_DOCKER_UPDATER_DIR: "/app/data/docker-updater"
+      AGENT_WITH_U_DOCKER_COMPOSE_FILE: "/workspace/deploy/docker-compose.example.yml"
+      AGENT_WITH_U_DOCKER_PROJECT_DIR: "/workspace"
+      # 留空时 updater 从现有 awu-backend 的 Compose label 自动识别，兼容
+      # 旧部署和用户自定义 project name。
+      AGENT_WITH_U_DOCKER_PROJECT_NAME: "${COMPOSE_PROJECT_NAME-}"
+      AGENT_WITH_U_BUILD_PROXY: "${AGENT_WITH_U_BUILD_PROXY-http://192.168.50.156:7890}"
+      AGENT_WITH_U_RUNTIME_PROXY: "${AGENT_WITH_U_RUNTIME_PROXY-http://192.168.50.156:7890}"
+      AGENT_WITH_U_NO_PROXY: "${AGENT_WITH_U_NO_PROXY-localhost,127.0.0.1,::1,awu-backend,awu-web,awu-updater}"
+      AGENTWITHU_CODEX_PROXY_MODE: "${AGENTWITHU_CODEX_PROXY_MODE-custom}"
+      AGENTWITHU_CODEX_FORCE_HTTP: "${AGENTWITHU_CODEX_FORCE_HTTP-1}"
+    volumes:
+      - /volume1/docker/agent-with-u/data:/app/data
+      - /var/run/docker.sock:/var/run/docker.sock
+      # 只读读取实际部署所用 Compose，保留用户自己的端口/卷/Relay 配置。
+      - ../:/workspace:ro
+    networks:
+      - awu-internal
 
 networks:
   awu-internal:

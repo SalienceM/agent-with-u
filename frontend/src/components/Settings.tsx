@@ -3,11 +3,11 @@ import type { AppConfig, ThemeType } from '../hooks/useConfig';
 import { themes } from '../hooks/useConfig';
 import {
   api, isTauri, getConnectionTarget, getRelayUserProfile,
-  updateRelayUserProfile, rememberRelayUserProfile,
+  updateRelayUserProfile, rememberRelayUserProfile, getCurrentUserProfile,
   type RelayUserProfile,
 } from '../api';
 import {
-  SCREENSHOT_HOTKEY_DEFAULT,
+  SCREENSHOT_HOTKEY_RECOMMENDED,
   buildAccelerator,
   displayAccelerator,
   isModifierOnly,
@@ -16,6 +16,11 @@ import {
 } from '../utils/hotkey';
 import { readHackerMode, writeHackerMode, type HackerModeConfig } from '../utils/hackerMode';
 import { base64ToArrayBuffer, systemSpeechRate } from '../utils/realtimeVoice';
+import { UpdateCenter } from './UpdateCenter';
+
+// 发布工作台只有维护者明确打开时才下载对应前端 chunk；普通用户的启动、聊天和
+// Settings 渲染都不会加载候选列表/manifest 预览代码。
+const LazyReleaseCenter = React.lazy(() => import('./ReleaseCenter'));
 
 const DASHSCOPE_REALTIME_DEFAULT = 'fun-asr-realtime-2026-02-28';
 const DASHSCOPE_FLASH_DEFAULT = 'fun-asr-flash-2026-06-15';
@@ -352,6 +357,14 @@ export const Settings: React.FC<SettingsProps> = ({
   const [legacyClaimRunning, setLegacyClaimRunning] = useState(false);
   const [legacyClaimError, setLegacyClaimError] = useState('');
   const [legacyClaimResult, setLegacyClaimResult] = useState<{ count: number; backupPath: string } | null>(null);
+  const releasePreferenceKey = (() => {
+    const profile = getCurrentUserProfile();
+    return `awu.releaseCenterEnabled.v1:${profile.mode}:${profile.userId}`;
+  })();
+  const [releaseToolsEnabled, setReleaseToolsEnabled] = useState(() => {
+    try { return localStorage.getItem(releasePreferenceKey) === 'true'; } catch { return false; }
+  });
+  const [releaseCenterOpen, setReleaseCenterOpen] = useState(false);
   const voicePreviewVersionRef = useRef(0);
   const voicePreviewAudioRef = useRef<HTMLAudioElement | null>(null);
   const voicePreviewUrlRef = useRef('');
@@ -404,6 +417,12 @@ export const Settings: React.FC<SettingsProps> = ({
   }, [activePage, isOpen, stopVoicePreview]);
 
   useEffect(() => () => stopVoicePreview(), [stopVoicePreview]);
+
+  useEffect(() => {
+    try { setReleaseToolsEnabled(localStorage.getItem(releasePreferenceKey) === 'true'); }
+    catch { setReleaseToolsEnabled(false); }
+    setReleaseCenterOpen(false);
+  }, [releasePreferenceKey]);
 
   useEffect(() => {
     if (!isOpen) return;
@@ -1544,6 +1563,44 @@ export const Settings: React.FC<SettingsProps> = ({
           </div>
         </div>}
 
+        {/* 发布工作台默认隐藏在折叠的维护者工具中，且开关只属于当前控制端用户。 */}
+        {activePage === 'system' && <details style={sectionStyle}>
+          <summary style={{
+            color: 'var(--theme-text)', fontSize: 12, fontWeight: 600, cursor: 'pointer', userSelect: 'none',
+          }}>维护者工具</summary>
+          <div style={{ marginTop: 11, paddingTop: 10, borderTop: '1px solid var(--theme-border)' }}>
+            <label style={{ ...labelStyle, display: 'flex', alignItems: 'flex-start', gap: 8, cursor: 'pointer' }}>
+              <input
+                type="checkbox"
+                checked={releaseToolsEnabled}
+                onChange={(event) => {
+                  const enabled = event.target.checked;
+                  setReleaseToolsEnabled(enabled);
+                  if (!enabled) setReleaseCenterOpen(false);
+                  try { localStorage.setItem(releasePreferenceKey, String(enabled)); } catch { /* */ }
+                }}
+                style={{ marginTop: 2, accentColor: 'var(--theme-accent)' }}
+              />
+              <span>
+                启用发布工作台（仅当前控制端用户）
+                <span style={{ display: 'block', marginTop: 4, color: 'var(--theme-text-muted)', fontSize: 10, fontWeight: 400, lineHeight: 1.5 }}>
+                  按需加载的独立窗口，用于选择候选安装包、比较 stable、冻结清单并正式发布；打包和 Workspace Kit 永远只登记候选。
+                </span>
+              </span>
+            </label>
+            {releaseToolsEnabled && (
+              <button type="button" onClick={() => setReleaseCenterOpen(true)} style={{
+                ...actionBtnStyle, marginTop: 10, background: 'var(--theme-accent-bg)', borderColor: 'var(--theme-accent)',
+              }}>
+                🚀 打开发布工作台
+              </button>
+            )}
+          </div>
+        </details>}
+
+        {/* 节点更新：单机一键更新 + Relay 跨节点批量更新 */}
+        {activePage === 'system' && <UpdateCenter />}
+
         {/* 数据导入导出 */}
         {activePage === 'system' && <div style={sectionStyle}>
           <label style={labelStyle}>Data Management</label>
@@ -1590,7 +1647,7 @@ export const Settings: React.FC<SettingsProps> = ({
               任务完成时显示 Windows 通知
             </label>
             <p style={{ fontSize: 11, color: 'var(--theme-text-muted)', margin: '6px 0 0', lineHeight: 1.5 }}>
-              仅在 AgentWithU 最小化、隐藏或未聚焦时提醒，窗口在前台时不打扰。
+              仅在 AgentWithU 最小化、隐藏或未聚焦时提醒；全屏游戏、视频或演示期间自动免打扰。
             </p>
           </div>
         )}
@@ -1605,11 +1662,11 @@ export const Settings: React.FC<SettingsProps> = ({
         {/* 截图全局快捷键(Tauri only) */}
         {activePage === 'desktop' && desktopRuntime && (
           <div style={sectionStyle}>
-            <label style={labelStyle}>Screenshot Hotkey</label>
+            <label style={labelStyle}>全局截图快捷键（默认关闭）</label>
             <ScreenshotHotkeySetting />
             <p style={{ fontSize: 11, color: 'var(--theme-text-muted)', marginTop: 6, margin: '6px 0 0 0' }}>
-              Triggers the system snip tool while AgentWithU is in the background.
-              Picked image lands in the focused pane's attachments.
+              显式设置后可在 AgentWithU 后台时调起系统截图；全屏游戏、视频或演示期间会自动暂停。
+              截图会加入当前焦点输入框的附件。
             </p>
           </div>
         )}
@@ -1743,6 +1800,14 @@ export const Settings: React.FC<SettingsProps> = ({
           displayName={userDraft.displayName || userDraft.username}
           onClose={() => setAvatarPreviewOpen(false)}
         />
+      )}
+      {releaseCenterOpen && releaseToolsEnabled && (
+        <React.Suspense fallback={<div style={{
+          position: 'fixed', inset: 0, zIndex: 1400, display: 'grid', placeItems: 'center',
+          background: 'rgba(2,6,12,.76)', color: 'var(--theme-text-muted)', fontSize: 12,
+        }}>正在加载发布工作台…</div>}>
+          <LazyReleaseCenter onClose={() => setReleaseCenterOpen(false)} />
+        </React.Suspense>
       )}
     </div>
   );
@@ -2001,7 +2066,7 @@ const HackerModeSetting: React.FC = () => {
           rows={2} style={{ ...inputStyle, width: '100%', boxSizing: 'border-box', resize: 'vertical', marginTop: 4 }} />
       </label>
       <div style={{ marginTop: 7, fontSize: 11, lineHeight: 1.5, color: 'var(--theme-text-muted)' }}>
-        截图：Ctrl + 双击左/右键。幽灵窗口：Smooth 开启后按左 Shift + 双击左键，在预设区域中央显示/隐藏当前问答；面板不会铺满选区，且置顶、鼠标穿透、不抢焦点。点击“预设区域”可用浮框拖动、缩放；模型忙碌时截图任务会静默排队。
+        截图：Ctrl + 双击左/右键。幽灵窗口：Smooth 开启后按左 Shift + 双击左键，在预设区域中央显示/隐藏当前问答；面板不会铺满选区，且置顶、鼠标穿透、不抢焦点。全屏游戏、视频或演示期间，两种手势都会自动暂停且不会吞掉鼠标点击。点击“预设区域”可用浮框拖动、缩放；模型忙碌时截图任务会静默排队。
       </div>
     </div>
   );
@@ -2011,7 +2076,7 @@ const HackerModeSetting: React.FC = () => {
 //   - 显示当前 accelerator(人类友好形态);
 //   - 点「Change」进入捕获模式,任意键盘组合 → 立即写入;Esc 取消;
 //   - 「Disable」清空 → 禁用快捷键;
-//   - 「Default」一键回 CtrlOrCmd+Shift+A。
+//   - 「使用 Ctrl+Shift+A」显式启用推荐组合；新安装默认不注册全局热键。
 const ScreenshotHotkeySetting: React.FC = () => {
   const [hotkey, setHotkey] = useState(() => readScreenshotHotkey());
   const [capturing, setCapturing] = useState(false);
@@ -2052,9 +2117,9 @@ const ScreenshotHotkeySetting: React.FC = () => {
     setHotkey('');
     setError(null);
   };
-  const onDefault = () => {
-    writeScreenshotHotkey(SCREENSHOT_HOTKEY_DEFAULT);
-    setHotkey(SCREENSHOT_HOTKEY_DEFAULT);
+  const onRecommended = () => {
+    writeScreenshotHotkey(SCREENSHOT_HOTKEY_RECOMMENDED);
+    setHotkey(SCREENSHOT_HOTKEY_RECOMMENDED);
     setError(null);
   };
 
@@ -2080,7 +2145,7 @@ const ScreenshotHotkeySetting: React.FC = () => {
           {capturing ? 'Press keys…' : displayAccelerator(hotkey)}
         </button>
         <button onClick={onDisable} style={actionBtnStyle} disabled={!hotkey}>Disable</button>
-        <button onClick={onDefault} style={actionBtnStyle}>Default</button>
+        <button onClick={onRecommended} style={actionBtnStyle}>使用 Ctrl+Shift+A</button>
       </div>
       {error && (
         <div style={{

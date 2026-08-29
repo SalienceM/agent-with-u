@@ -97,6 +97,22 @@ class WorkspaceKitModelTests(unittest.TestCase):
         self.assertIn("缺少必填输入：名字", errors)
         self.assertIn("缺少数据依赖：build.output", errors)
 
+    def test_file_output_can_register_a_release_candidate_without_publishing(self):
+        kit = WorkspaceKit.from_dict({
+            "title": "Package",
+            "command": "echo ok",
+            "outputs": [{
+                "key": "installer", "source": "file", "type": "file",
+                "path": "dist/AgentWithU-setup.exe", "releaseCandidate": True,
+            }],
+        })
+
+        BridgeWS._normalize_generated_kit(kit)
+        restored = WorkspaceKit.from_dict(kit.to_dict())
+
+        self.assertTrue(restored.outputs[0]["releaseCandidate"])
+        self.assertNotIn("publish", restored.outputs[0])
+
 
 class WorkspaceKitVerdictTests(unittest.TestCase):
     def test_assertions_produce_independent_red_green_results(self):

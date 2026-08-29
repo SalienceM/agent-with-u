@@ -1,0 +1,52 @@
+{
+  "channel": "stable",
+  "baseUrl": "https://cdn.example.com",
+  "qiniuBucket": "your-qiniu-bucket",
+  "prefix": "agentwithu/releases",
+  "manifestKey": "agentwithu/releases/stable/manifest.json",
+  "notes": "本次更新说明",
+  "artifacts": [
+    {
+      "id": "windows-x86_64-msi",
+      "path": "../src-tauri/target/release/bundle/msi/AgentWithU_x64.msi",
+      "platform": "windows",
+      "arch": "x86_64",
+      "target": "desktop",
+      "kind": "msi"
+    },
+    {
+      "id": "windows-x86_64-nsis",
+      "path": "../dist/AgentWithU-setup.exe",
+      "platform": "windows",
+      "arch": "x86_64",
+      "target": "desktop",
+      "kind": "nsis"
+    },
+    {
+      "id": "linux-x86_64-docker",
+      "path": "../dist/agent-with-u-docker-linux-x86_64.tar",
+      "platform": "linux",
+      "arch": "x86_64",
+      "target": "docker",
+      "kind": "docker-bundle"
+    },
+    {
+      "id": "linux-x86_64-custom",
+      "path": "../dist/agent-with-u-web-linux-x64.tar.gz",
+      "platform": "linux",
+      "arch": "x86_64",
+      "target": "executor",
+      "kind": "custom",
+      "install": {
+        "program": "/usr/local/sbin/install-agentwithu-release",
+        "args": ["{artifact}"],
+        "successExitCodes": [0],
+        "timeoutSeconds": 1800,
+        "restart": {
+          "program": "systemctl",
+          "args": ["--user", "start", "agent-with-u"]
+        }
+      }
+    }
+  ]
+}

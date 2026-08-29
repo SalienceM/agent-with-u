@@ -1,0 +1,12 @@
+# AgentWithU Docker 节点的最小升级伴随容器。
+#
+# Docker Socket 只挂给本容器，不挂给会执行 Agent 命令的 awu-backend。
+# 它只加载经过更新中心校验的固定镜像包，并只重建 awu-backend / awu-web。
+FROM docker:27-cli
+
+RUN apk add --no-cache docker-cli-compose jq
+
+COPY deploy/docker-updater.sh /usr/local/bin/agentwithu-docker-updater
+RUN chmod 0755 /usr/local/bin/agentwithu-docker-updater
+
+ENTRYPOINT ["/usr/local/bin/agentwithu-docker-updater"]

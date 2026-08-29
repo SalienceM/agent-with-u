@@ -3,7 +3,10 @@
 // 事件通知 App.tsx 重新注册——这样不重启就能改键位。
 
 export const SCREENSHOT_HOTKEY_KEY = 'awu.screenshotHotkey';
-export const SCREENSHOT_HOTKEY_DEFAULT = 'CommandOrControl+Shift+A';
+// 全局快捷键会在游戏、IDE 等其它程序前台时同样生效。默认不注册，只有用户
+// 明确选择键位后才启用；推荐组合仍保留给设置页的一键配置按钮。
+export const SCREENSHOT_HOTKEY_DEFAULT = '';
+export const SCREENSHOT_HOTKEY_RECOMMENDED = 'CommandOrControl+Shift+A';
 export const HOTKEY_CHANGED_EVENT = 'awu:hotkey-config-changed';
 
 export function readScreenshotHotkey(): string {

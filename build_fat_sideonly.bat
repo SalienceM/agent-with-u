@@ -12,11 +12,9 @@ echo   跳过 Tauri 前端编译，节省时间和内存
 echo  =============================================
 echo.
 
-:: ── 版本号 ──────────────────────────────────────
-for /f %%a in ('powershell -NoProfile -Command "[int](Get-Date -Format yy)"') do set VER_YY=%%a
-for /f %%a in ('powershell -NoProfile -Command "(Get-Date).Month"') do set VER_MM=%%a
-for /f %%a in ('powershell -NoProfile -Command "(Get-Date).Day"') do set VER_DD=%%a
-set "VERSION=!VER_YY!.!VER_MM!.!VER_DD!"
+:: ── 版本号：sidecar-only 也是一次可识别发布 ────────────────────
+for /f "delims=" %%a in ('python scripts\stamp_version.py --field displayVersion') do set "VERSION=%%a"
+if errorlevel 1 ( echo [ERROR] Version stamping failed & pause & exit /b 1 )
 echo [INFO] Version: !VERSION!
 
 :: ============================================================
@@ -317,6 +315,9 @@ if exist "!OUTPUT_EXE!" (
         echo [WARN] Installer seems too small for a fat build!
     )
 )
+
+python scripts\register_release_candidate.py --project-root "%CD%" --source build_fat_sideonly
+if errorlevel 1 echo [WARN] Build succeeded, but release candidate registration failed. You can rescan in Release Center.
 
 echo.
 echo  =============================================

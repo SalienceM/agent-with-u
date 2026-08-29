@@ -224,6 +224,13 @@ persists optional `model_override` + `reasoning_effort` runtime knobs separately
 For `codex-office`, these become Codex CLI `--model` and
 `model_reasoning_effort` overrides; an empty value keeps the backend/Codex default.
 
+`DashScopeImageBackend` must never stream downloaded result images as inline Base64
+Markdown. It atomically stores result bytes under `paths.sub("skill-images")` and emits only
+the short `/api/skill-images/<uuid>` reference, which `MessageBubble` hydrates through the
+executor RPC even over Relay. `markdownToHtml` additionally extracts legacy inline data images
+before calling `marked` and catches parser failures; marked v9 overflows its call stack around an
+8MB data URI, so removing either boundary reintroduces an application-wide render crash.
+
 ### Codex native threads and SSH Remote
 
 Codex sessions may persist `Session.codex_connection_mode`: empty means the
@@ -602,6 +609,67 @@ Kit RPCs include `kitGenerate`, `kitGetState`, `kitCreate`, `kitUpdate`, `kitDel
 `kitSetControlMode`, `kitTerminalCommand`, `kitTerminalClose`, `kitVersionList`,
 `kitVersionGet`, `kitVersionActivate`, `kitOptimizeGet`, `kitOptimizeAsk`, and
 `kitOptimizeFinalize`.
+
+### Release Center (optional maintainer workbench)
+
+Release production is deliberately separate from node update consumption. The lazy-loaded
+`frontend/src/components/ReleaseCenter.tsx` workbench is hidden under
+`Settings → Data & System → Maintainer tools`; its per-controller-user toggle defaults off,
+so ordinary users do not load the chunk or see a permanent navigation item. Release RPCs
+are global/node-scoped rather than Session-scoped and share the fail-closed physical-device
+management capability used by `nodeUpdate*`: only a local client or that Relay device's
+primary user can call them. The workbench can target any connected executor.
+
+`src/backend/release_center.py` stores candidate builds, frozen plans, background jobs and
+history under `~/.agent-with-u/release-center/`. Build is never publish: Windows/Linux build
+scripts call `scripts/register_release_candidate.py` after successful packaging, and a Kit
+file output may set `releaseCandidate=true`; both paths only upsert a candidate. The UI lets
+the maintainer select artifacts, edit platform/install metadata, compare the current channel
+manifest, inspect SHA-256/size/object keys, and freeze a plan. Formal publish requires a
+second acknowledgement + confirmation, re-hashes every frozen file, then invokes an already
+authenticated `qshell` asynchronously. Immutable artifacts are uploaded first, the versioned
+manifest second, and the channel manifest strictly last. Closing the UI does not cancel the
+backend job. `AGENT_WITH_U_UPDATE_SIGNING_KEY` stays environment-only; Qiniu account secrets
+remain owned by qshell. The config tab can initialize/update that node-local qshell account via
+`releaseConfigureQiniuAccount`; AK/SK are one-shot masked inputs, never persisted or echoed by
+AgentWithU, and a missing account blocks preview and publish before a job starts. New credentials
+use qshell's `-L` workspace under `release-center/qshell-workspace` for both account setup and
+uploads, avoiding `os/user` failures in services/sidecars; a pre-existing system-user qshell
+account remains a fallback. Keep the legacy
+`scripts/publish_updates.py` CLI operational for
+automation/recovery. Detailed operator instructions live in `docs/release-center.md`.
+
+### Docker executor runtime and online updates
+
+`deploy/docker-compose.example.yml` is a three-service executor deployment:
+`awu-backend`, `awu-web`, and a no-port `awu-updater`. The backend image installs both
+`@anthropic-ai/claude-code` and `@openai/codex` by default. Host bind mounts persist
+`/root/.codex` and `/root/.claude`, so container recreation preserves CLI auth and native
+Codex threads. The Compose file injects a build/runtime proxy (the 156 deployment defaults
+to `http://192.168.50.156:7890`) plus internal `NO_PROXY`; dedicated
+`AGENTWITHU_CODEX_*` process variables are merged beneath per-Backend overrides so Codex
+gets the intended custom/force-HTTP behavior without copying settings into every Backend.
+
+Docker updates are image/container updates, never in-container file replacement.
+`UpdateManager` reports `runtime=docker`, requires a manifest artifact with
+`target=docker` and `kind=docker-bundle`, and after SHA-256 verification atomically writes
+an `agentwithu-docker-update-request-v1` under the shared data root. The executing backend
+must never receive `/var/run/docker.sock`. Only `awu-updater` mounts it; the sidecar has no
+network API, re-verifies the managed plan and bundle hash, loads only the fixed labelled
+`agent-with-u-backend:latest` and `agent-with-u-web:latest` images, and recreates only those
+two Compose services. It retains rollback tags until both the backend port and web HTTP
+health checks pass, restoring the old images on any failure. A heartbeat gates the UI/apply
+path so legacy deployments fail with a one-time-bootstrap instruction rather than stopping
+their current container. The updater resolves the Compose project from the running backend's
+`com.docker.compose.project` label unless explicitly configured, preserving old/custom project
+names during the one-time migration.
+
+`deploy/build-docker-release.{bat,sh}` exports both images as
+`dist/agent-with-u-docker-linux-<arch>.tar`; Release Center classifies the file without an
+arbitrary installer command. `build_all.bat` and `build_web_linux.sh` invoke this packaging
+when Docker is available unless `AGENT_WITH_U_SKIP_DOCKER_RELEASE=1`. Existing Docker nodes
+must manually rebuild once with the new Compose file to install Codex, proxy policy, and
+the updater; subsequent application releases can use Node Update Center.
 
 ### Normal-session side features (序列任务 + By the way)
 

@@ -28,6 +28,11 @@ ExecStart=/usr/bin/python3 -m src.ws_main
 Restart=on-failure
 RestartSec=3
 
+# 在线更新会在主进程退出前启动一个已校验的独立安装 helper。默认的
+# KillMode=control-group 会在主进程退出时连 helper 一起杀掉；这里只结束
+# MainPID，让 helper 完成原子安装后再按更新清单拉起新版本。
+KillMode=process
+
 # 加固（按需）
 NoNewPrivileges=true
 PrivateTmp=true

@@ -30,11 +30,14 @@ DashScopeImageBackend — 阿里云 DashScope 文生图（万象/Wan 系列 + Qw
 import sys
 import asyncio
 import base64
+import os
+import uuid
 from typing import Optional, Callable
 
 import httpx
 
 from ..types import ModelBackendConfig, ChatMessage, ImageAttachment
+from . import paths
 from .base import ModelBackend, StreamDelta, _exc_msg
 
 
@@ -85,6 +88,8 @@ class DashScopeImageBackend(ModelBackend):
     _POLL_REQUEST_TIMEOUT = 30.0
     _PROGRESS_INTERVAL = 30.0
     _SYNC_REQUEST_TIMEOUT = 360.0
+    _MAX_DOWNLOADED_IMAGE_BYTES = 64 * 1024 * 1024
+    _LOCAL_IMAGE_HTTP_PORT = 44322
 
     # ── 比例 → 具体尺寸映射 ──────────────────────────────────────────
     _RATIO_MAP = {
@@ -342,20 +347,51 @@ class DashScopeImageBackend(ModelBackend):
     async def _download_images(
         client: httpx.AsyncClient,
         image_urls: list[str],
-    ) -> list[tuple[str, Optional[str], Optional[str]]]:
-        """并行下载短期结果 URL，返回 (url, data_uri, error)。"""
-        async def one(url: str) -> tuple[str, Optional[str], Optional[str]]:
+    ) -> list[tuple[str, Optional[bytes], Optional[str], Optional[str]]]:
+        """并行下载短期结果 URL，返回 (url, bytes, mime, error)。"""
+        async def one(url: str) -> tuple[str, Optional[bytes], Optional[str], Optional[str]]:
             try:
                 response = await client.get(url, timeout=60.0)
                 if response.status_code != 200:
-                    return url, None, f"HTTP {response.status_code}"
+                    return url, None, None, f"HTTP {response.status_code}"
+                if not response.content:
+                    return url, None, None, "响应图片为空"
+                if len(response.content) > DashScopeImageBackend._MAX_DOWNLOADED_IMAGE_BYTES:
+                    return url, None, None, "图片超过 64MB 本地保存上限"
                 mime = response.headers.get("content-type", "image/png").split(";", 1)[0]
-                encoded = base64.b64encode(response.content).decode("ascii")
-                return url, f"data:{mime};base64,{encoded}", None
+                if not mime.startswith("image/"):
+                    mime = "image/png"
+                return url, response.content, mime, None
             except Exception as exc:
-                return url, None, _exc_msg(exc)
+                return url, None, None, _exc_msg(exc)
 
         return list(await asyncio.gather(*(one(url) for url in image_urls)))
+
+    @classmethod
+    def _store_downloaded_image(cls, content: bytes, mime: str) -> str:
+        """原子保存结果图，聊天消息只携带短 URL，绝不内联数 MB Base64。"""
+        subtype = str(mime or "image/png").split("/", 1)[-1].lower()
+        extension = {
+            "jpeg": "jpg", "jpg": "jpg", "png": "png", "webp": "webp",
+            "gif": "gif", "bmp": "bmp", "tiff": "tiff",
+        }.get(subtype, "png")
+        image_dir = paths.sub("skill-images")
+        image_dir.mkdir(parents=True, exist_ok=True)
+        filename = f"{uuid.uuid4().hex}.{extension}"
+        destination = image_dir / filename
+        temporary = image_dir / f".{filename}.tmp"
+        try:
+            temporary.write_bytes(content)
+            os.replace(temporary, destination)
+        finally:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
+        return (
+            f"http://127.0.0.1:{cls._LOCAL_IMAGE_HTTP_PORT}"
+            f"/api/skill-images/{filename}"
+        )
 
     async def _emit_images(
         self,
@@ -363,10 +399,14 @@ class DashScopeImageBackend(ModelBackend):
         image_urls: list[str],
         emit: Callable,
     ) -> None:
-        for source_url, data_uri, error in await self._download_images(client, image_urls):
-            if data_uri:
-                emit("text_delta", text=f"![生成图像]({data_uri})\n\n")
-                continue
+        for source_url, content, mime, error in await self._download_images(client, image_urls):
+            if content:
+                try:
+                    local_url = self._store_downloaded_image(content, mime or "image/png")
+                    emit("text_delta", text=f"![生成图像]({local_url})\n\n")
+                    continue
+                except Exception as exc:
+                    error = f"本地保存失败：{_exc_msg(exc)}"
             print(
                 f"[DashScope] 图片下载失败，回退到原始链接: {source_url[:100]} ({error})",
                 file=sys.stderr,

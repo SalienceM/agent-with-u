@@ -231,6 +231,7 @@ const ChatInputInner: React.FC<Props> = ({
   onCompact,
   fontSize, onAdjustFontSize,
   isFocused = true,
+  execKey,
   sessionRuntime,
   onSessionRuntimeChange,
   voiceConversationActive = false,
@@ -249,50 +250,51 @@ const ChatInputInner: React.FC<Props> = ({
 
   // 截图按钮状态:正在等待用户选区域 / 已超时
   const [screenshotBusy, setScreenshotBusy] = useState(false);
+  const screenshotBusyRef = useRef(false);
 
   // 调起系统截图工具 → 等图片落进剪贴板 → 走既有粘贴流程加入附件。
   // 桌面端独占——浏览器无法触发系统截图工具。
   const handleScreenshot = useCallback(async () => {
     if (!isTauri()) return;
-    if (screenshotBusy) return;
-    let invoke: ((cmd: string) => Promise<unknown>) | null = null;
-    try {
-      const mod = await import('@tauri-apps/api/core');
-      invoke = mod.invoke;
-    } catch {
-      return;
-    }
-    // 记一下点击前剪贴板里现成的那张图(如果有),用 base64 前缀做去重
-    // key,避免后面把「旧图」误认成新截图加入附件。
-    let beforeKey = '';
-    try {
-      const before = await api.readClipboardImage();
-      if (before?.base64) beforeKey = before.base64.slice(0, 200);
-    } catch { /* 没装 PIL 或失败:无所谓,beforeKey 留空 */ }
+    // ref 在首个 await 之前同步上锁，避免全局热键连按时 React 状态尚未刷新，
+    // 同时拉起多个系统截图浮层。
+    if (screenshotBusyRef.current) return;
+    screenshotBusyRef.current = true;
     setScreenshotBusy(true);
     try {
-      await invoke('open_screenshot_tool');
-    } catch (e) {
-      console.error('[screenshot] open tool failed:', e);
-      setScreenshotBusy(false);
-      return;
-    }
-    // 轮询剪贴板,最长 60 秒
-    const start = Date.now();
-    const POLL_INTERVAL = 500;
-    const TIMEOUT = 60_000;
-    while (Date.now() - start < TIMEOUT) {
-      await new Promise((r) => setTimeout(r, POLL_INTERVAL));
+      const mod = await import('@tauri-apps/api/core');
+      // 记一下点击前剪贴板里现成的那张图(如果有),用 base64 前缀做去重
+      // key,避免后面把「旧图」误认成新截图加入附件。
+      let beforeKey = '';
       try {
-        const img = await api.readClipboardImage();
-        if (img && img.base64 && img.base64.slice(0, 200) !== beforeKey) {
-          addImage(img);
-          break;
-        }
-      } catch { /* 单次失败继续轮询 */ }
+        const before = await api.readClipboardImage();
+        if (before?.base64) beforeKey = before.base64.slice(0, 200);
+      } catch { /* 读取失败不阻止截图 */ }
+
+      await mod.invoke('open_screenshot_tool');
+
+      // 只在用户主动发起截图后短期轮询剪贴板。误触被上层全屏保护拦截，
+      // 这里也不会因为连按而叠加多个轮询循环。
+      const start = Date.now();
+      const POLL_INTERVAL = 500;
+      const TIMEOUT = 60_000;
+      while (Date.now() - start < TIMEOUT) {
+        await new Promise((r) => setTimeout(r, POLL_INTERVAL));
+        try {
+          const img = await api.readClipboardImage();
+          if (img && img.base64 && img.base64.slice(0, 200) !== beforeKey) {
+            addImage(img);
+            break;
+          }
+        } catch { /* 单次失败继续轮询 */ }
+      }
+    } catch (e) {
+      console.error('[screenshot] capture flow failed:', e);
+    } finally {
+      screenshotBusyRef.current = false;
+      setScreenshotBusy(false);
     }
-    setScreenshotBusy(false);
-  }, [addImage, screenshotBusy]);
+  }, [addImage]);
 
   // 全局快捷键(App.tsx 注册 Ctrl+Shift+A)触发时,每个 pane 的 ChatInput
   // 都会收到事件,只有焦点 pane 那一个真正去截图——其它静默。用 ref 拿最新
@@ -611,6 +613,8 @@ const ChatInputInner: React.FC<Props> = ({
 
   const workingDirRef = useRef(workingDir);
   workingDirRef.current = workingDir;
+  const execKeyRef = useRef(execKey);
+  execKeyRef.current = execKey;
 
   // ── 清理上下文 ──
   const [showNewSessionConfirm, setShowNewSessionConfirm] = useState(false);
@@ -1007,7 +1011,7 @@ const ChatInputInner: React.FC<Props> = ({
         el.selectionEnd = lastAt + 1;
       }
     }
-    api.listDirectory(dirPath, workingDirRef.current).then((entries) => {
+    api.listDirectory(dirPath, workingDirRef.current, execKeyRef.current).then((entries) => {
       if (Array.isArray(entries)) setFileEntries(entries);
     });
   }, []);
@@ -1389,7 +1393,7 @@ const ChatInputInner: React.FC<Props> = ({
           const lookupVersion = ++sessionLookupVersionRef.current;
           setSessionQuery(query);
           setSessionSelectedIndex(0);
-          api.listSessionRefs(query).then((items) => {
+          api.listSessionRefs(query, execKeyRef.current).then((items) => {
             if (lookupVersion !== sessionLookupVersionRef.current) return;
             setSessionRefs((items || []).filter((s: any) => s.id !== sessionIdRef.current));
             setShowSessionPicker(true);
@@ -1413,7 +1417,7 @@ const ChatInputInner: React.FC<Props> = ({
           setCurrentDir('.');
           const wd = workingDirRef.current || '.';
           const loadVersion = ++filePickerLoadVersionRef.current;
-          api.listDirectory(wd, wd).then((entries) => {
+          api.listDirectory(wd, wd, execKeyRef.current).then((entries) => {
             if (loadVersion !== filePickerLoadVersionRef.current) return;
             if (Array.isArray(entries)) {
               setFileEntries(entries);

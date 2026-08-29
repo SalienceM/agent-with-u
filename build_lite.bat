@@ -11,11 +11,8 @@ echo   (不含 Claude Code，需用户自行安装)
 echo  =============================================
 echo.
 
-:: ── 版本号 ──────────────────
-for /f %%a in ('powershell -NoProfile -Command "[int](Get-Date -Format yy)"') do set VER_YY=%%a
-for /f %%a in ('powershell -NoProfile -Command "(Get-Date).Month"') do set VER_MM=%%a
-for /f %%a in ('powershell -NoProfile -Command "(Get-Date).Day"') do set VER_DD=%%a
-set "VERSION=!VER_YY!.!VER_MM!.!VER_DD!"
+:: ── 版本号：沿用已经编译进主程序/sidecar 的版本 ────────────────
+for /f "delims=" %%a in ('python -c "import src._version as v; print(getattr(v,'__display_version__',v.__version__))"') do set "VERSION=%%a"
 
 for /f "tokens=2" %%T in ('rustc -Vv ^| findstr /i "host"') do set TARGET_TRIPLE=%%T
 if "%TARGET_TRIPLE%"=="" set TARGET_TRIPLE=x86_64-pc-windows-msvc
@@ -69,6 +66,9 @@ if not exist "dist" mkdir "dist"
 
 if errorlevel 1 ( echo [FAILED] NSIS compile failed & pause & exit /b 1 )
 rmdir /s /q "%STAGING%" 2>nul
+
+python scripts\register_release_candidate.py --project-root "%CD%" --source build_lite
+if errorlevel 1 echo [WARN] Build succeeded, but release candidate registration failed. You can rescan in Release Center.
 
 echo.
 echo  Done! Lite installer: dist\AgentWithU-!VERSION!-setup.exe

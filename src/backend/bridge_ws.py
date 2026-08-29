@@ -81,6 +81,8 @@ from .workspace_kit_store import (
 from .auth import AuthGuard
 from .asset_pool import AssetPool
 from .model_ledger import ModelLedger
+from .update_manager import UpdateManager
+from .release_center import ReleaseCenterManager
 from . import paths
 
 
@@ -770,6 +772,12 @@ class BridgeWS:
         # ★ 素材中转池：客户端图片/附件在交给 Agent 前先落到这里
         self._asset_pool = AssetPool()
         self._asset_pool.purge_expired()
+        # 节点更新状态属于物理执行端，不属于任何 Session/用户。写入单独目录，
+        # 由本机用户或 Relay 为该设备指定的主用户统一管理。
+        self._update_manager = UpdateManager()
+        # 发布中心是全局维护者工具，不属于 Session。保持惰性初始化：普通用户不打开
+        # 发布工作台时，不扫描目录、不探测 qshell，也不产生任何后台轮询。
+        self._release_center_manager: Optional[ReleaseCenterManager] = None
         # ★ 如果检测到内置 claude CLI，注入到默认后端配置
         self._cli_path = cli_path
         self._app_config_store = AppConfigStore()
@@ -1499,7 +1507,10 @@ class BridgeWS:
 
             # ★ 如果结果中有远程图片 URL（非 base64），尝试用 bridge 自身下载并缓存到本地
             # 这样即使用户浏览器无法直接访问 DashScope CDN，bridge 也可以代理
-            if result and "![" in result and "http" in result:
+            if (
+                result and "![" in result and "http" in result
+                and "/api/skill-images/" not in result
+            ):
                 import re as _re
                 import httpx as _httpx
                 _img_match = _re.search(r'!\[[^\]]*\]\((https?://[^)]+)\)', result)
@@ -1682,6 +1693,24 @@ class BridgeWS:
             *(ws.send(payload) for ws in recipients), return_exceptions=True,
         )
 
+    async def _send_to_local_clients(self, msg: dict) -> int:
+        """只向本机直连 UI 推送系统事件，绝不让远端控制端代替目标机退出。
+
+        更新安装由目标节点自己的 Tauri 壳接手。Relay 控制端只负责下发计划；
+        它即便收到该事件也不应退出自身，因此这里在后端边界直接过滤。
+        """
+        recipients = [
+            ws for ws in list(self._clients)
+            if str(getattr(ws, "identity_src", "") or "") != "relay"
+        ]
+        if not recipients:
+            return 0
+        payload = json.dumps(msg, ensure_ascii=False)
+        await asyncio.gather(
+            *(ws.send(payload) for ws in recipients), return_exceptions=True,
+        )
+        return len(recipients)
+
     async def _send_for_session(self, session_id: str, msg: dict,
                                 owner_id: Optional[str] = None) -> None:
         resolved_owner = owner_id or self._session_owner_id(session_id)
@@ -1847,6 +1876,8 @@ class BridgeWS:
 
     def _authorize_rpc(self, method: str, handler, params: list) -> None:
         """Apply one fail-closed Session ownership gate to the RPC surface."""
+        if method.startswith("nodeUpdate") or method.startswith("release"):
+            self._require_node_update_capability()
         try:
             bound = inspect.signature(handler).bind_partial(*params)
         except TypeError:
@@ -1898,9 +1929,9 @@ class BridgeWS:
         if asyncio.iscoroutinefunction(handler):
             return await handler(*params)
         # 大目录扫描/遍历是磁盘密集型同步代码。留在 WebSocket 事件循环中会同时
-        # 卡住心跳、Relay 和其它 RPC，客户端最终只能看到“无响应”。仅把这两个
+        # 卡住心跳、Relay 和其它 RPC，客户端最终只能看到“无响应”。仅把这些
         # 无共享状态的重任务放入工作线程，避免扩大其它状态型 RPC 的线程安全面。
-        if method in {"syncManifest", "syncFileList"}:
+        if method in {"syncManifest", "syncFileList", "syncFileSearch"}:
             return await asyncio.to_thread(handler, *params)
         return handler(*params)
 
@@ -1911,12 +1942,165 @@ class BridgeWS:
         return "pong"
 
     def _rpc_getAppVersion(self) -> str:
-        """返回应用版本号（格式 YY.MM.DD），由 build_all.bat 在构建时写入 src/_version.py。"""
+        """返回展示版本；新构建包含日期、时间和 revision，可区分同日多次发布。"""
         try:
-            from .._version import __version__
-            return str(__version__)
+            from .. import _version as version_module
+            return str(
+                getattr(version_module, "__display_version__", "")
+                or getattr(version_module, "__version__", "0.0.0-dev")
+            )
         except Exception:
             return "0.0.0-dev"
+
+    @staticmethod
+    def _require_node_update_capability() -> None:
+        """更新物理节点只允许本机，或 Relay 指定的该节点主用户。"""
+        source = str(_REQUEST_IDENTITY_SOURCE.get() or "")
+        if source in {"", "none", "internal", "loopback", "local-user"}:
+            return
+        if source == "relay" and _REQUEST_CAN_CLAIM_LEGACY.get():
+            return
+        raise PermissionError(
+            "Only a local client or this executor's Relay default user can manage node updates"
+        )
+
+    def _rpc_nodeUpdateStatus(self) -> str:
+        return json.dumps(self._update_manager.status(), ensure_ascii=False)
+
+    def _release_center(self) -> ReleaseCenterManager:
+        if self._release_center_manager is None:
+            self._release_center_manager = ReleaseCenterManager()
+        return self._release_center_manager
+
+    # ── RPC: 可视化发布中心（全局、非 Session）────────────────────
+
+    async def _rpc_releaseStatus(self) -> str:
+        # qshell 账号状态需要启动一个短进程检查，不能阻塞 WebSocket 心跳。
+        result = await asyncio.to_thread(self._release_center().status)
+        return json.dumps(result, ensure_ascii=False)
+
+    async def _rpc_releaseConfigure(self, config_json: str) -> str:
+        try:
+            config = json.loads(config_json or "{}")
+        except json.JSONDecodeError as error:
+            raise ValueError(f"invalid release configuration: {error}") from error
+        result = await asyncio.to_thread(self._release_center().configure, config)
+        return json.dumps(result, ensure_ascii=False)
+
+    async def _rpc_releaseConfigureQiniuAccount(
+        self, access_key: str, secret_key: str, account_name: str = "agentwithu-release",
+    ) -> str:
+        # 凭据只在本次 RPC 内存中流转并直接交给 qshell；禁止写日志或普通配置。
+        result = await asyncio.to_thread(
+            self._release_center().configure_qiniu_account,
+            access_key, secret_key, account_name,
+        )
+        return json.dumps(result, ensure_ascii=False)
+
+    async def _rpc_releaseScan(self, project_root: str = "", source: str = "manual") -> str:
+        result = await asyncio.to_thread(
+            self._release_center().scan_project, project_root, source,
+        )
+        return json.dumps(result, ensure_ascii=False)
+
+    def _rpc_releaseUpdateArtifact(
+        self, candidate_id: str, artifact_id: str, patch_json: str,
+    ) -> str:
+        try:
+            patch = json.loads(patch_json or "{}")
+        except json.JSONDecodeError as error:
+            raise ValueError(f"invalid artifact patch: {error}") from error
+        return json.dumps(
+            self._release_center().update_artifact(candidate_id, artifact_id, patch),
+            ensure_ascii=False,
+        )
+
+    def _rpc_releaseDiscard(self, candidate_id: str) -> str:
+        return json.dumps(
+            self._release_center().discard_candidate(candidate_id), ensure_ascii=False,
+        )
+
+    async def _rpc_releasePreview(
+        self, candidate_id: str, artifact_ids_json: str, options_json: str = "{}",
+    ) -> str:
+        try:
+            artifact_ids = json.loads(artifact_ids_json or "[]")
+            options = json.loads(options_json or "{}")
+        except json.JSONDecodeError as error:
+            raise ValueError(f"invalid release preview payload: {error}") from error
+        if not isinstance(artifact_ids, list) or not isinstance(options, dict):
+            raise ValueError("release preview expects an artifact id array and options object")
+        result = await self._release_center().preview(
+            candidate_id, [str(item) for item in artifact_ids], options,
+        )
+        return json.dumps(result, ensure_ascii=False)
+
+    async def _rpc_releasePublish(self, plan_id: str) -> str:
+        return json.dumps(
+            await self._release_center().start_publish(plan_id), ensure_ascii=False,
+        )
+
+    async def _rpc_releaseCancel(self, job_id: str) -> str:
+        return json.dumps(
+            await self._release_center().cancel_publish(job_id), ensure_ascii=False,
+        )
+
+    def _rpc_nodeUpdateConfigure(self, config_json: str) -> str:
+        try:
+            config = json.loads(config_json or "{}")
+        except json.JSONDecodeError as error:
+            raise ValueError(f"invalid update configuration: {error}") from error
+        if not isinstance(config, dict):
+            raise ValueError("update configuration must be an object")
+        return json.dumps({
+            "status": "ok",
+            "config": self._update_manager.configure(config),
+        }, ensure_ascii=False)
+
+    async def _rpc_nodeUpdateCheck(self, manifest_url: str = "",
+                                   artifact_id: str = "") -> str:
+        result = await self._update_manager.check(manifest_url, artifact_id)
+        return json.dumps(result, ensure_ascii=False)
+
+    async def _rpc_nodeUpdateStage(self, manifest_url: str = "",
+                                   artifact_id: str = "", force: bool = False) -> str:
+        result = await self._update_manager.start_stage(
+            manifest_url, artifact_id, bool(force),
+        )
+        return json.dumps(result, ensure_ascii=False)
+
+    async def _rpc_nodeUpdateCancel(self) -> str:
+        return json.dumps(await self._update_manager.cancel(), ensure_ascii=False)
+
+    def _rpc_nodeUpdateInstallFailed(self, message: str = "") -> str:
+        return json.dumps(
+            self._update_manager.mark_install_failed(message or "desktop updater failed"),
+            ensure_ascii=False,
+        )
+
+    async def _rpc_nodeUpdateApply(self) -> str:
+        result = self._update_manager.prepare_apply()
+        if result.get("requiresDesktop"):
+            # 稍后退出，先让当前 RPC 响应完整送回远端控制端；否则批量更新会把
+            # “目标节点按计划重启”误判成一次普通网络失败。
+            local_count = await self._send_to_local_clients({
+                "event": "nodeUpdateInstallRequested",
+                "data": json.dumps({
+                    "planPath": result.get("planPath", ""),
+                    "delayMs": 1500,
+                }, ensure_ascii=False),
+            })
+            if local_count <= 0:
+                self._update_manager.mark_install_failed(
+                    "目标节点没有在线的本机桌面客户端；请在该节点启动 AgentWithU 后重试"
+                )
+                raise RuntimeError("target desktop client is not connected locally")
+        else:
+            # 原生 headless 节点的独立 helper，或 Docker 节点的专用 updater
+            # sidecar 已经接管。给 WebSocket 留出回包时间后结束当前进程；
+            # systemd / Docker restart policy 会拉起更新后的节点。
+            asyncio.get_running_loop().call_later(1.5, os._exit, 0)
+        return json.dumps(result, ensure_ascii=False)
 
     def _rpc_listConnectedClients(self) -> str:
         """返回当前连接到本执行节点的所有 UI 客户端列表（本地 + 经中继）。
@@ -2897,8 +3081,14 @@ class BridgeWS:
             if not ref or ref.id in seen:
                 continue
             seen.add(ref.id)
-            msgs = ref.messages[-12:]
-            summary = compress_messages(msgs, keep_recent=12) if msgs else "(empty session)"
+            # 自动 LOOP 的普通聊天 transcript 通常为空，真正有用的上下文位于
+            # 独立 stage 文件。引用它时改用 LOOP 状态摘要，避免得到空上下文。
+            loop_state = self._loop_state(ref.id) if ref.session_type == "loop" else None
+            if loop_state is not None:
+                summary = self._loop_context_digest(loop_state)
+            else:
+                msgs = ref.messages[-12:]
+                summary = compress_messages(msgs, keep_recent=12) if msgs else "(empty session)"
             blocks.append(
                 f"### Referenced session: {ref.title} ({ref.id})\n"
                 f"Backend: {ref.backend_id}\n"
@@ -4657,6 +4847,10 @@ class BridgeWS:
         agent_session_id 显式传入时优先使用（不写回 session），用于 step 间线程上下文。
         backend_id 可为分析/转换步骤指定异构 backend（仅独立轮次用，找不到则回落会话 backend）。
         """
+        # LOOP 的 idea / goal / addon / execute 等入口最终都汇聚到这里。
+        # 在模型调用边界统一展开引用，既保留 stage 文件里的用户原文，也避免
+        # 每个上游流程分别实现一遍 @SESSION 语义。
+        prompt = self._build_session_reference_context(prompt, session.id)
         backend = None
         backend_config_id = backend_id or session.backend_id
         if backend_id and backend_id != session.backend_id:
@@ -6293,6 +6487,7 @@ class BridgeWS:
                 + (f"【最近的旁路问答】\n{history}\n\n" if history else "")
                 + f"【用户的问题】\n{turn.question}"
             )
+            prompt = self._build_session_reference_context(prompt, session.id)
             parts: list[str] = []
 
             def on_delta(delta: StreamDelta):
@@ -8836,6 +9031,37 @@ Kit 版本账本（版本属于 Kit，不属于 AI）：
                 artifacts = build_artifacts(kit, run, working_dir=working_dir)
                 state.artifacts.extend(artifacts)
                 run.artifact_ids = [item.id for item in artifacts]
+                # 标记过的 file 输出只进入全局候选区。这里绝不生成/上传 manifest，
+                # 更不会切换 stable；正式发布仍必须经过发布工作台的冻结计划与确认。
+                release_specs = {
+                    str(item.get("key") or ""): item
+                    for item in kit.outputs
+                    if item.get("releaseCandidate") and str(item.get("source") or "") == "file"
+                }
+                release_artifacts = [
+                    item for item in artifacts if item.path and item.key in release_specs
+                ]
+                if release_artifacts:
+                    metadata_by_path = {}
+                    for artifact in release_artifacts:
+                        spec = release_specs.get(artifact.key) or {}
+                        metadata_by_path[str(Path(artifact.path).resolve())] = {
+                            key: spec[key] for key in (
+                                "platform", "arch", "target", "kind", "install",
+                            ) if key in spec
+                        }
+                    try:
+                        await asyncio.to_thread(
+                            self._release_center().register_paths,
+                            Path(session.working_dir).resolve(),
+                            [item.path for item in release_artifacts],
+                            metadata_by_path=metadata_by_path,
+                            source=f"workspace-kit:{kit.title}",
+                        )
+                    except Exception as error:
+                        # 登记是发布准备动作，不反向伪造构建判言；把失败显式留在本次
+                        # 运行日志中，用户可在发布工作台重新扫描。
+                        run.stderr = (run.stderr + f"\n[发布候选登记失败] {error}").strip()[:200_000]
         except asyncio.CancelledError:
             if proc and proc.returncode is None:
                 try:
@@ -8959,6 +9185,7 @@ Kit 版本账本（版本属于 Kit，不属于 AI）：
                 + (f"【最近的旁路问答】\n{history}\n\n" if history else "")
                 + f"【用户的问题】\n{turn.question}"
             )
+            prompt = self._build_session_reference_context(prompt, session.id)
             parts: list[str] = []
 
             def on_delta(delta: StreamDelta):
@@ -10905,6 +11132,208 @@ except urllib.error.URLError as e:
             return json.dumps({"status": "ok", "files": files}, ensure_ascii=False)
         except ValueError as e:
             return json.dumps({"status": "error", "message": str(e)}, ensure_ascii=False)
+        except Exception as e:
+            return json.dumps({"status": "error", "message": str(e)}, ensure_ascii=False)
+
+    @staticmethod
+    def _sync_file_search_score(rel: str, query: str) -> Optional[int]:
+        """VS Code Quick Open 风格的路径模糊评分；不读取文件内容。"""
+        path = str(rel or "").replace("\\", "/").casefold()
+        needle = "".join(str(query or "").replace("\\", "/").casefold().split())
+        if not path or not needle:
+            return None
+        name = path.rsplit("/", 1)[-1]
+        depth_penalty = path.count("/") * 8
+
+        name_index = name.find(needle)
+        if name_index >= 0:
+            return 30_000 - name_index * 20 - (len(name) - len(needle)) - depth_penalty
+        path_index = path.find(needle)
+        if path_index >= 0:
+            return 20_000 - path_index * 4 - (len(path) - len(needle)) - depth_penalty
+
+        # 非连续子序列：分别从 basename 与完整路径的起点寻找，避免完整路径中
+        # 目录名的早期同字母“抢走”文件名匹配（例如 frontend/.../FileTreePanel）。
+        def fuzzy(candidate: str, base: int) -> Optional[int]:
+            positions: list[int] = []
+            cursor = -1
+            for char in needle:
+                cursor = candidate.find(char, cursor + 1)
+                if cursor < 0:
+                    return None
+                positions.append(cursor)
+            span = positions[-1] - positions[0] + 1
+            gaps = span - len(needle)
+            boundaries = sum(
+                1 for position in positions
+                if position == 0 or candidate[position - 1] in "/._- "
+            )
+            return base + boundaries * 35 - gaps * 12 - positions[0] - depth_penalty
+
+        candidates = [score for score in (fuzzy(name, 11_000), fuzzy(path, 10_000)) if score is not None]
+        return max(candidates) if candidates else None
+
+    def _rpc_syncFileSearch(
+        self, working_dir: str, query: str, limit: int = 200,
+        include_git: bool = False,
+    ) -> str:
+        """递归模糊查询工作区文件名/路径，返回少量排序结果。
+
+        首次查询只做 ``scandir/stat`` 建索引，不读取内容。索引短时缓存，使用户
+        连续输入字符时复用同一轮磁盘扫描；RPC 由 ``_dispatch`` 放到工作线程，
+        不会阻塞 WebSocket 心跳或其它会话。
+        """
+        import heapq
+        from pathlib import Path as _P
+
+        try:
+            root = _P(working_dir).resolve()
+            if not root.is_dir():
+                return json.dumps(
+                    {"status": "error", "message": "工作目录不存在"},
+                    ensure_ascii=False,
+                )
+            normalized_query = str(query or "").strip()[:256]
+            if not normalized_query:
+                return json.dumps(
+                    {"status": "ok", "results": [], "matched": 0, "indexed": 0},
+                    ensure_ascii=False,
+                )
+            result_limit = max(1, min(int(limit or 200), 500))
+            patterns = self._sync_ignore_patterns()
+            cache_key = (
+                f"{root}|git={int(bool(include_git))}|"
+                f"ignore={json.dumps(patterns, ensure_ascii=False)}"
+            )
+            cache = getattr(self, "_sync_file_search_cache", None)
+            if not isinstance(cache, dict):
+                cache = {}
+                self._sync_file_search_cache = cache
+            cache_lock = getattr(self, "_sync_file_search_cache_lock", None)
+            if cache_lock is None:
+                cache_lock = threading.Lock()
+                self._sync_file_search_cache_lock = cache_lock
+
+            now = time.monotonic()
+            with cache_lock:
+                cached = cache.get(cache_key)
+                if cached and now - cached[0] <= 5.0:
+                    entries = cached[1]
+                    index_truncated = cached[2]
+                else:
+                    entries: list[tuple[str, int, int]] = []
+                    index_truncated = False
+                    max_indexed_files = 300_000
+                    root_text = str(root)
+
+                    # Git 工作区优先采用 tracked + untracked/non-ignored 清单，行为与
+                    # VS Code Quick Open 更接近，也不会把 .gitignore 中的虚拟环境、
+                    # 构建缓存等噪声带进结果。Git 不可用/非仓库时再走通用扫描。
+                    indexed_from_git = False
+                    if not bool(include_git):
+                        try:
+                            import subprocess as _subprocess
+                            listed = _subprocess.run(
+                                ["git", "-C", root_text, "ls-files", "-co", "--exclude-standard", "-z"],
+                                stdout=_subprocess.PIPE,
+                                stderr=_subprocess.DEVNULL,
+                                timeout=20,
+                                check=False,
+                            )
+                            if listed.returncode == 0:
+                                indexed_from_git = True
+                                for raw_rel in listed.stdout.split(b"\0"):
+                                    if not raw_rel:
+                                        continue
+                                    rel = os.fsdecode(raw_rel).replace("\\", "/")
+                                    if self._sync_is_ignored(rel, patterns, False):
+                                        continue
+                                    target = root.joinpath(*[part for part in rel.split("/") if part])
+                                    try:
+                                        if target.is_symlink() or not target.is_file():
+                                            continue
+                                        stat = target.stat()
+                                        entries.append((
+                                            rel,
+                                            int(stat.st_size),
+                                            int(stat.st_mtime_ns // 1_000_000),
+                                        ))
+                                    except OSError:
+                                        continue
+                                    if len(entries) >= max_indexed_files:
+                                        index_truncated = True
+                                        break
+                        except (OSError, _subprocess.SubprocessError):
+                            indexed_from_git = False
+
+                    if not indexed_from_git:
+                        pending_dirs = [root_text]
+                        while pending_dirs and not index_truncated:
+                            current = pending_dirs.pop()
+                            try:
+                                scanner = os.scandir(current)
+                            except OSError:
+                                continue
+                            with scanner:
+                                for entry in scanner:
+                                    try:
+                                        if entry.is_symlink():
+                                            continue
+                                        rel = os.path.relpath(entry.path, root_text).replace("\\", "/")
+                                        if self._sync_is_ignored(rel, patterns, bool(include_git)):
+                                            continue
+                                        if entry.is_dir(follow_symlinks=False):
+                                            pending_dirs.append(entry.path)
+                                            continue
+                                        if not entry.is_file(follow_symlinks=False):
+                                            continue
+                                        stat = entry.stat(follow_symlinks=False)
+                                        entries.append((
+                                            rel,
+                                            int(stat.st_size),
+                                            int(stat.st_mtime_ns // 1_000_000),
+                                        ))
+                                    except OSError:
+                                        continue
+                                    if len(entries) >= max_indexed_files:
+                                        index_truncated = True
+                                        break
+                    # 大仓库扫描本身可能超过缓存 TTL；从扫描完成时起算，避免刚建好
+                    # 的索引在下一次按键查询时立即失效并重复遍历磁盘。
+                    cache[cache_key] = (time.monotonic(), entries, index_truncated)
+                    while len(cache) > 8:
+                        cache.pop(next(iter(cache)))
+
+            best: list[tuple[int, str, int, int]] = []
+            matched = 0
+            for rel, size, mtime in entries:
+                score = self._sync_file_search_score(rel, normalized_query)
+                if score is None:
+                    continue
+                matched += 1
+                candidate = (score, rel, size, mtime)
+                if len(best) < result_limit:
+                    heapq.heappush(best, candidate)
+                elif candidate > best[0]:
+                    heapq.heapreplace(best, candidate)
+
+            ordered = sorted(best, key=lambda item: (-item[0], item[1].casefold(), item[1]))
+            results = [
+                {
+                    "path": rel,
+                    "name": rel.rsplit("/", 1)[-1],
+                    "size": size,
+                    "mtime": mtime,
+                }
+                for _score, rel, size, mtime in ordered
+            ]
+            return json.dumps({
+                "status": "ok",
+                "results": results,
+                "matched": matched,
+                "indexed": len(entries),
+                "truncated": bool(index_truncated or matched > len(results)),
+            }, ensure_ascii=False)
         except Exception as e:
             return json.dumps({"status": "error", "message": str(e)}, ensure_ascii=False)
 

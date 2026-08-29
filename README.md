@@ -107,6 +107,7 @@ AgentWithU 用 PySide6 托管 QWebEngine，前端是 React，后端是 Python—
 - 图生图支持按顺序传入 1–3 张 JPG/PNG/BMP/TIFF/WEBP/GIF 参考图，单张不超过 10MB。
 - 支持 Direct/Agent 提示词增强、思考增强、1–6 张输出、反向提示词、Seed 与水印；Agent 增强在图生图时会自动降级为 Direct。
 - 调用方式默认设为“自动”：轻量标准版任务使用同步接口；Pro、图生图、多输出、高分辨率、Thinking、Agent 改写或长提示词在提交前直接改走异步任务接口，并按 `task_id` 最长等待 3600 秒（可在 Backend Manager 调整为 60–7200 秒）。同步请求发生读取超时时不会自动重发，避免重复生成和计费。
+- 生成完成后由执行节点立即下载并保存图片，聊天消息只传递本地图片引用，不把数 MB Base64 塞进 Markdown；远程控制端通过 AgentWithU 数据通道按需读取。
 - 推荐填写 Workspace ID 与地域，由应用生成业务空间专属 `/api/v1` 地址。模型、Endpoint、API Key 与 Workspace 必须属于同一地域。
 
 > **关于 `claude-agent-sdk` 模式**：底层依赖 [Claude Code](https://claude.ai/code) CLI 实现本地 Agent Loop。使用前须先完成 Claude Code 的安装与鉴权，这是**必选前置项**。
@@ -151,6 +152,12 @@ cd frontend && npm run dev
 python -m src.ws_main
 # 然后在浏览器打开 http://localhost:5173
 ```
+
+### Linux Docker 执行节点
+
+推荐使用 [`deploy/docker-compose.example.yml`](deploy/docker-compose.example.yml) 部署。Backend 镜像默认包含官方 Codex CLI 与 Claude CLI；默认运行代理为 `http://192.168.50.156:7890`，可用 `AGENT_WITH_U_RUNTIME_PROXY` 覆盖，显式设为空可关闭。Codex/Claude 登录目录和业务数据均挂载到宿主机，重建不丢失。
+
+Compose 同时启动无端口的 `awu-updater`。发布 `agent-with-u-docker-linux-<arch>.tar` 后，Docker 节点可在“节点在线更新”中一键加载新镜像、健康检查并重建 Backend/Web；失败自动恢复旧镜像。Docker Socket 只挂给 updater，不挂给执行 Agent 的 Backend。现有节点需先按[156 Docker 安装与更新指南](deploy/WEB_156_INSTALL.md)手动重建一次，之后才能在线升级。
 
 ### 接入本地模型（Ollama / LM Studio）
 

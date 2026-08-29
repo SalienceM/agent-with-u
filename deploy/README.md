@@ -51,8 +51,9 @@ python -m src.ws_main --bind 127.0.0.1 --port 44321
 | 文件 | 用途 |
 |------|------|
 | `WEB_156_INSTALL.md`             | **192.168.50.156:7890 代理环境**下的群晖 Docker 完整安装、更新与排障 |
-| `docker-compose.example.yml`     | **推荐**：后端 + web 容器一把起 |
+| `docker-compose.example.yml`     | **推荐**：后端 + web + 隔离升级器一把起 |
 | `Dockerfile`                     | 后端镜像 |
+| `Dockerfile.updater`             | 无端口 Docker 在线升级伴随容器 |
 | `requirements-docker.txt`        | 后端锁定依赖（pip 零回溯，弱网可装） |
 | `Dockerfile.web`                 | web 镜像（多阶段：构建前端 + nginx） |
 | `web-nginx.conf`                 | web 容器内的路径分流配置 |
@@ -80,7 +81,7 @@ python -m src.ws_main --bind 127.0.0.1 --port 44321
 
 ## 2b. nginx-proxy-manager (NPM) + Authelia 接入
 
-NPM 用户推荐用 `docker-compose.example.yml` 起两个容器。`awu-web` 映射一个
+NPM 用户推荐用 `docker-compose.example.yml` 起三个容器。`awu-web` 映射一个
 **宿主端口**，NPM 按「NAS 局域网 IP : 该端口」路由进来：
 
 ```

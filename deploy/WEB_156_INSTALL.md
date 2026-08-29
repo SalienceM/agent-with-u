@@ -1,6 +1,6 @@
 # AgentWithU 156 Web 服务端安装与更新
 
-本文用于在群晖 / Linux Docker 主机上部署 AgentWithU Web 服务，固定采用以下目录与构建代理：
+本文用于在群晖 / Linux Docker 主机上部署 AgentWithU Web 服务，固定采用以下目录、构建代理与运行代理：
 
 | 项目 | 配置 |
 |---|---|
@@ -8,11 +8,13 @@
 | 持久化数据 | `/volume1/docker/agent-with-u/data` |
 | Docker Compose 文件 | `deploy/docker-compose.example.yml` |
 | 构建代理 | `http://192.168.50.156:7890` |
+| 运行代理 | `http://192.168.50.156:7890`（可覆盖或显式置空） |
 | Web 宿主端口 | `44380` |
 | Web 容器 | `awu-web` |
 | Backend 容器 | `awu-backend` |
+| 升级伴随容器 | `awu-updater`（无端口，仅监听本机更新队列） |
 
-> `192.168.50.156:7890` 是构建时使用的 HTTP 代理地址。代理机器必须开启“允许局域网连接”，并允许 Docker 主机访问 TCP `7890`。
+> `192.168.50.156:7890` 默认同时用于镜像构建和 Backend/Codex 运行。代理机器必须开启“允许局域网连接”，并允许 Docker 主机访问 TCP `7890`。
 
 ## 一、部署结构
 
@@ -28,11 +30,14 @@ awu-web（nginx，宿主 44380 → 容器 80）
                          │
                          ▼
              /volume1/docker/agent-with-u/data
+                         │
+                         └─ awu-updater → Docker Socket（只重建 Backend/Web）
 ```
 
 - `awu-web` 是唯一映射宿主端口的容器。
+- `awu-updater` 不映射端口，Docker Socket 也不会暴露给会运行 Agent 命令的 Backend。
 - Backend 的 `44321`、`44322` 仅在 Docker 内部网络开放，不应直接暴露到公网。
-- Session、Backend 配置、Skills、素材池等数据保存在宿主机 `data` 目录中，重建容器不会删除。
+- Session、Backend 配置、Skills、素材池等数据保存在宿主机 `data` 目录中；Codex/Claude 登录态分别保存在 `codex-config`、`claude-config`，重建容器不会删除。
 
 ## 二、前置条件
 
@@ -130,7 +135,7 @@ PROXY=http://192.168.50.156:7890
 
 该变量只在当前终端会话有效，因此本步骤和下一步构建命令需要在同一个终端中执行。
 
-### 4. 构建 Backend 与 Web 镜像
+### 4. 构建 Backend、Web 与升级器镜像
 
 ```bash
 sudo docker compose -f deploy/docker-compose.example.yml build \
@@ -144,8 +149,20 @@ sudo docker compose -f deploy/docker-compose.example.yml build \
 
 - `agent-with-u-backend:latest`
 - `agent-with-u-web:latest`
+- `agent-with-u-updater:latest`
 
-代理会覆盖镜像构建过程中的 `apt`、`pip` 和 `npm` 网络请求，但不会作为运行时环境变量写入 Compose 服务。
+Compose 本身已经为构建与运行设置默认代理，因此上面的显式 build-arg 保留兼容但不再是必需项。运行时会向 Python HTTP 客户端、Claude/Codex 子进程注入同一代理，并用 `NO_PROXY` 绕过容器内通信。可在执行 Compose 前覆盖：
+
+```bash
+export AGENT_WITH_U_BUILD_PROXY=http://其他地址:端口
+export AGENT_WITH_U_RUNTIME_PROXY=http://其他地址:端口
+```
+
+若该节点无需运行代理，必须显式定义为空（“未定义”会使用 156 默认值）：
+
+```bash
+export AGENT_WITH_U_RUNTIME_PROXY=
+```
 
 ### 5. 使用新镜像重建并启动容器
 
@@ -196,6 +213,7 @@ sudo docker compose -f deploy/docker-compose.example.yml ps
 ```text
 awu-backend   Up
 awu-web       Up
+awu-updater   Up
 ```
 
 ### 2. 检查网页入口
@@ -266,7 +284,36 @@ sudo docker compose -f deploy/docker-compose.example.yml up -d --no-build
 
 > 不要执行 `docker compose down -v`。虽然当前核心数据使用宿主机目录挂载，但生产环境仍不应养成删除卷的操作习惯。
 
-## 八、NPM / Authelia 反向代理
+## 八、Codex、运行代理与在线升级验证
+
+Backend 镜像默认安装官方 Codex CLI 和 Claude CLI。首次重建后检查：
+
+```bash
+sudo docker exec awu-backend codex --version
+sudo docker exec awu-backend claude --version
+sudo docker exec awu-backend sh -lc 'printf "%s\n" "$HTTPS_PROXY" "$AGENTWITHU_CODEX_PROXY"'
+sudo docker compose -f deploy/docker-compose.example.yml logs --tail=30 awu-updater
+```
+
+如使用 Codex 账号登录，执行一次：
+
+```bash
+sudo docker exec -it awu-backend codex login
+```
+
+登录数据写入宿主机 `codex-config`，以后在线升级/重建不会丢失。
+
+构建发布包时，Windows 的 `build_all.bat` 或 Linux 的 `build_web_linux.sh` 会在 Docker Engine 可用时额外生成：
+
+```text
+dist/agent-with-u-docker-linux-x86_64.tar
+```
+
+发布中心会自动把它识别为 `target=docker / kind=docker-bundle`。发布后，在“设置 → 数据与系统 → 节点在线更新”中，Docker 节点应显示“Docker · 升级器在线”；点击“一键更新”后由节点下载和校验镜像包，`awu-updater` 保存旧镜像、加载新镜像、重建 Backend/Web 并做健康检查，失败会恢复旧镜像。
+
+旧 Docker 部署必须按本文第四、第五步**手动重建这一次**，让 Codex、代理环境和 `awu-updater` 进入部署；此后应用版本才可从 UI 在线升级。若不想在某次 Windows 打包中生成较大的 Docker 包，可在运行 BAT 前设置 `AGENT_WITH_U_SKIP_DOCKER_RELEASE=1`。
+
+## 九、NPM / Authelia 反向代理
 
 如果外层使用 Nginx Proxy Manager：
 
@@ -286,7 +333,7 @@ AGENT_WITH_U_TRUST_FORWARD_AUTH: "1"
 
 同时确保反向代理正确传递 `Remote-User` 等身份头。修改 Compose 后需要重新执行第 5 步重建容器。
 
-## 九、常见问题
+## 十、常见问题
 
 ### 1. `pip` 下载超时或显示 `No matching distribution found`
 
@@ -351,10 +398,12 @@ sudo docker compose -f deploy/docker-compose.example.yml logs --tail=100 awu-web
 
 如果经过 NPM，还需确认已经开启 WebSocket 支持，并且 `/ws` 也通过了 Authelia 鉴权。
 
-## 十、数据与备份边界
+## 十一、数据与备份边界
 
 - 代码与 Dockerfile：`/volume1/docker/agent-with-u/agent-with-u`
 - 持久化业务数据：`/volume1/docker/agent-with-u/data`
+- Codex 登录态与原生 thread：`/volume1/docker/agent-with-u/codex-config`
+- Claude 登录态：`/volume1/docker/agent-with-u/claude-config`
 - 镜像和容器可以重建。
 - `data` 目录不能随仓库更新一起覆盖或删除。
 
@@ -362,7 +411,8 @@ sudo docker compose -f deploy/docker-compose.example.yml logs --tail=100 awu-web
 
 ```text
 /volume1/docker/agent-with-u/data
+/volume1/docker/agent-with-u/codex-config
+/volume1/docker/agent-with-u/claude-config
 ```
 
 更新前如涉及重要 Session，可先确认该目录已有最新快照或备份。
-

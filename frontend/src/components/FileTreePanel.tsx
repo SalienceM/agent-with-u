@@ -39,6 +39,7 @@ import {
   sameWorkspacePath,
   type FileFocusRequest,
 } from '../utils/fileFocus';
+import { rankFileSearchPaths } from '../utils/fileSearch';
 
 const CodeEditor = lazy(() => import('./CodeEditor'));
 const PdfPreview = lazy(() => import('./PdfPreview'));
@@ -68,6 +69,9 @@ interface TNode {
   local?: boolean;
   typeConflict?: boolean;
 }
+
+const FILE_SEARCH_LIMIT = 200;
+const FILE_SEARCH_DEBOUNCE_MS = 180;
 
 // 文件同步状态(群晖式)。远端会话才有;本地会话恒为 null(不显示角标)。
 type FStatus = 'cloud' | 'local' | 'localOnly' | 'synced' | 'differs' | 'conflict';
@@ -359,6 +363,29 @@ function formatBytes(value: number): string {
   return `${(value / 1024 / 1024 / 1024).toFixed(2)} GB`;
 }
 
+const SearchHighlightedText: React.FC<{ text: string; query: string }> = ({ text, query }) => {
+  const needle = query.replace(/\\/g, '/').toLocaleLowerCase().replace(/\s+/g, '');
+  if (!needle) return <>{text}</>;
+  const lower = text.toLocaleLowerCase();
+  const exact = lower.indexOf(needle);
+  const matched = new Set<number>();
+  if (exact >= 0) {
+    for (let index = exact; index < exact + needle.length; index++) matched.add(index);
+  } else {
+    let cursor = -1;
+    for (const char of needle) {
+      cursor = lower.indexOf(char, cursor + 1);
+      if (cursor < 0) return <>{text}</>;
+      matched.add(cursor);
+    }
+  }
+  return <>{Array.from(text).map((char, index) => (
+    matched.has(index)
+      ? <mark key={index} style={searchHighlightStyle}>{char}</mark>
+      : <React.Fragment key={index}>{char}</React.Fragment>
+  ))}</>;
+};
+
 export const FileTreePanel: React.FC<Props> = ({ sessionId, workingDir, execKey, execLabel, execMode, backendId, focusRequest }) => {
   // execMode='local' 表示“在 Backend 所在机器执行”，不代表浏览器拥有那台
   // 机器的文件系统。只有 Tauri 本机执行时可直接视为同一端。
@@ -376,8 +403,18 @@ export const FileTreePanel: React.FC<Props> = ({ sessionId, workingDir, execKey,
   const [focusFlash, setFocusFlash] = useState<string | null>(null);
   const [msg, setMsg] = useState<{ kind: 'ok' | 'err'; text: string } | null>(null);
   const rowRefs = useRef<Map<string, HTMLDivElement>>(new Map());
+  const searchInputRef = useRef<HTMLInputElement>(null);
+  const searchResultRefs = useRef<Map<number, HTMLDivElement>>(new Map());
+  const searchRequestRef = useRef(0);
   const processedFocusRequestRef = useRef(0);
   const focusFlashTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [searchQuery, setSearchQuery] = useState('');
+  const [searchResults, setSearchResults] = useState<TNode[]>([]);
+  const [searchLoading, setSearchLoading] = useState(false);
+  const [searchError, setSearchError] = useState('');
+  const [searchMatched, setSearchMatched] = useState(0);
+  const [searchTruncated, setSearchTruncated] = useState(false);
+  const [searchSelectedIndex, setSearchSelectedIndex] = useState(0);
 
   // 远端会话的本地副本(离线/比对/同步用)。本地会话不涉及。
   const [localFs, setLocalFs] = useState<LocalFs | null>(null);
@@ -532,7 +569,9 @@ export const FileTreePanel: React.FC<Props> = ({ sessionId, workingDir, execKey,
 
   // 会话切换 → 重载根
   useEffect(() => {
+    searchRequestRef.current += 1;
     setChildren({}); setExpanded({}); setSelected(null);
+    setSearchQuery(''); setSearchResults([]); setSearchError(''); setSearchLoading(false);
     if (workingDir) loadChildren('');
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [workingDir, execKey]);
@@ -1012,6 +1051,95 @@ export const FileTreePanel: React.FC<Props> = ({ sessionId, workingDir, execKey,
     return dirs;
   }, [remoteManifest]);
 
+  // 文件搜索不能依赖已展开的懒加载目录。每次都精确尝试 Session 执行节点，不能
+  // 受可能滞后的在线状态快照影响；RPC 自己核验真实连接，失败后仍保留本机副本
+  // 结果。180ms 防抖 + request id 保证连续输入不会显示旧结果。
+  useEffect(() => {
+    const requestId = ++searchRequestRef.current;
+    const query = searchQuery.trim();
+    if (!query || !workingDir) {
+      setSearchResults([]);
+      setSearchLoading(false);
+      setSearchError('');
+      setSearchMatched(0);
+      setSearchTruncated(false);
+      setSearchSelectedIndex(0);
+      return;
+    }
+
+    // 查询一变化就清掉旧列表，避免防抖窗口内按 Enter 打开上一条查询的文件。
+    setSearchResults([]);
+    setSearchLoading(true);
+    setSearchError('');
+    setSearchSelectedIndex(0);
+
+    const timer = window.setTimeout(() => {
+      void (async () => {
+        const localRanked = rankFileSearchPaths(
+          Object.keys(localManifest || {}), query, FILE_SEARCH_LIMIT,
+        );
+        const merged = new Map<string, TNode>();
+        for (const item of localRanked.results) {
+          const meta = localManifest?.[item.path];
+          merged.set(item.path, {
+            name: item.path.split('/').pop() || item.path,
+            rel: item.path,
+            isDir: false,
+            size: meta?.size || 0,
+            remote: false,
+            local: true,
+          });
+        }
+
+        let remoteMatched = 0;
+        let remoteTruncated = false;
+        let remoteError = '';
+        try {
+          const response = await api.searchFiles(
+            workingDir, query, execKey, FILE_SEARCH_LIMIT, includeGitMetadata,
+          );
+          if (response.status !== 'ok') throw new Error(response.message || '执行端搜索失败');
+          remoteMatched = Number(response.matched || 0);
+          remoteTruncated = Boolean(response.truncated);
+          for (const item of response.results || []) {
+            const rel = item.path.replace(/\\/g, '/');
+            const previous = merged.get(rel);
+            merged.set(rel, {
+              name: item.name || rel.split('/').pop() || rel,
+              rel,
+              isDir: false,
+              size: Number(item.size || previous?.size || 0),
+              remoteMtime: item.mtime,
+              remote: true,
+              local: Boolean(previous?.local || localManifest?.[rel]),
+            });
+          }
+        } catch (error) {
+          remoteError = error instanceof Error ? error.message : String(error);
+        }
+
+        if (requestId !== searchRequestRef.current) return;
+        const combined = rankFileSearchPaths(merged.keys(), query, FILE_SEARCH_LIMIT);
+        setSearchResults(combined.results.map((item) => merged.get(item.path)!).filter(Boolean));
+        setSearchMatched(Math.max(combined.matched, localRanked.matched, remoteMatched));
+        setSearchTruncated(combined.truncated || localRanked.truncated || remoteTruncated);
+        setSearchSelectedIndex(0);
+        setSearchError(remoteError);
+        setSearchLoading(false);
+      })();
+    }, FILE_SEARCH_DEBOUNCE_MS);
+
+    return () => {
+      window.clearTimeout(timer);
+      if (searchRequestRef.current === requestId) searchRequestRef.current += 1;
+    };
+  }, [searchQuery, workingDir, execKey, isRemote, sessionOnline, localManifest, includeGitMetadata]);
+
+  useEffect(() => {
+    if (!searchQuery.trim()) return;
+    searchResultRefs.current.get(searchSelectedIndex)?.scrollIntoView({ block: 'nearest' });
+  }, [searchQuery, searchSelectedIndex, searchResults]);
+
   // 聊天气泡中的文件链接 → 自动逐层加载、展开、选中并滚动到目标。
   // 请求同时绑定 Session 和 workingDir，避免分屏/切换节点时定位到同名目录。
   useEffect(() => {
@@ -1029,6 +1157,7 @@ export const FileTreePanel: React.FC<Props> = ({ sessionId, workingDir, execKey,
 
     void (async () => {
       setOnlyDifferent(false);
+      setSearchQuery('');
       const parts = relativePath.split('/').filter(Boolean);
       const ancestors: Record<string, boolean> = {};
       for (let i = 1; i < parts.length; i++) {
@@ -2047,6 +2176,65 @@ export const FileTreePanel: React.FC<Props> = ({ sessionId, workingDir, execKey,
         </div>
       </div>
 
+      {/* VS Code Quick Open 风格的工作区文件查询。 */}
+      <div style={fileSearchBarStyle}>
+        <span aria-hidden="true" style={{ fontSize: 12, color: 'var(--theme-text-muted)', flexShrink: 0 }}>⌕</span>
+        <input
+          ref={searchInputRef}
+          type="text"
+          role="searchbox"
+          aria-label="搜索工作区文件"
+          value={searchQuery}
+          placeholder="搜索文件名或路径"
+          spellCheck={false}
+          title="递归模糊搜索 · ↑↓ 选择 · Enter 打开 · Esc 清空"
+          onChange={(event) => {
+            const value = event.target.value;
+            setSearchQuery(value);
+            if (value.trim()) setOnlyDifferent(false);
+          }}
+          onKeyDown={(event) => {
+            if (event.key === 'ArrowDown') {
+              event.preventDefault();
+              setSearchSelectedIndex((index) => Math.min(Math.max(0, searchResults.length - 1), index + 1));
+            } else if (event.key === 'ArrowUp') {
+              event.preventDefault();
+              setSearchSelectedIndex((index) => Math.max(0, index - 1));
+            } else if (event.key === 'Enter') {
+              const result = searchResults[searchSelectedIndex];
+              if (result) {
+                event.preventDefault();
+                setSelected(result.rel);
+                void openPreview(result);
+              }
+            } else if (event.key === 'Escape' && searchQuery) {
+              event.preventDefault();
+              setSearchQuery('');
+            }
+          }}
+          style={fileSearchInputStyle}
+        />
+        {searchLoading ? (
+          <span title="搜索中" style={fileSearchMetaStyle}>…</span>
+        ) : searchQuery.trim() ? (
+          <span
+            title={searchTruncated ? `命中 ${searchMatched} 项，仅显示前 ${searchResults.length} 项` : `命中 ${searchMatched} 项`}
+            style={fileSearchMetaStyle}
+          >
+            {searchTruncated ? `${searchResults.length}/${searchMatched}` : searchMatched}
+          </span>
+        ) : null}
+        {searchQuery && (
+          <button
+            type="button"
+            aria-label="清空文件搜索"
+            title="清空（Esc）"
+            onClick={() => { setSearchQuery(''); searchInputRef.current?.focus(); }}
+            style={fileSearchClearStyle}
+          >×</button>
+        )}
+      </div>
+
       {/* 远端目录在执行节点上；这里绑定当前 session 对应的本机目录，可随时更换。 */}
       {isRemote && (
         <>
@@ -2244,7 +2432,71 @@ export const FileTreePanel: React.FC<Props> = ({ sessionId, workingDir, execKey,
 
       {/* ★ 文件树滚动区 */}
       <div style={treeScrollStyle}>
-        {renderDir('', 0)}
+        {searchQuery.trim() ? (
+          <div role="listbox" aria-label="文件搜索结果">
+            {searchError && (
+              <div style={fileSearchErrorStyle} title={searchError}>⚠ {searchError}</div>
+            )}
+            {searchLoading && searchResults.length === 0 ? (
+              <Empty text="正在搜索工作区…" />
+            ) : searchResults.length === 0 ? (
+              <Empty text={searchError ? '没有可用的搜索结果' : `没有匹配“${searchQuery.trim()}”的文件`} />
+            ) : searchResults.map((result, index) => {
+              const st = statusOf(result);
+              const parent = result.rel.includes('/') ? result.rel.slice(0, result.rel.lastIndexOf('/')) : '根目录';
+              return (
+                <div
+                  key={result.rel}
+                  ref={(element) => {
+                    if (element) searchResultRefs.current.set(index, element);
+                    else searchResultRefs.current.delete(index);
+                  }}
+                  role="option"
+                  aria-selected={index === searchSelectedIndex}
+                  className={`ftp-row${index === searchSelectedIndex ? ' ftp-sel' : ''}`}
+                  style={fileSearchResultStyle}
+                  title={`${result.rel}\nEnter / 点击打开`}
+                  onMouseEnter={() => setSearchSelectedIndex(index)}
+                  onClick={() => {
+                    setSearchSelectedIndex(index);
+                    setSelected(result.rel);
+                    void openPreview(result);
+                  }}
+                  onContextMenu={(event) => {
+                    event.preventDefault();
+                    setSelected(result.rel);
+                    setContextMenu({
+                      x: Math.min(event.clientX, window.innerWidth - 230),
+                      y: Math.min(event.clientY, window.innerHeight - 260),
+                      node: result,
+                    });
+                  }}
+                >
+                  <span style={iconStyle}>{fileIcon(result, st)}</span>
+                  <span style={{ minWidth: 0, flex: 1 }}>
+                    <span style={fileSearchNameStyle}>
+                      <SearchHighlightedText text={result.name} query={searchQuery} />
+                    </span>
+                    <span style={fileSearchPathStyle}>
+                      <SearchHighlightedText text={parent} query={searchQuery} />
+                    </span>
+                  </span>
+                  {isRemote && (
+                    <span
+                      style={fileSearchSourceStyle}
+                      title={result.remote && result.local
+                        ? '该文件在远端执行节点和本机副本中都存在'
+                        : result.remote ? '来自远端执行节点' : '来自本机副本'}
+                    >
+                      {result.remote && result.local ? '两端' : result.remote ? '远端' : '本机'}
+                    </span>
+                  )}
+                  {result.size > 0 && <span style={fileSearchSizeStyle}>{formatBytes(result.size)}</span>}
+                </div>
+              );
+            })}
+          </div>
+        ) : renderDir('', 0)}
       </div>
 
       {contextMenu && (() => {
@@ -2948,6 +3200,69 @@ const topBarStyle: React.CSSProperties = {
   position: 'relative', display: 'flex', alignItems: 'center',
   minHeight: 34, padding: '5px 10px', flexShrink: 0, overflow: 'hidden',
   borderBottom: '1px solid var(--theme-border, rgba(255,255,255,0.08))',
+};
+
+const fileSearchBarStyle: React.CSSProperties = {
+  display: 'flex', alignItems: 'center', gap: 5, flexShrink: 0,
+  minHeight: 31, padding: '4px 8px',
+  borderBottom: '1px solid var(--theme-border, rgba(255,255,255,0.08))',
+  background: 'var(--theme-bg-secondary, #1e1e1e)',
+};
+
+const fileSearchInputStyle: React.CSSProperties = {
+  flex: 1, minWidth: 0, height: 23, padding: '2px 5px',
+  border: '1px solid var(--theme-border, rgba(255,255,255,.14))', borderRadius: 3,
+  outline: 'none', background: 'var(--theme-input-bg, rgba(255,255,255,.04))',
+  color: 'var(--theme-text, #c9d1d9)', font: '11px/1.4 inherit',
+};
+
+const fileSearchMetaStyle: React.CSSProperties = {
+  flexShrink: 0, maxWidth: 58, overflow: 'hidden', textOverflow: 'ellipsis',
+  color: 'var(--theme-text-muted)', fontSize: 9.5, fontVariantNumeric: 'tabular-nums',
+};
+
+const fileSearchClearStyle: React.CSSProperties = {
+  width: 19, height: 19, padding: 0, flexShrink: 0,
+  display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
+  border: 0, borderRadius: 3, background: 'transparent',
+  color: 'var(--theme-text-muted)', fontSize: 15, cursor: 'pointer',
+};
+
+const fileSearchResultStyle: React.CSSProperties = {
+  display: 'flex', alignItems: 'center', minHeight: 34, padding: '3px 8px', gap: 5,
+  cursor: 'pointer', userSelect: 'none', borderRadius: 3,
+};
+
+const fileSearchNameStyle: React.CSSProperties = {
+  display: 'block', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+  color: 'var(--theme-text)', fontSize: 11.5, lineHeight: 1.25,
+};
+
+const fileSearchPathStyle: React.CSSProperties = {
+  display: 'block', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+  color: 'var(--theme-text-muted)', fontSize: 9.5, lineHeight: 1.2,
+};
+
+const fileSearchSizeStyle: React.CSSProperties = {
+  flexShrink: 0, color: 'var(--theme-text-muted)', fontSize: 9,
+  fontVariantNumeric: 'tabular-nums', opacity: .8,
+};
+
+const fileSearchSourceStyle: React.CSSProperties = {
+  flexShrink: 0, padding: '1px 4px', borderRadius: 3,
+  color: 'var(--theme-text-muted)', background: 'var(--theme-hover, rgba(255,255,255,.06))',
+  fontSize: 9, lineHeight: 1.3,
+};
+
+const fileSearchErrorStyle: React.CSSProperties = {
+  padding: '5px 9px', color: '#f59e0b', background: 'rgba(245,158,11,.07)',
+  borderBottom: '1px solid rgba(245,158,11,.16)', fontSize: 10,
+  overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+};
+
+const searchHighlightStyle: React.CSSProperties = {
+  padding: 0, background: 'transparent', color: 'var(--theme-accent, #58a6ff)',
+  fontWeight: 700,
 };
 
 const headerIdentityStyle: React.CSSProperties = {

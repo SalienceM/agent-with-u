@@ -86,26 +86,12 @@ for /f "tokens=*" %%V in ('rustc --version 2^>^&1') do echo [OK] %%V
 echo.
 echo  -- Environment OK, starting build --
 echo.
-:: Read JSON with Python. findstr + quoted JSON keys is fragile under cmd.exe
-:: and previously parsed the opening "[" instead of the version value.
-set "CURRENT_VERSION=unknown"
-for /f "delims=" %%a in ('python -c "import json; print(json.load(open('src-tauri/tauri.conf.json',encoding='utf-8-sig')).get('version','unknown'))"') do set "CURRENT_VERSION=%%a"
-echo [INFO] Current version in config: !CURRENT_VERSION!
-:: Use YY.MM.DD format: MSI requires MAJOR<=255, MINOR<=255, PATCH<=65535
-:: e.g. 2026-03-23 → 26.3.23 (all components fit)
-for /f %%a in ('powershell -NoProfile -Command "[int](Get-Date -Format yy)"') do set VER_YY=%%a
-for /f %%a in ('powershell -NoProfile -Command "(Get-Date).Month"') do set VER_MM=%%a
-for /f %%a in ('powershell -NoProfile -Command "(Get-Date).Day"') do set VER_DD=%%a
-set "NEW_VERSION=!VER_YY!.!VER_MM!.!VER_DD!"
-echo [INFO] New version will be: !NEW_VERSION!
-:: Update version in tauri.conf.json using Python (avoids cmd pipe/quoting issues with PowerShell)
-python -c "import json; f='src-tauri/tauri.conf.json'; d=json.load(open(f,encoding='utf-8')); d['version']='!NEW_VERSION!'; open(f,'w',encoding='utf-8').write(json.dumps(d,ensure_ascii=False,indent=2)+'\n')"
-if errorlevel 1 ( echo [WARN] Version update failed, continuing with current version )
-echo [OK] Updated tauri.conf.json version to !NEW_VERSION!
-:: Sync version into Python package so the backend can log / expose it at runtime
-python -c "open('src/_version.py','w',encoding='utf-8').write('# auto-written by build_all.bat' + chr(10) + '__version__ = ' + chr(34) + '!NEW_VERSION!' + chr(34) + chr(10))"
-if errorlevel 1 ( echo [WARN] src/_version.py update failed )
-echo [OK] Updated src/_version.py to !NEW_VERSION!
+:: Same-day builds need distinct versions.  The stamper keeps Tauri/MSI's
+:: three numeric fields while exposing YY.M.D.HHMMSS to users and manifests.
+for /f "delims=" %%a in ('python scripts\stamp_version.py --field displayVersion') do set "DISPLAY_VERSION=%%a"
+if errorlevel 1 ( echo [ERROR] Version stamping failed & pause & exit /b 1 )
+for /f "delims=" %%a in ('python -c "import json; print(json.load(open('src-tauri/tauri.conf.json',encoding='utf-8-sig')).get('version','unknown'))"') do set "PACKAGE_VERSION=%%a"
+echo [OK] Build version !DISPLAY_VERSION! ^(package !PACKAGE_VERSION!^)
 :: ============================================================
 :: Step 1: PyInstaller - package Python sidecar
 :: ============================================================
@@ -167,6 +153,21 @@ del /q "src-tauri\target\release\agent-with-u-backend.exe" 2>nul
 if defined LOCAL_PROXY ( set "HTTPS_PROXY=%LOCAL_PROXY%" & echo [Proxy] %LOCAL_PROXY% )
 call npm run build
 if errorlevel 1 ( echo [FAILED] Tauri build failed & pause & exit /b 1 )
+:: When Docker Desktop is available, produce the Linux Docker image bundle in
+:: the same version group.  Set AGENT_WITH_U_SKIP_DOCKER_RELEASE=1 to skip it.
+if "%AGENT_WITH_U_SKIP_DOCKER_RELEASE%"=="1" goto docker_release_done
+where docker >nul 2>&1
+if errorlevel 1 goto docker_release_unavailable
+docker info >nul 2>&1
+if errorlevel 1 goto docker_release_unavailable
+call deploy\build-docker-release.bat --reuse-version
+if errorlevel 1 echo [WARN] Windows package succeeded, but Docker release bundle failed.
+goto docker_release_done
+:docker_release_unavailable
+echo [INFO] Docker engine unavailable; skipped optional Docker online-update bundle.
+:docker_release_done
+python scripts\register_release_candidate.py --project-root "%CD%" --source build_all
+if errorlevel 1 echo [WARN] Build succeeded, but release candidate registration failed. You can rescan in Release Center.
 echo.
 echo  ============================================
 echo   Done! Installer is at:

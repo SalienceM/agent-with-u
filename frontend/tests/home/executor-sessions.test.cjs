@@ -2,7 +2,18 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const {
   mergeExecutorSessionBatches,
+  selectExactExecutor,
 } = require('../../.home-test-dist/utils/executorSessions.js');
+
+test('an explicit remote executor never falls back to home', () => {
+  const home = { key: 'local' };
+  const remote = { key: 'relay:user:pc_47' };
+  const connections = new Map([[remote.key, remote]]);
+
+  assert.equal(selectExactExecutor(connections, home), home);
+  assert.equal(selectExactExecutor(connections, home, remote.key), remote);
+  assert.equal(selectExactExecutor(connections, home, 'relay:user:offline'), null);
+});
 
 test('the same sidecar exposed through local and Relay is rendered once', () => {
   const shared = { id: 'session-1', title: '同一会话' };
