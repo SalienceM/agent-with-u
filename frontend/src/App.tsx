@@ -82,6 +82,10 @@ export const App: React.FC = () => {
   }, []);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [backendManagerOpen, setBackendManagerOpen] = useState(false);
+  const [backendManagerExecKey, setBackendManagerExecKey] = useState(() => getHomeExecKey());
+  const [backendManagerLoading, setBackendManagerLoading] = useState(false);
+  const [backendManagerError, setBackendManagerError] = useState('');
+  const backendManagerLoadGenerationRef = useRef(0);
   const [repoPanelOpen, setRepoPanelOpen] = useState(false);
   const [logViewerOpen, setLogViewerOpen] = useState(false);
   const [connPanelOpen, setConnPanelOpen] = useState(false);
@@ -473,11 +477,38 @@ export const App: React.FC = () => {
     if (backendConnected !== true) return;
 
     api.getBackends().then(setBackends);
-    api.getBackends(undefined, true).then(setBackendConfigs);
     // 首页是明确的应用入口：连接完成后刷新真实数据，但不自动跳入最近会话，
     // 也不在空数据时强制弹出新建窗口。
     refreshSessionList();
   }, [backendConnected, refreshSessionList]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const loadBackendManagerConfigs = useCallback(async (execKey: string) => {
+    const generation = ++backendManagerLoadGenerationRef.current;
+    setBackendManagerLoading(true);
+    setBackendManagerError('');
+    try {
+      const list = await api.getBackends(execKey, true);
+      if (generation === backendManagerLoadGenerationRef.current) {
+        setBackendConfigs(list);
+      }
+    } catch (error: any) {
+      if (generation === backendManagerLoadGenerationRef.current) {
+        setBackendConfigs([]);
+        setBackendManagerError(error?.message || '无法读取该执行节点的 Backend 配置');
+      }
+    } finally {
+      if (generation === backendManagerLoadGenerationRef.current) {
+        setBackendManagerLoading(false);
+      }
+    }
+  }, []);
+
+  // Backend 配置属于物理执行节点。管理器打开或切换节点时，只读取明确选中的
+  // 节点；离线时保留错误，不允许 API 静默回退到默认节点。
+  useEffect(() => {
+    if (!backendManagerOpen) return;
+    void loadBackendManagerConfigs(backendManagerExecKey);
+  }, [backendManagerExecKey, backendManagerOpen, loadBackendManagerConfigs]);
 
   /* ---- 多端同步：其它客户端增删改 session 时刷新侧边栏 ---- */
   useEffect(() => {
@@ -731,14 +762,14 @@ export const App: React.FC = () => {
     }
     if (destination.section === 'models') {
       refreshSessionList();
-      api.getBackends(undefined, true).then(setBackendConfigs);
+      setBackendManagerExecKey(activeSession?.execKey || getHomeExecKey());
       setBackendManagerOpen(true);
     } else if (destination.section === 'connections') {
       setConnPanelOpen(true);
     } else {
       setSettingsOpen(true);
     }
-  }, [isMobile, refreshSessionList, setSessionInPane]);
+  }, [activeSession?.execKey, isMobile, refreshSessionList, setSessionInPane]);
 
   const handleCreateSession = useCallback(async (
     workingDir: string,
@@ -906,29 +937,35 @@ export const App: React.FC = () => {
   }, [showToast, runImport]);
 
   /* ---- Backend Manager ---- */
-  const handleSaveBackend = useCallback(async (config: any) => {
-    await api.saveBackend(config);
-    // Refresh backend list
-    const [list, allBackendConfigs] = await Promise.all([
-      api.getBackends(),
-      api.getBackends(undefined, true),
-    ]);
-    setBackends(list);
+  const handleSaveBackend = useCallback(async (config: any, execKey: string) => {
+    await api.saveBackend(config, execKey);
+    const allBackendConfigs = await api.getBackends(execKey, true);
     setBackendConfigs(allBackendConfigs);
+    // App 顶层 backends 表示当前默认执行节点；管理其它节点时不能拿远端列表
+    // 覆盖它，否则顶栏和新建会话会短暂显示错节点的 Backend。
+    if (execKey === getHomeExecKey()) {
+      setBackends(await api.getBackends(execKey));
+    }
     // Also refresh sessions to update backend references
     await refreshSessionList();
   }, [refreshSessionList]);
 
-  const handleDeleteBackend = useCallback(async (id: string, dependentSessions: any[] = [], targetBackendId?: string) => {
+  const handleDeleteBackend = useCallback(async (
+    id: string,
+    execKey: string,
+    dependentSessions: any[] = [],
+    targetBackendId?: string,
+  ) => {
     // If there are dependent sessions and a target backend is specified, migrate them
     if (dependentSessions.length > 0 && targetBackendId) {
       // 记录每个旧 session 迁移后对应的新 session id,后面统一替换 paneSessions
       const idMap = new Map<string, string>();
       for (const session of dependentSessions) {
-        const result = await api.migrateSession(session.id, targetBackendId);
-        if (result?.newSessionId) {
-          idMap.set(session.id, result.newSessionId);
+        const result = await api.migrateSession(session.id, targetBackendId, execKey);
+        if (result?.status !== 'ok' || !result?.newSessionId) {
+          throw new Error(result?.message || `迁移会话失败：${session.title || session.id}`);
         }
+        idMap.set(session.id, result.newSessionId);
       }
       // Refresh sessions after migration
       await refreshSessionList();
@@ -938,14 +975,12 @@ export const App: React.FC = () => {
       }
     }
 
-    await api.deleteBackend(id);
-    // Refresh backend list
-    const [list, allBackendConfigs] = await Promise.all([
-      api.getBackends(),
-      api.getBackends(undefined, true),
-    ]);
-    setBackends(list);
+    await api.deleteBackend(id, execKey);
+    const allBackendConfigs = await api.getBackends(execKey, true);
     setBackendConfigs(allBackendConfigs);
+    if (execKey === getHomeExecKey()) {
+      setBackends(await api.getBackends(execKey));
+    }
   }, [refreshSessionList]);
 
   const theme = themes[config.theme] || themes.dark;
@@ -1677,7 +1712,7 @@ export const App: React.FC = () => {
         onOpenBackendManager={() => {
           setSettingsOpen(false);
           refreshSessionList();
-          api.getBackends(undefined, true).then(setBackendConfigs);
+          setBackendManagerExecKey(activeSession?.execKey || getHomeExecKey());
           setBackendManagerOpen(true);
         }}
         onExportData={handleExportData}
@@ -1705,6 +1740,11 @@ export const App: React.FC = () => {
         onClose={() => setBackendManagerOpen(false)}
         backends={backendConfigs}
         sessions={sessions}
+        targetExecKey={backendManagerExecKey}
+        loading={backendManagerLoading}
+        loadError={backendManagerError}
+        onTargetExecChange={setBackendManagerExecKey}
+        onRefresh={() => loadBackendManagerConfigs(backendManagerExecKey)}
         onSaveBackend={handleSaveBackend}
         onDeleteBackend={handleDeleteBackend}
       />

@@ -1,5 +1,9 @@
 import React, { useState, useCallback, useEffect } from 'react';
-import { api } from '../api';
+import {
+  api, getExecutors, getHomeExecKey, onExecStatus,
+  type ExecutorInfo,
+} from '../api';
+import { sessionsForBackendExecutor } from '../utils/backendManagement';
 
 // 注入删除按钮 hover 样式（只执行一次）
 if (typeof document !== 'undefined' && !document.getElementById('bm-delete-btn-style')) {
@@ -62,8 +66,18 @@ interface BackendManagerProps {
   isOpen: boolean;
   onClose: () => void;
   backends: BackendConfig[];
-  onSaveBackend: (config: BackendConfig) => void;
-  onDeleteBackend: (id: string, dependentSessions?: any[], targetBackendId?: string) => void;
+  targetExecKey: string;
+  loading?: boolean;
+  loadError?: string;
+  onTargetExecChange: (execKey: string) => void;
+  onRefresh: () => void | Promise<void>;
+  onSaveBackend: (config: BackendConfig, execKey: string) => Promise<void>;
+  onDeleteBackend: (
+    id: string,
+    execKey: string,
+    dependentSessions?: any[],
+    targetBackendId?: string,
+  ) => Promise<void>;
   sessions?: any[];
 }
 
@@ -166,6 +180,11 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
   isOpen,
   onClose,
   backends,
+  targetExecKey,
+  loading = false,
+  loadError = '',
+  onTargetExecChange,
+  onRefresh,
   onSaveBackend,
   onDeleteBackend,
   sessions = [],
@@ -189,6 +208,11 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
   const [currentModel, setCurrentModel] = useState<string>('');
   const [backendToDelete, setBackendToDelete] = useState<BackendConfig | null>(null);
   const [dependentSessions, setDependentSessions] = useState<any[]>([]);
+  const [executors, setExecutors] = useState<ExecutorInfo[]>(() => getExecutors());
+  const [operationBusy, setOperationBusy] = useState(false);
+  const [operationMessage, setOperationMessage] = useState<{
+    kind: 'ok' | 'error'; text: string;
+  } | null>(null);
 
   // MCP tab state
   const [activeTab, setActiveTab] = useState<'backends' | 'mcp'>('backends');
@@ -198,6 +222,33 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
   const [editingMcpName, setEditingMcpName] = useState<string | null>(null);
   const [mcpForm, setMcpForm] = useState({ name: '', command: 'npx', args: '', env: '' });
   const [mcpSaveMsg, setMcpSaveMsg] = useState<string | null>(null);
+
+  const selectedExecutor = executors.find((item) => item.key === targetExecKey);
+  const nodeSessions = sessionsForBackendExecutor(
+    sessions,
+    targetExecKey,
+    getHomeExecKey(),
+  );
+
+  useEffect(() => {
+    if (!isOpen) return;
+    const refresh = () => setExecutors(getExecutors());
+    refresh();
+    return onExecStatus(refresh);
+  }, [isOpen]);
+
+  // 切换物理节点时，任何尚未提交的编辑/删除上下文都必须清掉，防止把 A 节点
+  // 表单保存到 B 节点。MCP 列表也由下面的 effect 按节点重新加载。
+  useEffect(() => {
+    setIsEditing(false);
+    setEditingBackend(null);
+    setBackendToDelete(null);
+    setDependentSessions([]);
+    setIsEditingMcp(false);
+    setEditingMcpName(null);
+    setOperationMessage(null);
+    window.__targetBackendForMigration = undefined;
+  }, [targetExecKey]);
 
   const handleNewBackend = useCallback(() => {
     setFormData({
@@ -223,11 +274,11 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
     setIsEditing(true);
     // 打开官方后端编辑时，读取当前模型
     if (backend.id === OFFICIAL_BACKEND_ID) {
-      api.getClaudeSettings().then(s => setCurrentModel(s.model || ''));
+      api.getClaudeSettings(targetExecKey).then(s => setCurrentModel(s.model || ''));
     }
-  }, []);
+  }, [targetExecKey]);
 
-  const handleSave = useCallback(() => {
+  const handleSave = useCallback(async () => {
     const saved: BackendConfig = {
       id: formData.id,
       type: formData.type,
@@ -320,10 +371,25 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
       if (Object.keys(cleanedEnv).length > 0) saved.env = cleanedEnv;
     }
 
-    onSaveBackend(saved);
-    setIsEditing(false);
-    onClose();
-  }, [formData, onSaveBackend, onClose]);
+    setOperationBusy(true);
+    setOperationMessage(null);
+    try {
+      await onSaveBackend(saved, targetExecKey);
+      setIsEditing(false);
+      setEditingBackend(null);
+      setOperationMessage({
+        kind: 'ok',
+        text: `已保存到「${selectedExecutor?.label || targetExecKey}」`,
+      });
+    } catch (error: any) {
+      setOperationMessage({
+        kind: 'error',
+        text: error?.message || '保存 Backend 失败',
+      });
+    } finally {
+      setOperationBusy(false);
+    }
+  }, [formData, onSaveBackend, selectedExecutor?.label, targetExecKey]);
 
   const handleEnvChange = useCallback((key: string, value: string) => {
     setFormData((prev) => ({
@@ -339,76 +405,103 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
     setLoginLaunching(true);
     setLoginMsg(null);
     try {
-      const res = await api.openLoginTerminal(formData.id);
+      const res = await api.openLoginTerminal(formData.id, targetExecKey);
       if (res.status === 'error') {
         setLoginMsg(res.message || '打开失败');
       } else {
-        setLoginMsg('已打开终端，请在终端窗口完成登录后关闭该窗口，再回来使用。');
+        setLoginMsg(`已在「${selectedExecutor?.label || targetExecKey}」打开终端，请在该机器完成登录。`);
       }
     } catch (e: any) {
       setLoginMsg(e?.message || '打开失败');
     } finally {
       setLoginLaunching(false);
     }
-  }, [formData.id]);
+  }, [formData.id, selectedExecutor?.label, targetExecKey]);
 
   const handleOpenModelTerminal = useCallback(async () => {
     setModelLaunching(true);
     setModelMsg(null);
     try {
-      const res = await api.openModelTerminal(formData.id);
+      const res = await api.openModelTerminal(formData.id, targetExecKey);
       if (res.status === 'error') {
         setModelMsg(res.message || '打开失败');
       } else {
-        setModelMsg('已打开终端，在 claude 中输入 /model <模型名> 切换，重启 AgentWithU 后生效。');
+        setModelMsg(`已在「${selectedExecutor?.label || targetExecKey}」打开终端；切换模型后重启该执行节点生效。`);
       }
     } catch (e: any) {
       setModelMsg(e?.message || '打开失败');
     } finally {
       setModelLaunching(false);
     }
-  }, [formData.id]);
+  }, [formData.id, selectedExecutor?.label, targetExecKey]);
 
   const handleDeleteClick = useCallback((backend: BackendConfig) => {
-    // Find sessions that depend on this backend
-    const dependents = sessions.filter(s => s.backendId === backend.id);
+    // Backend ID 只在当前物理节点内有意义；不能把其它节点上同名 Backend 的
+    // Session 误判为依赖，更不能跨节点迁移。
+    const dependents = nodeSessions.filter(s => s.backendId === backend.id);
 
     // Always show confirmation dialog (two-step confirmation)
     setDependentSessions(dependents);
     setBackendToDelete(backend);
-  }, [sessions]);
+  }, [nodeSessions]);
 
-  const confirmDeleteBackend = useCallback(() => {
-    if (backendToDelete) {
-      if (dependentSessions.length > 0) {
-        // 有依赖的 session，需要选择目标后端
-        const targetBackendId = window.__targetBackendForMigration;
-        if (!targetBackendId || targetBackendId === backendToDelete.id) {
-          alert('请选择一个有效的目标后端');
-          return;
-        }
-        // Call the original delete handler with migration info
-        onDeleteBackend(backendToDelete.id, dependentSessions, targetBackendId);
-        window.__targetBackendForMigration = undefined;
-      } else {
-        // 没有依赖的 session，直接删除
-        onDeleteBackend(backendToDelete.id);
+  const confirmDeleteBackend = useCallback(async () => {
+    if (!backendToDelete) return;
+    let targetBackendId: string | undefined;
+    if (dependentSessions.length > 0) {
+      targetBackendId = window.__targetBackendForMigration;
+      if (!targetBackendId || targetBackendId === backendToDelete.id) {
+        alert('请选择一个有效的目标后端');
+        return;
       }
+    }
+    setOperationBusy(true);
+    setOperationMessage(null);
+    try {
+      await onDeleteBackend(
+        backendToDelete.id,
+        targetExecKey,
+        dependentSessions,
+        targetBackendId,
+      );
+      setOperationMessage({
+        kind: 'ok',
+        text: `已从「${selectedExecutor?.label || targetExecKey}」删除 Backend`,
+      });
       setBackendToDelete(null);
       setDependentSessions([]);
+      window.__targetBackendForMigration = undefined;
+    } catch (error: any) {
+      setOperationMessage({
+        kind: 'error',
+        text: error?.message || '删除 Backend 失败',
+      });
+    } finally {
+      setOperationBusy(false);
     }
-  }, [backendToDelete, dependentSessions, onDeleteBackend]);
+  }, [backendToDelete, dependentSessions, onDeleteBackend, selectedExecutor?.label, targetExecKey]);
 
   // Load MCP servers when dialog opens
   useEffect(() => {
+    let cancelled = false;
     if (isOpen) {
       setMcpLoading(true);
-      api.getMcpServers().then(servers => {
+      setMcpServers({});
+      api.getMcpServers(targetExecKey).then(servers => {
+        if (cancelled) return;
         setMcpServers(servers);
         setMcpLoading(false);
-      }).catch(() => setMcpLoading(false));
+      }).catch((error: any) => {
+        if (cancelled) return;
+        setMcpLoading(false);
+        setOperationMessage({
+          kind: 'error',
+          text: error?.message || '无法读取该执行节点的 MCP 配置',
+        });
+      });
     }
-  }, [isOpen]);
+    return () => { cancelled = true; };
+  }, [isOpen, targetExecKey]);
 
   const handleNewMcp = useCallback(() => {
     setMcpForm({ name: '', command: 'npx', args: '', env: '' });
@@ -436,25 +529,39 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
     if (args.length > 0) srv.args = args;
     if (Object.keys(env).length > 0) srv.env = env;
     const updated = { ...mcpServers, [mcpForm.name.trim()]: srv };
-    const result = await api.saveMcpServers(updated);
-    if (result.status === 'ok') {
+    setOperationBusy(true);
+    setOperationMessage(null);
+    try {
+      const result = await api.saveMcpServers(updated, targetExecKey);
+      if (result.status !== 'ok') throw new Error(result.message || '保存 MCP 配置失败');
       setMcpServers(updated);
       setIsEditingMcp(false);
       setMcpSaveMsg('已保存');
       setTimeout(() => setMcpSaveMsg(null), 2000);
+    } catch (error: any) {
+      setOperationMessage({ kind: 'error', text: error?.message || '保存 MCP 配置失败' });
+    } finally {
+      setOperationBusy(false);
     }
-  }, [mcpForm, mcpServers]);
+  }, [mcpForm, mcpServers, targetExecKey]);
 
   const handleDeleteMcp = useCallback(async (name: string) => {
     const updated = { ...mcpServers };
     delete updated[name];
-    const result = await api.saveMcpServers(updated);
-    if (result.status === 'ok') {
+    setOperationBusy(true);
+    setOperationMessage(null);
+    try {
+      const result = await api.saveMcpServers(updated, targetExecKey);
+      if (result.status !== 'ok') throw new Error(result.message || '删除 MCP 配置失败');
       setMcpServers(updated);
       setMcpSaveMsg('已删除');
       setTimeout(() => setMcpSaveMsg(null), 2000);
+    } catch (error: any) {
+      setOperationMessage({ kind: 'error', text: error?.message || '删除 MCP 配置失败' });
+    } finally {
+      setOperationBusy(false);
     }
-  }, [mcpServers]);
+  }, [mcpServers, targetExecKey]);
 
   if (!isOpen) return null;
 
@@ -471,6 +578,70 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
           </h2>
           <button onClick={onClose} style={closeBtnStyle}>✕</button>
         </div>
+
+        {/* Backend/MCP 均属于物理执行节点，不跟随当前聊天会话隐式切换。 */}
+        <div style={{
+          marginBottom: 14,
+          padding: '10px 12px',
+          border: '1px solid var(--theme-border)',
+          borderRadius: 8,
+          background: 'var(--theme-input-bg)',
+        }}>
+          <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+            <label style={{ fontSize: 12, fontWeight: 600, color: 'var(--theme-text)', flexShrink: 0 }}>
+              管理执行节点
+            </label>
+            <select
+              aria-label="管理执行节点"
+              value={targetExecKey}
+              disabled={operationBusy || isEditing || isEditingMcp || !!backendToDelete}
+              onChange={(event) => onTargetExecChange(event.target.value)}
+              style={{ ...selectStyle, flex: 1, minWidth: 0 }}
+            >
+              {!executors.some((item) => item.key === targetExecKey) && (
+                <option value={targetExecKey}>{targetExecKey}（未连接）</option>
+              )}
+              {executors.map((executor) => (
+                <option key={executor.key} value={executor.key} disabled={!executor.connected}>
+                  {executor.label}{executor.isHome ? ' · 默认' : ''}{executor.connected ? '' : ' · 离线'}
+                </option>
+              ))}
+            </select>
+            <button
+              type="button"
+              onClick={() => { setOperationMessage(null); void onRefresh(); }}
+              disabled={loading || operationBusy}
+              style={{ ...cancelBtnStyle, padding: '7px 10px', flexShrink: 0 }}
+              title="重新读取所选节点的 Backend 配置"
+            >
+              {loading ? '读取中…' : '刷新'}
+            </button>
+          </div>
+          <div style={{ marginTop: 6, fontSize: 11, lineHeight: 1.5, color: 'var(--theme-text-muted)' }}>
+            配置只写入所选节点。远端节点需先在“连接 → 可分配执行节点”中加入并保持在线。
+          </div>
+        </div>
+
+        {(loadError || operationMessage) && (
+          <div style={{
+            marginBottom: 12,
+            padding: '8px 10px',
+            borderRadius: 7,
+            fontSize: 12,
+            lineHeight: 1.5,
+            color: loadError || operationMessage?.kind === 'error'
+              ? 'rgba(248,113,113,0.98)'
+              : 'rgba(74,222,128,0.98)',
+            background: loadError || operationMessage?.kind === 'error'
+              ? 'rgba(239,68,68,0.1)'
+              : 'rgba(34,197,94,0.1)',
+            border: `1px solid ${loadError || operationMessage?.kind === 'error'
+              ? 'rgba(239,68,68,0.25)'
+              : 'rgba(34,197,94,0.25)'}`,
+          }}>
+            {loadError || operationMessage?.text}
+          </div>
+        )}
 
         {/* Tab 导航 */}
         <div style={{ display: 'flex', gap: 4, marginBottom: 16, borderBottom: '1px solid var(--theme-border)', paddingBottom: 10 }}>
@@ -494,7 +665,15 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
           // Backend 列表视图
           <>
             <div style={{ marginBottom: 16 }}>
-              {backends.length === 0 ? (
+              {loading ? (
+                <div style={{ color: 'var(--theme-text-muted)', fontSize: 13, textAlign: 'center', padding: 20 }}>
+                  正在读取所选执行节点…
+                </div>
+              ) : loadError ? (
+                <div style={{ color: 'var(--theme-text-muted)', fontSize: 13, textAlign: 'center', padding: 20 }}>
+                  无法显示该节点的 Backend，请恢复连接后刷新
+                </div>
+              ) : backends.length === 0 ? (
                 <div style={{ color: 'var(--theme-text-muted)', fontSize: 13, textAlign: 'center', padding: 20 }}>
                   No backends configured
                 </div>
@@ -565,7 +744,14 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
               )}
             </div>
 
-            <button onClick={handleNewBackend} style={addBtnStyle}>
+            <button
+              onClick={handleNewBackend}
+              disabled={loading || !!loadError || !selectedExecutor?.connected}
+              style={{
+                ...addBtnStyle,
+                opacity: loading || loadError || !selectedExecutor?.connected ? 0.5 : 1,
+              }}
+            >
               + New Backend
             </button>
           </>
@@ -1840,8 +2026,15 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
             )}
 
             <div style={{ display: 'flex', gap: 8, marginTop: 20 }}>
-              <button onClick={handleSave} style={saveBtnStyle}>
-                Save
+              <button
+                onClick={handleSave}
+                disabled={operationBusy || !selectedExecutor?.connected}
+                style={{
+                  ...saveBtnStyle,
+                  opacity: operationBusy || !selectedExecutor?.connected ? 0.5 : 1,
+                }}
+              >
+                {operationBusy ? 'Saving…' : 'Save'}
               </button>
               <button onClick={() => setIsEditing(false)} style={cancelBtnStyle}>
                 Back
@@ -1879,7 +2072,8 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
                   <button
                     className="bm-delete-btn"
                     onClick={(e) => { e.stopPropagation(); handleDeleteMcp(name); }}
-                    style={deleteBtnStyle}
+                    disabled={operationBusy}
+                    style={{ ...deleteBtnStyle, opacity: operationBusy ? 0.5 : 1 }}
                     title="删除"
                   >🗑</button>
                 </div>
@@ -1887,7 +2081,15 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
             )}
             <button
               onClick={handleNewMcp}
-              style={{ ...addBtnStyle, background: 'rgba(99,102,241,0.12)', border: '1px solid rgba(99,102,241,0.3)', color: 'rgba(165,168,255,0.9)', marginTop: 8 }}
+              disabled={mcpLoading || operationBusy || !selectedExecutor?.connected}
+              style={{
+                ...addBtnStyle,
+                background: 'rgba(99,102,241,0.12)',
+                border: '1px solid rgba(99,102,241,0.3)',
+                color: 'rgba(165,168,255,0.9)',
+                marginTop: 8,
+                opacity: mcpLoading || operationBusy || !selectedExecutor?.connected ? 0.5 : 1,
+              }}
             >
               + 添加 MCP 服务器
             </button>
@@ -1946,10 +2148,13 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
             <div style={{ display: 'flex', gap: 8, marginTop: 8 }}>
               <button
                 onClick={handleSaveMcp}
-                disabled={!mcpForm.name.trim() || !mcpForm.command.trim()}
-                style={{ ...saveBtnStyle, opacity: (!mcpForm.name.trim() || !mcpForm.command.trim()) ? 0.5 : 1 }}
+                disabled={operationBusy || !selectedExecutor?.connected || !mcpForm.name.trim() || !mcpForm.command.trim()}
+                style={{
+                  ...saveBtnStyle,
+                  opacity: operationBusy || !selectedExecutor?.connected || !mcpForm.name.trim() || !mcpForm.command.trim() ? 0.5 : 1,
+                }}
               >
-                Save
+                {operationBusy ? 'Saving…' : 'Save'}
               </button>
               <button onClick={() => setIsEditingMcp(false)} style={cancelBtnStyle}>Back</button>
             </div>
@@ -1996,8 +2201,12 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
               </div>
 
               <div style={{ display: 'flex', gap: 8 }}>
-                <button onClick={confirmDeleteBackend} style={{ ...confirmBtnStyle, flex: 1 }}>
-                  迁移并删除
+                <button
+                  onClick={confirmDeleteBackend}
+                  disabled={operationBusy}
+                  style={{ ...confirmBtnStyle, flex: 1, opacity: operationBusy ? 0.5 : 1 }}
+                >
+                  {operationBusy ? '处理中…' : '迁移并删除'}
                 </button>
                 <button onClick={() => { setBackendToDelete(null); setDependentSessions([]); }} style={cancelBtnStyle}>
                   取消
@@ -2021,8 +2230,12 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
                 此操作不可撤销。
               </p>
               <div style={{ display: 'flex', gap: 8 }}>
-                <button onClick={confirmDeleteBackend} style={{ ...confirmBtnStyle, flex: 1 }}>
-                  删除
+                <button
+                  onClick={confirmDeleteBackend}
+                  disabled={operationBusy}
+                  style={{ ...confirmBtnStyle, flex: 1, opacity: operationBusy ? 0.5 : 1 }}
+                >
+                  {operationBusy ? '处理中…' : '删除'}
                 </button>
                 <button onClick={() => { setBackendToDelete(null); setDependentSessions([]); }} style={cancelBtnStyle}>
                   取消

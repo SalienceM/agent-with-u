@@ -1883,7 +1883,13 @@ class BridgeWS:
             method.startswith("nodeUpdate")
             or method.startswith("release")
             or method.startswith("relayNode")
+            or method in {
+                "saveBackend", "deleteBackend",
+                "saveMcpServers", "openLoginTerminal", "openModelTerminal",
+            }
         ):
+            # Backend/MCP 配置和登录终端与更新一样，都是物理节点级共享状态。
+            # 两名用户共用一个执行节点时，普通共享用户不能互相覆盖全局配置。
             self._require_node_update_capability()
         try:
             bound = inspect.signature(handler).bind_partial(*params)
@@ -4515,6 +4521,10 @@ class BridgeWS:
         target_backend_id = payload.get("targetBackendId")
         if not source_id or not target_backend_id:
             return json.dumps({"status": "error", "message": "Missing parameters"})
+
+        # payload 内的 sourceSessionId 不会被通用签名门控自动识别；远端管理
+        # Backend 时仍必须先验证当前 Relay 用户拥有该 Session。
+        self._require_session_access(str(source_id))
 
         source = self._active_sessions.get(source_id) or self._session_store.load(source_id)
         if not source:

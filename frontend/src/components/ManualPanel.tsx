@@ -80,7 +80,7 @@ const SECTIONS: ManualSection[] = [
   {
     id: 'models', title: '模型与连接', icon: '🌐', intro: '选择模型、代理方式和任务实际运行的机器。',
     items: [
-      { icon: '🤖', title: 'Backend 与运行参数', summary: 'Backend 负责账号、连接、CLI 和默认值；新建 Codex 会话时再选具体模型与推理档位，不必为 Sol / Terra 复制 Backend。', entry: '设置 → Backend Manager / 新建会话' },
+      { icon: '🤖', title: 'Backend 与运行参数', summary: 'Backend 负责账号、连接、CLI 和默认值；管理器顶部可选择任一已加入且在线的执行节点，配置、MCP 与登录终端都会严格作用于该节点。共享节点仅本机或 Relay 主用户可修改。', entry: '设置 → Backend Manager → 管理执行节点' },
       { icon: '🧲', title: '接管已有 Codex 会话', summary: '从当前所选 AgentWithU 执行节点读取原生 Codex threads，导入可见历史并继续同一上下文。家里执行节点通过 Relay 连接时，不需要家庭公网 IP 或 SSH。', entry: '新建会话 → 选择执行节点 → Codex → 接管已有', tips: '执行节点应以拥有这些 Codex 会话的同一系统用户运行，并已安装独立 Codex CLI。' },
       { icon: '🔀', title: 'Loop 分角色模型', summary: '任务执行、想法、目标、评审和旁路可分别覆盖模型与档位。例如执行用 Terra / medium，评审用 Sol / max；每次结果会记录实际选型。', entry: 'Loop → 策略与心智 → 角色运行配置' },
       { icon: '🛡', title: '权限确认', summary: '控制模型执行写文件和命令时是否逐次确认。跳过确认更流畅，但会按当前进程权限直接执行。', entry: '输入工具栏 ⚡（悬浮查看说明）' },

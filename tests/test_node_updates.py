@@ -362,6 +362,21 @@ class NodeUpdateAuthorizationTests(unittest.TestCase):
             _REQUEST_CAN_CLAIM_LEGACY.reset(capability)
             _REQUEST_IDENTITY_SOURCE.reset(source)
 
+    def test_backend_management_is_also_node_owner_only(self):
+        bridge = object.__new__(BridgeWS)
+        source = _REQUEST_IDENTITY_SOURCE.set("relay")
+        capability = _REQUEST_CAN_CLAIM_LEGACY.set(False)
+        try:
+            for method in (
+                "saveBackend", "deleteBackend", "saveMcpServers",
+                "openLoginTerminal", "openModelTerminal",
+            ):
+                with self.subTest(method=method), self.assertRaises(PermissionError):
+                    bridge._authorize_rpc(method, lambda: None, [])
+        finally:
+            _REQUEST_CAN_CLAIM_LEGACY.reset(capability)
+            _REQUEST_IDENTITY_SOURCE.reset(source)
+
 
 if __name__ == "__main__":
     unittest.main()

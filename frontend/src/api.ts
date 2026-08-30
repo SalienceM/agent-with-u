@@ -2046,11 +2046,16 @@ export const api = {
     try { return JSON.parse(result); } catch { return { status: 'error', message: '响应格式错误' }; }
   },
 
-  /** 列出后端配置;execKey 指定时取该执行节点的后端列表(新建会话选远端时用)。 */
+  /**
+   * 列出后端配置。显式传入 execKey 时必须精确命中该执行节点：管理远端
+   * Backend 不能在节点离线/被移除时静默回退到 home，否则会读到甚至改错机器。
+   */
   async getBackends(execKey?: string, includeDisabled = false): Promise<any[]> {
-    const conn = (execKey && pool.get(execKey)) || homeConn;
     // 默认保持无参数调用，兼容尚未升级的远端执行节点。
-    const result = await conn.request('getBackends', includeDisabled ? [true] : []);
+    const params = includeDisabled ? [true] : [];
+    const result = execKey
+      ? await callOnStrict(execKey, 'getBackends', params, 10_000)
+      : await homeConn.request('getBackends', params);
     try { return JSON.parse(result); } catch { return []; }
   },
 
@@ -2067,11 +2072,19 @@ export const api = {
     }
   },
 
-  async saveBackend(config: any): Promise<void> {
+  async saveBackend(config: any, execKey?: string): Promise<void> {
+    if (execKey) {
+      await callOnStrict(execKey, 'saveBackend', [JSON.stringify(config)], 15_000);
+      return;
+    }
     await send('saveBackend', JSON.stringify(config));
   },
 
-  async deleteBackend(id: string): Promise<void> {
+  async deleteBackend(id: string, execKey?: string): Promise<void> {
+    if (execKey) {
+      await callOnStrict(execKey, 'deleteBackend', [id], 15_000);
+      return;
+    }
     await send('deleteBackend', id);
   },
 
@@ -2084,8 +2097,11 @@ export const api = {
     return nativeOpenAnyFile();
   },
 
-  async migrateSession(sourceSessionId: string, targetBackendId: string): Promise<any> {
-    const result = await call('migrateSession', JSON.stringify({ sourceSessionId, targetBackendId }));
+  async migrateSession(sourceSessionId: string, targetBackendId: string, execKey?: string): Promise<any> {
+    const payload = JSON.stringify({ sourceSessionId, targetBackendId });
+    const result = execKey
+      ? await callOnStrict(execKey, 'migrateSession', [payload], 120_000)
+      : await call('migrateSession', payload);
     try { return JSON.parse(result); } catch { return null; }
   },
 
@@ -3096,28 +3112,39 @@ export const api = {
   },
 
   /** 响应后端发出的 permissionRequest，granted=true 继续，false 取消。 */
-  async openLoginTerminal(backendId: string): Promise<{ status: string; message?: string }> {
-    const result = await call('openLoginTerminal', backendId);
+  async openLoginTerminal(backendId: string, execKey?: string): Promise<{ status: string; message?: string }> {
+    const result = execKey
+      ? await callOnStrict(execKey, 'openLoginTerminal', [backendId], 15_000)
+      : await call('openLoginTerminal', backendId);
     try { return JSON.parse(result); } catch { return { status: 'ok' }; }
   },
 
-  async openModelTerminal(backendId: string): Promise<{ status: string; message?: string }> {
-    const result = await call('openModelTerminal', backendId);
+  async openModelTerminal(backendId: string, execKey?: string): Promise<{ status: string; message?: string }> {
+    const result = execKey
+      ? await callOnStrict(execKey, 'openModelTerminal', [backendId], 15_000)
+      : await call('openModelTerminal', backendId);
     try { return JSON.parse(result); } catch { return { status: 'ok' }; }
   },
 
-  async getClaudeSettings(): Promise<{ model: string }> {
-    const result = await call('getClaudeSettings');
+  async getClaudeSettings(execKey?: string): Promise<{ model: string }> {
+    const result = execKey
+      ? await callOnStrict(execKey, 'getClaudeSettings', [], 10_000)
+      : await call('getClaudeSettings');
     try { return JSON.parse(result); } catch { return { model: '' }; }
   },
 
-  async getMcpServers(): Promise<Record<string, any>> {
-    const result = await call('getMcpServers');
+  async getMcpServers(execKey?: string): Promise<Record<string, any>> {
+    const result = execKey
+      ? await callOnStrict(execKey, 'getMcpServers', [], 10_000)
+      : await call('getMcpServers');
     try { return JSON.parse(result) || {}; } catch { return {}; }
   },
 
-  async saveMcpServers(servers: Record<string, any>): Promise<{ status: string; message?: string }> {
-    const result = await call('saveMcpServers', JSON.stringify(servers));
+  async saveMcpServers(servers: Record<string, any>, execKey?: string): Promise<{ status: string; message?: string }> {
+    const params = [JSON.stringify(servers)];
+    const result = execKey
+      ? await callOnStrict(execKey, 'saveMcpServers', params, 15_000)
+      : await call('saveMcpServers', ...params);
     try { return JSON.parse(result); } catch { return { status: 'ok' }; }
   },
 

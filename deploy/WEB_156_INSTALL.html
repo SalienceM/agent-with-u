@@ -371,6 +371,7 @@ awu-updater   Up</code></pre>
 <p>Relay 主 Token 不会保存在浏览器，也不会由状态接口回显；它只写入持久化目录：</p>
 <pre class="md-pre"><code class="hljs"><div class="md-code-lang">text</div>/volume1/docker/agent-with-u/data/relay-node.json</code></pre>
 <p>取消纳管只会停止对外发布，不会关闭同源 Backend，也不会影响当前 Web 自执行。<br>只有本机直连用户或 Relay 为该设备指定的主用户可以修改这项全局节点配置。</p>
+<p>控制端已经在“连接”面板加入多台节点后，可打开“设置 → Backend Manager”，在顶部“管理执行节点”中切换机器。Backend、MCP、登录终端和模型终端操作都会严格发往所选节点；节点离线时会明确失败，不会误操作默认节点。Backend/MCP 是物理节点级共享配置，所以远程修改同样只允许该节点的 Relay 主用户执行。</p>
 <p>也可以在 Compose 启动前预置（环境变量在进程重启后优先于页面保存值）：</p>
 <pre class="md-pre"><code class="hljs"><div class="md-code-lang">bash</div><span class="hljs-built_in">export</span> AGENT_WITH_U_RELAY_URL=wss://relay.example.com/ws
 <span class="hljs-built_in">export</span> AGENT_WITH_U_RELAY_TOKEN=替换为Relay主Token

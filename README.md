@@ -164,6 +164,12 @@ python -m src.ws_main
 获授权控制端发现；关闭纳管不会关闭它的同源自执行能力。Web 中保存的 Relay
 主 Token 只落在 Backend 的 `data/relay-node.json`，不会写入浏览器或回显。
 
+同一个控制端加入多台执行节点后，可在 **设置 → Backend Manager** 顶部选择
+“管理执行节点”，直接读取和修改对应机器的 Backend、MCP 配置，并把登录/模型
+终端请求发到该机器。显式选择的节点离线时操作会报错，不会回退到默认节点。
+这些配置是节点级共享状态，因此仅本机直连用户或 Relay 为该节点指定的主用户
+可以修改；普通共享用户仍可使用已经配置好的 Backend。
+
 Compose 同时启动无端口的 `awu-updater`。发布 `agent-with-u-docker-linux-<arch>.tar` 后，Docker 节点可在“节点在线更新”中一键加载新镜像、健康检查并重建 Backend/Web；失败自动恢复旧镜像。Docker Socket 只挂给 updater，不挂给执行 Agent 的 Backend。现有节点需先按[156 Docker 安装与更新指南](deploy/WEB_156_INSTALL.md)手动重建一次，之后才能在线升级。
 
 ### 接入本地模型（Ollama / LM Studio）
