@@ -256,6 +256,8 @@ export interface SkillInfo {
   hasSecrets?: boolean;          // 是否已保存凭据
   hasSecretsSchema?: boolean;    // 是否有 secrets.schema.json
   manifest?: Record<string, any> | null;  // manifest.json 内容（插件包）
+  format?: 'legacy' | 'awu' | 'agent-skills' | string;
+  source?: Record<string, any> | null;
   backend?: string;
   type?: string;
   inputSchema?: Record<string, any>;
@@ -404,6 +406,61 @@ export interface RelayUserProfile {
   avatarColor: string;
   /** false = 兼容旧版单 token Relay，档案不可编辑。 */
   managed: boolean;
+}
+
+export interface SkillMarketSource {
+  id: string;
+  name: string;
+  repository: string;
+  ref: string;
+  root: string;
+  homepage: string;
+  description?: string;
+  official?: boolean;
+  removable?: boolean;
+  skillCount?: number;
+  skippedCount?: number;
+  issues?: Array<{ path: string; message: string }>;
+  effectiveRef?: string;
+  error?: string;
+}
+
+export interface SkillMarketItem {
+  id: string;
+  name: string;
+  description: string;
+  path: string;
+  digest: string;
+  sourceId: string;
+  sourceName: string;
+  repository: string;
+  ref: string;
+  homepage: string;
+  official: boolean;
+  license?: string;
+  compatibility?: string;
+  metadata?: Record<string, any>;
+  fileNames: string[];
+  fileCount: number;
+  size: number;
+  risk: { level: 'low' | 'medium' | 'high'; flags: string[] };
+  warnings: string[];
+  preview: string;
+  previewTruncated?: boolean;
+  installed: boolean;
+  sameSource: boolean;
+  localModified: boolean;
+  updateAvailable: boolean;
+  conflict: boolean;
+}
+
+export interface SkillMarketCatalog {
+  status: 'ok' | 'error';
+  message?: string;
+  sources: SkillMarketSource[];
+  directories: Array<{ name: string; url: string; description: string }>;
+  items: SkillMarketItem[];
+  refreshedAt?: number;
 }
 
 let localIdentityTokenPromise: Promise<string> | null = null;
@@ -3239,8 +3296,53 @@ export const api = {
   },
 
   // ── 插件包安装 ────────────────────────────────────────────────────────
-  async installSkillPackage(pkgPath: string, pkgBase64: string = ''): Promise<{ status: string; manifest?: any; message?: string }> {
+  async installSkillPackage(pkgPath: string, pkgBase64: string = ''): Promise<{
+    status: string; manifest?: any; skills?: any[]; format?: string; message?: string;
+  }> {
     const result = await call('installSkillPackage', pkgPath, pkgBase64);
+    if (result === null || result === undefined) return { status: 'error', message: '无法连接到后端' };
+    try { return JSON.parse(result); } catch { return { status: 'error', message: '响应格式错误' }; }
+  },
+
+  async skillMarketList(query: string = '', refresh: boolean = false): Promise<SkillMarketCatalog> {
+    const result = await call('skillMarketList', query, refresh);
+    if (result === null || result === undefined) {
+      return { status: 'error', message: '无法连接到后端', sources: [], directories: [], items: [] };
+    }
+    try {
+      const parsed = JSON.parse(result);
+      return {
+        status: parsed?.status === 'ok' ? 'ok' : 'error',
+        message: parsed?.message,
+        sources: Array.isArray(parsed?.sources) ? parsed.sources : [],
+        directories: Array.isArray(parsed?.directories) ? parsed.directories : [],
+        items: Array.isArray(parsed?.items) ? parsed.items : [],
+        refreshedAt: parsed?.refreshedAt,
+      };
+    } catch {
+      return { status: 'error', message: '响应格式错误', sources: [], directories: [], items: [] };
+    }
+  },
+
+  async skillMarketAddSource(repository: string, name: string = ''): Promise<{ status: string; source?: SkillMarketSource; message?: string }> {
+    const result = await call('skillMarketAddSource', repository, name);
+    if (result === null || result === undefined) return { status: 'error', message: '无法连接到后端' };
+    try { return JSON.parse(result); } catch { return { status: 'error', message: '响应格式错误' }; }
+  },
+
+  async skillMarketRemoveSource(sourceId: string): Promise<{ status: string; message?: string }> {
+    const result = await call('skillMarketRemoveSource', sourceId);
+    if (result === null || result === undefined) return { status: 'error', message: '无法连接到后端' };
+    try { return JSON.parse(result); } catch { return { status: 'error', message: '响应格式错误' }; }
+  },
+
+  async skillMarketInstall(
+    item: Pick<SkillMarketItem, 'sourceId' | 'path' | 'digest'>,
+    allowReplace: boolean = false,
+  ): Promise<{ status: string; skill?: any; message?: string }> {
+    const result = await call(
+      'skillMarketInstall', item.sourceId, item.path, item.digest, allowReplace,
+    );
     if (result === null || result === undefined) return { status: 'error', message: '无法连接到后端' };
     try { return JSON.parse(result); } catch { return { status: 'error', message: '响应格式错误' }; }
   },
@@ -3979,6 +4081,12 @@ function mockDispatch(method: string, params: any[]): any {
     case 'setPromptDefault': return JSON.stringify({ status: 'ok' });
     case 'setSkillDefault': return JSON.stringify({ status: 'ok' });
     case 'getDefaultAbilities': return JSON.stringify({ skills: [], prompts: [] });
+    case 'skillMarketList': return JSON.stringify({
+      status: 'ok', sources: [], directories: [], items: [], refreshedAt: Date.now() / 1000,
+    });
+    case 'skillMarketAddSource': return JSON.stringify({ status: 'error', message: 'mock mode' });
+    case 'skillMarketRemoveSource': return JSON.stringify({ status: 'ok' });
+    case 'skillMarketInstall': return JSON.stringify({ status: 'error', message: 'mock mode' });
     case 'getAppVersion': return '0.0.0-dev';
     case 'nodeUpdateStatus': return JSON.stringify({
       phase: 'idle', busy: false, platform: 'mock', arch: 'mock', desktop: false,

@@ -1,5 +1,6 @@
 import React, { useEffect, useState, useCallback, useRef } from 'react';
 import { api, SkillInfo } from '../api';
+import { SkillMarketDialog } from './SkillMarketDialog';
 
 // 注入卡片悬停样式
 if (typeof document !== 'undefined' && !document.getElementById('repo-panel-css')) {
@@ -240,7 +241,9 @@ export const RepoPanel: React.FC<Props> = ({ open, workingDir, onClose, onEditin
   // 安装插件包
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [installing, setInstalling] = useState(false);
-  const [installResult, setInstallResult] = useState<{ name: string; version: string } | null>(null);
+  const [installResult, setInstallResult] = useState<{ name: string; version: string; count?: number; format?: string } | null>(null);
+  const [installError, setInstallError] = useState('');
+  const [showSkillMarket, setShowSkillMarket] = useState(false);
   // Secrets 配置
   type SecretsField = { key: string; label: string; type: string; required?: boolean; placeholder?: string };
   const [secretsSkill, setSecretsSkill] = useState<string | null>(null);
@@ -277,7 +280,9 @@ export const RepoPanel: React.FC<Props> = ({ open, workingDir, onClose, onEditin
       setEditingIcon((item as PromptItem).icon || '📝');
       setEditingOrigName(item.name);
       setEditingSkillItem(type === 'skill' ? item as SkillItem : null);
-      const isPackage = type === 'skill' && !!(item as SkillItem).manifest;
+      const isPackage = type === 'skill' && !!(
+        (item as SkillItem).manifest || (item as SkillItem).source
+      );
       setEditingLocked(isPackage);
       setEditingOrigContent(item.content || '');
     } else {
@@ -369,6 +374,7 @@ export const RepoPanel: React.FC<Props> = ({ open, workingDir, onClose, onEditin
     const file = e.target.files?.[0];
     if (!file) return;
     setInstalling(true);
+    setInstallError('');
     try {
       // Qt 原生环境有 file.path；浏览器没有，改用 FileReader 读取 base64
       const nativePath: string = (file as any).path || '';
@@ -391,7 +397,15 @@ export const RepoPanel: React.FC<Props> = ({ open, workingDir, onClose, onEditin
       if (res.status === 'ok') {
         await refresh();
         const m = res.manifest;
-        setInstallResult({ name: m?.name || m?.id || '未知', version: m?.version || '?' });
+        const installedSkills = Array.isArray((res as any).skills) ? (res as any).skills : [];
+        setInstallResult({
+          name: installedSkills.length > 1
+            ? `${installedSkills[0]?.name || installedSkills[0]?.id || 'Skill'} 等`
+            : m?.name || m?.id || '未知',
+          version: m?.version || '',
+          count: installedSkills.length || 1,
+          format: (res as any).format || '',
+        });
         if (m?.id) {
           const schema = await api.getSkillSecretsSchema(m.id);
           if (schema?.fields?.length) {
@@ -401,7 +415,11 @@ export const RepoPanel: React.FC<Props> = ({ open, workingDir, onClose, onEditin
             setSecretsPresence([]);
           }
         }
+      } else {
+        setInstallError(res.message || 'Skill 包安装失败');
       }
+    } catch (error) {
+      setInstallError(error instanceof Error ? error.message : String(error));
     } finally {
       setInstalling(false);
       if (fileInputRef.current) fileInputRef.current.value = '';
@@ -468,8 +486,8 @@ export const RepoPanel: React.FC<Props> = ({ open, workingDir, onClose, onEditin
               value={editingName}
               onChange={e => setEditingName(e.target.value)}
               placeholder={editingType === 'skill' ? 'Skill 名称' : 'Prompt 名称'}
-              disabled={!!(editingSkillItem?.manifest)}
-              style={{ ...nameInputStyle, ...(editingSkillItem?.manifest ? { opacity: 0.5, cursor: 'not-allowed' } : {}) }}
+              disabled={!!(editingSkillItem?.manifest || editingSkillItem?.source)}
+              style={{ ...nameInputStyle, ...((editingSkillItem?.manifest || editingSkillItem?.source) ? { opacity: 0.5, cursor: 'not-allowed' } : {}) }}
             />
             <span style={{ fontSize: 11, color: 'var(--theme-text-muted)', textTransform: 'uppercase' }}>
               {editingType === 'skill' ? 'Skill' : 'Prompt'}
@@ -482,10 +500,10 @@ export const RepoPanel: React.FC<Props> = ({ open, workingDir, onClose, onEditin
               <select
                 value={parseSkillBackend(editingContent)}
                 onChange={e => {
-                  if (!editingSkillItem?.manifest) setEditingContent(prev => setSkillBackend(prev, e.target.value));
+                  if (!editingSkillItem?.manifest && !editingSkillItem?.source) setEditingContent(prev => setSkillBackend(prev, e.target.value));
                 }}
-                disabled={!!(editingSkillItem?.manifest)}
-                style={{ ...backendSelectStyle, ...(editingSkillItem?.manifest ? { opacity: 0.5, cursor: 'not-allowed' } : {}) }}
+                disabled={!!(editingSkillItem?.manifest || editingSkillItem?.source)}
+                style={{ ...backendSelectStyle, ...((editingSkillItem?.manifest || editingSkillItem?.source) ? { opacity: 0.5, cursor: 'not-allowed' } : {}) }}
               >
                 <option value="">无 (传统 Skill)</option>
                 {backends.map(b => (
@@ -498,7 +516,7 @@ export const RepoPanel: React.FC<Props> = ({ open, workingDir, onClose, onEditin
             </div>
           )}
           {/* 包安装 skill 的锁状态栏 */}
-          {editingSkillItem?.manifest && (
+          {(editingSkillItem?.manifest || editingSkillItem?.source) && (
             <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8,
               padding: '5px 10px', borderRadius: 6,
               background: editingLocked ? 'rgba(99,102,241,0.08)' : 'rgba(234,197,95,0.08)',
@@ -506,7 +524,9 @@ export const RepoPanel: React.FC<Props> = ({ open, workingDir, onClose, onEditin
               <span style={{ fontSize: 13 }}>{editingLocked ? '🔒' : '🔓'}</span>
               <span style={{ fontSize: 11, color: 'var(--theme-text-muted)', flex: 1 }}>
                 {editingLocked
-                  ? `📦 插件包 v${editingSkillItem.manifest.version || '?'} · 点击解锁后可编辑`
+                  ? editingSkillItem.manifest
+                    ? `📦 AgentWithU 包 v${editingSkillItem.manifest.version || '?'} · 点击解锁后可编辑`
+                    : `🌐 标准 Agent Skill · ${editingSkillItem.source?.label || editingSkillItem.source?.repository || '外部来源'} · 点击解锁后可编辑`
                   : '已解锁编辑，修改将覆盖原始内容'}
               </span>
               {editingSkillItem?.hasSecretsSchema && (
@@ -567,9 +587,14 @@ export const RepoPanel: React.FC<Props> = ({ open, workingDir, onClose, onEditin
             <span>⚡ Skills</span>
             <div style={{ display: 'flex', gap: 4 }}>
               <button
+                onClick={() => setShowSkillMarket(true)}
+                title="浏览并安装标准 Agent Skills"
+                style={{ ...addBtnStyle, fontSize: 11, padding: '2px 8px', width: 'auto' }}
+              >🛍 市场</button>
+              <button
                 onClick={() => fileInputRef.current?.click()}
                 disabled={installing}
-                title="从 .awu 文件安装插件 Skill"
+                title="从 .awu 或标准 Agent Skill ZIP 安装"
                 style={{ ...addBtnStyle, fontSize: 11, padding: '2px 7px' }}
               >{installing ? '…' : '📦'}</button>
               <button onClick={() => setShowSkillTypeSelector(true)} style={addBtnStyle} title="新建 Skill（开发者）">＋</button>
@@ -592,6 +617,10 @@ export const RepoPanel: React.FC<Props> = ({ open, workingDir, onClose, onEditin
                   {s.manifest && (
                     <span title={`插件包安装 v${s.manifest.version || '?'}`}
                       style={{ fontSize: 11, lineHeight: 1 }}>📦</span>
+                  )}
+                  {s.format === 'agent-skills' && (
+                    <span title={`标准 Agent Skills 格式${s.source?.label ? ` · ${s.source.label}` : ''}`}
+                      style={{ fontSize: 10, lineHeight: 1, color: 'var(--theme-accent)' }}>STD</span>
                   )}
                   {s.hasSecretsSchema && (
                     <span
@@ -771,12 +800,40 @@ export const RepoPanel: React.FC<Props> = ({ open, workingDir, onClose, onEditin
             <h3 style={{ margin: '0 0 6px', fontSize: 15, color: 'var(--theme-text)' }}>安装成功</h3>
             <p style={{ margin: '0 0 16px', fontSize: 13, color: 'var(--theme-text-muted)' }}>
               <strong style={{ color: 'var(--theme-text)' }}>{installResult.name}</strong>
-              <span style={{ marginLeft: 6, fontSize: 11, color: 'var(--theme-text-muted)' }}>v{installResult.version}</span>
+              {installResult.version && (
+                <span style={{ marginLeft: 6, fontSize: 11, color: 'var(--theme-text-muted)' }}>v{installResult.version}</span>
+              )}
+              {installResult.count && installResult.count > 1 && (
+                <span style={{ display: 'block', marginTop: 5, fontSize: 11, color: 'var(--theme-text-muted)' }}>
+                  共安装 {installResult.count} 个标准 Skill
+                </span>
+              )}
             </p>
             <button onClick={() => setInstallResult(null)} style={deleteConfirmBtnStyle}>确定</button>
           </div>
         </div>
       )}
+
+      {installError && (
+        <div style={deleteOverlayStyle} onClick={() => setInstallError('')}>
+          <div style={{ ...deleteDialogStyle, width: 380 }} onClick={e => e.stopPropagation()}>
+            <h3 style={{ margin: '0 0 8px', fontSize: 14, color: 'var(--theme-error, #cf222e)' }}>
+              Skill 安装失败
+            </h3>
+            <p style={{ margin: '0 0 16px', fontSize: 12, lineHeight: 1.55,
+              color: 'var(--theme-text-muted)', overflowWrap: 'anywhere' }}>{installError}</p>
+            <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
+              <button onClick={() => setInstallError('')} style={deleteConfirmBtnStyle}>确定</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      <SkillMarketDialog
+        open={showSkillMarket}
+        onClose={() => setShowSkillMarket(false)}
+        onInstalled={refresh}
+      />
 
       {/* ── Secrets 配置对话框 ── */}
       {secretsSkill && secretsSchema && (

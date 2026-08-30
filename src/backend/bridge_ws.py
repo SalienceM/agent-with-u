@@ -56,7 +56,8 @@ from .instance_manager import InstanceManager
 from .backend_store import BackendStore
 from .app_config_store import AppConfigStore
 from .skill_store import SkillStore
-from .skill_paths import project_skill_reference, project_skill_root
+from .skill_market import SkillMarket
+from .skill_paths import project_skill_reference, project_skill_root, render_skill_markdown
 from .prompt_store import PromptStore
 from .loop_store import (
     LoopStore, LoopState, LoopRecord, LoopStep, LoopAnalysis, IdeaEntry, AsideTurn, Addon,
@@ -711,6 +712,7 @@ class BridgeWS:
         self._session_store = SessionStore()
         self._backend_store = BackendStore()
         self._skill_store = SkillStore()
+        self._skill_market = SkillMarket(self._skill_store)
         self._prompt_store = PromptStore()
         # ★ 可视化 Loop 集成：stage 文件存储 + 并发想法池 + 运行去重
         self._loop_store = LoopStore()
@@ -9571,8 +9573,8 @@ Kit 版本账本（版本属于 Kit，不属于 AI）：
                 actual_path = tmp_path
             else:
                 actual_path = pkg_path
-            manifest = self._skill_store.install_package(actual_path)
-            return json.dumps({"status": "ok", "manifest": manifest}, ensure_ascii=False)
+            installed = self._skill_store.install_archive(actual_path)
+            return json.dumps({"status": "ok", **installed}, ensure_ascii=False)
         except Exception as e:
             print(f"[BridgeWS] installSkillPackage error: {e}", file=sys.stderr)
             return json.dumps({"status": "error", "message": str(e)}, ensure_ascii=False)
@@ -9581,6 +9583,59 @@ Kit 版本账本（版本属于 Kit，不属于 AI）：
                 import os as _os
                 try: _os.unlink(tmp_path)
                 except Exception: pass
+
+    async def _rpc_skillMarketList(self, query: str = "", refresh: bool = False) -> str:
+        """Browse portable Agent Skills from configured public GitHub sources."""
+        try:
+            payload = await self._skill_market.list_catalog(
+                str(query or ""),
+                force=bool(refresh),
+            )
+            return json.dumps(payload, ensure_ascii=False)
+        except Exception as e:
+            print(f"[BridgeWS] skillMarketList error: {e}", file=sys.stderr)
+            return json.dumps(
+                {"status": "error", "message": str(e), "sources": [], "items": []},
+                ensure_ascii=False,
+            )
+
+    def _rpc_skillMarketAddSource(self, repository: str, name: str = "") -> str:
+        try:
+            source = self._skill_market.add_source(repository, name)
+            return json.dumps({"status": "ok", "source": source}, ensure_ascii=False)
+        except Exception as e:
+            return json.dumps({"status": "error", "message": str(e)}, ensure_ascii=False)
+
+    def _rpc_skillMarketRemoveSource(self, source_id: str) -> str:
+        try:
+            removed = self._skill_market.remove_source(str(source_id or ""))
+            if not removed:
+                return json.dumps(
+                    {"status": "error", "message": "来源不存在，或该来源为不可删除的内置来源"},
+                    ensure_ascii=False,
+                )
+            return json.dumps({"status": "ok"}, ensure_ascii=False)
+        except Exception as e:
+            return json.dumps({"status": "error", "message": str(e)}, ensure_ascii=False)
+
+    async def _rpc_skillMarketInstall(
+        self,
+        source_id: str,
+        path: str,
+        digest: str,
+        allow_replace: bool = False,
+    ) -> str:
+        try:
+            installed = await self._skill_market.install(
+                str(source_id or ""),
+                str(path or ""),
+                str(digest or ""),
+                allow_replace=bool(allow_replace),
+            )
+            return json.dumps({"status": "ok", "skill": installed}, ensure_ascii=False)
+        except Exception as e:
+            print(f"[BridgeWS] skillMarketInstall error: {e}", file=sys.stderr)
+            return json.dumps({"status": "error", "message": str(e)}, ensure_ascii=False)
 
     # 内置类型的默认 secrets schema（用户在 skill 库中无 secrets.schema.json 时使用）
     _BUILTIN_SECRETS_SCHEMA: dict[str, dict] = {
@@ -10310,6 +10365,20 @@ except urllib.error.URLError as e:
             BackendType.OPENAI_COMPATIBLE,
         })
 
+    @staticmethod
+    def _is_backend_enhanced_skill(info: dict) -> bool:
+        """Whether AWU must generate a bridge tool instead of copying a Skill.
+
+        Portable Agent Skills may use unrelated custom frontmatter.  Treating
+        every unknown ``type`` value as an AWU backend extension would destroy
+        compatibility, so only the documented AWU types opt into generation.
+        """
+        return bool(
+            info.get("backend")
+            or info.get("hasCallPy")
+            or info.get("type") in {"web-search", "web-fetch", "python-script"}
+        )
+
     def _sync_backend_skills_to_directory(self, session: Session):
         """
         将 session 绑定的 Backend Skills 部署到本地 agent 原生目录：
@@ -10326,15 +10395,17 @@ except urllib.error.URLError as e:
         abilities = session.abilities or {}
         bound_skills = set(abilities.get("skills", []))
 
-        # 收集当前绑定中的系统增强型 Skills（有 backend 或 type 字段）
+        # 收集当前绑定中的系统增强型与标准 Skills。
         deployed_backend_skills: set[str] = set()
+        deployed_standard_skills: set[str] = set()
         deploy_payloads: dict[str, tuple[dict, bool, str]] = {}
         for sname in bound_skills:
             info = self._skill_store.get_skill(sname)
             if not info:
                 continue
-            if not info.get("backend") and not info.get("type"):
-                continue  # 传统 Skill，由用户手动激活
+            if not self._is_backend_enhanced_skill(info):
+                deployed_standard_skills.add(sname)
+                continue
             # 判断是否为图像生成类 backend（需要注入 ref_image 支持）
             is_image_backend = False
             backend_id = info.get("backend", "")
@@ -10354,6 +10425,25 @@ except urllib.error.URLError as e:
             deployed_backend_skills.add(sname)
 
         for agent_name, skills_dir in roots:
+            for sname in deployed_standard_skills:
+                target = skills_dir / sname
+                # A generated Backend Skill owns the whole target directory.
+                # Remove that old generated form before switching the same
+                # library entry back to a portable Skill.
+                if (target / "_call.py").exists() and not SkillStore.is_managed_directory(target):
+                    import shutil as _shutil
+                    _shutil.rmtree(target, ignore_errors=True)
+                self._skill_store.deploy_to_directory(
+                    sname,
+                    target,
+                    project_skill_reference(agent_name, sname),
+                )
+                print(
+                    f"[bridge_ws] Deployed standard Skill '{sname}' → {target} ({agent_name})",
+                    file=sys.stderr,
+                    flush=True,
+                )
+
             for sname, (info, is_image_backend, call_py) in deploy_payloads.items():
                 skill_md = self._generate_backend_skill_md(
                     sname,
@@ -10362,6 +10452,8 @@ except urllib.error.URLError as e:
                     is_image_backend=is_image_backend,
                 )
                 target = skills_dir / sname
+                if SkillStore.is_managed_directory(target):
+                    SkillStore.undeploy_from_directory(target)
                 target.mkdir(parents=True, exist_ok=True)
                 (target / "SKILL.md").write_text(skill_md, encoding="utf-8")
                 (target / "_call.py").write_text(call_py, encoding="utf-8")
@@ -10384,6 +10476,13 @@ except urllib.error.URLError as e:
                         _shutil.rmtree(skill_dir, ignore_errors=True)
                         print(f"[bridge_ws] Cleaned up unbound Backend Skill '{skill_dir.name}' from {skills_dir}",
                               file=sys.stderr, flush=True)
+                    elif SkillStore.is_managed_directory(skill_dir):
+                        SkillStore.undeploy_from_directory(skill_dir)
+                        print(
+                            f"[bridge_ws] Cleaned up unbound standard Skill '{skill_dir.name}' from {skills_dir}",
+                            file=sys.stderr,
+                            flush=True,
+                        )
 
     @staticmethod
     def _build_sandbox_constraints(session: "Session") -> str | None:
@@ -10447,6 +10546,36 @@ except urllib.error.URLError as e:
             if p and p.get("content"):
                 parts.append(p["content"])
 
+        # Native CLI agents discover portable Skills from their own project
+        # directories. Direct API backends have no such discovery mechanism;
+        # inject the selected standard instructions so binding a market Skill
+        # never becomes a silent no-op. Supporting files are still mirrored to
+        # the chosen fallback root and can be used when that backend exposes
+        # compatible file/command tools.
+        if not self._backend_has_native_project_skills(session.backend_id):
+            standard_roots = self._skill_deploy_roots_for_session(session)
+            standard_agent = standard_roots[0][0] if standard_roots else "claude"
+            for sname in abilities.get("skills", []):
+                info = self._skill_store.get_skill(sname)
+                if not info or self._is_backend_enhanced_skill(info):
+                    continue
+                content = str(info.get("content") or "")
+                if not content:
+                    continue
+                reference = project_skill_reference(standard_agent, sname)
+                rendered = render_skill_markdown(
+                    content,
+                    skill_name=sname,
+                    skill_dir_reference=reference,
+                )
+                parts.append(
+                    "## 已绑定标准 Agent Skill："
+                    f"{sname}\n\n"
+                    f"配套文件目录：`{reference}`。请遵循下方 Skill 指令；"
+                    "若当前后端没有指令所需工具，应明确说明缺少的能力，不要假装执行成功。\n\n"
+                    f"{rendered}"
+                )
+
         # ★ Backend Skills：只在既没有原生项目 Skill 发现、也没有结构化 tool
         #   注入能力的 backend 上追加 Bash fallback。Claude/Qwen CLI 会从
         #   .claude/.qwen skills 原生发现；API backend 走 extra_tools/on_tool_call。
@@ -10468,8 +10597,8 @@ except urllib.error.URLError as e:
             info = self._skill_store.get_skill(sname)
             if not info:
                 continue
-            if not info.get("backend") and not info.get("type"):
-                continue  # 传统指令型 Skill，无需注入
+            if not self._is_backend_enhanced_skill(info):
+                continue  # 标准指令型 Skill 由原生 Skill 发现处理
             desc = info.get("description", sname)
             python_exe = self._resolve_python_exe()
             call_script = f"{project_skill_reference(fallback_agent, sname)}/_call.py"

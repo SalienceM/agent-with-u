@@ -51,7 +51,9 @@ AgentWithU 用 PySide6 托管 QWebEngine，前端是 React，后端是 Python—
   - `python-script` — 执行本地 Python 脚本，支持凭据（Secrets）注入，适合爬虫/API 集成
   - `dashscope-image` — 阿里云 DashScope 图像生成与编辑，支持 Wan 与 Qwen Image 3.0、1–3 张参考图
 - **Skill 仓库（Repo 面板）** — 可视化创建、编辑、删除 Skill 和 Prompt
-- **插件包安装** — 支持 `.awu` 格式打包分发，一键安装，锁定防误编辑
+- **Agent Skills 市场** — 浏览/搜索公开 GitHub Skill 源，安装前查看来源、许可证、文件清单、`SKILL.md` 预览与风险提示
+- **开放格式兼容** — 直接安装标准 Agent Skills ZIP/仓库目录，完整保留 `scripts/`、`references/`、`assets/` 等配套文件
+- **旧包兼容** — 原有 `.awu` 格式继续支持，可与标准 Skill 共存
 - **凭据管理** — Secrets 本地 chmod 600 存储，永不传给大模型
 - **按会话绑定** — 每个 Session 独立绑定启用哪些 Skill 和 Prompt
 
@@ -241,27 +243,24 @@ Skill 文件误写到同名的本地路径。
 
 Skill 以目录形式存储，每个 Skill 包含一个 `SKILL.md`（声明元信息和调用指令）。
 
-### SKILL.md 基本结构
+### 标准 SKILL.md 基本结构
 
 ```yaml
 ---
 name: my-skill
-description: 描述何时触发此 Skill（AI 据此判断是否调用）
-type: python-script   # python-script / web-search / web-fetch
-input_schema:
-  type: object
-  properties:
-    query:
-      type: string
-      description: 输入参数描述
-  required:
-    - query
+description: 描述此 Skill 做什么、何时应使用
+license: MIT          # 可选
+compatibility: Python 3.10+  # 可选
 ---
 
 ## Instructions
 
-描述 AI 应如何调用此 Skill，以及调用时传入什么参数。
+描述 AI 应如何完成任务，可引用同目录的 scripts、references 与 assets。
 ```
+
+`name` 与 `description` 是开放 Agent Skills 规范要求的字段。`backend`、
+`type`、`input_schema` 是 AgentWithU 的可选增强字段；普通第三方 Skill
+不需要这些字段，也不需要 `manifest.json`。
 
 AgentWithU 会按运行框架部署到原生目录：
 
@@ -274,13 +273,20 @@ Skill 内不要硬编码 `.claude/skills/...`。需要引用与 `SKILL.md`
 部署时会自动解析为当前 Agent 的实际目录。旧 Skill 中指向自身目录的
 `.claude/.qwen/.agents` 路径也会在部署时自动迁移。
 
-### 打包分发
+### 安装与打包
+
+Repo 面板中的“🛍 市场”可直接接入 `owner/repo` 或 GitHub 仓库地址。
+本地安装按钮同时接受：
+
+- 标准 Agent Skill ZIP：根目录或某个子目录包含 `SKILL.md`，配套目录会完整保留；
+- AgentWithU `.awu`：继续用于需要 `manifest.json`、Secrets Schema 等 AWU 扩展的旧包。
 
 ```bash
-# 将 skill 目录打包为 .awu 文件
-zip -r my-skill-1.0.0.awu my-skill/
+# 标准 Skill ZIP（不要求 manifest.json）
+zip -r my-skill.zip my-skill/
 
-# 包含 manifest.json 可声明版本和 Secrets Schema
+# 旧版 AWU 扩展包
+zip -r my-skill-1.0.0.awu my-skill/
 ```
 
 `manifest.json` 示例：
