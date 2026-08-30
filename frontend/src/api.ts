@@ -52,6 +52,19 @@ export interface ConnectedClient {
   via: 'local' | 'relay'; // 直连本机 sidecar，还是经中继来
   since: string;          // ISO timestamp（UTC）
 }
+
+/** 当前 Web/桌面 Backend 作为 Relay 执行节点的注册状态。 */
+export interface RelayNodeStatus {
+  supported: boolean;
+  enabled: boolean;
+  connected: boolean;
+  url: string;
+  hasToken: boolean;
+  deviceId: string;
+  deviceName: string;
+  source: 'default' | 'saved' | 'environment' | 'unavailable' | string;
+  lastError: string;
+}
 type ClientsChangedCallback = (clients: ConnectedClient[], execKey: string) => void;
 
 export interface NodeUpdateRelease {
@@ -824,8 +837,14 @@ function handleMessage(e: MessageEvent, source?: Conn) {
 //  每条连接 = 一个 Conn;session→节点的执行位置记在 sessionExec 里,按 sessionId
 //  路由。执行位置与可视用户是两层边界：Backend 仍会按 Session.ownerId 鉴权。
 //  桌面窗口可同时连接“映射到当前用户的 local”和该 Relay 用户获授权的若干节点；
-//  浏览器窗口没有本机 sidecar。不同 Relay 用户的连接绝不进入同一个池。
+//  标准生产 Web 则把同源 /ws Backend 作为“当前 Web 节点”。不同 Relay 用户的
+//  连接绝不进入同一个池。
 // ═══════════════════════════════════════════════════════════════════
+
+// 桌面/dev 的本地执行能力由部署形态保证；生产 Web 要等同源 /ws 至少成功握手
+// 一次才确认。这样 Docker Web 会自动出现当前节点，同时仍兼容纯 Relay 静态页，
+// 不会给后者长期展示一个并不存在的“本地节点”。
+let localExecutorConfirmed = isTauri() || import.meta.env.DEV;
 
 function execTargetKey(t: ExecTarget): string {
   if (t.mode === 'local') return 'local';
@@ -833,7 +852,7 @@ function execTargetKey(t: ExecTarget): string {
 }
 
 function execLabelOf(t: ExecTarget): string {
-  if (t.mode === 'local') return '🏠 本机';
+  if (t.mode === 'local') return isTauri() ? '🏠 本机' : '🖥️ 当前 Web 节点';
   return (t.deviceName && t.deviceName.trim()) || t.deviceId || '远端节点';
 }
 
@@ -935,6 +954,7 @@ class Conn {
         useMock = false;
         connectionStatusCallbacks.forEach((cb) => cb(true));
       }
+      if (this.key === 'local') localExecutorConfirmed = true;
       notifyExecStatus();
       if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
       this.heartbeatTimer = setInterval(() => {
@@ -1152,7 +1172,9 @@ function reconcileLocalRelayDuplicates(): void {
 }
 
 function sessionListConnections(): Conn[] {
-  const connections = Array.from(pool.values());
+  const connections = Array.from(pool.values()).filter(
+    (connection) => connection.key !== 'local' || hasLocalExecutor(),
+  );
   if (!localPhysicalDeviceId || !pool.has('local')) return connections;
   return connections.filter((connection) => !isLocalRelayDuplicate(connection));
 }
@@ -1231,7 +1253,10 @@ function ensureConn(target: ExecTarget, isHome: boolean): Conn {
 }
 
 function localTargetForCurrentUser(): ExecTarget {
-  if (connectionTarget.mode === 'relay') {
+  // 只有 Tauri 能用桌面壳持有的本机密钥把 Relay userId 安全映射到 sidecar。
+  // Web 的同源 Backend 身份由它自己的 loopback/forward-auth 边界决定，不能把
+  // 浏览器里另一个 Relay 的 userId 伪装成同源 Web 用户。
+  if (isTauri() && connectionTarget.mode === 'relay') {
     const user = normalizeRelayProfile(connectionTarget.user);
     if (user.managed && user.userId && user.userId !== 'legacy') {
       return { mode: 'local', user };
@@ -1241,13 +1266,12 @@ function localTargetForCurrentUser(): ExecTarget {
 }
 
 function hasLocalExecutor(): boolean {
-  // Tauri 是完整客户端，本机 sidecar 始终存在；Vite 开发模式也有本地后端。
-  // 生产浏览器没有客户端 sidecar，不能凭空展示“本机”。
-  return connectionTarget.mode === 'local' || isTauri() || import.meta.env.DEV;
+  return localExecutorConfirmed;
 }
 
 function ensureLocalExecutorConnection(): void {
-  if (!hasLocalExecutor()) return;
+  // 生产 Web 在尚未确认能力时也要主动探测同源 /ws；成功握手后
+  // finishConnect 会把它发布到执行节点列表。失败时连接继续后台退避探测。
   const target = localTargetForCurrentUser();
   const existing = pool.get('local');
   if (existing && connectionTransportChanged(existing.target, target)) {
@@ -1435,6 +1459,7 @@ export function getExecutors(): ExecutorInfo[] {
     });
   };
   for (const c of pool.values()) {
+    if (c.key === 'local' && !hasLocalExecutor()) continue;
     if (!isLocalRelayDuplicate(c)) push(c);
   }
   out.sort((a, b) => {
@@ -1448,6 +1473,7 @@ export function getExecutors(): ExecutorInfo[] {
 
 /** 取某节点的完整连接目标(供「设为默认」用)。 */
 export function getExecTarget(key: string): ExecTarget | null {
+  if (key === 'local' && !hasLocalExecutor()) return null;
   const c = pool.get(key);
   if (c) return c.target;
   if (key === 'local') return localTargetForCurrentUser();
@@ -3600,6 +3626,47 @@ export const api = {
       const parsed = typeof r === 'string' ? JSON.parse(r) : r;
       return Array.isArray(parsed) ? parsed : [];
     } catch { return []; }
+  },
+
+  /** 查询当前物理 Backend 的 Relay 纳管状态；默认精确查询同源 Web/本机节点。 */
+  async relayNodeStatus(execKey = 'local'): Promise<RelayNodeStatus> {
+    const r = await callOnStrict(execKey, 'relayNodeStatus', [], 10_000);
+    const parsed = typeof r === 'string' ? JSON.parse(r) : r;
+    return {
+      supported: !!parsed?.supported,
+      enabled: !!parsed?.enabled,
+      connected: !!parsed?.connected,
+      url: String(parsed?.url || ''),
+      hasToken: !!parsed?.hasToken,
+      deviceId: String(parsed?.deviceId || ''),
+      deviceName: String(parsed?.deviceName || ''),
+      source: String(parsed?.source || 'unavailable'),
+      lastError: String(parsed?.lastError || ''),
+    };
+  },
+
+  /** Web/Docker 节点在线启用、修改或停用 Relay 注册；主 Token 不回传浏览器。 */
+  async relayNodeConfigure(config: {
+    enabled: boolean;
+    url: string;
+    token?: string;
+    deviceName: string;
+  }, execKey = 'local'): Promise<RelayNodeStatus> {
+    const r = await callOnStrict(
+      execKey, 'relayNodeConfigure', [JSON.stringify(config)], 15_000,
+    );
+    const parsed = typeof r === 'string' ? JSON.parse(r) : r;
+    return {
+      supported: !!parsed?.supported,
+      enabled: !!parsed?.enabled,
+      connected: !!parsed?.connected,
+      url: String(parsed?.url || ''),
+      hasToken: !!parsed?.hasToken,
+      deviceId: String(parsed?.deviceId || ''),
+      deviceName: String(parsed?.deviceName || ''),
+      source: String(parsed?.source || 'saved'),
+      lastError: String(parsed?.lastError || ''),
+    };
   },
 
   /** 订阅「在线 UI 列表」变化事件,接入/断开都会触发。 */

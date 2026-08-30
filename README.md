@@ -157,6 +157,13 @@ python -m src.ws_main
 
 推荐使用 [`deploy/docker-compose.example.yml`](deploy/docker-compose.example.yml) 部署。Backend 镜像默认包含官方 Codex CLI 与 Claude CLI；默认运行代理为 `http://192.168.50.156:7890`，可用 `AGENT_WITH_U_RUNTIME_PROXY` 覆盖，显式设为空可关闭。Codex/Claude 登录目录和业务数据均挂载到宿主机，重建不丢失。
 
+这套 Compose 不是“纯 Web 控制端”：`awu-web` 的同源 `/ws` 会连接同机
+`awu-backend`，因此页面里的 **当前 Web 节点** 本身就是完整执行节点。即使当前
+窗口默认查看 Relay 上的另一台机器，新建 Session 时仍可选择当前 Web 节点。
+“连接 → 当前 Web 节点 → 纳管执行节点”只负责把它额外注册到 Relay，供其他
+获授权控制端发现；关闭纳管不会关闭它的同源自执行能力。Web 中保存的 Relay
+主 Token 只落在 Backend 的 `data/relay-node.json`，不会写入浏览器或回显。
+
 Compose 同时启动无端口的 `awu-updater`。发布 `agent-with-u-docker-linux-<arch>.tar` 后，Docker 节点可在“节点在线更新”中一键加载新镜像、健康检查并重建 Backend/Web；失败自动恢复旧镜像。Docker Socket 只挂给 updater，不挂给执行 Agent 的 Backend。现有节点需先按[156 Docker 安装与更新指南](deploy/WEB_156_INSTALL.md)手动重建一次，之后才能在线升级。
 
 ### 接入本地模型（Ollama / LM Studio）

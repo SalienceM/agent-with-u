@@ -55,6 +55,13 @@ services:
       AGENT_WITH_U_DATA_ROOT: "/app/data"
       AGENT_WITH_U_RUNTIME: "docker"
       AGENT_WITH_U_DOCKER_UPDATER_DIR: "/app/data/docker-updater"
+      # 当前 Web Backend 本身具备自执行能力，也可注册到 Relay。以下环境变量
+      # 可在部署时预置；留空时仍可从 Web 的“连接 → 当前 Web 节点”在线配置，
+      # 配置会持久化到 /app/data/relay-node.json 并立即生效。
+      AGENT_WITH_U_RELAY_URL: "${AGENT_WITH_U_RELAY_URL-}"
+      AGENT_WITH_U_RELAY_TOKEN: "${AGENT_WITH_U_RELAY_TOKEN-}"
+      AGENT_WITH_U_DEVICE_ID: "${AGENT_WITH_U_DEVICE_ID-}"
+      AGENT_WITH_U_DEVICE_NAME: "${AGENT_WITH_U_DEVICE_NAME-}"
       # 信任来自 docker 网络的连接（awu-web 容器）
       AGENT_WITH_U_TRUSTED_PROXIES: "172.16.0.0/12"
       # Claude 凭据（可选）：在此直接给，或起来后在应用内 Backend Manager

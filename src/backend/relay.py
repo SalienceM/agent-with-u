@@ -28,10 +28,16 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import os
 import sys
-from typing import Optional
+import time
+from pathlib import Path
+from typing import Callable, Optional
+from urllib.parse import urlparse
 
 import websockets
+
+from . import paths
 
 
 _SENTINEL = object()
@@ -107,6 +113,9 @@ class RelayLink:
         self._send_lock = asyncio.Lock()
         self._transports: dict[str, RelayClientTransport] = {}
         self._tasks: dict[str, asyncio.Task] = {}
+        self.connected = False
+        self.last_error = ""
+        self._registered = asyncio.Event()
 
     async def run(self) -> None:
         """永久运行：断线后指数退避重连。"""
@@ -115,39 +124,57 @@ class RelayLink:
             try:
                 await self._connect_once()
                 backoff = 1
+            except asyncio.CancelledError:
+                raise
             except Exception as e:
+                self.last_error = str(e)
                 _log(f"link error: {e}")
             finally:
+                self.connected = False
                 self._teardown_all()
             _log(f"reconnecting to {self._relay_url} in {backoff}s")
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 30)
 
-    async def _connect_once(self) -> None:
-        async with websockets.connect(
-            self._relay_url, max_size=64 * 1024 * 1024,
-            ping_interval=20, ping_timeout=60,
-        ) as ws:
-            self._ws = ws
-            await ws.send(json.dumps({
-                "t": "register",
-                "deviceId": self._device_id,
-                "name": self._device_name,
-                "token": self._token,
-            }, ensure_ascii=False))
-            reply = json.loads(await ws.recv())
-            if reply.get("t") != "registered":
-                raise RuntimeError(f"register rejected: {reply.get('message', reply)}")
-            _log(f"registered as device={self._device_id!r} ({self._device_name})")
+    async def wait_until_registered(self, timeout: float = 8.0) -> bool:
+        """等待首次注册成功；超时只表示仍在重试，不会停止后台连接。"""
+        try:
+            await asyncio.wait_for(self._registered.wait(), timeout=timeout)
+            return True
+        except asyncio.TimeoutError:
+            return False
 
-            async for raw in ws:
-                if isinstance(raw, bytes):
-                    continue
-                try:
-                    await self._handle_frame(json.loads(raw))
-                except Exception as e:
-                    _log(f"frame error: {e}")
-        self._ws = None
+    async def _connect_once(self) -> None:
+        try:
+            async with websockets.connect(
+                self._relay_url, max_size=64 * 1024 * 1024,
+                ping_interval=20, ping_timeout=60,
+            ) as ws:
+                self._ws = ws
+                await ws.send(json.dumps({
+                    "t": "register",
+                    "deviceId": self._device_id,
+                    "name": self._device_name,
+                    "token": self._token,
+                }, ensure_ascii=False))
+                reply = json.loads(await ws.recv())
+                if reply.get("t") != "registered":
+                    raise RuntimeError(f"register rejected: {reply.get('message', reply)}")
+                self.connected = True
+                self.last_error = ""
+                self._registered.set()
+                _log(f"registered as device={self._device_id!r} ({self._device_name})")
+
+                async for raw in ws:
+                    if isinstance(raw, bytes):
+                        continue
+                    try:
+                        await self._handle_frame(json.loads(raw))
+                    except Exception as e:
+                        _log(f"frame error: {e}")
+        finally:
+            self._ws = None
+            self.connected = False
 
     async def _handle_frame(self, frame: dict) -> None:
         t = frame.get("t")
@@ -205,3 +232,204 @@ class RelayLink:
         for task in list(self._tasks.values()):
             task.cancel()
         self._tasks.clear()
+
+
+class RelayRuntimeManager:
+    """管理当前 Backend 作为 Relay 执行节点的运行期注册。
+
+    桌面壳仍可通过环境变量在进程启动时注入配置；Web/Docker 部署则可通过
+    受权限保护的 RPC 保存配置并立即重连。敏感的 Relay 主 Token 只写在服务端
+    数据目录，状态响应永远只返回 ``hasToken``。
+    """
+
+    _SCHEMA = 1
+
+    def __init__(
+        self,
+        bridge,
+        *,
+        device_id: str,
+        device_name: str,
+        initial_url: str = "",
+        initial_token: str = "",
+        config_path: Optional[Path] = None,
+        link_factory: Callable[..., RelayLink] = RelayLink,
+    ):
+        self._bridge = bridge
+        self._device_id = str(device_id or "").strip()
+        self._default_device_name = str(device_name or self._device_id).strip()
+        self._config_path = config_path or paths.sub("relay-node.json")
+        self._link_factory = link_factory
+        self._link: Optional[RelayLink] = None
+        self._task: Optional[asyncio.Task] = None
+        self._last_error = ""
+        # 同一物理节点可能同时打开多个控制 UI；全局 Relay 配置与热重连必须串行，
+        # 否则两个保存动作会争用同一个临时文件并互相取消刚创建的连接。
+        self._config_lock = asyncio.Lock()
+
+        env_url = str(initial_url or "").strip()
+        env_token = str(initial_token or "").strip()
+        saved = self._load_saved()
+        # 明确的启动参数/环境变量优先，保持桌面端“角色切换后重启”的既有语义；
+        # 没有启动配置时再使用 Web UI 保存的节点配置。
+        if env_url or env_token:
+            self._config = {
+                "enabled": bool(env_url),
+                "url": env_url,
+                "token": env_token,
+                "deviceName": self._default_device_name,
+            }
+            self._source = "environment"
+        elif saved:
+            self._config = saved
+            self._source = "saved"
+        else:
+            self._config = {
+                "enabled": False,
+                "url": "",
+                "token": "",
+                "deviceName": self._default_device_name,
+            }
+            self._source = "default"
+
+    @staticmethod
+    def _validate_url(value: str) -> str:
+        url = str(value or "").strip()
+        parsed = urlparse(url)
+        if parsed.scheme not in {"ws", "wss"} or not parsed.netloc:
+            raise ValueError("Relay 地址必须是完整的 ws:// 或 wss:// 地址")
+        return url
+
+    def _load_saved(self) -> Optional[dict]:
+        try:
+            raw = json.loads(self._config_path.read_text(encoding="utf-8"))
+            if not isinstance(raw, dict) or raw.get("schemaVersion") != self._SCHEMA:
+                return None
+            return {
+                "enabled": bool(raw.get("enabled")),
+                "url": str(raw.get("url") or "").strip(),
+                "token": str(raw.get("token") or "").strip(),
+                "deviceName": str(
+                    raw.get("deviceName") or self._default_device_name
+                ).strip()[:128],
+            }
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            return None
+
+    def _persist(self) -> None:
+        self._config_path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "schemaVersion": self._SCHEMA,
+            "enabled": bool(self._config.get("enabled")),
+            "url": str(self._config.get("url") or ""),
+            "token": str(self._config.get("token") or ""),
+            "deviceName": str(self._config.get("deviceName") or ""),
+            "updatedAt": int(time.time()),
+        }
+        temporary = self._config_path.with_suffix(self._config_path.suffix + ".tmp")
+        temporary.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        try:
+            temporary.chmod(0o600)
+        except OSError:
+            pass
+        os.replace(temporary, self._config_path)
+        try:
+            self._config_path.chmod(0o600)
+        except OSError:
+            pass
+
+    def status(self) -> dict:
+        link = self._link
+        error = str(getattr(link, "last_error", "") or self._last_error)
+        return {
+            "supported": True,
+            "enabled": bool(self._config.get("enabled")),
+            "connected": bool(link and link.connected),
+            "url": str(self._config.get("url") or ""),
+            "hasToken": bool(self._config.get("token")),
+            "deviceId": self._device_id,
+            "deviceName": str(
+                self._config.get("deviceName") or self._default_device_name
+            ),
+            "source": self._source,
+            "lastError": error,
+        }
+
+    async def start(self) -> dict:
+        async with self._config_lock:
+            await self._restart_link()
+            return self.status()
+
+    async def stop(self) -> None:
+        async with self._config_lock:
+            await self._stop_link()
+
+    async def _stop_link(self) -> None:
+        task = self._task
+        self._task = None
+        self._link = None
+        if task is None:
+            return
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            pass
+
+    async def _restart_link(self) -> None:
+        await self._stop_link()
+        self._last_error = ""
+        if not self._config.get("enabled"):
+            return
+        url = str(self._config.get("url") or "").strip()
+        token = str(self._config.get("token") or "").strip()
+        if not url or not token:
+            self._last_error = "Relay 已启用，但地址或主 Token 未配置"
+            return
+        try:
+            url = self._validate_url(url)
+        except ValueError as error:
+            self._last_error = str(error)
+            return
+        self._link = self._link_factory(
+            self._bridge,
+            url,
+            self._device_id,
+            str(self._config.get("deviceName") or self._default_device_name),
+            token,
+        )
+        self._task = asyncio.create_task(self._link.run())
+
+    async def configure(self, config: dict) -> dict:
+        if not isinstance(config, dict):
+            raise ValueError("Relay 节点配置必须是对象")
+        async with self._config_lock:
+            enabled = bool(config.get("enabled"))
+            url = str(config.get("url") or self._config.get("url") or "").strip()
+            supplied_token = str(config.get("token") or "").strip()
+            token = supplied_token or str(self._config.get("token") or "").strip()
+            device_name = str(
+                config.get("deviceName") or self._config.get("deviceName")
+                or self._default_device_name
+            ).strip()[:128]
+            if enabled:
+                url = self._validate_url(url)
+                if not token:
+                    raise ValueError("启用 Relay 纳管时必须填写主 Token")
+            self._config = {
+                "enabled": enabled,
+                "url": url,
+                "token": token,
+                "deviceName": device_name or self._default_device_name,
+            }
+            self._source = "saved"
+            self._persist()
+            await self._restart_link()
+            # 给快速可达的 Relay 一个短暂注册窗口；离线 Relay 不阻塞保存，后台继续重试。
+            if self._link is not None:
+                await self._link.wait_until_registered(timeout=1.5)
+            return self.status()

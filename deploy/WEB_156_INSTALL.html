@@ -1,0 +1,482 @@
+<!doctype html>
+<html lang="zh-CN" class="awu-export-root">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="generator" content="AgentWithU Markdown Preview">
+  <meta name="source-file" content="WEB_156_INSTALL.md">
+  <title>WEB_156_INSTALL</title>
+  <style>
+    /*
+     * 所有内容样式都限定在 awu-markdown-export 内。
+     * Trilium 等“渲染笔记”会把文档样式合入宿主页；不能使用 :root、body、
+     * --text 这类全局选择器/变量，否则会污染宿主 UI，也容易被宿主表格样式覆盖。
+     */
+    html.awu-export-root {
+      color-scheme: light dark;
+      background: #f6f8fa;
+    }
+    body.awu-export-body {
+      margin: 0;
+      background: #f6f8fa;
+    }
+    .awu-markdown-export {
+      --awu-paper-bg: #ffffff;
+      --awu-text: #1f2328;
+      --awu-muted: #59636e;
+      --awu-border: #d0d7de;
+      --awu-soft-bg: #f6f8fa;
+      --awu-code-bg: #f6f8fa;
+      --awu-accent: #0969da;
+      width: min(980px, calc(100% - 32px));
+      min-height: calc(100vh - 40px);
+      margin: 20px auto;
+      padding: clamp(24px, 5vw, 56px);
+      color: var(--awu-text) !important;
+      background: var(--awu-paper-bg);
+      border: 1px solid var(--awu-border);
+      box-shadow: 0 12px 36px rgba(31, 35, 40, .08);
+      font: 16px/1.7 -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans SC",
+        "Microsoft YaHei", Arial, sans-serif;
+      overflow-wrap: anywhere;
+      isolation: isolate;
+    }
+    .awu-markdown-export, .awu-markdown-export * { box-sizing: border-box; }
+    .awu-markdown-export .md-content { line-height: 1.7; color: var(--awu-text) !important; }
+    .awu-markdown-export .md-content p,
+    .awu-markdown-export .md-content li,
+    .awu-markdown-export .md-content dt,
+    .awu-markdown-export .md-content dd,
+    .awu-markdown-export .md-content strong,
+    .awu-markdown-export .md-content em,
+    .awu-markdown-export .md-content table,
+    .awu-markdown-export .md-content thead,
+    .awu-markdown-export .md-content tbody,
+    .awu-markdown-export .md-content tr,
+    .awu-markdown-export .md-content th,
+    .awu-markdown-export .md-content td {
+      color: var(--awu-text) !important;
+    }
+    .awu-markdown-export .md-content h1,
+    .awu-markdown-export .md-content h2,
+    .awu-markdown-export .md-content h3,
+    .awu-markdown-export .md-content h4,
+    .awu-markdown-export .md-content h5,
+    .awu-markdown-export .md-content h6 {
+      margin: 1.35em 0 .55em;
+      line-height: 1.28;
+      color: var(--awu-text) !important;
+    }
+    .awu-markdown-export .md-content h1 { margin-top: 0; font-size: 2em; border-bottom: 1px solid var(--awu-border); padding-bottom: .35em; }
+    .awu-markdown-export .md-content h2 { font-size: 1.5em; border-bottom: 1px solid var(--awu-border); padding-bottom: .28em; }
+    .awu-markdown-export .md-content h3 { font-size: 1.22em; }
+    .awu-markdown-export .md-content p { margin: .75em 0; }
+    .awu-markdown-export .md-content ul,
+    .awu-markdown-export .md-content ol { padding-left: 1.8em; }
+    .awu-markdown-export .md-content li + li { margin-top: .28em; }
+    .awu-markdown-export .md-content a { color: var(--awu-accent) !important; text-decoration: none; }
+    .awu-markdown-export .md-content a:hover { text-decoration: underline; }
+    .awu-markdown-export .md-content img { display: block; max-width: 100%; height: auto; margin: 1em auto; }
+    .awu-markdown-export .md-content hr { height: 1px; margin: 2em 0; border: 0; background: var(--awu-border); }
+    .awu-markdown-export .md-content blockquote {
+      margin: 1em 0;
+      padding: .3em 1em;
+      color: var(--awu-muted) !important;
+      border-left: 4px solid var(--awu-border);
+      background: var(--awu-soft-bg);
+    }
+    .awu-markdown-export .md-content blockquote p { color: var(--awu-muted) !important; }
+    .awu-markdown-export .md-content table { width: 100%; margin: 1em 0; border-collapse: collapse; display: block; overflow-x: auto; }
+    .awu-markdown-export .md-content th,
+    .awu-markdown-export .md-content td {
+      padding: .55em .8em;
+      color: var(--awu-text) !important;
+      border: 1px solid var(--awu-border);
+      text-align: left;
+    }
+    .awu-markdown-export .md-content th { background: var(--awu-soft-bg); font-weight: 650; }
+    .awu-markdown-export .md-content tr:nth-child(even) td { background: color-mix(in srgb, var(--awu-soft-bg) 55%, transparent); }
+    .awu-markdown-export .md-content code {
+      padding: .14em .38em;
+      color: var(--awu-text) !important;
+      background: var(--awu-code-bg);
+      border: 1px solid color-mix(in srgb, var(--awu-border) 70%, transparent);
+      border-radius: 4px;
+      font: .88em/1.55 "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+    }
+    .awu-markdown-export .md-content pre {
+      margin: 1em 0;
+      padding: 1em 1.15em;
+      color: var(--awu-text) !important;
+      overflow: auto;
+      background: var(--awu-code-bg);
+      border: 1px solid var(--awu-border);
+      border-radius: 6px;
+    }
+    .awu-markdown-export .md-content pre code { display: block; padding: 0; border: 0; background: transparent; font-size: .9em; }
+    .awu-markdown-export .md-content .md-code-lang { margin-bottom: .4em; color: var(--awu-muted) !important; font: 12px/1.4 sans-serif; }
+    .awu-markdown-export .hljs-doctag, .awu-markdown-export .hljs-keyword,
+    .awu-markdown-export .hljs-meta .hljs-keyword, .awu-markdown-export .hljs-template-tag,
+    .awu-markdown-export .hljs-type, .awu-markdown-export .hljs-variable.language_ { color: #cf222e !important; font-weight: 600; }
+    .awu-markdown-export .hljs-title, .awu-markdown-export .hljs-title.class_,
+    .awu-markdown-export .hljs-title.function_ { color: #8250df !important; font-weight: 600; }
+    .awu-markdown-export .hljs-attr, .awu-markdown-export .hljs-attribute,
+    .awu-markdown-export .hljs-literal, .awu-markdown-export .hljs-number,
+    .awu-markdown-export .hljs-operator, .awu-markdown-export .hljs-variable { color: #0550ae !important; }
+    .awu-markdown-export .hljs-regexp, .awu-markdown-export .hljs-string { color: #0a3069 !important; }
+    .awu-markdown-export .hljs-built_in, .awu-markdown-export .hljs-symbol { color: #953800 !important; }
+    .awu-markdown-export .hljs-comment, .awu-markdown-export .hljs-code,
+    .awu-markdown-export .hljs-formula { color: #6e7781 !important; }
+    .awu-markdown-export .hljs-name, .awu-markdown-export .hljs-quote,
+    .awu-markdown-export .hljs-selector-tag { color: #116329 !important; }
+    @media (prefers-color-scheme: dark) {
+      html.awu-export-root, body.awu-export-body { background: #0d1117; }
+      .awu-markdown-export {
+        --awu-paper-bg: #161b22;
+        --awu-text: #e6edf3;
+        --awu-muted: #9da7b3;
+        --awu-border: #30363d;
+        --awu-soft-bg: #1d232b;
+        --awu-code-bg: #0d1117;
+        --awu-accent: #58a6ff;
+      }
+      .awu-markdown-export .hljs-doctag, .awu-markdown-export .hljs-keyword,
+      .awu-markdown-export .hljs-meta .hljs-keyword, .awu-markdown-export .hljs-template-tag,
+      .awu-markdown-export .hljs-type, .awu-markdown-export .hljs-variable.language_ { color: #ff7b72 !important; }
+      .awu-markdown-export .hljs-title, .awu-markdown-export .hljs-title.class_,
+      .awu-markdown-export .hljs-title.function_ { color: #d2a8ff !important; }
+      .awu-markdown-export .hljs-attr, .awu-markdown-export .hljs-attribute,
+      .awu-markdown-export .hljs-literal, .awu-markdown-export .hljs-number,
+      .awu-markdown-export .hljs-operator, .awu-markdown-export .hljs-variable { color: #79c0ff !important; }
+      .awu-markdown-export .hljs-regexp, .awu-markdown-export .hljs-string { color: #a5d6ff !important; }
+      .awu-markdown-export .hljs-built_in, .awu-markdown-export .hljs-symbol { color: #ffa657 !important; }
+      .awu-markdown-export .hljs-comment, .awu-markdown-export .hljs-code,
+      .awu-markdown-export .hljs-formula { color: #8b949e !important; }
+      .awu-markdown-export .hljs-name, .awu-markdown-export .hljs-quote,
+      .awu-markdown-export .hljs-selector-tag { color: #7ee787 !important; }
+    }
+    @media (max-width: 640px) {
+      .awu-markdown-export { width: 100%; min-height: 100vh; margin: 0; padding: 22px 18px; border: 0; box-shadow: none; font-size: 15px; }
+    }
+    @media print {
+      html.awu-export-root, body.awu-export-body { background: #fff; }
+      .awu-markdown-export {
+        --awu-paper-bg: #fff;
+        --awu-text: #000;
+        --awu-border: #bbb;
+        width: 100%; min-height: 0; margin: 0; padding: 0; border: 0; box-shadow: none;
+      }
+    }
+  </style>
+</head>
+<body class="awu-export-body">
+  <main class="awu-markdown-export">
+<div class="md-content"><div class="md-content"><h1 class="md-h1">AgentWithU 156 Web 服务端安装与更新</h1>
+<p>本文用于在群晖 / Linux Docker 主机上部署 AgentWithU Web 服务，固定采用以下目录、构建代理与运行代理：</p>
+<table>
+<thead>
+<tr>
+<th>项目</th>
+<th>配置</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>仓库目录</td>
+<td><code class="md-code-inline">/volume1/docker/agent-with-u/agent-with-u</code></td>
+</tr>
+<tr>
+<td>持久化数据</td>
+<td><code class="md-code-inline">/volume1/docker/agent-with-u/data</code></td>
+</tr>
+<tr>
+<td>Docker Compose 文件</td>
+<td><code class="md-code-inline">deploy/docker-compose.example.yml</code></td>
+</tr>
+<tr>
+<td>构建代理</td>
+<td><code class="md-code-inline">http://192.168.50.156:7890</code></td>
+</tr>
+<tr>
+<td>运行代理</td>
+<td><code class="md-code-inline">http://192.168.50.156:7890</code>（可覆盖或显式置空）</td>
+</tr>
+<tr>
+<td>Web 宿主端口</td>
+<td><code class="md-code-inline">44380</code></td>
+</tr>
+<tr>
+<td>Web 容器</td>
+<td><code class="md-code-inline">awu-web</code></td>
+</tr>
+<tr>
+<td>Backend 容器</td>
+<td><code class="md-code-inline">awu-backend</code></td>
+</tr>
+<tr>
+<td>升级伴随容器</td>
+<td><code class="md-code-inline">awu-updater</code>（无端口，仅监听本机更新队列）</td>
+</tr>
+</tbody></table>
+<blockquote class="md-blockquote"><p><code class="md-code-inline">192.168.50.156:7890</code> 默认同时用于镜像构建和 Backend/Codex 运行。代理机器必须开启“允许局域网连接”，并允许 Docker 主机访问 TCP <code class="md-code-inline">7890</code>。</p>
+</blockquote>
+<h2 class="md-h2">一、部署结构</h2>
+<pre class="md-pre"><code class="hljs"><div class="md-code-lang">text</div>浏览器 / NPM / Authelia
+        │
+        │ http://&lt;Docker 主机 IP&gt;:44380
+        ▼
+awu-web（nginx，宿主 44380 → 容器 80）
+        ├─ /      前端静态文件
+        ├─ /ws    → awu-backend:44321
+        └─ /api/  → awu-backend:44322
+                         │
+                         ▼
+             /volume1/docker/agent-with-u/data
+                         │
+                         └─ awu-updater → Docker Socket（只重建 Backend/Web）</code></pre>
+<ul>
+<li><code class="md-code-inline">awu-web</code> 是唯一映射宿主端口的容器。</li>
+<li>这不是纯控制端部署：<code class="md-code-inline">awu-web</code> 通过同源 <code class="md-code-inline">/ws</code> 连接 <code class="md-code-inline">awu-backend</code>，所以<br><strong>当前 Web 节点本身就是完整执行节点</strong>，可直接创建和运行 Session。</li>
+<li><code class="md-code-inline">awu-updater</code> 不映射端口，Docker Socket 也不会暴露给会运行 Agent 命令的 Backend。</li>
+<li>Backend 的 <code class="md-code-inline">44321</code>、<code class="md-code-inline">44322</code> 仅在 Docker 内部网络开放，不应直接暴露到公网。</li>
+<li>Session、Backend 配置、Skills、素材池等数据保存在宿主机 <code class="md-code-inline">data</code> 目录中；Codex/Claude 登录态分别保存在 <code class="md-code-inline">codex-config</code>、<code class="md-code-inline">claude-config</code>，重建容器不会删除。</li>
+</ul>
+<h2 class="md-h2">二、前置条件</h2>
+<p>部署前确认：</p>
+<ol>
+<li>已安装 Git、Docker 与 Docker Compose v2。</li>
+<li>当前用户可以执行 <code class="md-code-inline">sudo docker ...</code>。</li>
+<li>宿主端口 <code class="md-code-inline">44380</code> 未被其他服务占用。</li>
+<li>Docker 主机可以访问 <code class="md-code-inline">192.168.50.156:7890</code>。</li>
+<li>代理服务已开启局域网访问权限。</li>
+</ol>
+<p>检查 Docker 环境：</p>
+<pre class="md-pre"><code class="hljs"><div class="md-code-lang">bash</div>docker --version
+docker compose version</code></pre>
+<p>检查端口占用：</p>
+<pre class="md-pre"><code class="hljs"><div class="md-code-lang">bash</div><span class="hljs-built_in">sudo</span> docker ps --format <span class="hljs-string">&#x27;table {{.Names}}\t{{.Ports}}&#x27;</span></code></pre>
+<p>检查代理：</p>
+<pre class="md-pre"><code class="hljs"><div class="md-code-lang">bash</div>PROXY=http://192.168.50.156:7890
+curl -x <span class="hljs-string">&quot;<span class="hljs-variable">$PROXY</span>&quot;</span> -I https://pypi.org/simple/</code></pre>
+<p>能收到 HTTP 响应头即可；出现连接拒绝或超时，应先修复代理连通性。</p>
+<h2 class="md-h2">三、首次准备仓库</h2>
+<p>如果仓库已经位于 <code class="md-code-inline">/volume1/docker/agent-with-u/agent-with-u</code>，跳过本节。</p>
+<pre class="md-pre"><code class="hljs"><div class="md-code-lang">bash</div><span class="hljs-built_in">sudo</span> <span class="hljs-built_in">mkdir</span> -p /volume1/docker/agent-with-u
+<span class="hljs-built_in">sudo</span> <span class="hljs-built_in">chown</span> <span class="hljs-string">&quot;<span class="hljs-subst">$(id -u)</span>:<span class="hljs-subst">$(id -g)</span>&quot;</span> /volume1/docker/agent-with-u
+<span class="hljs-built_in">cd</span> /volume1/docker/agent-with-u
+
+PROXY=http://192.168.50.156:7890
+git -c http.proxy=<span class="hljs-string">&quot;<span class="hljs-variable">$PROXY</span>&quot;</span> -c https.proxy=<span class="hljs-string">&quot;<span class="hljs-variable">$PROXY</span>&quot;</span> \
+  <span class="hljs-built_in">clone</span> --branch v2.2 https://github.com/SalienceM/agent-with-u.git agent-with-u
+
+<span class="hljs-built_in">cd</span> agent-with-u</code></pre>
+<blockquote class="md-blockquote"><p>如果不需要固定 <code class="md-code-inline">v2.2</code> 分支，可去掉 <code class="md-code-inline">--branch v2.2</code>，使用仓库默认分支。</p>
+</blockquote>
+<h2 class="md-h2">四、完整构建与启动</h2>
+<p>以下是日常安装或更新时使用的标准流程。</p>
+<h3 class="md-h3">1. 进入仓库目录</h3>
+<pre class="md-pre"><code class="hljs"><div class="md-code-lang">bash</div><span class="hljs-built_in">cd</span> /volume1/docker/agent-with-u/agent-with-u</code></pre>
+<p>确认当前位置正确：</p>
+<pre class="md-pre"><code class="hljs"><div class="md-code-lang">bash</div><span class="hljs-built_in">pwd</span>
+<span class="hljs-built_in">test</span> -f deploy/docker-compose.example.yml &amp;&amp; <span class="hljs-built_in">echo</span> <span class="hljs-string">&quot;Compose 文件存在&quot;</span></code></pre>
+<h3 class="md-h3">2. 拉取最新代码</h3>
+<pre class="md-pre"><code class="hljs"><div class="md-code-lang">bash</div>git pull --ff-only</code></pre>
+<p><code class="md-code-inline">--ff-only</code> 可以防止服务器上的分支被意外自动合并。如果拉取网络较慢，可让本次 Git 请求显式使用代理：</p>
+<pre class="md-pre"><code class="hljs"><div class="md-code-lang">bash</div>PROXY=http://192.168.50.156:7890
+git -c http.proxy=<span class="hljs-string">&quot;<span class="hljs-variable">$PROXY</span>&quot;</span> -c https.proxy=<span class="hljs-string">&quot;<span class="hljs-variable">$PROXY</span>&quot;</span> pull --ff-only</code></pre>
+<p>如果提示本地有改动，先检查：</p>
+<pre class="md-pre"><code class="hljs"><div class="md-code-lang">bash</div>git status --short</code></pre>
+<p>不要直接删除或覆盖这些改动；应先确认它们是否需要提交或备份。</p>
+<h3 class="md-h3">3. 设置本次构建代理</h3>
+<pre class="md-pre"><code class="hljs"><div class="md-code-lang">bash</div>PROXY=http://192.168.50.156:7890</code></pre>
+<p>该变量只在当前终端会话有效，因此本步骤和下一步构建命令需要在同一个终端中执行。</p>
+<h3 class="md-h3">4. 构建 Backend、Web 与升级器镜像</h3>
+<pre class="md-pre"><code class="hljs"><div class="md-code-lang">bash</div><span class="hljs-built_in">sudo</span> docker compose -f deploy/docker-compose.example.yml build \
+  --build-arg HTTP_PROXY=<span class="hljs-string">&quot;<span class="hljs-variable">$PROXY</span>&quot;</span> \
+  --build-arg HTTPS_PROXY=<span class="hljs-string">&quot;<span class="hljs-variable">$PROXY</span>&quot;</span> \
+  --build-arg http_proxy=<span class="hljs-string">&quot;<span class="hljs-variable">$PROXY</span>&quot;</span> \
+  --build-arg https_proxy=<span class="hljs-string">&quot;<span class="hljs-variable">$PROXY</span>&quot;</span></code></pre>
+<p>该命令会构建：</p>
+<ul>
+<li><code class="md-code-inline">agent-with-u-backend:latest</code></li>
+<li><code class="md-code-inline">agent-with-u-web:latest</code></li>
+<li><code class="md-code-inline">agent-with-u-updater:latest</code></li>
+</ul>
+<p>Compose 本身已经为构建与运行设置默认代理，因此上面的显式 build-arg 保留兼容但不再是必需项。运行时会向 Python HTTP 客户端、Claude/Codex 子进程注入同一代理，并用 <code class="md-code-inline">NO_PROXY</code> 绕过容器内通信。可在执行 Compose 前覆盖：</p>
+<pre class="md-pre"><code class="hljs"><div class="md-code-lang">bash</div><span class="hljs-built_in">export</span> AGENT_WITH_U_BUILD_PROXY=http://其他地址:端口
+<span class="hljs-built_in">export</span> AGENT_WITH_U_RUNTIME_PROXY=http://其他地址:端口</code></pre>
+<p>若该节点无需运行代理，必须显式定义为空（“未定义”会使用 156 默认值）：</p>
+<pre class="md-pre"><code class="hljs"><div class="md-code-lang">bash</div><span class="hljs-built_in">export</span> AGENT_WITH_U_RUNTIME_PROXY=</code></pre>
+<h3 class="md-h3">5. 使用新镜像重建并启动容器</h3>
+<pre class="md-pre"><code class="hljs"><div class="md-code-lang">bash</div><span class="hljs-built_in">sudo</span> docker compose -f deploy/docker-compose.example.yml \
+  up -d --no-build --force-recreate</code></pre>
+<p>参数说明：</p>
+<ul>
+<li><code class="md-code-inline">-d</code>：后台运行。</li>
+<li><code class="md-code-inline">--no-build</code>：只使用第 4 步已经成功生成的镜像，避免启动阶段重复构建。</li>
+<li><code class="md-code-inline">--force-recreate</code>：即使 Compose 配置未变化，也重新创建容器以确保使用新镜像。</li>
+</ul>
+<h2 class="md-h2">五、一段式更新命令</h2>
+<p>确认仓库没有需要保留的本地改动后，可以依次执行：</p>
+<pre class="md-pre"><code class="hljs"><div class="md-code-lang">bash</div><span class="hljs-built_in">cd</span> /volume1/docker/agent-with-u/agent-with-u
+
+git pull --ff-only
+
+PROXY=http://192.168.50.156:7890
+
+<span class="hljs-built_in">sudo</span> docker compose -f deploy/docker-compose.example.yml build \
+  --build-arg HTTP_PROXY=<span class="hljs-string">&quot;<span class="hljs-variable">$PROXY</span>&quot;</span> \
+  --build-arg HTTPS_PROXY=<span class="hljs-string">&quot;<span class="hljs-variable">$PROXY</span>&quot;</span> \
+  --build-arg http_proxy=<span class="hljs-string">&quot;<span class="hljs-variable">$PROXY</span>&quot;</span> \
+  --build-arg https_proxy=<span class="hljs-string">&quot;<span class="hljs-variable">$PROXY</span>&quot;</span>
+
+<span class="hljs-built_in">sudo</span> docker compose -f deploy/docker-compose.example.yml \
+  up -d --no-build --force-recreate</code></pre>
+<p>只有前一条命令成功后，才继续执行下一条。不要用分号强行忽略失败。</p>
+<h2 class="md-h2">六、启动后验证</h2>
+<h3 class="md-h3">1. 查看容器状态</h3>
+<pre class="md-pre"><code class="hljs"><div class="md-code-lang">bash</div><span class="hljs-built_in">sudo</span> docker compose -f deploy/docker-compose.example.yml ps</code></pre>
+<p>正常情况下应看到：</p>
+<pre class="md-pre"><code class="hljs"><div class="md-code-lang">text</div>awu-backend   Up
+awu-web       Up
+awu-updater   Up</code></pre>
+<h3 class="md-h3">2. 检查网页入口</h3>
+<pre class="md-pre"><code class="hljs"><div class="md-code-lang">bash</div>curl -I http://127.0.0.1:44380/</code></pre>
+<p>应返回 <code class="md-code-inline">HTTP/1.1 200 OK</code>。局域网浏览器使用：</p>
+<pre class="md-pre"><code class="hljs"><div class="md-code-lang">text</div>http://&lt;Docker 主机局域网 IP&gt;:44380/</code></pre>
+<p>如果 Docker 主机本身就是 <code class="md-code-inline">192.168.50.156</code>，则地址为：</p>
+<pre class="md-pre"><code class="hljs"><div class="md-code-lang">text</div>http://192.168.50.156:44380/</code></pre>
+<h3 class="md-h3">3. 查看日志</h3>
+<pre class="md-pre"><code class="hljs"><div class="md-code-lang">bash</div><span class="hljs-built_in">sudo</span> docker compose -f deploy/docker-compose.example.yml logs --<span class="hljs-built_in">tail</span>=100 awu-backend
+<span class="hljs-built_in">sudo</span> docker compose -f deploy/docker-compose.example.yml logs --<span class="hljs-built_in">tail</span>=100 awu-web</code></pre>
+<p>持续跟踪日志：</p>
+<pre class="md-pre"><code class="hljs"><div class="md-code-lang">bash</div><span class="hljs-built_in">sudo</span> docker compose -f deploy/docker-compose.example.yml logs -f --<span class="hljs-built_in">tail</span>=100</code></pre>
+<p>按 <code class="md-code-inline">Ctrl+C</code> 只会退出日志查看，不会停止容器。</p>
+<h3 class="md-h3">4. 验证当前 Web 节点的自执行与 Relay 纳管</h3>
+<p>打开 Web 页面的“连接”面板后，会看到两张相互独立的卡片：</p>
+<ul>
+<li><strong>A：当前 Web 节点</strong>：表示这套 Compose 中的同源 <code class="md-code-inline">awu-backend</code>。它始终能<br>自执行；“纳管执行节点”只决定是否额外把它发布到 Relay。</li>
+<li><strong>B：本 UI 连接到</strong>：决定当前窗口默认查看当前 Web 节点，还是 Relay 上的<br>另一台执行节点。切到远端不会移除 A，创建 Session 时仍可逐个选择执行节点。</li>
+</ul>
+<p>只使用当前 Web 节点时，卡片 B 选择“本地直连”即可，不需要暴露 Backend 的<br><code class="md-code-inline">44321</code>/<code class="md-code-inline">44322</code> 宿主端口。</p>
+<p>如需让其他控制端也能选择这台 Docker 节点：</p>
+<ol>
+<li>在卡片 A 选择“纳管执行节点”。</li>
+<li>填写 Relay 的 <code class="md-code-inline">ws://</code>/<code class="md-code-inline">wss://</code> 地址、<strong>Relay 主 Token</strong>和节点显示名。</li>
+<li>点击“保存并连接”。Backend 会立即热连接 Relay，无需重建容器。</li>
+</ol>
+<p>若 Relay 已启用多用户且提示 <code class="md-code-inline">device is not assigned to a Relay user</code>，先复制卡片<br>A 显示的节点 ID，再到 Relay 主机授权；这里的用户名替换为实际 Relay 用户：</p>
+<pre class="md-pre"><code class="hljs"><div class="md-code-lang">bash</div>python -m src.relay_server user grant 用户名 节点ID</code></pre>
+<p>需要指定谁能管理该共享节点时，再执行：</p>
+<pre class="md-pre"><code class="hljs"><div class="md-code-lang">bash</div>python -m src.relay_server user set-default 用户名 节点ID</code></pre>
+<p>Relay 主 Token 不会保存在浏览器，也不会由状态接口回显；它只写入持久化目录：</p>
+<pre class="md-pre"><code class="hljs"><div class="md-code-lang">text</div>/volume1/docker/agent-with-u/data/relay-node.json</code></pre>
+<p>取消纳管只会停止对外发布，不会关闭同源 Backend，也不会影响当前 Web 自执行。<br>只有本机直连用户或 Relay 为该设备指定的主用户可以修改这项全局节点配置。</p>
+<p>也可以在 Compose 启动前预置（环境变量在进程重启后优先于页面保存值）：</p>
+<pre class="md-pre"><code class="hljs"><div class="md-code-lang">bash</div><span class="hljs-built_in">export</span> AGENT_WITH_U_RELAY_URL=wss://relay.example.com/ws
+<span class="hljs-built_in">export</span> AGENT_WITH_U_RELAY_TOKEN=替换为Relay主Token
+<span class="hljs-built_in">export</span> AGENT_WITH_U_DEVICE_NAME=NAS-Web-Executor</code></pre>
+<p>未预置时保持为空即可，直接在 Web 连接面板配置。</p>
+<h2 class="md-h2">七、常用维护命令</h2>
+<p>以下命令均在仓库根目录执行：</p>
+<pre class="md-pre"><code class="hljs"><div class="md-code-lang">bash</div><span class="hljs-built_in">cd</span> /volume1/docker/agent-with-u/agent-with-u</code></pre>
+<p>重新启动：</p>
+<pre class="md-pre"><code class="hljs"><div class="md-code-lang">bash</div><span class="hljs-built_in">sudo</span> docker compose -f deploy/docker-compose.example.yml restart</code></pre>
+<p>停止服务但保留容器和数据：</p>
+<pre class="md-pre"><code class="hljs"><div class="md-code-lang">bash</div><span class="hljs-built_in">sudo</span> docker compose -f deploy/docker-compose.example.yml stop</code></pre>
+<p>重新启动已停止的服务：</p>
+<pre class="md-pre"><code class="hljs"><div class="md-code-lang">bash</div><span class="hljs-built_in">sudo</span> docker compose -f deploy/docker-compose.example.yml start</code></pre>
+<p>删除并重新创建容器，但保留宿主机数据：</p>
+<pre class="md-pre"><code class="hljs"><div class="md-code-lang">bash</div><span class="hljs-built_in">sudo</span> docker compose -f deploy/docker-compose.example.yml down
+<span class="hljs-built_in">sudo</span> docker compose -f deploy/docker-compose.example.yml up -d --no-build</code></pre>
+<blockquote class="md-blockquote"><p>不要执行 <code class="md-code-inline">docker compose down -v</code>。虽然当前核心数据使用宿主机目录挂载，但生产环境仍不应养成删除卷的操作习惯。</p>
+</blockquote>
+<h2 class="md-h2">八、Codex、运行代理与在线升级验证</h2>
+<p>Backend 镜像默认安装官方 Codex CLI 和 Claude CLI。首次重建后检查：</p>
+<pre class="md-pre"><code class="hljs"><div class="md-code-lang">bash</div><span class="hljs-built_in">sudo</span> docker <span class="hljs-built_in">exec</span> awu-backend codex --version
+<span class="hljs-built_in">sudo</span> docker <span class="hljs-built_in">exec</span> awu-backend claude --version
+<span class="hljs-built_in">sudo</span> docker <span class="hljs-built_in">exec</span> awu-backend sh -lc <span class="hljs-string">&#x27;printf &quot;%s\n&quot; &quot;$HTTPS_PROXY&quot; &quot;$AGENTWITHU_CODEX_PROXY&quot;&#x27;</span>
+<span class="hljs-built_in">sudo</span> docker compose -f deploy/docker-compose.example.yml logs --<span class="hljs-built_in">tail</span>=30 awu-updater</code></pre>
+<p>如使用 Codex 账号登录，执行一次：</p>
+<pre class="md-pre"><code class="hljs"><div class="md-code-lang">bash</div><span class="hljs-built_in">sudo</span> docker <span class="hljs-built_in">exec</span> -it awu-backend codex login</code></pre>
+<p>登录数据写入宿主机 <code class="md-code-inline">codex-config</code>，以后在线升级/重建不会丢失。</p>
+<p>构建发布包时，Windows 的 <code class="md-code-inline">build_all.bat</code> 或 Linux 的 <code class="md-code-inline">build_web_linux.sh</code> 会在 Docker Engine 可用时额外生成：</p>
+<pre class="md-pre"><code class="hljs"><div class="md-code-lang">text</div>dist/agent-with-u-docker-linux-x86_64.tar</code></pre>
+<p>发布中心会自动把它识别为 <code class="md-code-inline">target=docker / kind=docker-bundle</code>。发布后，在“设置 → 数据与系统 → 节点在线更新”中，Docker 节点应显示“Docker · 升级器在线”；点击“一键更新”后由节点下载和校验镜像包，<code class="md-code-inline">awu-updater</code> 保存旧镜像、加载新镜像、重建 Backend/Web 并做健康检查，失败会恢复旧镜像。</p>
+<p>旧 Docker 部署必须按本文第四、第五步<strong>手动重建这一次</strong>，让 Codex、代理环境和 <code class="md-code-inline">awu-updater</code> 进入部署；此后应用版本才可从 UI 在线升级。若不想在某次 Windows 打包中生成较大的 Docker 包，可在运行 BAT 前设置 <code class="md-code-inline">AGENT_WITH_U_SKIP_DOCKER_RELEASE=1</code>。</p>
+<h2 class="md-h2">九、NPM / Authelia 反向代理</h2>
+<p>如果外层使用 Nginx Proxy Manager：</p>
+<ol>
+<li>Forward Hostname 填 Docker 主机的局域网 IP。</li>
+<li>Forward Port 填 <code class="md-code-inline">44380</code>。</li>
+<li>开启 <strong>Websockets Support</strong>，否则 <code class="md-code-inline">/ws</code> 无法连接。</li>
+<li>SSL 页面选择证书并强制 HTTPS。</li>
+<li>Authelia 的认证规则需要同时覆盖网页请求和 WebSocket 握手。</li>
+</ol>
+<p>对外只开放反向代理入口；不要把 Backend 的 <code class="md-code-inline">44321</code>、<code class="md-code-inline">44322</code> 映射到公网。</p>
+<p>当前 <code class="md-code-inline">docker-compose.example.yml</code> 默认适合单用户使用：Authelia 负责入口认证，Backend 将来自受信 Docker 网络的请求视为本地身份。如果需要根据 Authelia 用户区分 Session，需在 <code class="md-code-inline">awu-backend.environment</code> 中启用：</p>
+<pre class="md-pre"><code class="hljs"><div class="md-code-lang">yaml</div><span class="hljs-attr">AGENT_WITH_U_TRUST_FORWARD_AUTH:</span> <span class="hljs-string">&quot;1&quot;</span></code></pre>
+<p>同时确保反向代理正确传递 <code class="md-code-inline">Remote-User</code> 等身份头。修改 Compose 后需要重新执行第 5 步重建容器。</p>
+<h2 class="md-h2">十、常见问题</h2>
+<h3 class="md-h3">1. <code class="md-code-inline">pip</code> 下载超时或显示 <code class="md-code-inline">No matching distribution found</code></h3>
+<p>如果日志同时出现 <code class="md-code-inline">ReadTimeoutError</code>、下载速度极低，或可用版本显示为 <code class="md-code-inline">none</code>，通常是 PyPI 网络请求失败，并不一定是依赖版本不存在。</p>
+<p>处理顺序：</p>
+<ol>
+<li><p>确认代理允许局域网访问。</p>
+</li>
+<li><p>从 Docker 主机执行：</p>
+<pre class="md-pre"><code class="hljs"><div class="md-code-lang">bash</div>PROXY=http://192.168.50.156:7890
+curl -x <span class="hljs-string">&quot;<span class="hljs-variable">$PROXY</span>&quot;</span> -I https://pypi.org/simple/aiohttp/</code></pre>
+</li>
+<li><p>重新执行带四个代理参数的 <code class="md-code-inline">docker compose build</code>。</p>
+</li>
+</ol>
+<h3 class="md-h3">2. 构建卡在 <code class="md-code-inline">apt-get</code>、<code class="md-code-inline">pip</code> 或 <code class="md-code-inline">npm</code></h3>
+<p>先检查 <code class="md-code-inline">192.168.50.156:7890</code> 是否可达，以及代理软件是否允许 LAN。构建缓存会保留已经成功完成的层，修复网络后直接重新执行构建即可。</p>
+<h3 class="md-h3">3. 卡在 <code class="md-code-inline">load metadata for docker.io/...</code></h3>
+<p>构建参数主要影响 Dockerfile 内的 <code class="md-code-inline">RUN</code> 命令；Docker 守护进程拉取 <code class="md-code-inline">FROM</code> 基础镜像时，不一定使用这些构建参数。</p>
+<p>当前构建需要以下基础镜像：</p>
+<pre class="md-pre"><code class="hljs"><div class="md-code-lang">text</div>python:3.11-slim
+node:20-alpine
+nginx:alpine</code></pre>
+<p>如果基础镜像拉取持续超时，需要为 Docker 守护进程 / 群晖 Container Manager 配置代理或镜像加速，之后再重新构建。</p>
+<h3 class="md-h3">4. <code class="md-code-inline">git pull --ff-only</code> 失败</h3>
+<ul>
+<li>网络失败：使用本文提供的 <code class="md-code-inline">git -c http.proxy=...</code> 命令。</li>
+<li>本地有改动：执行 <code class="md-code-inline">git status --short</code>，先提交或备份，不要直接重置。</li>
+<li>分支分叉：确认服务器应跟随的远端分支，再人工处理；<code class="md-code-inline">--ff-only</code> 拒绝执行是保护机制。</li>
+</ul>
+<h3 class="md-h3">5. <code class="md-code-inline">44380</code> 无法访问</h3>
+<p>依次检查：</p>
+<pre class="md-pre"><code class="hljs"><div class="md-code-lang">bash</div><span class="hljs-built_in">sudo</span> docker compose -f deploy/docker-compose.example.yml ps
+<span class="hljs-built_in">sudo</span> docker compose -f deploy/docker-compose.example.yml logs --<span class="hljs-built_in">tail</span>=100 awu-web
+curl -I http://127.0.0.1:44380/</code></pre>
+<p>如果本机可以访问但其他设备不行，检查宿主机防火墙和局域网访问规则。</p>
+<h3 class="md-h3">6. 页面能打开但一直显示 Backend 未连接</h3>
+<p>检查：</p>
+<pre class="md-pre"><code class="hljs"><div class="md-code-lang">bash</div><span class="hljs-built_in">sudo</span> docker compose -f deploy/docker-compose.example.yml logs --<span class="hljs-built_in">tail</span>=100 awu-backend
+<span class="hljs-built_in">sudo</span> docker compose -f deploy/docker-compose.example.yml logs --<span class="hljs-built_in">tail</span>=100 awu-web</code></pre>
+<p>如果经过 NPM，还需确认已经开启 WebSocket 支持，并且 <code class="md-code-inline">/ws</code> 也通过了 Authelia 鉴权。</p>
+<h3 class="md-h3">7. Web 中没有“当前 Web 节点”或无法纳管</h3>
+<p>先确认已使用包含该能力的 Backend 和 Web 镜像完成一次重建，而不是只更新了前端：</p>
+<pre class="md-pre"><code class="hljs"><div class="md-code-lang">bash</div><span class="hljs-built_in">sudo</span> docker compose -f deploy/docker-compose.example.yml ps
+<span class="hljs-built_in">sudo</span> docker compose -f deploy/docker-compose.example.yml logs --<span class="hljs-built_in">tail</span>=100 awu-backend
+<span class="hljs-built_in">sudo</span> docker compose -f deploy/docker-compose.example.yml up -d --build --force-recreate</code></pre>
+<p>随后在浏览器强制刷新。<code class="md-code-inline">awu-web</code> 必须能通过 Docker 内网访问<br><code class="md-code-inline">awu-backend:44321</code>；无需、也不应把该端口直接暴露到公网。若页面提示没有节点管理<br>权限，说明当前是普通共享用户，应改由本机直连用户或该节点的 Relay 主用户配置。</p>
+<h2 class="md-h2">十一、数据与备份边界</h2>
+<ul>
+<li>代码与 Dockerfile：<code class="md-code-inline">/volume1/docker/agent-with-u/agent-with-u</code></li>
+<li>持久化业务数据：<code class="md-code-inline">/volume1/docker/agent-with-u/data</code></li>
+<li>Codex 登录态与原生 thread：<code class="md-code-inline">/volume1/docker/agent-with-u/codex-config</code></li>
+<li>Claude 登录态：<code class="md-code-inline">/volume1/docker/agent-with-u/claude-config</code></li>
+<li>镜像和容器可以重建。</li>
+<li><code class="md-code-inline">data</code> 目录不能随仓库更新一起覆盖或删除。</li>
+</ul>
+<p>建议将以下目录纳入 NAS 的定期备份：</p>
+<pre class="md-pre"><code class="hljs"><div class="md-code-lang">text</div>/volume1/docker/agent-with-u/data
+/volume1/docker/agent-with-u/codex-config
+/volume1/docker/agent-with-u/claude-config</code></pre>
+<p>更新前如涉及重要 Session，可先确认该目录已有最新快照或备份。</p>
+</div></div>
+  </main>
+</body>
+</html>

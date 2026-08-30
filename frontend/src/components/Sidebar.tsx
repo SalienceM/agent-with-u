@@ -1,5 +1,5 @@
 import React, { useEffect, useState, useCallback, memo, useRef, useMemo } from 'react';
-import { api, onExecStatus } from '../api';
+import { api, isTauri, onExecStatus } from '../api';
 import { FileTreePanel } from './FileTreePanel';
 import type { FileFocusRequest } from '../utils/fileFocus';
 
@@ -607,11 +607,19 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
                 <div
                   onClick={() => toggleGroup(group.key)}
                   style={groupHeaderStyle}
-                  title={isPinnedGroup ? '收藏并置顶的会话' : group.isLocal ? '本机执行' : `执行节点：${group.label}`}
+                  title={isPinnedGroup
+                    ? '收藏并置顶的会话'
+                    : group.isLocal
+                      ? (isTauri() ? '本机执行' : '当前 Web 节点执行')
+                      : `执行节点：${group.label}`}
                 >
                   <span style={{ fontSize: 10, width: 12, textAlign: 'center', flexShrink: 0 }}>{isCollapsed ? '▸' : '▾'}</span>
                   <span style={{ fontSize: 11, fontWeight: 600 }}>
-                    {isPinnedGroup ? '★ 收藏' : group.isLocal ? '🏠 本机' : `🌐 ${group.label}`}
+                    {isPinnedGroup
+                      ? '★ 收藏'
+                      : group.isLocal
+                        ? (isTauri() ? '🏠 本机' : '🖥️ 当前 Web 节点')
+                        : `🌐 ${group.label}`}
                   </span>
                   <span style={{ fontSize: 10, color: 'var(--theme-text-muted)', marginLeft: 'auto' }}>{group.sessions.length}</span>
                 </div>

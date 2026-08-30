@@ -5,7 +5,7 @@ import {
   isTauri, getDesktopConfig, setDesktopConfig, type DesktopConfig,
   api, type ConnectedClient,
   getExecutors, addExecRoster, removeExecRoster, onExecStatus, getHomeExecKey,
-  type ExecutorInfo, type RelayUserProfile,
+  type ExecutorInfo, type RelayUserProfile, type RelayNodeStatus,
 } from '../api';
 import {
   listRelayProfiles, saveRelayProfile, deleteRelayProfile,
@@ -21,10 +21,10 @@ interface ConnectionPanelProps {
  *
  * 视觉上分成两张独立卡片，避免「两段中继地址」让人混淆：
  *
- *   ┌─[ 卡片 A · 本机能力 ]──────────  仅 Tauri 桌面端可见
- *   │ 本地执行始终可用；这里只决定是否发布为 Relay 受管节点
- *   │ + 发布到中继的配置（让远程 UI 经中继找到本机）
- *   │ + 「正在连接本机的 UI」实时列表 + 计数
+ *   ┌─[ 卡片 A · 当前物理执行端 ]──────  Tauri / Web 均可见
+ *   │ 桌面 sidecar 或同源 Web Backend 始终可执行；这里只决定是否发布到 Relay
+ *   │ + 发布到中继的配置（让远程 UI 经中继找到这个节点）
+ *   │ + 「正在连接当前节点的 UI」实时列表 + 计数
  *   └─────────────────────────────────
  *
  *   ┌─[ 卡片 B · 本 UI 连接到 ]─────────  所有端可见
@@ -47,7 +47,8 @@ export const ConnectionPanel: React.FC<ConnectionPanelProps> = ({ onClose }) => 
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState('');
 
-  // 桌面端发布模式（仅 Tauri）：两种模式都有本地 sidecar；executor 额外发布 Relay。
+  // 当前物理执行端：Tauri 是本机 sidecar；生产 Web 是提供同源 /ws 的 Backend。
+  // 两者都有自执行能力，executor 角色只决定是否额外发布到 Relay。
   const tauri = isTauri();
   const [role, setRole] = useState<'executor' | 'client'>('executor');
   const [pubUrl, setPubUrl] = useState('');
@@ -55,6 +56,8 @@ export const ConnectionPanel: React.FC<ConnectionPanelProps> = ({ onClose }) => 
   const [pubDeviceName, setPubDeviceName] = useState('');
   const [savedDesktop, setSavedDesktop] = useState<DesktopConfig | null>(null);
   const [restartHint, setRestartHint] = useState(false);
+  const [relayNode, setRelayNode] = useState<RelayNodeStatus | null>(null);
+  const [relayNodeLoading, setRelayNodeLoading] = useState(!tauri);
 
   // 「正在连接本机的 UI」实时列表
   const [clients, setClients] = useState<ConnectedClient[]>([]);
@@ -62,6 +65,9 @@ export const ConnectionPanel: React.FC<ConnectionPanelProps> = ({ onClose }) => 
   // ── 可分配执行节点（session 级模式）：默认 + 本机 + 额外节点，新建会话时可选 ──
   const [executors, setExecutors] = useState<ExecutorInfo[]>(() => getExecutors());
   useEffect(() => onExecStatus(() => setExecutors(getExecutors())), []);
+  const localExecutorConnected = executors.some(
+    (executor) => executor.key === 'local' && executor.connected,
+  );
   // 「加入可分配节点」的就地反馈（成功 / 已是 home / 提示）——避免「点了没反应」。
   const [execMsg, setExecMsg] = useState<{ kind: 'ok' | 'warn'; text: string } | null>(null);
 
@@ -162,10 +168,54 @@ export const ConnectionPanel: React.FC<ConnectionPanelProps> = ({ onClose }) => 
     });
   }, [tauri]);
 
-  // 卡片 A 描述物理本机，所以固定查询 local 连接，不能误读当前默认远端节点。
+  // Web 部署的同源 Backend 也是完整执行节点。它的 Relay 配置保存在服务端，
+  // 主 Token 只返回“是否已配置”，绝不回填到浏览器。连接池可能在面板打开后
+  // 才完成同源 /ws 握手，因此跟随 local 在线状态重试，不能只在 mount 时查一次。
+  useEffect(() => {
+    if (tauri) return;
+    if (!localExecutorConnected) {
+      setRelayNodeLoading(true);
+      return;
+    }
+    let cancelled = false;
+    setRelayNodeLoading(true);
+    api.relayNodeStatus('local').then((status) => {
+      if (cancelled) return;
+      setRelayNode(status);
+      setRole(status.enabled ? 'executor' : 'client');
+      setPubUrl(status.url || '');
+      setPubDeviceName(status.deviceName || '');
+      if (!status.supported) {
+        setErr(status.lastError || '当前 Web Backend 尚不支持在线纳管');
+      }
+    }).catch((error: any) => {
+      if (!cancelled) setErr(error?.message || '无法读取当前 Web 节点状态');
+    }).finally(() => {
+      if (!cancelled) setRelayNodeLoading(false);
+    });
+    return () => { cancelled = true; };
+  }, [tauri, localExecutorConnected]);
+
+  // RelayLink 会在后台自动重连；面板打开期间轻量刷新状态，让“连接中”能自行
+  // 变成“已注册”，也能如实显示后来发生的断线，而不要求用户关闭重开面板。
+  useEffect(() => {
+    if (tauri || !localExecutorConnected || !relayNode?.enabled) return;
+    let cancelled = false;
+    const timer = window.setInterval(() => {
+      api.relayNodeStatus('local').then((status) => {
+        if (!cancelled) setRelayNode(status);
+      }).catch(() => { /* 权限或瞬时断线由现有状态/连接指示承担 */ });
+    }, 2500);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [tauri, localExecutorConnected, relayNode?.enabled]);
+
+  // 卡片 A 描述物理执行端，所以固定查询 local 连接，不能误读当前默认远端节点。
   useEffect(() => {
     let cancelled = false;
-    const localExecKey = tauri ? 'local' : undefined;
+    const localExecKey = 'local';
     api.listConnectedClients(localExecKey).then((list) => {
       if (!cancelled) setClients(list);
     }).catch(() => { /* 后端未连上 / mock 时 list 为空 */ });
@@ -237,7 +287,7 @@ export const ConnectionPanel: React.FC<ConnectionPanelProps> = ({ onClose }) => 
         setBusy(false);
       }
     }
-    // 1. 持久化桌面端发布模式（仅 Tauri）。本地执行始终可用；改动需重启生效。
+    // 1. 配置当前物理执行端是否发布到 Relay。本地/同源执行始终可用。
     let needRestart = false;
     if (tauri) {
       const next: DesktopConfig = {
@@ -255,7 +305,44 @@ export const ConnectionPanel: React.FC<ConnectionPanelProps> = ({ onClose }) => 
         await setDesktopConfig(next);
         setSavedDesktop(next);
       }
+    } else if (relayNodeLoading && localExecutorConnected) {
+      // 已确认存在同源 Backend，只是管理状态尚未返回；此时不能用默认值覆盖配置。
+      setErr('正在读取当前 Web 节点状态，请稍候');
+      return;
+    } else if (relayNode?.supported) {
+      if (role === 'executor' && !pubUrl.trim()) {
+        setErr('请填写当前 Web 节点要注册到的 Relay 地址');
+        return;
+      }
+      if (role === 'executor' && !pubToken.trim() && !relayNode.hasToken) {
+        setErr('首次纳管当前 Web 节点时必须填写 Relay 主 Token');
+        return;
+      }
+      setBusy(true);
+      setErr('');
+      try {
+        const status = await api.relayNodeConfigure({
+          enabled: role === 'executor',
+          url: pubUrl.trim(),
+          token: pubToken.trim() || undefined,
+          deviceName: pubDeviceName.trim(),
+        }, 'local');
+        setRelayNode(status);
+        setPubToken('');
+        if (status.enabled && !status.connected && status.lastError) {
+          setErr(`配置已保存，Relay 正在后台重试：${status.lastError}`);
+          return;
+        }
+      } catch (error: any) {
+        setErr(error?.message || '当前 Web 节点纳管失败');
+        return;
+      } finally {
+        setBusy(false);
+      }
     }
+    // 没有同源 Backend、Backend 版本较旧或当前 Web 用户无物理节点管理权限时，
+    // 只跳过卡片 A；卡片 B 的个人连接目标仍必须可以保存，不能让全局权限阻断
+    // 普通用户继续使用已授权的 Relay 执行节点。
     // 2. 持久化当前 UI 的连接目标。
     if (mode === 'local') {
       await setConnectionTarget({ mode: 'local' });
@@ -290,11 +377,12 @@ export const ConnectionPanel: React.FC<ConnectionPanelProps> = ({ onClose }) => 
     }
     if (needRestart) setRestartHint(true);
     else onClose();
-  }, [tauri, role, pubUrl, pubToken, pubDeviceName, savedDesktop,
+  }, [tauri, role, pubUrl, pubToken, pubDeviceName, savedDesktop, relayNode, relayNodeLoading,
+      localExecutorConnected,
       mode, url, token, deviceId, devices, profiles, activeProfileId, refreshProfiles, onClose]);
 
   // 卡片 A 已配置好「发布中继」、卡片 B 选了 relay 但还没填地址：提示一键复制
-  const canSuggestCopy = tauri && role === 'executor' && mode === 'relay'
+  const canSuggestCopy = role === 'executor' && mode === 'relay'
     && pubUrl.trim() && (!url.trim() || url.trim() !== pubUrl.trim());
 
   return (
@@ -310,14 +398,14 @@ export const ConnectionPanel: React.FC<ConnectionPanelProps> = ({ onClose }) => 
 
         <div style={introStyle}>
           真实执行永远在<b>执行节点</b>上。
-          {tauri && <> 下面两张卡片各管一件事：</>}
-          {!tauri && <> 选择当前 UI 连到哪台执行节点：</>}
-          {tauri && (
-            <ul style={{ margin: '4px 0 0 16px', padding: 0 }}>
-              <li><b>本机能力</b> = 本地始终能执行；可选是否发布给其他客户端</li>
-              <li><b>本 UI 连接到</b> = 当前默认查看哪台节点，不等于物理本机</li>
-            </ul>
-          )}
+          <> 下面两张卡片各管一件事：</>
+          <ul style={{ margin: '4px 0 0 16px', padding: 0 }}>
+            <li>
+              <b>{tauri ? '本机能力' : '当前 Web 节点'}</b>
+              {' = '}Backend 始终能自执行；可选是否发布给其他客户端
+            </li>
+            <li><b>本 UI 连接到</b> = 当前默认查看哪台节点，不等于物理执行端</li>
+          </ul>
         </div>
 
         {/* ════ 可分配执行节点（session 级模式管理）════════════════════
@@ -369,20 +457,38 @@ export const ConnectionPanel: React.FC<ConnectionPanelProps> = ({ onClose }) => 
           </div>
         )}
 
-        {/* ════ 卡片 A：本机能力（仅 Tauri） ════════════════════════ */}
-        {tauri && (
-          <div style={cardStyle}>
+        {/* ════ 卡片 A：当前物理执行端（Tauri sidecar / 同源 Web Backend） ════ */}
+        <div style={cardStyle}>
             <div style={cardTitleStyle}>
               <span style={cardBadgeStyle}>A</span>
-              <span>本机能力</span>
-              <span style={cardSubtitleStyle}>桌面端 · 重启生效</span>
+              <span>{tauri ? '本机能力' : '当前 Web 节点'}</span>
+              <span style={cardSubtitleStyle}>
+                {tauri ? '桌面 sidecar · 重启生效' : '同源 Backend · 立即生效'}
+              </span>
             </div>
+
+            {!tauri && (
+              <div style={{ ...hintStyle, marginBottom: 9 }}>
+                {relayNodeLoading
+                  ? '正在读取当前 Web Backend 状态…'
+                  : relayNode?.supported
+                    ? <>
+                        节点 ID：<code>{relayNode.deviceId || '读取中'}</code>
+                        {' · '}{relayNode.enabled
+                          ? (relayNode.connected ? 'Relay 已注册' : 'Relay 正在后台连接')
+                          : '仅当前 Web 自执行'}
+                        {relayNode.lastError && <><br/>{relayNode.lastError}</>}
+                      </>
+                    : (relayNode?.lastError || '当前 Backend 版本不支持在线纳管')}
+              </div>
+            )}
 
             <div style={{ display: 'flex', gap: 8, marginBottom: 10 }}>
               {(['executor', 'client'] as const).map((r) => (
                 <button
                   key={r}
                   onClick={() => setRole(r)}
+                  disabled={!tauri && (relayNodeLoading || !relayNode?.supported)}
                   style={{
                     ...modeBtnStyle,
                     background: role === r ? 'var(--theme-accent-bg)' : 'transparent',
@@ -390,7 +496,9 @@ export const ConnectionPanel: React.FC<ConnectionPanelProps> = ({ onClose }) => 
                     color: role === r ? 'var(--theme-accent)' : 'var(--theme-text-muted)',
                   }}
                 >
-                  {r === 'executor' ? '🖥️ 纳管执行节点' : '💻 本地工作站'}
+                  {r === 'executor'
+                    ? '🖥️ 纳管执行节点'
+                    : (tauri ? '💻 本地工作站' : '💻 仅当前 Web 使用')}
                 </button>
               ))}
             </div>
@@ -398,51 +506,57 @@ export const ConnectionPanel: React.FC<ConnectionPanelProps> = ({ onClose }) => 
             {role === 'executor' && (
               <>
                 <div style={hintStyle}>
-                  本机始终可以运行 Agent；此模式额外把它注册到 Relay，供获授权用户远程选择。
+                  {tauri ? '本机 sidecar' : '当前 Web Backend'}始终可以运行 Agent；
+                  此模式额外把它注册到 Relay，供获授权用户远程选择。
                   这里使用 Relay 主 Token，不要交给普通用户。
                 </div>
                 <div style={{ display: 'flex', flexDirection: 'column', gap: 8, margin: '8px 0 4px' }}>
                   <input
                     type="text"
                     value={pubUrl}
-                    placeholder="中继地址 ws://relay.example.com:44360（可选）"
+                    placeholder="中继地址 ws://relay.example.com:44360"
                     onChange={(e) => setPubUrl(e.target.value)}
                     style={inputStyle}
                   />
                   <input
                     type="password"
                     value={pubToken}
-                    placeholder="Relay 主 Token（仅执行端注册使用）"
+                    placeholder={!tauri && relayNode?.hasToken
+                      ? 'Relay 主 Token（已保存；留空保持不变）'
+                      : 'Relay 主 Token（仅执行端注册使用）'}
                     onChange={(e) => setPubToken(e.target.value)}
                     style={inputStyle}
                   />
                   <input
                     type="text"
                     value={pubDeviceName}
-                    placeholder="本机显示名（远程设备列表里显示）"
+                    placeholder="节点显示名（远程设备列表里显示）"
                     onChange={(e) => setPubDeviceName(e.target.value)}
                     style={inputStyle}
                   />
                 </div>
 
-                {/* —— 正在连接本机的 UI ——————————————————————————— */}
-                <ConnectedClientsList clients={clients} />
+                {/* —— 正在连接当前物理执行端的 UI ——————————————————— */}
+                <ConnectedClientsList
+                  clients={clients}
+                  nodeLabel={tauri ? '本机' : '当前 Web 节点'}
+                />
               </>
             )}
 
             {role === 'client' && (
               <div style={hintStyle}>
-                本机仍运行 Agent、可创建本地 Session，但不会注册到 Relay，其他机器看不到这台设备。
+                {tauri ? '本机 sidecar' : '当前 Web Backend'}仍运行 Agent、可创建本节点 Session，
+                但不会注册到 Relay，其他机器看不到这台设备。
                 本窗口仍可同时使用下方已登录用户获授权的远端执行节点。
               </div>
             )}
-          </div>
-        )}
+        </div>
 
         {/* ════ 卡片 B：本 UI 连接到 ════════════════════════════════ */}
         <div style={cardStyle}>
           <div style={cardTitleStyle}>
-            {tauri && <span style={cardBadgeStyle}>B</span>}
+            <span style={cardBadgeStyle}>B</span>
             <span>本 UI 连接到</span>
             <span style={cardSubtitleStyle}>这个窗口要看哪台执行节点</span>
           </div>
@@ -460,7 +574,9 @@ export const ConnectionPanel: React.FC<ConnectionPanelProps> = ({ onClose }) => 
                     color: mode === m ? 'var(--theme-accent)' : 'var(--theme-text-muted)',
                   }}
                 >
-                  {m === 'local' ? '🏠 本地直连' : '🌐 远程(经中继)'}
+                  {m === 'local'
+                    ? (tauri ? '🏠 本地直连' : '🖥️ 当前 Web 节点')
+                    : '🌐 远程(经中继)'}
                 </button>
               );
             })}
@@ -468,8 +584,10 @@ export const ConnectionPanel: React.FC<ConnectionPanelProps> = ({ onClose }) => 
 
           {mode === 'local' && (
             <div style={hintStyle}>
-              连本机 / 局域网内的 sidecar，不经中继。延迟最低，流量不出网。
-              {tauri && <><br/>👉 完整桌面端无论是否发布为受管节点，都保留此能力。</>}
+              {tauri
+                ? '连接本机 sidecar，不经中继。延迟最低，流量不出网。'
+                : '连接这套 Web 部署的同源 Backend，不经 Relay；它就是当前 Web 节点。'}
+              <br/>👉 无论卡片 A 是否启用 Relay 纳管，都保留此执行能力。
             </div>
           )}
 
@@ -643,13 +761,16 @@ export const ConnectionPanel: React.FC<ConnectionPanelProps> = ({ onClose }) => 
 };
 
 // ── 子组件：正在连接本机的 UI 列表 ──────────────────────────────────
-const ConnectedClientsList: React.FC<{ clients: ConnectedClient[] }> = ({ clients }) => {
+const ConnectedClientsList: React.FC<{
+  clients: ConnectedClient[];
+  nodeLabel: string;
+}> = ({ clients, nodeLabel }) => {
   const count = clients.length;
   return (
     <div style={connectedBoxStyle}>
       <div style={{ display: 'flex', alignItems: 'center', marginBottom: 6 }}>
         <span style={{ fontSize: 12, fontWeight: 600, color: 'var(--theme-text)' }}>
-          📊 正在连接本机的 UI
+          📊 正在连接{nodeLabel}的 UI
         </span>
         <span style={{
           marginLeft: 6, padding: '1px 8px', borderRadius: 10,

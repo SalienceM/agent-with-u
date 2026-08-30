@@ -35,6 +35,8 @@ awu-web（nginx，宿主 44380 → 容器 80）
 ```
 
 - `awu-web` 是唯一映射宿主端口的容器。
+- 这不是纯控制端部署：`awu-web` 通过同源 `/ws` 连接 `awu-backend`，所以
+  **当前 Web 节点本身就是完整执行节点**，可直接创建和运行 Session。
 - `awu-updater` 不映射端口，Docker Socket 也不会暴露给会运行 Agent 命令的 Backend。
 - Backend 的 `44321`、`44322` 仅在 Docker 内部网络开放，不应直接暴露到公网。
 - Session、Backend 配置、Skills、素材池等数据保存在宿主机 `data` 目录中；Codex/Claude 登录态分别保存在 `codex-config`、`claude-config`，重建容器不会删除。
@@ -249,6 +251,56 @@ sudo docker compose -f deploy/docker-compose.example.yml logs -f --tail=100
 
 按 `Ctrl+C` 只会退出日志查看，不会停止容器。
 
+### 4. 验证当前 Web 节点的自执行与 Relay 纳管
+
+打开 Web 页面的“连接”面板后，会看到两张相互独立的卡片：
+
+- **A：当前 Web 节点**：表示这套 Compose 中的同源 `awu-backend`。它始终能
+  自执行；“纳管执行节点”只决定是否额外把它发布到 Relay。
+- **B：本 UI 连接到**：决定当前窗口默认查看当前 Web 节点，还是 Relay 上的
+  另一台执行节点。切到远端不会移除 A，创建 Session 时仍可逐个选择执行节点。
+
+只使用当前 Web 节点时，卡片 B 选择“本地直连”即可，不需要暴露 Backend 的
+`44321`/`44322` 宿主端口。
+
+如需让其他控制端也能选择这台 Docker 节点：
+
+1. 在卡片 A 选择“纳管执行节点”。
+2. 填写 Relay 的 `ws://`/`wss://` 地址、**Relay 主 Token**和节点显示名。
+3. 点击“保存并连接”。Backend 会立即热连接 Relay，无需重建容器。
+
+若 Relay 已启用多用户且提示 `device is not assigned to a Relay user`，先复制卡片
+A 显示的节点 ID，再到 Relay 主机授权；这里的用户名替换为实际 Relay 用户：
+
+```bash
+python -m src.relay_server user grant 用户名 节点ID
+```
+
+需要指定谁能管理该共享节点时，再执行：
+
+```bash
+python -m src.relay_server user set-default 用户名 节点ID
+```
+
+Relay 主 Token 不会保存在浏览器，也不会由状态接口回显；它只写入持久化目录：
+
+```text
+/volume1/docker/agent-with-u/data/relay-node.json
+```
+
+取消纳管只会停止对外发布，不会关闭同源 Backend，也不会影响当前 Web 自执行。
+只有本机直连用户或 Relay 为该设备指定的主用户可以修改这项全局节点配置。
+
+也可以在 Compose 启动前预置（环境变量在进程重启后优先于页面保存值）：
+
+```bash
+export AGENT_WITH_U_RELAY_URL=wss://relay.example.com/ws
+export AGENT_WITH_U_RELAY_TOKEN=替换为Relay主Token
+export AGENT_WITH_U_DEVICE_NAME=NAS-Web-Executor
+```
+
+未预置时保持为空即可，直接在 Web 连接面板配置。
+
 ## 七、常用维护命令
 
 以下命令均在仓库根目录执行：
@@ -397,6 +449,20 @@ sudo docker compose -f deploy/docker-compose.example.yml logs --tail=100 awu-web
 ```
 
 如果经过 NPM，还需确认已经开启 WebSocket 支持，并且 `/ws` 也通过了 Authelia 鉴权。
+
+### 7. Web 中没有“当前 Web 节点”或无法纳管
+
+先确认已使用包含该能力的 Backend 和 Web 镜像完成一次重建，而不是只更新了前端：
+
+```bash
+sudo docker compose -f deploy/docker-compose.example.yml ps
+sudo docker compose -f deploy/docker-compose.example.yml logs --tail=100 awu-backend
+sudo docker compose -f deploy/docker-compose.example.yml up -d --build --force-recreate
+```
+
+随后在浏览器强制刷新。`awu-web` 必须能通过 Docker 内网访问
+`awu-backend:44321`；无需、也不应把该端口直接暴露到公网。若页面提示没有节点管理
+权限，说明当前是普通共享用户，应改由本机直连用户或该节点的 Relay 主用户配置。
 
 ## 十一、数据与备份边界
 

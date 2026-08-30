@@ -85,9 +85,9 @@ const SECTIONS: ManualSection[] = [
       { icon: '🔀', title: 'Loop 分角色模型', summary: '任务执行、想法、目标、评审和旁路可分别覆盖模型与档位。例如执行用 Terra / medium，评审用 Sol / max；每次结果会记录实际选型。', entry: 'Loop → 策略与心智 → 角色运行配置' },
       { icon: '🛡', title: '权限确认', summary: '控制模型执行写文件和命令时是否逐次确认。跳过确认更流畅，但会按当前进程权限直接执行。', entry: '输入工具栏 ⚡（悬浮查看说明）' },
       { icon: '🧭', title: '代理与网络', summary: '为 Codex/Qwen 等 CLI 配置系统代理或自定义 HTTP 代理，不要求系统全局代理或 TUN。', entry: 'Backend Manager → 环境/代理配置' },
-      { icon: '📡', title: '连接池与执行节点', summary: '同一界面可连接本机或多个远端执行节点；新建会话时选择归属节点，之后任务固定在该节点执行。', entry: '顶栏 📡 → 可分配执行节点' },
-      { icon: '🔗', title: 'Relay 中继', summary: '执行节点主动连接中继，客户端经令牌找到它，无需把执行机直接暴露到公网。支持 Windows/Linux 无 Docker 部署包。', entry: '顶栏 📡 → 本机角色 / 中继连接' },
-      { icon: '🖥', title: '桌面执行与发布', summary: '完整桌面端始终保留本机执行能力；可选择仅本地使用，或注册到 Relay 成为其他客户端可见的受管执行节点。修改后重启生效。', entry: '顶栏 📡 → 本机能力' },
+      { icon: '📡', title: '连接池与执行节点', summary: '同一界面可连接本机、当前 Web Backend 或多个远端执行节点；新建会话时选择归属节点，之后任务固定在该节点执行。', entry: '顶栏 📡 → 可分配执行节点' },
+      { icon: '🔗', title: 'Relay 中继', summary: '执行节点主动连接中继，客户端经令牌找到它，无需把执行机直接暴露到公网。桌面、Linux 和 Docker Web Backend 都可成为执行节点。', entry: '顶栏 📡 → 当前物理执行端 / 中继连接' },
+      { icon: '🖥', title: '当前节点执行与发布', summary: '桌面 sidecar 和同源 Web Backend 始终保留自执行能力；注册到 Relay 只决定其他客户端能否发现。桌面修改后重启生效，Web Backend 在线保存后立即生效。', entry: '顶栏 📡 → 本机能力 / 当前 Web 节点' },
     ],
   },
   {

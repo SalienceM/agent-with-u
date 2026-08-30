@@ -517,26 +517,35 @@ async def main():
         logging.error("[ws_main] Web UI startup failed: %s", e)
         sys.exit(1)
 
-    # ★ 中继链路（C–C/S）：若配置了 --relay-url，本执行节点额外拨出一条
-    #   长连接到公网中继 S，让远程 UI 经 S 访问。本地直连不受影响、照常可用。
-    if args.relay_url:
-        if not args.relay_token:
-            logging.error("[ws_main] --relay-url given but no --relay-token; relay disabled")
-        else:
-            from .backend.relay import RelayLink
-            device_id, device_name = resolve_device_identity(args)
-            relay = RelayLink(
-                bridge, args.relay_url, device_id, device_name, args.relay_token,
-            )
-            logging.info(
-                f"[ws_main] Relay enabled: device={device_id} ({device_name}) "
-                f"-> {args.relay_url}"
-            )
-            asyncio.ensure_future(relay.run())
+    # ★ 当前 Backend 自身就是一个执行节点。桌面端可继续通过启动环境变量纳管；
+    #   Web/Docker 部署还可从连接面板把配置写入 data/relay-node.json 并热重连。
+    #   本地 /ws 连接始终保留，不因注册到 Relay 而失去自执行能力。
+    from .backend.relay import RelayRuntimeManager
+    device_id, device_name = resolve_device_identity(args)
+    relay_manager = RelayRuntimeManager(
+        bridge,
+        device_id=device_id,
+        device_name=device_name,
+        initial_url=args.relay_url or "",
+        initial_token=args.relay_token or "",
+    )
+    bridge.set_relay_runtime_manager(relay_manager)
+    relay_status = await relay_manager.start()
+    if relay_status.get("enabled"):
+        logging.info(
+            "[ws_main] Relay node enabled: device=%s (%s) -> %s; connected=%s",
+            relay_status.get("deviceId"), relay_status.get("deviceName"),
+            relay_status.get("url"), relay_status.get("connected"),
+        )
+        if relay_status.get("lastError"):
+            logging.error("[ws_main] Relay node pending: %s", relay_status["lastError"])
 
     logging.info("[ws_main] Ready.")
-    async with server:
-        await asyncio.Future()  # 永久运行直到进程被终止
+    try:
+        async with server:
+            await asyncio.Future()  # 永久运行直到进程被终止
+    finally:
+        await relay_manager.stop()
 
 
 if __name__ == "__main__":

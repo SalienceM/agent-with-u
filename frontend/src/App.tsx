@@ -2466,7 +2466,9 @@ const NewSessionDialog: React.FC<NewSessionDialogProps> = ({
                       {ex.mode === 'local' ? ex.label : `🌐 ${ex.label}`}
                     </div>
                     <div style={{ fontSize: 11, color: 'var(--theme-text-muted, #656d76)', marginTop: 2 }}>
-                      {`${ex.isHome ? '默认 · ' : ''}${ex.mode === 'local' ? '本机执行' : '远端执行节点'}`}
+                      {`${ex.isHome ? '默认 · ' : ''}${ex.mode === 'local'
+                        ? (isTauri() ? '本机执行' : '当前 Web 节点执行')
+                        : '远端执行节点'}`}
                     </div>
                   </button>
                 );

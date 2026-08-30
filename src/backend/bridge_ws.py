@@ -775,6 +775,9 @@ class BridgeWS:
         # 节点更新状态属于物理执行端，不属于任何 Session/用户。写入单独目录，
         # 由本机用户或 Relay 为该设备指定的主用户统一管理。
         self._update_manager = UpdateManager()
+        # 当前物理 Backend 的 Relay 纳管由 ws_main 注入运行期管理器。保持可空，
+        # 兼容单元测试和嵌入式调用；前端会据 supported 明确降级。
+        self._relay_runtime_manager = None
         # 发布中心是全局维护者工具，不属于 Session。保持惰性初始化：普通用户不打开
         # 发布工作台时，不扫描目录、不探测 qshell，也不产生任何后台轮询。
         self._release_center_manager: Optional[ReleaseCenterManager] = None
@@ -1876,7 +1879,11 @@ class BridgeWS:
 
     def _authorize_rpc(self, method: str, handler, params: list) -> None:
         """Apply one fail-closed Session ownership gate to the RPC surface."""
-        if method.startswith("nodeUpdate") or method.startswith("release"):
+        if (
+            method.startswith("nodeUpdate")
+            or method.startswith("release")
+            or method.startswith("relayNode")
+        ):
             self._require_node_update_capability()
         try:
             bound = inspect.signature(handler).bind_partial(*params)
@@ -1961,11 +1968,42 @@ class BridgeWS:
         if source == "relay" and _REQUEST_CAN_CLAIM_LEGACY.get():
             return
         raise PermissionError(
-            "Only a local client or this executor's Relay default user can manage node updates"
+            "Only a local client or this executor's Relay primary user can manage this node"
         )
 
     def _rpc_nodeUpdateStatus(self) -> str:
         return json.dumps(self._update_manager.status(), ensure_ascii=False)
+
+    def set_relay_runtime_manager(self, manager) -> None:
+        """由进程入口挂载物理节点的 Relay 运行期管理器。"""
+        self._relay_runtime_manager = manager
+
+    def _rpc_relayNodeStatus(self) -> str:
+        manager = self._relay_runtime_manager
+        if manager is None:
+            return json.dumps({
+                "supported": False,
+                "enabled": False,
+                "connected": False,
+                "hasToken": False,
+                "url": "",
+                "deviceId": "",
+                "deviceName": "",
+                "source": "unavailable",
+                "lastError": "当前 Backend 未挂载 Relay 运行期管理器",
+            }, ensure_ascii=False)
+        return json.dumps(manager.status(), ensure_ascii=False)
+
+    async def _rpc_relayNodeConfigure(self, config_json: str) -> str:
+        manager = self._relay_runtime_manager
+        if manager is None:
+            raise RuntimeError("当前 Backend 不支持运行期 Relay 纳管")
+        try:
+            config = json.loads(config_json or "{}")
+        except json.JSONDecodeError as error:
+            raise ValueError(f"invalid Relay node configuration: {error}") from error
+        result = await manager.configure(config)
+        return json.dumps(result, ensure_ascii=False)
 
     def _release_center(self) -> ReleaseCenterManager:
         if self._release_center_manager is None:

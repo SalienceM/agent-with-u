@@ -44,6 +44,11 @@ python scripts/publish_updates.py deploy/update-release.json --qiniu-bucket BUCK
 
 Docker 节点只选择 `target=docker / kind=docker-bundle` 制品，不会把普通 Linux portable 包覆盖进容器。`awu-backend` 校验 manifest、大小和 SHA-256 后，只向共享数据卷写入固定格式的请求；没有 Docker Socket。无网络入口的 `awu-updater` 独占 Docker Socket，再次校验计划和哈希，只允许加载带 AgentWithU component 标签的 `agent-with-u-backend:latest` 与 `agent-with-u-web:latest`，并只重建这两个服务。
 
+标准 Compose 中的 Web 不是纯控制端：同源 `awu-backend` 会作为“当前 Web 节点”
+进入执行节点池。它可直接执行 Session，也可在“连接”面板热注册到 Relay；Relay
+纳管只影响其他控制端能否发现它，不影响同源执行。运行期配置持久化在共享
+`data/relay-node.json`，因此 updater 重建 Backend/Web 后仍会自动恢复注册。
+
 升级前会给旧镜像创建临时回滚标签。新容器需同时满足 Backend 端口和 Web HTTP 健康检查；加载、重建或健康检查失败时，updater 会把旧镜像恢复为 `latest` 并重新拉起。业务数据、Codex/Claude 登录目录都是宿主 bind mount，不随镜像替换。
 
 现有 Docker 节点需要先用新版 `deploy/docker-compose.example.yml` 手工执行一次 `up -d --build --force-recreate`，安装默认 Codex、运行代理与 updater。之后更新中心状态会显示 `runtime=docker` 和升级器心跳，可正常参与单节点/全部节点在线更新。updater 不在线时 UI 禁用该节点的一键更新，并提示先完成这次引导重建。
