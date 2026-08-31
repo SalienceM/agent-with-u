@@ -1631,7 +1631,8 @@ export const Settings: React.FC<SettingsProps> = ({
           <p style={{ fontSize: 11, color: 'var(--theme-text-muted)', marginTop: 6, margin: '6px 0 0 0' }}>
             Includes: Backends config + Repo (Prompts + Skills). Sessions are NOT included.
             <br />
-            ⚠️ Import will overwrite matching entries. Skill credentials stay local.
+            整包导入按名称合并并覆盖匹配项；不会删除包外条目。若只迁移部分 Backend，
+            请使用上方 Manage Backends 内的“导入 / 导出”，可逐项勾选并选择冲突策略。Skill credentials stay local.
           </p>
         </div>}
 

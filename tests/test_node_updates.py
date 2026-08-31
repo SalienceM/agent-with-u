@@ -139,6 +139,67 @@ class NodeUpdateManagerTests(unittest.TestCase):
             update_module._release_sequence({"buildId": "20260828093115-0d2a4dceb95d"}),
         )
 
+    def test_older_remote_manifest_is_reported_as_stale_not_current(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            _, manifest_path = self._fixture(root)
+            manager = UpdateManager(root / "updates")
+            manager.configure({"manifestUrl": str(manifest_path)})
+            with mock.patch.object(update_module, "_current_release", return_value={
+                "version": "100.1.1.120000",
+                "buildId": "21990101120000-newer-local",
+                "sequence": 21990101120000,
+            }):
+                status = asyncio.run(manager.check())
+
+            self.assertEqual("stale", status["phase"])
+            self.assertFalse(status["available"])
+            self.assertEqual("older", status["manifestRelation"])
+            self.assertIn("远端更新清单早于当前节点", status["message"])
+            self.assertNotIn("已是最新", status["message"])
+
+    def test_http_manifest_request_bypasses_cdn_cache(self):
+        payload = b'{"schemaVersion":1}'
+        observed = {}
+
+        class FakeResponse:
+            content = payload
+
+            @staticmethod
+            def raise_for_status():
+                return None
+
+        class FakeClient:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, traceback):
+                return False
+
+            async def get(self, url, headers):
+                observed["url"] = str(url)
+                observed["headers"] = dict(headers)
+                return FakeResponse()
+
+        with tempfile.TemporaryDirectory() as temporary:
+            manager = UpdateManager(Path(temporary) / "updates")
+            manager.configure({"requestHeaders": {
+                "Authorization": "Bearer fixture",
+                "Cache-Control": "max-age=3600",
+            }})
+            with mock.patch("src.backend.update_manager.httpx.AsyncClient", FakeClient):
+                raw = asyncio.run(manager._read_source("https://updates.example.com/stable/manifest.json?channel=stable"))
+
+        self.assertEqual(payload, raw)
+        self.assertIn("channel=stable", observed["url"])
+        self.assertIn("_awu_cache_bust=", observed["url"])
+        self.assertEqual("no-cache, no-store, max-age=0", observed["headers"]["Cache-Control"])
+        self.assertEqual("no-cache", observed["headers"]["Pragma"])
+        self.assertEqual("Bearer fixture", observed["headers"]["Authorization"])
+
     def test_cancel_recovers_interrupted_persisted_download(self):
         with tempfile.TemporaryDirectory() as temporary:
             manager = UpdateManager(Path(temporary) / "updates")
@@ -368,7 +429,9 @@ class NodeUpdateAuthorizationTests(unittest.TestCase):
         capability = _REQUEST_CAN_CLAIM_LEGACY.set(False)
         try:
             for method in (
-                "saveBackend", "deleteBackend", "saveMcpServers",
+                "saveBackend", "deleteBackend", "exportBackends",
+                "previewBackendImport", "importBackends", "exportData", "importData",
+                "saveMcpServers",
                 "openLoginTerminal", "openModelTerminal",
             ):
                 with self.subTest(method=method), self.assertRaises(PermissionError):

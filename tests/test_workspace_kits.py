@@ -13,6 +13,7 @@ from src.backend.workspace_kit_store import (
     WorkspaceKit,
     WorkspaceKitState,
     WorkspaceKitStore,
+    KitGenerationJob,
     KitArtifact,
     KitRun,
     KitStepRun,
@@ -243,7 +244,153 @@ class _FakeKitCompilerBackend:
         return None
 
 
+class _SlowKitCompilerBackend(_FakeKitCompilerBackend):
+    def __init__(self, response: dict):
+        super().__init__(response)
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+        self.aborted = False
+
+    async def send_message(self, **kwargs):
+        self.prompt = kwargs["content"]
+        self.started.set()
+        await self.release.wait()
+        kwargs["on_delta"](StreamDelta(
+            kwargs["session_id"], kwargs["message_id"], "text_delta",
+            text=json.dumps(self.response, ensure_ascii=False),
+        ))
+        return {}
+
+    def abort(self, _session_id=None):
+        self.aborted = True
+        self.release.set()
+
+
 class WorkspaceKitGenerationTests(unittest.IsolatedAsyncioTestCase):
+    @staticmethod
+    def _generation_response() -> dict:
+        return {
+            "ready": True,
+            "implementationSummary": "输出可验收结果",
+            "safetySummary": "只读当前工作区",
+            "verificationSummary": "退出码为零",
+            "warnings": [],
+            "questions": [],
+            "kit": {
+                "title": "后台生成测试",
+                "description": "验证后台 Kit 编译",
+                "shell": "powershell",
+                "cwd": ".",
+                "timeoutSeconds": 30,
+                "command": "Write-Output 'ok'; exit 0",
+                "assertions": [{"type": "exit_code", "expected": 0}],
+            },
+        }
+
+    async def test_background_generation_returns_immediately_and_survives_requery(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(
+            os.environ, {"AGENT_WITH_U_DATA_ROOT": str(Path(tmp) / "data")},
+        ):
+            workspace = Path(tmp) / "workspace"
+            workspace.mkdir()
+            bridge = BridgeWS()
+            session_id = "background-kit-generation"
+            bridge._active_sessions[session_id] = Session(
+                id=session_id, title="Background generation", created_at=time.time(), updated_at=time.time(),
+                messages=[], working_dir=str(workspace), backend_id="fake",
+            )
+            fake = _SlowKitCompilerBackend(self._generation_response())
+            with patch.object(bridge, "_new_backend_instance", return_value=fake):
+                started_at = asyncio.get_running_loop().time()
+                started = json.loads(bridge._rpc_kitGenerateStart(session_id, json.dumps({
+                    "objective": "在后台生成一个 Kit",
+                    "successCriteria": "返回可执行并可验收的实现",
+                    "safetyConstraints": "不得修改工作区",
+                }, ensure_ascii=False)))
+                elapsed = asyncio.get_running_loop().time() - started_at
+                self.assertLess(elapsed, 0.1)
+                self.assertEqual(started["status"], "ok")
+                self.assertEqual(started["job"]["status"], "queued")
+
+                job_id = started["job"]["id"]
+                task = bridge._kit_generation_tasks[job_id]
+                await asyncio.wait_for(fake.started.wait(), timeout=1)
+                running = json.loads(bridge._rpc_kitGenerationGet(session_id))
+                self.assertEqual(running["job"]["id"], job_id)
+                self.assertEqual(running["job"]["status"], "running")
+                self.assertIn("后台", running["job"]["request"]["objective"])
+
+                duplicate = json.loads(bridge._rpc_kitGenerateStart(session_id, json.dumps({
+                    "objective": "不要重复提交",
+                }, ensure_ascii=False)))
+                self.assertTrue(duplicate["reused"])
+                self.assertEqual(duplicate["job"]["id"], job_id)
+
+                fake.release.set()
+                await asyncio.wait_for(task, timeout=2)
+
+            completed = json.loads(bridge._rpc_kitGenerationGet(session_id))
+            self.assertEqual(completed["job"]["status"], "succeeded")
+            self.assertEqual(completed["job"]["result"]["status"], "ok")
+            persisted = WorkspaceKitStore().load(session_id)
+            self.assertIsNotNone(persisted)
+            assert persisted is not None
+            self.assertEqual(persisted.generation_jobs[-1].status, "succeeded")
+            self.assertIsNotNone(persisted.generation_jobs[-1].result)
+
+    async def test_background_generation_can_be_cancelled(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(
+            os.environ, {"AGENT_WITH_U_DATA_ROOT": str(Path(tmp) / "data")},
+        ):
+            workspace = Path(tmp) / "workspace"
+            workspace.mkdir()
+            bridge = BridgeWS()
+            session_id = "cancel-kit-generation"
+            bridge._active_sessions[session_id] = Session(
+                id=session_id, title="Cancel generation", created_at=time.time(), updated_at=time.time(),
+                messages=[], working_dir=str(workspace), backend_id="fake",
+            )
+            fake = _SlowKitCompilerBackend(self._generation_response())
+            with patch.object(bridge, "_new_backend_instance", return_value=fake):
+                started = json.loads(bridge._rpc_kitGenerateStart(session_id, json.dumps({
+                    "objective": "生成后等待取消",
+                    "successCriteria": "可以停止",
+                }, ensure_ascii=False)))
+                job_id = started["job"]["id"]
+                task = bridge._kit_generation_tasks[job_id]
+                await asyncio.wait_for(fake.started.wait(), timeout=1)
+                cancelled = json.loads(bridge._rpc_kitGenerateCancel(session_id, job_id))
+                self.assertEqual(cancelled["job"]["status"], "cancelled")
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
+            restored = json.loads(bridge._rpc_kitGenerationGet(session_id, job_id))
+            self.assertEqual(restored["job"]["status"], "cancelled")
+            self.assertTrue(fake.aborted)
+
+    async def test_backend_restart_marks_orphaned_generation_as_interrupted(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(
+            os.environ, {"AGENT_WITH_U_DATA_ROOT": str(Path(tmp) / "data")},
+        ):
+            session_id = "interrupted-kit-generation"
+            store = WorkspaceKitStore()
+            state = WorkspaceKitState(session_id=session_id, generation_jobs=[
+                KitGenerationJob(
+                    id="orphan-job", session_id=session_id, status="running",
+                    request={"objective": "不会自动续跑"}, message="运行中",
+                    started_at=time.time(),
+                ),
+            ])
+            store.save(state)
+            bridge = BridgeWS()
+            bridge._active_sessions[session_id] = Session(
+                id=session_id, title="Interrupted generation", created_at=time.time(), updated_at=time.time(),
+                messages=[], working_dir=tmp, backend_id="fake",
+            )
+
+            restored = json.loads(bridge._rpc_kitGenerationGet(session_id))
+            self.assertEqual(restored["job"]["status"], "error")
+            self.assertIn("重启", restored["job"]["message"])
+
     async def test_ai_compiler_returns_preview_without_saving_or_running(self):
         with tempfile.TemporaryDirectory() as tmp, patch.dict(
             os.environ, {"AGENT_WITH_U_DATA_ROOT": str(Path(tmp) / "data")},

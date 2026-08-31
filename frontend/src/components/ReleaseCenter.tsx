@@ -2,7 +2,7 @@ import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   api, getExecutors, onExecStatus,
   type ExecutorInfo, type ReleaseArtifact, type ReleaseCandidate,
-  type ReleaseCenterConfig, type ReleaseCenterState, type ReleasePlan,
+  type ReleaseCenterConfig, type ReleaseCenterState, type ReleaseJob, type ReleasePlan,
 } from '../api';
 
 interface Props {
@@ -74,6 +74,16 @@ function formatDelta(value: number | null): string {
   if (value === null) return '新制品';
   if (!value) return '大小未变';
   return `${value > 0 ? '+' : '−'}${formatBytes(Math.abs(value))}`;
+}
+
+function transferLabel(job: ReleaseJob): string {
+  if (job.status === 'running' && (job.currentFileSize || 0) > 0) {
+    return `${job.currentFileName || '当前文件'} · ${formatBytes(job.currentFileBytes || 0)} / ${formatBytes(job.currentFileSize || 0)}`;
+  }
+  if ((job.totalBytes || 0) > 0) {
+    return `总计 ${formatBytes(job.uploadedBytes || 0)} / ${formatBytes(job.totalBytes || 0)}`;
+  }
+  return '';
 }
 
 function statusMeta(status: ReleaseCandidate['status']): { label: string; color: string } {
@@ -165,6 +175,13 @@ export const ReleaseCenter: React.FC<Props> = ({ onClose }) => {
   }, [execKey]);
 
   const activeJob = state?.activeJob || null;
+  const activeTransfer = activeJob ? transferLabel(activeJob) : '';
+  const activeIndeterminate = !!activeJob
+    && activeJob.status === 'running'
+    && (
+      ((activeJob.currentFileSize || 0) > 0 && (activeJob.currentFileBytes || 0) === 0)
+      || ((activeJob.currentFileSize || 0) === 0 && (activeJob.progress || 0) === 0)
+    );
   useEffect(() => {
     if (!activeJob || !['queued', 'running'].includes(activeJob.status)) return;
     const timer = window.setInterval(() => void refresh(false), 1000);
@@ -371,6 +388,12 @@ export const ReleaseCenter: React.FC<Props> = ({ onClose }) => {
 
   return (
     <div style={overlayStyle} role="dialog" aria-modal="true" aria-label="发布工作台">
+      <style>{`
+        @keyframes awu-release-indeterminate {
+          from { transform: translateX(-120%); }
+          to { transform: translateX(340%); }
+        }
+      `}</style>
       <div style={panelStyle}>
         <header style={headerStyle}>
           <div style={{ minWidth: 0 }}>
@@ -418,8 +441,13 @@ export const ReleaseCenter: React.FC<Props> = ({ onClose }) => {
                 <span style={{ color: 'var(--theme-text-muted)' }}>{activeJob.progress || 0}%</span>
               </div>
               <div style={progressTrackStyle}>
-                <div style={{ ...progressFillStyle, width: `${Math.max(2, activeJob.progress || 0)}%` }} />
+                <div style={{
+                  ...progressFillStyle,
+                  width: activeIndeterminate ? '28%' : `${Math.max(2, activeJob.progress || 0)}%`,
+                  animation: activeIndeterminate ? 'awu-release-indeterminate 1.1s ease-in-out infinite' : undefined,
+                }} />
               </div>
+              {activeTransfer && <div style={{ marginTop: 4, color: 'var(--theme-text-muted)', fontSize: 9.5 }}>{activeTransfer}</div>}
             </div>
             <button type="button" style={dangerButtonStyle} onClick={() => void cancelJob()}>取消发布</button>
           </div>
@@ -768,6 +796,7 @@ export const ReleaseCenter: React.FC<Props> = ({ onClose }) => {
                       </summary>
                       <div style={{ marginTop: 8, color: 'var(--theme-text-muted)', fontSize: 10, lineHeight: 1.55 }}>
                         {job.message}{job.error ? `：${job.error}` : ''}
+                        {transferLabel(job) ? <><br />{transferLabel(job)}</> : null}
                       </div>
                       {!!job.log?.length && <pre style={{ ...manifestStyle, maxHeight: 180 }}>{job.log.join('\n')}</pre>}
                     </details>

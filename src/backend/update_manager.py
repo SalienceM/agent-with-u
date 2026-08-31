@@ -16,7 +16,7 @@ import time
 import uuid
 from pathlib import Path
 from typing import Any, Optional
-from urllib.parse import unquote, urljoin, urlparse
+from urllib.parse import parse_qsl, unquote, urlencode, urljoin, urlparse, urlsplit, urlunsplit
 
 import httpx
 
@@ -25,7 +25,7 @@ from . import paths
 
 MAX_ARTIFACT_BYTES = 8 * 1024 * 1024 * 1024
 STATE_PHASES = {
-    "idle", "checking", "current", "available", "downloading", "staged",
+    "idle", "checking", "current", "stale", "available", "downloading", "staged",
     "installing", "installed", "cancelled", "error",
 }
 
@@ -146,12 +146,29 @@ def _release_sequence(release: dict[str, Any]) -> int:
     return int(first_number.group(0)[:20]) if first_number else 0
 
 
-def _is_newer(release: dict[str, Any], current: dict[str, Any]) -> bool:
+def _compare_releases(release: dict[str, Any], current: dict[str, Any]) -> int:
+    """Return 1 for newer, 0 for equal and -1 for an older remote manifest."""
     remote_sequence = _release_sequence(release)
     current_sequence = _release_sequence(current)
     if remote_sequence and current_sequence:
-        return remote_sequence > current_sequence
-    return _version_tuple(release.get("version")) > _version_tuple(current.get("version"))
+        return (remote_sequence > current_sequence) - (remote_sequence < current_sequence)
+    remote_version = _version_tuple(release.get("version"))
+    current_version = _version_tuple(current.get("version"))
+    return (remote_version > current_version) - (remote_version < current_version)
+
+
+def _is_newer(release: dict[str, Any], current: dict[str, Any]) -> bool:
+    return _compare_releases(release, current) > 0
+
+
+def _cache_busted_url(source: str) -> str:
+    parts = urlsplit(source)
+    if parts.scheme not in {"http", "https"}:
+        return source
+    query = [(key, value) for key, value in parse_qsl(parts.query, keep_blank_values=True)
+             if key != "_awu_cache_bust"]
+    query.append(("_awu_cache_bust", f"{int(time.time() * 1000)}-{uuid.uuid4().hex[:8]}"))
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment))
 
 
 def _safe_name(value: object, fallback: str = "artifact.bin") -> str:
@@ -291,8 +308,16 @@ class UpdateManager:
         parsed = urlparse(source)
         if parsed.scheme in {"https", "http"}:
             cfg = self._config()
+            headers = {
+                str(key): str(value) for key, value in cfg["requestHeaders"].items()
+                if str(key).lower() not in {"cache-control", "pragma"}
+            }
+            headers.update({
+                "Cache-Control": "no-cache, no-store, max-age=0",
+                "Pragma": "no-cache",
+            })
             async with httpx.AsyncClient(follow_redirects=True, timeout=httpx.Timeout(30, read=60)) as client:
-                response = await client.get(source, headers=cfg["requestHeaders"])
+                response = await client.get(_cache_busted_url(source), headers=headers)
                 response.raise_for_status()
                 if len(response.content) > limit:
                     raise UpdateError("update manifest is too large")
@@ -436,11 +461,25 @@ class UpdateManager:
                 "manifestUrl": source, "release": release, "artifact": artifact,
                 "signed": bool(document.get("signature")),
             }
-            available = _is_newer(release, _current_release())
+            relation = _compare_releases(release, _current_release())
+            available = relation > 0
+            if relation > 0:
+                phase = "available"
+                message = "发现可用更新"
+                manifest_relation = "newer"
+            elif relation < 0:
+                phase = "stale"
+                message = "远端更新清单早于当前节点；可能是 CDN 缓存未刷新或发布清单未切换"
+                manifest_relation = "older"
+            else:
+                phase = "current"
+                message = "当前已是最新版本"
+                manifest_relation = "same"
             return self._save_state({
-                "phase": "available" if available else "current",
+                "phase": phase,
                 "available": available,
-                "message": "发现可用更新" if available else "当前已是最新版本",
+                "message": message,
+                "manifestRelation": manifest_relation,
                 "error": "",
                 "manifestUrl": source,
                 "release": release,

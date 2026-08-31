@@ -47,6 +47,7 @@ function phaseLabel(status?: NodeUpdateStatus): string {
   switch (status?.phase) {
     case 'checking': return '检查中';
     case 'current': return '已是最新';
+    case 'stale': return '远端清单过期';
     case 'available': return '可更新';
     case 'downloading': return '下载中';
     case 'staged': return '已校验，待安装';
@@ -63,6 +64,7 @@ function phaseColor(status?: NodeUpdateStatus): string {
     case 'current': case 'installed': return '#3fb950';
     case 'available': case 'staged': return '#58a6ff';
     case 'checking': case 'downloading': case 'installing': return '#d29922';
+    case 'stale': return '#f0883e';
     case 'error': return '#f85149';
     default: return 'var(--theme-text-muted)';
   }
@@ -250,7 +252,7 @@ export const UpdateCenter: React.FC = () => {
     try {
       const started = await api.nodeUpdateStage(node.key, manifestUrl);
       updateStatus(node.key, started);
-      if (started.phase === 'current') return started;
+      if (started.phase === 'current' || started.phase === 'stale') return started;
       if (started.phase === 'error') throw new Error(started.error || '无法开始下载');
       return await waitForStage(node);
     } finally {
@@ -275,7 +277,9 @@ export const UpdateCenter: React.FC = () => {
     try {
       const checked = await checkNode(node);
       if (!checked.available) {
-        setNotice(`${node.label} 已是最新版本。`);
+        setNotice(checked.phase === 'stale'
+          ? `${node.label} 的远端清单比本机版本更旧；请先刷新 CDN 或重新切换发布清单。`
+          : `${node.label} 已是最新版本。`);
         return;
       }
       const target = checked.release?.version || '新版本';
@@ -310,10 +314,20 @@ export const UpdateCenter: React.FC = () => {
           ? [item.value.node]
           : []
       ));
+      const staleNodes = checks.flatMap((item) => (
+        item.status === 'fulfilled' && item.value.status.phase === 'stale'
+          ? [item.value.node]
+          : []
+      ));
       const checkFailures = checks.filter((item) => item.status === 'rejected').length;
       if (!available.length) {
         if (dockerWithoutUpdater.length) {
           throw new Error(`${dockerWithoutUpdater.length} 个 Docker 节点尚未启动升级器；请先用新版 Compose 手动重建一次`);
+        }
+        if (staleNodes.length) {
+          throw new Error(
+            `${staleNodes.length} 个节点发现远端清单比本机更旧；这通常表示 CDN 缓存未刷新或 stable manifest 没有切换成功`,
+          );
         }
         if (checkFailures) throw new Error(`${checkFailures} 个节点检查失败，其余节点已是最新版本`);
         setNotice('所有在线节点都已是最新版本。');

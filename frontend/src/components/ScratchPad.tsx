@@ -6,13 +6,72 @@
  *   window   - 独立弹出窗口（?scratchpad=1）
  *
  * 功能：
+ *   - 标题、搜索、置顶、颜色、归档与克隆
+ *   - 可勾选待办清单与完成进度
  *   - 文本 + 图片（Ctrl+V）交替内联块
  *   - 图片出现在光标位置
  *   - 复制全部（text/html + 内联图片 base64）
  *   - 跨窗口 localStorage 同步
  *   - 弹出为独立窗口
  */
-import React, { useState, useEffect, useLayoutEffect, useRef, useCallback } from 'react';
+import React, {
+  useState, useEffect, useLayoutEffect, useRef, useCallback, useMemo,
+} from 'react';
+import {
+  filterScratchEntries,
+  normalizeScratchEntries,
+  scratchEntryPreview,
+  scratchTodoStats,
+  sortScratchEntries,
+  type ScratchBlock,
+  type ScratchColor,
+  type ScratchEntry,
+  type ScratchTodo,
+} from '../utils/scratchPad';
+
+interface NotePalette {
+  label: string;
+  shell: string;
+  side: string;
+  editor: string;
+  header: string;
+  accent: string;
+  active: string;
+  border: string;
+}
+
+const NOTE_PALETTES: Record<ScratchColor, NotePalette> = {
+  yellow: {
+    label: '经典黄', shell: '#fff9c4', side: '#fef3c7', editor: '#fffde7',
+    header: '#fbbf24', accent: '#d97706', active: 'rgba(215,119,6,0.18)',
+    border: 'rgba(180,120,20,0.25)',
+  },
+  rose: {
+    label: '珊瑚粉', shell: '#fff1f2', side: '#ffe4e6', editor: '#fff7f7',
+    header: '#fda4af', accent: '#e11d48', active: 'rgba(225,29,72,0.13)',
+    border: 'rgba(190,24,93,0.2)',
+  },
+  mint: {
+    label: '薄荷绿', shell: '#ecfdf5', side: '#d1fae5', editor: '#f3fff9',
+    header: '#86efac', accent: '#15803d', active: 'rgba(21,128,61,0.13)',
+    border: 'rgba(22,101,52,0.2)',
+  },
+  sky: {
+    label: '晴空蓝', shell: '#f0f9ff', side: '#e0f2fe', editor: '#f7fcff',
+    header: '#7dd3fc', accent: '#0369a1', active: 'rgba(3,105,161,0.13)',
+    border: 'rgba(3,105,161,0.2)',
+  },
+  lavender: {
+    label: '薰衣紫', shell: '#faf5ff', side: '#f3e8ff', editor: '#fdfaff',
+    header: '#c4b5fd', accent: '#7e22ce', active: 'rgba(126,34,206,0.12)',
+    border: 'rgba(126,34,206,0.2)',
+  },
+  slate: {
+    label: '雾灰', shell: '#f8fafc', side: '#e2e8f0', editor: '#ffffff',
+    header: '#cbd5e1', accent: '#475569', active: 'rgba(71,85,105,0.13)',
+    border: 'rgba(71,85,105,0.22)',
+  },
+};
 
 // ── 注入编辑器全局样式（一次即可）──────────────────────────────────────
 if (typeof document !== 'undefined' && !document.getElementById('scratch-editor-style')) {
@@ -25,28 +84,19 @@ if (typeof document !== 'undefined' && !document.getElementById('scratch-editor-
   document.head.appendChild(s);
 }
 
-// ── 数据类型 ──────────────────────────────────────────────────────────
-type Block =
-  | { type: 'text';  id: string; content: string }
-  | { type: 'image'; id: string; src: string };
-
-export interface ScratchEntry {
-  id: string;
-  createdAt: number;
-  updatedAt: number;
-  blocks: Block[];
-}
-
 const STORAGE_KEY = 'agent-with-u:scratchpad';
 let _bc = 0;
 const bid = () => `b${Date.now()}-${++_bc}`;
 const eid = () => `e${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
 const emptyEntry = (): ScratchEntry => ({
   id: eid(), createdAt: Date.now(), updatedAt: Date.now(),
+  title: '', color: 'yellow', pinned: false, archived: false, todos: [],
   blocks: [{ type: 'text', id: bid(), content: '' }],
 });
 const load = (): ScratchEntry[] => {
-  try { return JSON.parse(localStorage.getItem(STORAGE_KEY) || '[]'); } catch { return []; }
+  try {
+    return normalizeScratchEntries(JSON.parse(localStorage.getItem(STORAGE_KEY) || '[]'));
+  } catch { return []; }
 };
 const persist = (entries: ScratchEntry[]) => {
   // Strip image data (stored in IndexedDB) to keep localStorage small
@@ -105,7 +155,7 @@ async function idbDelete(id: string): Promise<void> {
 async function hydrateImages(entries: ScratchEntry[]): Promise<ScratchEntry[]> {
   const result: ScratchEntry[] = [];
   for (const e of entries) {
-    const blocks: Block[] = [];
+    const blocks: ScratchBlock[] = [];
     for (const b of e.blocks) {
       if (b.type === 'image') {
         if (b.src) {
@@ -120,7 +170,7 @@ async function hydrateImages(entries: ScratchEntry[]): Promise<ScratchEntry[]> {
         blocks.push(b);
       }
     }
-    const merged: Block[] = [];
+    const merged: ScratchBlock[] = [];
     for (const b of blocks) {
       const last = merged[merged.length - 1];
       if (last?.type === 'text' && b.type === 'text') {
@@ -150,14 +200,19 @@ const fmtFull = (ts: number) =>
     year: 'numeric', month: '2-digit', day: '2-digit',
     hour: '2-digit', minute: '2-digit',
   });
-const groupByDate = (entries: ScratchEntry[]) => {
+const groupEntries = (entries: ScratchEntry[]) => {
+  const sorted = sortScratchEntries(entries);
   const map = new Map<string, ScratchEntry[]>();
-  for (const e of [...entries].sort((a, b) => b.updatedAt - a.updatedAt)) {
+  const pinned = sorted.filter((entry) => entry.pinned);
+  for (const e of sorted.filter((entry) => !entry.pinned)) {
     const k = fmtDate(e.updatedAt);
     if (!map.has(k)) map.set(k, []);
     map.get(k)!.push(e);
   }
-  return Array.from(map.entries()).map(([label, items]) => ({ label, items }));
+  return [
+    ...(pinned.length ? [{ label: '置顶', items: pinned }] : []),
+    ...Array.from(map.entries()).map(([label, items]) => ({ label, items })),
+  ];
 };
 
 // ── 编辑器常量 ────────────────────────────────────────────────────────
@@ -179,13 +234,14 @@ interface LineNumTAProps {
   value: string;
   startLine: number;
   wrapLines: boolean;
+  palette: NotePalette;
   placeholder?: string;
   taRef: (el: HTMLTextAreaElement | null) => void;
   onChange: (v: string, el: HTMLTextAreaElement) => void;
   onPaste: (e: React.ClipboardEvent<HTMLTextAreaElement>) => void;
 }
 const LineNumTextarea: React.FC<LineNumTAProps> = ({
-  value, startLine, wrapLines, placeholder, taRef, onChange, onPaste,
+  value, startLine, wrapLines, palette, placeholder, taRef, onChange, onPaste,
 }) => {
   const lines = value.split('\n');
   const selfRef  = useRef<HTMLTextAreaElement>(null);
@@ -218,8 +274,8 @@ const LineNumTextarea: React.FC<LineNumTAProps> = ({
         lineHeight: `${EDITOR_LINE_H}px`,
         fontSize: EDITOR_FONT_SZ - 1,
         fontFamily: EDITOR_FONT,
-        color: '#a08050',
-        background: '#fef9e7',
+        color: palette.accent,
+        background: palette.editor,
         zIndex: 1,
         userSelect: 'none', pointerEvents: 'none',
       }}>
@@ -231,7 +287,7 @@ const LineNumTextarea: React.FC<LineNumTAProps> = ({
       <div style={{
         width: 1, flexShrink: 0,
         position: 'sticky', left: GUTTER_W,
-        background: 'rgba(180,120,20,0.2)', marginRight: 10,
+        background: palette.border, marginRight: 10,
         zIndex: 1,
       }} />
       {/* 文本区：overflow 永远 hidden，宽度由镜像决定（不换行）或 flex:1（换行） */}
@@ -252,7 +308,7 @@ const LineNumTextarea: React.FC<LineNumTAProps> = ({
           fontFamily: EDITOR_FONT, padding: 0,
           minHeight: EDITOR_LINE_H, overflow: 'hidden',
           whiteSpace: wrapLines ? 'pre-wrap' : 'pre',
-          boxSizing: 'border-box', caretColor: '#d97706',
+          boxSizing: 'border-box', caretColor: palette.accent,
         }}
       />
       {/* 隐藏镜像：用于测量最长行的像素宽度 */}
@@ -279,6 +335,24 @@ function copyEntryAsHtml(entry: ScratchEntry): boolean {
     position: 'fixed', left: '-9999px', top: '0',
     whiteSpace: 'pre-wrap', userSelect: 'all', opacity: '0',
   });
+
+  if (entry.title.trim()) {
+    const title = document.createElement('h3');
+    title.textContent = entry.title.trim();
+    container.appendChild(title);
+  }
+
+  if (entry.todos.length > 0) {
+    const list = document.createElement('ul');
+    Object.assign(list.style, { listStyle: 'none', paddingLeft: '0' });
+    for (const todo of entry.todos) {
+      const item = document.createElement('li');
+      item.textContent = `${todo.done ? '☑' : '☐'} ${todo.text || '未命名待办'}`;
+      if (todo.done) item.style.textDecoration = 'line-through';
+      list.appendChild(item);
+    }
+    container.appendChild(list);
+  }
 
   for (const b of entry.blocks) {
     if (b.type === 'text') {
@@ -370,11 +444,25 @@ const ScratchPadEditor: React.FC<EditorProps> = ({ mode, onClose }) => {
   const [copyOk, setCopyOk] = useState(false);
   const [wrapLines, setWrapLines] = useState(false); // 默认不换行，与 Monaco 一致
   const [deleteConfirmId, setDeleteConfirmId] = useState<string | null>(null);
+  const [searchQuery, setSearchQuery] = useState('');
+  const [archiveView, setArchiveView] = useState(false);
+  const [hideCompleted, setHideCompleted] = useState(false);
+  const [showColors, setShowColors] = useState(false);
   const taRefs = useRef<Map<string, HTMLTextAreaElement>>(new Map());
+  const todoRefs = useRef<Map<string, HTMLInputElement>>(new Map());
   const focusTarget = useRef<{ blockId: string; pos: number } | null>(null);
+  const todoFocusTarget = useRef<string | null>(null);
   const copyTimer = useRef<ReturnType<typeof setTimeout>>();
+  const colorPickerRef = useRef<HTMLDivElement>(null);
 
   const active = entries.find(e => e.id === activeId) ?? null;
+  const palette = NOTE_PALETTES[active?.color || 'yellow'];
+  const visibleEntries = useMemo(
+    () => filterScratchEntries(entries, searchQuery, archiveView),
+    [entries, searchQuery, archiveView],
+  );
+  const groups = useMemo(() => groupEntries(visibleEntries), [visibleEntries]);
+  const archiveCount = entries.reduce((count, entry) => count + (entry.archived ? 1 : 0), 0);
 
   // 持久化
   useEffect(() => { persist(entries); }, [entries]);
@@ -396,7 +484,10 @@ const ScratchPadEditor: React.FC<EditorProps> = ({ mode, onClose }) => {
     const fresh = load();
     if (fresh.length > 0) {
       setEntries(fresh);
-      setActiveId([...fresh].sort((a, b) => b.updatedAt - a.updatedAt)[0].id);
+      const initial = sortScratchEntries(fresh.filter((entry) => !entry.archived))[0]
+        || sortScratchEntries(fresh)[0];
+      setArchiveView(Boolean(initial?.archived));
+      setActiveId(initial?.id || null);
       hydrateImages(fresh).then(hydrated => setEntries(hydrated));
     } else {
       const e = emptyEntry();
@@ -404,6 +495,12 @@ const ScratchPadEditor: React.FC<EditorProps> = ({ mode, onClose }) => {
       setActiveId(e.id);
     }
   }, []); // eslint-disable-line
+
+  // 搜索或归档视图变化后，确保当前记录始终属于可见集合。
+  useEffect(() => {
+    if (activeId && visibleEntries.some((entry) => entry.id === activeId)) return;
+    setActiveId(sortScratchEntries(visibleEntries)[0]?.id ?? null);
+  }, [activeId, visibleEntries]);
 
   // focus 指定文本块
   useEffect(() => {
@@ -417,9 +514,31 @@ const ScratchPadEditor: React.FC<EditorProps> = ({ mode, onClose }) => {
     autoResize(ta);
   });
 
+  useEffect(() => {
+    const target = todoFocusTarget.current;
+    if (!target) return;
+    todoFocusTarget.current = null;
+    const input = todoRefs.current.get(target);
+    input?.focus();
+    input?.setSelectionRange(input.value.length, input.value.length);
+  });
+
+  useEffect(() => {
+    if (!showColors) return;
+    const handler = (event: MouseEvent) => {
+      if (colorPickerRef.current && !colorPickerRef.current.contains(event.target as Node)) {
+        setShowColors(false);
+      }
+    };
+    document.addEventListener('mousedown', handler);
+    return () => document.removeEventListener('mousedown', handler);
+  }, [showColors]);
+
   const handleNew = useCallback(() => {
     const e = emptyEntry();
     setEntries(prev => [e, ...prev]);
+    setArchiveView(false);
+    setSearchQuery('');
     setActiveId(e.id);
   }, []);
 
@@ -431,13 +550,95 @@ const ScratchPadEditor: React.FC<EditorProps> = ({ mode, onClose }) => {
           if (b.type === 'image') idbDelete(b.id).catch(() => {});
         }
       }
-      const next = prev.filter(e => e.id !== id);
-      if (id === activeId) {
-        setActiveId([...next].sort((a, b) => b.updatedAt - a.updatedAt)[0]?.id ?? null);
-      }
-      return next;
+      return prev.filter(e => e.id !== id);
     });
-  }, [activeId]);
+  }, []);
+
+  const patchEntry = useCallback((id: string, patch: Partial<ScratchEntry>) => {
+    setEntries((previous) => previous.map((entry) => (
+      entry.id === id ? { ...entry, ...patch, updatedAt: Date.now() } : entry
+    )));
+  }, []);
+
+  const addTodo = useCallback((entryId: string, afterTodoId?: string) => {
+    const todo: ScratchTodo = { id: bid(), text: '', done: false, createdAt: Date.now() };
+    todoFocusTarget.current = todo.id;
+    setEntries((previous) => previous.map((entry) => {
+      if (entry.id !== entryId) return entry;
+      const insertAt = afterTodoId
+        ? Math.max(0, entry.todos.findIndex((item) => item.id === afterTodoId) + 1)
+        : entry.todos.length;
+      const todos = [...entry.todos];
+      todos.splice(insertAt, 0, todo);
+      return { ...entry, todos, updatedAt: Date.now() };
+    }));
+    setHideCompleted(false);
+  }, []);
+
+  const updateTodo = useCallback((entryId: string, todoId: string, patch: Partial<ScratchTodo>) => {
+    setEntries((previous) => previous.map((entry) => (
+      entry.id !== entryId ? entry : {
+        ...entry,
+        todos: entry.todos.map((todo) => todo.id === todoId ? { ...todo, ...patch } : todo),
+        updatedAt: Date.now(),
+      }
+    )));
+  }, []);
+
+  const removeTodo = useCallback((entryId: string, todoId: string) => {
+    setEntries((previous) => previous.map((entry) => (
+      entry.id !== entryId ? entry : {
+        ...entry,
+        todos: entry.todos.filter((todo) => todo.id !== todoId),
+        updatedAt: Date.now(),
+      }
+    )));
+  }, []);
+
+  const clearCompletedTodos = useCallback((entryId: string) => {
+    if (!window.confirm('清除这条便签中所有已完成待办？')) return;
+    setEntries((previous) => previous.map((entry) => (
+      entry.id !== entryId ? entry : {
+        ...entry,
+        todos: entry.todos.filter((todo) => !todo.done),
+        updatedAt: Date.now(),
+      }
+    )));
+  }, []);
+
+  const handleArchive = useCallback((entry: ScratchEntry) => {
+    patchEntry(entry.id, { archived: !entry.archived, pinned: false });
+  }, [patchEntry]);
+
+  const handleDuplicate = useCallback(async (source: ScratchEntry) => {
+    const blocks: ScratchBlock[] = [];
+    for (const block of source.blocks) {
+      if (block.type === 'text') {
+        blocks.push({ ...block, id: bid() });
+        continue;
+      }
+      const imageId = bid();
+      const src = block.src || await idbGet(block.id).catch(() => undefined) || '';
+      if (src) await idbPut(imageId, src).catch(() => {});
+      blocks.push({ type: 'image', id: imageId, src });
+    }
+    const now = Date.now();
+    const duplicate: ScratchEntry = {
+      ...source,
+      id: eid(),
+      title: source.title.trim() ? `${source.title.trim()}（副本）` : '',
+      createdAt: now,
+      updatedAt: now,
+      pinned: false,
+      archived: false,
+      todos: source.todos.map((todo) => ({ ...todo, id: bid(), createdAt: now })),
+      blocks,
+    };
+    setEntries((previous) => [duplicate, ...previous]);
+    setArchiveView(false);
+    setSearchQuery('');
+    setActiveId(duplicate.id);
+  }, []);
 
   const handleTextChange = useCallback((
     entryId: string, blockId: string, text: string, el: HTMLTextAreaElement,
@@ -467,8 +668,8 @@ const ScratchPadEditor: React.FC<EditorProps> = ({ mode, onClose }) => {
       if (block.type !== 'text') return e;
       const before = block.content.slice(0, cursorPos);
       const after  = block.content.slice(cursorPos);
-      const imgBlock: Block  = { type: 'image', id: imgId, src };
-      const afterBlock: Block = { type: 'text',  id: afterId, content: after };
+      const imgBlock: ScratchBlock = { type: 'image', id: imgId, src };
+      const afterBlock: ScratchBlock = { type: 'text', id: afterId, content: after };
       focusTarget.current = { blockId: afterBlock.id, pos: 0 };
       return {
         ...e, updatedAt: Date.now(),
@@ -491,7 +692,7 @@ const ScratchPadEditor: React.FC<EditorProps> = ({ mode, onClose }) => {
       if (idx < 0) return e;
       const without = e.blocks.filter(b => b.id !== blockId);
       // 合并相邻文本块
-      const merged: Block[] = [];
+      const merged: ScratchBlock[] = [];
       for (const b of without) {
         const last = merged[merged.length - 1];
         if (last?.type === 'text' && b.type === 'text') {
@@ -533,7 +734,6 @@ const ScratchPadEditor: React.FC<EditorProps> = ({ mode, onClose }) => {
     }
   }, [active]);
 
-  const groups = groupByDate(entries);
   const isWindow = mode === 'window';
 
   // 记录选择器下拉
@@ -552,14 +752,18 @@ const ScratchPadEditor: React.FC<EditorProps> = ({ mode, onClose }) => {
 
   // 当前记录标签
   const activeLabel = active
-    ? `${fmtDate(active.updatedAt)} ${fmtTime(active.updatedAt)}`
+    ? `${active.pinned ? '📍 ' : ''}${scratchEntryPreview(active)} · ${fmtDate(active.updatedAt)} ${fmtTime(active.updatedAt)}`
     : '无记录';
+  const activeTodoStats = active ? scratchTodoStats(active) : { total: 0, done: 0, pending: 0 };
+  const activeTodos = active
+    ? active.todos.filter((todo) => !hideCompleted || !todo.done)
+    : [];
 
   return (
     <div style={{
       display: 'flex', flexDirection: 'column',
       height: isWindow ? '100vh' : '100%',
-      background: '#fff9c4',
+      background: palette.shell,
       color: '#1c1917',
       fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif',
     }}>
@@ -619,8 +823,8 @@ const ScratchPadEditor: React.FC<EditorProps> = ({ mode, onClose }) => {
       <div style={{
         display: 'flex', alignItems: 'center', gap: 6,
         padding: '6px 8px',
-        borderBottom: '1px solid rgba(180,120,20,0.3)',
-        background: '#fbbf24',
+        borderBottom: `1px solid ${palette.border}`,
+        background: palette.header,
         flexShrink: 0, minWidth: 0,
       }}>
         <span style={{ fontSize: 13, flexShrink: 0 }}>📌</span>
@@ -636,8 +840,8 @@ const ScratchPadEditor: React.FC<EditorProps> = ({ mode, onClose }) => {
               style={{
                 display: 'flex', alignItems: 'center', gap: 4, width: '100%',
                 padding: '3px 7px', borderRadius: 5,
-                border: '1px solid rgba(180,120,20,0.25)',
-                background: showPicker ? 'rgba(215,119,6,0.18)' : 'rgba(255,255,255,0.35)',
+                border: `1px solid ${palette.border}`,
+                background: showPicker ? palette.active : 'rgba(255,255,255,0.45)',
                 color: '#78716c', fontSize: 11, cursor: 'pointer',
                 textAlign: 'left', minWidth: 0,
               }}
@@ -652,13 +856,13 @@ const ScratchPadEditor: React.FC<EditorProps> = ({ mode, onClose }) => {
             {showPicker && (
               <div style={{
                 position: 'absolute', top: '100%', left: 0, right: 0, marginTop: 3,
-                background: '#fef9c3', border: '1px solid rgba(180,120,20,0.25)',
+                background: palette.shell, border: `1px solid ${palette.border}`,
                 borderRadius: 7, boxShadow: '0 6px 24px rgba(100,60,0,0.18)',
                 zIndex: 200, maxHeight: 280, overflowY: 'auto',
               }}>
-                {entries.length === 0 ? (
+                {visibleEntries.length === 0 ? (
                   <div style={{ padding: '14px 10px', textAlign: 'center', fontSize: 11, color: '#78716c' }}>
-                    还没有记录
+                    {searchQuery ? '没有匹配的便签' : archiveView ? '归档中没有便签' : '还没有记录'}
                   </div>
                 ) : groups.map(({ label, items }) => (
                   <div key={label}>
@@ -667,10 +871,10 @@ const ScratchPadEditor: React.FC<EditorProps> = ({ mode, onClose }) => {
                     </div>
                     {items.map(entry => {
                       const isAct = entry.id === activeId;
-                      const textContent = entry.blocks
-                        .filter(b => b.type === 'text').map(b => (b as any).content).join(' ').trim();
                       const imgCount = entry.blocks.filter(b => b.type === 'image').length;
-                      const preview = textContent.split('\n')[0] || (imgCount > 0 ? '🖼' : '（空）');
+                      const todoStats = scratchTodoStats(entry);
+                      const preview = scratchEntryPreview(entry);
+                      const entryPalette = NOTE_PALETTES[entry.color];
                       return (
                         <div
                           key={entry.id}
@@ -678,15 +882,16 @@ const ScratchPadEditor: React.FC<EditorProps> = ({ mode, onClose }) => {
                           style={{
                             display: 'flex', alignItems: 'center', gap: 6,
                             padding: '6px 10px', cursor: 'pointer',
-                            background: isAct ? 'rgba(215,119,6,0.18)' : 'transparent',
-                            borderLeft: `2px solid ${isAct ? '#d97706' : 'transparent'}`,
+                            background: isAct ? entryPalette.active : 'transparent',
+                            borderLeft: `2px solid ${isAct ? entryPalette.accent : 'transparent'}`,
                           }}
                         >
-                          <span style={{ fontSize: 10, color: isAct ? '#d97706' : '#a08050', flexShrink: 0 }}>
-                            {fmtTime(entry.updatedAt)}
+                          <span style={{ fontSize: 10, color: isAct ? entryPalette.accent : '#78716c', flexShrink: 0 }}>
+                            {entry.pinned ? '📍' : fmtTime(entry.updatedAt)}
                           </span>
                           <span style={{ fontSize: 11, color: '#1c1917', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1 }}>
                             {imgCount > 0 && <span style={{ marginRight: 3, opacity: 0.7 }}>🖼</span>}
+                            {todoStats.total > 0 && <span style={{ marginRight: 3, opacity: 0.75 }}>☑{todoStats.done}/{todoStats.total}</span>}
                             {preview}
                           </span>
                         </div>
@@ -699,13 +904,55 @@ const ScratchPadEditor: React.FC<EditorProps> = ({ mode, onClose }) => {
           </div>
         )}
 
-        <button onClick={handleNew} title="新建" style={iconBtnStyle}>＋</button>
+        <button onClick={handleNew} title="新建便签" aria-label="新建便签" style={{ ...iconBtnStyle, color: palette.accent }}>＋</button>
         {!isWindow && (
-          <button onClick={() => void popout(onClose)} title="弹出独立窗口" style={iconBtnStyle}>⤢</button>
+          <button onClick={() => void popout(onClose)} title="弹出独立窗口" aria-label="弹出独立窗口" style={{ ...iconBtnStyle, color: palette.accent }}>⤢</button>
         )}
         {onClose && (
-          <button onClick={onClose} title="关闭" style={iconBtnStyle}>✕</button>
+          <button onClick={onClose} title="关闭" aria-label="关闭便签本" style={{ ...iconBtnStyle, color: palette.accent }}>✕</button>
         )}
+      </div>
+
+      {/* 搜索与归档入口在侧栏和独立窗口保持一致。 */}
+      <div style={{
+        display: 'flex', alignItems: 'center', gap: 6, padding: '6px 8px',
+        background: palette.side, borderBottom: `1px solid ${palette.border}`, flexShrink: 0,
+      }}>
+        <label style={{
+          display: 'flex', alignItems: 'center', gap: 5, flex: 1, minWidth: 0,
+          background: 'rgba(255,255,255,0.72)', border: `1px solid ${palette.border}`,
+          borderRadius: 6, padding: '4px 7px',
+        }}>
+          <span aria-hidden="true" style={{ fontSize: 11 }}>⌕</span>
+          <input
+            value={searchQuery}
+            onChange={(event) => setSearchQuery(event.target.value)}
+            aria-label="搜索便签"
+            placeholder="搜索标题、正文或待办"
+            style={{
+              flex: 1, minWidth: 0, border: 0, outline: 0, background: 'transparent',
+              color: '#1c1917', fontSize: 11,
+            }}
+          />
+          {searchQuery && (
+            <button
+              type="button" onClick={() => setSearchQuery('')} title="清除搜索"
+              aria-label="清除搜索" style={{ ...tinyIconButton, color: '#78716c' }}
+            >×</button>
+          )}
+        </label>
+        <button
+          type="button"
+          onClick={() => { setArchiveView((value) => !value); setShowPicker(false); }}
+          title={archiveView ? '返回普通便签' : '查看归档'}
+          aria-pressed={archiveView}
+          style={{
+            ...metaBtnBase, whiteSpace: 'nowrap', padding: '4px 7px',
+            color: archiveView ? palette.accent : '#78716c',
+            borderColor: archiveView ? palette.accent : palette.border,
+            background: archiveView ? palette.active : 'rgba(255,255,255,0.45)',
+          }}
+        >{archiveView ? '📝 便签' : `📦 ${archiveCount}`}</button>
       </div>
 
       {/* 主体 */}
@@ -714,14 +961,14 @@ const ScratchPadEditor: React.FC<EditorProps> = ({ mode, onClose }) => {
         {/* 独立窗口模式：左侧可点选记录列（稍窄） */}
         {isWindow && (
           <div style={{
-            width: 150, flexShrink: 0,
-            borderRight: '1px solid rgba(180,120,20,0.2)',
+            width: 180, flexShrink: 0,
+            borderRight: `1px solid ${palette.border}`,
             overflowY: 'auto', padding: '4px 0',
-            background: '#fef3c7',
+            background: palette.side,
           }}>
-            {entries.length === 0 && (
-              <div style={{ padding: '20px 8px', textAlign: 'center', fontSize: 11, color: '#a08050', lineHeight: 1.8 }}>
-                还没有记录<br />点击「＋」开始
+            {visibleEntries.length === 0 && (
+              <div style={{ padding: '20px 8px', textAlign: 'center', fontSize: 11, color: '#78716c', lineHeight: 1.8 }}>
+                {searchQuery ? '没有匹配的便签' : archiveView ? '归档中没有便签' : <>还没有记录<br />点击「＋」开始</>}
               </div>
             )}
             {groups.map(({ label, items }) => (
@@ -731,21 +978,22 @@ const ScratchPadEditor: React.FC<EditorProps> = ({ mode, onClose }) => {
                 </div>
                 {items.map(entry => {
                   const isAct = entry.id === activeId;
-                  const textContent = entry.blocks
-                    .filter(b => b.type === 'text').map(b => (b as any).content).join(' ').trim();
                   const imgCount = entry.blocks.filter(b => b.type === 'image').length;
-                  const preview = textContent.split('\n')[0] || (imgCount > 0 ? '🖼' : '（空）');
+                  const todoStats = scratchTodoStats(entry);
+                  const preview = scratchEntryPreview(entry);
+                  const entryPalette = NOTE_PALETTES[entry.color];
                   return (
                     <div key={entry.id} onClick={() => setActiveId(entry.id)} style={{
                       padding: '6px 8px', cursor: 'pointer',
-                      background: isAct ? 'rgba(215,119,6,0.18)' : 'transparent',
-                      borderLeft: `2px solid ${isAct ? '#d97706' : 'transparent'}`,
+                      background: isAct ? entryPalette.active : 'transparent',
+                      borderLeft: `2px solid ${isAct ? entryPalette.accent : 'transparent'}`,
                     }}>
-                      <div style={{ fontSize: 10, fontWeight: 600, color: isAct ? '#d97706' : '#a08050', marginBottom: 1 }}>
-                        {fmtTime(entry.updatedAt)}
+                      <div style={{ fontSize: 10, fontWeight: 600, color: isAct ? entryPalette.accent : '#78716c', marginBottom: 1 }}>
+                        {entry.pinned ? '📍 置顶' : fmtTime(entry.updatedAt)}
                       </div>
                       <div style={{ fontSize: 11, color: '#1c1917', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                         {imgCount > 0 && <span style={{ marginRight: 3, opacity: 0.6 }}>🖼</span>}
+                        {todoStats.total > 0 && <span style={{ marginRight: 3, opacity: 0.75 }}>☑{todoStats.done}/{todoStats.total}</span>}
                         {preview}
                       </div>
                     </div>
@@ -757,52 +1005,216 @@ const ScratchPadEditor: React.FC<EditorProps> = ({ mode, onClose }) => {
         )}
 
         {/* 编辑区 */}
-        <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden', background: '#fffde7' }}>
+        <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden', background: palette.editor }}>
           {active ? (
             <>
-              {/* 元信息栏 */}
+              {/* 标题与常用动作 */}
               <div style={{
-                display: 'flex', alignItems: 'center', gap: 6,
-                padding: '4px 12px',
-                borderBottom: '1px solid rgba(180,120,20,0.2)',
-                flexShrink: 0,
+                padding: '8px 12px 5px', borderBottom: `1px solid ${palette.border}`,
+                background: palette.editor, flexShrink: 0,
               }}>
-                <span style={{ fontSize: 10, color: '#78716c', flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                  🕐 {fmtFull(active.createdAt)}
-                  {active.updatedAt !== active.createdAt && <> · 改 {fmtFull(active.updatedAt)}</>}
-                </span>
-                <button
-                  onClick={() => setWrapLines(v => !v)}
-                  title={wrapLines ? '关闭自动换行（横向可滚动）' : '开启自动换行'}
+                <input
+                  value={active.title}
+                  onChange={(event) => patchEntry(active.id, { title: event.target.value })}
+                  aria-label="便签标题"
+                  placeholder="标题（可选）"
                   style={{
-                    ...metaBtnBase,
-                    color: wrapLines ? '#d97706' : '#78716c',
-                    borderColor: wrapLines ? '#d9770666' : 'rgba(180,120,20,0.2)',
-                    background: wrapLines ? 'rgba(215,119,6,0.1)' : 'transparent',
-                    fontFamily: EDITOR_FONT, fontSize: 10,
+                    display: 'block', width: '100%', boxSizing: 'border-box', border: 0,
+                    outline: 0, background: 'transparent', color: '#1c1917',
+                    fontSize: 16, lineHeight: '24px', fontWeight: 650, padding: '0 0 5px',
                   }}
-                >
-                  {wrapLines ? '↵ 换行' : '→ 不换行'}
-                </button>
-                <button
-                  onClick={handleCopyAll}
-                  title="复制全部内容（含图片，可粘贴到富文本编辑器）"
-                  style={{
-                    ...metaBtnBase,
-                    color: copyOk ? '#3fb950' : '#78716c',
-                    borderColor: copyOk ? '#3fb95066' : 'rgba(180,120,20,0.2)',
-                    background: copyOk ? 'rgba(63,185,80,0.1)' : 'transparent',
-                  }}
-                >
-                  {copyOk ? '✓ 已复制' : '📋 复制全部'}
-                </button>
-                <button onClick={() => setDeleteConfirmId(active.id)} style={{
-                  ...metaBtnBase, color: '#f85149',
-                  borderColor: 'rgba(248,81,73,0.3)', background: 'rgba(248,81,73,0.06)',
-                }}>
-                  🗑
-                </button>
+                />
+                <div style={{ display: 'flex', alignItems: 'center', gap: 5, flexWrap: 'wrap' }}>
+                  <span style={{
+                    fontSize: 10, color: '#78716c', flex: '1 1 145px',
+                    overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+                  }}>
+                    🕐 {fmtFull(active.createdAt)}
+                    {active.updatedAt !== active.createdAt && <> · 改 {fmtFull(active.updatedAt)}</>}
+                  </span>
+                  <button
+                    type="button" onClick={() => addTodo(active.id)}
+                    title="添加可勾选待办" style={{
+                      ...metaBtnBase, color: palette.accent, borderColor: palette.border,
+                      background: palette.active,
+                    }}
+                  >☑ 待办</button>
+                  <button
+                    type="button" onClick={() => patchEntry(active.id, { pinned: !active.pinned })}
+                    title={active.pinned ? '取消置顶' : '置顶便签'}
+                    aria-label={active.pinned ? '取消置顶' : '置顶便签'} aria-pressed={active.pinned}
+                    style={{
+                      ...squareMetaButton, color: active.pinned ? palette.accent : '#78716c',
+                      borderColor: active.pinned ? palette.accent : palette.border,
+                      background: active.pinned ? palette.active : 'transparent',
+                    }}
+                  >📍</button>
+                  <div ref={colorPickerRef} style={{ position: 'relative' }}>
+                    <button
+                      type="button" onClick={() => setShowColors((value) => !value)}
+                      title="更换便签颜色" aria-label="更换便签颜色" aria-expanded={showColors}
+                      style={{ ...squareMetaButton, color: palette.accent, borderColor: palette.border }}
+                    >🎨</button>
+                    {showColors && (
+                      <div style={{
+                        position: 'absolute', zIndex: 250, right: 0, top: 'calc(100% + 5px)',
+                        display: 'flex', gap: 6, padding: 8, borderRadius: 8,
+                        background: '#ffffff', border: `1px solid ${palette.border}`,
+                        boxShadow: '0 8px 28px rgba(30,41,59,0.2)',
+                      }}>
+                        {(Object.keys(NOTE_PALETTES) as ScratchColor[]).map((color) => {
+                          const option = NOTE_PALETTES[color];
+                          return (
+                            <button
+                              key={color} type="button" title={option.label}
+                              aria-label={`颜色：${option.label}`}
+                              aria-pressed={active.color === color}
+                              onClick={() => { patchEntry(active.id, { color }); setShowColors(false); }}
+                              style={{
+                                width: 24, height: 24, padding: 0, borderRadius: '50%', cursor: 'pointer',
+                                background: option.header,
+                                border: active.color === color ? `3px solid ${option.accent}` : '2px solid #fff',
+                                boxShadow: `0 0 0 1px ${option.border}`,
+                              }}
+                            />
+                          );
+                        })}
+                      </div>
+                    )}
+                  </div>
+                  <button
+                    type="button" onClick={() => handleArchive(active)}
+                    title={active.archived ? '恢复到普通便签' : '归档便签'}
+                    aria-label={active.archived ? '恢复到普通便签' : '归档便签'}
+                    style={{ ...squareMetaButton, color: '#78716c', borderColor: palette.border }}
+                  >{active.archived ? '↩' : '📦'}</button>
+                  <button
+                    type="button" onClick={() => void handleDuplicate(active)}
+                    title="克隆便签" aria-label="克隆便签"
+                    style={{ ...squareMetaButton, color: '#78716c', borderColor: palette.border }}
+                  >⧉</button>
+                  <button
+                    type="button" onClick={() => setWrapLines(v => !v)}
+                    title={wrapLines ? '关闭自动换行（横向可滚动）' : '开启自动换行'}
+                    aria-label={wrapLines ? '关闭自动换行' : '开启自动换行'}
+                    aria-pressed={wrapLines}
+                    style={{
+                      ...squareMetaButton,
+                      color: wrapLines ? palette.accent : '#78716c',
+                      borderColor: wrapLines ? palette.accent : palette.border,
+                      background: wrapLines ? palette.active : 'transparent',
+                      fontFamily: EDITOR_FONT, fontSize: 10,
+                    }}
+                  >{wrapLines ? '↵' : '→'}</button>
+                  <button
+                    type="button" onClick={handleCopyAll}
+                    title="复制全部内容（含标题、待办和图片）"
+                    aria-label="复制全部内容"
+                    style={{
+                      ...squareMetaButton,
+                      color: copyOk ? '#15803d' : '#78716c',
+                      borderColor: copyOk ? '#15803d' : palette.border,
+                      background: copyOk ? 'rgba(22,163,74,0.1)' : 'transparent',
+                    }}
+                  >{copyOk ? '✓' : '📋'}</button>
+                  <button
+                    type="button" onClick={() => setDeleteConfirmId(active.id)}
+                    title="删除便签" aria-label="删除便签" style={{
+                      ...squareMetaButton, color: '#dc2626',
+                      borderColor: 'rgba(220,38,38,0.3)', background: 'rgba(220,38,38,0.05)',
+                    }}
+                  >🗑</button>
+                </div>
               </div>
+
+              {/* 结构化待办清单 */}
+              {active.todos.length > 0 && (
+                <section aria-label="便签待办" style={{
+                  maxHeight: 'min(42vh, 320px)', overflowY: 'auto', flexShrink: 0,
+                  padding: '8px 12px', borderBottom: `1px solid ${palette.border}`,
+                  background: palette.side,
+                }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 6 }}>
+                    <strong style={{ color: '#1c1917', fontSize: 12 }}>待办</strong>
+                    <span style={{ color: '#78716c', fontSize: 10 }}>
+                      {activeTodoStats.done}/{activeTodoStats.total} 已完成
+                    </span>
+                    <div style={{
+                      flex: 1, minWidth: 28, height: 4, borderRadius: 4,
+                      background: 'rgba(100,116,139,0.16)', overflow: 'hidden',
+                    }}>
+                      <div style={{
+                        width: `${activeTodoStats.total ? (activeTodoStats.done / activeTodoStats.total) * 100 : 0}%`,
+                        height: '100%', background: palette.accent, transition: 'width 0.18s ease',
+                      }} />
+                    </div>
+                    {activeTodoStats.done > 0 && (
+                      <button
+                        type="button" onClick={() => setHideCompleted((value) => !value)}
+                        style={{ ...textMetaButton, color: palette.accent }}
+                      >{hideCompleted ? '显示已完成' : '隐藏已完成'}</button>
+                    )}
+                    {activeTodoStats.done > 0 && (
+                      <button
+                        type="button" onClick={() => clearCompletedTodos(active.id)}
+                        style={{ ...textMetaButton, color: '#dc2626' }}
+                      >清除</button>
+                    )}
+                  </div>
+                  {activeTodos.map((todo) => (
+                    <div key={todo.id} style={{
+                      display: 'flex', alignItems: 'center', gap: 7, minHeight: 30,
+                      borderBottom: `1px solid ${palette.border}`,
+                    }}>
+                      <input
+                        type="checkbox" checked={todo.done}
+                        onChange={(event) => updateTodo(active.id, todo.id, { done: event.target.checked })}
+                        aria-label={todo.text ? `完成：${todo.text}` : '切换待办完成状态'}
+                        style={{ width: 16, height: 16, margin: 0, accentColor: palette.accent, cursor: 'pointer' }}
+                      />
+                      <input
+                        ref={(element) => {
+                          if (element) todoRefs.current.set(todo.id, element);
+                          else todoRefs.current.delete(todo.id);
+                        }}
+                        value={todo.text}
+                        onChange={(event) => updateTodo(active.id, todo.id, { text: event.target.value })}
+                        onKeyDown={(event) => {
+                          if (event.key === 'Enter') {
+                            event.preventDefault();
+                            addTodo(active.id, todo.id);
+                          } else if (event.key === 'Backspace' && !todo.text) {
+                            event.preventDefault();
+                            removeTodo(active.id, todo.id);
+                          }
+                        }}
+                        aria-label="待办内容"
+                        placeholder="输入待办，按 Enter 新增下一项"
+                        style={{
+                          flex: 1, minWidth: 0, border: 0, outline: 0, padding: '5px 0',
+                          background: 'transparent', color: todo.done ? '#78716c' : '#1c1917',
+                          textDecoration: todo.done ? 'line-through' : 'none', fontSize: 12,
+                        }}
+                      />
+                      <button
+                        type="button" onClick={() => removeTodo(active.id, todo.id)}
+                        title="删除这项待办" aria-label="删除这项待办"
+                        style={{ ...tinyIconButton, color: '#b91c1c' }}
+                      >×</button>
+                    </div>
+                  ))}
+                  {activeTodos.length === 0 && hideCompleted && (
+                    <div style={{ padding: '5px 0', color: '#78716c', fontSize: 11 }}>已完成项目已隐藏</div>
+                  )}
+                  <button
+                    type="button" onClick={() => addTodo(active.id)}
+                    style={{
+                      marginTop: 6, padding: '4px 0', border: 0, background: 'transparent',
+                      color: palette.accent, fontSize: 11, cursor: 'pointer',
+                    }}
+                  >＋ 添加待办</button>
+                </section>
+              )}
 
               {/* 内容块（editor 风格） */}
               <div style={{
@@ -810,7 +1222,7 @@ const ScratchPadEditor: React.FC<EditorProps> = ({ mode, onClose }) => {
                 // 不换行时允许横向滚动；行号栏通过 sticky 固定在左侧
                 overflowX: wrapLines ? 'hidden' : 'auto',
                 padding: '12px 14px 12px 0',
-                background: '#fffde7',
+                background: palette.editor,
                 fontFamily: EDITOR_FONT,
               }}>
                 {(() => {
@@ -823,9 +1235,10 @@ const ScratchPadEditor: React.FC<EditorProps> = ({ mode, onClose }) => {
                       return (
                         <LineNumTextarea
                           key={block.id}
-                          value={block.content}
-                          startLine={startLine}
-                          wrapLines={wrapLines}
+                           value={block.content}
+                           startLine={startLine}
+                           wrapLines={wrapLines}
+                           palette={palette}
                           placeholder={active.blocks.length === 1
                             ? '在这里写点什么…\nCtrl+V 粘贴图片，图片将出现在光标位置'
                             : ''}
@@ -848,7 +1261,7 @@ const ScratchPadEditor: React.FC<EditorProps> = ({ mode, onClose }) => {
                             onClick={() => setLightbox(block.src)}
                             style={{
                               maxWidth: '100%', maxHeight: 400, display: 'block',
-                              borderRadius: 6, border: '1px solid rgba(180,120,20,0.2)',
+                              borderRadius: 6, border: `1px solid ${palette.border}`,
                               cursor: 'zoom-in',
                             }}
                           />
@@ -868,8 +1281,13 @@ const ScratchPadEditor: React.FC<EditorProps> = ({ mode, onClose }) => {
             </>
           ) : (
             <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', flexDirection: 'column', gap: 12, color: '#78716c', fontSize: 13 }}>
-              <span style={{ fontSize: 32 }}>📌</span>
-              <span>选择一条记录或新建</span>
+              <span style={{ fontSize: 32 }}>{archiveView ? '📦' : '📌'}</span>
+              <span>{searchQuery ? '没有匹配的便签' : archiveView ? '归档中没有便签' : '选择一条记录或新建'}</span>
+              {!archiveView && !searchQuery && (
+                <button type="button" onClick={handleNew} style={{ ...metaBtnBase, color: palette.accent, borderColor: palette.border }}>
+                  ＋ 新建便签
+                </button>
+              )}
             </div>
           )}
         </div>
@@ -888,7 +1306,25 @@ const iconBtnStyle: React.CSSProperties = {
 };
 
 const metaBtnBase: React.CSSProperties = {
-  padding: '2px 7px', borderRadius: 4, border: '1px solid', fontSize: 11, cursor: 'pointer',
+  minHeight: 26, padding: '2px 7px', borderRadius: 5, border: '1px solid',
+  fontSize: 11, cursor: 'pointer', background: 'transparent',
+};
+
+const squareMetaButton: React.CSSProperties = {
+  ...metaBtnBase,
+  width: 28, minWidth: 28, padding: 0,
+  display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
+};
+
+const tinyIconButton: React.CSSProperties = {
+  width: 20, height: 20, padding: 0, border: 0, borderRadius: 4,
+  display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
+  background: 'transparent', cursor: 'pointer', fontSize: 15, lineHeight: 1,
+};
+
+const textMetaButton: React.CSSProperties = {
+  padding: 0, border: 0, background: 'transparent', cursor: 'pointer',
+  fontSize: 10, whiteSpace: 'nowrap',
 };
 
 // ════════════════════════════════════════════════════════════════════

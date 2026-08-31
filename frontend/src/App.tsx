@@ -914,8 +914,8 @@ export const App: React.FC = () => {
 
   const handleImportData = useCallback(async () => {
     const confirmed = window.confirm(
-      '⚠️ 警告：导入将覆盖现有的 Backends 配置 和 Repo（Prompts + Skills）！\n\n' +
-      '（会话不会被导入／覆盖。）\n\n确定要继续吗？'
+      '整包导入会合并 Backends 与 Repo（Prompts + Skills），并覆盖包内同 ID／同名的匹配项。\n\n' +
+      '包外已有条目不会被删除，会话也不会被导入或覆盖。若只想迁移部分 Backend，请在 Backend Manager 中使用逐项导入。\n\n确定要继续吗？'
     );
     if (!confirmed) return;
 

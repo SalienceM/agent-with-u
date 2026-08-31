@@ -1,6 +1,7 @@
 import asyncio
 import io
 import json
+import stat
 import tempfile
 import unittest
 import zipfile
@@ -22,6 +23,23 @@ def make_zip(files: dict[str, bytes | str]) -> bytes:
         for name, content in files.items():
             data = content.encode("utf-8") if isinstance(content, str) else content
             archive.writestr(name, data)
+    return output.getvalue()
+
+
+def make_zip_with_symlink(
+    files: dict[str, bytes | str],
+    link_name: str,
+    link_target: str,
+) -> bytes:
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED) as archive:
+        for name, content in files.items():
+            data = content.encode("utf-8") if isinstance(content, str) else content
+            archive.writestr(name, data)
+        link = zipfile.ZipInfo(link_name)
+        link.create_system = 3
+        link.external_attr = (stat.S_IFLNK | 0o777) << 16
+        archive.writestr(link, link_target)
     return output.getvalue()
 
 
@@ -72,6 +90,57 @@ class StandardArchiveInspectionTests(unittest.TestCase):
         })
         with self.assertRaisesRegex(ValueError, "description"):
             standard_skills_from_zip_bytes(archive)
+
+    def test_local_skill_archive_still_rejects_symbolic_links(self):
+        archive = make_zip_with_symlink(
+            {"portable-demo/SKILL.md": STANDARD_MD},
+            "portable-demo/references/current.md",
+            "guide.md",
+        )
+
+        with self.assertRaisesRegex(ValueError, "符号链接"):
+            standard_skills_from_zip_bytes(archive)
+
+    def test_repository_catalog_ignores_unrelated_root_symbolic_link(self):
+        archive = make_zip_with_symlink(
+            {"repo-main/skills/portable-demo/SKILL.md": STANDARD_MD},
+            "repo-main/AGENTS.md",
+            "CLAUDE.md",
+        )
+        issues: list[dict] = []
+
+        skills = standard_skills_from_zip_bytes(
+            archive,
+            skip_invalid=True,
+            issues=issues,
+            repository_mode=True,
+        )
+
+        self.assertEqual([skill["name"] for skill in skills], ["portable-demo"])
+        self.assertEqual(issues, [])
+
+    def test_repository_catalog_skips_only_skill_that_contains_symbolic_link(self):
+        unsafe_md = STANDARD_MD.replace("portable-demo", "unsafe-demo")
+        archive = make_zip_with_symlink(
+            {
+                "repo-main/skills/portable-demo/SKILL.md": STANDARD_MD,
+                "repo-main/skills/unsafe-demo/SKILL.md": unsafe_md,
+            },
+            "repo-main/skills/unsafe-demo/references/current.md",
+            "guide.md",
+        )
+        issues: list[dict] = []
+
+        skills = standard_skills_from_zip_bytes(
+            archive,
+            skip_invalid=True,
+            issues=issues,
+            repository_mode=True,
+        )
+
+        self.assertEqual([skill["name"] for skill in skills], ["portable-demo"])
+        self.assertEqual(issues[0]["path"], "skills/unsafe-demo")
+        self.assertIn("符号链接", issues[0]["message"])
 
     def test_repository_catalog_ignores_unrelated_files_and_skips_bad_skill(self):
         files: dict[str, bytes | str] = {

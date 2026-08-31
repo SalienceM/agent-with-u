@@ -200,7 +200,9 @@ def _normalise_zip_members(
     Skills outside ``source_root``.  Catalog discovery must not apply the
     single-Skill file-count/expanded-size limits to those unrelated files.  In
     repository mode the same limits are applied later to each discovered Skill
-    directory instead.
+    directory instead.  Repository-level symlinks are likewise evaluated only
+    when they belong to a discovered Skill; a root helper link must not hide an
+    otherwise valid catalog.
     """
     all_members: dict[str, zipfile.ZipInfo] = {}
     for info in zf.infolist():
@@ -211,7 +213,7 @@ def _normalise_zip_members(
         if path.is_absolute() or not path.parts or any(part in {"", ".", ".."} for part in path.parts):
             raise ValueError(f"压缩包包含不安全路径：{raw}")
         mode = (info.external_attr >> 16) & 0xFFFF
-        if mode and stat.S_ISLNK(mode):
+        if mode and stat.S_ISLNK(mode) and not repository_mode:
             raise ValueError(f"压缩包不允许符号链接：{raw}")
         all_members[path.as_posix()] = info
 
@@ -344,6 +346,9 @@ def standard_skills_from_zip_bytes(
                             break
                     if nested:
                         continue
+                    mode = (info.external_attr >> 16) & 0xFFFF
+                    if mode and stat.S_ISLNK(mode):
+                        raise ValueError(f"Skill 目录包含符号链接：{member_name}")
                     if info.file_size > MAX_STANDARD_FILE_BYTES:
                         raise ValueError(f"Skill 文件过大：{member_name}")
                     total_size += info.file_size

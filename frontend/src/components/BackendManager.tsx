@@ -1,7 +1,7 @@
-import React, { useState, useCallback, useEffect } from 'react';
+import React, { useState, useCallback, useEffect, useRef } from 'react';
 import {
   api, getExecutors, getHomeExecKey, onExecStatus,
-  type ExecutorInfo,
+  type BackendImportPreviewItem, type ExecutorInfo,
 } from '../api';
 import { sessionsForBackendExecutor } from '../utils/backendManagement';
 
@@ -35,6 +35,8 @@ interface BackendConfig {
   mcpServers?: Record<string, any>;
   pinned?: boolean;  // 固定后端，不可删除
   cliPath?: string;  // qwen-code-cli: 自定义 CLI 路径
+  qwenContextWindowSize?: number;
+  qwenMaxOutputTokens?: number;
 }
 
 const OFFICIAL_BACKEND_ID = 'official-claude';
@@ -80,6 +82,20 @@ interface BackendManagerProps {
   ) => Promise<void>;
   sessions?: any[];
 }
+
+type BackendTransferState =
+  | {
+      mode: 'export';
+      selectedIds: Set<string>;
+    }
+  | {
+      mode: 'import';
+      fileName: string;
+      content: string;
+      items: BackendImportPreviewItem[];
+      selectedIds: Set<string>;
+      conflictPolicy: 'overwrite' | 'skip';
+    };
 
 function _cleanHeaders(h: Record<string, string> | undefined): Record<string, string> | undefined {
   if (!h) return undefined;
@@ -213,6 +229,8 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
   const [operationMessage, setOperationMessage] = useState<{
     kind: 'ok' | 'error'; text: string;
   } | null>(null);
+  const [transferState, setTransferState] = useState<BackendTransferState | null>(null);
+  const importFileInputRef = useRef<HTMLInputElement | null>(null);
 
   // MCP tab state
   const [activeTab, setActiveTab] = useState<'backends' | 'mcp'>('backends');
@@ -247,8 +265,127 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
     setIsEditingMcp(false);
     setEditingMcpName(null);
     setOperationMessage(null);
+    setTransferState(null);
+    if (importFileInputRef.current) importFileInputRef.current.value = '';
     window.__targetBackendForMigration = undefined;
   }, [targetExecKey]);
+
+  const toggleTransferSelection = useCallback((id: string, checked: boolean) => {
+    setTransferState((current) => {
+      if (!current) return current;
+      const selectedIds = new Set(current.selectedIds);
+      if (checked) selectedIds.add(id);
+      else selectedIds.delete(id);
+      return { ...current, selectedIds };
+    });
+  }, []);
+
+  const handleStartExport = useCallback(() => {
+    setOperationMessage(null);
+    setTransferState({
+      mode: 'export',
+      selectedIds: new Set(backends.map((backend) => backend.id)),
+    });
+  }, [backends]);
+
+  const handleExportSelected = useCallback(async () => {
+    if (transferState?.mode !== 'export' || transferState.selectedIds.size === 0) return;
+    setOperationBusy(true);
+    setOperationMessage(null);
+    try {
+      const result = await api.exportBackends([...transferState.selectedIds], targetExecKey);
+      if (result.status !== 'ok' || !result.content) {
+        throw new Error(result.message || '导出执行端没有返回配置文件');
+      }
+      const fileName = result.fileName || 'agent-with-u-backends.json';
+      const saved = await api.saveBackendExportFile(fileName, result.content);
+      if (saved.status === 'cancelled') return;
+      if (saved.status === 'unsupported') {
+        const blob = new Blob([result.content], { type: 'application/json;charset=utf-8' });
+        const url = URL.createObjectURL(blob);
+        const anchor = document.createElement('a');
+        anchor.href = url;
+        anchor.download = fileName;
+        document.body.appendChild(anchor);
+        anchor.click();
+        anchor.remove();
+        window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+      }
+      setTransferState(null);
+      setOperationMessage({
+        kind: 'ok',
+        text: saved.status === 'saved'
+          ? `已从 ${selectedExecutor?.label || targetExecKey} 导出 ${result.count || transferState.selectedIds.size} 个 Backend → ${saved.path}`
+          : `已从 ${selectedExecutor?.label || targetExecKey} 导出 ${result.count || transferState.selectedIds.size} 个 Backend；浏览器下载文件：${fileName}`,
+      });
+    } catch (error: any) {
+      setOperationMessage({ kind: 'error', text: error?.message || 'Backend 导出失败' });
+    } finally {
+      setOperationBusy(false);
+    }
+  }, [selectedExecutor?.label, targetExecKey, transferState]);
+
+  const handleImportFile = useCallback(async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    event.target.value = '';
+    if (!file) return;
+    setOperationBusy(true);
+    setOperationMessage(null);
+    try {
+      if (file.size > 4 * 1024 * 1024) {
+        throw new Error('Backend 配置文件不能超过 4 MiB');
+      }
+      const content = await file.text();
+      const preview = await api.previewBackendImport(content, targetExecKey);
+      if (preview.status !== 'ok') {
+        throw new Error(preview.message || '无法解析 Backend 配置文件');
+      }
+      setTransferState({
+        mode: 'import',
+        fileName: file.name,
+        content,
+        items: preview.items || [],
+        selectedIds: new Set((preview.items || []).filter((item) => !item.protected).map((item) => item.id)),
+        conflictPolicy: 'skip',
+      });
+    } catch (error: any) {
+      setTransferState(null);
+      setOperationMessage({ kind: 'error', text: error?.message || 'Backend 导入预览失败' });
+    } finally {
+      setOperationBusy(false);
+    }
+  }, [targetExecKey]);
+
+  const handleImportSelected = useCallback(async () => {
+    if (transferState?.mode !== 'import' || transferState.selectedIds.size === 0) return;
+    setOperationBusy(true);
+    setOperationMessage(null);
+    try {
+      const result = await api.importBackends(
+        transferState.content,
+        [...transferState.selectedIds],
+        transferState.conflictPolicy,
+        targetExecKey,
+      );
+      if (result.status !== 'ok') throw new Error(result.message || 'Backend 导入失败');
+      await onRefresh();
+      setTransferState(null);
+      const details = [
+        result.added ? `新增 ${result.added}` : '',
+        result.overwritten ? `覆盖 ${result.overwritten}` : '',
+        result.skipped ? `跳过 ${result.skipped}` : '',
+        result.protected ? `受保护 ${result.protected}` : '',
+      ].filter(Boolean).join('，');
+      setOperationMessage({
+        kind: 'ok',
+        text: `已导入 ${result.imported || 0} 个 Backend${details ? `（${details}）` : ''}；其他现有配置保持不变`,
+      });
+    } catch (error: any) {
+      setOperationMessage({ kind: 'error', text: error?.message || 'Backend 导入失败' });
+    } finally {
+      setOperationBusy(false);
+    }
+  }, [onRefresh, targetExecKey, transferState]);
 
   const handleNewBackend = useCallback(() => {
     setFormData({
@@ -334,6 +471,26 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
       if (formData.allowedTools?.length) saved.allowedTools = formData.allowedTools;
       // cliPath stored as a top-level field
       if (formData.cliPath?.trim()) (saved as any).cliPath = formData.cliPath.trim();
+      const contextWindow = formData.qwenContextWindowSize;
+      const maxOutput = formData.qwenMaxOutputTokens;
+      if (contextWindow != null && (!Number.isInteger(contextWindow) || contextWindow <= 0)) {
+        setOperationMessage({ kind: 'error', text: 'Qwen 上下文窗口必须是大于 0 的整数' });
+        return;
+      }
+      if (maxOutput != null && (!Number.isInteger(maxOutput) || maxOutput <= 0)) {
+        setOperationMessage({ kind: 'error', text: 'Qwen 最大输出 Tokens 必须是大于 0 的整数' });
+        return;
+      }
+      const effectiveMaxOutput = maxOutput ?? 32000;
+      if (contextWindow != null && effectiveMaxOutput >= contextWindow) {
+        setOperationMessage({
+          kind: 'error',
+          text: `最大输出 Tokens（${effectiveMaxOutput.toLocaleString()}）必须小于上下文窗口（${contextWindow.toLocaleString()}）`,
+        });
+        return;
+      }
+      if (contextWindow != null) saved.qwenContextWindowSize = contextWindow;
+      if (maxOutput != null) saved.qwenMaxOutputTokens = maxOutput;
     } else if (formData.type === 'codex-office') {
       const cleanedEnv: Record<string, string> = {};
       Object.entries(formData.env || {}).forEach(([k, v]) => {
@@ -594,7 +751,7 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
             <select
               aria-label="管理执行节点"
               value={targetExecKey}
-              disabled={operationBusy || isEditing || isEditingMcp || !!backendToDelete}
+              disabled={operationBusy || isEditing || isEditingMcp || !!backendToDelete || !!transferState}
               onChange={(event) => onTargetExecChange(event.target.value)}
               style={{ ...selectStyle, flex: 1, minWidth: 0 }}
             >
@@ -713,7 +870,13 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
                           <span> · 官方账户{backend.env?.HTTPS_PROXY ? ' · 代理✓' : ' · ⚠️无代理'}</span>
                         )}
                         {backend.type === 'qwen-code-cli' && (
-                          <span> · Qwen CLI{backend.model ? ` · 🤖${backend.model}` : ''}{backend.env?.DASHSCOPE_API_KEY ? ' · 🔑' : ' · ⚠️无Key'}</span>
+                          <span>
+                            {' · Qwen CLI'}
+                            {backend.model ? ` · 🤖${backend.model}` : ''}
+                            {backend.qwenContextWindowSize ? ` · 窗口 ${backend.qwenContextWindowSize.toLocaleString()}` : ''}
+                            {` · 输出 ≤${(backend.qwenMaxOutputTokens ?? 32000).toLocaleString()}`}
+                            {backend.env?.DASHSCOPE_API_KEY ? ' · 🔑' : ' · ⚠️无Key'}
+                          </span>
                         )}
                         {backend.type === 'codex-office' && (
                           <span> · Codex CLI{backend.model ? ` · 🤖${backend.model}` : ''}{backend.apiKey || backend.env?.OPENAI_API_KEY ? ' · 🔑' : ' · login'}</span>
@@ -744,16 +907,52 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
               )}
             </div>
 
-            <button
-              onClick={handleNewBackend}
-              disabled={loading || !!loadError || !selectedExecutor?.connected}
-              style={{
-                ...addBtnStyle,
-                opacity: loading || loadError || !selectedExecutor?.connected ? 0.5 : 1,
-              }}
-            >
-              + New Backend
-            </button>
+            <input
+              ref={importFileInputRef}
+              type="file"
+              accept=".json,application/json"
+              onChange={handleImportFile}
+              style={{ display: 'none' }}
+            />
+            <div style={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) auto auto', gap: 8 }}>
+              <button
+                onClick={handleNewBackend}
+                disabled={loading || !!loadError || !selectedExecutor?.connected || operationBusy}
+                style={{
+                  ...addBtnStyle,
+                  opacity: loading || loadError || !selectedExecutor?.connected || operationBusy ? 0.5 : 1,
+                }}
+              >
+                + New Backend
+              </button>
+              <button
+                type="button"
+                onClick={() => importFileInputRef.current?.click()}
+                disabled={loading || !!loadError || !selectedExecutor?.connected || operationBusy}
+                style={{
+                  ...transferBtnStyle,
+                  opacity: loading || loadError || !selectedExecutor?.connected || operationBusy ? 0.5 : 1,
+                }}
+                title="先预览配置文件，再选择要合并到该执行节点的 Backend"
+              >
+                📥 导入
+              </button>
+              <button
+                type="button"
+                onClick={handleStartExport}
+                disabled={loading || !!loadError || !selectedExecutor?.connected || operationBusy || backends.length === 0}
+                style={{
+                  ...transferBtnStyle,
+                  opacity: loading || loadError || !selectedExecutor?.connected || operationBusy || backends.length === 0 ? 0.5 : 1,
+                }}
+                title="勾选并导出该执行节点的 Backend 配置"
+              >
+                📤 导出
+              </button>
+            </div>
+            <div style={{ marginTop: 8, color: 'var(--theme-text-muted)', fontSize: 10.5, lineHeight: 1.5 }}>
+              导入采用合并模式：只处理你勾选的 Backend，未选择项和该节点的其他配置都不会被删除。
+            </div>
           </>
         ) : (
           // 编辑表单
@@ -1173,6 +1372,60 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
                     style={inputStyle}
                     placeholder="qwen-plus / qwen3-coder / qwen-max（留空使用 CLI 默认）"
                   />
+                </div>
+
+                {/* Backend 级 Token 边界 */}
+                <div style={{
+                  marginBottom: 12,
+                  padding: 10,
+                  border: '1px solid var(--theme-border)',
+                  borderRadius: 7,
+                  background: 'var(--theme-bg-tertiary, rgba(127,127,127,.055))',
+                }}>
+                  <div style={{ fontSize: 11, fontWeight: 650, color: 'var(--theme-text)', marginBottom: 8 }}>
+                    模型 Token 边界
+                  </div>
+                  <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: 10 }}>
+                    <div>
+                      <label style={{ fontSize: 10.5, color: 'var(--theme-text)', display: 'block', marginBottom: 4 }}>
+                        总上下文窗口（可选）
+                      </label>
+                      <input
+                        type="number"
+                        min={1024}
+                        step={1024}
+                        value={formData.qwenContextWindowSize ?? ''}
+                        onChange={(e) => setFormData({
+                          ...formData,
+                          qwenContextWindowSize: e.target.value ? Number(e.target.value) : undefined,
+                        })}
+                        style={inputStyle}
+                        placeholder="例如 135168"
+                      />
+                    </div>
+                    <div>
+                      <label style={{ fontSize: 10.5, color: 'var(--theme-text)', display: 'block', marginBottom: 4 }}>
+                        单次最大输出 Tokens
+                      </label>
+                      <input
+                        type="number"
+                        min={1}
+                        step={1024}
+                        max={formData.qwenContextWindowSize ? formData.qwenContextWindowSize - 1 : undefined}
+                        value={formData.qwenMaxOutputTokens ?? ''}
+                        onChange={(e) => setFormData({
+                          ...formData,
+                          qwenMaxOutputTokens: e.target.value ? Number(e.target.value) : undefined,
+                        })}
+                        style={inputStyle}
+                        placeholder="32000（安全默认）"
+                      />
+                    </div>
+                  </div>
+                  <p style={{ fontSize: 10, color: 'var(--theme-text-muted)', margin: '7px 0 0', lineHeight: 1.55 }}>
+                    限制跟随此 Backend 保存在执行节点。最大输出留空时固定使用 32,000，避免兼容端点把未知模型推导成超大的
+                    <code style={{ marginLeft: 3 }}>max_tokens</code>；输入与输出之和仍不能超过总上下文窗口。
+                  </p>
                 </div>
 
                 {/* Provider / auth-type 选择 */}
@@ -2161,6 +2414,196 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
           </>
         )}
 
+        {/* Backend 选择性导入 / 导出 */}
+        {transferState && (
+          <div style={{ ...overlayStyle, zIndex: 1120 }}>
+            <div
+              role="dialog"
+              aria-modal="true"
+              aria-label={transferState.mode === 'export' ? '选择导出的 Backend' : '选择导入的 Backend'}
+              style={{ ...panelStyle, width: 'min(92vw, 560px)', maxWidth: 560 }}
+              onClick={(event) => event.stopPropagation()}
+            >
+              <div style={{ display: 'flex', justifyContent: 'space-between', gap: 12, alignItems: 'flex-start', marginBottom: 12 }}>
+                <div>
+                  <h3 style={{ margin: 0, fontSize: 16, color: 'var(--theme-text)' }}>
+                    {transferState.mode === 'export' ? '选择要导出的 Backend' : '预览并选择要导入的 Backend'}
+                  </h3>
+                  <div style={{ marginTop: 5, fontSize: 11, lineHeight: 1.5, color: 'var(--theme-text-muted)' }}>
+                    目标节点：{selectedExecutor?.label || targetExecKey}
+                    {transferState.mode === 'import' ? ` · 文件：${transferState.fileName}` : ''}
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setTransferState(null)}
+                  disabled={operationBusy}
+                  style={closeBtnStyle}
+                  aria-label="关闭"
+                >✕</button>
+              </div>
+
+              <div style={{
+                marginBottom: 10, padding: '8px 10px', borderRadius: 7,
+                border: '1px solid rgba(245,158,11,0.25)', background: 'rgba(245,158,11,0.08)',
+                color: 'var(--theme-text-muted)', fontSize: 10.5, lineHeight: 1.55,
+              }}>
+                配置文件可能包含 API Key、Token 和代理信息，请只保存到可信位置。
+                {transferState.mode === 'import' && ' 导入采用原子合并，未勾选及本节点其他 Backend 均保持不变。'}
+              </div>
+
+              {operationMessage?.kind === 'error' && (
+                <div style={{
+                  marginBottom: 10, padding: '8px 10px', borderRadius: 7,
+                  border: '1px solid rgba(239,68,68,.28)', background: 'rgba(239,68,68,.1)',
+                  color: 'rgba(248,113,113,.98)', fontSize: 11, lineHeight: 1.5,
+                }}>
+                  {operationMessage.text}
+                </div>
+              )}
+
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, marginBottom: 8 }}>
+                <div style={{ color: 'var(--theme-text)', fontSize: 12 }}>
+                  已选择 <strong>{transferState.selectedIds.size}</strong> 项
+                </div>
+                <div style={{ display: 'flex', gap: 6 }}>
+                  <button
+                    type="button"
+                    style={{ ...cancelBtnStyle, flex: 'none', padding: '5px 9px', fontSize: 11 }}
+                    onClick={() => setTransferState((current) => {
+                      if (!current) return current;
+                      const ids = current.mode === 'export'
+                        ? backends.map((item) => item.id)
+                        : current.items.filter((item) => !item.protected).map((item) => item.id);
+                      return { ...current, selectedIds: new Set(ids) };
+                    })}
+                  >全选</button>
+                  <button
+                    type="button"
+                    style={{ ...cancelBtnStyle, flex: 'none', padding: '5px 9px', fontSize: 11 }}
+                    onClick={() => setTransferState((current) => (
+                      current ? { ...current, selectedIds: new Set<string>() } : current
+                    ))}
+                  >清空</button>
+                </div>
+              </div>
+
+              <div style={{
+                maxHeight: 'min(42vh, 360px)', overflowY: 'auto', marginBottom: 12,
+                border: '1px solid var(--theme-border)', borderRadius: 8,
+              }}>
+                {transferState.mode === 'export' ? backends.map((backend) => (
+                  <label key={backend.id} style={transferRowStyle}>
+                    <input
+                      type="checkbox"
+                      checked={transferState.selectedIds.has(backend.id)}
+                      onChange={(event) => toggleTransferSelection(backend.id, event.target.checked)}
+                      style={{ width: 15, height: 15, accentColor: 'var(--theme-accent)', flexShrink: 0 }}
+                    />
+                    <span style={{ minWidth: 0, flex: 1 }}>
+                      <span style={{ display: 'block', color: 'var(--theme-text)', fontSize: 12, fontWeight: 600 }}>
+                        {backend.label}{backend.pinned ? ' · 固定' : ''}
+                      </span>
+                      <span style={{ display: 'block', marginTop: 2, color: 'var(--theme-text-muted)', fontSize: 10.5, overflowWrap: 'anywhere' }}>
+                        {backend.id} · {backend.type} · {backend.enabled === false ? '已停用' : '已启用'}
+                      </span>
+                    </span>
+                  </label>
+                )) : transferState.items.length === 0 ? (
+                  <div style={{ padding: 18, textAlign: 'center', color: 'var(--theme-text-muted)', fontSize: 12 }}>
+                    文件中没有 Backend 配置
+                  </div>
+                ) : transferState.items.map((item) => (
+                  <label
+                    key={item.id}
+                    style={{ ...transferRowStyle, opacity: item.protected ? 0.62 : 1, cursor: item.protected ? 'not-allowed' : 'pointer' }}
+                  >
+                    <input
+                      type="checkbox"
+                      disabled={item.protected}
+                      checked={!item.protected && transferState.selectedIds.has(item.id)}
+                      onChange={(event) => toggleTransferSelection(item.id, event.target.checked)}
+                      style={{ width: 15, height: 15, accentColor: 'var(--theme-accent)', flexShrink: 0 }}
+                    />
+                    <span style={{ minWidth: 0, flex: 1 }}>
+                      <span style={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 6, color: 'var(--theme-text)', fontSize: 12, fontWeight: 600 }}>
+                        {item.label}
+                        <span style={{
+                          padding: '1px 6px', borderRadius: 999, fontSize: 9.5, fontWeight: 500,
+                          color: item.protected ? 'rgba(251,191,36,.95)' : item.conflict ? 'rgba(248,113,113,.95)' : 'rgba(74,222,128,.95)',
+                          background: item.protected ? 'rgba(245,158,11,.12)' : item.conflict ? 'rgba(239,68,68,.12)' : 'rgba(34,197,94,.12)',
+                        }}>
+                          {item.protected ? '受保护，不导入' : item.conflict ? '同 ID 冲突' : '新增'}
+                        </span>
+                      </span>
+                      <span style={{ display: 'block', marginTop: 2, color: 'var(--theme-text-muted)', fontSize: 10.5, overflowWrap: 'anywhere' }}>
+                        {item.id} · {item.type} · {item.enabled === false ? '已停用' : '已启用'}
+                      </span>
+                    </span>
+                  </label>
+                ))}
+              </div>
+
+              {transferState.mode === 'import' && transferState.items.some((item) => (
+                item.conflict && !item.protected && transferState.selectedIds.has(item.id)
+              )) && (
+                <fieldset style={{
+                  margin: '0 0 12px', padding: '9px 10px 10px', border: '1px solid var(--theme-border)',
+                  borderRadius: 8, color: 'var(--theme-text)',
+                }}>
+                  <legend style={{ padding: '0 5px', fontSize: 11, color: 'var(--theme-text-muted)' }}>同 ID 项如何处理</legend>
+                  <label style={{ display: 'flex', gap: 7, alignItems: 'center', fontSize: 11.5, cursor: 'pointer', marginBottom: 7 }}>
+                    <input
+                      type="radio"
+                      name="backend-import-conflict"
+                      checked={transferState.conflictPolicy === 'skip'}
+                      onChange={() => setTransferState((current) => (
+                        current?.mode === 'import' ? { ...current, conflictPolicy: 'skip' } : current
+                      ))}
+                    />
+                    跳过已有（更安全）
+                  </label>
+                  <label style={{ display: 'flex', gap: 7, alignItems: 'center', fontSize: 11.5, cursor: 'pointer' }}>
+                    <input
+                      type="radio"
+                      name="backend-import-conflict"
+                      checked={transferState.conflictPolicy === 'overwrite'}
+                      onChange={() => setTransferState((current) => (
+                        current?.mode === 'import' ? { ...current, conflictPolicy: 'overwrite' } : current
+                      ))}
+                    />
+                    用导入文件覆盖已有配置
+                  </label>
+                </fieldset>
+              )}
+
+              <div style={{ display: 'flex', gap: 8 }}>
+                <button
+                  type="button"
+                  onClick={transferState.mode === 'export' ? handleExportSelected : handleImportSelected}
+                  disabled={operationBusy || transferState.selectedIds.size === 0}
+                  style={{
+                    ...saveBtnStyle,
+                    opacity: operationBusy || transferState.selectedIds.size === 0 ? 0.5 : 1,
+                  }}
+                >
+                  {operationBusy
+                    ? '处理中…'
+                    : transferState.mode === 'export'
+                      ? `导出 ${transferState.selectedIds.size} 项`
+                      : `合并导入 ${transferState.selectedIds.size} 项`}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setTransferState(null)}
+                  disabled={operationBusy}
+                  style={cancelBtnStyle}
+                >取消</button>
+              </div>
+            </div>
+          </div>
+        )}
+
         {/* 删除确认对话框 - 有依赖的 session 时 */}
         {backendToDelete && dependentSessions.length > 0 && (
           <div style={overlayStyle}>
@@ -2287,6 +2730,19 @@ const addBtnStyle: React.CSSProperties = {
   background: 'rgba(34,197,94,0.15)', border: '1px solid rgba(34,197,94,0.3)',
   color: 'rgba(34,197,94,0.9)', fontSize: 14, fontWeight: 500,
   cursor: 'pointer',
+};
+
+const transferBtnStyle: React.CSSProperties = {
+  padding: '10px 11px', borderRadius: 8,
+  background: 'var(--theme-input-bg)', border: '1px solid var(--theme-border)',
+  color: 'var(--theme-text)', fontSize: 12, fontWeight: 500,
+  cursor: 'pointer', whiteSpace: 'nowrap',
+};
+
+const transferRowStyle: React.CSSProperties = {
+  display: 'flex', alignItems: 'center', gap: 10,
+  padding: '10px 11px', borderBottom: '1px solid var(--theme-border)',
+  background: 'var(--theme-input-bg)', cursor: 'pointer',
 };
 
 const labelStyle: React.CSSProperties = {

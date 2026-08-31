@@ -35,6 +35,10 @@ class ModelBackendConfig:
     # ★ Per-backend environment variables for ANTHROPIC_* settings
     env: Optional[dict[str, str]] = None  # {ANTHROPIC_MODEL, ANTHROPIC_BASE_URL, ANTHROPIC_AUTH_TOKEN}
     cli_path: Optional[str] = None  # Override path to claude CLI binary
+    # Qwen Code 请求边界。None 表示不覆盖上下文窗口；最大输出留空时由
+    # QwenCodeSdkBackend 使用安全默认值，避免兼容端点推导出超大 max_tokens。
+    qwen_context_window_size: Optional[int] = None
+    qwen_max_output_tokens: Optional[int] = None
     extra_headers: Optional[dict[str, str]] = None  # Custom HTTP headers for proxy/relay backends
     mcp_servers: Optional[dict[str, dict]] = None  # MCP server configurations
 
@@ -52,6 +56,8 @@ class ModelBackendConfig:
             "skipPermissions": self.skip_permissions,
             "env": self.env,
             "cliPath": self.cli_path,
+            "qwenContextWindowSize": self.qwen_context_window_size,
+            "qwenMaxOutputTokens": self.qwen_max_output_tokens,
             "extraHeaders": self.extra_headers,
             "mcpServers": self.mcp_servers,
         }

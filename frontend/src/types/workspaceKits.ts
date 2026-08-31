@@ -154,6 +154,23 @@ export interface KitGenerationResult {
   message?: string;
 }
 
+export type KitGenerationJobStatus =
+  | 'queued' | 'running' | 'succeeded' | 'needs_input' | 'error' | 'cancelled';
+
+export interface KitGenerationJob {
+  id: string;
+  sessionId: string;
+  status: KitGenerationJobStatus;
+  request: KitGenerationRequest;
+  result?: KitGenerationResult | null;
+  message: string;
+  error: string;
+  createdAt: number;
+  startedAt?: number | null;
+  endedAt?: number | null;
+  updatedAt: number;
+}
+
 export interface KitAssertionResult {
   type: string;
   label: string;

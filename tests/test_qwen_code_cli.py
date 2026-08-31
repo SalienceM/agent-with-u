@@ -125,6 +125,81 @@ class QwenCodeCliTests(unittest.IsolatedAsyncioTestCase):
                 settings["model"]["generationConfig"]["modalities"]["image"],
             )
             self.assertEqual(settings["model"]["generationConfig"]["timeout"], 90000)
+            self.assertEqual(
+                settings["model"]["generationConfig"]["samplingParams"]["max_tokens"],
+                32000,
+            )
+        finally:
+            shutil.rmtree(cwd, ignore_errors=True)
+
+    async def test_backend_token_limits_override_oversized_qwen_request(self):
+        import json
+        import os
+        import shutil
+        import tempfile
+
+        backend = QwenCodeSdkBackend(ModelBackendConfig(
+            id="enterprise-qwen",
+            label="Enterprise Qwen",
+            type=BackendType.QWEN_CODE_CLI,
+            qwen_context_window_size=135168,
+            qwen_max_output_tokens=32768,
+        ))
+        cwd = tempfile.mkdtemp()
+        try:
+            settings_dir = os.path.join(cwd, ".qwen")
+            os.makedirs(settings_dir, exist_ok=True)
+            with open(os.path.join(settings_dir, "settings.json"), "w", encoding="utf-8") as target:
+                json.dump({
+                    "model": {
+                        "generationConfig": {
+                            "timeout": 90000,
+                            "samplingParams": {
+                                "temperature": 0.2,
+                                "max_tokens": 384000,
+                            },
+                        },
+                    },
+                }, target)
+
+            backend._ensure_project_auth_settings(
+                cwd, "openai", "deepseek-v4-flash",
+            )
+
+            with open(os.path.join(settings_dir, "settings.json"), "r", encoding="utf-8") as source:
+                settings = json.load(source)
+            generation = settings["model"]["generationConfig"]
+            self.assertEqual(generation["contextWindowSize"], 135168)
+            self.assertEqual(generation["samplingParams"]["max_tokens"], 32768)
+            self.assertEqual(generation["samplingParams"]["temperature"], 0.2)
+            self.assertEqual(generation["timeout"], 90000)
+        finally:
+            shutil.rmtree(cwd, ignore_errors=True)
+
+    async def test_invalid_imported_limit_falls_back_below_context_window(self):
+        import json
+        import os
+        import shutil
+        import tempfile
+
+        backend = QwenCodeSdkBackend(ModelBackendConfig(
+            id="invalid-qwen",
+            label="Invalid Qwen",
+            type=BackendType.QWEN_CODE_CLI,
+            qwen_context_window_size=16000,
+            qwen_max_output_tokens=384000,
+        ))
+        cwd = tempfile.mkdtemp()
+        try:
+            backend._ensure_project_auth_settings(
+                cwd, "openai", "deepseek-v4-flash",
+            )
+            with open(os.path.join(cwd, ".qwen", "settings.json"), "r", encoding="utf-8") as source:
+                settings = json.load(source)
+            self.assertEqual(
+                settings["model"]["generationConfig"]["samplingParams"]["max_tokens"],
+                4000,
+            )
         finally:
             shutil.rmtree(cwd, ignore_errors=True)
 

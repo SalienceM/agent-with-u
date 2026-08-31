@@ -245,10 +245,21 @@ class ReleaseCenterTests(unittest.TestCase):
         class RecordingManager(ReleaseCenterManager):
             def __init__(self, release_root: Path):
                 self.uploaded: list[str] = []
+                self.refreshed: list[str] = []
+                self.public_manifest = None
                 super().__init__(release_root)
 
-            async def _upload(self, job_id, qshell, bucket, key, path):  # type: ignore[override]
+            async def _upload(self, job_id, qshell, bucket, key, path, **kwargs):  # type: ignore[override]
                 self.uploaded.append(key)
+                if key.endswith("/stable/manifest.json"):
+                    self.public_manifest = json.loads(path.read_text(encoding="utf-8"))
+
+            async def _fetch_manifest(self, source):  # type: ignore[override]
+                return self.public_manifest
+
+            async def _refresh_cdn(self, job_id, qshell, manifest_url):  # type: ignore[override]
+                self.refreshed.append(manifest_url)
+                return True
 
         async def scenario(root: Path) -> None:
             project, _ = self._project(root)
@@ -273,6 +284,7 @@ class ReleaseCenterTests(unittest.TestCase):
 
             self.assertEqual(preview["plan"]["manifestKey"], manager.uploaded[-1])
             self.assertEqual(preview["plan"]["versionedManifestKey"], manager.uploaded[-2])
+            self.assertEqual([preview["plan"]["manifestUrl"]], manager.refreshed)
             status = manager.status()
             self.assertEqual("succeeded", status["jobs"][0]["status"])
             self.assertEqual("published", status["candidates"][0]["status"])
@@ -281,6 +293,129 @@ class ReleaseCenterTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             with mock.patch.dict(os.environ, {"AGENT_WITH_U_UPDATE_SIGNING_KEY": "fixture-key"}):
                 asyncio.run(scenario(Path(temporary)))
+
+    def test_upload_reports_intermediate_process_bytes(self):
+        class FakeStream:
+            async def read(self, _size):
+                return b""
+
+        class FakeProcess:
+            def __init__(self):
+                self.pid = 4242
+                self.returncode = None
+                self.stdout = FakeStream()
+                self.stderr = FakeStream()
+
+            async def wait(self):
+                await asyncio.sleep(0.04)
+                self.returncode = 0
+                return 0
+
+        async def scenario(root: Path) -> None:
+            project, _ = self._project(root)
+            manager = self._manager(root, project)
+            upload_path = root / "large.bin"
+            upload_path.write_bytes(b"x" * 1_000)
+            with manager._guard():
+                state = manager._load_state()
+                state["jobs"] = [{
+                    "id": "job", "status": "running", "progress": 0,
+                    "message": "upload", "log": [], "createdAt": 1, "updatedAt": 1,
+                }]
+                manager._save_state(state)
+
+            observed_patches = []
+            original_update = manager._update_job
+
+            def capture(job_id, patch):
+                observed_patches.append(dict(patch))
+                return original_update(job_id, patch)
+
+            counters = iter([10_000, 10_120, 10_360, 10_710, 10_900, 10_900, 10_900])
+            last_counter = 10_900
+
+            def process_bytes(_pid):
+                nonlocal last_counter
+                try:
+                    last_counter = next(counters)
+                except StopIteration:
+                    pass
+                return last_counter
+
+            process = FakeProcess()
+            with (
+                mock.patch.object(asyncio, "create_subprocess_exec", new=mock.AsyncMock(return_value=process)),
+                mock.patch("src.backend.release_center._process_read_bytes", side_effect=process_bytes),
+                mock.patch("src.backend.release_center.UPLOAD_PROGRESS_INTERVAL", 0.005),
+                mock.patch.object(manager, "_update_job", side_effect=capture),
+            ):
+                await manager._upload(
+                    "job", "qshell", "bucket", "large.bin", upload_path,
+                    completed_bytes=0, total_bytes=1_000,
+                )
+
+            intermediate = [
+                int(patch.get("currentFileBytes") or 0) for patch in observed_patches
+                if 0 < int(patch.get("currentFileBytes") or 0) < 1_000
+            ]
+            self.assertTrue(intermediate, observed_patches)
+            final = manager.status()["jobs"][0]
+            self.assertEqual(1_000, final["currentFileBytes"])
+            self.assertEqual(1_000, final["uploadedBytes"])
+
+        with tempfile.TemporaryDirectory() as temporary:
+            asyncio.run(scenario(Path(temporary)))
+
+    def test_publish_fails_when_public_manifest_is_still_old(self):
+        class StaleManifestManager(ReleaseCenterManager):
+            async def _upload(self, job_id, qshell, bucket, key, path, **kwargs):  # type: ignore[override]
+                return None
+
+            async def _refresh_cdn(self, job_id, qshell, manifest_url):  # type: ignore[override]
+                return True
+
+            async def _fetch_manifest(self, source):  # type: ignore[override]
+                return {
+                    "schemaVersion": 1,
+                    "channel": "stable",
+                    "release": {
+                        "version": "26.8.27.100000",
+                        "buildId": "20260827100000-old",
+                        "sequence": 20260827100000,
+                    },
+                    "artifacts": [],
+                }
+
+            async def _verify_published_manifest(self, source, expected, **kwargs):  # type: ignore[override]
+                return await super()._verify_published_manifest(source, expected, attempts=1)
+
+        async def scenario(root: Path) -> None:
+            project, _ = self._project(root)
+            qshell = root / ("qshell.exe" if os.name == "nt" else "qshell")
+            qshell.write_text("fixture", encoding="utf-8")
+            manager = StaleManifestManager(root / "release-center")
+            manager.configure({
+                "projectRoot": str(project), "baseUrl": "https://cdn.example.com",
+                "qiniuBucket": "fixture-bucket", "qshell": str(qshell),
+            })
+            candidate = manager.scan_project()["candidate"]
+            with mock.patch.object(
+                manager, "qiniu_account_status", return_value=self._ACCOUNT_READY,
+            ):
+                preview = await manager.preview(
+                    candidate["id"], [candidate["artifacts"][0]["id"]], {},
+                )
+                started = await manager.start_publish(preview["plan"]["id"])
+                await manager._tasks[started["job"]["id"]]
+
+            status = manager.status()
+            self.assertEqual("failed", status["jobs"][0]["status"])
+            self.assertIn("回读不一致", status["jobs"][0]["error"])
+            self.assertEqual("candidate", status["candidates"][0]["status"])
+            self.assertEqual([], status["history"])
+
+        with tempfile.TemporaryDirectory() as temporary:
+            asyncio.run(scenario(Path(temporary)))
 
 
 class ReleaseCenterAuthorizationTests(unittest.TestCase):

@@ -29,6 +29,20 @@ from typing import Optional, Callable, Awaitable, Any
 from ..types import ModelBackendConfig, ChatMessage, ImageAttachment
 from .base import ModelBackend, StreamDelta, PermissionRequest, _exc_msg, cli_available, cli_missing_message
 
+
+DEFAULT_QWEN_MAX_OUTPUT_TOKENS = 32_000
+
+
+def _positive_token_limit(value: Any) -> Optional[int]:
+    """Normalize persisted/UI token limits without accepting bool/invalid values."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return parsed if parsed > 0 else None
+
 # ---------------------------------------------------------------------------
 #  CLI path resolution (fallback if SDK needs it)
 # ---------------------------------------------------------------------------
@@ -188,8 +202,29 @@ class QwenCodeSdkBackend(ModelBackend):
         """
         if not cwd:
             return
+        context_window_size = _positive_token_limit(
+            getattr(self.config, "qwen_context_window_size", None),
+        )
+        requested_max_output = _positive_token_limit(
+            getattr(self.config, "qwen_max_output_tokens", None),
+        )
+        max_output_tokens = requested_max_output or DEFAULT_QWEN_MAX_OUTPUT_TOKENS
+        if context_window_size and max_output_tokens >= context_window_size:
+            # 手工导入的旧配置可能绕过 UI 校验；运行时仍要保证不会再次构造
+            # max_tokens >= 总上下文的必错请求。
+            max_output_tokens = max(1, min(
+                DEFAULT_QWEN_MAX_OUTPUT_TOKENS,
+                context_window_size // 4,
+            ))
+            print(
+                "[QwenSdk] max output token limit exceeded context window; "
+                f"using safe fallback {max_output_tokens}",
+                file=sys.stderr,
+                flush=True,
+            )
         cache_key = (
             os.path.abspath(cwd), auth_type, model or "", enable_image_input,
+            context_window_size, max_output_tokens,
         )
         if cache_key in getattr(self, "_auth_settings_cache", set()):
             return
@@ -223,23 +258,38 @@ class QwenCodeSdkBackend(ModelBackend):
                     data["model"] = model_cfg
                 model_cfg.setdefault("name", model)
 
-                # Qwen Code uses a built-in name table to decide whether an
-                # @referenced image may be converted to inlineData.  New/custom
-                # visual model IDs (for example qwen3.7-plus) can be absent from
-                # that table and are otherwise downgraded to text with an
-                # "Unsupported image" placeholder.  An actual image attachment
-                # is an explicit capability signal from AgentWithU, so override
-                # only the image modality while preserving all user settings.
-                if enable_image_input:
-                    generation_cfg = model_cfg.setdefault("generationConfig", {})
-                    if not isinstance(generation_cfg, dict):
-                        generation_cfg = {}
-                        model_cfg["generationConfig"] = generation_cfg
-                    modalities = generation_cfg.setdefault("modalities", {})
-                    if not isinstance(modalities, dict):
-                        modalities = {}
-                        generation_cfg["modalities"] = modalities
-                    modalities["image"] = True
+            # Token limits are Backend policy, not a controller-only preference.
+            # Persist them in this executor's project settings so the external
+            # Qwen CLI applies the same boundary for local and Relay requests.
+            model_cfg = data.setdefault("model", {})
+            if not isinstance(model_cfg, dict):
+                model_cfg = {}
+                data["model"] = model_cfg
+            generation_cfg = model_cfg.setdefault("generationConfig", {})
+            if not isinstance(generation_cfg, dict):
+                generation_cfg = {}
+                model_cfg["generationConfig"] = generation_cfg
+            if context_window_size:
+                generation_cfg["contextWindowSize"] = context_window_size
+            sampling_params = generation_cfg.setdefault("samplingParams", {})
+            if not isinstance(sampling_params, dict):
+                sampling_params = {}
+                generation_cfg["samplingParams"] = sampling_params
+            sampling_params["max_tokens"] = max_output_tokens
+
+            # Qwen Code uses a built-in name table to decide whether an
+            # @referenced image may be converted to inlineData.  New/custom
+            # visual model IDs (for example qwen3.7-plus) can be absent from
+            # that table and are otherwise downgraded to text with an
+            # "Unsupported image" placeholder.  An actual image attachment
+            # is an explicit capability signal from AgentWithU, so override
+            # only the image modality while preserving all user settings.
+            if enable_image_input:
+                modalities = generation_cfg.setdefault("modalities", {})
+                if not isinstance(modalities, dict):
+                    modalities = {}
+                    generation_cfg["modalities"] = modalities
+                modalities["image"] = True
 
             settings_dir.mkdir(parents=True, exist_ok=True)
             settings_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")

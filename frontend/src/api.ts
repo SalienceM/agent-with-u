@@ -11,7 +11,7 @@
 import type { GitDetectResult, GitStatusResult, GitDiffResult, GitCommitResult, GitLogResult, GitBranchesResult, GitPushPullResult, GitStashListResult } from './types/git';
 import type {
   WorkspaceKitState, WorkspaceKit, KitRun, KitGenerationRequest, KitGenerationResult,
-  KitVersion, KitOptimizationMessage,
+  KitGenerationJob, KitVersion, KitOptimizationMessage,
 } from './types/workspaceKits';
 import type {
   ProvDocument, ProvOpenResult, ProvResolveResult, ProvSaveResult,
@@ -53,6 +53,28 @@ export interface ConnectedClient {
   since: string;          // ISO timestamp（UTC）
 }
 
+export interface BackendImportPreviewItem {
+  id: string;
+  label: string;
+  type: string;
+  enabled: boolean;
+  conflict: boolean;
+  protected: boolean;
+  existingLabel?: string;
+}
+
+export interface BackendImportResult {
+  status: string;
+  message?: string;
+  selected?: number;
+  imported?: number;
+  added?: number;
+  overwritten?: number;
+  skipped?: number;
+  protected?: number;
+  changedIds?: string[];
+}
+
 /** 当前 Web/桌面 Backend 作为 Relay 执行节点的注册状态。 */
 export interface RelayNodeStatus {
   supported: boolean;
@@ -89,7 +111,7 @@ export interface NodeUpdateArtifact {
 }
 
 export interface NodeUpdateStatus {
-  phase: 'idle' | 'checking' | 'current' | 'available' | 'downloading' | 'staged'
+  phase: 'idle' | 'checking' | 'current' | 'stale' | 'available' | 'downloading' | 'staged'
     | 'installing' | 'installed' | 'cancelled' | 'error';
   busy: boolean;
   available?: boolean;
@@ -106,6 +128,7 @@ export interface NodeUpdateStatus {
   downloadedBytes?: number;
   totalBytes?: number;
   manifestSigned?: boolean;
+  manifestRelation?: 'newer' | 'same' | 'older';
   config: {
     manifestUrl: string;
     channel: string;
@@ -178,6 +201,11 @@ export interface ReleaseJob {
   channel: string;
   status: 'queued' | 'running' | 'succeeded' | 'failed' | 'cancelled' | 'interrupted';
   progress: number;
+  uploadedBytes?: number;
+  totalBytes?: number;
+  currentFileBytes?: number;
+  currentFileSize?: number;
+  currentFileName?: string;
   step: number;
   totalSteps: number;
   message: string;
@@ -327,6 +355,8 @@ type ChatAsideUpdatedCallback = (data: { sessionId: string; asides: any[]; aside
 let chatAsideUpdatedCallbacks: ChatAsideUpdatedCallback[] = [];
 type KitUpdatedCallback = (data: WorkspaceKitState) => void;
 let kitUpdatedCallbacks: KitUpdatedCallback[] = [];
+type KitGenerationUpdatedCallback = (data: KitGenerationJob) => void;
+let kitGenerationUpdatedCallbacks: KitGenerationUpdatedCallback[] = [];
 
 type SttStreamEndCallback = (data: { reason: string }) => void;
 let sttStreamEndCallbacks: SttStreamEndCallback[] = [];
@@ -858,6 +888,9 @@ function handleMessage(e: MessageEvent, source?: Conn) {
     } else if (msg.event === 'kitUpdated') {
       const data = JSON.parse(msg.data);
       kitUpdatedCallbacks.forEach((cb) => cb(data));
+    } else if (msg.event === 'kitGenerationUpdated') {
+      const data = JSON.parse(msg.data) as KitGenerationJob;
+      kitGenerationUpdatedCallbacks.forEach((cb) => cb(data));
     } else if (msg.event === 'sttStreamText') {
       const data = JSON.parse(msg.data);
       sttStreamCallbacks.forEach((cb) => cb(data));
@@ -1769,6 +1802,18 @@ async function nativeSaveFile(defaultFilename?: string): Promise<string | null> 
   });
 }
 
+async function nativeSaveJsonFile(defaultFilename: string): Promise<string | null> {
+  if (!isTauri()) return null;
+  const defaultPath = await resolveDefaultSavePath(defaultFilename);
+  return tauriSaveDialog({
+    defaultPath,
+    filters: [
+      { name: 'JSON', extensions: ['json'] },
+      { name: 'All Files', extensions: ['*'] },
+    ],
+  });
+}
+
 async function nativeOpenFile(): Promise<string | null> {
   if (!isTauri()) {
     throw new Error('文件对话框仅在桌面应用中可用');
@@ -2145,6 +2190,54 @@ export const api = {
     await send('deleteBackend', id);
   },
 
+  async exportBackends(
+    selectedIds: string[], execKey: string,
+  ): Promise<{ status: string; count?: number; fileName?: string; content?: string; message?: string }> {
+    const result = await callOnStrict(
+      execKey, 'exportBackends', [JSON.stringify(selectedIds)], 20_000,
+    );
+    try { return JSON.parse(result); }
+    catch { return { status: 'error', message: '导出响应格式错误' }; }
+  },
+
+  /** Desktop saves controller-side content to a user-confirmed path; Web uses browser download. */
+  async saveBackendExportFile(
+    fileName: string, content: string,
+  ): Promise<{ status: 'saved' | 'cancelled' | 'unsupported'; path?: string }> {
+    if (!isTauri()) return { status: 'unsupported' };
+    const path = await nativeSaveJsonFile(fileName || 'agent-with-u-backends.json');
+    if (!path) return { status: 'cancelled' };
+    const { invoke } = await import('@tauri-apps/api/core');
+    await invoke('write_export_text_file', { path, data: content });
+    return { status: 'saved', path };
+  },
+
+  async previewBackendImport(
+    content: string, execKey: string,
+  ): Promise<{ status: string; count?: number; items: BackendImportPreviewItem[]; message?: string }> {
+    const result = await callOnStrict(
+      execKey, 'previewBackendImport', [content], 20_000,
+    );
+    try { return JSON.parse(result); }
+    catch { return { status: 'error', items: [], message: '导入预览响应格式错误' }; }
+  },
+
+  async importBackends(
+    content: string,
+    selectedIds: string[],
+    conflictPolicy: 'overwrite' | 'skip',
+    execKey: string,
+  ): Promise<BackendImportResult> {
+    const result = await callOnStrict(
+      execKey,
+      'importBackends',
+      [content, JSON.stringify(selectedIds), conflictPolicy],
+      30_000,
+    );
+    try { return JSON.parse(result); }
+    catch { return { status: 'error', message: '导入响应格式错误' }; }
+  },
+
   async selectDirectory(initialPath?: string): Promise<string | null> {
     return nativeOpenDirectory(initialPath);
   },
@@ -2448,6 +2541,30 @@ export const api = {
       return parsed;
     } catch { return { status: 'error', ready: false, message: 'AI Kit 编译响应解析失败' }; }
   },
+  async kitGenerateStart(sessionId: string, request: KitGenerationRequest): Promise<{
+    status: string; reused?: boolean; job?: KitGenerationJob; message?: string;
+  }> {
+    const result = await call('kitGenerateStart', sessionId, JSON.stringify(request || {}));
+    return parseRpcObject(result, {
+      status: 'error',
+      message: '执行端未响应后台 Kit 生成接口，请更新并重启该 Session 所属执行端',
+    });
+  },
+  async kitGenerationGet(sessionId: string, jobId = ''): Promise<{
+    status: string; job?: KitGenerationJob | null; message?: string;
+  }> {
+    const result = await call('kitGenerationGet', sessionId, jobId);
+    return parseRpcObject(result, {
+      status: 'error', job: null,
+      message: '执行端未响应 Kit 生成状态接口，请更新并重启该 Session 所属执行端',
+    });
+  },
+  async kitGenerateCancel(sessionId: string, jobId: string): Promise<{
+    status: string; job?: KitGenerationJob; message?: string;
+  }> {
+    const result = await call('kitGenerateCancel', sessionId, jobId);
+    return parseRpcObject(result, { status: 'error', message: '停止 Kit 生成失败' });
+  },
   async kitUpdate(sessionId: string, kitId: string, patch: Partial<WorkspaceKit>): Promise<{ status: string; kit?: WorkspaceKit; message?: string }> {
     const result = await call('kitUpdate', sessionId, kitId, JSON.stringify(patch || {}));
     try { return JSON.parse(result); } catch { return { status: 'error', message: 'Kit 更新响应解析失败' }; }
@@ -2597,6 +2714,12 @@ export const api = {
   onKitUpdated(cb: KitUpdatedCallback): () => void {
     kitUpdatedCallbacks.push(cb);
     return () => { kitUpdatedCallbacks = kitUpdatedCallbacks.filter((item) => item !== cb); };
+  },
+  onKitGenerationUpdated(cb: KitGenerationUpdatedCallback): () => void {
+    kitGenerationUpdatedCallbacks.push(cb);
+    return () => {
+      kitGenerationUpdatedCallbacks = kitGenerationUpdatedCallbacks.filter((item) => item !== cb);
+    };
   },
 
   // ── By the way 旁路问答（普通 session）─────────────────────
@@ -4033,6 +4156,10 @@ function mockDispatch(method: string, params: any[]): any {
     });
     case 'kitGenerate':
       return JSON.stringify({ status: 'error', message: 'mock mode 不支持 AI Kit 编译' });
+    case 'kitGenerateStart': case 'kitGenerateCancel':
+      return JSON.stringify({ status: 'error', message: 'mock mode 不支持后台 AI Kit 编译' });
+    case 'kitGenerationGet':
+      return JSON.stringify({ status: 'ok', job: null });
     case 'kitCreate': case 'kitUpdate': case 'kitDelete':
     case 'kitVersionList': case 'kitVersionGet': case 'kitVersionActivate':
     case 'kitOptimizeGet': case 'kitOptimizeAsk': case 'kitOptimizeFinalize':

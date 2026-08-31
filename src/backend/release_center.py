@@ -24,7 +24,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Optional
-from urllib.parse import quote, unquote, urlparse
+from urllib.parse import parse_qsl, quote, unquote, urlencode, urlparse, urlsplit, urlunsplit
 
 import httpx
 
@@ -37,6 +37,8 @@ MAX_HISTORY = 200
 MAX_JOBS = 50
 DEFAULT_SCAN_ROOTS = ["src-tauri/target/release/bundle", "dist"]
 CANDIDATE_STATUSES = {"candidate", "published", "discarded"}
+UPLOAD_PROGRESS_INTERVAL = 0.5
+PUBLISHED_MANIFEST_ATTEMPTS = 8
 
 
 def _now() -> float:
@@ -116,6 +118,74 @@ def canonical_payload(document: dict[str, Any]) -> bytes:
 
 def public_url(base_url: str, key: str) -> str:
     return f"{base_url.rstrip('/')}/{quote(key.strip('/'), safe='/._+-')}"
+
+
+def _cache_busted_url(source: str) -> str:
+    """Return a one-shot HTTP URL that cannot reuse an earlier manifest response."""
+    parts = urlsplit(source)
+    if parts.scheme not in {"http", "https"}:
+        return source
+    query = [(key, value) for key, value in parse_qsl(parts.query, keep_blank_values=True)
+             if key != "_awu_cache_bust"]
+    query.append(("_awu_cache_bust", f"{int(time.time() * 1000)}-{uuid.uuid4().hex[:8]}"))
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment))
+
+
+def _qshell_progress_fraction(text: str) -> Optional[float]:
+    """Extract the most recent percentage from qshell output when one is available."""
+    matches = re.findall(r"(?<![\d.])(\d{1,3}(?:\.\d+)?)\s*%", text or "")
+    if not matches:
+        return None
+    try:
+        return max(0.0, min(1.0, float(matches[-1]) / 100.0))
+    except ValueError:
+        return None
+
+
+def _process_read_bytes(pid: int) -> Optional[int]:
+    """Best-effort byte counter for a qshell subprocess without adding a psutil dependency."""
+    if pid <= 0:
+        return None
+    if os.name == "nt":
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            class _IoCounters(ctypes.Structure):
+                _fields_ = [
+                    ("ReadOperationCount", ctypes.c_ulonglong),
+                    ("WriteOperationCount", ctypes.c_ulonglong),
+                    ("OtherOperationCount", ctypes.c_ulonglong),
+                    ("ReadTransferCount", ctypes.c_ulonglong),
+                    ("WriteTransferCount", ctypes.c_ulonglong),
+                    ("OtherTransferCount", ctypes.c_ulonglong),
+                ]
+
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+            kernel32.OpenProcess.restype = wintypes.HANDLE
+            kernel32.GetProcessIoCounters.argtypes = [wintypes.HANDLE, ctypes.POINTER(_IoCounters)]
+            kernel32.GetProcessIoCounters.restype = wintypes.BOOL
+            kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+            handle = kernel32.OpenProcess(0x1000, False, int(pid))  # PROCESS_QUERY_LIMITED_INFORMATION
+            if not handle:
+                return None
+            try:
+                counters = _IoCounters()
+                if not kernel32.GetProcessIoCounters(handle, ctypes.byref(counters)):
+                    return None
+                return int(counters.ReadTransferCount)
+            finally:
+                kernel32.CloseHandle(handle)
+        except (AttributeError, OSError, TypeError, ValueError):
+            return None
+    try:
+        for line in Path(f"/proc/{int(pid)}/io").read_text(encoding="utf-8", errors="replace").splitlines():
+            if line.startswith("rchar:"):
+                return int(line.split(":", 1)[1].strip())
+    except (OSError, TypeError, ValueError):
+        pass
+    return None
 
 
 def _safe_id(value: object, fallback: str = "item") -> str:
@@ -351,6 +421,7 @@ class ReleaseCenterManager:
         self._tasks: dict[str, asyncio.Task] = {}
         self._processes: dict[str, asyncio.subprocess.Process] = {}
         self._job_account_modes: dict[str, str] = {}
+        self._upload_progress_marks: dict[str, tuple[float, int, int]] = {}
         self._cancel_requested: set[str] = set()
         # qshell `account` 会把 AccessKey/SecretKey 打到 stdout，状态探测必须只保留
         # 布尔结果，绝不能把命令输出带进 RPC、发布日志或持久化文件。
@@ -816,7 +887,13 @@ class ReleaseCenterManager:
                 async with httpx.AsyncClient(
                     follow_redirects=True, timeout=httpx.Timeout(20, read=30),
                 ) as client:
-                    response = await client.get(source)
+                    response = await client.get(
+                        _cache_busted_url(source),
+                        headers={
+                            "Cache-Control": "no-cache, no-store, max-age=0",
+                            "Pragma": "no-cache",
+                        },
+                    )
                     response.raise_for_status()
                     if len(response.content) > 4 * 1024 * 1024:
                         raise ReleaseCenterError("稳定版 manifest 过大")
@@ -1093,6 +1170,7 @@ class ReleaseCenterManager:
         self._tasks.pop(job_id, None)
         self._processes.pop(job_id, None)
         self._job_account_modes.pop(job_id, None)
+        self._upload_progress_marks.pop(job_id, None)
         self._cancel_requested.discard(job_id)
         try:
             task.exception()
@@ -1111,10 +1189,49 @@ class ReleaseCenterManager:
             job["updatedAt"] = _now()
             self._save_state(state)
 
-    async def _upload(self, job_id: str, qshell: str, bucket: str, key: str, path: Path) -> None:
+    def _report_upload_progress(
+        self, job_id: str, current_bytes: int, file_size: int,
+        completed_bytes: int, total_bytes: int, *, force: bool = False,
+    ) -> None:
+        file_size = max(0, int(file_size))
+        current_bytes = max(0, min(file_size, int(current_bytes)))
+        total_bytes = max(0, int(total_bytes))
+        uploaded_bytes = max(0, min(total_bytes, int(completed_bytes) + current_bytes))
+        progress = min(99, int(uploaded_bytes / total_bytes * 100)) if total_bytes else 0
+        now = time.monotonic()
+        previous = self._upload_progress_marks.get(job_id)
+        if not force and previous:
+            previous_at, previous_bytes, previous_progress = previous
+            if (
+                now - previous_at < UPLOAD_PROGRESS_INTERVAL
+                and progress == previous_progress
+                and uploaded_bytes - previous_bytes < 256 * 1024
+            ):
+                return
+        self._upload_progress_marks[job_id] = (now, uploaded_bytes, progress)
+        self._update_job(job_id, {
+            "progress": progress,
+            "uploadedBytes": uploaded_bytes,
+            "totalBytes": total_bytes,
+            "currentFileBytes": current_bytes,
+            "currentFileSize": file_size,
+        })
+
+    async def _upload(
+        self, job_id: str, qshell: str, bucket: str, key: str, path: Path, *,
+        completed_bytes: int = 0, total_bytes: int = 0,
+    ) -> None:
         if job_id in self._cancel_requested:
             raise asyncio.CancelledError
+        file_size = path.stat().st_size
         self._append_log(job_id, f"上传 {path.name} → {key}")
+        self._update_job(job_id, {
+            "currentFileName": path.name,
+            "currentFileBytes": 0,
+            "currentFileSize": file_size,
+            "uploadedBytes": max(0, completed_bytes),
+            "totalBytes": max(0, total_bytes),
+        })
         kwargs: dict[str, Any] = {
             "stdout": asyncio.subprocess.PIPE,
             "stderr": asyncio.subprocess.PIPE,
@@ -1132,16 +1249,145 @@ class ReleaseCenterManager:
             *command, **kwargs,
         )
         self._processes[job_id] = process
-        stdout, stderr = await process.communicate()
-        self._processes.pop(job_id, None)
+        output_tail = bytearray()
+        error_tail = bytearray()
+
+        async def read_stream(stream: Optional[asyncio.StreamReader], tail: bytearray) -> None:
+            parse_tail = ""
+            if stream is None:
+                return
+            while True:
+                chunk = await stream.read(4096)
+                if not chunk:
+                    return
+                tail.extend(chunk)
+                if len(tail) > 6_000:
+                    del tail[:-6_000]
+                parse_tail = (parse_tail + chunk.decode("utf-8", errors="replace"))[-1_000:]
+                fraction = _qshell_progress_fraction(parse_tail)
+                if fraction is not None:
+                    self._report_upload_progress(
+                        job_id, int(file_size * fraction), file_size,
+                        completed_bytes, total_bytes,
+                    )
+
+        async def monitor_file_reads() -> None:
+            baseline = _process_read_bytes(int(process.pid or 0))
+            while process.returncode is None:
+                await asyncio.sleep(UPLOAD_PROGRESS_INTERVAL)
+                observed = _process_read_bytes(int(process.pid or 0))
+                if observed is None:
+                    continue
+                if baseline is None:
+                    baseline = observed
+                    continue
+                # qshell may read a small amount of config around the upload. Capping at
+                # 98% prevents those reads from claiming completion before qshell exits.
+                current = min(int(file_size * 0.98), max(0, observed - baseline))
+                self._report_upload_progress(
+                    job_id, current, file_size, completed_bytes, total_bytes,
+                )
+
+        stdout_task = asyncio.create_task(read_stream(process.stdout, output_tail))
+        stderr_task = asyncio.create_task(read_stream(process.stderr, error_tail))
+        monitor_task = asyncio.create_task(monitor_file_reads())
+        try:
+            await process.wait()
+            await asyncio.gather(stdout_task, stderr_task)
+            await monitor_task
+        finally:
+            self._processes.pop(job_id, None)
         if job_id in self._cancel_requested:
             raise asyncio.CancelledError
-        output = stdout.decode("utf-8", errors="replace")[-6_000:].strip()
-        error = stderr.decode("utf-8", errors="replace")[-6_000:].strip()
+        output = bytes(output_tail).decode("utf-8", errors="replace").strip()
+        error = bytes(error_tail).decode("utf-8", errors="replace").strip()
         if output:
             self._append_log(job_id, output)
         if process.returncode != 0:
             raise ReleaseCenterError(error or output or f"qshell 退出码 {process.returncode}")
+        self._report_upload_progress(
+            job_id, file_size, file_size, completed_bytes, total_bytes, force=True,
+        )
+
+    async def _refresh_cdn(self, job_id: str, qshell: str, manifest_url: str) -> bool:
+        """Ask Qiniu to invalidate the mutable channel manifest before public verification."""
+        if not manifest_url.startswith(("https://", "http://")):
+            return False
+        kwargs: dict[str, Any] = {
+            "stdin": asyncio.subprocess.PIPE,
+            "stdout": asyncio.subprocess.PIPE,
+            "stderr": asyncio.subprocess.PIPE,
+        }
+        if os.name == "nt":
+            kwargs["creationflags"] = 0x08000000 | 0x00000200
+        else:
+            kwargs["start_new_session"] = True
+        command = [qshell]
+        if self._job_account_modes.get(job_id) == "workspace":
+            command.append("-L")
+            kwargs["cwd"] = str(self.qshell_workspace)
+        command.append("cdnrefresh")
+        process = await asyncio.create_subprocess_exec(*command, **kwargs)
+        self._processes[job_id] = process
+        try:
+            stdout, stderr = await process.communicate((manifest_url + "\n").encode("utf-8"))
+        finally:
+            self._processes.pop(job_id, None)
+        if job_id in self._cancel_requested:
+            raise asyncio.CancelledError
+        output = stdout.decode("utf-8", errors="replace")[-6_000:].strip()
+        error = stderr.decode("utf-8", errors="replace")[-6_000:].strip()
+        if process.returncode == 0:
+            self._append_log(job_id, f"已提交 CDN 刷新：{manifest_url}")
+            if output:
+                self._append_log(job_id, output)
+            return True
+        self._append_log(
+            job_id,
+            "CDN 主动刷新未成功，将继续使用防缓存 URL 回读校验："
+            + (error or output or f"qshell 退出码 {process.returncode}"),
+        )
+        return False
+
+    async def _verify_published_manifest(
+        self, source: str, expected: dict[str, Any], *,
+        attempts: int = PUBLISHED_MANIFEST_ATTEMPTS,
+    ) -> dict[str, Any]:
+        if not source.startswith(("https://", "http://")):
+            raise ReleaseCenterError("正式发布缺少可公开回读的 channel manifest URL")
+        expected_release = dict(expected.get("release") or {})
+        expected_build = str(expected_release.get("buildId") or "")
+        expected_sequence = int(expected_release.get("sequence") or 0)
+        expected_channel = str(expected.get("channel") or "")
+        last_seen = "未取得清单"
+        last_error = ""
+        for attempt in range(max(1, attempts)):
+            try:
+                observed = await self._fetch_manifest(source)
+                observed_release = dict((observed or {}).get("release") or {})
+                observed_build = str(observed_release.get("buildId") or "")
+                observed_sequence = int(observed_release.get("sequence") or 0)
+                observed_channel = str((observed or {}).get("channel") or "")
+                last_seen = (
+                    f"{observed_release.get('version') or '?'} / "
+                    f"{observed_build or observed_sequence or '?'}"
+                )
+                build_matches = not expected_build or observed_build == expected_build
+                sequence_matches = not expected_sequence or observed_sequence == expected_sequence
+                channel_matches = not expected_channel or observed_channel == expected_channel
+                if observed and build_matches and sequence_matches and channel_matches:
+                    return observed
+            except Exception as error:
+                last_error = str(error)
+            if attempt + 1 < max(1, attempts):
+                await asyncio.sleep(min(3.0, 0.5 * (attempt + 1)))
+        expected_label = f"{expected_release.get('version') or '?'} / {expected_build or expected_sequence or '?'}"
+        detail = f"；最后错误：{last_error}" if last_error else ""
+        raise ReleaseCenterError(
+            "公开 channel manifest 回读不一致，发布不能标记成功："
+            f"期望 {expected_label}，实际 {last_seen}{detail}。"
+            "请检查 CDN 缓存刷新及 manifest key 是否指向同一个桶。"
+        )
 
     async def _run_publish(self, job_id: str, plan: dict[str, Any]) -> None:
         try:
@@ -1180,34 +1426,72 @@ class ReleaseCenterManager:
             manifest_path = generated / "manifest.json"
             _atomic_json(manifest_path, manifest)
 
-            total = len(plan.get("uploadJobs") or []) + 2
+            upload_jobs = list(plan.get("uploadJobs") or [])
+            manifest_size = manifest_path.stat().st_size
+            total_bytes = sum(int(item.get("size") or 0) for item in upload_jobs) + manifest_size * 2
+            completed_bytes = 0
+            total = len(upload_jobs) + 2
             step = 0
-            for upload in plan.get("uploadJobs") or []:
+            self._update_job(job_id, {
+                "uploadedBytes": 0,
+                "totalBytes": total_bytes,
+                "currentFileBytes": 0,
+                "currentFileSize": 0,
+                "currentFileName": "",
+            })
+            for upload in upload_jobs:
                 step += 1
                 self._update_job(job_id, {
-                    "step": step, "progress": int((step - 1) / total * 100),
-                    "message": f"上传制品 {step}/{len(plan.get('uploadJobs') or [])}",
+                    "step": step,
+                    "message": f"上传制品 {step}/{len(upload_jobs)}",
                 })
+                upload_path = Path(str(upload["path"]))
                 await self._upload(
-                    job_id, qshell, bucket, str(upload["key"]), Path(str(upload["path"])),
+                    job_id, qshell, bucket, str(upload["key"]), upload_path,
+                    completed_bytes=completed_bytes, total_bytes=total_bytes,
                 )
+                completed_bytes += upload_path.stat().st_size
 
             step += 1
             self._update_job(job_id, {
-                "step": step, "progress": int((step - 1) / total * 100),
+                "step": step,
                 "message": "上传版本快照 manifest",
             })
             await self._upload(
                 job_id, qshell, bucket, str(plan["versionedManifestKey"]), manifest_path,
+                completed_bytes=completed_bytes, total_bytes=total_bytes,
             )
+            completed_bytes += manifest_size
 
             # stable/channel 指针必须是最后一个写入对象。此前任何失败都不会让客户端看到半套发布。
             step += 1
             self._update_job(job_id, {
-                "step": step, "progress": int((step - 1) / total * 100),
+                "step": step,
                 "message": f"最后切换 {plan.get('channel') or 'stable'} manifest",
             })
-            await self._upload(job_id, qshell, bucket, str(plan["manifestKey"]), manifest_path)
+            await self._upload(
+                job_id, qshell, bucket, str(plan["manifestKey"]), manifest_path,
+                completed_bytes=completed_bytes, total_bytes=total_bytes,
+            )
+            completed_bytes += manifest_size
+
+            manifest_url = str(plan.get("manifestUrl") or "").strip()
+            self._update_job(job_id, {
+                "progress": 99,
+                "uploadedBytes": completed_bytes,
+                "currentFileBytes": manifest_size,
+                "currentFileSize": manifest_size,
+                "message": "刷新 CDN 并核验公开 channel manifest",
+            })
+            await self._refresh_cdn(job_id, qshell, manifest_url)
+            self._update_job(job_id, {"message": "从公开 URL 回读并确认新版本"})
+            observed = await self._verify_published_manifest(manifest_url, manifest)
+            observed_release = dict(observed.get("release") or {})
+            self._append_log(
+                job_id,
+                "公开清单已确认："
+                f"{observed_release.get('version') or '?'} / {observed_release.get('buildId') or '?'}",
+            )
 
             finished = _now()
             with self._guard():

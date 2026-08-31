@@ -31,6 +31,12 @@ KIT_STEP_STATUSES = {
     "pending", "running", "waiting_client", "succeeded", "failed",
     "error", "cancelled", "skipped",
 }
+KIT_GENERATION_STATUSES = {
+    "queued", "running", "succeeded", "needs_input", "error", "cancelled",
+}
+FINAL_KIT_GENERATION_STATUSES = {
+    "succeeded", "needs_input", "error", "cancelled",
+}
 
 
 def _now() -> float:
@@ -657,11 +663,69 @@ class KitArtifact:
 
 
 @dataclass
+class KitGenerationJob:
+    """一次 AI Kit 编译任务。
+
+    编译结果先作为预览持久化，不会自动保存成 Kit，也不会执行。任务与前端组件
+    生命周期解耦，因此切换 Session、收起面板或 WebSocket 短暂重连都不会丢失。
+    """
+
+    id: str
+    session_id: str
+    status: str = "queued"
+    request: dict = field(default_factory=dict)
+    result: Optional[dict] = None
+    message: str = "已提交，等待后台编译"
+    error: str = ""
+    created_at: float = field(default_factory=_now)
+    started_at: Optional[float] = None
+    ended_at: Optional[float] = None
+    updated_at: float = field(default_factory=_now)
+
+    def to_dict(self) -> dict:
+        return {
+            "id": self.id,
+            "sessionId": self.session_id,
+            "status": self.status,
+            "request": self.request,
+            "result": self.result,
+            "message": self.message,
+            "error": self.error,
+            "createdAt": self.created_at,
+            "startedAt": self.started_at,
+            "endedAt": self.ended_at,
+            "updatedAt": self.updated_at,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "KitGenerationJob":
+        status = str(data.get("status") or "error")
+        if status not in KIT_GENERATION_STATUSES:
+            status = "error"
+        request = data.get("request") if isinstance(data.get("request"), dict) else {}
+        result = data.get("result") if isinstance(data.get("result"), dict) else None
+        return cls(
+            id=str(data.get("id") or _id()),
+            session_id=str(data.get("sessionId") or ""),
+            status=status,
+            request=_json_copy(request),
+            result=_json_copy(result) if result is not None else None,
+            message=_safe_text(data.get("message"), 4_000),
+            error=_safe_text(data.get("error"), 20_000),
+            created_at=float(data.get("createdAt") or _now()),
+            started_at=data.get("startedAt"),
+            ended_at=data.get("endedAt"),
+            updated_at=float(data.get("updatedAt") or data.get("createdAt") or _now()),
+        )
+
+
+@dataclass
 class WorkspaceKitState:
     session_id: str
     kits: list[WorkspaceKit] = field(default_factory=list)
     runs: list[KitRun] = field(default_factory=list)
     artifacts: list[KitArtifact] = field(default_factory=list)
+    generation_jobs: list[KitGenerationJob] = field(default_factory=list)
     created_at: float = field(default_factory=_now)
     updated_at: float = field(default_factory=_now)
 
@@ -676,6 +740,7 @@ class WorkspaceKitState:
             "kits": [item.to_dict() for item in self.kits],
             "runs": [item.to_dict() for item in self.runs],
             "artifacts": [item.to_dict() for item in self.artifacts],
+            "generationJobs": [item.to_dict() for item in self.generation_jobs],
             "dataMarket": list(latest.values()),
             "createdAt": self.created_at,
             "updatedAt": self.updated_at,
@@ -688,6 +753,10 @@ class WorkspaceKitState:
             kits=[WorkspaceKit.from_dict(x) for x in _dict_list(data.get("kits"))],
             runs=[KitRun.from_dict(x) for x in _dict_list(data.get("runs"))],
             artifacts=[KitArtifact.from_dict(x) for x in _dict_list(data.get("artifacts"))],
+            generation_jobs=[
+                KitGenerationJob.from_dict(x)
+                for x in _dict_list(data.get("generationJobs"))
+            ],
             created_at=float(data.get("createdAt") or _now()),
             updated_at=float(data.get("updatedAt") or _now()),
         )
@@ -699,6 +768,7 @@ class WorkspaceKitState:
     def compact(self) -> None:
         """限制 sidecar 增长；保留最近运行及每个数据键的近期版本。"""
         self.runs = self.runs[-100:]
+        self.generation_jobs = self.generation_jobs[-10:]
         for kit in self.kits:
             kit.optimization_messages = kit.optimization_messages[-200:]
         kept: list[KitArtifact] = []

@@ -8,6 +8,7 @@ import type {
   KitAssertionSpec,
   KitOutputSpec,
   KitGenerationResult,
+  KitGenerationJob,
   KitVersion,
   KitOptimizationMessage,
 } from '../types/workspaceKits';
@@ -106,6 +107,32 @@ function isActiveRun(run?: KitRun): boolean {
   return !!run && ['queued', 'running', 'waiting_client', 'evaluating'].includes(run.status);
 }
 
+function isActiveGeneration(job?: KitGenerationJob | null): boolean {
+  return !!job && (job.status === 'queued' || job.status === 'running');
+}
+
+function draftFromGenerationJob(job: KitGenerationJob): Draft {
+  const existing = job.request.existingKit || {};
+  const base: Draft = {
+    ...newDraft(),
+    ...existing,
+    objective: job.request.objective || existing.objective || '',
+    successCriteria: job.request.successCriteria || existing.successCriteria || '',
+    safetyConstraints: job.request.safetyConstraints || existing.safetyConstraints || '',
+    references: job.request.references || existing.references || [],
+    id: existing.id,
+  };
+  if (!job.result?.kit) return base;
+  const {
+    lastRunId: _lastRunId,
+    createdAt: _createdAt,
+    updatedAt: _updatedAt,
+    ...compiled
+  } = job.result.kit;
+  // 新建预览里的临时 id 不能被当作已有 Kit；重编译则保留原 Kit id。
+  return { ...newDraft(), ...compiled, id: existing.id };
+}
+
 function normalizeKitState(sessionId: string, next: Partial<WorkspaceKitState>): WorkspaceKitState {
   return {
     sessionId,
@@ -145,9 +172,21 @@ export const WorkspaceKitsPanel: React.FC<Props> = ({ sessionId, open, onClose }
   const [busy, setBusy] = useState(false);
   const [cancellingRunIds, setCancellingRunIds] = useState<Set<string>>(() => new Set());
   const [notice, setNotice] = useState<{ kind: 'error' | 'ok'; text: string } | null>(null);
+  const [generationJob, setGenerationJob] = useState<KitGenerationJob | null>(null);
+  const [generationEditorJobId, setGenerationEditorJobId] = useState('');
   const [clock, setClock] = useState(() => Date.now() / 1000);
   const clientClaims = useRef(new Set<string>());
   const clientCommandRuns = useRef(new Set<string>());
+
+  const acceptGenerationJob = (incoming: KitGenerationJob) => {
+    setGenerationJob((current) => {
+      if (!current || current.sessionId !== incoming.sessionId) return incoming;
+      if (current.id === incoming.id) {
+        return current.updatedAt > incoming.updatedAt ? current : incoming;
+      }
+      return current.createdAt > incoming.createdAt ? current : incoming;
+    });
+  };
 
   useEffect(() => {
     let cancelled = false;
@@ -179,6 +218,25 @@ export const WorkspaceKitsPanel: React.FC<Props> = ({ sessionId, open, onClose }
   }, [open, sessionId]);
 
   useEffect(() => {
+    let cancelled = false;
+    if (open) {
+      void api.kitGenerationGet(sessionId).then((result) => {
+        if (cancelled) return;
+        if (result.status === 'ok') {
+          if (result.job) acceptGenerationJob(result.job);
+          else setGenerationJob((current) => current?.sessionId === sessionId ? current : null);
+        } else if (result.message) {
+          setNotice({ kind: 'error', text: result.message });
+        }
+      });
+    }
+    const off = api.onKitGenerationUpdated((job) => {
+      if (job.sessionId === sessionId) acceptGenerationJob(job);
+    });
+    return () => { cancelled = true; off(); };
+  }, [open, sessionId]);
+
+  useEffect(() => {
     setState({ ...EMPTY_STATE, sessionId });
     setSelectedId('');
     setDetailOpen(false);
@@ -186,15 +244,17 @@ export const WorkspaceKitsPanel: React.FC<Props> = ({ sessionId, open, onClose }
     setDraft(null);
     setInputs({});
     setCancellingRunIds(new Set());
+    setGenerationJob(null);
+    setGenerationEditorJobId('');
     setNotice(null);
   }, [sessionId]);
 
   useEffect(() => {
-    if (!open || !state.runs.some(isActiveRun)) return;
+    if (!open || (!state.runs.some(isActiveRun) && !isActiveGeneration(generationJob))) return;
     setClock(Date.now() / 1000);
     const timer = window.setInterval(() => setClock(Date.now() / 1000), 250);
     return () => window.clearInterval(timer);
-  }, [open, state.runs]);
+  }, [open, state.runs, generationJob?.status]);
 
   useEffect(() => {
     if (!open) return;
@@ -308,6 +368,24 @@ export const WorkspaceKitsPanel: React.FC<Props> = ({ sessionId, open, onClose }
     setInputs(defaultInputsOf(selected));
   }, [selectedId]); // eslint-disable-line react-hooks/exhaustive-deps
 
+  const showGeneration = () => {
+    if (!generationJob) return;
+    setDraft(draftFromGenerationJob(generationJob));
+    setGenerationEditorJobId(generationJob.id);
+    setSelectedId(generationJob.request.existingKit?.id || '');
+    setDetailOpen(true);
+    setView('kits');
+  };
+
+  const cancelGeneration = async () => {
+    if (!generationJob || !isActiveGeneration(generationJob)) return;
+    const result = await api.kitGenerateCancel(sessionId, generationJob.id);
+    if (result.job) acceptGenerationJob(result.job);
+    if (result.status !== 'ok') {
+      setNotice({ kind: 'error', text: result.message || '停止 Kit 生成失败' });
+    }
+  };
+
   if (!open) return null;
 
   const saveDraft = async () => {
@@ -324,6 +402,7 @@ export const WorkspaceKitsPanel: React.FC<Props> = ({ sessionId, open, onClose }
     }
     if (result.kit) setSelectedId(result.kit.id);
     setDraft(null);
+    setGenerationEditorJobId('');
     setDetailOpen(true);
     setNotice({ kind: 'ok', text: 'Kit 已保存' });
   };
@@ -446,6 +525,32 @@ export const WorkspaceKitsPanel: React.FC<Props> = ({ sessionId, open, onClose }
           }}>{notice.text}</div>
         )}
 
+        {generationJob && (
+          <div style={{
+            padding: '9px 12px', display: 'flex', alignItems: 'center', gap: 10,
+            flexWrap: 'wrap', fontSize: 12,
+            color: generationJob.status === 'error' ? '#ff7b72'
+              : generationJob.status === 'succeeded' ? '#56d364' : '#e3b341',
+            background: generationJob.status === 'error' ? 'rgba(248,81,73,.08)'
+              : generationJob.status === 'succeeded' ? 'rgba(63,185,80,.08)' : 'rgba(210,153,34,.09)',
+            borderBottom: '1px solid var(--theme-border)',
+          }}>
+            <span aria-hidden="true">{isActiveGeneration(generationJob) ? '⏳' : generationJob.status === 'succeeded' ? '✓' : '⚠'}</span>
+            <span style={{ flex: 1, minWidth: 180 }}>
+              <strong>{isActiveGeneration(generationJob) ? '标准 Kit 正在后台生成' : '标准 Kit 生成任务已有结果'}</strong>
+              {' · '}{generationJob.message || generationJob.error || generationJob.status}
+              {generationJob.startedAt && <> · {formatDuration(generationJob.startedAt, generationJob.endedAt, clock)}</>}
+              {isActiveGeneration(generationJob) && <span style={{ color: 'var(--theme-text-muted)' }}> · 可切换 Session，不会中断</span>}
+            </span>
+            <button style={secondaryButton} onClick={showGeneration}>
+              {isActiveGeneration(generationJob) ? '查看进度' : '查看结果'}
+            </button>
+            {isActiveGeneration(generationJob) && (
+              <button style={dangerButton} onClick={() => void cancelGeneration()}>■ 停止</button>
+            )}
+          </div>
+        )}
+
         {view === 'data' ? (
           <DataMarket state={state} />
         ) : !detailOpen && !draft ? (
@@ -455,7 +560,9 @@ export const WorkspaceKitsPanel: React.FC<Props> = ({ sessionId, open, onClose }
                 <div style={sectionTitle}>Kits</div>
                 <div style={subtleStyle}>直接运行；需要输入或审计实现时再展开详情。</div>
               </div>
-              <button style={primaryButton} onClick={() => { setDraft(newDraft()); setDetailOpen(true); }}>
+              <button style={primaryButton} onClick={() => {
+                setGenerationEditorJobId(''); setDraft(newDraft()); setDetailOpen(true);
+              }}>
                 ＋ 新建 Kit
               </button>
             </div>
@@ -528,7 +635,7 @@ export const WorkspaceKitsPanel: React.FC<Props> = ({ sessionId, open, onClose }
             <aside style={sidebarStyle}>
               <button
                 style={{ ...primaryButton, width: '100%', marginBottom: 10 }}
-                onClick={() => { setDraft(newDraft()); setDetailOpen(true); }}
+                onClick={() => { setGenerationEditorJobId(''); setDraft(newDraft()); setDetailOpen(true); }}
               >＋ 新建 Kit</button>
               {state.kits.length === 0 && (
                 <div style={{ ...subtleStyle, padding: '18px 8px', textAlign: 'center' }}>
@@ -568,7 +675,10 @@ export const WorkspaceKitsPanel: React.FC<Props> = ({ sessionId, open, onClose }
             <main style={mainStyle}>
               {draft ? (
                 <KitEditor sessionId={sessionId} draft={draft} onChange={setDraft} onSave={saveDraft}
-                  onCancel={() => setDraft(null)} busy={busy} />
+                  onCancel={() => { setDraft(null); setGenerationEditorJobId(''); }} busy={busy}
+                  generationJob={generationJob?.id === generationEditorJobId ? generationJob : null}
+                  onGenerationJob={(job) => { acceptGenerationJob(job); setGenerationEditorJobId(job.id); }}
+                  onCancelGeneration={cancelGeneration} now={clock} />
               ) : selected ? (
                 <KitDetail
                   sessionId={sessionId}
@@ -579,7 +689,7 @@ export const WorkspaceKitsPanel: React.FC<Props> = ({ sessionId, open, onClose }
                   onInputsChange={setInputs}
                   onRun={() => runKit(selected, inputs)}
                   onCancel={(runId) => void cancelRun(runId)}
-                  onEdit={() => setDraft({ ...selected })}
+                  onEdit={() => { setGenerationEditorJobId(''); setDraft({ ...selected }); }}
                   onDelete={deleteKit}
                   onToggleEnabled={() => api.kitUpdate(sessionId, selected.id, { enabled: !selected.enabled })}
                   onControlMode={(mode) => api.kitSetControlMode(sessionId, selected.id, mode)}
@@ -620,16 +730,27 @@ const KitEditor: React.FC<{
   onSave: () => void;
   onCancel: () => void;
   busy: boolean;
-}> = ({ sessionId, draft, onChange, onSave, onCancel, busy }) => {
-  const [generating, setGenerating] = useState(false);
+  generationJob: KitGenerationJob | null;
+  onGenerationJob: (job: KitGenerationJob) => void;
+  onCancelGeneration: () => Promise<void>;
+  now: number;
+}> = ({
+  sessionId, draft, onChange, onSave, onCancel, busy,
+  generationJob, onGenerationJob, onCancelGeneration, now,
+}) => {
+  const [submittingGeneration, setSubmittingGeneration] = useState(false);
   const [advancedOpen, setAdvancedOpen] = useState(false);
-  const [generation, setGeneration] = useState<KitGenerationResult | null>(null);
+  const [generation, setGeneration] = useState<KitGenerationResult | null>(generationJob?.result || null);
+  const appliedGenerationRef = useRef('');
   const [clientSources, setClientSources] = useState<string[]>(() => (
-    draft.steps
+    generationJob?.request.clientSources?.length
+      ? generationJob.request.clientSources
+      : draft.steps
       .filter((step) => step.type === 'file_push')
       .map((step) => String(step.config?.source || ''))
       .filter((source) => source && !source.includes('{{'))
   ));
+  const generating = submittingGeneration || isActiveGeneration(generationJob);
   const patch = (value: Partial<Draft>) => onChange({ ...draft, ...value });
   const setInputs = (inputs: KitInputSpec[]) => patch({ inputs });
   const setAssertions = (assertions: KitAssertionSpec[]) => patch({ assertions });
@@ -643,6 +764,31 @@ const KitEditor: React.FC<{
         .filter((source) => source && !source.includes('{{')),
     );
   }, [draft.id]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  useEffect(() => {
+    if (!generationJob) return;
+    if (generationJob.request.clientSources?.length) {
+      setClientSources(generationJob.request.clientSources);
+    }
+    if (isActiveGeneration(generationJob)) {
+      setGeneration(null);
+      return;
+    }
+    if (!generationJob.result || appliedGenerationRef.current === generationJob.id) return;
+    appliedGenerationRef.current = generationJob.id;
+    const result = generationJob.result;
+    setGeneration(result);
+    if (result.kit) {
+      const {
+        lastRunId: _lastRunId,
+        createdAt: _createdAt,
+        updatedAt: _updatedAt,
+        ...compiled
+      } = result.kit;
+      onChange({ ...compiled, id: generationJob.request.existingKit?.id });
+    }
+    if (result.status !== 'ok') setAdvancedOpen(!!result.kit);
+  }, [generationJob?.id, generationJob?.status, generationJob?.updatedAt]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const addClientSource = async () => {
     try {
@@ -658,10 +804,10 @@ const KitEditor: React.FC<{
 
   const compileWithAi = async () => {
     if (!draft.objective.trim() || !draft.successCriteria.trim()) return;
-    setGenerating(true);
+    setSubmittingGeneration(true);
     setGeneration(null);
     try {
-      const result = await api.kitGenerate(sessionId, {
+      const result = await api.kitGenerateStart(sessionId, {
         objective: draft.objective,
         successCriteria: draft.successCriteria,
         safetyConstraints: draft.safetyConstraints,
@@ -669,16 +815,18 @@ const KitEditor: React.FC<{
         clientSources,
         existingKit: draft.id ? draft : undefined,
       });
-      setGeneration(result);
-      if (result.kit) {
-        const { lastRunId: _lastRunId, createdAt: _createdAt, updatedAt: _updatedAt, ...compiled } = result.kit;
-        onChange({ ...compiled, id: draft.id });
+      if (result.status !== 'ok' || !result.job) {
+        setGeneration({
+          status: 'error', ready: false,
+          message: result.message || '无法启动后台 AI Kit 编译',
+        });
+        return;
       }
-      if (result.status !== 'ok') setAdvancedOpen(!!result.kit);
+      onGenerationJob(result.job);
     } catch (error) {
       setGeneration({ status: 'error', ready: false, message: error instanceof Error ? error.message : 'AI Kit 编译失败' });
     } finally {
-      setGenerating(false);
+      setSubmittingGeneration(false);
     }
   };
 
@@ -750,6 +898,33 @@ const KitEditor: React.FC<{
         </button>
         <span style={subtleStyle}>生成阶段不保存、不执行任务；先给你审核。</span>
       </div>
+
+      {generationJob && isActiveGeneration(generationJob) && (
+        <section style={{ ...cardStyle, borderColor: 'rgba(210,153,34,.55)', background: 'rgba(210,153,34,.06)' }}>
+          <div style={{ ...cardTitle, color: '#e3b341', display: 'flex', alignItems: 'center', gap: 8 }}>
+            <span>⏳ AI 正在后台编译</span>
+            <span style={statusPill}>{formatDuration(generationJob.startedAt || generationJob.createdAt, null, now)}</span>
+          </div>
+          <div style={{ fontSize: 12.5, lineHeight: 1.6 }}>{generationJob.message || '正在准备…'}</div>
+          <div style={{ ...subtleStyle, marginTop: 6 }}>
+            任务运行在 Session 所属执行端；可以关闭面板或切换到其他 Session，生成不会中断。
+          </div>
+          <button style={{ ...dangerButton, marginTop: 10 }} onClick={() => void onCancelGeneration()}>
+            ■ 停止生成
+          </button>
+        </section>
+      )}
+
+      {generationJob && !isActiveGeneration(generationJob) && !generationJob.result && (
+        <section style={{ ...cardStyle, borderColor: 'rgba(248,81,73,.45)' }}>
+          <div style={{ ...cardTitle, color: generationJob.status === 'cancelled' ? '#8b949e' : '#ff7b72' }}>
+            {generationJob.status === 'cancelled' ? '后台生成已停止' : '后台生成失败'}
+          </div>
+          <div style={{ fontSize: 12, lineHeight: 1.55 }}>
+            {generationJob.error || generationJob.message || '没有生成可审核的 Kit 预览'}
+          </div>
+        </section>
+      )}
 
       {generation && (
         <section style={{ ...cardStyle, borderColor: generation.ready ? 'rgba(63,185,80,.45)' : 'rgba(210,153,34,.55)' }}>

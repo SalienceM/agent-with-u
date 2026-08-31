@@ -25,6 +25,7 @@
     "src/utils/markdown.ts",
     "src/utils/messageRedo.ts",
     "src/utils/promptReferences.ts",
+    "src/utils/scratchPad.ts",
     "src/utils/sha256.ts",
     "src/utils/clientAppearance.ts",
     "src/utils/backendManagement.ts"

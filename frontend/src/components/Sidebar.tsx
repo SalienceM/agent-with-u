@@ -533,6 +533,25 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
           top: 0; right: 0; bottom: 0; left: 0;
           pointer-events: none;
         }
+        .awu-session-group-toggle {
+          position: relative;
+          background: transparent !important;
+          border-color: transparent !important;
+        }
+        .awu-session-group-toggle[data-collapsed="true"] {
+          background: var(--theme-bg-secondary, rgba(255,255,255,.035)) !important;
+          border-color: var(--theme-border, rgba(127,127,127,.14)) !important;
+          box-shadow: 0 1px 0 rgba(0,0,0,.05);
+        }
+        .awu-session-group-toggle:hover {
+          filter: none !important;
+          background: var(--theme-bg-secondary, rgba(255,255,255,.045)) !important;
+          border-color: var(--theme-border, rgba(127,127,127,.2)) !important;
+        }
+        .awu-session-group-toggle:focus-visible {
+          outline: 2px solid var(--theme-accent, #7aa2f7);
+          outline-offset: 1px;
+        }
       `}</style>
       <div style={{ display: 'flex', alignItems: 'center', gap: 5, padding: '10px 10px 7px' }}>
         <button
@@ -597,34 +616,84 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
       ) : (
       <div style={{ flex: 1, overflow: 'auto', padding: '4px 7px 10px' }}>
         {groups.map(group => {
-          const isCollapsed = collapsedGroups.has(group.key);
           // 多组时显示组头；单组（仅本机）不显示
           const isPinnedGroup = group.key === '__pinned__';
           const showGroupHeader = groups.length > 1 || isPinnedGroup;
+          // 只有标题可见时才允许折叠，避免分组数量变化后留下一个无法展开的隐藏组。
+          const isCollapsed = showGroupHeader && collapsedGroups.has(group.key);
+          const groupTone = isPinnedGroup
+            ? { accent: '#d9ad45', iconBackground: 'rgba(217,173,69,.13)' }
+            : { accent: 'var(--theme-accent, #7aa2f7)', iconBackground: 'var(--theme-accent-bg, rgba(122,162,247,.13))' };
+          const groupLabel = isPinnedGroup
+            ? '收藏'
+            : group.isLocal
+              ? (isTauri() ? '本机' : '当前 Web 节点')
+              : group.label;
+          const groupDescription = isPinnedGroup
+            ? '置顶会话'
+            : group.isLocal
+              ? '此设备执行'
+              : '远程执行节点';
           return (
-            <div key={group.key}>
+            <section key={group.key} style={groupSectionStyle}>
               {showGroupHeader && (
-                <div
+                <button
+                  type="button"
                   onClick={() => toggleGroup(group.key)}
-                  style={groupHeaderStyle}
-                  title={isPinnedGroup
-                    ? '收藏并置顶的会话'
-                    : group.isLocal
-                      ? (isTauri() ? '本机执行' : '当前 Web 节点执行')
-                      : `执行节点：${group.label}`}
+                  className="awu-session-group-toggle"
+                  data-collapsed={isCollapsed ? 'true' : 'false'}
+                  style={{
+                    ...groupHeaderStyle,
+                  }}
+                  title={`${isCollapsed ? '展开' : '收起'}${isPinnedGroup ? '收藏会话' : groupDescription}`}
+                  aria-expanded={!isCollapsed}
                 >
-                  <span style={{ fontSize: 10, width: 12, textAlign: 'center', flexShrink: 0 }}>{isCollapsed ? '▸' : '▾'}</span>
-                  <span style={{ fontSize: 11, fontWeight: 600 }}>
-                    {isPinnedGroup
-                      ? '★ 收藏'
-                      : group.isLocal
-                        ? (isTauri() ? '🏠 本机' : '🖥️ 当前 Web 节点')
-                        : `🌐 ${group.label}`}
+                  <span style={{
+                    ...groupIconStyle,
+                    color: groupTone.accent,
+                    background: groupTone.iconBackground,
+                  }} aria-hidden="true">
+                    {isPinnedGroup ? (
+                      <svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor">
+                        <path d="m12 2.8 2.72 5.52 6.09.88-4.4 4.29 1.04 6.06L12 16.68l-5.45 2.87 1.04-6.06-4.4-4.29 6.09-.88L12 2.8Z" />
+                      </svg>
+                    ) : group.isLocal ? (
+                      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                        {isTauri()
+                          ? <><path d="m4.5 11 7.5-6.5 7.5 6.5" /><path d="M6.5 10v9h11v-9" /><path d="M10 19v-5h4v5" /></>
+                          : <><rect x="4" y="5" width="16" height="11" rx="2" /><path d="M9 20h6M12 16v4" /></>}
+                      </svg>
+                    ) : (
+                      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                        <circle cx="12" cy="6" r="2.5" /><circle cx="6" cy="17" r="2.5" /><circle cx="18" cy="17" r="2.5" /><path d="M12 8.5v3M6 14.5v-3h12v3" />
+                      </svg>
+                    )}
                   </span>
-                  <span style={{ fontSize: 10, color: 'var(--theme-text-muted)', marginLeft: 'auto' }}>{group.sessions.length}</span>
-                </div>
+                  <span style={groupTitleWrapStyle}>
+                    <span style={groupTitleStyle}>{groupLabel}</span>
+                    <span style={groupDescriptionStyle}>{groupDescription}</span>
+                  </span>
+                  <span style={groupCountStyle}>{group.sessions.length}</span>
+                  <span style={groupChevronStyle} aria-hidden="true">
+                    <svg
+                      width="14"
+                      height="14"
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      strokeWidth="2"
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                      style={{ transform: isCollapsed ? 'rotate(-90deg)' : 'rotate(0deg)', transition: 'transform .18s ease' }}
+                    >
+                      <path d="m7 9 5 5 5-5" />
+                    </svg>
+                  </span>
+                </button>
               )}
-              {!isCollapsed && group.sessions.map((s: Session) => {
+              {!isCollapsed && (
+                <div style={showGroupHeader ? groupSessionsStyle : undefined}>
+                {group.sessions.map((s: Session) => {
                 const isRunning = streamingSessions.has(s.id);
                 const isCompleted = !isRunning && completedSessions.has(s.id);
                 const isActive = s.id === activeSessionId;
@@ -741,7 +810,9 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
                 </div>
               );
               })}
-            </div>
+                </div>
+              )}
+            </section>
           );
         })}
         {sessions.length === 0 && (
@@ -1355,19 +1426,90 @@ const completedDotStyle: React.CSSProperties = {
   flexShrink: 0,
 };
 
+const groupSectionStyle: React.CSSProperties = {
+  margin: '2px 0 5px',
+};
+
 const groupHeaderStyle: React.CSSProperties = {
+  width: '100%',
+  minHeight: 44,
   display: 'flex',
   alignItems: 'center',
-  gap: 6,
-  padding: '6px 8px',
-  borderRadius: 4,
+  gap: 9,
+  padding: '5px 7px 5px 6px',
+  borderRadius: 8,
+  border: '1px solid transparent',
   cursor: 'pointer',
-  color: 'var(--theme-text-muted, #656d76)',
+  color: 'var(--theme-text, #e2e3ea)',
   background: 'transparent',
-  marginBottom: 4,
-  marginTop: 6,
+  fontFamily: 'inherit',
+  textAlign: 'left',
   userSelect: 'none',
-  fontSize: 11,
+  transition: 'background .15s ease, border-color .15s ease, box-shadow .15s ease',
+};
+
+const groupChevronStyle: React.CSSProperties = {
+  width: 20,
+  height: 24,
+  flexShrink: 0,
+  display: 'flex',
+  alignItems: 'center',
+  justifyContent: 'center',
+  color: 'var(--theme-text-muted, #656d76)',
+};
+
+const groupIconStyle: React.CSSProperties = {
+  width: 28,
+  height: 28,
+  flexShrink: 0,
+  display: 'inline-flex',
+  alignItems: 'center',
+  justifyContent: 'center',
+  borderRadius: 8,
+};
+
+const groupTitleWrapStyle: React.CSSProperties = {
+  minWidth: 0,
+  flex: 1,
+  display: 'flex',
+  flexDirection: 'column',
+  gap: 1,
+};
+
+const groupTitleStyle: React.CSSProperties = {
+  overflow: 'hidden',
+  textOverflow: 'ellipsis',
+  whiteSpace: 'nowrap',
+  color: 'var(--theme-text, #e2e3ea)',
+  fontSize: 12.5,
+  fontWeight: 650,
+  lineHeight: 1.2,
+};
+
+const groupDescriptionStyle: React.CSSProperties = {
+  overflow: 'hidden',
+  textOverflow: 'ellipsis',
+  whiteSpace: 'nowrap',
+  color: 'var(--theme-text-muted, #656d76)',
+  fontSize: 9.5,
+  lineHeight: 1.15,
+};
+
+const groupCountStyle: React.CSSProperties = {
+  minWidth: 18,
+  padding: '0 2px',
+  flexShrink: 0,
+  textAlign: 'right',
+  color: 'var(--theme-text-muted, #656d76)',
+  fontSize: 10,
+  fontWeight: 600,
+  fontVariantNumeric: 'tabular-nums',
+};
+
+const groupSessionsStyle: React.CSSProperties = {
+  margin: '2px 0 7px 20px',
+  paddingLeft: 8,
+  borderLeft: '1px solid var(--theme-border, rgba(127,127,127,.16))',
 };
 
 const showMoreBtnStyle: React.CSSProperties = {
