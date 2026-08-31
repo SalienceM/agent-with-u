@@ -41,6 +41,7 @@ pydantic-settings==2.14.1
 PyJWT==2.12.1
 python-multipart==0.0.28
 PyYAML==6.0.3
+qwen-code-sdk==0.1.0rc0
 referencing==0.37.0
 requests==2.34.2
 rpds-py==0.30.0

@@ -270,16 +270,29 @@ class RelayRuntimeManager:
         env_url = str(initial_url or "").strip()
         env_token = str(initial_token or "").strip()
         saved = self._load_saved()
-        # 明确的启动参数/环境变量优先，保持桌面端“角色切换后重启”的既有语义；
-        # 没有启动配置时再使用 Web UI 保存的节点配置。
+        # 明确的启动参数/环境变量优先。Docker Compose 可能只保留 URL、而 Token
+        # 来自 Web UI；不能因为一个不完整的环境变量就丢掉持久卷中的另一半配置。
+        # 只有 URL 与已保存 URL 相同才复用旧 Token，避免把 Token 误发给新 Relay。
         if env_url or env_token:
+            saved_url = str((saved or {}).get("url") or "").strip()
+            saved_token = str((saved or {}).get("token") or "").strip()
+            resolved_url = env_url or saved_url
+            same_saved_relay = bool(saved_url and resolved_url == saved_url)
+            resolved_token = env_token or (saved_token if same_saved_relay else "")
+            used_saved = bool(
+                (not env_url and resolved_url)
+                or (not env_token and resolved_token)
+            )
             self._config = {
-                "enabled": bool(env_url),
-                "url": env_url,
-                "token": env_token,
-                "deviceName": self._default_device_name,
+                "enabled": bool(resolved_url),
+                "url": resolved_url,
+                "token": resolved_token,
+                "deviceName": str(
+                    ((saved or {}).get("deviceName") if same_saved_relay else "")
+                    or self._default_device_name
+                ).strip()[:128],
             }
-            self._source = "environment"
+            self._source = "environment+saved" if used_saved else "environment"
         elif saved:
             self._config = saved
             self._source = "saved"
@@ -291,6 +304,20 @@ class RelayRuntimeManager:
                 "deviceName": self._default_device_name,
             }
             self._source = "default"
+
+        # 环境变量提供的 Relay 配置过去只存在于当前容器。在线升级器重建容器
+        # 后这些变量若未被 Compose 再次注入，节点就会掉出纳管。有效配置立即写入
+        # /app/data/relay-node.json，后续可从持久卷自动恢复。
+        if (
+            self._config.get("enabled")
+            and self._config.get("url")
+            and self._config.get("token")
+        ):
+            try:
+                self._validate_url(str(self._config["url"]))
+                self._persist()
+            except (OSError, ValueError) as error:
+                _log(f"cannot persist effective Relay node configuration: {error}")
 
     @staticmethod
     def _validate_url(value: str) -> str:
@@ -323,6 +350,7 @@ class RelayRuntimeManager:
             "enabled": bool(self._config.get("enabled")),
             "url": str(self._config.get("url") or ""),
             "token": str(self._config.get("token") or ""),
+            "deviceId": self._device_id,
             "deviceName": str(self._config.get("deviceName") or ""),
             "updatedAt": int(time.time()),
         }

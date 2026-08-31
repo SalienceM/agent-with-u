@@ -42,6 +42,7 @@ services:
         AGENT_WITH_U_VERSION: "${AGENT_WITH_U_VERSION-dev}"
     image: agent-with-u-backend:latest
     container_name: awu-backend
+    hostname: awu-backend
     restart: unless-stopped
 
     environment:
@@ -134,6 +135,12 @@ services:
       AGENT_WITH_U_NO_PROXY: "${AGENT_WITH_U_NO_PROXY-localhost,127.0.0.1,::1,awu-backend,awu-web,awu-updater}"
       AGENTWITHU_CODEX_PROXY_MODE: "${AGENTWITHU_CODEX_PROXY_MODE-custom}"
       AGENTWITHU_CODEX_FORCE_HTTP: "${AGENTWITHU_CODEX_FORCE_HTTP-1}"
+      # updater 会再次执行 docker compose；把首次部署时解析出的 Relay 身份
+      # 留在 updater 环境中，避免重建 backend 时四个变量被展开为空。
+      AGENT_WITH_U_RELAY_URL: "${AGENT_WITH_U_RELAY_URL-}"
+      AGENT_WITH_U_RELAY_TOKEN: "${AGENT_WITH_U_RELAY_TOKEN-}"
+      AGENT_WITH_U_DEVICE_ID: "${AGENT_WITH_U_DEVICE_ID-}"
+      AGENT_WITH_U_DEVICE_NAME: "${AGENT_WITH_U_DEVICE_NAME-}"
     volumes:
       - /volume1/docker/agent-with-u/data:/app/data
       - /var/run/docker.sock:/var/run/docker.sock

@@ -23,7 +23,7 @@ bundle="dist/agent-with-u-docker-linux-$arch.tar"
 mkdir -p dist
 rm -f "$bundle"
 
-echo "[Docker] Building backend/web images (Codex included)..."
+echo "[Docker] Building backend/web images (Codex + Qwen included)..."
 docker compose -f deploy/docker-compose.example.yml build awu-backend awu-web
 echo "[Docker] Exporting online-update bundle: $bundle"
 docker image save --output "$bundle" agent-with-u-backend:latest agent-with-u-web:latest

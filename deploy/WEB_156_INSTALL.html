@@ -391,10 +391,12 @@ awu-updater   Up</code></pre>
 <span class="hljs-built_in">sudo</span> docker compose -f deploy/docker-compose.example.yml up -d --no-build</code></pre>
 <blockquote class="md-blockquote"><p>不要执行 <code class="md-code-inline">docker compose down -v</code>。虽然当前核心数据使用宿主机目录挂载，但生产环境仍不应养成删除卷的操作习惯。</p>
 </blockquote>
-<h2 class="md-h2">八、Codex、运行代理与在线升级验证</h2>
-<p>Backend 镜像默认安装官方 Codex CLI 和 Claude CLI。首次重建后检查：</p>
+<h2 class="md-h2">八、Codex、Qwen SDK、运行代理与在线升级验证</h2>
+<p>Backend 镜像默认安装官方 Codex CLI、Claude CLI，以及 Qwen Code CLI + <code class="md-code-inline">qwen-code-sdk</code>。首次重建后检查：</p>
 <pre class="md-pre"><code class="hljs"><div class="md-code-lang">bash</div><span class="hljs-built_in">sudo</span> docker <span class="hljs-built_in">exec</span> awu-backend codex --version
 <span class="hljs-built_in">sudo</span> docker <span class="hljs-built_in">exec</span> awu-backend claude --version
+<span class="hljs-built_in">sudo</span> docker <span class="hljs-built_in">exec</span> awu-backend qwen --version
+<span class="hljs-built_in">sudo</span> docker <span class="hljs-built_in">exec</span> awu-backend python -c <span class="hljs-string">&#x27;import qwen_code_sdk; print(&quot;qwen-code-sdk OK&quot;)&#x27;</span>
 <span class="hljs-built_in">sudo</span> docker <span class="hljs-built_in">exec</span> awu-backend sh -lc <span class="hljs-string">&#x27;printf &quot;%s\n&quot; &quot;$HTTPS_PROXY&quot; &quot;$AGENTWITHU_CODEX_PROXY&quot;&#x27;</span>
 <span class="hljs-built_in">sudo</span> docker compose -f deploy/docker-compose.example.yml logs --<span class="hljs-built_in">tail</span>=30 awu-updater</code></pre>
 <p>如使用 Codex 账号登录，执行一次：</p>
@@ -403,7 +405,7 @@ awu-updater   Up</code></pre>
 <p>构建发布包时，Windows 的 <code class="md-code-inline">build_all.bat</code> 或 Linux 的 <code class="md-code-inline">build_web_linux.sh</code> 会在 Docker Engine 可用时额外生成：</p>
 <pre class="md-pre"><code class="hljs"><div class="md-code-lang">text</div>dist/agent-with-u-docker-linux-x86_64.tar</code></pre>
 <p>发布中心会自动把它识别为 <code class="md-code-inline">target=docker / kind=docker-bundle</code>。发布后，在“设置 → 数据与系统 → 节点在线更新”中，Docker 节点应显示“Docker · 升级器在线”；点击“一键更新”后由节点下载和校验镜像包，<code class="md-code-inline">awu-updater</code> 保存旧镜像、加载新镜像、重建 Backend/Web 并做健康检查，失败会恢复旧镜像。</p>
-<p>旧 Docker 部署必须按本文第四、第五步<strong>手动重建这一次</strong>，让 Codex、代理环境和 <code class="md-code-inline">awu-updater</code> 进入部署；此后应用版本才可从 UI 在线升级。若不想在某次 Windows 打包中生成较大的 Docker 包，可在运行 BAT 前设置 <code class="md-code-inline">AGENT_WITH_U_SKIP_DOCKER_RELEASE=1</code>。</p>
+<p>旧 Docker 部署必须按本文第四、第五步<strong>手动重建这一次</strong>，让 Codex、Qwen SDK、代理环境和 <code class="md-code-inline">awu-updater</code> 进入部署；此后应用版本才可从 UI 在线升级。若不想在某次 Windows 打包中生成较大的 Docker 包，可在运行 BAT 前设置 <code class="md-code-inline">AGENT_WITH_U_SKIP_DOCKER_RELEASE=1</code>。</p>
 <h2 class="md-h2">九、NPM / Authelia 反向代理</h2>
 <p>如果外层使用 Nginx Proxy Manager：</p>
 <ol>
@@ -437,6 +439,7 @@ curl -x <span class="hljs-string">&quot;<span class="hljs-variable">$PROXY</span
 <p>构建参数主要影响 Dockerfile 内的 <code class="md-code-inline">RUN</code> 命令；Docker 守护进程拉取 <code class="md-code-inline">FROM</code> 基础镜像时，不一定使用这些构建参数。</p>
 <p>当前构建需要以下基础镜像：</p>
 <pre class="md-pre"><code class="hljs"><div class="md-code-lang">text</div>python:3.11-slim
+node:20-bookworm-slim
 node:20-alpine
 nginx:alpine</code></pre>
 <p>如果基础镜像拉取持续超时，需要为 Docker 守护进程 / 群晖 Container Manager 配置代理或镜像加速，之后再重新构建。</p>

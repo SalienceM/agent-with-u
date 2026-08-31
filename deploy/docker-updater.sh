@@ -82,7 +82,36 @@ write_result() {
   mv -f "$temp" "$RESULT_PATH"
 }
 
+container_env_value() {
+  variable_name="$1"
+  docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' \
+    "$BACKEND_CONTAINER" 2>/dev/null \
+    | awk -v prefix="$variable_name=" \
+      'index($0, prefix) == 1 { print substr($0, length(prefix) + 1); exit }'
+}
+
+preserve_relay_environment() {
+  # `docker compose` 在 updater 容器内重新解析变量。用户首次部署时从终端
+  # 注入的 Relay 变量并不会天然存在于 updater 中，因此重建会把它们展开为空。
+  # 在旧 backend 消失前读取其实际环境并导出；值（尤其 Token）绝不写日志。
+  for variable_name in \
+    AGENT_WITH_U_RELAY_URL \
+    AGENT_WITH_U_RELAY_TOKEN \
+    AGENT_WITH_U_DEVICE_ID \
+    AGENT_WITH_U_DEVICE_NAME
+  do
+    current_value="$(printenv "$variable_name" 2>/dev/null || true)"
+    if [ -z "$current_value" ]; then
+      current_value="$(container_env_value "$variable_name")"
+      if [ -n "$current_value" ]; then
+        export "$variable_name=$current_value"
+      fi
+    fi
+  done
+}
+
 compose_up() {
+  preserve_relay_environment
   compose_project="$PROJECT_NAME"
   if [ -z "$compose_project" ]; then
     compose_project="$(docker inspect --format '{{index .Config.Labels "com.docker.compose.project"}}' "$BACKEND_CONTAINER" 2>/dev/null || true)"

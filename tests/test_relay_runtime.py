@@ -1,8 +1,11 @@
 import asyncio
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
 
 from src.backend.bridge_ws import (
     BridgeWS,
@@ -10,6 +13,7 @@ from src.backend.bridge_ws import (
     _REQUEST_IDENTITY_SOURCE,
 )
 from src.backend.relay import RelayRuntimeManager
+from src.ws_main import resolve_device_identity
 
 
 class _FakeRelayLink:
@@ -78,6 +82,7 @@ class RelayRuntimeManagerTests(unittest.IsolatedAsyncioTestCase):
         on_disk = json.loads(self.config_path.read_text(encoding="utf-8"))
         self.assertEqual("relay-master-secret", on_disk["token"])
         self.assertEqual("wss://relay.example.test/ws", on_disk["url"])
+        self.assertEqual("web-node-1", on_disk["deviceId"])
 
         await self.manager.stop()
         reloaded = RelayRuntimeManager(
@@ -153,6 +158,137 @@ class RelayRuntimeManagerTests(unittest.IsolatedAsyncioTestCase):
                 "token": "",
             })
         self.assertFalse(self.config_path.exists())
+
+    async def test_environment_registration_is_saved_for_the_next_container(self):
+        config_path = Path(self.temporary.name) / "environment-relay.json"
+        manager = RelayRuntimeManager(
+            object(),
+            device_id="docker-stable-id",
+            device_name="Docker executor",
+            initial_url="wss://relay.example.test/ws",
+            initial_token="environment-secret",
+            config_path=config_path,
+            link_factory=_FakeRelayLink,
+        )
+        try:
+            persisted = json.loads(config_path.read_text(encoding="utf-8"))
+            self.assertEqual("environment-secret", persisted["token"])
+            self.assertEqual("docker-stable-id", persisted["deviceId"])
+            self.assertEqual("environment", manager.status()["source"])
+        finally:
+            await manager.stop()
+
+        recreated = RelayRuntimeManager(
+            object(),
+            device_id="docker-stable-id",
+            device_name="Docker executor",
+            config_path=config_path,
+            link_factory=_FakeRelayLink,
+        )
+        try:
+            self.assertEqual("saved", recreated.status()["source"])
+            self.assertTrue(recreated.status()["hasToken"])
+            await recreated.start()
+            await asyncio.sleep(0)
+            self.assertTrue(recreated.status()["connected"])
+        finally:
+            await recreated.stop()
+
+    async def test_same_environment_url_reuses_saved_token_but_new_url_does_not(self):
+        await self.manager.configure({
+            "enabled": True,
+            "url": "wss://relay.example.test/ws",
+            "token": "saved-secret",
+            "deviceName": "NAS",
+        })
+        await self.manager.stop()
+
+        same_relay = RelayRuntimeManager(
+            object(),
+            device_id="web-node-1",
+            device_name="Docker Web",
+            initial_url="wss://relay.example.test/ws",
+            initial_token="",
+            config_path=self.config_path,
+            link_factory=_FakeRelayLink,
+        )
+        try:
+            self.assertEqual("environment+saved", same_relay.status()["source"])
+            self.assertTrue(same_relay.status()["hasToken"])
+        finally:
+            await same_relay.stop()
+
+        different_relay = RelayRuntimeManager(
+            object(),
+            device_id="web-node-1",
+            device_name="Docker Web",
+            initial_url="wss://other-relay.example.test/ws",
+            initial_token="",
+            config_path=self.config_path,
+            link_factory=_FakeRelayLink,
+        )
+        try:
+            self.assertFalse(different_relay.status()["hasToken"])
+            await different_relay.start()
+            self.assertIn("Token", different_relay.status()["lastError"])
+        finally:
+            await different_relay.stop()
+
+
+class DeviceIdentityPersistenceTests(unittest.TestCase):
+    def test_explicit_docker_device_id_is_always_written_to_data_volume(self):
+        with tempfile.TemporaryDirectory() as temporary, mock.patch.dict(
+            os.environ, {"AGENT_WITH_U_DATA_ROOT": temporary}, clear=False,
+        ):
+            device_id, device_name = resolve_device_identity(SimpleNamespace(
+                device_id="nas-docker-node", device_name="NAS Docker",
+            ))
+
+            self.assertEqual("nas-docker-node", device_id)
+            self.assertEqual("NAS Docker", device_name)
+            self.assertEqual(
+                "nas-docker-node",
+                (Path(temporary) / "device-id").read_text(encoding="utf-8").strip(),
+            )
+
+    def test_missing_device_file_recovers_identity_from_relay_config(self):
+        with tempfile.TemporaryDirectory() as temporary, mock.patch.dict(
+            os.environ, {"AGENT_WITH_U_DATA_ROOT": temporary}, clear=False,
+        ):
+            root = Path(temporary)
+            (root / "relay-node.json").write_text(json.dumps({
+                "schemaVersion": 1,
+                "enabled": True,
+                "deviceId": "recovered-relay-node",
+                "deviceName": "NAS",
+            }), encoding="utf-8")
+
+            device_id, _ = resolve_device_identity(SimpleNamespace(
+                device_id=None, device_name=None,
+            ))
+
+            self.assertEqual("recovered-relay-node", device_id)
+            self.assertEqual(
+                "recovered-relay-node",
+                (root / "device-id").read_text(encoding="utf-8").strip(),
+            )
+
+    def test_docker_updater_and_compose_retain_relay_inputs(self):
+        repository = Path(__file__).resolve().parents[1]
+        compose = (repository / "deploy" / "docker-compose.example.yml").read_text(encoding="utf-8")
+        updater = (repository / "deploy" / "docker-updater.sh").read_text(encoding="utf-8")
+        self.assertIn("hostname: awu-backend", compose)
+        updater_environment = compose.split("  awu-updater:", 1)[1]
+        for name in (
+            "AGENT_WITH_U_RELAY_URL", "AGENT_WITH_U_RELAY_TOKEN",
+            "AGENT_WITH_U_DEVICE_ID", "AGENT_WITH_U_DEVICE_NAME",
+        ):
+            self.assertIn(name, updater_environment)
+            self.assertIn(name, updater)
+        self.assertLess(
+            updater.index("preserve_relay_environment\n"),
+            updater.index("\n    docker compose"),
+        )
 
 
 class RelayNodeRpcAuthorizationTests(unittest.IsolatedAsyncioTestCase):

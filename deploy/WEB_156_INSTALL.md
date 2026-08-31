@@ -341,13 +341,15 @@ sudo docker compose -f deploy/docker-compose.example.yml up -d --no-build
 
 > 不要执行 `docker compose down -v`。虽然当前核心数据使用宿主机目录挂载，但生产环境仍不应养成删除卷的操作习惯。
 
-## 八、Codex、运行代理与在线升级验证
+## 八、Codex、Qwen SDK、运行代理与在线升级验证
 
-Backend 镜像默认安装官方 Codex CLI 和 Claude CLI。首次重建后检查：
+Backend 镜像默认安装官方 Codex CLI、Claude CLI，以及 Qwen Code CLI + `qwen-code-sdk`。首次重建后检查：
 
 ```bash
 sudo docker exec awu-backend codex --version
 sudo docker exec awu-backend claude --version
+sudo docker exec awu-backend qwen --version
+sudo docker exec awu-backend python -c 'import qwen_code_sdk; print("qwen-code-sdk OK")'
 sudo docker exec awu-backend sh -lc 'printf "%s\n" "$HTTPS_PROXY" "$AGENTWITHU_CODEX_PROXY"'
 sudo docker compose -f deploy/docker-compose.example.yml logs --tail=30 awu-updater
 ```
@@ -368,7 +370,7 @@ dist/agent-with-u-docker-linux-x86_64.tar
 
 发布中心会自动把它识别为 `target=docker / kind=docker-bundle`。发布后，在“设置 → 数据与系统 → 节点在线更新”中，Docker 节点应显示“Docker · 升级器在线”；点击“一键更新”后由节点下载和校验镜像包，`awu-updater` 保存旧镜像、加载新镜像、重建 Backend/Web 并做健康检查，失败会恢复旧镜像。
 
-旧 Docker 部署必须按本文第四、第五步**手动重建这一次**，让 Codex、代理环境和 `awu-updater` 进入部署；此后应用版本才可从 UI 在线升级。若不想在某次 Windows 打包中生成较大的 Docker 包，可在运行 BAT 前设置 `AGENT_WITH_U_SKIP_DOCKER_RELEASE=1`。
+旧 Docker 部署必须按本文第四、第五步**手动重建这一次**，让 Codex、Qwen SDK、代理环境和 `awu-updater` 进入部署；此后应用版本才可从 UI 在线升级。若不想在某次 Windows 打包中生成较大的 Docker 包，可在运行 BAT 前设置 `AGENT_WITH_U_SKIP_DOCKER_RELEASE=1`。
 
 ## 九、NPM / Authelia 反向代理
 
@@ -420,6 +422,7 @@ AGENT_WITH_U_TRUST_FORWARD_AUTH: "1"
 
 ```text
 python:3.11-slim
+node:20-bookworm-slim
 node:20-alpine
 nginx:alpine
 ```

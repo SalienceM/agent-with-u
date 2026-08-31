@@ -26,7 +26,7 @@ set "BUNDLE=dist\agent-with-u-docker-linux-%AGENT_WITH_U_DOCKER_ARCH%.tar"
 if not exist dist mkdir dist
 del /q "%BUNDLE%" 2>nul
 
-echo [Docker] Building backend/web images (Codex included)...
+echo [Docker] Building backend/web images (Codex + Qwen included)...
 docker compose -f deploy\docker-compose.example.yml build awu-backend awu-web
 if errorlevel 1 exit /b 1
 

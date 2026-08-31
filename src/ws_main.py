@@ -352,20 +352,54 @@ def resolve_device_identity(args: argparse.Namespace) -> tuple[str, str]:
     import socket
     from .backend import paths
 
+    data_root = paths.data_root()
+    id_file = data_root / "device-id"
+    relay_config_file = data_root / "relay-node.json"
     device_id = (args.device_id or "").strip()
+    persisted_id = ""
     if not device_id:
-        id_file = paths.data_root() / "device-id"
         try:
             if id_file.exists():
-                device_id = id_file.read_text(encoding="utf-8").strip()
-            if not device_id:
-                import uuid
-                device_id = uuid.uuid4().hex[:16]
-                id_file.parent.mkdir(parents=True, exist_ok=True)
-                id_file.write_text(device_id, encoding="utf-8")
-        except Exception:
-            import uuid
-            device_id = device_id or uuid.uuid4().hex[:16]
+                persisted_id = id_file.read_text(encoding="utf-8").strip()
+                device_id = persisted_id
+        except OSError as error:
+            logging.warning("[ws_main] Cannot read persistent device id %s: %s", id_file, error)
+
+    # relay-node.json 与 device-id 位于同一个持久卷。旧部署若曾丢失独立的
+    # device-id，仍可从 Relay 配置中的冗余身份恢复，避免被当成全新节点。
+    if not device_id:
+        try:
+            relay_config = json.loads(relay_config_file.read_text(encoding="utf-8"))
+            if isinstance(relay_config, dict):
+                device_id = str(relay_config.get("deviceId") or "").strip()
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            pass
+
+    if not device_id:
+        import uuid
+        device_id = uuid.uuid4().hex[:16]
+
+    # 显式 AGENT_WITH_U_DEVICE_ID 以前不会落盘；升级器一旦没有再次注入环境变量，
+    # 容器就会生成新 ID。现在无论身份来自环境、旧文件还是恢复路径，都统一写回。
+    if persisted_id != device_id:
+        try:
+            id_file.parent.mkdir(parents=True, exist_ok=True)
+            temporary = id_file.with_suffix(f".tmp.{os.getpid()}.{secrets.token_hex(4)}")
+            temporary.write_text(device_id + "\n", encoding="utf-8")
+            try:
+                temporary.chmod(0o600)
+            except OSError:
+                pass
+            os.replace(temporary, id_file)
+            try:
+                id_file.chmod(0o600)
+            except OSError:
+                pass
+        except OSError as error:
+            logging.warning(
+                "[ws_main] Device id %s is not persistent; Relay management may be lost after restart: %s",
+                device_id, error,
+            )
 
     device_name = (args.device_name or "").strip()
     if not device_name:
