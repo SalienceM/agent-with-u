@@ -287,6 +287,9 @@ class RelayRuntimeManager:
                 "enabled": bool(resolved_url),
                 "url": resolved_url,
                 "token": resolved_token,
+                "agentExecutionEnabled": bool(
+                    (saved or {}).get("agentExecutionEnabled", True)
+                ),
                 "deviceName": str(
                     ((saved or {}).get("deviceName") if same_saved_relay else "")
                     or self._default_device_name
@@ -301,6 +304,7 @@ class RelayRuntimeManager:
                 "enabled": False,
                 "url": "",
                 "token": "",
+                "agentExecutionEnabled": True,
                 "deviceName": self._default_device_name,
             }
             self._source = "default"
@@ -336,6 +340,9 @@ class RelayRuntimeManager:
                 "enabled": bool(raw.get("enabled")),
                 "url": str(raw.get("url") or "").strip(),
                 "token": str(raw.get("token") or "").strip(),
+                "agentExecutionEnabled": bool(
+                    raw.get("agentExecutionEnabled", True)
+                ),
                 "deviceName": str(
                     raw.get("deviceName") or self._default_device_name
                 ).strip()[:128],
@@ -350,6 +357,9 @@ class RelayRuntimeManager:
             "enabled": bool(self._config.get("enabled")),
             "url": str(self._config.get("url") or ""),
             "token": str(self._config.get("token") or ""),
+            "agentExecutionEnabled": bool(
+                self._config.get("agentExecutionEnabled", True)
+            ),
             "deviceId": self._device_id,
             "deviceName": str(self._config.get("deviceName") or ""),
             "updatedAt": int(time.time()),
@@ -374,6 +384,9 @@ class RelayRuntimeManager:
         return {
             "supported": True,
             "enabled": bool(self._config.get("enabled")),
+            "agentExecutionEnabled": bool(
+                self._config.get("agentExecutionEnabled", True)
+            ),
             "connected": bool(link and link.connected),
             "url": str(self._config.get("url") or ""),
             "hasToken": bool(self._config.get("token")),
@@ -436,7 +449,22 @@ class RelayRuntimeManager:
         if not isinstance(config, dict):
             raise ValueError("Relay 节点配置必须是对象")
         async with self._config_lock:
-            enabled = bool(config.get("enabled"))
+            previous_registration = (
+                bool(self._config.get("enabled")),
+                str(self._config.get("url") or ""),
+                str(self._config.get("token") or ""),
+                str(self._config.get("deviceName") or ""),
+            )
+            enabled = (
+                bool(config.get("enabled"))
+                if "enabled" in config
+                else bool(self._config.get("enabled"))
+            )
+            agent_execution_enabled = (
+                bool(config.get("agentExecutionEnabled"))
+                if "agentExecutionEnabled" in config
+                else bool(self._config.get("agentExecutionEnabled", True))
+            )
             url = str(config.get("url") or self._config.get("url") or "").strip()
             supplied_token = str(config.get("token") or "").strip()
             token = supplied_token or str(self._config.get("token") or "").strip()
@@ -452,12 +480,18 @@ class RelayRuntimeManager:
                 "enabled": enabled,
                 "url": url,
                 "token": token,
+                "agentExecutionEnabled": agent_execution_enabled,
                 "deviceName": device_name or self._default_device_name,
             }
             self._source = "saved"
             self._persist()
-            await self._restart_link()
+            registration = (
+                enabled, url, token, self._config["deviceName"],
+            )
+            # 单独切换 Agent 执行资格不应让 Relay 短暂掉线。
+            if registration != previous_registration:
+                await self._restart_link()
             # 给快速可达的 Relay 一个短暂注册窗口；离线 Relay 不阻塞保存，后台继续重试。
-            if self._link is not None:
+            if registration != previous_registration and self._link is not None:
                 await self._link.wait_until_registered(timeout=1.5)
             return self.status()

@@ -4,7 +4,9 @@ import {
   rememberRelayUserProfile,
   isTauri, getDesktopConfig, setDesktopConfig, type DesktopConfig,
   api, type ConnectedClient,
-  getExecutors, addExecRoster, removeExecRoster, onExecStatus, getHomeExecKey,
+  getExecutors, getAssignableExecutors, addExecRoster, removeExecRoster,
+  isLocalAgentExecutionEnabled, setLocalAgentExecutionEnabled,
+  onExecStatus, getHomeExecKey,
   type ExecutorInfo, type RelayUserProfile, type RelayNodeStatus,
 } from '../api';
 import {
@@ -22,7 +24,7 @@ interface ConnectionPanelProps {
  * 视觉上分成两张独立卡片，避免「两段中继地址」让人混淆：
  *
  *   ┌─[ 卡片 A · 当前物理执行端 ]──────  Tauri / Web 均可见
- *   │ 桌面 sidecar 或同源 Web Backend 始终可执行；这里只决定是否发布到 Relay
+ *   │ 控制连接始终保留；可分别决定是否承接 Agent、是否发布到 Relay
  *   │ + 发布到中继的配置（让远程 UI 经中继找到这个节点）
  *   │ + 「正在连接当前节点的 UI」实时列表 + 计数
  *   └─────────────────────────────────
@@ -48,7 +50,7 @@ export const ConnectionPanel: React.FC<ConnectionPanelProps> = ({ onClose }) => 
   const [err, setErr] = useState('');
 
   // 当前物理执行端：Tauri 是本机 sidecar；生产 Web 是提供同源 /ws 的 Backend。
-  // 两者都有自执行能力，executor 角色只决定是否额外发布到 Relay。
+  // 控制连接始终存在；Agent 执行资格与是否额外发布到 Relay 是两个独立开关。
   const tauri = isTauri();
   const [role, setRole] = useState<'executor' | 'client'>('executor');
   const [pubUrl, setPubUrl] = useState('');
@@ -65,11 +67,52 @@ export const ConnectionPanel: React.FC<ConnectionPanelProps> = ({ onClose }) => 
   // ── 可分配执行节点（session 级模式）：默认 + 本机 + 额外节点，新建会话时可选 ──
   const [executors, setExecutors] = useState<ExecutorInfo[]>(() => getExecutors());
   useEffect(() => onExecStatus(() => setExecutors(getExecutors())), []);
+  const assignableExecutors = getAssignableExecutors();
+  const localAgentExecutionEnabled = isLocalAgentExecutionEnabled();
   const localExecutorConnected = executors.some(
     (executor) => executor.key === 'local' && executor.connected,
   );
   // 「加入可分配节点」的就地反馈（成功 / 已是 home / 提示）——避免「点了没反应」。
   const [execMsg, setExecMsg] = useState<{ kind: 'ok' | 'warn'; text: string } | null>(null);
+
+  const updateLocalAgentExecution = useCallback(async (enabled: boolean) => {
+    setBusy(true);
+    setErr('');
+    try {
+      if (!tauri) {
+        if (!relayNode?.supported) {
+          throw new Error('当前 Web Backend 尚未就绪或版本过旧，无法保存全局执行策略');
+        }
+        const status = await api.relayNodeExecutionConfigure(enabled, 'local');
+        setRelayNode(status);
+        setLocalAgentExecutionEnabled(status.agentExecutionEnabled);
+      } else {
+        setLocalAgentExecutionEnabled(enabled);
+      }
+      setExecMsg({
+        kind: 'ok',
+        text: enabled
+          ? `✓ ${tauri ? '本机' : '当前 Web 节点'}已恢复承接新会话。`
+          : `✓ ${tauri ? '本机' : '当前 Web 节点'}已设为控制端专用；管理连接仍保留，但不会承接新会话。`,
+      });
+    } catch (error: any) {
+      setExecMsg({
+        kind: 'warn',
+        text: error?.message || '无法修改当前节点的 Agent 执行资格',
+      });
+    } finally {
+      setBusy(false);
+    }
+  }, [tauri, relayNode?.supported]);
+
+  const removeAssignableExecutor = useCallback((executor: ExecutorInfo) => {
+    if (executor.key === 'local') {
+      void updateLocalAgentExecution(false);
+      return;
+    }
+    removeExecRoster(executor.key);
+    setExecMsg({ kind: 'ok', text: `✓ 已从可分配列表移除「${executor.label}」。` });
+  }, [updateLocalAgentExecution]);
 
   // 把卡片 B 当前填好的中继 + 选中节点加入「可分配执行节点」（不切换默认节点）。
   const addSelectedAsExecutor = useCallback(() => {
@@ -182,6 +225,7 @@ export const ConnectionPanel: React.FC<ConnectionPanelProps> = ({ onClose }) => 
     api.relayNodeStatus('local').then((status) => {
       if (cancelled) return;
       setRelayNode(status);
+      setLocalAgentExecutionEnabled(status.agentExecutionEnabled);
       setRole(status.enabled ? 'executor' : 'client');
       setPubUrl(status.url || '');
       setPubDeviceName(status.deviceName || '');
@@ -199,18 +243,21 @@ export const ConnectionPanel: React.FC<ConnectionPanelProps> = ({ onClose }) => 
   // RelayLink 会在后台自动重连；面板打开期间轻量刷新状态，让“连接中”能自行
   // 变成“已注册”，也能如实显示后来发生的断线，而不要求用户关闭重开面板。
   useEffect(() => {
-    if (tauri || !localExecutorConnected || !relayNode?.enabled) return;
+    if (tauri || !localExecutorConnected || !relayNode?.supported) return;
     let cancelled = false;
     const timer = window.setInterval(() => {
       api.relayNodeStatus('local').then((status) => {
-        if (!cancelled) setRelayNode(status);
+        if (!cancelled) {
+          setRelayNode(status);
+          setLocalAgentExecutionEnabled(status.agentExecutionEnabled);
+        }
       }).catch(() => { /* 权限或瞬时断线由现有状态/连接指示承担 */ });
     }, 2500);
     return () => {
       cancelled = true;
       window.clearInterval(timer);
     };
-  }, [tauri, localExecutorConnected, relayNode?.enabled]);
+  }, [tauri, localExecutorConnected, relayNode?.supported]);
 
   // 卡片 A 描述物理执行端，所以固定查询 local 连接，不能误读当前默认远端节点。
   useEffect(() => {
@@ -262,6 +309,10 @@ export const ConnectionPanel: React.FC<ConnectionPanelProps> = ({ onClose }) => 
   }, [pubUrl]);
 
   const handleSave = useCallback(async () => {
+    if (mode === 'local' && !localAgentExecutionEnabled) {
+      setErr('当前节点已设为控制端专用；请先在卡片 A 恢复 Agent 执行资格，或改选远端节点。');
+      return;
+    }
     let checkedUser: RelayUserProfile | null = null;
     let checkedDevices = devices;
     if (mode === 'relay') {
@@ -379,7 +430,8 @@ export const ConnectionPanel: React.FC<ConnectionPanelProps> = ({ onClose }) => 
     else onClose();
   }, [tauri, role, pubUrl, pubToken, pubDeviceName, savedDesktop, relayNode, relayNodeLoading,
       localExecutorConnected,
-      mode, url, token, deviceId, devices, profiles, activeProfileId, refreshProfiles, onClose]);
+      mode, url, token, deviceId, devices, profiles, activeProfileId, refreshProfiles, onClose,
+      localAgentExecutionEnabled]);
 
   // 卡片 A 已配置好「发布中继」、卡片 B 选了 relay 但还没填地址：提示一键复制
   const canSuggestCopy = role === 'executor' && mode === 'relay'
@@ -402,7 +454,7 @@ export const ConnectionPanel: React.FC<ConnectionPanelProps> = ({ onClose }) => 
           <ul style={{ margin: '4px 0 0 16px', padding: 0 }}>
             <li>
               <b>{tauri ? '本机能力' : '当前 Web 节点'}</b>
-              {' = '}Backend 始终能自执行；可选是否发布给其他客户端
+              {' = '}控制连接始终保留；可分别关闭 Agent 执行、Relay 发布
             </li>
             <li><b>本 UI 连接到</b> = 当前默认查看哪台节点，不等于物理执行端</li>
           </ul>
@@ -413,7 +465,7 @@ export const ConnectionPanel: React.FC<ConnectionPanelProps> = ({ onClose }) => 
             的远端节点会与默认节点和物理本机同时在线,新建会话时可逐会话选择。这样
             「某些会话本机自执行,某些走远端」就成了每会话的选择,而非整窗口的
             系统级开关。 */}
-        {executors.length > 1 && (
+        {assignableExecutors.length > 1 && (
           <div style={cardStyle}>
             <div style={cardTitleStyle}>
               {tauri && <span style={cardBadgeStyle}>★</span>}
@@ -421,7 +473,7 @@ export const ConnectionPanel: React.FC<ConnectionPanelProps> = ({ onClose }) => 
               <span style={cardSubtitleStyle}>新建会话时逐个选择</span>
             </div>
             <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
-              {executors.map((ex) => (
+              {assignableExecutors.map((ex) => (
                 <div key={ex.key} style={execRowStyle}>
                   <span style={{
                     width: 8, height: 8, borderRadius: '50%', flexShrink: 0,
@@ -442,7 +494,7 @@ export const ConnectionPanel: React.FC<ConnectionPanelProps> = ({ onClose }) => 
                   <div style={{ flex: 1 }} />
                   {!ex.isHome && (
                     <button
-                      onClick={() => removeExecRoster(ex.key)}
+                      onClick={() => removeAssignableExecutor(ex)}
                       style={{
                         fontSize: 11, padding: '2px 8px', borderRadius: 6,
                         border: '1px solid var(--theme-border)', background: 'transparent',
@@ -454,6 +506,18 @@ export const ConnectionPanel: React.FC<ConnectionPanelProps> = ({ onClose }) => 
                 </div>
               ))}
             </div>
+          </div>
+        )}
+
+        {execMsg && (
+          <div style={{
+            margin: '-2px 0 10px', fontSize: 11, lineHeight: 1.6,
+            padding: '8px 10px', borderRadius: 6,
+            background: execMsg.kind === 'ok' ? 'rgba(34,197,94,0.12)' : 'rgba(234,179,8,0.12)',
+            border: `1px solid ${execMsg.kind === 'ok' ? 'rgba(34,197,94,0.4)' : 'rgba(234,179,8,0.4)'}`,
+            color: execMsg.kind === 'ok' ? 'var(--theme-success, #2da44e)' : '#b45309',
+          }}>
+            {execMsg.text}
           </div>
         )}
 
@@ -476,13 +540,55 @@ export const ConnectionPanel: React.FC<ConnectionPanelProps> = ({ onClose }) => 
                         节点 ID：<code>{relayNode.deviceId || '读取中'}</code>
                         {' · '}{relayNode.enabled
                           ? (relayNode.connected ? 'Relay 已注册' : 'Relay 正在后台连接')
-                          : '仅当前 Web 自执行'}
+                          : (localAgentExecutionEnabled
+                              ? '未发布 Relay · 允许本机执行'
+                              : '未发布 Relay · 控制端专用')}
                         {relayNode.lastError && <><br/>{relayNode.lastError}</>}
                       </>
                     : (relayNode?.lastError || '当前 Backend 版本不支持在线纳管')}
               </div>
             )}
 
+            <div style={{
+              marginBottom: 10, padding: '9px 10px', borderRadius: 8,
+              border: '1px solid var(--theme-border)',
+              background: 'var(--theme-bg-tertiary)',
+            }}>
+              <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--theme-text)', marginBottom: 7 }}>
+                Agent 执行资格
+              </div>
+              <div style={{ display: 'flex', gap: 8 }}>
+                <button
+                  onClick={() => { void updateLocalAgentExecution(true); }}
+                  disabled={busy || (!tauri && (relayNodeLoading || !relayNode?.supported))}
+                  style={{
+                    ...modeBtnStyle,
+                    background: localAgentExecutionEnabled ? 'var(--theme-accent-bg)' : 'transparent',
+                    borderColor: localAgentExecutionEnabled ? 'var(--theme-accent)' : 'var(--theme-border)',
+                    color: localAgentExecutionEnabled ? 'var(--theme-accent)' : 'var(--theme-text-muted)',
+                  }}
+                >允许承接 Agent 会话</button>
+                <button
+                  onClick={() => { void updateLocalAgentExecution(false); }}
+                  disabled={busy || (!tauri && (relayNodeLoading || !relayNode?.supported))}
+                  title="对所有 Web 用户生效；保留管理连接，但不承接新会话"
+                  style={{
+                    ...modeBtnStyle,
+                    opacity: busy || (!tauri && (relayNodeLoading || !relayNode?.supported)) ? 0.5 : 1,
+                    background: !localAgentExecutionEnabled ? 'var(--theme-accent-bg)' : 'transparent',
+                    borderColor: !localAgentExecutionEnabled ? 'var(--theme-accent)' : 'var(--theme-border)',
+                    color: !localAgentExecutionEnabled ? 'var(--theme-accent)' : 'var(--theme-text-muted)',
+                  }}
+                >控制端专用（不承接新会话）</button>
+              </div>
+              <div style={{ ...hintStyle, marginTop: 7 }}>
+                Web 部署中对所有用户生效。关闭只影响新建会话；Backend 设置、Session 管理和在线更新仍使用同源控制连接。
+              </div>
+            </div>
+
+            <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--theme-text)', marginBottom: 7 }}>
+              Relay 发布
+            </div>
             <div style={{ display: 'flex', gap: 8, marginBottom: 10 }}>
               {(['executor', 'client'] as const).map((r) => (
                 <button
@@ -497,8 +603,8 @@ export const ConnectionPanel: React.FC<ConnectionPanelProps> = ({ onClose }) => 
                   }}
                 >
                   {r === 'executor'
-                    ? '🖥️ 纳管执行节点'
-                    : (tauri ? '💻 本地工作站' : '💻 仅当前 Web 使用')}
+                    ? '📡 发布到 Relay'
+                    : '🔒 不发布到 Relay'}
                 </button>
               ))}
             </div>
@@ -506,8 +612,8 @@ export const ConnectionPanel: React.FC<ConnectionPanelProps> = ({ onClose }) => 
             {role === 'executor' && (
               <>
                 <div style={hintStyle}>
-                  {tauri ? '本机 sidecar' : '当前 Web Backend'}始终可以运行 Agent；
-                  此模式额外把它注册到 Relay，供获授权用户远程选择。
+                  此开关只把{tauri ? '本机 sidecar' : '当前 Web Backend'}注册到 Relay，
+                  供获授权用户远程发现；是否承接 Agent 由上方执行资格控制。
                   这里使用 Relay 主 Token，不要交给普通用户。
                 </div>
                 <div style={{ display: 'flex', flexDirection: 'column', gap: 8, margin: '8px 0 4px' }}>
@@ -546,8 +652,8 @@ export const ConnectionPanel: React.FC<ConnectionPanelProps> = ({ onClose }) => 
 
             {role === 'client' && (
               <div style={hintStyle}>
-                {tauri ? '本机 sidecar' : '当前 Web Backend'}仍运行 Agent、可创建本节点 Session，
-                但不会注册到 Relay，其他机器看不到这台设备。
+                {tauri ? '本机 sidecar' : '当前 Web Backend'}不会注册到 Relay，其他机器看不到这台设备；
+                是否允许当前窗口创建本节点 Session，由上方 Agent 执行资格单独控制。
                 本窗口仍可同时使用下方已登录用户获授权的远端执行节点。
               </div>
             )}
@@ -587,7 +693,7 @@ export const ConnectionPanel: React.FC<ConnectionPanelProps> = ({ onClose }) => 
               {tauri
                 ? '连接本机 sidecar，不经中继。延迟最低，流量不出网。'
                 : '连接这套 Web 部署的同源 Backend，不经 Relay；它就是当前 Web 节点。'}
-              <br/>👉 无论卡片 A 是否启用 Relay 纳管，都保留此执行能力。
+              <br/>👉 若上方已设为控制端专用，请先恢复 Agent 执行资格，才能在这里创建本节点会话。
             </div>
           )}
 
@@ -722,16 +828,6 @@ export const ConnectionPanel: React.FC<ConnectionPanelProps> = ({ onClose }) => 
                     <button onClick={addSelectedAsExecutor} style={{ ...refreshBtnStyle, marginTop: 8 }}>
                       ➕ 加入可分配执行节点（新建会话时可选）
                     </button>
-                    {execMsg && (
-                      <div style={{
-                        marginTop: 8, fontSize: 11, lineHeight: 1.6, padding: '8px 10px', borderRadius: 6,
-                        background: execMsg.kind === 'ok' ? 'rgba(34,197,94,0.12)' : 'rgba(234,179,8,0.12)',
-                        border: `1px solid ${execMsg.kind === 'ok' ? 'rgba(34,197,94,0.4)' : 'rgba(234,179,8,0.4)'}`,
-                        color: execMsg.kind === 'ok' ? 'var(--theme-success, #2da44e)' : '#b45309',
-                      }}>
-                        {execMsg.text}
-                      </div>
-                    )}
                   </div>
                 )}
               </div>

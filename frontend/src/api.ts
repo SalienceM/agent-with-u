@@ -79,6 +79,7 @@ export interface BackendImportResult {
 export interface RelayNodeStatus {
   supported: boolean;
   enabled: boolean;
+  agentExecutionEnabled: boolean;
   connected: boolean;
   url: string;
   hasToken: boolean;
@@ -936,6 +937,18 @@ function handleMessage(e: MessageEvent, source?: Conn) {
 // 不会给后者长期展示一个并不存在的“本地节点”。
 let localExecutorConfirmed = isTauri() || import.meta.env.DEV;
 
+// 同源 WebSocket 同时承担控制面 RPC，不能为了“不在本机跑 Agent”而断开。
+// 因此把物理连接与新 Session 的可分配资格分开：关闭后仍可管理当前 Backend，
+// 但新建会话的执行节点选择器不会再列出 local。localStorage 只是首屏缓存，
+// Web Backend 的 relay-node.json 才是多用户共享的权威策略。
+const LOCAL_AGENT_EXECUTION_KEY = 'awu.localAgentExecutionEnabled.v1';
+let localAgentExecutionEnabled = (() => {
+  // 服务端状态尚未返回时先使用上次缓存，随后由同源握手结果校正。
+  if (connectionTarget.mode === 'local') return true;
+  try { return localStorage.getItem(LOCAL_AGENT_EXECUTION_KEY) !== '0'; }
+  catch { return true; }
+})();
+
 function execTargetKey(t: ExecTarget): string {
   if (t.mode === 'local') return 'local';
   return `relay:${t.user?.userId || 'legacy'}:${t.deviceId}`;
@@ -1054,6 +1067,16 @@ class Conn {
         }
       }, HEARTBEAT_INTERVAL_MS);
       this.settleReady();
+      if (this.key === 'local') {
+        // 同源节点的执行资格是服务端全局策略。连接建立后立即同步，确保换浏览器、
+        // 换用户也不会把已设为“控制端专用”的弱 Web 节点重新列为候选。
+        void this.request('relayNodeStatus', [], 5_000).then((raw) => {
+          const status = typeof raw === 'string' ? JSON.parse(raw) : raw;
+          if (typeof status?.agentExecutionEnabled === 'boolean') {
+            setLocalAgentExecutionEnabled(status.agentExecutionEnabled);
+          }
+        }).catch(() => { /* 兼容尚未提供该字段的旧 Backend。 */ });
+      }
     };
 
     socket.onopen = () => {
@@ -1559,6 +1582,32 @@ export function getExecutors(): ExecutorInfo[] {
     return a.label.localeCompare(b.label);
   });
   return out;
+}
+
+/** 当前控制端是否允许把同源 Backend 分配给新建 Agent 会话。 */
+export function isLocalAgentExecutionEnabled(): boolean {
+  return localAgentExecutionEnabled;
+}
+
+/**
+ * 设置同源 Backend 的 Agent 执行资格。控制连接始终保留。
+ * 持久化到服务端由 relayNodeConfigure 负责；这里同步当前窗口及首屏缓存。
+ */
+export function setLocalAgentExecutionEnabled(enabled: boolean): boolean {
+  if (localAgentExecutionEnabled === enabled) return true;
+  localAgentExecutionEnabled = enabled;
+  try {
+    localStorage.setItem(LOCAL_AGENT_EXECUTION_KEY, enabled ? '1' : '0');
+  } catch { /* 浏览器禁用持久化时仍让本次窗口立即生效。 */ }
+  notifyExecStatus();
+  return true;
+}
+
+/** 仅返回可承接新建 Session 的节点；管理界面仍应使用 getExecutors()。 */
+export function getAssignableExecutors(): ExecutorInfo[] {
+  return getExecutors().filter(
+    (executor) => executor.key !== 'local' || isLocalAgentExecutionEnabled(),
+  );
 }
 
 /** 取某节点的完整连接目标(供「设为默认」用)。 */
@@ -2303,7 +2352,12 @@ export const api = {
     try { return JSON.parse(result); } catch { return null; }
   },
 
-  async loopGetRecord(sessionId: string, seq: number): Promise<{ status: string; record?: any; message?: string }> {
+  async loopGetRecord(sessionId: string, seq: number): Promise<{
+    status: string;
+    record?: any;
+    progress?: Record<string, string>;
+    message?: string;
+  }> {
     const result = await call('loopGetRecord', sessionId, seq);
     try { return JSON.parse(result); } catch { return { status: 'error', message: 'Loop 详情解析失败' }; }
   },
@@ -3887,6 +3941,7 @@ export const api = {
     return {
       supported: !!parsed?.supported,
       enabled: !!parsed?.enabled,
+      agentExecutionEnabled: parsed?.agentExecutionEnabled !== false,
       connected: !!parsed?.connected,
       url: String(parsed?.url || ''),
       hasToken: !!parsed?.hasToken,
@@ -3903,6 +3958,7 @@ export const api = {
     url: string;
     token?: string;
     deviceName: string;
+    agentExecutionEnabled?: boolean;
   }, execKey = 'local'): Promise<RelayNodeStatus> {
     const r = await callOnStrict(
       execKey, 'relayNodeConfigure', [JSON.stringify(config)], 15_000,
@@ -3911,12 +3967,39 @@ export const api = {
     return {
       supported: !!parsed?.supported,
       enabled: !!parsed?.enabled,
+      agentExecutionEnabled: parsed?.agentExecutionEnabled !== false,
       connected: !!parsed?.connected,
       url: String(parsed?.url || ''),
       hasToken: !!parsed?.hasToken,
       deviceId: String(parsed?.deviceId || ''),
       deviceName: String(parsed?.deviceName || ''),
       source: String(parsed?.source || 'saved'),
+      lastError: String(parsed?.lastError || ''),
+    };
+  },
+
+  /** 立即切换当前 Web Backend 的全局 Agent 执行资格，不改变 Relay 发布配置。 */
+  async relayNodeExecutionConfigure(
+    enabled: boolean,
+    execKey = 'local',
+  ): Promise<RelayNodeStatus> {
+    const r = await callOnStrict(
+      execKey,
+      'relayNodeConfigure',
+      [JSON.stringify({ agentExecutionEnabled: enabled })],
+      15_000,
+    );
+    const parsed = typeof r === 'string' ? JSON.parse(r) : r;
+    return {
+      supported: !!parsed?.supported,
+      enabled: !!parsed?.enabled,
+      agentExecutionEnabled: parsed?.agentExecutionEnabled !== false,
+      connected: !!parsed?.connected,
+      url: String(parsed?.url || ''),
+      hasToken: !!parsed?.hasToken,
+      deviceId: String(parsed?.deviceId || ''),
+      deviceName: String(parsed?.deviceName || ''),
+      source: String(parsed?.source || 'unavailable'),
       lastError: String(parsed?.lastError || ''),
     };
   },

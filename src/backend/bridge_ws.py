@@ -102,6 +102,10 @@ _REQUEST_CAN_CLAIM_LEGACY: ContextVar[bool] = ContextVar(
     "agentwithu_request_can_claim_legacy", default=False,
 )
 
+# LOOP 的流式正文无需反复写整份 stage 文件，但切换会话后必须可以恢复。
+# 每个当前子阶段只保留尾部，既能回放正在执行的步骤，也避免长任务无限占内存。
+_LOOP_PROGRESS_TAIL_CHARS = 50_000
+
 # ── 剪贴板（非 Qt，Pillow ImageGrab，仅 Windows/macOS）──────────
 
 def _find_system_python() -> Optional[str]:
@@ -734,6 +738,7 @@ class BridgeWS:
         # ★ 进程内 LoopState 单例缓存：iteration（反复整文件覆写）与旁路问答
         #   （追加 asides）共享同一对象，避免一方的保存覆盖另一方的写入。
         self._loop_states: dict[str, LoopState] = {}
+        self._loop_progress_snapshots: dict[str, dict[str, str]] = {}
         # ★ 普通 session 侧挂状态（序列任务队列 + by-the-way），独立 sidecar 文件
         self._chat_extras_store = ChatExtrasStore()
         self._chat_extras: dict[str, ChatExtras] = {}   # 进程内单例缓存
@@ -1993,11 +1998,12 @@ class BridgeWS:
         self._relay_runtime_manager = manager
 
     def _rpc_relayNodeStatus(self) -> str:
-        manager = self._relay_runtime_manager
+        manager = getattr(self, "_relay_runtime_manager", None)
         if manager is None:
             return json.dumps({
                 "supported": False,
                 "enabled": False,
+                "agentExecutionEnabled": True,
                 "connected": False,
                 "hasToken": False,
                 "url": "",
@@ -2009,7 +2015,7 @@ class BridgeWS:
         return json.dumps(manager.status(), ensure_ascii=False)
 
     async def _rpc_relayNodeConfigure(self, config_json: str) -> str:
-        manager = self._relay_runtime_manager
+        manager = getattr(self, "_relay_runtime_manager", None)
         if manager is None:
             raise RuntimeError("当前 Backend 不支持运行期 Relay 纳管")
         try:
@@ -2018,6 +2024,18 @@ class BridgeWS:
             raise ValueError(f"invalid Relay node configuration: {error}") from error
         result = await manager.configure(config)
         return json.dumps(result, ensure_ascii=False)
+
+    def _require_agent_execution_enabled(self) -> None:
+        """控制端专用节点保留管理 RPC，但不得承接新的 Agent Session。"""
+        manager = getattr(self, "_relay_runtime_manager", None)
+        if manager is None:
+            return
+        status = manager.status()
+        if not bool(status.get("agentExecutionEnabled", True)):
+            raise RuntimeError(
+                "当前 Web 节点已设为控制端专用，不能新建 Agent 会话；"
+                "请改用远端执行节点，或在连接面板恢复 Agent 执行资格"
+            )
 
     def _release_center(self) -> ReleaseCenterManager:
         if self._release_center_manager is None:
@@ -3217,6 +3235,7 @@ class BridgeWS:
 
     def _rpc_branchSession(self, payload_json: str) -> str:
         """Create a normal independent branch copied from a normal session."""
+        self._require_agent_execution_enabled()
         try:
             payload = json.loads(payload_json or "{}")
             source_id = payload.get("sourceSessionId") or payload.get("sessionId")
@@ -3684,6 +3703,7 @@ class BridgeWS:
     async def _rpc_createSession(self, working_dir: str, backend_id: str,
                                  session_type: str = "normal", runtime_json: str = "",
                                  remote_json: str = "") -> str:
+        self._require_agent_execution_enabled()
         # Session 保留与侧栏展示解耦：创建新 Session 不再静默淘汰旧数据。
         # 用户可在设置中调整展示数量，并通过“删除/销毁”显式管理生命周期。
         is_loop = session_type == "loop"
@@ -4506,6 +4526,7 @@ class BridgeWS:
         self._loop_cancel.pop(sid, None)
         self._aside_running.discard(sid)
         self._loop_states.pop(sid, None)
+        getattr(self, "_loop_progress_snapshots", {}).pop(sid, None)
         self._loop_store.delete(sid)
         self._chat_aside_running.discard(sid)
         self._chat_extras.pop(sid, None)
@@ -4543,6 +4564,7 @@ class BridgeWS:
         return ok
 
     def _rpc_migrateSession(self, payload_json: str) -> str:
+        self._require_agent_execution_enabled()
         payload = json.loads(payload_json)
         source_id = payload.get("sourceSessionId")
         target_backend_id = payload.get("targetBackendId")
@@ -4866,14 +4888,64 @@ class BridgeWS:
 
     def _emit_loop_updated(self, state: "LoopState") -> None:
         """广播首屏摘要；大段输出/人工 transcript 按选中记录再懒加载。"""
+        self._prune_loop_progress(state)
         asyncio.ensure_future(self._send_for_session(state.session_id, {
             "event": "loopUpdated",
             "data": json.dumps(self._loop_payload(state, compact=True), ensure_ascii=False),
         }))
 
+    def _remember_loop_progress(self, session_id: str, seq: int,
+                                sub_stage: str, text: str) -> None:
+        """缓存仍在执行的可见输出，使面板重新挂载后可以继续展开查看。"""
+        if seq <= 0 or not text:
+            return
+        if sub_stage not in (SUB_PREPARE, SUB_EXECUTE, SUB_ANALYSIS) \
+                and not sub_stage.startswith("step"):
+            return
+        snapshots = getattr(self, "_loop_progress_snapshots", None)
+        if snapshots is None:
+            snapshots = self._loop_progress_snapshots = {}
+        session_progress = snapshots.setdefault(session_id, {})
+        key = f"{seq}:{sub_stage}"
+        session_progress[key] = (session_progress.get(key, "") + text)[
+            -_LOOP_PROGRESS_TAIL_CHARS:
+        ]
+
+    def _loop_progress_for_record(self, session_id: str, seq: int) -> dict[str, str]:
+        prefix = f"{seq}:"
+        snapshots = getattr(self, "_loop_progress_snapshots", {}).get(session_id, {})
+        return {
+            key: value for key, value in snapshots.items()
+            if key.startswith(prefix) and value
+        }
+
+    def _prune_loop_progress(self, state: "LoopState") -> None:
+        """只保留未完成记录当前阶段/运行步骤的回放，完成后正文以持久化记录为准。"""
+        snapshots = getattr(self, "_loop_progress_snapshots", None)
+        if not snapshots or state.session_id not in snapshots:
+            return
+        allowed: set[str] = set()
+        for record in state.loops:
+            if record.completed or record.error or record.kind == "manual":
+                continue
+            if record.sub_stage in (SUB_PREPARE, SUB_EXECUTE, SUB_ANALYSIS):
+                allowed.add(f"{record.seq}:{record.sub_stage}")
+            for step in record.orchestration:
+                if step.status == "running":
+                    allowed.add(f"{record.seq}:step{step.index}")
+        retained = {
+            key: value for key, value in snapshots[state.session_id].items()
+            if key in allowed
+        }
+        if retained:
+            snapshots[state.session_id] = retained
+        else:
+            snapshots.pop(state.session_id, None)
+
     def _emit_loop_progress(self, session_id: str, seq: int, sub_stage: str,
                             text: str) -> None:
         """子阶段流式文本增量，供前端 LoopPanel 实时滚动展示。"""
+        self._remember_loop_progress(session_id, seq, sub_stage, text)
         asyncio.ensure_future(self._send_for_session(session_id, {
             "event": "loopProgress",
             "data": json.dumps({
@@ -5044,7 +5116,12 @@ class BridgeWS:
             for pos, bid in (record.backends or {}).items() if bid
         }
         payload["detailLoaded"] = True
-        return json.dumps({"status": "ok", "record": payload}, ensure_ascii=False)
+        progress = self._loop_progress_for_record(session_id, target_seq)
+        return json.dumps({
+            "status": "ok",
+            "record": payload,
+            "progress": progress,
+        }, ensure_ascii=False)
 
     # ── loopidea：非阻塞想法池 ────────────────────────────────────
 

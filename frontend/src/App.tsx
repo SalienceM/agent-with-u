@@ -1,6 +1,6 @@
 import React, { useState, useCallback, useEffect, useRef, useMemo } from 'react';
 import {
-  api, isTauri, getExecutors, onExecStatus, getHomeExecKey,
+  api, isTauri, getExecutors, getAssignableExecutors, onExecStatus, getHomeExecKey,
   getCurrentUserProfile, onCurrentUserChanged,
   type ExecutorInfo, type CurrentUserProfile,
 } from './api';
@@ -2287,14 +2287,24 @@ const NewSessionDialog: React.FC<NewSessionDialogProps> = ({
   const isAutoDir = !workingDir.trim() || workingDir.trim() === '.';
 
   // ── 执行节点（session 级模式管理）：默认节点与物理本机是两个独立概念 ──
-  const [executors, setExecutors] = useState<ExecutorInfo[]>(() => getExecutors());
-  const [execKey, setExecKey] = useState<string>(() => getHomeExecKey());
+  const [executors, setExecutors] = useState<ExecutorInfo[]>(() => getAssignableExecutors());
+  const [execKey, setExecKey] = useState<string>(() => {
+    const available = getAssignableExecutors();
+    const homeKey = getHomeExecKey();
+    return available.some((executor) => executor.key === homeKey)
+      ? homeKey
+      : (available[0]?.key || '');
+  });
   useEffect(() => onExecStatus(() => {
-    const next = getExecutors();
+    const next = getAssignableExecutors();
     setExecutors(next);
-    setExecKey((current) => (
-      next.some((executor) => executor.key === current) ? current : getHomeExecKey()
-    ));
+    setExecKey((current) => {
+      if (next.some((executor) => executor.key === current)) return current;
+      const homeKey = getHomeExecKey();
+      return next.some((executor) => executor.key === homeKey)
+        ? homeKey
+        : (next[0]?.key || '');
+    });
   }), []);
   const isHomeExec = execKey === getHomeExecKey();
 
@@ -2302,6 +2312,7 @@ const NewSessionDialog: React.FC<NewSessionDialogProps> = ({
   const [execBackends, setExecBackends] = useState<any[]>(backends);
   useEffect(() => {
     let cancelled = false;
+    if (!execKey) { setExecBackends([]); return; }
     if (isHomeExec) { setExecBackends(backends); return; }
     api.getBackends(execKey).then((list) => { if (!cancelled) setExecBackends(list || []); });
     return () => { cancelled = true; };
@@ -2379,6 +2390,7 @@ const NewSessionDialog: React.FC<NewSessionDialogProps> = ({
   }, [remoteThreadId, remoteThreads]);
 
   const handleCreate = useCallback(async () => {
+    if (!execKey) return;
     // 空值交给后端补一个时间戳目录
     const backend = execBackends.find((item) => item.id === selectedBackendId);
     const runtime = isRuntimeConfigurableBackend(backend) ? normalizeModelRuntime(sessionRuntime) : {};
@@ -2399,9 +2411,11 @@ const NewSessionDialog: React.FC<NewSessionDialogProps> = ({
     setDirPickerOpen(true);
   }, []);
 
-  const codexCreateBlocked = isCodex && codexLocation === 'node'
-    ? (remoteLoading || !remoteThreadId)
-    : false;
+  const codexCreateBlocked = !execKey || (
+    isCodex && codexLocation === 'node'
+      ? (remoteLoading || !remoteThreadId)
+      : false
+  );
 
   return (
     <div
@@ -2479,6 +2493,16 @@ const NewSessionDialog: React.FC<NewSessionDialogProps> = ({
 
         {/* ★ 执行节点：本会话在哪台机器上执行(本机自执行 / 远端节点)。
             只有配置了额外执行节点时才出现,单机用户无感(不臃肿)。 */}
+        {executors.length === 0 && (
+          <div style={{
+            ...formGroupStyle, padding: '10px 12px', borderRadius: 8,
+            border: '1px solid rgba(234,179,8,0.45)',
+            background: 'rgba(234,179,8,0.10)', color: '#b45309', fontSize: 12,
+          }}>
+            当前没有可分配执行节点。请先在“📡 连接”中连接远端节点，
+            或恢复当前 Web 节点的 Agent 执行资格。
+          </div>
+        )}
         {executors.length > 1 && (
           <div style={formGroupStyle}>
             <label style={labelStyle}>执行节点 / Runs on:</label>

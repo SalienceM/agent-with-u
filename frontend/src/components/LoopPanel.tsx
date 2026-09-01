@@ -170,18 +170,34 @@ export const LoopPanel: React.FC<LoopPanelProps> = ({
   progressRef.current = progress;
   const pendingProgressRef = useRef<Record<string, string>>({});
   const progressTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const activeSessionRef = useRef(sessionId);
+  activeSessionRef.current = sessionId;
 
   const refresh = useCallback(async () => {
+    const requestedSessionId = sessionId;
     const s = await api.loopGetState(sessionId);
-    if (s) setState(s);
+    if (s && activeSessionRef.current === requestedSessionId) setState(s);
   }, [sessionId]);
 
   const selectLoop = useCallback((seq: number | null) => {
     setSelectedSeq(seq);
     if (seq == null || recordDetails[seq]?.detailLoaded) return;
+    const requestedSessionId = sessionId;
     void api.loopGetRecord(sessionId, seq).then((result) => {
+      if (activeSessionRef.current !== requestedSessionId) return;
       if (result.status === 'ok' && result.record) {
         setRecordDetails((previous) => ({ ...previous, [seq]: result.record as LoopRecord }));
+        if (result.progress) {
+          setProgress((previous) => {
+            const next = { ...previous };
+            for (const [key, replay] of Object.entries(result.progress || {})) {
+              const current = next[key] || '';
+              if (!current || replay.includes(current)) next[key] = replay;
+              else if (!current.includes(replay)) next[key] = (replay + current).slice(-50_000);
+            }
+            return next;
+          });
+        }
       }
     });
   }, [sessionId, recordDetails]);
@@ -189,8 +205,14 @@ export const LoopPanel: React.FC<LoopPanelProps> = ({
   useEffect(() => { refresh(); }, [refresh]);
 
   useEffect(() => {
+    setState(null);
     setSelectedSeq(null);
     setRecordDetails({});
+    setProgress({});
+    progressRef.current = {};
+    pendingProgressRef.current = {};
+    if (progressTimerRef.current) clearTimeout(progressTimerRef.current);
+    progressTimerRef.current = null;
   }, [sessionId]);
 
   // 订阅整份状态更新 + 子阶段流式文本（仅本 session）
@@ -1684,11 +1706,12 @@ const STEP_COLOR: Record<string, string> = { pending: 'var(--theme-text-muted)',
 const StepRow: React.FC<{ step: LoopStep; live?: string }> = ({ step, live }) => {
   const [open, setOpen] = useState(false);
   const body = step.status === 'running' && live ? live : step.output;
+  const canExpand = !!body || step.status === 'running';
   return (
     <div style={{ marginBottom: 6 }}>
       <div
-        onClick={() => (body ? setOpen(!open) : undefined)}
-        style={{ display: 'flex', alignItems: 'baseline', gap: 6, cursor: body ? 'pointer' : 'default' }}
+        onClick={() => (canExpand ? setOpen(!open) : undefined)}
+        style={{ display: 'flex', alignItems: 'baseline', gap: 6, cursor: canExpand ? 'pointer' : 'default' }}
       >
         <span style={{ color: STEP_COLOR[step.status] || 'var(--theme-text-muted)', fontSize: 13,
           animation: step.status === 'running' ? 'awu-loop-pulse 1.2s infinite' : 'none' }}>
@@ -1696,12 +1719,16 @@ const StepRow: React.FC<{ step: LoopStep; live?: string }> = ({ step, live }) =>
         </span>
         <span style={{ fontSize: 11, color: STEP_COLOR[step.status], minWidth: 42 }}>{step.status}</span>
         <span style={{ fontSize: 13, color: 'var(--theme-text)', flex: 1 }}>{step.index}. {step.desc}</span>
-        {body && <span style={{ fontSize: 11, color: 'var(--theme-text-muted)' }}>{open ? '收起' : '展开'}</span>}
+        {canExpand && <span style={{ fontSize: 11, color: 'var(--theme-text-muted)' }}>{open ? '收起' : '展开'}</span>}
       </div>
-      {open && body && (
-        step.status === 'running'
+      {open && (
+        body && step.status === 'running'
           ? <div style={{ marginLeft: 22, marginTop: 4 }}><Live text={body} /></div>
-          : <div style={{ marginLeft: 22, marginTop: 4, background: 'var(--theme-code-bg)', borderRadius: 6, padding: '6px 10px' }}><Md text={body} /></div>
+          : body
+            ? <div style={{ marginLeft: 22, marginTop: 4, background: 'var(--theme-code-bg)', borderRadius: 6, padding: '6px 10px' }}><Md text={body} /></div>
+            : <div style={{ marginLeft: 22, marginTop: 4, color: 'var(--theme-text-muted)', fontSize: 11 }}>
+                正在等待该步骤的新实时输出…
+              </div>
       )}
     </div>
   );

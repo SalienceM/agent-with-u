@@ -109,6 +109,41 @@ class SessionLoadingPerformanceTests(unittest.TestCase):
         self.assertEqual(len(detail["record"]["analysis"]["verified"]), len(huge))
         self.assertTrue(detail["record"]["detailLoaded"])
 
+    def test_running_step_detail_replays_progress_after_panel_reopens(self):
+        state = LoopState(
+            session_id="loop-reopen",
+            stage=STAGE_EXECUTE,
+            loops=[LoopRecord(
+                seq=1,
+                sub_stage="execute",
+                orchestration=[LoopStep(
+                    index=1, desc="long running step", status="running",
+                )],
+            )],
+        )
+        bridge = BridgeWS.__new__(BridgeWS)
+        bridge._loop_running = {state.session_id}
+        bridge._loop_tasks = {}
+        bridge._loop_states = {state.session_id: state}
+        bridge._loop_progress_snapshots = {}
+
+        bridge._remember_loop_progress(state.session_id, 1, "step1", "first chunk")
+        bridge._remember_loop_progress(state.session_id, 1, "step1", " + second chunk")
+        bridge._remember_loop_progress(state.session_id, 2, "step1", "other loop")
+
+        detail = json.loads(bridge._rpc_loopGetRecord(state.session_id, 1))
+
+        self.assertEqual(detail["status"], "ok")
+        self.assertEqual(
+            detail["progress"],
+            {"1:step1": "first chunk + second chunk"},
+        )
+
+        state.loops[0].orchestration[0].status = "done"
+        state.loops[0].completed = True
+        bridge._prune_loop_progress(state)
+        self.assertNotIn(state.session_id, bridge._loop_progress_snapshots)
+
     def test_manual_loop_snapshot_does_not_duplicate_base64_or_unbounded_tool_output(self):
         huge = "x" * 1_000_000
         message = ChatMessage(

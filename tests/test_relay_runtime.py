@@ -73,6 +73,7 @@ class RelayRuntimeManagerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(status["supported"])
         self.assertTrue(status["enabled"])
+        self.assertTrue(status["agentExecutionEnabled"])
         self.assertTrue(status["connected"])
         self.assertTrue(status["hasToken"])
         self.assertNotIn("token", status)
@@ -83,6 +84,7 @@ class RelayRuntimeManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("relay-master-secret", on_disk["token"])
         self.assertEqual("wss://relay.example.test/ws", on_disk["url"])
         self.assertEqual("web-node-1", on_disk["deviceId"])
+        self.assertTrue(on_disk["agentExecutionEnabled"])
 
         await self.manager.stop()
         reloaded = RelayRuntimeManager(
@@ -143,6 +145,35 @@ class RelayRuntimeManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(status["connected"])
         self.assertTrue(status["hasToken"])
         self.assertFalse(active_link.connected)
+
+    async def test_agent_execution_policy_is_global_and_does_not_change_relay(self):
+        await self.manager.configure({
+            "enabled": True,
+            "url": "wss://relay.example.test/ws",
+            "token": "relay-master-secret",
+            "deviceName": "Docker Web",
+        })
+
+        status = await self.manager.configure({"agentExecutionEnabled": False})
+
+        self.assertTrue(status["enabled"])
+        self.assertTrue(status["connected"])
+        self.assertFalse(status["agentExecutionEnabled"])
+        stored = json.loads(self.config_path.read_text(encoding="utf-8"))
+        self.assertFalse(stored["agentExecutionEnabled"])
+
+        await self.manager.stop()
+        restored = RelayRuntimeManager(
+            object(),
+            device_id="web-node-1",
+            device_name="Docker Web",
+            config_path=self.config_path,
+            link_factory=_FakeRelayLink,
+        )
+        try:
+            self.assertFalse(restored.status()["agentExecutionEnabled"])
+        finally:
+            await restored.stop()
 
     async def test_invalid_or_incomplete_registration_is_rejected_before_save(self):
         with self.assertRaisesRegex(ValueError, "ws://"):
@@ -324,6 +355,14 @@ class RelayNodeRpcAuthorizationTests(unittest.IsolatedAsyncioTestCase):
     async def test_shared_relay_user_cannot_change_global_node_settings(self):
         with self.assertRaises(PermissionError):
             await self._dispatch("relay", can_claim=False)
+
+    async def test_control_only_node_rejects_new_agent_sessions(self):
+        self.bridge._relay_runtime_manager = type("Manager", (), {
+            "status": lambda _self: {"agentExecutionEnabled": False},
+        })()
+
+        with self.assertRaisesRegex(RuntimeError, "控制端专用"):
+            self.bridge._require_agent_execution_enabled()
 
 
 if __name__ == "__main__":
