@@ -28,6 +28,7 @@ interface BackendConfig {
   model?: string;
   baseUrl?: string;
   apiKey?: string;
+  workingDir?: string;
   allowedTools?: string[];
   skipPermissions?: boolean;
   env?: Record<string, string>;
@@ -207,6 +208,7 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
 }) => {
   const [isEditing, setIsEditing] = useState(false);
   const [editingBackend, setEditingBackend] = useState<BackendConfig | null>(null);
+  const [copySourceLabel, setCopySourceLabel] = useState<string | null>(null);
   const [formData, setFormData] = useState<BackendConfig>({
     id: '',
     type: 'claude-agent-sdk',
@@ -231,6 +233,7 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
   } | null>(null);
   const [transferState, setTransferState] = useState<BackendTransferState | null>(null);
   const importFileInputRef = useRef<HTMLInputElement | null>(null);
+  const panelRef = useRef<HTMLDivElement | null>(null);
 
   // MCP tab state
   const [activeTab, setActiveTab] = useState<'backends' | 'mcp'>('backends');
@@ -260,6 +263,7 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
   useEffect(() => {
     setIsEditing(false);
     setEditingBackend(null);
+    setCopySourceLabel(null);
     setBackendToDelete(null);
     setDependentSessions([]);
     setIsEditingMcp(false);
@@ -400,12 +404,22 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
       allowedTools: [...DEFAULT_TOOLS],
     });
     setEditingBackend(null);
+    setCopySourceLabel(null);
     setIsEditing(true);
   }, []);
 
   const handleEditBackend = useCallback((backend: BackendConfig) => {
-    setFormData({ ...backend, env: backend.env || {} });
+    setFormData({
+      ...backend,
+      env: { ...(backend.env || {}) },
+      extraHeaders: backend.extraHeaders ? { ...backend.extraHeaders } : undefined,
+      allowedTools: backend.allowedTools ? [...backend.allowedTools] : undefined,
+      mcpServers: backend.mcpServers
+        ? JSON.parse(JSON.stringify(backend.mcpServers))
+        : undefined,
+    });
     setEditingBackend(backend);
+    setCopySourceLabel(null);
     setLoginMsg(null);
     setModelMsg(null);
     setIsEditing(true);
@@ -415,11 +429,65 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
     }
   }, [targetExecKey]);
 
+  const handleCopyBackend = useCallback((backend: BackendConfig) => {
+    const usedIds = new Set(backends.map((item) => item.id));
+    const idRoot = (backend.id || 'backend').replace(/-copy(?:-\d+)?$/i, '');
+    let nextId = `${idRoot}-copy`;
+    let suffix = 2;
+    while (usedIds.has(nextId)) {
+      nextId = `${idRoot}-copy-${suffix}`;
+      suffix += 1;
+    }
+
+    const usedLabels = new Set(backends.map((item) => item.label));
+    const labelRoot = (backend.label || backend.id || 'Backend')
+      .replace(/ 副本(?: \(\d+\))?$/, '');
+    let nextLabel = `${labelRoot} 副本`;
+    let labelSuffix = 2;
+    while (usedLabels.has(nextLabel)) {
+      nextLabel = `${labelRoot} 副本 (${labelSuffix})`;
+      labelSuffix += 1;
+    }
+
+    setFormData({
+      ...backend,
+      id: nextId,
+      label: nextLabel,
+      pinned: false,
+      env: { ...(backend.env || {}) },
+      extraHeaders: backend.extraHeaders ? { ...backend.extraHeaders } : undefined,
+      allowedTools: backend.allowedTools ? [...backend.allowedTools] : undefined,
+      mcpServers: backend.mcpServers
+        ? JSON.parse(JSON.stringify(backend.mcpServers))
+        : undefined,
+    });
+    setEditingBackend(null);
+    setCopySourceLabel(backend.label || backend.id);
+    setLoginMsg(null);
+    setModelMsg(null);
+    setOperationMessage(null);
+    setIsEditing(true);
+    window.requestAnimationFrame(() => panelRef.current?.scrollTo({ top: 0, behavior: 'smooth' }));
+  }, [backends]);
+
   const handleSave = useCallback(async () => {
+    const normalizedId = formData.id.trim();
+    const normalizedLabel = formData.label.trim();
+    if (!normalizedId || !normalizedLabel) {
+      setOperationMessage({ kind: 'error', text: 'Backend ID 和显示名称不能为空' });
+      return;
+    }
+    const idConflict = backends.some((backend) => (
+      backend.id === normalizedId && backend.id !== editingBackend?.id
+    ));
+    if (idConflict) {
+      setOperationMessage({ kind: 'error', text: `Backend ID「${normalizedId}」已存在，请换一个 ID` });
+      return;
+    }
     const saved: BackendConfig = {
-      id: formData.id,
+      id: normalizedId,
       type: formData.type,
-      label: formData.label,
+      label: normalizedLabel,
       enabled: formData.enabled !== false,
     };
 
@@ -469,6 +537,7 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
       if (formData.model?.trim()) saved.model = formData.model.trim();
       saved.skipPermissions = formData.skipPermissions !== false;
       if (formData.allowedTools?.length) saved.allowedTools = formData.allowedTools;
+      if (formData.mcpServers && Object.keys(formData.mcpServers).length > 0) saved.mcpServers = formData.mcpServers;
       // cliPath stored as a top-level field
       if (formData.cliPath?.trim()) (saved as any).cliPath = formData.cliPath.trim();
       const contextWindow = formData.qwenContextWindowSize;
@@ -501,7 +570,9 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
       if (formData.baseUrl?.trim()) saved.baseUrl = formData.baseUrl.trim();
       if (formData.apiKey?.trim()) saved.apiKey = formData.apiKey.trim();
       saved.skipPermissions = formData.skipPermissions !== false;
+      if (formData.allowedTools?.length) saved.allowedTools = formData.allowedTools;
       if (formData.cliPath?.trim()) saved.cliPath = formData.cliPath.trim();
+      if (formData.mcpServers && Object.keys(formData.mcpServers).length > 0) saved.mcpServers = formData.mcpServers;
     } else if (formData.type === 'openai-compatible') {
       // base_url, api_key, model, extra_headers
       if (formData.baseUrl?.trim()) saved.baseUrl = formData.baseUrl.trim();
@@ -534,9 +605,13 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
       await onSaveBackend(saved, targetExecKey);
       setIsEditing(false);
       setEditingBackend(null);
+      const copiedFrom = copySourceLabel;
+      setCopySourceLabel(null);
       setOperationMessage({
         kind: 'ok',
-        text: `已保存到「${selectedExecutor?.label || targetExecKey}」`,
+        text: copiedFrom
+          ? `已基于「${copiedFrom}」创建「${saved.label}」，并保存到「${selectedExecutor?.label || targetExecKey}」`
+          : `已保存到「${selectedExecutor?.label || targetExecKey}」`,
       });
     } catch (error: any) {
       setOperationMessage({
@@ -546,7 +621,7 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
     } finally {
       setOperationBusy(false);
     }
-  }, [formData, onSaveBackend, selectedExecutor?.label, targetExecKey]);
+  }, [backends, copySourceLabel, editingBackend?.id, formData, onSaveBackend, selectedExecutor?.label, targetExecKey]);
 
   const handleEnvChange = useCallback((key: string, value: string) => {
     setFormData((prev) => ({
@@ -724,13 +799,13 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
 
   return (
     <div style={overlayStyle}>
-      <div style={panelStyle} onClick={(e) => e.stopPropagation()}>
+      <div ref={panelRef} style={panelStyle} onClick={(e) => e.stopPropagation()}>
         {/* 标题栏 */}
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
           <h2 style={{ margin: 0, fontSize: 18, fontWeight: 600, color: 'var(--theme-text)' }}>
             {activeTab === 'mcp'
               ? (isEditingMcp ? (editingMcpName ? `编辑 ${editingMcpName}` : '添加 MCP 服务器') : 'MCP 服务器')
-              : (editingBackend ? 'Edit Backend' : 'Backend Manager')
+              : (copySourceLabel ? `复制 Backend · ${copySourceLabel}` : editingBackend ? 'Edit Backend' : 'Backend Manager')
             }
           </h2>
           <button onClick={onClose} style={closeBtnStyle}>✕</button>
@@ -805,7 +880,13 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
           {(['backends', 'mcp'] as const).map(tab => (
             <button
               key={tab}
-              onClick={() => { setActiveTab(tab); setIsEditing(false); setIsEditingMcp(false); }}
+              onClick={() => {
+                setActiveTab(tab);
+                setIsEditing(false);
+                setEditingBackend(null);
+                setCopySourceLabel(null);
+                setIsEditingMcp(false);
+              }}
               style={{
                 padding: '5px 14px', borderRadius: '6px 6px 0 0', fontSize: 13, cursor: 'pointer',
                 border: 'none', background: activeTab === tab ? 'rgba(99,102,241,0.2)' : 'transparent',
@@ -892,6 +973,17 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
                         )}
                       </div>
                     </div>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 2, flexShrink: 0 }}>
+                      <button
+                        type="button"
+                        onClick={(e) => { e.stopPropagation(); handleCopyBackend(backend); }}
+                        disabled={operationBusy || !selectedExecutor?.connected}
+                        style={{
+                          ...copyBtnStyle,
+                          opacity: operationBusy || !selectedExecutor?.connected ? 0.5 : 1,
+                        }}
+                        title="复制为一份新的 Backend 配置"
+                      >⧉ 复制</button>
                     {!backend.pinned && (
                       <button
                         className="bm-delete-btn"
@@ -902,6 +994,7 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
                         🗑
                       </button>
                     )}
+                    </div>
                   </div>
                 ))
               )}
@@ -957,6 +1050,16 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
         ) : (
           // 编辑表单
           <>
+            {copySourceLabel && (
+              <div style={{
+                marginBottom: 14, padding: '9px 11px', borderRadius: 8,
+                color: 'var(--theme-accent)', background: 'var(--theme-accent-bg)',
+                border: '1px solid var(--theme-accent)', fontSize: 11.5, lineHeight: 1.55,
+              }}>
+                已复制「{copySourceLabel}」的完整配置，并生成新的 ID 与名称。
+                修改需要差异化的字段后再保存，原配置不会被覆盖。
+              </div>
+            )}
             <div style={{
               marginBottom: 16,
               padding: '12px 14px',
@@ -2289,7 +2392,11 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
               >
                 {operationBusy ? 'Saving…' : 'Save'}
               </button>
-              <button onClick={() => setIsEditing(false)} style={cancelBtnStyle}>
+              <button onClick={() => {
+                setIsEditing(false);
+                setEditingBackend(null);
+                setCopySourceLabel(null);
+              }} style={cancelBtnStyle}>
                 Back
               </button>
             </div>
@@ -2723,6 +2830,13 @@ const deleteBtnStyle: React.CSSProperties = {
   cursor: 'pointer', padding: '4px 8px',
   color: 'var(--theme-text-muted, #656d76)',
   transition: 'color 0.15s',
+};
+
+const copyBtnStyle: React.CSSProperties = {
+  padding: '4px 7px', borderRadius: 6,
+  background: 'var(--theme-input-bg)', border: '1px solid var(--theme-border)',
+  color: 'var(--theme-text-muted)', fontSize: 11, cursor: 'pointer',
+  whiteSpace: 'nowrap',
 };
 
 const addBtnStyle: React.CSSProperties = {

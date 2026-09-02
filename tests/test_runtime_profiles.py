@@ -1,5 +1,7 @@
 import unittest
+from types import SimpleNamespace
 
+from src.backend.bridge_ws import BridgeWS
 from src.backend.loop_store import LoopPolicy, LoopRecord
 from src.types import Session
 
@@ -16,10 +18,11 @@ class RuntimeProfileTests(unittest.TestCase):
         self.assertEqual(payload["reasoningEffort"], "medium")
         self.assertEqual(session.meta_dict()["reasoningEffort"], "medium")
 
-    def test_loop_roles_inherit_execute_runtime_and_override_analysis(self):
+    def test_loop_roles_inherit_execute_runtime_and_override_prepare_and_analysis(self):
         policy = LoopPolicy.from_dict({
             "runtimes": {
                 "execute": {"model": "gpt-5.6-terra", "reasoningEffort": "medium"},
+                "prepare": {"model": "gpt-5.6-sol", "reasoningEffort": "max"},
                 "analysis": {"model": "gpt-5.6-sol", "reasoningEffort": "xhigh"},
             },
         })
@@ -29,8 +32,47 @@ class RuntimeProfileTests(unittest.TestCase):
         self.assertEqual(policy.runtime_for("idea"), {
             "model": "gpt-5.6-terra", "reasoningEffort": "medium",
         })
+        self.assertEqual(policy.runtime_for("prepare"), {
+            "model": "gpt-5.6-sol", "reasoningEffort": "max",
+        })
         self.assertEqual(policy.runtime_for("analysis"), {
             "model": "gpt-5.6-sol", "reasoningEffort": "xhigh",
+        })
+
+    def test_legacy_policy_prepare_still_inherits_execute_runtime(self):
+        policy = LoopPolicy.from_dict({
+            "runtimes": {
+                "execute": {"model": "legacy-worker", "reasoningEffort": "low"},
+            },
+        })
+        self.assertEqual(policy.runtime_for("prepare"), {
+            "model": "legacy-worker", "reasoningEffort": "low",
+        })
+
+    def test_prepare_backend_is_persisted_as_a_routable_role(self):
+        policy = LoopPolicy.from_dict({"backends": {"prepare": "strong-planner"}})
+        self.assertEqual(policy.backend_for("prepare"), "strong-planner")
+        self.assertEqual(policy.to_dict()["backends"]["prepare"], "strong-planner")
+
+    def test_heterogeneous_planner_uses_its_default_not_executor_model(self):
+        bridge = BridgeWS.__new__(BridgeWS)
+        session = SimpleNamespace(
+            backend_id="worker", model_override="worker-only-model", reasoning_effort="low",
+        )
+        state = SimpleNamespace(policy=LoopPolicy.from_dict({
+            "backends": {"prepare": "planner"},
+            "runtimes": {
+                "execute": {"model": "worker-only-model", "reasoningEffort": "low"},
+            },
+        }))
+        self.assertEqual(bridge._loop_runtime(session, state, "prepare", "planner"), {})
+
+        state.policy = LoopPolicy.from_dict({
+            "backends": {"prepare": "planner"},
+            "runtimes": {"prepare": {"model": "planner-model", "reasoningEffort": "max"}},
+        })
+        self.assertEqual(bridge._loop_runtime(session, state, "prepare", "planner"), {
+            "model": "planner-model", "reasoningEffort": "max",
         })
 
     def test_unknown_effort_is_dropped_but_custom_model_is_kept(self):
@@ -48,10 +90,14 @@ class RuntimeProfileTests(unittest.TestCase):
     def test_loop_record_persists_actual_runtime(self):
         record = LoopRecord(
             seq=1,
-            backends={"execute": "official-codex"},
-            runtimes={"execute": {"model": "gpt-5.6-terra", "reasoningEffort": "medium"}},
+            backends={"prepare": "planner", "execute": "official-codex"},
+            runtimes={
+                "prepare": {"model": "gpt-5.6-sol", "reasoningEffort": "max"},
+                "execute": {"model": "gpt-5.6-terra", "reasoningEffort": "medium"},
+            },
         )
         restored = LoopRecord.from_dict(record.to_dict())
+        self.assertEqual(restored.backends, record.backends)
         self.assertEqual(restored.runtimes, record.runtimes)
 
 

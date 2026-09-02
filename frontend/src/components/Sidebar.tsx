@@ -1,4 +1,4 @@
-import React, { useEffect, useState, useCallback, memo, useRef, useMemo } from 'react';
+import React, { useEffect, useState, useCallback, memo, useRef, useMemo, useLayoutEffect } from 'react';
 import { api, isTauri, onExecStatus } from '../api';
 import { FileTreePanel } from './FileTreePanel';
 import type { FileFocusRequest } from '../utils/fileFocus';
@@ -62,7 +62,11 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
   // ★ 侧栏视图：会话列表 / 文件目录树（本地 ⇄ 远端），左侧小按钮切换
   const [view, setView] = useState<'sessions' | 'files'>('sessions');
   const [backends, setBackends] = useState<Backend[]>([]);
-  const [hoveredSessionId, setHoveredSessionId] = useState<string | null>(null);
+  const [sessionContextMenu, setSessionContextMenu] = useState<{
+    session: Session;
+    x: number;
+    y: number;
+  } | null>(null);
   const [sessionToDelete, setSessionToDelete] = useState<Session | null>(null);
   const [sessionToDestroy, setSessionToDestroy] = useState<Session | null>(null);
   const [destroyConfirmValue, setDestroyConfirmValue] = useState('');
@@ -178,6 +182,40 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
 
   const renamingRef = useRef(false);  // 防止 Enter+blur 双触发
   const pickerRef = useRef<HTMLDivElement>(null);
+  const sessionContextMenuRef = useRef<HTMLDivElement>(null);
+
+  useLayoutEffect(() => {
+    if (!sessionContextMenu || !sessionContextMenuRef.current) return;
+    const margin = 8;
+    const bounds = sessionContextMenuRef.current.getBoundingClientRect();
+    const nextX = Math.max(margin, Math.min(sessionContextMenu.x, window.innerWidth - bounds.width - margin));
+    const nextY = Math.max(margin, Math.min(sessionContextMenu.y, window.innerHeight - bounds.height - margin));
+    if (nextX !== sessionContextMenu.x || nextY !== sessionContextMenu.y) {
+      setSessionContextMenu((current) => current ? { ...current, x: nextX, y: nextY } : null);
+    }
+  }, [sessionContextMenu]);
+
+  useEffect(() => {
+    if (!sessionContextMenu) return;
+    const handlePointerDown = (event: PointerEvent) => {
+      if (sessionContextMenuRef.current?.contains(event.target as Node)) return;
+      setSessionContextMenu(null);
+    };
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setSessionContextMenu(null);
+    };
+    const handleViewportChange = () => setSessionContextMenu(null);
+    document.addEventListener('pointerdown', handlePointerDown, true);
+    document.addEventListener('keydown', handleKeyDown);
+    window.addEventListener('resize', handleViewportChange);
+    window.addEventListener('scroll', handleViewportChange, true);
+    return () => {
+      document.removeEventListener('pointerdown', handlePointerDown, true);
+      document.removeEventListener('keydown', handleKeyDown);
+      window.removeEventListener('resize', handleViewportChange);
+      window.removeEventListener('scroll', handleViewportChange, true);
+    };
+  }, [sessionContextMenu]);
 
   const handleRenameStart = useCallback((s: Session, e: React.MouseEvent) => {
     e.stopPropagation();
@@ -523,6 +561,73 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
           transition: background 0.15s, transform 0.1s;
           user-select: none;
         }
+        .awu-session-context-menu {
+          position: fixed;
+          width: 224px;
+          max-height: calc(100vh - 16px);
+          padding: 6px;
+          overflow-y: auto;
+          border: 1px solid var(--theme-border, rgba(127,127,127,.24));
+          border-radius: 9px;
+          background: var(--theme-bg-secondary, #fff);
+          box-shadow: 0 14px 38px rgba(0,0,0,.28), 0 2px 8px rgba(0,0,0,.16);
+          z-index: 1600;
+          user-select: none;
+          animation: awuSessionContextIn .12s ease-out;
+        }
+        @keyframes awuSessionContextIn {
+          from { opacity: 0; transform: translateY(-3px) scale(.985); }
+          to { opacity: 1; transform: translateY(0) scale(1); }
+        }
+        .awu-session-context-title {
+          padding: 6px 9px 7px;
+          overflow: hidden;
+          color: var(--theme-text-muted, #656d76);
+          font-size: 10px;
+          line-height: 1.35;
+          text-overflow: ellipsis;
+          white-space: nowrap;
+        }
+        .awu-session-context-item {
+          width: 100%;
+          min-height: 32px;
+          padding: 6px 9px;
+          display: flex;
+          align-items: center;
+          gap: 9px;
+          border: 0;
+          border-radius: 6px;
+          background: transparent;
+          color: var(--theme-text, #1f2328);
+          cursor: pointer;
+          font: 12px/1.35 inherit;
+          text-align: left;
+        }
+        .awu-session-context-item:hover:not(:disabled),
+        .awu-session-context-item:focus-visible:not(:disabled) {
+          outline: none;
+          background: var(--theme-accent-bg, rgba(122,162,247,.14));
+          color: var(--theme-accent, #7aa2f7);
+        }
+        .awu-session-context-item:disabled {
+          opacity: .42;
+          cursor: not-allowed;
+        }
+        .awu-session-context-icon {
+          width: 17px;
+          flex: 0 0 17px;
+          color: var(--theme-text-muted, #656d76);
+          font-size: 14px;
+          text-align: center;
+        }
+        .awu-session-context-item-danger {
+          color: var(--theme-error, #ef4444);
+        }
+        .awu-session-context-separator {
+          height: 1px;
+          margin: 5px 4px;
+          background: var(--theme-border, rgba(127,127,127,.2));
+        }
         .session-notify-badge:hover {
           background: #dc2626;
           transform: scale(1.2) !important;
@@ -697,7 +802,7 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
                 const isRunning = streamingSessions.has(s.id);
                 const isCompleted = !isRunning && completedSessions.has(s.id);
                 const isActive = s.id === activeSessionId;
-                const isHovered = hoveredSessionId === s.id;
+                const isContextTarget = sessionContextMenu?.session.id === s.id;
                 // “接管既有 thread”是来源，“SSH Codex”是执行位置；两者可同时成立。
                 const isCodexAttached = s.codexThreadAttached === true
                   || (s.codexThreadAttached === undefined && s.codexConnectionMode === 'node');
@@ -707,14 +812,21 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
                 return (
                 <div
                   key={s.id}
-                  onClick={() => onSelectSession(s.id)}
-                  onMouseEnter={() => setHoveredSessionId(s.id)}
-                  onMouseLeave={() => setHoveredSessionId(null)}
+                  onClick={() => {
+                    setSessionContextMenu(null);
+                    onSelectSession(s.id);
+                  }}
+                  onContextMenu={(event) => {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    setSessionContextMenu({ session: s, x: event.clientX, y: event.clientY });
+                  }}
+                  aria-haspopup="menu"
                   className={isRunning ? 'session-streaming-item' : undefined}
                   style={{
                     ...itemStyle,
                     background: rowBackground,
-                    ...(isHovered ? { boxShadow: 'inset 0 0 0 1px var(--theme-border, rgba(122,162,247,.3))' } : {}),
+                    ...(isContextTarget && !isActive ? { boxShadow: 'inset 0 0 0 1px var(--theme-accent, #7aa2f7)' } : {}),
                     ...(isActive ? { boxShadow: 'inset 2px 0 0 var(--theme-accent, #7aa2f7)' } : {}),
                     ...(isRunning ? { borderColor: '#22c55e55' } : {}),
                     ...(isCompleted ? { borderColor: '#ef444455' } : {}),
@@ -748,6 +860,7 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
                       onBlur={handleRenameConfirm}
                       onKeyDown={handleRenameKeyDown}
                       onClick={(e) => e.stopPropagation()}
+                      onContextMenu={(e) => e.stopPropagation()}
                       autoFocus
                       style={renameInputStyle}
                     />
@@ -764,48 +877,16 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
                     </div>
                   )}
                   <div style={compactActionsStyle}>
-                    {isHovered ? (
-                      <>
-                        <button
-                          onClick={(e) => { e.stopPropagation(); updateAppearance(s, { pinned: !s.pinned }); }}
-                          style={{ ...actionBtnStyle, color: s.pinned ? '#f5c451' : 'var(--theme-text-muted)' }}
-                          title={s.pinned ? '取消置顶' : '收藏并置顶'}
-                        >
-                          {s.pinned ? '★' : '☆'}
-                        </button>
-                        <button
-                          onClick={(e) => { e.stopPropagation(); setAppearancePickerSession(s); }}
-                          style={actionBtnStyle}
-                          title="配置底色"
-                        >
-                          ◐
-                        </button>
-                        <button onClick={(e) => handleRenameStart(s, e)} style={actionBtnStyle} title="重命名">✎</button>
-                        <button onClick={(e) => openAbilityPicker(s, e)} style={actionBtnStyle} title="绑定能力">🧩</button>
-                        <button onClick={(e) => handleDeleteClick(s, e)} style={actionBtnStyle} title="删除" disabled={isRunning}>×</button>
-                        <button
-                          onClick={(e) => handleDestroyClick(s, e)}
-                          style={{ ...actionBtnStyle, color: 'var(--theme-error, #ef4444)' }}
-                          title="销毁 Session 与整个工作目录"
-                          disabled={isRunning}
-                        >
-                          ♨
-                        </button>
-                      </>
-                    ) : (
-                      <>
-                      <span
-                        style={{
-                          ...compactBackendStyle,
-                          background: getBackendBadgeColor(s.backendId),
-                        }}
-                        title={getBackendShortLabel(s.backendId)}
-                      >
-                        {getBackendShortLabel(s.backendId)}
-                      </span>
-                        {s.pinned && <span style={{ color: '#f5c451', fontSize: 13 }} title="已置顶">★</span>}
-                      </>
-                    )}
+                    <span
+                      style={{
+                        ...compactBackendStyle,
+                        background: getBackendBadgeColor(s.backendId),
+                      }}
+                      title={getBackendShortLabel(s.backendId)}
+                    >
+                      {getBackendShortLabel(s.backendId)}
+                    </span>
+                    {s.pinned && <span style={{ color: '#f5c451', fontSize: 13 }} title="已置顶">★</span>}
                   </div>
                 </div>
               );
@@ -826,6 +907,107 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
           </div>
         )}
       </div>
+      )}
+
+      {sessionContextMenu && (
+        <div
+          ref={sessionContextMenuRef}
+          className="awu-session-context-menu"
+          role="menu"
+          aria-label={`${sessionContextMenu.session.title} 的会话操作`}
+          style={{ left: sessionContextMenu.x, top: sessionContextMenu.y }}
+          onClick={(event) => event.stopPropagation()}
+          onContextMenu={(event) => event.preventDefault()}
+        >
+          <div className="awu-session-context-title" title={sessionContextMenu.session.title}>
+            {sessionContextMenu.session.title}
+          </div>
+          <button
+            type="button"
+            className="awu-session-context-item"
+            role="menuitem"
+            onClick={(event) => {
+              event.stopPropagation();
+              const target = sessionContextMenu.session;
+              setSessionContextMenu(null);
+              void updateAppearance(target, { pinned: !target.pinned });
+            }}
+          >
+            <span className="awu-session-context-icon">{sessionContextMenu.session.pinned ? '★' : '☆'}</span>
+            <span>{sessionContextMenu.session.pinned ? '取消置顶' : '收藏并置顶'}</span>
+          </button>
+          <button
+            type="button"
+            className="awu-session-context-item"
+            role="menuitem"
+            onClick={(event) => {
+              event.stopPropagation();
+              const target = sessionContextMenu.session;
+              setSessionContextMenu(null);
+              setAppearancePickerSession(target);
+            }}
+          >
+            <span className="awu-session-context-icon">◐</span>
+            <span>配置底色</span>
+          </button>
+          <button
+            type="button"
+            className="awu-session-context-item"
+            role="menuitem"
+            onClick={(event) => {
+              const target = sessionContextMenu.session;
+              setSessionContextMenu(null);
+              handleRenameStart(target, event);
+            }}
+          >
+            <span className="awu-session-context-icon">✎</span>
+            <span>重命名</span>
+          </button>
+          <button
+            type="button"
+            className="awu-session-context-item"
+            role="menuitem"
+            onClick={(event) => {
+              const target = sessionContextMenu.session;
+              setSessionContextMenu(null);
+              void openAbilityPicker(target, event);
+            }}
+          >
+            <span className="awu-session-context-icon">🧩</span>
+            <span>绑定能力</span>
+          </button>
+          <div className="awu-session-context-separator" role="separator" />
+          <button
+            type="button"
+            className="awu-session-context-item"
+            role="menuitem"
+            disabled={streamingSessions.has(sessionContextMenu.session.id)}
+            title={streamingSessions.has(sessionContextMenu.session.id) ? '会话运行中，暂时无法删除' : '仅删除会话记录，保留工作目录'}
+            onClick={(event) => {
+              const target = sessionContextMenu.session;
+              setSessionContextMenu(null);
+              handleDeleteClick(target, event);
+            }}
+          >
+            <span className="awu-session-context-icon">×</span>
+            <span>删除会话（保留目录）</span>
+          </button>
+          <button
+            type="button"
+            className="awu-session-context-item awu-session-context-item-danger"
+            role="menuitem"
+            disabled={streamingSessions.has(sessionContextMenu.session.id)}
+            title={streamingSessions.has(sessionContextMenu.session.id) ? '会话运行中，暂时无法销毁' : '永久删除会话与整个工作目录'}
+            onClick={(event) => {
+              const target = sessionContextMenu.session;
+              setSessionContextMenu(null);
+              handleDestroyClick(target, event);
+            }}
+          >
+            <span className="awu-session-context-icon">♨</span>
+            <span>销毁会话与工作目录</span>
+          </button>
+        </div>
       )}
 
       {/* 能力绑定面板 */}

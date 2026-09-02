@@ -1,8 +1,9 @@
 import React, { useEffect, useState } from 'react';
 import { api } from '../api';
 import {
-  CodexRuntimeFields,
+  BackendRuntimeFields,
   isCodexBackend,
+  isRuntimeConfigurableBackend,
   normalizeModelRuntime,
   type ModelRuntime,
 } from './CodexRuntimeFields';
@@ -15,13 +16,14 @@ export interface LoopPolicy {
   riskThreshold: number;
   independentEval: boolean;
   intentGuard: boolean;
-  backends: Record<string, string>;   // 各分析/转换位置的专用 backend：{idea/goal/analysis/aside}
+  backends: Record<string, string>;   // 各分析/转换位置的专用 backend：{prepare/idea/goal/analysis/aside}
   runtimes: Record<string, ModelRuntime>; // 各角色的模型/推理档位覆盖
   strategy: string;
 }
 
-// 可路由的「AI 分析/转换」位置（执行 execute/step 不在此列，留在会话 backend）
+// 可路由的「AI 分析/转换」位置（真正执行 execute/step 留在会话 backend）
 export const BACKEND_POSITIONS: { key: string; label: string; hint: string }[] = [
+  { key: 'prepare', label: '规划与分步', hint: 'Prepare：识别焦点并拆成 1–4 步' },
   { key: 'idea', label: '想法展开', hint: 'loopidea 阶段' },
   { key: 'goal', label: '目标汇总 / 微调', hint: 'ideas→目标 / 微调' },
   { key: 'analysis', label: '评分 / 评审', hint: '关键评审位' },
@@ -29,8 +31,9 @@ export const BACKEND_POSITIONS: { key: string; label: string; hint: string }[] =
 ];
 
 export const RUNTIME_POSITIONS: { key: string; label: string; hint: string }[] = [
-  { key: 'execute', label: '任务执行', hint: 'Prepare / Execute / 分步' },
-  ...BACKEND_POSITIONS,
+  { key: 'prepare', label: '规划与分步', hint: 'Prepare：理解目标、核实现状、生成步骤' },
+  { key: 'execute', label: '逐步执行', hint: 'Execute：实际执行每个 step 并汇总' },
+  ...BACKEND_POSITIONS.filter((position) => position.key !== 'prepare'),
 ];
 
 export const DEFAULT_STRATEGY =
@@ -145,6 +148,7 @@ export const LoopPolicyEditor: React.FC<{
     set({
       runtimes: {
         ...(value.runtimes || {}),
+        prepare: { model: 'gpt-5.6-sol', reasoningEffort: 'max' },
         execute: { model: 'gpt-5.6-terra', reasoningEffort: 'medium' },
         analysis: { model: 'gpt-5.6-sol', reasoningEffort: 'max' },
       },
@@ -213,8 +217,8 @@ export const LoopPolicyEditor: React.FC<{
           <span style={{ ...labelText, marginBottom: 0 }}>角色运行配置（Backend / 模型 / 推理档位）</span>
           {codexBackend && (
             <button type="button" onClick={applyCodexSplit} style={{ ...smallBtn, marginLeft: 'auto', padding: '4px 8px', fontSize: 11 }}
-              title="执行使用 Terra / medium；独立评审使用 Sol / max">
-              ⚡ Terra 中档执行 / Sol 顶格评审
+              title="规划与评审使用 Sol / max；逐步执行使用 Terra / medium">
+              ⚡ Sol 顶格规划/评审 · Terra 中档执行
             </button>
           )}
         </div>
@@ -224,9 +228,12 @@ export const LoopPolicyEditor: React.FC<{
             const roleBackendId = backendOverride || sessionBackendId || '';
             const roleBackend = backends.find((b) => b.id === roleBackendId);
             const executeRuntime = normalizeModelRuntime(value.runtimes?.execute);
+            const followsSessionBackend = !roleBackendId || roleBackendId === sessionBackendId;
             const inheritedRuntime = pos.key === 'execute'
               ? normalizeModelRuntime(sessionRuntime)
-              : normalizeModelRuntime({ ...sessionRuntime, ...executeRuntime });
+              : followsSessionBackend
+                ? normalizeModelRuntime({ ...sessionRuntime, ...executeRuntime })
+                : {};
             const roleRuntime = normalizeModelRuntime(value.runtimes?.[pos.key]);
             return (
               <div key={pos.key} style={{
@@ -237,26 +244,30 @@ export const LoopPolicyEditor: React.FC<{
                   <span style={{ fontSize: 12, color: 'var(--theme-text)', fontWeight: 650 }}>{pos.label}</span>
                   <span style={{ fontSize: 10.5, color: 'var(--theme-text-muted)' }}>{pos.hint}</span>
                   {roleBackend && (
-                    <span style={{ marginLeft: 'auto', fontSize: 10, color: isCodexBackend(roleBackend) ? '#22c55e' : 'var(--theme-text-muted)' }}>
-                      {isCodexBackend(roleBackend) ? 'Codex · 可分档' : roleBackend.type}
+                    <span style={{ marginLeft: 'auto', fontSize: 10, color: isRuntimeConfigurableBackend(roleBackend) ? '#22c55e' : 'var(--theme-text-muted)' }}>
+                      {isCodexBackend(roleBackend)
+                        ? 'Codex · 可选模型/档位'
+                        : isRuntimeConfigurableBackend(roleBackend) ? 'Qwen · 可选模型' : roleBackend.type}
                     </span>
                   )}
                 </div>
                 {pos.key !== 'execute' && (
                   <select value={backendOverride}
                     onChange={(e) => set({ backends: { ...(value.backends || {}), [pos.key]: e.target.value } })}
-                    style={{ ...inputBase, width: '100%', marginBottom: isCodexBackend(roleBackend) ? 8 : 0 }}>
+                    style={{ ...inputBase, width: '100%', marginBottom: isRuntimeConfigurableBackend(roleBackend) ? 8 : 0 }}>
                     <option value="">跟随会话 Backend</option>
                     {backends.map((b) => <option key={b.id} value={b.id}>{b.label || b.id}</option>)}
                   </select>
                 )}
-                {roleBackend && isCodexBackend(roleBackend) && (
-                  <CodexRuntimeFields
+                {roleBackend && isRuntimeConfigurableBackend(roleBackend) && (
+                  <BackendRuntimeFields
                     backend={roleBackend}
                     value={roleRuntime}
                     inherited={inheritedRuntime}
                     compact
-                    inheritLabel={pos.key === 'execute' ? '跟随会话默认' : '跟随任务执行配置'}
+                    inheritLabel={pos.key === 'execute'
+                      ? '跟随会话默认'
+                      : followsSessionBackend ? '跟随逐步执行配置' : '跟随所选 Backend 默认'}
                     onChange={(runtime) => set({
                       runtimes: { ...(value.runtimes || {}), [pos.key]: runtime },
                     })}
@@ -267,8 +278,8 @@ export const LoopPolicyEditor: React.FC<{
           })}
         </div>
         <div style={{ fontSize: 10.5, color: 'var(--theme-text-muted)', marginTop: 4, lineHeight: 1.5 }}>
-          执行始终使用会话 Backend，但可在同一个 Codex 账号下换模型/档位；分析位置还能切换异构 Backend。
-          例如执行用 Terra / medium，评审用 Sol / max，无需复制两份 Codex Backend。
+          规划与分步可单独选择更强 Backend / 模型，逐步执行仍使用会话 Backend，但可独立指定 Codex 或 Qwen 模型。
+          例如 Sol / max 负责拆步、Terra / medium 逐步执行、Sol / max 独立评审；旧策略留空时规划会继续跟随执行配置。
         </div>
         {ledger.length > 0 && (
           <div style={{ marginTop: 8 }}>
@@ -286,6 +297,7 @@ export const LoopPolicyEditor: React.FC<{
                       {ex?.avgScore != null
                         ? <span>执行均分 <b style={{ color: 'var(--theme-text)' }}>{ex.avgScore.toFixed(0)}</b>（{ex.scored} 次）</span>
                         : <span>暂无执行评分</span>}
+                      {m.roles?.prepare?.count ? <span>· 规划 {m.roles.prepare.count} 次</span> : null}
                       {m.roles?.analysis?.count ? <span>· 评审 {m.roles.analysis.count} 次</span> : null}
                     </div>
                   );

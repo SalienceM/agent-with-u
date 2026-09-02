@@ -40,9 +40,9 @@ interface LoopRecord {
   completed: boolean; result: string; analysis: LoopAnalysis | null; error: string;
   subStarted?: Record<string, number>; createdAt?: number; updatedAt?: number;
   hasGitCheckpoint?: boolean;
-  backends?: Record<string, string>;          // {execute, analysis} → backend id
-  runtimes?: Record<string, ModelRuntime>;    // {execute, analysis} → 实际模型/档位
-  backendLabels?: Record<string, string>;     // {execute, analysis} → 可读 label
+  backends?: Record<string, string>;          // {prepare, execute, analysis} → backend id
+  runtimes?: Record<string, ModelRuntime>;    // {prepare, execute, analysis} → 实际模型/档位
+  backendLabels?: Record<string, string>;     // {prepare, execute, analysis} → 可读 label
   manualMessages?: Array<{
     id: string; role: string; content: string; timestamp?: number; streaming?: boolean;
     toolCalls?: Array<{ name: string; status?: string; input?: string; output?: string; error?: string }>;
@@ -1567,7 +1567,8 @@ const FlowLane: React.FC<{
       <FlowChip title={`Loop #${loop.seq}`} status={done ? 'done' : (loop.error ? 'error' : (live ? 'running' : 'current'))}
         sub={score != null ? `score ${score.toFixed(0)}` : (loop.round > 1 ? `第${loop.round}轮` : '进行中')} big />
       <FlowEdge active={nstatus(0) === 'running'} done={nstatus(0) !== 'pending'} />
-      <FlowChip title="Prepare" status={nstatus(0)} dur={fmtDur(subDur(0))} />
+      <FlowChip title="Prepare" status={nstatus(0)} dur={fmtDur(subDur(0))}
+        tag={<BackendTag role="prepare" label={loop.backendLabels?.prepare} />} />
       <FlowEdge active={nstatus(1) === 'running'} done={nstatus(1) !== 'pending'} />
       {/* Execute：含分步 */}
       <FlowChip title="Execute" status={nstatus(1)} dur={fmtDur(subDur(1))}
@@ -1824,7 +1825,12 @@ const LoopDetail: React.FC<{ loop: LoopRecord; progress: Record<string, string>;
         )}
       </Section>
 
-      <Section title="编排与分步执行（点步可展开产出）">
+      <Section title="编排与分步执行（点步可展开产出）" extra={(
+        <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4, flexWrap: 'wrap' }}>
+          <BackendTag role="prepare" label={loop.backendLabels?.prepare} />
+          <BackendTag role="execute" label={loop.backendLabels?.execute} />
+        </span>
+      )}>
         {loop.orchestration.length === 0 ? (livePrep ? <Live text={livePrep} /> : '—') : (
           <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
             {groups.map((g, gi) => g.length > 1 ? (
@@ -1894,12 +1900,14 @@ const Section: React.FC<{ title: string; extra?: React.ReactNode; children: Reac
   </div>
 );
 
-// 一个紧凑的 backend 选型标签：标出某阶段实际跑在哪个 backend（执行 / 评审）
-const BackendTag: React.FC<{ role: 'execute' | 'analysis'; label?: string }> = ({ role, label }) => {
+// 一个紧凑的 backend 选型标签：标出某阶段实际跑在哪个 backend（规划 / 执行 / 评审）
+const BackendTag: React.FC<{ role: 'prepare' | 'execute' | 'analysis'; label?: string }> = ({ role, label }) => {
   if (!label) return null;
   const meta = role === 'analysis'
-    ? { icon: '🔍', tip: '评审 backend', col: '#8957e5' }
-    : { icon: '⚙️', tip: '执行 backend', col: '#0969da' };
+    ? { icon: '🔍', tip: '评审 backend / 模型', col: '#8957e5' }
+    : role === 'prepare'
+      ? { icon: '🧭', tip: '规划 backend / 模型', col: '#d29922' }
+      : { icon: '⚙️', tip: '执行 backend / 模型', col: '#0969da' };
   return (
     <span title={`${meta.tip}：${label}`} style={{
       display: 'inline-flex', alignItems: 'center', gap: 4, fontSize: 10.5,

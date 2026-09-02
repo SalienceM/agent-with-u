@@ -238,6 +238,39 @@ class BackendEnabledTests(unittest.TestCase):
                     ["existing", "imported"],
                 )
 
+    def test_bridge_save_backend_preserves_reusable_nested_configuration(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "backends").mkdir()
+            with patch("src.backend.backend_store.paths.sub", side_effect=lambda name: root / name):
+                store = BackendStore()
+                bridge = BridgeWS.__new__(BridgeWS)
+                bridge._backend_store = store
+                bridge._backend_configs = []
+                bridge._backends = {}
+
+                bridge._rpc_saveBackend(json.dumps({
+                    "id": "copied-openai",
+                    "type": "openai-compatible",
+                    "label": "Copied OpenAI",
+                    "baseUrl": "https://gateway.example.test/v1",
+                    "model": "enterprise-model",
+                    "apiKey": "secret-key",
+                    "extraHeaders": {"X-Tenant": "team-a"},
+                    "allowedTools": ["Read", "Bash"],
+                    "mcpServers": {"repo": {"command": "npx", "args": ["repo-mcp"]}},
+                }))
+
+                saved = store.get("copied-openai")
+                self.assertIsNotNone(saved)
+                self.assertEqual(saved.api_key, "secret-key")
+                self.assertEqual(saved.extra_headers, {"X-Tenant": "team-a"})
+                self.assertEqual(saved.allowed_tools, ["Read", "Bash"])
+                self.assertEqual(
+                    saved.mcp_servers,
+                    {"repo": {"command": "npx", "args": ["repo-mcp"]}},
+                )
+
 
 if __name__ == "__main__":
     unittest.main()

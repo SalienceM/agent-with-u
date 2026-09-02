@@ -407,21 +407,24 @@ are a per-session `LoopPolicy` on the stage file (`loop_store.LoopPolicy`):
 `deliverable_score` (70), `outputtable_score` (85), `max_loops` (8),
 `risk_threshold` (0.85 — risk ≥ this seals to loopout), `independent_eval` (True),
 `intent_guard` (True — see below),
-a per-position **`backends` map** (`{idea, goal, analysis, aside}` → backend id;
+a per-position **`backends` map** (`{prepare, idea, goal, analysis, aside}` → backend id;
 each empty = follow the session) so every "AI analysis/transformation" point can run
 on a **different backend** than the executor for heterogeneous cross-evaluation —
 these all run on independent contexts so cross-backend is safe; execution
 (execute/step) always stays on the session backend. A separate per-position
-**`runtimes` map** (`{execute, idea, goal, analysis, aside}` →
+**`runtimes` map** (`{prepare, execute, idea, goal, analysis, aside}` →
 `{model, reasoningEffort}`) lets one Codex backend use different models/effort by
-role; non-execute roles inherit the execute profile unless overridden. Thus a
-typical policy can execute with Terra/medium and independently review with
-Sol/max without cloning backend configs. The backend and resolved runtime actually used per
-loop is persisted on `LoopRecord.backends` (`{execute, analysis}`) and the payload
+role; non-execute roles on the session backend inherit the execute profile unless
+overridden, while roles routed to another backend inherit that backend's own default. `prepare`
+is deliberately separate from `execute`: a stronger model/backend may identify the
+increment focus and produce the 1–4 step plan, while the session backend executes
+each step with a cheaper model. Thus a typical policy can plan and review with
+Sol/max while executing with Terra/medium without cloning backend configs. The backend and resolved runtime actually used per
+loop is persisted on `LoopRecord.backends` (`{prepare, execute, analysis}`) and the payload
 also stores `LoopRecord.runtimes`; `_loop_payload` resolves both into readable
 labels (`backendLabels`). The
-LoopPanel result sections and the flow-view Execute/Analysis chips show a compact
-**backend tag** (⚙️ 执行 / 🔍 评审) so you can see who executed vs. who reviewed. `_loop_run_agent`/`_run_aside`
+LoopPanel result sections and the flow-view Prepare/Execute/Analysis chips show a compact
+**backend tag** (🧭 规划 / ⚙️ 执行 / 🔍 评审) so you can see who planned, executed, and reviewed. `_loop_run_agent`/`_run_aside`
 resolve the override and fall back to the session backend if it's missing; legacy
 `evalBackendId` migrates into `analysis`+`goal`. Plus a free-text `strategy` ("心智")
 injected as a "must follow" block into every `prepare` and `analysis` prompt. **Anti-self-deception**: the default

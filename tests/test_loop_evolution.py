@@ -93,6 +93,60 @@ class LoopEvolutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(addon.status, "applied")
         self.assertEqual(addon.applied_seq, current.seq)
 
+    async def test_prepare_uses_distinct_planner_backend_and_runtime(self) -> None:
+        current = LoopRecord(seq=1, round=1)
+        state = LoopState(
+            session_id="split-planner",
+            stage=STAGE_EXECUTE,
+            goal="完成一项需要先准确拆步的任务",
+            loops=[current],
+            policy=LoopPolicy.from_dict({
+                "backends": {"prepare": "strong-planner"},
+                "runtimes": {
+                    "prepare": {"model": "planner-model", "reasoningEffort": "max"},
+                    "execute": {"model": "worker-model", "reasoningEffort": "low"},
+                },
+            }),
+        )
+        state.policy.intent_guard = False
+        session = SimpleNamespace(id=state.session_id, backend_id="worker")
+        bridge = self._bridge()
+        bridge._backend_configs = [
+            SimpleNamespace(id="worker"),
+            SimpleNamespace(id="strong-planner"),
+        ]
+        bridge._loop_runtime = lambda _session, _state, pos, _backend_id=None: _state.policy.runtime_for(pos)
+        bridge._resolved_runtime = lambda _backend_id, runtime: dict(runtime)
+        calls: list[dict] = []
+
+        async def run_agent(_session, _prompt, *_args, **kwargs):
+            calls.append(kwargs)
+            if len(calls) == 1:
+                return ("规划模型第一次没有给出合法 JSON", None)
+            return (
+                "```json\n"
+                '{"goal":"准确拆分当前任务","orchestration":['
+                '{"mode":"sequential","access":"read","desc":"先核实现状"},'
+                '{"mode":"sequential","access":"write","desc":"再执行修正"}]}'
+                "\n```",
+                None,
+            )
+
+        bridge._loop_run_agent = run_agent
+        await bridge._loop_do_prepare(session, state, current, history="")
+
+        self.assertEqual(len(calls), 2)
+        for call in calls:
+            self.assertEqual(call["backend_id"], "strong-planner")
+            self.assertEqual(call["runtime"], {
+                "model": "planner-model", "reasoningEffort": "max",
+            })
+        self.assertEqual(current.backends["prepare"], "strong-planner")
+        self.assertEqual(current.backends["execute"], "worker")
+        self.assertEqual(current.runtimes["prepare"]["model"], "planner-model")
+        self.assertEqual(current.runtimes["execute"]["model"], "worker-model")
+        self.assertEqual(len(current.orchestration), 2)
+
     async def test_analysis_scores_cumulative_state_and_emits_next_diagnosis(self) -> None:
         previous = LoopRecord(
             seq=1,

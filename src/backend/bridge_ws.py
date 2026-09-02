@@ -4649,7 +4649,7 @@ class BridgeWS:
             and not d["resumable"]
         )
         # ★ 把每条 loop 实际用到的 backend + model + reasoning effort 解析成可读 label，
-        #   供面板/流程视图准确追溯「谁以什么档位执行、谁评审」。
+        #   供面板/流程视图准确追溯「谁以什么档位规划、执行、评审」。
         for rec in d.get("loops", []):
             bmap = rec.get("backends") or {}
             rmap = rec.get("runtimes") or {}
@@ -5705,7 +5705,18 @@ class BridgeWS:
     async def _loop_do_prepare(self, session, state, record, history) -> None:
         record.sub_stage = SUB_PREPARE
         record.mark_sub(SUB_PREPARE)
-        # prepare + execute 恒走会话 backend；记下来供结果展示标出选型
+        # 规划拆步与逐步执行是两种能力：prepare 可独立选择更强的规划 backend / 模型，
+        # execute 仍固定在会话 backend 上实际操作工作区。未配置 prepare 时继承 execute，
+        # 因而旧策略保持原行为。
+        requested_prepare_backend = state.policy.backend_for("prepare") or session.backend_id
+        if not any(c.id == requested_prepare_backend for c in self._backend_configs):
+            requested_prepare_backend = session.backend_id
+        record.backends["prepare"] = requested_prepare_backend
+        prepare_runtime = self._resolved_runtime(
+            requested_prepare_backend,
+            self._loop_runtime(session, state, "prepare", requested_prepare_backend),
+        )
+        record.runtimes["prepare"] = prepare_runtime
         record.backends["execute"] = session.backend_id
         execute_runtime = self._loop_runtime(session, state, "execute")
         record.runtimes["execute"] = self._resolved_runtime(session.backend_id, execute_runtime)
@@ -5715,7 +5726,7 @@ class BridgeWS:
         record.backends["analysis"] = requested_analysis_backend
         record.runtimes["analysis"] = self._resolved_runtime(
             requested_analysis_backend,
-            self._loop_runtime(session, state, "analysis"),
+            self._loop_runtime(session, state, "analysis", requested_analysis_backend),
         )
         record.updated_at = time.time()
         self._loop_save(state)
@@ -5779,7 +5790,8 @@ class BridgeWS:
                                            resume=False,
                                            indep_session_id=f"{session.id}:loop{record.seq}:prepare",
                                            images=addon_imgs or None,
-                                           runtime=execute_runtime)
+                                           backend_id=requested_prepare_backend,
+                                           runtime=prepare_runtime)
         # 消费这些 addon：标记为已纳入本次 loop
         for a in pending:
             a.status = "applied"
@@ -5810,7 +5822,8 @@ class BridgeWS:
                 session, retry_prompt, SUB_PREPARE, record.seq,
                 resume=False,
                 indep_session_id=f"{session.id}:loop{record.seq}:prepare:retry",
-                runtime=execute_runtime,
+                backend_id=requested_prepare_backend,
+                runtime=prepare_runtime,
             )
             rj = self._extract_json_block(rtext) or {}
             r_orch = rj.get("orchestration") or []
@@ -5895,6 +5908,17 @@ class BridgeWS:
     async def _loop_do_execute(self, session, state, record) -> None:
         record.sub_stage = SUB_EXECUTE
         record.mark_sub(SUB_EXECUTE)
+        # 兼容在旧版本 prepare 完成后升级并恢复的记录：为 execute 入口的兜底 re-plan
+        # 补齐独立规划选型；新记录则复用 prepare 时已经冻结的实际配置。
+        prepare_backend = record.backends.get("prepare") or state.policy.backend_for("prepare") or session.backend_id
+        if not any(c.id == prepare_backend for c in self._backend_configs):
+            prepare_backend = session.backend_id
+        record.backends["prepare"] = prepare_backend
+        if not record.runtimes.get("prepare"):
+            record.runtimes["prepare"] = self._resolved_runtime(
+                prepare_backend, self._loop_runtime(session, state, "prepare", prepare_backend),
+            )
+        prepare_runtime = record.runtimes.get("prepare") or {}
         record.backends.setdefault("execute", session.backend_id)
         if not record.runtimes.get("execute"):
             record.runtimes["execute"] = self._resolved_runtime(
@@ -5924,7 +5948,8 @@ class BridgeWS:
                 session, replan_prompt, SUB_EXECUTE, record.seq,
                 resume=False,
                 indep_session_id=f"{session.id}:loop{record.seq}:replan",
-                runtime=execute_runtime,
+                backend_id=prepare_backend,
+                runtime=prepare_runtime,
             )
             rj = self._extract_json_block(rtext) or {}
             r_orch = rj.get("orchestration") or []
@@ -6086,7 +6111,7 @@ class BridgeWS:
         # 记下本次评审实际用的 backend（可能是异构评审 backend），供结果展示标出选型
         record.backends["analysis"] = eval_backend
         analysis_runtime = record.runtimes.get("analysis") or self._resolved_runtime(
-            eval_backend, self._loop_runtime(session, state, "analysis"),
+            eval_backend, self._loop_runtime(session, state, "analysis", eval_backend),
         )
         record.runtimes["analysis"] = analysis_runtime
         # 指定了异构评审 backend 时，必须用独立上下文（跨 backend 无法 resume 同一会话）
@@ -6187,7 +6212,8 @@ class BridgeWS:
         scored_records = [l for l in state.round_loops() if l.analysis]
         if scored_records:
             state.best_seq = max(scored_records, key=lambda l: l.analysis.score).seq
-        # ★ 跨 session 模型台账：执行 backend 拿到这次评分（衡量"谁更能干"），评审 backend 记参与
+        # ★ 跨 session 模型台账：执行 backend 拿到这次评分（衡量"谁更能干"），
+        #   规划与评审 backend 分别记录角色参与和成功率。
         try:
             exec_bid = session.backend_id
             exec_started = float(record.sub_started.get(SUB_EXECUTE, 0) or 0)
@@ -6199,6 +6225,19 @@ class BridgeWS:
                 success=exec_success, duration_ms=exec_duration_ms,
                 model=exec_runtime.get("model", ""),
                 reasoning_effort=exec_runtime.get("reasoningEffort", ""),
+            )
+            prepare_bid = record.backends.get("prepare") or session.backend_id
+            prepare_runtime = record.runtimes.get("prepare") or {}
+            prepare_started = float(record.sub_started.get(SUB_PREPARE, 0) or 0)
+            prepare_duration_ms = (
+                (exec_started - prepare_started) * 1000
+                if prepare_started and exec_started >= prepare_started else None
+            )
+            self._model_ledger.record(
+                prepare_bid, self._backend_label(prepare_bid), "prepare",
+                success=bool(record.orchestration), duration_ms=prepare_duration_ms,
+                model=prepare_runtime.get("model", ""),
+                reasoning_effort=prepare_runtime.get("reasoningEffort", ""),
             )
             eval_bid = eval_backend or session.backend_id
             eval_runtime = record.runtimes.get("analysis") or {}
@@ -6679,7 +6718,8 @@ class BridgeWS:
                     "sandbox_enabled": session.sandbox_enabled,
                 }
                 self._add_runtime_kwargs(
-                    backend, aside_kwargs, self._loop_runtime(session, state, "aside"), session,
+                    backend, aside_kwargs,
+                    self._loop_runtime(session, state, "aside", backend_config_id), session,
                 )
                 await backend.send_message(**aside_kwargs)
             finally:
@@ -9786,6 +9826,7 @@ Kit 版本账本（版本属于 Kit，不属于 AI）：
                 cli_path=data.get("cliPath"),
                 qwen_context_window_size=data.get("qwenContextWindowSize"),
                 qwen_max_output_tokens=data.get("qwenMaxOutputTokens"),
+                extra_headers=data.get("extraHeaders") or None,
                 mcp_servers=data.get("mcpServers") or None,
             )
         self._backend_store.save(config)
@@ -12335,10 +12376,19 @@ except urllib.error.URLError as e:
             runtime["reasoningEffort"] = effort
         return runtime
 
-    def _loop_runtime(self, session: "Session", state: "LoopState", pos: str) -> dict:
-        """Resolve Session defaults plus the Loop role-specific runtime profile."""
-        runtime = self._session_runtime(session)
-        runtime.update(state.policy.runtime_for(pos))
+    def _loop_runtime(self, session: "Session", state: "LoopState", pos: str,
+                      backend_id: Optional[str] = None) -> dict:
+        """Resolve the runtime for one LOOP role.
+
+        A role on the Session backend inherits the Session/execute profile. A role routed
+        to another backend only applies its own explicit override and otherwise uses that
+        backend's configured default; forwarding an executor-only model name to a
+        heterogeneous planner/reviewer would defeat the split and can be invalid.
+        """
+        target_backend_id = backend_id or state.policy.backend_for(pos) or session.backend_id
+        inherit_execute = target_backend_id == session.backend_id
+        runtime = self._session_runtime(session) if inherit_execute else {}
+        runtime.update(state.policy.runtime_for(pos, inherit_execute=inherit_execute))
         return runtime
 
     def _resolved_runtime(self, backend_id: str, runtime: Optional[dict] = None) -> dict:
