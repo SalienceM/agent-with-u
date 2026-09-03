@@ -50,9 +50,13 @@ class RuntimeProfileTests(unittest.TestCase):
         })
 
     def test_prepare_backend_is_persisted_as_a_routable_role(self):
-        policy = LoopPolicy.from_dict({"backends": {"prepare": "strong-planner"}})
+        policy = LoopPolicy.from_dict({"backends": {
+            "prepare": "strong-planner", "execute": "efficient-worker",
+        }})
         self.assertEqual(policy.backend_for("prepare"), "strong-planner")
+        self.assertEqual(policy.backend_for("execute"), "efficient-worker")
         self.assertEqual(policy.to_dict()["backends"]["prepare"], "strong-planner")
+        self.assertEqual(policy.to_dict()["backends"]["execute"], "efficient-worker")
 
     def test_heterogeneous_planner_uses_its_default_not_executor_model(self):
         bridge = BridgeWS.__new__(BridgeWS)
@@ -74,6 +78,24 @@ class RuntimeProfileTests(unittest.TestCase):
         self.assertEqual(bridge._loop_runtime(session, state, "prepare", "planner"), {
             "model": "planner-model", "reasoningEffort": "max",
         })
+
+    def test_roles_only_inherit_execute_runtime_on_the_same_backend(self):
+        bridge = BridgeWS.__new__(BridgeWS)
+        session = SimpleNamespace(
+            backend_id="session-backend", model_override="session-model", reasoning_effort="low",
+        )
+        state = SimpleNamespace(policy=LoopPolicy.from_dict({
+            "backends": {"prepare": "worker", "execute": "worker"},
+            "runtimes": {"execute": {"model": "worker-model", "reasoningEffort": "high"}},
+        }))
+        self.assertEqual(
+            bridge._loop_runtime(session, state, "prepare", "worker", "worker"),
+            {"model": "worker-model", "reasoningEffort": "high"},
+        )
+        self.assertEqual(
+            bridge._loop_runtime(session, state, "analysis", "reviewer", "worker"),
+            {},
+        )
 
     def test_unknown_effort_is_dropped_but_custom_model_is_kept(self):
         policy = LoopPolicy.from_dict({

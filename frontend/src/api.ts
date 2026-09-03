@@ -11,7 +11,7 @@
 import type { GitDetectResult, GitStatusResult, GitDiffResult, GitCommitResult, GitLogResult, GitBranchesResult, GitPushPullResult, GitStashListResult } from './types/git';
 import type {
   WorkspaceKitState, WorkspaceKit, KitRun, KitGenerationRequest, KitGenerationResult,
-  KitGenerationJob, KitVersion, KitOptimizationMessage,
+  KitGenerationJob, KitVersion, KitOptimizationMessage, KitCapabilityMetadata,
 } from './types/workspaceKits';
 import type {
   ProvDocument, ProvOpenResult, ProvResolveResult, ProvSaveResult,
@@ -595,6 +595,8 @@ export interface ExecutorInfo {
   mode: 'local' | 'relay';
   isHome: boolean;      // 是否为当前 home(新建会话的默认落点)
   connected: boolean;   // 连接是否在线
+  /** Relay 主用户可管理节点级状态（发布、更新、Backend 配置）；undefined=旧节点未知。 */
+  canManageNode?: boolean;
 }
 
 interface RelayInspection {
@@ -965,6 +967,7 @@ class Conn {
   target: ExecTarget;
   isHome: boolean;
   ws: WebSocket | null = null;
+  canManageNode: boolean | undefined;
   ready: Promise<void>;
   private settleReady: () => void = () => {};
   private settled = false;
@@ -1058,6 +1061,7 @@ class Conn {
         connectionStatusCallbacks.forEach((cb) => cb(true));
       }
       if (this.key === 'local') localExecutorConfirmed = true;
+      if (target.mode === 'local' && this.canManageNode === undefined) this.canManageNode = true;
       notifyExecStatus();
       if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
       this.heartbeatTimer = setInterval(() => {
@@ -1106,6 +1110,7 @@ class Conn {
         try {
           const m = JSON.parse(e.data);
           if (m.t === 'ready') {
+            if (typeof m.canClaimLegacy === 'boolean') this.canManageNode = m.canClaimLegacy;
             relayHandshake = false;
             finishConnect();
             // 兼容旧版只保存 URL/token/deviceId 的配置：Relay 握手返回的
@@ -1569,6 +1574,7 @@ export function getExecutors(): ExecutorInfo[] {
       mode: c.target.mode,
       isHome: isEffectiveHome(c),
       connected: c.isOpen,
+      canManageNode: c.canManageNode,
     });
   };
   for (const c of pool.values()) {
@@ -2210,6 +2216,12 @@ export const api = {
     try { return JSON.parse(result); } catch { return []; }
   },
 
+  async getSessionTokenUsage(id: string): Promise<any | null> {
+    const result = await call('getSessionTokenUsage', id);
+    if (result === null || result === undefined) return null;
+    try { return JSON.parse(result); } catch { return null; }
+  },
+
   /** 获取 Session 所属执行端的 Backend，而不是客户端当前 home 节点的 Backend。 */
   async getSessionBackends(sessionId: string, includeDisabled = false): Promise<any[]> {
     await homeConn.ready;
@@ -2519,7 +2531,7 @@ export const api = {
     text: string,
     images?: any[],
     textAttachments?: any[],
-  ): Promise<{ status: string; message?: string }> {
+  ): Promise<{ status: string; seqTasks?: any[]; seqAuto?: boolean; message?: string }> {
     const imagesJson = images && images.length ? JSON.stringify(images) : '';
     const textAttachmentsJson = textAttachments && textAttachments.length
       ? JSON.stringify(textAttachments)
@@ -2534,7 +2546,7 @@ export const api = {
     );
     try { return JSON.parse(result); } catch { return { status: 'error', message: '响应解析失败' }; }
   },
-  async seqtaskRemove(sessionId: string, taskId: string): Promise<{ status: string }> {
+  async seqtaskRemove(sessionId: string, taskId: string): Promise<{ status: string; seqTasks?: any[]; seqAuto?: boolean; message?: string }> {
     const result = await call('seqtaskRemove', sessionId, taskId);
     try { return JSON.parse(result); } catch { return { status: 'error' }; }
   },
@@ -2545,11 +2557,11 @@ export const api = {
     const result = await call('steerSeqTask', sessionId, taskId);
     try { return JSON.parse(result); } catch { return { status: 'error', message: '响应解析失败' }; }
   },
-  async seqtaskReorder(sessionId: string, ids: string[]): Promise<{ status: string }> {
+  async seqtaskReorder(sessionId: string, ids: string[]): Promise<{ status: string; seqTasks?: any[]; seqAuto?: boolean; message?: string }> {
     const result = await call('seqtaskReorder', sessionId, JSON.stringify(ids));
     try { return JSON.parse(result); } catch { return { status: 'error' }; }
   },
-  async seqtaskSetAuto(sessionId: string, on: boolean): Promise<{ status: string }> {
+  async seqtaskSetAuto(sessionId: string, on: boolean): Promise<{ status: string; seqTasks?: any[]; seqAuto?: boolean; message?: string }> {
     const result = await call('seqtaskSetAuto', sessionId, on);
     try { return JSON.parse(result); } catch { return { status: 'error' }; }
   },
@@ -2567,7 +2579,7 @@ export const api = {
       return { status: 'offline', task: null, retryAfterMs: 1000 };
     }
   },
-  async seqtaskClear(sessionId: string): Promise<{ status: string }> {
+  async seqtaskClear(sessionId: string): Promise<{ status: string; seqTasks?: any[]; seqAuto?: boolean; message?: string }> {
     const result = await call('seqtaskClear', sessionId);
     try { return JSON.parse(result); } catch { return { status: 'error' }; }
   },
@@ -2577,6 +2589,14 @@ export const api = {
   },
 
   // ── Workspace Kits（实验）───────────────────────────────────
+  async kitCapabilityList(): Promise<{
+    status: string; protocolVersion?: number; capabilities?: KitCapabilityMetadata[]; message?: string;
+  }> {
+    const result = await call('kitCapabilityList');
+    return parseRpcObject(result, {
+      status: 'error', message: '执行端未响应 Kit 能力目录请求',
+    });
+  },
   async kitGetState(sessionId: string): Promise<({ status: string; message?: string } & Partial<WorkspaceKitState>)> {
     const result = await call('kitGetState', sessionId);
     try { return JSON.parse(result); } catch { return { status: 'error', message: 'Kit 状态解析失败' }; }
@@ -2768,6 +2788,14 @@ export const api = {
   onKitUpdated(cb: KitUpdatedCallback): () => void {
     kitUpdatedCallbacks.push(cb);
     return () => { kitUpdatedCallbacks = kitUpdatedCallbacks.filter((item) => item !== cb); };
+  },
+  async kitCapabilityRespond(
+    sessionId: string, runId: string, stepId: string, approved: boolean,
+  ): Promise<{ status: string; decision?: string; run?: KitRun; message?: string }> {
+    const result = await call('kitCapabilityRespond', sessionId, runId, stepId, approved);
+    return parseRpcObject(result, {
+      status: 'error', message: '执行端未响应能力确认请求，请检查连接后重试',
+    });
   },
   onKitGenerationUpdated(cb: KitGenerationUpdatedCallback): () => void {
     kitGenerationUpdatedCallbacks.push(cb);
@@ -4234,6 +4262,9 @@ function mockDispatch(method: string, params: any[]): any {
     case 'seqtaskRemove': case 'seqtaskSetAuto': return JSON.stringify({ status: 'ok' });
     case 'steerSeqTask': return JSON.stringify({ status: 'error', message: 'mock mode 不支持当前轮引导' });
     case 'seqtaskTakeNext': return JSON.stringify({ status: 'ok', task: null });
+    case 'kitCapabilityList': return JSON.stringify({
+      status: 'ok', protocolVersion: 1, capabilities: [],
+    });
     case 'kitGetState': return JSON.stringify({
       status: 'ok', sessionId: params[0], kits: [], runs: [], artifacts: [], dataMarket: [],
     });
@@ -4246,7 +4277,7 @@ function mockDispatch(method: string, params: any[]): any {
     case 'kitCreate': case 'kitUpdate': case 'kitDelete':
     case 'kitVersionList': case 'kitVersionGet': case 'kitVersionActivate':
     case 'kitOptimizeGet': case 'kitOptimizeAsk': case 'kitOptimizeFinalize':
-    case 'kitRun': case 'kitCancel': case 'kitResume': case 'kitClientStepStart': case 'kitClientStepComplete':
+    case 'kitRun': case 'kitCancel': case 'kitResume': case 'kitCapabilityRespond': case 'kitClientStepStart': case 'kitClientStepComplete':
     case 'kitClientFileStart': case 'kitClientFileChunk': case 'kitClientFileFinish':
     case 'kitSetControlMode': case 'kitTerminalCommand':
     case 'kitTerminalClose':
@@ -4259,6 +4290,11 @@ function mockDispatch(method: string, params: any[]): any {
     case 'listConnectedClients': return '[]';
     case 'loadSession': return 'null';
     case 'loadSessionMeta': return 'null';
+    case 'getSessionTokenUsage': return JSON.stringify({
+      inputTokens: 1200, outputTokens: 360, totalTokens: 1560,
+      actualTurns: 3, estimatedTurns: 0, turnCount: 3, coverage: 1,
+      events: [], contextEvents: [], latestContext: null,
+    });
     case 'loadSessionMessages': return 'null';
     case 'syncAttachedCodexSession': return JSON.stringify({ status: 'ok', changed: false });
     case 'deleteSession': return true;

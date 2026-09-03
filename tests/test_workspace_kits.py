@@ -253,6 +253,18 @@ class _SlowKitCompilerBackend(_FakeKitCompilerBackend):
 
     async def send_message(self, **kwargs):
         self.prompt = kwargs["content"]
+        kwargs["on_delta"](StreamDelta(
+            kwargs["session_id"], kwargs["message_id"], "thinking",
+            text="正在判断需要读取哪些文件",
+        ))
+        kwargs["on_delta"](StreamDelta(
+            kwargs["session_id"], kwargs["message_id"], "tool_start",
+            tool_call={"name": "read_file", "input": {"path": "README.md"}},
+        ))
+        kwargs["on_delta"](StreamDelta(
+            kwargs["session_id"], kwargs["message_id"], "tool_result",
+            tool_call={"name": "read_file", "status": "done", "output": "workspace context"},
+        ))
         self.started.set()
         await self.release.wait()
         kwargs["on_delta"](StreamDelta(
@@ -319,6 +331,14 @@ class WorkspaceKitGenerationTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(running["job"]["id"], job_id)
                 self.assertEqual(running["job"]["status"], "running")
                 self.assertIn("后台", running["job"]["request"]["objective"])
+                self.assertEqual(running["job"]["backendId"], "fake")
+                self.assertEqual(running["job"]["backendLabel"], "fake")
+                self.assertGreater(running["job"]["thinkingChars"], 0)
+                self.assertIn("需要读取哪些文件", running["job"]["thinkingPreview"])
+                self.assertTrue(any(
+                    item["type"] == "tool_start" and "read_file" in item["label"]
+                    for item in running["job"]["activities"]
+                ))
 
                 duplicate = json.loads(bridge._rpc_kitGenerateStart(session_id, json.dumps({
                     "objective": "不要重复提交",
@@ -332,11 +352,16 @@ class WorkspaceKitGenerationTests(unittest.IsolatedAsyncioTestCase):
             completed = json.loads(bridge._rpc_kitGenerationGet(session_id))
             self.assertEqual(completed["job"]["status"], "succeeded")
             self.assertEqual(completed["job"]["result"]["status"], "ok")
+            self.assertGreater(completed["job"]["outputChars"], 0)
+            self.assertIn("后台生成测试", completed["job"]["outputPreview"])
             persisted = WorkspaceKitStore().load(session_id)
             self.assertIsNotNone(persisted)
             assert persisted is not None
             self.assertEqual(persisted.generation_jobs[-1].status, "succeeded")
             self.assertIsNotNone(persisted.generation_jobs[-1].result)
+            self.assertGreater(persisted.generation_jobs[-1].output_chars, 0)
+            self.assertGreater(persisted.generation_jobs[-1].thinking_chars, 0)
+            self.assertTrue(persisted.generation_jobs[-1].activities)
 
     async def test_background_generation_can_be_cancelled(self):
         with tempfile.TemporaryDirectory() as tmp, patch.dict(
@@ -435,6 +460,9 @@ class WorkspaceKitGenerationTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(result["kit"]["generatedByAi"])
             self.assertEqual(result["kit"]["objective"], "关闭 start-amp.bat 启动的 CMD 和附属 Java")
             self.assertIn("java -jar amp.jar", fake.prompt)
+            self.assertIn("AgentWithU 能力目录", fake.prompt)
+            self.assertIn('"release.publish_latest"', fake.prompt)
+            self.assertIn('"argumentSchema"', fake.prompt)
             self.assertEqual(bridge._kit_get(session_id).kits, [])
             self.assertEqual(bridge._kit_get(session_id).runs, [])
 
@@ -609,6 +637,9 @@ class WorkspaceKitVersionTests(unittest.IsolatedAsyncioTestCase):
             assistant = asked["message"]
             self.assertTrue(assistant["ready"])
             factory.assert_called_once_with("review-backend")
+            self.assertIn("AgentWithU 能力目录", fake.prompt)
+            self.assertIn('"release.publish_latest"', fake.prompt)
+            self.assertIn('"requiresExplicitIntent": true', fake.prompt)
             persisted = bridge._kit_get("kit-optimize").kits[0]
             self.assertEqual(persisted.command, "Write-Output one")
             self.assertEqual(len(persisted.versions), 1)

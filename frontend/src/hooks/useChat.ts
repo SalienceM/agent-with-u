@@ -66,7 +66,14 @@ export interface ChatMessage {
   images?: ImageAttachment[];
   textAttachments?: TextAttachment[];
   backendId?: string;
-  usage?: { inputTokens?: number; outputTokens?: number };
+  usage?: {
+    inputTokens?: number;
+    outputTokens?: number;
+    cachedInputTokens?: number;
+    reasoningOutputTokens?: number;
+    contextTokens?: number;
+    contextWindow?: number;
+  };
   toolCalls?: ToolCall[];
   thinking?: string;
   streaming?: boolean;
@@ -1013,30 +1020,26 @@ export function useChat(
 
         // ── 费用统计 ──
         case '/cost': {
-          const msgs = messagesRef.current;
-          let totalInput = 0;
-          let totalOutput = 0;
-          let countWithUsage = 0;
-          msgs.forEach((m) => {
-            if (m.usage) {
-              totalInput += m.usage.inputTokens || 0;
-              totalOutput += m.usage.outputTokens || 0;
-              countWithUsage++;
-            }
-          });
+          const usage = await api.getSessionTokenUsage(sessionId);
+          const totalInput = Number(usage?.inputTokens || 0);
+          const totalOutput = Number(usage?.outputTokens || 0);
           const total = totalInput + totalOutput;
-          // 估算费用（以 Claude Sonnet 4 为例：input $3/M, output $15/M）
-          const costInput = (totalInput / 1_000_000) * 3;
-          const costOutput = (totalOutput / 1_000_000) * 15;
-          const costTotal = costInput + costOutput;
+          const actualTurns = Number(usage?.actualTurns || 0);
+          const estimatedTurns = Number(usage?.estimatedTurns || 0);
+          const contextTokens = Number(usage?.latestContext?.contextTokens || 0);
+          const contextWindow = Number(usage?.latestContext?.contextWindow || 0);
+          const contextLine = contextTokens && contextWindow
+            ? `\n\n当前上下文：**${Math.round(contextTokens / contextWindow * 100)}%**（${contextTokens.toLocaleString()} / ${contextWindow.toLocaleString()}）`
+            : '';
           sys(
-            `📊 **Token 用量统计**\n\n` +
-            `| 方向 | Tokens | 估算费用 |\n` +
-            `|------|--------|----------|\n` +
-            `| ↑ 输入 | ${totalInput.toLocaleString()} | $${costInput.toFixed(4)} |\n` +
-            `| ↓ 输出 | ${totalOutput.toLocaleString()} | $${costOutput.toFixed(4)} |\n` +
-            `| **合计** | **${total.toLocaleString()}** | **$${costTotal.toFixed(4)}** |\n\n` +
-            `_${countWithUsage} 条回复有用量数据。费用按 Sonnet 定价估算。_`
+            `📊 **当前 Session Token 总览**\n\n` +
+            `| 方向 | Tokens |\n` +
+            `|------|--------|\n` +
+            `| ↑ 输入 | ${totalInput.toLocaleString()} |\n` +
+            `| ↓ 输出 | ${totalOutput.toLocaleString()} |\n` +
+            `| **累计** | **${total.toLocaleString()}** |` +
+            contextLine + `\n\n` +
+            `_精确 usage ${actualTurns} 轮，文本估算 ${estimatedTurns} 轮。会话可能跨 Backend / 模型，未用单一模型价格制造误导性费用。_`
           );
           break;
         }

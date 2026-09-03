@@ -43,15 +43,43 @@ def test_xlsx_sheet_and_shared_strings_preview() -> None:
         "xl/_rels/workbook.xml.rels": """<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
           <Relationship Id="rId1" Target="worksheets/sheet1.xml"/></Relationships>""",
         "xl/sharedStrings.xml": """<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
-          <si><t>姓名</t></si><si><t>Alice</t></si></sst>""",
+          <si><t>姓名</t></si><si><t>Alice</t></si><si><t>合计</t></si></sst>""",
+        "xl/styles.xml": """<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+          <fonts count="2"><font><sz val="11"/></font><font><b/><color rgb="FFFFFFFF"/><sz val="11"/></font></fonts>
+          <fills count="3"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill>
+            <fill><patternFill patternType="solid"><fgColor rgb="FF4472C4"/></patternFill></fill></fills>
+          <borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders>
+          <cellXfs count="2"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/>
+            <xf numFmtId="0" fontId="1" fillId="2" borderId="0"><alignment horizontal="center" wrapText="1"/></xf></cellXfs>
+        </styleSheet>""",
         "xl/worksheets/sheet1.xml": """<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
-          <sheetData><row r="1"><c r="A1" t="s"><v>0</v></c><c r="B1"><v>42</v></c></row>
-          <row r="2"><c r="A2" t="s"><v>1</v></c></row></sheetData></worksheet>""",
+          <sheetViews><sheetView workbookViewId="0"><pane ySplit="1" topLeftCell="A2" state="frozen"/></sheetView></sheetViews>
+          <cols><col min="1" max="1" width="18" customWidth="1"/></cols>
+          <sheetData><row r="1" ht="24"><c r="A1" t="s" s="1"><v>0</v></c><c r="B1"><v>42</v></c>
+            <c r="C1" t="s" s="1"><v>2</v></c></row>
+          <row r="2"><c r="A2" t="s"><v>1</v></c><c r="B2"><f>B1*2</f><v>84</v></c></row>
+          <row r="3"><c r="B3"><f>SUM(B1:B2)</f></c></row></sheetData>
+          <mergeCells count="1"><mergeCell ref="C1:D1"/></mergeCells>
+          <autoFilter ref="A1:D3"/></worksheet>""",
     })
     result = preview_bytes("data.xlsx", data)
     assert result["status"] == "ok", result
-    assert result["sheets"][0]["name"] == "数据"
-    assert result["sheets"][0]["rows"] == [["姓名", "42"], ["Alice"]]
+    sheet = result["sheets"][0]
+    assert sheet["name"] == "数据"
+    assert sheet["rows"][0]["cells"][0]["value"] == "姓名"
+    assert sheet["rows"][1]["cells"][1]["formula"] == "B1*2"
+    assert sheet["rows"][1]["cells"][1]["value"] == "84"
+    assert sheet["rows"][2]["cells"][0]["value"] == ""
+    assert sheet["rows"][2]["cells"][0]["formulaCached"] is False
+    assert sheet["columns"][0]["width"] == 18
+    assert sheet["rows"][0]["height"] == 24
+    assert sheet["merges"][0]["ref"] == "C1:D1"
+    assert sheet["frozen"]["rows"] == 1
+    assert sheet["autoFilter"] == "A1:D3"
+    assert sheet["formulaCount"] == 2
+    assert sheet["cachedFormulaCount"] == 1
+    assert result["styles"][1]["fill"] == "#4472C4"
+    assert result["styles"][1]["bold"] is True
 
 
 def test_pptx_text_and_slide_image_preview() -> None:

@@ -3,7 +3,7 @@ import type { AppConfig, ThemeType } from '../hooks/useConfig';
 import { themes } from '../hooks/useConfig';
 import {
   api, isTauri, getConnectionTarget, getRelayUserProfile,
-  updateRelayUserProfile, rememberRelayUserProfile, getCurrentUserProfile,
+  updateRelayUserProfile, rememberRelayUserProfile,
   type RelayUserProfile,
 } from '../api';
 import {
@@ -357,13 +357,6 @@ export const Settings: React.FC<SettingsProps> = ({
   const [legacyClaimRunning, setLegacyClaimRunning] = useState(false);
   const [legacyClaimError, setLegacyClaimError] = useState('');
   const [legacyClaimResult, setLegacyClaimResult] = useState<{ count: number; backupPath: string } | null>(null);
-  const releasePreferenceKey = (() => {
-    const profile = getCurrentUserProfile();
-    return `awu.releaseCenterEnabled.v1:${profile.mode}:${profile.userId}`;
-  })();
-  const [releaseToolsEnabled, setReleaseToolsEnabled] = useState(() => {
-    try { return localStorage.getItem(releasePreferenceKey) === 'true'; } catch { return false; }
-  });
   const [releaseCenterOpen, setReleaseCenterOpen] = useState(false);
   const voicePreviewVersionRef = useRef(0);
   const voicePreviewAudioRef = useRef<HTMLAudioElement | null>(null);
@@ -417,12 +410,6 @@ export const Settings: React.FC<SettingsProps> = ({
   }, [activePage, isOpen, stopVoicePreview]);
 
   useEffect(() => () => stopVoicePreview(), [stopVoicePreview]);
-
-  useEffect(() => {
-    try { setReleaseToolsEnabled(localStorage.getItem(releasePreferenceKey) === 'true'); }
-    catch { setReleaseToolsEnabled(false); }
-    setReleaseCenterOpen(false);
-  }, [releasePreferenceKey]);
 
   useEffect(() => {
     if (!isOpen) return;
@@ -1563,38 +1550,21 @@ export const Settings: React.FC<SettingsProps> = ({
           </div>
         </div>}
 
-        {/* 发布工作台默认隐藏在折叠的维护者工具中，且开关只属于当前控制端用户。 */}
+        {/* 发布工作台仍按需加载，但不再依赖每台手机/浏览器各自开启一个隐藏开关。 */}
         {activePage === 'system' && <details style={sectionStyle}>
           <summary style={{
             color: 'var(--theme-text)', fontSize: 12, fontWeight: 600, cursor: 'pointer', userSelect: 'none',
           }}>维护者工具</summary>
           <div style={{ marginTop: 11, paddingTop: 10, borderTop: '1px solid var(--theme-border)' }}>
-            <label style={{ ...labelStyle, display: 'flex', alignItems: 'flex-start', gap: 8, cursor: 'pointer' }}>
-              <input
-                type="checkbox"
-                checked={releaseToolsEnabled}
-                onChange={(event) => {
-                  const enabled = event.target.checked;
-                  setReleaseToolsEnabled(enabled);
-                  if (!enabled) setReleaseCenterOpen(false);
-                  try { localStorage.setItem(releasePreferenceKey, String(enabled)); } catch { /* */ }
-                }}
-                style={{ marginTop: 2, accentColor: 'var(--theme-accent)' }}
-              />
-              <span>
-                启用发布工作台（仅当前控制端用户）
-                <span style={{ display: 'block', marginTop: 4, color: 'var(--theme-text-muted)', fontSize: 10, fontWeight: 400, lineHeight: 1.5 }}>
-                  按需加载的独立窗口，用于选择候选安装包、比较 stable、冻结清单并正式发布；打包和 Workspace Kit 永远只登记候选。
-                </span>
-              </span>
-            </label>
-            {releaseToolsEnabled && (
-              <button type="button" onClick={() => setReleaseCenterOpen(true)} style={{
-                ...actionBtnStyle, marginTop: 10, background: 'var(--theme-accent-bg)', borderColor: 'var(--theme-accent)',
-              }}>
-                🚀 打开发布工作台
-              </button>
-            )}
+            <div style={{ color: 'var(--theme-text-muted)', fontSize: 10, lineHeight: 1.55 }}>
+              选择一台执行节点，由该节点扫描打包目录、比较 stable、冻结清单并正式上传；
+              手机或控制端只负责确认和查看进度。打包与 Workspace Kit 仍然只登记候选。
+            </div>
+            <button type="button" onClick={() => setReleaseCenterOpen(true)} style={{
+              ...actionBtnStyle, marginTop: 10, background: 'var(--theme-accent-bg)', borderColor: 'var(--theme-accent)',
+            }}>
+              🚀 打开发布工作台
+            </button>
           </div>
         </details>}
 
@@ -1802,7 +1772,7 @@ export const Settings: React.FC<SettingsProps> = ({
           onClose={() => setAvatarPreviewOpen(false)}
         />
       )}
-      {releaseCenterOpen && releaseToolsEnabled && (
+      {releaseCenterOpen && (
         <React.Suspense fallback={<div style={{
           position: 'fixed', inset: 0, zIndex: 1400, display: 'grid', placeItems: 'center',
           background: 'rgba(2,6,12,.76)', color: 'var(--theme-text-muted)', fontSize: 12,

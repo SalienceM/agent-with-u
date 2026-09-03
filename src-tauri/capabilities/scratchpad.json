@@ -5,6 +5,7 @@
   "platforms": ["macOS", "windows", "linux"],
   "windows": ["scratchpad"],
   "permissions": [
-    "core:default"
+    "core:default",
+    "core:window:allow-set-always-on-top"
   ]
 }

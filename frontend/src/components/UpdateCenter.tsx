@@ -12,6 +12,14 @@ interface FeedDraft {
   requireSignature: boolean;
 }
 
+type NodeAction = 'checking' | 'updating' | 'cancelling';
+type FeedbackTone = 'success' | 'info' | 'warning' | 'error';
+
+interface ActionFeedback {
+  tone: FeedbackTone;
+  message: string;
+}
+
 const emptyFeed: FeedDraft = { manifestUrl: '', channel: 'stable', requireSignature: false };
 
 function loadFeed(): FeedDraft {
@@ -70,7 +78,37 @@ function phaseColor(status?: NodeUpdateStatus): string {
   }
 }
 
+function feedbackIcon(tone: FeedbackTone): string {
+  switch (tone) {
+    case 'success': return '✓';
+    case 'info': return '↑';
+    case 'warning': return '!';
+    case 'error': return '×';
+  }
+}
+
+function feedbackToneStyle(tone: FeedbackTone): React.CSSProperties {
+  switch (tone) {
+    case 'success': return { color: '#3fb950', borderColor: 'rgba(63,185,80,.42)', background: 'rgba(46,160,67,.12)' };
+    case 'info': return { color: '#58a6ff', borderColor: 'rgba(88,166,255,.42)', background: 'rgba(56,139,253,.12)' };
+    case 'warning': return { color: '#d29922', borderColor: 'rgba(210,153,34,.45)', background: 'rgba(187,128,9,.13)' };
+    case 'error': return { color: '#f85149', borderColor: 'rgba(248,81,73,.45)', background: 'rgba(248,81,73,.12)' };
+  }
+}
+
 const sleep = (milliseconds: number) => new Promise((resolve) => window.setTimeout(resolve, milliseconds));
+
+const BusySpinner: React.FC = () => <span aria-hidden="true" style={spinnerStyle} />;
+
+function feedbackForStatus(status: NodeUpdateStatus): ActionFeedback {
+  if (status.phase === 'available') {
+    return { tone: 'info', message: `发现 ${status.release?.version || '可用更新'}` };
+  }
+  if (status.phase === 'current') return { tone: 'success', message: '已是最新版本' };
+  if (status.phase === 'stale') return { tone: 'warning', message: '远端清单比当前版本旧' };
+  if (status.phase === 'error') return { tone: 'error', message: status.error || status.message || '检查失败' };
+  return { tone: 'success', message: status.message || '检查已完成' };
+}
 
 export const UpdateCenter: React.FC = () => {
   const [executors, setExecutors] = useState<ExecutorInfo[]>(() => getExecutors());
@@ -78,7 +116,11 @@ export const UpdateCenter: React.FC = () => {
   const [feed, setFeed] = useState<FeedDraft>(() => loadFeed());
   const [signatureKey, setSignatureKey] = useState('');
   const [busyNodes, setBusyNodes] = useState<Set<string>>(new Set());
+  const [nodeActions, setNodeActions] = useState<Record<string, NodeAction | undefined>>({});
+  const [nodeFeedback, setNodeFeedback] = useState<Record<string, ActionFeedback | undefined>>({});
   const [globalBusy, setGlobalBusy] = useState(false);
+  const [refreshing, setRefreshing] = useState(false);
+  const [refreshFeedback, setRefreshFeedback] = useState<ActionFeedback | null>(null);
   const [notice, setNotice] = useState('');
   const mountedRef = useRef(true);
   const feedSeededRef = useRef(Boolean(feed.manifestUrl.trim()));
@@ -130,6 +172,16 @@ export const UpdateCenter: React.FC = () => {
     });
   }, []);
 
+  const updateNodeAction = useCallback((key: string, value?: NodeAction) => {
+    if (!mountedRef.current) return;
+    setNodeActions((current) => ({ ...current, [key]: value }));
+  }, []);
+
+  const updateNodeFeedback = useCallback((key: string, value?: ActionFeedback) => {
+    if (!mountedRef.current) return;
+    setNodeFeedback((current) => ({ ...current, [key]: value }));
+  }, []);
+
   const refresh = useCallback(async (nodes = getExecutors()) => {
     const online = nodes.filter((node) => node.connected);
     const resolved = await Promise.all(online.map(async (node) => {
@@ -156,7 +208,28 @@ export const UpdateCenter: React.FC = () => {
         });
       }
     }
+    return {
+      online: online.length,
+      succeeded: resolved.filter(Boolean).length,
+      failed: resolved.filter((item) => !item).length,
+    };
   }, [updateStatus, updateStatusError]);
+
+  const refreshFromButton = async () => {
+    if (refreshing || globalBusy) return;
+    setRefreshing(true);
+    setRefreshFeedback(null);
+    try {
+      const result = await refresh();
+      setRefreshFeedback(result.failed
+        ? { tone: 'warning', message: `已刷新 ${result.succeeded} 个，${result.failed} 个失败` }
+        : { tone: 'success', message: `已刷新 ${result.succeeded} 个在线节点` });
+    } catch (error) {
+      setRefreshFeedback({ tone: 'error', message: error instanceof Error ? error.message : String(error) });
+    } finally {
+      if (mountedRef.current) setRefreshing(false);
+    }
+  };
 
   useEffect(() => {
     mountedRef.current = true;
@@ -221,15 +294,33 @@ export const UpdateCenter: React.FC = () => {
   const checkNode = async (node: ExecutorInfo): Promise<NodeUpdateStatus> => {
     requireFeed();
     updateBusy(node.key, true);
+    updateNodeAction(node.key, 'checking');
+    updateNodeFeedback(node.key, undefined);
+    setStatuses((current) => {
+      const previous = current[node.key];
+      if (!previous) return current;
+      return {
+        ...current,
+        [node.key]: { ...previous, phase: 'checking', busy: true, error: '', message: '正在读取远端版本清单' },
+      };
+    });
     try {
       // “一键更新”同时把当前控制端的 feed 写入目标节点；以后人在目标机上
       // 打开同一页面时无需重新配置，也避免 beta/stable 通道不一致。
       await configureNode(node);
       const status = await api.nodeUpdateCheck(node.key, manifestUrl);
       updateStatus(node.key, status);
+      updateNodeFeedback(node.key, feedbackForStatus(status));
       return status;
+    } catch (error) {
+      updateStatusError(node.key, error);
+      updateNodeFeedback(node.key, {
+        tone: 'error', message: error instanceof Error ? error.message : String(error),
+      });
+      throw error;
     } finally {
       updateBusy(node.key, false);
+      updateNodeAction(node.key, undefined);
     }
   };
 
@@ -249,6 +340,7 @@ export const UpdateCenter: React.FC = () => {
 
   const stageNode = async (node: ExecutorInfo): Promise<NodeUpdateStatus> => {
     updateBusy(node.key, true);
+    updateNodeAction(node.key, 'updating');
     try {
       const started = await api.nodeUpdateStage(node.key, manifestUrl);
       updateStatus(node.key, started);
@@ -257,17 +349,20 @@ export const UpdateCenter: React.FC = () => {
       return await waitForStage(node);
     } finally {
       updateBusy(node.key, false);
+      updateNodeAction(node.key, undefined);
     }
   };
 
   const applyNode = async (node: ExecutorInfo) => {
     updateBusy(node.key, true);
+    updateNodeAction(node.key, 'updating');
     try {
       const result = await api.nodeUpdateApply(node.key);
       if (result.status !== 'restarting') throw new Error(result.message || '节点未进入重启流程');
       markInstalling(node.key);
     } finally {
       updateBusy(node.key, false);
+      updateNodeAction(node.key, undefined);
     }
   };
 
@@ -369,17 +464,20 @@ export const UpdateCenter: React.FC = () => {
 
   const cancelNode = async (node: ExecutorInfo) => {
     updateBusy(node.key, true);
+    updateNodeAction(node.key, 'cancelling');
     try {
       updateStatus(node.key, await api.nodeUpdateCancel(node.key));
     } catch (error) {
       setNotice(error instanceof Error ? error.message : String(error));
     } finally {
       updateBusy(node.key, false);
+      updateNodeAction(node.key, undefined);
     }
   };
 
   return (
     <div style={cardStyle}>
+      <style>{`@keyframes awu-update-spin { to { transform: rotate(360deg); } }`}</style>
       <div style={headingRowStyle}>
         <div>
           <div style={titleStyle}>节点在线更新</div>
@@ -387,9 +485,18 @@ export const UpdateCenter: React.FC = () => {
             单节点一键更新；也可从当前控制端并行暂存、逐台重启全部节点。制品直接由目标节点从对象存储下载。
           </div>
         </div>
-        <button type="button" style={smallButtonStyle} disabled={globalBusy} onClick={() => void refresh()}>
-          刷新状态
-        </button>
+        <div style={refreshActionsStyle}>
+          {refreshFeedback && (
+            <span role="status" style={{ ...feedbackBadgeStyle, ...feedbackToneStyle(refreshFeedback.tone) }}>
+              {feedbackIcon(refreshFeedback.tone)} {refreshFeedback.message}
+            </span>
+          )}
+          <button type="button" aria-busy={refreshing} style={{
+            ...smallButtonStyle, ...(refreshing ? activeBusyButtonStyle : {}),
+          }} disabled={globalBusy || refreshing} onClick={() => void refreshFromButton()}>
+            {refreshing ? <><BusySpinner /> 正在刷新…</> : refreshFeedback ? '再次刷新' : '刷新状态'}
+          </button>
+        </div>
       </div>
 
       <div style={feedGridStyle}>
@@ -444,7 +551,12 @@ export const UpdateCenter: React.FC = () => {
       <div style={nodeListStyle}>
         {executors.map((node) => {
           const status = statuses[node.key];
-          const nodeBusy = globalBusy || busyNodes.has(node.key) || !!status?.busy;
+          const nodeAction = nodeActions[node.key];
+          const feedback = nodeFeedback[node.key];
+          const checkInProgress = nodeAction === 'checking' || status?.phase === 'checking';
+          const updateInProgress = nodeAction === 'updating' || status?.phase === 'installing';
+          const cancelInProgress = nodeAction === 'cancelling';
+          const nodeBusy = globalBusy || busyNodes.has(node.key) || !!status?.busy || !!nodeAction;
           const downloaded = Number(status?.downloadedBytes || 0);
           const total = Number(status?.totalBytes || 0);
           const progress = total > 0 ? Math.min(100, Math.round(downloaded / total * 100)) : 0;
@@ -484,28 +596,42 @@ export const UpdateCenter: React.FC = () => {
                 )}
               </div>
               <div style={nodeActionsStyle}>
+                {feedback && (
+                  <span role="status" style={{ ...feedbackBadgeStyle, ...feedbackToneStyle(feedback.tone) }} title={feedback.message}>
+                    {feedbackIcon(feedback.tone)} {feedback.message}
+                  </span>
+                )}
                 {status?.artifact?.url && (
                   <a href={status.artifact.url} target="_blank" rel="noopener noreferrer" style={linkStyle}>
                     下载安装包
                   </a>
                 )}
                 {status?.phase === 'downloading' ? (
-                  <button type="button" style={smallButtonStyle} onClick={() => void cancelNode(node)}>取消</button>
+                  <button type="button" style={{ ...smallButtonStyle, ...(cancelInProgress ? activeBusyButtonStyle : {}) }}
+                    disabled={cancelInProgress} onClick={() => void cancelNode(node)}>
+                    {cancelInProgress ? <><BusySpinner /> 取消中…</> : '取消'}
+                  </button>
                 ) : (
                   <>
                     <button
-                      type="button" style={smallButtonStyle}
+                      type="button" aria-busy={checkInProgress} style={{
+                        ...smallButtonStyle, ...(checkInProgress ? activeBusyButtonStyle : {}),
+                      }}
                       disabled={!node.connected || nodeBusy || !manifestUrl}
                       onClick={() => void checkNode(node).catch((error) => setNotice(error instanceof Error ? error.message : String(error)))}
-                    >检查</button>
+                    >{checkInProgress
+                        ? <><BusySpinner /> 检查中…</>
+                        : feedback ? '再次检查' : '检查'}</button>
                     <button
-                      type="button" style={nodePrimaryButtonStyle}
+                      type="button" aria-busy={updateInProgress} style={{
+                        ...nodePrimaryButtonStyle, ...(updateInProgress ? activeBusyButtonStyle : {}),
+                      }}
                       disabled={!node.connected || nodeBusy || !manifestUrl || dockerUpdaterMissing}
                       title={dockerUpdaterMissing
                         ? '该 Docker 节点尚未启动 awu-updater；先在宿主机用新版 Compose 手动重建一次'
                         : undefined}
                       onClick={() => void oneClickNode(node)}
-                    >一键更新</button>
+                    >{updateInProgress ? <><BusySpinner /> 更新中…</> : '一键更新'}</button>
                   </>
                 )}
               </div>
@@ -529,6 +655,7 @@ const cardStyle: React.CSSProperties = {
   background: 'color-mix(in srgb, var(--theme-bg-secondary) 74%, transparent)',
 };
 const headingRowStyle: React.CSSProperties = { display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: 12 };
+const refreshActionsStyle: React.CSSProperties = { display: 'flex', alignItems: 'center', justifyContent: 'flex-end', gap: 7, flexWrap: 'wrap' };
 const titleStyle: React.CSSProperties = { color: 'var(--theme-text)', fontSize: 13, fontWeight: 650 };
 const descriptionStyle: React.CSSProperties = { marginTop: 4, color: 'var(--theme-text-muted)', fontSize: 10.5, lineHeight: 1.5 };
 const feedGridStyle: React.CSSProperties = { display: 'flex', gap: 8, alignItems: 'flex-end', flexWrap: 'wrap', marginTop: 12 };
@@ -542,8 +669,22 @@ const securityRowStyle: React.CSSProperties = { display: 'flex', alignItems: 'ce
 const checkStyle: React.CSSProperties = { display: 'flex', alignItems: 'center', gap: 7, color: 'var(--theme-text-muted)', fontSize: 10.5 };
 const buttonRowStyle: React.CSSProperties = { display: 'flex', justifyContent: 'flex-end', gap: 8, flexWrap: 'wrap', marginTop: 10 };
 const smallButtonStyle: React.CSSProperties = {
+  minHeight: 29, display: 'inline-flex', alignItems: 'center', justifyContent: 'center', gap: 6,
   padding: '6px 9px', border: '1px solid var(--theme-border)', borderRadius: 4,
   background: 'var(--theme-input-bg)', color: 'var(--theme-text)', fontSize: 10.5, cursor: 'pointer', fontFamily: 'inherit',
+};
+const activeBusyButtonStyle: React.CSSProperties = {
+  color: 'var(--theme-accent)', borderColor: 'var(--theme-accent)', background: 'var(--theme-accent-bg)', cursor: 'wait',
+};
+const spinnerStyle: React.CSSProperties = {
+  width: 12, height: 12, flex: '0 0 auto', display: 'inline-block', boxSizing: 'border-box',
+  border: '2px solid currentColor', borderRightColor: 'transparent', borderRadius: '50%',
+  animation: 'awu-update-spin .72s linear infinite',
+};
+const feedbackBadgeStyle: React.CSSProperties = {
+  maxWidth: 230, minHeight: 24, display: 'inline-flex', alignItems: 'center', gap: 5,
+  boxSizing: 'border-box', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+  padding: '4px 8px', border: '1px solid', borderRadius: 999, fontSize: 9.5, fontWeight: 650,
 };
 const primaryButtonStyle: React.CSSProperties = {
   ...smallButtonStyle, background: 'var(--theme-accent-bg)', borderColor: 'var(--theme-accent)', color: 'var(--theme-accent)', fontWeight: 650,

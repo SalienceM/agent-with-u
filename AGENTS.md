@@ -407,15 +407,16 @@ are a per-session `LoopPolicy` on the stage file (`loop_store.LoopPolicy`):
 `deliverable_score` (70), `outputtable_score` (85), `max_loops` (8),
 `risk_threshold` (0.85 — risk ≥ this seals to loopout), `independent_eval` (True),
 `intent_guard` (True — see below),
-a per-position **`backends` map** (`{prepare, idea, goal, analysis, aside}` → backend id;
+a per-position **`backends` map** (`{prepare, execute, idea, goal, analysis, aside}` → backend id;
 each empty = follow the session) so every "AI analysis/transformation" point can run
-on a **different backend** than the executor for heterogeneous cross-evaluation —
-these all run on independent contexts so cross-backend is safe; execution
-(execute/step) always stays on the session backend. A separate per-position
+on a **different backend** for heterogeneous planning, execution, and evaluation.
+Automated LOOP calls use isolated contexts, so `execute` may also route every step,
+fallback execution, and summary to another backend on the same executor; manual
+takeover remains on the Session backend. A separate per-position
 **`runtimes` map** (`{prepare, execute, idea, goal, analysis, aside}` →
 `{model, reasoningEffort}`) lets one Codex backend use different models/effort by
-role; non-execute roles on the session backend inherit the execute profile unless
-overridden, while roles routed to another backend inherit that backend's own default. `prepare`
+role; non-execute roles inherit the execute profile only when they share the same
+backend, while roles routed elsewhere inherit that backend's own default. `prepare`
 is deliberately separate from `execute`: a stronger model/backend may identify the
 increment focus and produce the 1–4 step plan, while the session backend executes
 each step with a cheaper model. Thus a typical policy can plan and review with
@@ -450,12 +451,31 @@ The shared editor + defaults live in `frontend/src/components/LoopPolicyEditor.t
 for agentic allocation: a long-lived ledger at `~/.agent-with-u/model-ledger/ledger.json`
 records, per backend × model × reasoning effort × role (`execute` / `analysis` / …), usage counts and — for
 execution — the analysis score it achieved, accumulated across sessions. Written
-when a loop's analysis completes (executor backend gets the score, eval backend gets
-a participation tick); read via `modelLedgerList` and surfaced in the
+when a loop's analysis completes (the selected execute backend gets the score, planning
+and evaluation backends get participation ticks); read via `modelLedgerList` and surfaced in the
 `LoopPolicyEditor` as a "📊 各模型历史表现" reference (execute average per concrete runtime profile)
 so allocation can be informed by who actually delivers. (Next stages — a routing
 "brain" that picks N backends per task, multi-party plan + pick-best, and an early
 human↔model intent-divergence guard — build on this.)
+
+**Session Token observability.** `Session.token_usage` is the durable lifetime ledger
+for both ordinary chat and LOOP-internal model calls. Exact Backend `usage` is preferred;
+when a Backend exposes no counters, `token_usage.estimate_tokens` records a conservative
+text-length estimate and marks the trend event `estimated`, so the UI never presents false
+precision. The ledger keeps cumulative input/output/cache/reasoning totals, a bounded recent
+event window, explicit context events (`/compact`, `/new`, visible-history clear, bridge-side
+history summarization), and detected large context drops. It survives message pagination and
+manual compaction; legacy Sessions bootstrap once from persisted assistant-message usage.
+Codex app-server additionally maps `thread/tokenUsage/updated.last.inputTokens` to current
+context size and `modelContextWindow` to its limit; a configured Qwen context window may use
+prompt input tokens as an explicitly labelled approximation. `_loop_run_agent` records every
+idea/goal/prepare/step/summary/analysis/aside call, while manual LOOP takeover is recorded as
+a LOOP `manual` event. `getSessionTokenUsage` returns a compact summary and
+`token_usage_updated` pushes live changes. `TokenUsageMonitor` is shared by ChatPane and the
+LOOP header: its collapsed pill expands into lifetime totals, recent trend bars, context
+occupancy, compaction/reset history, and a warning threshold. The threshold is a controller-side
+`localStorage` preference scoped by current user identity; it must never be persisted to a
+shared executor.
 
 **Intent guard (`intent_guard`, default on).** Early human↔model intent-divergence
 check: after the **first** loop of a round produces its plan (in `_loop_do_prepare`,
@@ -554,6 +574,17 @@ Workspace Kits are Session-level standard accessories stored separately in
   skip everything after the first failed step. The backend owns the authoritative
   `KitRun`/step verdict; a desktop client only claims and performs explicit client
   actions. Scheduled runs that require a client fail closed when no client can act.
+- `awu_capability` is the white-listed protocol bridge from deterministic Kit DSL to
+  AgentWithU product services; a Kit can never name an arbitrary Bridge RPC. The first
+  registered capability is `release.publish_latest`. It scans and filters fresh build
+  artifacts, calls Release Center preview to freeze a plan, then persists
+  `waiting_approval`. Formal publishing cannot start until `kitCapabilityRespond` records
+  an independent human approval bound to the plan fingerprint. AI generation may prepare
+  the plan but cannot approve it; Schedule fails closed before invoking an approval-required
+  capability. After approval, the existing Release Center
+  job owns upload/manifest semantics while bounded progress is mirrored into `KitStepRun`;
+  cancelling the Kit also cancels the release job. Capability metadata declares risk,
+  physical-node permission and approval policy in `src/backend/kit_capabilities.py`.
 - `kitCancel` is immediate and idempotent: it first persists the authoritative
   `cancelled` run/step state, then cancels any live orchestration task and terminates
   the exact command process tree by run PID. This also repairs orphaned active records
@@ -606,8 +637,9 @@ Optimization dialogue and candidate provenance persist with the Kit, while versi
 a Kit concept independent of which backend produced them. Details always shows the version
 ledger and allows viewing or safely reactivating any historical DSL.
 
-Kit RPCs include `kitGenerate`, `kitGetState`, `kitCreate`, `kitUpdate`, `kitDelete`,
+Kit RPCs include `kitGenerate`, `kitCapabilityList`, `kitGetState`, `kitCreate`, `kitUpdate`, `kitDelete`,
 `kitRun`, `kitCancel`, `kitResume`, `kitClientStepStart`, `kitClientStepComplete`,
+`kitCapabilityRespond`,
 `kitClientFileStart`, `kitClientFileChunk`, `kitClientFileFinish`,
 `kitSetControlMode`, `kitTerminalCommand`, `kitTerminalClose`, `kitVersionList`,
 `kitVersionGet`, `kitVersionActivate`, `kitOptimizeGet`, `kitOptimizeAsk`, and
@@ -626,7 +658,10 @@ primary user can call them. The workbench can target any connected executor.
 `src/backend/release_center.py` stores candidate builds, frozen plans, background jobs and
 history under `~/.agent-with-u/release-center/`. Build is never publish: Windows/Linux build
 scripts call `scripts/register_release_candidate.py` after successful packaging, and a Kit
-file output may set `releaseCandidate=true`; both paths only upsert a candidate. The UI lets
+file output may set `releaseCandidate=true`; both paths only upsert a candidate. A Kit may
+separately use the white-listed `release.publish_latest` capability to orchestrate the same
+scan/preview/publish services, but it still stops at a durable human-approval boundary and
+never bypasses the frozen plan. The UI lets
 the maintainer select artifacts, edit platform/install metadata, compare the current channel
 manifest, inspect SHA-256/size/object keys, and freeze a plan. Formal publish requires a
 second acknowledgement + confirmation, re-hashes every frozen file, then invokes an already

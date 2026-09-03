@@ -22,6 +22,7 @@ export interface SeqTaskT {
   deliveryMode?: 'redirect';
   status: string;
   createdAt?: number;
+  syncing?: boolean;
 }
 
 interface Props {
@@ -32,13 +33,15 @@ interface Props {
   onSendNext: () => void;
   canSteer?: boolean;
   onSteerTask?: (taskId: string) => Promise<{ status: string; message?: string }>;
+  onTasksChange?: (tasks: SeqTaskT[]) => void;
 }
 
 export const SeqTaskPanel: React.FC<Props> = ({
-  sessionId, tasks, chainActive, isStreaming, onSendNext, canSteer, onSteerTask,
+  sessionId, tasks, chainActive, isStreaming, onSendNext, canSteer, onSteerTask, onTasksChange,
 }) => {
   const pending = tasks.filter((t) => t.status === 'pending' || t.status === 'steering');
-  const readyPending = pending.filter((t) => t.status === 'pending');
+  const readyPending = pending.filter((t) => t.status === 'pending' && !t.syncing);
+  const hasSyncing = pending.some((t) => t.syncing);
   const sent = tasks.filter((t) => t.status === 'sent');
   const [open, setOpen] = useState(false);   // 默认收起,只留一条 slim 条
   const [editingId, setEditingId] = useState<string | null>(null);
@@ -49,6 +52,7 @@ export const SeqTaskPanel: React.FC<Props> = ({
   const [historyImages, setHistoryImages] = useState<EditImage[]>([]);
   const [steeringIds, setSteeringIds] = useState<Set<string>>(() => new Set());
   const [steerErrors, setSteerErrors] = useState<Record<string, string>>({});
+  const [mutationError, setMutationError] = useState('');
   const editPasteRef = useRef<HTMLTextAreaElement>(null);
 
   // 首页“处理待办”直接落到目标会话并展开队列，避免用户再点第二次。
@@ -82,10 +86,16 @@ export const SeqTaskPanel: React.FC<Props> = ({
     const imgs = editImages.length ? editImages.map((im) => ({
       id: im.id, base64: im.base64, mime_type: im.mime_type, size: im.size,
     })) : undefined;
-    await api.seqtaskEdit(sessionId, id, editText.trim(), imgs);
+    const result = await api.seqtaskEdit(sessionId, id, editText.trim(), imgs);
+    if (result.status !== 'ok') {
+      setMutationError(result.message || '保存队列任务失败');
+      return;
+    }
+    if (result.seqTasks) onTasksChange?.(result.seqTasks);
+    setMutationError('');
     setEditingId(null);
     setEditImages([]);
-  }, [editText, editImages, sessionId]);
+  }, [editText, editImages, sessionId, onTasksChange]);
 
   // ★ 编辑区粘贴图片
   const handleEditPaste = useCallback((e: React.ClipboardEvent) => {
@@ -136,10 +146,16 @@ export const SeqTaskPanel: React.FC<Props> = ({
     const imgs = historyImages.length ? historyImages.map((im) => ({
       id: im.id, base64: im.base64, mime_type: im.mime_type, size: im.size,
     })) : undefined;
-    await api.seqtaskEdit(sessionId, id, '', imgs);
+    const result = await api.seqtaskEdit(sessionId, id, '', imgs);
+    if (result.status !== 'ok') {
+      setMutationError(result.message || '保存历史附件失败');
+      return;
+    }
+    if (result.seqTasks) onTasksChange?.(result.seqTasks);
+    setMutationError('');
     setEditingHistoryId(null);
     setHistoryImages([]);
-  }, [historyImages, sessionId]);
+  }, [historyImages, sessionId, onTasksChange]);
 
   const handleHistoryPaste = useCallback((e: React.ClipboardEvent) => {
     const items = e.clipboardData?.items;
@@ -177,8 +193,26 @@ export const SeqTaskPanel: React.FC<Props> = ({
     const j = idx + dir;
     if (j < 0 || j >= ids.length) return;
     [ids[idx], ids[j]] = [ids[j], ids[idx]];
-    await api.seqtaskReorder(sessionId, ids);
-  }, [pending, sessionId]);
+    const result = await api.seqtaskReorder(sessionId, ids);
+    if (result.status === 'ok' && result.seqTasks) onTasksChange?.(result.seqTasks);
+    else if (result.status !== 'ok') setMutationError(result.message || '调整队列顺序失败');
+  }, [pending, sessionId, onTasksChange]);
+
+  const clearTasks = useCallback(async () => {
+    const result = await api.seqtaskClear(sessionId);
+    if (result.status === 'ok') {
+      if (result.seqTasks) onTasksChange?.(result.seqTasks);
+      setMutationError('');
+    } else setMutationError(result.message || '清空队列失败');
+  }, [sessionId, onTasksChange]);
+
+  const removeTask = useCallback(async (taskId: string) => {
+    const result = await api.seqtaskRemove(sessionId, taskId);
+    if (result.status === 'ok') {
+      if (result.seqTasks) onTasksChange?.(result.seqTasks);
+      setMutationError('');
+    } else setMutationError(result.message || '删除队列任务失败');
+  }, [sessionId, onTasksChange]);
 
   const steerTask = useCallback(async (taskId: string) => {
     if (!onSteerTask) return;
@@ -233,9 +267,13 @@ export const SeqTaskPanel: React.FC<Props> = ({
           </button>
         )}
         {pending.length > 0 && (
-          <button onClick={() => api.seqtaskClear(sessionId)} style={clearBtn} title="清空队列">清空</button>
+          <button onClick={() => void clearTasks()} disabled={hasSyncing}
+            style={{ ...clearBtn, opacity: hasSyncing ? .45 : 1 }}
+            title={hasSyncing ? '等待新增任务同步完成' : '清空队列'}>清空</button>
         )}
       </div>
+
+      {mutationError && <div style={mutationErrorStyle}>⚠ {mutationError}</div>}
 
       {/* 收起时也给出自动队列状态，避免用户误以为新输入丢失。 */}
       {pending.length > 0 && (
@@ -280,11 +318,12 @@ export const SeqTaskPanel: React.FC<Props> = ({
                 </div>
               ) : (
                 <div style={{ flex: 1, minWidth: 0 }}
-                  onClick={() => { if (t.status === 'pending') startEdit(t); }}
-                  title={t.status === 'pending' ? '点击编辑' : '正在引导当前轮'}>
+                  onClick={() => { if (t.status === 'pending' && !t.syncing) startEdit(t); }}
+                  title={t.syncing ? '正在同步到执行端' : t.status === 'pending' ? '点击编辑' : '正在引导当前轮'}>
                   <div style={taskLine}>
                     <span style={taskText}>{t.text || <span style={{ color: 'var(--theme-text-muted)' }}>（仅附件）</span>}</span>
-                    {(steeringIds.has(t.id) || t.status === 'steering' || (canSteer && t.status === 'pending')) && (
+                    {t.syncing && <span style={syncingBadge}>同步中…</span>}
+                    {!t.syncing && (steeringIds.has(t.id) || t.status === 'steering' || (canSteer && t.status === 'pending')) && (
                       <button
                         onClick={(event) => {
                           event.stopPropagation();
@@ -320,10 +359,10 @@ export const SeqTaskPanel: React.FC<Props> = ({
                 </div>
               )}
               <div style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
-                <button onClick={() => move(i, -1)} disabled={i === 0 || t.status === 'steering'} style={arrowBtn} title="上移">▲</button>
-                <button onClick={() => move(i, 1)} disabled={i === pending.length - 1 || t.status === 'steering'} style={arrowBtn} title="下移">▼</button>
+                <button onClick={() => move(i, -1)} disabled={i === 0 || t.status === 'steering' || hasSyncing} style={arrowBtn} title="上移">▲</button>
+                <button onClick={() => move(i, 1)} disabled={i === pending.length - 1 || t.status === 'steering' || hasSyncing} style={arrowBtn} title="下移">▼</button>
               </div>
-              <button onClick={() => api.seqtaskRemove(sessionId, t.id)} disabled={t.status === 'steering'} style={removeBtn} title="删除">✕</button>
+              <button onClick={() => void removeTask(t.id)} disabled={t.status === 'steering' || t.syncing} style={removeBtn} title="删除">✕</button>
             </div>
           ))}
 
@@ -411,6 +450,8 @@ const taskLine: React.CSSProperties = { display: 'flex', alignItems: 'center', f
 const taskText: React.CSSProperties = { fontSize: 12.5, color: 'var(--theme-text)', lineHeight: 1.5, whiteSpace: 'pre-wrap', wordBreak: 'break-word', cursor: 'text' };
 const steerBtn: React.CSSProperties = { flexShrink: 0, fontSize: 10.5, fontWeight: 650, padding: '2px 7px', borderRadius: 999, border: '1px solid var(--theme-accent)', background: 'var(--theme-accent-bg)', color: 'var(--theme-accent)' };
 const steerError: React.CSSProperties = { marginTop: 3, fontSize: 10.5, color: 'var(--theme-error, #cf222e)', lineHeight: 1.35 };
+const mutationErrorStyle: React.CSSProperties = { marginTop: 5, color: 'var(--theme-error, #cf222e)', fontSize: 10.5 };
+const syncingBadge: React.CSSProperties = { fontSize: 10, color: 'var(--theme-accent)', border: '1px solid var(--theme-accent)', borderRadius: 999, padding: '1px 6px' };
 const imgBadge: React.CSSProperties = { fontSize: 10, color: 'var(--theme-text-muted)', marginTop: 3, display: 'inline-block' };
 const editArea: React.CSSProperties = { width: '100%', minHeight: 48, fontSize: 12.5, padding: 6, borderRadius: 6, border: '1px solid var(--theme-accent)', background: 'var(--theme-bg)', color: 'var(--theme-text)', resize: 'vertical', fontFamily: 'inherit', boxSizing: 'border-box' };
 const arrowBtn: React.CSSProperties = { fontSize: 9, lineHeight: 1, padding: '2px 4px', border: '1px solid var(--theme-border)', borderRadius: 4, background: 'var(--theme-bg)', color: 'var(--theme-text-muted)', cursor: 'pointer' };

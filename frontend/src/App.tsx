@@ -50,6 +50,9 @@ import type { SmoothGhostState } from './utils/smoothGhost';
 import { notifyTaskCompletion } from './utils/desktopNotifications';
 import type { FileFocusRequest } from './utils/fileFocus';
 
+// 发布工作台保持按需加载；手机/控制端点击入口时才下载对应 chunk。
+const LazyReleaseCenter = React.lazy(() => import('./components/ReleaseCenter'));
+
 function hexToRgba(color: string, alpha: number): string {
   const m = color.match(/^#([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})/i);
   if (!m) return color;
@@ -81,6 +84,7 @@ export const App: React.FC = () => {
     }
   }, []);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [releaseCenterOpen, setReleaseCenterOpen] = useState(false);
   const [backendManagerOpen, setBackendManagerOpen] = useState(false);
   const [backendManagerExecKey, setBackendManagerExecKey] = useState(() => getHomeExecKey());
   const [backendManagerLoading, setBackendManagerLoading] = useState(false);
@@ -1521,6 +1525,10 @@ export const App: React.FC = () => {
                   setConnPanelOpen(true);
                   setMoreMenuOpen(false);
                 }} />
+                <TopbarMenuItem icon="🚀" label="发布工作台" onClick={() => {
+                  setReleaseCenterOpen(true);
+                  setMoreMenuOpen(false);
+                }} />
                 <TopbarMenuItem icon="📋" label="后端日志" onClick={() => {
                   setLogViewerOpen(true);
                   setMoreMenuOpen(false);
@@ -1722,6 +1730,16 @@ export const App: React.FC = () => {
           setConnPanelOpen(true);
         }}
       />
+
+      {/* 控制端统一发布入口：UI 只发指令，扫描和上传发生在工作台选中的执行节点。 */}
+      {releaseCenterOpen && (
+        <React.Suspense fallback={<div style={releaseCenterLoadingStyle}>正在连接发布执行端…</div>}>
+          <LazyReleaseCenter
+            onClose={() => setReleaseCenterOpen(false)}
+            initialExecKey={activeSession?.execKey || getHomeExecKey()}
+          />
+        </React.Suspense>
+      )}
 
       {/* ---- 后端日志查看器 ---- */}
       <LogViewer isOpen={logViewerOpen} onClose={() => setLogViewerOpen(false)} />
@@ -2043,6 +2061,13 @@ const moreMenuDividerStyle: React.CSSProperties = {
   height: 1,
   margin: '4px 5px',
   background: 'var(--theme-border)',
+};
+
+const releaseCenterLoadingStyle: React.CSSProperties = {
+  position: 'fixed', inset: 0, zIndex: 1400,
+  display: 'grid', placeItems: 'center',
+  background: 'rgba(2,6,12,.76)',
+  color: 'var(--theme-text-muted)', fontSize: 12,
 };
 
 const TopbarMenuItem: React.FC<{

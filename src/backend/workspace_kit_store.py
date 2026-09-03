@@ -19,16 +19,16 @@ from . import paths
 
 
 RUN_STATUSES = {
-    "queued", "running", "waiting_client", "evaluating",
+    "queued", "running", "waiting_client", "waiting_approval", "evaluating",
     "succeeded", "failed", "error", "cancelled",
 }
 FINAL_RUN_STATUSES = {"succeeded", "failed", "error", "cancelled"}
 CONTROL_MODES = {"ai", "human", "shared"}
 SHELLS = {"powershell", "cmd", "bash"}
 EXECUTION_TARGETS = {"executor", "client"}
-KIT_STEP_TYPES = {"command", "file_push", "kit_call"}
+KIT_STEP_TYPES = {"command", "file_push", "kit_call", "awu_capability"}
 KIT_STEP_STATUSES = {
-    "pending", "running", "waiting_client", "succeeded", "failed",
+    "pending", "running", "waiting_client", "waiting_approval", "succeeded", "failed",
     "error", "cancelled", "skipped",
 }
 KIT_GENERATION_STATUSES = {
@@ -677,6 +677,16 @@ class KitGenerationJob:
     result: Optional[dict] = None
     message: str = "已提交，等待后台编译"
     error: str = ""
+    phase: str = "queued"
+    backend_id: str = ""
+    backend_label: str = ""
+    model: str = ""
+    output_preview: str = ""
+    thinking_preview: str = ""
+    output_chars: int = 0
+    thinking_chars: int = 0
+    activities: list[dict] = field(default_factory=list)
+    last_activity_at: Optional[float] = None
     created_at: float = field(default_factory=_now)
     started_at: Optional[float] = None
     ended_at: Optional[float] = None
@@ -691,6 +701,16 @@ class KitGenerationJob:
             "result": self.result,
             "message": self.message,
             "error": self.error,
+            "phase": self.phase,
+            "backendId": self.backend_id,
+            "backendLabel": self.backend_label,
+            "model": self.model,
+            "outputPreview": self.output_preview,
+            "thinkingPreview": self.thinking_preview,
+            "outputChars": self.output_chars,
+            "thinkingChars": self.thinking_chars,
+            "activities": self.activities[-100:],
+            "lastActivityAt": self.last_activity_at,
             "createdAt": self.created_at,
             "startedAt": self.started_at,
             "endedAt": self.ended_at,
@@ -712,6 +732,19 @@ class KitGenerationJob:
             result=_json_copy(result) if result is not None else None,
             message=_safe_text(data.get("message"), 4_000),
             error=_safe_text(data.get("error"), 20_000),
+            phase=_safe_text(data.get("phase") or status, 80),
+            backend_id=_safe_text(data.get("backendId"), 500),
+            backend_label=_safe_text(data.get("backendLabel"), 500),
+            model=_safe_text(data.get("model"), 500),
+            output_preview=_safe_text(data.get("outputPreview"), 100_000),
+            thinking_preview=_safe_text(data.get("thinkingPreview"), 20_000),
+            output_chars=max(0, int(data.get("outputChars") or 0)),
+            thinking_chars=max(0, int(data.get("thinkingChars") or 0)),
+            activities=[
+                _json_copy(item) for item in (data.get("activities") or [])[-100:]
+                if isinstance(item, dict)
+            ],
+            last_activity_at=data.get("lastActivityAt"),
             created_at=float(data.get("createdAt") or _now()),
             started_at=data.get("startedAt"),
             ended_at=data.get("endedAt"),

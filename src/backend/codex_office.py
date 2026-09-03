@@ -874,14 +874,27 @@ class CodexOfficeBackend(ModelBackend):
                                 "status": "error" if str(item.get("status") or "").lower() == "failed" else "done",
                             })
                 elif method == "thread/tokenUsage/updated":
-                    usage = params.get("tokenUsage", {}).get("total", {})
+                    token_usage = params.get("tokenUsage", {})
+                    usage = token_usage.get("total", {})
                     if isinstance(usage, dict):
+                        last = token_usage.get("last", {})
                         final_usage = {
                             "inputTokens": usage.get("inputTokens", 0),
                             "outputTokens": usage.get("outputTokens", 0),
                             "cachedInputTokens": usage.get("cachedInputTokens", 0),
                             "reasoningOutputTokens": usage.get("reasoningOutputTokens", 0),
+                            # App-server 的 total 是 native thread 累计值。Bridge 的
+                            # Session 台账会按 contextId 做差，避免每轮重复累加。
+                            "cumulative": True,
+                            "contextId": thread_id or "",
                         }
+                        if isinstance(last, dict) and last.get("inputTokens") is not None:
+                            # last.inputTokens 代表最近一次模型请求携带的上下文规模；
+                            # total 则用于本轮累计消耗，两者不能混作同一指标。
+                            final_usage["contextTokens"] = last.get("inputTokens", 0)
+                        context_window = token_usage.get("modelContextWindow")
+                        if context_window is not None:
+                            final_usage["contextWindow"] = context_window
                 elif method == "error":
                     error = params.get("error") or {}
                     text = error.get("message") if isinstance(error, dict) else str(error)

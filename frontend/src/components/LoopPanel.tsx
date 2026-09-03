@@ -7,6 +7,7 @@ import type { ImageAttachment } from './../hooks/useClipboardImage';
 import { LoopPolicyEditor, normalizePolicy } from './LoopPolicyEditor';
 import type { LoopPolicy } from './LoopPolicyEditor';
 import type { ModelRuntime } from './CodexRuntimeFields';
+import { TokenUsageMonitor } from './TokenUsageMonitor';
 import {
   AdvancedPromptTextarea,
   type AdvancedPromptTextareaProps,
@@ -388,7 +389,7 @@ export const LoopPanel: React.FC<LoopPanelProps> = ({
   if (!stateForView) {
     return wrap(
       <>
-        <Header stage="…"
+        <Header stage="…" sessionId={sessionId}
           asideOpen={false} setAsideOpen={() => {}} asideCount={0} onClose={onClose}
           embedded={embedded} inspectOnly={inspectOnly} />
         <div style={{ padding: 40, textAlign: 'center', color: 'var(--theme-text-muted)' }}>
@@ -401,7 +402,7 @@ export const LoopPanel: React.FC<LoopPanelProps> = ({
   return wrap(
     <LoopPromptContext.Provider value={{ sessionId, workingDir, execKey }}>
       <>
-        <Header stage={stateForView.stage}
+        <Header stage={stateForView.stage} sessionId={sessionId}
           asideOpen={asideOpen} setAsideOpen={setAsideOpen} asideCount={stateForView.asides?.length || 0}
           onClose={onClose} embedded={embedded} inspectOnly={inspectOnly}
           viewMode={viewMode} setViewMode={setViewMode} canFlow={stateForView.stage !== 'loopidea'} />
@@ -525,12 +526,13 @@ const IntentBanner: React.FC<{ state: LoopStateT; sessionId: string }> = ({ stat
 // ══ Header ════════════════════════════════════════════════════
 const Header: React.FC<{
   stage: string;
+  sessionId: string;
   asideOpen: boolean; setAsideOpen: (v: boolean) => void; asideCount: number;
   onClose?: () => void; embedded?: boolean; inspectOnly?: boolean;
   viewMode?: 'panel' | 'flow'; setViewMode?: (v: 'panel' | 'flow') => void; canFlow?: boolean;
-}> = ({ stage, asideOpen, setAsideOpen, asideCount, onClose, embedded, inspectOnly, viewMode, setViewMode, canFlow }) => (
+}> = ({ stage, sessionId, asideOpen, setAsideOpen, asideCount, onClose, embedded, inspectOnly, viewMode, setViewMode, canFlow }) => (
     <div style={{
-      display: 'flex', alignItems: 'center', gap: 12, padding: '12px 18px',
+      display: 'flex', alignItems: 'center', gap: 10, padding: '12px 18px', flexWrap: 'wrap',
       borderBottom: '1px solid var(--theme-border)',
     }}>
       <span style={{ fontSize: 18 }}>🔁</span>
@@ -551,6 +553,7 @@ const Header: React.FC<{
         </div>
       )}
       <div style={{ flex: 1 }} />
+      <TokenUsageMonitor sessionId={sessionId} placement="header" />
       {/* ★ session 级 By the way 激活按钮：旁路问答，不污染 loop 主线 */}
       {!inspectOnly && (
         <button
@@ -1708,6 +1711,7 @@ const StepRow: React.FC<{ step: LoopStep; live?: string }> = ({ step, live }) =>
   const [open, setOpen] = useState(false);
   const body = step.status === 'running' && live ? live : step.output;
   const canExpand = !!body || step.status === 'running';
+  const description = step.desc?.trim();
   return (
     <div style={{ marginBottom: 6 }}>
       <div
@@ -1719,7 +1723,9 @@ const StepRow: React.FC<{ step: LoopStep; live?: string }> = ({ step, live }) =>
           {STEP_ICON[step.status] || '○'}
         </span>
         <span style={{ fontSize: 11, color: STEP_COLOR[step.status], minWidth: 42 }}>{step.status}</span>
-        <span style={{ fontSize: 13, color: 'var(--theme-text)', flex: 1 }}>{step.index}. {step.desc}</span>
+        <span style={{ fontSize: 13, color: description ? 'var(--theme-text)' : '#f59e0b', flex: 1 }}>
+          {step.index}. {description || '步骤说明缺失（旧版本规划解析异常）'}
+        </span>
         {canExpand && <span style={{ fontSize: 11, color: 'var(--theme-text-muted)' }}>{open ? '收起' : '展开'}</span>}
       </div>
       {open && (

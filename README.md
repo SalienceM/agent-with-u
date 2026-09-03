@@ -42,6 +42,7 @@ AgentWithU 用 PySide6 托管 QWebEngine，前端是 React，后端是 Python—
 - **手动或 Schedule** — 支持单次运行与最短 10 秒的周期执行，状态和运行历史独立持久化
 - **结果视图与数据市场** — 集中查看 stdout/stderr、判言和类型化输出；其他 Kit 可用 `sourceKey` 消费最新数据
 - **持久终端控制权** — Kit 可设为 AI、人工或共享控制；双方接管同一个 PowerShell/CMD/Bash，上下文保留且命令进入同一账本
+- **AgentWithU 能力编排** — Kit 可通过白名单能力调用发布中心；“发布最新包”自动扫描和预检，冻结计划后必须由用户确认才会正式发布
 - **Session 管家上下文** — By the way 能只读理解 Kit 状态、错误和数据依赖，不污染主对话
 
 ### Skill 插件系统

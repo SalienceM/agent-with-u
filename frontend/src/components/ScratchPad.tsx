@@ -85,6 +85,7 @@ if (typeof document !== 'undefined' && !document.getElementById('scratch-editor-
 }
 
 const STORAGE_KEY = 'agent-with-u:scratchpad';
+const WINDOW_PIN_KEY = 'agent-with-u:scratchpad:window-always-on-top';
 let _bc = 0;
 const bid = () => `b${Date.now()}-${++_bc}`;
 const eid = () => `e${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
@@ -107,6 +108,12 @@ const persist = (entries: ScratchEntry[]) => {
     ),
   }));
   try { localStorage.setItem(STORAGE_KEY, JSON.stringify(stripped)); } catch {}
+};
+const loadWindowPinned = (): boolean => {
+  try { return localStorage.getItem(WINDOW_PIN_KEY) === '1'; } catch { return false; }
+};
+const persistWindowPinned = (pinned: boolean): void => {
+  try { localStorage.setItem(WINDOW_PIN_KEY, pinned ? '1' : '0'); } catch {}
 };
 
 // ── IndexedDB 图片存储（突破 localStorage 5MB 限制）──────────────────
@@ -408,6 +415,7 @@ async function popout(onClose?: () => void) {
       width: 560,
       height: 800,
       resizable: true,
+      alwaysOnTop: loadWindowPinned(),
     });
     onClose?.();
     return;
@@ -448,6 +456,10 @@ const ScratchPadEditor: React.FC<EditorProps> = ({ mode, onClose }) => {
   const [archiveView, setArchiveView] = useState(false);
   const [hideCompleted, setHideCompleted] = useState(false);
   const [showColors, setShowColors] = useState(false);
+  const [windowPinned, setWindowPinned] = useState(loadWindowPinned);
+  const [windowPinSupported, setWindowPinSupported] = useState(false);
+  const [windowPinBusy, setWindowPinBusy] = useState(false);
+  const [windowPinError, setWindowPinError] = useState('');
   const taRefs = useRef<Map<string, HTMLTextAreaElement>>(new Map());
   const todoRefs = useRef<Map<string, HTMLInputElement>>(new Map());
   const focusTarget = useRef<{ blockId: string; pos: number } | null>(null);
@@ -736,6 +748,44 @@ const ScratchPadEditor: React.FC<EditorProps> = ({ mode, onClose }) => {
 
   const isWindow = mode === 'window';
 
+  // 独立 Tauri 便签使用系统级 always-on-top；浏览器弹窗没有跨应用置顶能力。
+  useEffect(() => {
+    if (!isWindow || typeof window === 'undefined' || !(window as any).__TAURI_INTERNALS__) return;
+    let cancelled = false;
+    void import('@tauri-apps/api/window').then(async ({ getCurrentWindow }) => {
+      const current = getCurrentWindow();
+      const preferred = loadWindowPinned();
+      await current.setAlwaysOnTop(preferred);
+      const actual = await current.isAlwaysOnTop().catch(() => preferred);
+      if (!cancelled) {
+        setWindowPinned(actual);
+        setWindowPinSupported(true);
+        setWindowPinError('');
+      }
+    }).catch((error) => {
+      if (!cancelled) setWindowPinError(error instanceof Error ? error.message : String(error));
+    });
+    return () => { cancelled = true; };
+  }, [isWindow]);
+
+  const toggleWindowPin = useCallback(async () => {
+    if (!isWindow || windowPinBusy) return;
+    const next = !windowPinned;
+    setWindowPinBusy(true);
+    setWindowPinError('');
+    try {
+      const { getCurrentWindow } = await import('@tauri-apps/api/window');
+      await getCurrentWindow().setAlwaysOnTop(next);
+      setWindowPinned(next);
+      setWindowPinSupported(true);
+      persistWindowPinned(next);
+    } catch (error) {
+      setWindowPinError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setWindowPinBusy(false);
+    }
+  }, [isWindow, windowPinBusy, windowPinned]);
+
   // 记录选择器下拉
   const [showPicker, setShowPicker] = useState(false);
   const pickerRef = useRef<HTMLDivElement>(null);
@@ -905,6 +955,25 @@ const ScratchPadEditor: React.FC<EditorProps> = ({ mode, onClose }) => {
         )}
 
         <button onClick={handleNew} title="新建便签" aria-label="新建便签" style={{ ...iconBtnStyle, color: palette.accent }}>＋</button>
+        {isWindow && windowPinSupported && (
+          <button
+            type="button" onClick={() => void toggleWindowPin()}
+            title={windowPinned ? '取消窗口始终置顶' : '让便签窗口始终位于其他窗口上方'}
+            aria-label={windowPinned ? '取消窗口置顶' : '窗口置顶'}
+            aria-pressed={windowPinned} disabled={windowPinBusy}
+            style={{
+              ...windowPinButtonStyle,
+              color: windowPinned ? '#7c2d12' : '#78716c',
+              borderColor: windowPinned ? palette.accent : palette.border,
+              background: windowPinned ? 'rgba(255,255,255,.78)' : 'rgba(255,255,255,.36)',
+              boxShadow: windowPinned ? `inset 0 -2px 0 ${palette.accent}` : 'none',
+              opacity: windowPinBusy ? .65 : 1,
+            }}
+          >
+            <span aria-hidden="true">{windowPinned ? '📌' : '📍'}</span>
+            {windowPinBusy ? '设置中…' : windowPinned ? '窗口已置顶' : '窗口置顶'}
+          </button>
+        )}
         {!isWindow && (
           <button onClick={() => void popout(onClose)} title="弹出独立窗口" aria-label="弹出独立窗口" style={{ ...iconBtnStyle, color: palette.accent }}>⤢</button>
         )}
@@ -912,6 +981,15 @@ const ScratchPadEditor: React.FC<EditorProps> = ({ mode, onClose }) => {
           <button onClick={onClose} title="关闭" aria-label="关闭便签本" style={{ ...iconBtnStyle, color: palette.accent }}>✕</button>
         )}
       </div>
+
+      {isWindow && windowPinError && (
+        <div role="alert" style={{
+          padding: '5px 9px', color: '#b42318', background: '#fff1f0',
+          borderBottom: `1px solid ${palette.border}`, fontSize: 10, flexShrink: 0,
+        }}>
+          窗口置顶设置失败：{windowPinError}
+        </div>
+      )}
 
       {/* 搜索与归档入口在侧栏和独立窗口保持一致。 */}
       <div style={{
@@ -1303,6 +1381,15 @@ const iconBtnStyle: React.CSSProperties = {
   padding: 0, border: 'none', borderRadius: 4,
   background: 'transparent', color: '#92400e',
   fontSize: 14, cursor: 'pointer', lineHeight: 1,
+};
+
+const windowPinButtonStyle: React.CSSProperties = {
+  minHeight: 24,
+  display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
+  gap: 4, padding: '2px 8px',
+  border: '1px solid', borderRadius: 5,
+  fontSize: 10, fontWeight: 650,
+  cursor: 'pointer', whiteSpace: 'nowrap',
 };
 
 const metaBtnBase: React.CSSProperties = {

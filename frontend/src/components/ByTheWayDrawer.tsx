@@ -15,6 +15,7 @@ interface Props {
   open: boolean;
   onClose: () => void;
   onSendToChat?: (text: string) => void;
+  onQueueTask?: (text: string) => void;
   backends?: any[];
   workingDir?: string;
   execKey?: string;
@@ -25,6 +26,7 @@ export const ByTheWayDrawer: React.FC<Props> = ({
   open,
   onClose,
   onSendToChat,
+  onQueueTask,
   backends = [],
   workingDir,
   execKey,
@@ -152,7 +154,10 @@ export const ByTheWayDrawer: React.FC<Props> = ({
                 {a.status === 'done' && a.answer && (
                   <div style={actRow}>
                     <button style={actBtn} title="把这条答案排进序列任务队列"
-                      onClick={async () => { await api.seqtaskAdd(sessionId, a.answer); }}>➕ 加入序列任务</button>
+                      onClick={() => {
+                        if (onQueueTask) onQueueTask(a.answer);
+                        else void api.seqtaskAdd(sessionId, a.answer);
+                      }}>➕ 加入序列任务</button>
                     {onSendToChat && (
                       <button style={actBtn} title="把这条答案作为一条消息发进主对话"
                         onClick={() => { onSendToChat(a.answer); onClose(); }}>↩ 发送到主对话</button>

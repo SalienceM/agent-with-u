@@ -1,4 +1,5 @@
 import React, { useMemo, useState } from 'react';
+import ExcelPreview, { type ExcelCellStyle, type ExcelSheet } from './ExcelPreview';
 
 export interface StructuredPreviewPayload {
   status: 'ok' | 'error' | 'unsupported';
@@ -7,7 +8,9 @@ export interface StructuredPreviewPayload {
   truncated?: boolean;
   blocks?: Array<{ type: 'paragraph' | 'table'; text?: string; style?: string; rows?: string[][] }>;
   images?: Array<{ name: string; dataUrl: string }>;
-  sheets?: Array<{ name: string; rows: string[][] }>;
+  sheets?: ExcelSheet[];
+  styles?: ExcelCellStyle[];
+  calculation?: { mode?: string; date1904?: boolean };
   slides?: Array<{
     number: number; title: string; texts: string[];
     images: Array<{ name: string; dataUrl: string }>;
@@ -26,7 +29,7 @@ const Empty: React.FC<{ text: string }> = ({ text }) => (
 
 export const StructuredFilePreview: React.FC<Props> = ({ preview, onReveal }) => {
   const [active, setActive] = useState(0);
-  const pages = preview.kind === 'excel' ? preview.sheets : preview.kind === 'drawio' ? preview.pages : undefined;
+  const pages = preview.kind === 'drawio' ? preview.pages : undefined;
   const safeActive = Math.min(active, Math.max(0, (pages?.length || 1) - 1));
   const drawioUrl = useMemo(() => {
     const svg = preview.kind === 'drawio' ? preview.pages?.[safeActive]?.svg : '';
@@ -57,7 +60,11 @@ export const StructuredFilePreview: React.FC<Props> = ({ preview, onReveal }) =>
         </div>
       )}
 
-      <div style={{ flex: 1, minHeight: 0, overflow: 'auto', padding: preview.kind === 'drawio' ? 10 : 18 }}>
+      <div style={{
+        flex: 1, minHeight: 0,
+        overflow: preview.kind === 'excel' ? 'hidden' : 'auto',
+        padding: preview.kind === 'excel' ? 0 : preview.kind === 'drawio' ? 10 : 18,
+      }}>
         {preview.kind === 'word' && (
           <div style={paperStyle}>
             {(preview.blocks || []).map((block, index) => block.type === 'table' ? (
@@ -80,22 +87,11 @@ export const StructuredFilePreview: React.FC<Props> = ({ preview, onReveal }) =>
           </div>
         )}
 
-        {preview.kind === 'excel' && (() => {
-          const sheet = preview.sheets?.[safeActive];
-          if (!sheet || sheet.rows.length === 0) return <Empty text="工作表没有可显示的数据" />;
-          return (
-            <div style={{ overflow: 'auto', maxHeight: '100%' }}>
-              <table style={{ ...tableStyle, minWidth: '100%', background: 'var(--theme-bg-secondary)' }}><tbody>
-                {sheet.rows.map((row, rowIndex) => (
-                  <tr key={rowIndex}>
-                    <th style={rowNumberStyle}>{rowIndex + 1}</th>
-                    {row.map((cell, cellIndex) => <td key={cellIndex} style={excelCellStyle}>{cell}</td>)}
-                  </tr>
-                ))}
-              </tbody></table>
-            </div>
-          );
-        })()}
+        {preview.kind === 'excel' && (
+          (preview.sheets || []).length
+            ? <ExcelPreview sheets={preview.sheets!} styles={preview.styles} calculation={preview.calculation} />
+            : <Empty text="工作簿没有可显示的数据" />
+        )}
 
         {preview.kind === 'powerpoint' && (
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(330px, 1fr))', gap: 18 }}>
@@ -142,8 +138,6 @@ const activeTabStyle: React.CSSProperties = { background: 'var(--theme-accent-bg
 const paperStyle: React.CSSProperties = { maxWidth: 850, minHeight: 600, margin: '0 auto', padding: '38px 48px', color: '#202124', background: '#fff', boxShadow: '0 3px 18px rgba(0,0,0,.22)', fontFamily: 'system-ui, sans-serif' };
 const tableStyle: React.CSSProperties = { borderCollapse: 'collapse', fontSize: 12 };
 const cellStyle: React.CSSProperties = { border: '1px solid #cbd5e1', padding: '6px 8px', verticalAlign: 'top', whiteSpace: 'pre-wrap' };
-const excelCellStyle: React.CSSProperties = { border: '1px solid var(--theme-border)', minWidth: 90, maxWidth: 360, padding: '5px 7px', verticalAlign: 'top', whiteSpace: 'pre-wrap', color: 'var(--theme-text)' };
-const rowNumberStyle: React.CSSProperties = { ...excelCellStyle, minWidth: 36, width: 36, textAlign: 'right', color: 'var(--theme-text-muted)', background: 'var(--theme-bg-tertiary)', position: 'sticky', left: 0 };
 const mediaGridStyle: React.CSSProperties = { display: 'flex', flexWrap: 'wrap', gap: 10, marginTop: 16 };
 const mediaImageStyle: React.CSSProperties = { maxWidth: 280, maxHeight: 190, objectFit: 'contain', border: '1px solid rgba(0,0,0,.16)', borderRadius: 4, background: '#fff' };
 const slideStyle: React.CSSProperties = { position: 'relative', aspectRatio: '16 / 9', overflow: 'auto', padding: '28px 34px', background: '#fff', color: '#1f2937', borderRadius: 7, boxShadow: '0 3px 14px rgba(0,0,0,.24)' };

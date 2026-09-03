@@ -13,6 +13,7 @@ from src.backend.loop_store import (
     LoopAnalysis,
     LoopPolicy,
     LoopRecord,
+    LoopStep,
     LoopState,
     STAGE_EXECUTE,
     SUB_ANALYSIS,
@@ -93,6 +94,24 @@ class LoopEvolutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(addon.status, "applied")
         self.assertEqual(addon.applied_seq, current.seq)
 
+    def test_orchestration_parser_accepts_common_model_aliases_but_never_blank_steps(self) -> None:
+        steps = BridgeWS._loop_parse_orchestration([
+            {"mode": "concurrent", "access": "read", "description": "1. 核实现状"},
+            {"mode": "concurrent", "access": "write", "task": "Step 2: 实施修正"},
+            {"title": "步骤 3：运行回归测试"},
+            "4) 汇总证据",
+        ])
+
+        self.assertEqual([step.desc for step in steps], [
+            "核实现状", "实施修正", "运行回归测试", "汇总证据",
+        ])
+        self.assertEqual(steps[0].mode, "concurrent")
+        self.assertEqual(steps[1].mode, "sequential")  # 写操作不能被模型标成并行
+        self.assertEqual(BridgeWS._loop_parse_orchestration([
+            {"mode": "sequential", "access": "read"},
+            {"desc": "这一步虽然有效，但整份计划仍应拒绝"},
+        ]), [])
+
     async def test_prepare_uses_distinct_planner_backend_and_runtime(self) -> None:
         current = LoopRecord(seq=1, round=1)
         state = LoopState(
@@ -115,14 +134,21 @@ class LoopEvolutionTests(unittest.IsolatedAsyncioTestCase):
             SimpleNamespace(id="worker"),
             SimpleNamespace(id="strong-planner"),
         ]
-        bridge._loop_runtime = lambda _session, _state, pos, _backend_id=None: _state.policy.runtime_for(pos)
+        bridge._loop_runtime = lambda _session, _state, pos, *_backend_ids: _state.policy.runtime_for(pos)
         bridge._resolved_runtime = lambda _backend_id, runtime: dict(runtime)
         calls: list[dict] = []
 
         async def run_agent(_session, _prompt, *_args, **kwargs):
             calls.append(kwargs)
             if len(calls) == 1:
-                return ("规划模型第一次没有给出合法 JSON", None)
+                # 有数组不等于有可执行计划：旧逻辑会接受这些空说明步骤，UI 只剩序号。
+                return (
+                    "```json\n"
+                    '{"goal":"空说明不应通过","orchestration":['
+                    '{"mode":"sequential","access":"read"}]}\n'
+                    "```",
+                    None,
+                )
             return (
                 "```json\n"
                 '{"goal":"准确拆分当前任务","orchestration":['
@@ -146,6 +172,91 @@ class LoopEvolutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(current.runtimes["prepare"]["model"], "planner-model")
         self.assertEqual(current.runtimes["execute"]["model"], "worker-model")
         self.assertEqual(len(current.orchestration), 2)
+
+    async def test_execute_routes_steps_and_summary_to_selected_backend(self) -> None:
+        current = LoopRecord(
+            seq=1,
+            round=1,
+            goal="执行已规划的修正",
+            orchestration=[LoopStep(
+                index=1, mode="sequential", access="write", desc="实施修正并验证",
+            )],
+            runtimes={"execute": {"model": "worker-model", "reasoningEffort": "high"}},
+        )
+        state = LoopState(
+            session_id="split-executor",
+            stage=STAGE_EXECUTE,
+            goal="完成可验证的修正",
+            loops=[current],
+            policy=LoopPolicy.from_dict({
+                "backends": {"execute": "dedicated-worker"},
+                "runtimes": {"execute": {"model": "worker-model", "reasoningEffort": "high"}},
+            }),
+        )
+        session = SimpleNamespace(id=state.session_id, backend_id="session-backend")
+        bridge = self._bridge()
+        bridge._backend_configs = [
+            SimpleNamespace(id="session-backend"),
+            SimpleNamespace(id="dedicated-worker"),
+        ]
+        bridge._loop_cancel = {}
+        calls: list[dict] = []
+
+        async def run_agent(_session, _prompt, *_args, **kwargs):
+            calls.append(kwargs)
+            return ("执行完成", "worker-thread")
+
+        bridge._loop_run_agent = run_agent
+        await bridge._loop_do_execute(session, state, current)
+
+        self.assertEqual(len(calls), 2)  # 单步执行 + 执行汇总
+        for call in calls:
+            self.assertEqual(call["backend_id"], "dedicated-worker")
+            self.assertEqual(call["runtime"], {
+                "model": "worker-model", "reasoningEffort": "high",
+            })
+        self.assertEqual(current.backends["execute"], "dedicated-worker")
+        self.assertEqual(current.orchestration[0].status, "done")
+        self.assertEqual(current.sub_stage, SUB_ANALYSIS)
+
+    async def test_execute_replans_blank_steps_persisted_by_legacy_parser(self) -> None:
+        current = LoopRecord(
+            seq=6,
+            round=1,
+            goal="完成 ETL 回归覆盖",
+            orchestration=[LoopStep(index=1, access="write", desc="")],
+        )
+        state = LoopState(
+            session_id="legacy-blank-steps",
+            stage=STAGE_EXECUTE,
+            goal="完成 ETL 回归覆盖",
+            loops=[current],
+        )
+        session = SimpleNamespace(id=state.session_id, backend_id="executor")
+        bridge = self._bridge()
+        bridge._loop_cancel = {}
+        calls: list[str] = []
+
+        async def run_agent(_session, prompt, *_args, **_kwargs):
+            calls.append(prompt)
+            if len(calls) == 1:
+                return (
+                    "```json\n"
+                    '{"goal":"补齐 ETL 回归","steps":['
+                    '{"mode":"sequential","access":"write",'
+                    '"description":"补齐并验证 ETL 回归"}]}\n'
+                    "```",
+                    None,
+                )
+            return ("执行完成并通过测试" if len(calls) == 2 else "本次已补齐 ETL 回归。", None)
+
+        bridge._loop_run_agent = run_agent
+        await bridge._loop_do_execute(session, state, current)
+
+        self.assertEqual(len(calls), 3)  # 重规划 + 新步骤 + 汇总
+        self.assertEqual(current.orchestration[0].desc, "补齐并验证 ETL 回归")
+        self.assertEqual(current.orchestration[0].status, "done")
+        self.assertEqual(current.sub_stage, SUB_ANALYSIS)
 
     async def test_analysis_scores_cumulative_state_and_emits_next_diagnosis(self) -> None:
         previous = LoopRecord(

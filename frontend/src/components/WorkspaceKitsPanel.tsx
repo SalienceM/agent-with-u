@@ -4,6 +4,8 @@ import type {
   WorkspaceKitState,
   WorkspaceKit,
   KitRun,
+  KitStepRun,
+  KitCapabilityRuntime,
   KitInputSpec,
   KitAssertionSpec,
   KitOutputSpec,
@@ -61,6 +63,7 @@ const statusMeta: Record<string, { label: string; color: string }> = {
   queued: { label: '排队', color: '#8b949e' },
   running: { label: '执行中', color: '#d29922' },
   waiting_client: { label: '等待客户端', color: '#d2a8ff' },
+  waiting_approval: { label: '等待确认', color: '#f0b429' },
   evaluating: { label: '验收中', color: '#58a6ff' },
   succeeded: { label: '成功', color: '#3fb950' },
   failed: { label: '失败', color: '#f85149' },
@@ -95,6 +98,55 @@ function formatDuration(start?: number | null, end?: number | null, now = Date.n
   return `${hours}h ${String(minutes % 60).padStart(2, '0')}m`;
 }
 
+const generationStages = ['准备上下文', '模型生成', '解析定义', '安全校验', '完成'];
+
+function generationPhaseIndex(phase?: string): number {
+  if (['queued', 'preparing', 'context'].includes(phase || '')) return 0;
+  if (['reasoning', 'generating', 'tool'].includes(phase || '')) return 1;
+  if (phase === 'parsing') return 2;
+  if (phase === 'validating') return 3;
+  if (['succeeded', 'needs_input', 'error', 'cancelled'].includes(phase || '')) return 4;
+  return 0;
+}
+
+function generationPhaseLabel(phase?: string): string {
+  const labels: Record<string, string> = {
+    queued: '等待执行端接收任务',
+    preparing: '正在准备编译任务',
+    context: '正在读取 Session 上下文与相关文件',
+    reasoning: '模型正在分析实现路径',
+    generating: '模型正在生成 Kit 定义',
+    tool: '模型正在调用工具检查工作区',
+    parsing: '正在解析模型返回的 Kit 定义',
+    validating: '正在执行安全与验收校验',
+    succeeded: '编译完成',
+    needs_input: '需要补充信息',
+    error: '编译失败',
+    cancelled: '编译已停止',
+  };
+  return labels[phase || ''] || '正在处理';
+}
+
+function generationActivityIcon(type?: string): string {
+  if (type === 'tool_start') return '↗';
+  if (type === 'tool_result') return '↙';
+  if (type?.startsWith('subagent')) return '◇';
+  if (type === 'error') return '!';
+  if (type === 'result') return '✓';
+  if (type === 'cancelled') return '■';
+  return '●';
+}
+
+function formatActivityAge(at?: number | null, now = Date.now() / 1000): string {
+  if (!at) return '尚未收到事件';
+  const seconds = Math.max(0, Math.floor(now - at));
+  if (seconds < 5) return '刚刚';
+  if (seconds < 60) return `${seconds} 秒前`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes} 分钟前`;
+  return new Date(at * 1000).toLocaleTimeString();
+}
+
 function defaultInputsOf(kit: WorkspaceKit): Record<string, unknown> {
   const defaults: Record<string, unknown> = {};
   kit.inputs.forEach((spec) => {
@@ -104,7 +156,7 @@ function defaultInputsOf(kit: WorkspaceKit): Record<string, unknown> {
 }
 
 function isActiveRun(run?: KitRun): boolean {
-  return !!run && ['queued', 'running', 'waiting_client', 'evaluating'].includes(run.status);
+  return !!run && ['queued', 'running', 'waiting_client', 'waiting_approval', 'evaluating'].includes(run.status);
 }
 
 function isActiveGeneration(job?: KitGenerationJob | null): boolean {
@@ -171,6 +223,7 @@ export const WorkspaceKitsPanel: React.FC<Props> = ({ sessionId, open, onClose }
   const [terminalCommand, setTerminalCommand] = useState('');
   const [busy, setBusy] = useState(false);
   const [cancellingRunIds, setCancellingRunIds] = useState<Set<string>>(() => new Set());
+  const [capabilityResponding, setCapabilityResponding] = useState('');
   const [notice, setNotice] = useState<{ kind: 'error' | 'ok'; text: string } | null>(null);
   const [generationJob, setGenerationJob] = useState<KitGenerationJob | null>(null);
   const [generationEditorJobId, setGenerationEditorJobId] = useState('');
@@ -244,6 +297,7 @@ export const WorkspaceKitsPanel: React.FC<Props> = ({ sessionId, open, onClose }
     setDraft(null);
     setInputs({});
     setCancellingRunIds(new Set());
+    setCapabilityResponding('');
     setGenerationJob(null);
     setGenerationEditorJobId('');
     setNotice(null);
@@ -452,6 +506,40 @@ export const WorkspaceKitsPanel: React.FC<Props> = ({ sessionId, open, onClose }
     }
   };
 
+  const respondCapability = async (runId: string, stepId: string, approved: boolean) => {
+    const key = `${runId}:${stepId}`;
+    if (capabilityResponding) return;
+    if (approved && !window.confirm(
+      '确认按当前冻结计划正式发布？确认后会上传制品并切换 channel manifest。',
+    )) return;
+    setCapabilityResponding(key);
+    setNotice(null);
+    try {
+      const result = await api.kitCapabilityRespond(sessionId, runId, stepId, approved);
+      if (result.status !== 'ok') {
+        setNotice({ kind: 'error', text: result.message || '能力确认失败' });
+        return;
+      }
+      if (result.run) {
+        setState((current) => ({
+          ...current,
+          runs: current.runs.map((item) => item.id === runId ? result.run! : item),
+        }));
+      }
+      setNotice({
+        kind: 'ok',
+        text: approved ? '已确认，发布中心正在执行冻结计划' : '已拒绝，没有开始正式发布',
+      });
+    } catch (error) {
+      setNotice({
+        kind: 'error',
+        text: `能力确认失败：${error instanceof Error ? error.message : String(error)}`,
+      });
+    } finally {
+      setCapabilityResponding('');
+    }
+  };
+
   const quickRunKit = async (kit: WorkspaceKit) => {
     const defaults = defaultInputsOf(kit);
     const missingRequired = kit.inputs.some((spec) => (
@@ -538,12 +626,16 @@ export const WorkspaceKitsPanel: React.FC<Props> = ({ sessionId, open, onClose }
             <span aria-hidden="true">{isActiveGeneration(generationJob) ? '⏳' : generationJob.status === 'succeeded' ? '✓' : '⚠'}</span>
             <span style={{ flex: 1, minWidth: 180 }}>
               <strong>{isActiveGeneration(generationJob) ? '标准 Kit 正在后台生成' : '标准 Kit 生成任务已有结果'}</strong>
-              {' · '}{generationJob.message || generationJob.error || generationJob.status}
+              {' · '}{generationPhaseLabel(generationJob.phase || generationJob.status)}
+              {generationJob.outputChars ? ` · 已输出 ${generationJob.outputChars.toLocaleString()} 字符` : ''}
               {generationJob.startedAt && <> · {formatDuration(generationJob.startedAt, generationJob.endedAt, clock)}</>}
+              {isActiveGeneration(generationJob) && generationJob.lastActivityAt && (
+                <> · 最近活动 {formatActivityAge(generationJob.lastActivityAt, clock)}</>
+              )}
               {isActiveGeneration(generationJob) && <span style={{ color: 'var(--theme-text-muted)' }}> · 可切换 Session，不会中断</span>}
             </span>
             <button style={secondaryButton} onClick={showGeneration}>
-              {isActiveGeneration(generationJob) ? '查看进度' : '查看结果'}
+              {isActiveGeneration(generationJob) ? '查看实时输出' : '查看结果'}
             </button>
             {isActiveGeneration(generationJob) && (
               <button style={dangerButton} onClick={() => void cancelGeneration()}>■ 停止</button>
@@ -658,7 +750,7 @@ export const WorkspaceKitsPanel: React.FC<Props> = ({ sessionId, open, onClose }
                     <span style={{
                       width: 8, height: 8, flex: '0 0 auto', borderRadius: '50%',
                       background: meta?.color || '#6e7681',
-                      boxShadow: ['running', 'waiting_client', 'evaluating'].includes(run?.status || '') ? `0 0 8px ${meta?.color}` : 'none',
+                      boxShadow: ['running', 'waiting_client', 'waiting_approval', 'evaluating'].includes(run?.status || '') ? `0 0 8px ${meta?.color}` : 'none',
                     }} />
                     <span style={{ minWidth: 0, flex: 1 }}>
                       <span style={{ display: 'block', overflow: 'hidden', textOverflow: 'ellipsis' }}>{kit.title}</span>
@@ -703,6 +795,8 @@ export const WorkspaceKitsPanel: React.FC<Props> = ({ sessionId, open, onClose }
                   dataMarket={state.dataMarket}
                   now={clock}
                   onOptimize={() => setOptimizerKitId(selected.id)}
+                  capabilityResponding={capabilityResponding}
+                  onCapabilityRespond={(runId, stepId, approved) => void respondCapability(runId, stepId, approved)}
                 />
               ) : (
                 <div style={emptyMainStyle}>选择或创建一个 Kit</div>
@@ -720,6 +814,164 @@ export const WorkspaceKitsPanel: React.FC<Props> = ({ sessionId, open, onClose }
         />
       )}
     </div>
+  );
+};
+
+const KitGenerationProgress: React.FC<{
+  job: KitGenerationJob;
+  now: number;
+  onCancel: () => void;
+}> = ({ job, now, onCancel }) => {
+  const outputRef = useRef<HTMLPreElement | null>(null);
+  const [followOutput, setFollowOutput] = useState(true);
+  const phaseIndex = generationPhaseIndex(job.phase || job.status);
+  const activities = [...(job.activities || [])].reverse().slice(0, 16);
+  const lastEventAt = job.lastActivityAt || job.updatedAt || job.startedAt || job.createdAt;
+  const inactiveSeconds = Math.max(0, now - lastEventAt);
+  const stalled = isActiveGeneration(job) && inactiveSeconds >= 45;
+
+  useEffect(() => {
+    if (!followOutput || !outputRef.current) return;
+    outputRef.current.scrollTop = outputRef.current.scrollHeight;
+  }, [job.outputChars, job.outputPreview, followOutput]);
+
+  return (
+    <section style={{
+      ...cardStyle, padding: 16, borderColor: stalled ? 'rgba(248,81,73,.5)' : 'rgba(88,166,255,.5)',
+      background: 'linear-gradient(145deg, rgba(88,166,255,.09), rgba(210,168,255,.035))',
+    }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: 12, flexWrap: 'wrap' }}>
+        <div style={{ minWidth: 0 }}>
+          <div style={{ color: '#79c0ff', fontSize: 11, fontWeight: 700, letterSpacing: '.08em' }}>
+            AI KIT COMPILER · {isActiveGeneration(job) ? 'LIVE' : 'TRACE'}
+          </div>
+          <div style={{ marginTop: 5, fontSize: 18, fontWeight: 720 }}>
+            {generationPhaseLabel(job.phase || job.status)}
+          </div>
+          <div style={{ marginTop: 5, color: 'var(--theme-text-muted)', fontSize: 12.5, lineHeight: 1.55 }}>
+            {job.message || '执行端正在准备任务'}
+          </div>
+        </div>
+        <div style={{ display: 'flex', gap: 7, alignItems: 'center', flexWrap: 'wrap' }}>
+          <span style={{ ...statusPill, color: '#79c0ff', borderColor: 'rgba(88,166,255,.55)', fontSize: 11 }}>
+            ⏱ {formatDuration(job.startedAt || job.createdAt, job.endedAt, now)}
+          </span>
+          {isActiveGeneration(job) && <button style={dangerButton} onClick={onCancel}>■ 停止生成</button>}
+        </div>
+      </div>
+
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(5, minmax(80px, 1fr))', gap: 7, marginTop: 16, overflowX: 'auto', paddingBottom: 2 }}>
+        {generationStages.map((stage, index) => {
+          const complete = index < phaseIndex || (index === 4 && job.status === 'succeeded');
+          const active = index === phaseIndex && isActiveGeneration(job);
+          const failed = index === 4 && ['error', 'cancelled'].includes(job.status);
+          const color = failed ? '#ff7b72' : complete ? '#56d364' : active ? '#79c0ff' : '#6e7681';
+          return (
+            <div key={stage} style={{ minWidth: 80 }}>
+              <div style={{ height: 5, borderRadius: 99, background: color, opacity: complete || active || failed ? 1 : .35 }} />
+              <div style={{ marginTop: 6, color, fontSize: 10.5, fontWeight: active ? 700 : 500 }}>
+                {complete ? '✓ ' : active ? '● ' : ''}{stage}
+              </div>
+            </div>
+          );
+        })}
+      </div>
+
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(135px, 1fr))', gap: 8, marginTop: 14 }}>
+        <div style={generationMetricStyle}>
+          <span style={generationMetricLabelStyle}>执行 Backend</span>
+          <strong style={generationMetricValueStyle}>{job.backendLabel || job.backendId || '正在解析'}</strong>
+        </div>
+        <div style={generationMetricStyle}>
+          <span style={generationMetricLabelStyle}>模型</span>
+          <strong style={generationMetricValueStyle}>{job.model || 'Backend 默认模型'}</strong>
+        </div>
+        <div style={generationMetricStyle}>
+          <span style={generationMetricLabelStyle}>模型正文</span>
+          <strong style={generationMetricValueStyle}>{(job.outputChars || 0).toLocaleString()} 字符</strong>
+        </div>
+        <div style={generationMetricStyle}>
+          <span style={generationMetricLabelStyle}>推理流</span>
+          <strong style={generationMetricValueStyle}>{(job.thinkingChars || 0).toLocaleString()} 字符</strong>
+        </div>
+        <div style={generationMetricStyle}>
+          <span style={generationMetricLabelStyle}>最近活动</span>
+          <strong style={{ ...generationMetricValueStyle, color: stalled ? '#ff7b72' : '#56d364' }}>
+            {formatActivityAge(lastEventAt, now)}
+          </strong>
+        </div>
+      </div>
+
+      {stalled && (
+        <div style={{
+          marginTop: 12, padding: '9px 11px', borderRadius: 7, fontSize: 12, lineHeight: 1.55,
+          color: '#ffb3ad', border: '1px solid rgba(248,81,73,.4)', background: 'rgba(248,81,73,.09)',
+        }}>
+          已有 {Math.floor(inactiveSeconds)} 秒没有收到新事件。任务尚未被判定失败，可能正在长推理、等待工具返回或等待模型连接；你可以继续观察或手动停止。
+        </div>
+      )}
+
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 300px), 1fr))', gap: 12, marginTop: 13 }}>
+        <div style={generationPaneStyle}>
+          <div style={generationPaneHeaderStyle}>
+            <div>
+              <strong>实时模型输出</strong>
+              <span style={{ ...subtleStyle, marginLeft: 7 }}>正在拼装标准 Kit JSON</span>
+            </div>
+            <button style={{ ...linkButton, opacity: followOutput ? .7 : 1 }} onClick={() => setFollowOutput((value) => !value)}>
+              {followOutput ? '● 跟随最新' : '○ 恢复跟随'}
+            </button>
+          </div>
+          <pre
+            ref={outputRef}
+            onScroll={(event) => {
+              const element = event.currentTarget;
+              setFollowOutput(element.scrollHeight - element.scrollTop - element.clientHeight < 28);
+            }}
+            style={generationOutputStyle}
+          >{job.outputPreview || '等待模型开始输出…\n\n如果模型先进行推理或检查文件，右侧活动会先更新。'}</pre>
+        </div>
+
+        <div style={generationPaneStyle}>
+          <div style={generationPaneHeaderStyle}>
+            <strong>最近活动</strong>
+            <span style={subtleStyle}>{activities.length} 条</span>
+          </div>
+          <div style={{ maxHeight: 330, overflow: 'auto', padding: '5px 10px 10px' }}>
+            {activities.length ? activities.map((activity, index) => (
+              <div key={`${activity.at}-${index}`} style={{ display: 'grid', gridTemplateColumns: '18px minmax(0, 1fr)', gap: 7, padding: '8px 0', borderBottom: '1px solid var(--theme-border)' }}>
+                <span style={{ color: activity.type === 'error' ? '#ff7b72' : '#79c0ff', fontWeight: 800 }}>
+                  {generationActivityIcon(activity.type)}
+                </span>
+                <div style={{ minWidth: 0 }}>
+                  <div style={{ fontSize: 11.5, lineHeight: 1.45, overflowWrap: 'anywhere' }}>{activity.label}</div>
+                  <div style={{ ...subtleStyle, marginTop: 2 }}>{new Date(activity.at * 1000).toLocaleTimeString()}</div>
+                  {activity.detail && (
+                    <details style={{ marginTop: 4 }}>
+                      <summary style={{ cursor: 'pointer', color: 'var(--theme-text-muted)', fontSize: 10.5 }}>查看输入 / 返回</summary>
+                      <pre style={{ ...generationActivityDetailStyle }}>{activity.detail}</pre>
+                    </details>
+                  )}
+                </div>
+              </div>
+            )) : <div style={{ ...subtleStyle, padding: '12px 2px' }}>等待第一个活动事件…</div>}
+          </div>
+        </div>
+      </div>
+
+      <details style={{ marginTop: 12 }}>
+        <summary style={{ cursor: 'pointer', fontSize: 12, color: '#d2a8ff', fontWeight: 650 }}>
+          模型推理流 · {(job.thinkingChars || 0).toLocaleString()} 字符
+        </summary>
+        <pre style={{ ...generationOutputStyle, maxHeight: 220, marginTop: 8, color: '#d2a8ff' }}>
+          {job.thinkingPreview || '当前 Backend 没有提供可展示的推理流。'}
+        </pre>
+      </details>
+
+      <div style={{ ...subtleStyle, marginTop: 10 }}>
+        任务运行在 Session 所属执行端；关闭面板或切换 Session 不会中断，回来后会恢复到最新状态。
+      </div>
+    </section>
   );
 };
 
@@ -751,10 +1003,16 @@ const KitEditor: React.FC<{
       .filter((source) => source && !source.includes('{{'))
   ));
   const generating = submittingGeneration || isActiveGeneration(generationJob);
+  const hasApprovalCapability = draft.steps.some((step) => step.type === 'awu_capability');
   const patch = (value: Partial<Draft>) => onChange({ ...draft, ...value });
   const setInputs = (inputs: KitInputSpec[]) => patch({ inputs });
   const setAssertions = (assertions: KitAssertionSpec[]) => patch({ assertions });
   const setOutputs = (outputs: KitOutputSpec[]) => patch({ outputs });
+  const updateStep = (index: number, value: Partial<Draft['steps'][number]>) => patch({
+    steps: draft.steps.map((step, itemIndex) => itemIndex === index
+      ? { ...step, ...value } : step),
+    generatedByAi: false,
+  });
 
   useEffect(() => {
     setClientSources(
@@ -899,31 +1157,11 @@ const KitEditor: React.FC<{
         <span style={subtleStyle}>生成阶段不保存、不执行任务；先给你审核。</span>
       </div>
 
-      {generationJob && isActiveGeneration(generationJob) && (
-        <section style={{ ...cardStyle, borderColor: 'rgba(210,153,34,.55)', background: 'rgba(210,153,34,.06)' }}>
-          <div style={{ ...cardTitle, color: '#e3b341', display: 'flex', alignItems: 'center', gap: 8 }}>
-            <span>⏳ AI 正在后台编译</span>
-            <span style={statusPill}>{formatDuration(generationJob.startedAt || generationJob.createdAt, null, now)}</span>
-          </div>
-          <div style={{ fontSize: 12.5, lineHeight: 1.6 }}>{generationJob.message || '正在准备…'}</div>
-          <div style={{ ...subtleStyle, marginTop: 6 }}>
-            任务运行在 Session 所属执行端；可以关闭面板或切换到其他 Session，生成不会中断。
-          </div>
-          <button style={{ ...dangerButton, marginTop: 10 }} onClick={() => void onCancelGeneration()}>
-            ■ 停止生成
-          </button>
-        </section>
-      )}
-
-      {generationJob && !isActiveGeneration(generationJob) && !generationJob.result && (
-        <section style={{ ...cardStyle, borderColor: 'rgba(248,81,73,.45)' }}>
-          <div style={{ ...cardTitle, color: generationJob.status === 'cancelled' ? '#8b949e' : '#ff7b72' }}>
-            {generationJob.status === 'cancelled' ? '后台生成已停止' : '后台生成失败'}
-          </div>
-          <div style={{ fontSize: 12, lineHeight: 1.55 }}>
-            {generationJob.error || generationJob.message || '没有生成可审核的 Kit 预览'}
-          </div>
-        </section>
+      {generationJob && (
+        isActiveGeneration(generationJob)
+        || (!generationJob.result && ['error', 'cancelled'].includes(generationJob.status))
+      ) && (
+        <KitGenerationProgress job={generationJob} now={now} onCancel={() => void onCancelGeneration()} />
       )}
 
       {generation && (
@@ -1009,9 +1247,10 @@ const KitEditor: React.FC<{
         </label>
         <label><FieldLabel>触发方式</FieldLabel>
           <select style={inputStyle} value={draft.schedule.mode}
+            title={hasApprovalCapability ? '需要人工确认的 AgentWithU 能力只能手动运行' : undefined}
             onChange={(e) => patch({ schedule: { ...draft.schedule, mode: e.target.value as 'manual' | 'interval' } })}>
             <option value="manual">单次手动执行</option>
-            <option value="interval">Schedule 周期执行</option>
+            <option value="interval" disabled={hasApprovalCapability}>Schedule 周期执行</option>
           </select>
         </label>
         {draft.schedule.mode === 'interval' && (
@@ -1029,6 +1268,38 @@ const KitEditor: React.FC<{
         <div style={{ ...subtleStyle, marginTop: 7, lineHeight: 1.5 }}>
           通常由 AI 维护。需要审计或手工兜底时再展开修改；这里的代码不会在创建阶段执行。
         </div>
+        <div style={{ display: 'flex', gap: 7, marginTop: 10, flexWrap: 'wrap' }}>
+          <button type="button" style={secondaryButton} onClick={() => patch({
+            steps: [
+              ...(draft.steps.length ? draft.steps : draft.command.trim() ? [{
+                id: 'legacy-command',
+                type: 'command' as const,
+                target: draft.executionTarget,
+                title: draft.title || '执行原有任务',
+                shell: draft.shell,
+                cwd: draft.cwd,
+                timeoutSeconds: draft.timeoutSeconds,
+                command: draft.command,
+                assertions: draft.assertions,
+              }] : []),
+              {
+              id: `awu-release-${Date.now()}`,
+              type: 'awu_capability',
+              target: 'executor',
+              title: '发布最新包',
+              config: {
+                capability: 'release.publish_latest',
+                arguments: { projectRoot: '.', channel: 'stable', notes: '' },
+              },
+              },
+            ],
+            generatedByAi: false,
+            schedule: { ...draft.schedule, mode: 'manual' },
+          })}>＋ AgentWithU · 发布最新包</button>
+          <span style={{ ...subtleStyle, alignSelf: 'center' }}>
+            自动扫描和预检；正式发布前仍须人工确认。
+          </span>
+        </div>
         {draft.steps.length > 0 && (
           <section style={{ ...editorGroup, marginTop: 10 }}>
             <strong style={{ fontSize: 12 }}>有序编排 · 任一步失败即停止</strong>
@@ -1041,10 +1312,67 @@ const KitEditor: React.FC<{
                     <div style={{ ...subtleStyle, marginTop: 3 }}>
                       {step.type === 'file_push' ? `文件推送：${step.config?.source || '未指定'} → ${step.config?.destination || '未指定'}`
                         : step.type === 'kit_call' ? `调用 Kit：${step.kitId || '未指定'}`
+                          : step.type === 'awu_capability' ? `AgentWithU 能力：${step.config?.capability || '未指定'}`
                           : `${step.shell || draft.shell} · ${(step.command || '').slice(0, 180)}`}
                     </div>
+                    {step.type === 'awu_capability' && (
+                      <div style={{ ...twoColumns, marginTop: 9 }}>
+                        <label><FieldLabel>项目目录</FieldLabel>
+                          <input style={miniInput} value={String(step.config?.arguments?.projectRoot || '.')}
+                            onChange={(e) => updateStep(index, { config: {
+                              ...step.config,
+                              arguments: { ...step.config?.arguments, projectRoot: e.target.value },
+                            } })} />
+                        </label>
+                        <label><FieldLabel>发布通道</FieldLabel>
+                          <input style={miniInput} value={String(step.config?.arguments?.channel || 'stable')}
+                            onChange={(e) => updateStep(index, { config: {
+                              ...step.config,
+                              arguments: { ...step.config?.arguments, channel: e.target.value },
+                            } })} />
+                        </label>
+                        <label><FieldLabel>平台筛选（可选，逗号分隔）</FieldLabel>
+                          <input style={miniInput}
+                            placeholder="windows,linux,macos"
+                            value={Array.isArray(step.config?.arguments?.platforms)
+                              ? step.config?.arguments?.platforms.join(',') : ''}
+                            onChange={(e) => updateStep(index, { config: {
+                              ...step.config,
+                              arguments: {
+                                ...step.config?.arguments,
+                                platforms: e.target.value.split(',').map((item) => item.trim()).filter(Boolean),
+                              },
+                            } })} />
+                        </label>
+                        <label><FieldLabel>制品类型（可选，逗号分隔）</FieldLabel>
+                          <input style={miniInput}
+                            placeholder="msi,nsis,docker-bundle"
+                            value={Array.isArray(step.config?.arguments?.kinds)
+                              ? step.config?.arguments?.kinds.join(',') : ''}
+                            onChange={(e) => updateStep(index, { config: {
+                              ...step.config,
+                              arguments: {
+                                ...step.config?.arguments,
+                                kinds: e.target.value.split(',').map((item) => item.trim()).filter(Boolean),
+                              },
+                            } })} />
+                        </label>
+                        <label style={{ gridColumn: '1 / -1' }}><FieldLabel>发布说明</FieldLabel>
+                          <textarea style={{ ...miniInput, width: '100%', minHeight: 54, resize: 'vertical' }}
+                            value={String(step.config?.arguments?.notes || '')}
+                            onChange={(e) => updateStep(index, { config: {
+                              ...step.config,
+                              arguments: { ...step.config?.arguments, notes: e.target.value },
+                            } })} />
+                        </label>
+                      </div>
+                    )}
                   </div>
                   <span style={mutedPill}>{step.target === 'client' ? '客户端' : '执行端'}</span>
+                  <button type="button" style={dangerMini} onClick={() => patch({
+                    steps: draft.steps.filter((_, itemIndex) => itemIndex !== index),
+                    generatedByAi: false,
+                  })}>×</button>
                 </div>
               ))}
             </div>
@@ -1172,6 +1500,119 @@ const EditorGroup: React.FC<{
   </section>
 );
 
+const CapabilityRunCard: React.FC<{
+  run: KitRun;
+  step: KitStepRun;
+  responding: boolean;
+  onRespond: (approved: boolean) => void;
+}> = ({ run, step, responding, onRespond }) => {
+  const runtime = (step.config?.capabilityRuntime || {}) as KitCapabilityRuntime;
+  const plan = runtime.plan || {};
+  const candidate = plan.candidate || {};
+  const artifacts: Array<Record<string, unknown>> = Array.isArray(plan.artifacts) ? plan.artifacts : [];
+  const job = runtime.job || {};
+  const progress = Math.max(0, Math.min(100, Number(job.progress || 0)));
+  const waiting = run.status === 'waiting_approval' && step.status === 'waiting_approval';
+  const bytes = (value: unknown) => {
+    const amount = Number(value || 0);
+    if (!amount) return '0 B';
+    if (amount < 1024 * 1024) return `${(amount / 1024).toFixed(1)} KB`;
+    return `${(amount / 1024 / 1024).toFixed(1)} MB`;
+  };
+  return (
+    <div style={{
+      marginTop: 10, padding: 13, borderRadius: 10,
+      border: `1px solid ${waiting ? 'rgba(240,180,41,.55)' : 'var(--theme-border)'}`,
+      background: waiting ? 'rgba(240,180,41,.075)' : 'rgba(88,166,255,.045)',
+    }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', gap: 10, flexWrap: 'wrap' }}>
+        <div>
+          <strong style={{ fontSize: 13 }}>AgentWithU · 发布最新包</strong>
+          <div style={{ ...subtleStyle, marginTop: 4 }}>
+            冻结计划 {String(plan.id || runtime.planId || '准备中').slice(0, 12)}
+            {plan.fingerprint ? ` · 指纹 ${String(plan.fingerprint).slice(0, 12)}` : ''}
+          </div>
+        </div>
+        <span style={{ ...statusPill, color: waiting ? '#f0b429' : '#79c0ff', borderColor: waiting ? '#f0b42966' : '#58a6ff66' }}>
+          {waiting ? '需要人工确认' : String(runtime.phase || step.status)}
+        </span>
+      </div>
+
+      {plan.id && (
+        <div style={{ ...runMetaGrid, marginTop: 11 }}>
+          <span>版本：{String(candidate.version || plan.release?.version || '—')}</span>
+          <span>Build：{String(candidate.buildId || plan.release?.buildId || '—')}</span>
+          <span>序号：{String(candidate.sequence || plan.release?.sequence || '—')}</span>
+          <span>Channel：{String(plan.channel || 'stable')}</span>
+          <span>制品：{artifacts.length}</span>
+          <span>Manifest：{String(plan.manifestUrl || '—')}</span>
+        </div>
+      )}
+
+      {artifacts.length > 0 && (
+        <div style={{ display: 'grid', gap: 5, marginTop: 10 }}>
+          {artifacts.map((artifact, index) => (
+            <div key={String(artifact.id || index)} style={{ ...assertionRow, fontSize: 11.5 }}>
+              <span style={{ color: '#79c0ff' }}>◆</span>
+              <span style={{ flex: 1 }}>{String(artifact.fileName || artifact.id || `制品 ${index + 1}`)}</span>
+              <span style={subtleStyle}>{String(artifact.platform || 'any')} / {String(artifact.arch || 'any')}</span>
+              <span style={subtleStyle}>{bytes(artifact.size)}</span>
+              <span style={{ ...subtleStyle, fontFamily: 'Consolas, monospace' }}>{String(artifact.sha256 || '').slice(0, 12)}</span>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {!!plan.blockers?.length && (
+        <div style={{ marginTop: 10, color: '#ff7b72', fontSize: 12 }}>
+          {plan.blockers.map((item, index) => <div key={index}>阻断：{item}</div>)}
+        </div>
+      )}
+      {!!plan.warnings?.length && (
+        <details style={{ marginTop: 9 }}>
+          <summary style={{ cursor: 'pointer', color: '#e3b341', fontSize: 11.5 }}>
+            {plan.warnings.length} 条发布提示
+          </summary>
+          <div style={{ marginTop: 5, color: '#e3b341', fontSize: 11.5 }}>
+            {plan.warnings.map((item, index) => <div key={index}>• {item}</div>)}
+          </div>
+        </details>
+      )}
+
+      {job.id && (
+        <div style={{ marginTop: 11 }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', gap: 8, fontSize: 11.5 }}>
+            <span>{String(job.message || job.status || '发布中')}</span>
+            <span>{progress}%{job.currentFileName ? ` · ${String(job.currentFileName)}` : ''}</span>
+          </div>
+          <div style={{ height: 6, marginTop: 6, borderRadius: 999, overflow: 'hidden', background: 'rgba(110,118,129,.25)' }}>
+            <div style={{ width: `${progress}%`, height: '100%', background: job.status === 'failed' ? '#f85149' : '#58a6ff', transition: 'width .25s ease' }} />
+          </div>
+          {job.totalBytes ? (
+            <div style={{ ...subtleStyle, marginTop: 4 }}>{bytes(job.uploadedBytes)} / {bytes(job.totalBytes)}</div>
+          ) : null}
+        </div>
+      )}
+
+      {waiting && (
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 10, marginTop: 13, flexWrap: 'wrap' }}>
+          <div style={{ color: '#f0b429', fontSize: 11.5 }}>
+            确认后会上传以上制品并切换 channel manifest；AI 与 Schedule 无权代替你确认。
+          </div>
+          <div style={{ display: 'flex', gap: 7 }}>
+            <button style={dangerButton} disabled={responding} onClick={() => onRespond(false)}>
+              拒绝并停止
+            </button>
+            <button style={primaryButton} disabled={responding} onClick={() => onRespond(true)}>
+              {responding ? '提交中…' : '确认正式发布'}
+            </button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};
+
 const KitDetail: React.FC<{
   sessionId: string;
   kit: WorkspaceKit;
@@ -1195,11 +1636,13 @@ const KitDetail: React.FC<{
   dataMarket: WorkspaceKitState['dataMarket'];
   now: number;
   onOptimize: () => void;
+  capabilityResponding: string;
+  onCapabilityRespond: (runId: string, stepId: string, approved: boolean) => void;
 }> = ({
   sessionId, kit, run, runs, inputs, onInputsChange, onRun, onCancel, onEdit, onDelete,
   onToggleEnabled, onControlMode, terminalCommand, onTerminalCommand, onTerminalRun,
   terminalConnected, onTerminalClose, busy, dataMarket, now, onOptimize,
-  cancelling,
+  cancelling, capabilityResponding, onCapabilityRespond,
 }) => {
   const running = isActiveRun(run);
   const meta = run ? statusMeta[run.status] : null;
@@ -1267,20 +1710,33 @@ const KitDetail: React.FC<{
               : '—';
             const stepColor = stepStatus === 'succeeded' ? '#56d364'
               : ['failed', 'error', 'cancelled'].includes(stepStatus) ? '#ff7b72'
-                : ['running', 'waiting_client'].includes(stepStatus) ? '#d2a8ff' : '#8b949e';
+                : stepStatus === 'waiting_approval' ? '#f0b429'
+                  : ['running', 'waiting_client'].includes(stepStatus) ? '#d2a8ff' : '#8b949e';
             return (
               <div key={step.id || index} style={{ ...assertionRow, color: stepColor }}>
                 <span>{index + 1}</span>
                 <span style={{ flex: 1, color: 'var(--theme-text)' }}>{step.title || `步骤 ${index + 1}`}</span>
-                <span style={subtleStyle}>{step.type === 'file_push' ? '文件推送' : step.type === 'kit_call' ? 'Kit 调用' : '命令'}</span>
+                <span style={subtleStyle}>{step.type === 'file_push' ? '文件推送'
+                  : step.type === 'kit_call' ? 'Kit 调用'
+                    : step.type === 'awu_capability' ? 'AgentWithU 能力' : '命令'}</span>
                 <span style={mutedPill}>{step.target === 'client' ? '客户端' : '执行端'}</span>
-                <span style={{ minWidth: 74 }}>{stepStatus === 'waiting_client' ? '等待客户端' : stepStatus}</span>
-                <span style={{ ...durationPill, color: ['running', 'waiting_client'].includes(stepStatus) ? '#d2a8ff' : '#8b949e' }}>
+                <span style={{ minWidth: 74 }}>{stepStatus === 'waiting_client' ? '等待客户端'
+                  : stepStatus === 'waiting_approval' ? '等待确认' : stepStatus}</span>
+                <span style={{ ...durationPill, color: ['running', 'waiting_client', 'waiting_approval'].includes(stepStatus) ? stepColor : '#8b949e' }}>
                   ⏱ {duration}
                 </span>
               </div>
             );
           })}
+          {run?.steps.filter((step) => step.type === 'awu_capability').map((step) => (
+            <CapabilityRunCard
+              key={`capability-${step.id}`}
+              run={run}
+              step={step}
+              responding={capabilityResponding === `${run.id}:${step.id}`}
+              onRespond={(approved) => onCapabilityRespond(run.id, step.id, approved)}
+            />
+          ))}
           {run?.status === 'waiting_client' && (
             <div style={{ ...subtleStyle, marginTop: 8, color: '#d2a8ff' }}>
               当前客户端正在接管这一步；文件会分块传输并在执行端完成大小与 SHA-256 验收。
@@ -1991,6 +2447,36 @@ const dslPreviewStyle: React.CSSProperties = {
   margin: '8px 0 0', padding: 10, maxHeight: 360, overflow: 'auto',
   borderRadius: 7, background: '#0d1117', color: '#c9d1d9', fontSize: 10.5,
   whiteSpace: 'pre-wrap', wordBreak: 'break-word', fontFamily: 'Consolas, monospace',
+};
+const generationMetricStyle: React.CSSProperties = {
+  minWidth: 0, padding: '9px 10px', borderRadius: 7,
+  border: '1px solid var(--theme-border)', background: 'rgba(13,17,23,.34)',
+};
+const generationMetricLabelStyle: React.CSSProperties = {
+  display: 'block', color: 'var(--theme-text-muted)', fontSize: 10, marginBottom: 4,
+};
+const generationMetricValueStyle: React.CSSProperties = {
+  display: 'block', fontSize: 12, fontWeight: 650, overflow: 'hidden',
+  textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontVariantNumeric: 'tabular-nums',
+};
+const generationPaneStyle: React.CSSProperties = {
+  minWidth: 0, overflow: 'hidden', borderRadius: 8,
+  border: '1px solid var(--theme-border)', background: 'rgba(13,17,23,.58)',
+};
+const generationPaneHeaderStyle: React.CSSProperties = {
+  minHeight: 38, boxSizing: 'border-box', padding: '8px 10px', display: 'flex',
+  alignItems: 'center', justifyContent: 'space-between', gap: 8, fontSize: 11.5,
+  borderBottom: '1px solid var(--theme-border)',
+};
+const generationOutputStyle: React.CSSProperties = {
+  height: 330, maxHeight: 330, margin: 0, padding: 12, boxSizing: 'border-box', overflow: 'auto',
+  whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', color: '#c9d1d9', background: '#0d1117',
+  font: '11.5px/1.6 Consolas, "SFMono-Regular", monospace', tabSize: 2,
+};
+const generationActivityDetailStyle: React.CSSProperties = {
+  maxHeight: 150, margin: '5px 0 0', padding: 7, overflow: 'auto', whiteSpace: 'pre-wrap',
+  overflowWrap: 'anywhere', borderRadius: 5, color: '#b1bac4', background: '#0d1117',
+  font: '10px/1.5 Consolas, monospace',
 };
 const optimizerOverlayStyle: React.CSSProperties = {
   position: 'absolute', inset: 0, zIndex: 4, display: 'flex', justifyContent: 'flex-end',

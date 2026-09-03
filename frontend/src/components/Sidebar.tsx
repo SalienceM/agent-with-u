@@ -2,6 +2,7 @@ import React, { useEffect, useState, useCallback, memo, useRef, useMemo, useLayo
 import { api, isTauri, onExecStatus } from '../api';
 import { FileTreePanel } from './FileTreePanel';
 import type { FileFocusRequest } from '../utils/fileFocus';
+import { AppModalPortal } from './AppModalPortal';
 
 interface Session {
   id: string;
@@ -569,9 +570,12 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
           overflow-y: auto;
           border: 1px solid var(--theme-border, rgba(127,127,127,.24));
           border-radius: 9px;
-          background: var(--theme-bg-secondary, #fff);
-          box-shadow: 0 14px 38px rgba(0,0,0,.28), 0 2px 8px rgba(0,0,0,.16);
-          z-index: 1600;
+          background: var(--theme-popover-bg, var(--theme-bg-secondary, #fff));
+          opacity: 1;
+          backdrop-filter: none;
+          box-shadow: 0 18px 48px rgba(0,0,0,.45), 0 0 0 1px rgba(255,255,255,.035);
+          z-index: 10060;
+          isolation: isolate;
           user-select: none;
           animation: awuSessionContextIn .12s ease-out;
         }
@@ -910,6 +914,7 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
       )}
 
       {sessionContextMenu && (
+        <AppModalPortal>
         <div
           ref={sessionContextMenuRef}
           className="awu-session-context-menu"
@@ -1008,6 +1013,7 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
             <span>销毁会话与工作目录</span>
           </button>
         </div>
+        </AppModalPortal>
       )}
 
       {/* 能力绑定面板 */}

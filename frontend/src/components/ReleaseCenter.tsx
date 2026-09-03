@@ -1,12 +1,14 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import {
-  api, getExecutors, onExecStatus,
+  api, getCurrentUserProfile, getExecutors, isTauri, onExecStatus,
   type ExecutorInfo, type ReleaseArtifact, type ReleaseCandidate,
   type ReleaseCenterConfig, type ReleaseCenterState, type ReleaseJob, type ReleasePlan,
 } from '../api';
 
 interface Props {
   onClose: () => void;
+  /** 从当前会话打开时可提示优先节点；用户明确选过的发布节点仍优先。 */
+  initialExecKey?: string;
 }
 
 type View = 'release' | 'config' | 'history';
@@ -36,6 +38,41 @@ const EMPTY_CONFIG: ConfigDraft = {
   qshell: 'qshell',
   requireSignature: false,
 };
+
+function releaseExecutorPreferenceKey(): string {
+  const profile = getCurrentUserProfile();
+  return `awu.releaseCenterExecutor.v1:${profile.mode}:${profile.userId}`;
+}
+
+function loadPreferredExecutor(): string {
+  try { return localStorage.getItem(releaseExecutorPreferenceKey()) || ''; }
+  catch { return ''; }
+}
+
+function persistPreferredExecutor(execKey: string): void {
+  try { localStorage.setItem(releaseExecutorPreferenceKey(), execKey); }
+  catch { /* 浏览器禁用持久化时，本次窗口内的选择仍然有效。 */ }
+}
+
+/**
+ * 发布节点不能像普通 Session 一样盲选 local：Web/控制端的 local 常常只负责 UI，
+ * 真正拥有打包目录和 qshell 的是 Relay 执行节点。
+ */
+function chooseReleaseExecutor(executors: ExecutorInfo[], initialExecKey = ''): string {
+  const connected = executors.filter((item) => item.connected && item.canManageNode !== false);
+  const preferred = loadPreferredExecutor();
+  const initial = connected.find((item) => item.key === initialExecKey);
+  return connected.find((item) => item.key === preferred)?.key
+    // 活跃会话若本来就在远端，直接沿用；不要让 Web 的同源 control Backend
+    // 因为恰好是当前 local 会话而盖过真正拥有安装包的 Relay 节点。
+    || (initial?.mode === 'relay' ? initial.key : '')
+    || (!isTauri() ? connected.find((item) => item.mode === 'relay')?.key : '')
+    || connected.find((item) => item.isHome)?.key
+    || connected.find((item) => item.mode === 'relay')?.key
+    || connected.find((item) => item.key === 'local')?.key
+    || executors[0]?.key
+    || '';
+}
 
 function toDraft(config?: ReleaseCenterConfig): ConfigDraft {
   if (!config) return EMPTY_CONFIG;
@@ -76,6 +113,17 @@ function formatDelta(value: number | null): string {
   return `${value > 0 ? '+' : '−'}${formatBytes(Math.abs(value))}`;
 }
 
+function releaseErrorMessage(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error);
+  if (/Only a local client or this executor's Relay primary user/i.test(message)) {
+    return '当前账号不是该执行节点的 Relay 主用户，不能管理发布；请切换主用户账号或调整 Relay 节点归属。';
+  }
+  if (/offline|connection lost|closed|WebSocket/i.test(message)) {
+    return '发布执行端已离线或 Relay 连接中断，请恢复节点在线后重试。';
+  }
+  return message;
+}
+
 function transferLabel(job: ReleaseJob): string {
   if (job.status === 'running' && (job.currentFileSize || 0) > 0) {
     return `${job.currentFileName || '当前文件'} · ${formatBytes(job.currentFileBytes || 0)} / ${formatBytes(job.currentFileSize || 0)}`;
@@ -104,16 +152,10 @@ function useNarrow(): boolean {
   return narrow;
 }
 
-export const ReleaseCenter: React.FC<Props> = ({ onClose }) => {
+export const ReleaseCenter: React.FC<Props> = ({ onClose, initialExecKey = '' }) => {
   const narrow = useNarrow();
   const [executors, setExecutors] = useState<ExecutorInfo[]>(() => getExecutors());
-  const [execKey, setExecKey] = useState(() => {
-    const all = getExecutors();
-    return all.find((item) => item.key === 'local' && item.connected)?.key
-      || all.find((item) => item.isHome && item.connected)?.key
-      || all.find((item) => item.connected)?.key
-      || 'local';
-  });
+  const [execKey, setExecKey] = useState(() => chooseReleaseExecutor(getExecutors(), initialExecKey));
   const [state, setState] = useState<ReleaseCenterState | null>(null);
   const [draft, setDraft] = useState<ConfigDraft>(EMPTY_CONFIG);
   const [view, setView] = useState<View>('release');
@@ -128,9 +170,19 @@ export const ReleaseCenter: React.FC<Props> = ({ onClose }) => {
   const [qiniuAccessKey, setQiniuAccessKey] = useState('');
   const [qiniuSecretKey, setQiniuSecretKey] = useState('');
   const [showQiniuCredentials, setShowQiniuCredentials] = useState(false);
+  const selectedExecutor = executors.find((item) => item.key === execKey) || null;
+
+  const selectExecutor = useCallback((nextExecKey: string) => {
+    setExecKey(nextExecKey);
+    persistPreferredExecutor(nextExecKey);
+  }, []);
 
   const refresh = useCallback(async (syncConfig = false) => {
-    if (!execKey) return;
+    if (!execKey) {
+      setState(null);
+      setNotice('没有可管理的在线执行节点；请先在“连接与 Relay”中接入家里的执行端。');
+      return;
+    }
     try {
       const next = await api.releaseStatus(execKey);
       if (next.status !== 'ok') throw new Error(next.message || '无法读取发布中心状态');
@@ -143,7 +195,7 @@ export const ReleaseCenter: React.FC<Props> = ({ onClose }) => {
       });
       setNotice('');
     } catch (error) {
-      setNotice(error instanceof Error ? error.message : String(error));
+      setNotice(releaseErrorMessage(error));
     }
   }, [execKey]);
 
@@ -164,15 +216,17 @@ export const ReleaseCenter: React.FC<Props> = ({ onClose }) => {
     const unsubscribe = onExecStatus(() => {
       const next = getExecutors();
       setExecutors(next);
-      if (!next.some((item) => item.key === execKey && item.connected)) {
-        const fallback = next.find((item) => item.key === 'local' && item.connected)
-          || next.find((item) => item.isHome && item.connected)
-          || next.find((item) => item.connected);
-        if (fallback) setExecKey(fallback.key);
+      const current = next.find((item) => item.key === execKey);
+      const newlyAvailableRemote = !loadPreferredExecutor() && !isTauri()
+        && current?.mode === 'local'
+        && next.some((item) => item.mode === 'relay' && item.connected && item.canManageNode !== false);
+      if (!current?.connected || current.canManageNode === false || newlyAvailableRemote) {
+        const fallback = chooseReleaseExecutor(next, initialExecKey);
+        if (fallback) setExecKey(fallback);
       }
     });
     return unsubscribe;
-  }, [execKey]);
+  }, [execKey, initialExecKey]);
 
   const activeJob = state?.activeJob || null;
   const activeTransfer = activeJob ? transferLabel(activeJob) : '';
@@ -400,24 +454,36 @@ export const ReleaseCenter: React.FC<Props> = ({ onClose }) => {
             <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
               <strong style={{ fontSize: 17, color: 'var(--theme-text)' }}>🚀 发布工作台</strong>
               <span style={tagStyle}>按需加载</span>
-              <span style={tagStyle}>全局候选</span>
+              <span style={tagStyle}>执行端发布</span>
             </div>
             <div style={{ marginTop: 3, color: 'var(--theme-text-muted)', fontSize: 10 }}>
               打包只登记候选；预检、选择和明确确认后才会正式发布
             </div>
           </div>
           <div style={{ display: 'flex', gap: 7, alignItems: 'center', flexWrap: 'wrap', justifyContent: 'flex-end' }}>
-            <select value={execKey} onChange={(event) => setExecKey(event.target.value)} style={headerSelectStyle}>
+            <label style={executorPickerStyle}>
+              <span>发布执行端</span>
+              <select value={execKey} onChange={(event) => selectExecutor(event.target.value)} style={headerSelectStyle}>
               {executors.map((item) => (
-                <option key={item.key} value={item.key} disabled={!item.connected}>
-                  {item.label}{item.connected ? '' : '（离线）'}
+                <option key={item.key} value={item.key} disabled={!item.connected || item.canManageNode === false}>
+                  {item.mode === 'relay' ? '🌐 ' : ''}{item.label}
+                  {!item.connected ? '（离线）' : item.canManageNode === false ? '（非主用户，无发布权限）' : ''}
                 </option>
               ))}
-            </select>
+              </select>
+            </label>
             <button type="button" style={buttonStyle} onClick={() => void refresh(false)}>刷新</button>
             <button type="button" style={closeButtonStyle} onClick={onClose} aria-label="关闭发布工作台">✕</button>
           </div>
         </header>
+
+        <div style={executionNoticeStyle}>
+          <strong>{selectedExecutor?.mode === 'relay' ? '🌐 远程执行' : '🖥️ 节点执行'}</strong>
+          <span>
+            扫描目录、读取安装包、计算哈希和上传都在“{selectedExecutor?.label || '所选节点'}”完成；
+            当前手机/控制端只发送指令和显示进度，不会传输或查找本机文件。远程发布仅允许该节点的 Relay 主用户操作。
+          </span>
+        </div>
 
         <div style={tabBarStyle}>
           {([
@@ -950,10 +1016,20 @@ const headerStyle: React.CSSProperties = {
   display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12,
   borderBottom: '1px solid var(--theme-border)', background: 'var(--theme-bg-secondary)',
 };
+const executorPickerStyle: React.CSSProperties = {
+  display: 'inline-flex', alignItems: 'center', gap: 6,
+  color: 'var(--theme-text-muted)', fontSize: 9, whiteSpace: 'nowrap',
+};
 const headerSelectStyle: React.CSSProperties = {
   ...({} as React.CSSProperties), minWidth: 140, maxWidth: 230, height: 30, padding: '0 8px',
   border: '1px solid var(--theme-border)', borderRadius: 4,
   background: 'var(--theme-input-bg)', color: 'var(--theme-text)', fontSize: 10,
+};
+const executionNoticeStyle: React.CSSProperties = {
+  flexShrink: 0, display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap',
+  padding: '7px 14px', borderBottom: '1px solid var(--theme-border)',
+  background: 'color-mix(in srgb, var(--theme-accent-bg) 38%, var(--theme-bg-secondary))',
+  color: 'var(--theme-text-muted)', fontSize: 9.5, lineHeight: 1.45,
 };
 const closeButtonStyle: React.CSSProperties = {
   width: 30, height: 30, border: 'none', background: 'transparent', color: 'var(--theme-text-muted)',

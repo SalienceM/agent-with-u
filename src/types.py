@@ -273,6 +273,9 @@ class Session:
     auto_commit: bool = False
     auto_commit_push: bool = False  # commit 后是否自动 push
     auto_commit_backend_id: Optional[str] = None  # AI commit 使用的后端（None = 跟随会话主模型）
+    # 会话级 Token 台账：累计值、最近趋势和上下文变化。单轮 usage 仍保留在消息上；
+    # 这里保证分页、手动压缩及无聊天气泡的 LOOP 不会丢失总体统计。
+    token_usage: dict = field(default_factory=dict)
 
     def to_dict(self, message_limit: int = 0) -> dict:
         """序列化 Session；message_limit>0 时只触碰最后 N 条消息。
@@ -315,6 +318,7 @@ class Session:
             "autoCommit": self.auto_commit,
             "autoCommitPush": self.auto_commit_push,
             "autoCommitBackendId": self.auto_commit_backend_id,
+            "tokenUsage": self.token_usage or {},
         }
 
     def meta_dict(self) -> dict:

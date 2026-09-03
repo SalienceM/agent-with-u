@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import base64
+import datetime as dt
 import html
 import io
 import mimetypes
@@ -166,6 +167,214 @@ def _relationship_map(zf: zipfile.ZipFile, rel_path: str, base_dir: str) -> dict
     return result
 
 
+_INDEXED_COLORS = (
+    "#000000", "#ffffff", "#ff0000", "#00ff00", "#0000ff", "#ffff00", "#ff00ff", "#00ffff",
+    "#000000", "#ffffff", "#9c0006", "#006100", "#00009c", "#9c6500", "#800080", "#008080",
+    "#c0c0c0", "#808080", "#9999ff", "#993366", "#ffffcc", "#ccffff", "#660066", "#ff8080",
+    "#0066cc", "#ccccff", "#000080", "#ff00ff", "#ffff00", "#00ffff", "#800080", "#800000",
+    "#008080", "#0000ff", "#00ccff", "#ccffff", "#ccffcc", "#ffff99", "#99ccff", "#ff99cc",
+    "#cc99ff", "#ffcc99", "#3366ff", "#33cccc", "#99cc00", "#ffcc00", "#ff9900", "#ff6600",
+    "#666699", "#969696", "#003366", "#339966", "#003300", "#333300", "#993300", "#993366",
+    "#333399", "#333333",
+)
+
+_BUILTIN_DATE_FORMAT_IDS = {
+    14, 15, 16, 17, 18, 19, 20, 21, 22, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36,
+    45, 46, 47, 50, 51, 52, 53, 54, 55, 56, 57, 58,
+}
+
+_BUILTIN_NUMBER_FORMATS = {
+    0: "General", 1: "0", 2: "0.00", 3: "#,##0", 4: "#,##0.00",
+    9: "0%", 10: "0.00%", 11: "0.00E+00", 12: "# ?/?", 13: "# ??/??",
+    14: "m/d/yy", 15: "d-mmm-yy", 16: "d-mmm", 17: "mmm-yy",
+    18: "h:mm AM/PM", 19: "h:mm:ss AM/PM", 20: "h:mm", 21: "h:mm:ss",
+    22: "m/d/yy h:mm",
+}
+
+
+def _xlsx_theme_colors(zf: zipfile.ZipFile) -> list[str]:
+    raw = _read(zf, "xl/theme/theme1.xml", required=False)
+    if not raw:
+        return []
+    root = _xml(raw)
+    scheme = root.find(".//a:clrScheme", NS)
+    colors: list[str] = []
+    for entry in list(scheme or []):
+        source = next(iter(entry), None)
+        value = "" if source is None else (source.get("val") or source.get("lastClr") or "")
+        colors.append(f"#{value[-6:]}" if re.fullmatch(r"[0-9A-Fa-f]{6,8}", value) else "")
+    return colors
+
+
+def _xlsx_tint(color: str, tint: float) -> str:
+    if not re.fullmatch(r"#[0-9A-Fa-f]{6}", color) or not tint:
+        return color
+    channels = [int(color[index:index + 2], 16) for index in (1, 3, 5)]
+    adjusted = [
+        round(channel * (1 + tint)) if tint < 0 else round(channel + (255 - channel) * tint)
+        for channel in channels
+    ]
+    return "#" + "".join(f"{max(0, min(255, value)):02x}" for value in adjusted)
+
+
+def _xlsx_color(node: ET.Element | None, theme: list[str]) -> str:
+    if node is None:
+        return ""
+    raw = node.get("rgb", "")
+    color = f"#{raw[-6:]}" if re.fullmatch(r"[0-9A-Fa-f]{6,8}", raw) else ""
+    if not color and node.get("theme", "").isdigit():
+        index = int(node.get("theme", "0"))
+        color = theme[index] if index < len(theme) else ""
+    if not color and node.get("indexed", "").isdigit():
+        index = int(node.get("indexed", "0"))
+        color = _INDEXED_COLORS[index] if index < len(_INDEXED_COLORS) else ""
+    try:
+        tint = float(node.get("tint", "0") or 0)
+    except ValueError:
+        tint = 0
+    return _xlsx_tint(color, tint)
+
+
+def _xlsx_styles(zf: zipfile.ZipFile) -> tuple[list[dict[str, Any]], dict[int, str]]:
+    raw = _read(zf, "xl/styles.xml", required=False)
+    if not raw:
+        return [{}], dict(_BUILTIN_NUMBER_FORMATS)
+    root = _xml(raw)
+    theme = _xlsx_theme_colors(zf)
+    formats = dict(_BUILTIN_NUMBER_FORMATS)
+    for node in root.findall("./x:numFmts/x:numFmt", NS):
+        try:
+            formats[int(node.get("numFmtId", "0"))] = node.get("formatCode", "")
+        except ValueError:
+            continue
+
+    fonts: list[dict[str, Any]] = []
+    for node in root.findall("./x:fonts/x:font", NS):
+        size = node.find("x:sz", NS)
+        font: dict[str, Any] = {
+            "bold": node.find("x:b", NS) is not None,
+            "italic": node.find("x:i", NS) is not None,
+            "underline": node.find("x:u", NS) is not None,
+        }
+        color = _xlsx_color(node.find("x:color", NS), theme)
+        if color:
+            font["color"] = color
+        if size is not None:
+            try:
+                font["fontSize"] = max(7.0, min(36.0, float(size.get("val", "11"))))
+            except ValueError:
+                pass
+        fonts.append(font)
+
+    fills: list[str] = []
+    for node in root.findall("./x:fills/x:fill", NS):
+        pattern = node.find("x:patternFill", NS)
+        color = ""
+        if pattern is not None and pattern.get("patternType") not in {"none", "gray125"}:
+            color = _xlsx_color(pattern.find("x:fgColor", NS), theme)
+            if not color:
+                color = _xlsx_color(pattern.find("x:bgColor", NS), theme)
+        fills.append(color)
+
+    borders: list[dict[str, Any]] = []
+    for node in root.findall("./x:borders/x:border", NS):
+        border: dict[str, Any] = {}
+        for side in ("left", "right", "top", "bottom"):
+            edge = node.find(f"x:{side}", NS)
+            if edge is None or not edge.get("style"):
+                continue
+            border[side] = {
+                "style": edge.get("style", "thin"),
+                "color": _xlsx_color(edge.find("x:color", NS), theme) or "#9aa0a6",
+            }
+        borders.append(border)
+
+    styles: list[dict[str, Any]] = []
+    cell_xfs = root.find("./x:cellXfs", NS)
+    for xf in list(cell_xfs or []):
+        try:
+            font_id = int(xf.get("fontId", "0"))
+            fill_id = int(xf.get("fillId", "0"))
+            border_id = int(xf.get("borderId", "0"))
+            number_id = int(xf.get("numFmtId", "0"))
+        except ValueError:
+            font_id = fill_id = border_id = number_id = 0
+        style = dict(fonts[font_id]) if font_id < len(fonts) else {}
+        if fill_id < len(fills) and fills[fill_id]:
+            style["fill"] = fills[fill_id]
+        if border_id < len(borders) and borders[border_id]:
+            style["borders"] = borders[border_id]
+        number_format = formats.get(number_id, "")
+        if number_format:
+            style["numberFormat"] = number_format
+        alignment = xf.find("x:alignment", NS)
+        if alignment is not None:
+            for source, target in (("horizontal", "horizontal"), ("vertical", "vertical")):
+                if alignment.get(source):
+                    style[target] = alignment.get(source)
+            if alignment.get("wrapText") in {"1", "true"}:
+                style["wrap"] = True
+            if alignment.get("textRotation", "0") not in {"", "0"}:
+                try:
+                    style["rotation"] = int(alignment.get("textRotation", "0"))
+                except ValueError:
+                    pass
+        styles.append(style)
+    return styles or [{}], formats
+
+
+def _xlsx_is_date_format(number_id: int, number_format: str) -> bool:
+    if number_id in _BUILTIN_DATE_FORMAT_IDS:
+        return True
+    cleaned = re.sub(r'"[^"]*"|\\.|\[[^\]]*\]', "", number_format.lower())
+    return bool(re.search(r"(?:^|[^a-z])[ymdhis]+", cleaned)) and not "e+" in cleaned
+
+
+def _xlsx_number(raw: str, number_id: int, number_format: str, date_1904: bool) -> str:
+    try:
+        value = float(raw)
+    except ValueError:
+        return raw
+    if _xlsx_is_date_format(number_id, number_format):
+        base = dt.datetime(1904, 1, 1) if date_1904 else dt.datetime(1899, 12, 30)
+        try:
+            value_at = base + dt.timedelta(days=value)
+            lowered = number_format.lower()
+            has_date = any(token in lowered for token in ("y", "d"))
+            has_time = any(token in lowered for token in ("h", "s"))
+            if has_date and has_time:
+                return value_at.strftime("%Y-%m-%d %H:%M:%S").rstrip("0").rstrip(":")
+            if has_time and not has_date:
+                return value_at.strftime("%H:%M:%S").rstrip("0").rstrip(":")
+            return value_at.strftime("%Y-%m-%d")
+        except (OverflowError, ValueError):
+            return raw
+    if "%" in number_format:
+        decimal = re.search(r"\.([0#]+)%", number_format)
+        places = len(decimal.group(1)) if decimal else 0
+        return f"{value * 100:.{places}f}%"
+    if "E+" in number_format.upper():
+        decimal = re.search(r"\.([0#]+)", number_format)
+        return f"{value:.{len(decimal.group(1)) if decimal else 2}E}"
+    decimal = re.search(r"\.([0#]+)", number_format.split(";")[0])
+    places = len(decimal.group(1)) if decimal else 0
+    use_grouping = "," in number_format.split(".")[0]
+    prefix = next((symbol for symbol in ("¥", "$", "€", "£") if symbol in number_format), "")
+    if number_format and number_format != "General":
+        return prefix + format(value, f",.{places}f" if use_grouping else f".{places}f")
+    return str(int(value)) if value.is_integer() else format(value, ".15g")
+
+
+def _xlsx_bounds(ref: str) -> tuple[int, int, int, int] | None:
+    match = re.fullmatch(r"([A-Za-z]+)(\d+):([A-Za-z]+)(\d+)", ref or "")
+    if not match:
+        return None
+    return (
+        int(match.group(2)), _column_index(match.group(1)),
+        int(match.group(4)), _column_index(match.group(3)),
+    )
+
+
 def _preview_xlsx(data: bytes) -> dict[str, Any]:
     with _open_zip(data) as zf:
         shared: list[str] = []
@@ -176,6 +385,11 @@ def _preview_xlsx(data: bytes) -> dict[str, Any]:
 
         workbook = _xml(_read(zf, "xl/workbook.xml"))
         rels = _relationship_map(zf, "xl/_rels/workbook.xml.rels", "xl")
+        styles, number_formats = _xlsx_styles(zf)
+        workbook_pr = workbook.find("x:workbookPr", NS)
+        date_1904 = workbook_pr is not None and workbook_pr.get("date1904") in {"1", "true"}
+        calc_pr = workbook.find("x:calcPr", NS)
+        calc_mode = calc_pr.get("calcMode", "auto") if calc_pr is not None else "auto"
         sheets: list[dict[str, Any]] = []
         truncated = False
         for sheet in workbook.findall(".//x:sheet", NS)[:12]:
@@ -185,34 +399,146 @@ def _preview_xlsx(data: bytes) -> dict[str, Any]:
             if not target:
                 continue
             root = _xml(_read(zf, target))
-            rows: list[list[str]] = []
-            for row_node in root.findall(".//x:sheetData/x:row", NS)[:300]:
-                values: list[str] = []
+            sheet_format = root.find("x:sheetFormatPr", NS)
+            try:
+                default_row_height = float(sheet_format.get("defaultRowHeight", "20")) if sheet_format is not None else 20
+            except ValueError:
+                default_row_height = 20
+            try:
+                default_col_width = float(sheet_format.get("defaultColWidth", "9")) if sheet_format is not None else 9
+            except ValueError:
+                default_col_width = 9
+
+            columns: dict[int, dict[str, Any]] = {}
+            for col in root.findall("./x:cols/x:col", NS):
+                try:
+                    first = max(1, int(col.get("min", "1")))
+                    last = min(60, int(col.get("max", str(first))))
+                    width = max(2.0, min(80.0, float(col.get("width", str(default_col_width)))))
+                except ValueError:
+                    continue
+                for one_based in range(first, last + 1):
+                    columns[one_based - 1] = {
+                        "index": one_based - 1,
+                        "width": width,
+                        "hidden": col.get("hidden") in {"1", "true"},
+                    }
+
+            rows: list[dict[str, Any]] = []
+            formula_count = 0
+            cached_formula_count = 0
+            max_column = 0
+            all_row_nodes = root.findall(".//x:sheetData/x:row", NS)
+            for position, row_node in enumerate(all_row_nodes[:300]):
+                try:
+                    row_index = max(1, int(row_node.get("r", str(position + 1))))
+                except ValueError:
+                    row_index = position + 1
+                cells: list[dict[str, Any]] = []
                 for cell in row_node.findall("x:c", NS):
                     idx = _column_index(cell.get("r", ""))
                     if idx >= 60:
                         truncated = True
                         continue
-                    while len(values) <= idx:
-                        values.append("")
+                    max_column = max(max_column, idx + 1)
                     kind = cell.get("t", "")
+                    style_id = int(cell.get("s", "0")) if cell.get("s", "0").isdigit() else 0
+                    number_id = 0
+                    # style_id 对应的 numFmt 已经折叠在公开 style 中；从格式码判断
+                    # 日期/百分比等显示即可覆盖常见预览，缺失时保持原始数值。
+                    number_format = str((styles[style_id] if style_id < len(styles) else {}).get("numberFormat") or "")
+                    value_node = cell.find("x:v", NS)
                     if kind == "inlineStr":
                         value = _texts(cell, "x:t")
+                        raw_value = value
                     else:
-                        value = (cell.findtext("x:v", default="", namespaces=NS) or "").strip()
-                        if kind == "s" and value.isdigit() and int(value) < len(shared):
-                            value = shared[int(value)]
+                        raw_value = ((value_node.text or "") if value_node is not None else "").strip()
+                        value = raw_value
+                        if kind == "s" and raw_value.isdigit() and int(raw_value) < len(shared):
+                            value = shared[int(raw_value)]
                         elif kind == "b":
-                            value = "TRUE" if value == "1" else "FALSE"
-                    formula = cell.findtext("x:f", default="", namespaces=NS)
-                    values[idx] = f"={formula} → {value}" if formula else value
-                rows.append(values)
-            if len(root.findall(".//x:sheetData/x:row", NS)) > len(rows):
+                            value = "TRUE" if raw_value == "1" else "FALSE"
+                        elif kind not in {"str", "e", "d"} and raw_value:
+                            value = _xlsx_number(raw_value, number_id, number_format, date_1904)
+                    formula_node = cell.find("x:f", NS)
+                    formula = (formula_node.text or "").strip() if formula_node is not None else ""
+                    if formula_node is not None:
+                        formula_count += 1
+                        if value_node is not None:
+                            cached_formula_count += 1
+                        if not formula and formula_node.get("t") == "shared":
+                            formula = f"[共享公式 {formula_node.get('si', '')}]"
+                    cells.append({
+                        "address": cell.get("r", "") or f"R{row_index}C{idx + 1}",
+                        "row": row_index,
+                        "column": idx,
+                        "value": value,
+                        "rawValue": raw_value,
+                        "formula": formula,
+                        "formulaCached": formula_node is None or value_node is not None,
+                        "type": kind or "number",
+                        "style": style_id if style_id < len(styles) else 0,
+                    })
+                row: dict[str, Any] = {"index": row_index, "cells": cells}
+                if row_node.get("ht"):
+                    try:
+                        row["height"] = max(8.0, min(180.0, float(row_node.get("ht", "20"))))
+                    except ValueError:
+                        pass
+                if row_node.get("hidden") in {"1", "true"}:
+                    row["hidden"] = True
+                rows.append(row)
+            if len(all_row_nodes) > len(rows):
                 truncated = True
-            sheets.append({"name": name, "rows": rows})
+
+            merges: list[dict[str, Any]] = []
+            for merge in root.findall("./x:mergeCells/x:mergeCell", NS)[:500]:
+                ref = merge.get("ref", "")
+                bounds = _xlsx_bounds(ref)
+                if not bounds:
+                    continue
+                start_row, start_col, end_row, end_col = bounds
+                if start_col >= 60 or start_row > 300:
+                    continue
+                merges.append({
+                    "ref": ref, "startRow": start_row, "startColumn": start_col,
+                    "endRow": min(300, end_row), "endColumn": min(59, end_col),
+                })
+                max_column = max(max_column, min(60, end_col + 1))
+
+            pane = root.find("./x:sheetViews/x:sheetView/x:pane", NS)
+            frozen: dict[str, Any] = {}
+            if pane is not None and pane.get("state") in {"frozen", "frozenSplit"}:
+                try:
+                    frozen["rows"] = max(0, int(float(pane.get("ySplit", "0"))))
+                    frozen["columns"] = max(0, int(float(pane.get("xSplit", "0"))))
+                except ValueError:
+                    frozen = {}
+                if pane.get("topLeftCell"):
+                    frozen["topLeftCell"] = pane.get("topLeftCell")
+
+            auto_filter = root.find("x:autoFilter", NS)
+            sheets.append({
+                "name": name,
+                "rows": rows,
+                "columns": [columns[index] for index in sorted(columns)],
+                "merges": merges,
+                "rowCount": max((row["index"] for row in rows), default=0),
+                "columnCount": max(max_column, max(columns, default=-1) + 1),
+                "defaultRowHeight": default_row_height,
+                "defaultColumnWidth": default_col_width,
+                "formulaCount": formula_count,
+                "cachedFormulaCount": cached_formula_count,
+                "frozen": frozen,
+                "autoFilter": auto_filter.get("ref", "") if auto_filter is not None else "",
+            })
         if len(workbook.findall(".//x:sheet", NS)) > len(sheets):
             truncated = True
-        return {"status": "ok", "kind": "excel", "sheets": sheets, "truncated": truncated}
+        return {
+            "status": "ok", "kind": "excel", "sheets": sheets, "styles": styles,
+            "calculation": {"mode": calc_mode, "date1904": date_1904},
+            "truncated": truncated,
+        }
 
 
 def _slide_number(name: str) -> int:

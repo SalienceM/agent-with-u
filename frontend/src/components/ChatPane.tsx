@@ -17,6 +17,29 @@ import type { SmoothGhostState } from '../utils/smoothGhost';
 import { normalizeModelRuntime, type ModelRuntime } from './CodexRuntimeFields';
 import type { TextAttachment } from '../types/attachments';
 import { buildMessageRedoPayload } from '../utils/messageRedo';
+import { TokenUsageMonitor } from './TokenUsageMonitor';
+import { uuid } from '../utils/uuid';
+
+function mergeAuthoritativeSeqTasks(authoritative: SeqTaskT[], current: SeqTaskT[]): SeqTaskT[] {
+  const canonical = (authoritative || []).map((task) => ({ ...task, syncing: false }));
+  const matched = new Set<number>();
+  const optimistic = current.filter((task) => task.syncing).filter((pending) => {
+    const pendingImages = pending.imageCount ?? pending.images?.length ?? 0;
+    const pendingAttachments = pending.textAttachmentCount ?? pending.textAttachments?.length ?? 0;
+    const match = canonical.findIndex((task, index) => {
+      if (matched.has(index) || task.status !== 'pending' || task.text !== pending.text) return false;
+      const images = task.imageCount ?? task.images?.length ?? 0;
+      const attachments = task.textAttachmentCount ?? task.textAttachments?.length ?? 0;
+      const closeInTime = !task.createdAt || !pending.createdAt
+        || Math.abs(task.createdAt - pending.createdAt) < 15;
+      return images === pendingImages && attachments === pendingAttachments && closeInTime;
+    });
+    if (match < 0) return true;
+    matched.add(match);
+    return false;
+  });
+  return [...canonical, ...optimistic];
+}
 
 function messageEpochMs(timestamp?: number): number {
   if (!timestamp || !Number.isFinite(timestamp)) return 0;
@@ -353,6 +376,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
 
   // ── 序列任务队列 + by-the-way（普通 session 侧挂状态）──
   const [seqTasks, setSeqTasks] = useState<SeqTaskT[]>([]);
+  const [seqQueueError, setSeqQueueError] = useState('');
   const [followUpCapabilities, setFollowUpCapabilities] = useState<FollowUpCapabilities>({
     status: 'ok', queue: true, nativeSteer: false,
     interruptResume: false, steerAttachments: false,
@@ -366,6 +390,8 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
   const seqRetryTimerRef = useRef<number | null>(null);
   const dispatchNextRef = useRef<() => void>(() => {});
   const seqPendingRef = useRef(false);
+  const seqViewSessionRef = useRef(sessionId);
+  seqViewSessionRef.current = sessionId;
   // 新输入在模型忙碌时会自动排队并激活本轮连续派发。应用重启后保留的
   // 历史队列不会擅自恢复，需要用户在队列条上点一次继续。
   const [seqChainActive, setSeqChainActive] = useState(false);
@@ -393,13 +419,17 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
     }
     seqChainSessionRef.current = null;
     setChain(false);
+    setSeqTasks([]);
+    setSeqQueueError('');
     if (!sessionId) { setSeqTasks([]); return; }
     api.seqtaskGet(sessionId).then((r) => {
-      if (!cancelled && r.status === 'ok') setSeqTasks(r.seqTasks || []);
+      if (!cancelled && r.status === 'ok') {
+        setSeqTasks((current) => mergeAuthoritativeSeqTasks(r.seqTasks || [], current));
+      }
     });
     const unsubscribe = api.onSeqtaskUpdated((data) => {
       if (data.sessionId !== sessionId) return;
-      setSeqTasks(data.seqTasks || []);
+      setSeqTasks((current) => mergeAuthoritativeSeqTasks(data.seqTasks || [], current));
     });
     return () => {
       cancelled = true;
@@ -422,7 +452,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
   doSendRef.current = chat.doSend;
   const sendMessageRef = useRef(chat.sendMessage);
   sendMessageRef.current = chat.sendMessage;
-  seqPendingRef.current = seqTasks.some((task) => task.status === 'pending');
+  seqPendingRef.current = seqTasks.some((task) => task.status === 'pending' && !task.syncing);
 
   // Smooth 顺滑问答只投递到最后聚焦的 pane。若当前回答尚未结束，先在
   // 内存中排队，等 done 边缘再发送，避免打断培训录屏中的现有回答。
@@ -503,18 +533,54 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
     content: string,
     images?: any[],
     textAttachments?: TextAttachment[],
+    activateChain = true,
   ) => {
     if (!sessionId) return;
     const text = (content || '').trim();
     if (!text && !(images && images.length) && !textAttachments?.length) return;
-    seqChainSessionRef.current = sessionId;
-    setChain(true);
-    api.seqtaskAdd(
+    const queuedSessionId = sessionId;
+    const optimisticId = `sync-${uuid()}`;
+    const optimisticTask: SeqTaskT = {
+      id: optimisticId,
+      text,
+      images: images || [],
+      imageCount: images?.length || 0,
+      textAttachments: textAttachments || [],
+      textAttachmentCount: textAttachments?.length || 0,
+      status: 'pending',
+      createdAt: Date.now() / 1000,
+      syncing: true,
+    };
+    if (activateChain) {
+      seqChainSessionRef.current = sessionId;
+      setChain(true);
+    }
+    setSeqQueueError('');
+    setSeqTasks((current) => [...current, optimisticTask]);
+    void api.seqtaskAdd(
       sessionId,
       text,
       images && images.length ? images : undefined,
       textAttachments?.length ? textAttachments : undefined,
-    );
+    ).then(async (result) => {
+      if (seqViewSessionRef.current !== queuedSessionId) return;
+      if (result.status === 'ok') {
+        const authoritative = Array.isArray(result.seqTasks)
+          ? result.seqTasks
+          : (await api.seqtaskGet(queuedSessionId)).seqTasks || [];
+        setSeqTasks((current) => mergeAuthoritativeSeqTasks(
+          authoritative,
+          current.filter((task) => task.id !== optimisticId),
+        ));
+        return;
+      }
+      setSeqTasks((current) => current.filter((task) => task.id !== optimisticId));
+      setSeqQueueError(result.message || '序列任务未能同步到执行端，请重新发送');
+    }).catch((error) => {
+      if (seqViewSessionRef.current !== queuedSessionId) return;
+      setSeqTasks((current) => current.filter((task) => task.id !== optimisticId));
+      setSeqQueueError(`序列任务同步失败：${error instanceof Error ? error.message : String(error)}`);
+    });
   }, [sessionId, setChain]);
 
   // Redo 与输入框的默认投递规则保持一致：空闲时立即发送；当前正在回答或已有
@@ -540,7 +606,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
   // 防止流状态与队列事件同时到达造成重复派发。
   useEffect(() => {
     if (!seqChainActive || seqChainSessionRef.current !== sessionId || chat.isStreaming || isStreamingRef.current) return;
-    if (!seqTasks.some((t) => t.status === 'pending')) return;
+    if (!seqTasks.some((t) => t.status === 'pending' && !t.syncing)) return;
     dispatchNext();
   }, [chat.isStreaming, seqChainActive, seqTasks, dispatchNext, sessionId]);
 
@@ -776,6 +842,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
         background: 'transparent',
       }}
     >
+      <TokenUsageMonitor sessionId={sessionId} placement="floating" />
       {/* ---- 消息列表 ---- */}
       <div style={{ flex: 1, position: 'relative', overflow: 'hidden' }}>
         <div
@@ -997,6 +1064,12 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
       </div>
 
       {/* ---- 有待发任务时显示 slim 队列条；输入框无需显式切换模式 ---- */}
+      {seqQueueError && (
+        <div style={seqQueueErrorStyle}>
+          <span style={{ flex: 1 }}>⚠ {seqQueueError}</span>
+          <button onClick={() => setSeqQueueError('')} style={seqQueueErrorCloseStyle}>✕</button>
+        </div>
+      )}
       {sessionId && seqTasks.some((t) => t.status === 'pending' || t.status === 'steering') && (
         <SeqTaskPanel
           sessionId={sessionId}
@@ -1006,6 +1079,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
           onSendNext={dispatchNext}
           canSteer={chat.isStreaming && followUpCapabilities.nativeSteer}
           onSteerTask={handleSteerSeqTask}
+          onTasksChange={(tasks) => setSeqTasks((current) => mergeAuthoritativeSeqTasks(tasks, current))}
         />
       )}
 
@@ -1077,6 +1151,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
             backends={effectiveBackends}
             workingDir={activeSession?.workingDir}
             execKey={activeSession?.execKey}
+            onQueueTask={(text) => handleQueueTask(text, undefined, undefined, false)}
             onSendToChat={(text) => { if (!isStreamingRef.current) doSendRef.current(text); }} />
           {config.workspaceKitsEnabled && (
             <WorkspaceKitsPanel
@@ -1103,6 +1178,15 @@ const paneRootStyle: React.CSSProperties = {
   overflow: 'hidden',
   boxSizing: 'border-box',
   position: 'relative',   // ★ 供 by-the-way 抽屉 overlay 定位
+};
+
+const seqQueueErrorStyle: React.CSSProperties = {
+  display: 'flex', alignItems: 'center', gap: 8, padding: '7px 12px',
+  borderTop: '1px solid rgba(248,81,73,.35)', background: 'rgba(248,81,73,.09)',
+  color: 'var(--theme-error, #ff7b72)', fontSize: 11.5,
+};
+const seqQueueErrorCloseStyle: React.CSSProperties = {
+  border: 0, background: 'transparent', color: 'inherit', cursor: 'pointer', padding: '0 3px',
 };
 
 const byTheWayFab: React.CSSProperties = {

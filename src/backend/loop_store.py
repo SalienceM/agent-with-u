@@ -147,8 +147,8 @@ class LoopRecord:
     # 各子阶段的开始时间戳（{prepare/execute/analysis/done: ts}），用于流程视图耗时
     sub_started: dict = field(default_factory=dict)
     # ★ 本次 loop 各阶段实际使用的 backend id（{prepare, execute, analysis}）。
-    #   prepare 可用独立规划 backend，execute 恒走会话 backend，analysis 可用异构评审
-    #   backend。用于在结果展示中追溯"谁规划、谁执行、谁评审"。
+    #   prepare / execute / analysis 均可独立选 backend；缺省时跟随会话 backend。
+    #   用于在结果展示中追溯"谁规划、谁执行、谁评审"。
     backends: dict = field(default_factory=dict)
     # ★ 各阶段实际使用的运行参数（{prepare/execute/analysis: {model, reasoningEffort}}）。
     #   与 backend id 分开记录，避免同一个 Codex backend 下的 Sol/Terra/档位混在一起。
@@ -415,19 +415,19 @@ class LoopPolicy:
     risk_threshold: float = 0.85                   # 风险止损阈值（≥ 即收口）
     independent_eval: bool = True                  # analysis 用独立上下文 + 对抗式评审（防自欺）
     intent_guard: bool = True                       # 早期检查人意图 vs 模型计划方向的偏差（非阻塞提示）
-    # 各「AI 分析/转换」位置的专用 backend：{prepare/idea/goal/analysis/aside: backend_id}，
-    # 缺省=跟随会话。这些位置都跑在独立上下文上，可安全换异构模型；真正的
-    # execute/step 仍走会话 backend。
+    # 各角色的专用 backend：{prepare/execute/idea/goal/analysis/aside: backend_id}，
+    # 缺省=跟随会话。自动 LOOP 的 prepare / execute / analysis 都在独立上下文中运行，
+    # 因而可安全切换异构 backend；人工接管仍使用 Session 自身 backend。
     backends: dict = field(default_factory=dict)
     # 各角色的运行参数覆盖：{prepare/execute/idea/goal/analysis/aside: {model, reasoningEffort}}。
-    # execute 缺省跟随 Session；prepare 与其他角色缺省先跟随 execute，再跟随 Session，
-    # 因此旧策略不配置 prepare 时保持原来的同模型行为。
+    # execute 缺省跟随 Session；与 execute 使用同一 backend 的其他角色会先继承 execute
+    # 模型配置，否则跟随各自 backend 默认。因此旧策略保持原来的同 backend / 同模型行为。
     # 参数仅在目标 backend 支持时生效（Codex 支持模型+档位，Qwen CLI 支持模型）。
     runtimes: dict = field(default_factory=dict)
     strategy: str = DEFAULT_STRATEGY               # 注入到 prepare/analysis 的策略心智文本
 
     # 可路由的分析/转换位置
-    BACKEND_POSITIONS = ("prepare", "idea", "goal", "analysis", "aside")
+    BACKEND_POSITIONS = ("prepare", "execute", "idea", "goal", "analysis", "aside")
     RUNTIME_POSITIONS = ("prepare", "execute", "idea", "goal", "analysis", "aside")
     REASONING_EFFORTS = {"none", "minimal", "low", "medium", "high", "xhigh", "max"}
 

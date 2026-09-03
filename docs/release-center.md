@@ -5,7 +5,8 @@
 
 ## 基本原则
 
-- 打包不等于发布。BAT、Shell 和 Workspace Kit 只能登记候选构建。
+- 打包不等于发布。BAT、Shell 和 Kit 的普通文件输出只登记候选构建；Kit 只有通过
+  白名单 `awu_capability` 协议才能编排发布中心，且正式发布仍需独立人工确认。
 - 正式发布前必须选择制品、比较稳定版、完成预检并显式确认。
 - 预检会冻结文件大小、SHA-256、对象 key 和 manifest；发布前再次校验。
 - 七牛不可变制品先上传，版本 manifest 随后上传，channel manifest 最后切换。
@@ -67,4 +68,40 @@
 ## Workspace Kit
 
 Kit 的文件输出新增“登记发布候选”开关。成功运行后，该文件进入全局候选区，
-但 Kit 不拥有正式发布权限，也不会绕过发布工作台的冻结计划和人工确认。
+但普通命令、脚本和 AI 不能因此获得正式发布权限。
+
+需要把“打包完成后的发布”做成一键流程时，可在 Kit 高级实现中加入
+`AgentWithU · 发布最新包`，其 DSL 为：
+
+```json
+{
+  "type": "awu_capability",
+  "title": "发布最新包",
+  "target": "executor",
+  "config": {
+    "capability": "release.publish_latest",
+    "arguments": {
+      "projectRoot": ".",
+      "channel": "stable",
+      "notes": "本次更新说明"
+    }
+  }
+}
+```
+
+该步骤复用发布中心现有服务，而不是模拟点击界面或复制上传脚本：
+
+1. 扫描当前构建，并按可选的 `platform`、`arch`、`target`、`kind` 或
+   `artifactIds` 筛选本次新制品；默认不选择版本时间戳之前的旧包。
+2. 运行完整预检，冻结制品大小、SHA-256、对象 key、manifest 和计划指纹。
+3. 有阻断项时 Kit 明确失败；无阻断项时进入持久化的 `waiting_approval`。
+4. 用户在 Kit 运行详情核对版本、Build、制品、哈希、channel 和 Manifest 后，
+   点击“确认正式发布”。确认记录与计划指纹一同写入运行账本。
+5. 确认后调用同一个 `ReleaseCenterManager.start_publish()`；上传字节进度、当前文件、
+   最终状态和 Manifest URL 持续回写 Kit Run。停止 Kit 会同步取消发布任务。
+
+AI 可以在用户明确提出发布意图时生成这个步骤，但生成不等于批准；Schedule 对这种
+需要人工确认的高风险能力直接拒绝触发。能力 ID 来自 Backend 白名单，Kit 不能按任意
+RPC 名称调用内部功能。
+后续节点升级、文件同步或 Backend 管理等产品能力应沿用同一协议，并分别声明参数、
+风险级别、设备权限和确认策略。

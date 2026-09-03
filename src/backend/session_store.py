@@ -341,6 +341,7 @@ class SessionStore:
                 auto_commit=data.get("autoCommit", False),
                 auto_commit_push=data.get("autoCommitPush", False),
                 auto_commit_backend_id=data.get("autoCommitBackendId"),
+                token_usage=dict(data.get("tokenUsage") or {}),
             )
         except Exception as e:
             print(f"Failed to load session {sid}: {e}")

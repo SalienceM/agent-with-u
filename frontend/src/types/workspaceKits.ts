@@ -1,9 +1,9 @@
 export type KitRunStatus =
-  | 'queued' | 'running' | 'waiting_client' | 'evaluating'
+  | 'queued' | 'running' | 'waiting_client' | 'waiting_approval' | 'evaluating'
   | 'succeeded' | 'failed' | 'error' | 'cancelled';
 
 export type KitExecutionTarget = 'executor' | 'client';
-export type KitStepType = 'command' | 'file_push' | 'kit_call';
+export type KitStepType = 'command' | 'file_push' | 'kit_call' | 'awu_capability';
 
 export interface KitStepSpec {
   id: string;
@@ -20,6 +20,10 @@ export interface KitStepSpec {
     destination?: string;
     overwrite?: boolean;
     sha256?: string;
+    capability?: string;
+    arguments?: Record<string, unknown>;
+    metadata?: KitCapabilityMetadata;
+    capabilityRuntime?: KitCapabilityRuntime;
     [key: string]: unknown;
   };
   kitId?: string;
@@ -157,6 +161,13 @@ export interface KitGenerationResult {
 export type KitGenerationJobStatus =
   | 'queued' | 'running' | 'succeeded' | 'needs_input' | 'error' | 'cancelled';
 
+export interface KitGenerationActivity {
+  at: number;
+  type: string;
+  label: string;
+  detail?: string;
+}
+
 export interface KitGenerationJob {
   id: string;
   sessionId: string;
@@ -165,6 +176,16 @@ export interface KitGenerationJob {
   result?: KitGenerationResult | null;
   message: string;
   error: string;
+  phase?: string;
+  backendId?: string;
+  backendLabel?: string;
+  model?: string;
+  outputPreview?: string;
+  thinkingPreview?: string;
+  outputChars?: number;
+  thinkingChars?: number;
+  activities?: KitGenerationActivity[];
+  lastActivityAt?: number | null;
   createdAt: number;
   startedAt?: number | null;
   endedAt?: number | null;
@@ -210,7 +231,7 @@ export interface KitStepRun {
   target: KitExecutionTarget;
   title: string;
   sourceKitId: string;
-  status: 'pending' | 'running' | 'waiting_client' | 'succeeded' | 'failed'
+  status: 'pending' | 'running' | 'waiting_client' | 'waiting_approval' | 'succeeded' | 'failed'
     | 'error' | 'cancelled' | 'skipped';
   shell: 'powershell' | 'cmd' | 'bash';
   command: string;
@@ -225,6 +246,45 @@ export interface KitStepRun {
   error: string;
   startedAt?: number | null;
   endedAt?: number | null;
+}
+
+export interface KitCapabilityMetadata {
+  id: string;
+  title: string;
+  description: string;
+  riskLevel: 'low' | 'medium' | 'high' | string;
+  permission: string;
+  approval: 'required' | 'none' | string;
+}
+
+export interface KitCapabilityRuntime {
+  phase?: 'preparing' | 'blocked' | 'waiting_approval' | 'approved'
+    | 'publishing' | 'succeeded' | 'failed' | 'cancelled' | string;
+  planId?: string;
+  planFingerprint?: string;
+  plan?: {
+    id?: string;
+    status?: string;
+    channel?: string;
+    manifestUrl?: string;
+    fingerprint?: string;
+    candidate?: Record<string, unknown>;
+    release?: Record<string, unknown>;
+    artifacts?: Array<Record<string, unknown>>;
+    blockers?: string[];
+    warnings?: string[];
+    comparison?: Record<string, unknown>;
+  };
+  approval?: {
+    approved: boolean;
+    actor?: string;
+    at?: number;
+    planId?: string;
+    planFingerprint?: string;
+  };
+  jobId?: string;
+  job?: Record<string, any>;
+  [key: string]: unknown;
 }
 
 export interface KitArtifact {
