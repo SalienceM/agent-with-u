@@ -555,6 +555,109 @@ class WorkspaceKitGenerationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(candidate["steps"][0]["config"]["source"], r"C:\build\amp-1.0-snapshot.jar")
         self.assertEqual(candidate["steps"][0]["config"]["destination"], "amp-1.0-snapshot.jar")
 
+    async def test_publish_latest_uses_builtin_release_center_when_weak_model_asks_for_paths(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(
+            os.environ, {"AGENT_WITH_U_DATA_ROOT": str(Path(tmp) / "data")},
+        ):
+            workspace = Path(tmp) / "workspace"
+            workspace.mkdir()
+            bridge = BridgeWS()
+            session_id = "builtin-release-latest"
+            bridge._active_sessions[session_id] = Session(
+                id=session_id, title="Publish latest", created_at=time.time(), updated_at=time.time(),
+                messages=[], working_dir=str(workspace), backend_id="fake",
+            )
+            # 还原较弱模型的典型误判：把本应由发布中心运行时发现的信息重新推给用户。
+            fake = _FakeKitCompilerBackend({
+                "ready": False,
+                "questions": [
+                    "请提供 GitHub 仓库地址",
+                    "请提供版本 tag",
+                    "请提供 Windows 和 Linux 制品的具体路径",
+                ],
+                "warnings": ["缺少发布目标，无法生成命令"],
+                "kit": {},
+            })
+            with patch.object(bridge, "_new_backend_instance", return_value=fake):
+                result = json.loads(await bridge._rpc_kitGenerate(session_id, json.dumps({
+                    "objective": "检查最新打包结果，选择 Windows 和 Linux 的稳定制品并发布",
+                    "successCriteria": "发布中心完成预检，人工确认后正式发布",
+                    "safetyConstraints": "只能发布本次新制品",
+                }, ensure_ascii=False)))
+
+            self.assertEqual(result["status"], "ok")
+            self.assertTrue(result["ready"])
+            self.assertEqual(result["questions"], [])
+            self.assertEqual(result["warnings"], [])
+            self.assertIn("内建发布中心", result["implementationSummary"])
+            self.assertEqual(len(result["kit"]["steps"]), 1)
+            step = result["kit"]["steps"][0]
+            self.assertEqual(step["type"], "awu_capability")
+            self.assertEqual(step["config"]["capability"], "release.publish_latest")
+            self.assertEqual(step["config"]["arguments"], {
+                "projectRoot": ".",
+                "channel": "stable",
+                "platforms": ["windows", "linux"],
+            })
+            self.assertEqual(result["kit"]["schedule"]["mode"], "manual")
+            self.assertIn("不要询问 GitHub 仓库", fake.prompt)
+            self.assertIn("正式上传仍由能力自己的独立确认点拦截", fake.prompt)
+
+    def test_inspecting_builds_without_publish_does_not_grant_release_capability(self):
+        bridge = BridgeWS()
+
+        candidate = bridge._kit_builtin_release_candidate(
+            "检查最新打包结果，比较 Windows 和 Linux 制品",
+            "输出文件大小、版本号和 SHA-256",
+        )
+
+        self.assertIsNone(candidate)
+
+    def test_non_software_or_negated_publish_does_not_grant_release_capability(self):
+        bridge = BridgeWS()
+
+        self.assertIsNone(bridge._kit_builtin_release_candidate(
+            "发布一篇项目周报", "文章可在线阅读",
+        ))
+        self.assertIsNone(bridge._kit_builtin_release_candidate(
+            "检查最新安装包但不要发布", "只输出版本和 SHA-256",
+        ))
+
+    async def test_file_push_and_publish_are_composed_from_builtin_primitives(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(
+            os.environ, {"AGENT_WITH_U_DATA_ROOT": str(Path(tmp) / "data")},
+        ):
+            workspace = Path(tmp) / "workspace"
+            workspace.mkdir()
+            bridge = BridgeWS()
+            session_id = "builtin-push-and-release"
+            bridge._active_sessions[session_id] = Session(
+                id=session_id, title="Push and publish", created_at=time.time(), updated_at=time.time(),
+                messages=[], working_dir=str(workspace), backend_id="fake",
+            )
+            fake = _FakeKitCompilerBackend({
+                "ready": False,
+                "questions": ["请提供 SSH 地址和发布 URL"],
+                "kit": {},
+            })
+            with patch.object(bridge, "_new_backend_instance", return_value=fake):
+                result = json.loads(await bridge._rpc_kitGenerate(session_id, json.dumps({
+                    "objective": "把本地的 awu-windows.zip 上传到当前 Session，然后发布最新稳定包",
+                    "successCriteria": "文件校验通过且发布成功",
+                    "clientSources": [r"C:\build\awu-windows.zip"],
+                }, ensure_ascii=False)))
+
+            self.assertEqual(result["status"], "ok")
+            self.assertTrue(result["ready"])
+            self.assertEqual(
+                [step["type"] for step in result["kit"]["steps"]],
+                ["file_push", "awu_capability"],
+            )
+            self.assertEqual(
+                result["kit"]["steps"][1]["config"]["capability"],
+                "release.publish_latest",
+            )
+
 
 class WorkspaceKitVersionTests(unittest.IsolatedAsyncioTestCase):
     @staticmethod

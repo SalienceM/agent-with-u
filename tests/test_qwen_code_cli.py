@@ -71,6 +71,16 @@ class QwenCodeCliTests(unittest.IsolatedAsyncioTestCase):
         self.assertLess(elapsed, 0.025)
         await query.finished.wait()
 
+    async def test_abort_actively_closes_a_silent_sdk_query(self):
+        query = _FakeQuery()
+        self.backend._active_queries = {"loop-call": query}
+
+        self.backend.abort("loop-call")
+        await asyncio.wait_for(query.finished.wait(), timeout=1)
+
+        self.assertTrue(query.closed)
+        self.assertTrue(self.backend.is_cancelled("loop-call"))
+
     async def test_image_is_materialized_inside_working_dir_for_at_reference(self):
         import base64
         import os
@@ -287,6 +297,63 @@ class QwenCodeCliTests(unittest.IsolatedAsyncioTestCase):
         await query.finished.wait()
         thinking = "".join(delta.text or "" for delta in deltas if delta.type == "thinking")
         self.assertEqual(thinking, "checking")
+
+    async def test_tool_result_is_forwarded_for_loop_activity_and_visibility(self):
+        import tempfile
+
+        query = _FakeQuery([
+            {
+                "type": "assistant",
+                "session_id": "qwen-session",
+                "message": {"content": [{
+                    "type": "tool_use",
+                    "id": "tool-1",
+                    "name": "run_shell_command",
+                    "input": {"command": "pytest"},
+                }]},
+            },
+            {
+                "type": "user",
+                "session_id": "qwen-session",
+                "message": {
+                    "role": "user",
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": "tool-1",
+                        "content": "12 tests passed",
+                    }],
+                },
+                "parent_tool_use_id": None,
+            },
+            {
+                "type": "result",
+                "subtype": "success",
+                "session_id": "qwen-session",
+                "is_error": False,
+                "usage": {},
+            },
+        ])
+        deltas = []
+        with tempfile.TemporaryDirectory() as cwd, \
+             patch("qwen_code_sdk.query", return_value=query), \
+             patch("src.backend.qwen_code_cli.cli_available", return_value=True), \
+             patch.object(self.backend, "_resolve_cli", return_value="qwen"):
+            await self.backend.send_message(
+                messages=[],
+                content="run tests",
+                images=None,
+                session_id="session-tool-result",
+                message_id="message-tool-result",
+                on_delta=deltas.append,
+                working_dir=cwd,
+            )
+
+        await query.finished.wait()
+        result_delta = next(delta for delta in deltas if delta.type == "tool_result")
+        self.assertEqual(result_delta.tool_call["id"], "tool-1")
+        self.assertEqual(result_delta.tool_call["name"], "Bash")
+        self.assertEqual(result_delta.tool_call["status"], "done")
+        self.assertIn("12 tests passed", result_delta.tool_call["output"])
 
 
 if __name__ == "__main__":

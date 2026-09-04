@@ -4,8 +4,9 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from src.backend.bridge_ws import BridgeWS
+from src.backend.bridge_ws import BridgeWS, _LoopAgentStalledError
 from src.backend.loop_store import (
+    LoopPolicy,
     LoopRecord,
     LoopState,
     LoopStep,
@@ -288,6 +289,202 @@ class LoopLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(observed[0])
         self.assertFalse(observed[-1])
         self.assertFalse(bridge._loop_is_running(sid))
+
+    async def test_auto_continues_after_a_terminal_iteration_failure(self) -> None:
+        sid = "loop-auto-after-error"
+        state = LoopState(
+            session_id=sid,
+            stage=STAGE_EXECUTE,
+            auto=True,
+            loops=[LoopRecord(seq=1, round=1, error="analysis backend timed out")],
+            policy=LoopPolicy(max_loops=8),
+        )
+        bridge, _session = self._bridge(state)
+        bridge._schedule_loop_iteration = Mock(return_value=True)
+
+        bridge._maybe_autocontinue(sid)
+
+        bridge._schedule_loop_iteration.assert_called_once_with(sid)
+        self.assertEqual(state.stage, STAGE_EXECUTE)
+
+    async def test_auto_stops_after_three_consecutive_iteration_failures(self) -> None:
+        sid = "loop-auto-failure-circuit-breaker"
+        state = LoopState(
+            session_id=sid,
+            stage=STAGE_EXECUTE,
+            auto=True,
+            loops=[
+                LoopRecord(seq=1, round=1, error="prepare failed"),
+                LoopRecord(seq=2, round=1, error="execute failed"),
+                LoopRecord(seq=3, round=1, error="analysis failed"),
+            ],
+            policy=LoopPolicy(max_loops=20),
+        )
+        bridge, _session = self._bridge(state)
+        bridge._schedule_loop_iteration = Mock(return_value=True)
+
+        bridge._maybe_autocontinue(sid)
+
+        bridge._schedule_loop_iteration.assert_not_called()
+        self.assertEqual(state.stage, STAGE_OUT)
+        self.assertEqual(state.status, "aborted")
+        self.assertIn("连续 3 次", state.stop_reason)
+        bridge._loop_save.assert_called_with(state)
+        bridge._emit_loop_updated.assert_called_with(state)
+
+    async def test_auto_completed_iteration_with_step_error_still_continues(self) -> None:
+        sid = "loop-auto-step-error"
+        state = LoopState(
+            session_id=sid,
+            stage=STAGE_EXECUTE,
+            auto=True,
+            loops=[LoopRecord(
+                seq=1,
+                round=1,
+                completed=True,
+                orchestration=[LoopStep(index=1, status="error", desc="weak model failed")],
+            )],
+            policy=LoopPolicy(max_loops=8),
+        )
+        bridge, _session = self._bridge(state)
+        bridge._schedule_loop_iteration = Mock(return_value=True)
+
+        bridge._maybe_autocontinue(sid)
+
+        bridge._schedule_loop_iteration.assert_called_once_with(sid)
+
+    async def test_failed_iteration_does_not_continue_when_auto_is_off(self) -> None:
+        sid = "loop-manual-after-error"
+        state = LoopState(
+            session_id=sid,
+            stage=STAGE_EXECUTE,
+            auto=False,
+            loops=[LoopRecord(seq=1, round=1, error="prepare failed")],
+        )
+        bridge, _session = self._bridge(state)
+        bridge._schedule_loop_iteration = Mock(return_value=True)
+
+        bridge._maybe_autocontinue(sid)
+
+        bridge._schedule_loop_iteration.assert_not_called()
+
+    async def test_failed_iterations_respect_max_loop_limit_without_analysis(self) -> None:
+        sid = "loop-auto-error-max"
+        state = LoopState(
+            session_id=sid,
+            stage=STAGE_EXECUTE,
+            auto=True,
+            risk_coefficient=0.0,
+            loops=[
+                LoopRecord(seq=1, round=1, error="prepare failed"),
+                LoopRecord(seq=2, round=1, error="prepare failed again"),
+            ],
+            policy=LoopPolicy(max_loops=2),
+        )
+        bridge, _session = self._bridge(state)
+        bridge._schedule_loop_iteration = Mock(return_value=True)
+
+        bridge._maybe_autocontinue(sid)
+
+        bridge._schedule_loop_iteration.assert_not_called()
+        self.assertEqual(state.stage, STAGE_OUT)
+        self.assertEqual(state.stop_reason, "达到最大 loop 约束")
+
+    async def test_stalled_step_retries_with_fresh_context_and_keeps_artifacts(self) -> None:
+        sid = "loop-step-auto-recovery"
+        step = LoopStep(index=4, desc="run focused tests")
+        record = LoopRecord(
+            seq=2,
+            round=1,
+            goal="verify feature",
+            orchestration=[step],
+            backends={"execute": "weak-qwen"},
+            runtimes={"execute": {"model": "enterprise-model"}},
+        )
+        state = LoopState(
+            session_id=sid,
+            stage=STAGE_EXECUTE,
+            goal="ship feature",
+            loops=[record],
+            policy=LoopPolicy(step_stall_seconds=30, step_max_attempts=2),
+        )
+        bridge = BridgeWS.__new__(BridgeWS)
+        bridge._loop_cancel = {}
+        bridge._loop_save = Mock()
+        bridge._emit_loop_updated = Mock()
+        bridge._emit_loop_progress = Mock()
+        calls = []
+
+        async def run_agent(*args, **kwargs):
+            calls.append((args, kwargs))
+            if len(calls) == 1:
+                raise _LoopAgentStalledError(30, partial_text="files already changed")
+            return "focused tests passed", "fresh-agent-thread"
+
+        bridge._loop_run_agent = run_agent
+        session = SimpleNamespace(id=sid, backend_id="weak-qwen")
+
+        result_sid = await bridge._loop_run_step(
+            session, state, record, step,
+            resume=True,
+            indep_session_id=f"{sid}:loop2:steps",
+            agent_session_id="old-agent-thread",
+        )
+
+        self.assertEqual(result_sid, "fresh-agent-thread")
+        self.assertEqual(step.status, "done")
+        self.assertEqual(step.output, "focused tests passed")
+        self.assertEqual(step.attempts, 2)
+        self.assertEqual(len(step.recovery_notes), 1)
+        self.assertIn("无活动", step.recovery_notes[0])
+        self.assertEqual(calls[0][1]["agent_session_id"], "old-agent-thread")
+        self.assertIsNone(calls[1][1]["agent_session_id"])
+        self.assertIn(":retry2", calls[1][1]["indep_session_id"])
+        self.assertIn("自动恢复重试", calls[1][0][1])
+
+    async def test_loop_agent_watchdog_aborts_a_silent_backend(self) -> None:
+        class SilentBackend:
+            def __init__(self):
+                self.aborted = []
+                self.cleared = []
+
+            async def send_message(self, **_kwargs):
+                await asyncio.Event().wait()
+
+            def abort(self, call_sid):
+                self.aborted.append(call_sid)
+
+            def clear_cancelled(self, call_sid):
+                self.cleared.append(call_sid)
+
+        backend = SilentBackend()
+        bridge = BridgeWS.__new__(BridgeWS)
+        bridge._loop_active_backends = {}
+        bridge._new_backend_instance = lambda _backend_id: backend
+        bridge._build_session_reference_context = lambda prompt, _sid: prompt
+        bridge._emit_loop_progress = Mock()
+        bridge._add_runtime_kwargs = lambda *_args, **_kwargs: None
+        bridge._record_session_usage = Mock()
+        bridge._session_store = SimpleNamespace(save=lambda *_args, **_kwargs: None)
+        session = SimpleNamespace(
+            id="silent-loop",
+            backend_id="silent-backend",
+            agent_session_id=None,
+            working_dir=".",
+            sandbox_enabled=False,
+        )
+
+        with self.assertRaises(_LoopAgentStalledError) as caught:
+            await bridge._loop_run_agent(
+                session, "do work", "step1", 1,
+                resume=False,
+                indep_session_id="silent-loop:loop1:step1",
+                inactivity_timeout=0.05,
+            )
+
+        self.assertTrue(caught.exception.retryable)
+        self.assertEqual(backend.aborted, ["silent-loop:loop1:step1"])
+        self.assertEqual(backend.cleared, ["silent-loop:loop1:step1"])
 
 
 if __name__ == "__main__":

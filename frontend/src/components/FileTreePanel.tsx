@@ -23,6 +23,7 @@ import { GitPanel } from './GitPanel';
 import type { GitFileStatus, GitFileStatusType, GitStashEntry } from '../types/git';
 import { DiffViewer } from './DiffViewer';
 import { StructuredFilePreview, type StructuredPreviewPayload } from './StructuredFilePreview';
+import { MarkdownPreview } from './MarkdownPreview';
 import { AppModalPortal } from './AppModalPortal';
 import type { ProvOpenResult } from '../types/prov';
 import {
@@ -2943,8 +2944,12 @@ export const FileTreePanel: React.FC<Props> = ({ sessionId, workingDir, execKey,
               ) : preview.structured ? (
                 <StructuredFilePreview preview={preview.structured} onReveal={revealPreview} />
               ) : preview.isMarkdown && !mdRaw ? (
-                <div style={{ padding: '8px 18px', fontSize: 14, overflow: 'auto' }}
-                  dangerouslySetInnerHTML={{ __html: markdownToHtml(preview.text || '') }} />
+                <MarkdownPreview
+                  key={`${preview.rel}:${preview.source}`}
+                  source={preview.text || ''}
+                  title={preview.name}
+                  initialDark={isDarkTheme()}
+                />
               ) : (
                 <pre className="md-pre" style={pvPre}>
                   <code className="hljs" dangerouslySetInnerHTML={{ __html: highlightCode(preview.text || '', extOf(preview.name)) }} />

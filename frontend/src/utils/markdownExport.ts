@@ -1,3 +1,5 @@
+import { markdownHtmlWithOutline } from './markdown';
+
 function sourceLeaf(sourceName: string): string {
   return sourceName.replace(/\\/g, '/').split('/').filter(Boolean).pop() || 'document.md';
 }
@@ -28,14 +30,35 @@ export function markdownHtmlFilename(sourceName: string): string {
 export function buildStandaloneMarkdownHtml(sourceName: string, renderedBody: string): string {
   const title = escapeHtmlText(withoutMarkdownExtension(sourceName));
   const source = escapeHtmlText(sourceLeaf(sourceName));
+  const outlined = markdownHtmlWithOutline(renderedBody);
+  const minimumOutlineLevel = outlined.outline.reduce(
+    (minimum, item) => Math.min(minimum, item.level),
+    6,
+  );
+  const outlineMarkup = outlined.outline.length > 0
+    ? outlined.outline.map((item) => (
+      `<button class="awu-toc-item" data-target="${item.id}" style="--awu-depth:${Math.min(4, Math.max(0, item.level - minimumOutlineLevel))}">`
+      + `<span class="awu-toc-dot"></span><span>${escapeHtmlText(item.title)}</span></button>`
+    )).join('')
+    : '<p class="awu-toc-empty">这份文档没有可导航的标题</p>';
   return `<!doctype html>
-<html lang="zh-CN" class="awu-export-root">
+<html lang="zh-CN" class="awu-export-root" data-awu-theme="light" data-awu-toc="open">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="generator" content="AgentWithU Markdown Preview">
   <meta name="source-file" content="${source}">
   <title>${title}</title>
+  <script>
+    try {
+      var awuTheme = localStorage.getItem('agentwithu.markdownExport.theme');
+      if (awuTheme !== 'light' && awuTheme !== 'dark') {
+        awuTheme = matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+      }
+      document.documentElement.dataset.awuTheme = awuTheme;
+      document.documentElement.dataset.awuToc = localStorage.getItem('agentwithu.markdownExport.tocOpen') === '0' ? 'closed' : 'open';
+    } catch (_) {}
+  </script>
   <style>
     /*
      * 所有内容样式都限定在 awu-markdown-export 内。
@@ -44,13 +67,7 @@ export function buildStandaloneMarkdownHtml(sourceName: string, renderedBody: st
      */
     html.awu-export-root {
       color-scheme: light dark;
-      background: #f6f8fa;
-    }
-    body.awu-export-body {
-      margin: 0;
-      background: #f6f8fa;
-    }
-    .awu-markdown-export {
+      --awu-page-bg: #f3f6fa;
       --awu-paper-bg: #ffffff;
       --awu-text: #1f2328;
       --awu-muted: #59636e;
@@ -58,6 +75,15 @@ export function buildStandaloneMarkdownHtml(sourceName: string, renderedBody: st
       --awu-soft-bg: #f6f8fa;
       --awu-code-bg: #f6f8fa;
       --awu-accent: #0969da;
+      background: var(--awu-page-bg);
+      scroll-behavior: smooth;
+    }
+    body.awu-export-body {
+      margin: 0;
+      color: var(--awu-text);
+      background: var(--awu-page-bg);
+    }
+    .awu-markdown-export {
       width: min(980px, calc(100% - 32px));
       min-height: calc(100vh - 40px);
       margin: 20px auto;
@@ -71,6 +97,55 @@ export function buildStandaloneMarkdownHtml(sourceName: string, renderedBody: st
       overflow-wrap: anywhere;
       isolation: isolate;
     }
+    .awu-reader-toolbar {
+      position: sticky; top: 0; z-index: 20; height: 54px; padding: 0 16px;
+      display: flex; align-items: center; gap: 12px;
+      color: var(--awu-text); background: color-mix(in srgb, var(--awu-paper-bg) 92%, transparent);
+      border-bottom: 1px solid var(--awu-border); backdrop-filter: blur(14px);
+      font: 600 13px/1.3 -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans SC", "Microsoft YaHei", sans-serif;
+    }
+    .awu-reader-title {
+      min-width: 0; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+      text-align: center; font-weight: 700;
+    }
+    .awu-reader-action {
+      min-height: 32px; padding: 5px 11px; display: inline-flex; align-items: center; gap: 6px;
+      color: var(--awu-text); background: var(--awu-paper-bg); border: 1px solid var(--awu-border);
+      border-radius: 8px; cursor: pointer; font: inherit;
+    }
+    .awu-reader-action:hover { color: var(--awu-accent); border-color: var(--awu-accent); }
+    .awu-reader-shell {
+      width: min(1440px, 100%); min-height: calc(100vh - 54px); margin: 0 auto;
+      display: grid; grid-template-columns: 270px minmax(0, 1fr); align-items: start;
+      transition: grid-template-columns .2s ease;
+    }
+    .awu-reader-toc {
+      position: sticky; top: 70px; z-index: 10; height: calc(100vh - 86px); min-width: 0;
+      margin: 16px 0 16px 16px; overflow: hidden;
+      color: var(--awu-text); background: var(--awu-paper-bg); border: 1px solid var(--awu-border);
+      border-radius: 10px; transition: opacity .18s ease, transform .2s ease;
+      font: 13px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans SC", "Microsoft YaHei", sans-serif;
+    }
+    .awu-toc-heading {
+      height: 45px; padding: 0 14px; display: flex; align-items: center; justify-content: space-between;
+      color: var(--awu-muted); border-bottom: 1px solid var(--awu-border);
+      font-size: 11px; font-weight: 750; letter-spacing: .12em;
+    }
+    .awu-toc-list { height: calc(100% - 45px); padding: 8px 7px 24px; box-sizing: border-box; overflow: auto; }
+    .awu-toc-item {
+      width: 100%; min-height: 32px; padding: 6px 9px 6px calc(14px + var(--awu-depth) * 13px);
+      display: flex; align-items: flex-start; gap: 8px; border: 0; border-radius: 7px;
+      color: var(--awu-muted); background: transparent; cursor: pointer; text-align: left;
+      font: 500 12px/1.45 inherit;
+    }
+    .awu-toc-item:hover { color: var(--awu-text); background: var(--awu-soft-bg); }
+    .awu-toc-item.is-active { color: var(--awu-accent); background: color-mix(in srgb, var(--awu-accent) 10%, transparent); font-weight: 700; }
+    .awu-toc-dot { width: 4px; height: 4px; margin-top: 7px; flex: 0 0 auto; border-radius: 50%; background: currentColor; }
+    .awu-toc-item.is-active .awu-toc-dot { height: 14px; margin-top: 2px; border-radius: 3px; }
+    .awu-toc-empty { padding: 10px; color: var(--awu-muted); }
+    .awu-toc-backdrop { display: none; }
+    html.awu-export-root[data-awu-toc="closed"] .awu-reader-shell { grid-template-columns: 0 minmax(0, 1fr); }
+    html.awu-export-root[data-awu-toc="closed"] .awu-reader-toc { opacity: 0; pointer-events: none; transform: translateX(-18px); }
     .awu-markdown-export, .awu-markdown-export * { box-sizing: border-box; }
     .awu-markdown-export .md-content { line-height: 1.7; color: var(--awu-text) !important; }
     .awu-markdown-export .md-content p,
@@ -159,9 +234,8 @@ export function buildStandaloneMarkdownHtml(sourceName: string, renderedBody: st
     .awu-markdown-export .hljs-formula { color: #6e7781 !important; }
     .awu-markdown-export .hljs-name, .awu-markdown-export .hljs-quote,
     .awu-markdown-export .hljs-selector-tag { color: #116329 !important; }
-    @media (prefers-color-scheme: dark) {
-      html.awu-export-root, body.awu-export-body { background: #0d1117; }
-      .awu-markdown-export {
+    html.awu-export-root[data-awu-theme="dark"] {
+        --awu-page-bg: #0d1117;
         --awu-paper-bg: #161b22;
         --awu-text: #e6edf3;
         --awu-muted: #9da7b3;
@@ -169,27 +243,58 @@ export function buildStandaloneMarkdownHtml(sourceName: string, renderedBody: st
         --awu-soft-bg: #1d232b;
         --awu-code-bg: #0d1117;
         --awu-accent: #58a6ff;
+    }
+    html.awu-export-root[data-awu-theme="dark"],
+    html.awu-export-root[data-awu-theme="dark"] body.awu-export-body { background: var(--awu-page-bg); }
+    html.awu-export-root[data-awu-theme="dark"] .awu-markdown-export .hljs-doctag,
+    html.awu-export-root[data-awu-theme="dark"] .awu-markdown-export .hljs-keyword,
+    html.awu-export-root[data-awu-theme="dark"] .awu-markdown-export .hljs-meta .hljs-keyword,
+    html.awu-export-root[data-awu-theme="dark"] .awu-markdown-export .hljs-template-tag,
+    html.awu-export-root[data-awu-theme="dark"] .awu-markdown-export .hljs-type,
+    html.awu-export-root[data-awu-theme="dark"] .awu-markdown-export .hljs-variable.language_ { color: #ff7b72 !important; }
+    html.awu-export-root[data-awu-theme="dark"] .awu-markdown-export .hljs-title,
+    html.awu-export-root[data-awu-theme="dark"] .awu-markdown-export .hljs-title.class_,
+    html.awu-export-root[data-awu-theme="dark"] .awu-markdown-export .hljs-title.function_ { color: #d2a8ff !important; }
+    html.awu-export-root[data-awu-theme="dark"] .awu-markdown-export .hljs-attr,
+    html.awu-export-root[data-awu-theme="dark"] .awu-markdown-export .hljs-attribute,
+    html.awu-export-root[data-awu-theme="dark"] .awu-markdown-export .hljs-literal,
+    html.awu-export-root[data-awu-theme="dark"] .awu-markdown-export .hljs-number,
+    html.awu-export-root[data-awu-theme="dark"] .awu-markdown-export .hljs-operator,
+    html.awu-export-root[data-awu-theme="dark"] .awu-markdown-export .hljs-variable { color: #79c0ff !important; }
+    html.awu-export-root[data-awu-theme="dark"] .awu-markdown-export .hljs-regexp,
+    html.awu-export-root[data-awu-theme="dark"] .awu-markdown-export .hljs-string { color: #a5d6ff !important; }
+    html.awu-export-root[data-awu-theme="dark"] .awu-markdown-export .hljs-built_in,
+    html.awu-export-root[data-awu-theme="dark"] .awu-markdown-export .hljs-symbol { color: #ffa657 !important; }
+    html.awu-export-root[data-awu-theme="dark"] .awu-markdown-export .hljs-comment,
+    html.awu-export-root[data-awu-theme="dark"] .awu-markdown-export .hljs-code,
+    html.awu-export-root[data-awu-theme="dark"] .awu-markdown-export .hljs-formula { color: #8b949e !important; }
+    html.awu-export-root[data-awu-theme="dark"] .awu-markdown-export .hljs-name,
+    html.awu-export-root[data-awu-theme="dark"] .awu-markdown-export .hljs-quote,
+    html.awu-export-root[data-awu-theme="dark"] .awu-markdown-export .hljs-selector-tag { color: #7ee787 !important; }
+    @media (max-width: 860px) {
+      .awu-reader-shell, html.awu-export-root[data-awu-toc="closed"] .awu-reader-shell { display: block; }
+      .awu-reader-toc {
+        position: fixed; top: 62px; bottom: 8px; left: 8px; width: min(82vw, 310px); height: auto;
+        margin: 0; box-shadow: 18px 0 46px rgba(0,0,0,.3); transform: translateX(0);
       }
-      .awu-markdown-export .hljs-doctag, .awu-markdown-export .hljs-keyword,
-      .awu-markdown-export .hljs-meta .hljs-keyword, .awu-markdown-export .hljs-template-tag,
-      .awu-markdown-export .hljs-type, .awu-markdown-export .hljs-variable.language_ { color: #ff7b72 !important; }
-      .awu-markdown-export .hljs-title, .awu-markdown-export .hljs-title.class_,
-      .awu-markdown-export .hljs-title.function_ { color: #d2a8ff !important; }
-      .awu-markdown-export .hljs-attr, .awu-markdown-export .hljs-attribute,
-      .awu-markdown-export .hljs-literal, .awu-markdown-export .hljs-number,
-      .awu-markdown-export .hljs-operator, .awu-markdown-export .hljs-variable { color: #79c0ff !important; }
-      .awu-markdown-export .hljs-regexp, .awu-markdown-export .hljs-string { color: #a5d6ff !important; }
-      .awu-markdown-export .hljs-built_in, .awu-markdown-export .hljs-symbol { color: #ffa657 !important; }
-      .awu-markdown-export .hljs-comment, .awu-markdown-export .hljs-code,
-      .awu-markdown-export .hljs-formula { color: #8b949e !important; }
-      .awu-markdown-export .hljs-name, .awu-markdown-export .hljs-quote,
-      .awu-markdown-export .hljs-selector-tag { color: #7ee787 !important; }
+      html.awu-export-root[data-awu-toc="closed"] .awu-reader-toc { transform: translateX(calc(-100% - 18px)); }
+      html.awu-export-root[data-awu-toc="open"] .awu-toc-backdrop {
+        display: block; position: fixed; inset: 54px 0 0; z-index: 9;
+        border: 0; background: rgba(0,0,0,.42); cursor: default;
+      }
+      .awu-reader-toolbar { padding: 0 8px; gap: 7px; }
+      .awu-reader-action { padding: 5px 8px; }
     }
     @media (max-width: 640px) {
       .awu-markdown-export { width: 100%; min-height: 100vh; margin: 0; padding: 22px 18px; border: 0; box-shadow: none; font-size: 15px; }
     }
     @media print {
-      html.awu-export-root, body.awu-export-body { background: #fff; }
+      html.awu-export-root[data-awu-theme], body.awu-export-body {
+        --awu-page-bg: #fff; --awu-paper-bg: #fff; --awu-text: #000; --awu-border: #bbb;
+        background: #fff;
+      }
+      .awu-reader-toolbar, .awu-reader-toc, .awu-toc-backdrop { display: none !important; }
+      .awu-reader-shell { display: block; }
       .awu-markdown-export {
         --awu-paper-bg: #fff;
         --awu-text: #000;
@@ -200,9 +305,72 @@ export function buildStandaloneMarkdownHtml(sourceName: string, renderedBody: st
   </style>
 </head>
 <body class="awu-export-body">
-  <main class="awu-markdown-export">
-${renderedBody}
-  </main>
+  <header class="awu-reader-toolbar">
+    <button id="awu-toc-toggle" class="awu-reader-action" type="button" aria-expanded="true">☰ <span>目录</span></button>
+    <div class="awu-reader-title" title="${title}">▤ ${title}</div>
+    <button id="awu-theme-toggle" class="awu-reader-action" type="button">☾ <span>夜间</span></button>
+  </header>
+  <button id="awu-toc-backdrop" class="awu-toc-backdrop" type="button" aria-label="关闭目录"></button>
+  <div class="awu-reader-shell">
+    <aside class="awu-reader-toc" aria-label="文档目录">
+      <div class="awu-toc-heading"><span>目录</span><span>${outlined.outline.length || '—'}</span></div>
+      <nav class="awu-toc-list">${outlineMarkup}</nav>
+    </aside>
+    <main class="awu-markdown-export">
+${outlined.html}
+    </main>
+  </div>
+  <script>
+    (function () {
+      var root = document.documentElement;
+      var tocButton = document.getElementById('awu-toc-toggle');
+      var themeButton = document.getElementById('awu-theme-toggle');
+      var backdrop = document.getElementById('awu-toc-backdrop');
+      function renderControls() {
+        var open = root.dataset.awuToc !== 'closed';
+        var dark = root.dataset.awuTheme === 'dark';
+        tocButton.setAttribute('aria-expanded', String(open));
+        tocButton.innerHTML = (open ? '◀' : '☰') + ' <span>' + (open ? '收起目录' : '展开目录') + '</span>';
+        themeButton.innerHTML = (dark ? '☀' : '☾') + ' <span>' + (dark ? '白天' : '夜间') + '</span>';
+      }
+      function setToc(open) {
+        root.dataset.awuToc = open ? 'open' : 'closed';
+        try { localStorage.setItem('agentwithu.markdownExport.tocOpen', open ? '1' : '0'); } catch (_) {}
+        renderControls();
+      }
+      tocButton.addEventListener('click', function () { setToc(root.dataset.awuToc === 'closed'); });
+      backdrop.addEventListener('click', function () { setToc(false); });
+      themeButton.addEventListener('click', function () {
+        root.dataset.awuTheme = root.dataset.awuTheme === 'dark' ? 'light' : 'dark';
+        try { localStorage.setItem('agentwithu.markdownExport.theme', root.dataset.awuTheme); } catch (_) {}
+        renderControls();
+      });
+      var links = Array.prototype.slice.call(document.querySelectorAll('.awu-toc-item[data-target]'));
+      var headings = Array.prototype.slice.call(document.querySelectorAll('.awu-markdown-export .md-content h1, .awu-markdown-export .md-content h2, .awu-markdown-export .md-content h3, .awu-markdown-export .md-content h4, .awu-markdown-export .md-content h5, .awu-markdown-export .md-content h6'));
+      function selectActive() {
+        var active = headings.length ? headings[0].id : '';
+        headings.some(function (heading) {
+          if (heading.getBoundingClientRect().top <= 92) { active = heading.id; return false; }
+          return true;
+        });
+        links.forEach(function (link) { link.classList.toggle('is-active', link.dataset.target === active); });
+      }
+      links.forEach(function (link) {
+        link.addEventListener('click', function () {
+          var heading = document.getElementById(link.dataset.target || '');
+          if (heading) heading.scrollIntoView({ behavior: 'smooth', block: 'start' });
+          if (matchMedia('(max-width: 860px)').matches) setToc(false);
+        });
+      });
+      var pending = 0;
+      addEventListener('scroll', function () {
+        if (pending) return;
+        pending = requestAnimationFrame(function () { pending = 0; selectActive(); });
+      }, { passive: true });
+      renderControls();
+      selectActive();
+    }());
+  </script>
 </body>
 </html>
 `;

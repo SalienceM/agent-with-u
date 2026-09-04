@@ -324,6 +324,22 @@ class LoopEvolutionTests(unittest.IsolatedAsyncioTestCase):
 
 
 class LoopEvolutionCompatibilityTests(unittest.TestCase):
+    def test_auto_recovery_policy_round_trip_and_bounds(self) -> None:
+        policy = LoopPolicy.from_dict({
+            "stepStallSeconds": 240,
+            "stepMaxAttempts": 3,
+        })
+        payload = policy.to_dict()
+        self.assertEqual(payload["stepStallSeconds"], 240)
+        self.assertEqual(payload["stepMaxAttempts"], 3)
+
+        bounded = LoopPolicy.from_dict({
+            "stepStallSeconds": 1,
+            "stepMaxAttempts": 99,
+        })
+        self.assertEqual(bounded.step_stall_seconds, 30)
+        self.assertEqual(bounded.step_max_attempts, 3)
+
     def test_analysis_fields_round_trip(self) -> None:
         original = LoopAnalysis(
             score=81,

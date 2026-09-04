@@ -63,11 +63,14 @@ class LoopStep:
     output: str = ""           # 该步执行产出（持久化，用于复盘）
     started_at: float = 0.0    # 开始执行时间戳（0 = 未开始），用于流程视图耗时
     ended_at: float = 0.0      # 结束时间戳（0 = 未结束）
+    attempts: int = 0          # 实际尝试次数；无活动超时后可自动重试当前步
+    recovery_notes: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return {"index": self.index, "mode": self.mode, "desc": self.desc, "access": self.access,
                 "status": self.status, "output": self.output,
-                "startedAt": self.started_at, "endedAt": self.ended_at}
+                "startedAt": self.started_at, "endedAt": self.ended_at,
+                "attempts": self.attempts, "recoveryNotes": list(self.recovery_notes)}
 
     @classmethod
     def from_dict(cls, d: dict) -> "LoopStep":
@@ -80,6 +83,8 @@ class LoopStep:
             output=d.get("output", ""),
             started_at=float(d.get("startedAt", 0) or 0),
             ended_at=float(d.get("endedAt", 0) or 0),
+            attempts=max(0, int(d.get("attempts", 0) or 0)),
+            recovery_notes=[str(v) for v in (d.get("recoveryNotes") or []) if str(v).strip()],
         )
 
 
@@ -413,6 +418,8 @@ class LoopPolicy:
     outputtable_score: float = OUTPUTTABLE_SCORE   # 可输出门槛
     max_loops: int = 8                             # 基础最大 loop 约束
     risk_threshold: float = 0.85                   # 风险止损阈值（≥ 即收口）
+    step_stall_seconds: int = 300                  # execute 单步多久无任何模型/工具事件即判定疑似卡住
+    step_max_attempts: int = 2                     # 卡住或空响应时，当前步最多自动尝试次数
     independent_eval: bool = True                  # analysis 用独立上下文 + 对抗式评审（防自欺）
     intent_guard: bool = True                       # 早期检查人意图 vs 模型计划方向的偏差（非阻塞提示）
     # 各角色的专用 backend：{prepare/execute/idea/goal/analysis/aside: backend_id}，
@@ -462,6 +469,8 @@ class LoopPolicy:
             "outputtableScore": self.outputtable_score,
             "maxLoops": self.max_loops,
             "riskThreshold": self.risk_threshold,
+            "stepStallSeconds": self.step_stall_seconds,
+            "stepMaxAttempts": self.step_max_attempts,
             "independentEval": self.independent_eval,
             "intentGuard": self.intent_guard,
             "backends": dict(self.backends or {}),
@@ -486,6 +495,16 @@ class LoopPolicy:
             ml = 8
         ml = max(1, min(50, ml))
         rt = max(0.1, min(1.0, _f("riskThreshold", 0.85)))
+        try:
+            stall = int(d.get("stepStallSeconds", 300))
+        except (TypeError, ValueError):
+            stall = 300
+        stall = max(30, min(3600, stall))
+        try:
+            attempts = int(d.get("stepMaxAttempts", 2))
+        except (TypeError, ValueError):
+            attempts = 2
+        attempts = max(1, min(3, attempts))
         strat = d.get("strategy")
         # 旧版本把“每次完整重做”固化进了持久化策略。只替换这段已知系统默认前缀，
         # 后面由用户或内置预设追加的个性化要求原样保留。
@@ -518,6 +537,7 @@ class LoopPolicy:
                     runtimes[k] = cleaned
         return cls(
             deliverable_score=dv, outputtable_score=ov, max_loops=ml, risk_threshold=rt,
+            step_stall_seconds=stall, step_max_attempts=attempts,
             independent_eval=bool(ie) if ie is not None else True,
             intent_guard=bool(ig) if ig is not None else True,
             backends=backends,

@@ -14,6 +14,8 @@ export interface LoopPolicy {
   outputtableScore: number;
   maxLoops: number;
   riskThreshold: number;
+  stepStallSeconds: number;
+  stepMaxAttempts: number;
   independentEval: boolean;
   intentGuard: boolean;
   backends: Record<string, string>;   // 各角色的专用 backend：{prepare/execute/idea/goal/analysis/aside}
@@ -56,6 +58,8 @@ export const DEFAULT_POLICY: LoopPolicy = {
   outputtableScore: 85,
   maxLoops: 8,
   riskThreshold: 0.85,
+  stepStallSeconds: 300,
+  stepMaxAttempts: 2,
   independentEval: true,
   intentGuard: true,
   backends: {},
@@ -70,6 +74,8 @@ export function normalizePolicy(p?: Partial<LoopPolicy> | null): LoopPolicy {
   const out = clamp(num(d.outputtableScore, 85), del, 100);
   const ml = Math.round(clamp(num(d.maxLoops, 8), 1, 50));
   const rt = clamp(num(d.riskThreshold, 0.85), 0.1, 1);
+  const stall = Math.round(clamp(num(d.stepStallSeconds, 300), 30, 3600));
+  const attempts = Math.round(clamp(num(d.stepMaxAttempts, 2), 1, 3));
   const ie = d.independentEval !== false;
   const ig = d.intentGuard !== false;
   const backends: Record<string, string> = {};
@@ -95,7 +101,7 @@ export function normalizePolicy(p?: Partial<LoopPolicy> | null): LoopPolicy {
     }
   }
   const strat = (typeof d.strategy === 'string' && d.strategy.trim()) ? d.strategy : DEFAULT_STRATEGY;
-  return { deliverableScore: del, outputtableScore: out, maxLoops: ml, riskThreshold: rt, independentEval: ie, intentGuard: ig, backends, runtimes, strategy: strat };
+  return { deliverableScore: del, outputtableScore: out, maxLoops: ml, riskThreshold: rt, stepStallSeconds: stall, stepMaxAttempts: attempts, independentEval: ie, intentGuard: ig, backends, runtimes, strategy: strat };
 }
 
 function num(v: any, fb: number): number { const n = Number(v); return Number.isFinite(n) ? n : fb; }
@@ -192,6 +198,15 @@ export const LoopPolicyEditor: React.FC<{
           min={1} max={50} step={1} onChange={(v) => set({ maxLoops: v })} />
         <NumField label="风险止损阈值" hint="风险系数 ≥ 此值即收口" value={value.riskThreshold}
           min={0.1} max={1} step={0.05} onChange={(v) => set({ riskThreshold: v })} />
+        <NumField label="单步无活动超时（秒）" hint="无任何模型/工具事件后自动止损" value={value.stepStallSeconds}
+          min={30} max={3600} step={30} onChange={(v) => set({ stepStallSeconds: v })} />
+        <NumField label="单步最大尝试次数" hint="卡住/空结果时换新上下文重试" value={value.stepMaxAttempts}
+          min={1} max={3} step={1} onChange={(v) => set({ stepMaxAttempts: v })} />
+      </div>
+
+      <div style={{ fontSize: 11, color: 'var(--theme-text-muted)', lineHeight: 1.55, padding: '7px 9px', borderRadius: 7, background: 'var(--theme-bg-secondary)', border: '1px solid var(--theme-border)' }}>
+        自动防卡死：单步超过设定时间没有任何新事件时，会关闭当前 Backend 调用，保留已经落盘的文件，
+        用全新模型上下文重试当前步；达到次数上限后该步记为失败，LOOP 仍继续汇总与评审，不会永久停在 running。
       </div>
 
       {/* 防自欺：独立对抗式评审 */}

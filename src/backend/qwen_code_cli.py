@@ -159,6 +159,26 @@ class QwenCodeSdkBackend(ModelBackend):
             "steerAttachments": False,
         }
 
+    def abort(self, session_id: Optional[str] = None):
+        """取消标记之外，主动关闭正在等待的 SDK Query/CLI 子进程。
+
+        仅靠 ModelBackend 的 cancelled 标记，要等 SDK 再吐出一条事件才会生效；
+        Bash 已经挂住时恰好不会再有事件，因此 LOOP 看门狗必须能直接 close。
+        """
+        super().abort(session_id)
+        active = getattr(self, "_active_queries", {})
+        targets = [
+            query for sid, query in list(active.items())
+            if session_id is None or sid == session_id
+        ]
+        for query in targets:
+            try:
+                self._detach_query_cleanup(query)
+            except RuntimeError:
+                # 没有活动事件循环时保留 cancelled 标记；正常 RPC/LOOP 路径
+                # 总在 asyncio loop 内，会走上面的主动关闭。
+                pass
+
     def _resolve_cli(self) -> str:
         return resolve_qwen_cli(getattr(self.config, "cli_path", None))
 
@@ -418,6 +438,7 @@ class QwenCodeSdkBackend(ModelBackend):
                 is_sdk_assistant_message,
                 is_sdk_result_message,
                 is_sdk_partial_assistant_message,
+                is_sdk_user_message,
             )
         except ImportError as _imp_err:
             import traceback as _tb
@@ -640,9 +661,16 @@ class QwenCodeSdkBackend(ModelBackend):
         _saw_partial_content = False
         _query_started_at = time.monotonic()
         _first_event_at: Optional[float] = None
+        _active_result: Any = None
+        _tool_names_by_id: dict[str, str] = {}
 
         try:
             async with sdk_query(prompt, options) as result:
+                _active_result = result
+                active_queries = getattr(self, "_active_queries", None)
+                if active_queries is None:
+                    active_queries = self._active_queries = {}
+                active_queries[session_id] = result
                 # Update session ID from result (SDK uses get_session_id() method)
                 try:
                     sdk_session_id = result.get_session_id()
@@ -688,11 +716,40 @@ class QwenCodeSdkBackend(ModelBackend):
                             elif btype == "tool_use":
                                 _tool_name = block.get("name", "")
                                 _tool_input = block.get("input", {})
+                                _tool_id = str(block.get("id", ""))
+                                if _tool_id:
+                                    _tool_names_by_id[_tool_id] = _display_tool_name(_tool_name)
                                 emit("tool_start", tool_call={
-                                    "id": block.get("id", ""),
+                                    "id": _tool_id,
                                     "name": _display_tool_name(_tool_name),
                                     "input": json.dumps(_tool_input, ensure_ascii=False),
                                     "status": "running",
+                                })
+
+                    elif is_sdk_user_message(message):
+                        # Qwen 把工具执行结果作为 user/tool_result 消息返回。旧适配器
+                        # 完全忽略了它，导致 UI 永远只看见“Bash 开始”，也无法用结果
+                        # 事件刷新 LOOP 看门狗的活动时间。
+                        msg_dict = dict(message)
+                        msg_content = msg_dict.get("message", {}).get("content", [])
+                        if isinstance(msg_content, list):
+                            for block in msg_content:
+                                if not isinstance(block, dict) or block.get("type") != "tool_result":
+                                    continue
+                                raw_content = block.get("content", "")
+                                if isinstance(raw_content, str):
+                                    output = raw_content
+                                else:
+                                    try:
+                                        output = json.dumps(raw_content, ensure_ascii=False)
+                                    except Exception:
+                                        output = str(raw_content)
+                                emit("tool_result", tool_call={
+                                    "id": block.get("tool_use_id", ""),
+                                    "name": _tool_names_by_id.get(str(block.get("tool_use_id", "")), "Tool"),
+                                    "output": output,
+                                    "status": "error" if block.get("is_error") else "done",
+                                    "error": output if block.get("is_error") else "",
                                 })
 
                     elif is_sdk_partial_assistant_message(message):
@@ -725,8 +782,11 @@ class QwenCodeSdkBackend(ModelBackend):
                             block = event.get("content_block", {})
                             if block.get("type") == "tool_use":
                                 _saw_partial_content = True
+                                _tool_id = str(block.get("id", ""))
+                                if _tool_id:
+                                    _tool_names_by_id[_tool_id] = _display_tool_name(block.get("name", ""))
                                 emit("tool_start", tool_call={
-                                    "id": block.get("id", ""),
+                                    "id": _tool_id,
                                     "name": _display_tool_name(block.get("name", "")),
                                     "input": "",
                                     "status": "running",
@@ -828,6 +888,9 @@ class QwenCodeSdkBackend(ModelBackend):
                 emit("done")
 
         finally:
+            active_queries = getattr(self, "_active_queries", {})
+            if _active_result is not None and active_queries.get(session_id) is _active_result:
+                active_queries.pop(session_id, None)
             if _image_temp_dir:
                 shutil.rmtree(_image_temp_dir, ignore_errors=True)
                 try:

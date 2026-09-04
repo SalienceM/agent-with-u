@@ -21,12 +21,22 @@ test('standalone markdown html preserves rendered content and escapes metadata',
   assert.match(html, /<meta charset="utf-8">/);
   assert.match(html, /<title>guide&lt;script&gt;<\/title>/);
   assert.doesNotMatch(html, /<title>guide<script>/);
-  assert.match(html, /<h1>部署指南<\/h1>/);
+  assert.match(html, /<h1 id="awu-md-heading-1" tabindex="-1">部署指南<\/h1>/);
   assert.match(html, /<table>/);
   assert.match(html, /\.md-content pre/);
   assert.match(html, /@media print/);
   assert.match(html, /<main class="awu-markdown-export">/);
+  assert.match(html, /class="awu-reader-toc"/);
+  assert.match(html, /id="awu-toc-toggle"/);
+  assert.match(html, /id="awu-theme-toggle"/);
+  assert.match(html, /data-target="awu-md-heading-1"/);
+  assert.match(html, /id="awu-md-heading-1" tabindex="-1"/);
+  assert.match(html, /agentwithu\.markdownExport\.theme/);
   assert.match(html, /\.awu-markdown-export \.md-content th,/);
   assert.doesNotMatch(html, /\n\s*:root\s*\{/);
   assert.doesNotMatch(html, /\n\s*body\s*\{/);
+
+  const scripts = [...html.matchAll(/<script>([\s\S]*?)<\/script>/g)].map((match) => match[1]);
+  assert.equal(scripts.length, 2);
+  scripts.forEach((script) => assert.doesNotThrow(() => new Function(script)));
 });

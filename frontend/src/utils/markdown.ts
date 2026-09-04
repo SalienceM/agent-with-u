@@ -211,6 +211,54 @@ export function markdownToHtml(src: string): string {
   return `<div class="md-content">${restoreInlineDataImages(html, protectedSource.images)}</div>`;
 }
 
+export interface MarkdownOutlineItem {
+  id: string;
+  level: number;
+  title: string;
+}
+
+function decodeHeadingText(fragment: string): string {
+  const withoutTags = fragment.replace(/<[^>]*>/g, ' ');
+  if (typeof document !== 'undefined') {
+    const textarea = document.createElement('textarea');
+    textarea.innerHTML = withoutTags;
+    return textarea.value.replace(/\s+/g, ' ').trim();
+  }
+  return withoutTags
+    .replace(/&nbsp;/gi, ' ')
+    .replace(/&amp;/gi, '&')
+    .replace(/&lt;/gi, '<')
+    .replace(/&gt;/gi, '>')
+    .replace(/&quot;/gi, '"')
+    .replace(/&#(?:39|x27);/gi, "'")
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+/**
+ * 给一份已经渲染的 Markdown 文档注入稳定且唯一的标题锚点，并返回目录模型。
+ * 不在普通聊天气泡中默认注入 id，避免多个消息里的同名标题污染整页锚点。
+ */
+export function markdownHtmlWithOutline(renderedHtml: string): {
+  html: string;
+  outline: MarkdownOutlineItem[];
+} {
+  const outline: MarkdownOutlineItem[] = [];
+  let index = 0;
+  const html = (renderedHtml || '').replace(
+    /<h([1-6])\b([^>]*)>([\s\S]*?)<\/h\1>/gi,
+    (_whole, rawLevel: string, rawAttrs: string, body: string) => {
+      index += 1;
+      const level = Number(rawLevel);
+      const id = `awu-md-heading-${index}`;
+      const attrs = String(rawAttrs || '').replace(/\s+id=(?:"[^"]*"|'[^']*')/i, '');
+      outline.push({ id, level, title: decodeHeadingText(body) || `未命名标题 ${index}` });
+      return `<h${level}${attrs} id="${id}" tabindex="-1">${body}</h${level}>`;
+    },
+  );
+  return { html, outline };
+}
+
 // ── 导出工具函数（不变）───────────────────────────────────────
 export function messagesToMarkdown(
   messages: Array<{ role: string; content: string; timestamp?: number }>,

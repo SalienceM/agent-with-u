@@ -25,7 +25,10 @@ import {
  * 右上角可切换「Hack 模式」——整份状态以 terminal 风格的等宽文本呈现。
  */
 
-interface LoopStep { index: number; mode: string; access?: 'read' | 'write'; desc: string; status: string; output: string; startedAt?: number; endedAt?: number; }
+interface LoopStep {
+  index: number; mode: string; access?: 'read' | 'write'; desc: string; status: string; output: string;
+  startedAt?: number; endedAt?: number; attempts?: number; recoveryNotes?: string[];
+}
 interface LoopAnalysis {
   score: number; notes: string; trend: string;
   optimizationPotential: number; challenges: string;
@@ -1726,8 +1729,18 @@ const StepRow: React.FC<{ step: LoopStep; live?: string }> = ({ step, live }) =>
         <span style={{ fontSize: 13, color: description ? 'var(--theme-text)' : '#f59e0b', flex: 1 }}>
           {step.index}. {description || '步骤说明缺失（旧版本规划解析异常）'}
         </span>
+        {!!step.attempts && step.attempts > 1 && (
+          <span style={{ fontSize: 10.5, color: '#d29922', background: '#d2992218', border: '1px solid #d2992240', borderRadius: 999, padding: '1px 7px' }}>
+            自动恢复 {step.attempts - 1} 次
+          </span>
+        )}
         {canExpand && <span style={{ fontSize: 11, color: 'var(--theme-text-muted)' }}>{open ? '收起' : '展开'}</span>}
       </div>
+      {!!step.recoveryNotes?.length && (
+        <div style={{ marginLeft: 22, marginTop: 4, color: '#d29922', fontSize: 11, lineHeight: 1.45 }}>
+          {step.recoveryNotes[step.recoveryNotes.length - 1]}
+        </div>
+      )}
       {open && (
         body && step.status === 'running'
           ? <div style={{ marginLeft: 22, marginTop: 4 }}><Live text={body} /></div>

@@ -20,6 +20,17 @@ class LoopCoreTests(unittest.TestCase):
         step = LoopStep(index=1, mode="concurrent", access="read", desc="inspect")
         self.assertEqual(LoopStep.from_dict(step.to_dict()).access, "read")
 
+    def test_loop_step_recovery_metadata_round_trips(self):
+        step = LoopStep(
+            index=2,
+            desc="verify",
+            attempts=2,
+            recovery_notes=["第一次无活动，已自动恢复"],
+        )
+        restored = LoopStep.from_dict(step.to_dict())
+        self.assertEqual(restored.attempts, 2)
+        self.assertEqual(restored.recovery_notes, ["第一次无活动，已自动恢复"])
+
     def test_manual_takeover_state_and_transcript_round_trip(self):
         record = LoopRecord(
             seq=2,
