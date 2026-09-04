@@ -24,6 +24,7 @@ interface ConfigDraft {
   stableManifestUrl: string;
   qshell: string;
   requireSignature: boolean;
+  retentionCount: number;
 }
 
 const EMPTY_CONFIG: ConfigDraft = {
@@ -37,6 +38,7 @@ const EMPTY_CONFIG: ConfigDraft = {
   stableManifestUrl: '',
   qshell: 'qshell',
   requireSignature: false,
+  retentionCount: 0,
 };
 
 function releaseExecutorPreferenceKey(): string {
@@ -87,6 +89,7 @@ function toDraft(config?: ReleaseCenterConfig): ConfigDraft {
     stableManifestUrl: config.stableManifestUrl || '',
     qshell: config.qshell || 'qshell',
     requireSignature: !!config.requireSignature,
+    retentionCount: Math.max(0, Math.min(100, Number(config.retentionCount || 0))),
   };
 }
 
@@ -274,6 +277,7 @@ export const ReleaseCenter: React.FC<Props> = ({ onClose, initialExecKey = '' })
     stableManifestUrl: draft.stableManifestUrl.trim(),
     qshell: draft.qshell.trim() || 'qshell',
     requireSignature: draft.requireSignature,
+    retentionCount: Math.max(0, Math.min(100, Math.trunc(Number(draft.retentionCount) || 0))),
   });
 
   const saveConfig = async (quiet = false): Promise<boolean> => {
@@ -374,7 +378,11 @@ export const ReleaseCenter: React.FC<Props> = ({ onClose, initialExecKey = '' })
     if (!plan || plan.blockers.length || !acknowledged) return;
     const target = `${plan.channel} · ${plan.candidate.buildId || candidate?.buildId}`;
     if (!window.confirm(
-      `正式发布 ${target}\n\n将上传 ${plan.uploadJobs.length} 个制品，并在最后切换 ${plan.manifestKey}。\n此操作会让节点看到新版本，确定继续吗？`,
+      `正式发布 ${target}\n\n将上传 ${plan.uploadJobs.length} 个制品，并在最后切换 ${plan.manifestKey}。`
+      + (plan.retentionCount > 0
+        ? `\n公网回读确认后，将保留最近 ${plan.retentionCount} 个版本并清理更老的已登记云端对象；本地安装包不会删除。`
+        : '')
+      + '\n此操作会让节点看到新版本，确定继续吗？',
     )) return;
     setBusy('publish');
     setNotice('');
@@ -798,6 +806,22 @@ export const ReleaseCenter: React.FC<Props> = ({ onClose, initialExecKey = '' })
                     placeholder="stable" style={inputStyle} />
                 </label>
                 <label style={fieldStyle}>
+                  <span>云端版本保留数量</span>
+                  <input type="number" min={0} max={100} step={1} value={draft.retentionCount}
+                    onChange={(event) => {
+                      setDraft({
+                        ...draft,
+                        retentionCount: Math.max(0, Math.min(100, Math.trunc(Number(event.target.value) || 0))),
+                      });
+                      invalidatePlan();
+                    }}
+                    style={inputStyle} />
+                  <small style={{ color: 'var(--theme-text-muted)', fontSize: 9, lineHeight: 1.45 }}>
+                    0 表示关闭。发布成功且公网清单确认后，按当前 Bucket、Channel 和 manifest key 保留最近 N 个；
+                    只清理发布中心记录的云端对象，不删除本地安装包。
+                  </small>
+                </label>
+                <label style={fieldStyle}>
                   <span>七牛 Bucket</span>
                   <input value={draft.qiniuBucket} onChange={(event) => { setDraft({ ...draft, qiniuBucket: event.target.value }); invalidatePlan(); }}
                     placeholder="your-bucket" style={inputStyle} />
@@ -884,6 +908,11 @@ export const ReleaseCenter: React.FC<Props> = ({ onClose, initialExecKey = '' })
                       <div style={{ color: 'var(--theme-text-muted)', fontSize: 9 }}>
                         {item.artifactCount} 个制品 · {formatDate(item.publishedAt)}
                       </div>
+                      {item.cleanupError && (
+                        <div style={{ marginTop: 4, color: '#d29922', fontSize: 9, lineHeight: 1.45 }}>
+                          ⚠ 旧对象清理未完成，将在下次发布时重试
+                        </div>
+                      )}
                       {item.manifestUrl && <a href={item.manifestUrl} target="_blank" rel="noreferrer"
                         style={{ marginTop: 4, fontSize: 9, color: 'var(--theme-accent)', wordBreak: 'break-all' }}>
                         {item.manifestUrl}

@@ -239,6 +239,8 @@ def _default_config() -> dict[str, Any]:
         "stableManifestUrl": "",
         "qshell": "qshell",
         "requireSignature": False,
+        # 0 = 不自动清理。启用后只清理由本发布中心记录过 objectKeys 的旧版本。
+        "retentionCount": 0,
     }
 
 
@@ -667,6 +669,14 @@ class ReleaseCenterManager:
                 current[field] = value
             if "requireSignature" in patch:
                 current["requireSignature"] = bool(patch.get("requireSignature"))
+            if "retentionCount" in patch:
+                try:
+                    retention_count = int(patch.get("retentionCount") or 0)
+                except (TypeError, ValueError) as error:
+                    raise ReleaseCenterError("版本保留数量必须是 0 到 100 的整数") from error
+                if retention_count < 0 or retention_count > 100:
+                    raise ReleaseCenterError("版本保留数量必须在 0 到 100 之间；0 表示不自动清理")
+                current["retentionCount"] = retention_count
             current["channel"] = _safe_id(current.get("channel"), "stable")[:40]
             current["prefix"] = _safe_key(current.get("prefix"), "agentwithu/releases") or "agentwithu/releases"
             current["manifestKey"] = _safe_key(
@@ -943,7 +953,7 @@ class ReleaseCenterManager:
         candidate = self._candidate(candidate_id)
         config = {**self._config(), **{key: value for key, value in (options or {}).items() if key in {
             "channel", "baseUrl", "qiniuBucket", "prefix", "manifestKey",
-            "stableManifestUrl", "requireSignature",
+            "stableManifestUrl", "requireSignature", "retentionCount",
         }}}
         channel = _safe_id(config.get("channel"), "stable")[:40]
         prefix = _safe_key(config.get("prefix"), "agentwithu/releases") or "agentwithu/releases"
@@ -981,6 +991,12 @@ class ReleaseCenterManager:
             warnings.append("发布清单将不带 HMAC 签名")
         if candidate.get("dirty"):
             warnings.append(f"构建时工作区存在 {candidate.get('dirtyFiles') or 0} 个未提交改动")
+        retention_count = max(0, min(100, int(config.get("retentionCount") or 0)))
+        if retention_count > 0:
+            warnings.append(
+                f"发布成功并从公网确认新清单后，将自动保留此存储范围最近 {retention_count} 个版本；"
+                "只删除发布中心已登记的七牛对象，不删除本地安装包"
+            )
 
         immutable_prefix = f"{prefix}/{_safe_id(candidate.get('buildId'), candidate_id)}"
         manifest_artifacts: list[dict[str, Any]] = []
@@ -1098,6 +1114,7 @@ class ReleaseCenterManager:
             "comparison": comparison,
             "signatureConfigured": bool(signing_key),
             "requireSignature": bool(config.get("requireSignature")),
+            "retentionCount": retention_count,
             "createdAt": _now(),
         }
         fingerprint_source = dict(plan)
@@ -1152,7 +1169,8 @@ class ReleaseCenterManager:
                 "status": "queued",
                 "progress": 0,
                 "step": 0,
-                "totalSteps": len(plan.get("uploadJobs") or []) + 2,
+                "totalSteps": len(plan.get("uploadJobs") or []) + 2
+                + (1 if int(plan.get("retentionCount") or 0) > 0 else 0),
                 "message": "等待发布任务启动",
                 "log": [],
                 "createdAt": _now(),
@@ -1309,6 +1327,139 @@ class ReleaseCenterManager:
             job_id, file_size, file_size, completed_bytes, total_bytes, force=True,
         )
 
+    async def _delete_object(
+        self, job_id: str, qshell: str, bucket: str, key: str,
+    ) -> None:
+        """Delete one explicitly recorded Qiniu object without ever listing the bucket."""
+        kwargs: dict[str, Any] = {
+            "stdout": asyncio.subprocess.PIPE,
+            "stderr": asyncio.subprocess.PIPE,
+        }
+        if os.name == "nt":
+            kwargs["creationflags"] = 0x08000000 | 0x00000200
+        else:
+            kwargs["start_new_session"] = True
+        command = [qshell]
+        if self._job_account_modes.get(job_id) == "workspace":
+            command.append("-L")
+            kwargs["cwd"] = str(self.qshell_workspace)
+        command.extend(["delete", bucket, key])
+        process = await asyncio.create_subprocess_exec(*command, **kwargs)
+        self._processes[job_id] = process
+        try:
+            stdout, stderr = await process.communicate()
+        finally:
+            self._processes.pop(job_id, None)
+        output = stdout.decode("utf-8", errors="replace")[-6_000:].strip()
+        error = stderr.decode("utf-8", errors="replace")[-6_000:].strip()
+        if process.returncode != 0:
+            raise ReleaseCenterError(error or output or f"qshell delete 退出码 {process.returncode}")
+        self._append_log(job_id, f"已删除旧版本对象：{key}")
+
+    async def _apply_retention(
+        self, job_id: str, qshell: str, current_history_id: str, retention_count: int,
+    ) -> dict[str, int]:
+        """Prune only tracked immutable objects in the current release storage scope."""
+        retention_count = max(0, min(100, int(retention_count or 0)))
+        if retention_count <= 0:
+            return {"removedReleases": 0, "deletedObjects": 0, "failedObjects": 0}
+
+        with self._guard():
+            state = self._load_state()
+            current = next(
+                (item for item in state["history"] if item.get("id") == current_history_id), None,
+            )
+            if not current:
+                raise ReleaseCenterError("无法读取本次发布记录，已跳过历史版本清理")
+            scope = (
+                str(current.get("qiniuBucket") or ""),
+                str(current.get("channel") or ""),
+                str(current.get("manifestKey") or ""),
+            )
+            scoped = sorted(
+                (
+                    dict(item) for item in state["history"]
+                    if (
+                        str(item.get("qiniuBucket") or ""),
+                        str(item.get("channel") or ""),
+                        str(item.get("manifestKey") or ""),
+                    ) == scope
+                ),
+                key=lambda item: float(item.get("publishedAt") or 0),
+                reverse=True,
+            )
+
+        retained = scoped[:retention_count]
+        stale = scoped[retention_count:]
+        protected_keys = {
+            str(key)
+            for item in retained
+            for key in (item.get("objectKeys") or [])
+            if str(key)
+        }
+        mutable_manifest_key = scope[2]
+        deleted_objects = 0
+        failed_objects = 0
+        removed_release_ids: set[str] = set()
+        remaining_by_release: dict[str, list[str]] = {}
+        errors_by_release: dict[str, list[str]] = {}
+
+        for release in stale:
+            release_id = str(release.get("id") or "")
+            recorded_keys = list(dict.fromkeys(
+                str(key).strip() for key in (release.get("objectKeys") or []) if str(key).strip()
+            ))
+            # 老版本没有 objectKeys 时无法证明哪些云对象属于它；宁可保留记录也不猜路径。
+            if not release_id or not recorded_keys:
+                continue
+            remaining: list[str] = []
+            errors: list[str] = []
+            for raw_key in recorded_keys:
+                safe_key = _safe_key(raw_key)
+                if not safe_key or safe_key != raw_key.strip("/ "):
+                    remaining.append(raw_key)
+                    errors.append(f"对象 key 不安全，已跳过：{raw_key}")
+                    failed_objects += 1
+                    continue
+                if safe_key == mutable_manifest_key or safe_key in protected_keys:
+                    # mutable manifest 永不删除；被保留版本共享的对象继续由保留版本持有。
+                    continue
+                try:
+                    await self._delete_object(job_id, qshell, scope[0], safe_key)
+                    deleted_objects += 1
+                except Exception as error:
+                    remaining.append(safe_key)
+                    detail = f"{safe_key}：{error}"
+                    errors.append(detail)
+                    self._append_log(job_id, f"旧版本对象清理失败：{detail}")
+                    failed_objects += 1
+            if remaining:
+                remaining_by_release[release_id] = remaining
+                errors_by_release[release_id] = errors
+            else:
+                removed_release_ids.add(release_id)
+
+        if removed_release_ids or remaining_by_release:
+            with self._guard():
+                state = self._load_state()
+                state["history"] = [
+                    item for item in state["history"]
+                    if str(item.get("id") or "") not in removed_release_ids
+                ]
+                for item in state["history"]:
+                    release_id = str(item.get("id") or "")
+                    if release_id in remaining_by_release:
+                        item["objectKeys"] = remaining_by_release[release_id]
+                        item["cleanupError"] = "；".join(errors_by_release[release_id])[:4_000]
+                        item["cleanupAttemptedAt"] = _now()
+                self._save_state(state)
+
+        return {
+            "removedReleases": len(removed_release_ids),
+            "deletedObjects": deleted_objects,
+            "failedObjects": failed_objects,
+        }
+
     async def _refresh_cdn(self, job_id: str, qshell: str, manifest_url: str) -> bool:
         """Ask Qiniu to invalidate the mutable channel manifest before public verification."""
         if not manifest_url.startswith(("https://", "http://")):
@@ -1430,7 +1581,8 @@ class ReleaseCenterManager:
             manifest_size = manifest_path.stat().st_size
             total_bytes = sum(int(item.get("size") or 0) for item in upload_jobs) + manifest_size * 2
             completed_bytes = 0
-            total = len(upload_jobs) + 2
+            retention_count = max(0, min(100, int(plan.get("retentionCount") or 0)))
+            total = len(upload_jobs) + 2 + (1 if retention_count > 0 else 0)
             step = 0
             self._update_job(job_id, {
                 "uploadedBytes": 0,
@@ -1512,20 +1664,73 @@ class ReleaseCenterManager:
                     "buildId": (plan.get("candidate") or {}).get("buildId"),
                     "version": (plan.get("candidate") or {}).get("version"),
                     "channel": plan.get("channel"),
+                    "qiniuBucket": bucket,
+                    "manifestKey": plan.get("manifestKey"),
                     "manifestUrl": plan.get("manifestUrl"),
                     "artifactCount": len(plan.get("uploadJobs") or []),
+                    # 仅这些经过本次冻结计划明确记录的不可变对象允许自动清理。
+                    # channel manifest 是可变指针，故意不进入此列表。
+                    "objectKeys": [
+                        *[str(item.get("key") or "") for item in upload_jobs if item.get("key")],
+                        str(plan.get("versionedManifestKey") or ""),
+                    ],
                     "publishedAt": finished,
                 }
                 state["history"] = [history, *state["history"]]
                 job = next((item for item in state["jobs"] if item.get("id") == job_id), None)
                 if job:
                     job.update({
-                        "status": "succeeded", "progress": 100, "step": total,
-                        "message": "正式发布完成，channel manifest 已切换",
-                        "manifestUrl": plan.get("manifestUrl"), "endedAt": finished,
+                        "message": (
+                            f"新版本已发布，正在清理旧版本（保留最近 {retention_count} 个）"
+                            if retention_count > 0 else "正式发布完成，channel manifest 已切换"
+                        ),
+                        "manifestUrl": plan.get("manifestUrl"),
                         "updatedAt": finished,
                     })
                 self._save_state(state)
+
+            cleanup = {"removedReleases": 0, "deletedObjects": 0, "failedObjects": 0}
+            if retention_count > 0:
+                step += 1
+                self._update_job(job_id, {
+                    "step": step,
+                    "message": f"清理旧版本（保留最近 {retention_count} 个）",
+                    "currentFileName": "",
+                    "currentFileBytes": 0,
+                    "currentFileSize": 0,
+                })
+                try:
+                    cleanup = await self._apply_retention(
+                        job_id, qshell, str(history["id"]), retention_count,
+                    )
+                except Exception as error:
+                    # stable manifest 已从公网回读确认，此时清理失败不能把成功发布
+                    # 伪报成失败；保留旧记录，下一次发布会再次尝试。
+                    cleanup = {"removedReleases": 0, "deletedObjects": 0, "failedObjects": 1}
+                    self._append_log(job_id, f"旧版本自动清理失败，已保留旧版本记录：{error}")
+
+            cleanup_failed = int(cleanup.get("failedObjects") or 0)
+            removed_releases = int(cleanup.get("removedReleases") or 0)
+            deleted_objects = int(cleanup.get("deletedObjects") or 0)
+            if retention_count <= 0:
+                final_message = "正式发布完成，channel manifest 已切换"
+            elif cleanup_failed:
+                final_message = (
+                    f"正式发布完成；已清理 {removed_releases} 个旧版本，"
+                    f"但有 {cleanup_failed} 个对象清理失败，可查看任务日志"
+                )
+            else:
+                final_message = (
+                    f"正式发布完成；保留最近 {retention_count} 个版本，"
+                    f"已清理 {removed_releases} 个旧版本 / {deleted_objects} 个对象"
+                )
+            self._update_job(job_id, {
+                "status": "succeeded", "progress": 100, "step": total,
+                "message": final_message,
+                "cleanup": cleanup,
+                "manifestUrl": plan.get("manifestUrl"), "endedAt": _now(),
+                "currentFileName": "", "currentFileBytes": 0, "currentFileSize": 0,
+            })
         except asyncio.CancelledError:
             self._update_job(job_id, {
                 "status": "cancelled", "message": "发布已取消；未确认切换 channel manifest",

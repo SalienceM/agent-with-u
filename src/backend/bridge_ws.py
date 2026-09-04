@@ -4929,24 +4929,40 @@ class BridgeWS:
         self._loop_save(state)
         self._emit_loop_updated(state)
 
-    def _rpc_loopTakeover(self, session_id: str) -> str:
-        """Switch an idle loop session to ordinary chat and start a manual pass."""
+    def _rpc_loopTakeover(self, session_id: str, goal: str = "") -> str:
+        """Switch an idle LOOP to ordinary chat and start a manual pass.
+
+        在 loopout 调用时会原子地开启新一轮再接管，避免用户先开启自动轮、
+        再赶在模型启动前点击接管的竞态。
+        """
         state = self._loop_state(session_id)
         session = self._active_sessions.get(session_id) or self._session_store.load(session_id)
         if not state or not session or session.session_type != "loop":
             return json.dumps({"status": "error", "message": "找不到 LOOP 会话"}, ensure_ascii=False)
-        payload = self._loop_payload(state, compact=True)
         if state.control_mode == "manual":
             self._mirror_loop_control_mode(session, "manual")
             return json.dumps({"status": "ok", "controlMode": "manual"}, ensure_ascii=False)
-        if state.stage != STAGE_EXECUTE:
-            return json.dumps({"status": "error", "message": "只有执行阶段可以人工接管"}, ensure_ascii=False)
+        if state.stage not in (STAGE_EXECUTE, STAGE_OUT):
+            return json.dumps({"status": "error", "message": "请先封口 loopidea，再开启人工轮"}, ensure_ascii=False)
+
+        from_loopout = state.stage == STAGE_OUT
+        payload = self._loop_payload(state, compact=True)
         if payload.get("running"):
-            return json.dumps({"status": "error", "message": "LOOP 正在运行，停止后才能接管"}, ensure_ascii=False)
-        if payload.get("resumable"):
+            message = "上一轮仍在收尾，请稍后再开启人工轮" if from_loopout else "LOOP 正在运行，停止后才能接管"
+            return json.dumps({"status": "error", "message": message}, ensure_ascii=False)
+        if not from_loopout and payload.get("resumable"):
             return json.dumps({"status": "error", "message": "存在未完成的 LOOP，请先继续完成或丢弃"}, ensure_ascii=False)
         if self._session_is_streaming(session):
             return json.dumps({"status": "error", "message": "当前回答尚未结束"}, ensure_ascii=False)
+
+        if from_loopout:
+            # 兼容重启后遗留的 loopout + 未封存记录；人工轮属于新 round，不能错误
+            # 地接续上一轮的断点或沿用上一轮风险曲线。
+            last = state.loops[-1] if state.loops else None
+            if (last and last.round == state.round
+                    and not last.completed and not last.error):
+                self._mark_loop_interrupted(last, "上一轮未完成，开启人工轮时已封存")
+            self._apply_loop_continue(state, goal)
 
         state.auto = False
         seq = max((item.seq for item in state.loops), default=0) + 1
@@ -4972,7 +4988,10 @@ class BridgeWS:
         self._loop_save(state)
         self._mirror_loop_control_mode(session, "manual")
         self._emit_loop_updated(state)
-        return json.dumps({"status": "ok", "controlMode": "manual", "seq": seq}, ensure_ascii=False)
+        return json.dumps({
+            "status": "ok", "controlMode": "manual", "seq": seq,
+            "stage": state.stage, "round": state.round,
+        }, ensure_ascii=False)
 
     def _rpc_loopRelease(self, session_id: str) -> str:
         """Seal the manual pass and return ownership to the LOOP panel."""

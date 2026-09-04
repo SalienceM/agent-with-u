@@ -190,6 +190,49 @@ class LoopLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(state.control_mode, "loop")
         self.assertEqual(state.loops, [])
 
+    async def test_loopout_can_open_a_new_manual_round_atomically(self) -> None:
+        sid = "loopout-manual-round"
+        state = LoopState(
+            session_id=sid,
+            stage=STAGE_OUT,
+            round=3,
+            goal="original goal",
+            auto=True,
+            loops=[LoopRecord(seq=7, kind="auto", round=3, completed=True)],
+        )
+        bridge, session = self._bridge(state)
+        session.session_type = "loop"
+        session.messages = []
+        session.backend_id = "qwen-enterprise"
+        session.working_dir = "C:/workspace"
+        bridge._session_is_streaming = Mock(return_value=False)
+        bridge._loop_context_digest = Mock(return_value="round 3 output digest")
+        bridge._resolved_runtime = Mock(return_value={"model": "qwen-enterprise-model"})
+        bridge._session_runtime = Mock(return_value={})
+        bridge._mirror_loop_control_mode = Mock()
+
+        with patch("src.backend.bridge_ws.git_snapshot", return_value="checkpoint"):
+            result = json.loads(bridge._rpc_loopTakeover(sid, "human follow-up goal"))
+
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["controlMode"], "manual")
+        self.assertEqual(result["stage"], STAGE_EXECUTE)
+        self.assertEqual(result["round"], 4)
+        self.assertEqual(state.stage, STAGE_EXECUTE)
+        self.assertEqual(state.round, 4)
+        self.assertEqual(state.goal, "human follow-up goal")
+        self.assertFalse(state.auto)
+        self.assertEqual(state.control_mode, "manual")
+        manual = state.loops[-1]
+        self.assertEqual(manual.kind, "manual")
+        self.assertEqual(manual.round, 4)
+        self.assertEqual(manual.seq, 8)
+        self.assertEqual(manual.manual_context, "round 3 output digest")
+        self.assertEqual(manual.backends["execute"], "qwen-enterprise")
+        bridge._loop_save.assert_called_once_with(state)
+        bridge._mirror_loop_control_mode.assert_called_once_with(session, "manual")
+        bridge._emit_loop_updated.assert_called_once_with(state)
+
     async def test_manual_release_obeys_authoritative_running_task(self) -> None:
         sid = "manual-real-running"
         record = LoopRecord(seq=1, kind="manual", round=1)

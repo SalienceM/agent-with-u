@@ -187,6 +187,8 @@ export interface ReleaseCenterConfig {
   stableManifestUrl: string;
   qshell: string;
   requireSignature: boolean;
+  /** 0 = 不自动清理；大于 0 时按存储范围保留最近 N 个已发布版本。 */
+  retentionCount: number;
   qshellAvailable: boolean;
   qiniuAccountConfigured: boolean;
   qiniuAccountMessage: string;
@@ -217,6 +219,7 @@ export interface ReleaseJob {
   updatedAt: number;
   startedAt?: number;
   endedAt?: number;
+  cleanup?: { removedReleases: number; deletedObjects: number; failedObjects: number };
 }
 
 export interface ReleaseHistoryItem {
@@ -230,6 +233,11 @@ export interface ReleaseHistoryItem {
   manifestUrl: string;
   artifactCount: number;
   publishedAt: number;
+  qiniuBucket?: string;
+  manifestKey?: string;
+  objectKeys?: string[];
+  cleanupError?: string;
+  cleanupAttemptedAt?: number;
 }
 
 export interface ReleaseCenterState {
@@ -268,6 +276,7 @@ export interface ReleasePlan {
     }>;
   };
   signatureConfigured: boolean;
+  retentionCount: number;
   requireSignature: boolean;
   fingerprint: string;
   createdAt: number;
@@ -2903,9 +2912,9 @@ export const api = {
     try { return JSON.parse(result); } catch { return { status: 'error', threads: [], message: '响应格式错误' }; }
   },
 
-  /** Idle LOOP -> ordinary chat. Starts one persisted manual loop pass. */
-  async loopTakeover(sessionId: string): Promise<{ status: string; controlMode?: string; seq?: number; message?: string }> {
-    const result = await call('loopTakeover', sessionId);
+  /** Idle loopexecute/loopout -> ordinary chat. Starts one persisted manual pass; loopout opens a new round. */
+  async loopTakeover(sessionId: string, goal: string = ''): Promise<{ status: string; controlMode?: string; seq?: number; stage?: string; round?: number; message?: string }> {
+    const result = await call('loopTakeover', sessionId, goal);
     try { return JSON.parse(result); } catch { return { status: 'error', message: '响应解析失败' }; }
   },
 
@@ -3645,7 +3654,7 @@ export const api = {
       config: {
         projectRoot: '', scanRoots: [], channel: 'stable', baseUrl: '', qiniuBucket: '',
         prefix: 'agentwithu/releases', manifestKey: 'agentwithu/releases/stable/manifest.json',
-        stableManifestUrl: '', qshell: 'qshell', requireSignature: false,
+        stableManifestUrl: '', qshell: 'qshell', requireSignature: false, retentionCount: 0,
         qshellAvailable: false, qiniuAccountConfigured: false, qiniuAccountMessage: '',
         signingKeyConfigured: false, dataRoot: '',
       },
@@ -3662,7 +3671,7 @@ export const api = {
     return parseRpcObject(result, {
       status: 'error', message: '发布配置保存失败', projectRoot: '', scanRoots: [],
       channel: 'stable', baseUrl: '', qiniuBucket: '', prefix: '', manifestKey: '',
-      stableManifestUrl: '', qshell: 'qshell', requireSignature: false,
+      stableManifestUrl: '', qshell: 'qshell', requireSignature: false, retentionCount: 0,
       qshellAvailable: false, qiniuAccountConfigured: false, qiniuAccountMessage: '',
       signingKeyConfigured: false, dataRoot: '',
     });
@@ -4353,7 +4362,7 @@ function mockDispatch(method: string, params: any[]): any {
         projectRoot: '', scanRoots: ['src-tauri/target/release/bundle', 'dist'],
         channel: 'stable', baseUrl: '', qiniuBucket: '', prefix: 'agentwithu/releases',
         manifestKey: 'agentwithu/releases/stable/manifest.json', stableManifestUrl: '',
-        qshell: 'qshell', requireSignature: false, qshellAvailable: false,
+        qshell: 'qshell', requireSignature: false, retentionCount: 0, qshellAvailable: false,
         qiniuAccountConfigured: false, qiniuAccountMessage: '尚未配置七牛账号',
         signingKeyConfigured: false, dataRoot: '',
       },

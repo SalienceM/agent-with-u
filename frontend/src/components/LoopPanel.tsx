@@ -324,15 +324,18 @@ export const LoopPanel: React.FC<LoopPanelProps> = ({
     setBusy(false);
   }, [sessionId]);
 
-  const takeover = useCallback(async () => {
+  const takeover = useCallback(async (nextRoundGoal: string = '') => {
+    const fromLoopout = state?.stage === 'loopout';
     if (!window.confirm(
-      '切换到普通会话进行人工接管？\n\n人工对话和工具操作会作为一轮 Manual LOOP 留在时间线中，完成后可交还 LOOP。'
+      fromLoopout
+        ? '开启新一轮并切换到普通会话进行人工处理？\n\n本轮会记录为 Manual LOOP；完成后可交还给自动 LOOP。'
+        : '切换到普通会话进行人工接管？\n\n人工对话和工具操作会作为一轮 Manual LOOP 留在时间线中，完成后可交还 LOOP。'
     )) return;
     setBusy(true);
-    const r = await api.loopTakeover(sessionId);
+    const r = await api.loopTakeover(sessionId, fromLoopout ? nextRoundGoal.trim() : '');
     setBusy(false);
     if (r.status !== 'ok' && r.message) alert(r.message);
-  }, [sessionId]);
+  }, [sessionId, state?.stage]);
 
   const discardLoop = useCallback(async () => {
     // 丢弃目标：正在跑的那次（或最后一次）
@@ -440,7 +443,7 @@ export const LoopPanel: React.FC<LoopPanelProps> = ({
                   <MetricBar state={stateForView} />
                   {stateForView.stage === 'loopexecute' && !inspectOnly && (
                     <div style={{ display: 'flex', justifyContent: 'flex-end', marginBottom: 10 }}>
-                      <button onClick={takeover} disabled={busy || !stateForView.canTakeover}
+                      <button onClick={() => void takeover()} disabled={busy || !stateForView.canTakeover}
                         style={{ ...btn, borderColor: '#d2992255', color: '#d29922', opacity: stateForView.canTakeover ? 1 : 0.5 }}>
                         ✋ 人工接管
                       </button>
@@ -461,7 +464,7 @@ export const LoopPanel: React.FC<LoopPanelProps> = ({
                     selectedSeq={selectedSeq} setSelectedSeq={selectLoop}
                     onRun={runIteration} onAdvanceOut={advanceOut} onSetAuto={setAuto}
                     onAddAddon={addAddon} onRemoveAddon={removeAddon} onEditAddon={editAddon} onContinue={continueRound}
-                    onDiscard={discardLoop} onTakeover={takeover}
+                    onDiscard={discardLoop} onTakeover={(goal = '') => void takeover(goal)}
                     running={running} busy={busy}
                     goalDraft={goalDraft} setGoalDraft={setGoalDraft} onSaveGoal={saveGoal}
                     onRefineGoal={refineGoal} inspectOnly={inspectOnly}
@@ -1053,11 +1056,12 @@ const AddonHistoryCard: React.FC<{ addons: Addon[]; loops: LoopRecord[] }> = ({ 
 
 // ══ loopout 引导：本轮产出 + 开启新一轮 ════════════════════════
 const LoopOutBanner: React.FC<{
-  state: LoopStateT; onContinue: (goal: string) => void; busy: boolean;
+  state: LoopStateT; onContinue: (goal: string) => void;
+  onTakeover: (goal: string) => void; busy: boolean;
   onSetAuto: (on: boolean) => void;
   onRefineGoal: (hint: string, images?: ImageAttachment[]) => Promise<{ status: string; goal?: string; message?: string }>;
 }> =
-  ({ state, onContinue, busy, onSetAuto, onRefineGoal }) => {
+  ({ state, onContinue, onTakeover, busy, onSetAuto, onRefineGoal }) => {
     const [goal, setGoal] = useState(state.goal || '');
     const [editing, setEditing] = useState(false);
     const [refineOpen, setRefineOpen] = useState(false);
@@ -1125,8 +1129,22 @@ const LoopOutBanner: React.FC<{
           >
             {state.running ? '⏹ 停止上一轮并开启新一轮' : `▶ 开启新一轮（第 ${state.round + 1} 轮 loopexecute）`}
           </button>
+          <button
+            onClick={() => onTakeover(goal.trim())}
+            disabled={busy || state.running}
+            style={{
+              ...btn,
+              borderColor: '#d2992266', color: '#d29922',
+              background: '#d2992212', opacity: (busy || state.running) ? 0.5 : 1,
+            }}
+            title={state.running
+              ? '上一轮仍在收尾，完成后才可开启人工轮'
+              : `开启第 ${state.round + 1} 轮并直接切到普通对话；本轮记为 Manual LOOP`}
+          >
+            ✋ 开启人工轮（第 {state.round + 1} 轮）
+          </button>
           <span style={{ fontSize: 11.5, color: 'var(--theme-text-muted)' }}>
-            可先确认 Auto，再开启新一轮
+            自动轮沿用 Auto 设置；人工轮会自动关闭 Auto
           </span>
         </div>
       </div>
@@ -1356,7 +1374,7 @@ const ExecuteStage: React.FC<{
   onRun: () => void; onAdvanceOut: () => void; onSetAuto: (on: boolean) => void;
   onAddAddon: (text: string, images?: ImageAttachment[]) => void; onRemoveAddon: (id: string) => void;
   onEditAddon: (id: string, text: string, images?: any[]) => Promise<{ status: string; message?: string }>;
-  onContinue: (goal: string) => void; onDiscard: () => void; onTakeover: () => void;
+  onContinue: (goal: string) => void; onDiscard: () => void; onTakeover: (goal?: string) => void;
   running: boolean; busy: boolean;
   goalDraft: string; setGoalDraft: (v: string) => void; onSaveGoal: () => void;
   onRefineGoal: (hint: string, images?: ImageAttachment[]) => Promise<{ status: string; goal?: string; message?: string }>;
@@ -1392,7 +1410,7 @@ const ExecuteStage: React.FC<{
             {running ? '⏹ 停止并进入 loopout' : '⏹ 进入 loopout'}
           </button>
           <button
-            onClick={onTakeover}
+            onClick={() => onTakeover()}
             disabled={busy || !state.canTakeover}
             style={{ ...btn, borderColor: '#d2992255', color: '#d29922', opacity: state.canTakeover ? 1 : 0.5 }}
             title={state.resumable ? '存在未完成的 LOOP，请先继续或丢弃' : running ? 'LOOP 运行中不能接管' : '切换到普通会话；人工操作记为一轮 Manual LOOP'}
@@ -1413,7 +1431,8 @@ const ExecuteStage: React.FC<{
         </div>
       )}
       {/* loopout：不是终点 —— 展示本轮产出小结 + 开启新一轮的引导 */}
-      {isOut && !inspectOnly && <LoopOutBanner state={state} onContinue={onContinue} busy={busy}
+      {isOut && !inspectOnly && <LoopOutBanner state={state} onContinue={onContinue}
+        onTakeover={(goal) => onTakeover(goal)} busy={busy}
         onSetAuto={onSetAuto} onRefineGoal={onRefineGoal} />}
 
       {/* ★ 执行中补充（addon）：不影响当前 loop，下一次 loop 纳入并完成 */}

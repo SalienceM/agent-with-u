@@ -67,6 +67,17 @@ class ReleaseCenterTests(unittest.TestCase):
             self.assertEqual(candidate["id"], repeated["id"])
             self.assertEqual(1, len(manager.status()["candidates"]))
 
+    def test_retention_config_is_explicit_and_bounded(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            project, _ = self._project(root)
+            manager = self._manager(root, project)
+
+            self.assertEqual(0, manager.public_config()["retentionCount"])
+            self.assertEqual(5, manager.configure({"retentionCount": 5})["retentionCount"])
+            with self.assertRaisesRegex(Exception, "0 到 100"):
+                manager.configure({"retentionCount": 101})
+
     def test_docker_image_archive_is_classified_without_custom_installer(self):
         metadata = _classify_artifact(Path("agent-with-u-docker-linux-x86_64.tar"))
         self.assertEqual({
@@ -293,6 +304,142 @@ class ReleaseCenterTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             with mock.patch.dict(os.environ, {"AGENT_WITH_U_UPDATE_SIGNING_KEY": "fixture-key"}):
                 asyncio.run(scenario(Path(temporary)))
+
+    def test_retention_deletes_only_tracked_old_objects_after_verified_publish(self):
+        class RetentionManager(ReleaseCenterManager):
+            def __init__(self, release_root: Path):
+                self.deleted: list[tuple[str, str]] = []
+                self.public_manifest = None
+                super().__init__(release_root)
+
+            async def _upload(self, job_id, qshell, bucket, key, path, **kwargs):  # type: ignore[override]
+                if key.endswith("/stable/manifest.json"):
+                    self.public_manifest = json.loads(path.read_text(encoding="utf-8"))
+
+            async def _fetch_manifest(self, source):  # type: ignore[override]
+                return self.public_manifest
+
+            async def _refresh_cdn(self, job_id, qshell, manifest_url):  # type: ignore[override]
+                return True
+
+            async def _delete_object(self, job_id, qshell, bucket, key):  # type: ignore[override]
+                self.deleted.append((bucket, key))
+
+        async def scenario(root: Path) -> None:
+            project, _ = self._project(root)
+            qshell = root / ("qshell.exe" if os.name == "nt" else "qshell")
+            qshell.write_text("fixture", encoding="utf-8")
+            manager = RetentionManager(root / "release-center")
+            manager.configure({
+                "projectRoot": str(project), "baseUrl": "https://cdn.example.com",
+                "qiniuBucket": "fixture-bucket", "qshell": str(qshell),
+                "retentionCount": 1,
+            })
+            with manager._guard():
+                state = manager._load_state()
+                state["history"] = [{
+                    "id": "old-release", "channel": "stable",
+                    "qiniuBucket": "fixture-bucket",
+                    "manifestKey": "agentwithu/releases/stable/manifest.json",
+                    "objectKeys": [
+                        "agentwithu/releases/old/AgentWithU.msi",
+                        "agentwithu/releases/old/manifest.json",
+                        # 防御旧数据：可变 channel manifest 即使误记也永不删除。
+                        "agentwithu/releases/stable/manifest.json",
+                    ],
+                    "publishedAt": 1,
+                }]
+                manager._save_state(state)
+
+            candidate = manager.scan_project()["candidate"]
+            with mock.patch.object(
+                manager, "qiniu_account_status", return_value=self._ACCOUNT_READY,
+            ):
+                preview = await manager.preview(
+                    candidate["id"], [candidate["artifacts"][0]["id"]], {},
+                )
+                self.assertEqual(1, preview["plan"]["retentionCount"])
+                started = await manager.start_publish(preview["plan"]["id"])
+                await manager._tasks[started["job"]["id"]]
+
+            status = manager.status()
+            self.assertEqual("succeeded", status["jobs"][0]["status"])
+            self.assertEqual({
+                "removedReleases": 1, "deletedObjects": 2, "failedObjects": 0,
+            }, status["jobs"][0]["cleanup"])
+            self.assertEqual(1, len(status["history"]))
+            self.assertNotEqual("old-release", status["history"][0]["id"])
+            self.assertEqual([
+                ("fixture-bucket", "agentwithu/releases/old/AgentWithU.msi"),
+                ("fixture-bucket", "agentwithu/releases/old/manifest.json"),
+            ], manager.deleted)
+            self.assertNotIn(
+                ("fixture-bucket", "agentwithu/releases/stable/manifest.json"),
+                manager.deleted,
+            )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            asyncio.run(scenario(Path(temporary)))
+
+    def test_cleanup_failure_keeps_old_record_without_failing_published_release(self):
+        class CleanupFailureManager(ReleaseCenterManager):
+            def __init__(self, release_root: Path):
+                self.public_manifest = None
+                super().__init__(release_root)
+
+            async def _upload(self, job_id, qshell, bucket, key, path, **kwargs):  # type: ignore[override]
+                if key.endswith("/stable/manifest.json"):
+                    self.public_manifest = json.loads(path.read_text(encoding="utf-8"))
+
+            async def _fetch_manifest(self, source):  # type: ignore[override]
+                return self.public_manifest
+
+            async def _refresh_cdn(self, job_id, qshell, manifest_url):  # type: ignore[override]
+                return True
+
+            async def _delete_object(self, job_id, qshell, bucket, key):  # type: ignore[override]
+                raise RuntimeError("fixture delete failure")
+
+        async def scenario(root: Path) -> None:
+            project, _ = self._project(root)
+            qshell = root / ("qshell.exe" if os.name == "nt" else "qshell")
+            qshell.write_text("fixture", encoding="utf-8")
+            manager = CleanupFailureManager(root / "release-center")
+            manager.configure({
+                "projectRoot": str(project), "baseUrl": "https://cdn.example.com",
+                "qiniuBucket": "fixture-bucket", "qshell": str(qshell),
+                "retentionCount": 1,
+            })
+            with manager._guard():
+                state = manager._load_state()
+                state["history"] = [{
+                    "id": "old-release", "channel": "stable",
+                    "qiniuBucket": "fixture-bucket",
+                    "manifestKey": "agentwithu/releases/stable/manifest.json",
+                    "objectKeys": ["agentwithu/releases/old/AgentWithU.msi"],
+                    "publishedAt": 1,
+                }]
+                manager._save_state(state)
+
+            candidate = manager.scan_project()["candidate"]
+            with mock.patch.object(
+                manager, "qiniu_account_status", return_value=self._ACCOUNT_READY,
+            ):
+                preview = await manager.preview(
+                    candidate["id"], [candidate["artifacts"][0]["id"]], {},
+                )
+                started = await manager.start_publish(preview["plan"]["id"])
+                await manager._tasks[started["job"]["id"]]
+
+            status = manager.status()
+            self.assertEqual("succeeded", status["jobs"][0]["status"])
+            self.assertEqual(1, status["jobs"][0]["cleanup"]["failedObjects"])
+            old = next(item for item in status["history"] if item["id"] == "old-release")
+            self.assertIn("fixture delete failure", old["cleanupError"])
+            self.assertIn("清理失败", status["jobs"][0]["message"])
+
+        with tempfile.TemporaryDirectory() as temporary:
+            asyncio.run(scenario(Path(temporary)))
 
     def test_upload_reports_intermediate_process_bytes(self):
         class FakeStream:

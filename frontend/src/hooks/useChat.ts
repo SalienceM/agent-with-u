@@ -8,6 +8,10 @@ import {
   shouldKeepChatMessage,
 } from '../utils/chatMessageVisibility';
 import {
+  mergeAuthoritativeChatMessages,
+  mergeCachedHistoryWithStreamTail,
+} from '../utils/chatMessageOrder';
+import {
   getStreamState,
   resetStreamAccumulators,
   clearStreamState,
@@ -167,60 +171,33 @@ function normalizeMessages(messages: any[]): ChatMessage[] {
   return messages.map(normalizeMessage).filter(shouldKeepChatMessage);
 }
 
-/**
- * 以后端返回的数组顺序为权威顺序，只保留尚未落盘的本地消息。
- *
- * 旧链路只把 assistant messageId 发给后端，user 消息会由前后端各生成一个
- * 不同 ID。若该本地 user 后面紧跟的 assistant 已经出现在 loaded 中，说明
- * 这一整轮其实已经落盘，不能再把 user 当成 local 追加到末尾。
- */
-function mergeLoadedWithLocal(
-  loaded: ChatMessage[],
-  current: ChatMessage[],
-): ChatMessage[] {
-  const loadedIds = new Set(loaded.map((message) => message.id));
-  const samePersistedUser = (local: ChatMessage): boolean => {
-    return loaded.some((saved) => {
-      if (saved.role !== 'user') return false;
-      const localText = (local.content || '').trim();
-      const savedText = (saved.content || '').trim();
-      const localImages = (local.images || []).map((image) => image.id).filter(Boolean);
-      const savedImages = (saved.images || []).map((image) => image.id).filter(Boolean);
-      const textMatches = localText
-        ? savedText === localText
-          || savedText.endsWith(`\n\n${localText}`)
-          || savedText.endsWith(`当前用户请求：\n${localText}`)
-        : !savedText || localImages.length > 0;
-      if (!textMatches) return false;
-      if (localImages.length === 0 && savedImages.length === 0) return true;
-      return localImages.length === savedImages.length
-        && localImages.every((id, index) => id === savedImages[index]);
-    });
-  };
-  const locals = current.filter((message, index) => {
-    if (!shouldKeepChatMessage(message)) return false;
-    if (loadedIds.has(message.id)) return false;
-    if (message.role === 'user') {
-      const following = current[index + 1];
-      if (following?.role === 'assistant') {
-        // 后续 assistant 尚未落盘，说明这确实是一轮刚发出的本地消息。
-        if (!loadedIds.has(following.id)) return true;
-        return false;
-      }
-      // 清理已经被旧合并逻辑挪到数组末尾、失去 assistant 邻接关系的重复
-      // user 气泡。Session 引用/技能图片会在后端给正文加前缀，所以允许
-      // savedText 以本地原文结尾。
-      if (samePersistedUser(message)) return false;
-    }
-    return true;
-  });
-  return locals.length > 0 ? [...loaded, ...locals] : loaded;
-}
-
 // 模块级历史缓存:loadSession RPC 比较慢(尤其经中继),切换 session 时如果
 // 同步可以从缓存里立刻拿出历史 + 当前流式 tail,就不会出现「先一条流再几条
 // 历史」的跳变。loadSession 回来后用最新结果覆盖缓存。
 const sessionHistoryCache = new Map<string, ChatMessage[]>();
+// sendMessage 是 fire-and-forget；loadSession 可能在后端接收新消息前先返回。
+// 明确登记这段竞态窗口中的本地 ID，避免为了防丢而保留所有未知旧气泡。
+const pendingLocalMessageIds = new Map<string, Set<string>>();
+
+function pendingIdsFor(sessionId: string): Set<string> {
+  let ids = pendingLocalMessageIds.get(sessionId);
+  if (!ids) {
+    ids = new Set<string>();
+    pendingLocalMessageIds.set(sessionId, ids);
+  }
+  return ids;
+}
+
+function mergeLoadedWithLocal(
+  sessionId: string,
+  loaded: ChatMessage[],
+  current: ChatMessage[],
+): ChatMessage[] {
+  const pendingIds = pendingIdsFor(sessionId);
+  for (const message of loaded) pendingIds.delete(message.id);
+  if (pendingIds.size === 0) pendingLocalMessageIds.delete(sessionId);
+  return mergeAuthoritativeChatMessages(loaded, current, pendingIds);
+}
 
 // 首次加载只取最近 N 条,远程过中继时几十兆 base64 一次性砸过来会卡几秒到
 // 十几秒。后续按需 loadEarlier(),每次再拉 EARLIER_CHUNK 条往前 prepend。
@@ -229,6 +206,7 @@ const EARLIER_CHUNK = 30;
 
 export function clearSessionHistoryCache(sessionId: string): void {
   sessionHistoryCache.delete(sessionId);
+  pendingLocalMessageIds.delete(sessionId);
 }
 
 export function useChat(
@@ -360,22 +338,9 @@ export function useChat(
             }
         : null;
 
-    if (cachedHistory && cachedHistory.length > 0) {
-      // 有缓存历史:铺历史,有 tail 就拼上去
-      const msgs = [...cachedHistory];
-      if (tail) {
-        const idx = msgs.findIndex((m) => m.id === tail.id);
-        if (idx >= 0) msgs[idx] = tail;
-        else msgs.push(tail);
-      }
-      setMessages(msgs);
-    } else if (tail) {
-      // 无历史但流已有内容:只铺 tail
-      setMessages([tail]);
-    } else {
-      // 啥都没:空,等 loadSession。绝不渲染幽灵 tail。
-      setMessages([]);
-    }
+    // 活跃 tail 可以补到缓存末尾；已完成 tail 只能覆盖缓存中的同 ID 原位置。
+    // 后者若不在缓存，必须等待 loadSession 返回权威顺序，不能猜成最后一条。
+    setMessages(mergeCachedHistoryWithStreamTail(cachedHistory, tail, hasActiveStream));
     isStreamingRef.current = hasActiveStream;
     setIsStreaming(hasActiveStream);
     setResolvedSessionId(sessionId);
@@ -403,7 +368,7 @@ export function useChat(
     api.loadSession(sessionId, initialLimit).then((session) => {
       if (cancelled) return;
       if (session?.messages) {
-        const loadedMessages = normalizeMessages(session.messages);
+        let loadedMessages = normalizeMessages(session.messages);
         const loadedStreaming = [...loadedMessages].reverse().find(
           (message: ChatMessage) => message.streaming,
         );
@@ -457,8 +422,11 @@ export function useChat(
               : Date.now() / 1000,
             streaming: stillStreaming,
           });
-          if (existingIndex >= 0) loadedMessages[existingIndex] = liveMessage;
-          else loadedMessages.push(liveMessage);
+          loadedMessages = mergeCachedHistoryWithStreamTail(
+            loadedMessages,
+            liveMessage,
+            stillStreaming,
+          );
         }
         // ★ 更新历史缓存(只缓存非 streaming 的「定稿」消息,避免下次切回来
         //    看到一个错位的 stale 流式版本)。注意:这里缓存的是「已加载的最近
@@ -467,12 +435,11 @@ export function useChat(
           sessionId,
           loadedMessages.filter((m: ChatMessage) => !m.streaming),
         );
-        // ★ 防丢消息：loadSession RPC 往返期间，doSend 可能已经通过 setMessages
-        //    追加了用户消息（尚未持久化）。全量替换会把它冲掉——用户看到"只有
-        //    回答没有提问"。用函数式更新拿到最新 prev，把不在 loaded 中的本地
-        //    消息（一般是刚发出去的用户气泡）保留在末尾。
+        // ★ 防丢消息：loadSession RPC 往返期间，doSend 可能已经追加了尚未被
+        //    后端确认的本地气泡。只保留显式登记的 pending/streaming/system，
+        //    不能再把任意未知的已完成 assistant 当成本地消息塞到末尾。
         setMessages((prev) => {
-          return mergeLoadedWithLocal(loadedMessages, prev);
+          return mergeLoadedWithLocal(sessionId, loadedMessages, prev);
         });
       }
       if (session?.autoContinue !== undefined) {
@@ -514,16 +481,20 @@ export function useChat(
           const loaded = normalizeMessages(session.messages);
           // ★ 同样防丢：compact 期间 doSend 可能已追加了本地用户消息
           setMessages((prev) => {
-            return mergeLoadedWithLocal(loaded, prev);
+            return mergeLoadedWithLocal(sessionId, loaded, prev);
           });
         }
       } else if (data.type === 'context_cleared') {
         // ★ clearSessionContext：清空对话窗口，session 本身不变
         setMessages([]);
+        clearSessionHistoryCache(sessionId);
         isStreamingRef.current = false;
         setIsStreaming(false);
       } else if (data.type === 'follow_up_added' && data.message) {
         const followUp = normalizeMessage(data.message);
+        // 其他控制端推来的 follow-up 也可能与本端正在返回的 loadSession 交错。
+        // 在下一次权威历史确认其 ID 前，保留它相对目标 assistant 的插入位置。
+        pendingIdsFor(sessionId).add(followUp.id);
         setMessages((prev) => {
           if (prev.some((message) => message.id === followUp.id)) return prev;
           const beforeIndex = data.beforeMessageId
@@ -553,7 +524,7 @@ export function useChat(
           setMessagesTotal(total);
           setHasMore(!!session.hasMore || loaded.length < total);
           sessionHistoryCache.set(sessionId, loaded);
-          setMessages((prev) => mergeLoadedWithLocal(loaded, prev));
+          setMessages((prev) => mergeLoadedWithLocal(sessionId, loaded, prev));
         }
       }
     });
@@ -593,7 +564,7 @@ export function useChat(
           if (session?.messages) {
             const loaded = normalizeMessages(session.messages);
             setMessages((prev) => {
-              return mergeLoadedWithLocal(loaded, prev);
+              return mergeLoadedWithLocal(sessionId, loaded, prev);
             });
           }
           clearStreamState(sessionId);
@@ -898,6 +869,9 @@ export function useChat(
         timestamp: Date.now() / 1000,
       };
       const assistantId = uuid();
+      const pendingIds = pendingIdsFor(sessionId);
+      pendingIds.add(userMsg.id);
+      pendingIds.add(assistantId);
 
       // 发送瞬间就展示明确的 Thinking 状态。它不是伪造的思考文本，也不会
       // 写入历史；首个 thinking / text / tool delta 到达后会原位替换。

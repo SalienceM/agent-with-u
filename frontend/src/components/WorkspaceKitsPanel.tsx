@@ -163,6 +163,22 @@ function isActiveGeneration(job?: KitGenerationJob | null): boolean {
   return !!job && (job.status === 'queued' || job.status === 'running');
 }
 
+function generationDismissKey(sessionId: string): string {
+  return `agent-with-u:kits:dismissed-generation:${sessionId}`;
+}
+
+function readDismissedGeneration(sessionId: string): string {
+  try { return window.localStorage.getItem(generationDismissKey(sessionId)) || ''; }
+  catch { return ''; }
+}
+
+function persistDismissedGeneration(sessionId: string, jobId: string): void {
+  try {
+    if (jobId) window.localStorage.setItem(generationDismissKey(sessionId), jobId);
+    else window.localStorage.removeItem(generationDismissKey(sessionId));
+  } catch { /* 隐私模式或受限 WebView 下仍允许本次关闭 */ }
+}
+
 function draftFromGenerationJob(job: KitGenerationJob): Draft {
   const existing = job.request.existingKit || {};
   const base: Draft = {
@@ -226,12 +242,24 @@ export const WorkspaceKitsPanel: React.FC<Props> = ({ sessionId, open, onClose }
   const [capabilityResponding, setCapabilityResponding] = useState('');
   const [notice, setNotice] = useState<{ kind: 'error' | 'ok'; text: string } | null>(null);
   const [generationJob, setGenerationJob] = useState<KitGenerationJob | null>(null);
+  const [dismissedGenerationJobId, setDismissedGenerationJobId] = useState(
+    () => readDismissedGeneration(sessionId),
+  );
   const [generationEditorJobId, setGenerationEditorJobId] = useState('');
   const [clock, setClock] = useState(() => Date.now() / 1000);
   const clientClaims = useRef(new Set<string>());
   const clientCommandRuns = useRef(new Set<string>());
 
   const acceptGenerationJob = (incoming: KitGenerationJob) => {
+    const dismissed = readDismissedGeneration(incoming.sessionId);
+    // 只压住用户明确关闭的那一条最终结果。新任务（包括同 id 重新进入活动态）
+    // 必须重新出现，以免把真实后台执行悄悄隐藏。
+    if (dismissed && (dismissed !== incoming.id || isActiveGeneration(incoming))) {
+      persistDismissedGeneration(incoming.sessionId, '');
+      setDismissedGenerationJobId('');
+    } else if (dismissed === incoming.id) {
+      setDismissedGenerationJobId(dismissed);
+    }
     setGenerationJob((current) => {
       if (!current || current.sessionId !== incoming.sessionId) return incoming;
       if (current.id === incoming.id) {
@@ -299,6 +327,7 @@ export const WorkspaceKitsPanel: React.FC<Props> = ({ sessionId, open, onClose }
     setCancellingRunIds(new Set());
     setCapabilityResponding('');
     setGenerationJob(null);
+    setDismissedGenerationJobId(readDismissedGeneration(sessionId));
     setGenerationEditorJobId('');
     setNotice(null);
   }, [sessionId]);
@@ -438,6 +467,12 @@ export const WorkspaceKitsPanel: React.FC<Props> = ({ sessionId, open, onClose }
     if (result.status !== 'ok') {
       setNotice({ kind: 'error', text: result.message || '停止 Kit 生成失败' });
     }
+  };
+
+  const dismissGeneration = () => {
+    if (!generationJob || isActiveGeneration(generationJob)) return;
+    persistDismissedGeneration(sessionId, generationJob.id);
+    setDismissedGenerationJobId(generationJob.id);
   };
 
   if (!open) return null;
@@ -613,7 +648,7 @@ export const WorkspaceKitsPanel: React.FC<Props> = ({ sessionId, open, onClose }
           }}>{notice.text}</div>
         )}
 
-        {generationJob && (
+        {generationJob && generationJob.id !== dismissedGenerationJobId && (
           <div style={{
             padding: '9px 12px', display: 'flex', alignItems: 'center', gap: 10,
             flexWrap: 'wrap', fontSize: 12,
@@ -639,6 +674,14 @@ export const WorkspaceKitsPanel: React.FC<Props> = ({ sessionId, open, onClose }
             </button>
             {isActiveGeneration(generationJob) && (
               <button style={dangerButton} onClick={() => void cancelGeneration()}>■ 停止</button>
+            )}
+            {!isActiveGeneration(generationJob) && (
+              <button
+                style={{ ...iconButton, width: 28, height: 28, flex: '0 0 auto' }}
+                onClick={dismissGeneration}
+                aria-label="关闭 Kit 生成结果提示"
+                title="关闭提示；不会删除生成结果或已保存的 Kit"
+              >×</button>
             )}
           </div>
         )}

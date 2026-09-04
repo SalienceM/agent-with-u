@@ -15,6 +15,7 @@
     "src/home/dashboardPerformance.ts",
     "src/home/dashboardPreferences.ts",
     "src/utils/realtimeVoice.ts",
+    "src/utils/chatMessageOrder.ts",
     "src/utils/chatMessageVisibility.ts",
     "src/utils/dirSyncPolicy.ts",
     "src/utils/dirSyncFreshness.ts",
