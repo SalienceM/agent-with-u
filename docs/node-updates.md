@@ -32,6 +32,8 @@ python scripts/publish_updates.py deploy/update-release.json --qiniu-bucket BUCK
 
 脚本会计算每个制品的大小和 SHA-256，先上传不可变制品与版本化清单，最后覆盖 `stable/manifest.json`，避免节点看到尚未上传完整的版本。
 
+发布中心的“发布配置 → 云端版本保留数量”可以按 Bucket、Channel 和 manifest key 范围保留最近 N 个版本（`0` 为关闭，`1–100` 为保留数量）。清理只会在新 manifest 从公网回读确认成功后执行，并且只删除发布中心明确登记过的七牛对象；不会扫描桶内其他文件，也不会删除本地安装包。缺少对象清单的旧历史不会被猜路径删除，清理失败也不影响已经成功的新版本发布。
+
 若需要签名，在发布机设置 `AGENT_WITH_U_UPDATE_SIGNING_KEY`；客户端更新页勾选“强制校验”并把同一密钥保存到节点。密钥不会从节点回显。清单可直接放在七牛云公开 HTTPS/CDN 域名；私有空间可在前置服务生成稳定的受控下载 URL。
 
 ## Linux/headless 节点
@@ -42,7 +44,7 @@ python scripts/publish_updates.py deploy/update-release.json --qiniu-bucket BUCK
 
 ## Docker 节点
 
-Docker 节点只选择 `target=docker / kind=docker-bundle` 制品，不会把普通 Linux portable 包覆盖进容器。`awu-backend` 校验 manifest、大小和 SHA-256 后，只向共享数据卷写入固定格式的请求；没有 Docker Socket。无网络入口的 `awu-updater` 独占 Docker Socket，再次校验计划和哈希，只允许加载带 AgentWithU component 标签的 `agent-with-u-backend:latest` 与 `agent-with-u-web:latest`，并只重建这两个服务。
+Docker 节点只选择 `target=docker / kind=docker-bundle` 制品，不会把普通 Linux portable 包覆盖进容器。`awu-backend` 校验 manifest、大小和 SHA-256 后，只向共享数据卷写入固定格式的请求；没有 Docker Socket。无网络入口的 `awu-updater` 独占 Docker Socket，再次校验计划和哈希，只允许加载带 AgentWithU component 标签的 `agent-with-u-backend:latest` 与 `agent-with-u-web:latest`，并只重建这两个服务。updater 位于可选的 `online-update` Compose profile 中；普通启动和手动 `git pull + build + up` 更新都不依赖它。
 
 标准 Compose 中的 Web 不是纯控制端：同源 `awu-backend` 会作为“当前 Web 节点”
 进入执行节点池。它可直接执行 Session，也可在“连接”面板热注册到 Relay；Relay
@@ -51,7 +53,7 @@ Docker 节点只选择 `target=docker / kind=docker-bundle` 制品，不会把�
 
 升级前会给旧镜像创建临时回滚标签。新容器需同时满足 Backend 端口和 Web HTTP 健康检查；加载、重建或健康检查失败时，updater 会把旧镜像恢复为 `latest` 并重新拉起。业务数据、Codex/Claude 登录目录都是宿主 bind mount，不随镜像替换。
 
-现有 Docker 节点需要先用新版 `deploy/docker-compose.example.yml` 手工执行一次 `up -d --build --force-recreate`，安装默认 Codex、运行代理与 updater。之后更新中心状态会显示 `runtime=docker` 和升级器心跳，可正常参与单节点/全部节点在线更新。updater 不在线时 UI 禁用该节点的一键更新，并提示先完成这次引导重建。
+需要在线升级的 Docker 节点先用新版 `deploy/docker-compose.example.yml` 执行一次 `--profile online-update up -d --build`，之后更新中心会显示 `runtime=docker` 和升级器心跳，可正常参与单节点/全部节点在线更新。不需要在线升级时保持默认启动即可；updater 不在线只会禁用该节点的一键更新，不影响执行能力或手动更新。
 
 ## 安全边界
 

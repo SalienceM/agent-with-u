@@ -173,7 +173,7 @@ python -m src.ws_main
 这些配置是节点级共享状态，因此仅本机直连用户或 Relay 为该节点指定的主用户
 可以修改；普通共享用户仍可使用已经配置好的 Backend。
 
-Compose 同时启动无端口的 `awu-updater`。发布 `agent-with-u-docker-linux-<arch>.tar` 后，Docker 节点可在“节点在线更新”中一键加载新镜像、健康检查并重建 Backend/Web；失败自动恢复旧镜像。Docker Socket 只挂给 updater，不挂给执行 Agent 的 Backend。现有节点需先按[156 Docker 安装与更新指南](deploy/WEB_156_INSTALL.md)手动重建一次，之后才能在线升级。
+Compose 默认只启动 Backend/Web；无端口的 `awu-updater` 位于可选的 `online-update` profile 中。发布 `agent-with-u-docker-linux-<arch>.tar` 后，只有显式启用该 profile 的 Docker 节点才可在“节点在线更新”中一键加载新镜像、健康检查并重建 Backend/Web；失败自动恢复旧镜像。Docker Socket 只挂给 updater，不挂给执行 Agent 的 Backend。只使用 `git pull + build + up` 手动维护时无需启动 updater；启用方法见[156 Docker 安装与更新指南](deploy/WEB_156_INSTALL.md)。
 
 ### 接入本地模型（Ollama / LM Studio）
 

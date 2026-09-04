@@ -1,15 +1,17 @@
 # AgentWithU — Docker Compose 部署示例
 #
-# 三个容器，全部在镜像内构建，NAS 上无需装 node / 手动 build / 挂源码：
+# 两个核心容器 + 一个可选在线升级容器，全部在镜像内构建，NAS 上无需装 node / 手动 build / 挂源码：
 #   awu-backend  Python 后端（WS 44321 + HTTP API 44322），不直接对外
 #   awu-web      多阶段构建：node 构建前端 → nginx 托管 + 路径分流
-#   awu-updater  无端口升级伴随容器，仅在受控请求下重建前两个服务
+#   awu-updater  可选；仅启用 online-update profile 时启动，无端口，仅重建前两个服务
 #
 # awu-web 映射一个【宿主端口】，NPM 通过「NAS局域网IP : 该端口」路由进来。
 # 最外层由 nginx-proxy-manager (NPM) + Authelia 负责 TLS 和认证。
 #
 # 用法（在仓库根目录）：
 #   docker compose -f deploy/docker-compose.example.yml up -d --build
+# 需要“节点在线更新”时才额外启用：
+#   docker compose -f deploy/docker-compose.example.yml --profile online-update up -d --build
 
 x-awu-build-proxy: &awu-build-proxy
   HTTP_PROXY: "${AGENT_WITH_U_BUILD_PROXY-http://192.168.50.156:7890}"
@@ -111,9 +113,12 @@ services:
     networks:
       - awu-internal      # 访问 awu-backend
 
-  # 专用 Docker 升级伴随容器：无端口、不运行 Agent，也不接受网络请求。
+  # 可选的 Docker 升级伴随容器：普通启动不会创建；只有启用 online-update profile 才启动。
+  # 它无端口、不运行 Agent，也不接受网络请求。
   # Docker Socket 只给它；awu-backend 仅通过共享数据卷投递校验后的升级请求。
   awu-updater:
+    profiles:
+      - online-update
     build:
       context: ..
       dockerfile: deploy/Dockerfile.updater

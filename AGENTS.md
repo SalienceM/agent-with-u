@@ -679,8 +679,9 @@ automation/recovery. Detailed operator instructions live in `docs/release-center
 
 ### Docker executor runtime and online updates
 
-`deploy/docker-compose.example.yml` is a three-service executor deployment:
-`awu-backend`, `awu-web`, and a no-port `awu-updater`. The backend image installs both
+`deploy/docker-compose.example.yml` is a two-service executor deployment by default:
+`awu-backend` and `awu-web`. A no-port `awu-updater` is available only through the optional
+`online-update` profile; manual `git pull + build + up` maintenance does not require it. The backend image installs both
 `@anthropic-ai/claude-code` and `@openai/codex` by default. Host bind mounts persist
 `/root/.codex` and `/root/.claude`, so container recreation preserves CLI auth and native
 Codex threads. The Compose file injects a build/runtime proxy (the 156 deployment defaults
@@ -706,8 +707,9 @@ names during the one-time migration.
 `dist/agent-with-u-docker-linux-<arch>.tar`; Release Center classifies the file without an
 arbitrary installer command. `build_all.bat` and `build_web_linux.sh` invoke this packaging
 when Docker is available unless `AGENT_WITH_U_SKIP_DOCKER_RELEASE=1`. Existing Docker nodes
-must manually rebuild once with the new Compose file to install Codex, proxy policy, and
-the updater; subsequent application releases can use Node Update Center.
+that want UI-driven online updates must enable the `online-update` profile once with the new
+Compose file; subsequent application releases can use Node Update Center. Manual-only Docker
+nodes should leave the profile disabled.
 
 ### Normal-session side features (序列任务 + By the way)
 

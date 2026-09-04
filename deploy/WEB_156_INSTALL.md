@@ -12,7 +12,7 @@
 | Web 宿主端口 | `44380` |
 | Web 容器 | `awu-web` |
 | Backend 容器 | `awu-backend` |
-| 升级伴随容器 | `awu-updater`（无端口，仅监听本机更新队列） |
+| 升级伴随容器 | `awu-updater`（可选；仅启用 `online-update` profile 时启动） |
 
 > `192.168.50.156:7890` 默认同时用于镜像构建和 Backend/Codex 运行。代理机器必须开启“允许局域网连接”，并允许 Docker 主机访问 TCP `7890`。
 
@@ -31,13 +31,14 @@ awu-web（nginx，宿主 44380 → 容器 80）
                          ▼
              /volume1/docker/agent-with-u/data
                          │
-                         └─ awu-updater → Docker Socket（只重建 Backend/Web）
+                         └─ [可选] awu-updater → Docker Socket（只重建 Backend/Web）
 ```
 
 - `awu-web` 是唯一映射宿主端口的容器。
 - 这不是纯控制端部署：`awu-web` 通过同源 `/ws` 连接 `awu-backend`，所以
   **当前 Web 节点本身就是完整执行节点**，可直接创建和运行 Session。
-- `awu-updater` 不映射端口，Docker Socket 也不会暴露给会运行 Agent 命令的 Backend。
+- `awu-updater` 属于可选的 `online-update` profile。普通启动不创建它；只有需要在 UI 中对 Docker 节点执行“一键更新”时才启动。
+- updater 不映射端口，Docker Socket 也不会暴露给会运行 Agent 命令的 Backend。
 - Backend 的 `44321`、`44322` 仅在 Docker 内部网络开放，不应直接暴露到公网。
 - Session、Backend 配置、Skills、素材池等数据保存在宿主机 `data` 目录中；Codex/Claude 登录态分别保存在 `codex-config`、`claude-config`，重建容器不会删除。
 
@@ -137,7 +138,7 @@ PROXY=http://192.168.50.156:7890
 
 该变量只在当前终端会话有效，因此本步骤和下一步构建命令需要在同一个终端中执行。
 
-### 4. 构建 Backend、Web 与升级器镜像
+### 4. 构建 Backend 与 Web 镜像
 
 ```bash
 sudo docker compose -f deploy/docker-compose.example.yml build \
@@ -151,7 +152,8 @@ sudo docker compose -f deploy/docker-compose.example.yml build \
 
 - `agent-with-u-backend:latest`
 - `agent-with-u-web:latest`
-- `agent-with-u-updater:latest`
+
+普通构建不会构建可选的 `agent-with-u-updater:latest`。如需节点在线更新，按第八节单独启用 `online-update` profile。
 
 Compose 本身已经为构建与运行设置默认代理，因此上面的显式 build-arg 保留兼容但不再是必需项。运行时会向 Python HTTP 客户端、Claude/Codex 子进程注入同一代理，并用 `NO_PROXY` 绕过容器内通信。可在执行 Compose 前覆盖：
 
@@ -179,6 +181,8 @@ sudo docker compose -f deploy/docker-compose.example.yml \
 - `--no-build`：只使用第 4 步已经成功生成的镜像，避免启动阶段重复构建。
 - `--force-recreate`：即使 Compose 配置未变化，也重新创建容器以确保使用新镜像。
 
+这条普通启动命令只要求 `awu-backend` 和 `awu-web`，不需要 updater。
+
 ## 五、一段式更新命令
 
 确认仓库没有需要保留的本地改动后，可以依次执行：
@@ -202,6 +206,8 @@ sudo docker compose -f deploy/docker-compose.example.yml \
 
 只有前一条命令成功后，才继续执行下一条。不要用分号强行忽略失败。
 
+这是一条完整可用的手动更新路径，不依赖 `awu-updater`。只要愿意继续用 `git pull + build + up` 维护 Docker 节点，就不需要启动 updater。
+
 ## 六、启动后验证
 
 ### 1. 查看容器状态
@@ -215,8 +221,9 @@ sudo docker compose -f deploy/docker-compose.example.yml ps
 ```text
 awu-backend   Up
 awu-web       Up
-awu-updater   Up
 ```
+
+普通部署看不到 `awu-updater` 是正常状态，不影响 Web、自执行 Backend、Relay 纳管或手动更新。
 
 ### 2. 检查网页入口
 
@@ -341,6 +348,13 @@ sudo docker compose -f deploy/docker-compose.example.yml up -d --no-build
 
 > 不要执行 `docker compose down -v`。虽然当前核心数据使用宿主机目录挂载，但生产环境仍不应养成删除卷的操作习惯。
 
+如果已经启用了在线升级 profile，管理三个容器时在 Compose 参数中加上 `--profile online-update`。例如：
+
+```bash
+sudo docker compose -f deploy/docker-compose.example.yml \
+  --profile online-update restart
+```
+
 ## 八、Codex、Qwen SDK、运行代理与在线升级验证
 
 Backend 镜像默认安装官方 Codex CLI、Claude CLI，以及 Qwen Code CLI + `qwen-code-sdk`。首次重建后检查：
@@ -351,7 +365,6 @@ sudo docker exec awu-backend claude --version
 sudo docker exec awu-backend qwen --version
 sudo docker exec awu-backend python -c 'import qwen_code_sdk; print("qwen-code-sdk OK")'
 sudo docker exec awu-backend sh -lc 'printf "%s\n" "$HTTPS_PROXY" "$AGENTWITHU_CODEX_PROXY"'
-sudo docker compose -f deploy/docker-compose.example.yml logs --tail=30 awu-updater
 ```
 
 如使用 Codex 账号登录，执行一次：
@@ -368,9 +381,52 @@ sudo docker exec -it awu-backend codex login
 dist/agent-with-u-docker-linux-x86_64.tar
 ```
 
-发布中心会自动把它识别为 `target=docker / kind=docker-bundle`。发布后，在“设置 → 数据与系统 → 节点在线更新”中，Docker 节点应显示“Docker · 升级器在线”；点击“一键更新”后由节点下载和校验镜像包，`awu-updater` 保存旧镜像、加载新镜像、重建 Backend/Web 并做健康检查，失败会恢复旧镜像。
+发布中心会自动把它识别为 `target=docker / kind=docker-bundle`。
 
-旧 Docker 部署必须按本文第四、第五步**手动重建这一次**，让 Codex、Qwen SDK、代理环境和 `awu-updater` 进入部署；此后应用版本才可从 UI 在线升级。若不想在某次 Windows 打包中生成较大的 Docker 包，可在运行 BAT 前设置 `AGENT_WITH_U_SKIP_DOCKER_RELEASE=1`。
+### 启用可选的 Docker 在线升级
+
+只有希望从“设置 → 数据与系统 → 节点在线更新”对这台 Docker 节点执行“一键更新”时，才需要启动 updater：
+
+```bash
+cd /volume1/docker/agent-with-u/agent-with-u
+
+sudo docker compose -f deploy/docker-compose.example.yml \
+  --profile online-update up -d --build awu-updater
+```
+
+验证状态与日志：
+
+```bash
+sudo docker compose -f deploy/docker-compose.example.yml \
+  --profile online-update ps
+sudo docker compose -f deploy/docker-compose.example.yml \
+  --profile online-update logs --tail=30 awu-updater
+```
+
+此时节点应显示“Docker · 升级器在线”。点击“一键更新”后，由节点下载和校验镜像包，`awu-updater` 保存旧镜像、加载新镜像、重建 Backend/Web 并做健康检查，失败会恢复旧镜像。
+
+不需要一键在线更新时，无需启动 updater；页面显示“升级器未在线”属于预期状态，仍可按第四、第五节手动更新。若旧版 Compose 已经启动过 updater，而现在决定停用它，执行一次：
+
+```bash
+sudo docker compose -f deploy/docker-compose.example.yml \
+  --profile online-update stop awu-updater
+sudo docker compose -f deploy/docker-compose.example.yml \
+  --profile online-update rm -f awu-updater
+```
+
+Compose profile 只控制后续创建，不会主动停止旧版本已经在运行的容器，所以上述迁移操作只需做一次。
+
+旧 Docker 部署若要使用 UI 在线升级，需要用新版 Compose 执行一次上面的 `--profile online-update up`，让 updater 进入部署；若只采用手动更新，则完全不需要这一步。若不想在某次 Windows 打包中生成较大的 Docker 包，可在运行 BAT 前设置 `AGENT_WITH_U_SKIP_DOCKER_RELEASE=1`。
+
+### 发布中心的云端版本保留
+
+在“发布中心 → 发布配置 → 云端版本保留数量”中可以设置自动清理规则：
+
+- `0`：关闭自动清理（默认）。
+- `1–100`：同一 Bucket、Channel 和 manifest key 范围内，只保留最近 N 个已发布版本。
+- 系统会先完成新版本发布，并从公网回读确认新 manifest 可用，然后才清理旧版本。
+- 只删除发布中心历史中明确登记过的七牛对象；不会扫描或删除桶内其他文件，也不会删除构建机上的本地安装包。
+- 旧发布历史如果没有对象清单，系统不会猜测路径删除。个别对象清理失败也不会把已经成功的新版本回滚，后续发布会继续尝试清理。
 
 ## 九、NPM / Authelia 反向代理
 
