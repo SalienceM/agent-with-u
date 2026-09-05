@@ -13,7 +13,6 @@ import type { ChatMessage } from '../hooks/useChat';
 import type { AppConfig } from '../hooks/useConfig';
 import { HACKER_CAPTURE_EVENT } from '../utils/hackerMode';
 import type { SmoothGhostState } from '../utils/smoothGhost';
-import { OPEN_THOUGHTS_EVENT } from '../utils/attentionContext';
 import { normalizeModelRuntime, type ModelRuntime } from './CodexRuntimeFields';
 import type { TextAttachment } from '../types/attachments';
 import { buildMessageRedoPayload } from '../utils/messageRedo';
@@ -1131,7 +1130,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
         }}
       />
 
-      {/* ---- 俺寻思：打开 App 顶层唯一注意力助手 ---- */}
+      {/* Session 内只保留 Session 专属工具；“俺寻思”统一从 App 顶栏进入。 */}
       {sessionId && (
         <>
           {config.workspaceKitsEnabled && (
@@ -1141,11 +1140,6 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
               style={kitFab}
             >🧰</button>
           )}
-          <button
-            onClick={() => window.dispatchEvent(new CustomEvent(OPEN_THOUGHTS_EVENT))}
-            title="俺寻思 · 自动关联当前 Session、文件或功能面板"
-            style={byTheWayFab}
-          >🤔</button>
           {config.workspaceKitsEnabled && (
             <WorkspaceKitsPanel
               sessionId={sessionId}
@@ -1170,7 +1164,7 @@ const paneRootStyle: React.CSSProperties = {
   minHeight: 0,
   overflow: 'hidden',
   boxSizing: 'border-box',
-  position: 'relative',   // ★ 供 by-the-way 抽屉 overlay 定位
+  position: 'relative',   // 供 Session 专属浮动工具定位
 };
 
 const seqQueueErrorStyle: React.CSSProperties = {
@@ -1182,7 +1176,7 @@ const seqQueueErrorCloseStyle: React.CSSProperties = {
   border: 0, background: 'transparent', color: 'inherit', cursor: 'pointer', padding: '0 3px',
 };
 
-const byTheWayFab: React.CSSProperties = {
+const paneFabStyle: React.CSSProperties = {
   position: 'absolute',
   top: 10,
   right: 12,
@@ -1199,6 +1193,6 @@ const byTheWayFab: React.CSSProperties = {
 };
 
 const kitFab: React.CSSProperties = {
-  ...byTheWayFab,
-  right: 54,
+  ...paneFabStyle,
+  right: 12,
 };

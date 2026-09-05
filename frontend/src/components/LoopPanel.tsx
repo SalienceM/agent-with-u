@@ -8,7 +8,6 @@ import { LoopPolicyEditor, normalizePolicy } from './LoopPolicyEditor';
 import type { LoopPolicy } from './LoopPolicyEditor';
 import type { ModelRuntime } from './CodexRuntimeFields';
 import { TokenUsageMonitor } from './TokenUsageMonitor';
-import { OPEN_THOUGHTS_EVENT } from '../utils/attentionContext';
 import {
   AdvancedPromptTextarea,
   type AdvancedPromptTextareaProps,
@@ -164,11 +163,6 @@ export const LoopPanel: React.FC<LoopPanelProps> = ({
   const [goalDraft, setGoalDraft] = useState('');
   const [busy, setBusy] = useState(false);
 
-  // By the way 旁路问答抽屉
-  const [asideOpen, setAsideOpen] = useState(false);
-  const [asideInput, setAsideInput] = useState('');
-  const [asideLive, setAsideLive] = useState<Record<string, string>>({});
-
   // 子阶段实时流式文本：key = `${seq}:${subStage}`
   const [progress, setProgress] = useState<Record<string, string>>({});
   const progressRef = useRef(progress);
@@ -225,14 +219,6 @@ export const LoopPanel: React.FC<LoopPanelProps> = ({
     const un1 = api.onLoopUpdated((s: LoopStateT) => {
       if (s.sessionId !== sessionId) return;
       setState(s);
-      setAsideLive((previous) => {
-        const answeringIds = new Set(
-          (s.asides || []).filter((aside) => aside.status === 'answering').map((aside) => aside.id),
-        );
-        const next = { ...previous };
-        for (const id of Object.keys(next)) if (!answeringIds.has(id)) delete next[id];
-        return next;
-      });
     });
     const un2 = api.onLoopProgress((d) => {
       if (d.sessionId !== sessionId) return;
@@ -254,39 +240,13 @@ export const LoopPanel: React.FC<LoopPanelProps> = ({
         }, 50);
       }
     });
-    const un3 = api.onLoopAsideDelta((d) => {
-      if (d.sessionId !== sessionId) return;
-      setAsideLive((prev) => ({ ...prev, [d.turnId]: (prev[d.turnId] || '') + d.text }));
-    });
     return () => {
-      un1(); un2(); un3();
+      un1(); un2();
       if (progressTimerRef.current) clearTimeout(progressTimerRef.current);
       progressTimerRef.current = null;
       pendingProgressRef.current = {};
     };
   }, [sessionId]);
-
-  const asideAnswering = state?.asides?.some((a) => a.status === 'answering') ?? false;
-  const submitAside = useCallback(async (images?: ImageAttachment[]) => {
-    const text = asideInput.trim();
-    if ((!text && !(images && images.length)) || asideAnswering) return;
-    setAsideInput('');
-    const r = await api.loopAsk(sessionId, text, images);
-    if (r.status !== 'ok' && r.message) alert(r.message);
-  }, [asideInput, asideAnswering, sessionId]);
-
-  const clearAsideHistory = useCallback(async () => {
-    const count = state?.asides?.length || 0;
-    if (!count || asideAnswering) return;
-    if (!window.confirm(`确认清空这 ${count} 条 BTW 旁路问答历史？\nLOOP 主线和结果不会受影响。`)) return;
-    const result = await api.loopAsideClear(sessionId);
-    if (result.status !== 'ok') {
-      alert(result.message || 'BTW 历史清空失败');
-      return;
-    }
-    setAsideLive({});
-    setState((previous) => previous ? { ...previous, asides: [] } : previous);
-  }, [state?.asides?.length, asideAnswering, sessionId]);
 
   const running = state?.running ?? false;
   const setAuto = useCallback((on: boolean) => api.loopSetAuto(sessionId, on), [sessionId]);
@@ -397,7 +357,7 @@ export const LoopPanel: React.FC<LoopPanelProps> = ({
     return wrap(
       <>
         <Header stage="…" sessionId={sessionId}
-          asideOpen={false} setAsideOpen={() => {}} asideCount={0} onClose={onClose}
+          onClose={onClose}
           embedded={embedded} inspectOnly={inspectOnly} />
         <div style={{ padding: 40, textAlign: 'center', color: 'var(--theme-text-muted)' }}>
           正在加载 Loop 状态…
@@ -410,7 +370,6 @@ export const LoopPanel: React.FC<LoopPanelProps> = ({
     <LoopPromptContext.Provider value={{ sessionId, workingDir, execKey }}>
       <>
         <Header stage={stateForView.stage} sessionId={sessionId}
-          asideOpen={asideOpen} setAsideOpen={setAsideOpen} asideCount={stateForView.asides?.length || 0}
           onClose={onClose} embedded={embedded} inspectOnly={inspectOnly}
           viewMode={viewMode} setViewMode={setViewMode} canFlow={stateForView.stage !== 'loopidea'} />
         <StageRail stage={stateForView.stage} />
@@ -474,16 +433,6 @@ export const LoopPanel: React.FC<LoopPanelProps> = ({
               )}
             </div>
           </div>
-
-          {asideOpen && (
-            <AsideDrawer
-              asides={stateForView.asides || []} live={asideLive}
-              input={asideInput} setInput={setAsideInput}
-              onSend={submitAside} answering={asideAnswering}
-              onClear={clearAsideHistory}
-              onClose={() => setAsideOpen(false)}
-            />
-          )}
         </div>
       </>
     </LoopPromptContext.Provider>
@@ -534,10 +483,9 @@ const IntentBanner: React.FC<{ state: LoopStateT; sessionId: string }> = ({ stat
 const Header: React.FC<{
   stage: string;
   sessionId: string;
-  asideOpen: boolean; setAsideOpen: (v: boolean) => void; asideCount: number;
   onClose?: () => void; embedded?: boolean; inspectOnly?: boolean;
   viewMode?: 'panel' | 'flow'; setViewMode?: (v: 'panel' | 'flow') => void; canFlow?: boolean;
-}> = ({ stage, sessionId, asideOpen, setAsideOpen, asideCount, onClose, embedded, inspectOnly, viewMode, setViewMode, canFlow }) => (
+}> = ({ stage, sessionId, onClose, embedded, inspectOnly, viewMode, setViewMode, canFlow }) => (
     <div style={{
       display: 'flex', alignItems: 'center', gap: 10, padding: '12px 18px', flexWrap: 'wrap',
       borderBottom: '1px solid var(--theme-border)',
@@ -561,148 +509,9 @@ const Header: React.FC<{
       )}
       <div style={{ flex: 1 }} />
       <TokenUsageMonitor sessionId={sessionId} placement="header" />
-      {/* 打开 App 顶层唯一的“俺寻思”，仍使用 LOOP 独立 aside 上下文。 */}
-      {!inspectOnly && (
-        <button
-          onClick={() => window.dispatchEvent(new CustomEvent(OPEN_THOUGHTS_EVENT))}
-          style={{ ...btn, ...(asideOpen ? btnActive : {}) }}
-          title="俺寻思 — 自动关联当前 LOOP、预览文件或功能面板"
-        >
-          🤔 俺寻思{asideCount > 0 ? ` (${asideCount})` : ''}
-        </button>
-      )}
       {!embedded && onClose && <button onClick={onClose} style={btn}>✕ 关闭</button>}
     </div>
   );
-
-// ══ By the way 旁路问答抽屉 ════════════════════════════════════
-const AsideDrawer: React.FC<{
-  asides: AsideTurn[]; live: Record<string, string>;
-  input: string; setInput: (v: string) => void;
-  onSend: (images?: ImageAttachment[]) => void; answering: boolean;
-  onClear: () => void; onClose: () => void;
-}> = ({ asides, live, input, setInput, onSend, answering, onClear, onClose }) => {
-  const scrollRef = useRef<HTMLDivElement>(null);
-  const endRef = useRef<HTMLDivElement>(null);
-  const inputRef = useRef<HTMLTextAreaElement>(null);
-  const autoScrollRef = useRef(true);   // 是否跟随最新(用户停在底部时为 true)
-  const [showJump, setShowJump] = useState(false);
-  // 图片附件:粘贴(含 Snipaste)自动入列,与主聊天框一致,作用域限定本输入框
-  const { images, removeImage, clearImages } = useClipboardImage(inputRef);
-
-  // 跟踪最新:仅当用户停在底部时才自动滚到底(与普通会话一致)
-  useEffect(() => {
-    if (!autoScrollRef.current) return;
-    endRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [asides, live]);
-
-  // 滚动事件:用户向上滚则暂停跟随并显示「最新」按钮;回到底部则恢复
-  const handleScroll = useCallback(() => {
-    const el = scrollRef.current;
-    if (!el) return;
-    const atBottom = el.scrollTop + el.clientHeight >= el.scrollHeight - 60;
-    if (atBottom) { autoScrollRef.current = true; setShowJump(false); }
-    else { autoScrollRef.current = false; setShowJump(true); }
-  }, []);
-
-  const jumpToLatest = useCallback(() => {
-    autoScrollRef.current = true;
-    setShowJump(false);
-    endRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, []);
-
-  // 发送新问题是显式操作:无论之前滚到哪,都恢复跟随,好看到自己的提问与流式回答
-  const handleSend = useCallback(() => {
-    if (answering) return;
-    if (!input.trim() && images.length === 0) return;
-    autoScrollRef.current = true;
-    setShowJump(false);
-    onSend(images);
-    clearImages();
-  }, [onSend, answering, input, images, clearImages]);
-
-
-  return (
-    <div style={asideDrawerStyle}>
-      <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '10px 14px', borderBottom: '1px solid var(--theme-border)' }}>
-        <span style={{ fontSize: 13, fontWeight: 700, color: 'var(--theme-text)' }}>💬 By the way</span>
-        <div style={{ flex: 1 }} />
-        {asides.length > 0 && (
-          <button onClick={onClear} disabled={answering}
-            style={{
-              ...miniX, width: 'auto', padding: '3px 7px', color: '#f87171',
-              border: '1px solid #f8717155', borderRadius: 5, background: '#f8717112',
-              opacity: answering ? 0.45 : 1, cursor: answering ? 'not-allowed' : 'pointer',
-            }}
-            title={answering ? '回答完成后可清空' : '清空 BTW 历史'}>
-            清空
-          </button>
-        )}
-        <button onClick={onClose} style={miniX}>✕</button>
-      </div>
-      <div style={{ padding: '8px 14px', fontSize: 11, color: 'var(--theme-text-muted)', borderBottom: '1px solid var(--theme-border)', lineHeight: 1.5 }}>
-        随手问。模型只读当前 loop 状态快照作答，用独立上下文，<b>不影响 / 不打断</b> loop 主线。
-      </div>
-
-      <div style={{ flex: 1, position: 'relative', minHeight: 0, display: 'flex' }}>
-      <div ref={scrollRef} onScroll={handleScroll} style={{ flex: 1, overflow: 'auto', padding: 12, display: 'flex', flexDirection: 'column', gap: 12 }}>
-        {asides.length === 0 && (
-          <div style={{ color: 'var(--theme-text-muted)', fontSize: 12 }}>例如：“第 3 次 loop 为什么分数低？”、“现在卡在哪？”、“下一步该往哪个方向调？”</div>
-        )}
-        {asides.map((t) => {
-          const liveText = live[t.id];
-          const answer = t.status === 'answering' ? (liveText ?? t.answer) : t.answer;
-          return (
-            <div key={t.id}>
-              <div style={{ display: 'flex', justifyContent: 'flex-end', marginBottom: 6 }}>
-                <div style={{ maxWidth: '85%', padding: '7px 11px', borderRadius: '12px 12px 2px 12px', background: 'var(--theme-accent)', color: '#fff', fontSize: 12.5, lineHeight: 1.5, whiteSpace: 'pre-wrap' }}>
-                  {!!t.imageCount && <span style={{ display: 'inline-block', marginRight: 5, opacity: 0.85 }}>🖼️{t.imageCount > 1 ? `×${t.imageCount}` : ''}</span>}
-                  {t.question}
-                </div>
-              </div>
-              <div style={{ display: 'flex', justifyContent: 'flex-start' }}>
-                <div style={{ maxWidth: '90%', padding: '7px 11px', borderRadius: '12px 12px 12px 2px', background: 'var(--theme-bg-tertiary)', color: 'var(--theme-text)', fontSize: 12.5, lineHeight: 1.55, border: '1px solid var(--theme-border)', overflowWrap: 'anywhere' }}>
-                  {t.seq > 0 && <span style={{ fontSize: 10, color: 'var(--theme-text-muted)', display: 'block', marginBottom: 3 }}>↳ 提问时：Loop #{t.seq} · {t.stage}</span>}
-                  {answer
-                    ? <Md text={answer} />
-                    : <span style={{ whiteSpace: 'pre-wrap' }}>{t.status === 'answering' ? '思考中…' : '—'}</span>}
-                  {t.status === 'answering' && <span style={{ animation: 'awu-loop-pulse 1s infinite' }}>▋</span>}
-                  {t.status === 'error' && !answer && <span style={{ color: '#f87171' }}>回答失败</span>}
-                </div>
-              </div>
-            </div>
-          );
-        })}
-        <div ref={endRef} />
-      </div>
-        {showJump && (
-          <button onClick={jumpToLatest} style={asideJumpBtn}>
-            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor"
-              strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><path d="M12 5v14M5 12l7 7 7-7" /></svg>
-            最新
-          </button>
-        )}
-      </div>
-
-      <div style={{ padding: 10, borderTop: '1px solid var(--theme-border)' }}>
-        {images.length > 0 && <ImagePreview images={images} onRemove={removeImage} />}
-        <div style={{ display: 'flex', gap: 6, alignItems: 'flex-end' }}>
-          <LoopPromptTextarea
-            textareaRef={inputRef}
-            value={input}
-            onValueChange={setInput}
-            onKeyDown={(e) => { if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') handleSend(); }}
-            placeholder={answering ? '上一条回答中…' : '顺便问一句…（@ 引用文件/SESSION，可贴图，Ctrl/Cmd+Enter）'}
-            disabled={answering}
-            containerStyle={{ flex: 1 }}
-            style={{ ...inputBase, width: '100%', minHeight: 40, maxHeight: 120, resize: 'vertical', opacity: answering ? 0.6 : 1 }}
-          />
-          <button onClick={handleSend} disabled={answering || (!input.trim() && images.length === 0)} style={{ ...primaryBtn, padding: '8px 12px', opacity: (answering || (!input.trim() && images.length === 0)) ? 0.5 : 1 }}>发送</button>
-        </div>
-      </div>
-    </div>
-  );
-};
 
 // ══ Stage rail ════════════════════════════════════════════════
 const StageRail: React.FC<{ stage: string }> = ({ stage }) => {
@@ -2052,23 +1861,6 @@ const miniX: React.CSSProperties = {
 };
 const linkBtn: React.CSSProperties = {
   background: 'none', border: 'none', color: 'var(--theme-accent)', cursor: 'pointer', fontSize: 12, padding: 0,
-};
-// By the way:浮动贴右、约半屏宽,覆盖在主面板之上(不挤压左侧)
-const asideDrawerStyle: React.CSSProperties = {
-  position: 'absolute', top: 0, right: 0, bottom: 0,
-  width: 'clamp(360px, 50%, 640px)',
-  display: 'flex', flexDirection: 'column',
-  borderLeft: '1px solid var(--theme-border)',
-  background: 'var(--theme-panel-bg, var(--theme-bg))',
-  backdropFilter: 'blur(10px)', WebkitBackdropFilter: 'blur(10px)',
-  boxShadow: '-10px 0 40px rgba(0,0,0,0.35)', zIndex: 30,
-};
-const asideJumpBtn: React.CSSProperties = {
-  position: 'absolute', bottom: 10, left: '50%', transform: 'translateX(-50%)',
-  display: 'flex', alignItems: 'center', gap: 4, padding: '5px 12px', borderRadius: 16,
-  border: '1px solid var(--theme-border)', background: 'var(--theme-bg-tertiary)',
-  color: 'var(--theme-text)', fontSize: 11.5, fontWeight: 500, cursor: 'pointer',
-  boxShadow: '0 2px 10px rgba(0,0,0,0.25)', whiteSpace: 'nowrap', zIndex: 5,
 };
 // 视图切换分段按钮
 const segBtn: React.CSSProperties = {

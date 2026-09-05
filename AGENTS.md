@@ -360,8 +360,9 @@ prepare/execute/analysis turns (cross-context pollution) and split attention; th
 panel-only design removes both. `LoopPanel` still supports a floating overlay
 mode (`embedded` omitted) but the app uses the inline mode.
 
-**俺寻思 (global attention sidecar).** The LoopPanel header and ordinary chat FAB
-both open the single App-level `ThoughtsAssistant`. Questions still go through
+**俺寻思 (global attention sidecar).** A single App-topbar entry opens the App-level
+`ThoughtsAssistant`; ordinary Session and Loop headers deliberately expose no duplicate
+entry. Questions still go through
 `loopAsk` → `_run_aside` on an **independent** agent session (never resumes the
 loop's `agent_session_id`), so they cannot pollute or interrupt the LOOP mainline.
 The prompt combines `_loop_context_digest` with a validated UI attention snapshot
@@ -370,10 +371,14 @@ Skills, assets, notes, connection, logs or manual). `AsideTurn.context_*` routes
 history per focus object; legacy records migrate to `contextKey=session`.
 Transient `content` is capped at 50K characters and never persisted, while binary,
 Base64 and Office bytes are stripped in `attentionContext.ts`. The global panel
-can float above the whole app or dock as a resizable right split, automatically
-follows focused panes/Sessions/files, supports browsing an older focus thread, and
-reuses `RealtimeVoiceBar` through a pluggable reply subscription. Image attachments
-remain supported; their Base64 is not persisted (only `image_count`).
+can float above the whole app, dock as a resizable right split, or detach into a
+wide browser/Tauri window; the native window can be always-on-top. A transient
+`BroadcastChannel` follows focused panes/Sessions/files without persisting file
+content. Selecting a text annotation in ReviewWorkbench injects its exact quote;
+selecting an image annotation also crops that region and sends it as an implicit
+image attachment. The composer uses the same streaming speech-to-text path as the
+normal chat input and only fills the draft—it never auto-sends or starts spoken
+replies. Pasted and focus-derived image Base64 is not persisted (only `image_count`).
 
 Loop state is read/written through a process-level singleton cache
 (`_loop_state` / `_loop_save` / `_loop_create`) so a running iteration's
@@ -973,10 +978,9 @@ filler or comma endings, exposes a live pause countdown, and always offers
 `立即发送`. The transcript is sent to the Session's current LLM Backend, and
 append-only `text_delta` frames go through an adaptive speech chunker (5–12 char
 first phrase, larger later phrases, fenced code/URLs omitted).
-`RealtimeVoiceBar.subscribeToReply` lets 俺寻思 map `chatAsideDelta` /
-`loopAsideDelta` into the same speech pipeline. `voiceOwnerId` enforces one active
-mic/TTS owner per page, so opening the companion voice automatically closes an
-active main-chat voice link (and vice versa).
+The global 俺寻思 assistant intentionally does not use `RealtimeVoiceBar`; its mic
+is speech-to-text only, leaving reply playback and wake-word behavior to ordinary
+chat's explicit realtime-conversation control.
 `ttsStreamSynthesize(sessionId, streamId, seq, ...)` accepts each Edge-TTS chunk
 without blocking the WebSocket RPC loop; two backend workers synthesize in
 parallel and push `ttsStreamAudio`, while the browser decodes and plays strictly

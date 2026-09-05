@@ -51,10 +51,15 @@ import type { SmoothGhostState } from './utils/smoothGhost';
 import { notifyTaskCompletion } from './utils/desktopNotifications';
 import type { FileFocusRequest } from './utils/fileFocus';
 import {
-  OPEN_THOUGHTS_EVENT,
   type AttentionContext,
   type AttentionKind,
 } from './utils/attentionContext';
+import {
+  createThoughtsChannel,
+  focusThoughtsWindow,
+  openThoughtsWindow,
+  type ThoughtsWindowMessage,
+} from './utils/thoughtsWindow';
 
 // 发布工作台保持按需加载；手机/控制端点击入口时才下载对应 chunk。
 const LazyReleaseCenter = React.lazy(() => import('./components/ReleaseCenter'));
@@ -106,6 +111,7 @@ export const App: React.FC = () => {
   const [manualLoopReleaseBusy, setManualLoopReleaseBusy] = useState(false);
   const [moreMenuOpen, setMoreMenuOpen] = useState(false);
   const [thoughtsOpen, setThoughtsOpen] = useState(false);
+  const [thoughtsDetached, setThoughtsDetached] = useState(false);
   const [fileAttention, setFileAttention] = useState<AttentionContext | null>(null);
   const [surfaceFocus, setSurfaceFocus] = useState<AttentionKind>('session');
   const [repoPanelEditing, setRepoPanelEditing] = useState(false);
@@ -217,12 +223,6 @@ export const App: React.FC = () => {
   const activeManualLoop = activeSession?.id === activeSessionId
     && activeSession?.sessionType === 'loop'
     && activeSession?.loopControlMode === 'manual';
-
-  useEffect(() => {
-    const openThoughts = () => setThoughtsOpen(true);
-    window.addEventListener(OPEN_THOUGHTS_EVENT, openThoughts);
-    return () => window.removeEventListener(OPEN_THOUGHTS_EVENT, openThoughts);
-  }, []);
 
   // 顶栏弹层遵循标准菜单交互：切换焦点会话、点击外部或按 Esc 都立即收起。
   useEffect(() => {
@@ -666,6 +666,63 @@ export const App: React.FC = () => {
     connPanelOpen, logViewerOpen, manualPanelOpen, newSessionDialogOpen, dataPicker,
     fileAttention, surfaceFocus, repoPanelOpen, assetPanelOpen, scratchPadOpen,
   ]);
+
+  const thoughtsSnapshotRef = useRef({ attention: currentAttention, sessionId: activeSessionId || '' });
+  thoughtsSnapshotRef.current = { attention: currentAttention, sessionId: activeSessionId || '' };
+  const thoughtsChannelRef = useRef<BroadcastChannel | null>(null);
+
+  useEffect(() => {
+    const channel = createThoughtsChannel();
+    thoughtsChannelRef.current = channel;
+    if (!channel) return;
+    channel.onmessage = (event: MessageEvent<ThoughtsWindowMessage>) => {
+      if (event.data?.type === 'request-snapshot') {
+        channel.postMessage({ type: 'snapshot', ...thoughtsSnapshotRef.current } satisfies ThoughtsWindowMessage);
+      } else if (event.data?.type === 'detached-open') {
+        setThoughtsDetached(true);
+        setThoughtsOpen(false);
+      } else if (event.data?.type === 'detached-closed') {
+        setThoughtsDetached(false);
+      }
+    };
+    return () => {
+      channel.close();
+      thoughtsChannelRef.current = null;
+    };
+  }, []);
+
+  useEffect(() => {
+    thoughtsChannelRef.current?.postMessage({
+      type: 'snapshot', attention: currentAttention, sessionId: activeSessionId || '',
+    } satisfies ThoughtsWindowMessage);
+  }, [activeSessionId, currentAttention]);
+
+  const toggleThoughts = useCallback(() => {
+    if (!thoughtsDetached) {
+      setThoughtsOpen((value) => !value);
+      return;
+    }
+    void focusThoughtsWindow().then((focused) => {
+      if (!focused) {
+        setThoughtsDetached(false);
+        setThoughtsOpen(true);
+      }
+    });
+  }, [thoughtsDetached]);
+
+  const detachThoughts = useCallback(() => {
+    void openThoughtsWindow(activeSessionId || '').then((opened) => {
+      if (!opened) {
+        setToast({ type: 'error', message: '弹出窗口被阻止，请允许本站打开弹窗后重试。' });
+        return;
+      }
+      setThoughtsDetached(true);
+      setThoughtsOpen(false);
+      thoughtsChannelRef.current?.postMessage({
+        type: 'snapshot', attention: currentAttention, sessionId: activeSessionId || '',
+      } satisfies ThoughtsWindowMessage);
+    });
+  }, [activeSessionId, currentAttention]);
 
   // ── 性能：便签本拖拽 handler，onMouseDown 每次渲染都会重新生成，改为 ref 方案 ──
   const scratchPadWidthRef = useRef(scratchPadWidth);
@@ -1538,17 +1595,17 @@ export const App: React.FC = () => {
           <button
             onClick={() => {
               setMoreMenuOpen(false);
-              setThoughtsOpen((value) => !value);
+              toggleThoughts();
             }}
             style={{
               ...settingsBtnStyle,
               width: isMobile ? 44 : 'auto',
               minWidth: isMobile ? 44 : 30,
               padding: isMobile ? 0 : '0 8px',
-              ...(thoughtsOpen ? { background: 'var(--theme-accent-bg)', color: 'var(--theme-accent)' } : {}),
+              ...(thoughtsOpen || thoughtsDetached ? { background: 'var(--theme-accent-bg)', color: 'var(--theme-accent)' } : {}),
               ...(isMobile ? { minWidth: 44, minHeight: 44 } : {}),
             }}
-            title="俺寻思 · 跟随当前 Session、文件或面板的独立思路"
+            title={thoughtsDetached ? '俺寻思已在独立窗口中，点击聚焦' : '俺寻思 · 跟随当前 Session、文件、框选或面板'}
             aria-label="打开俺寻思注意力助手"
           >
             🤔{!isMobile && <span style={{ marginLeft: 4, fontSize: 11 }}>俺寻思</span>}
@@ -1941,8 +1998,8 @@ export const App: React.FC = () => {
         session={activeSession}
         attention={currentAttention}
         backends={activeExecBackends}
-        config={config}
         isMobile={isMobile}
+        onDetach={detachThoughts}
       />
 
       {/* ---- Toast 通知 ---- */}

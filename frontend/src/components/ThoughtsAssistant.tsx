@@ -1,14 +1,23 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { api } from '../api';
+import { api, getCurrentUserProfile } from '../api';
 import { useClipboardImage } from '../hooks/useClipboardImage';
+import { themes, useConfig } from '../hooks/useConfig';
 import { markdownToHtml } from '../utils/markdown';
 import {
   attentionIcon,
   type AttentionContext,
   type AttentionKind,
 } from '../utils/attentionContext';
+import {
+  closeCurrentThoughtsWindow,
+  createThoughtsChannel,
+  isThoughtsWindow,
+  loadThoughtsWindowPinned,
+  persistThoughtsWindowPinned,
+  type ThoughtsWindowMessage,
+} from '../utils/thoughtsWindow';
 import { AdvancedPromptTextarea } from './AdvancedPromptTextarea';
-import { RealtimeVoiceBar } from './RealtimeVoiceBar';
+import { SpeechToTextControl } from './SpeechToTextControl';
 
 interface AsideTurn {
   id: string;
@@ -29,8 +38,9 @@ interface Props {
   session: any | null;
   attention: AttentionContext;
   backends: any[];
-  config: any;
   isMobile?: boolean;
+  standalone?: boolean;
+  onDetach?: () => void;
 }
 
 type PanelMode = 'float' | 'dock';
@@ -43,9 +53,9 @@ function storedMode(): PanelMode {
 function storedWidth(): number {
   try {
     const value = Number(localStorage.getItem('awu.thoughts.width'));
-    if (Number.isFinite(value)) return Math.max(380, Math.min(760, value));
+    if (Number.isFinite(value)) return Math.max(460, Math.min(900, value));
   } catch { /* ignore */ }
-  return 520;
+  return 660;
 }
 
 function turnContext(turn: AsideTurn): AttentionContext {
@@ -63,8 +73,9 @@ export const ThoughtsAssistant: React.FC<Props> = ({
   session,
   attention,
   backends,
-  config,
   isMobile = false,
+  standalone = false,
+  onDetach,
 }) => {
   const sessionId = session?.id || '';
   const isLoop = session?.sessionType === 'loop';
@@ -81,9 +92,11 @@ export const ThoughtsAssistant: React.FC<Props> = ({
   const [asideBackendId, setAsideBackendId] = useState('');
   const [followFocus, setFollowFocus] = useState(true);
   const [selectedContextKey, setSelectedContextKey] = useState(attention.key);
+  const [windowPinned, setWindowPinned] = useState(loadThoughtsWindowPinned);
+  const [windowPinBusy, setWindowPinBusy] = useState(false);
+  const [windowPinSupported, setWindowPinSupported] = useState(false);
   const boxRef = useRef<HTMLDivElement>(null);
   const listRef = useRef<HTMLDivElement>(null);
-  const voiceTurnIdRef = useRef('');
   const { images, removeImage, clearImages, readFromClipboard } = useClipboardImage(boxRef);
 
   useEffect(() => {
@@ -94,12 +107,27 @@ export const ThoughtsAssistant: React.FC<Props> = ({
   }, [width]);
 
   useEffect(() => {
+    if (!standalone || typeof (window as any).__TAURI_INTERNALS__ === 'undefined') return;
+    let cancelled = false;
+    void import('@tauri-apps/api/window').then(async ({ getCurrentWindow }) => {
+      const current = getCurrentWindow();
+      const preferred = loadThoughtsWindowPinned();
+      await current.setAlwaysOnTop(preferred);
+      const actual = await current.isAlwaysOnTop().catch(() => preferred);
+      if (!cancelled) {
+        setWindowPinned(actual);
+        setWindowPinSupported(true);
+      }
+    }).catch(() => { if (!cancelled) setWindowPinSupported(false); });
+    return () => { cancelled = true; };
+  }, [standalone]);
+
+  useEffect(() => {
     setFollowFocus(true);
     setSelectedContextKey(attention.key);
     setAsides([]);
     setLive({});
     setError('');
-    voiceTurnIdRef.current = '';
   }, [sessionId]);
 
   useEffect(() => {
@@ -193,19 +221,24 @@ export const ThoughtsAssistant: React.FC<Props> = ({
 
   const submit = useCallback(async (forcedText?: string) => {
     const question = (forcedText ?? draft).trim();
-    if (!sessionId || busy || (!question && images.length === 0)) return;
-    setError('');
     const context = attentionForRequest();
+    const focusImages = context.imageAttachments || [];
+    const outgoingImages = [...focusImages, ...images].filter((item, index, all) => (
+      all.findIndex((candidate) => candidate.id === item.id) === index
+    ));
+    if (!sessionId || busy || (!question && outgoingImages.length === 0)) return;
+    setError('');
+    // 图片框选是瞬时注意力附件；从 attention JSON 中剥离，避免复制两份 Base64。
+    const { imageAttachments: _focusImages, ...attentionPayload } = context;
     setSubmitting(true);
     try {
       const result = await (isLoop
-        ? api.loopAsk(sessionId, question, images.length ? images : undefined, context as unknown as Record<string, unknown>)
-        : api.chatAsk(sessionId, question, images.length ? images : undefined, context as unknown as Record<string, unknown>));
+        ? api.loopAsk(sessionId, question, outgoingImages.length ? outgoingImages : undefined, attentionPayload as unknown as Record<string, unknown>)
+        : api.chatAsk(sessionId, question, outgoingImages.length ? outgoingImages : undefined, attentionPayload as unknown as Record<string, unknown>));
       if (result.status !== 'ok') {
         setError(result.message || '提问失败');
         return;
       }
-      voiceTurnIdRef.current = result.turnId || '';
       if (forcedText === undefined) setDraft('');
       clearImages();
     } catch (reason: any) {
@@ -229,36 +262,11 @@ export const ThoughtsAssistant: React.FC<Props> = ({
     void (isLoop ? api.loopAsideAbort(sessionId) : api.chatAsideAbort(sessionId));
   }, [sessionId, isLoop]);
 
-  const subscribeToReply = useCallback((handler: (delta: any) => void) => {
-    const deltaHandler = (data: any) => {
-      if (data?.sessionId !== sessionId || data.turnId !== voiceTurnIdRef.current) return;
-      handler({ sessionId, messageId: data.turnId, type: 'text_delta', text: data.text || '' });
-    };
-    const updatedHandler = (data: any) => {
-      if (data?.sessionId !== sessionId || !voiceTurnIdRef.current) return;
-      const turn = (data.asides || []).find((item: AsideTurn) => item.id === voiceTurnIdRef.current);
-      if (!turn || turn.status === 'answering') return;
-      handler({
-        sessionId,
-        messageId: turn.id,
-        type: turn.status === 'error' ? 'error' : 'done',
-        error: turn.status === 'error' ? (turn.answer || '俺寻思回答失败') : undefined,
-      });
-      if (turn.status === 'error') {
-        handler({ sessionId, messageId: turn.id, type: 'done' });
-      }
-      voiceTurnIdRef.current = '';
-    };
-    const offDelta = isLoop ? api.onLoopAsideDelta(deltaHandler) : api.onChatAsideDelta(deltaHandler);
-    const offUpdated = isLoop ? api.onLoopUpdated(updatedHandler) : api.onChatAsideUpdated(updatedHandler);
-    return () => { offDelta(); offUpdated(); };
-  }, [sessionId, isLoop]);
-
   const startResize = useCallback((event: React.MouseEvent<HTMLDivElement>) => {
     event.preventDefault();
     const startX = event.clientX;
     const startWidth = widthRef.current;
-    const move = (next: MouseEvent) => setWidth(Math.max(380, Math.min(760, startWidth + startX - next.clientX)));
+    const move = (next: MouseEvent) => setWidth(Math.max(460, Math.min(900, startWidth + startX - next.clientX)));
     const up = () => {
       window.removeEventListener('mousemove', move);
       window.removeEventListener('mouseup', up);
@@ -267,10 +275,28 @@ export const ThoughtsAssistant: React.FC<Props> = ({
     window.addEventListener('mouseup', up);
   }, []);
 
+  const toggleWindowPin = useCallback(async () => {
+    if (!standalone || !windowPinSupported || windowPinBusy) return;
+    const next = !windowPinned;
+    setWindowPinBusy(true);
+    try {
+      const { getCurrentWindow } = await import('@tauri-apps/api/window');
+      await getCurrentWindow().setAlwaysOnTop(next);
+      persistThoughtsWindowPinned(next);
+      setWindowPinned(next);
+    } catch (reason: any) {
+      setError(reason?.message || '窗口置顶设置失败');
+    } finally {
+      setWindowPinBusy(false);
+    }
+  }, [standalone, windowPinBusy, windowPinSupported, windowPinned]);
+
   if (!open) return null;
 
-  const actualMode: PanelMode = isMobile ? 'float' : mode;
-  const shellStyle: React.CSSProperties = actualMode === 'dock'
+  const actualMode: PanelMode | 'window' = standalone ? 'window' : isMobile ? 'float' : mode;
+  const shellStyle: React.CSSProperties = actualMode === 'window'
+    ? detachedShell
+    : actualMode === 'dock'
     ? { ...dockShell, width }
     : isMobile
       ? { ...floatShell, width: '100%', maxWidth: '100vw', inset: 0, borderRadius: 0 }
@@ -288,11 +314,25 @@ export const ThoughtsAssistant: React.FC<Props> = ({
           <div style={{ fontSize: 10.5, color: 'var(--theme-text-muted)' }}>独立思路 · 跟着你的注意力走</div>
         </div>
         <div style={{ flex: 1 }} />
-        {!isMobile && (
+        {!standalone && !isMobile && (
           <button type="button" style={iconButton} onClick={() => setMode(actualMode === 'dock' ? 'float' : 'dock')}
             title={actualMode === 'dock' ? '改为最上层浮窗' : '停靠到右侧分屏'}>
             {actualMode === 'dock' ? '↗' : '◫'}
           </button>
+        )}
+        {!standalone && !isMobile && onDetach && (
+          <button type="button" style={{ ...iconButton, width: 'auto', padding: '0 9px' }} onClick={onDetach} title="分离为独立宽窗口，方便系统分屏">⧉ 分离</button>
+        )}
+        {standalone && (
+          <button
+            type="button"
+            style={{ ...iconButton, width: 'auto', padding: '0 9px', ...(windowPinned ? activeIconButton : {}), opacity: windowPinSupported ? 1 : 0.48 }}
+            disabled={!windowPinSupported || windowPinBusy}
+            onClick={() => void toggleWindowPin()}
+            title={windowPinSupported
+              ? windowPinned ? '取消独立窗口置顶' : '让独立窗口始终置顶'
+              : '浏览器弹窗无法强制跨应用置顶；可使用系统分屏'}
+          >{windowPinBusy ? '设置中…' : windowPinned ? '📌 已置顶' : '📍 置顶'}</button>
         )}
         <button type="button" style={iconButton} onClick={onClose} title="收起俺寻思">✕</button>
       </div>
@@ -326,7 +366,9 @@ export const ThoughtsAssistant: React.FC<Props> = ({
         </div>
         <div style={snapshotLine}>
           <span>{session ? `Session · ${session.title || session.name || session.id.slice(0, 8)}` : '尚未选择 Session'}</span>
-          <span>{displayedAttention.content ? `已带入 ${displayedAttention.content.length.toLocaleString()} 字界面快照` : '仅带入对象身份'}</span>
+          <span>{displayedAttention.imageAttachments?.length
+            ? `已关联 ${displayedAttention.imageAttachments.length} 张框选图 · 发送时自动附带`
+            : displayedAttention.content ? `已带入 ${displayedAttention.content.length.toLocaleString()} 字界面快照` : '仅带入对象身份'}</span>
         </div>
       </div>
 
@@ -389,30 +431,6 @@ export const ThoughtsAssistant: React.FC<Props> = ({
       {error && <div role="alert" style={errorStyle}>{error}</div>}
 
       <div ref={boxRef} style={composerStyle}>
-        {sessionId && (
-          <RealtimeVoiceBar
-            compact
-            sessionId={sessionId}
-            backendLabel={`俺寻思 · ${backendLabel}`}
-            isStreaming={busy}
-            isFocused={open}
-            voice={config.ttsVoice}
-            rate={config.ttsRate}
-            turnEndSilenceMs={config.realtimeVoiceTurnEndSilenceMs}
-            continuousWindowMs={config.realtimeVoiceContinuousWindowMs}
-            wakeWord={config.realtimeVoiceWakeWord}
-            ttsEngine={config.realtimeVoiceTtsEngine}
-            systemVoice={config.realtimeVoiceSystemVoice}
-            dashscopeModel={config.realtimeVoiceDashScopeModel}
-            dashscopeVoice={config.realtimeVoiceDashScopeVoice}
-            vadThreshold={config.realtimeVoiceVadThreshold}
-            bargeIn={config.realtimeVoiceBargeIn}
-            onSend={(text) => { void submit(text); }}
-            onAbort={abort}
-            subscribeToReply={subscribeToReply}
-            voiceOwnerId={`thoughts:${sessionId}`}
-          />
-        )}
         {images.length > 0 && (
           <div style={{ display: 'flex', gap: 7, flexWrap: 'wrap', marginBottom: 8 }}>
             {images.map((image) => (
@@ -445,7 +463,15 @@ export const ThoughtsAssistant: React.FC<Props> = ({
           {busy ? (
             <button style={stopButton} onClick={abort} title="停止当前俺寻思回答">■</button>
           ) : (
-            <button style={sendButton} disabled={!sessionId || (!draft.trim() && images.length === 0)} onClick={() => void submit()}>发送</button>
+            <button style={sendButton} disabled={!sessionId || (!draft.trim() && images.length === 0 && !displayedAttention.imageAttachments?.length)} onClick={() => void submit()}>发送</button>
+          )}
+          {sessionId && (
+            <SpeechToTextControl
+              sessionId={sessionId}
+              value={draft}
+              onValueChange={setDraft}
+              disabled={busy}
+            />
           )}
         </div>
       </div>
@@ -453,11 +479,127 @@ export const ThoughtsAssistant: React.FC<Props> = ({
   );
 };
 
+export { isThoughtsWindow };
+
+/** 独立 Web/Tauri 窗口：通过 BroadcastChannel 接收主窗口的瞬时注意力，不落盘正文。 */
+export const ThoughtsAssistantWindow: React.FC = () => {
+  const initialSessionId = new URLSearchParams(location.search).get('sessionId') || '';
+  const [attention, setAttention] = useState<AttentionContext>({
+    key: initialSessionId ? 'session' : 'home',
+    kind: initialSessionId ? 'session' : 'home',
+    label: initialSessionId ? `Session ${initialSessionId.slice(0, 8)}` : 'AgentWithU 工作总览',
+    detail: '等待主窗口同步当前关注点…',
+    sessionId: initialSessionId || undefined,
+  });
+  const [session, setSession] = useState<any | null>(null);
+  const [backends, setBackends] = useState<any[]>([]);
+  const currentUser = useMemo(() => getCurrentUserProfile(), []);
+  const { config } = useConfig(currentUser);
+  const channelRef = useRef<BroadcastChannel | null>(null);
+
+  useEffect(() => {
+    document.title = '俺寻思 — AgentWithU';
+    document.body.style.margin = '0';
+    document.body.style.overflow = 'hidden';
+    const channel = createThoughtsChannel();
+    channelRef.current = channel;
+    if (channel) {
+      channel.onmessage = (event: MessageEvent<ThoughtsWindowMessage>) => {
+        if (event.data?.type === 'snapshot') setAttention(event.data.attention);
+      };
+      channel.postMessage({ type: 'detached-open' } satisfies ThoughtsWindowMessage);
+      channel.postMessage({ type: 'request-snapshot' } satisfies ThoughtsWindowMessage);
+    }
+    const closed = () => channel?.postMessage({ type: 'detached-closed' } satisfies ThoughtsWindowMessage);
+    window.addEventListener('beforeunload', closed);
+    return () => {
+      closed();
+      window.removeEventListener('beforeunload', closed);
+      channel?.close();
+      channelRef.current = null;
+    };
+  }, []);
+
+  const sessionId = attention.sessionId || initialSessionId;
+  useEffect(() => {
+    if (!sessionId) { setSession(null); setBackends([]); return; }
+    let cancelled = false;
+    setSession((current: any) => current?.id === sessionId ? current : null);
+    void api.loadSessionMeta(sessionId).then((metadata) => {
+      if (!cancelled) setSession(metadata);
+    }).catch(() => {
+      if (!cancelled) setSession({ id: sessionId, title: attention.label, workingDir: attention.workingDir, execKey: attention.execKey });
+    });
+    return () => { cancelled = true; };
+  }, [attention.execKey, attention.label, attention.workingDir, sessionId]);
+
+  useEffect(() => {
+    if (!sessionId || !session) return;
+    let cancelled = false;
+    void api.getBackends(session.execKey).then((items) => { if (!cancelled) setBackends(items || []); });
+    return () => { cancelled = true; };
+  }, [session, sessionId]);
+
+  const palette = themes[config.theme] || themes.dark;
+  const rootStyle = {
+    width: '100vw', height: '100vh', overflow: 'hidden', background: palette.bg,
+    '--theme-bg': palette.bg,
+    '--theme-bg-secondary': palette.bgSecondary,
+    '--theme-bg-tertiary': palette.bgTertiary,
+    '--theme-panel-bg': palette.bg,
+    '--theme-input-bg': palette.inputBg,
+    '--theme-border': palette.border,
+    '--theme-text': palette.text,
+    '--theme-text-muted': palette.textMuted,
+    '--theme-accent': palette.accent,
+    '--theme-accent-bg': palette.accentBg,
+    '--theme-error': palette.error,
+    fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", sans-serif',
+  } as React.CSSProperties;
+
+  const close = () => {
+    channelRef.current?.postMessage({ type: 'detached-closed' } satisfies ThoughtsWindowMessage);
+    void closeCurrentThoughtsWindow();
+  };
+
+  return (
+    <div className="awu-thoughts-window" style={rootStyle}>
+      <style>{`
+        .awu-thoughts-window .md-content { line-height: 1.7; overflow-wrap: anywhere; }
+        .awu-thoughts-window .md-content p { margin: .55em 0; }
+        .awu-thoughts-window .md-content ul,
+        .awu-thoughts-window .md-content ol { margin: .55em 0; padding-left: 1.7em; }
+        .awu-thoughts-window .md-content pre { overflow: auto; margin: .65em 0; padding: 10px 12px; border-radius: 8px; background: ${palette.codeBg}; }
+        .awu-thoughts-window .md-content code { font-family: Consolas, "SFMono-Regular", monospace; }
+        .awu-thoughts-window .md-content blockquote { margin: .65em 0; padding-left: 10px; border-left: 3px solid ${palette.accent}; color: ${palette.textMuted}; }
+        .awu-thoughts-window .md-content table { display: block; max-width: 100%; overflow-x: auto; border-collapse: collapse; }
+        .awu-thoughts-window .md-content th,
+        .awu-thoughts-window .md-content td { padding: 6px 8px; border: 1px solid ${palette.border}; }
+        .awu-thoughts-window .streaming-cursor { color: ${palette.accent}; animation: awu-thoughts-blink .85s steps(1) infinite; }
+        @keyframes awu-thoughts-blink { 50% { opacity: 0; } }
+      `}</style>
+      <ThoughtsAssistant
+        open
+        standalone
+        onClose={close}
+        session={session}
+        attention={attention}
+        backends={backends}
+      />
+    </div>
+  );
+};
+
 const dockShell: React.CSSProperties = {
-  position: 'relative', zIndex: 32000, flexShrink: 0, height: '100%', minWidth: 380, maxWidth: '55vw',
+  position: 'relative', zIndex: 32000, flexShrink: 0, height: '100%', minWidth: 460, maxWidth: '70vw',
   display: 'flex', flexDirection: 'column', overflow: 'hidden',
   background: 'var(--theme-panel-bg, var(--theme-bg))',
   borderLeft: '1px solid var(--theme-border)', boxShadow: '-10px 0 30px rgba(0,0,0,.16)',
+};
+const detachedShell: React.CSSProperties = {
+  position: 'fixed', inset: 0, zIndex: 1, width: '100%', height: '100%',
+  display: 'flex', flexDirection: 'column', overflow: 'hidden',
+  background: 'var(--theme-panel-bg, var(--theme-bg))', color: 'var(--theme-text)',
 };
 const floatShell: React.CSSProperties = {
   position: 'fixed', zIndex: 32000, top: 62, right: 18, bottom: 18, maxWidth: 'calc(100vw - 24px)',
@@ -469,6 +611,7 @@ const resizeHandle: React.CSSProperties = { position: 'absolute', left: -3, top:
 const headerStyle: React.CSSProperties = { display: 'flex', alignItems: 'center', gap: 9, padding: '12px 14px 10px', borderBottom: '1px solid var(--theme-border)' };
 const brandMark: React.CSSProperties = { width: 34, height: 34, borderRadius: 11, display: 'grid', placeItems: 'center', fontSize: 18, background: 'linear-gradient(135deg, var(--theme-accent-bg), var(--theme-bg-tertiary))', border: '1px solid var(--theme-border)' };
 const iconButton: React.CSSProperties = { width: 30, height: 30, borderRadius: 8, border: '1px solid var(--theme-border)', background: 'var(--theme-bg-secondary)', color: 'var(--theme-text)', cursor: 'pointer' };
+const activeIconButton: React.CSSProperties = { color: 'var(--theme-accent)', borderColor: 'var(--theme-accent)', background: 'var(--theme-accent-bg)' };
 const attentionCard: React.CSSProperties = { margin: '11px 12px 8px', padding: '11px 12px', borderRadius: 12, border: '1px solid color-mix(in srgb, var(--theme-accent) 35%, var(--theme-border))', background: 'linear-gradient(135deg, var(--theme-accent-bg), transparent 72%)', color: 'var(--theme-text)' };
 const followingBadge: React.CSSProperties = { fontSize: 9.5, padding: '1px 5px', borderRadius: 999, color: 'var(--theme-accent)', background: 'var(--theme-bg)', border: '1px solid var(--theme-border)', flexShrink: 0 };
 const attentionDetail: React.CSSProperties = { marginTop: 2, fontSize: 10.5, color: 'var(--theme-text-muted)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' };

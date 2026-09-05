@@ -2,6 +2,7 @@ import React, {
   useCallback, useEffect, useMemo, useRef, useState,
 } from 'react';
 import { api } from '../../api';
+import { buildReviewAttentionContext, type AttentionContext } from '../../utils/attentionContext';
 import type {
   ProvAnnotation, ProvDocument, ProvImageShape, ProvOpenResult, ProvPoint,
   ProvReviewState, ProvSelector, ProvSourcePreview, ProvTool,
@@ -12,8 +13,10 @@ interface Props {
   initial: ProvOpenResult;
   workingDir: string;
   execKey?: string;
+  sessionId?: string;
   onClose: () => void;
   onSaved?: () => void;
+  onAttentionChange?: (context: AttentionContext | null) => void;
 }
 
 type Notice = { kind: 'ok' | 'error' | 'info'; text: string };
@@ -102,7 +105,7 @@ function descendantsOf(document: ProvDocument, annotationId: string): Set<string
 }
 
 export const ReviewWorkbench: React.FC<Props> = ({
-  initial, workingDir, execKey, onClose, onSaved,
+  initial, workingDir, execKey, sessionId, onClose, onSaved, onAttentionChange,
 }) => {
   const [document, setDocument] = useState<ProvDocument>(() => cloneDocument(initial.document));
   const [sourceStatus, setSourceStatus] = useState(initial.sourceStatus);
@@ -125,6 +128,27 @@ export const ReviewWorkbench: React.FC<Props> = ({
     [document.annotations, selectedId],
   );
   const isImage = sourcePreview?.kind === 'image';
+
+  // 审批里的选择就是用户此刻最明确的视觉注意力。文字带 exact quote；图片
+  // 自动裁出框选区域，均只保留在当前 UI 内存并交给全局“俺寻思”。
+  useEffect(() => {
+    if (!onAttentionChange) return;
+    if (!selected) {
+      onAttentionChange(null);
+      return;
+    }
+    let cancelled = false;
+    const timer = window.setTimeout(() => {
+      void buildReviewAttentionContext(document, sourcePreview, selected, {
+        sessionId, workingDir, execKey, source: 'remote',
+      }).then((context) => {
+        if (!cancelled) onAttentionChange(context);
+      });
+    }, 60);
+    return () => { cancelled = true; window.clearTimeout(timer); };
+  }, [document, execKey, onAttentionChange, selected, sessionId, sourcePreview, workingDir]);
+
+  useEffect(() => () => onAttentionChange?.(null), [onAttentionChange]);
 
   const replaceDocument = useCallback((next: ProvDocument) => {
     // 已审批的稿件一旦再次编辑就回到草稿，避免旧结论继续挂在新内容上。

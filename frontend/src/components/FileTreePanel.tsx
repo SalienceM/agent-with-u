@@ -485,6 +485,7 @@ export const FileTreePanel: React.FC<Props> = ({ sessionId, workingDir, execKey,
   const [htmlExporting, setHtmlExporting] = useState(false);
   const [htmlExported, setHtmlExported] = useState(false);
   const [review, setReview] = useState<ProvOpenResult | null>(null);
+  const [reviewAttention, setReviewAttention] = useState<AttentionContext | null>(null);
   const [reviewOpening, setReviewOpening] = useState(false);
   const [transfer, setTransfer] = useState<TransferProgress | null>(null);
   const transferBusyRef = useRef(false);
@@ -495,6 +496,10 @@ export const FileTreePanel: React.FC<Props> = ({ sessionId, workingDir, execKey,
   // buildFileAttentionContext 中剔除，正文只留在浏览器内直到用户真正提问。
   useEffect(() => {
     if (!onAttentionChange) return;
+    if (review && reviewAttention) {
+      onAttentionChange(reviewAttention);
+      return;
+    }
     if (!preview) {
       onAttentionChange(null);
       return;
@@ -505,7 +510,7 @@ export const FileTreePanel: React.FC<Props> = ({ sessionId, workingDir, execKey,
       execKey,
       editedText: editing ? editText : undefined,
     }));
-  }, [preview, editing, editText, sessionId, workingDir, execKey, onAttentionChange]);
+  }, [preview, editing, editText, sessionId, workingDir, execKey, onAttentionChange, review, reviewAttention]);
 
   useEffect(() => () => onAttentionChange?.(null), [onAttentionChange]);
 
@@ -2992,7 +2997,9 @@ export const FileTreePanel: React.FC<Props> = ({ sessionId, workingDir, execKey,
             initial={review}
             workingDir={workingDir}
             execKey={execKey}
-            onClose={() => setReview(null)}
+            sessionId={sessionId}
+            onAttentionChange={setReviewAttention}
+            onClose={() => { setReview(null); setReviewAttention(null); }}
             onSaved={() => { void reloadAll(); }}
           />
         </Suspense>
