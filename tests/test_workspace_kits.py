@@ -61,6 +61,22 @@ class WorkspaceKitModelTests(unittest.TestCase):
         self.assertEqual(env["KIT_INPUT_BRANCH"], "feature/a; Remove-Item *")
         self.assertNotIn("Remove-Item", command)
 
+    def test_secret_input_is_supported_but_cannot_keep_a_default(self):
+        kit = WorkspaceKit.from_dict({
+            "command": "Write-Output {{password}}",
+            "shell": "powershell",
+            "inputs": [{
+                "key": "password", "type": "secret",
+                "default": "must-not-persist", "sourceKey": "credential.password",
+            }],
+        })
+
+        BridgeWS._normalize_generated_kit(kit)
+
+        self.assertEqual("secret", kit.inputs[0]["type"])
+        self.assertNotIn("default", kit.inputs[0])
+        self.assertNotIn("sourceKey", kit.inputs[0])
+
     def test_inputs_can_consume_latest_data_market_value(self):
         state = WorkspaceKitState(
             session_id="s1",
@@ -466,6 +482,106 @@ class WorkspaceKitGenerationTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(bridge._kit_get(session_id).kits, [])
             self.assertEqual(bridge._kit_get(session_id).runs, [])
 
+    async def test_explicit_windows_ssh_linux_update_gets_a_runnable_builtin_kit(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(
+            os.environ, {"AGENT_WITH_U_DATA_ROOT": str(Path(tmp) / "data")},
+        ):
+            workspace = Path(tmp) / "workspace"
+            workspace.mkdir()
+            bridge = BridgeWS()
+            session_id = "ssh-linux-update-generation"
+            bridge._active_sessions[session_id] = Session(
+                id=session_id, title="SSH Linux update", created_at=time.time(), updated_at=time.time(),
+                messages=[], working_dir=str(workspace), backend_id="fake",
+            )
+            fake = _FakeKitCompilerBackend({
+                "ready": False,
+                "questions": ["请切换到 Linux Session"],
+                "warnings": ["当前 Session 是 Windows，禁止 SSH"],
+                "kit": {},
+            })
+            with patch.object(bridge, "_new_backend_instance", return_value=fake):
+                result = json.loads(await bridge._rpc_kitGenerate(session_id, json.dumps({
+                    "objective": (
+                        "按 deploy/WEB_156_INSTALL.md 的说明，完成一键更新远端处理，"
+                        "账户、密码、地址作为输入，由 PowerShell 登录那台 Linux 机器执行脚本"
+                    ),
+                    "successCriteria": "远端 Backend/Web 更新并通过健康检查",
+                }, ensure_ascii=False)))
+
+            self.assertEqual("ok", result["status"])
+            self.assertTrue(result["ready"])
+            self.assertEqual([], result["questions"])
+            kit = result["kit"]
+            self.assertEqual("powershell", kit["shell"])
+            self.assertEqual("secret", next(
+                item for item in kit["inputs"] if item["key"] == "ssh_password"
+            )["type"])
+            self.assertEqual("v2.2", next(
+                item for item in kit["inputs"] if item["key"] == "git_branch"
+            )["default"])
+            command = kit["steps"][0]["command"]
+            self.assertIn("ssh.exe", command)
+            self.assertIn("SSH_ASKPASS", command)
+            self.assertIn("askpass.exe", command)
+            self.assertIn("sudo -S", command)
+            self.assertIn("KIT_INPUT_GIT_BRANCH", command)
+            self.assertIn("/var/packages/Git/target/bin", command)
+            self.assertIn("command -v git", command)
+            self.assertIn("git status --porcelain --untracked-files=no", command)
+            self.assertIn("git check-ref-format --branch", command)
+            self.assertIn("git merge --ff-only", command)
+            self.assertIn("$remoteLauncher", command)
+            self.assertIn("QVdVX1JFTU9URV9VUERBVEVfT0sK", command)
+            self.assertNotIn("AWU_REMOTE_UPDATE_OK", command)
+            self.assertNotIn("{{ssh_password}}", command)
+            self.assertEqual("", fake.prompt, "确定性 SSH 模板不应依赖模型重新编译")
+
+    async def test_secret_runtime_input_is_not_persisted_in_kit_run(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(
+            os.environ, {"AGENT_WITH_U_DATA_ROOT": str(Path(tmp) / "data")},
+        ):
+            workspace = Path(tmp) / "workspace"
+            workspace.mkdir()
+            bridge = BridgeWS()
+            session_id = "kit-secret-runtime"
+            bridge._active_sessions[session_id] = Session(
+                id=session_id, title="Secret runtime", created_at=time.time(), updated_at=time.time(),
+                messages=[], working_dir=str(workspace), backend_id="fake",
+            )
+            created = json.loads(bridge._rpc_kitCreate(session_id, json.dumps({
+                "title": "Secret",
+                "steps": [{
+                    "id": "secret-step", "type": "command", "shell": "powershell",
+                    "command": "Write-Output {{ssh_password}}",
+                }],
+                "inputs": [{"key": "ssh_password", "type": "secret", "required": True}],
+            }, ensure_ascii=False)))
+            secret = "never-write-this-password"
+            gate = asyncio.Event()
+
+            async def hold_run(*_args, **_kwargs):
+                await gate.wait()
+
+            with patch.object(bridge, "_run_workspace_kit", new=hold_run):
+                started = bridge._queue_workspace_kit_run(
+                    session_id, created["kit"]["id"], {"ssh_password": secret},
+                    trigger="manual", owner="human",
+                )
+                run_id = started["run"]["id"]
+                persisted = WorkspaceKitStore().load(session_id)
+                self.assertIsNotNone(persisted)
+                serialized = json.dumps(persisted.to_dict(), ensure_ascii=False)
+                self.assertNotIn(secret, serialized)
+                self.assertEqual("••••••", started["run"]["inputs"]["ssh_password"])
+                self.assertEqual(
+                    secret, bridge._kit_run_secret_env[run_id]["KIT_INPUT_SSH_PASSWORD"],
+                )
+                task = bridge._kit_tasks[run_id]
+                task.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
+
     async def test_ai_compiler_blocks_global_process_name_kill(self):
         with tempfile.TemporaryDirectory() as tmp, patch.dict(
             os.environ, {"AGENT_WITH_U_DATA_ROOT": str(Path(tmp) / "data")},
@@ -541,7 +657,7 @@ class WorkspaceKitGenerationTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(step["config"]["source"], "{{local_file}}")
             self.assertEqual(step["config"]["destination"], "amp-1.0-snapshot.jar")
             self.assertNotIn("SSH", result["implementationSummary"])
-            self.assertIn("绝对不要询问", fake.prompt)
+            self.assertIn("不得额外发明 SSH", fake.prompt)
 
     def test_selected_client_file_keeps_exact_local_source_and_same_name_destination(self):
         candidate = BridgeWS._kit_builtin_file_push_candidate(
@@ -1025,6 +1141,40 @@ class WorkspaceKitExecutionTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(run.steps[0].status, "failed")
             self.assertEqual(run.steps[1].status, "skipped")
             self.assertFalse((workspace / "skipped.txt").exists())
+
+    async def test_secret_input_is_redacted_from_live_and_persisted_output(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(
+            os.environ, {"AGENT_WITH_U_DATA_ROOT": str(Path(tmp) / "data")},
+        ):
+            bridge = BridgeWS()
+            workspace = Path(tmp) / "workspace"
+            workspace.mkdir()
+            session_id = "kit-secret-redaction"
+            self._session(bridge, session_id, workspace)
+            shell = "powershell" if os.name == "nt" else "bash"
+            command = "Write-Output {{password}}" if os.name == "nt" else "printf '%s' {{password}}"
+            created = json.loads(bridge._rpc_kitCreate(session_id, json.dumps({
+                "title": "secret output",
+                "shell": shell,
+                "command": command,
+                "inputs": [{"key": "password", "type": "secret", "required": True}],
+                "assertions": [{"type": "stdout_contains", "expected": "[secret]"}],
+            })))
+            secret = "do-not-persist-this-secret"
+            started = json.loads(bridge._rpc_kitRun(
+                session_id, created["kit"]["id"], json.dumps({"password": secret}),
+            ))
+
+            self.assertNotIn(secret, json.dumps(started, ensure_ascii=False))
+            run_id = started["run"]["id"]
+            await bridge._kit_tasks[run_id]
+            run = bridge._kit_get(session_id).runs[-1]
+            persisted = WorkspaceKitStore().load(session_id)
+
+            self.assertEqual("succeeded", run.status)
+            self.assertIn("[secret]", run.stdout)
+            self.assertNotIn(secret, json.dumps(persisted.to_dict(), ensure_ascii=False))
+            self.assertNotIn(run_id, bridge._kit_run_secret_env)
 
     async def test_kit_call_expands_and_runs_in_order(self):
         with tempfile.TemporaryDirectory() as tmp, patch.dict(

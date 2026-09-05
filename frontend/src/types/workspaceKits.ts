@@ -33,7 +33,7 @@ export interface KitStepSpec {
 export interface KitInputSpec {
   key: string;
   label?: string;
-  type?: 'text' | 'number' | 'boolean' | 'select' | 'file';
+  type?: 'text' | 'number' | 'boolean' | 'select' | 'file' | 'secret';
   required?: boolean;
   default?: unknown;
   options?: string[];

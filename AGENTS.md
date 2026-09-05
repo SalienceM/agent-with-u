@@ -563,10 +563,12 @@ Workspace Kits are Session-level standard accessories stored separately in
 - Humans define the **objective**, **success criteria**, **safety constraints**, and
   optional file/object references in natural language. The primary editor must not
   require users to author shell code or machine predicates.
-- `kitGenerate` runs an independent, non-resuming AI compiler turn on the Session
-  backend. It may inspect explicitly referenced workspace files read-only, returns a
-  preview, and never saves or executes the Kit automatically. The original NL
-  contract, AI implementation summary, provenance, and warnings persist on the Kit.
+- `kitGenerate` normally runs an independent, non-resuming AI compiler turn on the
+  Session backend. It may inspect explicitly referenced workspace files read-only,
+  returns a preview, and never saves or executes the Kit automatically. Product-known
+  deterministic templates may bypass the model but still pass through the same
+  normalization/safety pipeline. The original NL contract, implementation summary,
+  provenance, and warnings persist on the Kit.
 - The AI compiles that contract into a deterministic shell command, typed inputs,
   machine assertions, outputs, schedule, and view. Shell/command/assertion editing is
   retained only in the collapsible **Advanced implementation** escape hatch.
@@ -598,13 +600,25 @@ Workspace Kits are Session-level standard accessories stored separately in
   after an executor exception/restart. Client-side commands are registered by `runId`;
   the desktop that owns the process observes the same state update and terminates its
   local process tree even if the Kits panel is folded or another client pressed Stop.
-- “remote Session” always means the already-connected Session executor, not an SSH
-  destination. Natural-language compilation must map local-file-to-Session requests to
-  the built-in `file_push` primitive and must never ask for host, port, username,
-  protocol or credentials. The creation editor can select a concrete client-local file;
-  otherwise the compiler emits a required typed `file` input so the desktop user chooses
-  the source at run time. An unspecified destination defaults to the same filename in the
-  Session workspace root. The executor verifies size and SHA-256 before atomic replace.
+- “remote Session” by itself means the already-connected Session executor, not an SSH
+  destination. Natural-language compilation maps local-file-to-Session requests to the
+  built-in `file_push` primitive and does not invent hosts or credentials. The explicit
+  exception is a human request for the current Windows/PowerShell executor to log into a
+  separate Linux host: the built-in AgentWithU Docker update Kit calls Windows
+  `ssh.exe`, takes host/port/user/repository/Git branch/proxy plus one-time SSH/sudo
+  credentials, sends a fixed Base64-encoded Bash program, then verifies Backend/Web,
+  port 44380 and `qwen_code_sdk`. It does not start `awu-updater`. Host/user/port and
+  branch are validated, the remote repository must be absolute, and tracked local changes
+  or missing Docker access fail closed. The branch defaults to `v2.2`; a non-empty branch
+  is fetched from `origin`, checked out (or created as a tracking branch), and advanced
+  only with `--ff-only`. Normal file transfers still use `file_push`; an unspecified destination
+  defaults to the same filename in the Session workspace root, with size and SHA-256
+  verified before atomic replace.
+- Kit inputs support `secret` for one-run passwords and keys. Secret specs cannot retain
+  `default` or `sourceKey`; the UI uses a password field and clears it immediately after
+  the run RPC. The executor keeps values only in an in-memory per-run environment map,
+  persists masked inputs/step env, redacts stdout/stderr/errors, and drops the map when
+  the child task ends. Schedules therefore cannot recover a prior secret implicitly.
 - The Kits tab opens in a compact list-first mode: every Kit exposes Run/Stop and an
   optional Details action directly on its card. Details restores the full editor,
   assertions, logs, terminal, history, and data-dependency surface and can be collapsed

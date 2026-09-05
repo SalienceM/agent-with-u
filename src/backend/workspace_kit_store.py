@@ -60,6 +60,15 @@ def _normalized_env_key(value: str) -> str:
     return key or "VALUE"
 
 
+def kit_input_env_key(value: str) -> str:
+    """Return the environment variable used by a rendered Kit input.
+
+    Kept public so the runner can remove secret values from the persisted plan
+    while still injecting them into the child process at execution time.
+    """
+    return f"KIT_INPUT_{_normalized_env_key(value)}"
+
+
 KIT_IMPLEMENTATION_FIELDS = (
     "implementationSummary", "generationWarnings", "generatedByAi",
     "executionTarget", "steps", "command", "shell", "cwd", "timeoutSeconds",
@@ -878,7 +887,7 @@ def render_kit_command(kit: WorkspaceKit, inputs: dict) -> tuple[str, dict[str, 
         key = str(item.get("key") or "").strip()
         if not key:
             continue
-        env_key = f"KIT_INPUT_{_normalized_env_key(key)}"
+        env_key = kit_input_env_key(key)
         value = inputs.get(key, item.get("default", ""))
         if isinstance(value, bool):
             value = "true" if value else "false"

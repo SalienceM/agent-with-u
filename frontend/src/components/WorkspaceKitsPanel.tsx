@@ -150,7 +150,7 @@ function formatActivityAge(at?: number | null, now = Date.now() / 1000): string 
 function defaultInputsOf(kit: WorkspaceKit): Record<string, unknown> {
   const defaults: Record<string, unknown> = {};
   kit.inputs.forEach((spec) => {
-    if (spec.default !== undefined) defaults[spec.key] = spec.default;
+    if (spec.type !== 'secret' && spec.default !== undefined) defaults[spec.key] = spec.default;
   });
   return defaults;
 }
@@ -499,10 +499,22 @@ export const WorkspaceKitsPanel: React.FC<Props> = ({ sessionId, open, onClose }
   const runKit = async (kit: WorkspaceKit, runInputs: Record<string, unknown>) => {
     setBusy(true);
     setNotice(null);
-    const result = await api.kitRun(sessionId, kit.id, runInputs);
-    setBusy(false);
-    if (result.status !== 'ok') {
-      setNotice({ kind: 'error', text: result.message || '启动失败' });
+    try {
+      const result = await api.kitRun(sessionId, kit.id, runInputs);
+      if (result.status !== 'ok') {
+        setNotice({ kind: 'error', text: result.message || '启动失败' });
+      }
+    } catch (error) {
+      setNotice({ kind: 'error', text: `启动失败：${error instanceof Error ? error.message : String(error)}` });
+    } finally {
+      // Secret 只为这一轮 RPC 短暂驻留在页面内存；无论启动是否成功都立即清空。
+      const secretKeys = new Set(kit.inputs.filter((spec) => spec.type === 'secret').map((spec) => spec.key));
+      if (secretKeys.size > 0) {
+        setInputs((current) => Object.fromEntries(
+          Object.entries(current).filter(([key]) => !secretKeys.has(key)),
+        ));
+      }
+      setBusy(false);
     }
   };
 
@@ -1254,7 +1266,7 @@ const KitEditor: React.FC<{
               onChange={(e) => setInputs(draft.inputs.map((x, i) => i === index ? { ...x, type: e.target.value as KitInputSpec['type'] } : x))}>
               <option value="text">文本</option><option value="number">数字</option>
               <option value="boolean">开关</option><option value="select">选项</option>
-              <option value="file">客户端本地文件</option>
+              <option value="file">客户端本地文件</option><option value="secret">一次性密码 / 密钥</option>
             </select>
             {item.type === 'select' && (
               <input style={miniInput} placeholder="选项，以逗号分隔" value={(item.options || []).join(',')}
@@ -1263,8 +1275,12 @@ const KitEditor: React.FC<{
                   options: e.target.value.split(',').map((v) => v.trim()).filter(Boolean),
                 } : x))} />
             )}
-            <input style={miniInput} placeholder="来源数据 key（可选）" value={item.sourceKey || ''}
-              onChange={(e) => setInputs(draft.inputs.map((x, i) => i === index ? { ...x, sourceKey: e.target.value } : x))} />
+            {item.type === 'secret' ? (
+              <span style={{ ...subtleStyle, alignSelf: 'center' }}>不保存默认值或数据来源</span>
+            ) : (
+              <input style={miniInput} placeholder="来源数据 key（可选）" value={item.sourceKey || ''}
+                onChange={(e) => setInputs(draft.inputs.map((x, i) => i === index ? { ...x, sourceKey: e.target.value } : x))} />
+            )}
             <label style={tinyCheck}><input type="checkbox" checked={!!item.required}
               onChange={(e) => setInputs(draft.inputs.map((x, i) => i === index ? { ...x, required: e.target.checked } : x))} />必填</label>
             <button style={dangerMini} onClick={() => setInputs(draft.inputs.filter((_, i) => i !== index))}>×</button>
@@ -1814,6 +1830,11 @@ const KitDetail: React.FC<{
                     <option value="">请选择</option>
                     {(spec.options || []).map((item) => <option key={item} value={item}>{item}</option>)}
                   </select>
+                ) : spec.type === 'secret' ? (
+                  <input style={inputStyle} type="password" autoComplete="new-password"
+                    placeholder={spec.placeholder || '仅本次运行使用，不保存到记录'}
+                    value={String(inputs[spec.key] ?? '')}
+                    onChange={(e) => onInputsChange({ ...inputs, [spec.key]: e.target.value })} />
                 ) : (
                   <input style={inputStyle} type={spec.type === 'number' ? 'number' : 'text'}
                     placeholder={spec.placeholder || (spec.sourceKey ? '留空则取数据市场' : '')}
