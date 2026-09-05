@@ -41,6 +41,7 @@ import {
   type FileFocusRequest,
 } from '../utils/fileFocus';
 import { rankFileSearchPaths } from '../utils/fileSearch';
+import { buildFileAttentionContext, type AttentionContext } from '../utils/attentionContext';
 
 const CodeEditor = lazy(() => import('./CodeEditor'));
 const PdfPreview = lazy(() => import('./PdfPreview'));
@@ -56,6 +57,7 @@ interface Props {
   execMode?: 'local' | 'relay';   // 会话运行在哪：本机 / 远端中继节点
   backendId?: string;             // ★ 当前会话的 backendId —— 供 AI 生成 commit message 使用
   focusRequest?: FileFocusRequest | null;
+  onAttentionChange?: (context: AttentionContext | null) => void;
 }
 
 interface TNode {
@@ -387,7 +389,7 @@ const SearchHighlightedText: React.FC<{ text: string; query: string }> = ({ text
   ))}</>;
 };
 
-export const FileTreePanel: React.FC<Props> = ({ sessionId, workingDir, execKey, execLabel, execMode, backendId, focusRequest }) => {
+export const FileTreePanel: React.FC<Props> = ({ sessionId, workingDir, execKey, execLabel, execMode, backendId, focusRequest, onAttentionChange }) => {
   // execMode='local' 表示“在 Backend 所在机器执行”，不代表浏览器拥有那台
   // 机器的文件系统。只有 Tauri 本机执行时可直接视为同一端。
   const isRemote = execMode === 'relay' || !isTauri();
@@ -488,6 +490,24 @@ export const FileTreePanel: React.FC<Props> = ({ sessionId, workingDir, execKey,
   const transferBusyRef = useRef(false);
   const transferAbortRef = useRef(false);
   const [contextMenu, setContextMenu] = useState<FileContextMenu | null>(null);
+
+  // 把“用户此刻正在看的文件”提升到 App 的全局注意力层。二进制/Base64 会在
+  // buildFileAttentionContext 中剔除，正文只留在浏览器内直到用户真正提问。
+  useEffect(() => {
+    if (!onAttentionChange) return;
+    if (!preview) {
+      onAttentionChange(null);
+      return;
+    }
+    onAttentionChange(buildFileAttentionContext(preview, {
+      sessionId,
+      workingDir,
+      execKey,
+      editedText: editing ? editText : undefined,
+    }));
+  }, [preview, editing, editText, sessionId, workingDir, execKey, onAttentionChange]);
+
+  useEffect(() => () => onAttentionChange?.(null), [onAttentionChange]);
 
   useEffect(() => {
     if (!sessionId) {

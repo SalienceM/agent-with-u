@@ -6998,43 +6998,71 @@ class BridgeWS:
         lines.append(self._kit_context_digest(state.session_id))
         return "\n".join(lines)
 
-    def _rpc_loopAsk(self, session_id: str, question: str, images_json: str = "") -> str:
-        """By the way 旁路提问：基于当前 loop 状态对话，独立 agent session，
+    def _rpc_loopAsk(self, session_id: str, question: str, images_json: str = "",
+                     attention_json: str = "") -> str:
+        """“俺寻思”旁路提问：基于当前 loop 状态与 UI 注意力快照对话，独立 agent session，
         不 resume loop 主线 agent_session_id，不污染 prepare/execute/analysis 上下文。
         loop 正在 run 时也可随时使用。可附带图片（images_json：前端图片附件数组）。"""
         q = (question or "").strip()
         images = self._parse_images_json(images_json)
+        attention = self._parse_attention_json(attention_json)
         if not q and not images:
             return json.dumps({"status": "error", "message": "问题为空"}, ensure_ascii=False)
         state = self._loop_state(session_id)
         if not state:
             return json.dumps({"status": "error", "message": "no loop state"}, ensure_ascii=False)
         if session_id in self._aside_running:
-            return json.dumps({"status": "error", "message": "上一条 by-the-way 仍在回答"}, ensure_ascii=False)
+            return json.dumps({"status": "error", "message": "上一条俺寻思仍在回答"}, ensure_ascii=False)
         running_seq = next((l.seq for l in state.loops if not l.completed and not l.error), 0)
         turn = AsideTurn(id=new_id(), question=q or "（图片）", status="answering",
                          stage=state.stage, seq=running_seq,
-                         image_count=len(images) if images else 0)
+                         image_count=len(images) if images else 0,
+                         context_key=attention["key"], context_kind=attention["kind"],
+                         context_label=attention["label"], context_detail=attention["detail"])
         state.asides.append(turn)
         self._loop_save(state)
         self._emit_loop_updated(state)
-        asyncio.ensure_future(self._run_aside(session_id, turn.id, images))
+        asyncio.ensure_future(self._run_aside(session_id, turn.id, images, attention))
         return json.dumps({"status": "ok", "turnId": turn.id}, ensure_ascii=False)
 
-    def _rpc_loopAsideClear(self, session_id: str) -> str:
-        """清空 LOOP 的 BTW 历史；不触碰 Loop 主线状态、结果或策略。"""
+    def _rpc_loopAsideList(self, session_id: str) -> str:
+        state = self._loop_state(session_id)
+        if not state:
+            return json.dumps({"status": "error", "message": "no loop state", "asides": []}, ensure_ascii=False)
+        return json.dumps({
+            "status": "ok",
+            "asides": [item.to_dict() for item in state.asides],
+            "asideBackendId": state.policy.backend_for("aside") if state.policy else "",
+        }, ensure_ascii=False)
+
+    def _rpc_loopAsideClear(self, session_id: str, context_key: str = "") -> str:
+        """清空 LOOP 的俺寻思历史；可只清当前注意力对象，不触碰 Loop 主线。"""
         if session_id in self._aside_running:
             return json.dumps({
-                "status": "error", "message": "BTW 正在回答，请等待完成后再清空",
+                "status": "error", "message": "俺寻思正在回答，请等待完成后再清空",
             }, ensure_ascii=False)
         state = self._loop_state(session_id)
         if not state:
             return json.dumps({"status": "error", "message": "no loop state"}, ensure_ascii=False)
-        cleared = len(state.asides)
-        state.asides.clear()
+        wanted = (context_key or "").strip()
+        before = len(state.asides)
+        if wanted:
+            state.asides[:] = [item for item in state.asides if item.context_key != wanted]
+        else:
+            state.asides.clear()
+        cleared = before - len(state.asides)
         self._loop_save(state)
         self._emit_loop_updated(state)
         return json.dumps({"status": "ok", "cleared": cleared}, ensure_ascii=False)
+
+    def _rpc_loopAsideAbort(self, session_id: str) -> str:
+        backend = self._loop_active_backends.get(f"{session_id}:aside")
+        if backend is not None:
+            try:
+                backend.abort(f"{session_id}:aside")
+            except Exception:
+                pass
+        return json.dumps({"status": "ok", "aborting": backend is not None}, ensure_ascii=False)
 
     @staticmethod
     def _parse_images_json(images_json: str) -> Optional[list["ImageAttachment"]]:
@@ -7058,6 +7086,50 @@ class BridgeWS:
             except Exception:
                 continue
         return out or None
+
+    @staticmethod
+    def _parse_attention_json(attention_json: str) -> dict[str, str]:
+        """验证 UI 注意力快照。正文只供本次调用使用，不会写进 sidecar。"""
+        allowed_kinds = {
+            "session", "file", "settings", "backend", "release", "skills",
+            "assets", "notes", "connection", "logs", "manual", "home",
+        }
+        try:
+            raw = json.loads(attention_json) if attention_json else {}
+        except Exception:
+            raw = {}
+        if not isinstance(raw, dict):
+            raw = {}
+
+        def clean(name: str, limit: int) -> str:
+            value = raw.get(name, "")
+            if not isinstance(value, str):
+                return ""
+            return value.replace("\x00", "").strip()[:limit]
+
+        kind = clean("kind", 32)
+        if kind not in allowed_kinds:
+            kind = "session"
+        key = clean("key", 240) or "session"
+        return {
+            "key": key,
+            "kind": kind,
+            "label": clean("label", 160),
+            "detail": clean("detail", 1200),
+            "content": clean("content", 50_000),
+        }
+
+    @staticmethod
+    def _attention_prompt_block(attention: dict[str, str]) -> str:
+        label = attention.get("label") or "当前 Session"
+        detail = attention.get("detail") or "（无补充说明）"
+        content = attention.get("content") or "（该焦点没有可安全提取的正文快照）"
+        return (
+            f"类型：{attention.get('kind', 'session')}\n"
+            f"对象：{label}\n"
+            f"位置/说明：{detail}\n"
+            f"界面可见内容快照：\n{content}"
+        )
 
     @staticmethod
     def _parse_text_attachments_json(
@@ -7094,7 +7166,8 @@ class BridgeWS:
         return out or None
 
     async def _run_aside(self, session_id: str, turn_id: str,
-                         images: Optional[list["ImageAttachment"]] = None) -> None:
+                         images: Optional[list["ImageAttachment"]] = None,
+                         attention: Optional[dict[str, str]] = None) -> None:
         session = self._active_sessions.get(session_id) or self._session_store.load(session_id)
         state = self._loop_state(session_id)
         if not session or not state:
@@ -7105,16 +7178,26 @@ class BridgeWS:
         self._aside_running.add(session_id)
         try:
             digest = self._loop_context_digest(state)
-            # 仅带最近几轮旁路历史，保证多轮连贯但不喧宾夺主
+            attention = attention or {
+                "key": turn.context_key, "kind": turn.context_kind,
+                "label": turn.context_label, "detail": turn.context_detail, "content": "",
+            }
+            # 只带相同注意力对象的最近历史，切换文件/面板时不串线。
+            related_history = [
+                t for t in state.asides[:-1]
+                if t.context_key == turn.context_key and t.status == "done" and t.answer
+            ][-4:]
             history = "\n".join(
                 f"问：{t.question}\n答：{t.answer}"
-                for t in state.asides[:-1][-4:] if t.status == "done" and t.answer
+                for t in related_history
             )
             prompt = (
-                "你是这个 Loop 任务的旁路助手（by the way）。下面是该任务**当前**的只读状态快照，"
-                "请仅基于它和常识来回答用户的随手提问——不要去执行 loop、不要改动任务、"
+                "你是 AgentWithU 的全局注意力伴随助手“俺寻思”。下面同时给出 Session/LOOP 主线摘要"
+                "和 UI 已确认的当前关注对象。用户说‘这个’、‘这里’、‘当前文件’时，优先指向该对象；"
+                "不要声称看到了快照之外的界面内容。请仅基于快照和常识回答——不要执行 loop、不要改动任务、"
                 "不要使用工具修改文件，只做解读、答疑和建议。\n\n"
                 f"===== Loop 状态快照 =====\n{digest}\n========================\n\n"
+                f"===== 当前注意力 =====\n{self._attention_prompt_block(attention)}\n========================\n\n"
                 + (f"【最近的旁路问答】\n{history}\n\n" if history else "")
                 + f"【用户的问题】\n{turn.question}"
             )
@@ -10593,15 +10676,20 @@ Kit 版本账本（版本属于 Kit，不属于 AI）：
         return json.dumps({"status": "ok", "asides": [a.to_dict() for a in ex.asides],
                            "asideBackendId": ex.aside_backend_id}, ensure_ascii=False)
 
-    def _rpc_chatAsideClear(self, session_id: str) -> str:
-        """清空普通 Session 的 BTW 历史，保留旁路模型选择与其它侧挂数据。"""
+    def _rpc_chatAsideClear(self, session_id: str, context_key: str = "") -> str:
+        """清空普通 Session 的俺寻思历史，可限定当前注意力对象。"""
         if session_id in self._chat_aside_running:
             return json.dumps({
-                "status": "error", "message": "BTW 正在回答，请等待完成后再清空",
+                "status": "error", "message": "俺寻思正在回答，请等待完成后再清空",
             }, ensure_ascii=False)
         ex = self._chat_extras_get(session_id)
-        cleared = len(ex.asides)
-        ex.asides.clear()
+        wanted = (context_key or "").strip()
+        before = len(ex.asides)
+        if wanted:
+            ex.asides[:] = [item for item in ex.asides if item.context_key != wanted]
+        else:
+            ex.asides.clear()
+        cleared = before - len(ex.asides)
         self._chat_extras_save(ex)
         self._emit_chat_aside_updated(ex)
         return json.dumps({
@@ -10615,6 +10703,15 @@ Kit 版本账本（版本属于 Kit，不属于 AI）：
         self._chat_extras_save(ex)
         self._emit_chat_aside_updated(ex)
         return json.dumps({"status": "ok", "asideBackendId": ex.aside_backend_id}, ensure_ascii=False)
+
+    def _rpc_chatAsideAbort(self, session_id: str) -> str:
+        backend = self._loop_active_backends.get(f"{session_id}:chataside")
+        if backend is not None:
+            try:
+                backend.abort(f"{session_id}:chataside")
+            except Exception:
+                pass
+        return json.dumps({"status": "ok", "aborting": backend is not None}, ensure_ascii=False)
 
     def _chat_context_digest(self, session: "Session", max_msgs: int = 8) -> str:
         """普通会话与 Workspace Kit 的只读摘要，喂给 Session 管家（不污染主线）。"""
@@ -10630,25 +10727,30 @@ Kit 版本账本（版本属于 Kit，不属于 AI）：
         chat = "\n".join(lines) if lines else "（暂无对话历史）"
         return f"{chat}\n\n{self._kit_context_digest(session.id)}"
 
-    def _rpc_chatAsk(self, session_id: str, question: str, images_json: str = "") -> str:
-        """普通 session 的 by-the-way：独立 agent 上下文，带最近对话摘要，不进 transcript。"""
+    def _rpc_chatAsk(self, session_id: str, question: str, images_json: str = "",
+                     attention_json: str = "") -> str:
+        """普通 session 的“俺寻思”：独立上下文，带 Session 与 UI 注意力摘要。"""
         q = (question or "").strip()
         images = self._parse_images_json(images_json)
+        attention = self._parse_attention_json(attention_json)
         if not q and not images:
             return json.dumps({"status": "error", "message": "问题为空"}, ensure_ascii=False)
         if session_id in self._chat_aside_running:
-            return json.dumps({"status": "error", "message": "上一条 by-the-way 仍在回答"}, ensure_ascii=False)
+            return json.dumps({"status": "error", "message": "上一条俺寻思仍在回答"}, ensure_ascii=False)
         ex = self._chat_extras_get(session_id)
         turn = ChatAside(id=new_id(), question=q or "（图片）", status="answering",
-                         image_count=len(images) if images else 0)
+                         image_count=len(images) if images else 0,
+                         context_key=attention["key"], context_kind=attention["kind"],
+                         context_label=attention["label"], context_detail=attention["detail"])
         ex.asides.append(turn)
         self._chat_extras_save(ex)
         self._emit_chat_aside_updated(ex)
-        asyncio.ensure_future(self._run_chat_aside(session_id, turn.id, images))
+        asyncio.ensure_future(self._run_chat_aside(session_id, turn.id, images, attention))
         return json.dumps({"status": "ok", "turnId": turn.id}, ensure_ascii=False)
 
     async def _run_chat_aside(self, session_id: str, turn_id: str,
-                              images: Optional[list["ImageAttachment"]] = None) -> None:
+                              images: Optional[list["ImageAttachment"]] = None,
+                              attention: Optional[dict[str, str]] = None) -> None:
         session = self._active_sessions.get(session_id) or self._session_store.load(session_id)
         ex = self._chat_extras_get(session_id)
         if not session:
@@ -10659,17 +10761,26 @@ Kit 版本账本（版本属于 Kit，不属于 AI）：
         self._chat_aside_running.add(session_id)
         try:
             digest = self._chat_context_digest(session)
+            attention = attention or {
+                "key": turn.context_key, "kind": turn.context_kind,
+                "label": turn.context_label, "detail": turn.context_detail, "content": "",
+            }
+            related_history = [
+                t for t in ex.asides[:-1]
+                if t.context_key == turn.context_key and t.status == "done" and t.answer
+            ][-4:]
             history = "\n".join(
                 f"问：{t.question}\n答：{t.answer}"
-                for t in ex.asides[:-1][-4:] if t.status == "done" and t.answer
+                for t in related_history
             )
             prompt = (
-                "你是这个综合 Session 工作空间的旁路管家（by the way）。下面是当前对话"
-                "**最近几条**和 Workspace Kits 的只读摘要，"
-                "用户想随手问一个不打断主线、也不希望写进主对话的问题。"
-                "请基于摘要与常识作答，可解释 Kit 状态、数据依赖和下一步编排；"
+                "你是 AgentWithU 的全局注意力伴随助手“俺寻思”。下面同时给出 Session 摘要和 UI 已确认的"
+                "当前关注对象。用户说‘这个’、‘这里’、‘当前文件’时，优先指向该对象；"
+                "不要声称看到了快照之外的界面内容。请基于摘要与常识作答，可解释 Kit 状态、"
+                "文件或当前面板以及下一步编排；"
                 "这是只读旁路，不要声称已经执行或改动主线任务。\n\n"
                 f"===== 最近对话摘要 =====\n{digest}\n========================\n\n"
+                f"===== 当前注意力 =====\n{self._attention_prompt_block(attention)}\n========================\n\n"
                 + (f"【最近的旁路问答】\n{history}\n\n" if history else "")
                 + f"【用户的问题】\n{turn.question}"
             )
@@ -10683,18 +10794,19 @@ Kit 版本账本（版本属于 Kit，不属于 AI）：
                 elif delta.type == "error" and delta.error:
                     self._emit_chat_aside_delta(session_id, turn_id, f"\n❌ {delta.error}\n")
 
-            # 旁路问答可走专用 backend（独立上下文，换异构模型安全）；缺失/不可用回落会话 backend
+            # 独立实例允许俺寻思与主对话并行，并拥有自己的取消边界。
             backend = None
             aside_bid = (ex.aside_backend_id or "").strip()
             if aside_bid and aside_bid != session.backend_id:
                 try:
-                    backend = self._get_backend(aside_bid)
+                    backend = self._new_backend_instance(aside_bid)
                 except Exception:
                     backend = None
             if backend is None:
-                backend = self._get_backend(session.backend_id)
+                backend = self._new_backend_instance(session.backend_id)
             aside_sid = f"{session_id}:chataside"
             try:
+                self._loop_active_backends[aside_sid] = backend
                 aside_kwargs = {
                     "messages": [], "content": prompt, "images": images,
                     "session_id": aside_sid, "message_id": new_id(), "on_delta": on_delta,
@@ -10707,6 +10819,8 @@ Kit 版本账本（版本属于 Kit，不属于 AI）：
                 await backend.send_message(**aside_kwargs)
             finally:
                 backend.clear_cancelled(aside_sid)
+                if self._loop_active_backends.get(aside_sid) is backend:
+                    self._loop_active_backends.pop(aside_sid, None)
 
             ex = self._chat_extras_get(session_id)
             turn = next((t for t in ex.asides if t.id == turn_id), None)

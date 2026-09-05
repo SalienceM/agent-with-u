@@ -2470,16 +2470,26 @@ export const api = {
     try { return JSON.parse(result); } catch { return { status: 'error', message: '响应解析失败' }; }
   },
 
-  /** By the way 旁路提问：基于当前 loop 状态对话，不污染 loop 主线上下文。 */
-  async loopAsk(sessionId: string, question: string, images?: any[]): Promise<{ status: string; turnId?: string; message?: string }> {
+  /** “俺寻思”旁路提问：基于 LOOP 状态和当前 UI 注意力，不污染主线上下文。 */
+  async loopAsk(sessionId: string, question: string, images?: any[], attention?: Record<string, unknown>): Promise<{ status: string; turnId?: string; message?: string }> {
     const imagesJson = images && images.length ? JSON.stringify(images) : '';
-    const result = await call('loopAsk', sessionId, question, imagesJson);
+    const result = await call('loopAsk', sessionId, question, imagesJson, attention ? JSON.stringify(attention) : '');
     try { return JSON.parse(result); } catch { return { status: 'error', message: '响应解析失败' }; }
   },
 
-  async loopAsideClear(sessionId: string): Promise<{ status: string; cleared?: number; message?: string }> {
-    const result = await call('loopAsideClear', sessionId);
+  async loopAsideList(sessionId: string): Promise<{ status: string; asides: any[]; asideBackendId?: string; message?: string }> {
+    const result = await call('loopAsideList', sessionId);
+    try { return JSON.parse(result); } catch { return { status: 'error', asides: [], message: '历史响应解析失败' }; }
+  },
+
+  async loopAsideClear(sessionId: string, contextKey: string = ''): Promise<{ status: string; cleared?: number; message?: string }> {
+    const result = await call('loopAsideClear', sessionId, contextKey);
     try { return JSON.parse(result); } catch { return { status: 'error', message: '清空响应解析失败' }; }
+  },
+
+  async loopAsideAbort(sessionId: string): Promise<{ status: string; aborting?: boolean }> {
+    const result = await call('loopAsideAbort', sessionId);
+    try { return JSON.parse(result); } catch { return { status: 'error' }; }
   },
 
   /** 执行中补充要求（addon，可带图片）：不影响当前 loop，下一次 loop 的 analysis/prepare 纳入。 */
@@ -2813,18 +2823,18 @@ export const api = {
     };
   },
 
-  // ── By the way 旁路问答（普通 session）─────────────────────
-  async chatAsk(sessionId: string, question: string, images?: any[]): Promise<{ status: string; turnId?: string; message?: string }> {
+  // ── “俺寻思”注意力伴随问答（普通 session）─────────────────
+  async chatAsk(sessionId: string, question: string, images?: any[], attention?: Record<string, unknown>): Promise<{ status: string; turnId?: string; message?: string }> {
     const imagesJson = images && images.length ? JSON.stringify(images) : '';
-    const result = await call('chatAsk', sessionId, question, imagesJson);
+    const result = await call('chatAsk', sessionId, question, imagesJson, attention ? JSON.stringify(attention) : '');
     try { return JSON.parse(result); } catch { return { status: 'error', message: '响应解析失败' }; }
   },
-  async chatAsideList(sessionId: string): Promise<{ status: string; asides: any[]; asideBackendId?: string }> {
+  async chatAsideList(sessionId: string): Promise<{ status: string; asides: any[]; asideBackendId?: string; message?: string }> {
     const result = await call('chatAsideList', sessionId);
     try { return JSON.parse(result); } catch { return { status: 'error', asides: [] }; }
   },
-  async chatAsideClear(sessionId: string): Promise<{ status: string; cleared?: number; message?: string }> {
-    const result = await call('chatAsideClear', sessionId);
+  async chatAsideClear(sessionId: string, contextKey: string = ''): Promise<{ status: string; cleared?: number; message?: string }> {
+    const result = await call('chatAsideClear', sessionId, contextKey);
     try { return JSON.parse(result); } catch { return { status: 'error', message: '清空响应解析失败' }; }
   },
   async chatAsideSetBackend(sessionId: string, backendId: string): Promise<{ status: string; asideBackendId?: string }> {
@@ -3189,6 +3199,10 @@ export const api = {
       }>(result, { status: 'error', message: 'syncFileList 无响应' });
       return { ...parsed, files: filterGitMetadata(parsed.files) };
     }
+  },
+  async chatAsideAbort(sessionId: string): Promise<{ status: string; aborting?: boolean }> {
+    const result = await call('chatAsideAbort', sessionId);
+    try { return JSON.parse(result); } catch { return { status: 'error' }; }
   },
 
   /**
@@ -4261,6 +4275,8 @@ function mockDispatch(method: string, params: any[]): any {
     case 'loopAdvanceToOut': return JSON.stringify({ status: 'error', message: 'mock mode' });
     case 'loopContinue': return JSON.stringify({ status: 'error', message: 'mock mode' });
     case 'loopAsk': return JSON.stringify({ status: 'error', message: 'mock mode' });
+    case 'loopAsideList': return JSON.stringify({ status: 'ok', asides: [], asideBackendId: '' });
+    case 'loopAsideAbort': return JSON.stringify({ status: 'ok', aborting: false });
     case 'loopAsideClear': return JSON.stringify({ status: 'ok', cleared: 0 });
     case 'loopAddAddon': return JSON.stringify({ status: 'error', message: 'mock mode' });
     case 'loopRemoveAddon': return JSON.stringify({ status: 'ok' });
@@ -4295,6 +4311,7 @@ function mockDispatch(method: string, params: any[]): any {
     case 'chatAsideList': return JSON.stringify({ status: 'ok', asides: [], asideBackendId: '' });
     case 'chatAsideClear': return JSON.stringify({ status: 'ok', cleared: 0 });
     case 'chatAsideSetBackend': return JSON.stringify({ status: 'ok', asideBackendId: params[1] || '' });
+    case 'chatAsideAbort': return JSON.stringify({ status: 'ok', aborting: false });
     case 'listSessions': return '[]';
     case 'listConnectedClients': return '[]';
     case 'loadSession': return 'null';

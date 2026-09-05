@@ -8,6 +8,7 @@ import { LoopPolicyEditor, normalizePolicy } from './LoopPolicyEditor';
 import type { LoopPolicy } from './LoopPolicyEditor';
 import type { ModelRuntime } from './CodexRuntimeFields';
 import { TokenUsageMonitor } from './TokenUsageMonitor';
+import { OPEN_THOUGHTS_EVENT } from '../utils/attentionContext';
 import {
   AdvancedPromptTextarea,
   type AdvancedPromptTextareaProps,
@@ -560,14 +561,14 @@ const Header: React.FC<{
       )}
       <div style={{ flex: 1 }} />
       <TokenUsageMonitor sessionId={sessionId} placement="header" />
-      {/* ★ session 级 By the way 激活按钮：旁路问答，不污染 loop 主线 */}
+      {/* 打开 App 顶层唯一的“俺寻思”，仍使用 LOOP 独立 aside 上下文。 */}
       {!inspectOnly && (
         <button
-          onClick={() => setAsideOpen(!asideOpen)}
+          onClick={() => window.dispatchEvent(new CustomEvent(OPEN_THOUGHTS_EVENT))}
           style={{ ...btn, ...(asideOpen ? btnActive : {}) }}
-          title="By the way — 基于当前 loop 状态旁路问答，不影响 loop 上下文"
+          title="俺寻思 — 自动关联当前 LOOP、预览文件或功能面板"
         >
-          💬 By the way{asideCount > 0 ? ` (${asideCount})` : ''}
+          🤔 俺寻思{asideCount > 0 ? ` (${asideCount})` : ''}
         </button>
       )}
       {!embedded && onClose && <button onClick={onClose} style={btn}>✕ 关闭</button>}

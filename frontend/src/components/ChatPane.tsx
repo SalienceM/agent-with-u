@@ -7,13 +7,13 @@ import { PermissionGate } from './PermissionGate';
 import { LoopPanel } from './LoopPanel';
 import { SeqTaskPanel } from './SeqTaskPanel';
 import type { SeqTaskT } from './SeqTaskPanel';
-import { ByTheWayDrawer } from './ByTheWayDrawer';
 import { WorkspaceKitsPanel } from './WorkspaceKitsPanel';
 import { useChat } from '../hooks/useChat';
 import type { ChatMessage } from '../hooks/useChat';
 import type { AppConfig } from '../hooks/useConfig';
 import { HACKER_CAPTURE_EVENT } from '../utils/hackerMode';
 import type { SmoothGhostState } from '../utils/smoothGhost';
+import { OPEN_THOUGHTS_EVENT } from '../utils/attentionContext';
 import { normalizeModelRuntime, type ModelRuntime } from './CodexRuntimeFields';
 import type { TextAttachment } from '../types/attachments';
 import { buildMessageRedoPayload } from '../utils/messageRedo';
@@ -381,7 +381,6 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
     status: 'ok', queue: true, nativeSteer: false,
     interruptResume: false, steerAttachments: false,
   });
-  const [byTheWayOpen, setByTheWayOpen] = useState(false);
   const [workspaceKitsOpen, setWorkspaceKitsOpen] = useState(false);
   useEffect(() => {
     if (!config.workspaceKitsEnabled) setWorkspaceKitsOpen(false);
@@ -779,7 +778,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
   }
 
   // ★ Loop 会话：直接把 LoopPanel 作为这个 pane 的内容内嵌渲染（不是浮层，
-  //   也没有自由聊天框）—— loop 的全部交互都在面板内（含 By the way 旁路问答），
+  //   也没有自由聊天框）—— loop 的主线交互都在面板内；俺寻思由 App 顶层独立承载，
   //   避免「聊天框 vs 面板」双入口、以及聊天与 loop 主线共用 agent 上下文的污染。
   if (automatedLoop) {
     return (
@@ -1132,7 +1131,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
         }}
       />
 
-      {/* ---- By the way 旁路问答：浮动入口 + 抽屉 ---- */}
+      {/* ---- 俺寻思：打开 App 顶层唯一注意力助手 ---- */}
       {sessionId && (
         <>
           {config.workspaceKitsEnabled && (
@@ -1143,16 +1142,10 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
             >🧰</button>
           )}
           <button
-            onClick={() => setByTheWayOpen(true)}
-            title="By the way · 旁路问答（独立上下文，不污染主对话）"
+            onClick={() => window.dispatchEvent(new CustomEvent(OPEN_THOUGHTS_EVENT))}
+            title="俺寻思 · 自动关联当前 Session、文件或功能面板"
             style={byTheWayFab}
-          >💬</button>
-          <ByTheWayDrawer sessionId={sessionId} open={byTheWayOpen} onClose={() => setByTheWayOpen(false)}
-            backends={effectiveBackends}
-            workingDir={activeSession?.workingDir}
-            execKey={activeSession?.execKey}
-            onQueueTask={(text) => handleQueueTask(text, undefined, undefined, false)}
-            onSendToChat={(text) => { if (!isStreamingRef.current) doSendRef.current(text); }} />
+          >🤔</button>
           {config.workspaceKitsEnabled && (
             <WorkspaceKitsPanel
               sessionId={sessionId}

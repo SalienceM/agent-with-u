@@ -56,6 +56,10 @@ interface Props {
   onSend: (text: string, interactionMode: RealtimeVoiceInteractionMode) => void;
   onAbort: () => void;
   onActiveChange?: (active: boolean) => void;
+  /** 可把主对话 streamDelta 换成旁路/其它确定来源，同时复用整套 STT/TTS 体验。 */
+  subscribeToReply?: (handler: (delta: any) => void) => () => void;
+  /** 同一页面只允许一个实时语音所有者，新的所有者会让旧链路自动收声。 */
+  voiceOwnerId?: string;
   compact?: boolean;
 }
 
@@ -132,6 +136,8 @@ export const RealtimeVoiceBar: React.FC<Props> = ({
   onSend,
   onAbort,
   onActiveChange,
+  subscribeToReply,
+  voiceOwnerId = `main:${sessionId}`,
   compact = false,
 }) => {
   const [active, setActive] = useState(false);
@@ -1990,6 +1996,9 @@ export const RealtimeVoiceBar: React.FC<Props> = ({
           ? 'DashScope 流式 TTS'
           : 'Edge TTS',
     );
+    window.dispatchEvent(new CustomEvent('awu:voice-owner-active', {
+      detail: { ownerId: voiceOwnerId },
+    }));
     setActive(true);
     activeRef.current = true;
     generationRef.current += 1;
@@ -2087,7 +2096,9 @@ export const RealtimeVoiceBar: React.FC<Props> = ({
   streamHandlerRef.current = handleStreamDelta;
   useEffect(() => {
     const offTts = api.onTtsStreamAudio((event) => { void ttsHandlerRef.current(event); });
-    const offStream = api.onStreamDelta((delta) => streamHandlerRef.current(delta));
+    const offStream = subscribeToReply
+      ? subscribeToReply((delta) => streamHandlerRef.current(delta))
+      : api.onStreamDelta((delta) => streamHandlerRef.current(delta));
     const offText = api.onSttStreamText((data) => {
       if (!activeRef.current) return;
       const rawText = data.text || '';
@@ -2154,7 +2165,7 @@ export const RealtimeVoiceBar: React.FC<Props> = ({
       }
     });
     return () => { offTts(); offStream(); offText(); offEnd(); };
-  }, [sessionId]);
+  }, [sessionId, subscribeToReply]);
 
   const stopRef = useRef(stopConversation);
   stopRef.current = stopConversation;
@@ -2165,6 +2176,14 @@ export const RealtimeVoiceBar: React.FC<Props> = ({
       stopRef.current();
     }
   }, [sessionId]);
+  useEffect(() => {
+    const handleVoiceOwner = (event: Event) => {
+      const nextOwner = (event as CustomEvent<{ ownerId?: string }>).detail?.ownerId;
+      if (nextOwner && nextOwner !== voiceOwnerId && activeRef.current) stopRef.current();
+    };
+    window.addEventListener('awu:voice-owner-active', handleVoiceOwner);
+    return () => window.removeEventListener('awu:voice-owner-active', handleVoiceOwner);
+  }, [voiceOwnerId]);
   useEffect(() => () => {
     stopRef.current(false, true);
     onActiveChangeRef.current?.(false);

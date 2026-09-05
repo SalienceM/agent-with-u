@@ -29,6 +29,7 @@
     "src/utils/scratchPad.ts",
     "src/utils/sha256.ts",
     "src/utils/clientAppearance.ts",
-    "src/utils/backendManagement.ts"
+    "src/utils/backendManagement.ts",
+    "src/utils/attentionContext.ts"
   ]
 }

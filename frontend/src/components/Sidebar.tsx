@@ -1,6 +1,7 @@
 import React, { useEffect, useState, useCallback, memo, useRef, useMemo, useLayoutEffect } from 'react';
 import { api, isTauri, onExecStatus } from '../api';
 import { FileTreePanel } from './FileTreePanel';
+import type { AttentionContext } from '../utils/attentionContext';
 import type { FileFocusRequest } from '../utils/fileFocus';
 import { AppModalPortal } from './AppModalPortal';
 
@@ -53,10 +54,11 @@ interface Props {
   activeCodexRemoteHost?: string;
   sessionLimit?: number;
   fileFocusRequest?: FileFocusRequest | null;
+  onAttentionChange?: (context: AttentionContext | null) => void;
 }
 
 // ★ Wrap with React.memo to prevent unnecessary re-renders when parent updates
-export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession, onNewSession, onDeleteSession, onAcknowledgeSession, streamingSessions, completedSessions = new Set(), collapsed, onToggleCollapse, isMobile, width, activeWorkingDir, activeSessionMetaId, activeExecKey, activeExecLabel, activeExecMode, activeBackendId, activeCodexRemoteHost, sessionLimit = 25, fileFocusRequest }) => {
+export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession, onNewSession, onDeleteSession, onAcknowledgeSession, streamingSessions, completedSessions = new Set(), collapsed, onToggleCollapse, isMobile, width, activeWorkingDir, activeSessionMetaId, activeExecKey, activeExecLabel, activeExecMode, activeBackendId, activeCodexRemoteHost, sessionLimit = 25, fileFocusRequest, onAttentionChange }) => {
   const [sessions, setSessions] = useState<Session[]>([]);
   const refreshGenerationRef = useRef(0);
   const refreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -721,7 +723,8 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
             当前会话的文件与命令位于 SSH 主机上，由远端 Codex 工具操作。为避免误操作本机同名目录，这里不展示本机文件树。
           </div>
         ) : <FileTreePanel sessionId={activeSessionId || undefined} workingDir={activeWorkingDir || ''} execKey={activeExecKey} execLabel={activeExecLabel} execMode={activeExecMode} backendId={activeBackendId}
-          focusRequest={activeSessionMetaId === activeSessionId && fileFocusRequest?.sessionId === activeSessionId ? fileFocusRequest : null} />
+          focusRequest={activeSessionMetaId === activeSessionId && fileFocusRequest?.sessionId === activeSessionId ? fileFocusRequest : null}
+          onAttentionChange={onAttentionChange} />
       ) : (
       <div style={{ flex: 1, overflow: 'auto', padding: '4px 7px 10px' }}>
         {groups.map(group => {

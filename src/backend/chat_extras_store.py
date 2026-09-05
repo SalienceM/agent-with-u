@@ -82,6 +82,12 @@ class ChatAside:
     answer: str = ""
     status: str = "answering"   # answering | done | error
     image_count: int = 0
+    # “俺寻思”按用户当前关注对象分流历史。旧数据没有这些字段时自然回落到
+    # session，且只持久化焦点元数据；文件正文等临时快照绝不落盘。
+    context_key: str = "session"
+    context_kind: str = "session"
+    context_label: str = ""
+    context_detail: str = ""
     created_at: float = field(default_factory=_now)
     updated_at: float = field(default_factory=_now)
 
@@ -92,6 +98,10 @@ class ChatAside:
             "answer": self.answer,
             "status": self.status,
             "imageCount": self.image_count,
+            "contextKey": self.context_key,
+            "contextKind": self.context_kind,
+            "contextLabel": self.context_label,
+            "contextDetail": self.context_detail,
             "createdAt": self.created_at,
             "updatedAt": self.updated_at,
         }
@@ -104,6 +114,10 @@ class ChatAside:
             answer=d.get("answer", ""),
             status=d.get("status", "answering"),
             image_count=int(d.get("imageCount", 0) or 0),
+            context_key=str(d.get("contextKey") or "session"),
+            context_kind=str(d.get("contextKind") or "session"),
+            context_label=str(d.get("contextLabel") or ""),
+            context_detail=str(d.get("contextDetail") or ""),
             created_at=d.get("createdAt", _now()),
             updated_at=d.get("updatedAt", _now()),
         )

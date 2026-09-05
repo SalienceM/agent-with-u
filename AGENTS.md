@@ -340,7 +340,7 @@ session the **LoopPanel is rendered inline as the pane's content** (ChatPane
 detects `sessionType === 'loop'` and renders `<LoopPanel embedded />` instead of
 the message list + chat input). This is deliberate: a loop session has **no
 free-form chat box** — all interaction is in the panel (stage rail / loop timeline /
-detail panels / addon / "By the way" /
+ detail panels / addon / global "俺寻思" attention assistant /
 a header **view toggle 🗂 面板 ⇄ 🔀 流程**: the flow view (`LoopFlowView`, plain
 SVG/CSS — no d3 dep) draws each loop as a horizontal lane
 `#seq → Prepare → Execute(steps) → Analysis` with status colors, a pulsing
@@ -360,18 +360,20 @@ prepare/execute/analysis turns (cross-context pollution) and split attention; th
 panel-only design removes both. `LoopPanel` still supports a floating overlay
 mode (`embedded` omitted) but the app uses the inline mode.
 
-**By the way (旁路问答).** The LoopPanel header has a session-level "💬 By the
-way" toggle opening a side drawer. Questions go through `loopAsk` →
-`_run_aside`, which feeds the model a read-only digest of the current loop state
-(`_loop_context_digest`) on an **independent** agent session (never resumes the
-loop's `agent_session_id`), so it never pollutes / interrupts the loop's main
-context — usable even while a loop is running. Answers stream via
-`loopAsideDelta` (per `turnId`) and persist as `asides` on the stage file. The
-By-the-way input supports **image attachments** (clipboard paste / Snipaste,
-same `useClipboardImage` flow as the main chat): `loopAsk` takes an
-optional third `images_json` arg parsed by `_parse_images_json` and passed to the
-agent turn; the base64 is **not** persisted (only `image_count` is kept on the
-`AsideTurn` to render a 🖼️ badge in history).
+**俺寻思 (global attention sidecar).** The LoopPanel header and ordinary chat FAB
+both open the single App-level `ThoughtsAssistant`. Questions still go through
+`loopAsk` → `_run_aside` on an **independent** agent session (never resumes the
+loop's `agent_session_id`), so they cannot pollute or interrupt the LOOP mainline.
+The prompt combines `_loop_context_digest` with a validated UI attention snapshot
+(current Session, previewed file, Settings, Backend Manager, Release Center,
+Skills, assets, notes, connection, logs or manual). `AsideTurn.context_*` routes
+history per focus object; legacy records migrate to `contextKey=session`.
+Transient `content` is capped at 50K characters and never persisted, while binary,
+Base64 and Office bytes are stripped in `attentionContext.ts`. The global panel
+can float above the whole app or dock as a resizable right split, automatically
+follows focused panes/Sessions/files, supports browsing an older focus thread, and
+reuses `RealtimeVoiceBar` through a pluggable reply subscription. Image attachments
+remain supported; their Base64 is not persisted (only `image_count`).
 
 Loop state is read/written through a process-level singleton cache
 (`_loop_state` / `_loop_save` / `_loop_create`) so a running iteration's
@@ -711,7 +713,7 @@ that want UI-driven online updates must enable the `online-update` profile once 
 Compose file; subsequent application releases can use Node Update Center. Manual-only Docker
 nodes should leave the profile disabled.
 
-### Normal-session side features (序列任务 + By the way)
+### Normal-session side features (序列任务 + 俺寻思)
 
 Two designs from loop sessions are also available to **normal** chat sessions, backed
 by a sidecar file `~/.agent-with-u/chat-extras/<session_id>.json`
@@ -747,23 +749,21 @@ streaming saves. A process-level cache (`_chat_extras` / `_chat_extras_get` /
   optional restart-resume, and clear; expand it to edit / remove / ▲▼ reorder. The
   legacy `seq_auto` field and `seqtaskSetAuto` RPC remain readable for compatibility,
   but the current UI's automatic chain no longer depends on that toggle.
-- **By the way (旁路问答).** A floating 💬 entry on each chat pane opens
-  `ByTheWayDrawer.tsx` — ask a quick side question that runs on an **independent agent
-  context** (`agent_session_id=None`, session `f"{sid}:chataside"`), seeded with a
-  read-only digest of the **last few chat messages** (`_chat_context_digest`), so it
-  has context but never pollutes the main thread or enters the transcript. `chatAsk`
-  streams via `chatAsideDelta` and persists answers as `asides` (full-state
-  `chatAsideUpdated`). The drawer has a **旁路模型 selector** (`chatAsideSetBackend`,
-  persisted as `ChatExtras.aside_backend_id`, empty = follow session) so the side Q&A
-  can run on a different / heterogeneous backend than the main chat — safe because it
-  is always an independent context. Mirrors the loop `loopAsk`/`_run_aside` design. Each finished
-  answer carries two one-click actions — **加入序列任务** (`seqtaskAdd`) and **发送到
-  主对话** (`onSendToChat` → main `doSend`) — to bring an aside conclusion back into
-  the main flow.
+- **俺寻思.** `ThoughtsAssistant.tsx` is an App-level attention companion, opened
+  from the top bar or the 🤔 button in ordinary/LOOP panes. Normal questions use an
+  **independent backend instance** (`agent_session_id=None`, call id
+  `f"{sid}:chataside"`) seeded with `_chat_context_digest` plus the current UI focus.
+  `ChatAside.context_*` keeps file/panel threads separate without duplicating the
+  Session sidecar. `chatAsk` streams via `chatAsideDelta`; `chatAsideAbort` cancels
+  only the isolated call. A backend selector is retained (`chatAsideSetBackend`,
+  empty = follow Session), and completed answers can be copied or queued into the
+  main flow. Temporary preview text is request-only and never enters the transcript
+  or persisted sidecar.
 
 Side RPCs: `seqtaskGet`, `seqtaskAdd`, `seqtaskEdit`, `seqtaskRemove`,
-`seqtaskReorder`, `seqtaskSetAuto`, `seqtaskTakeNext`, `seqtaskClear`, `chatAsk`,
-`chatAsideList`, `chatAsideSetBackend`. The chat-extras file is cleaned up on `deleteSession`.
+  `seqtaskReorder`, `seqtaskSetAuto`, `seqtaskTakeNext`, `seqtaskClear`, `chatAsk`,
+  `chatAsideList`, `chatAsideClear`, `chatAsideAbort`, `chatAsideSetBackend`. The
+  chat-extras file is cleaned up on `deleteSession`.
 
 **Conversation font size** is a global `config.fontSize` (`useConfig`, applied in
 `MessageBubble`): a Settings slider (11–28px) plus inline **A− / A+** steppers in the
@@ -973,6 +973,10 @@ filler or comma endings, exposes a live pause countdown, and always offers
 `立即发送`. The transcript is sent to the Session's current LLM Backend, and
 append-only `text_delta` frames go through an adaptive speech chunker (5–12 char
 first phrase, larger later phrases, fenced code/URLs omitted).
+`RealtimeVoiceBar.subscribeToReply` lets 俺寻思 map `chatAsideDelta` /
+`loopAsideDelta` into the same speech pipeline. `voiceOwnerId` enforces one active
+mic/TTS owner per page, so opening the companion voice automatically closes an
+active main-chat voice link (and vice versa).
 `ttsStreamSynthesize(sessionId, streamId, seq, ...)` accepts each Edge-TTS chunk
 without blocking the WebSocket RPC loop; two backend workers synthesize in
 parallel and push `ttsStreamAudio`, while the browser decodes and plays strictly

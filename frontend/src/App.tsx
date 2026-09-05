@@ -27,6 +27,7 @@ import { ConnectionPanel } from './components/ConnectionPanel';
 import { ManualPanel } from './components/ManualPanel';
 import { ChatPane } from './components/ChatPane';
 import { LoopPanel } from './components/LoopPanel';
+import { ThoughtsAssistant } from './components/ThoughtsAssistant';
 import { HomeDashboard } from './home/HomeDashboard';
 import type { DashboardDestination } from './home/dashboardModel';
 import { LoopPolicyEditor, DEFAULT_POLICY, normalizePolicy } from './components/LoopPolicyEditor';
@@ -49,6 +50,11 @@ import { messagesToMarkdown, messagesToJson } from './utils/markdown';
 import type { SmoothGhostState } from './utils/smoothGhost';
 import { notifyTaskCompletion } from './utils/desktopNotifications';
 import type { FileFocusRequest } from './utils/fileFocus';
+import {
+  OPEN_THOUGHTS_EVENT,
+  type AttentionContext,
+  type AttentionKind,
+} from './utils/attentionContext';
 
 // 发布工作台保持按需加载；手机/控制端点击入口时才下载对应 chunk。
 const LazyReleaseCenter = React.lazy(() => import('./components/ReleaseCenter'));
@@ -99,6 +105,9 @@ export const App: React.FC = () => {
   const [manualLoopInspectorOpen, setManualLoopInspectorOpen] = useState(false);
   const [manualLoopReleaseBusy, setManualLoopReleaseBusy] = useState(false);
   const [moreMenuOpen, setMoreMenuOpen] = useState(false);
+  const [thoughtsOpen, setThoughtsOpen] = useState(false);
+  const [fileAttention, setFileAttention] = useState<AttentionContext | null>(null);
+  const [surfaceFocus, setSurfaceFocus] = useState<AttentionKind>('session');
   const [repoPanelEditing, setRepoPanelEditing] = useState(false);
   const [newSessionDialogOpen, setNewSessionDialogOpen] = useState(false);
   const [newSessionInitialType, setNewSessionInitialType] = useState<'normal' | 'loop'>('normal');
@@ -208,6 +217,12 @@ export const App: React.FC = () => {
   const activeManualLoop = activeSession?.id === activeSessionId
     && activeSession?.sessionType === 'loop'
     && activeSession?.loopControlMode === 'manual';
+
+  useEffect(() => {
+    const openThoughts = () => setThoughtsOpen(true);
+    window.addEventListener(OPEN_THOUGHTS_EVENT, openThoughts);
+    return () => window.removeEventListener(OPEN_THOUGHTS_EVENT, openThoughts);
+  }, []);
 
   // 顶栏弹层遵循标准菜单交互：切换焦点会话、点击外部或按 Esc 都立即收起。
   useEffect(() => {
@@ -557,6 +572,9 @@ export const App: React.FC = () => {
       setActiveSession(null);
       return;
     }
+    // 切换窗格后先撤掉旧元数据，避免顶层“俺寻思”在新 Session 加载的极短窗口里
+    // 把问题误发给上一个 Session。
+    setActiveSession((current: any) => current?.id === activeSessionId ? current : null);
     let cancelled = false;
     // 顶栏只读 SessionStore index；不再为了元数据解析任意消息正文。
     api.loadSessionMeta(activeSessionId).then((session) => {
@@ -586,6 +604,68 @@ export const App: React.FC = () => {
     });
     return () => { cancelled = true; };
   }, [activeSession?.execKey, backends]);
+
+  useEffect(() => {
+    setFileAttention(null);
+    setSurfaceFocus(activeSessionId ? 'session' : 'home');
+  }, [activeSessionId]);
+
+  const handleAttentionChange = useCallback((context: AttentionContext | null) => {
+    setFileAttention(context);
+    setSurfaceFocus(context ? 'file' : (activeSessionIdRef.current ? 'session' : 'home'));
+  }, []);
+
+  const currentAttention = useMemo<AttentionContext>(() => {
+    const sessionLabel = activeSession?.title || activeSession?.name
+      || sessions.find((item) => item.id === activeSessionId)?.title
+      || (activeSessionId ? `Session ${activeSessionId.slice(0, 8)}` : '工作总览');
+    const base: AttentionContext = activeSessionId ? {
+      key: 'session', kind: 'session', label: sessionLabel,
+      detail: `${activeSession?.sessionType === 'loop' ? 'LOOP' : '普通会话'} · ${activeSession?.workingDir || '未设置工作目录'}`,
+      content: '当前注意力位于 Session 主工作区；后端会另外注入最近对话与 Workspace Kit 摘要。',
+      sessionId: activeSessionId,
+      workingDir: activeSession?.workingDir,
+      execKey: activeSession?.execKey,
+    } : {
+      key: 'home', kind: 'home', label: 'AgentWithU 工作总览',
+      detail: '尚未选中 Session', content: '当前位于工作总览。选择一个 Session 后可以开始提问。',
+    };
+    const panel = (kind: AttentionKind, key: string, label: string, detail: string, content: string): AttentionContext => ({
+      key, kind, label, detail, content, sessionId: activeSessionId || undefined,
+      workingDir: activeSession?.workingDir, execKey: activeSession?.execKey,
+    });
+
+    // 模态面板天然占据当前视觉焦点；右侧停靠面板则结合最近一次指针焦点判断。
+    if (backendManagerOpen) return panel('backend', 'panel:backend-manager', 'Backend 配置', `执行节点 ${backendManagerExecKey || '本机'}`,
+      `当前正在管理模型 Backend。可见配置：\n${activeExecBackends.map((item) => `- ${item.label || item.id}（${item.type || 'backend'}）`).join('\n') || '暂无可见 Backend'}\n敏感凭据不会进入注意力快照。`);
+    if (releaseCenterOpen) return panel('release', 'panel:release-center', '发布工作台', `执行节点 ${activeSession?.execLabel || activeSession?.execKey || '本机'}`,
+      '当前正在发布工作台中查看候选包、版本清单、保留规则或发布进度。具体未在界面安全暴露的数据不会被猜测。');
+    if (settingsOpen) return panel('settings', 'panel:settings', '用户与设置', `当前用户 ${currentUser.displayName}`,
+      `当前可安全感知的偏好：主题 ${config.theme}，字号 ${config.fontSize}，实时语音 ${config.realtimeVoiceTtsEngine}，Workspace Kits ${config.workspaceKitsEnabled ? '开启' : '关闭'}。密钥与 Token 不会进入注意力快照。`);
+    if (connPanelOpen) return panel('connection', 'panel:connection', '连接与 Relay', '当前正在配置控制端和执行节点连接',
+      '当前焦点是连接与 Relay 面板。连接 Token、凭据等敏感字段不会进入注意力快照。');
+    if (logViewerOpen) return panel('logs', 'panel:logs', 'Backend 日志', '当前正在查看执行节点日志',
+      '当前焦点是 Backend 日志查看器；日志正文尚未作为快照注入，可在提问时粘贴关键片段。');
+    if (manualPanelOpen) return panel('manual', 'panel:manual', '使用手册', 'AgentWithU 内置说明',
+      '当前焦点是内置使用手册。');
+    if (newSessionDialogOpen) return panel('settings', 'panel:new-session', '新建 Session', '正在选择工作目录、执行节点与模型',
+      '当前焦点是新建 Session 流程。');
+    if (dataPicker) return panel('settings', `panel:data-${dataPicker}`, dataPicker === 'export' ? '数据导出' : '数据导入', '正在选择服务器路径',
+      `当前焦点是${dataPicker === 'export' ? '导出' : '导入'}路径选择。`);
+    if (fileAttention?.sessionId === activeSessionId) return fileAttention;
+    if (surfaceFocus === 'skills' && repoPanelOpen) return panel('skills', 'panel:skills', 'Skills 与 Prompts', activeSession?.workingDir || '全局资源库',
+      '当前正在浏览或编辑 Skills 与 Prompts。具体编辑内容可通过当前编辑器或提问附件补充。');
+    if (surfaceFocus === 'assets' && assetPanelOpen) return panel('assets', 'panel:asset-pool', '素材池', '当前 Session 可用素材',
+      '当前正在浏览素材池。素材正文与二进制不会被自动批量注入。');
+    if (surfaceFocus === 'notes' && scratchPadOpen) return panel('notes', 'panel:scratch-pad', '便签本', '待办与随手记录',
+      '当前正在便签本中工作。便签正文不会在未确认的情况下批量发送给模型。');
+    return base;
+  }, [
+    activeSession, activeSessionId, sessions, backendManagerOpen, backendManagerExecKey,
+    activeExecBackends, releaseCenterOpen, settingsOpen, currentUser.displayName, config,
+    connPanelOpen, logViewerOpen, manualPanelOpen, newSessionDialogOpen, dataPicker,
+    fileAttention, surfaceFocus, repoPanelOpen, assetPanelOpen, scratchPadOpen,
+  ]);
 
   // ── 性能：便签本拖拽 handler，onMouseDown 每次渲染都会重新生成，改为 ref 方案 ──
   const scratchPadWidthRef = useRef(scratchPadWidth);
@@ -760,17 +840,21 @@ export const App: React.FC = () => {
       return;
     }
     if (destination.kind === 'new-session') {
+      setSurfaceFocus('settings');
       setNewSessionInitialType(destination.sessionType || 'normal');
       setNewSessionDialogOpen(true);
       return;
     }
     if (destination.section === 'models') {
+      setSurfaceFocus('backend');
       refreshSessionList();
       setBackendManagerExecKey(activeSession?.execKey || getHomeExecKey());
       setBackendManagerOpen(true);
     } else if (destination.section === 'connections') {
+      setSurfaceFocus('connection');
       setConnPanelOpen(true);
     } else {
+      setSurfaceFocus('settings');
       setSettingsOpen(true);
     }
   }, [activeSession?.execKey, isMobile, refreshSessionList, setSessionInPane]);
@@ -1306,6 +1390,7 @@ export const App: React.FC = () => {
         activeCodexRemoteHost={activeSession?.codexRemoteHost}
         sessionLimit={config.sidebarSessionLimit}
         fileFocusRequest={fileFocusRequest}
+        onAttentionChange={handleAttentionChange}
       />
 
       {/* 侧栏宽度拖拽手柄(桌面端展开时) */}
@@ -1322,7 +1407,8 @@ export const App: React.FC = () => {
         />
       )}
 
-      <div style={{ flex: 1, display: 'flex', flexDirection: 'column', minWidth: 0 }}>
+      <div onPointerDown={() => setSurfaceFocus(activeSessionId ? 'session' : 'home')}
+        style={{ flex: 1, display: 'flex', flexDirection: 'column', minWidth: 0 }}>
         {/* ---- 顶部栏 ---- */}
         <div className="awu-topbar" style={isMobile ? { ...headerStyle, padding: '4px 8px', gap: 2, flexWrap: 'nowrap', alignItems: 'center' } : headerStyle}>
           {/* ★ 移动端：唤出侧栏抽屉的汉堡按钮 */}
@@ -1452,6 +1538,25 @@ export const App: React.FC = () => {
           <button
             onClick={() => {
               setMoreMenuOpen(false);
+              setThoughtsOpen((value) => !value);
+            }}
+            style={{
+              ...settingsBtnStyle,
+              width: isMobile ? 44 : 'auto',
+              minWidth: isMobile ? 44 : 30,
+              padding: isMobile ? 0 : '0 8px',
+              ...(thoughtsOpen ? { background: 'var(--theme-accent-bg)', color: 'var(--theme-accent)' } : {}),
+              ...(isMobile ? { minWidth: 44, minHeight: 44 } : {}),
+            }}
+            title="俺寻思 · 跟随当前 Session、文件或面板的独立思路"
+            aria-label="打开俺寻思注意力助手"
+          >
+            🤔{!isMobile && <span style={{ marginLeft: 4, fontSize: 11 }}>俺寻思</span>}
+          </button>
+          <button
+            onClick={() => {
+              setMoreMenuOpen(false);
+              setSurfaceFocus('notes');
               setScratchPadOpen((open) => !open);
             }}
             style={{ ...settingsBtnStyle, ...(scratchPadOpen ? { background: 'var(--theme-accent-bg)', color: 'var(--theme-accent)' } : {}), ...(isMobile ? { minWidth: 44, minHeight: 44 } : {}) }}
@@ -1463,6 +1568,7 @@ export const App: React.FC = () => {
           <button
             onClick={() => {
               setMoreMenuOpen(false);
+              setSurfaceFocus('settings');
               setSettingsOpen(true);
             }}
             aria-label={`用户与设置：${currentUser.displayName}`}
@@ -1509,31 +1615,38 @@ export const App: React.FC = () => {
                   setMoreMenuOpen(false);
                 }} />
                 <TopbarMenuItem icon="📦" label="Skills 与 Prompts" active={repoPanelOpen} onClick={() => {
+                  setSurfaceFocus('skills');
                   setRepoPanelOpen((open) => !open);
                   setMoreMenuOpen(false);
                 }} />
                 <TopbarMenuItem icon="🗂" label="素材池" active={assetPanelOpen} onClick={() => {
+                  setSurfaceFocus('assets');
                   setAssetPanelOpen((open) => !open);
                   setMoreMenuOpen(false);
                 }} />
                 <TopbarMenuItem icon="◉" label={`Smooth 模式 · ${hackerMode.enabled ? '已开启' : '未开启'}`} active={hackerMode.enabled} onClick={() => {
+                  setSurfaceFocus('settings');
                   setSettingsOpen(true);
                   setMoreMenuOpen(false);
                 }} />
                 <div style={moreMenuDividerStyle} />
                 <TopbarMenuItem icon="📡" label="连接与 Relay" onClick={() => {
+                  setSurfaceFocus('connection');
                   setConnPanelOpen(true);
                   setMoreMenuOpen(false);
                 }} />
                 <TopbarMenuItem icon="🚀" label="发布工作台" onClick={() => {
+                  setSurfaceFocus('release');
                   setReleaseCenterOpen(true);
                   setMoreMenuOpen(false);
                 }} />
                 <TopbarMenuItem icon="📋" label="后端日志" onClick={() => {
+                  setSurfaceFocus('logs');
                   setLogViewerOpen(true);
                   setMoreMenuOpen(false);
                 }} />
                 <TopbarMenuItem icon="📖" label="使用手册" onClick={() => {
+                  setSurfaceFocus('manual');
                   setManualPanelOpen(true);
                   setMoreMenuOpen(false);
                 }} />
@@ -1545,7 +1658,7 @@ export const App: React.FC = () => {
         {/* ---- Claude 登录状态提示 ---- */}
 
         {/* ---- Repo 面板（展开区域）---- */}
-        <div style={{
+        <div onPointerDown={() => setSurfaceFocus('skills')} style={{
           maxHeight: repoPanelOpen ? (repoPanelEditing ? 'calc(100vh - 160px)' : 400) : 0,
           overflow: repoPanelEditing ? 'auto' : 'hidden',
           transition: repoPanelEditing ? 'none' : 'max-height 0.3s cubic-bezier(0.22,0.61,0.36,1)',
@@ -1666,7 +1779,7 @@ export const App: React.FC = () => {
       {/* ---- 便签本：桌面端右侧列 / 移动端全屏覆盖 ---- */}
       {scratchPadOpen && (
         isMobile ? (
-          <div style={mobilePanelOverlayStyle}>
+          <div onPointerDown={() => setSurfaceFocus('notes')} style={mobilePanelOverlayStyle}>
             <ScratchPad visible={true} onClose={() => setScratchPadOpen(false)} />
           </div>
         ) : (
@@ -1683,7 +1796,7 @@ export const App: React.FC = () => {
               onMouseLeave={e => (e.currentTarget.style.background = 'var(--theme-border, rgba(255,255,255,0.1))')}
             />
             {/* 便签本面板 */}
-            <div style={{ width: scratchPadWidth, flexShrink: 0, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
+            <div onPointerDown={() => setSurfaceFocus('notes')} style={{ width: scratchPadWidth, flexShrink: 0, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
               <ScratchPad visible={true} onClose={() => setScratchPadOpen(false)} />
             </div>
           </>
@@ -1693,7 +1806,7 @@ export const App: React.FC = () => {
       {/* ---- 素材池：桌面端右侧列 / 移动端全屏覆盖 ---- */}
       {assetPanelOpen && (
         isMobile ? (
-          <div style={mobilePanelOverlayStyle}>
+          <div onPointerDown={() => setSurfaceFocus('assets')} style={mobilePanelOverlayStyle}>
             <AssetPanel visible={true} onClose={() => setAssetPanelOpen(false)} />
           </div>
         ) : (
@@ -1702,7 +1815,7 @@ export const App: React.FC = () => {
               width: 4, flexShrink: 0,
               background: 'var(--theme-border, rgba(255,255,255,0.1))',
             }} />
-            <div style={{ width: 320, flexShrink: 0, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
+            <div onPointerDown={() => setSurfaceFocus('assets')} style={{ width: 320, flexShrink: 0, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
               <AssetPanel visible={true} onClose={() => setAssetPanelOpen(false)} />
             </div>
           </>
@@ -1718,6 +1831,7 @@ export const App: React.FC = () => {
         onExportChat={handleExportChat}
         onResetConfig={resetConfig}
         onOpenBackendManager={() => {
+          setSurfaceFocus('backend');
           setSettingsOpen(false);
           refreshSessionList();
           setBackendManagerExecKey(activeSession?.execKey || getHomeExecKey());
@@ -1726,6 +1840,7 @@ export const App: React.FC = () => {
         onExportData={handleExportData}
         onImportData={handleImportData}
         onOpenConnectionPanel={() => {
+          setSurfaceFocus('connection');
           setSettingsOpen(false);
           setConnPanelOpen(true);
         }}
@@ -1818,6 +1933,17 @@ export const App: React.FC = () => {
           </div>
         </div>
       )}
+
+      {/* 全局最上层注意力助手：浮窗不遮断左侧浏览，停靠时成为根布局右侧分屏。 */}
+      <ThoughtsAssistant
+        open={thoughtsOpen}
+        onClose={() => setThoughtsOpen(false)}
+        session={activeSession}
+        attention={currentAttention}
+        backends={activeExecBackends}
+        config={config}
+        isMobile={isMobile}
+      />
 
       {/* ---- Toast 通知 ---- */}
       {toast && (
