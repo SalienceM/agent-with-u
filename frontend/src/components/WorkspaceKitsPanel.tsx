@@ -98,6 +98,11 @@ function formatDuration(start?: number | null, end?: number | null, now = Date.n
   return `${hours}h ${String(minutes % 60).padStart(2, '0')}m`;
 }
 
+function formatRunTime(at?: number | null): string {
+  if (!at) return '尚未执行';
+  return new Date(at * 1000).toLocaleString();
+}
+
 const generationStages = ['准备上下文', '模型生成', '解析定义', '安全校验', '完成'];
 
 function generationPhaseIndex(phase?: string): number {
@@ -722,6 +727,7 @@ export const WorkspaceKitsPanel: React.FC<Props> = ({ sessionId, open, onClose }
                   const meta = run ? statusMeta[run.status] : null;
                   const running = isActiveRun(run);
                   const stepCount = run?.steps?.length || kit.steps.length || 1;
+                  const lastRunAt = run?.endedAt || run?.startedAt || run?.createdAt;
                   return (
                     <article key={kit.id} style={compactKitCard}>
                       <div style={{ display: 'flex', alignItems: 'flex-start', gap: 10 }}>
@@ -731,12 +737,19 @@ export const WorkspaceKitsPanel: React.FC<Props> = ({ sessionId, open, onClose }
                           boxShadow: running ? `0 0 9px ${meta?.color}` : 'none',
                         }} />
                         <div style={{ flex: 1, minWidth: 0 }}>
-                          <div style={{ display: 'flex', alignItems: 'center', gap: 7, flexWrap: 'wrap' }}>
-                            <strong style={{ fontSize: 14, overflow: 'hidden', textOverflow: 'ellipsis' }}>{kit.title}</strong>
+                          <div style={{ display: 'flex', alignItems: 'center', gap: 7, minWidth: 0 }}>
+                            <strong title={kit.title} style={{
+                              flex: 1, minWidth: 0, fontSize: 14, overflow: 'hidden',
+                              textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+                            }}>{kit.title}</strong>
                             {meta && <span style={{ ...statusPill, color: meta.color, borderColor: `${meta.color}66` }}>● {meta.label}</span>}
                             {!kit.enabled && <span style={mutedPill}>停用</span>}
                           </div>
-                          <div style={{ ...subtleStyle, marginTop: 6, lineHeight: 1.5, minHeight: 17 }}>
+                          <div title={kit.description || kit.objective || '标准化 Session 配件'} style={{
+                            ...subtleStyle, marginTop: 6, lineHeight: 1.5, minHeight: 33,
+                            display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical',
+                            overflow: 'hidden',
+                          }}>
                             {kit.description || kit.objective || '标准化 Session 配件'}
                           </div>
                           <div style={{ ...subtleStyle, display: 'flex', gap: 12, marginTop: 9, flexWrap: 'wrap' }}>
@@ -745,9 +758,12 @@ export const WorkspaceKitsPanel: React.FC<Props> = ({ sessionId, open, onClose }
                             <span>{kit.schedule.mode === 'interval' ? `每 ${kit.schedule.intervalSeconds}s` : '手动'}</span>
                             {run && <span>耗时 {formatDuration(run.startedAt, run.endedAt, clock)}</span>}
                           </div>
+                          <div style={{ ...subtleStyle, marginTop: 6, fontVariantNumeric: 'tabular-nums' }}>
+                            最后执行：{formatRunTime(lastRunAt)}
+                          </div>
                         </div>
                       </div>
-                      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-end', gap: 8, marginTop: 13, flexWrap: 'wrap' }}>
+                      <div style={compactKitFooter}>
                         <KitVersionPicker
                           sessionId={sessionId}
                           kit={kit}
@@ -755,7 +771,7 @@ export const WorkspaceKitsPanel: React.FC<Props> = ({ sessionId, open, onClose }
                           compact
                           onFeedback={(text, kind) => setNotice({ kind, text })}
                         />
-                        <div style={{ display: 'flex', gap: 7 }}>
+                        <div style={compactKitActions}>
                           <button style={secondaryButton} onClick={() => setOptimizerKitId(kit.id)}>✨ 优化</button>
                           <button style={secondaryButton} onClick={() => {
                             setSelectedId(kit.id); setInputs(defaultInputsOf(kit)); setDraft(null); setDetailOpen(true);
@@ -2433,7 +2449,15 @@ const compactKitGrid: React.CSSProperties = {
 const compactKitCard: React.CSSProperties = {
   border: '1px solid var(--theme-border, rgba(255,255,255,.12))',
   background: 'var(--theme-bg-secondary, rgba(255,255,255,.025))',
-  borderRadius: 10, padding: 13, minWidth: 0,
+  borderRadius: 10, padding: 13, minWidth: 0, minHeight: 248,
+  display: 'flex', flexDirection: 'column', boxSizing: 'border-box',
+};
+const compactKitFooter: React.CSSProperties = {
+  display: 'flex', flexDirection: 'column', alignItems: 'flex-start', gap: 10,
+  marginTop: 'auto', paddingTop: 13,
+};
+const compactKitActions: React.CSSProperties = {
+  display: 'flex', alignItems: 'center', gap: 7, flexWrap: 'wrap',
 };
 const sectionTitle: React.CSSProperties = { fontSize: 16, fontWeight: 650, marginBottom: 14 };
 const cardTitle: React.CSSProperties = { fontSize: 12, fontWeight: 650, marginBottom: 9 };
@@ -2447,7 +2471,10 @@ const experimentBadge: React.CSSProperties = {
   fontSize: 10, padding: '2px 6px', borderRadius: 9,
   color: '#d2a8ff', border: '1px solid rgba(210,168,255,.35)', background: 'rgba(210,168,255,.08)',
 };
-const statusPill: React.CSSProperties = { fontSize: 10, border: '1px solid', padding: '2px 7px', borderRadius: 10 };
+const statusPill: React.CSSProperties = {
+  flex: '0 0 auto', whiteSpace: 'nowrap', fontSize: 10,
+  border: '1px solid', padding: '2px 7px', borderRadius: 10,
+};
 const mutedPill: React.CSSProperties = { ...statusPill, color: '#8b949e', borderColor: '#6e768166' };
 const durationPill: React.CSSProperties = {
   minWidth: 68, textAlign: 'right', fontSize: 10, fontVariantNumeric: 'tabular-nums',

@@ -6,6 +6,7 @@ export interface ModelRuntime {
 }
 
 export const CODEX_MODELS = [
+  { id: 'gpt-6-astra', label: 'GPT-6 Astra · 最强端到端复杂任务' },
   { id: 'gpt-5.6-sol', label: 'GPT-5.6 Sol · 复杂任务/精细交付' },
   { id: 'gpt-5.6-terra', label: 'GPT-5.6 Terra · 日常均衡执行' },
   { id: 'gpt-5.6-luna', label: 'GPT-5.6 Luna · 快速/轻量' },

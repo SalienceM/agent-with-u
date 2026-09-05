@@ -44,6 +44,7 @@ const OFFICIAL_BACKEND_ID = 'official-claude';
 const OFFICIAL_CODEX_BACKEND_ID = 'official-codex';
 const CODEX_DEFAULT_MODEL = 'gpt-5.6-sol';
 const CODEX_RECOMMENDED_MODELS = [
+  { id: 'gpt-6-astra', label: 'GPT-6 Astra（最强端到端复杂任务）' },
   { id: 'gpt-5.6-sol', label: 'GPT-5.6 Sol（推荐，复杂编码/推理）' },
   { id: 'gpt-5.6-terra', label: 'GPT-5.6 Terra（日常工作均衡）' },
   { id: 'gpt-5.6-luna', label: 'GPT-5.6 Luna（更快/更省）' },
