@@ -2,6 +2,7 @@ const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const { workbenchReducer, initialWorkbench, selectSessionPane, sessionWorkbenchTab, workbenchSessionId, isConversationTab } = require('../../.home-test-dist/utils/workbench.js');
 const { filterMarketItems, marketVersion } = require('../../.home-test-dist/utils/skillMarketView.js');
+const { normalizeWorkbenchSnapshot, workbenchStorageKey, loadWorkbenchSnapshot, saveWorkbenchSnapshot } = require('../../.home-test-dist/utils/workbench.js');
 test('workbench opens unique tabs and restores previous neighbor on close', () => {
   let state = workbenchReducer(initialWorkbench, { type: 'open', tab: 'library' });
   state = workbenchReducer(state, { type: 'open', tab: 'market' });
@@ -13,6 +14,44 @@ test('workbench opens unique tabs and restores previous neighbor on close', () =
   assert.deepEqual(state, initialWorkbench);
   assert.deepEqual(workbenchReducer(state, { type: 'close', tab: 'chat' }), state);
   assert.deepEqual(workbenchReducer({ tabs: ['chat', 'market'], active: 'market' }, { type: 'reset' }), initialWorkbench);
+});
+
+test('navigation snapshot retains all tabs, active tab and unique split focus', () => {
+  const snapshot = { version: 1,
+    workbench: { tabs: ['chat', 'session:a', 'market', 'session:b', 'session:c'], active: 'session:b' },
+    panes: ['a', 'b', null, null], focused: 1, layout: '1x2' };
+  assert.deepEqual(normalizeWorkbenchSnapshot(JSON.parse(JSON.stringify(snapshot))), snapshot);
+  assert.equal(normalizeWorkbenchSnapshot({ ...snapshot, workbench: { ...snapshot.workbench, active: 'market' } }).workbench.active, 'market');
+  const malformed = normalizeWorkbenchSnapshot({ version: 1, workbench: { tabs: ['chat', 'session:a', 'session:a', 'bogus', 'session:'], active: 'session:a' }, panes: ['a', 'a'], focused: 99, layout: '1x2' });
+  assert.deepEqual(malformed.workbench.tabs, ['chat', 'session:a']);
+  assert.deepEqual(malformed.panes, ['a', null, null, null]);
+  assert.equal(malformed.focused, 0);
+  assert.deepEqual(normalizeWorkbenchSnapshot({ version: 99 }), normalizeWorkbenchSnapshot(null));
+  assert.notEqual(workbenchStorageKey({ mode: 'local', userId: 'local' }), workbenchStorageKey({ mode: 'relay', userId: 'local' }));
+  assert.notEqual(workbenchStorageKey({ mode: 'relay', userId: 'a' }), workbenchStorageKey({ mode: 'relay', userId: 'b' }));
+});
+
+test('window snapshots isolate users, prefer this window and store navigation only', () => {
+  const makeStorage = () => {
+    const data = new Map();
+    return { getItem: key => data.get(key) ?? null, setItem: (key, value) => data.set(key, value) };
+  };
+  const oldWindow = global.window;
+  global.window = { sessionStorage: makeStorage(), localStorage: makeStorage() };
+  try {
+    const a = { mode: 'relay', userId: 'a' }, b = { mode: 'relay', userId: 'b' };
+    const snapshot = normalizeWorkbenchSnapshot({ version: 1, workbench: { tabs: ['chat', 'session:s'], active: 'session:s' } });
+    saveWorkbenchSnapshot(a, { ...snapshot, token: 'do-not-store', kitApprovalDelegation: true });
+    assert.deepEqual(loadWorkbenchSnapshot(a), snapshot);
+    assert.deepEqual(loadWorkbenchSnapshot(b), normalizeWorkbenchSnapshot(null));
+    const raw = window.localStorage.getItem(workbenchStorageKey(a));
+    assert.equal(raw.includes('do-not-store'), false);
+    assert.equal(raw.includes('kitApprovalDelegation'), false);
+    window.localStorage.setItem(workbenchStorageKey(a), JSON.stringify(normalizeWorkbenchSnapshot(null)));
+    assert.deepEqual(loadWorkbenchSnapshot(a), snapshot);
+    window.sessionStorage = makeStorage();
+    assert.deepEqual(loadWorkbenchSnapshot(a), normalizeWorkbenchSnapshot(null));
+  } finally { global.window = oldWindow; }
 });
 test('market sorts metadata without converting missing numbers into ratings', () => {
   const base = { name: 'a', description: '', sourceName: '', repository: '', path: '', official: false, updateAvailable: false };

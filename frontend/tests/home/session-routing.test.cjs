@@ -10,6 +10,25 @@ test('partial Session updates do not reset manual ownership', () => {
   assert.equal(mergeSessionRouting(current, { loopControlMode: 'loop' }).loopControlMode, 'loop');
 });
 
+test('successful metadata loads notify every retained consumer and keep newer event ownership', () => {
+  const cache = new SessionRoutingCache();
+  const seen = [];
+  const off = cache.subscribe('a', value => seen.push(value));
+  cache.update('a', { sessionType: 'loop', loopControlMode: 'loop' });
+  const revision = cache.revision('a');
+  cache.update('a', { loopControlMode: 'manual' });
+  cache.loaded('a', { title: 'Loaded title', loopControlMode: 'loop' }, revision);
+  assert.equal(seen.at(-1).loopControlMode, 'manual');
+  assert.equal(seen.at(-1).title, 'Loaded title');
+  assert.equal(cache.get('a').title, 'Loaded title');
+  cache.clear();
+  assert.equal(seen.at(-1), null);
+  off();
+  const length = seen.length;
+  cache.update('a', { title: 'ignored' });
+  assert.equal(seen.length, length);
+});
+
 test('delayed metadata response cannot overwrite a takeover event', () => {
   const cache = new SessionRoutingCache();
   cache.update('session-A', { sessionType: 'loop', loopControlMode: 'loop' });

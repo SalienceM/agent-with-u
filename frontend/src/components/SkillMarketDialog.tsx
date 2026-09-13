@@ -3,7 +3,10 @@ import {
   api,
   SkillMarketCatalog,
   SkillMarketItem,
+  getHomeExecKey,
+  onCurrentUserChanged,
 } from '../api';
+import { SkillMarketExplanation } from './SkillMarketExplanation';
 import { filterMarketItems, marketVersion, type SkillMarketSort } from '../utils/skillMarketView';
 
 if (typeof document !== 'undefined' && !document.getElementById('skill-market-css')) {
@@ -13,17 +16,30 @@ if (typeof document !== 'undefined' && !document.getElementById('skill-market-cs
     .skill-market-layout { display:grid; grid-template-columns:minmax(290px,.9fr) minmax(380px,1.25fr); gap:12px; min-height:0; flex:1; }
     .skill-market-item:hover { border-color:var(--theme-accent,#7aa2f7)!important; }
     .skill-market-source:hover .skill-market-source-remove { opacity:1!important; }
+    .skill-market-source-inputs input { min-width:0; }
+    .skill-market-detail { overflow-wrap:anywhere; }
+    .skill-market-source-snapshot { height:84px; flex:none; display:flex; flex-direction:column; gap:7px; overflow:auto; scrollbar-gutter:stable; }
+    .skill-market-source-snapshot > * { flex-shrink:0; }
+    .skill-market-sync-slot { height:32px; flex:none; overflow:auto; scrollbar-gutter:stable; font-size:11px; line-height:16px; color:var(--theme-text-muted); }
+    .skill-market-directories { height:16px; overflow:auto; align-content:flex-start; }
+    .skill-market-list, .skill-market-detail { scrollbar-gutter:stable; }
+    .skill-market-detail-switch { display:flex; align-items:center; flex-wrap:wrap; gap:6px; margin:8px 0; }
     .skill-market-workbench { container-type:inline-size; container-name:skill-market; }
     @container skill-market (max-width:740px) {
       .skill-market-dialog { overflow-y:auto; }
       .skill-market-layout { display:flex; flex-direction:column; flex:none; overflow:visible; }
-      .skill-market-list { max-height:240px!important; }
-      .skill-market-detail { min-height:520px; flex:none; overflow:visible!important; }
+      .skill-market-list { height:240px; max-height:240px!important; flex:none!important; }
+      .skill-market-detail { height:max(540px,75dvh); min-height:0; flex:none; overflow:auto!important; }
+      .skill-market-directories { height:34px; }
       .skill-market-audit { max-height:420px; flex:none!important; }
       .skill-market-sources { flex-shrink:0; }
       .skill-market-header { flex-wrap:wrap; }
       .skill-market-source-inputs { grid-template-columns:minmax(0,1fr) auto!important; }
       .skill-market-source-inputs input:first-child { grid-column:1/-1; }
+      .skill-market-source-inputs button { grid-column:1/-1; }
+      .skill-market-detail-switch button, .skill-market-detail-switch select { min-height:44px; }
+      .skill-market-file-pages button { min-height:44px; }
+      .skill-market-explanation { min-height:180px; }
     }
     @container skill-market (max-width:480px) {
       .skill-market-audit { grid-template-columns:minmax(0,1fr)!important; }
@@ -33,8 +49,9 @@ if (typeof document !== 'undefined' && !document.getElementById('skill-market-cs
     @media (max-width: 760px) {
       .skill-market-dialog { inset:8px!important; width:auto!important; max-height:none!important; }
       .skill-market-layout { grid-template-columns:1fr; overflow:auto; }
-      .skill-market-list { max-height:280px!important; }
-      .skill-market-detail { min-height:360px; }
+      .skill-market-list { height:240px; max-height:240px!important; flex:none!important; }
+      .skill-market-detail { height:max(540px,75dvh); min-height:0; overflow:auto!important; }
+      .skill-market-directories { height:34px; }
     }
   `;
   document.head.appendChild(style);
@@ -73,7 +90,12 @@ function riskLabel(item: SkillMarketItem): { text: string; color: string; backgr
 
 export const SkillMarketDialog: React.FC<Props> = ({ open, onClose, onInstalled, embedded }) => {
   const [catalog, setCatalog] = useState<SkillMarketCatalog>(EMPTY_CATALOG);
-  const [loading, setLoading] = useState(false);
+  const [loading, setLoading] = useState(true);
+  const [catalogLoaded, setCatalogLoaded] = useState(false);
+  const [loadingText, setLoadingText] = useState('');
+  const [installProgress, setInstallProgress] = useState('');
+  const installOperation = useRef(0);
+  const loadAbort = useRef<AbortController | null>(null);
   const [query, setQuery] = useState('');
   const [sort, setSort] = useState<SkillMarketSort>('updates');
   const [sourceFilter, setSourceFilter] = useState('');
@@ -82,22 +104,39 @@ export const SkillMarketDialog: React.FC<Props> = ({ open, onClose, onInstalled,
   const [selectedId, setSelectedId] = useState('');
   const [sourceInput, setSourceInput] = useState('');
   const [sourceName, setSourceName] = useState('');
+  const [sourceBranch, setSourceBranch] = useState('');
+  const [explanationItemKey, setExplanationItemKey] = useState('');
+  const [explanationBackends, setExplanationBackends] = useState<any[]>([]);
+  const [backendsLoading, setBackendsLoading] = useState(true);
+  const [explanationBackendId, setExplanationBackendId] = useState('');
+  const [execKey, setExecKey] = useState(getHomeExecKey);
+  const [identityRevision, setIdentityRevision] = useState(0);
   const [addingSource, setAddingSource] = useState(false);
   const [installingId, setInstallingId] = useState('');
   const [reviewed, setReviewed] = useState(false);
+  const [fileQuery, setFileQuery] = useState('');
+  const [filePage, setFilePage] = useState(0);
   const [message, setMessage] = useState<{ kind: 'error' | 'ok'; text: string } | null>(null);
 
   const load = useCallback(async (force = false) => {
     const generation = ++loadGeneration.current;
+    loadAbort.current?.abort();
+    const controller = new AbortController();
+    loadAbort.current = controller;
     setLoading(true);
+    setLoadingText('后台加载仓库，首次下载大仓库可能需要一些时间…');
     setMessage(null);
     try {
-      const result = await api.skillMarketList('', force);
+      const result = await api.skillMarketList('', force, text => {
+        if (generation === loadGeneration.current) setLoadingText(text);
+      }, controller.signal);
       if (generation !== loadGeneration.current) return;
-      setCatalog(result);
       if (result.status !== 'ok') {
         setMessage({ kind: 'error', text: result.message || '技能市场加载失败' });
+        return; // 刷新失败保留已同步内容，不能用空错误载荷替换整页。
       }
+      setCatalog(result);
+      setCatalogLoaded(true);
       setSelectedId(current => {
         if (current && result.items.some(item => item.id === current)) return current;
         return result.items[0]?.id || '';
@@ -115,8 +154,41 @@ export const SkillMarketDialog: React.FC<Props> = ({ open, onClose, onInstalled,
 
   useEffect(() => {
     if (open) void load(false);
-    return () => { loadGeneration.current += 1; };
-  }, [open, load]);
+    return () => { loadGeneration.current += 1; loadAbort.current?.abort(); };
+  }, [open, load, identityRevision]);
+
+  useEffect(() => onCurrentUserChanged(() => {
+    loadGeneration.current += 1;
+    setCatalog(EMPTY_CATALOG);
+    setCatalogLoaded(false);
+    setLoading(true);
+    setBackendsLoading(true);
+    loadAbort.current?.abort();
+    setInstallingId('');
+    setInstallProgress('');
+    installOperation.current += 1;
+    setExplanationItemKey('');
+    setExplanationBackends([]);
+    setExplanationBackendId('');
+    setExecKey(getHomeExecKey());
+    setIdentityRevision(value => value + 1);
+  }), []);
+
+  useEffect(() => {
+    if (!open) return;
+    let cancelled = false;
+    const key = getHomeExecKey();
+    setExecKey(key);
+    setBackendsLoading(true);
+    void api.getBackends(key).then(backends => {
+      if (cancelled) return;
+      const eligible = backends.filter(item => item.enabled !== false && ['openai-compatible', 'anthropic-api'].includes(item.type));
+      setExplanationBackends(eligible);
+      setExplanationBackendId(current => eligible.some(item => item.id === current) ? current : eligible[0]?.id || '');
+    }).catch(() => { if (!cancelled) setExplanationBackends([]); })
+      .finally(() => { if (!cancelled) setBackendsLoading(false); });
+    return () => { cancelled = true; };
+  }, [open, identityRevision]);
 
   const filteredItems = useMemo(() => filterMarketItems(catalog.items, query, sourceFilter, sort), [catalog.items, query, sourceFilter, sort]);
 
@@ -124,29 +196,44 @@ export const SkillMarketDialog: React.FC<Props> = ({ open, onClose, onInstalled,
     () => filteredItems.find(item => item.id === selectedId) || filteredItems[0] || null,
     [filteredItems, selectedId],
   );
+  const detailKey = selected ? `${selected.id}:${selected.digest}` : '';
+  const matchingFiles = useMemo(() => {
+    const needle = fileQuery.trim().toLocaleLowerCase();
+    return (selected?.fileNames || []).filter(name => !needle || name.toLocaleLowerCase().includes(needle));
+  }, [selected?.fileNames, fileQuery]);
+  const filePageCount = Math.max(1, Math.ceil(matchingFiles.length / 100));
+  const currentFilePage = Math.min(filePage, filePageCount - 1);
+  // 同一 render 内按条目身份选择视图，避免 effect 重置前短暂挂载另一个 AI 请求。
+  const detailView = detailKey && explanationItemKey === detailKey ? 'explanation' : 'original';
 
   useEffect(() => {
     setReviewed(false);
     setMessage(null);
+    setExplanationItemKey('');
+    setFileQuery('');
+    setFilePage(0);
   }, [selected?.id, selected?.digest]);
 
   const addSource = useCallback(async () => {
-    if (!sourceInput.trim()) return;
+    if (!sourceInput.trim() || addingSource) return;
     setAddingSource(true);
     setMessage(null);
     try {
-      const result = await api.skillMarketAddSource(sourceInput.trim(), sourceName.trim());
+      const result = await api.skillMarketAddSource(sourceInput.trim(), sourceName.trim(), sourceBranch.trim());
       if (result.status !== 'ok') {
         setMessage({ kind: 'error', text: result.message || '来源添加失败' });
         return;
       }
       setSourceInput('');
       setSourceName('');
+      setSourceBranch('');
       await load(true);
+    } catch (error) {
+      setMessage({ kind: 'error', text: error instanceof Error ? error.message : '来源添加失败' });
     } finally {
       setAddingSource(false);
     }
-  }, [sourceInput, sourceName, load]);
+  }, [sourceInput, sourceName, sourceBranch, addingSource, load]);
 
   const removeSource = useCallback(async (sourceId: string) => {
     const result = await api.skillMarketRemoveSource(sourceId);
@@ -159,11 +246,17 @@ export const SkillMarketDialog: React.FC<Props> = ({ open, onClose, onInstalled,
   }, [load, sourceFilter]);
 
   const installSelected = useCallback(async () => {
-    if (!selected || !reviewed) return;
+    if (!selected || !reviewed || installingId) return;
+    const operation = ++installOperation.current;
     setInstallingId(selected.id);
+    setInstallProgress('后台检查并导入所选 Skill…');
+    const generation = loadGeneration.current;
     setMessage(null);
     try {
-      const result = await api.skillMarketInstall(selected, selected.conflict);
+      const result = await api.skillMarketInstall(selected, selected.conflict, text => {
+        if (generation === loadGeneration.current) setInstallProgress(text);
+      });
+      if (generation !== loadGeneration.current) return;
       if (result.status !== 'ok') {
         setMessage({ kind: 'error', text: result.message || '安装失败' });
         return;
@@ -174,14 +267,19 @@ export const SkillMarketDialog: React.FC<Props> = ({ open, onClose, onInstalled,
       });
       await onInstalled(result.skill?.name || result.skill?.id || selected.name);
       await load(false);
+    } catch (error) {
+      if (generation === loadGeneration.current) setMessage({ kind: 'error', text: error instanceof Error ? error.message : '安装失败' });
     } finally {
-      setInstallingId('');
+      if (installOperation.current === operation) {
+        setInstallingId('');
+        setInstallProgress('');
+      }
     }
-  }, [selected, reviewed, onInstalled, load]);
+  }, [selected, reviewed, installingId, onInstalled, load]);
 
   if (!open) return null;
 
-  const installDisabled = !selected || !reviewed || installingId === selected?.id
+  const installDisabled = !selected || !reviewed || Boolean(installingId)
     || Boolean(selected?.installed && selected?.sameSource && !selected?.updateAvailable);
   const installText = !selected ? '选择一个 Skill'
     : installingId === selected.id ? '安装中…'
@@ -203,6 +301,9 @@ export const SkillMarketDialog: React.FC<Props> = ({ open, onClose, onInstalled,
       : skippedTotal > 0 && catalog.items.length === 0
         ? `来源已读取，但没有可安装的兼容 Skill（已跳过 ${skippedTotal} 个不合规条目）`
         : '当前来源中没有可安装的标准 Skill';
+  const initialSync = loading && !catalogLoaded;
+  const syncText = installingId ? installProgress : loading ? `同步中 · ${loadingText}`
+    : message?.text || (catalogLoaded ? '同步完成' : '尚未同步，请点击刷新源重试');
 
   return (
     <div className={embedded ? 'skill-market-workbench' : undefined} style={embedded ? { display: 'flex', flex: 1, minWidth: 0, minHeight: 0, overflow: 'hidden' } : overlayStyle}>
@@ -219,19 +320,30 @@ export const SkillMarketDialog: React.FC<Props> = ({ open, onClose, onInstalled,
             </p>
           </div>
           <div style={{ display: 'flex', gap: 6 }}>
-            <button style={secondaryButtonStyle} onClick={() => void load(true)} disabled={loading}>
+            <button style={{ ...secondaryButtonStyle, width: 86 }} onClick={() => void load(true)} disabled={loading}>
               {loading ? '刷新中…' : '↻ 刷新源'}
             </button>
             {!embedded && <button style={closeButtonStyle} onClick={onClose} aria-label="关闭">×</button>}
           </div>
         </header>
 
+        <div className="skill-market-sync-slot" role={loading || installingId ? 'status' : message?.kind === 'error' ? 'alert' : undefined}
+          aria-live="polite" aria-atomic="true" title={syncText}
+          style={{ color: !loading && !installingId && message ? (message.kind === 'error' ? '#ef6b73' : '#4fb477') : undefined }}>
+          {syncText}
+        </div>
+
         <div className="skill-market-sources" style={sourceAreaStyle}>
           <button type="button" onClick={() => setSourcesExpanded(value => !value)} aria-expanded={sourcesExpanded}
-            style={{ ...secondaryButtonStyle, textAlign: 'left', alignSelf: 'flex-start' }}>
-            {sourcesExpanded ? '▾' : '▸'} 来源与添加 · {catalog.sources.length} 个仓库{failedSources.length ? ` · ${failedSources.length} 个失败` : ''}{skippedTotal ? ` · ${skippedTotal} 个条目跳过` : ''}
+            style={{ ...secondaryButtonStyle, textAlign: 'left', alignSelf: 'flex-start', maxWidth: '100%', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+            {sourcesExpanded ? '▾' : '▸'} 来源与添加 · {initialSync ? '同步中…' : `${catalog.sources.length} 个仓库`}{failedSources.length ? ` · ${failedSources.length} 个失败` : ''}{skippedTotal ? ` · ${skippedTotal} 个条目跳过` : ''}
           </button>
           <div hidden={!sourcesExpanded} style={{ display: sourcesExpanded ? 'flex' : 'none', flexDirection: 'column', gap: 7 }}>
+          <div className="skill-market-source-snapshot" aria-busy={loading}>
+          {initialSync && <div style={{ padding: '4px 2px', fontSize: 11, color: 'var(--theme-text-muted)' }}>
+            来源信息同步中…
+            <MarketSkeletonLines />
+          </div>}
           <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, alignItems: 'center' }}>
             {catalog.sources.map(source => (
               <span key={source.id} className="skill-market-source" style={{
@@ -242,7 +354,7 @@ export const SkillMarketDialog: React.FC<Props> = ({ open, onClose, onInstalled,
                     ? 'rgba(214,168,75,.45)'
                     : 'var(--theme-border)',
               }} title={source.error || source.homepage}>
-                {source.official ? '✓ ' : ''}{source.name}
+                {source.official ? '✓ ' : ''}{source.name} <span>@{source.effectiveRef || source.ref || 'main'}</span>
                 <small style={{ opacity: .65 }}>
                   {source.error
                     ? ' · 加载失败'
@@ -289,14 +401,21 @@ export const SkillMarketDialog: React.FC<Props> = ({ open, onClose, onInstalled,
               </button>
             </div>
           )}
-          <div className="skill-market-source-inputs" style={{ display: 'grid', gridTemplateColumns: 'minmax(150px,1fr) minmax(110px,.45fr) auto', gap: 6 }}>
+          </div>
+          <div className="skill-market-source-inputs" style={{ display: 'grid', gridTemplateColumns: 'minmax(150px,1fr) minmax(110px,.35fr) minmax(110px,.35fr) auto', gap: 6 }}>
             <input
               value={sourceInput}
               onChange={event => setSourceInput(event.target.value)}
               onKeyDown={event => { if (event.key === 'Enter') void addSource(); }}
               placeholder="添加 GitHub 仓库：owner/repo 或 https://github.com/…"
+              aria-label="GitHub 仓库地址"
               style={inputStyle}
             />
+            <input value={sourceBranch} onChange={event => setSourceBranch(event.target.value)}
+              aria-label="来源分支" placeholder="分支（如 main / master）" list="skill-market-branches"
+              title="填写后严格使用此分支；留空沿用地址中的分支，普通仓库地址依次尝试 main、master。含 / 的分支请在此填写。"
+              onKeyDown={event => { if (event.key === 'Enter') void addSource(); }} style={inputStyle} />
+            <datalist id="skill-market-branches"><option value="main" /><option value="master" /></datalist>
             <input
               value={sourceName}
               onChange={event => setSourceName(event.target.value)}
@@ -307,8 +426,10 @@ export const SkillMarketDialog: React.FC<Props> = ({ open, onClose, onInstalled,
               {addingSource ? '添加中…' : '＋ 添加源'}
             </button>
           </div>
-          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 10, fontSize: 10, color: 'var(--theme-text-muted)' }}>
+          <div style={{ fontSize: 10, color: 'var(--theme-text-muted)' }}>分支可填写 main、master 或自定义名称；留空使用地址中的分支，无分支地址尝试 main / master。指定分支不会自动换分支。</div>
+          <div className="skill-market-directories" style={{ display: 'flex', flexWrap: 'wrap', gap: '3px 10px', fontSize: 10, color: 'var(--theme-text-muted)' }}>
             <span>公开目录：</span>
+            {initialSync && <span>同步中…</span>}
             {catalog.directories.map(directory => (
               <a key={directory.url} href={directory.url} target="_blank" rel="noreferrer"
                 title={directory.description} style={{ color: 'var(--theme-accent)', textDecoration: 'none' }}>
@@ -318,14 +439,6 @@ export const SkillMarketDialog: React.FC<Props> = ({ open, onClose, onInstalled,
           </div>
           </div>
         </div>
-
-        {message && (
-          <div style={{
-            padding: '7px 10px', borderRadius: 7, fontSize: 12,
-            color: message.kind === 'ok' ? '#4fb477' : '#ef6b73',
-            background: message.kind === 'ok' ? 'rgba(79,180,119,.1)' : 'rgba(239,107,115,.1)',
-          }}>{message.text}</div>
-        )}
 
         <div className="skill-market-layout">
           <div style={listPaneStyle}>
@@ -346,11 +459,13 @@ export const SkillMarketDialog: React.FC<Props> = ({ open, onClose, onInstalled,
                 <option value="">全部来源</option>{catalog.sources.map(source => <option key={source.id} value={source.id}>{source.name}</option>)}
               </select>
             </div>
-            <div style={{ fontSize: 10, color: 'var(--theme-text-muted)', lineHeight: 1.5 }}>
-              {filteredItems.length} 个扩展 · Star / 推送时间属于整个仓库，不是技能评分。基础检查通过不代表效果优秀。
+            <div style={{ fontSize: 10, color: 'var(--theme-text-muted)', lineHeight: 1.5, height: 30, flexShrink: 0, overflow: 'auto' }}>
+              {initialSync ? '扩展列表同步中…' : `${filteredItems.length} 个扩展`} · Star / 推送时间属于整个仓库，不是技能评分。基础检查通过不代表效果优秀。
             </div>
-            <div className="skill-market-list" style={listStyle}>
-              {loading && catalog.items.length === 0 && <div style={emptyStyle}>正在读取公开 Skill 仓库…</div>}
+            <div className="skill-market-list" style={listStyle} aria-busy={loading}>
+              {initialSync && <div data-testid="market-list-placeholder" aria-hidden="true">
+                {[0, 1, 2].map(index => <div key={index} style={{ ...itemStyle, marginBottom: 6, cursor: 'default' }}><MarketSkeletonLines /></div>)}
+              </div>}
               {!loading && filteredItems.length === 0 && <div style={emptyStyle}>{emptyMessage}</div>}
               {filteredItems.map(item => {
                 const risk = riskLabel(item);
@@ -384,8 +499,13 @@ export const SkillMarketDialog: React.FC<Props> = ({ open, onClose, onInstalled,
             </div>
           </div>
 
-          <div className="skill-market-detail" style={detailPaneStyle}>
-            {!selected ? <div style={emptyStyle}>从左侧选择一个 Skill 查看完整内容</div> : (() => {
+          <div className="skill-market-detail" style={detailPaneStyle} aria-busy={initialSync}>
+            {!selected ? initialSync ? <div data-testid="market-detail-placeholder" style={{ display: 'flex', flexDirection: 'column', flex: 1, gap: 16 }}>
+              <div style={{ fontSize: 12, color: 'var(--theme-text-muted)' }}>Skill 详情同步中…</div>
+              <MarketSkeletonLines />
+              <div style={{ ...auditBoxStyle, flex: 1 }}><MarketSkeletonLines /></div>
+              <div aria-hidden="true" style={{ ...skeletonLineStyle, height: 36, width: '100%' }} />
+            </div> : <div style={emptyStyle}>{catalogLoaded ? '从左侧选择一个 Skill 查看完整内容' : '同步未完成，请点击刷新源重试'}</div> : (() => {
               const risk = riskLabel(selected);
               return (
                 <>
@@ -399,6 +519,23 @@ export const SkillMarketDialog: React.FC<Props> = ({ open, onClose, onInstalled,
                     </div>
                     <span style={{ ...riskBadgeStyle, color: risk.color, background: risk.background }}>{risk.text}</span>
                   </div>
+                  <div className="skill-market-detail-switch">
+                    <div role="group" aria-label="Skill 详情视图" style={{ display: 'flex', gap: 4 }}>
+                      <button type="button" aria-pressed={detailView === 'original'} onClick={() => setExplanationItemKey('')}
+                        style={{ ...secondaryButtonStyle, ...(detailView === 'original' ? selectedItemStyle : {}) }}>原文</button>
+                      <button type="button" aria-pressed={detailView === 'explanation'} onClick={() => setExplanationItemKey(detailKey)}
+                        title="使用所选 Backend 生成中文用途、用法与注意事项，会产生模型用量"
+                        style={{ ...secondaryButtonStyle, ...(detailView === 'explanation' ? selectedItemStyle : {}) }}>AI 中文解读</button>
+                    </div>
+                    <select aria-label="AI 解读 Backend" value={explanationBackendId} onChange={event => {
+                      setExplanationBackendId(event.target.value); setExplanationItemKey('');
+                    }} disabled={backendsLoading} aria-busy={backendsLoading} style={{ ...inputStyle, maxWidth: '100%', flex: 1 }}>
+                      {backendsLoading && <option value={explanationBackendId}>Backend 同步中…</option>}
+                      {!backendsLoading && !explanationBackends.length && <option value="">需配置文本 API Backend</option>}
+                      {!backendsLoading && explanationBackends.map(backend => <option key={backend.id} value={backend.id}>{backend.label || backend.id}</option>)}
+                    </select>
+                  </div>
+                  {detailView === 'original' ? <>
                   <p style={{ margin: '9px 0', fontSize: 12, lineHeight: 1.55, color: 'var(--theme-text)' }}>
                     {selected.description}
                   </p>
@@ -426,8 +563,19 @@ export const SkillMarketDialog: React.FC<Props> = ({ open, onClose, onInstalled,
                   <div className="skill-market-audit" style={{ display: 'grid', gridTemplateColumns: 'minmax(0,.8fr) minmax(0,1.2fr)', gap: 8, minHeight: 100, flex: 1 }}>
                     <div style={auditBoxStyle}>
                       <strong style={auditTitleStyle}>安装文件</strong>
+                      {selected.fileNames.length > 100 && (
+                        <div style={{ display: 'grid', gap: 4, marginBottom: 5 }}>
+                          <input aria-label="搜索安装文件" placeholder="搜索文件名…" value={fileQuery}
+                            onChange={event => { setFileQuery(event.target.value); setFilePage(0); }} style={{ ...inputStyle, width: '100%', boxSizing: 'border-box' }} />
+                          <div className="skill-market-file-pages" style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 5, fontSize: 11, color: 'var(--theme-text-muted)' }}>
+                            <span>共 {selected.fileCount} 个文件 · 匹配 {matchingFiles.length} · {currentFilePage + 1}/{filePageCount} 页</span>
+                            <button style={secondaryButtonStyle} disabled={currentFilePage === 0} onClick={() => setFilePage(currentFilePage - 1)}>上一页</button>
+                            <button style={secondaryButtonStyle} disabled={currentFilePage + 1 >= filePageCount} onClick={() => setFilePage(currentFilePage + 1)}>下一页</button>
+                          </div>
+                        </div>
+                      )}
                       <div style={scrollTextStyle}>
-                        {selected.fileNames.map(name => <div key={name}>{name}</div>)}
+                        {matchingFiles.slice(currentFilePage * 100, (currentFilePage + 1) * 100).map(name => <div key={name}>{name}</div>)}
                       </div>
                     </div>
                     <div style={auditBoxStyle}>
@@ -441,6 +589,8 @@ export const SkillMarketDialog: React.FC<Props> = ({ open, onClose, onInstalled,
                       <pre style={previewStyle}>{selected.preview}</pre>
                     </div>
                   </div>
+                  </> : <SkillMarketExplanation key={`${identityRevision}:${selected.id}:${selected.digest}:${explanationBackendId}`}
+                    item={selected} backendId={explanationBackendId} execKey={execKey} backendLoading={backendsLoading} />}
                   <footer className="skill-market-footer" style={detailFooterStyle}>
                     <label style={{ display: 'flex', alignItems: 'flex-start', gap: 7, fontSize: 11,
                       color: 'var(--theme-text-muted)', lineHeight: 1.4, flex: 1 }}>
@@ -462,6 +612,13 @@ export const SkillMarketDialog: React.FC<Props> = ({ open, onClose, onInstalled,
   );
 };
 
+const skeletonLineStyle: React.CSSProperties = {
+  height: 10, borderRadius: 4, background: 'var(--theme-border)', opacity: .65,
+};
+const MarketSkeletonLines: React.FC = () => <div aria-hidden="true" style={{ display: 'grid', gap: 9, padding: '9px 0' }}>
+  {[.6, .95, .8].map(width => <div key={width} style={{ ...skeletonLineStyle, width: `${width * 100}%` }} />)}
+</div>;
+
 const overlayStyle: React.CSSProperties = {
   position: 'fixed', inset: 0, zIndex: 2600, padding: 18,
   display: 'flex', alignItems: 'center', justifyContent: 'center',
@@ -474,10 +631,10 @@ const dialogStyle: React.CSSProperties = {
   background: 'var(--theme-bg-secondary)', boxShadow: '0 20px 70px rgba(0,0,0,.42)',
 };
 const headerStyle: React.CSSProperties = {
-  display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: 12,
+  display: 'flex', flexShrink: 0, justifyContent: 'space-between', alignItems: 'flex-start', gap: 12,
 };
 const sourceAreaStyle: React.CSSProperties = {
-  display: 'flex', flexDirection: 'column', gap: 7, padding: 9,
+  display: 'flex', flexShrink: 0, flexDirection: 'column', gap: 7, padding: 9,
   border: '1px solid var(--theme-border)', borderRadius: 9, background: 'var(--theme-bg)',
 };
 const sourceProblemStyle: React.CSSProperties = {
@@ -521,7 +678,7 @@ const listPaneStyle: React.CSSProperties = {
   display: 'flex', flexDirection: 'column', gap: 8, minWidth: 0, minHeight: 0,
 };
 const listStyle: React.CSSProperties = {
-  display: 'flex', flexDirection: 'column', gap: 6, minHeight: 0, overflowY: 'auto', paddingRight: 3,
+  display: 'flex', flexDirection: 'column', flex: 1, gap: 6, minHeight: 0, overflowY: 'auto', paddingRight: 3,
 };
 const itemStyle: React.CSSProperties = {
   display: 'flex', flexDirection: 'column', gap: 5, width: '100%', padding: 'var(--ui-field-padding, 9px 10px)',
@@ -542,7 +699,7 @@ const installedBadgeStyle: React.CSSProperties = {
 };
 const detailPaneStyle: React.CSSProperties = {
   display: 'flex', flexDirection: 'column', gap: 4, minWidth: 0, minHeight: 0,
-  padding: 11, borderRadius: 9, border: '1px solid var(--theme-border)', background: 'var(--theme-bg)', overflow: 'hidden',
+  padding: 11, borderRadius: 9, border: '1px solid var(--theme-border)', background: 'var(--theme-bg)', overflow: 'auto', boxSizing: 'border-box',
 };
 const riskBadgeStyle: React.CSSProperties = {
   padding: '3px 7px', borderRadius: 6, fontSize: 10, whiteSpace: 'nowrap',

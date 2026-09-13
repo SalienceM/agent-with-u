@@ -41,8 +41,13 @@ SECRETS_DIR  = paths.sub("skill-secrets")
 MANAGED_MARKER = ".awu-managed.json"
 STANDARD_SKILL_FORMAT = "agent-skills"
 MAX_STANDARD_ARCHIVE_BYTES = 64 * 1024 * 1024
+# 仓库含展示素材/多个 Skill，下载限额不能复用单个 Skill 的展开限额。
+MAX_REPOSITORY_ARCHIVE_BYTES = 1024 * 1024 * 1024
+MAX_REPOSITORY_ENTRIES = 100_000
+MAX_REPOSITORY_SKILLS = 2048
+MAX_STANDARD_SKILL_BYTES = 256 * 1024 * 1024
 MAX_STANDARD_FILE_BYTES = 16 * 1024 * 1024
-MAX_STANDARD_FILES = 512
+MAX_STANDARD_FILES = 20_000
 _STANDARD_NAME_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 _SAFE_LIBRARY_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
@@ -204,6 +209,8 @@ def _normalise_zip_members(
     when they belong to a discovered Skill; a root helper link must not hide an
     otherwise valid catalog.
     """
+    if len(zf.infolist()) > MAX_REPOSITORY_ENTRIES:
+        raise ValueError(f"仓库压缩包条目数超过 {MAX_REPOSITORY_ENTRIES}")
     all_members: dict[str, zipfile.ZipInfo] = {}
     for info in zf.infolist():
         raw = info.filename.replace("\\", "/")
@@ -215,6 +222,8 @@ def _normalise_zip_members(
         mode = (info.external_attr >> 16) & 0xFFFF
         if mode and stat.S_ISLNK(mode) and not repository_mode:
             raise ValueError(f"压缩包不允许符号链接：{raw}")
+        if path.as_posix() in all_members:
+            raise ValueError(f"压缩包包含重复路径：{raw}")
         all_members[path.as_posix()] = info
 
     if not all_members:
@@ -245,8 +254,8 @@ def _normalise_zip_members(
             if info.file_size > MAX_STANDARD_FILE_BYTES:
                 raise ValueError(f"Skill 文件过大：{member_name}")
             total_size += info.file_size
-            if total_size > MAX_STANDARD_ARCHIVE_BYTES:
-                raise ValueError("Skill 压缩包解压后超过 64 MiB")
+            if total_size > MAX_STANDARD_SKILL_BYTES:
+                raise ValueError("Skill 压缩包解压后超过 256 MiB")
         members[member_name] = info
 
     if not repository_mode and len(members) > MAX_STANDARD_FILES:
@@ -284,7 +293,45 @@ def standard_skills_from_zip_bytes(
     """
     if len(data) > MAX_STANDARD_ARCHIVE_BYTES:
         raise ValueError("Skill 压缩包超过 64 MiB")
-    with zipfile.ZipFile(io.BytesIO(data), "r") as zf:
+    return _standard_skills_from_zip(
+        io.BytesIO(data), source_root, skip_invalid=skip_invalid, issues=issues,
+        repository_mode=repository_mode,
+    )
+
+
+def standard_skills_from_zip_file(
+    archive_path: Path,
+    source_root: str = "",
+    *,
+    skip_invalid: bool = False,
+    issues: Optional[list[dict]] = None,
+    include_files: bool = False,
+    skill_path: Optional[str] = None,
+) -> list[dict]:
+    """Inspect a disk-backed repository; catalog results never retain asset bytes.
+
+    Installation selects one directory and reuses the exact same digest and
+    per-Skill validation as discovery. The local ZIP import limit is unchanged.
+    """
+    if archive_path.stat().st_size > MAX_REPOSITORY_ARCHIVE_BYTES:
+        raise ValueError("远程 Skill 仓库压缩包超过 1 GiB")
+    return _standard_skills_from_zip(
+        archive_path, source_root, skip_invalid=skip_invalid, issues=issues,
+        repository_mode=True, include_files=include_files, skill_path=skill_path,
+    )
+
+
+def _standard_skills_from_zip(
+    archive: Path | io.BytesIO,
+    source_root: str,
+    *,
+    skip_invalid: bool = False,
+    issues: Optional[list[dict]] = None,
+    repository_mode: bool = False,
+    include_files: bool = True,
+    skill_path: Optional[str] = None,
+) -> list[dict]:
+    with zipfile.ZipFile(archive, "r") as zf:
         members, wrapper = _normalise_zip_members(
             zf,
             source_root=source_root,
@@ -309,11 +356,26 @@ def standard_skills_from_zip_bytes(
             candidates.append((member_name, logical_parts))
         if not candidates:
             raise ValueError("未找到兼容的 SKILL.md")
+        if len(candidates) > MAX_REPOSITORY_SKILLS:
+            raise ValueError(f"仓库 Skill 数量超过 {MAX_REPOSITORY_SKILLS}，请指定来源子目录")
 
         original_roots = {
             PurePosixPath(member_name).parent.as_posix()
             for member_name, _logical in candidates
         }
+        # 每个文件归属最近的 SKILL.md 目录；避免每个 Skill 重扫仓库并遍历所有嵌套根。
+        owned_members: dict[str, list[tuple[str, zipfile.ZipInfo]]] = {}
+        for member_name, info in sorted(members.items()):
+            parent = PurePosixPath(member_name).parent
+            while True:
+                key = parent.as_posix()
+                if key in original_roots:
+                    owned_members.setdefault(key, []).append((member_name, info))
+                    break
+                if key == ".":
+                    break
+                parent = parent.parent
+        inspected_bytes = 0
         results: list[dict] = []
         seen_names: set[str] = set()
         for skill_member, logical_parts in sorted(candidates):
@@ -321,30 +383,17 @@ def standard_skills_from_zip_bytes(
             logical_parent = PurePosixPath(*logical_parts[:-1]).as_posix()
             if logical_parent == ".":
                 logical_parent = ""
+            if skill_path is not None and logical_parent != skill_path:
+                continue
             try:
                 files: dict[str, bytes] = {}
+                digest = hashlib.sha256()
+                markdown_bytes = b""
                 prefix = "" if original_root == "." else original_root + "/"
                 total_size = 0
-                for member_name, info in members.items():
-                    if prefix and not member_name.startswith(prefix):
-                        continue
-                    if not prefix and "/" in member_name:
-                        # A root Skill owns its support folders, except nested
-                        # independent Skills handled below.
-                        pass
+                for member_name, info in owned_members.get(original_root, []):
                     relative = member_name[len(prefix):] if prefix else member_name
                     if not relative:
-                        continue
-                    # Do not absorb another nested Skill into this package.
-                    nested = False
-                    for other_root in original_roots:
-                        if other_root == original_root or other_root == ".":
-                            continue
-                        other_prefix = other_root + "/"
-                        if member_name.startswith(other_prefix):
-                            nested = True
-                            break
-                    if nested:
                         continue
                     mode = (info.external_attr >> 16) & 0xFFFF
                     if mode and stat.S_ISLNK(mode):
@@ -352,14 +401,27 @@ def standard_skills_from_zip_bytes(
                     if info.file_size > MAX_STANDARD_FILE_BYTES:
                         raise ValueError(f"Skill 文件过大：{member_name}")
                     total_size += info.file_size
-                    if total_size > MAX_STANDARD_ARCHIVE_BYTES:
-                        raise ValueError("Skill 文件总大小超过 64 MiB")
-                    files[PurePosixPath(relative).as_posix()] = _read_zip_member(zf, info)
+                    if total_size > MAX_STANDARD_SKILL_BYTES:
+                        raise ValueError("Skill 文件总大小超过 256 MiB")
+                    inspected_bytes += info.file_size
+                    if inspected_bytes > MAX_REPOSITORY_ARCHIVE_BYTES:
+                        raise ValueError("所选目录的 Skill 展开数据超过 1 GiB，请缩小来源子目录")
+                    relative = PurePosixPath(relative).as_posix()
+                    data = _read_zip_member(zf, info)
+                    digest.update(relative.encode("utf-8"))
+                    digest.update(b"\0")
+                    digest.update(data)
+                    digest.update(b"\0")
+                    if relative == "SKILL.md":
+                        markdown_bytes = data
+                    # 目录缓存只保留名称；配套文件仅在安装选中条目时读入。
+                    files[relative] = data if include_files else b""
+                    del data
                     if len(files) > MAX_STANDARD_FILES:
                         raise ValueError(f"Skill 文件数超过 {MAX_STANDARD_FILES}")
 
                 try:
-                    markdown = files["SKILL.md"].decode("utf-8")
+                    markdown = markdown_bytes.decode("utf-8")
                 except UnicodeDecodeError as exc:
                     raise ValueError(f"{skill_member} 不是 UTF-8 文本") from exc
                 directory_name = logical_parts[-2] if len(logical_parts) >= 2 else ""
@@ -379,11 +441,11 @@ def standard_skills_from_zip_bytes(
                     "content": markdown,
                     "frontmatter": frontmatter,
                     "warnings": validation["warnings"],
-                    "files": files,
+                    **({"files": files} if include_files else {}),
                     "fileNames": sorted(files),
                     "fileCount": len(files),
-                    "size": sum(len(value) for value in files.values()),
-                    "digest": skill_files_digest(files),
+                    "size": total_size,
+                    "digest": digest.hexdigest(),
                     "risk": assess_skill_risk(files, markdown),
                 })
             except (KeyError, ValueError) as exc:
@@ -922,8 +984,8 @@ class SkillStore:
             if len(data) > MAX_STANDARD_FILE_BYTES:
                 raise ValueError(f"Skill 文件过大：{raw_name}")
             total_size += len(data)
-            if total_size > MAX_STANDARD_ARCHIVE_BYTES:
-                raise ValueError("Skill 文件总大小超过 64 MiB")
+            if total_size > MAX_STANDARD_SKILL_BYTES:
+                raise ValueError("Skill 文件总大小超过 256 MiB")
             normalized[path.as_posix()] = data
         if "SKILL.md" not in normalized:
             raise ValueError("标准 Skill 缺少根目录 SKILL.md")

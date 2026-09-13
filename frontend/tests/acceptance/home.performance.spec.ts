@@ -39,6 +39,8 @@ async function openMeasuredHome(page: Page): Promise<void> {
   await installPerformanceObservers(page);
   await page.addInitScript(() => {
     localStorage.removeItem('agent-with-u:pane-sessions');
+    localStorage.removeItem('agent-with-u:workbench:v1:local:local');
+    sessionStorage.removeItem('agent-with-u:workbench:v1:local:local');
     localStorage.removeItem('awu.connectionTarget');
     localStorage.removeItem('awu.execRoster');
     localStorage.removeItem('awu.home.preferences.v1');

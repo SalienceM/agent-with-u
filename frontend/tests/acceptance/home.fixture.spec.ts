@@ -4,6 +4,8 @@ test('isolated fixture reaches the real dashboard data chain', async ({ page }, 
   const stress = process.env.HOME_QA_PROFILE === 'stress';
   await page.addInitScript(() => {
     localStorage.removeItem('agent-with-u:pane-sessions');
+    localStorage.removeItem('agent-with-u:workbench:v1:local:local');
+    sessionStorage.removeItem('agent-with-u:workbench:v1:local:local');
     localStorage.removeItem('awu.connectionTarget');
     localStorage.removeItem('awu.execRoster');
   });

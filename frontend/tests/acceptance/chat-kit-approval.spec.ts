@@ -29,8 +29,9 @@ test('Kit delegation is an explicit one-send flag, never inferred or carried to 
   await page.goto('/');
   await openSidebar();
   await page.locator('.awu-sidebar').getByText(/^客户工作会话 \d+$/).first().click();
-  const optIn = page.getByRole('checkbox', { name: '本次允许 Kit 代确认' });
-  const input = page.locator('.chat-textarea');
+  const pane = page.locator('[data-session-tab-panel]:visible');
+  const optIn = pane.getByRole('switch', { name: '本次允许 Kit 代确认' });
+  const input = pane.locator('.chat-textarea');
   await expect(optIn).not.toBeChecked();
   await expect(optIn).toBeEnabled();
   await input.fill('我授权你代确认（正文不等于开关）');
@@ -41,7 +42,9 @@ test('Kit delegation is an explicit one-send flag, never inferred or carried to 
   finish!();
   await expect(optIn).toBeEnabled();
 
-  await optIn.check();
+  await optIn.click();
+  await expect(optIn).toBeChecked();
+  await expect(optIn).toContainText('仅本次');
   await input.fill('按顺序打包并发布，请核对本次发布计划');
   await page.screenshot({ path: testInfo.outputPath('kit-delegation-opt-in.png'), fullPage: true });
   await input.press('Enter');
@@ -58,9 +61,15 @@ test('Kit delegation is an explicit one-send flag, never inferred or carried to 
   expect(sent[2].kitApprovalDelegation).toBe(false);
   finish!();
   await expect(optIn).toBeEnabled();
-  await optIn.check();
+  await optIn.click();
   await openSidebar();
   await page.locator('.awu-sidebar').getByText(/^客户工作会话 \d+$/).nth(1).click();
+  await expect(optIn).not.toBeChecked();
+  await openSidebar();
+  await page.locator('.awu-sidebar').getByText(/^客户工作会话 \d+$/).first().click();
+  await expect(optIn).not.toBeChecked();
+  await optIn.click();
+  await page.reload();
   await expect(optIn).not.toBeChecked();
   expect(sent).toHaveLength(3);
 });

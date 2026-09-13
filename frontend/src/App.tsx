@@ -25,7 +25,7 @@ import { SkillRuntimeDialog } from './components/SkillRuntimeDialog';
 import { WorkbenchTabs } from './components/WorkbenchNavigation';
 import { AppModalVisibilityContext } from './components/AppModalPortal';
 import { uiDensityCss } from './utils/uiDensity';
-import { initialWorkbench, workbenchReducer, isConversationTab, sessionWorkbenchTab, workbenchSessionId, selectSessionPane, type SidebarView, type WorkbenchTab } from './utils/workbench';
+import { workbenchReducer, isConversationTab, sessionWorkbenchTab, workbenchSessionId, selectSessionPane, loadWorkbenchSnapshot, saveWorkbenchSnapshot, type SidebarView, type WorkbenchTab } from './utils/workbench';
 import { ScratchPad } from './components/ScratchPad';
 import { AssetPanel } from './components/AssetPanel';
 import { ServerDirPicker } from './components/ServerDirPicker';
@@ -108,7 +108,9 @@ export const App: React.FC = () => {
   const [backendManagerLoading, setBackendManagerLoading] = useState(false);
   const [backendManagerError, setBackendManagerError] = useState('');
   const backendManagerLoadGenerationRef = useRef(0);
-  const [workbench, dispatchWorkbench] = useReducer(workbenchReducer, initialWorkbench);
+  const [initialWorkspace] = useState(() => loadWorkbenchSnapshot(getCurrentUserProfile()));
+  const [workbench, dispatchWorkbench] = useReducer(workbenchReducer, initialWorkspace.workbench);
+  const mountedSessionIdsRef = useRef(new Set<string>());
   const [sidebarView, setSidebarView] = useState<SidebarView>('sessions');
   const chatWorkspaceVisible = isConversationTab(workbench.active);
   const repoPanelOpen = !chatWorkspaceVisible;
@@ -175,30 +177,9 @@ export const App: React.FC = () => {
   // ── 分屏布局状态(localStorage 持久化) ────────────────────────────────
   // layout: 当前几宫格;paneSessions: 每个 pane 对应的 sessionId;
   // focusedPaneIdx: 当前焦点 pane,新建 / 侧边栏选中 / 顶栏元数据都跟随它走。
-  const [layout, setLayout] = useState<Layout>(() => {
-    try {
-      const saved = localStorage.getItem('agent-with-u:layout');
-      if (saved === '1x1' || saved === '1x2' || saved === '2x2') return saved;
-    } catch {}
-    return '1x1';
-  });
-  const [paneSessions, setPaneSessions] = useState<(string | null)[]>(() => {
-    try {
-      const saved = localStorage.getItem('agent-with-u:pane-sessions');
-      if (saved) {
-        const parsed = JSON.parse(saved);
-        if (Array.isArray(parsed) && parsed.length === 4) {
-          const seen = new Set<string>();
-          return parsed.map(id => {
-            if (typeof id !== 'string' || !id || seen.has(id)) return null;
-            seen.add(id); return id;
-          });
-        }
-      }
-    } catch {}
-    return [null, null, null, null];
-  });
-  const [focusedPaneIdx, setFocusedPaneIdx] = useState(0);
+  const [layout, setLayout] = useState<Layout>(initialWorkspace.layout);
+  const [paneSessions, setPaneSessions] = useState<(string | null)[]>(initialWorkspace.panes);
+  const [focusedPaneIdx, setFocusedPaneIdx] = useState(initialWorkspace.focused);
 
   // 当前焦点 pane 对应的 sessionId(派生,不再是独立 state)
   const activeSessionId = paneSessions[focusedPaneIdx] ?? null;
@@ -213,7 +194,9 @@ export const App: React.FC = () => {
   useEffect(() => onCurrentUserChanged((profile, identityChanged) => {
     setCurrentUser(profile);
     if (!identityChanged) return;
-    dispatchWorkbench({ type: 'reset' });
+    const restored = loadWorkbenchSnapshot(profile);
+    mountedSessionIdsRef.current.clear();
+    dispatchWorkbench({ type: 'restore', state: restored.workbench });
     setMarketRuntimeNames([]);
     setRepoPanelEditing(false);
     setSidebarView('sessions');
@@ -221,7 +204,9 @@ export const App: React.FC = () => {
       if (session?.id) clearSessionHistoryCache(session.id);
     }
     setSessions([]);
-    setPaneSessions((current) => current.map(() => null));
+    setPaneSessions(restored.panes);
+    setFocusedPaneIdx(restored.focused);
+    setLayout(restored.layout);
     setActiveSession(null);
     setStreamingSessions(new Set());
     setCompletedSessions(new Set());
@@ -269,6 +254,7 @@ export const App: React.FC = () => {
     }
     const next = workbenchReducer(workbench, { type: 'close', tab });
     const sid = workbenchSessionId(tab);
+    if (sid) mountedSessionIdsRef.current.delete(sid);
     const panes = sid ? paneSessions.map(id => id === sid ? null : id) : paneSessions;
     if (next.active !== workbench.active && isConversationTab(next.active)) {
       const selected = selectSessionPane(panes, workbenchSessionId(next.active), focusedPaneIdx, LAYOUT_SLOTS[layout]);
@@ -335,13 +321,10 @@ export const App: React.FC = () => {
     } catch {}
   }, [completedSessions]);
 
-  // ★ layout / paneSessions 持久化到 localStorage
+  // 保存完整导航账本，不把未选中的 Tab 丢在刷新边界；只保存当前用户的导航。
   useEffect(() => {
-    try { localStorage.setItem('agent-with-u:layout', layout); } catch {}
-  }, [layout]);
-  useEffect(() => {
-    try { localStorage.setItem('agent-with-u:pane-sessions', JSON.stringify(paneSessions)); } catch {}
-  }, [paneSessions]);
+    saveWorkbenchSnapshot(currentUser, { version: 1, workbench, panes: paneSessions, focused: focusedPaneIdx, layout });
+  }, [currentUser.mode, currentUser.userId, workbench, paneSessions, focusedPaneIdx, layout]);
 
   // 焦点 pane 索引超出当前布局时,回落到 0,防止顶栏读到隐藏 pane 的 session
   useEffect(() => {
@@ -641,12 +624,17 @@ export const App: React.FC = () => {
     // 把问题误发给上一个 Session。
     setActiveSession((current: any) => current?.id === activeSessionId ? current : null);
     let cancelled = false;
+    const unsubscribe = api.onSessionMetaChanged(activeSessionId, session => {
+      if (!cancelled) setActiveSession(session);
+    });
     // 顶栏只读 SessionStore index；不再为了元数据解析任意消息正文。
     api.loadSessionMeta(activeSessionId).then((session) => {
       if (cancelled) return;
       setActiveSession(session);
+    }).catch(() => {
+      if (!cancelled) setActiveSession(api.peekSessionMeta(activeSessionId));
     });
-    return () => { cancelled = true; };
+    return () => { cancelled = true; unsubscribe(); };
   }, [activeSessionId]);
 
   // Phase 2: 每 Session 独立的模型配置(顶栏标签用)
@@ -1814,6 +1802,10 @@ export const App: React.FC = () => {
           const openedSessionIds = [...new Set([
             ...workbench.tabs.map(workbenchSessionId), ...paneSessions,
           ].filter((id): id is string => !!id))];
+          // 刷新恢复的后台 Tab 仅显示标题，首次选中才挂载；已打开的实例继续保活。
+          if (chatWorkspaceVisible) for (const sid of paneSessions.slice(0, slotCount)) {
+            if (sid) mountedSessionIdsRef.current.add(sid);
+          }
           const columnCount = layout === '1x1' ? 1 : 2;
           return (
             <div id="workbench-panel-chat" role="tabpanel" aria-labelledby={`workbench-tab-${chatWorkspaceVisible ? workbench.active : 'chat'}`} hidden={!chatWorkspaceVisible} style={{
@@ -1826,7 +1818,7 @@ export const App: React.FC = () => {
               minHeight: 0,
               background: 'var(--theme-border)',
             }}>
-              {openedSessionIds.map(sid => {
+              {openedSessionIds.filter(sid => mountedSessionIdsRef.current.has(sid)).map(sid => {
                 const idx = paneSessions.indexOf(sid);
                 const placed = idx >= 0 && idx < slotCount;
                 return <div key={sid} data-session-tab-panel={sid} hidden={!placed}

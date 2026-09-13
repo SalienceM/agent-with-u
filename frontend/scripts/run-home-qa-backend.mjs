@@ -32,6 +32,8 @@ function startBackend() {
       env: {
         ...process.env,
         AGENT_WITH_U_DATA_ROOT: dataRoot,
+        // Windows 日志路径独立于 DATA_ROOT，避免 QA 与运行中的正式应用争抢轮转日志。
+        ...(process.platform === 'win32' ? { APPDATA: path.join(dataRoot, '..', 'appdata') } : {}),
         AGENT_WITH_U_RELAY_URL: '',
         AGENT_WITH_U_RELAY_TOKEN: '',
       },

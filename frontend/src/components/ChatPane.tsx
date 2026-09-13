@@ -1,6 +1,6 @@
 import React, { useState, useCallback, useEffect, useLayoutEffect, useRef, useMemo } from 'react';
 import { api } from '../api';
-import { mergeSessionRouting } from '../utils/sessionRouting';
+import { mergeSessionRouting, isSessionMetaReady } from '../utils/sessionRouting';
 import type { CurrentUserProfile, FollowUpCapabilities } from '../api';
 import { MessageBubble } from './MessageBubble';
 import { ChatInput } from './ChatInput';
@@ -168,6 +168,9 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
 }) => {
   // ── pane 自己的 session 详情(workingDir / backendId / skip / sandbox) ──
   const [activeSession, setActiveSession] = useState<any | null>(() => sessionId ? api.peekSessionMeta(sessionId) : null);
+  const [sessionMetaError, setSessionMetaError] = useState('');
+  const [sessionMetaLoading, setSessionMetaLoading] = useState(false);
+  const reloadSessionMetaRef = useRef<() => void>(() => {});
   const [nodeBackends, setNodeBackends] = useState<any[]>(backends);
   const [loopRunning, setLoopRunning] = useState(false);
   const [realtimeVoiceActive, setRealtimeVoiceActive] = useState(false);
@@ -192,6 +195,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
 
   useLayoutEffect(() => {
     setActiveSession(sessionId ? api.peekSessionMeta(sessionId) : null);
+    setSessionMetaError('');
     setLoopRunning(false);
   }, [sessionId]);
 
@@ -199,6 +203,14 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
     if (!sessionId) return;
     let cancelled = false;
     let eventRevision = 0;
+    let requestGeneration = 0;
+    const unsubscribeMeta = api.onSessionMetaChanged(sessionId, session => {
+      if (cancelled) return;
+      setActiveSession(session);
+      if (isSessionMetaReady(session, sessionId)) setSessionMetaError('');
+      if (typeof session?.loopRunning === 'boolean') setLoopRunning(session.loopRunning);
+      if (typeof session?.skipPermissions === 'boolean') setSkipPermissions(session.skipPermissions);
+    });
     const unsubscribeLoop = api.onLoopUpdated((state: any) => {
       if (state?.sessionId !== sessionId) return;
       eventRevision++;
@@ -218,16 +230,38 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
         current?.id === sessionId ? current : api.peekSessionMeta(sessionId), data.summary,
       ));
     });
-    const requestRevision = eventRevision;
-    api.loadSessionMeta(sessionId).then((session) => {
-      if (cancelled || !session) return;
-      setActiveSession((current: any) => eventRevision === requestRevision
-        ? mergeSessionRouting(current?.id === sessionId ? current : null, session)
-        : mergeSessionRouting(session, current?.id === sessionId ? current : api.peekSessionMeta(sessionId)));
-      if (eventRevision === requestRevision) setLoopRunning(session.loopRunning === true);
-      if (session.skipPermissions !== undefined) setSkipPermissions(session.skipPermissions);
+    const load = () => {
+      const generation = ++requestGeneration;
+      const requestRevision = eventRevision;
+      setSessionMetaLoading(true);
+      setSessionMetaError('');
+      void api.loadSessionMeta(sessionId).then((session) => {
+        if (cancelled || generation !== requestGeneration || !session) return;
+        setActiveSession((current: any) => eventRevision === requestRevision
+          ? mergeSessionRouting(current?.id === sessionId ? current : null, session)
+          : mergeSessionRouting(session, current?.id === sessionId ? current : api.peekSessionMeta(sessionId)));
+        if (eventRevision === requestRevision) setLoopRunning(session.loopRunning === true);
+        if (session.skipPermissions !== undefined) setSkipPermissions(session.skipPermissions);
+      }).catch((error: unknown) => {
+        if (!cancelled && generation === requestGeneration) {
+          setSessionMetaError(error instanceof Error ? error.message : '无法读取会话信息，请重试');
+        }
+      }).finally(() => {
+        if (!cancelled && generation === requestGeneration) setSessionMetaLoading(false);
+      });
+    };
+    reloadSessionMetaRef.current = load;
+    load();
+    let firstStatus = true;
+    const unsubscribeConnection = api.onSessionConnectionStatus(sessionId, connected => {
+      // 初值由上面的 load 负责；后续重连必须补拉，保活 Tab 不依赖重新挂载。
+      if (connected && !firstStatus) load();
+      firstStatus = false;
     });
-    return () => { cancelled = true; unsubscribeLoop(); unsubscribeSession(); };
+    return () => {
+      cancelled = true; reloadSessionMetaRef.current = () => {};
+      unsubscribeMeta(); unsubscribeConnection(); unsubscribeLoop(); unsubscribeSession();
+    };
   }, [sessionId]);
 
   // Backend configuration belongs to the executor that owns the session.
@@ -250,9 +284,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
   const activeBackendLabel = effectiveBackends.find((item) => item.id === activeBackendId)?.label
     || activeBackendId
     || '当前 Backend';
-  const sessionMetaReady = !!sessionId && activeSession?.id === sessionId
-    && (activeSession.sessionType !== 'loop'
-      || activeSession.loopControlMode === 'manual' || activeSession.loopControlMode === 'loop');
+  const sessionMetaReady = isSessionMetaReady(activeSession, sessionId || '');
   const automatedLoop = sessionMetaReady
     && activeSession?.sessionType === 'loop'
     && activeSession.loopControlMode === 'loop';
@@ -783,7 +815,17 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
   //   避免「聊天框 vs 面板」双入口、以及聊天与 loop 主线共用 agent 上下文的污染。
   if (!sessionMetaReady) {
     return <div className="awu-chat-pane" style={paneRootStyle} onClick={onFocus}>
-      <div role="status" style={{ padding: 20, color: 'var(--theme-text-muted)' }}>正在恢复会话…</div>
+      <div role={sessionMetaError ? 'alert' : 'status'} style={{ padding: 20, color: 'var(--theme-text-muted)', fontSize: 13 }}>
+        <div>{sessionMetaError ? '无法恢复会话' : '正在读取会话信息…'}</div>
+        {sessionMetaError && <>
+          <p>{sessionMetaError}</p>
+          <button onClick={() => reloadSessionMetaRef.current()} disabled={sessionMetaLoading}
+            style={{ padding: '6px 12px', border: '1px solid var(--theme-border)', borderRadius: 6,
+              background: 'var(--theme-bg-secondary)', color: 'var(--theme-text)', cursor: 'pointer' }}>
+            重试恢复会话
+          </button>
+        </>}
+      </div>
     </div>;
   }
   if (automatedLoop) {

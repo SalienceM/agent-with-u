@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any
 
 from . import paths
+from .skill_store import MAX_STANDARD_FILE_BYTES, MAX_STANDARD_FILES, MAX_STANDARD_SKILL_BYTES
 
 
 class SkillRuntime:
@@ -48,11 +49,11 @@ class SkillRuntime:
                 raise ValueError("Skill 资源包含符号链接，不能用于依赖准备")
             if not item.is_file() or any(p in {".git", "__pycache__"} for p in item.relative_to(source).parts):
                 continue
-            if item.stat().st_size > 16 * 1024 * 1024:
+            if item.stat().st_size > MAX_STANDARD_FILE_BYTES:
                 raise ValueError("Skill 单文件超过检查上限")
             data = item.read_bytes()
             total += len(data)
-            if total > 64 * 1024 * 1024 or len(result) >= 512:
+            if total > MAX_STANDARD_SKILL_BYTES or len(result) >= MAX_STANDARD_FILES:
                 raise ValueError("Skill 资源超过检查上限")
             result[item.relative_to(source).as_posix()] = data
         return result

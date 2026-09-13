@@ -17,7 +17,7 @@ import type {
   ProvDocument, ProvOpenResult, ProvResolveResult, ProvSaveResult,
 } from './types/prov';
 import { filterGitMetadata } from './utils/dirSyncPolicy';
-import { SessionRoutingCache } from './utils/sessionRouting';
+import { SessionRoutingCache, isSessionMetaReady } from './utils/sessionRouting';
 import { rankFileSearchPaths } from './utils/fileSearch';
 import { mergeExecutorSessionBatches, selectExactExecutor } from './utils/executorSessions';
 
@@ -478,6 +478,7 @@ export interface SkillRepositoryInfo {
 }
 
 export interface SkillMarketSource {
+  refExplicit?: boolean;
   repositoryInfo?: SkillRepositoryInfo;
   id: string;
   name: string;
@@ -533,6 +534,16 @@ export interface SkillMarketCatalog {
   directories: Array<{ name: string; url: string; description: string }>;
   items: SkillMarketItem[];
   refreshedAt?: number;
+}
+
+export interface SkillMarketExplanation {
+  status: 'ok' | 'error';
+  jobId?: string;
+  state?: 'running' | 'done' | 'error';
+  text?: string;
+  message?: string;
+  truncated?: boolean;
+  backendId?: string;
 }
 
 let localIdentityTokenPromise: Promise<string> | null = null;
@@ -803,6 +814,7 @@ const pendingConn = new Map<string, string>();
 // 避免整个 session 分组忽隐忽现。
 const sessionListCache = new Map<string, any[]>();
 const sessionRoutingCache = new SessionRoutingCache();
+const sessionMetaRequests = new Map<string, Promise<any>>();
 let listSessionsInFlight: Promise<any[]> | null = null;
 let relayIdentityEpoch = 0;
 const SESSION_LIST_CACHE_KEY = 'awu.sessionListCache.v1';
@@ -1805,6 +1817,37 @@ async function callOnStrict(
   return connection.request(method, params, timeoutMs);
 }
 
+async function marketBackgroundCall(
+  method: string, params: any[], onProgress?: (text: string) => void, signal?: AbortSignal,
+): Promise<any> {
+  const execKey = getHomeExecKey();
+  const identity = getCurrentUserProfile();
+  const parse = (value: any) => typeof value === 'string' ? JSON.parse(value) : value;
+  let result = parse(await callOnStrict(execKey, method, [...params, true], 15000));
+  const deadline = Date.now() + 680_000;
+  while (result?.jobId && result.state === 'running') {
+    if (signal?.aborted) throw new Error('已停止等待市场加载；后台任务不受影响');
+    const current = getCurrentUserProfile();
+    if (current.mode !== identity.mode || current.userId !== identity.userId || getHomeExecKey() !== execKey) {
+      throw new Error('执行节点或用户已切换，请重新打开市场');
+    }
+    if (Date.now() > deadline) throw new Error('市场任务等待超时，请重新打开市场查看');
+    const progress = Array.isArray(result.progress) ? result.progress : [];
+    const text = progress.map((item: any) => {
+      const bytes = (value: number) => `${(Math.max(0, Number(value) || 0) / 1024 / 1024).toFixed(1)} MiB`;
+      return `${item.name}：${item.phase === 'downloading'
+        ? `已下载 ${bytes(item.downloaded)}${item.total > 0 ? ` / ${bytes(item.total)}` : ''}`
+        : item.phase === 'inspecting' ? '检查 Skill 和配套文件…' : '连接仓库…'}`;
+    }).join('；');
+    onProgress?.(text || '后台处理中，可切换 Session；关闭面板不会中断任务。');
+    await new Promise<void>(resolve => setTimeout(resolve, 1000));
+    if (signal?.aborted) throw new Error('已停止等待市场加载；后台任务不受影响');
+    result = parse(await callOnStrict(execKey, 'skillMarketJobGet', [result.jobId], 15000));
+  }
+  if (result?.state === 'error') return { status: 'error', message: result.message };
+  return result?.state === 'done' ? result.result : result;
+}
+
 function syncManifestError(error: unknown): string {
   const message = error instanceof Error ? error.message : String(error || '');
   if (/timeout/i.test(message)) return '扫描超时（3 分钟），目录可能过大；可缩小范围或检查执行端磁盘状态';
@@ -2183,15 +2226,51 @@ export const api = {
 
   /** 只拉 index 元数据，不读取消息正文或 LOOP stage；用于 pane 首屏路由。 */
   async loadSessionMeta(id: string): Promise<any | null> {
-    const cached = api.peekSessionMeta(id);
-    const revision = sessionRoutingCache.revision(id);
-    // 冷启动离线时不能等待 WebSocket 超时后才让平板进入文件副本。
-    if (!routeConn('loadSessionMeta', [id]).isOpen && cached) return cached;
-    const result = await call('loadSessionMeta', id);
+    const connection = routeConn('loadSessionMeta', [id]);
+    const epoch = relayIdentityEpoch;
+    const key = `${epoch}:${connection.key}:${id}`;
+    const pendingRequest = sessionMetaRequests.get(key);
+    if (pendingRequest) return pendingRequest;
+    const request = (async () => {
+      const revision = sessionRoutingCache.revision(id);
+      const deadline = Date.now() + 12000;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        // 连接就绪也计入超时；不通过吞异常的 call()，否则失败会伪装成永久恢复中。
+        const result = await Promise.race([
+          (async () => {
+            await connection.ready;
+            const remaining = deadline - Date.now();
+            if (remaining <= 0) throw new Error('会话信息加载超时，请重试');
+            if (epoch !== relayIdentityEpoch) throw new Error('用户身份已切换');
+            if (!connection.isOpen) throw new Error('执行节点未连接，连接恢复后会自动重试');
+            return connection.request('loadSessionMeta', [id], remaining);
+          })(),
+          new Promise<never>((_, reject) => {
+            timer = setTimeout(() => reject(new Error('会话信息加载超时，请重试')), 12000);
+          }),
+        ]);
+        if (epoch !== relayIdentityEpoch) throw new Error('用户身份已切换');
+        let parsed: any;
+        try { parsed = JSON.parse(result); } catch { throw new Error('执行端返回的会话信息格式无效'); }
+        if (!parsed || parsed.id !== id) throw new Error('会话不可用，请检查执行节点、会话权限或刷新列表');
+        const session = sessionRoutingCache.loaded(id, attachSessionExecutor(parsed), revision);
+        if (!isSessionMetaReady(session, id)) throw new Error('会话信息不完整：执行端未返回有效的会话类型或 LOOP 控制模式');
+        return session;
+      } catch (error) {
+        if (error instanceof Error && /RPC timeout/i.test(error.message)) throw new Error('会话信息加载超时，请重试');
+        if (error instanceof Error && /WebSocket connection lost/i.test(error.message)) throw new Error('连接已中断，恢复连接后会自动重试');
+        throw error;
+      } finally { if (timer) clearTimeout(timer); }
+    })();
+    sessionMetaRequests.set(key, request);
     try {
-      const parsed = attachSessionExecutor(JSON.parse(result));
-      return parsed ? sessionRoutingCache.loaded(id, parsed, revision) : cached;
-    } catch { return cached; }
+      return await request;
+    } finally { if (sessionMetaRequests.get(key) === request) sessionMetaRequests.delete(key); }
+  },
+
+  onSessionMetaChanged(id: string, callback: (session: any | null) => void): () => void {
+    return sessionRoutingCache.subscribe(id, value => callback(value ? api.peekSessionMeta(id) : null));
   },
 
   peekSessionMeta(id: string): any | null {
@@ -3633,13 +3712,14 @@ export const api = {
     try { return JSON.parse(result); } catch { return { status: 'error', message: '响应格式错误' }; }
   },
 
-  async skillMarketList(query: string = '', refresh: boolean = false): Promise<SkillMarketCatalog> {
-    const result = await call('skillMarketList', query, refresh);
+  async skillMarketList(query: string = '', refresh: boolean = false, onProgress?: (text: string) => void,
+    signal?: AbortSignal): Promise<SkillMarketCatalog> {
+    const result = await marketBackgroundCall('skillMarketList', [query, refresh], onProgress, signal);
     if (result === null || result === undefined) {
       return { status: 'error', message: '无法连接到后端', sources: [], directories: [], items: [] };
     }
     try {
-      const parsed = JSON.parse(result);
+      const parsed = typeof result === 'string' ? JSON.parse(result) : result;
       return {
         status: parsed?.status === 'ok' ? 'ok' : 'error',
         message: parsed?.message,
@@ -3653,10 +3733,21 @@ export const api = {
     }
   },
 
-  async skillMarketAddSource(repository: string, name: string = ''): Promise<{ status: string; source?: SkillMarketSource; message?: string }> {
-    const result = await call('skillMarketAddSource', repository, name);
+  async skillMarketAddSource(repository: string, name: string = '', branch: string = ''): Promise<{ status: string; source?: SkillMarketSource; message?: string }> {
+    const result = await call('skillMarketAddSource', repository, name, branch);
     if (result === null || result === undefined) return { status: 'error', message: '无法连接到后端' };
     try { return JSON.parse(result); } catch { return { status: 'error', message: '响应格式错误' }; }
+  },
+
+  async skillMarketExplainStart(item: Pick<SkillMarketItem, 'sourceId' | 'path' | 'digest'>,
+    backendId: string, execKey: string, refresh = false): Promise<SkillMarketExplanation> {
+    const result = await callOnStrict(execKey, 'skillMarketExplainStart', [item.sourceId, item.path, item.digest, backendId, refresh], 15000);
+    return JSON.parse(result);
+  },
+
+  async skillMarketExplainGet(jobId: string, execKey: string): Promise<SkillMarketExplanation> {
+    const result = await callOnStrict(execKey, 'skillMarketExplainGet', [jobId], 15000);
+    return JSON.parse(result);
   },
 
   async skillMarketRemoveSource(sourceId: string): Promise<{ status: string; message?: string }> {
@@ -3668,12 +3759,13 @@ export const api = {
   async skillMarketInstall(
     item: Pick<SkillMarketItem, 'sourceId' | 'path' | 'digest'>,
     allowReplace: boolean = false,
+    onProgress?: (text: string) => void,
   ): Promise<{ status: string; skill?: any; message?: string }> {
-    const result = await call(
-      'skillMarketInstall', item.sourceId, item.path, item.digest, allowReplace,
+    const result = await marketBackgroundCall(
+      'skillMarketInstall', [item.sourceId, item.path, item.digest, allowReplace], onProgress,
     );
     if (result === null || result === undefined) return { status: 'error', message: '无法连接到后端' };
-    try { return JSON.parse(result); } catch { return { status: 'error', message: '响应格式错误' }; }
+    try { return typeof result === 'string' ? JSON.parse(result) : result; } catch { return { status: 'error', message: '响应格式错误' }; }
   },
 
   // ── Secrets 管理（凭据不传 LLM）────────────────────────────────────────

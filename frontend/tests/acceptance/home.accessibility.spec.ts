@@ -6,6 +6,8 @@ const CONTROL_URL = 'http://127.0.0.1:45423';
 async function openCleanHome(page: Page): Promise<void> {
   await page.addInitScript(() => {
     localStorage.removeItem('agent-with-u:pane-sessions');
+    localStorage.removeItem('agent-with-u:workbench:v1:local:local');
+    sessionStorage.removeItem('agent-with-u:workbench:v1:local:local');
     localStorage.removeItem('awu.connectionTarget');
     localStorage.removeItem('awu.execRoster');
     localStorage.removeItem('awu.home.preferences.v1');

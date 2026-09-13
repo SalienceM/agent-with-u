@@ -11,6 +11,63 @@ async function selectSession(page: Page, index: number) {
   return { title, tab };
 }
 
+test('refresh restores all Session tabs in order and lazily loads only the selected conversation', async ({ page }) => {
+  const historyReads: string[] = [];
+  await page.routeWebSocket(/127\.0\.0\.1:45421/, socket => {
+    const server = socket.connectToServer();
+    socket.onMessage(message => {
+      const frame = JSON.parse(String(message));
+      if (['loadSession', 'loadSessionMessages'].includes(frame.method)) historyReads.push(frame.params[0]);
+      if (['sendMessage', 'abortMessage', 'deleteSession', 'seqtaskTakeNext', 'loopRunIteration'].includes(frame.method)) throw new Error('Unexpected mutation');
+      server.send(message);
+    });
+  });
+  await page.goto('/');
+  const opened = [];
+  for (let i = 0; i < 3; i++) opened.push(await selectSession(page, i));
+  await opened[1].tab.click();
+  const pane = page.locator('[data-session-tab-panel]:visible');
+  const sid = (await pane.getAttribute('data-session-tab-panel'))!;
+  await expect(pane.locator('.chat-textarea')).toBeVisible();
+  const tabNames = await page.getByRole('tablist', { name: '工作区标签页' }).getByRole('tab').allTextContents();
+  historyReads.length = 0;
+  await page.reload();
+  await expect(page.getByRole('tablist', { name: '工作区标签页' }).getByRole('tab')).toHaveText(tabNames);
+  await expect(opened[1].tab).toHaveAttribute('aria-selected', 'true');
+  await expect(page.locator('[data-session-tab-panel]')).toHaveCount(1);
+  await expect(pane.locator('.chat-textarea')).toBeVisible();
+  await expect.poll(() => historyReads.length).toBeGreaterThan(0);
+  expect([...new Set(historyReads)]).toEqual([sid]);
+  await opened[0].tab.click();
+  await expect(page.locator('[data-session-tab-panel]')).toHaveCount(2);
+  await expect(pane.locator('.chat-textarea')).toBeVisible();
+  await page.getByRole('button', { name: `关闭${opened[2].title}`, exact: true }).click();
+  await page.reload();
+  await expect(opened[2].tab).toHaveCount(0);
+  await expect(opened[0].tab).toHaveAttribute('aria-selected', 'true');
+});
+
+test('refresh restores split assignments and focused pane', async ({ page }, info) => {
+  test.skip(info.project.name.includes('mobile'));
+  await page.addInitScript(() => localStorage.setItem('agent-with-u:layout', '1x2'));
+  await page.goto('/');
+  const a = await selectSession(page, 0);
+  await page.getByRole('heading', { name: '工作总览', exact: true }).click();
+  const b = await selectSession(page, 1);
+  await expect(page.locator('[data-session-tab-panel]:visible')).toHaveCount(2);
+  await b.tab.click();
+  const before = await page.locator('[data-session-tab-panel]:visible').evaluateAll(nodes => nodes.map(node => ({
+    id: node.getAttribute('data-session-tab-panel'), column: (node as HTMLElement).style.gridColumn,
+  })));
+  await page.reload();
+  await expect(a.tab).toBeVisible();
+  await expect(b.tab).toHaveAttribute('aria-selected', 'true');
+  await expect(page.locator('[data-session-tab-panel]:visible')).toHaveCount(2);
+  expect(await page.locator('[data-session-tab-panel]:visible').evaluateAll(nodes => nodes.map(node => ({
+    id: node.getAttribute('data-session-tab-panel'), column: (node as HTMLElement).style.gridColumn,
+  })))).toEqual(before);
+});
+
 test('Session tabs reuse mounted conversations, retain drafts and close without deleting or aborting', async ({ page }, info) => {
   const forbidden: string[] = [];
   const historyReads: string[] = [];

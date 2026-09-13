@@ -57,6 +57,8 @@ from .backend_store import BackendStore
 from .app_config_store import AppConfigStore
 from .skill_store import SkillStore
 from .skill_market import SkillMarket
+from .skill_market_jobs import SkillMarketJobs
+from .skill_market_explain import SkillMarketExplainer, EXPLANATION_BACKENDS
 from .skill_runtime import SkillRuntime
 from .chat_kits import ChatKitTools, TOOL as CHAT_KIT_TOOL, TOOL_NAME as CHAT_KIT_TOOL_NAME
 from .skill_paths import project_skill_reference, project_skill_root, render_skill_markdown
@@ -748,6 +750,8 @@ class BridgeWS:
         self._backend_store = BackendStore()
         self._skill_store = SkillStore()
         self._skill_market = SkillMarket(self._skill_store)
+        self._skill_market_jobs = SkillMarketJobs()
+        self._skill_market_explainer = SkillMarketExplainer(self._skill_market, self._new_backend_instance)
         self._skill_runtime = SkillRuntime(self._skill_store)
         self._prompt_store = PromptStore()
         # ★ 可视化 Loop 集成：stage 文件存储 + 并发想法池 + 运行去重
@@ -11789,9 +11793,15 @@ Kit 版本账本（版本属于 Kit，不属于 AI）：
                 try: _os.unlink(tmp_path)
                 except Exception: pass
 
-    async def _rpc_skillMarketList(self, query: str = "", refresh: bool = False) -> str:
+    async def _rpc_skillMarketList(self, query: str = "", refresh: bool = False, background: bool = False) -> str:
         """Browse portable Agent Skills from configured public GitHub sources."""
         try:
+            if background:
+                job = self._skill_market_jobs.start(
+                    self._current_owner_id(), ("list", str(query or ""), self._skill_market._sources_revision),
+                    lambda: self._skill_market.list_catalog(str(query or ""), force=bool(refresh)),
+                )
+                return json.dumps(job, ensure_ascii=False)
             payload = await self._skill_market.list_catalog(
                 str(query or ""),
                 force=bool(refresh),
@@ -11804,12 +11814,40 @@ Kit 版本账本（版本属于 Kit，不属于 AI）：
                 ensure_ascii=False,
             )
 
-    def _rpc_skillMarketAddSource(self, repository: str, name: str = "") -> str:
+    def _rpc_skillMarketJobGet(self, job_id: str) -> str:
         try:
-            source = self._skill_market.add_source(repository, name)
+            job = self._skill_market_jobs.get(self._current_owner_id(), job_id)
+            if job["state"] == "running":
+                job["progress"] = [dict(value) for value in self._skill_market._progress.values()
+                                   if value["phase"] in {"connecting", "downloading", "inspecting"}]
+            return json.dumps(job, ensure_ascii=False)
+        except Exception as exc:
+            return json.dumps({"status": "error", "message": str(exc)}, ensure_ascii=False)
+
+    def _rpc_skillMarketAddSource(self, repository: str, name: str = "", branch: str = "") -> str:
+        try:
+            source = self._skill_market.add_source(repository, name, branch)
             return json.dumps({"status": "ok", "source": source}, ensure_ascii=False)
         except Exception as e:
             return json.dumps({"status": "error", "message": str(e)}, ensure_ascii=False)
+
+    def _rpc_skillMarketExplainStart(self, source_id: str, path: str, digest: str,
+                                    backend_id: str, refresh: bool = False) -> str:
+        try:
+            config = next((c for c in self._backend_configs if c.id == backend_id and c.enabled), None)
+            if not config or config.type.value not in EXPLANATION_BACKENDS:
+                raise ValueError("请选择启用的 OpenAI 兼容或 Anthropic API Backend，用于无工具的中文解读")
+            result = self._skill_market_explainer.start(self._current_owner_id(), source_id,
+                path, digest, backend_id, bool(refresh))
+            return json.dumps(result, ensure_ascii=False)
+        except Exception as exc:
+            return json.dumps({"status": "error", "message": str(exc)}, ensure_ascii=False)
+
+    def _rpc_skillMarketExplainGet(self, job_id: str) -> str:
+        try:
+            return json.dumps(self._skill_market_explainer.get(self._current_owner_id(), job_id), ensure_ascii=False)
+        except Exception as exc:
+            return json.dumps({"status": "error", "message": str(exc)}, ensure_ascii=False)
 
     def _rpc_skillMarketRemoveSource(self, source_id: str) -> str:
         try:
@@ -11829,8 +11867,21 @@ Kit 版本账本（版本属于 Kit，不属于 AI）：
         path: str,
         digest: str,
         allow_replace: bool = False,
+        background: bool = False,
     ) -> str:
         try:
+            if background:
+                async def install() -> dict:
+                    installed = await self._skill_market.install(
+                        str(source_id or ""), str(path or ""), str(digest or ""),
+                        allow_replace=bool(allow_replace),
+                    )
+                    return {"status": "ok", "skill": installed}
+
+                job = self._skill_market_jobs.start(
+                    self._current_owner_id(), ("install", source_id, path, digest, bool(allow_replace)), install,
+                )
+                return json.dumps(job, ensure_ascii=False)
             installed = await self._skill_market.install(
                 str(source_id or ""),
                 str(path or ""),

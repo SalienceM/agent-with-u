@@ -252,7 +252,7 @@ const ChatInputInner: React.FC<Props> = ({
   useEffect(() => {
     setKitApprovalDelegation(false);
     kitApprovalDelegationRef.current = false;
-  }, [sessionId, activeBackendId, isStreaming, seqCount]);
+  }, [sessionId, activeBackendId, isStreaming, seqCount, isFocused]);
   const textAttachmentsRef = useRef<TextAttachment[]>([]);
   textAttachmentsRef.current = textAttachments;
 
@@ -1084,7 +1084,7 @@ const ChatInputInner: React.FC<Props> = ({
     if (!text && imgs.length === 0 && textFiles.length === 0) return;
     // 不把本次委托悄悄带入自动队列、斜杠命令或未来轮次。
     if (kitApprovalDelegationRef.current && (isStreamingRef.current || seqCountRef.current > 0 || text.startsWith('/'))) {
-      setAttachmentNotice('Kit 委托只支持空闲时直接发送普通消息，请取消勾选或等待当前轮结束。');
+      setAttachmentNotice('Kit 代确认只支持空闲时直接发送普通消息，请关闭代确认开关或等待当前轮结束。');
       return;
     }
     // ★ 图像 backend：自动注入 --size 参数
@@ -1577,13 +1577,6 @@ const ChatInputInner: React.FC<Props> = ({
         </div>
       )}
       {/* ★ 工具栏：统一的图标按钮 */}
-      {!isImageBackend && <label style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 6,
-        fontSize: 11, color: kitApprovalDelegation ? 'var(--theme-text)' : 'var(--theme-text-muted)' }}
-        title="只授权本次发送所选的一个 Kit 运行/链；6 小时有效。Agent 核对冻结计划后可正式发布。不会由普通文字自动授权，不继承到队列、语音或下次发送。">
-        <input type="checkbox" aria-label="本次允许 Kit 代确认" checked={kitApprovalDelegation}
-          disabled={isStreaming || seqCount > 0} onChange={event => setKitApprovalDelegation(event.target.checked)} />
-        本次允许 Kit 代确认{kitApprovalDelegation ? ' · 一个运行，6 小时内有效' : ''}
-      </label>}
       <div style={{ display: 'flex', gap: 6, marginBottom: 6, alignItems: 'center', flexWrap: 'wrap' }}>
         <ToolbarBtn
           icon="⚡"
@@ -1620,6 +1613,26 @@ const ChatInputInner: React.FC<Props> = ({
           compact={isMobile}
           onClick={() => attachmentInputRef.current?.click()}
         />
+        {!isImageBackend && <button type="button" role="switch" aria-label="本次允许 Kit 代确认"
+          aria-checked={kitApprovalDelegation} disabled={isStreaming || seqCount > 0}
+          onClick={() => setKitApprovalDelegation(value => !value)}
+          title={isStreaming || seqCount > 0 ? '等待当前轮和队列结束后，可为一次直接发送开启 Kit 代确认' :
+            '仅授权本次发送所选的一个 Kit 运行/链，6 小时内有效。Agent 必须核对冻结计划；发送后自动关闭，不继承到队列、语音或下次发送。'}
+          style={{ display: 'inline-flex', alignItems: 'center', gap: 5, whiteSpace: 'nowrap',
+            minHeight: isMobile ? 44 : 'var(--ui-control-height, 28px)', padding: '3px 8px', borderRadius: 5,
+            border: `1px solid ${kitApprovalDelegation ? 'var(--theme-accent)' : 'var(--theme-border)'}`,
+            background: kitApprovalDelegation ? 'var(--theme-accent-bg)' : 'var(--theme-bg-secondary)',
+            color: kitApprovalDelegation ? 'var(--theme-accent)' : 'var(--theme-text-muted)',
+            fontSize: 11, cursor: isStreaming || seqCount > 0 ? 'not-allowed' : 'pointer',
+            opacity: isStreaming || seqCount > 0 ? .5 : 1 }}>
+          <span aria-hidden="true" style={{ width: 22, height: 12, borderRadius: 8, display: 'inline-flex',
+            alignItems: 'center', padding: 2, boxSizing: 'border-box',
+            background: kitApprovalDelegation ? 'var(--theme-accent)' : 'var(--theme-text-muted)' }}>
+            <span style={{ width: 8, height: 8, borderRadius: '50%', background: '#fff',
+              transform: kitApprovalDelegation ? 'translateX(10px)' : 'none', transition: 'transform .12s' }} />
+          </span>
+          Kit 代确认{kitApprovalDelegation && <span style={{ fontWeight: 650 }}> · 仅本次</span>}
+        </button>}
         {/* 截图按钮:桌面端独有,浏览器无法调起系统截图工具 */}
         {isTauri() && (
           <ToolbarBtn

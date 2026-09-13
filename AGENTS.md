@@ -549,6 +549,14 @@ and `loadSessionMessages` slice `ChatMessage` objects before calling `to_dict()`
 pagination is O(requested messages), not O(full history). Preserve these boundaries when
 adding LOOP fields or new consumers; the dashboard also relies on compact updates.
 
+`loadSessionMeta` uses a shared in-flight request per identity/executor/Session with
+a 12-second deadline including connection readiness. It propagates offline, timeout,
+missing and incomplete metadata errors instead of silently turning them into null.
+`SessionRoutingCache` notifies retained consumers when either an RPC or a push updates
+metadata; revision guards still keep delayed loads from overwriting takeover events.
+ChatPane offers explicit retry and reloads metadata after its own executor reconnects.
+Never equate missing metadata with loading forever, or native Codex context recovery.
+
 Loop RPCs: `loopGetState`, `loopSubmitIdea`, `loopRemoveIdea`, `loopSealIdea`,
 `loopSetGoal`, `loopRefineGoal`, `loopSetPolicy`, `loopRunIteration`, `loopDiscard`,
 `loopTakeover`, `loopRelease`, `loopSetAuto`, `loopAdvanceToOut`, `loopContinue`, `loopAsk`, `loopAddAddon`,
@@ -583,6 +591,60 @@ migration and authenticated-user changes remove/remap/reset tabs with the existi
 and ownership boundaries. Tab titles are live Session metadata, not tab identity. Running /
 completion indicators use the shared Session sets. Overflow scrolling is local to the tab
 bar; do not scroll the whole chat document when revealing the active tab.
+
+The versioned workbench snapshot stores tab order, selected tab, four pane assignments,
+focused pane and layout per controller identity (`mode` + stable userId). The current
+window's sessionStorage takes precedence over its localStorage fallback. Identity
+changes restore only that user's snapshot, never inherit another user's tabs; legacy
+unscoped pane preferences migrate for the local user only. Reload-restored hidden tabs
+remain unmounted until first selected, then follow the existing keep-mounted behavior.
+Only navigation IDs are persisted here, not transcript, input attachments or Kit grants.
+Ordinary input drafts still have their existing in-memory lifetime across tab switches.
+
+### Skill market branches and AI explanations
+
+Large repository archives are streamed to reference-held temporary disk snapshots
+(1 GiB compressed maximum, cache <=4 archives / 2 GiB, TTL 15 minutes). Catalogs
+retain metadata only, not support-file bytes. Installation reopens only the selected
+Skill, rechecks its complete content digest against the preview, and installs all
+of its files. `skill_store` and `skill_runtime` share the per-Skill limits of 256 MiB,
+20,000 files and 16 MiB per file; local uploaded ZIPs retain a 64 MiB compressed cap.
+Keep traversal/symlink, duplicate-path, archive-entry and expanded-size checks intact.
+`skillMarketList` / `skillMarketInstall` accept `background=true` for short receipts;
+`skillMarketJobGet` is owner-scoped. New clients poll these jobs on the original node
+and show progress, so large downloads never hold the serial WebSocket dispatcher.
+Legacy awaited calls remain compatible. Closing the market stops list polling, not
+the executor task; reopening reuses an in-flight job. File audits use searchable
+100-entry pages instead of rendering tens of thousands of DOM nodes.
+
+Market asynchronous UI uses reserved sync/status, source snapshot and directory-link
+slots. Initial catalog loading renders list/detail skeletons, while refresh and RPC
+errors retain the last successful catalog. Source warnings scroll within their reserved
+slot instead of pushing the filters down. Narrow layouts retain fixed list/detail
+viewports. Backend loading is distinct from an empty eligible Backend list; loading,
+missing-Backend and generated explanations share one content frame. Preserve these
+geometry invariants (`skill-market-layout.spec.ts`) when adding async messages.
+
+`skillMarketAddSource(repository, name, branch)` accepts an optional explicit branch.
+The branch field overrides an inline `@ref` or GitHub `tree` ref, and disambiguates
+slash-containing branches. Explicit refs are validated, URL-encoded, persisted with
+`refExplicit`, and never silently fall back to another branch. Bare legacy repository
+inputs retain main-then-master discovery; choosing main explicitly upgrades that source
+in place and invalidates its archive/catalog caches. The UI displays effective refs.
+
+The market's original/AI detail toggle calls short `skillMarketExplainStart` and
+`skillMarketExplainGet` RPCs. `SkillMarketExplainer` owns bounded background jobs,
+180-second deadlines and one-hour in-memory result reuse by owner/source/path/digest/
+Backend. Jobs are not chat Sessions and never receive chat history, workspace paths,
+Skill activation, MCP or tools. Only OpenAI-compatible and Anthropic API Backends are
+eligible; Agent CLI/SDK backends must not be silently substituted because they lack a
+shared enforced tool-free mode. Source content is looked up on the executor against
+the selected digest, capped at 50K with a visible truncation notice, and treated as
+untrusted documentation. Results explain purpose, usage, prerequisites and caveats;
+they are plain rendered text, not executable markup or a safety certification.
+Switching documents, users or nodes must not show a late result on another item.
+Returning to original text stops polling, not the accepted background job. Installation
+still requires the independent original-source review checkbox.
 
 ### Workspace Kits (experimental)
 
@@ -630,6 +692,9 @@ Workspace Kits are Session-level standard accessories stored separately in
   `waiting_approval`. Formal publishing cannot start until `kitCapabilityRespond` records
   a human approval or a validated one-run chat delegation bound to the plan fingerprint.
   ChatInput's default-off `kitApprovalDelegation` send field is the only chat opt-in;
+  Its UI is an inline toolbar switch labelled `Kit 代确认`, with a visible `仅本次`
+  state when enabled. Sending, focus/Session/Backend changes, busy/queue transitions
+  and reload clear the composer opt-in; it is never part of a navigation snapshot.
   prose, attachments, generated Kit DSL and model tool arguments cannot grant permission.
   `ChatKitTools` binds this opt-in to one run/chain, owner, Session workspace, capability
   arguments and release-config fingerprint for six hours. The first prepared plan's

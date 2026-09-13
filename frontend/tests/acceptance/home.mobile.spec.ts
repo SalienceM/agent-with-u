@@ -5,6 +5,9 @@ const CONTROL_URL = 'http://127.0.0.1:45423';
 async function openCleanHome(page: Page): Promise<void> {
   await page.addInitScript(() => {
     localStorage.removeItem('agent-with-u:pane-sessions');
+    // 首页用例显式清空隔离 QA 用户的新导航快照；默认刷新现在应恢复 Tab。
+    localStorage.removeItem('agent-with-u:workbench:v1:local:local');
+    sessionStorage.removeItem('agent-with-u:workbench:v1:local:local');
     localStorage.removeItem('awu.connectionTarget');
     localStorage.removeItem('awu.execRoster');
   });

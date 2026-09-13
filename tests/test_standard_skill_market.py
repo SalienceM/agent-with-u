@@ -287,6 +287,64 @@ class StandardSkillStoreTests(unittest.TestCase):
 
 
 class SkillMarketTests(unittest.TestCase):
+    def test_explicit_branch_supports_main_master_and_slashes(self):
+        for branch in ("main", "master", "release/2026"):
+            source = parse_github_source("example/skills#catalog", branch=branch)
+            self.assertEqual(source["ref"], branch)
+            self.assertTrue(source["refExplicit"])
+            self.assertEqual(source["root"], "catalog")
+            self.assertEqual(parse_github_source(source["homepage"])["ref"], branch)
+        inline = parse_github_source("example/skills@release/2026#catalog")
+        self.assertEqual(inline["ref"], "release/2026")
+        tree = parse_github_source("https://github.com/example/skills/tree/release/2026/catalog", branch="release/2026")
+        self.assertEqual(tree["root"], "catalog")
+        override = parse_github_source("https://github.com/example/skills/tree/main/catalog", branch="master")
+        self.assertEqual(override["ref"], "master")
+        self.assertEqual(override["root"], "catalog")
+
+    def test_invalid_explicit_branches_are_rejected(self):
+        for branch in ("../main", "a//b", "a?token=x", "a#b", "a\\b", "a.lock", "-main", "x\ny", "a@{b", "a%2fb"):
+            with self.subTest(branch=branch), self.assertRaisesRegex(ValueError, "ref"):
+                parse_github_source("example/skills", branch=branch)
+
+    def test_branch_persistence_and_existing_auto_source_upgrade(self):
+        with tempfile.TemporaryDirectory() as tmp, patch("src.backend.skill_market.DEFAULT_SOURCES", []):
+            market = SkillMarket(SkillStore(), data_dir=Path(tmp))
+            auto = market.add_source("example/skills")
+            market._archive_cache[auto["id"]] = (0, b"stale", "master")
+            explicit = market.add_source("example/skills", branch="main")
+            self.assertEqual(auto["id"], explicit["id"])
+            self.assertNotIn(auto["id"], market._archive_cache)
+            market.add_source("example/skills#catalog", branch="release/2026")
+            restored = SkillMarket(SkillStore(), data_dir=Path(tmp)).list_sources()
+            self.assertEqual(len(restored), 2)
+            self.assertTrue(restored[0]["refExplicit"])
+            self.assertEqual(restored[1]["ref"], "release/2026")
+            self.assertEqual(restored[1]["root"], "catalog")
+
+    def test_only_implicit_main_can_fall_back_to_master(self):
+        async def run():
+            urls = []
+            def handler(request):
+                urls.append(str(request.url))
+                return httpx.Response(200 if request.url.path.endswith("/master") else 404, content=b"zip")
+            with tempfile.TemporaryDirectory() as tmp, patch("src.backend.skill_market.DEFAULT_SOURCES", []):
+                market = SkillMarket(SkillStore(), data_dir=Path(tmp), transport=httpx.MockTransport(handler))
+                source = market.add_source("example/skills")
+                self.assertEqual((await market._download_archive(source))[1], "master")
+                self.assertEqual(len(urls), 2)
+                urls.clear()
+                source = market.add_source("example/skills", branch="main")
+                with self.assertRaisesRegex(ValueError, "main"):
+                    await market._download_archive(source)
+                self.assertEqual(len(urls), 1)
+                urls.clear()
+                source = market.add_source("example/skills", branch="release/2026")
+                with self.assertRaises(ValueError):
+                    await market._download_archive(source)
+                self.assertIn("release%2F2026", urls[0])
+        asyncio.run(run())
+
     def test_github_source_parser_accepts_repo_and_tree_urls(self):
         shorthand = parse_github_source("example/skills")
         tree = parse_github_source("https://github.com/example/skills/tree/dev/catalog")
