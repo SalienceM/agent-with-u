@@ -9,6 +9,7 @@ interface ManualItem {
   entry: string;
   tips?: string;
   keywords?: string;
+  steps?: { title: string; text: string; command?: string }[];
 }
 
 interface ManualSection { id: string; title: string; icon: string; intro: string; items: ManualItem[]; }
@@ -71,6 +72,7 @@ const SECTIONS: ManualSection[] = [
     items: [
       { icon: '🌳', title: '工作目录树', summary: '浏览项目文件和目录，查看已暂存/未暂存计数，打开文本文件预览或编辑。', entry: '左侧栏「文件」视图' },
       { icon: '👁', title: '文件预览与编辑', summary: '点击文件查看内容；预览窗可一键最大化。Markdown 可直接转换并导出为独立 HTML；PDF、DOCX 与 Draw.io 使用完全离线的专用渲染器，Excel/PPT 使用快速结构化预览；文本和代码可直接编辑保存。', entry: '文件行的预览图标 / 点击文件名', tips: 'DOCX 版式渲染失败会自动切换兼容预览；Draw.io 支持 Sheet 切换、滚轮缩放、左键拖动画布及官方 / 兼容渲染切换。' },
+      { icon: '🌐', title: 'HTML 页面与交互预览', summary: 'HTML/HTM 默认显示浏览器渲染页面，可切换源码。CSS、图片、字体和关联页面按原执行节点的工作目录读取；「实际位置」可点击定位，不会改用控制端同名文件。', entry: '文件 → HTML 文件 → 页面 / 源码', tips: '可信页面可点击「启用页面脚本」使用按钮、模块 JS 和本地 fetch 交互；源码切换保留当前页面状态。只读静态预览不等于运行服务：外部 CDN、登录、后端 API、动态计算的模块路径、XHR 和服务端路由需要真实服务地址。不会自动启动服务、提交表单或轮询刷新目录。', keywords: 'html htm 浏览器 渲染 交互 实际位置 JavaScript CSS 相对路径' },
       { icon: '±', title: 'Diff 变更对比', summary: '查看文件相对版本库的新增、删除和修改，辅助确认提交范围。', entry: '提交变更面板 → 点击文件名' },
       { icon: '＋', title: '加入版本追踪', summary: '将未跟踪文件执行 Git add，支持逐项操作和分组全选。', entry: '提交变更 → 未跟踪文件' },
       { icon: '✅', title: '提交与推送', summary: '选择要提交的文件，填写或让 AI 生成提交说明；提交推送会等待推送真正完成后再返回主界面。', entry: '左侧栏「提交」' },
@@ -88,6 +90,19 @@ const SECTIONS: ManualSection[] = [
       { icon: '🧭', title: '代理与网络', summary: '为 Codex/Qwen 等 CLI 配置系统代理或自定义 HTTP 代理，不要求系统全局代理或 TUN。', entry: 'Backend Manager → 环境/代理配置' },
       { icon: '📡', title: '连接池与执行节点', summary: '同一界面可连接本机、当前 Web Backend 或多个远端执行节点；新建会话时选择归属节点，之后任务固定在该节点执行。', entry: '顶栏 📡 → 可分配执行节点' },
       { icon: '🔗', title: 'Relay 中继', summary: '执行节点主动连接中继，客户端经令牌找到它，无需把执行机直接暴露到公网。桌面、Linux 和 Docker Web Backend 都可成为执行节点。', entry: '顶栏 📡 → 当前物理执行端 / 中继连接' },
+      {
+        icon: '＋', title: '新执行节点接入 Relay',
+        summary: '授权用新执行机器的 deviceId，不是 Session ID、用户 ID 或节点显示名。以下命令是操作示例，不会自动执行。',
+        entry: '新节点：连接 → 本机能力 / 当前 Web 节点；Relay 服务器：终端',
+        keywords: '节点ID 节点 ID device-id grant users.json 注册 授权 被拒绝 device is not assigned',
+        steps: [
+          { title: '1 · 在新节点读取 ID', text: 'Web 版在连接面板 A 卡片显示节点 ID。Windows 桌面版启动一次后，在新机器的 PowerShell 读取下面文件；显式配置 AGENT_WITH_U_DEVICE_ID 时以配置值为准。Linux 默认读取 ~/.agent-with-u/device-id；Backend 设置了 AGENT_WITH_U_DATA_ROOT 时，文件位于该数据目录。', command: 'Get-Content "$HOME\\.agent-with-u\\device-id"' },
+          { title: '2 · 在 Relay 服务器授权', text: '用 Relay 正在使用的同一份 users.json。把示例路径、用户名和节点 ID 替换为实际值。源码部署在项目目录和对应 Python 环境执行；独立包将 python -m src.relay_server 换成 ./agent-with-u-relay。Docker 在 Relay 容器内执行，官方 Compose 用户文件为 /data/users.json。', command: 'python -m src.relay_server --users-file "/实际路径/users.json" user list\npython -m src.relay_server --users-file "/实际路径/users.json" user grant "Relay用户名" "新节点ID"' },
+          { title: '3 · 在新节点发布', text: '连接面板 A 选择「纳管执行节点」，填写 Relay 地址、主 Token 和显示名，保存并连接。桌面版按提示重启，Web Backend 即时生效。主 Token 仅用于节点注册；控制端使用用户 Token 登录。不要把 Token 或密码粘进聊天、截图或文档。' },
+          { title: '4 · 确认在线', text: '出现 device is not assigned to a Relay user 时，核对授权 ID 和用户文件。授权后节点会自动重连，无需重启 Relay；成功日志为 device online。控制端刷新设备列表，将新节点加入可分配节点。' },
+          { title: '可选 · 设置设备主用户', text: '首次被授权的用户默认成为设备主用户。仅在需要改选管理者时执行，不是每次接入的必需步骤。', command: 'python -m src.relay_server --users-file "/实际路径/users.json" user set-default "Relay用户名" "新节点ID"' },
+        ],
+      },
       { icon: '🖥', title: '当前节点执行与发布', summary: '控制连接始终保留；本节点可分别设置是否承接 Agent 会话、是否发布到 Relay。设为控制端专用后仍能管理 Backend、Session 和更新，但不会出现在新建会话的执行节点候选中。', entry: '顶栏 📡 → 本机能力 / 当前 Web 节点' },
     ],
   },
@@ -133,7 +148,7 @@ export const ManualPanel: React.FC<ManualPanelProps> = ({ onClose }) => {
     return SECTIONS.map((section) => ({
       ...section,
       items: section.items.filter((item) =>
-        `${item.title} ${item.summary} ${item.entry} ${item.tips || ''} ${item.keywords || ''}`.toLowerCase().includes(q)),
+        `${item.title} ${item.summary} ${item.entry} ${item.tips || ''} ${item.keywords || ''} ${(item.steps || []).map(step => `${step.title} ${step.text} ${step.command || ''}`).join(' ')}`.toLowerCase().includes(q)),
     })).filter((section) => section.items.length > 0);
   }, [active, query]);
 
@@ -192,6 +207,14 @@ export const ManualPanel: React.FC<ManualPanelProps> = ({ onClose }) => {
                         <div style={{ marginTop: 5, fontSize: 12, lineHeight: 1.65, color: 'var(--theme-text-muted)' }}>{item.summary}</div>
                         <div style={entryStyle}><b>入口</b><span>{item.entry}</span></div>
                         {item.tips && <div style={tipStyle}>💡 {item.tips}</div>}
+                        {item.steps && <details style={{ marginTop: 10, fontSize: 12 }}>
+                          <summary style={{ cursor: 'pointer', color: 'var(--theme-accent)' }}>展开操作步骤与命令</summary>
+                          {item.steps.map(step => <div key={step.title} style={{ marginTop: 12, lineHeight: 1.65 }}>
+                            <strong>{step.title}</strong>
+                            <div style={{ color: 'var(--theme-text-muted)' }}>{step.text}</div>
+                            {step.command && <pre style={{ margin: '6px 0', padding: 8, overflowX: 'auto', background: 'var(--theme-input-bg)', borderRadius: 5, userSelect: 'text' }}><code>{step.command}</code></pre>}
+                          </div>)}
+                        </details>}
                       </div>
                     </article>
                   ))}

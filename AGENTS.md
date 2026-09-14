@@ -385,6 +385,21 @@ Loop state is read/written through a process-level singleton cache
 whole-file overwrites and concurrent aside appends share one object and don't
 clobber each other.
 
+**Per-stage evidence and detail freshness.** `LoopRecord.stage_details` (wire key
+`stageDetails`) durably retains each planning attempt's raw output, parsed JSON,
+structure-validation results and retry provenance, plus execution summaries and
+analysis raw/parsed results. Plan validation is not task acceptance. Failed planning
+stays `retrying` during bounded retries; exhausted retries retain the existing minimal
+increment fallback as an explicit, expandable system-generated step and mark Prepare
+`degraded`, never ordinary success. Exceptions retain their failing stage and available
+partial-output tails. Legacy records without originals are labelled as such, not invented.
+Compact pushes only carry stage status/count/message, never these large audit bodies.
+Flow-stage and individual-step buttons select independent detail views. The visible,
+selected record refreshes lazily on a compact revision change (including step status,
+attempts and end times); identical pushes, streaming deltas and hidden tabs do not trigger
+detail reads. In-flight reads are coalesced and failures expose retry; completed steps
+stay expandable while authoritative persisted detail replaces the live replay.
+
 **Addons (执行中补充).** `loopAddAddon` / `loopRemoveAddon` let the user queue
 supplementary requirements while a loop runs — they do **not** affect the current
 loop. The add input is a multi-line textarea with **image paste** support;
@@ -479,10 +494,18 @@ prompt input tokens as an explicitly labelled approximation. `_loop_run_agent` r
 idea/goal/prepare/step/summary/analysis/aside call, while manual LOOP takeover is recorded as
 a LOOP `manual` event. `getSessionTokenUsage` returns a compact summary and
 `token_usage_updated` pushes live changes. `TokenUsageMonitor` is shared by ChatPane and the
-LOOP header: its collapsed pill expands into lifetime totals, recent trend bars, context
+LOOP header: its collapsed pill expands into separately labelled lifetime input/output totals,
+two directional trend lines, context
 occupancy, compaction/reset history, and a warning threshold. The threshold is a controller-side
 `localStorage` preference scoped by current user identity; it must never be persisted to a
 shared executor.
+
+The Token chart uses a shared axis for input/output, with single-direction filters that
+rescale the axis so smaller output counts remain readable. Latest, recent average, and
+peak statistics stay separate for input/output/total (directional peaks can occur in
+different calls); the call-detail selector exposes exact counts on touch screens too.
+Estimated events retain hollow markers and explicit labels. Cache/reasoning are subcounts,
+not additions to input + output. Updates remain push-driven, without refresh polling.
 
 **Intent guard (`intent_guard`, default on).** Early human↔model intent-divergence
 check: after the **first** loop of a round produces its plan (in `_loop_do_prepare`,
@@ -603,6 +626,39 @@ Ordinary input drafts still have their existing in-memory lifetime across tab sw
 
 ### Skill market branches and AI explanations
 
+**Library loading and binding stay read-only until execution.** Sidebar opens the
+ability dialog immediately, then uses `loadSessionMeta` (never full chat history)
+and reads Skills/Prompts on that Session's executor. Loading, errors with retry,
+and an actually empty library are distinct; closed/old-node responses cannot
+repopulate the dialog. Saves are serialized in the UI and only applied after an
+`ok` response. Repo has an explicit executor selector; all CRUD/import/secrets and
+runtime actions keep that node. It never sends the active Session's potentially
+foreign working directory as a library filter and does not refresh while hidden.
+
+`loadSession`, branching and ability selection must not copy Skill directories.
+Binding stores the selection/constraints; ordinary chat and LOOP await native Skill
+preparation on a worker thread before invoking a model, including unbound-directory
+cleanup. Standard Skills use a durable `.awu-managed.json` source/target stat map
+to copy only changed/missing files; template text is compared on every preparation.
+Unrelated target files are preserved. A separate deployment lock serializes copies
+and source mutations without blocking library reads during large session deployments.
+Disk-heavy Skill RPCs run off the event loop; failures propagate instead of becoming
+fake empty lists. Keep `test_skill_library_responsiveness.py` and
+`skill-library-loading.spec.ts` regressions when changing these boundaries.
+
+**Installation location is explicit.** The market displays the default executor's
+name/host and actual Skill library/runtime roots from read-only `skillMarketLocation`.
+Only the desktop's `local` sidecar is labelled 本机; browser `local` connections mean
+the directly connected server, not storage on the browser device. The location card
+reserves its height while loading. Unconfirmed locations and offline nodes disable
+installation. Catalog/source changes/install/job polling/AI explanations use the
+same explicit executor key. Changing default node or identity invalidates catalog,
+review and late responses; switching Session tabs does not change installation target.
+`onInstalled` carries the actual key into `SkillRuntimeDialog`, so preparation cannot
+drift to a new default. Selecting another runtime node only inspects its existing
+Skill copy, never copies or installs Skill files there. File import, dependency
+preparation and Agent activation remain separate steps.
+
 Large repository archives are streamed to reference-held temporary disk snapshots
 (1 GiB compressed maximum, cache <=4 archives / 2 GiB, TTL 15 minutes). Catalogs
 retain metadata only, not support-file bytes. Installation reopens only the selected
@@ -635,10 +691,23 @@ in place and invalidates its archive/catalog caches. The UI displays effective r
 The market's original/AI detail toggle calls short `skillMarketExplainStart` and
 `skillMarketExplainGet` RPCs. `SkillMarketExplainer` owns bounded background jobs,
 180-second deadlines and one-hour in-memory result reuse by owner/source/path/digest/
-Backend. Jobs are not chat Sessions and never receive chat history, workspace paths,
-Skill activation, MCP or tools. Only OpenAI-compatible and Anthropic API Backends are
-eligible; Agent CLI/SDK backends must not be silently substituted because they lack a
-shared enforced tool-free mode. Source content is looked up on the executor against
+Backend. Jobs are not chat Sessions and never receive chat history, project workspace
+paths, Skill activation or MCP. `text_only.send_text_only` supports OpenAI-compatible,
+Anthropic API, Codex, Qwen Code and both Claude Backends. API requests have no tools;
+Agent document calls use disposable homes/workspaces, fresh non-resuming contexts and
+native execution restrictions, not the normal chat runner or its permission bypass.
+Qwen uses a known singleton core-tool allowlist excluded by its denylist (empty lists
+mean default tools, not no tools); Claude uses `tools=[]`, no settings/MCP/Skills.
+Codex has no execution environments, read-only sandbox, disabled execution features
+and an ephemeral thread. Some CLI versions still declare skills.list/read: the local
+catalog must be verified empty before inference and any tool event fails the job.
+Only credential access snapshots and whitelisted connection/model configuration are
+reused; copied refresh tokens are blanked to prevent isolated refresh from invalidating
+the main client's login. Expired access credentials require refreshing login in the
+original client. CLI/SDK incompatibility fails closed, never retries through normal chat.
+Use `AWU_TEST_NATIVE_TEXT_ONLY=1 python -m unittest tests.test_text_only_native` to check
+installed CLIs against a loopback fake provider without spending model credits.
+Source content is looked up on the executor against
 the selected digest, capped at 50K with a visible truncation notice, and treated as
 untrusted documentation. Results explain purpose, usage, prerequisites and caveats;
 they are plain rendered text, not executable markup or a safety certification.
@@ -1161,6 +1230,32 @@ focused session (all in the Sidebar memo comparator).
 **View/edit always act on the session's node** (`syncReadFile`/`syncWriteFile`, routed
 by `execKey`) — so it works uniformly for both session kinds and needs no local copy.
 
+**Stable async layout.** FileTreePanel reserves the local-copy identity/actions,
+status/transfer slot, and two-line Git toolbar on its first render. The notice stays
+`目录按需读取，可手动刷新` during directory/local-metadata/Git reads; only explicit
+operation results, compare summaries, errors and transfers replace it. Content-transfer
+and insecure-HTTP offline caveats remain in its tooltip. Initial identity/Git reads
+still show placeholders and disable unavailable actions; subsequent Git checks keep
+their settled labels even for non-repositories. Success, failure,
+non-Git detection, scanning and transfer progress update in place, never insert
+new bars above the tree. Initial directory reads use skeleton rows; refreshes
+retain the prior tree even on errors (an error is not an empty directory). Git
+is not labelled clean until its first status succeeds. Explicitly opening Stash
+reserves its list height before its response. Narrow action rows scroll rather
+than wrap. Regression coverage: `file-panel-layout.spec.ts` (desktop + mobile).
+
+**Manual refresh, no idle polling.** The file panel mounts only when the expanded
+Sidebar shows files. Directory/Git reads happen once on entry, on explicit refresh,
+or after a user file/Git action; there is no Git interval or reconnect-triggered tree
+reset. Concurrent directory/refresh requests coalesce. Refresh rereads only the root
+and visibly expanded levels, invalidating collapsed cache entries for lazy reopening.
+Transfers already update their affected manifests/directories, so completion never
+triggers another full scan. The panel subscribes only to its workspace's progress
+snapshot and is memoized against unrelated Sidebar updates. Unmounting aborts local
+metadata scanning and prevents late operation callbacks from starting directory/Git
+reads; submitted transfers themselves still continue. Tests count RPCs and local scans
+across idle time, reconnects, transfers and hidden/collapsed panels.
+
 **Local vs remote session** (`execMode`): a **local session** (`execMode!=='relay'`,
 runs on 本机) shows a plain working-dir tree — no cloud, no copy dir, click to view/edit
 the real files directly. A **remote session** (`execMode==='relay'`) marks every file
@@ -1216,6 +1311,24 @@ the deterministic structured table/slide preview; legacy `.doc/.xls/.ppt` report
 conversion is unsupported rather than requiring a heavyweight office suite. All rich
 engines are lazy chunks; PDF.js build assets are copied from the locked npm package by
 `scripts/copy-preview-assets.mjs`, while the Draw.io viewer is vendored at a fixed commit.
+
+**HTML/HTM** has a lazy `HtmlPreview` browser-rendered mode plus source view. Resources
+are read through the original `syncFileStat`/`syncReadChunk` executor route or the
+explicit local-copy `LocalFs`, never through controller-relative HTTP URLs. A virtual
+workspace base resolves CSS imports/URLs, images/fonts, scripts and literal ES module
+dependencies; a lexer + import map preserves module cycles. The actual node/path is
+visible and clickable. In-workspace links reopen the linked file on that same source;
+anchors scroll within the frame. Source toggling hides rather than remounts the frame.
+Page scripts require an explicit per-preview trust click. The opaque-origin iframe has
+no same-origin, top-navigation, popup or form privileges; its narrow, window/channel-bound
+message bridge supports only bounded static reads, navigation and diagnostics. It
+exposes no app RPCs or auth data. External networking and hidden/key paths are blocked.
+Limits are 8 MiB/file, 32 MiB of distinct assets and 128 files; the bundle/read cache is
+discarded on close/navigation. No directory polling, server startup or HTTP proxy is
+introduced. CDN/API/login/XHR and server-routed sites require a real running service;
+this is deliberately a static preview, not a claim of arbitrary browser compatibility.
+The built-in ManualPanel also includes searchable, expandable Relay onboarding commands
+and explains which machine, deviceId, users file and token role each step uses.
 
 For ordinary files, **code** is syntax-highlighted with `highlight.js` (ext→lang via
 `LANG_ALIAS`, else `highlightAuto`) into `.md-pre/.hljs` (globally themed); **markdown**

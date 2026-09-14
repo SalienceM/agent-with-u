@@ -1,4 +1,5 @@
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -226,7 +227,7 @@ class BackendSkillGenerationTests(unittest.TestCase):
             "https://example.test/c.png",
         ])
 
-    def test_loading_session_refreshes_deployed_skill_templates(self):
+    def test_loading_session_never_deploys_skill_files(self):
         session = type("SessionStub", (), {
             "id": "session-1",
             "messages": [],
@@ -241,11 +242,12 @@ class BackendSkillGenerationTests(unittest.TestCase):
 
         result = self.bridge._rpc_loadSession("session-1", 25)
 
-        self.assertEqual(refreshed, [session])
+        self.assertEqual(refreshed, [])
         self.assertIn('"id": "session-1"', result)
 
     def test_sync_writes_agent_specific_markdown_to_every_native_root(self):
         class FakeSkillStore:
+            _deployment_lock = threading.RLock()
             def get_skill(self, name):
                 if name != "web-search":
                     return None

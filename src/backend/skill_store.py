@@ -463,6 +463,9 @@ class SkillStore:
     def __init__(self):
         LIBRARY_DIR.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
+        # 部署只写目标目录，不应长期占住供列表/详情使用的库锁。
+        # 库文件修改按 deployment → library 顺序加锁，避免源文件边复制边替换。
+        self._deployment_lock = threading.RLock()
         self._index: dict = self._load_index()
 
     # ── 内部持久化 ────────────────────────────────────────────────
@@ -592,9 +595,18 @@ class SkillStore:
             )
             return
 
-        # Remove only files from the previous AgentWithU deployment.  A user
-        # may keep unrelated notes in the same folder; those are not ours.
-        self._remove_managed_target(target)
+        # 增量镜像：大 Skill 可有上万配套文件。相同源/目标 stat 直接复用，
+        # 不再每次删目录重拷。目标被删除/编辑、源更新或模板变化都会重新写入。
+        try:
+            previous = json.loads((target / MANAGED_MARKER).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            previous = {}
+        if not isinstance(previous, dict):
+            previous = {}
+        previous_states = previous.get("states", {})
+        if not isinstance(previous_states, dict):
+            previous_states = {}
+        states: dict[str, list[int]] = {}
         target.mkdir(parents=True, exist_ok=True)
         copied: list[str] = []
         for item in sorted(source.rglob("*")):
@@ -605,8 +617,16 @@ class SkillStore:
                 continue
             if item.suffix.lower() in {".pyc", ".pyo"}:
                 continue
+            if relative.as_posix() == MANAGED_MARKER:
+                continue
             destination = target / relative
-            destination.parent.mkdir(parents=True, exist_ok=True)
+            relative_name = relative.as_posix()
+            source_stat = item.stat()
+            source_state = [source_stat.st_size, source_stat.st_mtime_ns]
+            target_state = None
+            if destination.is_file() and not destination.is_symlink():
+                target_stat = destination.stat()
+                target_state = [target_stat.st_size, target_stat.st_mtime_ns]
             if relative.as_posix() == "SKILL.md":
                 content = item.read_text(encoding="utf-8")
                 rendered = render_skill_markdown(
@@ -614,14 +634,32 @@ class SkillStore:
                     skill_name=name,
                     skill_dir_reference=reference,
                 )
-                destination.write_text(rendered, encoding="utf-8")
-            else:
+                if destination.is_symlink():
+                    raise ValueError(f"Skill 目标文件不能是符号链接：{destination}")
+                if not destination.exists() or destination.read_text(encoding="utf-8", errors="replace") != rendered:
+                    destination.write_text(rendered, encoding="utf-8")
+            elif (target_state is None or
+                  previous_states.get(relative_name) != source_state + target_state):
+                if destination.is_symlink():
+                    raise ValueError(f"Skill 目标文件不能是符号链接：{destination}")
+                destination.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(item, destination)
-            copied.append(relative.as_posix())
-        (target / MANAGED_MARKER).write_text(
-            json.dumps({"managedBy": "AgentWithU", "files": copied}, ensure_ascii=False),
-            encoding="utf-8",
-        )
+            target_stat = destination.stat()
+            states[relative_name] = source_state + [target_stat.st_size, target_stat.st_mtime_ns]
+            copied.append(relative_name)
+        # 只清理上一次由 AWU 管理、此次已不在源中的文件，保留用户自己的文件。
+        for stale in set(previous.get("files", [])) - set(copied):
+            relative = PurePosixPath(stale)
+            if relative.is_absolute() or any(part in {"", ".", ".."} for part in relative.parts):
+                continue
+            path = target.joinpath(*relative.parts)
+            if path.is_file() or path.is_symlink():
+                path.unlink()
+        payload = {"managedBy": "AgentWithU", "files": copied, "states": states}
+        if payload != previous:
+            (target / MANAGED_MARKER).write_text(
+                json.dumps(payload, ensure_ascii=False), encoding="utf-8",
+            )
 
     def _deploy(self, name: str, content: str, target_key: str):
         for _agent_name, target, reference in self._target_dirs(name, target_key):
@@ -633,7 +671,7 @@ class SkillStore:
 
     def deploy_to_directory(self, name: str, target: Path, reference: str) -> None:
         """Deploy one full portable Skill directory to a native agent root."""
-        with self._lock:
+        with self._deployment_lock:
             safe_name = self._validate_library_name(name)
             self._deploy_to_target(safe_name, Path(target), reference)
 
@@ -753,7 +791,7 @@ class SkillStore:
             return result
 
     def save_skill(self, name: str, content: str) -> None:
-        with self._lock:
+        with self._deployment_lock, self._lock:
             name = self._validate_library_name(name)
             skill_dir = LIBRARY_DIR / name
             skill_dir.mkdir(parents=True, exist_ok=True)
@@ -773,7 +811,7 @@ class SkillStore:
                     print(f"[SkillStore] sync failed ({target_key}): {e}", flush=True)
 
     def delete_skill(self, name: str) -> None:
-        with self._lock:
+        with self._deployment_lock, self._lock:
             name = self._validate_library_name(name)
             for target_key in self._index.get(name, {}).get("activations", []):
                 try:
@@ -794,7 +832,7 @@ class SkillStore:
                     pass
 
     def activate(self, name: str, scope: str, working_dir: str = "") -> None:
-        with self._lock:
+        with self._deployment_lock, self._lock:
             name = self._validate_library_name(name)
             skill_file = LIBRARY_DIR / name / "SKILL.md"
             if not skill_file.exists():
@@ -810,7 +848,7 @@ class SkillStore:
             self._save_index()
 
     def deactivate(self, name: str, scope: str, working_dir: str = "") -> None:
-        with self._lock:
+        with self._deployment_lock, self._lock:
             name = self._validate_library_name(name)
             target_key = "global" if scope == "global" else working_dir
             if not target_key:
@@ -823,7 +861,7 @@ class SkillStore:
             self._save_index()
 
     def rename_skill(self, old_name: str, new_name: str, new_content: str) -> None:
-        with self._lock:
+        with self._deployment_lock, self._lock:
             old_name = self._validate_library_name(old_name)
             new_name = self._validate_library_name(new_name)
             old_file = LIBRARY_DIR / old_name / "SKILL.md"
@@ -906,7 +944,7 @@ class SkillStore:
 
         返回解析后的 manifest dict。
         """
-        with self._lock:
+        with self._deployment_lock, self._lock:
             with zipfile.ZipFile(pkg_path, "r") as zf:
                 names = set(zf.namelist())
 
@@ -999,7 +1037,7 @@ class SkillStore:
         name = validation["name"]
         digest = skill_files_digest(normalized)
 
-        with self._lock:
+        with self._deployment_lock, self._lock:
             destination = LIBRARY_DIR / name
             LIBRARY_DIR.mkdir(parents=True, exist_ok=True)
             if destination.exists() and not allow_replace:

@@ -1,5 +1,6 @@
 import React, { useEffect, useState, useCallback, useRef } from 'react';
-import { api, SkillInfo } from '../api';
+import { api, SkillInfo, getHomeExecKey, getExecutors, onExecStatus, onCurrentUserChanged, isTauri } from '../api';
+import { skillInstallTargetLabel } from '../utils/skillInstallTarget';
 import { SkillMarketDialog } from './SkillMarketDialog';
 import { SkillRuntimeDialog } from './SkillRuntimeDialog';
 
@@ -221,9 +222,37 @@ const SKILL_TYPE_PRESETS: SkillTypePreset[] = [
 // ═══════════════════════════════════════
 //  RepoPanel — Skill + Prompt 仓库面板
 // ═══════════════════════════════════════
-export const RepoPanel: React.FC<Props> = ({ open, workingDir, onClose, onEditingChange, embedded, onOpenMarket, revision }) => {
+export const RepoPanel: React.FC<Props> = (props) => {
+  const [execKey, setExecKey] = useState(getHomeExecKey);
+  const [executors, setExecutors] = useState(getExecutors);
+  const [busy, setBusy] = useState(false);
+  const [identityRevision, setIdentityRevision] = useState(0);
+  useEffect(() => onExecStatus(() => setExecutors(getExecutors())), []);
+  useEffect(() => onCurrentUserChanged((_profile, changed) => {
+    if (changed) { setExecKey(getHomeExecKey()); setIdentityRevision(value => value + 1); }
+  }), []);
+  return <div style={{ display: props.open ? 'flex' : 'none', flex: 1, minHeight: 0, flexDirection: 'column' }}>
+    <label style={{ display: 'flex', flexWrap: 'wrap', gap: 8, alignItems: 'center', padding: '8px 12px', fontSize: 12 }}>
+      能力库所在节点
+      <select aria-label="能力库所在节点" value={execKey} disabled={busy} onChange={event => setExecKey(event.target.value)}
+        style={{ background: 'var(--theme-bg)', color: 'var(--theme-text)', border: '1px solid var(--theme-border)', borderRadius: 4, padding: '3px 6px', maxWidth: '100%' }}>
+        {!executors.some(item => item.key === execKey) && <option value={execKey}>{execKey}（离线）</option>}
+        {executors.map(item => <option key={item.key} value={item.key}>{skillInstallTargetLabel(item.key, item, isTauri())}{item.connected ? '' : '（离线）'}</option>)}
+      </select>
+      <span>与市场安装节点一致时，才会显示相应 Skill</span>
+    </label>
+    <RepoPanelContent key={`${identityRevision}:${execKey}`} {...props} execKey={execKey} onBusyChange={setBusy} />
+  </div>;
+};
+
+const RepoPanelContent: React.FC<Props & { execKey: string; onBusyChange: (busy: boolean) => void }> = ({ open, onClose, onEditingChange, embedded, onOpenMarket, revision, execKey, onBusyChange }) => {
   const [skills, setSkills] = useState<SkillItem[]>([]);
   const [prompts, setPrompts] = useState<PromptItem[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState('');
+  const [actionError, setActionError] = useState('');
+  const [mutating, setMutating] = useState(false);
+  const loadGeneration = useRef(0);
   // 编辑状态
   const [editingType, setEditingType] = useState<'skill' | 'prompt' | null>(null);
   const [editingName, setEditingName] = useState('');
@@ -249,6 +278,7 @@ export const RepoPanel: React.FC<Props> = ({ open, workingDir, onClose, onEditin
   const [installError, setInstallError] = useState('');
   const [showSkillMarket, setShowSkillMarket] = useState(false);
   const [runtimeNames, setRuntimeNames] = useState<string[]>([]);
+  const [runtimeExecKey, setRuntimeExecKey] = useState<string | undefined>();
   // Secrets 配置
   type SecretsField = { key: string; label: string; type: string; required?: boolean; placeholder?: string };
   const [secretsSkill, setSecretsSkill] = useState<string | null>(null);
@@ -258,19 +288,45 @@ export const RepoPanel: React.FC<Props> = ({ open, workingDir, onClose, onEditin
   const [savingSecrets, setSavingSecrets] = useState(false);
 
   const refresh = useCallback(async () => {
-    const [sk, pr, bks] = await Promise.all([
-      api.listSkills(workingDir),
-      api.listPrompts(),
-      api.getBackends().catch(() => []),
-    ]);
-    setSkills(sk || []);
-    setPrompts(pr || []);
-    setBackends((bks || []).map((b: any) => ({ id: b.id, label: b.label || b.id, type: b.type })));
-  }, [workingDir]);
+    const generation = ++loadGeneration.current;
+    setLoading(true);
+    setLoadError('');
+    try {
+      const [sk, pr] = await Promise.all([
+        // Repo 是节点级库，不能把其它节点的 activeSession 工作目录传给它。
+        api.listSkills('', execKey), api.listPrompts(execKey),
+      ]);
+      if (generation !== loadGeneration.current) return;
+      setSkills(sk);
+      setPrompts(pr);
+    } catch (error) {
+      if (generation === loadGeneration.current) setLoadError(error instanceof Error ? error.message : String(error));
+    } finally {
+      if (generation === loadGeneration.current) setLoading(false);
+    }
+  }, [execKey]);
 
   useEffect(() => {
     if (open) refresh();
+    return () => { ++loadGeneration.current; };
   }, [open, refresh, revision]);
+
+  useEffect(() => {
+    if (!open) return;
+    let cancelled = false;
+    void api.getBackends(execKey).then(bks => {
+      if (!cancelled) setBackends((bks || []).map((b: any) => ({ id: b.id, label: b.label || b.id, type: b.type })));
+    }).catch(() => { if (!cancelled) setBackends([]); });
+    return () => { cancelled = true; };
+  }, [open, execKey]);
+
+  useEffect(() => {
+    onBusyChange(!!editingType || saving || installing || savingSecrets || mutating || !!secretsSkill);
+  }, [editingType, saving, installing, savingSecrets, mutating, secretsSkill, onBusyChange]);
+
+  const requireOk = (result: { status: string; message?: string }) => {
+    if (result.status !== 'ok') throw new Error(result.message || '操作失败，请重试');
+  };
 
   useEffect(() => {
     onEditingChange?.(editingType !== null);
@@ -314,51 +370,46 @@ export const RepoPanel: React.FC<Props> = ({ open, workingDir, onClose, onEditin
     const name = editingName.trim();
     if (!name) return;
     setSaving(true);
+    setActionError('');
     try {
       if (editingType === 'skill') {
         if (editingOrigName && editingOrigName !== name) {
-          await api.renameSkill(editingOrigName, name, editingContent);
+          requireOk(await api.renameSkill(editingOrigName, name, editingContent, execKey));
         } else {
-          await api.saveSkill(name, editingContent);
+          requireOk(await api.saveSkill(name, editingContent, execKey));
         }
       } else if (editingType === 'prompt') {
         if (editingOrigName && editingOrigName !== name) {
-          await api.renamePrompt(editingOrigName, name, editingContent);
+          requireOk(await api.renamePrompt(editingOrigName, name, editingContent, execKey));
         } else {
-          await api.savePrompt(name, editingContent, editingIcon);
+          requireOk(await api.savePrompt(name, editingContent, editingIcon, execKey));
         }
         // 保存 icon（改名后也需要更新）
         if (editingOrigName !== name || editingIcon) {
-          await api.updatePromptIcon(name, editingIcon);
+          requireOk(await api.updatePromptIcon(name, editingIcon, execKey));
         }
       }
       await refresh();
       closeEditor();
+    } catch (error) {
+      setActionError(error instanceof Error ? error.message : String(error));
     } finally {
       setSaving(false);
     }
-  }, [editingType, editingName, editingContent, editingIcon, editingOrigName, refresh, closeEditor]);
+  }, [editingType, editingName, editingContent, editingIcon, editingOrigName, refresh, closeEditor, execKey]);
 
   // ── 切换默认档 ──
-  // 默认档在新建 session 时会被自动绑定；这里做乐观更新 + 后台持久化
+  // 默认档在新建 session 时自动绑定；持久化成功后才更新标记。
   const toggleDefault = useCallback(async (type: 'skill' | 'prompt', name: string, next: boolean) => {
-    if (type === 'skill') {
-      setSkills(prev => prev.map(s => s.name === name ? { ...s, isDefault: next } : s));
-      const res = await api.setSkillDefault(name, next);
-      if (res.status !== 'ok') {
-        // 回滚 + 刷新
-        setSkills(prev => prev.map(s => s.name === name ? { ...s, isDefault: !next } : s));
-        await refresh();
-      }
-    } else {
-      setPrompts(prev => prev.map(p => p.name === name ? { ...p, isDefault: next } : p));
-      const res = await api.setPromptDefault(name, next);
-      if (res.status !== 'ok') {
-        setPrompts(prev => prev.map(p => p.name === name ? { ...p, isDefault: !next } : p));
-        await refresh();
-      }
-    }
-  }, [refresh]);
+    if (mutating) return;
+    setMutating(true); setActionError('');
+    try {
+      requireOk(type === 'skill' ? await api.setSkillDefault(name, next, execKey) : await api.setPromptDefault(name, next, execKey));
+      if (type === 'skill') setSkills(prev => prev.map(s => s.name === name ? { ...s, isDefault: next } : s));
+      else setPrompts(prev => prev.map(p => p.name === name ? { ...p, isDefault: next } : p));
+    } catch (error) { setActionError(error instanceof Error ? error.message : String(error)); }
+    finally { setMutating(false); }
+  }, [mutating, execKey]);
 
   // ── 删除：先弹确认框 ──
   const handleDelete = useCallback((type: 'skill' | 'prompt', name: string) => {
@@ -368,11 +419,14 @@ export const RepoPanel: React.FC<Props> = ({ open, workingDir, onClose, onEditin
   const confirmDelete = useCallback(async () => {
     if (!deleteConfirm) return;
     const { type, name } = deleteConfirm;
-    if (type === 'skill') await api.deleteSkill(name);
-    else await api.deletePrompt(name);
-    setDeleteConfirm(null);
-    await refresh();
-  }, [deleteConfirm, refresh]);
+    setMutating(true); setActionError('');
+    try {
+      requireOk(type === 'skill' ? await api.deleteSkill(name, execKey) : await api.deletePrompt(name, execKey));
+      setDeleteConfirm(null);
+      await refresh();
+    } catch (error) { setActionError(error instanceof Error ? error.message : String(error)); }
+    finally { setMutating(false); }
+  }, [deleteConfirm, refresh, execKey]);
 
   // ── 安装插件包 ──
   const handleInstallFile = useCallback(async (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -385,7 +439,7 @@ export const RepoPanel: React.FC<Props> = ({ open, workingDir, onClose, onEditin
       const nativePath: string = (file as any).path || '';
       let res: any;
       if (nativePath) {
-        res = await api.installSkillPackage(nativePath);
+        res = await api.installSkillPackage(nativePath, '', execKey);
       } else {
         const base64 = await new Promise<string>((resolve, reject) => {
           const reader = new FileReader();
@@ -397,9 +451,10 @@ export const RepoPanel: React.FC<Props> = ({ open, workingDir, onClose, onEditin
           reader.onerror = reject;
           reader.readAsDataURL(file);
         });
-        res = await api.installSkillPackage('', base64);
+        res = await api.installSkillPackage('', base64, execKey);
       }
       if (res.status === 'ok') {
+        setRuntimeExecKey(execKey);
         await refresh();
         const m = res.manifest;
         const installedSkills = Array.isArray((res as any).skills) ? (res as any).skills : [];
@@ -413,7 +468,7 @@ export const RepoPanel: React.FC<Props> = ({ open, workingDir, onClose, onEditin
           format: (res as any).format || '',
         });
         if (m?.id) {
-          const schema = await api.getSkillSecretsSchema(m.id);
+          const schema = await api.getSkillSecretsSchema(m.id, execKey);
           if (schema?.fields?.length) {
             setSecretsSkill(m.id);
             setSecretsSchema(schema);
@@ -430,34 +485,40 @@ export const RepoPanel: React.FC<Props> = ({ open, workingDir, onClose, onEditin
       setInstalling(false);
       if (fileInputRef.current) fileInputRef.current.value = '';
     }
-  }, [refresh]);
+  }, [refresh, execKey]);
 
   // ── 打开 Secrets 对话框 ──
   const openSecretsDialog = useCallback(async (skillName: string) => {
-    const [schema, presence] = await Promise.all([
-      api.getSkillSecretsSchema(skillName),
-      api.getSkillSecretsPresence(skillName),
-    ]);
-    if (!schema?.fields?.length) return;
-    setSecretsSkill(skillName);
-    setSecretsSchema(schema);
-    setSecretsValues({});
-    setSecretsPresence(presence);
-  }, []);
+    setActionError('');
+    try {
+      const [schema, presence] = await Promise.all([
+        api.getSkillSecretsSchema(skillName, execKey),
+        api.getSkillSecretsPresence(skillName, execKey),
+      ]);
+      if (!schema?.fields?.length) return;
+      setSecretsSkill(skillName);
+      setSecretsSchema(schema);
+      setSecretsValues({});
+      setSecretsPresence(presence);
+    } catch (error) { setActionError(error instanceof Error ? error.message : String(error)); }
+  }, [execKey]);
 
   const handleSaveSecrets = useCallback(async () => {
     if (!secretsSkill) return;
     setSavingSecrets(true);
     try {
-      const res = await api.setSkillSecrets(secretsSkill, secretsValues);
+      const res = await api.setSkillSecrets(secretsSkill, secretsValues, execKey);
+      requireOk(res);
       if (res.status === 'ok') {
         setSecretsSkill(null);
         await refresh();
       }
+    } catch (error) {
+      setActionError(error instanceof Error ? error.message : String(error));
     } finally {
       setSavingSecrets(false);
     }
-  }, [secretsSkill, secretsValues, refresh]);
+  }, [secretsSkill, secretsValues, refresh, execKey]);
 
   if (!open) return null;
 
@@ -466,6 +527,7 @@ export const RepoPanel: React.FC<Props> = ({ open, workingDir, onClose, onEditin
     return (
       <div style={{ ...panelEditorStyle, ...(embedded ? { flex: 1, minHeight: 0, maxHeight: 'none' } : {}) }}>
         <div style={editorWrapStyle}>
+          {actionError && <div role="alert" style={{ color: '#ef4444' }}>{actionError}</div>}
           <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 12 }}>
             {editingType === 'prompt' && (
               <div style={{ position: 'relative' }}>
@@ -586,6 +648,11 @@ export const RepoPanel: React.FC<Props> = ({ open, workingDir, onClose, onEditin
   // 卡片列表模式
   return (
     <div className={embedded ? 'repo-workbench' : undefined} style={{ ...panelStyle, ...(embedded ? { flex: 1, minHeight: 0 } : {}) }}>
+      <div style={{ display: 'flex', gap: 8, paddingBottom: 8, alignItems: 'center', fontSize: 12 }}>
+        <span role="status">{loading ? '正在加载能力库…' : loadError ? '能力库加载失败' : `${skills.length} Skills · ${prompts.length} Prompts`}</span>
+        <button disabled={loading} onClick={() => void refresh()} style={{ ...addBtnStyle, width: 'auto', height: 'auto', padding: '3px 8px', fontSize: 11 }}>{loadError ? '重试加载' : '刷新能力库'}</button>
+      </div>
+      {(loadError || actionError) && <div role="alert" style={{ color: '#ef4444', paddingBottom: 8 }}>{loadError || actionError}</div>}
       <style>{`.repo-workbench .repo-cards { max-height:none!important; align-content:flex-start; }
         @media(max-width:760px) { .repo-workbench .repo-columns { flex-direction:column; gap:16px!important; overflow:auto!important; }
           .repo-workbench .repo-column { border:0!important; padding:0!important; flex:none!important; }
@@ -625,7 +692,7 @@ export const RepoPanel: React.FC<Props> = ({ open, workingDir, onClose, onEditin
                 </div>
                 <div style={cardNameStyle}>{s.name}</div>
                 <button style={{ ...addBtnStyle, width: 'auto', height: 'auto', minHeight: 28, padding: '4px 6px', whiteSpace: 'nowrap', fontSize: 11, marginTop: 5 }} title="检查此技能在执行节点的资源、依赖与配置"
-                  onClick={e => { e.stopPropagation(); setRuntimeNames([s.name]); }}>运行准备 / 状态</button>
+                  onClick={e => { e.stopPropagation(); setRuntimeExecKey(execKey); setRuntimeNames([s.name]); }}>运行准备 / 状态</button>
                 <div style={{ position: 'absolute', top: 4, left: 4, display: 'flex', gap: 2 }}>
                   {s.manifest && (
                     <span title={`插件包安装 v${s.manifest.version || '?'}`}
@@ -663,7 +730,7 @@ export const RepoPanel: React.FC<Props> = ({ open, workingDir, onClose, onEditin
                 </div>
               </div>
             ))}
-            {skills.length === 0 && <div style={emptyStyle}>暂无 Skill</div>}
+            {!loading && !loadError && skills.length === 0 && <div style={emptyStyle}>该节点暂无 Skill</div>}
           </div>
         </div>
 
@@ -702,7 +769,7 @@ export const RepoPanel: React.FC<Props> = ({ open, workingDir, onClose, onEditin
                 </div>
               </div>
             ))}
-            {prompts.length === 0 && <div style={emptyStyle}>暂无 Prompt</div>}
+            {!loading && !loadError && prompts.length === 0 && <div style={emptyStyle}>该节点暂无 Prompt</div>}
           </div>
         </div>
       </div>
@@ -846,9 +913,13 @@ export const RepoPanel: React.FC<Props> = ({ open, workingDir, onClose, onEditin
       <SkillMarketDialog
         open={showSkillMarket}
         onClose={() => setShowSkillMarket(false)}
-        onInstalled={async (name) => { await refresh(); if (name) { setShowSkillMarket(false); setRuntimeNames([name]); } }}
+        onInstalled={async (name, execKey) => {
+          if (name) { setShowSkillMarket(false); setRuntimeExecKey(execKey); setRuntimeNames([name]); }
+          await refresh();
+        }}
       />
-      {runtimeNames.length > 0 && <SkillRuntimeDialog key={runtimeNames.join('|')} names={runtimeNames} onClose={() => setRuntimeNames([])} />}
+      {runtimeNames.length > 0 && <SkillRuntimeDialog key={`${runtimeExecKey}:${runtimeNames.join('|')}`} names={runtimeNames}
+        initialExecKey={runtimeExecKey} onClose={() => { setRuntimeNames([]); setRuntimeExecKey(undefined); }} />}
 
       {/* ── Secrets 配置对话框 ── */}
       {secretsSkill && secretsSchema && (

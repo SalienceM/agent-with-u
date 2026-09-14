@@ -1,6 +1,7 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { api, getCurrentUserProfile } from '../api';
 import { AppModalPortal } from './AppModalPortal';
+import { directionalTokens, tokenCount as count, tokenTrendStats } from '../utils/tokenUsageTrend';
 
 interface UsageEvent {
   id?: string;
@@ -62,11 +63,6 @@ const EMPTY: TokenUsageSummary = {
   contextEvents: [],
   latestContext: null,
 };
-
-function count(value: unknown): number {
-  const number = Number(value || 0);
-  return Number.isFinite(number) ? Math.max(0, Math.trunc(number)) : 0;
-}
 
 function normalizeSummary(value: any): TokenUsageSummary {
   if (!value || typeof value !== 'object') return EMPTY;
@@ -131,25 +127,6 @@ function savePreference(value: TokenMonitorPreference): void {
   try { localStorage.setItem(preferenceKey(), JSON.stringify(value)); } catch { /* private mode */ }
 }
 
-function trendText(events: UsageEvent[]): string {
-  const values = events.slice(-6).map((event) => count(event.inputTokens) + count(event.outputTokens));
-  if (values.length < 4) return '数据积累中';
-  const split = Math.floor(values.length / 2);
-  const before = values.slice(0, split).reduce((sum, value) => sum + value, 0) / split;
-  const afterValues = values.slice(split);
-  const after = afterValues.reduce((sum, value) => sum + value, 0) / afterValues.length;
-  if (!before) return '数据积累中';
-  const change = Math.round(((after - before) / before) * 100);
-  if (Math.abs(change) < 10) return '近期基本平稳';
-  return change > 0 ? `近期上升 ${change}%` : `近期下降 ${Math.abs(change)}%`;
-}
-
-function averageTokens(events: UsageEvent[], limit = 6): number {
-  const values = events.slice(-limit).map((event) => count(event.inputTokens) + count(event.outputTokens));
-  if (!values.length) return 0;
-  return Math.round(values.reduce((sum, value) => sum + value, 0) / values.length);
-}
-
 const STAGE_LABELS: Record<string, string> = {
   reply: '普通对话', manual: '人工接管', idea: '构思', goal: '整理目标',
   prepare: '规划', execute: '执行', summary: '总结', analysis: '评审', aside: '旁路问答',
@@ -162,14 +139,32 @@ function callLabel(event?: UsageEvent): string {
 }
 
 const UsageLineChart: React.FC<{ events: UsageEvent[] }> = ({ events }) => {
+  const [view, setView] = useState<'both' | 'input' | 'output'>('both');
+  const [selectedKey, setSelectedKey] = useState('');
+  const [width, setWidth] = useState(760);
+  const svgRef = useRef<SVGSVGElement>(null);
+  const hasEvents = events.length > 0;
+  useEffect(() => {
+    const svg = svgRef.current;
+    if (!svg) return;
+    const observer = new ResizeObserver(([entry]) => {
+      if (entry.contentRect.width > 0) setWidth(Math.max(180, Math.round(entry.contentRect.width)));
+    });
+    observer.observe(svg);
+    return () => observer.disconnect();
+  }, [hasEvents]);
   const visible = events.slice(-16);
-  const values = visible.map((event) => count(event.inputTokens) + count(event.outputTokens));
-  const maximum = Math.max(1, ...values);
+  const series = TOKEN_SERIES.filter(item => view === 'both' || item.direction === view);
+  // 单独查看时重新缩放，避免较小的输出量始终贴着横轴。
+  const maximum = Math.max(1, ...series.flatMap(item => visible.map(event => directionalTokens(event, item.direction))));
   if (!visible.length) {
     return <div style={emptyTrendStyle}>完成一轮后显示趋势</div>;
   }
+  const eventKey = (event: UsageEvent, index: number) => event.id || `${event.at}-${index}`;
+  const selectedIndex = selectedKey ? visible.findIndex((event, index) => eventKey(event, index) === selectedKey) : -1;
+  const detailIndex = selectedIndex < 0 ? visible.length - 1 : selectedIndex;
+  const detail = visible[detailIndex];
 
-  const width = 760;
   const height = 210;
   const left = 58;
   const right = 24;
@@ -181,13 +176,26 @@ const UsageLineChart: React.FC<{ events: UsageEvent[] }> = ({ events }) => {
     ? left + chartWidth / 2
     : left + (index / (visible.length - 1)) * chartWidth;
   const yAt = (value: number) => top + chartHeight - (value / maximum) * chartHeight;
-  const points = values.map((value, index) => `${xAt(index)},${yAt(value)}`).join(' ');
-  const areaPoints = `${left},${top + chartHeight} ${points} ${left + chartWidth},${top + chartHeight}`;
   const gridLevels = [0, 0.25, 0.5, 0.75, 1];
 
   return (
-    <div style={lineChartWrapStyle} aria-label="最近各次模型调用的 Token 折线趋势">
-      <svg viewBox={`0 0 ${width} ${height}`} role="img" style={lineChartStyle}>
+    <div style={lineChartWrapStyle}>
+      <div role="group" aria-label="Token 趋势显示范围" style={lineLegendStyle}>
+        {(['both', 'input', 'output'] as const).map(value => (
+          <button key={value} type="button" aria-pressed={view === value} onClick={() => setView(value)}
+            style={{ ...chartToggleStyle, ...(view === value ? { color: 'var(--theme-accent)', borderColor: 'var(--theme-accent)', background: 'var(--theme-accent-bg)' } : {}) }}>
+            {value === 'both' ? '输入 + 输出' : value === 'input' ? '只看输入' : '只看输出'}
+          </button>
+        ))}
+      </div>
+      <div style={lineLegendStyle}>
+        {series.map(item => <span key={item.direction} style={{ color: item.color }}>
+          <i style={{ display: 'inline-block', width: 20, marginRight: 5, verticalAlign: 'middle', borderTop: `2px ${item.direction === 'output' ? 'dashed' : 'solid'} ${item.color}` }} />
+          {item.label} · {item.direction === 'input' ? '实线' : '虚线'}
+        </span>)}
+        <span>{view === 'both' ? '同一纵轴 · Token / 次' : '纵轴按当前类型自动缩放'}</span>
+      </div>
+      <svg ref={svgRef} viewBox={`0 0 ${width} ${height}`} role="img" aria-label={`最近调用趋势：${series.map(item => item.label).join('与')}`} style={lineChartStyle}>
         {gridLevels.map((ratio) => {
           const y = top + chartHeight - ratio * chartHeight;
           return (
@@ -200,22 +208,24 @@ const UsageLineChart: React.FC<{ events: UsageEvent[] }> = ({ events }) => {
             </g>
           );
         })}
-        <polygon points={areaPoints} fill="var(--theme-accent)" opacity="0.10" />
-        <polyline points={points} fill="none" stroke="var(--theme-accent)" strokeWidth="3"
-          strokeLinejoin="round" strokeLinecap="round" />
+        {series.map(item => (
+          <polyline key={item.direction} data-token-series={item.direction}
+            points={visible.map((event, index) => `${xAt(index)},${yAt(directionalTokens(event, item.direction))}`).join(' ')}
+            fill="none" stroke={item.color} strokeWidth="3" strokeDasharray={item.direction === 'output' ? '7 4' : undefined}
+            strokeLinejoin="round" strokeLinecap="round" />
+        ))}
         {visible.map((event, index) => {
-          const value = values[index];
           const x = xAt(index);
-          const y = yAt(value);
-          const label = `${callLabel(event)}：${value.toLocaleString()} Token${event.estimated ? '（估算）' : '（Backend 实报）'}`;
-          const showTick = visible.length <= 10 || index % 2 === 0 || index === visible.length - 1;
+          const label = `第 ${index + 1} 次 · ${callLabel(event)}：输入 ${exactTokens(count(event.inputTokens))}，输出 ${exactTokens(count(event.outputTokens))}，合计 ${exactTokens(directionalTokens(event, 'total'))}${event.estimated ? '（文本估算）' : '（Backend 实报）'}`;
+          const tickEvery = Math.max(1, Math.ceil((visible.length - 1) / Math.max(1, Math.floor(chartWidth / 40))));
+          const showTick = index % tickEvery === 0 || index === visible.length - 1;
           return (
             <g key={event.id || `${event.at}-${index}`}>
               <title>{label}</title>
-              <circle cx={x} cy={y} r={event.estimated ? 5 : 4.5}
-                fill={event.estimated ? 'var(--theme-bg-secondary)' : 'var(--theme-accent)'}
-                stroke="var(--theme-accent)" strokeWidth={event.estimated ? 2.5 : 1.5}
-                strokeDasharray={event.estimated ? '2 1' : undefined} />
+              {series.map(item => <circle key={item.direction} cx={x} cy={yAt(directionalTokens(event, item.direction))} r={event.estimated ? 5 : 4.5}
+                fill={event.estimated ? 'var(--theme-bg-secondary)' : item.color}
+                stroke={item.color} strokeWidth={event.estimated ? 2.5 : 1.5}
+                strokeDasharray={event.estimated ? '2 1' : undefined} />)}
               {showTick && (
                 <text x={x} y={height - 11} textAnchor="middle" fill="var(--theme-text-muted)" fontSize="9.5">
                   {index + 1}
@@ -228,9 +238,26 @@ const UsageLineChart: React.FC<{ events: UsageEvent[] }> = ({ events }) => {
         <text x={left + chartWidth} y={height - 1} textAnchor="end" fill="var(--theme-text-muted)" fontSize="9.5">最近</text>
       </svg>
       <div style={lineLegendStyle}>
-        <span><i style={{ ...legendPointStyle, background: 'var(--theme-accent)' }} />Backend 实报</span>
-        <span><i style={{ ...legendPointStyle, background: 'transparent', border: '2px dashed var(--theme-accent)' }} />文本估算</span>
+        <span><i style={{ ...legendPointStyle, background: 'var(--theme-text-muted)' }} />实心点：Backend 实报</span>
+        <span><i style={{ ...legendPointStyle, background: 'transparent', border: '2px dashed var(--theme-text-muted)' }} />空心点：文本估算</span>
         <span>横轴数字 = 最近第几次模型调用</span>
+      </div>
+      <div style={callDetailStyle}>
+        <label style={callPickerStyle}>调用明细
+          <select aria-label="查看某次调用的 Token" value={selectedIndex < 0 ? '' : selectedKey}
+            onChange={event => setSelectedKey(event.target.value)} style={callSelectStyle}>
+            <option value="">最近一次</option>
+            {visible.map((event, index) => <option key={eventKey(event, index)} value={eventKey(event, index)}>
+              第 {index + 1} 次 · {callLabel(event)}{event.estimated ? '（估算）' : ''}
+            </option>)}
+          </select>
+        </label>
+        <div aria-label="所选调用统计" style={detailNumbersStyle}>
+          <span>第 {detailIndex + 1} 次 · {callLabel(detail)} · {detail.estimated ? '文本估算' : 'Backend 实报'}</span>
+          <span style={{ color: INPUT_COLOR }}>输入 {exactTokens(count(detail.inputTokens))}</span>
+          <span style={{ color: OUTPUT_COLOR }}>输出 {exactTokens(count(detail.outputTokens))}</span>
+          <span>合计 {exactTokens(directionalTokens(detail, 'total'))}</span>
+        </div>
       </div>
     </div>
   );
@@ -292,14 +319,10 @@ export const TokenUsageMonitor: React.FC<{
     () => summary.events.filter((event) => event.contextDrop).length,
     [summary.events],
   );
-  const recentTrend = trendText(summary.events);
   const latestEvent = summary.events.at(-1);
-  const latestTokens = latestEvent
-    ? count(latestEvent.inputTokens) + count(latestEvent.outputTokens) : 0;
-  const recentAverage = averageTokens(summary.events);
-  const peakTokens = Math.max(0, ...summary.events.slice(-16).map(
-    (event) => count(event.inputTokens) + count(event.outputTokens),
-  ));
+  const inputStats = tokenTrendStats(summary.events, 'input');
+  const outputStats = tokenTrendStats(summary.events, 'output');
+  const totalStats = tokenTrendStats(summary.events, 'total');
   const exactPercent = Math.round(summary.coverage * 100);
   const warningDistance = Math.max(0, preference.warningPercent - contextPercent);
   const nearWarning = preference.enabled && contextPercent >= Math.max(1, preference.warningPercent - 10);
@@ -325,7 +348,7 @@ export const TokenUsageMonitor: React.FC<{
       <button type="button" onClick={() => setOpen((value) => !value)}
         title={contextPercent
           ? `当前上下文已使用 ${contextPercent}%，点击查看 Token 详情`
-          : `本会话累计消耗 ${exactTokens(summary.totalTokens)}，点击查看详情`}
+          : `累计输入 ${exactTokens(summary.inputTokens)}，累计输出 ${exactTokens(summary.outputTokens)}，合计 ${exactTokens(summary.totalTokens)}，点击查看详情`}
         style={{ ...triggerStyle, ...(warning ? triggerWarningStyle : {}) }}>
         <span style={triggerDotStyle} />
         {contextPercent
@@ -405,7 +428,7 @@ export const TokenUsageMonitor: React.FC<{
           <section style={cumulativeSectionStyle}>
             <div style={cumulativeHeaderStyle}>
               <div>
-                <div style={sectionHeadingStyle}><span>本会话累计消耗</span></div>
+                <div style={sectionHeadingStyle}><span>本会话累计消耗 · 输入 + 输出</span></div>
                 <strong style={cumulativeValueStyle} title={exactTokens(summary.totalTokens)}>
                   {formatTokens(summary.totalTokens)} <small style={tokenUnitStyle}>Token</small>
                 </strong>
@@ -416,34 +439,38 @@ export const TokenUsageMonitor: React.FC<{
               这是从会话开始到现在所有模型调用的总和，不是模型此刻正在携带的上下文。一个 Agent 任务内部可能调用模型多次，所以累计值可以远大于上下文窗口。
             </div>
             <div style={metricGridStyle}>
-              <div style={metricStyle} title={exactTokens(summary.inputTokens)}><span>累计输入</span><strong>{formatTokens(summary.inputTokens)}</strong></div>
-              <div style={metricStyle} title={exactTokens(summary.outputTokens)}><span>累计输出</span><strong>{formatTokens(summary.outputTokens)}</strong></div>
-              <div style={metricStyle}><span>模型调用</span><strong>{summary.turnCount} 次</strong></div>
+              <div aria-label="累计输入统计" style={{ ...metricStyle, color: INPUT_COLOR }} title={exactTokens(summary.inputTokens)}><span>累计输入</span><strong style={directionValueStyle}>{formatTokens(summary.inputTokens)}</strong><span>Token · 发给模型</span></div>
+              <div aria-label="累计输出统计" style={{ ...metricStyle, color: OUTPUT_COLOR }} title={exactTokens(summary.outputTokens)}><span>累计输出</span><strong style={directionValueStyle}>{formatTokens(summary.outputTokens)}</strong><span>Token · 模型生成</span></div>
             </div>
+            <div style={finePrintStyle}>共 {summary.turnCount} 次记录 · {summary.actualTurns} 次实报 / {summary.estimatedTurns} 次估算。缓存输入、推理输出为细分项，不重复计入总量。</div>
           </section>
           </div>
 
           <section style={sectionStyle}>
             <div style={sectionHeadingStyle}>
-              <span>最近调用趋势</span><span style={trendCaptionStyle}>{recentTrend}</span>
+              <span>最近调用趋势</span>
+            </div>
+            <div style={directionTrendStyle}>
+              <span style={{ color: INPUT_COLOR }}>输入：{inputStats.trend}</span>
+              <span style={{ color: OUTPUT_COLOR }}>输出：{outputStats.trend}</span>
+              <span>比较近 6 次记录的前后半段</span>
             </div>
             <div style={trendMetricGridStyle}>
-              <div style={trendMetricStyle}>
-                <span>最近一次 · {callLabel(latestEvent)}</span>
-                <strong>{formatTokens(latestTokens)} Token</strong>
-              </div>
-              <div style={trendMetricStyle}>
-                <span>近 6 次平均</span>
-                <strong>{formatTokens(recentAverage)} Token</strong>
-              </div>
-              <div style={trendMetricStyle}>
-                <span>近 16 次峰值</span>
-                <strong>{formatTokens(peakTokens)} Token</strong>
-              </div>
+              {([
+                ['latest', `最近一次 · ${callLabel(latestEvent)}${latestEvent?.estimated ? '（估算）' : ''}`],
+                ['average', '近 6 次平均'],
+                ['peak', '近 16 次各项峰值'],
+              ] as const).map(([key, label]) => <div key={key} aria-label={label} style={trendMetricStyle}>
+                <span>{label}</span>
+                <strong style={{ color: INPUT_COLOR }} title={exactTokens(inputStats[key])}>输入 {formatTokens(inputStats[key])} Token</strong>
+                <strong style={{ color: OUTPUT_COLOR }} title={exactTokens(outputStats[key])}>输出 {formatTokens(outputStats[key])} Token</strong>
+                <span title={exactTokens(totalStats[key])}>{key === 'peak' ? '单次合计峰值' : '合计'} {formatTokens(totalStats[key])} Token</span>
+              </div>)}
             </div>
             <UsageLineChart events={summary.events} />
             <div style={finePrintStyle}>
               折线展示最近最多 16 次模型调用的连续变化，纵轴是单次调用消耗的 Token。
+              输入和输出分别统计，峰值可能来自不同调用；选择“只看输出”可放大输出趋势。
               当前 {summary.actualTurns}/{summary.turnCount} 次为精确数据（{exactPercent}%）。
             </div>
           </section>
@@ -488,6 +515,12 @@ export const TokenUsageMonitor: React.FC<{
 };
 
 const headerRootStyle: React.CSSProperties = { position: 'relative', flexShrink: 0 };
+const INPUT_COLOR = 'var(--theme-accent)';
+const OUTPUT_COLOR = 'var(--theme-success, #2da44e)';
+const TOKEN_SERIES = [
+  { direction: 'input', label: '输入', color: INPUT_COLOR },
+  { direction: 'output', label: '输出', color: OUTPUT_COLOR },
+] as const;
 const floatingRootStyle: React.CSSProperties = { position: 'absolute', top: 10, right: 96, zIndex: 70 };
 const triggerStyle: React.CSSProperties = {
   minWidth: 132, height: 36, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 7, padding: '0 13px',
@@ -520,18 +553,19 @@ const panelHeaderStyle: React.CSSProperties = { display: 'flex', alignItems: 'fl
 const titleStyle: React.CSSProperties = { fontSize: 19, fontWeight: 780, letterSpacing: '.01em' };
 const subtitleStyle: React.CSSProperties = { marginTop: 5, color: 'var(--theme-text-muted)', fontSize: 12 };
 const closeStyle: React.CSSProperties = { marginLeft: 'auto', width: 34, height: 34, border: '1px solid var(--theme-border)', borderRadius: 8, background: 'var(--theme-bg-tertiary)', color: 'var(--theme-text-muted)', fontSize: 21, cursor: 'pointer', lineHeight: 1 };
-const overviewGridStyle: React.CSSProperties = { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(300px, 1fr))', gap: 14, alignItems: 'stretch' };
+const overviewGridStyle: React.CSSProperties = { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 300px), 1fr))', gap: 14, alignItems: 'stretch' };
 const contextSectionStyle: React.CSSProperties = {
   padding: 16, border: '1px solid color-mix(in srgb, var(--theme-accent) 30%, var(--theme-border))',
   borderRadius: 11, background: 'color-mix(in srgb, var(--theme-bg-tertiary) 84%, var(--theme-accent) 16%)',
 };
 const cumulativeSectionStyle: React.CSSProperties = { padding: 16, border: '1px solid var(--theme-border)', borderRadius: 11, background: 'var(--theme-bg-tertiary)' };
-const metricGridStyle: React.CSSProperties = { display: 'grid', gridTemplateColumns: 'repeat(3, minmax(0, 1fr))', gap: 8, marginTop: 11 };
+const metricGridStyle: React.CSSProperties = { display: 'grid', gridTemplateColumns: 'repeat(2, minmax(0, 1fr))', gap: 8, marginTop: 11 };
+const directionValueStyle: React.CSSProperties = { fontSize: 22, fontVariantNumeric: 'tabular-nums' };
 const metricStyle: React.CSSProperties = { display: 'flex', flexDirection: 'column', gap: 5, padding: '10px 9px', borderRadius: 8, background: 'color-mix(in srgb, var(--theme-bg-secondary) 76%, transparent)', minWidth: 0, fontSize: 10.5, color: 'var(--theme-text-muted)' };
 const sectionStyle: React.CSSProperties = { padding: '17px 0', borderTop: '1px solid var(--theme-border)' };
 const sectionHeadingStyle: React.CSSProperties = { display: 'flex', alignItems: 'center', gap: 8, marginBottom: 9, fontSize: 13, fontWeight: 740 };
 const statusBadgeStyle: React.CSSProperties = { marginLeft: 'auto', padding: '3px 7px', borderRadius: 999, background: 'rgba(255,255,255,.06)', fontSize: 10.5, fontWeight: 700 };
-const trendCaptionStyle: React.CSSProperties = { marginLeft: 'auto', color: 'var(--theme-text-muted)', fontSize: 11, fontWeight: 550 };
+const directionTrendStyle: React.CSSProperties = { display: 'flex', gap: '6px 16px', flexWrap: 'wrap', marginBottom: 9, color: 'var(--theme-text-muted)', fontSize: 11 };
 const emptyTrendStyle: React.CSSProperties = { height: 54, display: 'grid', placeItems: 'center', color: 'var(--theme-text-muted)', fontSize: 10.5, border: '1px dashed var(--theme-border)', borderRadius: 7 };
 const finePrintStyle: React.CSSProperties = { marginTop: 8, color: 'var(--theme-text-muted)', fontSize: 10.5, lineHeight: 1.55 };
 const contextLineStyle: React.CSSProperties = { display: 'flex', alignItems: 'center', gap: 13, fontVariantNumeric: 'tabular-nums' };
@@ -552,7 +586,12 @@ const plainExplanationStyle: React.CSSProperties = { marginTop: 8, color: 'var(-
 const trendMetricGridStyle: React.CSSProperties = { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(170px, 1fr))', gap: 9, marginBottom: 9 };
 const trendMetricStyle: React.CSSProperties = { display: 'flex', flexDirection: 'column', gap: 5, padding: '9px 10px', borderRadius: 8, background: 'var(--theme-bg-tertiary)', color: 'var(--theme-text-muted)', fontSize: 10.5 };
 const lineChartWrapStyle: React.CSSProperties = { padding: '8px 10px 6px', border: '1px solid var(--theme-border)', borderRadius: 10, background: 'color-mix(in srgb, var(--theme-bg-tertiary) 76%, transparent)' };
-const lineChartStyle: React.CSSProperties = { display: 'block', width: '100%', height: 'auto', minHeight: 180, overflow: 'visible' };
+const lineChartStyle: React.CSSProperties = { display: 'block', width: '100%', height: 210, overflow: 'visible' };
+const chartToggleStyle: React.CSSProperties = { padding: '7px 9px', border: '1px solid var(--theme-border)', borderRadius: 6, background: 'var(--theme-bg-secondary)', color: 'var(--theme-text-muted)', fontSize: 11, cursor: 'pointer' };
+const callDetailStyle: React.CSSProperties = { display: 'flex', flexDirection: 'column', gap: 8, borderTop: '1px solid var(--theme-border)', padding: '10px 7px 5px' };
+const callPickerStyle: React.CSSProperties = { display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 8, fontSize: 11, color: 'var(--theme-text-muted)' };
+const callSelectStyle: React.CSSProperties = { minWidth: 0, maxWidth: '100%', padding: 6, border: '1px solid var(--theme-border)', borderRadius: 5, background: 'var(--theme-bg-secondary)', color: 'var(--theme-text)', fontSize: 11 };
+const detailNumbersStyle: React.CSSProperties = { display: 'flex', flexWrap: 'wrap', gap: '6px 16px', color: 'var(--theme-text-muted)', fontSize: 11, fontVariantNumeric: 'tabular-nums' };
 const lineLegendStyle: React.CSSProperties = { display: 'flex', alignItems: 'center', gap: 16, padding: '3px 7px 5px', color: 'var(--theme-text-muted)', fontSize: 10.5, flexWrap: 'wrap' };
 const legendPointStyle: React.CSSProperties = { display: 'inline-block', width: 8, height: 8, marginRight: 5, borderRadius: '50%', boxSizing: 'border-box' };
 const eventSummaryStyle: React.CSSProperties = { display: 'flex', gap: 16, color: 'var(--theme-text-muted)', fontSize: 11.5, flexWrap: 'wrap' };

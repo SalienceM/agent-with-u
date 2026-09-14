@@ -1,33 +1,39 @@
 import React, { useEffect, useState } from 'react';
-import { api, getExecutors, getHomeExecKey } from '../api';
+import { api, getExecutors, getHomeExecKey, isTauri, onExecStatus, onCurrentUserChanged } from '../api';
 import { AppModalPortal } from './AppModalPortal';
+import { skillInstallTargetLabel } from '../utils/skillInstallTarget';
 
 const labels: Record<string, string> = {
   preparing: '正在准备', blocked: '环境/资源缺失', needs_configuration: '待配置',
   needs_review: '需人工处理', ready: '运行检查通过', failed: '准备失败', needs_preparation: '文件已安装 · 待准备',
 };
 
-export const SkillRuntimeDialog: React.FC<{ names: string[]; onClose: () => void }> = ({ names, onClose }) => {
+export const SkillRuntimeDialog: React.FC<{ names: string[]; initialExecKey?: string; onClose: () => void }> = ({ names, initialExecKey, onClose }) => {
   const [name, setName] = useState(names[0] || '');
   // 固定目标节点，不随默认节点/当前 Session 漂移。
-  const [execKey, setExecKey] = useState(getHomeExecKey);
-  const [plan, setPlan] = useState<any>(null);
+  const [execKey, setExecKey] = useState(() => initialExecKey || getHomeExecKey());
+  const [planSnapshot, setPlanSnapshot] = useState<{ key: string; name: string; value: any } | null>(null);
+  const plan = planSnapshot?.key === execKey && planSnapshot.name === name ? planSnapshot.value : null;
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
   const [approved, setApproved] = useState(false);
   const [revision, setRevision] = useState(0);
-  const executors = getExecutors();
+  const [executors, setExecutors] = useState(getExecutors);
+  const connected = executors.some(executor => executor.key === execKey && executor.connected);
+  useEffect(() => onExecStatus(() => setExecutors(getExecutors())), []);
+  useEffect(() => onCurrentUserChanged((_profile, changed) => { if (changed) onClose(); }), [onClose]);
 
   useEffect(() => {
     let cancelled = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
-    setPlan(null); setError(''); setApproved(false);
+    setPlanSnapshot(null); setError(''); setApproved(false);
+    if (!connected) { setError('所选执行节点离线；不会切换到其它节点准备环境。'); return; }
     const load = async (review: boolean) => {
       try {
         const result = await api.skillRuntimeInspect(name, execKey, review);
         if (cancelled) return;
         if (result?.status !== 'ok') throw new Error(result?.message || '无法检查该节点');
-        setPlan(result.plan);
+        setPlanSnapshot({ key: execKey, name, value: result.plan });
         if (result.plan.status === 'preparing') timer = setTimeout(() => void load(false), 2000);
       } catch (reason: any) {
         if (!cancelled) setError(reason?.message || '检查失败');
@@ -35,10 +41,10 @@ export const SkillRuntimeDialog: React.FC<{ names: string[]; onClose: () => void
     };
     void load(true);
     return () => { cancelled = true; if (timer) clearTimeout(timer); };
-  }, [name, execKey, revision]);
+  }, [name, execKey, revision, connected]);
 
   const start = async () => {
-    if (!approved || !plan?.approvalToken || busy) return;
+    if (!approved || !plan?.approvalToken || busy || !connected) return;
     setBusy(true); setError('');
     try {
       const result = await api.skillRuntimePrepare(name, execKey, plan.approvalToken);
@@ -52,10 +58,15 @@ export const SkillRuntimeDialog: React.FC<{ names: string[]; onClose: () => void
     <section role="dialog" aria-modal="true" aria-label="Skill 运行准备" style={{ width: 'min(760px, 100%)', maxHeight: '92dvh', overflow: 'auto', padding: 18, boxSizing: 'border-box', borderRadius: 12, background: 'var(--theme-panel-solid, var(--theme-bg, #161b22))', color: 'var(--theme-text)', border: '1px solid var(--theme-border)' }}>
       <header style={{ display: 'flex', alignItems: 'center', gap: 10 }}><strong style={{ flex: 1 }}>🧰 Skill 运行准备</strong><button style={button} onClick={onClose} aria-label="关闭运行准备">✕</button></header>
       <p style={muted}>完整资源导入与运行就绪是两步。依赖安装发生在所选执行节点，关闭窗口不会停止已启动的任务。</p>
+      {initialExecKey && <p style={muted} data-testid="skill-import-node">
+        文件已导入：{skillInstallTargetLabel(initialExecKey, executors.find(e => e.key === initialExecKey), isTauri())}。
+        运行准备默认沿用此节点；切换节点只检查已有副本，不会复制或迁移 Skill。
+      </p>}
       <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
         <label>技能 <select disabled={busy} style={button} value={name} onChange={e => setName(e.target.value)}>{names.map(n => <option key={n}>{n}</option>)}</select></label>
-        <label>执行节点 <select disabled={busy} style={button} value={execKey} onChange={e => setExecKey(e.target.value)}>
-          {executors.map(e => <option key={e.key} value={e.key}>{e.label}{!e.connected ? ' · 离线' : ''}</option>)}
+        <label>运行准备节点 <select disabled={busy} style={button} value={execKey} onChange={e => setExecKey(e.target.value)}>
+          {!executors.some(e => e.key === execKey) && <option value={execKey}>{execKey} · 不可用</option>}
+          {executors.map(e => <option key={e.key} value={e.key}>{skillInstallTargetLabel(e.key, e, isTauri())}{!e.connected ? ' · 离线' : ''}</option>)}
         </select></label>
         <button disabled={busy} style={button} onClick={() => setRevision(v => v + 1)}>重新检查 / 重试</button>
       </div>
@@ -78,7 +89,7 @@ export const SkillRuntimeDialog: React.FC<{ names: string[]; onClose: () => void
             <input type="checkbox" checked={approved} onChange={e => setApproved(e.target.checked)} />
             我已核对上述节点、依赖和计划，同意下载第三方依赖到专属环境并执行列出的验证。不会运行实际生成任务，也不自动提权。
           </label>
-          <button style={{ ...button, marginTop: 12 }} disabled={busy || !approved || !plan.approvalToken || !!plan.blockers?.length}
+          <button style={{ ...button, marginTop: 12 }} disabled={busy || !connected || !approved || !plan.approvalToken || !!plan.blockers?.length}
             onClick={() => void start()}>{busy ? '提交中…' : '确认并准备运行环境'}</button>
         </>}
         {plan.lastRun?.startedAt && <p style={muted}>上次准备：{new Date(plan.lastRun.startedAt * 1000).toLocaleString()} · {plan.lastRun.message}</p>}

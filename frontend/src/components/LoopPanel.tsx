@@ -8,6 +8,8 @@ import { LoopPolicyEditor, normalizePolicy } from './LoopPolicyEditor';
 import type { LoopPolicy } from './LoopPolicyEditor';
 import type { ModelRuntime } from './CodexRuntimeFields';
 import { TokenUsageMonitor } from './TokenUsageMonitor';
+import { loopRecordRevision } from '../utils/loopRecordDetail';
+import { AppModalVisibilityContext } from './AppModalPortal';
 import {
   AdvancedPromptTextarea,
   type AdvancedPromptTextareaProps,
@@ -55,7 +57,14 @@ interface LoopRecord {
   manualContext?: string;
   detailLoaded?: boolean;
   manualMessageCount?: number;
+  stageDetails?: Record<string, StageDetail>;
 }
+interface StageAttempt { kind: string; rawOutput?: string; parsed?: unknown; valid: boolean; validation: string[]; }
+interface StageDetail {
+  status?: string; message?: string; attemptCount?: number; attempts?: StageAttempt[];
+  rawOutput?: string; partialOutput?: string; parsed?: unknown; validation?: string[];
+}
+type DetailTarget = 'all' | 'prepare' | 'execute' | 'analysis' | `step${number}`;
 interface IdeaEntry { id: string; prompt: string; status: string; result: string; error: string; images?: AddonImage[]; }
 interface GoalRevision { goal: string; hint: string; source: string; createdAt: number; }
 interface AsideTurn { id: string; question: string; answer: string; status: string; stage: string; seq: number; imageCount?: number; }
@@ -84,6 +93,7 @@ interface LoopStateT {
  * 旧详情快照覆盖新的 subStage / step.status，否则运行节点会停止动画。
  */
 function mergeLoopRecordDetail(summary: LoopRecord, detail?: LoopRecord): LoopRecord {
+  if (summary.detailLoaded !== false) return summary;
   if (!detail) return summary;
   const detailSteps = new Map((detail.orchestration || []).map((step) => [step.index, step]));
   const orchestration = (summary.orchestration || []).map((step) => {
@@ -113,6 +123,9 @@ function mergeLoopRecordDetail(summary: LoopRecord, detail?: LoopRecord): LoopRe
     evolutionBasis: detail.evolutionBasis || summary.evolutionBasis,
     analysis,
     orchestration,
+    stageDetails: Object.fromEntries(Object.entries(summary.stageDetails || detail.stageDetails || {}).map(
+      ([stage, value]) => [stage, { ...detail.stageDetails?.[stage], ...value }],
+    )),
     detailLoaded: true,
   };
 }
@@ -157,8 +170,15 @@ export const LoopPanel: React.FC<LoopPanelProps> = ({
   workingDir, execKey, headerActions,
 }) => {
   const [state, setState] = useState<LoopStateT | null>(null);
+  const visible = useContext(AppModalVisibilityContext);
+  const statePushRevision = useRef(0);
   const [selectedSeq, setSelectedSeq] = useState<number | null>(null);
   const [recordDetails, setRecordDetails] = useState<Record<number, LoopRecord>>({});
+  const [detailTarget, setDetailTarget] = useState<DetailTarget>('all');
+  const [detailErrors, setDetailErrors] = useState<Record<number, { revision: string; message: string }>>({});
+  const detailRequests = useRef(new Set<string>());
+  const detailVersions = useRef<Record<number, string>>({});
+  const detailGeneration = useRef(0);
   const [viewMode, setViewMode] = useState<'panel' | 'flow'>('panel');  // 可切换的执行流程视图
   const [ideaInput, setIdeaInput] = useState('');
   const [goalDraft, setGoalDraft] = useState('');
@@ -175,17 +195,37 @@ export const LoopPanel: React.FC<LoopPanelProps> = ({
 
   const refresh = useCallback(async () => {
     const requestedSessionId = sessionId;
+    const revision = statePushRevision.current;
     const s = await api.loopGetState(sessionId);
-    if (s && activeSessionRef.current === requestedSessionId) setState(s);
+    if (s && activeSessionRef.current === requestedSessionId && statePushRevision.current === revision) setState(s);
   }, [sessionId]);
 
-  const selectLoop = useCallback((seq: number | null) => {
+  const selectLoop = useCallback((seq: number | null, target: DetailTarget = 'all') => {
     setSelectedSeq(seq);
-    if (seq == null || recordDetails[seq]?.detailLoaded) return;
+    setDetailTarget(target);
+  }, []);
+
+  const selectedSummary = state?.loops.find(record => record.seq === selectedSeq);
+  const selectedRevision = selectedSummary ? loopRecordRevision(selectedSummary) : '';
+  // 只对当前选中记录按版本按需取详情；完成步骤/切换阶段的 push 会使缓存失效。
+  // 同一记录最多一个在途请求；请求期间出现的新版本等返回后补取，不并发重刷。
+  useEffect(() => {
+    if (!visible || state?.sessionId !== sessionId || !selectedSummary || selectedSummary.detailLoaded !== false) return;
+    const seq = selectedSummary.seq;
+    if (detailVersions.current[seq] === selectedRevision) return;
+    if (detailErrors[seq]?.revision === selectedRevision) return;
+    const generation = detailGeneration.current;
+    const key = `${generation}:${sessionId}:${seq}`;
+    if (detailRequests.current.has(key)) return;
+    detailRequests.current.add(key);
     const requestedSessionId = sessionId;
     void api.loopGetRecord(sessionId, seq).then((result) => {
-      if (activeSessionRef.current !== requestedSessionId) return;
+      if (activeSessionRef.current !== requestedSessionId || detailGeneration.current !== generation) return;
+      detailRequests.current.delete(key);
       if (result.status === 'ok' && result.record) {
+        detailVersions.current[seq] = selectedRevision;
+        detailRequests.current.delete(key);
+        setDetailErrors(previous => { const next = { ...previous }; delete next[seq]; return next; });
         setRecordDetails((previous) => ({ ...previous, [seq]: result.record as LoopRecord }));
         if (result.progress) {
           setProgress((previous) => {
@@ -198,9 +238,21 @@ export const LoopPanel: React.FC<LoopPanelProps> = ({
             return next;
           });
         }
+      } else {
+        setDetailErrors(previous => ({ ...previous, [seq]: { revision: selectedRevision, message: result.message || '详情加载失败' } }));
       }
-    });
-  }, [sessionId, recordDetails]);
+    }).catch(error => {
+      if (activeSessionRef.current === requestedSessionId && detailGeneration.current === generation) {
+        setDetailErrors(previous => ({ ...previous, [seq]: { revision: selectedRevision, message: String(error) } }));
+      }
+    }).finally(() => { detailRequests.current.delete(key); });
+  }, [sessionId, selectedSeq, selectedRevision, recordDetails, detailErrors, visible]);
+
+  const retryDetail = useCallback(() => {
+    if (selectedSeq == null) return;
+    delete detailVersions.current[selectedSeq];
+    setDetailErrors(previous => { const next = { ...previous }; delete next[selectedSeq]; return next; });
+  }, [selectedSeq]);
 
   useEffect(() => { refresh(); }, [refresh]);
 
@@ -208,17 +260,23 @@ export const LoopPanel: React.FC<LoopPanelProps> = ({
     setState(null);
     setSelectedSeq(null);
     setRecordDetails({});
+    setDetailErrors({});
+    detailVersions.current = {};
+    setDetailTarget('all');
+    detailGeneration.current++;
     setProgress({});
     progressRef.current = {};
     pendingProgressRef.current = {};
     if (progressTimerRef.current) clearTimeout(progressTimerRef.current);
     progressTimerRef.current = null;
+    return () => { detailGeneration.current++; };
   }, [sessionId]);
 
   // 订阅整份状态更新 + 子阶段流式文本（仅本 session）
   useEffect(() => {
     const un1 = api.onLoopUpdated((s: LoopStateT) => {
       if (s.sessionId !== sessionId) return;
+      statePushRevision.current++;
       setState(s);
     });
     const un2 = api.onLoopProgress((d) => {
@@ -414,7 +472,10 @@ export const LoopPanel: React.FC<LoopPanelProps> = ({
                   )}
                   <LoopFlowView state={stateForView} selectedSeq={selectedSeq} setSelectedSeq={selectLoop} />
                   {selectedSeq != null && stateForView.loops.find((l) => l.seq === selectedSeq) && (
-                    <LoopDetail loop={stateForView.loops.find((l) => l.seq === selectedSeq)!} progress={progress} onClose={() => selectLoop(null)} />
+                    <LoopDetail key={selectedSeq} loop={stateForView.loops.find((l) => l.seq === selectedSeq)!} progress={progress}
+                      target={detailTarget} onTarget={setDetailTarget} error={detailErrors[selectedSeq]?.message}
+                      onRetry={retryDetail}
+                      onClose={() => selectLoop(null)} />
                   )}
                 </>
               ) : (
@@ -425,6 +486,9 @@ export const LoopPanel: React.FC<LoopPanelProps> = ({
                   <ExecuteStage
                     state={stateForView} progress={progress}
                     selectedSeq={selectedSeq} setSelectedSeq={selectLoop}
+                    detailTarget={detailTarget} onDetailTarget={setDetailTarget}
+                    detailError={selectedSeq == null ? undefined : detailErrors[selectedSeq]?.message}
+                    onRetryDetail={retryDetail}
                     onRun={runIteration} onAdvanceOut={advanceOut} onSetAuto={setAuto}
                     onAddAddon={addAddon} onRemoveAddon={removeAddon} onEditAddon={editAddon} onContinue={continueRound}
                     onDiscard={discardLoop} onTakeover={(goal = '') => void takeover(goal)}
@@ -1185,7 +1249,9 @@ const GoalCard: React.FC<{
 // ══ Execute stage ═════════════════════════════════════════════
 const ExecuteStage: React.FC<{
   state: LoopStateT; progress: Record<string, string>;
-  selectedSeq: number | null; setSelectedSeq: (v: number | null) => void;
+  selectedSeq: number | null; setSelectedSeq: (v: number | null, target?: DetailTarget) => void;
+  detailTarget: DetailTarget; onDetailTarget: (target: DetailTarget) => void;
+  detailError?: string; onRetryDetail: () => void;
   onRun: () => void; onAdvanceOut: () => void; onSetAuto: (on: boolean) => void;
   onAddAddon: (text: string, images?: ImageAttachment[]) => void; onRemoveAddon: (id: string) => void;
   onEditAddon: (id: string, text: string, images?: any[]) => Promise<{ status: string; message?: string }>;
@@ -1194,7 +1260,7 @@ const ExecuteStage: React.FC<{
   goalDraft: string; setGoalDraft: (v: string) => void; onSaveGoal: () => void;
   onRefineGoal: (hint: string, images?: ImageAttachment[]) => Promise<{ status: string; goal?: string; message?: string }>;
   inspectOnly?: boolean;
-}> = ({ state, progress, selectedSeq, setSelectedSeq, onRun, onAdvanceOut, onSetAuto, onAddAddon, onRemoveAddon, onEditAddon, onContinue, onDiscard, onTakeover, running, busy, goalDraft, setGoalDraft, onSaveGoal, onRefineGoal, inspectOnly = false }) => {
+}> = ({ state, progress, selectedSeq, setSelectedSeq, detailTarget, onDetailTarget, detailError, onRetryDetail, onRun, onAdvanceOut, onSetAuto, onAddAddon, onRemoveAddon, onEditAddon, onContinue, onDiscard, onTakeover, running, busy, goalDraft, setGoalDraft, onSaveGoal, onRefineGoal, inspectOnly = false }) => {
   const isOut = state.stage === 'loopout';
   const selected = state.loops.find((l) => l.seq === selectedSeq) || null;
   const runLabel = state.resumable
@@ -1270,14 +1336,15 @@ const ExecuteStage: React.FC<{
                   </span>
                 </div>
               )}
-              <LoopNode loop={l} selected={l.seq === selectedSeq} onClick={() => setSelectedSeq(l.seq === selectedSeq ? null : l.seq)} />
+              <LoopNode loop={l} selected={l.seq === selectedSeq} onClick={() => setSelectedSeq(l.seq === selectedSeq ? null : l.seq)} onStage={target => setSelectedSeq(l.seq, target)} />
             </React.Fragment>
           );
         })}
       </div>
 
       {/* 详情面板 */}
-      {selected && <LoopDetail loop={selected} progress={progress} onClose={() => setSelectedSeq(null)} />}
+      {selected && <LoopDetail key={selected.seq} loop={selected} progress={progress} target={detailTarget} onTarget={onDetailTarget}
+        error={detailError} onRetry={onRetryDetail} onClose={() => setSelectedSeq(null)} />}
     </div>
   );
 };
@@ -1308,10 +1375,24 @@ function useNow(active: boolean): number {
 
 const FLOW_STATUS_COLOR: Record<string, string> = {
   done: '#2da44e', running: '#0969da', error: '#f87171', current: '#bf8700', pending: 'var(--theme-text-muted)',
+  retrying: '#bf8700', degraded: '#bf8700',
 };
+const STAGE_STATUS_LABEL: Record<string, string> = { done: '已完成', running: '进行中', retrying: '规划重试中', degraded: '已降级', error: '失败', current: '待继续', pending: '未开始' };
+
+function stageStatus(loop: LoopRecord, stage: string, live: boolean): string {
+  const explicit = loop.stageDetails?.[stage]?.status;
+  if (explicit) return explicit === 'running' && !live ? 'current' : explicit;
+  const index = SUB_ORDER.indexOf(stage);
+  const current = SUB_ORDER.indexOf(loop.subStage);
+  if (loop.error && index === current) return 'error';
+  if (stage === 'prepare' && (current > 0 || loop.completed) && !loop.orchestration.length) return 'degraded';
+  if (stage === 'execute' && loop.orchestration.some(step => step.status === 'error')) return 'error';
+  if (loop.completed || index < current) return 'done';
+  return index === current ? (live ? 'running' : 'current') : 'pending';
+}
 
 const LoopFlowView: React.FC<{
-  state: LoopStateT; selectedSeq: number | null; setSelectedSeq: (v: number | null) => void;
+  state: LoopStateT; selectedSeq: number | null; setSelectedSeq: (v: number | null, target?: DetailTarget) => void;
 }> = ({ state, selectedSeq, setSelectedSeq }) => {
   const now = useNow(state.running);
   const loops = state.loops;
@@ -1343,7 +1424,7 @@ const LoopFlowView: React.FC<{
             )}
             <FlowLane loop={loop} live={loop.seq === activeSeq} now={now}
               selected={loop.seq === selectedSeq}
-              onSelect={() => setSelectedSeq(loop.seq === selectedSeq ? null : loop.seq)} />
+              onSelect={target => setSelectedSeq(loop.seq, target)} />
           </React.Fragment>
         );
       })}
@@ -1352,20 +1433,13 @@ const LoopFlowView: React.FC<{
 };
 
 const FlowLane: React.FC<{
-  loop: LoopRecord; live: boolean; now: number; selected: boolean; onSelect: () => void;
+  loop: LoopRecord; live: boolean; now: number; selected: boolean; onSelect: (target?: DetailTarget) => void;
 }> = ({ loop, live, now, selected, onSelect }) => {
   const order = ['prepare', 'execute', 'analysis'];
   const sub = loop.subStarted || {};
-  const curName = loop.subStage === 'done' ? 'analysis' : loop.subStage;
-  const curIdx = order.indexOf(curName);
   const done = loop.completed;
 
-  const nstatus = (i: number): string => {
-    if (loop.error && i === curIdx && !done) return 'error';
-    if (done || i < curIdx) return 'done';
-    if (i === curIdx) return live ? 'running' : 'current';
-    return 'pending';
-  };
+  const nstatus = (i: number): string => stageStatus(loop, order[i], live);
   // 子阶段耗时：start 到下一阶段 start（或进行中到 now / 完成到 done）
   const subDur = (i: number): number => {
     const starts = [sub.prepare ?? loop.createdAt, sub.execute, sub.analysis];
@@ -1381,22 +1455,23 @@ const FlowLane: React.FC<{
     const duration = (loop.subStarted?.execute && loop.updatedAt)
       ? fmtDur(loop.updatedAt - loop.subStarted.execute) : '';
     return (
-      <div onClick={onSelect} className="awu-card" style={{
+      <div className="awu-card" style={{
         display: 'flex', alignItems: 'center', gap: 12, padding: '10px 12px', borderRadius: 12, cursor: 'pointer',
         background: selected ? 'var(--theme-accent-bg)' : 'var(--theme-bg-secondary)',
         border: `1px solid ${selected ? 'var(--theme-accent)' : '#d2992255'}`,
       }}>
         <FlowChip title={`Manual #${loop.seq}`} status={loop.completed ? 'done' : 'current'}
-          sub={`${loop.orchestration.length} 次人工交互`} big />
+          sub={`${loop.orchestration.length} 次人工交互`} big onSelect={() => onSelect('all')} />
         <FlowEdge active={false} done={loop.completed} />
         <FlowChip title="人工接管" status={loop.completed ? 'done' : 'current'} dur={duration}
+          onSelect={() => onSelect('all')}
           sub={loop.completed ? '已交还 LOOP' : '接管中'} steps={loop.orchestration} now={now}
           tag={<BackendTag role="execute" label={loop.backendLabels?.execute} />} />
       </div>
     );
   }
   return (
-    <div onClick={onSelect} className="awu-card"
+    <div className="awu-card"
       style={{
         display: 'flex', alignItems: 'stretch', gap: 0, padding: '10px 12px', borderRadius: 12, cursor: 'pointer',
         background: selected ? 'var(--theme-accent-bg)' : 'var(--theme-bg-secondary)',
@@ -1405,18 +1480,22 @@ const FlowLane: React.FC<{
       }}>
       {/* loop 头节点 */}
       <FlowChip title={`Loop #${loop.seq}`} status={done ? 'done' : (loop.error ? 'error' : (live ? 'running' : 'current'))}
+        onSelect={() => onSelect('all')}
         sub={score != null ? `score ${score.toFixed(0)}` : (loop.round > 1 ? `第${loop.round}轮` : '进行中')} big />
       <FlowEdge active={nstatus(0) === 'running'} done={nstatus(0) !== 'pending'} />
       <FlowChip title="Prepare" status={nstatus(0)} dur={fmtDur(subDur(0))}
+        onSelect={() => onSelect('prepare')} sub={STAGE_STATUS_LABEL[nstatus(0)]}
         tag={<BackendTag role="prepare" label={loop.backendLabels?.prepare} />} />
       <FlowEdge active={nstatus(1) === 'running'} done={nstatus(1) !== 'pending'} />
       {/* Execute：含分步 */}
       <FlowChip title="Execute" status={nstatus(1)} dur={fmtDur(subDur(1))}
+        onSelect={() => onSelect('execute')} onSelectStep={index => onSelect(`step${index}`)}
         sub={loop.orchestration.length ? `${loop.orchestration.filter((s) => s.status === 'done').length}/${loop.orchestration.length} 步` : undefined}
         steps={loop.orchestration} now={now}
         tag={<BackendTag role="execute" label={loop.backendLabels?.execute} />} />
       <FlowEdge active={nstatus(2) === 'running'} done={nstatus(2) !== 'pending'} />
       <FlowChip title="Analysis" status={nstatus(2)} dur={fmtDur(subDur(2))}
+        onSelect={() => onSelect('analysis')}
         sub={score != null ? `score ${score.toFixed(0)}` : undefined}
         tag={<BackendTag role="analysis" label={loop.backendLabels?.analysis} />} />
     </div>
@@ -1436,7 +1515,8 @@ const FlowEdge: React.FC<{ active: boolean; done: boolean }> = ({ active, done }
 const FlowChip: React.FC<{
   title: string; status: string; dur?: string; sub?: string; big?: boolean;
   steps?: LoopStep[]; now?: number; tag?: React.ReactNode;
-}> = ({ title, status, dur, sub, big, steps, now, tag }) => {
+  onSelect?: () => void; onSelectStep?: (index: number) => void;
+}> = ({ title, status, dur, sub, big, steps, now, tag, onSelect, onSelectStep }) => {
   const col = FLOW_STATUS_COLOR[status] || FLOW_STATUS_COLOR.pending;
   const pulse = status === 'running';
   return (
@@ -1448,11 +1528,12 @@ const FlowChip: React.FC<{
       boxShadow: pulse ? `0 0 0 0 ${col}` : 'none',
       animation: pulse ? 'awu-flow-pulse 1.3s infinite' : 'none',
     }}>
-      <div style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
+      <button type="button" onClick={onSelect} aria-label={`查看 ${title} 阶段`} data-stage-status={status}
+        style={{ display: 'flex', alignItems: 'center', gap: 5, padding: '4px 0', border: 0, background: 'transparent', cursor: 'pointer', textAlign: 'left' }}>
         <span style={{ width: 7, height: 7, borderRadius: '50%', background: col, flexShrink: 0,
           animation: pulse ? 'awu-loop-pulse 1.2s infinite' : 'none' }} />
         <span style={{ fontSize: 12, fontWeight: 700, color: 'var(--theme-text)' }}>{title}</span>
-      </div>
+      </button>
       {sub && <span style={{ fontSize: 10.5, color: 'var(--theme-text-muted)' }}>{sub}</span>}
       {dur && <span style={{ fontSize: 10.5, color: col, fontFamily: 'monospace', fontWeight: 600 }}>⏱ {dur}</span>}
       {tag && <div style={{ marginTop: 1 }}>{tag}</div>}
@@ -1462,7 +1543,9 @@ const FlowChip: React.FC<{
             const sc = FLOW_STATUS_COLOR[s.status === 'pending' ? 'pending' : s.status] || FLOW_STATUS_COLOR.pending;
             const d = s.startedAt ? ((s.endedAt || (s.status === 'running' ? (now || Date.now() / 1000) : 0)) - s.startedAt) : 0;
             return (
-              <div key={s.index} title={s.desc} style={{ display: 'flex', alignItems: 'center', gap: 4, maxWidth: 200 }}>
+              <button type="button" key={s.index} title={s.desc} aria-label={`查看步骤 ${s.index}：${s.desc}`}
+                onClick={() => onSelectStep ? onSelectStep(s.index) : onSelect?.()}
+                style={{ display: 'flex', alignItems: 'center', gap: 4, maxWidth: 200, padding: '4px 0', border: 0, background: 'transparent', cursor: 'pointer', textAlign: 'left' }}>
                 <span style={{ width: 6, height: 6, borderRadius: '50%', background: sc, flexShrink: 0,
                   animation: s.status === 'running' ? 'awu-loop-pulse 1.2s infinite' : 'none' }} />
                 <span style={{ fontSize: 10, color: 'var(--theme-text-muted)' }}>
@@ -1471,7 +1554,7 @@ const FlowChip: React.FC<{
                 </span>
                 <span style={{ fontSize: 10, color: 'var(--theme-text)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1 }}>{s.desc}</span>
                 {d > 0 && <span style={{ fontSize: 9.5, color: sc, fontFamily: 'monospace', flexShrink: 0 }}>{fmtDur(d)}</span>}
-              </div>
+              </button>
             );
           })}
         </div>
@@ -1480,7 +1563,7 @@ const FlowChip: React.FC<{
   );
 };
 
-const LoopNode: React.FC<{ loop: LoopRecord; selected: boolean; onClick: () => void }> = ({ loop, selected, onClick }) => {
+const LoopNode: React.FC<{ loop: LoopRecord; selected: boolean; onClick: () => void; onStage: (target: DetailTarget) => void }> = ({ loop, selected, onClick, onStage }) => {
   const score = loop.analysis?.score ?? null;
   const subIdx = SUB_ORDER.indexOf(loop.subStage);
   const manual = loop.kind === 'manual';
@@ -1503,9 +1586,10 @@ const LoopNode: React.FC<{ loop: LoopRecord; selected: boolean; onClick: () => v
       {/* 子阶段进度 */}
       {!manual && <div style={{ display: 'flex', gap: 4, marginBottom: 8 }}>
         {SUB_ORDER.slice(0, 3).map((s, i) => (
-          <div key={s} style={{
-            flex: 1, height: 4, borderRadius: 2,
-            background: loop.error ? '#f87171' : i < subIdx ? 'var(--theme-accent)' : i === subIdx && !loop.completed ? 'var(--theme-accent)' : i < subIdx || loop.completed ? 'var(--theme-accent)' : 'var(--theme-bg-tertiary)',
+          <button type="button" key={s} aria-label={`查看 Loop #${loop.seq} ${s} 阶段`} title={`${SUB_LABEL[s]} · ${STAGE_STATUS_LABEL[stageStatus(loop, s, false)]}`}
+            onClick={event => { event.stopPropagation(); onStage(s as DetailTarget); }} style={{
+            flex: 1, height: 14, border: 0, borderRadius: 2, cursor: 'pointer',
+            background: FLOW_STATUS_COLOR[stageStatus(loop, s, false)],
             opacity: i === subIdx && !loop.completed ? 0.6 : 1,
             animation: i === subIdx && !loop.completed ? 'awu-loop-pulse 1.2s infinite' : 'none',
           }} />
@@ -1514,6 +1598,11 @@ const LoopNode: React.FC<{ loop: LoopRecord; selected: boolean; onClick: () => v
       <div style={{ fontSize: 11, color: 'var(--theme-text-muted)' }}>
         {loop.error ? '❌ 失败' : manual ? (loop.completed ? '✓ 已交还 LOOP' : '✋ 人工接管中') : loop.completed ? '✓ 完成' : `${SUB_LABEL[loop.subStage] || loop.subStage}…`}
       </div>
+      {Object.entries(loop.stageDetails || {}).filter(([, value]) => ['degraded', 'retrying', 'error'].includes(value.status || '')).map(([stage, value]) => (
+        <div key={stage} style={{ marginTop: 4, color: FLOW_STATUS_COLOR[value.status || 'pending'], fontSize: 11 }}>
+          {SUB_LABEL[stage]} · {STAGE_STATUS_LABEL[value.status || 'pending']}
+        </div>
+      ))}
       {loop.orchestration.length > 0 && !loop.completed && (
         <div style={{ fontSize: 10, color: 'var(--theme-text-muted)', marginTop: 3 }}>
           步骤 {loop.orchestration.filter((s) => s.status === 'done').length}/{loop.orchestration.length}
@@ -1544,16 +1633,17 @@ function groupSteps(steps: LoopStep[]): LoopStep[][] {
 const STEP_ICON: Record<string, string> = { pending: '○', running: '⏳', done: '✓', error: '✗' };
 const STEP_COLOR: Record<string, string> = { pending: 'var(--theme-text-muted)', running: '#0969da', done: '#2da44e', error: '#f87171' };
 
-const StepRow: React.FC<{ step: LoopStep; live?: string }> = ({ step, live }) => {
-  const [open, setOpen] = useState(false);
-  const body = step.status === 'running' && live ? live : step.output;
-  const canExpand = !!body || step.status === 'running';
+const StepRow: React.FC<{ step: LoopStep; live?: string; expanded?: boolean }> = ({ step, live, expanded = false }) => {
+  const [open, setOpen] = useState(expanded);
+  useEffect(() => { if (expanded) setOpen(true); }, [expanded]);
+  const body = step.status === 'running' && live ? live : step.output || live;
+  const canExpand = true;
   const description = step.desc?.trim();
   return (
     <div style={{ marginBottom: 6 }}>
-      <div
+      <button type="button" aria-expanded={open} aria-label={`步骤 ${step.index} 详情`}
         onClick={() => (canExpand ? setOpen(!open) : undefined)}
-        style={{ display: 'flex', alignItems: 'baseline', gap: 6, cursor: canExpand ? 'pointer' : 'default' }}
+        style={{ display: 'flex', width: '100%', textAlign: 'left', padding: '4px 0', border: 0, background: 'transparent', alignItems: 'baseline', gap: 6, cursor: 'pointer' }}
       >
         <span style={{ color: STEP_COLOR[step.status] || 'var(--theme-text-muted)', fontSize: 13,
           animation: step.status === 'running' ? 'awu-loop-pulse 1.2s infinite' : 'none' }}>
@@ -1569,7 +1659,7 @@ const StepRow: React.FC<{ step: LoopStep; live?: string }> = ({ step, live }) =>
           </span>
         )}
         {canExpand && <span style={{ fontSize: 11, color: 'var(--theme-text-muted)' }}>{open ? '收起' : '展开'}</span>}
-      </div>
+      </button>
       {!!step.recoveryNotes?.length && (
         <div style={{ marginLeft: 22, marginTop: 4, color: '#d29922', fontSize: 11, lineHeight: 1.45 }}>
           {step.recoveryNotes[step.recoveryNotes.length - 1]}
@@ -1581,22 +1671,51 @@ const StepRow: React.FC<{ step: LoopStep; live?: string }> = ({ step, live }) =>
           : body
             ? <div style={{ marginLeft: 22, marginTop: 4, background: 'var(--theme-code-bg)', borderRadius: 6, padding: '6px 10px' }}><Md text={body} /></div>
             : <div style={{ marginLeft: 22, marginTop: 4, color: 'var(--theme-text-muted)', fontSize: 11 }}>
-                正在等待该步骤的新实时输出…
+                {step.status === 'pending' ? '该步骤尚未开始。' : step.status === 'running' ? '正在等待该步骤的新实时输出…' : '该步骤已结束，暂无已加载的文本产出。可通过上方按钮重新加载详情。'}
               </div>
       )}
     </div>
   );
 };
 
-const LoopDetail: React.FC<{ loop: LoopRecord; progress: Record<string, string>; onClose: () => void }> = ({ loop, progress, onClose }) => {
+const StageAudit: React.FC<{ stage: string; detail?: StageDetail; live?: string }> = ({ stage, detail, live }) => (
+  <Section title={`${SUB_LABEL[stage]} · 阶段记录`}>
+    {detail?.status && <div style={{ color: FLOW_STATUS_COLOR[detail.status], marginBottom: 6 }}>
+      {STAGE_STATUS_LABEL[detail.status] || detail.status}{detail.attemptCount ? ` · ${detail.attemptCount} 次尝试` : ''} · {detail.message}
+    </div>}
+    {(detail?.attempts || []).map((attempt, index) => (
+      <div key={index} style={{ margin: '8px 0', padding: '8px 10px', border: '1px solid var(--theme-border)', borderRadius: 6 }}>
+        <div style={{ color: attempt.valid ? '#2da44e' : '#bf8700', fontSize: 12 }}>第 {index + 1} 次 · {attempt.kind === 'initial' ? '首次规划' : attempt.kind === 'retry' ? '重试' : '重规划'} · {attempt.valid ? '结构校验通过' : '结构校验失败'}</div>
+        <div style={{ fontSize: 12, margin: '5px 0' }}>{attempt.validation.join(' ')}</div>
+        <details><summary style={{ cursor: 'pointer' }}>原始输出 · 第 {index + 1} 次</summary><pre style={auditPreStyle}>{attempt.rawOutput || '（无文本输出）'}</pre></details>
+        <details><summary style={{ cursor: 'pointer' }}>解析后的计划 · 第 {index + 1} 次</summary><pre style={auditPreStyle}>{attempt.parsed ? JSON.stringify(attempt.parsed, null, 2) : '未解析出 JSON 对象'}</pre></details>
+      </div>
+    ))}
+    {detail?.validation && <div style={{ marginBottom: 8 }}>{detail.validation.join(' ')}</div>}
+    {detail?.rawOutput && <details><summary style={{ cursor: 'pointer' }}>阶段原始输出</summary><pre style={auditPreStyle}>{detail.rawOutput}</pre></details>}
+    {detail?.parsed != null && <details><summary style={{ cursor: 'pointer' }}>解析结果</summary><pre style={auditPreStyle}>{JSON.stringify(detail.parsed, null, 2)}</pre></details>}
+    {detail?.partialOutput && <details><summary style={{ cursor: 'pointer' }}>中断前的输出尾部（非完整结果）</summary><pre style={auditPreStyle}>{detail.partialOutput}</pre></details>}
+    {live && (detail?.status === 'running' || detail?.status === 'retrying' || !detail) && <Live text={live} />}
+    {!detail && !live && <div style={{ color: 'var(--theme-text-muted)', fontSize: 12 }}>暂无阶段原文：可能尚未开始，或旧版本未保存；不会把其他阶段的内容当作此阶段结果。</div>}
+  </Section>
+);
+const auditPreStyle: React.CSSProperties = { whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', maxHeight: 350, overflow: 'auto', fontSize: 12, background: 'var(--theme-code-bg)', padding: 10 };
+
+const LoopDetail: React.FC<{
+  loop: LoopRecord; progress: Record<string, string>; onClose: () => void;
+  target: DetailTarget; onTarget: (target: DetailTarget) => void; error?: string; onRetry: () => void;
+}> = ({ loop, progress, onClose, target, onTarget, error, onRetry }) => {
   const liveExec = progress[`${loop.seq}:execute`];
   const livePrep = progress[`${loop.seq}:prepare`];
   const liveAna = progress[`${loop.seq}:analysis`];
-  const groups = groupSteps(loop.orchestration);
+  const targetStage = target.startsWith('step') ? 'execute' : target;
+  const show = (stage: string) => targetStage === 'all' || targetStage === stage;
+  const groups = groupSteps(target.startsWith('step') ? loop.orchestration.filter(step => `step${step.index}` === target) : loop.orchestration);
   if (loop.detailLoaded === false) {
     return (
       <div style={{ ...sealBox, marginTop: 4, color: 'var(--theme-text-muted)', fontSize: 12 }}>
-        正在按需加载 Loop #{loop.seq} 详情…
+        {error ? <span role="alert">{error} <button type="button" style={btn} onClick={onRetry}>重试加载详情</button></span> : `正在按需加载 Loop #${loop.seq} 详情…`}
+        <button type="button" onClick={onClose} style={miniX}>✕</button>
       </div>
     );
   }
@@ -1656,14 +1775,23 @@ const LoopDetail: React.FC<{ loop: LoopRecord; progress: Record<string, string>;
     );
   }
   return (
-    <div style={{ ...sealBox, marginTop: 4 }}>
+    <div aria-label={`Loop #${loop.seq} 阶段详情`} style={{ ...sealBox, marginTop: 4 }}>
       <div style={{ display: 'flex', alignItems: 'center', marginBottom: 10 }}>
         <span style={{ fontSize: 14, fontWeight: 700, color: 'var(--theme-text)' }}>Loop #{loop.seq} 详情</span>
         <div style={{ flex: 1 }} />
+        <button type="button" onClick={onRetry} style={btn}>重新加载详情</button>
         <button onClick={onClose} style={miniX}>✕</button>
       </div>
 
-      <Section title="本次增量焦点">
+      {error && <div role="alert" style={{ color: '#f87171', marginBottom: 8 }}>{error}（保留已加载的内容）</div>}
+      <div role="group" aria-label="阶段详情切换" style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginBottom: 12 }}>
+        {(['all', 'prepare', 'execute', 'analysis'] as const).map(stage => <button type="button" key={stage} aria-pressed={targetStage === stage}
+          onClick={() => onTarget(stage)} style={{ ...btn, ...(targetStage === stage ? { borderColor: 'var(--theme-accent)', color: 'var(--theme-accent)' } : {}) }}>
+          {stage === 'all' ? '全部' : SUB_LABEL[stage]}
+        </button>)}
+      </div>
+
+      {show('prepare') && <Section title="本次增量焦点">
         <div style={{ display: 'flex', alignItems: 'center', gap: 7, marginBottom: loop.evolutionBasis ? 6 : 0 }}>
           <Badge text={loop.iterationMode === 'evolution' ? '增量演进' : '基线核实'} color="#2563eb" />
           <div style={{ flex: 1 }}>{loop.goal ? <Md text={loop.goal} /> : '—'}</div>
@@ -1676,35 +1804,41 @@ const LoopDetail: React.FC<{ loop: LoopRecord; progress: Record<string, string>;
             </div>
           </details>
         )}
-      </Section>
+      </Section>}
+      {show('prepare') && <StageAudit stage="prepare" detail={loop.stageDetails?.prepare} live={livePrep} />}
+      {targetStage === 'prepare' && <Section title="规范化执行计划">
+        {loop.orchestration.length ? <ol>{loop.orchestration.map(step => <li key={step.index}>[{step.mode} / {step.access || 'write'}] {step.desc}</li>)}</ol> : '尚未获得有效步骤。'}
+      </Section>}
 
-      <Section title="编排与分步执行（点步可展开产出）" extra={(
+      {show('execute') && <Section title="编排与分步执行（点步可展开产出）" extra={(
         <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4, flexWrap: 'wrap' }}>
           <BackendTag role="prepare" label={loop.backendLabels?.prepare} />
           <BackendTag role="execute" label={loop.backendLabels?.execute} />
         </span>
       )}>
-        {loop.orchestration.length === 0 ? (livePrep ? <Live text={livePrep} /> : '—') : (
+        {loop.orchestration.length === 0 ? '尚未获得执行步骤；规划进度请查看 Prepare 阶段。' : (
           <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
             {groups.map((g, gi) => g.length > 1 ? (
               // 并行组：左侧竖条 + 「并行」标识
               <div key={gi} style={{ borderLeft: '3px solid #8957e5', paddingLeft: 10, background: '#8957e50d', borderRadius: 6, padding: '6px 10px' }}>
                 <div style={{ fontSize: 11, fontWeight: 700, color: '#8957e5', marginBottom: 4 }}>⚡ 并行执行（{g.length} 步同时）</div>
-                {g.map((s) => <StepRow key={s.index} step={s} live={progress[`${loop.seq}:step${s.index}`]} />)}
+                {g.map((s) => <StepRow key={s.index} step={s} live={progress[`${loop.seq}:step${s.index}`]} expanded={target === `step${s.index}`} />)}
               </div>
             ) : (
-              <div key={gi}><StepRow step={g[0]} live={progress[`${loop.seq}:step${g[0].index}`]} /></div>
+              <div key={gi}><StepRow step={g[0]} live={progress[`${loop.seq}:step${g[0].index}`]} expanded={target === `step${g[0].index}`} /></div>
             ))}
           </div>
         )}
-      </Section>
+      </Section>}
 
-      <Section title="本次执行结果" extra={<BackendTag role="execute" label={loop.backendLabels?.execute} />}>
+      {show('execute') && <StageAudit stage="execute" detail={loop.stageDetails?.execute} />}
+      {show('execute') && <Section title="本次执行结果" extra={<BackendTag role="execute" label={loop.backendLabels?.execute} />}>
         {loop.result ? <Md text={loop.result} />
           : liveExec ? <Live text={liveExec} /> : '—'}
-      </Section>
+      </Section>}
 
-      {loop.analysis ? (
+      {show('analysis') && <StageAudit stage="analysis" detail={loop.stageDetails?.analysis} />}
+      {show('analysis') && (loop.analysis ? (
         <Section title={`累计目标诊断 · 整体分数 ${loop.analysis.score.toFixed(0)}`}
           extra={<BackendTag role="analysis" label={loop.backendLabels?.analysis} />}>
           <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginBottom: 8 }}>
@@ -1736,7 +1870,7 @@ const LoopDetail: React.FC<{ loop: LoopRecord; progress: Record<string, string>;
           {loop.analysis.challenges && <div style={{ fontSize: 12, color: '#bf8700', marginTop: 6 }}>⚠ 约束：{loop.analysis.challenges}</div>}
         </Section>
       ) : liveAna ? <Section title="累计目标诊断（进行中）"
-          extra={<BackendTag role="analysis" label={loop.backendLabels?.analysis} />}><Live text={liveAna} /></Section> : null}
+          extra={<BackendTag role="analysis" label={loop.backendLabels?.analysis} />}><Live text={liveAna} /></Section> : null)}
 
       {loop.error && <Section title="错误"><span style={{ color: '#f87171' }}>{loop.error}</span></Section>}
     </div>

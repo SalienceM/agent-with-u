@@ -1,5 +1,5 @@
 import React, { useEffect, useState, useCallback, memo, useRef, useMemo, useLayoutEffect } from 'react';
-import { api, isTauri, onExecStatus } from '../api';
+import { api, getHomeExecKey, isTauri, onExecStatus, onCurrentUserChanged } from '../api';
 import { FileTreePanel } from './FileTreePanel';
 import type { AttentionContext } from '../utils/attentionContext';
 import type { FileFocusRequest } from '../utils/fileFocus';
@@ -14,7 +14,7 @@ interface Session {
   updatedAt: number;
   workingDir: string;
   backendId: string;
-  abilities?: { skills: string[]; prompts: string[] };
+  abilities?: { skills: string[]; prompts: string[]; constraints?: string };
   // ★ session 级执行节点归属（由 api.listSessions 合并时注入）
   execKey?: string;
   execLabel?: string;
@@ -90,6 +90,12 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
   const [abilityPickerSession, setAbilityPickerSession] = useState<Session | null>(null);
   const [availablePrompts, setAvailablePrompts] = useState<any[]>([]);
   const [availableSkills, setAvailableSkills] = useState<any[]>([]);
+  const [abilityLoading, setAbilityLoading] = useState(false);
+  const [abilityReady, setAbilityReady] = useState(false);
+  const [abilityError, setAbilityError] = useState('');
+  const [abilitySaving, setAbilitySaving] = useState(false);
+  const abilityGeneration = useRef(0);
+  const abilitySaveBusy = useRef(false);
   const [renamingSessionId, setRenamingSessionId] = useState<string | null>(null);
   const [renameValue, setRenameValue] = useState('');
   const [searchQuery, setSearchQuery] = useState('');
@@ -127,15 +133,75 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
   }, [refresh]);
 
   // ★ 能力绑定
-  const openAbilityPicker = useCallback(async (session: Session, e: React.MouseEvent) => {
+  const loadAbilityPicker = useCallback(async (session: Session) => {
+    const generation = ++abilityGeneration.current;
+    setAbilityLoading(true);
+    setAbilityReady(false);
+    setAbilityError('');
+    setAvailableSkills([]);
+    setAvailablePrompts([]);
+    try {
+      const execKey = session.execKey || getHomeExecKey();
+      const [latestSession, sk, pr] = await Promise.all([
+        api.loadSessionMeta(session.id),
+        api.listSkills(session.workingDir || '', execKey),
+        api.listPrompts(execKey),
+      ]);
+      if (generation !== abilityGeneration.current) return;
+      if (!latestSession) throw new Error('无法读取会话信息，请检查节点连接后重试');
+      setAbilityPickerSession({ ...session, ...latestSession, execKey });
+      setConstraintsValue(latestSession.abilities?.constraints || '');
+      setAvailableSkills(sk);
+      setAvailablePrompts(pr);
+      setAbilityReady(true);
+    } catch (error) {
+      if (generation === abilityGeneration.current) setAbilityError(error instanceof Error ? error.message : String(error));
+    } finally {
+      if (generation === abilityGeneration.current) setAbilityLoading(false);
+    }
+  }, []);
+
+  const closeAbilityPicker = useCallback(() => {
+    ++abilityGeneration.current;
+    setAbilityPickerSession(null);
+    setPreviewContent(null);
+    setItemToDelete(null);
+  }, []);
+
+  useEffect(() => () => { ++abilityGeneration.current; }, []);
+  useEffect(() => onCurrentUserChanged((_profile, changed) => {
+    if (changed) closeAbilityPicker();
+  }), [closeAbilityPicker]);
+
+  const openAbilityPicker = useCallback((session: Session, e: React.MouseEvent) => {
     e.stopPropagation();
-    // 先从服务器获取会话的最新数据，确保 abilities 是最新的
-    const latestSession = await api.loadSession(session.id);
-    setAbilityPickerSession(latestSession);
-    const [sk, pr] = await Promise.all([api.listSkills(latestSession.workingDir || ''), api.listPrompts()]);
-    setAvailableSkills(sk || []);
-    setAvailablePrompts(pr || []);
-  }, [api]);
+    setAbilityPickerSession(session);
+    setPreviewContent(null);
+    setItemToDelete(null);
+    void loadAbilityPicker(session);
+  }, [loadAbilityPicker]);
+
+  const saveAbilities = useCallback(async (abilities: NonNullable<Session['abilities']>, close = false) => {
+    if (!abilityPickerSession || !abilityReady || abilitySaveBusy.current) return;
+    const session = abilityPickerSession;
+    const generation = abilityGeneration.current;
+    abilitySaveBusy.current = true;
+    setAbilitySaving(true);
+    setAbilityError('');
+    try {
+      const result = await api.updateSessionAbilities(session.id, abilities, session.execKey || getHomeExecKey());
+      if (result.status !== 'ok') throw new Error(result.message || '能力绑定保存失败');
+      if (generation !== abilityGeneration.current) return;
+      setSessions(prev => prev.map(item => item.id === session.id ? { ...item, abilities } : item));
+      setAbilityPickerSession({ ...session, abilities });
+      if (close) closeAbilityPicker();
+    } catch (error) {
+      if (generation === abilityGeneration.current) setAbilityError(error instanceof Error ? error.message : String(error));
+    } finally {
+      abilitySaveBusy.current = false;
+      setAbilitySaving(false);
+    }
+  }, [abilityPickerSession, abilityReady, closeAbilityPicker]);
 
   // ★ 删除技能/提示确认
   const [itemToDelete, setItemToDelete] = useState<{ type: 'skills' | 'prompts', name: string } | null>(null);
@@ -149,11 +215,10 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
     if (idx >= 0) {
       list.splice(idx, 1);
       const newAbilities = { ...current, [type]: list };
-      await api.updateSessionAbilities(abilityPickerSession.id, newAbilities);
-      setAbilityPickerSession({ ...abilityPickerSession, abilities: newAbilities });
+      await saveAbilities(newAbilities);
     }
     setItemToDelete(null);
-  }, [itemToDelete, abilityPickerSession]);
+  }, [itemToDelete, abilityPickerSession, saveAbilities]);
 
   // ★ 预览内容状态
   const [previewContent, setPreviewContent] = useState<string | null>(null);
@@ -185,10 +250,8 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
     const idx = list.indexOf(name);
     if (idx >= 0) list.splice(idx, 1); else list.push(name);
     const newAbilities = { ...current, [type]: list };
-    await api.updateSessionAbilities(abilityPickerSession.id, newAbilities);
-    setAbilityPickerSession({ ...abilityPickerSession, abilities: newAbilities });
-    refresh();
-  }, [abilityPickerSession, refresh]);
+    await saveAbilities(newAbilities);
+  }, [abilityPickerSession, saveAbilities]);
 
   useEffect(() => {
     api.getBackends().then(setBackends);
@@ -1065,9 +1128,11 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
 
       {/* 能力绑定面板 */}
       {abilityPickerSession && (
-        <div ref={pickerRef} style={overlayStyle} onClick={() => setAbilityPickerSession(null)}>
-          <div style={{
+        <AppModalPortal>
+        <div ref={pickerRef} style={overlayStyle}>
+          <div role="dialog" aria-label="绑定能力" aria-busy={abilityLoading || abilitySaving} style={{
             ...confirmPanelStyle,
+            padding: isMobile ? 12 : 20,
             maxWidth: 720,
             width: '90%',
             height: '80vh',
@@ -1081,7 +1146,7 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
                 编辑会话
                 <span style={{ marginLeft: 6, color: 'var(--theme-accent)', fontSize: 13, fontWeight: 500 }}>"{abilityPickerSession.title}"</span>
               </span>
-              <button onClick={() => setAbilityPickerSession(null)} style={{
+              <button aria-label="关闭绑定能力" onClick={closeAbilityPicker} style={{
                 fontSize: 14, padding: '2px 6px', borderRadius: 4,
                 border: '1px solid var(--theme-border)', background: 'transparent',
                 color: 'var(--theme-text-muted)', cursor: 'pointer', width: 24, height: 24,
@@ -1091,16 +1156,26 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
               </button>
             </div>
 
+            <div style={{ fontSize: 12, color: 'var(--theme-text-muted)', marginBottom: 8 }}>
+              能力库节点：{abilityPickerSession.execLabel || abilityPickerSession.execKey || '默认执行节点'} · 绑定后在执行前准备 Skill 文件
+            </div>
+            {abilityLoading && <div role="status">正在加载能力库…</div>}
+            {abilitySaving && <div role="status">正在保存绑定…</div>}
+            {abilityError && <div role="alert" style={{ color: '#ef4444', marginBottom: 8 }}>
+              {abilityError}
+              {!abilityReady && <button style={{ ...confirmBtnStyle, marginLeft: 8, padding: '3px 8px', fontSize: 11 }} onClick={() => void loadAbilityPicker(abilityPickerSession)}>重试加载</button>}
+            </div>}
+
             {/* 主体内容：上下布局 */}
-            <div style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: 16, minHeight: 0 }}>
+            <div style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: 16, minHeight: 0, overflowY: 'auto', pointerEvents: !abilityReady || abilitySaving ? 'none' : undefined, opacity: abilitySaving ? 0.6 : 1 }}>
               {/* 上方：Skills 和 Prompts 左右分栏 - 占 45% */}
-              <div style={{ flex: '0 0 45%', display: 'flex', gap: 16, minHeight: 0 }}>
+              <div style={{ flex: '0 0 45%', display: 'flex', flexDirection: isMobile ? 'column' : 'row', gap: 12, minHeight: isMobile ? 220 : 140 }}>
                 {/* Skills 列 */}
                 <div style={{ flex: 1, display: 'flex', flexDirection: 'column', minWidth: 0 }}>
                   <div style={{ fontSize: 11, fontWeight: 600, color: 'var(--theme-text)', marginBottom: 6, textTransform: 'uppercase' }}>⚡ Skills</div>
                   <div style={{
                     flex: 1, overflowY: 'auto', border: '1px solid var(--theme-border)',
-                    borderRadius: 8, overflow: 'hidden', padding: '4px'
+                    borderRadius: 8, overflowX: 'hidden', padding: '4px'
                   }}>
                     {availableSkills.length > 0 ? (
                       availableSkills.map((sk: any) => {
@@ -1123,8 +1198,8 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
                             }}>
                               {bound && <div style={{ width: 6, height: 6, background: '#fff', borderRadius: 1 }} />}
                             </div>
-                            <span style={{ flex: 1, fontSize: 12, color: 'var(--theme-text)' }}>{sk.name}</span>
-                            <div style={{ display: 'flex', gap: 6 }}>
+                            <span style={{ flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontSize: 12, color: 'var(--theme-text)' }} title={sk.name}>{sk.name}</span>
+                            <div style={{ display: 'flex', flexShrink: 0, whiteSpace: 'nowrap', gap: 6 }}>
                               <button
                                 onClick={(e) => { e.stopPropagation(); show_preview_skill(sk); }}
                                 style={{ fontSize: 10, padding: '2px 6px', borderRadius: 4, border: '1px solid var(--theme-border)', background: 'transparent', color: 'var(--theme-text-muted)', cursor: 'pointer' }}
@@ -1144,7 +1219,7 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
                       })
                     ) : (
                       <div style={{ padding: 12, textAlign: 'center', color: 'var(--theme-text-muted)', fontSize: 12 }}>
-                        暂无 Skills，请先在 Repo 中创建
+                        {abilityLoading ? '正在加载 Skills…' : abilityReady ? '该节点暂无 Skills，请先在此节点的 Repo 中创建或安装' : 'Skills 未加载'}
                       </div>
                     )}
                   </div>
@@ -1155,7 +1230,7 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
                   <div style={{ fontSize: 11, fontWeight: 600, color: 'var(--theme-text)', marginBottom: 6, textTransform: 'uppercase' }}>📝 Prompts</div>
                   <div style={{
                     flex: 1, overflowY: 'auto', border: '1px solid var(--theme-border)',
-                    borderRadius: 8, overflow: 'hidden', padding: '4px'
+                    borderRadius: 8, overflowX: 'hidden', padding: '4px'
                   }}>
                     {availablePrompts.length > 0 ? (
                       availablePrompts.map((p: any) => {
@@ -1178,8 +1253,8 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
                             }}>
                               {bound && <div style={{ width: 6, height: 6, background: '#fff', borderRadius: 1 }} />}
                             </div>
-                            <span style={{ flex: 1, fontSize: 12, color: 'var(--theme-text)' }}>{p.icon || '📝'} {p.name}</span>
-                            <div style={{ display: 'flex', gap: 6 }}>
+                            <span style={{ flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontSize: 12, color: 'var(--theme-text)' }} title={p.name}>{p.icon || '📝'} {p.name}</span>
+                            <div style={{ display: 'flex', flexShrink: 0, whiteSpace: 'nowrap', gap: 6 }}>
                               <button
                                 onClick={(e) => { e.stopPropagation(); show_preview_prompt(p); }}
                                 style={{ fontSize: 10, padding: '2px 6px', borderRadius: 4, border: '1px solid var(--theme-border)', background: 'transparent', color: 'var(--theme-text-muted)', cursor: 'pointer' }}
@@ -1199,7 +1274,7 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
                       })
                     ) : (
                       <div style={{ padding: 12, textAlign: 'center', color: 'var(--theme-text-muted)', fontSize: 12 }}>
-                        暂无 Prompts，请先在 Repo 中创建
+                        {abilityLoading ? '正在加载 Prompts…' : abilityReady ? '该节点暂无 Prompts' : 'Prompts 未加载'}
                       </div>
                     )}
                   </div>
@@ -1207,7 +1282,7 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
               </div>
 
               {/* 下方：临时 Session 级约束 - 占 45% */}
-              <div style={{ flex: '0 0 45%', display: 'flex', flexDirection: 'column', minHeight: 0 }}>
+              <div style={{ flex: '1 0 auto', display: 'flex', flexDirection: 'column', minHeight: 210 }}>
                 <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--theme-text)', marginBottom: 6 }}>
                   临时约束/rule
                   <span style={{ marginLeft: 6, fontSize: 10, fontWeight: 400, color: 'var(--theme-text-muted)', background: 'var(--theme-accent-bg)', padding: '2px 8px', borderRadius: 4 }}>
@@ -1216,6 +1291,7 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
                 </div>
                 <div style={{ flex: 1, display: 'flex', flexDirection: 'column' }}>
                   <textarea
+                    disabled={!abilityReady || abilitySaving}
                     value={constraintsValue}
                     onChange={(e) => setConstraintsValue(e.target.value)}
                     onClick={(e) => e.stopPropagation()}
@@ -1235,11 +1311,11 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
                       清空约束
                     </button>
                     <button
+                      disabled={!abilityReady || abilitySaving}
                       onClick={() => {
                         const current = abilityPickerSession.abilities || { skills: [], prompts: [] };
                         const newAbilities = { ...current, constraints: constraintsValue };
-                        api.updateSessionAbilities(abilityPickerSession.id, newAbilities);
-                        setAbilityPickerSession(null);
+                        void saveAbilities(newAbilities, true);
                       }}
                       style={{ ...confirmBtnStyle, fontSize: 12, padding: '6px 16px' }}
                     >
@@ -1277,6 +1353,7 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
             )}
           </div>
         </div>
+        </AppModalPortal>
       )}
 
       {/* 受控渐变色板：只保存 preset id，不把任意 CSS 写入 Session。 */}

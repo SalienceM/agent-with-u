@@ -2020,8 +2020,15 @@ class BridgeWS:
             return await handler(*params)
         # 大目录扫描/遍历是磁盘密集型同步代码。留在 WebSocket 事件循环中会同时
         # 卡住心跳、Relay 和其它 RPC，客户端最终只能看到“无响应”。仅把这些
-        # 无共享状态的重任务放入工作线程，避免扩大其它状态型 RPC 的线程安全面。
-        if method in {"syncManifest", "syncFileList", "syncFileSearch"}:
+        # 无共享状态或已有 Store 锁保护的重任务放入工作线程。
+        if method in {
+            "syncManifest", "syncFileList", "syncFileSearch",
+            "listSkills", "saveSkill", "deleteSkill", "activateSkill",
+            "deactivateSkill", "renameSkill", "installSkillPackage",
+            "setSkillDefault", "getDefaultAbilities",
+            "listPrompts", "savePrompt", "deletePrompt", "renamePrompt",
+            "updatePromptIcon", "setPromptDefault",
+        }:
             return await asyncio.to_thread(handler, *params)
         return handler(*params)
 
@@ -3351,7 +3358,7 @@ class BridgeWS:
                 auto_commit_backend_id=source.auto_commit_backend_id,
             )
             self._active_sessions[new_session.id] = new_session
-            self._sync_backend_skills_to_directory(new_session)
+            # 分支只创建元数据；首次执行前才准备原生 Skill 文件。
             self._session_store.save(new_session, async_=True)
             self._emit_session_updated({
                 "type": "session_created",
@@ -3706,7 +3713,7 @@ class BridgeWS:
                 session.sandbox_enabled = payload.get("args", {}).get("enabled", True)
                 # 沙盒状态变更后重新组装 constraints（开启时注入沙盒约束，关闭时移除）
                 abilities = session.abilities or {}
-                self._apply_session_abilities(session, abilities)
+                self._apply_session_abilities(session, abilities, deploy=False)
                 self._session_store.save(session, async_=False)
             return json.dumps({"status": "ok", "sandboxEnabled": session.sandbox_enabled if session else True})
 
@@ -3901,9 +3908,9 @@ class BridgeWS:
             self._loop_create(session.id)
         # ★ 默认档自动绑定：新建 session 时把被标记为 isDefault 的 Prompt/Skill 全部挂上去
         try:
-            defaults = self._default_abilities()
+            defaults = await asyncio.to_thread(self._default_abilities)
             if defaults.get("skills") or defaults.get("prompts"):
-                self._apply_session_abilities(session, defaults)
+                await asyncio.to_thread(self._apply_session_abilities, session, defaults, deploy=False)
                 print(f"[BridgeWS] Auto-bound defaults to new session {session.id}: "
                       f"skills={defaults.get('skills')} prompts={defaults.get('prompts')}",
                       file=sys.stderr, flush=True)
@@ -4144,10 +4151,7 @@ class BridgeWS:
         if not session:
             return "null"
         self._active_sessions[sid] = session
-        # Backend Skill 模板可能在应用升级后改变（例如 Codex/Windows 从
-        # System32 bash/WSL 改为原生 PowerShell）。打开 Session 时即刷新，
-        # 不能等到下一次消息已经开始处理后才覆盖旧 SKILL.md。
-        self._sync_backend_skills_to_directory(session)
+        # 读取会话必须无部署副作用；模板/配套文件在模型执行前由工作线程准备。
         total = len(session.messages)
         truncated = bool(limit and limit > 0 and total > limit)
         data = session.to_dict(message_limit=(int(limit) if limit and limit > 0 else 0))
@@ -4904,6 +4908,12 @@ class BridgeWS:
             }
             if compact:
                 result = str(rec.get("result") or "")
+                rec["stageDetails"] = {
+                    name: {key: value for key, value in detail.items()
+                           if key in ("status", "attemptCount", "message")}
+                    for name, detail in rec.get("stageDetails", {}).items()
+                    if isinstance(detail, dict)
+                }
                 rec["resultPreview"] = result[:600]
                 rec["hasResult"] = bool(result)
                 rec["result"] = ""
@@ -5194,6 +5204,8 @@ class BridgeWS:
                 continue
             if record.sub_stage in (SUB_PREPARE, SUB_EXECUTE, SUB_ANALYSIS):
                 allowed.add(f"{record.seq}:{record.sub_stage}")
+            if record.stage_details.get(SUB_PREPARE, {}).get("status") == "retrying":
+                allowed.add(f"{record.seq}:{SUB_PREPARE}")
             for step in record.orchestration:
                 if step.status == "running":
                     allowed.add(f"{record.seq}:step{step.index}")
@@ -5330,6 +5342,8 @@ class BridgeWS:
         agent_session_id 显式传入时优先使用（不写回 session），用于 step 间线程上下文。
         backend_id 可为分析/转换步骤指定异构 backend（仅独立轮次用，找不到则回落会话 backend）。
         """
+        # 空绑定也需要撤销旧的托管目录，不能让 LOOP 原生发现已解绑的 Skill。
+        await self._prepare_session_skills(session)
         # LOOP 的 idea / goal / addon / execute 等入口最终都汇聚到这里。
         # 在模型调用边界统一展开引用，既保留 stage 文件里的用户原文，也避免
         # 每个上游流程分别实现一遍 @SESSION 语义。
@@ -6040,7 +6054,20 @@ class BridgeWS:
                   file=sys.stderr, flush=True)
             if record is not None and session_id not in self._loop_cancel:
                 record.error = str(e)
-                record.sub_stage = SUB_DONE
+                failed_stage = record.sub_stage
+                if record.stage_details.get(SUB_PREPARE, {}).get("status") == "retrying":
+                    failed_stage = SUB_PREPARE
+                detail = record.stage_details.setdefault(failed_stage, {})
+                detail.update({"status": "error", "message": str(e)})
+                partial = self._loop_progress_for_record(session_id, record.seq).get(f"{record.seq}:{failed_stage}", "")
+                if partial:
+                    detail["partialOutput"] = partial
+                for step in record.orchestration:
+                    if step.status == "running":
+                        step.status = "error"
+                        step.ended_at = time.time()
+                        step.output = self._loop_progress_for_record(session_id, record.seq).get(f"{record.seq}:step{step.index}", "") or step.output or str(e)
+                record.updated_at = time.time()
                 self._loop_save(state)
                 self._emit_loop_updated(state)
         finally:
@@ -6125,8 +6152,29 @@ class BridgeWS:
             state.stop_reason = ""
         return reverted
 
+    def _loop_audit_plan(self, record: "LoopRecord", text: str, kind: str) -> list[LoopStep]:
+        """保存每次规划原文和结构校验，不把校验通过混同于任务验收。"""
+        parsed = self._extract_json_block(text)
+        obj = parsed or {}
+        raw_steps = obj.get("orchestration") or obj.get("steps") or obj.get("plan") or []
+        steps = self._loop_parse_orchestration(raw_steps)
+        validation = (
+            [f"结构校验通过：{len(steps)} 个有效步骤；写操作已强制顺序执行。", "仅校验计划结构，不代表任务完成或验收通过。"]
+            if steps else ["未找到 JSON 对象。" if parsed is None else "计划无效：需要 1–4 个步骤，且每步必须有非空任务说明。"]
+        )
+        detail = record.stage_details.setdefault(SUB_PREPARE, {})
+        attempts = detail.setdefault("attempts", [])
+        attempts.append({"kind": kind, "rawOutput": text, "parsed": parsed,
+                         "valid": bool(steps), "validation": validation})
+        detail.update({"status": "done" if steps else "error", "attemptCount": len(attempts),
+                       "message": "结构校验通过" if steps else "规划结构校验失败"})
+        if steps and isinstance(obj.get("goal"), str) and obj["goal"].strip():
+            record.goal = obj["goal"].strip()
+        return steps
+
     async def _loop_do_prepare(self, session, state, record, history) -> None:
         record.sub_stage = SUB_PREPARE
+        record.stage_details.setdefault(SUB_PREPARE, {})["status"] = "running"
         record.mark_sub(SUB_PREPARE)
         # 规划拆步与逐步执行是两种能力：两者均可独立选择 backend / 模型；未配置时
         # 跟随会话 backend。同 backend 的 prepare 会继承 execute 模型，保持旧策略行为。
@@ -6230,10 +6278,8 @@ class BridgeWS:
             a.status = "applied"
             a.applied_seq = record.seq
             a.updated_at = time.time()
-        pj = self._extract_json_block(ptext) or {}
-        record.goal = (pj.get("goal") or "").strip() or state.goal
-        orch = pj.get("orchestration") or pj.get("steps") or pj.get("plan") or []
-        record.orchestration = self._loop_parse_orchestration(orch)
+        record.goal = state.goal
+        record.orchestration = self._loop_audit_plan(record, ptext, "initial")
         # ★ JSON 解析重试：模型输出不含有效编排（至少 1 个 step）时，补发一次更强约束的 prompt
         if not record.orchestration:
             retry_prompt = (
@@ -6246,6 +6292,10 @@ class BridgeWS:
                 "已满足的内容直接跳过。只输出 JSON，不要其他文字。\n\n"
                 f"【全局目标】\n{state.goal}\n\n【本次演进依据】\n{record.evolution_basis}\n"
             )
+            record.stage_details[SUB_PREPARE].update({"status": "retrying", "message": "规划结构校验失败，正在重试。"})
+            record.updated_at = time.time()
+            self._loop_save(state)
+            self._emit_loop_updated(state)
             rtext, _ = await self._loop_run_agent(
                 session, retry_prompt, SUB_PREPARE, record.seq,
                 resume=False,
@@ -6253,15 +6303,13 @@ class BridgeWS:
                 backend_id=requested_prepare_backend,
                 runtime=prepare_runtime,
             )
-            rj = self._extract_json_block(rtext) or {}
-            r_orch = rj.get("orchestration") or rj.get("steps") or rj.get("plan") or []
-            retry_steps = self._loop_parse_orchestration(r_orch)
+            retry_steps = self._loop_audit_plan(record, rtext, "retry")
             if retry_steps:
-                record.goal = (rj.get("goal") or "").strip() or record.goal
                 record.orchestration = retry_steps
                 print(f"[loop] prepare retry succeeded: {len(record.orchestration)} steps",
                       file=sys.stderr, flush=True)
             else:
+                record.stage_details[SUB_PREPARE].update({"status": "retrying", "message": "两次规划均未通过结构校验，将在执行前进行最后一次重规划。"})
                 print(f"[loop] prepare retry also empty — will re-plan at execute stage",
                       file=sys.stderr, flush=True)
         record.sub_stage = SUB_EXECUTE
@@ -6331,6 +6379,7 @@ class BridgeWS:
 
     async def _loop_do_execute(self, session, state, record) -> None:
         record.sub_stage = SUB_EXECUTE
+        record.stage_details.setdefault(SUB_EXECUTE, {})["status"] = "running"
         record.mark_sub(SUB_EXECUTE)
         # 本次实际执行选型在 prepare 时冻结；旧记录没有 execute 选型时才读取当前策略。
         execute_backend = record.backends.get("execute") or state.policy.backend_for("execute") or session.backend_id
@@ -6371,6 +6420,12 @@ class BridgeWS:
             self._emit_loop_updated(state)
         if not steps:
             # ★ 轻量 re-plan：prepare 两次都没产出编排时，在 execute 入口再尝试一次精简 prompt
+            record.stage_details.setdefault(SUB_PREPARE, {}).update({
+                "status": "retrying", "message": "未取得有效计划，正在重规划；尚未开始执行步骤。",
+            })
+            record.updated_at = time.time()
+            self._loop_save(state)
+            self._emit_loop_updated(state)
             replan_prompt = (
                 f"【全局目标】\n{state.goal or '(未设定)'}\n\n"
                 f"【本次演进依据】\n{record.evolution_basis or '（请从工作区核实现状）'}\n\n"
@@ -6385,40 +6440,36 @@ class BridgeWS:
                 "orchestration 至少 1 步。只输出 JSON，不要散文。"
             )
             rtext, _ = await self._loop_run_agent(
-                session, replan_prompt, SUB_EXECUTE, record.seq,
+                session, replan_prompt, SUB_PREPARE, record.seq,
                 resume=False,
                 indep_session_id=f"{session.id}:loop{record.seq}:replan",
                 backend_id=prepare_backend,
                 runtime=prepare_runtime,
             )
-            rj = self._extract_json_block(rtext) or {}
-            r_orch = rj.get("orchestration") or rj.get("steps") or rj.get("plan") or []
-            replan_steps = self._loop_parse_orchestration(r_orch)
+            replan_steps = self._loop_audit_plan(record, rtext, "replan")
             if replan_steps:
                 record.orchestration = replan_steps
                 steps = replan_steps
-                record.goal = (rj.get("goal") or "").strip() or record.goal
+                record.updated_at = time.time()
                 self._loop_save(state)
                 self._emit_loop_updated(state)
                 print(f"[loop] execute re-plan succeeded: {len(replan_steps)} steps",
                       file=sys.stderr, flush=True)
         if not steps:
-            # re-plan 也失败 → fallback 到一次最小增量推进（独立 session）
-            prompt = (
-                f"【全局目标】\n{state.goal}\n\n【本次演进依据】\n"
-                f"{record.evolution_basis or '（请先核实工作区现状）'}\n\n"
-                f"这是第 {record.seq} 次 loop。先核实当前产物，只处理一个最高价值剩余缺口或回归；"
-                "已有且验证通过的成果必须保留，不得从头重做或无收益地重复全量检查。"
-                "在工作目录内实际推进，完成后用 markdown 总结：本次增量贡献、产出/改动位置、"
-                "核实结果与失败项。"
-            )
-            record.result = (await self._loop_run_agent(
-                session, prompt, SUB_EXECUTE, record.seq,
-                resume=False,
+            # 保留既有最小增量降级策略，但生成可追溯的系统兜底步骤，不冒充规划成功。
+            record.stage_details[SUB_PREPARE].update({
+                "status": "degraded", "message": "规划重试耗尽，已降级为系统生成的单步最小增量执行；不是有效模型计划。",
+            })
+            fallback = LoopStep(index=1, desc="【降级执行】核实现状，保留已验证成果，只处理一个最高价值剩余缺口或回归，记录产出位置与验证结果。")
+            record.orchestration = [fallback]
+            record.updated_at = time.time()
+            self._loop_save(state)
+            self._emit_loop_updated(state)
+            await self._loop_run_step(
+                session, state, record, fallback, resume=False,
                 indep_session_id=f"{session.id}:loop{record.seq}:execute",
-                backend_id=execute_backend,
-                runtime=execute_runtime,
-            ))[0].strip()
+            )
+            record.result = fallback.output
         else:
             # 按编排执行：连续的 concurrent 步并行，sequential 步顺次
             # ★ 顺次 step 之间共享一个独立 agent session 保持连贯上下文
@@ -6468,6 +6519,11 @@ class BridgeWS:
                 backend_id=execute_backend,
                 runtime=execute_runtime,
             ))[0].strip()
+        record.stage_details[SUB_EXECUTE].update({
+            "status": "error" if any(s.status == "error" for s in record.orchestration) else "done",
+            "rawOutput": record.result,
+            "message": "步骤状态来自执行返回；是否满足目标仍需独立评审核实。",
+        })
         record.sub_stage = SUB_ANALYSIS
         record.updated_at = time.time()
         self._loop_save(state)
@@ -6625,6 +6681,7 @@ class BridgeWS:
 
     async def _loop_do_analysis(self, session, state, record) -> None:
         record.sub_stage = SUB_ANALYSIS
+        record.stage_details.setdefault(SUB_ANALYSIS, {})["status"] = "running"
         record.mark_sub(SUB_ANALYSIS)
         record.updated_at = time.time()
         self._loop_save(state)
@@ -6703,6 +6760,12 @@ class BridgeWS:
             runtime=analysis_runtime,
         )
         aj = self._extract_json_block(atext) or {}
+        valid_analysis = isinstance(aj.get("score"), (int, float)) and not isinstance(aj.get("score"), bool) and 0 <= aj["score"] <= 100
+        record.stage_details[SUB_ANALYSIS].update({
+            "rawOutput": atext, "parsed": aj,
+            "status": "done" if valid_analysis else "degraded",
+            "validation": ["已解析评审 JSON 和有效分数；这是结构校验，不代表验收通过。"] if valid_analysis else ["评审 JSON 或分数无效，已降级为兼容解析；请核对原文。"],
+        })
         try:
             score = float(aj.get("score", 0) or 0)
         except (TypeError, ValueError):
@@ -11710,7 +11773,7 @@ Kit 版本账本（版本属于 Kit，不属于 AI）：
             return json.dumps(skills, ensure_ascii=False)
         except Exception as e:
             print(f"[BridgeWS] listSkills error: {e}", file=sys.stderr)
-            return json.dumps([])
+            raise RuntimeError(f"Skill 库读取失败：{e}") from e
 
     def _rpc_saveSkill(self, name: str, content: str) -> str:
         """保存或更新孵化库中的 skill（同步到已激活位置）。"""
@@ -11793,6 +11856,18 @@ Kit 版本账本（版本属于 Kit，不属于 AI）：
                 try: _os.unlink(tmp_path)
                 except Exception: pass
 
+    def _rpc_skillMarketLocation(self) -> str:
+        """只读返回实际落盘位置；local/home 连接名称不代表浏览器所在机器。"""
+        import platform
+        import socket
+        from .skill_store import LIBRARY_DIR
+
+        return json.dumps({
+            "status": "ok", "host": socket.gethostname(), "platform": platform.system(),
+            "libraryPath": str(LIBRARY_DIR.resolve()),
+            "runtimePath": str(self._skill_runtime.root.resolve()),
+        }, ensure_ascii=False)
+
     async def _rpc_skillMarketList(self, query: str = "", refresh: bool = False, background: bool = False) -> str:
         """Browse portable Agent Skills from configured public GitHub sources."""
         try:
@@ -11836,7 +11911,7 @@ Kit 版本账本（版本属于 Kit，不属于 AI）：
         try:
             config = next((c for c in self._backend_configs if c.id == backend_id and c.enabled), None)
             if not config or config.type.value not in EXPLANATION_BACKENDS:
-                raise ValueError("请选择启用的 OpenAI 兼容或 Anthropic API Backend，用于无工具的中文解读")
+                raise ValueError("请选择已启用的 Codex、Qwen、Claude 或文本 API Backend，用于独立中文解读")
             result = self._skill_market_explainer.start(self._current_owner_id(), source_id,
                 path, digest, backend_id, bool(refresh))
             return json.dumps(result, ensure_ascii=False)
@@ -11966,7 +12041,7 @@ Kit 版本账本（版本属于 Kit，不属于 AI）：
             return json.dumps(self._prompt_store.list_prompts(), ensure_ascii=False)
         except Exception as e:
             print(f"[BridgeWS] listPrompts error: {e}", file=sys.stderr)
-            return json.dumps([])
+            raise RuntimeError(f"Prompt 库读取失败：{e}") from e
 
     def _rpc_savePrompt(self, name: str, content: str, icon: str = "📝") -> str:
         try:
@@ -12652,7 +12727,27 @@ except urllib.error.URLError as e:
             or info.get("type") in {"web-search", "web-fetch", "python-script"}
         )
 
-    def _sync_backend_skills_to_directory(self, session: Session):
+    async def _prepare_session_skills(self, session: Session) -> None:
+        """在执行边界冻结绑定；准备期间若改了选择，先补齐最新选择再启动模型。"""
+        import copy
+
+        for _attempt in range(3):
+            snapshot = copy.copy(session)
+            snapshot.abilities = copy.deepcopy(getattr(session, "abilities", None))
+            await asyncio.to_thread(self._sync_backend_skills_to_directory, snapshot)
+            if snapshot.abilities == getattr(session, "abilities", None):
+                return
+        raise RuntimeError("Skill 绑定在准备期间多次变化，请完成绑定后重试执行")
+
+    def _sync_backend_skills_to_directory(self, session: Session) -> None:
+        roots = self._skill_deploy_roots_for_session(session)
+        if not roots:
+            return
+        # 同一工作区的并行准备不得交错复制/清理；列表仍可使用独立的库读锁。
+        with self._skill_store._deployment_lock:
+            self._sync_backend_skills_to_directory_locked(session, roots)
+
+    def _sync_backend_skills_to_directory_locked(self, session: Session, roots: list[tuple[str, Path]]) -> None:
         """
         将 session 绑定的 Backend Skills 部署到本地 agent 原生目录：
         - Claude Code: working_dir/.claude/skills/
@@ -12661,10 +12756,6 @@ except urllib.error.URLError as e:
 
         同时清理不再绑定的系统部署 Backend Skill。
         """
-        roots = self._skill_deploy_roots_for_session(session)
-        if not roots:
-            return
-
         abilities = session.abilities or {}
         bound_skills = set(abilities.get("skills", []))
 
@@ -12728,8 +12819,10 @@ except urllib.error.URLError as e:
                 if SkillStore.is_managed_directory(target):
                     SkillStore.undeploy_from_directory(target)
                 target.mkdir(parents=True, exist_ok=True)
-                (target / "SKILL.md").write_text(skill_md, encoding="utf-8")
-                (target / "_call.py").write_text(call_py, encoding="utf-8")
+                for filename, content in (("SKILL.md", skill_md), ("_call.py", call_py)):
+                    path = target / filename
+                    if not path.exists() or path.read_text(encoding="utf-8") != content:
+                        path.write_text(content, encoding="utf-8")
                 print(f"[bridge_ws] Deployed Backend Skill '{sname}' → {target} ({agent_name})",
                       file=sys.stderr, flush=True)
 
@@ -12801,7 +12894,7 @@ except urllib.error.URLError as e:
             "违反沙盒约束的请求应拒绝并说明原因。"
         )
 
-    def _apply_session_abilities(self, session: Session, abilities: dict) -> None:
+    def _apply_session_abilities(self, session: Session, abilities: dict, *, deploy: bool = True) -> None:
         """
         把 abilities 绑定到 session：
           - 更新 session.abilities
@@ -12974,7 +13067,8 @@ except urllib.error.URLError as e:
 
         session.constraints = "\n\n---\n\n".join(parts) if parts else None
         # ★ Backend Skills：自动部署到当前 Agent 的原生项目 Skill 目录
-        self._sync_backend_skills_to_directory(session)
+        if deploy:
+            self._sync_backend_skills_to_directory(session)
 
     def _default_abilities(self) -> dict:
         """收集当前 PromptStore/SkillStore 中所有被标记为默认档的条目。"""
@@ -12990,14 +13084,29 @@ except urllib.error.URLError as e:
             default_skills = []
         return {"skills": default_skills, "prompts": default_prompts}
 
-    def _rpc_updateSessionAbilities(self, session_id: str, abilities_json: str) -> str:
+    async def _rpc_updateSessionAbilities(self, session_id: str, abilities_json: str) -> str:
         """绑定/解绑 skill 和 prompt 到 session。"""
         try:
             abilities = json.loads(abilities_json)
-            session = self._active_sessions.get(session_id) or self._session_store.load(session_id)
+            session = self._active_sessions.get(session_id)
+            if session is None:
+                loaded = await asyncio.to_thread(self._session_store.load, session_id)
+                session = self._active_sessions.get(session_id) or loaded
             if not session:
                 return json.dumps({"status": "error", "message": "Session not found"}, ensure_ascii=False)
-            self._apply_session_abilities(session, abilities)
+            if not isinstance(abilities, dict) or any(
+                not isinstance(abilities.get(key, []), list)
+                or not all(isinstance(name, str) for name in abilities.get(key, []))
+                for key in ("skills", "prompts")
+            ):
+                raise ValueError("能力绑定格式错误")
+            # 原生目录在执行前准备。绑定操作只保存选择，不复制大目录；构建约束
+            # 也离开事件循环，避免与市场安装持有的库锁一起卡住所有连接。
+            import copy
+            prepared = copy.copy(session)
+            await asyncio.to_thread(self._apply_session_abilities, prepared, abilities, deploy=False)
+            session.abilities = prepared.abilities
+            session.constraints = prepared.constraints
             self._active_sessions[session_id] = session
             self._session_store.save(session, async_=True)
             return json.dumps({"status": "ok"}, ensure_ascii=False)
@@ -15666,8 +15775,8 @@ except urllib.error.URLError as e:
                 "summary": session.meta_dict(),
             })
 
-            # ★ 每次发消息前重新部署 Backend Skill 文件，确保 SKILL.md 始终是最新模板
-            self._sync_backend_skills_to_directory(session)
+            # 文件准备必须在模型开始前完成，但磁盘工作不能阻塞心跳/Relay。
+            await self._prepare_session_skills(session)
 
             constraints = self._compose_constraints(session)
             if manual_context:

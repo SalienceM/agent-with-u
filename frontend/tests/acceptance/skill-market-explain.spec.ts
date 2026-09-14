@@ -38,7 +38,9 @@ test('explicit branch and AI original/explanation switch preserve source and iso
       });
       if (frame.method === 'getBackends') return reply([
         { id: 'text-api', label: '测试文本 API', type: 'openai-compatible', enabled: true },
-        { id: 'agent', label: '不能执行的 Agent', type: 'codex-office', enabled: true },
+        { id: 'agent', label: 'Codex 独立解读', type: 'codex-office', enabled: true },
+        { id: 'image', label: '图像 Backend', type: 'dashscope-image', enabled: true },
+        { id: 'disabled', label: '已禁用 Qwen', type: 'qwen-code-cli', enabled: false },
       ]);
       if (frame.method === 'skillMarketAddSource') { addCalls.push(frame.params); return reply({ status: 'ok' }); }
       if (frame.method === 'skillMarketExplainStart') {
@@ -82,7 +84,7 @@ test('explicit branch and AI original/explanation switch preserve source and iso
   await market.getByRole('button', { name: /来源与添加/ }).click();
   expect(generations).toBe(0);
   await expect(market.getByRole('combobox', { name: 'AI 解读 Backend' })).toHaveValue('text-api');
-  await expect(market.getByRole('combobox', { name: 'AI 解读 Backend' }).locator('option')).toHaveCount(1);
+  await expect(market.getByRole('combobox', { name: 'AI 解读 Backend' }).locator('option')).toHaveCount(2);
   await market.getByRole('button', { name: 'AI 中文解读', exact: true }).click();
   await expect(market.getByText(/正在生成中文解读/)).toBeVisible();
   await expect.poll(() => polls).toBe(1);
@@ -112,7 +114,7 @@ test('explicit branch and AI original/explanation switch preserve source and iso
   expect(pageErrors).toEqual([]);
 });
 
-test('missing text API backend is explicit and never starts an agent', async ({ page }) => {
+test('missing text-capable backend is explicit and never starts a job', async ({ page }) => {
   let calls = 0;
   await page.routeWebSocket(/.*/, socket => {
     const server = socket.connectToServer();
@@ -120,7 +122,7 @@ test('missing text API backend is explicit and never starts an agent', async ({ 
       let frame: any;
       try { frame = JSON.parse(String(message)); } catch { server.send(message); return; }
       const reply = (payload: any) => socket.send(JSON.stringify({ id: frame.id, result: JSON.stringify(payload) }));
-      if (frame.method === 'getBackends') return reply([{ id: 'agent', type: 'codex-office', label: 'Agent' }]);
+      if (frame.method === 'getBackends') return reply([{ id: 'image', type: 'dashscope-image', label: 'Image' }]);
       if (frame.method === 'skillMarketList') return reply({ status: 'ok', sources: [], directories: [], items: [makeItem('alpha')] });
       if (frame.method === 'skillMarketExplainStart') { calls++; return reply({ status: 'error' }); }
       server.send(message);
@@ -128,8 +130,37 @@ test('missing text API backend is explicit and never starts an agent', async ({ 
   });
   const market = await openMarket(page);
   await market.getByRole('button', { name: 'AI 中文解读', exact: true }).click();
-  await expect(market.getByRole('status')).toContainText('请先在 Backend 管理中配置');
+  await expect(market.getByRole('status')).toContainText('请先在 Backend 管理中启用');
   expect(calls).toBe(0);
   await market.getByRole('button', { name: '原文', exact: true }).click();
   await expect(market.getByRole('button', { name: '安装到 Skill 库', exact: true })).toBeDisabled();
 });
+
+for (const type of ['codex-office', 'qwen-code-cli', 'claude-agent-sdk', 'claude-code-official']) {
+  test(`${type} can explain an uninstalled skill without a text API backend`, async ({ page }) => {
+    const calls: unknown[][] = [];
+    await page.routeWebSocket(/.*/, socket => {
+      const server = socket.connectToServer();
+      socket.onMessage(message => {
+        let frame: any;
+        try { frame = JSON.parse(String(message)); } catch { server.send(message); return; }
+        const reply = (payload: any) => socket.send(JSON.stringify({ id: frame.id, result: JSON.stringify(payload) }));
+        if (frame.method === 'getBackends') return reply([{ id: 'agent', type, label: '现有 Agent', enabled: true }]);
+        if (frame.method === 'skillMarketList') return reply({ status: 'ok', sources: [], directories: [], items: [makeItem('alpha')] });
+        if (frame.method === 'skillMarketExplainStart') {
+          calls.push(frame.params);
+          return reply({ status: 'ok', state: 'done', jobId: 'isolated-job', text: '## 有什么用\n无需安装即可解读' });
+        }
+        if (frame.method === 'skillMarketInstall' || frame.method === 'sendMessage') throw new Error('Explanation must not install or start a chat');
+        server.send(message);
+      });
+    });
+    const market = await openMarket(page);
+    await expect(market.getByRole('combobox', { name: 'AI 解读 Backend' })).toHaveValue('agent');
+    await market.getByRole('button', { name: 'AI 中文解读', exact: true }).click();
+    await expect(market.getByText('无需安装即可解读', { exact: true })).toBeVisible();
+    expect(calls).toHaveLength(1);
+    expect(calls[0].slice(0, 4)).toEqual(['demo-source', 'skills/alpha', 'digest1', 'agent']);
+    await expect(market.getByRole('button', { name: '安装到 Skill 库', exact: true })).toBeDisabled();
+  });
+}

@@ -116,6 +116,7 @@ export const App: React.FC = () => {
   const repoPanelOpen = !chatWorkspaceVisible;
   const [skillLibraryRevision, setSkillLibraryRevision] = useState(0);
   const [marketRuntimeNames, setMarketRuntimeNames] = useState<string[]>([]);
+  const [marketRuntimeExecKey, setMarketRuntimeExecKey] = useState('');
   const [logViewerOpen, setLogViewerOpen] = useState(false);
   const [connPanelOpen, setConnPanelOpen] = useState(false);
   const [currentUser, setCurrentUser] = useState<CurrentUserProfile>(() => getCurrentUserProfile());
@@ -1780,16 +1781,20 @@ export const App: React.FC = () => {
           onSelect={selectWorkbenchTab} onClose={closeWorkbenchTab} />
         {workbench.tabs.includes('library') && <section id="workbench-panel-library" role="tabpanel" aria-labelledby="workbench-tab-library"
           hidden={workbench.active !== 'library'} style={{ display: workbench.active === 'library' ? 'flex' : 'none', flex: 1, minHeight: 0, overflow: 'hidden' }}>
-          <RepoPanel open embedded revision={skillLibraryRevision} workingDir={activeSession?.workingDir || ''}
+          <RepoPanel open={workbench.active === 'library'} embedded revision={skillLibraryRevision} workingDir=""
             onClose={() => closeWorkbenchTab('library')} onEditingChange={setRepoPanelEditing}
             onOpenMarket={() => dispatchWorkbench({ type: 'open', tab: 'market' })} />
         </section>}
         {workbench.tabs.includes('market') && <section id="workbench-panel-market" role="tabpanel" aria-labelledby="workbench-tab-market"
           hidden={workbench.active !== 'market'} style={{ display: workbench.active === 'market' ? 'flex' : 'none', flex: 1, minHeight: 0, overflow: 'hidden' }}>
           <SkillMarketDialog open embedded onClose={() => closeWorkbenchTab('market')}
-            onInstalled={name => { setSkillLibraryRevision(value => value + 1); if (name) setMarketRuntimeNames([name]); }} />
+            onInstalled={(name, execKey) => {
+              setSkillLibraryRevision(value => value + 1);
+              if (name) { setMarketRuntimeExecKey(execKey || getHomeExecKey()); setMarketRuntimeNames([name]); }
+            }} />
         </section>}
-        {marketRuntimeNames.length > 0 && <SkillRuntimeDialog names={marketRuntimeNames} onClose={() => setMarketRuntimeNames([])} />}
+        {marketRuntimeNames.length > 0 && <SkillRuntimeDialog key={`${marketRuntimeExecKey}:${marketRuntimeNames.join('|')}`}
+          names={marketRuntimeNames} initialExecKey={marketRuntimeExecKey} onClose={() => setMarketRuntimeNames([])} />}
 
         {/* ---- 分屏布局:1×1 / 1×2 / 2×2 ---- *
          * 每个 ChatPane 内部独立 useChat,有自己的消息流、滚动、权限气泡和 ChatInput。

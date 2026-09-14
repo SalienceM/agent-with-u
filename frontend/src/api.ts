@@ -527,6 +527,14 @@ export interface SkillMarketItem {
   conflict: boolean;
 }
 
+export interface SkillMarketLocation {
+  status: 'ok';
+  host: string;
+  platform: string;
+  libraryPath: string;
+  runtimePath: string;
+}
+
 export interface SkillMarketCatalog {
   status: 'ok' | 'error';
   message?: string;
@@ -1810,17 +1818,28 @@ async function callOnStrict(
   timeoutMs?: number,
 ): Promise<any> {
   const connection = connByKey(execKey);
-  await connection.ready;
+  const started = Date.now();
+  let readyTimer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([
+      connection.ready,
+      new Promise<never>((_, reject) => {
+        readyTimer = setTimeout(() => reject(new Error('执行端连接超时，请重试')), timeoutMs || 15000);
+      }),
+    ]);
+  } finally {
+    if (readyTimer) clearTimeout(readyTimer);
+  }
   if (!connection.isOpen) {
     throw new Error('执行端离线，请恢复连接后重试');
   }
-  return connection.request(method, params, timeoutMs);
+  return connection.request(method, params, timeoutMs ? Math.max(1, timeoutMs - (Date.now() - started)) : undefined);
 }
 
 async function marketBackgroundCall(
   method: string, params: any[], onProgress?: (text: string) => void, signal?: AbortSignal,
+  execKey: string = getHomeExecKey(),
 ): Promise<any> {
-  const execKey = getHomeExecKey();
   const identity = getCurrentUserProfile();
   const parse = (value: any) => typeof value === 'string' ? JSON.parse(value) : value;
   let result = parse(await callOnStrict(execKey, method, [...params, true], 15000));
@@ -1828,8 +1847,8 @@ async function marketBackgroundCall(
   while (result?.jobId && result.state === 'running') {
     if (signal?.aborted) throw new Error('已停止等待市场加载；后台任务不受影响');
     const current = getCurrentUserProfile();
-    if (current.mode !== identity.mode || current.userId !== identity.userId || getHomeExecKey() !== execKey) {
-      throw new Error('执行节点或用户已切换，请重新打开市场');
+    if (current.mode !== identity.mode || current.userId !== identity.userId) {
+      throw new Error('用户已切换，请重新打开市场');
     }
     if (Date.now() > deadline) throw new Error('市场任务等待超时，请重新打开市场查看');
     const progress = Array.isArray(result.progress) ? result.progress : [];
@@ -3614,49 +3633,59 @@ export const api = {
   },
 
   // ── Prompt 模板库 ─────────────────────────────────────────────────────
-  async listPrompts(): Promise<any[]> {
-    const result = await call('listPrompts');
+  async listPrompts(execKey?: string): Promise<any[]> {
+    const result = execKey !== undefined
+      ? await callOnStrict(execKey, 'listPrompts', [], 15000)
+      : await call('listPrompts');
+    if (execKey !== undefined) {
+      const data = typeof result === 'string' ? JSON.parse(result) : result;
+      if (!Array.isArray(data)) throw new Error('Prompt 库响应无效，请重试');
+      return data;
+    }
     try { return JSON.parse(result) || []; } catch { return []; }
   },
 
-  async savePrompt(name: string, content: string, icon: string = '📝'): Promise<{ status: string; message?: string }> {
-    const result = await call('savePrompt', name, content, icon);
+  async savePrompt(name: string, content: string, icon: string = '📝', execKey?: string): Promise<{ status: string; message?: string }> {
+    const result = execKey !== undefined ? await callOnStrict(execKey, 'savePrompt', [name, content, icon], 30000) : await call('savePrompt', name, content, icon);
     if (result === null || result === undefined) return { status: 'error', message: '无法连接到后端' };
     try { return JSON.parse(result); } catch { return { status: 'error', message: '响应格式错误' }; }
   },
 
-  async deletePrompt(name: string): Promise<{ status: string; message?: string }> {
-    const result = await call('deletePrompt', name);
+  async deletePrompt(name: string, execKey?: string): Promise<{ status: string; message?: string }> {
+    const result = execKey !== undefined ? await callOnStrict(execKey, 'deletePrompt', [name], 30000) : await call('deletePrompt', name);
     if (result === null || result === undefined) return { status: 'error', message: '无法连接到后端' };
     try { return JSON.parse(result); } catch { return { status: 'error', message: '响应格式错误' }; }
   },
 
-  async renamePrompt(oldName: string, newName: string, content: string): Promise<{ status: string; message?: string }> {
-    const result = await call('renamePrompt', oldName, newName, content);
+  async renamePrompt(oldName: string, newName: string, content: string, execKey?: string): Promise<{ status: string; message?: string }> {
+    const result = execKey !== undefined ? await callOnStrict(execKey, 'renamePrompt', [oldName, newName, content], 30000) : await call('renamePrompt', oldName, newName, content);
     if (result === null || result === undefined) return { status: 'error', message: '无法连接到后端' };
     try { return JSON.parse(result); } catch { return { status: 'error', message: '响应格式错误' }; }
   },
 
-  async updatePromptIcon(name: string, icon: string): Promise<{ status: string; message?: string }> {
-    const result = await call('updatePromptIcon', name, icon);
+  async updatePromptIcon(name: string, icon: string, execKey?: string): Promise<{ status: string; message?: string }> {
+    const result = execKey !== undefined ? await callOnStrict(execKey, 'updatePromptIcon', [name, icon], 30000) : await call('updatePromptIcon', name, icon);
     if (result === null || result === undefined) return { status: 'error', message: '无法连接到后端' };
     try { return JSON.parse(result); } catch { return { status: 'error', message: '响应格式错误' }; }
   },
 
-  async updateSessionAbilities(sessionId: string, abilities: { skills: string[]; prompts: string[] }): Promise<{ status: string; message?: string }> {
-    const result = await call('updateSessionAbilities', sessionId, JSON.stringify(abilities));
+  async updateSessionAbilities(sessionId: string, abilities: { skills: string[]; prompts: string[] }, execKey?: string): Promise<{ status: string; message?: string }> {
+    try {
+      const key = execKey ?? routeConn('updateSessionAbilities', [sessionId]).key;
+      const result = await callOnStrict(key, 'updateSessionAbilities', [sessionId, JSON.stringify(abilities)], 15000);
+      const data = typeof result === 'string' ? JSON.parse(result) : result;
+      return data?.status ? data : { status: 'error', message: '响应格式错误' };
+    } catch (error) { return { status: 'error', message: error instanceof Error ? error.message : String(error) }; }
+  },
+
+  async setPromptDefault(name: string, isDefault: boolean, execKey?: string): Promise<{ status: string; message?: string }> {
+    const result = execKey !== undefined ? await callOnStrict(execKey, 'setPromptDefault', [name, isDefault], 30000) : await call('setPromptDefault', name, isDefault);
     if (result === null || result === undefined) return { status: 'error', message: '无法连接到后端' };
     try { return JSON.parse(result); } catch { return { status: 'error', message: '响应格式错误' }; }
   },
 
-  async setPromptDefault(name: string, isDefault: boolean): Promise<{ status: string; message?: string }> {
-    const result = await call('setPromptDefault', name, isDefault);
-    if (result === null || result === undefined) return { status: 'error', message: '无法连接到后端' };
-    try { return JSON.parse(result); } catch { return { status: 'error', message: '响应格式错误' }; }
-  },
-
-  async setSkillDefault(name: string, isDefault: boolean): Promise<{ status: string; message?: string }> {
-    const result = await call('setSkillDefault', name, isDefault);
+  async setSkillDefault(name: string, isDefault: boolean, execKey?: string): Promise<{ status: string; message?: string }> {
+    const result = execKey !== undefined ? await callOnStrict(execKey, 'setSkillDefault', [name, isDefault], 30000) : await call('setSkillDefault', name, isDefault);
     if (result === null || result === undefined) return { status: 'error', message: '无法连接到后端' };
     try { return JSON.parse(result); } catch { return { status: 'error', message: '响应格式错误' }; }
   },
@@ -3668,19 +3697,26 @@ export const api = {
   },
 
   // ── Skill 孵化库 ──────────────────────────────────────────────────────
-  async listSkills(workingDir: string = ''): Promise<SkillInfo[]> {
-    const result = await call('listSkills', workingDir);
+  async listSkills(workingDir: string = '', execKey?: string): Promise<SkillInfo[]> {
+    const result = execKey !== undefined
+      ? await callOnStrict(execKey, 'listSkills', [workingDir], 15000)
+      : await call('listSkills', workingDir);
+    if (execKey !== undefined) {
+      const data = typeof result === 'string' ? JSON.parse(result) : result;
+      if (!Array.isArray(data)) throw new Error('Skill 库响应无效，请重试');
+      return data;
+    }
     try { return JSON.parse(result) || []; } catch { return []; }
   },
 
-  async saveSkill(name: string, content: string): Promise<{ status: string; message?: string }> {
-    const result = await call('saveSkill', name, content);
+  async saveSkill(name: string, content: string, execKey?: string): Promise<{ status: string; message?: string }> {
+    const result = execKey !== undefined ? await callOnStrict(execKey, 'saveSkill', [name, content], 30000) : await call('saveSkill', name, content);
     if (result === null || result === undefined) return { status: 'error', message: '无法连接到后端' };
     try { return JSON.parse(result); } catch { return { status: 'error', message: '响应格式错误' }; }
   },
 
-  async deleteSkill(name: string): Promise<{ status: string; message?: string }> {
-    const result = await call('deleteSkill', name);
+  async deleteSkill(name: string, execKey?: string): Promise<{ status: string; message?: string }> {
+    const result = execKey !== undefined ? await callOnStrict(execKey, 'deleteSkill', [name], 30000) : await call('deleteSkill', name);
     if (result === null || result === undefined) return { status: 'error', message: '无法连接到后端' };
     try { return JSON.parse(result); } catch { return { status: 'error', message: '响应格式错误' }; }
   },
@@ -3697,24 +3733,33 @@ export const api = {
     try { return JSON.parse(result); } catch { return { status: 'error', message: '响应格式错误' }; }
   },
 
-  async renameSkill(oldName: string, newName: string, newContent: string): Promise<{ status: string; message?: string }> {
-    const result = await call('renameSkill', oldName, newName, newContent);
+  async renameSkill(oldName: string, newName: string, newContent: string, execKey?: string): Promise<{ status: string; message?: string }> {
+    const result = execKey !== undefined ? await callOnStrict(execKey, 'renameSkill', [oldName, newName, newContent], 30000) : await call('renameSkill', oldName, newName, newContent);
     if (result === null || result === undefined) return { status: 'error', message: '无法连接到后端' };
     try { return JSON.parse(result); } catch { return { status: 'error', message: '响应格式错误' }; }
   },
 
   // ── 插件包安装 ────────────────────────────────────────────────────────
-  async installSkillPackage(pkgPath: string, pkgBase64: string = ''): Promise<{
+  async installSkillPackage(pkgPath: string, pkgBase64: string = '', execKey?: string): Promise<{
     status: string; manifest?: any; skills?: any[]; format?: string; message?: string;
   }> {
-    const result = await call('installSkillPackage', pkgPath, pkgBase64);
+    const result = execKey !== undefined ? await callOnStrict(execKey, 'installSkillPackage', [pkgPath, pkgBase64], 120000) : await call('installSkillPackage', pkgPath, pkgBase64);
     if (result === null || result === undefined) return { status: 'error', message: '无法连接到后端' };
     try { return JSON.parse(result); } catch { return { status: 'error', message: '响应格式错误' }; }
   },
 
+  async skillMarketLocation(execKey: string): Promise<SkillMarketLocation> {
+    const result = await callOnStrict(execKey, 'skillMarketLocation', [], 15000);
+    const data = typeof result === 'string' ? JSON.parse(result) : result;
+    if (data?.status !== 'ok' || !data.host || !data.libraryPath || !data.runtimePath) {
+      throw new Error(data?.message || '该节点未提供安装位置，请更新节点后重试');
+    }
+    return data;
+  },
+
   async skillMarketList(query: string = '', refresh: boolean = false, onProgress?: (text: string) => void,
-    signal?: AbortSignal): Promise<SkillMarketCatalog> {
-    const result = await marketBackgroundCall('skillMarketList', [query, refresh], onProgress, signal);
+    signal?: AbortSignal, execKey: string = getHomeExecKey()): Promise<SkillMarketCatalog> {
+    const result = await marketBackgroundCall('skillMarketList', [query, refresh], onProgress, signal, execKey);
     if (result === null || result === undefined) {
       return { status: 'error', message: '无法连接到后端', sources: [], directories: [], items: [] };
     }
@@ -3733,8 +3778,8 @@ export const api = {
     }
   },
 
-  async skillMarketAddSource(repository: string, name: string = '', branch: string = ''): Promise<{ status: string; source?: SkillMarketSource; message?: string }> {
-    const result = await call('skillMarketAddSource', repository, name, branch);
+  async skillMarketAddSource(repository: string, name: string = '', branch: string = '', execKey: string = getHomeExecKey()): Promise<{ status: string; source?: SkillMarketSource; message?: string }> {
+    const result = await callOnStrict(execKey, 'skillMarketAddSource', [repository, name, branch], 15000);
     if (result === null || result === undefined) return { status: 'error', message: '无法连接到后端' };
     try { return JSON.parse(result); } catch { return { status: 'error', message: '响应格式错误' }; }
   },
@@ -3750,8 +3795,8 @@ export const api = {
     return JSON.parse(result);
   },
 
-  async skillMarketRemoveSource(sourceId: string): Promise<{ status: string; message?: string }> {
-    const result = await call('skillMarketRemoveSource', sourceId);
+  async skillMarketRemoveSource(sourceId: string, execKey: string = getHomeExecKey()): Promise<{ status: string; message?: string }> {
+    const result = await callOnStrict(execKey, 'skillMarketRemoveSource', [sourceId], 15000);
     if (result === null || result === undefined) return { status: 'error', message: '无法连接到后端' };
     try { return JSON.parse(result); } catch { return { status: 'error', message: '响应格式错误' }; }
   },
@@ -3760,9 +3805,10 @@ export const api = {
     item: Pick<SkillMarketItem, 'sourceId' | 'path' | 'digest'>,
     allowReplace: boolean = false,
     onProgress?: (text: string) => void,
+    execKey: string = getHomeExecKey(),
   ): Promise<{ status: string; skill?: any; message?: string }> {
     const result = await marketBackgroundCall(
-      'skillMarketInstall', [item.sourceId, item.path, item.digest, allowReplace], onProgress,
+      'skillMarketInstall', [item.sourceId, item.path, item.digest, allowReplace], onProgress, undefined, execKey,
     );
     if (result === null || result === undefined) return { status: 'error', message: '无法连接到后端' };
     try { return typeof result === 'string' ? JSON.parse(result) : result; } catch { return { status: 'error', message: '响应格式错误' }; }
@@ -3779,19 +3825,19 @@ export const api = {
     return typeof result === 'string' ? JSON.parse(result) : result;
   },
 
-  async getSkillSecretsSchema(name: string): Promise<{ fields: Array<{ key: string; label: string; type: 'text' | 'password' | 'textarea'; required?: boolean; placeholder?: string }> } | null> {
-    const result = await call('getSkillSecretsSchema', name);
+  async getSkillSecretsSchema(name: string, execKey?: string): Promise<{ fields: Array<{ key: string; label: string; type: 'text' | 'password' | 'textarea'; required?: boolean; placeholder?: string }> } | null> {
+    const result = execKey !== undefined ? await callOnStrict(execKey, 'getSkillSecretsSchema', [name], 15000) : await call('getSkillSecretsSchema', name);
     try { return result ? JSON.parse(result) : null; } catch { return null; }
   },
 
-  async setSkillSecrets(name: string, secrets: Record<string, string>): Promise<{ status: string; message?: string }> {
-    const result = await call('setSkillSecrets', name, JSON.stringify(secrets));
+  async setSkillSecrets(name: string, secrets: Record<string, string>, execKey?: string): Promise<{ status: string; message?: string }> {
+    const result = execKey !== undefined ? await callOnStrict(execKey, 'setSkillSecrets', [name, JSON.stringify(secrets)], 30000) : await call('setSkillSecrets', name, JSON.stringify(secrets));
     if (result === null || result === undefined) return { status: 'error', message: '无法连接到后端' };
     try { return JSON.parse(result); } catch { return { status: 'error', message: '响应格式错误' }; }
   },
 
-  async getSkillSecretsPresence(name: string): Promise<string[]> {
-    const result = await call('getSkillSecretsPresence', name);
+  async getSkillSecretsPresence(name: string, execKey?: string): Promise<string[]> {
+    const result = execKey !== undefined ? await callOnStrict(execKey, 'getSkillSecretsPresence', [name], 15000) : await call('getSkillSecretsPresence', name);
     try { return result ? JSON.parse(result) : []; } catch { return []; }
   },
 

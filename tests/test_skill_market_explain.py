@@ -113,13 +113,21 @@ class SkillMarketExplanationTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("超时", self.service.get("alice", job["jobId"])["message"])
             self.backend.abort.assert_called()
 
-    async def test_agent_backend_fails_closed_without_send(self):
+    async def test_agent_backend_uses_isolated_text_path_not_chat_runner(self):
         self.backend.config.type = BackendType.CODEX_OFFICIAL
+        with patch("src.backend.text_only._codex_text", AsyncMock(return_value="中文解读")) as runner:
+            result = await self.finish(self.start())
+        self.assertEqual(result["state"], "done")
+        runner.assert_awaited_once()
+        self.backend.send_message.assert_not_called()
+
+    async def test_image_backend_fails_closed_without_send(self):
+        self.backend.config.type = BackendType.DASHSCOPE_IMAGE
         result = await self.finish(self.start())
         self.assertEqual(result["state"], "error")
         self.backend.send_message.assert_not_called()
 
-    async def test_rpc_rejects_disabled_or_agent_configs_and_uses_owner(self):
+    async def test_rpc_rejects_disabled_configs_and_uses_owner(self):
         bridge = BridgeWS.__new__(BridgeWS)
         bridge._backend_configs = [self.backend.config]
         bridge._skill_market_explainer = self.service

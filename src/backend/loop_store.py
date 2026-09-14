@@ -24,6 +24,7 @@ LoopStore: 可视化 Loop 集成的状态持久化（"stage 文件"）。
 from __future__ import annotations
 
 import json
+import copy
 import os
 import threading
 import time
@@ -149,6 +150,8 @@ class LoopRecord:
     result: str = ""                    # 本次 loop 执行完成的结果信息
     analysis: Optional[LoopAnalysis] = None
     error: str = ""
+    # 阶段审计：原文、解析对象与结构校验结论，独立于实时尾部回放持久化。
+    stage_details: dict = field(default_factory=dict)
     # 各子阶段的开始时间戳（{prepare/execute/analysis/done: ts}），用于流程视图耗时
     sub_started: dict = field(default_factory=dict)
     # ★ 本次 loop 各阶段实际使用的 backend id（{prepare, execute, analysis}）。
@@ -198,6 +201,7 @@ class LoopRecord:
             "result": self.result,
             "analysis": self.analysis.to_dict() if self.analysis else None,
             "error": self.error,
+            "stageDetails": copy.deepcopy(self.stage_details),
             "subStarted": self.sub_started,
             "backends": dict(self.backends or {}),
             "runtimes": {k: dict(v) for k, v in (self.runtimes or {}).items()
@@ -229,6 +233,7 @@ class LoopRecord:
             result=d.get("result", ""),
             analysis=LoopAnalysis.from_dict(d["analysis"]) if d.get("analysis") else None,
             error=d.get("error", ""),
+            stage_details=copy.deepcopy(d.get("stageDetails") or {}),
             sub_started=dict(d.get("subStarted") or {}),
             backends=dict(d.get("backends") or {}),
             runtimes={k: dict(v) for k, v in (d.get("runtimes") or {}).items()

@@ -3,11 +3,16 @@ import {
   api,
   SkillMarketCatalog,
   SkillMarketItem,
+  SkillMarketLocation,
   getHomeExecKey,
+  getExecutors,
+  isTauri,
+  onExecStatus,
   onCurrentUserChanged,
 } from '../api';
 import { SkillMarketExplanation } from './SkillMarketExplanation';
 import { filterMarketItems, marketVersion, type SkillMarketSort } from '../utils/skillMarketView';
+import { skillInstallTargetLabel } from '../utils/skillInstallTarget';
 
 if (typeof document !== 'undefined' && !document.getElementById('skill-market-css')) {
   const style = document.createElement('style');
@@ -18,6 +23,8 @@ if (typeof document !== 'undefined' && !document.getElementById('skill-market-cs
     .skill-market-source:hover .skill-market-source-remove { opacity:1!important; }
     .skill-market-source-inputs input { min-width:0; }
     .skill-market-detail { overflow-wrap:anywhere; }
+    .skill-market-install-target { height:94px; flex:none; box-sizing:border-box; overflow:auto; }
+    .skill-market-install-target-line { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; line-height:18px; min-width:0; }
     .skill-market-source-snapshot { height:84px; flex:none; display:flex; flex-direction:column; gap:7px; overflow:auto; scrollbar-gutter:stable; }
     .skill-market-source-snapshot > * { flex-shrink:0; }
     .skill-market-sync-slot { height:32px; flex:none; overflow:auto; scrollbar-gutter:stable; font-size:11px; line-height:16px; color:var(--theme-text-muted); }
@@ -61,7 +68,7 @@ interface Props {
   embedded?: boolean;
   open: boolean;
   onClose: () => void;
-  onInstalled: (name?: string) => Promise<void> | void;
+  onInstalled: (name?: string, execKey?: string) => Promise<void> | void;
 }
 
 const EMPTY_CATALOG: SkillMarketCatalog = {
@@ -101,6 +108,7 @@ export const SkillMarketDialog: React.FC<Props> = ({ open, onClose, onInstalled,
   const [sourceFilter, setSourceFilter] = useState('');
   const [sourcesExpanded, setSourcesExpanded] = useState(() => window.innerWidth > 760);
   const loadGeneration = useRef(0);
+  const marketScope = useRef(0);
   const [selectedId, setSelectedId] = useState('');
   const [sourceInput, setSourceInput] = useState('');
   const [sourceName, setSourceName] = useState('');
@@ -110,6 +118,11 @@ export const SkillMarketDialog: React.FC<Props> = ({ open, onClose, onInstalled,
   const [backendsLoading, setBackendsLoading] = useState(true);
   const [explanationBackendId, setExplanationBackendId] = useState('');
   const [execKey, setExecKey] = useState(getHomeExecKey);
+  const [executors, setExecutors] = useState(getExecutors);
+  const [locationSnapshot, setLocationSnapshot] = useState<{ key: string; value: SkillMarketLocation } | null>(null);
+  const [locationLoading, setLocationLoading] = useState(true);
+  const [locationError, setLocationError] = useState('');
+  const [locationRevision, setLocationRevision] = useState(0);
   const [identityRevision, setIdentityRevision] = useState(0);
   const [addingSource, setAddingSource] = useState(false);
   const [installingId, setInstallingId] = useState('');
@@ -117,6 +130,26 @@ export const SkillMarketDialog: React.FC<Props> = ({ open, onClose, onInstalled,
   const [fileQuery, setFileQuery] = useState('');
   const [filePage, setFilePage] = useState(0);
   const [message, setMessage] = useState<{ kind: 'error' | 'ok'; text: string } | null>(null);
+
+  const executor = executors.find(item => item.key === execKey);
+  const targetConnected = executor?.connected === true;
+  const location = locationSnapshot?.key === execKey ? locationSnapshot.value : null;
+  const targetLabel = skillInstallTargetLabel(execKey, executor, isTauri());
+  const targetName = `${targetLabel}${location ? ` · ${location.host}` : ''}`;
+  const targetReady = targetConnected && !!location && !locationLoading && !locationError;
+
+  useEffect(() => onExecStatus(() => setExecutors(getExecutors())), []);
+  useEffect(() => {
+    if (!open) return;
+    let cancelled = false;
+    setLocationLoading(targetConnected); setLocationError(''); setReviewed(false);
+    if (targetConnected) void api.skillMarketLocation(execKey).then(value => {
+      if (!cancelled) setLocationSnapshot({ key: execKey, value });
+    }).catch((error: unknown) => {
+      if (!cancelled) setLocationError(error instanceof Error ? error.message : '安装位置读取失败');
+    }).finally(() => { if (!cancelled) setLocationLoading(false); });
+    return () => { cancelled = true; };
+  }, [open, execKey, targetConnected, identityRevision, locationRevision]);
 
   const load = useCallback(async (force = false) => {
     const generation = ++loadGeneration.current;
@@ -129,7 +162,7 @@ export const SkillMarketDialog: React.FC<Props> = ({ open, onClose, onInstalled,
     try {
       const result = await api.skillMarketList('', force, text => {
         if (generation === loadGeneration.current) setLoadingText(text);
-      }, controller.signal);
+      }, controller.signal, execKey);
       if (generation !== loadGeneration.current) return;
       if (result.status !== 'ok') {
         setMessage({ kind: 'error', text: result.message || '技能市场加载失败' });
@@ -150,7 +183,7 @@ export const SkillMarketDialog: React.FC<Props> = ({ open, onClose, onInstalled,
     } finally {
       if (generation === loadGeneration.current) setLoading(false);
     }
-  }, []);
+  }, [execKey]);
 
   useEffect(() => {
     if (open) void load(false);
@@ -158,11 +191,13 @@ export const SkillMarketDialog: React.FC<Props> = ({ open, onClose, onInstalled,
   }, [open, load, identityRevision]);
 
   useEffect(() => onCurrentUserChanged(() => {
+    marketScope.current += 1;
     loadGeneration.current += 1;
     setCatalog(EMPTY_CATALOG);
     setCatalogLoaded(false);
     setLoading(true);
     setBackendsLoading(true);
+    setAddingSource(false);
     loadAbort.current?.abort();
     setInstallingId('');
     setInstallProgress('');
@@ -170,6 +205,11 @@ export const SkillMarketDialog: React.FC<Props> = ({ open, onClose, onInstalled,
     setExplanationItemKey('');
     setExplanationBackends([]);
     setExplanationBackendId('');
+    setReviewed(false);
+    setLocationSnapshot(null);
+    setLocationLoading(true);
+    setLocationError('');
+    setExecutors(getExecutors());
     setExecKey(getHomeExecKey());
     setIdentityRevision(value => value + 1);
   }), []);
@@ -177,18 +217,19 @@ export const SkillMarketDialog: React.FC<Props> = ({ open, onClose, onInstalled,
   useEffect(() => {
     if (!open) return;
     let cancelled = false;
-    const key = getHomeExecKey();
-    setExecKey(key);
+    const key = execKey;
     setBackendsLoading(true);
     void api.getBackends(key).then(backends => {
       if (cancelled) return;
-      const eligible = backends.filter(item => item.enabled !== false && ['openai-compatible', 'anthropic-api'].includes(item.type));
+      const eligible = backends.filter(item => item.enabled !== false && [
+        'openai-compatible', 'anthropic-api', 'codex-office', 'qwen-code-cli', 'claude-agent-sdk', 'claude-code-official',
+      ].includes(item.type));
       setExplanationBackends(eligible);
       setExplanationBackendId(current => eligible.some(item => item.id === current) ? current : eligible[0]?.id || '');
     }).catch(() => { if (!cancelled) setExplanationBackends([]); })
       .finally(() => { if (!cancelled) setBackendsLoading(false); });
     return () => { cancelled = true; };
-  }, [open, identityRevision]);
+  }, [open, identityRevision, execKey]);
 
   const filteredItems = useMemo(() => filterMarketItems(catalog.items, query, sourceFilter, sort), [catalog.items, query, sourceFilter, sort]);
 
@@ -216,10 +257,12 @@ export const SkillMarketDialog: React.FC<Props> = ({ open, onClose, onInstalled,
 
   const addSource = useCallback(async () => {
     if (!sourceInput.trim() || addingSource) return;
+    const scope = marketScope.current;
     setAddingSource(true);
     setMessage(null);
     try {
-      const result = await api.skillMarketAddSource(sourceInput.trim(), sourceName.trim(), sourceBranch.trim());
+      const result = await api.skillMarketAddSource(sourceInput.trim(), sourceName.trim(), sourceBranch.trim(), execKey);
+      if (scope !== marketScope.current) return;
       if (result.status !== 'ok') {
         setMessage({ kind: 'error', text: result.message || '来源添加失败' });
         return;
@@ -229,24 +272,30 @@ export const SkillMarketDialog: React.FC<Props> = ({ open, onClose, onInstalled,
       setSourceBranch('');
       await load(true);
     } catch (error) {
-      setMessage({ kind: 'error', text: error instanceof Error ? error.message : '来源添加失败' });
+      if (scope === marketScope.current) setMessage({ kind: 'error', text: error instanceof Error ? error.message : '来源添加失败' });
     } finally {
-      setAddingSource(false);
+      if (scope === marketScope.current) setAddingSource(false);
     }
-  }, [sourceInput, sourceName, sourceBranch, addingSource, load]);
+  }, [sourceInput, sourceName, sourceBranch, addingSource, load, execKey]);
 
   const removeSource = useCallback(async (sourceId: string) => {
-    const result = await api.skillMarketRemoveSource(sourceId);
-    if (result.status !== 'ok') {
-      setMessage({ kind: 'error', text: result.message || '来源删除失败' });
-      return;
+    const scope = marketScope.current;
+    try {
+      const result = await api.skillMarketRemoveSource(sourceId, execKey);
+      if (scope !== marketScope.current) return;
+      if (result.status !== 'ok') {
+        setMessage({ kind: 'error', text: result.message || '来源删除失败' });
+        return;
+      }
+      if (sourceFilter === sourceId) setSourceFilter('');
+      await load(false);
+    } catch (error) {
+      if (scope === marketScope.current) setMessage({ kind: 'error', text: error instanceof Error ? error.message : '来源删除失败' });
     }
-    if (sourceFilter === sourceId) setSourceFilter('');
-    await load(false);
-  }, [load, sourceFilter]);
+  }, [load, sourceFilter, execKey]);
 
   const installSelected = useCallback(async () => {
-    if (!selected || !reviewed || installingId) return;
+    if (!selected || !reviewed || installingId || !targetReady) return;
     const operation = ++installOperation.current;
     setInstallingId(selected.id);
     setInstallProgress('后台检查并导入所选 Skill…');
@@ -255,7 +304,7 @@ export const SkillMarketDialog: React.FC<Props> = ({ open, onClose, onInstalled,
     try {
       const result = await api.skillMarketInstall(selected, selected.conflict, text => {
         if (generation === loadGeneration.current) setInstallProgress(text);
-      });
+      }, execKey);
       if (generation !== loadGeneration.current) return;
       if (result.status !== 'ok') {
         setMessage({ kind: 'error', text: result.message || '安装失败' });
@@ -263,10 +312,10 @@ export const SkillMarketDialog: React.FC<Props> = ({ open, onClose, onInstalled,
       }
       setMessage({
         kind: 'ok',
-        text: selected.name + " 文件已导入，接下来检查目标节点的运行环境。",
+        text: `${selected.name} 已导入 ${targetName} 的 Skill 库，接下来在同一节点检查运行环境。`,
       });
-      await onInstalled(result.skill?.name || result.skill?.id || selected.name);
-      await load(false);
+      await onInstalled(result.skill?.name || result.skill?.id || selected.name, execKey);
+      if (generation === loadGeneration.current) await load(false);
     } catch (error) {
       if (generation === loadGeneration.current) setMessage({ kind: 'error', text: error instanceof Error ? error.message : '安装失败' });
     } finally {
@@ -275,11 +324,11 @@ export const SkillMarketDialog: React.FC<Props> = ({ open, onClose, onInstalled,
         setInstallProgress('');
       }
     }
-  }, [selected, reviewed, installingId, onInstalled, load]);
+  }, [selected, reviewed, installingId, onInstalled, load, execKey, targetReady, targetName]);
 
   if (!open) return null;
 
-  const installDisabled = !selected || !reviewed || Boolean(installingId)
+  const installDisabled = !selected || !reviewed || !targetReady || Boolean(installingId)
     || Boolean(selected?.installed && selected?.sameSource && !selected?.updateAvailable);
   const installText = !selected ? '选择一个 Skill'
     : installingId === selected.id ? '安装中…'
@@ -326,6 +375,29 @@ export const SkillMarketDialog: React.FC<Props> = ({ open, onClose, onInstalled,
             {!embedded && <button style={closeButtonStyle} onClick={onClose} aria-label="关闭">×</button>}
           </div>
         </header>
+
+        <section className="skill-market-install-target" aria-label="Skill 安装位置" aria-busy={locationLoading}
+          style={{ padding: '7px 10px', border: '1px solid var(--theme-border)', borderRadius: 7, background: 'var(--theme-bg)', fontSize: 11 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, height: 22 }}>
+            <strong className="skill-market-install-target-line" style={{ flex: 1 }} title={`${targetName} · 节点 ID：${execKey}`}>
+              安装节点：{targetName}
+            </strong>
+            <span style={{ flexShrink: 0, color: targetConnected ? '#4fb477' : '#ef6b73' }}>{targetConnected ? '在线' : '离线'}</span>
+            <button style={{ ...secondaryButtonStyle, padding: '1px 6px' }} disabled={locationLoading || !targetConnected || !!installingId}
+              onClick={() => setLocationRevision(value => value + 1)} aria-label="刷新安装位置">↻</button>
+          </div>
+          <div className="skill-market-install-target-line" title={location?.libraryPath}>
+            文件目录：<code>{location?.libraryPath || (locationLoading ? '同步中…' : '未确认')}</code>
+          </div>
+          <div className="skill-market-install-target-line" title={location?.runtimePath}>
+            依赖目录：<code>{location?.runtimePath || (locationLoading ? '同步中…' : '未确认')}</code>（需另行确认）
+          </div>
+          <div className="skill-market-install-target-line" style={{ color: locationError ? '#ef6b73' : 'var(--theme-text-muted)' }}
+            title={locationError || '市场使用默认执行节点，不随当前 Session 切换。文件导入与 Agent 启用是两步；不会复制到其它节点。浏览器仅负责操作，文件不会写入浏览器存储或下载目录。'}>
+            {locationError || (!targetConnected ? '节点离线，暂不能安装；不会改装到其它节点。'
+              : `使用默认节点，不随 Session 切换；${isTauri() ? '仅导入该节点 Skill 库，不自动启用。' : '文件写入上述节点，不存入浏览器。'}`)}
+          </div>
+        </section>
 
         <div className="skill-market-sync-slot" role={loading || installingId ? 'status' : message?.kind === 'error' ? 'alert' : undefined}
           aria-live="polite" aria-atomic="true" title={syncText}
@@ -531,7 +603,7 @@ export const SkillMarketDialog: React.FC<Props> = ({ open, onClose, onInstalled,
                       setExplanationBackendId(event.target.value); setExplanationItemKey('');
                     }} disabled={backendsLoading} aria-busy={backendsLoading} style={{ ...inputStyle, maxWidth: '100%', flex: 1 }}>
                       {backendsLoading && <option value={explanationBackendId}>Backend 同步中…</option>}
-                      {!backendsLoading && !explanationBackends.length && <option value="">需配置文本 API Backend</option>}
+                      {!backendsLoading && !explanationBackends.length && <option value="">请启用一个解读 Backend</option>}
                       {!backendsLoading && explanationBackends.map(backend => <option key={backend.id} value={backend.id}>{backend.label || backend.id}</option>)}
                     </select>
                   </div>
@@ -593,12 +665,15 @@ export const SkillMarketDialog: React.FC<Props> = ({ open, onClose, onInstalled,
                     item={selected} backendId={explanationBackendId} execKey={execKey} backendLoading={backendsLoading} />}
                   <footer className="skill-market-footer" style={detailFooterStyle}>
                     <label style={{ display: 'flex', alignItems: 'flex-start', gap: 7, fontSize: 11,
-                      color: 'var(--theme-text-muted)', lineHeight: 1.4, flex: 1 }}>
+                      color: 'var(--theme-text-muted)', lineHeight: 1.4, flex: 1, minWidth: 0 }}>
                       <input type="checkbox" checked={reviewed} onChange={event => setReviewed(event.target.checked)} />
-                      <span>我已检查来源、文件和 SKILL.md。Skill 可指导 Agent 运行命令，安装不代表内容绝对安全。</span>
+                      <span style={{ minWidth: 0 }}>
+                        <strong className="skill-market-install-target-line" style={{ display: 'block' }} title={targetName}>安装到：{targetName}</strong>
+                        我已核对安装节点、来源、文件和 SKILL.md。Skill 可指导 Agent 运行命令，安装不代表内容绝对安全。
+                      </span>
                     </label>
                     <button style={{ ...primaryButtonStyle, opacity: installDisabled ? .55 : 1 }}
-                      disabled={installDisabled} onClick={() => void installSelected()}>
+                      disabled={installDisabled} title={`安装到 ${targetName} 的 Skill 库；不会安装到其它节点`} onClick={() => void installSelected()}>
                       {installText}
                     </button>
                   </footer>

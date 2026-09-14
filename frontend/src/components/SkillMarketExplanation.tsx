@@ -34,8 +34,8 @@ export const SkillMarketExplanation: React.FC<Props> = ({ item, backendId, execK
   }, [item.sourceId, item.path, item.digest, backendId, execKey, backendLoading, attempt]);
   if (backendLoading || !backendId) return <div className="skill-market-explanation" style={panelStyle}>
     <div role="status" style={noticeStyle}>{backendLoading ? 'Backend 同步中… 无需安装 Skill，同步完成后即可选择解读。' : <>
-    请先在 Backend 管理中配置并启用 OpenAI 兼容或 Anthropic API，再选择解读 Backend。
-    此功能使用纯文本请求，不启动 Codex / Qwen / Claude Agent 工具。
+    请先在 Backend 管理中启用 Codex、Qwen、Claude 或文本 API，再选择解读 Backend。
+    无需安装 Skill；解读使用独立上下文，不执行工具或文档中的命令。
     </>}</div>
   </div>;
   const failed = result?.status === 'error' || result?.state === 'error';

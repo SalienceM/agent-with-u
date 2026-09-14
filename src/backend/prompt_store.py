@@ -6,6 +6,7 @@ Index at ~/.agent-with-u/prompt-library/index.json
 """
 
 import json
+import threading
 import time
 from pathlib import Path
 from typing import Optional
@@ -15,6 +16,7 @@ from . import paths
 
 class PromptStore:
     def __init__(self):
+        self._lock = threading.RLock()
         self._dir = paths.sub("prompt-library")
         self._dir.mkdir(parents=True, exist_ok=True)
         self._index_path = self._dir / "index.json"
@@ -40,87 +42,99 @@ class PromptStore:
         )
 
     def list_prompts(self) -> list[dict]:
-        result = []
-        for meta in sorted(self._index.values(), key=lambda x: x.get("updatedAt", 0), reverse=True):
-            path = self._dir / f"{meta['name']}.md"
-            content = path.read_text(encoding="utf-8") if path.exists() else ""
-            # Ensure ID exists (migrates from name-based to ID-based)
-            entry = {**meta, "content": content}
-            if "id" not in entry:
-                entry["id"] = entry.get("name", "")
-            entry["isDefault"] = bool(meta.get("isDefault", False))
-            result.append(entry)
-        return result
+        with self._lock:
+            result = []
+            for meta in sorted(self._index.values(), key=lambda x: x.get("updatedAt", 0), reverse=True):
+                path = self._dir / f"{meta['name']}.md"
+                content = path.read_text(encoding="utf-8") if path.exists() else ""
+                # Ensure ID exists (migrates from name-based to ID-based)
+                entry = {**meta, "content": content}
+                if "id" not in entry:
+                    entry["id"] = entry.get("name", "")
+                entry["isDefault"] = bool(meta.get("isDefault", False))
+                result.append(entry)
+            return result
 
     def get_prompt(self, name: str) -> Optional[dict]:
-        meta = self._index.get(name)
-        if not meta:
-            return None
-        path = self._dir / f"{name}.md"
-        content = path.read_text(encoding="utf-8") if path.exists() else ""
-        return {**meta, "content": content, "isDefault": bool(meta.get("isDefault", False))}
+        with self._lock:
+            meta = self._index.get(name)
+            if not meta:
+                return None
+            path = self._dir / f"{name}.md"
+            content = path.read_text(encoding="utf-8") if path.exists() else ""
+            return {**meta, "content": content, "isDefault": bool(meta.get("isDefault", False))}
 
     def save_prompt(self, name: str, content: str, icon: str = "📝"):
-        now = time.time()
-        existing = self._index.get(name)
-        meta = {
-            "name": name,
-            "icon": icon or (existing or {}).get("icon", "📝"),
-            "createdAt": (existing or {}).get("createdAt", now),
-            "updatedAt": now,
-            "isDefault": bool((existing or {}).get("isDefault", False)),
-        }
-        self._index[name] = meta
-        (self._dir / f"{name}.md").write_text(content, encoding="utf-8")
-        self._save_index()
+        with self._lock:
+            now = time.time()
+            existing = self._index.get(name)
+            meta = {
+                "name": name,
+                "icon": icon or (existing or {}).get("icon", "📝"),
+                "createdAt": (existing or {}).get("createdAt", now),
+                "updatedAt": now,
+                "isDefault": bool((existing or {}).get("isDefault", False)),
+            }
+            self._index[name] = meta
+            (self._dir / f"{name}.md").write_text(content, encoding="utf-8")
+            self._save_index()
 
     def delete_prompt(self, name: str):
-        self._index.pop(name, None)
-        path = self._dir / f"{name}.md"
-        if path.exists():
-            path.unlink()
-        self._save_index()
+        with self._lock:
+            self._index.pop(name, None)
+            path = self._dir / f"{name}.md"
+            if path.exists():
+                path.unlink()
+            self._save_index()
 
     def rename_prompt(self, old_name: str, new_name: str, content: Optional[str] = None):
-        meta = self._index.pop(old_name, None)
-        if not meta:
-            return
-        old_path = self._dir / f"{old_name}.md"
-        new_path = self._dir / f"{new_name}.md"
-        if content is not None:
-            new_path.write_text(content, encoding="utf-8")
-        elif old_path.exists():
-            new_path.write_text(old_path.read_text(encoding="utf-8"), encoding="utf-8")
-        if old_path.exists() and old_path != new_path:
-            old_path.unlink()
-        meta["name"] = new_name
-        meta["updatedAt"] = time.time()
-        self._index[new_name] = meta
-        self._save_index()
+        with self._lock:
+            meta = self._index.pop(old_name, None)
+            if not meta:
+                return
+            old_path = self._dir / f"{old_name}.md"
+            new_path = self._dir / f"{new_name}.md"
+            if content is not None:
+                new_path.write_text(content, encoding="utf-8")
+            elif old_path.exists():
+                new_path.write_text(old_path.read_text(encoding="utf-8"), encoding="utf-8")
+            if old_path.exists() and old_path != new_path:
+                old_path.unlink()
+            meta["name"] = new_name
+            meta["updatedAt"] = time.time()
+            self._index[new_name] = meta
+            self._save_index()
 
     def update_icon(self, name: str, icon: str):
-        meta = self._index.get(name)
-        if meta:
-            meta["icon"] = icon
-            meta["updatedAt"] = time.time()
-            self._save_index()
+        with self._lock:
+            meta = self._index.get(name)
+            if meta:
+                meta["icon"] = icon
+                meta["updatedAt"] = time.time()
+                self._save_index()
 
     def set_default(self, name: str, is_default: bool) -> bool:
         """标记/取消某个 Prompt 为默认档。默认档会在新建 session 时自动绑定。"""
-        meta = self._index.get(name)
-        if not meta:
-            return False
-        meta["isDefault"] = bool(is_default)
-        meta["updatedAt"] = time.time()
-        self._save_index()
-        return True
+        with self._lock:
+            meta = self._index.get(name)
+            if not meta:
+                return False
+            meta["isDefault"] = bool(is_default)
+            meta["updatedAt"] = time.time()
+            self._save_index()
+            return True
 
     def list_default_names(self) -> list[str]:
         """返回所有被标记为默认档的 Prompt 名称列表。"""
-        return [name for name, meta in self._index.items() if meta.get("isDefault")]
+        with self._lock:
+            return [name for name, meta in self._index.items() if meta.get("isDefault")]
 
     # ── 导出 / 导入 ─────────────────────────────────────────────────
     def export_library(self, target_path: str) -> bool:
+        with self._lock:
+            return self._export_library(target_path)
+
+    def _export_library(self, target_path: str) -> bool:
         """把整个 prompt-library 目录打包成 tar.gz。"""
         import tarfile
         try:
@@ -135,6 +149,10 @@ class PromptStore:
             return False
 
     def import_library(self, source_path: str) -> int:
+        with self._lock:
+            return self._import_library(source_path)
+
+    def _import_library(self, source_path: str) -> int:
         """从 tar.gz 恢复 prompt-library。返回新增/合并的 prompt 数量。
         策略：文件名冲突时新包覆盖旧包；index.json 做字段级合并（保留本地已有项）。
         """
