@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from src.backend.bridge_ws import BridgeWS
 from src.backend.session_store import SessionStore
 from src.types import ChatMessage, Session
+from src.backend.base import StreamDelta
 
 
 class _EmptyBackend:
@@ -18,6 +19,25 @@ class _EmptyBackend:
 class _CancelledBackend:
     async def send_message(self, **_kwargs):
         raise asyncio.CancelledError
+
+
+class _ErrorOnlyBackend:
+    async def send_message(self, **kwargs):
+        kwargs['on_delta'](StreamDelta(kwargs['session_id'], kwargs['message_id'], 'error', error='rate limited'))
+        kwargs['on_delta'](StreamDelta(kwargs['session_id'], kwargs['message_id'], 'done'))
+        return {}
+
+
+class _RecoveringBackend:
+    def __init__(self):
+        self.calls = 0
+
+    async def send_message(self, **kwargs):
+        self.calls += 1
+        if self.calls == 1:
+            kwargs['on_delta'](StreamDelta(kwargs['session_id'], kwargs['message_id'], 'resume_failed'))
+            kwargs['on_delta'](StreamDelta(kwargs['session_id'], kwargs['message_id'], 'error', error='expired context'))
+        return {}
 
 
 class EmptyAssistantPersistenceTests(unittest.TestCase):
@@ -81,7 +101,7 @@ class EmptyAssistantStreamingTests(unittest.IsolatedAsyncioTestCase):
             working_dir=".", backend_id="backend",
         )
 
-        await bridge._async_send(session, "question", None, "backend", "assistant")
+        self.last_result = await bridge._async_send(session, "question", None, "backend", "assistant")
 
         return session, emitted
 
@@ -96,6 +116,17 @@ class EmptyAssistantStreamingTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual([message.id for message in session.messages], ["user"])
         self.assertTrue(any(delta.type == "done" for delta in emitted))
+        self.assertFalse(self.last_result)
+
+    async def test_error_then_done_is_not_queue_success(self):
+        await self._run_empty_backend(_ErrorOnlyBackend())
+        self.assertFalse(self.last_result)
+
+    async def test_successful_resume_retry_does_not_pause_sequence(self):
+        backend = _RecoveringBackend()
+        await self._run_empty_backend(backend)
+        self.assertEqual(backend.calls, 2)
+        self.assertTrue(self.last_result)
 
 
 if __name__ == "__main__":

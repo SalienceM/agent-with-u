@@ -25,6 +25,71 @@ async function openRepo(page: Page) {
   return page.locator('#workbench-panel-library');
 }
 
+test('built-in Kit prompt defaults to auto, persists per session, and failed mode saves never look applied', async ({ page }, testInfo) => {
+  const current = structuredClone(session) as typeof session & { abilities: { kitToolsMode?: string } };
+  let fail = true;
+  let saves = 0;
+  let kitReads = 0;
+  await page.routeWebSocket(/.*/, socket => {
+    const server = socket.connectToServer();
+    socket.onMessage(message => {
+      const frame = JSON.parse(String(message));
+      const reply = (value: unknown) => socket.send(JSON.stringify({ id: frame.id, result: JSON.stringify(value) }));
+      if (frame.method === 'listSessions') return reply([current]);
+      if (frame.method === 'getBackends') return reply([]);
+      if (frame.method === 'loadSessionMeta') return reply(current);
+      if (frame.method === 'listSkills') return reply([skill]);
+      if (frame.method === 'listPrompts') return reply([]);
+      if (frame.method === 'kitGetState' && frame.params[0] === session.id) kitReads++;
+      if (frame.method === 'updateSessionAbilities') {
+        saves++;
+        if (fail) return reply({ status: 'error', message: '模拟模式保存失败' });
+        current.abilities = JSON.parse(frame.params[1]);
+        return reply({ status: 'ok' });
+      }
+      server.send(message);
+    });
+  });
+  await page.goto('/');
+  let dialog = await openBinding(page);
+  let mode = dialog.getByRole('combobox', { name: 'Kit 调用 Prompt 激活模式' });
+  await expect(mode).toBeEnabled();
+  await expect(mode).toHaveValue('auto');
+  await expect(dialog).toContainText('新会话没有 Kit 时不附加');
+  await mode.selectOption('off');
+  await expect(dialog.getByRole('alert')).toContainText('模拟模式保存失败');
+  await expect(mode).toHaveValue('auto');
+  fail = false;
+  await dialog.getByRole('textbox').fill('保留未保存的约束草稿');
+  await mode.selectOption('off');
+  await expect(mode).toHaveValue('off');
+  await expect(dialog).toContainText('仍可从 Kit 面板操作');
+  expect(current.abilities.constraints).toBe('保留未保存的约束草稿');
+  await dialog.getByText(skill.name, { exact: true }).click();
+  await expect.poll(() => current.abilities.skills).toEqual([skill.name]);
+  expect(current.abilities.kitToolsMode).toBe('off');
+  await expect(mode).toBeEnabled();
+  const promptCard = dialog.getByRole('region', { name: '内置 Kit 调用 Prompt' });
+  await promptCard.scrollIntoViewIfNeeded();
+  const cardBounds = await promptCard.boundingBox();
+  const constraintBounds = await dialog.getByText(/^临时约束\/rule/).boundingBox();
+  expect(cardBounds).not.toBeNull();
+  expect(constraintBounds).not.toBeNull();
+  expect(cardBounds!.y + cardBounds!.height).toBeLessThanOrEqual(constraintBounds!.y);
+  await page.screenshot({ path: testInfo.outputPath('kit-prompt-activation.png'), fullPage: false });
+  await dialog.getByRole('button', { name: '关闭绑定能力' }).click();
+  dialog = await openBinding(page);
+  mode = dialog.getByRole('combobox', { name: 'Kit 调用 Prompt 激活模式' });
+  await expect(mode).toHaveValue('off');
+  await mode.selectOption('on');
+  await expect(mode).toHaveValue('on');
+  await expect(dialog).toContainText('不会自动创建或执行 Kit');
+  await mode.selectOption('auto');
+  await expect(mode).toHaveValue('auto');
+  expect(saves).toBe(5);
+  expect(kitReads).toBe(0); // Binding never loads full Kit definitions/logs or starts polling.
+});
+
 test('binding opens before metadata, never loads chat history, and failed saves remain visible', async ({ page }, testInfo) => {
   const pending: Array<() => void> = [];
   let loads = 0;

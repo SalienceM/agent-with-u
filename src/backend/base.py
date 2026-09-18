@@ -238,6 +238,7 @@ class StreamDelta:
         error: Optional[str] = None,
         usage: Optional[dict] = None,
         subagent: Optional[dict] = None,
+        diagnostic: Optional[dict] = None,
     ):
         self.session_id = session_id
         self.message_id = message_id
@@ -247,6 +248,7 @@ class StreamDelta:
         self.error = error
         self.usage = usage
         self.subagent = subagent
+        self.diagnostic = diagnostic
 
     def to_dict(self) -> dict:
         d = {
@@ -264,6 +266,8 @@ class StreamDelta:
             d["usage"] = self.usage
         if self.subagent is not None:
             d["subagent"] = self.subagent
+        if self.diagnostic is not None:
+            d["diagnostic"] = self.diagnostic
         return d
 
 

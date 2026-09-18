@@ -722,7 +722,9 @@ class CodexOfficeBackend(ModelBackend):
                 f"resume={thread_id!r}, model={model!r}, effort={effort or 'default'!r}",
                 file=sys.stderr, flush=True,
             )
+            emit("diagnostic", diagnostic={"phase": "runner_start", "model": model})
             await conn.start()
+            emit("diagnostic", diagnostic={"phase": "runner_ready"})
             approval = "never" if skip else "on-request"
             # app-server 的 thread/start 与 thread/resume 接收 SandboxMode，
             # 其 JSON 形式是 kebab-case 字符串，不是旧版 SandboxPolicy 对象。
@@ -758,6 +760,7 @@ class CodexOfficeBackend(ModelBackend):
             if effort:
                 turn_params["effort"] = effort
             started = await conn.request("turn/start", turn_params, timeout=45)
+            emit("diagnostic", diagnostic={"phase": "turn_accepted"})
             turn = started.get("turn", {}) if isinstance(started, dict) else {}
             turn_id = str(turn.get("id") or "")
             if not turn_id:

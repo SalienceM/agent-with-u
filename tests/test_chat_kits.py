@@ -208,6 +208,7 @@ class ChatKitTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(run.approval_delegation["messageId"], "new-human-message")
 
     async def test_send_wrapper_only_uses_separate_user_delegation_flag(self):
+        self.kit("available")
         leases = []
         async def capture(*args, **kwargs):
             leases.append(self.service.leases[kwargs["kit_token"]].copy())
@@ -464,6 +465,7 @@ class ChatKitTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.state.runs[0].status, "cancelled")
 
     async def test_wrapper_revokes_cli_token_even_on_exception(self):
+        self.kit("available")
         async def fail(*args, **kwargs):
             self.assertIn(kwargs["kit_token"], self.service.leases)
             raise RuntimeError("backend failed")
@@ -516,6 +518,7 @@ class ChatKitTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(list(self.service.leases), [self.token])
 
     async def test_resumed_cli_gets_fresh_token_in_content_not_saved_transcript(self):
+        self.kit("available")
         captured = []
         class Probe(ClaudeCodeOfficialBackend):
             def __init__(self):

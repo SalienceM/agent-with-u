@@ -28,6 +28,7 @@ from typing import Optional, Callable, Awaitable, Any
 
 from ..types import ModelBackendConfig, ChatMessage, ImageAttachment
 from .base import ModelBackend, StreamDelta, PermissionRequest, _exc_msg, cli_available, cli_missing_message
+from .loop_diagnostics import error_evidence
 
 
 DEFAULT_QWEN_MAX_OUTPUT_TOKENS = 32_000
@@ -681,7 +682,9 @@ class QwenCodeSdkBackend(ModelBackend):
         _tool_names_by_id: dict[str, str] = {}
 
         try:
+            emit("diagnostic", diagnostic={"phase": "runner_start", "model": model})
             async with sdk_query(prompt, options) as result:
+                emit("diagnostic", diagnostic={"phase": "runner_ready", "model": model})
                 _active_result = result
                 active_queries = getattr(self, "_active_queries", None)
                 if active_queries is None:
@@ -842,6 +845,7 @@ class QwenCodeSdkBackend(ModelBackend):
                             err_obj = msg_dict.get("error", {})
                             err_msg = err_obj.get("message", "") if isinstance(err_obj, dict) else ""
                             display_text = result_text or err_msg
+                            emit("diagnostic", diagnostic={"phase": "backend_error", **error_evidence(display_text)})
 
                             print(f"[QwenSdk] result error: subtype={subtype}, text={display_text[:300]}",
                                   file=sys.stderr, flush=True)

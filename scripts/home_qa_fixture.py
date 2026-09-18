@@ -175,6 +175,8 @@ def extras_payload(session: dict, count: int, index: int) -> dict:
         "sessionId": session["id"],
         "seqTasks": tasks,
         "seqAuto": False,
+        # UI fixtures must stay paused under executor-owned dispatch; never start real models.
+        "seqSchedulerVersion": 1,
         "asides": [],
         "asideBackendId": "qa-reviewer",
         "createdAt": updated - 1800,

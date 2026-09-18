@@ -135,10 +135,17 @@ class OpenAICompatibleBackend(ModelBackend):
                         break
                     if attempt > 0:
                         delay = _RETRY_DELAYS[attempt - 1]
+                        emit("diagnostic", diagnostic={"phase": "retry_wait", "attempt": attempt + 1,
+                             "maxAttempts": _MAX_RETRIES + 1, "delaySeconds": delay,
+                             "category": "rate_limit" if "429" in (last_error or "") else "network"})
                         print(f"[OpenAI] retry {attempt}/{_MAX_RETRIES} in {delay}s ...",
                               file=sys.stderr, flush=True)
                         await asyncio.sleep(delay)
                     try:
+                        emit("diagnostic", diagnostic={"phase": "request", "attempt": attempt + 1,
+                             "model": req_json["model"],
+                             "maxAttempts": _MAX_RETRIES + 1,
+                             "requestBytes": len(json.dumps(req_json, ensure_ascii=False).encode("utf-8"))})
                         async with httpx.AsyncClient(timeout=120.0) as client:
                             async with client.stream(
                                 "POST",
@@ -146,6 +153,7 @@ class OpenAICompatibleBackend(ModelBackend):
                                 json=req_json,
                                 headers=headers,
                             ) as response:
+                                emit("diagnostic", diagnostic={"phase": "response_headers", "httpStatus": response.status_code})
                                 if response.status_code == 429 and attempt < _MAX_RETRIES:
                                     last_error = f"API error: 429 (rate limited, retrying {attempt+1}/{_MAX_RETRIES})"
                                     print(f"[OpenAI] 429 rate limit, will retry", file=sys.stderr, flush=True)
@@ -168,6 +176,8 @@ class OpenAICompatibleBackend(ModelBackend):
                                         parsed = json.loads(data)
                                         choice = parsed.get("choices", [{}])[0]
                                         delta = choice.get("delta", {})
+                                        if delta.get("reasoning_content"):
+                                            emit("thinking", text=delta["reasoning_content"])
                                         fr = choice.get("finish_reason")
                                         if fr:
                                             _finish_reason = fr
@@ -282,4 +292,3 @@ class OpenAICompatibleBackend(ModelBackend):
                 emit("error", error=_exc_msg(e))
             emit("done")
             return {}
-

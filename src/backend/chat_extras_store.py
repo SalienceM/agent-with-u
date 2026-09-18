@@ -6,8 +6,8 @@
 
 - **序列任务 SeqTask**：用户预先排好的一串渐进明细的想法/指令。一条答完（模型整轮
   结束）再发下一条；可 auto 自动连发，也可手动一条条触发。未发送的随时可编辑/增删/
-  调序。发送由前端的显式 done 信号驱动，但取队首前还必须由后端权威运行态确认主 turn
-  已退出；error / Relay 重连都不算完成。队列本身存后端，多端同步、刷新不丢。
+  调序。执行端在主 turn 真正退出后继续派发，控制端只修改队列与暂停状态。
+  断线不暂停；执行异常保留断点，等待用户重试。
 - **旁路问答 ChatAside**：随手问，跑在独立 agent 上下文（不 resume 主线、不进
   transcript），带最近几轮聊天的只读摘要，不污染主对话。
 """
@@ -40,7 +40,8 @@ class SeqTask:
     images: list = field(default_factory=list)
     text_attachments: list = field(default_factory=list)
     delivery_mode: str = ""  # "" | redirect；redirect 表示由中断后重引导产生
-    status: str = "pending"   # pending | steering | sent
+    status: str = "pending"   # pending | steering | running | done | error | interrupted | sent(legacy)
+    error: str = ""
     created_at: float = field(default_factory=_now)
     updated_at: float = field(default_factory=_now)
 
@@ -54,6 +55,7 @@ class SeqTask:
             "textAttachmentCount": len(self.text_attachments or []),
             "deliveryMode": self.delivery_mode,
             "status": self.status,
+            "error": self.error,
             "createdAt": self.created_at,
             "updatedAt": self.updated_at,
         }
@@ -69,6 +71,7 @@ class SeqTask:
             # ``steering`` 是进程内的短暂租约；服务重启说明该 steer 已无法
             # 完成，必须恢复为 pending，避免消息永久卡死。
             status=("pending" if d.get("status") == "steering" else d.get("status", "pending")),
+            error=str(d.get("error") or ""),
             created_at=d.get("createdAt", _now()),
             updated_at=d.get("updatedAt", _now()),
         )
@@ -128,7 +131,8 @@ class ChatExtras:
     """单个普通 session 的侧挂状态文件。"""
     session_id: str
     seq_tasks: list[SeqTask] = field(default_factory=list)
-    seq_auto: bool = False
+    seq_auto: bool = True
+    seq_error: str = ""
     asides: list[ChatAside] = field(default_factory=list)
     aside_backend_id: str = ""   # by-the-way 专用 backend（空=跟随会话 backend）
     created_at: float = field(default_factory=_now)
@@ -142,6 +146,8 @@ class ChatExtras:
             "sessionId": self.session_id,
             "seqTasks": [t.to_dict() for t in self.seq_tasks],
             "seqAuto": self.seq_auto,
+            "seqError": self.seq_error,
+            "seqSchedulerVersion": 1,
             "asides": [a.to_dict() for a in self.asides],
             "asideBackendId": self.aside_backend_id,
             "createdAt": self.created_at,
@@ -153,7 +159,9 @@ class ChatExtras:
         return cls(
             session_id=d.get("sessionId", ""),
             seq_tasks=[SeqTask.from_dict(x) for x in d.get("seqTasks", [])],
-            seq_auto=bool(d.get("seqAuto", False)),
+            # 旧版 seqAuto 已弃用，False 不代表用户暂停；新版才有持久暂停语义。
+            seq_auto=bool(d.get("seqAuto", True)) if d.get("seqSchedulerVersion") == 1 else True,
+            seq_error=str(d.get("seqError") or ""),
             asides=[ChatAside.from_dict(x) for x in d.get("asides", [])],
             aside_backend_id=d.get("asideBackendId", "") or "",
             created_at=d.get("createdAt", _now()),
@@ -186,10 +194,16 @@ class ChatExtrasStore:
     def save(self, ex: ChatExtras) -> None:
         ex.updated_at = _now()
         with self._lock:
-            self._path(ex.session_id).write_text(
+            target = self._path(ex.session_id)
+            temporary = target.with_suffix(".json.tmp")
+            temporary.write_text(
                 json.dumps(ex.to_dict(), ensure_ascii=False, indent=2),
                 encoding="utf-8",
             )
+            temporary.replace(target)
+
+    def session_ids(self) -> list[str]:
+        return [path.stem for path in self._dir.glob("*.json")]
 
     def create(self, sid: str) -> ChatExtras:
         ex = ChatExtras(session_id=sid)

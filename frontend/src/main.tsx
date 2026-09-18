@@ -3,6 +3,8 @@ import { createRoot } from 'react-dom/client';
 import { App } from './App';
 import { ScratchPadWindow, isScratchPadWindow } from './components/ScratchPad';
 import { ThoughtsAssistantWindow, isThoughtsWindow } from './components/ThoughtsAssistant';
+import { SkillManualWindow } from './components/SkillManual';
+import { isSkillManualWindow } from './utils/skillManual';
 import { SmoothRegionSelector, isSmoothRegionSelector } from './components/SmoothRegionSelector';
 import { SmoothGhostWindow, isSmoothGhostWindow } from './components/SmoothGhostWindow';
 import { api } from './api';
@@ -11,7 +13,7 @@ import { ErrorBoundary } from './components/ErrorBoundary';
 
 // Web/平板缓存应用外壳；文件正文另存于 IndexedDB。Tauri 不注册，避免与
 // sidecar 的版本更新产生双重缓存。
-if (!isScratchPadWindow && !isThoughtsWindow && !isSmoothGhostWindow && !isSmoothRegionSelector
+if (!isScratchPadWindow && !isThoughtsWindow && !isSkillManualWindow && !isSmoothGhostWindow && !isSmoothRegionSelector
   && typeof navigator !== 'undefined' && 'serviceWorker' in navigator
   && typeof (window as any).__TAURI_INTERNALS__ === 'undefined') {
   window.addEventListener('load', () => {
@@ -65,7 +67,7 @@ window.addEventListener('unhandledrejection', (ev) => {
 // 全局流路由：所有 session 的 streamDelta 都进 streamStates Map,不论 UI 当前
 // 看的是哪个 session。必须在 React 挂载之前装,确保它的订阅者排在 useChat
 // 的订阅者之前(forEach 按 push 顺序触发)。
-if (!isSmoothGhostWindow && !isSmoothRegionSelector && !isScratchPadWindow) {
+if (!isSmoothGhostWindow && !isSmoothRegionSelector && !isScratchPadWindow && !isSkillManualWindow) {
   installGlobalStreamRouter(api);
 }
 
@@ -158,7 +160,7 @@ createRoot(document.getElementById('root')!).render(
           ? <ScratchPadWindow />
           : isThoughtsWindow
             ? <ThoughtsAssistantWindow />
-            : <App />}
+            : isSkillManualWindow ? <SkillManualWindow /> : <App />}
   </ErrorBoundary>,
 );
 _reactMounted = true; // React 已接管，后续错误由 ErrorBoundary 处理

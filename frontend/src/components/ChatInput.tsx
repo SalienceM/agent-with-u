@@ -6,7 +6,8 @@ import type { ImageAttachment } from '../hooks/useClipboardImage';
 import type { TextAttachment, TextAttachmentSource } from '../types/attachments';
 import { SLASH_COMMANDS } from '../hooks/useChat';
 import type { SlashCommand } from '../hooks/useChat';
-import { api, isTauri } from '../api';
+import { api, isTauri, onCurrentUserChanged, getExecutors } from '../api';
+import { isSkillCommand, slashQuery, skillInvocation, type SkillInvocation, type SkillCommand } from '../utils/skillCommands';
 import { RealtimeVoiceBar } from './RealtimeVoiceBar';
 import type { RealtimeVoiceInteractionMode } from '../utils/realtimeVoice';
 import { uuid } from '../utils/uuid';
@@ -130,6 +131,7 @@ interface Props {
     images?: ImageAttachment[],
     textAttachments?: TextAttachment[],
     kitApprovalDelegation?: boolean,
+    skillInvocation?: SkillInvocation,
   ) => void;
   onAbort: () => void;
   isStreaming: boolean;
@@ -398,7 +400,46 @@ const ChatInputInner: React.FC<Props> = ({
   //  ★ 斜杠命令自动补全状态
   // ═══════════════════════════════════════
   const [showCommands, setShowCommands] = useState(false);
-  const [filteredCommands, setFilteredCommands] = useState<SlashCommand[]>([]);
+  const [commandQuery, setCommandQuery] = useState('');
+  const [skillCommands, setSkillCommands] = useState<SkillCommand[]>([]);
+  const [commandLoading, setCommandLoading] = useState(false);
+  const [commandError, setCommandError] = useState('');
+  const [commandRevision, setCommandRevision] = useState(0);
+  const skillCommandsRef = useRef(skillCommands);
+  skillCommandsRef.current = skillCommands;
+  const filteredCommands = useMemo<SlashCommand[]>(() => [
+    ...SLASH_COMMANDS,
+    ...skillCommands.map(item => ({ ...item, shortDesc: item.skillName })),
+  ].filter(item => item.name.toLowerCase().startsWith(commandQuery)), [commandQuery, skillCommands]);
+  // 仅打开菜单时读取本节点已绑定的元数据；输入每个字符、流式输出不触发 RPC。
+  useEffect(() => {
+    setSkillCommands([]);
+    setShowCommands(false);
+    setCommandError('');
+  }, [sessionId, execKey, activeBackendId]);
+  useEffect(() => onCurrentUserChanged(() => {
+    setSkillCommands([]); setShowCommands(false); setCommandRevision(value => value + 1);
+  }), []);
+  useEffect(() => {
+    if (!showCommands || !sessionId || isFocused === false) return;
+    let cancelled = false;
+    setCommandLoading(true); setCommandError('');
+    void api.listSessionSkillCommands(sessionId, execKey).then(result => {
+      if (!cancelled) setSkillCommands(result.commands);
+    }).catch((error: unknown) => {
+      if (!cancelled) { setSkillCommands([]); setCommandError(error instanceof Error ? error.message : 'Skill 命令加载失败'); }
+    }).finally(() => { if (!cancelled) setCommandLoading(false); });
+    return () => { cancelled = true; };
+  }, [showCommands, sessionId, execKey, activeBackendId, isFocused, commandRevision]);
+  useEffect(() => {
+    let previous = JSON.stringify(api.peekSessionMeta(sessionId || '')?.abilities?.skills || []);
+    return api.onSessionUpdated((data: any) => {
+      if (data.sessionId !== sessionId || !data.summary?.abilities) return;
+      const key = JSON.stringify(data.summary.abilities.skills || []);
+      if (key !== previous) setCommandRevision(value => value + 1);
+      previous = key;
+    });
+  }, [sessionId]);
   const [selectedIndex, setSelectedIndex] = useState(0);
   const popupRef = useRef<HTMLDivElement>(null);
 
@@ -1082,6 +1123,10 @@ const ChatInputInner: React.FC<Props> = ({
     const imgs = imagesRef.current;
     const textFiles = textAttachmentsRef.current;
     if (!text && imgs.length === 0 && textFiles.length === 0) return;
+    if (isSkillCommand(text) && (isStreamingRef.current || seqCountRef.current > 0)) {
+      setAttachmentNotice('Skill 命令尚未发送，请等待当前轮及队列结束；命令与参数已保留在输入框。');
+      return;
+    }
     // 不把本次委托悄悄带入自动队列、斜杠命令或未来轮次。
     if (kitApprovalDelegationRef.current && (isStreamingRef.current || seqCountRef.current > 0 || text.startsWith('/'))) {
       setAttachmentNotice('Kit 代确认只支持空闲时直接发送普通消息，请关闭代确认开关或等待当前轮结束。');
@@ -1107,6 +1152,7 @@ const ChatInputInner: React.FC<Props> = ({
         imgs.length > 0 ? imgs : undefined,
         textFiles.length > 0 ? textFiles : undefined,
         kitApprovalDelegationRef.current,
+        isSkillCommand(text) ? skillInvocation(text, skillCommandsRef.current) : undefined,
       );
     }
     kitApprovalDelegationRef.current = false;
@@ -1245,12 +1291,17 @@ const ChatInputInner: React.FC<Props> = ({
         }
         if (e.key === 'Enter' && !e.shiftKey) {
           e.preventDefault();
-          // Enter: 补全并执行
+          // Skill/带参数命令先补全，第二次发送才执行，不能空参数误启动工作流。
           const cmd = filteredCommandsRef.current[selectedIndexRef.current];
           if (cmd && ref.current) {
-            ref.current.value = cmd.name;
+            ref.current.value = cmd.name + (cmd.requiresArguments ? ' ' : '');
           }
           setShowCommands(false);
+          if (cmd?.requiresArguments) {
+            saveSessionDraft(ref.current?.value || '');
+            scheduleTextareaResize(true);
+            return;
+          }
           handleSend();
           return;
         }
@@ -1459,13 +1510,10 @@ const ChatInputInner: React.FC<Props> = ({
     }
 
     // ★ 斜杠命令检测（仅在行首 / 时触发）
-    if (text.startsWith('/') && !text.includes(' ') && text.length > 0) {
-      const query = text.toLowerCase();
-      const matched = SLASH_COMMANDS.filter((cmd) =>
-        cmd.name.startsWith(query)
-      );
-      setFilteredCommands(matched);
-      setShowCommands(matched.length > 0);
+    const query = slashQuery(text);
+    if (query !== null) {
+      setCommandQuery(query);
+      setShowCommands(true);
       setSelectedIndex(0);
     } else {
       setShowCommands(false);
@@ -1475,12 +1523,17 @@ const ChatInputInner: React.FC<Props> = ({
   // ── 点击选择命令 ──
   const handleSelectCommand = useCallback((cmd: SlashCommand) => {
     if (ref.current) {
-      ref.current.value = cmd.name;
+      ref.current.value = cmd.name + (cmd.requiresArguments ? ' ' : '');
       ref.current.focus();
     }
     setShowCommands(false);
+    if (cmd.requiresArguments) {
+      saveSessionDraft(ref.current?.value || '');
+      scheduleTextareaResize(true);
+      return;
+    }
     handleSend();
-  }, [handleSend]);
+  }, [handleSend, saveSessionDraft, scheduleTextareaResize]);
 
   useEffect(() => {
     ref.current?.focus();
@@ -1489,7 +1542,7 @@ const ChatInputInner: React.FC<Props> = ({
   // 滚动选中项到可见区域（斜杠命令）
   useEffect(() => {
     if (showCommands && popupRef.current) {
-      const items = popupRef.current.children;
+      const items = popupRef.current.querySelectorAll('[role="option"]');
       if (items[selectedIndex]) {
         (items[selectedIndex] as HTMLElement).scrollIntoView({ block: 'nearest' });
       }
@@ -1837,11 +1890,25 @@ const ChatInputInner: React.FC<Props> = ({
       )}
 
       {/* ★ 斜杠命令弹窗 */}
-      {showCommands && filteredCommands.length > 0 && (
-        <div ref={popupRef} style={commandPopupStyle}>
+      {showCommands && (
+        <div ref={popupRef} style={commandPopupStyle} role="listbox" aria-label="聊天命令">
+          <div style={{ padding: '6px 10px', fontSize: 11, color: 'var(--theme-text-muted)', overflowWrap: 'anywhere' }}>
+            Skill 执行节点：{getExecutors().find(item => item.key === execKey)?.label || execKey || '当前会话节点'} · {workingDir || '未设置项目目录'}
+            <div>{commandLoading ? '读取已启用的 Skill…' : commandError || 'Skill 命令发送前会检查依赖，不自动安装或初始化。'}</div>
+            <button type="button" aria-label="刷新 Skill 命令" onClick={() => setCommandRevision(value => value + 1)} disabled={commandLoading}
+              style={{ marginTop: 4, padding: '4px 8px', borderRadius: 5, fontSize: 11,
+                border: '1px solid var(--theme-border, rgba(255,255,255,0.12))',
+                background: 'var(--theme-bg-tertiary)', color: 'var(--theme-text-muted)',
+                cursor: commandLoading ? 'wait' : 'pointer', opacity: commandLoading ? 0.6 : 1 }}>
+              刷新命令
+            </button>
+          </div>
+          {!commandLoading && !commandError && filteredCommands.length === 0 && <div style={{ padding: 10, fontSize: 12 }}>没有匹配命令。请先在本节点安装并绑定 Skill，或输入 /skill 技能名 参数查看具体检查结果。</div>}
           {filteredCommands.map((cmd, i) => (
             <div
               key={cmd.name}
+              role="option" aria-selected={i === selectedIndex}
+              title={cmd.unavailableReason || cmd.source || 'AgentWithU 应用命令'}
               style={{
                 ...commandItemStyle,
                 background: i === selectedIndex ? 'var(--theme-bg-tertiary, #eaeef2)' : 'transparent',
@@ -1849,16 +1916,16 @@ const ChatInputInner: React.FC<Props> = ({
               onClick={() => handleSelectCommand(cmd)}
               onMouseEnter={() => setSelectedIndex(i)}
             >
-              <span style={{ fontFamily: 'monospace', fontWeight: 600, color: 'var(--theme-accent, #0969da)', minWidth: 120, display: 'inline-block' }}>
+              <span style={{ fontFamily: 'monospace', fontWeight: 600, color: 'var(--theme-accent, #0969da)', minWidth: 0, overflowWrap: 'anywhere', display: 'inline-block' }}>
                 {cmd.name}
               </span>
               <span style={{ color: 'var(--theme-text-muted, #656d76)', fontSize: 12 }}>
-                {cmd.description}
+                {cmd.unavailableReason || cmd.description}{cmd.source && <small style={{ display: 'block' }}>来源：{cmd.source}</small>}
               </span>
             </div>
           ))}
           <div style={{ padding: '4px 10px', fontSize: 10, color: 'var(--theme-text-muted, #656d76)', borderTop: '1px solid var(--theme-border, rgba(0,0,0,0.08))' }}>
-            ↑↓ 导航 · Tab 补全 · Enter 执行 · Esc 关闭
+            ↑↓ 导航 · Tab 补全 · Skill/带参数命令先填入，发送后执行 · Esc 关闭
           </div>
         </div>
       )}

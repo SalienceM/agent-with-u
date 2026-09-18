@@ -60,25 +60,25 @@ class SequenceDispatchGuardTests(unittest.IsolatedAsyncioTestCase):
 
         result = json.loads(bridge._rpc_seqtaskTakeNext("session-1"))
 
-        self.assertEqual(result["status"], "busy")
+        self.assertEqual(result["status"], "server_managed")
         self.assertIsNone(result["task"])
         self.assertEqual(extras.seq_tasks[0].status, "pending")
         blocker.set()
         await running
 
-    async def test_take_next_reserves_dispatch_window(self) -> None:
+    async def test_legacy_take_next_never_claims_a_task(self) -> None:
         bridge, extras = self._bridge_with_task()
 
         first = json.loads(bridge._rpc_seqtaskTakeNext("session-1"))
         second = json.loads(bridge._rpc_seqtaskTakeNext("session-1"))
         state = json.loads(bridge._rpc_getSessionRunState("session-1"))
 
-        self.assertEqual(first["status"], "ok")
-        self.assertEqual(first["task"]["id"], "task-1")
-        self.assertEqual(extras.seq_tasks[0].status, "sent")
-        self.assertEqual(second["status"], "busy")
-        self.assertTrue(state["busy"])
-        self.assertTrue(state["dispatchReserved"])
+        self.assertEqual(first["status"], "server_managed")
+        self.assertIsNone(first["task"])
+        self.assertEqual(extras.seq_tasks[0].status, "pending")
+        self.assertEqual(second["status"], "server_managed")
+        self.assertFalse(state["busy"])
+        self.assertFalse(state["dispatchReserved"])
 
     async def test_take_next_skips_task_being_steered(self) -> None:
         bridge, extras = self._bridge_with_task()
@@ -87,8 +87,8 @@ class SequenceDispatchGuardTests(unittest.IsolatedAsyncioTestCase):
 
         result = json.loads(bridge._rpc_seqtaskTakeNext("session-1"))
 
-        self.assertEqual(result["status"], "ok")
-        self.assertEqual(result["task"]["id"], "task-2")
+        self.assertEqual(result["status"], "server_managed")
+        self.assertIsNone(result["task"])
         self.assertEqual(extras.seq_tasks[0].status, "steering")
 
     async def test_send_message_tracks_real_task_lifetime(self) -> None:

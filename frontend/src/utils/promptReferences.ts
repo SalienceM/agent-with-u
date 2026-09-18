@@ -1,4 +1,4 @@
-export type PromptReferenceKind = 'file' | 'session';
+export type PromptReferenceKind = 'file' | 'session' | 'skill';
 
 export interface PromptReferenceTrigger {
   kind: PromptReferenceKind;
@@ -15,6 +15,7 @@ export interface PromptReferenceTrigger {
 export function detectPromptReference(
   value: string,
   cursor: number = value.length,
+  allowSkills = false,
 ): PromptReferenceTrigger | null {
   const safeCursor = Math.max(0, Math.min(cursor, value.length));
   const before = value.slice(0, safeCursor);
@@ -22,6 +23,9 @@ export function detectPromptReference(
   if (start < 0) return null;
   const token = before.slice(start + 1);
   if (/\s/.test(token)) return null;
+  if (allowSkills && /^SKILL(?::.*)?$/i.test(token)) {
+    return { kind: 'skill', start, cursor: safeCursor, query: token.includes(':') ? token.slice(token.indexOf(':') + 1) : '', expandSessionPrefix: false };
+  }
   if (/^SE$/i.test(token)) {
     return { kind: 'session', start, cursor: safeCursor, query: '', expandSessionPrefix: true };
   }

@@ -259,7 +259,7 @@ class Session:
     # ★ Constraints/rules/prompts for this session -限定性提示词/规则/约束
     constraints: Optional[str] = None  # Special system prompts, rules, or constraints for this session
     # ★ Repo 能力绑定 — 替代 constraints 的新模式
-    abilities: Optional[dict] = None  # {"skills": ["skill-name"], "prompts": ["prompt-name"]}
+    abilities: Optional[dict] = None  # {skills: [...], prompts: [...], kitToolsMode?: auto|on|off}
     # ★ 会话类型：普通会话 / 可视化 loop 会话（loop 状态另存于 loops/<id>.json）
     session_type: str = "normal"  # "normal" | "loop"
     # LOOP 当前所有权的轻量镜像。完整 stage 仍以 LoopState 为准；这个字段只用于

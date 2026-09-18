@@ -21,6 +21,7 @@ export interface SeqTaskT {
   textAttachmentCount?: number;
   deliveryMode?: 'redirect';
   status: string;
+  error?: string;
   createdAt?: number;
   syncing?: boolean;
 }
@@ -28,21 +29,24 @@ export interface SeqTaskT {
 interface Props {
   sessionId: string;
   tasks: SeqTaskT[];
-  chainActive?: boolean;   // false 通常表示应用重启后保留的队列尚未恢复
+  chainActive?: boolean;   // 执行端持久化的自动调度开关
+  queueError?: string;
   isStreaming: boolean;
   onSendNext: () => void;
+  onPause?: () => void;
   canSteer?: boolean;
   onSteerTask?: (taskId: string) => Promise<{ status: string; message?: string }>;
   onTasksChange?: (tasks: SeqTaskT[]) => void;
 }
 
 export const SeqTaskPanel: React.FC<Props> = ({
-  sessionId, tasks, chainActive, isStreaming, onSendNext, canSteer, onSteerTask, onTasksChange,
+  sessionId, tasks, chainActive, queueError, isStreaming, onSendNext, onPause, canSteer, onSteerTask, onTasksChange,
 }) => {
-  const pending = tasks.filter((t) => t.status === 'pending' || t.status === 'steering');
-  const readyPending = pending.filter((t) => t.status === 'pending' && !t.syncing);
+  const pending = tasks.filter((t) => ['pending', 'steering', 'error'].includes(t.status));
+  const running = tasks.some((t) => t.status === 'running');
+  const failed = tasks.some((t) => t.status === 'error');
   const hasSyncing = pending.some((t) => t.syncing);
-  const sent = tasks.filter((t) => t.status === 'sent');
+  const sent = tasks.filter((t) => ['sent', 'done', 'interrupted'].includes(t.status));
   const [open, setOpen] = useState(false);   // 默认收起,只留一条 slim 条
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editText, setEditText] = useState('');
@@ -244,7 +248,7 @@ export const SeqTaskPanel: React.FC<Props> = ({
     }
   }, [onSteerTask]);
 
-  const canSendNext = readyPending.length > 0 && !isStreaming;
+  const canSendNext = !hasSyncing;
 
   return (
     <div style={wrap}>
@@ -261,10 +265,13 @@ export const SeqTaskPanel: React.FC<Props> = ({
         <div style={{ flex: 1 }} />
         {chainActive === false && (
           <button onClick={onSendNext} disabled={!canSendNext}
-            title={isStreaming ? '当前回答结束后可恢复队列' : '恢复保留的序列队列'}
+            title={failed ? '重试失败条目并继续；已执行的部分操作可能重复，请先核对聊天结果' : '恢复执行端自动调度，当前回答结束后继续'}
             style={{ ...sendBtn, opacity: canSendNext ? 1 : 0.45, cursor: canSendNext ? 'pointer' : 'not-allowed' }}>
-            ▶ 继续
+            {failed ? '↻ 重试并继续' : '▶ 继续'}
           </button>
+        )}
+        {chainActive && onPause && (
+          <button onClick={onPause} style={sendBtn} title="暂停后续任务，不中断当前回答；状态保存在执行端">⏸ 暂停</button>
         )}
         {pending.length > 0 && (
           <button onClick={() => void clearTasks()} disabled={hasSyncing}
@@ -274,13 +281,14 @@ export const SeqTaskPanel: React.FC<Props> = ({
       </div>
 
       {mutationError && <div style={mutationErrorStyle}>⚠ {mutationError}</div>}
+      {queueError && <div style={mutationErrorStyle}>⚠ {queueError}</div>}
 
       {/* 收起时也给出自动队列状态，避免用户误以为新输入丢失。 */}
-      {pending.length > 0 && (
+      {(pending.length > 0 || running || chainActive === false) && (
         <div style={autoHint}>
           {chainActive === false
-            ? '⏸ 已保留上次队列，点「▶ 继续」后恢复。'
-            : isStreaming ? '⏳ 当前回答完成后自动发送下一条。' : '⚡ 正在发送下一条…'}
+            ? '⏸ 执行端已暂停后续任务；重新打开控制端不会自动解除暂停。'
+            : isStreaming || running ? '⏳ 执行端按序执行，关闭控制端不影响后续任务。' : '⚡ 等待执行端派发下一条…'}
         </div>
       )}
 
@@ -318,7 +326,7 @@ export const SeqTaskPanel: React.FC<Props> = ({
                 </div>
               ) : (
                 <div style={{ flex: 1, minWidth: 0 }}
-                  onClick={() => { if (t.status === 'pending' && !t.syncing) startEdit(t); }}
+                  onClick={() => { if (['pending', 'error'].includes(t.status) && !t.syncing) startEdit(t); }}
                   title={t.syncing ? '正在同步到执行端' : t.status === 'pending' ? '点击编辑' : '正在引导当前轮'}>
                   <div style={taskLine}>
                     <span style={taskText}>{t.text || <span style={{ color: 'var(--theme-text-muted)' }}>（仅附件）</span>}</span>
@@ -342,6 +350,7 @@ export const SeqTaskPanel: React.FC<Props> = ({
                     )}
                   </div>
                   {steerErrors[t.id] && <div style={steerError}>{steerErrors[t.id]}</div>}
+                  {t.error && <div style={steerError}>{t.error}</div>}
                   {!!(t.imageCount || t.images?.length) && (
                     <span style={imgBadge}>🖼️ {t.imageCount ?? t.images?.length}</span>
                   )}
@@ -373,11 +382,11 @@ export const SeqTaskPanel: React.FC<Props> = ({
                 onClick={() => setHistoryOpen(!historyOpen)}
                 style={historyToggleBtn}
               >
-                {historyOpen ? '▾' : '▸'} 📋 已发送历史 ({sent.length})
+                {historyOpen ? '▾' : '▸'} 📋 执行历史 ({sent.length})
               </button>
               {historyOpen && sent.map((t) => (
                 <div key={t.id} style={historyCard}>
-                  <span style={historyBadge}>✓</span>
+                  <span style={historyBadge}>{t.status === 'interrupted' ? '⏹' : '✓'}</span>
                   {editingHistoryId === t.id ? (
                     <div style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: 6 }}>
                       <div style={historyText}>{t.text}</div>
@@ -407,6 +416,7 @@ export const SeqTaskPanel: React.FC<Props> = ({
                   ) : (
                     <>
                       <div style={{ flex: 1, minWidth: 0 }} onClick={() => startHistoryEdit(t)} title="点击编辑图片">
+                        {t.error && <div style={steerError}>{t.error}</div>}
                         <div style={historyText}>{t.text || <span style={{ color: 'var(--theme-text-muted)' }}>（仅附件）</span>}</div>
                         {!!(t.imageCount || t.images?.length) && (
                           <span style={imgBadge}>🖼️ {t.imageCount ?? t.images?.length}</span>

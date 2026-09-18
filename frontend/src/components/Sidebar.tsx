@@ -14,7 +14,7 @@ interface Session {
   updatedAt: number;
   workingDir: string;
   backendId: string;
-  abilities?: { skills: string[]; prompts: string[]; constraints?: string };
+  abilities?: { skills: string[]; prompts: string[]; constraints?: string; kitToolsMode?: 'auto' | 'on' | 'off' };
   // ★ session 级执行节点归属（由 api.listSessions 合并时注入）
   execKey?: string;
   execLabel?: string;
@@ -1168,13 +1168,13 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
 
             {/* 主体内容：上下布局 */}
             <div style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: 16, minHeight: 0, overflowY: 'auto', pointerEvents: !abilityReady || abilitySaving ? 'none' : undefined, opacity: abilitySaving ? 0.6 : 1 }}>
-              {/* 上方：Skills 和 Prompts 左右分栏 - 占 45% */}
-              <div style={{ flex: '0 0 45%', display: 'flex', flexDirection: isMobile ? 'column' : 'row', gap: 12, minHeight: isMobile ? 220 : 140 }}>
+              {/* 桌面分栏；手机按内容高度排列，避免固定比例让 Prompt 卡片溢出覆盖约束区。 */}
+              <div style={{ flex: isMobile ? '0 0 auto' : '0 0 45%', display: 'flex', flexDirection: isMobile ? 'column' : 'row', gap: 12, minHeight: isMobile ? undefined : 140 }}>
                 {/* Skills 列 */}
-                <div style={{ flex: 1, display: 'flex', flexDirection: 'column', minWidth: 0 }}>
+                <div style={{ flex: isMobile ? '0 0 auto' : 1, display: 'flex', flexDirection: 'column', minWidth: 0, minHeight: 0 }}>
                   <div style={{ fontSize: 11, fontWeight: 600, color: 'var(--theme-text)', marginBottom: 6, textTransform: 'uppercase' }}>⚡ Skills</div>
                   <div style={{
-                    flex: 1, overflowY: 'auto', border: '1px solid var(--theme-border)',
+                    flex: isMobile ? '0 0 auto' : 1, overflowY: 'auto', border: '1px solid var(--theme-border)',
                     borderRadius: 8, overflowX: 'hidden', padding: '4px'
                   }}>
                     {availableSkills.length > 0 ? (
@@ -1226,12 +1226,36 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
                 </div>
 
                 {/* Prompts 列 */}
-                <div style={{ flex: 1, display: 'flex', flexDirection: 'column', minWidth: 0 }}>
+                <div style={{ flex: isMobile ? '0 0 auto' : 1, display: 'flex', flexDirection: 'column', minWidth: 0, minHeight: 0 }}>
                   <div style={{ fontSize: 11, fontWeight: 600, color: 'var(--theme-text)', marginBottom: 6, textTransform: 'uppercase' }}>📝 Prompts</div>
                   <div style={{
-                    flex: 1, overflowY: 'auto', border: '1px solid var(--theme-border)',
+                    flex: isMobile ? '0 0 auto' : 1, overflowY: 'auto', border: '1px solid var(--theme-border)',
                     borderRadius: 8, overflowX: 'hidden', padding: '4px'
                   }}>
+                    <section aria-label="内置 Kit 调用 Prompt" style={{ padding: '8px 10px', borderBottom: '1px solid var(--theme-border)', background: 'var(--theme-accent-bg)', borderRadius: 6, marginBottom: 4 }}>
+                      <label style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', fontSize: 12, fontWeight: 600 }}>
+                        🧰 Kit 调用 <span style={{ color: 'var(--theme-text-muted)', fontSize: 10 }}>内置 Prompt</span>
+                        <select aria-label="Kit 调用 Prompt 激活模式" disabled={!abilityReady || abilitySaving}
+                          value={abilityPickerSession.abilities?.kitToolsMode || 'auto'}
+                          onChange={event => {
+                            const current = abilityPickerSession.abilities || { skills: [], prompts: [] };
+                            void saveAbilities({ ...current, constraints: constraintsValue,
+                              kitToolsMode: event.target.value as 'auto' | 'on' | 'off' });
+                          }} style={{ fontSize: 12, borderRadius: 5, padding: '4px 6px', color: 'var(--theme-text)', background: 'var(--theme-bg-secondary)', border: '1px solid var(--theme-border)' }}>
+                          <option value="auto">自动（默认）</option>
+                          <option value="on">始终启用</option>
+                          <option value="off">停用</option>
+                        </select>
+                      </label>
+                      <div style={{ fontSize: 11, color: 'var(--theme-text-muted)', lineHeight: 1.6, marginTop: 6 }}>
+                        {(abilityPickerSession.abilities?.kitToolsMode || 'auto') === 'auto'
+                          ? '仅当前 Session 有启用的 Kit 或未结束的 Kit 运行时附加；新会话没有 Kit 时不附加。'
+                          : abilityPickerSession.abilities?.kitToolsMode === 'on'
+                            ? '每次发送附加 Kit 调用说明，可查询空列表；不会自动创建或执行 Kit。'
+                            : '不再附加 Kit 调用说明、API 工具或令牌；仍可从 Kit 面板操作。'}
+                        <div>下一次发送生效，不清除历史上下文、不取消已有运行。启用 ≠ 执行授权；发布代确认仍需单独勾选「仅本次」。</div>
+                      </div>
+                    </section>
                     {availablePrompts.length > 0 ? (
                       availablePrompts.map((p: any) => {
                         const bound = (abilityPickerSession.abilities?.prompts || []).includes(p.name);
@@ -1274,7 +1298,7 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
                       })
                     ) : (
                       <div style={{ padding: 12, textAlign: 'center', color: 'var(--theme-text-muted)', fontSize: 12 }}>
-                        {abilityLoading ? '正在加载 Prompts…' : abilityReady ? '该节点暂无 Prompts' : 'Prompts 未加载'}
+                        {abilityLoading ? '正在加载 Prompts…' : abilityReady ? '该节点暂无自定义 Prompts' : 'Prompts 未加载'}
                       </div>
                     )}
                   </div>

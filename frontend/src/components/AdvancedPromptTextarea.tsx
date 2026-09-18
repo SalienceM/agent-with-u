@@ -1,16 +1,17 @@
 import React, {
   useCallback, useEffect, useId, useMemo, useRef, useState,
 } from 'react';
-import { api } from '../api';
+import { api, onCurrentUserChanged } from '../api';
 import {
   detectPromptReference,
   replacePromptReference,
   type PromptReferenceTrigger,
 } from '../utils/promptReferences';
 import { AppModalPortal } from './AppModalPortal';
+import type { SkillManualSummary } from '../utils/skillManual';
 
 type FileEntry = { name: string; path: string; isDir: boolean };
-type PickerMode = 'file' | 'session' | null;
+type PickerMode = 'file' | 'session' | 'skill' | null;
 
 export interface AdvancedPromptTextareaProps extends Omit<
   React.TextareaHTMLAttributes<HTMLTextAreaElement>,
@@ -23,6 +24,7 @@ export interface AdvancedPromptTextareaProps extends Omit<
   execKey?: string;
   textareaRef?: React.RefObject<HTMLTextAreaElement>;
   containerStyle?: React.CSSProperties;
+  enableSkillReferences?: boolean;
 }
 
 interface PopupPosition {
@@ -45,6 +47,7 @@ export const AdvancedPromptTextarea: React.FC<AdvancedPromptTextareaProps> = ({
   execKey,
   textareaRef,
   containerStyle,
+  enableSkillReferences = false,
   onKeyDown,
   onCompositionStart,
   onCompositionEnd,
@@ -62,6 +65,11 @@ export const AdvancedPromptTextarea: React.FC<AdvancedPromptTextareaProps> = ({
   const pickerRef = useRef<PickerMode>(null);
   const fileRequestRef = useRef(0);
   const sessionRequestRef = useRef(0);
+  const skillRequestRef = useRef(0);
+  const [skillRefs, setSkillRefs] = useState<SkillManualSummary[]>([]);
+  const [skillQuery, setSkillQuery] = useState('');
+  const [skillLoading, setSkillLoading] = useState(false);
+  const [skillError, setSkillError] = useState('');
   const listboxId = useId();
 
   const [picker, setPickerState] = useState<PickerMode>(null);
@@ -84,6 +92,7 @@ export const AdvancedPromptTextarea: React.FC<AdvancedPromptTextareaProps> = ({
     activeTriggerRef.current = null;
     fileRequestRef.current += 1;
     sessionRequestRef.current += 1;
+    skillRequestRef.current += 1;
     setPicker(null);
     setSelectedIndex(0);
   }, [setPicker]);
@@ -100,13 +109,13 @@ export const AdvancedPromptTextarea: React.FC<AdvancedPromptTextareaProps> = ({
   const replaceActive = useCallback((replacement: string, close = true) => {
     const input = inputRef.current;
     const trigger = activeTriggerRef.current
-      || detectPromptReference(value, input?.selectionStart ?? value.length);
+      || detectPromptReference(value, input?.selectionStart ?? value.length, enableSkillReferences);
     if (!trigger) return;
     const next = replacePromptReference(value, trigger, replacement);
     onValueChange(next.value);
     if (close) closePicker();
     restoreCaret(next.cursor);
-  }, [closePicker, inputRef, onValueChange, restoreCaret, value]);
+  }, [closePicker, inputRef, onValueChange, restoreCaret, value, enableSkillReferences]);
 
   const loadDirectory = useCallback(async (dir: string) => {
     const version = ++fileRequestRef.current;
@@ -148,11 +157,28 @@ export const AdvancedPromptTextarea: React.FC<AdvancedPromptTextareaProps> = ({
     restoreCaret(next.cursor);
   }, [inputRef, loadSessions, onValueChange, restoreCaret, setPicker, value]);
 
+  const loadSkills = useCallback(async () => {
+    const version = ++skillRequestRef.current;
+    setSkillLoading(true); setSkillError('');
+    try {
+      if (!execKey) throw new Error('尚未确认 Session 执行节点，请稍后重试');
+      const entries = await api.listSkillManuals(execKey);
+      if (version === skillRequestRef.current) setSkillRefs(entries);
+    } catch (reason) { if (version === skillRequestRef.current) { setSkillRefs([]); setSkillError(String(reason)); } }
+    finally { if (version === skillRequestRef.current) setSkillLoading(false); }
+  }, [execKey]);
+
   const inspectValue = useCallback((nextValue: string, cursor: number) => {
-    const trigger = detectPromptReference(nextValue, cursor);
+    const trigger = detectPromptReference(nextValue, cursor, enableSkillReferences);
     activeTriggerRef.current = trigger;
     if (!trigger) {
       closePicker();
+      return;
+    }
+    if (trigger.kind === 'skill') {
+      fileRequestRef.current += 1; sessionRequestRef.current += 1;
+      setSkillQuery(trigger.query); setSelectedIndex(0);
+      if (pickerRef.current !== 'skill') { setSkillRefs([]); setPicker('skill'); void loadSkills(); }
       return;
     }
     if (trigger.kind === 'session') {
@@ -189,7 +215,7 @@ export const AdvancedPromptTextarea: React.FC<AdvancedPromptTextareaProps> = ({
       setPicker('file');
       void loadDirectory('.');
     }
-  }, [closePicker, loadDirectory, loadSessions, onValueChange, restoreCaret, setPicker]);
+  }, [closePicker, loadDirectory, loadSessions, loadSkills, enableSkillReferences, onValueChange, restoreCaret, setPicker]);
 
   const handleChange = useCallback((event: React.ChangeEvent<HTMLTextAreaElement>) => {
     const nextValue = event.currentTarget.value;
@@ -253,7 +279,8 @@ export const AdvancedPromptTextarea: React.FC<AdvancedPromptTextareaProps> = ({
 
   const handlePickerKey = useCallback((event: React.KeyboardEvent<HTMLTextAreaElement>): boolean => {
     if (!pickerRef.current) return false;
-    const count = pickerRef.current === 'session' ? sessionRefs.length : fileOptionCount;
+    const matches = skillRefs.filter(item => item.name.toLowerCase().includes(skillQuery.toLowerCase()));
+    const count = pickerRef.current === 'skill' ? matches.length : pickerRef.current === 'session' ? sessionRefs.length : fileOptionCount;
     if (event.key === 'ArrowUp' || event.key === 'ArrowDown') {
       event.preventDefault();
       const delta = event.key === 'ArrowUp' ? -1 : 1;
@@ -262,7 +289,10 @@ export const AdvancedPromptTextarea: React.FC<AdvancedPromptTextareaProps> = ({
     }
     if ((event.key === 'Enter' && !event.shiftKey) || event.key === 'Tab') {
       event.preventDefault();
-      if (pickerRef.current === 'session') {
+      if (pickerRef.current === 'skill') {
+        const entry = matches[selectedIndex];
+        if (entry) replaceActive(`@SKILL:${entry.name} `);
+      } else if (pickerRef.current === 'session') {
         const entry = sessionRefs[selectedIndex];
         if (entry?.id) replaceActive(`@SESSION:${entry.id} `);
       } else {
@@ -276,7 +306,7 @@ export const AdvancedPromptTextarea: React.FC<AdvancedPromptTextareaProps> = ({
       return true;
     }
     return false;
-  }, [chooseFileOption, closePicker, fileOptionCount, replaceActive, selectedIndex, sessionRefs]);
+  }, [chooseFileOption, closePicker, fileOptionCount, replaceActive, selectedIndex, sessionRefs, skillRefs, skillQuery]);
 
   const handleKeyDown = useCallback((event: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (handlePickerKey(event)) return;
@@ -329,12 +359,15 @@ export const AdvancedPromptTextarea: React.FC<AdvancedPromptTextareaProps> = ({
     if (!picker || !popupRef.current) return;
     popupRef.current.querySelector<HTMLElement>(`[data-ref-index="${selectedIndex}"]`)
       ?.scrollIntoView({ block: 'nearest' });
-  }, [picker, selectedIndex, sessionRefs, filteredFiles]);
+  }, [picker, selectedIndex, sessionRefs, filteredFiles, skillRefs]);
 
   useEffect(() => () => {
     fileRequestRef.current += 1;
     sessionRequestRef.current += 1;
+    skillRequestRef.current += 1;
   }, []);
+  useEffect(() => { closePicker(); setSkillRefs([]); }, [sessionId, execKey, closePicker]);
+  useEffect(() => onCurrentUserChanged(() => { closePicker(); setSkillRefs([]); }), [closePicker]);
 
   const popup = picker && popupPosition ? (
     <AppModalPortal>
@@ -342,10 +375,10 @@ export const AdvancedPromptTextarea: React.FC<AdvancedPromptTextareaProps> = ({
         ref={popupRef}
         id={listboxId}
         role="listbox"
-        aria-label={picker === 'session' ? '引用会话' : '引用工作区文件'}
+        aria-label={picker === 'skill' ? '引用 Skill 手册' : picker === 'session' ? '引用会话' : '引用工作区文件'}
         onMouseDown={(event) => event.preventDefault()}
         style={{
-          position: 'fixed', zIndex: 10040,
+          position: 'fixed', zIndex: 40040,
           left: popupPosition.left, width: popupPosition.width,
           top: popupPosition.top, bottom: popupPosition.bottom,
           maxHeight: popupPosition.maxHeight,
@@ -358,14 +391,19 @@ export const AdvancedPromptTextarea: React.FC<AdvancedPromptTextareaProps> = ({
         <div style={popupHeaderStyle}>
           <span>{picker === 'session' ? '💬' : '📁'}</span>
           <span style={{ flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-            {picker === 'session'
+            {picker === 'skill' ? '📖 引用 Skill 使用知识（不执行）' : picker === 'session'
               ? `引用会话${sessionQuery ? ` · ${sessionQuery}` : ''}`
               : currentDir === '.' ? '引用工作区文件或会话' : currentDir}
           </span>
           {(picker === 'session' ? sessionLoading : fileLoading) && <span>…</span>}
         </div>
         <div style={{ overflowY: 'auto', minHeight: 0 }}>
-          {picker === 'session' ? (
+          {picker === 'skill' ? <>
+            {skillError && <div role="alert" style={{ padding: 10 }}>{skillError}<button type="button" onClick={() => void loadSkills()}>重试</button></div>}
+            {skillRefs.filter(item => item.name.toLowerCase().includes(skillQuery.toLowerCase())).map((entry, index) => <ReferenceOption key={entry.name} index={index} selected={index === selectedIndex}
+              icon="📖" label={entry.name} hint={entry.hasManual ? '维护手册' : '原始资料'} onChoose={() => replaceActive(`@SKILL:${entry.name} `)} onHover={setSelectedIndex} />)}
+            {skillLoading ? <EmptyPicker text="读取本节点已安装的 Skill…" /> : !skillError && !skillRefs.some(item => item.name.toLowerCase().includes(skillQuery.toLowerCase())) && <EmptyPicker text="无匹配 Skill；可在本节点市场安装后重试" />}
+          </> : picker === 'session' ? (
             sessionRefs.length ? sessionRefs.map((entry: any, index) => (
               <ReferenceOption
                 key={entry.id}

@@ -152,6 +152,7 @@ class LoopRecord:
     error: str = ""
     # 阶段审计：原文、解析对象与结构校验结论，独立于实时尾部回放持久化。
     stage_details: dict = field(default_factory=dict)
+    call_diagnostics: list[dict] = field(default_factory=list)
     # 各子阶段的开始时间戳（{prepare/execute/analysis/done: ts}），用于流程视图耗时
     sub_started: dict = field(default_factory=dict)
     # ★ 本次 loop 各阶段实际使用的 backend id（{prepare, execute, analysis}）。
@@ -202,6 +203,7 @@ class LoopRecord:
             "analysis": self.analysis.to_dict() if self.analysis else None,
             "error": self.error,
             "stageDetails": copy.deepcopy(self.stage_details),
+            "callDiagnostics": copy.deepcopy(self.call_diagnostics),
             "subStarted": self.sub_started,
             "backends": dict(self.backends or {}),
             "runtimes": {k: dict(v) for k, v in (self.runtimes or {}).items()
@@ -234,6 +236,7 @@ class LoopRecord:
             analysis=LoopAnalysis.from_dict(d["analysis"]) if d.get("analysis") else None,
             error=d.get("error", ""),
             stage_details=copy.deepcopy(d.get("stageDetails") or {}),
+            call_diagnostics=copy.deepcopy(d.get("callDiagnostics") or [])[-64:],
             sub_started=dict(d.get("subStarted") or {}),
             backends=dict(d.get("backends") or {}),
             runtimes={k: dict(v) for k, v in (d.get("runtimes") or {}).items()

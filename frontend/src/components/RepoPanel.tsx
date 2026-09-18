@@ -3,6 +3,8 @@ import { api, SkillInfo, getHomeExecKey, getExecutors, onExecStatus, onCurrentUs
 import { skillInstallTargetLabel } from '../utils/skillInstallTarget';
 import { SkillMarketDialog } from './SkillMarketDialog';
 import { SkillRuntimeDialog } from './SkillRuntimeDialog';
+import { SkillManual } from './SkillManual';
+import { openSkillManual } from '../utils/skillManual';
 
 // 注入卡片悬停样式
 if (typeof document !== 'undefined' && !document.getElementById('repo-panel-css')) {
@@ -252,6 +254,7 @@ const RepoPanelContent: React.FC<Props & { execKey: string; onBusyChange: (busy:
   const [loadError, setLoadError] = useState('');
   const [actionError, setActionError] = useState('');
   const [mutating, setMutating] = useState(false);
+  const [manualName, setManualName] = useState('');
   const loadGeneration = useRef(0);
   // 编辑状态
   const [editingType, setEditingType] = useState<'skill' | 'prompt' | null>(null);
@@ -321,16 +324,16 @@ const RepoPanelContent: React.FC<Props & { execKey: string; onBusyChange: (busy:
   }, [open, execKey]);
 
   useEffect(() => {
-    onBusyChange(!!editingType || saving || installing || savingSecrets || mutating || !!secretsSkill);
-  }, [editingType, saving, installing, savingSecrets, mutating, secretsSkill, onBusyChange]);
+    onBusyChange(!!editingType || !!manualName || saving || installing || savingSecrets || mutating || !!secretsSkill);
+  }, [editingType, manualName, saving, installing, savingSecrets, mutating, secretsSkill, onBusyChange]);
 
   const requireOk = (result: { status: string; message?: string }) => {
     if (result.status !== 'ok') throw new Error(result.message || '操作失败，请重试');
   };
 
   useEffect(() => {
-    onEditingChange?.(editingType !== null);
-  }, [editingType, onEditingChange]);
+    onEditingChange?.(editingType !== null || !!manualName);
+  }, [editingType, manualName, onEditingChange]);
 
   // ── 打开编辑器 ──
   const openEditor = useCallback((type: 'skill' | 'prompt', item?: SkillItem | PromptItem) => {
@@ -648,6 +651,7 @@ const RepoPanelContent: React.FC<Props & { execKey: string; onBusyChange: (busy:
   // 卡片列表模式
   return (
     <div className={embedded ? 'repo-workbench' : undefined} style={{ ...panelStyle, ...(embedded ? { flex: 1, minHeight: 0 } : {}) }}>
+      {manualName && <SkillManual name={manualName} execKey={execKey} onClose={() => setManualName('')} />}
       <div style={{ display: 'flex', gap: 8, paddingBottom: 8, alignItems: 'center', fontSize: 12 }}>
         <span role="status">{loading ? '正在加载能力库…' : loadError ? '能力库加载失败' : `${skills.length} Skills · ${prompts.length} Prompts`}</span>
         <button disabled={loading} onClick={() => void refresh()} style={{ ...addBtnStyle, width: 'auto', height: 'auto', padding: '3px 8px', fontSize: 11 }}>{loadError ? '重试加载' : '刷新能力库'}</button>
@@ -691,6 +695,12 @@ const RepoPanelContent: React.FC<Props & { execKey: string; onBusyChange: (busy:
                   {parseSkillBackend(s.content || '') ? '🔗' : s.type === 'python-script' || s.hasCallPy ? '🐍' : '⚡'}
                 </div>
                 <div style={cardNameStyle}>{s.name}</div>
+                <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap', justifyContent: 'center' }}>
+                  <button style={{ ...addBtnStyle, width: 'auto', height: 'auto', fontSize: 11, padding: 4 }}
+                    onClick={e => { e.stopPropagation(); void openSkillManual(s.name, execKey).catch(error => setActionError(String(error))); }}>使用手册 ↗</button>
+                  <button style={{ ...addBtnStyle, width: 'auto', height: 'auto', fontSize: 11, padding: 4 }}
+                    onClick={e => { e.stopPropagation(); setManualName(s.name); }}>维护手册</button>
+                </div>
                 <button style={{ ...addBtnStyle, width: 'auto', height: 'auto', minHeight: 28, padding: '4px 6px', whiteSpace: 'nowrap', fontSize: 11, marginTop: 5 }} title="检查此技能在执行节点的资源、依赖与配置"
                   onClick={e => { e.stopPropagation(); setRuntimeExecKey(execKey); setRuntimeNames([s.name]); }}>运行准备 / 状态</button>
                 <div style={{ position: 'absolute', top: 4, left: 4, display: 'flex', gap: 2 }}>

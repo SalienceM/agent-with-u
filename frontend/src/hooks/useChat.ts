@@ -1,5 +1,6 @@
 import { useState, useCallback, useEffect, useRef, startTransition } from 'react';
 import { api } from '../api';
+import { isSkillCommand, type SkillInvocation } from '../utils/skillCommands';
 import { uuid } from '../utils/uuid';
 import type { ImageAttachment } from './useClipboardImage';
 import type { TextAttachment } from '../types/attachments';
@@ -95,9 +96,14 @@ export interface SlashCommand {
   name: string;
   description: string;
   shortDesc: string;
+  requiresArguments?: boolean;
+  kind?: 'skill';
+  source?: string;
+  unavailableReason?: string;
 }
 
 export const SLASH_COMMANDS: SlashCommand[] = [
+  { name: '/skill', description: '显式调用当前 Session 已启用的 Skill：技能名 参数', shortDesc: '调用 Skill', requiresArguments: true },
   { name: '/help',          description: '显示可用命令列表',                     shortDesc: '帮助' },
   { name: '/new',           description: '清空对话上下文（session不变，重置下游agent session）', shortDesc: '清空上下文' },
   { name: '/clear',         description: '清空当前对话历史',                     shortDesc: '清空' },
@@ -119,6 +125,7 @@ const HELP_TEXT = `📋 **可用命令：**
 | 命令 | 说明 |
 |------|------|
 | \`/help\` | 显示此帮助信息 |
+| \`/skill 技能名 参数\` | 调用当前 Session 已安装且启用的 Skill；输入 / 查看快捷入口 |
 | \`/clear\` | 清空对话历史 |
 | \`/compact\` | 压缩早期消息节省上下文 |
 | \`/cost\` | 显示 Token 用量 |
@@ -132,7 +139,9 @@ const HELP_TEXT = `📋 **可用命令：**
 | \`/commit\` | AI 生成 commit message 并提交 |
 | \`/git\` | Git: status / log / push / pull |
 
-**快捷键：** Enter 发送 · Shift+Enter 换行 · Ctrl+V 粘贴图片`;
+Skill 命令会检查当前执行节点、项目和依赖；OpenSpec 的 /opsx-* 为 AWU 快捷别名，不是任意 Agent 原生命令透传。缺少环境不会自动安装。
+
+**快捷键：** Enter 发送 · Skill 命令选择后先填入参数 · Shift+Enter 换行 · Ctrl+V 粘贴图片`;
 
 function normalizeMessage(msg: any): ChatMessage {
   const thinking =
@@ -475,7 +484,41 @@ export function useChat(
   useEffect(() => {
     return api.onSessionUpdated(async (data: any) => {
       if (data.sessionId !== sessionId) return;
-      if (data.type === 'session_compacted') {
+      if (data.type === 'chat_send_rejected' && getStreamState(sessionId).messageId === data.messageId) {
+        const authoritative = normalizeMessages(data.messages || []);
+        const assistant = authoritative.find((message: ChatMessage) => message.role === 'assistant' && message.streaming);
+        clearStreamState(sessionId);
+        if (assistant) {
+          initStreamMessage(sessionId, assistant.id);
+          const state = getStreamState(sessionId);
+          state.text = assistant.content || '';
+          state.thinking = assistant.thinking || '';
+          state.toolCalls = assistant.toolCalls || [];
+          state.contentBlocks = assistant.contentBlocks || [];
+        }
+        isStreamingRef.current = !!assistant;
+        setIsStreaming(!!assistant);
+        pendingIdsFor(sessionId).delete(data.messageId);
+        pendingIdsFor(sessionId).delete(data.userMessageId);
+        setMessages((previous) => {
+          const kept = previous.filter((message) => ![data.messageId, data.userMessageId].includes(message.id));
+          return [...kept, ...authoritative.filter((message: ChatMessage) => !kept.some((item) => item.id === message.id)),
+            { id: uuid(), role: 'system', content: `⚠️ 消息未发送：${data.error}`, timestamp: Date.now() / 1000 }];
+        });
+      } else if (data.type === 'chat_turn_started' && Array.isArray(data.messages)) {
+        const started = normalizeMessages(data.messages);
+        const assistant = started.find((message: ChatMessage) => message.role === 'assistant');
+        if (assistant) {
+          if (getStreamState(sessionId).messageId !== assistant.id) initStreamMessage(sessionId, assistant.id);
+          isStreamingRef.current = true;
+          setIsStreaming(true);
+        }
+        for (const message of started) pendingIdsFor(sessionId).add(message.id);
+        setMessages((previous) => [
+          ...previous,
+          ...started.filter((message: ChatMessage) => !previous.some((item) => item.id === message.id)),
+        ]);
+      } else if (data.type === 'session_compacted') {
         const session = await api.loadSession(sessionId);
         if (session?.messages) {
           const loaded = normalizeMessages(session.messages);
@@ -857,6 +900,7 @@ export function useChat(
         | 'realtime-voice-foreground'
         | 'realtime-voice-background',
       kitApprovalDelegation: boolean = false,
+      skillInvocation?: SkillInvocation,
     ) => {
       if (isStreamingRef.current) return;
 
@@ -912,6 +956,7 @@ export function useChat(
         deliveryMode,
         interactionMode,
         kitApprovalDelegation,
+        skillInvocation,
       });
     },
     [sessionId, backendId]
@@ -1223,12 +1268,22 @@ export function useChat(
       images?: ImageAttachment[],
       textAttachments?: TextAttachment[],
       kitApprovalDelegation: boolean = false,
+      skillInvocation?: SkillInvocation,
     ) => {
       if (
         !content.trim()
         && (!images || images.length === 0)
         && (!textAttachments || textAttachments.length === 0)
       ) return;
+
+      if (isSkillCommand(content)) {
+        if (isStreamingRef.current || kitApprovalDelegation) {
+          addSystemMessage('Skill 命令未发送：请等待当前轮结束，并关闭 Kit 代确认后重试。');
+          return;
+        }
+        doSend(content, images, textAttachments, undefined, undefined, false, skillInvocation);
+        return;
+      }
 
       if (isStreamingRef.current) {
         if (kitApprovalDelegation) {

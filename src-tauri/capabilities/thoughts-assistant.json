@@ -6,6 +6,11 @@
   "windows": ["thoughts-assistant"],
   "permissions": [
     "core:default",
+    "core:webview:allow-create-webview-window",
+    "core:window:allow-show",
+    "core:window:allow-unminimize",
+    "core:window:allow-set-focus",
+    "core:window:allow-close",
     "core:window:allow-set-always-on-top"
   ]
 }

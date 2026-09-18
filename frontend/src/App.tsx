@@ -761,7 +761,7 @@ export const App: React.FC = () => {
         setThoughtsDetached(false);
         setThoughtsOpen(true);
       }
-    });
+    }).catch((error: unknown) => setToast({ type: 'error', message: String(error) }));
   }, [thoughtsDetached]);
 
   const detachThoughts = useCallback(() => {
@@ -775,7 +775,7 @@ export const App: React.FC = () => {
       thoughtsChannelRef.current?.postMessage({
         type: 'snapshot', attention: currentAttention, sessionId: activeSessionId || '',
       } satisfies ThoughtsWindowMessage);
-    });
+    }).catch((error: unknown) => setToast({ type: 'error', message: String(error) }));
   }, [activeSessionId, currentAttention]);
 
   // ── 性能：便签本拖拽 handler，onMouseDown 每次渲染都会重新生成，改为 ref 方案 ──

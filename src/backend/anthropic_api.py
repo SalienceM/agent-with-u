@@ -188,14 +188,22 @@ class AnthropicAPIBackend(ModelBackend):
                             break
                         if _attempt > 0:
                             _d = _RETRY_DELAYS[_attempt - 1]
+                            emit("diagnostic", diagnostic={"phase": "retry_wait", "attempt": _attempt + 1,
+                                 "maxAttempts": _MAX_RETRIES + 1, "delaySeconds": _d,
+                                 "category": "rate_limit" if "429" in (_last_err or "") else "network"})
                             print(f"[AnthropicAPI] retry {_attempt}/{_MAX_RETRIES} in {_d}s ...",
                                   file=sys.stderr, flush=True)
                             await asyncio.sleep(_d)
                         try:
+                            emit("diagnostic", diagnostic={"phase": "request", "attempt": _attempt + 1,
+                                 "model": model,
+                                 "maxAttempts": _MAX_RETRIES + 1,
+                                 "requestBytes": len(json.dumps(req_body, ensure_ascii=False).encode("utf-8"))})
                             async with httpx.AsyncClient(timeout=120.0) as hclient:
                                 async with hclient.stream(
                                     "POST", url, headers=req_headers, json=req_body
                                 ) as resp:
+                                    emit("diagnostic", diagnostic={"phase": "response_headers", "httpStatus": resp.status_code})
                                     if resp.status_code == 429 and _attempt < _MAX_RETRIES:
                                         _last_err = f"HTTP 429 (rate limited, retrying {_attempt+1}/{_MAX_RETRIES})"
                                         print(f"[AnthropicAPI] 429 rate limit, will retry",
@@ -368,7 +376,9 @@ class AnthropicAPIBackend(ModelBackend):
                     if extra_tools:
                         stream_kwargs["tools"] = extra_tools
 
+                    emit("diagnostic", diagnostic={"phase": "sdk_request", "model": model})
                     async with client.messages.stream(**stream_kwargs) as stream:
+                        emit("diagnostic", diagnostic={"phase": "sdk_response"})
                         async for event in stream:
                             if self.is_cancelled(session_id):
                                 break
@@ -488,5 +498,3 @@ class AnthropicAPIBackend(ModelBackend):
                 emit("error", error=_exc_msg(e))
                 emit("done")
             return {}
-
-

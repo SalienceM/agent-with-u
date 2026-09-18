@@ -12,6 +12,23 @@ from .workspace_kit_store import WorkspaceKit, FINAL_RUN_STATUSES, CHAT_CHAIN_DE
 
 TOOL_NAME = "awu_kits"
 DELEGATION_TTL = 6 * 60 * 60
+KIT_PROMPT_MODES = {"auto", "on", "off"}
+
+
+def kit_prompt_mode(abilities: dict | None) -> str:
+    """Legacy/new Sessions default to conditional activation, never global opt-in."""
+    value = (abilities or {}).get("kitToolsMode", "auto")
+    return value if isinstance(value, str) and value in KIT_PROMPT_MODES else "off"
+
+
+def kit_prompt_enabled(mode: str, state: Any) -> bool:
+    if mode != "auto":
+        return mode == "on"
+    # 运行结束前保留查询/取消能力；自动启用不创建 Kit，也不授予执行或发布权限。
+    return bool(any(kit.enabled for kit in state.visible_kits())
+                or any(run.status not in FINAL_RUN_STATUSES for run in state.runs))
+
+
 TOOL = {
     "name": TOOL_NAME,
     "description": (

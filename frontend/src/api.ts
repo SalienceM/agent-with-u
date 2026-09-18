@@ -370,13 +370,13 @@ let ttsStreamAudioCallbacks: TtsStreamAudioCallback[] = [];
 // ── 可视化 Loop 集成 ──────────────────────────────────────────
 type LoopUpdatedCallback = (state: any) => void;
 let loopUpdatedCallbacks: LoopUpdatedCallback[] = [];
-type LoopProgressCallback = (data: { sessionId: string; seq: number; subStage: string; text: string }) => void;
+type LoopProgressCallback = (data: { sessionId: string; seq: number; subStage: string; text: string; diagnostic?: import('./utils/loopDiagnostics').CallDiagnostic }) => void;
 let loopProgressCallbacks: LoopProgressCallback[] = [];
 type LoopAsideDeltaCallback = (data: { sessionId: string; turnId: string; text: string }) => void;
 let loopAsideDeltaCallbacks: LoopAsideDeltaCallback[] = [];
 
 // ── 普通 session 侧挂：序列任务 + by-the-way ──────────────────
-type SeqtaskUpdatedCallback = (data: { sessionId: string; seqTasks: any[]; seqAuto: boolean }) => void;
+type SeqtaskUpdatedCallback = (data: { sessionId: string; seqTasks: any[]; seqAuto: boolean; seqError?: string }) => void;
 let seqtaskUpdatedCallbacks: SeqtaskUpdatedCallback[] = [];
 type ChatAsideDeltaCallback = (data: { sessionId: string; turnId: string; text: string }) => void;
 let chatAsideDeltaCallbacks: ChatAsideDeltaCallback[] = [];
@@ -1799,6 +1799,18 @@ function connByKey(execKey?: string): Conn {
   if (!connection) throw new Error(`找不到指定的执行节点：${execKey}`);
   return connection;
 }
+
+// 队列属于执行端权威状态，离线时不能用 home mock 假装保存/清空成功。
+async function sequenceCall(method: string, ...params: any[]): Promise<any> {
+  const conn = routeConn(method, params);
+  await conn.ready;
+  if (!conn.isOpen) return JSON.stringify({ status: 'offline', message: '执行端离线，未修改序列' });
+  try {
+    return await conn.request(method, params, 10000);
+  } catch {
+    return JSON.stringify({ status: 'error', message: '未收到执行端确认，请重连后核对序列状态' });
+  }
+}
 async function callOn(execKey: string | undefined, method: string, ...params: any[]): Promise<any> {
   try {
     const connection = connByKey(execKey);
@@ -2185,6 +2197,14 @@ export const api = {
     } finally {
       if (listSessionsInFlight === request) listSessionsInFlight = null;
     }
+  },
+
+  async listSessionSkillCommands(sessionId: string, execKey?: string): Promise<import('./utils/skillCommands').SkillCommandCatalog> {
+    const key = execKey ?? routeConn('listSessionSkillCommands', [sessionId]).key;
+    const raw = await callOnStrict(key, 'listSessionSkillCommands', [sessionId], 15000);
+    const result = typeof raw === 'string' ? JSON.parse(raw) : raw;
+    if (result?.status !== 'ok' || !Array.isArray(result.commands)) throw new Error(result?.message || 'Skill 命令列表加载失败');
+    return result;
   },
 
   async legacySessionOwnershipPreview(): Promise<{
@@ -2713,8 +2733,8 @@ export const api = {
   },
 
   // ── 序列任务（普通 session）────────────────────────────────
-  async seqtaskGet(sessionId: string): Promise<{ status: string; seqTasks: any[]; seqAuto: boolean }> {
-    const result = await call('seqtaskGet', sessionId);
+  async seqtaskGet(sessionId: string): Promise<{ status: string; seqTasks: any[]; seqAuto: boolean; seqError?: string }> {
+    const result = await sequenceCall('seqtaskGet', sessionId);
     try { return JSON.parse(result); } catch { return { status: 'error', seqTasks: [], seqAuto: false }; }
   },
   async seqtaskAdd(
@@ -2727,7 +2747,7 @@ export const api = {
     const textAttachmentsJson = textAttachments && textAttachments.length
       ? JSON.stringify(textAttachments)
       : '';
-    const result = await call('seqtaskAdd', sessionId, text, imagesJson, textAttachmentsJson);
+    const result = await sequenceCall('seqtaskAdd', sessionId, text, imagesJson, textAttachmentsJson);
     try { return JSON.parse(result); } catch { return { status: 'error', message: '响应解析失败' }; }
   },
   async seqtaskEdit(
@@ -2741,7 +2761,7 @@ export const api = {
     const textAttachmentsJson = textAttachments && textAttachments.length
       ? JSON.stringify(textAttachments)
       : '';
-    const result = await call(
+    const result = await sequenceCall(
       'seqtaskEdit',
       sessionId,
       taskId,
@@ -2752,7 +2772,7 @@ export const api = {
     try { return JSON.parse(result); } catch { return { status: 'error', message: '响应解析失败' }; }
   },
   async seqtaskRemove(sessionId: string, taskId: string): Promise<{ status: string; seqTasks?: any[]; seqAuto?: boolean; message?: string }> {
-    const result = await call('seqtaskRemove', sessionId, taskId);
+    const result = await sequenceCall('seqtaskRemove', sessionId, taskId);
     try { return JSON.parse(result); } catch { return { status: 'error' }; }
   },
   async steerSeqTask(
@@ -2763,12 +2783,12 @@ export const api = {
     try { return JSON.parse(result); } catch { return { status: 'error', message: '响应解析失败' }; }
   },
   async seqtaskReorder(sessionId: string, ids: string[]): Promise<{ status: string; seqTasks?: any[]; seqAuto?: boolean; message?: string }> {
-    const result = await call('seqtaskReorder', sessionId, JSON.stringify(ids));
+    const result = await sequenceCall('seqtaskReorder', sessionId, JSON.stringify(ids));
     try { return JSON.parse(result); } catch { return { status: 'error' }; }
   },
   async seqtaskSetAuto(sessionId: string, on: boolean): Promise<{ status: string; seqTasks?: any[]; seqAuto?: boolean; message?: string }> {
-    const result = await call('seqtaskSetAuto', sessionId, on);
-    try { return JSON.parse(result); } catch { return { status: 'error' }; }
+    const result = await sequenceCall('seqtaskSetAuto', sessionId, on);
+    try { return JSON.parse(result); } catch { return { status: 'error', message: '状态响应解析失败' }; }
   },
   async seqtaskTakeNext(sessionId: string): Promise<{
     status: string; task: any | null; retryAfterMs?: number;
@@ -2785,7 +2805,7 @@ export const api = {
     }
   },
   async seqtaskClear(sessionId: string): Promise<{ status: string; seqTasks?: any[]; seqAuto?: boolean; message?: string }> {
-    const result = await call('seqtaskClear', sessionId);
+    const result = await sequenceCall('seqtaskClear', sessionId);
     try { return JSON.parse(result); } catch { return { status: 'error' }; }
   },
   onSeqtaskUpdated(cb: SeqtaskUpdatedCallback): () => void {
@@ -3669,7 +3689,7 @@ export const api = {
     try { return JSON.parse(result); } catch { return { status: 'error', message: '响应格式错误' }; }
   },
 
-  async updateSessionAbilities(sessionId: string, abilities: { skills: string[]; prompts: string[] }, execKey?: string): Promise<{ status: string; message?: string }> {
+  async updateSessionAbilities(sessionId: string, abilities: { skills: string[]; prompts: string[]; constraints?: string; kitToolsMode?: 'auto' | 'on' | 'off' }, execKey?: string): Promise<{ status: string; message?: string }> {
     try {
       const key = execKey ?? routeConn('updateSessionAbilities', [sessionId]).key;
       const result = await callOnStrict(key, 'updateSessionAbilities', [sessionId, JSON.stringify(abilities)], 15000);
@@ -3697,6 +3717,24 @@ export const api = {
   },
 
   // ── Skill 孵化库 ──────────────────────────────────────────────────────
+  async listSkillManuals(execKey: string): Promise<import('./utils/skillManual').SkillManualSummary[]> {
+    const raw = await callOnStrict(execKey, 'listSkillManuals', [], 15000);
+    const data = typeof raw === 'string' ? JSON.parse(raw) : raw;
+    if (data?.status !== 'ok' || !Array.isArray(data.manuals)) throw new Error(data?.message || '使用手册列表加载失败');
+    return data.manuals;
+  },
+  async getSkillManual(name: string, execKey: string, document = ''): Promise<import('./utils/skillManual').SkillManual> {
+    const raw = await callOnStrict(execKey, 'getSkillManual', [name, document], 15000);
+    const data = typeof raw === 'string' ? JSON.parse(raw) : raw;
+    if (data?.status !== 'ok') throw new Error(data?.message || '使用手册读取失败');
+    return data;
+  },
+  async saveSkillManual(name: string, content: string, revision: string, execKey: string, document = ''): Promise<import('./utils/skillManual').SkillManual> {
+    const raw = await callOnStrict(execKey, 'saveSkillManual', [name, content, revision, document], 15000);
+    const data = typeof raw === 'string' ? JSON.parse(raw) : raw;
+    if (data?.status !== 'ok') throw new Error(data?.message || '使用手册保存失败');
+    return data;
+  },
   async listSkills(workingDir: string = '', execKey?: string): Promise<SkillInfo[]> {
     const result = execKey !== undefined
       ? await callOnStrict(execKey, 'listSkills', [workingDir], 15000)

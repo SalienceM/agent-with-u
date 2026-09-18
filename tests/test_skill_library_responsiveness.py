@@ -89,8 +89,10 @@ class SkillLibraryResponsivenessTests(unittest.IsolatedAsyncioTestCase):
     async def test_binding_persists_without_deploying_and_apply_runs_off_loop(self):
         bridge = BridgeWS.__new__(BridgeWS)
         session = SimpleNamespace(id='test', abilities={}, constraints=None)
+        session.meta_dict = lambda: {'id': 'test', 'abilities': session.abilities}
         bridge._active_sessions = {'test': session}
         bridge._session_store = SimpleNamespace(save=Mock())
+        bridge._emit_session_updated = Mock()
         loop_thread = threading.get_ident()
 
         def apply(prepared, abilities, *, deploy=True):

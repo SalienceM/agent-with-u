@@ -42,12 +42,22 @@ const SECTIONS: ManualSection[] = [
   {
     id: 'flow', title: '效率工作流', icon: '⚡', intro: '不打断主线的任务组织与辅助空间。',
     items: [
-      { icon: '🧬', title: '序列任务', summary: '无需开启模式：第一条在空闲时直接发送；回答期间继续输入的文字、图片或斜杠命令会自动排队，上一条完整结束后依次发送。队列可编辑、排序或清空。', entry: '回答期间继续使用底部输入框', tips: '重启后保留的旧队列不会擅自执行，需要在队列条点击「继续」恢复。' },
+      { icon: '🧬', title: '序列任务', summary: '任务和调度状态都保存在执行端，默认逐条执行。回答期间继续输入会排队；关闭控制端、切换会话或 Relay 断线不影响执行端连跑。控制端可暂停、继续、编辑、排序或清空待发任务。', entry: '回答期间继续使用底部输入框，队列条可暂停／继续', tips: '暂停只阻止后续任务；■ 停止同时暂停序列。失败会保留条目，可核对结果后「重试并继续」。执行端重启自动恢复待发队列，但结果未确认的执行中条目会暂停，防止重复副作用。支持 /compact、/clear、/new、/autocontinue、/continue 与 Skill 命令；其他 UI 命令会明确报错，不会当提示词发给模型。' },
       { icon: '💭', title: 'By the way 旁路问答', summary: '基于最近对话摘要开启独立问答，不污染主会话上下文，也不会打断正在执行的任务。', entry: '会话中的悬浮 💬 按钮', tips: '回答可一键加入序列任务或发送回主对话。' },
       { icon: '📌', title: '便签本', summary: '本地草稿与待办空间，支持可勾选清单、标题、搜索、置顶、颜色、归档、文本和图片，不进入模型会话。', entry: '顶栏 📌 / Ctrl+Shift+N' },
       { icon: '🗂', title: '素材池', summary: '集中保存粘贴或生成的图片与文件，支持预览、固定、取消固定和删除，可跨后续步骤引用。', entry: '顶栏 🗂' },
       { icon: '✨', title: 'Prompts 提示词', summary: '把常用指令保存成可复用模板，在不同会话快速插入。', entry: '顶栏 📦 Repo → Prompts' },
       { icon: '🧩', title: 'Skills 技能', summary: '为模型提供结构化的专用能力与执行说明，例如网页搜索、图片生成或业务工具。', entry: '顶栏 📦 Repo → Skills', tips: '后端技能会按当前模型部署到会话工作目录。' },
+      { icon: '📖', title: 'Skill 使用手册与 @SKILL 答疑', summary: 'Repo 的 Skill 卡片提供「使用手册 ↗」独立阅读窗口和「维护手册」入口。维护内容与原始 README / SKILL.md 分开保存，更新或重新安装 Skill 不会覆盖你的手册。', entry: '扩展 → Skills 与 Prompts → Skill 卡片；俺寻思输入 @SKILL', keywords: '使用文档 手册 维护 原始资料 窗口 弹窗 预览',
+        tips: '在俺寻思输入 @SKILL:技能名 后提问，只提取当前 Session 执行节点的资料，不要求会话启用 Skill，也不会安装或执行。最多同时引用 3 份，每份正文最多带入 12K 字符；超限会注明截断。继续追问沿用手册关注，点击「退出 Skill 关注」恢复跟随界面。手册问答使用无工具的纯文本通道，暂不与图片混用。原始文档可切换渲染/源码，安全预览不会执行脚本或加载外部资源。多窗口保存冲突保留草稿并提示刷新核对。浏览器需允许本站弹窗；桌面创建失败会显示原因并保留原面板。' },
+      { icon: '/', title: 'Skill 命令与 OpenSpec 工作流', summary: '市场安装后，在 Session 的「绑定能力」启用。聊天输入 / 会列出本会话的 Skill；通用格式为 /skill 技能名 参数。选择命令只填入输入框，确认参数后发送，结果仍显示在当前聊天。', entry: '右键 Session → 绑定能力 → Skills；当前聊天输入 /', keywords: 'openspec opsx slash 斜杠 命令 缺少 CLI 项目 初始化',
+        tips: '仅菜单打开时读取绑定元数据，无市场下载或定时扫描。忙碌/队列未结束时，Skill 命令保留在草稿中，不自动入队。当前支持本执行节点上的 Codex、Qwen Code、Claude Agent；纯 API 与 SSH 线程不宣称有通用文件/终端通道。原生 TUI 命令不能直接当作 SDK 命令。',
+        steps: [
+          { title: '1. 安装与启用是两步', text: '在目标执行节点的市场安装业务工作流 Skill，再绑定到这个 Session。SKILL_NOT_INSTALLED 表示此节点未安装；SKILL_NOT_ENABLED 表示已安装但会话未启用。不会自动安装或绑定。' },
+          { title: '2. 自行准备 OpenSpec 环境', text: 'OpenSpec Skill 不包含 CLI 安装或项目初始化。发送前检查 Backend PATH 或当前项目 node_modules/.bin 中的 openspec（Windows 优先 openspec.cmd），以及当前工作目录的 openspec/config.yaml。缺少时分别报 OPENSPEC_CLI_MISSING、OPENSPEC_PROJECT_NOT_INITIALIZED；不会借用父项目或自动初始化。预检只检查路径存在，CLI 的实际版本/status 由 Agent 在执行阶段核验。' },
+          { title: '3. 显式选择工作流', text: '例如 /opsx-apply market-persistent-cache 等价于 /skill openspec-apply-change market-persistent-cache。new、continue、ff、apply、verify、sync、archive 等快捷入口只在对应 Skill 已安装且绑定时出现；其他 Skill 始终可用通用 /skill 入口。命令参数按任务文本传递，不直接拼成 shell。' },
+          { title: '4. 查看结果与处理错误', text: '调用沿用本 Session 的节点、项目、工具权限和聊天流。缺少工具或准备期间发生解绑/Skill 更新会报错，不会静默运行旧选择。应用 /new、/clear 不会被 Skill 覆盖；安装一个 Skill 不代表授权发布或 Kit 代确认。' },
+        ] },
     ],
   },
   {

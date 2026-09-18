@@ -98,7 +98,8 @@ def _codex_restrictions() -> dict[str, Any]:
 
 
 async def _codex_text(backend: ModelBackend, content: str, rules: str,
-                      home: Path, cwd: Path) -> str:
+                      home: Path, cwd: Path, model_override: str | None = None,
+                      reasoning_effort: str | None = None) -> str:
     from .codex_app_server import CodexAppServerProcess, local_app_server_command
     from .codex_office import resolve_codex_cli
 
@@ -106,6 +107,8 @@ async def _codex_text(backend: ModelBackend, content: str, rules: str,
     original_home = Path(original_env.get("CODEX_HOME") or Path.home() / ".codex")
     config = _codex_connection_config(original_home)
     config.update(_codex_restrictions())
+    if reasoning_effort:
+        config['model_reasoning_effort'] = reasoning_effort
     env = _isolated_env(original_env, home)
     _copy_auth(original_home / "auth.json", home / ".codex" / "auth.json")
     # 原生 provider 配置经 JSON-RPC 传递，凭据不会进入进程命令行。
@@ -138,7 +141,7 @@ async def _codex_text(backend: ModelBackend, content: str, rules: str,
             "baseInstructions": rules, "developerInstructions": "只返回文档解读正文。",
             "config": config,
         }
-        model = backend.config.model or backend.get_env("OPENAI_MODEL")
+        model = model_override or backend.config.model or backend.get_env("OPENAI_MODEL")
         if model and model != "default":
             params["model"] = model
         started = await conn.request("thread/start", params, timeout=45)
@@ -207,7 +210,7 @@ def _assistant_text(blocks: list[Any]) -> str:
 
 
 async def _qwen_text(backend: ModelBackend, content: str, rules: str,
-                     home: Path, cwd: Path) -> str:
+                     home: Path, cwd: Path, model_override: str | None = None) -> str:
     from qwen_code_sdk import query
     original_env = backend._build_env()
     env = _isolated_env(original_env, home)
@@ -218,7 +221,7 @@ async def _qwen_text(backend: ModelBackend, content: str, rules: str,
     empty_settings.write_text("{}", encoding="utf-8")
     env.update(QWEN_CODE_SYSTEM_SETTINGS_PATH=str(empty_settings),
                QWEN_CODE_SYSTEM_DEFAULTS_PATH=str(empty_settings))
-    model = backend.get_env("QWEN_MODEL") or backend.config.model
+    model = model_override or backend.get_env("QWEN_MODEL") or backend.config.model
     auth = backend.get_env("QWEN_PROVIDER") or backend.get_env("QWEN_AUTH_TYPE") or "openai"
     if backend.config.base_url:
         env.setdefault("OPENAI_BASE_URL" if auth != "anthropic" else "ANTHROPIC_BASE_URL", backend.config.base_url)
@@ -296,7 +299,8 @@ async def _claude_text(backend: ModelBackend, content: str, rules: str,
 
 async def send_text_only(backend: ModelBackend, *, content: str, constraints: str,
                          session_id: str, message_id: str,
-                         on_delta: Callable[[StreamDelta], None]) -> None:
+                         on_delta: Callable[[StreamDelta], None],
+                         model_override: str | None = None, reasoning_effort: str | None = None) -> None:
     kind = getattr(backend.config.type, "value", backend.config.type)
     if kind not in TEXT_ONLY_BACKENDS:
         raise ValueError("请选择支持文本解读的 Backend（图像生成 Backend 不适用）")
@@ -312,5 +316,10 @@ async def send_text_only(backend: ModelBackend, *, content: str, constraints: st
         for directory in (".codex", ".qwen", ".claude", ".config"):
             (home / directory).mkdir()
         runner = _codex_text if kind == "codex-office" else _qwen_text if kind == "qwen-code-cli" else _claude_text
-        text = await runner(backend, content, constraints, home, cwd)
+        runtime: dict[str, Any] = {}
+        if kind in {'codex-office', 'qwen-code-cli'} and model_override:
+            runtime['model_override'] = model_override
+        if kind == 'codex-office' and reasoning_effort:
+            runtime['reasoning_effort'] = reasoning_effort
+        text = await runner(backend, content, constraints, home, cwd, **runtime)
         on_delta(StreamDelta(session_id, message_id, "text_delta", text=text[:24000]))

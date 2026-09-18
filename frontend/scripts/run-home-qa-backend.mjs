@@ -1,4 +1,4 @@
-import { spawn } from 'node:child_process';
+import { spawn, execFileSync } from 'node:child_process';
 import http from 'node:http';
 import net from 'node:net';
 import path from 'node:path';
@@ -202,6 +202,10 @@ function startControlServer() {
 }
 
 async function startRuntime() {
+  // Playwright starts webServer before globalSetup. Prepare explicitly paused
+  // fixtures before the executor can restore queues; never launch real models.
+  execFileSync('python', [path.join(repoRoot, 'scripts', 'home_qa_fixture.py'), '--profile', profile],
+    { cwd: repoRoot, stdio: 'inherit' });
   startBackend();
   await waitForBackend();
   startControlServer();

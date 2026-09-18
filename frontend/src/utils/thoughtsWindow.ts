@@ -1,4 +1,5 @@
 import type { AttentionContext } from './attentionContext';
+import { detachedUrl, openDetachedWindow, focusDetachedWindow } from './detachedWindow';
 
 export const THOUGHTS_WINDOW_CHANNEL = 'awu:thoughts-window:v1';
 export const THOUGHTS_WINDOW_LABEL = 'thoughts-assistant';
@@ -10,7 +11,6 @@ export type ThoughtsWindowMessage =
   | { type: 'detached-open' }
   | { type: 'detached-closed' };
 
-let browserWindow: Window | null = null;
 
 export function createThoughtsChannel(): BroadcastChannel | null {
   try {
@@ -30,63 +30,18 @@ export function persistThoughtsWindowPinned(pinned: boolean): void {
 }
 
 function thoughtsUrl(sessionId = ''): string {
-  const url = new URL(location.href);
-  url.searchParams.delete('scratchpad');
-  url.searchParams.set('thoughts', '1');
-  if (sessionId) url.searchParams.set('sessionId', sessionId);
-  else url.searchParams.delete('sessionId');
-  return `${url.pathname}${url.search}${url.hash}`;
+  return detachedUrl('thoughts', { sessionId });
 }
 
 export async function openThoughtsWindow(sessionId = ''): Promise<boolean> {
-  const url = thoughtsUrl(sessionId);
-  if (typeof (window as any).__TAURI_INTERNALS__ !== 'undefined') {
-    try {
-      const { WebviewWindow } = await import('@tauri-apps/api/webviewWindow');
-      const existing = await WebviewWindow.getByLabel(THOUGHTS_WINDOW_LABEL).catch(() => null);
-      if (existing) {
-        await existing.setFocus().catch(() => {});
-        return true;
-      }
-      const child = new WebviewWindow(THOUGHTS_WINDOW_LABEL, {
-        url,
-        title: '俺寻思 — AgentWithU',
-        width: 980,
-        height: 820,
-        minWidth: 620,
-        minHeight: 520,
-        resizable: true,
-        alwaysOnTop: loadThoughtsWindowPinned(),
-      });
-      await new Promise<void>((resolve, reject) => {
-        child.once('tauri://created', () => resolve());
-        child.once('tauri://error', (event) => reject(new Error(String(event.payload || '窗口创建失败'))));
-      });
-      return true;
-    } catch (error) {
-      console.warn('[thoughts] native window failed, falling back to browser popup', error);
-    }
-  }
-
-  browserWindow = window.open(url, 'agent-thoughts-assistant', 'width=980,height=820,resizable=yes,scrollbars=yes');
-  if (!browserWindow) return false;
-  browserWindow.focus();
+  await openDetachedWindow({ label: THOUGHTS_WINDOW_LABEL, url: thoughtsUrl(sessionId),
+    title: '俺寻思 — AgentWithU', width: 980, height: 820, minWidth: 620, minHeight: 520,
+    alwaysOnTop: loadThoughtsWindowPinned() });
   return true;
 }
 
 export async function focusThoughtsWindow(): Promise<boolean> {
-  if (typeof (window as any).__TAURI_INTERNALS__ !== 'undefined') {
-    try {
-      const { WebviewWindow } = await import('@tauri-apps/api/webviewWindow');
-      const existing = await WebviewWindow.getByLabel(THOUGHTS_WINDOW_LABEL).catch(() => null);
-      if (!existing) return false;
-      await existing.setFocus();
-      return true;
-    } catch { return false; }
-  }
-  if (!browserWindow || browserWindow.closed) return false;
-  browserWindow.focus();
-  return true;
+  return focusDetachedWindow(THOUGHTS_WINDOW_LABEL);
 }
 
 export async function closeCurrentThoughtsWindow(): Promise<void> {
@@ -102,4 +57,3 @@ export async function closeCurrentThoughtsWindow(): Promise<void> {
 
 export const isThoughtsWindow = typeof location !== 'undefined'
   && new URLSearchParams(location.search).has('thoughts');
-

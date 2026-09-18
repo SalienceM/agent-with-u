@@ -462,7 +462,7 @@ def _standard_skills_from_zip(
 class SkillStore:
     def __init__(self):
         LIBRARY_DIR.mkdir(parents=True, exist_ok=True)
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         # 部署只写目标目录，不应长期占住供列表/详情使用的库锁。
         # 库文件修改按 deployment → library 顺序加锁，避免源文件边复制边替换。
         self._deployment_lock = threading.RLock()
@@ -696,6 +696,10 @@ class SkillStore:
 
     # ── 公开 API：Skill CRUD ──────────────────────────────────────────
 
+    def manuals(self) -> "SkillManuals":
+        from .skill_manuals import SkillManuals
+        return SkillManuals(LIBRARY_DIR, self._lock, self._index)
+
     def list_skills(self, working_dir: str = "") -> list[dict]:
         with self._lock:
             result = []
@@ -822,6 +826,7 @@ class SkillStore:
             if skill_dir.exists():
                 shutil.rmtree(skill_dir)
             self._index.pop(name, None)
+            self.manuals()._saved_path(name).unlink(missing_ok=True)
             self._save_index()
             # 删除 skill 时一并清理凭据
             secrets_file = SECRETS_DIR / f"{name}.json"
@@ -876,6 +881,12 @@ class SkillStore:
                         pass
                 return
             old_entry = self._index.get(old_name, {}) or {}
+            old_manual = self.manuals()._saved_path(old_name)
+            new_manual = self.manuals()._saved_path(new_name)
+            if new_manual.exists():
+                raise ValueError('目标名称已有使用手册，不能覆盖')
+            if old_manual.exists():
+                old_manual.replace(new_manual)
             old_activations = old_entry.get("activations", [])
             old_is_default = bool(old_entry.get("isDefault", False))
             for target_key in old_activations:

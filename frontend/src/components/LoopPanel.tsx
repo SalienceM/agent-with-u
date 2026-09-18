@@ -9,6 +9,7 @@ import type { LoopPolicy } from './LoopPolicyEditor';
 import type { ModelRuntime } from './CodexRuntimeFields';
 import { TokenUsageMonitor } from './TokenUsageMonitor';
 import { loopRecordRevision } from '../utils/loopRecordDetail';
+import { activeLoopSeq, mergeCallDiagnostics, CALL_PHASE, CALL_ERROR, type CallDiagnostic } from '../utils/loopDiagnostics';
 import { AppModalVisibilityContext } from './AppModalPortal';
 import {
   AdvancedPromptTextarea,
@@ -58,6 +59,8 @@ interface LoopRecord {
   detailLoaded?: boolean;
   manualMessageCount?: number;
   stageDetails?: Record<string, StageDetail>;
+  callDiagnostics?: CallDiagnostic[];
+  diagnosticLive?: boolean;
 }
 interface StageAttempt { kind: string; rawOutput?: string; parsed?: unknown; valid: boolean; validation: string[]; }
 interface StageDetail {
@@ -126,6 +129,7 @@ function mergeLoopRecordDetail(summary: LoopRecord, detail?: LoopRecord): LoopRe
     stageDetails: Object.fromEntries(Object.entries(summary.stageDetails || detail.stageDetails || {}).map(
       ([stage, value]) => [stage, { ...detail.stageDetails?.[stage], ...value }],
     )),
+    callDiagnostics: mergeCallDiagnostics(detail.callDiagnostics, summary.callDiagnostics),
     detailLoaded: true,
   };
 }
@@ -174,6 +178,7 @@ export const LoopPanel: React.FC<LoopPanelProps> = ({
   const statePushRevision = useRef(0);
   const [selectedSeq, setSelectedSeq] = useState<number | null>(null);
   const [recordDetails, setRecordDetails] = useState<Record<number, LoopRecord>>({});
+  const [callDiagnostics, setCallDiagnostics] = useState<Record<number, CallDiagnostic[]>>({});
   const [detailTarget, setDetailTarget] = useState<DetailTarget>('all');
   const [detailErrors, setDetailErrors] = useState<Record<number, { revision: string; message: string }>>({});
   const detailRequests = useRef(new Set<string>());
@@ -260,6 +265,7 @@ export const LoopPanel: React.FC<LoopPanelProps> = ({
     setState(null);
     setSelectedSeq(null);
     setRecordDetails({});
+    setCallDiagnostics({});
     setDetailErrors({});
     detailVersions.current = {};
     setDetailTarget('all');
@@ -281,6 +287,14 @@ export const LoopPanel: React.FC<LoopPanelProps> = ({
     });
     const un2 = api.onLoopProgress((d) => {
       if (d.sessionId !== sessionId) return;
+      if (d.diagnostic) {
+        setCallDiagnostics(previous => {
+          const next = { ...previous, [d.seq]: mergeCallDiagnostics(previous[d.seq], [d.diagnostic!]) };
+          for (const seq of Object.keys(next).map(Number).sort((a, b) => b - a).slice(12)) delete next[seq];
+          return next;
+        });
+        return;
+      }
       const key = `${d.seq}:${d.subStage}`;
       pendingProgressRef.current[key] = (pendingProgressRef.current[key] || '') + d.text;
       if (!progressTimerRef.current) {
@@ -409,7 +423,11 @@ export const LoopPanel: React.FC<LoopPanelProps> = ({
 
   const stateForView = state ? {
     ...state,
-    loops: state.loops.map((record) => mergeLoopRecordDetail(record, recordDetails[record.seq])),
+    loops: state.loops.map((record) => {
+      const merged = mergeLoopRecordDetail(record, recordDetails[record.seq]);
+      return { ...merged, diagnosticLive: record.seq === activeLoopSeq(state),
+        callDiagnostics: mergeCallDiagnostics(merged.callDiagnostics, callDiagnostics[record.seq]) };
+    }),
   } : null;
 
   if (!stateForView) {
@@ -471,6 +489,16 @@ export const LoopPanel: React.FC<LoopPanelProps> = ({
                     </div>
                   )}
                   <LoopFlowView state={stateForView} selectedSeq={selectedSeq} setSelectedSeq={selectLoop} />
+                  {selectedSeq != null && <div role="navigation" aria-label="流程轮次切换" style={{
+                    position: 'sticky', top: 0, zIndex: 2, display: 'flex', alignItems: 'center', gap: 8,
+                    padding: '8px 6px', background: 'var(--theme-bg-secondary)', borderBottom: '1px solid var(--theme-border)', flexWrap: 'wrap',
+                  }}>
+                    <label>查看轮次 <select aria-label="查看流程轮次" value={selectedSeq}
+                      onChange={event => selectLoop(Number(event.target.value), detailTarget)} style={btn}>
+                      {stateForView.loops.slice().reverse().map(loop => <option key={loop.seq} value={loop.seq}>第 {loop.round} 轮 · Loop #{loop.seq}</option>)}
+                    </select></label>
+                    <button type="button" style={btn} onClick={() => selectLoop(stateForView.loops[stateForView.loops.length - 1].seq, detailTarget)}>返回最新 Loop</button>
+                  </div>}
                   {selectedSeq != null && stateForView.loops.find((l) => l.seq === selectedSeq) && (
                     <LoopDetail key={selectedSeq} loop={stateForView.loops.find((l) => l.seq === selectedSeq)!} progress={progress}
                       target={detailTarget} onTarget={setDetailTarget} error={detailErrors[selectedSeq]?.message}
@@ -1363,13 +1391,14 @@ function fmtDur(sec: number): string {
 
 // 进行中需要实时刷新耗时：active 时每秒 tick
 function useNow(active: boolean): number {
+  const visible = useContext(AppModalVisibilityContext);
   const [now, setNow] = useState(() => Date.now() / 1000);
   useEffect(() => {
-    if (!active) return;
+    if (!active || !visible) return;
     setNow(Date.now() / 1000);
     const id = setInterval(() => setNow(Date.now() / 1000), 1000);
     return () => clearInterval(id);
-  }, [active]);
+  }, [active, visible]);
   return now;
 }
 
@@ -1380,6 +1409,7 @@ const FLOW_STATUS_COLOR: Record<string, string> = {
 const STAGE_STATUS_LABEL: Record<string, string> = { done: '已完成', running: '进行中', retrying: '规划重试中', degraded: '已降级', error: '失败', current: '待继续', pending: '未开始' };
 
 function stageStatus(loop: LoopRecord, stage: string, live: boolean): string {
+  if (loop.error && stage === loop.subStage) return 'error';
   const explicit = loop.stageDetails?.[stage]?.status;
   if (explicit) return explicit === 'running' && !live ? 'current' : explicit;
   const index = SUB_ORDER.indexOf(stage);
@@ -1397,9 +1427,7 @@ const LoopFlowView: React.FC<{
   const now = useNow(state.running);
   const loops = state.loops;
   // 当前真正在跑的 loop（用于脉冲 / 动线）
-  const activeSeq = state.running
-    ? (loops.find((l) => !l.completed && !l.error)?.seq ?? null)
-    : null;
+  const activeSeq = activeLoopSeq(state);
 
   if (loops.length === 0) {
     return <div style={{ color: 'var(--theme-text-muted)', fontSize: 13, padding: '20px 0' }}>还没有 loop —— 切回「面板」点运行开始第 1 次。</div>;
@@ -1446,7 +1474,7 @@ const FlowLane: React.FC<{
     const st = starts[i];
     if (!st) return 0;
     const nextStart = i < 2 ? starts[i + 1] : (sub.done ?? (done ? loop.updatedAt : undefined));
-    const end = nextStart ?? (nstatus(i) === 'running' ? now : undefined);
+    const end = nextStart ?? (live && (nstatus(i) === 'running' || nstatus(i) === 'retrying') ? now : loop.updatedAt);
     return end ? end - st : 0;
   };
 
@@ -1471,7 +1499,7 @@ const FlowLane: React.FC<{
     );
   }
   return (
-    <div className="awu-card"
+    <div className="awu-card" role="group" aria-label={`Loop #${loop.seq} 流程`} data-selected={selected}
       style={{
         display: 'flex', alignItems: 'stretch', gap: 0, padding: '10px 12px', borderRadius: 12, cursor: 'pointer',
         background: selected ? 'var(--theme-accent-bg)' : 'var(--theme-bg-secondary)',
@@ -1481,7 +1509,7 @@ const FlowLane: React.FC<{
       {/* loop 头节点 */}
       <FlowChip title={`Loop #${loop.seq}`} status={done ? 'done' : (loop.error ? 'error' : (live ? 'running' : 'current'))}
         onSelect={() => onSelect('all')}
-        sub={score != null ? `score ${score.toFixed(0)}` : (loop.round > 1 ? `第${loop.round}轮` : '进行中')} big />
+        sub={score != null ? `score ${score.toFixed(0)}` : (live ? '进行中' : loop.error ? '已中断' : done ? '已完成' : '未完成')} big />
       <FlowEdge active={nstatus(0) === 'running'} done={nstatus(0) !== 'pending'} />
       <FlowChip title="Prepare" status={nstatus(0)} dur={fmtDur(subDur(0))}
         onSelect={() => onSelect('prepare')} sub={STAGE_STATUS_LABEL[nstatus(0)]}
@@ -1491,7 +1519,7 @@ const FlowLane: React.FC<{
       <FlowChip title="Execute" status={nstatus(1)} dur={fmtDur(subDur(1))}
         onSelect={() => onSelect('execute')} onSelectStep={index => onSelect(`step${index}`)}
         sub={loop.orchestration.length ? `${loop.orchestration.filter((s) => s.status === 'done').length}/${loop.orchestration.length} 步` : undefined}
-        steps={loop.orchestration} now={now}
+        steps={loop.orchestration} now={live ? now : loop.updatedAt} liveSteps={live}
         tag={<BackendTag role="execute" label={loop.backendLabels?.execute} />} />
       <FlowEdge active={nstatus(2) === 'running'} done={nstatus(2) !== 'pending'} />
       <FlowChip title="Analysis" status={nstatus(2)} dur={fmtDur(subDur(2))}
@@ -1514,40 +1542,42 @@ const FlowEdge: React.FC<{ active: boolean; done: boolean }> = ({ active, done }
 
 const FlowChip: React.FC<{
   title: string; status: string; dur?: string; sub?: string; big?: boolean;
-  steps?: LoopStep[]; now?: number; tag?: React.ReactNode;
+  steps?: LoopStep[]; now?: number; liveSteps?: boolean; tag?: React.ReactNode;
   onSelect?: () => void; onSelectStep?: (index: number) => void;
-}> = ({ title, status, dur, sub, big, steps, now, tag, onSelect, onSelectStep }) => {
+}> = ({ title, status, dur, sub, big, steps, now, liveSteps = false, tag, onSelect, onSelectStep }) => {
   const col = FLOW_STATUS_COLOR[status] || FLOW_STATUS_COLOR.pending;
   const pulse = status === 'running';
   return (
     <div style={{
       flexShrink: 0, minWidth: big ? 96 : 110, display: 'flex', flexDirection: 'column', gap: 4,
-      padding: '8px 10px', borderRadius: 10,
+      padding: 0, borderRadius: 10,
       background: 'var(--theme-bg-tertiary)',
       border: `1.5px solid ${col === 'var(--theme-text-muted)' ? 'var(--theme-border)' : col}`,
       boxShadow: pulse ? `0 0 0 0 ${col}` : 'none',
       animation: pulse ? 'awu-flow-pulse 1.3s infinite' : 'none',
     }}>
       <button type="button" onClick={onSelect} aria-label={`查看 ${title} 阶段`} data-stage-status={status}
-        style={{ display: 'flex', alignItems: 'center', gap: 5, padding: '4px 0', border: 0, background: 'transparent', cursor: 'pointer', textAlign: 'left' }}>
+        style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'flex-start', gap: 4, padding: '12px 10px', border: 0, borderRadius: 10, background: 'transparent', cursor: 'pointer', textAlign: 'left' }}>
+        <span style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
         <span style={{ width: 7, height: 7, borderRadius: '50%', background: col, flexShrink: 0,
           animation: pulse ? 'awu-loop-pulse 1.2s infinite' : 'none' }} />
         <span style={{ fontSize: 12, fontWeight: 700, color: 'var(--theme-text)' }}>{title}</span>
-      </button>
+        </span>
       {sub && <span style={{ fontSize: 10.5, color: 'var(--theme-text-muted)' }}>{sub}</span>}
       {dur && <span style={{ fontSize: 10.5, color: col, fontFamily: 'monospace', fontWeight: 600 }}>⏱ {dur}</span>}
-      {tag && <div style={{ marginTop: 1 }}>{tag}</div>}
+      {tag && <span style={{ marginTop: 1 }}>{tag}</span>}
+      </button>
       {steps && steps.length > 0 && (
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 3, marginTop: 2 }}>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 3, padding: '0 10px 8px' }}>
           {steps.map((s) => {
-            const sc = FLOW_STATUS_COLOR[s.status === 'pending' ? 'pending' : s.status] || FLOW_STATUS_COLOR.pending;
-            const d = s.startedAt ? ((s.endedAt || (s.status === 'running' ? (now || Date.now() / 1000) : 0)) - s.startedAt) : 0;
+            const sc = FLOW_STATUS_COLOR[s.status === 'running' && !liveSteps ? 'current' : s.status] || FLOW_STATUS_COLOR.pending;
+            const d = s.startedAt ? ((s.endedAt || (s.status === 'running' ? (now || s.startedAt) : 0)) - s.startedAt) : 0;
             return (
               <button type="button" key={s.index} title={s.desc} aria-label={`查看步骤 ${s.index}：${s.desc}`}
                 onClick={() => onSelectStep ? onSelectStep(s.index) : onSelect?.()}
                 style={{ display: 'flex', alignItems: 'center', gap: 4, maxWidth: 200, padding: '4px 0', border: 0, background: 'transparent', cursor: 'pointer', textAlign: 'left' }}>
                 <span style={{ width: 6, height: 6, borderRadius: '50%', background: sc, flexShrink: 0,
-                  animation: s.status === 'running' ? 'awu-loop-pulse 1.2s infinite' : 'none' }} />
+                  animation: s.status === 'running' && liveSteps ? 'awu-loop-pulse 1.2s infinite' : 'none' }} />
                 <span style={{ fontSize: 10, color: 'var(--theme-text-muted)' }}>
                   {s.mode === 'concurrent' && s.access === 'read' ? '∥' : '→'}{s.index}
                   {s.access === 'write' ? ' ✎' : ''}
@@ -1701,6 +1731,70 @@ const StageAudit: React.FC<{ stage: string; detail?: StageDetail; live?: string 
 );
 const auditPreStyle: React.CSSProperties = { whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', maxHeight: 350, overflow: 'auto', fontSize: 12, background: 'var(--theme-code-bg)', padding: 10 };
 
+const CallDiagnostics: React.FC<{ calls: CallDiagnostic[]; live: boolean }> = ({ calls, live }) => {
+  const [selectedId, setSelectedId] = useState('');
+  const call = calls.find(item => item.id === selectedId) || calls[calls.length - 1];
+  const active = live && call?.status === 'running';
+  const now = useNow(active);
+  if (!call) return <div style={{ color: 'var(--theme-text-muted)', fontSize: 12, marginBottom: 12 }}>
+    调用诊断暂无记录（阶段尚未调用，或旧版本未采集）。
+  </div>;
+  const end = call.endedAt || (active ? now : call.observedAt || call.startedAt);
+  const elapsed = (from?: number, to?: number) => from && to ? fmtDur(Math.max(0.001, to - from)) : '尚未观察到';
+  const wait = (at?: number) => at ? elapsed(call.dispatchedAt, at) : call.dispatchedAt
+    ? `尚未观察到 · ${active ? '已等' : '观察到'} ${elapsed(call.dispatchedAt, end)}` : '尚未进入 Backend';
+  const counts = call.eventCounts || {};
+  return <section aria-label="模型调用诊断" style={{ border: '1px solid var(--theme-border)', borderRadius: 8, padding: 12, marginBottom: 14, overflowWrap: 'anywhere' }}>
+    <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap', marginBottom: 8 }}>
+      <strong>调用诊断</strong>
+      <select aria-label="选择调用记录" value={call.id} onChange={event => setSelectedId(event.target.value)} style={{ ...btn, maxWidth: '100%' }}>
+        {calls.map((item, index) => <option key={item.id} value={item.id}>{item.stage} · 第 {index + 1} 次调用 · {CALL_PHASE[item.status] || item.status}</option>)}
+      </select>
+    </div>
+    <div style={{ minHeight: 38, color: call.status === 'error' || call.status === 'stalled' ? '#f87171' : 'var(--theme-accent)', fontSize: 12, marginBottom: 8 }}>
+      {call.status === 'running' && !live ? '当前已不在运行；以下为最后一次诊断快照' : CALL_PHASE[call.phase] || call.phase}
+      {' · '}总耗时 {elapsed(call.startedAt, end)}
+      {call.httpStatus ? ` · HTTP ${call.httpStatus}` : ''}
+    </div>
+    <dl style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(210px, 1fr))', gap: '8px 14px', margin: 0, fontSize: 12 }}>
+      {[
+        ['实际调用', `${call.backendType || '初始化中'} / ${call.model || '尚未解析'}${call.reasoningEffort ? ` / ${call.reasoningEffort}` : ''}`],
+        ['本地准备', call.localPrepareMs != null ? fmtDur(call.localPrepareMs / 1000) || '<1ms' : elapsed(call.startedAt, end)],
+        ['进入 Backend 后 → 首个可见事件（含错误）', wait(call.firstEventAt)],
+        ['进入 Backend 后 → 首段正文', wait(call.firstTextAt)],
+        ['最近可见事件距今', call.lastActivityAt ? elapsed(call.lastActivityAt, end) : '尚未观察到'],
+        ['本次传入提示', `${call.promptChars.toLocaleString()} 字符 · 约 ${call.estimatedPromptTokens.toLocaleString()} tokens · ${call.imageCount} 张图片`],
+        ['Backend 上报用量', call.usage?.inputTokens != null || call.usage?.outputTokens != null
+          ? `输入 ${call.usage.inputTokens?.toLocaleString() ?? '未提供'} / 输出 ${call.usage.outputTokens?.toLocaleString() ?? '未提供'} tokens` : '尚未提供实际计数'],
+        ['派发时本节点同 Backend 的 LOOP 调用', call.activeLoopCallsAtDispatch != null
+          ? `${call.activeLoopCallsAtDispatch} 个（含本次，不含聊天／外部系统，非服务商并发额度）` : '未采集'],
+        ['可见事件', `正文 ${counts.text_delta || 0} · 思考 ${counts.thinking || 0} · 工具 ${counts.tool_start || 0} 次启动 / ${counts.tool_result || 0} 次结束`],
+        ['输出体量', `正文 ${call.textChars.toLocaleString()} 字符 · 思考 ${call.thinkingChars.toLocaleString()} 字符`],
+        ['HTTP 请求／后端重试', `${call.transportAttempts} 次可观测请求 · ${call.retryCount} 次可观测重试 · 计划退避累计 ${call.retryWaitSeconds}s`],
+        ['无事件超时设置', call.inactivityTimeoutSeconds ? `${call.inactivityTimeoutSeconds}s（不是整个阶段的总时限）` : '未设置'],
+      ].map(([label, value]) => <div key={label}><dt style={{ color: 'var(--theme-text-muted)' }}>{label}</dt><dd style={{ margin: '3px 0 0' }}>{value}</dd></div>)}
+    </dl>
+    {call.lastError && <div style={{ marginTop: 10, color: '#bf8700', fontSize: 12 }}>
+      最近错误证据：{call.lastError.httpStatus ? `HTTP ${call.lastError.httpStatus} · ` : ''}{CALL_ERROR[call.lastError.category] || CALL_ERROR.unknown}
+      {call.status === 'done' ? '（调用随后结束；请另看计划校验结果）' : ''}
+    </div>}
+    <div style={{ marginTop: 10, color: 'var(--theme-text-muted)', fontSize: 11, lineHeight: 1.6 }}>
+      提示大小只统计本次传入文本，不含 Agent 隐式系统提示、工具定义及原生历史；tokens 为估算，不是服务商实际计费输入。
+      {call.resumedContext ? ' 本次续用原生上下文，其大小未在此计量。' : ''}
+      {call.requestBytes != null ? ` 最近 HTTP JSON 约 ${(call.requestBytes / 1024).toFixed(1)} KiB（含附件，不含请求头）。` : ''}
+      {' '}进入 Backend／Agent 接受任务不等于服务商已开始推理；没有明确错误时，无法确认内部排队、并发限额或服务商耗时。阶段总时长还可能包括快照、校验及多次规划调用。
+    </div>
+    <details style={{ marginTop: 8, fontSize: 12 }}><summary style={{ cursor: 'pointer' }}>事件时间线（最近 32 个状态变化，无请求原文／密钥）</summary>
+      <ol style={{ paddingLeft: 22 }}>{(call.timeline || []).map((item, index) => <li key={index} style={{ margin: '5px 0' }}>
+        +{fmtDur(Math.max(0.001, item.elapsedMs / 1000))} · {CALL_PHASE[item.phase] || item.phase}
+        {item.httpStatus ? ` · HTTP ${item.httpStatus}` : ''}{item.attempt ? ` · 第 ${item.attempt} 次` : ''}
+        {item.delaySeconds ? ` · 等待 ${item.delaySeconds}s` : ''}
+      </li>)}</ol>
+      <div>调用 ID：{call.id} · 开始：{new Date(call.startedAt * 1000).toLocaleString()}</div>
+    </details>
+  </section>;
+};
+
 const LoopDetail: React.FC<{
   loop: LoopRecord; progress: Record<string, string>; onClose: () => void;
   target: DetailTarget; onTarget: (target: DetailTarget) => void; error?: string; onRetry: () => void;
@@ -1709,6 +1803,8 @@ const LoopDetail: React.FC<{
   const livePrep = progress[`${loop.seq}:prepare`];
   const liveAna = progress[`${loop.seq}:analysis`];
   const targetStage = target.startsWith('step') ? 'execute' : target;
+  const diagnostics = <CallDiagnostics key={target} live={!!loop.diagnosticLive} calls={(loop.callDiagnostics || []).filter(call =>
+    target === 'all' || call.stage === target || (target === 'execute' && call.stage.startsWith('step')))} />;
   const show = (stage: string) => targetStage === 'all' || targetStage === stage;
   const groups = groupSteps(target.startsWith('step') ? loop.orchestration.filter(step => `step${step.index}` === target) : loop.orchestration);
   if (loop.detailLoaded === false) {
@@ -1716,6 +1812,7 @@ const LoopDetail: React.FC<{
       <div style={{ ...sealBox, marginTop: 4, color: 'var(--theme-text-muted)', fontSize: 12 }}>
         {error ? <span role="alert">{error} <button type="button" style={btn} onClick={onRetry}>重试加载详情</button></span> : `正在按需加载 Loop #${loop.seq} 详情…`}
         <button type="button" onClick={onClose} style={miniX}>✕</button>
+        {diagnostics}
       </div>
     );
   }
@@ -1784,6 +1881,7 @@ const LoopDetail: React.FC<{
       </div>
 
       {error && <div role="alert" style={{ color: '#f87171', marginBottom: 8 }}>{error}（保留已加载的内容）</div>}
+      {diagnostics}
       <div role="group" aria-label="阶段详情切换" style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginBottom: 12 }}>
         {(['all', 'prepare', 'execute', 'analysis'] as const).map(stage => <button type="button" key={stage} aria-pressed={targetStage === stage}
           onClick={() => onTarget(stage)} style={{ ...btn, ...(targetStage === stage ? { borderColor: 'var(--theme-accent)', color: 'var(--theme-accent)' } : {}) }}>

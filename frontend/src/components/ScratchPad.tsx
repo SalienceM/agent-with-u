@@ -28,6 +28,7 @@ import {
   type ScratchEntry,
   type ScratchTodo,
 } from '../utils/scratchPad';
+import { detachedUrl, openDetachedWindow } from '../utils/detachedWindow';
 
 interface NotePalette {
   label: string;
@@ -397,39 +398,17 @@ function copyEntryAsHtml(entry: ScratchEntry): boolean {
 
 // ── 弹出为独立窗口（弹出后关闭侧栏，窗口由自己决定关闭）────────────────
 async function popout(onClose?: () => void) {
-  const url = `${location.pathname}${location.search ? location.search + '&' : '?'}scratchpad=1`;
-
-  // Tauri 环境：使用原生 WebviewWindow（window.open 在 Tauri webview 中被拦截）
   try {
-    const { WebviewWindow } = await import('@tauri-apps/api/webviewWindow');
-    // 若已有便签窗口，聚焦复用
-    const existing = await WebviewWindow.getByLabel('scratchpad').catch(() => null);
-    if (existing) {
-      await existing.setFocus().catch(() => {});
-      onClose?.();
-      return;
-    }
-    new WebviewWindow('scratchpad', {
-      url,
+    await openDetachedWindow({ label: 'scratchpad', url: detachedUrl('scratchpad'),
       title: '便签本 — AgentWithU',
       width: 560,
       height: 800,
-      resizable: true,
       alwaysOnTop: loadWindowPinned(),
     });
     onClose?.();
-    return;
-  } catch {
-    // 非 Tauri 环境，降级到 window.open
+  } catch (error) {
+    alert(`便签本弹窗未打开：${error instanceof Error ? error.message : String(error)}`);
   }
-
-  const win = window.open(url, 'agent-scratchpad',
-    'width=560,height=800,resizable=yes,scrollbars=yes');
-  if (!win) {
-    alert('浏览器阻止了弹出窗口，请允许本站弹出窗口后重试');
-    return;
-  }
-  onClose?.();
 }
 
 /** 检测是否当前页面就是独立便签窗口 */

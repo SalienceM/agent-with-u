@@ -415,17 +415,12 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
   useEffect(() => {
     if (!config.workspaceKitsEnabled) setWorkspaceKitsOpen(false);
   }, [config.workspaceKitsEnabled]);
-  const dispatchingRef = useRef(false);
-  const seqRetryTimerRef = useRef<number | null>(null);
-  const dispatchNextRef = useRef<() => void>(() => {});
   const seqPendingRef = useRef(false);
   const seqViewSessionRef = useRef(sessionId);
   seqViewSessionRef.current = sessionId;
-  // 新输入在模型忙碌时会自动排队并激活本轮连续派发。应用重启后保留的
-  // 历史队列不会擅自恢复，需要用户在队列条上点一次继续。
-  const [seqChainActive, setSeqChainActive] = useState(false);
-  const seqChainSessionRef = useRef<string | null>(null);
-  const setChain = useCallback((v: boolean) => { setSeqChainActive(v); }, []);
+  // 执行端持久状态；切换页面/断线不再改变序列调度。
+  const [seqChainActive, setSeqChainActive] = useState(true);
+  const [seqStateError, setSeqStateError] = useState('');
 
   useEffect(() => {
     let cancelled = false;
@@ -442,46 +437,48 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
 
   useEffect(() => {
     let cancelled = false;
-    if (seqRetryTimerRef.current !== null) {
-      window.clearTimeout(seqRetryTimerRef.current);
-      seqRetryTimerRef.current = null;
-    }
-    seqChainSessionRef.current = null;
-    setChain(false);
+    let revision = 0;
+    setSeqChainActive(true);
+    setSeqStateError('');
     setSeqTasks([]);
     setSeqQueueError('');
     if (!sessionId) { setSeqTasks([]); return; }
-    api.seqtaskGet(sessionId).then((r) => {
-      if (!cancelled && r.status === 'ok') {
-        setSeqTasks((current) => mergeAuthoritativeSeqTasks(r.seqTasks || [], current));
-      }
-    });
+    const refresh = () => {
+      const requestedRevision = revision;
+      void api.seqtaskGet(sessionId).then((r) => {
+        if (!cancelled && requestedRevision === revision && r.status === 'ok') {
+          setSeqTasks((current) => mergeAuthoritativeSeqTasks(r.seqTasks || [], current));
+          setSeqChainActive(r.seqAuto);
+          setSeqStateError(r.seqError || '');
+        }
+      });
+    };
+    refresh();
     const unsubscribe = api.onSeqtaskUpdated((data) => {
       if (data.sessionId !== sessionId) return;
+      revision += 1;
       setSeqTasks((current) => mergeAuthoritativeSeqTasks(data.seqTasks || [], current));
+      setSeqChainActive(data.seqAuto);
+      setSeqStateError(data.seqError || '');
+    });
+    const unsubscribeConnection = api.onSessionConnectionStatus(sessionId, (connected) => {
+      if (connected) refresh();
     });
     return () => {
       cancelled = true;
-      if (seqRetryTimerRef.current !== null) {
-        window.clearTimeout(seqRetryTimerRef.current);
-        seqRetryTimerRef.current = null;
-      }
       unsubscribe();
+      unsubscribeConnection();
     };
-  }, [sessionId, setChain]);
+  }, [sessionId]);
 
-  // 取队首待发任务，派发进主对话（doSend 跳过斜杠命令拦截 + 自带 isStreaming 守卫）
-  // ★ 用 ref 持有 chat 方法，避免 chat 对象每 render 换新导致 dispatchNext 被频繁重建、
-  //   auto-dispatch effect 不断清除/重建 timeout 引发的竞态：seqtaskUpdated 事件触发
-  //   re-render 时 dispatchNext 正在 await 中，旧的 chat 闭包可能持有过期的 isStreaming
-  //   或 doSend 引用，造成 setMessages(userMsg) 被跳过或被后续 loadSession 覆盖。
+  // 手动发送/截图使用最新 chat 方法；序列派发不再经过这些前端 ref。
   const isStreamingRef = useRef(chat.isStreaming);
   isStreamingRef.current = chat.isStreaming;
   const doSendRef = useRef(chat.doSend);
   doSendRef.current = chat.doSend;
   const sendMessageRef = useRef(chat.sendMessage);
   sendMessageRef.current = chat.sendMessage;
-  seqPendingRef.current = seqTasks.some((task) => task.status === 'pending' && !task.syncing);
+  seqPendingRef.current = seqTasks.some((task) => ['pending', 'running', 'error'].includes(task.status) && !task.syncing);
 
   // Smooth 顺滑问答只投递到最后聚焦的 pane。若当前回答尚未结束，先在
   // 内存中排队，等 done 边缘再发送，避免打断培训录屏中的现有回答。
@@ -505,48 +502,12 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
     if (next) doSendRef.current(next.prompt, [next.image]);
   }, [chat.isStreaming, isFocused, sessionId]);
 
-  const dispatchNext = useCallback(async () => {
-    if (!sessionId || dispatchingRef.current || isStreamingRef.current) return;
-    seqChainSessionRef.current = sessionId;
-    setChain(true);   // 主动派发即激活连发链（▶按钮也走这里，可续上被打断的链）
-    dispatchingRef.current = true;
-    try {
-      const r = await api.seqtaskTakeNext(sessionId);
-      if (r.status === 'ok' && r.task) {
-        const imgs = r.task.images && r.task.images.length ? r.task.images : undefined;
-        const textAttachments = r.task.textAttachments && r.task.textAttachments.length
-          ? r.task.textAttachments
-          : undefined;
-        const text = r.task.text || '';
-        // 以 / 开头的条目当作斜杠命令处理（/compact、/clear 等可排进队列）；
-        // 其余走原始发送，绕过命令拦截。
-        // ★ 通过 ref 调用，始终拿到最新的函数引用，不受闭包陈旧影响
-        if (text.trim().startsWith('/') && !textAttachments?.length) {
-          await sendMessageRef.current(text, imgs, textAttachments);
-        } else {
-          // React state 要到下一次 render 才会回写这个 ref；先同步占位，封住
-          // seqtaskUpdated 与 setIsStreaming(true) 之间的同帧二次派发窗口。
-          isStreamingRef.current = true;
-          doSendRef.current(text, imgs, textAttachments, r.task.deliveryMode || undefined);
-        }
-      } else if (seqPendingRef.current) {
-        // done 帧会略早于后端任务清理/落盘；Relay 断线时 RPC 也可能暂不可用。
-        // 队首保持 pending，短暂轮询权威 busy 状态，不把“取不到”当成已完成。
-        const delay = Math.max(250, Math.min(Number(r.retryAfterMs) || 1000, 3000));
-        if (seqRetryTimerRef.current === null) {
-          seqRetryTimerRef.current = window.setTimeout(() => {
-            seqRetryTimerRef.current = null;
-            if (seqChainSessionRef.current === sessionId && seqPendingRef.current) {
-              dispatchNextRef.current();
-            }
-          }, delay);
-        }
-      }
-    } finally {
-      dispatchingRef.current = false;
-    }
-  }, [sessionId]); // ★ 不再依赖 chat 对象，dispatchNext 稳定不变
-  dispatchNextRef.current = dispatchNext;
+  const setSequenceAuto = useCallback(async (enabled: boolean) => {
+    if (!sessionId) return;
+    const result = await api.seqtaskSetAuto(sessionId, enabled);
+    if (seqViewSessionRef.current !== sessionId) return;
+    if (result.status !== 'ok') setSeqQueueError(result.message || '序列状态修改失败');
+  }, [sessionId]);
 
   // 空闲时的第一条输入直接发送。
   const handleUserSend = useCallback((
@@ -554,8 +515,9 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
     images?: any[],
     textAttachments?: TextAttachment[],
     kitApprovalDelegation?: boolean,
+    skillInvocation?: import('../utils/skillCommands').SkillInvocation,
   ) => {
-    return sendMessageRef.current(content, images, textAttachments, kitApprovalDelegation);
+    return sendMessageRef.current(content, images, textAttachments, kitApprovalDelegation, skillInvocation);
   }, []); // ★ 通过 ref 调用，无需依赖 chat
 
   // 模型忙碌时 ChatInput 会把后续输入送到这里；无需显式开启模式。
@@ -563,7 +525,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
     content: string,
     images?: any[],
     textAttachments?: TextAttachment[],
-    activateChain = true,
+    _activateChain = true,
   ) => {
     if (!sessionId) return;
     const text = (content || '').trim();
@@ -581,10 +543,6 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
       createdAt: Date.now() / 1000,
       syncing: true,
     };
-    if (activateChain) {
-      seqChainSessionRef.current = sessionId;
-      setChain(true);
-    }
     setSeqQueueError('');
     setSeqTasks((current) => [...current, optimisticTask]);
     void api.seqtaskAdd(
@@ -611,7 +569,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
       setSeqTasks((current) => current.filter((task) => task.id !== optimisticId));
       setSeqQueueError(`序列任务同步失败：${error instanceof Error ? error.message : String(error)}`);
     });
-  }, [sessionId, setChain]);
+  }, [sessionId]);
 
   // Redo 与输入框的默认投递规则保持一致：空闲时立即发送；当前正在回答或已有
   // 队列时排到下一轮，不能因为点历史消息而意外中断正在生成的内容。
@@ -631,14 +589,6 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
     if (!sessionId) return { status: 'error', message: 'Session 不存在' };
     return api.steerSeqTask(sessionId, taskId);
   }, [sessionId]);
-
-  // 当前回答结束后自动取队首；dispatchNext 使用稳定 ref，并由 dispatchingRef
-  // 防止流状态与队列事件同时到达造成重复派发。
-  useEffect(() => {
-    if (!seqChainActive || seqChainSessionRef.current !== sessionId || chat.isStreaming || isStreamingRef.current) return;
-    if (!seqTasks.some((t) => t.status === 'pending' && !t.syncing)) return;
-    dispatchNext();
-  }, [chat.isStreaming, seqChainActive, seqTasks, dispatchNext, sessionId]);
 
   // ── 持久化 skipPermissions ──
   const handleSkipPermissionsChange = useCallback(
@@ -1119,13 +1069,15 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
           <button onClick={() => setSeqQueueError('')} style={seqQueueErrorCloseStyle}>✕</button>
         </div>
       )}
-      {sessionId && seqTasks.some((t) => t.status === 'pending' || t.status === 'steering') && (
+      {sessionId && (!seqChainActive || seqTasks.some((t) => ['pending', 'steering', 'running', 'error'].includes(t.status))) && (
         <SeqTaskPanel
           sessionId={sessionId}
           tasks={seqTasks}
           chainActive={seqChainActive}
+          queueError={seqStateError}
           isStreaming={chat.isStreaming}
-          onSendNext={dispatchNext}
+          onSendNext={() => void setSequenceAuto(true)}
+          onPause={() => void setSequenceAuto(false)}
           canSteer={chat.isStreaming && followUpCapabilities.nativeSteer}
           onSteerTask={handleSteerSeqTask}
           onTasksChange={(tasks) => setSeqTasks((current) => mergeAuthoritativeSeqTasks(tasks, current))}
@@ -1145,7 +1097,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
         onSkipPermissionsChange={handleSkipPermissionsChange}
         isMobile={isMobile}
         onQueueTask={handleQueueTask}
-        seqCount={seqTasks.filter((t) => t.status === 'pending').length}
+        seqCount={seqTasks.filter((t) => ['pending', 'running', 'error'].includes(t.status)).length}
         onCompact={handleCompact}
         fontSize={config.fontSize}
         onAdjustFontSize={onAdjustFontSize}

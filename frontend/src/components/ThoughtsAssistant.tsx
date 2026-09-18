@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { api, getCurrentUserProfile } from '../api';
+import { api, getCurrentUserProfile, onCurrentUserChanged } from '../api';
+import { manualReferences, openSkillManual } from '../utils/skillManual';
 import { useClipboardImage } from '../hooks/useClipboardImage';
 import { themes, useConfig } from '../hooks/useConfig';
 import { markdownToHtml } from '../utils/markdown';
@@ -81,7 +82,13 @@ export const ThoughtsAssistant: React.FC<Props> = ({
   // 固定的是请求目标和瞬时快照，不只是下拉框；切换 Session 不能改写绑定。
   const [binding, setBinding] = useState<{ session: any; attention: AttentionContext; backends: any[] } | null>(null);
   const session = binding ? binding.session : currentSession;
-  const attention = binding ? binding.attention : currentAttention;
+  const baseAttention = binding ? binding.attention : currentAttention;
+  const [skillFocus, setSkillFocus] = useState<string[]>([]);
+  const attention: AttentionContext = skillFocus.length ? {
+    key: `skills:${[...skillFocus].sort().join(',')}`, kind: 'skills', label: `Skill 手册 · ${skillFocus.join('、')}`,
+    detail: '仅引用使用知识，不执行 Skill；每次提问读取本节点最新维护内容。',
+    sessionId: session?.id, workingDir: session?.workingDir, execKey: session?.execKey,
+  } : baseAttention;
   const backends = binding ? binding.backends : currentBackends;
   const sessionId = session?.id || '';
   const isLoop = session?.sessionType === 'loop';
@@ -130,11 +137,15 @@ export const ThoughtsAssistant: React.FC<Props> = ({
 
   useEffect(() => {
     setFollowFocus(true);
+    setSkillFocus([]);
     setSelectedContextKey(attention.key);
     setAsides([]);
     setLive({});
     setError('');
   }, [sessionId]);
+  useEffect(() => onCurrentUserChanged(() => {
+    setBinding(null); setSkillFocus([]); setDraft(''); setAsides([]); setLive({}); clearImages();
+  }), [clearImages]);
 
   useEffect(() => {
     if (followFocus) setSelectedContextKey(attention.key);
@@ -226,7 +237,11 @@ export const ThoughtsAssistant: React.FC<Props> = ({
   }, [followFocus, displayedAttention, attention, sessionId, session]);
 
   const submit = useCallback(async (forcedText?: string) => {
-    const question = (forcedText ?? draft).trim();
+    let question = (forcedText ?? draft).trim();
+    if (question && skillFocus.length) {
+      const existing = manualReferences(question);
+      question += skillFocus.filter(name => !existing.includes(name)).map(name => ` @SKILL:${name}`).join('');
+    }
     const context = attentionForRequest();
     const focusImages = context.imageAttachments || [];
     const outgoingImages = [...focusImages, ...images].filter((item, index, all) => (
@@ -252,7 +267,7 @@ export const ThoughtsAssistant: React.FC<Props> = ({
     } finally {
       setSubmitting(false);
     }
-  }, [draft, sessionId, busy, images, attentionForRequest, isLoop, clearImages]);
+  }, [draft, sessionId, busy, images, attentionForRequest, isLoop, clearImages, skillFocus]);
 
   const clearCurrent = useCallback(async () => {
     if (!sessionId || busy || visibleAsides.length === 0) return;
@@ -326,7 +341,7 @@ export const ThoughtsAssistant: React.FC<Props> = ({
             {actualMode === 'dock' ? '↗' : '◫'}
           </button>
         )}
-        {!standalone && !isMobile && onDetach && (
+        {!standalone && onDetach && (
           <button type="button" disabled={!!binding} style={{ ...iconButton, width: 'auto', padding: '0 9px', opacity: binding ? 0.5 : 1 }} onClick={onDetach} title={binding ? '请先解除注意力固定，再分离窗口' : '分离为独立宽窗口，方便系统分屏'}>⧉ 分离</button>
         )}
         {standalone && (
@@ -450,6 +465,14 @@ export const ThoughtsAssistant: React.FC<Props> = ({
       {error && <div role="alert" style={errorStyle}>{error}</div>}
 
       <div ref={boxRef} style={composerStyle}>
+        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, alignItems: 'center', fontSize: 11, marginBottom: 6 }}>
+          <span>输入 @SKILL 引用使用手册（纯文本答疑）</span>
+          {skillFocus.map(name => <button key={name} style={quietButton} title="独立窗口预览手册" onClick={() => {
+            if (!session?.execKey) { setError('Session 执行节点尚未确认'); return; }
+            void openSkillManual(name, session.execKey).catch(reason => setError(String(reason)));
+          }}>📖 {name} ↗</button>)}
+          {skillFocus.length > 0 && <button style={quietButton} onClick={() => { setSkillFocus([]); setFollowFocus(true); }}>退出 Skill 关注</button>}
+        </div>
         {images.length > 0 && (
           <div style={{ display: 'flex', gap: 7, flexWrap: 'wrap', marginBottom: 8 }}>
             {images.map((image) => (
@@ -463,7 +486,13 @@ export const ThoughtsAssistant: React.FC<Props> = ({
         <div style={{ display: 'flex', gap: 8, alignItems: 'flex-end' }}>
           <AdvancedPromptTextarea
             value={draft}
-            onValueChange={setDraft}
+            onValueChange={value => {
+              setDraft(value);
+              const names = manualReferences(value);
+              if (names.length) { setSkillFocus(names); setFollowFocus(true); }
+              else if (manualReferences(draft).length) setSkillFocus([]);
+            }}
+            enableSkillReferences
             sessionId={sessionId || undefined}
             workingDir={session?.workingDir}
             execKey={session?.execKey}

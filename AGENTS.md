@@ -400,6 +400,34 @@ attempts and end times); identical pushes, streaming deltas and hidden tabs do n
 detail reads. In-flight reads are coalesced and failures expose retry; completed steps
 stay expandable while authoritative persisted detail replaces the live replay.
 
+**LOOP call diagnostics.** `LoopRecord.call_diagnostics` / `callDiagnostics` stores at
+most 64 content-free call observations (32 recent phase transitions each). Timings
+separate local Skill/reference preparation, entry into Backend, first model/tool event,
+first text, last activity, and terminal outcome. Prompt characters/token estimates exclude
+implicit Agent context; HTTP JSON sizes are estimates, not wire/usage counters. API backends
+expose HTTP attempts/status and retry backoff; CLI/SDK acceptance never claims provider
+acceptance or internal queue visibility. Error evidence retains categories/status only, not
+raw exceptions, prompts, headers, URLs or credentials. Diagnostic updates reuse session-routed
+`loopProgress` pushes, throttled to once per second with no idle timer/polling; cached data
+is checkpointed during activity and at call boundaries. Compact state includes only the
+latest call; lazy full-record reads refresh at call boundaries, not on diagnostic activity.
+The existing retry/degrade/continue policy remains unchanged. Flow cards have full-size
+stage buttons and independent step buttons, plus a sticky historical/latest navigator.
+Only the current round's last unfinished record may animate; stale historical timers freeze.
+
+**Optional chat Kit Prompt.** `Session.abilities.kitToolsMode` is a session-scoped
+`auto | on | off` policy exposed as an immutable built-in Prompt control in Sidebar's
+binding dialog. Missing values (including legacy/new Sessions) mean `auto`: inject only
+when this Session has an enabled visible Kit or a nonterminal Kit run. `on` supports
+explicit discovery even with an empty list; `off` overrides inventory. Resolve at the
+normal chat send boundary, not from keywords, model arguments or global workspace Kits.
+Inactive turns receive neither CLI instructions/lease tokens nor the reserved API tool.
+The policy is not approval delegation; `Kit 代确认` stays a separate one-send grant, and
+cannot override a disabled/unavailable tool. Changes affect subsequent sends, not existing
+native history or submitted Kit jobs. Old clients omitting the field in ability updates
+preserve an existing explicit choice. The binding dialog does not load full Kit state or
+poll to implement this feature; dynamic tokens never enter saved Prompt templates.
+
 **Addons (执行中补充).** `loopAddAddon` / `loopRemoveAddon` let the user queue
 supplementary requirements while a loop runs — they do **not** affect the current
 loop. The add input is a multi-line textarea with **image paste** support;
@@ -625,6 +653,37 @@ Only navigation IDs are persisted here, not transcript, input attachments or Kit
 Ordinary input drafts still have their existing in-memory lifetime across tab switches.
 
 ### Skill market branches and AI explanations
+
+**Skill usage manuals and attention references.** Repo Skill cards expose a separate
+human-facing usage guide, source Markdown preview, and independent Web/Tauri window.
+`skill_manuals.SkillManuals` stores custom guides under `skill-library/.manuals/`,
+outside installed package directories; reinstalls preserve them, rename/delete follow
+the Skill, and library backups include them. Saves compare the expected content revision
+and replace atomically; source hashes flag outdated guides. No manual becomes SKILL.md,
+an activation or a deployment. Without a custom guide, use local USAGE/README/SKILL.md
+(bounded, confined paths), never fetch remote docs on browsing. `listSkillManuals` is
+metadata-only; get/save are explicit node-routed, off-loop calls. Body reads happen only
+on opening a guide or asking a question. The renderer escapes raw HTML and uses a
+script/network-disabled opaque iframe; source mode is escaped text.
+
+Thoughts' opt-in `@SKILL:name` picker reads installed names from the Session executor.
+It does not require activation. The backend resolves references from the question itself,
+never trusts a client-supplied manual body, and keeps a separate `skills:<names>` attention
+thread. At most three documents / 12K characters each enter the transient prompt, with
+provenance and explicit truncation notices. Missing manuals produce persistent errors.
+These turns use `text_only.send_text_only` (no native tools or project inheritance), a
+180-second bound and a separately cancellable task; ordinary aside semantics stay intact.
+Images plus Skill references currently fail explicitly rather than dropping attachments.
+Reference bodies are not saved with the question; followups reread the current guides.
+
+`detachedWindow.ts` owns scratchpad, Thoughts and Skill-manual opening. Browser popups
+must be opened synchronously within the user click, before any native import. Tauri
+calls wait for created/error with a deadline, restore/show/focus existing windows and
+propagate errors; do not silently fall back to `window.open` inside a Tauri webview or
+close the originating pane on failure. Native capabilities explicitly grant show,
+unminimize, focus, close and scoped child creation where needed. Detached URLs have
+mutually exclusive page selectors and retain the same deployment prefix and node IDs.
+Tests: `test_skill_manuals.py`, `skill-manuals.test.cjs`, `skill-manuals.spec.ts`.
 
 **Library loading and binding stay read-only until execution.** Sidebar opens the
 ability dialog immediately, then uses `loadSessionMeta` (never full chat history)
@@ -940,30 +999,35 @@ streaming saves. A process-level cache (`_chat_extras` / `_chat_extras_get` /
 - **序列任务 (Sequence tasks).** A queue of pre-planned, progressively-detailed prompts
   the user lines up; they are sent into the main conversation **one at a time** — the
   next is sent only after the model has **fully finished** answering the previous turn.
-  Persistence + ordering live server-side; **dispatch** is driven in the frontend
-  (`ChatPane`) only after an explicit `done` edge. `error` is a diagnostic frame, not
-  a completion signal. `seqtaskTakeNext` also checks the executor's authoritative
-  main-turn registry and uses a short dispatch reservation, so Relay reconnects and
-  multiple clients cannot pop the next item while the prior turn is still alive;
-  then `chat.doSend` sends it raw (bypassing slash-command interception).
+  Persistence, ordering, and **dispatch** live on the executor in
+  `sequence_scheduler.SequenceScheduler`. It waits for the authoritative main-turn
+  task to exit (not an early `done`/`error` frame), durably claims the next entry,
+  and registers its chat turn without an intervening await/client RPC. Controllers
+  only mutate queue/state and render `seqtaskUpdated` / `chat_turn_started` events.
+  `seqtaskTakeNext` is a compatibility no-op and never returns a claimable task.
   There is no explicit sequence-mode switch. When the conversation is idle, the first
   Enter sends normally; while a response is streaming (or a queue already exists),
   subsequent input is added with `seqtaskAdd` and the active chain drains it automatically.
-  A chain is armed by new input and remains active until the pending queue is empty.
-  Persisted tasks loaded after an app/session restart are deliberately left paused so
-  stale work cannot execute by surprise; the slim panel's "▶ 继续" action re-arms them.
+  `seq_auto` now defaults true and persists explicit pause/resume across clients and
+  restarts. Legacy unused `seqAuto` values migrate to true via `seqSchedulerVersion`.
+  New input does not override a pause. Controller disconnects do not stop the chain;
+  executor startup resumes pending work. A persisted `running` entry has uncertain
+  effects after a crash, so recovery marks it error and pauses instead of replaying it.
+  Failures pause with details; "重试并继续" explicitly retries failed entries. Manual
+  abort also pauses; Qwen redirect intentionally interrupts then runs its priority entry.
   Unsent tasks are freely editable / removable / reorderable
-  (`seqtaskAdd/Edit/Remove/Reorder/Clear`, images supported). A queued entry starting
-  with `/` is dispatched as a **slash command** (so `/compact`, `/clear`, … can be
-  lined up between prompts); everything else goes raw. State syncs via the
-  `seqtaskUpdated` push event.
+  (`seqtaskAdd/Edit/Remove/Reorder/Clear`, images supported); running entries cannot
+  be edited/removed/reordered, and clear preserves them. Executor-safe slash commands
+  (`/compact`, `/clear`, `/new`, `/autocontinue`, `/continue`, `/skill`, `/opsx-*`)
+  retain explicit semantics; unsupported UI commands pause with an error, never become
+  plain prompts. No per-send Kit approval delegation or token is stored/replayed.
   **UI is input-box-centric**: no activation control is shown. During streaming the
   textarea remains usable, Enter/＋ queues the next item, and ■ remains available to
   abort the current response. `SeqTaskPanel.tsx` is a **slim, collapsed-by-default
   strip** shown only while pending items exist: 🧬 count, current wait/send state,
-  optional restart-resume, and clear; expand it to edit / remove / ▲▼ reorder. The
-  legacy `seq_auto` field and `seqtaskSetAuto` RPC remain readable for compatibility,
-  but the current UI's automatic chain no longer depends on that toggle.
+  pause/resume/retry, and clear; expand it to edit / remove / ▲▼ reorder. The strip
+  stays visible while paused or failed, including with an empty queue, so a saved
+  pause always has an explicit resume control. `seqtaskSetAuto` controls the executor.
 - **俺寻思.** `ThoughtsAssistant.tsx` is an App-level attention companion, opened
   from the top bar or the 🤔 button in ordinary/LOOP panes. Normal questions use an
   **independent backend instance** (`agent_session_id=None`, call id
@@ -985,6 +1049,29 @@ Side RPCs: `seqtaskGet`, `seqtaskAdd`, `seqtaskEdit`, `seqtaskRemove`,
 `ChatInput` toolbar (`onAdjustFontSize` → App `updateConfig`, clamped 11–28).
 
 ### Slash Commands
+
+**Explicit Skill commands.** `/skill <bound-name> <arguments>` is a Session-scoped
+call, with explicit OpenSpec `/opsx-*` aliases defined in `skill_commands.py`.
+It is not an arbitrary native-TUI/shell passthrough. `listSessionSkillCommands`
+is ownership-gated, executor-routed, reads only bound Skill metadata off-loop and
+never downloads, deploys or probes CLIs. ChatInput loads it only while its menu
+is open, refreshes on binding changes or explicit retry, and ignores stale node/
+Session replies. Parameterized selections fill the draft without sending; busy
+Skill sends retain the draft rather than entering the ordinary queue. App commands
+cannot be overwritten. API-only/SSH transports advertise no general native Skill
+execution support; `/native` fails explicitly instead of pretending to execute.
+
+The ordinary send boundary parses the original command and validates optional
+`skillInvocation` name/arguments/instruction digest, installed/bound state, backend
+and workspace. OpenSpec checks Backend PATH/project node_modules/.bin for its CLI
+and requires openspec/config.yaml in this exact project (not a parent). Presence
+checks are not version/health checks; no install, init or business CLI runs during
+preflight. Check failures persist an assistant error before any model call. After
+preparation the selection is revalidated; only the selected Skill's complete
+instructions enter turn-only constraints. Raw slash commands remain in visible
+history, but model input is prefixed to prevent a CLI expanding the alias again.
+Arguments are data, never shell interpolation; existing permissions/Kit approval
+gates are unchanged. Tests: test_skill_commands.py and skill-commands.spec.ts.
 
 Frontend handles these slash commands in `useChat.ts`:
 
