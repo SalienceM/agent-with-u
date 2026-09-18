@@ -1,4 +1,4 @@
-"""Isolated document generation; deliberately never enters an agent's chat runner.
+"""Isolated document/image Q&A with text output, never an agent's chat runner.
 
 API backends receive no tools. CLI backends get a disposable home/workspace,
 authentication-only copies and native tool restrictions, not just a prompt saying
@@ -9,17 +9,47 @@ Normal chat permissions and persisted threads are untouched.
 from __future__ import annotations
 
 import json
+import base64
+import io
 import os
 import tempfile
 from pathlib import Path
 from typing import Any, AsyncIterator, Callable
 
 from .base import ModelBackend, StreamDelta
+from ..types import ImageAttachment
 
 TEXT_ONLY_BACKENDS = {
     "openai-compatible", "anthropic-api", "codex-office", "qwen-code-cli",
     "claude-agent-sdk", "claude-code-official",
 }
+
+
+def _reference_images(images: list[ImageAttachment] | None) -> list[ImageAttachment]:
+    """只接收本轮上传的图片字节，不允许文档/客户端借 file_path 读取执行端文件。"""
+    if len(images or []) > 8:
+        raise ValueError('手册答疑一次最多附带 8 张图片；未调用模型。')
+    from PIL import Image
+    formats = {'image/png': 'PNG', 'image/jpeg': 'JPEG', 'image/webp': 'WEBP', 'image/gif': 'GIF'}
+    total = 0
+    for image in images or []:
+        if image.mime_type not in formats or not image.base64:
+            raise ValueError('请上传 PNG/JPEG/WebP/GIF 图片；手册答疑不读取执行端文件路径。')
+        if len(image.base64) > 23_000_000:
+            raise ValueError('本轮图片合计不能超过 16 MiB；未调用模型。')
+        try:
+            data = base64.b64decode(image.base64, validate=True)
+            total += len(data)
+            if total > 16 * 1024 * 1024:
+                raise ValueError()
+            with Image.open(io.BytesIO(data)) as picture:
+                if picture.format != formats[image.mime_type] or picture.width * picture.height > 20_000_000:
+                    raise ValueError()
+                picture.verify()
+        except Exception:
+            raise ValueError('图片无效或过大（合计 16 MiB、单张 2000 万像素以内）；未调用模型。') from None
+    # 丢掉可选路径，防止某个 Backend 绕过已经核验的上传字节。
+    return [ImageAttachment(id=image.id, mime_type=image.mime_type, base64=image.base64) for image in images or []]
 
 
 def _copy_auth(source: Path, target: Path) -> None:
@@ -99,7 +129,7 @@ def _codex_restrictions() -> dict[str, Any]:
 
 async def _codex_text(backend: ModelBackend, content: str, rules: str,
                       home: Path, cwd: Path, model_override: str | None = None,
-                      reasoning_effort: str | None = None) -> str:
+                      reasoning_effort: str | None = None, images: list[ImageAttachment] | None = None) -> str:
     from .codex_app_server import CodexAppServerProcess, local_app_server_command
     from .codex_office import resolve_codex_cli
 
@@ -155,7 +185,8 @@ async def _codex_text(backend: ModelBackend, content: str, rules: str,
         if not isinstance(entries, list) or any(entry.get("skills") or entry.get("errors") for entry in entries):
             raise RuntimeError("Codex isolated skill catalog is not empty")
         await conn.request("turn/start", {
-            "threadId": tid, "input": [{"type": "text", "text": content}],
+            "threadId": tid, "input": [{"type": "text", "text": content}] + [
+                {"type": "image", "url": f"data:{image.mime_type};base64,{image.base64}"} for image in images or []],
             "environments": [], "approvalPolicy": "never",
         }, timeout=45)
         partial = ""
@@ -210,7 +241,8 @@ def _assistant_text(blocks: list[Any]) -> str:
 
 
 async def _qwen_text(backend: ModelBackend, content: str, rules: str,
-                     home: Path, cwd: Path, model_override: str | None = None) -> str:
+                     home: Path, cwd: Path, model_override: str | None = None,
+                     images: list[ImageAttachment] | None = None) -> str:
     from qwen_code_sdk import query
     original_env = backend._build_env()
     env = _isolated_env(original_env, home)
@@ -225,7 +257,7 @@ async def _qwen_text(backend: ModelBackend, content: str, rules: str,
     auth = backend.get_env("QWEN_PROVIDER") or backend.get_env("QWEN_AUTH_TYPE") or "openai"
     if backend.config.base_url:
         env.setdefault("OPENAI_BASE_URL" if auth != "anthropic" else "ANTHROPIC_BASE_URL", backend.config.base_url)
-    backend._ensure_project_auth_settings(str(cwd), auth, model)
+    backend._ensure_project_auth_settings(str(cwd), auth, model, enable_image_input=bool(images))
     # SDK 会省略 []，CLI 则将空 core-tools 当作全部工具。使用已知工具的
     # 单项白名单再排除它，交集严格为空；回调作为额外拒绝边界。
     options = dict(cwd=str(cwd), env=env, path_to_qwen_executable=backend._resolve_cli(),
@@ -236,7 +268,19 @@ async def _qwen_text(backend: ModelBackend, content: str, rules: str,
     text = ""
     completed = False
     # JSON 中的 @ 转为等价转义，避免 CLI 将第三方文档误作 @文件附件展开。
-    async with query(content.replace("@", "\\u0040"), options) as result:
+    prompt = content.replace("@", "\\u0040")
+    if images:
+        # Qwen SDK 的 stream-json 只接受文本；仅为已核验的本轮图片生成原生附件引用。
+        # 文件位于一次性 workspace，成功、报错和取消都会随 TemporaryDirectory 清理。
+        attachments = cwd / 'reference-images'
+        attachments.mkdir()
+        refs = []
+        for index, image in enumerate(images):
+            filename = f'{index}.{image.mime_type.split("/")[-1]}'
+            (attachments / filename).write_bytes(base64.b64decode(image.base64))
+            refs.append(f'@reference-images/{filename}')
+        prompt = '\n'.join(refs) + '\n\n' + prompt
+    async with query(prompt, options) as result:
         async for message in result:
             if message.get("type") == "assistant":
                 text = _assistant_text((message.get("message") or {}).get("content") or [])
@@ -252,7 +296,7 @@ async def _qwen_text(backend: ModelBackend, content: str, rules: str,
 
 
 async def _claude_text(backend: ModelBackend, content: str, rules: str,
-                       home: Path, cwd: Path) -> str:
+                       home: Path, cwd: Path, images: list[ImageAttachment] | None = None) -> str:
     from claude_agent_sdk import ClaudeAgentOptions, query
     from .base import resolve_claude_cli
     from .claude_code import ClaudeCodeOfficialBackend
@@ -276,7 +320,9 @@ async def _claude_text(backend: ModelBackend, content: str, rules: str,
     )
 
     async def prompt() -> AsyncIterator[dict[str, Any]]:
-        yield {"type": "user", "message": {"role": "user", "content": content}}
+        blocks = [{"type": "image", "source": {"type": "base64", "media_type": image.mime_type,
+                   "data": image.base64}} for image in images or []] + [{"type": "text", "text": content}]
+        yield {"type": "user", "message": {"role": "user", "content": blocks if images else content}}
 
     text = ""
     completed = False
@@ -300,14 +346,24 @@ async def _claude_text(backend: ModelBackend, content: str, rules: str,
 async def send_text_only(backend: ModelBackend, *, content: str, constraints: str,
                          session_id: str, message_id: str,
                          on_delta: Callable[[StreamDelta], None],
-                         model_override: str | None = None, reasoning_effort: str | None = None) -> None:
+                         model_override: str | None = None, reasoning_effort: str | None = None,
+                         images: list[ImageAttachment] | None = None) -> None:
+    images = _reference_images(images)
     kind = getattr(backend.config.type, "value", backend.config.type)
     if kind not in TEXT_ONLY_BACKENDS:
         raise ValueError("请选择支持文本解读的 Backend（图像生成 Backend 不适用）")
     if kind in {"openai-compatible", "anthropic-api"}:
-        await backend.send_message(messages=[], content=content, images=None,
-            session_id=session_id, message_id=message_id, on_delta=on_delta,
+        errors: list[str] = []
+        def receive(delta: StreamDelta) -> None:
+            if delta.type == 'error':
+                errors.append(delta.error or '模型未能完成答疑')
+            else:
+                on_delta(delta)
+        await backend.send_message(messages=[], content=content, images=images or None,
+            session_id=session_id, message_id=message_id, on_delta=receive,
             constraints=constraints, extra_tools=None, on_tool_call=None)
+        if errors:
+            raise RuntimeError(('图片与手册答疑失败，请确认当前模型支持图片。' if images else '文档答疑失败。') + errors[-1][:500])
         return
     with tempfile.TemporaryDirectory(prefix="awu-text-only-") as root:
         home, cwd = Path(root) / "home", Path(root) / "work"
@@ -317,6 +373,8 @@ async def send_text_only(backend: ModelBackend, *, content: str, constraints: st
             (home / directory).mkdir()
         runner = _codex_text if kind == "codex-office" else _qwen_text if kind == "qwen-code-cli" else _claude_text
         runtime: dict[str, Any] = {}
+        if images:
+            runtime['images'] = images
         if kind in {'codex-office', 'qwen-code-cli'} and model_override:
             runtime['model_override'] = model_override
         if kind == 'codex-office' and reasoning_effort:

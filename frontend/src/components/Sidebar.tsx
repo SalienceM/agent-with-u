@@ -7,6 +7,8 @@ import { AppModalPortal } from './AppModalPortal';
 import { ActivityBar } from './WorkbenchNavigation';
 import type { SidebarView, WorkbenchTab } from '../utils/workbench';
 
+import { SkillBindingTree } from './SkillBindingTree';
+
 interface Session {
   id: string;
   title: string;
@@ -1178,45 +1180,9 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
                     borderRadius: 8, overflowX: 'hidden', padding: '4px'
                   }}>
                     {availableSkills.length > 0 ? (
-                      availableSkills.map((sk: any) => {
-                        const bound = (abilityPickerSession.abilities?.skills || []).includes(sk.name);
-                        return (
-                          <div
-                            key={sk.id}
-                            onClick={(e) => { e.stopPropagation(); toggleAbility('skills', sk.name); }}
-                            style={{
-                              padding: '6px 10px', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 8,
-                              background: bound ? 'var(--theme-accent-bg, rgba(122,162,247,0.08))' : 'transparent',
-                              borderBottom: '1px solid var(--theme-border, rgba(0,0,0,0.04))',
-                            }}
-                          >
-                            <div style={{
-                              width: 14, height: 14, borderRadius: 3, borderWidth: 2, borderStyle: 'solid',
-                              display: 'flex', alignItems: 'center', justifyContent: 'center',
-                              background: bound ? 'var(--theme-accent)' : 'transparent',
-                              borderColor: bound ? 'var(--theme-accent)' : 'var(--theme-border)',
-                            }}>
-                              {bound && <div style={{ width: 6, height: 6, background: '#fff', borderRadius: 1 }} />}
-                            </div>
-                            <span style={{ flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontSize: 12, color: 'var(--theme-text)' }} title={sk.name}>{sk.name}</span>
-                            <div style={{ display: 'flex', flexShrink: 0, whiteSpace: 'nowrap', gap: 6 }}>
-                              <button
-                                onClick={(e) => { e.stopPropagation(); show_preview_skill(sk); }}
-                                style={{ fontSize: 10, padding: '2px 6px', borderRadius: 4, border: '1px solid var(--theme-border)', background: 'transparent', color: 'var(--theme-text-muted)', cursor: 'pointer' }}
-                              >
-                                预览
-                              </button>
-                              <button
-                                onClick={(e) => { e.stopPropagation(); setItemToDelete({ type: 'skills', name: sk.name }); }}
-                                style={{ fontSize: 10, padding: '2px 6px', borderRadius: 4, border: '1px solid #ef4444', background: 'rgba(239,68,68,0.1)', color: '#ef4444', cursor: 'pointer' }}
-                                title="取消绑定"
-                              >
-                                ✕
-                              </button>
-                            </div>
-                          </div>
-                        );
-                      })
+                      <SkillBindingTree skills={availableSkills} selected={abilityPickerSession.abilities?.skills || []}
+                        disabled={!abilityReady || abilitySaving} onPreview={show_preview_skill}
+                        onChange={skills => void saveAbilities({ ...(abilityPickerSession.abilities || { prompts: [] }), skills })} />
                     ) : (
                       <div style={{ padding: 12, textAlign: 'center', color: 'var(--theme-text-muted)', fontSize: 12 }}>
                         {abilityLoading ? '正在加载 Skills…' : abilityReady ? '该节点暂无 Skills，请先在此节点的 Repo 中创建或安装' : 'Skills 未加载'}

@@ -97,7 +97,7 @@ export interface SlashCommand {
   description: string;
   shortDesc: string;
   requiresArguments?: boolean;
-  kind?: 'skill';
+  kind?: 'skill' | 'project';
   source?: string;
   unavailableReason?: string;
 }
@@ -139,7 +139,7 @@ const HELP_TEXT = `📋 **可用命令：**
 | \`/commit\` | AI 生成 commit message 并提交 |
 | \`/git\` | Git: status / log / push / pull |
 
-Skill 命令会检查当前执行节点、项目和依赖；OpenSpec 的 /opsx-* 为 AWU 快捷别名，不是任意 Agent 原生命令透传。缺少环境不会自动安装。
+扩展项目命令仅在当前执行节点安装对应 Skill 后显示，具体工作流还需在 Session 启用。输入 / 查看当前实际入口。发送前会检查执行节点、项目和依赖，不自动安装，不是原生命令透传，也不会覆盖应用命令。
 
 **快捷键：** Enter 发送 · Skill 命令选择后先填入参数 · Shift+Enter 换行 · Ctrl+V 粘贴图片`;
 

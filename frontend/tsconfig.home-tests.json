@@ -17,6 +17,7 @@
     "src/utils/skillCommands.ts",
     "src/utils/detachedWindow.ts",
     "src/utils/skillManual.ts",
+    "src/utils/skillGroups.ts",
     "src/utils/tokenUsageTrend.ts",
     "src/utils/loopRecordDetail.ts",
     "src/utils/loopDiagnostics.ts",

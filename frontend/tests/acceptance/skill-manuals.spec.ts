@@ -5,6 +5,7 @@ const original = '# 原始说明\n\n原始步骤不会被维护操作覆盖。\n
 async function mockManuals(context: BrowserContext) {
   const requests: string[] = [];
   const asks: unknown[][] = [];
+  let failNextAsk = false;
   let data = { status: 'ok', name: skill.name, hasManual: false, content: original, originalContent: original,
     originalPath: 'README.md', documents: ['README.md', 'SKILL.md'], revision: '', sourceHash: 'source', outdated: false, source: { repository: 'fixture/repo' } };
   await context.routeWebSocket(/.*/, socket => {
@@ -23,11 +24,15 @@ async function mockManuals(context: BrowserContext) {
         data = { ...data, content: frame.params[1], hasManual: true, revision: `r${data.revision}` };
         return reply(data);
       }
-      if (frame.method === 'chatAsk') { asks.push(frame.params); return reply({ status: 'ok', turnId: 'manual-question' }); }
+      if (frame.method === 'chatAsk') {
+        asks.push(frame.params);
+        if (failNextAsk) { failNextAsk = false; return reply({ status: 'error', message: '模拟提交失败' }); }
+        return reply({ status: 'ok', turnId: 'manual-question' });
+      }
       server.send(message);
     });
   });
-  return { requests, asks };
+  return { requests, asks, failAsk: () => { failNextAsk = true; } };
 }
 async function sidebar(page: Page) {
   const opener = page.getByRole('button', { name: '打开会话列表', exact: true });
@@ -46,6 +51,7 @@ test('Repo manuals are lazy, editable, isolated from source, and open as real in
   const library = await repo(page);
   await expect(library.getByText(skill.name, { exact: true })).toBeVisible();
   expect(requests.filter(name => name === 'getSkillManual')).toHaveLength(0);
+  await library.getByRole('button', { name: `管理 ${skill.name}`, exact: true }).click();
   await library.getByRole('button', { name: '维护手册', exact: true }).click();
   const manual = page.getByRole('dialog', { name: 'Skill 使用手册' });
   await expect(manual).toContainText('尚未维护');
@@ -78,7 +84,7 @@ test('Repo manuals are lazy, editable, isolated from source, and open as real in
   await popup.close();
 });
 
-test('Thoughts @SKILL selects knowledge, preserves focus for followups, and previews without executing', async ({ page, context }, info) => {
+test('Thoughts @SKILL is explicit per message, preserves Session focus, and previews without executing', async ({ page, context }, info) => {
   const { requests, asks } = await mockManuals(context);
   await page.goto('/');
   await sidebar(page);
@@ -96,23 +102,56 @@ test('Thoughts @SKILL selects knowledge, preserves focus for followups, and prev
   await picker.getByRole('option').filter({ hasText: skill.name }).click();
   await expect(input).toHaveValue(`@SKILL:${skill.name} `);
   expect(asks).toHaveLength(0);
-  await input.fill(`@SKILL:${skill.name} 怎么开始？`);
-  await input.press('Enter');
-  await expect.poll(() => asks.length).toBe(1);
-  expect(asks[0][1]).toContain(`@SKILL:${skill.name}`);
-  expect(JSON.parse(String(asks[0][3])).kind).toBe('skills');
-  await input.fill('下一步呢？');
-  await input.press('Enter');
-  await expect.poll(() => asks.length).toBe(2);
-  expect(asks[1][1]).toContain(`@SKILL:${skill.name}`);
   const popupPromise = page.waitForEvent('popup');
   await thoughts.getByRole('button', { name: `📖 ${skill.name} ↗` }).click();
   const popup = await popupPromise;
   await expect(popup.getByRole('dialog', { name: 'Skill 使用手册' })).toBeVisible();
   await popup.close();
-  await thoughts.getByRole('button', { name: '退出 Skill 关注' }).click();
+  await input.fill(`@SKILL:${skill.name} 怎么开始？`);
+  await input.press('Enter');
+  await expect.poll(() => asks.length).toBe(1);
+  expect(asks[0][1]).toContain(`@SKILL:${skill.name}`);
+  expect(JSON.parse(String(asks[0][3])).kind).toBe('session');
+  expect(JSON.parse(String(asks[0][3])).content).toContain('Session 主工作区');
+  await expect(input).toHaveValue('');
+  await expect(thoughts.getByRole('group', { name: '附加 Skill 参考资料' })).toHaveCount(0);
+  await input.fill('下一步呢？');
+  await input.press('Enter');
+  await expect.poll(() => asks.length).toBe(2);
+  expect(asks[1][1]).toBe('下一步呢？');
+  await expect(input).toHaveValue('');
+  await input.fill(`@SKILL:${skill.name} 再结合手册看看`);
+  await thoughts.getByRole('button', { name: '清除 Skill 参考' }).click();
+  await expect(input).toHaveValue('再结合手册看看');
   await expect(thoughts.getByRole('button', { name: `📖 ${skill.name} ↗` })).toHaveCount(0);
   await page.screenshot({ path: info.outputPath('manual-attention.png') });
+});
+
+test('failed Skill question preserves explicit draft for retry; editing references immediately updates chips', async ({ page, context }) => {
+  const fixture = await mockManuals(context);
+  await page.goto('/'); await sidebar(page);
+  await page.locator('.awu-sidebar').getByText(/^客户工作会话 \d+$/).first().click();
+  await page.getByRole('button', { name: /俺寻思/ }).first().click();
+  const thoughts = page.getByRole('complementary', { name: '俺寻思注意力助手' });
+  const input = thoughts.locator('textarea').first();
+  const question = `@SKILL:${skill.name} 帮我看这个项目`;
+  await input.fill(question);
+  await expect(thoughts.getByRole('group', { name: '附加 Skill 参考资料' })).toBeVisible();
+  await input.fill('暂时不引用手册');
+  await expect(thoughts.getByRole('group', { name: '附加 Skill 参考资料' })).toHaveCount(0);
+  await input.fill(question);
+  fixture.failAsk();
+  await input.press('Enter');
+  await expect(thoughts.getByRole('alert')).toContainText('模拟提交失败');
+  await expect(input).toHaveValue(question);
+  await expect(input).toBeEnabled();
+  await expect(thoughts.getByRole('group', { name: '附加 Skill 参考资料' })).toContainText('仅本条有效');
+  await input.press('Enter');
+  await expect.poll(() => fixture.asks.length).toBe(2);
+  expect(fixture.asks[0][1]).toBe(question);
+  expect(fixture.asks[1][1]).toBe(question);
+  await expect(input).toHaveValue('');
+  await expect(thoughts.getByRole('group', { name: '附加 Skill 参考资料' })).toHaveCount(0);
 });
 
 test('scratchpad and thoughts browser detach open the correct page; blocked popup keeps original panel', async ({ page, context }) => {

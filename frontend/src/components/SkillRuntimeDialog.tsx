@@ -44,7 +44,7 @@ export const SkillRuntimeDialog: React.FC<{ names: string[]; initialExecKey?: st
   }, [name, execKey, revision, connected]);
 
   const start = async () => {
-    if (!approved || !plan?.approvalToken || busy || !connected) return;
+    if (!approved || !plan?.approvalToken || plan.status === 'ready' || busy || !connected) return;
     setBusy(true); setError('');
     try {
       const result = await api.skillRuntimePrepare(name, execKey, plan.approvalToken);
@@ -84,7 +84,7 @@ export const SkillRuntimeDialog: React.FC<{ names: string[]; initialExecKey?: st
         {!!plan.requirements?.length && <details><summary>Python 依赖 · {plan.requirements.length}</summary><pre style={logStyle}>{plan.requirements.join('\n')}</pre></details>}
         {!!plan.pythonImports?.length && <p style={muted}>将验证模块导入：{plan.pythonImports.join('、')}</p>}
         {plan.needsNode && <details><summary>Node 依赖声明</summary><pre style={logStyle}>{JSON.stringify(plan.nodeDependencies, null, 2)}</pre></details>}
-        {plan.status === 'preparing' ? <p role="status">正在后台执行，请稍候。日志自动刷新；切换页面不会中断。</p> : <>
+        {plan.status === 'ready' ? <p role="status" style={{ color: '#4fb477' }}>已就绪，无需重复准备。可以关闭窗口并在 Session 中按需启用。</p> : plan.status === 'preparing' ? <p role="status">正在后台执行，请稍候。日志自动刷新；切换页面不会中断。</p> : <>
           <label style={{ display: 'flex', gap: 8, alignItems: 'flex-start', fontSize: 13, lineHeight: 1.6 }}>
             <input type="checkbox" checked={approved} onChange={e => setApproved(e.target.checked)} />
             我已核对上述节点、依赖和计划，同意下载第三方依赖到专属环境并执行列出的验证。不会运行实际生成任务，也不自动提权。

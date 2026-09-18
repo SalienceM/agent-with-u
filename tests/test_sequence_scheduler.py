@@ -20,6 +20,7 @@ class SequenceSchedulerTests(unittest.IsolatedAsyncioTestCase):
         b._chat_extras = {}
         b._chat_extras_store = ChatExtrasStore()
         b._chat_turn_tasks = {}
+        b._skill_store = SimpleNamespace(command_sources=lambda: {'installed': [], 'profiles': []})
         b._seq_dispatch_reservations = {}
         self.session = Session(id='s', title='test', created_at=1, updated_at=1,
                                messages=[], working_dir='.', backend_id='test',

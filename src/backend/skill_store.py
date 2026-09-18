@@ -165,6 +165,10 @@ def assess_skill_risk(files: dict[str, bytes], markdown: str) -> dict:
     if shipped_binary:
         level = "high"
         flags.append(f"包含二进制文件：{', '.join(shipped_binary[:6])}")
+    if "awu.commands.json" in names:
+        if level == "low":
+            level = "medium"
+        flags.append("包含 AWU / 命令声明；安装后注册入口，不自动执行，请核对命令配置")
     if any(
         name.endswith(("requirements.txt", "package.json", "pyproject.toml", "environment.yml"))
         for name in names
@@ -249,7 +253,11 @@ def _normalise_zip_members(
         parts = PurePosixPath(member_name).parts
         logical_parts = parts[1:] if wrapper and parts[0] == wrapper else parts
         if root_parts and logical_parts[:len(root_parts)] != root_parts:
-            continue
+            # 指定来源子目录时仍保留其祖先共享声明；不把其他仓库文件纳入扫描。
+            ancestor_config = (logical_parts[-1:] == ('awu.commands.json',)
+                               and logical_parts[:-1] == root_parts[:len(logical_parts) - 1])
+            if not ancestor_config:
+                continue
         if not repository_mode:
             if info.file_size > MAX_STANDARD_FILE_BYTES:
                 raise ValueError(f"Skill 文件过大：{member_name}")
@@ -391,7 +399,26 @@ def _standard_skills_from_zip(
                 markdown_bytes = b""
                 prefix = "" if original_root == "." else original_root + "/"
                 total_size = 0
-                for member_name, info in owned_members.get(original_root, []):
+                from .skill_command_manifest import FILENAME, MAX_BYTES, parse_manifest
+                selected_members = list(owned_members.get(original_root, []))
+                # 仓库共享配置随每个子 Skill 携带；就近配置覆盖祖先配置。
+                if prefix + FILENAME not in members:
+                    for ancestor in PurePosixPath(original_root).parents:
+                        inherited_name = (ancestor / FILENAME).as_posix()
+                        if inherited_name in members:
+                            inherited = members[inherited_name]
+                            if inherited.file_size > MAX_BYTES:
+                                raise ValueError("命令配置超过 128 KB")
+                            inherited_profile = parse_manifest(_read_zip_member(zf, inherited))
+                            # 仓库配置可仅关联部分 Skill；不能让其阻止其他子 Skill 的安装。
+                            if members[skill_member].file_size > MAX_STANDARD_FILE_BYTES:
+                                raise ValueError("SKILL.md 文件过大")
+                            owner = parse_skill_frontmatter(_read_zip_member(zf, members[skill_member]).decode('utf-8')).get('name')
+                            if owner in inherited_profile['skillIds']:
+                                selected_members.append((prefix + FILENAME, inherited))
+                            break
+                command_profile = None
+                for member_name, info in sorted(selected_members, key=lambda item: item[0]):
                     relative = member_name[len(prefix):] if prefix else member_name
                     if not relative:
                         continue
@@ -407,7 +434,11 @@ def _standard_skills_from_zip(
                     if inspected_bytes > MAX_REPOSITORY_ARCHIVE_BYTES:
                         raise ValueError("所选目录的 Skill 展开数据超过 1 GiB，请缩小来源子目录")
                     relative = PurePosixPath(relative).as_posix()
+                    if relative == FILENAME and info.file_size > MAX_BYTES:
+                        raise ValueError("命令配置超过 128 KB")
                     data = _read_zip_member(zf, info)
+                    if relative == FILENAME:
+                        command_profile = parse_manifest(data)
                     digest.update(relative.encode("utf-8"))
                     digest.update(b"\0")
                     digest.update(data)
@@ -430,6 +461,8 @@ def _standard_skills_from_zip(
                     joined = "；".join(validation["errors"])
                     raise ValueError(f"{skill_member} 不符合 Agent Skills 规范：{joined}")
                 name = validation["name"]
+                if command_profile is not None and name not in command_profile["skillIds"]:
+                    raise ValueError("命令配置未关联当前 Skill ID")
                 if name in seen_names:
                     raise ValueError(f"压缩包内存在重复 Skill name：{name}")
                 seen_names.add(name)
@@ -700,6 +733,24 @@ class SkillStore:
         from .skill_manuals import SkillManuals
         return SkillManuals(LIBRARY_DIR, self._lock, self._index)
 
+    def groups(self) -> "SkillGroups":
+        from .skill_groups import SkillGroups
+        return SkillGroups(LIBRARY_DIR, self._lock, self._index)
+
+    def set_group_default(self, parent_id: str, is_default: bool) -> None:
+        with self._lock:
+            group = next((group for group in self.groups().list() if group['id'] == parent_id), None)
+            if not group:
+                raise ValueError('Skill 父级不存在')
+            previous = {name: dict(self._index[name]) for name in group['children']}
+            for name in group['children']:
+                self._index[name]['isDefault'] = is_default
+            try:
+                self._save_index()
+            except Exception:
+                self._index.update(previous)
+                raise
+
     def list_skills(self, working_dir: str = "") -> list[dict]:
         with self._lock:
             result = []
@@ -794,6 +845,19 @@ class SkillStore:
                 result["inputSchema"] = fm["input_schema"]
             return result
 
+    def has_installed_skill(self, names: tuple[str, ...]) -> bool:
+        """只查当前节点库中的真实入口文件，不读正文、激活目录或修改索引。"""
+        with self._lock:
+            return any((LIBRARY_DIR / self._validate_library_name(name) / "SKILL.md").is_file()
+                       for name in names)
+
+    def command_configs(self):
+        from .skill_command_config import SkillCommandConfigs
+        return SkillCommandConfigs(self, LIBRARY_DIR)
+
+    def command_sources(self) -> dict:
+        return self.command_configs().sources()
+
     def save_skill(self, name: str, content: str) -> None:
         with self._deployment_lock, self._lock:
             name = self._validate_library_name(name)
@@ -880,6 +944,9 @@ class SkillStore:
                     except Exception:
                         pass
                 return
+            from .skill_command_manifest import FILENAME
+            if (LIBRARY_DIR / old_name / FILENAME).exists():
+                raise ValueError('此 Skill 带有按稳定 ID 关联的命令配置，不能直接改 ID。请修改父级显示名称；迁移 ID 需先迁移并移除旧命令配置。')
             old_entry = self._index.get(old_name, {}) or {}
             old_manual = self.manuals()._saved_path(old_name)
             new_manual = self.manuals()._saved_path(new_name)
@@ -938,6 +1005,7 @@ class SkillStore:
     _PKG_ALLOWED = {
         "manifest.json", "SKILL.md", "call.py",
         "secrets.schema.json", "requirements.txt", "README.md", "icon.png",
+        "awu.commands.json",
     }
 
     def install_package(self, pkg_path: str) -> dict:
@@ -972,8 +1040,22 @@ class SkillStore:
                         f"manifest.id 格式非法：{skill_id!r}（要求小写字母开头，仅含小写字母/数字/连字符）"
                     )
 
+                from .skill_command_manifest import FILENAME, MAX_BYTES, parse_manifest
+                if FILENAME in names:
+                    if zf.getinfo(FILENAME).file_size > MAX_BYTES:
+                        raise ValueError("命令配置超过 128 KB")
+                    profile = parse_manifest(zf.read(FILENAME))
+                    if skill_id not in profile["skillIds"]:
+                        raise ValueError("命令配置未关联当前 Skill ID")
+                if any(Path(item).name == FILENAME and item != FILENAME for item in names):
+                    raise ValueError("命令配置只能位于包根目录")
+
                 skill_dir = LIBRARY_DIR / skill_id
                 skill_dir.mkdir(parents=True, exist_ok=True)
+
+                # 更新包已撤掉声明时，同步移除旧入口，而不是保留上版配置。
+                if FILENAME not in names:
+                    (skill_dir / FILENAME).unlink(missing_ok=True)
 
                 # 只提取白名单文件
                 for item in names:
@@ -1012,6 +1094,7 @@ class SkillStore:
         *,
         source: Optional[dict] = None,
         allow_replace: bool = True,
+        protect_local: bool = False,
     ) -> dict:
         """Install one portable Agent Skills directory into the library.
 
@@ -1046,11 +1129,24 @@ class SkillStore:
         if not validation["valid"]:
             raise ValueError("；".join(validation["errors"]))
         name = validation["name"]
+        from .skill_command_manifest import FILENAME, parse_manifest
+        if FILENAME in normalized:
+            profile = parse_manifest(normalized[FILENAME])
+            if name not in profile["skillIds"]:
+                raise ValueError("命令配置未关联当前 Skill ID")
         digest = skill_files_digest(normalized)
 
         with self._deployment_lock, self._lock:
             destination = LIBRARY_DIR / name
             LIBRARY_DIR.mkdir(parents=True, exist_ok=True)
+            if destination.exists() and protect_local:
+                # 批量安装下载期间可能有其它来源安装或用户编辑；提交时再核对一次。
+                current_source = self._index.get(name, {}).get("source") or {}
+                if (current_source.get("dirty") or not source or
+                        current_source.get("kind") != "github" or
+                        any(current_source.get(key, "") != source.get(key, "")
+                            for key in ("repository", "ref", "path"))):
+                    raise FileExistsError(f"Skill '{name}' 已变化；保留同名内容或本地修改，请重新预览")
             if destination.exists() and not allow_replace:
                 raise FileExistsError(f"Skill '{name}' 已存在")
 

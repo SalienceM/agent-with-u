@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Optional
 
 from . import paths
+from .aside_context import migrate_reference_attention
 
 
 def _now() -> float:
@@ -111,6 +112,7 @@ class ChatAside:
 
     @classmethod
     def from_dict(cls, d: dict) -> "ChatAside":
+        d = migrate_reference_attention(d)
         return cls(
             id=d.get("id") or _nid(),
             question=d.get("question", ""),

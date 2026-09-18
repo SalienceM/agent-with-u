@@ -76,7 +76,7 @@ export const SkillManual: React.FC<{ name: string; execKey: string; onClose?: ()
   const content = view === 'original' ? data?.originalContent || '' : data?.content || '';
   const srcDoc = useMemo(() => `<!doctype html><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'"><style>body{background:#151c27;color:#e2e8f0;font:15px/1.75 system-ui;padding:20px;overflow-wrap:anywhere}pre{overflow:auto;background:#0c111b;padding:12px;border-radius:8px}code{font-family:Consolas,monospace}table{border-collapse:collapse;display:block;overflow:auto}td,th{border:1px solid #526070;padding:6px}blockquote{border-left:3px solid #739cff;padding-left:12px}a{color:#739cff}</style>${markdown.parse(content)}`, [content]);
   const panel = <section role="dialog" aria-label="Skill 使用手册" style={{ ...shell, ...(standalone ? { position: 'absolute', inset: 0, width: '100%', height: '100%', borderRadius: 0 } : {}) }}>
-    <header style={row}><strong style={{ flex: 1, overflowWrap: 'anywhere' }}>📖 {name} · 使用手册{dirty ? ' ●' : ''}</strong>
+    <header style={row}><strong style={{ flex: 1, overflowWrap: 'anywhere' }}>📖 {data?.displayName || name} · 使用手册{dirty ? ' ●' : ''}</strong>
       {!standalone && <button style={button} onClick={() => void openSkillManual(name, execKey).catch(reason => setError(String(reason)))}>独立窗口</button>}
       {standalone && isDesktopWindow() && <button style={button} aria-pressed={pinned} onClick={() => void togglePin()}>{pinned ? '取消置顶' : '窗口置顶'}</button>}
       {(onClose || standalone) && <button style={button} disabled={saving} onClick={close}>关闭</button>}
@@ -88,6 +88,10 @@ export const SkillManual: React.FC<{ name: string; execKey: string; onClose?: ()
       {data && <div>{data.hasManual ? '维护手册' : `尚未维护，使用 ${data.originalPath} 原文`} · {data.source.repository || '本节点资料'} {data.updatedAt ? `· ${new Date(data.updatedAt * 1000).toLocaleString()}` : ''}</div>}
       {data && <div>资料版本：{(data.revision || data.sourceHash).slice(0, 12)} {data.source.ref || ''} · {data.originalPath}</div>}
       {data?.outdated && <div role="status" style={{ color: '#efbd64' }}>原始资料已更新，请复核维护手册。</div>}
+      {data?.kind === 'parent' && <details><summary style={{ cursor: 'pointer' }}>全部 {data.children?.length || 0} 个子 Skill · 可单独打开</summary>
+        <div style={{ display: 'flex', gap: 5, flexWrap: 'wrap', maxHeight: 100, overflow: 'auto' }}>{data.children?.map(child => <button key={child} style={button} onClick={() => void openSkillManual(child, execKey).catch(reason => setError(String(reason)))}>{child} ↗</button>)}</div>
+        <div>父级答疑始终汇总各子项资料；父级维护手册用于补充总流程，不替代子项手册。</div>
+      </details>}
     </div>
     <nav style={row}>
       <button style={button} onClick={() => setView('manual')} aria-pressed={view === 'manual'}>使用手册</button>

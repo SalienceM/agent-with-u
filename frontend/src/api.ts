@@ -302,6 +302,7 @@ export interface ReleasePlan {
 }
 
 export interface SkillInfo {
+  parent?: import('./utils/skillGroups').SkillParent;
   name: string;
   content: string;               // SKILL.md 完整内容
   isGlobal: boolean;             // 是否已激活到各 Agent 的全局 Skill 目录
@@ -1851,12 +1852,14 @@ async function callOnStrict(
 async function marketBackgroundCall(
   method: string, params: any[], onProgress?: (text: string) => void, signal?: AbortSignal,
   execKey: string = getHomeExecKey(),
+  onBatch?: (batch: any, jobId: string) => void,
 ): Promise<any> {
   const identity = getCurrentUserProfile();
   const parse = (value: any) => typeof value === 'string' ? JSON.parse(value) : value;
-  let result = parse(await callOnStrict(execKey, method, [...params, true], 15000));
+  let result = parse(await callOnStrict(execKey, method, method === 'skillMarketInstallBatch' ? params : [...params, true], 15000));
   const deadline = Date.now() + 680_000;
   while (result?.jobId && result.state === 'running') {
+    if (result.batch) onBatch?.(result.batch, result.jobId);
     if (signal?.aborted) throw new Error('已停止等待市场加载；后台任务不受影响');
     const current = getCurrentUserProfile();
     if (current.mode !== identity.mode || current.userId !== identity.userId) {
@@ -1874,8 +1877,10 @@ async function marketBackgroundCall(
     await new Promise<void>(resolve => setTimeout(resolve, 1000));
     if (signal?.aborted) throw new Error('已停止等待市场加载；后台任务不受影响');
     result = parse(await callOnStrict(execKey, 'skillMarketJobGet', [result.jobId], 15000));
+    if (result?.status === 'error') throw new Error(result.message || '无法确认市场任务状态，请重查原批次');
   }
-  if (result?.state === 'error') return { status: 'error', message: result.message };
+  if (result?.batch) onBatch?.(result.batch, result.jobId);
+  if (result?.state === 'error') return { status: 'error', message: result.message, batch: result.batch };
   return result?.state === 'done' ? result.result : result;
 }
 
@@ -3717,11 +3722,33 @@ export const api = {
   },
 
   // ── Skill 孵化库 ──────────────────────────────────────────────────────
+  async getSkillCommandConfig(name: string, execKey: string): Promise<import('./utils/skillCommands').SkillCommandConfig> {
+    const raw = await callOnStrict(execKey, 'getSkillCommandConfig', [name], 15000);
+    const data = typeof raw === 'string' ? JSON.parse(raw) : raw;
+    if (data?.status !== 'ok') throw new Error(data?.message || '命令配置读取失败');
+    return data;
+  },
+  async saveSkillCommandConfig(name: string, content: string, revision: string, execKey: string): Promise<import('./utils/skillCommands').SkillCommandConfig> {
+    const raw = await callOnStrict(execKey, 'saveSkillCommandConfig', [name, content, revision], 15000);
+    const data = typeof raw === 'string' ? JSON.parse(raw) : raw;
+    if (data?.status !== 'ok') throw new Error(data?.message || '命令配置保存失败');
+    return data;
+  },
   async listSkillManuals(execKey: string): Promise<import('./utils/skillManual').SkillManualSummary[]> {
     const raw = await callOnStrict(execKey, 'listSkillManuals', [], 15000);
     const data = typeof raw === 'string' ? JSON.parse(raw) : raw;
     if (data?.status !== 'ok' || !Array.isArray(data.manuals)) throw new Error(data?.message || '使用手册列表加载失败');
     return data.manuals;
+  },
+
+  async renameSkillGroup(parentId: string, name: string, revision: string, execKey: string): Promise<any> {
+    const raw = await callOnStrict(execKey, 'renameSkillGroup', [parentId, name, revision], 15000);
+    return typeof raw === 'string' ? JSON.parse(raw) : raw;
+  },
+
+  async setSkillGroupDefault(parentId: string, enabled: boolean, execKey: string): Promise<any> {
+    const raw = await callOnStrict(execKey, 'setSkillGroupDefault', [parentId, enabled], 15000);
+    return typeof raw === 'string' ? JSON.parse(raw) : raw;
   },
   async getSkillManual(name: string, execKey: string, document = ''): Promise<import('./utils/skillManual').SkillManual> {
     const raw = await callOnStrict(execKey, 'getSkillManual', [name, document], 15000);
@@ -3853,6 +3880,12 @@ export const api = {
   },
 
   // ── Secrets 管理（凭据不传 LLM）────────────────────────────────────────
+  async skillMarketInstallBatch(sourceId: string, items: Array<{ path: string; digest: string }>,
+    allowReplace: boolean, requestId: string, execKey: string, onBatch: (batch: any, jobId: string) => void): Promise<any> {
+    return marketBackgroundCall('skillMarketInstallBatch',
+      [sourceId, JSON.stringify(items), allowReplace, requestId], undefined, undefined, execKey, onBatch);
+  },
+
   async skillRuntimeInspect(name: string, execKey: string, review = false): Promise<any> {
     const result = await callOnStrict(execKey, 'skillRuntimeInspect', [name, review], 60_000);
     return typeof result === 'string' ? JSON.parse(result) : result;

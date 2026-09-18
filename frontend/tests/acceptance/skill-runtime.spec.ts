@@ -1,7 +1,7 @@
 import { test, expect } from '@playwright/test';
 import { execFileSync } from 'node:child_process';
 
-test('complete skill import opens a confirmation-based runtime check and persists readiness', async ({ page }, testInfo) => {
+test('complete skill import leaves runtime preparation manual and persists confirmed readiness', async ({ page }, testInfo) => {
   // 仅使用隔离的 HOME_QA 数据；不访问网络，不安装任何第三方包。
   const skillName = `qa-runtime-${testInfo.project.name}`;
   const archive = execFileSync('python', ['-c', [
@@ -19,6 +19,12 @@ test('complete skill import opens a confirmation-based runtime check and persist
   await page.getByText('Skills 与 Prompts', { exact: true }).click();
   await page.locator('input[type="file"][accept=".awu,.zip"]').setInputFiles({ name: 'qa-runtime.zip', mimeType: 'application/zip', buffer: archive });
   const dialog = page.getByRole('dialog', { name: 'Skill 运行准备' });
+  await expect(page.getByRole('heading', { name: '资源已导入', exact: true })).toBeVisible();
+  await expect(dialog).toHaveCount(0);
+  await page.getByRole('button', { name: '确定', exact: true }).click();
+  const row = page.getByRole('region', { name: `Skill ${skillName}`, exact: true });
+  await row.getByRole('button', { name: `管理 ${skillName}`, exact: true }).click();
+  await row.getByRole('button', { name: '运行准备 / 状态' }).click();
   await expect(dialog).toBeVisible();
   await expect(dialog.getByText('文件已安装 · 待准备', { exact: true })).toBeVisible();
   const prepare = dialog.getByRole('button', { name: '确认并准备运行环境' });
@@ -30,7 +36,7 @@ test('complete skill import opens a confirmation-based runtime check and persist
   await expect(dialog.getByText('安装日志（尾部）')).toBeVisible();
   await page.screenshot({ path: testInfo.outputPath('skill-runtime-ready.png') });
   await dialog.getByRole('button', { name: '关闭运行准备' }).click();
-  await page.getByRole('button', { name: '确定', exact: true }).click();
-  await page.locator('.repo-card').filter({ hasText: skillName }).getByRole('button', { name: '运行准备 / 状态' }).click();
+  await row.getByRole('button', { name: '运行准备 / 状态' }).click();
   await expect(dialog.getByRole('heading', { name: '运行检查通过' })).toBeVisible();
+  await expect(dialog.getByRole('button', { name: '确认并准备运行环境' })).toHaveCount(0);
 });

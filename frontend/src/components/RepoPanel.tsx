@@ -4,19 +4,21 @@ import { skillInstallTargetLabel } from '../utils/skillInstallTarget';
 import { SkillMarketDialog } from './SkillMarketDialog';
 import { SkillRuntimeDialog } from './SkillRuntimeDialog';
 import { SkillManual } from './SkillManual';
+import { SkillCommandConfigDialog } from './SkillCommandConfigDialog';
 import { openSkillManual } from '../utils/skillManual';
+import { groupSkills } from '../utils/skillGroups';
+import { SkillRepositoryGroup } from './SkillRepositoryGroup';
+import { AbilityLibraryRow, libraryActionStyle, libraryManualStyle } from './AbilityLibraryRow';
 
-// 注入卡片悬停样式
+// 只改变本面板的交互反馈，不依赖悬停才能操作（触屏也能管理）。
 if (typeof document !== 'undefined' && !document.getElementById('repo-panel-css')) {
   const s = document.createElement('style');
   s.id = 'repo-panel-css';
   s.textContent = `
-    .repo-card:hover { border-color: var(--theme-accent, #7aa2f7) !important; transform: translateY(-2px); box-shadow: 0 4px 12px rgba(0,0,0,0.15); }
-    .repo-card:hover .repo-card-actions { opacity: 1 !important; }
-    .repo-card:hover .repo-card-star { opacity: 1 !important; }
-    .repo-card.repo-card-default { border-color: rgba(234,197,95,0.55) !important; box-shadow: 0 0 0 1px rgba(234,197,95,0.18) inset; }
-    .repo-card.repo-card-default .repo-card-star { opacity: 1 !important; }
-    .repo-column-separator { border-right: 1px solid var(--theme-border); }
+    .ability-library-row button:hover:not(:disabled) { background: var(--theme-accent-bg) !important; }
+    .ability-library-row button:focus-visible { outline: 2px solid var(--theme-accent); outline-offset: 2px; }
+    .ability-library-row button:disabled { opacity: .5; cursor: default; }
+    .ability-library-children > .ability-library-row { background: transparent !important; border-color: transparent !important; border-left-color: var(--theme-border) !important; border-radius: 0 !important; }
   `;
   document.head.appendChild(s);
 }
@@ -233,15 +235,14 @@ export const RepoPanel: React.FC<Props> = (props) => {
   useEffect(() => onCurrentUserChanged((_profile, changed) => {
     if (changed) { setExecKey(getHomeExecKey()); setIdentityRevision(value => value + 1); }
   }), []);
-  return <div style={{ display: props.open ? 'flex' : 'none', flex: 1, minHeight: 0, flexDirection: 'column' }}>
-    <label style={{ display: 'flex', flexWrap: 'wrap', gap: 8, alignItems: 'center', padding: '8px 12px', fontSize: 12 }}>
+  return <div style={{ display: props.open ? 'flex' : 'none', flex: 1, minWidth: 0, minHeight: 0, width: '100%', flexDirection: 'column' }}>
+    <label title="与市场安装节点一致时，才会显示相应 Skill" style={{ display: 'flex', flexWrap: 'wrap', gap: 8, alignItems: 'center', padding: '8px 12px', fontSize: 12, flexShrink: 0 }}>
       能力库所在节点
       <select aria-label="能力库所在节点" value={execKey} disabled={busy} onChange={event => setExecKey(event.target.value)}
-        style={{ background: 'var(--theme-bg)', color: 'var(--theme-text)', border: '1px solid var(--theme-border)', borderRadius: 4, padding: '3px 6px', maxWidth: '100%' }}>
+        style={{ background: 'var(--theme-bg)', color: 'var(--theme-text)', border: '1px solid var(--theme-border)', borderRadius: 4, padding: '3px 6px', maxWidth: '100%', minWidth: 0, flex: '0 1 auto' }}>
         {!executors.some(item => item.key === execKey) && <option value={execKey}>{execKey}（离线）</option>}
         {executors.map(item => <option key={item.key} value={item.key}>{skillInstallTargetLabel(item.key, item, isTauri())}{item.connected ? '' : '（离线）'}</option>)}
       </select>
-      <span>与市场安装节点一致时，才会显示相应 Skill</span>
     </label>
     <RepoPanelContent key={`${identityRevision}:${execKey}`} {...props} execKey={execKey} onBusyChange={setBusy} />
   </div>;
@@ -255,6 +256,9 @@ const RepoPanelContent: React.FC<Props & { execKey: string; onBusyChange: (busy:
   const [actionError, setActionError] = useState('');
   const [mutating, setMutating] = useState(false);
   const [manualName, setManualName] = useState('');
+  const [commandConfigName, setCommandConfigName] = useState('');
+  const [libraryTab, setLibraryTab] = useState<'skills' | 'prompts'>('skills');
+  const [librarySearch, setLibrarySearch] = useState('');
   const loadGeneration = useRef(0);
   // 编辑状态
   const [editingType, setEditingType] = useState<'skill' | 'prompt' | null>(null);
@@ -324,16 +328,16 @@ const RepoPanelContent: React.FC<Props & { execKey: string; onBusyChange: (busy:
   }, [open, execKey]);
 
   useEffect(() => {
-    onBusyChange(!!editingType || !!manualName || saving || installing || savingSecrets || mutating || !!secretsSkill);
-  }, [editingType, manualName, saving, installing, savingSecrets, mutating, secretsSkill, onBusyChange]);
+    onBusyChange(!!editingType || !!manualName || !!commandConfigName || saving || installing || savingSecrets || mutating || !!secretsSkill);
+  }, [editingType, manualName, commandConfigName, saving, installing, savingSecrets, mutating, secretsSkill, onBusyChange]);
 
   const requireOk = (result: { status: string; message?: string }) => {
     if (result.status !== 'ok') throw new Error(result.message || '操作失败，请重试');
   };
 
   useEffect(() => {
-    onEditingChange?.(editingType !== null || !!manualName);
-  }, [editingType, manualName, onEditingChange]);
+    onEditingChange?.(editingType !== null || !!manualName || !!commandConfigName);
+  }, [editingType, manualName, commandConfigName, onEditingChange]);
 
   // ── 打开编辑器 ──
   const openEditor = useCallback((type: 'skill' | 'prompt', item?: SkillItem | PromptItem) => {
@@ -461,7 +465,6 @@ const RepoPanelContent: React.FC<Props & { execKey: string; onBusyChange: (busy:
         await refresh();
         const m = res.manifest;
         const installedSkills = Array.isArray((res as any).skills) ? (res as any).skills : [];
-        setRuntimeNames(installedSkills.length ? installedSkills.map((s: any) => s.name || s.id).filter(Boolean) : [m?.name || m?.id].filter(Boolean));
         setInstallResult({
           name: installedSkills.length > 1
             ? `${installedSkills[0]?.name || installedSkills[0]?.id || 'Skill'} 等`
@@ -648,138 +651,102 @@ const RepoPanelContent: React.FC<Props & { execKey: string; onBusyChange: (busy:
     );
   }
 
-  // 卡片列表模式
+  // 搜索命中子项仍保留完整父组，避免整组操作因筛选而悄悄变成部分操作。
+  const query = librarySearch.trim().toLocaleLowerCase();
+  const skillGroups = groupSkills(skills);
+  const visibleGroups = skillGroups.filter(group => [group.name, group.parent?.repository || '',
+    ...group.children.flatMap(child => [child.name, child.description || ''])].some(value => value.toLocaleLowerCase().includes(query)));
+  const visiblePrompts = prompts.filter(prompt => prompt.name.toLocaleLowerCase().includes(query));
+
+  // 统一列表，Skills / Prompts 分页共用可用宽度。
   return (
     <div className={embedded ? 'repo-workbench' : undefined} style={{ ...panelStyle, ...(embedded ? { flex: 1, minHeight: 0 } : {}) }}>
       {manualName && <SkillManual name={manualName} execKey={execKey} onClose={() => setManualName('')} />}
-      <div style={{ display: 'flex', gap: 8, paddingBottom: 8, alignItems: 'center', fontSize: 12 }}>
-        <span role="status">{loading ? '正在加载能力库…' : loadError ? '能力库加载失败' : `${skills.length} Skills · ${prompts.length} Prompts`}</span>
-        <button disabled={loading} onClick={() => void refresh()} style={{ ...addBtnStyle, width: 'auto', height: 'auto', padding: '3px 8px', fontSize: 11 }}>{loadError ? '重试加载' : '刷新能力库'}</button>
-      </div>
+      {commandConfigName && <SkillCommandConfigDialog name={commandConfigName} execKey={execKey} onClose={() => setCommandConfigName('')} />}
       {(loadError || actionError) && <div role="alert" style={{ color: '#ef4444', paddingBottom: 8 }}>{loadError || actionError}</div>}
-      <style>{`.repo-workbench .repo-cards { max-height:none!important; align-content:flex-start; }
-        @media(max-width:760px) { .repo-workbench .repo-columns { flex-direction:column; gap:16px!important; overflow:auto!important; }
-          .repo-workbench .repo-column { border:0!important; padding:0!important; flex:none!important; }
-          .repo-workbench .repo-cards { overflow:visible!important; } }`}</style>
-      <div className="repo-columns" style={{ display: 'flex', gap: 24, flex: 1, minHeight: 0, overflow: 'hidden' }}>
-        {/* ── 左：Skills ── */}
-        <div className="repo-column" style={{ ...columnStyle, borderRight: '1px solid var(--theme-border)', paddingRight: 24 }}>
-          <div style={{ ...columnHeaderStyle, border: 'none', padding: 0 }}>
-            <span>⚡ Skills</span>
-            <div style={{ display: 'flex', gap: 4 }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, borderBottom: '1px solid var(--theme-border)', marginBottom: 12, flexShrink: 0 }}>
+      <div role="tablist" aria-label="能力类型" style={{ display: 'flex', gap: 16, flex: 1 }}>
+        {(['skills', 'prompts'] as const).map(tab => <button key={tab} type="button" role="tab" id={`ability-tab-${tab}`} aria-controls={`ability-panel-${tab}`}
+          aria-selected={libraryTab === tab} tabIndex={libraryTab === tab ? 0 : -1}
+          onClick={() => { setLibraryTab(tab); setLibrarySearch(''); }}
+          onKeyDown={event => {
+            if (['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) {
+              event.preventDefault();
+              const next = event.key === 'Home' ? 'skills' : event.key === 'End' ? 'prompts' : tab === 'skills' ? 'prompts' : 'skills';
+              setLibraryTab(next); setLibrarySearch('');
+              document.getElementById(`ability-tab-${next}`)?.focus();
+            }
+          }} style={{ background: 'transparent', color: libraryTab === tab ? 'var(--theme-text)' : 'var(--theme-text-muted)', border: 0, borderBottom: `2px solid ${libraryTab === tab ? 'var(--theme-accent)' : 'transparent'}`, padding: '8px 2px', fontSize: 13, fontWeight: 600, cursor: 'pointer' }}>
+          {tab === 'skills' ? `Skills · ${skills.length}` : `Prompts · ${prompts.length}`}
+        </button>)}
+      </div>
+      <button disabled={loading} onClick={() => void refresh()} aria-label={loadError ? '重试加载' : '刷新能力库'} title={loadError ? '重试加载' : '刷新能力库'}
+        style={{ ...libraryManualStyle, fontSize: 16 }}>{loadError ? '重试' : '↻'}</button>
+      </div>
+      <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center', marginBottom: 10, flexShrink: 0 }}>
+        <input aria-label="搜索能力库" placeholder={libraryTab === 'skills' ? '搜索仓库或 Skill…' : '搜索 Prompt…'} value={librarySearch} onChange={event => setLibrarySearch(event.target.value)}
+          style={{ ...nameInputStyle, minWidth: 120, width: 0, minHeight: 34, boxSizing: 'border-box', fontSize: 12, fontWeight: 400 }} />
+        {libraryTab === 'skills' ? <div style={{ display: 'flex', gap: 6 }}>
               <button
                 onClick={() => onOpenMarket ? onOpenMarket() : setShowSkillMarket(true)}
                 title="浏览并安装标准 Agent Skills"
-                style={{ ...addBtnStyle, fontSize: 11, padding: '2px 8px', width: 'auto' }}
-              >🛍 市场</button>
+                style={libraryActionStyle}
+              >市场</button>
               <button
                 onClick={() => fileInputRef.current?.click()}
                 disabled={installing}
                 title="从 .awu 或标准 Agent Skill ZIP 安装"
                 aria-label="从文件安装 Skill"
-                style={{ ...addBtnStyle, fontSize: 11, padding: '2px 7px' }}
-              >{installing ? '…' : '📦'}</button>
-              <button onClick={() => setShowSkillTypeSelector(true)} style={addBtnStyle} title="新建 Skill（开发者）" aria-label="新建 Skill（开发者）">＋</button>
-            </div>
-          </div>
+                style={libraryActionStyle}
+              >{installing ? '…' : '导入'}</button>
+              <button onClick={() => setShowSkillTypeSelector(true)} style={libraryActionStyle} title="新建 Skill（开发者）" aria-label="新建 Skill（开发者）">＋</button>
+            </div> : <button onClick={() => openEditor('prompt')} style={libraryActionStyle} title="新建 Prompt" aria-label="新建 Prompt">＋ 新建</button>}
+      </div>
+      <div role="status" style={{ fontSize: 11, color: 'var(--theme-text-muted)', paddingBottom: 10, flexShrink: 0 }}>
+        {loading ? '正在加载能力库…' : loadError ? '能力库加载失败' : libraryTab === 'skills' ? `${skillGroups.filter(group => group.parent).length} 个仓库 · ${skillGroups.filter(group => !group.parent).length} 个独立 Skill · 点击名称查看详情` : '可复用的提示词模板 · 点击名称编辑'}
+      </div>
+      <div style={{ flex: 1, minHeight: 0, overflowY: 'auto', ...(embedded ? {} : { maxHeight: 380 }), paddingBottom: 4 }}>
+        <div role="tabpanel" id="ability-panel-skills" aria-labelledby="ability-tab-skills" hidden={libraryTab !== 'skills'}>
           <input ref={fileInputRef} type="file" accept=".awu,.zip" style={{ display: 'none' }} onChange={handleInstallFile} />
-          <div className="repo-cards" style={cardGridStyle}>
-            {skills.map(s => (
-              <div
-                key={s.name}
-                className={`repo-card${s.isDefault ? ' repo-card-default' : ''}`}
-                style={cardStyle}
-                onClick={() => openEditor('skill', s)}
-              >
-                <div style={cardIconStyle}>
-                  {parseSkillBackend(s.content || '') ? '🔗' : s.type === 'python-script' || s.hasCallPy ? '🐍' : '⚡'}
-                </div>
-                <div style={cardNameStyle}>{s.name}</div>
-                <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap', justifyContent: 'center' }}>
-                  <button style={{ ...addBtnStyle, width: 'auto', height: 'auto', fontSize: 11, padding: 4 }}
-                    onClick={e => { e.stopPropagation(); void openSkillManual(s.name, execKey).catch(error => setActionError(String(error))); }}>使用手册 ↗</button>
-                  <button style={{ ...addBtnStyle, width: 'auto', height: 'auto', fontSize: 11, padding: 4 }}
-                    onClick={e => { e.stopPropagation(); setManualName(s.name); }}>维护手册</button>
-                </div>
-                <button style={{ ...addBtnStyle, width: 'auto', height: 'auto', minHeight: 28, padding: '4px 6px', whiteSpace: 'nowrap', fontSize: 11, marginTop: 5 }} title="检查此技能在执行节点的资源、依赖与配置"
-                  onClick={e => { e.stopPropagation(); setRuntimeExecKey(execKey); setRuntimeNames([s.name]); }}>运行准备 / 状态</button>
-                <div style={{ position: 'absolute', top: 4, left: 4, display: 'flex', gap: 2 }}>
-                  {s.manifest && (
-                    <span title={`插件包安装 v${s.manifest.version || '?'}`}
-                      style={{ fontSize: 11, lineHeight: 1 }}>📦</span>
-                  )}
-                  {s.format === 'agent-skills' && (
-                    <span title={`标准 Agent Skills 格式${s.source?.label ? ` · ${s.source.label}` : ''}`}
-                      style={{ fontSize: 10, lineHeight: 1, color: 'var(--theme-accent)' }}>STD</span>
-                  )}
-                  {s.hasSecretsSchema && (
-                    <span
-                      onClick={e => { e.stopPropagation(); openSecretsDialog(s.name); }}
-                      title={s.hasSecrets ? '已配置凭据，点击修改' : '需要配置凭据'}
-                      style={{ fontSize: 11, cursor: 'pointer', lineHeight: 1,
-                        color: s.hasSecrets ? 'rgba(234,197,95,0.9)' : 'rgba(255,255,255,0.3)' }}
-                    >🔑</span>
-                  )}
-                </div>
-                <span
-                  className="repo-card-star"
-                  onClick={e => { e.stopPropagation(); toggleDefault('skill', s.name, !s.isDefault); }}
-                  title={s.isDefault ? '取消默认档（新 session 不再自动绑定）' : '设为默认档（每个新 session 自动绑定）'}
-                  style={{
-                    ...cardStarStyle,
-                    opacity: s.isDefault ? 1 : 0,
-                    color: s.isDefault ? 'rgba(234,197,95,0.95)' : 'rgba(255,255,255,0.4)',
-                  }}
-                >{s.isDefault ? '★' : '☆'}</span>
-                <div className="repo-card-actions" style={cardActionsStyle}>
-                  <button
-                    onClick={e => { e.stopPropagation(); handleDelete('skill', s.name); }}
-                    style={cardDelBtnStyle}
-                    title="删除"
-                  >×</button>
-                </div>
-              </div>
+          <div style={libraryListStyle}>
+            {visibleGroups.map(group => <SkillRepositoryGroup key={group.id} group={group} execKey={execKey}
+              disabled={mutating} onBusyChange={setMutating} onChanged={refresh}
+              onCommands={setCommandConfigName}
+              onManual={(name, detached) => { if (detached) void openSkillManual(name, execKey).catch(error => setActionError(String(error))); else setManualName(name); }}
+              onPrepare={names => { setRuntimeExecKey(execKey); setRuntimeNames(names); }}>
+            {group.children.map(s => (
+              <AbilityLibraryRow key={s.name} name={s.name} label={`Skill ${s.name}`}
+                icon={parseSkillBackend(s.content || '') ? '🔗' : s.type === 'python-script' || s.hasCallPy ? '🐍' : '⚡'}
+                subtitle={`${s.isDefault ? '默认档 · ' : ''}${s.description || (s.format === 'agent-skills' ? '标准 Agent Skill' : s.manifest ? `插件包 · v${s.manifest.version || '?'}` : s.parent ? '仓库子 Skill' : '独立 Skill')}`}
+                onOpen={() => openEditor('skill', s)}
+                primaryAction={<button style={libraryManualStyle} aria-label="使用手册 ↗" title="在独立窗口打开使用手册" onClick={() => void openSkillManual(s.name, execKey).catch(error => setActionError(String(error)))}>手册 ↗</button>}
+                actions={<>
+                  <button style={libraryActionStyle} onClick={() => openEditor('skill', s)}>查看 / 编辑</button>
+                  <button style={libraryActionStyle} onClick={() => setManualName(s.name)}>维护手册</button>
+                  <button style={libraryActionStyle} onClick={() => setCommandConfigName(s.name)}>/ 命令配置</button>
+                  <button style={libraryActionStyle} onClick={() => { setRuntimeExecKey(execKey); setRuntimeNames([s.name]); }}>运行准备 / 状态</button>
+                  <button style={libraryActionStyle} disabled={mutating} onClick={() => void toggleDefault('skill', s.name, !s.isDefault)} title="默认档仅影响新建会话">{s.isDefault ? '取消默认档' : '设为默认档'}</button>
+                  {s.hasSecretsSchema && <button style={libraryActionStyle} onClick={() => openSecretsDialog(s.name)}>{s.hasSecrets ? '修改凭据' : '配置凭据'}</button>}
+                  <button style={{ ...libraryActionStyle, color: 'var(--theme-error, #cf222e)' }} disabled={mutating} onClick={() => handleDelete('skill', s.name)}>删除</button>
+                </>} />
             ))}
+            </SkillRepositoryGroup>)}
             {!loading && !loadError && skills.length === 0 && <div style={emptyStyle}>该节点暂无 Skill</div>}
+            {!loading && skills.length > 0 && visibleGroups.length === 0 && <div style={emptyStyle}>没有匹配的仓库或 Skill</div>}
           </div>
         </div>
 
-        {/* ── 右：Prompts ── */}
-        <div className="repo-column" style={{ ...columnStyle, paddingLeft: 24 }}>
-          <div style={{ ...columnHeaderStyle, border: 'none', padding: 0 }}>
-            <span>📝 Prompts</span>
-            <button onClick={() => openEditor('prompt')} style={addBtnStyle} title="新建 Prompt" aria-label="新建 Prompt">＋</button>
-          </div>
-          <div className="repo-cards" style={cardGridStyle}>
-            {prompts.map(p => (
-              <div
-                key={p.id}
-                className={`repo-card${p.isDefault ? ' repo-card-default' : ''}`}
-                style={cardStyle}
-                onClick={() => openEditor('prompt', p)}
-              >
-                <div style={cardIconStyle}>{p.icon || '📝'}</div>
-                <div style={cardNameStyle}>{p.name}</div>
-                <span
-                  className="repo-card-star"
-                  onClick={e => { e.stopPropagation(); toggleDefault('prompt', p.name, !p.isDefault); }}
-                  title={p.isDefault ? '取消默认档（新 session 不再自动绑定）' : '设为默认档（每个新 session 自动绑定）'}
-                  style={{
-                    ...cardStarStyle,
-                    opacity: p.isDefault ? 1 : 0,
-                    color: p.isDefault ? 'rgba(234,197,95,0.95)' : 'rgba(255,255,255,0.4)',
-                  }}
-                >{p.isDefault ? '★' : '☆'}</span>
-                <div className="repo-card-actions" style={cardActionsStyle}>
-                  <button
-                    onClick={e => { e.stopPropagation(); handleDelete('prompt', p.name); }}
-                    style={cardDelBtnStyle}
-                    title="删除"
-                  >×</button>
-                </div>
-              </div>
-            ))}
+        <div role="tabpanel" id="ability-panel-prompts" aria-labelledby="ability-tab-prompts" hidden={libraryTab !== 'prompts'}>
+          <div style={libraryListStyle}>
+            {visiblePrompts.map(p => <AbilityLibraryRow key={p.name} name={p.name} label={`Prompt ${p.name}`} icon={p.icon || '📝'}
+              subtitle={p.isDefault ? '默认档 · 新会话自动绑定' : 'Prompt 模板'} onOpen={() => openEditor('prompt', p)}
+              actions={<>
+                <button style={libraryActionStyle} onClick={() => openEditor('prompt', p)}>编辑</button>
+                <button style={libraryActionStyle} disabled={mutating} onClick={() => void toggleDefault('prompt', p.name, !p.isDefault)}>{p.isDefault ? '取消默认档' : '设为默认档'}</button>
+                <button style={{ ...libraryActionStyle, color: 'var(--theme-error, #cf222e)' }} disabled={mutating} onClick={() => handleDelete('prompt', p.name)}>删除</button>
+              </>} />)}
             {!loading && !loadError && prompts.length === 0 && <div style={emptyStyle}>该节点暂无 Prompt</div>}
+            {!loading && prompts.length > 0 && visiblePrompts.length === 0 && <div style={emptyStyle}>没有匹配的 Prompt</div>}
           </div>
         </div>
       </div>
@@ -923,10 +890,8 @@ const RepoPanelContent: React.FC<Props & { execKey: string; onBusyChange: (busy:
       <SkillMarketDialog
         open={showSkillMarket}
         onClose={() => setShowSkillMarket(false)}
-        onInstalled={async (name, execKey) => {
-          if (name) { setShowSkillMarket(false); setRuntimeExecKey(execKey); setRuntimeNames([name]); }
-          await refresh();
-        }}
+        onInstalled={async () => { await refresh(); }}
+        onPrepare={(names, execKey) => { setRuntimeExecKey(execKey); setRuntimeNames(names); }}
       />
       {runtimeNames.length > 0 && <SkillRuntimeDialog key={`${runtimeExecKey}:${runtimeNames.join('|')}`} names={runtimeNames}
         initialExecKey={runtimeExecKey} onClose={() => { setRuntimeNames([]); setRuntimeExecKey(undefined); }} />}
@@ -1015,6 +980,7 @@ const RepoPanelContent: React.FC<Props & { execKey: string; onBusyChange: (busy:
 const panelStyle: React.CSSProperties = {
   display: 'flex',
   flexDirection: 'column',
+  minWidth: 0,
   padding: 'var(--ui-space-md, 12px) var(--ui-space-lg, 16px)',
   background: 'var(--theme-bg-secondary)',
   borderBottom: '1px solid var(--theme-border)',
@@ -1033,131 +999,7 @@ const panelEditorStyle: React.CSSProperties = {
   maxHeight: 'calc(100vh - 120px)',
 };
 
-const columnStyle: React.CSSProperties = {
-  flex: 1,
-  display: 'flex',
-  flexDirection: 'column',
-  minWidth: 0,
-};
-
-const columnHeaderStyle: React.CSSProperties = {
-  display: 'flex',
-  justifyContent: 'space-between',
-  alignItems: 'center',
-  fontSize: 13,
-  fontWeight: 600,
-  color: 'var(--theme-text)',
-  marginBottom: 8,
-  padding: '0 4px',
-};
-
-const cardGridStyle: React.CSSProperties = {
-  display: 'flex',
-  flexWrap: 'wrap',
-  gap: 'var(--ui-space-sm, 8px)',
-  overflow: 'auto',
-  maxHeight: 200,
-  padding: '2px',
-};
-
-const cardStyle: React.CSSProperties = {
-  width: 110,
-  padding: 'var(--ui-space-sm, 10px) 8px var(--ui-space-sm, 8px)',
-  borderRadius: 10,
-  border: '1px solid var(--theme-border)',
-  background: 'var(--theme-bg)',
-  cursor: 'pointer',
-  display: 'flex',
-  flexDirection: 'column',
-  alignItems: 'center',
-  gap: 4,
-  position: 'relative',
-  transition: 'border-color 0.15s, transform 0.15s, box-shadow 0.15s',
-};
-
-const cardIconStyle: React.CSSProperties = {
-  fontSize: 22,
-  lineHeight: 1,
-};
-
-const cardNameStyle: React.CSSProperties = {
-  fontSize: 11,
-  color: 'var(--theme-text)',
-  textAlign: 'center',
-  overflow: 'hidden',
-  textOverflow: 'ellipsis',
-  whiteSpace: 'nowrap',
-  width: '100%',
-  fontWeight: 500,
-};
-
-const cardActionsStyle: React.CSSProperties = {
-  position: 'absolute',
-  top: 2,
-  right: 2,
-  opacity: 0,
-  transition: 'opacity 0.12s',
-};
-
-const cardStarStyle: React.CSSProperties = {
-  position: 'absolute',
-  bottom: 3,
-  right: 5,
-  fontSize: 13,
-  lineHeight: 1,
-  cursor: 'pointer',
-  transition: 'opacity 0.12s, transform 0.12s',
-  userSelect: 'none',
-};
-
-const cardDelBtnStyle: React.CSSProperties = {
-  width: 18,
-  height: 18,
-  borderRadius: 4,
-  border: 'none',
-  background: 'rgba(239,68,68,0.15)',
-  color: '#ef4444',
-  fontSize: 12,
-  cursor: 'pointer',
-  display: 'flex',
-  alignItems: 'center',
-  justifyContent: 'center',
-  lineHeight: 1,
-};
-
-const addBtnStyle: React.CSSProperties = {
-  width: 24,
-  height: 24,
-  borderRadius: 6,
-  border: '1px dashed var(--theme-border)',
-  background: 'transparent',
-  color: 'var(--theme-text-muted)',
-  fontSize: 16,
-  cursor: 'pointer',
-  display: 'flex',
-  alignItems: 'center',
-  justifyContent: 'center',
-  transition: 'all 0.15s',
-};
-
-const closeBtnStyle: React.CSSProperties = {
-  position: 'absolute',
-  bottom: 4,
-  left: '50%',
-  transform: 'translateX(-50%)',
-  width: 32,
-  height: 18,
-  borderRadius: '0 0 8px 8px',
-  border: '1px solid var(--theme-border)',
-  borderTop: 'none',
-  background: 'var(--theme-bg-secondary)',
-  color: 'var(--theme-text-muted)',
-  cursor: 'pointer',
-  display: 'flex',
-  alignItems: 'center',
-  justifyContent: 'center',
-  fontSize: 12,
-};
+const libraryListStyle: React.CSSProperties = { display: 'flex', flexDirection: 'column', gap: 8, minWidth: 0, padding: 2 };
 
 const emptyStyle: React.CSSProperties = {
   fontSize: 12,

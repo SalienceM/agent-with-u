@@ -36,8 +36,14 @@ async def dispatch_sequence_message(bridge: BridgeWS, payload_json: str) -> bool
         return result.get("status") in {"ok", "skip"}
     if command == "/continue":
         payload["content"] = "Continue exactly from where you left off. Do not repeat any content you already generated."
-    elif command.startswith("/") and command != "/skill" and not command.startswith("/opsx-"):
-        raise ValueError(f"{command} 尚不支持执行端序列，请在聊天窗口单独执行或编辑此条；未调用模型。")
+    elif command.startswith("/") and command != "/skill":
+        from .skill_command_manifest import RESERVED
+        if command in RESERVED:
+            raise ValueError(f"{command} 尚不支持执行端序列；未调用模型。")
+        from .skill_commands import registered_definitions
+        definitions, _issues = await asyncio.to_thread(registered_definitions, bridge._skill_store)
+        if command not in definitions:
+            raise ValueError(f"{command} 未注册或不支持执行端序列，请检查命令配置；未调用模型。")
     return await bridge._handle_send_message(json.dumps(payload, ensure_ascii=False))
 
 

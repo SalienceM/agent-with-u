@@ -1,7 +1,7 @@
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const { detachedUrl, openDetachedWindow } = require('../../.home-test-dist/utils/detachedWindow.js');
-const { manualReferences } = require('../../.home-test-dist/utils/skillManual.js');
+const { manualReferences, normalizeManualHistory, removeManualReferences, skillReferenceLabel } = require('../../.home-test-dist/utils/skillManual.js');
 const { detectPromptReference } = require('../../.home-test-dist/utils/promptReferences.js');
 
 test('manual reference namespace is opt-in for Thoughts, keeps other composers unchanged', () => {
@@ -10,6 +10,23 @@ test('manual reference namespace is opt-in for Thoughts, keeps other composers u
   assert.equal(detectPromptReference('@SKILL:open', 11, true).query, 'open');
   assert.deepEqual(manualReferences('@SKILL:demo 怎么用 @skill:demo'), ['demo']);
   assert.deepEqual(manualReferences('@SKILL:../secret'), []);
+});
+test('parent attention uses metadata display names, never exposes internal IDs as labels', () => {
+  const id = 'repo.0123456789abcdef';
+  assert.equal(skillReferenceLabel(id, []), '仓库手册');
+  assert.equal(skillReferenceLabel(id, [{ name: id, displayName: 'OpenSpec' }]), 'OpenSpec');
+  assert.equal(skillReferenceLabel('child', []), 'child');
+});
+test('removing Skill references keeps the question and never leaves hidden execution references', () => {
+  assert.equal(removeManualReferences('@SKILL:repo.0123456789abcdef [OpenSpec] 这个项目怎么用', ['repo.0123456789abcdef']), '这个项目怎么用');
+  assert.equal(removeManualReferences('@SKILL:"我的规范" 怎么用 @SKILL:other', ['我的规范']), '怎么用 @SKILL:other');
+});
+test('old reference histories join Session without changing question, while library focus is preserved', () => {
+  const original = { contextKey: 'skills:demo', contextKind: 'skills', contextLabel: 'Skill 手册', question: '@SKILL:demo q' };
+  assert.deepEqual(normalizeManualHistory(original), { ...original, contextKey: 'session', contextKind: 'session', contextLabel: '', contextDetail: '' });
+  assert.equal(original.contextKey, 'skills:demo');
+  const panel = { ...original, contextKey: 'panel:library' };
+  assert.equal(normalizeManualHistory(panel), panel);
 });
 test('detached routes are mutually exclusive and keep deployment prefix', () => {
   global.location = { href: 'https://fixture.local/awu/?thoughts=1&sessionId=old#section' };

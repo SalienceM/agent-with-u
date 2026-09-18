@@ -8,7 +8,7 @@ import {
   type PromptReferenceTrigger,
 } from '../utils/promptReferences';
 import { AppModalPortal } from './AppModalPortal';
-import type { SkillManualSummary } from '../utils/skillManual';
+import { skillReferenceText, type SkillManualSummary } from '../utils/skillManual';
 
 type FileEntry = { name: string; path: string; isDir: boolean };
 type PickerMode = 'file' | 'session' | 'skill' | null;
@@ -25,6 +25,7 @@ export interface AdvancedPromptTextareaProps extends Omit<
   textareaRef?: React.RefObject<HTMLTextAreaElement>;
   containerStyle?: React.CSSProperties;
   enableSkillReferences?: boolean;
+  onSkillManualsLoaded?: (entries: SkillManualSummary[]) => void;
 }
 
 interface PopupPosition {
@@ -48,6 +49,7 @@ export const AdvancedPromptTextarea: React.FC<AdvancedPromptTextareaProps> = ({
   textareaRef,
   containerStyle,
   enableSkillReferences = false,
+  onSkillManualsLoaded,
   onKeyDown,
   onCompositionStart,
   onCompositionEnd,
@@ -67,9 +69,12 @@ export const AdvancedPromptTextarea: React.FC<AdvancedPromptTextareaProps> = ({
   const sessionRequestRef = useRef(0);
   const skillRequestRef = useRef(0);
   const [skillRefs, setSkillRefs] = useState<SkillManualSummary[]>([]);
+  const [showSkillChildren, setShowSkillChildren] = useState(false);
   const [skillQuery, setSkillQuery] = useState('');
   const [skillLoading, setSkillLoading] = useState(false);
   const [skillError, setSkillError] = useState('');
+  const skillMatches = useMemo(() => skillRefs.flatMap(entry => [entry, ...(showSkillChildren ? entry.children || [] : [])])
+    .filter(entry => `${entry.name} ${entry.displayName || ''} ${entry.repository || ''} ${(entry.children || []).map(child => child.name).join(' ')}`.toLowerCase().includes(skillQuery.toLowerCase())), [skillRefs, showSkillChildren, skillQuery]);
   const listboxId = useId();
 
   const [picker, setPickerState] = useState<PickerMode>(null);
@@ -163,10 +168,13 @@ export const AdvancedPromptTextarea: React.FC<AdvancedPromptTextareaProps> = ({
     try {
       if (!execKey) throw new Error('尚未确认 Session 执行节点，请稍后重试');
       const entries = await api.listSkillManuals(execKey);
-      if (version === skillRequestRef.current) setSkillRefs(entries);
+      if (version === skillRequestRef.current) {
+        setSkillRefs(entries);
+        onSkillManualsLoaded?.(entries);
+      }
     } catch (reason) { if (version === skillRequestRef.current) { setSkillRefs([]); setSkillError(String(reason)); } }
     finally { if (version === skillRequestRef.current) setSkillLoading(false); }
-  }, [execKey]);
+  }, [execKey, onSkillManualsLoaded]);
 
   const inspectValue = useCallback((nextValue: string, cursor: number) => {
     const trigger = detectPromptReference(nextValue, cursor, enableSkillReferences);
@@ -279,7 +287,7 @@ export const AdvancedPromptTextarea: React.FC<AdvancedPromptTextareaProps> = ({
 
   const handlePickerKey = useCallback((event: React.KeyboardEvent<HTMLTextAreaElement>): boolean => {
     if (!pickerRef.current) return false;
-    const matches = skillRefs.filter(item => item.name.toLowerCase().includes(skillQuery.toLowerCase()));
+    const matches = skillMatches;
     const count = pickerRef.current === 'skill' ? matches.length : pickerRef.current === 'session' ? sessionRefs.length : fileOptionCount;
     if (event.key === 'ArrowUp' || event.key === 'ArrowDown') {
       event.preventDefault();
@@ -291,7 +299,7 @@ export const AdvancedPromptTextarea: React.FC<AdvancedPromptTextareaProps> = ({
       event.preventDefault();
       if (pickerRef.current === 'skill') {
         const entry = matches[selectedIndex];
-        if (entry) replaceActive(`@SKILL:${entry.name} `);
+        if (entry) replaceActive(skillReferenceText(entry));
       } else if (pickerRef.current === 'session') {
         const entry = sessionRefs[selectedIndex];
         if (entry?.id) replaceActive(`@SESSION:${entry.id} `);
@@ -306,7 +314,7 @@ export const AdvancedPromptTextarea: React.FC<AdvancedPromptTextareaProps> = ({
       return true;
     }
     return false;
-  }, [chooseFileOption, closePicker, fileOptionCount, replaceActive, selectedIndex, sessionRefs, skillRefs, skillQuery]);
+  }, [chooseFileOption, closePicker, fileOptionCount, replaceActive, selectedIndex, sessionRefs, skillMatches]);
 
   const handleKeyDown = useCallback((event: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (handlePickerKey(event)) return;
@@ -400,9 +408,10 @@ export const AdvancedPromptTextarea: React.FC<AdvancedPromptTextareaProps> = ({
         <div style={{ overflowY: 'auto', minHeight: 0 }}>
           {picker === 'skill' ? <>
             {skillError && <div role="alert" style={{ padding: 10 }}>{skillError}<button type="button" onClick={() => void loadSkills()}>重试</button></div>}
-            {skillRefs.filter(item => item.name.toLowerCase().includes(skillQuery.toLowerCase())).map((entry, index) => <ReferenceOption key={entry.name} index={index} selected={index === selectedIndex}
-              icon="📖" label={entry.name} hint={entry.hasManual ? '维护手册' : '原始资料'} onChoose={() => replaceActive(`@SKILL:${entry.name} `)} onHover={setSelectedIndex} />)}
-            {skillLoading ? <EmptyPicker text="读取本节点已安装的 Skill…" /> : !skillError && !skillRefs.some(item => item.name.toLowerCase().includes(skillQuery.toLowerCase())) && <EmptyPicker text="无匹配 Skill；可在本节点市场安装后重试" />}
+            {skillRefs.some(entry => entry.kind === 'parent') && <button type="button" onClick={() => { setShowSkillChildren(value => !value); setSelectedIndex(0); }} style={{ margin: 6 }}>{showSkillChildren ? '仅显示父级' : '展开子 Skill（单独引用）'}</button>}
+            {skillMatches.map((entry, index) => <ReferenceOption key={entry.name} index={index} selected={index === selectedIndex}
+              icon={entry.kind === 'parent' ? '📦' : '📖'} label={entry.displayName || entry.name} hint={entry.kind === 'parent' ? `全部 ${entry.children?.length || 0} 个子 Skill` : entry.hasManual ? '维护手册' : '原始资料'} onChoose={() => replaceActive(skillReferenceText(entry))} onHover={setSelectedIndex} />)}
+            {skillLoading ? <EmptyPicker text="读取本节点已安装的 Skill…" /> : !skillError && !skillMatches.length && <EmptyPicker text="无匹配 Skill；可在本节点市场安装后重试" />}
           </> : picker === 'session' ? (
             sessionRefs.length ? sessionRefs.map((entry: any, index) => (
               <ReferenceOption

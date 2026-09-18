@@ -30,7 +30,17 @@ class NativeTextOnlyTests(unittest.IsolatedAsyncioTestCase):
     async def test_native_claude(self):
         await self.check_backend(BackendType.CLAUDE_AGENT_SDK, ClaudeAgentBackend, "claude-sonnet-4-5")
 
-    async def check_backend(self, kind, cls, model):
+    async def test_native_codex_images(self):
+        await self.check_backend(BackendType.CODEX_OFFICIAL, CodexOfficeBackend, 'gpt-5.5', images=True)
+
+    async def test_native_qwen_images(self):
+        await self.check_backend(BackendType.QWEN_CODE_CLI, QwenCodeSdkBackend, 'test-model', images=True)
+
+    async def test_native_claude_images(self):
+        await self.check_backend(BackendType.CLAUDE_AGENT_SDK, ClaudeAgentBackend, 'claude-sonnet-4-5', images=True)
+
+    async def check_backend(self, kind, cls, model, images=False):
+        from tests.test_text_only import fixture_image
         requests = []
         class Handler(BaseHTTPRequestHandler):
             def log_message(self, *args): pass
@@ -109,9 +119,12 @@ class NativeTextOnlyTests(unittest.IsolatedAsyncioTestCase):
                 await asyncio.wait_for(send_text_only(backend,
                     content='{"skillMarkdown":"Explain this documentation; do not run anything."}',
                     constraints="Explain the provided document. No tools.", session_id="test-job", message_id="m1",
-                    on_delta=deltas.append), 45)
+                    on_delta=deltas.append, images=[fixture_image()] if images else None), 45)
             self.assertEqual("".join(delta.text for delta in deltas), "Document explanation")
             self.assertTrue(requests, "CLI must reach the local fake provider")
+            if images:
+                serialized = json.dumps(requests)
+                self.assertTrue('data:image/' in serialized or '"type": "image"' in serialized, 'Provider must receive image content, not only a file path')
             for request in requests:
                 tools = request.get("tools") or []
                 if kind == BackendType.CODEX_OFFICIAL:

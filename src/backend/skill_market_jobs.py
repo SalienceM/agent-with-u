@@ -12,13 +12,15 @@ class SkillMarketJobs:
         self._jobs: dict[str, dict] = {}
         self._tasks: dict[str, asyncio.Task] = {}
 
-    def start(self, owner: str, key: tuple, work: Callable[[], Awaitable[dict]]) -> dict:
+    def start(self, owner: str, key: tuple, work: Callable[[], Awaitable[dict]], *, batch: dict | None = None) -> dict:
         now = time.time()
         for job_id, job in list(self._jobs.items()):
             if job["state"] != "running" and now - job["createdAt"] > 900:
                 del self._jobs[job_id]
         for job in self._jobs.values():
-            if job["owner"] == owner and job["key"] == key and job["state"] == "running":
+            if key and key[0] == "batch" and job["owner"] == owner and job["key"][:2] == key[:2] and job["key"] != key:
+                raise ValueError("批次请求 ID 已用于不同参数，请重新核对后创建新批次")
+            if job["owner"] == owner and job["key"] == key and (job["state"] == "running" or key[0] == "batch"):
                 return self.get(owner, job["jobId"])
         if sum(job["state"] == "running" for job in self._jobs.values()) >= 8:
             raise ValueError("市场任务较多，请等待已有任务完成")
@@ -27,6 +29,8 @@ class SkillMarketJobs:
             del self._jobs[oldest]
         job_id = uuid.uuid4().hex
         job = {"owner": owner, "key": key, "jobId": job_id, "createdAt": now, "state": "running"}
+        if batch is not None:
+            job["batch"] = batch
         self._jobs[job_id] = job
 
         async def run() -> None:

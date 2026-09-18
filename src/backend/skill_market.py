@@ -610,14 +610,15 @@ class SkillMarket:
         digest: str,
         *,
         allow_replace: bool = False,
+        protect_local: bool = False,
     ) -> dict:
         source = self._source_by_id(self.list_sources(), source_id)
         lock = self._source_locks.setdefault(source_id, asyncio.Lock())
         async with lock:
-            return await self._install_locked(source, path, digest, allow_replace=allow_replace)
+            return await self._install_locked(source, path, digest, allow_replace=allow_replace, protect_local=protect_local)
 
     async def _install_locked(
-        self, source: dict, path: str, digest: str, *, allow_replace: bool,
+        self, source: dict, path: str, digest: str, *, allow_replace: bool, protect_local: bool = False,
     ) -> dict:
         source_id = source["id"]
         candidates, effective_ref, _issues = await self._catalog_for_source_locked(
@@ -631,8 +632,10 @@ class SkillMarket:
         if not candidate:
             raise ValueError("市场条目已变化，请刷新后重新检查再安装")
 
-        existing = self._skill_store.get_skill(candidate["name"])
+        existing = await asyncio.to_thread(self._skill_store.get_skill, candidate["name"])
         existing_source = existing.get("source") if existing else None
+        if protect_local and not allow_replace and isinstance(existing_source, dict) and existing_source.get("dirty"):
+            raise FileExistsError("Skill 含本地修改，未授权覆盖；已保留现有内容")
         same_source = bool(
             isinstance(existing_source, dict)
             and existing_source.get("kind") == "github"
@@ -669,6 +672,7 @@ class SkillMarket:
             return self._skill_store.install_standard_files(
                 selected[0]["files"], source=source_meta,
                 allow_replace=bool(existing is None or same_source or allow_replace),
+                protect_local=protect_local and not allow_replace,
             )
 
         return await asyncio.to_thread(install_snapshot)

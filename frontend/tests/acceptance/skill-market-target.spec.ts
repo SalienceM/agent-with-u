@@ -118,7 +118,13 @@ test('remote install and environment inspection use the displayed node, never th
   await market.getByRole('checkbox').check();
   await market.getByRole('button', { name: '安装到 Skill 库', exact: true }).click();
   const runtime = page.getByRole('dialog', { name: 'Skill 运行准备' });
+  await expect(market.getByRole('button', { name: '查看运行准备', exact: true })).toBeVisible();
+  await expect(runtime).toHaveCount(0);
+  expect(inspections).toEqual([]);
+  await market.getByRole('button', { name: '查看运行准备', exact: true }).click();
   await expect(runtime).toContainText('A-host');
+  await expect(runtime.getByRole('checkbox')).toHaveCount(0);
+  await expect(runtime).toContainText('无需重复准备');
   await expect(runtime.getByTestId('skill-import-node')).toContainText('工作站 A');
   await expect(runtime.getByRole('combobox', { name: '运行准备节点' })).toHaveValue('relay:target-test:A');
   expect(installs).toEqual(['A']);

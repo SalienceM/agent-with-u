@@ -1788,10 +1788,8 @@ export const App: React.FC = () => {
         {workbench.tabs.includes('market') && <section id="workbench-panel-market" role="tabpanel" aria-labelledby="workbench-tab-market"
           hidden={workbench.active !== 'market'} style={{ display: workbench.active === 'market' ? 'flex' : 'none', flex: 1, minHeight: 0, overflow: 'hidden' }}>
           <SkillMarketDialog open embedded onClose={() => closeWorkbenchTab('market')}
-            onInstalled={(name, execKey) => {
-              setSkillLibraryRevision(value => value + 1);
-              if (name) { setMarketRuntimeExecKey(execKey || getHomeExecKey()); setMarketRuntimeNames([name]); }
-            }} />
+            onInstalled={() => setSkillLibraryRevision(value => value + 1)}
+            onPrepare={(names, execKey) => { setMarketRuntimeExecKey(execKey); setMarketRuntimeNames(names); }} />
         </section>}
         {marketRuntimeNames.length > 0 && <SkillRuntimeDialog key={`${marketRuntimeExecKey}:${marketRuntimeNames.join('|')}`}
           names={marketRuntimeNames} initialExecKey={marketRuntimeExecKey} onClose={() => setMarketRuntimeNames([])} />}

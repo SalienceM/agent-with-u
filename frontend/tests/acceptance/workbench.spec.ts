@@ -52,6 +52,7 @@ test('activity rail and persistent workspace tabs; market filtering, versions an
   await market.getByRole('combobox', { name: '扩展来源筛选' }).selectOption('');
   await market.getByRole('textbox', { name: '搜索扩展' }).fill('beta');
   await expect(market.getByRole('heading', { name: 'beta', exact: true })).toBeVisible();
+  await market.locator('summary').filter({ hasText: '版本与仓库信息' }).click();
   await expect(market.getByText('作者未声明', { exact: true })).toBeVisible();
   await expect(market.getByText('repo-v9', { exact: true })).toBeVisible();
   await page.getByRole('tab', { name: '扩展市场', exact: true }).focus();
@@ -65,6 +66,7 @@ test('activity rail and persistent workspace tabs; market filtering, versions an
   await expect(market.getByRole('heading', { name: 'beta', exact: true })).toHaveCount(0);
   await expect(market.getByRole('button', { name: '安装到 Skill 库', exact: true })).toHaveCount(0);
   await market.getByRole('textbox', { name: '搜索扩展' }).fill('alpha');
+  await market.locator('summary').filter({ hasText: '版本与仓库信息' }).click();
   await expect(market.getByText('1.2.3', { exact: true })).toBeVisible();
   const bounds = await market.boundingBox();
   expect(bounds!.width).toBeLessThanOrEqual(page.viewportSize()!.width);
@@ -76,6 +78,7 @@ test('activity rail and persistent workspace tabs; market filtering, versions an
   await page.getByRole('button', { name: '更多功能', exact: true }).click();
   await page.getByRole('menuitem', { name: /Skills 与 Prompts/ }).click();
   await expect(page.getByRole('tabpanel', { name: 'Skills 与 Prompts' })).toBeVisible();
+  await page.getByRole('tab', { name: /^Prompts ·/ }).click();
   await page.getByRole('button', { name: '新建 Prompt', exact: true }).click();
   await page.getByPlaceholder('Prompt 名称', { exact: true }).fill('保留草稿');
   await page.getByPlaceholder('输入 Prompt 模板内容…', { exact: true }).fill('标签切换不能丢失此内容');

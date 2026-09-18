@@ -260,6 +260,7 @@ test('repo ignores old-node replies and binding stays on the Session node after 
   holdA = false;
   pending.splice(0).forEach(release => release());
   await expect(repo.getByText('skill-A', { exact: true })).toHaveCount(0);
+  await repo.getByRole('button', { name: '管理 skill-B', exact: true }).click();
   await repo.getByRole('button', { name: '运行准备 / 状态', exact: true }).click();
   const runtime = page.getByRole('dialog', { name: 'Skill 运行准备' });
   await expect(runtime).toContainText('B-host');

@@ -33,6 +33,7 @@ from pathlib import Path
 from typing import Optional
 
 from . import paths
+from .aside_context import migrate_reference_attention
 
 
 # ── 阶段常量 ──────────────────────────────────────────────────────
@@ -327,6 +328,7 @@ class AsideTurn:
 
     @classmethod
     def from_dict(cls, d: dict) -> "AsideTurn":
+        d = migrate_reference_attention(d)
         return cls(
             id=d.get("id", ""),
             question=d.get("question", ""),

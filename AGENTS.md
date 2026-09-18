@@ -668,13 +668,72 @@ script/network-disabled opaque iframe; source mode is escaped text.
 
 Thoughts' opt-in `@SKILL:name` picker reads installed names from the Session executor.
 It does not require activation. The backend resolves references from the question itself,
-never trusts a client-supplied manual body, and keeps a separate `skills:<names>` attention
-thread. At most three documents / 12K characters each enter the transient prompt, with
-provenance and explicit truncation notices. Missing manuals produce persistent errors.
-These turns use `text_only.send_text_only` (no native tools or project inheritance), a
-180-second bound and a separately cancellable task; ordinary aside semantics stay intact.
-Images plus Skill references currently fail explicitly rather than dropping attachments.
-Reference bodies are not saved with the question; followups reread the current guides.
+never trusts a client-supplied manual body. References are auxiliary to the current
+Session/project and UI focus, never replace its attention key, label or visible snapshot.
+References are strictly per-message: chips derive from the current draft's explicit
+`@SKILL` tokens, never from a sticky selection or history. Sending submits that draft
+without appending references. Success clears the draft/chips; rejected sends keep them
+for retry. Plain text/image followups never automatically reread manuals; prior Q&A
+remains ordinary history. Adding/removing references keeps the same question history. Legacy `skills:<names>`
+turns migrate to their owning Session thread without changing questions/answers/timestamps;
+real `panel:library` focus stays separate. The UI shows a named reference strip beneath
+the primary attention card; unpinned Session/executor changes clear transient references,
+draft and images, while explicit pinning retains the original target and unsent draft.
+At most three parent/child references expand to 100 documents with a shared
+36K-character budget (up to 12K per document). Every selected child receives a fair
+budget, provenance and explicit truncation notices; oversized groups fail before a
+model call, never silently drop later children. Missing manuals produce persistent errors.
+These turns use `text_only.send_text_only` (text output, no native tools or project inheritance),
+a 180-second bound and a separately cancellable task; ordinary aside semantics stay intact.
+Skill references can accompany uploaded screenshots (up to 8, 16 MiB total, 20M pixels/image).
+Image bytes and formats are validated; executor file paths are never read. API/Codex/Claude
+carry native image blocks. Qwen gets only generated image references inside the disposable
+workspace, while all document-supplied `@` paths remain escaped and native tools stay denied.
+Unsupported model/media errors fail explicitly, never silently retry without the images.
+The answer also receives a read-only snapshot of referenced child bindings and registered
+commands for the Session, explicitly separating CLI commands, slash aliases and prerequisites.
+`aside_context.project_reference_snapshot` reads only the authoritative Session workspace:
+bounded top-level names and README.md/package.json/pyproject.toml/openspec/config.yaml snippets
+(2.5K each, 10K total), plus shallow OpenSpec spec/change names. No recursive scan, CLI call,
+hidden credential files, out-of-workspace symlink targets, or controller-supplied cwd is used.
+SSH/unconfigured/unreadable workspaces are explicitly unknown, not inspected on the wrong node.
+These snapshots are fetched only for an explicit referenced question on a worker thread,
+never polled or persisted; the isolated model still has no project or tool access.
+Reference labels resolve parent names from metadata on the correct node (stable IDs remain
+the identity), independently of the Session/file attention label.
+Reference bodies are not saved with the question; only a new explicit reference rereads guides.
+
+**Repository parents.** `skill_groups.SkillGroups` derives stable `repo.<hash>` IDs from
+the case-insensitive repository identity, independent of branch, install count or display
+name. A one-Skill repository is also a parent; unprovenanced/local Skills stay independent
+rather than guessing a shared repository. Executor-local `.groups.json` stores optional
+display names with optimistic revision checks, outside installed packages. `listSkills`
+adds parent metadata; Repo and ability binding default to collapsed parent rows. Parent
+selection changes the current installed child names in one existing ability-save RPC;
+partial legacy selections remain partial, child-only actions preserve other repositories,
+and later installs never silently broaden a Session's execution permissions. Group default
+flags are saved atomically for current children; native slash/deployment identities stay
+child-level. Parent management never installs, deploys or executes a Skill implicitly.
+
+`listSkillManuals` exposes parent metadata with expandable child choices. The picker adds
+a stable parent token plus readable display name, so renaming never breaks picker-created
+references or detached windows. Explicit quoted display-name aliases are also accepted,
+but ambiguous aliases fail closed. Parent previews aggregate child originals/maintained
+guides with a fair 128K cap; parent guides are saved separately under `.manuals/` and their
+source hashes cover child membership and document revisions. Referencing a parent always
+includes every child's latest guide plus any maintained parent overview, deduplicating
+explicit child references. A custom parent guide never replaces child evidence. No market
+downloads, activation or model calls occur when browsing metadata or previewing manuals.
+Tests: `test_skill_groups.py`, `skill-groups.test.cjs`, `skill-groups.spec.ts`.
+
+The library uses full-width Skills / Prompts tabs with a local metadata search instead
+of mixing repository banners and narrow tiles. `AbilityLibraryRow` keeps repository,
+standalone Skill, child and Prompt geometry consistent. Only manual preview and an
+always-visible management disclosure accompany the title; maintenance/default/secrets/
+delete controls are keyboard- and touch-accessible in the disclosure, never hover-only.
+Repository title toggles nested children. Search matches children but preserves the whole
+group for parent operations. Browsing, filtering and tab switches make no new RPCs.
+Keep light/dark and narrow layout coverage in `skill-groups.spec.ts`.
 
 `detachedWindow.ts` owns scratchpad, Thoughts and Skill-manual opening. Browser popups
 must be opened synchronously within the user click, before any native import. Tauri
@@ -713,10 +772,29 @@ reserves its height while loading. Unconfirmed locations and offline nodes disab
 installation. Catalog/source changes/install/job polling/AI explanations use the
 same explicit executor key. Changing default node or identity invalidates catalog,
 review and late responses; switching Session tabs does not change installation target.
-`onInstalled` carries the actual key into `SkillRuntimeDialog`, so preparation cannot
+The separate manual `onPrepare` action carries the actual key into `SkillRuntimeDialog`, so preparation cannot
 drift to a new default. Selecting another runtime node only inspects its existing
 Skill copy, never copies or installs Skill files there. File import, dependency
 preparation and Agent activation remain separate steps.
+
+**Repository batch import.** The market's “安装此仓库全部” uses every catalog item from
+the selected source (or selected item's source), independent of the search filter.
+The review dialog freezes paths/digests, source, executor and library directory, with
+an explicit default-off overwrite policy. `skillMarketInstallBatch` creates one
+owner-scoped job (1–500 items), serially imports files and exposes per-item results;
+current copies and same-name conflicts/local edits are skipped by default, repository
+duplicate names require individual selection, and failures retain earlier successes.
+Content digests are rechecked, with conflict/edit protection rechecked atomically under
+the store's deployment lock. Same request IDs reuse running/terminal receipts while
+retained; changed parameters with the same ID are rejected. An uncertain transport
+failure rechecks the original batch, while a confirmed terminal retry submits only
+failed/unfinished items. Closing the batch dialog retains its receipt while the market
+remains mounted; “查看安装批次” reopens it. Jobs are transient and do not survive executor
+restart. Neither single nor batch import automatically opens runtime preparation or
+activates Skills; “查看运行准备” is manual and a ready plan has no prepare confirmation.
+Source management and verbose repository metadata start collapsed; compact cards and
+a wider modal prioritize the list and source preview without shrinking text. Tests:
+`test_skill_market_batch.py`, `skill-market-batch.spec.ts`, `skill-market-target.spec.ts`.
 
 Large repository archives are streamed to reference-held temporary disk snapshots
 (1 GiB compressed maximum, cache <=4 archives / 2 GiB, TTL 15 minutes). Catalogs
@@ -1050,28 +1128,47 @@ Side RPCs: `seqtaskGet`, `seqtaskAdd`, `seqtaskEdit`, `seqtaskRemove`,
 
 ### Slash Commands
 
-**Explicit Skill commands.** `/skill <bound-name> <arguments>` is a Session-scoped
-call, with explicit OpenSpec `/opsx-*` aliases defined in `skill_commands.py`.
-It is not an arbitrary native-TUI/shell passthrough. `listSessionSkillCommands`
-is ownership-gated, executor-routed, reads only bound Skill metadata off-loop and
-never downloads, deploys or probes CLIs. ChatInput loads it only while its menu
-is open, refreshes on binding changes or explicit retry, and ignores stale node/
-Session replies. Parameterized selections fill the draft without sending; busy
-Skill sends retain the draft rather than entering the ordinary queue. App commands
-cannot be overwritten. API-only/SSH transports advertise no general native Skill
-execution support; `/native` fails explicitly instead of pretending to execute.
+**Portable Skill command configurations.** `awu.commands.json` (schemaVersion 1)
+maps stable installed Skill IDs to slash declarations. `skill_command_manifest.py`
+strictly validates metadata; `skill_commands.py` uses one generic registry/resolver,
+not OpenSpec-specific parser branches. Built-in OpenSpec compatibility data in
+`skill_command_presets.py` is the same exportable schema, gated by real installed
+IDs, and is suppressed by package configuration (including invalid/empty overrides).
+No installed owner means no extension entries, even if the CLI/project exists.
 
-The ordinary send boundary parses the original command and validates optional
-`skillInvocation` name/arguments/instruction digest, installed/bound state, backend
-and workspace. OpenSpec checks Backend PATH/project node_modules/.bin for its CLI
-and requires openspec/config.yaml in this exact project (not a parent). Presence
-checks are not version/health checks; no install, init or business CLI runs during
-preflight. Check failures persist an assistant error before any model call. After
-preparation the selection is revalidated; only the selected Skill's complete
-instructions enter turn-only constraints. Raw slash commands remain in visible
-history, but model input is prefixed to prevent a CLI expanding the alias again.
-Arguments are data, never shell interpolation; existing permissions/Kit approval
-gates are unchanged. Tests: test_skill_commands.py and skill-commands.spec.ts.
+The Repo library's parent/child **/ 命令配置** editor reads, imports, saves and
+exports this file through executor-routed `getSkillCommandConfig` /
+`saveSkillCommandConfig`. Parent save explicitly unifies all currently installed
+children under that parent; revisions cover content and membership. Files are inside
+the packages, included in backups and marked locally dirty for market updates.
+Portable ZIP/market installation inherits the nearest ancestor declaration when
+there is no Skill-local declaration and includes it in preview/install digests.
+AWU packages whitelist this file too. Import never runs hooks, CLI or dependencies.
+See [command configuration guide](docs/skill-command-config.md).
+
+A `kind=skill` declaration invokes an installed, Session-bound `skillId` and
+loads its complete instructions; `kind=project` supplies a CLI filename, structured
+argv, typed positional arguments and optional declarative filesystem/YAML guards.
+Project bootstrap entries require installation, not binding, so init is available
+before project setup. Backend/workspace/terminal checks remain enforced. Neither
+kind grants permissions, Kit approval, shell interpolation or implicit installation.
+CLI existence is checked only on send, not while opening a menu. Execution is an
+ordinary Agent turn with real tool/result verification, not a deterministic Kit.
+
+Identical shared profile copies deduplicate. Conflicting profile versions or alias
+names fail closed with visible diagnostics; app commands are reserved. Invalid
+files cannot silently fall back to a compatibility profile. Changing declarations
+or instructions invalidates old invocations; sends re-resolve after preparation.
+Unknown non-app slash text is validated by the executor even without prior menu
+discovery, never treated as an ordinary model prompt. Busy sends retain the draft.
+Queue dispatch uses the same declarations instead of an OpenSpec namespace exception.
+
+`listSessionSkillCommands` remains ownership-gated and reads off-loop. It exposes
+metadata, not instruction bodies; it never deploys or probes dependencies. Menu and
+Thoughts use the same catalog. Thoughts stays read-only, with the current Session
+as primary focus; only explicitly referenced Skills' commands enter its auxiliary
+snapshot. Uninstall/stale bindings/config errors cannot advertise executable entries.
+API-only/SSH transports remain unsupported for these execution routes.
 
 Frontend handles these slash commands in `useChat.ts`:
 

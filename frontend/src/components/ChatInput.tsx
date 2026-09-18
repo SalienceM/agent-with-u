@@ -409,7 +409,7 @@ const ChatInputInner: React.FC<Props> = ({
   skillCommandsRef.current = skillCommands;
   const filteredCommands = useMemo<SlashCommand[]>(() => [
     ...SLASH_COMMANDS,
-    ...skillCommands.map(item => ({ ...item, shortDesc: item.skillName })),
+    ...skillCommands.map(item => ({ ...item, shortDesc: item.family || item.targetSkillId || item.skillName })),
   ].filter(item => item.name.toLowerCase().startsWith(commandQuery)), [commandQuery, skillCommands]);
   // 仅打开菜单时读取本节点已绑定的元数据；输入每个字符、流式输出不触发 RPC。
   useEffect(() => {
@@ -421,11 +421,20 @@ const ChatInputInner: React.FC<Props> = ({
     setSkillCommands([]); setShowCommands(false); setCommandRevision(value => value + 1);
   }), []);
   useEffect(() => {
+    const changed = () => { setSkillCommands([]); setCommandRevision(value => value + 1); };
+    window.addEventListener('awu-skill-commands-changed', changed);
+    return () => window.removeEventListener('awu-skill-commands-changed', changed);
+  }, []);
+  useEffect(() => {
     if (!showCommands || !sessionId || isFocused === false) return;
     let cancelled = false;
+    setSkillCommands([]); // 重开/刷新时先撤下旧节点或已卸载扩展的入口。
     setCommandLoading(true); setCommandError('');
     void api.listSessionSkillCommands(sessionId, execKey).then(result => {
-      if (!cancelled) setSkillCommands(result.commands);
+      if (!cancelled) {
+        setSkillCommands(result.commands);
+        setCommandError((result.issues || []).map(issue => `${issue.source}: ${issue.message}`).join('；'));
+      }
     }).catch((error: unknown) => {
       if (!cancelled) { setSkillCommands([]); setCommandError(error instanceof Error ? error.message : 'Skill 命令加载失败'); }
     }).finally(() => { if (!cancelled) setCommandLoading(false); });
@@ -1297,7 +1306,7 @@ const ChatInputInner: React.FC<Props> = ({
             ref.current.value = cmd.name + (cmd.requiresArguments ? ' ' : '');
           }
           setShowCommands(false);
-          if (cmd?.requiresArguments) {
+          if (cmd?.requiresArguments || cmd?.kind === 'project') {
             saveSessionDraft(ref.current?.value || '');
             scheduleTextareaResize(true);
             return;
@@ -1527,7 +1536,7 @@ const ChatInputInner: React.FC<Props> = ({
       ref.current.focus();
     }
     setShowCommands(false);
-    if (cmd.requiresArguments) {
+    if (cmd.requiresArguments || cmd.kind === 'project') {
       saveSessionDraft(ref.current?.value || '');
       scheduleTextareaResize(true);
       return;
@@ -1894,7 +1903,7 @@ const ChatInputInner: React.FC<Props> = ({
         <div ref={popupRef} style={commandPopupStyle} role="listbox" aria-label="聊天命令">
           <div style={{ padding: '6px 10px', fontSize: 11, color: 'var(--theme-text-muted)', overflowWrap: 'anywhere' }}>
             Skill 执行节点：{getExecutors().find(item => item.key === execKey)?.label || execKey || '当前会话节点'} · {workingDir || '未设置项目目录'}
-            <div>{commandLoading ? '读取已启用的 Skill…' : commandError || 'Skill 命令发送前会检查依赖，不自动安装或初始化。'}</div>
+            <div>{commandLoading ? '读取 Skill 与项目命令…' : commandError || '扩展命令随对应 Skill 提供；选择只填草稿，发送才执行，不自动安装依赖。'}</div>
             <button type="button" aria-label="刷新 Skill 命令" onClick={() => setCommandRevision(value => value + 1)} disabled={commandLoading}
               style={{ marginTop: 4, padding: '4px 8px', borderRadius: 5, fontSize: 11,
                 border: '1px solid var(--theme-border, rgba(255,255,255,0.12))',
