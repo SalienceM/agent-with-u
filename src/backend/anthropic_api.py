@@ -200,6 +200,8 @@ class AnthropicAPIBackend(ModelBackend):
                                  "maxAttempts": _MAX_RETRIES + 1,
                                  "requestBytes": len(json.dumps(req_body, ensure_ascii=False).encode("utf-8"))})
                             async with httpx.AsyncClient(timeout=120.0) as hclient:
+                                from .call_trace import trace_request, trace_response
+                                trace_request("anthropic-http-body", req_body, "实际提交给 HTTP 客户端的 JSON 请求体，认证头未保存。")
                                 async with hclient.stream(
                                     "POST", url, headers=req_headers, json=req_body
                                 ) as resp:
@@ -224,6 +226,7 @@ class AnthropicAPIBackend(ModelBackend):
                                             continue
                                         try:
                                             evt = json.loads(data_str)
+                                            trace_response("anthropic-sse", evt, "供应商 SSE data JSON（脱敏）。")
                                         except json.JSONDecodeError:
                                             continue
 
@@ -377,9 +380,13 @@ class AnthropicAPIBackend(ModelBackend):
                         stream_kwargs["tools"] = extra_tools
 
                     emit("diagnostic", diagnostic={"phase": "sdk_request", "model": model})
+                    from .call_trace import trace_request, trace_response
+                    trace_request("anthropic-sdk", {k: v for k, v in stream_kwargs.items() if v is not _anthropic.NOT_GIVEN}, "实际传入 Anthropic SDK 的参数，认证信息未保存。")
                     async with client.messages.stream(**stream_kwargs) as stream:
                         emit("diagnostic", diagnostic={"phase": "sdk_response"})
                         async for event in stream:
+                            if hasattr(event, "model_dump"):
+                                trace_response("anthropic-sdk-event", event.model_dump(mode="json"))
                             if self.is_cancelled(session_id):
                                 break
 

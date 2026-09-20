@@ -24,8 +24,10 @@ if (typeof document !== 'undefined' && !document.getElementById('skill-market-cs
     .skill-market-source:hover .skill-market-source-remove { opacity:1!important; }
     .skill-market-source-inputs input { min-width:0; }
     .skill-market-detail { overflow-wrap:anywhere; }
-    .skill-market-install-target { height:56px; flex:none; box-sizing:border-box; overflow:auto; }
-    .skill-market-install-target[data-expanded="true"] { height:94px; }
+    .skill-market-install-target { height:64px; flex:none; box-sizing:border-box; overflow:auto; }
+    .skill-market-install-target[data-expanded="true"] { height:102px; }
+    .skill-market-target-picker { display:flex; align-items:center; gap:6px; flex:1; min-width:0; }
+    .skill-market-target-picker select { flex:1; min-width:0; width:0; height:28px; }
     .skill-market-install-target-line { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; line-height:18px; min-width:0; }
     .skill-market-source-snapshot { height:84px; flex:none; display:flex; flex-direction:column; gap:7px; overflow:auto; scrollbar-gutter:stable; }
     .skill-market-source-snapshot > * { flex-shrink:0; }
@@ -47,6 +49,9 @@ if (typeof document !== 'undefined' && !document.getElementById('skill-market-cs
       .skill-market-source-inputs input:first-child { grid-column:1/-1; }
       .skill-market-source-inputs button { grid-column:1/-1; }
       .skill-market-detail-switch button, .skill-market-detail-switch select { min-height:44px; }
+      .skill-market-install-target { height:80px; }
+      .skill-market-install-target[data-expanded="true"] { height:118px; }
+      .skill-market-target-picker select { height:44px; }
       .skill-market-file-pages button { min-height:44px; }
       .skill-market-explanation { min-height:180px; }
     }
@@ -57,6 +62,9 @@ if (typeof document !== 'undefined' && !document.getElementById('skill-market-cs
     }
     @media (max-width: 760px) {
       .skill-market-dialog { inset:8px!important; width:auto!important; max-height:none!important; }
+      .skill-market-install-target { height:80px; }
+      .skill-market-install-target[data-expanded="true"] { height:118px; }
+      .skill-market-target-picker select { height:44px; }
       .skill-market-layout { grid-template-columns:1fr; overflow:auto; }
       .skill-market-list { height:240px; max-height:240px!important; flex:none!important; }
       .skill-market-detail { height:max(540px,75dvh); min-height:0; overflow:auto!important; }
@@ -68,6 +76,8 @@ if (typeof document !== 'undefined' && !document.getElementById('skill-market-cs
 
 interface Props {
   embedded?: boolean;
+  // 仅打开时取值；之后切换 Session / 默认连接不能改变已经选定的目标。
+  initialExecKey?: string;
   open: boolean;
   onClose: () => void;
   onInstalled: (name?: string, execKey?: string) => Promise<void> | void;
@@ -98,7 +108,7 @@ function riskLabel(item: SkillMarketItem): { text: string; color: string; backgr
   return { text: '基础检查通过', color: '#4fb477', background: 'rgba(79,180,119,.12)' };
 }
 
-export const SkillMarketDialog: React.FC<Props> = ({ open, onClose, onInstalled, onPrepare, embedded }) => {
+export const SkillMarketDialog: React.FC<Props> = ({ open, onClose, onInstalled, onPrepare, embedded, initialExecKey }) => {
   const [catalog, setCatalog] = useState<SkillMarketCatalog>(EMPTY_CATALOG);
   const [loading, setLoading] = useState(true);
   const [catalogLoaded, setCatalogLoaded] = useState(false);
@@ -125,7 +135,7 @@ export const SkillMarketDialog: React.FC<Props> = ({ open, onClose, onInstalled,
   const [explanationBackends, setExplanationBackends] = useState<any[]>([]);
   const [backendsLoading, setBackendsLoading] = useState(true);
   const [explanationBackendId, setExplanationBackendId] = useState('');
-  const [execKey, setExecKey] = useState(getHomeExecKey);
+  const [execKey, setExecKey] = useState(() => initialExecKey || getHomeExecKey());
   const [executors, setExecutors] = useState(getExecutors);
   const [locationSnapshot, setLocationSnapshot] = useState<{ key: string; value: SkillMarketLocation } | null>(null);
   const [locationLoading, setLocationLoading] = useState(true);
@@ -198,7 +208,7 @@ export const SkillMarketDialog: React.FC<Props> = ({ open, onClose, onInstalled,
     return () => { loadGeneration.current += 1; loadAbort.current?.abort(); };
   }, [open, load, identityRevision]);
 
-  useEffect(() => onCurrentUserChanged(() => {
+  const resetScope = useCallback((nextKey: string) => {
     marketScope.current += 1;
     loadGeneration.current += 1;
     setCatalog(EMPTY_CATALOG);
@@ -210,6 +220,7 @@ export const SkillMarketDialog: React.FC<Props> = ({ open, onClose, onInstalled,
     setInstallingId('');
     setInstallProgress('');
     setBatchSnapshot(null);
+    setBatchVisible(false);
     setLastInstalled(null);
     installOperation.current += 1;
     setExplanationItemKey('');
@@ -219,10 +230,33 @@ export const SkillMarketDialog: React.FC<Props> = ({ open, onClose, onInstalled,
     setLocationSnapshot(null);
     setLocationLoading(true);
     setLocationError('');
+    setQuery('');
+    setSourceFilter('');
+    setSelectedId('');
+    setSourceInput('');
+    setSourceName('');
+    setSourceBranch('');
+    setFileQuery('');
+    setFilePage(0);
+    setMessage(null);
     setExecutors(getExecutors());
-    setExecKey(getHomeExecKey());
+    setExecKey(nextKey);
     setIdentityRevision(value => value + 1);
-  }), []);
+  }, []);
+
+  useEffect(() => onCurrentUserChanged((_profile, changed) => {
+    if (changed) resetScope(getHomeExecKey());
+  }), [resetScope]);
+  // 节点/用户范围之外的迟到来源操作不能触发目录刷新或覆盖当前反馈。
+  useEffect(() => () => { marketScope.current += 1; }, []);
+
+  const targetLocked = Boolean(installingId || addingSource || batchSnapshot);
+  const targetHint = batchSnapshot ? '批次已锁定安装节点；请在“查看安装批次”中取消未提交批次或完成结果查看后再切换。'
+    : targetLocked ? '操作进行中，安装节点已锁定。'
+      : '仅选择本次市场操作的目标，不修改全局默认连接；切换 Session 不会自动改变此选择。';
+  const changeTarget = (nextKey: string) => {
+    if (!targetLocked && nextKey !== execKey) resetScope(nextKey);
+  };
 
   useEffect(() => {
     if (!open) return;
@@ -366,7 +400,7 @@ export const SkillMarketDialog: React.FC<Props> = ({ open, onClose, onInstalled,
         : '当前来源中没有可安装的标准 Skill';
   const initialSync = loading && !catalogLoaded;
   const syncText = installingId ? installProgress : loading ? `同步中 · ${loadingText}`
-    : message?.text || (catalogLoaded ? '同步完成' : '尚未同步，请点击刷新源重试');
+    : message?.text || (batchSnapshot ? targetHint : catalogLoaded ? '同步完成' : '尚未同步，请点击刷新源重试');
 
   return (
     <div className={embedded ? 'skill-market-workbench' : undefined} style={embedded ? { display: 'flex', flex: 1, minWidth: 0, minHeight: 0, overflow: 'hidden' } : overlayStyle}>
@@ -389,10 +423,19 @@ export const SkillMarketDialog: React.FC<Props> = ({ open, onClose, onInstalled,
 
         <section className="skill-market-install-target" aria-label="Skill 安装位置" aria-busy={locationLoading} data-expanded={targetExpanded}
           style={{ padding: '7px 10px', border: '1px solid var(--theme-border)', borderRadius: 7, background: 'var(--theme-bg)', fontSize: 11 }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 8, height: 22 }}>
-            <strong className="skill-market-install-target-line" style={{ flex: 1 }} title={`${targetName} · 节点 ID：${execKey}`}>
-              安装节点：{targetName}
-            </strong>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <label className="skill-market-target-picker" title={targetHint}>
+              <strong style={{ flexShrink: 0 }}>安装到</strong>
+              <select aria-label="Skill 安装节点" value={execKey} disabled={targetLocked}
+                onChange={event => changeTarget(event.target.value)}
+                style={{ ...inputStyle, padding: '2px 6px', fontSize: 11 }}>
+                {!executors.some(item => item.key === execKey) && <option value={execKey}>{targetName}（离线）</option>}
+                {executors.map(item => <option key={item.key} value={item.key}>
+                  {skillInstallTargetLabel(item.key, item, isTauri())}{item.key === execKey && location ? ` · ${location.host}` : ''}{item.connected ? '' : '（离线）'}
+                </option>)}
+              </select>
+            </label>
+            {targetLocked && <span title={targetHint} style={{ flexShrink: 0 }}>已锁定</span>}
             <span style={{ flexShrink: 0, color: targetConnected ? '#4fb477' : '#ef6b73' }}>{targetConnected ? '在线' : '离线'}</span>
             <button style={{ ...secondaryButtonStyle, padding: '1px 6px' }} aria-label="安装目录与说明" aria-expanded={targetExpanded}
               onClick={() => setTargetExpanded(value => !value)}>{targetExpanded ? '收起' : '详情'}</button>
@@ -407,9 +450,9 @@ export const SkillMarketDialog: React.FC<Props> = ({ open, onClose, onInstalled,
             依赖目录：<code>{location?.runtimePath || (locationLoading ? '同步中…' : '未确认')}</code>（需另行确认）
           </div>
           <div className="skill-market-install-target-line" style={{ color: locationError ? '#ef6b73' : 'var(--theme-text-muted)' }}
-            title={locationError || '市场使用默认执行节点，不随当前 Session 切换。文件导入与 Agent 启用是两步；不会复制到其它节点。浏览器仅负责操作，文件不会写入浏览器存储或下载目录。'}>
+            title={locationError || `${targetHint} 文件导入与 Agent 启用是两步；不会复制到其它节点。浏览器仅负责操作，文件不会写入浏览器存储或下载目录。`}>
             {locationError || (!targetConnected ? '节点离线，暂不能安装；不会改装到其它节点。'
-              : `使用默认节点，不随 Session 切换；${isTauri() ? '仅导入该节点 Skill 库，不自动启用。' : '文件写入上述节点，不存入浏览器。'}`)}
+              : `独立选择节点，不修改默认连接；${isTauri() ? '仅导入该节点 Skill 库，不自动启用。' : '文件写入上述节点，不存入浏览器。'}`)}
           </div>
           </div>
         </section>

@@ -5,6 +5,8 @@ import { DiffView, type DiffData } from './DiffView';
 export interface PermissionRequestData {
   sessionId: string;
   messageId: string;
+  allowSkip?: boolean;
+  requestId?: string;
   tools: Array<{
     id?: string;
     name: string;
@@ -55,24 +57,32 @@ function tryParseCommand(name: string, input?: string): string | null {
 export const PermissionGate: React.FC<Props> = ({ request, onDismiss, onSkipRest }) => {
   const [expandedTool, setExpandedTool] = useState<number | null>(0); // 默认展开第一个
   const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
 
   const isPreExecution = request.tools.some(t => t.status === 'pending');
-  const title = isPreExecution ? '🔒 需要确认执行' : '🔄 继续执行？';
-  const description = isPreExecution
-    ? 'Claude 请求执行以下操作，请确认后继续：'
-    : 'Claude 已执行以下操作并希望自动继续：';
+  const isWorkspace = request.tools.some(t => t.name === 'awu_workspace');
+  const isCurrentWorkspace = isWorkspace && request.allowSkip === true;
+  const canSkip = request.allowSkip !== false && (!isWorkspace || isCurrentWorkspace);
+  const title = isCurrentWorkspace ? '📝 确认当前 Session 写入'
+    : isWorkspace ? '🌐 确认工作区操作' : isPreExecution ? '🔒 需要确认执行' : '🔄 继续执行？';
+  const description = isWorkspace
+    ? isCurrentWorkspace
+      ? '仅向当前 Session 工作区新增文件，遵循普通工具确认设置。可允许一次，或跳过本轮后续普通工具确认；不授权跨 Session／跨节点操作。'
+      : '请核对实际节点、目标 Session 与新增文件。跨 Session／跨节点写入或新建 Session 需单独确认；不会覆盖源文件，也不会自动运行新 Session。'
+    : isPreExecution ? 'Agent 请求执行以下操作，请确认后继续：' : 'Agent 已执行以下操作并希望自动继续：';
 
   const handleGrant = async (granted: boolean) => {
     setLoading(true);
-    try { await api.grantPermission(request.sessionId, granted); }
-    catch (e) { console.error('[PermissionGate] grantPermission error:', e); }
+    setError('');
+    try { await api.grantPermission(request.sessionId, granted, false, request.requestId); }
+    catch (e) { setError(e instanceof Error ? e.message : '确认未送达，请重试'); setLoading(false); return; }
     onDismiss();
   };
 
   const handleSkipRest = async () => {
     setLoading(true);
-    try { await api.grantPermission(request.sessionId, true, true); }
-    catch (e) { console.error('[PermissionGate] grantPermission error:', e); }
+    try { await api.grantPermission(request.sessionId, true, true, request.requestId); }
+    catch (e) { setError(e instanceof Error ? e.message : '确认未送达，请重试'); setLoading(false); return; }
     onSkipRest();
     onDismiss();
   };
@@ -91,8 +101,12 @@ export const PermissionGate: React.FC<Props> = ({ request, onDismiss, onSkipRest
       </div>
 
       {/* 工具列表 */}
-      <div style={{ marginBottom: 12 }}>
+      <div style={{ marginBottom: 12, ...(isWorkspace ? { maxHeight: '36vh', overflow: 'auto' } : {}) }}>
         {request.tools.map((tc, i) => {
+          let workspacePlan: any = null;
+          if (tc.name === 'awu_workspace' && tc.input) {
+            try { workspacePlan = JSON.parse(tc.input); } catch { /* 显示原始信息 */ }
+          }
           const isExpanded = expandedTool === i;
           const diffData = tryParseDiff(tc.name, tc.input);
           const command = tryParseCommand(tc.name, tc.input);
@@ -155,7 +169,28 @@ export const PermissionGate: React.FC<Props> = ({ request, onDismiss, onSkipRest
               {/* 展开内容 */}
               {isExpanded && (
                 <div style={{ borderTop: '1px solid var(--theme-border, rgba(0,0,0,0.08))', padding: '8px 12px' }}>
-                  {diffData ? (
+                  {workspacePlan ? (
+                    <div style={{ fontSize: 12, lineHeight: 1.7, overflowWrap: 'anywhere' }}>
+                      <div>节点：<strong>{workspacePlan.node?.name}</strong> <small>{workspacePlan.node?.id}</small></div>
+                      <div>{workspacePlan.action === 'create_session' ? '新建 Session' : '写入 Session'}：{workspacePlan.session?.title}</div>
+                      <div>工作区：{workspacePlan.session?.workingDir}</div>
+                      <div>Backend：{workspacePlan.session?.backendId}</div>
+                      <div>新增 {workspacePlan.files?.length || 0} 个文件 · {workspacePlan.totalBytes || 0} 字节</div>
+                      <div style={{ maxHeight: 260, overflow: 'auto', marginTop: 8 }}>
+                        {(workspacePlan.files || []).map((file: any) => (
+                          <details key={file.path} style={{ marginBottom: 4 }}>
+                            <summary>{file.path} · {file.bytes} 字节</summary>
+                            {workspacePlan.contents?.some((item: any) => item.path.replace(/\\/g, '/') === file.path) && (
+                              <pre style={{ whiteSpace: 'pre-wrap', fontSize: 11, maxHeight: 180, overflow: 'auto' }}>
+                                {workspacePlan.contents.find((item: any) => item.path.replace(/\\/g, '/') === file.path)?.text}
+                              </pre>
+                            )}
+                            <code style={{ fontSize: 10 }}>SHA-256: {file.sha256}</code>
+                          </details>
+                        ))}
+                      </div>
+                    </div>
+                  ) : diffData ? (
                     <DiffView diff={diffData} />
                   ) : command ? (
                     <pre style={{
@@ -188,6 +223,7 @@ export const PermissionGate: React.FC<Props> = ({ request, onDismiss, onSkipRest
       </div>
 
       {/* 操作按钮 */}
+      {error && <div role="alert" style={{ color: 'var(--theme-error, #f87171)', fontSize: 12, marginBottom: 8 }}>{error}</div>}
       <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
         <button
           onClick={() => handleGrant(false)}
@@ -200,7 +236,7 @@ export const PermissionGate: React.FC<Props> = ({ request, onDismiss, onSkipRest
         >
           ⛔ {isPreExecution ? '拒绝' : '中止'}
         </button>
-        <button
+        {canSkip && <button
           onClick={handleSkipRest}
           disabled={loading}
           style={{
@@ -210,7 +246,7 @@ export const PermissionGate: React.FC<Props> = ({ request, onDismiss, onSkipRest
           }}
         >
           ✅ 允许并跳过后续
-        </button>
+        </button>}
         <button
           onClick={() => handleGrant(true)}
           disabled={loading}

@@ -1,5 +1,6 @@
 import React, { useState, useCallback, useEffect, useRef, memo, useMemo } from 'react';
 import { markdownToHtml } from '../utils/markdown';
+import { parseWorkspaceSessionLink } from '../utils/workspaceTools';
 import { suggestedSlashCommand } from '../utils/skillCommands';
 import { api, loadSkillImageDataUrl } from '../api';
 import type { CurrentUserProfile } from '../api';
@@ -1283,6 +1284,14 @@ function MessageBubbleInner({
   // 委托捕获气泡内 Markdown 文件链接和图片点击。
   const handleContentClick = useCallback((e: React.MouseEvent<HTMLDivElement>) => {
     const target = e.target as HTMLElement;
+    const sessionLink = target.closest<HTMLAnchorElement>('a.md-link');
+    const destination = sessionLink && parseWorkspaceSessionLink(sessionLink.getAttribute('href') || '');
+    if (destination) {
+      e.preventDefault();
+      e.stopPropagation();
+      window.dispatchEvent(new CustomEvent('awu-open-workspace-session', { detail: destination }));
+      return;
+    }
     const hit = resolveFileLinkHit(e.target);
     if (hit && onFocusFile) {
       e.preventDefault();

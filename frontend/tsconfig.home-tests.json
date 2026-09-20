@@ -11,6 +11,8 @@
     "outDir": ".home-test-dist"
   },
   "include": [
+    "src/utils/inputHistory.ts",
+    "src/utils/workspaceTools.ts",
     "src/utils/workbench.ts",
     "src/utils/skillMarketView.ts",
     "src/utils/skillInstallTarget.ts",

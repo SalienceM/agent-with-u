@@ -19,6 +19,7 @@ import type { TextAttachment } from '../types/attachments';
 import { buildMessageRedoPayload } from '../utils/messageRedo';
 import { TokenUsageMonitor } from './TokenUsageMonitor';
 import { uuid } from '../utils/uuid';
+import { inputHistoryKey, normalizeInputHistory } from '../utils/inputHistory';
 
 function mergeAuthoritativeSeqTasks(authoritative: SeqTaskT[], current: SeqTaskT[]): SeqTaskT[] {
   const canonical = (authoritative || []).map((task) => ({ ...task, syncing: false }));
@@ -345,6 +346,11 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
     },
     chatHydrationEnabled,
   );
+  const historyKey = inputHistoryKey(currentUser, activeSession?.id === sessionId ? activeSession?.execKey : null, sessionId);
+  // 仅复用当前 Session 已水合的用户消息；不为输入回看额外拉取聊天历史。
+  const historySeed = useMemo(() => chat.hydratedSessionId === sessionId
+    ? normalizeInputHistory(chat.messages.filter(message => message.role === 'user').map(message => message.content))
+    : [], [chat.hydratedSessionId, chat.messages, sessionId]);
 
   // ── 向 App 上报权威运行态,用于侧边栏指示灯 ──
   // 自动 LOOP 为了秒开不会水合 chat，因此不能再只看 chat.isStreaming。
@@ -1101,6 +1107,8 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
         backends={effectiveBackends}
         activeBackendId={activeBackendId}
         sessionId={sessionId || undefined}
+        historyKey={historyKey}
+        historySeed={historySeed}
         workingDir={activeSession?.workingDir || undefined}
         skipPermissions={skipPermissions}
         onSkipPermissionsChange={handleSkipPermissionsChange}

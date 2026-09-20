@@ -535,6 +535,40 @@ different calls); the call-detail selector exposes exact counts on touch screens
 Estimated events retain hollow markers and explicit labels. Cache/reasoning are subcounts,
 not additions to input + output. Updates remain push-driven, without refresh polling.
 
+**Call input/output evidence.** The Token monitor has an executor-persisted, default-off
+per-Session capture switch and a lazy “查看此笔输入 / 输出” action. `call_trace.py` stores
+redacted evidence separately under `call-traces/`, bounded to 24 files / 20 MiB per Session
+and 800K text characters per record; never put bodies into usage pushes or Session JSON.
+Session-scoped get/toggle/clear RPCs retain owner/node routing; clearing invalidates active
+recorders too. Ordinary chat and LOOP calls are captured, not Thoughts' transient previews.
+Old, disabled and expired records are explicitly unavailable, never reconstructed from chat.
+OpenAI/Anthropic adapters capture request JSON and returned events. Qwen records SDK evidence
+and, only when capture is enabled, a process-local Node preload observes fetch model-request
+JSON via a bounded stderr channel consumed before logging. Qwen 0.19.8's bundled undici
+is observed through request diagnostics and already-sent body chunks, preserving callback
+arguments/returns without consuming request/response streams. It does not proxy requests,
+persist headers, change global settings or propagate to tool children; propagation is limited
+to Qwen's same-entry memory relaunch and verified cli-entry.js → cli.js bin wrapper. Unsupported CLI
+transports show the SDK boundary limitation, never claim complete provider input. Binary
+attachments/secrets are stripped and truncation is labelled. Evidence may still contain
+project text; users can disable capture and explicitly clear it.
+
+`qwen_usage.py` deduplicates completed assistant usage, retains cache counts and numeric
+provider fields, and supplies native totals as a checkpoint. Main accounting uses observed
+reply usage, never replacing it with a larger cumulative delta. `qwenAccounting` stores
+reply counts, checkpoint before/after and its source event ID, signed delta, unattributed
+remainder and the actual booked counts. Missing baselines and counter resets are explicit;
+unattributed remainder is not proof of auxiliary model requests. SDK usage-event counts
+(including zero-usage thinking events) are not labelled network request counts. Each trace
+attempt exposes observer readiness/capture failure, request structure character counts
+(not tokens), and independently labelled captured JSON boundaries. Result-only resumed calls without a checkpoint are explicitly estimated
+while establishing a baseline; reported zero deltas stay zero. Existing ambiguous legacy
+totals are not silently rewritten. Tests include fake-provider installed-Qwen validation
+(`AWU_TEST_NATIVE_QWEN_TRACE=1 python -m unittest tests.test_qwen_trace_native`), with isolated
+temporary homes/workspaces and no paid model calls. `AWU_TEST_QWEN_ENTRY` selects a versioned
+CLI entry without changing global installations; `AWU_TEST_QWEN_CMD=1` exercises a Windows
+CMD wrapper. Contracts cover installed 0.14.0 and the 0.19.8 release entry.
+
 **Intent guard (`intent_guard`, default on).** Early human↔model intent-divergence
 check: after the **first** loop of a round produces its plan (in `_loop_do_prepare`,
 before the heavy execute), `_intent_check` runs one lightweight independent turn
@@ -652,6 +686,19 @@ remain unmounted until first selected, then follow the existing keep-mounted beh
 Only navigation IDs are persisted here, not transcript, input attachments or Kit grants.
 Ordinary input drafts still have their existing in-memory lifetime across tab switches.
 
+**Input recall survives restart.** `utils/inputHistory.ts` stores the last ten nonempty,
+consecutively deduplicated submitted/queued input texts in controller `localStorage`,
+scoped by user identity, executor and Session. Save synchronously at send time, before
+automatic image parameters are added, not on unmount or every keystroke. Store text only:
+attachments, tool prompts/tokens and per-send Kit delegation are never captured. A missing
+history may seed once from this Session's already hydrated user messages; do not fetch
+extra pages or replace newer local slash/queue inputs with a transcript. Oversized entries
+are omitted rather than truncated (32K/entry, 64K/history); storage failure preserves an
+in-window fallback and warns without blocking send. Successful Session deletion removes
+its local history. Arrow recall only fills the composer; Down/Escape restores the draft,
+and multiline selection/editing keeps normal cursor behavior. In-memory drafts use the
+same identity/node/Session key but are not persisted by this feature.
+
 ### Skill market branches and AI explanations
 
 **Skill usage manuals and attention references.** Repo Skill cards expose a separate
@@ -764,14 +811,22 @@ Disk-heavy Skill RPCs run off the event loop; failures propagate instead of beco
 fake empty lists. Keep `test_skill_library_responsiveness.py` and
 `skill-library-loading.spec.ts` regressions when changing these boundaries.
 
-**Installation location is explicit.** The market displays the default executor's
-name/host and actual Skill library/runtime roots from read-only `skillMarketLocation`.
+**Installation location is explicit.** The market has an independent “安装到” executor
+picker. A newly opened market defaults to the focused Session's executor (home if no
+Session); the standalone library dialog seeds its library node. The choice stays fixed
+across Session tab and same-user default-connection changes, and never changes global
+connections. The market displays that node's name/host and actual Skill library/runtime
+roots from read-only `skillMarketLocation`.
 Only the desktop's `local` sidecar is labelled 本机; browser `local` connections mean
 the directly connected server, not storage on the browser device. The location card
 reserves its height while loading. Unconfirmed locations and offline nodes disable
 installation. Catalog/source changes/install/job polling/AI explanations use the
-same explicit executor key. Changing default node or identity invalidates catalog,
-review and late responses; switching Session tabs does not change installation target.
+same explicit executor key. Explicit selection or identity changes invalidate catalog,
+source drafts/filters, review, location and late responses. Missing/offline selections
+remain selected and fail closed; never silently fall back to another node. Source additions
+and single installs lock the picker while pending. A batch snapshot locks it until the user
+cancels the unsubmitted review or finishes viewing a known terminal result; merely hiding
+the batch dialog or changing the same user's home node keeps its original target and polling.
 The separate manual `onPrepare` action carries the actual key into `SkillRuntimeDialog`, so preparation cannot
 drift to a new default. Selecting another runtime node only inspects its existing
 Skill copy, never copies or installs Skill files there. File import, dependency
@@ -1337,6 +1392,38 @@ caches before the new identity is used; do not weaken this cleanup when adding
 new cached or process-global Relay state.
 
 ### Session-level execution node (连接池, 每会话归属执行节点)
+
+**Chat workspace collaboration.** `workspace_tools.py` exposes the bounded `awu_workspace`
+protocol (`nodes/sessions/backends/files/read_file/create_session/write_files/status`).
+Manual frontend sends advertise `workspaceToolsVersion=1`; the turn lease captures the
+authenticated originating WebSocket, not all same-owner clients. API backends receive a
+structured tool; local CLI/SDK backends receive a temporary loopback `/api/chat-workspace`
+entry. Old clients, automated calls, SSH threads and unsupported backends receive no lease.
+Session `abilities.workspaceToolsMode=off` disables subsequent sends. Relay discovery and
+exact node routing run on the originating controller with its existing credentials; no
+credentials or whole histories are passed to the model. Nodes are discovered on demand,
+not polled or added to persistent roster merely by discovery. A successful write remembers
+its target in the controller roster so the resulting Session stays accessible after restart.
+Losing the controller/identity fails closed.
+The target's `WorkspaceOperations` applies owner/workspace gates and exposes only safe
+Backend metadata, bounded UTF-8 reads and paginated file listings. Writes freeze a plan
+and only add files. Current-node/current-Session `write_files` follows the effective
+ordinary-tool permission setting captured in the turn lease, including live skip-rest.
+Scope comes from the originating controller's actual node route plus the frozen Session
+ID and authoritative working directory, never names, the home/default node or model flags.
+Cross-Session/cross-node writes and `create_session` still require a separate one-batch UI
+confirmation, never skip-rest or Kit delegation. Both scopes retain request-id-bound
+confirmation and disconnect cleanup; commit rechecks the Session's frozen workspace.
+The prompt prefers native file tools for ordinary current-Session work. Relative paths reject traversal, links/junctions, Windows
+reserved names, credential locations and cross-platform collisions. Owner/origin/request
+journals deduplicate retries across turns/restarts; exclusive atomic file publication and
+readback hashes distinguish partial progress from success. A new Session is published
+only after its files verify, without automatically invoking a model. Controller closure
+does not undo already-submitted writes; use the same requestId to inspect/resume. Returned
+`#awu-session=...&node=...` links navigate only after target ownership is checked. A plan
+expires after 24 hours; the initial protocol handles at most 100 new text files / 1 MiB
+per batch and 4 MiB source files. Tests: `test_workspace_tools.py`, `workspace-tools.test.cjs`,
+`workspace-tools.spec.ts`.
 
 Execution location used to be **system-level**: the whole UI window pointed at
 one executor via a single global `connectionTarget` in `frontend/src/api.ts`

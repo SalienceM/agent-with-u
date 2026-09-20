@@ -16,7 +16,7 @@ interface Session {
   updatedAt: number;
   workingDir: string;
   backendId: string;
-  abilities?: { skills: string[]; prompts: string[]; constraints?: string; kitToolsMode?: 'auto' | 'on' | 'off' };
+  abilities?: { skills: string[]; prompts: string[]; constraints?: string; kitToolsMode?: 'auto' | 'on' | 'off'; workspaceToolsMode?: 'on' | 'off' };
   // ★ session 级执行节点归属（由 api.listSessions 合并时注入）
   execKey?: string;
   execLabel?: string;
@@ -1198,6 +1198,22 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
                     flex: isMobile ? '0 0 auto' : 1, overflowY: 'auto', border: '1px solid var(--theme-border)',
                     borderRadius: 8, overflowX: 'hidden', padding: '4px'
                   }}>
+                    <section aria-label="AWU 应用工具" style={{ padding: '8px 10px', borderBottom: '1px solid var(--theme-border)', borderRadius: 6, marginBottom: 4 }}>
+                      <label style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 12, fontWeight: 600 }}>
+                        🌐 跨节点工作区协作
+                        <select aria-label="应用工具激活模式" disabled={!abilityReady || abilitySaving}
+                          value={abilityPickerSession.abilities?.workspaceToolsMode || 'on'}
+                          onChange={event => void saveAbilities({ ...(abilityPickerSession.abilities || { skills: [], prompts: [] }),
+                            constraints: constraintsValue, workspaceToolsMode: event.target.value as 'on' | 'off' })}
+                          style={{ color: 'var(--theme-text)', background: 'var(--theme-bg-secondary)', border: '1px solid var(--theme-border)', borderRadius: 5, padding: 4 }}>
+                          <option value="on">启用（按需调用）</option><option value="off">停用</option>
+                        </select>
+                      </label>
+                      <div style={{ fontSize: 11, color: 'var(--theme-text-muted)', lineHeight: 1.6, marginTop: 6 }}>
+                        聊天可查找有权限的节点、Session 和文件。新增 Session／文件须逐批确认，不覆盖已有文件。
+                        仅使用时读取数据，不预载历史；操作期间须保持发起窗口连接。下一次发送生效。
+                      </div>
+                    </section>
                     <section aria-label="内置 Kit 调用 Prompt" style={{ padding: '8px 10px', borderBottom: '1px solid var(--theme-border)', background: 'var(--theme-accent-bg)', borderRadius: 6, marginBottom: 4 }}>
                       <label style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', fontSize: 12, fontWeight: 600 }}>
                         🧰 Kit 调用 <span style={{ color: 'var(--theme-text-muted)', fontSize: 10 }}>内置 Prompt</span>

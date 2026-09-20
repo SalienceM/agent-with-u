@@ -29,6 +29,9 @@ from typing import Optional, Callable, Awaitable, Any
 from ..types import ModelBackendConfig, ChatMessage, ImageAttachment
 from .base import ModelBackend, StreamDelta, PermissionRequest, _exc_msg, cli_available, cli_missing_message
 from .loop_diagnostics import error_evidence
+from .qwen_usage import QwenTurnUsage
+from .call_trace import trace_request, trace_response
+from .qwen_trace import prepare_qwen_trace
 
 
 DEFAULT_QWEN_MAX_OUTPUT_TOKENS = 32_000
@@ -579,9 +582,12 @@ class QwenCodeSdkBackend(ModelBackend):
             options["resume"] = agent_session_id
 
         # stderr callback
+        options["env"], _consume_trace = await asyncio.to_thread(prepare_qwen_trace, options.get("env") or {})
         _stderr_lines: list[str] = []
         def _on_stderr(line: str):
             line = line.rstrip()
+            if _consume_trace(line):
+                return
             if line:
                 _stderr_lines.append(line)
                 if len(_stderr_lines) > 50:
@@ -671,6 +677,7 @@ class QwenCodeSdkBackend(ModelBackend):
         _new_agent_sid: Optional[str] = agent_session_id
         _done_emitted = False
         _usage: Optional[dict] = None
+        _turn_usage = QwenTurnUsage()
         # 仅在收到真正可展示的增量后，才跳过随后重复的 completed assistant。
         # message_start/message_stop 也是 stream_event，但本身没有内容；旧逻辑
         # 会因此误判并吞掉某些 provider 只在 completed 中返回的最终内容。
@@ -683,6 +690,11 @@ class QwenCodeSdkBackend(ModelBackend):
 
         try:
             emit("diagnostic", diagnostic={"phase": "runner_start", "model": model})
+            trace_request("qwen-sdk", {
+                "prompt": prompt,
+                "options": {key: value for key, value in options.items()
+                            if key not in {"env", "can_use_tool", "stderr"}},
+            }, "实际传入 Qwen SDK 的内容。CLI 自行加载的上下文不在此段；如捕获到 qwen-model-request，请以该段查看实际模型请求。若无该段，当前 CLI 传输无法观测完整请求。")
             async with sdk_query(prompt, options) as result:
                 emit("diagnostic", diagnostic={"phase": "runner_ready", "model": model})
                 _active_result = result
@@ -700,6 +712,8 @@ class QwenCodeSdkBackend(ModelBackend):
                     pass
 
                 async for message in result:
+                    if isinstance(message, dict) and message.get("type") in {"assistant", "result", "system", "user"}:
+                        trace_response("qwen-sdk", message, "Qwen SDK 返回事件（脱敏）；不是供应商原始 HTTP 报文。")
                     if self.is_cancelled(session_id):
                         self._detach_query_cleanup(result)
                         await asyncio.sleep(0)
@@ -714,6 +728,7 @@ class QwenCodeSdkBackend(ModelBackend):
                         )
 
                     if is_sdk_assistant_message(message):
+                        _turn_usage.observe(dict(message))
                         # Assistant messages contain the completed assistant content.
                         # When include_partial_messages=True, Qwen also sends stream_event
                         # deltas for the same content; emitting both causes the final
@@ -876,11 +891,7 @@ class QwenCodeSdkBackend(ModelBackend):
 
                         # Usage stats
                         usage = msg_dict.get("usage", {})
-                        if usage:
-                            _usage = {
-                                "inputTokens": usage.get("input_tokens", 0),
-                                "outputTokens": usage.get("output_tokens", 0),
-                            }
+                        _usage = _turn_usage.finish(usage, _new_agent_sid, bool(agent_session_id))
 
                         # Qwen SDK may keep the underlying process/generator alive briefly
                         # after the terminal result message.  Emit `done` as soon as the
@@ -901,6 +912,7 @@ class QwenCodeSdkBackend(ModelBackend):
             # Stream completed normally without an explicit result message.
             if not _done_emitted:
                 _done_emitted = True
+                _usage = _turn_usage.finish({}, _new_agent_sid, bool(agent_session_id))
                 emit("done", **(_usage and {"usage": _usage} or {}))
 
         except Exception as e:

@@ -1,6 +1,7 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { api, getCurrentUserProfile } from '../api';
 import { AppModalPortal } from './AppModalPortal';
+import { CallDetailViewer } from './CallDetailViewer';
 import { directionalTokens, tokenCount as count, tokenTrendStats } from '../utils/tokenUsageTrend';
 
 interface UsageEvent {
@@ -44,6 +45,7 @@ export interface TokenUsageSummary {
   contextEvents: ContextEvent[];
   contextEventCount?: number;
   latestContext?: UsageEvent | null;
+  captureEnabled?: boolean;
 }
 
 interface TokenMonitorPreference {
@@ -86,6 +88,7 @@ function normalizeSummary(value: any): TokenUsageSummary {
     contextEventCount: count(value.contextEventCount),
     latestContext: value.latestContext && typeof value.latestContext === 'object'
       ? value.latestContext : null,
+    captureEnabled: value.captureEnabled === true,
   };
 }
 
@@ -138,7 +141,7 @@ function callLabel(event?: UsageEvent): string {
   return event.source === 'loop' ? `LOOP · ${stage}` : stage;
 }
 
-const UsageLineChart: React.FC<{ events: UsageEvent[] }> = ({ events }) => {
+const UsageLineChart: React.FC<{ events: UsageEvent[]; sessionId: string; detailRevision: number }> = ({ events, sessionId, detailRevision }) => {
   const [view, setView] = useState<'both' | 'input' | 'output'>('both');
   const [selectedKey, setSelectedKey] = useState('');
   const [width, setWidth] = useState(760);
@@ -240,7 +243,7 @@ const UsageLineChart: React.FC<{ events: UsageEvent[] }> = ({ events }) => {
       <div style={lineLegendStyle}>
         <span><i style={{ ...legendPointStyle, background: 'var(--theme-text-muted)' }} />实心点：Backend 实报</span>
         <span><i style={{ ...legendPointStyle, background: 'transparent', border: '2px dashed var(--theme-text-muted)' }} />空心点：文本估算</span>
-        <span>横轴数字 = 最近第几次模型调用</span>
+        <span>横轴数字 = 调用记录；一笔 Agent 任务可能含多个模型请求</span>
       </div>
       <div style={callDetailStyle}>
         <label style={callPickerStyle}>调用明细
@@ -259,6 +262,7 @@ const UsageLineChart: React.FC<{ events: UsageEvent[] }> = ({ events }) => {
           <span>合计 {exactTokens(directionalTokens(detail, 'total'))}</span>
         </div>
       </div>
+      {detail?.id && <CallDetailViewer key={`${sessionId}:${detail.id}:${detailRevision}`} sessionId={sessionId} eventId={detail.id} />}
     </div>
   );
 };
@@ -270,18 +274,27 @@ export const TokenUsageMonitor: React.FC<{
   const [summary, setSummary] = useState<TokenUsageSummary>(EMPTY);
   const [open, setOpen] = useState(false);
   const [preference, setPreference] = useState<TokenMonitorPreference>(() => loadPreference());
+  const [captureBusy, setCaptureBusy] = useState(false);
+  const [captureError, setCaptureError] = useState('');
+  const [detailRevision, setDetailRevision] = useState(0);
+  const sessionRef = useRef(sessionId);
+  sessionRef.current = sessionId;
   const rootRef = useRef<HTMLDivElement>(null);
   const panelRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     let cancelled = false;
+    let pushReceived = false;
     setSummary(EMPTY);
+    setCaptureBusy(false);
+    setCaptureError('');
     void api.getSessionTokenUsage(sessionId).then((value) => {
-      if (!cancelled) setSummary(normalizeSummary(value));
-    });
+      if (!cancelled && !pushReceived) setSummary(normalizeSummary(value));
+    }).catch(() => { /* Keep the next authoritative push available. */ });
     const unsubscribe = api.onSessionUpdated((event: any) => {
       if (event?.sessionId !== sessionId) return;
       if (event.tokenUsage) {
+        pushReceived = true;
         setSummary(normalizeSummary(event.tokenUsage));
       } else if (event.type === 'session_compacted' || event.type === 'context_cleared') {
         void api.getSessionTokenUsage(sessionId).then((value) => {
@@ -340,6 +353,31 @@ export const TokenUsageMonitor: React.FC<{
     const next = { ...preference, ...patch };
     setPreference(next);
     savePreference(next);
+  };
+
+  const updateCapture = async (enabled: boolean) => {
+    setCaptureBusy(true); setCaptureError('');
+    try {
+      const value = await api.setSessionCallCapture(sessionId, enabled);
+      if (sessionRef.current === sessionId) setSummary(normalizeSummary(value));
+    } catch (error) {
+      if (sessionRef.current === sessionId) setCaptureError(String(error));
+    } finally {
+      if (sessionRef.current === sessionId) setCaptureBusy(false);
+    }
+  };
+
+  const clearDetails = async () => {
+    if (!window.confirm('清除此 Session 已保存的调用输入/输出？不影响聊天记录和 Token 统计；正在采集的旧调用也不会重新写回。')) return;
+    setCaptureBusy(true); setCaptureError('');
+    try {
+      await api.clearSessionCallDetails(sessionId);
+      if (sessionRef.current === sessionId) setDetailRevision(value => value + 1);
+    } catch (error) {
+      if (sessionRef.current === sessionId) setCaptureError(String(error));
+    } finally {
+      if (sessionRef.current === sessionId) setCaptureBusy(false);
+    }
   };
 
   return (
@@ -442,7 +480,7 @@ export const TokenUsageMonitor: React.FC<{
               <div aria-label="累计输入统计" style={{ ...metricStyle, color: INPUT_COLOR }} title={exactTokens(summary.inputTokens)}><span>累计输入</span><strong style={directionValueStyle}>{formatTokens(summary.inputTokens)}</strong><span>Token · 发给模型</span></div>
               <div aria-label="累计输出统计" style={{ ...metricStyle, color: OUTPUT_COLOR }} title={exactTokens(summary.outputTokens)}><span>累计输出</span><strong style={directionValueStyle}>{formatTokens(summary.outputTokens)}</strong><span>Token · 模型生成</span></div>
             </div>
-            <div style={finePrintStyle}>共 {summary.turnCount} 次记录 · {summary.actualTurns} 次实报 / {summary.estimatedTurns} 次估算。缓存输入、推理输出为细分项，不重复计入总量。</div>
+            <div style={finePrintStyle}>共 {summary.turnCount} 次记录 · {summary.actualTurns} 次实报 / {summary.estimatedTurns} 次估算。缓存输入、推理输出为细分项，不重复计入总量。新版 Qwen 主账优先统计本轮回复上报值；累计差分及未归因差额在单笔明细中独立列出，不额外相加。旧版历史账目不会自动重算。</div>
           </section>
           </div>
 
@@ -467,12 +505,23 @@ export const TokenUsageMonitor: React.FC<{
                 <span title={exactTokens(totalStats[key])}>{key === 'peak' ? '单次合计峰值' : '合计'} {formatTokens(totalStats[key])} Token</span>
               </div>)}
             </div>
-            <UsageLineChart events={summary.events} />
+            <UsageLineChart events={summary.events} sessionId={sessionId} detailRevision={detailRevision} />
             <div style={finePrintStyle}>
               折线展示最近最多 16 次模型调用的连续变化，纵轴是单次调用消耗的 Token。
               输入和输出分别统计，峰值可能来自不同调用；选择“只看输出”可放大输出趋势。
-              当前 {summary.actualTurns}/{summary.turnCount} 次为精确数据（{exactPercent}%）。
+              当前 {summary.actualTurns}/{summary.turnCount} 次来自 Backend 上报（{exactPercent}%），并非供应商账单核验。
             </div>
+          </section>
+
+          <section style={sectionStyle}>
+            <div style={sectionHeadingStyle}><span>调用输入 / 输出留存</span></div>
+            <label style={checkboxLabelStyle}><input type="checkbox" checked={summary.captureEnabled === true}
+              disabled={captureBusy} onChange={event => void updateCapture(event.target.checked)} />
+              记录本 Session 后续调用的输入 / 输出
+            </label>
+            <div style={finePrintStyle}>默认关闭。开启后在执行端保存脱敏文本，可能仍含项目内容；不保存认证头、环境变量或二进制附件。最近最多 24 笔 / 20 MiB，每笔文本上限 80 万字符；截断会明确标注。俺寻思临时预览正文不记录。关闭不删除已有记录。</div>
+            <button type="button" style={closeStyle} disabled={captureBusy} onClick={() => void clearDetails()}>清除已保存明细</button>
+            {captureError && <div role="alert">{captureError}</div>}
           </section>
 
           <section style={sectionStyle}>

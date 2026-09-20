@@ -20,6 +20,8 @@ import { filterGitMetadata } from './utils/dirSyncPolicy';
 import { SessionRoutingCache, isSessionMetaReady } from './utils/sessionRouting';
 import { rankFileSearchPaths } from './utils/fileSearch';
 import { mergeExecutorSessionBatches, selectExactExecutor } from './utils/executorSessions';
+import { executeWorkspaceRequest, type WorkspaceToolRequest, type WorkspaceNode } from './utils/workspaceTools';
+import { inputHistoryKey, inputHistoryStore } from './utils/inputHistory';
 
 type StreamDeltaCallback = (delta: any) => void;
 type SessionUpdateCallback = (data: any) => void;
@@ -867,6 +869,11 @@ function handleMessage(e: MessageEvent, source?: Conn) {
   if (typeof e.data !== 'string') return;
   try {
     const msg = JSON.parse(e.data);
+    // 点对点工具回调不是广播；不能被 local/Relay 别名去重吞掉。
+    if (msg.event === 'workspaceToolRequest' && source) {
+      void handleWorkspaceToolRequest(msg.data, source);
+      return;
+    }
     // 同一 sidecar 同时经 local 与 Relay 接入时，RPC 响应仍由各自连接处理，
     // 但 Relay 别名上的广播事件必须丢弃，否则 stream/session 更新会触发两遍。
     if (msg.event && source && isLocalRelayDuplicate(source)
@@ -884,6 +891,9 @@ function handleMessage(e: MessageEvent, source?: Conn) {
       }
     } else if (msg.event === 'streamDelta') {
       const delta = JSON.parse(msg.data);
+      if (delta.type === 'done' && workspaceControllers.get(delta.sessionId)?.conn === source) {
+        workspaceControllers.delete(delta.sessionId);
+      }
       streamCallbacks.forEach((cb) => cb(delta));
     } else if (msg.event === 'sessionUpdated') {
       const parsed = JSON.parse(msg.data);
@@ -903,6 +913,7 @@ function handleMessage(e: MessageEvent, source?: Conn) {
       else if (sessionId && data.summary) sessionRoutingCache.update(sessionId, data.summary);
       if (source && sessionId) {
         if (data.type === 'session_deleted') {
+          inputHistoryStore.remove(inputHistoryKey(getCurrentUserProfile(), source.key, sessionId));
           sessionExec.delete(sessionId);
           persistSessionExec();
         } else if (sessionExec.get(sessionId) !== source.key) {
@@ -1290,6 +1301,79 @@ class Conn {
 const pool = new Map<string, Conn>();
 let homeConn!: Conn;  // initPool() 在模块加载时立即赋值
 const sessionExec = new Map<string, string>();   // sessionId → conn.key
+const workspaceControllers = new Map<string, { conn: Conn; socket: WebSocket | null; epoch: number }>();
+const workspaceDiscoveredTargets = new Map<string, ExecTarget>();
+
+async function handleWorkspaceToolRequest(data: WorkspaceToolRequest, source: Conn): Promise<void> {
+  const controller = workspaceControllers.get(data?.sessionId);
+  const assertCurrent = () => {
+    if (!controller || controller.conn !== source || controller.socket !== source.ws
+        || controller.epoch !== relayIdentityEpoch || !source.isOpen) {
+      throw new Error('发起本轮聊天的控制窗口或身份已变化，请重新发送后查询原 requestId');
+    }
+  };
+  let result: Record<string, any>;
+  try {
+    assertCurrent();
+    result = await executeWorkspaceRequest(data, {
+      assertCurrent,
+      nodes: async (discover) => {
+        if (discover) {
+          workspaceDiscoveredTargets.clear();
+          const target = connectionTarget;
+          if (target.mode === 'relay') {
+            const inspected = await inspectRelay(target.url, target.token);
+            assertCurrent();
+            if (target.user?.userId && inspected.profile?.userId !== target.user.userId) throw new Error('Relay 用户身份发生变化');
+            for (const device of inspected.devices) {
+              const candidate: ExecTarget = { ...target, user: inspected.profile, deviceId: device.id, deviceName: device.name };
+              workspaceDiscoveredTargets.set(execTargetKey(candidate), candidate);
+            }
+          }
+        }
+        const nodes = new Map<string, WorkspaceNode>();
+        for (const executor of getExecutors()) nodes.set(executor.key, {
+          id: executor.key, name: executor.label, connected: executor.connected,
+          online: executor.connected, isCurrent: executor.key === source.key || (executor.key === 'local' && isLocalRelayDuplicate(source)), isDefault: executor.isHome,
+          canCreate: executor.key !== 'local' || isLocalAgentExecutionEnabled(),
+        });
+        for (const [key, target] of workspaceDiscoveredTargets) if (!nodes.has(key)) nodes.set(key, {
+          id: key, name: execLabelOf(target), connected: false, online: true, isCurrent: key === source.key,
+          isDefault: key === getHomeExecKey(), canCreate: true,
+        });
+        return [...nodes.values()];
+      },
+      request: async (node, method, params) => {
+        assertCurrent();
+        if (!pool.has(node)) {
+          const target = workspaceDiscoveredTargets.get(node);
+          if (!target) throw new Error('目标节点不在当前用户可访问列表中');
+          ensureConn(target, false); // 按需连接；不修改用户默认节点或持久 roster。
+        }
+        const response = await callOnStrict(node, method, params, 35000);
+        assertCurrent();
+        return response;
+      },
+    });
+    // 发现/预览不改常用节点；确认成功后的落点需记住，否则重开窗口会丢失该 Session 的入口。
+    if (result.status === 'succeeded' && result.receipt?.session?.id) {
+      assertCurrent();
+      const target = pool.get(result.node?.id)?.target;
+      if (target?.mode === 'relay') addExecRoster(target);
+    }
+  } catch (error) {
+    result = { status: 'unavailable', message: error instanceof Error ? error.message : '应用操作失败' };
+  }
+  // 回复只走原 WebSocket；身份切换/重连后不得将旧结果送给新连接。
+  if (controller && controller.socket === source.ws && controller.epoch === relayIdentityEpoch && source.isOpen) {
+    await source.request('workspaceToolReply', [data.id, JSON.stringify(result)], 5000).catch(() => {});
+  }
+}
+
+/** 只读已知的 Session 归属；未知时不猜测 home，供管理面板初始化目标。 */
+export function getSessionExecKey(sessionId?: string | null): string | undefined {
+  return sessionId ? sessionExec.get(sessionId) : undefined;
+}
 let execStatusCallbacks: (() => void)[] = [];
 
 function notifyExecStatus(): void { execStatusCallbacks.forEach((cb) => cb()); }
@@ -1415,6 +1499,8 @@ function clearRelaySessionCaches(): void {
 
 /** 身份切换是安全边界：旧用户的全部连接、路由与离线 Session 缓存都丢弃。 */
 function clearRelayIdentityState(): void {
+  workspaceControllers.clear();
+  workspaceDiscoveredTargets.clear();
   sessionRoutingCache.clear();
   relayIdentityEpoch += 1;
   listSessionsInFlight = null;
@@ -2071,7 +2157,33 @@ export const api = {
   },
 
   async sendMessage(payload: any): Promise<void> {
-    await send('sendMessage', JSON.stringify(payload));
+    const conn = routeConn('sendMessage', [JSON.stringify(payload)]);
+    await conn.ready;
+    workspaceControllers.set(payload.sessionId, { conn, socket: conn.ws, epoch: relayIdentityEpoch });
+    // 只发送协议版本，不传节点凭据/历史/目录列表；真正使用时才按需发现。
+    await send('sendMessage', JSON.stringify({ ...payload, workspaceToolsVersion: 1 }));
+  },
+
+  async resolveWorkspaceSession(execKey: string, sessionId: string): Promise<any> {
+    const epoch = relayIdentityEpoch;
+    if (!pool.has(execKey) && connectionTarget.mode === 'relay') {
+      const target = connectionTarget;
+      const inventory = await inspectRelay(target.url, target.token);
+      if (epoch !== relayIdentityEpoch) throw new Error('用户已切换');
+      for (const device of inventory.devices) {
+        const candidate: ExecTarget = { ...target, user: inventory.profile, deviceId: device.id, deviceName: device.name };
+        if (execTargetKey(candidate) === execKey) ensureConn(candidate, false);
+      }
+    }
+    const raw = await callOnStrict(execKey, 'loadSessionMeta', [sessionId], 15000);
+    if (epoch !== relayIdentityEpoch) throw new Error('用户已切换');
+    const session = typeof raw === 'string' ? JSON.parse(raw) : raw;
+    if (!session?.id) throw new Error('Session 不可用或无访问权限');
+    sessionExec.set(session.id, execKey);
+    persistSessionExec();
+    const conn = connByKey(execKey);
+    sessionRoutingCache.update(session.id, { ...session, execKey, execLabel: conn.label, execMode: conn.target.mode, execIsHome: isEffectiveHome(conn) });
+    return session;
   },
 
   async abortMessage(sessionId: string): Promise<void> {
@@ -2368,7 +2480,10 @@ export const api = {
   },
 
   async deleteSession(id: string): Promise<boolean> {
-    return await call('deleteSession', id);
+    const historyKey = inputHistoryKey(getCurrentUserProfile(), getSessionExecKey(id), id);
+    const deleted = await call('deleteSession', id);
+    if (deleted) inputHistoryStore.remove(historyKey);
+    return deleted;
   },
 
   async destroySession(id: string, confirmation: 'DESTROY'): Promise<{
@@ -2458,6 +2573,20 @@ export const api = {
     const result = await call('getSessionTokenUsage', id);
     if (result === null || result === undefined) return null;
     try { return JSON.parse(result); } catch { return null; }
+  },
+
+  async getSessionCallDetail(id: string, eventId: string): Promise<any> {
+    const result = await callOnStrict(routeConn('getSessionCallDetail', [id]).key, 'getSessionCallDetail', [id, eventId], 15000);
+    return typeof result === 'string' ? JSON.parse(result) : result;
+  },
+
+  async setSessionCallCapture(id: string, enabled: boolean): Promise<any> {
+    const result = await callOnStrict(routeConn('setSessionCallCapture', [id]).key, 'setSessionCallCapture', [id, enabled], 15000);
+    return typeof result === 'string' ? JSON.parse(result) : result;
+  },
+
+  async clearSessionCallDetails(id: string): Promise<void> {
+    await callOnStrict(routeConn('clearSessionCallDetails', [id]).key, 'clearSessionCallDetails', [id], 15000);
   },
 
   /** 获取 Session 所属执行端的 Backend，而不是客户端当前 home 节点的 Backend。 */
@@ -2576,12 +2705,10 @@ export const api = {
     execKey?: string,
     codexRemote: { mode?: 'node'; threadId?: string; title?: string } = {},
   ): Promise<any> {
-    const conn = (execKey && pool.get(execKey))
-      || pool.get(getHomeExecKey())
-      || homeConn;
-    const result = await conn.request('createSession', [
+    const conn = connByKey(execKey || getHomeExecKey());
+    const result = await callOnStrict(conn.key, 'createSession', [
       workingDir, backendId, sessionType, JSON.stringify(runtime || {}), JSON.stringify(codexRemote || {}),
-    ]);
+    ], 60000);
     try {
       const s = JSON.parse(result);
       if (s && s.id) {
@@ -3722,7 +3849,7 @@ export const api = {
     try { return JSON.parse(result); } catch { return { status: 'error', message: '响应格式错误' }; }
   },
 
-  async updateSessionAbilities(sessionId: string, abilities: { skills: string[]; prompts: string[]; constraints?: string; kitToolsMode?: 'auto' | 'on' | 'off' }, execKey?: string): Promise<{ status: string; message?: string }> {
+  async updateSessionAbilities(sessionId: string, abilities: { skills: string[]; prompts: string[]; constraints?: string; kitToolsMode?: 'auto' | 'on' | 'off'; workspaceToolsMode?: 'on' | 'off' }, execKey?: string): Promise<{ status: string; message?: string }> {
     try {
       const key = execKey ?? routeConn('updateSessionAbilities', [sessionId]).key;
       const result = await callOnStrict(key, 'updateSessionAbilities', [sessionId, JSON.stringify(abilities)], 15000);
@@ -3940,8 +4067,11 @@ export const api = {
     try { return result ? JSON.parse(result) : []; } catch { return []; }
   },
 
-  async grantPermission(sessionId: string, granted: boolean, skipRest: boolean = false): Promise<void> {
-    await send('grantPermission', sessionId, granted, skipRest);
+  async grantPermission(sessionId: string, granted: boolean, skipRest: boolean = false, requestId?: string): Promise<void> {
+    const params: any[] = [sessionId, granted, skipRest];
+    if (requestId) params.push(requestId);
+    if (requestId) await callOnStrict(routeConn('grantPermission', params).key, 'grantPermission', params, 15000);
+    else await send('grantPermission', ...params);
   },
 
   onPermissionRequest(callback: PermissionRequestCallback): () => void {

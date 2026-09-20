@@ -146,6 +146,8 @@ class OpenAICompatibleBackend(ModelBackend):
                              "model": req_json["model"],
                              "maxAttempts": _MAX_RETRIES + 1,
                              "requestBytes": len(json.dumps(req_json, ensure_ascii=False).encode("utf-8"))})
+                        from .call_trace import trace_request, trace_response
+                        trace_request("openai-http-body", req_json, "实际提交给 HTTP 客户端的 JSON 请求体，认证头未保存。")
                         async with httpx.AsyncClient(timeout=120.0) as client:
                             async with client.stream(
                                 "POST",
@@ -174,6 +176,7 @@ class OpenAICompatibleBackend(ModelBackend):
                                         break
                                     try:
                                         parsed = json.loads(data)
+                                        trace_response("openai-sse", parsed, "供应商 SSE data JSON（脱敏）。")
                                         choice = parsed.get("choices", [{}])[0]
                                         delta = choice.get("delta", {})
                                         if delta.get("reasoning_content"):

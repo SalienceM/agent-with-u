@@ -58,6 +58,9 @@ export interface ContentBlock {
 }
 
 export interface PermissionRequest {
+  resolved?: boolean;
+  allowSkip?: boolean;
+  requestId?: string;
   sessionId: string;
   messageId: string;
   tools: ToolCall[];
@@ -577,7 +580,9 @@ export function useChat(
   useEffect(() => {
     return api.onPermissionRequest((data: PermissionRequest) => {
       if (data.sessionId !== sessionId) return;
-      setPendingPermission(data);
+      if (data.resolved) {
+        setPendingPermission(previous => previous?.requestId === data.requestId ? null : previous);
+      } else setPendingPermission(data);
     });
   }, [sessionId]);
 

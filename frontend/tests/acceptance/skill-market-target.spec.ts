@@ -15,8 +15,8 @@ const profile = { userId: 'target-test', username: 'target-test', displayName: '
 const target = (deviceId: string) => ({ mode: 'relay', url: 'ws://127.0.0.1:45421/market-target-qa',
   token: 'qa-fixture-not-a-credential', deviceId, deviceName: `工作站 ${deviceId}`, user: profile });
 
-async function openMarket(page: Page) {
-  await page.goto('/');
+async function openMarket(page: Page, navigate = true) {
+  if (navigate) await page.goto('/');
   const opener = page.getByRole('button', { name: '打开会话列表', exact: true });
   if (await opener.isVisible()) await opener.click();
   await page.getByRole('navigation', { name: '功能栏' }).getByRole('button', { name: '扩展', exact: true }).click();
@@ -130,8 +130,8 @@ test('remote install and environment inspection use the displayed node, never th
   expect(installs).toEqual(['A']);
   expect(inspections).toEqual(['A']);
 
-  // A different default affects the market only after resetting its catalog/review.
-  // The already-open preparation dialog must retain the actual installation node.
+  // Changing the global default must not move the independently selected market
+  // target or the already-open preparation dialog.
   await page.evaluate(async value => {
     const modulePath = '/src/api.ts';
     const { setConnectionTarget } = await import(modulePath);
@@ -140,6 +140,10 @@ test('remote install and environment inspection use the displayed node, never th
   await expect(runtime.getByRole('combobox', { name: '运行准备节点' })).toHaveValue('relay:target-test:A');
   await expect(runtime).toContainText('A-host');
   await runtime.getByRole('button', { name: '关闭运行准备' }).click();
+  await expect(installLocation).toContainText('/data/A/skill-library');
+  const picker = market.getByRole('combobox', { name: 'Skill 安装节点' });
+  await expect(picker).toHaveValue('relay:target-test:A');
+  await picker.selectOption('relay:target-test:B');
   await expect(installLocation).toContainText('/data/B/skill-library');
   await expect(market.getByRole('checkbox')).not.toBeChecked();
   await expect(market.getByRole('button', { name: '安装到 Skill 库', exact: true })).toBeDisabled();
@@ -150,4 +154,193 @@ test('remote install and environment inspection use the displayed node, never th
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1)).toBe(true);
   await installLocation.scrollIntoViewIfNeeded();
   await page.screenshot({ path: testInfo.outputPath('market-remote-install-location.png'), fullPage: true });
+});
+
+test('node selection isolates delayed catalog/location/backend replies, review and offline state', async ({ page }, testInfo) => {
+  await page.addInitScript(value => {
+    localStorage.setItem('awu.connectionTarget', JSON.stringify(value.home));
+    localStorage.setItem('awu.execRoster', JSON.stringify([value.other]));
+  }, { home: target('A'), other: target('B') });
+  const delayed: Array<() => void> = [];
+  const installReplies: Array<() => void> = [];
+  const installs: string[] = [];
+  let holdB = true;
+  await page.routeWebSocket(/.*/, socket => {
+    const server = socket.connectToServer();
+    let node = 'direct-server';
+    socket.onMessage(message => {
+      const frame = JSON.parse(String(message));
+      const reply = (value: unknown) => socket.send(JSON.stringify({ id: frame.id, result: JSON.stringify(value) }));
+      if (frame.t === 'hello') { node = frame.deviceId; socket.send(JSON.stringify({ t: 'ready' })); return; }
+      if (frame.method === 'listSessions') return reply([]);
+      if (['skillMarketLocation', 'skillMarketList', 'getBackends'].includes(frame.method)) {
+        const result = frame.method === 'skillMarketLocation' ? location(node)
+          : frame.method === 'getBackends' ? [{ id: node, type: 'openai-compatible', label: `Backend ${node}` }]
+            : { ...catalog, items: [{ ...item, name: `Skill ${node}`, installed: node === 'B', sameSource: node === 'B' }] };
+        if (node === 'B' && holdB) delayed.push(() => reply(result));
+        else reply(result);
+        return;
+      }
+      if (frame.method === 'skillMarketInstall') {
+        installs.push(node); installReplies.push(() => reply({ status: 'ok', skill: { name: item.name } })); return;
+      }
+      server.send(message);
+    });
+  });
+  const market = await openMarket(page);
+  const picker = market.getByRole('combobox', { name: 'Skill 安装节点' });
+  const position = market.getByRole('region', { name: 'Skill 安装位置' });
+  await expect(position).toContainText('/data/A/skill-library');
+  await market.getByRole('checkbox').check();
+  await expect(market.getByRole('button', { name: '安装到 Skill 库', exact: true })).toBeEnabled();
+  await picker.selectOption('relay:target-test:B');
+  await expect(position).not.toContainText('/data/A/skill-library');
+  await expect(market.getByRole('heading', { name: 'Skill A', exact: true })).toHaveCount(0);
+  await expect.poll(() => delayed.length).toBeGreaterThanOrEqual(3);
+  await picker.selectOption('relay:target-test:A');
+  holdB = false;
+  delayed.splice(0).forEach(release => release());
+  await expect(position).toContainText('/data/A/skill-library');
+  await expect(market.getByRole('heading', { name: 'Skill A', exact: true })).toBeVisible();
+  await expect(market.getByRole('combobox', { name: 'AI 解读 Backend' })).toHaveValue('A');
+  await expect(market.getByRole('checkbox')).not.toBeChecked();
+  await picker.selectOption('relay:target-test:B');
+  await expect(position).toContainText('/data/B/skill-library');
+  await expect(market.getByRole('button', { name: '已是当前版本', exact: true })).toBeDisabled();
+  // Removing B from the pool simulates an unavailable selected target; never use A instead.
+  await page.evaluate(async () => {
+    const modulePath = '/src/api.ts';
+    const { removeExecRoster } = await import(modulePath);
+    removeExecRoster('relay:target-test:B');
+  });
+  await expect(picker).toHaveValue('relay:target-test:B');
+  await expect(position.getByText('离线', { exact: true })).toBeVisible();
+  await market.getByRole('checkbox').check();
+  await expect(market.getByRole('button', { name: '已是当前版本', exact: true })).toBeDisabled();
+  expect(installs).toEqual([]);
+  await picker.scrollIntoViewIfNeeded();
+  await page.screenshot({ path: testInfo.outputPath('market-node-picker-offline.png'), fullPage: true });
+  // Selecting a different available node explicitly must route the real install there,
+  // without modifying home. A pending single install also locks the picker.
+  await picker.selectOption('local');
+  await expect(position).toContainText('/data/direct-server/skill-library');
+  await market.getByRole('checkbox').check();
+  await market.getByRole('button', { name: '安装到 Skill 库', exact: true }).click();
+  await expect(picker).toBeDisabled();
+  await expect.poll(() => installReplies.length).toBe(1);
+  installReplies.splice(0).forEach(reply => reply());
+  await expect(picker).toBeEnabled();
+  expect(installs).toEqual(['direct-server']);
+  expect(await page.evaluate(() => JSON.parse(localStorage.getItem('awu.connectionTarget')!).deviceId)).toBe('A');
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1)).toBe(true);
+});
+
+test('batch keeps its reviewed node across default changes and hidden progress, then unlocks selection', async ({ page }) => {
+  await page.addInitScript(value => {
+    localStorage.setItem('awu.connectionTarget', JSON.stringify(value.home));
+    localStorage.setItem('awu.execRoster', JSON.stringify([value.other]));
+  }, { home: target('A'), other: target('B') });
+  const submissions: string[] = [];
+  const polls: string[] = [];
+  let complete = false;
+  await page.routeWebSocket(/.*/, socket => {
+    const server = socket.connectToServer();
+    let node = 'direct-server';
+    socket.onMessage(message => {
+      const frame = JSON.parse(String(message));
+      const reply = (value: unknown) => socket.send(JSON.stringify({ id: frame.id, result: JSON.stringify(value) }));
+      if (frame.t === 'hello') { node = frame.deviceId; socket.send(JSON.stringify({ t: 'ready' })); return; }
+      if (['listSessions', 'getBackends'].includes(frame.method)) return reply([]);
+      if (frame.method === 'skillMarketLocation') return reply(location(node));
+      if (frame.method === 'skillMarketList') return reply(catalog);
+      if (frame.method === 'skillMarketInstallBatch') {
+        submissions.push(node); return reply({ status: 'ok', state: 'running', jobId: 'batch-A' });
+      }
+      if (frame.method === 'skillMarketJobGet') {
+        polls.push(node);
+        return reply(complete ? { status: 'ok', state: 'done', result: { status: 'ok', batch: { items: [{ ...item, status: 'installed' }] } } }
+          : { status: 'ok', state: 'running', jobId: 'batch-A' });
+      }
+      server.send(message);
+    });
+  });
+  const market = await openMarket(page);
+  const picker = market.getByRole('combobox', { name: 'Skill 安装节点' });
+  await market.getByRole('button', { name: '安装此仓库全部（1）', exact: true }).click();
+  const dialog = page.getByRole('dialog', { name: '安装仓库全部 Skill', exact: true });
+  await expect(dialog).toContainText('/data/A/skill-library');
+  await expect(picker).toBeDisabled();
+  await dialog.getByRole('checkbox', { name: /我已核对/ }).check();
+  await dialog.getByRole('button', { name: '确认安装全部', exact: true }).click();
+  await expect.poll(() => submissions).toEqual(['A']);
+  await dialog.getByRole('button', { name: '关闭批量安装', exact: true }).click();
+  await page.evaluate(async value => {
+    const modulePath = '/src/api.ts';
+    const { setConnectionTarget } = await import(modulePath);
+    await setConnectionTarget(value);
+  }, target('B'));
+  await expect(picker).toHaveValue('relay:target-test:A');
+  await expect(picker).toBeDisabled();
+  complete = true;
+  await market.getByRole('button', { name: '查看安装批次', exact: true }).click();
+  await expect(dialog.getByRole('status')).toContainText('成功 1');
+  expect(polls.length).toBeGreaterThan(0);
+  expect(new Set(polls)).toEqual(new Set(['A']));
+  await dialog.getByRole('button', { name: '完成查看，返回市场', exact: true }).click();
+  await expect(picker).toBeEnabled();
+  await picker.selectOption('relay:target-test:B');
+  await expect(market.getByRole('region', { name: 'Skill 安装位置' })).toContainText('/data/B/skill-library');
+  expect(submissions).toEqual(['A']);
+});
+
+test('a newly opened market starts on the focused Session node and preserves a manual choice across tabs', async ({ page }, testInfo) => {
+  await page.addInitScript(value => {
+    localStorage.setItem('awu.connectionTarget', JSON.stringify(value.home));
+    localStorage.setItem('awu.execRoster', JSON.stringify([value.other]));
+  }, { home: target('A'), other: target('B') });
+  const session = { id: 'market-session-B', title: '市场节点默认值 QA', messageCount: 0, updatedAt: 1,
+    workingDir: '/project-on-B', backendId: 'qa-backend', sessionType: 'normal', abilities: { skills: [], prompts: [] } };
+  const reads: string[] = [];
+  const forbidden: string[] = [];
+  await page.routeWebSocket(/.*/, socket => {
+    const server = socket.connectToServer();
+    let node = 'direct-server';
+    socket.onMessage(message => {
+      const frame = JSON.parse(String(message));
+      const reply = (value: unknown) => socket.send(JSON.stringify({ id: frame.id, result: JSON.stringify(value) }));
+      if (frame.t === 'hello') { node = frame.deviceId; socket.send(JSON.stringify({ t: 'ready' })); return; }
+      if (frame.method === 'listSessions') return reply(node === 'B' ? [session] : []);
+      if (frame.method === 'getBackends') return reply([]);
+      if (frame.method === 'loadSessionMeta') return reply(session);
+      if (frame.method === 'loadSession') return reply({ ...session, messages: [] });
+      if (frame.method === 'skillMarketLocation') return reply(location(node));
+      if (frame.method === 'skillMarketList') { reads.push(node); return reply(catalog); }
+      if (['skillMarketInstall', 'skillMarketInstallBatch', 'skillRuntimePrepare', 'sendMessage'].includes(frame.method)) {
+        forbidden.push(frame.method); return reply({ status: 'error' });
+      }
+      server.send(message);
+    });
+  });
+  await page.goto('/');
+  const sidebarToggle = page.getByRole('button', { name: '打开会话列表', exact: true });
+  if (await sidebarToggle.isVisible()) await sidebarToggle.click();
+  await page.locator('.awu-sidebar').getByText(session.title, { exact: true }).click();
+  const market = await openMarket(page, false);
+  const picker = market.getByRole('combobox', { name: 'Skill 安装节点' });
+  await expect(picker).toHaveValue('relay:target-test:B');
+  await expect(market.getByRole('region', { name: 'Skill 安装位置' })).toContainText('/data/B/skill-library');
+  expect(reads.every(node => node === 'B')).toBe(true);
+  await picker.selectOption('local');
+  await expect(market.getByRole('region', { name: 'Skill 安装位置' })).toContainText('/data/direct-server/skill-library');
+  // Browser "local" means the connected server, not this browser's computer.
+  await expect(picker.locator('option:checked')).toContainText('直连执行节点（服务器）');
+  await page.locator('[id="workbench-tab-session:market-session-B"]').click();
+  await page.getByRole('tab', { name: '扩展市场', exact: true }).click();
+  await expect(picker).toHaveValue('local');
+  expect(await page.evaluate(() => JSON.parse(localStorage.getItem('awu.connectionTarget')!).deviceId)).toBe('A');
+  expect(forbidden).toEqual([]);
+  await picker.scrollIntoViewIfNeeded();
+  expect((await picker.boundingBox())!.width).toBeGreaterThan(90);
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1)).toBe(true);
+  await page.screenshot({ path: testInfo.outputPath('market-node-picker.png'), fullPage: true });
 });

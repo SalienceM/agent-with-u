@@ -25,7 +25,7 @@ import threading
 import time
 from dataclasses import replace
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 import websockets
 import websockets.exceptions
@@ -62,6 +62,7 @@ from .skill_market_explain import SkillMarketExplainer, EXPLANATION_BACKENDS
 from .skill_runtime import SkillRuntime
 from .chat_kits import ChatKitTools, TOOL as CHAT_KIT_TOOL, TOOL_NAME as CHAT_KIT_TOOL_NAME
 from .chat_kits import kit_prompt_mode, kit_prompt_enabled, KIT_PROMPT_MODES
+from .workspace_tools import ChatWorkspaceTools, WorkspaceOperations, TOOL as WORKSPACE_TOOL, TOOL_NAME as WORKSPACE_TOOL_NAME
 from .skill_commands import command_catalog, resolve_skill_call, SkillCommandError
 from .skill_manuals import skill_references
 from .skill_paths import project_skill_reference, project_skill_root, render_skill_markdown
@@ -123,6 +124,7 @@ _REQUEST_IDENTITY_SOURCE: ContextVar[str] = ContextVar(
 _REQUEST_CAN_CLAIM_LEGACY: ContextVar[bool] = ContextVar(
     "agentwithu_request_can_claim_legacy", default=False,
 )
+_REQUEST_CLIENT: ContextVar[Any] = ContextVar("agentwithu_request_client", default=None)
 
 # LOOP 的流式正文无需反复写整份 stage 文件，但切换会话后必须可以恢复。
 # 每个当前子阶段只保留尾部，既能回放正在执行的步骤，也避免长任务无限占内存。
@@ -1284,6 +1286,24 @@ class BridgeWS:
 
         parsed = urlparse(path)
 
+        if parsed.path == "/api/chat-workspace":
+            if not self._is_loopback(peer_ip):
+                return 403, "Application tools are executor-local only"
+            if method != "POST":
+                return 405, "POST required"
+            if len(body) > 2 * 1024 * 1024:
+                return 413, "Request too large"
+            try:
+                payload = json.loads(body.decode("utf-8"))
+                if not isinstance(payload, dict) or not isinstance(payload.get("token"), str):
+                    return 400, "Invalid request"
+            except (ValueError, UnicodeError):
+                return 400, "Invalid JSON"
+            service = getattr(self, "_chat_workspace_tools", None)
+            if service is None or payload["token"] not in service.leases:
+                return 403, "Application tool lease expired"
+            return 200, json.dumps(await service.call(payload["token"], payload.get("arguments")), ensure_ascii=False)
+
         if parsed.path == "/api/chat-kits":
             if not self._is_loopback(peer_ip):
                 return 403, "Forbidden: chat Kit tools are local-only"
@@ -1934,6 +1954,7 @@ class BridgeWS:
                         self._owner_id_for_client(websocket)
                     )
                     source_token = _REQUEST_IDENTITY_SOURCE.set(str(ident_src or "none"))
+                    client_token = _REQUEST_CLIENT.set(websocket)
                     legacy_claim_token = _REQUEST_CAN_CLAIM_LEGACY.set(bool(
                         ident_src == "relay"
                         and getattr(websocket, "can_claim_legacy", False)
@@ -1941,6 +1962,7 @@ class BridgeWS:
                     try:
                         result = await self._dispatch(method, params)
                     finally:
+                        _REQUEST_CLIENT.reset(client_token)
                         _REQUEST_CAN_CLAIM_LEGACY.reset(legacy_claim_token)
                         _REQUEST_IDENTITY_SOURCE.reset(source_token)
                         _REQUEST_OWNER_ID.reset(owner_token)
@@ -1952,6 +1974,9 @@ class BridgeWS:
         except websockets.exceptions.ConnectionClosed:
             pass
         finally:
+            workspace_tools = getattr(self, "_chat_workspace_tools", None)
+            if workspace_tools is not None:
+                workspace_tools.disconnect(websocket)
             self._clients.discard(websocket)
             self._client_meta.pop(websocket, None)
             print(f"[bridge_ws] client disconnected user={ident} (total={len(self._clients)})",
@@ -2047,6 +2072,39 @@ class BridgeWS:
     def _rpc_ping(self) -> str:
         """前端心跳探针，保持 WebSocket 活跃 + 快速检测连接是否存活。"""
         return "pong"
+
+    def _workspace_operations(self) -> WorkspaceOperations:
+        service = getattr(self, "_workspace_operations_service", None)
+        if service is None:
+            service = self._workspace_operations_service = WorkspaceOperations(self)
+        return service
+
+    def _rpc_workspaceToolReply(self, request_id: str, result_json: str) -> bool:
+        service = getattr(self, "_chat_workspace_tools", None)
+        return bool(service and service.respond(_REQUEST_CLIENT.get(), request_id, json.loads(result_json)))
+
+    async def _rpc_workspaceQuery(self, arguments_json: str) -> str:
+        result = await asyncio.to_thread(self._workspace_operations().query, json.loads(arguments_json))
+        return json.dumps(result, ensure_ascii=False)
+
+    async def _rpc_workspacePrepare(self, origin: str, arguments_json: str) -> str:
+        result = await self._workspace_operations().prepare(origin, json.loads(arguments_json))
+        return json.dumps(result, ensure_ascii=False)
+
+    async def _rpc_workspaceOperationStatus(self, origin: str, request_id: str) -> str:
+        result = await asyncio.to_thread(self._workspace_operations().status, origin, request_id)
+        return json.dumps(result, ensure_ascii=False)
+
+    async def _rpc_workspaceCommit(self, origin: str, request_id: str, fingerprint: str) -> str:
+        result = await self._workspace_operations().commit(origin, request_id, fingerprint)
+        receipt = result.get("receipt")
+        if receipt and result.get("status") == "succeeded":
+            info = receipt["session"]
+            session = self._active_sessions.get(info["id"]) or self._session_store.load(info["id"])
+            if session:
+                self._emit_session_updated({"type": "session_created" if receipt["createdSession"] else "session_changed",
+                                            "sessionId": session.id, "summary": session.meta_dict()})
+        return json.dumps(result, ensure_ascii=False)
 
     def _rpc_getAppVersion(self) -> str:
         """返回展示版本；新构建包含日期、时间和 revision，可区分同日多次发布。"""
@@ -4170,6 +4228,37 @@ class BridgeWS:
             })
         return summary
 
+    async def _rpc_getSessionCallDetail(self, sid: str, event_id: str) -> str:
+        """Session ownership is enforced by the common sid RPC gate."""
+        from .call_trace import read_trace
+        session = self._active_sessions.get(sid) or self._session_store.load(sid)
+        if not session:
+            return "null"
+        ledger = ensure_session_ledger(session)
+        event = next((item for item in ledger["events"] if item.get("id") == event_id), None)
+        detail = await asyncio.to_thread(read_trace, sid, str(event_id))
+        return json.dumps({"event": event, "trace": detail,
+                           "message": "" if detail else "此笔没有保留输入/输出：可能产生于功能启用前、记录开关关闭时，或已超过保留上限。不能从聊天记录还原原始请求。"}, ensure_ascii=False)
+
+    def _rpc_setSessionCallCapture(self, sid: str, enabled: bool) -> str:
+        if not isinstance(enabled, bool):
+            raise ValueError("enabled must be boolean")
+        session = self._active_sessions.get(sid) or self._session_store.load(sid)
+        if not session:
+            raise ValueError("Session not found")
+        self._active_sessions[sid] = session
+        ledger = ensure_session_ledger(session)
+        ledger["captureEnabled"] = enabled
+        self._session_store.save(session, async_=True)
+        summary = usage_summary(ledger)
+        self._emit_session_updated({"type": "token_usage_updated", "sessionId": sid, "tokenUsage": summary})
+        return json.dumps(summary, ensure_ascii=False)
+
+    async def _rpc_clearSessionCallDetails(self, sid: str) -> bool:
+        from .call_trace import clear_traces
+        await asyncio.to_thread(clear_traces, sid)
+        return True
+
     def _rpc_getSessionTokenUsage(self, sid: str) -> str:
         """Return lightweight lifetime totals and recent trends without message bodies."""
         session = self._active_sessions.get(sid) or self._session_store.load(sid)
@@ -4731,6 +4820,8 @@ class BridgeWS:
             destroying.discard(session_id)
 
     def _rpc_deleteSession(self, sid: str) -> bool:
+        from .call_trace import clear_traces
+        clear_traces(sid)
         owner_id = self._session_owner_id(sid)
         scheduler = getattr(self, "_sequence_scheduler", None)
         if scheduler is not None:
@@ -5485,6 +5576,9 @@ class BridgeWS:
             backend = self._new_backend_instance(session.backend_id)
         mid = new_id()
         sid_for_backend = indep_session_id or session.id
+        from .call_trace import CallTrace, traced_send
+        call_trace = (CallTrace(session.id, f"loop:{seq}:{sub_stage}:{mid}")
+                      if (getattr(session, "token_usage", None) or {}).get("captureEnabled") and sub_stage != "aside" else None)
         parts: list[str] = []
         call_usage: Optional[dict] = None
         last_activity_at = time.monotonic()
@@ -5588,7 +5682,7 @@ class BridgeWS:
                     inactivityTimeoutSeconds=inactivity_timeout)
                 self._loop_save(self._loop_state(session.id))
             if inactivity_timeout and inactivity_timeout > 0:
-                send_task = asyncio.create_task(backend.send_message(**send_kwargs))
+                send_task = asyncio.create_task(traced_send(backend, send_kwargs, call_trace))
                 poll_seconds = min(5.0, max(0.05, inactivity_timeout / 4.0))
                 while True:
                     done, _ = await asyncio.wait({send_task}, timeout=poll_seconds)
@@ -5619,7 +5713,7 @@ class BridgeWS:
                         retryable=backend_call_quiesced,
                     )
             else:
-                result = await backend.send_message(**send_kwargs)
+                result = await traced_send(backend, send_kwargs, call_trace)
             # 真实 backend 返回 camelCase "agentSessionId"；instance_manager 用 snake
             if isinstance(result, dict):
                 new_sid = result.get("agentSessionId") or result.get("agent_session_id")
@@ -13429,6 +13523,11 @@ except urllib.error.URLError as e:
             elif "kitToolsMode" in (session.abilities or {}):
                 # 旧客户端只修改 Skills/Prompts，不能把显式停用意外改回自动。
                 abilities["kitToolsMode"] = kit_prompt_mode(session.abilities)
+            if "workspaceToolsMode" in abilities:
+                if abilities["workspaceToolsMode"] not in {"on", "off"}:
+                    raise ValueError("应用工具模式必须为 on 或 off")
+            elif "workspaceToolsMode" in (session.abilities or {}):
+                abilities["workspaceToolsMode"] = session.abilities["workspaceToolsMode"]
             # 原生目录在执行前准备。绑定操作只保存选择，不复制大目录；构建约束
             # 也离开事件循环，避免与市场安装持有的库锁一起卡住所有连接。
             import copy
@@ -14609,10 +14708,16 @@ except urllib.error.URLError as e:
 
     # ── 权限门控 RPC ─────────────────────────────────────────────
 
-    def _rpc_grantPermission(self, session_id: str, granted: bool, skip_rest: bool = False) -> None:
+    def _rpc_grantPermission(self, session_id: str, granted: bool, skip_rest: bool = False, request_id: str = "") -> None:
         """前端响应权限请求：granted=True 继续执行，False 取消。
         skip_rest=True 表示后续工具自动授权（用户点击了"跳过后续确认"）。
         """
+        if request_id and request_id != getattr(self, "_permission_gate_ids", {}).get(session_id):
+            raise ValueError("该确认已结束或被更新，请查看当前计划")
+        if (session_id in getattr(self, "_permission_no_skip", set())
+                or session_id in getattr(self, "_permission_require_id", set())):
+            if not request_id or request_id != getattr(self, "_permission_gate_ids", {}).get(session_id):
+                raise ValueError("请确认当前工作区计划，旧确认不能用于新计划")
         gate = self._permission_gates.get(session_id)
         if gate and not gate.done():
             try:
@@ -14620,7 +14725,7 @@ except urllib.error.URLError as e:
             except asyncio.InvalidStateError:
                 pass  # 超时已处理，忽略
         # ★ 记录 skip_rest 标志，后续权限检查时跳过
-        if skip_rest and granted:
+        if skip_rest and granted and session_id not in getattr(self, "_permission_no_skip", set()):
             self._skip_rest_sessions.add(session_id)
             print(f"[bridge_ws] Session {session_id} 设置 skip_rest=True", file=sys.stderr, flush=True)
 
@@ -14638,6 +14743,8 @@ except urllib.error.URLError as e:
         message_id: str,
         tools: list,
         timeout: float = 300.0,
+        allow_skip: bool = True,
+        require_request_id: bool = False,
     ) -> bool:
         """
         向所有已连接客户端推送 permissionRequest 事件，
@@ -14650,12 +14757,28 @@ except urllib.error.URLError as e:
             old_gate.set_result(False)
         gate: "asyncio.Future[bool]" = loop.create_future()
         self._permission_gates[session_id] = gate
+        if not hasattr(self, "_permission_no_skip"):
+            self._permission_no_skip: set[str] = set()
+        if not hasattr(self, "_permission_gate_ids"):
+            self._permission_gate_ids: dict[str, str] = {}
+        if not hasattr(self, "_permission_require_id"):
+            self._permission_require_id: set[str] = set()
+        permission_id = new_id()
+        self._permission_gate_ids[session_id] = permission_id
+        self._permission_no_skip.discard(session_id)
+        if not allow_skip:
+            self._permission_no_skip.add(session_id)
+        self._permission_require_id.discard(session_id)
+        if require_request_id:
+            self._permission_require_id.add(session_id)
 
         await self._send_for_session(session_id, {
             "event": "permissionRequest",
             "data": json.dumps({
                 "sessionId": session_id,
                 "messageId": message_id,
+                "allowSkip": allow_skip,
+                "requestId": permission_id,
                 "tools": [tc.to_dict() for tc in tools],
             }, ensure_ascii=False),
         })
@@ -14665,7 +14788,16 @@ except urllib.error.URLError as e:
             logging.warning(f"[bridge_ws] Permission request timed out for session {session_id}")
             return False
         finally:
-            self._permission_gates.pop(session_id, None)
+            if self._permission_gates.get(session_id) is gate:
+                self._permission_gates.pop(session_id, None)
+                self._permission_no_skip.discard(session_id)
+                self._permission_require_id.discard(session_id)
+                self._permission_gate_ids.pop(session_id, None)
+                if not allow_skip or require_request_id:
+                    await self._send_for_session(session_id, {"event": "permissionRequest", "data": json.dumps({
+                        "sessionId": session_id, "messageId": message_id, "requestId": permission_id,
+                        "resolved": True, "tools": [],
+                    }, ensure_ascii=False)})
 
     # ════════════════════════════════════════════════════════════
     #  核心：带自动续跑的流式发送（与 bridge.py _async_send 相同逻辑）
@@ -16028,6 +16160,7 @@ except urllib.error.URLError as e:
                 constraints=constraints, runtime=turn_runtime,
                 kit_approval_delegation=kit_approval_delegation,
                 user_message_id=str(user_id),
+                workspace_tools=payload.get("workspaceToolsVersion") == 1,
             )
         except Exception as e:
             import traceback
@@ -16086,6 +16219,7 @@ except urllib.error.URLError as e:
         runtime: Optional[dict] = None,
         kit_approval_delegation: bool = False,
         user_message_id: str = "",
+        workspace_tools: bool = False,
     ):
         service = getattr(self, "_chat_kit_tools", None)
         if service is None:
@@ -16096,6 +16230,7 @@ except urllib.error.URLError as e:
         from .claude_agent import ClaudeAgentBackend
         from .claude_code import ClaudeCodeOfficialBackend
         token = ""
+        workspace_token = ""
         if session.codex_connection_mode != "ssh":
             backend = self._get_backend(backend_id)
             # 图片等非工具 Backend 不得收到带令牌的控制指令。
@@ -16105,6 +16240,15 @@ except urllib.error.URLError as e:
             )) and self._session_kit_prompt_enabled(session):
                 token = service.issue(session.id, allow_approval=kit_approval_delegation,
                                       message_id=user_message_id)
+            if (workspace_tools and (session.abilities or {}).get("workspaceToolsMode", "on") == "on"
+                    and isinstance(backend, (AnthropicAPIBackend, OpenAICompatibleBackend, CodexOfficeBackend,
+                                            QwenCodeSdkBackend, ClaudeAgentBackend, ClaudeCodeOfficialBackend))):
+                workspace_service = getattr(self, "_chat_workspace_tools", None)
+                if workspace_service is None:
+                    workspace_service = self._chat_workspace_tools = ChatWorkspaceTools(self)
+                workspace_token = workspace_service.issue(
+                    session.id, message_id, _REQUEST_CLIENT.get(), skip_permissions=skip_permissions,
+                )
         try:
             if kit_approval_delegation and not token:
                 raise ValueError("当前 Session 未启用 Kit 调用 Prompt，或 Backend 不支持聊天 Kit。"
@@ -16116,10 +16260,12 @@ except urllib.error.URLError as e:
                     ) if part)
             return await self._async_send_with_kit_tools(
                 session, content, images, backend_id, message_id,
-                auto_continue, skip_permissions, constraints, runtime, kit_token=token,
+                auto_continue, skip_permissions, constraints, runtime, kit_token=token, workspace_token=workspace_token,
             )
         finally:
             service.revoke(token)
+            if workspace_token:
+                self._chat_workspace_tools.revoke(workspace_token)
 
     async def _async_send_with_kit_tools(
         self,
@@ -16133,6 +16279,7 @@ except urllib.error.URLError as e:
         constraints: Optional[str] = None,
         runtime: Optional[dict] = None,
         kit_token: str = "",
+        workspace_token: str = "",
     ):
         backend = self._get_backend(backend_id)
         assistant_msg = session.messages[-1]
@@ -16140,9 +16287,11 @@ except urllib.error.URLError as e:
         # ── 收集 Backend Skills（API 类 backend 使用）──
         extra_tools, skill_map = self._collect_backend_skills(session)
         # 内置名称保留；停用时不能借同名 Repo Skill 暴露伪造的 Kit 入口。
-        extra_tools = [tool for tool in extra_tools if tool["name"] != CHAT_KIT_TOOL_NAME]
+        extra_tools = [tool for tool in extra_tools if tool["name"] not in {CHAT_KIT_TOOL_NAME, WORKSPACE_TOOL_NAME}]
         if kit_token:
             extra_tools.append(CHAT_KIT_TOOL)
+        if workspace_token:
+            extra_tools.append(WORKSPACE_TOOL)
         if extra_tools:
             print(f"[bridge_ws] Session {session.id}: {len(extra_tools)} Backend Skills detected: "
                   f"{[t['name'] for t in extra_tools]}", file=sys.stderr, flush=True)
@@ -16165,6 +16314,10 @@ except urllib.error.URLError as e:
 
         async def _on_tool_call(tool_name: str, tool_input: dict) -> str:
             """Skill 工具调用回调：路由到 Backend Skill 或内置/python-script 类型。"""
+            if tool_name == WORKSPACE_TOOL_NAME:
+                if not workspace_token:
+                    return json.dumps({"status": "unavailable", "message": "本轮未启用应用工具"}, ensure_ascii=False)
+                return json.dumps(await self._chat_workspace_tools.call(workspace_token, tool_input), ensure_ascii=False)
             if tool_name == CHAT_KIT_TOOL_NAME:
                 if not kit_token:
                     return json.dumps({"status": "error", "message": "本轮未启用 Kit 调用工具"}, ensure_ascii=False)
@@ -16199,6 +16352,9 @@ except urllib.error.URLError as e:
             "reasoningOutputTokens": 0,
         }
         latest_context_usage: dict = {}
+        from .call_trace import CallTrace, traced_send
+        call_trace = (CallTrace(session.id, f"chat:{assistant_msg.id}")
+                      if (getattr(session, "token_usage", None) or {}).get("captureEnabled") else None)
 
         current_content = content
         current_images = images
@@ -16399,6 +16555,11 @@ except urllib.error.URLError as e:
 
                 # Codex/Qwen 恢复线程时跳过 session constraints。轮次令牌必须在每次
                 # 模型输入边界注入，不写聊天记录，也不依赖第一轮的过期 system prompt。
+                if workspace_token:
+                    from .anthropic_api import AnthropicAPIBackend
+                    from .openai_compat import OpenAICompatibleBackend
+                    if not isinstance(backend, (AnthropicAPIBackend, OpenAICompatibleBackend)):
+                        send_content = self._chat_workspace_tools.instructions(workspace_token, self._HTTP_API_PORT) + "\n\n【用户本轮请求】\n" + send_content
                 if kit_token:
                     from .anthropic_api import AnthropicAPIBackend
                     from .openai_compat import OpenAICompatibleBackend
@@ -16460,7 +16621,7 @@ except urllib.error.URLError as e:
                         _send_kwargs["extra_tools"] = extra_tools
                         _send_kwargs["on_tool_call"] = _on_tool_call
                 self._add_runtime_kwargs(backend, _send_kwargs, runtime, session)
-                result = await backend.send_message(**_send_kwargs)
+                result = await traced_send(backend, _send_kwargs, call_trace)
 
                 if use_agent_session and result.get("agentSessionId") != use_agent_session:
                     session.agent_session_id = None
@@ -16484,9 +16645,13 @@ except urllib.error.URLError as e:
                         for key in (
                             "contextTokens", "contextWindow", "contextCompacted",
                             "cumulative", "contextId",
+                            "reported", "baselineRequired", "providerCumulative", "providerUsage", "usageSource", "requestCount", "nativeResumed",
                         ):
                             if iter_usage.get(key) is not None:
                                 latest_context_usage[key] = iter_usage[key]
+                        for key in ("usageEventCount", "zeroUsageEventCount"):
+                            if key in iter_usage:
+                                latest_context_usage[key] = latest_context_usage.get(key, 0) + int(iter_usage[key] or 0)
                     if result.get("agentSessionId"):
                         session.agent_session_id = result["agentSessionId"]
 
@@ -16557,7 +16722,7 @@ except urllib.error.URLError as e:
             )
 
             final_usage = None
-            if any(usage_totals.values()):
+            if any(usage_totals.values()) or latest_context_usage.get("reported"):
                 final_usage = {**usage_totals, **latest_context_usage}
 
             usage_loop_record = (

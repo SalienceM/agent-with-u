@@ -143,6 +143,9 @@ class SessionUserIsolationTests(unittest.IsolatedAsyncioTestCase):
             ("renameSession", self.alice.id, "stolen"),
             ("loopGetState", self.alice.id, True),
             ("kitGetState", self.alice.id),
+            ("getSessionCallDetail", self.alice.id, "chat:private"),
+            ("setSessionCallCapture", self.alice.id, True),
+            ("clearSessionCallDetails", self.alice.id),
             ("sendMessage", json.dumps({
                 "sessionId": self.alice.id,
                 "backendId": "backend",

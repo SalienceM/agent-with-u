@@ -1,7 +1,7 @@
 import React, { useState, useCallback, useEffect, useRef, useMemo, useReducer } from 'react';
 import { FileTransferCenter } from './components/FileTransferCenter';
 import {
-  api, isTauri, getExecutors, getAssignableExecutors, onExecStatus, getHomeExecKey,
+  api, isTauri, getExecutors, getAssignableExecutors, onExecStatus, getHomeExecKey, getSessionExecKey,
   getCurrentUserProfile, onCurrentUserChanged,
   type ExecutorInfo, type CurrentUserProfile,
 } from './api';
@@ -225,6 +225,24 @@ export const App: React.FC = () => {
       const next = new Set(previous); next.delete(id); return next;
     });
   }, [focusedPaneIdx, paneSessions, layout]);
+
+  // 分屏焦点、启动恢复、会话迁移也走同一个标签账本；列表更新不会重排/打开所有 Session。
+  useEffect(() => {
+    const open = (event: Event) => {
+      const detail = (event as CustomEvent).detail;
+      if (!detail || typeof detail.session !== 'string' || typeof detail.node !== 'string') return;
+      // 点击仅导航已有、有权限的 Session；链接不创建对象、不自动发送消息。
+      void api.resolveWorkspaceSession(detail.node, detail.session).then(session => {
+        if (session?.id) setSessionInPane(session.id);
+      }).catch(error => {
+        setToast({ type: 'error', message: error instanceof Error ? error.message : '无法打开目标 Session' });
+        if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
+        toastTimerRef.current = setTimeout(() => setToast(null), 6000);
+      });
+    };
+    window.addEventListener('awu-open-workspace-session', open);
+    return () => window.removeEventListener('awu-open-workspace-session', open);
+  }, [setSessionInPane]);
 
   // 分屏焦点、启动恢复、会话迁移也走同一个标签账本；列表更新不会重排/打开所有 Session。
   useEffect(() => {
@@ -1788,6 +1806,7 @@ export const App: React.FC = () => {
         {workbench.tabs.includes('market') && <section id="workbench-panel-market" role="tabpanel" aria-labelledby="workbench-tab-market"
           hidden={workbench.active !== 'market'} style={{ display: workbench.active === 'market' ? 'flex' : 'none', flex: 1, minHeight: 0, overflow: 'hidden' }}>
           <SkillMarketDialog open embedded onClose={() => closeWorkbenchTab('market')}
+            initialExecKey={getSessionExecKey(activeSessionId)}
             onInstalled={() => setSkillLibraryRevision(value => value + 1)}
             onPrepare={(names, execKey) => { setMarketRuntimeExecKey(execKey); setMarketRuntimeNames(names); }} />
         </section>}

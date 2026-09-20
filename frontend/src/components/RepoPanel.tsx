@@ -889,6 +889,7 @@ const RepoPanelContent: React.FC<Props & { execKey: string; onBusyChange: (busy:
 
       <SkillMarketDialog
         open={showSkillMarket}
+        initialExecKey={execKey}
         onClose={() => setShowSkillMarket(false)}
         onInstalled={async () => { await refresh(); }}
         onPrepare={(names, execKey) => { setRuntimeExecKey(execKey); setRuntimeNames(names); }}
