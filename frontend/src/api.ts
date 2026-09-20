@@ -660,6 +660,24 @@ export interface ExecutorInfo {
   canManageNode?: boolean;
 }
 
+export interface GitCommitRule {
+  mode: 'builtin' | 'custom' | 'library';
+  prompt: string;
+  promptName: string;
+  signature: boolean;
+}
+export interface GitCommitRuleState {
+  status: string; message?: string; root: string; revision: string;
+  setting: GitCommitRule | null; effective: GitCommitRule;
+  source: 'project' | 'default' | 'builtin'; prompt: string;
+  resolutionError: string; defaultPrompt: string;
+  inherited: GitCommitRule; inheritedPrompt: string;
+}
+export interface GitCommitPromptPreview {
+  status: string; message?: string; constraints: string; content: string;
+  source: string; warnings: string[]; fileCount: number; scope: string;
+}
+
 interface RelayInspection {
   devices: { id: string; name: string; isDefaultOwner?: boolean }[];
   profile: RelayUserProfile;
@@ -3418,6 +3436,16 @@ export const api = {
       }>(result, { status: 'error', message: 'syncFileList 无响应' });
       return { ...parsed, files: filterGitMetadata(parsed.files) };
     }
+  },
+
+  async gitCommitSettingsGet(workingDir: string, execKey: string): Promise<GitCommitRuleState> {
+    return JSON.parse(await callOn(execKey, 'gitCommitSettingsGet', workingDir));
+  },
+  async gitCommitSettingsSave(workingDir: string, setting: GitCommitRule | null, revision: string, execKey: string): Promise<GitCommitRuleState> {
+    return JSON.parse(await callOn(execKey, 'gitCommitSettingsSave', workingDir, JSON.stringify(setting), revision));
+  },
+  async gitCommitPromptPreview(workingDir: string, stagedOnly: boolean, execKey: string): Promise<GitCommitPromptPreview> {
+    return JSON.parse(await callOn(execKey, 'gitCommitPromptPreview', workingDir, stagedOnly));
   },
   async chatAsideAbort(sessionId: string): Promise<{ status: string; aborting?: boolean }> {
     const result = await call('chatAsideAbort', sessionId);

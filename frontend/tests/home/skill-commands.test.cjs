@@ -1,6 +1,19 @@
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
-const { isSkillCommand, slashQuery, skillInvocation } = require('../../.home-test-dist/utils/skillCommands.js');
+const { isSkillCommand, slashQuery, skillInvocation, suggestedSlashCommand } = require('../../.home-test-dist/utils/skillCommands.js');
+
+test('reply commands can be drafted verbatim, without treating paths, shell or batches as one command', () => {
+  for (const text of ['/opsx-apply persist-login-debug-preference', '/help', '/skill demo 检查这里',
+    '/review-plan "x y" & <file>', '/My-review change-1', '/review-plan\t中文参数']) {
+    assert.equal(suggestedSlashCommand(text), text);
+  }
+  assert.equal(suggestedSlashCommand('\n/opsx-init\n'), '/opsx-init');
+  for (const text of ['/opsx-init\n/opsx-apply x', '/opsx-init\r/opsx-apply x', '/', '//example.com',
+    '/tmp/config.yaml', 'C:/project', './run.sh', 'openspec init', '$ /opsx-init', '执行 /opsx-init',
+    '/opsx-init\u202ehidden', '/opsx-init\u0000hidden', '/opsx-init\u2028another', '/x ' + 'a'.repeat(4000)]) {
+    assert.equal(suggestedSlashCommand(text), null, text);
+  }
+});
 
 test('all non-app slash commands use the executor registry, even before menu discovery', () => {
   for (const text of ['/skill demo args', ' /OPSX-APPLY id', '/opsx:apply id', '/native /model', '/skills', '/my-review path']) assert.equal(isSkillCommand(text), true);

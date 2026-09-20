@@ -1,4 +1,4 @@
-import React, { useRef, useCallback, useEffect, useLayoutEffect, memo, useState, useMemo } from 'react';
+import React, { useRef, useCallback, useEffect, useLayoutEffect, useImperativeHandle, forwardRef, memo, useState, useMemo } from 'react';
 import { ImagePreview } from './ImagePreview';
 import { TextAttachmentPreview } from './TextAttachmentPreview';
 import { useClipboardImage } from '../hooks/useClipboardImage';
@@ -7,7 +7,7 @@ import type { TextAttachment, TextAttachmentSource } from '../types/attachments'
 import { SLASH_COMMANDS } from '../hooks/useChat';
 import type { SlashCommand } from '../hooks/useChat';
 import { api, isTauri, onCurrentUserChanged, getExecutors } from '../api';
-import { isSkillCommand, slashQuery, skillInvocation, type SkillInvocation, type SkillCommand } from '../utils/skillCommands';
+import { isSkillCommand, slashQuery, skillInvocation, suggestedSlashCommand, type SkillInvocation, type SkillCommand } from '../utils/skillCommands';
 import { RealtimeVoiceBar } from './RealtimeVoiceBar';
 import type { RealtimeVoiceInteractionMode } from '../utils/realtimeVoice';
 import { uuid } from '../utils/uuid';
@@ -181,6 +181,10 @@ interface Props {
   };
 }
 
+export interface ChatInputHandle {
+  insertCommand: (command: string, sourceSessionId: string) => void;
+}
+
 // ═══════════════════════════════════════
 //  ★ 工具栏按钮组件
 // ═══════════════════════════════════════
@@ -226,7 +230,7 @@ const ToolbarBtn: React.FC<ToolbarBtnProps> = ({ icon, title, active, onClick, l
   );
 };
 
-const ChatInputInner: React.FC<Props> = ({
+const ChatInputInner = forwardRef<ChatInputHandle, Props>(({
   onSend, onAbort, isStreaming, backends, activeBackendId, sessionId, workingDir,
   skipPermissions = true, onSkipPermissionsChange,
   isMobile = false,
@@ -239,7 +243,7 @@ const ChatInputInner: React.FC<Props> = ({
   onSessionRuntimeChange,
   voiceConversationActive = false,
   realtimeVoice,
-}) => {
+}, forwardedRef) => {
   const ref = useRef<HTMLTextAreaElement>(null);
   const attachmentInputRef = useRef<HTMLInputElement>(null);
   const attachmentNoticeTimerRef = useRef<number | null>(null);
@@ -248,6 +252,7 @@ const ChatInputInner: React.FC<Props> = ({
   const { images, removeImage, clearImages, addImage } = useClipboardImage(ref);
   const [textAttachments, setTextAttachments] = useState<TextAttachment[]>([]);
   const [attachmentNotice, setAttachmentNotice] = useState('');
+  const [attachmentNoticeTone, setAttachmentNoticeTone] = useState<'error' | 'info'>('error');
   const [kitApprovalDelegation, setKitApprovalDelegation] = useState(false);
   const kitApprovalDelegationRef = useRef(false);
   kitApprovalDelegationRef.current = kitApprovalDelegation;
@@ -546,12 +551,13 @@ const ChatInputInner: React.FC<Props> = ({
     return attachment;
   }, [setTextAttachmentList]);
 
-  const showAttachmentNotice = useCallback((message: string) => {
+  const showAttachmentNotice = useCallback((message: string, tone: 'error' | 'info' = 'error') => {
     if (attachmentNoticeTimerRef.current !== null) {
       window.clearTimeout(attachmentNoticeTimerRef.current);
       attachmentNoticeTimerRef.current = null;
     }
     setAttachmentNotice(message);
+    setAttachmentNoticeTone(tone);
     if (message) {
       attachmentNoticeTimerRef.current = window.setTimeout(() => {
         attachmentNoticeTimerRef.current = null;
@@ -653,6 +659,7 @@ const ChatInputInner: React.FC<Props> = ({
     setShowCommands(false);
     setShowFilePicker(false);
     setShowSessionPicker(false);
+    showAttachmentNotice('');
 
     return () => {
       if (!sessionId || !ref.current) return;
@@ -667,7 +674,31 @@ const ChatInputInner: React.FC<Props> = ({
         sessionInputDrafts.delete(sessionId);
       }
     };
-  }, [sessionId, scheduleTextareaResize]);
+  }, [sessionId, scheduleTextareaResize, showAttachmentNotice]);
+
+  useImperativeHandle(forwardedRef, () => ({
+    insertCommand: (text, sourceSessionId) => {
+      const el = ref.current;
+      const command = suggestedSlashCommand(text);
+      // 局部 ref + Session 核验：不广播到其它分屏、隐藏 Session 或独立窗口。
+      if (!el || !command || !sourceSessionId || sourceSessionId !== sessionIdRef.current) return;
+      if (el.value.trim() && el.value.trim() !== command && !window.confirm(
+        '输入框已有未发送的草稿，是否替换为这条命令？现有附件会保留；取消可保留原稿。',
+      )) return;
+      if (sourceSessionId !== sessionIdRef.current) return;
+      el.value = command;
+      setHistIdx(-1); histIdxRef.current = -1; draftRef.current = command;
+      sessionLookupVersionRef.current += 1;
+      filePickerLoadVersionRef.current += 1;
+      setShowCommands(false); setShowFilePicker(false); setShowSessionPicker(false);
+      saveSessionDraft(command);
+      scheduleTextareaResize(true);
+      el.focus(); el.setSelectionRange(command.length, command.length);
+      showAttachmentNotice(imagesRef.current.length || textAttachmentsRef.current.length
+        ? '已填入，未发送。现有附件已保留，请核对后发送。'
+        : '已填入输入框，未发送；请确认后发送。', 'info');
+    },
+  }), [saveSessionDraft, scheduleTextareaResize, showAttachmentNotice]);
 
   const workingDirRef = useRef(workingDir);
   workingDirRef.current = workingDir;
@@ -1133,12 +1164,12 @@ const ChatInputInner: React.FC<Props> = ({
     const textFiles = textAttachmentsRef.current;
     if (!text && imgs.length === 0 && textFiles.length === 0) return;
     if (isSkillCommand(text) && (isStreamingRef.current || seqCountRef.current > 0)) {
-      setAttachmentNotice('Skill 命令尚未发送，请等待当前轮及队列结束；命令与参数已保留在输入框。');
+      showAttachmentNotice('Skill 命令尚未发送，请等待当前轮及队列结束；命令与参数已保留在输入框。');
       return;
     }
     // 不把本次委托悄悄带入自动队列、斜杠命令或未来轮次。
     if (kitApprovalDelegationRef.current && (isStreamingRef.current || seqCountRef.current > 0 || text.startsWith('/'))) {
-      setAttachmentNotice('Kit 代确认只支持空闲时直接发送普通消息，请关闭代确认开关或等待当前轮结束。');
+      showAttachmentNotice('Kit 代确认只支持空闲时直接发送普通消息，请关闭代确认开关或等待当前轮结束。');
       return;
     }
     // ★ 图像 backend：自动注入 --size 参数
@@ -1166,6 +1197,7 @@ const ChatInputInner: React.FC<Props> = ({
     }
     kitApprovalDelegationRef.current = false;
     setKitApprovalDelegation(false);
+    showAttachmentNotice('');
     if (ref.current) {
       ref.current.value = '';
       textareaHeightCappedRef.current = false;
@@ -1177,7 +1209,7 @@ const ChatInputInner: React.FC<Props> = ({
     setTextAttachments([]);
     clearImagesRef.current();
     setShowCommands(false);
-  }, [scheduleTextareaResize]);
+  }, [scheduleTextareaResize, showAttachmentNotice]);
 
   // ── 键盘事件 ──
   const handleKeyDown = useCallback(
@@ -1796,14 +1828,14 @@ const ChatInputInner: React.FC<Props> = ({
 
       {attachmentNotice && (
         <div
-          role="alert"
+          role={attachmentNoticeTone === 'error' ? 'alert' : 'status'}
           style={{
             margin: '-1px 0 6px',
             padding: '5px 8px',
             borderRadius: 5,
-            border: '1px solid rgba(248,81,73,.25)',
-            background: 'rgba(248,81,73,.08)',
-            color: 'var(--theme-error, #cf222e)',
+            border: attachmentNoticeTone === 'error' ? '1px solid rgba(248,81,73,.25)' : '1px solid var(--theme-border)',
+            background: attachmentNoticeTone === 'error' ? 'rgba(248,81,73,.08)' : 'var(--theme-accent-bg)',
+            color: attachmentNoticeTone === 'error' ? 'var(--theme-error, #cf222e)' : 'var(--theme-text-secondary)',
             fontSize: 11,
             lineHeight: 1.4,
           }}
@@ -2040,7 +2072,7 @@ const ChatInputInner: React.FC<Props> = ({
 
     </div>
   );
-};
+});
 
 export const ChatInput = memo(ChatInputInner);
 

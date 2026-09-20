@@ -66,6 +66,7 @@ from .skill_commands import command_catalog, resolve_skill_call, SkillCommandErr
 from .skill_manuals import skill_references
 from .skill_paths import project_skill_reference, project_skill_root, render_skill_markdown
 from .prompt_store import PromptStore
+from .git_commit_message import CommitMessageSettings, repository_root, collect_evidence, build_prompt, clean_message
 from .loop_store import (
     LoopStore, LoopState, LoopRecord, LoopStep, LoopAnalysis, IdeaEntry, AsideTurn, Addon,
     LoopPolicy, LoopPolicyStore,
@@ -758,6 +759,7 @@ class BridgeWS:
         self._skill_market_explainer = SkillMarketExplainer(self._skill_market, self._new_backend_instance)
         self._skill_runtime = SkillRuntime(self._skill_store)
         self._prompt_store = PromptStore()
+        self._commit_settings = CommitMessageSettings(self._prompt_store)
         # ★ 可视化 Loop 集成：stage 文件存储 + 并发想法池 + 运行去重
         self._loop_store = LoopStore()
         self._loop_policy_store = LoopPolicyStore()   # 策略预设库
@@ -15423,144 +15425,93 @@ except urllib.error.URLError as e:
             return json.dumps({"status": "error", "message": err.strip()})
         return json.dumps({"status": "ok"}, ensure_ascii=False)
 
-    async def _rpc_gitGenerateCommitMessage(self, working_dir: str, staged_only: bool = True, backend_id: str = "", only_paths_json: str = "") -> str:
-        """AI 生成 commit message：获取 diff → 调用独立 agent session → 流式推送。
-        only_paths_json 非空时只分析勾选的文件。"""
-        import os, re, uuid
-        if not working_dir or not os.path.isdir(working_dir) or not _git_is_repo(working_dir):
-            self._emit_event("gitCommitMsgReady", {"workingDir": working_dir, "message": "", "error": "非 Git 仓库"})
-            return json.dumps({"status": "error", "message": "非 Git 仓库"})
-
-        diff_out = ""
-        only_paths: list[str] = []
-        if only_paths_json:
-            try:
-                only_paths = json.loads(only_paths_json)
-            except Exception:
-                only_paths = []
-
-        if only_paths:
-            # ★ 只获取勾选文件的 diff
-            parts: list[str] = []
-            for path in only_paths:
-                # 检查是否是 untracked
-                rc_s, out_s, _ = self._git_run(working_dir, ["status", "--porcelain", "--untracked-files=all", "--", path], timeout=10)
-                is_untracked = False
-                if rc_s == 0:
-                    for line in out_s.splitlines():
-                        if len(line) >= 4 and line[:2] == "??":
-                            is_untracked = True
-                            break
-
-                if is_untracked:
-                    # Untracked 文件：用 --no-index 对比 /dev/null
-                    rc, d, _ = self._git_run(working_dir, ["diff", "--no-index", "/dev/null", path], timeout=15)
-                    if rc in (0, 1) and d:
-                        parts.append(d)
-                else:
-                    # 已跟踪文件：普通 diff
-                    rc, d, _ = self._git_run(working_dir, ["diff", "--", path], timeout=15)
-                    if rc == 0 and d:
-                        parts.append(d)
-                    else:
-                        # 回退：尝试 --cached
-                        rc2, d2, _ = self._git_run(working_dir, ["diff", "--cached", "--", path], timeout=15)
-                        if rc2 == 0 and d2:
-                            parts.append(d2)
-
-            diff_out = "\n".join(parts)
-            if not diff_out.strip():
-                # 勾选的文件都没有 diff（可能还没保存？）
-                self._emit_event("gitCommitMsgReady", {"workingDir": working_dir, "message": "", "error": "勾选的文件没有检测到变更"})
-                return json.dumps({"status": "ok", "message": ""})
-        else:
-            # 全量 diff（原有逻辑）
-            diff_args = ["diff", "--cached"] if staged_only else ["diff"]
-            rc, diff_out, _ = self._git_run(working_dir, diff_args, timeout=15)
-            if staged_only and (rc != 0 or not diff_out.strip()):
-                diff_args = ["diff"]
-                rc, diff_out, _ = self._git_run(working_dir, diff_args, timeout=15)
-            if rc != 0 or not diff_out.strip():
-                rc2, diff_out2, _ = self._git_run(working_dir, ["status", "--porcelain"], timeout=5)
-                if rc2 == 0 and diff_out2.strip():
-                    diff_out = f"新文件（untracked）：\n{diff_out2}"
-                else:
-                    self._emit_event("gitCommitMsgReady", {"workingDir": working_dir, "message": "", "error": "没有可提交的改动"})
-                    return json.dumps({"status": "ok", "message": ""})
-
-        diff_text = diff_out[:50000]
-        # 获取最近 commit 作为风格参考
-        _, recent_log, _ = self._git_run(working_dir, ["log", "--oneline", "-5"], timeout=5)
-        prompt = (
-            "你是一个专业的 Git commit message 生成器。根据以下 git diff 生成一条简洁、准确的 commit message。\n"
-            "要求：\n"
-            "- 使用中文撰写 commit message（Conventional Commits 前缀如 feat:/fix:/refactor: 等保留英文，描述部分用中文）\n"
-            "- 第一行简短描述（不超过 72 字符）\n"
-            "- 如有必要，空一行后补充详细说明\n"
-            "- 末尾加一行署名：By AgentWithU（不要使用 Co-Authored-By 格式）\n"
-            "- 只返回 commit message 文本，不要任何额外说明、不要 markdown 代码块包裹\n\n"
-            f"最近的 commit 风格参考：\n{recent_log.strip()}\n\n"
-            f"git diff：\n{diff_text}"
-        )
-        # 使用独立 backend session 流式生成（与旁路问答相同模式）
-        msg_id = str(uuid.uuid4())[:8]
-        aside_sid = f"gitcommitmsg:{msg_id}"
-        self._emit_event("gitCommitMsgDelta", {"workingDir": working_dir, "text": ""})
+    async def _rpc_gitCommitSettingsGet(self, working_dir: str = "") -> str:
         try:
+            root = await asyncio.to_thread(repository_root, working_dir) if working_dir else ""
+            result = await asyncio.to_thread(self._commit_settings.get, self._current_owner_id(), root)
+            return json.dumps(result, ensure_ascii=False)
+        except Exception as exc:
+            return json.dumps({"status": "error", "message": str(exc)}, ensure_ascii=False)
+
+    async def _rpc_gitCommitSettingsSave(self, working_dir: str, settings_json: str, revision: str) -> str:
+        try:
+            root = await asyncio.to_thread(repository_root, working_dir) if working_dir else ""
+            result = await asyncio.to_thread(
+                self._commit_settings.save, self._current_owner_id(), root, json.loads(settings_json), revision)
+            return json.dumps(result, ensure_ascii=False)
+        except Exception as exc:
+            return json.dumps({"status": "error", "message": str(exc)}, ensure_ascii=False)
+
+    async def _commit_message_input(self, working_dir: str, staged_only: bool,
+                                    selected: Optional[list[str]], owner: str) -> tuple[dict, dict]:
+        # 先冻结规则，采集 diff / 模型生成期间的设置修改仅影响下一次调用。
+        root = await asyncio.to_thread(repository_root, working_dir)
+        settings = await asyncio.to_thread(self._commit_settings.get, owner, root)
+        if settings.get("resolutionError"):
+            raise ValueError(settings["resolutionError"])
+        evidence = await asyncio.to_thread(collect_evidence, working_dir, staged_only, selected)
+        return settings, build_prompt(settings, evidence)
+
+    async def _rpc_gitCommitPromptPreview(self, working_dir: str, staged_only: bool = False) -> str:
+        """只读预览当前已保存规则及材料；不 stage、不调用模型、不写仓库。"""
+        try:
+            _, prompt = await self._commit_message_input(working_dir, staged_only, None, self._current_owner_id())
+            return json.dumps({"status": "ok", **prompt}, ensure_ascii=False)
+        except Exception as exc:
+            return json.dumps({"status": "error", "message": str(exc)}, ensure_ascii=False)
+
+    async def _generate_commit_message(self, working_dir: str, staged_only: bool,
+                                       selected: Optional[list[str]], backend_id: str,
+                                       owner: str, session: Optional["Session"] = None,
+                                       stream: bool = False) -> str:
+        from .text_only import send_text_only
+        import uuid
+        settings, prompt = await self._commit_message_input(working_dir, staged_only, selected, owner)
+        try:
+            backend = self._get_backend(backend_id) if backend_id else None
+        except Exception:
             backend = None
-            # 优先使用前端传入的 backend_id（当前会话的 backend）
-            if backend_id:
-                try:
-                    backend = self._get_backend(backend_id)
-                except Exception:
-                    backend = None
-            # 回退：使用第一个可用 backend
-            if backend is None and self._backend_configs:
-                try:
-                    backend = self._get_backend(self._backend_configs[0].id)
-                except Exception:
-                    backend = None
-            if backend:
-                parts: list[str] = []
+        if backend is None and self._backend_configs:
+            backend = self._get_backend(self._backend_configs[0].id)
+        if backend is None:
+            raise ValueError("无可用 Backend")
+        parts: list[str] = []
+        msg_id = uuid.uuid4().hex
+        call_id = f"gitcommitmsg:{msg_id}"
 
-                def on_delta(delta: StreamDelta):
-                    if delta.type == "text_delta" and delta.text:
-                        parts.append(delta.text)
-                        self._emit_event("gitCommitMsgDelta", {"workingDir": working_dir, "text": delta.text})
-                    elif delta.type == "error" and delta.error:
-                        self._emit_event("gitCommitMsgDelta", {"workingDir": working_dir, "text": f"\n❌ {delta.error}\n"})
+        def on_delta(delta: StreamDelta) -> None:
+            if delta.type == "error":
+                raise ValueError(delta.error or "AI 生成失败")
+            if delta.type == "text_delta" and delta.text:
+                parts.append(delta.text)
+                if stream:
+                    self._emit_event("gitCommitMsgDelta", {"workingDir": working_dir, "text": delta.text})
 
-                await backend.send_message(
-                    messages=[], content=prompt, images=None,
-                    session_id=aside_sid, message_id=msg_id, on_delta=on_delta,
-                    agent_session_id=None,  # 独立上下文
-                    working_dir=working_dir,
-                    skip_permissions=True,
-                    sandbox_enabled=False,
-                )
-                backend.clear_cancelled(aside_sid)
-                message = "".join(parts).strip()
-                if not message:
-                    # AI 调用成功但没有产生任何文本 → 模型/凭证可能有问题
-                    self._emit_event("gitCommitMsgReady", {"workingDir": working_dir, "message": "", "error": "AI 未返回内容"})
-                    return json.dumps({"status": "error", "message": "AI 模型未生成任何内容，请检查模型配置和凭证是否有效"}, ensure_ascii=False)
-                # 清理可能的 markdown 代码块
-                message = re.sub(r"^```(?:commit|message)?\s*\n?", "", message)
-                message = re.sub(r"\n?```$", "", message)
-                # ★ 强制署名：strip 掉 Co-Authored-By 行，统一替换为 By AgentWithU
-                message = re.sub(r"(?m)^Co-Authored-By:.*$", "", message).strip()
-                message = re.sub(r"(?m)^By AgentWithU\s*$", "", message).strip()
-                if message:
-                    message = message.rstrip() + "\n\nBy AgentWithU"
-                message = message.strip()
-                self._emit_event("gitCommitMsgReady", {"workingDir": working_dir, "message": message})
-                return json.dumps({"status": "ok", "message": message}, ensure_ascii=False)
-            else:
-                self._emit_event("gitCommitMsgReady", {"workingDir": working_dir, "message": "", "error": "无可用 backend"})
-                return json.dumps({"status": "error", "message": "无可用 backend"})
-        except Exception as e:
-            self._emit_event("gitCommitMsgReady", {"workingDir": working_dir, "message": "", "error": str(e)})
-            return json.dumps({"status": "error", "message": str(e)})
+        runtime = self._session_runtime(session) if session and backend.config.id == session.backend_id else {}
+        try:
+            await send_text_only(
+                backend, content=prompt["content"], constraints=prompt["constraints"],
+                session_id=call_id, message_id=msg_id, on_delta=on_delta,
+                model_override=runtime.get("model"), reasoning_effort=runtime.get("reasoningEffort"),
+            )
+        finally:
+            backend.clear_cancelled(call_id)
+        return clean_message("".join(parts), settings["effective"]["signature"])
+
+    async def _rpc_gitGenerateCommitMessage(self, working_dir: str, staged_only: bool = True,
+                                             backend_id: str = "", only_paths_json: str = "") -> str:
+        try:
+            selected = json.loads(only_paths_json) if only_paths_json else None
+            if only_paths_json and not isinstance(selected, list):
+                raise ValueError("提交文件列表格式错误")
+            self._emit_event("gitCommitMsgDelta", {"workingDir": working_dir, "text": ""})
+            message = await self._generate_commit_message(
+                working_dir, staged_only, selected, backend_id, self._current_owner_id(), stream=True)
+            self._emit_event("gitCommitMsgReady", {"workingDir": working_dir, "message": message})
+            return json.dumps({"status": "ok", "message": message}, ensure_ascii=False)
+        except Exception as exc:
+            self._emit_event("gitCommitMsgReady", {"workingDir": working_dir, "message": "", "error": str(exc)})
+            return json.dumps({"status": "error", "message": str(exc)}, ensure_ascii=False)
 
     # ── 自动 AI commit + push ──────────────────────────────────────
 
@@ -15627,10 +15578,6 @@ except urllib.error.URLError as e:
 
             # 4. AI 生成 commit message（同步版本，不推送流式事件）
             commit_msg = await self._auto_generate_commit_msg(wd, session)
-            if not commit_msg:
-                # AI 生成失败 → 用默认 message
-                commit_msg = f"auto-commit ({trigger})"
-
             # 5. Commit
             rc, commit_out, commit_err = self._git_run(
                 wd, ["commit", "-m", commit_msg], timeout=15)
@@ -15685,81 +15632,11 @@ except urllib.error.URLError as e:
                 "status": "error", "error": str(e),
             })
 
-    async def _auto_generate_commit_msg(self, working_dir: str, session: "Session") -> Optional[str]:
-        """为自动提交同步生成 commit message（不走流式推送）。
-        使用 session.auto_commit_backend_id 或 session.backend_id 对应的 backend。
-        """
-        import re, uuid
-        # 获取 staged diff
-        rc, diff_out, _ = self._git_run(working_dir, ["diff", "--cached"], timeout=15)
-        if rc != 0 or not diff_out.strip():
-            return None
-        diff_text = diff_out[:50000]
-        # 获取最近 commit 风格参考
-        _, recent_log, _ = self._git_run(working_dir, ["log", "--oneline", "-5"], timeout=5)
-
-        prompt = (
-            "你是一个专业的 Git commit message 生成器。根据以下 git diff 生成一条简洁、准确的 commit message。\n"
-            "要求：\n"
-            "- 使用中文撰写 commit message（Conventional Commits 前缀如 feat:/fix:/refactor: 等保留英文，描述部分用中文）\n"
-            "- 第一行简短描述（不超过 72 字符）\n"
-            "- 如有必要，空一行后补充详细说明\n"
-            "- 末尾加一行署名：By AgentWithU（不要使用 Co-Authored-By 格式）\n"
-            "- 只返回 commit message 文本，不要任何额外说明、不要 markdown 代码块包裹\n\n"
-            f"最近的 commit 风格参考：\n{recent_log.strip()}\n\n"
-            f"git diff：\n{diff_text}"
+    async def _auto_generate_commit_msg(self, working_dir: str, session: "Session") -> str:
+        return await self._generate_commit_message(
+            working_dir, True, None, session.auto_commit_backend_id or session.backend_id,
+            session.owner_id or "local", session=session,
         )
-
-        # 选择 backend：auto_commit_backend_id > session.backend_id > 第一个可用
-        backend_id = session.auto_commit_backend_id or session.backend_id
-        backend = None
-        try:
-            backend = self._get_backend(backend_id)
-        except Exception:
-            pass
-        if backend is None and self._backend_configs:
-            try:
-                backend = self._get_backend(self._backend_configs[0].id)
-            except Exception:
-                backend = None
-        if not backend:
-            return None
-
-        msg_id = f"autocommit-{uuid.uuid4().hex[:8]}"
-        aside_sid = f"autocommit:{sid_prefix}" if (sid_prefix := session.id[:8]) else f"autocommit:{msg_id}"
-        parts: list[str] = []
-
-        def on_delta(delta):
-            if delta.type == "text_delta" and delta.text:
-                parts.append(delta.text)
-
-        try:
-            send_kwargs = {
-                "messages": [], "content": prompt, "images": None,
-                "session_id": aside_sid, "message_id": msg_id, "on_delta": on_delta,
-                "agent_session_id": None,
-                "working_dir": working_dir,
-                "skip_permissions": True,
-                "sandbox_enabled": False,
-            }
-            if backend_id == session.backend_id:
-                self._add_runtime_kwargs(backend, send_kwargs, self._session_runtime(session), session)
-            await backend.send_message(**send_kwargs)
-            backend.clear_cancelled(aside_sid)
-            message = "".join(parts).strip()
-            # 清理可能的 markdown 代码块包裹
-            message = re.sub(r"^```(?:commit|message)?\s*\n?", "", message)
-            message = re.sub(r"\n?```$", "", message)
-            # ★ 强制署名：strip 掉模型自行添加的 Co-Authored-By 行，统一替换为 By AgentWithU
-            message = re.sub(r"(?m)^Co-Authored-By:.*$", "", message).strip()
-            message = re.sub(r"(?m)^By AgentWithU\s*$", "", message).strip()  # 先清除已有的，避免重复
-            if message:
-                message = message.rstrip() + "\n\nBy AgentWithU"
-            return message.strip() or None
-        except Exception as e:
-            print(f"[auto-commit] AI 生成 commit message 失败: {e}",
-                  file=sys.stderr, flush=True)
-            return None
 
     def _get_backend(self, config_id: str) -> ModelBackend:
         if config_id in self._backends:

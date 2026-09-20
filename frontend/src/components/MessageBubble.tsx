@@ -1,5 +1,6 @@
 import React, { useState, useCallback, useEffect, useRef, memo, useMemo } from 'react';
 import { markdownToHtml } from '../utils/markdown';
+import { suggestedSlashCommand } from '../utils/skillCommands';
 import { api, loadSkillImageDataUrl } from '../api';
 import type { CurrentUserProfile } from '../api';
 import type { ChatMessage, ToolCall, ContentBlock, SubagentInfo } from '../hooks/useChat';
@@ -151,6 +152,17 @@ if (typeof document !== 'undefined' && !document.getElementById('msg-bubble-css'
       opacity: 1;
     }
     /* ── 代码块复制按钮 ── */
+    .command-draft-btn {
+      display: inline-flex; align-items: center; vertical-align: baseline;
+      margin: 2px 0 2px 6px; padding: 3px 7px; min-height: 28px;
+      border: 1px solid var(--theme-border); border-radius: 5px;
+      background: var(--theme-accent-bg, rgba(9,105,218,.1));
+      color: var(--theme-accent, #0969da); cursor: pointer;
+      font: 12px/1.4 system-ui, sans-serif; white-space: nowrap;
+    }
+    .command-draft-btn:hover { filter: brightness(1.15); }
+    .command-draft-btn:focus-visible { outline: 2px solid var(--theme-accent); outline-offset: 2px; }
+    pre.md-pre > .command-draft-btn { display: flex; margin: 10px 64px 0 0; width: fit-content; }
     pre.md-pre {
       position: relative;
     }
@@ -824,6 +836,7 @@ interface Props {
   workingDir?: string;
   onFocusFile?: (relativePath: string) => void;
   onRedoMessage?: (message: ChatMessage) => void | Promise<void>;
+  onInsertCommand?: (command: string) => void;
 }
 
 // 复制气泡内容到剪贴板
@@ -1170,6 +1183,7 @@ function MessageBubbleInner({
   workingDir,
   onFocusFile,
   onRedoMessage,
+  onInsertCommand,
 }: Props) {
   const [lightboxSrc, setLightboxSrc] = useState<string | null>(null);
   const [fileLinkMenu, setFileLinkMenu] = useState<{
@@ -1184,6 +1198,35 @@ function MessageBubbleInner({
     relativePath: string;
   } | null>(null);
   const contentRef = useRef<HTMLDivElement>(null);
+
+  // 只增强已完成的助手正文，不扫描工具日志、Thinking 或用户消息。
+  // 命令来自 code 的可见文本，而非 Markdown 可伪造的 data-*；点击仅填草稿。
+  useEffect(() => {
+    const root = contentRef.current;
+    if (!root || !renderMarkdown || message.role !== 'assistant' || message.streaming || !onInsertCommand) return;
+    const buttons: HTMLButtonElement[] = [];
+    root.querySelectorAll<HTMLElement>('.msg-content code.md-code-inline, .msg-content pre.md-pre > code').forEach(code => {
+      if (code.closest('a, button')) return;
+      const clone = code.cloneNode(true) as HTMLElement;
+      clone.querySelector('.md-code-lang')?.remove();
+      const command = suggestedSlashCommand(clone.textContent || '');
+      if (!command) return;
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'command-draft-btn';
+      button.textContent = '填入输入框';
+      button.title = '填入此会话的输入框，不会发送或执行；可用性在发送时校验';
+      button.setAttribute('aria-label', `填入输入框：${command}`);
+      button.onclick = event => {
+        event.preventDefault(); event.stopPropagation();
+        onInsertCommand(command);
+      };
+      if (code.parentElement?.matches('pre.md-pre')) code.parentElement.appendChild(button);
+      else code.insertAdjacentElement('afterend', button);
+      buttons.push(button);
+    });
+    return () => buttons.forEach(button => { button.onclick = null; button.remove(); });
+  }, [message.id, message.role, message.content, message.contentBlocks, message.streaming, renderMarkdown, onInsertCommand]);
 
   // React 流式更新可能在 MutationObserver 两次回调之间替换链接节点。
   // 这里既供批量 hydrate 使用，也在真实 pointer/focus 事件发生时即时兜底，
@@ -1879,6 +1922,7 @@ function bubblePropsEqual(prev: Props, next: Props): boolean {
   return (
     prev.message.id        === next.message.id        &&
     prev.message.content   === next.message.content   &&
+    prev.message.contentBlocks === next.message.contentBlocks &&
     prev.message.images    === next.message.images    &&
     prev.message.textAttachments === next.message.textAttachments &&
     prev.message.deliveryMode === next.message.deliveryMode &&
@@ -1898,7 +1942,8 @@ function bubblePropsEqual(prev: Props, next: Props): boolean {
     prev.canBranch         === next.canBranch         &&
     prev.workingDir        === next.workingDir        &&
     prev.onFocusFile       === next.onFocusFile       &&
-    prev.onRedoMessage     === next.onRedoMessage
+    prev.onRedoMessage     === next.onRedoMessage     &&
+    prev.onInsertCommand   === next.onInsertCommand
   );
 }
 

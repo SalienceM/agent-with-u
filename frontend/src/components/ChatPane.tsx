@@ -3,7 +3,7 @@ import { api } from '../api';
 import { mergeSessionRouting, isSessionMetaReady } from '../utils/sessionRouting';
 import type { CurrentUserProfile, FollowUpCapabilities } from '../api';
 import { MessageBubble } from './MessageBubble';
-import { ChatInput } from './ChatInput';
+import { ChatInput, type ChatInputHandle } from './ChatInput';
 import { PermissionGate } from './PermissionGate';
 import { LoopPanel } from './LoopPanel';
 import { SeqTaskPanel } from './SeqTaskPanel';
@@ -189,9 +189,16 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
   const animMsgCountRef = useRef(0);
   const prevSessionRef = useRef<string | null>(sessionId);
   const onFocusRef = useRef(onFocus);
+  const chatInputRef = useRef<ChatInputHandle>(null);
   const onRequestFileFocusRef = useRef(onRequestFileFocus);
   onFocusRef.current = onFocus;
   onRequestFileFocusRef.current = onRequestFileFocus;
+
+  const handleInsertCommand = useCallback((command: string) => {
+    if (!sessionId) return;
+    onFocusRef.current();
+    chatInputRef.current?.insertCommand(command, sessionId);
+  }, [sessionId]);
 
   useLayoutEffect(() => {
     setActiveSession(sessionId ? api.peekSessionMeta(sessionId) : null);
@@ -953,6 +960,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
                   workingDir={activeSession?.workingDir}
                   onFocusFile={handleFocusLinkedFile}
                   onRedoMessage={handleRedoMessage}
+                  onInsertCommand={handleInsertCommand}
                 />
               </React.Fragment>
             );
@@ -1086,6 +1094,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
 
       {/* ---- 输入栏 ---- */}
       <ChatInput
+        ref={chatInputRef}
         onSend={handleUserSend}
         onAbort={chat.abort}
         isStreaming={chat.isStreaming}

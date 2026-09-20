@@ -1128,6 +1128,29 @@ Side RPCs: `seqtaskGet`, `seqtaskAdd`, `seqtaskEdit`, `seqtaskRemove`,
 
 ### Slash Commands
 
+**Git AI commit rules.** Settings → Git 提交 owns the only rule editor; the commit
+panel has no duplicate configuration surface. `git_commit_message.py` persists
+per-owner, executor-local defaults and canonical-repository overrides under
+`paths.sub("git-commit")`, using atomic writes and revision-checked saves.
+Precedence is project → owner default → built-in. Rules may use the improved
+built-in text, independent custom text, or a live reference to `PromptStore`;
+a deleted/empty reference fails closed instead of silently changing style.
+The signature is an explicit postprocessing option. The editor routes every read,
+save and preview to the selected executor; workspace ownership checks remain in
+the RPC gate. It protects unsaved drafts on navigation and rejects stale replies.
+
+Manual generation, `/commit`, and automated commit all use `_generate_commit_message`
+and `text_only.send_text_only` with unique isolated calls and no model tools.
+`collect_evidence` never stages: manual selected-file/working-tree evidence is
+HEAD → working tree (including both staged and unstaged edits); automatic and
+staged-only requests read only the index. New files, binary summaries, inventory,
+statistics and recent subjects are collected off-loop with file/time/size budgets
+and explicit truncation warnings. Git external diff/textconv/fsmonitor hooks are
+disabled. `gitCommitPromptPreview` shows the saved effective rules and actual
+material without a model call. Diff/history are data, not instructions. Generation
+errors no longer cause auto-commit to substitute a generic message and commit;
+existing stage/commit/push authorization is otherwise unchanged.
+
 **Portable Skill command configurations.** `awu.commands.json` (schemaVersion 1)
 maps stable installed Skill IDs to slash declarations. `skill_command_manifest.py`
 strictly validates metadata; `skill_commands.py` uses one generic registry/resolver,
@@ -1169,6 +1192,15 @@ Thoughts use the same catalog. Thoughts stays read-only, with the current Sessio
 as primary focus; only explicitly referenced Skills' commands enter its auxiliary
 snapshot. Uninstall/stale bindings/config errors cannot advertise executable entries.
 API-only/SSH transports remain unsupported for these execution routes.
+
+Finalized assistant Markdown offers **填入输入框** beside a single slash command
+in inline code or a fenced block. `MessageBubble` recognizes syntax only; it does
+not advertise registration or fetch a catalog. The action uses the originating
+`ChatPane`'s local `ChatInput` ref plus a Session ID check, preserving attachments
+and confirming replacement of a different unsent draft. It only fills/focuses the
+composer, never sends, queues, installs or executes (including during streaming).
+Normal send-time command resolution/preflight remains authoritative. Partial
+streaming text, user/system messages, Thinking and tool output are not enhanced.
 
 Frontend handles these slash commands in `useChat.ts`:
 

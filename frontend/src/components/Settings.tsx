@@ -17,6 +17,7 @@ import {
 import { readHackerMode, writeHackerMode, type HackerModeConfig } from '../utils/hackerMode';
 import { base64ToArrayBuffer, systemSpeechRate } from '../utils/realtimeVoice';
 import { UpdateCenter } from './UpdateCenter';
+import { GitCommitSettings } from './GitCommitSettings';
 
 // 发布工作台只有维护者明确打开时才下载对应前端 chunk；普通用户的启动、聊天和
 // Settings 渲染都不会加载候选列表/manifest 预览代码。
@@ -270,7 +271,7 @@ const AvatarPreviewDialog: React.FC<{
   );
 };
 
-type SettingsPage = 'user' | 'general' | 'voice' | 'appearance' | 'desktop' | 'system';
+type SettingsPage = 'user' | 'general' | 'voice' | 'appearance' | 'desktop' | 'system' | 'git';
 
 const SETTINGS_PAGES: Array<{
   id: SettingsPage;
@@ -281,6 +282,7 @@ const SETTINGS_PAGES: Array<{
 }> = [
   { id: 'user', icon: '●', label: '用户', description: '当前身份、用户名与头像' },
   { id: 'general', icon: '⌘', label: '常规', description: '对话、Session 与实验功能' },
+  { id: 'git', icon: '⑂', label: 'Git 提交', description: 'AI 提交说明与生成规则' },
   { id: 'voice', icon: '◉', label: '语音', description: '识别、朗读与实时对话' },
   { id: 'appearance', icon: '◐', label: '外观', description: '主题、透明度与背景' },
   { id: 'desktop', icon: '⌁', label: '桌面交互', description: 'Smooth 与系统快捷键', desktopOnly: true },
@@ -288,6 +290,8 @@ const SETTINGS_PAGES: Array<{
 ];
 
 interface SettingsProps {
+  gitExecKey?: string;
+  gitWorkingDir?: string;
   isOpen: boolean;
   onClose: () => void;
   config: AppConfig;
@@ -319,6 +323,8 @@ interface LegacyClaimPreview {
 }
 
 export const Settings: React.FC<SettingsProps> = ({
+  gitExecKey,
+  gitWorkingDir,
   isOpen,
   onClose,
   config,
@@ -341,6 +347,8 @@ export const Settings: React.FC<SettingsProps> = ({
   const [installing, setInstalling] = useState(false);
   const [installLog, setInstallLog] = useState('');
   const [activePage, setActivePage] = useState<SettingsPage>('user');
+  const [gitRulesDirty, setGitRulesDirty] = useState(false);
+  const canLeaveGitRules = () => !gitRulesDirty || window.confirm('提交生成规则尚未保存，是否放弃修改？');
   const [systemVoices, setSystemVoices] = useState<SpeechSynthesisVoice[]>([]);
   const [voicePreviewing, setVoicePreviewing] = useState(false);
   const [voicePreviewError, setVoicePreviewError] = useState('');
@@ -730,7 +738,7 @@ export const Settings: React.FC<SettingsProps> = ({
               AgentWithU preferences
             </div>
           </div>
-          <button onClick={onClose} style={closeBtnStyle}>✕</button>
+          <button onClick={() => { if (canLeaveGitRules()) onClose(); }} aria-label="关闭设置" style={closeBtnStyle}>✕</button>
         </div>
 
         <div style={settingsBodyStyle}>
@@ -742,7 +750,7 @@ export const Settings: React.FC<SettingsProps> = ({
                   key={page.id}
                   type="button"
                   aria-current={selected ? 'page' : undefined}
-                  onClick={() => setActivePage(page.id)}
+                  onClick={() => { if (page.id !== activePage && canLeaveGitRules()) setActivePage(page.id); }}
                   style={{
                     ...settingsNavButtonStyle,
                     color: selected ? 'var(--theme-text)' : 'var(--theme-text-muted)',
@@ -772,6 +780,7 @@ export const Settings: React.FC<SettingsProps> = ({
               </div>
             </div>
 
+        {activePage === 'git' && <GitCommitSettings initialExecKey={gitExecKey} initialWorkingDir={gitWorkingDir} onDirtyChange={setGitRulesDirty} />}
         {activePage === 'user' && (
           <div style={sectionStyle}>
             {userLoading && (

@@ -1,4 +1,11 @@
 export interface SkillInvocation { name: string; arguments: string; digest?: string }
+/** Recognizing a suggested command's shape is not registration or authorization. */
+export function suggestedSlashCommand(text: string): string | null {
+  if (text.length > 4200) return null;
+  const value = text.trim();
+  if (value.length > 4000 || /[\r\n\u0000-\u0008\u000b-\u001f\u007f-\u009f\u2028-\u202e\u2066-\u2069]/.test(value)) return null;
+  return /^\/[a-z][a-z0-9-]{0,63}(?:[ \t]+[^\r\n]+)?$/i.test(value) ? value : null;
+}
 export interface SkillCommandConfig {
   status: string; name: string; displayName?: string; owners: string[]; content: string; revision: string;
   origin: 'package' | 'compatibility' | 'new'; warnings: string[];

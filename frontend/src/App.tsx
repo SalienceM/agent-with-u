@@ -1969,6 +1969,8 @@ export const App: React.FC = () => {
 
       {/* ---- Settings 弹窗 ---- */}
       <Settings
+        gitExecKey={activeSession?.execKey || getHomeExecKey()}
+        gitWorkingDir={activeSession?.workingDir}
         isOpen={settingsOpen}
         onClose={() => setSettingsOpen(false)}
         config={config}
