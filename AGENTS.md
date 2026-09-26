@@ -649,6 +649,17 @@ Loop RPCs: `loopGetState`, `loopSubmitIdea`, `loopRemoveIdea`, `loopSealIdea`,
 
 ### Session workbench tabs
 
+**Chat image viewer.** Message attachments, Markdown/tool images and composer thumbnails
+share `ImageLightbox.tsx`. Mount through `AppModalPortal`, outside chat transforms and
+overflow/paint containment; `AppModalVisibilityContext` also unmounts its global listeners
+while the owning Session is hidden. Fit natural image dimensions to a symmetric stage in
+the visual viewport (including resize), without upscaling small originals. Wheel/trackpad
+and pointer-pinch zoom continuously around the pointer; bounded pan reaches every edge.
+Fit/1:1, double-click, keyboard controls, focus return, load/retry and a focus trap stay
+local to the viewer, with no image upload, model calls or backend changes. Geometry lives
+in `utils/imageViewport.ts`; verify unit geometry and `image-preview.spec.ts` on desktop
+and touch viewports when changing this behavior.
+
 **Desktop UI density.** `frontend/src/utils/uiDensity.ts` supplies shared `--ui-*`
 spacing/height tokens to `.app-root` only for viewports wider than 768px with a fine
 pointer. Desktop workbench chrome, Session rows, composer, Settings, Backend/connection
@@ -1182,6 +1193,17 @@ Side RPCs: `seqtaskGet`, `seqtaskAdd`, `seqtaskEdit`, `seqtaskRemove`,
 `ChatInput` toolbar (`onAdjustFontSize` → App `updateConfig`, clamped 11–28).
 
 ### Slash Commands
+
+**Directory-level @ references.** ChatInput and AdvancedPromptTextarea separate reference
+selection from browsing: name click / Enter inserts a file or trailing-slash directory
+reference; the explicit Enter-directory button / Tab / Right browses children. Current
+directory (including root/empty) is selectable via its button or Ctrl/Meta+Enter, with Left
+returning to the parent. `promptReferences.ts` formats space-escaped paths and resolves
+typed prefixes such as `@src/components/`. Navigation keeps that path in the draft, not
+hidden state alone. Only direct children are fetched on the Session executor; selection
+never loads file bodies, sends a turn or grants execution permissions. Request versions
+invalidate late results on navigation, close and Session/node/workspace changes. Loading,
+empty and failed listings remain distinct; a failed/unverified directory cannot be selected.
 
 **Git AI commit rules.** Settings → Git 提交 owns the only rule editor; the commit
 panel has no duplicate configuration surface. `git_commit_message.py` persists

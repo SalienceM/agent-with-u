@@ -12,6 +12,7 @@ import { RealtimeVoiceBar } from './RealtimeVoiceBar';
 import type { RealtimeVoiceInteractionMode } from '../utils/realtimeVoice';
 import { uuid } from '../utils/uuid';
 import { inputHistoryStore, normalizeInputHistory } from '../utils/inputHistory';
+import { fileReferenceLocation, formatFileReference } from '../utils/promptReferences';
 import {
   BackendRuntimeFields,
   formatRuntimeLabel,
@@ -485,6 +486,9 @@ const ChatInputInner = forwardRef<ChatInputHandle, Props>(({
   const [fileSelectedIndex, setFileSelectedIndex] = useState(0);
   const [currentDir, setCurrentDir] = useState('');
   const [fileQuery, setFileQuery] = useState('');
+  const [fileLoading, setFileLoading] = useState(false);
+  const [fileError, setFileError] = useState('');
+  const fileReadyRef = useRef(false);
   const filePopupRef = useRef<HTMLDivElement>(null);
 
   const showFilePickerRef = useRef(false);
@@ -669,6 +673,8 @@ const ChatInputInner = forwardRef<ChatInputHandle, Props>(({
       el.selectionStart = el.selectionEnd = restored.length;
     }
     setShowCommands(false);
+    filePickerLoadVersionRef.current += 1;
+    sessionLookupVersionRef.current += 1;
     setShowFilePicker(false);
     setShowSessionPicker(false);
     showAttachmentNotice('');
@@ -716,6 +722,14 @@ const ChatInputInner = forwardRef<ChatInputHandle, Props>(({
   workingDirRef.current = workingDir;
   const execKeyRef = useRef(execKey);
   execKeyRef.current = execKey;
+
+  useEffect(() => {
+    filePickerLoadVersionRef.current += 1;
+    showFilePickerRef.current = false;
+    setShowFilePicker(false);
+    setFileEntries([]);
+    return () => { filePickerLoadVersionRef.current += 1; };
+  }, [sessionId, execKey, workingDir]);
 
   // ── 清理上下文 ──
   const [showNewSessionConfirm, setShowNewSessionConfirm] = useState(false);
@@ -1094,11 +1108,36 @@ const ChatInputInner = forwardRef<ChatInputHandle, Props>(({
     return normalized.substring(0, lastSep) || '.';
   };
 
-  // 进入子目录
-  const navigateToDir = useCallback((dirPath: string) => {
+  // 所有层级共用版本守卫：关窗、切 Session、快速返回后不接受旧目录结果。
+  const loadFileDirectory = useCallback((dirPath: string) => {
+    const version = ++filePickerLoadVersionRef.current;
+    currentDirRef.current = dirPath;
     setCurrentDir(dirPath);
+    fileReadyRef.current = false;
+    setFileLoading(true);
+    setFileError('');
+    setFileEntries([]);
+    fileEntriesRef.current = [];
+    api.listDirectory(dirPath, workingDirRef.current || '.', execKeyRef.current).then((entries) => {
+      if (version !== filePickerLoadVersionRef.current) return;
+      fileReadyRef.current = true;
+      fileEntriesRef.current = entries;
+      setFileEntries(entries);
+    }).catch((error) => {
+      if (version === filePickerLoadVersionRef.current) setFileError(String(error));
+    }).finally(() => {
+      if (version !== filePickerLoadVersionRef.current) return;
+      setFileLoading(false);
+    });
+  }, []);
+
+  // 进入子目录仅浏览；把路径保留在草稿中，关闭弹窗也不会丢掉已定位的目录。
+  const navigateToDir = useCallback((dirPath: string) => {
+    const token = formatFileReference(dirPath, true);
     setFileQuery('');
+    fileQueryRef.current = '';
     setFileSelectedIndex(0);
+    fileSelectedIndexRef.current = 0;
     // 清除光标前 @ 后面的查询词
     const el = ref.current;
     if (el) {
@@ -1106,38 +1145,40 @@ const ChatInputInner = forwardRef<ChatInputHandle, Props>(({
       const before = el.value.substring(0, cursor);
       const lastAt = before.lastIndexOf('@');
       if (lastAt >= 0) {
-        const newVal = el.value.substring(0, lastAt + 1) + el.value.substring(cursor);
+        const newVal = el.value.substring(0, lastAt) + token + el.value.substring(cursor);
         el.value = newVal;
-        el.selectionStart = lastAt + 1;
-        el.selectionEnd = lastAt + 1;
+        el.selectionStart = el.selectionEnd = lastAt + token.length;
+        el.focus();
+        saveSessionDraft(newVal);
+        scheduleTextareaResize(true);
       }
     }
-    api.listDirectory(dirPath, workingDirRef.current, execKeyRef.current).then((entries) => {
-      if (Array.isArray(entries)) setFileEntries(entries);
-    });
-  }, []);
+    loadFileDirectory(dirPath);
+  }, [loadFileDirectory, saveSessionDraft, scheduleTextareaResize]);
 
   const navigateToDirRef = useRef(navigateToDir);
   navigateToDirRef.current = navigateToDir;
 
   // 选中文件：在光标处替换 @query → @path
-  const insertFileRef = useCallback((filePath: string) => {
+  const insertFileRef = useCallback((filePath: string, isDir = false) => {
     const el = ref.current;
     if (!el) return;
     const cursor = el.selectionStart ?? el.value.length;
     const before = el.value.substring(0, cursor);
     const lastAt = before.lastIndexOf('@');
     if (lastAt < 0) { setShowFilePicker(false); return; }
-    const normalized = filePath.replace(/\\/g, '/');
-    const newVal = el.value.substring(0, lastAt) + '@' + normalized + ' ' + el.value.substring(cursor);
+    const token = formatFileReference(filePath, isDir);
+    const newVal = el.value.substring(0, lastAt) + token + ' ' + el.value.substring(cursor);
     el.value = newVal;
-    const newCursor = lastAt + 1 + normalized.length + 1;
+    const newCursor = lastAt + token.length + 1;
     el.selectionStart = newCursor;
     el.selectionEnd = newCursor;
     el.focus();
     saveSessionDraft(el.value);
     textareaHeightCappedRef.current = false;
     scheduleTextareaResize(true);
+    filePickerLoadVersionRef.current += 1;
+    showFilePickerRef.current = false;
     setShowFilePicker(false);
     setFileQuery('');
   }, [saveSessionDraft, scheduleTextareaResize]);
@@ -1185,6 +1226,11 @@ const ChatInputInner = forwardRef<ChatInputHandle, Props>(({
       return;
     }
     // 保存用户原始输入，不重复保存自动注入的参数，更不保存本次代确认开关。
+    filePickerLoadVersionRef.current += 1;
+    sessionLookupVersionRef.current += 1;
+    showFilePickerRef.current = false;
+    setShowFilePicker(false);
+    setShowSessionPicker(false);
     const historyPersisted = text ? pushHistory(text) : true;
     // ★ 图像 backend：自动注入 --size 参数
     if (isImageBackendRef.current && imageSizeRef.current && imageSizeRef.current !== 'auto' && text) {
@@ -1273,7 +1319,7 @@ const ChatInputInner = forwardRef<ChatInputHandle, Props>(({
         if (e.key === 'ArrowDown') {
           e.preventDefault();
           setFileSelectedIndex((prev) => {
-            const next = Math.min(filtered.length - 1, prev + 1);
+            const next = Math.max(0, Math.min(filtered.length - 1, prev + 1));
             fileSelectedIndexRef.current = next;
             return next;
           });
@@ -1281,24 +1327,33 @@ const ChatInputInner = forwardRef<ChatInputHandle, Props>(({
         }
         if (e.key === 'Enter' && !e.shiftKey) {
           e.preventDefault();
+          if (!fileReadyRef.current) return;
+          if (e.ctrlKey || e.metaKey || (!filtered.length && !q)) {
+            insertFileRefRef.current(currentDirRef.current, true);
+            return;
+          }
+          const entry = filtered[fileSelectedIndexRef.current];
+          if (entry) insertFileRefRef.current(entry.path, entry.isDir);
+          return;
+        }
+        if (e.key === 'Tab' || (e.key === 'ArrowRight' && !e.shiftKey && !e.ctrlKey && !e.metaKey)) {
+          e.preventDefault();
+          if (!fileReadyRef.current) return;
           const entry = filtered[fileSelectedIndexRef.current];
           if (entry) {
             if (entry.isDir) navigateToDirRef.current(entry.path);
-            else insertFileRefRef.current(entry.path);
+            else if (e.key === 'Tab') insertFileRefRef.current(entry.path);
           }
           return;
         }
-        if (e.key === 'Tab') {
-          e.preventDefault();
-          const entry = filtered[fileSelectedIndexRef.current];
-          if (entry) {
-            if (entry.isDir) navigateToDirRef.current(entry.path);
-            else insertFileRefRef.current(entry.path);
-          }
-          return;
+        if (e.key === 'ArrowLeft' && !e.shiftKey && !e.ctrlKey && !e.metaKey) {
+          const parent = getParentDir(currentDirRef.current);
+          if (parent) { e.preventDefault(); navigateToDirRef.current(parent); return; }
         }
         if (e.key === 'Escape') {
           e.preventDefault();
+          filePickerLoadVersionRef.current += 1;
+          showFilePickerRef.current = false;
           setShowFilePicker(false);
           return;
         }
@@ -1543,24 +1598,19 @@ const ChatInputInner = forwardRef<ChatInputHandle, Props>(({
           return;
         }
       }
-      if (!afterAt.includes(' ') && !afterAt.includes('\n')) {
+      if (!/[\r\n]/.test(afterAt) && !/(^|[^\\])\s/.test(afterAt)) {
         sessionLookupVersionRef.current += 1;
-        const query = afterAt;
-        setFileQuery(query);
+        const location = fileReferenceLocation(afterAt);
+        setFileQuery(location.query);
+        fileQueryRef.current = location.query;
         setFileSelectedIndex(0);
-        if (!showFilePickerRef.current) {
-          // 首次打开：加载工作目录
-          setCurrentDir('.');
-          const wd = workingDirRef.current || '.';
-          const loadVersion = ++filePickerLoadVersionRef.current;
-          api.listDirectory(wd, wd, execKeyRef.current).then((entries) => {
-            if (loadVersion !== filePickerLoadVersionRef.current) return;
-            if (Array.isArray(entries)) {
-              setFileEntries(entries);
-              setShowFilePicker(true);
-            }
-          });
+        fileSelectedIndexRef.current = 0;
+        if (!showFilePickerRef.current || location.directory !== currentDirRef.current) {
+          loadFileDirectory(location.directory);
         }
+        showFilePickerRef.current = true;
+        setShowFilePicker(true);
+        setShowSessionPicker(false);
         setShowCommands(false);
         return;
       }
@@ -1574,6 +1624,7 @@ const ChatInputInner = forwardRef<ChatInputHandle, Props>(({
       setSessionQuery('');
     }
     if (showFilePickerRef.current) {
+      showFilePickerRef.current = false;
       setShowFilePicker(false);
       setFileQuery('');
     }
@@ -1587,7 +1638,7 @@ const ChatInputInner = forwardRef<ChatInputHandle, Props>(({
     } else {
       setShowCommands(false);
     }
-  }, [addTextAttachment, saveSessionDraft, scheduleTextareaResize]);
+  }, [addTextAttachment, loadFileDirectory, saveSessionDraft, scheduleTextareaResize]);
 
   // ── 点击选择命令 ──
   const handleSelectCommand = useCallback((cmd: SlashCommand) => {
@@ -1621,10 +1672,8 @@ const ChatInputInner = forwardRef<ChatInputHandle, Props>(({
   // 滚动选中项到可见区域（文件选择器）
   useEffect(() => {
     if (showFilePicker && filePopupRef.current) {
-      const items = filePopupRef.current.querySelectorAll<HTMLElement>('[data-file-item]');
-      if (items[fileSelectedIndex]) {
-        items[fileSelectedIndex].scrollIntoView({ block: 'nearest' });
-      }
+      filePopupRef.current.querySelector<HTMLElement>(`[data-file-index="${fileSelectedIndex}"]`)
+        ?.scrollIntoView({ block: 'nearest' });
     }
   }, [fileSelectedIndex, showFilePicker]);
 
@@ -1913,47 +1962,53 @@ const ChatInputInner = forwardRef<ChatInputHandle, Props>(({
 
       {/* ★ @ 文件选择器弹窗 */}
       {showFilePicker && (
-        <div ref={filePopupRef} style={filePickerPopupStyle}>
+        <div ref={filePopupRef} style={filePickerPopupStyle} role="dialog" aria-label="引用文件或目录"
+          onMouseDown={(event) => event.preventDefault()}>
           {/* 当前目录路径 */}
           <div style={filePickerHeaderStyle}>
             <span style={{ opacity: 0.6, fontSize: 10 }}>📁</span>
-            <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', direction: 'rtl', textAlign: 'left' }}>
+            {parentDir && <button type="button" tabIndex={-1} aria-label="上级目录" title="上级目录（←）"
+              style={fileActionStyle} onClick={() => navigateToDirRef.current(parentDir)}>←</button>}
+            <span title={currentDir === '.' ? workingDir : currentDir} style={{ flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', direction: 'rtl', textAlign: 'left' }}>
               {currentDir === '.' ? (workingDir || '.').replace(/\\/g, '/').split('/').pop() || '.' : currentDir}
             </span>
+            <button type="button" tabIndex={-1} style={fileActionStyle} disabled={fileLoading || !!fileError}
+              title="引用当前目录（Ctrl/⌘+Enter），只填入，不发送"
+              onClick={() => insertFileRefRef.current(currentDir, true)}>引用当前目录</button>
           </div>
-          {/* 上级目录 */}
-          {parentDir && (
-            <div
-              data-file-item
-              style={{ ...fileItemStyle, color: 'var(--theme-text-muted, #656d76)' }}
-              onClick={() => navigateToDirRef.current(parentDir)}
-              onMouseEnter={() => setFileSelectedIndex(-1)}
-            >
-              <span>↩</span>
-              <span>..</span>
+          {fileLoading && <div role="status" style={{ padding: 10, fontSize: 12 }}>正在读取目录…</div>}
+          {fileError && <div role="alert" style={{ padding: 10, fontSize: 12 }}>{fileError}
+            <button type="button" style={fileActionStyle} onClick={() => loadFileDirectory(currentDir)}>重试</button>
+          </div>}
+          {!fileLoading && !fileError && filteredEntries.length === 0 && (
+            <div style={{ padding: '8px 12px', color: 'var(--theme-text-muted)', fontSize: 12 }}>
+              {fileQuery ? '无匹配文件或目录' : '空目录，可直接引用当前目录'}
             </div>
-          )}
-          {filteredEntries.length === 0 && (
-            <div style={{ padding: '8px 12px', color: 'var(--theme-text-muted)', fontSize: 12 }}>无匹配文件</div>
           )}
           {filteredEntries.map((entry, i) => (
             <div
               key={entry.path}
-              data-file-item
+              data-file-index={i}
               style={{
                 ...fileItemStyle,
                 background: i === fileSelectedIndex ? 'var(--theme-bg-tertiary, #eaeef2)' : 'transparent',
               }}
-              onClick={() => entry.isDir ? navigateToDirRef.current(entry.path) : insertFileRefRef.current(entry.path)}
               onMouseEnter={() => setFileSelectedIndex(i)}
             >
-              <span>{entry.isDir ? '📁' : '📄'}</span>
-              <span style={{ flex: 1 }}>{entry.name}</span>
-              {entry.isDir && <span style={{ fontSize: 10, opacity: 0.5 }}>▶</span>}
+              <button type="button" tabIndex={-1} aria-label={`引用${entry.isDir ? '目录' : '文件'} ${entry.name}`}
+                title={`${entry.path} · 点击引用，不发送`}
+                style={{ ...fileActionStyle, flex: 1, minWidth: 0, display: 'flex', gap: 8, textAlign: 'left', border: 0, background: 'transparent' }}
+                onClick={() => insertFileRefRef.current(entry.path, entry.isDir)}>
+                <span>{entry.isDir ? '📁' : '📄'}</span>
+                <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{entry.name}</span>
+              </button>
+              {entry.isDir && <button type="button" tabIndex={-1} aria-label={`进入目录 ${entry.name}`}
+                title="进入目录（Tab / →）" style={fileActionStyle}
+                onClick={() => navigateToDirRef.current(entry.path)}>进入 ›</button>}
             </div>
           ))}
           <div style={filePickerFooterStyle}>
-            ↑↓ 导航 · Enter/Tab 进入/选择 · Esc 关闭
+            ↑↓ 选择 · Enter 引用 · Tab/→ 进入 · Ctrl+Enter 当前目录 · Esc 关闭
           </div>
         </div>
       )}
@@ -2007,7 +2062,7 @@ const ChatInputInner = forwardRef<ChatInputHandle, Props>(({
           className="chat-textarea"
           placeholder={isStreaming || seqCount > 0
             ? `继续输入，Enter 自动排队${seqCount ? ` · 待发 ${seqCount}` : ''}`
-            : '输入消息… 长文本会自动收纳为附件 · @ 引用文件 · Ctrl+V 粘贴'}
+            : '输入消息… 长文本会自动收纳为附件 · @ 引用文件/目录 · Ctrl+V 粘贴'}
           onKeyDown={handleKeyDown}
           onCompositionStart={handleCompositionStart}
           onCompositionEnd={handleCompositionEnd}
@@ -2225,6 +2280,12 @@ const fileItemStyle: React.CSSProperties = {
   transition: 'background 0.1s',
   borderBottom: '1px solid var(--theme-border, rgba(0,0,0,0.05))',
   color: 'var(--theme-text, #1f2328)',
+};
+
+const fileActionStyle: React.CSSProperties = {
+  padding: '6px 8px', minHeight: 32, flexShrink: 0, borderRadius: 4,
+  border: '1px solid var(--theme-border)', background: 'var(--theme-bg-secondary)',
+  color: 'var(--theme-text)', font: 'inherit', cursor: 'pointer',
 };
 
 const filePickerFooterStyle: React.CSSProperties = {

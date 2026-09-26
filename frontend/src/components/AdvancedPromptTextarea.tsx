@@ -1,9 +1,11 @@
 import React, {
-  useCallback, useEffect, useId, useMemo, useRef, useState,
+  useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState,
 } from 'react';
 import { api, onCurrentUserChanged } from '../api';
 import {
   detectPromptReference,
+  fileReferenceLocation,
+  formatFileReference,
   replacePromptReference,
   type PromptReferenceTrigger,
 } from '../utils/promptReferences';
@@ -63,6 +65,7 @@ export const AdvancedPromptTextarea: React.FC<AdvancedPromptTextareaProps> = ({
   const inputRef = textareaRef || fallbackRef;
   const popupRef = useRef<HTMLDivElement>(null);
   const composingRef = useRef(false);
+  const pendingCaretRef = useRef<number | null>(null);
   const activeTriggerRef = useRef<PromptReferenceTrigger | null>(null);
   const pickerRef = useRef<PickerMode>(null);
   const fileRequestRef = useRef(0);
@@ -83,6 +86,7 @@ export const AdvancedPromptTextarea: React.FC<AdvancedPromptTextareaProps> = ({
   const [fileQuery, setFileQuery] = useState('');
   const [currentDir, setCurrentDir] = useState('.');
   const [fileLoading, setFileLoading] = useState(false);
+  const [fileError, setFileError] = useState('');
   const [sessionRefs, setSessionRefs] = useState<any[]>([]);
   const [sessionQuery, setSessionQuery] = useState('');
   const [sessionLoading, setSessionLoading] = useState(false);
@@ -103,13 +107,18 @@ export const AdvancedPromptTextarea: React.FC<AdvancedPromptTextareaProps> = ({
   }, [setPicker]);
 
   const restoreCaret = useCallback((cursor: number) => {
-    window.requestAnimationFrame(() => {
-      const input = inputRef.current;
-      if (!input) return;
-      input.focus();
-      input.setSelectionRange(cursor, cursor);
-    });
-  }, [inputRef]);
+    pendingCaretRef.current = cursor;
+  }, []);
+  // 跟随受控 value 的同次提交恢复，避免延迟 RAF 抢走用户下一次编辑的选区。
+  useLayoutEffect(() => {
+    const cursor = pendingCaretRef.current;
+    if (cursor === null) return;
+    pendingCaretRef.current = null;
+    const input = inputRef.current;
+    if (!input) return;
+    input.focus();
+    input.setSelectionRange(cursor, cursor);
+  });
 
   const replaceActive = useCallback((replacement: string, close = true) => {
     const input = inputRef.current;
@@ -125,12 +134,16 @@ export const AdvancedPromptTextarea: React.FC<AdvancedPromptTextareaProps> = ({
   const loadDirectory = useCallback(async (dir: string) => {
     const version = ++fileRequestRef.current;
     setFileLoading(true);
-    const entries = await api.listDirectory(
-      dir || '.', workingDir || '.', execKey, false,
-    ).catch(() => [] as FileEntry[]);
-    if (version !== fileRequestRef.current) return;
-    setFileEntries(Array.isArray(entries) ? entries : []);
-    setFileLoading(false);
+    setFileEntries([]);
+    setFileError('');
+    try {
+      const entries = await api.listDirectory(dir || '.', workingDir || '.', execKey, false);
+      if (version === fileRequestRef.current) setFileEntries(entries);
+    } catch (error) {
+      if (version === fileRequestRef.current) setFileError(String(error));
+    } finally {
+      if (version === fileRequestRef.current) setFileLoading(false);
+    }
   }, [execKey, workingDir]);
 
   const loadSessions = useCallback(async (query: string) => {
@@ -215,17 +228,18 @@ export const AdvancedPromptTextarea: React.FC<AdvancedPromptTextareaProps> = ({
     }
 
     sessionRequestRef.current += 1;
-    setFileQuery(trigger.query);
+    const location = fileReferenceLocation(trigger.query);
+    setFileQuery(location.query);
     setSelectedIndex(0);
-    if (pickerRef.current !== 'file') {
-      setCurrentDir('.');
-      setFileEntries([]);
+    if (pickerRef.current !== 'file' || currentDir !== location.directory) {
+      setCurrentDir(location.directory);
       setPicker('file');
-      void loadDirectory('.');
+      void loadDirectory(location.directory);
     }
-  }, [closePicker, loadDirectory, loadSessions, loadSkills, enableSkillReferences, onValueChange, restoreCaret, setPicker]);
+  }, [closePicker, currentDir, loadDirectory, loadSessions, loadSkills, enableSkillReferences, onValueChange, restoreCaret, setPicker]);
 
   const handleChange = useCallback((event: React.ChangeEvent<HTMLTextAreaElement>) => {
+    pendingCaretRef.current = null;
     const nextValue = event.currentTarget.value;
     const cursor = event.currentTarget.selectionStart ?? nextValue.length;
     onValueChange(nextValue);
@@ -252,11 +266,12 @@ export const AdvancedPromptTextarea: React.FC<AdvancedPromptTextareaProps> = ({
     const trigger = activeTriggerRef.current
       || detectPromptReference(value, input?.selectionStart ?? value.length);
     if (trigger) {
-      const next = replacePromptReference(value, trigger, '@');
+      const token = formatFileReference(path || '.', true);
+      const next = replacePromptReference(value, trigger, token);
       onValueChange(next.value);
       activeTriggerRef.current = {
         kind: 'file', start: trigger.start, cursor: next.cursor,
-        query: '', expandSessionPrefix: false,
+        query: token.slice(1), expandSessionPrefix: false,
       };
       restoreCaret(next.cursor);
     }
@@ -266,7 +281,7 @@ export const AdvancedPromptTextarea: React.FC<AdvancedPromptTextareaProps> = ({
     void loadDirectory(path || '.');
   }, [inputRef, loadDirectory, onValueChange, restoreCaret, value]);
 
-  const chooseFileOption = useCallback((index: number) => {
+  const chooseFileOption = useCallback((index: number, browse = false) => {
     if (showParentOption && index === 0 && parentDir) {
       navigateToDirectory(parentDir);
       return;
@@ -278,8 +293,8 @@ export const AdvancedPromptTextarea: React.FC<AdvancedPromptTextareaProps> = ({
     }
     const entry = filteredFiles[index - fileEntryOffset];
     if (!entry) return;
-    if (entry.isDir) navigateToDirectory(entry.path);
-    else replaceActive(`@${entry.path.replace(/\\/g, '/')} `);
+    if (entry.isDir && browse) navigateToDirectory(entry.path);
+    else replaceActive(`${formatFileReference(entry.path, entry.isDir)} `);
   }, [
     enterSessionPicker, fileEntryOffset, filteredFiles, navigateToDirectory,
     parentDir, replaceActive, showParentOption, showSessionShortcut,
@@ -287,6 +302,23 @@ export const AdvancedPromptTextarea: React.FC<AdvancedPromptTextareaProps> = ({
 
   const handlePickerKey = useCallback((event: React.KeyboardEvent<HTMLTextAreaElement>): boolean => {
     if (!pickerRef.current) return false;
+    if (event.nativeEvent.isComposing || composingRef.current || event.keyCode === 229) return true;
+    if (pickerRef.current === 'file') {
+      if (event.key === 'Enter' && !event.shiftKey && (event.ctrlKey || event.metaKey || fileOptionCount === 0 && !fileQuery)) {
+        event.preventDefault();
+        if (!fileLoading && !fileError) replaceActive(`${formatFileReference(currentDir, true)} `);
+        return true;
+      }
+      if (event.key === 'ArrowLeft' && !event.shiftKey && !event.ctrlKey && !event.metaKey && parentDir) {
+        event.preventDefault(); navigateToDirectory(parentDir); return true;
+      }
+      if (event.key === 'ArrowRight' && !event.shiftKey && !event.ctrlKey && !event.metaKey) {
+        event.preventDefault();
+        const entry = filteredFiles[selectedIndex - fileEntryOffset];
+        if (!fileLoading && entry?.isDir) navigateToDirectory(entry.path);
+        return true;
+      }
+    }
     const matches = skillMatches;
     const count = pickerRef.current === 'skill' ? matches.length : pickerRef.current === 'session' ? sessionRefs.length : fileOptionCount;
     if (event.key === 'ArrowUp' || event.key === 'ArrowDown') {
@@ -304,7 +336,7 @@ export const AdvancedPromptTextarea: React.FC<AdvancedPromptTextareaProps> = ({
         const entry = sessionRefs[selectedIndex];
         if (entry?.id) replaceActive(`@SESSION:${entry.id} `);
       } else {
-        chooseFileOption(selectedIndex);
+        if (!fileLoading && !fileError) chooseFileOption(selectedIndex, event.key === 'Tab');
       }
       return true;
     }
@@ -314,7 +346,8 @@ export const AdvancedPromptTextarea: React.FC<AdvancedPromptTextareaProps> = ({
       return true;
     }
     return false;
-  }, [chooseFileOption, closePicker, fileOptionCount, replaceActive, selectedIndex, sessionRefs, skillMatches]);
+  }, [chooseFileOption, closePicker, currentDir, fileEntryOffset, fileError, fileLoading, fileOptionCount, fileQuery,
+    filteredFiles, navigateToDirectory, parentDir, replaceActive, selectedIndex, sessionRefs, skillMatches]);
 
   const handleKeyDown = useCallback((event: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (handlePickerKey(event)) return;
@@ -374,7 +407,7 @@ export const AdvancedPromptTextarea: React.FC<AdvancedPromptTextareaProps> = ({
     sessionRequestRef.current += 1;
     skillRequestRef.current += 1;
   }, []);
-  useEffect(() => { closePicker(); setSkillRefs([]); }, [sessionId, execKey, closePicker]);
+  useEffect(() => { closePicker(); setSkillRefs([]); }, [sessionId, execKey, workingDir, closePicker]);
   useEffect(() => onCurrentUserChanged(() => { closePicker(); setSkillRefs([]); }), [closePicker]);
 
   const popup = picker && popupPosition ? (
@@ -383,7 +416,7 @@ export const AdvancedPromptTextarea: React.FC<AdvancedPromptTextareaProps> = ({
         ref={popupRef}
         id={listboxId}
         role="listbox"
-        aria-label={picker === 'skill' ? '引用 Skill 手册' : picker === 'session' ? '引用会话' : '引用工作区文件'}
+        aria-label={picker === 'skill' ? '引用 Skill 手册' : picker === 'session' ? '引用会话' : '引用工作区文件或目录'}
         onMouseDown={(event) => event.preventDefault()}
         style={{
           position: 'fixed', zIndex: 40040,
@@ -401,9 +434,12 @@ export const AdvancedPromptTextarea: React.FC<AdvancedPromptTextareaProps> = ({
           <span style={{ flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
             {picker === 'skill' ? '📖 引用 Skill 使用知识（不执行）' : picker === 'session'
               ? `引用会话${sessionQuery ? ` · ${sessionQuery}` : ''}`
-              : currentDir === '.' ? '引用工作区文件或会话' : currentDir}
+              : currentDir === '.' ? '引用工作区文件、目录或会话' : currentDir}
           </span>
           {(picker === 'session' ? sessionLoading : fileLoading) && <span>…</span>}
+          {picker === 'file' && <button type="button" tabIndex={-1} style={directoryActionStyle}
+            disabled={fileLoading || !!fileError} title="Ctrl/⌘+Enter 引用当前目录，只填入不发送"
+            onClick={() => replaceActive(`${formatFileReference(currentDir, true)} `)}>引用当前目录</button>}
         </div>
         <div style={{ overflowY: 'auto', minHeight: 0 }}>
           {picker === 'skill' ? <>
@@ -427,6 +463,9 @@ export const AdvancedPromptTextarea: React.FC<AdvancedPromptTextareaProps> = ({
             )) : <EmptyPicker text={sessionLoading ? '正在查询会话…' : '无匹配会话'} />
           ) : (
             <>
+              {fileError && <div role="alert" style={{ padding: 10 }}>{fileError}
+                <button type="button" onClick={() => void loadDirectory(currentDir)}>重试</button>
+              </div>}
               {showParentOption && parentDir && (
                 <ReferenceOption
                   index={0}
@@ -458,19 +497,21 @@ export const AdvancedPromptTextarea: React.FC<AdvancedPromptTextareaProps> = ({
                     selected={index === selectedIndex}
                     icon={entry.isDir ? '📁' : '📄'}
                     label={entry.name}
-                    hint={entry.isDir ? '进入' : entry.path}
-                    onChoose={() => entry.isDir
-                      ? navigateToDirectory(entry.path)
-                      : replaceActive(`@${entry.path.replace(/\\/g, '/')} `)}
+                    hint={entry.isDir ? '引用目录' : entry.path}
+                    onChoose={() => replaceActive(`${formatFileReference(entry.path, entry.isDir)} `)}
+                    onBrowse={entry.isDir ? () => navigateToDirectory(entry.path) : undefined}
                     onHover={setSelectedIndex}
                   />
                 );
               })}
-              {!fileLoading && fileOptionCount === 0 && <EmptyPicker text="无匹配文件" />}
+              {fileLoading && <EmptyPicker text="正在读取目录…" />}
+              {!fileLoading && !fileError && !filteredFiles.length && <EmptyPicker text={fileQuery ? '无匹配文件或目录' : '空目录，可直接引用当前目录'} />}
             </>
           )}
         </div>
-        <div style={popupFooterStyle}>↑↓ 导航 · Enter/Tab 选择 · Esc 关闭</div>
+        <div style={popupFooterStyle}>{picker === 'file'
+          ? '↑↓ 选择 · Enter 引用 · Tab/→ 进入 · Ctrl+Enter 当前目录 · Esc 关闭'
+          : '↑↓ 导航 · Enter/Tab 选择 · Esc 关闭'}</div>
       </div>
     </AppModalPortal>
   ) : null;
@@ -507,8 +548,9 @@ export const AdvancedPromptTextarea: React.FC<AdvancedPromptTextareaProps> = ({
 
 const ReferenceOption: React.FC<{
   index: number; selected: boolean; icon: string; label: string; hint?: string;
-  onChoose: () => void; onHover: (index: number) => void;
-}> = ({ index, selected, icon, label, hint, onChoose, onHover }) => (
+  onChoose: () => void; onHover: (index: number) => void; onBrowse?: () => void;
+}> = ({ index, selected, icon, label, hint, onChoose, onHover, onBrowse }) => (
+  <div style={{ display: 'flex', alignItems: 'center', minWidth: 0 }}>
   <button
     type="button"
     tabIndex={-1}
@@ -518,7 +560,7 @@ const ReferenceOption: React.FC<{
     onMouseEnter={() => onHover(index)}
     onClick={onChoose}
     style={{
-      display: 'flex', alignItems: 'center', gap: 8, width: '100%', minHeight: 34,
+      display: 'flex', alignItems: 'center', gap: 8, flex: 1, minWidth: 0, width: '100%', minHeight: 34,
       padding: '6px 10px', border: 0, textAlign: 'left', cursor: 'pointer',
       color: 'var(--theme-text)',
       background: selected ? 'var(--theme-accent-bg, rgba(9,105,218,.12))' : 'transparent',
@@ -529,7 +571,16 @@ const ReferenceOption: React.FC<{
     <span style={{ flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{label}</span>
     {hint && <span style={{ maxWidth: '45%', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', color: 'var(--theme-text-muted)', fontSize: 10 }}>{hint}</span>}
   </button>
+  {onBrowse && <button type="button" tabIndex={-1} aria-label={`进入目录 ${label}`}
+    title="进入目录（Tab / →）" style={directoryActionStyle} onClick={onBrowse}>进入 ›</button>}
+  </div>
 );
+
+const directoryActionStyle: React.CSSProperties = {
+  flexShrink: 0, minHeight: 32, padding: '5px 8px', marginRight: 4, borderRadius: 4,
+  border: '1px solid var(--theme-border)', color: 'var(--theme-text)',
+  background: 'var(--theme-bg-secondary)', font: 'inherit', fontSize: 11, cursor: 'pointer',
+};
 
 const EmptyPicker: React.FC<{ text: string }> = ({ text }) => (
   <div style={{ padding: '10px 12px', color: 'var(--theme-text-muted)', fontSize: 12 }}>{text}</div>

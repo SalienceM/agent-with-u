@@ -1,5 +1,6 @@
 import React, { useState } from 'react';
 import type { ImageAttachment } from '../hooks/useClipboardImage';
+import { ImageLightbox } from './ImageLightbox';
 
 interface Props {
   images: ImageAttachment[];
@@ -8,21 +9,6 @@ interface Props {
 
 export const ImagePreview: React.FC<Props> = ({ images, onRemove }) => {
   const [previewImage, setPreviewImage] = useState<string | null>(null);
-
-  // Esc 键关闭预览
-  React.useEffect(() => {
-    const handleEsc = (e: KeyboardEvent) => {
-      if (e.key === 'Escape' && previewImage) {
-        setPreviewImage(null);
-      }
-    };
-    if (previewImage) {
-      window.addEventListener('keydown', handleEsc);
-    }
-    return () => {
-      window.removeEventListener('keydown', handleEsc);
-    };
-  }, [previewImage]);
 
   if (images.length === 0) return null;
   return (
@@ -38,14 +24,16 @@ export const ImagePreview: React.FC<Props> = ({ images, onRemove }) => {
                 cursor: 'zoom-in',
                 transition: 'transform 0.15s',
               }}
-              onClick={() => setPreviewImage(src)}
-              title="点击放大"
             >
-              <img
-                src={src}
-                alt="Pasted"
-                style={{ width: '100%', height: '100%', objectFit: 'cover' }}
-              />
+              <button type="button" aria-label="预览待发送图片" title="点击放大"
+                style={{ width: '100%', height: '100%', padding: 0, border: 0, background: 'transparent', cursor: 'zoom-in' }}
+                onClick={event => { event.currentTarget.focus({ preventScroll: true }); setPreviewImage(src); }}>
+                <img
+                  src={src}
+                  alt="Pasted"
+                  style={{ width: '100%', height: '100%', objectFit: 'cover' }}
+                />
+              </button>
               <button
                 onClick={(e) => {
                   e.stopPropagation();
@@ -65,30 +53,7 @@ export const ImagePreview: React.FC<Props> = ({ images, onRemove }) => {
       </div>
 
       {/* 放大预览 */}
-      {previewImage && (
-        <div
-          style={previewOverlayStyle}
-          onClick={() => setPreviewImage(null)}
-        >
-          <div
-            style={previewContentStyle}
-            onClick={(e) => e.stopPropagation()}
-          >
-            <img
-              src={previewImage}
-              alt="Preview"
-              style={{ maxWidth: '100%', maxHeight: '100%', objectFit: 'contain' }}
-            />
-          </div>
-          <button
-            onClick={() => setPreviewImage(null)}
-            style={previewCloseBtnStyle}
-            title="关闭 (Esc)"
-          >
-            ×
-          </button>
-        </div>
-      )}
+      {previewImage && <ImageLightbox src={previewImage} onClose={() => setPreviewImage(null)} />}
     </>
   );
 };
@@ -105,45 +70,8 @@ const removeBtnStyle: React.CSSProperties = {
   zIndex: 1,
 };
 const labelStyle: React.CSSProperties = {
+  pointerEvents: 'none',
   position: 'absolute', bottom: 2, left: 2, fontSize: 10, color: '#fff',
   background: 'rgba(0,0,0,0.5)', padding: '1px 4px', borderRadius: 4,
   zIndex: 1,
-};
-
-const previewOverlayStyle: React.CSSProperties = {
-  position: 'fixed',
-  inset: 0,
-  background: 'rgba(0,0,0,0.85)',
-  display: 'flex',
-  alignItems: 'center',
-  justifyContent: 'center',
-  zIndex: 9999,
-  cursor: 'zoom-out',
-};
-
-const previewContentStyle: React.CSSProperties = {
-  padding: 20,
-  maxWidth: '95vw',
-  maxHeight: '95vh',
-  display: 'flex',
-  alignItems: 'center',
-  justifyContent: 'center',
-};
-
-const previewCloseBtnStyle: React.CSSProperties = {
-  position: 'absolute',
-  top: 20,
-  right: 20,
-  width: 40,
-  height: 40,
-  borderRadius: '50%',
-  border: 'none',
-  background: 'rgba(255,255,255,0.2)',
-  color: '#fff',
-  fontSize: 24,
-  cursor: 'pointer',
-  display: 'flex',
-  alignItems: 'center',
-  justifyContent: 'center',
-  transition: 'background 0.15s',
 };

@@ -8,6 +8,7 @@ import type { ChatMessage, ToolCall, ContentBlock, SubagentInfo } from '../hooks
 import { shouldKeepChatMessage } from '../utils/chatMessageVisibility';
 import { DiffView, type DiffData } from './DiffView';
 import { TextAttachmentPreview } from './TextAttachmentPreview';
+import { ImageLightbox } from './ImageLightbox';
 import { AppModalPortal } from './AppModalPortal';
 import { resolveFileLink, type ResolvedFileLink } from '../utils/fileFocus';
 import {
@@ -219,70 +220,6 @@ if (typeof document !== 'undefined' && !document.getElementById('msg-bubble-css'
   `;
   document.head.appendChild(style);
 }
-
-// ═══════════════════════════════════════
-//  ImageLightbox — 点击放大预览
-// ═══════════════════════════════════════
-const ImageLightbox: React.FC<{ src: string; onClose: () => void }> = ({ src, onClose }) => {
-  const [loaded, setLoaded] = useState(false);
-
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose(); };
-    document.addEventListener('keydown', onKey);
-    return () => document.removeEventListener('keydown', onKey);
-  }, [onClose]);
-
-  return (
-    <div
-      onClick={onClose}
-      style={{
-        position: 'fixed', inset: 0, zIndex: 9999,
-        background: 'rgba(0,0,0,0.85)',
-        display: 'flex', alignItems: 'center', justifyContent: 'center',
-        cursor: 'zoom-out',
-      }}
-    >
-      <div style={{
-        position: 'relative',
-        maxWidth: '92vw', maxHeight: '92vh',
-        display: 'flex', alignItems: 'center', justifyContent: 'center',
-      }}>
-        {!loaded && (
-          <div className="img-lazy-placeholder" style={{
-            width: '200px', height: '200px',
-            background: 'linear-gradient(135deg, rgba(128,128,128,0.1) 25%, transparent 25%, transparent 50%, rgba(128,128,128,0.1) 50%, rgba(128,128,128,0.1) 75%, transparent 75%, transparent)',
-            backgroundSize: '20px 20px',
-          }}>
-            <span>Loading...</span>
-          </div>
-        )}
-        <img
-          src={src}
-          alt="preview"
-          onClick={(e) => e.stopPropagation()}
-          onLoad={() => setLoaded(true)}
-          style={{
-            maxWidth: '92vw', maxHeight: '92vh',
-            borderRadius: 8,
-            boxShadow: '0 8px 40px rgba(0,0,0,0.6)',
-            cursor: 'default',
-            display: loaded ? 'block' : 'none',
-          }}
-        />
-      </div>
-      <button
-        onClick={onClose}
-        style={{
-          position: 'fixed', top: 16, right: 20,
-          background: 'rgba(255,255,255,0.15)', border: 'none',
-          color: '#fff', fontSize: 22, lineHeight: 1,
-          width: 36, height: 36, borderRadius: '50%',
-          cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center',
-        }}
-      >×</button>
-    </div>
-  );
-};
 
 // ═══════════════════════════════════════
 //  ThinkingBlock
@@ -1302,6 +1239,9 @@ function MessageBubbleInner({
       return;
     }
     if (target.tagName === 'IMG') {
+      e.preventDefault();
+      target.tabIndex = -1;
+      target.focus({ preventScroll: true });
       setLightboxSrc((target as HTMLImageElement).src);
     }
   }, [onFocusFile, resolveFileLinkHit]);
@@ -1756,14 +1696,15 @@ function MessageBubbleInner({
                   ? img
                   : `data:${img.mimeType || img.mime_type || 'image/png'};base64,${img.base64}`;
               return (
-                <div key={i} className="img-lazy-placeholder" style={{
+                <button key={i} type="button" aria-label={`预览附件图片 ${i + 1}`} className="img-lazy-placeholder" style={{
                   width: 120, height: 120,
+                  padding: 0, background: 'transparent',
                   borderRadius: 8,
                   border: '1px solid var(--theme-border, rgba(0,0,0,0.12))',
                   overflow: 'hidden',
                   position: 'relative',
                   cursor: 'zoom-in',
-                }} onClick={() => setLightboxSrc(src)}>
+                }} onClick={event => { event.currentTarget.focus({ preventScroll: true }); setLightboxSrc(src); }}>
                   {/* 小尺寸图片直接显示，大图片懒加载 */}
                   <img
                     className="lazy"
@@ -1776,7 +1717,7 @@ function MessageBubbleInner({
                       display: 'block',
                     }}
                   />
-                </div>
+                </button>
               );
             })}
           </div>

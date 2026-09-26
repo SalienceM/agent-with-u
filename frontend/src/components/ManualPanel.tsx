@@ -41,8 +41,9 @@ const SECTIONS: ManualSection[] = [
   {
     id: 'chat', title: '对话与输入', icon: '✦', intro: '文字、图片、语音和内容渲染能力。',
     items: [
-      { icon: '⌨', title: '文字与引用', summary: '输入任务，使用 @ 引用项目文件；支持多行编辑、历史上下文和斜杠命令。', entry: '底部输入框', tips: '空闲时 Enter 直接发送；模型回答期间继续输入会自动排队；Shift+Enter 换行。' },
+      { icon: '⌨', title: '文字与引用', summary: '输入任务，使用 @ 引用项目文件或整个目录；支持多行编辑、历史上下文和斜杠命令。', entry: '底部输入框', tips: '@ 选择器中点击名称或 Enter 引用文件/目录，点击「进入」或 Tab/→ 浏览下一层，← 返回上级；「引用当前目录」或 Ctrl/⌘+Enter 选择当前层（含根目录、空目录）。也可直接输入 @src/ 定位，目录路径保留尾斜杠，含空格的路径自动转义。选择只填入，不发送、不读取目录内文件正文。关闭选择器后，空闲时 Enter 发送；模型回答期间继续输入会自动排队；Shift+Enter 换行。' },
       { icon: '🖼', title: '图片粘贴', summary: '支持 Snipaste、系统剪贴板和本地图片。图片会先显示为附件缩略图，再随消息发送给支持视觉的模型。', entry: 'Ctrl+V 或输入框图片按钮' },
+      { icon: '🔎', title: '图片预览与缩放', summary: '点击待发送缩略图、消息附件或正文图片，以整个窗口居中预览，首次自动完整显示长图和横图。滚轮／触控板／双指可连续缩放，放大后拖动查看细节。', entry: '点击聊天中的图片', tips: '「适应」恢复完整居中，「1:1」查看原始尺寸；双击在两者间切换。键盘 + / − 缩放，方向键移动，0 适应窗口，1 原始尺寸，Esc 关闭；缩放仅作用于图片，不改变聊天字号。' },
       { icon: '✂', title: '区域截图', summary: '调用系统选区工具，选择完成后自动把截图加入当前输入框附件。', entry: '输入框截图按钮 / 可配置全局快捷键' },
       { icon: '🎙', title: '语音转文字', summary: '支持 OpenAI 兼容接口、DashScope 与本地 faster-whisper，将语音转成输入文字。', entry: '输入框麦克风；设置 → Voice-to-Text' },
       { icon: '◉', title: '实时语音对话（实验）', summary: 'Fun-ASR 实时识别停顿后自动发送给当前 Session Backend；模型流式生成时分块合成 Edge TTS 并立即顺序播放，支持开口打断。', entry: '输入区上方「实时对话」', tips: '先在设置中把 STT 设为 DashScope 并配置 API Key；停顿时长、收音阈值和打断开关位于 Assistant Voice。' },

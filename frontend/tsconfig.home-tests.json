@@ -11,6 +11,7 @@
     "outDir": ".home-test-dist"
   },
   "include": [
+    "src/utils/imageViewport.ts",
     "src/utils/inputHistory.ts",
     "src/utils/workspaceTools.ts",
     "src/utils/workbench.ts",
