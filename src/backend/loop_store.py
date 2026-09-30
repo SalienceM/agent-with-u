@@ -100,7 +100,7 @@ class LoopAnalysis:
     challenges: str = ""                # 环境/系统/网络等可触达性挑战
     verified: str = ""                  # 已经用实际产物/检查核实成立的能力与证据
     gaps: str = ""                      # 对照全局目标仍未满足或发生回归的缺口
-    next_focus: str = ""                # 下一次只应优先处理的最小高价值焦点
+    next_focus: str = ""                # 下一批就绪任务/候选路径与取舍
     deliverable: bool = False           # score >= 70
     outputtable: bool = False           # score >= 85
 
@@ -154,6 +154,9 @@ class LoopRecord:
     # 阶段审计：原文、解析对象与结构校验结论，独立于实时尾部回放持久化。
     stage_details: dict = field(default_factory=dict)
     call_diagnostics: list[dict] = field(default_factory=list)
+    progress_version: int = 0          # 0=旧记录未知；1=结构化任务/证据评审
+    progress_scope: str = ""           # 全局目标版本摘要；用户改目标后不把旧任务硬套到新目标
+    delivery: dict = field(default_factory=dict)
     # 各子阶段的开始时间戳（{prepare/execute/analysis/done: ts}），用于流程视图耗时
     sub_started: dict = field(default_factory=dict)
     # ★ 本次 loop 各阶段实际使用的 backend id（{prepare, execute, analysis}）。
@@ -173,7 +176,7 @@ class LoopRecord:
     # ★ 非 git 目录的文件级备份路径（dir_snapshot 创建的临时目录）。
     #   None=未备份。丢弃时据此恢复文件。
     dir_checkpoint: Optional[str] = None
-    # 本轮分析完成后的 Git 产物快照，用于 loopout 恢复真正的最佳版本。
+    # 本轮分析完成后的 Git 产物快照，仅供显式恢复；评分变化不能触发自动回滚。
     artifact_checkpoint: Optional[str] = None
     # Manual takeover keeps a self-contained transcript snapshot so the pass is
     # inspectable from LoopPanel even though the same messages also live in the
@@ -205,6 +208,9 @@ class LoopRecord:
             "error": self.error,
             "stageDetails": copy.deepcopy(self.stage_details),
             "callDiagnostics": copy.deepcopy(self.call_diagnostics),
+            "progressVersion": self.progress_version,
+            "progressScope": self.progress_scope,
+            "delivery": copy.deepcopy(self.delivery),
             "subStarted": self.sub_started,
             "backends": dict(self.backends or {}),
             "runtimes": {k: dict(v) for k, v in (self.runtimes or {}).items()
@@ -238,6 +244,9 @@ class LoopRecord:
             error=d.get("error", ""),
             stage_details=copy.deepcopy(d.get("stageDetails") or {}),
             call_diagnostics=copy.deepcopy(d.get("callDiagnostics") or [])[-64:],
+            progress_version=1 if d.get("progressVersion") == 1 else 0,
+            progress_scope=str(d.get("progressScope") or "")[:20],
+            delivery=copy.deepcopy(d.get("delivery") or {}),
             sub_started=dict(d.get("subStarted") or {}),
             backends=dict(d.get("backends") or {}),
             runtimes={k: dict(v) for k, v in (d.get("runtimes") or {}).items()
@@ -412,7 +421,7 @@ LEGACY_FRONTEND_DEFAULT_STRATEGY = (
 )
 
 
-DEFAULT_STRATEGY = (
+LEGACY_INCREMENTAL_STRATEGY = (
     "LOOP 是围绕【全局目标】和当前真实产物的连续增量演进：既不在每次 loop 重做完整目标，"
     "也不预先把任务机械切成固定阶段。\n"
     "- prepare：回顾全局目标、原始诉求、上轮诊断和本次 addon；先核实现状，保留已验证成果，"
@@ -432,6 +441,18 @@ DEFAULT_STRATEGY = (
     "6. 宁可保守扣分、点明差距与下一步，也不要为了收口而粉饰；真完不成就如实在 challenges 标注。"
 )
 
+DEFAULT_STRATEGY = (
+    "LOOP 围绕全局目标持续交付，保留已验证成果，不重做整个项目，也不把轮次机械切成固定阶段。\n"
+    "- prepare：继承当前工作流与决策，核实真实任务来源、依赖及已有证据。已有任务清单时选择一组相关、就绪的任务，"
+    "探索任务则选择可验证假设；按风险与成本编排 1–4 步，一个步骤可以连续完成多个相关任务。\n"
+    "- execute：实施并进行针对性验证，保持稳定任务编号；不要把审计、文档和重复检查变成默认流水线。"
+    "阻塞要注明影响范围、已尝试路径、解除条件，只有依赖受影响的任务等待；不绕过全局 blocked、授权或安全门槛。\n"
+    "- analysis：独立核实本次影响面和关键回归，复用版本与环境仍有效的证据；区分已实现、已验证、局部阻塞和明确人工项。"
+    "下一步给出候选与取舍，不把最小瑕疵自动升级为唯一优先项。\n"
+    "评分以累计实际产物为准，默认未完成，不轻信执行自述；操作次数、文档数量和乐观措辞不等于进展。"
+    "连续无实质推进时换路规划或请求人工输入。完整任务验收及必要 verify 才是收口依据，分数只作辅助。"
+)
+
 
 @dataclass
 class LoopPolicy:
@@ -444,6 +465,8 @@ class LoopPolicy:
     step_max_attempts: int = 2                     # 卡住或空响应时，当前步最多自动尝试次数
     independent_eval: bool = True                  # analysis 用独立上下文 + 对抗式评审（防自欺）
     intent_guard: bool = True                       # 早期检查人意图 vs 模型计划方向的偏差（非阻塞提示）
+    work_mode: str = "auto"                       # auto | delivery | explore
+    progress_patience: int = 3                    # 无任务状态推进时先重规划，达到此次数暂停 Auto
     # 各角色的专用 backend：{prepare/execute/idea/goal/analysis/aside: backend_id}，
     # 缺省=跟随会话。自动 LOOP 的 prepare / execute / analysis 都在独立上下文中运行，
     # 因而可安全切换异构 backend；人工接管仍使用 Session 自身 backend。
@@ -495,6 +518,8 @@ class LoopPolicy:
             "stepMaxAttempts": self.step_max_attempts,
             "independentEval": self.independent_eval,
             "intentGuard": self.intent_guard,
+            "workMode": self.work_mode,
+            "progressPatience": self.progress_patience,
             "backends": dict(self.backends or {}),
             "runtimes": {k: self._clean_runtime(v) for k, v in (self.runtimes or {}).items()
                          if k in self.RUNTIME_POSITIONS and self._clean_runtime(v)},
@@ -534,7 +559,8 @@ class LoopPolicy:
         # 后面由用户或内置预设追加的个性化要求原样保留。
         if isinstance(strat, str):
             normalized = strat.strip()
-            for legacy_default in (LEGACY_DEFAULT_STRATEGY, LEGACY_FRONTEND_DEFAULT_STRATEGY):
+            for legacy_default in (LEGACY_DEFAULT_STRATEGY, LEGACY_FRONTEND_DEFAULT_STRATEGY,
+                                   LEGACY_INCREMENTAL_STRATEGY, LEGACY_INCREMENTAL_STRATEGY.replace("**", "")):
                 if normalized.startswith(legacy_default):
                     strat = DEFAULT_STRATEGY + normalized[len(legacy_default):]
                     break
@@ -564,6 +590,8 @@ class LoopPolicy:
             step_stall_seconds=stall, step_max_attempts=attempts,
             independent_eval=bool(ie) if ie is not None else True,
             intent_guard=bool(ig) if ig is not None else True,
+            work_mode=d.get("workMode") if d.get("workMode") in ("auto", "delivery", "explore") else "auto",
+            progress_patience=int(max(2, min(8, _f("progressPatience", 3)))),
             backends=backends,
             runtimes=runtimes,
             strategy=strat if isinstance(strat, str) and strat.strip() else DEFAULT_STRATEGY,
@@ -615,6 +643,8 @@ class LoopState:
     intent_alert: dict = field(default_factory=dict)       # 意图守卫：人意图 vs 模型计划偏差提示
     best_seq: int = 0                                      # 当前轮最佳产物对应的 loop seq
     risk_factors: dict = field(default_factory=dict)       # 可解释风险分量
+    handoff: dict = field(default_factory=dict)           # 有界、脱敏的转换交接；不包含工具授权
+    progress_guard: dict = field(default_factory=dict)    # 可见的停滞/阻塞诊断，不冒充验收
     created_at: float = field(default_factory=_now)
     updated_at: float = field(default_factory=_now)
 
@@ -667,6 +697,8 @@ class LoopState:
             "intentAlert": self.intent_alert or {},
             "bestSeq": self.best_seq,
             "riskFactors": dict(self.risk_factors or {}),
+            "handoff": copy.deepcopy(self.handoff),
+            "progressGuard": copy.deepcopy(self.progress_guard),
             "bestScore": self.best_score(),
             "latestScore": self.latest_score(),
             "createdAt": self.created_at,
@@ -699,6 +731,8 @@ class LoopState:
             intent_alert=dict(d.get("intentAlert") or {}),
             best_seq=int(d.get("bestSeq", 0) or 0),
             risk_factors=dict(d.get("riskFactors") or {}),
+            handoff=copy.deepcopy(d.get("handoff") or {}),
+            progress_guard=copy.deepcopy(d.get("progressGuard") or {}),
             created_at=d.get("createdAt", _now()),
             updated_at=d.get("updatedAt", _now()),
         )

@@ -75,6 +75,11 @@ from .loop_store import (
     SUB_PREPARE, SUB_EXECUTE, SUB_ANALYSIS, SUB_DONE,
 )
 from .chat_extras_store import ChatExtrasStore, ChatExtras, SeqTask, ChatAside
+from .loop_delivery import (
+    handoff_from_session, evidence_packet, excerpt as loop_excerpt,
+    normalize_report, completion_ready, assess_progress, planning_context, scope_key,
+    REPORT_INSTRUCTIONS, SAFETY_CONSTRAINTS, call_scope_constraints,
+)
 from .workspace_kit_store import (
     WorkspaceKitStore,
     WorkspaceKitState,
@@ -133,6 +138,12 @@ _LOOP_PROGRESS_TAIL_CHARS = 50_000
 # Auto LOOP 遇到 prepare / summary / analysis 等整轮级异常时仍应自行恢复，
 # 但认证、网络或 Backend 配置持续错误时不能无限创建失败记录。
 _LOOP_AUTO_CONSECUTIVE_FAILURE_LIMIT = 3
+
+
+class _LoopAgentCallError(RuntimeError):
+    def __init__(self, message: str, partial_text: str = "") -> None:
+        super().__init__(message)
+        self.partial_text = partial_text
 
 
 class _LoopAgentStalledError(RuntimeError):
@@ -1931,6 +1942,37 @@ class BridgeWS:
         print(f"[bridge_ws] client connected user={ident} via={ident_src} (total={len(self._clients)})",
               file=sys.stderr, flush=True)
         self._emit_clients_changed()
+        # 只允许无副作用的文件树读请求并发；写操作仍是顺序屏障。
+        # Relay 的虚拟 websocket 复用此入口，身份 ContextVar 在各任务内独立绑定。
+        reads: set[asyncio.Task] = set()
+        concurrent_reads = {"listDirectory", "gitDetect", "gitStatus", "ping"}
+
+        async def reply(req: dict) -> None:
+            req_id = req.get("id")
+            owner_token = _REQUEST_OWNER_ID.set(self._owner_id_for_client(websocket))
+            source_token = _REQUEST_IDENTITY_SOURCE.set(str(ident_src or "none"))
+            client_token = _REQUEST_CLIENT.set(websocket)
+            legacy_token = _REQUEST_CAN_CLAIM_LEGACY.set(bool(
+                ident_src == "relay" and getattr(websocket, "can_claim_legacy", False)
+            ))
+            try:
+                result = await self._dispatch(req.get("method", ""), req.get("params", []))
+                await websocket.send(json.dumps({"id": req_id, "result": result}, ensure_ascii=False))
+            except websockets.exceptions.ConnectionClosed:
+                pass
+            except Exception as e:
+                print(f"[bridge_ws] dispatch error: {e}", file=sys.stderr, flush=True)
+                if req_id is not None:
+                    try:
+                        await websocket.send(json.dumps({"id": req_id, "error": str(e)}, ensure_ascii=False))
+                    except Exception:
+                        pass
+            finally:
+                _REQUEST_CLIENT.reset(client_token)
+                _REQUEST_CAN_CLAIM_LEGACY.reset(legacy_token)
+                _REQUEST_IDENTITY_SOURCE.reset(source_token)
+                _REQUEST_OWNER_ID.reset(owner_token)
+
         try:
             async for raw in websocket:
                 if isinstance(raw, bytes):
@@ -1949,24 +1991,17 @@ class BridgeWS:
                     req = json.loads(raw)
                     req_id = req.get("id")
                     method = req.get("method", "")
-                    params = req.get("params", [])
-                    owner_token = _REQUEST_OWNER_ID.set(
-                        self._owner_id_for_client(websocket)
-                    )
-                    source_token = _REQUEST_IDENTITY_SOURCE.set(str(ident_src or "none"))
-                    client_token = _REQUEST_CLIENT.set(websocket)
-                    legacy_claim_token = _REQUEST_CAN_CLAIM_LEGACY.set(bool(
-                        ident_src == "relay"
-                        and getattr(websocket, "can_claim_legacy", False)
-                    ))
-                    try:
-                        result = await self._dispatch(method, params)
-                    finally:
-                        _REQUEST_CLIENT.reset(client_token)
-                        _REQUEST_CAN_CLAIM_LEGACY.reset(legacy_claim_token)
-                        _REQUEST_IDENTITY_SOURCE.reset(source_token)
-                        _REQUEST_OWNER_ID.reset(owner_token)
-                    await websocket.send(json.dumps({"id": req_id, "result": result}, ensure_ascii=False))
+                    if method in concurrent_reads:
+                        # 有界背压，不能为大量展开目录制造无上限后台任务。
+                        if len(reads) >= 16:
+                            await asyncio.wait(reads, return_when=asyncio.FIRST_COMPLETED)
+                        task = asyncio.create_task(reply(req))
+                        reads.add(task)
+                        task.add_done_callback(reads.discard)
+                    else:
+                        if reads:
+                            await asyncio.gather(*reads, return_exceptions=True)
+                        await reply(req)
                 except Exception as e:
                     print(f"[bridge_ws] dispatch error: {e}", file=sys.stderr, flush=True)
                     if req_id is not None:
@@ -1974,6 +2009,10 @@ class BridgeWS:
         except websockets.exceptions.ConnectionClosed:
             pass
         finally:
+            for task in reads:
+                task.cancel()
+            if reads:
+                await asyncio.gather(*reads, return_exceptions=True)
             workspace_tools = getattr(self, "_chat_workspace_tools", None)
             if workspace_tools is not None:
                 workspace_tools.disconnect(websocket)
@@ -2055,6 +2094,7 @@ class BridgeWS:
         # 卡住心跳、Relay 和其它 RPC，客户端最终只能看到“无响应”。仅把这些
         # 无共享状态或已有 Store 锁保护的重任务放入工作线程。
         if method in {
+            "listDirectory", "gitDetect", "gitStatus",
             "syncManifest", "syncFileList", "syncFileSearch",
             "listSkills", "saveSkill", "deleteSkill", "activateSkill",
             "listSkillManuals", "getSkillManual", "saveSkillManual", "renameSkillGroup", "setSkillGroupDefault",
@@ -4968,6 +5008,7 @@ class BridgeWS:
             }, ensure_ascii=False)
 
         state = LoopState(session_id=session_id, stage=STAGE_EXECUTE, goal=target)
+        state.handoff = handoff_from_session(session)
         state.record_goal(target, source="manual")
         previous_type = session.session_type
         previous_control_mode = session.loop_control_mode
@@ -5040,6 +5081,8 @@ class BridgeWS:
     def _loop_payload(self, state: "LoopState", *, compact: bool = False) -> dict:
         """序列化 LoopState，并注入运行态；compact 首屏不携带详情大字段。"""
         d = state.to_dict()
+        if compact:
+            d["handoff"] = {"source": state.handoff.get("source", ""), "available": bool(state.handoff)}
         running = self._loop_is_running(state.session_id)
         last = state.loops[-1] if state.loops else None
         # 可续：最后一条 loop 没跑完、不是错误、当前没在跑、仍在 execute 阶段
@@ -5064,6 +5107,14 @@ class BridgeWS:
                 for pos, bid in bmap.items() if bid
             }
             if compact:
+                report = rec.get("delivery") or {}
+                rec["deliverySummary"] = {
+                    "mode": report.get("mode", ""),
+                    "counts": {status: sum(i.get("status") == status for i in report.get("items", []))
+                               for status in ("pending", "implemented", "verified", "blocked", "manual")},
+                    "blockerCount": len(report.get("blockers", [])),
+                } if report else {}
+                rec["delivery"] = {}
                 rec["callDiagnostics"] = rec.get("callDiagnostics", [])[-1:]
                 result = str(rec.get("result") or "")
                 rec["stageDetails"] = {
@@ -5491,10 +5542,12 @@ class BridgeWS:
                               backend_id: Optional[str] = None,
                               agent_session_id: Optional[str] = None,
                               runtime: Optional[dict] = None,
-                              inactivity_timeout: float = 0.0) -> tuple:
+                              inactivity_timeout: float = 0.0,
+                              execution_access: Optional[str] = None) -> tuple:
         kwargs = {"resume": resume, "indep_session_id": indep_session_id, "images": images,
                   "backend_id": backend_id, "agent_session_id": agent_session_id,
-                  "runtime": runtime, "inactivity_timeout": inactivity_timeout}
+                  "runtime": runtime, "inactivity_timeout": inactivity_timeout,
+                  "execution_access": execution_access}
         state = self._loop_state(session.id) if seq > 0 and hasattr(self, "_loop_states") else None
         record = next((r for r in state.loops if r.seq == seq), None) if state else None
         if record is None:
@@ -5538,6 +5591,7 @@ class BridgeWS:
                               agent_session_id: Optional[str] = None,
                               runtime: Optional[dict] = None,
                               inactivity_timeout: float = 0.0,
+                              execution_access: Optional[str] = None,
                               _diagnostic: Optional[LoopCallDiagnostics] = None) -> tuple:
         """让会话绑定的 backend 跑一轮，收集全文，并把增量推给 LoopPanel。
 
@@ -5581,10 +5635,11 @@ class BridgeWS:
                       if (getattr(session, "token_usage", None) or {}).get("captureEnabled") and sub_stage != "aside" else None)
         parts: list[str] = []
         call_usage: Optional[dict] = None
+        call_error = ""
         last_activity_at = time.monotonic()
 
         def on_delta(delta: StreamDelta):
-            nonlocal call_usage, last_activity_at
+            nonlocal call_usage, last_activity_at, call_error
             if _diagnostic:
                 _diagnostic.observe(delta)
             # 诊断/重试倒计时不是模型的有效活动，不能延长无事件看门狗。
@@ -5621,6 +5676,7 @@ class BridgeWS:
                     f"\n{marker} {tool_name} 执行{('失败' if status == 'error' else '完成')}{detail}\n",
                 )
             elif delta.type == "error" and delta.error:
+                call_error = delta.error
                 self._emit_loop_progress(session.id, seq, sub_stage,
                                          f"\n❌ {delta.error}\n")
 
@@ -5654,6 +5710,12 @@ class BridgeWS:
             effective_agent_sid = agent_session_id if agent_session_id is not None else (
                 session.agent_session_id if resume and indep_session_id is None else None
             )
+            # 同一份访问值同时驱动 Backend 和角色说明，避免规划器把局部只读误判为全局无权。
+            call_access = execution_access or (
+                "read-only" if sub_stage in (SUB_PREPARE, "intent") else "workspace-write")
+            scope_constraints = call_scope_constraints(
+                sub_stage, call_access, native_codex=isinstance(backend, CodexOfficeBackend),
+            ) if seq > 0 else ""
             send_kwargs = {
                 "messages": [], "content": prompt, "images": img_objs,
                 "session_id": sid_for_backend, "message_id": mid, "on_delta": on_delta,
@@ -5661,8 +5723,13 @@ class BridgeWS:
                 "working_dir": session.working_dir,
                 "skip_permissions": True,
                 "sandbox_enabled": session.sandbox_enabled,
+                "constraints": "\n\n".join(filter(None, [self._compose_constraints(session), SAFETY_CONSTRAINTS, scope_constraints])),
             }
             self._add_runtime_kwargs(backend, send_kwargs, runtime, session)
+            if seq > 0 and isinstance(backend, CodexOfficeBackend):
+                # 使用原生 Codex 沙箱，不复活旧的提示词/路径猜测式 Layer-2 沙箱。
+                # 不支持时让 Backend 明确失败，绝不重试为 danger-full-access。
+                send_kwargs["execution_access"] = call_access
             if _diagnostic:
                 from .token_usage import estimate_tokens
                 config = getattr(backend, "config", None)
@@ -5726,6 +5793,7 @@ class BridgeWS:
         except _LoopAgentStalledError:
             raise
         except Exception as e:
+            call_error = str(e)
             if _diagnostic:
                 _diagnostic.fail(e)
             import traceback
@@ -5754,6 +5822,8 @@ class BridgeWS:
         # 自动 LOOP 没有 ChatMessage 落盘，必须显式保存这次内部调用的台账。
         if hasattr(self, "_session_store"):
             self._session_store.save(session, async_=True)
+        if seq > 0 and call_error:
+            raise _LoopAgentCallError(call_error, partial_text="".join(parts))
         return "".join(parts), new_sid if resume or agent_session_id is not None else None
 
     def _rpc_loopGetState(self, session_id: str, compact: bool = True) -> str:
@@ -5930,6 +6000,8 @@ class BridgeWS:
         if not isinstance(pd, dict):
             return json.dumps({"status": "error", "message": "策略格式不对"}, ensure_ascii=False)
         state = self._loop_get_or_create(session_id)
+        for key in ("workMode", "progressPatience"):
+            pd.setdefault(key, state.policy.to_dict()[key])
         state.policy = LoopPolicy.from_dict(pd)
         self._loop_save(state)
         self._emit_loop_updated(state)
@@ -6162,6 +6234,7 @@ class BridgeWS:
         state.risk_coefficient = 0.3
         state.risk_factors = {}
         state.best_seq = 0
+        state.progress_guard = {}
 
     def _rpc_loopSetAuto(self, session_id: str, on) -> str:
         """切换自动连跑。打开后：一次 loop 完成即自动开始下一次，直到收口/取消。"""
@@ -6171,6 +6244,8 @@ class BridgeWS:
         if state.control_mode == "manual" and self._coerce_bool(on):
             return json.dumps({"status": "error", "message": "人工接管期间不能启动 Auto LOOP"}, ensure_ascii=False)
         state.auto = self._coerce_bool(on)
+        if state.auto:
+            state.progress_guard = {**state.progress_guard, "pause": False}
         self._loop_save(state)
         self._emit_loop_updated(state)
         # 打开 auto 且当前空闲、仍在 execute、未到收口 → 立刻续跑
@@ -6191,6 +6266,7 @@ class BridgeWS:
             return json.dumps({"status": "error", "message": "当前不在 loopexecute 阶段"}, ensure_ascii=False)
         if self._loop_is_running(session_id):
             return json.dumps({"status": "error", "message": "上一次 loop 仍在进行"}, ensure_ascii=False)
+        state.progress_guard = {**state.progress_guard, "pause": False}
         self._schedule_loop_iteration(session_id)
         return json.dumps({"status": "ok"}, ensure_ascii=False)
 
@@ -6280,6 +6356,8 @@ class BridgeWS:
                     await self._loop_do_execute(session, state, record)
                 elif stage == SUB_ANALYSIS:
                     await self._loop_do_analysis(session, state, record)
+                if state.progress_guard.get("pause"):
+                    break
         except Exception as e:
             import traceback
             print(f"[loop] iteration failed: {e}\n{traceback.format_exc()}",
@@ -6341,7 +6419,9 @@ class BridgeWS:
                     self._emit_loop_updated(st)
             else:
                 # ★ 自动 AI commit：loop 正常完成后自动 stage-all → commit → push
-                if session.auto_commit:
+                if (session.auto_commit and record and record.completed and not record.error
+                        and not state.progress_guard.get("pause")
+                        and not any(s.status == "error" for s in record.orchestration)):
                     asyncio.ensure_future(self._try_auto_commit(session, "loop"))
                 self._maybe_autocontinue(session_id)
 
@@ -6384,6 +6464,22 @@ class BridgeWS:
             state.stop_reason = ""
         return reverted
 
+    def _loop_pause_control(self, state: "LoopState", record: "LoopRecord", text: str) -> bool:
+        """模型只能请求收紧执行，不能用控制字段授予权限或宣告完成。"""
+        parsed = self._extract_json_block(text) or {}
+        control = parsed.get("loopControl")
+        if not isinstance(control, dict) or control.get("pause") is not True:
+            return False
+        reason = loop_excerpt(control.get("reason"), 1200).strip() or "模型报告需人工介入，未提供解除条件，请检查阶段原文。"
+        state.auto = False
+        state.progress_guard = {"pause": True, "reason": reason, "seq": record.seq}
+        record.error = "已暂停自动执行：" + reason
+        record.stage_details.setdefault(record.sub_stage, {}).update({"status": "paused", "message": reason, "rawOutput": text})
+        record.updated_at = time.time()
+        self._loop_save(state)
+        self._emit_loop_updated(state)
+        return True
+
     def _loop_audit_plan(self, record: "LoopRecord", text: str, kind: str) -> list[LoopStep]:
         """保存每次规划原文和结构校验，不把校验通过混同于任务验收。"""
         parsed = self._extract_json_block(text)
@@ -6405,6 +6501,11 @@ class BridgeWS:
         return steps
 
     async def _loop_do_prepare(self, session, state, record, history) -> None:
+        record.progress_version = 1
+        record.progress_scope = scope_key(state.goal)
+        if not state.handoff and getattr(session, "messages", None):
+            state.handoff = handoff_from_session(session)
+            state.handoff["source"] = "legacy-resume"
         record.sub_stage = SUB_PREPARE
         record.stage_details.setdefault(SUB_PREPARE, {})["status"] = "running"
         record.mark_sub(SUB_PREPARE)
@@ -6468,11 +6569,10 @@ class BridgeWS:
             if state.policy.strategy else ""
         )
         mode_instruction = (
-            "这是当前 round 的第一次自动演进：先审计工作区已有产物并建立可信基线，"
-            "然后只推进最重要的一个缺口；已有项目不等于从零开始。"
+            "这是当前 round 的第一次自动演进：先用有界检查确认已有成果与工作流，"
+            "继承有效基线后尽快推进就绪任务；不要把全面审计当作所有实现的默认前置。"
             if record.iteration_mode == "baseline" else
-            "这是后续增量演进：以上一轮诊断为主要入口，先复核诊断是否仍成立，"
-            "然后只处理最高价值的剩余缺口、回归或本次 Addon。"
+            "这是后续增量演进：上一轮诊断是候选输入而非唯一队头，结合依赖、收益、风险和成本选择工作批次。"
         )
         prepare_prompt = (
             f"{strategy_block}"
@@ -6480,17 +6580,24 @@ class BridgeWS:
             f"{state.goal or '(未显式给出，自行从上下文推断)'}\n\n"
             f"【最初的原始诉求】\n{original_intent or '（无单独记录，以全局目标为准）'}\n\n"
             f"【历次演进与诊断】\n{history or '（暂无历史诊断）'}\n"
+            f"{planning_context(state, record)}\n"
+            f"【调度模式】{state.policy.work_mode}（auto：已有任务表采用交付批次，无明确任务表采用探索验证）\n"
             f"{addon_block}\n"
             f"这是第 {record.seq} 次 loop。{mode_instruction}\n"
             "核心规则：先用工作区真实产物核实现状；保留已经验证成立的成果；禁止重复生成、"
             "大范围重写或无收益地重复全量测试。不要把 loop 预设成固定阶段，也不要尝试在本次"
-            "重新完成整个目标。选择**一个最高价值增量焦点**（有冻结 Addon 时需综合覆盖它们），"
-            "编排 1–4 个完成该焦点所必需的步骤。"
-            "goal 字段只写本次增量焦点。只输出一个 JSON 围栏：\n"
+            "重新完成整个目标。选择一组相关且依赖就绪的任务，或一个需要探索验证的问题，"
+            "按实际复杂度编排 1–4 步；每步可以连续实现多个相关任务，不限制每轮只能完成一项。"
+            "不要固定安排‘审计→修改→复核→写文档’四步；执行附带针对性测试，独立评审由 analysis 完成。"
+            "局部阻塞只冻结受影响任务，说明依赖/解除条件并选择其他就绪工作；"
+            "整体工作流 blocked、未遏制安全事故或必要人工授权不可绕过。"
+            "若没有安全可执行的工作，不编造步骤；返回 loopControl:{pause:true,reason:具体原因及所需输入}。"
+            "同一问题再次入选必须说明新证据或新路径；无法恢复的历史数据仅哈希不可还原，不得无限查找。"
+            "goal 写本次批次目标，步骤注明稳定任务编号、验收和停止边界；保留当前 Skill 工作流。只输出一个 JSON 围栏：\n"
             "每个步骤必须标注 access：纯读取/分析用 read；任何可能写文件、运行会产生文件的命令或改配置用 write。"
             "只有 access=read 的步骤允许 concurrent；不确定时必须用 write + sequential。\n"
             "```json\n"
-            '{"goal": "本次最高价值增量焦点", "orchestration": '
+            '{"goal": "本次可验证的交付批次/探索目标", "orchestration": '
             '[{"mode": "sequential", "access": "read", "desc": "核实焦点相关现状…"}, '
             '{"mode": "sequential", "access": "write", "desc": "只实施必要修正…"}]}\n'
             "```"
@@ -6511,17 +6618,21 @@ class BridgeWS:
             a.applied_seq = record.seq
             a.updated_at = time.time()
         record.goal = state.goal
+        if self._loop_pause_control(state, record, ptext):
+            return
         record.orchestration = self._loop_audit_plan(record, ptext, "initial")
         # ★ JSON 解析重试：模型输出不含有效编排（至少 1 个 step）时，补发一次更强约束的 prompt
         if not record.orchestration:
             retry_prompt = (
                 "上一次的输出没有包含有效的编排 JSON。请重新输出，格式必须严格为：\n"
                 "```json\n"
-                '{"goal": "本次最高价值增量焦点", "orchestration": '
+                '{"goal": "本次交付批次/探索目标", "orchestration": '
                 '[{"mode": "sequential", "access": "read", "desc": "…"}, …]}\n'
                 "```\n"
                 "orchestration 数组包含 1–4 个必要步骤。不得重做整个目标；先核实现状，"
                 "已满足的内容直接跳过。只输出 JSON，不要其他文字。\n\n"
+                "若无安全可执行工作，返回 loopControl:{pause:true,reason:具体阻塞及所需输入}。\n"
+                f"{planning_context(state, record)}\n"
                 f"【全局目标】\n{state.goal}\n\n【本次演进依据】\n{record.evolution_basis}\n"
             )
             record.stage_details[SUB_PREPARE].update({"status": "retrying", "message": "规划结构校验失败，正在重试。"})
@@ -6535,6 +6646,8 @@ class BridgeWS:
                 backend_id=requested_prepare_backend,
                 runtime=prepare_runtime,
             )
+            if self._loop_pause_control(state, record, rtext):
+                return
             retry_steps = self._loop_audit_plan(record, rtext, "retry")
             if retry_steps:
                 record.orchestration = retry_steps
@@ -6549,12 +6662,14 @@ class BridgeWS:
         self._loop_save(state)
         self._emit_loop_updated(state)
         # ★ 意图守卫：本轮第一遍出 plan 后、真正重执行前，检查"人意图 vs 模型计划方向"，
-        #   早暴露偏差、省算力；非阻塞（不打断执行），每轮只查一次。
+        #   正常推进时不重复调用；出现实质停滞时重新检查方向。
         try:
             if getattr(state.policy, "intent_guard", True) and not session.id in self._loop_cancel:
                 first_in_round = not any(l.seq != record.seq for l in state.round_loops())
                 already = (state.intent_alert or {}).get("round") == state.round
-                if first_in_round and not already:
+                guard = assess_progress([r for r in state.round_loops() if r.seq != record.seq and r.progress_scope == record.progress_scope], state.policy.progress_patience)
+                recheck = guard["needsReplan"] and (state.intent_alert or {}).get("seq") != record.seq
+                if (first_in_round and not already) or recheck:
                     await self._intent_check(session, state, record)
         except Exception as e:
             print(f"[loop] intent guard skipped: {e}", file=sys.stderr, flush=True)
@@ -6574,6 +6689,7 @@ class BridgeWS:
             "- suggestion: 一句话给用户的修正建议（对齐则空）\n\n"
             f"【全局目标】\n{state.goal or '(未定)'}\n\n【最初的原始诉求】\n{ideas_text}\n\n"
             f"【模型本次增量计划】\n增量焦点：{record.goal or '(待核实)'}\n分步：\n{steps_text}\n\n"
+            f"{planning_context(state, record)}\n"
             "```json\n{\"aligned\": true, \"severity\": \"low\", \"divergence\": \"\", \"suggestion\": \"\"}\n```"
         )
         text, _ = await self._loop_run_agent(
@@ -6582,6 +6698,8 @@ class BridgeWS:
             backend_id=(record.backends.get("analysis") or session.backend_id),
             runtime=(record.runtimes.get("analysis") or {}),
         )
+        if self._loop_pause_control(state, record, text):
+            return
         aj = self._extract_json_block(text) or {}
         sev = str(aj.get("severity", "low")).lower()
         if sev not in ("low", "medium", "high"):
@@ -6661,11 +6779,15 @@ class BridgeWS:
             replan_prompt = (
                 f"【全局目标】\n{state.goal or '(未设定)'}\n\n"
                 f"【本次演进依据】\n{record.evolution_basis or '（请从工作区核实现状）'}\n\n"
-                "前面规划阶段未产出有效编排。请只选择当前最高价值的一个剩余缺口，"
-                "快速给出 1–3 步增量执行计划。已满足的工作不要重做。\n"
+                f"{planning_context(state, record)}\n"
+                f"【调度模式】{state.policy.work_mode}\n"
+                "前面规划阶段未产出有效编排。请选择一组相关就绪任务或一个可验证假设，"
+                "给出 1–4 步执行计划，注明稳定任务编号、验收和停止边界。已满足的工作不要重做。"
+                "局部阻塞仅冻结受影响任务，不绕过全局、安全或授权门槛；"
+                "若无安全可执行工作，返回 loopControl:{pause:true,reason:具体阻塞及所需输入}。\n"
                 "只输出 JSON 围栏：\n"
                 "```json\n"
-                '{"goal": "本次增量焦点", "orchestration": '
+                '{"goal": "本次交付批次/探索目标", "orchestration": '
                 '[{"mode": "sequential", "access": "read", "desc": "核实现状…"}, '
                 '{"mode": "sequential", "access": "write", "desc": "必要修正…"}]}\n'
                 "```\n"
@@ -6678,6 +6800,8 @@ class BridgeWS:
                 backend_id=prepare_backend,
                 runtime=prepare_runtime,
             )
+            if self._loop_pause_control(state, record, rtext):
+                return
             replan_steps = self._loop_audit_plan(record, rtext, "replan")
             if replan_steps:
                 record.orchestration = replan_steps
@@ -6690,9 +6814,9 @@ class BridgeWS:
         if not steps:
             # 保留既有最小增量降级策略，但生成可追溯的系统兜底步骤，不冒充规划成功。
             record.stage_details[SUB_PREPARE].update({
-                "status": "degraded", "message": "规划重试耗尽，已降级为系统生成的单步最小增量执行；不是有效模型计划。",
+                "status": "degraded", "message": "规划重试耗尽，已降级为系统生成的只读诊断；不是有效模型计划，不执行修改。",
             })
-            fallback = LoopStep(index=1, desc="【降级执行】核实现状，保留已验证成果，只处理一个最高价值剩余缺口或回归，记录产出位置与验证结果。")
+            fallback = LoopStep(index=1, access="read", desc="【降级执行】仅有界读取并诊断规划失败，记录任务来源、依赖和所需输入；不要在无有效计划时修改文件或运行有副作用的测试。")
             record.orchestration = [fallback]
             record.updated_at = time.time()
             self._loop_save(state)
@@ -6731,26 +6855,17 @@ class BridgeWS:
                         agent_session_id=step_agent_sid,
                     )
                     i += 1
+                if state.progress_guard.get("pause"):
+                    return
+                if any(s.status == "error" for s in steps[:i]):
+                    # 后续步骤可能依赖失败产物，不能继续盲跑；评审后由下一轮重新选择就绪任务。
+                    break
             if session.id in self._loop_cancel:
                 return
-            # 汇总各步 → 本次执行结果（独立 session）
-            recap = "\n".join(
-                f"{s.index}. [{s.mode}/{s.status}] {s.desc}\n   → {(s.output or '')[:400]}"
-                for s in steps
-            )
-            summary_prompt = (
-                f"以下是第 {record.seq} 次 loop 各分步的执行情况：\n{recap}\n\n"
-                "请只汇总**本次增量贡献**：修复/演进了什么、产出或改动在哪、核实了什么、"
-                "哪些步骤成功或失败。不要把既有成果冒充本次新完成，也不要自行宣称全局目标已完成。"
-                "3–6 句，可用 markdown。"
-            )
-            record.result = (await self._loop_run_agent(
-                session, summary_prompt, SUB_EXECUTE, record.seq,
-                resume=False,
-                indep_session_id=f"{session.id}:loop{record.seq}:summary",
-                backend_id=execute_backend,
-                runtime=execute_runtime,
-            ))[0].strip()
+            # 确定性摘录供界面阅读；评审另收更完整的原文，省去有损的二次模型汇总。
+            record.result = evidence_packet(record, 1400)
+        if state.progress_guard.get("pause"):
+            return
         record.stage_details[SUB_EXECUTE].update({
             "status": "error" if any(s.status == "error" for s in record.orchestration) else "done",
             "rawOutput": record.result,
@@ -6779,22 +6894,29 @@ class BridgeWS:
             f"【本次增量焦点】\n{record.goal}\n\n"
             if record.goal and record.goal != state.goal else ""
         )
+        prior_evidence = "\n".join(
+            f"步骤 {s.index} [{s.status}] {s.desc}\n{loop_excerpt(s.output, 2400)}"
+            for s in record.orchestration if s.index < step.index and s.output
+        )
         prompt = (
             f"【全局目标】\n{state.goal}\n\n"
             f"{strategy_hint}"
             f"【本次冻结的演进依据】\n{record.evolution_basis or '（无）'}\n\n"
+            f"{planning_context(state, record) if not agent_session_id else '工作流交接与台账沿用本轮执行上下文，仍须核对证据有效性。'}\n"
+            f"{('【本轮已执行步骤证据（供核实）】' + prior_evidence) if not agent_session_id else ''}\n"
             f"【本次增量编排】\n{all_steps_text}\n\n"
             f"你现在执行的是第 {step.index} 步（共 {len(record.orchestration)} 步），"
             f"模式：{'可并发' if step.mode == 'concurrent' else '顺次'}。\n"
             f"【本步任务】{step.desc}\n\n"
             "请结合上面的增量规划理解本步边界。动手前先核实相关现状；若本步目标已经满足，"
             "直接记录核实证据并跳过，不要重复改写、重复生成或扩大到整个全局目标。"
-            "在工作目录内实际执行（可用工具读写文件、运行命令）。"
+            f"本步访问范围：{step.access}。read 步只可读取，不运行会改文件/缓存/用户数据的命令；write 步在授权范围执行。"
             "所有终端命令必须是非交互、可自行退出的有界命令；禁止启动 watch、dev server、"
             "tail -f 或其他常驻进程。预计耗时很长的全量测试应先运行能验证本步的最小测试集，"
             "并为可能阻塞的命令设置超时。"
-            "命令失败时先分析原因并作有界处理，避免反复运行同一失败命令。完成后用 2–4 句话说明："
-            "这一步做了什么、产出/改动在哪、成功还是失败。"
+            "命令失败时先分析原因并作有界处理，避免反复运行同一失败命令。完成后简洁列出任务编号、"
+            "已实现/已验证/受阻、产物路径与版本、实际测试命令/结果/环境、剩余缺口；不要用字数限制省略失败证据。"
+            "若安全风险未遏制或后续执行需要新授权，停止并返回 JSON loopControl:{pause:true,reason:具体原因及所需输入}。"
         )
         policy = getattr(state, "policy", None)
         stall_seconds = max(30, min(3600, int(
@@ -6825,6 +6947,10 @@ class BridgeWS:
                     "请先检查工作目录中已经落盘的结果，保留正确成果，不要盲目从头重做；"
                     "改用更小、非交互且有明确超时的检查或命令完成本步。"
                 )
+                if agent_session_id:
+                    attempt_prompt += "\n" + planning_context(state, record) + "\n" + prior_evidence
+                if step.output:
+                    attempt_prompt += "\n【上次尝试的部分结果（不是成功证明）】\n" + loop_excerpt(step.output, 2400)
 
             # 第一次沿用原来的顺次上下文；恢复重试使用全新 agent 上下文，避免
             # 继续挂在已经异常的 CLI/thread 上，但仍可从真实工作区发现已有产物。
@@ -6842,7 +6968,15 @@ class BridgeWS:
                     backend_id=(record.backends.get("execute") or session.backend_id),
                     runtime=(record.runtimes.get("execute") or {}),
                     inactivity_timeout=stall_seconds,
+                    execution_access="read-only" if step.access == "read" else "workspace-write",
                 )
+            except _LoopAgentCallError as exc:
+                step.status = "error"
+                step.ended_at = time.time()
+                step.output = exc.partial_text + f"\nBackend 调用失败（不能视作任务成功）：{exc}"
+                self._loop_save(state)
+                self._emit_loop_updated(state)
+                return None
             except _LoopAgentStalledError as exc:
                 note = (
                     f"第 {attempt}/{max_attempts} 次尝试连续 {int(exc.idle_seconds)} 秒无活动，"
@@ -6877,6 +7011,11 @@ class BridgeWS:
                 step.output = text
                 step.status = "done"
                 step.ended_at = time.time()
+                if self._loop_pause_control(state, record, text):
+                    step.status = "error"
+                    self._loop_save(state)
+                    self._emit_loop_updated(state)
+                    return new_sid
                 self._loop_save(state)
                 self._emit_loop_updated(state)
                 return new_sid
@@ -6967,22 +7106,25 @@ class BridgeWS:
             f"【本次增量焦点】\n{record.goal or '（未明确）'}\n\n"
             f"【本次冻结的诊断 / Addon 范围】\n{record.evolution_basis or '（无）'}\n\n"
             f"【执行阶段的自述结果（仅供参考，需自行核实，勿轻信）】\n{record.result or '(无)'}\n"
+            f"【步骤原始证据包（首尾保留，省略处可查步骤详情/产物）】\n{evidence_packet(record)}\n"
+            f"{planning_context(state, record)}\n"
+            f"【调度模式】{state.policy.work_mode}\n"
             f"{addon_block}\n"
             "请按以下口径打分与分析，只输出一个 JSON 围栏：\n"
             f"- score: 0–100，当前累计产物对全局目标的完成度（>={dscore:.0f} 可交付，>={oscore:.0f} 可输出）；"
             "证据不足/未验证就按未完成给分，不要凑高分\n"
-            "- optimizationPotential: 0–1，针对剩余缺口再做一次最小增量预计还能提升的空间\n"
+            "- optimizationPotential: 0–1，针对剩余就绪任务再推进一个合理批次预计能提升的空间\n"
             "- trend: 与历史累计状态相比（上升 / 平缓 / 受阻），重复工作不能算改进\n"
             "- verified: 已用文件、命令、测试或其他真实产物核实成立的证据（简洁 markdown 字符串）\n"
             "- gaps: 对照全局目标仍未满足、未核实或出现回归之处（简洁 markdown 字符串）\n"
-            "- nextFocus: 下一次唯一优先的最小高价值焦点；若已完成则为空\n"
+            "- nextFocus: 下一批就绪任务/候选路径与取舍；不要把最小瑕疵自动提升为全局阻塞；若已完成则为空\n"
             "本次冻结 Addon 必须逐项核实；尚未满足的 Addon 必须明确写入 gaps。\n"
             "- challenges: 环境/系统/网络等硬约束，或无法验证的部分\n"
             "- notes: 区分“本次新增贡献”与“整体累计完成度”的简要结论（可 markdown）\n"
             "```json\n"
             '{"score": 0, "optimizationPotential": 0.0, "trend": "", "verified": "", '
-            '"gaps": "", "nextFocus": "", "challenges": "", "notes": ""}\n'
-            "```"
+            '"gaps": "", "nextFocus": "", "challenges": "", "notes": "", "delivery": {}}\n'
+            "```\n" + REPORT_INSTRUCTIONS
         )
         atext, _ = await self._loop_run_agent(
             session, analysis_prompt, SUB_ANALYSIS, record.seq,
@@ -6992,6 +7134,8 @@ class BridgeWS:
             runtime=analysis_runtime,
         )
         aj = self._extract_json_block(atext) or {}
+        if self._loop_pause_control(state, record, atext):
+            return
         valid_analysis = isinstance(aj.get("score"), (int, float)) and not isinstance(aj.get("score"), bool) and 0 <= aj["score"] <= 100
         record.stage_details[SUB_ANALYSIS].update({
             "rawOutput": atext, "parsed": aj,
@@ -7041,10 +7185,25 @@ class BridgeWS:
             outputtable=score >= state.policy.outputtable_score,
         )
         record.analysis = analysis
+        record.delivery = normalize_report(aj.get("delivery"))
+        if (record.delivery and state.policy.work_mode != "auto"
+                and record.delivery["mode"] != state.policy.work_mode):
+            record.delivery.update(valid=False, scopeComplete=False)
         record.completed = True
         record.sub_stage = SUB_DONE
         record.mark_sub(SUB_DONE)
         record.updated_at = time.time()
+        if record.progress_version:
+            state.progress_guard = assess_progress(state.round_loops(), state.policy.progress_patience)
+            ready = (completion_ready(record.delivery) and not state.progress_guard["scopeLost"]
+                     and (not record.progress_scope or record.progress_scope == scope_key(state.goal))
+                     and not any(a.status == "pending" for a in state.addons))
+            analysis.outputtable = analysis.outputtable and ready
+            analysis.deliverable = analysis.deliverable and ready
+            if state.progress_guard["pause"]:
+                state.auto = False
+            if not record.delivery:
+                record.stage_details[SUB_ANALYSIS]["validation"].append("缺少有效 delivery 台账，不能据分数收口；下轮需补齐结构化证据。")
         record.artifact_checkpoint = git_snapshot(session.working_dir)
         scored_records = [l for l in state.round_loops() if l.analysis]
         if scored_records:
@@ -7086,16 +7245,14 @@ class BridgeWS:
         except Exception:
             pass
         self._recompute_risk(state)
-        stop, reason = self._loop_should_stop(state)
+        stop, reason = (False, "") if state.progress_guard.get("pause") else self._loop_should_stop(state)
         if stop:
             state.stage = STAGE_OUT
             state.stop_reason = reason
             state.status = "output" if analysis.outputtable else (
                 "delivered" if analysis.deliverable else "aborted")
-            best_record = next((l for l in state.round_loops() if l.seq == state.best_seq), None)
-            if (best_record and best_record.seq != record.seq
-                    and best_record.artifact_checkpoint):
-                git_restore_snapshot(session.working_dir, best_record.artifact_checkpoint)
+            # 分数不是文件版本优劣的充分依据，禁止收口时自动回滚后续真实成果。
+            # 保留检查点供用户显式确认恢复/丢弃。
         self._loop_save(state)
         self._emit_loop_updated(state)
 
@@ -7103,7 +7260,7 @@ class BridgeWS:
         """Auto 开启时在一次 Loop 终止后续跑；连续整轮失败时确定性止损。"""
         state = self._loop_state(session_id)
         if (not state or state.control_mode != "loop" or not state.auto
-                or state.stage != STAGE_EXECUTE):
+                or state.stage != STAGE_EXECUTE or state.progress_guard.get("pause")):
             return
         last = state.loops[-1] if state.loops else None
         # 正常完成和明确失败都代表本次已经终止。失败不能继续 resume 同一条记录，
@@ -13738,6 +13895,7 @@ except urllib.error.URLError as e:
         path 相对于 working_dir 返回相对路径；不允许越过 working_dir 上级。
         """
         import os
+        import stat
         from pathlib import Path as _Path
         try:
             # 如果有工作目录限制，相对路径基于 working_dir 解析
@@ -13757,10 +13915,19 @@ except urllib.error.URLError as e:
                     return json.dumps({"error": "不允许浏览工作目录之外的路径"}, ensure_ascii=False)
             entries = []
             with os.scandir(str(abs_path)) as it:
-                for entry in sorted(it, key=lambda e: (not e.is_dir(), e.name.lower())):
+                for entry in it:
                     if entry.name.startswith('.') and not include_hidden:
                         continue
-                    entry_abs = _Path(entry.path).resolve()
+                    try:
+                        info = entry.stat(follow_symlinks=False)
+                    except FileNotFoundError:
+                        continue  # 扫描期间刚删除的条目不应使整层目录失败。
+                    # 父目录已 resolve；普通子项不再逐个调用 Windows realpath。
+                    # symlink / junction 等重解析点仍必须 resolve 并核对根边界。
+                    is_link = entry.is_symlink() or bool(
+                        getattr(info, "st_file_attributes", 0) & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+                    )
+                    entry_abs = _Path(entry.path).resolve() if is_link else abs_path / entry.name
                     if abs_root:
                         # 返回相对于 working_dir 的路径
                         try:
@@ -13775,10 +13942,11 @@ except urllib.error.URLError as e:
                         "isDir": entry.is_dir(),
                         # 未做整目录哈希比对时，也能展示未下载远端文件的修改时间。
                         "mtime": (
-                            int(entry.stat(follow_symlinks=False).st_mtime_ns // 1_000_000)
-                            if entry.is_file(follow_symlinks=False) else None
+                            int(info.st_mtime_ns // 1_000_000)
+                            if stat.S_ISREG(info.st_mode) else None
                         ),
                     })
+            entries.sort(key=lambda entry: (not entry["isDir"], entry["name"].lower()))
             return json.dumps(entries, ensure_ascii=False)
         except PermissionError:
             return json.dumps({"error": "无访问权限"}, ensure_ascii=False)
@@ -14931,13 +15099,16 @@ except urllib.error.URLError as e:
         except Exception as e:
             return -1, "", str(e)
 
-    def _rpc_gitDetect(self, working_dir: str) -> str:
+    def _rpc_gitDetect(self, working_dir: str, lightweight: bool = False) -> str:
         """检测目录是否为 Git 仓库，返回基本信息。"""
         import os
         if not working_dir or not os.path.isdir(working_dir):
             return json.dumps({"isRepo": False, "branch": "", "ahead": 0, "behind": 0, "remote": "", "hasUncommitted": False})
         if not _git_is_repo(working_dir):
             return json.dumps({"isRepo": False, "branch": "", "ahead": 0, "behind": 0, "remote": "", "hasUncommitted": False})
+        if lightweight:
+            # 文件树随后调用 gitStatus，不在检测阶段重复扫描工作区/提交图。
+            return json.dumps({"isRepo": True, "branch": ""})
         rc, branch, _ = self._git_run(working_dir, ["rev-parse", "--abbrev-ref", "HEAD"])
         branch = branch.strip() if rc == 0 else ""
         # ahead/behind
@@ -14958,46 +15129,22 @@ except urllib.error.URLError as e:
             "remote": remote, "hasUncommitted": has_uncommitted,
         }, ensure_ascii=False)
 
-    def _rpc_gitStatus(self, working_dir: str) -> str:
+    def _rpc_gitStatus(self, working_dir: str, include_numstat: bool = True) -> str:
         """获取 Git 工作区文件状态列表。"""
-        import os, re
-        if not working_dir or not os.path.isdir(working_dir) or not _git_is_repo(working_dir):
+        import os
+        from .git_status import parse_worktree_status
+        if not working_dir or not os.path.isdir(working_dir):
             return json.dumps({"files": [], "branch": "", "upstream": "", "ahead": 0, "behind": 0, "totalChanges": 0, "stagedCount": 0})
-
-        # ─ v2: 仅取 branch 信息（# branch.* 行） ──
-        branch = upstream = ""
-        ahead = behind = 0
-        rc2, out2, _ = self._git_run(working_dir, ["status", "--porcelain=v2", "--branch"], timeout=10)
-        if rc2 == 0:
-            for line in out2.splitlines():
-                if line.startswith("# branch.head"):
-                    branch = line.split(" ", 2)[2] if len(line.split(" ", 2)) > 2 else ""
-                elif line.startswith("# branch.upstream"):
-                    upstream = line.split(" ", 2)[2] if len(line.split(" ", 2)) > 2 else ""
-                elif line.startswith("# branch.ab"):
-                    m = re.match(r"# branch\.ab \+(\d+) -(\d+)", line)
-                    if m:
-                        ahead, behind = int(m.group(1)), int(m.group(2))
-
-        # ── v1: 文件列表（XY path，简单可靠） ──
-        files = []
-        rc, out, _ = self._git_run(working_dir, ["status", "--porcelain", "--untracked-files=all"], timeout=10)
-        if rc == 0:
-            for line in out.splitlines():
-                if len(line) < 4:
-                    continue
-                xy = line[:2]
-                path = line[3:]  # v1: "XY path" (3rd char is space)
-                if not path:
-                    continue
-                # v1 rename: "R  old => new" → 取 new path
-                if xy[0] == "R" and " => " in path:
-                    path = path.split(" => ", 1)[1]
-                x, y = xy[0], xy[1]
-                status = self._xy_to_status(x, y)
-                staged = x != "." and x != " " and x != "?"
-                files.append({"path": path, "status": status, "staged": staged})
-        staged_count = sum(1 for f in files if f["staged"])
+        # 不写 Git 可选索引锁；一次扫描返回分支 + XY 状态。-z 保留中文、空格、换行和 rename 原样路径。
+        rc, out, error = self._git_run(working_dir, [
+            "--no-optional-locks", "status", "--porcelain=v2", "--branch", "--untracked-files=all", "-z",
+        ], timeout=10)
+        if rc != 0:
+            return json.dumps({"error": error.strip() or "Git 状态读取失败", "files": []}, ensure_ascii=False)
+        result = parse_worktree_status(out, self._xy_to_status)
+        files = result["files"]
+        if not include_numstat or not files:
+            return json.dumps(result, ensure_ascii=False)
 
         # ── 获取每文件增删行数 (numstat) ──
         numstat_map: dict[str, tuple[int, int]] = {}
@@ -15027,11 +15174,7 @@ except urllib.error.URLError as e:
                 f["addedLines"] = numstat_map[f["path"]][0]
                 f["deletedLines"] = numstat_map[f["path"]][1]
 
-        return json.dumps({
-            "files": files, "branch": branch, "upstream": upstream,
-            "ahead": ahead, "behind": behind,
-            "totalChanges": len(files), "stagedCount": staged_count,
-        }, ensure_ascii=False)
+        return json.dumps(result, ensure_ascii=False)
 
     @staticmethod
     def _xy_to_status(x: str, y: str) -> str:
@@ -15862,11 +16005,11 @@ except urllib.error.URLError as e:
 
     def _compose_constraints(self, session: "Session") -> Optional[str]:
         """会话约束 + 素材池上下文块（后者不写入持久化的 session.constraints）。"""
-        session_constraints = self._strip_generated_backend_skill_block(session.constraints)
+        session_constraints = self._strip_generated_backend_skill_block(getattr(session, "constraints", None))
         parts = [p for p in (session_constraints, self._build_asset_context_block()) if p]
         runtime = getattr(self, "_skill_runtime", None)
         if runtime:
-            for skill_name in (session.abilities or {}).get("skills", []):
+            for skill_name in (getattr(session, "abilities", None) or {}).get("skills", []):
                 try:
                     hint = runtime.hint(skill_name)
                     if hint:

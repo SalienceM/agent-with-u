@@ -6,6 +6,7 @@ import { useClipboardImage } from './../hooks/useClipboardImage';
 import type { ImageAttachment } from './../hooks/useClipboardImage';
 import { LoopPolicyEditor, normalizePolicy } from './LoopPolicyEditor';
 import type { LoopPolicy } from './LoopPolicyEditor';
+import { LoopProgressNotice, LoopDeliveryDetail, type DeliveryReport, type ProgressGuard } from './LoopDeliveryStatus';
 import type { ModelRuntime } from './CodexRuntimeFields';
 import { TokenUsageMonitor } from './TokenUsageMonitor';
 import { loopRecordRevision } from '../utils/loopRecordDetail';
@@ -43,6 +44,7 @@ interface LoopRecord {
   kind?: 'agent' | 'manual';
   iterationMode?: 'baseline' | 'evolution';
   evolutionBasis?: string;
+  delivery?: DeliveryReport;
   hasEvolutionBasis?: boolean;
   completed: boolean; result: string; analysis: LoopAnalysis | null; error: string;
   subStarted?: Record<string, number>; createdAt?: number; updatedAt?: number;
@@ -83,6 +85,8 @@ interface LoopStateT {
   status: string; stopReason: string; bestScore: number; latestScore: number;
   bestSeq?: number;
   riskFactors?: Record<string, number>;
+  progressGuard?: ProgressGuard;
+  handoff?: { available?: boolean; source?: string };
   asides: AsideTurn[];
   addons: Addon[];
   intentAlert?: { round?: number; seq?: number; aligned?: boolean; severity?: string; divergence?: string; suggestion?: string; dismissed?: boolean };
@@ -124,6 +128,7 @@ function mergeLoopRecordDetail(summary: LoopRecord, detail?: LoopRecord): LoopRe
     manualMessages: detail.manualMessages || summary.manualMessages,
     manualContext: detail.manualContext || summary.manualContext,
     evolutionBasis: detail.evolutionBasis || summary.evolutionBasis,
+    delivery: detail.delivery?.mode ? detail.delivery : summary.delivery,
     analysis,
     orchestration,
     stageDetails: Object.fromEntries(Object.entries(summary.stageDetails || detail.stageDetails || {}).map(
@@ -465,6 +470,7 @@ export const LoopPanel: React.FC<LoopPanelProps> = ({
           <div style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
             <div style={{ flex: 1, overflow: 'auto', padding: 'var(--ui-loop-body-padding, 12px 18px 24px)' }}>
               {!inspectOnly && <IntentBanner state={stateForView} sessionId={sessionId} />}
+              <LoopProgressNotice guard={stateForView.progressGuard} handoff={stateForView.handoff} />
               {stateForView.stage === 'loopidea' ? (
                 <>
                   <PolicyCard sessionId={sessionId} policy={stateForView.policy} readOnly={inspectOnly}
@@ -1970,6 +1976,7 @@ const LoopDetail: React.FC<{
       ) : liveAna ? <Section title="累计目标诊断（进行中）"
           extra={<BackendTag role="analysis" label={loop.backendLabels?.analysis} />}><Live text={liveAna} /></Section> : null)}
 
+      {(target === 'all' || target === 'analysis') && <LoopDeliveryDetail report={loop.delivery} />}
       {loop.error && <Section title="错误"><span style={{ color: '#f87171' }}>{loop.error}</span></Section>}
     </div>
   );

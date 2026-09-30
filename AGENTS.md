@@ -296,8 +296,8 @@ The global stage advances one-way: `loopidea → loopexecute → loopout`.
   **evidence-driven incremental evolution** of the current workspace. Every pass
   re-anchors on the global goal and original ideas, consumes the latest diagnosis
   plus Addons pending at pass start, verifies the real artifacts, preserves work
-  already proven correct, and selects only the highest-value remaining gap or
-  regression. It is neither a full restart of the whole goal nor a predetermined
+  already proven correct, and selects a related batch of ready tasks (or a
+  verifiable exploration hypothesis). It is neither a full restart nor a predetermined
   phase split across loop numbers. It runs three sub-stages: `prepare` (freeze the
   diagnostic/Addon basis and plan 1–4 necessary steps), `execute` (run the steps —
   consecutive `concurrent` steps go in parallel via `asyncio.gather`, `sequential`
@@ -306,7 +306,9 @@ The global stage advances one-way: `loopidea → loopexecute → loopout`.
   workspace against the global goal and persist `verified`, `gaps`, `next_focus`).
   Sub-stage and per-step timings are persisted (`LoopRecord.sub_started`,
   `LoopStep.started_at/ended_at`) to drive the flow view's durations.
-  Score ≥70 = deliverable, ≥85 = outputtable. A composite **risk coefficient**
+  Scores ≥70/≥85 are necessary but not sufficient for deliverable/outputtable:
+  new iterations also require a complete, stable task scope and verified acceptance.
+  A composite **risk coefficient**
   (0–1) caps the effective max loops. **Auto-continue** (`loopSetAuto`): when on,
   a finished loop auto-starts the next until stop/cancel. **Resume**: state is
   persisted per sub-stage and per step, so an interrupted loop is `resumable` —
@@ -359,6 +361,43 @@ Rationale: the old chat box shared `session.agent_session_id` with the loop's
 prepare/execute/analysis turns (cross-context pollution) and split attention; the
 panel-only design removes both. `LoopPanel` still supports a floating overlay
 mode (`embedded` omitted) but the app uses the inline mode.
+
+**Adaptive delivery and progress guard.** `loop_delivery.py` provides bounded
+conversion handoff, step evidence packets, structured reviewer reports and progress
+comparison. Handoff includes recent visible text and Skill IDs, never hidden thinking,
+attachments or historical tool grants; LOOP calls now also carry current Session
+constraints and bound Skill hints. `workMode` (`auto | delivery | explore`) selects
+task batching versus hypothesis testing. The reviewer reports stable task IDs,
+dependencies, implemented/verified/manual states and scoped blockers. Local blockers
+do not automatically stall independent work; global/safety blockers pause Auto.
+No-progress comparisons use evidence-backed task-state advances, not score increases
+or rewritten reports. `progressPatience` (default 3, range 2–8) triggers visible
+Auto pause after repeated non-progress, with replanning before that limit. These are
+reviewer observations, not machine proofs. Full reports live in lazy record details;
+compact pushes contain only counts and the guard. Legacy records remain unknown;
+known old default strategies migrate, custom strategies are preserved. See
+`docs/loop-adaptive-delivery.md` for boundaries and compatibility.
+
+Sequential execution retains its native context; fresh/retried calls receive prior
+step evidence. A deterministic display summary replaces the extra model summary
+call; analysis receives bounded head-and-tail originals. Backend failures after
+partial output remain failures. Explicit `loopControl.pause` requests halt subsequent
+stages at call boundaries. A lower score or automatic loopout never restores an old
+Git snapshot; rollback remains a separate explicit discard/recovery operation.
+
+Automated Codex iterations request native `read-only` for planning/read steps and
+`workspace-write` for write steps/analysis, separately from the removed Layer-2
+sandbox above. Unsupported sandbox requests fail rather than retry unrestricted.
+Actual isolation depends on the installed Codex/platform. Other Backends receive
+the same safety constraints but do not gain equivalent OS isolation. Tests that
+write user data must first verify a separate test-user directory; project snapshots
+do not protect external user files.
+Each call's role explanation uses the same access value as its Backend request:
+read-only planning may schedule authorized write/sequential execution later. A
+planner must not infer global missing write permission from its own read-only turn
+or from one denied user-file read; real authorization/safety blockers still pause.
+Historical next-focus notes are not permanent priority locks when a newer explicit
+user disposition changes scheduling; unresolved losses and acceptance remain visible.
 
 **俺寻思 (global attention sidecar).** A single App-topbar entry opens the App-level
 `ThoughtsAssistant`; ordinary Session and Loop headers deliberately expose no duplicate
@@ -456,12 +495,12 @@ ideas + the hint and rewrites the goal, appending a `refine` revision. Manual ed
 are a per-session `LoopPolicy` on the stage file (`loop_store.LoopPolicy`):
 `deliverable_score` (70), `outputtable_score` (85), `max_loops` (8),
 `risk_threshold` (0.85 — risk ≥ this seals to loopout), `independent_eval` (True),
-`intent_guard` (True — see below),
+`intent_guard` (True — see below), `work_mode` (`auto`), `progress_patience` (3),
 a per-position **`backends` map** (`{prepare, execute, idea, goal, analysis, aside}` → backend id;
 each empty = follow the session) so every "AI analysis/transformation" point can run
 on a **different backend** for heterogeneous planning, execution, and evaluation.
 Automated LOOP calls use isolated contexts, so `execute` may also route every step,
-fallback execution, and summary to another backend on the same executor; manual
+and fallback execution to another backend on the same executor; manual
 takeover remains on the Session backend. A separate per-position
 **`runtimes` map** (`{prepare, execute, idea, goal, analysis, aside}` →
 `{model, reasoningEffort}`) lets one Codex backend use different models/effort by
@@ -519,7 +558,7 @@ manual compaction; legacy Sessions bootstrap once from persisted assistant-messa
 Codex app-server additionally maps `thread/tokenUsage/updated.last.inputTokens` to current
 context size and `modelContextWindow` to its limit; a configured Qwen context window may use
 prompt input tokens as an explicitly labelled approximation. `_loop_run_agent` records every
-idea/goal/prepare/step/summary/analysis/aside call, while manual LOOP takeover is recorded as
+idea/goal/prepare/step/analysis/aside call (and legacy summary calls), while manual LOOP takeover is recorded as
 a LOOP `manual` event. `getSessionTokenUsage` returns a compact summary and
 `token_usage_updated` pushes live changes. `TokenUsageMonitor` is shared by ChatPane and the
 LOOP header: its collapsed pill expands into separately labelled lifetime input/output totals,
@@ -570,7 +609,8 @@ CLI entry without changing global installations; `AWU_TEST_QWEN_CMD=1` exercises
 CMD wrapper. Contracts cover installed 0.14.0 and the 0.19.8 release entry.
 
 **Intent guard (`intent_guard`, default on).** Early human↔model intent-divergence
-check: after the **first** loop of a round produces its plan (in `_loop_do_prepare`,
+check: after the **first** loop of a round, or a loop following observed no-progress,
+produces its plan (in `_loop_do_prepare`,
 before the heavy execute), `_intent_check` runs one lightweight independent turn
 (on the `analysis` backend) comparing the plan's direction against the user's real
 intent (global goal + original ideas). It writes `state.intent_alert`
@@ -579,7 +619,7 @@ shows a non-blocking `IntentBanner` only on medium/high divergence — it never 
 execution (respecting "don't over-interrupt"); the user can refine the goal or
 discard. The banner has a one-click **"✨ 采纳建议"** that feeds the
 divergence/suggestion into `loopRefineGoal` (rewrites the goal to realign) and then
-dismisses. Dismiss via `loopDismissIntent`. Runs once per round (省算力).
+dismisses. Dismiss via `loopDismissIntent`. Normal progressing loops skip this extra call.
 
 **Stop & discard a loop (`loopDiscard`).** A mis-clicked / unwanted iteration can
 be thrown away as if it never ran: `loopDiscard(session_id, seq=0)` (defaults to
@@ -1580,6 +1620,20 @@ snapshot and is memoized against unrelated Sidebar updates. Unmounting aborts lo
 metadata scanning and prevents late operation callbacks from starting directory/Git
 reads; submitted transfers themselves still continue. Tests count RPCs and local scans
 across idle time, reconnects, transfers and hidden/collapsed panels.
+
+**Local refresh fast path.** `listDirectory`, `gitDetect` and `gitStatus` run off the
+WebSocket event loop. The shared local/Relay receiver allows only these read-only RPCs
+and ping to overlap (16 in flight per connection); other RPCs retain an ordered barrier.
+Each request binds its own owner/client ContextVars and passes normal authorization;
+disconnect cancels pending replies. Ordinary scandir entries reuse the resolved parent,
+while symlinks and Windows junction/reparse points still resolve and validate containment.
+The tree requests lightweight Git detection and a single NUL-delimited porcelain-v2
+status scan, without diff/numstat or optional index writes. Legacy full Git APIs retain
+their defaults; old nodes lacking the options fall back only on a signature error.
+Git's pending request never holds the directory refresh lock. Parent Git badges are
+indexed once per status snapshot, and single-source children reuse their sorted list.
+This is on-demand refresh, not a new watcher or a content/hash scan. Tests:
+`test_file_panel_performance.py`, `file-tree-git.test.cjs`, `file-panel-layout.spec.ts`.
 
 **Local vs remote session** (`execMode`): a **local session** (`execMode!=='relay'`,
 runs on 本机) shows a plain working-dir tree — no cloud, no copy dir, click to view/edit

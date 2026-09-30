@@ -83,7 +83,8 @@ class LoopEvolutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("登录不能影响离线用户", prompt)
         self.assertIn("刷新 token 后状态会丢失", prompt)
         self.assertIn("同时保留离线登录兼容", prompt)
-        self.assertIn("一个最高价值增量焦点", prompt)
+        self.assertIn("一组相关且依赖就绪的任务", prompt)
+        self.assertNotIn("一个最高价值增量焦点", prompt)
         self.assertIn("不要尝试在本次重新完成整个目标", prompt)
         self.assertNotIn("一次完整、尽力的执行", prompt)
         self.assertEqual(current.iteration_mode, "evolution")
@@ -209,7 +210,7 @@ class LoopEvolutionTests(unittest.IsolatedAsyncioTestCase):
         bridge._loop_run_agent = run_agent
         await bridge._loop_do_execute(session, state, current)
 
-        self.assertEqual(len(calls), 2)  # 单步执行 + 执行汇总
+        self.assertEqual(len(calls), 1)  # 单步执行，确定性证据摘录不再调用模型
         for call in calls:
             self.assertEqual(call["backend_id"], "dedicated-worker")
             self.assertEqual(call["runtime"], {
@@ -253,7 +254,7 @@ class LoopEvolutionTests(unittest.IsolatedAsyncioTestCase):
         bridge._loop_run_agent = run_agent
         await bridge._loop_do_execute(session, state, current)
 
-        self.assertEqual(len(calls), 3)  # 重规划 + 新步骤 + 汇总
+        self.assertEqual(len(calls), 2)  # 重规划 + 新步骤，不再进行有损模型汇总
         self.assertEqual(current.orchestration[0].desc, "补齐并验证 ETL 回归")
         self.assertEqual(current.orchestration[0].status, "done")
         self.assertEqual(current.sub_stage, SUB_ANALYSIS)

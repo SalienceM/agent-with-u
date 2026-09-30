@@ -3363,14 +3363,25 @@ export const api = {
 
   // ── Git 集成：所有操作通过 execKey 路由到执行节点 ─────────────
 
-  async gitDetect(workingDir: string, execKey?: string): Promise<GitDetectResult> {
-    const result = await callOn(execKey, 'gitDetect', workingDir);
-    try { return JSON.parse(result); } catch { return { isRepo: false, branch: '', ahead: 0, behind: 0, remote: '', hasUncommitted: false }; }
+  async gitDetect(workingDir: string, execKey?: string, lightweight = false): Promise<GitDetectResult> {
+    let result;
+    try { result = await callOnStrict(execKey, 'gitDetect', [workingDir, lightweight]); }
+    catch (error) {
+      // 旧执行节点尚无轻量参数时仅回退只读调用，不把断线/权限错误当作版本不支持。
+      if (!/_rpc_gitDetect\(\).*positional argument/.test(String(error))) throw error;
+      result = await callOnStrict(execKey, 'gitDetect', [workingDir]);
+    }
+    return JSON.parse(result);
   },
 
-  async gitStatus(workingDir: string, execKey?: string): Promise<GitStatusResult> {
-    const result = await callOn(execKey, 'gitStatus', workingDir);
-    try { return JSON.parse(result); } catch { return { files: [], branch: '', upstream: '', ahead: 0, behind: 0, totalChanges: 0, stagedCount: 0 }; }
+  async gitStatus(workingDir: string, execKey?: string, includeNumstat = true): Promise<GitStatusResult> {
+    let result;
+    try { result = await callOnStrict(execKey, 'gitStatus', [workingDir, includeNumstat]); }
+    catch (error) {
+      if (!/_rpc_gitStatus\(\).*positional argument/.test(String(error))) throw error;
+      result = await callOnStrict(execKey, 'gitStatus', [workingDir]);
+    }
+    return JSON.parse(result);
   },
 
   async gitDiff(workingDir: string, path: string = '', staged: boolean = false, execKey?: string): Promise<GitDiffResult> {

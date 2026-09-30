@@ -1,5 +1,6 @@
 import { test, expect, type Page, type WebSocketRoute } from '@playwright/test';
 import type { CallDiagnostic } from '../../src/utils/loopDiagnostics';
+import type { DeliveryReport, ProgressGuard } from '../../src/components/LoopDeliveryStatus';
 
 function recordFixture() {
   const now = Date.now() / 1000;
@@ -7,6 +8,7 @@ function recordFixture() {
     seq: 1, round: 1, subStage: 'execute', goal: '修复当前回归', completed: false, error: '', result: '',
     createdAt: now - 60, updatedAt: now - 10, subStarted: { prepare: now - 60, execute: now - 50 }, analysis: null,
     callDiagnostics: [] as CallDiagnostic[],
+    delivery: {} as DeliveryReport,
     orchestration: [
       { index: 1, desc: '核实现状', mode: 'sequential', access: 'read', status: 'done', output: '第一步核实完成', endedAt: 3 },
       { index: 2, desc: '修复缺口', mode: 'sequential', access: 'write', status: 'running', output: '', endedAt: 0 },
@@ -21,7 +23,7 @@ function recordFixture() {
   };
 }
 
-async function fixture(page: Page) {
+async function fixture(page: Page, progressGuard: ProgressGuard = {}) {
   let record = recordFixture();
   let older: ReturnType<typeof recordFixture> | null = null;
   const sessionId = 'qa-loop-000';
@@ -31,7 +33,8 @@ async function fixture(page: Page) {
   let reads = 0;
   const pending: Array<() => void> = [];
   const state = () => ({ sessionId, stage: 'loopexecute', goal: '阶段审计回归', goalHistory: [], ideas: [],
-    loops: (older ? [older, record] : [record]).map(item => ({ ...item, detailLoaded: false, result: '',
+    progressGuard, handoff: { available: true, source: 'conversion' },
+    loops: (older ? [older, record] : [record]).map(item => ({ ...item, detailLoaded: false, result: '', delivery: {},
       callDiagnostics: item.callDiagnostics.slice(-1),
       orchestration: item.orchestration.map(step => ({ ...step, output: '', hasOutput: !!step.output })),
       stageDetails: Object.fromEntries(Object.entries(item.stageDetails).map(([key, value]) => [key,
@@ -66,6 +69,7 @@ async function fixture(page: Page) {
     setHold: (value: boolean) => { hold = value; },
     setFail: (value: boolean) => { fail = value; },
     release: () => pending.splice(0).forEach(send => send()),
+    seed: (change: (value: ReturnType<typeof recordFixture>) => void) => { change(record); },
     update: (change: (value: ReturnType<typeof recordFixture>) => void) => { change(record); socket.send(JSON.stringify({ event: 'loopUpdated', data: JSON.stringify(state()) })); },
     progress: (text: string) => socket.send(JSON.stringify({ event: 'loopProgress', data: JSON.stringify({ sessionId, seq: 1, subStage: 'step2', text }) })),
   };
@@ -186,6 +190,40 @@ test('flow switches newer → older → newer using status, blank area, keyboard
   await expect(pane.getByLabel('Loop #2 阶段详情', { exact: true })).toBeVisible();
   expect(data.reads()).toBe(2);
   await page.screenshot({ path: info.outputPath('flow-reselection.png'), fullPage: false });
+});
+
+test('delivery evidence and scoped blockers stay inspectable without extra polling', async ({ page }, info) => {
+  const errors: string[] = [];
+  page.on('pageerror', error => errors.push(error.message));
+  const data = await fixture(page, { pause: true, reason: '连续 3 次评审未确认任务状态推进', noProgressCount: 3, readyIds: ['2.1'] });
+  data.seed(record => {
+    record.delivery = {
+      mode: 'delivery', source: 'openspec/changes/example/tasks.md', scopeComplete: true, valid: true,
+      items: [
+        { id: '1.2', title: '恢复用户数据', status: 'blocked', dependsOn: [], evidence: '原哈希不能还原正文', manualBasis: '' },
+        { id: '2.1', title: '独立组件', status: 'implemented', dependsOn: [], evidence: 'components/button.ts@abc；隔离测试通过', manualBasis: '' },
+        { id: '3.1', title: '人工检查', status: 'manual', dependsOn: [], evidence: '', manualBasis: '用户明确要求真机人工检查' },
+      ],
+      blockers: [{ id: 'recovery', kind: 'local', affected: ['1.2'], reason: '没有可信备份', resolution: '提供备份后核对原哈希' }],
+      verification: { status: 'pending', evidence: '仍有非人工项未验收' },
+    };
+  });
+  const pane = await openFlow(page);
+  await expect(pane.getByTestId('loop-progress-notice')).toContainText('自动执行已暂停');
+  await expect(pane.getByTestId('loop-progress-notice')).toContainText('尚未宣称完成');
+  await pane.getByRole('button', { name: '查看 Analysis 阶段', exact: true }).click();
+  const report = pane.getByRole('region', { name: '任务与证据台账' });
+  await expect(report).toContainText('局部阻塞');
+  await expect(report).toContainText('已实现待验 1');
+  await report.getByText('展开 3 项任务、依赖和证据', { exact: true }).click();
+  await expect(report).toContainText('用户明确要求真机人工检查');
+  expect(data.reads()).toBe(1);
+  for (let i = 0; i < 3; i++) data.update(() => {});
+  await expect(report).toContainText('提供备份后核对原哈希');
+  expect(data.reads()).toBe(1);
+  await report.scrollIntoViewIfNeeded();
+  await page.screenshot({ path: info.outputPath('loop-delivery-evidence.png'), fullPage: false });
+  expect(errors).toEqual([]);
 });
 
 test('live prepare diagnostics distinguish rate limiting, thinking and text without repeated detail reads', async ({ page }, info) => {

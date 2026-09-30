@@ -44,6 +44,7 @@ import { rankFileSearchPaths } from '../utils/fileSearch';
 import { buildFileAttentionContext, type AttentionContext } from '../utils/attentionContext';
 import { fileTransfers, type TransferProgress } from '../utils/fileTransfers';
 import { buildLocalManifestTree } from '../utils/localFileTree';
+import { buildGitDirectoryStatuses } from '../utils/fileTreeGit';
 
 const CodeEditor = lazy(() => import('./CodeEditor'));
 const PdfPreview = lazy(() => import('./PdfPreview'));
@@ -425,6 +426,7 @@ export const FileTreePanel: React.FC<Props> = React.memo(({ sessionId, workingDi
   const gitRefreshRef = useRef<(() => Promise<void>) | null>(null);
   const [gitBranch, setGitBranch] = useState('');
   const [gitFiles, setGitFiles] = useState<Record<string, GitFileStatus>>({});
+  const gitDirectories = useMemo(() => buildGitDirectoryStatuses(gitFiles), [gitFiles]);
   const [gitStagedCount, setGitStagedCount] = useState(0);
   const [gitUnstagedCount, setGitUnstagedCount] = useState(0);
   const [gitAhead, setGitAhead] = useState(0);
@@ -640,15 +642,15 @@ export const FileTreePanel: React.FC<Props> = React.memo(({ sessionId, workingDi
       pending = (async () => {
         try {
           if (!detected || redetect) {
-            const res = await api.gitDetect(workingDir, execKey);
+            const res = await api.gitDetect(workingDir, execKey, true);
             if (cancelled) return;
             if (typeof res.isRepo !== 'boolean') throw new Error('Git 检测响应无效');
             detected = true; isRepo = res.isRepo;
             setGitAvailable(isRepo);
-            setGitBranch(res.branch || '');
+            if (!isRepo) setGitBranch('');
           }
           if (isRepo) {
-            const res = await api.gitStatus(workingDir, execKey);
+            const res = await api.gitStatus(workingDir, execKey, false);
             if (cancelled) return;
             if (res.error || !Array.isArray(res.files)) throw new Error(res.error || 'Git 状态响应无效');
             const map: Record<string, GitFileStatus> = {};
@@ -1094,10 +1096,11 @@ export const FileTreePanel: React.FC<Props> = React.memo(({ sessionId, workingDi
   const refreshAll = useCallback(async () => {
     if (!mountedRef.current) return;
     if (refreshPendingRef.current) return refreshPendingRef.current;
+    // Git 有独立合并/错误状态，不能让慢 Git 挡住下一次目录刷新。
+    void gitRefreshRef.current?.();
     const task = Promise.all([
       reloadAll(),
       localFs ? scanLocal(localFs) : Promise.resolve(),
-      gitRefreshRef.current?.(),
     ]).then(() => {});
     refreshPendingRef.current = task;
     try { await task; }
@@ -1357,6 +1360,7 @@ export const FileTreePanel: React.FC<Props> = React.memo(({ sessionId, workingDi
 
   /** 统一目录 = 已加载远端子项 ∪ 本机清单子项。 */
   const mergedChildren = useCallback((rel: string): TNode[] => {
+    if (!isRemote || !(localTree[rel]?.length)) return children[rel] || [];
     const merged = new Map<string, TNode>();
     for (const node of children[rel] || []) {
       merged.set(node.rel, { ...node, remote: true });
@@ -2171,18 +2175,7 @@ export const FileTreePanel: React.FC<Props> = React.memo(({ sessionId, workingDi
           const gf = gitFiles[n.rel];
           if (gf) gitBadge = { letter: GIT_STATUS_LETTER[gf.status], color: GIT_STATUS_COLOR[gf.status], title: `${gf.status}${gf.staged ? ' (staged)' : ''}` };
         } else {
-          // 目录：聚合子项中最严重的 Git 状态
-          const prefix = n.rel ? `${n.rel}/` : '';
-          let worst: GitFileStatus | null = null;
-          const priority: GitFileStatusType[] = ['conflicted', 'deleted', 'added', 'renamed', 'modified', 'untracked', 'copied'];
-          for (const p of priority) {
-            for (const [path, gf] of Object.entries(gitFiles)) {
-              if (path === n.rel || path.startsWith(prefix)) {
-                if (gf.status === p) { worst = gf; break; }
-              }
-            }
-            if (worst) break;
-          }
+          const worst = gitDirectories.get(n.rel) || gitFiles[n.rel];
           if (worst) gitBadge = { letter: GIT_STATUS_LETTER[worst.status], color: GIT_STATUS_COLOR[worst.status], title: worst.status };
         }
       }

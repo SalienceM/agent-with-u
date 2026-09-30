@@ -678,6 +678,7 @@ class CodexOfficeBackend(ModelBackend):
         model_override: Optional[str],
         reasoning_effort: Optional[str],
         remote_host: str = "",
+        execution_access: Optional[str] = None,
     ) -> dict:
         """Run one turn through a local executor or SSH Codex app-server."""
         self.clear_cancelled(session_id)
@@ -730,7 +731,7 @@ class CodexOfficeBackend(ModelBackend):
             # 其 JSON 形式是 kebab-case 字符串，不是旧版 SandboxPolicy 对象。
             # 线程已经保存该权限模式，turn/start 继承即可；不要重复发送
             # sandboxPolicy，否则不同 Codex CLI 版本之间还会产生协议兼容问题。
-            sandbox_mode = "workspace-write" if sandbox_enabled else "danger-full-access"
+            sandbox_mode = execution_access or ("workspace-write" if sandbox_enabled else "danger-full-access")
             thread_params: dict = {
                 "cwd": cwd,
                 "approvalPolicy": approval,
@@ -940,7 +941,10 @@ class CodexOfficeBackend(ModelBackend):
         reasoning_effort: Optional[str] = None,
         remote_host: Optional[str] = None,
         app_server_local: bool = False,
+        execution_access: Optional[str] = None,
     ) -> dict:
+        if execution_access not in (None, "read-only", "workspace-write"):
+            raise ValueError("Unsupported execution access")
         if remote_host or app_server_local:
             return await self._send_app_server_message(
                 messages=messages, content=content, images=images,
@@ -951,6 +955,7 @@ class CodexOfficeBackend(ModelBackend):
                 constraints=constraints, sandbox_enabled=sandbox_enabled,
                 model_override=model_override, reasoning_effort=reasoning_effort,
                 remote_host=remote_host or "",
+                execution_access=execution_access,
             )
         self.clear_cancelled(session_id)
 
@@ -1018,7 +1023,7 @@ class CodexOfficeBackend(ModelBackend):
                 return {"agentSessionId": new_agent_sid}
 
             approval_mode = "never" if skip else "on-request"
-            sandbox_mode = "workspace-write" if sandbox_enabled else "danger-full-access"
+            sandbox_mode = execution_access or ("workspace-write" if sandbox_enabled else "danger-full-access")
 
             if not codex_resume_id:
                 with tempfile.NamedTemporaryFile("w", delete=False, suffix=".txt", encoding="utf-8") as f:

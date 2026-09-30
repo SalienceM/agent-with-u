@@ -18,6 +18,8 @@ export interface LoopPolicy {
   stepMaxAttempts: number;
   independentEval: boolean;
   intentGuard: boolean;
+  workMode: 'auto' | 'delivery' | 'explore';
+  progressPatience: number;
   backends: Record<string, string>;   // 各角色的专用 backend：{prepare/execute/idea/goal/analysis/aside}
   runtimes: Record<string, ModelRuntime>; // 各角色的模型/推理档位覆盖
   strategy: string;
@@ -40,18 +42,11 @@ export const RUNTIME_POSITIONS: { key: string; label: string; hint: string }[] =
 ];
 
 export const DEFAULT_STRATEGY =
-  `LOOP 是围绕【全局目标】和当前真实产物的连续增量演进：既不在每次 loop 重做完整目标，也不预先把任务机械切成固定阶段。
-- prepare：回顾全局目标、原始诉求、上轮诊断和本次 addon；先核实现状，保留已验证成果，只选择当前最高价值的剩余缺口或回归，编排 1–4 个必要步骤。
-- execute：针对本次增量焦点实际执行；动手前确认现状，已经满足的工作直接跳过，不要重复生成、重写或做无收益的全量检查。
-- analysis：独立核实当前工作区的累计状态，并始终对照全局目标评分；明确记录已核实证据、剩余缺口和下一次唯一优先焦点。
-
-评分心智（防自欺，必须遵守）：
-1. 以可验证的实际产物为准——文件是否真存在、代码是否真能跑、命令/测试输出是否真通过；不要轻信执行阶段的自述总结，能验证就动手验证。
-2. score 衡量的是当前累计产物对全局目标的完成度，不是本次做了多少；本次贡献与整体完成度要分开。
-3. 默认未完成：除非有明确证据满足验收标准，否则不给高分；模糊、未验证、想当然一律压低。
-4. 警惕「美好陷阱」：流程跑顺 ≠ 目标达成；高分（≥可输出门槛）必须对应验收标准逐条被证据支撑。
-5. 趋势判断看已核实的净新增价值；禁止把重复执行、重复测试或更乐观的措辞算作进展。
-6. 宁可保守扣分、点明差距与下一步，也不要为了收口而粉饰；真完不成就如实在 challenges 标注。`;
+  `LOOP 围绕全局目标持续交付，保留已验证成果，不重做整个项目，也不把轮次机械切成固定阶段。
+- prepare：继承当前工作流与决策，核实真实任务来源、依赖及已有证据。已有任务清单时选择一组相关、就绪的任务，探索任务则选择可验证假设；按风险与成本编排 1–4 步，一个步骤可以连续完成多个相关任务。
+- execute：实施并进行针对性验证，保持稳定任务编号；不要把审计、文档和重复检查变成默认流水线。阻塞要注明影响范围、已尝试路径、解除条件，只有依赖受影响的任务等待；不绕过全局 blocked、授权或安全门槛。
+- analysis：独立核实本次影响面和关键回归，复用版本与环境仍有效的证据；区分已实现、已验证、局部阻塞和明确人工项。下一步给出候选与取舍，不把最小瑕疵自动升级为唯一优先项。
+评分以累计实际产物为准，默认未完成，不轻信执行自述；操作次数、文档数量和乐观措辞不等于进展。连续无实质推进时换路规划或请求人工输入。完整任务验收及必要 verify 才是收口依据，分数只作辅助。`;
 
 export const DEFAULT_POLICY: LoopPolicy = {
   deliverableScore: 70,
@@ -62,6 +57,8 @@ export const DEFAULT_POLICY: LoopPolicy = {
   stepMaxAttempts: 2,
   independentEval: true,
   intentGuard: true,
+  workMode: 'auto',
+  progressPatience: 3,
   backends: {},
   runtimes: {},
   strategy: DEFAULT_STRATEGY,
@@ -79,6 +76,8 @@ export function normalizePolicy(p?: Partial<LoopPolicy> | null): LoopPolicy {
   const attempts = Math.round(clamp(num(d.stepMaxAttempts, 2), 1, 3));
   const ie = d.independentEval !== false;
   const ig = d.intentGuard !== false;
+  const workMode = ['delivery', 'explore'].includes(d.workMode) ? d.workMode : 'auto';
+  const progressPatience = Math.round(clamp(num(d.progressPatience, 3), 2, 8));
   const backends: Record<string, string> = {};
   const rawB: any = (d as any).backends;
   if (rawB && typeof rawB === 'object') {
@@ -102,7 +101,7 @@ export function normalizePolicy(p?: Partial<LoopPolicy> | null): LoopPolicy {
     }
   }
   const strat = (typeof d.strategy === 'string' && d.strategy.trim()) ? d.strategy : DEFAULT_STRATEGY;
-  return { deliverableScore: del, outputtableScore: out, maxLoops: ml, riskThreshold: rt, stepStallSeconds: stall, stepMaxAttempts: attempts, independentEval: ie, intentGuard: ig, backends, runtimes, strategy: strat };
+  return { deliverableScore: del, outputtableScore: out, maxLoops: ml, riskThreshold: rt, stepStallSeconds: stall, stepMaxAttempts: attempts, independentEval: ie, intentGuard: ig, workMode, progressPatience, backends, runtimes, strategy: strat };
 }
 
 function num(v: any, fb: number): number { const n = Number(v); return Number.isFinite(n) ? n : fb; }
@@ -191,9 +190,18 @@ export const LoopPolicyEditor: React.FC<{
       {selPreset?.desc && <div style={{ fontSize: 11, color: 'var(--theme-text-muted)' }}>{selPreset.desc}</div>}
 
       <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
-        <NumField label="可交付门槛" hint="分数 ≥ 此值视为可交付" value={value.deliverableScore}
+        <label style={labelText}>推进方式
+          <select aria-label="LOOP 推进方式" value={value.workMode} onChange={(e) => set({ workMode: e.target.value as LoopPolicy['workMode'] })} style={inputBase}>
+            <option value="auto">自动识别：任务交付 / 探索验证</option>
+            <option value="delivery">任务交付：依赖就绪的相关批次</option>
+            <option value="explore">探索验证：假设与成果</option>
+          </select>
+        </label>
+        <NumField label="无实质进展容忍次数" hint="先换路规划；持续无任务状态推进则暂停 Auto，不宣称完成" value={value.progressPatience}
+          min={2} max={8} step={1} onChange={(v) => set({ progressPatience: v })} />
+        <NumField label="可交付门槛" hint="分数达到且任务/verify 验收通过才可交付" value={value.deliverableScore}
           min={0} max={100} step={1} onChange={(v) => set({ deliverableScore: v })} />
-        <NumField label="可输出门槛" hint="分数 ≥ 此值视为可输出" value={value.outputtableScore}
+        <NumField label="可输出门槛" hint="分数达到且完整范围验收通过才可输出" value={value.outputtableScore}
           min={0} max={100} step={1} onChange={(v) => set({ outputtableScore: v })} />
         <NumField label="最大 Loop 数" hint="本轮次数预算，不设固定上限" value={value.maxLoops}
           min={1} step={1} onChange={(v) => set({ maxLoops: v })} />
@@ -207,7 +215,8 @@ export const LoopPolicyEditor: React.FC<{
 
       <div style={{ fontSize: 11, color: 'var(--theme-text-muted)', lineHeight: 1.55, padding: '7px 9px', borderRadius: 7, background: 'var(--theme-bg-secondary)', border: '1px solid var(--theme-border)' }}>
         自动防卡死：单步超过设定时间没有任何新事件时，会关闭当前 Backend 调用，保留已经落盘的文件，
-        用全新模型上下文重试当前步；达到次数上限后该步记为失败，LOOP 仍继续汇总与评审，不会永久停在 running。
+        用全新模型上下文重试当前步；达到次数上限后停止盲跑后续依赖步骤，交给评审和下一轮重新选路。
+        持续无实质推进会暂停 Auto；安全或全局阻塞可提前暂停。Codex 自动调用使用原生只读/工作区写入沙箱，其他 Backend 仍需验证测试数据隔离，不能把提示词当作沙箱。
       </div>
 
       {/* 防自欺：独立对抗式评审 */}
@@ -227,7 +236,7 @@ export const LoopPolicyEditor: React.FC<{
         <span>
           <span style={{ fontSize: 12.5, fontWeight: 600, color: 'var(--theme-text)' }}>意图守卫（早期偏差提示）</span>
           <span style={{ display: 'block', fontSize: 11, color: 'var(--theme-text-muted)', marginTop: 2, lineHeight: 1.5 }}>
-            每轮第一遍出 plan 后、真正重执行前，独立检查「计划方向 vs 你的真实意图」是否跑偏；有实质偏差才非阻塞地提示，早暴露、省算力，又不打断执行。
+            每轮首次规划及出现无实质进展后的重规划，独立检查计划是否偏离真实目标；仅有实质偏差才提示。
           </span>
         </span>
       </label>

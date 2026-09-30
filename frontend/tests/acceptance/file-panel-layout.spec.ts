@@ -2,6 +2,75 @@ import { test, expect, type Page, type Locator } from '@playwright/test';
 
 const idleNotice = '目录按需读取，可手动刷新';
 
+test('directory refresh and expansion stay usable while Git is still pending', async ({ page }) => {
+  let rootReads = 0;
+  let gitReads = 0;
+  let finishGit: (() => void) | undefined;
+  await page.routeWebSocket(/.*/, socket => {
+    const server = socket.connectToServer();
+    socket.onMessage(message => {
+      const frame = JSON.parse(String(message));
+      const reply = (result: unknown) => socket.send(JSON.stringify({ id: frame.id, result: JSON.stringify(result) }));
+      if (frame.method === 'gitDetect') {
+        expect(frame.params[1]).toBe(true);
+        return reply({ isRepo: true });
+      }
+      if (frame.method === 'gitStatus') {
+        expect(frame.params[1]).toBe(false);
+        gitReads++;
+        finishGit = () => reply({ branch: 'main', files: [] });
+        return;
+      }
+      if (frame.method === 'listDirectory') {
+        const rel = frame.params[0];
+        if (!rel) rootReads++;
+        return reply(rel ? [{ name: 'child.txt', path: 'src/child.txt', isDir: false }]
+          : [{ name: 'src', path: 'src', isDir: true },
+            { name: `refresh-${rootReads}.txt`, path: `refresh-${rootReads}.txt`, isDir: false }]);
+      }
+      server.send(message);
+    });
+  });
+  const panel = await openFiles(page);
+  await expect(panel.locator('.ftp-row').filter({ hasText: 'refresh-1.txt' })).toBeVisible();
+  await expect.poll(() => gitReads).toBe(1);
+  await expect(panel.locator('.ftp-local-actions')).toHaveAttribute('aria-busy', 'false');
+  for (const count of [2, 3]) {
+    await panel.locator('.ftp-hdr').hover();
+    await panel.getByTitle('刷新本机与远端目录', { exact: true }).click();
+    await expect(panel.locator('.ftp-row').filter({ hasText: `refresh-${count}.txt` })).toBeVisible();
+    expect(gitReads).toBe(1);
+  }
+  await panel.locator('.ftp-row').filter({ has: page.getByText('src', { exact: true }) }).click();
+  await expect(panel.locator('.ftp-row').filter({ hasText: 'child.txt' })).toBeVisible();
+  await expect(panel.locator('.ftp-git-toolbar')).toContainText('同步中');
+  finishGit?.();
+  await expect(panel.locator('.ftp-git-toolbar')).toContainText('工作区干净');
+});
+
+test('older executors fall back only on the unsupported read option signature', async ({ page }) => {
+  const methods: string[] = [];
+  await page.routeWebSocket(/.*/, socket => {
+    const server = socket.connectToServer();
+    socket.onMessage(message => {
+      const frame = JSON.parse(String(message));
+      if (['gitDetect', 'gitStatus'].includes(frame.method)) {
+        methods.push(`${frame.method}:${frame.params.length}`);
+        if (frame.params.length > 1) {
+          return socket.send(JSON.stringify({ id: frame.id,
+            error: `BridgeWS._rpc_${frame.method}() takes 2 positional arguments but 3 were given` }));
+        }
+        return socket.send(JSON.stringify({ id: frame.id, result: JSON.stringify(frame.method === 'gitDetect'
+          ? { isRepo: true } : { branch: 'old-node', files: [] }) }));
+      }
+      server.send(message);
+    });
+  });
+  const panel = await openFiles(page);
+  await expect(panel.locator('.ftp-git-toolbar')).toContainText('工作区干净');
+  expect(methods).toEqual(['gitDetect:2', 'gitDetect:1', 'gitStatus:2', 'gitStatus:1']);
+});
+
 // Isolated QA sessions + held read-only RPC replies; never touch real workspace files.
 async function openFiles(page: Page, beforeOpen?: () => Promise<void>): Promise<Locator> {
   await page.goto('/');
