@@ -1,5 +1,7 @@
 import React, { useState, useCallback, useEffect, useRef, useMemo, useReducer } from 'react';
 import { FileTransferCenter } from './components/FileTransferCenter';
+import { backendCatalog } from './backendCatalog';
+import { saveAndVerifyBackend } from './utils/codexModelOptions';
 import {
   api, isTauri, getExecutors, getAssignableExecutors, onExecStatus, getHomeExecKey, getSessionExecKey,
   getCurrentUserProfile, onCurrentUserChanged,
@@ -1155,14 +1157,14 @@ export const App: React.FC = () => {
 
   /* ---- Backend Manager ---- */
   const handleSaveBackend = useCallback(async (config: any, execKey: string) => {
-    await api.saveBackend(config, execKey);
-    const allBackendConfigs = await api.getBackends(execKey, true);
+    const allBackendConfigs = await saveAndVerifyBackend(config, execKey, api.saveBackend, api.getBackends);
     setBackendConfigs(allBackendConfigs);
     // App 顶层 backends 表示当前默认执行节点；管理其它节点时不能拿远端列表
     // 覆盖它，否则顶栏和新建会话会短暂显示错节点的 Backend。
     if (execKey === getHomeExecKey()) {
-      setBackends(await api.getBackends(execKey));
+      setBackends(allBackendConfigs.filter((item: any) => item.enabled !== false));
     }
+    backendCatalog.publish(execKey, config.id);
     // Also refresh sessions to update backend references
     await refreshSessionList();
   }, [refreshSessionList]);
@@ -2628,10 +2630,14 @@ const NewSessionDialog: React.FC<NewSessionDialogProps> = ({
     });
   }), []);
   const isHomeExec = execKey === getHomeExecKey();
+  const homeBackendSnapshot = isHomeExec ? backends : undefined;
+  useEffect(() => backendCatalog.subscribe(execKey, () => {
+    setExecutorRevision(current => current + 1);
+  }), [execKey]);
 
   // 上层列表只用于弹窗首帧占位。弹窗打开、切换节点或节点重连后，都向所选
   // 执行节点读取权威清单，避免首屏不完整缓存一直保留到整页刷新。
-  const [execBackends, setExecBackends] = useState<any[]>(backends);
+  const [execBackends, setExecBackends] = useState<any[]>(isHomeExec ? backends : []);
   const [execBackendsLoading, setExecBackendsLoading] = useState(false);
   const [execBackendsError, setExecBackendsError] = useState('');
   const execBackendsKeyRef = useRef(execKey);
@@ -2648,12 +2654,12 @@ const NewSessionDialog: React.FC<NewSessionDialogProps> = ({
     const keyChanged = execBackendsKeyRef.current !== execKey;
     execBackendsKeyRef.current = execKey;
     setExecBackends((current) => {
-      if (keyChanged) return isHomeExec ? backends : [];
-      return current.length ? current : (isHomeExec ? backends : current);
+      if (keyChanged) return homeBackendSnapshot ?? [];
+      return current.length ? current : (homeBackendSnapshot ?? current);
     });
     setExecBackendsLoading(true);
     setExecBackendsError('');
-    api.getBackends(execKey).then((list) => {
+    backendCatalog.read(execKey).then((list) => {
       if (!cancelled) setExecBackends(Array.isArray(list) ? list : []);
     }).catch((error: any) => {
       if (!cancelled) {
@@ -2663,7 +2669,7 @@ const NewSessionDialog: React.FC<NewSessionDialogProps> = ({
       if (!cancelled) setExecBackendsLoading(false);
     });
     return () => { cancelled = true; };
-  }, [execKey, isHomeExec, backends, executorRevision]);
+  }, [execKey, homeBackendSnapshot, executorRevision]);
 
   const [selectedBackendId, setSelectedBackendId] = useState(
     backends[0]?.id || 'claude-agent-sdk-default'

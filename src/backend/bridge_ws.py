@@ -759,7 +759,14 @@ def _codex_message_equivalent(native: ChatMessage, local: ChatMessage) -> bool:
     return False
 
 
-class BridgeWS:
+from .loop_source_bridge import LoopSourceBridge
+from .loop_decisions import DecisionFacts, decide_next, digest as loop_digest
+from .loop_task_source import source_summary, reconcile, snapshot_fresh
+from .loop_milestones import (MILESTONE_INSTRUCTIONS, register_plan, review_milestones,
+                              milestone_progress, inherit_plan)
+
+
+class BridgeWS(LoopSourceBridge):
     """WebSocket bridge，业务逻辑与 Bridge（Qt）完全相同，去掉 Qt 依赖。"""
 
     def __init__(self, cli_path: Optional[str] = None, auth_guard: Optional["AuthGuard"] = None):
@@ -1942,10 +1949,10 @@ class BridgeWS:
         print(f"[bridge_ws] client connected user={ident} via={ident_src} (total={len(self._clients)})",
               file=sys.stderr, flush=True)
         self._emit_clients_changed()
-        # 只允许无副作用的文件树读请求并发；写操作仍是顺序屏障。
+        # 只允许只读文件树/目录查询并发；写操作仍是顺序屏障。
         # Relay 的虚拟 websocket 复用此入口，身份 ContextVar 在各任务内独立绑定。
         reads: set[asyncio.Task] = set()
-        concurrent_reads = {"listDirectory", "gitDetect", "gitStatus", "ping"}
+        concurrent_reads = {"listDirectory", "gitDetect", "gitStatus", "ping", "codexModelCatalog"}
 
         async def reply(req: dict) -> None:
             req_id = req.get("id")
@@ -2030,7 +2037,7 @@ class BridgeWS:
             or method.startswith("relayNode")
             or method.startswith("skillRuntime")
             or method in {
-                "saveBackend", "deleteBackend", "exportBackends", "poeAccountOverview",
+                "saveBackend", "deleteBackend", "exportBackends", "poeAccountOverview", "codexModelCatalog",
                 "previewBackendImport", "importBackends",
                 "exportData", "importData",
                 "saveMcpServers", "openLoginTerminal", "openModelTerminal",
@@ -5083,12 +5090,13 @@ class BridgeWS:
         d = state.to_dict()
         if compact:
             d["handoff"] = {"source": state.handoff.get("source", ""), "available": bool(state.handoff)}
+            d["taskSource"] = source_summary(state.task_source)
         running = self._loop_is_running(state.session_id)
         last = state.loops[-1] if state.loops else None
         # 可续：最后一条 loop 没跑完、不是错误、当前没在跑、仍在 execute 阶段
         d["running"] = running
         d["resumable"] = bool(
-            last and last.kind != "manual" and not last.completed and not last.error
+            last and last.kind != "manual" and not last.completed and not last.error and not last.terminal_kind
             and not running and state.stage == STAGE_EXECUTE
         )
         d["canTakeover"] = bool(
@@ -5106,14 +5114,21 @@ class BridgeWS:
                 pos: self._runtime_label(bid, rmap.get(pos))
                 for pos, bid in bmap.items() if bid
             }
+            report = rec.get("delivery") or {}
+            rec["deliverySummary"] = {
+                "mode": report.get("mode", ""),
+                "counts": {status: sum(i.get("status") == status for i in report.get("items", []))
+                           for status in ("pending", "implemented", "verified", "blocked", "manual")},
+                "blockerCount": len(report.get("blockers", [])),
+                "formal": report.get("reconciliation", {}),
+                "milestones": report.get("milestoneSummary", {}),
+            } if report else {}
+            rec['sourceSummary'] = {key: {'scopeDigest': snap.get('scopeDigest'), 'stateDigest': snap.get('stateDigest'),
+                'capturedAt': snap.get('capturedAt')} for key, snap in rec.get('sourceSnapshots', {}).items() if isinstance(snap, dict)}
             if compact:
-                report = rec.get("delivery") or {}
-                rec["deliverySummary"] = {
-                    "mode": report.get("mode", ""),
-                    "counts": {status: sum(i.get("status") == status for i in report.get("items", []))
-                               for status in ("pending", "implemented", "verified", "blocked", "manual")},
-                    "blockerCount": len(report.get("blockers", [])),
-                } if report else {}
+                rec['sourceSnapshots'] = {}
+                rec['decisionHistory'] = []
+                rec['milestonePlan'] = {}
                 rec["delivery"] = {}
                 rec["callDiagnostics"] = rec.get("callDiagnostics", [])[-1:]
                 result = str(rec.get("result") or "")
@@ -5580,6 +5595,9 @@ class BridgeWS:
             raise
         finally:
             diagnostic.finish(outcome)
+            record.outcome_version = 1
+            record.call_results[sub_stage] = {'done': 'normal', 'stalled': 'timeout'}.get(outcome, outcome)
+            self._loop_save(state)
             self._emit_loop_updated(state)
 
     async def _loop_run_agent_impl(self, session: "Session", prompt: str,
@@ -5790,6 +5808,16 @@ class BridgeWS:
             elif resume and new_sid and indep_session_id is None:
                 session.agent_session_id = new_sid
                 self._session_store.save(session, async_=True)
+        except asyncio.CancelledError:
+            try:
+                backend.abort(sid_for_backend)
+            except Exception:
+                pass
+            if 'send_task' in locals() and not send_task.done():
+                send_task.cancel()
+                stopped, _ = await asyncio.wait({send_task}, timeout=3.0)
+                backend_call_quiesced = bool(stopped)
+            raise
         except _LoopAgentStalledError:
             raise
         except Exception as e:
@@ -5805,8 +5833,13 @@ class BridgeWS:
             # 可能继续向旧面板写数据。LOOP backend 是独立实例，不影响后续轮次。
             if backend_call_quiesced:
                 backend.clear_cancelled(sid_for_backend)
-            if self._loop_active_backends.get(sid_for_backend) is backend:
+            if backend_call_quiesced and self._loop_active_backends.get(sid_for_backend) is backend:
                 self._loop_active_backends.pop(sid_for_backend, None)
+            elif not backend_call_quiesced and 'send_task' in locals():
+                def release_old_call(_task):
+                    if self._loop_active_backends.get(sid_for_backend) is backend:
+                        self._loop_active_backends.pop(sid_for_backend, None)
+                send_task.add_done_callback(release_old_call)
         self._record_session_usage(
             session,
             usage=call_usage,
@@ -6150,7 +6183,7 @@ class BridgeWS:
             or self._active_loop_task(session_id) is not None
         )
 
-    def _schedule_loop_iteration(self, session_id: str) -> bool:
+    def _schedule_loop_iteration(self, session_id: str, *, auto_required: bool = False, decision_id: str = '') -> bool:
         """去重启动一次 iteration，并保留可强制取消的顶层 Task。"""
         existing = self._active_loop_task(session_id)
         try:
@@ -6163,7 +6196,7 @@ class BridgeWS:
             return False
         if session_id in self._loop_running:
             return False
-        task = asyncio.create_task(self._run_loop_iteration(session_id))
+        task = asyncio.create_task(self._run_loop_iteration(session_id, auto_required=auto_required, decision_id=decision_id))
         self._loop_tasks[session_id] = task
 
         # create_task 到协程真正进入 _loop_running 之间也属于运行中。登记后立刻
@@ -6206,7 +6239,16 @@ class BridgeWS:
                 step.ended_at = step.ended_at or now
                 if not step.output:
                     step.output = reason
-        record.error = reason
+        if record.outcome_version:
+            record.terminal_kind = 'cancelled'
+            record.decision = decide_next(DecisionFacts(user_stop=True), f'{record.round}:{record.seq}:cancelled')
+            record.decision.update(round=record.round, seq=record.seq)
+            record.decision_history = (record.decision_history + [dict(record.decision)])[-16:]
+            for step in record.orchestration:
+                if step.status == 'error' and step.call_result == 'unknown':
+                    step.call_result = 'cancelled'
+        else:
+            record.error = reason
         record.sub_stage = SUB_DONE
         record.mark_sub(SUB_DONE)
         record.updated_at = now
@@ -6252,7 +6294,7 @@ class BridgeWS:
         if state.auto and state.stage == STAGE_EXECUTE and not self._loop_is_running(session_id):
             stop, _ = self._loop_should_stop(state)
             if not stop:
-                self._schedule_loop_iteration(session_id)
+                self._schedule_loop_iteration(session_id, auto_required=True)
         return json.dumps({"status": "ok", "auto": state.auto}, ensure_ascii=False)
 
     def _rpc_loopRunIteration(self, session_id: str) -> str:
@@ -6266,6 +6308,8 @@ class BridgeWS:
             return json.dumps({"status": "error", "message": "当前不在 loopexecute 阶段"}, ensure_ascii=False)
         if self._loop_is_running(session_id):
             return json.dumps({"status": "error", "message": "上一次 loop 仍在进行"}, ensure_ascii=False)
+        if self._loop_has_active_call(session_id):
+            return json.dumps({"status": "error", "message": "旧 Backend 调用尚未确认退出，不能启动新的写调用"}, ensure_ascii=False)
         state.progress_guard = {**state.progress_guard, "pause": False}
         self._schedule_loop_iteration(session_id)
         return json.dumps({"status": "ok"}, ensure_ascii=False)
@@ -6305,7 +6349,7 @@ class BridgeWS:
         self._emit_loop_updated(state)
         return json.dumps({"status": "ok", "seq": rec.seq, "revertedAddons": reverted}, ensure_ascii=False)
 
-    async def _run_loop_iteration(self, session_id: str) -> None:
+    async def _run_loop_iteration(self, session_id: str, *, auto_required: bool = False, decision_id: str = '') -> None:
         """跑一次增量演进 loop（resume 断点 or 新开），按 prepare→execute→analysis。
 
         ★ 始终回看全局目标，但只推进诊断出的最高价值剩余缺口，保留已核实成果。
@@ -6318,7 +6362,15 @@ class BridgeWS:
             return
         if state.control_mode != "loop":
             return
+        if auto_required and (not state.auto or state.progress_guard.get('pause') or state.stage != STAGE_EXECUTE
+                or decision_id and (not state.loops or state.loops[-1].decision.get('decisionId') != decision_id)):
+            return
         if session_id in self._loop_running:
+            return
+        if self._loop_has_active_call(session_id):
+            last = state.loops[-1] if state.loops else None
+            if last:
+                self._loop_wait(state, last, 'call_active', '上一 Backend 调用尚未确认退出。', '确认旧调用退出后显式恢复。')
             return
         self._loop_running.add(session_id)
         record: Optional[LoopRecord] = None
@@ -6328,12 +6380,18 @@ class BridgeWS:
             # resume-or-new：最后一条未完成且非错误 → 续跑它；否则新开
             last = state.loops[-1] if state.loops else None
             if (last and last.round == state.round
-                    and not last.completed and not last.error):
+                    and not last.completed and not last.error and not last.terminal_kind):
                 record = last
             else:
+                if len(state.round_loops()) >= state.effective_max_loops():
+                    if last:
+                        self._loop_reduce(state, last)
+                        self._loop_save(state)
+                        self._emit_loop_updated(state)
+                    return
                 record = LoopRecord(seq=max((item.seq for item in state.loops), default=0) + 1,
                                     sub_stage=SUB_PREPARE,
-                                    round=state.round)
+                                    round=state.round, outcome_version=1)
                 # ★ 版本隔离：开跑前快照 agent 上下文 + git 工作树，丢弃本次 loop 时回滚到这里
                 record.agent_checkpoint = session.agent_session_id or ""
                 record.git_checkpoint = git_snapshot(session.working_dir)
@@ -6347,6 +6405,9 @@ class BridgeWS:
             history = self._loop_history_brief(state, exclude_seq=record.seq)
             order = [SUB_PREPARE, SUB_EXECUTE, SUB_ANALYSIS]
             start = order.index(record.sub_stage) if record.sub_stage in order else 0
+            if not await self._loop_check_source(session, state, record, 'prepare', force=True):
+                return
+            self._loop_stage_decision(state, record, 'resume' if record is last else 'start', order[start])
             for stage in order[start:]:
                 if session_id in self._loop_cancel:
                     break
@@ -6355,15 +6416,22 @@ class BridgeWS:
                 elif stage == SUB_EXECUTE:
                     await self._loop_do_execute(session, state, record)
                 elif stage == SUB_ANALYSIS:
+                    if not await self._loop_check_source(session, state, record, 'after-execute', force=True):
+                        break
                     await self._loop_do_analysis(session, state, record)
                 if state.progress_guard.get("pause"):
                     break
+                if stage != SUB_ANALYSIS:
+                    self._loop_stage_decision(state, record, stage, SUB_EXECUTE if stage == SUB_PREPARE else SUB_ANALYSIS)
         except Exception as e:
             import traceback
             print(f"[loop] iteration failed: {e}\n{traceback.format_exc()}",
                   file=sys.stderr, flush=True)
             if record is not None and session_id not in self._loop_cancel:
                 record.error = str(e)
+                record.outcome_version = 1
+                record.terminal_kind = 'failed'
+                record.call_results[record.sub_stage] = 'timeout' if isinstance(e, _LoopAgentStalledError) else 'error'
                 failed_stage = record.sub_stage
                 if record.stage_details.get(SUB_PREPARE, {}).get("status") == "retrying":
                     failed_stage = SUB_PREPARE
@@ -6406,7 +6474,7 @@ class BridgeWS:
                     self._loop_save(st)
                     self._emit_loop_updated(st)
                     if st.auto:
-                        self._schedule_loop_iteration(session_id)
+                        self._schedule_loop_iteration(session_id, auto_required=True)
             elif session_id in self._loop_pending_out:
                 # 运行中“进入 loopout”是一次受控停止，而不是只改 stage 后把旧任务
                 # 留在后台。已有步骤产出保留，当前 running 步明确标为中止。
@@ -6464,6 +6532,47 @@ class BridgeWS:
             state.stop_reason = ""
         return reverted
 
+    def _loop_has_active_call(self, session_id: str) -> bool:
+        return any(key == session_id or key.startswith(session_id + ':')
+                   for key in getattr(self, '_loop_active_backends', {}))
+
+    def _loop_evidence_environment(self, session, record) -> str:
+        backend_id = record.backends.get('execute') or session.backend_id
+        config = next((c for c in self._backend_configs if c.id == backend_id), None)
+        return loop_digest([backend_id, str(getattr(config, 'type', '')), getattr(config, 'env', {}) or {},
+                            getattr(config, 'cli_path', ''), sys.platform, sys.version_info[:3],
+                            str(getattr(session, 'working_dir', ''))])[:40]
+
+    def _loop_keep_decision(self, state, record, decision: dict) -> None:
+        decision.update(round=record.round, seq=record.seq, revision=state.task_source.get('revision', 0))
+        record.decision = decision
+        if not record.decision_history or record.decision_history[-1].get('decisionId') != decision['decisionId']:
+            record.decision_history.append(dict(decision))
+            record.decision_history = record.decision_history[-16:]
+
+    def _loop_stage_decision(self, state, record, boundary: str, next_stage: str) -> None:
+        decision = decide_next(DecisionFacts(auto=True, control_mode=state.control_mode,
+            source_status=state.task_source.get('status', 'unbound'),
+            user_stop=state.session_id in self._loop_cancel or state.session_id in self._loop_pending_out,
+            call_still_active=self._loop_has_active_call(state.session_id), ready_ids=[next_stage]),
+            f'{record.round}:{record.seq}:{boundary}', [f'record:{record.seq}:{boundary}'])
+        decision['nextStep'] = f'在本次已请求的迭代内进入 {next_stage}；不扩大目标或授权。'
+        self._loop_keep_decision(state, record, decision)
+        self._loop_save(state)
+
+    def _loop_wait(self, state, record, code: str, reason: str, condition: str = '') -> None:
+        state.auto = False
+        state.progress_guard = {**state.progress_guard, 'pause': True, 'reasonCode': code,
+                                'reason': reason, 'resumeCondition': condition, 'seq': record.seq}
+        record.outcome_version, record.terminal_kind = 1, 'paused'
+        record.task_result = 'blocked'
+        decision = decide_next(DecisionFacts(hard_reason=code, reason_text=reason,
+            resume_condition=condition, control_mode=state.control_mode), f'{record.round}:{record.seq}:{record.sub_stage}')
+        self._loop_keep_decision(state, record, decision)
+        record.updated_at = time.time()
+        self._loop_save(state)
+        self._emit_loop_updated(state)
+
     def _loop_pause_control(self, state: "LoopState", record: "LoopRecord", text: str) -> bool:
         """模型只能请求收紧执行，不能用控制字段授予权限或宣告完成。"""
         parsed = self._extract_json_block(text) or {}
@@ -6471,9 +6580,8 @@ class BridgeWS:
         if not isinstance(control, dict) or control.get("pause") is not True:
             return False
         reason = loop_excerpt(control.get("reason"), 1200).strip() or "模型报告需人工介入，未提供解除条件，请检查阶段原文。"
-        state.auto = False
-        state.progress_guard = {"pause": True, "reason": reason, "seq": record.seq}
-        record.error = "已暂停自动执行：" + reason
+        code = control.get('kind') if control.get('kind') in ('safety', 'authorization', 'human_input', 'workflow_blocked') else 'unclassified_pause'
+        self._loop_wait(state, record, code, reason, loop_excerpt(control.get('resolution'), 1200))
         record.stage_details.setdefault(record.sub_stage, {}).update({"status": "paused", "message": reason, "rawOutput": text})
         record.updated_at = time.time()
         self._loop_save(state)
@@ -6501,8 +6609,8 @@ class BridgeWS:
         return steps
 
     async def _loop_do_prepare(self, session, state, record, history) -> None:
-        record.progress_version = 1
-        record.progress_scope = scope_key(state.goal)
+        record.progress_version = 2
+        record.progress_scope = scope_key(state.goal + ':' + str(state.task_source.get('scopeRevision', 0))) if state.task_source.get('scopeRevision') else scope_key(state.goal)
         if not state.handoff and getattr(session, "messages", None):
             state.handoff = handoff_from_session(session)
             state.handoff["source"] = "legacy-resume"
@@ -6602,6 +6710,7 @@ class BridgeWS:
             '{"mode": "sequential", "access": "write", "desc": "只实施必要修正…"}]}\n'
             "```"
         )
+        prepare_prompt += MILESTONE_INSTRUCTIONS
         # 把待纳入 addon 携带的图片一起带给 prepare（让模型规划时也能看到素材）
         addon_imgs: list = []
         for a in pending:
@@ -6728,6 +6837,8 @@ class BridgeWS:
         return json.dumps({"status": "ok"}, ensure_ascii=False)
 
     async def _loop_do_execute(self, session, state, record) -> None:
+        if not await self._loop_check_source(session, state, record, 'execute'):
+            return
         record.sub_stage = SUB_EXECUTE
         record.stage_details.setdefault(SUB_EXECUTE, {})["status"] = "running"
         record.mark_sub(SUB_EXECUTE)
@@ -6811,6 +6922,23 @@ class BridgeWS:
                 self._emit_loop_updated(state)
                 print(f"[loop] execute re-plan succeeded: {len(replan_steps)} steps",
                       file=sys.stderr, flush=True)
+        if steps:
+            # 最后有效 prepare/replan 冻结登记，执行后不能补登记来获取信用。
+            attempts = record.stage_details.get(SUB_PREPARE, {}).get('attempts', [])
+            parsed = next((a.get('parsed') for a in reversed(attempts) if a.get('valid')), {}) or {}
+            plan_raw = parsed.get('milestonePlan')
+            if not isinstance(plan_raw, dict):
+                plan_raw = {}
+            parents = state.task_source.get('snapshot', {}).get('tasks', []) or plan_raw.get('parents', [])
+            if plan_raw and not record.milestone_plan:
+                record.milestone_plan = register_plan(plan_raw, parents, record.progress_scope, record.seq,
+                    session.working_dir, state.task_source.get('snapshot', {}).get('artifactDigests', {}))
+        # 降级只改变本轮执行方式，不能丢弃先前登记的验收范围。
+        if record.progress_version >= 2:
+            record.milestone_plan = inherit_plan(record.milestone_plan, state.round_loops(), record.progress_scope,
+                record.seq, session.working_dir, self._loop_evidence_environment(session, record))
+            if record.milestone_plan:
+                record.milestone_plan['environment'] = self._loop_evidence_environment(session, record)
         if not steps:
             # 保留既有最小增量降级策略，但生成可追溯的系统兜底步骤，不冒充规划成功。
             record.stage_details[SUB_PREPARE].update({
@@ -6885,6 +7013,13 @@ class BridgeWS:
         返回本次执行后的 agent_session_id（供后续顺次 step 线程上下文用）。"""
         if step.status == "done":
             return agent_session_id
+        if state.progress_guard.get('pause'):
+            return None
+        if step.access != 'read' and self._loop_has_active_call(session.id):
+            self._loop_wait(state, record, 'call_active', '上一调用未确认退出。')
+            return None
+        if step.access != 'read' and not await self._loop_check_source(session, state, record, f'write:{step.index}'):
+            return None
         # ★ 让每个 step 看到本次增量编排与冻结诊断，理解边界但不扩成全量重做。
         all_steps_text = "\n".join(
             f"  {s.index}. [{s.mode}/{s.access}] {s.desc}" + (" ← 当前步" if s.index == step.index else "")
@@ -6970,7 +7105,12 @@ class BridgeWS:
                     inactivity_timeout=stall_seconds,
                     execution_access="read-only" if step.access == "read" else "workspace-write",
                 )
+            except asyncio.CancelledError:
+                step.call_result = 'cancelled'
+                self._loop_save(state)
+                raise
             except _LoopAgentCallError as exc:
+                step.call_result = 'error'
                 step.status = "error"
                 step.ended_at = time.time()
                 step.output = exc.partial_text + f"\nBackend 调用失败（不能视作任务成功）：{exc}"
@@ -6978,6 +7118,7 @@ class BridgeWS:
                 self._emit_loop_updated(state)
                 return None
             except _LoopAgentStalledError as exc:
+                step.call_result = 'timeout'
                 note = (
                     f"第 {attempt}/{max_attempts} 次尝试连续 {int(exc.idle_seconds)} 秒无活动，"
                     + ("已安全终止。" if exc.retryable else "底层调用未能确认退出。")
@@ -6998,6 +7139,8 @@ class BridgeWS:
                     self._emit_loop_updated(state)
                     await asyncio.sleep(0)
                     continue
+                if not exc.retryable:
+                    self._loop_wait(state, record, 'call_active', '底层调用未能确认退出。', '确认旧调用退出后显式恢复。')
                 step.status = "error"
                 step.ended_at = time.time()
                 if not step.output:
@@ -7006,13 +7149,14 @@ class BridgeWS:
                 self._emit_loop_updated(state)
                 return None
 
+            step.call_result = 'normal'
             text = text.strip()
             if text:
                 step.output = text
                 step.status = "done"
                 step.ended_at = time.time()
                 if self._loop_pause_control(state, record, text):
-                    step.status = "error"
+                    step.task_result = 'blocked'
                     self._loop_save(state)
                     self._emit_loop_updated(state)
                     return new_sid
@@ -7124,7 +7268,8 @@ class BridgeWS:
             "```json\n"
             '{"score": 0, "optimizationPotential": 0.0, "trend": "", "verified": "", '
             '"gaps": "", "nextFocus": "", "challenges": "", "notes": "", "delivery": {}}\n'
-            "```\n" + REPORT_INSTRUCTIONS
+            "```\n" + REPORT_INSTRUCTIONS + MILESTONE_INSTRUCTIONS
+            + f"\n证据 environment 必须核实为当前环境：{self._loop_evidence_environment(session, record)}；文件 fingerprint 使用文件内容 SHA256。"
         )
         atext, _ = await self._loop_run_agent(
             session, analysis_prompt, SUB_ANALYSIS, record.seq,
@@ -7186,17 +7331,36 @@ class BridgeWS:
         )
         record.analysis = analysis
         record.delivery = normalize_report(aj.get("delivery"))
+        if record.progress_version >= 2 and record.delivery:
+            record.delivery['milestoneReview'] = review_milestones((aj.get('delivery') or {}).get('milestones', []),
+                record.milestone_plan, session.working_dir, self._loop_evidence_environment(session, record))
+        if not await self._loop_check_source(session, state, record, 'acceptance'):
+            return
+        if state.task_source.get('binding') and record.delivery:
+            record.delivery['reconciliation'] = reconcile(state.task_source.get('snapshot', {}), record.delivery)
+            # 映射失效不能刷新进展；正式任务尚未勾完则仍允许真实子项增量。
+            if not record.delivery['reconciliation']['mappingValid']:
+                record.delivery.update(valid=False, scopeComplete=False)
         if (record.delivery and state.policy.work_mode != "auto"
                 and record.delivery["mode"] != state.policy.work_mode):
             record.delivery.update(valid=False, scopeComplete=False)
+        record.task_result = 'unknown'
+        if record.delivery.get('valid'):
+            record.task_result = ('verified' if completion_ready(record.delivery) else 'partial' if any(
+                i.get('evidence') and i['status'] in ('implemented', 'verified') for i in record.delivery.get('items', []))
+                or any(m['status'] in ('implemented', 'verified') for m in record.delivery.get('milestoneReview', {}).get('milestones', []))
+                else 'blocked' if record.delivery.get('blockers') else 'unknown')
         record.completed = True
         record.sub_stage = SUB_DONE
+        record.terminal_kind = 'completed'
         record.mark_sub(SUB_DONE)
         record.updated_at = time.time()
         if record.progress_version:
             state.progress_guard = assess_progress(state.round_loops(), state.policy.progress_patience)
+            if record.progress_version >= 2 and record.delivery:
+                record.delivery['milestoneSummary'] = milestone_progress(state.round_loops())
             ready = (completion_ready(record.delivery) and not state.progress_guard["scopeLost"]
-                     and (not record.progress_scope or record.progress_scope == scope_key(state.goal))
+                     and (not record.progress_scope or record.progress_scope == (scope_key(state.goal + ':' + str(state.task_source.get('scopeRevision', 0))) if state.task_source.get('scopeRevision') else scope_key(state.goal)))
                      and not any(a.status == "pending" for a in state.addons))
             analysis.outputtable = analysis.outputtable and ready
             analysis.deliverable = analysis.deliverable and ready
@@ -7245,6 +7409,11 @@ class BridgeWS:
         except Exception:
             pass
         self._recompute_risk(state)
+        if record.outcome_version:
+            self._loop_reduce(state, record)
+            self._loop_save(state)
+            self._emit_loop_updated(state)
+            return
         stop, reason = (False, "") if state.progress_guard.get("pause") else self._loop_should_stop(state)
         if stop:
             state.stage = STAGE_OUT
@@ -7256,9 +7425,88 @@ class BridgeWS:
         self._loop_save(state)
         self._emit_loop_updated(state)
 
+    def _loop_reduce(self, state, record) -> dict:
+        """Persist an explanation before the one existing scheduler consumes it."""
+        guard, report = state.progress_guard, record.delivery
+        hard = next((b for b in report.get('blockers', []) if b['kind'] in ('global', 'safety', 'authorization')), None)
+        code = guard.get('reasonCode', '') if guard.get('pause') else ''
+        if hard:
+            code = 'workflow_blocked' if hard['kind'] == 'global' else hard['kind']
+        elif guard.get('pause') and not guard.get('noProgressCount') and not code:
+            code = 'human_input'
+        evaluated = [r for r in state.round_loops() if r.analysis]
+        flat = len(evaluated) >= 2 and evaluated[-1].analysis.score - evaluated[-2].analysis.score < 3
+        accepted = bool(record.analysis and record.analysis.outputtable and completion_ready(report)
+                        and not guard.get('scopeLost') and not any(a.status == 'pending' for a in state.addons))
+        complete = accepted and (not state.policy.independent_eval or len(evaluated) >= 2) and (record.analysis.optimization_potential < .15 or flat)
+        failures = 0
+        for prior in reversed(state.round_loops()):
+            if not prior.outcome_version:
+                break  # 不把历史自然语言暂停重解释成新 Backend 故障。
+            failed = prior.terminal_kind == 'failed' or any(s.call_result in ('error', 'timeout') for s in prior.orchestration)
+            if not failed:
+                break
+            failures += 1
+        failed = record.terminal_kind == 'failed' or any(s.call_result in ('error', 'timeout') for s in record.orchestration)
+        source_status = state.task_source.get('status', 'unbound')
+        if source_status == 'current' and not snapshot_fresh(state.task_source.get('snapshot', {})):
+            source_status = 'stale'
+            state.task_source['status'] = 'stale'
+        facts = DecisionFacts(auto=state.auto or bool(guard.get('pause')), control_mode=state.control_mode,
+            user_stop=state.session_id in getattr(self, '_loop_cancel', {}) or state.session_id in getattr(self, '_loop_pending_out', set()),
+            hard_reason=code, reason_text=hard['reason'] if hard else guard.get('reason', ''),
+            resume_condition=hard.get('resolution', '') if hard else guard.get('resumeCondition', ''),
+            source_status=source_status, complete=complete,
+            manual_remaining=any(i['status'] == 'manual' for i in report.get('items', [])),
+            budget_exhausted=len(state.round_loops()) >= state.effective_max_loops(),
+            risk_limit=state.risk_coefficient >= state.policy.risk_threshold,
+            failure_limit=failures >= _LOOP_AUTO_CONSECUTIVE_FAILURE_LIMIT,
+            call_result='error' if failed else 'normal' if record.completed else 'unknown', retry_allowed=failed,
+            call_still_active=self._loop_has_active_call(state.session_id),
+            no_progress_pause=guard.get('noProgressCount', 0) >= state.policy.progress_patience,
+            needs_replan=bool(guard.get('needsReplan')), needs_review=not report or accepted and not complete,
+            ready_ids=guard.get('readyIds', []))
+        decision = decide_next(facts, f'{record.round}:{record.seq}:terminal',
+                               [f'record:{record.seq}', f'source:{state.task_source.get("revision", 0)}'])
+        self._loop_keep_decision(state, record, decision)
+        if decision['action'] in ('complete', 'stop'):
+            self._apply_loop_out(state, decision['reasonText'])
+            state.status = 'output' if decision['action'] == 'complete' else 'aborted'
+        elif decision['action'] == 'wait' and decision['reasonCode'] != 'auto_off':
+            state.auto = False
+            state.progress_guard = {**guard, 'pause': True, 'reasonCode': decision['reasonCode'],
+                                    'reason': decision['reasonText'], 'resumeCondition': decision['resumeCondition']}
+        return decision
+
     def _maybe_autocontinue(self, session_id: str) -> None:
         """Auto 开启时在一次 Loop 终止后续跑；连续整轮失败时确定性止损。"""
         state = self._loop_state(session_id)
+        last = state.loops[-1] if state and state.loops else None
+        if state and last and last.outcome_version:
+            if not (last.completed or last.terminal_kind or last.error):
+                return  # 真正中断：只允许用户显式恢复，不自动重放遗留决定。
+            if state.stage != STAGE_EXECUTE:
+                return
+            if last.terminal_kind == 'paused':
+                return
+            decision = self._loop_reduce(state, last)
+            self._loop_save(state)
+            self._emit_loop_updated(state)
+            if decision['action'] not in ('continue', 'replan', 'retry'):
+                return
+            if last.decision_dispatched == decision['decisionId']:
+                return
+            active = self._active_loop_task(session_id)
+            if active is not None and active is not asyncio.current_task():
+                return
+            if not state.auto or state.control_mode != 'loop' or state.progress_guard.get('pause') or self._loop_has_active_call(session_id):
+                return
+            last.decision_dispatched = decision['decisionId']
+            self._loop_save(state)
+            if not self._schedule_loop_iteration(session_id, auto_required=True, decision_id=decision['decisionId']):
+                last.decision_dispatched = ''
+                self._loop_save(state)
+            return
         if (not state or state.control_mode != "loop" or not state.auto
                 or state.stage != STAGE_EXECUTE or state.progress_guard.get("pause")):
             return
@@ -7321,6 +7569,8 @@ class BridgeWS:
                  else ("人工" if record.kind == "manual" else "?"))
         label = "manual" if record.kind == "manual" else record.iteration_mode
         chunks = [f"#{record.seq} [{label}] 累计分数:{score} 增量焦点:{(record.goal or '—')[:240]}"]
+        if record.decision:
+            chunks.append('已记录边界决定：' + json.dumps(record.decision, ensure_ascii=False))
         result_limit = 900 if latest else 360
         if record.result:
             chunks.append(f"本次贡献:{record.result[:result_limit]}")
@@ -7393,7 +7643,7 @@ class BridgeWS:
         latest = done[-1].analysis
         record = done[-1]
         step_count = len(record.orchestration)
-        step_errors = sum(1 for s in record.orchestration if s.status == "error")
+        step_errors = sum(1 for s in record.orchestration if (s.call_result in ('error', 'timeout') if record.outcome_version else s.status == "error"))
         error_rate = step_errors / step_count if step_count else (0.0 if record.result else 1.0)
         score_gap = max(0.0, state.policy.deliverable_score - latest.score) / max(
             1.0, state.policy.deliverable_score)
@@ -7501,7 +7751,7 @@ class BridgeWS:
         self._loop_save(state)
         self._emit_loop_updated(state)
         if state.auto:
-            self._schedule_loop_iteration(session_id)
+            self._schedule_loop_iteration(session_id, auto_required=True)
         return json.dumps({"status": "ok", "stage": state.stage, "round": state.round}, ensure_ascii=False)
 
     # ── by the way：旁路问答（不污染 loop 主线上下文）──────────────
@@ -12087,6 +12337,31 @@ Kit 版本账本（版本属于 Kit，不属于 AI）：
             return json.dumps({"status": "error", "message": "请选择 Codex Office backend", "hosts": []}, ensure_ascii=False)
         return json.dumps({"status": "ok", "hosts": list_ssh_hosts()}, ensure_ascii=False)
 
+    async def _rpc_codexModelCatalog(self, backend_id: str) -> str:
+        """只读查询当前节点的指定 Backend，不能从缺失 ID 回退默认 Backend。"""
+        from .codex_model_catalog import CatalogError, query_codex_catalog
+
+        self._require_node_update_capability()
+        cfg = next((item for item in self._backend_configs if item.id == backend_id), None)
+        if not cfg or cfg.type != BackendType.CODEX_OFFICIAL:
+            return json.dumps({"status": "error", "code": "backend", "message": "请选择已保存的 Codex Backend。"}, ensure_ascii=False)
+        try:
+            # 不获取/重配持有活动 turn 的 Backend 实例。
+            backend = CodexOfficeBackend(cfg)
+            if backend._proxy_config_error():
+                raise CatalogError("configuration", "Codex 代理配置无效，请先修正配置。")
+            result = await query_codex_catalog(
+                resolve_codex_cli(cfg.cli_path), backend._build_env(),
+                (["--enable", "respect_system_proxy"] if backend._system_proxy_enabled() else [])
+                + backend._http_provider_args(),
+                cwd=cfg.working_dir or None,
+            )
+        except CatalogError as exc:
+            result = {"status": "error", "code": exc.code, "message": str(exc)}
+        except Exception:
+            result = {"status": "error", "code": "unavailable", "message": "Codex 目录不可用，请检查目标节点配置。"}
+        return json.dumps(result, ensure_ascii=False)
+
     async def _rpc_codexLocalThreads(self, backend_id: str) -> str:
         """列出当前 AgentWithU 执行节点本机已有的原生 Codex threads。"""
         cfg = next((item for item in self._backend_configs if item.id == backend_id), None)
@@ -12148,6 +12423,8 @@ Kit 版本账本（版本属于 Kit，不属于 AI）：
             return json.dumps({"status": "error", "message": str(exc), "threads": []}, ensure_ascii=False)
 
     def _rpc_saveBackend(self, config_json: str) -> None:
+        from ..model_options import normalize_model_options
+
         data = json.loads(config_json)
         if data["id"] == OFFICIAL_BACKEND_ID:
             # 官方后端：只允许修改 env（代理）和 skipPermissions，其他字段保持固定
@@ -12190,6 +12467,13 @@ Kit 版本账本（版本属于 Kit，不属于 AI）：
                 qwen_max_output_tokens=data.get("qwenMaxOutputTokens"),
                 extra_headers=data.get("extraHeaders") or None,
                 mcp_servers=data.get("mcpServers") or None,
+            )
+        if config.type == BackendType.CODEX_OFFICIAL:
+            existing = next((c for c in self._backend_configs if c.id == config.id), None)
+            # 旧客户端省略字段时保留；显式 null/[] 分别恢复内置/清空。
+            config.model_options = normalize_model_options(
+                data["modelOptions"] if "modelOptions" in data else
+                existing.model_options if existing and existing.type == config.type else None
             )
         self._backend_store.save(config)
         idx = next((i for i, c in enumerate(self._backend_configs) if c.id == config.id), -1)

@@ -287,7 +287,7 @@ export const LoopPolicyEditor: React.FC<{
                     </span>
                   )}
                 </div>
-                <select value={backendOverride}
+                <select aria-label={`${pos.label} Backend`} value={backendOverride}
                   onChange={(e) => set({ backends: { ...(value.backends || {}), [pos.key]: e.target.value } })}
                   style={{ ...inputBase, width: '100%', marginBottom: isRuntimeConfigurableBackend(roleBackend) ? 8 : 0 }}>
                   <option value="">跟随会话 Backend</option>

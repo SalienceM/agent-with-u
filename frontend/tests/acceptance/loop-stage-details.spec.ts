@@ -1,6 +1,7 @@
 import { test, expect, type Page, type WebSocketRoute } from '@playwright/test';
 import type { CallDiagnostic } from '../../src/utils/loopDiagnostics';
 import type { DeliveryReport, ProgressGuard } from '../../src/components/LoopDeliveryStatus';
+import type { LoopDecision, LoopSourceSummary } from '../../src/types/loopContinuation';
 
 function recordFixture() {
   const now = Date.now() / 1000;
@@ -9,6 +10,7 @@ function recordFixture() {
     createdAt: now - 60, updatedAt: now - 10, subStarted: { prepare: now - 60, execute: now - 50 }, analysis: null,
     callDiagnostics: [] as CallDiagnostic[],
     delivery: {} as DeliveryReport,
+    outcomeVersion: 0, terminalKind: '', decision: {} as LoopDecision, callResults: {} as Record<string, string>, taskResult: 'unknown',
     orchestration: [
       { index: 1, desc: '核实现状', mode: 'sequential', access: 'read', status: 'done', output: '第一步核实完成', endedAt: 3 },
       { index: 2, desc: '修复缺口', mode: 'sequential', access: 'write', status: 'running', output: '', endedAt: 0 },
@@ -23,7 +25,7 @@ function recordFixture() {
   };
 }
 
-async function fixture(page: Page, progressGuard: ProgressGuard = {}) {
+async function fixture(page: Page, progressGuard: ProgressGuard = {}, options: { running?: boolean; source?: LoopSourceSummary; manual?: boolean } = {}) {
   let record = recordFixture();
   let older: ReturnType<typeof recordFixture> | null = null;
   const sessionId = 'qa-loop-000';
@@ -31,9 +33,12 @@ async function fixture(page: Page, progressGuard: ProgressGuard = {}) {
   let hold = false;
   let fail = false;
   let reads = 0;
+  let source = options.source;
+  let sourceReads = 0;
+  let executionCalls = 0;
   const pending: Array<() => void> = [];
   const state = () => ({ sessionId, stage: 'loopexecute', goal: '阶段审计回归', goalHistory: [], ideas: [],
-    progressGuard, handoff: { available: true, source: 'conversion' },
+    progressGuard, taskSource: source, handoff: { available: true, source: 'conversion' },
     loops: (older ? [older, record] : [record]).map(item => ({ ...item, detailLoaded: false, result: '', delivery: {},
       callDiagnostics: item.callDiagnostics.slice(-1),
       orchestration: item.orchestration.map(step => ({ ...step, output: '', hasOutput: !!step.output })),
@@ -41,7 +46,7 @@ async function fixture(page: Page, progressGuard: ProgressGuard = {}) {
         { status: value.status, message: value.message, ...('attemptCount' in value ? { attemptCount: value.attemptCount } : {}) }])),
     })), riskCoefficient: 0, maxLoops: 8, effectiveMaxLoops: 8, round: record.round, roundLoopCount: 1,
     status: 'active', stopReason: '', bestScore: 0, latestScore: 0, asides: [], addons: [],
-    auto: false, running: true, resumable: false, controlMode: 'loop', canTakeover: false });
+    auto: false, running: options.running ?? true, resumable: false, controlMode: options.manual ? 'manual' : 'loop', canTakeover: false });
   await page.routeWebSocket(/.*/, ws => {
     socket = ws;
     const server = ws.connectToServer();
@@ -49,6 +54,26 @@ async function fixture(page: Page, progressGuard: ProgressGuard = {}) {
       const frame = JSON.parse(String(message));
       const reply = (value: unknown) => ws.send(JSON.stringify({ id: frame.id, result: JSON.stringify(value) }));
       if (frame.method === 'loopGetState' && frame.params[0] === sessionId) return reply(state());
+      if (frame.method.startsWith('loopTaskSource')) {
+        sourceReads++;
+        if (frame.method === 'loopTaskSourceDiscover') {
+          const send = () => reply({ status: 'ok', sessionId, revision: source?.revision || 0, discoveryId: 'fixture-discovery',
+            candidates: [{ name: 'first-change' }, { name: 'second-change' }],
+            binding: { executor: 'fixture-node', workspace: 'isolated workspace', backendId: 'fixture', cliVersion: '1.13.1' } });
+          if (hold) pending.push(send); else send();
+          return;
+        }
+        if (frame.method === 'loopTaskSourceSet') {
+          const action = frame.params[1];
+          source = { ...source, revision: (source?.revision || 0) + 1, status: action === 'unbind' ? 'unbound' : 'current',
+            change: frame.params[4] || source?.change, executor: 'fixture-node', backendId: 'fixture', total: 25, checked: 2 };
+          reply({ status: 'ok', sessionId, source });
+          socket.send(JSON.stringify({ event: 'loopUpdated', data: JSON.stringify(state()) }));
+          return;
+        }
+        return reply({ status: 'ok', sessionId, source });
+      }
+      if (['loopRunIteration', 'loopSetAuto'].includes(frame.method)) { executionCalls++; return reply({ status: 'ok' }); }
       if (frame.method === 'loopGetRecord' && frame.params[0] === sessionId) {
         reads++;
         const snapshot = structuredClone(older?.seq === frame.params[1] ? older : record);
@@ -66,6 +91,9 @@ async function fixture(page: Page, progressGuard: ProgressGuard = {}) {
       socket.send(JSON.stringify({ event: 'loopProgress', data: JSON.stringify({ sessionId, seq: record.seq, subStage: call.stage, text: '', diagnostic: call }) }));
     },
     reads: () => reads,
+    sourceReads: () => sourceReads,
+    executionCalls: () => executionCalls,
+    setSource: (value: LoopSourceSummary) => { source = value; socket.send(JSON.stringify({ event: 'loopUpdated', data: JSON.stringify(state()) })); },
     setHold: (value: boolean) => { hold = value; },
     setFail: (value: boolean) => { fail = value; },
     release: () => pending.splice(0).forEach(send => send()),
@@ -254,4 +282,119 @@ test('live prepare diagnostics distinguish rate limiting, thinking and text with
   await expect(diagnostics).toContainText('等待 8s');
   await diagnostics.scrollIntoViewIfNeeded();
   await page.screenshot({ path: info.outputPath('prepare-diagnostics.png'), fullPage: false });
+});
+
+test('explicit source discovery, conflict confirmation and unbinding never start execution', async ({ page }, info) => {
+  const data = await fixture(page, {}, { running: false });
+  data.seed(record => { record.terminalKind = 'paused'; });
+  const pane = await openFlow(page);
+  const card = pane.getByTestId('loop-source-card');
+  await expect(card).toContainText('未绑定（通用模式）');
+  expect(data.sourceReads()).toBe(0);
+  await card.getByRole('button', { name: '发现 OpenSpec 来源' }).click();
+  await expect(card.getByLabel('选择 OpenSpec change')).toHaveValue('first-change');
+  await expect(card).toContainText('即使只有一个候选');
+  await card.getByLabel('选择 OpenSpec change').selectOption('second-change');
+  await card.getByRole('button', { name: '确认绑定', exact: true }).click();
+  await expect(card).toContainText('second-change');
+  expect(data.executionCalls()).toBe(0);
+  data.setSource({ status: 'unavailable', revision: 2, change: 'second-change', executor: 'fixture-node', total: 25, checked: 2, reason: '任务来源暂不可核对' });
+  await expect(card).toContainText('任务来源暂不可核对');
+  data.setSource({ status: 'stale', revision: 3, change: 'second-change', executor: 'fixture-node', total: 25, checked: 2 });
+  await expect(card).toContainText('快照已过期');
+  data.setSource({ status: 'conflict', revision: 4, change: 'second-change', executor: 'fixture-node', total: 25, checked: 2,
+    diff: { removed: ['1.3'], added: ['1.26'], artifactsChanged: true } });
+  await expect(card).toContainText('范围冲突');
+  await expect(card.getByRole('button', { name: '确认范围修订' })).toBeDisabled();
+  await card.getByLabel('来源范围处置依据').fill('用户确认新范围，旧损失继续保留');
+  await card.getByRole('button', { name: '确认范围修订' }).click();
+  await expect(card).toContainText('已核对');
+  await card.getByLabel('来源范围处置依据').fill('转为通用核对，未完成项保留');
+  await card.getByRole('button', { name: '确认解除绑定' }).click();
+  await expect(card).toContainText('未绑定（通用模式）');
+  expect(data.executionCalls()).toBe(0);
+  await card.scrollIntoViewIfNeeded();
+  await page.screenshot({ path: info.outputPath('loop-source-controls.png'), fullPage: false });
+});
+
+test('same decision and 2/25 milestone evidence in panel and flow, without polling', async ({ page }, info) => {
+  const data = await fixture(page, {}, { running: false });
+  data.seed(record => {
+    record.outcomeVersion = 1; record.terminalKind = 'completed'; record.completed = true;
+    record.callResults = { execute: 'normal', analysis: 'normal' };
+    record.decision = { action: 'replan', reasonCode: 'ready_work', reasonText: '外壳已有增量，父任务未验收', nextStep: '选择属性/技能就绪任务', decisionId: 'decision-1' };
+    record.delivery = { mode: 'delivery', source: 'fixture/tasks.md', valid: true, scopeComplete: true,
+      items: [{ id: '1.3', title: '外壳父任务', status: 'pending', dependsOn: [], evidence: '', manualBasis: '' }], blockers: [],
+      reconciliation: { valid: false, checked: 2, total: 25 },
+      milestoneSummary: { counts: { verified: 1 }, credited: ['shell'] },
+      milestoneReview: { valid: true, milestones: [{ id: 'shell', parentId: '1.3', acceptance: '可操作外壳', status: 'verified', validity: 'current' }] } };
+  });
+  const pane = await openFlow(page);
+  await expect(pane.getByTestId('loop-decision').first()).toContainText('选择属性/技能就绪任务');
+  await pane.getByRole('button', { name: '查看 Analysis 阶段', exact: true }).click();
+  const report = pane.getByRole('region', { name: '任务与证据台账' });
+  await expect(report.getByTestId('loop-formal-count')).toContainText('2/25');
+  await report.getByTestId('loop-milestones').locator('summary').click();
+  await expect(report).toContainText('本轮认可增量：shell');
+  await expect(report).toContainText('不代表父任务集成验收通过');
+  await pane.getByRole('button', { name: '🗂 面板', exact: true }).click();
+  await expect(pane.getByTestId('loop-decision').first()).toContainText('选择属性/技能就绪任务');
+  expect(data.sourceReads()).toBe(0);
+  expect(data.reads()).toBe(1);
+  data.update(record => { record.decision = { action: 'wait', reasonText: '需补充授权', resumeCondition: '由用户完成授权确认', decisionId: 'decision-2' }; });
+  await expect(pane.getByTestId('loop-decision').first()).toContainText('由用户完成授权确认');
+  await page.screenshot({ path: info.outputPath('loop-decision-milestone.png'), fullPage: false });
+});
+
+test('waiting, failure, budget stop and completion remain distinct in both views', async ({ page }) => {
+  const data = await fixture(page, {}, { running: false });
+  data.seed(record => { record.outcomeVersion = 1; record.completed = true; });
+  const pane = await openFlow(page);
+  const scenarios: Array<{ decision: LoopDecision; call: string; expected: string[] }> = [
+    { decision: { action: 'wait', reasonText: '等待必要输入', resumeCondition: '用户补充条件' }, call: 'normal', expected: ['调度：等待', '正常结束', '解除条件：用户补充条件'] },
+    { decision: { action: 'retry', reasonText: '真实调用失败，有限重试' }, call: 'error', expected: ['调度：有限重试', '真实失败'] },
+    { decision: { action: 'stop', reasonCode: 'budget_exhausted', reasonText: '轮次预算耗尽，目标尚未完成' }, call: 'normal', expected: ['调度：停止', '预算耗尽，目标尚未完成'] },
+    { decision: { action: 'complete', completionScope: 'full', reasonText: '完整验收已核对' }, call: 'normal', expected: ['调度：完成', '完整验收已核对'] },
+    { decision: { action: 'complete', completionScope: 'automatic', reasonText: '人工真机核验保留' }, call: 'normal', expected: ['自动范围完成，待人工核验', '人工真机核验保留'] },
+  ];
+  for (const [index, scenario] of scenarios.entries()) {
+    data.update(record => { record.decision = { ...scenario.decision, decisionId: `result-${index}` }; record.callResults = { execute: scenario.call }; record.taskResult = scenario.decision.action === 'complete' ? 'verified' : 'partial'; });
+    const acceptance = scenario.decision.action === 'complete' ? '累计任务验收：已验证' : '累计任务验收：部分成果';
+    for (const expected of scenario.expected) await expect(pane.getByTestId('loop-decision').first()).toContainText(expected);
+    await expect(pane.getByTestId('loop-decision').first()).toContainText(acceptance);
+    await pane.getByRole('button', { name: '🗂 面板', exact: true }).click();
+    for (const expected of scenario.expected) await expect(pane.getByTestId('loop-decision').first()).toContainText(expected);
+    await expect(pane.getByTestId('loop-decision').first()).toContainText(acceptance);
+    await pane.getByRole('button', { name: '🔀 流程', exact: true }).click();
+  }
+  expect(data.executionCalls()).toBe(0);
+  expect(data.sourceReads()).toBe(0);
+});
+
+test('running and manual takeover are read-only; ordinary chat does not query sources', async ({ page }) => {
+  const data = await fixture(page, {}, { running: false, manual: true });
+  const pane = await openFlow(page);
+  await expect(pane.getByTestId('loop-source-card').getByRole('button', { name: '发现 OpenSpec 来源' })).toBeDisabled();
+  expect(data.sourceReads()).toBe(0);
+  if (!await page.locator('.awu-sidebar').isVisible()) await page.getByRole('button', { name: '打开会话列表', exact: true }).click();
+  await page.locator('.awu-sidebar').getByText('客户工作会话 5', { exact: true }).click();
+  await expect(page.locator('[data-session-tab-panel]:visible').getByTestId('loop-source-card')).toHaveCount(0);
+  expect(data.sourceReads()).toBe(0);
+  expect(data.executionCalls()).toBe(0);
+});
+
+test('a late source discovery belongs only to its original session', async ({ page }) => {
+  const data = await fixture(page, {}, { running: false });
+  const pane = await openFlow(page);
+  data.setHold(true);
+  await pane.getByTestId('loop-source-card').getByRole('button', { name: '发现 OpenSpec 来源' }).click();
+  await expect.poll(data.sourceReads).toBe(1);
+  if (!await page.locator('.awu-sidebar').isVisible()) await page.getByRole('button', { name: '打开会话列表', exact: true }).click();
+  await page.locator('.awu-sidebar').getByText('首页交付 Loop 2', { exact: true }).click();
+  const current = page.locator('[data-session-tab-panel]:visible');
+  await expect(current.getByTestId('loop-source-card')).toContainText('未绑定');
+  data.setHold(false); data.release();
+  await expect(current.getByLabel('选择 OpenSpec change')).toHaveCount(0);
+  expect(data.sourceReads()).toBe(1);
+  expect(data.executionCalls()).toBe(0);
 });

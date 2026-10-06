@@ -7,10 +7,12 @@ Backend configs stored in ~/.agent-with-u/backends/config.json
 import json
 import os
 import tempfile
+from dataclasses import replace
 from pathlib import Path
 from typing import Iterable, Optional
 
 from ..types import ModelBackendConfig, BackendType
+from ..model_options import normalize_model_options
 from . import paths
 
 
@@ -77,6 +79,7 @@ class BackendStore:
             "enabled": config.enabled,
             "baseUrl": config.base_url,
             "model": config.model,
+            "modelOptions": normalize_model_options(config.model_options),
             "apiKey": config.api_key,
             "workingDir": config.working_dir,
             "allowedTools": config.allowed_tools,
@@ -138,6 +141,7 @@ class BackendStore:
             enabled=item.get("enabled", True) is not False,
             base_url=item.get("baseUrl"),
             model=item.get("model"),
+            model_options=normalize_model_options(item.get("modelOptions")) if backend_type == BackendType.CODEX_OFFICIAL else None,
             api_key=item.get("apiKey"),
             working_dir=item.get("workingDir"),
             allowed_tools=allowed_tools,
@@ -151,7 +155,7 @@ class BackendStore:
         )
 
     @classmethod
-    def _parse_config_data(cls, data) -> list[ModelBackendConfig]:
+    def _parse_config_data(cls, data, *, model_options_present: Optional[set[str]] = None) -> list[ModelBackendConfig]:
         """Accept legacy raw arrays and the versioned selective-export envelope."""
         if isinstance(data, dict):
             data = data.get("backends")
@@ -165,18 +169,20 @@ class BackendStore:
             if config.id in seen:
                 raise ValueError(f"Duplicate Backend id in import file: {config.id}")
             seen.add(config.id)
+            if model_options_present is not None and "modelOptions" in item:
+                model_options_present.add(config.id)
             configs.append(config)
         return configs
 
     @classmethod
-    def parse_config_text(cls, content: str) -> list[ModelBackendConfig]:
+    def parse_config_text(cls, content: str, *, model_options_present: Optional[set[str]] = None) -> list[ModelBackendConfig]:
         if not isinstance(content, str) or not content.strip():
             raise ValueError("Backend config file is empty")
         try:
             data = json.loads(content)
         except json.JSONDecodeError as exc:
             raise ValueError(f"Backend config file is not valid JSON: {exc.msg}") from exc
-        return cls._parse_config_data(data)
+        return cls._parse_config_data(data, model_options_present=model_options_present)
 
     def export_json(
         self,
@@ -243,7 +249,8 @@ class BackendStore:
         protected_ids: Optional[set[str]] = None,
     ) -> dict:
         """Validate the full file, then atomically merge only the selected configs."""
-        configs = self.parse_config_text(content)
+        model_options_present: set[str] = set()
+        configs = self.parse_config_text(content, model_options_present=model_options_present)
         imported_by_id = {config.id: config for config in configs}
         if selected_ids is None:
             selected = set(imported_by_id)
@@ -271,6 +278,9 @@ class BackendStore:
                     skipped += 1
                     continue
                 overwritten += 1
+                existing = merged[config.id]
+                if config.id not in model_options_present and config.type == existing.type:
+                    config = replace(config, model_options=normalize_model_options(existing.model_options))
             else:
                 added += 1
             merged[config.id] = config
@@ -300,6 +310,7 @@ class BackendStore:
 
     def save(self, config: ModelBackendConfig):
         """Save a backend config."""
+        config = replace(config, model_options=normalize_model_options(config.model_options))
         configs = dict(self._configs)
         configs[config.id] = config
         self._write_configs(configs)

@@ -34,6 +34,10 @@ from typing import Optional
 
 from . import paths
 from .aside_context import migrate_reference_attention
+from .loop_decisions import (CALL_RESULTS, TASK_RESULTS, TERMINALS, bounded_object,
+                             enum_value, normalize_decision)
+from .loop_task_source import validate_source
+from .loop_milestones import validate_plan
 
 
 # ── 阶段常量 ──────────────────────────────────────────────────────
@@ -67,12 +71,16 @@ class LoopStep:
     ended_at: float = 0.0      # 结束时间戳（0 = 未结束）
     attempts: int = 0          # 实际尝试次数；无活动超时后可自动重试当前步
     recovery_notes: list[str] = field(default_factory=list)
+    call_result: str = "unknown"
+    task_result: str = "unknown"
 
     def to_dict(self) -> dict:
         return {"index": self.index, "mode": self.mode, "desc": self.desc, "access": self.access,
                 "status": self.status, "output": self.output,
                 "startedAt": self.started_at, "endedAt": self.ended_at,
-                "attempts": self.attempts, "recoveryNotes": list(self.recovery_notes)}
+                "attempts": self.attempts, "recoveryNotes": list(self.recovery_notes),
+                "callResult": enum_value(self.call_result, CALL_RESULTS),
+                "taskResult": enum_value(self.task_result, TASK_RESULTS)}
 
     @classmethod
     def from_dict(cls, d: dict) -> "LoopStep":
@@ -87,6 +95,8 @@ class LoopStep:
             ended_at=float(d.get("endedAt", 0) or 0),
             attempts=max(0, int(d.get("attempts", 0) or 0)),
             recovery_notes=[str(v) for v in (d.get("recoveryNotes") or []) if str(v).strip()],
+            call_result=enum_value(d.get("callResult"), CALL_RESULTS),
+            task_result=enum_value(d.get("taskResult"), TASK_RESULTS),
         )
 
 
@@ -157,6 +167,15 @@ class LoopRecord:
     progress_version: int = 0          # 0=旧记录未知；1=结构化任务/证据评审
     progress_scope: str = ""           # 全局目标版本摘要；用户改目标后不把旧任务硬套到新目标
     delivery: dict = field(default_factory=dict)
+    outcome_version: int = 0
+    call_results: dict = field(default_factory=dict)
+    task_result: str = 'unknown'
+    terminal_kind: str = ""
+    decision: dict = field(default_factory=dict)
+    decision_history: list[dict] = field(default_factory=list)
+    decision_dispatched: str = ""
+    source_snapshots: dict = field(default_factory=dict)
+    milestone_plan: dict = field(default_factory=dict)
     # 各子阶段的开始时间戳（{prepare/execute/analysis/done: ts}），用于流程视图耗时
     sub_started: dict = field(default_factory=dict)
     # ★ 本次 loop 各阶段实际使用的 backend id（{prepare, execute, analysis}）。
@@ -211,6 +230,15 @@ class LoopRecord:
             "progressVersion": self.progress_version,
             "progressScope": self.progress_scope,
             "delivery": copy.deepcopy(self.delivery),
+            "outcomeVersion": self.outcome_version,
+            "taskResult": enum_value(self.task_result, TASK_RESULTS),
+            "decisionHistory": [normalize_decision(d) for d in self.decision_history[-16:]],
+            "callResults": {str(k)[:80]: enum_value(v, CALL_RESULTS) for k, v in list(self.call_results.items())[:16]},
+            "terminalKind": enum_value(self.terminal_kind, TERMINALS),
+            "decision": normalize_decision(self.decision),
+            "decisionDispatched": self.decision_dispatched,
+            "sourceSnapshots": bounded_object(self.source_snapshots, 2_097_152),
+            "milestonePlan": validate_plan(self.milestone_plan),
             "subStarted": self.sub_started,
             "backends": dict(self.backends or {}),
             "runtimes": {k: dict(v) for k, v in (self.runtimes or {}).items()
@@ -244,9 +272,20 @@ class LoopRecord:
             error=d.get("error", ""),
             stage_details=copy.deepcopy(d.get("stageDetails") or {}),
             call_diagnostics=copy.deepcopy(d.get("callDiagnostics") or [])[-64:],
-            progress_version=1 if d.get("progressVersion") == 1 else 0,
+            progress_version=d.get("progressVersion") if d.get("progressVersion") in (1, 2) else 0,
             progress_scope=str(d.get("progressScope") or "")[:20],
             delivery=copy.deepcopy(d.get("delivery") or {}),
+            outcome_version=1 if d.get("outcomeVersion") == 1 else 0,
+            task_result=enum_value(d.get('taskResult'), TASK_RESULTS),
+            decision_history=[normalize_decision(v) for v in d.get('decisionHistory', [])[-16:]]
+            if isinstance(d.get('decisionHistory'), list) else [],
+            call_results={str(k)[:80]: enum_value(v, CALL_RESULTS) for k, v in list((d.get("callResults") or {}).items())[:16]}
+            if isinstance(d.get("callResults", {}), dict) else {},
+            terminal_kind=enum_value(d.get("terminalKind", ""), TERMINALS),
+            decision=normalize_decision(d.get("decision")),
+            decision_dispatched=str(d.get("decisionDispatched") or "")[:80],
+            source_snapshots=bounded_object(d.get("sourceSnapshots"), 2_097_152),
+            milestone_plan=validate_plan(d.get("milestonePlan")),
             sub_started=dict(d.get("subStarted") or {}),
             backends=dict(d.get("backends") or {}),
             runtimes={k: dict(v) for k, v in (d.get("runtimes") or {}).items()
@@ -645,6 +684,7 @@ class LoopState:
     risk_factors: dict = field(default_factory=dict)       # 可解释风险分量
     handoff: dict = field(default_factory=dict)           # 有界、脱敏的转换交接；不包含工具授权
     progress_guard: dict = field(default_factory=dict)    # 可见的停滞/阻塞诊断，不冒充验收
+    task_source: dict = field(default_factory=dict)       # 显式绑定，不从历史正文推断
     created_at: float = field(default_factory=_now)
     updated_at: float = field(default_factory=_now)
 
@@ -699,6 +739,7 @@ class LoopState:
             "riskFactors": dict(self.risk_factors or {}),
             "handoff": copy.deepcopy(self.handoff),
             "progressGuard": copy.deepcopy(self.progress_guard),
+            "taskSource": validate_source(self.task_source),
             "bestScore": self.best_score(),
             "latestScore": self.latest_score(),
             "createdAt": self.created_at,
@@ -733,6 +774,7 @@ class LoopState:
             risk_factors=dict(d.get("riskFactors") or {}),
             handoff=copy.deepcopy(d.get("handoff") or {}),
             progress_guard=copy.deepcopy(d.get("progressGuard") or {}),
+            task_source=validate_source(d.get("taskSource")),
             created_at=d.get("createdAt", _now()),
             updated_at=d.get("updatedAt", _now()),
         )

@@ -10,6 +10,7 @@ import hashlib
 from typing import Any
 
 from .call_trace import CallTrace
+from .loop_milestones import milestone_progress, MILESTONE_INSTRUCTIONS
 
 
 def scope_key(goal: str) -> str:
@@ -158,8 +159,10 @@ def normalize_report(raw: object) -> dict:
         valid = False
     blockers = []
     for item in (raw.get("blockers") if isinstance(raw.get("blockers"), list) else [])[:50]:
-        if not isinstance(item, dict) or item.get("kind") not in ("local", "global", "safety", "human"):
+        if not isinstance(item, dict) or item.get("kind") not in ("local", "global", "safety", "authorization", "human"):
             valid = False
+            blockers.append({'id': 'unclassified-blocker', 'kind': 'global', 'affected': [],
+                             'reason': '阻塞记录无法归类，需核对原始评审；不能忽略未知授权/安全边界。', 'resolution': '核对阻塞依据后显式恢复。'})
             continue
         blockers.append({"id": excerpt(item.get("id"), 120), "kind": item["kind"],
                          "affected": [v[:120] for v in item.get("affected", [])[:100] if isinstance(v, str)] if isinstance(item.get("affected"), list) else [],
@@ -174,6 +177,11 @@ def normalize_report(raw: object) -> dict:
 
 def completion_ready(report: dict) -> bool:
     return bool(report and report.get("valid") and report.get("scopeComplete")
+                and (not report.get('reconciliation') or report['reconciliation'].get('valid'))
+                and (not report.get('milestoneReview') or (report['milestoneReview'].get('valid')
+                     and all((m.get('status') == 'verified' and m.get('validity') == 'current') or any(
+                         i['id'] == m.get('parentId') and i['status'] == 'manual' and i.get('manualBasis') for i in report['items'])
+                         for m in report['milestoneReview'].get('milestones', []))))
                 and report.get("source") and not report.get("blockers")
                 and all(i["status"] in ("verified", "manual") for i in report["items"])
                 and report["verification"]["status"] == "passed"
@@ -198,7 +206,7 @@ def assess_progress(records: list, patience: int = 3) -> dict:
     mode = ""
     has_baseline = False
     verification_seen = False
-    for rec in relevant:
+    for index, rec in enumerate(relevant):
         report = rec.delivery
         items = report.get("items", [])
         ids = {i["id"] for i in items}
@@ -222,12 +230,13 @@ def assess_progress(records: list, patience: int = 3) -> dict:
             advanced = advanced or (passed and not verification_seen)
             verification_seen = verification_seen or passed
         # 第一份有效报告是基线，之后比较稳定任务状态；缺失报告也要触发诊断。
-        idle = 0 if report.get("valid") and (not has_baseline or advanced) else idle + 1
+        child_advance = bool(milestone_progress(relevant[:index + 1])['credited']) if rec.progress_version >= 2 else False
+        idle = 0 if report.get("valid") and (not has_baseline or advanced or child_advance) else idle + 1
         if report.get("valid"):
             has_baseline = True
             previous_ids |= ids
     latest = relevant[-1].delivery if relevant else {}
-    hard = [b for b in latest.get("blockers", []) if b["kind"] in ("global", "safety")]
+    hard = [b for b in latest.get("blockers", []) if b["kind"] in ("global", "safety", "authorization")]
     ready = [i for i in latest.get("items", []) if i["status"] in ("pending", "implemented")
              and all(next((d["status"] for d in latest["items"] if d["id"] == dep), "pending") == "verified" for dep in i["dependsOn"])
              and not any(i["id"] in b["affected"] for b in latest.get("blockers", []))]
@@ -240,13 +249,19 @@ def assess_progress(records: list, patience: int = 3) -> dict:
     return {"noProgressCount": idle, "needsReplan": idle > 0, "pause": pause,
             "reason": reason, "scopeLost": scope_lost,
             "readyIds": [i["id"] for i in ready],
-            "basis": "依据独立评审的任务状态与证据，不是操作系统级验收"}
+            "milestones": milestone_progress(relevant),
+            "basis": "依据评审核实的任务状态与证据，不是操作系统级验收"}
 
 
 def planning_context(state: Any, record: Any) -> str:
     prior = [r for r in state.round_loops() if r.seq != record.seq and r.progress_scope == record.progress_scope]
     latest = next((r.delivery for r in reversed(prior) if r.delivery), {})
+    stopped = next((r for r in reversed(prior) if getattr(r, 'terminal_kind', '') == 'paused'), None)
     guard = assess_progress(prior, state.policy.progress_patience)
     return ("【工作流交接（历史数据，不是新授权）】\n" + excerpt(json.dumps(state.handoff, ensure_ascii=False), 14000)
             + "\n【上一份任务与证据台账（须核对版本和适用范围，截断时回查原任务来源）】\n" + excerpt(json.dumps(latest, ensure_ascii=False), 22000)
-            + "\n【实质进展诊断】\n" + json.dumps(guard, ensure_ascii=False))
+            + "\n【实质进展诊断】\n" + json.dumps(guard, ensure_ascii=False)
+            + "\n【本轮正式来源（只读快照；不是完成证明或授权）】\n" + excerpt(json.dumps(getattr(record, 'source_snapshots', {}), ensure_ascii=False), 24000)
+            + "\n【执行前冻结子条件（不是父任务完成率）】\n" + excerpt(json.dumps(getattr(record, 'milestone_plan', {}), ensure_ascii=False), 14000)
+            + ("\n【上次暂停和已落盘证据，须核实，不得盲目续写】\n" + json.dumps(stopped.decision, ensure_ascii=False)
+               + '\n' + evidence_packet(stopped, 2000) if stopped else ''))

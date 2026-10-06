@@ -17,3 +17,11 @@ test('plan retry and degradation invalidate the audit detail cache', () => {
   assert.notEqual(loopRecordRevision(record), loopRecordRevision({ ...record,
     stageDetails: { prepare: { status: 'retrying', attemptCount: 2 } } }));
 });
+
+test('new decisions, source revisions and milestone summaries invalidate but bodies do not', () => {
+  const current = { ...record, outcomeVersion: 1, terminalKind: 'paused', decision: { decisionId: 'a', revision: 1 },
+    sourceSummary: { before: { scopeDigest: 'scope', stateDigest: 'state' } }, deliverySummary: { milestones: { credited: [] } } };
+  assert.notEqual(loopRecordRevision(current), loopRecordRevision({ ...current, decision: { decisionId: 'b', revision: 2 } }));
+  assert.notEqual(loopRecordRevision(current), loopRecordRevision({ ...current, deliverySummary: { milestones: { credited: ['shell'] } } }));
+  assert.equal(loopRecordRevision(current), loopRecordRevision({ ...current, sourceSnapshots: { huge: 'body' }, milestonePlan: { raw: 'body' } }));
+});

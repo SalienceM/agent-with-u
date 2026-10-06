@@ -7,6 +7,8 @@ import type { ImageAttachment } from './../hooks/useClipboardImage';
 import { LoopPolicyEditor, normalizePolicy } from './LoopPolicyEditor';
 import type { LoopPolicy } from './LoopPolicyEditor';
 import { LoopProgressNotice, LoopDeliveryDetail, type DeliveryReport, type ProgressGuard } from './LoopDeliveryStatus';
+import { LoopDecisionNotice, LoopSourceCard } from './LoopContinuationStatus';
+import type { LoopDecision, LoopSourceSummary } from '../types/loopContinuation';
 import type { ModelRuntime } from './CodexRuntimeFields';
 import { TokenUsageMonitor } from './TokenUsageMonitor';
 import { loopRecordRevision } from '../utils/loopRecordDetail';
@@ -30,6 +32,7 @@ import {
  */
 
 interface LoopStep {
+  callResult?: string; taskResult?: string;
   index: number; mode: string; access?: 'read' | 'write'; desc: string; status: string; output: string;
   startedAt?: number; endedAt?: number; attempts?: number; recoveryNotes?: string[];
 }
@@ -40,6 +43,8 @@ interface LoopAnalysis {
   deliverable: boolean; outputtable: boolean;
 }
 interface LoopRecord {
+  outcomeVersion?: number; terminalKind?: string; decision?: LoopDecision; callResults?: Record<string, string>; taskResult?: string;
+  sourceSummary?: unknown; deliverySummary?: unknown;
   seq: number; subStage: string; round: number; goal: string; orchestration: LoopStep[];
   kind?: 'agent' | 'manual';
   iterationMode?: 'baseline' | 'evolution';
@@ -76,6 +81,7 @@ interface AsideTurn { id: string; question: string; answer: string; status: stri
 interface AddonImage { id?: string; base64: string; mime_type?: string; }
 interface Addon { id: string; text: string; status: string; appliedSeq: number; images?: AddonImage[]; }
 interface LoopStateT {
+  taskSource?: LoopSourceSummary;
   sessionId: string; stage: string; goal: string;
   goalHistory: GoalRevision[];
   policy?: LoopPolicy;
@@ -145,6 +151,7 @@ const SUB_LABEL: Record<string, string> = {
 const SUB_ORDER = ['prepare', 'execute', 'analysis', 'done'];
 
 export interface LoopPanelProps {
+  onRefreshBackends?: () => void;
   sessionId: string;
   headerActions?: React.ReactNode;
   onClose?: () => void;
@@ -176,7 +183,7 @@ const LoopPromptTextarea: React.FC<LoopPromptTextareaProps> = (props) => {
 
 export const LoopPanel: React.FC<LoopPanelProps> = ({
   sessionId, onClose, embedded, inspectOnly = false, sessionBackendId, sessionRuntime, backends,
-  workingDir, execKey, headerActions,
+  workingDir, execKey, headerActions, onRefreshBackends,
 }) => {
   const [state, setState] = useState<LoopStateT | null>(null);
   const visible = useContext(AppModalVisibilityContext);
@@ -471,9 +478,14 @@ export const LoopPanel: React.FC<LoopPanelProps> = ({
             <div style={{ flex: 1, overflow: 'auto', padding: 'var(--ui-loop-body-padding, 12px 18px 24px)' }}>
               {!inspectOnly && <IntentBanner state={stateForView} sessionId={sessionId} />}
               <LoopProgressNotice guard={stateForView.progressGuard} handoff={stateForView.handoff} />
+              <LoopSourceCard key={`${execKey}:${sessionId}`} sessionId={sessionId} execKey={execKey}
+                source={stateForView.taskSource} readOnly={!!inspectOnly || stateForView.controlMode === 'manual' || stateForView.running || stateForView.resumable} />
+              <LoopDecisionNotice decision={stateForView.loops[stateForView.loops.length - 1]?.decision}
+                callResults={stateForView.loops[stateForView.loops.length - 1]?.outcomeVersion ? stateForView.loops[stateForView.loops.length - 1]?.callResults : undefined}
+                taskResult={stateForView.loops[stateForView.loops.length - 1]?.outcomeVersion ? stateForView.loops[stateForView.loops.length - 1]?.taskResult : undefined} />
               {stateForView.stage === 'loopidea' ? (
                 <>
-                  <PolicyCard sessionId={sessionId} policy={stateForView.policy} readOnly={inspectOnly}
+                  <PolicyCard onRefreshBackends={onRefreshBackends} sessionId={sessionId} policy={stateForView.policy} readOnly={inspectOnly}
                     sessionBackendId={sessionBackendId} sessionRuntime={sessionRuntime} backends={backends} />
                   <IdeaStage
                     state={stateForView} ideaInput={ideaInput} setIdeaInput={setIdeaInput}
@@ -515,7 +527,7 @@ export const LoopPanel: React.FC<LoopPanelProps> = ({
               ) : (
                 <>
                   <MetricBar state={stateForView} />
-                  <PolicyCard sessionId={sessionId} policy={stateForView.policy} readOnly={inspectOnly}
+                  <PolicyCard onRefreshBackends={onRefreshBackends} sessionId={sessionId} policy={stateForView.policy} readOnly={inspectOnly}
                     sessionBackendId={sessionBackendId} sessionRuntime={sessionRuntime} backends={backends} />
                   <ExecuteStage
                     state={stateForView} progress={progress}
@@ -1082,13 +1094,14 @@ function relTime(ts: number): string {
 
 // ══ 策略与心智卡片：实时查看 / 调整 ═══════════════════════════
 const PolicyCard: React.FC<{
+  onRefreshBackends?: () => void;
   sessionId: string;
   policy?: LoopPolicy;
   readOnly?: boolean;
   sessionBackendId?: string;
   sessionRuntime?: ModelRuntime;
   backends?: any[];
-}> = ({ sessionId, policy, readOnly = false, sessionBackendId, sessionRuntime, backends }) => {
+}> = ({ sessionId, policy, readOnly = false, sessionBackendId, sessionRuntime, backends, onRefreshBackends }) => {
   const [open, setOpen] = useState(false);
   const [draft, setDraft] = useState<LoopPolicy>(() => normalizePolicy(policy));
   const [dirty, setDirty] = useState(false);
@@ -1109,7 +1122,7 @@ const PolicyCard: React.FC<{
         {readOnly ? (
           <span style={{ fontWeight: 700, fontSize: 13, color: 'var(--theme-text)' }}>⚙️ 策略与心智</span>
         ) : (
-          <button onClick={() => setOpen(!open)}
+          <button onClick={() => { if (!open) onRefreshBackends?.(); setOpen(!open); }}
             style={{ ...linkBtn, fontWeight: 700, fontSize: 13, color: 'var(--theme-text)' }}>
             {open ? '▾' : '▸'} ⚙️ 策略与心智
           </button>
@@ -1976,6 +1989,7 @@ const LoopDetail: React.FC<{
       ) : liveAna ? <Section title="累计目标诊断（进行中）"
           extra={<BackendTag role="analysis" label={loop.backendLabels?.analysis} />}><Live text={liveAna} /></Section> : null)}
 
+      <LoopDecisionNotice decision={loop.decision} callResults={loop.callResults} taskResult={loop.taskResult} steps={loop.outcomeVersion ? loop.orchestration : undefined} />
       {(target === 'all' || target === 'analysis') && <LoopDeliveryDetail report={loop.delivery} />}
       {loop.error && <Section title="错误"><span style={{ color: '#f87171' }}>{loop.error}</span></Section>}
     </div>

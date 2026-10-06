@@ -1,5 +1,6 @@
 import React, { useState, useCallback, useEffect, useLayoutEffect, useRef, useMemo } from 'react';
 import { api } from '../api';
+import { backendCatalog } from '../backendCatalog';
 import { mergeSessionRouting, isSessionMetaReady } from '../utils/sessionRouting';
 import type { CurrentUserProfile, FollowUpCapabilities } from '../api';
 import { MessageBubble } from './MessageBubble';
@@ -173,6 +174,9 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
   const [sessionMetaLoading, setSessionMetaLoading] = useState(false);
   const reloadSessionMetaRef = useRef<() => void>(() => {});
   const [nodeBackends, setNodeBackends] = useState<any[]>(backends);
+  const [nodeBackendsError, setNodeBackendsError] = useState('');
+  const refreshBackendsRef = useRef<() => void>(() => {});
+  const refreshBackends = useCallback(() => refreshBackendsRef.current(), []);
   const [loopRunning, setLoopRunning] = useState(false);
   const [realtimeVoiceActive, setRealtimeVoiceActive] = useState(false);
   // 权限 state: 初值从 session 读,变化时持久化
@@ -263,7 +267,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
     let firstStatus = true;
     const unsubscribeConnection = api.onSessionConnectionStatus(sessionId, connected => {
       // 初值由上面的 load 负责；后续重连必须补拉，保活 Tab 不依赖重新挂载。
-      if (connected && !firstStatus) load();
+      if (connected && !firstStatus) { load(); refreshBackendsRef.current(); }
       firstStatus = false;
     });
     return () => {
@@ -273,19 +277,37 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
   }, [sessionId]);
 
   // Backend configuration belongs to the executor that owns the session.
+  const fallbackBackends = activeSession?.execKey ? undefined : backends;
   useEffect(() => {
     const execKey = activeSession?.execKey;
+    setNodeBackendsError('');
     if (!execKey) {
-      setNodeBackends(backends);
+      refreshBackendsRef.current = () => {};
+      setNodeBackends(fallbackBackends ?? []);
       return;
     }
     let cancelled = false;
+    let generation = 0;
     setNodeBackends([]);
-    api.getBackends(execKey)
-      .then((list) => { if (!cancelled) setNodeBackends(Array.isArray(list) ? list : []); })
-      .catch(() => { if (!cancelled) setNodeBackends([]); });
-    return () => { cancelled = true; };
-  }, [activeSession?.execKey, backends]);
+    const refresh = () => {
+      const request = ++generation;
+      backendCatalog.read(execKey)
+        .then(list => {
+          if (!cancelled && generation === request) {
+            setNodeBackends(list);
+            setNodeBackendsError('');
+          }
+        })
+        .catch(error => {
+          if (!cancelled && generation === request) setNodeBackendsError(error?.message || '无法读取会话执行节点的 Backend');
+        });
+    };
+    refresh();
+    refreshBackendsRef.current = refresh;
+    const unsubscribe = backendCatalog.subscribe(execKey, refresh);
+    return () => { cancelled = true; unsubscribe(); refreshBackendsRef.current = () => {}; };
+  }, [activeSession?.execKey, fallbackBackends]);
+  useEffect(() => { if (isVisible) refreshBackends(); }, [isVisible, refreshBackends]);
 
   const effectiveBackends = activeSession?.execKey ? nodeBackends : backends;
   const activeBackendId = activeSession?.backendId || effectiveBackends[0]?.id || '';
@@ -803,7 +825,9 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
           background: 'transparent',
         }}
       >
+        {nodeBackendsError && <div role="alert" style={{ padding: 8, color: '#f85149', fontSize: 12 }}>{nodeBackendsError}</div>}
         <LoopPanel
+          onRefreshBackends={refreshBackends}
           sessionId={sessionId}
           embedded
           headerActions={config.workspaceKitsEnabled ? (
@@ -855,6 +879,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
       }}
     >
       <TokenUsageMonitor sessionId={sessionId} placement="floating" />
+      {nodeBackendsError && <div role="alert" style={{ padding: 8, color: '#f85149', fontSize: 12 }}>{nodeBackendsError}</div>}
       {/* ---- 消息列表 ---- */}
       <div style={{ flex: 1, position: 'relative', overflow: 'hidden' }}>
         <div
@@ -1126,6 +1151,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
           reasoningEffort: activeSession?.reasoningEffort,
         }}
         onSessionRuntimeChange={handleSessionRuntimeChange}
+        onRefreshBackends={refreshBackends}
         voiceConversationActive={realtimeVoiceActive}
         realtimeVoice={{
           sessionId,

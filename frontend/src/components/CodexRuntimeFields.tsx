@@ -1,19 +1,12 @@
 import React, { useId } from 'react';
+import { resolveCodexModelOptions } from '../utils/codexModelOptions';
+export { CODEX_MODELS } from '../utils/codexModelOptions';
 
 export interface ModelRuntime {
   model?: string;
   reasoningEffort?: string;
 }
 
-export const CODEX_MODELS = [
-  { id: 'gpt-6-astra', label: 'GPT-6 Astra · 最强端到端复杂任务' },
-  { id: 'gpt-5.6-sol', label: 'GPT-5.6 Sol · 复杂任务/精细交付' },
-  { id: 'gpt-5.6-terra', label: 'GPT-5.6 Terra · 日常均衡执行' },
-  { id: 'gpt-5.6-luna', label: 'GPT-5.6 Luna · 快速/轻量' },
-  { id: 'gpt-5.5', label: 'GPT-5.5' },
-  { id: 'gpt-5.4', label: 'GPT-5.4' },
-  { id: 'gpt-5.4-mini', label: 'GPT-5.4 Mini' },
-];
 
 export const CODEX_REASONING_EFFORTS = [
   { id: 'none', label: '关闭 · none' },
@@ -119,7 +112,7 @@ export const BackendRuntimeFields: React.FC<Props> = ({
         />
         {codex && (
           <datalist id={listId}>
-            {CODEX_MODELS.map((model) => <option key={model.id} value={model.id}>{model.label}</option>)}
+            {resolveCodexModelOptions(backend).map((model) => <option key={model.id} value={model.id}>{model.label || model.id}</option>)}
           </datalist>
         )}
       </label>

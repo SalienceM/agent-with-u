@@ -4,6 +4,9 @@ import {
   type BackendImportPreviewItem, type ExecutorInfo, type PoeAccountOverview,
 } from '../api';
 import { sessionsForBackendExecutor } from '../utils/backendManagement';
+import { cloneCodexModelOptions, normalizeCodexModelOptions, resolveCodexModelOptions, type CodexModelOption } from '../utils/codexModelOptions';
+import { CodexModelOptionsEditor } from './CodexModelOptionsEditor';
+import { CodexCatalogSync } from './CodexCatalogSync';
 
 // 注入删除按钮 hover 样式（只执行一次）
 if (typeof document !== 'undefined' && !document.getElementById('bm-delete-btn-style')) {
@@ -26,6 +29,7 @@ interface BackendConfig {
   label: string;
   enabled?: boolean;
   model?: string;
+  modelOptions?: CodexModelOption[] | null;
   baseUrl?: string;
   apiKey?: string;
   workingDir?: string;
@@ -65,15 +69,6 @@ function formatPoeTime(value: number): string {
 const OFFICIAL_BACKEND_ID = 'official-claude';
 const OFFICIAL_CODEX_BACKEND_ID = 'official-codex';
 const CODEX_DEFAULT_MODEL = 'gpt-5.6-sol';
-const CODEX_RECOMMENDED_MODELS = [
-  { id: 'gpt-6-astra', label: 'GPT-6 Astra（最强端到端复杂任务）' },
-  { id: 'gpt-5.6-sol', label: 'GPT-5.6 Sol（推荐，复杂编码/推理）' },
-  { id: 'gpt-5.6-terra', label: 'GPT-5.6 Terra（日常工作均衡）' },
-  { id: 'gpt-5.6-luna', label: 'GPT-5.6 Luna（更快/更省）' },
-  { id: 'gpt-5.5', label: 'GPT-5.5（上一代旗舰）' },
-  { id: 'gpt-5.4', label: 'GPT-5.4' },
-  { id: 'gpt-5.4-mini', label: 'GPT-5.4 Mini' },
-];
 const DASHSCOPE_IMAGE_MODELS = [
   { id: 'qwen-image-3.0-pro', label: 'Qwen Image 3.0 Pro（质量优先）' },
   { id: 'qwen-image-3.0', label: 'Qwen Image 3.0（质量/速度均衡）' },
@@ -231,6 +226,7 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
 }) => {
   const [isEditing, setIsEditing] = useState(false);
   const [editingBackend, setEditingBackend] = useState<BackendConfig | null>(null);
+  const [catalogGeneration, setCatalogGeneration] = useState(0);
   const [copySourceLabel, setCopySourceLabel] = useState<string | null>(null);
   const [formData, setFormData] = useState<BackendConfig>({
     id: '',
@@ -473,6 +469,7 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
   }, [onRefresh, targetExecKey, transferState]);
 
   const handleNewBackend = useCallback(() => {
+    setCatalogGeneration(value => value + 1);
     setFormData({
       id: `backend-${Date.now()}`,
       type: 'claude-agent-sdk',
@@ -490,8 +487,10 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
   }, []);
 
   const handleEditBackend = useCallback((backend: BackendConfig) => {
+    setCatalogGeneration(value => value + 1);
     setFormData({
       ...backend,
+      modelOptions: cloneCodexModelOptions(backend.modelOptions),
       env: { ...(backend.env || {}) },
       extraHeaders: backend.extraHeaders ? { ...backend.extraHeaders } : undefined,
       allowedTools: backend.allowedTools ? [...backend.allowedTools] : undefined,
@@ -511,6 +510,7 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
   }, [targetExecKey]);
 
   const handleCopyBackend = useCallback((backend: BackendConfig) => {
+    setCatalogGeneration(value => value + 1);
     const usedIds = new Set(backends.map((item) => item.id));
     const idRoot = (backend.id || 'backend').replace(/-copy(?:-\d+)?$/i, '');
     let nextId = `${idRoot}-copy`;
@@ -535,6 +535,7 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
       id: nextId,
       label: nextLabel,
       pinned: false,
+      modelOptions: cloneCodexModelOptions(backend.modelOptions),
       env: { ...(backend.env || {}) },
       extraHeaders: backend.extraHeaders ? { ...backend.extraHeaders } : undefined,
       allowedTools: backend.allowedTools ? [...backend.allowedTools] : undefined,
@@ -552,6 +553,7 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
   }, [backends]);
 
   const handleSave = useCallback(async () => {
+    setCatalogGeneration(value => value + 1);
     const normalizedId = formData.id.trim();
     const normalizedLabel = formData.label.trim();
     if (!normalizedId || !normalizedLabel) {
@@ -680,6 +682,13 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
       if (Object.keys(cleanedEnv).length > 0) saved.env = cleanedEnv;
     }
 
+    if (formData.type === 'codex-office') {
+      try { saved.modelOptions = normalizeCodexModelOptions(formData.modelOptions); }
+      catch (error: any) {
+        setOperationMessage({ kind: 'error', text: error.message });
+        return;
+      }
+    }
     setOperationBusy(true);
     setOperationMessage(null);
     try {
@@ -880,7 +889,7 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
 
   return (
     <div style={overlayStyle}>
-      <div ref={panelRef} style={panelStyle} onClick={(e) => e.stopPropagation()}>
+      <div role="dialog" aria-label="Backend 配置" aria-modal="true" ref={panelRef} style={panelStyle} onClick={(e) => e.stopPropagation()}>
         {/* 标题栏 */}
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
           <h2 style={{ margin: 0, fontSize: 18, fontWeight: 600, color: 'var(--theme-text)' }}>
@@ -889,7 +898,7 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
               : (copySourceLabel ? `复制 Backend · ${copySourceLabel}` : editingBackend ? 'Edit Backend' : 'Backend Manager')
             }
           </h2>
-          <button onClick={onClose} style={closeBtnStyle}>✕</button>
+          <button aria-label="关闭 Backend 配置" onClick={onClose} style={closeBtnStyle}>✕</button>
         </div>
 
         {/* Backend/MCP 均属于物理执行节点，不跟随当前聊天会话隐式切换。 */}
@@ -1000,6 +1009,7 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
                 backends.map((backend) => (
                   <div
                     key={backend.id}
+                    data-backend-id={backend.id}
                     style={{
                       ...backendItemStyle,
                       ...(backend.pinned ? { borderLeft: '2px solid rgba(99,102,241,0.6)' } : {}),
@@ -1957,11 +1967,12 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
                     onChange={(e) => setFormData({ ...formData, model: e.target.value })}
                     style={inputStyle}
                     list="codex-recommended-models"
+                    aria-label="Backend 默认模型"
                     placeholder={CODEX_DEFAULT_MODEL}
                   />
                   <datalist id="codex-recommended-models">
-                    {CODEX_RECOMMENDED_MODELS.map((m) => (
-                      <option key={m.id} value={m.id}>{m.label}</option>
+                    {resolveCodexModelOptions(formData).map((m) => (
+                      <option key={m.id} value={m.id}>{m.label || m.id}</option>
                     ))}
                   </datalist>
                   <div style={{ fontSize: 11, color: 'var(--theme-text-muted)', marginTop: 5, lineHeight: 1.5 }}>
@@ -1971,6 +1982,13 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
                     <a href="https://developers.openai.com/codex/pricing" target="_blank" rel="noreferrer" style={{ color: 'var(--theme-accent)' }}>Codex Pricing</a>。
                   </div>
                 </div>
+
+                <CodexCatalogSync key={`${targetExecKey}:${catalogGeneration}`}
+                  draft={formData} saved={editingBackend} execKey={targetExecKey}
+                  disabled={operationBusy || !selectedExecutor?.connected}
+                  onChange={modelOptions => setFormData(current => ({ ...current, modelOptions }))} />
+                <CodexModelOptionsEditor value={formData.modelOptions}
+                  onChange={modelOptions => setFormData(current => ({ ...current, modelOptions }))} />
 
                 <div style={{ marginBottom: 10 }}>
                   <label style={{ fontSize: 11, color: 'var(--theme-text)', display: 'block', marginBottom: 4 }}>

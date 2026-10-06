@@ -1,6 +1,10 @@
 import React from 'react';
+import type { MilestoneSummary } from '../types/loopContinuation';
 
 export interface DeliveryReport {
+  reconciliation?: { valid?: boolean; mappingValid?: boolean; total?: number; checked?: number; missing?: string[]; extra?: string[]; uncheckedVerified?: string[]; manualIds?: string[]; sourceMismatch?: boolean };
+  milestoneSummary?: MilestoneSummary;
+  milestoneReview?: { valid?: boolean; issues?: string[]; discoveries?: Array<{ id: string; parentId: string; acceptance: string; reason: string }>; milestones?: Array<{ id: string; parentId: string; acceptance: string; status: string; validity: string; evidenceRefs?: unknown[] }> };
   mode?: string; source?: string; scopeComplete?: boolean; valid?: boolean;
   items?: Array<{ id: string; title: string; status: string; dependsOn: string[]; evidence: string; manualBasis: string }>;
   blockers?: Array<{ id: string; kind: string; affected: string[]; reason: string; resolution: string }>;
@@ -12,7 +16,7 @@ export interface ProgressGuard {
 }
 const labels: Record<string, string> = {
   pending: '待实现', implemented: '已实现待验', verified: '已验证', blocked: '受阻', manual: '人工项',
-  local: '局部阻塞', global: '全局阻塞', safety: '安全阻塞', human: '需人工输入', passed: '通过',
+  local: '局部阻塞', global: '全局阻塞', safety: '安全阻塞', authorization: '授权阻塞', human: '需人工输入', passed: '通过',
 };
 const box: React.CSSProperties = {
   border: '1px solid var(--theme-border)', borderRadius: 8, padding: 10,
@@ -38,7 +42,22 @@ export const LoopDeliveryDetail: React.FC<{ report?: DeliveryReport }> = ({ repo
     <strong>任务与证据台账 · {report.mode === 'delivery' ? '任务交付' : '探索验证'}</strong>
     <div>来源：{report.source || '未明确'} · {report.scopeComplete ? '已声明完整范围' : '范围仍待核对'}</div>
     <div style={{ color: 'var(--theme-text-muted)' }}>以下是评审核实记录，不以模型自述或操作次数代替验收。</div>
-    {!report.valid && <div>台账结构不完整，不能作为完成依据。</div>}
+    {!report.valid && <div>台账结构或来源/模式核对未通过，不能作为完成依据。</div>}
+    {report.reconciliation && <div data-testid="loop-formal-count">正式任务勾选 {report.reconciliation.checked}/{report.reconciliation.total} · {report.reconciliation.valid ? '清单对账一致（仍需验收）' : '对账未通过，不能收口'}
+      {!!report.reconciliation.missing?.length && <div>遗漏：{report.reconciliation.missing.join('、')}</div>}
+      {!!report.reconciliation.extra?.length && <div>无法映射：{report.reconciliation.extra.join('、')}</div>}
+      {report.reconciliation.sourceMismatch && <div>评审引用的来源与绑定 change 不一致，需核对。</div>}
+      {!!report.reconciliation.uncheckedVerified?.length && <div>未勾选但声称验证：{report.reconciliation.uncheckedVerified.join('、')}</div>}
+      {!!report.reconciliation.manualIds?.length && <div>正式范围内待人工核验：{report.reconciliation.manualIds.join('、')}</div>}
+    </div>}
+    {report.milestoneReview && <details data-testid="loop-milestones"><summary>子里程碑（独立侧台账，不计入正式任务分母）</summary>
+      {!report.milestoneReview.valid && <div>子项条件/证据未通过核对，不计新增信用。</div>}
+      {report.milestoneReview.discoveries?.map((d, index) => <div key={`${d.id}-${index}`}>基线候选 {d.parentId}/{d.id} · {d.acceptance} · {d.reason}</div>)}
+      <div>本轮认可增量：{report.milestoneSummary?.credited?.join('、') || '无'} · 恢复旧高水位：{report.milestoneSummary?.restored?.join('、') || '无'}</div>
+      <div>已实现待验 {report.milestoneSummary?.counts?.implemented || 0} · 已验证 {report.milestoneSummary?.counts?.verified || 0}</div>
+      {report.milestoneReview.milestones?.map(m => <div key={m.id} style={{ marginTop: 6 }}>{m.parentId} / {m.id} · {m.acceptance}<br />{labels[m.status] || m.status} · 证据 {m.validity === 'current' ? '当前适用' : `失效/待核对：${m.validity}`}<br />{JSON.stringify(m.evidenceRefs || [])}</div>)}
+      <div>子项全部已验证仍不代表父任务集成验收通过；旧记录不补造进度。</div>
+    </details>}
     <div>{Object.entries(labels).filter(([key]) => items.some((i) => i.status === key)).map(([key, label]) =>
       <span key={key} style={{ marginRight: 10 }}>{label} {items.filter((i) => i.status === key).length}</span>)}</div>
     {(report.blockers || []).map((blocker, index) => <div key={`${blocker.id}-${index}`} style={{ marginTop: 8 }}>

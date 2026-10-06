@@ -164,6 +164,7 @@ interface Props {
   execMode?: 'local' | 'relay';
   sessionRuntime?: ModelRuntime;
   onSessionRuntimeChange?: (runtime: ModelRuntime) => Promise<{ status: string; message?: string }>;
+  onRefreshBackends?: () => void;
   // 自动实时语音对话占用麦克风/STT 时，关闭这里的单次听写入口。
   voiceConversationActive?: boolean;
   realtimeVoice?: {
@@ -245,6 +246,7 @@ const ChatInputInner = forwardRef<ChatInputHandle, Props>(({
   execKey,
   sessionRuntime,
   onSessionRuntimeChange,
+  onRefreshBackends,
   voiceConversationActive = false,
   realtimeVoice,
 }, forwardedRef) => {
@@ -1768,7 +1770,7 @@ const ChatInputInner = forwardRef<ChatInputHandle, Props>(({
             title={`切换本 Session 模型${activeBackend?.type === 'codex-office' ? ' / 推理档位' : ''}（当前：${formatRuntimeLabel(activeBackend, sessionRuntime)}）`}
             active={showRuntimePicker}
             compact={isMobile}
-            onClick={() => setShowRuntimePicker((value) => !value)}
+            onClick={() => { if (!showRuntimePicker) onRefreshBackends?.(); setShowRuntimePicker((value) => !value); }}
           />
         )}
         {onAdjustFontSize && (

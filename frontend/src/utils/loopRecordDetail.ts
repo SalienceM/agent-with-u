@@ -1,4 +1,6 @@
 interface DetailRevisionSource {
+  outcomeVersion?: number; terminalKind?: string; decision?: { decisionId?: string; revision?: number };
+  sourceSummary?: unknown; deliverySummary?: unknown;
   seq: number; subStage: string; completed: boolean; error: string; updatedAt?: number;
   manualMessageCount?: number; manualMessages?: unknown[];
   stageDetails?: Record<string, { status?: string; attemptCount?: number; message?: string }>;
@@ -11,6 +13,8 @@ interface DetailRevisionSource {
 export function loopRecordRevision(record: DetailRevisionSource): string {
   return JSON.stringify([
     record.seq, record.subStage, record.completed, record.error, record.updatedAt,
+    record.outcomeVersion, record.terminalKind, record.decision?.decisionId, record.decision?.revision,
+    record.sourceSummary, record.deliverySummary,
     record.manualMessageCount ?? record.manualMessages?.length ?? 0,
     Object.entries(record.stageDetails || {}).sort(([a], [b]) => a.localeCompare(b))
       .map(([stage, detail]) => [stage, detail.status, detail.attemptCount, detail.message]),

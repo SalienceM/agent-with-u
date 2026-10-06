@@ -41,6 +41,7 @@ class ModelBackendConfig:
     qwen_max_output_tokens: Optional[int] = None
     extra_headers: Optional[dict[str, str]] = None  # Custom HTTP headers for proxy/relay backends
     mcp_servers: Optional[dict[str, dict]] = None  # MCP server configurations
+    model_options: Optional[list[dict[str, str]]] = None  # None=内置；[]=无候选
 
     def to_dict(self) -> dict:
         return {
@@ -60,6 +61,7 @@ class ModelBackendConfig:
             "qwenMaxOutputTokens": self.qwen_max_output_tokens,
             "extraHeaders": self.extra_headers,
             "mcpServers": self.mcp_servers,
+            "modelOptions": [dict(item) for item in self.model_options] if self.model_options is not None else None,
         }
 
     def get_env(self, key: str, default: Optional[str] = None) -> Optional[str]:

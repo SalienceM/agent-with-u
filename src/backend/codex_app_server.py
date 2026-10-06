@@ -122,12 +122,16 @@ class CodexAppServerProcess:
     def __init__(self, host: str = "", command: str = "codex app-server --listen stdio://",
                  *, launch_command: Optional[list[str]] = None,
                  env: Optional[dict[str, str]] = None,
-                 cwd: Optional[str] = None):
+                 cwd: Optional[str] = None,
+                 stream_limit: int = CODEX_JSONL_STREAM_LIMIT,
+                 isolated_process_group: bool = False):
         self.host = validate_ssh_host(host) if host else ""
         self.command = str(command or "codex app-server --listen stdio://").strip()
         self.launch_command = list(launch_command or [])
         self.env = env
         self.cwd = cwd
+        self.stream_limit = stream_limit
+        self.isolated_process_group = isolated_process_group
         self.proc: Optional[asyncio.subprocess.Process] = None
         self._stderr_task: Optional[asyncio.Task] = None
         self._stderr_tail: list[str] = []
@@ -148,7 +152,10 @@ class CodexAppServerProcess:
                 stderr=asyncio.subprocess.PIPE,
                 env=self.env,
                 cwd=self.cwd,
-                limit=CODEX_JSONL_STREAM_LIMIT,
+                limit=self.stream_limit,
+                start_new_session=self.isolated_process_group and sys.platform != "win32",
+                creationflags=(subprocess.CREATE_NO_WINDOW if sys.platform == "win32"
+                               and self.isolated_process_group else 0),
             )
         except FileNotFoundError as exc:
             if self.launch_command:

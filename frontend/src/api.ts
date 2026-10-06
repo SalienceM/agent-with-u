@@ -9,6 +9,7 @@
  */
 
 import type { GitDetectResult, GitStatusResult, GitDiffResult, GitCommitResult, GitLogResult, GitBranchesResult, GitPushPullResult, GitStashListResult } from './types/git';
+import type { LoopSourceResponse } from './types/loopContinuation';
 import type {
   WorkspaceKitState, WorkspaceKit, KitRun, KitGenerationRequest, KitGenerationResult,
   KitGenerationJob, KitVersion, KitOptimizationMessage, KitCapabilityMetadata,
@@ -2543,6 +2544,16 @@ export const api = {
     try { return JSON.parse(result); } catch { return []; }
   },
 
+  async codexModelCatalog(backendId: string, execKey: string): Promise<unknown> {
+    try {
+      const result = await callOnStrict(execKey, 'codexModelCatalog', [backendId], 35_000);
+      return JSON.parse(result);
+    } catch {
+      // 旧端/中继可能返回原始异常；目录 UI 不回显可能含认证信息的文本。
+      throw new Error('无法读取目录，请检查目标节点连接、权限和版本；原草稿未修改。');
+    }
+  },
+
   async poeAccountOverview(apiKey = '', execKey?: string): Promise<PoeAccountOverview> {
     const result = execKey
       ? await callOnStrict(execKey, 'poeAccountOverview', [apiKey], 30_000)
@@ -2724,6 +2735,16 @@ export const api = {
   },
 
   // ── 可视化 Loop 集成 ────────────────────────────────────────
+  async loopTaskSourceDiscover(sessionId: string): Promise<LoopSourceResponse> {
+    return JSON.parse(await call('loopTaskSourceDiscover', sessionId));
+  },
+  async loopTaskSourceGet(sessionId: string): Promise<LoopSourceResponse> {
+    return JSON.parse(await call('loopTaskSourceGet', sessionId));
+  },
+  async loopTaskSourceSet(sessionId: string, action: 'bind' | 'unbind' | 'confirm' | 'refresh', revision: number,
+    executor: string, change = '', discoveryId = '', disposition = ''): Promise<LoopSourceResponse> {
+    return JSON.parse(await call('loopTaskSourceSet', sessionId, action, revision, executor, change, discoveryId, disposition));
+  },
   async loopGetState(sessionId: string): Promise<any | null> {
     const result = await call('loopGetState', sessionId, true);
     try { return JSON.parse(result); } catch { return null; }
