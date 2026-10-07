@@ -17,7 +17,14 @@ for (const recovery of ['retry', 'reconnect', 'other-consumer', 'timeout'] as co
         const frame = JSON.parse(String(message));
         if (frame.params?.[0] === sid) reads.push(frame.method);
         if (['sendMessage', 'abortMessage', 'deleteSession', 'loopRunIteration', 'seqtaskTakeNext'].includes(frame.method)) throw new Error('Unexpected mutation in recovery test');
-        if (frame.method === 'loadSessionMeta' && frame.params?.[0] === sid) {
+        if (frame.method === 'loopControlGet' && frame.params?.[0] === sid) {
+          // 所有权查询与本夹具的 metadata 保持一致，不能把旧自动态当成权威新结果。
+          socket.send(JSON.stringify(healthy ? { id: frame.id, result: JSON.stringify({
+            protocolVersion: 1, sessionId: sid, controlMode: 'manual', controlRevision: 0,
+            auto: false, stage: 'loopexecute', round: 1, operation: {},
+            eligibility: { takeover: { allowed: true }, release: { allowed: true } },
+          }) } : { id: frame.id, error: 'QA injected metadata failure' }));
+        } else if (frame.method === 'loadSessionMeta' && frame.params?.[0] === sid) {
           if (!healthy && recovery === 'timeout') { blockedRequest = { socket, id: frame.id }; return; }
           socket.send(JSON.stringify(healthy ? { id: frame.id, result: JSON.stringify({
             id: sid, title, sessionType: 'loop', loopControlMode: 'manual', backendId: 'qa-primary',

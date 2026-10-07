@@ -22,6 +22,7 @@ from .codex_app_server import (
     CodexAppServerProcess,
     local_app_server_command,
 )
+from .loop_execution_environment import ExecutionIdentity, path_identity, EnvironmentPause
 
 
 _PROXY_ENV_KEYS = (
@@ -175,6 +176,39 @@ class CodexOfficeBackend(ModelBackend):
     def app_server_default_enabled(self) -> bool:
         value = str(self.config.get_env("AGENTWITHU_CODEX_APP_SERVER", "true") or "true")
         return value.strip().lower() not in {"0", "false", "no", "off"}
+
+    def execution_environment_capabilities(self, identity) -> dict:
+        return {'supported': sys.platform == 'win32' and identity.transport == 'app-server',
+                'coverage': 'native_policy', 'method': 'command/exec'}
+
+    async def check_execution_environment(self, identity, gate, observer) -> None:
+        """独立复查仅使用 command/exec；不创建 native thread 或模型轮次。"""
+        from .codex_environment import ProbeAppServerProcess
+        from .loop_execution_environment import EnvironmentError, new_check
+        conn = ProbeAppServerProcess(launch_command=local_app_server_command(
+            resolve_codex_cli(self.config.cli_path),
+            (["--enable", "respect_system_proxy"] if self._system_proxy_enabled() else []) + self._http_provider_args()),
+            env=self._build_env(), cwd=identity.workspace, isolated_process_group=True)
+        pause = None
+        try:
+            await conn.start()
+            await gate(conn)
+        except EnvironmentPause as exc:
+            pause = exc
+            raise
+        except Exception as exc:
+            pause = EnvironmentPause(new_check(identity, status='blocked', coverage='native_policy',
+                reason=exc.code if isinstance(exc, EnvironmentError) else 'env_probe_failed',
+                probePath='command/exec', quiesced=False))
+            raise pause from None
+        finally:
+            await conn.close()
+            self.environment_cleanup_confirmed = conn.cleanup_confirmed
+            if pause:
+                pause.check['quiesced'] = conn.cleanup_confirmed
+                pause.quiesced = conn.cleanup_confirmed
+                observer('preflight', pause.check)
+            observer('cleanup', {'quiesced': conn.cleanup_confirmed, 'connection': conn})
 
     def follow_up_capabilities(self) -> dict:
         return {
@@ -679,6 +713,9 @@ class CodexOfficeBackend(ModelBackend):
         reasoning_effort: Optional[str],
         remote_host: str = "",
         execution_access: Optional[str] = None,
+        execution_identity: Optional[ExecutionIdentity] = None,
+        environment_gate=None,
+        environment_observer=None,
     ) -> dict:
         """Run one turn through a local executor or SSH Codex app-server."""
         self.clear_cancelled(session_id)
@@ -703,7 +740,9 @@ class CodexOfficeBackend(ModelBackend):
             conn = CodexAppServerProcess(remote_host, remote_command)
         else:
             codex_cli = resolve_codex_cli(self.config.cli_path)
-            conn = CodexAppServerProcess(
+            from .codex_environment import ProbeAppServerProcess
+            connection_class = ProbeAppServerProcess if environment_gate else CodexAppServerProcess
+            conn = connection_class(
                 launch_command=local_app_server_command(
                     codex_cli,
                     (["--enable", "respect_system_proxy"] if self._system_proxy_enabled() else [])
@@ -716,6 +755,8 @@ class CodexOfficeBackend(ModelBackend):
         final_usage: Optional[dict] = None
         streamed_agent_items: set[str] = set()
         started_tools: set[str] = set()
+        model_requested = False
+        environment_pause = None
 
         try:
             print(
@@ -749,6 +790,12 @@ class CodexOfficeBackend(ModelBackend):
             if not thread_id:
                 raise RuntimeError("远端 Codex 未返回 thread id")
 
+            if environment_gate:
+                hint = await environment_gate(conn, bootstrap)
+                if hint:
+                    # 顺序恢复也必须收到本次环境证据，不能被 native history 去重省略。
+                    prompt = hint + '\n\n' + prompt
+
             user_input = self._app_server_input(prompt, images)
             turn_params: dict = {
                 "threadId": thread_id,
@@ -760,6 +807,7 @@ class CodexOfficeBackend(ModelBackend):
                 turn_params["model"] = model
             if effort:
                 turn_params["effort"] = effort
+            model_requested = True
             started = await conn.request("turn/start", turn_params, timeout=45)
             emit("diagnostic", diagnostic={"phase": "turn_accepted"})
             turn = started.get("turn", {}) if isinstance(started, dict) else {}
@@ -862,6 +910,8 @@ class CodexOfficeBackend(ModelBackend):
                             started_tools.add(item_id)
                         if completed:
                             emit("tool_result", tool_call=tool)
+                            if environment_observer:
+                                environment_observer('commandExecution', item)
                     elif item_type in {"mcpToolCall", "dynamicToolCall", "fileChange", "webSearch"}:
                         name = item.get("tool") or item.get("query") or item_type
                         if item_id not in started_tools:
@@ -901,6 +951,8 @@ class CodexOfficeBackend(ModelBackend):
                             final_usage["contextWindow"] = context_window
                 elif method == "error":
                     error = params.get("error") or {}
+                    if environment_observer and not params.get('willRetry'):
+                        environment_observer('nativeError', error)
                     text = error.get("message") if isinstance(error, dict) else str(error)
                     if not params.get("willRetry"):
                         emit("error", error=text or "远端 Codex 执行失败")
@@ -911,7 +963,17 @@ class CodexOfficeBackend(ModelBackend):
                         err = completed_turn.get("error") or {}
                         emit("error", error=(err.get("message") if isinstance(err, dict) else str(err)) or "远端 Codex turn 失败")
                     break
+        except EnvironmentPause as exc:
+            environment_pause = exc
+            raise
         except Exception as exc:
+            if environment_gate and not model_requested:
+                from .loop_execution_environment import EnvironmentError, new_check
+                check = new_check(execution_identity, status='blocked',
+                    reason=exc.code if isinstance(exc, EnvironmentError) else 'env_probe_failed',
+                    coverage='native_policy', probePath='command/exec', quiesced=False)
+                environment_pause = EnvironmentPause(check)
+                raise environment_pause from None
             emit("error", error=_exc_msg(exc))
         finally:
             active_turn = self._active_app_turns.get(session_id)
@@ -919,7 +981,17 @@ class CodexOfficeBackend(ModelBackend):
                 self._active_app_turns.pop(session_id, None)
                 self._finish_active_turn(active_turn)
             await conn.close()
-            emit("done", **({"usage": final_usage} if final_usage else {}))
+            if environment_gate:
+                quiesced = getattr(conn, 'cleanup_confirmed', False)
+                if environment_pause:
+                    environment_pause.check['quiesced'] = quiesced
+                    environment_pause.quiesced = quiesced
+                    if environment_observer:
+                        environment_observer('preflight', environment_pause.check)
+                if environment_observer:
+                    environment_observer('cleanup', {'quiesced': quiesced, 'connection': conn})
+            if model_requested:
+                emit("done", **({"usage": final_usage} if final_usage else {}))
             self.clear_cancelled(session_id)
         return {"agentSessionId": thread_id}
 
@@ -942,9 +1014,17 @@ class CodexOfficeBackend(ModelBackend):
         remote_host: Optional[str] = None,
         app_server_local: bool = False,
         execution_access: Optional[str] = None,
+        execution_identity: Optional[ExecutionIdentity] = None,
+        environment_gate=None,
+        environment_observer=None,
     ) -> dict:
         if execution_access not in (None, "read-only", "workspace-write"):
             raise ValueError("Unsupported execution access")
+        if execution_identity is not None:
+            transport = 'ssh' if remote_host else 'app-server' if app_server_local else 'exec'
+            if (execution_identity.access != execution_access or execution_identity.transport != transport
+                    or path_identity(working_dir or self.config.working_dir or '.') != path_identity(execution_identity.workspace)):
+                raise ValueError('Execution environment identity changed before dispatch')
         if remote_host or app_server_local:
             return await self._send_app_server_message(
                 messages=messages, content=content, images=images,
@@ -956,6 +1036,9 @@ class CodexOfficeBackend(ModelBackend):
                 model_override=model_override, reasoning_effort=reasoning_effort,
                 remote_host=remote_host or "",
                 execution_access=execution_access,
+                execution_identity=execution_identity,
+                environment_gate=environment_gate,
+                environment_observer=environment_observer,
             )
         self.clear_cancelled(session_id)
 
@@ -1165,6 +1248,9 @@ class CodexOfficeBackend(ModelBackend):
                             })
                             started_tool_ids.add(tool_id)
                         emit("tool_result", tool_call=tool)
+                        if environment_observer:
+                            environment_observer('commandExecution', {'id': tool_id,
+                                'exitCode': item.get('exit_code'), 'status': item.get('status')})
                     else:
                         tool.pop("output", None)
                         emit("tool_start", tool_call=tool)
@@ -1193,6 +1279,8 @@ class CodexOfficeBackend(ModelBackend):
                         pending_transport_error = error_text
                         print(f"[CodexOffice][transport-retry] {error_text}", file=sys.stderr, flush=True)
                     else:
+                        if environment_observer and isinstance(obj.get('error'), dict):
+                            environment_observer('nativeError', obj['error'])
                         emit("error", error=error_text)
                 elif "tool" in typ or "command" in typ:
                     name = obj.get("name") or obj.get("tool") or obj.get("command") or "Codex tool"

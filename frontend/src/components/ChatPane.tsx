@@ -7,6 +7,8 @@ import { MessageBubble } from './MessageBubble';
 import { ChatInput, type ChatInputHandle } from './ChatInput';
 import { PermissionGate } from './PermissionGate';
 import { LoopPanel } from './LoopPanel';
+import { LoopControlStatus } from './LoopControlStatus';
+import { useLoopControl } from '../hooks/useLoopControl';
 import { SeqTaskPanel } from './SeqTaskPanel';
 import type { SeqTaskT } from './SeqTaskPanel';
 import { WorkspaceKitsPanel } from './WorkspaceKitsPanel';
@@ -231,6 +233,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
         {
           id: sessionId, sessionType: 'loop',
           loopControlMode: state.controlMode,
+          controlRevision: state.controlRevision,
         },
       ));
       if (typeof state.running === 'boolean') setLoopRunning(state.running);
@@ -319,6 +322,9 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
     && activeSession?.sessionType === 'loop'
     && activeSession.loopControlMode === 'loop';
   const chatHydrationEnabled = sessionMetaReady && !automatedLoop;
+  const control = useLoopControl(sessionId, activeSession?.execKey,
+    sessionMetaReady && activeSession?.sessionType === 'loop' && isVisible);
+  const [loopViewRetry, setLoopViewRetry] = useState(0);
 
   const handleFocusLinkedFile = useCallback((relativePath: string) => {
     const workingDir = activeSession?.workingDir;
@@ -369,6 +375,18 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
     chatHydrationEnabled,
   );
   const historyKey = inputHistoryKey(currentUser, activeSession?.id === sessionId ? activeSession?.execKey : null, sessionId);
+  useEffect(() => {
+    if (!control.state.summary?.operation?.committed) return;
+    if (sessionMetaError || chat.hydrationError) control.viewReady(sessionMetaError || chat.hydrationError);
+    else if (!automatedLoop && sessionMetaReady && chat.hydratedSessionId === sessionId && !chat.isLoadingSession)
+      control.viewReady();
+  }, [control.state.summary?.controlRevision, control.state.phase, sessionMetaError, chat.hydrationError,
+      automatedLoop, sessionMetaReady, chat.hydratedSessionId, chat.isLoadingSession, sessionId]);
+  const handoffStatus = sessionId && activeSession?.sessionType === 'loop' ? <LoopControlStatus
+    sessionId={sessionId} execKey={activeSession?.execKey}
+    onQueue={() => window.dispatchEvent(new CustomEvent('awu:open-seq-tasks', { detail: { sessionId } }))}
+    onChat={() => { onFocusRef.current(); document.querySelector<HTMLElement>(`[data-session-tab-panel="${sessionId}"] .chat-textarea`)?.focus(); }}
+    onReload={() => { reloadSessionMetaRef.current(); chat.retryHydration(); setLoopViewRetry(value => value + 1); }} /> : null;
   // 仅复用当前 Session 已水合的用户消息；不为输入回看额外拉取聊天历史。
   const historySeed = useMemo(() => chat.hydratedSessionId === sessionId
     ? normalizeInputHistory(chat.messages.filter(message => message.role === 'user').map(message => message.content))
@@ -443,9 +461,11 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
   const [seqTasks, setSeqTasks] = useState<SeqTaskT[]>([]);
   const [seqQueueError, setSeqQueueError] = useState('');
   const [followUpCapabilities, setFollowUpCapabilities] = useState<FollowUpCapabilities>({
-    status: 'ok', queue: true, nativeSteer: false,
+    status: 'loading', queue: true, nativeSteer: false,
     interruptResume: false, steerAttachments: false,
   });
+  const [followUpRefresh, setFollowUpRefresh] = useState(0);
+  const hasPendingSeqTasks = seqTasks.some(task => task.status === 'pending' && !task.syncing);
   const [workspaceKitsOpen, setWorkspaceKitsOpen] = useState(false);
   useEffect(() => {
     if (!config.workspaceKitsEnabled) setWorkspaceKitsOpen(false);
@@ -459,16 +479,44 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
 
   useEffect(() => {
     let cancelled = false;
-    setFollowUpCapabilities({
-      status: 'ok', queue: true, nativeSteer: false,
+    let revision = 0;
+    const unavailable: FollowUpCapabilities = {
+      status: 'loading', queue: true, nativeSteer: false,
       interruptResume: false, steerAttachments: false,
+    };
+    setFollowUpCapabilities(unavailable);
+    if (!sessionId || !activeBackendId || !chatHydrationEnabled) return () => { cancelled = true; };
+    const refresh = () => {
+      const requestRevision = ++revision;
+      setFollowUpCapabilities(unavailable);
+      void api.getFollowUpCapabilities(sessionId).then((result) => {
+        if (cancelled || requestRevision !== revision) return;
+        setFollowUpCapabilities(result.status === 'ok' ? result : {
+          ...unavailable, status: 'error', message: result.message || '无法确认当前 Backend 的引导能力',
+        });
+      }).catch(() => {
+        if (!cancelled && requestRevision === revision) setFollowUpCapabilities({
+          ...unavailable, status: 'error', message: '引导能力查询失败，请重试',
+        });
+      });
+    };
+    // 订阅会立即给出连接初值；重连、调用边界及配置变化都重新查询，
+    // 不能把一次离线/加载失败永久缓存成“不支持”。旧连接响应不得恢复能力。
+    const unsubscribeConnection = api.onSessionConnectionStatus(sessionId, connected => {
+      if (connected) refresh();
+      else {
+        revision += 1;
+        setFollowUpCapabilities({ ...unavailable, status: 'error', message: '执行端离线，连接恢复后会重新确认引导能力' });
+      }
     });
-    if (!sessionId || !activeBackendId) return () => { cancelled = true; };
-    void api.getFollowUpCapabilities(sessionId).then((result) => {
-      if (!cancelled && result.status === 'ok') setFollowUpCapabilities(result);
-    });
-    return () => { cancelled = true; };
-  }, [sessionId, activeBackendId]);
+    const unsubscribeBackend = activeSession?.execKey
+      ? backendCatalog.subscribe(activeSession.execKey, event => {
+        if (!event.backendId || event.backendId === activeBackendId) refresh();
+      })
+      : () => {};
+    return () => { cancelled = true; unsubscribeConnection(); unsubscribeBackend(); };
+  }, [sessionId, activeBackendId, activeSession?.execKey, activeSession?.codexConnectionMode,
+    activeSession?.codexRemoteHost, chatHydrationEnabled, chat.isStreaming, hasPendingSeqTasks, followUpRefresh]);
 
   useEffect(() => {
     let cancelled = false;
@@ -800,6 +848,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
   //   避免「聊天框 vs 面板」双入口、以及聊天与 loop 主线共用 agent 上下文的污染。
   if (!sessionMetaReady) {
     return <div className="awu-chat-pane" style={paneRootStyle} onClick={onFocus}>
+      {handoffStatus}
       <div role={sessionMetaError ? 'alert' : 'status'} style={{ padding: 20, color: 'var(--theme-text-muted)', fontSize: 13 }}>
         <div>{sessionMetaError ? '无法恢复会话' : '正在读取会话信息…'}</div>
         {sessionMetaError && <>
@@ -825,8 +874,10 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
           background: 'transparent',
         }}
       >
+        {handoffStatus}
         {nodeBackendsError && <div role="alert" style={{ padding: 8, color: '#f85149', fontSize: 12 }}>{nodeBackendsError}</div>}
         <LoopPanel
+          key={`${sessionId}:${loopViewRetry}`}
           onRefreshBackends={refreshBackends}
           sessionId={sessionId}
           embedded
@@ -879,6 +930,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
       }}
     >
       <TokenUsageMonitor sessionId={sessionId} placement="floating" />
+      {handoffStatus}
       {nodeBackendsError && <div role="alert" style={{ padding: 8, color: '#f85149', fontSize: 12 }}>{nodeBackendsError}</div>}
       {/* ---- 消息列表 ---- */}
       <div style={{ flex: 1, position: 'relative', overflow: 'hidden' }}>
@@ -1118,6 +1170,8 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
           onSendNext={() => void setSequenceAuto(true)}
           onPause={() => void setSequenceAuto(false)}
           canSteer={chat.isStreaming && followUpCapabilities.nativeSteer}
+          steerCapabilityError={followUpCapabilities.status === 'error' ? followUpCapabilities.message : undefined}
+          onRefreshSteerCapabilities={() => setFollowUpRefresh(value => value + 1)}
           onSteerTask={handleSteerSeqTask}
           onTasksChange={(tasks) => setSeqTasks((current) => mergeAuthoritativeSeqTasks(tasks, current))}
         />

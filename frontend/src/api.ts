@@ -23,6 +23,9 @@ import { rankFileSearchPaths } from './utils/fileSearch';
 import { mergeExecutorSessionBatches, selectExactExecutor } from './utils/executorSessions';
 import { executeWorkspaceRequest, type WorkspaceToolRequest, type WorkspaceNode } from './utils/workspaceTools';
 import { inputHistoryKey, inputHistoryStore } from './utils/inputHistory';
+import { LoopControlStore, controlKey, type ControlTarget, type ControlSummary } from './utils/loopControl';
+import { LoopControlTransport, requestWithReadiness } from './utils/loopControlTransport';
+import { uuid } from './utils/uuid';
 
 type StreamDeltaCallback = (delta: any) => void;
 type SessionUpdateCallback = (data: any) => void;
@@ -967,9 +970,16 @@ function handleMessage(e: MessageEvent, source?: Conn) {
       }
     } else if (msg.event === 'loopUpdated') {
       const data = JSON.parse(msg.data);
+      if (source && sessionExec.get(data.sessionId) !== source.key) return;
+      if (source && data.controlProtocolVersion === 1) {
+        loopControls.receive(loopControlTarget(data.sessionId, source.key), {
+          ...data, protocolVersion: 1, eligibility: data.controlEligibility, operation: data.controlOperation,
+        });
+      }
       if (data.sessionId && (data.controlMode === 'manual' || data.controlMode === 'loop')) {
         sessionRoutingCache.update(data.sessionId, {
           sessionType: 'loop', loopControlMode: data.controlMode, loopRunning: data.running === true,
+          controlRevision: data.controlRevision,
         });
       }
       loopUpdatedCallbacks.forEach((cb) => cb(data));
@@ -1936,23 +1946,42 @@ async function callOnStrict(
   timeoutMs?: number,
 ): Promise<any> {
   const connection = connByKey(execKey);
-  const started = Date.now();
-  let readyTimer: ReturnType<typeof setTimeout> | undefined;
-  try {
-    await Promise.race([
-      connection.ready,
-      new Promise<never>((_, reject) => {
-        readyTimer = setTimeout(() => reject(new Error('执行端连接超时，请重试')), timeoutMs || 15000);
-      }),
-    ]);
-  } finally {
-    if (readyTimer) clearTimeout(readyTimer);
-  }
-  if (!connection.isOpen) {
-    throw new Error('执行端离线，请恢复连接后重试');
-  }
-  return connection.request(method, params, timeoutMs ? Math.max(1, timeoutMs - (Date.now() - started)) : undefined);
+  return requestWithReadiness(connection, method, params, timeoutMs);
 }
+
+export function loopControlTarget(session: string, executor?: string): ControlTarget {
+  const profile = getCurrentUserProfile();
+  return { user: `${profile.mode}:${connectionTarget.mode === 'relay' ? connectionTarget.url : ''}:${profile.userId}`,
+    executor: executor || getSessionExecKey(session) || '', session };
+}
+
+const controlTransport = new LoopControlTransport({ target: loopControlTarget, call: callOnStrict,
+  current: target => loopControls.get(target) });
+
+export const loopControls: LoopControlStore = new LoopControlStore({
+  get: (target, requestId) => controlTransport.read(target, requestId),
+  requestId: uuid,
+  restore: target => {
+    try { return JSON.parse(sessionStorage.getItem(`awu.loopControl:${controlKey(target)}`) || 'null'); }
+    catch { return null; }
+  },
+  remember: (target, view) => {
+    try {
+      const key = `awu.loopControl:${controlKey(target)}`;
+      if (['succeeded', 'failed', 'blocked'].includes(view.phase)) sessionStorage.removeItem(key);
+      else if (view.requestId) sessionStorage.setItem(key, JSON.stringify({ requestId: view.requestId, action: view.action, since: view.since }));
+    } catch { /* 仅保留最小身份，不保存 goal、消息或授权。 */ }
+  },
+  request: (target, input, legacy): Promise<ControlSummary> => controlTransport.request(target, input, legacy),
+  apply: (target, summary) => {
+    if (getSessionExecKey(target.session) !== target.executor || loopControlTarget(target.session).user !== target.user) return;
+    const previous = sessionRoutingCache.get(target.session);
+    if (previous?.loopControlMode === summary.controlMode && previous?.controlRevision === summary.controlRevision) return;
+    const updated = sessionRoutingCache.update(target.session, { sessionType: 'loop', loopControlMode: summary.controlMode,
+      controlRevision: summary.controlRevision, execKey: target.executor });
+    sessionUpdateCallbacks.forEach(callback => callback({ type: 'session_changed', sessionId: target.session, summary: updated }));
+  },
+});
 
 async function marketBackgroundCall(
   method: string, params: any[], onProgress?: (text: string) => void, signal?: AbortSignal,
@@ -2501,7 +2530,7 @@ export const api = {
     try { return JSON.parse(result); } catch { return { status: 'error', message: '响应格式错误' }; }
   },
 
-  async convertSessionToLoop(sessionId: string, goal: string): Promise<{
+  async convertSessionToLoop(sessionId: string, goal: string, workflowCommand = '', workflowDigest = ''): Promise<{
     status: string;
     sessionType?: 'loop';
     stage?: string;
@@ -2510,7 +2539,7 @@ export const api = {
     alreadyConverted?: boolean;
     message?: string;
   }> {
-    const result = await call('convertSessionToLoop', sessionId, goal);
+    const result = await call('convertSessionToLoop', sessionId, goal, workflowCommand, workflowDigest);
     if (result === null || result === undefined) return { status: 'error', message: '无法连接到执行节点' };
     try { return JSON.parse(result); } catch { return { status: 'error', message: '转换响应格式错误' }; }
   },
@@ -2737,6 +2766,21 @@ export const api = {
   // ── 可视化 Loop 集成 ────────────────────────────────────────
   async loopTaskSourceDiscover(sessionId: string): Promise<LoopSourceResponse> {
     return JSON.parse(await call('loopTaskSourceDiscover', sessionId));
+  },
+  async loopExecutionEnvironmentGet(sessionId: string, execKey?: string): Promise<import('./types/loopEnvironment').EnvironmentResponse> {
+    const target = execKey || sessionExec.get(sessionId);
+    if (!target) throw new Error('Session 的执行节点未知，请刷新后重试');
+    return JSON.parse(await callOnStrict(target, 'loopExecutionEnvironmentGet', [sessionId], 15000));
+  },
+  async loopExecutionEnvironmentCheck(sessionId: string, revision: number, execKey?: string): Promise<import('./types/loopEnvironment').EnvironmentResponse> {
+    const target = execKey || sessionExec.get(sessionId);
+    if (!target) throw new Error('Session 的执行节点未知，请刷新后重试');
+    return JSON.parse(await callOnStrict(target, 'loopExecutionEnvironmentCheck', [sessionId, revision], 45000));
+  },
+  async loopExecutionEnvironmentSelectWorkflow(sessionId: string, command: string, digest: string, revision: number, execKey?: string): Promise<import('./types/loopEnvironment').EnvironmentResponse> {
+    const target = execKey || sessionExec.get(sessionId);
+    if (!target) throw new Error('Session 的执行节点未知，请刷新后重试');
+    return JSON.parse(await callOnStrict(target, 'loopExecutionEnvironmentSelectWorkflow', [sessionId, command, digest, revision], 15000));
   },
   async loopTaskSourceGet(sessionId: string): Promise<LoopSourceResponse> {
     return JSON.parse(await call('loopTaskSourceGet', sessionId));

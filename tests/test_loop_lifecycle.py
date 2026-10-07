@@ -2,7 +2,7 @@ import asyncio
 import json
 import unittest
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, AsyncMock, patch
 
 from src.backend.bridge_ws import BridgeWS, _LoopAgentStalledError
 from src.backend.loop_store import (
@@ -15,6 +15,7 @@ from src.backend.loop_store import (
     SUB_PREPARE,
 )
 from src.types import ChatMessage
+from src.backend.loop_control_snapshot import SnapshotResult
 
 
 class LoopLifecycleTests(unittest.IsolatedAsyncioTestCase):
@@ -34,6 +35,8 @@ class LoopLifecycleTests(unittest.IsolatedAsyncioTestCase):
         bridge._loop_states = {state.session_id: state}
         bridge._loop_state = lambda sid: bridge._loop_states.get(sid)
         bridge._loop_save = Mock()
+        bridge._loop_store = SimpleNamespace(save_frozen=Mock())
+        bridge._require_session_access = Mock()
         bridge._emit_loop_updated = Mock()
         bridge._loop_history_brief = lambda *_args, **_kwargs: ""
         bridge._loop_running = set()
@@ -172,6 +175,7 @@ class LoopLifecycleTests(unittest.IsolatedAsyncioTestCase):
         session = SimpleNamespace(
             id=sid,
             messages=[SimpleNamespace(streaming=True)],
+            session_type='loop', working_dir=None, backend_id='fake', agent_session_id='',
         )
         bridge = BridgeWS.__new__(BridgeWS)
         bridge._loop_states = {sid: state}
@@ -182,9 +186,15 @@ class LoopLifecycleTests(unittest.IsolatedAsyncioTestCase):
         bridge._chat_extras_get = lambda _sid: SimpleNamespace(pending=lambda: [object()])
         bridge._sync_manual_loop_record = Mock()
         bridge._loop_save = Mock()
+        bridge._loop_store = SimpleNamespace(save_frozen=Mock())
+        bridge._require_session_access = Mock()
+        bridge._resolved_runtime = Mock(return_value={})
+        bridge._session_runtime = Mock(return_value={})
         bridge._emit_loop_updated = Mock()
 
-        result = json.loads(bridge._rpc_loopRelease(sid))
+        with patch('src.backend.loop_control_bridge.snapshot_handoff', new_callable=AsyncMock,
+                   return_value=SnapshotResult()):
+            result = json.loads(await bridge._rpc_loopRelease(sid))
 
         self.assertEqual(result["status"], "ok")
         self.assertEqual(state.control_mode, "loop")
@@ -211,8 +221,9 @@ class LoopLifecycleTests(unittest.IsolatedAsyncioTestCase):
         bridge._session_runtime = Mock(return_value={})
         bridge._mirror_loop_control_mode = Mock()
 
-        with patch("src.backend.bridge_ws.git_snapshot", return_value="checkpoint"):
-            result = json.loads(bridge._rpc_loopTakeover(sid, "human follow-up goal"))
+        with patch('src.backend.loop_control_bridge.snapshot_handoff', new_callable=AsyncMock,
+                   return_value=SnapshotResult(git='checkpoint')):
+            result = json.loads(await bridge._rpc_loopTakeover(sid, "human follow-up goal"))
 
         self.assertEqual(result["status"], "ok")
         self.assertEqual(result["controlMode"], "manual")
@@ -229,9 +240,9 @@ class LoopLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(manual.seq, 8)
         self.assertEqual(manual.manual_context, "round 3 output digest")
         self.assertEqual(manual.backends["execute"], "qwen-enterprise")
-        bridge._loop_save.assert_called_once_with(state)
+        self.assertTrue(bridge._loop_store.save_frozen.called)
         bridge._mirror_loop_control_mode.assert_called_once_with(session, "manual")
-        bridge._emit_loop_updated.assert_called_once_with(state)
+        self.assertEqual(bridge._emit_loop_updated.call_args.args, (state,))
 
     async def test_manual_release_obeys_authoritative_running_task(self) -> None:
         sid = "manual-real-running"
@@ -242,16 +253,17 @@ class LoopLifecycleTests(unittest.IsolatedAsyncioTestCase):
             control_mode="manual",
             loops=[record],
         )
-        session = SimpleNamespace(id=sid, messages=[])
+        session = SimpleNamespace(id=sid, messages=[], session_type='loop')
         bridge = BridgeWS.__new__(BridgeWS)
         bridge._loop_state = lambda _sid: state
         bridge._active_sessions = {sid: session}
         bridge._session_store = SimpleNamespace(load=lambda _sid: session)
+        bridge._require_session_access = Mock()
         release = asyncio.Event()
         task = asyncio.create_task(release.wait())
         bridge._chat_turn_tasks = {sid: {task}}
 
-        result = json.loads(bridge._rpc_loopRelease(sid))
+        result = json.loads(await bridge._rpc_loopRelease(sid))
 
         self.assertEqual(result["status"], "error")
         self.assertIn("仍在生成", result["message"])
@@ -533,6 +545,7 @@ class LoopLifecycleTests(unittest.IsolatedAsyncioTestCase):
         backend = SilentBackend()
         bridge = BridgeWS.__new__(BridgeWS)
         bridge._loop_active_backends = {}
+        bridge._loop_state = lambda _sid: None
         bridge._new_backend_instance = lambda _backend_id: backend
         bridge._build_session_reference_context = lambda prompt, _sid: prompt
         bridge._emit_loop_progress = Mock()

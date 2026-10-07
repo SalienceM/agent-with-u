@@ -399,6 +399,53 @@ or from one denied user-file read; real authorization/safety blockers still paus
 Historical next-focus notes are not permanent priority locks when a newer explicit
 user disposition changes scheduling; unresolved losses and acceptance remain visible.
 
+**LOOP control handoff.** `loop_control_bridge.py` owns the shared eligibility,
+bounded receipts and session-local reservation for `loopControlGet/Request`.
+Accepted is not committed: only the ordered stage-file commit changes ownership,
+round and manual record. `loop_control_snapshot.py` gates an owned helper before
+snapshot I/O; timeout or unconfirmed cleanup retains the reservation. Frozen builds
+enter through `--agentwithu-control-snapshot` before server/log initialization.
+`OrderedLoopWrites` merges concurrent Addon/aside saves without restoring stale
+control fields. Its owned write also installs committed fields on the event loop;
+cancelling the waiter cannot skip that merge. Recovery must check outstanding writes
+before declaring interruption or releasing a reservation. Session metadata is a
+repairable mirror, never transaction authority. Index writers serialize separately
+from the short-lived memory lock, freezing after acquiring the write lock; disk I/O
+must not hold the memory lock used by handoff mirrors and lightweight reads.
+Legacy takeover/release adapters still await terminal results. Release never schedules
+models/queues or enables Auto. The frontend shares per-user/executor/session feedback
+across menus, panel/flow and chat; strict 12-second waits include connection readiness.
+Unknown outcomes trigger one coalesced read, not write retry or polling. View hydration
+failure has its own read-only retry. Timeout and hydration guards must match the active
+request identity and phase, never a previous committed receipt. Never clear a reservation just because the UI
+timed out, a worker task was cancelled, or the in-memory registry disappeared.
+
+**LOOP execution environment.** `loop_execution_environment.py` and
+`loop_environment_bridge.py` keep bounded evidence separate from task acceptance.
+`loop_environment_workflow.py` revalidates explicit Skill/command declarations;
+installed or bound Skills alone never require a CLI or bind an OpenSpec change.
+Automatic calls and explicit checks share actual backend/cwd/access identities.
+`codex_environment.py` supports only verified executor-local Windows app-server
+profiles (currently Codex 0.154.0): fixed read-only checks, no model requests,
+10-second commands/30-second flow, native 1 MiB capture per stream but AWU accepts
+only complete results strictly below 32 KiB. A single reader and probe-only pre-decode
+frame limit bound checks; formal thread/turn responses and events retain 128 MiB.
+Windows has no command/exec terminate; owned Job
+and process handles in `owned_process_tree.py` confirm cleanup, retaining activity
+when exit is unknown. Never clear that lock merely because cancellation was sent.
+Confirmed pre-spawn OS failures create no orphan lock; an absent process reference
+alone never proves this. All delayed preflight outcomes are history-only when stale,
+including timeout/cancel and final notifications; real unconfirmed cleanup still locks.
+`native_policy` is partial coverage, not actual helper equivalence; actual-tool
+faults cannot be cleared by weaker probes or manual success. Environment waits do
+not fabricate model errors or erase normal-call/blocked-task evidence.
+Get/Check/SelectWorkflow RPCs enforce owner/executor/revision/idle boundaries;
+checks neither enable Auto nor resume work. Unknown/offline executor routing fails
+without fallback. `LoopExecutionEnvironment.tsx` is shared by panel/flow, with lazy
+details and no polling. No automatic install, PATH/ACL change or permission escape.
+See `docs/loop-adaptive-delivery.md`; opt-in native tests use isolated homes and a
+loopback fake provider, never production Sessions or paid model requests.
+
 **俺寻思 (global attention sidecar).** A single App-topbar entry opens the App-level
 `ThoughtsAssistant`; ordinary Session and Loop headers deliberately expose no duplicate
 entry. Questions still go through

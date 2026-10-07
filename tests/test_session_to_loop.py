@@ -6,6 +6,7 @@ from unittest.mock import Mock
 from src.backend.bridge_ws import BridgeWS
 from src.backend.loop_store import STAGE_EXECUTE
 from src.types import ChatMessage, Session
+from src.backend.loop_environment_workflow import workflow_choices
 
 
 def _session() -> Session:
@@ -37,6 +38,33 @@ def _bridge(session: Session) -> BridgeWS:
 
 
 class SessionToLoopTests(unittest.TestCase):
+    def test_conversion_explicit_dependency_is_not_source_or_execution_authorization(self):
+        session = _session()
+        session.abilities = {'skills': ['openspec-apply-change']}
+        session.messages[0].content = '历史 token=never-copy /opsx-archive'
+        bridge = _bridge(session)
+        bridge._skill_store = SimpleNamespace(
+            command_sources=lambda: {'installed': ['openspec-apply-change'], 'profiles': []},
+            get_skill=lambda name: {'content': 'instructions'} if name == 'openspec-apply-change' else None)
+        choice = workflow_choices(session, bridge._skill_store)[0]
+        result = json.loads(bridge._rpc_convertSessionToLoop(session.id, 'goal', choice['command'], choice['digest']))
+        self.assertEqual(result['status'], 'ok')
+        state = bridge._loop_states[session.id]
+        self.assertEqual(state.execution_environment['workflowRef']['skillId'], 'openspec-apply-change')
+        self.assertNotIn('never-copy', json.dumps(state.execution_environment))
+        self.assertEqual(state.task_source, {})
+        self.assertFalse(state.auto)
+        self.assertEqual(state.loops, [])
+
+    def test_conversion_never_infers_dependency_from_bound_skill_or_history(self):
+        session = _session()
+        session.abilities = {'skills': ['openspec-apply-change']}
+        session.messages[0].content = '/opsx-apply old-change'
+        session.messages[0].workflow_ref = {'skillId': 'openspec-apply-change'}
+        bridge = _bridge(session)
+        self.assertEqual(json.loads(bridge._rpc_convertSessionToLoop(session.id, 'new goal'))['status'], 'ok')
+        self.assertFalse(bridge._loop_states[session.id].execution_environment.get('workflowRef'))
+
     def test_conversion_requires_an_explicit_goal(self) -> None:
         session = _session()
         bridge = _bridge(session)

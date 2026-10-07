@@ -35,12 +35,15 @@ interface Props {
   onSendNext: () => void;
   onPause?: () => void;
   canSteer?: boolean;
+  steerCapabilityError?: string;
+  onRefreshSteerCapabilities?: () => void;
   onSteerTask?: (taskId: string) => Promise<{ status: string; message?: string }>;
   onTasksChange?: (tasks: SeqTaskT[]) => void;
 }
 
 export const SeqTaskPanel: React.FC<Props> = ({
-  sessionId, tasks, chainActive, queueError, isStreaming, onSendNext, onPause, canSteer, onSteerTask, onTasksChange,
+  sessionId, tasks, chainActive, queueError, isStreaming, onSendNext, onPause, canSteer,
+  steerCapabilityError, onRefreshSteerCapabilities, onSteerTask, onTasksChange,
 }) => {
   const pending = tasks.filter((t) => ['pending', 'steering', 'error'].includes(t.status));
   const running = tasks.some((t) => t.status === 'running');
@@ -282,6 +285,14 @@ export const SeqTaskPanel: React.FC<Props> = ({
 
       {mutationError && <div style={mutationErrorStyle}>⚠ {mutationError}</div>}
       {queueError && <div style={mutationErrorStyle}>⚠ {queueError}</div>}
+      {steerCapabilityError && pending.length > 0 && (
+        <div style={mutationErrorStyle}>
+          引导能力暂未确认：{steerCapabilityError}。待发消息仍保留在队列中。
+          {onRefreshSteerCapabilities && (
+            <button onClick={onRefreshSteerCapabilities} style={tinyGhost}>重新检查引导能力</button>
+          )}
+        </div>
+      )}
 
       {/* 收起时也给出自动队列状态，避免用户误以为新输入丢失。 */}
       {(pending.length > 0 || running || chainActive === false) && (

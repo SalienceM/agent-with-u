@@ -1,5 +1,11 @@
 export function mergeSessionRouting(current: any, incoming: any): any {
   const merged = { ...current, ...incoming };
+  if (typeof current?.controlRevision === 'number'
+      && (typeof incoming?.controlRevision !== 'number' || incoming.controlRevision < current.controlRevision)) {
+    merged.loopControlMode = current.loopControlMode;
+    merged.controlRevision = current.controlRevision;
+    return merged;
+  }
   if (incoming?.loopControlMode !== 'manual' && incoming?.loopControlMode !== 'loop') {
     merged.loopControlMode = current?.loopControlMode;
   }

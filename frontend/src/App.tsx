@@ -1,5 +1,7 @@
 import React, { useState, useCallback, useEffect, useRef, useMemo, useReducer } from 'react';
 import { FileTransferCenter } from './components/FileTransferCenter';
+import { useLoopControl } from './hooks/useLoopControl';
+import { mergeSessionRouting } from './utils/sessionRouting';
 import { backendCatalog } from './backendCatalog';
 import { saveAndVerifyBackend } from './utils/codexModelOptions';
 import {
@@ -125,7 +127,6 @@ export const App: React.FC = () => {
   const [manualPanelOpen, setManualPanelOpen] = useState(false);
   const [manualLoopMenuOpen, setManualLoopMenuOpen] = useState(false);
   const [manualLoopInspectorOpen, setManualLoopInspectorOpen] = useState(false);
-  const [manualLoopReleaseBusy, setManualLoopReleaseBusy] = useState(false);
   const [moreMenuOpen, setMoreMenuOpen] = useState(false);
   const [thoughtsOpen, setThoughtsOpen] = useState(false);
   const [thoughtsDetached, setThoughtsDetached] = useState(false);
@@ -296,6 +297,8 @@ export const App: React.FC = () => {
   const activeManualLoop = activeSession?.id === activeSessionId
     && activeSession?.sessionType === 'loop'
     && activeSession?.loopControlMode === 'manual';
+  const manualControl = useLoopControl(activeSessionId, activeSession?.execKey, false);
+  const manualLoopReleaseBusy = manualControl.busy;
 
   // 顶栏弹层遵循标准菜单交互：切换焦点会话、点击外部或按 Esc 都立即收起。
   useEffect(() => {
@@ -840,10 +843,10 @@ export const App: React.FC = () => {
       if (state.controlMode === 'manual' || state.controlMode === 'loop') {
         const loopControlMode = state.controlMode === 'manual' ? 'manual' : 'loop';
         setSessions((previous) => previous.map((session) => (
-          session.id === sid ? { ...session, loopControlMode } : session
+          session.id === sid ? mergeSessionRouting(session, { loopControlMode, controlRevision: state.controlRevision }) : session
         )));
         setActiveSession((previous: any) => (
-          previous?.id === sid ? { ...previous, loopControlMode } : previous
+          previous?.id === sid ? mergeSessionRouting(previous, { loopControlMode, controlRevision: state.controlRevision }) : previous
         ));
       }
     });
@@ -851,37 +854,8 @@ export const App: React.FC = () => {
 
   const handleReleaseManualLoop = useCallback(async () => {
     if (!activeSessionId || !activeManualLoop || manualLoopReleaseBusy) return;
-    const releasingSessionId = activeSessionId;
-    setManualLoopReleaseBusy(true);
-    try {
-      // 本地渲染状态可能在异常中断或 Relay 重连后滞后，交还前始终询问执行节点。
-      const runState = await api.getSessionRunState(releasingSessionId);
-      if (runState.busy) {
-        showToast('error', runState.status === 'offline'
-          ? '执行节点当前离线，暂时无法确认是否可交还 LOOP'
-          : '回答仍在生成，结束或停止后才能交还 LOOP');
-        return;
-      }
-      const result = await api.loopRelease(releasingSessionId);
-      if (result.status !== 'ok') {
-        showToast('error', result.message || '交还 LOOP 失败');
-        return;
-      }
-      setActiveSession((previous: any) => (
-        previous?.id === releasingSessionId ? { ...previous, loopControlMode: 'loop' } : previous
-      ));
-      setSessions((previous) => previous.map((session) => (
-        session.id === releasingSessionId ? { ...session, loopControlMode: 'loop' } : session
-      )));
-      if (activeSessionIdRef.current === releasingSessionId) {
-        setManualLoopMenuOpen(false);
-        setManualLoopInspectorOpen(false);
-      }
-      showToast('success', '已交还 LOOP');
-    } finally {
-      setManualLoopReleaseBusy(false);
-    }
-  }, [activeManualLoop, activeSessionId, manualLoopReleaseBusy, showToast]);
+    await manualControl.request('release');
+  }, [activeManualLoop, activeSessionId, manualLoopReleaseBusy, manualControl.request]);
 
   // ★ 全局监听所有 session 的显式 done
   // 修正两个 bug：
@@ -1654,7 +1628,7 @@ export const App: React.FC = () => {
                     </button>
                     <button
                       type="button"
-                      disabled={manualLoopReleaseBusy}
+                      disabled={manualLoopReleaseBusy || !manualControl.state.summary?.eligibility.release.allowed}
                       onClick={() => void handleReleaseManualLoop()}
                       style={{
                         ...topbarMenuActionStyle,
@@ -1665,9 +1639,23 @@ export const App: React.FC = () => {
                       title="检查真实运行状态后，封存人工操作并返回 LOOP"
                     >
                       <span style={topbarMenuActionIconStyle}>↩</span>
-                      <span style={topbarMenuActionCopyStyle}><strong>{manualLoopReleaseBusy ? '交还中…' : '交还 LOOP'}</strong><small>结束人工接管并恢复自动流程</small></span>
+                      <span style={topbarMenuActionCopyStyle}><strong>{manualLoopReleaseBusy ? '交还中…' : '交还 LOOP'}</strong>
+                        <small>封存人工轮并返回 LOOP；不会自动运行</small>
+                        {!manualControl.state.summary?.eligibility.release.allowed && <small>
+                          {manualControl.state.summary?.eligibility.release.message || manualControl.state.error || '正在核对交还条件…'}
+                        </small>}
+                      </span>
                     </button>
                   </div>
+                  {['chat', 'queue'].includes(manualControl.state.summary?.eligibility.release.nextStep || '') && <button
+                    type="button" style={topbarMenuActionStyle} onClick={() => {
+                      setManualLoopMenuOpen(false);
+                      if (manualControl.state.summary?.eligibility.release.nextStep === 'queue')
+                        window.dispatchEvent(new CustomEvent('awu:open-seq-tasks', { detail: { sessionId: activeSession?.id } }));
+                      else document.querySelector<HTMLElement>(`[data-session-tab-panel="${activeSession?.id}"] .chat-textarea`)?.focus();
+                    }}>
+                    {manualControl.state.summary?.eligibility.release.nextStep === 'queue' ? '查看队列' : '返回聊天'}
+                  </button>}
                 </div>
               )}
             </div>

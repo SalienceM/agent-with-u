@@ -249,6 +249,9 @@ export function useChat(
   // 层什么时候已经完成目标 session 的权威历史水合。
   const [resolvedSessionId, setResolvedSessionId] = useState(sessionId);
   const [hydratedSessionId, setHydratedSessionId] = useState('');
+  const [hydrationError, setHydrationError] = useState('');
+  const [hydrationRetry, setHydrationRetry] = useState(0);
+  const retryHydration = useCallback(() => setHydrationRetry(value => value + 1), []);
 
   // 累积器 refs - 用于本地快速访问，实际状态存储在全局 StreamState
   const textRef = useRef('');
@@ -290,6 +293,7 @@ export function useChat(
 
   // ── 加载 session ──
   useEffect(() => {
+    setHydrationError('');
     if (!sessionId || !hydrationEnabled) {
       // session 被删除或未选中 → 清空聊天区
       setMessages([]);
@@ -379,6 +383,7 @@ export function useChat(
     const initialLimit = Math.max(INITIAL_LOAD_LIMIT, cachedHistory?.length ?? 0);
     api.loadSession(sessionId, initialLimit).then((session) => {
       if (cancelled) return;
+      if (!session || !Array.isArray(session.messages)) throw new Error('聊天记录加载失败，请重试读取');
       if (session?.messages) {
         let loadedMessages = normalizeMessages(session.messages);
         const loadedStreaming = [...loadedMessages].reverse().find(
@@ -457,9 +462,11 @@ export function useChat(
       if (session?.autoContinue !== undefined) {
         setAutoContinue(session.autoContinue);
       }
+      setHydratedSessionId(sessionId);
+    }).catch((error: unknown) => {
+      if (!cancelled) setHydrationError(error instanceof Error ? error.message : '聊天记录加载失败');
     }).finally(() => {
       if (!cancelled) {
-        setHydratedSessionId(sessionId);
         setIsLoadingSession(false);
       }
     });
@@ -481,7 +488,7 @@ export function useChat(
         sessionHistoryCache.set(sessionId, finalized);
       }
     };
-  }, [sessionId, hydrationEnabled, syncFromGlobalState]);
+  }, [sessionId, hydrationEnabled, syncFromGlobalState, hydrationRetry]);
 
   // ── sessionUpdated 监听（compact 等后端操作完成后重载）──
   useEffect(() => {
@@ -1374,6 +1381,8 @@ export function useChat(
     isLoadingSession,
     resolvedSessionId,
     hydratedSessionId,
+    hydrationError,
+    retryHydration,
     // ★ 序列任务直接派发用：跳过斜杠命令拦截，仅在非流式时发送（doSend 自带 isStreaming 守卫）
     doSend,
   };

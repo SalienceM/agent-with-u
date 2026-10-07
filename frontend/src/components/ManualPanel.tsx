@@ -84,7 +84,7 @@ const SECTIONS: ManualSection[] = [
       { icon: '🔁', title: '普通 Session 转 LOOP', summary: '保留原会话的聊天记录、Backend、工作目录和原生 Agent 上下文，制定全局目标后直接进入 Execute；转换完成后由你手动开始第一轮。', entry: '侧栏右键普通 Session → 转为 LOOP', tips: '运行中的会话需先等待当前回答结束。' },
       { icon: '💡', title: 'Idea 构想阶段', summary: '并行扩展多个想法，支持文字和图片。封存后综合成全局目标，原始诉求仍保留可追溯。', entry: '新建 Loop 会话 → Idea' },
       { icon: '▶', title: 'Execute 迭代', summary: '每轮都是对完整目标的一次最佳尝试，依次进行 Prepare、Execute、Analysis；步骤可串行或并行。', entry: 'Loop 面板 → 开始本轮' },
-      { icon: '✋', title: '人工接管', summary: 'LOOP 完全停止且没有待恢复的半截任务时，可切到普通会话亲自接管。人工对话、工具调用和操作步骤会保存为一轮 Manual LOOP，回答结束后可交还自动 LOOP。', entry: 'Loop Execute 操作区 → 人工接管', tips: '运行中不能切换；先暂停 Auto，等待本轮完成。' },
+      { icon: '✋', title: '人工接管与交还', summary: 'LOOP 空闲、断点已处理且旧调用已退出时，可接管；loopout 可开启人工轮。确认后状态条持续显示快照、记录整理和提交阶段。人工对话与操作保留为 Manual LOOP，空人工轮交还时不占记录。', entry: 'LOOP 面板 / 流程 → 人工接管；人工聊天顶栏 Manual LOOP → 交还 LOOP', tips: '接管会关闭 Auto；交还只切回面板，不自动运行。运行中不能强制接管。超时或断线请检查状态，不要盲目重发；已切换但界面加载失败时只重试加载。旧执行端仅支持基本状态核对。' },
       { icon: '◎', title: '独立评审', summary: '可用不同模型独立评分执行结果，降低执行者自评过高的问题；得分、风险和趋势决定是否继续。', entry: 'Loop → 策略与心智' },
       { icon: '⚙', title: '策略与心智', summary: '设置交付分、输出分、最大轮数、风险阈值、执行/评审模型和强制遵循的策略。支持预设。', entry: 'Loop 面板 → ⚙ 策略与心智' },
       { icon: '📎', title: 'Addon 执行中补充', summary: '运行期间追加文字或图片要求，不影响当前轮，从下一轮 Prepare 开始吸收；已应用内容保留历史。', entry: 'Loop Execute 阶段 → Addon' },

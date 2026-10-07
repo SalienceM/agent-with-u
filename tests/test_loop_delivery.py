@@ -326,6 +326,8 @@ class DeliveryIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([call['execution_access'] for call in captured], ['read-only', 'workspace-write', 'read-only'])
         for call in captured:
             self.assertIn('请求原生沙箱 ' + call['execution_access'], call['constraints'])
+            self.assertEqual(call['execution_identity'].access, call['execution_access'])
+            self.assertEqual(call['execution_identity'].workspace, call['working_dir'])
         self.assertIn('当前只负责只读核实并产出计划', captured[0]['constraints'])
         self.assertNotIn('当前只负责只读核实并产出计划', captured[1]['constraints'])
         self.assertNotIn('当前只负责只读核实并产出计划', captured[2]['constraints'])
@@ -341,6 +343,7 @@ class DeliveryIntegrationTests(unittest.IsolatedAsyncioTestCase):
         await bridge._loop_run_agent(session, 'idea', 'idea', 0, resume=False)
         self.assertNotIn('【本次 LOOP 调用范围', calls[0]['constraints'])
         self.assertNotIn('execution_access', calls[0])
+        self.assertNotIn('execution_identity', calls[0])
 
     async def test_real_execution_wrapper_retains_sequential_context_and_constraints(self):
         calls = []

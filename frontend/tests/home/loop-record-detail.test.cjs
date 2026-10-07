@@ -18,6 +18,21 @@ test('plan retry and degradation invalidate the audit detail cache', () => {
     stageDetails: { prepare: { status: 'retrying', attemptCount: 2 } } }));
 });
 
+test('environment evidence revisions refresh selected detail; full bodies and identical pushes do not', () => {
+  const current = { ...record, environmentChecks: [{ id: 'env', revision: 3, status: 'passed' }] };
+  assert.notEqual(loopRecordRevision(current), loopRecordRevision({ ...current,
+    environmentChecks: [{ id: 'env-new', revision: 4, status: 'blocked' }] }));
+  assert.equal(loopRecordRevision(current), loopRecordRevision({ ...current,
+    environmentChecks: [{ id: 'older', revision: 2, status: 'passed' }, { ...current.environmentChecks[0], entry: 'body' }] }));
+});
+
+test('stale cleanup evidence refreshes history without a current environment revision change', () => {
+  const current = { ...record, environmentChecks: [{ id: 'late', revision: 1, status: 'stale', quiesced: false }] };
+  const cleaned = { ...current, environmentChecks: [{ ...current.environmentChecks[0], revision: 2, quiesced: true }] };
+  assert.notEqual(loopRecordRevision(current), loopRecordRevision(cleaned));
+  assert.equal(loopRecordRevision(cleaned), loopRecordRevision(JSON.parse(JSON.stringify(cleaned))));
+});
+
 test('new decisions, source revisions and milestone summaries invalidate but bodies do not', () => {
   const current = { ...record, outcomeVersion: 1, terminalKind: 'paused', decision: { decisionId: 'a', revision: 1 },
     sourceSummary: { before: { scopeDigest: 'scope', stateDigest: 'state' } }, deliverySummary: { milestones: { credited: [] } } };

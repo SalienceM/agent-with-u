@@ -84,6 +84,16 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
   const [sessionToDestroy, setSessionToDestroy] = useState<Session | null>(null);
   const [sessionToConvert, setSessionToConvert] = useState<Session | null>(null);
   const [conversionGoal, setConversionGoal] = useState('');
+  const [conversionWorkflow, setConversionWorkflow] = useState('');
+  const [conversionChoices, setConversionChoices] = useState<import('../types/loopEnvironment').WorkflowReference[]>([]);
+  useEffect(() => {
+    let active = true;
+    setConversionWorkflow(''); setConversionChoices([]);
+    if (sessionToConvert) void api.loopExecutionEnvironmentGet(sessionToConvert.id).then(result => {
+      if (active && result.sessionId === sessionToConvert.id) setConversionChoices(result.choices || []);
+    }).catch(() => { /* 依赖目录不可用时仍允许通用转换，不猜测选择。 */ });
+    return () => { active = false; };
+  }, [sessionToConvert]);
   const [conversionError, setConversionError] = useState('');
   const [converting, setConverting] = useState(false);
   const [destroyConfirmValue, setDestroyConfirmValue] = useState('');
@@ -492,7 +502,8 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
     setConverting(true);
     setConversionError('');
     try {
-      const result = await api.convertSessionToLoop(sessionToConvert.id, goal);
+      const choice = conversionChoices.find(item => item.command === conversionWorkflow);
+      const result = await api.convertSessionToLoop(sessionToConvert.id, goal, choice?.command, choice?.digest);
       if (result.status !== 'ok') {
         setConversionError(result.message || '转换失败');
         return;
@@ -507,7 +518,7 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
     } finally {
       setConverting(false);
     }
-  }, [conversionGoal, converting, onSelectSession, refresh, sessionToConvert]);
+  }, [conversionGoal, conversionChoices, conversionWorkflow, converting, onSelectSession, refresh, sessionToConvert]);
 
   const normalizedSearch = searchQuery.trim().toLocaleLowerCase();
   const visibleSessions = useMemo(() => {
@@ -1479,6 +1490,14 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
                   font: 'inherit', fontSize: 13, lineHeight: 1.55, outline: 'none',
                 }}
               />
+              <label style={{ display: 'block', marginTop: 8, fontSize: 12 }}>
+                工具环境依赖（可选，不执行工作流）
+                <select aria-label="LOOP 工作流依赖" value={conversionWorkflow} disabled={converting}
+                  onChange={event => setConversionWorkflow(event.target.value)} style={{ width: '100%', marginTop: 5 }}>
+                  <option value="">通用 LOOP · 不从历史猜测依赖</option>
+                  {conversionChoices.map(item => <option key={item.command} value={item.command}>{item.command} · {item.skillId}</option>)}
+                </select>
+              </label>
               {conversionError && (
                 <div role="alert" style={{ marginTop: 8, fontSize: 12, color: 'var(--theme-error, #cf222e)' }}>
                   {conversionError}

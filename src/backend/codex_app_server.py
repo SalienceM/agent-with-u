@@ -137,6 +137,10 @@ class CodexAppServerProcess:
         self._stderr_tail: list[str] = []
         self._queued: list[dict[str, Any]] = []
         self._next_id = 1
+        self.server_version = ''
+
+    def _process_started(self) -> None:
+        """Lifecycle hook before initialize; default transports need no extra lease."""
 
     async def start(self) -> None:
         if self.launch_command:
@@ -161,9 +165,10 @@ class CodexAppServerProcess:
             if self.launch_command:
                 raise RuntimeError("未找到 Codex CLI；请在当前执行节点安装 Codex") from exc
             raise RuntimeError("未找到 OpenSSH 客户端 ssh；请先安装 Windows OpenSSH Client") from exc
+        self._process_started()
         self._stderr_task = asyncio.create_task(self._read_stderr())
         try:
-            await self.request("initialize", {
+            initialized = await self.request("initialize", {
                 "clientInfo": {
                     "name": "agent_with_u",
                     "title": "AgentWithU",
@@ -171,6 +176,9 @@ class CodexAppServerProcess:
                 },
                 "capabilities": {"experimentalApi": True},
             }, timeout=20)
+            agent = str(initialized.get('userAgent') or '') if isinstance(initialized, dict) else ''
+            version = re.match(r'(?:agent_with_u|codex(?:[-_]cli(?:_rs)?)?)/(\d+\.\d+\.\d+)(?:\b|\s)', agent)
+            self.server_version = version.group(1) if version else ''
             await self.notify("initialized", {})
         except Exception:
             await self.close()
@@ -249,6 +257,18 @@ class CodexAppServerProcess:
         if self._queued:
             return self._queued.pop(0)
         return await self._read_one(timeout)
+
+    async def read_bounded(self, timeout: float, max_bytes: int) -> dict[str, Any]:
+        """仅在无其他 reader 的预检边界使用；解码前限制帧而非事后裁剪。"""
+        if not self.proc or not self.proc.stdout:
+            raise RuntimeError('Codex 连接已关闭')
+        reader = self.proc.stdout
+        old_limit = reader._limit
+        reader._limit = min(old_limit, max_bytes)
+        try:
+            return await self._read_one(timeout)
+        finally:
+            reader._limit = old_limit
 
     async def close(self) -> None:
         proc = self.proc

@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useCallback, useContext, useRef } from 'react';
 import { api } from '../api';
+import { useLoopControl } from '../hooks/useLoopControl';
 import { markdownToHtml } from '../utils/markdown';
 import { ImagePreview } from './ImagePreview';
 import { useClipboardImage } from './../hooks/useClipboardImage';
@@ -8,6 +9,8 @@ import { LoopPolicyEditor, normalizePolicy } from './LoopPolicyEditor';
 import type { LoopPolicy } from './LoopPolicyEditor';
 import { LoopProgressNotice, LoopDeliveryDetail, type DeliveryReport, type ProgressGuard } from './LoopDeliveryStatus';
 import { LoopDecisionNotice, LoopSourceCard } from './LoopContinuationStatus';
+import { LoopEnvironmentCard, EnvironmentEvidence } from './LoopExecutionEnvironment';
+import type { EnvironmentCheck, ExecutionEnvironment } from '../types/loopEnvironment';
 import type { LoopDecision, LoopSourceSummary } from '../types/loopContinuation';
 import type { ModelRuntime } from './CodexRuntimeFields';
 import { TokenUsageMonitor } from './TokenUsageMonitor';
@@ -43,6 +46,7 @@ interface LoopAnalysis {
   deliverable: boolean; outputtable: boolean;
 }
 interface LoopRecord {
+  environmentChecks?: EnvironmentCheck[];
   outcomeVersion?: number; terminalKind?: string; decision?: LoopDecision; callResults?: Record<string, string>; taskResult?: string;
   sourceSummary?: unknown; deliverySummary?: unknown;
   seq: number; subStage: string; round: number; goal: string; orchestration: LoopStep[];
@@ -81,6 +85,7 @@ interface AsideTurn { id: string; question: string; answer: string; status: stri
 interface AddonImage { id?: string; base64: string; mime_type?: string; }
 interface Addon { id: string; text: string; status: string; appliedSeq: number; images?: AddonImage[]; }
 interface LoopStateT {
+  executionEnvironment?: ExecutionEnvironment;
   taskSource?: LoopSourceSummary;
   sessionId: string; stage: string; goal: string;
   goalHistory: GoalRevision[];
@@ -98,7 +103,9 @@ interface LoopStateT {
   intentAlert?: { round?: number; seq?: number; aligned?: boolean; severity?: string; divergence?: string; suggestion?: string; dismissed?: boolean };
   auto: boolean; running: boolean; resumable: boolean;
   controlMode?: 'loop' | 'manual';
+  controlRevision?: number;
   canTakeover?: boolean;
+  controlReason?: string;
 }
 
 /**
@@ -141,6 +148,7 @@ function mergeLoopRecordDetail(summary: LoopRecord, detail?: LoopRecord): LoopRe
       ([stage, value]) => [stage, { ...detail.stageDetails?.[stage], ...value }],
     )),
     callDiagnostics: mergeCallDiagnostics(detail.callDiagnostics, summary.callDiagnostics),
+    environmentChecks: loopRecordRevision(summary) === loopRecordRevision(detail) ? detail.environmentChecks : summary.environmentChecks,
     detailLoaded: true,
   };
 }
@@ -199,7 +207,15 @@ export const LoopPanel: React.FC<LoopPanelProps> = ({
   const [viewMode, setViewMode] = useState<'panel' | 'flow'>('panel');  // 可切换的执行流程视图
   const [ideaInput, setIdeaInput] = useState('');
   const [goalDraft, setGoalDraft] = useState('');
-  const [busy, setBusy] = useState(false);
+  const [actionBusy, setBusy] = useState(false);
+  const control = useLoopControl(sessionId, execKey, !embedded && !inspectOnly && visible);
+  const busy = actionBusy || control.busy;
+  const [loadError, setLoadError] = useState('');
+  useEffect(() => {
+    if (inspectOnly || !control.state.summary?.operation?.committed || control.state.summary.controlMode !== 'loop') return;
+    if (loadError) control.viewReady(loadError);
+    else if (state?.sessionId === sessionId && state.controlMode !== 'manual') control.viewReady();
+  }, [sessionId, inspectOnly, state, loadError, control.state.phase, control.state.summary?.controlRevision]);
 
   // 子阶段实时流式文本：key = `${seq}:${subStage}`
   const [progress, setProgress] = useState<Record<string, string>>({});
@@ -214,7 +230,9 @@ export const LoopPanel: React.FC<LoopPanelProps> = ({
     const requestedSessionId = sessionId;
     const revision = statePushRevision.current;
     const s = await api.loopGetState(sessionId);
-    if (s && activeSessionRef.current === requestedSessionId && statePushRevision.current === revision) setState(s);
+    if (activeSessionRef.current !== requestedSessionId || statePushRevision.current !== revision) return;
+    if (s) { setState(s); setLoadError(''); }
+    else setLoadError('LOOP 面板加载失败，请重试读取');
   }, [sessionId]);
 
   const selectLoop = useCallback((seq: number | null, target: DetailTarget = 'all') => {
@@ -295,7 +313,7 @@ export const LoopPanel: React.FC<LoopPanelProps> = ({
     const un1 = api.onLoopUpdated((s: LoopStateT) => {
       if (s.sessionId !== sessionId) return;
       statePushRevision.current++;
-      setState(s);
+      setState(previous => (previous?.controlRevision || 0) > (s.controlRevision || 0) ? previous : s);
     });
     const un2 = api.onLoopProgress((d) => {
       if (d.sessionId !== sessionId) return;
@@ -377,11 +395,8 @@ export const LoopPanel: React.FC<LoopPanelProps> = ({
         ? '开启新一轮并切换到普通会话进行人工处理？\n\n本轮会记录为 Manual LOOP；完成后可交还给自动 LOOP。'
         : '切换到普通会话进行人工接管？\n\n人工对话和工具操作会作为一轮 Manual LOOP 留在时间线中，完成后可交还 LOOP。'
     )) return;
-    setBusy(true);
-    const r = await api.loopTakeover(sessionId, fromLoopout ? nextRoundGoal.trim() : '');
-    setBusy(false);
-    if (r.status !== 'ok' && r.message) alert(r.message);
-  }, [sessionId, state?.stage]);
+    await control.request('takeover', fromLoopout ? nextRoundGoal.trim() : '');
+  }, [control.request, state?.stage]);
 
   const discardLoop = useCallback(async () => {
     // 丢弃目标：正在跑的那次（或最后一次）
@@ -435,6 +450,8 @@ export const LoopPanel: React.FC<LoopPanelProps> = ({
 
   const stateForView = state ? {
     ...state,
+    canTakeover: !control.busy && control.state.summary?.eligibility.takeover.allowed === true,
+    controlReason: control.state.summary?.eligibility.takeover.message || control.state.error || '正在核对接管条件…',
     loops: state.loops.map((record) => {
       const merged = mergeLoopRecordDetail(record, recordDetails[record.seq]);
       return { ...merged, diagnosticLive: record.seq === activeLoopSeq(state),
@@ -450,7 +467,8 @@ export const LoopPanel: React.FC<LoopPanelProps> = ({
           onClose={onClose}
           embedded={embedded} inspectOnly={inspectOnly} />
         <div style={{ padding: 40, textAlign: 'center', color: 'var(--theme-text-muted)' }}>
-          正在加载 Loop 状态…
+          {loadError || '正在加载 Loop 状态…'}
+          {loadError && <button onClick={() => void refresh()}>重试加载 LOOP 面板</button>}
         </div>
       </>
     );
@@ -464,6 +482,8 @@ export const LoopPanel: React.FC<LoopPanelProps> = ({
           onClose={onClose} embedded={embedded} inspectOnly={inspectOnly}
           viewMode={viewMode} setViewMode={setViewMode} canFlow={stateForView.stage !== 'loopidea'} />
         <StageRail stage={stateForView.stage} />
+        {!inspectOnly && !stateForView.canTakeover && <div role="status" style={{ padding: '6px 18px', fontSize: 12,
+          color: 'var(--theme-text-muted)' }}>人工接管：{control.busy ? '转交正在处理，请查看上方状态' : stateForView.controlReason}</div>}
         {inspectOnly && (
           <div style={{
             flexShrink: 0, padding: '7px 18px', fontSize: 12,
@@ -478,8 +498,11 @@ export const LoopPanel: React.FC<LoopPanelProps> = ({
             <div style={{ flex: 1, overflow: 'auto', padding: 'var(--ui-loop-body-padding, 12px 18px 24px)' }}>
               {!inspectOnly && <IntentBanner state={stateForView} sessionId={sessionId} />}
               <LoopProgressNotice guard={stateForView.progressGuard} handoff={stateForView.handoff} />
+              <LoopEnvironmentCard key={`env:${execKey}:${sessionId}`} sessionId={sessionId} execKey={execKey}
+                environment={stateForView.executionEnvironment} resumable={stateForView.resumable}
+                readOnly={!!inspectOnly || control.busy || stateForView.controlMode === 'manual' || stateForView.running || !!stateForView.executionEnvironment?.checking} />
               <LoopSourceCard key={`${execKey}:${sessionId}`} sessionId={sessionId} execKey={execKey}
-                source={stateForView.taskSource} readOnly={!!inspectOnly || stateForView.controlMode === 'manual' || stateForView.running || stateForView.resumable} />
+                source={stateForView.taskSource} readOnly={!!inspectOnly || control.busy || stateForView.controlMode === 'manual' || stateForView.running || stateForView.resumable} />
               <LoopDecisionNotice decision={stateForView.loops[stateForView.loops.length - 1]?.decision}
                 callResults={stateForView.loops[stateForView.loops.length - 1]?.outcomeVersion ? stateForView.loops[stateForView.loops.length - 1]?.callResults : undefined}
                 taskResult={stateForView.loops[stateForView.loops.length - 1]?.outcomeVersion ? stateForView.loops[stateForView.loops.length - 1]?.taskResult : undefined} />
@@ -1056,7 +1079,7 @@ const LoopOutBanner: React.FC<{
           </button>
           <button
             onClick={() => onTakeover(goal.trim())}
-            disabled={busy || state.running}
+            disabled={busy || !state.canTakeover}
             style={{
               ...btn,
               borderColor: '#d2992266', color: '#d29922',
@@ -1329,6 +1352,7 @@ const ExecuteStage: React.FC<{
           {/* ★ 自动连跑开关：开则一次 loop 完成自动续下一次，可随时取消 */}
           <button
             onClick={() => onSetAuto(!state.auto)}
+            disabled={busy}
             style={{ ...btn, ...(state.auto ? { background: '#2da44e1f', color: '#2da44e', borderColor: '#2da44e55' } : {}) }}
             title="自动连跑：开启后一次 loop 完成即自动开始下一次，直到收口或你取消"
           >
@@ -1990,6 +2014,9 @@ const LoopDetail: React.FC<{
           extra={<BackendTag role="analysis" label={loop.backendLabels?.analysis} />}><Live text={liveAna} /></Section> : null)}
 
       <LoopDecisionNotice decision={loop.decision} callResults={loop.callResults} taskResult={loop.taskResult} steps={loop.outcomeVersion ? loop.orchestration : undefined} />
+      <details data-testid="loop-environment-history"><summary>本轮执行环境证据 · {loop.environmentChecks?.length || 0}</summary>
+        {loop.environmentChecks?.length ? loop.environmentChecks.map(check => <EnvironmentEvidence key={check.id} check={check} />) : <EnvironmentEvidence />}
+      </details>
       {(target === 'all' || target === 'analysis') && <LoopDeliveryDetail report={loop.delivery} />}
       {loop.error && <Section title="错误"><span style={{ color: '#f87171' }}>{loop.error}</span></Section>}
     </div>

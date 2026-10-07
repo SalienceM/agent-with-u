@@ -2,6 +2,7 @@ import { test, expect, type Page, type WebSocketRoute } from '@playwright/test';
 import type { CallDiagnostic } from '../../src/utils/loopDiagnostics';
 import type { DeliveryReport, ProgressGuard } from '../../src/components/LoopDeliveryStatus';
 import type { LoopDecision, LoopSourceSummary } from '../../src/types/loopContinuation';
+import type { ExecutionEnvironment, EnvironmentCheck } from '../../src/types/loopEnvironment';
 
 function recordFixture() {
   const now = Date.now() / 1000;
@@ -9,6 +10,7 @@ function recordFixture() {
     seq: 1, round: 1, subStage: 'execute', goal: '修复当前回归', completed: false, error: '', result: '',
     createdAt: now - 60, updatedAt: now - 10, subStarted: { prepare: now - 60, execute: now - 50 }, analysis: null,
     callDiagnostics: [] as CallDiagnostic[],
+    environmentChecks: [] as EnvironmentCheck[],
     delivery: {} as DeliveryReport,
     outcomeVersion: 0, terminalKind: '', decision: {} as LoopDecision, callResults: {} as Record<string, string>, taskResult: 'unknown',
     orchestration: [
@@ -25,7 +27,7 @@ function recordFixture() {
   };
 }
 
-async function fixture(page: Page, progressGuard: ProgressGuard = {}, options: { running?: boolean; source?: LoopSourceSummary; manual?: boolean } = {}) {
+async function fixture(page: Page, progressGuard: ProgressGuard = {}, options: { running?: boolean; source?: LoopSourceSummary; manual?: boolean; environment?: ExecutionEnvironment } = {}) {
   let record = recordFixture();
   let older: ReturnType<typeof recordFixture> | null = null;
   const sessionId = 'qa-loop-000';
@@ -36,9 +38,11 @@ async function fixture(page: Page, progressGuard: ProgressGuard = {}, options: {
   let source = options.source;
   let sourceReads = 0;
   let executionCalls = 0;
+  let environment = options.environment;
+  let environmentReads = 0, environmentChecks = 0;
   const pending: Array<() => void> = [];
   const state = () => ({ sessionId, stage: 'loopexecute', goal: '阶段审计回归', goalHistory: [], ideas: [],
-    progressGuard, taskSource: source, handoff: { available: true, source: 'conversion' },
+    progressGuard, taskSource: source, executionEnvironment: environment, handoff: { available: true, source: 'conversion' },
     loops: (older ? [older, record] : [record]).map(item => ({ ...item, detailLoaded: false, result: '', delivery: {},
       callDiagnostics: item.callDiagnostics.slice(-1),
       orchestration: item.orchestration.map(step => ({ ...step, output: '', hasOutput: !!step.output })),
@@ -54,6 +58,19 @@ async function fixture(page: Page, progressGuard: ProgressGuard = {}, options: {
       const frame = JSON.parse(String(message));
       const reply = (value: unknown) => ws.send(JSON.stringify({ id: frame.id, result: JSON.stringify(value) }));
       if (frame.method === 'loopGetState' && frame.params[0] === sessionId) return reply(state());
+      if (frame.method.startsWith('loopExecutionEnvironment')) {
+        if (frame.method === 'loopExecutionEnvironmentGet') {
+          environmentReads++;
+          return reply({ status: 'ok', sessionId, environment, choices: [{ command: 'opsx-apply', skillId: 'openspec-apply-change', digest: 'fixture-digest' }] });
+        }
+        if (frame.method === 'loopExecutionEnvironmentCheck') environmentChecks++;
+        const snapshot = { ...environment, revision: (environment?.revision || 0) + 1,
+          status: 'passed' as const, latest: { ...environment?.latest, id: 'checked', status: 'passed' as const, reason: '', resumeCondition: '', quiesced: true }, blockers: [] };
+        if (frame.method === 'loopExecutionEnvironmentSelectWorkflow') snapshot.workflowRef = { command: frame.params[1] };
+        const send = () => { environment = snapshot; reply({ status: 'ok', sessionId, environment }); };
+        if (hold) pending.push(send); else { send(); socket.send(JSON.stringify({ event: 'loopUpdated', data: JSON.stringify(state()) })); }
+        return;
+      }
       if (frame.method.startsWith('loopTaskSource')) {
         sourceReads++;
         if (frame.method === 'loopTaskSourceDiscover') {
@@ -93,6 +110,9 @@ async function fixture(page: Page, progressGuard: ProgressGuard = {}, options: {
     reads: () => reads,
     sourceReads: () => sourceReads,
     executionCalls: () => executionCalls,
+    environmentReads: () => environmentReads,
+    environmentChecks: () => environmentChecks,
+    setEnvironment: (value: ExecutionEnvironment) => { environment = value; socket.send(JSON.stringify({ event: 'loopUpdated', data: JSON.stringify(state()) })); },
     setSource: (value: LoopSourceSummary) => { source = value; socket.send(JSON.stringify({ event: 'loopUpdated', data: JSON.stringify(state()) })); },
     setHold: (value: boolean) => { hold = value; },
     setFail: (value: boolean) => { fail = value; },
@@ -113,6 +133,60 @@ async function openFlow(page: Page) {
   await expect(pane.getByRole('button', { name: '查看 Prepare 阶段', exact: true }).first()).toBeVisible();
   return pane;
 }
+
+const environmentFixture = (): ExecutionEnvironment => ({ revision: 1, status: 'blocked', latest: {
+  id: 'env-first', revision: 1, status: 'blocked', coverage: 'native_policy', backendId: 'fixture', role: 'prepare',
+  access: 'read-only', transport: 'app-server', runnerVersion: '0.154.0', checkedAt: 1700000000,
+  reasonCode: 'env_access_denied', reason: '当前受限环境拒绝访问所需入口。',
+  resumeCondition: '在相同策略下恢复合法访问后重新检查。', quiesced: true,
+}, blockers: [] });
+
+test('environment check is explicit, coalesces clicks and never starts task work', async ({ page }, info) => {
+  const data = await fixture(page, { pause: true }, { running: false, environment: environmentFixture() });
+  const pane = await openFlow(page);
+  const card = pane.getByTestId('loop-environment-card');
+  await expect(card).toContainText('read-only');
+  await expect(card).toContainText('部分覆盖');
+  expect(data.environmentReads()).toBe(0);
+  await card.getByRole('button', { name: '查看详情与工作流选项' }).click();
+  await card.getByLabel('工作流依赖', { exact: true }).selectOption('opsx-apply');
+  await card.getByRole('button', { name: '确认依赖选择' }).click();
+  await expect(card).toContainText('工作流依赖：opsx-apply');
+  data.setHold(true);
+  await card.getByRole('button', { name: '重新检查环境' }).click();
+  await expect(card.getByRole('button', { name: '重新检查环境' })).toBeDisabled();
+  expect(data.environmentChecks()).toBe(1);
+  data.setHold(false); data.release();
+  await expect(card).toContainText('未开启 Auto 或恢复任务');
+  expect(data.executionCalls()).toBe(0);
+  for (let i = 0; i < 4; i++) data.update(() => {});
+  expect(data.environmentReads()).toBe(1);
+  await page.screenshot({ path: info.outputPath('environment-check.png') });
+});
+
+test('environment delayed reply cannot replace a newer revision; unknown and unsupported remain honest', async ({ page }) => {
+  const data = await fixture(page, {}, { running: false });
+  const pane = await openFlow(page);
+  const card = pane.getByTestId('loop-environment-card');
+  await expect(card).toContainText('环境未知');
+  data.setEnvironment({ ...environmentFixture(), revision: 3, status: 'unsupported', latest: { ...environmentFixture().latest, status: 'unsupported' } });
+  await expect(card).toContainText('不支持或覆盖不足');
+  data.setHold(true);
+  await card.getByRole('button', { name: '重新检查环境' }).click();
+  data.setEnvironment({ ...environmentFixture(), revision: 10 });
+  data.release(); data.setHold(false);
+  await expect(card).toContainText('当前受限环境拒绝访问所需入口');
+  expect(data.executionCalls()).toBe(0);
+});
+
+test('running and inspectOnly environment cards expose no mutation controls', async ({ page }) => {
+  const data = await fixture(page, {}, { running: true, environment: environmentFixture() });
+  const pane = await openFlow(page);
+  const card = pane.getByTestId('loop-environment-card');
+  await expect(card.getByRole('button', { name: '重新检查环境' })).toHaveCount(0);
+  await expect(card).toContainText('人工成功不能证明自动受限路径可用');
+  expect(data.environmentChecks()).toBe(0);
+});
 
 test('each stage opens independently and completed step output refreshes while the next runs', async ({ page }, info) => {
   const errors: string[] = [];
@@ -375,11 +449,29 @@ test('running and manual takeover are read-only; ordinary chat does not query so
   const data = await fixture(page, {}, { running: false, manual: true });
   const pane = await openFlow(page);
   await expect(pane.getByTestId('loop-source-card').getByRole('button', { name: '发现 OpenSpec 来源' })).toBeDisabled();
+  await expect(pane.getByTestId('loop-environment-card').getByRole('button', { name: '重新检查环境' })).toHaveCount(0);
   expect(data.sourceReads()).toBe(0);
   if (!await page.locator('.awu-sidebar').isVisible()) await page.getByRole('button', { name: '打开会话列表', exact: true }).click();
   await page.locator('.awu-sidebar').getByText('客户工作会话 5', { exact: true }).click();
   await expect(page.locator('[data-session-tab-panel]:visible').getByTestId('loop-source-card')).toHaveCount(0);
   expect(data.sourceReads()).toBe(0);
+  expect(data.executionCalls()).toBe(0);
+  expect(data.environmentChecks()).toBe(0);
+  expect(data.environmentReads()).toBe(0);
+});
+
+test('a late environment check belongs only to its original session', async ({ page }) => {
+  const data = await fixture(page, {}, { running: false, environment: environmentFixture() });
+  const pane = await openFlow(page);
+  data.setHold(true);
+  await pane.getByTestId('loop-environment-card').getByRole('button', { name: '重新检查环境' }).click();
+  await expect.poll(data.environmentChecks).toBe(1);
+  if (!await page.locator('.awu-sidebar').isVisible()) await page.getByRole('button', { name: '打开会话列表', exact: true }).click();
+  await page.locator('.awu-sidebar').getByText('首页交付 Loop 2', { exact: true }).click();
+  const card = page.locator('[data-session-tab-panel]:visible').getByTestId('loop-environment-card');
+  data.setHold(false); data.release();
+  await expect(card).toContainText('环境未知');
+  await expect(card).not.toContainText('对应检查项通过');
   expect(data.executionCalls()).toBe(0);
 });
 

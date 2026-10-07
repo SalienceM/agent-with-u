@@ -272,6 +272,10 @@ class StreamDelta:
 
 
 class ModelBackend(ABC):
+    def execution_environment_capabilities(self, identity) -> dict:
+        """能力声明不是就绪证据；未适配 Backend 保留原有受限路径。"""
+        return {'supported': False, 'coverage': 'host_discovery'}
+
     def __init__(self, config: ModelBackendConfig):
         self.config = config
         self._cancelled_sessions: set[str] = set()  # ★ Per-session cancellation

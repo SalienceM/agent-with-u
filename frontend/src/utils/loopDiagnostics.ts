@@ -3,6 +3,7 @@ export interface CallDiagnostic {
   startedAt: number; dispatchedAt?: number; endedAt?: number; observedAt?: number;
   firstEventAt?: number; firstTextAt?: number; lastActivityAt?: number;
   localPrepareMs?: number; durationMs?: number;
+  environmentCheckStartedAt?: number; environmentCheckEndedAt?: number; environmentCheckId?: string;
   backendId?: string; backendType?: string; model?: string; reasoningEffort?: string;
   promptChars: number; estimatedPromptTokens: number; imageCount: number; resumedContext?: boolean;
   requestBytes?: number; inactivityTimeoutSeconds?: number;
@@ -18,6 +19,8 @@ export interface CallDiagnostic {
 export const CALL_PHASE: Record<string, string> = {
   local_prepare: '本地准备：同步 Skill／展开引用', backend_dispatch: '已进入 Backend，等待可见事件',
   running: '进行中',
+  environment_check: '固定环境检查（尚未发送模型请求）', environment_checked: '环境检查已返回（不等于任务完成）',
+  environment_wait: '环境等待（未计为模型调用失败）',
   runner_start: '启动 Agent 进程／连接', runner_ready: 'Agent 就绪，初始化线程',
   turn_accepted: 'Agent 已接受任务，等待模型事件', request: '已发起 HTTP 请求，等待响应头',
   response_headers: '已收到 HTTP 响应头', retry_wait: '后端自动重试等待',

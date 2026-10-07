@@ -41,6 +41,8 @@
     "src/utils/fileSearch.ts",
     "src/utils/fileTransfers.ts",
     "src/utils/sessionRouting.ts",
+    "src/utils/loopControl.ts",
+    "src/utils/loopControlTransport.ts",
     "src/utils/localFileTree.ts",
     "src/utils/executorSessions.ts",
     "src/utils/markdownExport.ts",

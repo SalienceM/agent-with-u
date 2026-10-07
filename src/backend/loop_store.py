@@ -23,6 +23,8 @@ LoopStore: 可视化 Loop 集成的状态持久化（"stage 文件"）。
 
 from __future__ import annotations
 
+from .loop_control import normalize_operation, normalize_receipts, operation_public, revision
+
 import json
 import copy
 import os
@@ -38,6 +40,7 @@ from .loop_decisions import (CALL_RESULTS, TASK_RESULTS, TERMINALS, bounded_obje
                              enum_value, normalize_decision)
 from .loop_task_source import validate_source
 from .loop_milestones import validate_plan
+from .loop_execution_environment import normalize_environment, normalize_history
 
 
 # ── 阶段常量 ──────────────────────────────────────────────────────
@@ -164,6 +167,7 @@ class LoopRecord:
     # 阶段审计：原文、解析对象与结构校验结论，独立于实时尾部回放持久化。
     stage_details: dict = field(default_factory=dict)
     call_diagnostics: list[dict] = field(default_factory=list)
+    environment_checks: list[dict] = field(default_factory=list)
     progress_version: int = 0          # 0=旧记录未知；1=结构化任务/证据评审
     progress_scope: str = ""           # 全局目标版本摘要；用户改目标后不把旧任务硬套到新目标
     delivery: dict = field(default_factory=dict)
@@ -227,6 +231,7 @@ class LoopRecord:
             "error": self.error,
             "stageDetails": copy.deepcopy(self.stage_details),
             "callDiagnostics": copy.deepcopy(self.call_diagnostics),
+            "environmentChecks": normalize_history(self.environment_checks),
             "progressVersion": self.progress_version,
             "progressScope": self.progress_scope,
             "delivery": copy.deepcopy(self.delivery),
@@ -272,6 +277,7 @@ class LoopRecord:
             error=d.get("error", ""),
             stage_details=copy.deepcopy(d.get("stageDetails") or {}),
             call_diagnostics=copy.deepcopy(d.get("callDiagnostics") or [])[-64:],
+            environment_checks=normalize_history(d.get("environmentChecks")),
             progress_version=d.get("progressVersion") if d.get("progressVersion") in (1, 2) else 0,
             progress_scope=str(d.get("progressScope") or "")[:20],
             delivery=copy.deepcopy(d.get("delivery") or {}),
@@ -676,6 +682,9 @@ class LoopState:
     # loop | manual. Session type stays "loop"; this only selects which surface
     # currently owns the stopped session.
     control_mode: str = "loop"
+    control_revision: int = 0
+    control_operation: dict = field(default_factory=dict)
+    control_receipts: list[dict] = field(default_factory=list)
     stop_reason: str = ""               # 触发 loopout / 终止的原因
     asides: list[AsideTurn] = field(default_factory=list)  # by the way 旁路问答
     addons: list[Addon] = field(default_factory=list)      # 执行中补充的要求
@@ -685,10 +694,38 @@ class LoopState:
     handoff: dict = field(default_factory=dict)           # 有界、脱敏的转换交接；不包含工具授权
     progress_guard: dict = field(default_factory=dict)    # 可见的停滞/阻塞诊断，不冒充验收
     task_source: dict = field(default_factory=dict)       # 显式绑定，不从历史正文推断
+    execution_environment: dict = field(default_factory=dict)
     created_at: float = field(default_factory=_now)
     updated_at: float = field(default_factory=_now)
 
     # ── 派生指标 ────────────────────────────────────────────────
+    def accept_control_operation(self, operation: dict) -> None:
+        """只在持有会话预留后调用；重放不能推进控制权修订。"""
+        cleaned = normalize_operation(operation)
+        if not cleaned or cleaned['status'] != 'accepted':
+            raise ValueError('invalid control operation')
+        if self.control_operation and self.control_operation.get('status') not in ('succeeded', 'failed', 'blocked', 'interrupted'):
+            raise ValueError('control operation is active')
+        if cleaned['sourceControlRevision'] != self.control_revision:
+            raise ValueError('stale control revision')
+        self.control_revision += 1
+        cleaned['controlRevision'] = self.control_revision
+        self.control_operation = cleaned
+
+    def finish_control_operation(self, operation: dict) -> None:
+        cleaned = normalize_operation(operation)
+        if not cleaned or cleaned['status'] not in ('succeeded', 'failed', 'blocked', 'interrupted'):
+            raise ValueError('invalid control receipt')
+        if not self.control_operation or cleaned['requestId'] != self.control_operation['requestId']:
+            raise ValueError('control operation identity changed')
+        if self.control_operation.get('status') in ('succeeded', 'failed', 'blocked', 'interrupted'):
+            raise ValueError('control operation already terminal')
+        if cleaned['committed']:
+            self.control_revision += 1
+        cleaned['controlRevision'] = self.control_revision
+        self.control_operation = cleaned
+        self.control_receipts = normalize_receipts([*self.control_receipts, cleaned])
+
     def record_goal(self, goal: str, hint: str = "", source: str = "seal") -> None:
         """登记一版全局目标(去重:与当前最新版相同则不追加)。"""
         g = (goal or "").strip()
@@ -731,6 +768,9 @@ class LoopState:
             "auto": self.auto,
             "status": self.status,
             "controlMode": self.control_mode,
+            "controlRevision": revision(self.control_revision),
+            "controlOperation": normalize_operation(self.control_operation),
+            "controlReceipts": normalize_receipts(self.control_receipts),
             "stopReason": self.stop_reason,
             "asides": [a.to_dict() for a in self.asides],
             "addons": [a.to_dict() for a in self.addons],
@@ -740,6 +780,7 @@ class LoopState:
             "handoff": copy.deepcopy(self.handoff),
             "progressGuard": copy.deepcopy(self.progress_guard),
             "taskSource": validate_source(self.task_source),
+            "executionEnvironment": normalize_environment(self.execution_environment),
             "bestScore": self.best_score(),
             "latestScore": self.latest_score(),
             "createdAt": self.created_at,
@@ -766,6 +807,9 @@ class LoopState:
             auto=bool(d.get("auto", False)),
             status=d.get("status", "active"),
             control_mode=("manual" if d.get("controlMode") == "manual" else "loop"),
+            control_revision=revision(d.get("controlRevision")),
+            control_operation=normalize_operation(d.get("controlOperation")),
+            control_receipts=normalize_receipts(d.get("controlReceipts")),
             stop_reason=d.get("stopReason", ""),
             asides=[AsideTurn.from_dict(a) for a in d.get("asides", [])],
             addons=[Addon.from_dict(a) for a in d.get("addons", [])],
@@ -775,6 +819,7 @@ class LoopState:
             handoff=copy.deepcopy(d.get("handoff") or {}),
             progress_guard=copy.deepcopy(d.get("progressGuard") or {}),
             task_source=validate_source(d.get("taskSource")),
+            execution_environment=normalize_environment(d.get("executionEnvironment")),
             created_at=d.get("createdAt", _now()),
             updated_at=d.get("updatedAt", _now()),
         )
@@ -787,6 +832,7 @@ class LoopStore:
         self._dir = paths.sub("loops")
         self._dir.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
+        self._session_locks: dict[str, threading.Lock] = {}
 
     def _path(self, sid: str) -> Path:
         return self._dir / f"{sid}.json"
@@ -800,6 +846,8 @@ class LoopStore:
             "sessionId": state.session_id,
             "stage": state.stage,
             "controlMode": state.control_mode,
+            "controlRevision": revision(state.control_revision),
+            "controlOperation": operation_public(state.control_operation),
             "auto": state.auto,
             "status": state.status,
             "round": state.round,
@@ -825,13 +873,14 @@ class LoopStore:
     def load_meta(self, sid: str) -> Optional[dict]:
         """读取小型路由元数据；旧 stage 仅做一次逐行扫描并自动生成 sidecar。"""
         meta_path = self._meta_path(sid)
+        stage_path = self._path(sid)
         if meta_path.exists():
             try:
                 data = json.loads(meta_path.read_text(encoding="utf-8"))
-                return data if isinstance(data, dict) else None
+                if isinstance(data, dict) and data.get('_stateMtimeNs') == stage_path.stat().st_mtime_ns:
+                    return data
             except Exception:
                 pass
-        stage_path = self._path(sid)
         if not stage_path.exists():
             return None
         stage = STAGE_IDEA
@@ -839,7 +888,10 @@ class LoopStore:
         auto = False
         status = "active"
         round_no = 1
+        control_revision = 0
+        control_operation = {}
         try:
+            state_stat = stage_path.stat()
             # controlMode 位于庞大的 loops 之后；逐行扫描避免构建整个 JSON 对象。
             with stage_path.open("r", encoding="utf-8", errors="replace") as handle:
                 for line in handle:
@@ -853,6 +905,19 @@ class LoopStore:
                     elif stripped.startswith('"controlMode"'):
                         value = json.loads("{" + stripped + "}").get("controlMode")
                         control_mode = "manual" if value == "manual" else "loop"
+                    elif stripped.startswith('"controlRevision"'):
+                        control_revision = revision(json.loads("{" + stripped + "}").get("controlRevision"))
+                    elif stripped.startswith('"controlOperation"'):
+                        # 回执只含有界标量；只累计这一个顶层对象，不加载历史正文。
+                        body = stripped
+                        if stripped.endswith('{'):
+                            for nested in handle:
+                                body += nested.rstrip().rstrip(',') if nested.startswith('  }') else nested
+                                if len(body) > 8192:
+                                    raise ValueError('oversized control summary')
+                                if nested.startswith('  }'):
+                                    break
+                        control_operation = operation_public(json.loads('{' + body + '}').get('controlOperation'))
                     elif stripped.startswith('"auto"'):
                         auto = bool(json.loads("{" + stripped + "}").get("auto", False))
                     elif stripped.startswith('"status"'):
@@ -861,8 +926,9 @@ class LoopStore:
                         round_no = int(json.loads("{" + stripped + "}").get("round") or 1)
             meta = {
                 "sessionId": sid, "stage": stage, "controlMode": control_mode,
+                "controlRevision": control_revision, "controlOperation": control_operation,
                 "auto": auto, "status": status, "round": round_no,
-                "updatedAt": stage_path.stat().st_mtime,
+                "updatedAt": state_stat.st_mtime, "_stateMtimeNs": state_stat.st_mtime_ns,
             }
             # 迁移写入失败不影响本次读取。
             try:
@@ -892,17 +958,49 @@ class LoopStore:
 
     def save(self, state: LoopState) -> None:
         state.updated_at = _now()
+        self.save_frozen(state.to_dict())
+
+    def save_frozen(self, data: dict) -> None:
+        """持久化调用方已冻结的数据；序列化和 fsync 可在线程中完成。
+
+        全局锁只保护锁表，不覆盖磁盘 I/O，避免一个慢会话阻塞其它会话。
+        同会话的同步/异步调用必须由桥接层的有序边界排序。
+        """
+        sid = data['sessionId']
         with self._lock:
-            path = self._path(state.session_id)
+            lock = self._session_locks.setdefault(sid, threading.Lock())
+        with lock:
+            path = self._path(sid)
             tmp = path.with_suffix(path.suffix + ".tmp")
-            payload = json.dumps(state.to_dict(), ensure_ascii=False, indent=2)
+            payload = json.dumps(data, ensure_ascii=False, indent=2)
             try:
                 with tmp.open("w", encoding="utf-8", newline="\n") as f:
                     f.write(payload)
                     f.flush()
                     os.fsync(f.fileno())
                 os.replace(tmp, path)
-                self._write_meta_unlocked(state)
+                # 正文替换是权威提交点。meta 是可修复镜像，失败不能把已提交
+                # 结果解释为未提交。只复制顶层摘要，不重建整个 LoopState。
+                meta = {key: data.get(key) for key in ('sessionId', 'stage', 'controlMode',
+                    'controlRevision', 'auto', 'status', 'round', 'updatedAt')}
+                meta['controlOperation'] = operation_public(data.get('controlOperation'))
+                meta['_stateMtimeNs'] = path.stat().st_mtime_ns
+                meta_path = self._meta_path(sid)
+                meta_tmp = meta_path.with_suffix(meta_path.suffix + '.tmp')
+                try:
+                    meta_tmp.write_text(json.dumps(meta, ensure_ascii=False, separators=(',', ':')), encoding='utf-8')
+                    os.replace(meta_tmp, meta_path)
+                except OSError:
+                    # 删除旧 mirror，下一次 load_meta 从权威文件重建。
+                    try:
+                        meta_path.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                finally:
+                    try:
+                        meta_tmp.unlink(missing_ok=True)
+                    except OSError:
+                        pass
             finally:
                 try:
                     if tmp.exists():

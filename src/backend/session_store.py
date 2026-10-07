@@ -12,6 +12,7 @@ Index kept in ~/.agent-with-u/sessions/index.json for fast listing.
 from __future__ import annotations
 
 import json
+import copy
 import os
 import time
 import threading
@@ -34,6 +35,7 @@ class SessionStore:
         self._index_dirty = False
         self._index_save_timer: Optional[threading.Timer] = None
         self._lock = threading.Lock()
+        self._index_write_lock = threading.Lock()
         self._load_index()
 
         # ★ Worker thread for async file I/O
@@ -83,10 +85,17 @@ class SessionStore:
 
     def _save_index_sync(self):
         """Synchronously save index (used on shutdown)."""
-        with self._lock:
-            entries = sorted(self._index.values(), key=lambda x: x.get("updatedAt", 0), reverse=True)
-            self._index_path.write_text(json.dumps(entries, ensure_ascii=False, indent=2), encoding="utf-8")
-            self._index_dirty = False
+        # 写线程单独排序；获取写锁后再冻结最新索引，避免旧 timer 覆盖新提交。
+        # 内存锁不覆盖序列化、fsync 或 replace，转交镜像/轻量查询不等慢磁盘。
+        with self._index_write_lock:
+            with self._lock:
+                snapshot = copy.deepcopy(self._index)
+                self._index_dirty = True
+            entries = sorted(snapshot.values(), key=lambda x: x.get("updatedAt", 0), reverse=True)
+            self._atomic_write_text(self._index_path, json.dumps(entries, ensure_ascii=False, indent=2))
+            with self._lock:
+                # 写入期间的新值仍待后续 timer/flush 保存，不能错误清除 dirty。
+                self._index_dirty = self._index != snapshot
 
     def _save_index_debounced(self):
         """Schedule index save with 500ms debounce to reduce I/O."""
@@ -282,6 +291,7 @@ class SessionStore:
                 message = ChatMessage(
                     id=m["id"],
                     role=m["role"],
+                    workflow_ref=m.get('workflowRef') if isinstance(m.get('workflowRef'), dict) else None,
                     content=m["content"],
                     timestamp=m.get("timestamp", 0),
                     images=images,

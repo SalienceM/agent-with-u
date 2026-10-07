@@ -80,6 +80,7 @@ from .loop_delivery import (
     normalize_report, completion_ready, assess_progress, planning_context, scope_key,
     REPORT_INSTRUCTIONS, SAFETY_CONSTRAINTS, call_scope_constraints,
 )
+from .loop_control import ControlFacts, eligibility as control_eligibility, operation_public, TERMINAL_STATUSES
 from .workspace_kit_store import (
     WorkspaceKitStore,
     WorkspaceKitState,
@@ -357,10 +358,19 @@ def _git_is_repo(path: str) -> bool:
         return False
 
 
-def git_snapshot(working_dir: Optional[str]) -> Optional[str]:
+def git_snapshot(working_dir: Optional[str], *, command_deadline: Optional[float] = None) -> Optional[str]:
     """对工作目录做一次**非破坏性**快照（用临时索引，不动真实索引/HEAD/工作树），
     捕获已跟踪 + 未跟踪文件（遵循 .gitignore）。返回快照 commit sha；非 git 仓库或失败返回 None。"""
     import os, subprocess, time as _t
+    def run(args, **kwargs):
+        if command_deadline is not None:
+            remaining = command_deadline - _t.monotonic()
+            if remaining <= 0:
+                raise TimeoutError('snapshot command budget exhausted')
+            kwargs['timeout'] = min(10, remaining)
+        # subprocess.run 在超时后 kill + wait 自己拥有的进程；若等待仍卡住，
+        # 外层线程保持存活，转交预留不会因客户端超时被解除。
+        return subprocess.run(args, **kwargs)
     if not working_dir or not os.path.isdir(working_dir) or not _git_is_repo(working_dir):
         return None
     tmp_index = None
@@ -368,25 +378,25 @@ def git_snapshot(working_dir: Optional[str]) -> Optional[str]:
         env = dict(os.environ)
         tmp_index = os.path.join(working_dir, ".git", f"awu_loop_idx_{int(_t.time() * 1000)}")
         env["GIT_INDEX_FILE"] = tmp_index
-        head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=working_dir,
+        head = run(["git", "rev-parse", "HEAD"], cwd=working_dir,
                               capture_output=True, text=True,
                               encoding="utf-8", errors="replace")
         has_head = head.returncode == 0
         if has_head:
-            subprocess.run(["git", "read-tree", "HEAD"], cwd=working_dir, env=env,
+            run(["git", "read-tree", "HEAD"], cwd=working_dir, env=env,
                            capture_output=True, text=True,
                            encoding="utf-8", errors="replace", check=True)
-        subprocess.run(["git", "add", "-A"], cwd=working_dir, env=env,
+        run(["git", "add", "-A"], cwd=working_dir, env=env,
                        capture_output=True, text=True,
                        encoding="utf-8", errors="replace", check=True)
-        tree = subprocess.run(["git", "write-tree"], cwd=working_dir, env=env,
+        tree = run(["git", "write-tree"], cwd=working_dir, env=env,
                               capture_output=True, text=True,
                               encoding="utf-8", errors="replace",
                               check=True).stdout.strip()
         args = ["git", "commit-tree", tree, "-m", "awu loop checkpoint"]
         if has_head:
             args += ["-p", (head.stdout or "").strip()]
-        snap = subprocess.run(args, cwd=working_dir, capture_output=True, text=True,
+        snap = run(args, cwd=working_dir, capture_output=True, text=True,
                               encoding="utf-8", errors="replace",
                               check=True).stdout.strip()
         return snap or None
@@ -760,13 +770,16 @@ def _codex_message_equivalent(native: ChatMessage, local: ChatMessage) -> bool:
 
 
 from .loop_source_bridge import LoopSourceBridge
+from .loop_environment_bridge import LoopEnvironmentBridge
+from .loop_control_bridge import LoopControlBridge
+from .loop_execution_environment import EnvironmentPause, normalize_environment
 from .loop_decisions import DecisionFacts, decide_next, digest as loop_digest
 from .loop_task_source import source_summary, reconcile, snapshot_fresh
 from .loop_milestones import (MILESTONE_INSTRUCTIONS, register_plan, review_milestones,
                               milestone_progress, inherit_plan)
 
 
-class BridgeWS(LoopSourceBridge):
+class BridgeWS(LoopSourceBridge, LoopEnvironmentBridge, LoopControlBridge):
     """WebSocket bridge，业务逻辑与 Bridge（Qt）完全相同，去掉 Qt 依赖。"""
 
     def __init__(self, cli_path: Optional[str] = None, auth_guard: Optional["AuthGuard"] = None):
@@ -1952,7 +1965,7 @@ class BridgeWS(LoopSourceBridge):
         # 只允许只读文件树/目录查询并发；写操作仍是顺序屏障。
         # Relay 的虚拟 websocket 复用此入口，身份 ContextVar 在各任务内独立绑定。
         reads: set[asyncio.Task] = set()
-        concurrent_reads = {"listDirectory", "gitDetect", "gitStatus", "ping", "codexModelCatalog"}
+        concurrent_reads = {"listDirectory", "gitDetect", "gitStatus", "ping", "codexModelCatalog", "loopControlGet"}
 
         async def reply(req: dict) -> None:
             req_id = req.get("id")
@@ -2095,6 +2108,19 @@ class BridgeWS(LoopSourceBridge):
         if handler is None:
             return None
         self._authorize_rpc(method, handler, params)
+        bound = inspect.signature(handler).bind_partial(*params)
+        sid = str(bound.arguments.get('session_id') or bound.arguments.get('sid') or '')
+        control_read_or_independent = {
+            'loopControlGet', 'loopControlRequest', 'loopTakeover', 'loopRelease',
+            'loopGetState', 'loopGetRecord', 'loopExecutionEnvironmentGet',
+            'loopAddAddon', 'loopEditAddon', 'loopRemoveAddon',
+            'loopAsk', 'loopAsideList', 'loopAsideClear', 'loopAsideAbort',
+        }
+        if sid and self._loop_control_reserved(sid) and (
+                method.startswith('loop') and method not in control_read_or_independent
+                or method in {'clearSessionContext', 'syncAttachedCodexSession', 'destroySession', 'deleteSession',
+                              'updateSessionRuntime', 'updateSessionAbilities', 'updateSessionConstraints'}):
+            return self._control_error('handoff_busy')
         if asyncio.iscoroutinefunction(handler):
             return await handler(*params)
         # 大目录扫描/遍历是磁盘密集型同步代码。留在 WebSocket 事件循环中会同时
@@ -2112,7 +2138,12 @@ class BridgeWS(LoopSourceBridge):
             "updatePromptIcon", "setPromptDefault",
         }:
             return await asyncio.to_thread(handler, *params)
-        return handler(*params)
+        result = handler(*params)
+        writer = getattr(self, '_loop_control_writes', {}).get(sid)
+        if writer and method in {'loopAddAddon', 'loopEditAddon', 'loopRemoveAddon', 'loopAsk', 'loopAsideClear'}:
+            # 同步兼容入口仍须等待自己的保存完成才回复 ok；等待期间不持有 Store 锁。
+            await writer.flush()
+        return result
 
     # ── RPC: 心跳 ─────────────────────────────────────────────
 
@@ -3706,8 +3737,14 @@ class BridgeWS(LoopSourceBridge):
             pass
 
         if session_id:
+            if self._loop_control_reserved(session_id):
+                raise ValueError('控制权正在转交，确认结果后才能发送。')
             if self._active_chat_turn_tasks(session_id):
                 raise ValueError("当前会话正在回答，请排入序列或引导当前轮")
+            if (session_id in getattr(self, '_loop_environment_checks', {})
+                    or any(key[0] == session_id for key in getattr(self, '_loop_environment_requests', {}))
+                    or getattr(self, '_loop_environment_orphans', {}).get(session_id)):
+                raise ValueError('环境检查尚未退出，不能并发启动对话写调用。')
             reservations = getattr(self, "_seq_dispatch_reservations", None)
             if reservations is not None:
                 reservations.pop(session_id, None)
@@ -3806,6 +3843,8 @@ class BridgeWS(LoopSourceBridge):
         payload = json.loads(payload_json)
         command = payload.get("command", "")
         session_id = payload.get("sessionId", "")
+        if self._loop_control_reserved(session_id):
+            return self._control_error('handoff_busy')
 
         if command == "compact":
             session = self._active_sessions.get(session_id)
@@ -4324,12 +4363,14 @@ class BridgeWS(LoopSourceBridge):
         if not meta:
             return "null"
         if meta.get("sessionType") == "loop":
+            meta['loopControlProtocolVersion'] = 1
             loop_meta = self._loop_store.load_meta(sid)
             if loop_meta:
                 meta["loopControlMode"] = (
                     "manual" if loop_meta.get("controlMode") == "manual" else "loop"
                 )
                 meta["loopStage"] = loop_meta.get("stage")
+                meta['controlRevision'] = loop_meta.get('controlRevision', 0)
             # 运行态只读进程内任务注册表，不触碰庞大的 LOOP stage。自动 LOOP
             # 禁用聊天水合后，首屏必须从这里恢复侧栏/面板的运行指示。
             meta["loopRunning"] = self._loop_is_running(sid)
@@ -4693,6 +4734,8 @@ class BridgeWS(LoopSourceBridge):
             return "Session 仍有对话任务正在运行"
         if self._loop_is_running(session_id):
             return "Session 的 LOOP 仍在运行"
+        if self._loop_has_active_call(session_id):
+            return "Session 的执行或环境检查尚未确认退出"
         if session_id in getattr(self, "_aside_running", set()) or session_id in getattr(self, "_chat_aside_running", set()):
             return "Session 的旁路任务仍在运行"
         if any(
@@ -4968,7 +5011,7 @@ class BridgeWS(LoopSourceBridge):
             "compressedHistory": compressed is not None,
         }, ensure_ascii=False)
 
-    def _rpc_convertSessionToLoop(self, session_id: str, goal: str) -> str:
+    def _rpc_convertSessionToLoop(self, session_id: str, goal: str, workflow_command: str = '', workflow_digest: str = '') -> str:
         """Convert an idle ordinary Session into a LOOP with an explicit goal.
 
         The Session id, transcript, Backend/runtime, working directory and native
@@ -5015,6 +5058,14 @@ class BridgeWS(LoopSourceBridge):
             }, ensure_ascii=False)
 
         state = LoopState(session_id=session_id, stage=STAGE_EXECUTE, goal=target)
+        if workflow_command:
+            from .loop_environment_workflow import select_workflow, WorkflowSelectionError
+            try:
+                reference = select_workflow(session, self._skill_store, workflow_command,
+                                             workflow_digest, target, source='conversion')
+                state.execution_environment = {'revision': 1, 'status': 'unknown', 'workflowRef': reference}
+            except WorkflowSelectionError as exc:
+                return json.dumps({'status': 'error', 'message': str(exc)}, ensure_ascii=False)
         state.handoff = handoff_from_session(session)
         state.record_goal(target, source="manual")
         previous_type = session.session_type
@@ -5073,6 +5124,11 @@ class BridgeWS(LoopSourceBridge):
     def _loop_save(self, st: "LoopState") -> None:
         """写盘并刷新缓存，保证后续读到同一对象。"""
         self._loop_states[st.session_id] = st
+        writer = getattr(self, '_loop_control_writes', {}).get(st.session_id)
+        if writer is not None:
+            st.updated_at = time.time()
+            writer.enqueue(st.to_dict())
+            return
         store = self._loop_store
         store.save(st)
 
@@ -5088,7 +5144,14 @@ class BridgeWS(LoopSourceBridge):
     def _loop_payload(self, state: "LoopState", *, compact: bool = False) -> dict:
         """序列化 LoopState，并注入运行态；compact 首屏不携带详情大字段。"""
         d = state.to_dict()
+        d['controlProtocolVersion'] = 1
+        d['controlOperation'] = operation_public(state.control_operation)
+        d.pop('controlReceipts', None)
         if compact:
+            from .loop_execution_environment import environment_summary
+            d['executionEnvironment'] = environment_summary(state.execution_environment)
+            d['executionEnvironment']['checking'] = (state.session_id in getattr(self, '_loop_environment_checks', {})
+                or any(key[0] == state.session_id for key in getattr(self, '_loop_environment_requests', {})))
             d["handoff"] = {"source": state.handoff.get("source", ""), "available": bool(state.handoff)}
             d["taskSource"] = source_summary(state.task_source)
         running = self._loop_is_running(state.session_id)
@@ -5099,12 +5162,8 @@ class BridgeWS(LoopSourceBridge):
             last and last.kind != "manual" and not last.completed and not last.error and not last.terminal_kind
             and not running and state.stage == STAGE_EXECUTE
         )
-        d["canTakeover"] = bool(
-            state.control_mode == "loop"
-            and state.stage == STAGE_EXECUTE
-            and not running
-            and not d["resumable"]
-        )
+        d['controlEligibility'] = self._loop_control_eligibility(state)
+        d['canTakeover'] = state.control_mode == 'loop' and d['controlEligibility']['takeover']['allowed']
         # ★ 把每条 loop 实际用到的 backend + model + reasoning effort 解析成可读 label，
         #   供面板/流程视图准确追溯「谁以什么档位规划、执行、评审」。
         for rec in d.get("loops", []):
@@ -5126,6 +5185,9 @@ class BridgeWS(LoopSourceBridge):
             rec['sourceSummary'] = {key: {'scopeDigest': snap.get('scopeDigest'), 'stateDigest': snap.get('stateDigest'),
                 'capturedAt': snap.get('capturedAt')} for key, snap in rec.get('sourceSnapshots', {}).items() if isinstance(snap, dict)}
             if compact:
+                from .loop_execution_environment import check_summary
+                rec['environmentCheckCount'] = len(rec.get('environmentChecks', []))
+                rec['environmentChecks'] = [check_summary(v) for v in rec.get('environmentChecks', [])[-1:]]
                 rec['sourceSnapshots'] = {}
                 rec['decisionHistory'] = []
                 rec['milestonePlan'] = {}
@@ -5175,6 +5237,51 @@ class BridgeWS(LoopSourceBridge):
         record = state.loops[-1]
         return record if record.kind == "manual" and not record.completed else None
 
+    def _loop_control_reserved(self, session_id: str) -> bool:
+        if session_id in getattr(self, '_loop_control_jobs', {}):
+            return True
+        state = getattr(self, '_loop_states', {}).get(session_id)
+        operation = state.control_operation if state else {}
+        if state is None:
+            # 重启后首次动作可能是序列派发/直接发送，而不是打开 LOOP 面板。
+            # 先读轻量持久化保护，不能把缓存未命中当作没有在途转交。
+            store = getattr(self, '_loop_store', None)
+            load_meta = getattr(store, 'load_meta', None)
+            if callable(load_meta):
+                meta = load_meta(session_id)
+                if meta is None and store.exists(session_id):
+                    return True  # 权威记录损坏/不可读也不是允许冲突写的证据。
+                operation = (meta or {}).get('controlOperation') or {}
+        return bool(operation and operation.get('status') not in TERMINAL_STATUSES)
+
+    def _loop_control_eligibility(self, state: "LoopState", session: Optional[Session] = None,
+                                  *, ignore_reservation: bool = False) -> dict:
+        """展示与实际入口共用；不创建状态、不保存、不调用模型。"""
+        if session is None:
+            session = getattr(self, '_active_sessions', {}).get(state.session_id)
+            if session is None:
+                store = getattr(self, '_session_store', None)
+                session = store.load(state.session_id) if store else None
+        record = self._loop_manual_record(state)
+        messages = getattr(session, 'messages', [])
+        has_messages = bool(record and messages[max(0, record.manual_start_index):])
+        last = state.loops[-1] if state.loops else None
+        running = self._loop_is_running(state.session_id)
+        facts = ControlFacts(
+            available=session is not None and getattr(session, 'session_type', 'loop') == 'loop',
+            mode=state.control_mode, stage=state.stage, running=running,
+            resumable=bool(last and last.kind != 'manual' and not last.completed and not last.error
+                           and not last.terminal_kind and not running and state.stage == STAGE_EXECUTE),
+            active_call=self._loop_has_active_call(state.session_id),
+            chat_running=bool(session and (self._session_is_streaming(session)
+                              or self._has_seq_dispatch_reservation(state.session_id))),
+            manual_has_messages=has_messages,
+            sequence_pending=bool(has_messages and self._chat_extras_get(state.session_id).pending()),
+            reserved=not ignore_reservation and self._loop_control_reserved(state.session_id),
+            control_revision=state.control_revision,
+        )
+        return {action: control_eligibility(action, facts) for action in ('takeover', 'release')}
+
     def _session_is_streaming(self, session: "Session") -> bool:
         """以真实主任务注册表判断忙闲，不信任可能跨重启残留的消息 streaming 标志。"""
         return bool(self._active_chat_turn_tasks(session.id))
@@ -5184,15 +5291,20 @@ class BridgeWS(LoopSourceBridge):
         normalized = "manual" if mode == "manual" else "loop"
         if getattr(session, "loop_control_mode", None) == normalized:
             return
+        previous = getattr(session, 'loop_control_mode', None)
         session.loop_control_mode = normalized
         store = getattr(self, "_session_store", None)
         save_meta = getattr(store, "save_meta", None)
-        if callable(save_meta):
-            save_meta(session)
-        else:
-            save = getattr(store, "save", None)
-            if callable(save):
-                save(session, async_=True)
+        try:
+            if callable(save_meta):
+                save_meta(session)
+            else:
+                save = getattr(store, "save", None)
+                if callable(save):
+                    save(session, async_=True)
+        except Exception:
+            session.loop_control_mode = previous
+            raise
         emit = getattr(self, "_emit_session_updated", None)
         if callable(emit) and hasattr(self, "_clients"):
             summary = session.meta_dict() if hasattr(session, "meta_dict") else {
@@ -5241,7 +5353,18 @@ class BridgeWS(LoopSourceBridge):
         record = self._loop_manual_record(state)
         if not record:
             return
+        self._build_manual_loop_record(session, record, finalize=finalize)
+        if finalize:
+            record.completed = True
+            record.sub_stage = SUB_DONE
+            record.mark_sub(SUB_DONE)
+            record.artifact_checkpoint = git_snapshot(session.working_dir)
+        self._loop_save(state)
+        self._emit_loop_updated(state)
 
+    def _build_manual_loop_record(self, session: Session, record: LoopRecord,
+                                  *, finalize: bool = False) -> None:
+        """整理指定记录，不做 I/O、不提交完成标记；转交可使用独立草稿。"""
         start = max(0, min(record.manual_start_index, len(session.messages)))
         messages = session.messages[start:]
         record.manual_messages = [self._manual_message_payload(m) for m in messages]
@@ -5281,108 +5404,12 @@ class BridgeWS(LoopSourceBridge):
                              if m.role == "assistant" and m.content.strip()]
         record.result = "\n\n---\n\n".join(assistant_results[-4:])[-12000:]
         record.updated_at = time.time()
-        if finalize:
-            record.completed = True
-            record.sub_stage = SUB_DONE
-            record.mark_sub(SUB_DONE)
-            record.artifact_checkpoint = git_snapshot(session.working_dir)
-        self._loop_save(state)
-        self._emit_loop_updated(state)
 
-    def _rpc_loopTakeover(self, session_id: str, goal: str = "") -> str:
-        """Switch an idle LOOP to ordinary chat and start a manual pass.
+    async def _rpc_loopTakeover(self, session_id: str, goal: str = "") -> str:
+        return await self._control_legacy(session_id, 'takeover', goal)
 
-        在 loopout 调用时会原子地开启新一轮再接管，避免用户先开启自动轮、
-        再赶在模型启动前点击接管的竞态。
-        """
-        state = self._loop_state(session_id)
-        session = self._active_sessions.get(session_id) or self._session_store.load(session_id)
-        if not state or not session or session.session_type != "loop":
-            return json.dumps({"status": "error", "message": "找不到 LOOP 会话"}, ensure_ascii=False)
-        if state.control_mode == "manual":
-            self._mirror_loop_control_mode(session, "manual")
-            return json.dumps({"status": "ok", "controlMode": "manual"}, ensure_ascii=False)
-        if state.stage not in (STAGE_EXECUTE, STAGE_OUT):
-            return json.dumps({"status": "error", "message": "请先封口 loopidea，再开启人工轮"}, ensure_ascii=False)
-
-        from_loopout = state.stage == STAGE_OUT
-        payload = self._loop_payload(state, compact=True)
-        if payload.get("running"):
-            message = "上一轮仍在收尾，请稍后再开启人工轮" if from_loopout else "LOOP 正在运行，停止后才能接管"
-            return json.dumps({"status": "error", "message": message}, ensure_ascii=False)
-        if not from_loopout and payload.get("resumable"):
-            return json.dumps({"status": "error", "message": "存在未完成的 LOOP，请先继续完成或丢弃"}, ensure_ascii=False)
-        if self._session_is_streaming(session):
-            return json.dumps({"status": "error", "message": "当前回答尚未结束"}, ensure_ascii=False)
-
-        if from_loopout:
-            # 兼容重启后遗留的 loopout + 未封存记录；人工轮属于新 round，不能错误
-            # 地接续上一轮的断点或沿用上一轮风险曲线。
-            last = state.loops[-1] if state.loops else None
-            if (last and last.round == state.round
-                    and not last.completed and not last.error):
-                self._mark_loop_interrupted(last, "上一轮未完成，开启人工轮时已封存")
-            self._apply_loop_continue(state, goal)
-
-        state.auto = False
-        seq = max((item.seq for item in state.loops), default=0) + 1
-        record = LoopRecord(
-            seq=seq,
-            kind="manual",
-            sub_stage=SUB_EXECUTE,
-            round=state.round,
-            goal="人工接管",
-            manual_start_index=len(session.messages),
-            manual_context=self._loop_context_digest(state),
-            agent_checkpoint=session.agent_session_id or "",
-            git_checkpoint=git_snapshot(session.working_dir),
-        )
-        if not record.git_checkpoint:
-            record.dir_checkpoint = dir_snapshot(session.working_dir)
-        record.mark_sub(SUB_EXECUTE)
-        record.backends["execute"] = session.backend_id
-        record.runtimes["execute"] = self._resolved_runtime(
-            session.backend_id, self._session_runtime(session))
-        state.loops.append(record)
-        state.control_mode = "manual"
-        self._loop_save(state)
-        self._mirror_loop_control_mode(session, "manual")
-        self._emit_loop_updated(state)
-        return json.dumps({
-            "status": "ok", "controlMode": "manual", "seq": seq,
-            "stage": state.stage, "round": state.round,
-        }, ensure_ascii=False)
-
-    def _rpc_loopRelease(self, session_id: str) -> str:
-        """Seal the manual pass and return ownership to the LOOP panel."""
-        state = self._loop_state(session_id)
-        session = self._active_sessions.get(session_id) or self._session_store.load(session_id)
-        if not state or not session:
-            return json.dumps({"status": "error", "message": "找不到 LOOP 会话"}, ensure_ascii=False)
-        if state.control_mode != "manual":
-            self._mirror_loop_control_mode(session, "loop")
-            return json.dumps({"status": "ok", "controlMode": "loop"}, ensure_ascii=False)
-        if self._session_is_streaming(session):
-            return json.dumps({"status": "error", "message": "回答仍在生成，结束后才能交还 LOOP"}, ensure_ascii=False)
-        record = self._loop_manual_record(state)
-        # 空接管必须能立即交还。历史/暂停的序列任务不属于这次空接管，不应把
-        # control_mode 永久锁在 manual；真正产生过人工消息后仍保留原有队列保护。
-        manual_has_messages = bool(
-            record and session.messages[max(0, record.manual_start_index):]
-        )
-        if manual_has_messages and self._chat_extras_get(session_id).pending():
-            return json.dumps({"status": "error", "message": "仍有待发送的序列任务，请先执行完或清空"}, ensure_ascii=False)
-        if record:
-            self._sync_manual_loop_record(session, finalize=True)
-            state = self._loop_state(session_id) or state
-            # Opening and immediately returning should not consume a fake pass.
-            if not record.manual_messages:
-                state.loops = [item for item in state.loops if item is not record]
-        state.control_mode = "loop"
-        self._loop_save(state)
-        self._mirror_loop_control_mode(session, "loop")
-        self._emit_loop_updated(state)
-        return json.dumps({"status": "ok", "controlMode": "loop"}, ensure_ascii=False)
+    async def _rpc_loopRelease(self, session_id: str) -> str:
+        return await self._control_legacy(session_id, 'release')
 
     def _emit_loop_updated(self, state: "LoopState") -> None:
         """广播首屏摘要；大段输出/人工 transcript 按选中记录再懒加载。"""
@@ -5589,6 +5616,9 @@ class BridgeWS(LoopSourceBridge):
         except asyncio.CancelledError:
             outcome = "cancelled"
             raise
+        except EnvironmentPause:
+            outcome = 'environment_wait'
+            raise
         except Exception as exc:
             diagnostic.fail(exc)
             outcome = "stalled" if isinstance(exc, _LoopAgentStalledError) else "error"
@@ -5596,7 +5626,8 @@ class BridgeWS(LoopSourceBridge):
         finally:
             diagnostic.finish(outcome)
             record.outcome_version = 1
-            record.call_results[sub_stage] = {'done': 'normal', 'stalled': 'timeout'}.get(outcome, outcome)
+            if outcome != 'environment_wait':
+                record.call_results[sub_stage] = {'done': 'normal', 'stalled': 'timeout'}.get(outcome, outcome)
             self._loop_save(state)
             self._emit_loop_updated(state)
 
@@ -5715,6 +5746,8 @@ class BridgeWS(LoopSourceBridge):
             img_objs = img_objs or None
         new_sid: Optional[str] = None
         backend_call_quiesced = True
+        execution_identity = None
+        env_state = None
         try:
             self._loop_active_backends[sid_for_backend] = backend
             print(
@@ -5744,10 +5777,25 @@ class BridgeWS(LoopSourceBridge):
                 "constraints": "\n\n".join(filter(None, [self._compose_constraints(session), SAFETY_CONSTRAINTS, scope_constraints])),
             }
             self._add_runtime_kwargs(backend, send_kwargs, runtime, session)
+            execution_identity = self._loop_execution_identity(
+                session, backend, backend_config_id, sub_stage, call_access, send_kwargs) if seq > 0 else None
             if seq > 0 and isinstance(backend, CodexOfficeBackend):
                 # 使用原生 Codex 沙箱，不复活旧的提示词/路径猜测式 Layer-2 沙箱。
                 # 不支持时让 Backend 明确失败，绝不重试为 danger-full-access。
-                send_kwargs["execution_access"] = call_access
+                send_kwargs["execution_access"] = execution_identity.access
+                send_kwargs["execution_identity"] = execution_identity
+            env_state = self._loop_state(session.id) if execution_identity else None
+            if env_state:
+                blocker = self._loop_environment_blocker(env_state, execution_identity)
+                if blocker:
+                    raise EnvironmentPause(blocker)
+                gate, observer = self._loop_environment_hooks(session, backend, execution_identity, seq, _diagnostic)
+                if isinstance(backend, CodexOfficeBackend):
+                    send_kwargs['environment_observer'] = observer
+                if getattr(backend, 'execution_environment_capabilities', lambda _: {})(execution_identity).get('supported'):
+                    send_kwargs.update(environment_gate=gate, environment_observer=observer)
+                else:
+                    await gate()
             if _diagnostic:
                 from .token_usage import estimate_tokens
                 config = getattr(backend, "config", None)
@@ -5765,6 +5813,8 @@ class BridgeWS(LoopSourceBridge):
                     )),
                     imageCount=len(img_objs or []), resumedContext=bool(effective_agent_sid),
                     inactivityTimeoutSeconds=inactivity_timeout)
+                if execution_identity:
+                    _diagnostic.data['executionEnvironment'] = execution_identity.summary()
                 self._loop_save(self._loop_state(session.id))
             if inactivity_timeout and inactivity_timeout > 0:
                 send_task = asyncio.create_task(traced_send(backend, send_kwargs, call_trace))
@@ -5820,6 +5870,8 @@ class BridgeWS(LoopSourceBridge):
             raise
         except _LoopAgentStalledError:
             raise
+        except EnvironmentPause:
+            raise
         except Exception as e:
             call_error = str(e)
             if _diagnostic:
@@ -5857,6 +5909,12 @@ class BridgeWS(LoopSourceBridge):
             self._session_store.save(session, async_=True)
         if seq > 0 and call_error:
             raise _LoopAgentCallError(call_error, partial_text="".join(parts))
+        if execution_identity and env_state:
+            blocker = self._loop_environment_blocker(env_state, execution_identity)
+            if blocker:
+                record = next((r for r in env_state.loops if r.seq == seq), None)
+                if record:
+                    self._loop_wait(env_state, record, blocker['reasonCode'], blocker['reason'], blocker['resumeCondition'])
         return "".join(parts), new_sid if resume or agent_session_id is not None else None
 
     def _rpc_loopGetState(self, session_id: str, compact: bool = True) -> str:
@@ -6185,6 +6243,8 @@ class BridgeWS(LoopSourceBridge):
 
     def _schedule_loop_iteration(self, session_id: str, *, auto_required: bool = False, decision_id: str = '') -> bool:
         """去重启动一次 iteration，并保留可强制取消的顶层 Task。"""
+        if self._loop_control_reserved(session_id):
+            return False
         existing = self._active_loop_task(session_id)
         try:
             current = asyncio.current_task()
@@ -6285,6 +6345,9 @@ class BridgeWS(LoopSourceBridge):
             return json.dumps({"status": "error", "message": "no loop state"}, ensure_ascii=False)
         if state.control_mode == "manual" and self._coerce_bool(on):
             return json.dumps({"status": "error", "message": "人工接管期间不能启动 Auto LOOP"}, ensure_ascii=False)
+        if self._coerce_bool(on) and (self._loop_has_active_call(session_id)
+                or normalize_environment(state.execution_environment)['blockers']):
+            return json.dumps({'status': 'error', 'message': '请先核对环境与旧调用，再显式恢复；不能用 Auto 绕过阻塞。'}, ensure_ascii=False)
         state.auto = self._coerce_bool(on)
         if state.auto:
             state.progress_guard = {**state.progress_guard, "pause": False}
@@ -6310,7 +6373,6 @@ class BridgeWS(LoopSourceBridge):
             return json.dumps({"status": "error", "message": "上一次 loop 仍在进行"}, ensure_ascii=False)
         if self._loop_has_active_call(session_id):
             return json.dumps({"status": "error", "message": "旧 Backend 调用尚未确认退出，不能启动新的写调用"}, ensure_ascii=False)
-        state.progress_guard = {**state.progress_guard, "pause": False}
         self._schedule_loop_iteration(session_id)
         return json.dumps({"status": "ok"}, ensure_ascii=False)
 
@@ -6372,6 +6434,21 @@ class BridgeWS(LoopSourceBridge):
             if last:
                 self._loop_wait(state, last, 'call_active', '上一 Backend 调用尚未确认退出。', '确认旧调用退出后显式恢复。')
             return
+        environment = normalize_environment(state.execution_environment)
+        if environment['blockers'] or environment['incomplete']:
+            if not auto_required and not any(not b['quiesced'] for b in environment['blockers']):
+                await self._loop_environment_recheck(session, state)
+            environment = normalize_environment(state.execution_environment)
+            if environment['blockers'] or environment['incomplete']:
+                last = state.loops[-1] if state.loops else None
+                if last:
+                    check = (environment['blockers'] or [environment['latest']])[-1]
+                    self._loop_wait(state, last, check.get('reasonCode') or 'env_unknown',
+                                    check.get('reason') or '环境检查不完整。', check.get('resumeCondition', ''))
+                return
+        if not auto_required:
+            self._loop_environment_cache = {}
+            state.progress_guard = {**state.progress_guard, 'pause': False}
         self._loop_running.add(session_id)
         record: Optional[LoopRecord] = None
         # ★ 独立 session 上下文：保存主会话的 agent_session_id，loop 内各 sub-stage 用独立上下文
@@ -6423,6 +6500,12 @@ class BridgeWS(LoopSourceBridge):
                     break
                 if stage != SUB_ANALYSIS:
                     self._loop_stage_decision(state, record, stage, SUB_EXECUTE if stage == SUB_PREPARE else SUB_ANALYSIS)
+        except EnvironmentPause as exc:
+            if record is not None:
+                check = exc.check
+                self._loop_wait(state, record, check['reasonCode'] or 'env_unknown', str(exc), check['resumeCondition'])
+                record.stage_details.setdefault(record.sub_stage, {}).update(status='paused', message=str(exc))
+                self._loop_save(state)
         except Exception as e:
             import traceback
             print(f"[loop] iteration failed: {e}\n{traceback.format_exc()}",
@@ -6446,6 +6529,10 @@ class BridgeWS(LoopSourceBridge):
                         step.ended_at = time.time()
                         step.output = self._loop_progress_for_record(session_id, record.seq).get(f"{record.seq}:step{step.index}", "") or step.output or str(e)
                 record.updated_at = time.time()
+                blockers = normalize_environment(state.execution_environment)['blockers']
+                if blockers:
+                    check = blockers[-1]
+                    self._loop_wait(state, record, check['reasonCode'], check['reason'], check['resumeCondition'])
                 self._loop_save(state)
                 self._emit_loop_updated(state)
         finally:
@@ -6533,8 +6620,14 @@ class BridgeWS(LoopSourceBridge):
         return reverted
 
     def _loop_has_active_call(self, session_id: str) -> bool:
-        return any(key == session_id or key.startswith(session_id + ':')
+        state = getattr(self, '_loop_states', {}).get(session_id)
+        unresolved_exit = state and any(not check['quiesced']
+            for check in normalize_environment(state.execution_environment)['blockers'])
+        return (any(key == session_id or key.startswith(session_id + ':')
                    for key in getattr(self, '_loop_active_backends', {}))
+                or session_id in getattr(self, '_loop_environment_checks', {})
+                or any(key[0] == session_id for key in getattr(self, '_loop_environment_requests', {}))
+                or bool(getattr(self, '_loop_environment_orphans', {}).get(session_id)) or bool(unresolved_exit))
 
     def _loop_evidence_environment(self, session, record) -> str:
         backend_id = record.backends.get('execute') or session.backend_id
@@ -6561,13 +6654,16 @@ class BridgeWS(LoopSourceBridge):
         self._loop_save(state)
 
     def _loop_wait(self, state, record, code: str, reason: str, condition: str = '') -> None:
+        condition = condition.strip() or '核对原始阶段详情及当前环境，补充原因或解除条件后显式恢复。'
         state.auto = False
         state.progress_guard = {**state.progress_guard, 'pause': True, 'reasonCode': code,
                                 'reason': reason, 'resumeCondition': condition, 'seq': record.seq}
         record.outcome_version, record.terminal_kind = 1, 'paused'
         record.task_result = 'blocked'
         decision = decide_next(DecisionFacts(hard_reason=code, reason_text=reason,
-            resume_condition=condition, control_mode=state.control_mode), f'{record.round}:{record.seq}:{record.sub_stage}')
+            resume_condition=condition, control_mode=state.control_mode,
+            user_stop=state.session_id in getattr(self, '_loop_cancel', {}) or state.session_id in getattr(self, '_loop_pending_out', set()),
+            call_still_active=self._loop_has_active_call(state.session_id)), f'{record.round}:{record.seq}:{record.sub_stage}')
         self._loop_keep_decision(state, record, decision)
         record.updated_at = time.time()
         self._loop_save(state)
@@ -6575,6 +6671,8 @@ class BridgeWS(LoopSourceBridge):
 
     def _loop_pause_control(self, state: "LoopState", record: "LoopRecord", text: str) -> bool:
         """模型只能请求收紧执行，不能用控制字段授予权限或宣告完成。"""
+        if state.progress_guard.get('pause') and str(state.progress_guard.get('reasonCode', '')).startswith('env_'):
+            return True
         parsed = self._extract_json_block(text) or {}
         control = parsed.get("loopControl")
         if not isinstance(control, dict) or control.get("pause") is not True:
@@ -6780,6 +6878,8 @@ class BridgeWS(LoopSourceBridge):
                 recheck = guard["needsReplan"] and (state.intent_alert or {}).get("seq") != record.seq
                 if (first_in_round and not already) or recheck:
                     await self._intent_check(session, state, record)
+        except EnvironmentPause:
+            raise
         except Exception as e:
             print(f"[loop] intent guard skipped: {e}", file=sys.stderr, flush=True)
 
@@ -7109,11 +7209,21 @@ class BridgeWS(LoopSourceBridge):
                 step.call_result = 'cancelled'
                 self._loop_save(state)
                 raise
+            except EnvironmentPause:
+                step.attempts -= 1
+                step.status = 'pending'
+                step.task_result = 'blocked'
+                self._loop_save(state)
+                raise
             except _LoopAgentCallError as exc:
                 step.call_result = 'error'
                 step.status = "error"
                 step.ended_at = time.time()
                 step.output = exc.partial_text + f"\nBackend 调用失败（不能视作任务成功）：{exc}"
+                blockers = normalize_environment(state.execution_environment)['blockers']
+                if blockers:
+                    check = blockers[-1]
+                    self._loop_wait(state, record, check['reasonCode'], check['reason'], check['resumeCondition'])
                 self._loop_save(state)
                 self._emit_loop_updated(state)
                 return None
@@ -7151,6 +7261,11 @@ class BridgeWS(LoopSourceBridge):
 
             step.call_result = 'normal'
             text = text.strip()
+            if state.progress_guard.get('pause'):
+                step.status, step.task_result = 'done', 'blocked'
+                step.output, step.ended_at = text, time.time()
+                self._loop_save(state)
+                return new_sid
             if text:
                 step.output = text
                 step.status = "done"
@@ -7741,6 +7856,8 @@ class BridgeWS(LoopSourceBridge):
                 "status": "ok", "stage": state.stage, "round": state.round,
                 "stopping": True, "message": "正在停止上一轮，随后自动开启新一轮",
             }, ensure_ascii=False)
+        if self._loop_has_active_call(session_id):
+            return json.dumps({'status': 'error', 'message': '环境检查或旧调用尚未退出，不能开启新一轮。'}, ensure_ascii=False)
         # 进程重启会清空运行注册，但旧 stage 文件可能仍有未完成记录。封存它，
         # 保留部分产出且阻止新一轮错误地 resume 上一 round。
         last = state.loops[-1] if state.loops else None
@@ -8400,6 +8517,8 @@ class BridgeWS(LoopSourceBridge):
 
     def _rpc_seqtaskTakeNext(self, session_id: str) -> str:
         """旧客户端兼容入口：不再领取条目，避免客户端与执行端重复发送。"""
+        if self._loop_control_reserved(session_id):
+            return self._control_error('handoff_busy')
         scheduler = getattr(self, "_sequence_scheduler", None)
         if scheduler is not None:
             scheduler.kick(session_id)
@@ -16223,6 +16342,13 @@ except urllib.error.URLError as e:
 
     def _abort_loop_backend_calls(self, session_id: str) -> None:
         """Abort active isolated LOOP backend calls for one loop session."""
+        checks = {task for key, task in getattr(self, '_loop_environment_requests', {}).items() if key[0] == session_id}
+        check = getattr(self, '_loop_environment_checks', {}).get(session_id)
+        if check:
+            checks.add(check)
+        for task in checks:
+            if not task.done():
+                task.cancel()
         prefix = f"{session_id}:"
         for call_sid, backend in list(self._loop_active_backends.items()):
             if call_sid == session_id or call_sid.startswith(prefix):
@@ -16572,6 +16698,15 @@ except urllib.error.URLError as e:
             constraints = self._compose_constraints(session)
             if skill_call:
                 constraints = "\n\n---\n\n".join(part for part in (constraints, skill_call[1]) if part)
+                from .loop_environment_workflow import workflow_choices
+                from .loop_execution_environment import normalize_workflow
+                choices = await asyncio.to_thread(workflow_choices, session, self._skill_store)
+                choice = next((item for item in choices if item['command'] == skill_call[0].get('command')
+                               and item['digest'] == skill_call[0].get('digest')), None)
+                user_message = next((item for item in reversed(session.messages)
+                                     if item.id == user_id and item.role == 'user'), None)
+                if choice and user_message:
+                    user_message.workflow_ref = normalize_workflow({**choice, 'source': 'explicit_send', 'revision': 1})
                 # 不把行首 /opsx-* 交给 CLI 自己再展开一次；本轮由 AWU 解析并
                 # 加载选中 Skill，原始命令只作为任务记录/参数，附件仍保持完整。
                 call_kind = "项目命令" if skill_call[0].get("kind") == "project" else "Skill"

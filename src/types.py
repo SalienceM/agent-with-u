@@ -170,6 +170,7 @@ class ChatMessage:
     # Follow-up delivery semantics.  Kept on the message (not the backend)
     # because it is part of the visible Session history.
     delivery_mode: Optional[str] = None  # steer | redirect
+    workflow_ref: Optional[dict] = None  # 显式工作流元数据，不含参数或历史授权
 
     def has_visible_payload(self) -> bool:
         """正文之外，思考、工具和附件也都属于可展示的有效回复。"""
@@ -208,6 +209,9 @@ class ChatMessage:
             d["thinkingBlocks"] = [tb.to_dict() for tb in self.thinking_blocks]
         if self.delivery_mode in {"steer", "redirect"}:
             d["deliveryMode"] = self.delivery_mode
+        if self.workflow_ref:
+            from .backend.loop_execution_environment import normalize_workflow
+            d['workflowRef'] = normalize_workflow(self.workflow_ref)
         return d
 
 
