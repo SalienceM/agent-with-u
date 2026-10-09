@@ -6,10 +6,12 @@ import type { FileFocusRequest } from '../utils/fileFocus';
 import { AppModalPortal } from './AppModalPortal';
 import { ActivityBar } from './WorkbenchNavigation';
 import type { SidebarView, WorkbenchTab } from '../utils/workbench';
+import type { SessionViewMetadata, SessionViewMode } from '../utils/sessionWorkbench';
+import { WorkbenchIcon } from './WorkbenchChrome';
 
 import { SkillBindingTree } from './SkillBindingTree';
 
-interface Session {
+interface Session extends SessionViewMetadata {
   id: string;
   title: string;
   messageCount: number;
@@ -43,6 +45,7 @@ interface Props {
   activeWorkbenchTab?: WorkbenchTab;
   activeSessionId: string | null;
   onSelectSession: (id: string) => void;
+  onRequestViewMode?: (id: string, mode: SessionViewMode) => void;
   onNewSession: () => void;
   onDeleteSession?: (id: string) => void;
   onAcknowledgeSession?: (id: string) => void; // ★ 用户明确确认后才消除通知
@@ -60,13 +63,14 @@ interface Props {
   activeExecMode?: 'local' | 'relay';
   activeBackendId?: string;
   activeCodexRemoteHost?: string;
+  activeEngineMode?: boolean;
   sessionLimit?: number;
   fileFocusRequest?: FileFocusRequest | null;
   onAttentionChange?: (context: AttentionContext | null) => void;
 }
 
 // ★ Wrap with React.memo to prevent unnecessary re-renders when parent updates
-export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession, onNewSession, onDeleteSession, onAcknowledgeSession, streamingSessions, completedSessions = new Set(), collapsed, onToggleCollapse, isMobile, width, activeWorkingDir, activeSessionMetaId, activeExecKey, activeExecLabel, activeExecMode, activeBackendId, activeCodexRemoteHost, sessionLimit = 25, fileFocusRequest, onAttentionChange, view: controlledView, onViewChange, onOpenExtension, activeWorkbenchTab }) => {
+export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession, onRequestViewMode, onNewSession, onDeleteSession, onAcknowledgeSession, streamingSessions, completedSessions = new Set(), collapsed, onToggleCollapse, isMobile, width, activeWorkingDir, activeSessionMetaId, activeExecKey, activeExecLabel, activeExecMode, activeBackendId, activeCodexRemoteHost, activeEngineMode, sessionLimit = 25, fileFocusRequest, onAttentionChange, view: controlledView, onViewChange, onOpenExtension, activeWorkbenchTab }) => {
   const [sessions, setSessions] = useState<Session[]>([]);
   const refreshGenerationRef = useRef(0);
   const refreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -817,7 +821,7 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
           <p style={{ color: 'var(--theme-text-muted)', fontSize: 11, lineHeight: 1.7 }}>在右侧标签页打开。切回对话不会关闭市场，也不会停止正在进行的会话。</p>
         </div>
       ) : view === 'files' ? (
-        activeCodexRemoteHost ? (
+        activeEngineMode ? <p style={{ padding: 14, fontSize: 12, color: 'var(--theme-text-muted)' }}>文件目录已在当前 Engine 工作区中打开。</p> : activeCodexRemoteHost ? (
           <div style={{ margin: 12, padding: 14, border: '1px solid var(--theme-border)', borderRadius: 8, color: 'var(--theme-text-muted)', fontSize: 12, lineHeight: 1.65 }}>
             <div style={{ color: 'var(--theme-text)', fontWeight: 600, marginBottom: 5 }}>🌐 Codex SSH Remote · {activeCodexRemoteHost}</div>
             当前会话的文件与命令位于 SSH 主机上，由远端 Codex 工具操作。为避免误操作本机同名目录，这里不展示本机文件树。
@@ -1030,6 +1034,14 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
           <div className="awu-session-context-title" title={sessionContextMenu.session.title}>
             {sessionContextMenu.session.title}
           </div>
+          {onRequestViewMode && <>
+            {(['chat', 'engine'] as const).map(mode => <button key={mode} type="button" className="awu-session-context-item" role="menuitem"
+              onClick={() => { const target = sessionContextMenu.session; setSessionContextMenu(null); onRequestViewMode(target.id, mode); }}>
+              <span className="awu-session-context-icon"><WorkbenchIcon name={mode === 'chat' ? 'chat' : 'code'} size={15} /></span>
+              <span>{mode === 'chat' ? 'Chat · 多会话' : 'Engine · 工程工作区'}</span>
+            </button>)}
+            <div className="awu-session-context-separator" role="separator" />
+          </>}
           <button
             type="button"
             className="awu-session-context-item"
@@ -1609,6 +1621,7 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
   );
 }, (prevProps, nextProps) => {
   return prevProps.activeSessionId === nextProps.activeSessionId
+    && prevProps.onRequestViewMode === nextProps.onRequestViewMode
     && prevProps.view === nextProps.view
     && prevProps.onViewChange === nextProps.onViewChange
     && prevProps.onOpenExtension === nextProps.onOpenExtension
@@ -1625,6 +1638,7 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
     && prevProps.activeExecMode === nextProps.activeExecMode
     && prevProps.activeBackendId === nextProps.activeBackendId
     && prevProps.activeCodexRemoteHost === nextProps.activeCodexRemoteHost
+    && prevProps.activeEngineMode === nextProps.activeEngineMode
     && prevProps.fileFocusRequest?.requestId === nextProps.fileFocusRequest?.requestId
     && prevProps.sessionLimit === nextProps.sessionLimit;
 });

@@ -8,3 +8,5 @@ dashscope>=1.26.3
 PyYAML>=6.0
 tomli>=2.0; python_version < "3.11"
 edge-tts>=7.0.0
+pathspec==0.12.1
+pywinpty==2.0.15; sys_platform == "win32"

@@ -1,0 +1,21 @@
+[package]
+name = "awu-engine-native-documents"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# 直接编译生产核心，不复制适配器；不依赖 Tauri/GTK/WebKit 或生产用户数据。
+[lib]
+path = "../../src-tauri/src/local_documents_core.rs"
+
+[dependencies]
+base64 = "=0.22.1"
+serde = { version = "=1.0.228", features = ["derive"] }
+sha2 = "=0.10.9"
+uuid = { version = "=1.23.1", features = ["v4"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "=0.2.186"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "=0.61.2", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }

@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock, AsyncMock, patch
 
 from src.backend.bridge_ws import BridgeWS, _LoopAgentStalledError
+from src.backend.chat_extras_store import ChatExtras, SeqTask
 from src.backend.loop_store import (
     LoopPolicy,
     LoopRecord,
@@ -183,7 +184,8 @@ class LoopLifecycleTests(unittest.IsolatedAsyncioTestCase):
         bridge._active_sessions = {sid: session}
         bridge._session_store = SimpleNamespace(load=lambda _sid: session)
         bridge._chat_turn_tasks = {}
-        bridge._chat_extras_get = lambda _sid: SimpleNamespace(pending=lambda: [object()])
+        bridge._chat_extras = {sid: ChatExtras(session_id=sid,
+            seq_tasks=[SeqTask(id='queued')])}
         bridge._sync_manual_loop_record = Mock()
         bridge._loop_save = Mock()
         bridge._loop_store = SimpleNamespace(save_frozen=Mock())

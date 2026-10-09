@@ -1,5 +1,5 @@
 import { useState, useCallback, useEffect, useRef, startTransition } from 'react';
-import { api } from '../api';
+import { api, getSessionExecKey } from '../api';
 import { isSkillCommand, type SkillInvocation } from '../utils/skillCommands';
 import { uuid } from '../utils/uuid';
 import type { ImageAttachment } from './useClipboardImage';
@@ -58,6 +58,8 @@ export interface ContentBlock {
 }
 
 export interface PermissionRequest {
+  executor?: string;
+  authoritativeEmpty?: boolean;
   resolved?: boolean;
   allowSkip?: boolean;
   requestId?: string;
@@ -494,6 +496,7 @@ export function useChat(
   useEffect(() => {
     return api.onSessionUpdated(async (data: any) => {
       if (data.sessionId !== sessionId) return;
+      if (data.execKey && data.execKey !== getSessionExecKey(sessionId)) return;
       if (data.type === 'chat_send_rejected' && getStreamState(sessionId).messageId === data.messageId) {
         const authoritative = normalizeMessages(data.messages || []);
         const assistant = authoritative.find((message: ChatMessage) => message.role === 'assistant' && message.streaming);
@@ -587,8 +590,9 @@ export function useChat(
   useEffect(() => {
     return api.onPermissionRequest((data: PermissionRequest) => {
       if (data.sessionId !== sessionId) return;
+      if (data.executor && getSessionExecKey(sessionId) && data.executor !== getSessionExecKey(sessionId)) return;
       if (data.resolved) {
-        setPendingPermission(previous => previous?.requestId === data.requestId ? null : previous);
+        setPendingPermission(previous => data.authoritativeEmpty || previous?.requestId === data.requestId ? null : previous);
       } else setPendingPermission(data);
     });
   }, [sessionId]);
@@ -665,6 +669,7 @@ export function useChat(
       // 注意:全局累积已经在 main.tsx 安装的 installGlobalStreamRouter 里完成,
       //      这里只负责把「属于当前活动 session 的」delta 渲染出来。
       if (delta.sessionId !== sessionId) return;
+      if (delta.executor && delta.executor !== getSessionExecKey(sessionId)) return;
 
       // ★ 从全局 Map 读最新状态(此刻已被全局路由更新好)
       const state = getStreamState(sessionId);
@@ -723,6 +728,10 @@ export function useChat(
       };
 
       switch (delta.type) {
+        case 'workbench_snapshot':
+          setIsStreaming(state.isStreaming); isStreamingRef.current = state.isStreaming;
+          if (mid) scheduleStreamingUpdate();
+          break;
         case 'text_delta':
         case 'thinking':
         case 'tool_start':

@@ -772,7 +772,7 @@ interface Props {
   ttsVoice?: string;
   ttsRate?: number;
   workingDir?: string;
-  onFocusFile?: (relativePath: string) => void;
+  onFocusFile?: (relativePath: string, line?: number, column?: number) => void;
   onRedoMessage?: (message: ChatMessage) => void | Promise<void>;
   onInsertCommand?: (command: string) => void;
 }
@@ -1129,6 +1129,8 @@ function MessageBubbleInner({
     y: number;
     relativePath: string;
     filePath: string;
+    line?: number;
+    column?: number;
   } | null>(null);
   const [fileLinkHover, setFileLinkHover] = useState<{
     x: number;
@@ -1235,7 +1237,7 @@ function MessageBubbleInner({
       e.stopPropagation();
       setFileLinkHover(null);
       setFileLinkMenu(null);
-      onFocusFile(hit.resolved.relativePath);
+      onFocusFile(hit.resolved.relativePath, hit.resolved.line, hit.resolved.column);
       return;
     }
     if (target.tagName === 'IMG') {
@@ -1283,6 +1285,8 @@ function MessageBubbleInner({
       y: Math.max(8, Math.min(e.clientY, window.innerHeight - 174)),
       relativePath: hit.resolved.relativePath,
       filePath: hit.resolved.filePath,
+      line: hit.resolved.line,
+      column: hit.resolved.column,
     });
   }, [onFocusFile, resolveFileLinkHit]);
 
@@ -1578,7 +1582,7 @@ function MessageBubbleInner({
               onClick={() => {
                 const relativePath = fileLinkMenu.relativePath;
                 setFileLinkMenu(null);
-                onFocusFile?.(relativePath);
+                onFocusFile?.(relativePath, fileLinkMenu.line, fileLinkMenu.column);
               }}
               className="file-link-menu-item"
             >

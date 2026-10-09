@@ -6,7 +6,8 @@ import type { ImageAttachment } from '../hooks/useClipboardImage';
 import type { TextAttachment, TextAttachmentSource } from '../types/attachments';
 import { SLASH_COMMANDS } from '../hooks/useChat';
 import type { SlashCommand } from '../hooks/useChat';
-import { api, isTauri, onCurrentUserChanged, getExecutors } from '../api';
+import { api, isTauri, onCurrentUserChanged, getExecutors, getCurrentUserProfile, getSessionExecKey } from '../api';
+import { handoffParticipants, handoffScope } from '../utils/workbenchHandoffState';
 import { isSkillCommand, slashQuery, skillInvocation, suggestedSlashCommand, type SkillInvocation, type SkillCommand } from '../utils/skillCommands';
 import { RealtimeVoiceBar } from './RealtimeVoiceBar';
 import type { RealtimeVoiceInteractionMode } from '../utils/realtimeVoice';
@@ -255,7 +256,7 @@ const ChatInputInner = forwardRef<ChatInputHandle, Props>(({
   const attachmentNoticeTimerRef = useRef<number | null>(null);
   // 把 textarea ref 传给 useClipboardImage,这样多 pane 场景下只有聚焦
   // 的输入框对应的 hook 会处理粘贴,避免一张图被所有 pane 同时吃下。
-  const { images, removeImage, clearImages, addImage } = useClipboardImage(ref);
+  const { images, removeImage, clearImages, addImage, restoreImages } = useClipboardImage(ref);
   const [textAttachments, setTextAttachments] = useState<TextAttachment[]>([]);
   const [attachmentNotice, setAttachmentNotice] = useState('');
   const [attachmentNoticeTone, setAttachmentNoticeTone] = useState<'error' | 'info'>('error');
@@ -695,6 +696,41 @@ const ChatInputInner = forwardRef<ChatInputHandle, Props>(({
       }
     };
   }, [historyKey, sessionId, scheduleTextareaResize, showAttachmentNotice]);
+
+  useEffect(() => {
+    const owner = getCurrentUserProfile().userId, executor = execKey || getSessionExecKey(sessionId);
+    if (!sessionId || !workingDir || !executor) return;
+    const current = () => sessionIdRef.current === sessionId && historyKeyRef.current === historyKey && getCurrentUserProfile().userId === owner;
+    return handoffParticipants.register(handoffScope(owner, executor, sessionId, workingDir), 'input', {
+      export: () => {
+        if (!current() || !ref.current) throw new Error('输入框身份已变化');
+        return { text: ref.current.value, textAttachments: textAttachmentsRef.current.map(item => ({
+          id: item.id, name: item.name, content: item.content, size: item.size, source: item.source })),
+          images: imagesRef.current.map(image => ({ id: image.id, base64: image.base64, mime_type: image.mime_type,
+            size: image.size, width: image.width, height: image.height })),
+          selectionStart: ref.current.selectionStart, selectionEnd: ref.current.selectionEnd, scrollTop: ref.current.scrollTop };
+      },
+      import: value => {
+        const row = value as any, el = ref.current;
+        if (!current() || !el || !row || Object.keys(row).some(key => !['text', 'textAttachments', 'images', 'selectionStart', 'selectionEnd', 'scrollTop'].includes(key))
+          || typeof row.text !== 'string' || row.text.length > 1024 * 1024 || !Array.isArray(row.textAttachments) || row.textAttachments.length > 100
+          || row.textAttachments.some((item: any) => !item || !['id', 'name', 'content'].every(key => typeof item[key] === 'string') || item.content.length > 10 * 1024 * 1024
+            || !Number.isFinite(item.size) || item.size < 0 || item.source && !['paste', 'input', 'voice', 'file'].includes(item.source))
+          || !Array.isArray(row.images) || row.images.length > 32 || row.images.some((image: any) => !image || typeof image.id !== 'string'
+            || typeof image.base64 !== 'string' || image.base64.length > 14 * 1024 * 1024 || !/^[A-Za-z0-9+/=]*$/.test(image.base64)
+            || typeof image.mime_type !== 'string' || !/^image\/[\w.+-]+$/.test(image.mime_type) || !Number.isFinite(image.size) || image.size < 0)
+          || ![row.selectionStart, row.selectionEnd, row.scrollTop].every(n => Number.isFinite(n) && n >= 0)) throw new Error('输入草稿交接内容无效');
+        el.value = row.text;
+        setTextAttachmentList(row.textAttachments.map((item: TextAttachment) => ({ id: item.id, name: item.name, content: item.content, size: item.size, source: item.source })));
+        restoreImages(row.images.map((image: ImageAttachment) => ({ id: image.id, base64: image.base64, mime_type: image.mime_type, size: image.size, width: image.width, height: image.height })));
+        // 单次委托是发送时授权，不属于可迁移的草稿。
+        kitApprovalDelegationRef.current = false; setKitApprovalDelegation(false);
+        saveSessionDraft(row.text); scheduleTextareaResize(true);
+        el.setSelectionRange(Math.min(row.text.length, row.selectionStart), Math.min(row.text.length, row.selectionEnd));
+        el.scrollTop = row.scrollTop;
+      },
+    });
+  }, [historyKey, sessionId, execKey, workingDir, restoreImages, setTextAttachmentList, saveSessionDraft, scheduleTextareaResize]);
 
   useImperativeHandle(forwardedRef, () => ({
     insertCommand: (text, sourceSessionId) => {

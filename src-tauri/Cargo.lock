@@ -15,6 +15,7 @@ dependencies = [
  "arboard",
  "base64 0.22.1",
  "dirs 5.0.1",
+ "libc",
  "png 0.17.16",
  "serde",
  "serde_json",

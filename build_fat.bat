@@ -194,8 +194,12 @@ if exist "src-tauri\binaries\agent-with-u-backend-%TARGET_TRIPLE%.exe" (
 ) else if exist "dist\agent-with-u-backend.exe" (
     copy /y "dist\agent-with-u-backend.exe" "%STAGING%\agent-with-u-backend.exe"
 ) else (
-    echo [WARN] Backend sidecar not found! Installer will be incomplete.
+    echo [ERROR] Backend sidecar not found!
+    exit /b 1
 )
+if errorlevel 1 exit /b 1
+python scripts\check_backend_package.py "%STAGING%\agent-with-u-backend.exe" --report dist\backend-fat.readiness.json
+if errorlevel 1 ( echo [FAILED] Staged backend readiness failed & exit /b 1 )
 
 echo [OK] Artifacts staged
 
@@ -279,6 +283,8 @@ if not exist "dist" mkdir "dist"
 set "NSIS_LOG=dist\nsis-build.log"
 echo [INFO] NSIS log will be saved to: !NSIS_LOG!
 
+python scripts\check_backend_package.py "%STAGING%\agent-with-u-backend.exe" --report dist\backend-fat.readiness.json --confirm
+if errorlevel 1 exit /b 1
 "%MAKENSIS%" /V4 ^
     /DVERSION=!VERSION! ^
     /DTAURI_BUNDLE_DIR=_staging ^

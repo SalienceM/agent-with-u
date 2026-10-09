@@ -80,6 +80,8 @@ test('activity rail and persistent workspace tabs; market filtering, versions an
   await expect(page.getByRole('tabpanel', { name: 'Skills 与 Prompts' })).toBeVisible();
   await page.getByRole('tab', { name: /^Prompts ·/ }).click();
   await page.getByRole('button', { name: '新建 Prompt', exact: true }).click();
+  // 新建编辑器会延迟聚焦名称；等初始化完成，避免它抢走下一项 fill 的焦点。
+  await expect(page.getByPlaceholder('Prompt 名称', { exact: true })).toBeFocused();
   await page.getByPlaceholder('Prompt 名称', { exact: true }).fill('保留草稿');
   await page.getByPlaceholder('输入 Prompt 模板内容…', { exact: true }).fill('标签切换不能丢失此内容');
   await page.getByRole('tab', { name: '扩展市场', exact: true }).click();

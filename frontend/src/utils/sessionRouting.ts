@@ -1,5 +1,9 @@
+import { isSessionViewMode, normalizeSessionViewMode } from './sessionWorkbench';
+
 export function mergeSessionRouting(current: any, incoming: any): any {
   const merged = { ...current, ...incoming };
+  merged.viewMode = isSessionViewMode(incoming?.viewMode)
+    ? incoming.viewMode : normalizeSessionViewMode(current?.viewMode);
   if (typeof current?.controlRevision === 'number'
       && (typeof incoming?.controlRevision !== 'number' || incoming.controlRevision < current.controlRevision)) {
     merged.loopControlMode = current.loopControlMode;

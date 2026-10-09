@@ -19,7 +19,10 @@
 !endif
 
 Name "${PRODUCT_NAME} ${VERSION}"
-OutFile "..\dist\AgentWithU-${VERSION}-setup.exe"
+!ifndef OUTPUT_FILE
+  !define OUTPUT_FILE "..\dist\AgentWithU-${VERSION}-setup.exe"
+!endif
+OutFile "${OUTPUT_FILE}"
 InstallDir "$LOCALAPPDATA\${PRODUCT_NAME}"
 InstallDirRegKey HKCU "${UNINST_KEY}" "InstallLocation"
 RequestExecutionLevel user
@@ -61,7 +64,7 @@ FunctionEnd
 Function CheckAndInstallWebView2
 
   ; 常量定义
-  StrCpy $R0 "F3017226-FE2A-4295-8BDF-00C3A9A7E4C5"  ; WebView2 runtime GUID
+  StrCpy $R0 "{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}"  ; 注册表中的 WebView2 GUID 包含花括号
   StrCpy $R1 "https://go.microsoft.com/fwlink/p/?LinkId=2124703"  ; Evergreen Bootstrapper
 
   ; ── 1. 快速检测：NSIS 原生注册表读取（32 位视图 + 64 位视图）──

@@ -42,6 +42,7 @@ class LoopControlBridge:
                 'controlMode': state.control_mode, 'controlRevision': state.control_revision,
                 'auto': state.auto, 'stage': state.stage, 'round': state.round,
                 'eligibility': self._loop_control_eligibility(state, session),
+                'engineeringActivities': self._engineering_feedback(state.session_id),
                 'currentOperation': operation_public(state.control_operation),
                 'operation': operation_public(operation)}
 

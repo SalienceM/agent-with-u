@@ -29,14 +29,18 @@ import { SkillRuntimeDialog } from './components/SkillRuntimeDialog';
 import { WorkbenchTabs } from './components/WorkbenchNavigation';
 import { AppModalVisibilityContext } from './components/AppModalPortal';
 import { uiDensityCss } from './utils/uiDensity';
-import { workbenchReducer, isConversationTab, sessionWorkbenchTab, workbenchSessionId, selectSessionPane, loadWorkbenchSnapshot, saveWorkbenchSnapshot, type SidebarView, type WorkbenchTab } from './utils/workbench';
+import { workbenchReducer, isConversationTab, sessionWorkbenchTab, workbenchSessionId, selectSessionPane, loadWorkbenchSnapshot, saveWorkbenchSnapshot, normalizeWorkbenchSnapshot, type SidebarView, type WorkbenchTab } from './utils/workbench';
+import { readSessionWindowRoute } from './utils/sessionWindowRoute';
 import { ScratchPad } from './components/ScratchPad';
 import { AssetPanel } from './components/AssetPanel';
 import { ServerDirPicker } from './components/ServerDirPicker';
 import { LogViewer } from './components/LogViewer';
 import { ConnectionPanel } from './components/ConnectionPanel';
 import { ManualPanel } from './components/ManualPanel';
-import { ChatPane } from './components/ChatPane';
+import { SessionWorkbench } from './components/SessionWorkbench';
+import { useWorkbenchExitState } from './hooks/useWorkbenchExitState';
+import { localSessionView, sessionViewKey } from './utils/sessionViewPreference';
+import type { SessionViewMode } from './utils/sessionWorkbench';
 import { LoopPanel } from './components/LoopPanel';
 import { ThoughtsAssistant } from './components/ThoughtsAssistant';
 import { HomeDashboard } from './home/HomeDashboard';
@@ -88,6 +92,7 @@ const LAYOUT_CYCLE: Layout[] = ['1x1', '1x2', '2x2'];
 const LAYOUT_LABEL: Record<Layout, string> = { '1x1': '1×1', '1x2': '1×2', '2x2': '2×2' };
 
 export const App: React.FC = () => {
+  useWorkbenchExitState();
   const [backends, setBackends] = useState<any[]>([]);
   const [backendConfigs, setBackendConfigs] = useState<any[]>([]);
   const [sessions, setSessions] = useState<any[]>([]);
@@ -112,7 +117,8 @@ export const App: React.FC = () => {
   const [backendManagerLoading, setBackendManagerLoading] = useState(false);
   const [backendManagerError, setBackendManagerError] = useState('');
   const backendManagerLoadGenerationRef = useRef(0);
-  const [initialWorkspace] = useState(() => loadWorkbenchSnapshot(getCurrentUserProfile()));
+  const [windowRoute] = useState(() => readSessionWindowRoute(window.location.search));
+  const [initialWorkspace] = useState(() => windowRoute ? normalizeWorkbenchSnapshot(null) : loadWorkbenchSnapshot(getCurrentUserProfile()));
   const [workbench, dispatchWorkbench] = useReducer(workbenchReducer, initialWorkspace.workbench);
   const mountedSessionIdsRef = useRef(new Set<string>());
   const [sidebarView, setSidebarView] = useState<SidebarView>('sessions');
@@ -124,6 +130,17 @@ export const App: React.FC = () => {
   const [logViewerOpen, setLogViewerOpen] = useState(false);
   const [connPanelOpen, setConnPanelOpen] = useState(false);
   const [currentUser, setCurrentUser] = useState<CurrentUserProfile>(() => getCurrentUserProfile());
+  const [sessionViews, setSessionViews] = useState<Record<string, SessionViewMode>>({});
+  const [sessionViewPresence, setSessionViewPresence] = useState<Record<string, boolean>>({});
+  const [modeRequest, setModeRequest] = useState<{ id: number; user: string; session: string; mode: SessionViewMode } | null>(null);
+  const [sessionMenuRequest, setSessionMenuRequest] = useState<{ id: number; session: string; anchor: HTMLButtonElement } | null>(null);
+  const sessionMenuSequence = useRef(0);
+  const handleViewModeChange = useCallback((key: string, mode: SessionViewMode) => {
+    setSessionViews(previous => previous[key] === mode ? previous : { ...previous, [key]: mode });
+  }, []);
+  const handleViewPresenceChange = useCallback((key: string, present: boolean) => {
+    setSessionViewPresence(previous => previous[key] === present ? previous : { ...previous, [key]: present });
+  }, []);
   const [manualPanelOpen, setManualPanelOpen] = useState(false);
   const [manualLoopMenuOpen, setManualLoopMenuOpen] = useState(false);
   const [manualLoopInspectorOpen, setManualLoopInspectorOpen] = useState(false);
@@ -148,7 +165,7 @@ export const App: React.FC = () => {
   const [isImporting, setIsImporting] = useState(false);
   const [dataPicker, setDataPicker] = useState<'export' | 'import' | null>(null);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(
-    () => typeof window !== 'undefined' && window.innerWidth <= 768,
+    () => !!windowRoute || typeof window !== 'undefined' && window.innerWidth <= 768,
   );
   // 侧栏宽度可拖拽(localStorage 持久化),规避窄侧栏下文件目录树太挤。
   const [sidebarWidth, setSidebarWidth] = useState<number>(() => {
@@ -194,10 +211,20 @@ export const App: React.FC = () => {
 
   // 焦点 pane 的 session 详情(顶栏展示 workingDir / backendId 用)
   const [activeSession, setActiveSession] = useState<any | null>(null);
+  const focusedMeta = activeSession?.id === activeSessionId ? activeSession : sessions.find(session => session.id === activeSessionId);
+  const focusedViewKey = sessionViewKey(currentUser.userId, focusedMeta?.execKey || getSessionExecKey(activeSessionId) || '', activeSessionId || '');
+  const focusedMode = sessionViews[focusedViewKey] || (() => {
+    try { return localSessionView(window.localStorage, focusedViewKey); } catch { return undefined; }
+  })() || focusedMeta?.viewMode;
+  const engineWorkspace = chatWorkspaceVisible && !!activeSessionId && focusedMode === 'engine' && sessionViewPresence[focusedViewKey] !== false;
+  // 单工程只隔离导航与展示；保留 Chat 的标签、分屏和已挂载状态，不停止后台工作。
+  const engineSessionRef = useRef<string | null>(null);
+  engineSessionRef.current = engineWorkspace ? activeSessionId : null;
 
   useEffect(() => onCurrentUserChanged((profile, identityChanged) => {
     setCurrentUser(profile);
     if (!identityChanged) return;
+    setSessionViews({}); setSessionViewPresence({}); setModeRequest(null); setSessionMenuRequest(null);
     const restored = loadWorkbenchSnapshot(profile);
     mountedSessionIdsRef.current.clear();
     dispatchWorkbench({ type: 'restore', state: restored.workbench });
@@ -219,6 +246,11 @@ export const App: React.FC = () => {
 
   // 把 sessionId 写入指定 pane(默认焦点 pane)的小工具
   const setSessionInPane = useCallback((id: string | null, paneIdx?: number) => {
+    if (engineSessionRef.current && id !== engineSessionRef.current) {
+      setToast({ type: 'info', message: '当前窗口专注此工程。请从当前会话菜单返回 Chat 后再切换会话。' });
+      return;
+    }
+    if (id) window.dispatchEvent(new CustomEvent('awu-session-selected', { detail: { session: id } }));
     const selected = selectSessionPane(paneSessions, id, paneIdx ?? focusedPaneIdx, LAYOUT_SLOTS[layout]);
     dispatchWorkbench({ type: 'open', tab: id ? sessionWorkbenchTab(id) : 'chat' });
     setPaneSessions(selected.panes);
@@ -228,6 +260,28 @@ export const App: React.FC = () => {
       const next = new Set(previous); next.delete(id); return next;
     });
   }, [focusedPaneIdx, paneSessions, layout]);
+  const requestSessionMode = useCallback((session: string, mode: SessionViewMode) => {
+    if (engineSessionRef.current && session !== engineSessionRef.current) return;
+    setSessionInPane(session);
+    setModeRequest({ id: ++sessionMenuSequence.current, user: currentUser.userId, session, mode });
+  }, [setSessionInPane, currentUser.userId]);
+  const openSessionMenu = useCallback((session: string, anchor: HTMLButtonElement) => {
+    if (engineSessionRef.current && session !== engineSessionRef.current) return;
+    setSessionInPane(session);
+    setSessionMenuRequest({ id: ++sessionMenuSequence.current, session, anchor });
+  }, [setSessionInPane]);
+
+  useEffect(() => {
+    if (!windowRoute || !backendConnected) return;
+    let alive = true;
+    void api.resolveWorkspaceSession(windowRoute.executor, windowRoute.session).then(session => {
+      if (alive && session?.id) {
+        dispatchWorkbench({ type: 'open', tab: sessionWorkbenchTab(session.id) });
+        setPaneSessions([session.id, null, null, null]); setFocusedPaneIdx(0); setLayout('1x1');
+      }
+    }).catch(error => { if (alive) setToast({ type: 'error', message: String(error) }); });
+    return () => { alive = false; };
+  }, [windowRoute, backendConnected, currentUser.userId]);
 
   // 分屏焦点、启动恢复、会话迁移也走同一个标签账本；列表更新不会重排/打开所有 Session。
   useEffect(() => {
@@ -261,6 +315,7 @@ export const App: React.FC = () => {
   }, [activeSessionId, chatWorkspaceVisible]);
 
   const selectWorkbenchTab = useCallback((tab: WorkbenchTab) => {
+    if (engineSessionRef.current && tab !== sessionWorkbenchTab(engineSessionRef.current)) return;
     if (isConversationTab(tab)) {
       setSessionInPane(workbenchSessionId(tab));
       setSurfaceFocus(tab === 'chat' ? 'home' : 'session');
@@ -291,6 +346,7 @@ export const App: React.FC = () => {
   const notifiedCompletionKeysRef = useRef<Set<string>>(new Set());
   const isMobile = useIsMobile();
   const openExtensionTab = useCallback((tab: 'library' | 'market') => {
+    if (engineSessionRef.current) return;
     dispatchWorkbench({ type: 'open', tab }); setSurfaceFocus('skills');
     if (isMobile) setSidebarCollapsed(true);
   }, [isMobile]);
@@ -919,6 +975,10 @@ export const App: React.FC = () => {
 
   /* ---- 新建会话 ---- */
   const handleNewSession = useCallback(() => {
+    if (engineSessionRef.current) {
+      setToast({ type: 'info', message: '请先返回 Chat，再新建或切换会话。' });
+      return;
+    }
     // Open dialog to select working directory first
     setNewSessionInitialType('normal');
     setNewSessionDialogOpen(true);
@@ -1442,7 +1502,7 @@ export const App: React.FC = () => {
       `}</style>
 
       {/* ★ 移动端侧栏抽屉的半透明遮罩 */}
-      {isMobile && !sidebarCollapsed && (
+      {isMobile && !sidebarCollapsed && !engineWorkspace && (
         <div
           onClick={() => setSidebarCollapsed(true)}
           style={{
@@ -1452,6 +1512,7 @@ export const App: React.FC = () => {
         />
       )}
 
+      <div hidden={engineWorkspace} style={{ display: engineWorkspace ? 'none' : 'contents' }}>
       <Sidebar
         view={sidebarView}
         onViewChange={setSidebarView}
@@ -1459,6 +1520,7 @@ export const App: React.FC = () => {
         onOpenExtension={openExtensionTab}
         isMobile={isMobile}
         activeSessionId={activeSessionId}
+        onRequestViewMode={requestSessionMode}
         onSelectSession={(id) => {
           // 分屏架构:把选中的 session 放到当前焦点 pane,activeSessionId 自动派生过去
           setSessionInPane(id);
@@ -1504,9 +1566,10 @@ export const App: React.FC = () => {
         fileFocusRequest={fileFocusRequest}
         onAttentionChange={handleAttentionChange}
       />
+      </div>
 
       {/* 侧栏宽度拖拽手柄(桌面端展开时) */}
-      {!sidebarCollapsed && !isMobile && (
+      {!sidebarCollapsed && !isMobile && !engineWorkspace && (
         <div
           onMouseDown={handleSidebarDragStart}
           title="拖拽调整侧栏宽度"
@@ -1524,7 +1587,7 @@ export const App: React.FC = () => {
         {/* ---- 顶部栏 ---- */}
         <div className="awu-topbar" style={isMobile ? { ...headerStyle, padding: '4px 8px', gap: 2, flexWrap: 'nowrap', alignItems: 'center' } : headerStyle}>
           {/* ★ 移动端：唤出侧栏抽屉的汉堡按钮 */}
-          {isMobile && (
+          {isMobile && !engineWorkspace && (
             <button
               onClick={() => setSidebarCollapsed(false)}
               aria-label="打开会话列表"
@@ -1534,7 +1597,7 @@ export const App: React.FC = () => {
               ☰
             </button>
           )}
-          <button
+          {engineWorkspace ? <span style={{ fontSize: 15, fontWeight: 600, padding: '4px 2px', color: 'var(--theme-text)' }}>AgentWithU</span> : <button
             type="button"
             onClick={() => setSessionInPane(null)}
             aria-label="返回工作总览"
@@ -1546,7 +1609,7 @@ export const App: React.FC = () => {
             }}
           >
             {isMobile ? 'AWU' : 'AgentWithU'}
-          </button>
+          </button>}
           {/* ★ Backend connection indicator */}
           {backendConnected === false && (
             <span
@@ -1736,16 +1799,16 @@ export const App: React.FC = () => {
             </button>
             {moreMenuOpen && (
               <div role="menu" aria-label="更多功能" style={moreMenuStyle}>
-                <TopbarMenuItem icon="▦" label={`分屏布局 · ${LAYOUT_LABEL[layout]}`} onClick={() => {
+                {!engineWorkspace && <TopbarMenuItem icon="▦" label={`分屏布局 · ${LAYOUT_LABEL[layout]}`} onClick={() => {
                   setLayout((current) => LAYOUT_CYCLE[(LAYOUT_CYCLE.indexOf(current) + 1) % LAYOUT_CYCLE.length]);
                   setMoreMenuOpen(false);
-                }} />
-                <TopbarMenuItem icon="📦" label="Skills 与 Prompts" active={repoPanelOpen} onClick={() => {
+                }} />}
+                {!engineWorkspace && <TopbarMenuItem icon="📦" label="Skills 与 Prompts" active={repoPanelOpen} onClick={() => {
                   setSurfaceFocus('skills');
                   dispatchWorkbench({ type: 'open', tab: 'library' });
                   setSidebarView('extensions');
                   setMoreMenuOpen(false);
-                }} />
+                }} />}
                 <TopbarMenuItem icon="🗂" label="素材池" active={assetPanelOpen} onClick={() => {
                   setSurfaceFocus('assets');
                   setAssetPanelOpen((open) => !open);
@@ -1784,9 +1847,9 @@ export const App: React.FC = () => {
 
         {/* ---- Claude 登录状态提示 ---- */}
 
-        <WorkbenchTabs state={workbench} editing={repoPanelEditing} sessions={sessions}
+        {!engineWorkspace && <WorkbenchTabs state={workbench} editing={repoPanelEditing} sessions={sessions}
           streamingSessions={streamingSessions} completedSessions={completedSessions}
-          onSelect={selectWorkbenchTab} onClose={closeWorkbenchTab} />
+          onSelect={selectWorkbenchTab} onClose={closeWorkbenchTab} onSessionMenu={openSessionMenu} />}
         {workbench.tabs.includes('library') && <section id="workbench-panel-library" role="tabpanel" aria-labelledby="workbench-tab-library"
           hidden={workbench.active !== 'library'} style={{ display: workbench.active === 'library' ? 'flex' : 'none', flex: 1, minHeight: 0, overflow: 'hidden' }}>
           <RepoPanel open={workbench.active === 'library'} embedded revision={skillLibraryRevision} workingDir=""
@@ -1809,8 +1872,8 @@ export const App: React.FC = () => {
          */}
         {(() => {
           const slotCount = LAYOUT_SLOTS[layout];
-          const gridCols = layout === '2x2' ? '1fr 1fr' : layout === '1x2' ? '1fr 1fr' : '1fr';
-          const gridRows = layout === '2x2' ? '1fr 1fr' : '1fr';
+          const gridCols = engineWorkspace ? '1fr' : layout === '2x2' ? '1fr 1fr' : layout === '1x2' ? '1fr 1fr' : '1fr';
+          const gridRows = !engineWorkspace && layout === '2x2' ? '1fr 1fr' : '1fr';
           const openedSessionIds = [...new Set([
             ...workbench.tabs.map(workbenchSessionId), ...paneSessions,
           ].filter((id): id is string => !!id))];
@@ -1820,7 +1883,8 @@ export const App: React.FC = () => {
           }
           const columnCount = layout === '1x1' ? 1 : 2;
           return (
-            <div id="workbench-panel-chat" role="tabpanel" aria-labelledby={`workbench-tab-${chatWorkspaceVisible ? workbench.active : 'chat'}`} hidden={!chatWorkspaceVisible} style={{
+            <div id="workbench-panel-chat" role={engineWorkspace ? 'region' : 'tabpanel'} aria-label={engineWorkspace ? 'Session 工程工作区' : undefined}
+              aria-labelledby={engineWorkspace ? undefined : `workbench-tab-${chatWorkspaceVisible ? workbench.active : 'chat'}`} hidden={!chatWorkspaceVisible} style={{
               flex: 1,
               display: chatWorkspaceVisible ? 'grid' : 'none',
               gridTemplateColumns: gridCols,
@@ -1832,13 +1896,20 @@ export const App: React.FC = () => {
             }}>
               {openedSessionIds.filter(sid => mountedSessionIdsRef.current.has(sid)).map(sid => {
                 const idx = paneSessions.indexOf(sid);
-                const placed = idx >= 0 && idx < slotCount;
+                const placed = engineWorkspace ? sid === activeSessionId : idx >= 0 && idx < slotCount;
                 return <div key={sid} data-session-tab-panel={sid} hidden={!placed}
                   style={{ display: placed ? 'flex' : 'none', minWidth: 0, minHeight: 0, overflow: 'hidden',
-                    gridColumn: placed ? idx % columnCount + 1 : undefined,
-                    gridRow: placed ? Math.floor(idx / columnCount) + 1 : undefined }}>
+                    gridColumn: placed ? engineWorkspace ? 1 : idx % columnCount + 1 : undefined,
+                    gridRow: placed ? engineWorkspace ? 1 : Math.floor(idx / columnCount) + 1 : undefined }}>
                   <AppModalVisibilityContext.Provider value={chatWorkspaceVisible && placed}>
-                  <ChatPane
+                  <SessionWorkbench
+                    key={currentUser.userId}
+                    onViewModeChange={handleViewModeChange}
+                    onViewPresenceChange={handleViewPresenceChange}
+                    modeRequest={modeRequest?.session === sid ? modeRequest : null}
+                    menuRequest={sessionMenuRequest?.session === sid ? sessionMenuRequest : undefined}
+                    onRestoreFilePanel={() => { setSessionInPane(sid, idx >= 0 ? idx : undefined); setSidebarView('files'); setSidebarCollapsed(false); }}
+                    onAttentionChange={chatWorkspaceVisible && placed && focusedPaneIdx === idx ? handleAttentionChange : undefined}
                     paneId={idx}
                     sessionId={sid}
                     isVisible={chatWorkspaceVisible && placed}
@@ -1868,7 +1939,7 @@ export const App: React.FC = () => {
                   </AppModalVisibilityContext.Provider>
                 </div>;
               })}
-              {Array.from({ length: slotCount }).map((_, idx) => paneSessions[idx] ? null : (
+              {!engineWorkspace && Array.from({ length: slotCount }).map((_, idx) => paneSessions[idx] ? null : (
                 <div key={`empty-slot-${idx}`} onPointerDown={() => {
                   setFocusedPaneIdx(idx); dispatchWorkbench({ type: 'open', tab: 'chat' });
                 }} style={{ display: 'contents' }}>

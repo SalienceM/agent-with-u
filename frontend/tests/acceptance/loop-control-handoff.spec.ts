@@ -1,7 +1,8 @@
 import { test, expect, type Page, type WebSocketRoute } from '@playwright/test';
+import { selectMode } from './engine-actions';
 
 const sid = 'qa-loop-000', title = '首页交付 Loop 1';
-async function fixture(page: Page, mode: 'loop' | 'manual' = 'loop', legacy = false) {
+async function fixture(page: Page, mode: 'loop' | 'manual' = 'loop', legacy = false, engineering = false, workbench = engineering) {
   let socket: WebSocketRoute;
   let operation: any;
   let revision = 0;
@@ -11,12 +12,20 @@ async function fixture(page: Page, mode: 'loop' | 'manual' = 'loop', legacy = fa
   let state: any;
   const writes: any[] = [], reads: string[] = [];
   const condition = { allowed: true, reasonCode: 'ready', message: '可以转交', nextStep: 'request' };
+  const workspace = { ownerId: 'local', executorInstance: 'fixture', sessionId: sid, workingDir: 'C:/qa/loop-engine', workspaceRevision: 'a'.repeat(64) };
+  let confirmStop = false;
+  const terminal: any = { workspace, resourceId: 'loop-terminal', generation: 'loop-generation', requestId: 'prior-create', activityId: 'blocking-terminal',
+    status: 'running', exitConfirmed: false, reasonCode: '', revision: 1, lastSequence: 0, inputSequence: 0, cols: 80, rows: 24,
+    shell: { id: 'fake', executable: 'C:/qa/shell', args: [] } };
+  const activities = () => engineering && !terminal.exitConfirmed ? [{ activityId: terminal.activityId, kind: 'terminal', workspace,
+    status: terminal.status, resourceId: terminal.resourceId, generation: terminal.generation, relativePath: '' }] : [];
   let eligibility = { takeover: { ...condition }, release: { ...condition } };
   const summary = () => ({ protocolVersion: 1, sessionId: sid, controlMode: mode, controlRevision: revision,
-    stage, round: 1, auto: false, eligibility, operation });
+    stage, round: 1, auto: false, eligibility, operation, engineeringActivities: activities() });
   const loopState = () => ({ ...state, sessionId: sid, stage, controlMode: mode, controlRevision: revision,
     running: false, resumable: false, auto: false, controlProtocolVersion: legacy ? undefined : 1, controlOperation: operation,
-    controlEligibility: eligibility, canTakeover: eligibility.takeover.allowed });
+    controlEligibility: eligibility, canTakeover: eligibility.takeover.allowed, engineeringActivities: activities() });
+  if (engineering) eligibility.release = { allowed: false, reasonCode: 'engineering_activity', message: '终端仍存活', nextStep: 'workbench' };
   await page.addInitScript(() => {
     window.confirm = () => { (window as any).handoffConfirmedAt = performance.now(); return true; };
   });
@@ -27,6 +36,24 @@ async function fixture(page: Page, mode: 'loop' | 'manual' = 'loop', legacy = fa
     ws.onMessage(message => {
       const frame = JSON.parse(String(message));
       const respond = (result: any) => ws.send(JSON.stringify({ id: frame.id, result: JSON.stringify(result) }));
+      if ((workbench || engineering) && frame.params?.[0] === sid) {
+        if (frame.method === 'sessionWorkbenchCapabilities') return respond({ status: 'ok', protocolVersion: 1, identity: workspace,
+          capabilities: { viewMode: 1, documents: 1, windowHandoff: 0, terminal: engineering ? 1 : 0, languageServices: 0 } });
+        if (frame.method === 'listDirectory') return respond([]);
+        if (frame.method === 'gitDetect') return respond({ isRepo: false });
+        if (frame.method === 'terminalList') return respond({ status: 'ok', workspace, terminals: [terminal], shells: [terminal.shell], controlRevision: revision });
+        if (frame.method === 'terminalRead') return respond({ ...terminal, status: 'ok', terminalStatus: terminal.status, gap: false, through: 0, earliestSequence: 1, chunks: [] });
+        if (frame.method === 'terminalResize') return respond(terminal);
+        if (frame.method === 'terminalStop') {
+          const input = JSON.parse(frame.params[2]);
+          expect(input.resourceId).toBe(terminal.resourceId); expect(input.generation).toBe(terminal.generation);
+          terminal.status = confirmStop ? 'stopped' : 'unknown'; terminal.exitConfirmed = confirmStop; terminal.revision++;
+          if (confirmStop) eligibility.release = { ...condition };
+          reads.push('terminalStop'); return respond(terminal);
+        }
+        if (frame.method === 'updateSessionWorkbench') return respond({ status: 'ok', viewMode: 'engine', summary: { id: sid, viewMode: 'engine', workingDir: workspace.workingDir } });
+        if (['terminalCreate', 'terminalInput', 'workspaceDocumentSave', 'languageServiceStart'].includes(frame.method)) throw Error(`Unrequested engineering mutation ${frame.method}`);
+      }
       if (['sendMessage', 'loopRunIteration', 'seqtaskTakeNext', 'loopSetAuto', 'loopContinue', 'seqtaskClear', 'abortMessage'].includes(frame.method)
         || (!legacy && ['loopTakeover', 'loopRelease'].includes(frame.method)))
         throw new Error(`Unexpected mutation ${frame.method}`);
@@ -57,6 +84,7 @@ async function fixture(page: Page, mode: 'loop' | 'manual' = 'loop', legacy = fa
         let value: any; try { value = JSON.parse(frame.result); } catch { /* */ }
         if (request.method === 'loadSessionMeta' && value) Object.assign(value,
           { loopControlMode: staleMirror ? 'loop' : mode, controlRevision: staleMirror ? 0 : revision,
+            ...(workbench || engineering ? { workingDir: workspace.workingDir } : {}),
             loopControlProtocolVersion: legacy ? undefined : 1 });
         if (request.method === 'loopGetState' && value) { state = value; value = loopState(); }
         if (value) frame.result = JSON.stringify(value);
@@ -69,17 +97,35 @@ async function fixture(page: Page, mode: 'loop' | 'manual' = 'loop', legacy = fa
   if (await opener.isVisible()) await opener.click();
   await page.locator('.awu-sidebar').getByText(title, { exact: true }).click();
   const pane = page.locator(`[data-session-tab-panel="${sid}"]`);
-  return { pane, writes, reads,
+  const expectSuccess = async (controlMode: 'manual' | 'loop') => {
+    await expect.poll(() => page.evaluate(async sessionId => {
+      // @ts-ignore Read the actual shared state without issuing RPCs.
+      const { loopControls, loopControlTarget } = await import('/src/api.ts');
+      const view = loopControls.get(loopControlTarget(sessionId));
+      return { phase: view.phase, controlMode: view.summary?.controlMode, auto: view.summary?.auto,
+        committed: view.summary?.operation?.committed, error: view.error };
+    }, sid)).toEqual({ phase: 'succeeded', controlMode, auto: false, committed: true, error: '' });
+    await expect(pane.locator(controlMode === 'manual' ? '.chat-textarea' : '.awu-loop')).toBeVisible();
+    await expect(pane.getByTestId('loop-control-status')).toHaveCount(0);
+  };
+  return { pane, writes, reads, expectSuccess,
+    engineering: (enabled: boolean) => { engineering = enabled; },
+    confirmStop: () => { confirmStop = true; },
     push: () => socket.send(JSON.stringify({ event: 'loopUpdated', data: JSON.stringify(loopState()) })),
-    complete: (push = true, reply = true) => {
+    complete: (push = true, reply = true, checkpointAvailable = true) => {
       mode = operation.action === 'takeover' ? 'manual' : 'loop'; revision++;
       operation = { ...operation, status: 'succeeded', phase: 'done', revision: 5, controlRevision: revision,
-        updatedAt: Date.now() / 1000, committed: true, checkpointAvailable: true };
+        updatedAt: Date.now() / 1000, committed: true, checkpointAvailable };
       if (push) socket.send(JSON.stringify({ event: 'loopUpdated', data: JSON.stringify(loopState()) }));
       if (reply && pending) pending.ws.send(JSON.stringify({ id: pending.frame.id, result: JSON.stringify({ status: 'accepted', ...summary() }) }));
     },
     failChat: (value: boolean) => { failChat = value; },
     failLoop: (value: boolean) => { failLoop = value; },
+    failOperation: (status: 'failed' | 'blocked') => {
+      operation = { ...operation, status, phase: 'done', revision: 5, message: 'QA 条件已变化', committed: false };
+      socket.send(JSON.stringify({ event: 'loopUpdated', data: JSON.stringify(loopState()) }));
+      pending.ws.send(JSON.stringify({ id: pending.frame.id, result: JSON.stringify({ status: 'accepted', ...summary() }) }));
+    },
     staleMirror: () => { staleMirror = true; },
     offline: (value: boolean) => { offlineRead = value; },
     disconnect: () => socket.close({ code: 1012, reason: 'QA injected disconnect' }),
@@ -87,8 +133,49 @@ async function fixture(page: Page, mode: 'loop' | 'manual' = 'loop', legacy = fa
     block: (message: string, action = 'takeover', nextStep = 'check') => { eligibility = { ...eligibility,
       [action]: { ...condition, allowed: false, message, nextStep } };
       socket.send(JSON.stringify({ event: 'loopUpdated', data: JSON.stringify(loopState()) })); },
-  };
+};
 }
+
+test('idle terminal blocks release, locates Engine, and unknown stop stays protected until confirmed', async ({ page }) => {
+  const f = await fixture(page, 'manual', false, true);
+  const feedback = f.pane.getByLabel('LOOP 工程阻塞活动').first();
+  await expect(feedback).toContainText('空闲 Shell 仍占用');
+  await feedback.getByRole('button', { name: '定位工程活动' }).click();
+  await expect(f.pane.locator('[data-view-mode="engine"]')).toBeVisible();
+  await expect(f.pane.getByRole('region', { name: 'Engine 终端区域' })).toBeVisible();
+  await feedback.getByRole('button', { name: '停止此活动及所属进程' }).click();
+  await expect(feedback).toContainText('退出未确认');
+  expect(f.writes).toHaveLength(0); expect(f.reads.filter(r => r === 'terminalStop')).toHaveLength(1);
+  f.confirmStop();
+  await feedback.getByRole('button', { name: '停止此活动及所属进程' }).click();
+  await expect(feedback.getByText('空闲 Shell 仍占用', { exact: false })).toHaveCount(0);
+  expect(f.writes).toHaveLength(0); // Explicit stop never auto-releases or starts a loop.
+});
+
+test('draft-only release can be cancelled and never saves or discards a buffer', async ({ page }) => {
+  const f = await fixture(page, 'manual');
+  await expect(f.pane.locator('.chat-textarea')).toBeVisible();
+  await page.evaluate(async sessionId => {
+    // @ts-ignore Vite serves this module in the isolated acceptance page.
+    const { documentStore } = await import('/src/utils/documentStore.ts');
+    const workspace = { ownerId: 'local', executorInstance: 'fixture', sessionId, workingDir: '/qa', workspaceRevision: 'a'.repeat(64) };
+    const doc = await documentStore.open({ identity: workspace, read: async (relativePath: string) => ({ document: { workspace, source: 'executor', relativePath }, text: 'base', editable: true }) }, 'draft.py');
+    documentStore.edit(doc.key, 'unsaved');
+    (window as any).confirm = (text: string) => { (window as any).draftWarning = text; return false; };
+  }, sid);
+  await page.getByRole('button', { name: 'Manual LOOP 人工接管中', exact: true }).click();
+  await page.getByRole('button', { name: /交还 LOOP.*封存人工轮/ }).click();
+  await expect.poll(() => page.evaluate(() => (window as any).draftWarning)).toContain('未保存草稿');
+  expect(f.writes).toHaveLength(0);
+  await page.evaluate(() => { window.confirm = () => true; });
+  await page.getByRole('button', { name: /交还 LOOP.*封存人工轮/ }).click();
+  await expect.poll(() => f.writes.length).toBe(1); f.complete();
+  expect(await page.evaluate(async () => {
+    // @ts-ignore Vite fixture import.
+    const { documentStore } = await import('/src/utils/documentStore.ts');
+    return documentStore.all().some((doc: any) => doc.dirty && doc.text === 'unsaved');
+  })).toBe(true);
+});
 
 test('takeover immediately reports pending, slow snapshot and push-before-response', async ({ page }, info) => {
   const f = await fixture(page);
@@ -108,7 +195,7 @@ test('takeover immediately reports pending, slow snapshot and push-before-respon
   await page.screenshot({ path: info.outputPath('slow-handoff.png') });
   f.complete(true, false);
   await expect(f.pane.locator('.chat-textarea')).toBeVisible();
-  await expect(status).toContainText('已人工接管');
+  await f.expectSuccess('manual');
   const reads = f.reads.length;
   await page.waitForTimeout(1500);
   expect(f.writes).toHaveLength(1);
@@ -116,7 +203,7 @@ test('takeover immediately reports pending, slow snapshot and push-before-respon
 });
 
 test('release feedback stays after menu closes and does not enable Auto', async ({ page }, info) => {
-  const f = await fixture(page, 'manual');
+  const f = await fixture(page, 'manual', false, false, true);
   await expect(f.pane.locator('.chat-textarea')).toBeVisible();
   const menu = page.getByRole('button', { name: 'Manual LOOP 人工接管中', exact: true });
   await menu.click();
@@ -126,9 +213,87 @@ test('release feedback stays after menu closes and does not enable Auto', async 
   await expect(f.pane.getByTestId('loop-control-status')).toContainText('正在申请交还 LOOP');
   f.complete(false, true);
   await expect(f.pane.locator('.awu-loop')).toBeVisible();
-  await expect(f.pane.getByTestId('loop-control-status')).toContainText('已交还 LOOP，Auto 仍关闭');
+  await f.expectSuccess('loop');
   expect(f.writes).toHaveLength(1);
   await page.screenshot({ path: info.outputPath('returned-loop.png') });
+});
+
+test('release without checkpoint removes the whole success banner in Chat and Engine', async ({ page }, info) => {
+  const f = await fixture(page, 'manual', false, false, true);
+  await expect(f.pane.locator('.chat-textarea')).toBeVisible();
+  const menu = page.getByRole('button', { name: 'Manual LOOP 人工接管中', exact: true });
+  await menu.click();
+  await page.getByRole('button', { name: /交还 LOOP.*封存人工轮/ }).click();
+  await expect.poll(() => f.writes.length).toBe(1);
+  await menu.click();
+  f.complete(true, true, false);
+  await f.expectSuccess('loop');
+  const checkpoint = () => page.evaluate(async sessionId => {
+    // @ts-ignore Inspect the receipt; removing UI must not erase recovery evidence.
+    const { loopControls, loopControlTarget } = await import('/src/api.ts');
+    return loopControls.get(loopControlTarget(sessionId)).summary?.operation?.checkpointAvailable;
+  }, sid);
+  for (const mode of ['Chat', 'Engine'] as const) {
+    if (mode === 'Engine') {
+      await selectMode(page, f.pane, mode);
+      await expect(f.pane.locator('[data-view-mode="engine"]')).toBeVisible();
+      const conversation = f.pane.getByRole('button', { name: '对话 / LOOP', exact: true });
+      if (await conversation.isVisible()) await conversation.click();
+    }
+    await f.expectSuccess('loop');
+    expect(await checkpoint()).toBe(false);
+    await expect(f.pane.getByText('文件检查点不可用，不能依赖它恢复。', { exact: true })).toHaveCount(0);
+    await expect.poll(async () => {
+      const pane = (await f.pane.locator('.awu-chat-pane').boundingBox())!;
+      const panel = (await f.pane.locator('.awu-loop').boundingBox())!;
+      return Math.abs(panel.y - pane.y);
+    }).toBeLessThanOrEqual(2); // No hidden banner wrapper or reserved top height.
+    await page.screenshot({ path: info.outputPath(`settled-${mode.toLowerCase()}.png`) });
+  }
+  expect(f.writes).toHaveLength(1);
+});
+
+test('settled takeover still shows new read errors and engineering blockers without the old success receipt', async ({ page }) => {
+  const f = await fixture(page);
+  await f.pane.getByRole('button', { name: '✋ 人工接管', exact: true }).click();
+  await expect.poll(() => f.writes.length).toBe(1);
+  f.complete();
+  await f.expectSuccess('manual');
+  f.offline(true);
+  await page.evaluate(async sessionId => {
+    // @ts-ignore Trigger a user-equivalent read, not another control write.
+    const { loopControls, loopControlTarget } = await import('/src/api.ts');
+    await loopControls.check(loopControlTarget(sessionId));
+  }, sid);
+  const status = f.pane.getByTestId('loop-control-status');
+  await expect(status).toContainText('控制权状态核对失败');
+  await expect(status).toHaveAttribute('role', 'alert');
+  await expect(status).not.toContainText('已人工接管');
+  await expect(f.pane.locator('.chat-textarea')).toBeVisible();
+  f.offline(false);
+  await status.getByRole('button', { name: '检查状态', exact: true }).click();
+  await f.expectSuccess('manual');
+  f.engineering(true); f.push();
+  await expect(status).toContainText('交还前请处理以下工程活动');
+  await expect(status.getByLabel('LOOP 工程阻塞活动')).toContainText('空闲 Shell 仍占用');
+  await expect(status).not.toContainText('已人工接管');
+  f.engineering(false); f.push();
+  await f.expectSuccess('manual');
+  expect(f.writes).toHaveLength(1);
+});
+
+for (const result of ['failed', 'blocked'] as const) test(`${result} handoff retains actionable feedback`, async ({ page }) => {
+  const f = await fixture(page);
+  await f.pane.getByRole('button', { name: '✋ 人工接管', exact: true }).click();
+  await expect.poll(() => f.writes.length).toBe(1);
+  f.failOperation(result);
+  const status = f.pane.getByTestId('loop-control-status');
+  await expect(status).toHaveAttribute('role', 'alert');
+  await expect(status).toContainText('QA 条件已变化');
+  await expect(status.getByRole('button', { name: '重新申请', exact: true })).toBeVisible();
+  await expect(f.pane.locator('.awu-loop')).toBeVisible();
+  await expect(f.pane.locator('.chat-textarea')).toHaveCount(0);
+  expect(f.writes).toHaveLength(1);
 });
 
 test('consecutive takeover release and takeover keep each new request busy until its own receipt', async ({ page }) => {
@@ -137,7 +302,7 @@ test('consecutive takeover release and takeover keep each new request busy until
   await f.pane.getByRole('button', { name: '✋ 人工接管', exact: true }).click();
   await expect.poll(() => f.writes.length).toBe(1);
   f.complete();
-  await expect(status).toContainText('已人工接管');
+  await f.expectSuccess('manual');
   await expect(f.pane.locator('.chat-textarea')).toBeVisible();
   const menu = page.getByRole('button', { name: 'Manual LOOP 人工接管中', exact: true });
   await menu.click();
@@ -153,7 +318,7 @@ test('consecutive takeover release and takeover keep each new request busy until
   await page.waitForTimeout(250); // 让上一笔已加载聊天的 effect 有机会运行。
   await expect(status).toContainText('正在申请交还 LOOP');
   f.complete();
-  await expect(status).toContainText('已交还 LOOP，Auto 仍关闭');
+  await f.expectSuccess('loop');
   const takeover = f.pane.getByRole('button', { name: '✋ 人工接管', exact: true });
   await takeover.click();
   await expect.poll(() => f.writes.length).toBe(3);
@@ -162,7 +327,7 @@ test('consecutive takeover release and takeover keep each new request busy until
   await expect(takeover).toBeDisabled();
   await expect(f.pane.locator('.chat-textarea')).toHaveCount(0);
   f.complete();
-  await expect(status).toContainText('已人工接管');
+  await f.expectSuccess('manual');
   expect(new Set(f.writes.map(input => input.requestId)).size).toBe(3);
 });
 
@@ -172,7 +337,7 @@ test('release timeout after successful takeover reconciles without losing the ac
   await f.pane.getByRole('button', { name: '✋ 人工接管', exact: true }).click();
   await expect.poll(() => f.writes.length).toBe(1);
   f.complete();
-  await expect(status).toContainText('已人工接管');
+  await f.expectSuccess('manual');
   await expect(f.pane.locator('.chat-textarea')).toBeVisible();
   const menu = page.getByRole('button', { name: 'Manual LOOP 人工接管中', exact: true });
   await menu.click();
@@ -185,19 +350,20 @@ test('release timeout after successful takeover reconciles without losing the ac
   await expect(status.getByRole('button', { name: '检查状态', exact: true })).toBeEnabled();
   f.complete(false, false); f.offline(false);
   await status.getByRole('button', { name: '检查状态', exact: true }).click();
-  await expect(status).toContainText('已交还 LOOP，Auto 仍关闭');
+  await f.expectSuccess('loop');
   expect(f.writes).toHaveLength(2);
 });
 
 test('committed takeover with failed view retries reads only', async ({ page }) => {
   const f = await fixture(page);
   await f.pane.getByRole('button', { name: '✋ 人工接管', exact: true }).click();
+  await expect.poll(() => f.writes.length).toBe(1);
   f.failChat(true); f.complete();
   const status = f.pane.getByTestId('loop-control-status');
   await expect(status).toContainText('切换已完成，界面加载失败');
   f.failChat(false);
   await status.getByRole('button', { name: '重试加载聊天', exact: true }).click();
-  await expect(status).toContainText('已人工接管');
+  await f.expectSuccess('manual');
   expect(f.writes).toHaveLength(1);
 });
 
@@ -226,7 +392,7 @@ test('lost response and offline query recover by checking without another write'
   await expect(f.pane.locator('.chat-textarea')).toHaveCount(0);
   f.complete(false, false); f.offline(false);
   await status.getByRole('button', { name: '检查状态', exact: true }).click();
-  await expect(status).toContainText('已人工接管');
+  await f.expectSuccess('manual');
   expect(f.writes).toHaveLength(1);
 });
 
@@ -243,7 +409,7 @@ test('late result updates original session without stealing another tab', async 
   await expect(current).toHaveAttribute('data-session-tab-panel', selected!);
   await expect(current.getByTestId('loop-control-status')).toHaveCount(0);
   await page.getByRole('tab', { name: title, exact: true }).click();
-  await expect(f.pane.getByTestId('loop-control-status')).toContainText('已人工接管');
+  await f.expectSuccess('manual');
   expect(f.writes).toHaveLength(1);
 });
 
@@ -258,7 +424,7 @@ test('loopout manual entry preserves edited goal and waits for ownership', async
   expect(f.writes[0].goal).toBe('QA 新人工轮目标');
   await expect(f.pane.locator('.chat-textarea')).toHaveCount(0);
   f.complete();
-  await expect(f.pane.getByTestId('loop-control-status')).toContainText('已人工接管');
+  await f.expectSuccess('manual');
 });
 
 test('release view failure only reloads LOOP and does not resubmit', async ({ page }) => {
@@ -266,22 +432,24 @@ test('release view failure only reloads LOOP and does not resubmit', async ({ pa
   await expect(f.pane.locator('.chat-textarea')).toBeVisible();
   await page.getByRole('button', { name: 'Manual LOOP 人工接管中', exact: true }).click();
   await page.getByRole('button', { name: /交还 LOOP.*封存人工轮/ }).click();
+  await expect.poll(() => f.writes.length).toBe(1);
   f.failLoop(true); f.complete();
   const status = f.pane.getByTestId('loop-control-status');
   await expect(status).toContainText('切换已完成，界面加载失败');
   f.failLoop(false);
   await status.getByRole('button', { name: '重试加载LOOP 面板', exact: true }).click();
-  await expect(status).toContainText('已交还 LOOP，Auto 仍关闭');
+  await f.expectSuccess('loop');
   expect(f.writes).toHaveLength(1);
 });
 
 test('legacy executor explains limited phases and verifies final ownership', async ({ page }) => {
   const f = await fixture(page, 'loop', true);
   await f.pane.getByRole('button', { name: '✋ 人工接管', exact: true }).click();
+  await expect.poll(() => f.writes.length).toBe(1);
   const status = f.pane.getByTestId('loop-control-status');
   await expect(status).toContainText('旧执行端不支持阶段详情');
   f.complete(false, true);
-  await expect(status).toContainText('已人工接管');
+  await f.expectSuccess('manual');
   expect(f.writes).toHaveLength(1);
 });
 
@@ -311,6 +479,6 @@ test('reload recovers committed ownership despite stale session mirror and lost 
   if (await opener.isVisible()) await opener.click();
   await page.locator('.awu-sidebar').getByText(title, { exact: true }).click();
   await expect(f.pane.locator('.chat-textarea')).toBeVisible();
-  await expect(f.pane.getByTestId('loop-control-status')).toContainText('已人工接管');
+  await f.expectSuccess('manual');
   expect(f.writes).toHaveLength(1);
 });

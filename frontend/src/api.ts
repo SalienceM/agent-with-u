@@ -19,6 +19,14 @@ import type {
 } from './types/prov';
 import { filterGitMetadata } from './utils/dirSyncPolicy';
 import { SessionRoutingCache, isSessionMetaReady } from './utils/sessionRouting';
+import { readWorkbenchCapabilities } from './utils/sessionWorkbench';
+import { WorkspaceDocuments, sameWorkspace } from './utils/workspaceDocuments';
+import { WorkbenchStreamGate, type StreamTransfer } from './utils/workbenchStream';
+import { getStreamState, restoreStreamState, clearAllStreamStates, configureStreamIdentity } from './hooks/useStreamState';
+import { WindowOwnershipClient, loadWindowNavigation, windowTransport, windowMutations } from './utils/workbenchWindows';
+import { AuthoritativeReadGate } from './utils/authoritativeReadGate';
+import { WorkspaceTerminals, terminalResources } from './utils/workspaceTerminals';
+import { WorkspaceLanguages, languageResources } from './utils/workspaceLanguages';
 import { rankFileSearchPaths } from './utils/fileSearch';
 import { mergeExecutorSessionBatches, selectExactExecutor } from './utils/executorSessions';
 import { executeWorkspaceRequest, type WorkspaceToolRequest, type WorkspaceNode } from './utils/workspaceTools';
@@ -344,8 +352,17 @@ let connectionStatusCallbacks: ConnectionStatusCallback[] = [];
 let reqCounter = 0;
 const pending = new Map<string, { resolve: (result: any) => void; reject: (err: Error) => void }>();
 let streamCallbacks: StreamDeltaCallback[] = [];
+const streamGate = new WorkbenchStreamGate((delta, key) => {
+  const [owner, executor] = JSON.parse(key);
+  if (owner === getCurrentUserProfile().userId) streamCallbacks.forEach(cb => cb({ ...delta, executor }));
+});
+const streamKey = (executor: string, session: string) => JSON.stringify([getCurrentUserProfile().userId, executor, session]);
+configureStreamIdentity((session, executor) => streamKey(executor || getSessionExecKey(session) || '', session));
 let sessionUpdateCallbacks: SessionUpdateCallback[] = [];
 let permissionRequestCallbacks: PermissionRequestCallback[] = [];
+const permissionReadGate = new AuthoritativeReadGate();
+const terminalCallbacks = new Set<(data: any, executor: string) => void>();
+const languageCallbacks = new Set<(data: any, executor: string) => void>();
 let assetChangedCallbacks: AssetChangedCallback[] = [];
 let clientsChangedCallbacks: ClientsChangedCallback[] = [];
 let pendingDesktopUpdatePlan = '';
@@ -898,7 +915,7 @@ function handleMessage(e: MessageEvent, source?: Conn) {
       if (delta.type === 'done' && workspaceControllers.get(delta.sessionId)?.conn === source) {
         workspaceControllers.delete(delta.sessionId);
       }
-      streamCallbacks.forEach((cb) => cb(delta));
+      streamGate.push(streamKey(source?.key || getSessionExecKey(delta.sessionId) || '', delta.sessionId), delta);
     } else if (msg.event === 'sessionUpdated') {
       const parsed = JSON.parse(msg.data);
       const execMeta = source ? {
@@ -943,7 +960,15 @@ function handleMessage(e: MessageEvent, source?: Conn) {
       sessionUpdateCallbacks.forEach((cb) => cb(data));
     } else if (msg.event === 'permissionRequest') {
       const data = JSON.parse(msg.data);
-      permissionRequestCallbacks.forEach((cb) => cb(data));
+      const executor = source?.key || 'local';
+      permissionReadGate.begin(streamKey(executor, data.sessionId));
+      permissionRequestCallbacks.forEach((cb) => cb({ ...data, executor }));
+    } else if (msg.event === 'terminalUpdated') {
+      const data = JSON.parse(msg.data);
+      terminalCallbacks.forEach(cb => cb(data, source?.key || 'local'));
+    } else if (msg.event === 'languageServiceUpdated') {
+      const data = JSON.parse(msg.data);
+      languageCallbacks.forEach(cb => cb(data, source?.key || 'local'));
     } else if (msg.event === 'assetChanged') {
       const data = msg.data ? JSON.parse(msg.data) : {};
       assetChangedCallbacks.forEach((cb) => cb(data));
@@ -1177,7 +1202,7 @@ class Conn {
       this.heartbeatTimer = setInterval(() => {
         if (this.isOpen) {
           const id = nextId();
-          try { this.ws!.send(JSON.stringify({ id, method: 'ping', params: [] })); } catch { /* */ }
+          try { this.ws!.send(JSON.stringify({ id, method: 'ping', params: [], workbench: windowTransport.metadata(this.key, 'ping', []) })); } catch { /* */ }
         }
       }, HEARTBEAT_INTERVAL_MS);
       this.settleReady();
@@ -1271,6 +1296,7 @@ class Conn {
       console.warn(`[api] exec node ${this.key} offline, "${method}" dropped`);
       return null;
     }
+    await ensureWindowMutation(this, method, params);
     return await new Promise((resolve, reject) => {
       const id = nextId();
       const timer = timeoutMs && timeoutMs > 0 ? setTimeout(() => {
@@ -1286,7 +1312,7 @@ class Conn {
       });
       pendingConn.set(id, this.key);
       try {
-        this.ws!.send(JSON.stringify({ id, method, params }));
+        this.ws!.send(JSON.stringify({ id, method, params, workbench: windowTransport.metadata(this.key, method, params) }));
       } catch (e) {
         if (timer) clearTimeout(timer);
         pending.delete(id);
@@ -1304,7 +1330,9 @@ class Conn {
       return;
     }
     const id = nextId();
-    try { this.ws!.send(JSON.stringify({ id, method, params })); } catch { /* */ }
+    await ensureWindowMutation(this, method, params);
+    const workbench = windowTransport.metadata(this.key, method, params);
+    this.ws!.send(JSON.stringify({ id, method, params, workbench }));
   }
 }
 
@@ -1379,6 +1407,38 @@ async function handleWorkspaceToolRequest(data: WorkspaceToolRequest, source: Co
   if (controller && controller.socket === source.ws && controller.epoch === relayIdentityEpoch && source.isOpen) {
     await source.request('workspaceToolReply', [data.id, JSON.stringify(result)], 5000).catch(() => {});
   }
+}
+
+const windowMutationChecks = new Map<string, Promise<void>>();
+async function ensureWindowMutation(conn: Conn, method: string, params: any[]): Promise<void> {
+  if (!windowMutations.has(method)) return;
+  const payload = ['sendMessage', 'executeCommand'].includes(method) ? (typeof params[0] === 'string' ? JSON.parse(params[0]) : params[0]) : null;
+  const session = payload ? payload.sessionId : params[0];
+  if (typeof session !== 'string' || !session || windowTransport.get(conn.key, session)) return;
+  const user = getCurrentUserProfile().userId, epoch = relayIdentityEpoch, socket = conn.ws;
+  const current = () => user === getCurrentUserProfile().userId && epoch === relayIdentityEpoch && conn.isOpen && conn.ws === socket;
+  const key = JSON.stringify([user, epoch, conn.key, session]);
+  const existing = windowMutationChecks.get(key); if (existing) return existing;
+  const work = (async () => {
+    const raw = await conn.request('loadSessionMeta', [session], 12000);
+    if (!current()) throw new Error('窗口写入身份已变化');
+    const meta = typeof raw === 'string' ? JSON.parse(raw) : raw;
+    if (!meta || meta.id !== session) throw new Error('无法核对会话窗口写入身份');
+    // 无工程目录/SSH 的普通 Chat 不能使用窗口交接，保留旧业务入口。
+    if (!meta.workingDir || meta.codexRemoteHost) return;
+    const caps = await conn.request('sessionWorkbenchCapabilities', [session, meta.workingDir], 12000);
+    const capability = typeof caps === 'string' ? JSON.parse(caps) : caps;
+    if (!current()) throw new Error('窗口写入身份已变化');
+    if (capability == null || capability?.status === 'ok' && capability.capabilities?.windowHandoff === 0
+      || capability?.status === 'error' && capability.reasonCode === 'workspace_unavailable') return;
+    const client = await WindowOwnershipClient.connect({ user, executor: conn.key, session, workingDir: meta.workingDir }, callOnStrict,
+      current, windowTransport, () => windowTransport.identity || loadWindowNavigation(user, window.localStorage, window.sessionStorage,
+        new URLSearchParams(window.location.search).get('workbenchWindow') || undefined));
+    await client.register();
+    // 只完成准入，不发送业务请求。外层将在同一 frame 生成处复核最新代次。
+  })();
+  windowMutationChecks.set(key, work);
+  try { await work; } finally { if (windowMutationChecks.get(key) === work) windowMutationChecks.delete(key); }
 }
 
 /** 只读已知的 Session 归属；未知时不猜测 home，供管理面板初始化目标。 */
@@ -1510,6 +1570,11 @@ function clearRelaySessionCaches(): void {
 
 /** 身份切换是安全边界：旧用户的全部连接、路由与离线 Session 缓存都丢弃。 */
 function clearRelayIdentityState(): void {
+  windowTransport.clear();
+  permissionReadGate.clear();
+  terminalResources.clear();
+  languageResources.clear();
+  streamGate.clear(); clearAllStreamStates();
   workspaceControllers.clear();
   workspaceDiscoveredTargets.clear();
   sessionRoutingCache.clear();
@@ -2542,6 +2607,101 @@ export const api = {
     const result = await call('convertSessionToLoop', sessionId, goal, workflowCommand, workflowDigest);
     if (result === null || result === undefined) return { status: 'error', message: '无法连接到执行节点' };
     try { return JSON.parse(result); } catch { return { status: 'error', message: '转换响应格式错误' }; }
+  },
+
+  async updateSessionWorkbench(
+    sessionId: string,
+    patch: import('./utils/sessionWorkbench').SessionWorkbenchPatch,
+    execKey: string,
+    workingDir: string,
+    isCurrent: () => boolean = () => true,
+  ): Promise<{ status: string; viewMode?: import('./utils/sessionWorkbench').SessionViewMode; message?: string }> {
+    const user = getCurrentUserProfile().userId;
+    const current = () => isCurrent() && getCurrentUserProfile().userId === user
+      && getSessionExecKey(sessionId) === execKey && api.peekSessionMeta(sessionId)?.workingDir === workingDir;
+    if (!current()) throw new Error('工作台身份已变化');
+    const capability = await api.sessionWorkbenchCapabilities(sessionId, execKey, workingDir);
+    if (!current()) throw new Error('工作台身份已变化');
+    if (capability.status !== 'ok' || capability.capabilities.viewMode !== 1) {
+      return { status: 'unsupported', message: '执行端尚不支持会话展示模式持久化' };
+    }
+    const raw = await callOnStrict(execKey, 'updateSessionWorkbench', [sessionId, JSON.stringify(patch), JSON.stringify(capability.identity)], 12000);
+    if (!current()) throw new Error('工作台身份已变化');
+    if (raw === null || raw === undefined) throw new Error('未收到展示模式保存回执，结果未知');
+    const result = typeof raw === 'string' ? JSON.parse(raw) : raw;
+    if (!result || typeof result.status !== 'string') throw new Error('展示模式保存回执无效，结果未知');
+    if (result?.status === 'ok') {
+      if (result.summary?.id !== sessionId || result.viewMode !== patch.viewMode || result.summary.viewMode !== patch.viewMode) {
+        throw new Error('展示模式保存回执不匹配');
+      }
+      sessionRoutingCache.update(sessionId, result.summary);
+    }
+    return result;
+  },
+
+  async sessionWorkbenchCapabilities(sessionId: string, execKey: string, workingDir: string) {
+    const user = getCurrentUserProfile().userId;
+    return readWorkbenchCapabilities({ user, executor: execKey, session: sessionId, workingDir }, callOnStrict,
+      () => getCurrentUserProfile().userId === user);
+  },
+
+  async workspaceDocuments(sessionId: string, execKey: string, workingDir: string, isCurrent: () => boolean = () => true) {
+    const user = getCurrentUserProfile().userId;
+    return WorkspaceDocuments.connect({ user, executor: execKey, session: sessionId, workingDir }, callOnStrict,
+      () => getCurrentUserProfile().userId === user && isCurrent());
+  },
+
+  async workspaceTerminals(sessionId: string, execKey: string, workingDir: string, isCurrent: () => boolean) {
+    const user = getCurrentUserProfile().userId, epoch = relayIdentityEpoch;
+    return WorkspaceTerminals.connect({ user, executor: execKey, session: sessionId, workingDir }, callOnStrict,
+      () => user === getCurrentUserProfile().userId && epoch === relayIdentityEpoch && isCurrent());
+  },
+  onTerminalUpdated(callback: (data: any, executor: string) => void) {
+    terminalCallbacks.add(callback); return () => { terminalCallbacks.delete(callback); };
+  },
+
+  async workspaceLanguages(sessionId: string, execKey: string, workingDir: string, isCurrent: () => boolean) {
+    const user = getCurrentUserProfile().userId, epoch = relayIdentityEpoch;
+    return WorkspaceLanguages.connect({ user, executor: execKey, session: sessionId, workingDir }, callOnStrict,
+      () => user === getCurrentUserProfile().userId && epoch === relayIdentityEpoch && isCurrent());
+  },
+  onLanguageUpdated(callback: (data: any, executor: string) => void) {
+    languageCallbacks.add(callback); return () => { languageCallbacks.delete(callback); };
+  },
+
+  async workbenchWindows(sessionId: string, execKey: string, workingDir: string, isCurrent: () => boolean = () => true) {
+    const user = getCurrentUserProfile().userId;
+    return WindowOwnershipClient.connect({ user, executor: execKey, session: sessionId, workingDir }, callOnStrict,
+      () => getCurrentUserProfile().userId === user && isCurrent(), windowTransport,
+      () => windowTransport.identity || loadWindowNavigation(user, window.localStorage, window.sessionStorage,
+        new URLSearchParams(window.location.search).get('workbenchWindow') || undefined));
+  },
+
+  captureWorkbenchStream(sessionId: string, executor: string) {
+    return streamGate.capture(streamKey(executor, sessionId), getStreamState(sessionId, executor));
+  },
+  async reloadWorkbenchPermission(sessionId: string, executor: string, current: () => boolean) {
+    const key = streamKey(executor, sessionId), revision = permissionReadGate.begin(key), epoch = relayIdentityEpoch;
+    const raw = await callOnStrict(executor, 'workbenchPermissionGet', [sessionId], 12000);
+    if (!current() || epoch !== relayIdentityEpoch) throw new Error('工具计划读取身份已变化');
+    const row = typeof raw === 'string' ? JSON.parse(raw) : raw;
+    if (row?.status !== 'ok' || row.sessionId !== sessionId) throw new Error('无法核对当前待确认计划');
+    if (!permissionReadGate.current(key, revision)) return;
+    permissionRequestCallbacks.forEach(cb => cb(row.pending ? { ...row.pending, executor }
+      : { sessionId, executor, resolved: true, authoritativeEmpty: true }));
+  },
+  async restoreWorkbenchStream(client: WindowOwnershipClient, transfer: StreamTransfer, current: () => boolean) {
+    const { session, executor } = client.target;
+    await streamGate.restore(streamKey(executor, session), session, transfer, async (epoch, after) => {
+      const raw = await callOnStrict(executor, 'workbenchStreamGet', [session, JSON.stringify(client.workspace), epoch, after], 12000);
+      if (!current()) throw new Error('流恢复身份已变化');
+      const result = typeof raw === 'string' ? JSON.parse(raw) : raw;
+      if (!sameWorkspace(client.workspace, result?.workspace)) throw new Error('流恢复工作区不匹配');
+      return result;
+    }, value => {
+      const state = restoreStreamState(session, value, executor);
+      streamCallbacks.forEach(cb => cb({ type: 'workbench_snapshot', sessionId: session, executor, messageId: state.messageId }));
+    }, current);
   },
 
   async updateSessionAppearance(

@@ -2,6 +2,30 @@ const assert = require('node:assert/strict');
 const { test } = require('node:test');
 const { LoopControlStore, controlBusy } = require('../../.home-test-dist/utils/loopControl.js');
 const target = { user: 'local', executor: 'node-a', session: 's' };
+
+test('late failed Get never downgrades committed view-loading or a newer hydration stage', async () => {
+  for (const hydrated of [false, true]) {
+    let reject;
+    const { store, calls } = fixture({ get: () => { calls.get++; return new Promise((_, fail) => { reject = fail; }); } });
+    store.receive(target, summary(1, op()));
+    const read = store.check(target); await Promise.resolve();
+    store.receive(target, summary(2, op('succeeded', 4)));
+    if (hydrated) store.view(target, 2);
+    reject(new Error('old offline')); await read;
+    assert.equal(store.get(target).phase, hydrated ? 'succeeded' : 'view-loading');
+    assert.equal(store.get(target).summary.controlRevision, 2);
+    assert.equal(store.get(target).summary.eligibility.release.allowed, true);
+    assert.equal(store.get(target).error, ''); assert.equal(store.get(target).checking, false);
+    assert.equal(calls.request, 0);
+  }
+});
+
+test('a new read failure during committed hydration retains ownership and hydration phase', async () => {
+  const { store } = fixture({ get: async () => { throw Error('offline'); } });
+  store.receive(target, summary(2, op('succeeded', 4))); await store.check(target);
+  assert.equal(store.get(target).phase, 'view-loading');
+  assert.equal(store.get(target).summary.operation.committed, true);
+});
 const summary = (rev = 0, operation) => ({ protocolVersion: 1, sessionId: 's', controlMode: rev >= 2 ? 'manual' : 'loop',
   controlRevision: rev, auto: false, stage: 'loopexecute', round: 1,
   eligibility: { takeover: { allowed: true }, release: { allowed: true } }, operation });

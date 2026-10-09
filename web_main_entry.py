@@ -4,6 +4,13 @@ import asyncio
 import os
 import sys
 
+from src.package_readiness import entry_check
+entry_check(web=True)
+
+if "--agentwithu-engine-host" in sys.argv:
+    from src.backend.engineering_host import run_worker
+    raise SystemExit(run_worker())
+
 if "--agentwithu-update-helper" in sys.argv:
     from src.backend.update_helper import run_update_helper
 

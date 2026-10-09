@@ -12,6 +12,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock, AsyncMock, patch
 
 from src.backend.bridge_ws import BridgeWS
+from src.backend.chat_extras_store import ChatExtras, SeqTask
 from src.backend.loop_control import ControlFacts, eligibility, normalize_operation, normalize_receipts
 from src.backend.loop_store import LoopState, LoopRecord, LoopStore, AsideTurn
 from src.types import ChatMessage
@@ -58,7 +59,8 @@ class EligibilityTests(unittest.IsolatedAsyncioTestCase):
                 bridge._active_sessions = {'s': session}
                 bridge._loop_states = {'s': state}
                 bridge._session_store = SimpleNamespace(load=lambda _: session)
-                bridge._chat_extras_get = lambda _: SimpleNamespace(pending=lambda: [object()])
+                bridge._chat_extras = {'s': ChatExtras(session_id='s',
+                    seq_tasks=[SeqTask(id='queued')])}
                 bridge._loop_save = Mock()
                 bridge._require_session_access = Mock()
                 shown = bridge._loop_control_eligibility(state)[action]
@@ -202,7 +204,8 @@ class HandoffIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.bridge._loop_context_digest = Mock(return_value='bounded context')
         self.bridge._session_runtime = Mock(return_value={})
         self.bridge._resolved_runtime = Mock(return_value={})
-        self.bridge._chat_extras_get = Mock(return_value=SimpleNamespace(pending=lambda: []))
+        self.extras = ChatExtras(session_id='s')
+        self.bridge._chat_extras = {'s': self.extras}
         self.bridge._ensure_kit_scheduler = Mock()
         self.bridge._loop_run_agent = Mock(side_effect=AssertionError('no model calls allowed'))
         self.git = patch('src.backend.loop_control_bridge.snapshot_handoff',
@@ -564,7 +567,7 @@ class HandoffIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result['status'], 'ok')
         self.assertEqual(self.state.round, 2)
         self.assertEqual(self.state.control_operation['status'], 'succeeded')
-        self.bridge._chat_extras_get.return_value = SimpleNamespace(pending=lambda: [object()])
+        self.extras.seq_tasks.append(SeqTask(id='queued'))
         result = json.loads(await self.bridge._rpc_loopRelease('s'))
         self.assertEqual(result['status'], 'ok')
         self.assertEqual(self.state.control_mode, 'loop')
@@ -666,6 +669,74 @@ class HandoffIntegrationTests(unittest.IsolatedAsyncioTestCase):
         await self.finish()
         self.assertEqual(self.state.control_operation['reasonCode'], 'active_call')
         self.assertEqual(self.state.control_mode, 'loop')
+
+    async def test_control_get_with_manual_messages_uses_real_queue(self) -> None:
+        await self.request()
+        await self.finish()
+        self.session.messages = [ChatMessage(id='u', role='user', content='manual work')]
+        cases = [
+            ([], 'ready'),
+            (['done', 'error', 'interrupted', 'sent'], 'ready'),
+            (['pending'], 'sequence_pending'),
+            (['done', 'pending'], 'sequence_pending'),
+        ]
+        for statuses, reason in cases:
+            with self.subTest(statuses=statuses):
+                self.extras.seq_tasks = [SeqTask(id=str(i), status=status)
+                                         for i, status in enumerate(statuses)]
+                state_before = self.state.to_dict()
+                extras_before = self.extras.to_dict()
+                result = json.loads(await self.bridge._rpc_loopControlGet('s', 'one'))
+                self.assertEqual(result['status'], 'ok')
+                self.assertEqual(result['controlMode'], 'manual')
+                self.assertTrue(result['operation']['committed'])
+                self.assertEqual(result['eligibility']['release']['reasonCode'], reason)
+                self.assertEqual(result['eligibility']['release']['allowed'], reason == 'ready')
+                self.assertEqual(self.state.to_dict(), state_before)
+                self.assertEqual(self.extras.to_dict(), extras_before)
+        self.git.assert_called_once()
+        self.bridge._loop_run_agent.assert_not_called()
+
+    async def test_pending_queue_blocks_release_until_task_is_done(self) -> None:
+        await self.request()
+        await self.finish()
+        self.session.messages = [ChatMessage(id='u', role='user', content='manual work')]
+        queued = SeqTask(id='queued', text='next task')
+        self.extras.seq_tasks.append(queued)
+        state_before = self.state.to_dict()
+        extras_before = self.extras.to_dict()
+        result = await self.request('release', 'release')
+        self.assertEqual(result['status'], 'error')
+        self.assertEqual(result['reasonCode'], 'sequence_pending')
+        self.assertEqual(self.state.to_dict(), state_before)
+        self.assertEqual(self.extras.to_dict(), extras_before)
+        self.assertFalse(self.bridge._loop_control_reserved('s'))
+        self.git.assert_called_once()
+
+        queued.status = 'done'
+        result = await self.request('release-after-queue', 'release')
+        self.assertEqual(result['status'], 'accepted')
+        await self.finish()
+        self.assertEqual(self.state.control_operation['status'], 'succeeded')
+        self.assertEqual(self.state.control_mode, 'loop')
+        self.assertFalse(self.state.auto)
+        self.assertEqual(self.extras.seq_tasks, [queued])
+        self.assertEqual(queued.status, 'done')
+        self.bridge._loop_run_agent.assert_not_called()
+
+    async def test_takeover_receipt_after_manual_message_uses_real_queue(self) -> None:
+        await self.request()
+        await self.finish()
+        self.session.messages = [ChatMessage(id='u', role='user', content='manual work')]
+        state_before = self.state.to_dict()
+        result = await self.request(expected=0)
+        self.assertEqual(result['status'], 'ok')
+        self.assertEqual(result['controlMode'], 'manual')
+        self.assertTrue(result['operation']['committed'])
+        self.assertEqual(result['operation']['status'], 'succeeded')
+        self.assertEqual(self.state.to_dict(), state_before)
+        self.assertEqual(len(self.state.loops), 1)
+        self.git.assert_called_once()
 
     async def test_release_commits_replayable_manual_steps_only_after_disk_success(self):
         await self.request()

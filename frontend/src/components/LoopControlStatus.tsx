@@ -1,5 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import { useLoopControl } from '../hooks/useLoopControl';
+import { LoopEngineeringActivities } from './LoopEngineeringActivities';
 
 const phases: Record<string, string> = {
   validating: '正在核对条件', snapshot: '正在保存工作区快照', manual_record: '正在整理人工记录',
@@ -20,7 +21,10 @@ export const LoopControlStatus: React.FC<{
     const timer = setInterval(() => setNow(Date.now()), 1000); // 仅本地计时，不请求服务端。
     return () => clearInterval(timer);
   }, [control.busy, state.phase, state.since]);
-  if (state.phase === 'idle' && !state.error) return null;
+  const activities = state.summary?.engineeringActivities || [];
+  const settled = state.phase === 'idle' || state.phase === 'succeeded';
+  // 成功回执仍留在共享状态中；视图就绪后不再用历史结果占据工作区。
+  if (settled && !state.error && !activities.length) return null;
   const summary = state.summary;
   const operation = summary?.operation?.requestId === state.requestId ? summary?.operation : undefined;
   const action = state.action === 'release' ? '交还 LOOP' : '人工接管';
@@ -30,21 +34,18 @@ export const LoopControlStatus: React.FC<{
     : state.phase === 'reconciling' ? '转交结果待确认，请检查状态'
     : state.phase === 'view-error' ? '切换已完成，界面加载失败'
     : state.phase === 'view-loading' ? `已${action}，正在加载${summary?.controlMode === 'manual' ? '聊天' : 'LOOP 面板'}…`
-    : state.phase === 'succeeded' ? (summary?.controlMode === 'manual' ? '已人工接管' : '已交还 LOOP')
-      + (summary?.auto ? '，Auto 当前开启' : '，Auto 仍关闭')
     : state.phase === 'running' ? `${phases[operation?.phase || ''] || '执行端正在处理'}…`
-    : `${action}未完成`;
+    : settled ? (state.error ? '控制权状态核对失败' : '交还前请处理以下工程活动') : `${action}未完成`;
   const reason = summary?.eligibility[state.action || 'takeover'];
-  return <section data-testid="loop-control-status" role={['failed', 'blocked', 'view-error'].includes(state.phase) ? 'alert' : 'status'}
+  return <section data-testid="loop-control-status" role={state.error || ['failed', 'blocked', 'view-error'].includes(state.phase) ? 'alert' : 'status'}
     aria-live="polite" style={{ flexShrink: 0, padding: '10px 14px', borderBottom: '1px solid #d2992255',
       background: '#d2992210', fontSize: 12, color: 'var(--theme-text)', display: 'flex', flexWrap: 'wrap', gap: 8 }}>
     <div style={{ flex: '1 1 220px' }}>
       <strong>{title}</strong>
       {control.busy && state.phase !== 'view-error' && <span> · 已用 {elapsed} 秒{phaseElapsed >= 5 ? ' · 耗时较长，仍在等待确定结果' : ''}</span>}
       {state.error && <div>{state.error}</div>}
-      {summary?.protocolVersion === 0 && <div>旧执行端不支持阶段详情；仅核对当前控制权。</div>}
-      {operation?.checkpointAvailable === false && operation.committed && <div>文件检查点不可用，不能依赖它恢复。</div>}
-      {state.phase === 'succeeded' && summary?.controlMode === 'loop' && <div>交还本身未启动模型。可在面板独立选择运行下一次或开启 Auto。</div>}
+      {!settled && summary?.protocolVersion === 0 && <div>旧执行端不支持阶段详情；仅核对当前控制权。</div>}
+      {!settled && operation?.checkpointAvailable === false && operation.committed && <div>文件检查点不可用，不能依赖它恢复。</div>}
     </div>
     <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, alignItems: 'center' }}>
       <button style={buttonStyle} disabled={state.checking} onClick={() => void control.check()}>{state.checking ? '正在核对…' : '检查状态'}</button>
@@ -54,5 +55,6 @@ export const LoopControlStatus: React.FC<{
       {reason?.nextStep === 'queue' && onQueue && <button style={buttonStyle} onClick={onQueue}>查看队列</button>}
       {reason?.nextStep === 'chat' && onChat && <button style={buttonStyle} onClick={onChat}>返回聊天</button>}
     </div>
+    <LoopEngineeringActivities target={control.target} activities={activities} refresh={control.check} />
   </section>;
 };

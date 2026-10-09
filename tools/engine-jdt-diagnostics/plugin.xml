@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<plugin>
+  <extension point="org.eclipse.jdt.ls.core.delegateCommandHandler">
+    <delegateCommandHandler class="awu.engine.VersionedDiagnostics">
+      <command id="awu.java.versionedDiagnostics" />
+    </delegateCommandHandler>
+  </extension>
+</plugin>

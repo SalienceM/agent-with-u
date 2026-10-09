@@ -1,5 +1,9 @@
 import React, { useEffect, useRef } from 'react';
 import { isConversationTab, workbenchSessionId, type SidebarView, type WorkbenchTab, type WorkbenchState } from '../utils/workbench';
+import { getSessionExecKey } from '../api';
+import { isDesktopWindow } from '../utils/detachedWindow';
+import { beginSessionDrag, readSessionDrag, SESSION_DRAG_TYPE } from '../utils/sessionWindowDrag';
+import { WorkbenchChromeStyles, WorkbenchIcon } from './WorkbenchChrome';
 
 const destinations: { id: SidebarView; label: string; path: React.ReactNode }[] = [
   { id: 'sessions', label: 'Session 会话', path: <path d="M4 4h16v12H9l-5 4V4Z" /> },
@@ -31,7 +35,8 @@ export const WorkbenchTabs: React.FC<{
   state: WorkbenchState; editing: boolean; onSelect: (tab: WorkbenchTab) => void; onClose: (tab: WorkbenchTab) => void;
   sessions: { id: string; title?: string; sessionType?: string; execLabel?: string }[];
   streamingSessions: Set<string>; completedSessions: Set<string>;
-}> = ({ state, editing, onSelect, onClose, sessions, streamingSessions, completedSessions }) => {
+  onSessionMenu?: (session: string, anchor: HTMLButtonElement) => void;
+}> = ({ state, editing, onSelect, onClose, sessions, streamingSessions, completedSessions, onSessionMenu }) => {
   const barRef = useRef<HTMLDivElement>(null);
   useEffect(() => {
     const bar = barRef.current;
@@ -45,8 +50,15 @@ export const WorkbenchTabs: React.FC<{
     else if (bounds.right > viewport.right) bar.scrollLeft += bounds.right - viewport.right;
   }, [state.active, state.tabs.length]);
   const byId = new Map(sessions.map(session => [session.id, session]));
-  return <div ref={barRef} role="tablist" aria-label="工作区标签页" style={{ display: 'flex', overflowX: 'auto', minWidth: 0, flexShrink: 0,
-    background: 'var(--theme-sidebar-bg)', borderBottom: '1px solid var(--theme-border)' }}>
+  return <div ref={barRef} className="awu-session-tabs" role="tablist" aria-label="工作区标签页"
+    onDragOver={event => { if (isDesktopWindow() && event.dataTransfer.types.includes(SESSION_DRAG_TYPE)) { event.preventDefault(); event.dataTransfer.dropEffect = 'move'; } }}
+    onDrop={event => {
+      if (!isDesktopWindow()) return;
+      const drag = readSessionDrag(event.dataTransfer.getData(SESSION_DRAG_TYPE)); if (!drag) return;
+      event.preventDefault(); window.dispatchEvent(new CustomEvent('awu-session-window-command', { detail: { session: drag.session, action: 'drop', drag } }));
+    }} style={{ display: 'flex', overflowX: 'auto', minWidth: 0, flexShrink: 0,
+    background: 'var(--theme-sidebar-solid, var(--theme-bg-secondary))', borderBottom: '1px solid var(--theme-border)' }}>
+    <WorkbenchChromeStyles />
     {state.tabs.map(tab => {
       const sid = workbenchSessionId(tab);
       const session = sid ? byId.get(sid) : undefined;
@@ -54,26 +66,41 @@ export const WorkbenchTabs: React.FC<{
       const streaming = !!sid && streamingSessions.has(sid);
       const completed = !!sid && completedSessions.has(sid);
       const tooltip = [label, session?.execLabel, streaming ? '正在运行' : completed ? '已完成，待查看' : '', sid ? '关闭标签不会删除会话或停止当前任务' : ''].filter(Boolean).join(' · ');
-      return <div key={tab} style={{ display: 'flex', flexShrink: 0, maxWidth: sid ? 260 : undefined,
+      return <div key={tab} className="awu-session-tab" data-active={state.active === tab} style={{ display: 'flex', flexShrink: 0, maxWidth: sid ? 240 : undefined,
       borderRight: '1px solid var(--theme-border)', borderTop: `2px solid ${state.active === tab ? 'var(--theme-accent)' : 'transparent'}`,
       background: state.active === tab ? 'var(--theme-bg)' : 'transparent' }}>
       <button id={`workbench-tab-${tab}`} role="tab" title={tooltip} aria-label={label}
+        aria-haspopup={sid && onSessionMenu ? 'dialog' : undefined}
+        onContextMenu={sid && onSessionMenu ? event => { event.preventDefault(); event.currentTarget.focus(); onSessionMenu(sid, event.currentTarget); } : undefined}
+        draggable={!!sid && isDesktopWindow()}
+        onDragStart={event => {
+          const drag = sid && beginSessionDrag(sid, getSessionExecKey(sid) || '');
+          if (!drag) { event.preventDefault(); return; }
+          event.dataTransfer.setData(SESSION_DRAG_TYPE, JSON.stringify(drag)); event.dataTransfer.effectAllowed = 'move';
+        }}
+        onDragEnd={event => {
+          if (!sid || !isDesktopWindow() || new URLSearchParams(location.search).has('sessionWindow')) return;
+          const outside = event.screenX < window.screenX || event.screenY < window.screenY
+            || event.screenX > window.screenX + window.outerWidth || event.screenY > window.screenY + window.outerHeight;
+          if (outside && event.dataTransfer.dropEffect === 'none') window.dispatchEvent(new CustomEvent('awu-session-window-command', { detail: { session: sid, action: 'detach' } }));
+        }}
         aria-selected={state.active === tab} aria-controls={isConversationTab(tab) ? 'workbench-panel-chat' : `workbench-panel-${tab}`}
         tabIndex={state.active === tab ? 0 : -1} onClick={() => onSelect(tab)} onKeyDown={event => {
+          if (sid && onSessionMenu && (event.key === 'ContextMenu' || event.shiftKey && event.key === 'F10')) { event.preventDefault(); onSessionMenu(sid, event.currentTarget); return; }
           const index = state.tabs.indexOf(tab);
           const next = event.key === 'ArrowRight' ? (index + 1) % state.tabs.length
             : event.key === 'ArrowLeft' ? (index - 1 + state.tabs.length) % state.tabs.length
               : event.key === 'Home' ? 0 : event.key === 'End' ? state.tabs.length - 1 : -1;
           if (next >= 0) { event.preventDefault(); onSelect(state.tabs[next]); document.getElementById(`workbench-tab-${state.tabs[next]}`)?.focus(); }
-        }} style={{ border: 0, background: 'transparent', color: 'var(--theme-text)', padding: 'var(--ui-tab-padding, 9px 12px)', minHeight: 'var(--ui-tab-height, 40px)',
+        }} style={{ border: 0, background: 'transparent', color: state.active === tab ? 'var(--theme-text)' : 'var(--theme-text-muted)', fontWeight: state.active === tab ? 500 : 400, padding: 'var(--ui-tab-padding, 9px 12px)', minHeight: 'var(--ui-tab-height, 40px)',
           cursor: 'pointer', whiteSpace: 'nowrap', fontSize: 12, minWidth: 0, display: 'flex', alignItems: 'center', gap: 6 }}>
         {sid && <span aria-hidden="true" style={{ color: streaming ? 'var(--theme-accent)' : completed ? '#56d364' : 'var(--theme-text-muted)' }}>
-          {streaming ? '◌' : completed ? '●' : session?.sessionType === 'loop' ? '↻' : '▤'}
+          {streaming ? '◌' : completed ? '●' : <WorkbenchIcon name={session?.sessionType === 'loop' ? 'restore' : 'chat'} size={14} />}
         </span>}
         <span style={{ overflow: 'hidden', textOverflow: 'ellipsis' }}>{label}{tab === 'library' && editing ? ' · 编辑中' : ''}</span>
       </button>
-      {tab !== 'chat' && <button type="button" title={`关闭${label}`} aria-label={`关闭${label}`} onClick={() => onClose(tab)}
-        style={{ border: 0, background: 'transparent', color: 'var(--theme-text-muted)', minWidth: 'var(--ui-tab-close-width, 34px)', flexShrink: 0, cursor: 'pointer', fontSize: 17 }}>×</button>}
+      {tab !== 'chat' && <button className="awu-wb-control" type="button" title={`关闭${label}`} aria-label={`关闭${label}`} onClick={() => onClose(tab)}
+        style={{ display: 'grid', placeItems: 'center', border: 0, borderRadius: 4, margin: '4px 3px', background: 'transparent', color: 'var(--theme-text-muted)', width: 22, flexShrink: 0, cursor: 'pointer' }}><WorkbenchIcon name="close" size={13} /></button>}
     </div>; })}
   </div>;
 };

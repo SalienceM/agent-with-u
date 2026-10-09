@@ -6,25 +6,29 @@
  *
  * 会话类型不同,呈现不同(做好兼容)：
  *   · 远端会话，或 Web/平板访问任意会话：文件默认都是 ☁️ 执行端文件。
- *     查看/编辑走按需拉取(syncReadFile/Write,经中继)。可选配一个"本地目录"作副本,
+ *     预览按需拉取，编辑使用完整读取/版本保存接口。可选配一个"本地目录"作副本,
  *     下载后变 ✓ 本地,可离线/比对(🔍)/双向同步(⬆⬇)。
  *   · 本地会话(execMode='local')：工作目录本来就在本机,没有"远端"这一说,不显示云朵,
  *     直接就是普通文件树,点开即看/即改。
  *
- * 无论哪种,查看/编辑都作用在**会话所在节点**的工作目录上(syncReadFile/syncWriteFile,
- * 按 execKey 路由);本地副本目录只服务于远端会话的"离线下载 + 差异同步"。
+ * 执行端文档按 execKey 精确路由；显式打开本机副本则使用独立来源与安全适配器。
+ * 保存副本不上传，编辑绝不回退 syncWriteFile；原明确传输入口保持既有语义。
  */
 import React, { useCallback, useEffect, useMemo, useState, useRef, lazy, Suspense } from 'react';
+import { createPortal } from 'react-dom';
 import hljs from 'highlight.js';
-import { api, isTauri } from '../api';
+import { api, isTauri, getCurrentUserProfile, getSessionExecKey, onCurrentUserChanged } from '../api';
 import { markdownToHtml } from '../utils/markdown';
 import { buildStandaloneMarkdownHtml, markdownHtmlFilename } from '../utils/markdownExport';
 import { GitPanel } from './GitPanel';
+import { WorkbenchFileCommands } from './WorkbenchFileCommands';
+import { WorkbenchButton, WorkbenchIcon, WorkbenchOverflow } from './WorkbenchChrome';
 import type { GitFileStatus, GitFileStatusType, GitStashEntry } from '../types/git';
 import { DiffViewer } from './DiffViewer';
 import { StructuredFilePreview, type StructuredPreviewPayload } from './StructuredFilePreview';
 import { MarkdownPreview } from './MarkdownPreview';
-import { AppModalPortal } from './AppModalPortal';
+import { AppModalPortal, WorkbenchInteractionContext } from './AppModalPortal';
+import { useWindowWriteBlocked } from '../hooks/useWindowWriteBlocked';
 import type { ProvOpenResult } from '../types/prov';
 import {
   pickLocalDir, restoreLocalDir, loadBaseline, saveBaseline,
@@ -45,6 +49,17 @@ import { buildFileAttentionContext, type AttentionContext } from '../utils/atten
 import { fileTransfers, type TransferProgress } from '../utils/fileTransfers';
 import { buildLocalManifestTree } from '../utils/localFileTree';
 import { buildGitDirectoryStatuses } from '../utils/fileTreeGit';
+import { loadDocumentPreview, defaultDocumentView, extOf, type DocumentPreview } from '../utils/documentPreview';
+import { documentStore, readonlyDocumentClient, type DocumentClient } from '../utils/documentStore';
+import { documentDrafts, type StoredDocumentDraft } from '../utils/documentDrafts';
+import { LocalDocuments } from '../utils/localDocuments';
+import { IndexedLocalJournal } from '../utils/localDocumentStorage';
+import { DocumentProtocolError, sameWorkspace } from '../utils/workspaceDocuments';
+import type { DiskVersion } from '../utils/sessionWorkbench';
+import type { EditorDocumentState } from '../utils/editorDocumentState';
+import { handoffParticipants, handoffScope } from '../utils/workbenchHandoffState';
+import type { RecoverableDraft } from '../utils/documentStore';
+import { useLanguageEditor } from '../hooks/useLanguageEditor';
 
 const CodeEditor = lazy(() => import('./CodeEditor'));
 const PdfPreview = lazy(() => import('./PdfPreview'));
@@ -52,6 +67,7 @@ const DocxPreview = lazy(() => import('./DocxPreview'));
 const DrawioPreview = lazy(() => import('./DrawioPreview'));
 const HtmlPreview = lazy(() => import('./HtmlPreview'));
 const ReviewWorkbench = lazy(() => import('./review/ReviewWorkbench'));
+const DocumentDraftRecovery = lazy(() => import('./DocumentDraftRecovery').then(module => ({ default: module.DocumentDraftRecovery })));
 
 interface Props {
   sessionId?: string;
@@ -62,7 +78,20 @@ interface Props {
   backendId?: string;             // ★ 当前会话的 backendId —— 供 AI 生成 commit message 使用
   focusRequest?: FileFocusRequest | null;
   onAttentionChange?: (context: AttentionContext | null) => void;
+  documentHost?: HTMLDivElement;
+  isVisible?: boolean;
+  onDocumentOpen?: () => void;
+  onBrowseFiles?: () => void;
 }
+
+/** 同一预览/编辑实现：Chat 仍是模态，Engine 只改变 DOM 挂载位置。 */
+const DocumentSurface: React.FC<React.PropsWithChildren<{ host?: HTMLDivElement }>> = ({ host, children }) =>
+  host ? createPortal(children, host) : <AppModalPortal>{children}</AppModalPortal>;
+
+type DocumentSelection = { key: string; client: DocumentClient; scope: string };
+type DocumentView = 'preview' | 'source' | 'split';
+interface FileTab { id: string; rel: string; name: string; source: 'local' | 'remote'; view: DocumentView; document?: DocumentSelection }
+const fileTabId = (file: { rel: string; source: string }) => JSON.stringify([file.source, file.rel]);
 
 interface TNode {
   name: string;
@@ -154,15 +183,8 @@ const GIT_STATUS_LETTER: Record<GitFileStatusType, string> = {
 };
 
 // ── 预览/高亮/编辑 复用(highlight.js + marked + CodeMirror 懒加载)──
-const IMAGE_EXTS = new Set(['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp', 'svg', 'ico', 'avif']);
-const MARKDOWN_EXTS = new Set(['md', 'markdown', 'mdx']);
-const HTML_EXTS = new Set(['html', 'htm']);
 const PROV_IMAGE_EXTS = new Set(['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp']);
 const PROV_TEXT_EXTS = new Set(['md', 'markdown', 'mdx', 'txt']);
-const STRUCTURED_PREVIEW_EXTS = new Set(['doc', 'xlsx', 'xlsm', 'xls', 'pptx', 'ppt']);
-const PREVIEW_TEXT_CAP = 200_000;
-const PREVIEW_ARCHIVE_CAP = 32 * 1024 * 1024;
-const PREVIEW_PDF_CAP = 64 * 1024 * 1024;
 // 后端与 Tauri 原语均允许 1 MiB；用满单块可把高延迟中继下的往返次数减半。
 const TRANSFER_CHUNK_SIZE = 1024 * 1024;
 // 不同文件拥有独立临时文件/transferId，可安全并行；限制为 4，兼顾吞吐与内存。
@@ -176,12 +198,6 @@ const LANG_ALIAS: Record<string, string> = {
   less: 'less', sql: 'sql', toml: 'ini', ini: 'ini', cfg: 'ini', conf: 'ini', md: 'markdown',
   markdown: 'markdown', swift: 'swift', dart: 'dart', lua: 'lua', r: 'r', scala: 'scala', pl: 'perl',
 };
-function extOf(name: string): string {
-  const lower = name.toLowerCase();
-  if (lower === 'dockerfile' || lower === 'makefile') return lower;
-  const i = name.lastIndexOf('.');
-  return i >= 0 ? name.slice(i + 1).toLowerCase() : '';
-}
 function escapeHtml(s: string): string { return s.replace(/[&<>]/g, (c) => (c === '&' ? '&amp;' : c === '<' ? '&lt;' : '&gt;')); }
 function highlightCode(text: string, ext: string): string {
   const lang = LANG_ALIAS[ext] || ext;
@@ -189,14 +205,6 @@ function highlightCode(text: string, ext: string): string {
     if (lang && hljs.getLanguage(lang)) return hljs.highlight(text, { language: lang, ignoreIllegals: true }).value;
     return text.length > 0 ? hljs.highlightAuto(text).value : '';
   } catch { return escapeHtml(text); }
-}
-function imageMime(ext: string): string {
-  if (ext === 'svg') return 'image/svg+xml';
-  if (ext === 'ico') return 'image/x-icon';
-  return `image/${ext === 'jpg' ? 'jpeg' : ext}`;
-}
-function base64ToText(b64: string): string {
-  return new TextDecoder('utf-8', { fatal: false }).decode(base64ToBytes(b64));
 }
 function base64ToBytes(b64: string): Uint8Array {
   const binary = atob(b64);
@@ -209,12 +217,6 @@ function bytesToBase64(bytes: Uint8Array): string {
   for (let i = 0; i < bytes.length; i += 0x8000) binary += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
   return btoa(binary);
 }
-function textToBase64(text: string): string {
-  const bytes = new TextEncoder().encode(text);
-  let bin = '';
-  for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
-  return btoa(bin);
-}
 type GeneratedTextExportResult =
   | { mode: 'saved'; destination: string }
   | { mode: 'shared' }
@@ -223,6 +225,7 @@ type GeneratedTextExportResult =
 
 async function exportGeneratedText(text: string, filename: string, mime: string): Promise<GeneratedTextExportResult> {
   const blob = new Blob([text], { type: mime });
+  const html = mime.startsWith('text/html');
 
   // 桌面应用必须使用原生“另存为”，不能把文件静默丢进默认下载目录。
   if (isTauri()) {
@@ -235,7 +238,7 @@ async function exportGeneratedText(text: string, filename: string, mime: string)
     const destination = await save({
       defaultPath,
       filters: [
-        { name: 'HTML 文档', extensions: ['html', 'htm'] },
+        { name: html ? 'HTML 文档' : '文本草稿', extensions: html ? ['html', 'htm'] : ['txt'] },
         { name: '所有文件', extensions: ['*'] },
       ],
     });
@@ -251,8 +254,8 @@ async function exportGeneratedText(text: string, filename: string, mime: string)
       const handle = await picker({
         suggestedName: filename,
         types: [{
-          description: 'HTML 文档',
-          accept: { 'text/html': ['.html', '.htm'] },
+          description: html ? 'HTML 文档' : '文本草稿',
+          accept: html ? { 'text/html': ['.html', '.htm'] } : { 'text/plain': ['.txt'] },
         }],
       });
       const writable = await handle.createWritable();
@@ -294,7 +297,7 @@ async function exportGeneratedText(text: string, filename: string, mime: string)
 function isDarkTheme(): boolean {
   try {
     const el = document.querySelector('.app-root') as HTMLElement | null;
-    const raw = (el ? getComputedStyle(el).getPropertyValue('--theme-bg') : '').trim() || getComputedStyle(document.body).backgroundColor;
+    const raw = (el ? getComputedStyle(el).getPropertyValue('--theme-panel-solid') || getComputedStyle(el).getPropertyValue('--theme-bg') : '').trim() || getComputedStyle(document.body).backgroundColor;
     let r = 20, g = 20, b = 30;
     const hex = raw.match(/^#([0-9a-f]{3}|[0-9a-f]{6})$/i);
     if (hex) {
@@ -305,16 +308,7 @@ function isDarkTheme(): boolean {
   } catch { return true; }
 }
 
-interface PreviewState {
-  rel: string; name: string;
-  source: 'remote' | 'local';
-  loading: boolean; text?: string; dataUrl?: string; isImage?: boolean; isMarkdown?: boolean;
-  isHtml?: boolean;
-  htmlFragment?: string;
-  truncated?: boolean;
-  renderer?: 'pdf' | 'docx' | 'drawio'; bytes?: Uint8Array; drawioXml?: string;
-  loadingText?: string; structured?: StructuredPreviewPayload; error?: string;
-}
+type PreviewState = DocumentPreview<StructuredPreviewPayload>;
 
 
 interface FileContextMenu {
@@ -358,7 +352,7 @@ const SearchHighlightedText: React.FC<{ text: string; query: string }> = ({ text
   ))}</>;
 };
 
-export const FileTreePanel: React.FC<Props> = React.memo(({ sessionId, workingDir, execKey, execLabel, execMode, backendId, focusRequest: externalFocusRequest, onAttentionChange }: Props) => {
+export const FileTreePanel: React.FC<Props> = React.memo(({ sessionId, workingDir, execKey, execLabel, execMode, backendId, focusRequest: externalFocusRequest, onAttentionChange, documentHost, isVisible = true, onDocumentOpen, onBrowseFiles }: Props) => {
   const mountedRef = useRef(true);
   useEffect(() => {
     mountedRef.current = true;
@@ -368,6 +362,9 @@ export const FileTreePanel: React.FC<Props> = React.memo(({ sessionId, workingDi
   const focusRequest = treeFocus && treeFocus.external === externalFocusRequest
     ? treeFocus.request : externalFocusRequest;
   const treeFocusId = useRef(0);
+  const navigateRef = useRef<(request: Pick<FileFocusRequest, 'relativePath' | 'line' | 'column'>) => void>(() => {});
+  const [editorCommand, setEditorCommand] = useState<{ id: number; relativePath: string; source: string; type: 'position' | 'search' | 'line'; line?: number; column?: number } | null>(null);
+  const editorCommandId = useRef(0);
   // execMode='local' 表示“在 Backend 所在机器执行”，不代表浏览器拥有那台
   // 机器的文件系统。只有 Tauri 本机执行时可直接视为同一端。
   const isRemote = execMode === 'relay' || !isTauri();
@@ -466,12 +463,67 @@ export const FileTreePanel: React.FC<Props> = React.memo(({ sessionId, workingDi
 
   // 预览 / 编辑
   const [preview, setPreview] = useState<PreviewState | null>(null);
+  const [documentOwner, setDocumentOwner] = useState(() => getCurrentUserProfile().userId);
+  const [draftRecoveryOpen, setDraftRecoveryOpen] = useState(false);
+  useEffect(() => onCurrentUserChanged((profile, changed) => {
+    if (changed) { setDocumentOwner(profile.userId); setPreview(null); setDraftRecoveryOpen(false); }
+  }), []);
+  const previewRequestRef = useRef(0);
+  const previewScope = JSON.stringify([documentOwner, execKey, sessionId, workingDir]);
+  const windowFrozen = useWindowWriteBlocked(execKey || '', sessionId);
+  const previewScopeRef = useRef(previewScope);
+  previewScopeRef.current = previewScope;
+  useEffect(() => { previewRequestRef.current++; setPreview(null); }, [previewScope]);
   const [previewMaximized, setPreviewMaximized] = useState(false);
   const [mdRaw, setMdRaw] = useState(false);
   const [editing, setEditing] = useState(false);
-  const [editText, setEditText] = useState('');
-  const [dirty, setDirty] = useState(false);
-  const [saving, setSaving] = useState(false);
+  const [editingDocument, setEditingDocument] = useState<DocumentSelection | null>(null);
+  const [fileTabs, setFileTabs] = useState<FileTab[]>([]);
+  const tabsRef = useRef(fileTabs); tabsRef.current = fileTabs;
+  const [documentView, setDocumentView] = useState<DocumentView>('source');
+  const [editNotice, setEditNotice] = useState('');
+  const [closingTab, setClosingTab] = useState<FileTab | null>(null);
+  const [tabClosing, setTabClosing] = useState(false);
+  const autoEditRequest = useRef(-1);
+  const [, refreshTabIndicators] = useState(0);
+  useEffect(() => documentHost ? documentStore.subscribe(() => refreshTabIndicators(value => value + 1)) : undefined, [documentHost]);
+  useEffect(() => { setFileTabs([]); setClosingTab(null); setEditNotice(''); }, [previewScope]);
+  useEffect(() => { setFileTabs(tabs => tabs.filter(tab => tab.source !== 'local')); }, [localFs]);
+  useEffect(() => {
+    if (!documentHost || !preview || !editingDocument || editingDocument.scope !== previewScope) return;
+    setFileTabs(tabs => tabs.map(tab => tab.id === fileTabId(preview) && tab.document !== editingDocument ? { ...tab, document: editingDocument } : tab));
+  }, [documentHost, preview?.rel, preview?.source, editingDocument, previewScope]);
+  const [editOpening, setEditOpening] = useState(false);
+  const [batchSaving, setBatchSaving] = useState(false);
+  const [batchResults, setBatchResults] = useState<{ scope: string; rows: { name: string; status: string }[] } | null>(null);
+  const [comparison, setComparison] = useState<{ key: string; diskVersion: DiskVersion; revision: number; text: string } | null>(null);
+  const [draftChoices, setDraftChoices] = useState<{ key: string; rows: StoredDocumentDraft[] } | null>(null);
+  const editOpenRequest = useRef(0);
+  const localFsRef = useRef(localFs); localFsRef.current = localFs;
+  const getEditSnapshot = useCallback(() => editingDocument?.scope === previewScope && getCurrentUserProfile().userId === documentOwner
+    ? documentStore.get(editingDocument.key) : undefined, [editingDocument, previewScope, documentOwner]);
+  const activeDocument = React.useSyncExternalStore(documentStore.subscribe, getEditSnapshot);
+  const languageEditor = useLanguageEditor(activeDocument, editingDocument?.client, (relativePath, line, column) => {
+    navigateRef.current({ relativePath, line, column });
+  });
+  const editText = activeDocument?.text || '';
+  const dirty = !!activeDocument?.dirty;
+  const saving = !!activeDocument?.save && !activeDocument.save.receipt && !activeDocument.save.unknown;
+  const needsSaveCheck = !!activeDocument?.save && (activeDocument.save.unknown || activeDocument.save.receipt?.status === 'accepted');
+  useEffect(() => {
+    if (preview?.source !== 'local') return;
+    previewRequestRef.current++; editOpenRequest.current++;
+    setPreview(null); setEditing(false); setEditingDocument(null); setEditOpening(false);
+    // 换副本绑定不将旧缓冲区附到新目录；原草稿仍按旧身份保留。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [localFs]);
+  useEffect(() => {
+    if (!activeDocument || editingDocument?.scope !== previewScope) return;
+    setPreview(current => current && current.rel === activeDocument.identity.relativePath
+      && (current.source === 'local') === (activeDocument.identity.source === 'local-copy')
+      && (current.text !== activeDocument.text || current.truncated && activeDocument.read?.complete)
+      ? { ...current, text: activeDocument.text, truncated: activeDocument.read?.complete ? false : current.truncated } : current);
+  }, [activeDocument?.text, activeDocument?.key, editingDocument?.scope, previewScope]);
   const [htmlExporting, setHtmlExporting] = useState(false);
   const [htmlExported, setHtmlExported] = useState(false);
   const [review, setReview] = useState<ProvOpenResult | null>(null);
@@ -1257,6 +1309,7 @@ export const FileTreePanel: React.FC<Props> = React.memo(({ sessionId, workingDi
     const relativePath = normalizeRelativeFilePath(focusRequest.relativePath);
     if (!relativePath) return;
     processedFocusRequestRef.current = focusRequest.requestId;
+    if (documentHost) { setSelected(relativePath); navigateRef.current({ ...focusRequest, relativePath }); return; }
     let cancelled = false;
     let revealFrame = 0;
 
@@ -1309,7 +1362,7 @@ export const FileTreePanel: React.FC<Props> = React.memo(({ sessionId, workingDi
       cancelled = true;
       if (revealFrame) cancelAnimationFrame(revealFrame);
     };
-  }, [focusRequest, sessionId, workingDir, isRemote, sessionOnline, localFs]);
+  }, [focusRequest, sessionId, workingDir, isRemote, sessionOnline, localFs, documentHost]);
 
   useEffect(() => () => {
     if (focusFlashTimerRef.current) clearTimeout(focusFlashTimerRef.current);
@@ -1729,6 +1782,7 @@ export const FileTreePanel: React.FC<Props> = React.memo(({ sessionId, workingDi
       paintProgress(true);
       applyCompleted();
       report({ kind: 'ok', text: `✓ 已下载 ${ok.length}/${rels.length} 个文件到本地` });
+      return !node.isDir && ok.includes(node.rel);
     } catch (e: any) {
       report({ kind: 'err', text: e?.message === '__TRANSFER_CANCELLED__' ? '下载已取消，未完成文件不会覆盖本地原文件' : `下载失败：${e?.message ?? e}` });
     }
@@ -1863,10 +1917,13 @@ export const FileTreePanel: React.FC<Props> = React.memo(({ sessionId, workingDi
     source: PreviewState['source'],
     maxBytes: number,
   ): Promise<Uint8Array> => {
+    const request = previewRequestRef.current;
+    const scope = previewScopeRef.current;
     let size = 0;
+    const selectedFs = localFsRef.current;
     if (source === 'local') {
-      if (!localFs) throw new Error('本机目录未连接');
-      size = await localFs.fileSize(node.rel);
+      if (!selectedFs) throw new Error('本机目录未连接');
+      size = await selectedFs.fileSize(node.rel);
     } else {
       const stat = await api.syncFileStat(workingDir, node.rel, execKey);
       if (stat.status !== 'ok' || typeof stat.size !== 'number') throw new Error(stat.message || '无法读取文件大小');
@@ -1880,7 +1937,7 @@ export const FileTreePanel: React.FC<Props> = React.memo(({ sessionId, workingDi
       const requestSize = Math.min(TRANSFER_CHUNK_SIZE, size - offset);
       let encoded = '';
       if (source === 'local') {
-        encoded = await localFs!.readChunk(node.rel, offset, requestSize);
+        encoded = await selectedFs!.readChunk(node.rel, offset, requestSize);
       } else {
         const result = await api.syncReadChunk(workingDir, node.rel, offset, requestSize, execKey);
         if (result.status !== 'ok' || result.data == null) throw new Error(result.message || '读取预览分块失败');
@@ -1891,7 +1948,8 @@ export const FileTreePanel: React.FC<Props> = React.memo(({ sessionId, workingDi
       output.set(chunk, offset);
       offset += chunk.length;
       const percent = size > 0 ? Math.min(100, Math.round(offset / size * 100)) : 100;
-      setPreview((current) => current?.rel === node.rel && current.source === source
+      setPreview((current) => previewRequestRef.current === request && previewScopeRef.current === scope
+        && current?.rel === node.rel && current.source === source
         ? { ...current, loadingText: `读取文件… ${percent}%（${formatBytes(offset)} / ${formatBytes(size)}）` }
         : current);
     }
@@ -1904,8 +1962,9 @@ export const FileTreePanel: React.FC<Props> = React.memo(({ sessionId, workingDi
     bytes?: Uint8Array,
   ): Promise<StructuredPreviewPayload> => {
     if (source === 'remote') return api.filePreview(workingDir, node.rel, execKey) as Promise<StructuredPreviewPayload>;
-    if (!localFs) throw new Error('本机目录未连接');
-    const encoded = bytes ? bytesToBase64(bytes) : await localFs.readFile(node.rel);
+    const selectedFs = localFsRef.current;
+    if (!selectedFs) throw new Error('本机目录未连接');
+    const encoded = bytes ? bytesToBase64(bytes) : await selectedFs.readFile(node.rel);
     return api.filePreviewData(node.name, encoded, execKey) as Promise<StructuredPreviewPayload>;
   }, [workingDir, execKey, localFs]);
 
@@ -1928,11 +1987,34 @@ export const FileTreePanel: React.FC<Props> = React.memo(({ sessionId, workingDi
     } finally { setReviewOpening(false); }
   }, [execKey, reviewOpening, workingDir]);
 
-  // ── 预览 / 编辑：在线默认查看执行端；断线后已下载文件自动切本地副本。──
-  const openPreview = useCallback(async (node: TNode, htmlFragment = '') => {
-    const source: PreviewState['source'] = node.local && (!node.remote || !sessionOnline) ? 'local' : 'remote';
+  // ── 已下载优先本机副本；远端保持只读，两种来源从不共享缓冲区或隐式上传。──
+  const openPreview = useCallback(async (node: TNode, htmlFragment = '', requireReady = false) => {
+    onDocumentOpen?.();
+    const source: PreviewState['source'] = node.local ? 'local' : 'remote';
+    if (documentHost && extOf(node.name) === 'prov') { await openReview(node.rel, source); return; }
+    const tabId = fileTabId({ rel: node.rel, source });
+    const previous = tabsRef.current.find(tab => tab.id === tabId);
+    if (documentHost && preview && fileTabId(preview) === tabId && !htmlFragment) {
+      if (requireReady && (preview.loading || preview.error)) throw new Error(preview.error || '活动文件仍在加载');
+      return;
+    }
+    if (documentHost && !previous && tabsRef.current.length >= 32) {
+      setMsg({ kind: 'err', text: '最多同时打开 32 个文件；请先关闭一些标签，未保存内容不会被淘汰。' }); return;
+    }
+    const nextView = previous?.view || defaultDocumentView(node.name);
+    setDocumentView(nextView); setEditNotice(''); setComparison(null); setDraftChoices(null);
+    if (documentHost && extOf(node.name) !== 'prov') setFileTabs(tabs => tabs.some(tab => tab.id === tabId) ? tabs
+      : [...tabs, { id: tabId, rel: node.rel, name: node.name, source, view: nextView }]);
+    const request = ++previewRequestRef.current;
+    const scope = previewScopeRef.current;
+    const user = getCurrentUserProfile().userId;
+    const publish = (value: PreviewState) => {
+      if (mountedRef.current && request === previewRequestRef.current && scope === previewScopeRef.current
+          && user === getCurrentUserProfile().userId) setPreview(value);
+    };
     const base: PreviewState = { rel: node.rel, name: node.name, source, htmlFragment, loading: true, loadingText: '正在准备预览…' };
-    setPreview(base); setPreviewMaximized(false); setEditing(false); setDirty(false); setMdRaw(false); setHtmlExported(false);
+    editOpenRequest.current++; setEditingDocument(null); setEditOpening(false);
+    setPreview(base); setPreviewMaximized(false); setEditing(false); setMdRaw(false); setHtmlExported(false);
     try {
       if (!workingDir) throw new Error('未打开会话');
       const ext = extOf(node.name);
@@ -1943,58 +2025,23 @@ export const FileTreePanel: React.FC<Props> = React.memo(({ sessionId, workingDi
         return;
       }
 
-      if (HTML_EXTS.has(ext)) {
-        // 页面必须完整读取，不把 200KB 截断片段当作可运行 HTML。
-        const bytes = await readPreviewBytes(node, source, 8 * 1024 * 1024);
-        setPreview({ ...base, loading: false, isHtml: true, text: new TextDecoder().decode(bytes) });
-        return;
-      }
-
-      if (ext === 'pdf') {
-        const bytes = await readPreviewBytes(node, source, PREVIEW_PDF_CAP);
-        setPreview({ ...base, loading: false, loadingText: undefined, renderer: 'pdf', bytes });
-        return;
-      }
-
-      if (ext === 'docx') {
-        const bytes = await readPreviewBytes(node, source, PREVIEW_ARCHIVE_CAP);
-        setPreview({ ...base, loading: false, loadingText: undefined, renderer: 'docx', bytes });
-        return;
-      }
-
-      if (ext === 'drawio' || ext === 'dio') {
-        const bytes = await readPreviewBytes(node, source, PREVIEW_ARCHIVE_CAP);
-        setPreview((current) => current?.rel === node.rel ? { ...current, loadingText: '正在准备 Draw.io 兼容预览…' } : current);
-        const structured = await structuredPreviewFor(node, source, bytes);
-        const xml = new TextDecoder('utf-8', { fatal: false }).decode(bytes);
-        setPreview({ ...base, loading: false, loadingText: undefined, renderer: 'drawio', drawioXml: xml, structured });
-        return;
-      }
-
-      if (STRUCTURED_PREVIEW_EXTS.has(ext)) {
-        const result = await structuredPreviewFor(node, source);
-        setPreview({ ...base, loading: false, structured: result as StructuredPreviewPayload });
-        return;
-      }
-      let b64 = '';
-      if (source === 'local') {
-        if (!localFs) throw new Error('本机目录未连接');
-        b64 = await localFs.readFile(node.rel);
-      } else {
-        const r = await api.syncReadFile(workingDir, node.rel, execKey);
-        if (r.status !== 'ok') throw new Error(r.message || '读取失败');
-        if (r.tooLarge) { setPreview({ ...base, loading: false, error: '文件过大，不便预览' }); return; }
-        b64 = r.data ?? '';
-      }
-      if (IMAGE_EXTS.has(ext)) setPreview({ ...base, loading: false, isImage: true, dataUrl: `data:${imageMime(ext)};base64,${b64}` });
-      else {
-        let text = base64ToText(b64);
-        const truncated = text.length > PREVIEW_TEXT_CAP;
-        if (truncated) text = text.slice(0, PREVIEW_TEXT_CAP) + '\n\n…（已截断,仅预览前 200KB）';
-        setPreview({ ...base, loading: false, isImage: false, isMarkdown: MARKDOWN_EXTS.has(ext), text, truncated });
-      }
-    } catch (e: any) { setPreview({ ...base, loading: false, error: e?.message ?? String(e) }); }
-  }, [workingDir, execKey, localFs, openReview, readPreviewBytes, structuredPreviewFor, sessionOnline]);
+      publish(await loadDocumentPreview(base, {
+        bytes: max => readPreviewBytes(node, source, max),
+        structured: bytes => structuredPreviewFor(node, source, bytes),
+        base64: async () => {
+          if (source === 'local') {
+            const selectedFs = localFsRef.current;
+            if (!selectedFs) throw new Error('本机目录未连接');
+            return selectedFs.readFile(node.rel);
+          }
+          const result = await api.syncReadFile(workingDir, node.rel, execKey);
+          if (result.status !== 'ok') throw new Error(result.message || '读取失败');
+          if (result.tooLarge) throw new Error('文件过大，不便预览');
+          return result.data ?? '';
+        },
+      }));
+    } catch (e: any) { publish({ ...base, loading: false, error: e?.message ?? String(e) }); if (requireReady) throw e; }
+  }, [workingDir, execKey, localFs, openReview, readPreviewBytes, structuredPreviewFor, sessionOnline, onDocumentOpen, documentHost, preview]);
 
   const htmlSource = preview?.source;
   const readHtmlResource = useCallback((rel: string) => {
@@ -2009,14 +2056,18 @@ export const FileTreePanel: React.FC<Props> = React.memo(({ sessionId, workingDi
   const fallbackDocxPreview = useCallback((_renderError: string) => {
     const current = preview;
     if (!current || current.renderer !== 'docx' || !current.bytes) return;
+    const scope = previewScopeRef.current, request = previewRequestRef.current;
+    const matches = (latest: PreviewState | null): latest is PreviewState => mountedRef.current && previewScopeRef.current === scope
+      && previewRequestRef.current === request && latest?.rel === current.rel && latest.source === current.source
+      && latest.bytes === current.bytes && latest.renderer === 'docx';
     const node: TNode = { name: current.name, rel: current.rel, isDir: false, size: current.bytes.length };
     void structuredPreviewFor(node, current.source, current.bytes).then((structured) => {
-      setPreview((latest) => latest?.rel === current.rel && latest.renderer === 'docx'
+      setPreview((latest) => matches(latest)
         ? { ...latest, renderer: undefined, bytes: undefined, structured }
         : latest);
     }).catch((reason: unknown) => {
       const message = reason instanceof Error ? reason.message : String(reason);
-      setPreview((latest) => latest?.rel === current.rel ? { ...latest, error: `Word 兼容预览也失败：${message}` } : latest);
+      setPreview((latest) => matches(latest) ? { ...latest, error: `Word 兼容预览也失败：${message}` } : latest);
     });
   }, [preview, structuredPreviewFor]);
 
@@ -2082,21 +2133,176 @@ export const FileTreePanel: React.FC<Props> = React.memo(({ sessionId, workingDi
     }
   }, [htmlExporting, preview]);
 
-  const startEdit = useCallback(() => { if (preview && !preview.isImage && !preview.structured && !preview.renderer) { setEditText(preview.text || ''); setDirty(false); setEditing(true); } }, [preview]);
-  const saveEdit = useCallback(async () => {
-    if (!preview || !workingDir) return;
-    setSaving(true);
+  const startEdit = useCallback(async (desiredView: DocumentView = 'source') => {
+    if (!preview || preview.isImage || preview.structured || preview.renderer || editOpening) return;
+    const request = ++editOpenRequest.current, scope = previewScopeRef.current;
+    const user = getCurrentUserProfile().userId, selectedFs = localFs;
+    const target = execKey || getSessionExecKey(sessionId);
+    const current = () => mountedRef.current && previewScopeRef.current === scope
+      && getCurrentUserProfile().userId === user && (preview.source !== 'local' || selectedFs === localFsRef.current);
+    setEditOpening(true); setEditNotice('');
     try {
+      if (!sessionId || !target) throw new DocumentProtocolError('workspace_identity_required');
+      let client: DocumentClient;
       if (preview.source === 'local') {
-        if (!localFs) throw new Error('本机目录未连接');
-        await localFs.writeFile(preview.rel, textToBase64(editText));
+        if (!selectedFs?.documentAdapter) throw new DocumentProtocolError('safe_local_documents_unsupported');
+        const adapter = await selectedFs.documentAdapter();
+        client = new LocalDocuments(user, sessionId, target, adapter, new IndexedLocalJournal(), current);
       } else {
-        const r = await api.syncWriteFile(workingDir, preview.rel, textToBase64(editText), execKey);
-        if (r.status !== 'ok') throw new Error(r.message || '保存失败');
+        const executorClient = await api.workspaceDocuments(sessionId, target, workingDir, current);
+        client = isRemote ? readonlyDocumentClient(executorClient) : executorClient;
       }
-      setPreview((p) => (p ? { ...p, text: editText } : p));
-      setDirty(false); setEditing(false);
-      setMsg({ kind: 'ok', text: `✓ 已保存 ${preview.name}${preview.source === 'local' ? '（本机）' : ''}` });
+      if (!current()) throw new DocumentProtocolError('stale_workspace');
+      const loaded = await documentDrafts.open(client, preview.rel), doc = loaded.document;
+      if (!current() || request !== editOpenRequest.current) return;
+      setEditingDocument({ key: doc.key, client, scope }); setEditing(desiredView !== 'preview');
+      if (documentHost) setDocumentView(desiredView);
+      setDraftChoices({ key: doc.key, rows: loaded.choices });
+      if (doc.persistence === 'restored') setMsg({ kind: 'ok', text: '已恢复本设备草稿；未自动保存，磁盘版本变化时需先比较。' });
+      if (!doc.read?.editable && doc.read?.reasonCode !== 'remote_readonly') setMsg({ kind: 'err', text: `此文件仅可查看：${doc.read?.reasonCode || '完整性未确认'}，不会覆盖原文件。` });
+    } catch (error: any) {
+      if (current() && request === editOpenRequest.current) {
+        const text = `只读：无法安全编辑（${error?.message || error}）。未使用预览内容覆盖文件。`;
+        setEditNotice(text); setMsg({ kind: 'err', text });
+      }
+    } finally { if (request === editOpenRequest.current) setEditOpening(false); }
+  }, [preview, localFs, execKey, sessionId, workingDir, editOpening, documentHost, isRemote]);
+  useEffect(() => {
+    if (!documentHost || !preview || preview.loading || preview.error || preview.isImage || preview.structured
+      || preview.renderer || autoEditRequest.current === previewRequestRef.current) return;
+    autoEditRequest.current = previewRequestRef.current;
+    void startEdit(documentView);
+  }, [documentHost, preview, startEdit, documentView]);
+  const changeDocumentView = (view: DocumentView) => {
+    if (!preview) return;
+    setDocumentView(view); setEditing(view !== 'preview');
+    setFileTabs(tabs => tabs.map(tab => tab.id === fileTabId(preview) ? { ...tab, view } : tab));
+  };
+  navigateRef.current = request => {
+    const rel = normalizeRelativeFilePath(request.relativePath); if (!rel) return;
+    const local = isRemote && !!localManifest?.[rel];
+    if (request.line) setEditorCommand({ id: ++editorCommandId.current, relativePath: rel, source: local ? 'local' : 'remote', type: 'position', line: request.line, column: request.column });
+    else setEditorCommand(null);
+    void openPreview({ rel, name: rel.split('/').pop()!, isDir: false, size: 0, remote: true, local });
+  };
+  useEffect(() => {
+    if (editorCommand?.type === 'position' && preview?.rel === editorCommand.relativePath && preview.source === editorCommand.source
+      && activeDocument && documentView === 'preview') changeDocumentView('source');
+  }, [editorCommand, activeDocument?.key, preview?.rel]);
+  const connectSearch = async () => {
+    const target = execKey || getSessionExecKey(sessionId), scope = previewScopeRef.current, user = getCurrentUserProfile().userId;
+    if (!sessionId || !target) throw new Error('会话执行端身份未就绪');
+    return api.workspaceDocuments(sessionId, target, workingDir, () => mountedRef.current && previewScopeRef.current === scope && getCurrentUserProfile().userId === user);
+  };
+  const selectFileTab = (tab: FileTab) => void openPreview({ rel: tab.rel, name: tab.name, size: 0, isDir: false,
+    local: tab.source === 'local', remote: tab.source === 'remote' });
+  const transferRef = useRef<{ export: () => Promise<unknown>; import: (value: unknown) => Promise<void> } | null>(null);
+  transferRef.current = {
+    export: async () => {
+      if (preview?.loading || editOpening) throw new Error('文件正在打开，请等待读取完成再移动');
+      if (fileTransfers.active(transferKey)) throw new Error('本窗口文件传输仍在进行；请先等待完成或核对取消，再移动工作台');
+      const clients: DocumentClient[] = [];
+      const remote = await connectSearch(); if (remote.supported) clients.push(isRemote ? readonlyDocumentClient(remote) : remote);
+      if (localFs?.documentAdapter && sessionId && execKey) clients.push(new LocalDocuments(documentOwner, sessionId, execKey,
+        await localFs.documentAdapter(), new IndexedLocalJournal(), () => previewScopeRef.current === previewScope && getCurrentUserProfile().userId === documentOwner));
+      const docs = documentStore.all().filter(doc => clients.some(client => sameWorkspace(client.identity, doc.identity.workspace)));
+      if (docs.length > 64) throw new Error('打开文档超过交接上限，请先导出或关闭部分文件');
+      const { exportDocumentHandoff } = await import('../utils/documentHandoff');
+      const documents = docs.filter(doc => doc.dirty || doc.read?.editable).map(exportDocumentHandoff);
+      const tabs = documentHost ? fileTabs.map(tab => ({ rel: tab.rel, name: tab.name, source: tab.source, view: tab.view }))
+        : preview ? [{ rel: preview.rel, name: preview.name, source: preview.source, view: editing ? 'source' : 'preview' }] : [];
+      return { tabs, active: preview ? { rel: preview.rel, source: preview.source } : null, documents };
+    },
+    import: async value => {
+      const row = value as any, scope = previewScope;
+      const current = () => mountedRef.current && previewScopeRef.current === scope && getCurrentUserProfile().userId === documentOwner;
+      if (!row || !Array.isArray(row.tabs) || row.tabs.length > 32 || !Array.isArray(row.documents) || row.documents.length > 64
+        || row.tabs.some((tab: any) => !tab || normalizeRelativeFilePath(tab.rel) !== tab.rel || typeof tab.name !== 'string'
+          || !['local', 'remote'].includes(tab.source) || !['preview', 'source', 'split'].includes(tab.view))) throw new Error('文件标签交接数据无效');
+      const clients: Partial<Record<'local' | 'remote', DocumentClient>> = {};
+      const clientFor = async (source: 'local' | 'remote') => {
+        if (clients[source]) return clients[source]!;
+        if (source === 'remote') { const remote = await connectSearch(); clients.remote = isRemote ? readonlyDocumentClient(remote) : remote; }
+        else {
+          const fs = localFsRef.current || await restoreLocalDir(localBindingKey);
+          if (!fs?.documentAdapter || !sessionId || !execKey) throw new Error('目标窗口无法恢复本机目录绑定');
+          if (!current()) throw new Error('交接目标身份已变化');
+          setLocalFs(fs); localFsRef.current = fs;
+          clients.local = new LocalDocuments(documentOwner, sessionId, execKey, await fs.documentAdapter(), new IndexedLocalJournal(), current);
+        }
+        return clients[source]!;
+      };
+      const restored = new Map<string, DocumentSelection>();
+      const { importDocumentHandoff } = await import('../utils/documentHandoff');
+      for (const draft of row.documents as RecoverableDraft[]) {
+        const source = draft?.identity?.source === 'local-copy' ? 'local' : 'remote', client = await clientFor(source);
+        const key = await importDocumentHandoff(client, draft, current);
+        restored.set(fileTabId({ rel: draft.identity.relativePath, source }), { key, client, scope });
+      }
+      if (!current()) throw new Error('交接目标身份已变化');
+      const tabs: FileTab[] = row.tabs.map((tab: FileTab) => ({ rel: tab.rel, name: tab.name, source: tab.source, view: tab.view,
+        id: fileTabId(tab), document: restored.get(fileTabId(tab)) }));
+      setFileTabs(tabs); tabsRef.current = tabs;
+      const active = row.active && tabs.find(tab => tab.rel === row.active.rel && tab.source === row.active.source);
+      if (row.active && !active) throw new Error('活动文件不在交接标签内');
+      if (active) {
+        if (active.source === 'local') await clientFor('local');
+        await openPreview({ rel: active.rel, name: active.name, isDir: false, size: 0, local: active.source === 'local', remote: active.source === 'remote' }, '', true);
+        if (!current()) throw new Error('交接目标身份已变化');
+        setDocumentView(active.view); setEditing(active.view !== 'preview');
+        if (active.document) setEditingDocument(active.document);
+      }
+    },
+  };
+  useEffect(() => {
+    if (!sessionId || !execKey || !workingDir) return;
+    return handoffParticipants.register(handoffScope(documentOwner, execKey, sessionId, workingDir), documentHost ? 'filesEngine' : 'filesChat', {
+      export: () => transferRef.current!.export(), import: value => transferRef.current!.import(value),
+    });
+  }, [previewScope, documentHost]);
+  const removeFileTab = (tab: FileTab) => {
+    const remaining = tabsRef.current.filter(item => item.id !== tab.id);
+    setFileTabs(remaining); tabsRef.current = remaining; setClosingTab(null);
+    if (preview && fileTabId(preview) === tab.id) {
+      previewRequestRef.current++; editOpenRequest.current++; setPreview(null); setEditingDocument(null); setEditOpening(false);
+      if (remaining.length) selectFileTab(remaining[Math.max(0, remaining.length - 1)]);
+    }
+  };
+  const requestCloseTab = (tab: FileTab) => {
+    const doc = tab.document && documentStore.get(tab.document.key);
+    if (doc?.dirty || doc?.save && !['succeeded', 'failed'].includes(doc.save.receipt?.status || '')) setClosingTab(tab);
+    else removeFileTab(tab);
+  };
+  const finishCloseTab = async (action: 'save' | 'discard') => {
+    const tab = closingTab, scope = previewScope;
+    if (!tab?.document || tabClosing) return;
+    setTabClosing(true);
+    try {
+      if (action === 'discard') await documentDrafts.discard(tab.document.key);
+      else {
+        const doc = documentStore.get(tab.document.key);
+        const unknown = doc?.save?.unknown || doc?.save?.receipt?.status === 'accepted';
+        const receipt = unknown ? await documentStore.reconcile(tab.document.client, tab.document.key)
+          : await documentStore.save(tab.document.client, tab.document.key);
+        if (receipt.status !== 'succeeded' || documentStore.get(tab.document.key)?.dirty) throw new Error('保存未完成或产生了新编辑，标签仍保留');
+      }
+      if (previewScopeRef.current === scope) removeFileTab(tab);
+    } catch (error: any) { if (previewScopeRef.current === scope) setEditNotice(`未关闭文件：${error?.message || error}`); }
+    finally { if (previewScopeRef.current === scope) setTabClosing(false); }
+  };
+  const saveEdit = useCallback(async () => {
+    if (!preview || !editingDocument || !activeDocument) return;
+    const selected = editingDocument;
+    try {
+      const receipt = needsSaveCheck ? await documentStore.reconcile(selected.client, selected.key)
+        : await documentStore.save(selected.client, selected.key);
+      if (!mountedRef.current || previewScopeRef.current !== selected.scope) return;
+      if (receipt.status !== 'succeeded') {
+        setMsg({ kind: 'err', text: receipt.status === 'failed' ? `未保存：${receipt.reasonCode}；草稿已保留。`
+          : '保存结果尚未确认，草稿已保留。请使用“核对保存”，不会重复写入。' });
+        return;
+      }
+      setMsg({ kind: 'ok', text: `✓ 已保存 ${preview.name}${preview.source === 'local' ? '（本机副本，未上传）' : ''}` });
       if (preview.source === 'local') {
         void scanLocal(localFs);
       } else {
@@ -2104,16 +2310,46 @@ export const FileTreePanel: React.FC<Props> = React.memo(({ sessionId, workingDi
         void loadChildren(preview.rel.split('/').slice(0, -1).join('/'));
         void gitRefreshRef.current?.();
       }
-    } catch (e: any) { setMsg({ kind: 'err', text: `保存失败：${e?.message ?? e}` }); }
-    finally { setSaving(false); }
-  }, [preview, workingDir, execKey, editText, localFs, scanLocal, loadChildren]);
+    } catch (e: any) {
+      if (mountedRef.current && previewScopeRef.current === selected.scope) setMsg({ kind: 'err', text: `保存失败：${e?.message ?? e}` });
+    }
+  }, [preview, editingDocument, activeDocument, needsSaveCheck, localFs, scanLocal, loadChildren]);
+  const saveAllEdits = useCallback(async () => {
+    if (!editingDocument || batchSaving) return;
+    const { client, scope } = editingDocument;
+    const keys = documentStore.all().filter(doc => sameWorkspace(client.identity, doc.identity.workspace)
+      && doc.identity.source === (client.source || 'executor') && doc.dirty).map(doc => doc.key);
+    setBatchSaving(true);
+    try {
+      const results = await documentStore.saveAll(client, keys);
+      if (mountedRef.current && previewScopeRef.current === scope) setBatchResults({ scope, rows: results.map(row => ({
+        name: documentStore.get(row.key)?.identity.relativePath || '文件',
+        status: row.receipt?.status === 'succeeded' ? '已保存' : row.receipt?.reasonCode || row.error || '结果待核对',
+      })) });
+    } finally { if (mountedRef.current) setBatchSaving(false); }
+  }, [editingDocument, batchSaving]);
+  const compareDocument = useCallback(async () => {
+    if (!editingDocument || !activeDocument) return;
+    const selected = editingDocument;
+    try {
+      const doc = await documentStore.open(selected.client, activeDocument.identity.relativePath, true);
+      if (previewScopeRef.current !== selected.scope || !doc.disk?.version) return;
+      setComparison({ key: doc.key, diskVersion: doc.disk.version, revision: doc.revision, text: doc.text });
+    } catch (error: any) {
+      if (previewScopeRef.current === selected.scope) setMsg({ kind: 'err', text: `无法读取磁盘比较版本：${error?.message || error}；未修改草稿。` });
+    }
+  }, [editingDocument, activeDocument]);
   const closePreview = useCallback(() => {
-    if (editing && dirty && !window.confirm('有未保存的修改，确定关闭？')) return;
-    setPreview(null); setPreviewMaximized(false); setEditing(false); setDirty(false); setHtmlExported(false);
-  }, [editing, dirty]);
+    if (dirty && !window.confirm(activeDocument?.persistence === 'saved'
+      ? '修改尚未保存到文件。关闭预览会保留本设备草稿；仍要关闭？'
+      : '修改尚未保存，草稿尚未可靠持久化，刷新或退出可能丢失；仍要关闭？')) return;
+    previewRequestRef.current++;
+    editOpenRequest.current++; setEditingDocument(null); setEditOpening(false);
+    setPreview(null); setPreviewMaximized(false); setEditing(false); setHtmlExported(false);
+  }, [dirty, activeDocument?.persistence]);
 
   useEffect(() => {
-    if (!preview) return;
+    if (!preview || !isVisible || documentHost) return;
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key !== 'Escape') return;
       event.preventDefault();
@@ -2121,7 +2357,7 @@ export const FileTreePanel: React.FC<Props> = React.memo(({ sessionId, workingDi
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [preview, previewMaximized]);
+  }, [preview, previewMaximized, documentHost, isVisible]);
 
   // ── 渲染 ──
   const fileIcon = (n: TNode, st: FStatus | null): string => {
@@ -2281,8 +2517,28 @@ export const FileTreePanel: React.FC<Props> = React.memo(({ sessionId, workingDi
       ? '局域网 HTTP：副本与当前页面可离线使用，关闭浏览器后离线重开需 HTTPS' : '',
   ].filter(Boolean).join('\n');
   const gitActionDisabled = !gitAvailable || !gitStatusReady || !!gitError;
+  const editorElement = preview && <Suspense fallback={<div style={{ padding: 24 }}>编辑器加载中…</div>}>
+    <CodeEditor key={activeDocument?.lifecycleId || fileTabId(preview)} documentKey={activeDocument?.key}
+      language={languageEditor.binding}
+      value={activeDocument ? editText : preview.text || ''} ext={extOf(preview.name)} dark={isDarkTheme()}
+      height={documentHost ? '100%' : undefined}
+      command={activeDocument && editorCommand?.relativePath === preview.rel && editorCommand.source === preview.source ? editorCommand : undefined}
+      readOnly={!activeDocument?.read?.editable}
+      editorState={activeDocument?.editor as EditorDocumentState | undefined}
+      onEditorState={state => { if (activeDocument) documentStore.editorState(activeDocument.key, state, activeDocument.lifecycleId); }}
+      onChange={value => { if (activeDocument) documentStore.edit(activeDocument.key, value); }} onSave={saveEdit} onSaveAll={saveAllEdits} />
+  </Suspense>;
+  const engineRichPreview = preview?.isHtml ? <Suspense fallback={<p>HTML 预览加载中…</p>}>
+    <HtmlPreview key={fileTabId(preview)} source={activeDocument ? editText : preview.text || ''} rel={preview.rel} fragment={preview.htmlFragment}
+      root={preview.source === 'local' ? localFs?.label() || '本机副本' : workingDir}
+      nodeLabel={preview.source === 'local' ? '本机副本' : execLabel || '会话执行节点'}
+      readFile={readHtmlResource} onNavigate={navigateHtmlResource} onReveal={revealPreview} />
+  </Suspense> : preview?.isMarkdown ? <MarkdownPreview key={fileTabId(preview)}
+    source={activeDocument ? editText : preview.text || ''} title={preview.name} initialDark={isDarkTheme()} /> : null;
+
   return (
-    <div className="ftp-panel" style={wrapStyle}>
+    <WorkbenchInteractionContext.Provider value={windowFrozen}>
+    <div className="ftp-panel" {...(windowFrozen ? { inert: '' } as any : {})} style={wrapStyle}>
       <style>{`
         @keyframes ftp-focus-pulse {
           0%, 100% { box-shadow: inset 2px 0 0 var(--theme-accent, #0969da); }
@@ -2337,6 +2593,7 @@ export const FileTreePanel: React.FC<Props> = React.memo(({ sessionId, workingDi
           </span>
         </div>
         <div className="ftp-hactions" style={headerActionsStyle}>
+          <button style={hdrIconStyle} aria-label="本设备草稿" title="离线草稿恢复、导出与清理" onClick={() => setDraftRecoveryOpen(true)}>▤</button>
             <button
               disabled={gitActionDisabled}
               style={{ ...hdrIconStyle, fontSize: 11, width: 'auto', padding: '0 6px', gap: 3 }}
@@ -2362,6 +2619,9 @@ export const FileTreePanel: React.FC<Props> = React.memo(({ sessionId, workingDi
           <button style={hdrIconStyle} title="全部折叠" onClick={() => setExpanded({})}>⊟</button>
         </div>
       </div>
+
+      {draftRecoveryOpen && <Suspense fallback={null}><DocumentDraftRecovery owner={documentOwner}
+        onClose={() => setDraftRecoveryOpen(false)} onExport={exportGeneratedText} /></Suspense>}
 
       {/* VS Code Quick Open 风格的工作区文件查询。 */}
       <div className="ftp-search" style={fileSearchBarStyle}>
@@ -2657,6 +2917,11 @@ export const FileTreePanel: React.FC<Props> = React.memo(({ sessionId, workingDi
           >
             {!n.isDir && !n.typeConflict && (
               <button style={contextItemStyle} onClick={() => { setContextMenu(null); openPreview(n); }}>👁️ 预览 / 编辑</button>
+            )}
+            {isRemote && n.remote && n.local && !n.isDir && !n.typeConflict && (
+              <button style={contextItemStyle} disabled={!sessionOnline} onClick={() => {
+                setContextMenu(null); void openPreview({ ...n, local: false });
+              }}>查看远端（只读）</button>
             )}
             <button style={contextItemStyle} disabled={!sessionId} onClick={() => {
               if (!sessionId) return;
@@ -3000,17 +3265,57 @@ export const FileTreePanel: React.FC<Props> = React.memo(({ sessionId, workingDi
         );
       })()}
 
+      {documentHost && createPortal(<WorkbenchFileCommands key={previewScope} host={documentHost} visible={isVisible} scope={previewScope}
+        connect={connectSearch} onOpen={(relativePath, line, column) => navigateRef.current({ relativePath, line, column })}
+        onActivate={() => onDocumentOpen?.()} editable={!!activeDocument?.read?.editable}
+        relativePath={preview?.source === 'remote' ? preview.rel : undefined} draft={activeDocument?.text}
+        onEditorCommand={type => { if (!preview) return; changeDocumentView('source');
+          setEditorCommand({ id: ++editorCommandId.current, relativePath: preview.rel, source: preview.source, type }); }} />, documentHost)}
+      {documentHost && !preview && createPortal(<div style={{ display: 'flex', flex: 1, minHeight: 0, alignItems: 'center', justifyContent: 'center', padding: 24, overflow: 'auto' }}>
+        <div style={{ maxWidth: 330, width: '100%', fontSize: 12, color: 'var(--theme-text-muted)' }}>
+          <div style={{ display: 'inline-flex', padding: 12, borderRadius: 10, background: 'var(--theme-accent-bg)', color: 'var(--theme-accent)' }}><WorkbenchIcon name="code" size={28} /></div>
+          <h3 style={{ fontSize: 16, fontWeight: 500, color: 'var(--theme-text)', margin: '18px 0 8px' }}>打开文件，开始工作</h3>
+          <p style={{ lineHeight: 1.8, margin: '0 0 20px' }}>代码直接编辑，文档默认预览。文件会保留在这里，随时与右侧对话协作。</p>
+          <WorkbenchButton icon="files" onClick={onBrowseFiles}>打开文件目录</WorkbenchButton>
+          <div style={{ marginTop: 24, paddingTop: 14, borderTop: '1px solid var(--theme-border)', display: 'flex', justifyContent: 'space-between', gap: 8 }}><span>快速打开文件</span><kbd>Ctrl / ⌘ P</kbd></div>
+          <div style={{ marginTop: 10, display: 'flex', justifyContent: 'space-between', gap: 8 }}><span>搜索项目内容</span><kbd>Ctrl / ⌘ ⇧ F</kbd></div>
+        </div>
+      </div>, documentHost)}
       {preview && (
-        <AppModalPortal>
-          <div style={pvOverlay}>
-            <div style={{ ...pvBox, ...(previewMaximized ? pvBoxMaximized : {}) }} onClick={(e) => e.stopPropagation()}>
-            <div style={pvHeader}>
-              <span style={{ fontSize: 13 }}>{preview.isImage ? '🖼️' : preview.renderer === 'pdf' ? '📕' : preview.renderer === 'docx' ? '📘' : preview.renderer === 'drawio' ? '🧩' : preview.structured ? '📊' : editing ? '✏️' : '📄'}</span>
-              <span style={{ fontWeight: 600, fontSize: 13, minWidth: 70, maxWidth: 240, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={preview.rel}>
-                {dirty && <span style={{ color: 'var(--theme-accent)' }}>● </span>}{preview.name}
+        <DocumentSurface host={documentHost}>
+          <div style={documentHost ? { display: 'flex', flex: 1, minWidth: 0, minHeight: 0, overflow: 'hidden' } : pvOverlay}>
+            <div style={documentHost ? { display: 'flex', flexDirection: 'column', flex: 1, minWidth: 0, minHeight: 0, overflow: 'hidden', background: 'var(--theme-panel-solid, var(--theme-bg))' }
+              : { ...pvBox, ...(previewMaximized ? pvBoxMaximized : {}) }} onClick={(e) => e.stopPropagation()}>
+            {documentHost && <div role="tablist" aria-label="打开的文件" style={{ display: 'flex', overflowX: 'auto', flexShrink: 0, borderBottom: '1px solid var(--theme-border)', background: 'var(--theme-sidebar-solid)' }}>
+              {fileTabs.map((tab, index) => <div key={tab.id} style={{ display: 'flex', flexShrink: 0, borderRight: '1px solid var(--theme-border)', borderTop: `2px solid ${tab.id === fileTabId(preview) ? 'var(--theme-accent)' : 'transparent'}` }}>
+                <button role="tab" aria-selected={tab.id === fileTabId(preview)} tabIndex={tab.id === fileTabId(preview) ? 0 : -1}
+                  title={`${execLabel || execKey} · ${workingDir}/${tab.rel} · ${tab.source === 'local' ? '本机副本' : '执行端'}`}
+                  className="awu-wb-control" style={{ ...hdrBtnStyle, display: 'flex', alignItems: 'center', gap: 6, padding: '6px 10px', border: 0, borderRadius: 0, background: tab.id === fileTabId(preview) ? 'var(--theme-panel-solid)' : 'transparent' }}
+                  onClick={() => selectFileTab(tab)} onKeyDown={event => {
+                    const next = event.key === 'ArrowRight' ? (index + 1) % fileTabs.length : event.key === 'ArrowLeft' ? (index - 1 + fileTabs.length) % fileTabs.length : -1;
+                    if (next < 0) return;
+                    event.preventDefault(); selectFileTab(fileTabs[next]);
+                    (event.currentTarget.closest('[role="tablist"]')?.querySelectorAll<HTMLButtonElement>('[role="tab"]')[next])?.focus();
+                  }}>
+                  <WorkbenchIcon name="code" size={13} />{tab.document && documentStore.get(tab.document.key)?.dirty ? '● ' : ''}{tab.name}{tab.source === 'local' ? ' · 本机' : ''}
+                </button>
+                <button className="awu-wb-control" aria-label={`关闭文件 ${tab.rel}${tab.source === 'local' ? '（本机）' : ''}`} style={{ ...hdrBtnStyle, border: 0, background: 'transparent' }}
+                  onClick={() => requestCloseTab(tab)}>×</button>
+              </div>)}
+            </div>}
+            {documentHost && closingTab && <div role="alertdialog" aria-label="关闭未保存文件" style={{ padding: 12, borderBottom: '1px solid var(--theme-border)', fontSize: 12 }}>
+              <p>{closingTab.rel} 尚未保存或结果待核对。保存成功才能关闭；放弃只丢弃此窗口草稿，不修改磁盘。</p>
+              <button style={hdrBtnStyle} disabled={tabClosing} onClick={() => void finishCloseTab('save')}>保存并关闭</button>
+              <button style={hdrBtnStyle} disabled={tabClosing} onClick={() => void finishCloseTab('discard')}>放弃草稿并关闭</button>
+              <button style={hdrBtnStyle} disabled={tabClosing} onClick={() => setClosingTab(null)}>取消关闭</button>
+            </div>}
+            <div style={{ ...pvHeader, ...(documentHost ? { height: 38, minHeight: 38, padding: '0 8px', gap: 6, overflowX: 'auto' } : {}) }}>
+              {!documentHost && <span style={{ fontSize: 13 }}>{preview.isImage ? '🖼️' : preview.renderer === 'pdf' ? '📕' : preview.renderer === 'docx' ? '📘' : preview.renderer === 'drawio' ? '🧩' : preview.structured ? '📊' : editing ? '✏️' : '📄'}</span>}
+              <span style={{ fontWeight: documentHost ? 400 : 600, fontSize: documentHost ? 11 : 13, minWidth: 35, maxWidth: 240, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', color: documentHost ? 'var(--theme-text-muted)' : undefined }} title={`${preview.rel} · ${execLabel || execKey}`}>
+                {dirty && <span style={{ color: 'var(--theme-accent)' }}>● </span>}{documentHost ? preview.rel : preview.name}
               </span>
               <span style={{ ...tagStyle, marginLeft: 0 }}>
-                {preview.source === 'local' ? '💻 本机' : '☁️ 远端'}
+                {documentHost ? preview.source === 'local' ? '本机副本' : '执行端' : preview.source === 'local' ? '💻 本机' : '☁️ 远端'}
               </span>
               <div style={{ flex: 1 }} />
               {!preview.loading && !(preview.source === 'local' && !isTauri()) && (
@@ -3045,38 +3350,133 @@ export const FileTreePanel: React.FC<Props> = React.memo(({ sessionId, workingDi
                   {htmlExporting ? '⏳ 转换中…' : htmlExported ? '✓ 已保存' : '⇩ HTML 另存为'}
                 </button>
               )}
-              {!editing && (preview.isMarkdown || preview.isHtml) && !preview.loading && !preview.error && (
+              {documentHost && (preview.isMarkdown || preview.isHtml) && <div role="group" aria-label="文档显示方式" style={{ display: 'flex' }}>
+                {(['preview', 'source', 'split'] as const).map(view => <button key={view} style={{ ...hdrBtnStyle, color: documentView === view ? 'var(--theme-accent)' : undefined }}
+                  aria-pressed={documentView === view} onClick={() => changeDocumentView(view)}>{view === 'preview' ? '预览' : view === 'source' ? '源码' : '并排'}</button>)}
+              </div>}
+              {!documentHost && !editing && (preview.isMarkdown || preview.isHtml) && !preview.loading && !preview.error && (
                 <div style={{ display: 'flex', flexShrink: 0, border: '1px solid var(--theme-border)', borderRadius: 6, overflow: 'hidden', marginRight: 4 }}>
                   <button style={{ ...segBtnStyle, ...(!mdRaw ? segActiveStyle : {}) }} onClick={() => setMdRaw(false)}>{preview.isHtml ? '🌐 页面' : '👁 预览'}</button>
                   <button style={{ ...segBtnStyle, ...(mdRaw ? segActiveStyle : {}) }} onClick={() => setMdRaw(true)}>{'</> 源码'}</button>
                 </div>
               )}
-              {!editing && !preview.isImage && !preview.structured && !preview.renderer && !preview.loading && !preview.error && (
-                <button style={hdrBtnStyle} onClick={startEdit}>✏️ 编辑</button>
+              {isRemote && preview.source === 'remote' && !preview.loading && !preview.error && <>
+                {localManifest?.[preview.rel] ? <button style={hdrBtnStyle} onClick={() => void openPreview({ rel: preview.rel, name: preview.name, isDir: false, size: 0, local: true })}>打开本机副本</button>
+                  : <button style={hdrBtnStyle} disabled={!sessionOnline || !!transfer || localRestoring} onClick={async () => {
+                    if (!localFs) { await chooseLocal(); return; }
+                    const source = preview, scope = previewScopeRef.current, request = previewRequestRef.current;
+                    const downloaded = await pull({ rel: source.rel, name: source.name, isDir: false, size: 0, remote: true });
+                    if (downloaded && mountedRef.current && previewScopeRef.current === scope && previewRequestRef.current === request)
+                      await openPreview({ rel: source.rel, name: source.name, isDir: false, size: 0, local: true });
+                  }}>{localFs ? '下载到本机并打开' : '选择本机副本目录'}</button>}
+              </>}
+              {!documentHost && !editing && !(isRemote && preview.source === 'remote') && !preview.isImage && !preview.structured && !preview.renderer && !preview.loading && !preview.error && (
+                <button style={hdrBtnStyle} onClick={() => void startEdit()} disabled={editOpening}>{editOpening ? '完整读取中…' : '✏️ 编辑'}</button>
               )}
-              {editing && (
+              {(documentHost ? !!activeDocument?.read?.editable : editing) && (
                 <>
+                  <WorkbenchOverflow enabled={!!documentHost} label="文件与草稿操作">
+                  <button style={hdrBtnStyle} onClick={() => void exportGeneratedText(editText, `${preview.name}.draft.txt`, 'text/plain;charset=utf-8').catch(error =>
+                    setMsg({ kind: 'err', text: `导出失败：${error?.message || error}` }))}>导出草稿</button>
+                  <button style={hdrBtnStyle} disabled={saving || needsSaveCheck} onClick={async () => {
+                    if (!editingDocument || !activeDocument || !window.confirm('放弃本窗口此文件草稿及编辑历史？不会修改磁盘文件。')) return;
+                    try {
+                      await documentDrafts.discard(activeDocument.key);
+                      await documentStore.open(editingDocument.client, activeDocument.identity.relativePath);
+                    } catch (error: any) { setMsg({ kind: 'err', text: `未放弃草稿：${error?.message || error}` }); }
+                  }}>放弃草稿</button>
+                  <button style={hdrBtnStyle} onClick={() => void compareDocument()} disabled={saving}>比较 / 合并</button>
+                  <button style={hdrBtnStyle} onClick={() => void saveAllEdits()} disabled={batchSaving || saving}
+                    title="只保存当前执行端或本机副本中已打开的脏文档；逐文件报告结果（Ctrl+Shift+S）">{batchSaving ? '逐文件保存中…' : '保存此来源全部'}</button>
+                  </WorkbenchOverflow>
                   <button style={{ ...hdrBtnStyle, ...(dirty && !saving ? { borderColor: 'var(--theme-accent)', color: 'var(--theme-accent)', background: 'var(--theme-accent-bg)' } : { opacity: 0.5 }) }}
-                    onClick={saveEdit} disabled={!dirty || saving}>{saving ? '保存中…' : '💾 保存'}</button>
-                  <button style={hdrBtnStyle} onClick={() => {
-                    if (!dirty || window.confirm('放弃未保存的修改？')) { setEditing(false); setDirty(false); }
-                  }}>取消</button>
+                    onClick={saveEdit} disabled={saving || (!dirty && !needsSaveCheck) || !activeDocument?.read?.canSave}>{saving ? '保存中…' : needsSaveCheck ? '核对保存' : documentHost ? '保存' : '💾 保存'}</button>
+                  {!documentHost && <button style={hdrBtnStyle} onClick={() => {
+                    setEditing(false);
+                  }}>预览（保留草稿）</button>}
                 </>
               )}
-              <button style={hdrBtnStyle} onClick={() => setPreviewMaximized((value) => !value)} title={previewMaximized ? '退出最大化（Esc）' : '最大化预览'}>
+              {!documentHost && <button style={hdrBtnStyle} onClick={() => setPreviewMaximized((value) => !value)} title={previewMaximized ? '退出最大化（Esc）' : '最大化预览'}>
                 {previewMaximized ? '🗗 还原' : '⛶ 最大化'}
-              </button>
-              <button style={hdrBtnStyle} onClick={closePreview} title="关闭预览" aria-label="关闭预览">✕</button>
+              </button>}
+              {!documentHost && <button style={hdrBtnStyle} onClick={closePreview} title="关闭预览" aria-label="关闭预览">✕</button>}
             </div>
-            <div style={pvBody}>
+            <div style={{ ...pvBody, ...(documentHost ? { display: 'flex', flexDirection: 'column' as const } : {}) }}>
+              {isRemote && preview.source === 'remote' && <div role="status" style={{ padding: '6px 10px', fontSize: 11, color: 'var(--theme-text-muted)', borderBottom: '1px solid var(--theme-border)' }}>
+                远端文件 · 只读。下载到本机副本后编辑，保存不会自动上传。
+                {activeDocument?.dirty && <button style={hdrBtnStyle} onClick={() => void exportGeneratedText(editText, `${preview.name}.draft.txt`, 'text/plain;charset=utf-8').catch(error => setMsg({ kind: 'err', text: `导出失败：${error}` }))}>导出历史远端草稿</button>}
+              </div>}
+              {languageEditor.panel}
+              {documentHost && editOpening && <div role="status" style={{ padding: 8, fontSize: 12 }}>正在核对完整内容与编辑能力…</div>}
+              {documentHost && editNotice && <div role="status" style={{ padding: 8, fontSize: 12, color: '#fbbf24' }}>{editNotice}</div>}
+              {(editing || documentHost) && activeDocument && draftChoices?.key === activeDocument.key && draftChoices.rows.length > 0 && (
+                <div role="status" style={{ padding: 12, fontSize: 12 }}>发现保留的窗口草稿，请选择恢复（不会保存文件）：
+                  {draftChoices.rows.map(row => <button key={row.id} style={hdrBtnStyle} onClick={async () => {
+                    try { await documentDrafts.restore(activeDocument.key, row, () => mountedRef.current
+                      && previewScopeRef.current === previewScope && getCurrentUserProfile().userId === documentOwner); setDraftChoices(null); }
+                    catch (error: any) { setMsg({ kind: 'err', text: `无法恢复：${error?.message || error}` }); }
+                  }}>{new Date(row.updatedAt).toLocaleString()} · {row.branch.slice(0, 8)}</button>)}
+                </div>
+              )}
+              {(editing || documentHost) && batchResults?.scope === previewScope && (
+                <details open style={{ padding: '6px 12px', fontSize: 12 }}><summary>逐文件保存结果（非整体事务）</summary>
+                  {batchResults.rows.map(row => <div key={row.name}>{row.name}：{row.status}</div>)}
+                </details>
+              )}
+              {(editing || documentHost) && activeDocument && comparison?.key === activeDocument.key && activeDocument.disk && (
+                <section aria-label="基线磁盘草稿比较" style={{ padding: 12, borderBottom: '1px solid var(--theme-border)' }}>
+                  <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, minmax(0, 1fr))', gap: 8 }}>
+                    {[['原基线', activeDocument.baseText], ['磁盘版本', activeDocument.disk.text], ['当前草稿', activeDocument.text]].map(([label, value]) => (
+                      <label key={label} style={{ minWidth: 0, fontSize: 12 }}>{label}<textarea aria-label={label} readOnly value={value} rows={6}
+                        style={{ width: '100%', boxSizing: 'border-box', resize: 'vertical' }} /></label>
+                    ))}
+                  </div>
+                  <label style={{ display: 'block', fontSize: 12 }}>合并结果（仅修改草稿，不自动保存）
+                    <textarea aria-label="合并结果（仅修改草稿，不自动保存）" value={comparison.text} rows={6} onChange={event => setComparison({ ...comparison, text: event.target.value })}
+                      style={{ width: '100%', boxSizing: 'border-box', resize: 'vertical' }} />
+                  </label>
+                  <button style={hdrBtnStyle} disabled={saving || needsSaveCheck || !activeDocument.disk.editable} onClick={() => {
+                    try { documentStore.merge(activeDocument.key, comparison.diskVersion, comparison.revision, comparison.text); setComparison(null); }
+                    catch (error: any) { setMsg({ kind: 'err', text: `合并未应用：${error?.message || error}，请重新比较。` }); }
+                  }}>采用合并并更新基线</button>
+                  <button style={hdrBtnStyle} onClick={() => setComparison(null)}>取消合并</button>
+                </section>
+              )}
+              {(editing || documentHost) && activeDocument && (
+                <div role="status" style={{ padding: '5px 10px', fontSize: 11, flexShrink: 0, order: documentHost ? 1 : undefined,
+                  color: activeDocument.error || !activeDocument.read?.editable ? 'var(--theme-error)' : 'var(--theme-text-muted)',
+                  borderTop: documentHost ? '1px solid var(--theme-border)' : undefined, borderBottom: documentHost ? undefined : '1px solid var(--theme-border)' }}>
+                  {activeDocument.identity.source === 'local-copy' ? '本机副本 · 保存不上传' : '执行端文件'}
+                  {' · '}{activeDocument.read?.encoding || '未知编码'}{' · '}{activeDocument.read?.eol || '未知换行'}
+                  {!activeDocument.read?.editable && ` · ${activeDocument.read?.reasonCode === 'remote_readonly' ? '远端只读，请下载到本机编辑' : `只读：${activeDocument.read?.reasonCode || '完整性未确认'}`}`}
+                  {activeDocument.identity.source === 'local-copy' && activeDocument.read?.eol === 'mixed' && ' · 混合换行，按行保留（新增行沿用邻近格式）'}
+                  {activeDocument.error && ` · ${activeDocument.error}（草稿已保留）`}
+                  {needsSaveCheck && ' · 结果未知，请核对保存；不会自动重试写入'}
+                  {!dirty && activeDocument.persistence === 'failed' && ` · 草稿存储/恢复不可用：${activeDocument.persistenceError || '未知原因'}`}
+                  {dirty && ` · ${activeDocument.persistence === 'saved' ? '草稿已存本设备（未加密）'
+                    : activeDocument.persistence === 'pending' ? '草稿持久化中，退出前请等待'
+                    : activeDocument.persistence === 'restored' ? '已恢复草稿，未保存文件'
+                    : '草稿持久化不可用，请保存或导出；刷新可能丢失'}`}
+                </div>
+              )}
               {preview.loading ? (
                 <div style={{ padding: 24, textAlign: 'center', color: 'var(--theme-text-muted)' }}>{preview.loadingText || '加载中…'}</div>
               ) : preview.error ? (
                 <div style={{ padding: 24, color: '#f87171', fontSize: 13 }}>⚠ {preview.error}</div>
+              ) : documentHost && !preview.isImage && !preview.structured && !preview.renderer ? (
+                activeDocument?.read?.reasonCode === 'binary' ? <p style={{ padding: 16 }}>二进制文件只读；不提供通用文本编辑或保存。</p> :
+                <div style={{ display: 'flex', flex: 1, minHeight: 0, minWidth: 0 }}>
+                  <div hidden={documentView === 'preview'} aria-label="文档源码" style={{ display: documentView === 'preview' ? 'none' : 'flex', flex: 1, minWidth: 0, minHeight: 0 }}>{editorElement}</div>
+                  {!!engineRichPreview && <div hidden={documentView === 'source'} aria-label="文档预览" style={{ display: documentView === 'source' ? 'none' : 'flex', flexDirection: 'column', flex: 1, minWidth: 0, minHeight: 0, overflow: 'auto', borderLeft: documentView === 'split' ? '1px solid var(--theme-border)' : undefined }}>{engineRichPreview}</div>}
+                </div>
               ) : editing ? (
                 <Suspense fallback={<div style={{ padding: 24, textAlign: 'center', color: 'var(--theme-text-muted)' }}>编辑器加载中…</div>}>
-                  <CodeEditor key={preview.rel} value={editText} ext={extOf(preview.name)} dark={isDarkTheme()}
-                    onChange={(v) => { setEditText(v); setDirty(true); }} onSave={saveEdit} />
+                  <CodeEditor key={activeDocument?.lifecycleId} documentKey={activeDocument?.key} value={editText}
+                    language={languageEditor.binding}
+                    ext={extOf(preview.name)} dark={isDarkTheme()} readOnly={!activeDocument?.read?.editable}
+                    editorState={activeDocument?.editor as EditorDocumentState | undefined}
+                    onEditorState={state => { if (activeDocument) documentStore.editorState(activeDocument.key, state, activeDocument.lifecycleId); }}
+                    onChange={value => { if (activeDocument) documentStore.edit(activeDocument.key, value); }} onSave={saveEdit} onSaveAll={saveAllEdits} />
                 </Suspense>
               ) : preview.isImage ? (
                 <div style={{ padding: 12, textAlign: 'center', overflow: 'auto' }}>
@@ -3121,7 +3521,7 @@ export const FileTreePanel: React.FC<Props> = React.memo(({ sessionId, workingDi
             </div>
             </div>
           </div>
-        </AppModalPortal>
+        </DocumentSurface>
       )}
 
       {review && (
@@ -3180,6 +3580,7 @@ export const FileTreePanel: React.FC<Props> = React.memo(({ sessionId, workingDi
         </AppModalPortal>
       )}
     </div>
+    </WorkbenchInteractionContext.Provider>
   );
 });
 

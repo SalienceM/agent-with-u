@@ -9,6 +9,8 @@ import { LoopPolicyEditor, normalizePolicy } from './LoopPolicyEditor';
 import type { LoopPolicy } from './LoopPolicyEditor';
 import { LoopProgressNotice, LoopDeliveryDetail, type DeliveryReport, type ProgressGuard } from './LoopDeliveryStatus';
 import { LoopDecisionNotice, LoopSourceCard } from './LoopContinuationStatus';
+import { LoopTaskBlockerDetail } from './LoopTaskBlockerDetail';
+import { mergeBlockerDetails, type TaskBlockerDetails } from '../utils/loopTaskBlockers';
 import { LoopEnvironmentCard, EnvironmentEvidence } from './LoopExecutionEnvironment';
 import type { EnvironmentCheck, ExecutionEnvironment } from '../types/loopEnvironment';
 import type { LoopDecision, LoopSourceSummary } from '../types/loopContinuation';
@@ -40,12 +42,12 @@ interface LoopStep {
   startedAt?: number; endedAt?: number; attempts?: number; recoveryNotes?: string[];
 }
 interface LoopAnalysis {
-  score: number; notes: string; trend: string;
+  score: number; scoreObserved?: boolean; notes: string; trend: string;
   optimizationPotential: number; challenges: string;
   verified: string; gaps: string; nextFocus: string;
   deliverable: boolean; outputtable: boolean;
 }
-interface LoopRecord {
+interface LoopRecord extends TaskBlockerDetails {
   environmentChecks?: EnvironmentCheck[];
   outcomeVersion?: number; terminalKind?: string; decision?: LoopDecision; callResults?: Record<string, string>; taskResult?: string;
   sourceSummary?: unknown; deliverySummary?: unknown;
@@ -149,6 +151,7 @@ function mergeLoopRecordDetail(summary: LoopRecord, detail?: LoopRecord): LoopRe
     )),
     callDiagnostics: mergeCallDiagnostics(detail.callDiagnostics, summary.callDiagnostics),
     environmentChecks: loopRecordRevision(summary) === loopRecordRevision(detail) ? detail.environmentChecks : summary.environmentChecks,
+    ...mergeBlockerDetails(summary, detail),
     detailLoaded: true,
   };
 }
@@ -504,6 +507,7 @@ export const LoopPanel: React.FC<LoopPanelProps> = ({
               <LoopSourceCard key={`${execKey}:${sessionId}`} sessionId={sessionId} execKey={execKey}
                 source={stateForView.taskSource} readOnly={!!inspectOnly || control.busy || stateForView.controlMode === 'manual' || stateForView.running || stateForView.resumable} />
               <LoopDecisionNotice decision={stateForView.loops[stateForView.loops.length - 1]?.decision}
+                blockerSummary={stateForView.loops[stateForView.loops.length - 1]?.blockerSummary}
                 callResults={stateForView.loops[stateForView.loops.length - 1]?.outcomeVersion ? stateForView.loops[stateForView.loops.length - 1]?.callResults : undefined}
                 taskResult={stateForView.loops[stateForView.loops.length - 1]?.outcomeVersion ? stateForView.loops[stateForView.loops.length - 1]?.taskResult : undefined} />
               {stateForView.stage === 'loopidea' ? (
@@ -1521,7 +1525,7 @@ const FlowLane: React.FC<{
     return end ? end - st : 0;
   };
 
-  const score = loop.analysis?.score ?? null;
+  const score = loop.analysis?.scoreObserved === false || loop.blockerSummary?.status ? null : loop.analysis?.score ?? null;
   if (loop.kind === 'manual') {
     const duration = (loop.subStarted?.execute && loop.updatedAt)
       ? fmtDur(loop.updatedAt - loop.subStarted.execute) : '';
@@ -1637,7 +1641,7 @@ const FlowChip: React.FC<{
 };
 
 const LoopNode: React.FC<{ loop: LoopRecord; selected: boolean; onClick: () => void; onStage: (target: DetailTarget) => void }> = ({ loop, selected, onClick, onStage }) => {
-  const score = loop.analysis?.score ?? null;
+  const score = loop.analysis?.scoreObserved === false || loop.blockerSummary?.status ? null : loop.analysis?.score ?? null;
   const subIdx = SUB_ORDER.indexOf(loop.subStage);
   const manual = loop.kind === 'manual';
   return (
@@ -1980,7 +1984,7 @@ const LoopDetail: React.FC<{
 
       {show('analysis') && <StageAudit stage="analysis" detail={loop.stageDetails?.analysis} />}
       {show('analysis') && (loop.analysis ? (
-        <Section title={`累计目标诊断 · 整体分数 ${loop.analysis.score.toFixed(0)}`}
+        <Section title={loop.blockerSummary?.status ? '任务级只读复核 · 未执行验收测试' : `累计目标诊断 · 整体分数 ${loop.analysis.score.toFixed(0)}`}
           extra={<BackendTag role="analysis" label={loop.backendLabels?.analysis} />}>
           <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginBottom: 8 }}>
             {loop.analysis.deliverable && <Badge text="可交付" color="#2da44e" />}
@@ -2013,7 +2017,8 @@ const LoopDetail: React.FC<{
       ) : liveAna ? <Section title="累计目标诊断（进行中）"
           extra={<BackendTag role="analysis" label={loop.backendLabels?.analysis} />}><Live text={liveAna} /></Section> : null)}
 
-      <LoopDecisionNotice decision={loop.decision} callResults={loop.callResults} taskResult={loop.taskResult} steps={loop.outcomeVersion ? loop.orchestration : undefined} />
+      <LoopDecisionNotice decision={loop.decision} blockerSummary={loop.blockerSummary} callResults={loop.callResults} taskResult={loop.taskResult} steps={loop.outcomeVersion ? loop.orchestration : undefined} />
+      <LoopTaskBlockerDetail record={loop} />
       <details data-testid="loop-environment-history"><summary>本轮执行环境证据 · {loop.environmentChecks?.length || 0}</summary>
         {loop.environmentChecks?.length ? loop.environmentChecks.map(check => <EnvironmentEvidence key={check.id} check={check} />) : <EnvironmentEvidence />}
       </details>

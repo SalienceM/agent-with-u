@@ -1,6 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { api } from '../api';
 import type { LoopDecision, LoopSourceResponse, LoopSourceSummary } from '../types/loopContinuation';
+import { blockerLabel, type BlockerReview } from '../utils/loopTaskBlockers';
 
 const box: React.CSSProperties = { border: '1px solid var(--theme-border)', borderRadius: 8, padding: 10,
   marginBottom: 10, fontSize: 12, lineHeight: 1.6, overflowWrap: 'anywhere', minWidth: 0,
@@ -12,7 +13,8 @@ const calls: Record<string, string> = { normal: '正常结束', error: '真实�
 const acceptance: Record<string, string> = { partial: '部分成果', implemented: '已实现待验', verified: '已验证', blocked: '受阻', unknown: '尚未核实' };
 
 export const LoopDecisionNotice: React.FC<{ decision?: LoopDecision; callResults?: Record<string, string>; taskResult?: string;
-  steps?: Array<{ index: number; callResult?: string; taskResult?: string }> }> = ({ decision, callResults, steps, taskResult }) => {
+  blockerSummary?: BlockerReview;
+  steps?: Array<{ index: number; callResult?: string; taskResult?: string }> }> = ({ decision, callResults, steps, taskResult, blockerSummary }) => {
   if (!decision?.action && !callResults && !steps?.some(s => s.callResult)) return null;
   return <section style={box} aria-label="调用、验收与调度决定" data-testid="loop-decision">
     {decision?.action && <><strong>调度：{decision.completionScope === 'automatic' ? '自动范围完成，待人工核验' : actions[decision.action] || '待核对'}</strong>
@@ -22,6 +24,7 @@ export const LoopDecisionNotice: React.FC<{ decision?: LoopDecision; callResults
       {!!decision.affectedIds?.length && <div>影响任务：{decision.affectedIds.join('、')}</div>}</>}
     {Object.entries(callResults || {}).map(([stage, outcome]) => <div key={stage}>{stage} 调用：{calls[outcome] || '未知'}</div>)}
     {taskResult && <div>累计任务验收：{acceptance[taskResult] || '尚未核实'}</div>}
+    {blockerLabel(blockerSummary) && <div>{blockerLabel(blockerSummary)}</div>}
     {steps?.map(step => <div key={step.index}>步骤 {step.index} · 调用：{calls[step.callResult || 'unknown'] || '未知'} · 任务验收：{acceptance[step.taskResult || 'unknown'] || '尚未核实'}</div>)}
     <div style={{ color: 'var(--theme-text-muted)' }}>调用结束、提交或测试通过，不等于整体目标完成。</div>
   </section>;

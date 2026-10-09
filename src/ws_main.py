@@ -240,6 +240,10 @@ def _ensure_single_instance(port: int) -> None:
     import atexit
     import time
 
+    from .package_readiness import probe_root
+    if probe_root() is not None:
+        return  # 验证实例从不读取旧 PID 或终止其他实例；端口占用直接绑定失败。
+
     pid_file = _get_pid_file(port)
 
     if pid_file.exists():
@@ -425,6 +429,10 @@ def build_auth_config(args: argparse.Namespace) -> AuthConfig:
 
 def _portable_runtime_dir() -> Path:
     """Directory beside the portable executable; audit JSON lives here."""
+    from .package_readiness import probe_root
+    isolated = probe_root()
+    if isolated is not None:
+        return isolated / "data"
     if getattr(sys, "frozen", False):
         return Path(sys.executable).resolve().parent
     return Path.cwd().resolve()

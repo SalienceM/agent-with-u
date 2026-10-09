@@ -1,0 +1,8 @@
+{
+  "$schema": "https://schema.tauri.app/config/2/capability.json",
+  "identifier": "session-workbench",
+  "description": "Session view windows: no shell spawning, global shortcuts, window creation or application exit permission",
+  "platforms": ["windows", "linux", "macOS"],
+  "windows": ["session-*"],
+  "permissions": ["core:default", "core:webview:allow-set-webview-zoom", "core:window:allow-show", "core:window:allow-unminimize", "core:window:allow-set-focus", "dialog:allow-open", "dialog:allow-save"]
+}

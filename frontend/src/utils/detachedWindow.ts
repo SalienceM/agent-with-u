@@ -1,7 +1,7 @@
 /** 同源工具窗口：浏览器在点击栈内打开；桌面必须等创建回执，失败不关闭原面板。 */
 export interface DetachedWindowOptions {
   label: string; title: string; url: string; width: number; height: number;
-  minWidth?: number; minHeight?: number; alwaysOnTop?: boolean;
+  minWidth?: number; minHeight?: number; alwaysOnTop?: boolean; dragDropEnabled?: boolean;
 }
 const browserWindows = new Map<string, Window>();
 const opening = new Map<string, Promise<void>>();

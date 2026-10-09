@@ -39,8 +39,12 @@ if exist "src-tauri\binaries\agent-with-u-backend-%TARGET_TRIPLE%.exe" (
 ) else if exist "dist\agent-with-u-backend.exe" (
     copy /y "dist\agent-with-u-backend.exe" "%STAGING%\agent-with-u-backend.exe"
 ) else (
-    echo [WARN] Backend sidecar not found!
+    echo [ERROR] Backend sidecar not found!
+    exit /b 1
 )
+if errorlevel 1 exit /b 1
+python scripts\check_backend_package.py "%STAGING%\agent-with-u-backend.exe" --report dist\backend-lite.readiness.json
+if errorlevel 1 ( echo [FAILED] Staged backend readiness failed & exit /b 1 )
 copy /y "src-tauri\target\release\WebView2Loader.dll" "%STAGING%\" >nul 2>nul
 
 :: NSIS（不传 FAT_MODE）— 按优先级查找：PATH → Tauri 缓存 → 常见安装路径
@@ -59,6 +63,8 @@ echo [OK] Found NSIS: !MAKENSIS!
 
 if not exist "dist" mkdir "dist"
 
+python scripts\check_backend_package.py "%STAGING%\agent-with-u-backend.exe" --report dist\backend-lite.readiness.json --confirm
+if errorlevel 1 exit /b 1
 "%MAKENSIS%" /V3 ^
     /DVERSION=!VERSION! ^
     /DTAURI_BUNDLE_DIR=_staging ^

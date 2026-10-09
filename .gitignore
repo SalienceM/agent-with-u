@@ -11,6 +11,8 @@ agent-with-u-web-auth.json
 *.egg-info/
 .env
 node_modules/
+tools/engine-providers/.python/
+tools/engine-native-documents/target/
 frontend/.home-test-dist/
 frontend/dist/
 .qa/

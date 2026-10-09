@@ -15,8 +15,14 @@
  */
 import { api, isTauri } from '../api';
 import { sha256BlobHex } from './sha256';
+import { uuid } from './uuid';
 import { yieldToUi } from './cooperativeWork';
 import { isIgnored } from './dirSyncPolicy';
+import type { LocalDocumentAdapter } from './localDocuments';
+import { BrowserDocumentAdapter } from './browserLocalDocuments';
+import { TauriDocumentAdapter } from './tauriLocalDocuments';
+import { ManagedDocumentAdapter, type ManagedDocumentRecord } from './managedLocalDocuments';
+import { DocumentProtocolError, documentRelativePath } from './workspaceDocuments';
 export { isGitMetadataPath, isIgnored } from './dirSyncPolicy';
 
 export interface FileMeta {
@@ -102,6 +108,8 @@ export interface LocalFs {
   label(): string;
   /** 跨会话稳定的标识，用于给基线做 key */
   id(): string;
+  /** 独立于传输接口的有版本编辑路径；不允许回落 writeFile。 */
+  documentAdapter?(): Promise<LocalDocumentAdapter>;
   scan(ignore: string[], includeGit?: boolean, options?: { hash?: boolean; signal?: AbortSignal }): Promise<Manifest>;
   /** 列出某相对目录的直接子项(懒加载逐层浏览用,不递归、不算哈希)。 */
   listDir(rel: string): Promise<LocalEntry[]>;
@@ -161,6 +169,7 @@ export class TauriLocalFs implements LocalFs {
   id(): string {
     return `tauri:${this.dir}`;
   }
+  documentAdapter(): Promise<LocalDocumentAdapter> { return TauriDocumentAdapter.connect(this.dir, tauriInvoke); }
   async scan(ignore: string[], includeGit = false, options: { hash?: boolean; signal?: AbortSignal } = {}): Promise<Manifest> {
     const r = await tauriInvoke<{ files: Manifest }>('dir_sync_scan', {
       dir: this.dir,
@@ -221,6 +230,7 @@ export class BrowserLocalFs implements LocalFs {
   id(): string {
     return `browser:${this.handle?.name || ''}`;
   }
+  documentAdapter(): Promise<LocalDocumentAdapter> { return BrowserDocumentAdapter.connect(this.handle); }
   async scan(ignore: string[], includeGit = false, options: { hash?: boolean; signal?: AbortSignal } = {}): Promise<Manifest> {
     const out: Manifest = {};
     await this._walk(this.handle, '', ignore, includeGit, out, options);
@@ -465,6 +475,7 @@ interface ManagedFileRecord {
   size: number;
   hash?: string;
   updatedAt: number;
+  documentRevision?: string;
 }
 
 interface ManagedChunkRecord {
@@ -507,6 +518,47 @@ export class ManagedBrowserLocalFs implements LocalFs {
     return `managed:${this.workspace}`;
   }
 
+  async documentAdapter(): Promise<LocalDocumentAdapter> {
+    return new ManagedDocumentAdapter(this.id(), {
+      read: rel => this.documentTransaction(rel),
+      replace: async (rel, revision, value, assertCurrent) => {
+        await this.documentTransaction(rel, { revision, value, assertCurrent });
+      },
+    });
+  }
+
+  private async documentTransaction(rel: string,
+    replace?: { revision: string; value: ManagedDocumentRecord; assertCurrent: () => void }): Promise<ManagedDocumentRecord> {
+    rel = documentRelativePath(rel);
+    const db = await idbOpen();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(IDB_FILE_STORE, 'readwrite');
+      const store = tx.objectStore(IDB_FILE_STORE);
+      const request = store.get(managedKey(this.workspace, rel));
+      let result: ManagedDocumentRecord, failure: unknown;
+      request.onsuccess = () => {
+        try {
+          const record = request.result as ManagedFileRecord | undefined;
+          if (!record || record.workspace !== this.workspace || record.rel !== rel) throw new DocumentProtocolError('disk_conflict');
+          if (replace) {
+            if (record.documentRevision !== replace.revision) throw new DocumentProtocolError('disk_conflict');
+            replace.assertCurrent();
+            const saved = { ...record, ...replace.value, size: replace.value.data.size, hash: undefined };
+            store.put(saved); result = saved;
+          } else {
+            const documentRevision = record.documentRevision || uuid();
+            if (!record.documentRevision) store.put({ ...record, documentRevision });
+            result = { ...record, documentRevision };
+          }
+        } catch (error) { failure = error; tx.abort(); }
+      };
+      tx.oncomplete = () => { db.close(); resolve(result); };
+      // abort 是 IDB 的确定回滚，不是提交未知；成功只依据 oncomplete。
+      tx.onabort = () => { db.close(); reject(failure || new DocumentProtocolError('write_aborted')); };
+      tx.onerror = () => { /* 默认错误中止事务，由 onabort 给出确定结果。 */ };
+    });
+  }
+
   private async files(): Promise<ManagedFileRecord[]> {
     return idbIndexAll(IDB_FILE_STORE, 'workspace', this.workspace);
   }
@@ -545,7 +597,7 @@ export class ManagedBrowserLocalFs implements LocalFs {
           size: record.size,
           mtime: record.updatedAt,
         };
-        if (hash && !record.hash) await idbStorePut(IDB_FILE_STORE, { ...record, hash });
+        // 异步哈希期间可能有编辑/下载提交，不能将扫描快照写回覆盖新记录。
       }));
     }
     return out;
@@ -573,7 +625,7 @@ export class ManagedBrowserLocalFs implements LocalFs {
   async writeBlob(rel: string, data: Blob): Promise<void> {
     await idbStorePut(IDB_FILE_STORE, {
       key: managedKey(this.workspace, rel), workspace: this.workspace, rel,
-      data, size: data.size, hash: undefined, updatedAt: Date.now(),
+      data, size: data.size, hash: undefined, updatedAt: Date.now(), documentRevision: uuid(),
     } satisfies ManagedFileRecord);
   }
 
@@ -621,7 +673,7 @@ export class ManagedBrowserLocalFs implements LocalFs {
     // 正式记录最后写入：此前任何失败都不会覆盖旧副本。
     await idbStorePut(IDB_FILE_STORE, {
       key: managedKey(this.workspace, rel), workspace: this.workspace, rel,
-      data, size: data.size, hash: undefined, updatedAt: Date.now(),
+      data, size: data.size, hash: undefined, updatedAt: Date.now(), documentRevision: uuid(),
     } satisfies ManagedFileRecord);
     this.activeWrites.delete(transferId);
     await idbStoreDeleteMany(IDB_CHUNK_STORE, chunks.map((chunk) => chunk.key));

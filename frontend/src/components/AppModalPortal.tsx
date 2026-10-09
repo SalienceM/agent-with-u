@@ -7,6 +7,7 @@ interface Props {
 
 // 保活的 Session Tab 不会卸载子组件；Portal 也必须跟随所属视图隐藏。
 export const AppModalVisibilityContext = React.createContext(true);
+export const WorkbenchInteractionContext = React.createContext(false);
 
 /**
  * 把应用级浮层移出侧栏/分栏的 transform + overflow 裁剪上下文。
@@ -14,7 +15,8 @@ export const AppModalVisibilityContext = React.createContext(true);
  */
 export const AppModalPortal: React.FC<Props> = ({ children }) => {
   const visible = React.useContext(AppModalVisibilityContext);
+  const frozen = React.useContext(WorkbenchInteractionContext);
   if (typeof document === 'undefined') return null;
   const target = document.querySelector<HTMLElement>('.app-root') || document.body;
-  return createPortal(<div hidden={!visible} style={{ display: visible ? 'contents' : 'none' }}>{children}</div>, target);
+  return createPortal(<div hidden={!visible} {...(frozen ? { inert: '' } as any : {})} style={{ display: visible ? 'contents' : 'none' }}>{children}</div>, target);
 };

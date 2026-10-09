@@ -10,6 +10,8 @@ use tauri_plugin_notification::NotificationExt;
 use tauri_plugin_shell::process::CommandChild;
 
 mod hacker_mode;
+mod local_documents;
+mod session_windows;
 
 const WS_PORT: u16 = 44321;
 static APP_EXITING: AtomicBool = AtomicBool::new(false);
@@ -1571,6 +1573,7 @@ fn dir_sync_delete_file(dir: String, rel: String) -> Result<(), String> {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .manage(session_windows::WindowExitStates::default())
         // Register this first: launching the desktop shortcut while the main
         // window is hidden in the tray must reveal the existing process, not
         // start a second frontend/backend pair.
@@ -1614,7 +1617,12 @@ pub fn run() {
                         }
                     }
                     "quit" => {
-                        quit_app_completely(app);
+                        use tauri_plugin_dialog::{DialogExt, MessageDialogButtons};
+                        let owned = app.clone();
+                        app.dialog().message(session_windows::exit_message(app)).title("彻底退出 AgentWithU")
+                            .buttons(MessageDialogButtons::OkCancel).show(move |confirmed| {
+                                if confirmed { quit_app_completely(&owned); }
+                            });
                     }
                     _ => {}
                 })
@@ -1748,6 +1756,8 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             get_ws_port,
+            session_windows::close_session_window,
+            session_windows::report_workbench_exit_state,
             get_local_device_id,
             get_local_identity_token,
             get_desktop_logs,
@@ -1767,6 +1777,9 @@ pub fn run() {
             install_staged_update,
             dir_sync_scan,
             dir_sync_read_file,
+            local_documents::local_document_bind,
+            local_documents::local_document_read,
+            local_documents::local_document_replace,
             dir_sync_file_size,
             dir_sync_read_chunk,
             kit_client_file_info,

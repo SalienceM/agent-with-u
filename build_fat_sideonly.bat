@@ -33,6 +33,8 @@ for %%F in ("!TAURI_EXE!") do echo [OK] Tauri exe exists (%%~tF, %%~zF bytes)
 :: ============================================================
 echo.
 echo [STEP 1] Rebuilding Python sidecar ...
+python scripts\prepare_backend_build.py
+if errorlevel 1 ( echo [FAILED] Backend dependencies failed & exit /b 1 )
 
 :: 检查 PyInstaller
 python -m PyInstaller --version >nul 2>&1
@@ -51,16 +53,7 @@ rmdir /s /q "build" 2>nul
 rmdir /s /q "dist" 2>nul
 
 echo [BUILD] Running PyInstaller ...
-python -m PyInstaller --name "agent-with-u-backend" --onefile --console ^
-    --hidden-import websockets ^
-    --hidden-import PIL ^
-    --hidden-import claude_agent_sdk ^
-    --hidden-import certifi --collect-data certifi ^
-    --collect-all pydantic_core ^
-    --hidden-import pydantic --hidden-import mcp ^
-    --hidden-import dashscope --collect-all dashscope ^
-    --collect-all edge_tts ^
-    --noconfirm ws_main_entry.py
+python scripts\build_backend_package.py
 if errorlevel 1 (
     echo [FAILED] PyInstaller build failed
     pause & exit /b 1
@@ -71,12 +64,15 @@ if not exist "dist\agent-with-u-backend.exe" (
     pause & exit /b 1
 )
 for %%F in ("dist\agent-with-u-backend.exe") do echo [OK] Sidecar built: %%~zF bytes
+python scripts\check_backend_package.py dist\agent-with-u-backend.exe
+if errorlevel 1 ( echo [FAILED] Backend readiness failed & exit /b 1 )
 
 :: 同步到 src-tauri\binaries（供后续 Tauri 构建使用）
 for /f "tokens=2" %%T in ('rustc -Vv ^| findstr /i "host"') do set TARGET_TRIPLE=%%T
 if "%TARGET_TRIPLE%"=="" set TARGET_TRIPLE=x86_64-pc-windows-msvc
 if not exist "src-tauri\binaries" mkdir "src-tauri\binaries"
 copy /y "dist\agent-with-u-backend.exe" "src-tauri\binaries\agent-with-u-backend-%TARGET_TRIPLE%.exe" >nul
+if errorlevel 1 exit /b 1
 echo [OK] Sidecar synced to src-tauri\binaries\
 
 :: ============================================================
@@ -231,6 +227,8 @@ if errorlevel 1 (
 :: WebView2Loader
 copy /y "src-tauri\target\release\WebView2Loader.dll" "%STAGING%\" >nul 2>nul
 echo [OK] Artifacts staged
+python scripts\check_backend_package.py "%STAGING%\agent-with-u-backend.exe" --report dist\backend-sideonly.readiness.json
+if errorlevel 1 ( echo [FAILED] Staged backend readiness failed & exit /b 1 )
 
 :: ============================================================
 ::  Step 4: 验证 claude-env
@@ -283,6 +281,8 @@ if not exist "dist" mkdir "dist"
 set "NSIS_LOG=dist\nsis-build.log"
 echo [INFO] NSIS log: !NSIS_LOG!
 
+python scripts\check_backend_package.py "%STAGING%\agent-with-u-backend.exe" --report dist\backend-sideonly.readiness.json --confirm
+if errorlevel 1 exit /b 1
 "!MAKENSIS!" /V4 ^
     /DVERSION=!VERSION! ^
     /DTAURI_BUNDLE_DIR=_staging ^

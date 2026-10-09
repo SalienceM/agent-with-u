@@ -12,6 +12,8 @@ export interface FileFocusRequest {
   sessionId: string;
   workingDir: string;
   relativePath: string;
+  line?: number;
+  column?: number;
 }
 
 interface ParsedFileHref {

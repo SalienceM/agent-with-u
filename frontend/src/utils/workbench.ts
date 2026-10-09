@@ -58,6 +58,13 @@ type WorkbenchIdentity = { mode: 'local' | 'relay'; userId: string };
 export const workbenchStorageKey = (identity: WorkbenchIdentity): string =>
   `agent-with-u:workbench:v1:${identity.mode}:${encodeURIComponent(identity.userId || 'legacy')}`;
 
+export function scopedWorkbenchStorageKey(identity: WorkbenchIdentity): string {
+  let id = '';
+  try { id = new URLSearchParams(window.location?.search || '').get('workbenchWindow')
+    || window.sessionStorage.getItem(`awu-window-id-v1:${identity.userId}`) || ''; } catch { /* 旧布局迁移 */ }
+  return /^[\w-]{1,128}$/.test(id) ? `${workbenchStorageKey(identity)}:window:${id}` : workbenchStorageKey(identity);
+}
+
 /** 只持久化导航 ID；不包含消息、附件、凭据或 Kit 本次授权。 */
 export function normalizeWorkbenchSnapshot(value: any): WorkbenchSnapshot {
   const validId = (id: unknown): id is string => typeof id === 'string' && /^[\w-]+$/.test(id);
@@ -89,12 +96,16 @@ export function normalizeWorkbenchSnapshot(value: any): WorkbenchSnapshot {
 }
 
 export function loadWorkbenchSnapshot(identity: WorkbenchIdentity): WorkbenchSnapshot {
-  const key = workbenchStorageKey(identity);
+  const key = scopedWorkbenchStorageKey(identity);
   for (const kind of ['sessionStorage', 'localStorage'] as const) {
     try {
       const raw = window[kind].getItem(key);
       if (raw) return normalizeWorkbenchSnapshot(JSON.parse(raw));
     } catch { /* 损坏/禁用的存储不阻止打开应用 */ }
+  }
+  // 仅普通入口迁移旧主窗口导航，独立 Session 窗口不读取/覆盖该共享回退。
+  if (key !== workbenchStorageKey(identity) && !new URLSearchParams(window.location?.search || '').has('sessionWindow')) {
+    try { const raw = window.localStorage.getItem(workbenchStorageKey(identity)); if (raw) return normalizeWorkbenchSnapshot(JSON.parse(raw)); } catch { /* */ }
   }
   // 旧版分屏未隔离身份，仅允许本机用户首次迁移，不能泄漏给 Relay 用户。
   if (identity.mode === 'local' && identity.userId === 'local') {
@@ -109,7 +120,7 @@ export function loadWorkbenchSnapshot(identity: WorkbenchIdentity): WorkbenchSna
 }
 
 export function saveWorkbenchSnapshot(identity: WorkbenchIdentity, snapshot: WorkbenchSnapshot): void {
-  const key = workbenchStorageKey(identity);
+  const key = scopedWorkbenchStorageKey(identity);
   const raw = JSON.stringify(normalizeWorkbenchSnapshot(snapshot));
   // 本浏览器页优先；本地副本供关闭应用后恢复，多个窗口不覆盖彼此的刷新状态。
   for (const kind of ['sessionStorage', 'localStorage'] as const) {

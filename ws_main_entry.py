@@ -10,6 +10,13 @@ import sys
 import os
 from pathlib import Path
 
+from src.package_readiness import entry_check
+entry_check()
+
+if "--agentwithu-engine-host" in sys.argv:
+    from src.backend.engineering_host import run_worker
+    raise SystemExit(run_worker())
+
 # 快照 helper 在父进程取得进程树拥有权前只等 stdin；不能先重定向用户日志
 # 或启动另一个 WebSocket 服务。冻结 sidecar 和源码模式使用相同实现。
 if "--agentwithu-control-snapshot" in sys.argv:

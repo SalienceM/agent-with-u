@@ -386,7 +386,7 @@ stages at call boundaries. A lower score or automatic loopout never restores an 
 Git snapshot; rollback remains a separate explicit discard/recovery operation.
 
 Automated Codex iterations request native `read-only` for planning/read steps and
-`workspace-write` for write steps/analysis, separately from the removed Layer-2
+`workspace-write` for write steps/legacy analysis, separately from the removed Layer-2
 sandbox above. Unsupported sandbox requests fail rather than retry unrestricted.
 Actual isolation depends on the installed Codex/platform. Other Backends receive
 the same safety constraints but do not gain equivalent OS isolation. Tests that
@@ -398,6 +398,19 @@ planner must not infer global missing write permission from its own read-only tu
 or from one denied user-file read; real authorization/safety blockers still pause.
 Historical next-focus notes are not permanent priority locks when a newer explicit
 user disposition changes scheduling; unresolved losses and acceptance remain visible.
+
+**任务级阻塞恢复。** `loop_task_blockers.py` 冻结有界任务图并归约传递依赖；
+`loop_task_blocker_bridge.py` 在调用边界接收顶层 `taskBlockers`，停止本轮未启动步骤，
+复用 analysis 至多一次独立 `read-only` 复核，再由既有决定/去重调度器重规划独立任务。
+显式 `loopControl.pause`（含旧未分类暂停）、停止/控制权、原生环境、未确认退出、Auto/预算/风险
+始终优先；不得从“Access denied”正文猜测沙箱根因或解除授权门槛。未解决阻塞跨轮保留，
+旧身份/迟到失败只记历史；running/unknown 复核不自动重放。新任务协议的普通验收也只读，
+不在分析中绕过测试前置。阻塞复核无完成度评分，不当作一次独立收口验收。
+`loop_task_isolation.py` 只核对工作区内路径、文件修订和有限模型观察，不执行证据命令。
+隔离准备与应用测试分开调用，前置须绑定计划/Backend/访问策略/配置，未知则不启动测试。
+真实存档基线仅在用户/规则/规格明确要求时保留；不能默加、伪造或豁免。文件哈希和模型复核
+不等于 OS 隔离证明，不改 ACL、不换宿主/节点/通道重试拒绝资源。反馈复用紧凑摘要与懒加载详情。
+旧暂停必须显式恢复；相关回归只用 fake Backend/隔离文件，未验证外部 Godot 项目或生产 Session。
 
 **LOOP control handoff.** `loop_control_bridge.py` owns the shared eligibility,
 bounded receipts and session-local reservation for `loopControlGet/Request`.
@@ -763,8 +776,8 @@ The top workbench tab ledger (`frontend/src/utils/workbench.ts`) contains the pe
 `market` extension tabs. It must never eagerly open or hydrate the entire Session list.
 `paneSessions` still assigns visible split-grid slots; selecting a Session already visible
 in another slot focuses that slot instead of duplicating its renderer. Each open Session
-has one keyed, kept-mounted `ChatPane`; switching tabs or extension pages hides it without
-discarding the draft, transcript, pagination or scroll state. `ChatPane.isVisible` prevents
+has one keyed, kept-mounted `SessionWorkbench` with a stable `ChatPane`; switching tabs
+or extension pages hides it without discarding drafts, transcript, pagination or scroll state. `ChatPane.isVisible` prevents
 hidden streaming updates from resetting scroll offsets, and `isFocused` gates keyboard,
 screenshot and attention actions. Closing a Session tab only removes its view, never calls
 abort/delete RPCs; Session-owned `AppModalPortal` overlays inherit the same visibility
@@ -774,6 +787,25 @@ migration and authenticated-user changes remove/remap/reset tabs with the existi
 and ownership boundaries. Tab titles are live Session metadata, not tab identity. Running /
 completion indicators use the shared Session sets. Overflow scrolling is local to the tab
 bar; do not scroll the whole chat document when revealing the active tab.
+
+`SessionWorkbench` keeps Chat/Engine presentation separate from normal/LOOP execution.
+Engine has a 240px file tree, central embedded document surface and 360px conversation;
+under 900px it exposes region navigation. `FileTreePanel` portals its existing safe
+preview/editor into the central host; Chat retains its modal. The same ChatPane stays
+mounted across mode changes, including automated LOOP versus manual-chat routing.
+Mode saves use the exact user/executor/session/cwd and reject stale or missing receipts.
+Only known unsupported capability permits explicitly labelled, bounded local preferences.
+There is no fullscreen, command, control-transfer or process launch on entry. The terminal
+area is explicit-only: opening it never creates a Shell. Multi-file/type-default views,
+versioned safe editing, per-window layout, authenticated ACK/commit handoff and managed
+LSP/PTY resources are integrated. Native drag/tray/whole-application exit acceptance
+remains a separate manual gate; see `docs/engine-workbench-verification.md`.
+`engineering_host.py` is released only after Windows Job ownership; it resets the
+inherited Ctrl+C-ignore attribute before ConPTY spawn. Linux uses an isolated subreaper
+and pidfds, including daemonized children. Only confirmed tree exit releases LOOP activity.
+LSP close carries both buffer revision and provider protocol version and shares the sync
+lock; stale close cannot evict a newer buffer. Windows/Linux frozen-helper checks are
+terminal evidence, not certification of every optional model Backend distribution.
 
 The versioned workbench snapshot stores tab order, selected tab, four pane assignments,
 focused pane and layout per controller identity (`mode` + stable userId). The current
@@ -1639,8 +1671,9 @@ remote-only files preview/edit from the executor. App feeds
 the Sidebar `activeWorkingDir/activeExecKey/activeExecLabel/activeExecMode` from the
 focused session (all in the Sidebar memo comparator).
 
-**View/edit always act on the session's node** (`syncReadFile`/`syncWriteFile`, routed
-by `execKey`) — so it works uniformly for both session kinds and needs no local copy.
+**Executor view/edit always act on the session's node** (preview via `syncReadFile`,
+editing via versioned `workspaceDocument*`, routed by `execKey`). Explicitly opened
+local copies use separate safe document adapters and never upload implicitly.
 
 **Stable async layout.** FileTreePanel reserves the local-copy identity/actions,
 status/transfer slot, and two-line Git toolbar on its first render. The notice stays
@@ -1764,9 +1797,18 @@ toggle; **images** show as a `data:` URL. Text files are also **editable** in pl
 numbers, bracket matching, undo/search and per-extension syntax highlighting (`langFor`
 maps ext → a `@codemirror/lang-*`), oneDark in dark themes (chosen via `isDarkTheme()`).
 Tab indents, Ctrl/⌘+S saves, a ● dirty indicator + close-guard protect unsaved changes;
-💾 保存 writes back via `syncWriteFile` (remote, with `execKey`) / `LocalFs.writeFile`
-(local), base64-encoded with `textToBase64`, then reloads that side's tree (and re-runs
-比对 if active). **CodeMirror is `React.lazy`-loaded** (`lazy(() => import('./CodeEditor'))`
+💾 保存 now uses `DocumentStore` plus full, versioned `WorkspaceDocuments` or the
+selected `LocalDocuments` adapter; it never falls back to unversioned transfer writes.
+Conflicts preserve baseline/disk/draft for explicit merge, unknown results only reconcile,
+and later edits stay dirty. IndexedDB draft persistence is bounded and owner/window-scoped;
+the file-tree “本设备草稿” entry supports offline read-only recovery/export/cleanup without
+rebinding an old executor identity. See `docs/engine-document-contract.md` for tested
+platform boundaries. Windows and Linux native document cores are tested directly; Linux
+requires `/proc/self/fd` and `FS_IOC_GETVERSION` (verified on WSL2/ext4), refusing safe editing
+when object identity cannot be proven. The headless Cargo harness compiles the production
+core, not a substitute; it does not verify Tauri window IPC or other POSIX platforms.
+Explicit file transfers retain their
+original APIs. **CodeMirror is `React.lazy`-loaded** (`lazy(() => import('./CodeEditor'))`
 + `Suspense`) so it + its language packs land in a separate ~360KB-gzip chunk fetched
 only on first edit — the main bundle is unchanged (chose this over Monaco, which is ~1MB+
 gzip plus workers). Section headers stay minimal for the narrow

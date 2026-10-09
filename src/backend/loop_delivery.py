@@ -11,6 +11,7 @@ from typing import Any
 
 from .call_trace import CallTrace
 from .loop_milestones import milestone_progress, MILESTONE_INSTRUCTIONS
+from .loop_task_blockers import BLOCKER_INSTRUCTIONS, closure
 
 
 def scope_key(goal: str) -> str:
@@ -88,6 +89,7 @@ SAFETY_CONSTRAINTS = """【LOOP 自动执行边界】
 "loopControl":{"pause":true,"reason":"具体事实与人工处理条件"}，不要自行尝试高风险恢复。
 上述是执行约束，不代表底层具备操作系统级隔离。
 """
+SAFETY_CONSTRAINTS += BLOCKER_INSTRUCTIONS
 
 
 def call_scope_constraints(sub_stage: str, access: str, *, native_codex: bool) -> str:
@@ -237,9 +239,10 @@ def assess_progress(records: list, patience: int = 3) -> dict:
             previous_ids |= ids
     latest = relevant[-1].delivery if relevant else {}
     hard = [b for b in latest.get("blockers", []) if b["kind"] in ("global", "safety", "authorization")]
+    frozen = closure(latest.get('items', []), {key for b in latest.get('blockers', []) for key in b['affected']})
     ready = [i for i in latest.get("items", []) if i["status"] in ("pending", "implemented")
              and all(next((d["status"] for d in latest["items"] if d["id"] == dep), "pending") == "verified" for dep in i["dependsOn"])
-             and not any(i["id"] in b["affected"] for b in latest.get("blockers", []))]
+             and i['id'] not in frozen]
     need_human = any(b["kind"] == "human" for b in latest.get("blockers", [])) and not ready
     pause = bool(hard or need_human or idle >= patience)
     reason = ("安全/全局阻塞：" + hard[0]["reason"] if hard else
@@ -263,5 +266,9 @@ def planning_context(state: Any, record: Any) -> str:
             + "\n【实质进展诊断】\n" + json.dumps(guard, ensure_ascii=False)
             + "\n【本轮正式来源（只读快照；不是完成证明或授权）】\n" + excerpt(json.dumps(getattr(record, 'source_snapshots', {}), ensure_ascii=False), 24000)
             + "\n【执行前冻结子条件（不是父任务完成率）】\n" + excerpt(json.dumps(getattr(record, 'milestone_plan', {}), ensure_ascii=False), 14000)
+            + ("\n【未解决任务阻塞（遗漏、改号或下一轮不能解除）】\n" + excerpt(json.dumps(state.unresolved_blockers, ensure_ascii=False), 14000)
+               + "\n【阻塞范围的原任务图】\n" + excerpt(json.dumps(state.blocked_task_scope, ensure_ascii=False), 22000)
+               if state.unresolved_blockers else '')
+            + ("\n【本轮冻结任务/隔离前置】\n" + excerpt(json.dumps(record.task_plan, ensure_ascii=False), 22000) if record.task_plan else '')
             + ("\n【上次暂停和已落盘证据，须核实，不得盲目续写】\n" + json.dumps(stopped.decision, ensure_ascii=False)
                + '\n' + evidence_packet(stopped, 2000) if stopped else ''))

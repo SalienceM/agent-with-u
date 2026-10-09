@@ -13,6 +13,7 @@ sendMessage / abortMessage 是 fire-and-forget：立即返回 null，
 
 import asyncio
 import base64
+import copy
 from contextvars import ContextVar
 import inspect
 import json
@@ -771,7 +772,17 @@ def _codex_message_equivalent(native: ChatMessage, local: ChatMessage) -> bool:
 
 from .loop_source_bridge import LoopSourceBridge
 from .loop_environment_bridge import LoopEnvironmentBridge
+from .loop_task_blocker_bridge import LoopTaskBlockerBridge
+from .loop_task_blockers import (PLAN_INSTRUCTIONS, BLOCKER_INSTRUCTIONS, protect_report,
+                                reduce_scope as reduce_task_scope)
 from .loop_control_bridge import LoopControlBridge
+from .engine_workbench import EngineWorkbenchBridge, WorkbenchError
+from .workspace_document_bridge import WorkspaceDocumentBridge
+from .workbench_windows import WorkbenchWindowBridge, WINDOW_REQUEST
+from .workbench_stream import WorkbenchStreamBridge
+from .workspace_terminals import TerminalBridge
+from .workspace_languages import LanguageBridge
+from .workspace_search_bridge import WorkspaceSearchBridge
 from .loop_execution_environment import EnvironmentPause, normalize_environment
 from .loop_decisions import DecisionFacts, decide_next, digest as loop_digest
 from .loop_task_source import source_summary, reconcile, snapshot_fresh
@@ -779,7 +790,7 @@ from .loop_milestones import (MILESTONE_INSTRUCTIONS, register_plan, review_mile
                               milestone_progress, inherit_plan)
 
 
-class BridgeWS(LoopSourceBridge, LoopEnvironmentBridge, LoopControlBridge):
+class BridgeWS(LoopSourceBridge, LoopEnvironmentBridge, LoopTaskBlockerBridge, LoopControlBridge, EngineWorkbenchBridge, WorkspaceDocumentBridge, WorkspaceSearchBridge, WorkbenchWindowBridge, WorkbenchStreamBridge, TerminalBridge, LanguageBridge):
     """WebSocket bridge，业务逻辑与 Bridge（Qt）完全相同，去掉 Qt 依赖。"""
 
     def __init__(self, cli_path: Optional[str] = None, auth_guard: Optional["AuthGuard"] = None):
@@ -1865,9 +1876,13 @@ class BridgeWS(LoopSourceBridge, LoopEnvironmentBridge, LoopControlBridge):
         await asyncio.gather(*(ws.send(payload) for ws in list(self._clients)), return_exceptions=True)
 
     def _emit_delta(self, delta: StreamDelta):
+        owner = self._session_owner_id(delta.session_id)
+        value = delta.to_dict()
+        if owner is not None:
+            value = self._stream_window_journal().append(owner, delta.session_id, value)
         asyncio.ensure_future(self._send_for_session(delta.session_id, {
             "event": "streamDelta",
-            "data": json.dumps(delta.to_dict(), ensure_ascii=False),
+            "data": json.dumps(value, ensure_ascii=False),
         }))
 
     def _emit_session_updated(self, data: dict, owner_id: Optional[str] = None):
@@ -1972,10 +1987,12 @@ class BridgeWS(LoopSourceBridge, LoopEnvironmentBridge, LoopControlBridge):
             owner_token = _REQUEST_OWNER_ID.set(self._owner_id_for_client(websocket))
             source_token = _REQUEST_IDENTITY_SOURCE.set(str(ident_src or "none"))
             client_token = _REQUEST_CLIENT.set(websocket)
+            window_token = WINDOW_REQUEST.set(None)
             legacy_token = _REQUEST_CAN_CLAIM_LEGACY.set(bool(
                 ident_src == "relay" and getattr(websocket, "can_claim_legacy", False)
             ))
             try:
+                WINDOW_REQUEST.set(self._window_bind_connection(websocket, req.get('workbench')))
                 result = await self._dispatch(req.get("method", ""), req.get("params", []))
                 await websocket.send(json.dumps({"id": req_id, "result": result}, ensure_ascii=False))
             except websockets.exceptions.ConnectionClosed:
@@ -1988,6 +2005,7 @@ class BridgeWS(LoopSourceBridge, LoopEnvironmentBridge, LoopControlBridge):
                     except Exception:
                         pass
             finally:
+                WINDOW_REQUEST.reset(window_token)
                 _REQUEST_CLIENT.reset(client_token)
                 _REQUEST_CAN_CLAIM_LEGACY.reset(legacy_token)
                 _REQUEST_IDENTITY_SOURCE.reset(source_token)
@@ -2037,6 +2055,7 @@ class BridgeWS(LoopSourceBridge, LoopEnvironmentBridge, LoopControlBridge):
             if workspace_tools is not None:
                 workspace_tools.disconnect(websocket)
             self._clients.discard(websocket)
+            getattr(self, '_window_connection_bindings', {}).pop(websocket, None)
             self._client_meta.pop(websocket, None)
             print(f"[bridge_ws] client disconnected user={ident} (total={len(self._clients)})",
                   file=sys.stderr, flush=True)
@@ -2110,6 +2129,17 @@ class BridgeWS(LoopSourceBridge, LoopEnvironmentBridge, LoopControlBridge):
         self._authorize_rpc(method, handler, params)
         bound = inspect.signature(handler).bind_partial(*params)
         sid = str(bound.arguments.get('session_id') or bound.arguments.get('sid') or '')
+        if sid and method in {
+                'workspaceDocumentSave', 'terminalCreate', 'terminalInput', 'terminalResize', 'terminalStop',
+                'languageServiceStart', 'languageServiceRequest', 'languageServiceStop',
+                'steerMessage', 'redirectMessage', 'steerSeqTask', 'seqtaskAdd', 'seqtaskEdit',
+                'seqtaskRemove', 'seqtaskReorder', 'seqtaskSetAuto', 'seqtaskTakeNext', 'seqtaskClear',
+                'abortMessage', 'grantPermission', 'loopControlRequest', 'loopTakeover', 'loopRelease'}:
+            self._window_guard(sid)
+        if method == 'executeCommand' and params:
+            payload = json.loads(params[0]) if isinstance(params[0], str) else params[0]
+            if isinstance(payload, dict) and payload.get('sessionId'):
+                self._window_guard(payload['sessionId'])
         control_read_or_independent = {
             'loopControlGet', 'loopControlRequest', 'loopTakeover', 'loopRelease',
             'loopGetState', 'loopGetRecord', 'loopExecutionEnvironmentGet',
@@ -3710,6 +3740,7 @@ class BridgeWS(LoopSourceBridge, LoopEnvironmentBridge, LoopControlBridge):
     def _rpc_sendMessage(self, payload_json: str) -> None:
         """Fire-and-forget：立即返回 null，后台异步推送 streamDelta。"""
         try:
+            self._window_guard(str(json.loads(payload_json).get('sessionId') or ''))
             self._start_chat_turn(payload_json)
         except ValueError as exc:
             # 旧控制端的 sendMessage 没有 RPC id。推送明确拒绝，不能让其
@@ -4687,6 +4718,40 @@ class BridgeWS(LoopSourceBridge, LoopEnvironmentBridge, LoopControlBridge):
         except Exception as e:
             return json.dumps({"status": "error", "message": str(e)}, ensure_ascii=False)
 
+    def _rpc_updateSessionWorkbench(self, session_id: str, patch_json: str, expected_json: str = '') -> str:
+        """只更新展示模式；缺失字段不重置旧值，不启动任何执行资源。"""
+        self._require_session_access(session_id)
+        if expected_json:
+            try:
+                self._workbench_identity(session_id, json.loads(expected_json))
+            except (WorkbenchError, ValueError, TypeError, OSError):
+                return json.dumps({'status': 'error', 'reasonCode': 'stale_workspace'}, ensure_ascii=False)
+        try:
+            patch = json.loads(patch_json)
+        except (TypeError, ValueError):
+            return json.dumps({'status': 'error', 'message': '工作台设置必须是 JSON 对象'}, ensure_ascii=False)
+        if not isinstance(patch, dict) or set(patch) - {'viewMode'}:
+            return json.dumps({'status': 'error', 'message': '不支持的工作台设置字段'}, ensure_ascii=False)
+        if 'viewMode' in patch and patch['viewMode'] not in ('chat', 'engine'):
+            return json.dumps({'status': 'error', 'message': '无效的会话展示模式'}, ensure_ascii=False)
+        session = self._active_sessions.get(session_id) or self._session_store.load(session_id)
+        if session is None:
+            return json.dumps({'status': 'error', 'message': '会话不可用'}, ensure_ascii=False)
+        previous = session.view_mode
+        if 'viewMode' in patch and patch['viewMode'] != previous:
+            session.view_mode = patch['viewMode']
+            try:
+                self._session_store.save_meta(session, touch_updated=False, immediate=True)
+            except Exception:
+                session.view_mode = previous
+                self._session_store.update_meta(session)
+                return json.dumps({'status': 'error', 'message': '工作台设置保存失败，请重新读取状态'}, ensure_ascii=False)
+            self._active_sessions[session_id] = session
+            self._emit_session_updated({'type': 'session_changed', 'sessionId': session_id,
+                                        'summary': session.meta_dict()})
+        return json.dumps({'status': 'ok', 'viewMode': session.view_mode,
+                           'summary': session.meta_dict()}, ensure_ascii=False)
+
     def _rpc_updateSessionAppearance(self, session_id: str, patch_json: str) -> str:
         """更新侧栏收藏/底色；轻量持久化，不改会话活跃时间或重写消息正文。"""
         allowed_colors = {"", "ocean", "violet", "sunset", "forest", "amber", "rose"}
@@ -4736,6 +4801,8 @@ class BridgeWS(LoopSourceBridge, LoopEnvironmentBridge, LoopControlBridge):
             return "Session 的 LOOP 仍在运行"
         if self._loop_has_active_call(session_id):
             return "Session 的执行或环境检查尚未确认退出"
+        if self._engineering_active(session_id):
+            return "Session 的文件保存、终端或语言服务尚未确认结束"
         if session_id in getattr(self, "_aside_running", set()) or session_id in getattr(self, "_chat_aside_running", set()):
             return "Session 的旁路任务仍在运行"
         if any(
@@ -5154,6 +5221,9 @@ class BridgeWS(LoopSourceBridge, LoopEnvironmentBridge, LoopControlBridge):
                 or any(key[0] == state.session_id for key in getattr(self, '_loop_environment_requests', {})))
             d["handoff"] = {"source": state.handoff.get("source", ""), "available": bool(state.handoff)}
             d["taskSource"] = source_summary(state.task_source)
+            d['unresolvedBlockers'] = {'available': bool(state.unresolved_blockers),
+                'count': len(state.unresolved_blockers.get('items', [])), 'valid': state.unresolved_blockers.get('valid')}
+            d['blockedTaskScope'] = {}
         running = self._loop_is_running(state.session_id)
         last = state.loops[-1] if state.loops else None
         # 可续：最后一条 loop 没跑完、不是错误、当前没在跑、仍在 execute 阶段
@@ -5163,6 +5233,7 @@ class BridgeWS(LoopSourceBridge, LoopEnvironmentBridge, LoopControlBridge):
             and not running and state.stage == STAGE_EXECUTE
         )
         d['controlEligibility'] = self._loop_control_eligibility(state)
+        d['engineeringActivities'] = self._engineering_feedback(state.session_id)
         d['canTakeover'] = state.control_mode == 'loop' and d['controlEligibility']['takeover']['allowed']
         # ★ 把每条 loop 实际用到的 backend + model + reasoning effort 解析成可读 label，
         #   供面板/流程视图准确追溯「谁以什么档位规划、执行、评审」。
@@ -5186,6 +5257,9 @@ class BridgeWS(LoopSourceBridge, LoopEnvironmentBridge, LoopControlBridge):
                 'capturedAt': snap.get('capturedAt')} for key, snap in rec.get('sourceSnapshots', {}).items() if isinstance(snap, dict)}
             if compact:
                 from .loop_execution_environment import check_summary
+                rec['blockerSummary'] = {key: rec.get('blockerReview', {}).get(key) for key in ('status', 'readyIds', 'affectedIds', 'valid')}
+                for key in ('taskPlan', 'taskBlockers', 'isolationEvidence', 'blockerReview'):
+                    rec[key] = {}
                 rec['environmentCheckCount'] = len(rec.get('environmentChecks', []))
                 rec['environmentChecks'] = [check_summary(v) for v in rec.get('environmentChecks', [])[-1:]]
                 rec['sourceSnapshots'] = {}
@@ -5273,10 +5347,11 @@ class BridgeWS(LoopSourceBridge, LoopEnvironmentBridge, LoopControlBridge):
             resumable=bool(last and last.kind != 'manual' and not last.completed and not last.error
                            and not last.terminal_kind and not running and state.stage == STAGE_EXECUTE),
             active_call=self._loop_has_active_call(state.session_id),
+            engineering_activity=bool(self._engineering_active(state.session_id)),
             chat_running=bool(session and (self._session_is_streaming(session)
                               or self._has_seq_dispatch_reservation(state.session_id))),
             manual_has_messages=has_messages,
-            sequence_pending=bool(has_messages and self._chat_extras_get(state.session_id).pending()),
+            sequence_pending=bool(has_messages and self._chat_extras_get(state.session_id).pending_tasks()),
             reserved=not ignore_reservation and self._loop_control_reserved(state.session_id),
             control_revision=state.control_revision,
         )
@@ -5574,6 +5649,10 @@ class BridgeWS(LoopSourceBridge, LoopEnvironmentBridge, LoopControlBridge):
                 mode=mode,
                 access=access,
                 desc=desc[:4_000],
+                task_ids=item.get('taskIds', []) if isinstance(item, dict) else [],
+                depends_on=item.get('dependsOn', []) if isinstance(item, dict) else [],
+                precondition_ids=item.get('preconditionIds', []) if isinstance(item, dict) else [],
+                test_writes_user_data=item.get('testWritesUserData', False) if isinstance(item, dict) else False,
             ))
         return steps
 
@@ -5666,10 +5745,15 @@ class BridgeWS(LoopSourceBridge, LoopEnvironmentBridge, LoopControlBridge):
             )))
         backend = None
         backend_config_id = backend_id or session.backend_id
+        task_state = self._loop_state(session.id) if seq > 0 and hasattr(self, '_loop_states') else None
+        task_record = next((r for r in task_state.loops if r.seq == seq), None) if task_state else None
+        scoped_tasks = bool(task_record and (task_record.task_plan or task_record.blocker_review or task_state.unresolved_blockers))
         if backend_id and backend_id != session.backend_id:
             try:
                 backend = self._new_backend_instance(backend_id)
             except Exception as e:
+                if scoped_tasks:
+                    raise _LoopAgentCallError('冻结任务 Backend 不可用；不能换 Backend 逃避作用域门槛。', '') from e
                 print(f"[loop] eval backend '{backend_id}' 不可用，回落会话 backend：{e}",
                       file=sys.stderr, flush=True)
                 backend = None
@@ -5683,12 +5767,15 @@ class BridgeWS(LoopSourceBridge, LoopEnvironmentBridge, LoopControlBridge):
         call_trace = (CallTrace(session.id, f"loop:{seq}:{sub_stage}:{mid}")
                       if (getattr(session, "token_usage", None) or {}).get("captureEnabled") and sub_stage != "aside" else None)
         parts: list[str] = []
+        review_output_limit = 262144 if task_record and task_record.blocker_review and sub_stage == SUB_ANALYSIS else 0
+        captured_chars = 0
+        output_overflow = False
         call_usage: Optional[dict] = None
         call_error = ""
         last_activity_at = time.monotonic()
 
         def on_delta(delta: StreamDelta):
-            nonlocal call_usage, last_activity_at, call_error
+            nonlocal call_usage, last_activity_at, call_error, captured_chars, output_overflow
             if _diagnostic:
                 _diagnostic.observe(delta)
             # 诊断/重试倒计时不是模型的有效活动，不能延长无事件看门狗。
@@ -5701,8 +5788,16 @@ class BridgeWS(LoopSourceBridge, LoopEnvironmentBridge, LoopControlBridge):
                 call_usage = dict(delta.usage)
                 return
             if delta.type == "text_delta" and delta.text:
-                parts.append(delta.text)
-                self._emit_loop_progress(session.id, seq, sub_stage, delta.text)
+                chunk = delta.text
+                if review_output_limit:
+                    remaining = max(0, review_output_limit - captured_chars)
+                    output_overflow = output_overflow or len(chunk) > remaining
+                    chunk = chunk[:remaining]
+                    if output_overflow:
+                        call_error = '任务只读复核输出超限；不采纳截断台账。'
+                captured_chars += len(chunk)
+                parts.append(chunk)
+                self._emit_loop_progress(session.id, seq, sub_stage, chunk)
             elif delta.type == "tool_start" and delta.tool_call:
                 self._emit_loop_progress(
                     session.id, seq, sub_stage,
@@ -5825,7 +5920,7 @@ class BridgeWS(LoopSourceBridge, LoopEnvironmentBridge, LoopControlBridge):
                         result = send_task.result()
                         break
                     idle_for = time.monotonic() - last_activity_at
-                    if idle_for < inactivity_timeout:
+                    if idle_for < inactivity_timeout and not output_overflow:
                         continue
 
                     # 同时通知 Backend 关闭底层 SDK/CLI 并取消当前 await，防止
@@ -5842,6 +5937,8 @@ class BridgeWS(LoopSourceBridge, LoopEnvironmentBridge, LoopControlBridge):
                             send_task.result()
                         except BaseException:
                             pass
+                    if output_overflow and backend_call_quiesced:
+                        raise _LoopAgentCallError(call_error, ''.join(parts))
                     raise _LoopAgentStalledError(
                         idle_for,
                         partial_text="".join(parts),
@@ -6587,7 +6684,7 @@ class BridgeWS(LoopSourceBridge, LoopEnvironmentBridge, LoopControlBridge):
         上下文回滚到这次 loop 开跑前的快照（版本隔离，避免被丢弃 loop 的对话污染后续）。
         restore_files=True 且有 git 快照时，还把工作目录文件回滚到开跑前。返回退回的 addon 数。"""
         state.loops = [l for l in state.loops if l.seq != record.seq]
-        scored = [l for l in state.round_loops() if l.analysis]
+        scored = [l for l in state.round_loops() if l.analysis and l.analysis.score_observed]
         state.best_seq = max(scored, key=lambda l: l.analysis.score).seq if scored else 0
         reverted = 0
         for a in state.addons:
@@ -6631,7 +6728,7 @@ class BridgeWS(LoopSourceBridge, LoopEnvironmentBridge, LoopControlBridge):
 
     def _loop_evidence_environment(self, session, record) -> str:
         backend_id = record.backends.get('execute') or session.backend_id
-        config = next((c for c in self._backend_configs if c.id == backend_id), None)
+        config = next((c for c in getattr(self, '_backend_configs', []) if c.id == backend_id), None)
         return loop_digest([backend_id, str(getattr(config, 'type', '')), getattr(config, 'env', {}) or {},
                             getattr(config, 'cli_path', ''), sys.platform, sys.version_info[:3],
                             str(getattr(session, 'working_dir', ''))])[:40]
@@ -6808,7 +6905,7 @@ class BridgeWS(LoopSourceBridge, LoopEnvironmentBridge, LoopControlBridge):
             '{"mode": "sequential", "access": "write", "desc": "只实施必要修正…"}]}\n'
             "```"
         )
-        prepare_prompt += MILESTONE_INSTRUCTIONS
+        prepare_prompt += MILESTONE_INSTRUCTIONS + PLAN_INSTRUCTIONS + BLOCKER_INSTRUCTIONS
         # 把待纳入 addon 携带的图片一起带给 prepare（让模型规划时也能看到素材）
         addon_imgs: list = []
         for a in pending:
@@ -6842,6 +6939,7 @@ class BridgeWS(LoopSourceBridge, LoopEnvironmentBridge, LoopControlBridge):
                 f"{planning_context(state, record)}\n"
                 f"【全局目标】\n{state.goal}\n\n【本次演进依据】\n{record.evolution_basis}\n"
             )
+            retry_prompt += PLAN_INSTRUCTIONS + BLOCKER_INSTRUCTIONS
             record.stage_details[SUB_PREPARE].update({"status": "retrying", "message": "规划结构校验失败，正在重试。"})
             record.updated_at = time.time()
             self._loop_save(state)
@@ -7004,6 +7102,7 @@ class BridgeWS(LoopSourceBridge, LoopEnvironmentBridge, LoopControlBridge):
                 "```\n"
                 "orchestration 至少 1 步。只输出 JSON，不要散文。"
             )
+            replan_prompt += PLAN_INSTRUCTIONS + BLOCKER_INSTRUCTIONS
             rtext, _ = await self._loop_run_agent(
                 session, replan_prompt, SUB_PREPARE, record.seq,
                 resume=False,
@@ -7026,6 +7125,8 @@ class BridgeWS(LoopSourceBridge, LoopEnvironmentBridge, LoopControlBridge):
             # 最后有效 prepare/replan 冻结登记，执行后不能补登记来获取信用。
             attempts = record.stage_details.get(SUB_PREPARE, {}).get('attempts', [])
             parsed = next((a.get('parsed') for a in reversed(attempts) if a.get('valid')), {}) or {}
+            if not self._loop_freeze_tasks(session, state, record, parsed):
+                return
             plan_raw = parsed.get('milestonePlan')
             if not isinstance(plan_raw, dict):
                 plan_raw = {}
@@ -7085,6 +7186,8 @@ class BridgeWS(LoopSourceBridge, LoopEnvironmentBridge, LoopControlBridge):
                     i += 1
                 if state.progress_guard.get("pause"):
                     return
+                if record.blocker_review:
+                    break
                 if any(s.status == "error" for s in steps[:i]):
                     # 后续步骤可能依赖失败产物，不能继续盲跑；评审后由下一轮重新选择就绪任务。
                     break
@@ -7095,7 +7198,7 @@ class BridgeWS(LoopSourceBridge, LoopEnvironmentBridge, LoopControlBridge):
         if state.progress_guard.get("pause"):
             return
         record.stage_details[SUB_EXECUTE].update({
-            "status": "error" if any(s.status == "error" for s in record.orchestration) else "done",
+            "status": "blocked" if record.blocker_review else "error" if any(s.status == "error" for s in record.orchestration) else "done",
             "rawOutput": record.result,
             "message": "步骤状态来自执行返回；是否满足目标仍需独立评审核实。",
         })
@@ -7120,6 +7223,10 @@ class BridgeWS(LoopSourceBridge, LoopEnvironmentBridge, LoopControlBridge):
             return None
         if step.access != 'read' and not await self._loop_check_source(session, state, record, f'write:{step.index}'):
             return None
+        if not await self._loop_task_step_gate(session, state, record, step):
+            return None
+        task_identity = self._loop_task_identity(session, state, record)
+        task_control = state.control_revision
         # ★ 让每个 step 看到本次增量编排与冻结诊断，理解边界但不扩成全量重做。
         all_steps_text = "\n".join(
             f"  {s.index}. [{s.mode}/{s.access}] {s.desc}" + (" ← 当前步" if s.index == step.index else "")
@@ -7137,7 +7244,7 @@ class BridgeWS(LoopSourceBridge, LoopEnvironmentBridge, LoopControlBridge):
             f"【全局目标】\n{state.goal}\n\n"
             f"{strategy_hint}"
             f"【本次冻结的演进依据】\n{record.evolution_basis or '（无）'}\n\n"
-            f"{planning_context(state, record) if not agent_session_id else '工作流交接与台账沿用本轮执行上下文，仍须核对证据有效性。'}\n"
+            f"{planning_context(state, record) if not agent_session_id or state.unresolved_blockers or record.task_plan else '工作流交接与台账沿用本轮执行上下文，仍须核对证据有效性。'}\n"
             f"{('【本轮已执行步骤证据（供核实）】' + prior_evidence) if not agent_session_id else ''}\n"
             f"【本次增量编排】\n{all_steps_text}\n\n"
             f"你现在执行的是第 {step.index} 步（共 {len(record.orchestration)} 步），"
@@ -7153,6 +7260,7 @@ class BridgeWS(LoopSourceBridge, LoopEnvironmentBridge, LoopControlBridge):
             "已实现/已验证/受阻、产物路径与版本、实际测试命令/结果/环境、剩余缺口；不要用字数限制省略失败证据。"
             "若安全风险未遏制或后续执行需要新授权，停止并返回 JSON loopControl:{pause:true,reason:具体原因及所需输入}。"
         )
+        prompt += BLOCKER_INSTRUCTIONS + PLAN_INSTRUCTIONS
         policy = getattr(state, "policy", None)
         stall_seconds = max(30, min(3600, int(
             getattr(policy, "step_stall_seconds", 300) or 300
@@ -7167,6 +7275,14 @@ class BridgeWS(LoopSourceBridge, LoopEnvironmentBridge, LoopControlBridge):
             step.recovery_notes = []
 
         while step.attempts < max_attempts:
+            if step.attempts and (record.task_plan or record.blocker_review or state.unresolved_blockers):
+                # 自动重试也是新调用，必须重新通过当前控制权、来源和隔离前置。
+                if not self._loop_task_boundary_current(session, state, record, task_identity, task_control):
+                    return None
+                if step.access != 'read' and not await self._loop_check_source(session, state, record, f'retry:{step.index}'):
+                    return None
+                if not await self._loop_task_step_gate(session, state, record, step):
+                    return None
             step.attempts += 1
             attempt = step.attempts
             step.status = "running"
@@ -7240,7 +7356,10 @@ class BridgeWS(LoopSourceBridge, LoopEnvironmentBridge, LoopControlBridge):
                     session.id, record.seq, f"step{step.index}",
                     f"\n\n⚠️ {note}\n",
                 )
-                if exc.retryable and attempt < max_attempts and session.id not in self._loop_cancel:
+                scoped_retry_allowed = not (record.task_plan or record.blocker_review or state.unresolved_blockers) or (
+                    not record.blocker_review and self._loop_task_boundary_current(
+                        session, state, record, task_identity, task_control))
+                if exc.retryable and attempt < max_attempts and session.id not in self._loop_cancel and scoped_retry_allowed:
                     self._emit_loop_progress(
                         session.id, record.seq, f"step{step.index}",
                         "🔄 保留已落盘成果，正在用全新上下文自动重试当前步…\n",
@@ -7270,11 +7389,17 @@ class BridgeWS(LoopSourceBridge, LoopEnvironmentBridge, LoopControlBridge):
                 step.output = text
                 step.status = "done"
                 step.ended_at = time.time()
+                if (record.task_plan or record.blocker_review or state.unresolved_blockers) and not self._loop_task_boundary_current(
+                        session, state, record, task_identity, task_control):
+                    step.task_result = 'unknown'
+                    self._loop_save(state)
+                    return new_sid
                 if self._loop_pause_control(state, record, text):
                     step.task_result = 'blocked'
                     self._loop_save(state)
                     self._emit_loop_updated(state)
                     return new_sid
+                await self._loop_task_result(session, state, record, step, text, task_identity, task_control)
                 self._loop_save(state)
                 self._emit_loop_updated(state)
                 return new_sid
@@ -7310,6 +7435,12 @@ class BridgeWS(LoopSourceBridge, LoopEnvironmentBridge, LoopControlBridge):
         return None
 
     async def _loop_do_analysis(self, session, state, record) -> None:
+        if state.unresolved_blockers and not record.blocker_review:
+            record.task_blockers = copy.deepcopy(state.unresolved_blockers)
+            record.blocker_review = {'status': 'pending', 'boundary': f'{record.round}:{record.seq}:analysis'}
+        if record.blocker_review:
+            await self._loop_review_blockers(session, state, record)
+            return
         record.sub_stage = SUB_ANALYSIS
         record.stage_details.setdefault(SUB_ANALYSIS, {})["status"] = "running"
         record.mark_sub(SUB_ANALYSIS)
@@ -7332,6 +7463,9 @@ class BridgeWS(LoopSourceBridge, LoopEnvironmentBridge, LoopControlBridge):
         )
         eval_backend = record.backends.get("analysis") or state.policy.backend_for("analysis") or session.backend_id
         if not any(c.id == eval_backend for c in self._backend_configs):
+            if record.task_plan:
+                self._loop_wait(state, record, 'task_review_unavailable', '冻结任务的评审 Backend 不可用；不改用其他 Backend。')
+                return
             eval_backend = session.backend_id
         # 记下本次评审实际用的 backend（可能是异构评审 backend），供结果展示标出选型
         record.backends["analysis"] = eval_backend
@@ -7345,6 +7479,8 @@ class BridgeWS(LoopSourceBridge, LoopEnvironmentBridge, LoopControlBridge):
         record.runtimes["analysis"] = analysis_runtime
         # 指定了异构评审 backend 时，必须用独立上下文（跨 backend 无法 resume 同一会话）
         independent = bool(getattr(state.policy, "independent_eval", True)) or eval_backend != session.backend_id
+        readonly_acceptance = bool(record.task_plan)
+        independent = independent or readonly_acceptance
         # ★ 防自欺：独立评审用一个不复用执行上下文的会话，避免被执行阶段的乐观自述带偏；
         #   并以"对抗式、以证据为准、默认未完成"的口径打分。
         reviewer_block = (
@@ -7356,6 +7492,9 @@ class BridgeWS(LoopSourceBridge, LoopEnvironmentBridge, LoopControlBridge):
             "不要每次重跑无关的全量检查。\n\n"
             if independent else ""
         )
+        if readonly_acceptance:
+            reviewer_block = ('独立只读验收：仅核对已落盘产物与有效证据，不运行应用/构建/测试或写文件。'
+                '测试只能由具有适用隔离前置的独立执行步运行；不能在评审内绕过调用边界。\n')
         analysis_prompt = (
             f"{strategy_block}{reviewer_block}"
             f"对第 {record.seq} 次 LOOP 增量演进后的**当前累计工作区状态**做评估。"
@@ -7386,15 +7525,32 @@ class BridgeWS(LoopSourceBridge, LoopEnvironmentBridge, LoopControlBridge):
             "```\n" + REPORT_INSTRUCTIONS + MILESTONE_INSTRUCTIONS
             + f"\n证据 environment 必须核实为当前环境：{self._loop_evidence_environment(session, record)}；文件 fingerprint 使用文件内容 SHA256。"
         )
+        task_identity, task_control = self._loop_task_identity(session, state, record), state.control_revision
+        review_identity = self._loop_review_identity(session, record)
         atext, _ = await self._loop_run_agent(
             session, analysis_prompt, SUB_ANALYSIS, record.seq,
             resume=not independent,
             indep_session_id=(f"{session.id}:eval:{record.seq}" if independent else None),
             backend_id=eval_backend,
             runtime=analysis_runtime,
+            execution_access='read-only' if readonly_acceptance else None,
         )
         aj = self._extract_json_block(atext) or {}
+        if (readonly_acceptance or 'taskBlockers' in aj) and (not self._loop_task_boundary_current(
+                session, state, record, task_identity, task_control)
+                or self._loop_review_identity(session, record) != review_identity):
+            record.stage_details[SUB_ANALYSIS].update(rawOutput=atext, status='stale')
+            self._loop_save(state)
+            return
         if self._loop_pause_control(state, record, atext):
+            return
+        if 'taskBlockers' in aj:
+            self._loop_record_task_blockers(session, state, record, aj['taskBlockers'], task_identity)
+            record.call_results[SUB_ANALYSIS] = 'normal'
+            record.stage_details[SUB_ANALYSIS].update(rawOutput=atext, parsed=aj, status='paused',
+                message='评审首次发现任务阻塞；本轮评审额度已使用，不追加模型复核。')
+            record.blocker_review.update(status='unknown', reason='评审首次发现阻塞，需要显式恢复后重新规划。')
+            self._loop_wait(state, record, 'task_review_unknown', '评审首次发现任务阻塞；保留范围并等待重新规划，不追加第二次复核。')
             return
         valid_analysis = isinstance(aj.get("score"), (int, float)) and not isinstance(aj.get("score"), bool) and 0 <= aj["score"] <= 100
         record.stage_details[SUB_ANALYSIS].update({
@@ -7446,10 +7602,18 @@ class BridgeWS(LoopSourceBridge, LoopEnvironmentBridge, LoopControlBridge):
         )
         record.analysis = analysis
         record.delivery = normalize_report(aj.get("delivery"))
+        if state.unresolved_blockers:
+            record.delivery = protect_report(record.delivery, record.task_plan, state.unresolved_blockers,
+                self._loop_task_identity(session, state, record))
         if record.progress_version >= 2 and record.delivery:
             record.delivery['milestoneReview'] = review_milestones((aj.get('delivery') or {}).get('milestones', []),
                 record.milestone_plan, session.working_dir, self._loop_evidence_environment(session, record))
         if not await self._loop_check_source(session, state, record, 'acceptance'):
+            return
+        if readonly_acceptance and (not self._loop_task_boundary_current(session, state, record, task_identity, task_control)
+                or self._loop_review_identity(session, record) != review_identity):
+            record.stage_details[SUB_ANALYSIS]['status'] = 'stale'
+            self._loop_save(state)
             return
         if state.task_source.get('binding') and record.delivery:
             record.delivery['reconciliation'] = reconcile(state.task_source.get('snapshot', {}), record.delivery)
@@ -7472,6 +7636,12 @@ class BridgeWS(LoopSourceBridge, LoopEnvironmentBridge, LoopControlBridge):
         record.updated_at = time.time()
         if record.progress_version:
             state.progress_guard = assess_progress(state.round_loops(), state.policy.progress_patience)
+            if state.unresolved_blockers:
+                task_scope = reduce_task_scope(record.task_plan, state.unresolved_blockers,
+                    self._loop_task_identity(session, state, record), record.delivery)
+                state.progress_guard.update(readyIds=task_scope['readyIds'], affectedIds=task_scope['affectedIds'])
+                if not task_scope['valid']:
+                    state.progress_guard.update(pause=True, reasonCode='task_scope_unknown', reason=task_scope['reason'])
             if record.progress_version >= 2 and record.delivery:
                 record.delivery['milestoneSummary'] = milestone_progress(state.round_loops())
             ready = (completion_ready(record.delivery) and not state.progress_guard["scopeLost"]
@@ -7484,7 +7654,7 @@ class BridgeWS(LoopSourceBridge, LoopEnvironmentBridge, LoopControlBridge):
             if not record.delivery:
                 record.stage_details[SUB_ANALYSIS]["validation"].append("缺少有效 delivery 台账，不能据分数收口；下轮需补齐结构化证据。")
         record.artifact_checkpoint = git_snapshot(session.working_dir)
-        scored_records = [l for l in state.round_loops() if l.analysis]
+        scored_records = [l for l in state.round_loops() if l.analysis and l.analysis.score_observed]
         if scored_records:
             state.best_seq = max(scored_records, key=lambda l: l.analysis.score).seq
         # ★ 跨 session 模型台账：执行 backend 拿到这次评分（衡量"谁更能干"），
@@ -7549,7 +7719,7 @@ class BridgeWS(LoopSourceBridge, LoopEnvironmentBridge, LoopControlBridge):
             code = 'workflow_blocked' if hard['kind'] == 'global' else hard['kind']
         elif guard.get('pause') and not guard.get('noProgressCount') and not code:
             code = 'human_input'
-        evaluated = [r for r in state.round_loops() if r.analysis]
+        evaluated = [r for r in state.round_loops() if r.analysis and r.analysis.score_observed]
         flat = len(evaluated) >= 2 and evaluated[-1].analysis.score - evaluated[-2].analysis.score < 3
         accepted = bool(record.analysis and record.analysis.outputtable and completion_ready(report)
                         and not guard.get('scopeLost') and not any(a.status == 'pending' for a in state.addons))
@@ -7579,10 +7749,17 @@ class BridgeWS(LoopSourceBridge, LoopEnvironmentBridge, LoopControlBridge):
             call_result='error' if failed else 'normal' if record.completed else 'unknown', retry_allowed=failed,
             call_still_active=self._loop_has_active_call(state.session_id),
             no_progress_pause=guard.get('noProgressCount', 0) >= state.policy.progress_patience,
-            needs_replan=bool(guard.get('needsReplan')), needs_review=not report or accepted and not complete,
-            ready_ids=guard.get('readyIds', []))
+            needs_replan=bool(guard.get('needsReplan')), needs_review=not report or accepted and not complete
+                or record.blocker_review.get('status') == 'done' and not state.unresolved_blockers,
+            ready_ids=guard.get('readyIds', []), affected_ids=guard.get('affectedIds', []))
         decision = decide_next(facts, f'{record.round}:{record.seq}:terminal',
                                [f'record:{record.seq}', f'source:{state.task_source.get("revision", 0)}'])
+        if record.blocker_review.get('valid') and decision['action'] in ('continue', 'replan'):
+            decision.update(action='replan', reasonCode='independent_work',
+                reasonText=('部分任务受阻，已只读复核独立就绪工作；受阻验收保持未完成。' if state.unresolved_blockers
+                            else '任务阻塞已按新证据解除；重新规划后仍需独立验收。'),
+                nextStep='下一轮重新规划：' + '、'.join(record.blocker_review.get('readyIds', [])))
+            decision['decisionId'] = loop_digest(decision)[:32]
         self._loop_keep_decision(state, record, decision)
         if decision['action'] in ('complete', 'stop'):
             self._apply_loop_out(state, decision['reasonText'])
@@ -7680,7 +7857,7 @@ class BridgeWS(LoopSourceBridge, LoopEnvironmentBridge, LoopControlBridge):
 
     @classmethod
     def _loop_record_diagnosis_brief(cls, record: "LoopRecord", *, latest: bool = False) -> str:
-        score = (f"{record.analysis.score:.0f}" if record.analysis
+        score = (f"{record.analysis.score:.0f}" if record.analysis and record.analysis.score_observed
                  else ("人工" if record.kind == "manual" else "?"))
         label = "manual" if record.kind == "manual" else record.iteration_mode
         chunks = [f"#{record.seq} [{label}] 累计分数:{score} 增量焦点:{(record.goal or '—')[:240]}"]
@@ -7732,7 +7909,7 @@ class BridgeWS(LoopSourceBridge, LoopEnvironmentBridge, LoopControlBridge):
 
     def _recompute_risk(self, state: "LoopState") -> None:
         """综合风险系数：完成度低 + 遇到硬约束 + 提升乏力 → 升高（按当前轮计）。"""
-        done = [l for l in state.round_loops() if l.analysis]
+        done = [l for l in state.round_loops() if l.analysis and l.analysis.score_observed]
         if not done:
             return
         latest = done[-1].analysis
@@ -7783,7 +7960,7 @@ class BridgeWS(LoopSourceBridge, LoopEnvironmentBridge, LoopControlBridge):
 
     def _loop_should_stop(self, state: "LoopState") -> tuple[bool, str]:
         """是否结束 loopexecute、进入全局 loopout（按当前轮计）。"""
-        done = [l for l in state.round_loops() if l.analysis]
+        done = [l for l in state.round_loops() if l.analysis and l.analysis.score_observed]
         if not done:
             # 整轮异常可能没有 analysis，也必须受最大次数约束，不能因缺少评分而无限续跑。
             if len(state.round_loops()) >= state.effective_max_loops():
@@ -7919,7 +8096,7 @@ class BridgeWS(LoopSourceBridge, LoopEnvironmentBridge, LoopControlBridge):
             for i in state.ideas:
                 lines.append(f"  - [{i.status}] {i.prompt}")
         for l in state.loops:
-            sc = f"{l.analysis.score:.0f}" if l.analysis else "?"
+            sc = f"{l.analysis.score:.0f}" if l.analysis and l.analysis.score_observed else "?"
             head = f"Loop #{l.seq} [{l.sub_stage}] 累计分数={sc} 增量焦点={l.goal[:60]}"
             lines.append(head)
             if l.orchestration:
@@ -15279,6 +15456,18 @@ except urllib.error.URLError as e:
 
     # ── 权限门控 RPC ─────────────────────────────────────────────
 
+    def _rpc_workbenchPermissionGet(self, session_id: str) -> str:
+        """只读重载当前计划；不继承 skip/delegation，不解决或延长 gate。"""
+        self._require_session_access(session_id)
+        gate = self._permission_gates.get(session_id)
+        payload = getattr(self, '_permission_payloads', {}).get(session_id)
+        if gate is None or gate.done() or not payload:
+            return json.dumps({'status': 'ok', 'sessionId': session_id, 'pending': None})
+        serialized = json.dumps(payload, ensure_ascii=False)
+        if len(serialized) > 1024 * 1024:
+            return json.dumps({'status': 'error', 'reasonCode': 'permission_plan_too_large'})
+        return json.dumps({'status': 'ok', 'sessionId': session_id, 'pending': payload}, ensure_ascii=False)
+
     def _rpc_grantPermission(self, session_id: str, granted: bool, skip_rest: bool = False, request_id: str = "") -> None:
         """前端响应权限请求：granted=True 继续执行，False 取消。
         skip_rest=True 表示后续工具自动授权（用户点击了"跳过后续确认"）。
@@ -15343,15 +15532,15 @@ except urllib.error.URLError as e:
         if require_request_id:
             self._permission_require_id.add(session_id)
 
+        if not hasattr(self, '_permission_payloads'):
+            self._permission_payloads: dict[str, dict] = {}
+        self._permission_payloads[session_id] = {
+            'sessionId': session_id, 'messageId': message_id, 'allowSkip': allow_skip,
+            'requestId': permission_id, 'tools': [tc.to_dict() for tc in tools],
+        }
         await self._send_for_session(session_id, {
             "event": "permissionRequest",
-            "data": json.dumps({
-                "sessionId": session_id,
-                "messageId": message_id,
-                "allowSkip": allow_skip,
-                "requestId": permission_id,
-                "tools": [tc.to_dict() for tc in tools],
-            }, ensure_ascii=False),
+            "data": json.dumps(self._permission_payloads[session_id], ensure_ascii=False),
         })
         try:
             return await asyncio.wait_for(asyncio.shield(gate), timeout=timeout)
@@ -15364,6 +15553,7 @@ except urllib.error.URLError as e:
                 self._permission_no_skip.discard(session_id)
                 self._permission_require_id.discard(session_id)
                 self._permission_gate_ids.pop(session_id, None)
+                self._permission_payloads.pop(session_id, None)
                 if not allow_skip or require_request_id:
                     await self._send_for_session(session_id, {"event": "permissionRequest", "data": json.dumps({
                         "sessionId": session_id, "messageId": message_id, "requestId": permission_id,

@@ -10,6 +10,7 @@
  */
 
 import type { ChatMessage, ToolCall, ContentBlock } from './useChat';
+import { ScopedStreamStates } from '../utils/scopedStreamStates';
 
 // 流式状态
 export interface StreamState {
@@ -36,21 +37,33 @@ function createEmptyState(): StreamState {
 }
 
 // 全局流式状态存储
-const streamStates = new Map<string, StreamState>();
+const streamStates = new ScopedStreamStates<StreamState>();
+export const configureStreamIdentity = (key: (session: string, executor?: string) => string) => streamStates.configure(key);
+
+export function clearAllStreamStates(): void { streamStates.clear(); }
+export function restoreStreamState(session: string, value: unknown, executor?: string): StreamState {
+  const row = value as StreamState;
+  if (!row || typeof row !== 'object' || Object.keys(row).some(key => !Object.keys(createEmptyState()).includes(key))
+    || !(row.messageId === null || typeof row.messageId === 'string') || typeof row.text !== 'string'
+    || typeof row.thinking !== 'string' || !Array.isArray(row.toolCalls) || !Array.isArray(row.contentBlocks)
+    || typeof row.isStreaming !== 'boolean' || !Number.isFinite(row.streamStart)
+    || JSON.stringify(row).length > 4 * 1024 * 1024) throw new Error('无效的流恢复状态');
+  const restored = structuredClone(row); streamStates.set(session, restored, executor); return restored;
+}
 
 // 获取或创建 session 的流式状态
-export function getStreamState(sessionId: string): StreamState {
-  let state = streamStates.get(sessionId);
+export function getStreamState(sessionId: string, executor?: string): StreamState {
+  let state = streamStates.get(sessionId, executor);
   if (!state) {
     state = createEmptyState();
-    streamStates.set(sessionId, state);
+    streamStates.set(sessionId, state, executor);
   }
   return state;
 }
 
 // 清除 session 的流式状态
-export function clearStreamState(sessionId: string): void {
-  streamStates.delete(sessionId);
+export function clearStreamState(sessionId: string, executor?: string): void {
+  streamStates.delete(sessionId, executor);
 }
 
 /**
@@ -73,7 +86,7 @@ export function installGlobalStreamRouter(
   if (_routerInstalled) return;
   _routerInstalled = true;
   api.onStreamDelta((delta: any) => {
-    if (delta && typeof delta.sessionId === 'string' && delta.sessionId) {
+    if (delta && delta.type !== 'workbench_snapshot' && typeof delta.sessionId === 'string' && delta.sessionId) {
       processStreamDelta(delta.sessionId, delta);
     }
   });
@@ -116,7 +129,7 @@ export function processStreamDelta(sessionId: string, delta: any): {
   messagesUpdated: boolean;
   state: StreamState;
 } {
-  const state = getStreamState(sessionId);
+  const state = getStreamState(sessionId, delta.executor);
   const mid = delta.messageId;
 
   // 如果是新消息，初始化状态

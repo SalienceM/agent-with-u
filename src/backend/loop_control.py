@@ -16,6 +16,7 @@ REASONS: dict[str, tuple[str, str]] = {
     "unavailable": ("找不到 LOOP 会话。", "check"),
     "handoff_busy": ("控制权正在转交，结果待确认。", "check"),
     "active_call": ("旧调用或环境检查尚未退出，暂不能转交。", "environment"),
+    "engineering_activity": ("文件保存、终端或写入型语言服务尚未确认结束。", "workbench"),
     "idea_unsealed": ("请先封口 loopidea，再开启人工轮。", "ideas"),
     "loop_running": ("LOOP 正在运行，请等待当前轮结束后接管。", "loop"),
     "loop_resumable": ("存在未完成的 LOOP，请先继续完成或处理断点。", "loop"),
@@ -44,6 +45,7 @@ class ControlFacts:
     running: bool = False
     resumable: bool = False
     active_call: bool = False
+    engineering_activity: bool = False
     chat_running: bool = False
     manual_has_messages: bool = False
     sequence_pending: bool = False
@@ -62,6 +64,8 @@ def eligibility(action: str, facts: ControlFacts) -> dict:
         reason = "handoff_busy"
     elif facts.active_call:
         reason = "active_call"
+    elif facts.engineering_activity:
+        reason = "engineering_activity"
     elif action == "takeover" and facts.mode != "manual":
         if facts.stage not in ("loopexecute", "loopout"):
             reason = "idea_unsealed"

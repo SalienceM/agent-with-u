@@ -21,6 +21,7 @@ from typing import Optional
 
 from ..types import (
     Session, ChatMessage, ImageAttachment, TextAttachment, ThinkingBlock, ToolCallInfo,
+    normalize_session_view_mode,
 )
 from . import paths
 
@@ -341,6 +342,7 @@ class SessionStore:
                 constraints=data.get("constraints"),
                 abilities=data.get("abilities"),
                 session_type=data.get("sessionType", "normal"),
+                view_mode=normalize_session_view_mode(meta.get("viewMode", data.get("viewMode"))),
                 loop_control_mode=(
                     "manual" if data.get("loopControlMode") == "manual"
                     else "loop" if data.get("loopControlMode") == "loop"

@@ -41,6 +41,7 @@ from .loop_decisions import (CALL_RESULTS, TASK_RESULTS, TERMINALS, bounded_obje
 from .loop_task_source import validate_source
 from .loop_milestones import validate_plan
 from .loop_execution_environment import normalize_environment, normalize_history
+from .loop_task_blockers import persisted as task_contract, stored_ids, mapping_valid
 
 
 # ── 阶段常量 ──────────────────────────────────────────────────────
@@ -76,6 +77,11 @@ class LoopStep:
     recovery_notes: list[str] = field(default_factory=list)
     call_result: str = "unknown"
     task_result: str = "unknown"
+    task_ids: list[str] = field(default_factory=list)
+    depends_on: list[str] = field(default_factory=list)
+    precondition_ids: list[str] = field(default_factory=list)
+    test_writes_user_data: bool = False
+    task_mapping_valid: bool = True
 
     def to_dict(self) -> dict:
         return {"index": self.index, "mode": self.mode, "desc": self.desc, "access": self.access,
@@ -83,7 +89,11 @@ class LoopStep:
                 "startedAt": self.started_at, "endedAt": self.ended_at,
                 "attempts": self.attempts, "recoveryNotes": list(self.recovery_notes),
                 "callResult": enum_value(self.call_result, CALL_RESULTS),
-                "taskResult": enum_value(self.task_result, TASK_RESULTS)}
+                "taskResult": enum_value(self.task_result, TASK_RESULTS),
+                "taskIds": stored_ids(self.task_ids), "dependsOn": stored_ids(self.depends_on),
+                "preconditionIds": stored_ids(self.precondition_ids), "testWritesUserData": self.test_writes_user_data is True,
+                "taskMappingValid": self.task_mapping_valid and mapping_valid({'taskIds': self.task_ids,
+                    'dependsOn': self.depends_on, 'preconditionIds': self.precondition_ids, 'testWritesUserData': self.test_writes_user_data})}
 
     @classmethod
     def from_dict(cls, d: dict) -> "LoopStep":
@@ -100,6 +110,9 @@ class LoopStep:
             recovery_notes=[str(v) for v in (d.get("recoveryNotes") or []) if str(v).strip()],
             call_result=enum_value(d.get("callResult"), CALL_RESULTS),
             task_result=enum_value(d.get("taskResult"), TASK_RESULTS),
+            task_ids=stored_ids(d.get('taskIds', [])), depends_on=stored_ids(d.get('dependsOn', [])),
+            precondition_ids=stored_ids(d.get('preconditionIds', [])), test_writes_user_data=d.get('testWritesUserData', False) is True,
+            task_mapping_valid=mapping_valid(d),
         )
 
 
@@ -116,6 +129,7 @@ class LoopAnalysis:
     next_focus: str = ""                # 下一批就绪任务/候选路径与取舍
     deliverable: bool = False           # score >= 70
     outputtable: bool = False           # score >= 85
+    score_observed: bool = True         # 只读阻塞复核不产生完成度评分；旧记录保留原语义
 
     def to_dict(self) -> dict:
         return {
@@ -129,6 +143,7 @@ class LoopAnalysis:
             "nextFocus": self.next_focus,
             "deliverable": self.deliverable,
             "outputtable": self.outputtable,
+            "scoreObserved": self.score_observed,
         }
 
     @classmethod
@@ -144,6 +159,7 @@ class LoopAnalysis:
             next_focus=d.get("nextFocus", d.get("next_focus", "")),
             deliverable=bool(d.get("deliverable", False)),
             outputtable=bool(d.get("outputtable", False)),
+            score_observed=d.get("scoreObserved", True) is not False,
         )
 
 
@@ -180,6 +196,10 @@ class LoopRecord:
     decision_dispatched: str = ""
     source_snapshots: dict = field(default_factory=dict)
     milestone_plan: dict = field(default_factory=dict)
+    task_plan: dict = field(default_factory=dict)
+    blocker_review: dict = field(default_factory=dict)
+    task_blockers: dict = field(default_factory=dict)
+    isolation_evidence: dict = field(default_factory=dict)
     # 各子阶段的开始时间戳（{prepare/execute/analysis/done: ts}），用于流程视图耗时
     sub_started: dict = field(default_factory=dict)
     # ★ 本次 loop 各阶段实际使用的 backend id（{prepare, execute, analysis}）。
@@ -244,6 +264,11 @@ class LoopRecord:
             "decisionDispatched": self.decision_dispatched,
             "sourceSnapshots": bounded_object(self.source_snapshots, 2_097_152),
             "milestonePlan": validate_plan(self.milestone_plan),
+            "taskPlan": task_contract(self.task_plan),
+            "blockerReview": task_contract(self.blocker_review),
+            "blockerSummary": {key: self.blocker_review.get(key) for key in ('status', 'readyIds', 'affectedIds', 'valid')},
+            "taskBlockers": task_contract(self.task_blockers),
+            "isolationEvidence": task_contract(self.isolation_evidence),
             "subStarted": self.sub_started,
             "backends": dict(self.backends or {}),
             "runtimes": {k: dict(v) for k, v in (self.runtimes or {}).items()
@@ -292,6 +317,10 @@ class LoopRecord:
             decision_dispatched=str(d.get("decisionDispatched") or "")[:80],
             source_snapshots=bounded_object(d.get("sourceSnapshots"), 2_097_152),
             milestone_plan=validate_plan(d.get("milestonePlan")),
+            task_plan=task_contract(d.get('taskPlan')),
+            blocker_review=task_contract(d.get('blockerReview')),
+            task_blockers=task_contract(d.get('taskBlockers')),
+            isolation_evidence=task_contract(d.get('isolationEvidence')),
             sub_started=dict(d.get("subStarted") or {}),
             backends=dict(d.get("backends") or {}),
             runtimes={k: dict(v) for k, v in (d.get("runtimes") or {}).items()
@@ -695,6 +724,8 @@ class LoopState:
     progress_guard: dict = field(default_factory=dict)    # 可见的停滞/阻塞诊断，不冒充验收
     task_source: dict = field(default_factory=dict)       # 显式绑定，不从历史正文推断
     execution_environment: dict = field(default_factory=dict)
+    unresolved_blockers: dict = field(default_factory=dict)
+    blocked_task_scope: dict = field(default_factory=dict)
     created_at: float = field(default_factory=_now)
     updated_at: float = field(default_factory=_now)
 
@@ -740,11 +771,11 @@ class LoopState:
         return [l for l in self.loops if l.round == self.round]
 
     def best_score(self) -> float:
-        scores = [l.analysis.score for l in self.round_loops() if l.analysis]
+        scores = [l.analysis.score for l in self.round_loops() if l.analysis and l.analysis.score_observed]
         return max(scores) if scores else 0.0
 
     def latest_score(self) -> float:
-        done = [l for l in self.round_loops() if l.analysis]
+        done = [l for l in self.round_loops() if l.analysis and l.analysis.score_observed]
         return done[-1].analysis.score if done else 0.0
 
     def effective_max_loops(self) -> int:
@@ -781,6 +812,8 @@ class LoopState:
             "progressGuard": copy.deepcopy(self.progress_guard),
             "taskSource": validate_source(self.task_source),
             "executionEnvironment": normalize_environment(self.execution_environment),
+            "unresolvedBlockers": task_contract(self.unresolved_blockers),
+            "blockedTaskScope": task_contract(self.blocked_task_scope),
             "bestScore": self.best_score(),
             "latestScore": self.latest_score(),
             "createdAt": self.created_at,
@@ -820,6 +853,8 @@ class LoopState:
             progress_guard=copy.deepcopy(d.get("progressGuard") or {}),
             task_source=validate_source(d.get("taskSource")),
             execution_environment=normalize_environment(d.get("executionEnvironment")),
+            unresolved_blockers=task_contract(d.get('unresolvedBlockers')),
+            blocked_task_scope=task_contract(d.get('blockedTaskScope')),
             created_at=d.get("createdAt", _now()),
             updated_at=d.get("updatedAt", _now()),
         )

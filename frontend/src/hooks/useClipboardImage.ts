@@ -48,6 +48,8 @@ export function useClipboardImage(scopeRef?: RefObject<HTMLElement | null>) {
   }, []);
 
   const clearImages = useCallback(() => setImages([]), []);
+  // 窗口交接恢复已有附件，不重复写入素材池或读取系统剪贴板。
+  const restoreImages = useCallback((value: ImageAttachment[]) => setImages(value.map(image => ({ ...image }))), []);
 
   useEffect(() => {
     const handler = async (e: ClipboardEvent) => {
@@ -130,5 +132,5 @@ export function useClipboardImage(scopeRef?: RefObject<HTMLElement | null>) {
     return () => document.removeEventListener('paste', handler);
   }, [readFromClipboard, addImage, scopeRef]);
 
-  return { images, removeImage, clearImages, readFromClipboard, addImage };
+  return { images, removeImage, clearImages, readFromClipboard, addImage, restoreImages };
 }

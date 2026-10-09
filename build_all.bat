@@ -18,12 +18,8 @@ for /f "tokens=*" %%V in ('python --version 2^>^&1') do echo [OK] %%V
 ::  pip dependencies
 echo.
 echo [CHECK] Python dependencies...
-python -c "import websockets, PIL, httpx, edge_tts; from dashscope.audio.tts_v2 import SpeechSynthesizer; from importlib.metadata import version; assert tuple(int(x) for x in version('dashscope').split('.')[:3]) >= (1,26,3)" >nul 2>&1
-if not errorlevel 1 goto deps_ok
-echo [INSTALL] Installing Python deps (Tsinghua mirror)...
-python -m pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple --trusted-host pypi.tuna.tsinghua.edu.cn
-if errorlevel 1 ( echo [ERROR] pip install failed & pause & exit /b 1 )
-:deps_ok
+python scripts\prepare_backend_build.py
+if errorlevel 1 ( echo [ERROR] Backend dependencies failed & exit /b 1 )
 echo [OK] Python deps ready
 ::  PyInstaller
 echo.
@@ -102,8 +98,10 @@ echo [CLEAN] Removing old dist folder...
 rmdir /s /q "dist" 2>nul
 echo [CLEAN] Removing old build folder...
 rmdir /s /q "build" 2>nul
-python -m PyInstaller --name "agent-with-u-backend" --onefile --console --hidden-import websockets --hidden-import PIL --hidden-import claude_agent_sdk --hidden-import certifi --collect-data certifi --collect-all pydantic_core --hidden-import pydantic --hidden-import mcp --hidden-import dashscope --collect-all dashscope --collect-all edge_tts --noconfirm ws_main_entry.py
+python scripts\build_backend_package.py
 if errorlevel 1 ( echo [FAILED] PyInstaller build failed & pause & exit /b 1 )
+python scripts\check_backend_package.py dist\agent-with-u-backend.exe
+if errorlevel 1 ( echo [FAILED] Backend readiness failed & exit /b 1 )
 :: ============================================================
 :: Step 2: Copy sidecar to src-tauri/binaries/
 :: ============================================================
@@ -151,8 +149,14 @@ echo [CLEAN] Removing old target/release build...
 del /q "src-tauri\target\release\agent-with-u.exe" 2>nul
 del /q "src-tauri\target\release\agent-with-u-backend.exe" 2>nul
 if defined LOCAL_PROXY ( set "HTTPS_PROXY=%LOCAL_PROXY%" & echo [Proxy] %LOCAL_PROXY% )
+python scripts\check_backend_package.py "src-tauri\binaries\agent-with-u-backend-%TARGET_TRIPLE%.exe"
+if errorlevel 1 ( echo [FAILED] Bundled backend readiness failed & exit /b 1 )
+python scripts\check_backend_package.py "src-tauri\binaries\agent-with-u-backend-%TARGET_TRIPLE%.exe" --confirm
+if errorlevel 1 exit /b 1
 call npm run build
 if errorlevel 1 ( echo [FAILED] Tauri build failed & pause & exit /b 1 )
+python scripts\check_backend_package.py "src-tauri\binaries\agent-with-u-backend-%TARGET_TRIPLE%.exe" --confirm
+if errorlevel 1 exit /b 1
 :: When Docker Desktop is available, produce the Linux Docker image bundle in
 :: the same version group.  Set AGENT_WITH_U_SKIP_DOCKER_RELEASE=1 to skip it.
 if "%AGENT_WITH_U_SKIP_DOCKER_RELEASE%"=="1" goto docker_release_done

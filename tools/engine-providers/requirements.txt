@@ -1,0 +1,3 @@
+# Explicit development preparation only. Never installed by the application.
+ruff==0.11.13
+pywinpty==2.0.15; sys_platform == "win32"

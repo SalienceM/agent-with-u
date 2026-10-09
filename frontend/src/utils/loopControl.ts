@@ -1,4 +1,9 @@
+import type { WorkspaceIdentity } from './sessionWorkbench';
 export type ControlAction = 'takeover' | 'release';
+export interface EngineeringActivity {
+  activityId: string; kind: 'document-save' | 'terminal' | 'language-write'; workspace: WorkspaceIdentity;
+  status: string; resourceId: string; generation: string; relativePath: string;
+}
 export interface ControlTarget { user: string; executor: string; session: string }
 export interface ControlEligibility { allowed: boolean; reasonCode: string; message: string; nextStep: string }
 export interface ControlOperation {
@@ -12,6 +17,7 @@ export interface ControlSummary {
   eligibility: Record<ControlAction, ControlEligibility>; operation?: ControlOperation;
   currentOperation?: ControlOperation;
   status?: string; message?: string;
+  engineeringActivities?: EngineeringActivity[];
 }
 export type ControlPhase = 'idle' | 'sending' | 'running' | 'reconciling' | 'view-loading'
   | 'succeeded' | 'blocked' | 'failed' | 'view-error';
@@ -94,15 +100,17 @@ export class LoopControlStore {
     if (existing) return existing;
     const start = this.get(target);
     this.set(target, { ...start, checking: true });
-    const read = Promise.resolve().then(() => this.io.get(target, this.get(target).requestId || '')).then(result => {
+    const read = Promise.resolve().then(() => this.io.get(target, start.requestId || '')).then(result => {
       this.receive(target, result);
     }).catch(error => {
       const current = this.get(target);
+      // 只读核对可能晚于 committed 推送/视图水合；旧查询失败不能降级较新的请求或阶段。
+      if (current.requestId !== start.requestId || current.phase !== start.phase || current.summary !== start.summary) return;
       const message = error instanceof Error ? error.message : '执行节点不可达，结果待确认';
       const unavailable = { allowed: false, reasonCode: 'offline', message, nextStep: 'check' };
       this.set(target, { ...current, checking: false,
         summary: current.summary ? { ...current.summary, eligibility: { takeover: unavailable, release: unavailable } } : undefined,
-        phase: current.requestId && !['succeeded', 'view-error'].includes(current.phase) ? 'reconciling' : current.phase,
+        phase: current.requestId && !['view-loading', 'succeeded', 'view-error'].includes(current.phase) ? 'reconciling' : current.phase,
         error: message });
     }).finally(() => {
       this.reads.delete(key);

@@ -1,5 +1,6 @@
 import React, { useState, useCallback, useEffect, useLayoutEffect, useRef, useMemo } from 'react';
-import { api } from '../api';
+import { api, getCurrentUserProfile } from '../api';
+import { handoffParticipants, handoffScope } from '../utils/workbenchHandoffState';
 import { backendCatalog } from '../backendCatalog';
 import { mergeSessionRouting, isSessionMetaReady } from '../utils/sessionRouting';
 import type { CurrentUserProfile, FollowUpCapabilities } from '../api';
@@ -149,6 +150,8 @@ export interface ChatPaneProps {
     sessionId: string;
     workingDir: string;
     relativePath: string;
+    line?: number;
+    column?: number;
   }) => void;
 }
 
@@ -326,11 +329,11 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
     sessionMetaReady && activeSession?.sessionType === 'loop' && isVisible);
   const [loopViewRetry, setLoopViewRetry] = useState(0);
 
-  const handleFocusLinkedFile = useCallback((relativePath: string) => {
+  const handleFocusLinkedFile = useCallback((relativePath: string, line?: number, column?: number) => {
     const workingDir = activeSession?.workingDir;
     if (!sessionId || activeSession?.id !== sessionId || !workingDir) return;
     onFocusRef.current();
-    onRequestFileFocusRef.current?.({ sessionId, workingDir, relativePath });
+    onRequestFileFocusRef.current?.({ sessionId, workingDir, relativePath, line, column });
   }, [sessionId, activeSession?.id, activeSession?.workingDir]);
 
   const handleSessionRuntimeChange = useCallback(async (runtime: ModelRuntime) => {
@@ -805,6 +808,25 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
     if (container) container.scrollTop = container.scrollHeight;
     else endRef.current?.scrollIntoView({ behavior: 'auto', block: 'end' });
   }, []);
+
+  const scrollTransferRef = useRef({ export: () => ({} as unknown), import: (_value: unknown) => {} });
+  scrollTransferRef.current = {
+    export: () => ({ top: scrollContainerRef.current?.scrollTop || 0, left: scrollContainerRef.current?.scrollLeft || 0, follow: autoScrollRef.current }),
+    import: value => {
+      const row = value as any;
+      if (!row || ![row.top, row.left].every(n => typeof n === 'number' && Number.isFinite(n) && n >= 0) || typeof row.follow !== 'boolean') throw new Error('聊天滚动状态无效');
+      autoScrollRef.current = row.follow; setShowScrollBtn(!row.follow);
+      if (scrollContainerRef.current) { scrollContainerRef.current.scrollTop = row.top; scrollContainerRef.current.scrollLeft = row.left; }
+    },
+  };
+  useEffect(() => {
+    if (!sessionId || !sessionMetaReady || !activeSession?.workingDir || !activeSession?.execKey || (!automatedLoop && chat.hydratedSessionId !== sessionId)) return;
+    const owner = getCurrentUserProfile().userId;
+    return handoffParticipants.register(handoffScope(owner, activeSession.execKey, sessionId, activeSession.workingDir), 'chatScroll', {
+      export: () => { if (getCurrentUserProfile().userId !== owner) throw new Error('聊天身份已变化'); return scrollTransferRef.current.export(); },
+      import: value => { if (getCurrentUserProfile().userId !== owner) throw new Error('聊天身份已变化'); scrollTransferRef.current.import(value); },
+    });
+  }, [sessionId, sessionMetaReady, activeSession?.workingDir, activeSession?.execKey, chat.hydratedSessionId, automatedLoop]);
 
   // 空 pane 占位
   if (!sessionId) {

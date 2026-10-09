@@ -3,6 +3,8 @@ setlocal
 chcp 65001 >nul
 cd /d "%~dp0"
 
+python scripts\prepare_backend_build.py
+if errorlevel 1 exit /b 1
 echo [Web] Building frontend...
 pushd frontend
 call npm run build
@@ -17,9 +19,16 @@ if errorlevel 1 (
 )
 python -m PyInstaller --noconfirm --clean agent-with-u-web.spec
 if errorlevel 1 exit /b 1
+python scripts\check_backend_package.py dist\agent-with-u-web.exe --web
+if errorlevel 1 exit /b 1
 
 if not exist "dist\web-windows-x64" mkdir "dist\web-windows-x64"
 copy /y "dist\agent-with-u-web.exe" "dist\web-windows-x64\agent-with-u-web.exe" >nul
+if errorlevel 1 exit /b 1
+python scripts\check_backend_package.py dist\web-windows-x64\agent-with-u-web.exe --web
+if errorlevel 1 exit /b 1
+python scripts\check_backend_package.py dist\web-windows-x64\agent-with-u-web.exe --confirm
+if errorlevel 1 exit /b 1
 copy /y "deploy\run-web.bat" "dist\web-windows-x64\run-web.bat" >nul
 echo.
 echo [OK] Portable web package: dist\web-windows-x64\

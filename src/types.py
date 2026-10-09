@@ -4,7 +4,7 @@ Shared type definitions and IPC protocol.
 
 from dataclasses import dataclass, field, asdict
 from enum import Enum
-from typing import Optional, Any
+from typing import Optional, Any, Literal
 import json
 import time
 import uuid
@@ -215,6 +215,14 @@ class ChatMessage:
         return d
 
 
+SessionViewMode = Literal["chat", "engine"]
+
+
+def normalize_session_view_mode(value: object) -> SessionViewMode:
+    """展示模式独立于执行类型；旧数据或未知枚举安全保持 Chat。"""
+    return "engine" if value == "engine" else "chat"
+
+
 @dataclass
 class Session:
     id: str
@@ -282,6 +290,8 @@ class Session:
     # 会话级 Token 台账：累计值、最近趋势和上下文变化。单轮 usage 仍保留在消息上；
     # 这里保证分页、手动压缩及无聊天气泡的 LOOP 不会丢失总体统计。
     token_usage: dict = field(default_factory=dict)
+    # 仅影响展示，不转换普通/LOOP 类型，也不更改执行或控制权。
+    view_mode: SessionViewMode = "chat"
 
     def to_dict(self, message_limit: int = 0) -> dict:
         """序列化 Session；message_limit>0 时只触碰最后 N 条消息。
@@ -316,6 +326,7 @@ class Session:
             "constraints": self.constraints,
             "abilities": self.abilities,
             "sessionType": self.session_type,
+            "viewMode": normalize_session_view_mode(self.view_mode),
             "loopControlMode": self.loop_control_mode,
             "pinned": self.pinned,
             "sidebarColor": self.sidebar_color,
@@ -346,6 +357,7 @@ class Session:
             "agentSessionId": self.agent_session_id,
             "abilities": self.abilities,
             "sessionType": self.session_type,
+            "viewMode": normalize_session_view_mode(self.view_mode),
             "loopControlMode": self.loop_control_mode,
             "pinned": self.pinned,
             "sidebarColor": self.sidebar_color,

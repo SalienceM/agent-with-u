@@ -3,6 +3,7 @@ import type { CallDiagnostic } from '../../src/utils/loopDiagnostics';
 import type { DeliveryReport, ProgressGuard } from '../../src/components/LoopDeliveryStatus';
 import type { LoopDecision, LoopSourceSummary } from '../../src/types/loopContinuation';
 import type { ExecutionEnvironment, EnvironmentCheck } from '../../src/types/loopEnvironment';
+import type { TaskBlockerDetails } from '../../src/utils/loopTaskBlockers';
 
 function recordFixture() {
   const now = Date.now() / 1000;
@@ -11,6 +12,10 @@ function recordFixture() {
     createdAt: now - 60, updatedAt: now - 10, subStarted: { prepare: now - 60, execute: now - 50 }, analysis: null,
     callDiagnostics: [] as CallDiagnostic[],
     environmentChecks: [] as EnvironmentCheck[],
+    blockerSummary: {} as TaskBlockerDetails['blockerSummary'],
+    blockerReview: {} as TaskBlockerDetails['blockerReview'],
+    taskBlockers: {} as TaskBlockerDetails['taskBlockers'],
+    taskPlan: {} as TaskBlockerDetails['taskPlan'],
     delivery: {} as DeliveryReport,
     outcomeVersion: 0, terminalKind: '', decision: {} as LoopDecision, callResults: {} as Record<string, string>, taskResult: 'unknown',
     orchestration: [
@@ -44,6 +49,7 @@ async function fixture(page: Page, progressGuard: ProgressGuard = {}, options: {
   const state = () => ({ sessionId, stage: 'loopexecute', goal: '阶段审计回归', goalHistory: [], ideas: [],
     progressGuard, taskSource: source, executionEnvironment: environment, handoff: { available: true, source: 'conversion' },
     loops: (older ? [older, record] : [record]).map(item => ({ ...item, detailLoaded: false, result: '', delivery: {},
+      blockerReview: {}, taskBlockers: {}, taskPlan: {},
       callDiagnostics: item.callDiagnostics.slice(-1),
       orchestration: item.orchestration.map(step => ({ ...step, output: '', hasOutput: !!step.output })),
       stageDetails: Object.fromEntries(Object.entries(item.stageDetails).map(([key, value]) => [key,
@@ -489,4 +495,64 @@ test('a late source discovery belongs only to its original session', async ({ pa
   await expect(current.getByLabel('选择 OpenSpec change')).toHaveCount(0);
   expect(data.sourceReads()).toBe(1);
   expect(data.executionCalls()).toBe(0);
+});
+
+function seedTaskBlocker(record: ReturnType<typeof recordFixture>) {
+  record.outcomeVersion = 1;
+  record.taskResult = 'blocked';
+  record.callResults = { execute: 'normal', analysis: 'normal' };
+  record.blockerSummary = { status: 'done', valid: true, affectedIds: ['T', 'D'], readyIds: ['U'] };
+  record.blockerReview = { ...record.blockerSummary, evidenceRefs: ['独立性核对证据'] };
+  record.taskBlockers = { valid: true, items: [{ id: 'baseline', affectedTaskIds: ['T'], reasonCode: 'check_unavailable',
+    reason: '真实基线读取拒绝；Godot 未启动；0 个用例和截图', evidenceRefs: ['step1:exit23'],
+    resolution: '明确基线验收保留，等待合法读取条件或适用的新证据' }] };
+  record.taskPlan = { valid: true, sourceKind: 'model_plan', tasks: [
+    { id: 'T', dependsOn: [] }, { id: 'D', dependsOn: ['T'] }, { id: 'U', dependsOn: [] }] };
+  record.decision = { action: 'replan', reasonCode: 'independent_work', decisionId: 'local-blocker',
+    reasonText: '部分任务受阻，已只读复核独立就绪工作；受阻验收保持未完成。', nextStep: '下一轮重新规划：U' };
+}
+
+test('task blockers use lazy compact details consistently in panel and flow without execution', async ({ page }, info) => {
+  const data = await fixture(page, {}, { running: false });
+  data.seed(seedTaskBlocker);
+  const pane = await openFlow(page);
+  await expect(pane.getByTestId('loop-decision').first()).toContainText('有独立就绪工作');
+  expect(data.reads()).toBe(0);
+  await pane.getByRole('button', { name: '查看 Execute 阶段', exact: true }).click();
+  const detail = pane.getByTestId('loop-task-blockers');
+  await expect(detail).toHaveCount(1);
+  await detail.locator('summary').click();
+  await expect(detail).toContainText('冻结任务（含依赖）：T、D');
+  await expect(detail).toContainText('独立就绪：U');
+  await expect(detail).toContainText('Godot 未启动');
+  await expect(detail).toContainText('明确基线验收保留');
+  await expect(detail).toContainText('模型观察（非 OS 证明）');
+  expect(data.reads()).toBe(1);
+  for (let i = 0; i < 4; i++) data.update(() => {});
+  await expect(detail).toContainText('明确基线验收保留');
+  expect(data.reads()).toBe(1);
+  await detail.scrollIntoViewIfNeeded();
+  const bounds = await detail.boundingBox();
+  expect(bounds!.width).toBeLessThanOrEqual(page.viewportSize()!.width);
+  await page.screenshot({ path: info.outputPath('task-blocker-details.png') });
+  await pane.getByRole('button', { name: '🗂 面板', exact: true }).click();
+  await expect(pane.getByTestId('loop-decision').first()).toContainText('有独立就绪工作');
+  expect(data.executionCalls()).toBe(0);
+  expect(data.environmentChecks()).toBe(0);
+});
+
+test('task blocker late detail cannot enter a different session and unknown never means ready', async ({ page }) => {
+  const data = await fixture(page, {}, { running: false });
+  data.seed(record => { seedTaskBlocker(record); record.blockerSummary = { status: 'unknown' }; });
+  const pane = await openFlow(page);
+  await expect(pane.getByTestId('loop-decision').first()).toContainText('未放行后续工作');
+  data.setHold(true);
+  await pane.getByRole('button', { name: '查看 Execute 阶段', exact: true }).click();
+  await expect.poll(data.reads).toBe(1);
+  if (!await page.locator('.awu-sidebar').isVisible()) await page.getByRole('button', { name: '打开会话列表', exact: true }).click();
+  await page.locator('.awu-sidebar').getByText('首页交付 Loop 2', { exact: true }).click();
+  data.setHold(false); data.release();
+  await expect(page.locator('[data-session-tab-panel]:visible')).not.toContainText('Godot 未启动');
+  expect(data.executionCalls()).toBe(0);
+  expect(data.reads()).toBe(1);
 });
