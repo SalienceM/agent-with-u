@@ -392,9 +392,9 @@ type TtsStreamAudioCallback = (data: TtsStreamAudioEvent) => void;
 let ttsStreamAudioCallbacks: TtsStreamAudioCallback[] = [];
 
 // ── 可视化 Loop 集成 ──────────────────────────────────────────
-type LoopUpdatedCallback = (state: any) => void;
+type LoopUpdatedCallback = (state: any, executor: string) => void;
 let loopUpdatedCallbacks: LoopUpdatedCallback[] = [];
-type LoopProgressCallback = (data: { sessionId: string; seq: number; subStage: string; text: string; diagnostic?: import('./utils/loopDiagnostics').CallDiagnostic }) => void;
+type LoopProgressCallback = (data: { sessionId: string; seq: number; subStage: string; text: string; diagnostic?: import('./utils/loopDiagnostics').CallDiagnostic }, executor: string) => void;
 let loopProgressCallbacks: LoopProgressCallback[] = [];
 type LoopAsideDeltaCallback = (data: { sessionId: string; turnId: string; text: string }) => void;
 let loopAsideDeltaCallbacks: LoopAsideDeltaCallback[] = [];
@@ -1007,10 +1007,11 @@ function handleMessage(e: MessageEvent, source?: Conn) {
           controlRevision: data.controlRevision,
         });
       }
-      loopUpdatedCallbacks.forEach((cb) => cb(data));
+      loopUpdatedCallbacks.forEach((cb) => cb(data, source?.key || 'local'));
     } else if (msg.event === 'loopProgress') {
       const data = JSON.parse(msg.data);
-      loopProgressCallbacks.forEach((cb) => cb(data));
+      if (source && sessionExec.get(data.sessionId) !== source.key) return;
+      loopProgressCallbacks.forEach((cb) => cb(data, source?.key || 'local'));
     } else if (msg.event === 'loopAsideDelta') {
       const data = JSON.parse(msg.data);
       loopAsideDeltaCallbacks.forEach((cb) => cb(data));
@@ -2949,18 +2950,18 @@ export const api = {
     executor: string, change = '', discoveryId = '', disposition = ''): Promise<LoopSourceResponse> {
     return JSON.parse(await call('loopTaskSourceSet', sessionId, action, revision, executor, change, discoveryId, disposition));
   },
-  async loopGetState(sessionId: string): Promise<any | null> {
-    const result = await call('loopGetState', sessionId, true);
+  async loopGetState(sessionId: string, execKey?: string): Promise<any | null> {
+    const result = execKey ? await callOnStrict(execKey, 'loopGetState', [sessionId, true]) : await call('loopGetState', sessionId, true);
     try { return JSON.parse(result); } catch { return null; }
   },
 
-  async loopGetRecord(sessionId: string, seq: number): Promise<{
+  async loopGetRecord(sessionId: string, seq: number, execKey?: string): Promise<{
     status: string;
     record?: any;
     progress?: Record<string, string>;
     message?: string;
   }> {
-    const result = await call('loopGetRecord', sessionId, seq);
+    const result = execKey ? await callOnStrict(execKey, 'loopGetRecord', [sessionId, seq]) : await call('loopGetRecord', sessionId, seq);
     try { return JSON.parse(result); } catch { return { status: 'error', message: 'Loop 详情解析失败' }; }
   },
 

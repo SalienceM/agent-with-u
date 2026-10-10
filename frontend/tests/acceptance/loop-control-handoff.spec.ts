@@ -97,6 +97,7 @@ async function fixture(page: Page, mode: 'loop' | 'manual' = 'loop', legacy = fa
   if (await opener.isVisible()) await opener.click();
   await page.locator('.awu-sidebar').getByText(title, { exact: true }).click();
   const pane = page.locator(`[data-session-tab-panel="${sid}"]`);
+  if (mode === 'loop') await pane.getByText('更多操作', { exact: true }).click();
   const expectSuccess = async (controlMode: 'manual' | 'loop') => {
     await expect.poll(() => page.evaluate(async sessionId => {
       // @ts-ignore Read the actual shared state without issuing RPCs.
@@ -143,6 +144,9 @@ test('idle terminal blocks release, locates Engine, and unknown stop stays prote
   await feedback.getByRole('button', { name: '定位工程活动' }).click();
   await expect(f.pane.locator('[data-view-mode="engine"]')).toBeVisible();
   await expect(f.pane.getByRole('region', { name: 'Engine 终端区域' })).toBeVisible();
+  // 窄屏工程区一次只展示一个区域；定位终端后显式返回 LOOP 查看共享保护状态。
+  const conversation = f.pane.getByRole('button', { name: '对话 / LOOP', exact: true });
+  if (await conversation.isVisible()) await conversation.click();
   await feedback.getByRole('button', { name: '停止此活动及所属进程' }).click();
   await expect(feedback).toContainText('退出未确认');
   expect(f.writes).toHaveLength(0); expect(f.reads.filter(r => r === 'terminalStop')).toHaveLength(1);
@@ -187,7 +191,7 @@ test('takeover immediately reports pending, slow snapshot and push-before-respon
   expect(await page.evaluate(() => performance.now() - (window as any).handoffConfirmedAt)).toBeLessThan(200);
   await expect(button).toBeDisabled();
   await button.evaluate(element => { (element as HTMLButtonElement).click(); (element as HTMLButtonElement).click(); });
-  expect(f.writes).toHaveLength(1);
+  await expect.poll(() => f.writes.length).toBe(1);
   f.push();
   await expect(status).toContainText('正在保存工作区快照');
   await expect(status).toContainText('耗时较长', { timeout: 7000 });
@@ -320,6 +324,7 @@ test('consecutive takeover release and takeover keep each new request busy until
   f.complete();
   await f.expectSuccess('loop');
   const takeover = f.pane.getByRole('button', { name: '✋ 人工接管', exact: true });
+  await f.pane.getByText('更多操作', { exact: true }).click();
   await takeover.click();
   await expect.poll(() => f.writes.length).toBe(3);
   await page.waitForTimeout(250);
@@ -367,10 +372,10 @@ test('committed takeover with failed view retries reads only', async ({ page }) 
   expect(f.writes).toHaveLength(1);
 });
 
-test('disabled reasons are visible without hover in panel and flow', async ({ page }) => {
+test('disabled reasons are visible in workbench secondary actions', async ({ page }) => {
   const f = await fixture(page);
   await expect(f.pane.getByRole('button', { name: '✋ 人工接管', exact: true })).toBeEnabled();
-  for (const view of ['🔀 流程', '🗂 面板']) {
+  for (const view of ['任务设置', '任务设置']) {
     await f.pane.getByRole('button', { name: view, exact: true }).click();
     for (const message of ['LOOP 正在运行，请等待当前轮结束', '存在未完成的 LOOP，请先处理断点', '旧调用或环境检查尚未退出']) {
       f.block(message);
@@ -417,7 +422,7 @@ test('loopout manual entry preserves edited goal and waits for ownership', async
   const f = await fixture(page);
   await expect(f.pane.getByRole('button', { name: '✋ 人工接管', exact: true })).toBeEnabled();
   f.loopout();
-  await f.pane.getByTitle('点击修改新一轮目标').click();
+
   await f.pane.getByPlaceholder('新一轮目标（支持 @ 文件/SESSION；默认沿用上一轮，可修改或追加）').fill('QA 新人工轮目标');
   await f.pane.getByRole('button', { name: /开启人工轮（第/ }).click();
   await expect.poll(() => f.writes.length).toBe(1);

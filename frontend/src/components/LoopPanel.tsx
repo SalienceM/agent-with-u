@@ -7,154 +7,25 @@ import { useClipboardImage } from './../hooks/useClipboardImage';
 import type { ImageAttachment } from './../hooks/useClipboardImage';
 import { LoopPolicyEditor, normalizePolicy } from './LoopPolicyEditor';
 import type { LoopPolicy } from './LoopPolicyEditor';
-import { LoopProgressNotice, LoopDeliveryDetail, type DeliveryReport, type ProgressGuard } from './LoopDeliveryStatus';
+import { LoopProgressNotice, LoopDeliveryDetail } from './LoopDeliveryStatus';
 import { LoopDecisionNotice, LoopSourceCard } from './LoopContinuationStatus';
 import { LoopTaskBlockerDetail } from './LoopTaskBlockerDetail';
-import { mergeBlockerDetails, type TaskBlockerDetails } from '../utils/loopTaskBlockers';
 import { LoopEnvironmentCard, EnvironmentEvidence } from './LoopExecutionEnvironment';
-import type { EnvironmentCheck, ExecutionEnvironment } from '../types/loopEnvironment';
-import type { LoopDecision, LoopSourceSummary } from '../types/loopContinuation';
 import type { ModelRuntime } from './CodexRuntimeFields';
-import { TokenUsageMonitor } from './TokenUsageMonitor';
-import { loopRecordRevision } from '../utils/loopRecordDetail';
-import { activeLoopSeq, mergeCallDiagnostics, CALL_PHASE, CALL_ERROR, type CallDiagnostic } from '../utils/loopDiagnostics';
+import { activeLoopSeq, CALL_PHASE, CALL_ERROR, type CallDiagnostic } from '../utils/loopDiagnostics';
 import { AppModalVisibilityContext } from './AppModalPortal';
 import {
   AdvancedPromptTextarea,
   type AdvancedPromptTextareaProps,
 } from './AdvancedPromptTextarea';
 
-/**
- * LoopPanel — 可视化 Loop 集成的全屏面板。
- *
- * 阶段（单向）：loopidea → loopexecute → loopout
- *  - loopidea ：非阻塞投递多条想法（后端并发池跑），封口后形成全局目标
- *  - loopexecute：每次 loop 走 prepare → execute → analysis，时间轴可视化 +
- *    点击查看任意 loop 的详情；带分数环、风险系数、可交付/可输出徽标
- *  - loopout ：全局产出
- *
- * 右上角可切换「Hack 模式」——整份状态以 terminal 风格的等宽文本呈现。
- */
-
-interface LoopStep {
-  callResult?: string; taskResult?: string;
-  index: number; mode: string; access?: 'read' | 'write'; desc: string; status: string; output: string;
-  startedAt?: number; endedAt?: number; attempts?: number; recoveryNotes?: string[];
-}
-interface LoopAnalysis {
-  score: number; scoreObserved?: boolean; notes: string; trend: string;
-  optimizationPotential: number; challenges: string;
-  verified: string; gaps: string; nextFocus: string;
-  deliverable: boolean; outputtable: boolean;
-}
-interface LoopRecord extends TaskBlockerDetails {
-  environmentChecks?: EnvironmentCheck[];
-  outcomeVersion?: number; terminalKind?: string; decision?: LoopDecision; callResults?: Record<string, string>; taskResult?: string;
-  sourceSummary?: unknown; deliverySummary?: unknown;
-  seq: number; subStage: string; round: number; goal: string; orchestration: LoopStep[];
-  kind?: 'agent' | 'manual';
-  iterationMode?: 'baseline' | 'evolution';
-  evolutionBasis?: string;
-  delivery?: DeliveryReport;
-  hasEvolutionBasis?: boolean;
-  completed: boolean; result: string; analysis: LoopAnalysis | null; error: string;
-  subStarted?: Record<string, number>; createdAt?: number; updatedAt?: number;
-  hasGitCheckpoint?: boolean;
-  backends?: Record<string, string>;          // {prepare, execute, analysis} → backend id
-  runtimes?: Record<string, ModelRuntime>;    // {prepare, execute, analysis} → 实际模型/档位
-  backendLabels?: Record<string, string>;     // {prepare, execute, analysis} → 可读 label
-  manualMessages?: Array<{
-    id: string; role: string; content: string; timestamp?: number; streaming?: boolean;
-    toolCalls?: Array<{ name: string; status?: string; input?: string; output?: string; error?: string }>;
-    thinkingBlocks?: Array<{ content: string }>;
-  }>;
-  manualContext?: string;
-  detailLoaded?: boolean;
-  manualMessageCount?: number;
-  stageDetails?: Record<string, StageDetail>;
-  callDiagnostics?: CallDiagnostic[];
-  diagnosticLive?: boolean;
-}
-interface StageAttempt { kind: string; rawOutput?: string; parsed?: unknown; valid: boolean; validation: string[]; }
-interface StageDetail {
-  status?: string; message?: string; attemptCount?: number; attempts?: StageAttempt[];
-  rawOutput?: string; partialOutput?: string; parsed?: unknown; validation?: string[];
-}
-type DetailTarget = 'all' | 'prepare' | 'execute' | 'analysis' | `step${number}`;
-interface IdeaEntry { id: string; prompt: string; status: string; result: string; error: string; images?: AddonImage[]; }
-interface GoalRevision { goal: string; hint: string; source: string; createdAt: number; }
-interface AsideTurn { id: string; question: string; answer: string; status: string; stage: string; seq: number; imageCount?: number; }
-interface AddonImage { id?: string; base64: string; mime_type?: string; }
-interface Addon { id: string; text: string; status: string; appliedSeq: number; images?: AddonImage[]; }
-interface LoopStateT {
-  executionEnvironment?: ExecutionEnvironment;
-  taskSource?: LoopSourceSummary;
-  sessionId: string; stage: string; goal: string;
-  goalHistory: GoalRevision[];
-  policy?: LoopPolicy;
-  ideas: IdeaEntry[]; loops: LoopRecord[];
-  riskCoefficient: number; maxLoops: number; effectiveMaxLoops: number;
-  round: number; roundLoopCount: number;
-  status: string; stopReason: string; bestScore: number; latestScore: number;
-  bestSeq?: number;
-  riskFactors?: Record<string, number>;
-  progressGuard?: ProgressGuard;
-  handoff?: { available?: boolean; source?: string };
-  asides: AsideTurn[];
-  addons: Addon[];
-  intentAlert?: { round?: number; seq?: number; aligned?: boolean; severity?: string; divergence?: string; suggestion?: string; dismissed?: boolean };
-  auto: boolean; running: boolean; resumable: boolean;
-  controlMode?: 'loop' | 'manual';
-  controlRevision?: number;
-  canTakeover?: boolean;
-  controlReason?: string;
-}
-
-/**
- * 完整详情只提供大字段，compact 摘要持续提供权威实时状态。合并时不能让
- * 旧详情快照覆盖新的 subStage / step.status，否则运行节点会停止动画。
- */
-function mergeLoopRecordDetail(summary: LoopRecord, detail?: LoopRecord): LoopRecord {
-  if (summary.detailLoaded !== false) return summary;
-  if (!detail) return summary;
-  const detailSteps = new Map((detail.orchestration || []).map((step) => [step.index, step]));
-  const orchestration = (summary.orchestration || []).map((step) => {
-    const full = detailSteps.get(step.index);
-    return full ? {
-      ...full,
-      ...step,
-      output: full.output || step.output,
-    } : step;
-  });
-  const analysis = summary.analysis && detail.analysis ? {
-    ...detail.analysis,
-    ...summary.analysis,
-    notes: detail.analysis.notes || summary.analysis.notes,
-    trend: detail.analysis.trend || summary.analysis.trend,
-    challenges: detail.analysis.challenges || summary.analysis.challenges,
-    verified: detail.analysis.verified || summary.analysis.verified,
-    gaps: detail.analysis.gaps || summary.analysis.gaps,
-    nextFocus: detail.analysis.nextFocus || summary.analysis.nextFocus,
-  } : (summary.analysis || detail.analysis);
-  return {
-    ...detail,
-    ...summary,
-    result: detail.result || summary.result,
-    manualMessages: detail.manualMessages || summary.manualMessages,
-    manualContext: detail.manualContext || summary.manualContext,
-    evolutionBasis: detail.evolutionBasis || summary.evolutionBasis,
-    delivery: detail.delivery?.mode ? detail.delivery : summary.delivery,
-    analysis,
-    orchestration,
-    stageDetails: Object.fromEntries(Object.entries(summary.stageDetails || detail.stageDetails || {}).map(
-      ([stage, value]) => [stage, { ...detail.stageDetails?.[stage], ...value }],
-    )),
-    callDiagnostics: mergeCallDiagnostics(detail.callDiagnostics, summary.callDiagnostics),
-    environmentChecks: loopRecordRevision(summary) === loopRecordRevision(detail) ? detail.environmentChecks : summary.environmentChecks,
-    ...mergeBlockerDetails(summary, detail),
-    detailLoaded: true,
-  };
-}
+import type { LoopStep, LoopRecord, StageDetail, DetailTarget, Addon, AddonImage, LoopStateT } from '../types/loopWorkbench';
+import { useLoopWorkbenchState } from '../hooks/useLoopWorkbenchState';
+import { loopWorkbenchView, boundedText, loopSubstageLabel, type WorkbenchSection } from '../utils/loopWorkbenchView';
+import { loopControlTarget } from '../api';
+import { controlKey } from '../utils/loopControl';
+import { LoopControlStatus } from './LoopControlStatus';
+import { LoopWorkbench } from './LoopWorkbench';
 
 const SUB_LABEL: Record<string, string> = {
   prepare: 'Prepare', execute: 'Execute', analysis: 'Analysis', done: 'Done',
@@ -165,9 +36,10 @@ export interface LoopPanelProps {
   onRefreshBackends?: () => void;
   sessionId: string;
   headerActions?: React.ReactNode;
+  controlFeedback?: React.ReactNode;
   onClose?: () => void;
   embedded?: boolean;   // true = 作为会话内容内嵌渲染（无浮层、无关闭按钮）
-  inspectOnly?: boolean; // true = 人工接管期间的只读总览（保留面板/流程，不暴露状态变更操作）
+  inspectOnly?: boolean; // true = 人工接管期间的只读总览（只查阅目标与证据，不暴露状态变更操作）
   sessionBackendId?: string;
   sessionRuntime?: ModelRuntime;
   backends?: any[];
@@ -192,182 +64,62 @@ const LoopPromptTextarea: React.FC<LoopPromptTextareaProps> = (props) => {
   return <AdvancedPromptTextarea {...context} {...props} />;
 };
 
-export const LoopPanel: React.FC<LoopPanelProps> = ({
+
+export const LoopPanel: React.FC<LoopPanelProps> = props => {
+  const identity = controlKey(loopControlTarget(props.sessionId, props.execKey));
+  return <LoopPanelContent key={identity} {...props} identity={identity} />;
+};
+
+const LoopPanelContent: React.FC<LoopPanelProps & { identity: string }> = ({
   sessionId, onClose, embedded, inspectOnly = false, sessionBackendId, sessionRuntime, backends,
-  workingDir, execKey, headerActions, onRefreshBackends,
+  workingDir, execKey, headerActions, controlFeedback, onRefreshBackends, identity,
 }) => {
-  const [state, setState] = useState<LoopStateT | null>(null);
   const visible = useContext(AppModalVisibilityContext);
-  const statePushRevision = useRef(0);
-  const [selectedSeq, setSelectedSeq] = useState<number | null>(null);
-  const [recordDetails, setRecordDetails] = useState<Record<number, LoopRecord>>({});
-  const [callDiagnostics, setCallDiagnostics] = useState<Record<number, CallDiagnostic[]>>({});
-  const [detailTarget, setDetailTarget] = useState<DetailTarget>('all');
-  const [detailErrors, setDetailErrors] = useState<Record<number, { revision: string; message: string }>>({});
-  const detailRequests = useRef(new Set<string>());
-  const detailVersions = useRef<Record<number, string>>({});
-  const detailGeneration = useRef(0);
-  const [viewMode, setViewMode] = useState<'panel' | 'flow'>('panel');  // 可切换的执行流程视图
+  const [section, setSection] = useState<WorkbenchSection | null>(null);
+  const [visited, setVisited] = useState<Set<WorkbenchSection>>(new Set());
+  const trigger = useRef<HTMLElement | null>(null);
   const [ideaInput, setIdeaInput] = useState('');
   const [goalDraft, setGoalDraft] = useState('');
+  const [nextGoal, setNextGoal] = useState<string | null>(null);
+  const [refineNext, setRefineNext] = useState(false);
   const [actionBusy, setBusy] = useState(false);
-  const control = useLoopControl(sessionId, execKey, !embedded && !inspectOnly && visible);
+  const actionPending = useRef(false);
+  const control = useLoopControl(sessionId, execKey, !inspectOnly && visible);
   const busy = actionBusy || control.busy;
-  const [loadError, setLoadError] = useState('');
+  const { state, loadError, refresh, selectedSeq, selectLoop, detailTarget, setDetailTarget, detailErrors, retryDetail, progress } =
+    useLoopWorkbenchState(sessionId, control.target.executor, identity, visible, section === 'process' || section === 'evidence');
+  useEffect(() => { setNextGoal(null); }, [state?.round]);
+  const once = useCallback(async (request: () => Promise<{ status: string; message?: string }>) => {
+    if (actionPending.current) return;
+    actionPending.current = true; setBusy(true);
+    try { const result = await request(); if (result.status !== 'ok' && result.message) alert(result.message); return result; }
+    catch (error) { alert(String(error)); }
+    finally { actionPending.current = false; setBusy(false); }
+  }, []);
   useEffect(() => {
     if (inspectOnly || !control.state.summary?.operation?.committed || control.state.summary.controlMode !== 'loop') return;
     if (loadError) control.viewReady(loadError);
     else if (state?.sessionId === sessionId && state.controlMode !== 'manual') control.viewReady();
   }, [sessionId, inspectOnly, state, loadError, control.state.phase, control.state.summary?.controlRevision]);
 
-  // 子阶段实时流式文本：key = `${seq}:${subStage}`
-  const [progress, setProgress] = useState<Record<string, string>>({});
-  const progressRef = useRef(progress);
-  progressRef.current = progress;
-  const pendingProgressRef = useRef<Record<string, string>>({});
-  const progressTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const activeSessionRef = useRef(sessionId);
-  activeSessionRef.current = sessionId;
-
-  const refresh = useCallback(async () => {
-    const requestedSessionId = sessionId;
-    const revision = statePushRevision.current;
-    const s = await api.loopGetState(sessionId);
-    if (activeSessionRef.current !== requestedSessionId || statePushRevision.current !== revision) return;
-    if (s) { setState(s); setLoadError(''); }
-    else setLoadError('LOOP 面板加载失败，请重试读取');
-  }, [sessionId]);
-
-  const selectLoop = useCallback((seq: number | null, target: DetailTarget = 'all') => {
-    setSelectedSeq(seq);
-    setDetailTarget(target);
-  }, []);
-
-  const selectedSummary = state?.loops.find(record => record.seq === selectedSeq);
-  const selectedRevision = selectedSummary ? loopRecordRevision(selectedSummary) : '';
-  // 只对当前选中记录按版本按需取详情；完成步骤/切换阶段的 push 会使缓存失效。
-  // 同一记录最多一个在途请求；请求期间出现的新版本等返回后补取，不并发重刷。
-  useEffect(() => {
-    if (!visible || state?.sessionId !== sessionId || !selectedSummary || selectedSummary.detailLoaded !== false) return;
-    const seq = selectedSummary.seq;
-    if (detailVersions.current[seq] === selectedRevision) return;
-    if (detailErrors[seq]?.revision === selectedRevision) return;
-    const generation = detailGeneration.current;
-    const key = `${generation}:${sessionId}:${seq}`;
-    if (detailRequests.current.has(key)) return;
-    detailRequests.current.add(key);
-    const requestedSessionId = sessionId;
-    void api.loopGetRecord(sessionId, seq).then((result) => {
-      if (activeSessionRef.current !== requestedSessionId || detailGeneration.current !== generation) return;
-      detailRequests.current.delete(key);
-      if (result.status === 'ok' && result.record) {
-        detailVersions.current[seq] = selectedRevision;
-        detailRequests.current.delete(key);
-        setDetailErrors(previous => { const next = { ...previous }; delete next[seq]; return next; });
-        setRecordDetails((previous) => ({ ...previous, [seq]: result.record as LoopRecord }));
-        if (result.progress) {
-          setProgress((previous) => {
-            const next = { ...previous };
-            for (const [key, replay] of Object.entries(result.progress || {})) {
-              const current = next[key] || '';
-              if (!current || replay.includes(current)) next[key] = replay;
-              else if (!current.includes(replay)) next[key] = (replay + current).slice(-50_000);
-            }
-            return next;
-          });
-        }
-      } else {
-        setDetailErrors(previous => ({ ...previous, [seq]: { revision: selectedRevision, message: result.message || '详情加载失败' } }));
-      }
-    }).catch(error => {
-      if (activeSessionRef.current === requestedSessionId && detailGeneration.current === generation) {
-        setDetailErrors(previous => ({ ...previous, [seq]: { revision: selectedRevision, message: String(error) } }));
-      }
-    }).finally(() => { detailRequests.current.delete(key); });
-  }, [sessionId, selectedSeq, selectedRevision, recordDetails, detailErrors, visible]);
-
-  const retryDetail = useCallback(() => {
-    if (selectedSeq == null) return;
-    delete detailVersions.current[selectedSeq];
-    setDetailErrors(previous => { const next = { ...previous }; delete next[selectedSeq]; return next; });
-  }, [selectedSeq]);
-
-  useEffect(() => { refresh(); }, [refresh]);
-
-  useEffect(() => {
-    setState(null);
-    setSelectedSeq(null);
-    setRecordDetails({});
-    setCallDiagnostics({});
-    setDetailErrors({});
-    detailVersions.current = {};
-    setDetailTarget('all');
-    detailGeneration.current++;
-    setProgress({});
-    progressRef.current = {};
-    pendingProgressRef.current = {};
-    if (progressTimerRef.current) clearTimeout(progressTimerRef.current);
-    progressTimerRef.current = null;
-    return () => { detailGeneration.current++; };
-  }, [sessionId]);
-
-  // 订阅整份状态更新 + 子阶段流式文本（仅本 session）
-  useEffect(() => {
-    const un1 = api.onLoopUpdated((s: LoopStateT) => {
-      if (s.sessionId !== sessionId) return;
-      statePushRevision.current++;
-      setState(previous => (previous?.controlRevision || 0) > (s.controlRevision || 0) ? previous : s);
-    });
-    const un2 = api.onLoopProgress((d) => {
-      if (d.sessionId !== sessionId) return;
-      if (d.diagnostic) {
-        setCallDiagnostics(previous => {
-          const next = { ...previous, [d.seq]: mergeCallDiagnostics(previous[d.seq], [d.diagnostic!]) };
-          for (const seq of Object.keys(next).map(Number).sort((a, b) => b - a).slice(12)) delete next[seq];
-          return next;
-        });
-        return;
-      }
-      const key = `${d.seq}:${d.subStage}`;
-      pendingProgressRef.current[key] = (pendingProgressRef.current[key] || '') + d.text;
-      if (!progressTimerRef.current) {
-        progressTimerRef.current = setTimeout(() => {
-          const batch = pendingProgressRef.current;
-          pendingProgressRef.current = {};
-          progressTimerRef.current = null;
-          setProgress((prev) => {
-            const next = { ...prev };
-            for (const [batchKey, text] of Object.entries(batch)) {
-              // 实时窗口只保留尾部 50KB；完整结果以后端持久化状态为准。
-              next[batchKey] = ((next[batchKey] || '') + text).slice(-50_000);
-            }
-            return next;
-          });
-        }, 50);
-      }
-    });
-    return () => {
-      un1(); un2();
-      if (progressTimerRef.current) clearTimeout(progressTimerRef.current);
-      progressTimerRef.current = null;
-      pendingProgressRef.current = {};
-    };
-  }, [sessionId]);
-
+  const openSection = (value: WorkbenchSection, seq?: number, target: DetailTarget = 'all') => {
+    if (!section && document.activeElement instanceof HTMLElement) trigger.current = document.activeElement;
+    setVisited(previous => new Set([...previous, value]));
+    setSection(value);
+    if (value === 'process' || value === 'evidence') {
+      const chosen = seq ?? selectedSeq ?? (value === 'evidence' ? state?.loops.at(-1)?.seq : undefined);
+      if (chosen != null) selectLoop(chosen, target);
+    }
+  };
+  const closeSection = () => { setSection(null); requestAnimationFrame(() => trigger.current?.focus()); };
   const running = state?.running ?? false;
-  const setAuto = useCallback((on: boolean) => api.loopSetAuto(sessionId, on), [sessionId]);
+  const setAuto = useCallback((on: boolean) => once(() => api.loopSetAuto(sessionId, on)), [sessionId, once]);
   const addAddon = useCallback((text: string, images?: ImageAttachment[]) => api.loopAddAddon(sessionId, text, images), [sessionId]);
   const editAddon = useCallback((id: string, text: string, images?: any[]) => api.loopEditAddon(sessionId, id, text, images), [sessionId]);
   const removeAddon = useCallback((id: string) => api.loopRemoveAddon(sessionId, id), [sessionId]);
   const continueRound = useCallback(async (goal: string) => {
-    setBusy(true);
-    try {
-      const r = await api.loopContinue(sessionId, goal);
-      if (r.status !== 'ok' && r.message) alert(r.message);
-    } finally {
-      setBusy(false);
-    }
-  }, [sessionId]);
+    await once(() => api.loopContinue(sessionId, goal));
+  }, [sessionId, once]);
 
   const submitIdea = useCallback(async (images?: ImageAttachment[]) => {
     const text = ideaInput.trim();
@@ -377,18 +129,12 @@ export const LoopPanel: React.FC<LoopPanelProps> = ({
   }, [ideaInput, sessionId]);
 
   const sealIdea = useCallback(async () => {
-    if (!window.confirm('封口 loopidea 后将单向进入 loopexecute，无法回退。继续？')) return;
-    setBusy(true);
-    await api.loopSealIdea(sessionId, goalDraft.trim());
-    setGoalDraft('');
-    setBusy(false);
+    if (!window.confirm('确认目标后进入执行准备，不能退回想法阶段。继续？')) return;
+    await once(async () => { const result = await api.loopSealIdea(sessionId, goalDraft.trim()); if (result.status === 'ok') setGoalDraft(''); return result; });
   }, [sessionId, goalDraft]);
 
   const runIteration = useCallback(async () => {
-    setBusy(true);
-    const r = await api.loopRunIteration(sessionId);
-    if (r.status !== 'ok' && r.message) alert(r.message);
-    setBusy(false);
+    await once(() => api.loopRunIteration(sessionId));
   }, [sessionId]);
 
   const takeover = useCallback(async (nextRoundGoal: string = '') => {
@@ -402,11 +148,11 @@ export const LoopPanel: React.FC<LoopPanelProps> = ({
   }, [control.request, state?.stage]);
 
   const discardLoop = useCallback(async () => {
-    // 丢弃目标：正在跑的那次（或最后一次）
-    const target = state?.loops.find((l) => !l.completed && !l.error) || state?.loops[state.loops.length - 1];
+    // seq=0 的执行端语义始终是最近一次，不能用历史未完成记录判断磁盘快照。
+    const target = state?.loops[state.loops.length - 1];
     const hasGit = !!target?.hasGitCheckpoint;
     if (!window.confirm(
-      '停止并删除本次 loop？当作没发生过：\n' +
+      `停止并删除最近一次 Loop #${target?.seq}？\n` +
       '· 这次 loop 记录与结果不保存\n' +
       '· 它消费的补充（addon）退回「待纳入」\n' +
       '· agent 上下文回滚到本次开跑前（不污染后续 loop）'
@@ -420,22 +166,15 @@ export const LoopPanel: React.FC<LoopPanelProps> = ({
         '取消 = 仅丢弃记录/addon/上下文，保留磁盘上的文件改动。'
       );
     }
-    const r = await api.loopDiscard(sessionId, 0, restoreFiles);
-    if (r.status !== 'ok' && r.message) alert(r.message);
+    await once(() => api.loopDiscard(sessionId, 0, restoreFiles));
   }, [sessionId, state]);
 
   const advanceOut = useCallback(async () => {
     const prompt = running
-      ? '当前 Loop 仍在执行。停止它、保留已完成步骤的结果并进入 loopout？'
-      : '进入 loopout 全局产出阶段（单向）。继续？';
+      ? '当前 Loop 仍在执行。停止它、保留已完成步骤的结果并进入本轮结果？'
+      : '结束本轮并查看已保留成果？未完成事项仍会保留。';
     if (!window.confirm(prompt)) return;
-    setBusy(true);
-    try {
-      const r = await api.loopAdvanceToOut(sessionId);
-      if (r.status !== 'ok' && r.message) alert(r.message);
-    } finally {
-      setBusy(false);
-    }
+    await once(() => api.loopAdvanceToOut(sessionId));
   }, [sessionId, running]);
 
   const saveGoal = useCallback(async () => {
@@ -446,137 +185,181 @@ export const LoopPanel: React.FC<LoopPanelProps> = ({
     return api.loopRefineGoal(sessionId, hint, images);
   }, [sessionId]);
 
-  // embedded = 作为会话内容内嵌（填满 pane，无浮层 backdrop）；否则浮层模式
+
   const wrap = (children: React.ReactNode) => embedded
     ? <div className="awu-loop" style={embeddedShell}>{children}</div>
     : <div style={overlay}><div className="awu-loop" style={shell}>{children}</div></div>;
-
-  const stateForView = state ? {
-    ...state,
-    canTakeover: !control.busy && control.state.summary?.eligibility.takeover.allowed === true,
-    controlReason: control.state.summary?.eligibility.takeover.message || control.state.error || '正在核对接管条件…',
-    loops: state.loops.map((record) => {
-      const merged = mergeLoopRecordDetail(record, recordDetails[record.seq]);
-      return { ...merged, diagnosticLive: record.seq === activeLoopSeq(state),
-        callDiagnostics: mergeCallDiagnostics(merged.callDiagnostics, callDiagnostics[record.seq]) };
-    }),
-  } : null;
-
-  if (!stateForView) {
-    return wrap(
-      <>
-        <Header stage="…" sessionId={sessionId}
-          actions={headerActions}
-          onClose={onClose}
-          embedded={embedded} inspectOnly={inspectOnly} />
-        <div style={{ padding: 40, textAlign: 'center', color: 'var(--theme-text-muted)' }}>
-          {loadError || '正在加载 Loop 状态…'}
-          {loadError && <button onClick={() => void refresh()}>重试加载 LOOP 面板</button>}
+  if (!state) return wrap(<div style={{ padding: 20, color: 'var(--theme-text)' }}>
+    {controlFeedback ?? <LoopControlStatus sessionId={sessionId} execKey={execKey} onReload={() => void refresh()} />}
+    <strong>LOOP 工作台</strong><p>{loadError || '正在加载 LOOP 状态…'}</p>
+    {loadError && <button style={btn} onClick={() => void refresh()}>重试加载 LOOP 面板</button>}
+    {onClose && <button style={btn} onClick={onClose}>关闭</button>}
+  </div>);
+  const view = loopWorkbenchView(state, { readOnly: inspectOnly, controlPending: control.busy, controlError: control.state.error });
+  const readOnly = view.manual;
+  const canTakeover = !busy && control.state.summary?.eligibility.takeover.allowed === true;
+  const takeoverReason = control.state.summary?.eligibility.takeover.message || control.state.error || '正在核对接管条件…';
+  const latest = state.loops.at(-1);
+  const selected = state.loops.find(loop => loop.seq === selectedSeq);
+  const labels: Record<string, string> = { manual: '返回人工工作区', check: '检查控制状态', running: '本轮执行中', seal: '确认目标，进入执行',
+    continue: state.running ? '停止上一轮并开启新一轮' : '开启新一轮', issues: '处理当前问题', resume: '继续未完成步骤', run: '运行下一次' };
+  const primary = () => {
+    switch (view.primary) {
+      case 'manual': onClose?.(); break;
+      case 'check': void control.check(); break;
+      case 'seal': void sealIdea(); break;
+      case 'continue': void continueRound(nextGoal ?? state.goal); break;
+      case 'issues': openSection('issues'); break;
+      case 'resume': case 'run': void runIteration(); break;
+    }
+  };
+  const sourceLocked = readOnly || busy || state.running || state.resumable;
+  const feedback = controlFeedback ?? <LoopControlStatus sessionId={sessionId} execKey={execKey} onReload={() => void refresh()} onChat={onClose} />;
+  const issueList = <div>
+    {section === 'issues' && feedback}
+    {view.issues.filter(issue => issue.id !== 'control').map(issue => <section key={issue.id} style={{ ...sealBox, marginBottom: 10 }}>
+      <strong>{issue.title}</strong><p>{issue.reason}</p><p>{issue.next}</p>
+      <button style={btn} onClick={() => openSection(issue.section)}>查看相关{issue.section === 'settings' ? '设置' : '证据'}</button>
+      <details style={{ marginTop: 8 }}><summary>关联依据</summary>{issue.refs.map(ref => <div key={ref}>{ref}</div>)}</details>
+    </section>)}
+    {!view.issues.length && <p>当前摘要没有待处理问题；这不代表完整验收。</p>}
+    {!readOnly && !state.running && state.stage === 'loopexecute' && <div style={sealBox}>
+      <p>查看、核对或修改设置不会自动恢复。处理条件后显式继续，执行端仍会检查原有授权、来源和环境门槛。</p>
+      <button style={btn} disabled={busy || view.issues.some(issue => issue.priority < 30)}
+        onClick={() => void runIteration()}>{state.resumable ? '按原条件恢复断点' : '按原条件运行下一次'}</button>
+    </div>}
+  </div>;
+  const header = <>
+    <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', fontSize: 12 }}>
+      <strong style={{ fontSize: 14 }}>LOOP 工作台</strong>
+      <span data-testid="loop-current-status">{view.status}</span><span>第 {state.round} 轮 · Auto {state.auto ? '开' : '关'}</span>
+      <div style={{ marginLeft: 'auto', display: 'flex', gap: 6 }}>{headerActions}{onClose && <button style={btn} onClick={onClose}>关闭总览</button>}</div>
+    </div>
+    <div data-testid="loop-goal-summary" style={{ marginTop: 8, fontSize: 15, lineHeight: 1.5, fontWeight: 600 }}>{boundedText(state.goal, 160) || '先整理想法，确认这次想完成什么'}</div>
+    <div role="group" aria-label="LOOP 统一操作" style={{ position: 'relative', display: 'flex', gap: 7, flexWrap: 'wrap', alignItems: 'center', marginTop: 10 }}>
+      <button style={{ ...primaryBtn, opacity: busy || view.primary === 'running' ? 0.6 : 1 }}
+        disabled={view.primary === 'running' || (busy && view.primary !== 'check') || view.primary === 'check' && control.state.checking}
+        onClick={primary}>{labels[view.primary]}</button>
+      {!readOnly && state.stage !== 'loopidea' && <>
+        <button style={btn} disabled={busy} onClick={() => void setAuto(!state.auto)}>
+          {state.auto ? '停止后续自动执行' : '开启 Auto'}</button>
+        {state.stage === 'loopexecute' && <button style={btn} disabled={busy} onClick={() => void advanceOut()}>
+          {state.running ? '停止本轮并查看结果' : '结束本轮并查看结果'}</button>}
+      </>}
+      <button style={btn} onClick={() => openSection('settings')}>任务设置</button>
+      {!readOnly && <details style={{ position: 'relative', marginLeft: 'auto' }}>
+        <summary style={{ ...btn, listStyle: 'none' }}>更多操作</summary>
+        <div data-testid="loop-more-actions" style={{ position: 'absolute', right: 0, top: '100%', zIndex: 5, width: 240, maxWidth: '80vw',
+          ...sealBox, boxShadow: '0 6px 20px #0004', marginTop: 6 }}>
+          <button style={btn} disabled={!canTakeover} onClick={() => void takeover(nextGoal ?? state.goal)}>
+            {state.stage === 'loopout' ? `✋ 开启人工轮（第 ${state.round + 1} 轮）` : '✋ 人工接管'}</button>
+          {!canTakeover && <p role="status" style={{ fontSize: 12 }}>人工接管：{takeoverReason}</p>}
+          {!!state.loops.length && <button style={{ ...btn, color: '#f87171', marginTop: 8 }} disabled={busy}
+            onClick={() => void discardLoop()}>丢弃本次记录…</button>}
         </div>
-      </>
-    );
-  }
-
-  return wrap(
-    <LoopPromptContext.Provider value={{ sessionId, workingDir, execKey }}>
-      <>
-        <Header stage={stateForView.stage} sessionId={sessionId}
-          actions={headerActions}
-          onClose={onClose} embedded={embedded} inspectOnly={inspectOnly}
-          viewMode={viewMode} setViewMode={setViewMode} canFlow={stateForView.stage !== 'loopidea'} />
-        <StageRail stage={stateForView.stage} />
-        {!inspectOnly && !stateForView.canTakeover && <div role="status" style={{ padding: '6px 18px', fontSize: 12,
-          color: 'var(--theme-text-muted)' }}>人工接管：{control.busy ? '转交正在处理，请查看上方状态' : stateForView.controlReason}</div>}
-        {inspectOnly && (
-          <div style={{
-            flexShrink: 0, padding: '7px 18px', fontSize: 12,
-            color: '#d29922', background: '#d2992214', borderBottom: '1px solid #d2992244',
-          }}>
-            ✋ 人工接管中 · 当前为只读 LOOP 总览，可切换面板 / 流程；返回聊天后继续人工操作。
+      </details>}
+    </div>
+    {!readOnly && state.stage !== 'loopidea' && <div style={{ marginTop: 6, fontSize: 11, color: 'var(--theme-text-muted)' }}>
+      {state.stage === 'loopout' ? (state.auto ? '新一轮将按当前 Auto 设置自动连跑。' : '新一轮沿用手动逐次执行。')
+        : state.running ? '关闭 Auto 只停止后续自动执行，不等于当前调用已退出。' : state.resumable ? '继续当前断点，保留已完成步骤。' : '执行仍由当前节点的既有授权和恢复条件约束。'}
+    </div>}
+  </>;
+  const details = <>
+    {(section === 'process' || section === 'evidence') && <>
+      <LoopProgressNotice guard={state.progressGuard} handoff={state.handoff} />
+      {!selected && <LoopDecisionNotice decision={latest?.decision} blockerSummary={latest?.blockerSummary}
+        callResults={latest?.callResults} taskResult={latest?.taskResult} />}
+      {!!state.loops.length && <nav aria-label="流程轮次切换" style={{ position: 'sticky', top: 0, zIndex: 2, display: 'flex', gap: 8,
+        flexWrap: 'wrap', padding: '8px 0', background: 'var(--theme-bg-secondary)' }}>
+        <label>查看轮次 <select style={btn} aria-label="查看流程轮次" value={selectedSeq ?? ''}
+          onChange={event => selectLoop(Number(event.target.value), detailTarget)}>
+          {state.loops.slice().reverse().map(loop => <option key={loop.seq} value={loop.seq}>第 {loop.round} 轮 · Loop #{loop.seq}</option>)}
+        </select></label>
+        <button style={btn} onClick={() => selectLoop(latest!.seq, detailTarget)}>返回最新 Loop</button>
+      </nav>}
+      {section === 'process' && <LoopFlowView state={state} selectedSeq={selectedSeq} setSelectedSeq={selectLoop} />}
+      {selected && <LoopDetail key={selected.seq} loop={selected} progress={progress} target={detailTarget} onTarget={setDetailTarget}
+        error={detailErrors[selected.seq!]?.message} onRetry={retryDetail} onClose={closeSection} />}
+      {!state.loops.length && section === 'evidence' && <p>尚无执行记录。</p>}
+    </>}
+    <div hidden={section !== 'goal'}>
+      {visited.has('goal') && <>
+        <GoalCard state={state} readOnly={readOnly || busy} goalDraft={goalDraft}
+          setGoalDraft={setGoalDraft} onSaveGoal={saveGoal} onRefineGoal={refineGoal} />
+        {!readOnly && <IntentBanner state={state} sessionId={sessionId} />}
+        <AddonHistoryCard addons={state.addons || []} loops={state.loops} />
+        {readOnly && (state.addons || []).filter(addon => addon.status === 'pending').map(addon => <section key={addon.id} style={sealBox}>
+          <div style={{ fontSize: 12, marginBottom: 6 }}>待纳入补充 · 只读</div><div>{addon.text}</div>
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4, marginTop: 6 }}>{(addon.images || []).map((im, index) =>
+            <img key={im.id || index} alt="待纳入补充图片" src={`data:${im.mime_type || 'image/png'};base64,${im.base64}`}
+              style={{ width: 56, height: 56, objectFit: 'cover', borderRadius: 5 }} />)}</div>
+        </section>)}
+      </>}
+    </div>
+    <div hidden={section !== 'settings'}>
+      {visited.has('settings') && <>
+        <LoopSourceCard sessionId={sessionId} execKey={execKey} source={state.taskSource} readOnly={sourceLocked} />
+        <LoopEnvironmentCard sessionId={sessionId} execKey={execKey} environment={state.executionEnvironment} resumable={state.resumable}
+          readOnly={readOnly || busy || state.running || !!state.executionEnvironment?.checking} />
+        <PolicyCard onRefreshBackends={onRefreshBackends} sessionId={sessionId} policy={state.policy} readOnly={readOnly || busy}
+          sessionBackendId={sessionBackendId} sessionRuntime={sessionRuntime} backends={backends} />
+        <details><summary>诊断指标（不是验收）</summary><div>当前分数 {state.latestScore} · 历史最高分 {state.bestScore} · 风险 {state.riskCoefficient} · 本轮预算 {state.roundLoopCount}/{state.effectiveMaxLoops}</div></details>
+      </>}
+    </div>
+    {section === 'issues' && issueList}
+  </>;
+  return wrap(<LoopPromptContext.Provider value={{ sessionId, workingDir, execKey }}>
+    <LoopWorkbench header={header} section={section} onSection={value => value ? openSection(value) : closeSection()}
+      trigger={trigger} details={details}>
+      {!!view.issues.length && <section aria-label="需要处理" style={{ ...sealBox, borderColor: '#d2992255', marginBottom: 12 }}>
+        <strong>{view.issues[0].title}</strong><div style={{ margin: '6px 0', fontSize: 12 }}>{boundedText(view.issues[0].reason)}</div>
+        {view.issues[0].id === 'control' ? section !== 'issues' && feedback : <button style={btn} onClick={() => openSection(view.issues[0].section)}>查看处理依据</button>}
+        <button style={{ ...btn, marginLeft: 6 }} onClick={() => openSection('issues')}>
+          {view.issues.length > 1 ? `还有 ${view.issues.length - 1} 个问题` : '查看问题详情'}</button>
+      </section>}
+      {section !== 'issues' && !view.issues.some(issue => issue.id === 'control') && feedback}
+      {state.stage === 'loopidea' && !readOnly ? <>
+        <div style={{ marginBottom: 12 }}><label style={{ fontSize: 13 }}>本次目标
+          <LoopPromptTextarea value={goalDraft} onValueChange={setGoalDraft}
+            placeholder="直接写目标，或留空让模型汇总下方想法" containerStyle={{ width: '100%', marginTop: 6 }}
+            style={{ ...inputBase, width: '100%', minHeight: 70, boxSizing: 'border-box' }} /></label></div>
+        <IdeaStage state={state} ideaInput={ideaInput} setIdeaInput={setIdeaInput} onSubmit={submitIdea} busy={busy}
+          onRemove={id => { void api.loopRemoveIdea(sessionId, id); }} />
+      </> : <>
+        <section style={{ ...sealBox, marginBottom: 12 }} aria-label="当前进展">
+          <div style={{ fontSize: 11, color: 'var(--theme-text-muted)', marginBottom: 7 }}>
+            {view.current ? `Loop #${view.current.seq} · ${loopSubstageLabel(view.current.subStage)} · ${view.steps}` : '准备执行'}</div>
+          <div style={{ fontSize: 14, lineHeight: 1.6 }}>{view.focus}</div>
+          <div data-testid="loop-acceptance" style={{ marginTop: 8, fontSize: 12 }}>{view.acceptance}</div>
+          {state.taskSource?.status === 'current' && <div style={{ marginTop: 6, fontSize: 12 }}>来源 {boundedText(state.taskSource.change, 60)} · 正式任务勾选 {state.taskSource.checked ?? '?'}/{state.taskSource.total ?? '?'}（不是验收比例）</div>}
+          {view.current?.deliverySummary?.counts && <div style={{ marginTop: 6, fontSize: 12 }}>
+            已实现待验 {view.current.deliverySummary.counts.implemented || 0} · 已验证 {view.current.deliverySummary.counts.verified || 0} · 待人工 {view.current.deliverySummary.counts.manual || 0} · 受阻 {view.current.deliverySummary.counts.blocked || 0}</div>}
+          {view.current?.analysisPreview?.gaps && <p style={{ fontSize: 12 }}>剩余缺口：{boundedText(view.current.analysisPreview.gaps)}</p>}
+          {view.current?.analysisPreview?.nextFocus && <p style={{ fontSize: 12 }}>下一步：{boundedText(view.current.analysisPreview.nextFocus)}</p>}
+          {state.stage === 'loopout' && <p style={{ fontSize: 12 }}>停止原因：{boundedText(state.stopReason) || '旧记录未提供原因；请核对证据'}</p>}
+          {state.stage === 'loopout' && view.current?.resultPreview && <p style={{ fontSize: 12 }}>已保留成果：{boundedText(view.current.resultPreview)}</p>}
+          <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginTop: 12 }}>
+            <button style={btn} onClick={() => openSection('process')}>过程与历史</button>
+            <button style={btn} onClick={() => openSection('evidence', undefined, 'analysis')}>成果与证据</button>
+            <button style={btn} onClick={() => openSection('goal')}>目标与补充</button>
           </div>
-        )}
-
-        <div style={{ flex: 1, display: 'flex', minHeight: 0, position: 'relative' }}>
-          <div style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
-            <div style={{ flex: 1, overflow: 'auto', padding: 'var(--ui-loop-body-padding, 12px 18px 24px)' }}>
-              {!inspectOnly && <IntentBanner state={stateForView} sessionId={sessionId} />}
-              <LoopProgressNotice guard={stateForView.progressGuard} handoff={stateForView.handoff} />
-              <LoopEnvironmentCard key={`env:${execKey}:${sessionId}`} sessionId={sessionId} execKey={execKey}
-                environment={stateForView.executionEnvironment} resumable={stateForView.resumable}
-                readOnly={!!inspectOnly || control.busy || stateForView.controlMode === 'manual' || stateForView.running || !!stateForView.executionEnvironment?.checking} />
-              <LoopSourceCard key={`${execKey}:${sessionId}`} sessionId={sessionId} execKey={execKey}
-                source={stateForView.taskSource} readOnly={!!inspectOnly || control.busy || stateForView.controlMode === 'manual' || stateForView.running || stateForView.resumable} />
-              <LoopDecisionNotice decision={stateForView.loops[stateForView.loops.length - 1]?.decision}
-                blockerSummary={stateForView.loops[stateForView.loops.length - 1]?.blockerSummary}
-                callResults={stateForView.loops[stateForView.loops.length - 1]?.outcomeVersion ? stateForView.loops[stateForView.loops.length - 1]?.callResults : undefined}
-                taskResult={stateForView.loops[stateForView.loops.length - 1]?.outcomeVersion ? stateForView.loops[stateForView.loops.length - 1]?.taskResult : undefined} />
-              {stateForView.stage === 'loopidea' ? (
-                <>
-                  <PolicyCard onRefreshBackends={onRefreshBackends} sessionId={sessionId} policy={stateForView.policy} readOnly={inspectOnly}
-                    sessionBackendId={sessionBackendId} sessionRuntime={sessionRuntime} backends={backends} />
-                  <IdeaStage
-                    state={stateForView} ideaInput={ideaInput} setIdeaInput={setIdeaInput}
-                    goalDraft={goalDraft} setGoalDraft={setGoalDraft}
-                    onSubmit={submitIdea} onSeal={sealIdea} busy={busy}
-                    onRemove={(id) => api.loopRemoveIdea(sessionId, id)}
-                  />
-                </>
-              ) : viewMode === 'flow' ? (
-                /* ★ 流程视图：把执行过程画成可追踪的流程图（当前位置 / 每步耗时 / doing 动线） */
-                <>
-                  <MetricBar state={stateForView} />
-                  {stateForView.stage === 'loopexecute' && !inspectOnly && (
-                    <div style={{ display: 'flex', justifyContent: 'flex-end', marginBottom: 10 }}>
-                      <button onClick={() => void takeover()} disabled={busy || !stateForView.canTakeover}
-                        style={{ ...btn, borderColor: '#d2992255', color: '#d29922', opacity: stateForView.canTakeover ? 1 : 0.5 }}>
-                        ✋ 人工接管
-                      </button>
-                    </div>
-                  )}
-                  <LoopFlowView state={stateForView} selectedSeq={selectedSeq} setSelectedSeq={selectLoop} />
-                  {selectedSeq != null && <div role="navigation" aria-label="流程轮次切换" style={{
-                    position: 'sticky', top: 0, zIndex: 2, display: 'flex', alignItems: 'center', gap: 8,
-                    padding: '8px 6px', background: 'var(--theme-bg-secondary)', borderBottom: '1px solid var(--theme-border)', flexWrap: 'wrap',
-                  }}>
-                    <label>查看轮次 <select aria-label="查看流程轮次" value={selectedSeq}
-                      onChange={event => selectLoop(Number(event.target.value), detailTarget)} style={btn}>
-                      {stateForView.loops.slice().reverse().map(loop => <option key={loop.seq} value={loop.seq}>第 {loop.round} 轮 · Loop #{loop.seq}</option>)}
-                    </select></label>
-                    <button type="button" style={btn} onClick={() => selectLoop(stateForView.loops[stateForView.loops.length - 1].seq, detailTarget)}>返回最新 Loop</button>
-                  </div>}
-                  {selectedSeq != null && stateForView.loops.find((l) => l.seq === selectedSeq) && (
-                    <LoopDetail key={selectedSeq} loop={stateForView.loops.find((l) => l.seq === selectedSeq)!} progress={progress}
-                      target={detailTarget} onTarget={setDetailTarget} error={detailErrors[selectedSeq]?.message}
-                      onRetry={retryDetail}
-                      onClose={() => selectLoop(null)} />
-                  )}
-                </>
-              ) : (
-                <>
-                  <MetricBar state={stateForView} />
-                  <PolicyCard onRefreshBackends={onRefreshBackends} sessionId={sessionId} policy={stateForView.policy} readOnly={inspectOnly}
-                    sessionBackendId={sessionBackendId} sessionRuntime={sessionRuntime} backends={backends} />
-                  <ExecuteStage
-                    state={stateForView} progress={progress}
-                    selectedSeq={selectedSeq} setSelectedSeq={selectLoop}
-                    detailTarget={detailTarget} onDetailTarget={setDetailTarget}
-                    detailError={selectedSeq == null ? undefined : detailErrors[selectedSeq]?.message}
-                    onRetryDetail={retryDetail}
-                    onRun={runIteration} onAdvanceOut={advanceOut} onSetAuto={setAuto}
-                    onAddAddon={addAddon} onRemoveAddon={removeAddon} onEditAddon={editAddon} onContinue={continueRound}
-                    onDiscard={discardLoop} onTakeover={(goal = '') => void takeover(goal)}
-                    running={running} busy={busy}
-                    goalDraft={goalDraft} setGoalDraft={setGoalDraft} onSaveGoal={saveGoal}
-                    onRefineGoal={refineGoal} inspectOnly={inspectOnly}
-                  />
-                </>
-              )}
-            </div>
-          </div>
-        </div>
-      </>
-    </LoopPromptContext.Provider>
-  );
+        </section>
+        {state.stage === 'loopout' && !readOnly && <section style={{ ...sealBox, marginBottom: 12 }}>
+          <label style={{ fontSize: 13 }}>新一轮目标
+            <LoopPromptTextarea value={nextGoal ?? state.goal} onValueChange={setNextGoal}
+              placeholder="新一轮目标（支持 @ 文件/SESSION；默认沿用上一轮，可修改或追加）"
+              containerStyle={{ marginTop: 6, width: '100%' }} style={{ ...inputBase, width: '100%', minHeight: 70, boxSizing: 'border-box' }} /></label>
+          <button style={{ ...btn, marginTop: 6 }} onClick={() => setRefineNext(true)}>微调新一轮目标</button>
+          {refineNext && <RefineBox onRefineGoal={refineGoal} onResult={setNextGoal} onCancel={() => setRefineNext(false)} />}
+        </section>}
+        {!readOnly && <details style={{ ...sealBox, fontSize: 12 }}><summary style={{ cursor: 'pointer' }}>
+          补充要求 · {(state.addons || []).filter(addon => addon.status === 'pending').length} 条待纳入</summary>
+          <p>纳入下一次适用规划；不修改当前已开始的调用。</p>
+          <AddonPanel addons={state.addons || []} onAdd={addAddon} onRemove={removeAddon} onEdit={editAddon} />
+        </details>}
+      </>}
+    </LoopWorkbench>
+  </LoopPromptContext.Provider>);
 };
 
 // ══ 意图守卫提示横幅（非阻塞）═══════════════════════════════════
@@ -612,111 +395,12 @@ const IntentBanner: React.FC<{ state: LoopStateT; sessionId: string }> = ({ stat
           </button>
         )}
         <span style={{ fontSize: 10.5, color: 'var(--theme-text-muted)' }}>
-          不打断执行。采纳=让模型按建议微调全局目标；也可手动改目标或「🗑 停止并删除本次」止损。
+          不打断执行。采纳会请求模型微调目标；也可手动编辑。正常停止与危险的丢弃记录是独立操作。
         </span>
       </div>
     </div>
   );
 };
-
-// ══ Header ════════════════════════════════════════════════════
-const Header: React.FC<{
-  stage: string;
-  sessionId: string;
-  actions?: React.ReactNode;
-  onClose?: () => void; embedded?: boolean; inspectOnly?: boolean;
-  viewMode?: 'panel' | 'flow'; setViewMode?: (v: 'panel' | 'flow') => void; canFlow?: boolean;
-}> = ({ stage, sessionId, actions, onClose, embedded, inspectOnly, viewMode, setViewMode, canFlow }) => (
-    <div style={{
-      display: 'flex', alignItems: 'center', gap: 'var(--ui-space-sm, 10px)', padding: 'var(--ui-loop-header-padding, 12px 18px)', flexWrap: 'wrap',
-      borderBottom: '1px solid var(--theme-border)',
-    }}>
-      <span style={{ fontSize: 18 }}>🔁</span>
-      <span style={{ fontSize: 15, fontWeight: 700, color: 'var(--theme-text)' }}>可视化 Loop</span>
-      <span style={{ fontSize: 12, color: 'var(--theme-accent)', fontFamily: 'monospace' }}>{stage}</span>
-      {inspectOnly && (
-        <span style={{ fontSize: 10.5, color: '#d29922', border: '1px solid #d2992255', borderRadius: 5, padding: '2px 6px' }}>
-          只读
-        </span>
-      )}
-      {/* ★ 视图切换：面板（原功能）⇄ 流程（执行追踪），随时切 */}
-      {canFlow && setViewMode && (
-        <div style={{ display: 'flex', gap: 0, border: '1px solid var(--theme-border)', borderRadius: 7, overflow: 'hidden', marginLeft: 4 }}>
-          <button onClick={() => setViewMode('panel')} title="面板视图（原功能）"
-            style={{ ...segBtn, ...(viewMode === 'panel' ? segActive : {}) }}>🗂 面板</button>
-          <button onClick={() => setViewMode('flow')} title="流程视图：执行追踪 / 每步耗时"
-            style={{ ...segBtn, ...(viewMode === 'flow' ? segActive : {}) }}>🔀 流程</button>
-        </div>
-      )}
-      <div style={{ flex: 1 }} />
-      <TokenUsageMonitor sessionId={sessionId} placement="header" />
-      {actions}
-      {!embedded && onClose && <button onClick={onClose} style={btn}>✕ 关闭</button>}
-    </div>
-  );
-
-// ══ Stage rail ════════════════════════════════════════════════
-const StageRail: React.FC<{ stage: string }> = ({ stage }) => {
-  const stages = ['loopidea', 'loopexecute', 'loopout'];
-  const cur = stages.indexOf(stage);
-  return (
-    <div style={{ display: 'flex', alignItems: 'center', gap: 0, padding: 'var(--ui-loop-rail-padding, 10px 18px)', borderBottom: '1px solid var(--theme-border)' }}>
-      {stages.map((s, i) => (
-        <React.Fragment key={s}>
-          <div style={{
-            display: 'flex', alignItems: 'center', gap: 6,
-            opacity: i <= cur ? 1 : 0.4,
-          }}>
-            <span style={{
-              width: 22, height: 22, borderRadius: '50%', flexShrink: 0,
-              display: 'flex', alignItems: 'center', justifyContent: 'center',
-              fontSize: 11, fontWeight: 700,
-              background: i < cur ? 'var(--theme-accent)' : i === cur ? 'var(--theme-accent-bg)' : 'var(--theme-bg-tertiary)',
-              color: i < cur ? '#fff' : 'var(--theme-accent)',
-              border: `1px solid ${i <= cur ? 'var(--theme-accent)' : 'var(--theme-border)'}`,
-            }}>{i < cur ? '✓' : i + 1}</span>
-            <span style={{ fontSize: 13, fontWeight: i === cur ? 700 : 500, color: i === cur ? 'var(--theme-text)' : 'var(--theme-text-muted)' }}>{s}</span>
-          </div>
-          {i < stages.length - 1 && (
-            <div style={{ flex: 1, height: 2, margin: '0 10px', background: i < cur ? 'var(--theme-accent)' : 'var(--theme-border)' }} />
-          )}
-        </React.Fragment>
-      ))}
-    </div>
-  );
-};
-
-// ══ Metric bar ════════════════════════════════════════════════
-const MetricBar: React.FC<{ state: LoopStateT }> = ({ state }) => (
-  <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', marginBottom: 16 }}>
-    <Metric label="最佳分数" value={state.bestScore.toFixed(0)} accent={scoreColor(state.bestScore)} />
-    <Metric label="最近分数" value={state.latestScore.toFixed(0)} accent={scoreColor(state.latestScore)} />
-    <Metric label={state.round > 1 ? `本轮 Loop（第${state.round}轮）` : '已跑 Loop'} value={`${state.roundLoopCount} / ${state.effectiveMaxLoops}`} />
-    <RiskMetric risk={state.riskCoefficient} factors={state.riskFactors} />
-    {state.bestScore >= 70 && <Badge text="可交付" color="#2da44e" />}
-    {state.bestScore >= 85 && <Badge text="可输出" color="#8957e5" />}
-    {state.status !== 'active' && <Badge text={state.status} color="#bf8700" />}
-  </div>
-);
-
-const Metric: React.FC<{ label: string; value: string; accent?: string }> = ({ label, value, accent }) => (
-  <div style={metricBox}>
-    <div style={{ fontSize: 11, color: 'var(--theme-text-muted)' }}>{label}</div>
-    <div style={{ fontSize: 20, fontWeight: 700, color: accent || 'var(--theme-text)', fontFamily: 'monospace' }}>{value}</div>
-  </div>
-);
-
-const RiskMetric: React.FC<{ risk: number; factors?: Record<string, number> }> = ({ risk, factors }) => (
-  <div style={metricBox} title={factors ? Object.entries(factors).map(([k, v]) => `${k}: ${v}`).join('\n') : undefined}>
-    <div style={{ fontSize: 11, color: 'var(--theme-text-muted)' }}>风险系数</div>
-    <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-      <div style={{ fontSize: 20, fontWeight: 700, fontFamily: 'monospace', color: riskColor(risk) }}>{risk.toFixed(2)}</div>
-      <div style={{ width: 50, height: 6, borderRadius: 3, background: 'var(--theme-bg-tertiary)', overflow: 'hidden' }}>
-        <div style={{ width: `${risk * 100}%`, height: '100%', background: riskColor(risk) }} />
-      </div>
-    </div>
-  </div>
-);
 
 const Badge: React.FC<{ text: string; color: string }> = ({ text, color }) => (
   <div style={{
@@ -728,10 +412,9 @@ const Badge: React.FC<{ text: string; color: string }> = ({ text, color }) => (
 // ══ Idea stage ════════════════════════════════════════════════
 const IdeaStage: React.FC<{
   state: LoopStateT; ideaInput: string; setIdeaInput: (v: string) => void;
-  goalDraft: string; setGoalDraft: (v: string) => void;
-  onSubmit: (images?: ImageAttachment[]) => void; onSeal: () => void; busy: boolean;
+  onSubmit: (images?: ImageAttachment[]) => void; busy: boolean;
   onRemove: (id: string) => void;
-}> = ({ state, ideaInput, setIdeaInput, goalDraft, setGoalDraft, onSubmit, onSeal, busy, onRemove }) => {
+}> = ({ state, ideaInput, setIdeaInput, onSubmit, busy, onRemove }) => {
   const runningCount = state.ideas.filter((i) => i.status === 'running').length;
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const { images, removeImage, clearImages } = useClipboardImage(inputRef);
@@ -742,7 +425,7 @@ const IdeaStage: React.FC<{
   return (
     <div>
       <p style={{ fontSize: 13, color: 'var(--theme-text-muted)', margin: '0 0 12px' }}>
-        头脑风暴阶段 · 非阻塞投递想法（可粘贴图片），后端最多 3 个并发展开。封口后形成全局目标并单向进入 loopexecute。
+        也可以投递想法和参考图片，由模型分别展开。
         {runningCount > 0 && <span style={{ color: 'var(--theme-accent)' }}> · {runningCount} 个进行中</span>}
       </p>
 
@@ -757,7 +440,7 @@ const IdeaStage: React.FC<{
           containerStyle={{ flex: 1 }}
           style={{ ...inputBase, width: '100%', minHeight: 56, resize: 'vertical' }}
         />
-        <button onClick={submit} disabled={!ideaInput.trim() && images.length === 0}
+        <button onClick={submit} disabled={busy || (!ideaInput.trim() && images.length === 0)}
           style={{ ...primaryBtn, opacity: (ideaInput.trim() || images.length) ? 1 : 0.5 }}>投递</button>
       </div>
 
@@ -771,7 +454,7 @@ const IdeaStage: React.FC<{
               <StatusDot status={idea.status} />
               <span style={{ fontSize: 11, color: 'var(--theme-text-muted)' }}>{idea.status}</span>
               <div style={{ flex: 1 }} />
-              <button onClick={() => onRemove(idea.id)} style={miniX} title="删除">✕</button>
+              <button disabled={busy} onClick={() => onRemove(idea.id)} style={miniX} title="删除">✕</button>
             </div>
             {(idea.images || []).length > 0 && (
               <div style={{ display: 'flex', gap: 4, marginBottom: 5, flexWrap: 'wrap' }}>
@@ -788,19 +471,7 @@ const IdeaStage: React.FC<{
         ))}
       </div>
 
-      <div style={sealBox}>
-        <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--theme-text)', marginBottom: 8 }}>封口 → 形成全局目标</div>
-        <LoopPromptTextarea
-          value={goalDraft}
-          onValueChange={setGoalDraft}
-          placeholder="可选：直接写全局目标；支持 @ 文件/SESSION。留空则由模型收敛。"
-          containerStyle={{ width: '100%', marginBottom: 10 }}
-          style={{ ...inputBase, minHeight: 60, resize: 'vertical', width: '100%' }}
-        />
-        <button onClick={onSeal} disabled={busy} style={{ ...primaryBtn, background: '#bf8700' }}>
-          🔒 封口并进入 loopexecute
-        </button>
-      </div>
+
     </div>
   );
 };
@@ -830,7 +501,7 @@ const AddonPanel: React.FC<{
         )}
       </div>
       <div style={{ fontSize: 11, color: 'var(--theme-text-muted)', marginBottom: 8, lineHeight: 1.5 }}>
-        随手补充要求（可粘贴图片）—— <b>不影响当前正在跑的 loop</b>；下一次 loop 的分析与规划会带上并设法完成。纳入前可随时增删。已纳入的见下方「Addon 历史」。
+        支持粘贴图片；纳入下一次适用规划，不改变当前调用。纳入前可编辑或移除，已纳入内容见「目标与补充」。
       </div>
       {images.length > 0 && <ImagePreview images={images} onRemove={removeImage} />}
       <div style={{ display: 'flex', gap: 8, marginBottom: pending.length ? 12 : 0, alignItems: 'flex-end' }}>
@@ -1006,103 +677,6 @@ const AddonHistoryCard: React.FC<{ addons: Addon[]; loops: LoopRecord[] }> = ({ 
   );
 };
 
-// ══ loopout 引导：本轮产出 + 开启新一轮 ════════════════════════
-const LoopOutBanner: React.FC<{
-  state: LoopStateT; onContinue: (goal: string) => void;
-  onTakeover: (goal: string) => void; busy: boolean;
-  onSetAuto: (on: boolean) => void;
-  onRefineGoal: (hint: string, images?: ImageAttachment[]) => Promise<{ status: string; goal?: string; message?: string }>;
-}> =
-  ({ state, onContinue, onTakeover, busy, onSetAuto, onRefineGoal }) => {
-    const [goal, setGoal] = useState(state.goal || '');
-    const [editing, setEditing] = useState(false);
-    const [refineOpen, setRefineOpen] = useState(false);
-    return (
-      <div style={{ ...sealBox, marginBottom: 16, borderColor: '#8957e555', background: '#8957e50d' }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6 }}>
-          <span style={{ fontSize: 14, fontWeight: 700, color: 'var(--theme-text)' }}>
-            ✅ loopout · 第 {state.round} 轮已产出
-          </span>
-          <span style={{ fontSize: 12, color: 'var(--theme-text-muted)' }}>最佳分数 {state.bestScore.toFixed(0)}</span>
-        </div>
-        {state.stopReason && (
-          <div style={{ fontSize: 12, color: 'var(--theme-text-muted)', marginBottom: 8 }}>收口原因：{state.stopReason}</div>
-        )}
-        <div style={{ fontSize: 12.5, color: 'var(--theme-text)', lineHeight: 1.6, marginBottom: 10 }}>
-          loopout 是本轮的产出阶段，<b>不是会话终点</b>。你可以在现有成果（同一工作目录与上下文）的
-          基础上 <b>设定 / 修改任务，开启新一轮迭代</b>——相当于一段新的 auto-loop，轮次 +1、趋势与
-          风险从头计。{state.auto && <span style={{ color: '#2da44e' }}> Auto 已开启：开启后将自动连跑。</span>}
-        </div>
-        {refineOpen ? (
-          <RefineBox onRefineGoal={onRefineGoal} onResult={(g) => setGoal(g)} onCancel={() => setRefineOpen(false)} />
-        ) : (
-          <>
-            {editing ? (
-              <LoopPromptTextarea
-                value={goal} onValueChange={setGoal}
-                placeholder="新一轮目标（支持 @ 文件/SESSION；默认沿用上一轮，可修改或追加）"
-                containerStyle={{ width: '100%', marginBottom: 10 }}
-                style={{ ...inputBase, width: '100%', minHeight: 64, resize: 'vertical' }}
-              />
-            ) : (
-              <div
-                onClick={() => setEditing(true)}
-                title="点击修改新一轮目标"
-                style={{ fontSize: 13, color: 'var(--theme-text)', lineHeight: 1.6, marginBottom: 10, padding: '8px 10px', borderRadius: 8, background: 'var(--theme-bg-secondary)', border: '1px dashed var(--theme-border)', cursor: 'text', whiteSpace: 'pre-wrap' }}
-              >
-                🎯 {goal || '（点击设定新一轮目标）'}
-              </div>
-            )}
-            <div style={{ display: 'flex', gap: 8, marginBottom: 12 }}>
-              <button onClick={() => setRefineOpen(true)} style={{ ...btn, ...btnActive }}
-                title="给一句提示，让模型基于当前目标+原始诉求自动改写新一轮目标">✨ 微调目标</button>
-            </div>
-          </>
-        )}
-        <div style={{ display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}>
-          {/* 在离开 loopout 前显式展示持久化的 Auto 状态，避免用户在不知情时直接触发连跑。 */}
-          <button
-            onClick={() => onSetAuto(!state.auto)}
-            disabled={busy}
-            style={{
-              ...btn,
-              ...(state.auto ? { background: '#2da44e1f', color: '#2da44e', borderColor: '#2da44e55' } : {}),
-              opacity: busy ? 0.6 : 1,
-            }}
-            title="先设定新一轮是否自动连跑；在 loopout 中切换此项不会启动任务"
-          >
-            {state.auto ? '🔄 Auto 开（新一轮将自动连跑）' : '⏸ Auto 关（新一轮手动逐次运行）'}
-          </button>
-          <button
-            onClick={() => onContinue(goal.trim())}
-            disabled={busy}
-            style={{ ...primaryBtn, background: '#8957e5', opacity: busy ? 0.6 : 1 }}
-            title={state.running ? '先强制结束仍未退出的上一轮，再自动切换到新一轮' : undefined}
-          >
-            {state.running ? '⏹ 停止上一轮并开启新一轮' : `▶ 开启新一轮（第 ${state.round + 1} 轮 loopexecute）`}
-          </button>
-          <button
-            onClick={() => onTakeover(goal.trim())}
-            disabled={busy || !state.canTakeover}
-            style={{
-              ...btn,
-              borderColor: '#d2992266', color: '#d29922',
-              background: '#d2992212', opacity: (busy || state.running) ? 0.5 : 1,
-            }}
-            title={state.running
-              ? '上一轮仍在收尾，完成后才可开启人工轮'
-              : `开启第 ${state.round + 1} 轮并直接切到普通对话；本轮记为 Manual LOOP`}
-          >
-            ✋ 开启人工轮（第 {state.round + 1} 轮）
-          </button>
-          <span style={{ fontSize: 11.5, color: 'var(--theme-text-muted)' }}>
-            自动轮沿用 Auto 设置；人工轮会自动关闭 Auto
-          </span>
-        </div>
-      </div>
-    );
-  };
-
 // ══ Goal card：全局目标 + 演变历史 + 按提示微调 + 原始诉求回看 ═══
 const SRC_LABEL: Record<string, { t: string; c: string }> = {
   seal: { t: '封口汇总', c: '#0969da' },
@@ -1155,7 +729,7 @@ const PolicyCard: React.FC<{
           </button>
         )}
         <span style={{ fontSize: 11, color: 'var(--theme-text-muted)' }}>
-          可交付≥{p.deliverableScore} · 可输出≥{p.outputtableScore} · 最多 {p.maxLoops} loop · 风险≥{p.riskThreshold.toFixed(2)} 收口 · 评审{p.independentEval ? '独立防自欺' : '常规'}{Object.values(p.backends || {}).some(Boolean) ? ' · 异构 Backend' : ''}{Object.values(p.runtimes || {}).some((r) => r?.model || r?.reasoningEffort) ? ' · 模型分档' : ''}
+          诊断阈值 {p.deliverableScore}/{p.outputtableScore}（不代替验收） · 最多 {p.maxLoops} loop · 风险≥{p.riskThreshold.toFixed(2)} 收口 · 评审{p.independentEval ? '独立防自欺' : '常规'}{Object.values(p.backends || {}).some(Boolean) ? ' · 异构 Backend' : ''}{Object.values(p.runtimes || {}).some((r) => r?.model || r?.reasoningEffort) ? ' · 模型分档' : ''}
         </span>
       </div>
       {open && !readOnly && (
@@ -1171,6 +745,8 @@ const PolicyCard: React.FC<{
           </div>
         </div>
       )}
+      {readOnly && <details style={{ marginTop: 8 }}><summary>查看只读策略配置</summary>
+        <pre style={{ whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' }}>{JSON.stringify(p, null, 2)}</pre></details>}
     </div>
   );
 };
@@ -1216,11 +792,11 @@ const RefineBox: React.FC<{
 };
 
 const GoalCard: React.FC<{
-  state: LoopStateT; isOut: boolean;
+  state: LoopStateT;
   readOnly?: boolean;
   onRefineGoal: (hint: string, images?: ImageAttachment[]) => Promise<{ status: string; goal?: string; message?: string }>;
   goalDraft: string; setGoalDraft: (v: string) => void; onSaveGoal: () => void;
-}> = ({ state, isOut, readOnly = false, onRefineGoal, goalDraft, setGoalDraft, onSaveGoal }) => {
+}> = ({ state, readOnly = false, onRefineGoal, goalDraft, setGoalDraft, onSaveGoal }) => {
   const [mode, setMode] = useState<'view' | 'refine' | 'edit'>('view');
   const [showHist, setShowHist] = useState(false);
   const [showIdeas, setShowIdeas] = useState(false);
@@ -1320,114 +896,6 @@ const GoalCard: React.FC<{
   );
 };
 
-// ══ Execute stage ═════════════════════════════════════════════
-const ExecuteStage: React.FC<{
-  state: LoopStateT; progress: Record<string, string>;
-  selectedSeq: number | null; setSelectedSeq: (v: number | null, target?: DetailTarget) => void;
-  detailTarget: DetailTarget; onDetailTarget: (target: DetailTarget) => void;
-  detailError?: string; onRetryDetail: () => void;
-  onRun: () => void; onAdvanceOut: () => void; onSetAuto: (on: boolean) => void;
-  onAddAddon: (text: string, images?: ImageAttachment[]) => void; onRemoveAddon: (id: string) => void;
-  onEditAddon: (id: string, text: string, images?: any[]) => Promise<{ status: string; message?: string }>;
-  onContinue: (goal: string) => void; onDiscard: () => void; onTakeover: (goal?: string) => void;
-  running: boolean; busy: boolean;
-  goalDraft: string; setGoalDraft: (v: string) => void; onSaveGoal: () => void;
-  onRefineGoal: (hint: string, images?: ImageAttachment[]) => Promise<{ status: string; goal?: string; message?: string }>;
-  inspectOnly?: boolean;
-}> = ({ state, progress, selectedSeq, setSelectedSeq, detailTarget, onDetailTarget, detailError, onRetryDetail, onRun, onAdvanceOut, onSetAuto, onAddAddon, onRemoveAddon, onEditAddon, onContinue, onDiscard, onTakeover, running, busy, goalDraft, setGoalDraft, onSaveGoal, onRefineGoal, inspectOnly = false }) => {
-  const isOut = state.stage === 'loopout';
-  const selected = state.loops.find((l) => l.seq === selectedSeq) || null;
-  const runLabel = state.resumable
-    ? `▶ 继续未完成的 Loop #${state.loops.length}`
-    : `▶ 运行下一次 Loop${state.round > 1 ? `（第 ${state.round} 轮）` : ''}`;
-
-  return (
-    <div>
-      {/* 全局目标（含演变历史 + 按提示微调 + 原始诉求回看） */}
-      <GoalCard state={state} isOut={isOut} readOnly={inspectOnly} onRefineGoal={onRefineGoal}
-        goalDraft={goalDraft} setGoalDraft={setGoalDraft} onSaveGoal={onSaveGoal} />
-
-      {/* 操作 */}
-      {!isOut && !inspectOnly && (
-        <div style={{ display: 'flex', gap: 10, marginBottom: 18, alignItems: 'center', flexWrap: 'wrap' }}>
-          <button onClick={onRun} disabled={busy || running} style={{ ...primaryBtn, opacity: (busy || running) ? 0.5 : 1 }}>
-            {running ? '⏳ Loop 进行中…' : runLabel}
-          </button>
-          {/* ★ 自动连跑开关：开则一次 loop 完成自动续下一次，可随时取消 */}
-          <button
-            onClick={() => onSetAuto(!state.auto)}
-            disabled={busy}
-            style={{ ...btn, ...(state.auto ? { background: '#2da44e1f', color: '#2da44e', borderColor: '#2da44e55' } : {}) }}
-            title="自动连跑：开启后一次 loop 完成即自动开始下一次，直到收口或你取消"
-          >
-            {state.auto ? '🔄 Auto 连跑中（点此暂停）' : '⏸ Auto 关（点此自动连跑）'}
-          </button>
-          <button onClick={onAdvanceOut} disabled={busy} style={btn}>
-            {running ? '⏹ 停止并进入 loopout' : '⏹ 进入 loopout'}
-          </button>
-          <button
-            onClick={() => onTakeover()}
-            disabled={busy || !state.canTakeover}
-            style={{ ...btn, borderColor: '#d2992255', color: '#d29922', opacity: state.canTakeover ? 1 : 0.5 }}
-            title={state.resumable ? '存在未完成的 LOOP，请先继续或丢弃' : running ? 'LOOP 运行中不能接管' : '切换到普通会话；人工操作记为一轮 Manual LOOP'}
-          >
-            ✋ 人工接管
-          </button>
-          {/* ★ 误触兜底：停止并删除本次 loop（当作没发生过，addon 退回待纳入） */}
-          {(running || state.resumable) && (
-            <button onClick={onDiscard}
-              style={{ ...btn, background: '#f871711f', color: '#f87171', borderColor: '#f8717155', marginLeft: 'auto' }}
-              title="停止并删除本次 loop：不保存结果，已消费的补充(addon)退回待纳入">
-              🗑 停止并删除本次
-            </button>
-          )}
-          {state.auto && running && (
-            <span style={{ fontSize: 12, color: 'var(--theme-text-muted)' }}>完成本次后将自动继续…</span>
-          )}
-        </div>
-      )}
-      {/* loopout：不是终点 —— 展示本轮产出小结 + 开启新一轮的引导 */}
-      {isOut && !inspectOnly && <LoopOutBanner state={state} onContinue={onContinue}
-        onTakeover={(goal) => onTakeover(goal)} busy={busy}
-        onSetAuto={onSetAuto} onRefineGoal={onRefineGoal} />}
-
-      {/* ★ 执行中补充（addon）：不影响当前 loop，下一次 loop 纳入并完成 */}
-      {!isOut && !inspectOnly && <AddonPanel addons={state.addons || []} onAdd={onAddAddon} onRemove={onRemoveAddon} onEdit={onEditAddon} />}
-
-      {/* ★ Addon 历史：哪一轮/哪次 loop 纳入了哪些补充（执行中 & loopout 都可看） */}
-      <AddonHistoryCard addons={state.addons || []} loops={state.loops} />
-
-      {/* Loop 时间轴（多轮时按轮分隔） */}
-      <div style={{ display: 'flex', gap: 10, overflowX: 'auto', paddingBottom: 12, marginBottom: 8, alignItems: 'stretch' }}>
-        {state.loops.length === 0 && <div style={{ color: 'var(--theme-text-muted)', fontSize: 13 }}>还没有 loop，点击上方按钮开始第 1 次。</div>}
-        {state.loops.slice().reverse().map((l, i, arr) => {
-          const newRound = state.round > 1 && (i === 0 || arr[i - 1].round !== l.round);
-          return (
-            <React.Fragment key={l.seq}>
-              {newRound && (
-                <div style={{ display: 'flex', alignItems: 'center', flexShrink: 0 }}>
-                  <span style={{ writingMode: 'vertical-rl', fontSize: 10, fontWeight: 700, color: 'var(--theme-accent)', background: 'var(--theme-accent-bg)', borderRadius: 6, padding: '6px 3px', letterSpacing: 1 }}>
-                    第 {l.round} 轮
-                  </span>
-                </div>
-              )}
-              <LoopNode loop={l} selected={l.seq === selectedSeq} onClick={() => setSelectedSeq(l.seq === selectedSeq ? null : l.seq)} onStage={target => setSelectedSeq(l.seq, target)} />
-            </React.Fragment>
-          );
-        })}
-      </div>
-
-      {/* 详情面板 */}
-      {selected && <LoopDetail key={selected.seq} loop={selected} progress={progress} target={detailTarget} onTarget={onDetailTarget}
-        error={detailError} onRetry={onRetryDetail} onClose={() => setSelectedSeq(null)} />}
-    </div>
-  );
-};
-
-// ══ 流程视图：把执行过程画成可追踪的流程图 ════════════════════
-//   每个 loop 一条横向泳道：[#seq] → Prepare → Execute(分步) → Analysis
-//   节点按状态着色，当前在跑的节点脉冲 + 入边走「marching ants」动线，
-//   每个节点/分步标注耗时（进行中实时累计）。
 function fmtDur(sec: number): string {
   if (!isFinite(sec) || sec <= 0) return '';
   if (sec < 1) return `${Math.round(sec * 1000)}ms`;
@@ -1477,7 +945,7 @@ const LoopFlowView: React.FC<{
   const activeSeq = activeLoopSeq(state);
 
   if (loops.length === 0) {
-    return <div style={{ color: 'var(--theme-text-muted)', fontSize: 13, padding: '20px 0' }}>还没有 loop —— 切回「面板」点运行开始第 1 次。</div>;
+    return <div style={{ color: 'var(--theme-text-muted)', fontSize: 13, padding: '20px 0' }}>尚无执行记录，可从工作台开始第一次运行。</div>;
   }
 
   return (
@@ -1636,57 +1104,6 @@ const FlowChip: React.FC<{
           })}
         </div>
       )}
-    </div>
-  );
-};
-
-const LoopNode: React.FC<{ loop: LoopRecord; selected: boolean; onClick: () => void; onStage: (target: DetailTarget) => void }> = ({ loop, selected, onClick, onStage }) => {
-  const score = loop.analysis?.scoreObserved === false || loop.blockerSummary?.status ? null : loop.analysis?.score ?? null;
-  const subIdx = SUB_ORDER.indexOf(loop.subStage);
-  const manual = loop.kind === 'manual';
-  return (
-    <div
-      onClick={onClick}
-      className="awu-card"
-      style={{
-        flexShrink: 0, width: 150, cursor: 'pointer', padding: 12, borderRadius: 12,
-        background: selected ? 'var(--theme-accent-bg)' : 'var(--theme-bg-secondary)',
-        border: `1px solid ${selected ? 'var(--theme-accent)' : 'var(--theme-border)'}`,
-      }}
-    >
-      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 8 }}>
-        <span style={{ fontSize: 12, fontWeight: 700, color: manual ? '#d29922' : 'var(--theme-text)' }}>
-          {manual ? 'Manual' : 'Loop'} #{loop.seq}
-        </span>
-        {manual ? <span style={{ fontSize: 16 }}>✋</span> : <ScoreRing score={score} pending={!loop.completed} />}
-      </div>
-      {/* 子阶段进度 */}
-      {!manual && <div style={{ display: 'flex', gap: 4, marginBottom: 8 }}>
-        {SUB_ORDER.slice(0, 3).map((s, i) => (
-          <button type="button" key={s} aria-label={`查看 Loop #${loop.seq} ${s} 阶段`} title={`${SUB_LABEL[s]} · ${STAGE_STATUS_LABEL[stageStatus(loop, s, false)]}`}
-            onClick={event => { event.stopPropagation(); onStage(s as DetailTarget); }} style={{
-            flex: 1, height: 14, border: 0, borderRadius: 2, cursor: 'pointer',
-            background: FLOW_STATUS_COLOR[stageStatus(loop, s, false)],
-            opacity: i === subIdx && !loop.completed ? 0.6 : 1,
-            animation: i === subIdx && !loop.completed ? 'awu-loop-pulse 1.2s infinite' : 'none',
-          }} />
-        ))}
-      </div>}
-      <div style={{ fontSize: 11, color: 'var(--theme-text-muted)' }}>
-        {loop.error ? '❌ 失败' : manual ? (loop.completed ? '✓ 已交还 LOOP' : '✋ 人工接管中') : loop.completed ? '✓ 完成' : `${SUB_LABEL[loop.subStage] || loop.subStage}…`}
-      </div>
-      {Object.entries(loop.stageDetails || {}).filter(([, value]) => ['degraded', 'retrying', 'error'].includes(value.status || '')).map(([stage, value]) => (
-        <div key={stage} style={{ marginTop: 4, color: FLOW_STATUS_COLOR[value.status || 'pending'], fontSize: 11 }}>
-          {SUB_LABEL[stage]} · {STAGE_STATUS_LABEL[value.status || 'pending']}
-        </div>
-      ))}
-      {loop.orchestration.length > 0 && !loop.completed && (
-        <div style={{ fontSize: 10, color: 'var(--theme-text-muted)', marginTop: 3 }}>
-          步骤 {loop.orchestration.filter((s) => s.status === 'done').length}/{loop.orchestration.length}
-          {loop.orchestration.some((s) => s.status === 'running') && ' · 执行中'}
-        </div>
-      )}
-      {loop.goal && <div style={{ fontSize: 11, color: 'var(--theme-text-muted)', marginTop: 4, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{loop.goal}</div>}
     </div>
   );
 };
@@ -1987,8 +1404,6 @@ const LoopDetail: React.FC<{
         <Section title={loop.blockerSummary?.status ? '任务级只读复核 · 未执行验收测试' : `累计目标诊断 · 整体分数 ${loop.analysis.score.toFixed(0)}`}
           extra={<BackendTag role="analysis" label={loop.backendLabels?.analysis} />}>
           <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginBottom: 8 }}>
-            {loop.analysis.deliverable && <Badge text="可交付" color="#2da44e" />}
-            {loop.analysis.outputtable && <Badge text="可输出" color="#8957e5" />}
             <span style={{ fontSize: 12, color: 'var(--theme-text-muted)', alignSelf: 'center' }}>
               优化空间 {(loop.analysis.optimizationPotential * 100).toFixed(0)}% · 趋势 {loop.analysis.trend || '—'}
             </span>
@@ -2075,36 +1490,6 @@ const StatusDot: React.FC<{ status: string }> = ({ status }) => {
   return <span style={{ width: 8, height: 8, borderRadius: '50%', background: c, animation: status === 'running' ? 'awu-loop-pulse 1.2s infinite' : 'none' }} />;
 };
 
-const ScoreRing: React.FC<{ score: number | null; pending: boolean }> = ({ score, pending }) => {
-  if (score === null) {
-    return <span style={{ fontSize: 11, color: 'var(--theme-text-muted)' }}>{pending ? '…' : '—'}</span>;
-  }
-  const col = scoreColor(score);
-  return (
-    <div style={{
-      width: 30, height: 30, borderRadius: '50%', display: 'flex', alignItems: 'center', justifyContent: 'center',
-      fontSize: 11, fontWeight: 700, color: col,
-      background: `conic-gradient(${col} ${score * 3.6}deg, var(--theme-bg-tertiary) 0deg)`,
-    }}>
-      <div style={{ width: 23, height: 23, borderRadius: '50%', background: 'var(--theme-bg-secondary)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-        {score.toFixed(0)}
-      </div>
-    </div>
-  );
-};
-
-function scoreColor(s: number): string {
-  if (s >= 85) return '#8957e5';
-  if (s >= 70) return '#2da44e';
-  if (s >= 40) return '#bf8700';
-  return '#f87171';
-}
-function riskColor(r: number): string {
-  if (r >= 0.7) return '#f87171';
-  if (r >= 0.4) return '#bf8700';
-  return '#2da44e';
-}
-
 // ══ styles ════════════════════════════════════════════════════
 const overlay: React.CSSProperties = {
   position: 'fixed', inset: 0, zIndex: 1200,
@@ -2136,10 +1521,6 @@ const inputBase: React.CSSProperties = {
   background: 'var(--theme-input-bg)', border: '1px solid var(--theme-border)',
   color: 'var(--theme-text)', borderRadius: 8, padding: '8px 10px', fontSize: 13, outline: 'none', fontFamily: 'inherit',
 };
-const metricBox: React.CSSProperties = {
-  padding: 'var(--ui-space-sm, 8px) var(--ui-space-md, 14px)', borderRadius: 10, background: 'var(--theme-bg-secondary)',
-  border: '1px solid var(--theme-border)', minWidth: 90,
-};
 const ideaCard: React.CSSProperties = {
   padding: 'var(--ui-section-padding, 12px)', borderRadius: 10, background: 'var(--theme-bg-secondary)', border: '1px solid var(--theme-border)',
 };
@@ -2151,14 +1532,6 @@ const miniX: React.CSSProperties = {
 };
 const linkBtn: React.CSSProperties = {
   background: 'none', border: 'none', color: 'var(--theme-accent)', cursor: 'pointer', fontSize: 12, padding: 0,
-};
-// 视图切换分段按钮
-const segBtn: React.CSSProperties = {
-  background: 'var(--theme-bg-tertiary)', border: 'none', color: 'var(--theme-text-muted)',
-  fontSize: 12, padding: '4px 10px', cursor: 'pointer',
-};
-const segActive: React.CSSProperties = {
-  background: 'var(--theme-accent-bg)', color: 'var(--theme-accent)', fontWeight: 600,
 };
 
 // 注入脉冲 / 流程动画（一次性）

@@ -11,6 +11,7 @@
     "outDir": ".home-test-dist"
   },
   "include": [
+    "src/utils/loopWorkbenchView.ts",
     "src/utils/codexCatalogSync.ts",
     "src/utils/codexModelOptions.ts",
     "src/utils/backendCatalog.ts",

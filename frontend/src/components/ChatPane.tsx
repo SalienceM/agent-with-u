@@ -896,9 +896,9 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
           background: 'transparent',
         }}
       >
-        {handoffStatus}
         {nodeBackendsError && <div role="alert" style={{ padding: 8, color: '#f85149', fontSize: 12 }}>{nodeBackendsError}</div>}
         <LoopPanel
+          controlFeedback={handoffStatus}
           key={`${sessionId}:${loopViewRetry}`}
           onRefreshBackends={refreshBackends}
           sessionId={sessionId}

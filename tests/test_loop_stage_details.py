@@ -4,7 +4,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from src.backend.bridge_ws import BridgeWS
-from src.backend.loop_store import LoopRecord, LoopState, STAGE_EXECUTE
+from src.backend.loop_store import LoopAnalysis, LoopRecord, LoopState, STAGE_EXECUTE
 
 
 class LoopStageDetailsTests(unittest.IsolatedAsyncioTestCase):
@@ -92,6 +92,7 @@ class LoopStageDetailsTests(unittest.IsolatedAsyncioTestCase):
     def test_compact_keeps_stage_status_but_never_sends_or_mutates_audit_bodies(self):
         bridge, _session, state, record = self.setup_case()
         huge = "x" * 1_000_000
+        record.analysis = LoopAnalysis(verified=huge, gaps=huge, next_focus=huge)
         record.stage_details = {"prepare": {"status": "degraded", "attemptCount": 1,
             "attempts": [{"rawOutput": huge, "parsed": {"goal": huge}, "validation": ["invalid"], "valid": False}]},
             "analysis": {"rawOutput": huge, "parsed": {"notes": huge}, "status": "done"}}
@@ -100,6 +101,9 @@ class LoopStageDetailsTests(unittest.IsolatedAsyncioTestCase):
         bridge._loop_states = {state.session_id: state}
         compact = bridge._loop_payload(state, compact=True)
         self.assertLess(len(json.dumps(compact)), 20_000)
+        self.assertEqual(compact["loops"][0]["analysisPreview"],
+                         {key: huge[:240] for key in ("verified", "gaps", "nextFocus")})
+        self.assertEqual(record.analysis.gaps, huge)
         self.assertEqual(compact["loops"][0]["stageDetails"]["prepare"]["status"], "degraded")
         full = json.loads(bridge._rpc_loopGetRecord(state.session_id, 1))["record"]
         self.assertEqual(full["stageDetails"]["prepare"]["attempts"][0]["rawOutput"], huge)
@@ -107,6 +111,22 @@ class LoopStageDetailsTests(unittest.IsolatedAsyncioTestCase):
 
     def test_legacy_records_have_no_fabricated_stage_originals(self):
         self.assertEqual(LoopRecord.from_dict({"seq": 4, "completed": True}).stage_details, {})
+
+    def test_many_history_records_keep_each_preview_bounded(self):
+        bridge, _session, state, _record = self.setup_case()
+        text = "bounded-history-" * 10_000
+        state.loops = [LoopRecord(seq=i, result=text,
+            analysis=LoopAnalysis(verified=text, gaps=text, next_focus=text))
+            for i in range(1, 61)]
+        bridge._loop_running = set()
+        bridge._loop_tasks = {}
+        compact = bridge._loop_payload(state, compact=True)
+        self.assertLess(len(json.dumps(compact)), 500_000)
+        for row in compact["loops"]:
+            self.assertEqual(row["result"], "")
+            self.assertLessEqual(len(row["resultPreview"]), 600)
+            self.assertTrue(all(len(value) <= 240 for value in row["analysisPreview"].values()))
+        self.assertEqual(state.loops[-1].analysis.gaps, text)
 
     async def test_planner_exception_keeps_failing_stage_previous_attempt_and_partial_tail(self):
         bridge, session, state, record = self.setup_case()

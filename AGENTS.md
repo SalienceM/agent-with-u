@@ -325,8 +325,8 @@ The global stage advances one-way: `loopidea → loopexecute → loopout`.
   loopout (stage → loopexecute, `round`+1, status active, risk reset), reusing the
   same working dir / agent context, with an optional new/edited goal. Scores, risk,
   trend, and the effective-max-loops budget are scoped **per round** (`round_loops()`);
-  `seq` stays globally unique. The LoopPanel shows a loopout banner with the
-  new-round box and renders the timeline with per-round dividers. Top-level iteration
+  `seq` stays globally unique. The workbench shows the round's result (not an
+  automatic success claim), a new-round goal and per-round history. Top-level iteration
   tasks are registered in `_loop_tasks`, so a manual transition while a backend step is
   stuck can cancel both the isolated backend call and its owning asyncio task. Entering
   loopout while running first seals the partial record as interrupted; starting a new
@@ -336,19 +336,27 @@ The global stage advances one-way: `loopidea → loopexecute → loopout`.
 
 Loop turns run silently against the agent (`_loop_run_agent`); their plans,
 results and scores stream to a dedicated **LoopPanel** (`frontend/src/components/
-LoopPanel.tsx`) via `loopUpdated` (full state) and `loopProgress` (sub-stage text
+LoopPanel.tsx`) via `loopUpdated` (compact state) and `loopProgress` (sub-stage text
 deltas) push events — they do **not** pollute the chat transcript. For a loop
 session the **LoopPanel is rendered inline as the pane's content** (ChatPane
 detects `sessionType === 'loop'` and renders `<LoopPanel embedded />` instead of
 the message list + chat input). This is deliberate: a loop session has **no
-free-form chat box** — all interaction is in the panel (stage rail / loop timeline /
- detail panels / addon / global "俺寻思" attention assistant /
-a header **view toggle 🗂 面板 ⇄ 🔀 流程**: the flow view (`LoopFlowView`, plain
-SVG/CSS — no d3 dep) draws each loop as a horizontal lane
-`#seq → Prepare → Execute(steps) → Analysis` with status colors, a pulsing
-node + marching-ants edge for whatever is currently running, and per-node /
-per-step durations (live-ticking while running). It is a **switchable alternate
-view** over the same state; the panel view is left untouched).
+free-form chat box**. `LoopPanel` is now a compatibility container for one
+`LoopWorkbench`: compact goal/status, one primary action, separate Auto/stop,
+and "更多操作" for takeover and dangerous discard (with separate disk-restore
+confirmation). There is no top-level panel/flow toggle, stage rail, metric bar
+or score-ring navigation. Scores are diagnostic detail, never completion badges.
+Source/environment/policy live in "任务设置"; "需要处理" retains related evidence
+and other unresolved issues without deciding scheduler outcomes. Opening/checking
+does not resume work. "过程与历史" keeps the flow lanes and independent stage/step
+details; "成果与证据" keeps acceptance and diagnostics; "目标与补充" keeps goal
+revisions, original images/ideas and applied Addons. Pending Addons have a compact
+entry on the main face and affect the next applicable planning boundary.
+`useLoopWorkbenchState` owns subscription/stream buffering and revision-coalesced
+lazy detail reads, keyed by owner/executor/Session. Hidden details and repeated
+pushes do not reload; historic selection stays put. Wide panes use a right detail
+split, narrow panes a full-width detail surface with Escape/back focus return.
+The global "俺寻思" entry remains outside this workbench.
 
 **Sandbox mode removed (UI + default-off).** The Layer-2 working-dir sandbox
 (`validate_tool_sandbox` / `validate_sandbox_path`) had incomplete, false-positive-prone
@@ -427,7 +435,7 @@ from the short-lived memory lock, freezing after acquiring the write lock; disk 
 must not hold the memory lock used by handoff mirrors and lightweight reads.
 Legacy takeover/release adapters still await terminal results. Release never schedules
 models/queues or enables Auto. The frontend shares per-user/executor/session feedback
-across menus, panel/flow and chat; strict 12-second waits include connection readiness.
+across menus, workbench/details and chat; strict 12-second waits include connection readiness.
 Unknown outcomes trigger one coalesced read, not write retry or polling. View hydration
 failure has its own read-only retry. Timeout and hydration guards must match the active
 request identity and phase, never a previous committed receipt. Never clear a reservation just because the UI
@@ -454,7 +462,7 @@ faults cannot be cleared by weaker probes or manual success. Environment waits d
 not fabricate model errors or erase normal-call/blocked-task evidence.
 Get/Check/SelectWorkflow RPCs enforce owner/executor/revision/idle boundaries;
 checks neither enable Auto nor resume work. Unknown/offline executor routing fails
-without fallback. `LoopExecutionEnvironment.tsx` is shared by panel/flow, with lazy
+without fallback. `LoopExecutionEnvironment.tsx` lives in workbench settings, with lazy
 details and no polling. No automatic install, PATH/ACL change or permission escape.
 See `docs/loop-adaptive-delivery.md`; opt-in native tests use isolated homes and a
 loopback fake provider, never production Sessions or paid model requests.
@@ -539,7 +547,7 @@ consumed: marked `applied` with the `seq` that incorporated them). Pending addon
 consumed (`loopEditAddon` edits text + images inline); applied ones remain as history — surfaced in a collapsible **"📌 Addon
 历史" card** (always available, incl. loopout) that groups applied addons by the
 loop (`appliedSeq` → round / `#seq`) that incorporated them. The active add/queue
-UI lives in the addon panel (execute stage only).
+UI lives in the workbench's "补充要求" disclosure (execution and result stages).
 
 **Global goal provenance & versioning.** Sealing ideas forms the **global goal**.
 The original ideas (`state.ideas`) are kept and surfaced in the LoopPanel's
@@ -591,7 +599,7 @@ constants — `effective_max_loops`, `_recompute_risk`, `_loop_should_stop`,
 deliverable/outputtable flags all read the policy. It is **editable at session
 creation** (NewSessionDialog shows `LoopPolicyEditor` for loop sessions, applied
 via `loopSetPolicy` right after `createSession`) and **viewable/adjustable live**
-(a collapsible "⚙️ 策略与心智" PolicyCard in the LoopPanel). Policy changes don't
+(a collapsible "⚙️ 策略与心智" PolicyCard in workbench task settings). Policy changes don't
 touch an in-flight loop — they take effect from the next prepare/analysis.
 Legacy stage files without `policy` migrate their old `maxLoops` into the policy.
 The shared editor + defaults live in `frontend/src/components/LoopPolicyEditor.tsx`.
@@ -714,8 +722,8 @@ only after the executor's authoritative chat-task registry is idle (persisted/lo
 `streaming` flags are not trusted); it seals the manual record without inventing an
 analysis score and returns ownership to LOOP. Opening and immediately releasing creates
 no empty pass and is not blocked by a paused sequence queue. During takeover, ChatPane's
-`🗂 LOOP 总览` opens `LoopPanel` in `inspectOnly` mode: the complete metrics, timeline,
-details, and panel/flow toggle remain visible in a read-only overlay while mutation
+`🗂 LOOP 总览` opens `LoopPanel` in `inspectOnly` mode: goals, history, evidence
+and settings remain inspectable in a read-only workbench while mutation
 controls stay hidden. The next automated prepare sees a non-empty manual record through
 loop history.
 

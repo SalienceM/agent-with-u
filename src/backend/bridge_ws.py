@@ -5285,6 +5285,11 @@ class BridgeWS(LoopSourceBridge, LoopEnvironmentBridge, LoopTaskBlockerBridge, L
                 rec["evolutionBasis"] = ""
                 analysis = rec.get("analysis")
                 if isinstance(analysis, dict):
+                    # 工作台只呈现有界摘要，原文仍由 loopGetRecord 按需读取。
+                    rec["analysisPreview"] = {
+                        key: str(analysis.get(key) or "")[:240]
+                        for key in ("verified", "gaps", "nextFocus")
+                    }
                     analysis["hasDetails"] = bool(
                         analysis.get("notes") or analysis.get("trend") or analysis.get("challenges")
                         or analysis.get("verified") or analysis.get("gaps") or analysis.get("nextFocus")
