@@ -18,6 +18,7 @@ export async function openSessionMenu(page: Page, pane: Locator, keyboard = fals
 export async function selectMode(page: Page, pane: Locator, mode: 'Chat' | 'Engine') {
   const menu = await openSessionMenu(page, pane);
   await menu.getByRole('menuitemradio', { name: new RegExp(`^${mode} ·`) }).click();
+  await expect(menu).toHaveCount(0);
 }
 
 // 预置已下载夹具，不接触 OS 用户目录；真实下载操作另有端到端用例。

@@ -15,7 +15,13 @@ MAX_BLOCKERS = 50
 
 
 class ContractError(ValueError):
-    pass
+    def __init__(self, message: str, *, code: str = 'plan_invalid', field: str = '',
+                 origin: str = 'output', repairable: bool = True,
+                 affected: list[str] | None = None) -> None:
+        super().__init__(message)
+        self.code, self.field = code, field
+        self.origin, self.repairable = origin, repairable
+        self.affected = affected or []
 
 
 def text(value: Any, limit: int = 1200) -> str:
@@ -39,8 +45,21 @@ def refs(value: Any) -> list[str]:
     return [text(v, 240) for v in value]
 
 
-def invalid(reason: str) -> dict:
-    return {'version': 1, 'valid': False, 'reason': reason, 'items': []}
+def invalid(reason: str, *, code: str = 'plan_invalid', field: str = '',
+            origin: str = 'unknown', repairable: bool = False,
+            affected: list[str] | None = None) -> dict:
+    return {'version': 1, 'valid': False, 'reason': reason[:1200], 'items': [],
+            'reasonCode': code, 'origin': origin, 'repairable': repairable,
+            'fields': [field[:160]] if field else [],
+            'affectedIds': [v[:120] for v in (affected or [])[:MAX_TASKS]],
+            'scopeUnknown': not bool(affected) or len(affected or []) > MAX_TASKS, 'evidenceRefs': []}
+
+
+def contract_error(exc: Exception, field: str = '', *, origin: str = 'output') -> dict:
+    if isinstance(exc, ContractError):
+        return invalid(str(exc), code=exc.code, field=exc.field or field,
+                       origin=exc.origin, repairable=exc.repairable, affected=exc.affected)
+    return invalid('任务协议字段缺失或类型无效', field=field, origin=origin, repairable=True)
 
 
 def task_graph(raw: Any) -> list[dict]:
@@ -86,26 +105,38 @@ def scope_shape(tasks: list[dict]) -> dict:
 
 
 def freeze_plan(raw: Any, steps: list[dict], source: dict, identity: dict,
-                previous: dict | None = None) -> dict:
+                previous: dict | None = None, *, required: bool = False) -> dict:
     """Legacy absence is unknown, but a malformed new contract is not legacy."""
-    if raw is None and not any(s.get('taskMappingValid') is False or s.get('taskIds') or s.get('dependsOn') or s.get('preconditionIds') or s.get('testWritesUserData') for s in steps):
+    if not required and raw is None and not any(s.get('taskMappingValid') is False or s.get('taskIds') or s.get('dependsOn') or s.get('preconditionIds') or s.get('testWritesUserData') for s in steps):
         return {}
+    field = 'taskPlan'
     try:
+        if source.get('binding') and source.get('status') != 'current':
+            raise ContractError('正式任务来源尚未核对', code='source_unavailable',
+                                origin='source', repairable=False)
+        if previous and not previous.get('valid'):
+            raise ContractError('历史冻结任务范围无效，需显式修复', code='historical_scope_invalid',
+                                origin='history', repairable=False)
         if not isinstance(raw, dict) or set(raw) - {'version', 'tasks', 'preconditions'} or type(raw.get('version')) is not int or raw['version'] != 1:
             raise ContractError('不支持的任务计划协议')
+        field = 'taskPlan.tasks'
         tasks = task_graph(raw.get('tasks'))
         graph = shape(tasks)
         if source.get('binding'):
             snapshot = source.get('snapshot', {})
-            if source.get('status') != 'current' or set(graph) != {t['id'] for t in snapshot.get('tasks', [])}:
-                raise ContractError('任务编号与正式来源冲突')
+            formal_ids = {t['id'] for t in snapshot.get('tasks', [])}
+            if set(graph) != formal_ids:
+                raise ContractError('模型任务编号与当前正式来源不一致', code='task_ids_mismatch',
+                                    affected=sorted(set(graph) ^ formal_ids))
         if previous and (not previous.get('valid') or scope_shape(previous.get('tasks', [])) != scope_shape(tasks)):
-            raise ContractError('未解决阻塞的任务编号或依赖漂移')
+            raise ContractError('未解决阻塞的任务编号或依赖漂移', code='frozen_scope_mismatch')
+        field = 'taskPlan.preconditions'
         preconditions = raw.get('preconditions', [])
         if not isinstance(preconditions, list) or len(preconditions) > 50:
             raise ContractError('前置超限')
         conditions = []
-        for p in preconditions:
+        for p_index, p in enumerate(preconditions):
+            field = f'taskPlan.preconditions[{p_index}]'
             if not isinstance(p, dict) or set(p) - {'id', 'affectedTaskIds', 'writeKind', 'isolatedRoot', 'verificationMethod', 'configRevision', 'evidenceRefs', 'baselineBasis'}:
                 raise ContractError('未知前置字段/身份')
             affected = ids(p.get('affectedTaskIds'), nonempty=True)
@@ -119,7 +150,8 @@ def freeze_plan(raw: Any, steps: list[dict], source: dict, identity: dict,
         if len(by_id) != len(conditions):
             raise ContractError('前置编号重复')
         mappings = []
-        for step in steps:
+        for step_index, step in enumerate(steps):
+            field = f'orchestration[{step_index}]'
             if step.get('taskMappingValid') is False:
                 raise ContractError('步骤原始映射无效')
             task_ids = ids(step.get('taskIds'), nonempty=True)
@@ -143,7 +175,7 @@ def freeze_plan(raw: Any, steps: list[dict], source: dict, identity: dict,
         result['planId'] = digest(result)
         return result
     except (ContractError, KeyError, TypeError, RecursionError) as exc:
-        return invalid(str(exc))
+        return contract_error(exc, field)
 
 
 def normalize_blockers(raw: Any, plan: dict, identity: dict, *, boundary: str) -> dict:
@@ -170,7 +202,7 @@ def normalize_blockers(raw: Any, plan: dict, identity: dict, *, boundary: str) -
                 'identity': copy.deepcopy(identity), 'planId': plan['planId'], 'boundary': boundary})
         return {'version': 1, 'valid': True, 'items': items}
     except (ContractError, KeyError, TypeError) as exc:
-        return invalid(str(exc))
+        return invalid(str(exc), code='blockers_invalid', field='taskBlockers', origin='blocker')
 
 
 def merge_blockers(previous: dict, incoming: dict) -> dict:
@@ -202,14 +234,27 @@ def closure(tasks: list[dict], affected: set[str]) -> set[str]:
 
 
 def reduce_scope(plan: dict, blockers: dict, identity: dict, report: dict | None = None) -> dict:
+    # 保留原校验原因；无效计划、身份变化与旧阻塞损坏不能折叠成同一句话。
+    failure = None
+    if not plan.get('valid'):
+        failure = copy.deepcopy(plan) if plan else invalid('缺少冻结任务计划', field='taskPlan')
+    elif plan.get('identity') != identity:
+        dimensions = [key for key in identity if plan.get('identity', {}).get(key) != identity[key]]
+        failure = invalid('冻结计划的执行身份已变化', code='identity_mismatch',
+                          origin='identity', field='identity')
+        failure['identityDimensions'] = dimensions[:16]
+    elif blockers and not blockers.get('valid'):
+        failure = invalid(blockers.get('reason') or '历史阻塞协议无效', code='blockers_invalid',
+                          origin='history', field='unresolvedBlockers')
+    if failure is not None:
+        return {**failure, 'valid': False, 'readyIds': [], 'affectedIds': failure.get('affectedIds', [])}
     try:
-        if not plan.get('valid') or plan.get('identity') != identity or (blockers and not blockers.get('valid')):
-            raise ContractError('任务映射/阻塞身份未确认')
         tasks = task_graph((report or {}).get('items', plan['tasks']))
         if scope_shape(tasks) != scope_shape(plan['tasks']):
             raise ContractError('评审遗漏任务或改写依赖')
         if any(b.get('identity') != identity for b in blockers.get('items', [])):
-            raise ContractError('历史阻塞身份/来源修订改变，需核对而不是丢弃')
+            raise ContractError('历史阻塞身份/来源修订改变，需核对而不是丢弃',
+                                code='identity_mismatch', origin='identity', repairable=False)
         affected = set().union(*(set(b['affectedTaskIds']) for b in blockers.get('items', []))) if blockers.get('items') else set()
         if not affected <= shape(tasks).keys():
             raise ContractError('历史阻塞任务被遗漏')
@@ -219,7 +264,25 @@ def reduce_scope(plan: dict, blockers: dict, identity: dict, report: dict | None
                  and set(t['dependsOn']) <= verified]
         return {'valid': True, 'affectedIds': sorted(frozen), 'readyIds': ready}
     except (ContractError, KeyError, TypeError, RecursionError) as exc:
-        return {'valid': False, 'affectedIds': [], 'readyIds': [], 'reason': str(exc)}
+        return {**contract_error(exc, 'taskScope'), 'readyIds': []}
+
+
+def validate_candidate(raw: Any, steps: list[dict], source: dict, identity: dict,
+                       previous: dict | None = None, blockers: dict | None = None,
+                       *, required: bool = True) -> dict:
+    """只产生候选；调用方在身份边界提交，不在校验中修改任何现有记录。"""
+    if not isinstance(steps, list) or not 1 <= len(steps) <= 4 or any(
+            not isinstance(s, dict) or not isinstance(s.get('desc'), str) or not s['desc'].strip()
+            for s in steps):
+        return invalid('计划需要 1–4 个有任务说明的步骤', code='steps_invalid',
+                       field='orchestration', origin='output', repairable=True)
+    plan = freeze_plan(raw, steps, source, identity, previous, required=required)
+    if not plan and not blockers:
+        return {'version': 1, 'valid': True, 'legacy': True, 'plan': {}}
+    scope = reduce_scope(plan, blockers or {}, identity)
+    if not scope['valid']:
+        return scope
+    return {'version': 1, 'valid': True, 'plan': plan, 'scope': scope}
 
 
 def review_scope(raw: Any, report: dict, plan: dict, blockers: dict, identity: dict,

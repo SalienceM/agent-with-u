@@ -381,35 +381,25 @@ class ContinuationTests(unittest.IsolatedAsyncioTestCase):
         await self.bind()
         chosen = []
         async def model(session, prompt, sub_stage, seq, **kwargs):
-            if sub_stage == 'prepare':
-                task = '1.3 login shell' if seq == 1 else '1.4 Attributes and skills'
-                chosen.append(task)
-                return json.dumps({'goal': task, 'orchestration': [{'desc': task, 'mode': 'sequential', 'access': 'write'}],
-                    'milestonePlan': {'milestones': [{'id': 'shell', 'parentId': '1.3', 'originRef': '1.3',
-                        'acceptance': 'login shell', 'deliverable': 'operable shell', 'status': 'pending'}]}}), None
-            if sub_stage.startswith('step'):
-                (p.root / 'shell.py').write_text('stable shell', encoding='utf-8')
-                return 'Local batch finished; overall acceptance remains incomplete.', 'thread'
-            items = [dict(id=f'1.{i}', title=text, status='verified' if i < 3 else 'pending', evidence='fixture baseline' if i < 3 else '', dependsOn=[]) for i, text in enumerate(descriptions, 1)]
-            raw = dict(mode='delivery', source='openspec/changes/test-change/tasks.md', scopeComplete=True, items=items, blockers=[], verification={})
-            raw['milestones'] = [{'id': 'shell', 'status': 'implemented', 'mappingConfirmed': True, 'evidenceRefs': [{
-                'path': 'shell.py', 'fingerprint': hashlib.sha256((p.root / 'shell.py').read_bytes()).hexdigest(),
-                'environment': self.bridge._loop_evidence_environment(self.session, self.state.loops[-1]), 'command': 'fixture isolated test', 'result': 'passed'}]}]
-            return json.dumps({'score': 65, 'optimizationPotential': .8, 'delivery': raw}), None
+            self.assertEqual(sub_stage, 'execute')  # 不再先调用模型拆分第二份任务图。
+            chosen.append(seq)
+            self.assertIn('openspec-apply-change', prompt)
+            (p.root / 'shell.py').write_text('stable shell', encoding='utf-8')
+            if seq == 2:
+                p.tasks.write_text(p.tasks.read_text(encoding='utf-8').replace('- [ ] 1.3 ', '- [x] 1.3 '), encoding='utf-8')
+            return 'Local batch finished; overall acceptance remains incomplete.', 'thread'
         self.bridge._loop_run_agent = model
         with patch('src.backend.bridge_ws.git_snapshot', return_value='fixture'):
             for _ in range(3):
                 await self.bridge._run_loop_iteration('s')
-        self.assertEqual(chosen, ['1.3 login shell', '1.4 Attributes and skills', '1.4 Attributes and skills'])
+        self.assertEqual(chosen, [1, 2, 3])
         first, second, third = self.state.loops
-        self.assertEqual(first.delivery['milestoneSummary']['credited'], ['shell'])
-        self.assertEqual(second.delivery['milestoneSummary']['credited'], [])
-        self.assertEqual(third.delivery['milestoneSummary']['credited'], [])
-        self.assertEqual(self.state.progress_guard['noProgressCount'], 2)
+        self.assertEqual([r.openspec_run['progress']['checked'] for r in (first, second, third)], [2, 3, 3])
+        self.assertEqual([r.openspec_run['noProgress'] for r in (first, second, third)], [1, 0, 1])
         for rec in self.state.loops:
-            self.assertEqual(rec.delivery['reconciliation']['checked'], 2)
-            self.assertEqual(rec.delivery['reconciliation']['total'], 25)
-            self.assertFalse(completion_ready(rec.delivery))
+            self.assertFalse(rec.task_plan)
+            self.assertFalse(rec.delivery)
+            self.assertEqual(rec.openspec_run['progress']['total'], 25)
             self.assertIn(rec.decision['action'], ('continue', 'replan'))
             self.assertEqual(rec.orchestration[0].call_result, 'normal')
             self.assertEqual(rec.orchestration[0].task_result, 'unknown')

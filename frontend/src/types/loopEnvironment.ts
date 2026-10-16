@@ -30,6 +30,8 @@ export interface EnvironmentCheck {
 }
 
 export interface ExecutionEnvironment {
+  effectiveDependencies?: { version: number; sessionId: string; environmentRevision: number; sourceRevision: number;
+    items: Array<{ id: string; required: boolean; origins: Array<{ kind: string; status: string; ref: string; revision?: number; coverage?: string }> }> };
   checking?: boolean;
   revision: number;
   status: EnvironmentCheck['status'];

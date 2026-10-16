@@ -218,7 +218,12 @@ async def _codex_text(backend: ModelBackend, content: str, rules: str,
                     raise RuntimeError("Codex text generation did not complete")
                 return final or partial
     finally:
+        # 保留原生进程引用，close() 发出 kill 不等于已确认退出。
+        # 俺寻思的拥有者会在清理未结束时保持本次旁路预留，不锁主线。
+        process = conn.proc
         await conn.close()
+        if process is not None and process.returncode is None:
+            await process.wait()
 
 
 async def _deny_tool(*_args: Any, **_kwargs: Any) -> dict[str, str]:

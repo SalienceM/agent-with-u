@@ -98,7 +98,7 @@ class SkillManualTests(unittest.IsolatedAsyncioTestCase):
         bridge._chat_context_digest = Mock(return_value='fixture snapshot')
         bridge._session_runtime = Mock(return_value={})
         bridge._add_runtime_kwargs = Mock()
-        bridge._new_backend_instance = Mock(return_value=Mock())
+        bridge._new_backend_instance = Mock(return_value=Mock(config=SimpleNamespace(type='openai-compatible')))
         return bridge, turn
 
     async def test_reference_reads_authoritative_document_via_text_only_not_normal_runner(self):
@@ -107,7 +107,7 @@ class SkillManualTests(unittest.IsolatedAsyncioTestCase):
         async def answer(_backend, **kwargs):
             self.assertIn('authoritative guide', kwargs['content'])
             self.assertNotIn('client forged document', kwargs['content'])
-            kwargs['on_delta'](StreamDelta('session:chataside', 'm', 'text_delta', text='guide answer'))
+            kwargs['on_delta'](StreamDelta('session:chataside', 'm', 'text_delta', text=json.dumps({'type': 'answer', 'text': 'guide answer'})))
         with patch('src.backend.text_only.send_text_only', side_effect=answer) as send:
             await bridge._run_chat_aside('session', 'turn', attention={'content': ''})
             send.assert_awaited_once()
@@ -127,20 +127,26 @@ class SkillManualTests(unittest.IsolatedAsyncioTestCase):
             answer='已了解兼容要求', status='done'))
         image = fixture_image()
         async def answer(_backend, **kwargs):
+            payload = json.loads(kwargs['content'])
+            facts = payload['context']['registeredSkillFacts']
             self.assertIn('Original usage', kwargs['content'])
             self.assertIn('registeredCommandsForReferences', kwargs['content'])
             self.assertIn('registeredProjectCommands', kwargs['content'])
-            self.assertIn('"registeredProjectCommands": []', kwargs['content'])
+            self.assertIn('"registeredProjectCommands": []', facts)
             self.assertNotIn('/opsx-init', kwargs['content'])
             self.assertIn('俺寻思这里只答疑', kwargs['content'])
-            self.assertIn('Current project: existing todo application', kwargs['content'])
             self.assertIn('项目要保留旧接口', kwargs['content'])
             self.assertIn('项目规范', kwargs['content'])
-            self.assertIn('"sessionId": "session"', kwargs['content'])
+            self.assertIn('"sessionId": "session"', facts)
             self.assertIn('/skill demo', kwargs['content'])
-            self.assertIn('"enabledInSession": true', kwargs['content'])
+            self.assertIn('"enabledInSession": true', facts)
             self.assertEqual(kwargs['images'], [image])
-            kwargs['on_delta'](StreamDelta('session:chataside', 'm', 'text_delta', text='image answer'))
+            if not payload['queryResults']:
+                packet = {'type': 'query', 'queries': [{'operation': 'read_text', 'arguments': {'path': 'README.md'}}]}
+            else:
+                self.assertIn('Current project: existing todo application', kwargs['content'])
+                packet = {'type': 'answer', 'text': 'image answer'}
+            kwargs['on_delta'](StreamDelta('session:chataside', 'm', 'text_delta', text=json.dumps(packet)))
         with patch('src.backend.text_only.send_text_only', side_effect=answer):
             await bridge._run_chat_aside('session', 'turn', images=[image])
         self.assertEqual(turn.context_label, 'fixture')
@@ -167,9 +173,9 @@ class SkillManualTests(unittest.IsolatedAsyncioTestCase):
         async def answer(_backend, **kwargs):
             self.assertIn('Original usage', kwargs['content'])
             self.assertIn('registeredCommandsForReferences', kwargs['content'])
-            self.assertIn('"enabledInSession": false', kwargs['content'])
+            self.assertIn('"enabledInSession": false', json.loads(kwargs['content'])['context']['registeredSkillFacts'])
             self.assertEqual(kwargs['images'], [image])
-            kwargs['on_delta'](StreamDelta('session:aside', 'm', 'text_delta', text='loop image answer'))
+            kwargs['on_delta'](StreamDelta('session:aside', 'm', 'text_delta', text=json.dumps({'type': 'answer', 'text': 'loop image answer'})))
         with patch('src.backend.text_only.send_text_only', side_effect=answer) as send:
             await bridge._run_aside('session', 'turn', images=[image])
             send.assert_awaited_once()
@@ -198,7 +204,7 @@ class SkillManualTests(unittest.IsolatedAsyncioTestCase):
         async def answer(_backend, **kwargs):
             self.assertIn('actual preview', kwargs['content'])
             self.assertIn('Original usage', kwargs['content'])
-            kwargs['on_delta'](StreamDelta('session:chataside', 'm', 'text_delta', text='file answer'))
+            kwargs['on_delta'](StreamDelta('session:chataside', 'm', 'text_delta', text=json.dumps({'type': 'answer', 'text': 'file answer'})))
         with patch('src.backend.text_only.send_text_only', side_effect=answer):
             await bridge._run_chat_aside('session', 'turn', attention=attention)
         self.assertEqual(turn.status, 'done', turn.answer)
@@ -220,14 +226,14 @@ class SkillManualTests(unittest.IsolatedAsyncioTestCase):
         bridge._build_session_reference_context = Mock(side_effect=lambda content, _sid: content)
         bridge._send_skill_manual_answer = AsyncMock()
         bridge._skill_reference_snapshot = AsyncMock()
-        async def answer(**kwargs):
+        async def answer(_backend, **kwargs):
             # 历史问答可以保留；不能把历史中的 @SKILL 当成本条的新引用。
             self.assertIn('@SKILL:demo 如何使用', kwargs['content'])
-            self.assertIn('【用户的问题】\n有报错，看我如何安装呢', kwargs['content'])
+            self.assertEqual(json.loads(kwargs['content'])['question'], '有报错，看我如何安装呢')
             self.assertNotIn('显式引用的 Skill 使用资料', kwargs['content'])
-            kwargs['on_delta'](StreamDelta('session:chataside', 'm', 'text_delta', text='plain answer'))
-        bridge._new_backend_instance.return_value.send_message = AsyncMock(side_effect=answer)
-        with patch.object(self.manuals, 'context', side_effect=AssertionError('no new manual load')) as read:
+            kwargs['on_delta'](StreamDelta('session:chataside', 'm', 'text_delta', text=json.dumps({'type': 'answer', 'text': 'plain answer'})))
+        with patch.object(self.manuals, 'context', side_effect=AssertionError('no new manual load')) as read, \
+                patch('src.backend.text_only.send_text_only', side_effect=answer):
             await bridge._run_chat_aside('session', 'turn')
             read.assert_not_called()
         self.assertEqual(turn.status, 'done', turn.answer)

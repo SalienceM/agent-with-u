@@ -16,9 +16,10 @@ from .loop_store import LoopAnalysis, SUB_ANALYSIS, SUB_DONE
 from .loop_task_blockers import (freeze_plan, normalize_blockers, merge_blockers,
     reduce_scope, review_scope, protect_report, invalid, REVIEW_INSTRUCTIONS, ContractError, text)
 from .loop_task_isolation import isolation_gate, isolation_receipts, resolve_observations
+from .loop_task_recovery_bridge import LoopTaskRecoveryBridge
 
 
-class LoopTaskBlockerBridge:
+class LoopTaskBlockerBridge(LoopTaskRecoveryBridge):
     def _loop_review_identity(self, session: Any, record: Any) -> dict:
         backend_id = record.backends.get('analysis') or session.backend_id
         config = next((c for c in getattr(self, '_backend_configs', []) if c.id == backend_id), None)
@@ -50,19 +51,23 @@ class LoopTaskBlockerBridge:
         identity = self._loop_task_identity(session, state, record)
         if not record.task_plan:
             record.task_plan = freeze_plan(parsed.get('taskPlan'), [s.to_dict() for s in record.orchestration],
-                state.task_source, identity, state.blocked_task_scope if state.unresolved_blockers else None)
+                state.task_source, identity, state.blocked_task_scope if state.unresolved_blockers else None,
+                required=record.contract_required)
         if not record.task_plan and not state.unresolved_blockers:
             return True  # 旧计划无映射仍沿用旧语义，但不能由局部阻塞推断独立工作。
         scope = reduce_scope(record.task_plan, state.unresolved_blockers, identity)
         if not scope['valid']:
-            self._loop_wait(state, record, 'task_scope_unknown', scope['reason'])
+            if record.contract_required:
+                self._loop_contract_wait(state, record, scope)
+            else:
+                self._loop_wait(state, record, 'task_scope_unknown', scope['reason'])
             return False
         # 对模型计划做第二次原始步骤校验，持久化字段修改不能借旧 planId 通过。
         fresh = freeze_plan(parsed.get('taskPlan') or {
             'version': 1, 'tasks': record.task_plan['tasks'], 'preconditions': [
                 {k: v for k, v in p.items() if k != 'status'} for p in record.task_plan['preconditions']]},
             [s.to_dict() for s in record.orchestration], state.task_source, identity,
-            state.blocked_task_scope if state.unresolved_blockers else None)
+            state.blocked_task_scope if state.unresolved_blockers else None, required=record.contract_required)
         if not fresh.get('valid') or fresh['planId'] != record.task_plan['planId']:
             self._loop_wait(state, record, 'task_scope_unknown', '冻结步骤/任务计划发生漂移。')
             return False

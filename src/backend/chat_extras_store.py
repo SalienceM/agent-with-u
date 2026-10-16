@@ -92,10 +92,12 @@ class ChatAside:
     context_kind: str = "session"
     context_label: str = ""
     context_detail: str = ""
+    inspection: dict = field(default_factory=dict)
     created_at: float = field(default_factory=_now)
     updated_at: float = field(default_factory=_now)
 
     def to_dict(self) -> dict:
+        from .aside_inspection import clean_inspection
         return {
             "id": self.id,
             "question": self.question,
@@ -106,12 +108,14 @@ class ChatAside:
             "contextKind": self.context_kind,
             "contextLabel": self.context_label,
             "contextDetail": self.context_detail,
+            "inspection": clean_inspection(self.inspection),
             "createdAt": self.created_at,
             "updatedAt": self.updated_at,
         }
 
     @classmethod
     def from_dict(cls, d: dict) -> "ChatAside":
+        from .aside_inspection import clean_inspection
         d = migrate_reference_attention(d)
         return cls(
             id=d.get("id") or _nid(),
@@ -123,6 +127,7 @@ class ChatAside:
             context_kind=str(d.get("contextKind") or "session"),
             context_label=str(d.get("contextLabel") or ""),
             context_detail=str(d.get("contextDetail") or ""),
+            inspection=clean_inspection(d.get('inspection')),
             created_at=d.get("createdAt", _now()),
             updated_at=d.get("updatedAt", _now()),
         )

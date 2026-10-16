@@ -22,7 +22,8 @@ import { markdownToHtml } from '../utils/markdown';
 import { buildStandaloneMarkdownHtml, markdownHtmlFilename } from '../utils/markdownExport';
 import { GitPanel } from './GitPanel';
 import { WorkbenchFileCommands } from './WorkbenchFileCommands';
-import { WorkbenchButton, WorkbenchIcon, WorkbenchOverflow } from './WorkbenchChrome';
+import { WorkbenchButton, WorkbenchIcon, WorkbenchOverflow, WorkbenchPopover } from './WorkbenchChrome';
+import { filePanelGit, filePanelFeedback, filePanelComparison, type FilePanelFeedback } from '../utils/filePanelPresentation';
 import type { GitFileStatus, GitFileStatusType, GitStashEntry } from '../types/git';
 import { DiffViewer } from './DiffViewer';
 import { StructuredFilePreview, type StructuredPreviewPayload } from './StructuredFilePreview';
@@ -82,6 +83,8 @@ interface Props {
   isVisible?: boolean;
   onDocumentOpen?: () => void;
   onBrowseFiles?: () => void;
+  filesVisible?: boolean;
+  onSearchExit?: () => void;
 }
 
 /** 同一预览/编辑实现：Chat 仍是模态，Engine 只改变 DOM 挂载位置。 */
@@ -98,6 +101,8 @@ interface TNode {
   rel: string;
   isDir: boolean;
   size: number;
+  /** 旧执行端可能不返回 size；未知大小不能伪装成 0 B。 */
+  sizeKnown?: boolean;
   /** 懒加载目录直接返回的远端文件修改时间（Unix 毫秒）。 */
   remoteMtime?: number;
   /** 该条目实际存在于哪一端；合并树会把同路径的两端标记合在一个节点上。 */
@@ -352,7 +357,7 @@ const SearchHighlightedText: React.FC<{ text: string; query: string }> = ({ text
   ))}</>;
 };
 
-export const FileTreePanel: React.FC<Props> = React.memo(({ sessionId, workingDir, execKey, execLabel, execMode, backendId, focusRequest: externalFocusRequest, onAttentionChange, documentHost, isVisible = true, onDocumentOpen, onBrowseFiles }: Props) => {
+export const FileTreePanel: React.FC<Props> = React.memo(({ sessionId, workingDir, execKey, execLabel, execMode, backendId, focusRequest: externalFocusRequest, onAttentionChange, documentHost, isVisible = true, onDocumentOpen, onBrowseFiles, filesVisible = true, onSearchExit }: Props) => {
   const mountedRef = useRef(true);
   useEffect(() => {
     mountedRef.current = true;
@@ -417,6 +422,7 @@ export const FileTreePanel: React.FC<Props> = React.memo(({ sessionId, workingDi
 
   // ── Git 集成（首次检测 + 手动/操作后刷新，不做定时轮询）──
   const [gitAvailable, setGitAvailable] = useState(false);
+  const [gitDetected, setGitDetected] = useState(false);
   const [gitLoading, setGitLoading] = useState(!!workingDir);
   const [gitStatusReady, setGitStatusReady] = useState(false);
   const [gitError, setGitError] = useState('');
@@ -460,6 +466,8 @@ export const FileTreePanel: React.FC<Props> = React.memo(({ sessionId, workingDi
   const [stashesLoading, setStashesLoading] = useState(false);
   const [stashExpanded, setStashExpanded] = useState(false);
   const [stashOperating, setStashOperating] = useState<number | null>(null); // 正在操作的 stash index
+  const stashRead = useRef<{ scope: string; loaded: boolean; pending?: Promise<void> }>({ scope: '', loaded: false });
+  const [stashError, setStashError] = useState('');
 
   // 预览 / 编辑
   const [preview, setPreview] = useState<PreviewState | null>(null);
@@ -473,6 +481,45 @@ export const FileTreePanel: React.FC<Props> = React.memo(({ sessionId, workingDi
   const windowFrozen = useWindowWriteBlocked(execKey || '', sessionId);
   const previewScopeRef = useRef(previewScope);
   previewScopeRef.current = previewScope;
+  type Tool = 'more' | 'identity' | 'sync' | 'git' | 'feedback';
+  const [tool, setTool] = useState<{ kind: Tool; anchor: HTMLElement; id: number } | null>(null);
+  const toolSequence = useRef(0);
+  const openTool = (kind: Tool, anchor: HTMLElement) => setTool({ kind, anchor, id: ++toolSequence.current });
+  const [retainedErrors, setRetainedErrors] = useState<FilePanelFeedback[]>([]);
+  const [panelAction, setPanelAction] = useState('');
+  const panelActionRef = useRef(false);
+  const runPanelAction = async (label: string, action: () => unknown) => {
+    if (panelActionRef.current) return;
+    panelActionRef.current = true; setPanelAction(label);
+    const scope = previewScope;
+    try { await action(); }
+    finally { panelActionRef.current = false; if (mountedRef.current && previewScopeRef.current === scope) setPanelAction(''); }
+  };
+  useEffect(() => { setTool(null); setRetainedErrors([]); setMsg(null); }, [previewScope]);
+  useEffect(() => { if (!isVisible) { setTool(null); searchRequestRef.current++; } }, [isVisible]);
+  useEffect(() => {
+    if (msg?.kind === 'err') setRetainedErrors(rows => [...rows.filter(row => row.text !== msg.text),
+      { id: `operation:${msg.text}`, text: msg.text, kind: 'error' as const }].slice(-12));
+  }, [msg]);
+  const searchReturnFocus = useRef<HTMLElement | null>(null);
+  const [searchFocusPending, setSearchFocusPending] = useState(false);
+  const focusFileSearch = () => {
+    if (!isVisible) return;
+    if (document.activeElement !== searchInputRef.current) searchReturnFocus.current = document.activeElement as HTMLElement;
+    onBrowseFiles?.(); setSearchFocusPending(true);
+  };
+  useEffect(() => {
+    if (searchFocusPending && filesVisible && isVisible) { searchInputRef.current?.focus(); setSearchFocusPending(false); }
+  }, [searchFocusPending, filesVisible, isVisible]);
+  const exitFileSearch = () => {
+    searchRequestRef.current++; setSearchQuery(''); setSearchResults([]); setSearchLoading(false); setSearchError('');
+    onSearchExit?.();
+    requestAnimationFrame(() => {
+      const target = searchReturnFocus.current;
+      if (target?.isConnected && target.getClientRects().length) target.focus();
+      searchReturnFocus.current = null;
+    });
+  };
   useEffect(() => { previewRequestRef.current++; setPreview(null); }, [previewScope]);
   const [previewMaximized, setPreviewMaximized] = useState(false);
   const [mdRaw, setMdRaw] = useState(false);
@@ -581,12 +628,7 @@ export const FileTreePanel: React.FC<Props> = React.memo(({ sessionId, workingDi
     };
   }, [contextMenu]);
 
-  // ── msg 自动消失（5 秒后清除）──
-  useEffect(() => {
-    if (!msg) return;
-    const t = setTimeout(() => setMsg(null), 5000);
-    return () => clearTimeout(t);
-  }, [msg]);
+  // 操作回执由用户关闭；错误不能被计时器或另一项成功静默清除。
 
   useEffect(() => {
     if (!htmlExported) return;
@@ -616,6 +658,7 @@ export const FileTreePanel: React.FC<Props> = React.memo(({ sessionId, workingDi
             rel: rel ? `${rel}/${entry.name}` : entry.name,
             isDir: entry.isDir,
             size: entry.size,
+            sizeKnown: !entry.isDir,
             remote: false,
             local: true,
           }));
@@ -624,10 +667,15 @@ export const FileTreePanel: React.FC<Props> = React.memo(({ sessionId, workingDi
         }
         // 文件传输面板必须忠实展示工作空间，包括 .git 等点号目录。
         const ents = await api.listDirectory(rel, workingDir, execKey, true);
-        const nodes: TNode[] = ents.map((e) => ({
-          name: e.name, rel: e.path, isDir: e.isDir, size: 0,
-          remote: true, local: false, remoteMtime: e.mtime,
-        }));
+        const nodes: TNode[] = ents.map((e) => {
+          const sizeKnown = !e.isDir && typeof e.size === 'number' && Number.isFinite(e.size);
+          return {
+            name: e.name, rel: e.path, isDir: e.isDir,
+            size: sizeKnown ? Math.max(0, Number(e.size)) : 0,
+            sizeKnown,
+            remote: true, local: false, remoteMtime: e.mtime,
+          };
+        });
         nodes.sort((a, b) => (a.isDir !== b.isDir ? (a.isDir ? -1 : 1) : a.name.localeCompare(b.name)));
         if (isCurrent()) setChildren((p) => ({ ...p, [rel]: nodes }));
         return nodes;
@@ -686,7 +734,7 @@ export const FileTreePanel: React.FC<Props> = React.memo(({ sessionId, workingDi
     let detected = false;
     let isRepo = false;
     let pending: Promise<void> | null = null;
-    setGitLoading(true); setGitStatusReady(false); setGitError('');
+    setGitDetected(false); setGitAvailable(false); setGitLoading(true); setGitStatusReady(false); setGitError('');
     // 初次检测与 status 都完成后才展示“干净/变更数”；慢节点只保留一个请求。
     const refreshGit = (redetect = false): Promise<void> => {
       if (cancelled || !mountedRef.current) return Promise.resolve();
@@ -698,6 +746,7 @@ export const FileTreePanel: React.FC<Props> = React.memo(({ sessionId, workingDi
             if (cancelled) return;
             if (typeof res.isRepo !== 'boolean') throw new Error('Git 检测响应无效');
             detected = true; isRepo = res.isRepo;
+            setGitDetected(true);
             setGitAvailable(isRepo);
             if (!isRepo) setGitBranch('');
           }
@@ -732,26 +781,33 @@ export const FileTreePanel: React.FC<Props> = React.memo(({ sessionId, workingDi
     gitRefreshRef.current = () => refreshGit(true);
     void refreshGit();
     return () => { cancelled = true; gitRefreshRef.current = null; };
-  }, [workingDir, execKey]);
+  }, [workingDir, execKey, documentOwner]);
 
   // ── Stash 操作 ──
-  const loadStashes = useCallback(async () => {
+  const loadStashes = useCallback(async (force = true) => {
     if (!workingDir || !gitAvailable) return;
-    setStashesLoading(true);
-    try {
-      const res = await api.gitStashList(workingDir, execKey);
-      setStashes(res.stashes || []);
-    } catch {
-      setStashes([]);
-    } finally {
-      setStashesLoading(false);
-    }
-  }, [workingDir, execKey, gitAvailable]);
+    if (stashRead.current.scope !== previewScope) stashRead.current = { scope: previewScope, loaded: false };
+    const read = stashRead.current;
+    if (read.pending) return read.pending;
+    if (read.loaded && !force) return;
+    const current = () => mountedRef.current && previewScopeRef.current === read.scope;
+    setStashesLoading(true); setStashError('');
+    read.pending = (async () => {
+      try {
+        const res = await api.gitStashList(workingDir, execKey);
+        if (!current()) return;
+        if (!Array.isArray(res.stashes)) throw new Error('Stash 响应无效');
+        setStashes(res.stashes); read.loaded = true;
+      } catch { if (current()) setStashError('Stash 读取失败，请手动刷新'); }
+      finally { read.pending = undefined; if (current()) setStashesLoading(false); }
+    })();
+    return read.pending;
+  }, [workingDir, execKey, gitAvailable, previewScope]);
 
   // 当 stash 面板展开且 git 可用时加载列表
   useEffect(() => {
     if (stashExpanded && gitAvailable && workingDir) {
-      loadStashes();
+      void loadStashes(false);
     }
   }, [stashExpanded, gitAvailable, workingDir, loadStashes]);
 
@@ -1212,7 +1268,7 @@ export const FileTreePanel: React.FC<Props> = React.memo(({ sessionId, workingDi
   useEffect(() => {
     const requestId = ++searchRequestRef.current;
     const query = searchQuery.trim();
-    if (!query || !workingDir) {
+    if (!query || !workingDir || !isVisible) {
       setSearchResults([]);
       setSearchLoading(false);
       setSearchError('');
@@ -1288,7 +1344,7 @@ export const FileTreePanel: React.FC<Props> = React.memo(({ sessionId, workingDi
       window.clearTimeout(timer);
       if (searchRequestRef.current === requestId) searchRequestRef.current += 1;
     };
-  }, [searchQuery, workingDir, execKey, isRemote, sessionOnline, localManifest, includeGitMetadata]);
+  }, [searchQuery, workingDir, execKey, isRemote, localManifest, includeGitMetadata, isVisible, previewScope]);
 
   useEffect(() => {
     if (!searchQuery.trim()) return;
@@ -1424,6 +1480,8 @@ export const FileTreePanel: React.FC<Props> = React.memo(({ sessionId, workingDi
         if (remoteNode) {
           merged.set(localNode.rel, {
             ...remoteNode,
+            size: remoteNode.sizeKnown ? remoteNode.size : localNode.size,
+            sizeKnown: !remoteNode.isDir,
             local: true,
             // 同一路径一端是文件、一端是目录时按冲突展示，保留远端类型避免误操作。
             typeConflict: remoteNode.isDir !== localNode.isDir,
@@ -1435,7 +1493,12 @@ export const FileTreePanel: React.FC<Props> = React.memo(({ sessionId, workingDi
           const existsRemotely = localNode.isDir
             ? remoteManifestDirs.has(localNode.rel)
             : !!remoteManifest?.[localNode.rel];
-          merged.set(localNode.rel, { ...localNode, remote: existsRemotely || typeConflict, typeConflict });
+          merged.set(localNode.rel, {
+            ...localNode,
+            sizeKnown: !localNode.isDir,
+            remote: existsRemotely || typeConflict,
+            typeConflict,
+          });
         }
       }
     }
@@ -1639,7 +1702,9 @@ export const FileTreePanel: React.FC<Props> = React.memo(({ sessionId, workingDi
       if (kids === undefined) {
         const ents = workingDir ? await api.listDirectory(rel, workingDir, execKey, true) : [];
         kids = ents.map((e) => ({
-          name: e.name, rel: e.path, isDir: e.isDir, size: 0,
+          name: e.name, rel: e.path, isDir: e.isDir,
+          size: !e.isDir && typeof e.size === 'number' && Number.isFinite(e.size) ? Math.max(0, Number(e.size)) : 0,
+          sizeKnown: !e.isDir && typeof e.size === 'number' && Number.isFinite(e.size),
           remote: true, remoteMtime: e.mtime,
         }));
       }
@@ -2455,6 +2520,9 @@ export const FileTreePanel: React.FC<Props> = React.memo(({ sessionId, workingDi
             <span style={chevronStyle}>{n.isDir ? (open ? '▾' : '▸') : ''}</span>
             <span style={{ ...iconStyle, ...(st === 'cloud' ? { opacity: 0.85 } : {}) }}>{fileIcon(n, st)}</span>
             <span style={{ ...nameStyle, ...(st === 'cloud' ? { color: 'var(--theme-text-muted)' } : dotColor ? { color: dotColor } : {}) }}>{n.name}</span>
+            {!n.isDir && n.sizeKnown && (
+              <span className="ftp-file-size" style={fileTreeSizeStyle}>{formatBytes(n.size)}</span>
+            )}
             {freshness && freshness.kind !== 'same' && (
               <span
                 className="ftp-freshness"
@@ -2507,15 +2575,17 @@ export const FileTreePanel: React.FC<Props> = React.memo(({ sessionId, workingDi
       title="分批展开，避免大量文件阻塞界面">显示更多（剩余 {nodes.length - limit} 项）</button>}</>;
   };
 
-  const directoryError = Object.values(directoryErrors).find(Boolean) || '';
-  // 常驻提示不订阅扫描/读取/Git 轮询状态；仅显式操作结果和错误覆盖提示。
-  const panelStatus = directoryError || gitError || (summary && remoteManifest
-    ? `比对结果 · 仅本机 ${summary.localOnly} · 仅远端 ${summary.cloud} · 不同 ${summary.differs} · 冲突 ${summary.conflict}`
-    : workingDir ? '目录按需读取，可手动刷新' : '请选择有工作目录的会话');
-  const panelStatusDetail = [panelStatus, '文件内容按需读取，不会自动上传或下载',
-    !isTauri() && localFs?.kind === 'managed' && !offlineAppShellSupported()
-      ? '局域网 HTTP：副本与当前页面可离线使用，关闭浏览器后离线重开需 HTTPS' : '',
-  ].filter(Boolean).join('\n');
+  const gitPresentation = filePanelGit({ detected: gitDetected, available: gitAvailable, loading: gitLoading,
+    ready: gitStatusReady, error: gitError, branch: gitBranch, staged: gitStagedCount, unstaged: gitUnstagedCount });
+  const transferLabel = transfer ? `${transfer.direction === 'delete' ? '删除执行端' : transfer.direction === 'pull' ? '下载' : '上传'}${transfer.rel ? ` · ${transfer.rel}` : ''}` : '';
+  const feedbackRows = filePanelFeedback({ directories: directoryErrors, gitError, searchError,
+    conflicts: summary?.conflict || 0, compared: !!remoteManifest, offline: isRemote && !sessionOnline,
+    active: panelAction || transferLabel, messages: [
+      ...retainedErrors,
+      ...(msg?.kind === 'ok' ? [{ id: `done:${msg.text}`, text: msg.text, kind: 'done' as const }] : []),
+    ] });
+  const visibleFeedback = feedbackRows[0];
+  const directoryName = workingDir.replace(/[\\/]+$/, '').split(/[\\/]/).pop() || workingDir || '工作目录';
   const gitActionDisabled = !gitAvailable || !gitStatusReady || !!gitError;
   const editorElement = preview && <Suspense fallback={<div style={{ padding: 24 }}>编辑器加载中…</div>}>
     <CodeEditor key={activeDocument?.lifecycleId || fileTabId(preview)} documentKey={activeDocument?.key}
@@ -2575,49 +2645,30 @@ export const FileTreePanel: React.FC<Props> = React.memo(({ sessionId, workingDi
         .ftp-hdr:hover .ftp-hactions, .ftp-hactions:focus-within { opacity: 1; pointer-events: auto; }
         .ftp-panel button:disabled { opacity: .4; cursor: not-allowed; }
         .ftp-action-row > * { flex-shrink: 0; white-space: nowrap; }
+        @media (pointer: coarse) {
+          .ftp-hdr { height: 42px !important; padding-block: 3px !important; }
+          .ftp-search { min-height: 36px !important; }
+          .ftp-search input { min-height: 28px; }
+        }
       `}</style>
 
-      {/* 顶部工具条 */}
+      {/* 紧凑身份行：所有低频工具按需展开，始终保留触屏/键盘入口。 */}
       <div className="ftp-hdr" style={topBarStyle}>
-        <div style={headerIdentityStyle}>
-          <span style={{ fontSize: 14, flexShrink: 0 }}>{isRemote ? '☁️' : '🗂'}</span>
-          <span
-            title={isRemote ? '远端工作目录' : '工作目录'}
-            style={headerTitleStyle}
-          >
-            {isRemote ? '远端工作目录' : '工作目录'}
-          </span>
-          {isRemote && <span style={{ ...tagStyle, width: 70 }} title={workingDir}>{execLabel || '执行节点'}</span>}
-          <span className="ftp-branch" style={{ ...gitBranchBadgeStyle, width: 92 }} title={gitBranch ? `Git branch: ${gitBranch}` : gitError || 'Git 状态'}>
-            {gitBranch ? `🔀 ${gitBranch}` : gitLoading ? 'Git 同步中…' : gitError ? 'Git 不可用' : '无 Git'}
-          </span>
-        </div>
-        <div className="ftp-hactions" style={headerActionsStyle}>
-          <button style={hdrIconStyle} aria-label="本设备草稿" title="离线草稿恢复、导出与清理" onClick={() => setDraftRecoveryOpen(true)}>▤</button>
-            <button
-              disabled={gitActionDisabled}
-              style={{ ...hdrIconStyle, fontSize: 11, width: 'auto', padding: '0 6px', gap: 3 }}
-              title="Stash 当前改动"
-              onClick={handleStashPush}
-            >📦 Stash</button>
-            <button
-              disabled={gitActionDisabled}
-              style={{
-                ...hdrIconStyle, fontSize: 11, width: 40, padding: '0 6px',
-                ...(stashExpanded ? { background: 'var(--theme-accent-bg)', color: 'var(--theme-accent)' } : {}),
-              }}
-              title="查看 Stash 列表"
-              onClick={() => setStashExpanded((v) => !v)}
-            >▾<span style={{ marginLeft: 2, fontSize: 10, overflow: 'hidden', textOverflow: 'ellipsis' }}>({stashes.length})</span></button>
-            <button
-              disabled={gitActionDisabled}
-              style={{ ...hdrIconStyle, fontSize: 11, width: 'auto', padding: '0 6px', gap: 3 }}
-              title="查看 Git 提交历史"
-              onClick={() => setGitLogOpen(true)}
-            >Log</button>
-          <button style={hdrIconStyle} title="刷新本机与远端目录" onClick={refreshAll}>↻</button>
-          <button style={hdrIconStyle} title="全部折叠" onClick={() => setExpanded({})}>⊟</button>
-        </div>
+        <button className="awu-wb-control" style={compactIdentityButtonStyle} title={workingDir}
+          aria-label={`工作目录 ${directoryName}，查看身份详情`} onClick={event => openTool('identity', event.currentTarget)}>
+          <span aria-hidden="true">{isRemote ? '☁️' : '🗂'}</span>
+          <span style={compactDirectoryNameStyle}>{directoryName}</span>
+          {isRemote && <span style={compactExecutorStyle}>{execLabel || '执行节点'}</span>}
+          {isRemote && <span title={sessionOnline ? '执行端在线' : '执行端离线'} style={{ color: sessionOnline ? '#22c55e' : '#f59e0b' }}>●</span>}
+        </button>
+        {gitPresentation.label && <button className="awu-wb-control ftp-git-summary" style={compactSummaryButtonStyle}
+          title={gitPresentation.detail} onClick={event => openTool('git', event.currentTarget)}>{gitPresentation.label}</button>}
+        {onlyDifferent && <button className="awu-wb-control" style={compactFilterButtonStyle} title="清除仅不同筛选"
+          onClick={() => setOnlyDifferent(false)}>仅不同 {differentPaths.size} ×</button>}
+        <button className="awu-wb-control" style={compactIconButtonStyle} aria-label="刷新文件目录" title="刷新文件目录"
+          onClick={() => void runPanelAction('刷新目录中…', refreshAll)}>↻</button>
+        <button className="awu-wb-control" style={compactIconButtonStyle} aria-label="更多文件工具" title="更多文件工具"
+          onClick={event => openTool('more', event.currentTarget)}>•••</button>
       </div>
 
       {draftRecoveryOpen && <Suspense fallback={null}><DocumentDraftRecovery owner={documentOwner}
@@ -2654,9 +2705,9 @@ export const FileTreePanel: React.FC<Props> = React.memo(({ sessionId, workingDi
                 setSelected(result.rel);
                 void openPreview(result);
               }
-            } else if (event.key === 'Escape' && searchQuery) {
+            } else if (event.key === 'Escape') {
               event.preventDefault();
-              setSearchQuery('');
+              exitFileSearch();
             }
           }}
           style={fileSearchInputStyle}
@@ -2676,36 +2727,37 @@ export const FileTreePanel: React.FC<Props> = React.memo(({ sessionId, workingDi
             type="button"
             aria-label="清空文件搜索"
             title="清空（Esc）"
-            onClick={() => { setSearchQuery(''); searchInputRef.current?.focus(); }}
+            onClick={() => { searchRequestRef.current++; setSearchQuery(''); searchInputRef.current?.focus(); }}
             style={fileSearchClearStyle}
           >×</button>
         )}
       </div>
 
-      {/* 远端目录在执行节点上；这里绑定当前 session 对应的本机目录，可随时更换。 */}
-      {isRemote && (
-        <>
-        <div className="ftp-local-identity" style={localDirBarStyle}>
-          <span style={{ fontSize: 11, width: 78, color: 'var(--theme-text-muted)', flexShrink: 0 }}>
-            {localFs?.kind === 'managed' ? '📱 离线空间' : '💻 本机目录'}
-          </span>
-          <span
-            title={localRestoring ? '本机目录同步中' : localFs?.label() || '尚未指定本机目录'}
-            style={{
-              flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
-              fontSize: 10, fontFamily: 'monospace', color: localFs ? 'var(--theme-text)' : 'var(--theme-text-muted)',
-            }}
-          >
-            {localFs?.label() || (localRestoring ? '同步中…' : '未指定（远端文件仍可在线查看）')}
-          </span>
-          <span
-            title={sessionOnline ? '执行端在线' : '执行端离线：已下载文件仍可查看和编辑'}
-            style={{ fontSize: 9, whiteSpace: 'nowrap', color: sessionOnline ? '#22c55e' : '#f59e0b' }}
-          >
-            {sessionOnline ? '● 在线' : '● 离线'}
-          </span>
-        </div>
-        <div className="ftp-local-actions ftp-action-row" style={localActionsStyle} aria-busy={localRestoring}>
+      <WorkbenchPopover label="工作目录详情" triggerless externalTrigger={tool?.kind === 'identity' ? tool.anchor : undefined}
+        openSignal={tool?.kind === 'identity' ? tool.id : undefined} width={390}>{() => <div style={toolBodyStyle}>
+          <strong>{isRemote ? '执行端工作目录' : '工作目录'}</strong><code style={toolCodeStyle}>{workingDir}</code>
+          <span>执行节点：{execLabel || execKey || '当前节点'} · {isRemote ? (sessionOnline ? '执行端在线' : '执行端离线') : '本机执行'}</span>
+          {isRemote && <><strong>本机副本</strong><code style={toolCodeStyle}>{localRestoring ? '恢复中…' : localFs?.label() || '未指定'}</code>
+            <span>{localFs ? '副本可独立查看和保存；保存不会自动上传。' : '执行端文件仍可在线按需查看。'}</span></>}
+          {!gitDetected && !gitError && <span>Git 状态尚未确认。</span>}
+          {gitPresentation.state === 'absent' && <span>{gitPresentation.detail}</span>}
+        </div>}</WorkbenchPopover>
+
+      <WorkbenchPopover label="更多文件工具" triggerless externalTrigger={tool?.kind === 'more' ? tool.anchor : undefined}
+        openSignal={tool?.kind === 'more' ? tool.id : undefined} width={310}>{close => <div style={toolBodyStyle}>
+          {isRemote && <WorkbenchButton icon="files" className="awu-wb-menu-action" onClick={() => { const anchor = tool?.anchor; close(); if (anchor) openTool('sync', anchor); }}>本机副本与同步</WorkbenchButton>}
+          {gitAvailable && <WorkbenchButton icon="diff" className="awu-wb-menu-action" onClick={() => { const anchor = tool?.anchor; close(); if (anchor) openTool('git', anchor); }}>Git · {gitPresentation.label || '状态'}</WorkbenchButton>}
+          <WorkbenchButton icon="restore" className="awu-wb-menu-action" onClick={() => { close(); setDraftRecoveryOpen(true); }}>本设备草稿</WorkbenchButton>
+          <WorkbenchButton className="awu-wb-menu-action" onClick={() => { close(); setExpanded({}); }}>全部折叠</WorkbenchButton>
+          {gitPresentation.state === 'absent' && <span style={toolMutedStyle}>此目录未启用 Git</span>}
+        </div>}</WorkbenchPopover>
+
+      <WorkbenchPopover label="本机副本与同步" triggerless externalTrigger={tool?.kind === 'sync' ? tool.anchor : undefined}
+        openSignal={tool?.kind === 'sync' ? tool.id : undefined} width={430}>{() => <div className="ftp-local-actions" style={toolBodyStyle} aria-busy={localRestoring}>
+          <div style={toolIdentityStyle}><strong>{localFs?.kind === 'managed' ? '平板离线空间' : '本机副本'}</strong>
+            <code style={toolCodeStyle}>{localRestoring ? '恢复中…' : localFs?.label() || '未指定'}</code></div>
+          <span>{filePanelComparison(!!remoteManifest, summary)}</span>
+          <div className="ftp-action-row" style={toolActionRowStyle}>
             <button
               disabled={!localFs || !remoteManifest || localRestoring}
               style={{
@@ -2752,8 +2804,7 @@ export const FileTreePanel: React.FC<Props> = React.memo(({ sessionId, workingDi
                 : '启用当前浏览器的平板离线空间'
           }>
             {localFs ? (localFs.kind === 'managed' ? '重开' : '更换') : (!isTauri() && !browserDirectoryPickerSupported() ? '启用离线' : '指定')}
-          </button>
-        </div>
+          </button></div>
         <details style={syncAdvancedStyle}>
           <summary style={syncAdvancedSummaryStyle}>
             高级同步 · Git 元数据{includeGitMetadata ? '已包含' : '默认排除'}
@@ -2773,59 +2824,13 @@ export const FileTreePanel: React.FC<Props> = React.memo(({ sessionId, workingDi
             </span>
           </label>
         </details>
-        </>
-      )}
+        {!isTauri() && localFs?.kind === 'managed' && !offlineAppShellSupported() && <span style={toolMutedStyle}>局域网 HTTP 下，关闭浏览器后离线重开需要 HTTPS。</span>}
+      </div>}</WorkbenchPopover>
 
-      {/* 固定提示/传输槽从首帧占位；后台扫描保持静默，消息、错误和进度原位展示。 */}
-      <div className="ftp-status-slot" style={statusSlotStyle}>
-      {transfer ? (() => {
-        const overall = transfer.totalBytes > 0 ? Math.min(100, transfer.doneBytes / transfer.totalBytes * 100) : 100;
-        const current = transfer.fileSize > 0 ? Math.min(100, transfer.fileBytes / transfer.fileSize * 100) : 100;
-        const elapsedSeconds = Math.max(0.25, (Date.now() - transfer.startedAt) / 1000);
-        const bytesPerSecond = transfer.doneBytes / elapsedSeconds;
-        return (
-          <div style={transferBoxStyle}>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 7, minWidth: 0 }}>
-              <span>{transfer.direction === 'delete' ? '🗑' : transfer.direction === 'pull' ? '⬇' : '⬆'}</span>
-              <span style={{ flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={transfer.rel}>
-                {transfer.direction === 'delete' ? '删除执行端' : transfer.direction === 'pull' ? '下载' : '上传'} {transfer.direction !== 'delete' && transfer.fileIndex + '/' + transfer.fileCount} · {transfer.rel}
-              </span>
-              <span style={{ color: 'var(--theme-text-muted)', fontVariantNumeric: 'tabular-nums', whiteSpace: 'nowrap' }}>
-                {formatBytes(transfer.fileBytes)} / {formatBytes(transfer.fileSize)}
-                {transfer.doneBytes > 0 ? ` · ${formatBytes(bytesPerSecond)}/s` : ''}
-                {transfer.activeCount > 1 ? ` · ×${transfer.activeCount}` : ''}
-              </span>
-              <button style={transferCancelStyle} disabled={transfer.direction === 'delete'} onClick={() => {
-                const job = fileTransfers.active(transferKey);
-                if (job) fileTransfers.cancel(job);
-              }}>取消</button>
-            </div>
-            <div style={transferTrackStyle} title={`当前文件 ${current.toFixed(1)}% · 总进度 ${overall.toFixed(1)}%`}>
-              <div style={{ ...transferFillStyle, width: `${overall}%` }} />
-            </div>
-          </div>
-        );
-      })() : <div role="status" aria-live="polite" style={{ ...panelNoticeStyle,
-        color: msg && !gitModalOpen ? (msg.kind === 'err' ? '#f85149' : '#3fb950') : (directoryError || gitError) ? '#f59e0b' : 'var(--theme-text-muted)',
-      }}>
-        <span style={{ flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}
-          title={msg && !gitModalOpen ? msg.text : panelStatusDetail}>{msg && !gitModalOpen ? msg.text : panelStatus}</span>
-        {msg && !gitModalOpen && <button style={hdrIconStyle} aria-label="关闭文件面板提示" onClick={() => setMsg(null)}>✕</button>}
-      </div>}
-      </div>
-
-      {/* 固定两行 Git 槽：检测/状态未就绪时占位，非仓库/失败也不收缩。 */}
-      <div className="ftp-git-toolbar" style={gitToolbarStyle} role="region" aria-label="Git 工作区状态" aria-busy={gitLoading}>
-        <div style={gitSummaryStyle}>
-          <span style={{ flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}
-            title={gitError || (gitStatusReady ? `已暂存 ${gitStagedCount} · 未暂存 ${gitUnstagedCount} · 领先 ${gitAhead} · 落后 ${gitBehind}` : 'Git 工作区状态')}>
-            {gitError || (!gitStatusReady ? (gitLoading ? 'Git 同步中…' : (gitAvailable ? 'Git 状态待同步' : '此目录未启用 Git'))
-              : gitStagedCount + gitUnstagedCount === 0 ? '✓ 工作区干净'
-                : `✓ ${gitStagedCount} 已暂存 · ○ ${gitUnstagedCount} 未暂存`)}
-          </span>
-          {gitStatusReady && <span style={{ flexShrink: 0, fontVariantNumeric: 'tabular-nums' }} title={`领先 ${gitAhead} · 落后 ${gitBehind}`}>↑{gitAhead} ↓{gitBehind}</span>}
-        </div>
-        <div className="ftp-action-row" style={gitActionRowStyle}>
+      <WorkbenchPopover label="Git 工作区" triggerless externalTrigger={tool?.kind === 'git' ? tool.anchor : undefined}
+        openSignal={tool?.kind === 'git' ? tool.id : undefined} width={430} disabled={!gitAvailable}>{() => <div style={toolBodyStyle}>
+        <div style={toolIdentityStyle}><strong>{gitBranch || 'HEAD'}</strong><span>{gitPresentation.detail} · ↑{gitAhead} ↓{gitBehind}</span></div>
+        <div className="ftp-action-row" style={toolActionRowStyle}>
           <button style={gitMiniBtn} disabled={gitActionDisabled || gitStagedCount + gitUnstagedCount === 0} title="暂存所有变更" onClick={handleStageAll}>📥 暂存</button>
           <button style={gitMiniBtn} disabled={gitActionDisabled || gitPulling || gitBehind === 0} onClick={handlePull}
             title="拉取远端变更">{gitPulling ? '⏳' : '⬇'} 拉取</button>
@@ -2833,16 +2838,23 @@ export const FileTreePanel: React.FC<Props> = React.memo(({ sessionId, workingDi
             title="推送到远端">{gitPushing ? '⏳' : '⬆'} 推送</button>
           <button style={{ ...gitMiniBtn, fontWeight: 600 }} disabled={gitActionDisabled}
             onClick={() => setGitModalOpen(true)} title="提交变更">✅ 提交</button>
+          <button style={gitMiniBtn} disabled={gitActionDisabled} onClick={handleStashPush}>📦 Stash</button>
+          <button style={gitMiniBtn} disabled={gitActionDisabled} onClick={() => setGitLogOpen(true)}>历史</button>
         </div>
-      </div>
+        <button style={localDirButtonStyle} disabled={gitActionDisabled} onClick={() => setStashExpanded(value => !value)}>{stashExpanded ? '收起 Stash' : `查看 Stash (${stashes.length})`}</button>
+        {stashExpanded && <div className="ftp-stash-list" style={stashListStyle} aria-busy={stashesLoading}>
+          {stashError && <span style={{ color: '#f59e0b' }}>{stashError}</span>}
+          {stashesLoading ? <Empty text="Stash 读取中…" /> : stashes.length === 0 ? <Empty text="没有 Stash" /> : stashes.map((stash, index) => <div key={stash.hash || index} style={stashItemStyle}>
+            <span style={{ flex: 1, minWidth: 0 }}>{stash.message || stash.hash?.slice(0, 7) || `stash@{${index}}`}</span>
+            <button style={stashBtnStyle} disabled={stashOperating !== null} title="应用此 Stash" onClick={() => void handleStashPop(index)}>✅</button>
+            <button style={stashBtnStyle} disabled={stashOperating !== null} title="删除此 Stash" onClick={() => void handleStashDrop(index)}>🗑</button>
+          </div>)}</div>}
+      </div>}</WorkbenchPopover>
 
       {/* ★ 文件树滚动区 */}
       <div className="ftp-tree-scroll" style={treeScrollStyle}>
         {searchQuery.trim() ? (
           <div role="listbox" aria-label="文件搜索结果">
-            {searchError && (
-              <div style={fileSearchErrorStyle} title={searchError}>⚠ {searchError}</div>
-            )}
             {searchLoading && searchResults.length === 0 ? (
               <Empty text="正在搜索工作区…" />
             ) : searchResults.length === 0 ? (
@@ -2891,10 +2903,10 @@ export const FileTreePanel: React.FC<Props> = React.memo(({ sessionId, workingDi
                     <span
                       style={fileSearchSourceStyle}
                       title={result.remote && result.local
-                        ? '该文件在远端执行节点和本机副本中都存在'
-                        : result.remote ? '来自远端执行节点' : '来自本机副本'}
+                        ? '该文件在执行端和本机副本中都存在'
+                        : result.remote ? '来自执行端' : '来自本机副本'}
                     >
-                      {result.remote && result.local ? '两端' : result.remote ? '远端' : '本机'}
+                      {result.remote && result.local ? '两端' : result.remote ? '执行端' : '本机副本'}
                     </span>
                   )}
                   {result.size > 0 && <span style={fileSearchSizeStyle}>{formatBytes(result.size)}</span>}
@@ -2904,6 +2916,39 @@ export const FileTreePanel: React.FC<Props> = React.memo(({ sessionId, workingDi
           </div>
         ) : renderDir('', 0)}
       </div>
+
+      {visibleFeedback && <>
+        <div className="ftp-feedback" style={{ ...feedbackFooterStyle,
+          color: visibleFeedback.kind === 'error' ? '#f85149' : visibleFeedback.kind === 'offline' ? '#f59e0b' : 'var(--theme-text-muted)' }}>
+          <button type="button" style={feedbackSummaryStyle} title={visibleFeedback.text}
+            onClick={event => openTool('feedback', event.currentTarget)}>
+            <span aria-hidden="true">{visibleFeedback.kind === 'error' ? '⚠' : visibleFeedback.kind === 'active' ? '↻' : visibleFeedback.kind === 'done' ? '✓' : '○'}</span>
+            <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{visibleFeedback.text}</span>
+            {feedbackRows.length > 1 && <span style={feedbackCountStyle}>+{feedbackRows.length - 1}</span>}
+          </button>
+          {transfer && transfer.direction !== 'delete' && <button type="button" style={feedbackCancelStyle}
+            onClick={() => { const job = fileTransfers.active(transferKey); if (job) fileTransfers.cancel(job); }}>取消</button>}
+        </div>
+        <WorkbenchPopover label="文件面板状态" triggerless externalTrigger={tool?.kind === 'feedback' ? tool.anchor : undefined}
+          openSignal={tool?.kind === 'feedback' ? tool.id : undefined} width={430}>{() => <div style={toolBodyStyle}>
+            {feedbackRows.map(row => {
+              const dismissible = row.id.startsWith('operation:') || row.id.startsWith('done:');
+              return <div key={row.id} style={feedbackRowStyle}>
+                <span aria-hidden="true" style={{ color: row.kind === 'error' ? '#f85149' : row.kind === 'offline' ? '#f59e0b' : undefined }}>
+                  {row.kind === 'error' ? '⚠' : row.kind === 'active' ? '↻' : row.kind === 'done' ? '✓' : '○'}
+                </span>
+                <span style={{ flex: 1, minWidth: 0 }}>{row.text}</span>
+                {row.id === 'active' && transfer && transfer.direction !== 'delete' && <button type="button" style={feedbackCancelStyle}
+                  onClick={() => { const job = fileTransfers.active(transferKey); if (job) fileTransfers.cancel(job); }}>取消传输</button>}
+                {dismissible && <button type="button" aria-label={`关闭状态：${row.text}`} style={feedbackDismissStyle}
+                  onClick={() => {
+                    if (row.id.startsWith('operation:')) setRetainedErrors(rows => rows.filter(item => item.id !== row.id));
+                    if (row.id.startsWith('done:')) setMsg(null);
+                  }}>×</button>}
+              </div>;
+            })}
+          </div>}</WorkbenchPopover>
+      </>}
 
       {contextMenu && (() => {
         const n = contextMenu.node;
@@ -2976,21 +3021,6 @@ export const FileTreePanel: React.FC<Props> = React.memo(({ sessionId, workingDi
           </div>
         );
       })()}
-
-      {/* ★ Stash 列表 */}
-      {stashExpanded && (
-        <div className="ftp-stash-list" style={stashListStyle} aria-busy={stashesLoading}>
-          {stashesLoading ? <Empty text="Stash 同步中…" /> : stashes.length === 0 ? <Empty text="没有 stash" /> : stashes.map((s, i) => (
-            <div key={s.hash || i} style={stashItemStyle}>
-              <span style={{ flex: 1, fontSize: 11, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                {s.message || s.hash?.slice(0, 7) || `stash@{${i}}`}
-              </span>
-              <button style={stashBtnStyle} title="应用此 stash (pop)" onClick={() => handleStashPop(i)}>✅</button>
-              <button style={stashBtnStyle} title="删除此 stash (drop)" onClick={() => handleStashDrop(i)}>🗑</button>
-            </div>
-          ))}
-        </div>
-      )}
 
       {/* ★ Git Log 面板 */}
       {gitAvailable && (
@@ -3267,7 +3297,7 @@ export const FileTreePanel: React.FC<Props> = React.memo(({ sessionId, workingDi
 
       {documentHost && createPortal(<WorkbenchFileCommands key={previewScope} host={documentHost} visible={isVisible} scope={previewScope}
         connect={connectSearch} onOpen={(relativePath, line, column) => navigateRef.current({ relativePath, line, column })}
-        onActivate={() => onDocumentOpen?.()} editable={!!activeDocument?.read?.editable}
+        onActivate={() => onDocumentOpen?.()} onQuickOpen={focusFileSearch} editable={!!activeDocument?.read?.editable}
         relativePath={preview?.source === 'remote' ? preview.rel : undefined} draft={activeDocument?.text}
         onEditorCommand={type => { if (!preview) return; changeDocumentView('source');
           setEditorCommand({ id: ++editorCommandId.current, relativePath: preview.rel, source: preview.source, type }); }} />, documentHost)}
@@ -3276,7 +3306,7 @@ export const FileTreePanel: React.FC<Props> = React.memo(({ sessionId, workingDi
           <div style={{ display: 'inline-flex', padding: 12, borderRadius: 10, background: 'var(--theme-accent-bg)', color: 'var(--theme-accent)' }}><WorkbenchIcon name="code" size={28} /></div>
           <h3 style={{ fontSize: 16, fontWeight: 500, color: 'var(--theme-text)', margin: '18px 0 8px' }}>打开文件，开始工作</h3>
           <p style={{ lineHeight: 1.8, margin: '0 0 20px' }}>代码直接编辑，文档默认预览。文件会保留在这里，随时与右侧对话协作。</p>
-          <WorkbenchButton icon="files" onClick={onBrowseFiles}>打开文件目录</WorkbenchButton>
+          {!filesVisible && <WorkbenchButton icon="files" onClick={onBrowseFiles}>显示文件目录</WorkbenchButton>}
           <div style={{ marginTop: 24, paddingTop: 14, borderTop: '1px solid var(--theme-border)', display: 'flex', justifyContent: 'space-between', gap: 8 }}><span>快速打开文件</span><kbd>Ctrl / ⌘ P</kbd></div>
           <div style={{ marginTop: 10, display: 'flex', justifyContent: 'space-between', gap: 8 }}><span>搜索项目内容</span><kbd>Ctrl / ⌘ ⇧ F</kbd></div>
         </div>
@@ -3790,6 +3820,47 @@ const topBarStyle: React.CSSProperties = {
   borderBottom: '1px solid var(--theme-border, rgba(255,255,255,0.08))',
 };
 
+const compactIdentityButtonStyle: React.CSSProperties = {
+  display: 'inline-flex', alignItems: 'center', gap: 5, minWidth: 0, flex: 1,
+  height: 24, padding: '1px 4px', border: 0, background: 'transparent',
+  color: 'var(--theme-text)', cursor: 'pointer', textAlign: 'left',
+};
+const compactDirectoryNameStyle: React.CSSProperties = {
+  minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontWeight: 600,
+};
+const compactExecutorStyle: React.CSSProperties = {
+  minWidth: 0, maxWidth: 86, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+  color: 'var(--theme-text-muted)', fontSize: 10,
+};
+const compactSummaryButtonStyle: React.CSSProperties = {
+  flexShrink: 1, minWidth: 0, maxWidth: 105, height: 22, padding: '1px 5px',
+  overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+  border: 0, borderRadius: 4, background: 'transparent', color: 'var(--theme-text-muted)', cursor: 'pointer', fontSize: 10,
+};
+const compactFilterButtonStyle: React.CSSProperties = {
+  flexShrink: 0, height: 21, padding: '1px 5px', borderRadius: 4,
+  border: '1px solid var(--theme-accent-border)', background: 'var(--theme-accent-bg)',
+  color: 'var(--theme-accent)', cursor: 'pointer', fontSize: 9.5,
+};
+const compactIconButtonStyle: React.CSSProperties = {
+  width: 23, height: 23, padding: 0, flexShrink: 0, display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
+  border: 0, borderRadius: 4, background: 'transparent', color: 'var(--theme-text-muted)', cursor: 'pointer', fontSize: 13,
+};
+const toolBodyStyle: React.CSSProperties = {
+  display: 'flex', flexDirection: 'column', gap: 8, padding: 8, minWidth: 0, color: 'var(--theme-text)', fontSize: 11.5,
+};
+const toolCodeStyle: React.CSSProperties = {
+  display: 'block', overflowWrap: 'anywhere', padding: '5px 7px', borderRadius: 4,
+  background: 'var(--theme-bg-tertiary)', color: 'var(--theme-text-muted)', fontSize: 10.5,
+};
+const toolMutedStyle: React.CSSProperties = { color: 'var(--theme-text-muted)', fontSize: 10.5, lineHeight: 1.5 };
+const toolIdentityStyle: React.CSSProperties = {
+  display: 'flex', flexDirection: 'column', gap: 4, minWidth: 0, paddingBottom: 3,
+};
+const toolActionRowStyle: React.CSSProperties = {
+  display: 'flex', alignItems: 'center', gap: 5, flexWrap: 'wrap', minWidth: 0,
+};
+
 const fileSearchBarStyle: React.CSSProperties = {
   display: 'flex', alignItems: 'center', gap: 5, flexShrink: 0,
   minHeight: 31, padding: '4px 8px',
@@ -3840,12 +3911,6 @@ const fileSearchSourceStyle: React.CSSProperties = {
   flexShrink: 0, padding: '1px 4px', borderRadius: 3,
   color: 'var(--theme-text-muted)', background: 'var(--theme-hover, rgba(255,255,255,.06))',
   fontSize: 9, lineHeight: 1.3,
-};
-
-const fileSearchErrorStyle: React.CSSProperties = {
-  padding: '5px 9px', color: '#f59e0b', background: 'rgba(245,158,11,.07)',
-  borderBottom: '1px solid rgba(245,158,11,.16)', fontSize: 10,
-  overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
 };
 
 const searchHighlightStyle: React.CSSProperties = {
@@ -4020,6 +4085,15 @@ const nameStyle: React.CSSProperties = {
   fontSize: 12, color: 'var(--theme-text, #c9d1d9)',
 };
 
+const fileTreeSizeStyle: React.CSSProperties = {
+  flexShrink: 0,
+  minWidth: 0,
+  color: 'var(--theme-text-muted, #8b949e)',
+  fontSize: 9.5,
+  fontVariantNumeric: 'tabular-nums',
+  whiteSpace: 'nowrap',
+};
+
 const syncFreshnessBadgeStyle: React.CSSProperties = {
   flexShrink: 0,
   maxWidth: 230,
@@ -4044,6 +4118,30 @@ const actBtnStyle: React.CSSProperties = {
 const treeScrollStyle: React.CSSProperties = {
   flex: 1, overflow: 'auto', minHeight: 0,
   padding: '2px 0',
+};
+
+const feedbackFooterStyle: React.CSSProperties = {
+  display: 'flex', alignItems: 'center', gap: 5, minHeight: 27, padding: '3px 7px', flexShrink: 0,
+  borderTop: '1px solid var(--theme-border)', background: 'var(--theme-bg-tertiary)', fontSize: 10.5,
+};
+const feedbackSummaryStyle: React.CSSProperties = {
+  display: 'flex', alignItems: 'center', gap: 5, flex: 1, minWidth: 0, padding: 0,
+  border: 0, background: 'transparent', color: 'inherit', cursor: 'pointer', textAlign: 'left', fontSize: 'inherit',
+};
+const feedbackCountStyle: React.CSSProperties = {
+  flexShrink: 0, padding: '0 4px', borderRadius: 8, background: 'var(--theme-hover)', color: 'var(--theme-text-muted)',
+};
+const feedbackCancelStyle: React.CSSProperties = {
+  flexShrink: 0, padding: '2px 6px', borderRadius: 4, border: '1px solid var(--theme-border)',
+  background: 'transparent', color: 'var(--theme-text)', cursor: 'pointer', fontSize: 10,
+};
+const feedbackRowStyle: React.CSSProperties = {
+  display: 'flex', alignItems: 'flex-start', gap: 6, minWidth: 0, padding: '5px 0', lineHeight: 1.45,
+  borderBottom: '1px solid var(--theme-border)',
+};
+const feedbackDismissStyle: React.CSSProperties = {
+  flexShrink: 0, width: 20, height: 20, padding: 0, border: 0, background: 'transparent',
+  color: 'var(--theme-text-muted)', cursor: 'pointer', fontSize: 14,
 };
 
 const stashListStyle: React.CSSProperties = {

@@ -117,6 +117,25 @@ class Client:
 
 
 class FilePanelConcurrencyTests(unittest.IsolatedAsyncioTestCase):
+    async def test_slow_codex_catalog_does_not_block_chat_or_stop(self):
+        started = asyncio.Event()
+        release = asyncio.Event()
+        async def slow():
+            started.set()
+            await release.wait()
+            return 'catalog'
+        self.bridge._rpc_codexSessionModelCatalog = slow
+        self.bridge._rpc_testWrite = Mock(return_value='chat-or-stop')
+        client, _ = self.client('alice')
+        client.request(1, 'codexSessionModelCatalog')
+        await asyncio.wait_for(started.wait(), .5)
+        client.request(2, 'testWrite')
+        reply = await asyncio.wait_for(client.outgoing.get(), .5)
+        self.assertEqual(reply['id'], 2)
+        self.assertEqual(reply['result'], 'chat-or-stop')
+        release.set()
+        self.assertEqual((await asyncio.wait_for(client.outgoing.get(), .5))['id'], 1)
+
     async def asyncSetUp(self):
         self.bridge = BridgeWS.__new__(BridgeWS)
         self.bridge._clients = set()

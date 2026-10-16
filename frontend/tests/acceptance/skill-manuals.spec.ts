@@ -27,7 +27,13 @@ async function mockManuals(context: BrowserContext) {
       if (frame.method === 'chatAsk') {
         asks.push(frame.params);
         if (failNextAsk) { failNextAsk = false; return reply({ status: 'error', message: '模拟提交失败' }); }
-        return reply({ status: 'ok', turnId: 'manual-question' });
+        const turnId = `manual-question-${asks.length}`;
+        const attention = JSON.parse(frame.params[3]);
+        reply({ status: 'ok', turnId });
+        socket.send(JSON.stringify({ event: 'chatAsideUpdated', data: JSON.stringify({ sessionId: frame.params[0],
+          asides: [{ id: turnId, question: frame.params[1], answer: '手册参考答复', status: 'done',
+            contextKey: attention.key, contextKind: attention.kind, contextLabel: attention.label }] }) }));
+        return;
       }
       server.send(message);
     });

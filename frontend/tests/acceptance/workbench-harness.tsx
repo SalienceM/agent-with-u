@@ -5,9 +5,12 @@ import { LoopPanel } from '../../src/components/LoopPanel';
 
 // 仅供浏览器回归：绕过真实 RPC，检查同 Session 的节点身份切换与迟到详情。
 export function mountWorkbenchHarness() {
+  const appRoot = document.querySelector<HTMLElement>('.app-root');
+  if (!appRoot) throw new Error('Workbench harness requires the mounted application theme');
   const host = document.createElement('div');
-  Object.assign(host.style, { position: 'fixed', inset: '0', zIndex: '99999', background: '#202126' });
-  document.body.appendChild(host);
+  Object.assign(host.style, { position: 'fixed', inset: '0', zIndex: '99999', background: 'var(--theme-bg)' });
+  // 继承应用真实主题、字体及控件样式，避免独立测试根丢失 CSS 变量而生成误导截图。
+  appRoot.appendChild(host);
   const root = createRoot(host);
   const saved = { get: api.loopGetState, record: api.loopGetRecord };
   const pending: Array<() => void> = [];

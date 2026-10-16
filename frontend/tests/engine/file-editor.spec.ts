@@ -123,9 +123,11 @@ test('Engine unified navigation retains line/column, offers keyboard search/repl
   await expect(query.getByLabel('当前草稿', { exact: true })).toHaveValue('first\nxy new draft\nlast');
   await query.getByRole('button', { name: '关闭查询' }).click();
   await editor.focus(); await page.keyboard.press('Control+p');
-  await expect(page.getByLabel('文件名查询')).toBeFocused();
-  await page.getByLabel('文件名查询').fill('a'); await page.getByLabel('文件名查询').press('Enter');
-  await query.getByRole('button', { name: 'a.py', exact: true }).click();
+  const fileSearch = page.getByRole('searchbox', { name: '搜索工作区文件' });
+  await expect(fileSearch).toBeFocused();
+  await expect(page.getByRole('region', { name: '工程文件查询' })).toHaveCount(0);
+  await fileSearch.press('Escape');
+  await expect(editor).toBeFocused();
   await expect(editor).toContainText('new draft');
   expect(await page.evaluate(() => (window as any).fixture.saves)).toEqual([]);
   await page.getByRole('button', { name: '编辑导航', exact: true }).click();
@@ -147,7 +149,7 @@ test('Engine unified navigation retains line/column, offers keyboard search/repl
 test('Engine cancelled or hidden search ignores late results; content result goes to its exact position', async ({ page }) => {
   await mountFiles(page, false, false, true);
   await page.evaluate(() => { const f = (window as any).fixture; f.files['a.py'] = 'first\nxy target'; f.holdSearch = true; });
-  await page.getByRole('button', { name: '项目搜索', exact: true }).click();
+  await page.getByRole('button', { name: '搜索项目内容', exact: true }).click();
   await page.getByLabel('项目内容查询').fill('target'); await page.getByLabel('项目内容查询').press('Enter');
   await page.waitForFunction(() => (window as any).fixture.finishSearch);
   await page.getByRole('button', { name: '取消查询', exact: true }).click();

@@ -20,6 +20,7 @@ import {
 } from '../utils/thoughtsWindow';
 import { AdvancedPromptTextarea } from './AdvancedPromptTextarea';
 import { SpeechToTextControl } from './SpeechToTextControl';
+import { inspectionLabel, matchesThoughtsScope, mergeAsideTurns, sourceStatus, type ThoughtsInspection } from '../utils/thoughtsInspection';
 
 interface AsideTurn {
   id: string;
@@ -32,6 +33,7 @@ interface AsideTurn {
   contextLabel?: string;
   contextDetail?: string;
   createdAt?: number;
+  inspection?: ThoughtsInspection;
 }
 
 interface Props {
@@ -81,10 +83,16 @@ export const ThoughtsAssistant: React.FC<Props> = ({
 }) => {
   // 固定的是请求目标和瞬时快照，不只是下拉框；切换 Session 不能改写绑定。
   const [binding, setBinding] = useState<{ session: any; attention: AttentionContext; backends: any[] } | null>(null);
+  const [userRevision, setUserRevision] = useState(0);
   const session = binding ? binding.session : currentSession;
   const attention = binding ? binding.attention : currentAttention;
   const [skillCatalog, setSkillCatalog] = useState<{ scope: string; entries: SkillManualSummary[] } | null>(null);
-  const skillScope = `${session?.execKey || ''}:${session?.id || ''}`;
+  const skillScope = `${userRevision}:${session?.execKey || ''}:${session?.id || ''}`;
+  const execKey = session?.execKey || '';
+  const scopeRef = useRef({ key: skillScope, revision: 0 });
+  if (scopeRef.current.key !== skillScope) scopeRef.current = { key: skillScope, revision: scopeRef.current.revision + 1 };
+  const submissionRef = useRef<object | null>(null);
+  const unknownRef = useRef<{ scope: object; question: string; oldIds: Set<string> } | null>(null);
   const skillEntries = useMemo(() => skillCatalog?.scope === skillScope ? skillCatalog.entries : [], [skillCatalog, skillScope]);
   const receiveSkillCatalog = useCallback((entries: SkillManualSummary[]) => {
     setSkillCatalog({ scope: skillScope, entries });
@@ -103,6 +111,8 @@ export const ThoughtsAssistant: React.FC<Props> = ({
   const skillReferences = useMemo(() => manualReferences(draft), [draft]);
   const [loading, setLoading] = useState(false);
   const [submitting, setSubmitting] = useState(false);
+  const [submissionUnknown, setSubmissionUnknown] = useState(false);
+  const [stopping, setStopping] = useState(false);
   const [error, setError] = useState('');
   const [asideBackendId, setAsideBackendId] = useState('');
   const [followFocus, setFollowFocus] = useState(true);
@@ -154,8 +164,11 @@ export const ThoughtsAssistant: React.FC<Props> = ({
     setAsides([]);
     setLive({});
     setError('');
+    setSubmitting(false); setSubmissionUnknown(false); setStopping(false); submissionRef.current = null; unknownRef.current = null;
   }, [skillScope, clearImages]);
   useEffect(() => onCurrentUserChanged(() => {
+    scopeRef.current = { key: '', revision: scopeRef.current.revision + 1 };
+    setUserRevision(value => value + 1);
     setBinding(null); setSkillCatalog(null); setDraft(''); setAsides([]); setLive({}); clearImages();
   }), [clearImages]);
 
@@ -164,23 +177,26 @@ export const ThoughtsAssistant: React.FC<Props> = ({
   }, [attention.key, followFocus]);
 
   useEffect(() => {
-    if (!sessionId) return;
+    if (!open || !sessionId) return;
     let cancelled = false;
+    let receivedUpdate = false;
+    const requestScope = scopeRef.current;
     setLoading(true);
-    const request = isLoop ? api.loopAsideList(sessionId) : api.chatAsideList(sessionId);
+    const request = isLoop ? api.loopAsideList(sessionId, execKey) : api.chatAsideList(sessionId, execKey);
     request.then((result) => {
-      if (cancelled) return;
+      if (cancelled || scopeRef.current !== requestScope || receivedUpdate) return;
       if (result.status === 'ok') {
-        setAsides((result.asides || []).map(normalizeManualHistory));
+        setAsides(previous => mergeAsideTurns(previous, (result.asides || []).map(normalizeManualHistory)));
         setAsideBackendId(result.asideBackendId || '');
       } else setError(result.message || '无法读取俺寻思历史');
     }).catch((reason) => {
       if (!cancelled) setError(reason?.message || '无法读取俺寻思历史');
     }).finally(() => { if (!cancelled) setLoading(false); });
 
-    const applyUpdate = (data: any) => {
-      if (data?.sessionId !== sessionId) return;
-      setAsides((data.asides || []).map(normalizeManualHistory));
+    const applyUpdate = (data: any, source?: string) => {
+      if (cancelled || scopeRef.current !== requestScope || !matchesThoughtsScope(sessionId, execKey, data, source)) return;
+      receivedUpdate = true;
+      setAsides(previous => mergeAsideTurns(previous, (data.asides || []).map(normalizeManualHistory)));
       if (data.asideBackendId !== undefined) setAsideBackendId(data.asideBackendId || '');
       setLive((previous) => {
         const next = { ...previous };
@@ -191,8 +207,8 @@ export const ThoughtsAssistant: React.FC<Props> = ({
         return next;
       });
     };
-    const applyDelta = (data: any) => {
-      if (data?.sessionId !== sessionId || !data.turnId || !data.text) return;
+    const applyDelta = (data: any, source?: string) => {
+      if (cancelled || scopeRef.current !== requestScope || !matchesThoughtsScope(sessionId, execKey, data, source) || !data.turnId || !data.text) return;
       setLive((previous) => ({
         ...previous,
         [data.turnId]: `${previous[data.turnId] || ''}${data.text}`,
@@ -205,7 +221,16 @@ export const ThoughtsAssistant: React.FC<Props> = ({
       offUpdated();
       offDelta();
     };
-  }, [sessionId, isLoop]);
+  }, [open, skillScope, sessionId, execKey, isLoop]);
+
+  useEffect(() => {
+    const unknown = unknownRef.current;
+    if (unknown?.scope === scopeRef.current && asides.some(turn => !unknown.oldIds.has(turn.id) && turn.question === unknown.question)) {
+      unknownRef.current = null;
+      setSubmissionUnknown(false);
+      setError('已核对到新问题，请查看回答状态；未重复提交。');
+    }
+  }, [asides]);
 
   const contexts = useMemo(() => {
     const map = new Map<string, AttentionContext>();
@@ -227,7 +252,7 @@ export const ThoughtsAssistant: React.FC<Props> = ({
     [asides, displayedAttention.key],
   );
   const answeringBusy = asides.some((turn) => turn.status === 'answering');
-  const busy = submitting || answeringBusy;
+  const busy = submitting || submissionUnknown || answeringBusy;
   const otherBusy = answeringBusy && !visibleAsides.some((turn) => turn.status === 'answering');
 
   useEffect(() => {
@@ -256,41 +281,76 @@ export const ThoughtsAssistant: React.FC<Props> = ({
     const outgoingImages = [...focusImages, ...images].filter((item, index, all) => (
       all.findIndex((candidate) => candidate.id === item.id) === index
     ));
-    if (!sessionId || busy || (!question && outgoingImages.length === 0)) return;
+    if (!sessionId || busy || submissionRef.current || (!question && outgoingImages.length === 0)) return;
+    if (!execKey) { setError('Session 执行节点尚未确认，未提交问题'); return; }
+    const scope = scopeRef.current;
+    submissionRef.current = scope;
+    const oldIds = new Set(asides.map(turn => turn.id));
     setError('');
     // 图片框选是瞬时注意力附件；从 attention JSON 中剥离，避免复制两份 Base64。
     const { imageAttachments: _focusImages, ...attentionPayload } = context;
     setSubmitting(true);
     try {
       const result = await (isLoop
-        ? api.loopAsk(sessionId, question, outgoingImages.length ? outgoingImages : undefined, attentionPayload as unknown as Record<string, unknown>)
-        : api.chatAsk(sessionId, question, outgoingImages.length ? outgoingImages : undefined, attentionPayload as unknown as Record<string, unknown>));
+        ? api.loopAsk(sessionId, question, outgoingImages.length ? outgoingImages : undefined, attentionPayload as unknown as Record<string, unknown>, execKey)
+        : api.chatAsk(sessionId, question, outgoingImages.length ? outgoingImages : undefined, attentionPayload as unknown as Record<string, unknown>, execKey));
+      if (scopeRef.current !== scope) return;
       if (result.status !== 'ok') {
         setError(result.message || '提问失败');
         return;
       }
+      if (result.turnId) setAsides(previous => previous.some(turn => turn.id === result.turnId) ? previous : [...previous, {
+        id: result.turnId!, question: question || '（图片）', answer: '', status: 'answering',
+        contextKey: context.key, contextKind: context.kind, contextLabel: context.label,
+        imageCount: outgoingImages.length,
+        inspection: { requestId: result.turnId, phase: 'preparing', sequence: 0, message: '问题已接收，正在准备只读查询' },
+      }]);
       setDraft('');
       clearImages();
     } catch (reason: any) {
-      setError(reason?.message || '提问失败');
+      if (scopeRef.current !== scope) return;
+      setSubmissionUnknown(true);
+      unknownRef.current = { scope, question: question || '（图片）', oldIds };
+      setError(`提交结果待确认：${reason?.message || '连接中断'}。问题已保留，不会自动重试。`);
+      // 仅核对一次已有记录，绝不重放写请求；未找到对应新记录不能假装未提交。
+      try {
+        const result = await (isLoop ? api.loopAsideList(sessionId, execKey) : api.chatAsideList(sessionId, execKey));
+        if (scopeRef.current !== scope || result.status !== 'ok') return;
+        setAsides(previous => mergeAsideTurns(previous, (result.asides || []).map(normalizeManualHistory)));
+        if ((result.asides || []).some((turn: AsideTurn) => !oldIds.has(turn.id) && turn.question === (question || '（图片）'))) {
+          setSubmissionUnknown(false); setError('已核对到新问题，请查看回答状态；未重复提交。');
+        }
+      } catch { /* 保留未知结果，不回退节点或轮询 */ }
     } finally {
-      setSubmitting(false);
+      if (scopeRef.current === scope) { setSubmitting(false); submissionRef.current = null; }
     }
-  }, [draft, sessionId, busy, images, attentionForRequest, isLoop, clearImages]);
+  }, [draft, sessionId, execKey, busy, images, attentionForRequest, isLoop, clearImages, asides]);
 
   const clearCurrent = useCallback(async () => {
     if (!sessionId || busy || visibleAsides.length === 0) return;
     if (!window.confirm(`只清空“${displayedAttention.label}”下的 ${visibleAsides.length} 条俺寻思记录？`)) return;
-    const result = isLoop
-      ? await api.loopAsideClear(sessionId, displayedAttention.key)
-      : await api.chatAsideClear(sessionId, displayedAttention.key);
-    if (result.status !== 'ok') setError(result.message || '清空失败');
-  }, [sessionId, busy, visibleAsides.length, displayedAttention, isLoop]);
+    const scope = scopeRef.current;
+    try {
+      const result = isLoop
+        ? await api.loopAsideClear(sessionId, displayedAttention.key, execKey)
+        : await api.chatAsideClear(sessionId, displayedAttention.key, execKey);
+      if (scopeRef.current === scope && result.status !== 'ok') setError(result.message || '清空失败');
+    } catch (reason: any) {
+      if (scopeRef.current === scope) setError(reason?.message || '清空结果未确认');
+    }
+  }, [sessionId, execKey, busy, visibleAsides.length, displayedAttention, isLoop]);
 
-  const abort = useCallback(() => {
-    if (!sessionId) return;
-    void (isLoop ? api.loopAsideAbort(sessionId) : api.chatAsideAbort(sessionId));
-  }, [sessionId, isLoop]);
+  const abort = useCallback(async () => {
+    if (!sessionId || stopping) return;
+    const scope = scopeRef.current;
+    setStopping(true);
+    try {
+      const result = await (isLoop ? api.loopAsideAbort(sessionId, execKey) : api.chatAsideAbort(sessionId, execKey));
+      if (scopeRef.current === scope && result.status !== 'ok') setError('停止未获确认；主线未受影响');
+    } catch (reason: any) {
+      if (scopeRef.current === scope) setError(`停止结果待确认：${reason?.message || '连接中断'}；未重复发送停止请求`);
+    } finally { if (scopeRef.current === scope) setStopping(false); }
+  }, [sessionId, execKey, isLoop, stopping]);
 
   const startResize = useCallback((event: React.MouseEvent<HTMLDivElement>) => {
     event.preventDefault();
@@ -411,7 +471,10 @@ export const ThoughtsAssistant: React.FC<Props> = ({
           <span>{session ? `Session · ${session.title || session.name || session.id.slice(0, 8)}` : '尚未选择 Session'}</span>
           <span>{displayedAttention.imageAttachments?.length
             ? `已关联 ${displayedAttention.imageAttachments.length} 张框选图 · 发送时自动附带`
-            : displayedAttention.content ? `已带入 ${displayedAttention.content.length.toLocaleString()} 字界面快照` : '仅带入对象身份'}</span>
+            : displayedAttention.content ? '已附界面上下文（辅助理解）' : '当前关注对象已关联'}</span>
+        </div>
+        <div style={{ fontSize: 10.5, marginTop: 6, color: 'var(--theme-text-muted)', lineHeight: 1.5 }}>
+          可按问题只读查询当前项目与运行进度；不改文件、不控制主线。每次提问重新取证。
         </div>
         {skillReferences.length > 0 && <div role="group" aria-label="附加 Skill 参考资料" style={{ display: 'flex', flexWrap: 'wrap', gap: 6, alignItems: 'center', marginTop: 8, fontSize: 11 }}>
           <span style={{ color: 'var(--theme-text-muted)' }}>本条参考资料</span>
@@ -435,7 +498,10 @@ export const ThoughtsAssistant: React.FC<Props> = ({
             onChange={(event) => {
               const value = event.target.value;
               setAsideBackendId(value);
-              void api.chatAsideSetBackend(sessionId, value);
+              const scope = scopeRef.current;
+              void api.chatAsideSetBackend(sessionId, value, execKey).catch(reason => {
+                if (scopeRef.current === scope) setError(String(reason));
+              });
             }}>
             <option value="">跟随 Session</option>
             {backends.map((backend) => <option key={backend.id} value={backend.id}>{backend.label || backend.id}</option>)}
@@ -463,13 +529,33 @@ export const ThoughtsAssistant: React.FC<Props> = ({
                 <span style={{ whiteSpace: 'pre-wrap' }}>{turn.question}</span>
                 {!!turn.imageCount && <span style={{ color: 'var(--theme-text-muted)' }}>🖼️ {turn.imageCount}</span>}
               </div>
+              <div role="status" aria-live="polite" style={{ margin: '7px 0 0 27px', fontSize: 11, lineHeight: 1.6, color: turn.status === 'error' ? 'var(--theme-error, #ef4444)' : 'var(--theme-text-muted)' }}>
+                {inspectionLabel(turn.status, turn.inspection)}
+                {turn.inspection?.message && <div>{turn.inspection.message}</div>}
+              </div>
               <div style={answerStyle}>
                 <span style={answerTag}>想</span>
                 {answer ? (
                   <div className="md-content" style={{ flex: 1, minWidth: 0 }}
                     dangerouslySetInnerHTML={{ __html: markdownToHtml(answer) + (answering ? ' <span class="streaming-cursor">▍</span>' : '') }} />
-                ) : <span style={{ color: 'var(--theme-text-muted)' }}>正在顺着这里想…</span>}
+                ) : <span style={{ color: 'var(--theme-text-muted)' }}>{answering ? '问题已接收，进度见上方。' : '本次没有生成回答；问题已保留。'}</span>}
               </div>
+              <details style={{ margin: '8px 0 0 27px', fontSize: 10.5, color: 'var(--theme-text-muted)', overflowWrap: 'anywhere', lineHeight: 1.6 }}>
+                <summary style={{ cursor: 'pointer' }}>查询来源{turn.inspection?.sources?.length ? ` · ${turn.inspection.sources.length} 项` : ' · 未记录'}</summary>
+                {turn.inspection?.sampledAt && <div>运行状态采样：{new Date(turn.inspection.sampledAt * 1000).toLocaleString()}</div>}
+                {!turn.inspection?.sources?.length && <div>本条未记录项目文件来源，不表示已核验项目。</div>}
+                {turn.inspection?.sources?.map((source, index) => <div key={index} style={{ marginTop: 6 }}>
+                  <div>{source.path || source.operation || '运行状态'} · {sourceStatus(source)}</div>
+                  {source.change && <div>变更：{source.change}</div>}
+                  {source.readAt && <div>读取：{new Date(source.readAt * 1000).toLocaleString()}</div>}
+                  {source.revision && <div title={source.revision}>修订：{source.revision.slice(0, 16)}</div>}
+                  {source.offset !== undefined && <div>字符范围：{source.offset}–{source.end ?? '?'}{source.complete === false ? '（非全文）' : ''}</div>}
+                  {source.checked !== undefined && <div>文件勾选：{source.checked}/{source.total}；不等于人工验收</div>}
+                </div>)}
+              </details>
+              {(turn.status === 'error' || turn.status === 'cancelled') && <div style={actionRow}>
+                <button style={quietButton} disabled={busy} onClick={() => { setDraft(turn.question); setError('原问题已填回，可编辑后发送为新请求；图片请按需重新附加。'); }}>编辑后重新提问</button>
+              </div>}
               {turn.status === 'done' && turn.answer && (
                 <div style={actionRow}>
                   <button style={quietButton} onClick={() => void api.seqtaskAdd(sessionId, turn.answer)}>→ 加入主流程队列</button>
@@ -485,6 +571,9 @@ export const ThoughtsAssistant: React.FC<Props> = ({
       {error && <div role="alert" style={errorStyle}>{error}</div>}
 
       <div ref={boxRef} style={composerStyle}>
+        {(submitting || submissionUnknown || stopping) && <div role="status" style={{ fontSize: 11, marginBottom: 7, color: 'var(--theme-accent)' }}>
+          {stopping ? '正在停止旁路；主线继续运行' : submitting ? '正在提交问题…' : '提交结果待确认，未自动重试'}
+        </div>}
         <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, alignItems: 'center', fontSize: 11, marginBottom: 6 }}>
           <span>围绕当前 Session 提问 · @SKILL 仅为本条添加资料 · 可附截图</span>
         </div>
@@ -520,7 +609,7 @@ export const ThoughtsAssistant: React.FC<Props> = ({
             style={textareaStyle}
           />
           {busy ? (
-            <button style={stopButton} onClick={abort} title="停止当前俺寻思回答">■</button>
+            <button style={stopButton} disabled={submitting || stopping} onClick={() => void abort()} title="停止当前俺寻思回答（不影响主线）">■</button>
           ) : (
             <button style={sendButton} disabled={!sessionId || (!draft.trim() && images.length === 0 && !displayedAttention.imageAttachments?.length)} onClick={() => void submit()}>发送</button>
           )}
@@ -584,10 +673,11 @@ export const ThoughtsAssistantWindow: React.FC = () => {
     if (!sessionId) { setSession(null); setBackends([]); return; }
     let cancelled = false;
     setSession((current: any) => current?.id === sessionId ? current : null);
-    void api.loadSessionMeta(sessionId).then((metadata) => {
-      if (!cancelled) setSession(metadata);
+    if (!attention.execKey) { setSession(null); return; }
+    void api.resolveWorkspaceSession(attention.execKey, sessionId).then((metadata) => {
+      if (!cancelled) setSession({ ...metadata, execKey: attention.execKey });
     }).catch(() => {
-      if (!cancelled) setSession({ id: sessionId, title: attention.label, workingDir: attention.workingDir, execKey: attention.execKey });
+      if (!cancelled) setSession(null);
     });
     return () => { cancelled = true; };
   }, [attention.execKey, attention.label, attention.workingDir, sessionId]);

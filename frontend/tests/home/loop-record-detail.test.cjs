@@ -17,6 +17,11 @@ test('plan retry and degradation invalidate the audit detail cache', () => {
   assert.notEqual(loopRecordRevision(record), loopRecordRevision({ ...record,
     stageDetails: { prepare: { status: 'retrying', attemptCount: 2 } } }));
 });
+test('native OpenSpec task and verify summaries refresh detail without full raw output', () => {
+  const current = { ...record, openspecSummary: { phase: 'verify', fixes: 2 } };
+  assert.notEqual(loopRecordRevision(current), loopRecordRevision({ ...current, openspecSummary: { phase: 'verify', fixes: 0 } }));
+  assert.equal(loopRecordRevision(current), loopRecordRevision({ ...current, openspecRun: { hugeRaw: 'not part of revision' } }));
+});
 
 test('environment evidence revisions refresh selected detail; full bodies and identical pushes do not', () => {
   const current = { ...record, environmentChecks: [{ id: 'env', revision: 3, status: 'passed' }] };

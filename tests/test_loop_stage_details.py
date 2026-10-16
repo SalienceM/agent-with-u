@@ -1,7 +1,7 @@
 import json
 import unittest
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from src.backend.bridge_ws import BridgeWS
 from src.backend.loop_store import LoopAnalysis, LoopRecord, LoopState, STAGE_EXECUTE
@@ -17,6 +17,7 @@ class LoopStageDetailsTests(unittest.IsolatedAsyncioTestCase):
         bridge._resolved_runtime = lambda *_a, **_kw: {}
         bridge._loop_runtime = lambda *_a, **_kw: {}
         bridge._loop_save = Mock()
+        bridge._loop_startup_snapshot = AsyncMock(return_value=True)
         bridge._emit_loop_updated = Mock()
         bridge._loop_cancel = {}
         session = SimpleNamespace(id=state.session_id, backend_id="worker", working_dir=".")

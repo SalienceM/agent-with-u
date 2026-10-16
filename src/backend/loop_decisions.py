@@ -58,6 +58,8 @@ def normalize_decision(raw: Any) -> dict:
         'completionScope': raw.get('completionScope', '') if action == 'complete'
         and raw.get('completionScope') in ('automatic', 'full') else '',
         'boundary': short(raw.get('boundary'), 120),
+        'causeRef': short(raw.get('causeRef'), 100),
+        'causeRevision': raw.get('causeRevision', 0) if type(raw.get('causeRevision', 0)) is int else 0,
         **{key: raw.get(key, 0) if isinstance(raw.get(key, 0), int) else 0
            for key in ('revision', 'round', 'seq')},
     }

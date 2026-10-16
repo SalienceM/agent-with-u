@@ -1,7 +1,7 @@
 import json
 import unittest
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from src.backend.bridge_ws import BridgeWS
 from src.backend.loop_store import (
@@ -29,6 +29,7 @@ class LoopEvolutionTests(unittest.IsolatedAsyncioTestCase):
         bridge._resolved_runtime = lambda *_args, **_kwargs: {}
         bridge._loop_runtime = lambda *_args, **_kwargs: {}
         bridge._loop_save = Mock()
+        bridge._loop_startup_snapshot = AsyncMock(return_value=True)
         bridge._emit_loop_updated = Mock()
         return bridge
 

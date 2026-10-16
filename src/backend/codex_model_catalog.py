@@ -11,6 +11,7 @@ from typing import Any
 
 from ..model_options import normalize_model_options
 from .codex_app_server import CodexAppServerProcess, local_app_server_command
+from .codex_reasoning import normalize_reasoning_effort
 
 CATALOG_TIMEOUT = 25
 MAX_PAGES = 20
@@ -122,9 +123,10 @@ async def query_codex_catalog(codex_cli: str, env: dict[str, str],
         stream_limit=1024 * 1024, isolated_process_group=True,
     )
 
-    async def collect() -> list[dict[str, str]]:
+    async def collect() -> tuple[list[dict[str, str]], list[dict[str, Any]]]:
         await conn.start()
         rows: list[dict[str, str]] = []
+        capabilities: list[dict[str, Any]] = []
         cursor = None
         seen: set[str] = set()
         size = 0
@@ -135,6 +137,7 @@ async def query_codex_catalog(codex_cli: str, env: dict[str, str],
                 raise CatalogError("limit", "Codex 目录超过安全大小上限，原候选未修改。")
             page, cursor = parse_catalog_page(value)
             rows.extend(page)
+            capabilities.extend(parse_reasoning_capabilities(value))
             try:
                 normalize_model_options(rows)
             except ValueError:
@@ -142,15 +145,16 @@ async def query_codex_catalog(codex_cli: str, env: dict[str, str],
             if cursor is None:
                 if not rows:
                     raise CatalogError("empty", "Codex 返回空目录，未清空候选；可继续手工维护。")
-                return rows
+                return rows, capabilities
             if cursor in seen:
                 raise CatalogError("incomplete", "Codex 目录分页重复，未取得完整结果。")
             seen.add(cursor)
         raise CatalogError("incomplete", "Codex 目录分页超过安全上限，未取得完整结果。")
 
     try:
-        rows = await asyncio.wait_for(collect(), CATALOG_TIMEOUT)
-        return {"status": "ok", "modelOptions": rows, "source": "codex-app-server",
+        rows, capabilities = await asyncio.wait_for(collect(), CATALOG_TIMEOUT)
+        return {"status": "ok", "modelOptions": rows, "reasoningCapabilities": capabilities,
+                "source": "codex-app-server",
                 "freshness": "unknown", "upstreamUpdatedAt": None,
                 "fetchedAt": datetime.now(timezone.utc).isoformat()}
     except asyncio.TimeoutError:
@@ -165,3 +169,34 @@ async def query_codex_catalog(codex_cli: str, env: dict[str, str],
             await conn.close()
         except Exception:
             raise CatalogError("cleanup", "目录查询进程清理失败，未应用结果；请检查目标节点。") from None
+
+
+def parse_reasoning_capabilities(value: dict[str, Any]) -> list[dict[str, Any]]:
+    """只投影有界能力字段；旧 Codex 缺失字段表示未知，不补本地固定列表。"""
+    result: list[dict[str, Any]] = []
+    for item in value["data"]:
+        if "supportedReasoningEfforts" not in item:
+            continue
+        options = item["supportedReasoningEfforts"]
+        default = item.get("defaultReasoningEffort")
+        if (not isinstance(options, list) or len(options) > 32
+                or not normalize_reasoning_effort(default) or default != normalize_reasoning_effort(default)):
+            raise CatalogError("invalid", "Codex 推理档位格式无效，未应用结果。")
+        seen: set[str] = set()
+        efforts: list[dict[str, str]] = []
+        for option in options:
+            if not isinstance(option, dict):
+                raise CatalogError("invalid", "Codex 推理档位格式无效，未应用结果。")
+            effort = option.get("reasoningEffort")
+            description = option.get("description", "")
+            if (not normalize_reasoning_effort(effort) or effort != normalize_reasoning_effort(effort)
+                    or effort in seen or not isinstance(description, str) or len(description) > 2000
+                    or any(ord(char) < 32 and char not in "\n\r\t" for char in description)):
+                raise CatalogError("invalid", "Codex 推理档位格式无效，未应用结果。")
+            seen.add(effort)
+            efforts.append({"reasoningEffort": effort, "description": description})
+        if efforts and default not in seen:
+            raise CatalogError("invalid", "Codex 默认档位不在支持列表内，未应用结果。")
+        result.append({"model": item["model"], "supportedReasoningEfforts": efforts,
+                       "defaultReasoningEffort": default})
+    return result

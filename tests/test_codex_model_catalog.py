@@ -13,7 +13,7 @@ from src.backend import codex_model_catalog as catalog
 from src.backend.backend_store import BackendStore
 from src.backend.bridge_ws import BridgeWS
 from src.backend.codex_office import CodexOfficeBackend
-from src.types import BackendType, ModelBackendConfig
+from src.types import BackendType, ModelBackendConfig, Session
 
 
 def page(*models, cursor=None):
@@ -61,6 +61,38 @@ class QueryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(conn.request.call_args_list[1].args[1]["cursor"], "next")
         self.assertTrue(all(call.args[0] == "model/list" for call in conn.request.call_args_list))
         conn.close.assert_awaited_once()
+
+    async def test_reasoning_capabilities_are_native_per_model_and_paginated(self):
+        first = page("a", cursor="next")
+        first["data"][0].update(supportedReasoningEfforts=[
+            {"reasoningEffort": "high", "description": "Higher effort"},
+            {"reasoningEffort": "ultra", "description": "Native new effort"}], defaultReasoningEffort="ultra")
+        second = page("b", "legacy")
+        second["data"][0].update(supportedReasoningEfforts=[], defaultReasoningEffort="none")
+        conn = self.fake([first, second])
+        with patch.object(catalog, "CatalogProcess", return_value=conn):
+            result = await catalog.query_codex_catalog("codex", {}, [])
+        self.assertEqual(result["reasoningCapabilities"], [
+            {"model": "a", "supportedReasoningEfforts": first["data"][0]["supportedReasoningEfforts"],
+             "defaultReasoningEffort": "ultra"},
+            {"model": "b", "supportedReasoningEfforts": [], "defaultReasoningEffort": "none"}])
+        self.assertEqual(result["modelOptions"], [{"id": name, "label": "名称 " + name} for name in ["a", "b", "legacy"]])
+
+    async def test_malformed_capabilities_never_return_partial_or_sensitive_results(self):
+        for options, default in [({}, "high"), ([None], "high"),
+            ([{"reasoningEffort": "high;secret"}], "high"),
+            ([{"reasoningEffort": "high", "description": "secret"}] * 2, "high"),
+            ([{"reasoningEffort": "high", "description": "secret"}], "low"),
+            ([{"reasoningEffort": "high", "description": "secret" * 1000}], "high"),
+            ([], None)]:
+            value = page("a")
+            value["data"][0].update(supportedReasoningEfforts=options, defaultReasoningEffort=default)
+            conn = self.fake([value])
+            with self.subTest(options=options), patch.object(catalog, "CatalogProcess", return_value=conn):
+                with self.assertRaises(catalog.CatalogError) as caught:
+                    await catalog.query_codex_catalog("codex", {}, [])
+                self.assertNotIn("secret", str(caught.exception))
+            conn.close.assert_awaited_once()
 
     async def test_complete_or_fail_and_cleanup(self):
         cases = [([page()], "empty"), ([page("a", cursor="n"), page("a")], "invalid"),
@@ -142,6 +174,31 @@ class QueryTests(unittest.IsolatedAsyncioTestCase):
 
 
 class RpcTests(unittest.IsolatedAsyncioTestCase):
+    async def test_session_catalog_uses_owned_session_cwd_without_admin_or_active_backend(self):
+        session = Session(id="s", title="S", created_at=1, updated_at=1, messages=[],
+                          working_dir="project-cwd", backend_id="codex", agent_session_id="native-thread")
+        bridge = BridgeWS.__new__(BridgeWS)
+        bridge._active_sessions = {"s": session}
+        bridge._backend_configs = [ModelBackendConfig(id="codex", type=BackendType.CODEX_OFFICIAL, label="Test")]
+        bridge._require_session_access = MagicMock(return_value="s")
+        bridge._require_node_update_capability = MagicMock(side_effect=AssertionError("not an admin action"))
+        bridge._get_backend = MagicMock(side_effect=AssertionError("no active backend access"))
+        with patch.object(catalog, "query_codex_catalog", AsyncMock(return_value={"status": "ok"})) as query:
+            bridge._authorize_rpc("codexSessionModelCatalog", bridge._rpc_codexSessionModelCatalog, ["s", "codex"])
+            self.assertEqual(json.loads(await bridge._rpc_codexSessionModelCatalog("s", "codex"))["status"], "ok")
+            self.assertEqual(query.call_args.kwargs["cwd"], "project-cwd")
+            self.assertEqual(session.agent_session_id, "native-thread")
+            query.reset_mock()
+            session.codex_connection_mode = "ssh"
+            self.assertEqual(json.loads(await bridge._rpc_codexSessionModelCatalog("s", "codex"))["code"], "unsupported")
+            query.assert_not_called()
+            bridge._require_session_access.side_effect = PermissionError("denied")
+            with self.assertRaises(PermissionError):
+                await bridge._rpc_codexSessionModelCatalog("s", "codex")
+            query.assert_not_called()
+        bridge._require_node_update_capability.assert_not_called()
+        bridge._get_backend.assert_not_called()
+
     async def test_backend_scope_readonly_runtime_and_normal_save(self):
         with tempfile.TemporaryDirectory() as directory, patch("src.backend.backend_store.paths.sub", side_effect=lambda name: Path(directory) / name):
             store = BackendStore()

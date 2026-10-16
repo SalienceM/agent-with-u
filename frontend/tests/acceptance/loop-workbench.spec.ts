@@ -1,5 +1,5 @@
 import { test, expect, type Page, type WebSocketRoute } from '@playwright/test';
-const { states, record } = require('../home/fixtures/loop-workbench.cjs');
+const { states, record, environmentStates } = require('../home/fixtures/loop-workbench.cjs');
 const sid = 'qa-loop-000';
 
 async function fixture(page: Page, name = 'idle') {
@@ -8,11 +8,15 @@ async function fixture(page: Page, name = 'idle') {
   const calls: Array<{ method: string; params: any[] }> = [];
   const pending: Array<() => void> = [];
   let hold = false;
+  let holdRun = false;
+  let holdAuto = false;
+  let rejectGoal = false;
   const summary = () => ({ protocolVersion: 1, sessionId: sid, controlMode: 'loop', controlRevision: 0,
     stage: value.stage, round: value.round, auto: value.auto,
     eligibility: { takeover: { allowed: true, reasonCode: 'ready', message: '可以接管', nextStep: 'request' },
       release: { allowed: false, reasonCode: 'loop', message: '已在 LOOP', nextStep: 'check' } } });
-  const push = () => socket.send(JSON.stringify({ event: 'loopUpdated', data: JSON.stringify(value) }));
+  const push = () => socket.send(JSON.stringify({ event: 'loopUpdated', data: JSON.stringify({ ...value,
+    loops: value.loops.map((rec: any) => rec.openspecSummary ? { ...rec, openspecRun: {}, detailLoaded: false } : rec) }) }));
   await page.routeWebSocket(/127\.0\.0\.1:45421/, ws => {
     socket = ws;
     const server = ws.connectToServer();
@@ -31,6 +35,19 @@ async function fixture(page: Page, name = 'idle') {
       if (frame.method === 'loopControlGet') return reply(summary());
       if (frame.method === 'loopAsideList') return reply({ status: 'ok', asides: [] });
       if (frame.method === 'loopGetState') return reply(value);
+      if (frame.method === 'loopRepairTaskContract') {
+        const request = JSON.parse(frame.params[1]);
+        value.contractRepair = { ...request, version: 1, status: 'running', attemptCount: 1, reason: '核对原始任务图' };
+        value.contractRepairActive = true;
+        value.contractRepairEligibility.canRequest = false;
+        value.contractRepairEligibility.message = '原修复正在执行，请等待回执';
+        reply({ status: 'accepted', operation: value.contractRepair }); push(); return;
+      }
+      if (frame.method === 'loopTaskContractRepairGet') return reply({ status: 'ok', operation: value.contractRepair });
+      if (frame.method === 'loopCancelTaskContractRepair') return reply({ status: 'accepted', message: '已请求停止，等待退出确认' });
+      if (frame.method === 'loopRunIteration' && holdRun) { pending.push(() => reply({ status: 'ok' })); return; }
+      if (frame.method === 'loopSetAuto' && holdAuto) { pending.push(() => { value.auto = frame.params[1]; reply({ status: 'ok' }); push(); }); return; }
+      if (frame.method === 'loopSetGoal' && rejectGoal) return reply({ status: 'error', message: '隔离夹具拒绝保存' });
       if (frame.method === 'loopGetRecord') {
         const result = { status: 'ok', record: { ...value.loops.find((item: any) => item.seq === frame.params[1]), detailLoaded: true,
           result: '隔离持久化成果', stageDetails: {}, callDiagnostics: [] } };
@@ -59,9 +76,85 @@ async function fixture(page: Page, name = 'idle') {
     replace: (name: string, extra: any = {}) => { value = { ...states()[name], sessionId: sid, ...extra }; push(); },
     update: (fn: (state: any) => void) => { fn(value); push(); }, hold: (on: boolean) => { hold = on; },
     release: () => { pending.splice(0).forEach(reply => reply()); },
+    holdRun: (on: boolean) => { holdRun = on; },
+    holdAuto: (on: boolean) => { holdAuto = on; }, rejectGoal: (on: boolean) => { rejectGoal = on; },
     progress: () => socket.send(JSON.stringify({ event: 'loopProgress', data: JSON.stringify({ sessionId: sid, seq: 1, subStage: 'step1', text: '实时内容' }) })),
   };
 }
+
+for (const width of [1366, 390]) test(`contract recovery is explicit and one cause stays one card at ${width}`, async ({ page }, info) => {
+  await page.setViewportSize({ width, height: width === 390 ? 844 : 900 });
+  const f = await fixture(page);
+  if (width === 390 && await page.locator('.awu-sidebar').isVisible()) await page.getByRole('button', { name: '收起侧栏', exact: true }).click();
+  const cause = { causeRef: 'contract:fixture', causeRevision: 1 };
+  f.update(state => {
+    state.contractRepairProtocolVersion = 1;
+    state.taskSource = { status: 'current', revision: 1, change: 'fixture', checked: 0, total: 3 };
+    state.contractRepairEligibility = { ...cause, canRequest: true, round: 1, seq: 1, controlRevision: 0 };
+    state.iterationRequest = { version: 1, sessionId: sid, round: 1, seq: 1, controlRevision: 0,
+      sourceRevision: 1, environmentRevision: 0, canRequest: false, message: '先核对任务映射问题' };
+    state.progressGuard = { ...cause, pause: true, round: 1, seq: 1, reason: '任务编号 U 遗漏' };
+    state.loops = [{ ...record(), detailLoaded: false,
+      decision: { ...cause, decisionId: 'contract-wait', round: 1, seq: 1, action: 'wait', reasonCode: 'task_contract_invalid',
+        reasonText: '任务编号 U 遗漏', resumeCondition: '打开任务映射详情，核对原始证据；不必重新绑定正常来源。' },
+      contractValidation: { ...cause, version: 1, status: 'exhausted', origin: 'output', attemptCount: 3,
+        fields: ['taskPlan.tasks'], affectedIds: ['U'], reason: '任务编号 U 遗漏' } }];
+  });
+  const issue = f.pane.getByRole('region', { name: '需要处理', exact: true });
+  await expect(issue).toContainText('任务计划仍不合格');
+  await expect(f.pane.getByTestId('loop-progress-notice')).toHaveCount(0);
+  await expect(issue.getByText(/还有/)).toHaveCount(0);
+  await f.pane.getByRole('button', { name: '流程', exact: true }).click();
+  await expect(issue.getByText(/还有/)).toHaveCount(0);
+  await f.pane.getByRole('button', { name: '面板', exact: true }).click();
+  await issue.getByRole('button', { name: '查看处理依据', exact: true }).click();
+  const dialog = f.pane.getByRole('dialog');
+  await expect(dialog).toContainText('错误字段：taskPlan.tasks');
+  await expect(dialog).toContainText('规划调用 3/3');
+  await expect(dialog).toContainText('受影响任务：U');
+  expect(f.count('loopRepairTaskContract')).toBe(0);
+  expect(f.count('loopRunIteration')).toBe(0);
+  await page.screenshot({ path: info.outputPath(`contract-${width}-cause.png`) });
+  const repair = dialog.getByRole('button', { name: '修复任务映射', exact: true });
+  await repair.dispatchEvent('click'); await repair.dispatchEvent('click');
+  await expect(dialog.getByRole('region', { name: '任务映射修复' })).toContainText('正在只读修复');
+  expect(f.count('loopRepairTaskContract')).toBe(1);
+  f.update(state => {
+    state.contractRepair.status = 'succeeded'; state.contractRepair.reason = '映射已修复，尚未运行';
+    state.contractRepairActive = false;
+    state.contractRepairEligibility.message = '当前无待修复的协议问题';
+    state.loops[0].contractValidation.status = 'repaired';
+    state.iterationRequest.canRequest = true;
+    state.iterationRequest.message = '';
+  });
+  await expect(dialog.getByRole('region', { name: '任务映射修复' })).toContainText('映射已修复，尚未运行');
+  await expect(dialog).toHaveAttribute('aria-label', '映射已修复，尚未运行');
+  expect(f.count('loopRunIteration')).toBe(0); expect(f.count('loopSetAuto')).toBe(0);
+  await page.screenshot({ path: info.outputPath(`contract-${width}-repaired.png`) });
+  await dialog.getByRole('button', { name: '关闭详情，返回工作台' }).press('Escape');
+  await expect(issue.getByRole('button', { name: '查看处理依据', exact: true })).toBeFocused();
+  await f.pane.getByRole('button', { name: '运行下一次', exact: true }).click();
+  expect(f.count('loopRunIteration')).toBe(1);
+});
+
+test('old issue form cannot repair a new revision and legacy endpoint never runs as fallback', async ({ page }) => {
+  const f = await fixture(page);
+  f.update(state => {
+    const cause = { causeRef: 'contract:c', causeRevision: 1 };
+    state.contractRepairProtocolVersion = 1;
+    state.contractRepairEligibility = { ...cause, canRequest: true, round: 1, seq: 1, controlRevision: 0 };
+    state.loops = [{ ...record(), contractValidation: { ...cause, status: 'paused' },
+      decision: { ...cause, decisionId: 'd', round: 1, seq: 1, action: 'wait', reasonCode: 'task_contract_invalid' } }];
+  });
+  await f.pane.getByRole('button', { name: '查看处理依据', exact: true }).click();
+  const dialog = f.pane.getByRole('dialog');
+  f.update(state => { state.loops[0].decision.causeRevision++; state.loops[0].contractValidation.causeRevision++; state.contractRepairEligibility.causeRevision++; });
+  await expect(dialog).toContainText('旧目标不能执行操作');
+  await expect(dialog.getByRole('button', { name: '修复任务映射', exact: true })).toBeDisabled();
+  f.update(state => { delete state.contractRepairProtocolVersion; });
+  await expect(dialog).toContainText('当前执行端未提供修复协议');
+  expect(f.count('loopRepairTaskContract')).toBe(0); expect(f.count('loopRunIteration')).toBe(0);
+});
 
 for (const size of [{ width: 1366, height: 768 }, { width: 390, height: 844 }]) {
   test(`workbench states fit ${size.width} and keyboard details return focus`, async ({ page }, info) => {
@@ -72,6 +165,9 @@ for (const size of [{ width: 1366, height: 768 }, { width: 390, height: 844 }]) 
       const bench = f.pane.getByTestId('loop-workbench');
       await expect(bench.getByTestId('loop-goal-summary')).toBeInViewport();
       await expect(bench.getByTestId('loop-current-status')).toBeInViewport();
+      await expect(bench.getByTestId('loop-stage-rail')).toBeInViewport();
+      await expect(bench.getByRole('button', { name: '面板', exact: true })).toBeVisible();
+      await expect(bench.getByRole('button', { name: '流程', exact: true })).toBeVisible();
       await expect(bench.getByRole('group', { name: 'LOOP 统一操作' }).getByRole('button').first()).toBeInViewport();
       await expect(bench.getByTestId('loop-source-card')).toHaveCount(0);
       expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
@@ -87,10 +183,14 @@ for (const size of [{ width: 1366, height: 768 }, { width: 390, height: 844 }]) 
     expect(menu!.x + menu!.width).toBeLessThanOrEqual(size.width);
     await page.screenshot({ path: info.outputPath(`workbench-${size.width}-more.png`) });
     await more.click();
-    const trigger = f.pane.getByRole('button', { name: '过程与历史', exact: true });
+    const trigger = f.pane.getByRole('button', { name: '运行诊断', exact: true });
     await trigger.focus(); await trigger.press('Enter');
     const close = f.pane.getByRole('button', { name: '关闭详情，返回工作台' });
     await expect(close).toBeFocused();
+    const kit = await f.pane.getByTitle('Workspace Kits · Session 标准配件（实验）').boundingBox();
+    expect(kit).not.toBeNull();
+    expect(await f.pane.getByRole('dialog').evaluate((dialog, box) =>
+      dialog.contains(document.elementFromPoint(box.x + box.width / 2, box.y + box.height / 2)), kit!)).toBe(true);
     await page.screenshot({ path: info.outputPath(`workbench-${size.width}-details.png`) });
     await close.press('Escape');
     await expect(trigger).toBeFocused();
@@ -111,13 +211,136 @@ test('each main action sends one matching RPC; Auto stop never discards current 
   await f.pane.getByRole('button', { name: '开启新一轮', exact: true }).click();
   expect(f.count('loopContinue')).toBe(1);
   f.replace('resumable');
-  await f.pane.getByRole('button', { name: '继续未完成步骤', exact: true }).click();
+  await f.pane.getByRole('button', { name: '恢复 Loop #1', exact: true }).click();
   expect(f.count('loopRunIteration')).toBe(1);
   f.replace('idea');
   await f.pane.getByPlaceholder('直接写目标，或留空让模型汇总下方想法').fill('明确本轮目标');
   page.once('dialog', dialog => dialog.accept());
   await f.pane.getByRole('button', { name: '确认目标，进入执行', exact: true }).click();
   expect(f.count('loopSealIdea')).toBe(1);
+});
+
+test('two primary views keep scores separate from 7/25 task and subtask evidence', async ({ page }, info) => {
+  const f = await fixture(page);
+  f.update(state => {
+    state.taskSource = { status: 'current', revision: 3, change: 'fixture', checked: 7, total: 25 };
+    state.roundLoopCount = 1;
+    state.loops = [{ ...record(), detailLoaded: false, analysis: { score: 99, scoreObserved: true },
+      deliverySummary: { counts: { implemented: 2, verified: 7, manual: 1 }, milestones: { counts: { verified: 3 } } } }];
+  });
+  await expect(f.pane.getByTestId('loop-score-ring')).toHaveAttribute('aria-label', '评审 99 分');
+  await expect(f.pane).toContainText('正式任务勾选 7/25');
+  await expect(f.pane).toContainText('子项台账（不计入正式任务分母）：已实现待验 0 · 已验证 3');
+  await expect(f.pane.getByTestId('loop-acceptance')).toContainText('尚未确认');
+  await expect(f.pane.getByText('可交付', { exact: true })).toHaveCount(0);
+  f.update(state => { state.loops[0].deliverySummary.milestones.counts.implemented = 1; state.latestScore = 85; state.loops[0].analysis.score = 85; });
+  await expect(f.pane).toContainText('正式任务勾选 7/25');
+  await expect(f.pane).toContainText('子项台账（不计入正式任务分母）：已实现待验 1 · 已验证 3');
+  await f.pane.getByRole('button', { name: 'Loop #1 第 1 轮 · 未完成', exact: false }).click();
+  await expect.poll(() => f.count('loopGetRecord')).toBe(1);
+  const stateReads = f.count('loopGetState');
+  for (let i = 0; i < 3; i++) {
+    await f.pane.getByRole('button', { name: '流程', exact: true }).click();
+    await expect(f.pane.getByRole('group', { name: 'Loop #1 流程' })).toBeVisible();
+    await f.pane.getByRole('button', { name: '面板', exact: true }).click();
+  }
+  expect(f.count('loopGetRecord')).toBe(1);
+  expect(f.count('loopGetState')).toBe(stateReads);
+  expect(f.calls.some(call => /Source|Environment|RunIteration/.test(call.method))).toBe(false);
+  for (const width of [1366, 390]) {
+    // 在宽屏状态先收起，再缩小视口，避免移动端自动折叠与点击竞争。
+    const collapse = page.getByRole('button', { name: '收起侧栏', exact: true });
+    // 折叠后的桌面图标栏也有 .awu-sidebar，必须检查展开状态的真实按钮。
+    if (width === 390 && await collapse.isVisible()) await collapse.click();
+    await page.setViewportSize({ width, height: width === 390 ? 844 : 768 });
+    if (width === 390) await expect(page.locator('.awu-sidebar')).toBeHidden();
+    await f.pane.getByRole('button', { name: '流程', exact: true }).click();
+    const lane = f.pane.getByRole('group', { name: 'Loop #1 流程' });
+    await lane.scrollIntoViewIfNeeded();
+    const bounds = await lane.boundingBox();
+    const main = await f.pane.getByRole('main', { name: 'LOOP 当前任务' }).boundingBox();
+    expect(bounds!.width / main!.width).toBeGreaterThan(.85);
+    expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+    await page.screenshot({ path: info.outputPath(`restored-flow-${width}.png`) });
+  }
+});
+
+test('unsupported diagnosis does not lock resume and duplicate requests stay single across view changes', async ({ page }) => {
+  const f = await fixture(page);
+  f.replace('resumable', environmentStates().unsupported);
+  // Keep the fixture identity, not the synthetic unit-test identity.
+  f.update(state => { state.sessionId = sid; });
+  const resume = f.pane.getByRole('button', { name: '恢复 Loop #1', exact: true });
+  await expect(resume).toBeEnabled();
+  await expect(f.pane.getByRole('region', { name: '需要处理' })).toHaveCount(0);
+  f.holdRun(true);
+  await resume.click();
+  await expect(f.pane.getByRole('button', { name: '正在提交执行…', exact: true })).toBeDisabled();
+  await f.pane.getByRole('button', { name: '流程', exact: true }).click();
+  await expect(f.pane.getByRole('button', { name: '正在提交执行…', exact: true })).toBeDisabled();
+  expect(f.count('loopRunIteration')).toBe(1);
+  f.release();
+  await expect(resume).toBeEnabled();
+  await f.pane.getByRole('button', { name: '运行诊断', exact: true }).click();
+  await expect(f.pane.getByRole('dialog')).toContainText('不支持或覆盖不足');
+  expect(f.count('loopRunIteration')).toBe(1);
+  expect(f.count('loopExecutionEnvironmentCheck')).toBe(0);
+});
+
+test('bound source explains effective dependency without selecting an extra workflow or hiding invalid declarations', async ({ page }) => {
+  const f = await fixture(page);
+  f.update(state => {
+    state.taskSource = { status: 'current', revision: 4, change: 'fixture', checked: 7, total: 25 };
+    state.executionEnvironment = { revision: 3, status: 'unknown', effectiveDependencies: { version: 1, sessionId: sid,
+      sourceRevision: 4, environmentRevision: 3, items: [{ id: 'openspec', required: true, origins: [
+        { kind: 'task_source', status: 'current', ref: 'source:4' }, { kind: 'declaration', status: 'invalid', ref: 'opsx-apply' }] }] } };
+  });
+  await f.pane.getByRole('button', { name: '运行诊断', exact: true }).click();
+  const dialog = f.pane.getByRole('dialog');
+  await expect(dialog).toContainText('来自任务来源 · 来源已核对');
+  await expect(dialog).toContainText('来自显式声明 · 声明失效，需重新核对');
+  await expect(dialog).toContainText('额外工作流选择：无额外选择');
+  await expect(dialog).not.toContainText('未选择（通用');
+  await dialog.getByRole('button', { name: '关闭详情，返回工作台' }).press('Shift+Tab');
+  expect(await dialog.evaluate(el => el.contains(document.activeElement))).toBe(true);
+  expect(f.calls.some(call => /Source|Environment|RunIteration/.test(call.method))).toBe(false);
+});
+
+test('normal source inspection has no unbind form, cancellation and long text do not write or overflow', async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  const f = await fixture(page);
+  f.update(state => { state.goal = '很长的目标说明'.repeat(150); state.taskSource = {
+    status: 'current', revision: 4, change: 'long-source-name-'.repeat(20), checked: 7, total: 25 };
+  });
+  await f.pane.getByRole('button', { name: /^来源：/ }).click();
+  const card = f.pane.getByTestId('loop-source-card');
+  await expect(card.getByRole('textbox')).toHaveCount(0);
+  await card.getByRole('button', { name: '解除绑定…', exact: true }).click();
+  await card.getByLabel('来源范围处置依据').fill('仅草稿，取消不提交');
+  await card.getByRole('button', { name: '取消', exact: true }).click();
+  await expect(card.getByRole('textbox')).toHaveCount(0);
+  expect(f.count('loopTaskSourceSet')).toBe(0);
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+});
+
+test('specific issue navigation is read only and obsolete targets cannot act on another revision', async ({ page }) => {
+  const f = await fixture(page, 'multi');
+  await f.pane.getByRole('button', { name: '查看处理依据', exact: true }).click();
+  const dialog = f.pane.getByRole('dialog');
+  await expect(dialog).toHaveAttribute('aria-label', '旧调用退出尚未确认');
+  await expect(dialog.getByLabel('指定检查依据')).toBeVisible();
+  await expect(dialog.getByTestId('loop-source-card')).toHaveCount(0);
+  await expect(dialog.getByLabel('详情分类')).toHaveCount(0);
+  f.update(state => { state.executionEnvironment = { revision: 4, status: 'passed', blockers: [] }; });
+  await expect(dialog).toContainText('该问题已更新或解决');
+  await expect(dialog.getByRole('button', { name: '重新检查环境' })).toHaveCount(0);
+  await dialog.getByRole('button', { name: '关闭详情，返回工作台' }).click();
+  await f.pane.getByRole('button', { name: '还有 1 个问题', exact: true }).click();
+  await expect(dialog).toContainText('核对任务来源');
+  await expect(dialog).toContainText('存在未解决任务阻塞');
+  await dialog.getByRole('button', { name: '核对范围差异' }).click();
+  await expect(dialog.getByTestId('loop-source-card')).toBeVisible();
+  expect(f.calls.some(call => /Source|Environment|RunIteration/.test(call.method))).toBe(false);
 });
 
 test('discard has separate record and disk confirmations; cancellation is read only', async ({ page }) => {
@@ -148,38 +371,46 @@ test('hidden details, repeated pushes and streaming do not reload; selected hist
   for (let i = 0; i < 5; i++) { f.push(); f.progress(); }
   await expect(f.pane.getByLabel('查看流程轮次')).toHaveValue('1');
   expect(f.count('loopGetRecord')).toBe(1);
-  await f.pane.getByRole('button', { name: '关闭详情，返回工作台' }).click();
+  await f.pane.getByRole('button', { name: '运行诊断', exact: true }).click();
   f.update(state => { state.loops[0].updatedAt++; });
   await page.waitForTimeout(150);
   expect(f.count('loopGetRecord')).toBe(1);
-  await f.pane.getByRole('button', { name: '过程与历史', exact: true }).click();
+  await f.pane.getByRole('button', { name: '关闭详情，返回工作台' }).click();
   await expect.poll(() => f.count('loopGetRecord')).toBe(2);
   expect(f.calls.some(call => /Source|Environment/.test(call.method))).toBe(false);
 });
 
 test('goal and Addon drafts survive opening details; supplement is queued without altering current step', async ({ page }) => {
   const f = await fixture(page, 'running');
-  await f.pane.getByText('补充要求 · 0 条待纳入', { exact: true }).click();
   const input = f.pane.getByPlaceholder('补充要求 / 修正…（@ 引用文件/SESSION，可贴图，Ctrl/Cmd+Enter）');
   await input.fill('保留正在执行的步骤');
+  await input.focus();
+  await page.evaluate(() => {
+    const data = new DataTransfer();
+    data.setData('text/html', '<img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=">');
+    document.dispatchEvent(new ClipboardEvent('paste', { clipboardData: data, bubbles: true }));
+  });
   await f.pane.getByRole('button', { name: '目标与补充', exact: true }).click();
   await f.pane.getByRole('button', { name: '编辑', exact: true }).click();
-  const goal = f.pane.getByLabel('LOOP 详情').locator('textarea').first();
+  const goal = f.pane.getByRole('dialog').locator('textarea').first();
   await goal.fill('未提交的目标草稿');
-  await f.pane.getByLabel('详情分类').selectOption('settings');
-  await f.pane.getByLabel('详情分类').selectOption('goal');
+  await f.pane.getByRole('button', { name: '关闭详情，返回工作台' }).click();
+  await f.pane.getByRole('button', { name: '流程', exact: true }).click();
+  await f.pane.getByRole('button', { name: '目标与补充', exact: true }).click();
   await expect(goal).toHaveValue('未提交的目标草稿');
   await f.pane.getByRole('button', { name: '关闭详情，返回工作台' }).click();
   await expect(f.pane.getByRole('button', { name: '目标与补充', exact: true })).toBeFocused();
   await expect(input).toHaveValue('保留正在执行的步骤');
   await input.press('Control+Enter');
   await expect.poll(() => f.count('loopAddAddon')).toBe(1);
+  expect(JSON.parse(f.calls.find(call => call.method === 'loopAddAddon')!.params[2])).toHaveLength(1);
   await expect(f.pane.getByTestId('loop-current-status')).toContainText('正在执行');
   expect(f.count('loopRunIteration')).toBe(0); expect(f.count('loopSetGoal')).toBe(0);
 });
 
 test('same Session on a different executor cannot receive a late cached detail', async ({ page }, info) => {
   await page.goto('/');
+  await expect(page.locator('.app-root')).toBeVisible();
   await page.evaluate(async () => {
     // @ts-ignore Vite serves this test-only module; all LOOP reads are in-memory fakes.
     const { mountWorkbenchHarness } = await import('/tests/acceptance/workbench-harness.tsx');
@@ -199,12 +430,13 @@ test('same Session on a different executor cannot receive a late cached detail',
   await page.evaluate(() => (window as any).loopHarness.release());
   await bench.getByRole('button', { name: 'Execute', exact: true }).click();
   await expect(bench).toContainText('node-b 的独立原文');
-  await bench.getByRole('button', { name: '关闭详情，返回工作台' }).click();
+  await bench.getByLabel('Loop #1 阶段详情').getByRole('button', { name: '✕', exact: true }).click();
   for (const width of [1366, 390]) {
     await page.setViewportSize({ width, height: width === 390 ? 844 : 768 });
     await expect(bench.getByTestId('loop-current-status')).toContainText('只读总览');
     await expect(bench.getByRole('button', { name: '返回人工工作区' })).toBeInViewport();
     await expect(bench.getByText('更多操作', { exact: true })).toHaveCount(0);
+    expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
     await page.screenshot({ path: info.outputPath(`workbench-${width}-manual.png`) });
   }
   await bench.getByRole('button', { name: '目标与补充', exact: true }).click();
@@ -233,11 +465,12 @@ test('custom strategy survives settings edits and every unresolved issue stays i
   f.update(state => { state.policy = { maxLoops: 13, workMode: 'delivery', strategy: '用户自定义：先看证据，再实现',
     backends: { analysis: 'qa-reviewer' }, runtimes: { execute: { model: 'fixture-model', reasoningEffort: 'high' } } }; });
   await f.pane.getByRole('button', { name: '还有 2 个问题', exact: true }).click();
-  const details = f.pane.getByLabel('LOOP 详情');
+  const details = f.pane.getByRole('dialog');
   await expect(details).toContainText('旧调用退出尚未确认');
   await expect(details).toContainText('核对任务来源');
   await expect(details).toContainText('存在未解决任务阻塞');
-  await details.getByLabel('详情分类').selectOption('settings');
+  await details.getByRole('button', { name: '关闭详情，返回工作台' }).click();
+  await f.pane.getByRole('button', { name: '策略与心智', exact: true }).click();
   await details.getByRole('button', { name: /策略与心智/ }).click();
   const strategy = details.getByPlaceholder('描述 loop 的策略与评分心智，会注入到每次 prepare / analysis 提示中…');
   await expect(strategy).toHaveValue('用户自定义：先看证据，再实现');
@@ -250,6 +483,70 @@ test('custom strategy survives settings edits and every unresolved issue stays i
   expect(f.count('loopRunIteration')).toBe(0);
 });
 
+for (const width of [1366, 390]) test(`native OpenSpec actions show waiting receipts progress and defects at ${width}`, async ({ page }, info) => {
+  await page.setViewportSize({ width, height: 900 });
+  const f = await fixture(page);
+  if (width === 390 && await page.locator('.awu-sidebar').isVisible()) await page.getByRole('button', { name: '收起侧栏', exact: true }).click();
+  f.holdRun(true);
+  await f.pane.getByRole('button', { name: '运行下一次', exact: true }).click();
+  await expect(f.pane.getByTestId('loop-action-feedback')).toContainText('执行 LOOP：正在提交');
+  await expect(f.pane.getByRole('button', { name: '正在提交执行…', exact: true })).toBeDisabled();
+  await f.pane.getByRole('button', { name: '流程', exact: true }).click();
+  await expect(f.pane.getByTestId('loop-action-feedback')).toContainText('正在提交');
+  expect(f.count('loopRunIteration')).toBe(1);
+  await page.screenshot({ path: info.outputPath(`native-${width}-sending.png`) });
+  f.release();
+  f.update(state => { state.running = true; state.startup = { status: 'running', message: '正在准备工作区快照…' }; });
+  await expect(f.pane.getByTestId('loop-action-feedback')).toContainText('请求已接收');
+  await expect(f.pane).toContainText('正在准备工作区快照');
+  f.update(state => {
+    state.startup = { status: 'done' }; state.running = false;
+    state.loops = [{ ...record(), openspecSummary: { change: 'test-change', phase: 'verify', status: 'done',
+      checked: 24, total: 25, pending: 0, manual: 1, fixes: 1, verified: true, message: '发现必修问题' },
+      openspecRun: { verify: { issues: [{ id: 'bug', severity: 'critical', summary: '重复保存导致任务丢失', evidence: 'fixture.ts:12', requiresFix: true, manual: false }] } } }];
+  });
+  await expect(f.pane.getByTestId('loop-openspec-status')).toContainText('任务 24/25');
+  await expect(f.pane.getByTestId('loop-openspec-status')).toContainText('人工未验收 1');
+  await expect(f.pane.getByTestId('loop-openspec-status')).toContainText('必修问题 1');
+  f.holdAuto(true);
+  await f.pane.getByRole('button', { name: '开启 Auto', exact: true }).click();
+  await expect(f.pane.getByTestId('loop-action-feedback')).toContainText('开启 Auto：正在提交');
+  f.release();
+  await expect(f.pane.getByTestId('loop-action-feedback')).toContainText('已完成');
+  await expect(f.pane.getByRole('button', { name: '停止后续自动执行', exact: true })).toBeVisible();
+  await page.screenshot({ path: info.outputPath(`native-${width}-progress.png`) });
+  await f.pane.getByRole('button', { name: '成果与证据', exact: true }).click();
+  await expect(f.pane.getByText('重复保存导致任务丢失', { exact: false })).toBeVisible();
+  expect(f.count('loopTaskSourceDiscover')).toBe(0);
+  expect(f.count('loopSetAuto')).toBe(1);
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+});
+
+test('pending Run does not freeze another Session and failed goal save retains the draft', async ({ page }) => {
+  const f = await fixture(page);
+  f.holdRun(true);
+  await f.pane.getByRole('button', { name: '运行下一次', exact: true }).click();
+  await expect(f.pane.getByTestId('loop-action-feedback')).toContainText('正在提交');
+  if (!await page.locator('.awu-sidebar').isVisible()) await page.getByRole('button', { name: '打开会话列表', exact: true }).click();
+  await page.locator('.awu-sidebar').getByText(/^客户工作会话 \d+$/).first().click();
+  const current = page.locator('[data-session-tab-panel]:visible');
+  const selected = await current.getAttribute('data-session-tab-panel');
+  await expect(current.getByTestId('loop-action-feedback')).toHaveCount(0);
+  f.release();
+  await expect(current).toHaveAttribute('data-session-tab-panel', selected!);
+  await page.getByRole('tab', { name: '首页交付 Loop 1', exact: true }).click();
+  await f.pane.getByRole('button', { name: '目标与补充', exact: true }).click();
+  const details = f.pane.getByRole('dialog');
+  await details.getByRole('button', { name: '编辑', exact: true }).click();
+  const input = details.locator('textarea').first();
+  await input.fill('保留失败后的目标草稿');
+  f.rejectGoal(true);
+  await details.getByRole('button', { name: '保存', exact: true }).click();
+  await expect(details.getByTestId('loop-action-feedback')).toContainText('隔离夹具拒绝保存');
+  await expect(input).toHaveValue('保留失败后的目标草稿');
+  expect(f.count('loopRunIteration')).toBe(1);
+});
+
 test('original ideas, goal revisions and applied Addon images remain readable', async ({ page }) => {
   const f = await fixture(page);
   const img = { id: 'synthetic-image', mime_type: 'image/png', base64: 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=' };
@@ -260,7 +557,7 @@ test('original ideas, goal revisions and applied Addon images remain readable', 
     state.loops = [record()];
   });
   await f.pane.getByRole('button', { name: '目标与补充', exact: true }).click();
-  const details = f.pane.getByLabel('LOOP 详情');
+  const details = f.pane.getByRole('dialog');
   await details.getByRole('button', { name: /目标演变/ }).click();
   await expect(details).toContainText('原始目标'); await expect(details).toContainText('修订目标');
   await details.getByRole('button', { name: /原始诉求/ }).click();

@@ -220,7 +220,7 @@ class CodexOfficeTests(unittest.TestCase):
             output_path=None,
             image_paths=[],
             stdin_mode=False,
-            reasoning_effort="ultra-unknown",
+            reasoning_effort="high;unsafe",
         )
         self.assertNotIn("--config", command)
 

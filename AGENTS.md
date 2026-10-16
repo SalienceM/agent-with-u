@@ -224,6 +224,19 @@ persists optional `model_override` + `reasoning_effort` runtime knobs separately
 For `codex-office`, these become Codex CLI `--model` and
 `model_reasoning_effort` overrides; an empty value keeps the backend/Codex default.
 
+Codex reasoning choices are read on opening runtime settings from the target executor's
+`model/list` (`supportedReasoningEfforts` / `defaultReasoningEffort`), per selected model.
+`codexSessionModelCatalog` checks Session ownership and uses its cwd without resuming
+the active native thread; pre-creation settings use the explicitly selected executor.
+SSH Sessions report unsupported rather than querying local Codex. Directory defaults
+are not effective config.toml defaults. Missing/failed capabilities never become a
+hard-coded list; existing drafts remain visible as unconfirmed. Reads are coalesced
+in flight, bounded, identity-scoped and do not hold the chat/stop RPC write barrier.
+Reasoning normalization validates safe tokens instead of a fixed effort enum, so new
+Codex values survive Session/LOOP persistence and CLI/app-server submission. Qwen is
+unchanged. Protocol fields were checked against isolated Codex 0.162.1 JSON schema;
+directory results do not prove account availability or upstream freshness.
+
 `DashScopeImageBackend` must never stream downloaded result images as inline Base64
 Markdown. It atomically stores result bytes under `paths.sub("skill-images")` and emits only
 the short `/api/skill-images/<uuid>` reference, which `MessageBubble` hydrates through the
@@ -308,8 +321,8 @@ The global stage advances one-way: `loopidea → loopexecute → loopout`.
   `LoopStep.started_at/ended_at`) to drive the flow view's durations.
   Scores ≥70/≥85 are necessary but not sufficient for deliverable/outputtable:
   new iterations also require a complete, stable task scope and verified acceptance.
-  A composite **risk coefficient**
-  (0–1) caps the effective max loops. **Auto-continue** (`loopSetAuto`): when on,
+  A composite **risk coefficient** (0–1) participates in stopping decisions;
+  the displayed iteration budget remains the configured per-round maximum. **Auto-continue** (`loopSetAuto`): when on,
   a finished loop auto-starts the next until stop/cancel. **Resume**: state is
   persisted per sub-stage and per step, so an interrupted loop is `resumable` —
   `loopRunIteration` continues the last unfinished `LoopRecord` from its breakpoint
@@ -341,21 +354,33 @@ deltas) push events — they do **not** pollute the chat transcript. For a loop
 session the **LoopPanel is rendered inline as the pane's content** (ChatPane
 detects `sessionType === 'loop'` and renders `<LoopPanel embedded />` instead of
 the message list + chat input). This is deliberate: a loop session has **no
-free-form chat box**. `LoopPanel` is now a compatibility container for one
-`LoopWorkbench`: compact goal/status, one primary action, separate Auto/stop,
-and "更多操作" for takeover and dangerous discard (with separate disk-restore
-confirmation). There is no top-level panel/flow toggle, stage rail, metric bar
-or score-ring navigation. Scores are diagnostic detail, never completion badges.
-Source/environment/policy live in "任务设置"; "需要处理" retains related evidence
-and other unresolved issues without deciding scheduler outcomes. Opening/checking
-does not resume work. "过程与历史" keeps the flow lanes and independent stage/step
-details; "成果与证据" keeps acceptance and diagnostics; "目标与补充" keeps goal
-revisions, original images/ideas and applied Addons. Pending Addons have a compact
-entry on the main face and affect the next applicable planning boundary.
+free-form chat box**. `LoopPanel` shares one `useLoopWorkbenchState` controller across
+the restored primary **面板 / 流程** views. The three-stage rail, iteration cards,
+score rings and current-round score/risk/budget metrics are visible again; scores
+are never completion badges. Formal tasks and sub-milestone counts remain separate.
+Flow lanes and selected stage/step output occupy the main workspace. Run/resume,
+Auto, stop, takeover, goal and strategy controls are direct and shared. Dangerous
+discard stays in "更多操作" with independent disk-restore confirmation.
+"来源" opens compact status, explicit discovery/change, conflict or unbind forms;
+unbind disposition is absent until requested. "运行诊断" separates coverage,
+retained faults and dependency origins; technical evidence is expandable.
+"需要处理" targets the exact issue/revision, never a generic settings warehouse;
+only current causal references merge issues. Opening/checking never resumes work.
+"目标与补充" keeps goal revisions, original images/ideas and applied Addons;
+the main-face Addon composer affects the next applicable planning boundary.
 `useLoopWorkbenchState` owns subscription/stream buffering and revision-coalesced
 lazy detail reads, keyed by owner/executor/Session. Hidden details and repeated
-pushes do not reload; historic selection stays put. Wide panes use a right detail
-split, narrow panes a full-width detail surface with Escape/back focus return.
+pushes do not reload; historic selection stays put. Auxiliary operations use a
+bounded overlay (580px desktop, full width narrow), a single title, keyboard focus
+trap and Escape/back focus return, preserving drafts and main workspace width.
+The versioned `iterationRequest` compact snapshot reuses the submission gate and
+is only “can request”, not permission or a ready/acceptance verdict. Submission and
+actual execution recheck authoritative boundaries. Unsupported/stale coverage alone
+does not disable requests; real faults and unconfirmed exits remain protected.
+`effectiveDependencies` is a bounded projection of source, declaration validation
+and observed checks, never new discovery during serialization. Empty optional
+workflow selection does not hide an OpenSpec source dependency. Legacy/offline and
+late identity/revision results remain distinct; never retry writes or fall back nodes.
 The global "俺寻思" entry remains outside this workbench.
 
 **Sandbox mode removed (UI + default-off).** The Layer-2 working-dir sandbox
@@ -407,7 +432,31 @@ or from one denied user-file read; real authorization/safety blockers still paus
 Historical next-focus notes are not permanent priority locks when a newer explicit
 user disposition changes scheduling; unresolved losses and acceptance remain visible.
 
-**任务级阻塞恢复。** `loop_task_blockers.py` 冻结有界任务图并归约传递依赖；
+**OpenSpec 原生续跑（优先于下文的通用任务建图）。** `loop_openspec.py` /
+`loop_openspec_bridge.py` 在用户显式运行/开启 Auto 时，用当前目标指定或唯一真实候选
+自动采用 OpenSpec change；仅查看不发现/绑定/启动。相同来源范围变化记录差异并自动刷新，
+不再反复要求确认。歧义、来源消失、CLI blocked、越界/执行身份变化仍须处理。
+直接根据真实 tasks 勾选运行 apply，不要求第二份 taskPlan/milestone/delivery 台账。
+自动任务完成后调用只读 verify；critical 和需修复 warning 进入修复→verify，建议不导致无限优化。
+用户明确排除的独立人工项保持未勾选；含实现工作的混合项不整体排除。否定和后续恢复安排
+不能误判为跳过。模型 verify 是有界评审结论，不是机器证明；未知/失败/变化中的结论不通过。
+保留 Auto/预算/风险/停止/原生环境/未确认退出及已有真实阻塞；只替代内部重复计划格式。
+`openspecRun` 保留原任务进度和验证问题，紧凑推送只发 `openspecSummary`，原文仍按需读取。
+`loop_startup_bridge.py` 用 owned helper 准备快照并先推送启动状态；取消不等于退出，
+running/unknown 持久保护本 Session。普通保存与转交/修复共用有序异步写队列，不更换未完成队列。
+工作台 `LoopActionController` 显示提交中/已接收/完成/失败/结果未知，12 秒包括连接等待，
+未知后最多一次自动只读核对，无写重试。运行接收不等于完成，保存失败保留草稿，反馈不串 Session。
+本仓库验证使用 fake Backend、临时仓库和隔离浏览器；不声称生产模型/用户项目验收。
+
+**任务级阻塞恢复（通用 LOOP）。** `loop_task_blockers.py` 冻结有界任务图并归约传递依赖；
+`loop_task_recovery.py` / `loop_task_recovery_bridge.py` 将完整协议校验前移到规划接受边界；
+初次/纠正/execute 重规划共享最多三次只读规划额度，新协议损坏不走 legacy 写兜底。
+历史修复是绑定问题/控制修订和 requestId 的独立显式操作，最多两次只读候选调用；
+原文缺失/影响未知不启动纠正。通过确定性核对后用共享 `OrderedLoopWrites` 提交替代映射，
+保留原始无效记录、已执行成果与全部真实阻塞；不启用 Auto、不自动运行、不获得验收信用。
+未知退出/落盘结果保持预留；超时、断线和重启不重放请求。紧凑推送只含动作资格/回执摘要，
+完整审计经 `loopGetRecord` 懒加载；共享控制器只对未知结果合并一次只读查询，没有轮询或节点回退。
+决定/守卫只按当前 causeRef 与修订精确合并。正常来源不建议重绑，真实环境/授权门槛始终优先。
 `loop_task_blocker_bridge.py` 在调用边界接收顶层 `taskBlockers`，停止本轮未启动步骤，
 复用 analysis 至多一次独立 `read-only` 复核，再由既有决定/去重调度器重规划独立任务。
 显式 `loopControl.pause`（含旧未分类暂停）、停止/控制权、原生环境、未确认退出、Auto/预算/风险
@@ -462,17 +511,18 @@ faults cannot be cleared by weaker probes or manual success. Environment waits d
 not fabricate model errors or erase normal-call/blocked-task evidence.
 Get/Check/SelectWorkflow RPCs enforce owner/executor/revision/idle boundaries;
 checks neither enable Auto nor resume work. Unknown/offline executor routing fails
-without fallback. `LoopExecutionEnvironment.tsx` lives in workbench settings, with lazy
+without fallback. `LoopExecutionEnvironment.tsx` lives in on-demand "运行诊断", with lazy
 details and no polling. No automatic install, PATH/ACL change or permission escape.
 See `docs/loop-adaptive-delivery.md`; opt-in native tests use isolated homes and a
 loopback fake provider, never production Sessions or paid model requests.
 
 **俺寻思 (global attention sidecar).** A single App-topbar entry opens the App-level
 `ThoughtsAssistant`; ordinary Session and Loop headers deliberately expose no duplicate
-entry. Questions still go through
-`loopAsk` → `_run_aside` on an **independent** agent session (never resumes the
-loop's `agent_session_id`), so they cannot pollute or interrupt the LOOP mainline.
-The prompt combines `_loop_context_digest` with a validated UI attention snapshot
+entry. `loopAsk` and `chatAsk` share `AsideInspectionBridge` and `InspectionRunner`:
+isolated `text_only.send_text_only` inference proposes bounded query/answer JSON;
+only the executor's restricted reader accesses the current project. Never resume the
+main `agent_session_id`, enable native tools, or fall back to another Backend/node.
+The prompt combines fresh `aside_runtime.runtime_evidence` with validated UI context
 (current Session, previewed file, Settings, Backend Manager, Release Center,
 Skills, assets, notes, connection, logs or manual). `AsideTurn.context_*` routes
 history per focus object; legacy records migrate to `contextKey=session`.
@@ -486,6 +536,23 @@ selecting an image annotation also crops that region and sends it as an implicit
 image attachment. The composer uses the same streaming speech-to-text path as the
 normal chat input and only fills the draft—it never auto-sends or starts spoken
 replies. Pasted and focus-derived image Base64 is not persisted (only `image_count`).
+
+`aside_files.py` pins and checks actual Windows handles (POSIX no-follow descriptors),
+rejecting links/reparse points, out-of-root/device/UNC/ADS paths, known credentials and
+binary files. File I/O and explicit Skill reference reads run as owned async workers;
+cancelled waiters cannot release an unconfirmed read/model reservation. This reservation
+belongs only to the aside, never the main LOOP or other Sessions. Questions have 180s,
+4 decision rounds + 1 final answer, 24 read operations, 256 KiB/file, 1 MiB total disk
+reads and 64K project-evidence characters. `aside_openspec.py` reads real tasks without
+CLI, binding or scheduling: explicit target → valid association → unique candidate;
+ambiguous/failed sources do not silently switch. File checkboxes, excluded manual scope
+and model verify remain different evidence. @SKILL adds reference material without
+disabling project queries; the Skill marketplace remains pure document Q&A.
+`inspection` persists only whitelisted bounded phase/source metadata, not query packets
+or file bodies. The UI shows preparation/read/answer and actual terminal/unknown states,
+strict owner/executor/Session routing and monotonic turn revisions, including legacy
+terminal events without metadata. Timeout reads once, never replays submission. Retry
+fills a draft for a new user submission. See `docs/thoughts-readonly-inspection.md`.
 
 Loop state is read/written through a process-level singleton cache
 (`_loop_state` / `_loop_save` / `_loop_create`) so a running iteration's
@@ -801,6 +868,10 @@ Engine has a 240px file tree, central embedded document surface and 360px conver
 under 900px it exposes region navigation. `FileTreePanel` portals its existing safe
 preview/editor into the central host; Chat retains its modal. The same ChatPane stays
 mounted across mode changes, including automated LOOP versus manual-chat routing.
+Ctrl/Meta+P has one owner: it reveals and focuses the file tree's existing filename
+search (including from a hidden/narrow directory region), and Escape restores the prior
+region/focus. The center document toolbar retains project-content search, read-only Git
+comparison and editor navigation, but does not host a second quick-open query.
 Mode saves use the exact user/executor/session/cwd and reject stale or missing receipts.
 Only known unsupported capability permits explicitly labelled, bounded local preferences.
 There is no fullscreen, command, control-transfer or process launch on entry. The terminal
@@ -1300,9 +1371,10 @@ streaming saves. A process-level cache (`_chat_extras` / `_chat_extras_get` /
   stays visible while paused or failed, including with an empty queue, so a saved
   pause always has an explicit resume control. `seqtaskSetAuto` controls the executor.
 - **俺寻思.** `ThoughtsAssistant.tsx` is an App-level attention companion, opened
-  from the top bar or the 🤔 button in ordinary/LOOP panes. Normal questions use an
-  **independent backend instance** (`agent_session_id=None`, call id
-  `f"{sid}:chataside"`) seeded with `_chat_context_digest` plus the current UI focus.
+  from the single top-bar entry. Normal and LOOP questions use the same restricted
+  read-only coordinator above, with an **independent backend instance** and no main
+  native thread reuse. Fresh runtime facts and project queries supplement UI focus;
+  the amount of UI context never determines project-read capability.
   `ChatAside.context_*` keeps file/panel threads separate without duplicating the
   Session sidecar. `chatAsk` streams via `chatAsideDelta`; `chatAsideAbort` cancels
   only the isolated call. A backend selector is retained (`chatAsideSetBackend`,
@@ -1683,19 +1755,20 @@ focused session (all in the Sidebar memo comparator).
 editing via versioned `workspaceDocument*`, routed by `execKey`). Explicitly opened
 local copies use separate safe document adapters and never upload implicitly.
 
-**Stable async layout.** FileTreePanel reserves the local-copy identity/actions,
-status/transfer slot, and two-line Git toolbar on its first render. The notice stays
-`目录按需读取，可手动刷新` during directory/local-metadata/Git reads; only explicit
-operation results, compare summaries, errors and transfers replace it. Content-transfer
-and insecure-HTTP offline caveats remain in its tooltip. Initial identity/Git reads
-still show placeholders and disable unavailable actions; subsequent Git checks keep
-their settled labels even for non-repositories. Success, failure,
-non-Git detection, scanning and transfer progress update in place, never insert
-new bars above the tree. Initial directory reads use skeleton rows; refreshes
-retain the prior tree even on errors (an error is not an empty directory). Git
-is not labelled clean until its first status succeeds. Explicitly opening Stash
-reserves its list height before its response. Narrow action rows scroll rather
-than wrap. Regression coverage: `file-panel-layout.spec.ts` (desktop + mobile).
+**Compact async layout.** FileTreePanel's default face is only a compact
+identity/tool row plus the filename-search row; at desktop widths the tree starts within
+80 CSS px. Full executor path/connection details, local-copy binding and comparison,
+advanced sync, and Git actions are on-demand popovers. Refresh and More remain visible
+without hover. A confirmed Git repository gets a compact summary; unknown/loading/error
+states never look clean, while non-repositories have no disabled Git toolbar or repeated
+“no Git” row. Directory/Git errors, offline state, conflicts, transfers and operation
+receipts share a compact footer that preserves multiple independent issues and the
+applicable transfer-cancel action. Opening or closing tools does not scan, compare,
+transfer, write, or poll; Stash is read only when expanded and coalesces in-flight reads.
+Initial directory reads may show skeleton rows, while refresh retains the prior tree on
+failure (an error is not an empty directory). Narrow popovers stay bounded instead of
+expanding the page. Regression coverage: `file-panel-layout.spec.ts` and
+`session-engine-workbench.spec.ts` (desktop + narrow/mobile).
 
 **Manual refresh, no idle polling.** The file panel mounts only when the expanded
 Sidebar shows files. Directory/Git reads happen once on entry, on explicit refresh,
@@ -1727,12 +1800,12 @@ This is on-demand refresh, not a new watcher or a content/hash scan. Tests:
 runs on 本机) shows a plain working-dir tree — no cloud, no copy dir, click to view/edit
 the real files directly. A **remote session** (`execMode==='relay'`) marks every file
 ☁️ **cloud** by default (content lives on the executor node, fetched on demand); an
-optional **本地副本目录** (`选择本地副本目录`, File-System-Access/Tauri `LocalFs`) enables
+optional **本机副本** (opened from `本机副本与同步`, File-System-Access/Tauri `LocalFs`) enables
 offline download + diff + two-way sync. The binding is persisted **per session**
 (`pickLocalDir` / `restoreLocalDir` receive a session binding key), and the remote
-file view always exposes a compact `本机目录 · 指定/更换` row, so a copy directory can
-be assigned or changed after session creation without changing the remote working
-directory. Per-file status (`statusOf`) = `cloud` (not
+file view exposes binding/change controls on demand, so a copy directory can be assigned
+or changed after session creation without changing the remote working directory.
+Per-file status (`statusOf`) = `cloud` (not
 downloaded) / `local` (downloaded, presence-only) / `synced` ✓ / `differs` ± / `conflict`
 ⚠ (the last two need `🔍 比对`, which loads `syncManifest` hashes + three-way `baseline`).
 Hover actions: 👁 preview/edit, ⬇ download-to-local, ⬆ upload-local-changes (folders

@@ -24,6 +24,9 @@ LoopStore: 可视化 Loop 集成的状态持久化（"stage 文件"）。
 from __future__ import annotations
 
 from .loop_control import normalize_operation, normalize_receipts, operation_public, revision
+from .codex_reasoning import normalize_reasoning_effort
+from .loop_task_recovery import (diagnostic as contract_diagnostic, count as contract_count,
+                                 receipts as contract_receipts, repair_active)
 
 import json
 import copy
@@ -195,8 +198,12 @@ class LoopRecord:
     decision_history: list[dict] = field(default_factory=list)
     decision_dispatched: str = ""
     source_snapshots: dict = field(default_factory=dict)
+    openspec_run: dict = field(default_factory=dict)  # 原生 apply/verify/修复的阶段证据
     milestone_plan: dict = field(default_factory=dict)
     task_plan: dict = field(default_factory=dict)
+    contract_validation: dict = field(default_factory=dict)
+    plan_attempt_count: int = 0
+    contract_required: bool = False  # 新规划显式启用；旧记录缺省不是新协议失败的降级路径。
     blocker_review: dict = field(default_factory=dict)
     task_blockers: dict = field(default_factory=dict)
     isolation_evidence: dict = field(default_factory=dict)
@@ -235,7 +242,7 @@ class LoopRecord:
         if sub and sub not in self.sub_started:
             self.sub_started[sub] = _now()
 
-    def to_dict(self) -> dict:
+    def to_dict(self, *, compact: bool = False) -> dict:
         return {
             "seq": self.seq,
             "kind": self.kind,
@@ -249,8 +256,10 @@ class LoopRecord:
             "result": self.result,
             "analysis": self.analysis.to_dict() if self.analysis else None,
             "error": self.error,
-            "stageDetails": copy.deepcopy(self.stage_details),
-            "callDiagnostics": copy.deepcopy(self.call_diagnostics),
+            "stageDetails": ({name: {k: v for k, v in detail.items() if k in ('status', 'attemptCount', 'message')}
+                              for name, detail in self.stage_details.items() if isinstance(detail, dict)}
+                             if compact else copy.deepcopy(self.stage_details)),
+            "callDiagnostics": copy.deepcopy(self.call_diagnostics[-1:] if compact else self.call_diagnostics),
             "environmentChecks": normalize_history(self.environment_checks),
             "progressVersion": self.progress_version,
             "progressScope": self.progress_scope,
@@ -262,13 +271,19 @@ class LoopRecord:
             "terminalKind": enum_value(self.terminal_kind, TERMINALS),
             "decision": normalize_decision(self.decision),
             "decisionDispatched": self.decision_dispatched,
-            "sourceSnapshots": bounded_object(self.source_snapshots, 2_097_152),
-            "milestonePlan": validate_plan(self.milestone_plan),
-            "taskPlan": task_contract(self.task_plan),
-            "blockerReview": task_contract(self.blocker_review),
+            "sourceSnapshots": ({key: {k: v.get(k) for k in ('scopeDigest', 'stateDigest', 'capturedAt')}
+                                  for key, v in self.source_snapshots.items() if isinstance(v, dict)}
+                                 if compact else bounded_object(self.source_snapshots, 2_097_152)),
+            "openspecRun": self.openspec_run if compact else bounded_object(self.openspec_run, 262_144),
+            "milestonePlan": {} if compact else validate_plan(self.milestone_plan),
+            "taskPlan": {} if compact else task_contract(self.task_plan),
+            "contractValidation": contract_diagnostic(self.contract_validation),
+            "planAttemptCount": contract_count(self.plan_attempt_count),
+            "contractRequired": self.contract_required,
+            "blockerReview": self.blocker_review if compact else task_contract(self.blocker_review),
             "blockerSummary": {key: self.blocker_review.get(key) for key in ('status', 'readyIds', 'affectedIds', 'valid')},
-            "taskBlockers": task_contract(self.task_blockers),
-            "isolationEvidence": task_contract(self.isolation_evidence),
+            "taskBlockers": {} if compact else task_contract(self.task_blockers),
+            "isolationEvidence": {} if compact else task_contract(self.isolation_evidence),
             "subStarted": self.sub_started,
             "backends": dict(self.backends or {}),
             "runtimes": {k: dict(v) for k, v in (self.runtimes or {}).items()
@@ -316,8 +331,12 @@ class LoopRecord:
             decision=normalize_decision(d.get("decision")),
             decision_dispatched=str(d.get("decisionDispatched") or "")[:80],
             source_snapshots=bounded_object(d.get("sourceSnapshots"), 2_097_152),
+            openspec_run=bounded_object(d.get("openspecRun"), 262_144),
             milestone_plan=validate_plan(d.get("milestonePlan")),
             task_plan=task_contract(d.get('taskPlan')),
+            contract_validation=contract_diagnostic(d.get('contractValidation')),
+            plan_attempt_count=contract_count(d.get('planAttemptCount')),
+            contract_required=d.get('contractRequired') is True,
             blocker_review=task_contract(d.get('blockerReview')),
             task_blockers=task_contract(d.get('taskBlockers')),
             isolation_evidence=task_contract(d.get('isolationEvidence')),
@@ -389,10 +408,12 @@ class AsideTurn:
     context_kind: str = "session"
     context_label: str = ""
     context_detail: str = ""
+    inspection: dict = field(default_factory=dict)
     created_at: float = field(default_factory=_now)
     updated_at: float = field(default_factory=_now)
 
     def to_dict(self) -> dict:
+        from .aside_inspection import clean_inspection
         return {
             "id": self.id,
             "question": self.question,
@@ -405,12 +426,14 @@ class AsideTurn:
             "contextKind": self.context_kind,
             "contextLabel": self.context_label,
             "contextDetail": self.context_detail,
+            "inspection": clean_inspection(self.inspection),
             "createdAt": self.created_at,
             "updatedAt": self.updated_at,
         }
 
     @classmethod
     def from_dict(cls, d: dict) -> "AsideTurn":
+        from .aside_inspection import clean_inspection
         d = migrate_reference_attention(d)
         return cls(
             id=d.get("id", ""),
@@ -424,6 +447,7 @@ class AsideTurn:
             context_kind=str(d.get("contextKind") or "session"),
             context_label=str(d.get("contextLabel") or ""),
             context_detail=str(d.get("contextDetail") or ""),
+            inspection=clean_inspection(d.get('inspection')),
             created_at=d.get("createdAt", _now()),
             updated_at=d.get("updatedAt", _now()),
         )
@@ -555,7 +579,6 @@ class LoopPolicy:
     # 可路由的分析/转换位置
     BACKEND_POSITIONS = ("prepare", "execute", "idea", "goal", "analysis", "aside")
     RUNTIME_POSITIONS = ("prepare", "execute", "idea", "goal", "analysis", "aside")
-    REASONING_EFFORTS = {"none", "minimal", "low", "medium", "high", "xhigh", "max"}
 
     def backend_for(self, pos: str) -> str:
         b = (self.backends or {}).get(pos)
@@ -570,8 +593,8 @@ class LoopPolicy:
         if isinstance(model, str) and model.strip():
             out["model"] = model.strip()
         effort = raw.get("reasoningEffort", raw.get("reasoning_effort"))
-        if isinstance(effort, str) and effort.strip().lower() in cls.REASONING_EFFORTS:
-            out["reasoningEffort"] = effort.strip().lower()
+        if normalized := normalize_reasoning_effort(effort):
+            out["reasoningEffort"] = normalized
         return out
 
     def runtime_for(self, pos: str, inherit_execute: bool = True) -> dict:
@@ -722,10 +745,12 @@ class LoopState:
     risk_factors: dict = field(default_factory=dict)       # 可解释风险分量
     handoff: dict = field(default_factory=dict)           # 有界、脱敏的转换交接；不包含工具授权
     progress_guard: dict = field(default_factory=dict)    # 可见的停滞/阻塞诊断，不冒充验收
-    task_source: dict = field(default_factory=dict)       # 显式绑定，不从历史正文推断
+    task_source: dict = field(default_factory=dict)       # 用户选择或显式运行按当前目标采用；不从模型历史推断
+    startup: dict = field(default_factory=dict)           # 快照拥有关系；重启不把 running 当作已退出
     execution_environment: dict = field(default_factory=dict)
     unresolved_blockers: dict = field(default_factory=dict)
     blocked_task_scope: dict = field(default_factory=dict)
+    contract_repairs: list[dict] = field(default_factory=list)
     created_at: float = field(default_factory=_now)
     updated_at: float = field(default_factory=_now)
 
@@ -782,14 +807,14 @@ class LoopState:
         """返回用户指定的本轮次数预算，不再根据风险系数暗中折减。"""
         return max(1, self.policy.max_loops)
 
-    def to_dict(self) -> dict:
+    def to_dict(self, *, compact: bool = False) -> dict:
         return {
             "sessionId": self.session_id,
             "stage": self.stage,
             "goal": self.goal,
             "goalHistory": [g.to_dict() for g in self.goal_history],
             "ideas": [i.to_dict() for i in self.ideas],
-            "loops": [l.to_dict() for l in self.loops],
+            "loops": [l.to_dict(compact=compact) for l in self.loops],
             "riskCoefficient": self.risk_coefficient,
             "policy": self.policy.to_dict(),
             "maxLoops": self.policy.max_loops,
@@ -810,10 +835,13 @@ class LoopState:
             "riskFactors": dict(self.risk_factors or {}),
             "handoff": copy.deepcopy(self.handoff),
             "progressGuard": copy.deepcopy(self.progress_guard),
-            "taskSource": validate_source(self.task_source),
+            "taskSource": self.task_source if compact else validate_source(self.task_source),
+            "startup": bounded_object(self.startup, 4096),
             "executionEnvironment": normalize_environment(self.execution_environment),
             "unresolvedBlockers": task_contract(self.unresolved_blockers),
             "blockedTaskScope": task_contract(self.blocked_task_scope),
+            "contractRepairs": [] if compact else contract_receipts(self.contract_repairs),
+            "contractRepairActive": repair_active(self.contract_repairs),
             "bestScore": self.best_score(),
             "latestScore": self.latest_score(),
             "createdAt": self.created_at,
@@ -852,9 +880,11 @@ class LoopState:
             handoff=copy.deepcopy(d.get("handoff") or {}),
             progress_guard=copy.deepcopy(d.get("progressGuard") or {}),
             task_source=validate_source(d.get("taskSource")),
+            startup=bounded_object(d.get('startup'), 4096),
             execution_environment=normalize_environment(d.get("executionEnvironment")),
             unresolved_blockers=task_contract(d.get('unresolvedBlockers')),
             blocked_task_scope=task_contract(d.get('blockedTaskScope')),
+            contract_repairs=contract_receipts(d.get('contractRepairs')),
             created_at=d.get("createdAt", _now()),
             updated_at=d.get("updatedAt", _now()),
         )
@@ -883,6 +913,7 @@ class LoopStore:
             "controlMode": state.control_mode,
             "controlRevision": revision(state.control_revision),
             "controlOperation": operation_public(state.control_operation),
+            "contractRepairActive": repair_active(state.contract_repairs),
             "auto": state.auto,
             "status": state.status,
             "round": state.round,
@@ -925,6 +956,7 @@ class LoopStore:
         round_no = 1
         control_revision = 0
         control_operation = {}
+        contract_repair_active = False
         try:
             state_stat = stage_path.stat()
             # controlMode 位于庞大的 loops 之后；逐行扫描避免构建整个 JSON 对象。
@@ -942,6 +974,8 @@ class LoopStore:
                         control_mode = "manual" if value == "manual" else "loop"
                     elif stripped.startswith('"controlRevision"'):
                         control_revision = revision(json.loads("{" + stripped + "}").get("controlRevision"))
+                    elif stripped.startswith('"contractRepairActive"'):
+                        contract_repair_active = json.loads('{' + stripped + '}').get('contractRepairActive') is True
                     elif stripped.startswith('"controlOperation"'):
                         # 回执只含有界标量；只累计这一个顶层对象，不加载历史正文。
                         body = stripped
@@ -962,6 +996,7 @@ class LoopStore:
             meta = {
                 "sessionId": sid, "stage": stage, "controlMode": control_mode,
                 "controlRevision": control_revision, "controlOperation": control_operation,
+                "contractRepairActive": contract_repair_active,
                 "auto": auto, "status": status, "round": round_no,
                 "updatedAt": state_stat.st_mtime, "_stateMtimeNs": state_stat.st_mtime_ns,
             }
@@ -1019,6 +1054,7 @@ class LoopStore:
                 meta = {key: data.get(key) for key in ('sessionId', 'stage', 'controlMode',
                     'controlRevision', 'auto', 'status', 'round', 'updatedAt')}
                 meta['controlOperation'] = operation_public(data.get('controlOperation'))
+                meta['contractRepairActive'] = repair_active(data.get('contractRepairs'))
                 meta['_stateMtimeNs'] = path.stat().st_mtime_ns
                 meta_path = self._meta_path(sid)
                 meta_tmp = meta_path.with_suffix(meta_path.suffix + '.tmp')

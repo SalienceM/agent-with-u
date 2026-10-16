@@ -375,7 +375,7 @@ test('committed takeover with failed view retries reads only', async ({ page }) 
 test('disabled reasons are visible in workbench secondary actions', async ({ page }) => {
   const f = await fixture(page);
   await expect(f.pane.getByRole('button', { name: '✋ 人工接管', exact: true })).toBeEnabled();
-  for (const view of ['任务设置', '任务设置']) {
+  for (const view of ['流程', '面板']) {
     await f.pane.getByRole('button', { name: view, exact: true }).click();
     for (const message of ['LOOP 正在运行，请等待当前轮结束', '存在未完成的 LOOP，请先处理断点', '旧调用或环境检查尚未退出']) {
       f.block(message);

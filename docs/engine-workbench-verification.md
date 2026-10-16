@@ -152,6 +152,37 @@ Linux Rust 使用 `RUSTUP_HOME=/root/awu-engine-qa/rustup`、`CARGO_HOME=/root/a
 | 交还提交后目标视图加载失败 | `home/loop-control.test.cjs` 旧 Get 晚于 committed/view-loading 回归；`acceptance/loop-control-handoff.spec.ts` committed takeover / release view failure / stale mirror reload |
 | 无新人工消息的工程会话交还 | `test_engineering_activity.py` successful_engineering_work；`test_loop_control_handoff.py`、`test_loop_lifecycle.py` 保留 pending_tasks 修复 |
 
+## 文件面板紧凑布局与统一导航验收
+
+Chat 与 Engine 共用同一文件面板：默认只显示身份/工具行和文件名搜索行，桌面栏宽至少
+240px 时，文件树顶端距面板顶端不超过 80 CSS px。完整路径、执行节点与连接状态从身份按钮
+读取；本机副本绑定/比对/导入/高级同步和 Git 写操作只在按需工具中出现。非 Git 目录不保留
+禁用工具栏或重复说明，Git 未知、读取中与失败也不得显示成“工作区干净”。
+
+目录/Git 错误、离线、冲突、传输进度和操作回执位于树底部紧凑反馈区；多个问题独立保留，
+传输期间仍能取消，反馈出现不得盖住或清空已有树。打开/关闭身份、同步、Git、Stash 或反馈
+工具不触发扫描、比对、传输、写入或轮询；Stash 仅显式展开后读取，并合并在途请求。
+
+Engine 的 Ctrl/Meta+P 只显示并聚焦左侧文件名搜索，不再创建中央“快速打开”查询。
+窄屏或隐藏目录时先切到目录区域，Escape 清空查询并恢复先前区域/焦点；打开文件继续使用
+结果携带的执行端/本机副本来源，不复制文档或重挂 ChatPane。Ctrl/Meta+Shift+F 仍打开执行端
+项目内容搜索；只读 Git 差异、跳行和查找/替换保持独立。目录已可见时中央空态不重复显示
+“打开文件目录”，只有目录隐藏时提供“显示文件目录”。
+
+自动验收使用 `file-panel-layout.spec.ts`、`session-engine-workbench.spec.ts`、
+`file-editor.spec.ts` 及 home 文件搜索/Git 单测，全部使用 fake RPC、隔离数据和固定内容；
+不得据此宣称真实 Tauri 目录选择或实际触屏已验收。真实设备选择、更换、触屏目标和保存副本
+不上传仍是单独人工门槛。
+
+2026-10-14 最终限定回归：`npm run test:home` 291/291 通过；文件面板四个配置项目合计
+20/20 通过（其中 desktop-chromium 与 narrow-mobile-chromium 10/10）；Session Engine
+desktop-chromium 15/15 通过；独立
+Engine 文件编辑 2/2 通过。`npx tsc --noEmit`、`npm run build` 和本 change 的 OpenSpec strict
+校验通过；构建仅保留既有 Vite CJS、uuid 混合导入与大 chunk 警告。上述浏览器测试运行于
+`.qa/home` 隔离环境，使用 fake RPC/LocalFs，不连接生产 Session、不写用户目录、不执行真实
+Git/模型/终端/LSP/控制权操作。截图位于 `.qa/home/results/typical/artifacts/`；真实 Tauri
+设备目录选择/更换及实物触屏仍未执行，因此 `simplify-workspace-file-panel` 任务 5.1 保持未勾选。
+
 ## 2026-10-09 工作台视觉与交互复验
 
 根据用户截图反馈，本轮修正原有变更的 UI，不改变文档保存、窗口交接、语言服务信任或 LOOP 准入协议。

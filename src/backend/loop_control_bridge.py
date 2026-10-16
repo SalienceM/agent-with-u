@@ -189,7 +189,8 @@ class LoopControlBridge:
         source = (state.control_revision, state.stage, state.round, session.working_dir, len(session.messages))
         jobs[session_id] = {'requestId': rid, 'inputDigest': digest, 'identityDigest': identity,
                             'action': action, 'goal': goal, 'task': None, 'source': source}
-        writers[session_id] = OrderedLoopWrites(self._loop_store.save_frozen)
+        # 普通 LOOP 保存也使用此队列；替换仍在写盘的队列会让旧快照晚于转交提交。
+        writers.setdefault(session_id, OrderedLoopWrites(self._loop_store.save_frozen))
         draft = copy.deepcopy(state)
         now = time.time()
         draft.accept_control_operation({'requestId': rid, 'action': action, 'status': 'accepted',

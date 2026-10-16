@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useCallback, useContext, useRef } from 'react';
 import { api } from '../api';
+import { LoopActionController, type LoopActionFeedback, type ActionResult } from '../utils/loopActionController';
 import { useLoopControl } from '../hooks/useLoopControl';
 import { markdownToHtml } from '../utils/markdown';
 import { ImagePreview } from './ImagePreview';
@@ -10,6 +11,8 @@ import type { LoopPolicy } from './LoopPolicyEditor';
 import { LoopProgressNotice, LoopDeliveryDetail } from './LoopDeliveryStatus';
 import { LoopDecisionNotice, LoopSourceCard } from './LoopContinuationStatus';
 import { LoopTaskBlockerDetail } from './LoopTaskBlockerDetail';
+import { LoopContractRepair } from './LoopContractRepair';
+import { repairActive } from '../types/loopContract';
 import { LoopEnvironmentCard, EnvironmentEvidence } from './LoopExecutionEnvironment';
 import type { ModelRuntime } from './CodexRuntimeFields';
 import { activeLoopSeq, CALL_PHASE, CALL_ERROR, type CallDiagnostic } from '../utils/loopDiagnostics';
@@ -21,11 +24,12 @@ import {
 
 import type { LoopStep, LoopRecord, StageDetail, DetailTarget, Addon, AddonImage, LoopStateT } from '../types/loopWorkbench';
 import { useLoopWorkbenchState } from '../hooks/useLoopWorkbenchState';
-import { loopWorkbenchView, boundedText, loopSubstageLabel, type WorkbenchSection } from '../utils/loopWorkbenchView';
+import { loopWorkbenchView, boundedText, loopSubstageLabel, type WorkbenchSection, type WorkbenchIssue } from '../utils/loopWorkbenchView';
 import { loopControlTarget } from '../api';
 import { controlKey } from '../utils/loopControl';
 import { LoopControlStatus } from './LoopControlStatus';
 import { LoopWorkbench } from './LoopWorkbench';
+import { StageRail, MetricBar, LoopTimeline } from './LoopVisualOverview';
 
 const SUB_LABEL: Record<string, string> = {
   prepare: 'Prepare', execute: 'Execute', analysis: 'Analysis', done: 'Done',
@@ -76,6 +80,13 @@ const LoopPanelContent: React.FC<LoopPanelProps & { identity: string }> = ({
 }) => {
   const visible = useContext(AppModalVisibilityContext);
   const [section, setSection] = useState<WorkbenchSection | null>(null);
+  const [viewMode, setViewMode] = useState<'panel' | 'flow'>(() => {
+    try { return sessionStorage.getItem(`loop-view:${identity}`) === 'flow' ? 'flow' : 'panel'; } catch { return 'panel'; }
+  });
+  const [issueTarget, setIssueTarget] = useState<WorkbenchIssue>();
+  const flowStart = useRef<HTMLDivElement>(null);
+  useEffect(() => { try { sessionStorage.setItem(`loop-view:${identity}`, viewMode); } catch { /* 私密浏览仍可切换 */ } }, [identity, viewMode]);
+  useEffect(() => { if (viewMode === 'flow') flowStart.current?.scrollIntoView({ block: 'nearest' }); }, [viewMode]);
   const [visited, setVisited] = useState<Set<WorkbenchSection>>(new Set());
   const trigger = useRef<HTMLElement | null>(null);
   const [ideaInput, setIdeaInput] = useState('');
@@ -83,18 +94,30 @@ const LoopPanelContent: React.FC<LoopPanelProps & { identity: string }> = ({
   const [nextGoal, setNextGoal] = useState<string | null>(null);
   const [refineNext, setRefineNext] = useState(false);
   const [actionBusy, setBusy] = useState(false);
-  const actionPending = useRef(false);
+  const [actionFeedback, setActionFeedback] = useState<LoopActionFeedback>({ label: '', phase: 'idle', message: '' });
+  const actionController = useRef<LoopActionController>();
+  const actionGeneration = useRef(0);
+  const [connected, setConnected] = useState(true);
+  useEffect(() => {
+    const controller = new LoopActionController(setActionFeedback);
+    actionController.current = controller;
+    setActionFeedback(controller.feedback);
+    setBusy(false);
+    const off = api.onSessionConnectionStatus(sessionId, setConnected);
+    return () => { actionGeneration.current++; controller.dispose(); off(); };
+  }, [sessionId, identity]);
   const control = useLoopControl(sessionId, execKey, !inspectOnly && visible);
-  const busy = actionBusy || control.busy;
-  const { state, loadError, refresh, selectedSeq, selectLoop, detailTarget, setDetailTarget, detailErrors, retryDetail, progress } =
-    useLoopWorkbenchState(sessionId, control.target.executor, identity, visible, section === 'process' || section === 'evidence');
+  const { state, loadError, refresh, selectedSeq, selectLoop, detailTarget, setDetailTarget, detailErrors, retryDetail, progress,
+    repair, requestRepair, checkRepair, cancelRepair } =
+    useLoopWorkbenchState(sessionId, control.target.executor, identity, visible, !section || section === 'evidence');
+  const repairBusy = repair.sending || repairActive(repair.receipt) || !!state?.contractRepairActive;
+  const busy = actionBusy || actionFeedback.phase === 'sending' || control.busy || repairBusy;
   useEffect(() => { setNextGoal(null); }, [state?.round]);
-  const once = useCallback(async (request: () => Promise<{ status: string; message?: string }>) => {
-    if (actionPending.current) return;
-    actionPending.current = true; setBusy(true);
-    try { const result = await request(); if (result.status !== 'ok' && result.message) alert(result.message); return result; }
-    catch (error) { alert(String(error)); }
-    finally { actionPending.current = false; setBusy(false); }
+  const once = useCallback(async <T extends ActionResult,>(label: string, request: () => Promise<T>, accepted = false, reconcile?: () => Promise<boolean>) => {
+    const generation = actionGeneration.current;
+    setBusy(true);
+    try { return await actionController.current!.run(label, request, accepted, reconcile); }
+    finally { if (generation === actionGeneration.current) setBusy(false); }
   }, []);
   useEffect(() => {
     if (inspectOnly || !control.state.summary?.operation?.committed || control.state.summary.controlMode !== 'loop') return;
@@ -105,37 +128,48 @@ const LoopPanelContent: React.FC<LoopPanelProps & { identity: string }> = ({
   const openSection = (value: WorkbenchSection, seq?: number, target: DetailTarget = 'all') => {
     if (!section && document.activeElement instanceof HTMLElement) trigger.current = document.activeElement;
     setVisited(previous => new Set([...previous, value]));
-    setSection(value);
+    setIssueTarget(undefined);
     if (value === 'process' || value === 'evidence') {
+      setSection(null);
+      if (value === 'process') setViewMode('flow');
       const chosen = seq ?? selectedSeq ?? (value === 'evidence' ? state?.loops.at(-1)?.seq : undefined);
       if (chosen != null) selectLoop(chosen, target);
-    }
+    } else setSection(value);
+  };
+  const openIssue = (issue: WorkbenchIssue) => {
+    if (document.activeElement instanceof HTMLElement) trigger.current = document.activeElement;
+    setVisited(previous => new Set([...previous, issue.section]));
+    setIssueTarget(issue); setSection(issue.section);
+    if (issue.target?.seq && issue.section === 'evidence') selectLoop(issue.target.seq, 'analysis');
   };
   const closeSection = () => { setSection(null); requestAnimationFrame(() => trigger.current?.focus()); };
   const running = state?.running ?? false;
-  const setAuto = useCallback((on: boolean) => once(() => api.loopSetAuto(sessionId, on)), [sessionId, once]);
-  const addAddon = useCallback((text: string, images?: ImageAttachment[]) => api.loopAddAddon(sessionId, text, images), [sessionId]);
-  const editAddon = useCallback((id: string, text: string, images?: any[]) => api.loopEditAddon(sessionId, id, text, images), [sessionId]);
-  const removeAddon = useCallback((id: string) => api.loopRemoveAddon(sessionId, id), [sessionId]);
+  const setAuto = useCallback((on: boolean) => once(on ? '开启 Auto' : '关闭 Auto', () => api.loopSetAuto(sessionId, on), false,
+    async () => (await api.loopGetState(sessionId, control.target.executor))?.auto === on), [sessionId, control.target.executor, once]);
+  const addAddon = useCallback((text: string, images?: ImageAttachment[]) => once('添加补充', () => api.loopAddAddon(sessionId, text, images)), [sessionId, once]);
+  const editAddon = useCallback((id: string, text: string, images?: any[]) => once('保存补充', () => api.loopEditAddon(sessionId, id, text, images)), [sessionId, once]);
+  const removeAddon = useCallback((id: string) => once('删除补充', () => api.loopRemoveAddon(sessionId, id)), [sessionId, once]);
   const continueRound = useCallback(async (goal: string) => {
-    await once(() => api.loopContinue(sessionId, goal));
+    await once('开启新一轮', () => api.loopContinue(sessionId, goal), true);
   }, [sessionId, once]);
 
   const submitIdea = useCallback(async (images?: ImageAttachment[]) => {
     const text = ideaInput.trim();
-    if (!text && !(images && images.length)) return;
-    setIdeaInput('');
-    await api.loopSubmitIdea(sessionId, text, images);
-  }, [ideaInput, sessionId]);
+    if (!text && !(images && images.length)) return { status: 'error', message: '请填写想法' };
+    const result = await once('提交想法', () => api.loopSubmitIdea(sessionId, text, images), true);
+    if (result.status === 'ok') setIdeaInput('');
+    return result;
+  }, [ideaInput, sessionId, once]);
 
   const sealIdea = useCallback(async () => {
     if (!window.confirm('确认目标后进入执行准备，不能退回想法阶段。继续？')) return;
-    await once(async () => { const result = await api.loopSealIdea(sessionId, goalDraft.trim()); if (result.status === 'ok') setGoalDraft(''); return result; });
+    await once('确认目标', async () => { const result = await api.loopSealIdea(sessionId, goalDraft.trim()); if (result.status === 'ok') setGoalDraft(''); return result; }, true);
   }, [sessionId, goalDraft]);
 
   const runIteration = useCallback(async () => {
-    await once(() => api.loopRunIteration(sessionId));
-  }, [sessionId]);
+    await once('执行 LOOP', () => api.loopRunIteration(sessionId, control.target.executor), true,
+      async () => (await api.loopGetState(sessionId, control.target.executor))?.running === true);
+  }, [sessionId, control.target.executor, once]);
 
   const takeover = useCallback(async (nextRoundGoal: string = '') => {
     const fromLoopout = state?.stage === 'loopout';
@@ -166,7 +200,7 @@ const LoopPanelContent: React.FC<LoopPanelProps & { identity: string }> = ({
         '取消 = 仅丢弃记录/addon/上下文，保留磁盘上的文件改动。'
       );
     }
-    await once(() => api.loopDiscard(sessionId, 0, restoreFiles));
+    await once('丢弃本次 LOOP', () => api.loopDiscard(sessionId, 0, restoreFiles));
   }, [sessionId, state]);
 
   const advanceOut = useCallback(async () => {
@@ -174,16 +208,16 @@ const LoopPanelContent: React.FC<LoopPanelProps & { identity: string }> = ({
       ? '当前 Loop 仍在执行。停止它、保留已完成步骤的结果并进入本轮结果？'
       : '结束本轮并查看已保留成果？未完成事项仍会保留。';
     if (!window.confirm(prompt)) return;
-    await once(() => api.loopAdvanceToOut(sessionId));
+    await once('结束本轮', () => api.loopAdvanceToOut(sessionId), running);
   }, [sessionId, running]);
 
   const saveGoal = useCallback(async () => {
-    await api.loopSetGoal(sessionId, goalDraft.trim());
-  }, [sessionId, goalDraft]);
+    return once('保存目标', () => api.loopSetGoal(sessionId, goalDraft.trim()));
+  }, [sessionId, goalDraft, once]);
 
   const refineGoal = useCallback(async (hint: string, images?: ImageAttachment[]) => {
-    return api.loopRefineGoal(sessionId, hint, images);
-  }, [sessionId]);
+    return once('微调目标', () => api.loopRefineGoal(sessionId, hint, images), true);
+  }, [sessionId, once]);
 
 
   const wrap = (children: React.ReactNode) => embedded
@@ -195,79 +229,103 @@ const LoopPanelContent: React.FC<LoopPanelProps & { identity: string }> = ({
     {loadError && <button style={btn} onClick={() => void refresh()}>重试加载 LOOP 面板</button>}
     {onClose && <button style={btn} onClick={onClose}>关闭</button>}
   </div>);
-  const view = loopWorkbenchView(state, { readOnly: inspectOnly, controlPending: control.busy, controlError: control.state.error });
+  const view = loopWorkbenchView(state, { readOnly: inspectOnly, controlPending: control.busy, controlError: control.state.error, offline: !connected });
   const readOnly = view.manual;
   const canTakeover = !busy && control.state.summary?.eligibility.takeover.allowed === true;
   const takeoverReason = control.state.summary?.eligibility.takeover.message || control.state.error || '正在核对接管条件…';
   const latest = state.loops.at(-1);
   const selected = state.loops.find(loop => loop.seq === selectedSeq);
   const labels: Record<string, string> = { manual: '返回人工工作区', check: '检查控制状态', running: '本轮执行中', seal: '确认目标，进入执行',
-    continue: state.running ? '停止上一轮并开启新一轮' : '开启新一轮', issues: '处理当前问题', resume: '继续未完成步骤', run: '运行下一次' };
+    continue: state.running ? '停止上一轮并开启新一轮' : '开启新一轮', resume: `恢复 Loop #${latest?.seq ?? ''}`, run: '运行下一次' };
   const primary = () => {
     switch (view.primary) {
       case 'manual': onClose?.(); break;
       case 'check': void control.check(); break;
       case 'seal': void sealIdea(); break;
       case 'continue': void continueRound(nextGoal ?? state.goal); break;
-      case 'issues': openSection('issues'); break;
       case 'resume': case 'run': void runIteration(); break;
     }
   };
   const sourceLocked = readOnly || busy || state.running || state.resumable;
+  const targetCurrent = !issueTarget || view.issues.some(issue => issue.id === issueTarget.id && JSON.stringify(issue.target) === JSON.stringify(issueTarget.target));
+  const activeIssue = targetCurrent ? view.issues.find(issue => issue.id === issueTarget?.id) || issueTarget : issueTarget;
+  const sharedPause = view.issues.some(issue => issue.refs.includes(`guard:${state.round}:${view.current?.seq ?? 0}`)
+    && issue.refs.some(ref => ref.startsWith('decision:')));
   const feedback = controlFeedback ?? <LoopControlStatus sessionId={sessionId} execKey={execKey} onReload={() => void refresh()} onChat={onClose} />;
+  const operationFeedback = actionFeedback.phase !== 'idle' && <div data-testid="loop-action-feedback" role={actionFeedback.phase === 'error' ? 'alert' : 'status'} aria-live="polite"
+    style={{ padding: '7px 0', fontSize: 12, overflowWrap: 'anywhere', color: actionFeedback.phase === 'error' || actionFeedback.phase === 'unknown' ? 'var(--theme-warning, #bf8700)' : 'var(--theme-text-secondary)' }}>
+    {actionFeedback.phase === 'sending' ? '⏳ ' : actionFeedback.phase === 'done' ? '✓ ' : ''}{actionFeedback.message}
+    {actionFeedback.phase === 'unknown' && <button style={btn} onClick={() => { void refresh(); void actionController.current?.check(); }}>只读核对状态</button>}
+  </div>;
   const issueList = <div>
     {section === 'issues' && feedback}
     {view.issues.filter(issue => issue.id !== 'control').map(issue => <section key={issue.id} style={{ ...sealBox, marginBottom: 10 }}>
       <strong>{issue.title}</strong><p>{issue.reason}</p><p>{issue.next}</p>
-      <button style={btn} onClick={() => openSection(issue.section)}>查看相关{issue.section === 'settings' ? '设置' : '证据'}</button>
+      <button style={btn} onClick={() => openIssue(issue)}>{issue.section === 'source' ? '核对范围差异' : issue.section === 'environment' ? '核对该检查' : '查看受影响任务与证据'}</button>
       <details style={{ marginTop: 8 }}><summary>关联依据</summary>{issue.refs.map(ref => <div key={ref}>{ref}</div>)}</details>
     </section>)}
     {!view.issues.length && <p>当前摘要没有待处理问题；这不代表完整验收。</p>}
     {!readOnly && !state.running && state.stage === 'loopexecute' && <div style={sealBox}>
       <p>查看、核对或修改设置不会自动恢复。处理条件后显式继续，执行端仍会检查原有授权、来源和环境门槛。</p>
-      <button style={btn} disabled={busy || view.issues.some(issue => issue.priority < 30)}
+      <button style={btn} disabled={busy || !view.canRequest}
         onClick={() => void runIteration()}>{state.resumable ? '按原条件恢复断点' : '按原条件运行下一次'}</button>
     </div>}
   </div>;
   const header = <>
     <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', fontSize: 12 }}>
       <strong style={{ fontSize: 14 }}>LOOP 工作台</strong>
+      <div role="group" aria-label="LOOP 主视图" style={{ display: 'flex', gap: 2, padding: 2, borderRadius: 7, background: 'var(--theme-bg-tertiary)' }}>
+        {(['panel', 'flow'] as const).map(mode => <button key={mode} aria-pressed={viewMode === mode} style={{ ...btn, borderColor: viewMode === mode ? 'var(--theme-accent)' : 'transparent', padding: '4px 10px' }}
+          onClick={() => setViewMode(mode)}>{mode === 'panel' ? '面板' : '流程'}</button>)}
+      </div>
       <span data-testid="loop-current-status">{view.status}</span><span>第 {state.round} 轮 · Auto {state.auto ? '开' : '关'}</span>
       <div style={{ marginLeft: 'auto', display: 'flex', gap: 6 }}>{headerActions}{onClose && <button style={btn} onClick={onClose}>关闭总览</button>}</div>
     </div>
-    <div data-testid="loop-goal-summary" style={{ marginTop: 8, fontSize: 15, lineHeight: 1.5, fontWeight: 600 }}>{boundedText(state.goal, 160) || '先整理想法，确认这次想完成什么'}</div>
+    <StageRail stage={state.stage} />
+    {!section && operationFeedback}
+    {state.startup?.status !== 'done' && state.startup?.message && <div role="status" data-testid="loop-startup-status" style={{ fontSize: 12 }}>{state.startup.message}</div>}
+    {latest?.openspecSummary && <div data-testid="loop-openspec-status" role="status" style={{ fontSize: 12, padding: '5px 0', overflowWrap: 'anywhere' }}>
+      OpenSpec · {latest.openspecSummary.change} · {{ apply: '实现原任务', verify: 'Verify 验证', repair: '修复必修问题' }[latest.openspecSummary.phase] || latest.openspecSummary.phase}
+      {' · '}任务 {latest.openspecSummary.checked}/{latest.openspecSummary.total}
+      {' · '}剩余自动 {latest.openspecSummary.pending} · 人工未验收 {latest.openspecSummary.manual}
+      {latest.openspecSummary.fixes > 0 && ` · 必修问题 ${latest.openspecSummary.fixes}`}
+    </div>}
+    <div data-testid="loop-goal-summary" style={{ fontSize: 13, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{state.goal || '先整理想法，确认目标'}</div>
     <div role="group" aria-label="LOOP 统一操作" style={{ position: 'relative', display: 'flex', gap: 7, flexWrap: 'wrap', alignItems: 'center', marginTop: 10 }}>
-      <button style={{ ...primaryBtn, opacity: busy || view.primary === 'running' ? 0.6 : 1 }}
-        disabled={view.primary === 'running' || (busy && view.primary !== 'check') || view.primary === 'check' && control.state.checking}
-        onClick={primary}>{labels[view.primary]}</button>
+      <button style={{ ...primaryBtn, opacity: busy || view.primary === 'running' || (view.primary === 'run' || view.primary === 'resume') && !view.canRequest ? 0.6 : 1 }}
+        title={view.requestReason || view.requestCompatibility}
+        disabled={view.primary === 'running' || (busy && view.primary !== 'check') || view.primary === 'check' && control.state.checking || (view.primary === 'run' || view.primary === 'resume') && !view.canRequest}
+        onClick={primary}>{actionFeedback.phase === 'sending' && actionFeedback.label === '执行 LOOP' ? '正在提交执行…' : labels[view.primary]}</button>
       {!readOnly && state.stage !== 'loopidea' && <>
+        {repairBusy && <button style={btn} disabled={repair.sending || !connected} onClick={() => void cancelRepair()}>停止修复</button>}
         <button style={btn} disabled={busy} onClick={() => void setAuto(!state.auto)}>
-          {state.auto ? '停止后续自动执行' : '开启 Auto'}</button>
+          {actionFeedback.phase === 'sending' && actionFeedback.label.includes('Auto') ? '正在设置 Auto…' : state.auto ? '停止后续自动执行' : '开启 Auto'}</button>
         {state.stage === 'loopexecute' && <button style={btn} disabled={busy} onClick={() => void advanceOut()}>
           {state.running ? '停止本轮并查看结果' : '结束本轮并查看结果'}</button>}
       </>}
-      <button style={btn} onClick={() => openSection('settings')}>任务设置</button>
+      <button style={btn} onClick={() => openSection('goal')}>目标与补充</button>
+      <button style={btn} onClick={() => openSection('policy')}>策略与心智</button>
+      {!readOnly && <button style={btn} title={canTakeover ? '' : takeoverReason} disabled={!canTakeover} onClick={() => void takeover(nextGoal ?? state.goal)}>
+        {state.stage === 'loopout' ? `✋ 开启人工轮（第 ${state.round + 1} 轮）` : '✋ 人工接管'}</button>}
       {!readOnly && <details style={{ position: 'relative', marginLeft: 'auto' }}>
         <summary style={{ ...btn, listStyle: 'none' }}>更多操作</summary>
         <div data-testid="loop-more-actions" style={{ position: 'absolute', right: 0, top: '100%', zIndex: 5, width: 240, maxWidth: '80vw',
           ...sealBox, boxShadow: '0 6px 20px #0004', marginTop: 6 }}>
-          <button style={btn} disabled={!canTakeover} onClick={() => void takeover(nextGoal ?? state.goal)}>
-            {state.stage === 'loopout' ? `✋ 开启人工轮（第 ${state.round + 1} 轮）` : '✋ 人工接管'}</button>
           {!canTakeover && <p role="status" style={{ fontSize: 12 }}>人工接管：{takeoverReason}</p>}
           {!!state.loops.length && <button style={{ ...btn, color: '#f87171', marginTop: 8 }} disabled={busy}
             onClick={() => void discardLoop()}>丢弃本次记录…</button>}
         </div>
       </details>}
     </div>
+    {view.requestReason && <p role="status" style={{ fontSize: 12, margin: '6px 0' }}>{view.requestReason}</p>}
     {!readOnly && state.stage !== 'loopidea' && <div style={{ marginTop: 6, fontSize: 11, color: 'var(--theme-text-muted)' }}>
       {state.stage === 'loopout' ? (state.auto ? '新一轮将按当前 Auto 设置自动连跑。' : '新一轮沿用手动逐次执行。')
         : state.running ? '关闭 Auto 只停止后续自动执行，不等于当前调用已退出。' : state.resumable ? '继续当前断点，保留已完成步骤。' : '执行仍由当前节点的既有授权和恢复条件约束。'}
     </div>}
   </>;
-  const details = <>
-    {(section === 'process' || section === 'evidence') && <>
-      <LoopProgressNotice guard={state.progressGuard} handoff={state.handoff} />
-      {!selected && <LoopDecisionNotice decision={latest?.decision} blockerSummary={latest?.blockerSummary}
+  const recordView = <>
+      <LoopProgressNotice guard={sharedPause ? undefined : state.progressGuard} handoff={state.handoff} />
+      {!selected && !sharedPause && <LoopDecisionNotice decision={latest?.decision} blockerSummary={latest?.blockerSummary}
         callResults={latest?.callResults} taskResult={latest?.taskResult} />}
       {!!state.loops.length && <nav aria-label="流程轮次切换" style={{ position: 'sticky', top: 0, zIndex: 2, display: 'flex', gap: 8,
         flexWrap: 'wrap', padding: '8px 0', background: 'var(--theme-bg-secondary)' }}>
@@ -277,16 +335,42 @@ const LoopPanelContent: React.FC<LoopPanelProps & { identity: string }> = ({
         </select></label>
         <button style={btn} onClick={() => selectLoop(latest!.seq, detailTarget)}>返回最新 Loop</button>
       </nav>}
-      {section === 'process' && <LoopFlowView state={state} selectedSeq={selectedSeq} setSelectedSeq={selectLoop} />}
+      {viewMode === 'flow' ? <LoopFlowView state={state} selectedSeq={selectedSeq} setSelectedSeq={selectLoop} />
+        : <LoopTimeline state={state} selected={selectedSeq} onSelect={seq => selectLoop(seq)} />}
       {selected && <LoopDetail key={selected.seq} loop={selected} progress={progress} target={detailTarget} onTarget={setDetailTarget}
-        error={detailErrors[selected.seq!]?.message} onRetry={retryDetail} onClose={closeSection} />}
-      {!state.loops.length && section === 'evidence' && <p>尚无执行记录。</p>}
+        error={detailErrors[selected.seq!]?.message} onRetry={retryDetail} onClose={() => selectLoop(null)} />}
+  </>;
+  const details = <>
+    {section && operationFeedback}
+    {activeIssue && <section style={{ ...sealBox, marginBottom: 10 }}><p>{activeIssue.reason}</p><p>{activeIssue.next}</p>
+      {!!activeIssue.affectedIds?.length && <p>受影响任务：{activeIssue.affectedIds.join('、')}</p>}
+      {!targetCurrent && <p role="status">该问题已更新或解决。请返回问题列表重新选择；旧目标不能执行操作。</p>}
+      <details><summary>关联依据</summary>{activeIssue.refs.map(ref => <div key={ref}>{ref}</div>)}</details></section>}
+    {issueTarget && view.current?.decision?.basisRefs?.some(ref => issueTarget.refs.includes(ref))
+      && section !== 'evidence' && <LoopDecisionNotice decision={view.current.decision} />}
+    {section === 'evidence' && selected && <>
+      {issueTarget && selected.contractValidation?.causeRef === selected.decision?.causeRef && selected.contractValidation?.causeRef
+        ? <details style={{ marginBottom: 10, fontSize: 12 }}><summary>原调度决定与暂停依据</summary>
+          <LoopDecisionNotice decision={selected.decision} taskResult={selected.taskResult} blockerSummary={selected.blockerSummary} /></details>
+        : <LoopDecisionNotice decision={selected.decision} taskResult={selected.taskResult} blockerSummary={selected.blockerSummary} />}
+      <LoopTaskBlockerDetail key={issueTarget?.id} record={selected} open />
+      {selected.seq === latest?.seq && selected.round === state.round && (selected.contractValidation?.status && selected.contractValidation.status !== 'valid'
+        || ['task_contract_invalid', 'task_scope_unknown'].includes(selected.decision?.reasonCode || '')) && <LoopContractRepair
+        supported={state.contractRepairProtocolVersion === 1} eligibility={state.contractRepairEligibility} feedback={repair}
+        current={targetCurrent}
+        available={!readOnly && !actionBusy && !control.busy && connected}
+        onRepair={() => { if (targetCurrent) void requestRepair(!readOnly && !actionBusy && !control.busy && connected && targetCurrent); }}
+        onCheck={() => void checkRepair()} onCancel={() => void cancelRepair()} />}
+      <LoopDeliveryDetail report={selected.delivery} />
+      <OpenSpecIssues record={selected} />
+      {detailErrors[selected.seq] && <button style={btn} onClick={retryDetail}>重试读取证据</button>}
+      <button style={btn} onClick={() => { setSection(null); setViewMode('flow'); }}>查看对应阶段原文</button>
     </>}
     <div hidden={section !== 'goal'}>
       {visited.has('goal') && <>
-        <GoalCard state={state} readOnly={readOnly || busy} goalDraft={goalDraft}
+        <GoalCard state={state} readOnly={readOnly} busy={busy} goalDraft={goalDraft}
           setGoalDraft={setGoalDraft} onSaveGoal={saveGoal} onRefineGoal={refineGoal} />
-        {!readOnly && <IntentBanner state={state} sessionId={sessionId} />}
+        {!readOnly && <IntentBanner state={state} sessionId={sessionId} action={once} />}
         <AddonHistoryCard addons={state.addons || []} loops={state.loops} />
         {readOnly && (state.addons || []).filter(addon => addon.status === 'pending').map(addon => <section key={addon.id} style={sealBox}>
           <div style={{ fontSize: 12, marginBottom: 6 }}>待纳入补充 · 只读</div><div>{addon.text}</div>
@@ -296,24 +380,39 @@ const LoopPanelContent: React.FC<LoopPanelProps & { identity: string }> = ({
         </section>)}
       </>}
     </div>
-    <div hidden={section !== 'settings'}>
-      {visited.has('settings') && <>
-        <LoopSourceCard sessionId={sessionId} execKey={execKey} source={state.taskSource} readOnly={sourceLocked} />
+    <div hidden={section !== 'source'}>
+      {visited.has('source') && <LoopSourceCard sessionId={sessionId} execKey={execKey} source={state.taskSource} readOnly={sourceLocked || !targetCurrent}
+        lockedReason={readOnly ? '人工总览只读' : state.running ? '当前正在执行，停止后再更改来源' : state.resumable ? '须先处理可恢复断点，再更改来源' : undefined} />}
+    </div>
+    <div hidden={section !== 'environment'}>
+      {visited.has('environment') && <>
         <LoopEnvironmentCard sessionId={sessionId} execKey={execKey} environment={state.executionEnvironment} resumable={state.resumable}
-          readOnly={readOnly || busy || state.running || !!state.executionEnvironment?.checking} />
-        <PolicyCard onRefreshBackends={onRefreshBackends} sessionId={sessionId} policy={state.policy} readOnly={readOnly || busy}
+          source={state.taskSource} checkId={issueTarget?.section === 'environment' ? issueTarget.id.split(':')[1] : undefined}
+          readOnly={readOnly || busy || !targetCurrent || state.running || !!state.executionEnvironment?.checking} />
+      </>}
+    </div>
+    <div hidden={section !== 'policy'}>
+      {visited.has('policy') && <>
+        <PolicyCard onRefreshBackends={onRefreshBackends} sessionId={sessionId} policy={state.policy} readOnly={readOnly}
+          onSave={policy => once('保存策略', () => api.loopSetPolicy(sessionId, policy))}
           sessionBackendId={sessionBackendId} sessionRuntime={sessionRuntime} backends={backends} />
-        <details><summary>诊断指标（不是验收）</summary><div>当前分数 {state.latestScore} · 历史最高分 {state.bestScore} · 风险 {state.riskCoefficient} · 本轮预算 {state.roundLoopCount}/{state.effectiveMaxLoops}</div></details>
       </>}
     </div>
     {section === 'issues' && issueList}
   </>;
   return wrap(<LoopPromptContext.Provider value={{ sessionId, workingDir, execKey }}>
     <LoopWorkbench header={header} section={section} onSection={value => value ? openSection(value) : closeSection()}
-      trigger={trigger} details={details}>
+      trigger={trigger} details={details} title={activeIssue?.title}>
+      <MetricBar state={state} />
+      <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap', marginBottom: 12, fontSize: 12 }}>
+        <button style={{ ...btn, maxWidth: '100%', whiteSpace: 'normal', textAlign: 'left' }} onClick={() => openSection('source')}>来源：{boundedText(state.taskSource?.change, 65) || '未绑定'}
+          {state.taskSource?.change && <> · {({ current: '已核对', stale: '待重新核对', conflict: '范围冲突', unavailable: '不可用', blocked: '来源受阻', invalid: '记录无效' } as Record<string, string>)[state.taskSource.status || ''] || '待核对'}
+            {' · '}{state.taskSource.checked ?? '?'}/{state.taskSource.total ?? '?'} 正式任务</>}</button>
+        <button style={btn} onClick={() => openSection('environment')}>运行诊断</button>
+      </div>
       {!!view.issues.length && <section aria-label="需要处理" style={{ ...sealBox, borderColor: '#d2992255', marginBottom: 12 }}>
         <strong>{view.issues[0].title}</strong><div style={{ margin: '6px 0', fontSize: 12 }}>{boundedText(view.issues[0].reason)}</div>
-        {view.issues[0].id === 'control' ? section !== 'issues' && feedback : <button style={btn} onClick={() => openSection(view.issues[0].section)}>查看处理依据</button>}
+        {view.issues[0].id === 'control' ? section !== 'issues' && feedback : <button style={btn} onClick={() => openIssue(view.issues[0])}>查看处理依据</button>}
         <button style={{ ...btn, marginLeft: 6 }} onClick={() => openSection('issues')}>
           {view.issues.length > 1 ? `还有 ${view.issues.length - 1} 个问题` : '查看问题详情'}</button>
       </section>}
@@ -324,16 +423,24 @@ const LoopPanelContent: React.FC<LoopPanelProps & { identity: string }> = ({
             placeholder="直接写目标，或留空让模型汇总下方想法" containerStyle={{ width: '100%', marginTop: 6 }}
             style={{ ...inputBase, width: '100%', minHeight: 70, boxSizing: 'border-box' }} /></label></div>
         <IdeaStage state={state} ideaInput={ideaInput} setIdeaInput={setIdeaInput} onSubmit={submitIdea} busy={busy}
-          onRemove={id => { void api.loopRemoveIdea(sessionId, id); }} />
+          onRemove={id => { void once('删除想法', () => api.loopRemoveIdea(sessionId, id)); }} />
       </> : <>
         <section style={{ ...sealBox, marginBottom: 12 }} aria-label="当前进展">
           <div style={{ fontSize: 11, color: 'var(--theme-text-muted)', marginBottom: 7 }}>
             {view.current ? `Loop #${view.current.seq} · ${loopSubstageLabel(view.current.subStage)} · ${view.steps}` : '准备执行'}</div>
-          <div style={{ fontSize: 14, lineHeight: 1.6 }}>{view.focus}</div>
+          <div style={{ fontSize: 14, lineHeight: 1.6 }}>{boundedText(state.goal, 220)}</div>
+          {view.focus !== state.goal && <div style={{ fontSize: 12, marginTop: 6 }}>{view.focus}</div>}
           <div data-testid="loop-acceptance" style={{ marginTop: 8, fontSize: 12 }}>{view.acceptance}</div>
           {state.taskSource?.status === 'current' && <div style={{ marginTop: 6, fontSize: 12 }}>来源 {boundedText(state.taskSource.change, 60)} · 正式任务勾选 {state.taskSource.checked ?? '?'}/{state.taskSource.total ?? '?'}（不是验收比例）</div>}
           {view.current?.deliverySummary?.counts && <div style={{ marginTop: 6, fontSize: 12 }}>
             已实现待验 {view.current.deliverySummary.counts.implemented || 0} · 已验证 {view.current.deliverySummary.counts.verified || 0} · 待人工 {view.current.deliverySummary.counts.manual || 0} · 受阻 {view.current.deliverySummary.counts.blocked || 0}</div>}
+          {view.current?.deliverySummary?.milestones?.counts && <div style={{ marginTop: 6, fontSize: 12 }}>
+            子项台账（不计入正式任务分母）：已实现待验 {view.current.deliverySummary.milestones.counts.implemented || 0} · 已验证 {view.current.deliverySummary.milestones.counts.verified || 0}</div>}
+          {view.current?.deliverySummary?.milestones && <div style={{ marginTop: 6, fontSize: 12 }}>
+            本次认可增量：{view.current.deliverySummary.milestones.credited?.join('、') || '无'}
+            {!!view.current.deliverySummary.milestones.invalid?.length && <> · 证据待重新核对：{view.current.deliverySummary.milestones.invalid.join('、')}</>}
+            {!!view.current.deliverySummary.milestones.restored?.length && <> · 恢复旧证据：{view.current.deliverySummary.milestones.restored.join('、')}</>}
+          </div>}
           {view.current?.analysisPreview?.gaps && <p style={{ fontSize: 12 }}>剩余缺口：{boundedText(view.current.analysisPreview.gaps)}</p>}
           {view.current?.analysisPreview?.nextFocus && <p style={{ fontSize: 12 }}>下一步：{boundedText(view.current.analysisPreview.nextFocus)}</p>}
           {state.stage === 'loopout' && <p style={{ fontSize: 12 }}>停止原因：{boundedText(state.stopReason) || '旧记录未提供原因；请核对证据'}</p>}
@@ -341,9 +448,9 @@ const LoopPanelContent: React.FC<LoopPanelProps & { identity: string }> = ({
           <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginTop: 12 }}>
             <button style={btn} onClick={() => openSection('process')}>过程与历史</button>
             <button style={btn} onClick={() => openSection('evidence', undefined, 'analysis')}>成果与证据</button>
-            <button style={btn} onClick={() => openSection('goal')}>目标与补充</button>
           </div>
         </section>
+        <div ref={flowStart} data-testid="loop-main-records">{recordView}</div>
         {state.stage === 'loopout' && !readOnly && <section style={{ ...sealBox, marginBottom: 12 }}>
           <label style={{ fontSize: 13 }}>新一轮目标
             <LoopPromptTextarea value={nextGoal ?? state.goal} onValueChange={setNextGoal}
@@ -352,18 +459,18 @@ const LoopPanelContent: React.FC<LoopPanelProps & { identity: string }> = ({
           <button style={{ ...btn, marginTop: 6 }} onClick={() => setRefineNext(true)}>微调新一轮目标</button>
           {refineNext && <RefineBox onRefineGoal={refineGoal} onResult={setNextGoal} onCancel={() => setRefineNext(false)} />}
         </section>}
-        {!readOnly && <details style={{ ...sealBox, fontSize: 12 }}><summary style={{ cursor: 'pointer' }}>
-          补充要求 · {(state.addons || []).filter(addon => addon.status === 'pending').length} 条待纳入</summary>
-          <p>纳入下一次适用规划；不修改当前已开始的调用。</p>
+        {!readOnly && <div style={{ marginTop: 12 }}>
           <AddonPanel addons={state.addons || []} onAdd={addAddon} onRemove={removeAddon} onEdit={editAddon} />
-        </details>}
+        </div>}
       </>}
     </LoopWorkbench>
   </LoopPromptContext.Provider>);
 };
 
 // ══ 意图守卫提示横幅（非阻塞）═══════════════════════════════════
-const IntentBanner: React.FC<{ state: LoopStateT; sessionId: string }> = ({ state, sessionId }) => {
+const IntentBanner: React.FC<{ state: LoopStateT; sessionId: string;
+  action: (label: string, request: () => Promise<ActionResult>) => Promise<ActionResult>;
+}> = ({ state, sessionId, action }) => {
   const a = state.intentAlert;
   const [busy, setBusy] = useState(false);
   if (!a || a.dismissed || a.aligned || !(a.severity === 'medium' || a.severity === 'high')) return null;
@@ -373,17 +480,16 @@ const IntentBanner: React.FC<{ state: LoopStateT; sessionId: string }> = ({ stat
     const hint = [a.suggestion, a.divergence ? `（针对偏差：${a.divergence}）` : ''].filter(Boolean).join(' ').trim();
     if (!hint) return;
     setBusy(true);
-    const r = await api.loopRefineGoal(sessionId, hint);
+    const r = await action('采纳目标建议', () => api.loopRefineGoal(sessionId, hint));
     setBusy(false);
-    if (r.status === 'ok') api.loopDismissIntent(sessionId);
-    else if (r.message) alert(r.message);
+    if (r.status === 'ok') await action('关闭意图提示', () => api.loopDismissIntent(sessionId));
   };
   return (
     <div className="awu-reveal" style={{ marginBottom: 14, padding: '10px 12px', borderRadius: 10, background: `${col}1a`, border: `1px solid ${col}55` }}>
       <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 4 }}>
         <span style={{ fontSize: 13, fontWeight: 700, color: col }}>⚠️ 意图可能跑偏（{high ? '高' : '中'}）</span>
         <div style={{ flex: 1 }} />
-        <button onClick={() => api.loopDismissIntent(sessionId)} style={miniX} title="知道了，关闭">✕</button>
+        <button onClick={() => void action('关闭意图提示', () => api.loopDismissIntent(sessionId))} style={miniX} title="知道了，关闭">✕</button>
       </div>
       {a.divergence && <div style={{ fontSize: 12.5, color: 'var(--theme-text)', lineHeight: 1.55 }}>{a.divergence}</div>}
       {a.suggestion && <div style={{ fontSize: 12, color: 'var(--theme-text-muted)', marginTop: 4, lineHeight: 1.55 }}>建议：{a.suggestion}</div>}
@@ -412,15 +518,15 @@ const Badge: React.FC<{ text: string; color: string }> = ({ text, color }) => (
 // ══ Idea stage ════════════════════════════════════════════════
 const IdeaStage: React.FC<{
   state: LoopStateT; ideaInput: string; setIdeaInput: (v: string) => void;
-  onSubmit: (images?: ImageAttachment[]) => void; busy: boolean;
+  onSubmit: (images?: ImageAttachment[]) => Promise<ActionResult>; busy: boolean;
   onRemove: (id: string) => void;
 }> = ({ state, ideaInput, setIdeaInput, onSubmit, busy, onRemove }) => {
   const runningCount = state.ideas.filter((i) => i.status === 'running').length;
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const { images, removeImage, clearImages } = useClipboardImage(inputRef);
-  const submit = () => {
+  const submit = async () => {
     if (!ideaInput.trim() && images.length === 0) return;
-    onSubmit(images); clearImages();
+    if ((await onSubmit(images)).status === 'ok') clearImages();
   };
   return (
     <div>
@@ -478,17 +584,21 @@ const IdeaStage: React.FC<{
 
 // ══ Addon 面板（执行中补充要求）═══════════════════════════════
 const AddonPanel: React.FC<{
-  addons: Addon[]; onAdd: (text: string, images?: ImageAttachment[]) => void; onRemove: (id: string) => void;
+  addons: Addon[]; onAdd: (text: string, images?: ImageAttachment[]) => Promise<ActionResult>; onRemove: (id: string) => void;
   onEdit: (id: string, text: string, images?: any[]) => Promise<{ status: string; message?: string }>;
 }> = ({ addons, onAdd, onRemove, onEdit }) => {
   const [text, setText] = useState('');
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const { images, removeImage, clearImages } = useClipboardImage(inputRef);
   const pending = addons.filter((a) => a.status === 'pending');
-  const submit = () => {
+  const [submitting, setSubmitting] = useState(false);
+  const submit = async () => {
     const t = text.trim();
     if (!t && images.length === 0) return;
-    setText(''); onAdd(t, images); clearImages();
+    if (submitting) return;
+    setSubmitting(true);
+    try { if ((await onAdd(t, images)).status === 'ok') { setText(''); clearImages(); } }
+    finally { setSubmitting(false); }
   };
   return (
     <div style={{ ...sealBox, marginBottom: 16, borderColor: pending.length ? '#bf870055' : 'var(--theme-border)' }}>
@@ -514,8 +624,8 @@ const AddonPanel: React.FC<{
           containerStyle={{ flex: 1 }}
           style={{ ...inputBase, width: '100%', minHeight: 56, maxHeight: 160, resize: 'vertical', lineHeight: 1.5 }}
         />
-        <button onClick={submit} disabled={!text.trim() && images.length === 0}
-          style={{ ...primaryBtn, padding: '8px 14px', opacity: (text.trim() || images.length) ? 1 : 0.5 }}>＋ 添加</button>
+        <button onClick={submit} disabled={submitting || !text.trim() && images.length === 0}
+          style={{ ...primaryBtn, padding: '8px 14px', opacity: (text.trim() || images.length) ? 1 : 0.5 }}>{submitting ? '添加中…' : '＋ 添加'}</button>
       </div>
       <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
         {pending.map((a) => (
@@ -557,7 +667,6 @@ const AddonItem: React.FC<{
     const r = await onEdit(addon.id, text.trim(), combined);
     setSaving(false);
     if (r.status === 'ok') { clearImages(); setEditing(false); }
-    else if (r.message) alert(r.message);
   };
 
   if (editing) {
@@ -695,6 +804,7 @@ function relTime(ts: number): string {
 
 // ══ 策略与心智卡片：实时查看 / 调整 ═══════════════════════════
 const PolicyCard: React.FC<{
+  onSave: (policy: LoopPolicy) => Promise<ActionResult>;
   onRefreshBackends?: () => void;
   sessionId: string;
   policy?: LoopPolicy;
@@ -702,7 +812,7 @@ const PolicyCard: React.FC<{
   sessionBackendId?: string;
   sessionRuntime?: ModelRuntime;
   backends?: any[];
-}> = ({ sessionId, policy, readOnly = false, sessionBackendId, sessionRuntime, backends, onRefreshBackends }) => {
+}> = ({ sessionId, policy, readOnly = false, sessionBackendId, sessionRuntime, backends, onRefreshBackends, onSave }) => {
   const [open, setOpen] = useState(false);
   const [draft, setDraft] = useState<LoopPolicy>(() => normalizePolicy(policy));
   const [dirty, setDirty] = useState(false);
@@ -712,10 +822,9 @@ const PolicyCard: React.FC<{
   const p = normalizePolicy(policy);
   const save = async () => {
     setSaving(true);
-    const r = await api.loopSetPolicy(sessionId, normalizePolicy(draft));
+    const r = await onSave(normalizePolicy(draft));
     setSaving(false);
     if (r.status === 'ok') setDirty(false);
-    else if (r.message) alert(r.message);
   };
   return (
     <div style={{ ...sealBox, marginBottom: 16 }}>
@@ -725,7 +834,7 @@ const PolicyCard: React.FC<{
         ) : (
           <button onClick={() => { if (!open) onRefreshBackends?.(); setOpen(!open); }}
             style={{ ...linkBtn, fontWeight: 700, fontSize: 13, color: 'var(--theme-text)' }}>
-            {open ? '▾' : '▸'} ⚙️ 策略与心智
+            {open ? '▾ 收起策略编辑' : '▸ 编辑策略与心智'}
           </button>
         )}
         <span style={{ fontSize: 11, color: 'var(--theme-text-muted)' }}>
@@ -735,6 +844,7 @@ const PolicyCard: React.FC<{
       {open && !readOnly && (
         <div className="awu-reveal" style={{ marginTop: 10 }}>
           <LoopPolicyEditor value={draft} onChange={(v) => { setDraft(v); setDirty(true); }}
+            sessionId={sessionId}
             availableBackends={backends} sessionBackendId={sessionBackendId} sessionRuntime={sessionRuntime} />
           <div style={{ display: 'flex', gap: 8, marginTop: 10, alignItems: 'center', flexWrap: 'wrap' }}>
             <button onClick={save} disabled={saving || !dirty}
@@ -768,7 +878,6 @@ const RefineBox: React.FC<{
     const r = await onRefineGoal(h, images.length ? images : undefined);
     setRefining(false);
     if (r.status === 'ok') { if (r.goal) onResult?.(r.goal); setHint(''); clearImages(); onCancel(); }
-    else if (r.message) alert(r.message);
   };
   return (
     <div className="awu-reveal" style={{ marginTop: 10, padding: 10, borderRadius: 8, background: 'var(--theme-bg-secondary)', border: '1px solid var(--theme-accent)' }}>
@@ -794,9 +903,10 @@ const RefineBox: React.FC<{
 const GoalCard: React.FC<{
   state: LoopStateT;
   readOnly?: boolean;
+  busy?: boolean;
   onRefineGoal: (hint: string, images?: ImageAttachment[]) => Promise<{ status: string; goal?: string; message?: string }>;
-  goalDraft: string; setGoalDraft: (v: string) => void; onSaveGoal: () => void;
-}> = ({ state, readOnly = false, onRefineGoal, goalDraft, setGoalDraft, onSaveGoal }) => {
+  goalDraft: string; setGoalDraft: (v: string) => void; onSaveGoal: () => Promise<ActionResult>;
+}> = ({ state, readOnly = false, busy = false, onRefineGoal, goalDraft, setGoalDraft, onSaveGoal }) => {
   const [mode, setMode] = useState<'view' | 'refine' | 'edit'>('view');
   const [showHist, setShowHist] = useState(false);
   const [showIdeas, setShowIdeas] = useState(false);
@@ -833,7 +943,7 @@ const GoalCard: React.FC<{
           <LoopPromptTextarea value={goalDraft} onValueChange={setGoalDraft}
             containerStyle={{ flex: 1 }} style={{ ...inputBase, width: '100%', minHeight: 54 }} />
           <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
-            <button onClick={() => { onSaveGoal(); setMode('view'); }} style={primaryBtn}>保存</button>
+            <button disabled={busy} onClick={async () => { if ((await onSaveGoal()).status === 'ok') setMode('view'); }} style={primaryBtn}>{busy ? '正在保存…' : '保存'}</button>
             <button onClick={() => setMode('view')} style={btn}>取消</button>
           </div>
         </div>
@@ -1259,6 +1369,13 @@ const CallDiagnostics: React.FC<{ calls: CallDiagnostic[]; live: boolean }> = ({
   </section>;
 };
 
+const OpenSpecIssues: React.FC<{ record: LoopRecord }> = ({ record }) => <>
+  {record.openspecRun?.verify?.issues?.map(issue => <section key={issue.id} style={sealBox}>
+    <strong>{issue.manual ? '人工未验收' : issue.requiresFix ? '需修复' : '建议'} · {issue.severity}</strong>
+    <p>{issue.summary}</p><p>{issue.evidence}</p>
+  </section>)}
+</>;
+
 const LoopDetail: React.FC<{
   loop: LoopRecord; progress: Record<string, string>; onClose: () => void;
   target: DetailTarget; onTarget: (target: DetailTarget) => void; error?: string; onRetry: () => void;
@@ -1438,6 +1555,7 @@ const LoopDetail: React.FC<{
         {loop.environmentChecks?.length ? loop.environmentChecks.map(check => <EnvironmentEvidence key={check.id} check={check} />) : <EnvironmentEvidence />}
       </details>
       {(target === 'all' || target === 'analysis') && <LoopDeliveryDetail report={loop.delivery} />}
+      {(target === 'all' || target === 'analysis') && <OpenSpecIssues record={loop} />}
       {loop.error && <Section title="错误"><span style={{ color: '#f87171' }}>{loop.error}</span></Section>}
     </div>
   );

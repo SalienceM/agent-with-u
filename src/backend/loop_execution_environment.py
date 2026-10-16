@@ -171,12 +171,17 @@ def normalize_environment(raw: Any) -> dict:
               'incomplete': raw.get('incomplete') is True or isinstance(blockers, list) and len(blockers) > MAX_DEPENDENCIES}
     if result['incomplete']:
         result['status'] = 'blocked'
+    validation = raw.get('workflowValidation')
+    if isinstance(validation, dict):
+        result['workflowValidation'] = {'basis': _hash(validation.get('basis')),
+            'status': _enum(validation.get('status'), ('validated', 'invalid', 'unknown')),
+            'checkedAt': _number(validation.get('checkedAt'))}
     return result
 
 
 def check_summary(raw: Any) -> dict:
     value = normalize_check(raw)
-    return {k: v for k, v in value.items() if k not in ('entry', 'basisRefs', 'dependencies')}
+    return {k: v for k, v in value.items() if k != 'entry'}
 
 
 def environment_summary(raw: Any) -> dict:

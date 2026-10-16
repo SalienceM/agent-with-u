@@ -41,10 +41,22 @@ async def snapshot_handoff(working_dir: str | None, action: str, budget: float =
     """先取得进程树拥有权再放行 I/O；结果返回前确认退出，不依赖超时推断。"""
     args = ([sys.executable, '--agentwithu-control-snapshot'] if getattr(sys, 'frozen', False)
             else [sys.executable, '-m', 'src.backend.loop_control_snapshot'])
-    process = await asyncio.create_subprocess_exec(*args, cwd=str(Path(__file__).resolve().parents[2]),
+    spawn = asyncio.create_task(asyncio.create_subprocess_exec(*args, cwd=str(Path(__file__).resolve().parents[2]),
         stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
         limit=16_384, **({'creationflags': subprocess.CREATE_NO_WINDOW} if os.name == 'nt'
-                        else {'start_new_session': True}))
+                        else {'start_new_session': True})))
+    cancelled = False
+    try:
+        process = await asyncio.shield(spawn)
+    except asyncio.CancelledError:
+        # spawn 可能已创建 OS 进程；保留原任务并取回句柄，不能取消等待后丢失拥有权。
+        cancelled = True
+        try:
+            process = await asyncio.shield(spawn)
+        except OSError:
+            return SnapshotResult()
+    except OSError:
+        return SnapshotResult()  # OS 明确未创建进程；上层报告快照失败，但没有未知退出锁。
     try:
         owner = OwnedProcessTree(process)
     except Exception:
@@ -82,7 +94,7 @@ async def snapshot_handoff(working_dir: str | None, action: str, budget: float =
             return False  # 保留本次 owner，不能用清理异常当作退出证据。
 
     try:
-        if os.name == 'nt' and not owner.complete:
+        if cancelled or os.name == 'nt' and not owner.complete:
             confirmed = await cleanup()
             if confirmed:
                 owner.release()

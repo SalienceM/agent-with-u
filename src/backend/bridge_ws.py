@@ -786,11 +786,16 @@ from .workspace_search_bridge import WorkspaceSearchBridge
 from .loop_execution_environment import EnvironmentPause, normalize_environment
 from .loop_decisions import DecisionFacts, decide_next, digest as loop_digest
 from .loop_task_source import source_summary, reconcile, snapshot_fresh
+from .loop_openspec import requested as openspec_requested, run_summary as openspec_summary
+from .loop_openspec_bridge import LoopOpenSpecBridge
+from .loop_startup_bridge import LoopStartupBridge
+from .aside_bridge import AsideInspectionBridge
+from .loop_control_persistence import OrderedLoopWrites
 from .loop_milestones import (MILESTONE_INSTRUCTIONS, register_plan, review_milestones,
                               milestone_progress, inherit_plan)
 
 
-class BridgeWS(LoopSourceBridge, LoopEnvironmentBridge, LoopTaskBlockerBridge, LoopControlBridge, EngineWorkbenchBridge, WorkspaceDocumentBridge, WorkspaceSearchBridge, WorkbenchWindowBridge, WorkbenchStreamBridge, TerminalBridge, LanguageBridge):
+class BridgeWS(AsideInspectionBridge, LoopStartupBridge, LoopOpenSpecBridge, LoopSourceBridge, LoopEnvironmentBridge, LoopTaskBlockerBridge, LoopControlBridge, EngineWorkbenchBridge, WorkspaceDocumentBridge, WorkspaceSearchBridge, WorkbenchWindowBridge, WorkbenchStreamBridge, TerminalBridge, LanguageBridge):
     """WebSocket bridge，业务逻辑与 Bridge（Qt）完全相同，去掉 Qt 依赖。"""
 
     def __init__(self, cli_path: Optional[str] = None, auth_guard: Optional["AuthGuard"] = None):
@@ -891,6 +896,9 @@ class BridgeWS(LoopSourceBridge, LoopEnvironmentBridge, LoopTaskBlockerBridge, L
         # 随着用户浏览目录不断增长。
         self._sync_manifest_cache: dict[str, dict[str, tuple[int, int, str]]] = {}
         self._sync_manifest_cache_lock = threading.Lock()
+        # 数据导出先在执行端生成临时包，再由控制端分块读取。路径永远不跨机器传递；
+        # 每个传输绑定发起用户，并在完成、取消或过期后删除临时文件。
+        self._data_export_transfers: dict[str, dict[str, Any]] = {}
         self._backends: dict[str, ModelBackend] = {}
         # ★ LOOP 并发隔离：普通 chat 继续复用 backend 配置实例；LOOP/aside 的每次
         #   agent 调用使用独立 backend 实例，并在这里短暂登记，避免同一 backend
@@ -1980,7 +1988,8 @@ class BridgeWS(LoopSourceBridge, LoopEnvironmentBridge, LoopTaskBlockerBridge, L
         # 只允许只读文件树/目录查询并发；写操作仍是顺序屏障。
         # Relay 的虚拟 websocket 复用此入口，身份 ContextVar 在各任务内独立绑定。
         reads: set[asyncio.Task] = set()
-        concurrent_reads = {"listDirectory", "gitDetect", "gitStatus", "ping", "codexModelCatalog", "loopControlGet"}
+        catalog_reads: set[asyncio.Task] = set()
+        concurrent_reads = {"listDirectory", "gitDetect", "gitStatus", "ping", "codexModelCatalog", "codexSessionModelCatalog", "loopControlGet"}
 
         async def reply(req: dict) -> None:
             req_id = req.get("id")
@@ -2036,9 +2045,13 @@ class BridgeWS(LoopSourceBridge, LoopEnvironmentBridge, LoopTaskBlockerBridge, L
                         task = asyncio.create_task(reply(req))
                         reads.add(task)
                         task.add_done_callback(reads.discard)
+                        if method in {"codexModelCatalog", "codexSessionModelCatalog"}:
+                            # 独立只读 app-server 不参与会话写顺序，打开设置不能阻塞聊天/停止。
+                            catalog_reads.add(task)
+                            task.add_done_callback(catalog_reads.discard)
                     else:
-                        if reads:
-                            await asyncio.gather(*reads, return_exceptions=True)
+                        if ordered_reads := reads - catalog_reads:
+                            await asyncio.gather(*ordered_reads, return_exceptions=True)
                         await reply(req)
                 except Exception as e:
                     print(f"[bridge_ws] dispatch error: {e}", file=sys.stderr, flush=True)
@@ -2071,7 +2084,7 @@ class BridgeWS(LoopSourceBridge, LoopEnvironmentBridge, LoopTaskBlockerBridge, L
             or method in {
                 "saveBackend", "deleteBackend", "exportBackends", "poeAccountOverview", "codexModelCatalog",
                 "previewBackendImport", "importBackends",
-                "exportData", "importData",
+                "exportData", "exportDataStart", "exportDataChunk", "exportDataFinish", "importData",
                 "saveMcpServers", "openLoginTerminal", "openModelTerminal",
                 "kitCapabilityRespond",
             }
@@ -2134,7 +2147,8 @@ class BridgeWS(LoopSourceBridge, LoopEnvironmentBridge, LoopTaskBlockerBridge, L
                 'languageServiceStart', 'languageServiceRequest', 'languageServiceStop',
                 'steerMessage', 'redirectMessage', 'steerSeqTask', 'seqtaskAdd', 'seqtaskEdit',
                 'seqtaskRemove', 'seqtaskReorder', 'seqtaskSetAuto', 'seqtaskTakeNext', 'seqtaskClear',
-                'abortMessage', 'grantPermission', 'loopControlRequest', 'loopTakeover', 'loopRelease'}:
+                'abortMessage', 'grantPermission', 'loopControlRequest', 'loopTakeover', 'loopRelease',
+                'loopRepairTaskContract', 'loopCancelTaskContractRepair'}:
             self._window_guard(sid)
         if method == 'executeCommand' and params:
             payload = json.loads(params[0]) if isinstance(params[0], str) else params[0]
@@ -2143,6 +2157,7 @@ class BridgeWS(LoopSourceBridge, LoopEnvironmentBridge, LoopTaskBlockerBridge, L
         control_read_or_independent = {
             'loopControlGet', 'loopControlRequest', 'loopTakeover', 'loopRelease',
             'loopGetState', 'loopGetRecord', 'loopExecutionEnvironmentGet',
+            'loopRepairTaskContract', 'loopTaskContractRepairGet', 'loopCancelTaskContractRepair',
             'loopAddAddon', 'loopEditAddon', 'loopRemoveAddon',
             'loopAsk', 'loopAsideList', 'loopAsideClear', 'loopAsideAbort',
         }
@@ -2170,7 +2185,7 @@ class BridgeWS(LoopSourceBridge, LoopEnvironmentBridge, LoopTaskBlockerBridge, L
             return await asyncio.to_thread(handler, *params)
         result = handler(*params)
         writer = getattr(self, '_loop_control_writes', {}).get(sid)
-        if writer and method in {'loopAddAddon', 'loopEditAddon', 'loopRemoveAddon', 'loopAsk', 'loopAsideClear'}:
+        if writer and method.startswith('loop') and method not in {'loopGetState', 'loopGetRecord'}:
             # 同步兼容入口仍须等待自己的保存完成才回复 ok；等待期间不持有 Store 锁。
             await writer.flush()
         return result
@@ -5192,6 +5207,14 @@ class BridgeWS(LoopSourceBridge, LoopEnvironmentBridge, LoopTaskBlockerBridge, L
         """写盘并刷新缓存，保证后续读到同一对象。"""
         self._loop_states[st.session_id] = st
         writer = getattr(self, '_loop_control_writes', {}).get(st.session_id)
+        if writer is None:
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                pass
+            else:
+                _, writers = self._control_maps()
+                writer = writers.setdefault(st.session_id, OrderedLoopWrites(self._loop_store.save_frozen))
         if writer is not None:
             st.updated_at = time.time()
             writer.enqueue(st.to_dict())
@@ -5210,7 +5233,12 @@ class BridgeWS(LoopSourceBridge, LoopEnvironmentBridge, LoopTaskBlockerBridge, L
 
     def _loop_payload(self, state: "LoopState", *, compact: bool = False) -> dict:
         """序列化 LoopState，并注入运行态；compact 首屏不携带详情大字段。"""
-        d = state.to_dict()
+        d = state.to_dict(compact=compact)
+        from .loop_task_recovery import receipt_summary
+        d['contractRepairProtocolVersion'] = 1
+        d['contractRepair'] = receipt_summary(state.contract_repairs[-1]) if state.contract_repairs else {}
+        d['contractRepairEligibility'] = self._loop_repair_eligibility(state)
+        d.pop('contractRepairs', None)  # 原候选/身份与修复审计绝不广播。
         d['controlProtocolVersion'] = 1
         d['controlOperation'] = operation_public(state.control_operation)
         d.pop('controlReceipts', None)
@@ -5229,15 +5257,19 @@ class BridgeWS(LoopSourceBridge, LoopEnvironmentBridge, LoopTaskBlockerBridge, L
         # 可续：最后一条 loop 没跑完、不是错误、当前没在跑、仍在 execute 阶段
         d["running"] = running
         d["resumable"] = bool(
-            last and last.kind != "manual" and not last.completed and not last.error and not last.terminal_kind
+            last and last.round == state.round and last.kind != "manual" and not last.completed and not last.error and not last.terminal_kind
             and not running and state.stage == STAGE_EXECUTE
         )
         d['controlEligibility'] = self._loop_control_eligibility(state)
         d['engineeringActivities'] = self._engineering_feedback(state.session_id)
         d['canTakeover'] = state.control_mode == 'loop' and d['controlEligibility']['takeover']['allowed']
+        d['iterationRequest'] = self._loop_iteration_request(state)
+        d['executionEnvironment']['effectiveDependencies'] = self._loop_dependency_summary(state)
         # ★ 把每条 loop 实际用到的 backend + model + reasoning effort 解析成可读 label，
         #   供面板/流程视图准确追溯「谁以什么档位规划、执行、评审」。
         for rec in d.get("loops", []):
+            rec['contractRepairRevision'] = loop_digest([receipt_summary(item) for item in state.contract_repairs
+                if item.get('seq') == rec['seq'] and item.get('round') == rec['round']])[:32]
             bmap = rec.get("backends") or {}
             rmap = rec.get("runtimes") or {}
             rec["backendLabels"] = {
@@ -5245,6 +5277,7 @@ class BridgeWS(LoopSourceBridge, LoopEnvironmentBridge, LoopTaskBlockerBridge, L
                 for pos, bid in bmap.items() if bid
             }
             report = rec.get("delivery") or {}
+            rec['openspecSummary'] = openspec_summary(rec.get('openspecRun', {}))
             rec["deliverySummary"] = {
                 "mode": report.get("mode", ""),
                 "counts": {status: sum(i.get("status") == status for i in report.get("items", []))
@@ -5257,6 +5290,7 @@ class BridgeWS(LoopSourceBridge, LoopEnvironmentBridge, LoopTaskBlockerBridge, L
                 'capturedAt': snap.get('capturedAt')} for key, snap in rec.get('sourceSnapshots', {}).items() if isinstance(snap, dict)}
             if compact:
                 from .loop_execution_environment import check_summary
+                rec['openspecRun'] = {}
                 rec['blockerSummary'] = {key: rec.get('blockerReview', {}).get(key) for key in ('status', 'readyIds', 'affectedIds', 'valid')}
                 for key in ('taskPlan', 'taskBlockers', 'isolationEvidence', 'blockerReview'):
                     rec[key] = {}
@@ -5317,10 +5351,13 @@ class BridgeWS(LoopSourceBridge, LoopEnvironmentBridge, LoopTaskBlockerBridge, L
         return record if record.kind == "manual" and not record.completed else None
 
     def _loop_control_reserved(self, session_id: str) -> bool:
-        if session_id in getattr(self, '_loop_control_jobs', {}):
+        from .loop_task_recovery import repair_active
+        if session_id in getattr(self, '_loop_control_jobs', {}) or session_id in getattr(self, '_loop_contract_jobs', {}):
             return True
         state = getattr(self, '_loop_states', {}).get(session_id)
         operation = state.control_operation if state else {}
+        if state and repair_active(state.contract_repairs):
+            return True
         if state is None:
             # 重启后首次动作可能是序列派发/直接发送，而不是打开 LOOP 面板。
             # 先读轻量持久化保护，不能把缓存未命中当作没有在途转交。
@@ -5331,6 +5368,8 @@ class BridgeWS(LoopSourceBridge, LoopEnvironmentBridge, LoopTaskBlockerBridge, L
                 if meta is None and store.exists(session_id):
                     return True  # 权威记录损坏/不可读也不是允许冲突写的证据。
                 operation = (meta or {}).get('controlOperation') or {}
+                if (meta or {}).get('contractRepairActive'):
+                    return True
         return bool(operation and operation.get('status') not in TERMINAL_STATUSES)
 
     def _loop_control_eligibility(self, state: "LoopState", session: Optional[Session] = None,
@@ -5670,6 +5709,7 @@ class BridgeWS(LoopSourceBridge, LoopEnvironmentBridge, LoopTaskBlockerBridge, L
                               runtime: Optional[dict] = None,
                               inactivity_timeout: float = 0.0,
                               execution_access: Optional[str] = None) -> tuple:
+        await self._loop_flush(session.id)
         kwargs = {"resume": resume, "indep_session_id": indep_session_id, "images": images,
                   "backend_id": backend_id, "agent_session_id": agent_session_id,
                   "runtime": runtime, "inactivity_timeout": inactivity_timeout,
@@ -5752,7 +5792,7 @@ class BridgeWS(LoopSourceBridge, LoopEnvironmentBridge, LoopTaskBlockerBridge, L
         backend_config_id = backend_id or session.backend_id
         task_state = self._loop_state(session.id) if seq > 0 and hasattr(self, '_loop_states') else None
         task_record = next((r for r in task_state.loops if r.seq == seq), None) if task_state else None
-        scoped_tasks = bool(task_record and (task_record.task_plan or task_record.blocker_review or task_state.unresolved_blockers))
+        scoped_tasks = bool(task_record and (task_record.openspec_run or task_record.task_plan or task_record.blocker_review or task_state.unresolved_blockers))
         if backend_id and backend_id != session.backend_id:
             try:
                 backend = self._new_backend_instance(backend_id)
@@ -6043,6 +6083,14 @@ class BridgeWS(LoopSourceBridge, LoopEnvironmentBridge, LoopTaskBlockerBridge, L
         if not record:
             return json.dumps({"status": "error", "message": "Loop 记录不存在"}, ensure_ascii=False)
         payload = record.to_dict()
+        payload['openspecSummary'] = openspec_summary(record.openspec_run)
+        from .loop_task_recovery import receipt_summary, repair_audit
+        payload['contractRepairAudits'] = [
+            repair_audit(item)
+            for item in state.contract_repairs if item.get('seq') == record.seq and item.get('round') == record.round
+        ]
+        payload['contractRepairRevision'] = loop_digest([receipt_summary(item) for item in state.contract_repairs
+            if item.get('seq') == record.seq and item.get('round') == record.round])[:32]
         payload["backendLabels"] = {
             pos: self._runtime_label(bid, (record.runtimes or {}).get(pos))
             for pos, bid in (record.backends or {}).items() if bid
@@ -6447,7 +6495,9 @@ class BridgeWS(LoopSourceBridge, LoopEnvironmentBridge, LoopTaskBlockerBridge, L
             return json.dumps({"status": "error", "message": "no loop state"}, ensure_ascii=False)
         if state.control_mode == "manual" and self._coerce_bool(on):
             return json.dumps({"status": "error", "message": "人工接管期间不能启动 Auto LOOP"}, ensure_ascii=False)
-        if self._coerce_bool(on) and (self._loop_has_active_call(session_id)
+        if self._coerce_bool(on) and (self._loop_contract_pending(state) and not openspec_requested(state) or self._loop_control_reserved(session_id)):
+            return json.dumps({'status': 'error', 'message': '请先处理任务映射问题或未确认操作；Auto 不会自动修复。'}, ensure_ascii=False)
+        if self._coerce_bool(on) and (self._loop_has_active_call(session_id) and not self._loop_is_running(session_id)
                 or normalize_environment(state.execution_environment)['blockers']):
             return json.dumps({'status': 'error', 'message': '请先核对环境与旧调用，再显式恢复；不能用 Auto 绕过阻塞。'}, ensure_ascii=False)
         state.auto = self._coerce_bool(on)
@@ -6460,23 +6510,53 @@ class BridgeWS(LoopSourceBridge, LoopEnvironmentBridge, LoopTaskBlockerBridge, L
             stop, _ = self._loop_should_stop(state)
             if not stop:
                 self._schedule_loop_iteration(session_id, auto_required=True)
-        return json.dumps({"status": "ok", "auto": state.auto}, ensure_ascii=False)
+            else:
+                state.auto = False
+                self._loop_save(state)
+                self._emit_loop_updated(state)
+                return json.dumps({'status': 'error', 'auto': False, 'message': '未开启 Auto：' + (self._loop_should_stop(state)[1] or '本轮已达到停止条件')}, ensure_ascii=False)
+        return json.dumps({"status": "ok", "auto": state.auto, 'message': 'Auto 已开启，按当前阶段继续' if state.auto else 'Auto 已关闭；当前执行不会被丢弃'}, ensure_ascii=False)
 
     def _rpc_loopRunIteration(self, session_id: str) -> str:
         """跑下一次 loop（非阻塞）；若上一次 loop 未跑完则从断点续跑。"""
         state = self._loop_state(session_id)
         if not state:
             return json.dumps({"status": "error", "message": "no loop state"}, ensure_ascii=False)
-        if state.control_mode == "manual":
-            return json.dumps({"status": "error", "message": "请先将会话交还 LOOP"}, ensure_ascii=False)
-        if state.stage != STAGE_EXECUTE:
-            return json.dumps({"status": "error", "message": "当前不在 loopexecute 阶段"}, ensure_ascii=False)
-        if self._loop_is_running(session_id):
-            return json.dumps({"status": "error", "message": "上一次 loop 仍在进行"}, ensure_ascii=False)
-        if self._loop_has_active_call(session_id):
-            return json.dumps({"status": "error", "message": "旧 Backend 调用尚未确认退出，不能启动新的写调用"}, ensure_ascii=False)
-        self._schedule_loop_iteration(session_id)
-        return json.dumps({"status": "ok"}, ensure_ascii=False)
+        request = self._loop_iteration_request(state)
+        if not request['canRequest']:
+            return json.dumps({"status": "error", "message": request['message']}, ensure_ascii=False)
+        if not self._schedule_loop_iteration(session_id):
+            return json.dumps({"status": "error", "message": "执行未被接收：当前会话已有启动或控制操作，请核对状态。"}, ensure_ascii=False)
+        return json.dumps({"status": "ok", "message": "请求已接收；正在准备工作区，随后显示实际执行阶段。"}, ensure_ascii=False)
+
+    def _loop_iteration_request(self, state: "LoopState") -> dict:
+        """与提交入口共用的无 I/O 快照；可请求不代表来源/环境/预算验收通过。"""
+        last = state.loops[-1] if state.loops else None
+        env = normalize_environment(state.execution_environment)
+        running = self._loop_is_running(state.session_id)
+        code, message = '', ''
+        if state.control_mode == 'manual':
+            code, message = 'manual', '请先将会话交还 LOOP'
+        elif (state.session_id in getattr(self, '_loop_control_jobs', {})
+              or state.control_operation and state.control_operation.get('status') not in TERMINAL_STATUSES):
+            code, message = 'handoff_busy', '控制权转交尚未确认，不能重复启动'
+        elif state.stage != STAGE_EXECUTE:
+            code, message = 'stage', '当前不在 loopexecute 阶段'
+        elif running:
+            code, message = 'running', '上一次 loop 仍在进行'
+        elif self._loop_has_active_call(state.session_id):
+            code, message = 'call_active', '旧 Backend 调用尚未确认退出，不能启动新的写调用'
+        elif self._loop_contract_pending(state) and not openspec_requested(state):
+            code, message = 'task_contract_repair', '请打开当前任务映射问题并显式修复；不会重复启动同因失败轮次。'
+        resumable = bool(last and last.round == state.round and last.kind != 'manual'
+            and not last.completed and not last.error and not last.terminal_kind)
+        return {'version': 1, 'sessionId': state.session_id, 'round': state.round,
+            'seq': last.seq if last else 0, 'controlRevision': state.control_revision,
+            'environmentRevision': env['revision'], 'sourceRevision': state.task_source.get('revision', 0),
+            'action': 'resume' if resumable else 'run', 'canRequest': not code,
+            'reasonCode': code, 'message': message,
+            'recheckRequired': bool(env['blockers'] or env['incomplete'] or state.progress_guard.get('pause')),
+            'basisRefs': [f"environment:{c['id']}:{c['revision']}" for c in env['blockers'][:8]]}
 
     def _rpc_loopDiscard(self, session_id: str, seq: int = 0, restore_files=False) -> str:
         """停止并删除一次 loop（误触兜底）：当作没发生过。
@@ -6526,6 +6606,8 @@ class BridgeWS(LoopSourceBridge, LoopEnvironmentBridge, LoopTaskBlockerBridge, L
             return
         if state.control_mode != "loop":
             return
+        if self._loop_contract_pending(state) and not openspec_requested(state) or self._loop_control_reserved(session_id):
+            return
         if auto_required and (not state.auto or state.progress_guard.get('pause') or state.stage != STAGE_EXECUTE
                 or decision_id and (not state.loops or state.loops[-1].decision.get('decisionId') != decision_id)):
             return
@@ -6558,6 +6640,9 @@ class BridgeWS(LoopSourceBridge, LoopEnvironmentBridge, LoopTaskBlockerBridge, L
         try:
             # resume-or-new：最后一条未完成且非错误 → 续跑它；否则新开
             last = state.loops[-1] if state.loops else None
+            if (last and openspec_requested(state) and not last.openspec_run
+                    and not last.completed and not last.error and not last.terminal_kind):
+                self._mark_loop_interrupted(last, '转入 OpenSpec 原任务驱动；旧步骤和证据保留，不重放旧任务映射。')
             if (last and last.round == state.round
                     and not last.completed and not last.error and not last.terminal_kind):
                 record = last
@@ -6570,18 +6655,20 @@ class BridgeWS(LoopSourceBridge, LoopEnvironmentBridge, LoopTaskBlockerBridge, L
                     return
                 record = LoopRecord(seq=max((item.seq for item in state.loops), default=0) + 1,
                                     sub_stage=SUB_PREPARE,
-                                    round=state.round, outcome_version=1)
+                                    round=state.round, outcome_version=1, contract_required=not openspec_requested(state))
                 # ★ 版本隔离：开跑前快照 agent 上下文 + git 工作树，丢弃本次 loop 时回滚到这里
                 record.agent_checkpoint = session.agent_session_id or ""
-                record.git_checkpoint = git_snapshot(session.working_dir)
-                # 非 git 目录：用 Python 文件级备份作为替代
-                if not record.git_checkpoint:
-                    record.dir_checkpoint = dir_snapshot(session.working_dir)
                 state.loops.append(record)
                 self._loop_save(state)
                 self._emit_loop_updated(state)
+                if not await self._loop_startup_snapshot(session, state, record):
+                    return
 
             history = self._loop_history_brief(state, exclude_seq=record.seq)
+            if openspec_requested(state):
+                if await self._loop_openspec_source(session, state, record, 'prepare'):
+                    await self._loop_openspec_iteration(session, state, record)
+                return
             order = [SUB_PREPARE, SUB_EXECUTE, SUB_ANALYSIS]
             start = order.index(record.sub_stage) if record.sub_stage in order else 0
             if not await self._loop_check_source(session, state, record, 'prepare', force=True):
@@ -6729,7 +6816,9 @@ class BridgeWS(LoopSourceBridge, LoopEnvironmentBridge, LoopTaskBlockerBridge, L
                    for key in getattr(self, '_loop_active_backends', {}))
                 or session_id in getattr(self, '_loop_environment_checks', {})
                 or any(key[0] == session_id for key in getattr(self, '_loop_environment_requests', {}))
-                or bool(getattr(self, '_loop_environment_orphans', {}).get(session_id)) or bool(unresolved_exit))
+                or bool(getattr(self, '_loop_environment_orphans', {}).get(session_id)) or bool(unresolved_exit)
+                or session_id in getattr(self, '_loop_startup_jobs', {})
+                or bool(state and state.startup.get('status') in ('running', 'unknown')))
 
     def _loop_evidence_environment(self, session, record) -> str:
         backend_id = record.backends.get('execute') or session.backend_id
@@ -6739,6 +6828,12 @@ class BridgeWS(LoopSourceBridge, LoopEnvironmentBridge, LoopTaskBlockerBridge, L
                             str(getattr(session, 'working_dir', ''))])[:40]
 
     def _loop_keep_decision(self, state, record, decision: dict) -> None:
+        guard = state.progress_guard
+        if (not decision.get('causeRef') and guard.get('causeRef') and guard.get('pause')
+                and decision.get('action') == 'wait' and guard.get('reasonCode') == decision.get('reasonCode')
+                and guard.get('reason') == decision.get('reasonText')
+                and guard.get('round') == record.round and guard.get('seq') == record.seq):
+            decision.update(causeRef=guard['causeRef'], causeRevision=guard.get('causeRevision', 0))
         decision.update(round=record.round, seq=record.seq, revision=state.task_source.get('revision', 0))
         record.decision = decision
         if not record.decision_history or record.decision_history[-1].get('decisionId') != decision['decisionId']:
@@ -6766,6 +6861,22 @@ class BridgeWS(LoopSourceBridge, LoopEnvironmentBridge, LoopTaskBlockerBridge, L
             resume_condition=condition, control_mode=state.control_mode,
             user_stop=state.session_id in getattr(self, '_loop_cancel', {}) or state.session_id in getattr(self, '_loop_pending_out', set()),
             call_still_active=self._loop_has_active_call(state.session_id)), f'{record.round}:{record.seq}:{record.sub_stage}')
+        # 一个暂停事实投影到决定和守卫；不能继承上一个不同原因的关联。
+        detail = record.contract_validation
+        if code in ('task_contract_invalid', 'task_scope_unknown') and decision.get('reasonCode') == code and detail.get('causeRef'):
+            cause, revision = detail['causeRef'], detail.get('causeRevision', 0)
+        else:
+            cause = 'wait:' + loop_digest([state.session_id, record.round, record.seq, state.control_revision,
+                                      decision.get('reasonCode'), reason, condition])[:32]
+            old = state.progress_guard
+            revision = int(old.get('causeRevision', 0)) + (old.get('causeRef') != cause)
+        decision.update(causeRef=cause, causeRevision=revision)
+        state.progress_guard.update(causeRef=cause, causeRevision=revision, round=record.round,
+                                    reasonCode=decision.get('reasonCode', code))
+        check = normalize_environment(state.execution_environment)['latest']
+        if check.get('reasonCode') == code and check.get('status') == 'blocked' and any(
+                item.get('id') == check['id'] and item.get('revision') == check['revision'] for item in record.environment_checks):
+            decision['basisRefs'] = [*decision.get('basisRefs', []), f"environment:{check['id']}:{check['revision']}"][:16]
         self._loop_keep_decision(state, record, decision)
         record.updated_at = time.time()
         self._loop_save(state)
@@ -6788,7 +6899,8 @@ class BridgeWS(LoopSourceBridge, LoopEnvironmentBridge, LoopTaskBlockerBridge, L
         self._emit_loop_updated(state)
         return True
 
-    def _loop_audit_plan(self, record: "LoopRecord", text: str, kind: str) -> list[LoopStep]:
+    def _loop_audit_plan(self, record: "LoopRecord", text: str, kind: str,
+                         *, session=None, state=None) -> list[LoopStep]:
         """保存每次规划原文和结构校验，不把校验通过混同于任务验收。"""
         parsed = self._extract_json_block(text)
         obj = parsed or {}
@@ -6800,8 +6912,16 @@ class BridgeWS(LoopSourceBridge, LoopEnvironmentBridge, LoopTaskBlockerBridge, L
         )
         detail = record.stage_details.setdefault(SUB_PREPARE, {})
         attempts = detail.setdefault("attempts", [])
+        record.plan_attempt_count = min(3, max(record.plan_attempt_count, len(attempts) + 1))
+        contract = None
+        if session is not None and state is not None:
+            contract = self._loop_contract_audit(session, state, record, obj, steps)
+            if not contract['valid']:
+                validation = [contract.get('reason', '任务协议校验未通过')]
+                steps = []
         attempts.append({"kind": kind, "rawOutput": text, "parsed": parsed,
-                         "valid": bool(steps), "validation": validation})
+                         "valid": bool(steps), "validation": validation,
+                         "contractValidation": copy.deepcopy(record.contract_validation) if contract else {}})
         detail.update({"status": "done" if steps else "error", "attemptCount": len(attempts),
                        "message": "结构校验通过" if steps else "规划结构校验失败"})
         if steps and isinstance(obj.get("goal"), str) and obj["goal"].strip():
@@ -6882,6 +7002,18 @@ class BridgeWS(LoopSourceBridge, LoopEnvironmentBridge, LoopTaskBlockerBridge, L
             if record.iteration_mode == "baseline" else
             "这是后续增量演进：上一轮诊断是候选输入而非唯一队头，结合依赖、收益、风险和成本选择工作批次。"
         )
+        record.contract_required = record.contract_required or bool(state.task_source.get('binding'))
+        if record.contract_required and record.plan_attempt_count:
+            attempts = record.stage_details.get(SUB_PREPARE, {}).get('attempts', [])
+            if record.plan_attempt_count > len(attempts):
+                self._loop_contract_wait(state, record, {'reason': '上次规划调用结果未确认，不自动重放。',
+                    'reasonCode': 'call_unknown', 'origin': 'history', 'repairable': False})
+                return
+            if not record.orchestration and not await self._loop_correct_contract(session, state, record):
+                return
+            record.sub_stage = SUB_EXECUTE
+            self._loop_save(state)
+            return
         prepare_prompt = (
             f"{strategy_block}"
             f"【全局目标（每次都必须回看，不得被本次焦点替代）】\n"
@@ -6915,21 +7047,39 @@ class BridgeWS(LoopSourceBridge, LoopEnvironmentBridge, LoopTaskBlockerBridge, L
         addon_imgs: list = []
         for a in pending:
             addon_imgs.extend(a.images or [])
+        record.stage_details.setdefault('contractContext', self._loop_contract_context(session, state, record))
+        boundary = self._loop_contract_boundary(session, state, record, record.stage_details['contractContext'])
+        if boundary:
+            if not state.progress_guard.get('pause'):
+                self._loop_contract_wait(state, record, boundary)
+            return
+        record.plan_attempt_count = 1
+        self._loop_save(state)
         ptext, _ = await self._loop_run_agent(session, prepare_prompt, SUB_PREPARE, record.seq,
                                            resume=False,
                                            indep_session_id=f"{session.id}:loop{record.seq}:prepare",
                                            images=addon_imgs or None,
                                            backend_id=requested_prepare_backend,
-                                           runtime=prepare_runtime)
+                                           runtime=prepare_runtime, execution_access='read-only')
         # 消费这些 addon：标记为已纳入本次 loop
         for a in pending:
             a.status = "applied"
             a.applied_seq = record.seq
             a.updated_at = time.time()
         record.goal = state.goal
+        boundary = self._loop_contract_boundary(session, state, record, record.stage_details['contractContext'])
+        if boundary:
+            self._loop_audit_plan(record, ptext, 'initial', session=session, state=state)
+            if not state.progress_guard.get('pause'):
+                self._loop_contract_wait(state, record, boundary)
+            self._loop_save(state)
+            return
         if self._loop_pause_control(state, record, ptext):
             return
-        record.orchestration = self._loop_audit_plan(record, ptext, "initial")
+        record.orchestration = self._loop_audit_plan(record, ptext, "initial", session=session, state=state)
+        if record.contract_required and not record.orchestration:
+            if not await self._loop_correct_contract(session, state, record):
+                return
         # ★ JSON 解析重试：模型输出不含有效编排（至少 1 个 step）时，补发一次更强约束的 prompt
         if not record.orchestration:
             retry_prompt = (
@@ -6958,7 +7108,7 @@ class BridgeWS(LoopSourceBridge, LoopEnvironmentBridge, LoopTaskBlockerBridge, L
             )
             if self._loop_pause_control(state, record, rtext):
                 return
-            retry_steps = self._loop_audit_plan(record, rtext, "retry")
+            retry_steps = self._loop_audit_plan(record, rtext, "retry", session=session, state=state)
             if retry_steps:
                 record.orchestration = retry_steps
                 print(f"[loop] prepare retry succeeded: {len(record.orchestration)} steps",
@@ -6967,6 +7117,9 @@ class BridgeWS(LoopSourceBridge, LoopEnvironmentBridge, LoopTaskBlockerBridge, L
                 record.stage_details[SUB_PREPARE].update({"status": "retrying", "message": "两次规划均未通过结构校验，将在执行前进行最后一次重规划。"})
                 print(f"[loop] prepare retry also empty — will re-plan at execute stage",
                       file=sys.stderr, flush=True)
+            if record.contract_required and not record.orchestration:
+                if not await self._loop_correct_contract(session, state, record):
+                    return
         record.sub_stage = SUB_EXECUTE
         record.updated_at = time.time()
         self._loop_save(state)
@@ -7073,6 +7226,10 @@ class BridgeWS(LoopSourceBridge, LoopEnvironmentBridge, LoopTaskBlockerBridge, L
         self._loop_save(state)
         self._emit_loop_updated(state)
         steps = record.orchestration
+        if record.contract_required and not steps:
+            if not await self._loop_correct_contract(session, state, record):
+                return
+            steps = record.orchestration
         if steps and any(not str(step.desc or "").strip() for step in steps):
             # 兼容旧 stage：旧解析器可能已持久化只有 index、没有 desc 的步骤。
             # 不允许带着无目标步骤继续执行；保留工作区现状并走下方轻量 re-plan。
@@ -7117,7 +7274,7 @@ class BridgeWS(LoopSourceBridge, LoopEnvironmentBridge, LoopTaskBlockerBridge, L
             )
             if self._loop_pause_control(state, record, rtext):
                 return
-            replan_steps = self._loop_audit_plan(record, rtext, "replan")
+            replan_steps = self._loop_audit_plan(record, rtext, "replan", session=session, state=state)
             if replan_steps:
                 record.orchestration = replan_steps
                 steps = replan_steps
@@ -7126,6 +7283,9 @@ class BridgeWS(LoopSourceBridge, LoopEnvironmentBridge, LoopTaskBlockerBridge, L
                 self._emit_loop_updated(state)
                 print(f"[loop] execute re-plan succeeded: {len(replan_steps)} steps",
                       file=sys.stderr, flush=True)
+            if record.contract_required and not replan_steps:
+                self._loop_contract_wait(state, record, record.contract_validation)
+                return
         if steps:
             # 最后有效 prepare/replan 冻结登记，执行后不能补登记来获取信用。
             attempts = record.stage_details.get(SUB_PREPARE, {}).get('attempts', [])
@@ -7658,7 +7818,8 @@ class BridgeWS(LoopSourceBridge, LoopEnvironmentBridge, LoopTaskBlockerBridge, L
                 state.auto = False
             if not record.delivery:
                 record.stage_details[SUB_ANALYSIS]["validation"].append("缺少有效 delivery 台账，不能据分数收口；下轮需补齐结构化证据。")
-        record.artifact_checkpoint = git_snapshot(session.working_dir)
+        if not await self._loop_startup_snapshot(session, state, record, artifact=True):
+            return
         scored_records = [l for l in state.round_loops() if l.analysis and l.analysis.score_observed]
         if scored_records:
             state.best_seq = max(scored_records, key=lambda l: l.analysis.score).seq
@@ -7717,6 +7878,8 @@ class BridgeWS(LoopSourceBridge, LoopEnvironmentBridge, LoopTaskBlockerBridge, L
 
     def _loop_reduce(self, state, record) -> dict:
         """Persist an explanation before the one existing scheduler consumes it."""
+        if record.openspec_run:
+            return self._loop_openspec_reduce(state, record)
         guard, report = state.progress_guard, record.delivery
         hard = next((b for b in report.get('blockers', []) if b['kind'] in ('global', 'safety', 'authorization')), None)
         code = guard.get('reasonCode', '') if guard.get('pause') else ''
@@ -7965,6 +8128,12 @@ class BridgeWS(LoopSourceBridge, LoopEnvironmentBridge, LoopTaskBlockerBridge, L
 
     def _loop_should_stop(self, state: "LoopState") -> tuple[bool, str]:
         """是否结束 loopexecute、进入全局 loopout（按当前轮计）。"""
+        if openspec_requested(state):
+            if state.risk_coefficient >= state.policy.risk_threshold:
+                return True, '风险系数达到本轮上限'
+            if len(state.round_loops()) >= state.effective_max_loops():
+                return True, '达到最大 loop 约束'
+            return False, ''  # 旧通用评分不影响新 OpenSpec 原任务路径。
         done = [l for l in state.round_loops() if l.analysis and l.analysis.score_observed]
         if not done:
             # 整轮异常可能没有 analysis，也必须受最大次数约束，不能因缺少评分而无限续跑。
@@ -8090,40 +8259,8 @@ class BridgeWS(LoopSourceBridge, LoopEnvironmentBridge, LoopTaskBlockerBridge, L
 
     def _loop_context_digest(self, state: "LoopState") -> str:
         """把当前 loop 持久化状态压成一段只读摘要，喂给旁路问答用。"""
-        lines = [
-            f"阶段(stage): {state.stage}",
-            f"全局目标(goal): {state.goal or '(未定)'}",
-            f"风险系数: {state.risk_coefficient:.2f}　已跑 loop: {len(state.loops)}/{state.effective_max_loops()}",
-            f"最佳分数: {state.best_score():.0f}　最近分数: {state.latest_score():.0f}　状态: {state.status}",
-        ]
-        if state.stage == STAGE_IDEA and state.ideas:
-            lines.append("想法池:")
-            for i in state.ideas:
-                lines.append(f"  - [{i.status}] {i.prompt}")
-        for l in state.loops:
-            sc = f"{l.analysis.score:.0f}" if l.analysis and l.analysis.score_observed else "?"
-            head = f"Loop #{l.seq} [{l.sub_stage}] 累计分数={sc} 增量焦点={l.goal[:60]}"
-            lines.append(head)
-            if l.orchestration:
-                lines.append("  编排: " + "；".join(
-                    f"{s.index}.({s.mode}){s.desc[:40]}" for s in l.orchestration))
-            if l.result:
-                lines.append(f"  结果: {l.result[:300]}")
-            if l.analysis:
-                if l.analysis.verified:
-                    lines.append(f"  已核实: {l.analysis.verified[:300]}")
-                if l.analysis.gaps:
-                    lines.append(f"  剩余缺口: {l.analysis.gaps[:300]}")
-                if l.analysis.next_focus:
-                    lines.append(f"  下一焦点: {l.analysis.next_focus[:200]}")
-                if l.analysis.notes:
-                    lines.append(f"  分析: {l.analysis.notes[:300]}")
-                if l.analysis.challenges:
-                    lines.append(f"  约束: {l.analysis.challenges[:200]}")
-            if l.error:
-                lines.append(f"  错误: {l.error[:200]}")
-        lines.append(self._kit_context_digest(state.session_id))
-        return "\n".join(lines)
+        from .aside_runtime import runtime_evidence
+        return json.dumps(runtime_evidence(state=state), ensure_ascii=False) + '\n' + self._kit_context_digest(state.session_id)
 
     def _rpc_loopAsk(self, session_id: str, question: str, images_json: str = "",
                      attention_json: str = "") -> str:
@@ -8150,11 +8287,7 @@ class BridgeWS(LoopSourceBridge, LoopEnvironmentBridge, LoopTaskBlockerBridge, L
                          image_count=len(images) if images else 0,
                          context_key=attention["key"], context_kind=attention["kind"],
                          context_label=attention["label"], context_detail=attention["detail"])
-        state.asides.append(turn)
-        self._loop_save(state)
-        self._emit_loop_updated(state)
-        asyncio.ensure_future(self._run_aside(session_id, turn.id, images, attention))
-        return json.dumps({"status": "ok", "turnId": turn.id}, ensure_ascii=False)
+        return self._accept_inspection(state, turn, images, attention, True)
 
     def _rpc_loopAsideList(self, session_id: str) -> str:
         state = self._loop_state(session_id)
@@ -8187,14 +8320,7 @@ class BridgeWS(LoopSourceBridge, LoopEnvironmentBridge, LoopTaskBlockerBridge, L
         return json.dumps({"status": "ok", "cleared": cleared}, ensure_ascii=False)
 
     def _rpc_loopAsideAbort(self, session_id: str) -> str:
-        self._cancel_skill_manual_answer(f"{session_id}:aside")
-        backend = self._loop_active_backends.get(f"{session_id}:aside")
-        if backend is not None:
-            try:
-                backend.abort(f"{session_id}:aside")
-            except Exception:
-                pass
-        return json.dumps({"status": "ok", "aborting": backend is not None}, ensure_ascii=False)
+        return self._cancel_inspection(session_id, True)
 
     @staticmethod
     def _parse_images_json(images_json: str) -> Optional[list["ImageAttachment"]]:
@@ -8266,7 +8392,7 @@ class BridgeWS(LoopSourceBridge, LoopEnvironmentBridge, LoopTaskBlockerBridge, L
             return ""
         return await asyncio.to_thread(self._skill_store.manuals().context, names)
 
-    async def _skill_reference_snapshot(self, question: str, session: Session) -> str:
+    async def _skill_reference_snapshot(self, question: str, session: Session, *, inspect_project: bool = True) -> str:
         """答疑的真实名称/绑定/命令清单，只读当前执行端；不运行 CLI 或扩展工具。"""
         import copy
         from .aside_context import project_reference_snapshot
@@ -8287,7 +8413,10 @@ class BridgeWS(LoopSourceBridge, LoopEnvironmentBridge, LoopTaskBlockerBridge, L
             project_commands = [{key: entry[key] for key in ('name', 'description', 'unavailableReason')}
                                 for entry in catalog['commands'] if entry.get('kind') == 'project'
                                 and set(entry.get('ownerSkillIds', [])) & set(members)]
-            facts = {'sessionProject': project_reference_snapshot(snapshot),
+            project = project_reference_snapshot(snapshot) if inspect_project else {
+                'sessionId': snapshot.id, 'title': snapshot.title, 'workingDirectory': snapshot.working_dir,
+                'inspection': 'on_demand_readonly', 'note': '项目正文由本次受限查询按需读取，不限于此界面上下文。'}
+            facts = {'sessionProject': project,
                      'referenceLabels': labels,
                      'referencedSkills': [{'name': name, 'enabledInSession': name in bound} for name in members],
                      'registeredCommandsForReferences': entries,
@@ -8380,119 +8509,7 @@ class BridgeWS(LoopSourceBridge, LoopEnvironmentBridge, LoopTaskBlockerBridge, L
     async def _run_aside(self, session_id: str, turn_id: str,
                          images: Optional[list["ImageAttachment"]] = None,
                          attention: Optional[dict[str, str]] = None) -> None:
-        session = self._active_sessions.get(session_id) or self._session_store.load(session_id)
-        state = self._loop_state(session_id)
-        if not session or not state:
-            return
-        turn = next((t for t in state.asides if t.id == turn_id), None)
-        if not turn:
-            return
-        self._aside_running.add(session_id)
-        try:
-            digest = self._loop_context_digest(state)
-            manual_content = await self._skill_reference_content(turn.question, images)
-            attention = attention or {
-                "key": turn.context_key, "kind": turn.context_kind,
-                "label": turn.context_label, "detail": turn.context_detail, "content": "",
-            }
-            # 只带相同注意力对象的最近历史，切换文件/面板时不串线。
-            related_history = [
-                t for t in state.asides[:-1]
-                if t.context_key == turn.context_key and t.status == "done" and t.answer
-            ][-4:]
-            history = "\n".join(
-                f"问：{t.question}\n答：{t.answer}"
-                for t in related_history
-            )
-            prompt = (
-                "你是 AgentWithU 的全局注意力伴随助手“俺寻思”。下面同时给出 Session/LOOP 主线摘要"
-                "和 UI 已确认的当前关注对象。用户说‘这个’、‘这里’、‘当前文件’时，优先指向该对象；"
-                "不要声称看到了快照之外的界面内容。请仅基于快照和常识回答——不要执行 loop、不要改动任务、"
-                "不要使用工具修改文件，只做解读、答疑和建议。\n\n"
-                f"===== Loop 状态快照 =====\n{digest}\n========================\n\n"
-                f"===== 当前注意力 =====\n{self._attention_prompt_block(attention)}\n========================\n\n"
-                + (f"【最近的旁路问答】\n{history}\n\n" if history else "")
-                + f"【用户的问题】\n{turn.question}"
-            )
-            if manual_content:
-                facts = await self._skill_reference_snapshot(turn.question, session)
-                prompt += "\n\n【显式引用的 Skill 使用资料】\n" + manual_content + "\n\n" + facts
-            else:
-                prompt = self._build_session_reference_context(prompt, session.id)
-            parts: list[str] = []
-
-            def on_delta(delta: StreamDelta):
-                if delta.type == "text_delta" and delta.text:
-                    parts.append(delta.text)
-                    self._emit_aside_delta(session_id, turn_id, delta.text)
-                elif delta.type == "error" and delta.error:
-                    self._emit_aside_delta(session_id, turn_id, f"\n❌ {delta.error}\n")
-
-            # 旁路问答也可走专用 backend（独立上下文，安全）
-            aside_backend_id = state.policy.backend_for("aside") if state else ""
-            backend = None
-            backend_config_id = aside_backend_id or session.backend_id
-            if aside_backend_id and aside_backend_id != session.backend_id:
-                try:
-                    backend = self._new_backend_instance(aside_backend_id)
-                except Exception:
-                    backend = None
-                    backend_config_id = session.backend_id
-            if backend is None:
-                backend_config_id = session.backend_id
-                backend = self._new_backend_instance(session.backend_id)
-            aside_sid = f"{session_id}:aside"
-            try:
-                self._loop_active_backends[aside_sid] = backend
-                print(
-                    f"[loop] isolated aside backend call: cfg={backend_config_id!r}, "
-                    f"session={session.id!r}, call_sid={aside_sid!r}",
-                    file=sys.stderr, flush=True,
-                )
-                aside_kwargs = {
-                    "messages": [], "content": prompt, "images": images,
-                    "session_id": aside_sid, "message_id": new_id(), "on_delta": on_delta,
-                    "agent_session_id": None,       # ★ 独立上下文，绝不 resume loop 主线
-                    "working_dir": session.working_dir,
-                    "skip_permissions": True,
-                    "sandbox_enabled": session.sandbox_enabled,
-                }
-                self._add_runtime_kwargs(
-                    backend, aside_kwargs,
-                    self._loop_runtime(session, state, "aside", backend_config_id), session,
-                )
-                if manual_content:
-                    await self._send_skill_manual_answer(backend, aside_kwargs)
-                else:
-                    await backend.send_message(**aside_kwargs)
-            finally:
-                backend.clear_cancelled(aside_sid)
-                if self._loop_active_backends.get(aside_sid) is backend:
-                    self._loop_active_backends.pop(aside_sid, None)
-
-            # 共享缓存对象，重新取一遍 turn 即可
-            state = self._loop_state(session_id) or state
-            turn = next((t for t in state.asides if t.id == turn_id), None)
-            if not turn:
-                return
-            answer = "".join(parts).strip()
-            turn.answer = answer or "(无输出)"
-            turn.status = "done" if answer else "error"
-            turn.updated_at = time.time()
-            self._loop_save(state)
-            self._emit_loop_updated(state)
-        except Exception as e:
-            import traceback
-            print(f"[loop] aside failed: {e}\n{traceback.format_exc()}",
-                  file=sys.stderr, flush=True)
-            t = next((t for t in (state.asides if state else []) if t.id == turn_id), None)
-            if t:
-                t.status = "error"
-                t.answer = (t.answer or "") + f"\n❌ {e}"
-                self._loop_save(state)
-                self._emit_loop_updated(state)
-        finally:
-            self._aside_running.discard(session_id)
+        await self._run_inspection_turn(session_id, turn_id, images, attention, True)
 
     # ══════════════════════════════════════════════════════════════
     #  普通 session 侧挂：序列任务队列 + by-the-way 旁路问答
@@ -12388,14 +12405,7 @@ Kit 版本账本（版本属于 Kit，不属于 AI）：
         return json.dumps({"status": "ok", "asideBackendId": ex.aside_backend_id}, ensure_ascii=False)
 
     def _rpc_chatAsideAbort(self, session_id: str) -> str:
-        self._cancel_skill_manual_answer(f"{session_id}:chataside")
-        backend = self._loop_active_backends.get(f"{session_id}:chataside")
-        if backend is not None:
-            try:
-                backend.abort(f"{session_id}:chataside")
-            except Exception:
-                pass
-        return json.dumps({"status": "ok", "aborting": backend is not None}, ensure_ascii=False)
+        return self._cancel_inspection(session_id, False)
 
     def _chat_context_digest(self, session: "Session", max_msgs: int = 8) -> str:
         """普通会话与 Workspace Kit 的只读摘要，喂给 Session 管家（不污染主线）。"""
@@ -12430,117 +12440,12 @@ Kit 版本账本（版本属于 Kit，不属于 AI）：
                          image_count=len(images) if images else 0,
                          context_key=attention["key"], context_kind=attention["kind"],
                          context_label=attention["label"], context_detail=attention["detail"])
-        ex.asides.append(turn)
-        self._chat_extras_save(ex)
-        self._emit_chat_aside_updated(ex)
-        asyncio.ensure_future(self._run_chat_aside(session_id, turn.id, images, attention))
-        return json.dumps({"status": "ok", "turnId": turn.id}, ensure_ascii=False)
+        return self._accept_inspection(ex, turn, images, attention, False)
 
     async def _run_chat_aside(self, session_id: str, turn_id: str,
                               images: Optional[list["ImageAttachment"]] = None,
                               attention: Optional[dict[str, str]] = None) -> None:
-        session = self._active_sessions.get(session_id) or self._session_store.load(session_id)
-        ex = self._chat_extras_get(session_id)
-        if not session:
-            return
-        turn = next((t for t in ex.asides if t.id == turn_id), None)
-        if not turn:
-            return
-        self._chat_aside_running.add(session_id)
-        try:
-            digest = self._chat_context_digest(session)
-            manual_content = await self._skill_reference_content(turn.question, images)
-            attention = attention or {
-                "key": turn.context_key, "kind": turn.context_kind,
-                "label": turn.context_label, "detail": turn.context_detail, "content": "",
-            }
-            related_history = [
-                t for t in ex.asides[:-1]
-                if t.context_key == turn.context_key and t.status == "done" and t.answer
-            ][-4:]
-            history = "\n".join(
-                f"问：{t.question}\n答：{t.answer}"
-                for t in related_history
-            )
-            prompt = (
-                "你是 AgentWithU 的全局注意力伴随助手“俺寻思”。下面同时给出 Session 摘要和 UI 已确认的"
-                "当前关注对象。用户说‘这个’、‘这里’、‘当前文件’时，优先指向该对象；"
-                "不要声称看到了快照之外的界面内容。请基于摘要与常识作答，可解释 Kit 状态、"
-                "文件或当前面板以及下一步编排；"
-                "这是只读旁路，不要声称已经执行或改动主线任务。\n\n"
-                f"===== 最近对话摘要 =====\n{digest}\n========================\n\n"
-                f"===== 当前注意力 =====\n{self._attention_prompt_block(attention)}\n========================\n\n"
-                + (f"【最近的旁路问答】\n{history}\n\n" if history else "")
-                + f"【用户的问题】\n{turn.question}"
-            )
-            if manual_content:
-                facts = await self._skill_reference_snapshot(turn.question, session)
-                prompt += "\n\n【显式引用的 Skill 使用资料】\n" + manual_content + "\n\n" + facts
-            else:
-                prompt = self._build_session_reference_context(prompt, session.id)
-            parts: list[str] = []
-
-            def on_delta(delta: StreamDelta):
-                if delta.type == "text_delta" and delta.text:
-                    parts.append(delta.text)
-                    self._emit_chat_aside_delta(session_id, turn_id, delta.text)
-                elif delta.type == "error" and delta.error:
-                    self._emit_chat_aside_delta(session_id, turn_id, f"\n❌ {delta.error}\n")
-
-            # 独立实例允许俺寻思与主对话并行，并拥有自己的取消边界。
-            backend = None
-            aside_bid = (ex.aside_backend_id or "").strip()
-            if aside_bid and aside_bid != session.backend_id:
-                try:
-                    backend = self._new_backend_instance(aside_bid)
-                except Exception:
-                    backend = None
-            if backend is None:
-                backend = self._new_backend_instance(session.backend_id)
-            aside_sid = f"{session_id}:chataside"
-            try:
-                self._loop_active_backends[aside_sid] = backend
-                aside_kwargs = {
-                    "messages": [], "content": prompt, "images": images,
-                    "session_id": aside_sid, "message_id": new_id(), "on_delta": on_delta,
-                    "agent_session_id": None,       # ★ 独立上下文，绝不 resume 主线
-                    "working_dir": session.working_dir,
-                    "skip_permissions": True,
-                    "sandbox_enabled": session.sandbox_enabled,
-                }
-                self._add_runtime_kwargs(backend, aside_kwargs, self._session_runtime(session), session)
-                if manual_content:
-                    await self._send_skill_manual_answer(backend, aside_kwargs)
-                else:
-                    await backend.send_message(**aside_kwargs)
-            finally:
-                backend.clear_cancelled(aside_sid)
-                if self._loop_active_backends.get(aside_sid) is backend:
-                    self._loop_active_backends.pop(aside_sid, None)
-
-            ex = self._chat_extras_get(session_id)
-            turn = next((t for t in ex.asides if t.id == turn_id), None)
-            if not turn:
-                return
-            answer = "".join(parts).strip()
-            turn.answer = answer or "(无输出)"
-            turn.status = "done" if answer else "error"
-            turn.updated_at = time.time()
-            self._chat_extras_save(ex)
-            self._emit_chat_aside_updated(ex)
-        except Exception as e:
-            import traceback
-            print(f"[chat] aside failed: {e}\n{traceback.format_exc()}",
-                  file=sys.stderr, flush=True)
-            ex = self._chat_extras_get(session_id)
-            t = next((t for t in ex.asides if t.id == turn_id), None)
-            if t:
-                t.status = "error"
-                t.answer = (t.answer or "") + f"\n❌ {e}"
-                self._chat_extras_save(ex)
-                self._emit_chat_aside_updated(ex)
-        finally:
-            self._chat_aside_running.discard(session_id)
+        await self._run_inspection_turn(session_id, turn_id, images, attention, False)
 
     # ── RPC: 后端配置 ────────────────────────────────────────────
 
@@ -12640,9 +12545,23 @@ Kit 版本账本（版本属于 Kit，不属于 AI）：
 
     async def _rpc_codexModelCatalog(self, backend_id: str) -> str:
         """只读查询当前节点的指定 Backend，不能从缺失 ID 回退默认 Backend。"""
+        self._require_node_update_capability()
+        return await self._codex_model_catalog(backend_id)
+
+    async def _rpc_codexSessionModelCatalog(self, session_id: str, backend_id: str) -> str:
+        """会话用户可读可选 Backend 能力；不授予节点配置修改权限。"""
+        self._require_session_access(session_id)
+        session = self._active_sessions.get(session_id) or self._session_store.load(session_id)
+        if not session:
+            raise PermissionError("Session is unavailable for the current user")
+        if session.codex_connection_mode == "ssh":
+            return json.dumps({"status": "error", "code": "unsupported",
+                               "message": "SSH Codex 的能力查询暂不支持；不会改查本机。"}, ensure_ascii=False)
+        return await self._codex_model_catalog(backend_id, session.working_dir)
+
+    async def _codex_model_catalog(self, backend_id: str, working_dir: str = "") -> str:
         from .codex_model_catalog import CatalogError, query_codex_catalog
 
-        self._require_node_update_capability()
         cfg = next((item for item in self._backend_configs if item.id == backend_id), None)
         if not cfg or cfg.type != BackendType.CODEX_OFFICIAL:
             return json.dumps({"status": "error", "code": "backend", "message": "请选择已保存的 Codex Backend。"}, ensure_ascii=False)
@@ -12655,7 +12574,7 @@ Kit 版本账本（版本属于 Kit，不属于 AI）：
                 resolve_codex_cli(cfg.cli_path), backend._build_env(),
                 (["--enable", "respect_system_proxy"] if backend._system_proxy_enabled() else [])
                 + backend._http_provider_args(),
-                cwd=cfg.working_dir or None,
+                cwd=working_dir or cfg.working_dir or None,
             )
         except CatalogError as exc:
             result = {"status": "error", "code": exc.code, "message": str(exc)}
@@ -14393,6 +14312,125 @@ except urllib.error.URLError as e:
 
     # ── RPC: 数据导入导出 ────────────────────────────────────────
 
+    def _build_data_export_archive(self, target_path: str) -> None:
+        """在当前执行端生成完整导出包；调用方决定如何把包交给客户端。"""
+        import tarfile
+        import tempfile
+        from pathlib import Path
+
+        target = Path(target_path)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmppath = Path(tmpdir)
+            backends_json = tmppath / "backends.json"
+            backends_json.write_text(
+                self._backend_store.export_json(
+                    configs=self._backend_configs,
+                    envelope=False,
+                ),
+                encoding="utf-8",
+            )
+            prompts_tar = tmppath / "prompt-library.tar.gz"
+            self._prompt_store.export_library(str(prompts_tar))
+            skills_tar = tmppath / "skill-library.tar.gz"
+            self._skill_store.export_library(str(skills_tar))
+            with tarfile.open(target, "w:gz") as tar:
+                if backends_json.exists():
+                    tar.add(backends_json, arcname="backends.json")
+                if prompts_tar.exists():
+                    tar.add(prompts_tar, arcname="prompt-library.tar.gz")
+                if skills_tar.exists():
+                    tar.add(skills_tar, arcname="skill-library.tar.gz")
+
+    def _cleanup_data_export_transfers(self, *, owner: str = "", max_age: float = 900.0) -> None:
+        import time
+        cutoff = time.time() - max_age
+        for transfer_id, transfer in list(self._data_export_transfers.items()):
+            if (owner and transfer.get("owner") == owner) or float(transfer.get("created", 0)) < cutoff:
+                self._data_export_transfers.pop(transfer_id, None)
+                try:
+                    transfer["path"].unlink(missing_ok=True)
+                except OSError:
+                    pass
+
+    async def _rpc_exportDataStart(self) -> str:
+        """生成一次性导出包，返回客户端分块下载所需的传输元数据。"""
+        import hashlib
+        import os
+        import tempfile
+        import time
+        from pathlib import Path
+
+        owner = str(_REQUEST_OWNER_ID.get() or "local")
+        self._cleanup_data_export_transfers()
+        if sum(1 for transfer in self._data_export_transfers.values() if transfer.get("owner") == owner) >= 4:
+            return json.dumps({"status": "error", "message": "已有过多未完成的数据导出，请稍后重试"}, ensure_ascii=False)
+        fd, raw_path = tempfile.mkstemp(prefix="awu-export-", suffix=".tar.gz")
+        os.close(fd)
+        path = Path(raw_path)
+        try:
+            await asyncio.to_thread(self._build_data_export_archive, str(path))
+            def hash_archive() -> str:
+                hasher = hashlib.sha256()
+                with path.open("rb") as stream:
+                    for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                        hasher.update(chunk)
+                return hasher.hexdigest()
+            digest = await asyncio.to_thread(hash_archive)
+            transfer_id = new_id().replace("-", "")
+            size = path.stat().st_size
+            self._data_export_transfers[transfer_id] = {
+                "owner": owner, "path": path, "size": size, "sha256": digest, "created": time.time(),
+            }
+            return json.dumps({
+                "status": "ok",
+                "transferId": transfer_id,
+                "fileName": f"agent-with-u-export-{time.strftime('%Y-%m-%d')}.tar.gz",
+                "size": size,
+                "sha256": digest,
+            }, ensure_ascii=False)
+        except Exception as exc:
+            path.unlink(missing_ok=True)
+            return json.dumps({"status": "error", "message": str(exc)}, ensure_ascii=False)
+
+    def _data_export_transfer(self, transfer_id: str) -> dict[str, Any]:
+        if not re.fullmatch(r"[A-Za-z0-9_-]{8,80}", str(transfer_id or "")):
+            raise ValueError("导出传输标识无效")
+        transfer = self._data_export_transfers.get(transfer_id)
+        if not transfer or transfer.get("owner") != str(_REQUEST_OWNER_ID.get() or "local"):
+            raise ValueError("导出传输不存在或已过期")
+        return transfer
+
+    def _rpc_exportDataChunk(self, transfer_id: str, offset: int, size: int) -> str:
+        """读取导出包的一块；单块不超过 1 MiB。"""
+        try:
+            transfer = self._data_export_transfer(transfer_id)
+            offset, size = int(offset), int(size)
+            if offset < 0 or size <= 0 or size > 1024 * 1024:
+                raise ValueError("导出分块范围无效")
+            total = int(transfer["size"])
+            if offset > total:
+                raise ValueError("导出分块偏移超出文件范围")
+            with transfer["path"].open("rb") as stream:
+                stream.seek(offset)
+                data = stream.read(size)
+            return json.dumps({
+                "status": "ok", "offset": offset, "size": len(data), "total": total,
+                "eof": offset + len(data) >= total,
+                "data": base64.b64encode(data).decode("ascii"),
+            }, ensure_ascii=False)
+        except Exception as exc:
+            return json.dumps({"status": "error", "message": str(exc)}, ensure_ascii=False)
+
+    def _rpc_exportDataFinish(self, transfer_id: str) -> str:
+        """确认或取消传输；两种情况都立即清理执行端临时包。"""
+        try:
+            transfer = self._data_export_transfer(transfer_id)
+            self._data_export_transfers.pop(transfer_id, None)
+            transfer["path"].unlink(missing_ok=True)
+            return json.dumps({"status": "ok"}, ensure_ascii=False)
+        except Exception as exc:
+            return json.dumps({"status": "error", "message": str(exc)}, ensure_ascii=False)
+
     async def _rpc_exportData(self, target_path: str) -> str:
         """
         导出 = Backends 配置 + Repo（Prompts + Skills）。
@@ -14400,29 +14438,7 @@ except urllib.error.URLError as e:
         ⚠️ 不包含 skill-secrets（凭据永不外带）。
         """
         try:
-            import tarfile, tempfile
-            from pathlib import Path
-            with tempfile.TemporaryDirectory() as tmpdir:
-                tmppath = Path(tmpdir)
-                backends_json = tmppath / "backends.json"
-                backends_json.write_text(
-                    self._backend_store.export_json(
-                        configs=self._backend_configs,
-                        envelope=False,
-                    ),
-                    encoding="utf-8",
-                )
-                prompts_tar = tmppath / "prompt-library.tar.gz"
-                self._prompt_store.export_library(str(prompts_tar))
-                skills_tar = tmppath / "skill-library.tar.gz"
-                self._skill_store.export_library(str(skills_tar))
-                with tarfile.open(target_path, "w:gz") as tar:
-                    if backends_json.exists():
-                        tar.add(backends_json, arcname="backends.json")
-                    if prompts_tar.exists():
-                        tar.add(prompts_tar, arcname="prompt-library.tar.gz")
-                    if skills_tar.exists():
-                        tar.add(skills_tar, arcname="skill-library.tar.gz")
+            await asyncio.to_thread(self._build_data_export_archive, target_path)
             return json.dumps({"status": "ok", "message": "导出成功"}, ensure_ascii=False)
         except Exception as e:
             return json.dumps({"status": "error", "message": str(e)}, ensure_ascii=False)
@@ -14474,7 +14490,7 @@ except urllib.error.URLError as e:
         self, path: str, working_dir: str = "", include_hidden: bool = False,
     ) -> str:
         """列出目录内容，供前端文件树与 @ 文件引用选择器使用。
-        返回 [{name, path, isDir}, ...] 目录优先，字母序排列。默认跳过隐藏
+        返回 [{name, path, isDir, size, mtime}, ...] 目录优先，字母序排列。默认跳过隐藏
         文件；Session 文件面板可显式传 include_hidden=True，以便展示和传输
         ``.git`` 等点号目录。
         path 相对于 working_dir 返回相对路径；不允许越过 working_dir 上级。
@@ -14525,6 +14541,8 @@ except urllib.error.URLError as e:
                         "name": entry.name,
                         "path": rel,
                         "isDir": entry.is_dir(),
+                        # 目录不递归统计大小；普通文件直接复用上面的 stat 结果。
+                        "size": info.st_size if stat.S_ISREG(info.st_mode) else None,
                         # 未做整目录哈希比对时，也能展示未下载远端文件的修改时间。
                         "mtime": (
                             int(info.st_mtime_ns // 1_000_000)
@@ -15578,8 +15596,8 @@ except urllib.error.URLError as e:
         runtime: dict = {}
         if isinstance(session.model_override, str) and session.model_override.strip():
             runtime["model"] = session.model_override.strip()
-        effort = str(session.reasoning_effort or "").strip().lower()
-        if effort in LoopPolicy.REASONING_EFFORTS:
+        effort = LoopPolicy._clean_runtime({"reasoningEffort": session.reasoning_effort}).get("reasoningEffort")
+        if effort:
             runtime["reasoningEffort"] = effort
         return runtime
 
@@ -15616,7 +15634,6 @@ except urllib.error.URLError as e:
         # 未显式覆盖时 Codex 可能从自己的 config.toml 取值；这里不猜测，
         # 只记录 AgentWithU 确实传给 CLI 的档位。
         effort = raw.get("reasoningEffort") if cfg.type == BackendType.CODEX_OFFICIAL else ""
-        effort = effort if effort in LoopPolicy.REASONING_EFFORTS else ""
         out: dict = {}
         if model:
             out["model"] = model

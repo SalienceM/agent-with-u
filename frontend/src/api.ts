@@ -396,15 +396,15 @@ type LoopUpdatedCallback = (state: any, executor: string) => void;
 let loopUpdatedCallbacks: LoopUpdatedCallback[] = [];
 type LoopProgressCallback = (data: { sessionId: string; seq: number; subStage: string; text: string; diagnostic?: import('./utils/loopDiagnostics').CallDiagnostic }, executor: string) => void;
 let loopProgressCallbacks: LoopProgressCallback[] = [];
-type LoopAsideDeltaCallback = (data: { sessionId: string; turnId: string; text: string }) => void;
+type LoopAsideDeltaCallback = (data: { sessionId: string; turnId: string; text: string }, execKey?: string) => void;
 let loopAsideDeltaCallbacks: LoopAsideDeltaCallback[] = [];
 
 // ── 普通 session 侧挂：序列任务 + by-the-way ──────────────────
 type SeqtaskUpdatedCallback = (data: { sessionId: string; seqTasks: any[]; seqAuto: boolean; seqError?: string }) => void;
 let seqtaskUpdatedCallbacks: SeqtaskUpdatedCallback[] = [];
-type ChatAsideDeltaCallback = (data: { sessionId: string; turnId: string; text: string }) => void;
+type ChatAsideDeltaCallback = (data: { sessionId: string; turnId: string; text: string }, execKey?: string) => void;
 let chatAsideDeltaCallbacks: ChatAsideDeltaCallback[] = [];
-type ChatAsideUpdatedCallback = (data: { sessionId: string; asides: any[]; asideBackendId?: string }) => void;
+type ChatAsideUpdatedCallback = (data: { sessionId: string; asides: any[]; asideBackendId?: string }, execKey?: string) => void;
 let chatAsideUpdatedCallbacks: ChatAsideUpdatedCallback[] = [];
 type KitUpdatedCallback = (data: WorkspaceKitState) => void;
 let kitUpdatedCallbacks: KitUpdatedCallback[] = [];
@@ -1014,16 +1014,16 @@ function handleMessage(e: MessageEvent, source?: Conn) {
       loopProgressCallbacks.forEach((cb) => cb(data, source?.key || 'local'));
     } else if (msg.event === 'loopAsideDelta') {
       const data = JSON.parse(msg.data);
-      loopAsideDeltaCallbacks.forEach((cb) => cb(data));
+      loopAsideDeltaCallbacks.forEach((cb) => cb(data, source?.key || 'local'));
     } else if (msg.event === 'seqtaskUpdated') {
       const data = JSON.parse(msg.data);
       seqtaskUpdatedCallbacks.forEach((cb) => cb(data));
     } else if (msg.event === 'chatAsideDelta') {
       const data = JSON.parse(msg.data);
-      chatAsideDeltaCallbacks.forEach((cb) => cb(data));
+      chatAsideDeltaCallbacks.forEach((cb) => cb(data, source?.key || 'local'));
     } else if (msg.event === 'chatAsideUpdated') {
       const data = JSON.parse(msg.data);
-      chatAsideUpdatedCallbacks.forEach((cb) => cb(data));
+      chatAsideUpdatedCallbacks.forEach((cb) => cb(data, source?.key || 'local'));
     } else if (msg.event === 'kitUpdated') {
       const data = JSON.parse(msg.data);
       kitUpdatedCallbacks.forEach((cb) => cb(data));
@@ -1960,7 +1960,15 @@ initPool();
 
 // ── RPC 调用（按 session 归属路由到对应执行节点）──────────────────────
 
+const boundedLoopMutations = new Set(['loopSetAuto', 'loopContinue', 'loopAdvanceToOut', 'loopDiscard', 'loopSetGoal',
+    'loopSetPolicy', 'loopAddAddon', 'loopEditAddon', 'loopRemoveAddon', 'loopSubmitIdea', 'loopRemoveIdea',
+    'loopSealIdea', 'loopRefineGoal', 'loopDismissIntent']);
 async function call(method: string, ...params: any[]): Promise<any> {
+  if (boundedLoopMutations.has(method)) {
+    const target = sessionExec.get(params[0]);
+    if (!target) throw new Error('Session 的执行节点未知，未提交操作');
+    return callOnStrict(target, method, params, 12000);
+  }
   await homeConn.ready;
   try {
     return await routeConn(method, params).request(method, params);
@@ -2013,6 +2021,13 @@ async function callOnStrict(
 ): Promise<any> {
   const connection = connByKey(execKey);
   return requestWithReadiness(connection, method, params, timeoutMs);
+}
+
+/** 旁路查询固定当前 Session 节点；未确定/离线不回退 home。 */
+async function asideCall(method: string, sessionId: string, params: any[], execKey?: string): Promise<any> {
+  const target = execKey || sessionExec.get(sessionId);
+  if (!target) throw new Error('Session 执行节点未知，未提交旁路请求');
+  return callOnStrict(target, method, [sessionId, ...params], 12000);
 }
 
 export function loopControlTarget(session: string, executor?: string): ControlTarget {
@@ -2744,6 +2759,17 @@ export const api = {
     }
   },
 
+  async codexRuntimeCatalog(backendId: string, execKey?: string, sessionId?: string): Promise<unknown> {
+    const target = execKey || getSessionExecKey(sessionId);
+    if (!target) throw new Error('执行节点未知，未读取 Codex 档位。');
+    const user = getCurrentUserProfile().userId, epoch = relayIdentityEpoch;
+    const result = await callOnStrict(target, sessionId ? 'codexSessionModelCatalog' : 'codexModelCatalog',
+      sessionId ? [sessionId, backendId] : [backendId], 35_000);
+    if (getCurrentUserProfile().userId !== user || relayIdentityEpoch !== epoch
+      || (sessionId && getSessionExecKey(sessionId) !== target)) throw new Error('查询身份已变化。');
+    return JSON.parse(result);
+  },
+
   async poeAccountOverview(apiKey = '', execKey?: string): Promise<PoeAccountOverview> {
     const result = execKey
       ? await callOnStrict(execKey, 'poeAccountOverview', [apiKey], 30_000)
@@ -2925,8 +2951,10 @@ export const api = {
   },
 
   // ── 可视化 Loop 集成 ────────────────────────────────────────
-  async loopTaskSourceDiscover(sessionId: string): Promise<LoopSourceResponse> {
-    return JSON.parse(await call('loopTaskSourceDiscover', sessionId));
+  async loopTaskSourceDiscover(sessionId: string, execKey?: string): Promise<LoopSourceResponse> {
+    const target = execKey || sessionExec.get(sessionId);
+    if (!target) throw new Error('Session 的执行节点未知，请刷新后重试');
+    return JSON.parse(await callOnStrict(target, 'loopTaskSourceDiscover', [sessionId]));
   },
   async loopExecutionEnvironmentGet(sessionId: string, execKey?: string): Promise<import('./types/loopEnvironment').EnvironmentResponse> {
     const target = execKey || sessionExec.get(sessionId);
@@ -2943,12 +2971,16 @@ export const api = {
     if (!target) throw new Error('Session 的执行节点未知，请刷新后重试');
     return JSON.parse(await callOnStrict(target, 'loopExecutionEnvironmentSelectWorkflow', [sessionId, command, digest, revision], 15000));
   },
-  async loopTaskSourceGet(sessionId: string): Promise<LoopSourceResponse> {
-    return JSON.parse(await call('loopTaskSourceGet', sessionId));
+  async loopTaskSourceGet(sessionId: string, execKey?: string): Promise<LoopSourceResponse> {
+    const target = execKey || sessionExec.get(sessionId);
+    if (!target) throw new Error('Session 的执行节点未知，请刷新后重试');
+    return JSON.parse(await callOnStrict(target, 'loopTaskSourceGet', [sessionId]));
   },
   async loopTaskSourceSet(sessionId: string, action: 'bind' | 'unbind' | 'confirm' | 'refresh', revision: number,
-    executor: string, change = '', discoveryId = '', disposition = ''): Promise<LoopSourceResponse> {
-    return JSON.parse(await call('loopTaskSourceSet', sessionId, action, revision, executor, change, discoveryId, disposition));
+    executor: string, change = '', discoveryId = '', disposition = '', execKey?: string): Promise<LoopSourceResponse> {
+    const target = execKey || sessionExec.get(sessionId);
+    if (!target) throw new Error('Session 的执行节点未知，请刷新后重试');
+    return JSON.parse(await callOnStrict(target, 'loopTaskSourceSet', [sessionId, action, revision, executor, change, discoveryId, disposition]));
   },
   async loopGetState(sessionId: string, execKey?: string): Promise<any | null> {
     const result = execKey ? await callOnStrict(execKey, 'loopGetState', [sessionId, true]) : await call('loopGetState', sessionId, true);
@@ -3024,8 +3056,10 @@ export const api = {
     try { return JSON.parse(result); } catch { return { status: 'error' }; }
   },
 
-  async loopRunIteration(sessionId: string): Promise<{ status: string; message?: string }> {
-    const result = await call('loopRunIteration', sessionId);
+  async loopRunIteration(sessionId: string, execKey?: string): Promise<{ status: string; message?: string }> {
+    const target = execKey || sessionExec.get(sessionId);
+    if (!target) throw new Error('Session 的执行节点未知，请刷新后重试');
+    const result = await callOnStrict(target, 'loopRunIteration', [sessionId], 12000);
     try { return JSON.parse(result); } catch { return { status: 'error', message: '响应解析失败' }; }
   },
 
@@ -3053,24 +3087,37 @@ export const api = {
   },
 
   /** “俺寻思”旁路提问：基于 LOOP 状态和当前 UI 注意力，不污染主线上下文。 */
-  async loopAsk(sessionId: string, question: string, images?: any[], attention?: Record<string, unknown>): Promise<{ status: string; turnId?: string; message?: string }> {
+  async loopAsk(sessionId: string, question: string, images?: any[], attention?: Record<string, unknown>, execKey?: string): Promise<{ status: string; turnId?: string; message?: string }> {
     const imagesJson = images && images.length ? JSON.stringify(images) : '';
-    const result = await call('loopAsk', sessionId, question, imagesJson, attention ? JSON.stringify(attention) : '');
+    const result = await asideCall('loopAsk', sessionId, [question, imagesJson, attention ? JSON.stringify(attention) : ''], execKey);
     try { return JSON.parse(result); } catch { return { status: 'error', message: '响应解析失败' }; }
   },
 
-  async loopAsideList(sessionId: string): Promise<{ status: string; asides: any[]; asideBackendId?: string; message?: string }> {
-    const result = await call('loopAsideList', sessionId);
+  async loopRepairTaskContract(sessionId: string, payload: import('./types/loopContract').RepairRequest, execKey: string): Promise<import('./types/loopContract').RepairResponse> {
+    if (!execKey) throw new Error('执行节点未知；不会回退或运行普通迭代');
+    return JSON.parse(await callOnStrict(execKey, 'loopRepairTaskContract', [sessionId, JSON.stringify(payload)], 12000));
+  },
+  async loopTaskContractRepairGet(sessionId: string, requestId: string, execKey: string): Promise<import('./types/loopContract').RepairResponse> {
+    if (!execKey) throw new Error('执行节点未知；不会回退');
+    return JSON.parse(await callOnStrict(execKey, 'loopTaskContractRepairGet', [sessionId, requestId], 12000));
+  },
+  async loopCancelTaskContractRepair(sessionId: string, requestId: string, execKey: string): Promise<import('./types/loopContract').RepairResponse> {
+    if (!execKey) throw new Error('执行节点未知；不会回退');
+    return JSON.parse(await callOnStrict(execKey, 'loopCancelTaskContractRepair', [sessionId, requestId], 12000));
+  },
+
+  async loopAsideList(sessionId: string, execKey?: string): Promise<{ status: string; asides: any[]; asideBackendId?: string; message?: string }> {
+    const result = await asideCall('loopAsideList', sessionId, [], execKey);
     try { return JSON.parse(result); } catch { return { status: 'error', asides: [], message: '历史响应解析失败' }; }
   },
 
-  async loopAsideClear(sessionId: string, contextKey: string = ''): Promise<{ status: string; cleared?: number; message?: string }> {
-    const result = await call('loopAsideClear', sessionId, contextKey);
+  async loopAsideClear(sessionId: string, contextKey: string = '', execKey?: string): Promise<{ status: string; cleared?: number; message?: string }> {
+    const result = await asideCall('loopAsideClear', sessionId, [contextKey], execKey);
     try { return JSON.parse(result); } catch { return { status: 'error', message: '清空响应解析失败' }; }
   },
 
-  async loopAsideAbort(sessionId: string): Promise<{ status: string; aborting?: boolean }> {
-    const result = await call('loopAsideAbort', sessionId);
+  async loopAsideAbort(sessionId: string, execKey?: string): Promise<{ status: string; aborting?: boolean }> {
+    const result = await asideCall('loopAsideAbort', sessionId, [], execKey);
     try { return JSON.parse(result); } catch { return { status: 'error' }; }
   },
 
@@ -3414,21 +3461,21 @@ export const api = {
   },
 
   // ── “俺寻思”注意力伴随问答（普通 session）─────────────────
-  async chatAsk(sessionId: string, question: string, images?: any[], attention?: Record<string, unknown>): Promise<{ status: string; turnId?: string; message?: string }> {
+  async chatAsk(sessionId: string, question: string, images?: any[], attention?: Record<string, unknown>, execKey?: string): Promise<{ status: string; turnId?: string; message?: string }> {
     const imagesJson = images && images.length ? JSON.stringify(images) : '';
-    const result = await call('chatAsk', sessionId, question, imagesJson, attention ? JSON.stringify(attention) : '');
+    const result = await asideCall('chatAsk', sessionId, [question, imagesJson, attention ? JSON.stringify(attention) : ''], execKey);
     try { return JSON.parse(result); } catch { return { status: 'error', message: '响应解析失败' }; }
   },
-  async chatAsideList(sessionId: string): Promise<{ status: string; asides: any[]; asideBackendId?: string; message?: string }> {
-    const result = await call('chatAsideList', sessionId);
+  async chatAsideList(sessionId: string, execKey?: string): Promise<{ status: string; asides: any[]; asideBackendId?: string; message?: string }> {
+    const result = await asideCall('chatAsideList', sessionId, [], execKey);
     try { return JSON.parse(result); } catch { return { status: 'error', asides: [] }; }
   },
-  async chatAsideClear(sessionId: string, contextKey: string = ''): Promise<{ status: string; cleared?: number; message?: string }> {
-    const result = await call('chatAsideClear', sessionId, contextKey);
+  async chatAsideClear(sessionId: string, contextKey: string = '', execKey?: string): Promise<{ status: string; cleared?: number; message?: string }> {
+    const result = await asideCall('chatAsideClear', sessionId, [contextKey], execKey);
     try { return JSON.parse(result); } catch { return { status: 'error', message: '清空响应解析失败' }; }
   },
-  async chatAsideSetBackend(sessionId: string, backendId: string): Promise<{ status: string; asideBackendId?: string }> {
-    const result = await call('chatAsideSetBackend', sessionId, backendId || '');
+  async chatAsideSetBackend(sessionId: string, backendId: string, execKey?: string): Promise<{ status: string; asideBackendId?: string }> {
+    const result = await asideCall('chatAsideSetBackend', sessionId, [backendId || ''], execKey);
     try { return JSON.parse(result); } catch { return { status: 'error' }; }
   },
   onChatAsideDelta(cb: ChatAsideDeltaCallback): () => void {
@@ -3460,6 +3507,25 @@ export const api = {
     }
     try { return JSON.parse(result); }
     catch { return { status: 'error', message: `返回值解析失败: ${String(result).slice(0, 120)}` }; }
+  },
+
+  async exportDataStart(): Promise<{
+    status: string; message?: string; transferId?: string; fileName?: string; size?: number; sha256?: string;
+  }> {
+    const result = await call('exportDataStart');
+    return parseRpcObject(result, { status: 'error', message: '导出包生成无响应' });
+  },
+
+  async exportDataChunk(transferId: string, offset: number, size: number): Promise<{
+    status: string; message?: string; offset?: number; size?: number; total?: number; eof?: boolean; data?: string;
+  }> {
+    const result = await call('exportDataChunk', transferId, offset, size);
+    return parseRpcObject(result, { status: 'error', message: '导出分块读取无响应' });
+  },
+
+  async exportDataFinish(transferId: string): Promise<{ status: string; message?: string }> {
+    const result = await call('exportDataFinish', transferId);
+    return parseRpcObject(result, { status: 'error', message: '导出临时文件清理无响应' });
   },
 
   async importData(sourcePath: string): Promise<any> {
@@ -3529,7 +3595,7 @@ export const api = {
     workingDir?: string,
     execKey?: string,
     includeHidden = false,
-  ): Promise<{ name: string; path: string; isDir: boolean; mtime?: number }[]> {
+  ): Promise<{ name: string; path: string; isDir: boolean; size?: number; mtime?: number }[]> {
     // execKey 指定时发到该会话的执行节点(远端目录懒加载逐层浏览);缺省回落 home。
     const result = execKey
       ? await callOn(execKey, 'listDirectory', path, workingDir || '', includeHidden)
@@ -3811,8 +3877,8 @@ export const api = {
   async gitCommitPromptPreview(workingDir: string, stagedOnly: boolean, execKey: string): Promise<GitCommitPromptPreview> {
     return JSON.parse(await callOn(execKey, 'gitCommitPromptPreview', workingDir, stagedOnly));
   },
-  async chatAsideAbort(sessionId: string): Promise<{ status: string; aborting?: boolean }> {
-    const result = await call('chatAsideAbort', sessionId);
+  async chatAsideAbort(sessionId: string, execKey?: string): Promise<{ status: string; aborting?: boolean }> {
+    const result = await asideCall('chatAsideAbort', sessionId, [], execKey);
     try { return JSON.parse(result); } catch { return { status: 'error' }; }
   },
 

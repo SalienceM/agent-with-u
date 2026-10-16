@@ -79,6 +79,7 @@ export const SessionWorkbench: React.FC<Props> = props => {
   const terminalHeight = Math.min(layout.terminalHeight, Math.max(100, height - 220));
   const [fileFocus, setFileFocus] = useState<FileFocusRequest | null>(null);
   const focusSequence = useRef(0);
+  const searchFilesReturn = useRef<{ region: EngineLayout['region']; filesCollapsed: boolean } | null>(null);
   const container = useRef<HTMLDivElement>(null);
   const onModeRef = useRef(onViewModeChange); onModeRef.current = onViewModeChange;
   useEffect(() => { onModeRef.current?.(identity, mode); if (engine) setVisited(true); }, [identity, mode, engine]);
@@ -258,9 +259,17 @@ export const SessionWorkbench: React.FC<Props> = props => {
           {meta?.codexRemoteHost ? <div role="status" style={{ padding: 12, fontSize: 12 }}>SSH 会话文件位于 {meta.codexRemoteHost}；不展示本机同名目录。</div>
             : ready && documentHost ? <FileTreePanel key={scope} sessionId={sessionId!} workingDir={workingDir} execKey={executor}
               execLabel={meta?.execLabel} execMode={meta?.execMode} backendId={meta?.backendId}
-              documentHost={documentHost} isVisible={isVisible && engine}
+              documentHost={documentHost} isVisible={isVisible && engine} filesVisible={fileVisible}
               focusRequest={fileFocus} onDocumentOpen={() => setRegion('document')}
-              onBrowseFiles={() => setRegion('files')}
+              onBrowseFiles={() => {
+                if (!fileVisible && !searchFilesReturn.current) searchFilesReturn.current = { region, filesCollapsed: layout.filesCollapsed };
+                setRegion('files');
+              }}
+              onSearchExit={() => {
+                const previous = searchFilesReturn.current;
+                searchFilesReturn.current = null;
+                if (previous) updateLayout(previous);
+              }}
               onAttentionChange={isVisible && engine ? onAttentionChange : undefined} />
             : <p style={{ padding: 12, fontSize: 12 }}>请先设置会话工作目录。</p>}
         </AppModalVisibilityContext.Provider>}

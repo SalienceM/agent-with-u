@@ -23,15 +23,13 @@ from .codex_app_server import (
     local_app_server_command,
 )
 from .loop_execution_environment import ExecutionIdentity, path_identity, EnvironmentPause
+from .codex_reasoning import normalize_reasoning_effort
 
 
 _PROXY_ENV_KEYS = (
     "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
     "http_proxy", "https_proxy", "all_proxy", "no_proxy",
 )
-
-CODEX_REASONING_EFFORTS = {"none", "minimal", "low", "medium", "high", "xhigh", "max"}
-
 
 @dataclass
 class _SteerRequest:
@@ -50,9 +48,8 @@ class _ActiveAppTurn:
 
 
 def normalize_codex_reasoning_effort(value: object) -> str:
-    """Return a CLI-supported Codex reasoning effort or an empty default."""
-    effort = str(value or "").strip().lower()
-    return effort if effort in CODEX_REASONING_EFFORTS else ""
+    """校验安全 token；具体模型是否支持由 Codex 目录及运行端决定。"""
+    return normalize_reasoning_effort(value)
 
 
 def _normalize_proxy_url(value: object) -> str:
@@ -582,7 +579,7 @@ class CodexOfficeBackend(ModelBackend):
         if effort:
             # --config is a global Codex option and must precede `exec`/`resume`.
             # Codex treats an unparseable TOML bare word as a string. Passing the
-            # bare enum is deliberate: embedding TOML quotes in argv crosses an
+            # bare token is deliberate: embedding TOML quotes in argv crosses an
             # extra cmd.exe + npm-shim quoting layer on Windows and arrives as
             # the literal value \"medium\", which the API rejects.
             cmd.extend(["--config", f"model_reasoning_effort={effort}"])

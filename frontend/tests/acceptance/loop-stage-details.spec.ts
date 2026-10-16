@@ -16,6 +16,9 @@ function recordFixture() {
     blockerReview: {} as TaskBlockerDetails['blockerReview'],
     taskBlockers: {} as TaskBlockerDetails['taskBlockers'],
     taskPlan: {} as TaskBlockerDetails['taskPlan'],
+    contractValidation: {} as TaskBlockerDetails['contractValidation'],
+    contractRepairAudits: [] as TaskBlockerDetails['contractRepairAudits'],
+    contractRepairRevision: '',
     delivery: {} as DeliveryReport,
     outcomeVersion: 0, terminalKind: '', decision: {} as LoopDecision, callResults: {} as Record<string, string>, taskResult: 'unknown',
     orchestration: [
@@ -50,6 +53,7 @@ async function fixture(page: Page, progressGuard: ProgressGuard = {}, options: {
     progressGuard, taskSource: source, executionEnvironment: environment, handoff: { available: true, source: 'conversion' },
     loops: (older ? [older, record] : [record]).map(item => ({ ...item, detailLoaded: false, result: '', delivery: {},
       blockerReview: {}, taskBlockers: {}, taskPlan: {},
+      contractRepairAudits: undefined,
       callDiagnostics: item.callDiagnostics.slice(-1),
       orchestration: item.orchestration.map(step => ({ ...step, output: '', hasOutput: !!step.output })),
       stageDetails: Object.fromEntries(Object.entries(item.stageDetails).map(([key, value]) => [key,
@@ -151,15 +155,16 @@ const environmentFixture = (): ExecutionEnvironment => ({ revision: 1, status: '
 test('environment check is explicit, coalesces clicks and never starts task work', async ({ page }, info) => {
   const data = await fixture(page, { pause: true }, { running: false, environment: environmentFixture() });
   const pane = await openFlow(page);
-  await pane.getByRole('button', { name: '任务设置', exact: true }).click();
+  await pane.getByRole('button', { name: '运行诊断', exact: true }).click();
   const card = pane.getByTestId('loop-environment-card');
+  await card.getByText('技术证据', { exact: true }).first().click();
   await expect(card).toContainText('read-only');
   await expect(card).toContainText('部分覆盖');
   expect(data.environmentReads()).toBe(0);
-  await card.getByRole('button', { name: '查看详情与工作流选项' }).click();
+  await card.getByRole('button', { name: '选择额外工作流…' }).click();
   await card.getByLabel('工作流依赖', { exact: true }).selectOption('opsx-apply');
   await card.getByRole('button', { name: '确认依赖选择' }).click();
-  await expect(card).toContainText('工作流依赖：opsx-apply');
+  await expect(card).toContainText('额外工作流选择：opsx-apply');
   data.setHold(true);
   await card.getByRole('button', { name: '重新检查环境' }).click();
   await expect(card.getByRole('button', { name: '重新检查环境' })).toBeDisabled();
@@ -175,7 +180,7 @@ test('environment check is explicit, coalesces clicks and never starts task work
 test('environment delayed reply cannot replace a newer revision; unknown and unsupported remain honest', async ({ page }) => {
   const data = await fixture(page, {}, { running: false });
   const pane = await openFlow(page);
-  await pane.getByRole('button', { name: '任务设置', exact: true }).click();
+  await pane.getByRole('button', { name: '运行诊断', exact: true }).click();
   const card = pane.getByTestId('loop-environment-card');
   await expect(card).toContainText('环境未知');
   data.setEnvironment({ ...environmentFixture(), revision: 3, status: 'unsupported', latest: { ...environmentFixture().latest, status: 'unsupported' } });
@@ -191,7 +196,7 @@ test('environment delayed reply cannot replace a newer revision; unknown and uns
 test('running and inspectOnly environment cards expose no mutation controls', async ({ page }) => {
   const data = await fixture(page, {}, { running: true, environment: environmentFixture() });
   const pane = await openFlow(page);
-  await pane.getByRole('button', { name: '任务设置', exact: true }).click();
+  await pane.getByRole('button', { name: '运行诊断', exact: true }).click();
   const card = pane.getByTestId('loop-environment-card');
   await expect(card.getByRole('button', { name: '重新检查环境' })).toHaveCount(0);
   await expect(card).toContainText('人工成功不能证明自动受限路径可用');
@@ -372,12 +377,12 @@ test('explicit source discovery, conflict confirmation and unbinding never start
   const data = await fixture(page, {}, { running: false });
   data.seed(record => { record.terminalKind = 'paused'; });
   const pane = await openFlow(page);
-  await pane.getByRole('button', { name: '任务设置', exact: true }).click();
+  await pane.getByRole('button', { name: /^来源：/ }).click();
   const card = pane.getByTestId('loop-source-card');
   await expect(card).toContainText('未绑定（通用模式）');
   expect(data.sourceReads()).toBe(0);
   await card.getByRole('button', { name: '发现 OpenSpec 来源' }).click();
-  await expect(card.getByLabel('选择 OpenSpec change')).toHaveValue('first-change');
+  await expect(card.getByLabel('选择 OpenSpec change')).toHaveValue('');
   await expect(card).toContainText('即使只有一个候选');
   await card.getByLabel('选择 OpenSpec change').selectOption('second-change');
   await card.getByRole('button', { name: '确认绑定', exact: true }).click();
@@ -394,6 +399,11 @@ test('explicit source discovery, conflict confirmation and unbinding never start
   await card.getByLabel('来源范围处置依据').fill('用户确认新范围，旧损失继续保留');
   await card.getByRole('button', { name: '确认范围修订' }).click();
   await expect(card).toContainText('已核对');
+  await expect(card.getByLabel('来源范围处置依据')).toHaveCount(0);
+  await card.getByRole('button', { name: '解除绑定…', exact: true }).click();
+  await card.getByRole('button', { name: '取消', exact: true }).click();
+  expect(data.executionCalls()).toBe(0);
+  await card.getByRole('button', { name: '解除绑定…', exact: true }).click();
   await card.getByLabel('来源范围处置依据').fill('转为通用核对，未完成项保留');
   await card.getByRole('button', { name: '确认解除绑定' }).click();
   await expect(card).toContainText('未绑定（通用模式）');
@@ -422,7 +432,7 @@ test('same decision and 2/25 milestone evidence across workbench details, withou
   await report.getByTestId('loop-milestones').locator('summary').click();
   await expect(report).toContainText('本轮认可增量：shell');
   await expect(report).toContainText('不代表父任务集成验收通过');
-  await pane.getByLabel('详情分类').selectOption('evidence');
+  await pane.getByRole('button', { name: '面板', exact: true }).click();
   await expect(pane.getByTestId('loop-decision').first()).toContainText('选择属性/技能就绪任务');
   expect(data.sourceReads()).toBe(0);
   expect(data.reads()).toBe(1);
@@ -447,10 +457,10 @@ test('waiting, failure, budget stop and completion remain distinct in workbench 
     const acceptance = scenario.decision.action === 'complete' ? '累计任务验收：已验证' : '累计任务验收：部分成果';
     for (const expected of scenario.expected) await expect(pane.getByTestId('loop-decision').first()).toContainText(expected);
     await expect(pane.getByTestId('loop-decision').first()).toContainText(acceptance);
-    await pane.getByLabel('详情分类').selectOption('evidence');
+    await pane.getByRole('button', { name: '面板', exact: true }).click();
     for (const expected of scenario.expected) await expect(pane.getByTestId('loop-decision').first()).toContainText(expected);
     await expect(pane.getByTestId('loop-decision').first()).toContainText(acceptance);
-    await pane.getByLabel('详情分类').selectOption('process');
+    await pane.getByRole('button', { name: '流程', exact: true }).click();
   }
   expect(data.executionCalls()).toBe(0);
   expect(data.sourceReads()).toBe(0);
@@ -459,8 +469,10 @@ test('waiting, failure, budget stop and completion remain distinct in workbench 
 test('running and manual takeover are read-only; ordinary chat does not query sources', async ({ page }) => {
   const data = await fixture(page, {}, { running: false, manual: true });
   const pane = await openFlow(page);
-  await pane.getByRole('button', { name: '任务设置', exact: true }).click();
+  await pane.getByRole('button', { name: /^来源：/ }).click();
   await expect(pane.getByTestId('loop-source-card').getByRole('button', { name: '发现 OpenSpec 来源' })).toBeDisabled();
+  await pane.getByRole('button', { name: '关闭详情，返回工作台' }).click();
+  await pane.getByRole('button', { name: '运行诊断', exact: true }).click();
   await expect(pane.getByTestId('loop-environment-card').getByRole('button', { name: '重新检查环境' })).toHaveCount(0);
   expect(data.sourceReads()).toBe(0);
   if (!await page.locator('.awu-sidebar').isVisible()) await page.getByRole('button', { name: '打开会话列表', exact: true }).click();
@@ -475,13 +487,13 @@ test('running and manual takeover are read-only; ordinary chat does not query so
 test('a late environment check belongs only to its original session', async ({ page }) => {
   const data = await fixture(page, {}, { running: false, environment: environmentFixture() });
   const pane = await openFlow(page);
-  await pane.getByRole('button', { name: '任务设置', exact: true }).click();
+  await pane.getByRole('button', { name: '运行诊断', exact: true }).click();
   data.setHold(true);
   await pane.getByTestId('loop-environment-card').getByRole('button', { name: '重新检查环境' }).click();
   await expect.poll(data.environmentChecks).toBe(1);
   if (!await page.locator('.awu-sidebar').isVisible()) await page.getByRole('button', { name: '打开会话列表', exact: true }).click();
   await page.locator('.awu-sidebar').getByText('首页交付 Loop 2', { exact: true }).click();
-  await page.locator('[data-session-tab-panel]:visible').getByRole('button', { name: '任务设置', exact: true }).click();
+  await page.locator('[data-session-tab-panel]:visible').getByRole('button', { name: '运行诊断', exact: true }).click();
   const card = page.locator('[data-session-tab-panel]:visible').getByTestId('loop-environment-card');
   data.setHold(false); data.release();
   await expect(card).toContainText('环境未知');
@@ -492,14 +504,14 @@ test('a late environment check belongs only to its original session', async ({ p
 test('a late source discovery belongs only to its original session', async ({ page }) => {
   const data = await fixture(page, {}, { running: false });
   const pane = await openFlow(page);
-  await pane.getByRole('button', { name: '任务设置', exact: true }).click();
+  await pane.getByRole('button', { name: /^来源：/ }).click();
   data.setHold(true);
   await pane.getByTestId('loop-source-card').getByRole('button', { name: '发现 OpenSpec 来源' }).click();
   await expect.poll(data.sourceReads).toBe(1);
   if (!await page.locator('.awu-sidebar').isVisible()) await page.getByRole('button', { name: '打开会话列表', exact: true }).click();
   await page.locator('.awu-sidebar').getByText('首页交付 Loop 2', { exact: true }).click();
   const current = page.locator('[data-session-tab-panel]:visible');
-  await current.getByRole('button', { name: '任务设置', exact: true }).click();
+  await current.getByRole('button', { name: /^来源：/ }).click();
   await expect(current.getByTestId('loop-source-card')).toContainText('未绑定');
   data.setHold(false); data.release();
   await expect(current.getByLabel('选择 OpenSpec change')).toHaveCount(0);
@@ -545,7 +557,7 @@ test('task blockers use lazy compact details consistently in workbench details w
   const bounds = await detail.boundingBox();
   expect(bounds!.width).toBeLessThanOrEqual(page.viewportSize()!.width);
   await page.screenshot({ path: info.outputPath('task-blocker-details.png') });
-  await pane.getByLabel('详情分类').selectOption('evidence');
+  await pane.getByRole('button', { name: '面板', exact: true }).click();
   await expect(pane.getByTestId('loop-decision').first()).toContainText('有独立就绪工作');
   expect(data.executionCalls()).toBe(0);
   expect(data.environmentChecks()).toBe(0);
@@ -565,4 +577,40 @@ test('task blocker late detail cannot enter a different session and unknown neve
   await expect(page.locator('[data-session-tab-panel]:visible')).not.toContainText('Godot 未启动');
   expect(data.executionCalls()).toBe(0);
   expect(data.reads()).toBe(1);
+});
+
+for (const width of [1366, 390]) test(`contract audits are lazy and correction remains planning at ${width}`, async ({ page }, info) => {
+  await page.setViewportSize({ width, height: width === 390 ? 844 : 900 });
+  const data = await fixture(page);
+  data.seed(record => {
+    record.subStage = 'prepare';
+    record.contractValidation = { version: 1, status: 'retrying', origin: 'output', attemptCount: 2,
+      reason: '步骤映射存在未知编号', fields: ['orchestration[0].taskIds'], affectedIds: ['unknown'] };
+    record.stageDetails.prepare = { status: 'retrying', attemptCount: 2, message: '纠正任务协议', attempts: [
+      { kind: 'initial', rawOutput: '第一份无效映射原文', parsed: {}, valid: false, validation: ['未知任务编号'] },
+    ] };
+  });
+  const pane = await openFlow(page);
+  if (width === 390 && await page.locator('.awu-sidebar').isVisible()) await page.getByRole('button', { name: '收起侧栏', exact: true }).click();
+  await expect(pane.getByTestId('loop-current-status')).toContainText('正在纠正任务映射（第 2/3 次）');
+  expect(data.reads()).toBe(0);
+  await pane.getByRole('button', { name: '查看 Prepare 阶段', exact: true }).click();
+  await expect(pane).toContainText('第一份无效映射原文');
+  await expect.poll(data.reads).toBe(1);
+  data.update(record => {
+    record.contractRepairRevision = 'repair-committed';
+    record.contractValidation!.status = 'repaired';
+    record.contractRepairAudits = [{ requestId: 'audit-only', status: 'succeeded', original: { reason: '原始无效历史必须保留' } }];
+  });
+  await expect.poll(data.reads).toBe(2);
+  const blocker = pane.getByTestId('loop-task-blockers');
+  await blocker.locator(':scope > summary').click();
+  await blocker.getByText('修复审计 · audit-only · succeeded', { exact: true }).click();
+  await expect(blocker).toContainText('原始无效历史必须保留');
+  for (let i = 0; i < 4; i++) data.update(() => {});
+  await expect(blocker).toContainText('映射已修复，尚未运行');
+  expect(data.reads()).toBe(2);
+  expect(data.executionCalls()).toBe(0);
+  await blocker.scrollIntoViewIfNeeded();
+  await page.screenshot({ path: info.outputPath(`contract-audit-${width}.png`) });
 });

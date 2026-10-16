@@ -420,7 +420,7 @@ class TaskSourceReader:
                 raise SourceError('change_missing', '绑定的 change 不存在或已归档，不会改绑其他 change。')
             status = await self._query(binding, env, ['status', '--change', change, '--json'])
             apply = await self._query(binding, env, ['instructions', 'apply', '--change', change, '--json'])
-            result = normalize_snapshot(root, change, status, apply, version)
+            result = await asyncio.to_thread(normalize_snapshot, root, change, status, apply, version)
             if bounded_object(result).get('status') == 'invalid':
                 raise SourceError('output_limit', '规范化快照超过 1 MiB，未使用截断清单。')
             return result

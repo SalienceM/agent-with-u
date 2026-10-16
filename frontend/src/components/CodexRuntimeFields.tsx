@@ -1,5 +1,7 @@
 import React, { useId } from 'react';
 import { resolveCodexModelOptions } from '../utils/codexModelOptions';
+import { normalizeReasoningEffort } from '../utils/codexReasoning';
+import { useCodexReasoning } from '../hooks/useCodexReasoning';
 export { CODEX_MODELS } from '../utils/codexModelOptions';
 
 export interface ModelRuntime {
@@ -7,18 +9,6 @@ export interface ModelRuntime {
   reasoningEffort?: string;
 }
 
-
-export const CODEX_REASONING_EFFORTS = [
-  { id: 'none', label: '关闭 · none' },
-  { id: 'minimal', label: '最低 · minimal' },
-  { id: 'low', label: '低 · low' },
-  { id: 'medium', label: '中 · medium' },
-  { id: 'high', label: '高 · high' },
-  { id: 'xhigh', label: '极高 · xhigh' },
-  { id: 'max', label: '顶格 · max' },
-];
-
-const EFFORT_IDS = new Set(CODEX_REASONING_EFFORTS.map((item) => item.id));
 
 export function isCodexBackend(backend: any): boolean {
   return backend?.type === 'codex-office';
@@ -39,7 +29,7 @@ export function normalizeModelRuntime(raw?: ModelRuntime | null): ModelRuntime {
     ? raw.reasoningEffort.trim().toLowerCase()
     : '';
   if (model) runtime.model = model;
-  if (EFFORT_IDS.has(effort)) runtime.reasoningEffort = effort;
+  if (normalizeReasoningEffort(effort)) runtime.reasoningEffort = effort;
   return runtime;
 }
 
@@ -71,6 +61,8 @@ interface Props {
   inherited?: ModelRuntime;
   compact?: boolean;
   inheritLabel?: string;
+  sessionId?: string;
+  execKey?: string;
 }
 
 /** 每个 Session 的运行参数。Backend 仍只负责账号、连接与 CLI 配置。 */
@@ -81,12 +73,18 @@ export const BackendRuntimeFields: React.FC<Props> = ({
   inherited,
   compact = false,
   inheritLabel = '跟随 Backend / Codex 默认',
+  sessionId,
+  execKey,
 }) => {
   const listId = `codex-models-${useId().replace(/:/g, '')}`;
+  const catalog = useCodexReasoning(backend, sessionId, execKey);
   if (!isRuntimeConfigurableBackend(backend)) return null;
   const codex = isCodexBackend(backend);
   const own = normalizeModelRuntime(value);
   const resolved = resolveModelRuntime(backend, own, inherited);
+  const capability = catalog.rows.find(item => item.model === resolved.model);
+  const efforts = capability?.supportedReasoningEfforts || [];
+  const unlistedEffort = own.reasoningEffort && !efforts.some(item => item.reasoningEffort === own.reasoningEffort);
   const patch = (next: Partial<ModelRuntime>) => {
     const normalized = normalizeModelRuntime({ ...own, ...next });
     if (!codex) delete normalized.reasoningEffort;
@@ -97,7 +95,7 @@ export const BackendRuntimeFields: React.FC<Props> = ({
     <div style={{
       display: 'grid',
       gridTemplateColumns: codex
-        ? (compact ? 'minmax(145px, 1.4fr) minmax(120px, 1fr)' : 'repeat(2, minmax(180px, 1fr))')
+        ? (compact ? 'minmax(0, 1.4fr) minmax(0, 1fr)' : 'repeat(2, minmax(0, 1fr))')
         : 'minmax(180px, 1fr)',
       gap: 8, alignItems: 'end',
     }}>
@@ -117,6 +115,7 @@ export const BackendRuntimeFields: React.FC<Props> = ({
         )}
       </label>
       {codex && (
+        <>
         <label style={fieldStyle}>
           <span style={labelStyle}>推理档位</span>
           <select
@@ -125,15 +124,27 @@ export const BackendRuntimeFields: React.FC<Props> = ({
             style={inputStyle}
           >
             <option value="">{inheritLabel}</option>
-            {CODEX_REASONING_EFFORTS.map((effort) => (
-              <option key={effort.id} value={effort.id}>{effort.label}</option>
+            {unlistedEffort && <option value={own.reasoningEffort} disabled>{own.reasoningEffort} · 原配置（未确认支持）</option>}
+            {efforts.map((effort) => (
+              <option key={effort.reasoningEffort} value={effort.reasoningEffort} title={effort.description}>
+                {effort.reasoningEffort}{effort.reasoningEffort === capability?.defaultReasoningEffort ? ' · Codex 目录默认' : ''}
+              </option>
             ))}
           </select>
         </label>
+        <div role="status" style={{ ...labelStyle, gridColumn: '1 / -1', fontSize: 10, lineHeight: 1.4 }}>
+          {catalog.loading ? '正在读取 Codex 档位…' : catalog.error || (capability
+            ? efforts.length ? '来源：当前执行节点 Codex。继承时仍由 Codex 配置决定。' : 'Codex 未提供可选档位，使用默认。'
+            : resolved.model ? 'Codex 未返回此模型的档位，未使用固定列表。' : '请指定模型后查看其 Codex 档位。')}
+          {!catalog.loading && (catalog.error || !capability) && <button type="button" onClick={catalog.retry}
+            style={{ border: 0, background: 'none', color: 'var(--theme-accent)', cursor: 'pointer', fontSize: 10 }}>重新读取</button>}
+          {!catalog.loading && unlistedEffort && <div>原档位已保留；可选跟随默认或重新选择受支持档位。</div>}
+        </div>
+        </>
       )}
       {!compact && (
         <div style={{ gridColumn: '1 / -1', fontSize: 10.5, color: 'var(--theme-text-muted)', lineHeight: 1.45 }}>
-          本次实际配置：<b style={{ color: 'var(--theme-text)' }}>{formatRuntimeLabel(backend, resolveModelRuntime(backend, own, inherited))}</b>。
+          本次提交配置：<b style={{ color: 'var(--theme-text)' }}>{formatRuntimeLabel(backend, resolveModelRuntime(backend, own, inherited))}</b>。
           留空即继承，不需要为 Sol / Terra / 不同档位复制 Backend。
         </div>
       )}

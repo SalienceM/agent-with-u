@@ -10,11 +10,27 @@ const states = () => ({
   resumable: { ...base(), resumable: true, loops: [record()] },
   multi: { ...base(), taskSource: { status: 'conflict', revision: 4, change: 'fixture' },
     executionEnvironment: { revision: 1, status: 'blocked', latest: { id: 'env-1', status: 'blocked', quiesced: false } },
-    unresolvedBlockers: { available: true, count: 2 }, loops: [{ ...record(), decision: { action: 'wait', reasonCode: 'scope_conflict', decisionId: 'd1' } }] },
+    unresolvedBlockers: { available: true, count: 2 }, loops: [{ ...record(), decision: { action: 'wait', reasonCode: 'scope_conflict', decisionId: 'd1', round: 1, seq: 1, revision: 4, basisRefs: ['source:4'] } }] },
   result: { ...base(), stage: 'loopout', stopReason: '预算耗尽', loops: [{ ...record(), completed: true, taskResult: 'partial', decision: { action: 'stop', reasonCode: 'budget_exhausted' } }] },
   manual: { ...base(), controlMode: 'manual' }, legacy: { ...base(), loops: [record()] },
   human: { ...base(), stage: 'loopout', loops: [{ ...record(), taskResult: 'verified', decision: { action: 'complete', completionScope: 'automatic' } }] },
 });
 const migrations = { 'panel|flow': '过程与历史', StageRail: '中文状态', MetricBar: '成果与证据', ScoreRing: '评审详情',
   LoopSourceCard: '任务设置', LoopEnvironmentCard: '任务设置', PolicyCard: '任务设置', AddonHistoryCard: '目标与补充' };
-module.exports = { base, record, states, migrations };
+const environmentStates = () => {
+  const check = { id: 'probe', revision: 3, status: 'unsupported', coverage: 'native_policy', quiesced: true };
+  const state = (environment) => ({ ...base(), resumable: true, loops: [record()], executionEnvironment: { revision: 3, blockers: [], ...environment } });
+  return {
+    unsupported: state({ status: 'unsupported', latest: check }),
+    stale: state({ status: 'stale', latest: { ...check, status: 'stale' } }),
+    actualFault: state({ status: 'blocked', latest: { ...check, status: 'passed' }, blockers: [{ ...check, id: 'fault', status: 'blocked', coverage: 'actual_tool' }] }),
+    incomplete: state({ status: 'unknown', incomplete: true }),
+    unconfirmed: state({ status: 'unsupported', latest: { ...check, quiesced: false } }),
+    local: { ...base(), loops: [{ ...record(), blockerSummary: { valid: true, readyIds: ['U'], affectedIds: ['T'] } }], unresolvedBlockers: { available: true } },
+    source: { ...base(), taskSource: { status: 'conflict', revision: 4 } },
+    paused: { ...base(), progressGuard: { pause: true, reason: '显式恢复后核对' } },
+    legacy: base(),
+  };
+};
+const restored = ['StageRail', 'panel|flow', 'MetricBar', 'ScoreRing', 'FlowLane', 'Addon', 'Policy', 'Goal'];
+module.exports = { base, record, states, migrations, environmentStates, restored };

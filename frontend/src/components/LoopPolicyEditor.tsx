@@ -113,7 +113,9 @@ export const LoopPolicyEditor: React.FC<{
   availableBackends?: any[];
   sessionBackendId?: string;
   sessionRuntime?: ModelRuntime;
-}> = ({ value, onChange, availableBackends, sessionBackendId, sessionRuntime }) => {
+  sessionId?: string;
+  execKey?: string;
+}> = ({ value, onChange, availableBackends, sessionBackendId, sessionRuntime, sessionId, execKey }) => {
   const set = (patch: Partial<LoopPolicy>) => onChange({ ...value, ...patch });
   const [presets, setPresets] = useState<any[]>([]);
   const [sel, setSel] = useState('');
@@ -296,6 +298,8 @@ export const LoopPolicyEditor: React.FC<{
                 {roleBackend && isRuntimeConfigurableBackend(roleBackend) && (
                   <BackendRuntimeFields
                     backend={roleBackend}
+                    sessionId={sessionId}
+                    execKey={execKey}
                     value={roleRuntime}
                     inherited={inheritedRuntime}
                     compact

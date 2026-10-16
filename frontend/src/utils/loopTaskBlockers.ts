@@ -7,6 +7,9 @@ export interface TaskBlocker {
   resolution: string; evidenceRefs: string[]; evidenceLevel?: string;
 }
 export interface TaskBlockerDetails {
+  contractRepairRevision?: string;
+  contractValidation?: import('../types/loopContract').ContractDiagnostic;
+  contractRepairAudits?: Array<import('../types/loopContract').RepairReceipt & { original?: unknown; attempts?: unknown; validation?: unknown; replacement?: unknown }>;
   blockerSummary?: BlockerReview;
   blockerReview?: BlockerReview;
   taskBlockers?: { valid?: boolean; reason?: string; items?: TaskBlocker[] };

@@ -5,7 +5,7 @@ import type { EnvironmentCheck, ExecutionEnvironment } from './loopEnvironment';
 import type { LoopDecision, LoopSourceSummary } from './loopContinuation';
 import type { ModelRuntime } from '../components/CodexRuntimeFields';
 import type { CallDiagnostic } from '../utils/loopDiagnostics';
-import type { WorkbenchRecord } from '../utils/loopWorkbenchView';
+import type { WorkbenchRecord, IterationRequest } from '../utils/loopWorkbenchView';
 
 export interface LoopStep {
   callResult?: string; taskResult?: string;
@@ -19,6 +19,8 @@ export interface LoopAnalysis {
   deliverable: boolean; outputtable: boolean;
 }
 export interface LoopRecord extends TaskBlockerDetails {
+  openspecSummary?: { change: string; phase: string; status: string; total: number; checked: number; pending: number; manual: number; fixes: number; verified: boolean; message: string };
+  openspecRun?: { verify?: { issues?: Array<{ id: string; severity: string; summary: string; evidence: string; manual: boolean; requiresFix: boolean }> } };
   environmentChecks?: EnvironmentCheck[];
   outcomeVersion?: number; terminalKind?: string; decision?: LoopDecision; callResults?: Record<string, string>; taskResult?: string;
   sourceSummary?: unknown; deliverySummary?: WorkbenchRecord['deliverySummary'];
@@ -59,6 +61,12 @@ export interface AsideTurn { id: string; question: string; answer: string; statu
 export interface AddonImage { id?: string; base64: string; mime_type?: string; }
 export interface Addon { id: string; text: string; status: string; appliedSeq: number; images?: AddonImage[]; }
 export interface LoopStateT {
+  startup?: { status: string; phase?: string; message?: string; seq?: number };
+  contractRepairProtocolVersion?: number;
+  contractRepairActive?: boolean;
+  contractRepair?: import('./loopContract').RepairReceipt;
+  contractRepairEligibility?: import('./loopContract').RepairEligibility;
+  iterationRequest?: IterationRequest;
   executionEnvironment?: ExecutionEnvironment;
   unresolvedBlockers?: { available?: boolean; count?: number };
   taskSource?: LoopSourceSummary;

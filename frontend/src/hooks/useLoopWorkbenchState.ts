@@ -4,6 +4,7 @@ import type { LoopRecord, LoopStateT, DetailTarget } from '../types/loopWorkbenc
 import { loopRecordRevision } from '../utils/loopRecordDetail';
 import { activeLoopSeq, mergeCallDiagnostics, type CallDiagnostic } from '../utils/loopDiagnostics';
 import { mergeBlockerDetails } from '../utils/loopTaskBlockers';
+import { LoopContractController, contractSnapshotStale, type RepairFeedback } from '../utils/loopContractController';
 
 function mergeLoopRecordDetail(summary: LoopRecord, detail?: LoopRecord): LoopRecord {
   if (summary.detailLoaded !== false) return summary;
@@ -35,6 +36,7 @@ function mergeLoopRecordDetail(summary: LoopRecord, detail?: LoopRecord): LoopRe
     manualContext: detail.manualContext || summary.manualContext,
     evolutionBasis: detail.evolutionBasis || summary.evolutionBasis,
     delivery: detail.delivery?.mode ? detail.delivery : summary.delivery,
+    openspecRun: JSON.stringify(summary.openspecSummary) === JSON.stringify(detail.openspecSummary) ? detail.openspecRun : summary.openspecRun,
     analysis,
     orchestration,
     stageDetails: Object.fromEntries(Object.entries(summary.stageDetails || detail.stageDetails || {}).map(
@@ -60,6 +62,20 @@ export function useLoopWorkbenchState(sessionId: string, execKey: string, identi
   const detailVersions = useRef<Record<number, string>>({});
   const detailGeneration = useRef(0);
   const [loadError, setLoadError] = useState('');
+  const [repair, setRepair] = useState<RepairFeedback>({ sending: false, checking: false, error: '' });
+  const repairController = useRef<LoopContractController>();
+  useEffect(() => {
+    const controller = new LoopContractController({
+      request: payload => api.loopRepairTaskContract(sessionId, payload, execKey),
+      get: rid => api.loopTaskContractRepairGet(sessionId, rid, execKey),
+      cancel: rid => api.loopCancelTaskContractRepair(sessionId, rid, execKey),
+    }, setRepair);
+    repairController.current = controller;
+    setRepair(controller.feedback);
+    return () => { controller.dispose(); };
+  }, [sessionId, execKey, identity]);
+  useEffect(() => { repairController.current?.receive(state?.contractRepairEligibility, state?.contractRepair); },
+    [state?.contractRepairEligibility, state?.contractRepair, identity]);
 
   // 子阶段实时流式文本：key = `${seq}:${subStage}`
   const [progress, setProgress] = useState<Record<string, string>>({});
@@ -74,7 +90,7 @@ export function useLoopWorkbenchState(sessionId: string, execKey: string, identi
     let s: LoopStateT | null = null;
     try { s = await api.loopGetState(sessionId, execKey); } catch { /* 只提供只读重试 */ }
     if (activeIdentityRef.current !== requestedIdentity || statePushRevision.current !== revision) return;
-    if (s) { setState(s); setLoadError(''); }
+    if (s?.sessionId === sessionId) { setState(s); setLoadError(''); }
     else setLoadError('LOOP 工作台加载失败，请重试读取');
   }, [sessionId, identity, execKey]);
 
@@ -135,6 +151,7 @@ export function useLoopWorkbenchState(sessionId: string, execKey: string, identi
   useEffect(() => { refresh(); }, [refresh]);
 
   useEffect(() => {
+    activeIdentityRef.current = identity;
     setState(null);
     setSelectedSeq(null);
     setRecordDetails({});
@@ -147,7 +164,7 @@ export function useLoopWorkbenchState(sessionId: string, execKey: string, identi
     pendingProgressRef.current = {};
     if (progressTimerRef.current) clearTimeout(progressTimerRef.current);
     progressTimerRef.current = null;
-    return () => { detailGeneration.current++; };
+    return () => { detailGeneration.current++; activeIdentityRef.current = ''; };
   }, [sessionId, identity, execKey]);
 
   // 订阅整份状态更新 + 子阶段流式文本（仅本 session）
@@ -155,7 +172,13 @@ export function useLoopWorkbenchState(sessionId: string, execKey: string, identi
     const un1 = api.onLoopUpdated((s: LoopStateT, executor) => {
       if (executor !== execKey || s.sessionId !== sessionId) return;
       statePushRevision.current++;
-      setState(previous => (previous?.controlRevision || 0) > (s.controlRevision || 0) ? previous : s);
+      setState(previous => {
+        if ((previous?.controlRevision || 0) > (s.controlRevision || 0)) return previous;
+        const before = previous?.loops.at(-1), after = s.loops.at(-1);
+        if (before?.seq === after?.seq && before?.round === after?.round
+          && contractSnapshotStale(before?.contractValidation, after?.contractValidation)) return previous;
+        return s;
+      });
     });
     const un2 = api.onLoopProgress((d, executor) => {
       if (executor !== execKey || d.sessionId !== sessionId) return;
@@ -199,5 +222,7 @@ export function useLoopWorkbenchState(sessionId: string, execKey: string, identi
     return { ...merged, diagnosticLive: record.seq === activeLoopSeq(state),
       callDiagnostics: mergeCallDiagnostics(merged.callDiagnostics, callDiagnostics[record.seq]) };
   }) } : null;
-  return { state: stateForView, loadError, refresh, selectedSeq, selectLoop, detailTarget, setDetailTarget, detailErrors, retryDetail, progress };
+  return { state: stateForView, loadError, refresh, selectedSeq, selectLoop, detailTarget, setDetailTarget, detailErrors, retryDetail, progress,
+    repair, requestRepair: (available: boolean) => repairController.current?.request(state?.contractRepairEligibility, available),
+    checkRepair: () => repairController.current?.check(), cancelRepair: () => repairController.current?.cancel() };
 }

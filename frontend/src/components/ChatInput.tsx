@@ -10,6 +10,7 @@ import { api, isTauri, onCurrentUserChanged, getExecutors, getCurrentUserProfile
 import { handoffParticipants, handoffScope } from '../utils/workbenchHandoffState';
 import { isSkillCommand, slashQuery, skillInvocation, suggestedSlashCommand, type SkillInvocation, type SkillCommand } from '../utils/skillCommands';
 import { RealtimeVoiceBar } from './RealtimeVoiceBar';
+import { AppModalPortal } from './AppModalPortal';
 import type { RealtimeVoiceInteractionMode } from '../utils/realtimeVoice';
 import { uuid } from '../utils/uuid';
 import { inputHistoryStore, normalizeInputHistory } from '../utils/inputHistory';
@@ -1764,6 +1765,8 @@ const ChatInputInner = forwardRef<ChatInputHandle, Props>(({
           </div>
           <BackendRuntimeFields
             backend={activeBackend}
+            sessionId={sessionId}
+            execKey={execKey}
             value={runtimeDraft}
             onChange={setRuntimeDraft}
           />
@@ -2165,30 +2168,35 @@ const ChatInputInner = forwardRef<ChatInputHandle, Props>(({
 
       {/* 新会话确认对话框（风格与 Sidebar 删除会话保持一致） */}
       {showNewSessionConfirm && (
-        <div style={confirmOverlayStyle} onClick={() => setShowNewSessionConfirm(false)}>
-          <div
-            style={{ ...confirmPanelStyle, animation: 'dialogSlideIn 0.28s cubic-bezier(0.22,0.61,0.36,1)' }}
-            onClick={(e) => e.stopPropagation()}
-          >
-            <h3 style={{ margin: '0 0 12px 0', fontSize: 16, fontWeight: 600, color: 'var(--theme-text, #1f2328)' }}>
-              开启新会话
-            </h3>
-            <p style={{ fontSize: 13, color: 'var(--theme-text-muted, #656d76)', margin: '0 0 16px 0', lineHeight: 1.5 }}>
-              当前会话的上下文将被清空，模型不再保留之前的对话内容。
-            </p>
-            <p style={{ fontSize: 12, color: 'var(--theme-text-muted, #656d76)', margin: '0 0 16px 0' }}>
-              历史消息仍保留在侧边栏，可随时回看。
-            </p>
-            <div style={{ display: 'flex', gap: 8 }}>
-              <button onClick={confirmNewSession} style={confirmBtnStyle}>
-                开始
-              </button>
-              <button onClick={() => setShowNewSessionConfirm(false)} style={cancelBtnStyle}>
-                取消
-              </button>
+        <AppModalPortal>
+          <div style={confirmOverlayStyle} onClick={() => setShowNewSessionConfirm(false)}>
+            <div
+              role="dialog"
+              aria-modal="true"
+              aria-labelledby="new-session-confirm-title"
+              style={{ ...confirmPanelStyle, animation: 'dialogSlideIn 0.28s cubic-bezier(0.22,0.61,0.36,1)' }}
+              onClick={(e) => e.stopPropagation()}
+            >
+              <h3 id="new-session-confirm-title" style={{ margin: '0 0 10px 0', fontSize: 16, fontWeight: 600, color: 'var(--theme-text, #1f2328)' }}>
+                开启新会话
+              </h3>
+              <p style={{ fontSize: 13, color: 'var(--theme-text-muted, #656d76)', margin: '0 0 8px 0', lineHeight: 1.5 }}>
+                当前会话的上下文将被清空，模型不再保留之前的对话内容。
+              </p>
+              <p style={{ fontSize: 12, color: 'var(--theme-text-muted, #656d76)', margin: '0 0 14px 0' }}>
+                历史消息仍保留在侧边栏，可随时回看。
+              </p>
+              <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8 }}>
+                <button onClick={() => setShowNewSessionConfirm(false)} style={cancelBtnStyle}>
+                  取消
+                </button>
+                <button onClick={confirmNewSession} style={confirmBtnStyle}>
+                  开始
+                </button>
+              </div>
             </div>
           </div>
-        </div>
+        </AppModalPortal>
       )}
 
     </div>
@@ -2338,24 +2346,26 @@ const filePickerFooterStyle: React.CSSProperties = {
 const confirmOverlayStyle: React.CSSProperties = {
   position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.5)',
   display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 1000,
+  padding: 16, boxSizing: 'border-box', overflow: 'auto',
 };
 
 const confirmPanelStyle: React.CSSProperties = {
   background: 'var(--theme-bg-secondary, #ffffff)',
   border: '1px solid var(--theme-border, rgba(0,0,0,0.15))',
   borderRadius: 8,
-  padding: 24, width: '90%', maxWidth: 400,
+  padding: 18, width: '100%', maxWidth: 360,
+  maxHeight: 'calc(100dvh - 32px)', overflowY: 'auto', boxSizing: 'border-box',
   boxShadow: '0 4px 20px rgba(0,0,0,0.15)',
 };
 
 const confirmBtnStyle: React.CSSProperties = {
-  flex: 1, padding: 10, borderRadius: 5,
+  minWidth: 78, padding: '8px 14px', borderRadius: 5,
   background: 'var(--theme-accent, #0969da)', border: 'none',
   color: '#fff', fontSize: 14, fontWeight: 500, cursor: 'pointer',
 };
 
 const cancelBtnStyle: React.CSSProperties = {
-  flex: 1, padding: 10, borderRadius: 5,
+  minWidth: 78, padding: '8px 14px', borderRadius: 5,
   background: 'var(--theme-bg-secondary, #f6f8fa)', border: '1px solid var(--theme-border, rgba(0,0,0,0.15))',
   color: 'var(--theme-text, #1f2328)', fontSize: 14, cursor: 'pointer',
 };

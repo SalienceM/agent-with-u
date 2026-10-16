@@ -50,6 +50,8 @@ async function fixture(page: Page, kind: 'normal' | 'loop' | 'manual' = 'normal'
       }
       if (frame.method === 'listDirectory') return reply(frame, [{ name: 'hello.py', path: 'hello.py', isDir: false }]);
       if (frame.method === 'gitDetect') return reply(frame, { isRepo: false });
+      if (frame.method === 'syncFileSearch') return reply(frame, { status: 'ok', matched: 1, indexed: 1, truncated: false,
+        results: [{ path: 'hello.py', name: 'hello.py', size: sourceText.length }] });
       if (frame.method === 'syncReadFile') return reply(frame, { status: 'ok', data: Buffer.from(sourceText).toString('base64') });
       if (frame.method === 'syncFileStat') return reply(frame, { status: 'ok', size: Buffer.byteLength(sourceText) });
       if (frame.method === 'syncReadChunk') { const bytes = Buffer.from(sourceText).subarray(frame.params[2], frame.params[2] + frame.params[3]);
@@ -123,7 +125,7 @@ for (const kind of ['normal', 'loop', 'manual'] as const) {
     const [left, center, right] = await Promise.all([files.boundingBox(), document.boundingBox(), chat.boundingBox()]);
     expect(left!.x + left!.width).toBeLessThanOrEqual(center!.x + 1);
     expect(center!.x + center!.width).toBeLessThanOrEqual(right!.x + 1);
-    await expect(document.getByRole('button', { name: '打开文件目录' })).toBeVisible();
+    await expect(document.getByRole('button', { name: '打开文件目录' })).toHaveCount(0);
     await files.locator('.ftp-row').filter({ hasText: 'hello.py' }).dblclick();
     await expect(document).toContainText('print("fixture")');
     await expect(page.getByRole('button', { name: '⛶ 最大化', exact: true })).toHaveCount(0);
@@ -141,6 +143,56 @@ for (const kind of ['normal', 'loop', 'manual'] as const) {
     expect(f.patches).toEqual([{ viewMode: 'engine' }, { viewMode: 'chat' }, { viewMode: 'engine' }]);
   });
 }
+
+test('new-session confirmation escapes pane clipping and keeps its actions in the viewport', async ({ page }) => {
+  const { pane } = await fixture(page);
+  await pane.getByTitle('新会话（清空上下文，同目录）').click();
+
+  const dialog = page.getByRole('dialog', { name: '开启新会话' });
+  await expect(dialog).toBeVisible();
+  await expect(dialog.getByRole('button', { name: '取消' })).toBeVisible();
+  await expect(dialog.getByRole('button', { name: '开始' })).toBeVisible();
+
+  const box = await dialog.boundingBox();
+  const viewport = page.viewportSize();
+  expect(box).not.toBeNull();
+  expect(viewport).not.toBeNull();
+  expect(box!.x).toBeGreaterThanOrEqual(0);
+  expect(box!.y).toBeGreaterThanOrEqual(0);
+  expect(box!.x + box!.width).toBeLessThanOrEqual(viewport!.width);
+  expect(box!.y + box!.height).toBeLessThanOrEqual(viewport!.height);
+
+  await dialog.getByRole('button', { name: '取消' }).click();
+  await expect(dialog).toBeHidden();
+});
+
+test('Ctrl+P has one file-search owner and restores a hidden narrow region without remounting documents', async ({ page }) => {
+  const f = await fixture(page);
+  await selectMode(page, f.pane, 'Engine');
+  const files = f.pane.getByRole('complementary', { name: 'Engine 文件目录' });
+  const document = f.pane.getByRole('region', { name: 'Engine 文件工作区' });
+  await files.locator('.ftp-row').filter({ hasText: 'hello.py' }).dblclick();
+  const editor = document.locator('.cm-content');
+  await expect(editor).toBeVisible();
+  const original = await editor.elementHandle();
+  await page.setViewportSize({ width: 390, height: 844 });
+  const regions = f.pane.getByRole('group', { name: 'Engine 区域' });
+  await regions.getByRole('button', { name: '文件', exact: true }).click();
+
+  const before = f.calls.filter(method => method === 'syncFileSearch').length;
+  await editor.focus();
+  await page.keyboard.press('Control+p');
+  const input = f.pane.getByRole('searchbox', { name: '搜索工作区文件' });
+  await expect(input).toBeFocused();
+  await page.keyboard.press('Control+p');
+  await expect(input).toBeFocused();
+  await input.fill('hello');
+  await expect.poll(() => f.calls.filter(method => method === 'syncFileSearch').length).toBe(before + 1);
+  await expect(f.pane.getByRole('region', { name: '工程文件查询' })).toHaveCount(0);
+  await input.press('Escape');
+  await expect(regions.getByRole('button', { name: '文件', exact: true })).toHaveAttribute('aria-pressed', 'true');
+  expect(await original!.evaluate(node => node.isConnected)).toBe(true);
+});
 
 test('only a known old executor gets local-only mode; it survives reload', async ({ page }) => {
   const f = await fixture(page, 'normal', 'old');
@@ -231,6 +283,7 @@ test('layout resizes with pointer/keyboard, collapses without destroying state a
   await f.pane.getByRole('button', { name: '对话区域', exact: true }).click();
   await expect(f.pane.locator('.chat-textarea')).toHaveValue('布局草稿');
   await selectMode(page, f.pane, 'Chat');
+  await expect(f.pane.locator('.awu-session-workbench')).toHaveAttribute('data-view-mode', 'chat');
   await selectMode(page, f.pane, 'Engine');
   await expect(handle).toHaveAttribute('aria-valuenow', '296');
   await expect(editor).toHaveText('unsaved layout file');

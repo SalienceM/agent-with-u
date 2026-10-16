@@ -1,4 +1,5 @@
 export interface LoopDecision {
+  causeRef?: string; causeRevision?: number;
   version?: number; decisionId?: string; action?: string; reasonCode?: string; reasonText?: string;
   nextStep?: string; resumeCondition?: string; affectedIds?: string[]; basisRefs?: string[];
   completionScope?: 'automatic' | 'full' | ''; revision?: number; round?: number; seq?: number;

@@ -11,6 +11,7 @@ export interface DeliveryReport {
   verification?: { status: string; evidence: string };
 }
 export interface ProgressGuard {
+  causeRef?: string; causeRevision?: number; round?: number; seq?: number;
   pause?: boolean; reason?: string; noProgressCount?: number; needsReplan?: boolean;
   scopeLost?: boolean; readyIds?: string[]; basis?: string;
 }

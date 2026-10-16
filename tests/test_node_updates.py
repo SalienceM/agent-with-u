@@ -430,7 +430,8 @@ class NodeUpdateAuthorizationTests(unittest.TestCase):
         try:
             for method in (
                 "saveBackend", "deleteBackend", "exportBackends",
-                "previewBackendImport", "importBackends", "exportData", "importData",
+                "previewBackendImport", "importBackends", "exportData", "exportDataStart",
+                "exportDataChunk", "exportDataFinish", "importData",
                 "saveMcpServers",
                 "openLoginTerminal", "openModelTerminal",
                 "skillRuntimeInspect", "skillRuntimePrepare",

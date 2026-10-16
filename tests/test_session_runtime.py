@@ -5,6 +5,8 @@ import unittest
 from src.backend.bridge_ws import BridgeWS
 from src.backend.codex_office import CodexOfficeBackend
 from src.backend.qwen_code_cli import QwenCodeSdkBackend
+from src.backend.codex_reasoning import normalize_reasoning_effort
+from src.backend.loop_store import LoopPolicy
 from src.types import BackendType, ModelBackendConfig, Session
 
 
@@ -20,6 +22,31 @@ class _Store:
 
 
 class SessionRuntimeTests(unittest.TestCase):
+    def test_dynamic_effort_survives_session_loop_and_cli(self):
+        runtime = {"model": "native-next", "reasoningEffort": "ultra"}
+        self.assertEqual(LoopPolicy._clean_runtime(runtime), runtime)
+        session, cfg = self._session(BackendType.CODEX_OFFICIAL)
+        session.reasoning_effort = "ultra"
+        session.model_override = "native-next"
+        self.assertEqual(BridgeWS._session_runtime(session), runtime)
+        bridge = object.__new__(BridgeWS)
+        bridge._backend_configs = [cfg]
+        bridge._active_sessions = {session.id: session}
+        bridge._session_store = _Store()
+        bridge._emit_session_updated = lambda _payload: None
+        self.assertEqual(json.loads(bridge._rpc_updateSessionRuntime(session.id, json.dumps(runtime)))["runtime"], runtime)
+        self.assertEqual(bridge._resolved_runtime(cfg.id, runtime), runtime)
+        kwargs = {}
+        backend = CodexOfficeBackend(cfg)
+        BridgeWS._add_runtime_kwargs(backend, kwargs, runtime)
+        self.assertEqual(kwargs["reasoning_effort"], "ultra")
+        command = backend._build_cmd(codex_cli="codex", prompt="test", model="native-next",
+            approval_mode="never", sandbox_mode="read-only", agent_session_id=None,
+            output_path=None, image_paths=[], stdin_mode=False, reasoning_effort="ultra")
+        self.assertIn("model_reasoning_effort=ultra", command)
+        for invalid in [None, {}, "", "a" * 65, 'high"', "high;cmd", "high\ncmd", "--config"]:
+            self.assertEqual(normalize_reasoning_effort(invalid), "")
+
     def _config(self, backend_type):
         return ModelBackendConfig(id="backend", label="Backend", type=backend_type)
 

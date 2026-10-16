@@ -15,6 +15,7 @@ async function fixture(page: Page, remote = false) {
     ]])) as Record<string, any[]>,
     mode: 'ok', hold: '', delayed: [] as Array<() => void>,
     catalogMode: 'ok', catalogHold: false, catalogDelayed: [] as Array<() => void>,
+    reasoning: false,
     calls: [] as Array<{ node: string; method: string; params: any[] }>,
     errors: [] as string[],
   };
@@ -49,10 +50,20 @@ async function fixture(page: Page, remote = false) {
         if (state.mode === 'save-then-read-fail') state.mode = 'read-fail';
         return reply(null);
       }
-      if (frame.method === 'codexModelCatalog') {
+      if (frame.method === 'codexModelCatalog' || frame.method === 'codexSessionModelCatalog') {
         const mode = state.catalogMode;
-        const result = { status: 'ok', source: 'codex-app-server', freshness: 'unknown',
+        const result: any = { status: 'ok', source: 'codex-app-server', freshness: 'unknown',
           fetchedAt: '2026-10-06T00:00:00Z', modelOptions: options(`synced-${node}`) };
+        if (state.reasoning) {
+          result.modelOptions = [{ id: 'unlisted-default' }, { id: 'other-model' }];
+          result.reasoningCapabilities = [
+            { model: 'unlisted-default', defaultReasoningEffort: 'ultra', supportedReasoningEfforts: [
+              { reasoningEffort: node === 'B' ? 'low' : 'high', description: `Native ${node}` },
+              { reasoningEffort: 'ultra', description: 'Native future effort' }] },
+            { model: 'other-model', defaultReasoningEffort: 'medium', supportedReasoningEfforts: [
+              { reasoningEffort: 'medium', description: 'Other model only' }] },
+          ];
+        }
         const complete = () => {
           if (mode === 'transport') return fail();
           if (mode === 'empty-ok') return reply({ ...result, modelOptions: [] });
@@ -90,6 +101,91 @@ async function edit(manager: Locator, label = 'Codex 官方账户') {
 async function candidates(input: Locator): Promise<string[]> {
   return input.evaluate((element: HTMLInputElement) => [...(element.list?.options ?? [])].map(o => o.value));
 }
+
+async function effortValues(select: Locator): Promise<string[]> {
+  return select.locator('option:not([disabled])').evaluateAll(items => items.map(item => (item as HTMLOptionElement).value));
+}
+
+test('native reasoning follows selected model, shows directory default and sends new effort unchanged', async ({ page }, info) => {
+  const data = await fixture(page);
+  data.reasoning = true;
+  const opener = page.getByRole('button', { name: '打开会话列表', exact: true });
+  if (await opener.isVisible()) await opener.click();
+  await page.locator('.awu-sidebar').getByText('客户工作会话 5', { exact: true }).click();
+  const pane = page.locator('[data-session-tab-panel="qa-chat-004"]');
+  await pane.getByRole('button', { name: /切换本 Session 模型/ }).click();
+  await pane.getByRole('button', { name: '跟随后端默认', exact: true }).click();
+  const effort = pane.getByRole('combobox', { name: '推理档位', exact: true });
+  await expect.poll(() => effortValues(effort)).toEqual(['', 'high', 'ultra']);
+  await expect(effort.locator('option[value="ultra"]')).toContainText('Codex 目录默认');
+  await expect(effort).toHaveValue('');
+  await effort.selectOption('ultra');
+  await pane.getByRole('button', { name: '应用到后续 turn' }).click();
+  expect(JSON.parse(data.calls.findLast(c => c.method === 'updateSessionRuntime')!.params[1])).toEqual({ reasoningEffort: 'ultra' });
+  await pane.getByRole('button', { name: /切换本 Session 模型/ }).click();
+  const model = pane.getByRole('combobox', { name: 'Codex 模型', exact: true });
+  await model.fill('other-model');
+  await expect.poll(() => effortValues(effort)).toEqual(['', 'medium']);
+  await expect(effort).toHaveValue('ultra');
+  await expect(pane).toContainText('原档位已保留');
+  await effort.selectOption('medium');
+  expect(data.calls.filter(c => c.method === 'codexSessionModelCatalog').every(c => c.params[0] === 'qa-chat-004' && c.params[1] === 'qa-primary')).toBe(true);
+  expect(data.calls.filter(c => c.method === 'codexModelCatalog')).toHaveLength(0);
+  await page.screenshot({ path: info.outputPath('native-reasoning.png') });
+  expect(data.errors).toEqual([]);
+});
+
+test('native reasoning loading and failure never invent choices or discard drafts; retry is explicit', async ({ page }) => {
+  const data = await fixture(page);
+  data.reasoning = true;
+  data.catalogHold = true;
+  await page.locator('.home-action-grid button').nth(0).click();
+  const effort = page.getByRole('combobox', { name: '推理档位', exact: true }).last();
+  const model = page.getByRole('combobox', { name: 'Codex 模型', exact: true }).last();
+  await expect(page.getByText('正在读取 Codex 档位…', { exact: true })).toBeVisible();
+  await expect.poll(() => effortValues(effort)).toEqual(['']);
+  await model.fill('other-model');
+  await expect.poll(() => data.catalogDelayed.length).toBeGreaterThan(0);
+  data.catalogDelayed.splice(0).forEach(fn => fn());
+  await expect.poll(() => effortValues(effort)).toEqual(['', 'medium']);
+  await effort.selectOption('medium');
+  await model.fill('not-in-codex');
+  await expect(page.getByText('原档位已保留', { exact: false })).toBeVisible();
+  data.catalogHold = false;
+  data.catalogMode = 'transport';
+  await page.getByRole('button', { name: '重新读取', exact: true }).click();
+  await expect(page.getByText('未能读取 Codex 档位', { exact: false })).toBeVisible();
+  await expect(effort).toHaveValue('medium');
+  await expect(model).toHaveValue('not-in-codex');
+  await expect.poll(() => effortValues(effort)).toEqual(['']);
+  data.catalogMode = 'ok';
+  await model.fill('unlisted-default');
+  await page.getByRole('button', { name: '重新读取', exact: true }).click();
+  await expect.poll(() => effortValues(effort)).toEqual(['', 'high', 'ultra']);
+  expect(data.errors).toEqual([]);
+});
+
+test('native reasoning isolates executor replies and non-Codex backends never query', async ({ page }) => {
+  const data = await fixture(page, true);
+  data.reasoning = true;
+  data.catalogHold = true;
+  data.nodes.B.push({ id: 'qwen', type: 'qwen-code-cli', label: 'Qwen QA', enabled: true, model: 'qwen-test' });
+  await page.locator('.home-action-grid button').nth(0).click();
+  await expect.poll(() => data.catalogDelayed.length).toBeGreaterThan(0);
+  const delayedA = data.catalogDelayed.splice(0);
+  data.catalogHold = false;
+  await page.getByRole('button', { name: /工作站 B/ }).click();
+  const effort = page.getByRole('combobox', { name: '推理档位', exact: true }).last();
+  await expect.poll(() => effortValues(effort)).toEqual(['', 'low', 'ultra']);
+  delayedA.forEach(fn => fn());
+  await expect.poll(() => effortValues(effort)).toEqual(['', 'low', 'ultra']);
+  const count = data.calls.filter(c => /codex.*ModelCatalog/.test(c.method)).length;
+  await page.locator('select').filter({ has: page.locator('option[value="qwen"]') }).selectOption('qwen');
+  await expect(page.getByRole('textbox', { name: 'Qwen 模型', exact: true })).toBeVisible();
+  await expect(effort).toHaveCount(0);
+  expect(data.calls.filter(c => /codex.*ModelCatalog/.test(c.method))).toHaveLength(count);
+  expect(data.errors).toEqual([]);
+});
 
 async function publish(page: Page, execKey = 'local', backendId = 'qa-primary') {
   await page.evaluate(async ({ execKey, backendId }) => {
@@ -423,6 +519,7 @@ test('an open LOOP policy keeps role drafts while candidate lists refresh and re
   const pane = page.locator('[data-session-tab-panel="qa-loop-000"]');
   const toggle = pane.getByRole('button', { name: /策略与心智/ });
   await toggle.click();
+  await pane.getByRole('button', { name: /编辑策略与心智/ }).click();
   const role = (name: string) => pane.getByRole('combobox', { name: `${name} Backend`, exact: true })
     .locator('..').getByRole('combobox', { name: 'Codex 模型', exact: true });
   await expect.poll(() => candidates(role('逐步执行'))).toEqual(['local/future', 'local/old']);
@@ -435,9 +532,9 @@ test('an open LOOP policy keeps role drafts while candidate lists refresh and re
   }
   await expect(role('逐步执行')).toHaveValue('unlisted/loop-draft');
   await expect.poll(() => candidates(role('评分 / 评审'))).toEqual(['review/future', 'review/old']);
-  await toggle.click();
+  await pane.getByRole('button', { name: /收起策略编辑/ }).click();
   data.nodes.local[0].modelOptions = options('other-window');
-  await toggle.click();
+  await pane.getByRole('button', { name: /编辑策略与心智/ }).click();
   await expect.poll(() => candidates(role('逐步执行'))).toEqual(['other-window/future', 'other-window/old']);
   await expect(role('逐步执行')).toHaveValue('unlisted/loop-draft');
   expect(data.calls.filter(c => c.method === 'loopSetPolicy')).toHaveLength(0);

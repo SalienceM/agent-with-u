@@ -163,7 +163,7 @@ export const App: React.FC = () => {
   const [backendConnected, setBackendConnected] = useState<boolean | null>(null);  // ★ null = connecting
   const [toast, setToast] = useState<{ type: 'success' | 'error' | 'info'; message: string } | null>(null);
   const [isImporting, setIsImporting] = useState(false);
-  const [dataPicker, setDataPicker] = useState<'export' | 'import' | null>(null);
+  const [dataPicker, setDataPicker] = useState<'import' | null>(null);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(
     () => !!windowRoute || typeof window !== 'undefined' && window.innerWidth <= 768,
   );
@@ -783,8 +783,8 @@ export const App: React.FC = () => {
       '当前焦点是内置使用手册。');
     if (newSessionDialogOpen) return panel('settings', 'panel:new-session', '新建 Session', '正在选择工作目录、执行节点与模型',
       '当前焦点是新建 Session 流程。');
-    if (dataPicker) return panel('settings', `panel:data-${dataPicker}`, dataPicker === 'export' ? '数据导出' : '数据导入', '正在选择服务器路径',
-      `当前焦点是${dataPicker === 'export' ? '导出' : '导入'}路径选择。`);
+    if (dataPicker) return panel('settings', 'panel:data-import', '数据导入', '正在选择服务器路径',
+      '当前焦点是导入路径选择。');
     if (surfaceFocus === 'skills' && repoPanelOpen) return panel('skills', `panel:${workbench.active}`, workbench.active === 'market' ? '扩展市场' : 'Skills 与 Prompts', activeSession?.workingDir || '全局资源库',
       '当前正在扩展工作区浏览市场或编辑 Skills 与 Prompts。具体编辑内容可通过当前编辑器或提问附件补充。');
     if (fileAttention?.sessionId === activeSessionId) return fileAttention;
@@ -1102,25 +1102,107 @@ export const App: React.FC = () => {
   }, [activeSessionId, config.exportFormat, showToast]);
 
   /* ---- 数据导出 ---- */
-  const runExport = useCallback(async (targetPath: string) => {
+  const runExport = useCallback(async (targetPath?: string) => {
     showToast('info', '导出中，请稍候…', 60000);
+    let transferId = '';
+    let localWrite: { dir: string; rel: string; transferId: string } | null = null;
     try {
-      const result = await api.exportData(targetPath);
-      if (result.status === 'ok') {
+      const started = await api.exportDataStart();
+      if (started.status !== 'ok' || !started.transferId || !started.fileName
+          || !Number.isFinite(started.size) || !started.sha256) {
+        throw new Error(started.message || '执行端没有返回有效的导出包');
+      }
+      transferId = started.transferId;
+      const total = Number(started.size);
+      const chunkSize = 1024 * 1024;
+      const browserParts: BlobPart[] = [];
+      let invoke: ((command: string, args?: Record<string, unknown>) => Promise<any>) | null = null;
+
+      if (targetPath) {
+        const [{ invoke: tauriInvoke }, pathApi] = await Promise.all([
+          import('@tauri-apps/api/core'), import('@tauri-apps/api/path'),
+        ]);
+        invoke = tauriInvoke;
+        localWrite = {
+          dir: await pathApi.dirname(targetPath),
+          rel: await pathApi.basename(targetPath),
+          transferId: crypto.randomUUID().replace(/-/g, ''),
+        };
+        await invoke('dir_sync_write_start', {
+          dir: localWrite.dir, rel: localWrite.rel, transferId: localWrite.transferId,
+        });
+      }
+
+      let offset = 0;
+      while (offset < total) {
+        const chunk = await api.exportDataChunk(transferId, offset, Math.min(chunkSize, total - offset));
+        if (chunk.status !== 'ok' || chunk.offset !== offset || chunk.total !== total
+            || !chunk.data || !Number.isFinite(chunk.size)) {
+          throw new Error(chunk.message || '导出分块响应无效');
+        }
+        const binary = atob(chunk.data);
+        const bytes = new Uint8Array(binary.length);
+        for (let index = 0; index < binary.length; index++) bytes[index] = binary.charCodeAt(index);
+        if (chunk.size !== bytes.length) throw new Error('导出分块大小校验失败');
+        if (localWrite && invoke) {
+          await invoke('dir_sync_write_chunk', {
+            dir: localWrite.dir, rel: localWrite.rel, transferId: localWrite.transferId,
+            offset, data: chunk.data,
+          });
+        } else {
+          browserParts.push(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer);
+        }
+        offset += bytes.length;
+        if (bytes.length === 0 && offset < total) throw new Error('导出传输提前结束');
+      }
+
+      if (localWrite && invoke && targetPath) {
+        await invoke('dir_sync_write_finish', {
+          dir: localWrite.dir, rel: localWrite.rel, transferId: localWrite.transferId, expectedSize: total,
+        });
+        localWrite = null;
+        const verified = await api.kitClientLocalFileInfo(targetPath);
+        if (verified.size !== total || verified.sha256.toLowerCase() !== started.sha256.toLowerCase()) {
+          throw new Error('客户端导出文件完整性校验失败');
+        }
         showToast('success', `导出成功 → ${targetPath}`);
       } else {
-        showToast('error', `导出失败：${result.message}`);
+        const blob = new Blob(browserParts, { type: 'application/gzip' });
+        const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', await blob.arrayBuffer()));
+        const digestHex = Array.from(digest, value => value.toString(16).padStart(2, '0')).join('');
+        if (blob.size !== total || digestHex !== started.sha256.toLowerCase()) {
+          throw new Error('浏览器导出文件完整性校验失败');
+        }
+        const url = URL.createObjectURL(blob);
+        const anchor = document.createElement('a');
+        anchor.href = url;
+        anchor.download = started.fileName;
+        document.body.appendChild(anchor);
+        anchor.click();
+        anchor.remove();
+        window.setTimeout(() => URL.revokeObjectURL(url), 30_000);
+        showToast('success', `导出成功 → ${started.fileName}`);
       }
     } catch (e: any) {
       console.error('[export] exportData failed:', e);
       showToast('error', `导出异常：${e?.message ?? e}`);
+      if (localWrite) {
+        try {
+          const { invoke } = await import('@tauri-apps/api/core');
+          await invoke('dir_sync_write_abort', {
+            dir: localWrite.dir, rel: localWrite.rel, transferId: localWrite.transferId,
+          });
+        } catch { /* 最佳努力清理客户端临时文件 */ }
+      }
+    } finally {
+      if (transferId) await api.exportDataFinish(transferId);
     }
   }, [showToast]);
 
   const handleExportData = useCallback(async () => {
-    // 浏览器 / 远程 C/S：导出文件落在「服务器」上，用 ServerDirPicker。
+    // 浏览器直接下载到客户端；桌面端先选择客户端路径，再从执行端分块拉取。
     if (!isTauri()) {
-      setDataPicker('export');
+      await runExport();
       return;
     }
     let targetPath: string | null = null;
@@ -2125,15 +2207,7 @@ export const App: React.FC = () => {
         />
       )}
 
-      {/* ---- 数据导入/导出：服务器文件选择器（非桌面端） ---- */}
-      {dataPicker === 'export' && (
-        <ServerDirPicker
-          mode="save"
-          saveFilename={`agent-with-u-export-${new Date().toISOString().slice(0, 10)}.tar.gz`}
-          onSelect={(p) => { setDataPicker(null); runExport(p); }}
-          onCancel={() => setDataPicker(null)}
-        />
-      )}
+      {/* ---- 数据导入：服务器文件选择器（非桌面端） ---- */}
       {dataPicker === 'import' && (
         <ServerDirPicker
           mode="open"
@@ -2894,6 +2968,7 @@ const NewSessionDialog: React.FC<NewSessionDialogProps> = ({
               <div style={{ marginTop: 10 }}>
                 <LoopPolicyEditor
                   value={loopPolicy}
+                  execKey={execKey}
                   onChange={setLoopPolicy}
                   availableBackends={execBackends}
                   sessionBackendId={selectedBackendId}
@@ -3014,6 +3089,7 @@ const NewSessionDialog: React.FC<NewSessionDialogProps> = ({
           <div style={formGroupStyle}>
             <BackendRuntimeFields
               backend={execBackends.find((b) => b.id === selectedBackendId)}
+              execKey={execKey}
               value={sessionRuntime}
               onChange={setSessionRuntime}
             />

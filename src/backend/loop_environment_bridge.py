@@ -181,10 +181,46 @@ class LoopEnvironmentBridge:
     async def _loop_environment_dependencies(self, session: Any, state: Any) -> list[str]:
         reference = normalize_environment(state.execution_environment)['workflowRef']
         if reference:
-            await asyncio.to_thread(resolve_workflow, session, self._skill_store, reference, state.goal)
+            basis, goal = digest([reference, state.goal]), state.goal
+            status = 'unknown'
+            try:
+                await asyncio.to_thread(resolve_workflow, session, self._skill_store, reference, goal)
+                status = 'validated'
+            except WorkflowSelectionError:
+                status = 'invalid'
+                raise
+            finally:
+                current = normalize_environment(state.execution_environment)
+                if basis == digest([current['workflowRef'], state.goal]):
+                    # 复用实际解析观察，不在序列化期间发现声明或执行命令；迟到结果不覆盖新身份。
+                    state.execution_environment = {**current, 'workflowValidation': {
+                        'basis': basis, 'status': status, 'checkedAt': time.time()}}
             return ['openspec']
         # 当前正式来源适配器仅 OpenSpec；绑定依赖不等于猜选 change。
         return ['openspec'] if (state.task_source or {}).get('binding') else []
+
+    def _loop_dependency_summary(self, state: Any) -> dict:
+        """有界的依据摘要；核验声明不是工具可用证明，更不是任务验收。"""
+        env = normalize_environment(state.execution_environment)
+        source, origins = state.task_source or {}, []
+        if source.get('binding'):
+            origins.append({'kind': 'task_source', 'status': source.get('status', 'unknown'),
+                'ref': f"source:{state.session_id}:{source.get('revision', 0)}"})
+        reference = env['workflowRef']
+        if reference:
+            observation = env.get('workflowValidation', {})
+            status = observation.get('status', 'unknown') if observation.get('basis') == digest([reference, state.goal]) else 'unknown'
+            if reference.get('scope') != digest(state.goal):
+                status = 'invalid'
+            origins.append({'kind': 'declaration', 'status': status,
+                'ref': reference.get('command', ''), 'revision': reference.get('revision', 0)})
+        latest = env['latest']
+        if latest.get('dependencyId') == 'openspec':
+            origins.append({'kind': 'observation', 'status': latest['status'],
+                'ref': f"environment:{latest['id']}:{latest['revision']}", 'coverage': latest['coverage']})
+        return {'version': 1, 'sessionId': state.session_id, 'environmentRevision': env['revision'],
+            'sourceRevision': source.get('revision', 0), 'items': [{'id': 'openspec',
+                'required': bool(source.get('binding') or reference), 'origins': origins}] if origins else []}
 
     def _loop_environment_hooks(self, session: Any, backend: Any, identity: ExecutionIdentity,
                                 seq: int, diagnostic: Any = None, *, explicit: bool = False):

@@ -11,7 +11,12 @@
     "outDir": ".home-test-dist"
   },
   "include": [
+    "src/utils/filePanelPresentation.ts",
+    "src/utils/codexReasoning.ts",
+    "src/utils/thoughtsInspection.ts",
     "src/utils/loopWorkbenchView.ts",
+    "src/utils/loopContractController.ts",
+    "src/utils/loopActionController.ts",
     "src/utils/codexCatalogSync.ts",
     "src/utils/codexModelOptions.ts",
     "src/utils/backendCatalog.ts",

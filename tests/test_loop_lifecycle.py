@@ -47,6 +47,8 @@ class LoopLifecycleTests(unittest.IsolatedAsyncioTestCase):
         bridge._loop_pending_continues = {}
         bridge._loop_active_backends = {}
         bridge._abort_loop_backend_calls = Mock()
+        # 业务夹具不启动真正的快照 worker；拥有权/响应性在 startup 专项测试验证。
+        bridge._loop_startup_snapshot = AsyncMock(return_value=True)
         return bridge, session
 
     async def _start_blocked_iteration(
