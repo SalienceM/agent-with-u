@@ -1,10 +1,13 @@
+import asyncio
 import json
 import time
 import unittest
+from types import SimpleNamespace
 
 from src.backend.bridge_ws import BridgeWS
 from src.backend.codex_office import CodexOfficeBackend
 from src.backend.qwen_code_cli import QwenCodeSdkBackend
+from src.backend.openai_compat import OpenAICompatibleBackend
 from src.backend.codex_reasoning import normalize_reasoning_effort
 from src.backend.loop_store import LoopPolicy
 from src.types import BackendType, ModelBackendConfig, Session
@@ -90,6 +93,56 @@ class SessionRuntimeTests(unittest.TestCase):
         self.assertEqual(result["runtime"], {"model": "qwen-next"})
         self.assertEqual(session.agent_session_id, "native-thread-id")
         self.assertIsNone(session.reasoning_effort)
+
+    def test_poe_chat_accepts_session_bot_but_drops_effort(self):
+        session, config = self._session(BackendType.OPENAI_COMPATIBLE)
+        config.base_url = "https://api.poe.com/v1"
+        config.model = "assistant"
+        bridge = object.__new__(BridgeWS)
+        bridge._active_sessions = {session.id: session}
+        bridge._backend_configs = [config]
+        bridge._session_store = _Store()
+        bridge._emit_session_updated = lambda _payload: None
+
+        result = json.loads(bridge._rpc_updateSessionRuntime(
+            session.id, json.dumps({"model": "GPT-Official-Bot", "reasoningEffort": "high"})
+        ))
+
+        self.assertEqual(result["runtime"], {"model": "GPT-Official-Bot"})
+        self.assertEqual(session.model_override, "GPT-Official-Bot")
+        self.assertIsNone(session.reasoning_effort)
+        self.assertEqual(
+            bridge._resolved_runtime(config.id, {"model": "GPT-Official-Bot"}),
+            {"model": "GPT-Official-Bot"},
+        )
+        kwargs = {}
+        BridgeWS._add_runtime_kwargs(OpenAICompatibleBackend(config), kwargs, result["runtime"])
+        self.assertEqual(kwargs, {"model_override": "GPT-Official-Bot"})
+
+    def test_poe_chat_rejects_skills_and_filters_legacy_skill_constraints(self):
+        session, config = self._session(BackendType.OPENAI_COMPATIBLE)
+        config.base_url = "https://api.poe.com/v1"
+        session.abilities = {"skills": ["legacy-agent"], "prompts": ["tone"]}
+        session.constraints = "LEGACY SKILL MANUAL MUST NOT LEAK"
+        bridge = object.__new__(BridgeWS)
+        bridge._active_sessions = {session.id: session}
+        bridge._backend_configs = [config]
+        bridge._session_store = _Store()
+        bridge._prompt_store = SimpleNamespace(
+            get_prompt=lambda name: {"content": "Be concise."} if name == "tone" else None,
+        )
+        bridge._build_asset_context_block = lambda: None
+
+        rejected = json.loads(asyncio.run(bridge._rpc_updateSessionAbilities(
+            session.id, json.dumps({"skills": ["new-agent"], "prompts": []}),
+        )))
+
+        self.assertEqual(rejected["status"], "error")
+        self.assertIn("纯 Chat", rejected["message"])
+        self.assertEqual(
+            bridge._compose_constraints(session, include_skill_hints=False),
+            "Be concise.",
+        )
 
     def test_runtime_kwargs_are_backend_specific(self):
         qwen = QwenCodeSdkBackend(self._config(BackendType.QWEN_CODE_CLI))

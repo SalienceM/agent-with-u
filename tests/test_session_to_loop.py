@@ -5,7 +5,7 @@ from unittest.mock import Mock
 
 from src.backend.bridge_ws import BridgeWS
 from src.backend.loop_store import STAGE_EXECUTE
-from src.types import ChatMessage, Session
+from src.types import BackendType, ChatMessage, ModelBackendConfig, Session
 from src.backend.loop_environment_workflow import workflow_choices
 
 
@@ -38,6 +38,22 @@ def _bridge(session: Session) -> BridgeWS:
 
 
 class SessionToLoopTests(unittest.TestCase):
+    def test_poe_chat_session_cannot_convert_to_loop(self) -> None:
+        session = _session()
+        session.backend_id = "poe"
+        bridge = _bridge(session)
+        bridge._backend_configs = [ModelBackendConfig(
+            id="poe", type=BackendType.OPENAI_COMPATIBLE, label="Poe Chat",
+            base_url="https://api.poe.com/v1", model="assistant",
+        )]
+
+        result = json.loads(bridge._rpc_convertSessionToLoop(session.id, "目标"))
+
+        self.assertEqual("error", result["status"])
+        self.assertIn("Poe", result["message"])
+        self.assertEqual("normal", session.session_type)
+        bridge._session_store.save.assert_not_called()
+
     def test_conversion_explicit_dependency_is_not_source_or_execution_authorization(self):
         session = _session()
         session.abilities = {'skills': ['openspec-apply-change']}

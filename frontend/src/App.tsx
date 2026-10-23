@@ -51,6 +51,7 @@ import {
   BackendRuntimeFields,
   formatRuntimeLabel,
   isCodexBackend,
+  isPoeBackend,
   isRuntimeConfigurableBackend,
   normalizeModelRuntime,
   type ModelRuntime,
@@ -2705,7 +2706,7 @@ function formatModelLabel(backend: any, session?: any): string {
     model: session?.modelOverride,
     reasoningEffort: session?.reasoningEffort,
   });
-  return backend.model || env.OPENAI_MODEL || env.ANTHROPIC_MODEL || env.QWEN_MODEL || 'auto';
+  return session?.modelOverride || backend.model || env.OPENAI_MODEL || env.ANTHROPIC_MODEL || env.QWEN_MODEL || 'auto';
 }
 
 /* ---- New Session Dialog: Select working directory first ---- */
@@ -2817,6 +2818,7 @@ const NewSessionDialog: React.FC<NewSessionDialogProps> = ({
   }, [selectedBackendId]);
   const selectedBackend = execBackends.find((item) => item.id === selectedBackendId);
   const isCodex = isCodexBackend(selectedBackend);
+  const poeChatOnly = isPoeBackend(selectedBackend);
   const runtimeConfigurable = isRuntimeConfigurableBackend(selectedBackend);
   const [codexLocation, setCodexLocation] = useState<'local' | 'node'>('local');
   const [remoteThreads, setRemoteThreads] = useState<any[]>([]);
@@ -2837,6 +2839,13 @@ const NewSessionDialog: React.FC<NewSessionDialogProps> = ({
       setRemoteThreadId('');
     }
   }, [isCodex]);
+
+  useEffect(() => {
+    if (poeChatOnly && sessionType !== 'normal') {
+      setSessionType('normal');
+      setPolicyOpen(false);
+    }
+  }, [poeChatOnly, sessionType]);
 
   useEffect(() => {
     setRemoteThreads([]);
@@ -2932,12 +2941,16 @@ const NewSessionDialog: React.FC<NewSessionDialogProps> = ({
             ] as const).map((opt) => (
               <button
                 key={opt.v}
-                onClick={() => setSessionType(opt.v)}
+                onClick={() => { if (!(poeChatOnly && opt.v === 'loop')) setSessionType(opt.v); }}
+                disabled={poeChatOnly && opt.v === 'loop'}
+                title={poeChatOnly && opt.v === 'loop' ? 'Poe 通道仅支持普通 Chat Session' : undefined}
                 style={{
-                  flex: 1, textAlign: 'left', padding: '10px 12px', borderRadius: 8, cursor: 'pointer',
+                  flex: 1, textAlign: 'left', padding: '10px 12px', borderRadius: 8,
                   background: sessionType === opt.v ? 'var(--theme-accent-bg, #0969da1a)' : 'var(--theme-bg-tertiary, #f6f8fa)',
                   border: `1px solid ${sessionType === opt.v ? 'var(--theme-accent, #0969da)' : 'var(--theme-border, rgba(0,0,0,0.12))'}`,
                   color: 'var(--theme-text, #1f2328)',
+                  opacity: poeChatOnly && opt.v === 'loop' ? 0.45 : 1,
+                  cursor: poeChatOnly && opt.v === 'loop' ? 'not-allowed' : 'pointer',
                 }}
               >
                 <div style={{ fontSize: 13, fontWeight: 600 }}>{opt.icon} {opt.title}</div>

@@ -108,6 +108,15 @@ export interface PoeAccountOverview {
   message?: string;
 }
 
+export interface PoeModelCatalog {
+  status: 'ok' | 'error' | string;
+  models: PoeModelInfo[];
+  modelCount: number;
+  catalogError?: string;
+  fetchedAt: number;
+  message?: string;
+}
+
 /** 当前 Web/桌面 Backend 作为 Relay 执行节点的注册状态。 */
 export interface RelayNodeStatus {
   supported: boolean;
@@ -2796,6 +2805,28 @@ export const api = {
     }
   },
 
+  async poeModelCatalog(backendId: string, execKey?: string): Promise<PoeModelCatalog> {
+    const result = execKey
+      ? await callOnStrict(execKey, 'poeModelCatalog', [backendId], 30_000)
+      : await homeConn.request('poeModelCatalog', [backendId]);
+    try {
+      const parsed = JSON.parse(result);
+      return {
+        status: parsed?.status || 'error',
+        models: Array.isArray(parsed?.models) ? parsed.models : [],
+        modelCount: Number(parsed?.modelCount || 0),
+        catalogError: parsed?.catalogError || '',
+        fetchedAt: Number(parsed?.fetchedAt || 0),
+        message: parsed?.message,
+      };
+    } catch {
+      return {
+        status: 'error', models: [], modelCount: 0, fetchedAt: 0,
+        message: 'Poe Bot 目录响应格式错误',
+      };
+    }
+  },
+
   async getSessionTokenUsage(id: string): Promise<any | null> {
     const result = await call('getSessionTokenUsage', id);
     if (result === null || result === undefined) return null;
@@ -5119,6 +5150,15 @@ function mockDispatch(method: string, params: any[]): any {
       modelCount: 2,
       currentPointBalance: params[0] ? 1500 : null,
       balanceError: params[0] ? '' : '请填写 Poe API Key 后刷新余额',
+      fetchedAt: Date.now(),
+    });
+    case 'poeModelCatalog': return JSON.stringify({
+      status: 'ok',
+      models: [
+        { id: 'assistant', createdAt: Date.now() - 86_400_000, description: 'Poe 自动路由助手', ownedBy: 'poe' },
+        { id: 'GPT-5.4', createdAt: Date.now() - 172_800_000, description: 'OpenAI model on Poe', ownedBy: 'poe' },
+      ],
+      modelCount: 2,
       fetchedAt: Date.now(),
     });
     case 'saveBackend': {

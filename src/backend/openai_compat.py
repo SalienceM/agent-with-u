@@ -4,6 +4,7 @@ from typing import Optional, Callable, Awaitable
 import httpx
 from ..types import ModelBackendConfig, ChatMessage, ImageAttachment, new_id
 from .base import ModelBackend, StreamDelta, _exc_msg
+from .poe_api import is_poe_api_base_url
 
 # ---------------------------------------------------------------------------
 #  OpenAI Compatible Backend (unchanged)
@@ -23,6 +24,7 @@ class OpenAICompatibleBackend(ModelBackend):
         extra_tools: Optional[list[dict]] = None,
         on_tool_call: Optional[Callable] = None,
         constraints: Optional[str] = None,  # ★ Session-level constraints/rules/prompts
+        model_override: Optional[str] = None,
         **kwargs,
     ) -> dict:
         self.clear_cancelled(session_id)
@@ -69,6 +71,7 @@ class OpenAICompatibleBackend(ModelBackend):
             api_messages.append({"role": "user", "content": current_content})
 
             base_url = self.config.base_url or "https://api.openai.com/v1"
+            poe_chat_only = is_poe_api_base_url(base_url)
             headers = {"Content-Type": "application/json"}
             if self.config.api_key:
                 headers["Authorization"] = f"Bearer {self.config.api_key}"
@@ -78,7 +81,10 @@ class OpenAICompatibleBackend(ModelBackend):
             # 转换 Anthropic 格式 tools 到 OpenAI 格式
             oai_tools: Optional[list[dict]] = None
             oai_tool_names: set[str] = set()
-            if extra_tools:
+            # Poe is intentionally a plain chat channel in AgentWithU.  Even if
+            # a caller accidentally supplies Backend Skills, never expose them
+            # to a Poe bot and never enter the function-call execution loop.
+            if extra_tools and not poe_chat_only:
                 oai_tools = []
                 for t in extra_tools:
                     oai_tools.append({
@@ -103,7 +109,8 @@ class OpenAICompatibleBackend(ModelBackend):
                 _finish_reason: Optional[str] = None
 
                 req_json: dict = {
-                    "model": self.config.model or "gpt-4o",
+                    "model": (str(model_override or "").strip()
+                              or self.config.model or "gpt-4o"),
                     "messages": api_messages,
                     "stream": True,
                 }

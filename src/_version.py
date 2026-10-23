@@ -1,7 +1,7 @@
 # auto-written by scripts/stamp_version.py
-__version__ = '26.10.15.160027'
-__display_version__ = '26.10.15.160027'
-__package_version__ = '26.10.30960'
-__build_id__ = '20261015160027-1800ae42e7d7'
-__build_sequence__ = 20261015160027
-__commit__ = '1800ae42e7d7'
+__version__ = '26.10.23.235903'
+__display_version__ = '26.10.23.235903'
+__package_version__ = '26.10.47439'
+__build_id__ = '20261023235903-43607381dac3'
+__build_sequence__ = 20261023235903
+__commit__ = '43607381dac3'

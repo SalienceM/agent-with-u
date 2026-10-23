@@ -5,12 +5,36 @@ from __future__ import annotations
 import asyncio
 import time
 from typing import Any, Optional
+from urllib.parse import urlsplit
 
 import httpx
 
 
 POE_MODELS_URL = "https://api.poe.com/v1/models"
 POE_BALANCE_URL = "https://api.poe.com/usage/current_balance"
+
+
+def is_poe_api_base_url(value: Any) -> bool:
+    """Return whether a configured OpenAI-compatible endpoint is Poe's API.
+
+    Keep this check strict: chat-only restrictions must not be enabled by a
+    look-alike hostname or by a path that merely contains ``/v1``.
+    """
+
+    try:
+        parsed = urlsplit(str(value or "").strip())
+        return (
+            parsed.scheme.lower() == "https"
+            and (parsed.hostname or "").lower() == "api.poe.com"
+            and parsed.port in (None, 443)
+            and parsed.path.rstrip("/") == "/v1"
+            and not parsed.username
+            and not parsed.password
+            and not parsed.query
+            and not parsed.fragment
+        )
+    except ValueError:
+        return False
 
 
 def _response_error(label: str, response: httpx.Response) -> str:

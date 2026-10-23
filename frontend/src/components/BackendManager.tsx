@@ -2074,7 +2074,7 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
                   <div>
                     <label style={{ ...labelStyle, marginBottom: 4 }}>OpenAI Compatible 配置</label>
                     <p style={{ fontSize: 11, color: 'var(--theme-text-muted)', margin: 0, lineHeight: 1.5 }}>
-                      兼容 OpenAI Chat Completions API 的服务；Poe 可额外读取实时模型目录与账号积分。
+                      兼容 OpenAI Chat Completions API 的服务；Poe 可读取官方 Bot 目录与账号积分。
                     </p>
                   </div>
                   <button
@@ -2144,10 +2144,10 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
                     <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 10, marginBottom: 9 }}>
                       <div>
                         <div style={{ fontSize: 12, fontWeight: 650, color: 'var(--theme-text)' }}>
-                          ◈ Poe 实时入口
+                          ◈ Poe Chat · 官方 Bot
                         </div>
                         <div style={{ marginTop: 3, fontSize: 10.5, color: 'var(--theme-text-muted)' }}>
-                          API 可用目录与当前账号积分；每次刷新都直接查询 Poe。
+                          实时读取 API 可用目录与当前账号积分；会话中也可切换 Bot。
                         </div>
                       </div>
                       <button
@@ -2246,6 +2246,7 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
                       {poeOverview?.fetchedAt ? `最后查询：${formatPoeTime(poeOverview.fetchedAt)}。` : ''}
                       余额是 API 返回的当前可用积分总数；Poe 暂不返回套餐总额、已用量或到期拆分。
                       目录仅代表 API 可调用项，不等同于 Poe Explore 全站榜单，私有 Bot 目前不可通过 API 调用。
+                      Poe 在 AgentWithU 中固定为纯 Chat 通道：不发送 Skills、Kit、Workspace tools 或函数工具，不参与 LOOP。
                     </div>
                   </div>
                 )}

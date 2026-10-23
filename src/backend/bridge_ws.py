@@ -110,7 +110,7 @@ from .token_usage import (
 from .loop_diagnostics import LoopCallDiagnostics
 from .update_manager import UpdateManager
 from .release_center import ReleaseCenterManager
-from .poe_api import fetch_poe_overview
+from .poe_api import fetch_poe_overview, is_poe_api_base_url
 from .kit_capabilities import (
     KitCapabilityContext,
     KitCapabilityError,
@@ -2082,7 +2082,7 @@ class BridgeWS(AsideInspectionBridge, LoopStartupBridge, LoopOpenSpecBridge, Loo
             or method.startswith("relayNode")
             or method.startswith("skillRuntime")
             or method in {
-                "saveBackend", "deleteBackend", "exportBackends", "poeAccountOverview", "codexModelCatalog",
+                "saveBackend", "deleteBackend", "exportBackends", "poeAccountOverview", "poeModelCatalog", "codexModelCatalog",
                 "previewBackendImport", "importBackends",
                 "exportData", "exportDataStart", "exportDataChunk", "exportDataFinish", "importData",
                 "saveMcpServers", "openLoginTerminal", "openModelTerminal",
@@ -4087,6 +4087,13 @@ class BridgeWS(AsideInspectionBridge, LoopStartupBridge, LoopOpenSpecBridge, Loo
                 remote_thread_id, connection_mode, codex_remote_host,
             )
         cfg = next((item for item in self._backend_configs if item.id == backend_id), None)
+        if (
+            is_loop
+            and cfg is not None
+            and cfg.type == BackendType.OPENAI_COMPATIBLE
+            and is_poe_api_base_url(cfg.base_url)
+        ):
+            raise ValueError("Poe 通道仅支持普通 Chat Session，不支持 LOOP / Agent 执行。")
         if connection_mode in {"node", "ssh"}:
             if not cfg or cfg.type != BackendType.CODEX_OFFICIAL:
                 raise ValueError("Codex 原生 thread 只能用于 Codex Office backend")
@@ -4146,7 +4153,10 @@ class BridgeWS(AsideInspectionBridge, LoopStartupBridge, LoopOpenSpecBridge, Loo
             messages=imported_messages, working_dir=resolved_dir, backend_id=backend_id,
             owner_id=self._current_owner_id(),
             model_override=runtime.get("model"),
-            reasoning_effort=runtime.get("reasoningEffort"),
+            reasoning_effort=(
+                runtime.get("reasoningEffort")
+                if cfg and cfg.type == BackendType.CODEX_OFFICIAL else None
+            ),
             agent_session_id=remote_thread_id,
             codex_connection_mode=connection_mode or None,
             codex_remote_host=codex_remote_host,
@@ -4160,15 +4170,20 @@ class BridgeWS(AsideInspectionBridge, LoopStartupBridge, LoopOpenSpecBridge, Loo
         if is_loop:
             self._loop_create(session.id)
         # ★ 默认档自动绑定：新建 session 时把被标记为 isDefault 的 Prompt/Skill 全部挂上去
-        try:
-            defaults = await asyncio.to_thread(self._default_abilities)
-            if defaults.get("skills") or defaults.get("prompts"):
-                await asyncio.to_thread(self._apply_session_abilities, session, defaults, deploy=False)
-                print(f"[BridgeWS] Auto-bound defaults to new session {session.id}: "
-                      f"skills={defaults.get('skills')} prompts={defaults.get('prompts')}",
-                      file=sys.stderr, flush=True)
-        except Exception as e:
-            print(f"[BridgeWS] Failed to auto-bind defaults: {e}", file=sys.stderr)
+        if not (
+            cfg
+            and cfg.type == BackendType.OPENAI_COMPATIBLE
+            and is_poe_api_base_url(cfg.base_url)
+        ):
+            try:
+                defaults = await asyncio.to_thread(self._default_abilities)
+                if defaults.get("skills") or defaults.get("prompts"):
+                    await asyncio.to_thread(self._apply_session_abilities, session, defaults, deploy=False)
+                    print(f"[BridgeWS] Auto-bound defaults to new session {session.id}: "
+                          f"skills={defaults.get('skills')} prompts={defaults.get('prompts')}",
+                          file=sys.stderr, flush=True)
+            except Exception as e:
+                print(f"[BridgeWS] Failed to auto-bind defaults: {e}", file=sys.stderr)
         self._active_sessions[session.id] = session
         self._session_store.save(session, async_=True)
         self._emit_session_updated({
@@ -5127,6 +5142,20 @@ class BridgeWS(AsideInspectionBridge, LoopStartupBridge, LoopOpenSpecBridge, Loo
         if session.session_type != "normal":
             return json.dumps({
                 "status": "error", "message": "当前 Session 类型不支持转换为 LOOP",
+            }, ensure_ascii=False)
+
+        cfg = next((
+            item for item in getattr(self, "_backend_configs", [])
+            if item.id == session.backend_id
+        ), None)
+        if (
+            cfg is not None
+            and cfg.type == BackendType.OPENAI_COMPATIBLE
+            and is_poe_api_base_url(cfg.base_url)
+        ):
+            return json.dumps({
+                "status": "error",
+                "message": "Poe 通道是纯 Chat Backend，不能转换为 LOOP / Agent Session",
             }, ensure_ascii=False)
 
         busy_reason = self._session_destroy_busy_reason(session_id)
@@ -12470,6 +12499,31 @@ Kit 版本账本（版本属于 Kit，不属于 AI）：
             return json.dumps({"status": "error", "message": "Poe API Key 过长"}, ensure_ascii=False)
         return json.dumps(await fetch_poe_overview(api_key), ensure_ascii=False)
 
+    async def _rpc_poeModelCatalog(self, backend_id: str) -> str:
+        """Load the official Poe API bot catalog for a saved chat backend.
+
+        The caller sends only a Backend id.  Its API key stays on the executor
+        and is not needed by Poe's public ``/models`` catalog endpoint.
+        """
+        config = next((item for item in self._backend_configs if item.id == backend_id), None)
+        if (
+            config is None
+            or config.type != BackendType.OPENAI_COMPATIBLE
+            or not is_poe_api_base_url(config.base_url)
+        ):
+            return json.dumps({
+                "status": "error", "message": "请选择已保存的 Poe Chat Backend",
+                "models": [], "modelCount": 0,
+            }, ensure_ascii=False)
+        overview = await fetch_poe_overview("")
+        return json.dumps({
+            "status": overview.get("status", "error"),
+            "models": overview.get("models", []),
+            "modelCount": overview.get("modelCount", 0),
+            "catalogError": overview.get("catalogError", ""),
+            "fetchedAt": overview.get("fetchedAt", 0),
+        }, ensure_ascii=False)
+
     def _rpc_exportBackends(self, selected_ids_json: str = "") -> str:
         """Return a controller-downloadable JSON file for selected Backends."""
         try:
@@ -14177,6 +14231,23 @@ except urllib.error.URLError as e:
                 for key in ("skills", "prompts")
             ):
                 raise ValueError("能力绑定格式错误")
+            config = next((
+                item for item in getattr(self, "_backend_configs", [])
+                if item.id == session.backend_id
+            ), None)
+            poe_chat_only = bool(
+                config
+                and config.type == BackendType.OPENAI_COMPATIBLE
+                and is_poe_api_base_url(config.base_url)
+            )
+            if poe_chat_only and abilities.get("skills"):
+                return json.dumps({
+                    "status": "error",
+                    "message": "Poe 通道固定为纯 Chat，不能绑定或执行 Skill",
+                }, ensure_ascii=False)
+            if poe_chat_only:
+                abilities["kitToolsMode"] = "off"
+                abilities["workspaceToolsMode"] = "off"
             if "kitToolsMode" in abilities:
                 mode = abilities["kitToolsMode"]
                 if not isinstance(mode, str) or mode not in KIT_PROMPT_MODES:
@@ -14606,7 +14677,15 @@ except urllib.error.URLError as e:
             if not session:
                 return json.dumps({"status": "error", "message": "Session not found"}, ensure_ascii=False)
             cfg = next((item for item in self._backend_configs if item.id == session.backend_id), None)
-            if not cfg or cfg.type not in {BackendType.CODEX_OFFICIAL, BackendType.QWEN_CODE_CLI}:
+            poe_chat = bool(
+                cfg
+                and cfg.type == BackendType.OPENAI_COMPATIBLE
+                and is_poe_api_base_url(cfg.base_url)
+            )
+            if not cfg or (
+                cfg.type not in {BackendType.CODEX_OFFICIAL, BackendType.QWEN_CODE_CLI}
+                and not poe_chat
+            ):
                 return json.dumps({
                     "status": "error",
                     "message": "当前 Backend 不支持 Session 级模型切换",
@@ -15623,7 +15702,15 @@ except urllib.error.URLError as e:
     def _resolved_runtime(self, backend_id: str, runtime: Optional[dict] = None) -> dict:
         """Resolve the runtime actually visible to a backend for trace/ledger UI."""
         cfg = next((c for c in self._backend_configs if c.id == backend_id), None)
-        if not cfg or cfg.type not in {BackendType.CODEX_OFFICIAL, BackendType.QWEN_CODE_CLI}:
+        poe_chat = bool(
+            cfg
+            and cfg.type == BackendType.OPENAI_COMPATIBLE
+            and is_poe_api_base_url(cfg.base_url)
+        )
+        if not cfg or (
+            cfg.type not in {BackendType.CODEX_OFFICIAL, BackendType.QWEN_CODE_CLI}
+            and not poe_chat
+        ):
             return {}
         raw = LoopPolicy._clean_runtime(runtime or {})
         env = cfg.env or {}
@@ -15645,7 +15732,13 @@ except urllib.error.URLError as e:
     def _add_runtime_kwargs(backend: ModelBackend, kwargs: dict, runtime: Optional[dict],
                             session: Optional["Session"] = None) -> None:
         """Pass per-turn model knobs only to backends that explicitly support them."""
-        if not isinstance(backend, (CodexOfficeBackend, QwenCodeSdkBackend)):
+        from .openai_compat import OpenAICompatibleBackend
+
+        poe_chat = (
+            isinstance(backend, OpenAICompatibleBackend)
+            and is_poe_api_base_url(getattr(getattr(backend, "config", None), "base_url", None))
+        )
+        if not isinstance(backend, (CodexOfficeBackend, QwenCodeSdkBackend)) and not poe_chat:
             return
         cleaned = LoopPolicy._clean_runtime(runtime or {})
         kwargs["model_override"] = cleaned.get("model")
@@ -16625,12 +16718,25 @@ except urllib.error.URLError as e:
         cleaned = _re.sub(r"(?:\s*---)+$", "", cleaned).strip()
         return cleaned or None
 
-    def _compose_constraints(self, session: "Session") -> Optional[str]:
+    def _compose_constraints(
+        self, session: "Session", *, include_skill_hints: bool = True,
+    ) -> Optional[str]:
         """会话约束 + 素材池上下文块（后者不写入持久化的 session.constraints）。"""
         session_constraints = self._strip_generated_backend_skill_block(getattr(session, "constraints", None))
+        if not include_skill_hints and (getattr(session, "abilities", None) or {}).get("skills"):
+            # Poe is chat-only.  Older Sessions may still contain a constraints
+            # snapshot generated from bound Agent Skills, so rebuild only the
+            # explicitly selected reusable prompts instead of leaking Skill
+            # manuals into the request context.
+            prompt_parts: list[str] = []
+            for prompt_name in (session.abilities or {}).get("prompts", []):
+                prompt = self._prompt_store.get_prompt(prompt_name)
+                if prompt and prompt.get("content"):
+                    prompt_parts.append(str(prompt["content"]))
+            session_constraints = "\n\n---\n\n".join(prompt_parts) or None
         parts = [p for p in (session_constraints, self._build_asset_context_block()) if p]
         runtime = getattr(self, "_skill_runtime", None)
-        if runtime:
+        if runtime and include_skill_hints:
             for skill_name in (getattr(session, "abilities", None) or {}).get("skills", []):
                 try:
                     hint = runtime.hint(skill_name)
@@ -16697,6 +16803,12 @@ except urllib.error.URLError as e:
             content = payload.get("content", "")
             display_content = content
             backend_id = payload["backendId"]
+            backend_cfg = next((c for c in self._backend_configs if c.id == backend_id), None)
+            poe_chat_only = bool(
+                backend_cfg
+                and backend_cfg.type == BackendType.OPENAI_COMPATIBLE
+                and is_poe_api_base_url(backend_cfg.base_url)
+            )
             raw_images = payload.get("images")
             raw_text_attachments = payload.get("textAttachments")
             auto_continue = payload.get("autoContinue", True)
@@ -16713,7 +16825,6 @@ except urllib.error.URLError as e:
             if "skipPermissions" in payload:
                 skip_permissions = bool(payload["skipPermissions"])
             else:
-                backend_cfg = next((c for c in self._backend_configs if c.id == backend_id), None)
                 skip_permissions = getattr(backend_cfg, "skip_permissions", True)
             working_dir = payload.get("workingDir")
 
@@ -16803,7 +16914,8 @@ except urllib.error.URLError as e:
             # ★ 用户贴图 + session 有 Backend Skill 时：
             #   保存图片到 skill-images 并在 content 中注入 HTTP URL，
             #   让模型知道可以把这些 URL 作为 ref_image 传给 skill
-            if images and session.abilities and session.abilities.get("skills"):
+            if (not poe_chat_only and images and session.abilities
+                    and session.abilities.get("skills")):
                 import base64 as _b64
                 from pathlib import Path as _Path
                 has_backend_skill = any(
@@ -16887,16 +16999,26 @@ except urllib.error.URLError as e:
             # 失败都在此落盘并推送，不能仅在前端提示或把命令当普通文本交给模型。
             skill_call = None
             if display_content.lstrip().startswith('/') or payload.get("skillInvocation") is not None:
-                config = next((c for c in self._backend_configs if c.id == backend_id), None)
+                config = backend_cfg
                 skill_call = await asyncio.to_thread(
                     resolve_skill_call, session, config, self._skill_store,
                     display_content, payload.get("skillInvocation"),
                 )
+                if (
+                    skill_call
+                    and config is not None
+                    and config.type == BackendType.OPENAI_COMPATIBLE
+                    and is_poe_api_base_url(config.base_url)
+                ):
+                    raise SkillCommandError(
+                        "POE_CHAT_ONLY",
+                        "Poe 通道仅支持普通对话，不执行 Skill 或 Agent 工具。",
+                    )
                 if skill_call and kit_approval_delegation:
                     raise SkillCommandError("SKILL_DELEGATION_UNSUPPORTED", "Skill 命令不携带 Kit 代确认授权，请关闭仅本次代确认后重试。")
 
             # 文件准备必须在模型开始前完成，但磁盘工作不能阻塞心跳/Relay。
-            if not skill_call or skill_call[0].get("kind") != "project":
+            if not poe_chat_only and (not skill_call or skill_call[0].get("kind") != "project"):
                 await self._prepare_session_skills(session)
 
             if skill_call:
@@ -16907,7 +17029,9 @@ except urllib.error.URLError as e:
                     {key: metadata[key] for key in ("name", "arguments", "digest")},
                 )
 
-            constraints = self._compose_constraints(session)
+            constraints = self._compose_constraints(
+                session, include_skill_hints=not poe_chat_only,
+            )
             if skill_call:
                 constraints = "\n\n---\n\n".join(part for part in (constraints, skill_call[1]) if part)
                 from .loop_environment_workflow import workflow_choices
@@ -17005,18 +17129,24 @@ except urllib.error.URLError as e:
         from .claude_code import ClaudeCodeOfficialBackend
         token = ""
         workspace_token = ""
+        poe_chat_only = False
         if session.codex_connection_mode != "ssh":
             backend = self._get_backend(backend_id)
+            poe_chat_only = (
+                isinstance(backend, OpenAICompatibleBackend)
+                and is_poe_api_base_url(getattr(getattr(backend, "config", None), "base_url", None))
+            )
             # 图片等非工具 Backend 不得收到带令牌的控制指令。
             if isinstance(backend, (
                 AnthropicAPIBackend, OpenAICompatibleBackend, CodexOfficeBackend,
                 QwenCodeSdkBackend, ClaudeAgentBackend, ClaudeCodeOfficialBackend,
-            )) and self._session_kit_prompt_enabled(session):
+            )) and not poe_chat_only and self._session_kit_prompt_enabled(session):
                 token = service.issue(session.id, allow_approval=kit_approval_delegation,
                                       message_id=user_message_id)
             if (workspace_tools and (session.abilities or {}).get("workspaceToolsMode", "on") == "on"
                     and isinstance(backend, (AnthropicAPIBackend, OpenAICompatibleBackend, CodexOfficeBackend,
-                                            QwenCodeSdkBackend, ClaudeAgentBackend, ClaudeCodeOfficialBackend))):
+                                            QwenCodeSdkBackend, ClaudeAgentBackend, ClaudeCodeOfficialBackend))
+                    and not poe_chat_only):
                 workspace_service = getattr(self, "_chat_workspace_tools", None)
                 if workspace_service is None:
                     workspace_service = self._chat_workspace_tools = ChatWorkspaceTools(self)
@@ -17057,14 +17187,23 @@ except urllib.error.URLError as e:
     ):
         backend = self._get_backend(backend_id)
         assistant_msg = session.messages[-1]
+        from .openai_compat import OpenAICompatibleBackend
+        poe_chat_only = (
+            isinstance(backend, OpenAICompatibleBackend)
+            and is_poe_api_base_url(getattr(getattr(backend, "config", None), "base_url", None))
+        )
 
         # ── 收集 Backend Skills（API 类 backend 使用）──
         extra_tools, skill_map = self._collect_backend_skills(session)
+        if poe_chat_only:
+            # Defense in depth: Poe never receives executable tool schemas or
+            # callbacks, even when the Session has Skills/Kit abilities bound.
+            extra_tools, skill_map = [], None
         # 内置名称保留；停用时不能借同名 Repo Skill 暴露伪造的 Kit 入口。
         extra_tools = [tool for tool in extra_tools if tool["name"] not in {CHAT_KIT_TOOL_NAME, WORKSPACE_TOOL_NAME}]
-        if kit_token:
+        if kit_token and not poe_chat_only:
             extra_tools.append(CHAT_KIT_TOOL)
-        if workspace_token:
+        if workspace_token and not poe_chat_only:
             extra_tools.append(WORKSPACE_TOOL)
         if extra_tools:
             print(f"[bridge_ws] Session {session.id}: {len(extra_tools)} Backend Skills detected: "
@@ -17076,7 +17215,7 @@ except urllib.error.URLError as e:
             "web-search": ["WebSearch"],
             "web-fetch": ["WebFetch"],
         }
-        abilities = session.abilities or {}
+        abilities = {} if poe_chat_only else (session.abilities or {})
         blocked_tools: set[str] = set()
         for sname in abilities.get("skills", []):
             info = self._skill_store.get_skill(sname)

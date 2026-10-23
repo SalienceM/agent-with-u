@@ -3,6 +3,7 @@ import { api } from '../api';
 import {
   BackendRuntimeFields,
   isCodexBackend,
+  isPoeBackend,
   isRuntimeConfigurableBackend,
   normalizeModelRuntime,
   type ModelRuntime,
@@ -120,7 +121,9 @@ export const LoopPolicyEditor: React.FC<{
   const [presets, setPresets] = useState<any[]>([]);
   const [sel, setSel] = useState('');
   const [loadedBackends, setLoadedBackends] = useState<any[]>([]);
-  const backends = availableBackends ?? loadedBackends;
+  // Poe is a deliberately chat-only channel and must not be offered for any
+  // LOOP role, even when it exists in the executor's Backend catalog.
+  const backends = (availableBackends ?? loadedBackends).filter((backend) => !isPoeBackend(backend));
   const [ledger, setLedger] = useState<any[]>([]);
   const [showLedger, setShowLedger] = useState(false);
   const reload = () => api.loopPolicyPresetList().then((r) => setPresets(r.presets || [])).catch(() => {});
