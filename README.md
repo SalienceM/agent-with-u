@@ -36,6 +36,30 @@ AgentWithU 用 PySide6 托管 QWebEngine，前端是 React，后端是 Python—
 - **会话管理** — 多会话侧边栏，按工作目录组织，支持迁移模型，一键新建干净会话
 - **权限审批** — 工具调用权限弹窗，diff 预览文件改动
 
+### DeepSeek Harness（预发布接入）
+
+在 Backend Manager 新建 `DeepSeek Harness`，配置 API Key 和可选连接地址、默认模型。Session 的模型/推理覆盖留空时沿用 Backend/运行时默认；候选由用户维护，不表示账号一定可用。保存或查看配置不会启动模型，也不会替换现有 Qwen/Codex/API 后端。
+
+当前锁定 **dsh-v0.2.1-rc.3**（预发布，2026-10-26 核对），commit `1f81c047fc48fa190a683e469daa699857e9afe8`。PyPI 当时仅有 rc2，因此使用固定官方源码构建的同版 SDK/runtime wheel；不从 `latest` 动态更新，不混配 rc2/rc3。版本和摘要见 `deploy/deepseek-harness.lock.json` 及两平台构建回执。
+
+- 原生文件/命令、流式工具结果、独立原生上下文恢复、显式 Skills/MCP、隔离 LOOP 和无工具辅助问答。
+- 运行中只支持**排到下一轮**；不支持同轮引导、中断后自动重引导、外部线程接管和图片附件。不支持的请求会明确失败，不暗删参数重发。
+- 访问策略与 OS 沙箱证明不同；“不询问”是拒绝权限升级，不是全权限。退出未确认会保留活动保护，不能自动重试或切换 Backend 解锁。
+- `session-log-deepseek` 额外日志上传关闭；正常模型请求仍会发送任务上下文。API Key 使用既有凭据配置，不写入 Harness patch 或诊断。
+- Skills 只准备显式绑定项，不扫描用户默认 Agent home。Kit 代确认仍要求本次独立开关，Workspace 跨会话写入仍单独确认。
+
+源码/发行构建须先准备锁定的 wheel 和桥，运行 `scripts/prepare_harness_bundle.py`，再运行 `scripts/prepare_backend_build.py`。缺少或摘要不匹配即停止，不在聊天时下载安装。runtime 路径覆盖仅接受摘要匹配的整套配套目录。PyInstaller 两入口共用收集规则；Docker 同样在安装前验证本地 wheel。**离线依赖不等于离线模型。** 目标平台为 Windows amd64 / Linux x86_64，其他架构明确拒绝；完整冻结包验收尚未完成，详见 [归档实施记录](openspec/changes/archive/2026-10-27-add-deepseek-harness-backend/implementation-status.md)，不能将当前开发产物当作已发布版本。
+
+验收边界（2026-10-27）：Windows 冻结包的文件/命令、授权、恢复、停止已通过，但外网阻断测试未完成；Linux 冻结包启动与资源校验通过，当前验证容器不允许创建沙箱 namespace，命令工具会明确拒绝执行。安装 bubblewrap 不代表宿主允许使用它，不能用全权限模式替代原沙箱验收。
+
+回滚时先停用新 Backend 并确认运行已退出，保留 Harness home、原生历史与 AWU 关联；不要删除历史、转换为别的后端类型或用旧 runtime 降级读取。
+
+### AIMEIN 执行模式
+
+在 **New Session → AIMEIN** 创建会话，以动态 Sprint 建设产品功能流程（FlowBuild）及必要基础设施（Infra）。三个不同模型在独立会话中评审同版成果，全部通过才推进阶段；未通过则保留标准修补。工作台展示阶段成熟度、三方意见、历史尝试与证据，支持手动推进、Auto、停止和人工接管。
+
+成熟度只描述当前 Sprint 的范围；整体目标有独立收口条件。使用方式、实现边界和后续设计依据见 [AIMEIN 设计与使用](docs/aimein-execution-mode.md)。
+
 ### Workspace Kits（实验）
 - **Session 级标准配件** — 用 🧰 入口把重复工作定义成带类型输入的 Kit，而不是散落的临时命令
 - **可恢复的 Kit 优化对话** — 优化窗口仅点击关闭按钮退出，点击旁边不关闭；关闭后后台继续生成，重新打开恢复历史和真实状态。同一浏览器标签页保留未发送草稿与 Backend 选择，执行端重启导致的中断会明确提示，不会一直假装运行。

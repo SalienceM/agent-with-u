@@ -1,0 +1,7 @@
+{
+  "name": "@agentwithu/deepseek-harness-bridge",
+  "version": "0.2.1-rc.3",
+  "private": true,
+  "type": "module",
+  "license": "MIT"
+}

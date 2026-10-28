@@ -458,6 +458,21 @@ class BlockerIntegrationTests(unittest.IsolatedAsyncioTestCase):
 
 
 class IsolationTests(unittest.TestCase):
+    def test_unverified_declaration_can_schedule_preparation_not_tests(self):
+        self.condition['evidenceRefs'] = []
+        plan = freeze_plan(dict(version=1, tasks=tasks(), preconditions=[self.condition]), self.steps, {}, IDENTITY)
+        self.assertTrue(plan['valid'], plan)
+        self.assertEqual(plan['preconditions'][0]['status'], 'unverified')
+        self.assertTrue(isolation_gate(plan, {}, IDENTITY, self.steps[1], str(self.root)))
+        receipt = isolation_receipts(self.observation, plan, IDENTITY, self.steps[0], str(self.root))
+        self.assertTrue(receipt['valid'], receipt)
+        self.assertEqual(isolation_gate(plan, receipt, IDENTITY, self.steps[1], str(self.root)), '')
+        self.observation['items'][0]['evidenceRefs'] = []
+        self.assertFalse(isolation_receipts(self.observation, plan, IDENTITY, self.steps[0], str(self.root))['valid'])
+        for malformed in (None, '', ['ref'] * 17):
+            self.condition['evidenceRefs'] = malformed
+            self.assertFalse(freeze_plan(dict(version=1, tasks=tasks(), preconditions=[self.condition]), self.steps, {}, IDENTITY)['valid'])
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
@@ -491,6 +506,12 @@ class IsolationTests(unittest.TestCase):
         self.assertTrue(isolation_gate(self.plan, receipts, IDENTITY, self.steps[1], str(self.root)))
         self.plan['preconditions'][0]['baselineBasis'] = '用户明确要求真实基线前后比较'
         self.assertFalse(isolation_receipts(self.observation, self.plan, IDENTITY, self.steps[0], str(self.root))['valid'])
+
+    def test_receipt_cannot_rewrite_declared_mechanism_or_revision(self):
+        for field in ('method', 'configRevision'):
+            observation = copy.deepcopy(self.observation)
+            observation['items'][0][field] = 'different mechanism or revision'
+            self.assertFalse(isolation_receipts(observation, self.plan, IDENTITY, self.steps[0], str(self.root))['valid'])
 
     def test_outside_root_or_alias_never_reads_real_data(self):
         self.observation['items'][0]['actualRoot'] = '..'

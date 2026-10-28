@@ -4,15 +4,20 @@ import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(SPECPATH)))
 from src.package_readiness import MODULES, RESOURCES
+from scripts.harness_pyinstaller import collect as collect_harness
 
 datas = [("frontend/dist", "frontend_dist")]
 datas += [("tools/engine-providers/" + name, "engine-providers") for name in RESOURCES]
 binaries = []
+_hdata, _hbinary, _himports = collect_harness()
+datas += _hdata
+binaries += _hbinary
 hiddenimports = [
     "websockets", "PIL", "claude_agent_sdk", "certifi", "pydantic", "mcp", "dashscope", "edge_tts",
 ]
 datas += collect_data_files("certifi")
 hiddenimports += list(MODULES)
+hiddenimports += _himports
 if sys.version_info < (3, 11):
     hiddenimports += ['tomli']
 _data, _binary, _imports = collect_all('pathspec')

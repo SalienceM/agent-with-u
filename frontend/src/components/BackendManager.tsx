@@ -1,3 +1,4 @@
+import { createPortal } from 'react-dom';
 import React, { useState, useCallback, useEffect, useRef } from 'react';
 import {
   api, getExecutors, getHomeExecKey, onExecStatus,
@@ -7,6 +8,7 @@ import { sessionsForBackendExecutor } from '../utils/backendManagement';
 import { cloneCodexModelOptions, normalizeCodexModelOptions, resolveCodexModelOptions, type CodexModelOption } from '../utils/codexModelOptions';
 import { CodexModelOptionsEditor } from './CodexModelOptionsEditor';
 import { CodexCatalogSync } from './CodexCatalogSync';
+import { HarnessBackendFields, type HarnessConfigFields } from './HarnessBackendFields';
 
 // 注入删除按钮 hover 样式（只执行一次）
 if (typeof document !== 'undefined' && !document.getElementById('bm-delete-btn-style')) {
@@ -23,7 +25,7 @@ declare global {
   }
 }
 
-interface BackendConfig {
+interface BackendConfig extends HarnessConfigFields {
   id: string;
   type: string;
   label: string;
@@ -85,6 +87,8 @@ const ALL_TOOLS = ['Read', 'Edit', 'Write', 'Bash', 'Glob', 'Grep', 'WebSearch',
 
 interface BackendManagerProps {
   isOpen: boolean;
+  worldDock?: boolean;
+  worldDockTarget?: HTMLElement | null;
   onClose: () => void;
   backends: BackendConfig[];
   targetExecKey: string;
@@ -177,7 +181,7 @@ const McpServersEditor: React.FC<{
       </label>
       <p style={{ fontSize: 11, color: 'var(--theme-text-muted)', margin: '0 0 10px 0', lineHeight: 1.6 }}>
         配置 MCP (Model Context Protocol) 工具服务器。
-        Claude 会自动使用这些服务器提供的工具（如 Puppeteer 截图、文件系统访问等）。
+        Agent 会使用这些服务器提供的工具（如 Puppeteer 截图、文件系统访问等）。
         留空则不启用 MCP。
       </p>
       <div style={{ marginBottom: 8 }}>
@@ -213,6 +217,8 @@ const McpServersEditor: React.FC<{
 
 export const BackendManager: React.FC<BackendManagerProps> = ({
   isOpen,
+  worldDock = false,
+  worldDockTarget,
   onClose,
   backends,
   targetExecKey,
@@ -253,6 +259,9 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
   const [transferState, setTransferState] = useState<BackendTransferState | null>(null);
   const importFileInputRef = useRef<HTMLInputElement | null>(null);
   const panelRef = useRef<HTMLDivElement | null>(null);
+  useEffect(() => {
+    if (isOpen && worldDock) panelRef.current?.querySelector<HTMLButtonElement>('[aria-label="关闭 Backend 配置"]')?.focus();
+  }, [isOpen, worldDock, worldDockTarget]);
   const [poeOverview, setPoeOverview] = useState<PoeAccountOverview | null>(null);
   const [poeLoading, setPoeLoading] = useState(false);
   const [poeError, setPoeError] = useState('');
@@ -643,6 +652,21 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
       }
       if (contextWindow != null) saved.qwenContextWindowSize = contextWindow;
       if (maxOutput != null) saved.qwenMaxOutputTokens = maxOutput;
+    } else if (formData.type === 'deepseek-harness') {
+      const maximum = formData.harnessMaxTokens;
+      if (maximum != null && (!Number.isSafeInteger(maximum) || maximum <= 0)) {
+        setOperationMessage({ kind: 'error', text: 'Harness 最大输出 Tokens 必须是正整数' });
+        return;
+      }
+      Object.assign(saved, {
+        model: formData.model?.trim() || undefined, baseUrl: formData.baseUrl?.trim() || undefined,
+        apiKey: formData.apiKey?.trim() || undefined, cliPath: formData.cliPath?.trim() || undefined,
+        workingDir: formData.workingDir?.trim() || undefined,
+        harnessProvider: formData.harnessProvider || 'deepseek-official',
+        harnessPermissionMode: formData.harnessPermissionMode || 'workspace-write',
+        harnessMaxTokens: maximum, skipPermissions: formData.skipPermissions === true,
+        env: formData.env, allowedTools: formData.allowedTools, mcpServers: formData.mcpServers,
+      });
     } else if (formData.type === 'codex-office') {
       const cleanedEnv: Record<string, string> = {};
       Object.entries(formData.env || {}).forEach(([k, v]) => {
@@ -682,7 +706,7 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
       if (Object.keys(cleanedEnv).length > 0) saved.env = cleanedEnv;
     }
 
-    if (formData.type === 'codex-office') {
+    if (formData.type === 'codex-office' || formData.type === 'deepseek-harness') {
       try { saved.modelOptions = normalizeCodexModelOptions(formData.modelOptions); }
       catch (error: any) {
         setOperationMessage({ kind: 'error', text: error.message });
@@ -887,9 +911,11 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
 
   if (!isOpen) return null;
 
-  return (
-    <div style={overlayStyle}>
-      <div role="dialog" aria-label="Backend 配置" aria-modal="true" ref={panelRef} style={panelStyle} onClick={(e) => e.stopPropagation()}>
+  const manager = (
+    <div style={worldDock ? { position: 'absolute', inset: 0, zIndex: 3 } : overlayStyle}>
+      <div role="dialog" aria-label="Backend 配置" aria-modal={!worldDock} ref={panelRef}
+        onKeyDown={event => { if (worldDock && event.key === 'Escape') { event.stopPropagation(); onClose(); } }}
+        style={worldDock ? { ...panelStyle, width: '100%', height: '100%', maxWidth: 'none', maxHeight: 'none', padding: 14 } : panelStyle} onClick={(e) => e.stopPropagation()}>
         {/* 标题栏 */}
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
           <h2 style={{ margin: 0, fontSize: 18, fontWeight: 600, color: 'var(--theme-text)' }}>
@@ -1223,6 +1249,8 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
                           apiKey: '',
                           env: {},
                           extraHeaders: undefined,
+                          ...(newType === 'deepseek-harness' ? { allowedTools: undefined, modelOptions: null,
+                            cliPath: undefined, harnessProvider: 'deepseek-official', harnessPermissionMode: 'workspace-write' } : {}),
                           skipPermissions: (newType === 'claude-agent-sdk' || newType === 'qwen-code-cli' || newType === 'codex-office') ? true : undefined,
                         });
                       }}
@@ -1230,6 +1258,7 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
                     >
                       <option value="claude-agent-sdk">Claude Agent SDK</option>
                       <option value="qwen-code-cli">Qwen Code CLI</option>
+                      <option value="deepseek-harness">DeepSeek Harness（0.2.1-rc.3）</option>
                       <option value="codex-office">Codex Office</option>
                       <option value="openai-compatible">OpenAI Compatible / Poe</option>
                       <option value="anthropic-api">Anthropic API</option>
@@ -1532,6 +1561,8 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
             )}
 
             {/* ── Qwen Code CLI 专属配置 ── */}
+            {formData.type === 'deepseek-harness' && <HarnessBackendFields value={formData}
+              onChange={patch => setFormData(previous => ({ ...previous, ...patch }))} />}
             {formData.type === 'qwen-code-cli' && (
               <div style={{ marginBottom: 16, padding: 12, background: 'var(--theme-bg-secondary)', borderRadius: 8 }}>
                 <label style={{ ...labelStyle, marginBottom: 8 }}>Qwen Code CLI 配置</label>
@@ -2060,7 +2091,7 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
             )}
 
             {/* ── MCP Servers 配置（claude-agent-sdk / claude-code-official / qwen-code-cli）── */}
-            {(formData.type === 'claude-agent-sdk' || formData.type === 'claude-code-official' || formData.type === 'qwen-code-cli' || formData.type === 'codex-office' || formData.pinned) && (
+            {(formData.type === 'claude-agent-sdk' || formData.type === 'claude-code-official' || formData.type === 'qwen-code-cli' || formData.type === 'codex-office' || formData.type === 'deepseek-harness' || formData.pinned) && (
               <McpServersEditor
                 mcpServers={formData.mcpServers}
                 onChange={(v) => setFormData((prev) => ({ ...prev, mcpServers: v }))}
@@ -3033,6 +3064,7 @@ export const BackendManager: React.FC<BackendManagerProps> = ({
       </div>
     </div>
   );
+  return worldDock && worldDockTarget ? createPortal(manager, worldDockTarget) : manager;
 };
 
 /* ---- styles ---- */

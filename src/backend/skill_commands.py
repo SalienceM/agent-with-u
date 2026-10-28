@@ -16,7 +16,8 @@ from .skill_command_presets import BUILTIN_PROFILES
 from .skill_paths import project_skill_reference, render_skill_markdown
 
 NATIVE_SKILL_BACKENDS = {"codex-office": "codex", "qwen-code-cli": "qwen",
-                       "claude-agent-sdk": "claude", "claude-code-official": "claude"}
+                       "claude-agent-sdk": "claude", "claude-code-official": "claude",
+                       "deepseek-harness": "harness"}
 MAX_INSTRUCTION_CHARS = 128_000
 
 
@@ -174,7 +175,9 @@ def _preflight(command: dict, root: Path, config: Any) -> str:
     cli = ""
     if "cli" in command:
         tools = set(config.allowed_tools or [])
-        if str(getattr(config.type, "value", config.type)) != "codex-office" and tools and not tools.intersection({"Bash", "run_shell_command"}):
+        if str(getattr(config.type, "value", config.type)) == "deepseek-harness" and config.allowed_tools is not None and not tools.intersection({"bash", "pwsh"}):
+            raise SkillCommandError("SKILL_TOOL_UNAVAILABLE", "Harness 工具白名单未开放原生 bash/pwsh 终端。")
+        if str(getattr(config.type, "value", config.type)) not in {"codex-office", "deepseek-harness"} and tools and not tools.intersection({"Bash", "run_shell_command"}):
             raise SkillCommandError("SKILL_TOOL_UNAVAILABLE", "当前 Backend 的工具白名单未开放终端。")
         spec = command["cli"]
         executable = spec.get("windowsExecutable", spec["executable"]) if os.name == "nt" else spec["executable"]
@@ -273,7 +276,11 @@ def resolve_skill_call(session: Any, config: Any, store: Any, content: str,
         if not body.strip() or len(body) > MAX_INSTRUCTION_CHARS:
             raise SkillCommandError("SKILL_INSTRUCTIONS_INVALID", "Skill 说明为空或超过 128K 字符，无法完整加载。")
         backend_type = str(getattr(config.type, "value", config.type))
-        reference = project_skill_reference(NATIVE_SKILL_BACKENDS[backend_type], name)
+        if backend_type == "deepseek-harness":
+            from .deepseek_harness_skills import skill_root
+            reference = (skill_root(owner=session.owner_id, backend=config.id, session=session.id) / name).as_posix()
+        else:
+            reference = project_skill_reference(NATIVE_SKILL_BACKENDS[backend_type], name)
         metadata["reference"] = reference
         instructions += f"配套文件参考路径：{reference}\n【所选 Skill 的完整说明】\n" + render_skill_markdown(
             body, skill_name=name, skill_dir_reference=reference)

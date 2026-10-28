@@ -18,6 +18,7 @@ class BackendType(str, Enum):
     DASHSCOPE_IMAGE = "dashscope-image"             # DashScope 图像（Wan / Qwen Image 3.0）
     QWEN_CODE_CLI = "qwen-code-cli"                 # Qwen Code CLI（子进程 stream-json 模式）
     CODEX_OFFICIAL = "codex-office"                 # OpenAI Codex CLI（本地官方账户 / API key）
+    DEEPSEEK_HARNESS = "deepseek-harness"             # DeepSeek 官方完整 SDK profile
 
 
 @dataclass
@@ -42,6 +43,9 @@ class ModelBackendConfig:
     extra_headers: Optional[dict[str, str]] = None  # Custom HTTP headers for proxy/relay backends
     mcp_servers: Optional[dict[str, dict]] = None  # MCP server configurations
     model_options: Optional[list[dict[str, str]]] = None  # None=内置；[]=无候选
+    harness_provider: Optional[str] = None
+    harness_permission_mode: Optional[str] = None
+    harness_max_tokens: Optional[int] = None
 
     def to_dict(self) -> dict:
         return {
@@ -62,6 +66,9 @@ class ModelBackendConfig:
             "extraHeaders": self.extra_headers,
             "mcpServers": self.mcp_servers,
             "modelOptions": [dict(item) for item in self.model_options] if self.model_options is not None else None,
+            "harnessProvider": self.harness_provider,
+            "harnessPermissionMode": self.harness_permission_mode,
+            "harnessMaxTokens": self.harness_max_tokens,
         }
 
     def get_env(self, key: str, default: Optional[str] = None) -> Optional[str]:
@@ -242,6 +249,7 @@ class Session:
     model_override: Optional[str] = None
     reasoning_effort: Optional[str] = None
     agent_session_id: Optional[str] = None
+    harness_loop_agent_session_id: Optional[str] = None  # 与普通聊天原生历史分离
     # Codex transport: empty = regular local CLI, "node" = app-server on the
     # selected AgentWithU executor, "ssh" = app-server reached through SSH.
     codex_connection_mode: Optional[str] = None
@@ -276,6 +284,7 @@ class Session:
     abilities: Optional[dict] = None  # {skills: [...], prompts: [...], kitToolsMode?: auto|on|off}
     # ★ 会话类型：普通会话 / 可视化 loop 会话（loop 状态另存于 loops/<id>.json）
     session_type: str = "normal"  # "normal" | "loop"
+    loop_execution_mode: str = "loop"  # 轻量展示镜像；权威配置属于 LoopPolicy
     # LOOP 当前所有权的轻量镜像。完整 stage 仍以 LoopState 为准；这个字段只用于
     # 首屏路由，让人工接管像普通 session 一样直接打开，不必先传完整 stage。
     loop_control_mode: Optional[str] = None  # None | "loop" | "manual"
@@ -314,6 +323,7 @@ class Session:
             "modelOverride": self.model_override,
             "reasoningEffort": self.reasoning_effort,
             "agentSessionId": self.agent_session_id,
+            "harnessLoopAgentSessionId": self.harness_loop_agent_session_id,
             "codexConnectionMode": self.codex_connection_mode,
             "codexRemoteHost": self.codex_remote_host,
             "codexThreadAttached": self.codex_thread_attached,
@@ -326,6 +336,7 @@ class Session:
             "constraints": self.constraints,
             "abilities": self.abilities,
             "sessionType": self.session_type,
+            "loopExecutionMode": self.loop_execution_mode,
             "viewMode": normalize_session_view_mode(self.view_mode),
             "loopControlMode": self.loop_control_mode,
             "pinned": self.pinned,
@@ -355,8 +366,10 @@ class Session:
             "codexRemoteHost": self.codex_remote_host,
             "codexThreadAttached": self.codex_thread_attached,
             "agentSessionId": self.agent_session_id,
+            "harnessLoopAgentSessionId": self.harness_loop_agent_session_id,
             "abilities": self.abilities,
             "sessionType": self.session_type,
+            "loopExecutionMode": self.loop_execution_mode,
             "viewMode": normalize_session_view_mode(self.view_mode),
             "loopControlMode": self.loop_control_mode,
             "pinned": self.pinned,

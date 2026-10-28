@@ -47,6 +47,10 @@ class LoopEnvironmentBridge:
                     backend = self._new_backend_instance(requested)
                     backend_id = requested
                 except Exception:
+                    from ..types import BackendType
+                    selected = next((c for c in self._backend_configs if c.id == requested), None)
+                    if getattr(selected, 'type', None) == BackendType.DEEPSEEK_HARNESS:
+                        raise WorkflowSelectionError('Harness Backend 不可用，不能改用其他 Backend 的环境证据。')
                     backend_id = session.backend_id
                     backend = self._new_backend_instance(backend_id)
                 runtime = self._loop_runtime(session, state, role, backend_id, requested_execute)

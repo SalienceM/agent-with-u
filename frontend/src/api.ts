@@ -1971,7 +1971,7 @@ initPool();
 
 const boundedLoopMutations = new Set(['loopSetAuto', 'loopContinue', 'loopAdvanceToOut', 'loopDiscard', 'loopSetGoal',
     'loopSetPolicy', 'loopAddAddon', 'loopEditAddon', 'loopRemoveAddon', 'loopSubmitIdea', 'loopRemoveIdea',
-    'loopSealIdea', 'loopRefineGoal', 'loopDismissIntent']);
+    'loopSealIdea', 'loopRefineGoal', 'loopDismissIntent', 'loopAimeinUpdate']);
 async function call(method: string, ...params: any[]): Promise<any> {
   if (boundedLoopMutations.has(method)) {
     const target = sessionExec.get(params[0]);
@@ -2958,14 +2958,16 @@ export const api = {
   async createSession(
     workingDir: string,
     backendId: string,
-    sessionType: 'normal' | 'loop' = 'normal',
+    sessionType: 'normal' | 'loop' | 'aimein' = 'normal',
     runtime: { model?: string; reasoningEffort?: string } = {},
     execKey?: string,
     codexRemote: { mode?: 'node'; threadId?: string; title?: string } = {},
+    initialPolicy?: unknown,
   ): Promise<any> {
     const conn = connByKey(execKey || getHomeExecKey());
     const result = await callOnStrict(conn.key, 'createSession', [
       workingDir, backendId, sessionType, JSON.stringify(runtime || {}), JSON.stringify(codexRemote || {}),
+      ...(sessionType === 'aimein' ? [JSON.stringify(initialPolicy || {})] : []),
     ], 60000);
     try {
       const s = JSON.parse(result);
@@ -3153,15 +3155,22 @@ export const api = {
   },
 
   /** 执行中补充要求（addon，可带图片）：不影响当前 loop，下一次 loop 的 analysis/prepare 纳入。 */
-  async loopAddAddon(sessionId: string, text: string, images?: any[]): Promise<{ status: string; addonId?: string; message?: string }> {
+  async loopAddAddon(sessionId: string, text: string, images?: any[], anchor?: import('./types/aimein').AimeinAnchor): Promise<{ status: string; addonId?: string; message?: string }> {
     const imagesJson = images && images.length ? JSON.stringify(images) : '';
-    const result = await call('loopAddAddon', sessionId, text, imagesJson);
+    const result = await call('loopAddAddon', sessionId, text, imagesJson, anchor ? JSON.stringify(anchor) : '');
     try { return JSON.parse(result); } catch { return { status: 'error', message: '响应解析失败' }; }
   },
 
   async loopRemoveAddon(sessionId: string, addonId: string): Promise<{ status: string }> {
     const result = await call('loopRemoveAddon', sessionId, addonId);
     try { return JSON.parse(result); } catch { return { status: 'error' }; }
+  },
+
+  async loopAimeinGet(sessionId: string, execKey: string, task = ''): Promise<import('./types/aimein').AimeinLibraryResult> {
+    return JSON.parse(await callOnStrict(execKey, 'loopAimeinGet', [sessionId, task], 12000));
+  },
+  async loopAimeinUpdate(sessionId: string, command: Record<string, unknown>): Promise<{ status: string; message?: string }> {
+    return JSON.parse(await call('loopAimeinUpdate', sessionId, JSON.stringify(command)));
   },
 
   /** 编辑一条待纳入的补充（文字 + 图片）。 */

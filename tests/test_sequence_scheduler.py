@@ -107,6 +107,37 @@ class SequenceSchedulerTests(unittest.IsolatedAsyncioTestCase):
         await self.until(lambda: len(self.calls) == 2)
         self.assertEqual(self.calls[1]['content'], 'queued')
 
+    async def test_harness_unknown_exit_blocks_dispatch_across_backend_switch(self):
+        from src.backend.deepseek_harness_state import HarnessLayout, HarnessReservation
+        layout = HarnessLayout.for_session(owner=self.session.owner_id, executor='local',
+            backend=self.session.backend_id, session=self.session.id)
+        reservation = HarnessReservation(layout)
+        reservation.acquire()
+        reservation.mark_active('fake-test-generation')
+        try:
+            self.add('must remain pending')
+            await asyncio.sleep(0)
+            self.assertEqual(self.calls, [])
+            self.assertEqual(self.extras().seq_tasks[0].status, 'pending')
+            self.session.backend_id = 'other-backend'
+            self.assertTrue(json.loads(self.bridge._rpc_getSessionRunState('s'))['busy'])
+            with self.assertRaisesRegex(ValueError, '退出尚未确认'):
+                self.bridge._start_chat_turn(json.dumps({'sessionId': 's', 'content': 'blocked'}))
+        finally:
+            reservation.release(confirmed=True)
+        self.bridge._sequence_scheduler.kick('s')
+        await self.until(lambda: len(self.calls) == 1)
+        self.releases[0].set()
+
+    def test_harness_followup_rpc_exposes_only_queue(self):
+        from src.backend.deepseek_harness import DeepSeekHarnessBackend
+        from src.types import BackendType, ModelBackendConfig
+        backend = DeepSeekHarnessBackend(ModelBackendConfig('test', BackendType.DEEPSEEK_HARNESS, 'fixture'))
+        self.bridge._get_backend = lambda _id: backend
+        value = json.loads(self.bridge._rpc_getFollowUpCapabilities('s'))
+        self.assertEqual(value, {'status': 'ok', 'queue': True, 'nativeSteer': False,
+                                'interruptResume': False, 'steerAttachments': False})
+
     async def test_failed_task_pauses_and_explicit_retry_uses_edited_content(self):
         self.outcomes = [False]
         self.add('one')

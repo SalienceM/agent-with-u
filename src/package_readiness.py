@@ -41,6 +41,12 @@ def check_components(*, resources: bool = True, web: bool = False) -> dict[str, 
                 failures.append("resource:" + name)
         if web and not (base / "frontend_dist/index.html").is_file():
             failures.append("resource:frontend_dist/index.html")
+        if getattr(sys, "frozen", False):
+            try:
+                from .backend.deepseek_harness_distribution import verify_bundle
+                verify_bundle(repair_executable=True)
+            except Exception:
+                failures.append("resource:deepseek-harness-bundle")
     from ._version import __version__
     return {"ok": not failures, "failures": failures, "version": __version__, "platform": sys.platform}
 

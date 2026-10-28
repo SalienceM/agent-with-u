@@ -90,6 +90,9 @@ class BackendStore:
             "qwenContextWindowSize": config.qwen_context_window_size,
             "qwenMaxOutputTokens": config.qwen_max_output_tokens,
             "mcpServers": config.mcp_servers,
+            "harnessProvider": config.harness_provider,
+            "harnessPermissionMode": config.harness_permission_mode,
+            "harnessMaxTokens": config.harness_max_tokens,
         }
 
     @staticmethod
@@ -134,6 +137,9 @@ class BackendStore:
                 f"Backend {config_id} qwenMaxOutputTokens must be smaller than qwenContextWindowSize"
             )
 
+        if backend_type == BackendType.DEEPSEEK_HARNESS:
+            from .deepseek_harness_config import validate_config_fields
+            validate_config_fields(item)
         return ModelBackendConfig(
             id=config_id,
             type=backend_type,
@@ -141,7 +147,9 @@ class BackendStore:
             enabled=item.get("enabled", True) is not False,
             base_url=item.get("baseUrl"),
             model=item.get("model"),
-            model_options=normalize_model_options(item.get("modelOptions")) if backend_type == BackendType.CODEX_OFFICIAL else None,
+            model_options=normalize_model_options(item.get("modelOptions")) if backend_type in {
+                BackendType.CODEX_OFFICIAL, BackendType.DEEPSEEK_HARNESS,
+            } else None,
             api_key=item.get("apiKey"),
             working_dir=item.get("workingDir"),
             allowed_tools=allowed_tools,
@@ -152,6 +160,9 @@ class BackendStore:
             qwen_context_window_size=context_window,
             qwen_max_output_tokens=max_output,
             mcp_servers=item.get("mcpServers"),
+            harness_provider=item.get("harnessProvider"),
+            harness_permission_mode=item.get("harnessPermissionMode"),
+            harness_max_tokens=cls._optional_positive_int(item, "harnessMaxTokens", index),
         )
 
     @classmethod
@@ -310,6 +321,9 @@ class BackendStore:
 
     def save(self, config: ModelBackendConfig):
         """Save a backend config."""
+        if config.type == BackendType.DEEPSEEK_HARNESS:
+            from .deepseek_harness_config import validate_config_fields
+            validate_config_fields(config.to_dict())
         config = replace(config, model_options=normalize_model_options(config.model_options))
         configs = dict(self._configs)
         configs[config.id] = config

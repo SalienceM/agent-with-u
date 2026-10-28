@@ -7,14 +7,32 @@ from typing import Any
 from .loop_decisions import bounded_object, digest
 
 
-def user_intent(state: Any) -> str:
+def user_intent(state: Any, record: Any = None) -> str:
     # 原始想法在前，当前目标/较新补充在后；新的明确安排可覆盖旧指令。
     return '\n'.join([*[idea.prompt for idea in state.ideas], state.goal,
-                      *[a.text for a in state.addons]])[-50_000:]
+                      *[a.text for a in state.addons if record is None or not getattr(a, 'feedback', {})
+                        or not record.aimein_run or a.id in record.aimein_run.get('scopeAddonIds', [a.id])]])[-50_000:]
 
 
 def requested(state: Any) -> bool:
-    return bool(state.task_source.get('binding')) or bool(re.search(r'openspec|/opsx[-: ]', user_intent(state), re.I))
+    if state.task_source.get('binding'):
+        return True
+    selected = False
+    # 仅识别用户明确的来源安排；否定文字不能解除已有绑定或来源保护。
+    for clause in re.split(r'[\n。；;.!?，,]', user_intent(state)):
+        for mention in re.finditer(r'openspec|/opsx[-: ]', clause, re.I):
+            before, after = clause[:mention.start()][-80:], clause[mention.end():][:40]
+            double_negative = re.search(
+                r'(?:不要|不能|不可|不得|别|do not|don.t|never)\s*(?:跳过|忽略|禁用|skip|ignore|disable)\s*$', before, re.I)
+            excluded = re.search(
+                r'(?:(?:无需|不需要|不用)\s*(?:(?:使用|采用|启用)\s*)?'
+                r'(?:[\w /-]{1,24}(?:、|或|和|及)\s*)*|'
+                r'(?:不使用|不采用|不启用|不要(?:使用|采用|启用)?|禁用|跳过)\s*|'
+                r'\b(?:without(?: using)?|no need (?:for|to use)|do not use|don.t use|skip)\s*)$', before, re.I)
+            # 普通提及保持原行为；同一意图中更新的明确提及覆盖前一项。
+            selected = bool(double_negative) or not bool(excluded or re.match(
+                r'\s*(?:(?:来源|流程)\s*)?(?:不需要|无需|不用|不使用|is not required\b|is unnecessary\b)', after, re.I))
+    return selected
 
 
 def select_change(intent: str, candidates: list[dict], bound: str = '') -> str:

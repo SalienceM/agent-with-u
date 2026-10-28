@@ -381,6 +381,31 @@ class WorkspaceToolTests(unittest.IsolatedAsyncioTestCase):
 
 
 class WorkspaceBackendInjectionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_harness_receives_turn_lease_only_for_supported_manual_clients(self):
+        from src.backend.deepseek_harness import DeepSeekHarnessBackend
+        captured = []
+        class Probe(DeepSeekHarnessBackend):
+            def __init__(inner): pass
+            async def send_message(inner, **kwargs):
+                captured.append(kwargs)
+                return {"stopReason": "end_turn", "agentSessionId": "native"}
+        self.session.agent_session_id = "native"
+        await self.invoke(Probe())
+        self.assertIn("/api/chat-workspace", captured[-1]["content"])
+        self.assertEqual(self.bridge._chat_workspace_tools.leases, {})
+        self.assertNotIn("/api/chat-workspace", json.dumps([m.to_dict() for m in self.session.messages]))
+        await self.invoke(Probe(), enabled=False)
+        self.assertNotIn("/api/chat-workspace", captured[-1]["content"])
+        self.session.abilities["workspaceToolsMode"] = "off"
+        await self.invoke(Probe())
+        self.assertNotIn("/api/chat-workspace", captured[-1]["content"])
+        self.session.abilities["workspaceToolsMode"] = "on"
+        client_scope = _REQUEST_CLIENT.set(None)
+        try:
+            await self.invoke(Probe())
+        finally:
+            _REQUEST_CLIENT.reset(client_scope)
+        self.assertNotIn("/api/chat-workspace", captured[-1]["content"])
     async def asyncSetUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.environment = patch.dict(os.environ, {"AGENT_WITH_U_DATA_ROOT": self.temp.name})

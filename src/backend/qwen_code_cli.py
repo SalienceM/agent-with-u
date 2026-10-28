@@ -216,6 +216,7 @@ class QwenCodeSdkBackend(ModelBackend):
         auth_type: str,
         model: Optional[str],
         enable_image_input: bool = False,
+        *, strict: bool = False,
     ) -> None:
         """Ensure Qwen CLI has a non-interactive auth selection.
 
@@ -325,7 +326,36 @@ class QwenCodeSdkBackend(ModelBackend):
             print(f"[QwenSdk] ensured project auth settings: {settings_path} selectedType={auth_type}",
                   file=sys.stderr, flush=True)
         except Exception as e:
+            if strict:
+                raise
             print(f"[QwenSdk] failed to ensure project auth settings: {e}", file=sys.stderr, flush=True)
+
+    def _isolated_auth_settings(self, env: dict, cwd: str, auth_type: str,
+                                model: Optional[str], images: bool = False) -> tempfile.TemporaryDirectory:
+        """自动调用只写专用运行配置；不能让评委配置污染产品指纹。"""
+        from pathlib import Path
+        default_system = ('C:/ProgramData/qwen-code/settings.json' if sys.platform == 'win32' else
+                          '/Library/Application Support/QwenCode/settings.json' if sys.platform == 'darwin' else
+                          '/etc/qwen-code/settings.json')
+        original = Path(env.get('QWEN_CODE_SYSTEM_SETTINGS_PATH') or default_system)
+        if not original.is_absolute():
+            original = Path(cwd) / original
+        original = original.resolve()
+        data = json.loads(original.read_text(encoding='utf-8')) if original.exists() else {}
+        if not isinstance(data, dict):
+            raise ValueError('Qwen 系统设置必须为对象，未启动自动调用')
+        temporary = tempfile.TemporaryDirectory(prefix='awu-qwen-runtime-')
+        try:
+            target = Path(temporary.name) / '.qwen' / 'settings.json'
+            target.parent.mkdir()
+            target.write_text(json.dumps(data, ensure_ascii=False), encoding='utf-8')
+            self._ensure_project_auth_settings(temporary.name, auth_type, model, images, strict=True)
+            env.setdefault('QWEN_CODE_SYSTEM_DEFAULTS_PATH', str(original.parent / 'system-defaults.json'))
+            env['QWEN_CODE_SYSTEM_SETTINGS_PATH'] = str(target)
+            return temporary
+        except BaseException:
+            temporary.cleanup()
+            raise
 
     def _build_env(self) -> dict:
         """Build environment dict for SDK.
@@ -427,6 +457,7 @@ class QwenCodeSdkBackend(ModelBackend):
         constraints: Optional[str] = None,
         sandbox_enabled: bool = True,
         model_override: Optional[str] = None,
+        isolated_context: bool = False,
     ) -> dict:
         self.clear_cancelled(session_id)
 
@@ -504,9 +535,8 @@ class QwenCodeSdkBackend(ModelBackend):
             # avoid repeating Qwen's headless warning on every request.  An
             # explicit backend env value still wins over this default.
             env_dict.setdefault("QWEN_CODE_SUPPRESS_YOLO_WARNING", "1")
-        self._ensure_project_auth_settings(
-            cwd, auth_type, model, enable_image_input=bool(images),
-        )
+        if not isolated_context:
+            self._ensure_project_auth_settings(cwd, auth_type, model, enable_image_input=bool(images))
         print(f"[QwenSdk] auth: {auth_type}, model={model!r}, permission_mode={permission_mode}",
               file=sys.stderr, flush=True)
 
@@ -542,6 +572,9 @@ class QwenCodeSdkBackend(ModelBackend):
         if image_refs:
             print(f"[QwenSdk] images: {len(image_refs)} @file attachment(s)",
                   file=sys.stderr, flush=True)
+
+        # 不修改产品工作区；系统设置读取失败必须明确失败，不能绕回项目写配置。
+        _settings_temp = self._isolated_auth_settings(env_dict, cwd, auth_type, model, bool(images)) if isolated_context else None
 
         # SDK options
         options = {
@@ -938,6 +971,8 @@ class QwenCodeSdkBackend(ModelBackend):
                 emit("done")
 
         finally:
+            if _settings_temp:
+                _settings_temp.cleanup()
             active_queries = getattr(self, "_active_queries", {})
             if _active_result is not None and active_queries.get(session_id) is _active_result:
                 active_queries.pop(session_id, None)

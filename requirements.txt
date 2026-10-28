@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 websockets>=13.0
 claude-agent-sdk>=0.1.0
 qwen-code-sdk>=0.1.0rc0
@@ -10,3 +11,4 @@ tomli>=2.0; python_version < "3.11"
 edge-tts>=7.0.0
 pathspec==0.12.1
 pywinpty==2.0.15; sys_platform == "win32"
+# Harness 的精确本地 wheel 在 deploy/requirements-harness.txt；构建准备单独校验安装。

@@ -117,6 +117,25 @@ class AsideBridgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.bridge._new_backend_instance.call_count, 1)
         self.assertEqual(self.extras.asides[-1].status, 'error')
 
+    async def test_harness_unknown_native_exit_keeps_reservation_after_text_waiter_finished(self):
+        from src.backend.deepseek_harness import DeepSeekHarnessBackend
+        from src.types import BackendType, ModelBackendConfig
+        backend = DeepSeekHarnessBackend(ModelBackendConfig('b', BackendType.DEEPSEEK_HARNESS, 'fixture'))
+        finished = asyncio.get_running_loop().create_future()
+        finished.set_result(None)
+        backend._harness_workers = {'s:chataside': SimpleNamespace(task=finished, confirmed=False)}
+        self.bridge._new_backend_instance.return_value = backend
+        with patch('src.backend.text_only.send_text_only', side_effect=self.answer):
+            self.submit(question='普通问题')
+            job = self.bridge._inspection_jobs['s:chataside']
+            await job['task']
+            await job['cleanup']
+        self.assertEqual(self.extras.asides[-1].inspection['phase'], 'unknown')
+        self.assertIs(self.bridge._inspection_jobs['s:chataside'], job)
+        self.assertEqual(self.submit()['status'], 'error')
+        self.assertTrue(self.state.auto)
+        self.assertIn('s', self.bridge._loop_running)
+
     async def test_changed_identity_rejects_late_answer(self):
         async def change(backend, **kwargs):
             self.session.working_dir = str(self.root / 'other')

@@ -35,6 +35,8 @@ class ChatKitTests(unittest.IsolatedAsyncioTestCase):
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
+        from tests.test_session_user_isolation import _stop_store
+        _stop_store(self.bridge._session_store)
         self.env.stop()
         self.temp.cleanup()
 

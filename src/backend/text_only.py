@@ -21,7 +21,7 @@ from ..types import ImageAttachment
 
 TEXT_ONLY_BACKENDS = {
     "openai-compatible", "anthropic-api", "codex-office", "qwen-code-cli",
-    "claude-agent-sdk", "claude-code-official",
+    "claude-agent-sdk", "claude-code-official", "deepseek-harness",
 }
 
 
@@ -352,11 +352,22 @@ async def send_text_only(backend: ModelBackend, *, content: str, constraints: st
                          session_id: str, message_id: str,
                          on_delta: Callable[[StreamDelta], None],
                          model_override: str | None = None, reasoning_effort: str | None = None,
-                         images: list[ImageAttachment] | None = None) -> None:
+                         images: list[ImageAttachment] | None = None,
+                         owner_id: str = "local") -> None:
     images = _reference_images(images)
     kind = getattr(backend.config.type, "value", backend.config.type)
     if kind not in TEXT_ONLY_BACKENDS:
         raise ValueError("请选择支持文本解读的 Backend（图像生成 Backend 不适用）")
+    if kind == "deepseek-harness":
+        from .deepseek_harness_turn import send_turn
+        result = await send_turn(backend, messages=[], content=content, images=images or None,
+            session_id=session_id, message_id=message_id, on_delta=on_delta, agent_session_id=None,
+            working_dir=None, skip_permissions=True, on_permission_request=None, constraints=constraints,
+            sandbox_enabled=False, model_override=model_override, reasoning_effort=reasoning_effort,
+            owner_id=owner_id, text_only=True)
+        if not result.get("success"):
+            raise RuntimeError(result.get("error") or "Harness 纯文本调用未完成")
+        return
     if kind in {"openai-compatible", "anthropic-api"}:
         errors: list[str] = []
         def receive(delta: StreamDelta) -> None:

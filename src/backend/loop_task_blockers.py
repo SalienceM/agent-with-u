@@ -39,8 +39,8 @@ def ids(value: Any, *, nonempty: bool = False, limit: int = MAX_TASKS) -> list[s
     return result
 
 
-def refs(value: Any) -> list[str]:
-    if not isinstance(value, list) or not 1 <= len(value) <= 16:
+def refs(value: Any, *, allow_empty: bool = False) -> list[str]:
+    if not isinstance(value, list) or not (0 if allow_empty else 1) <= len(value) <= 16:
         raise ContractError('缺失或超限证据引用')
     return [text(v, 240) for v in value]
 
@@ -144,7 +144,8 @@ def freeze_plan(raw: Any, steps: list[dict], source: dict, identity: dict,
                 raise ContractError('前置任务越界')
             conditions.append({'id': text(p.get('id'), 120), 'affectedTaskIds': affected,
                 **{k: text(p.get(k)) for k in ('writeKind', 'isolatedRoot', 'verificationMethod', 'configRevision')},
-                'evidenceRefs': refs(p.get('evidenceRefs')),
+                # 声明只是待核实的准备需求，不能反过来要求先完成准备。
+                'evidenceRefs': refs(p.get('evidenceRefs'), allow_empty=True),
                 'baselineBasis': text(p['baselineBasis']) if p.get('baselineBasis') else '', 'status': 'unverified'})
         by_id = {p['id']: p for p in conditions}
         if len(by_id) != len(conditions):
@@ -353,15 +354,23 @@ title 保持任务原义和稳定文本，评审 delivery.items 必须使用相�
 每个 orchestration 步增加 taskIds、dependsOn（外部任务依赖）、preconditionIds 数组，以及
 testWritesUserData 布尔值。依赖只引用真实任务；写测试必须 sequential/write。
 会写用户数据的测试前置：{id,affectedTaskIds,writeKind,isolatedRoot,verificationMethod,
-configRevision,evidenceRefs,baselineBasis}。初始未核实，独立的准备/路径核对步骤先返回，
+configRevision,evidenceRefs,baselineBasis}。初始未核实，声明 evidenceRefs 尚无证据时必须为 []，
+不可伪造未来证据；实际准备回执仍须非空证据和有效文件哈希。baselineBasis 只填写用户/规则/规格
+明确要求真实文件基线的依据；无此要求必须为 ""，不要填“无需基线”或准备流程的说明。
+独立的准备/路径核对步骤先返回，
 后续测试调用才能消费 preconditionIds；同次调用不能自行宣布安全然后启动应用。
 准备步骤本身不能消费该前置或启动应用。实际路径应在本工作区已授权独立测试根，核对链接/别名、
 应用真实机制及配置修订；只有变量/目录名或 safe=true 不算证据。不知道隔离方式就报告任务阻塞。
 准备结果可返回 isolationEvidence:{version:1,items:[{id,actualRoot,method,configRevision,
 evidenceRefs,files:[{path,sha256}],baselineEvidenceRefs:[]}]}；files 是工作区内核对记录/配置的 SHA256。
+回执 id、method、configRevision 必须分别逐字复制冻结前置的 id、verificationMethod、configRevision，
+它们是协议关联字段，不得用本步核对摘要改写。实际核对过程写入证据文件或 evidenceRefs。
 这是有限模型观察和文件修订核对，不是操作系统隔离证明；不得伪造工具观察。
 准备/实现步骤可返回 taskEvidence:[{id,status:"verified|implemented",evidence:"已核实的产物修订与结果"}]，
 只报告本步 taskIds。依赖尚未 verified 时不得调度依赖任务，正常调用结束不等于依赖已验收。
+上述依赖门禁检查发生在实际执行调用前，不禁止规划后续顺序步骤：可先编排依赖的实现/验证，
+再编排其消费者；前一步未返回适用的 verified 证据，系统不会启动消费者。不得因规划时都是 pending
+而机械地每轮只安排第一个任务。单步相关任务组内须按依赖顺序完成；独立隔离准备与测试仍必须分步。
 """
 
 BLOCKER_INSTRUCTIONS = """

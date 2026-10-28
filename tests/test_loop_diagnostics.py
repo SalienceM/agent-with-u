@@ -29,6 +29,8 @@ class LoopDiagnosticsTests(unittest.IsolatedAsyncioTestCase):
         bridge._record_session_usage = Mock()
         bridge._emit_loop_progress = Mock()
         bridge._session_store = SimpleNamespace(save=Mock())
+        # 此夹具只验证调用诊断，不读取真实用户的 Harness 活动目录。
+        bridge._has_native_session_activity = Mock(return_value=False)
         session = SimpleNamespace(id='s', backend_id='worker', working_dir='.', sandbox_enabled=False, agent_session_id=None)
         return bridge, session, record
 

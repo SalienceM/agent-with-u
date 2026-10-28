@@ -51,10 +51,10 @@ export function resolveCodexModelOptions(backend?: CodexModelCatalog | null): Co
 }
 
 export function assertCodexModelOptionsSaved(submitted: CodexModelCatalog, actual?: CodexModelCatalog): void {
-  if (submitted.type !== 'codex-office' || submitted.modelOptions === undefined) return;
+  if (!['codex-office', 'deepseek-harness'].includes(submitted.type || '') || submitted.modelOptions === undefined) return;
   let matches = false;
   try {
-    matches = actual?.type === 'codex-office'
+    matches = !!actual && actual.type === submitted.type
       && JSON.stringify(normalizeCodexModelOptions(submitted.modelOptions))
         === JSON.stringify(normalizeCodexModelOptions(actual.modelOptions));
   } catch { /* 非法回读同样不能宣称保存成功。 */ }

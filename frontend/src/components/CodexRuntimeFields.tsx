@@ -1,5 +1,5 @@
 import React, { useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from 'react';
-import { createPortal } from 'react-dom';
+import { AppModalPortal } from './AppModalPortal';
 import { api, type PoeModelInfo } from '../api';
 import { resolveCodexModelOptions } from '../utils/codexModelOptions';
 import { normalizeReasoningEffort } from '../utils/codexReasoning';
@@ -20,6 +20,10 @@ export function isQwenBackend(backend: any): boolean {
   return backend?.type === 'qwen-code-cli';
 }
 
+export function isHarnessBackend(backend: any): boolean {
+  return backend?.type === 'deepseek-harness';
+}
+
 export function isPoeBackend(backend: any): boolean {
   if (backend?.type !== 'openai-compatible') return false;
   try {
@@ -38,7 +42,7 @@ export function isPoeBackend(backend: any): boolean {
 }
 
 export function isRuntimeConfigurableBackend(backend: any): boolean {
-  return isCodexBackend(backend) || isQwenBackend(backend) || isPoeBackend(backend);
+  return isCodexBackend(backend) || isQwenBackend(backend) || isPoeBackend(backend) || isHarnessBackend(backend);
 }
 
 export function normalizeModelRuntime(raw?: ModelRuntime | null): ModelRuntime {
@@ -61,8 +65,8 @@ export function resolveModelRuntime(
   const own = normalizeModelRuntime(explicit);
   return {
     model: own.model || base.model || backend?.model
-      || backend?.env?.OPENAI_MODEL || backend?.env?.QWEN_MODEL || undefined,
-    reasoningEffort: isCodexBackend(backend)
+      || (!isHarnessBackend(backend) && (backend?.env?.OPENAI_MODEL || backend?.env?.QWEN_MODEL)) || undefined,
+    reasoningEffort: isCodexBackend(backend) || isHarnessBackend(backend)
       ? own.reasoningEffort || base.reasoningEffort || undefined
       : undefined,
   };
@@ -192,7 +196,8 @@ const PoeBotPicker: React.FC<{
         </span>
         <span aria-hidden="true" style={{ flex: '0 0 auto', opacity: 0.7 }}>{open ? '▴' : '▾'}</span>
       </button>
-      {open && menuPosition && createPortal(
+      {open && menuPosition && (
+        <AppModalPortal>
         <div
           ref={menuRef}
           style={{ ...poePickerMenuStyle, ...menuPosition }}
@@ -256,8 +261,8 @@ const PoeBotPicker: React.FC<{
               </div>
             )}
           </div>
-        </div>,
-        document.body,
+        </div>
+        </AppModalPortal>
       )}
     </div>
   );
@@ -277,6 +282,7 @@ export const BackendRuntimeFields: React.FC<Props> = ({
   const listId = `codex-models-${useId().replace(/:/g, '')}`;
   const catalog = useCodexReasoning(backend, sessionId, execKey);
   const codex = isCodexBackend(backend);
+  const harness = isHarnessBackend(backend);
   const poe = isPoeBackend(backend);
   const [poeModels, setPoeModels] = useState<PoeModelInfo[]>([]);
   const [poeLoading, setPoeLoading] = useState(false);
@@ -314,7 +320,7 @@ export const BackendRuntimeFields: React.FC<Props> = ({
   const unlistedEffort = own.reasoningEffort && !efforts.some(item => item.reasoningEffort === own.reasoningEffort);
   const patch = (next: Partial<ModelRuntime>) => {
     const normalized = normalizeModelRuntime({ ...own, ...next });
-    if (!codex) delete normalized.reasoningEffort;
+    if (!codex && !harness) delete normalized.reasoningEffort;
     onChange(normalized);
   };
 
@@ -327,7 +333,7 @@ export const BackendRuntimeFields: React.FC<Props> = ({
       gap: 8, alignItems: 'end',
     }}>
       <div style={fieldStyle}>
-        <span style={labelStyle}>{codex ? 'Codex 模型' : poe ? 'Poe 官方 Bot' : 'Qwen 模型'}</span>
+        <span style={labelStyle}>{codex ? 'Codex 模型' : harness ? 'Harness 模型' : poe ? 'Poe 官方 Bot' : 'Qwen 模型'}</span>
         {poe ? (
           <PoeBotPicker
             models={poeModels}
@@ -340,17 +346,33 @@ export const BackendRuntimeFields: React.FC<Props> = ({
           <input
             value={own.model || ''}
             onChange={(e) => patch({ model: e.target.value || undefined })}
-            list={codex ? listId : undefined}
+            aria-label={codex ? 'Codex 模型' : harness ? 'Harness 模型覆盖' : 'Qwen 模型'}
+            list={codex || harness ? listId : undefined}
             placeholder={resolved.model ? `继承：${resolved.model}` : '跟随默认'}
             style={inputStyle}
           />
         )}
-        {codex && (
+        {(codex || harness) && (
           <datalist id={listId}>
-            {resolveCodexModelOptions(backend).map((model) => <option key={model.id} value={model.id}>{model.label || model.id}</option>)}
+            {(harness ? (backend.modelOptions || []) : resolveCodexModelOptions(backend)).map((model: { id: string; label?: string }) => <option key={model.id} value={model.id}>{model.label || model.id}</option>)}
           </datalist>
         )}
       </div>
+      {harness && <>
+        <label style={fieldStyle}>
+          <span style={labelStyle}>Harness 推理档位</span>
+          <select aria-label="Harness 推理档位" value={own.reasoningEffort || ''} style={inputStyle}
+            onChange={e => patch({ reasoningEffort: e.target.value || undefined })}>
+            <option value="">跟随 Harness 默认</option>
+            {own.reasoningEffort && !['off', 'low', 'high', 'max'].includes(own.reasoningEffort)
+              && <option value={own.reasoningEffort} disabled>{own.reasoningEffort} · 原配置（不支持）</option>}
+            {['off', 'low', 'high', 'max'].map(effort => <option key={effort} value={effort}>{effort}</option>)}
+          </select>
+        </label>
+        <div role="status" style={{ ...labelStyle, gridColumn: '1 / -1', lineHeight: 1.5 }}>
+          档位来自锁定的 Harness 0.2.1-rc.3 路由。候选仅为 Backend 配置，模型账号可用性未确认；可手填模型，留空继承。
+        </div>
+      </>}
       {codex && (
         <>
         <label style={fieldStyle}>
@@ -395,7 +417,7 @@ export const BackendRuntimeFields: React.FC<Props> = ({
       {!compact && (
         <div style={{ gridColumn: '1 / -1', fontSize: 10.5, color: 'var(--theme-text-muted)', lineHeight: 1.45 }}>
           本次提交配置：<b style={{ color: 'var(--theme-text)' }}>{formatRuntimeLabel(backend, resolveModelRuntime(backend, own, inherited))}</b>。
-          留空即继承，不需要为 Sol / Terra / 不同档位复制 Backend。
+          留空即继承，不需要为不同模型或档位复制 Backend。
         </div>
       )}
     </div>
@@ -417,7 +439,8 @@ const poePickerMenuStyle: React.CSSProperties = {
   position: 'fixed', zIndex: 10000, boxSizing: 'border-box',
   display: 'flex', flexDirection: 'column', maxHeight: 340, padding: 8,
   border: '1px solid var(--theme-border)', borderRadius: 9,
-  background: 'var(--theme-bg-secondary, #242a31)',
+  background: 'var(--theme-popover-bg, var(--theme-bg-secondary))',
+  color: 'var(--theme-text)', fontFamily: 'var(--ui-font, inherit)',
   boxShadow: '0 12px 32px rgba(0,0,0,0.35)',
 };
 

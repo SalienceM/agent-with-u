@@ -17,7 +17,7 @@ class LoopOpenSpecBridge:
     async def _loop_openspec_source(self, session: Any, state: Any, record: Any, boundary: str) -> bool:
         previous = state.task_source
         revision, control = previous.get('revision', 0), state.control_revision
-        intent = user_intent(state)
+        intent = user_intent(state, record)
         try:
             binding, env = self._loop_source_environment(session, state)
             old = previous.get('binding', {})
@@ -31,7 +31,7 @@ class LoopOpenSpecBridge:
             snapshot = await self._loop_source_reader().read(binding, env,
                 f'driver:{record.round}:{record.seq}:{boundary}', revision, change, force=True)
             if (state.task_source is not previous or state.control_revision != control
-                    or user_intent(state) != intent or state.control_mode != 'loop'
+                    or user_intent(state, record) != intent or state.control_mode != 'loop'
                     or self._loop_source_environment(session, state)[0] != binding):
                 raise SourceError('stale_revision', '来源查询期间目标或执行身份已变化，请重新运行。')
             before = previous.get('snapshot', {})
@@ -72,8 +72,9 @@ class LoopOpenSpecBridge:
             return
         record.contract_required = False
         record.goal = state.goal
-        pending = [a for a in state.addons if a.status == 'pending']
-        intent = user_intent(state)
+        from .aimein_learning import addon_in_scope
+        pending = [a for a in state.addons if a.status == 'pending' and addon_in_scope(a, record)]
+        intent = user_intent(state, record)
         intent_digest = digest([intent, state.policy.strategy])
         skip_manual = manual_policy(state.policy.strategy + '\n' + intent)
         policy_digest = digest(state.policy.to_dict())
@@ -133,6 +134,9 @@ class LoopOpenSpecBridge:
         self._loop_save(state)
         self._emit_loop_updated(state)
         if step.status != 'done':
+            if record.aimein_run:
+                prompt += ('\n【AIMEIN 阶段执行边界】只推进当前冻结 Sprint 对应的原任务与验证；'
+                           '其他就绪任务留给后续阶段。遵循原 tasks 与 apply/verify，不生成第二份任务台账。')
             step.status, step.started_at = 'running', time.time()
             record.stage_details[stage] = {'status': 'running', 'message': labels[phase]}
             self._loop_save(state)

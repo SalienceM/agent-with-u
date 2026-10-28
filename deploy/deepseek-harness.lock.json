@@ -1,0 +1,36 @@
+{
+  "schemaVersion": 1,
+  "checkedAt": "2026-10-26",
+  "repository": "https://github.com/deepseek-ai/deepseek-harness",
+  "tag": "dsh-v0.2.1-rc.3",
+  "commit": "1f81c047fc48fa190a683e469daa699857e9afe8",
+  "version": "0.2.1-rc.3",
+  "pythonVersion": "0.2.1rc3",
+  "prerelease": true,
+  "sourceLockSha256": "911b049924e8256d8d6e684235cf935ca75b28fd0dd46f0c3b316a51c2cf5dc1",
+  "toolchain": {"node": "24.10.0", "pnpm": "11.28.5", "uv": "0.11.23"},
+  "linuxBuildImages": {
+    "node": "node@sha256:06e54ecf113a30f0ff9a1d309866a5924d3bda4389eab11a0e1e92f3251d915d",
+    "manylinux": "quay.io/pypa/manylinux_2_28_x86_64@sha256:e0adf18521ad35192df733a6c62d35df7801957d24e0470238aacecfab2188a3"
+  },
+  "observedChannels": {
+    "npmNext": "0.2.1-rc.3",
+    "npmLatest": "0.2.1-rc.2",
+    "pypiSdk": "0.2.1rc2",
+    "pypiRuntime": "0.2.1rc2",
+    "githubReleaseAssets": 0
+  },
+  "npm": {
+    "package": "@deepseek-ai/dsh",
+    "version": "0.2.1-rc.3",
+    "tarball": "https://registry.npmjs.org/@deepseek-ai/dsh/-/dsh-0.2.1-rc.3.tgz",
+    "integrity": "sha512-H+E9HLnHf7fJqzen84Z9Bq8ggb5xbrcbyhZjXTJLE9NabHr3zteGvTRvdvGkxPl4ov80is4WLglFmSo+/olJjg=="
+  },
+  "distribution": "awu-source-build",
+  "platforms": {
+    "win-x64": {"wheelTag": "win_amd64", "executable": "deepseek-harness-sdk-runtime-win-x64.exe"},
+    "linux-x64": {"wheelTag": "manylinux_2_28_x86_64", "executable": "deepseek-harness-sdk-runtime-linux-x64"}
+  },
+  "license": "MIT",
+  "runtimeNoticesRequired": true
+}

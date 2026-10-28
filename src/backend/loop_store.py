@@ -199,6 +199,7 @@ class LoopRecord:
     decision_dispatched: str = ""
     source_snapshots: dict = field(default_factory=dict)
     openspec_run: dict = field(default_factory=dict)  # 原生 apply/verify/修复的阶段证据
+    aimein_run: dict = field(default_factory=dict)  # AIMEIN 冻结 Sprint 与本次独立评审
     milestone_plan: dict = field(default_factory=dict)
     task_plan: dict = field(default_factory=dict)
     contract_validation: dict = field(default_factory=dict)
@@ -220,6 +221,7 @@ class LoopRecord:
     #   None=未快照（老记录）；""=当时无上下文；"X"=具体 id。丢弃本次 loop 时据此回滚，
     #   避免被丢弃 loop 的对话污染后续 loop 的上下文。
     agent_checkpoint: Optional[str] = None
+    harness_loop_checkpoint: Optional[str] = None  # 自动 Harness 上下文，不覆盖人工主聊天
     # ★ 文件级版本隔离：本次 loop 开跑前对 git 工作目录的非破坏性快照 commit sha。
     #   None=非 git 仓库/未快照。丢弃时经用户确认可据此把工作树恢复到开跑前。
     git_checkpoint: Optional[str] = None
@@ -275,6 +277,7 @@ class LoopRecord:
                                   for key, v in self.source_snapshots.items() if isinstance(v, dict)}
                                  if compact else bounded_object(self.source_snapshots, 2_097_152)),
             "openspecRun": self.openspec_run if compact else bounded_object(self.openspec_run, 262_144),
+            "aimeinRun": self.aimein_run if compact else bounded_object(self.aimein_run),
             "milestonePlan": {} if compact else validate_plan(self.milestone_plan),
             "taskPlan": {} if compact else task_contract(self.task_plan),
             "contractValidation": contract_diagnostic(self.contract_validation),
@@ -289,6 +292,7 @@ class LoopRecord:
             "runtimes": {k: dict(v) for k, v in (self.runtimes or {}).items()
                          if isinstance(v, dict)},
             "agentCheckpoint": self.agent_checkpoint,
+            "harnessLoopCheckpoint": self.harness_loop_checkpoint,
             "gitCheckpoint": self.git_checkpoint,
             "dirCheckpoint": self.dir_checkpoint,
             "artifactCheckpoint": self.artifact_checkpoint,
@@ -332,6 +336,7 @@ class LoopRecord:
             decision_dispatched=str(d.get("decisionDispatched") or "")[:80],
             source_snapshots=bounded_object(d.get("sourceSnapshots"), 2_097_152),
             openspec_run=bounded_object(d.get("openspecRun"), 262_144),
+            aimein_run=bounded_object(d.get("aimeinRun")),
             milestone_plan=validate_plan(d.get("milestonePlan")),
             task_plan=task_contract(d.get('taskPlan')),
             contract_validation=contract_diagnostic(d.get('contractValidation')),
@@ -345,6 +350,7 @@ class LoopRecord:
             runtimes={k: dict(v) for k, v in (d.get("runtimes") or {}).items()
                       if isinstance(v, dict)},
             agent_checkpoint=d.get("agentCheckpoint", None),
+            harness_loop_checkpoint=d.get("harnessLoopCheckpoint", None),
             git_checkpoint=d.get("gitCheckpoint", None),
             dir_checkpoint=d.get("dirCheckpoint", None),
             artifact_checkpoint=d.get("artifactCheckpoint", None),
@@ -464,11 +470,13 @@ class Addon:
     images: list = field(default_factory=list)  # 附带的图片附件（base64 dict），随补充一起带给下一次 prepare
     created_at: float = field(default_factory=_now)
     updated_at: float = field(default_factory=_now)
+    feedback: dict = field(default_factory=dict)  # AIMEIN 对象意见及处理依据
 
     def to_dict(self) -> dict:
         return {
             "id": self.id, "text": self.text, "status": self.status,
             "appliedSeq": self.applied_seq, "images": self.images,
+            "feedback": bounded_object(self.feedback, 48000),
             "createdAt": self.created_at, "updatedAt": self.updated_at,
         }
 
@@ -479,6 +487,7 @@ class Addon:
             text=d.get("text", ""),
             status=d.get("status", "pending"),
             applied_seq=int(d.get("appliedSeq", 0)),
+            feedback=bounded_object(d.get('feedback'), 48000),
             images=list(d.get("images") or []),
             created_at=d.get("createdAt", _now()),
             updated_at=d.get("updatedAt", _now()),
@@ -564,6 +573,8 @@ class LoopPolicy:
     independent_eval: bool = True                  # analysis 用独立上下文 + 对抗式评审（防自欺）
     intent_guard: bool = True                       # 早期检查人意图 vs 模型计划方向的偏差（非阻塞提示）
     work_mode: str = "auto"                       # auto | delivery | explore
+    execution_mode: str = "loop"                  # loop | aimein，保持共享执行保护
+    aimein_reviewers: list[dict] = field(default_factory=list)
     progress_patience: int = 3                    # 无任务状态推进时先重规划，达到此次数暂停 Auto
     # 各角色的专用 backend：{prepare/execute/idea/goal/analysis/aside: backend_id}，
     # 缺省=跟随会话。自动 LOOP 的 prepare / execute / analysis 都在独立上下文中运行，
@@ -616,6 +627,8 @@ class LoopPolicy:
             "independentEval": self.independent_eval,
             "intentGuard": self.intent_guard,
             "workMode": self.work_mode,
+            "executionMode": self.execution_mode,
+            "aimeinReviewers": copy.deepcopy(self.aimein_reviewers),
             "progressPatience": self.progress_patience,
             "backends": dict(self.backends or {}),
             "runtimes": {k: self._clean_runtime(v) for k, v in (self.runtimes or {}).items()
@@ -625,6 +638,7 @@ class LoopPolicy:
 
     @classmethod
     def from_dict(cls, d: dict) -> "LoopPolicy":
+        from .aimein import reviewer_settings
         d = d or {}
         def _f(key, default):
             try:
@@ -688,6 +702,8 @@ class LoopPolicy:
             independent_eval=bool(ie) if ie is not None else True,
             intent_guard=bool(ig) if ig is not None else True,
             work_mode=d.get("workMode") if d.get("workMode") in ("auto", "delivery", "explore") else "auto",
+            execution_mode="aimein" if d.get("executionMode") == "aimein" else "loop",
+            aimein_reviewers=reviewer_settings(d.get("aimeinReviewers")),
             progress_patience=int(max(2, min(8, _f("progressPatience", 3)))),
             backends=backends,
             runtimes=runtimes,
@@ -740,6 +756,7 @@ class LoopState:
     stop_reason: str = ""               # 触发 loopout / 终止的原因
     asides: list[AsideTurn] = field(default_factory=list)  # by the way 旁路问答
     addons: list[Addon] = field(default_factory=list)      # 执行中补充的要求
+    aimein_memory: dict = field(default_factory=dict)
     intent_alert: dict = field(default_factory=dict)       # 意图守卫：人意图 vs 模型计划偏差提示
     best_seq: int = 0                                      # 当前轮最佳产物对应的 loop seq
     risk_factors: dict = field(default_factory=dict)       # 可解释风险分量
@@ -808,8 +825,10 @@ class LoopState:
         return max(1, self.policy.max_loops)
 
     def to_dict(self, *, compact: bool = False) -> dict:
+        from .aimein_learning import memory_summary
         return {
             "sessionId": self.session_id,
+            "aimeinMemory": memory_summary(self.aimein_memory) if compact else copy.deepcopy(self.aimein_memory),
             "stage": self.stage,
             "goal": self.goal,
             "goalHistory": [g.to_dict() for g in self.goal_history],
@@ -874,6 +893,7 @@ class LoopState:
             stop_reason=d.get("stopReason", ""),
             asides=[AsideTurn.from_dict(a) for a in d.get("asides", [])],
             addons=[Addon.from_dict(a) for a in d.get("addons", [])],
+            aimein_memory=bounded_object(d.get('aimeinMemory'), 900000),
             intent_alert=dict(d.get("intentAlert") or {}),
             best_seq=int(d.get("bestSeq", 0) or 0),
             risk_factors=dict(d.get("riskFactors") or {}),

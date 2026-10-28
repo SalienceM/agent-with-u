@@ -28,6 +28,7 @@ interface Session extends SessionViewMetadata {
   codexRemoteHost?: string;
   codexThreadAttached?: boolean;
   sessionType?: 'normal' | 'loop';
+  loopExecutionMode?: 'loop' | 'aimein';
   pinned?: boolean;
   sidebarColor?: string;
 }
@@ -977,7 +978,7 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
                     />
                   ) : (
                     <div style={sessionTitleStyle}>
-                      {s.sessionType === 'loop' && <span title="LOOP 会话">🔁</span>}
+                      {s.sessionType === 'loop' && <span title={s.loopExecutionMode === 'aimein' ? 'AIMEIN 执行模式' : 'LOOP 会话'}>{s.loopExecutionMode === 'aimein' ? '◎' : '🔁'}</span>}
                       {(s.execMode === 'relay' || String(s.execKey || '').startsWith('relay:'))
                         && <span title={`远程执行：${s.execLabel || '执行端'}`}>🌐</span>}
                       {isCodexAttached && <span title="接管已有 Codex thread">🧲</span>}

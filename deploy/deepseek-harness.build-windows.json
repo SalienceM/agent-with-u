@@ -1,0 +1,44 @@
+{
+  "schemaVersion": 1,
+  "builtAt": "2026-10-26",
+  "origin": "awu-source-build",
+  "commit": "1f81c047fc48fa190a683e469daa699857e9afe8",
+  "platform": "win-x64",
+  "sourceVersion": "0.2.1-rc.3",
+  "pythonVersion": "0.2.1rc3",
+  "buildNode": "24.10.0",
+  "embeddedCarrierNode": "24.22.1",
+  "pnpm": "11.28.5",
+  "uv": "0.11.23",
+  "upstreamArtifactGates": {"passed": 7, "failed": 0},
+  "wheels": [
+    {
+      "filename": "deepseek_harness_sdk-0.2.1rc3-py3-none-any.whl",
+      "size": 18113,
+      "sha256": "edc2f6b6b98f939263c7be02dd72c7a006947aa6e8202af45ad662b73e725bf6"
+    },
+    {
+      "filename": "deepseek_harness_runtime_bin-0.2.1rc3-py3-none-win_amd64.whl",
+      "size": 83869767,
+      "sha256": "ccc2113cab35d77a27beb25aa76d61b41253dc0b3ed02be6d8e4b413744eaeee"
+    }
+  ],
+  "checks": {
+    "metadataExactRuntimePin": true,
+    "upstreamWheelValidation": true,
+    "licensesAndSidecars": true,
+    "sdkProtocolAgainstFakeProcess": true,
+    "packagedRuntimeInitialize": true,
+    "awuBridgeInitialize": true,
+    "liveFramesAgainstLoopbackModel": true,
+    "productionModelsCalled": false,
+    "linuxBuildVerified": true,
+    "awuBackendIntegrationComplete": false
+  },
+  "knownLimits": [
+    "Docker proxy port corrected to user-specified 7897; standalone Linux build verified separately in deepseek-harness.build-linux.json, not full AWU acceptance.",
+    "Upstream SDK close emits unclosed-pipe ResourceWarning; owned lifecycle adapter is still required.",
+    "Bridge is a tested prototype and is not yet registered as a user-selectable AWU Backend.",
+    "pkg node24 resolved carrier 24.22.1; future rebuilds must record and verify carrier identity rather than assume bit-identical output."
+  ]
+}

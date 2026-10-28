@@ -4,10 +4,12 @@ import { resolveCodexModelOptions, normalizeCodexModelOptions, type CodexModelOp
 interface Props {
   value?: CodexModelOption[] | null;
   onChange: (value: CodexModelOption[] | null) => void;
+  backendType?: string;
 }
 
-export const CodexModelOptionsEditor: React.FC<Props> = ({ value, onChange }) => {
-  const rows = resolveCodexModelOptions({ type: 'codex-office', modelOptions: value });
+export const CodexModelOptionsEditor: React.FC<Props> = ({ value, onChange, backendType = 'codex-office' }) => {
+  const codex = backendType === 'codex-office';
+  const rows = codex ? resolveCodexModelOptions({ type: backendType, modelOptions: value }) : (value || []).map(row => ({ ...row }));
   let error = '';
   try { normalizeCodexModelOptions(value); } catch (e) { error = (e as Error).message; }
   const move = (index: number, delta: number) => {
@@ -15,7 +17,7 @@ export const CodexModelOptionsEditor: React.FC<Props> = ({ value, onChange }) =>
     onChange(rows);
   };
   return <section aria-label="模型候选编辑" style={{ minWidth: 0, margin: '14px 0', padding: 10, border: '1px solid var(--theme-border)', borderRadius: 8 }}>
-    <div style={{ fontSize: 12, fontWeight: 600 }}>模型候选 · {value == null ? '内置' : '自定义'}（{rows.length}/100）</div>
+    <div style={{ fontSize: 12, fontWeight: 600 }}>模型候选 · {value == null && codex ? '内置' : '自定义'}（{rows.length}/100）</div>
     <p style={{ fontSize: 11, lineHeight: 1.6, color: 'var(--theme-text-muted)', margin: '6px 0' }}>
       候选由你维护，不保证账号可用。只影响输入建议，不修改默认模型或已有会话；可随时手填其他模型。修改后请保存 Backend。
     </p>
@@ -40,7 +42,7 @@ export const CodexModelOptionsEditor: React.FC<Props> = ({ value, onChange }) =>
     <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginTop: 8 }}>
       <button type="button" style={buttonStyle} disabled={rows.length >= 100} onClick={() => onChange([...rows, { id: '' }])}>添加候选</button>
       <button type="button" style={buttonStyle} onClick={() => onChange([])}>清空候选</button>
-      <button type="button" style={buttonStyle} onClick={() => onChange(null)}>恢复内置候选</button>
+      {codex && <button type="button" style={buttonStyle} onClick={() => onChange(null)}>恢复内置候选</button>}
     </div>
     {error && <div role="alert" style={{ fontSize: 11, color: 'var(--theme-danger, #f85149)', marginTop: 8 }}>{error}</div>}
   </section>;

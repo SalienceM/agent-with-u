@@ -266,7 +266,7 @@ export const SkillMarketDialog: React.FC<Props> = ({ open, onClose, onInstalled,
     void api.getBackends(key).then(backends => {
       if (cancelled) return;
       const eligible = backends.filter(item => item.enabled !== false && [
-        'openai-compatible', 'anthropic-api', 'codex-office', 'qwen-code-cli', 'claude-agent-sdk', 'claude-code-official',
+        'openai-compatible', 'anthropic-api', 'codex-office', 'qwen-code-cli', 'claude-agent-sdk', 'claude-code-official', 'deepseek-harness',
       ].includes(item.type));
       setExplanationBackends(eligible);
       setExplanationBackendId(current => eligible.some(item => item.id === current) ? current : eligible[0]?.id || '');

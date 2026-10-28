@@ -11,6 +11,8 @@ import {
 
 /** Loop 策略与心智（与后端 LoopPolicy 对齐，camelCase）。 */
 export interface LoopPolicy {
+  executionMode?: 'loop' | 'aimein';
+  aimeinReviewers?: Array<{ backendId: string; model: string; reasoningEffort?: string; profileId?: string }>;
   deliverableScore: number;
   outputtableScore: number;
   maxLoops: number;
@@ -50,6 +52,8 @@ export const DEFAULT_STRATEGY =
 评分以累计实际产物为准，默认未完成，不轻信执行自述；操作次数、文档数量和乐观措辞不等于进展。连续无实质推进时换路规划或请求人工输入。完整任务验收及必要 verify 才是收口依据，分数只作辅助。`;
 
 export const DEFAULT_POLICY: LoopPolicy = {
+  executionMode: 'loop',
+  aimeinReviewers: [],
   deliverableScore: 70,
   outputtableScore: 85,
   maxLoops: 8,
@@ -102,7 +106,7 @@ export function normalizePolicy(p?: Partial<LoopPolicy> | null): LoopPolicy {
     }
   }
   const strat = (typeof d.strategy === 'string' && d.strategy.trim()) ? d.strategy : DEFAULT_STRATEGY;
-  return { deliverableScore: del, outputtableScore: out, maxLoops: ml, riskThreshold: rt, stepStallSeconds: stall, stepMaxAttempts: attempts, independentEval: ie, intentGuard: ig, workMode, progressPatience, backends, runtimes, strategy: strat };
+  return { executionMode: d.executionMode === 'aimein' ? 'aimein' : 'loop', aimeinReviewers: (d.aimeinReviewers || []).slice(0, 3).map(r => ({ backendId: r.backendId || '', ...normalizeModelRuntime(r), model: r.model || '', profileId: r.profileId || '' })), deliverableScore: del, outputtableScore: out, maxLoops: ml, riskThreshold: rt, stepStallSeconds: stall, stepMaxAttempts: attempts, independentEval: ie, intentGuard: ig, workMode, progressPatience, backends, runtimes, strategy: strat };
 }
 
 function num(v: any, fb: number): number { const n = Number(v); return Number.isFinite(n) ? n : fb; }
@@ -117,13 +121,15 @@ export const LoopPolicyEditor: React.FC<{
   sessionId?: string;
   execKey?: string;
 }> = ({ value, onChange, availableBackends, sessionBackendId, sessionRuntime, sessionId, execKey }) => {
+  const aimein = value.executionMode === 'aimein';
+  const SettingsBody = aimein ? 'details' : 'div';
   const set = (patch: Partial<LoopPolicy>) => onChange({ ...value, ...patch });
   const [presets, setPresets] = useState<any[]>([]);
   const [sel, setSel] = useState('');
   const [loadedBackends, setLoadedBackends] = useState<any[]>([]);
   // Poe is a deliberately chat-only channel and must not be offered for any
   // LOOP role, even when it exists in the executor's Backend catalog.
-  const backends = (availableBackends ?? loadedBackends).filter((backend) => !isPoeBackend(backend));
+  const backends = (availableBackends ?? loadedBackends).filter((backend) => !isPoeBackend(backend) && (!aimein || backend.enabled !== false));
   const [ledger, setLedger] = useState<any[]>([]);
   const [showLedger, setShowLedger] = useState(false);
   const reload = () => api.loopPolicyPresetList().then((r) => setPresets(r.presets || [])).catch(() => {});
@@ -136,7 +142,7 @@ export const LoopPolicyEditor: React.FC<{
   const applyPreset = (id: string) => {
     setSel(id);
     const p = presets.find((x) => x.id === id);
-    if (p?.policy) onChange(normalizePolicy(p.policy));
+    if (p?.policy) onChange(normalizePolicy({ ...p.policy, executionMode: value.executionMode, aimeinReviewers: value.aimeinReviewers }));
   };
   const saveAsPreset = async () => {
     const name = window.prompt('预设名称：', '我的策略');
@@ -173,6 +179,10 @@ export const LoopPolicyEditor: React.FC<{
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+      {aimein && <AimeinReviewers value={value} onChange={set} backends={backends} sessionId={sessionId} execKey={execKey} />}
+      <SettingsBody>
+      {aimein && <summary style={{ cursor: 'pointer', padding: '8px 0', fontSize: 12 }}>预算、规划模型与高级策略</summary>}
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
       {/* 预设：像 Prompts/Skills 一样直接选用，选完仍可调整 */}
       <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
         <span style={{ ...labelText, marginBottom: 0 }}>预设</span>
@@ -204,11 +214,11 @@ export const LoopPolicyEditor: React.FC<{
         </label>
         <NumField label="无实质进展容忍次数" hint="先换路规划；持续无任务状态推进则暂停 Auto，不宣称完成" value={value.progressPatience}
           min={2} max={8} step={1} onChange={(v) => set({ progressPatience: v })} />
-        <NumField label="可交付门槛" hint="分数达到且任务/verify 验收通过才可交付" value={value.deliverableScore}
-          min={0} max={100} step={1} onChange={(v) => set({ deliverableScore: v })} />
-        <NumField label="可输出门槛" hint="分数达到且完整范围验收通过才可输出" value={value.outputtableScore}
-          min={0} max={100} step={1} onChange={(v) => set({ outputtableScore: v })} />
-        <NumField label="最大 Loop 数" hint="本轮次数预算，不设固定上限" value={value.maxLoops}
+        {!aimein && <NumField label="可交付门槛" hint="分数达到且任务/verify 验收通过才可交付" value={value.deliverableScore}
+          min={0} max={100} step={1} onChange={(v) => set({ deliverableScore: v })} />}
+        {!aimein && <NumField label="可输出门槛" hint="分数达到且完整范围验收通过才可输出" value={value.outputtableScore}
+          min={0} max={100} step={1} onChange={(v) => set({ outputtableScore: v })} />}
+        <NumField label={aimein ? '本轮执行预算（含修补尝试）' : '最大 Loop 数'} hint="本轮次数预算，不设固定上限" value={value.maxLoops}
           min={1} step={1} onChange={(v) => set({ maxLoops: v })} />
         <NumField label="风险止损阈值" hint="风险系数 ≥ 此值即收口" value={value.riskThreshold}
           min={0.1} max={1} step={0.05} onChange={(v) => set({ riskThreshold: v })} />
@@ -226,7 +236,7 @@ export const LoopPolicyEditor: React.FC<{
 
       {/* 防自欺：独立对抗式评审 */}
       <label style={{ display: 'flex', gap: 8, alignItems: 'flex-start', cursor: 'pointer', padding: '8px 10px', borderRadius: 8, background: 'var(--theme-bg-secondary)', border: '1px solid var(--theme-border)' }}>
-        <input type="checkbox" checked={value.independentEval} onChange={(e) => set({ independentEval: e.target.checked })} style={{ marginTop: 2 }} />
+        <input type="checkbox" disabled={aimein} checked={aimein || value.independentEval} onChange={(e) => set({ independentEval: e.target.checked })} style={{ marginTop: 2 }} />
         <span>
           <span style={{ fontSize: 12.5, fontWeight: 600, color: 'var(--theme-text)' }}>独立对抗式评审（防自欺）</span>
           <span style={{ display: 'block', fontSize: 11, color: 'var(--theme-text-muted)', marginTop: 2, lineHeight: 1.5 }}>
@@ -250,7 +260,7 @@ export const LoopPolicyEditor: React.FC<{
       <div>
         <div style={{ ...labelRow, marginBottom: 7 }}>
           <span style={{ ...labelText, marginBottom: 0 }}>角色运行配置（Backend / 模型 / 推理档位）</span>
-          {canApplyCodexSplit && (
+          {canApplyCodexSplit && !aimein && (
             <button type="button" onClick={applyCodexSplit} style={{ ...smallBtn, marginLeft: 'auto', padding: '4px 8px', fontSize: 11 }}
               title="规划与评审使用 Sol / max；逐步执行使用 Terra / medium">
               ⚡ Sol 顶格规划/评审 · Terra 中档执行
@@ -258,7 +268,7 @@ export const LoopPolicyEditor: React.FC<{
           )}
         </div>
         <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-          {RUNTIME_POSITIONS.map((pos) => {
+          {RUNTIME_POSITIONS.filter(pos => !aimein || pos.key !== 'analysis').map((pos) => {
             const backendOverride = value.backends?.[pos.key] || '';
             const roleBackendId = backendOverride || sessionBackendId || '';
             const roleBackend = backends.find((b) => b.id === roleBackendId);
@@ -369,8 +379,44 @@ export const LoopPolicyEditor: React.FC<{
           这段文本会在每次 prepare（规划）与 analysis（评分）时作为「须遵循」的指导注入给模型。
         </div>
       </div>
+      </div>
+      </SettingsBody>
     </div>
   );
+};
+
+export function aimeinReviewerIssue(policy: LoopPolicy, backends: any[]): string {
+  const reviewers = policy.aimeinReviewers || [];
+  if (reviewers.length !== 3) return '请选择三个不同模型；每位评审都会开启独立会话。';
+  const models = reviewers.map(r => r.model.trim() || backends.find(b => b.id === r.backendId)?.model || '');
+  if (reviewers.some(r => !backends.some(b => b.id === r.backendId && b.enabled !== false && !isPoeBackend(b))) || models.some(m => !m)) return '请为每位评审选择可用连接和明确的模型。';
+  if (new Set(models.map(m => m.toLocaleLowerCase())).size !== 3) return '三个评审需要不同模型；更换账号或推理档位不算不同模型。';
+  return '';
+}
+
+const AimeinReviewers: React.FC<{ value: LoopPolicy; onChange: (patch: Partial<LoopPolicy>) => void; backends: any[]; sessionId?: string; execKey?: string }> = ({ value, onChange, backends, sessionId, execKey }) => {
+  const reviewers = Array.from({ length: 3 }, (_, i) => value.aimeinReviewers?.[i] || { backendId: '', model: '' });
+  const issue = aimeinReviewerIssue(value, backends);
+  return <section aria-label="AIMEIN 三模型评审" style={{ padding: 12, border: '1px solid var(--theme-accent)', borderRadius: 10 }}>
+    <strong>三模型独立评审</strong>
+    <p style={{ fontSize: 12, lineHeight: 1.6 }}>三位都通过才推进阶段。每次评审使用新会话和同一份成果；成熟度只针对当前 Sprint 的范围。</p>
+    {reviewers.map((reviewer, i) => {
+      const backend = backends.find(b => b.id === reviewer.backendId);
+      const update = (patch: Partial<typeof reviewer>) => onChange({ aimeinReviewers: reviewers.map((r, n) => n === i ? { ...r, ...patch } : r) });
+      return <div key={i} style={{ padding: '10px 0', borderTop: '1px solid var(--theme-border)' }}>
+        <label style={labelText}>评审 {i + 1} · 连接
+          <select aria-label={`评审 ${i + 1} Backend`} value={reviewer.backendId} style={{ ...inputBase, width: '100%' }}
+            onChange={e => update({ backendId: e.target.value, model: '', reasoningEffort: '', profileId: '' })}>
+            <option value="">选择连接</option>{backends.map(b => <option key={b.id} value={b.id}>{b.label || b.id}</option>)}
+          </select>
+        </label>
+        {backend && isRuntimeConfigurableBackend(backend) ? <BackendRuntimeFields backend={backend} sessionId={sessionId} execKey={execKey} value={reviewer} compact
+          inheritLabel="需选择明确模型" onChange={runtime => update({ model: runtime.model || '', reasoningEffort: runtime.reasoningEffort || '', profileId: '' })} />
+          : backend && <div style={{ fontSize: 12 }}>模型：{backend.model || '此连接未配置模型，请先在模型设置中补齐'}</div>}
+      </div>;
+    })}
+    <div role="status" style={{ fontSize: 12, color: issue ? 'var(--theme-warning, #bf8700)' : 'var(--theme-text-muted)' }}>{issue || '三个不同模型已配置，运行时会再次核对。'}</div>
+  </section>;
 };
 
 const NumField: React.FC<{

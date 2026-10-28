@@ -6,26 +6,13 @@ import subprocess
 import sys
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT))
-from src.package_readiness import MODULES, RESOURCES
 
 
 def command() -> list[str]:
-    args = [sys.executable, "-m", "PyInstaller", "--name", "agent-with-u-backend",
-            "--onefile", "--console", "--clean", "--noconfirm"]
-    for module in MODULES:
-        args.extend(["--hidden-import", module])
-    args.extend(["--collect-data", "certifi"])
-    for module in ("pydantic_core", "dashscope", "edge_tts", "pathspec"):
-        args.extend(["--collect-all", module])
-    if sys.version_info < (3, 11):
-        args.extend(["--hidden-import", "tomli"])
-    if sys.platform == "win32":
-        args.extend(["--collect-all", "winpty"])
-    for resource in RESOURCES:
-        args.extend(["--add-data", f"tools/engine-providers/{resource}{';' if sys.platform == 'win32' else ':'}engine-providers"])
-    return args + ["ws_main_entry.py"]
+    return [sys.executable, "-m", "PyInstaller", "--clean", "--noconfirm",
+            "agent-with-u-backend.spec"]
 
 
 if __name__ == "__main__":
+    # 使用共用 spec，避免命令行入口遗漏 Harness metadata/许可证/资源。
     raise SystemExit(subprocess.call(command(), cwd=ROOT))

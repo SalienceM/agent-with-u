@@ -7,6 +7,14 @@ import sys
 from src.package_readiness import entry_check
 entry_check(web=True)
 
+if "--agentwithu-harness-check" in sys.argv:
+    from src.harness_package_probe import run
+    raise SystemExit(run())
+
+if "--agentwithu-harness-supervisor" in sys.argv:
+    from src.backend.deepseek_harness_supervisor import run_worker
+    raise SystemExit(run_worker(sys.argv[sys.argv.index("--agentwithu-harness-supervisor"):]))
+
 if "--agentwithu-engine-host" in sys.argv:
     from src.backend.engineering_host import run_worker
     raise SystemExit(run_worker())

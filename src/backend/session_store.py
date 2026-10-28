@@ -324,6 +324,7 @@ class SessionStore:
                 model_override=data.get("modelOverride"),
                 reasoning_effort=data.get("reasoningEffort"),
                 agent_session_id=data.get("agentSessionId"),
+                harness_loop_agent_session_id=data.get("harnessLoopAgentSessionId"),
                 codex_connection_mode=data.get("codexConnectionMode"),
                 codex_remote_host=data.get("codexRemoteHost"),
                 # 旧版 node 模式只允许选择既有 thread，可安全迁移为 attached。
@@ -343,6 +344,7 @@ class SessionStore:
                 abilities=data.get("abilities"),
                 session_type=data.get("sessionType", "normal"),
                 view_mode=normalize_session_view_mode(meta.get("viewMode", data.get("viewMode"))),
+                loop_execution_mode="aimein" if data.get("loopExecutionMode") == "aimein" else "loop",
                 loop_control_mode=(
                     "manual" if data.get("loopControlMode") == "manual"
                     else "loop" if data.get("loopControlMode") == "loop"

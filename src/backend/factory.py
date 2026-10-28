@@ -8,6 +8,7 @@ from .anthropic_api import AnthropicAPIBackend
 from .dashscope_image import DashScopeImageBackend
 from .qwen_code_cli import QwenCodeSdkBackend
 from .codex_office import CodexOfficeBackend
+from .deepseek_harness import DeepSeekHarnessBackend
 
 
 def create_backend(config: ModelBackendConfig) -> ModelBackend:
@@ -26,5 +27,7 @@ def create_backend(config: ModelBackendConfig) -> ModelBackend:
         return QwenCodeSdkBackend(config)
     elif config.type == BackendType.CODEX_OFFICIAL:
         return CodexOfficeBackend(config)
+    elif config.type == BackendType.DEEPSEEK_HARNESS:
+        return DeepSeekHarnessBackend(config)
     else:
         raise ValueError(f"Unknown backend type: {config.type}")

@@ -37,6 +37,7 @@ function mergeLoopRecordDetail(summary: LoopRecord, detail?: LoopRecord): LoopRe
     evolutionBasis: detail.evolutionBasis || summary.evolutionBasis,
     delivery: detail.delivery?.mode ? detail.delivery : summary.delivery,
     openspecRun: JSON.stringify(summary.openspecSummary) === JSON.stringify(detail.openspecSummary) ? detail.openspecRun : summary.openspecRun,
+    aimeinRun: summary.aimeinSummary?.revision === detail.aimeinSummary?.revision ? detail.aimeinRun : summary.aimeinRun,
     analysis,
     orchestration,
     stageDetails: Object.fromEntries(Object.entries(summary.stageDetails || detail.stageDetails || {}).map(

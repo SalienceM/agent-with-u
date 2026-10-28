@@ -21,6 +21,7 @@ from .anthropic_api import AnthropicAPIBackend
 from .dashscope_image import DashScopeImageBackend
 from .qwen_code_cli import QwenCodeSdkBackend
 from .codex_office import CodexOfficeBackend
+from .deepseek_harness import DeepSeekHarnessBackend
 from .factory import create_backend
 
 __all__ = [
@@ -35,5 +36,6 @@ __all__ = [
     "DashScopeImageBackend",
     "QwenCodeSdkBackend",
     "CodexOfficeBackend",
+    "DeepSeekHarnessBackend",
     "create_backend",
 ]

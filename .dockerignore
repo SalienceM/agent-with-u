@@ -27,3 +27,4 @@ deploy/docker-compose*.yml
 # ---- Docs / misc ----
 *.md
 LICENSE
+!build/deepseek-harness/bridge/THIRD_PARTY_NOTICES.md

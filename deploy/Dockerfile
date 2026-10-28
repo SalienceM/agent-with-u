@@ -28,7 +28,7 @@ ARG QWEN_CODE_VERSION=latest
 RUN ln -s /usr/local/lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
     && ln -s /usr/local/lib/node_modules/npm/bin/npx-cli.js /usr/local/bin/npx \
     && apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates curl git libatomic1 \
+    && apt-get install -y --no-install-recommends ca-certificates curl git libatomic1 bubblewrap \
     && npm install -g \
        "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" \
        "@openai/codex@${CODEX_VERSION}" \
@@ -51,6 +51,18 @@ RUN pip install --no-cache-dir --upgrade pip \
 # 后端源码 + 内置 skills
 COPY src ./src
 COPY skills ./skills
+
+# Harness 使用同源固定制品，不依赖上面的系统 Node，不在聊天时下载。
+COPY build/deepseek-harness/wheels/*manylinux_2_28_x86_64.whl /tmp/harness-wheels/
+COPY build/deepseek-harness/wheels/deepseek_harness_sdk-0.2.1rc3-py3-none-any.whl /tmp/harness-wheels/
+COPY deploy/requirements-harness.txt ./deploy/requirements-harness.txt
+COPY deploy/deepseek-harness.lock.json deploy/deepseek-harness.build-linux.json ./deploy/
+COPY scripts/prepare_deepseek_harness.py ./scripts/prepare_deepseek_harness.py
+COPY build/deepseek-harness/bridge ./build/deepseek-harness/bridge
+COPY build/deepseek-harness/bundle-manifest.json ./build/deepseek-harness/bundle-manifest.json
+RUN python scripts/prepare_deepseek_harness.py --verify-staged /tmp/harness-wheels --platform linux-x64 \
+    && pip install --no-index --no-deps --find-links /tmp/harness-wheels -r deploy/requirements-harness.txt \
+    && python -c "from src.backend.deepseek_harness_distribution import verify_bundle; verify_bundle()"
 
 # 数据目录（compose 里把宿主目录 bind-mount 到这里）
 ENV AGENT_WITH_U_DATA_ROOT=/app/data

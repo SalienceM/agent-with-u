@@ -5,7 +5,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
-from src.backend.loop_openspec import (select_change, manual_policy, task_progress,
+from src.backend.loop_openspec import (requested, select_change, manual_policy, task_progress,
                                       normalize_verify, next_phase, run_summary)
 from src.backend.loop_store import LoopRecord, LoopState, STAGE_EXECUTE
 from tests import test_loop_lifecycle as lifecycle
@@ -22,6 +22,21 @@ def snapshot(done=False):
 
 
 class DriverModelTests(unittest.TestCase):
+    def test_source_request_excludes_explicit_negation_but_not_binding(self):
+        for goal in ('普通实现', '无需 OpenSpec 来源', '不要使用 OpenSpec',
+                     '无需历史存档基线、外部工具或 OpenSpec 来源。',
+                     'Implement without OpenSpec', 'OpenSpec is not required',
+                     '使用 OpenSpec。现在不用 OpenSpec'):
+            state = LoopState('s', goal=goal)
+            self.assertFalse(requested(state), goal)
+            state.task_source = {'binding': {'change': 'keep'}}
+            self.assertTrue(requested(state), goal)
+        for goal in ('使用 OpenSpec', '/opsx:apply example', '不要跳过 OpenSpec',
+                     "don't skip OpenSpec", '不用 OpenSpec。现在使用 OpenSpec',
+                     '不要删除项目，使用 OpenSpec', '不要修改代码而是使用 OpenSpec',
+                     '不需要重新安装 OpenSpec', '不要删除 OpenSpec'):
+            self.assertTrue(requested(LoopState('s', goal=goal)), goal)
+
     def test_selection_is_explicit_or_unique_not_latest(self):
         candidates = [{'name': 'first'}, {'name': 'second'}]
         self.assertEqual(select_change('openspec first', candidates), 'first')

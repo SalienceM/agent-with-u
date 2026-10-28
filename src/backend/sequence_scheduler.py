@@ -85,6 +85,8 @@ class SequenceScheduler:
         # 主 turn 注册在 create_task 同步边界；done 帧不是任务完成信号。
         if getattr(self.bridge, "_chat_turn_tasks", {}).get(sid):
             return
+        if getattr(self.bridge, "_has_native_session_activity", lambda _: False)(sid):
+            return
         ex = self.bridge._chat_extras_get(sid)
         if not ex.seq_auto or not ex.pending_tasks():
             return
@@ -135,6 +137,8 @@ class SequenceScheduler:
                     return  # 转交不领取、不清空队列，交还本身也不自动重启派发。
                 ex = self.bridge._chat_extras_get(sid)
                 if not ex.seq_auto or getattr(self.bridge, "_chat_turn_tasks", {}).get(sid):
+                    return
+                if getattr(self.bridge, "_has_native_session_activity", lambda _: False)(sid):
                     return
                 remaining = [task for task in ex.seq_tasks if task.status not in {"done", "sent", "interrupted"}]
                 if not remaining or remaining[0].status != "pending":

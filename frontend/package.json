@@ -41,6 +41,7 @@
     "@codemirror/state": "^6.4.1",
     "@codemirror/theme-one-dark": "^6.1.2",
     "@codemirror/view": "^6.26.0",
+    "@react-three/fiber": "8.18.0",
     "@tauri-apps/api": "^2.10.1",
     "@tauri-apps/plugin-dialog": "^2.6.0",
     "@tauri-apps/plugin-global-shortcut": "^2.3.1",
@@ -53,13 +54,15 @@
     "marked": "^9.1.6",
     "pdfjs-dist": "^4.8.69",
     "react": "^18.2.0",
-    "react-dom": "^18.2.0"
+    "react-dom": "^18.2.0",
+    "three": "0.170.0"
   },
   "devDependencies": {
     "@axe-core/playwright": "^4.12.1",
     "@playwright/test": "^1.54.1",
     "@types/react": "^18.2.48",
     "@types/react-dom": "^18.2.18",
+    "@types/three": "0.170.0",
     "@vitejs/plugin-react": "^4.2.1",
     "cross-env": "^7.0.3",
     "typescript": "^5.3.3",

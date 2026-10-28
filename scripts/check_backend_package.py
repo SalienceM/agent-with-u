@@ -32,7 +32,8 @@ def digest(path: Path) -> str:
 def isolated_environment(root: Path) -> dict[str, str]:
     # 白名单继承：不携带模型、Relay、代理、Python 路径和桌面凭据。
     env = {k: v for k, v in os.environ.items()
-           if k.upper() in {"SYSTEMROOT", "WINDIR", "COMSPEC", "SYSTEMDRIVE", "NUMBER_OF_PROCESSORS"}}
+           if k.upper() in {"SYSTEMROOT", "WINDIR", "COMSPEC", "SYSTEMDRIVE", "NUMBER_OF_PROCESSORS",
+                            "PROCESSOR_ARCHITECTURE", "PROCESSOR_ARCHITEW6432"}}
     for name in ("home", "appdata", "localappdata", "data", "work", "tmp"):
         (root / name).mkdir()
     (root / ".awu-package-probe").touch()
@@ -115,10 +116,18 @@ class ProbeProcess:
                 except ProcessLookupError:
                     pass
                 await asyncio.wait_for(self.proc.wait(), 5)
-                try:
-                    os.killpg(self.proc.pid, 0)
-                except ProcessLookupError:
-                    confirmed = True
+                # 根进程已被 wait 不代表组内后代此刻已被 reaper 收割。
+                # 有界等待整个组消失；不能仅凭发过 SIGKILL 就报告清理成功。
+                deadline = time.monotonic() + 2
+                while True:
+                    try:
+                        os.killpg(self.proc.pid, 0)
+                    except ProcessLookupError:
+                        confirmed = True
+                        break
+                    if time.monotonic() >= deadline:
+                        break
+                    await asyncio.sleep(.05)
         except (OSError, asyncio.TimeoutError):
             confirmed = False
         finally:

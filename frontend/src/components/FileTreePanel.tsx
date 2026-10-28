@@ -61,6 +61,7 @@ import type { EditorDocumentState } from '../utils/editorDocumentState';
 import { handoffParticipants, handoffScope } from '../utils/workbenchHandoffState';
 import type { RecoverableDraft } from '../utils/documentStore';
 import { useLanguageEditor } from '../hooks/useLanguageEditor';
+import { openPreviewWindow } from '../utils/previewWindow';
 
 const CodeEditor = lazy(() => import('./CodeEditor'));
 const PdfPreview = lazy(() => import('./PdfPreview'));
@@ -228,7 +229,7 @@ type GeneratedTextExportResult =
   | { mode: 'downloaded' }
   | { mode: 'cancelled' };
 
-async function exportGeneratedText(text: string, filename: string, mime: string): Promise<GeneratedTextExportResult> {
+export async function exportGeneratedText(text: string, filename: string, mime: string): Promise<GeneratedTextExportResult> {
   const blob = new Blob([text], { type: mime });
   const html = mime.startsWith('text/html');
 
@@ -471,6 +472,13 @@ export const FileTreePanel: React.FC<Props> = React.memo(({ sessionId, workingDi
 
   // 预览 / 编辑
   const [preview, setPreview] = useState<PreviewState | null>(null);
+  const previewWindows = useRef(new Set<() => void>());
+  const [previewWindowError, setPreviewWindowError] = useState('');
+  useEffect(() => {
+    const dispose = () => { previewWindows.current.forEach(close => close()); previewWindows.current.clear(); };
+    const unsubscribe = onCurrentUserChanged(dispose);
+    return () => { unsubscribe(); dispose(); };
+  }, [sessionId, workingDir, execKey]);
   const [documentOwner, setDocumentOwner] = useState(() => getCurrentUserProfile().userId);
   const [draftRecoveryOpen, setDraftRecoveryOpen] = useState(false);
   useEffect(() => onCurrentUserChanged((profile, changed) => {
@@ -2033,15 +2041,19 @@ export const FileTreePanel: React.FC<Props> = React.memo(({ sessionId, workingDi
     return api.filePreviewData(node.name, encoded, execKey) as Promise<StructuredPreviewPayload>;
   }, [workingDir, execKey, localFs]);
 
-  const openReview = useCallback(async (rel: string, source: PreviewState['source']) => {
+  const openReview = useCallback(async (rel: string, source: PreviewState['source'], requireReady = false) => {
     if (source === 'local') {
       setMsg({
         kind: 'err',
         text: '审阅稿必须保存在 Session 执行端，才能交给 Agent。请先将本机文件上传到执行端。',
       });
+      if (requireReady) throw new Error('本机副本不支持执行端审阅');
       return;
     }
-    if (!workingDir || reviewOpening) return;
+    if (!workingDir || reviewOpening) {
+      if (requireReady) throw new Error('工作目录未就绪或审阅正在打开');
+      return;
+    }
     setReviewOpening(true);
     try {
       const result = await api.provOpen(workingDir, rel, execKey);
@@ -2049,6 +2061,7 @@ export const FileTreePanel: React.FC<Props> = React.memo(({ sessionId, workingDi
       setReview(result);
     } catch (error: any) {
       setMsg({ kind: 'err', text: `打开审阅失败：${error?.message ?? error}` });
+      if (requireReady) throw error;
     } finally { setReviewOpening(false); }
   }, [execKey, reviewOpening, workingDir]);
 
@@ -2113,6 +2126,68 @@ export const FileTreePanel: React.FC<Props> = React.memo(({ sessionId, workingDi
     if (!htmlSource) return Promise.reject(new Error('预览已关闭'));
     return readPreviewBytes({ name: rel.split('/').pop() || rel, rel, isDir: false, size: 0 }, htmlSource, 8 * 1024 * 1024);
   }, [htmlSource, readPreviewBytes]);
+  const detachPreview = () => {
+    if (!preview || preview.loading || preview.error) return;
+    setPreviewWindowError('');
+    const theme: Record<string, string> = {};
+    const root = document.querySelector('.app-root') || document.documentElement;
+    const styles = getComputedStyle(root);
+    for (let index = 0; index < styles.length; index++) {
+      const name = styles[index];
+      if (name.startsWith('--theme-') || name.startsWith('--ui-')) theme[name] = styles.getPropertyValue(name);
+    }
+    const detachedSource = preview.source;
+    const detachedScope = previewScopeRef.current;
+    const detachedUser = getCurrentUserProfile().userId;
+    const selectedFs = localFs;
+    const current = () => mountedRef.current && previewScopeRef.current === detachedScope
+      && getCurrentUserProfile().userId === detachedUser && (detachedSource !== 'local' || selectedFs === localFsRef.current);
+    const assertCurrent = () => { if (!current()) throw new Error('原文件窗口的工作区或身份已变化'); };
+    const nodeFor = (rel: string): TNode => ({ rel, name: rel.split('/').pop()!, isDir: false, size: 0 });
+    let detachedClient: Promise<DocumentClient> | undefined;
+    const getClient = () => {
+      assertCurrent();
+      return detachedClient ||= (async () => {
+        const target = execKey || getSessionExecKey(sessionId);
+        if (!sessionId || !target) throw new DocumentProtocolError('workspace_identity_required');
+        if (detachedSource === 'local') {
+          if (!selectedFs?.documentAdapter) throw new DocumentProtocolError('safe_local_documents_unsupported');
+          return new LocalDocuments(detachedUser, sessionId, target, await selectedFs.documentAdapter(), new IndexedLocalJournal(), current);
+        }
+        const client = await api.workspaceDocuments(sessionId, target, workingDir, current);
+        return isRemote ? readonlyDocumentClient(client) : client;
+      })();
+    };
+    const result = openPreviewWindow({ preview, theme, dark: isDarkTheme(), initialView: editing ? 'source' : 'preview',
+      root: preview.source === 'local' ? localFs?.label() || '本机副本' : workingDir,
+      nodeLabel: preview.source === 'local' ? '本机副本' : execLabel || '会话执行节点',
+    }, rel => { assertCurrent(); return readPreviewBytes(nodeFor(rel), detachedSource, 8 * 1024 * 1024); }, {
+      documentClient: getClient,
+      load: async rel => {
+        assertCurrent();
+        const node = nodeFor(rel);
+        const loaded = await loadDocumentPreview<StructuredPreviewPayload>({ rel, name: node.name, source: detachedSource, loading: true }, {
+          bytes: max => readPreviewBytes(node, detachedSource, max),
+          structured: bytes => structuredPreviewFor(node, detachedSource, bytes),
+          base64: async () => {
+            if (detachedSource === 'local') return selectedFs!.readFile(rel);
+            const result = await api.syncReadFile(workingDir, rel, execKey);
+            if (result.status !== 'ok' || result.tooLarge) throw new Error(result.message || '文件无法完整预览');
+            return result.data || '';
+          },
+        });
+        assertCurrent(); return loaded;
+      },
+      reveal: async rel => { assertCurrent(); await revealNode(nodeFor(rel), detachedSource, true); },
+      review: async rel => { assertCurrent(); await openReview(rel, detachedSource, true); },
+      structured: async rel => { assertCurrent(); return structuredPreviewFor(nodeFor(rel), detachedSource); },
+    });
+    previewWindows.current.add(result.dispose);
+    void result.opened.catch(error => {
+      previewWindows.current.delete(result.dispose);
+      setPreviewWindowError(`独立窗口打开失败：${String(error)}`);
+    });
+  };
   const navigateHtmlResource = useCallback((rel: string, fragment: string) => {
     void openPreview({ name: rel.split('/').pop() || rel, rel, isDir: false, size: 0,
       local: htmlSource === 'local', remote: htmlSource === 'remote' }, fragment);
@@ -2136,7 +2211,7 @@ export const FileTreePanel: React.FC<Props> = React.memo(({ sessionId, workingDi
     });
   }, [preview, structuredPreviewFor]);
 
-  const revealNode = useCallback(async (node: TNode, source: 'local' | 'remote') => {
+  const revealNode = useCallback(async (node: TNode, source: 'local' | 'remote', requireReady = false) => {
     setContextMenu(null);
     try {
       if (source === 'local') {
@@ -2149,6 +2224,7 @@ export const FileTreePanel: React.FC<Props> = React.memo(({ sessionId, workingDi
       }
     } catch (e: any) {
       setMsg({ kind: 'err', text: `定位失败：${e?.message ?? e}` });
+      if (requireReady) throw e;
     }
   }, [localFs, workingDir, execKey]);
 
@@ -3426,12 +3502,15 @@ export const FileTreePanel: React.FC<Props> = React.memo(({ sessionId, workingDi
                   }}>预览（保留草稿）</button>}
                 </>
               )}
+              <button style={hdrBtnStyle} onClick={detachPreview} disabled={preview.loading || !!preview.error || !!activeDocument?.dirty || needsSaveCheck}
+                title={activeDocument?.dirty || needsSaveCheck ? '请先保存或核对当前改动，再分离文件窗口' : '在可移动、缩放的独立窗口中预览或编辑当前文件'}>↗ 独立窗口</button>
               {!documentHost && <button style={hdrBtnStyle} onClick={() => setPreviewMaximized((value) => !value)} title={previewMaximized ? '退出最大化（Esc）' : '最大化预览'}>
                 {previewMaximized ? '🗗 还原' : '⛶ 最大化'}
               </button>}
               {!documentHost && <button style={hdrBtnStyle} onClick={closePreview} title="关闭预览" aria-label="关闭预览">✕</button>}
             </div>
             <div style={{ ...pvBody, ...(documentHost ? { display: 'flex', flexDirection: 'column' as const } : {}) }}>
+              {previewWindowError && <div role="alert" style={{ padding: '8px 12px', color: '#f87171', fontSize: 12 }}>{previewWindowError}</div>}
               {isRemote && preview.source === 'remote' && <div role="status" style={{ padding: '6px 10px', fontSize: 11, color: 'var(--theme-text-muted)', borderBottom: '1px solid var(--theme-border)' }}>
                 远端文件 · 只读。下载到本机副本后编辑，保存不会自动上传。
                 {activeDocument?.dirty && <button style={hdrBtnStyle} onClick={() => void exportGeneratedText(editText, `${preview.name}.draft.txt`, 'text/plain;charset=utf-8').catch(error => setMsg({ kind: 'err', text: `导出失败：${error}` }))}>导出历史远端草稿</button>}

@@ -50,6 +50,59 @@ class QwenCodeCliTests(unittest.IsolatedAsyncioTestCase):
             type=BackendType.QWEN_CODE_CLI,
         ))
 
+    async def test_isolated_settings_preserve_policy_without_workspace_mutation(self):
+        import json
+        import tempfile
+        from pathlib import Path
+        from src.backend.aimein import workspace_fingerprint
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root)
+            cwd = root / 'product'; cwd.mkdir()
+            (cwd / '.qwen').mkdir()
+            existing = cwd / '.qwen/settings.json'
+            existing.write_text('{"custom":"product configuration"}', encoding='utf-8')
+            system = root / 'system.json'
+            system.write_text('{"security":{"policy":"retain"},"tools":{"exclude":["write_file"]}}', encoding='utf-8')
+            env = {'QWEN_CODE_SYSTEM_SETTINGS_PATH': str(system)}
+            before = workspace_fingerprint(str(cwd))
+            with self.backend._isolated_auth_settings(env, str(cwd), 'openai', 'review-model'):
+                runtime = Path(env['QWEN_CODE_SYSTEM_SETTINGS_PATH'])
+                data = json.loads(runtime.read_text(encoding='utf-8'))
+                self.assertEqual(data['security']['policy'], 'retain')
+                self.assertEqual(data['security']['auth']['selectedType'], 'openai')
+                self.assertEqual(data['tools']['exclude'], ['write_file'])
+                self.assertEqual(data['model']['name'], 'review-model')
+                self.assertEqual(env['QWEN_CODE_SYSTEM_DEFAULTS_PATH'], str(system.parent / 'system-defaults.json'))
+                self.assertEqual(workspace_fingerprint(str(cwd)), before)
+            self.assertFalse(runtime.exists())
+            self.assertEqual(workspace_fingerprint(str(cwd)), before)
+            system.write_text('invalid settings', encoding='utf-8')
+            with self.assertRaises(ValueError):
+                self.backend._isolated_auth_settings({'QWEN_CODE_SYSTEM_SETTINGS_PATH': str(system)}, str(cwd), 'openai', 'review-model')
+            self.assertEqual(workspace_fingerprint(str(cwd)), before)
+
+    async def test_isolated_sdk_call_uses_temporary_settings_and_cleans_after_result(self):
+        import tempfile
+        from pathlib import Path
+        query = _FakeQuery([{'type': 'result', 'subtype': 'success', 'session_id': 'review-native'}])
+        paths = []
+        def invoke(prompt, options):
+            target = Path(options['env']['QWEN_CODE_SYSTEM_SETTINGS_PATH'])
+            self.assertTrue(target.is_file())
+            self.assertFalse((Path(options['cwd']) / '.qwen').exists())
+            paths.append(target)
+            return query
+        with tempfile.TemporaryDirectory() as cwd, \
+             patch('qwen_code_sdk.query', side_effect=invoke), \
+             patch('src.backend.qwen_code_cli.cli_available', return_value=True), \
+             patch.object(self.backend, '_build_env', return_value={'QWEN_CODE_SYSTEM_SETTINGS_PATH': str(Path(cwd) / 'absent-system.json')}):
+            await self.backend.send_message(messages=[], content='review', images=None, session_id='review',
+                message_id='review-message', on_delta=lambda _: None, working_dir=cwd, isolated_context=True)
+            self.assertFalse((Path(cwd) / '.qwen').exists())
+        await query.finished.wait()
+        self.assertEqual(len(paths), 1)
+        self.assertFalse(paths[0].exists())
+
     async def test_terminal_cleanup_is_detached_and_tracked(self):
         query = _FakeQuery()
         self.backend._detach_query_cleanup(query)

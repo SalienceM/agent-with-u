@@ -103,6 +103,7 @@ class AsideInspectionBridge:
             return
         job = getattr(self, '_inspection_jobs', {}).get(key)
         runner = None
+        backend = None
         terminal, terminal_message, error_code = 'done', '回答完成', ''
 
         def publish(phase: str, message: str) -> None:
@@ -159,6 +160,7 @@ class AsideInspectionBridge:
                     if delta.type == 'text_delta' and delta.text:
                         receive(delta.text)
                 await send_text_only(backend, content=content, constraints=rules, session_id=key,
+                    owner_id=session.owner_id,
                     message_id=turn_id, on_delta=on_delta, images=images,
                     model_override=(runtime or {}).get('model'), reasoning_effort=(runtime or {}).get('reasoningEffort'))
             def output(text: str) -> None:
@@ -206,12 +208,14 @@ class AsideInspectionBridge:
             turn.answer = (turn.answer + '\n\n' if turn.answer else '') + '❌ ' + terminal_message
         finally:
             if job and job.get('identity').turn_id == turn_id:
-                if runner and not await runner.settled():
+                from .deepseek_harness import DeepSeekHarnessBackend
+                native_active = isinstance(backend, DeepSeekHarnessBackend) and backend.has_unconfirmed_activity(key)
+                if runner and (not await runner.settled() or native_active):
                     turn.status = 'answering'
                     publish('unknown', '结果待确认：旁路调用或读取尚未确认退出，主线不受影响')
                     # 仅等拥有的任务结束，无查询轮询/重放；预留保留至确认。
                     job['cleanup'] = asyncio.create_task(self._finish_inspection(
-                        sid, key, loop, job, turn, publish, terminal, terminal_message, runner))
+                        sid, key, loop, job, turn, publish, terminal, terminal_message, runner, backend))
                 else:
                     turn.status = terminal
                     try:
@@ -228,8 +232,16 @@ class AsideInspectionBridge:
                     self._emit_chat_aside_updated(state)
 
     async def _finish_inspection(self, sid: str, key: str, loop: bool, job: dict, turn: Any,
-                                 publish: Any, terminal: str, message: str, runner: InspectionRunner) -> None:
+                                 publish: Any, terminal: str, message: str, runner: InspectionRunner,
+                                 backend: Any = None) -> None:
         await asyncio.gather(*(runner.pending | runner.queries.pending), return_exceptions=True)
+        from .deepseek_harness import DeepSeekHarnessBackend
+        worker = getattr(backend, '_harness_workers', {}).get(key) if isinstance(backend, DeepSeekHarnessBackend) else None
+        if worker and worker.task:
+            await asyncio.gather(asyncio.shield(worker.task), return_exceptions=True)
+            if not worker.confirmed:
+                publish('unknown', 'Harness 旁路进程退出未确认，保留预留，主线不受影响')
+                return
         if getattr(self, '_inspection_jobs', {}).get(key) is not job:
             return
         turn.status = terminal

@@ -551,6 +551,7 @@ class LoopLifecycleTests(unittest.IsolatedAsyncioTestCase):
         bridge._loop_active_backends = {}
         bridge._loop_state = lambda _sid: None
         bridge._new_backend_instance = lambda _backend_id: backend
+        bridge._prepare_session_skills = AsyncMock()
         bridge._build_session_reference_context = lambda prompt, _sid: prompt
         bridge._emit_loop_progress = Mock()
         bridge._add_runtime_kwargs = lambda *_args, **_kwargs: None

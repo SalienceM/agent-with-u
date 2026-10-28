@@ -45,6 +45,7 @@ import { LoopPanel } from './components/LoopPanel';
 import { ThoughtsAssistant } from './components/ThoughtsAssistant';
 import { HomeDashboard } from './home/HomeDashboard';
 import type { DashboardDestination } from './home/dashboardModel';
+import { AimeinEntrance } from './components/AimeinEntrance';
 import { LoopPolicyEditor, DEFAULT_POLICY, normalizePolicy } from './components/LoopPolicyEditor';
 import type { LoopPolicy } from './components/LoopPolicyEditor';
 import {
@@ -114,6 +115,8 @@ export const App: React.FC = () => {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [releaseCenterOpen, setReleaseCenterOpen] = useState(false);
   const [backendManagerOpen, setBackendManagerOpen] = useState(false);
+  const [backendManagerInWorld, setBackendManagerInWorld] = useState(false);
+  const [backendWorldHost, setBackendWorldHost] = useState<HTMLDivElement | null>(null);
   const [backendManagerExecKey, setBackendManagerExecKey] = useState(() => getHomeExecKey());
   const [backendManagerLoading, setBackendManagerLoading] = useState(false);
   const [backendManagerError, setBackendManagerError] = useState('');
@@ -981,9 +984,10 @@ export const App: React.FC = () => {
       return;
     }
     // Open dialog to select working directory first
+    if (isMobile) setSidebarCollapsed(true);
     setNewSessionInitialType('normal');
     setNewSessionDialogOpen(true);
-  }, []);
+  }, [isMobile]);
 
   const handleDashboardNavigate = useCallback((destination: DashboardDestination) => {
     if (destination.kind === 'session' || destination.kind === 'loop' || destination.kind === 'tasks') {
@@ -1028,7 +1032,7 @@ export const App: React.FC = () => {
   const handleCreateSession = useCallback(async (
     workingDir: string,
     backendId: string,
-    sessionType: 'normal' | 'loop' = 'normal',
+    sessionType: 'normal' | 'loop' | 'aimein' = 'normal',
     loopPolicy?: any,
     runtime: ModelRuntime = {},
     execKey?: string,
@@ -1036,7 +1040,7 @@ export const App: React.FC = () => {
   ) => {
     let session;
     try {
-      session = await api.createSession(workingDir, backendId, sessionType, runtime, execKey, codexRemote);
+      session = await api.createSession(workingDir, backendId, sessionType, runtime, execKey, codexRemote, loopPolicy);
     } catch (e: any) {
       // ★ 后端抛出错误（如节点 session 数量已达上限）
       showToast('error', e?.message || '创建会话失败');
@@ -1048,7 +1052,12 @@ export const App: React.FC = () => {
     }
     // ★ Loop 会话：把建会话时编辑的策略与心智落到 stage 文件
     if (sessionType === 'loop' && loopPolicy) {
-      api.loopSetPolicy(session.id, loopPolicy).catch(() => {});
+      try {
+        const result = await api.loopSetPolicy(session.id, loopPolicy);
+        if (result.status !== 'ok') throw new Error(result.message || '策略未保存');
+      } catch (error: any) {
+        showToast('error', `会话已创建，但策略保存未确认：${error?.message || '连接失败'}。请在工作台设置中核对后运行。`);
+      }
     }
     // ★ Set session first, then close dialog in next render cycle to avoid visual tearing
     // 分屏架构下:把新 session 放进焦点 pane,activeSessionId 自动派生过去。
@@ -2180,7 +2189,9 @@ export const App: React.FC = () => {
       {/* ---- Backend Manager ---- */}
       <BackendManager
         isOpen={backendManagerOpen}
-        onClose={() => setBackendManagerOpen(false)}
+        worldDock={backendManagerInWorld && newSessionDialogOpen}
+        worldDockTarget={backendWorldHost}
+        onClose={() => { setBackendManagerOpen(false); setBackendManagerInWorld(false); }}
         backends={backendConfigs}
         sessions={sessions}
         targetExecKey={backendManagerExecKey}
@@ -2199,9 +2210,13 @@ export const App: React.FC = () => {
         <NewSessionDialog
           backends={backends}
           initialSessionType={newSessionInitialType}
+          suspended={backendManagerOpen}
+          onWorldDockHost={setBackendWorldHost}
+          onManageBackends={key => { setBackendManagerExecKey(key || getHomeExecKey()); setBackendManagerInWorld(true); setBackendManagerOpen(true); }}
           onClose={() => {
             // ★ User manually closed - mark as done to prevent re-opening
             setNewSessionDialogOpen(false);
+            if (backendManagerInWorld) { setBackendManagerOpen(false); setBackendManagerInWorld(false); }
             initialCheckDoneRef.current = true;
           }}
           onCreate={handleCreateSession}
@@ -2702,7 +2717,7 @@ function formatModelLabel(backend: any, session?: any): string {
   if (backend.type === 'claude-agent-sdk' || backend.type === 'claude-code-official') {
     return env.ANTHROPIC_MODEL || backend.model || 'auto';
   }
-  if (backend.type === 'codex-office') return formatRuntimeLabel(backend, {
+  if (backend.type === 'codex-office' || backend.type === 'deepseek-harness') return formatRuntimeLabel(backend, {
     model: session?.modelOverride,
     reasoningEffort: session?.reasoningEffort,
   });
@@ -2713,11 +2728,14 @@ function formatModelLabel(backend: any, session?: any): string {
 interface NewSessionDialogProps {
   backends: any[];
   initialSessionType?: 'normal' | 'loop';
+  suspended?: boolean;
+  onWorldDockHost?: React.Ref<HTMLDivElement>;
+  onManageBackends?: (execKey: string) => void;
   onClose: () => void;
   onCreate: (
     workingDir: string,
     backendId: string,
-    sessionType: 'normal' | 'loop',
+    sessionType: 'normal' | 'loop' | 'aimein',
     loopPolicy?: LoopPolicy,
     runtime?: ModelRuntime,
     execKey?: string,
@@ -2728,16 +2746,19 @@ interface NewSessionDialogProps {
 const NewSessionDialog: React.FC<NewSessionDialogProps> = ({
   backends,
   initialSessionType = 'normal',
+  suspended, onManageBackends, onWorldDockHost,
   onClose,
   onCreate,
 }) => {
   // 留空 = 后端自动生成按时间命名的默认目录（放在日志目录同级）
   const [workingDir, setWorkingDir] = useState('');
-  const [sessionType, setSessionType] = useState<'normal' | 'loop'>(initialSessionType);
+  const [sessionType, setSessionType] = useState<'normal' | 'loop' | 'aimein'>(initialSessionType);
   const [dirPickerOpen, setDirPickerOpen] = useState(false);
   const [loopPolicy, setLoopPolicy] = useState<LoopPolicy>(DEFAULT_POLICY);
   const [sessionRuntime, setSessionRuntime] = useState<ModelRuntime>({});
   const [policyOpen, setPolicyOpen] = useState(false);
+  const [creating, setCreating] = useState(false);
+  const creatingRef = useRef(false);
   const isAutoDir = !workingDir.trim() || workingDir.trim() === '.';
 
   // ── 执行节点（session 级模式管理）：默认节点与物理本机是两个独立概念 ──
@@ -2777,6 +2798,8 @@ const NewSessionDialog: React.FC<NewSessionDialogProps> = ({
   const execBackendsKeyRef = useRef(execKey);
   useEffect(() => {
     let cancelled = false;
+    // 从连接配置返回时重新读取当前节点；仅浏览配置也可能观察到外部更新。
+    if (suspended) return;
     if (!execKey) {
       execBackendsKeyRef.current = '';
       setExecBackends([]);
@@ -2803,7 +2826,7 @@ const NewSessionDialog: React.FC<NewSessionDialogProps> = ({
       if (!cancelled) setExecBackendsLoading(false);
     });
     return () => { cancelled = true; };
-  }, [execKey, homeBackendSnapshot, executorRevision]);
+  }, [execKey, homeBackendSnapshot, executorRevision, suspended]);
 
   const [selectedBackendId, setSelectedBackendId] = useState(
     backends[0]?.id || 'claude-agent-sdk-default'
@@ -2841,7 +2864,7 @@ const NewSessionDialog: React.FC<NewSessionDialogProps> = ({
   }, [isCodex]);
 
   useEffect(() => {
-    if (poeChatOnly && sessionType !== 'normal') {
+    if (poeChatOnly && sessionType === 'loop') {
       setSessionType('normal');
       setPolicyOpen(false);
     }
@@ -2885,7 +2908,7 @@ const NewSessionDialog: React.FC<NewSessionDialogProps> = ({
   }, [remoteThreadId, remoteThreads]);
 
   const handleCreate = useCallback(async () => {
-    if (!execKey) return;
+    if (!execKey || creatingRef.current) return;
     // 空值交给后端补一个时间戳目录
     const backend = execBackends.find((item) => item.id === selectedBackendId);
     if (!backend || execBackendsLoading) return;
@@ -2898,8 +2921,11 @@ const NewSessionDialog: React.FC<NewSessionDialogProps> = ({
           title: selectedThread?.title || undefined,
         }
       : {};
-    await onCreate(workingDir.trim() || '', selectedBackendId, sessionType,
-      sessionType === 'loop' ? normalizePolicy(loopPolicy) : undefined, runtime, execKey, codexRemote);
+    creatingRef.current = true; setCreating(true);
+    try {
+      await onCreate(workingDir.trim() || '', selectedBackendId, sessionType,
+        sessionType !== 'normal' ? normalizePolicy({ ...loopPolicy, executionMode: sessionType }) : undefined, runtime, execKey, codexRemote);
+    } finally { creatingRef.current = false; setCreating(false); }
   }, [workingDir, selectedBackendId, sessionType, loopPolicy, sessionRuntime, execKey, execBackends, execBackendsLoading, onCreate, codexLocation, remoteThreadId, remoteThreads]);
 
   const handleBrowse = useCallback(() => {
@@ -2907,91 +2933,13 @@ const NewSessionDialog: React.FC<NewSessionDialogProps> = ({
     setDirPickerOpen(true);
   }, []);
 
-  const createBlocked = !execKey || execBackendsLoading || !selectedBackend || (
+  const createBlocked = creating || !execKey || execBackendsLoading || !selectedBackend || (
     isCodex && codexLocation === 'node'
       ? (remoteLoading || !remoteThreadId)
       : false
   );
 
-  return (
-    <div
-      style={overlayStyle}
-    >
-      <div
-        style={{
-          ...dialogStyle,
-          willChange: 'transform',
-          animation: 'dialogSlideIn 0.28s cubic-bezier(0.22,0.61,0.36,1)',
-        }}
-        onClick={(e) => e.stopPropagation()}
-      >
-        <h3 style={dialogTitleStyle}>New Session</h3>
-        <p style={dialogDescStyle}>
-          Each session is tied to a working directory. Claude will operate within this directory,
-          with full access to read, edit, and run commands here.
-        </p>
-
-        {/* ★ 会话类型：普通 / Loop（可视化迭代任务） */}
-        <div style={formGroupStyle}>
-          <label style={labelStyle}>会话类型 / Type:</label>
-          <div style={{ display: 'flex', gap: 8 }}>
-            {([
-              { v: 'normal', icon: '💬', title: '普通会话', desc: '常规对话工作区' },
-              { v: 'loop', icon: '🔁', title: 'Loop 会话', desc: '想法→迭代执行→产出，可视化' },
-            ] as const).map((opt) => (
-              <button
-                key={opt.v}
-                onClick={() => { if (!(poeChatOnly && opt.v === 'loop')) setSessionType(opt.v); }}
-                disabled={poeChatOnly && opt.v === 'loop'}
-                title={poeChatOnly && opt.v === 'loop' ? 'Poe 通道仅支持普通 Chat Session' : undefined}
-                style={{
-                  flex: 1, textAlign: 'left', padding: '10px 12px', borderRadius: 8,
-                  background: sessionType === opt.v ? 'var(--theme-accent-bg, #0969da1a)' : 'var(--theme-bg-tertiary, #f6f8fa)',
-                  border: `1px solid ${sessionType === opt.v ? 'var(--theme-accent, #0969da)' : 'var(--theme-border, rgba(0,0,0,0.12))'}`,
-                  color: 'var(--theme-text, #1f2328)',
-                  opacity: poeChatOnly && opt.v === 'loop' ? 0.45 : 1,
-                  cursor: poeChatOnly && opt.v === 'loop' ? 'not-allowed' : 'pointer',
-                }}
-              >
-                <div style={{ fontSize: 13, fontWeight: 600 }}>{opt.icon} {opt.title}</div>
-                <div style={{ fontSize: 11, color: 'var(--theme-text-muted, #656d76)', marginTop: 2 }}>{opt.desc}</div>
-              </button>
-            ))}
-          </div>
-        </div>
-
-        {/* ★ Loop 策略与心智：建会话时可编辑（默认即可，按需展开调整） */}
-        {sessionType === 'loop' && (
-          <div style={formGroupStyle}>
-            <button
-              onClick={() => setPolicyOpen((v) => !v)}
-              style={{
-                display: 'flex', alignItems: 'center', gap: 6, width: '100%', textAlign: 'left',
-                background: 'none', border: 'none', cursor: 'pointer', padding: 0,
-                color: 'var(--theme-text, #1f2328)', fontSize: 13, fontWeight: 600,
-              }}
-            >
-              <span>{policyOpen ? '▾' : '▸'}</span>
-              <span>⚙️ Loop 策略与心智</span>
-              <span style={{ fontSize: 11, fontWeight: 400, color: 'var(--theme-text-muted, #656d76)' }}>
-                （门槛 / 最大 loop / 风险 / 策略文本，可不改用默认；建后也能随时调）
-              </span>
-            </button>
-            {policyOpen && (
-              <div style={{ marginTop: 10 }}>
-                <LoopPolicyEditor
-                  value={loopPolicy}
-                  execKey={execKey}
-                  onChange={setLoopPolicy}
-                  availableBackends={execBackends}
-                  sessionBackendId={selectedBackendId}
-                  sessionRuntime={sessionRuntime}
-                />
-              </div>
-            )}
-          </div>
-        )}
-
+  const connectionFields = <>
         {/* ★ 执行节点：本会话在哪台机器上执行(本机自执行 / 远端节点)。
             只有配置了额外执行节点时才出现,单机用户无感(不臃肿)。 */}
         {executors.length === 0 && (
@@ -3050,9 +2998,10 @@ const NewSessionDialog: React.FC<NewSessionDialogProps> = ({
           <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
             <input
               type="text"
+              aria-label="工坊工作目录"
               value={workingDir}
               onChange={(e) => setWorkingDir(e.target.value)}
-              style={inputStyle}
+              style={{ ...inputStyle, minWidth: 0, width: '100%' }}
               placeholder="留空 = 自动按时间命名（放在日志目录旁）"
             />
             <button onClick={handleBrowse} style={browseBtnStyle} title="Select directory with file picker">
@@ -3072,6 +3021,7 @@ const NewSessionDialog: React.FC<NewSessionDialogProps> = ({
           <label style={labelStyle}>Backend:</label>
           <div style={selectWrapperStyle}>
             <select
+              aria-label="建设模型连接"
               value={selectedBackend ? selectedBackendId : ''}
               onChange={(e) => setSelectedBackendId(e.target.value)}
               style={selectStyle}
@@ -3144,6 +3094,105 @@ const NewSessionDialog: React.FC<NewSessionDialogProps> = ({
           </div>
         )}
 
+  </>;
+  if (sessionType === 'aimein') {
+    const problem = !execKey ? '请先连接一个执行节点，再安放工坊。'
+      : execBackendsError || (!execBackendsLoading && (!selectedBackend || selectedBackend.enabled === false) ? '当前节点还没有可用的建设模型连接。' : '')
+      || (poeChatOnly ? '当前连接只支持聊天，请换一个支持建设的模型连接。' : '');
+    return <>
+      <AimeinEntrance blocked={createBlocked || !!problem} loading={execBackendsLoading} creating={creating} problem={problem}
+        suspended={suspended} onPanelHost={onWorldDockHost} backendLabel={selectedBackend?.label || selectedBackend?.id || ''} workingDir={workingDir}
+        executorLabel={executors.find(ex => ex.key === execKey)?.label || ''} onCreate={() => void handleCreate()}
+        onClose={onClose} onBack={() => setSessionType('normal')} onManage={() => onManageBackends?.(execKey)}>
+        {connectionFields}
+      </AimeinEntrance>
+      {dirPickerOpen && <ServerDirPicker execKey={execKey} initialPath={isAutoDir ? undefined : workingDir}
+        onSelect={p => { setWorkingDir(p); setDirPickerOpen(false); }} onCancel={() => setDirPickerOpen(false)} />}
+    </>;
+  }
+
+  return (
+    <div
+      style={overlayStyle}
+    >
+      <div
+        style={{
+          ...dialogStyle,
+          willChange: 'transform',
+          animation: 'dialogSlideIn 0.28s cubic-bezier(0.22,0.61,0.36,1)',
+        }}
+        onClick={(e) => e.stopPropagation()}
+      >
+        <h3 style={dialogTitleStyle}>New Session</h3>
+        <p style={dialogDescStyle}>
+          Each session is tied to a working directory. Claude will operate within this directory,
+          with full access to read, edit, and run commands here.
+        </p>
+
+        {/* ★ 会话类型：普通 / Loop（可视化迭代任务） */}
+        <div style={formGroupStyle}>
+          <label style={labelStyle}>会话类型 / Type:</label>
+          <div style={{ display: 'flex', gap: 8 }}>
+            {([
+              { v: 'normal', icon: '💬', title: '普通会话', desc: '常规对话工作区' },
+              { v: 'loop', icon: '🔁', title: 'Loop 会话', desc: '想法→迭代执行→产出，可视化' },
+              { v: 'aimein', icon: '◎', title: 'AIMEIN', desc: '动态阶段 · 三模型验收 · 逐步成熟' },
+            ] as const).map((opt) => (
+              <button
+                key={opt.v}
+                onClick={() => { if (!(poeChatOnly && opt.v === 'loop')) setSessionType(opt.v); }}
+                disabled={poeChatOnly && opt.v === 'loop'}
+                title={poeChatOnly && opt.v === 'loop' ? 'Poe 通道仅支持普通 Chat Session' : undefined}
+                style={{
+                  flex: 1, minWidth: 0, textAlign: 'left', padding: '10px 12px', borderRadius: 8,
+                  background: sessionType === opt.v ? 'var(--theme-accent-bg, #0969da1a)' : 'var(--theme-bg-tertiary, #f6f8fa)',
+                  border: `1px solid ${sessionType === opt.v ? 'var(--theme-accent, #0969da)' : 'var(--theme-border, rgba(0,0,0,0.12))'}`,
+                  color: 'var(--theme-text, #1f2328)',
+                  opacity: poeChatOnly && opt.v === 'loop' ? 0.45 : 1,
+                  cursor: poeChatOnly && opt.v === 'loop' ? 'not-allowed' : 'pointer',
+                }}
+              >
+                <div style={{ fontSize: 13, fontWeight: 600 }}>{opt.icon} {opt.title}</div>
+                <div style={{ fontSize: 11, color: 'var(--theme-text-muted, #656d76)', marginTop: 2 }}>{opt.desc}</div>
+              </button>
+            ))}
+          </div>
+        </div>
+
+        {/* ★ Loop 策略与心智：建会话时可编辑（默认即可，按需展开调整） */}
+        {sessionType !== 'normal' && (
+          <div style={formGroupStyle}>
+            <button
+              onClick={() => setPolicyOpen((v) => !v)}
+              style={{
+                display: 'flex', alignItems: 'center', gap: 6, width: '100%', textAlign: 'left',
+                background: 'none', border: 'none', cursor: 'pointer', padding: 0,
+                color: 'var(--theme-text, #1f2328)', fontSize: 13, fontWeight: 600,
+              }}
+            >
+              <span>{policyOpen ? '▾' : '▸'}</span>
+              <span>⚙️ Loop 策略与心智</span>
+              <span style={{ fontSize: 11, fontWeight: 400, color: 'var(--theme-text-muted, #656d76)' }}>
+                （门槛 / 预算 / 风险 / 策略文本，建后也可调整）
+              </span>
+            </button>
+            {policyOpen && (
+              <div style={{ marginTop: 10 }}>
+                <LoopPolicyEditor
+                  value={{ ...loopPolicy, executionMode: 'loop' }}
+                  execKey={execKey}
+                  onChange={setLoopPolicy}
+                  availableBackends={execBackends}
+                  sessionBackendId={selectedBackendId}
+                  sessionRuntime={sessionRuntime}
+                />
+              </div>
+            )}
+          </div>
+        )}
+
+        {connectionFields}
+
         <div style={dialogActionsStyle}>
           <button onClick={onClose} style={cancelBtnStyle}>Cancel</button>
           <button
@@ -3151,7 +3200,7 @@ const NewSessionDialog: React.FC<NewSessionDialogProps> = ({
             disabled={createBlocked}
             style={{ ...confirmBtnStyle, opacity: createBlocked ? 0.5 : 1 }}
           >
-            Create Session
+            {creating ? '正在创建…' : 'Create Session'}
           </button>
         </div>
       </div>

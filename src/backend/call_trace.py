@@ -173,7 +173,7 @@ async def traced_send(backend: Any, kwargs: dict, trace: CallTrace | None) -> An
     try:
         backend_type = getattr(config, "type", "")
         backend_type = getattr(backend_type, "value", backend_type)
-        instrumented = backend_type in {"qwen-code-cli", "openai-compatible", "anthropic-api"}
+        instrumented = backend_type in {"qwen-code-cli", "deepseek-harness", "openai-compatible", "anthropic-api"}
         boundary = {
             "backendId": getattr(config, "id", ""),
             "backendType": backend_type,

@@ -40,9 +40,22 @@ def prepare(*, install: bool = True) -> int:
         result = subprocess.run([sys.executable, "-m", "pip", "install", "-r", str(ROOT / "requirements.txt")], check=False)
         if result.returncode:
             return result.returncode
+        # rc.3 尚未发布到 PyPI；只安装预先校验/暂存的同版 wheel。
+        from scripts.prepare_deepseek_harness import verify_staged_wheels
+        from src.backend.deepseek_harness_distribution import target_platform
+        verified = verify_staged_wheels(ROOT / "build/deepseek-harness/wheels", target_platform())
+        result = subprocess.run([sys.executable, "-m", "pip", "install", "--no-index", "--no-deps",
+            *map(str, verified)], check=False)
+        if result.returncode:
+            return result.returncode
     failures = validate_requirements()
     from src.package_readiness import check_components
     failures.extend(check_components()["failures"])
+    from src.backend.deepseek_harness_distribution import verify_bundle
+    try:
+        verify_bundle()
+    except Exception as exc:
+        failures.append("harness-bundle:" + str(exc))
     result = subprocess.run([sys.executable, "-m", "pip", "check"], check=False)
     if result.returncode:
         failures.append("pip-check")

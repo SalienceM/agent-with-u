@@ -1,0 +1,5 @@
+# -*- coding: utf-8 -*-
+# 使用 deploy/deepseek-harness.build-{windows,linux}.json 校验过的本地配套 wheel。
+# PyPI 当前没有 rc.3；构建安装必须 --no-index --find-links build/deepseek-harness/wheels。
+deepseek-harness-sdk==0.2.1rc3
+deepseek-harness-runtime-bin==0.2.1rc3

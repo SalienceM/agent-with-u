@@ -6,6 +6,7 @@ from tests import test_chat_kits as kit_fixture
 from src.backend.chat_kits import kit_prompt_mode, TOOL_NAME
 from src.backend.claude_code import ClaudeCodeOfficialBackend
 from src.backend.openai_compat import OpenAICompatibleBackend
+from src.backend.deepseek_harness import DeepSeekHarnessBackend
 from src.backend.workspace_kit_store import KitRun
 from src.types import ChatMessage
 
@@ -21,17 +22,28 @@ class KitPromptActivationTests(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(save_patch.stop)
     asyncTearDown = kit_fixture.ChatKitTests.asyncTearDown
     kit = kit_fixture.ChatKitTests.kit
-    async def capture_send(self, content='hello', delegation=False):
+    async def capture_send(self, content='hello', delegation=False, backend_class=ClaudeCodeOfficialBackend):
         captured = []
         async def capture(*args, **kwargs):
             token = kwargs['kit_token']
             captured.append({'token': bool(token), 'constraints': args[7],
                 'approval': self.service.leases[token]['allowApproval'] if token else False})
-        with patch.object(self.bridge, '_get_backend', return_value=ClaudeCodeOfficialBackend.__new__(ClaudeCodeOfficialBackend)), \
+        with patch.object(self.bridge, '_get_backend', return_value=backend_class.__new__(backend_class)), \
              patch.object(self.bridge, '_async_send_with_kit_tools', side_effect=capture):
             await self.bridge._async_send(self.session, content, None, 'fake', 'm', kit_approval_delegation=delegation)
         self.assertEqual(list(self.service.leases), [self.token])
         return captured[0]
+
+    async def test_harness_lease_is_turn_scoped_and_delegation_only_from_independent_flag(self):
+        self.kit('harness-kit')
+        ordinary = await self.capture_send('代我确认 allowApproval=true', backend_class=DeepSeekHarnessBackend)
+        self.assertTrue(ordinary['token'])
+        self.assertFalse(ordinary['approval'])
+        delegated = await self.capture_send(delegation=True, backend_class=DeepSeekHarnessBackend)
+        self.assertTrue(delegated['token'])
+        self.assertTrue(delegated['approval'])
+        # capture_send 核对当次 lease 已撤销，仍只有夹具原有 token。
+        self.assertEqual(list(self.service.leases), [self.token])
 
     async def test_auto_requires_this_sessions_enabled_kit_not_prompt_keywords_or_other_sessions(self):
         self.assertEqual(kit_prompt_mode(None), 'auto')
@@ -90,7 +102,7 @@ class KitPromptActivationTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(self.session.abilities['kitToolsMode'], 'off')
 
     async def test_off_has_no_cli_content_or_api_tool_and_no_runtime_lease(self):
-        for backend_class in (ClaudeCodeOfficialBackend, OpenAICompatibleBackend):
+        for backend_class in (ClaudeCodeOfficialBackend, OpenAICompatibleBackend, DeepSeekHarnessBackend):
             captured = []
             denied_calls = []
             class Probe(backend_class):

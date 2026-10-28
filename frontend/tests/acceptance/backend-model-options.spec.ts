@@ -7,7 +7,7 @@ const target = (deviceId: string) => ({ mode: 'relay', url: 'ws://127.0.0.1:4542
   token: 'qa-fixture-not-a-credential', deviceId, deviceName: `工作站 ${deviceId}`,
   user: { userId: 'catalog-test', username: 'catalog-test', displayName: 'Catalog QA', managed: false } });
 
-async function fixture(page: Page, remote = false) {
+async function fixture(page: Page, remote = false, harness = false) {
   const state = {
     nodes: Object.fromEntries(['local', 'A', 'B'].map(node => [node, [primary(node),
       { ...primary('review'), id: 'qa-reviewer', label: 'Codex Reviewer' },
@@ -20,6 +20,11 @@ async function fixture(page: Page, remote = false) {
     errors: [] as string[],
   };
   page.on('pageerror', error => state.errors.push(error.message));
+  if (harness) for (const node of Object.keys(state.nodes)) state.nodes[node] = [{
+    id: 'qa-primary', type: 'deepseek-harness', label: 'Harness QA', enabled: true,
+    modelOptions: [{ id: 'configured-model', label: '配置候选' }], skipPermissions: false,
+    harnessProvider: 'deepseek-official', harnessPermissionMode: 'workspace-write',
+  }];
   if (remote) await page.addInitScript(value => {
     localStorage.setItem('awu.connectionTarget', JSON.stringify(value.home));
     localStorage.setItem('awu.execRoster', JSON.stringify([value.other]));
@@ -83,6 +88,65 @@ async function fixture(page: Page, remote = false) {
   await expect(page.locator('.home-action-grid')).toBeVisible();
   return state;
 }
+
+for (const theme of ['dark', 'light']) {
+test(`Harness configuration (${theme}) creates edits reloads and keeps offline drafts without starting models`, async ({ page }, info) => {
+  await page.addInitScript(value => localStorage.setItem('agent-with-u:appearance:v1:local:local', JSON.stringify({
+    version: 1, theme: value, bgOpacity: .3, uiOpacity: 1, background: 'none',
+  })), theme);
+  const data = await fixture(page, false, true);
+  const manager = await openManager(page);
+  await manager.getByRole('button', { name: '+ New Backend', exact: true }).click();
+  await manager.locator('select:has(option[value="deepseek-harness"])').selectOption('deepseek-harness');
+  await manager.getByPlaceholder('backend-id', { exact: true }).fill('new-harness');
+  await manager.getByPlaceholder('My Custom Backend', { exact: true }).fill('New Harness');
+  const fields = manager.getByRole('region', { name: 'DeepSeek Harness 配置' });
+  await fields.getByLabel('默认模型（可选）', { exact: true }).fill('manual-future');
+  await fields.getByLabel('最大输出 Tokens（可选）', { exact: true }).fill('1234');
+  await fields.getByLabel('访问策略', { exact: true }).selectOption('read-only');
+  await manager.getByRole('button', { name: 'Save', exact: true }).click();
+  await expect(manager).toContainText('已保存到');
+  expect(data.nodes.local.find(item => item.id === 'new-harness')).toMatchObject({
+    type: 'deepseek-harness', model: 'manual-future', harnessMaxTokens: 1234,
+    harnessPermissionMode: 'read-only', skipPermissions: false, modelOptions: null,
+  });
+  expect(data.nodes.local.find(item => item.id === 'new-harness').allowedTools).toBeUndefined();
+  await manager.locator('[data-backend-id="new-harness"]').click();
+  await expect(fields.getByLabel('默认模型（可选）', { exact: true })).toHaveValue('manual-future');
+  data.mode = 'offline';
+  await fields.getByLabel('默认模型（可选）', { exact: true }).fill('retain-offline-draft');
+  await manager.getByRole('button', { name: 'Save', exact: true }).click();
+  await expect(fields.getByLabel('默认模型（可选）', { exact: true })).toHaveValue('retain-offline-draft');
+  await expect(manager).toContainText('节点不可达');
+  expect(await fields.evaluate(el => el.scrollWidth <= el.clientWidth + 1)).toBe(true);
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1)).toBe(true);
+  expect(data.nodes.local.find(item => item.id === 'new-harness').model).toBe('manual-future');
+  expect(data.calls.filter(call => /codex.*Catalog|sendMessage|loopRunIteration/.test(call.method))).toHaveLength(0);
+  await page.screenshot({ path: info.outputPath('harness-backend.png') });
+  expect(data.errors).toEqual([]);
+});
+}
+
+test('Harness runtime inherits empty values and preserves unlisted models without Codex catalogs', async ({ page }, info) => {
+  const data = await fixture(page, false, true);
+  await page.locator('.home-action-grid button').nth(0).click();
+  const model = page.getByRole('combobox', { name: 'Harness 模型覆盖', exact: true }).last();
+  const effort = page.getByRole('combobox', { name: 'Harness 推理档位', exact: true }).last();
+  await expect(model).toBeVisible();
+  await expect.poll(() => candidates(model)).toEqual(['configured-model']);
+  await expect(model).toHaveValue('');
+  await expect(effort).toHaveValue('');
+  await model.fill('unlisted/future');
+  await effort.selectOption('max');
+  await expect(model).toHaveValue('unlisted/future');
+  await expect.poll(() => effortValues(effort)).toEqual(['', 'off', 'low', 'high', 'max']);
+  await model.fill('');
+  await effort.selectOption('');
+  await expect(page.getByText(/模型账号可用性未确认/)).toBeVisible();
+  expect(data.calls.filter(call => /codex.*Catalog|sendMessage|loopRunIteration/.test(call.method))).toHaveLength(0);
+  await page.screenshot({ path: info.outputPath('harness-runtime.png') });
+  expect(data.errors).toEqual([]);
+});
 
 async function openManager(page: Page) {
   await page.locator('.home-action-grid button').nth(4).click();

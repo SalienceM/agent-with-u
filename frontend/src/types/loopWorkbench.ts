@@ -19,6 +19,8 @@ export interface LoopAnalysis {
   deliverable: boolean; outputtable: boolean;
 }
 export interface LoopRecord extends TaskBlockerDetails {
+  aimeinSummary?: import('./aimein').AimeinSummary;
+  aimeinRun?: import('./aimein').AimeinRun;
   openspecSummary?: { change: string; phase: string; status: string; total: number; checked: number; pending: number; manual: number; fixes: number; verified: boolean; message: string };
   openspecRun?: { verify?: { issues?: Array<{ id: string; severity: string; summary: string; evidence: string; manual: boolean; requiresFix: boolean }> } };
   environmentChecks?: EnvironmentCheck[];
@@ -59,8 +61,9 @@ export interface IdeaEntry { id: string; prompt: string; status: string; result:
 export interface GoalRevision { goal: string; hint: string; source: string; createdAt: number; }
 export interface AsideTurn { id: string; question: string; answer: string; status: string; stage: string; seq: number; imageCount?: number; }
 export interface AddonImage { id?: string; base64: string; mime_type?: string; }
-export interface Addon { id: string; text: string; status: string; appliedSeq: number; images?: AddonImage[]; }
+export interface Addon { id: string; text: string; status: string; appliedSeq: number; images?: AddonImage[]; feedback?: import('./aimein').AimeinFeedback; }
 export interface LoopStateT {
+  aimeinMemory?: { revision: number; profiles: number; calibrations: number };
   startup?: { status: string; phase?: string; message?: string; seq?: number };
   contractRepairProtocolVersion?: number;
   contractRepairActive?: boolean;

@@ -9,7 +9,7 @@ import sys
 import tempfile
 from types import SimpleNamespace
 import unittest
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from scripts import prepare_backend_build as dependencies
 from scripts import check_backend_package as smoke
@@ -69,10 +69,11 @@ class DependencyTests(unittest.TestCase):
 
     def test_shared_freezer_collects_declared_modules(self) -> None:
         args = command()
-        self.assertIn("pathspec", args)
-        self.assertIn("qwen_code_sdk", args)
-        if sys.platform == "win32":
-            self.assertIn("winpty", args)
+        self.assertEqual(args[-1], "agent-with-u-backend.spec")
+        spec = (ROOT / args[-1]).read_text(encoding="utf-8")
+        for module in (*readiness.MODULES, "pathspec", "winpty"):
+            self.assertIn(repr(module), spec)
+        self.assertIn("collect_harness()", spec)
 
 
 class IsolationTests(unittest.TestCase):
@@ -165,6 +166,19 @@ class ProcessTests(unittest.IsolatedAsyncioTestCase):
         probe = smoke.ProbeProcess()
         probe.launch_pending = True
         self.assertFalse(await probe.stop())
+
+    async def test_posix_cleanup_waits_for_whole_group_and_keeps_unknown(self) -> None:
+        probe = smoke.ProbeProcess()
+        probe.proc = SimpleNamespace(pid=1234, wait=AsyncMock(return_value=-9))
+        signal_group = Mock(side_effect=[None, None, ProcessLookupError()])
+        with patch.object(smoke, "os", SimpleNamespace(name="posix", killpg=signal_group)), \
+                patch.object(smoke, "signal", SimpleNamespace(SIGKILL=9)):
+            self.assertTrue(await probe.stop())
+            self.assertEqual(signal_group.call_count, 3)
+        with patch.object(smoke, "os", SimpleNamespace(name="posix", killpg=Mock())), \
+                patch.object(smoke, "signal", SimpleNamespace(SIGKILL=9)), \
+                patch.object(smoke, "time", SimpleNamespace(monotonic=Mock(side_effect=[0, 3]))):
+            self.assertFalse(await probe.stop())
 
     async def test_failed_components_and_unknown_cleanup_stay_failed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

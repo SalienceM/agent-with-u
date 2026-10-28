@@ -111,7 +111,7 @@ class SkillMarketExplainer:
             # 不注入任何 Skill/MCP/工具，使用新实例和空历史，绝不复用主会话。
             await send_text_only(backend, content=json.dumps(payload, ensure_ascii=False),
                 session_id=sid, message_id=job["jobId"], on_delta=on_delta,
-                constraints=EXPLANATION_RULES)
+                constraints=EXPLANATION_RULES, owner_id=job["owner"])
             if errors:
                 raise ValueError(errors[0])
             if not job["text"].strip():

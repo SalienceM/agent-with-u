@@ -1,0 +1,50 @@
+{
+  "schemaVersion": 1,
+  "builtAt": "2026-10-26",
+  "origin": "awu-source-build",
+  "commit": "1f81c047fc48fa190a683e469daa699857e9afe8",
+  "sourceArchiveSha256": "9588698c10b45db2b3a179af6a6e5362570ec501f6a9180ec8ae1863496cbd95",
+  "platform": "linux-x64",
+  "sourceVersion": "0.2.1-rc.3",
+  "pythonVersion": "0.2.1rc3",
+  "buildNode": "24.10.0",
+  "embeddedCarrierNode": "24.22.1",
+  "pnpm": "11.28.5",
+  "uv": "0.11.23",
+  "nodeImage": "node@sha256:06e54ecf113a30f0ff9a1d309866a5924d3bda4389eab11a0e1e92f3251d915d",
+  "manylinuxImage": "quay.io/pypa/manylinux_2_28_x86_64@sha256:e0adf18521ad35192df733a6c62d35df7801957d24e0470238aacecfab2188a3",
+  "upstreamArtifactGates": {"passed": 7, "failed": 0},
+  "nativeGlibcRequirements": {"node-pty": "2.28", "flock": "2.2.5"},
+  "wheels": [
+    {
+      "filename": "deepseek_harness_sdk-0.2.1rc3-py3-none-any.whl",
+      "size": 18113,
+      "sha256": "edc2f6b6b98f939263c7be02dd72c7a006947aa6e8202af45ad662b73e725bf6"
+    },
+    {
+      "filename": "deepseek_harness_runtime_bin-0.2.1rc3-py3-none-manylinux_2_28_x86_64.whl",
+      "size": 94631960,
+      "sha256": "37bb6a679aa02ad8bc5dc9c8290ef9dc79529df4279f866c42452f7d85dca0da"
+    }
+  ],
+  "checks": {
+    "metadataExactRuntimePin": true,
+    "upstreamWheelValidation": true,
+    "licensesAndSidecars": true,
+    "networkDisabledVerification": true,
+    "sdkProtocolAgainstFakeProcess": true,
+    "packagedRuntimeInitialize": true,
+    "awuBridgeInitialize": true,
+    "liveFramesAgainstLoopbackModel": true,
+    "pythonTestsPassed": 10,
+    "pythonTestsSkipped": 0,
+    "productionModelsCalled": false,
+    "awuBackendIntegrationComplete": false
+  },
+  "buildVolume": "awu-dsh-linux-1829967b223445b68e4e2bb06274b410",
+  "knownLimits": [
+    "Standalone SDK/runtime and bridge checks are not full AWU Backend, UI or release acceptance.",
+    "Upstream SDK close emits unclosed-pipe ResourceWarning; owned lifecycle adapter is still required.",
+    "pkg node24 resolved carrier 24.22.1; future rebuilds must verify carrier identity, not assume bit-identical output."
+  ]
+}
