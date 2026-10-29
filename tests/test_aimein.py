@@ -76,7 +76,9 @@ class AimeinContracts(unittest.TestCase):
 
     def test_distinct_models_and_no_backend_fallback(self):
         self.assertEqual(len(resolve_reviewers(settings(), configs())), 3)
-        for raw in (settings()[:2], [settings()[0]] * 3, [{**v, 'backendId': 'missing'} for v in settings()]):
+        for count in (1, 2):
+            self.assertEqual(len(resolve_reviewers(settings()[:count], configs())), count)
+        for raw in ([], settings() + [settings()[0]], [settings()[0]] * 3, [{**v, 'backendId': 'missing'} for v in settings()]):
             with self.assertRaises(AimeinError): resolve_reviewers(raw, configs())
         cfg = configs(); cfg[0].type = 'openai-compatible'; cfg[0].model = 'configured'
         with self.assertRaises(AimeinError): resolve_reviewers(settings(), cfg)
@@ -115,6 +117,21 @@ class AimeinContracts(unittest.TestCase):
 
     def test_persisted_complete_flag_alone_is_not_acceptance(self):
         self.assertFalse(acceptance_complete(dict(complete=True, accepted=True, reviews=[])))
+
+    def test_frozen_count_and_legacy_missing_reports_never_gain_acceptance(self):
+        reports = [dict(model=f'm{i}', **normalize_review(review(True, True), normalize_plan(plan()), str(self.root))) for i in range(3)]
+        for count in (1, 2, 3):
+            run = dict(reviewerCount=count, complete=True, accepted=True, plan=normalize_plan(plan()), reviews=reports[:count])
+            self.assertTrue(acceptance_complete(run))
+            self.assertTrue(progress_observation(run, [])['advanced'])
+            self.assertEqual(run_summary(run)['reviewerCount'], count)
+            run['reviews'] = reports[:count - 1]
+            self.assertFalse(acceptance_complete(run))
+            self.assertFalse(progress_observation(run, [])['advanced'])
+        legacy = dict(complete=True, accepted=True, reviews=reports[:1])
+        self.assertFalse(acceptance_complete(legacy))
+        for invalid in (0, 4, True, '1', None):
+            self.assertFalse(acceptance_complete({**legacy, 'reviewerCount': invalid}))
 
 
 class AimeinLifecycle(unittest.IsolatedAsyncioTestCase):
@@ -163,6 +180,45 @@ class AimeinLifecycle(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(second.aimein_run['sprintNumber'], 2)
         self.assertEqual(second.aimein_run['attempt'], 1)
         self.assertEqual(self.state.stage, 'loopexecute')
+
+    async def test_one_and_two_reviewer_attempts_freeze_count_and_call_only_enabled_models(self):
+        for count in (1, 2):
+            self.state.policy.aimein_reviewers = settings()[:count]
+            self.calls.clear()
+            rec = await self.run_attempt()
+            self.assertEqual(rec.aimein_run['reviewerCount'], count)
+            self.assertTrue(rec.aimein_run['accepted'])
+            calls = [c for c in self.calls if c[0].startswith('aimein-review')]
+            self.assertEqual(len(calls), count)
+            self.assertEqual(len({c[2]['indep_session_id'] for c in calls}), count)
+            self.assertTrue(all(c[2]['execution_access'] == 'read-only' for c in calls))
+            self.assertEqual(LoopRecord.from_dict(rec.to_dict()).aimein_run['reviewerCount'], count)
+
+    async def test_two_reviewers_do_not_hide_a_negative_report(self):
+        self.state.policy.aimein_reviewers = settings()[:2]
+        original = self.bridge._loop_run_agent
+        async def agent(*args, **kwargs):
+            if args[2] == 'aimein-review2':
+                return json.dumps({'aimeinReview': review(False)}), None
+            return await original(*args, **kwargs)
+        self.bridge._loop_run_agent = agent
+        rec = await self.run_attempt()
+        self.assertFalse(rec.aimein_run['accepted'])
+        self.assertEqual([r['status'] for r in rec.aimein_run['reviews']], ['passed', 'changes_requested'])
+
+    async def test_reducing_reviewers_during_review_keeps_original_roster_stale(self):
+        self.state.policy.aimein_reviewers = settings()[:2]
+        original = self.bridge._loop_run_agent
+        async def agent(*args, **kwargs):
+            result = await original(*args, **kwargs)
+            if args[2] == 'aimein-review1': self.state.policy.aimein_reviewers = settings()[:1]
+            return result
+        self.bridge._loop_run_agent = agent
+        rec = await self.run_attempt()
+        self.assertEqual(rec.aimein_run['reviewerCount'], 2)
+        self.assertFalse(rec.aimein_run['accepted'])
+        self.assertEqual(rec.aimein_run['status'], 'stale')
+        self.assertEqual(len([c for c in self.calls if c[0].startswith('aimein-review')]), 1)
 
     async def test_explicitly_unneeded_source_uses_generic_execution(self):
         self.state.goal = '建设产品。无需历史存档基线、外部工具或 OpenSpec 来源。'

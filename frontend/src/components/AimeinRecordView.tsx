@@ -1,6 +1,7 @@
 import React from 'react';
 import type { LoopRecord, LoopStateT } from '../types/loopWorkbench';
 import { planWaitingMessage } from '../utils/aimeinWorld';
+import { AimeinReviewSummary } from './AimeinReviewSummary';
 
 const status: Record<string, string> = { planning: '拆解目标', preparing: '编排步骤', executing: '建设中', reviewing: '独立验收中', accepted: '阶段通过', repair: '需要修补', blocked: '执行受阻', stale: '依据已变化', needs_attention: '需要处理', pending: '等待评审', running: '正在核对', passed: '通过', changes_requested: '需修补', error: '评审失败' };
 const card: React.CSSProperties = { border: '1px solid var(--theme-border)', borderRadius: 12, padding: 16, minWidth: 0, background: 'var(--theme-bg-secondary)', overflowWrap: 'anywhere' };
@@ -25,13 +26,13 @@ export const AimeinRecordView: React.FC<{
       <h2 style={{ fontSize: 20, margin: '6px 0 10px', lineHeight: 1.4 }}>{run?.title || '让目标逐阶段成为可用的产品'}</h2>
       <p style={{ margin: '0 0 12px', lineHeight: 1.7, fontSize: 13 }}>{run?.outcome || '先确认产品目标，再动态生成 Sprint。每个阶段同时安排功能流程、必要基础设施和可核实的验收条件。'}</p>
       <ol aria-label="AIMEIN 执行流程" style={{ display: 'flex', flexWrap: 'wrap', gap: 8, padding: 0, margin: 0, listStyle: 'none', fontSize: 12 }}>
-        {['整体目标', '动态 Sprint', 'FlowBuild + Infra', '三模型验收'].map((name, i) => <li key={name} aria-current={stage === i ? 'step' : undefined}
+        {['整体目标', '动态 Sprint', 'FlowBuild + Infra', '独立评审'].map((name, i) => <li key={name} aria-current={stage === i ? 'step' : undefined}
           style={{ padding: '6px 10px', borderRadius: 20, border: `1px solid ${stage === i ? 'var(--theme-accent)' : 'var(--theme-border)'}`, fontWeight: stage === i ? 700 : 400 }}>{i + 1} · {name}</li>)}
       </ol>
     </div>
     {!run ? <section style={card}>
-      <strong>开始前，选好三位评审</strong><p style={muted}>三个不同模型，各自开启新会话。三位全部通过当前阶段才继续；有分歧时保留标准并修补。</p>
-      <button style={button} onClick={onSettings}>配置三模型评审</button>
+      <strong>开始前，选好评审组</strong><p style={muted}>可选 1–3 位评委，各自开启新会话。启用的评委全部通过当前阶段才继续；有分歧时保留标准并修补。</p>
+      <button style={button} onClick={onSettings}>配置评审组</button>
     </section> : <>
       <nav aria-label="AIMEIN 阶段历史" style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 8 }}>
         <label style={{ fontSize: 12 }}>阶段与尝试 <select style={{ ...button, maxWidth: '100%' }} aria-label="查看 AIMEIN 阶段" value={current!.seq} onChange={e => onSelect(Number(e.target.value))}>
@@ -54,8 +55,9 @@ export const AimeinRecordView: React.FC<{
           <ul style={{ paddingLeft: 20, marginBottom: 0, fontSize: 12, lineHeight: 1.8 }}>{run.criteria.filter(c => c.lane === lane).map(c => <li key={c.id}>{c.acceptance}</li>)}</ul>
         </section>)}
       </div>
-      <section aria-label="三方验收">
-        <h3 style={{ fontSize: 14, margin: '0 0 10px' }}>三方验收 <span style={muted}>· {run.reviews.filter(r => r.status === 'passed').length} / 3 通过</span></h3>
+      <section aria-label="评审验收">
+        <AimeinReviewSummary summary={run} detail={detail} />
+        <h3 style={{ fontSize: 14, margin: '0 0 10px' }}>评审验收 <span style={muted}>· {run.reviews.filter(r => r.status === 'passed').length} / {run.reviewerCount ?? 3} 通过</span></h3>
         <div style={grid}>{run.reviews.map((review, i) => {
           const full = detail?.reviews?.find(r => r.id === review.id);
           const raw = current?.stageDetails?.[`aimein-${review.id}`]?.rawOutput || progress[`${current?.seq}:aimein-${review.id}`];
@@ -76,7 +78,7 @@ export const AimeinRecordView: React.FC<{
         })}</div>
       </section>
       {(run.message || run.issues.length > 0 || current?.error) && <section aria-label="阶段结论" style={card}>
-        <strong>{run.complete ? '三方整体目标验收通过' : run.accepted ? '本阶段通过，整体目标尚未完成' : '当前处理依据'}</strong>
+        <strong>{run.complete ? '整体目标评审通过' : run.accepted ? '本阶段通过，整体目标尚未完成' : '当前处理依据'}</strong>
         <p style={{ fontSize: 13, lineHeight: 1.7 }}>{current?.error || run.message}</p>
         {run.issues.map((issue, i) => <p key={i} style={muted}><b>{issue.model} · {issue.id}</b><br />{issue.reason}</p>)}
         {run.nextFocus && <p style={{ ...muted, whiteSpace: 'pre-wrap' }}>后续建议：{run.nextFocus}</p>}

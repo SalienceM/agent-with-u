@@ -136,10 +136,10 @@ export const AimeinReviewLibrary: React.FC<{
       <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, margin: '12px 0' }}>
         <button style={aimeinButton} onClick={() => { setTask(query); setRetry(n => n + 1); }}>查看匹配推荐</button>
         <button style={aimeinButton} disabled={controlsDisabled || !ranked.some(r => r.recommended)} onClick={() => setChosen(ranked.filter(r => r.recommended).map(r => r.profileId))}>勾选推荐组合</button>
-        <button style={aimeinButton} disabled={controlsDisabled || chosen.length !== 3 || duplicateModels} onClick={() => void perform({ action: 'select', profileIds: chosen })}>选用这三位 ({chosen.length}/3)</button>
+        <button style={aimeinButton} disabled={controlsDisabled || (chosen.length < 1 || chosen.length > 3) || duplicateModels} onClick={() => void perform({ action: 'select', profileIds: chosen })}>选用 {chosen.length} 位评委</button>
       </div>
-      <p style={small}>只依据领域匹配和同版本用户校准排序。{ranked.filter(r => r.recommended).length < 3 ? '当前不足三个可推荐的不同模型，可补充档案或主动选择。' : '不同模型相互补充；选用后在下一次尝试冻结。'}</p>
-      {duplicateModels && <p role="status" style={small}>三个席位需要不同模型；同一模型的不同档案不能重复占位。</p>}
+      <p style={small}>只依据领域匹配和同版本用户校准排序。{ranked.filter(r => r.recommended).length < 3 ? '可以选用 1–3 位不同模型；数量由你决定。' : '不同模型相互补充；选用后在下一次尝试冻结。'}</p>
+      {duplicateModels && <p role="status" style={small}>各席位需要不同模型；同一模型的不同档案不能重复占位。</p>}
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 230px), 1fr))', gap: 12 }}>
         {ranked.map(item => {
           const profile = memory?.profiles.find(p => p.id === item.profileId); if (!profile) return null;
@@ -168,7 +168,7 @@ export const AimeinReviewLibrary: React.FC<{
     <form ref={calibrationForm} aria-label="评委校准" style={block} onSubmit={async e => { e.preventDefault(); const key = noteKey; if (await perform({ action: 'calibrate', seq: current?.seq, reviewId, kind, note })) setNotes(prev => ({ ...prev, [key]: '' })); }}>
       <h4 style={{ marginTop: 0 }}>从这次评审中学到什么</h4>
       <p style={small}>针对当前查看的尝试 #{current?.seq || '—'}，记录判断与实际用户需求的差异。偏好不增加能力信用，同一评审重复保存会更新原校准。</p>
-      {!eligibleReviews.length ? <p style={small}>先选用档案完成一次三方评审，才能在这里校准其模型与档案组合。</p> : <>
+      {!eligibleReviews.length ? <p style={small}>先选用档案完成一次独立评审，才能在这里校准其模型与档案组合。</p> : <>
         <label style={small}>被校准的评委<select style={aimeinInput} value={reviewId} onChange={e => setReviewId(e.target.value)}><option value="">请选择</option>{eligibleReviews.map(r => <option key={r.id} value={r.id}>{r.profile?.name} · {r.model}</option>)}</select></label>
         <label style={{ ...small, display: 'block', marginTop: 10 }}>观察类型<select style={aimeinInput} value={kind} onChange={e => setKind(e.target.value)}>{Object.entries(kinds).map(([key, label]) => <option key={key} value={key}>{label}</option>)}</select></label>
         <label style={{ ...small, display: 'block', marginTop: 10 }}>具体依据 / 下次应如何理解<textarea required maxLength={1600} rows={3} style={aimeinInput} value={note} onChange={e => setNotes({ ...notes, [noteKey]: e.target.value })} placeholder="指出具体判断、实际结果和需要调整的关注点" /></label>

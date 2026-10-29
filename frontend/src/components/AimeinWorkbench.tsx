@@ -1,9 +1,12 @@
 import React, { useEffect, useRef, useState } from 'react';
 import type { LoopRecord, LoopStateT } from '../types/loopWorkbench';
 import type { AimeinAnchor, AimeinLibraryResult } from '../types/aimein';
+import { expectedReviewers } from '../types/aimein';
 import { AimeinRecordView } from './AimeinRecordView';
 import { AimeinWorld } from './AimeinWorld';
 import { AimeinSceneDock } from './AimeinSceneDock';
+import { AimeinRuntimePanel } from './AimeinRuntimePanel';
+import { aimeinCurrent, aimeinRecords, aimeinRuntime } from '../utils/aimeinRuntime';
 import { AimeinPlayPanel, useAimeinPlay } from './AimeinPlayPanel';
 import type { AimeinPlayState, AimeinTool } from '../utils/aimeinPlay';
 import { goalObservation, planWaitingMessage } from '../utils/aimeinWorld';
@@ -25,14 +28,20 @@ export const AimeinWorkbench: React.FC<{
   preparation?: React.ReactNode; preparationStep?: number | null; preparationRevision?: number; onPreparationStep?: (step: number) => void;
   externalPanel?: boolean; onCloseExternal?: () => void; extra?: React.ReactNode;
   launch?: AimeinPlayState['launch'];
+  connected: boolean; controls?: (compact: boolean) => React.ReactNode; notices?: React.ReactNode;
 }> = props => {
   const { state, selected, onSelect, onSettings, onFeedback } = props;
-  const records = state.loops.filter(r => r.aimeinSummary?.sprintId);
-  const current = selected?.aimeinSummary?.sprintId ? selected : records.at(-1);
+  const root = useRef<HTMLDivElement>(null);
+  const [compact, setCompact] = useState(false);
+  useEffect(() => { const observer = new ResizeObserver(([entry]) => setCompact(entry.contentRect.width < 600)); if (root.current) observer.observe(root.current); return () => observer.disconnect(); }, []);
+  const records = aimeinRecords(state);
+  const current = aimeinCurrent(state, selected);
+  const runtime = aimeinRuntime(state, current, props.progress, props.connected);
   const summary = current?.aimeinSummary;
+  const reviewerCount = summary ? expectedReviewers(summary) : state.policy?.aimeinReviewers?.length || 3;
   const detail = current?.aimeinRun;
   const planMessage = planWaitingMessage(current, state.running && current?.seq === records.at(-1)?.seq);
-  const [tab, setTab] = useState<'world' | 'records' | 'reviewers'>('world');
+  const [tab, setTab] = useState<'live' | 'world' | 'records' | 'reviewers'>(() => records.length || state.running ? 'live' : 'world');
   const [libraryVisited, setLibraryVisited] = useState(false);
   const [calibration, setCalibration] = useState<{ id: string; serial: number }>();
   const [panelOpen, setPanelOpen] = useState(true);
@@ -44,7 +53,11 @@ export const AimeinWorkbench: React.FC<{
   const [object, setObject] = useState<AimeinAnchor>({ kind: 'goal', seq: 0 });
   const historical = !!current && current !== records.at(-1);
   const play = useAimeinPlay(state, current, props.busy || props.readOnly || state.running || historical, props.execKey, onFeedback);
-  const chooseTool = (tool: AimeinTool) => { play.setTool(tool); openTab('world'); panelContent.current?.closest('[data-testid="aimein-scene-panel"]')?.scrollTo(0, 0); };
+  const chooseTool = (tool: AimeinTool) => {
+    play.setTool(tool); openTab('world');
+    // 等新工具内容挂载后定位，避免浏览器滚动锚定把整体意见留在视口上方。
+    requestAnimationFrame(() => panelContent.current?.closest('[data-testid="aimein-scene-panel"]')?.scrollTo(0, 0));
+  };
   const chooseTarget = (id: string) => { play.pick(id); openTab('world'); };
   const calibrate = (id: string) => { setCalibration(previous => ({ id, serial: (previous?.serial || 0) + 1 })); openLibrary(); };
   const observe = (value: AimeinAnchor) => {
@@ -58,6 +71,11 @@ export const AimeinWorkbench: React.FC<{
     });
   };
   useEffect(() => { if (props.preparationStep != null) setPanelOpen(true); }, [props.preparationStep, props.preparationRevision]);
+  const wasRunning = useRef(state.running);
+  useEffect(() => {
+    if (state.running && !wasRunning.current && !historical) { setTab('live'); setPanelOpen(true); }
+    wasRunning.current = state.running;
+  }, [state.running, historical]);
   useEffect(() => { panelContent.current?.closest('[data-testid="aimein-scene-panel"]')?.scrollTo(0, 0); }, [tab]);
   const [drafts, setDrafts] = useState<Record<string, string>>({});
   const [feedbackMessage, setFeedbackMessage] = useState<Record<string, string>>({});
@@ -68,26 +86,32 @@ export const AimeinWorkbench: React.FC<{
   const observation = goalObservation(current);
   const selectedOpinions = state.addons.filter(a => a.feedback?.seq === anchor.seq && a.feedback.kind === anchor.kind && (a.feedback.reviewId || '') === (anchor.reviewId || ''));
   const opinions = state.addons.filter(a => a.feedback?.kind);
-  return <div data-testid="aimein-workbench" style={{ display: 'flex', flexDirection: 'column', flex: 1, gap: 8, minWidth: 0, minHeight: 0 }}>
+  const runtimePanel = <AimeinRuntimePanel compact={compact} state={state} current={current} connected={props.connected} progress={props.progress} onSelect={onSelect} detailError={props.detailError} onRetry={props.onRetry} />;
+  const livePanel = !props.preparation && (tab === 'live' || tab === 'records' && !!current && !summary);
+  return <div ref={root} data-testid="aimein-workbench" style={{ display: 'flex', flexDirection: 'column', flex: 1, gap: compact ? 4 : 8, minWidth: 0, minHeight: 0, background: '#102625', borderRadius: 14,
+    '--theme-bg-secondary': '#142d2c', '--theme-bg-tertiary': '#1d3730', '--theme-border': '#35574e', '--theme-text-muted': '#9bb7aa', '--theme-accent-bg': '#29483c' } as React.CSSProperties}>
+    {props.controls?.(compact)}
+    {props.notices}
     <header style={{ display: props.externalPanel ? 'none' : 'flex', gap: 5, alignItems: 'center', flexShrink: 0, overflowX: 'auto', whiteSpace: 'nowrap' }}>
       {!props.preparation && <nav aria-label="AIMEIN 视图" style={{ display: 'flex', gap: 5 }}>
-        {([['world', '建设场景'], ['records', '阶段记录'], ['reviewers', '评委工坊']] as const).map(([key, label]) => <button key={key} style={{ ...button, background: tab === key ? 'var(--theme-accent-bg)' : 'var(--theme-bg-secondary)', fontWeight: tab === key ? 700 : 400 }} aria-pressed={tab === key} onClick={() => key === 'reviewers' ? openLibrary() : openTab(key)}>{label}</button>)}
+        {([['live', '运行现场'], ['world', '建设场景'], ['records', '阶段记录'], ['reviewers', '评委工坊']] as const).map(([key, label]) => <button key={key} aria-label={label} style={{ ...button, ...(compact ? { padding: '5px 7px', fontSize: 11 } : {}), background: tab === key ? 'var(--theme-accent-bg)' : 'var(--theme-bg-secondary)', fontWeight: tab === key ? 700 : 400 }} aria-pressed={tab === key} onClick={() => key === 'reviewers' ? openLibrary() : openTab(key)}>{key === 'live' && runtime.live ? '● ' : ''}{compact ? ({ live: '运行', world: '观察', records: '阶段', reviewers: '评委' })[key] : label}</button>)}
       </nav>}
-      <button ref={panelToggle} type="button" style={{ ...button, marginLeft: 'auto' }} aria-expanded={panelOpen && !props.externalPanel} onClick={() => { props.onCloseExternal?.(); setPanelOpen(!panelOpen || !!props.externalPanel); }}>{panelOpen && !props.externalPanel ? '收起面板' : props.preparation ? '继续建设准备' : '展开观察'}</button>
+      <button ref={panelToggle} type="button" style={{ ...button, marginLeft: 'auto', ...(compact ? { padding: '5px 7px', fontSize: 11 } : {}) }} aria-expanded={panelOpen && !props.externalPanel} onClick={() => { props.onCloseExternal?.(); setPanelOpen(!panelOpen || !!props.externalPanel); }}>{panelOpen && !props.externalPanel ? '收起面板' : props.preparation ? '继续建设准备' : '展开观察'}</button>
     </header>
-    <AimeinSceneDock open={panelOpen && !props.externalPanel} scene={<AimeinWorld contained preparing={!!props.preparation} current={current} selected={anchor} running={state.running} latest={current?.seq === records.at(-1)?.seq} built={records.some(r => r.seq <= (current?.seq || 0) && r.orchestration.some(step => step.status === 'done'))} onSelect={observe}
-      play={!props.preparation ? { tool: play.tool, targetId: play.targetId, assembled: play.tool === 'assemble' ? play.closure.ids : [], roots: play.draft.ids, onTool: chooseTool, onTarget: chooseTarget,
+    <AimeinSceneDock live={livePanel} balanced={livePanel} open={panelOpen && !props.externalPanel} scene={<AimeinWorld contained observing={tab === 'live'} reviewerCount={reviewerCount} preparing={!!props.preparation} current={current} selected={anchor} running={runtime.live} latest={current?.seq === records.at(-1)?.seq} goal={runtime.goal} activityLabel={runtime.title} built={records.some(r => r.seq <= (current?.seq || 0) && r.orchestration.some(step => step.status === 'done'))} onSelect={observe}
+      play={!props.preparation ? { tool: play.tool, targetId: play.targetId, assembled: play.tool === 'assemble' ? play.closure.ids : [], roots: play.draft.ids, onTool: chooseTool, onTarget: chooseTarget, onInspectTarget: id => { play.inspect(id); openTab('world'); },
         footprints: records.slice(-12).map(r => ({ seq: r.seq, title: r.aimeinSummary?.title || '等待规划', accepted: !!r.aimeinSummary?.accepted, saved: r.detailLoaded === false ? null : r.orchestration.filter(s => s.status === 'done' && s.output).length })),
         onHistory: seq => { onSelect(seq); play.setTool('inspect'); openTab('world'); },
         launch: historical ? { label: '返回当前', disabled: false, reason: '历史只供观察', onClick: () => onSelect(records.at(-1)!.seq) } : props.launch } : undefined} />}>
-    <div ref={panelContent} onKeyDown={event => { if (event.key === 'Escape') { event.stopPropagation(); setPanelOpen(false); panelToggle.current?.focus(); } }}>
+    <div ref={panelContent} style={livePanel ? { display: 'flex', flexDirection: 'column', flex: 1, minHeight: 0 } : undefined} onKeyDown={event => { if (event.key === 'Escape') { event.stopPropagation(); setPanelOpen(false); panelToggle.current?.focus(); } }}>
     {props.preparation || <>
+    {tab === 'live' && runtimePanel}
     {tab === 'world' && <div>
       <AimeinPlayPanel play={play} current={current} progress={props.progress} historical={historical} running={state.running}
         onReview={id => observe({ kind: 'review', reviewId: id, seq: current?.seq || 0 })} onCalibrate={calibrate} />
       <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
         {records.length > 0 && <label style={muted}>观察时间 <select aria-label="查看 AIMEIN 阶段" style={{ ...button, maxWidth: '100%' }} value={current!.seq} onChange={e => onSelect(Number(e.target.value))}>
-          {records.slice().reverse().map(r => <option key={r.seq} value={r.seq}>Sprint {r.aimeinSummary!.sprintNumber} · 尝试 {r.aimeinSummary!.attempt} · 第 {r.round} 轮</option>)}
+          {records.slice().reverse().map(r => <option key={r.seq} value={r.seq}>{r.aimeinSummary ? `Sprint ${r.aimeinSummary.sprintNumber} · 尝试 ${r.aimeinSummary.attempt}` : `准备 #${r.seq}`} · 第 {r.round} 轮</option>)}
         </select></label>}
         {current && current !== records.at(-1) && <button style={button} onClick={() => onSelect(records.at(-1)!.seq)}>返回最新阶段</button>}
         <span style={{ ...muted, marginLeft: 'auto' }}>{state.running ? '◉ 正在建设' : state.resumable ? '◌ 等待继续' : '◇ 工坊待命'}</span>
@@ -101,8 +125,8 @@ export const AimeinWorkbench: React.FC<{
           <b style={{ fontSize: 28 }}>{summary?.maturityTarget == null ? '—' : `${summary.maturityTarget}%`}</b> <span style={muted}>本阶段目标成熟度</span>
           <p style={muted}>{summary?.maturityMeaning || '动态拆解目标，让每个阶段都有具体可核实的结果。'}</p><div style={muted}>只针对当前 Sprint 范围，不代表整体完成率。</div>
         </section>
-        <section aria-label="三方验收" style={panel}>
-          <div style={muted}>评委席 · 独立观察同版成果</div><h3 style={{ margin: '6px 0 14px', fontSize: 15 }}>{summary?.reviews.filter(r => r.status === 'passed').length || 0} / 3 通过</h3>
+        <section aria-label="评审验收" style={panel}>
+          <div style={muted}>评委席 · 独立观察同版成果</div><h3 style={{ margin: '6px 0 14px', fontSize: 15 }}>{summary?.reviews.filter(r => r.status === 'passed').length || 0} / {reviewerCount || '待确认'} 通过</h3>
           {(summary?.reviews || []).map(r => <button key={r.id} style={{ ...button, display: 'block', width: '100%', textAlign: 'left', marginTop: 6 }} onClick={() => observe({ kind: 'review', reviewId: r.id, seq: current!.seq })}>{r.profileName || r.model} <span style={muted}>· {reviewStatus[r.status] || r.status}</span></button>)}
           <p style={muted}>{summary?.message || '可为每个模型建立口味与聚焦档案，逐步积累可校准的经验。'}</p>
         </section>
@@ -114,7 +138,7 @@ export const AimeinWorkbench: React.FC<{
           <h3 style={{ fontSize: 17, margin: '6px 0 12px' }}>{labels[object.kind]}{review ? ` · ${review.profileName || review.model}` : ''}</h3>
           {object.kind === 'goal' && <>
             <p style={{ fontSize: 14, lineHeight: 1.8 }}>{detail?.goal || (current && current !== records.at(-1) ? '旧记录未保存整体目标原文，请结合下方子目标和当时依据查看。' : state.goal) || '先在目标准备中写下要建设的产品。'}</p>
-            <div style={{ display: 'flex', alignItems: 'baseline', gap: 8 }}><strong style={{ fontSize: 28 }}>{observation.known ? `${observation.verified} / ${observation.total}` : '—'}</strong><span style={muted}>整体子目标获三方共同核实</span></div>
+            <div style={{ display: 'flex', alignItems: 'baseline', gap: 8 }}><strong style={{ fontSize: 28 }}>{observation.known ? `${observation.verified} / ${observation.total}` : '—'}</strong><span style={muted}>整体子目标已核实</span></div>
             <p style={muted}>目标瓶表示所查看版本的评审观察，证据未齐时保持未知。工具数量和阶段成熟度不会填满它。</p>
             {observation.fraction === 1 && !summary?.complete && <p style={muted}>子目标已覆盖，整体收口条件尚未满足。</p>}
             {!props.detailError && planMessage && <p role="status" style={muted}>{planMessage}</p>}
@@ -132,7 +156,7 @@ export const AimeinWorkbench: React.FC<{
           </>}
           {object.kind === 'review' && <>
             <p style={{ fontSize: 14 }}>{review ? reviewStatus[review.status] || review.status : '尚未开始评审'}{review?.maturity != null ? ` · 阶段成熟度 ${review.maturity}%` : ''}</p>
-            <p style={muted}>{review?.error || review?.summary || '三个不同模型，各自独立查看同一版成果。'}</p>
+            <p style={muted}>{review?.error || review?.summary || '启用的评委分别独立查看同一版成果。'}</p>
             {fullReview?.profile && <p style={muted}><b>口味</b> {fullReview.profile.flavor}<br /><b>聚焦</b> {fullReview.profile.focus}<br />冻结版本 v{fullReview.profile.revision?.slice(0, 8)}</p>}
             {fullReview?.criteria?.map(c => <details key={c.id} style={muted}><summary style={{ cursor: 'pointer' }}>{c.id} · {c.status === 'verified' ? '已核实' : '待处理'}</summary><p>{c.reason}<br />{c.evidence.join(' · ')}</p></details>)}
             <button style={{ ...button, marginTop: 10 }} onClick={() => object.reviewId ? calibrate(object.reviewId) : openLibrary()}>查看档案与校准</button>
@@ -140,7 +164,7 @@ export const AimeinWorkbench: React.FC<{
           {props.detailError && <p role="alert" style={muted}>{props.detailError} <button style={button} onClick={props.onRetry}>重新读取详情</button></p>}
           <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginTop: 16 }}>
             <button style={button} onClick={() => openTab('records')}>查看完整阶段记录</button>
-            <button style={button} onClick={onSettings}>{summary ? '评审与执行设置' : '配置三模型评审'}</button>
+            <button style={button} onClick={onSettings}>{summary ? '评审与执行设置' : '配置评审组'}</button>
           </div>
         </section>
         <section style={panel} aria-label="对象意见">
@@ -182,7 +206,7 @@ export const AimeinWorkbench: React.FC<{
       </section> : null}
       {props.extra}
     </div>}
-    {tab === 'records' && <AimeinRecordView {...props} />}
+    {tab === 'records' && (current && !summary ? runtimePanel : <AimeinRecordView {...props} />)}
     {libraryVisited && <div hidden={tab !== 'reviewers'}><AimeinReviewLibrary active={tab === 'reviewers' && panelOpen && !props.externalPanel} state={state} current={current} backends={props.backends} execKey={props.execKey} disabled={props.busy || props.readOnly || state.running}
       load={props.loadLibrary} update={props.updateLibrary} calibration={calibration} /></div>}
     </>}

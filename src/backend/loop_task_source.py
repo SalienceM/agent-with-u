@@ -227,6 +227,10 @@ def validate_source(raw: Any) -> dict:
         return value
     if value.get('status') == 'unbound':
         return value
+    # 尚未建立绑定的准备/失败也是真实状态；不能把它重写成损坏的来源记录。
+    if (not value.get('binding') and not value.get('snapshot') and not value.get('candidate')
+            and value.get('status') in ('preparing', 'unavailable')):
+        return value
     binding = value.get('binding')
     valid = (isinstance(binding, dict) and all(isinstance(binding.get(k), str) and binding[k]
              for k in ('executor', 'sessionId', 'workspace', 'backendId', 'environmentDigest', 'cli', 'change'))
@@ -262,13 +266,17 @@ def source_summary(source: dict) -> dict:
             'diff': source.get('diff', {})}
 
 
-def environment(session: Any, config: Any, executor: str) -> tuple[dict, dict[str, str]]:
+def environment(session: Any, config: Any, executor: str, *, allow_uninitialized: bool = False) -> tuple[dict, dict[str, str]]:
     if getattr(session, 'codex_connection_mode', '') == 'ssh':
         raise SourceError('remote_filesystem', '首版不支持 SSH 文件系统来源。')
     root = Path(session.working_dir).resolve()
-    if not (root / 'openspec').is_dir():
-        raise SourceError('project_required', '当前工作区没有 openspec；不会借用父项目或自动初始化。')
+    if not root.is_dir():
+        raise SourceError('workspace_missing', '当前工作区不存在，请先核对 Session 目录。')
     confined(root, 'openspec')
+    if not (root / 'openspec').is_dir() and not allow_uninitialized:
+        raise SourceError('project_required', '当前工作区尚未准备 OpenSpec；明确要求 OpenSpec 后点击推进，会自动准备当前项目并衔接方案。')
+    if (root / 'openspec').exists() and not (root / 'openspec').is_dir():
+        raise SourceError('project_invalid', '工作区 openspec 路径不是目录，请先处理路径冲突。')
     for name in ('config.yaml', 'config.yml'):
         path = root / 'openspec' / name
         if path.exists():

@@ -1,8 +1,10 @@
 import type { AimeinRun, AimeinSummary } from '../types/aimein';
+import { expectedReviewers } from '../types/aimein';
 
 interface GoalRecord {
   completed: boolean;
   aimeinRun?: {
+    reviewerCount?: number;
     plan?: { targets?: Array<{ id: string }> };
     reviews?: Array<{ status: string; targets?: Array<{ id: string; status: string; fingerprints?: Record<string, string> }> }>;
   };
@@ -45,31 +47,57 @@ export function worldProjection(record?: { seq: number; completed: boolean; aime
   };
 }
 
+export const TASK_PAGE_SIZE = 12;
+
+/** 每页保留可点击的地块间距。聚合只改变水平间距，装配不再另建一套坐标。 */
 export function targetPosition(index: number, targets: WorldTarget[], layout: WorldLayout): WorldPoint {
-  const target = targets[index];
-  const columns = Math.min(5, Math.max(2, Math.ceil(Math.sqrt(targets.length))));
-  if (layout === 'cluster' && target.inSprint) {
-    const rank = targets.slice(0, index).filter(t => t.inSprint).length;
-    return [-3.6 + rank % 3 * .68, .8 + Math.floor(rank / 9) * .62, -.6 + Math.floor(rank % 9 / 3) * .68];
-  }
-  return [-5.3 + (index % columns) * 1.03, 1.65, -2.3 + Math.floor(index / columns) * .72];
+  const start = Math.floor(index / TASK_PAGE_SIZE) * TASK_PAGE_SIZE;
+  const count = Math.min(TASK_PAGE_SIZE, targets.length - start);
+  const columns = Math.max(1, Math.min(4, count));
+  const rows = Math.ceil(count / columns);
+  const local = index - start;
+  const dx = layout === 'split' ? 1.28 : 1.15;
+  const dz = layout === 'split' ? 1.42 : 1.3;
+  return [-2.9 + (local % columns - (columns - 1) / 2) * dx, .24,
+    -.45 + (Math.floor(local / columns) - (rows - 1) / 2) * dz];
 }
 
-/** 仅对所查看版本的完整三方报告投影；不从成熟度、轮次或文件数量推断。 */
+export function taskPage(targets: WorldTarget[], requested = 0) {
+  const pages = Math.max(1, Math.ceil(targets.length / TASK_PAGE_SIZE));
+  const page = Math.max(0, Math.min(pages - 1, Math.floor(requested) || 0));
+  const start = page * TASK_PAGE_SIZE;
+  return { page, pages, start, targets: targets.slice(start, start + TASK_PAGE_SIZE) };
+}
+
+/** 仅投影直接关联，不把跨页、缺失或循环依赖悄悄当成完成。 */
+export function targetRelations(targets: WorldTarget[], focused: string) {
+  const target = targets.find(t => t.id === focused);
+  if (!target) return [];
+  const edges = new Map<string, { from: string; to: string; missing: boolean }>();
+  const ids = new Set(targets.map(t => t.id));
+  targets.forEach(t => t.dependsOn.forEach(id => {
+    if (t.id === focused || id === focused) edges.set(JSON.stringify([id, t.id]), { from: id, to: t.id, missing: !ids.has(id) });
+  }));
+  return [...edges.values()];
+}
+
+/** 仅对所查看版本的完整评审组报告投影；不从成熟度、轮次或文件数量推断。 */
 export function goalObservation(record?: GoalRecord) {
   const targets = record?.aimeinRun?.plan?.targets || [];
   const reviews = record?.aimeinRun?.reviews || [];
-  const known = !!record?.completed && !!targets.length && reviews.length === 3
+  const expected = expectedReviewers(record?.aimeinRun);
+  const known = !!record?.completed && !!targets.length && expected > 0 && reviews.length === expected
     && reviews.every(r => ['passed', 'changes_requested'].includes(r.status) && targets.every(t => r.targets?.some(v => v.id === t.id
       && ['verified', 'gap', 'unknown'].includes(v.status) && (v.status !== 'verified' || Object.keys(v.fingerprints || {}).length > 0))));
   const verified = known ? targets.filter(t => reviews.every(r => r.targets?.some(v => v.id === t.id && v.status === 'verified'))).length : 0;
   return { known, verified, total: targets.length, fraction: known ? verified / targets.length : 0 };
 }
 
-export type FlowRouteId = 'build' | 'infra' | 'store' | 'repair' | `review${number}` | `verify${number}`;
+export type FlowRouteId = 'prepare' | 'plan' | 'build' | 'infra' | 'store' | 'repair' | `review${number}` | `verify${number}`;
 interface FlowRecord {
   seq: number; completed: boolean; aimeinRun?: AimeinRun; aimeinSummary?: AimeinSummary;
   orchestration: Array<{ index: number; status: string; output: string }>;
+  error?: string; callDiagnostics?: Array<{ stage: string; status: string; phase: string }>;
 }
 
 /** 运行颗粒表达活动；只有已保存输出才形成堆积，绝不猜测步骤属于哪个目标。 */
@@ -82,10 +110,15 @@ export function flowProjection(record: FlowRecord | undefined, running: boolean,
   const reviews = (summary?.reviews || []).slice(0, 3).map(r => ({ id: r.id, status: r.status }));
   const lanes = new Set((record?.aimeinRun?.plan?.sprint?.criteria || summary?.criteria || []).map(c => c.lane));
   const workRoutes: FlowRouteId[] = [...(lanes.has('flow') ? ['build' as const] : []), ...(lanes.has('infra') ? ['infra' as const] : [])];
-  const live = ready && latest && running && !record?.completed;
-  const activity: FlowRouteId[] = !live ? [] : status === 'executing' && steps.some(s => s.status === 'running')
+  const live = !!record && latest && running && !record.completed && !record.error;
+  const calls = record?.callDiagnostics || [];
+  const working = calls.filter(call => call.status === 'running' && ['thinking', 'text', 'tools', 'running', 'local_prepare', 'environment_check'].includes(call.phase));
+  const preparation: FlowRouteId[] = working.flatMap(call => call.stage === 'prepare' ? ['prepare' as const] : ['aimein-plan', 'aimein-prepare'].includes(call.stage) ? ['plan' as const] : []);
+  // 有诊断时尊重实际等待/重试；兼容旧记录的步骤状态，但不凭 ready 伪造活动。
+  const observable = !calls.length || working.length > 0;
+  const activity: FlowRouteId[] = !live || !observable ? [] : preparation.length ? [...new Set(preparation)] : !ready ? [] : status === 'executing' && steps.some(s => s.status === 'running')
     ? [...workRoutes, 'store'] : status === 'reviewing'
-      ? reviews.flatMap((r, i) => r.status === 'running' ? [`review${i}` as FlowRouteId] : [])
+      ? reviews.flatMap((r, i) => r.status === 'running' && (!calls.length || working.some(call => call.stage === `aimein-${r.id}`)) ? [`review${i}` as FlowRouteId] : [])
       : ['planning', 'preparing'].includes(status) && lanes.size ? ['build'] : [];
   const coverage = goalObservation(record);
   return { identity: `${record?.seq || 0}:${summary?.sprintId || ''}:${summary?.attempt || 0}`, seq: record?.seq || 0,

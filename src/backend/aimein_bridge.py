@@ -9,7 +9,7 @@ from typing import Any
 
 from .aimein import (AimeinError, PLAN_PROMPT, REVIEW_PROMPT, evidence_current,
                      normalize_plan, normalize_review, progress_observation, resolve_reviewers,
-                     reviewer_revision, workspace_fingerprint)
+                     reviewer_revision, workspace_fingerprint, review_count, review_roster_complete)
 from .loop_decisions import DecisionFacts, decide_next, digest
 from .loop_execution_environment import EnvironmentPause, normalize_environment
 from .loop_openspec import requested as openspec_requested, task_progress, manual_policy
@@ -23,8 +23,9 @@ def aimein_enabled(state: Any) -> bool:
 
 def acceptance_complete(run: dict) -> bool:
     reviews = run.get('reviews', [])
-    return bool(run.get('complete') and run.get('accepted') and len(reviews) == 3
-                and len({r.get('model', '').casefold() for r in reviews}) == 3
+    return bool(run.get('complete') and run.get('accepted') and review_roster_complete(run)
+                and all(r.get('model') for r in reviews)
+                and len({r.get('model', '').casefold() for r in reviews}) == review_count(run)
                 and all(r.get('status') == 'passed' and r.get('passed') is True
                         and r.get('goalComplete') is True and r.get('targets')
                         and all(t.get('status') == 'verified' for t in r['targets']) for r in reviews))
@@ -44,7 +45,7 @@ def review_checkpoint(state: Any, record: Any) -> bool:
     return bool(record.round == state.round and record.kind != 'manual' and not record.completed
                 and record.sub_stage == SUB_ANALYSIS and record.terminal_kind in ('', 'paused', 'failed', 'unknown')
                 and run.get('status') != 'stale' and run.get('plan') and run.get('artifact')
-                and len(run.get('reviews', [])) == 3
+                and review_roster_complete(run)
                 and run.get('scope') == scope_revision(state, run.get('scopeAddonIds'))
                 and run.get('policyRevision') == digest(state.policy.to_dict())
                 and record.orchestration and all(s.status == 'done' for s in record.orchestration)
@@ -59,7 +60,7 @@ def sprint_context(run: dict) -> str:
             + '\n只实施本 Sprint 的条件，完整任务图仍保留整体目标；FlowBuild 指产品功能流程。'
               '补齐必要 Infra 与验证，维护以前已验证能力；不得提前执行后续阶段或降低成熟度条件。'
               '这个 Sprint 已经是从整体目标选出的增量，请围绕全部当前验收条件编排连贯实施与必要验证，'
-              '不要再次任意缩成一个原子子目标后就交给三方评审。可以编排依赖就绪后才能启动的后续顺序步骤；'
+              '不要再次任意缩成一个原子子目标后就交给评审组。可以编排依赖就绪后才能启动的后续顺序步骤；'
               '真实阻塞、授权和独立测试准备门槛仍优先，不能为了本阶段通过而绕过。'
             + '\n【上次修补依据】\n' + json.dumps(run.get('repairBasis', []), ensure_ascii=False) + '\n')
 
@@ -73,6 +74,8 @@ class AimeinBridge(AimeinLearningBridge):
     def _aimein_boundary(self, session: Any, state: Any, record: Any) -> bool:
         run = record.aimein_run
         try:
+            if not review_roster_complete(run):
+                raise AimeinError('本次冻结的评审组不完整')
             resolve_reviewers(run.get('reviews'), self._backend_configs)
             reviewer_current = reviewer_revision(run['reviews'], self._backend_configs) == run.get('reviewerRevision')
         except AimeinError:
@@ -111,7 +114,7 @@ class AimeinBridge(AimeinLearningBridge):
             if not state.goal.strip():
                 raise AimeinError('请先填写可验收的整体目标')
         except AimeinError as exc:
-            self._loop_wait(state, record, 'aimein_configuration', str(exc), '打开评审设置，保存三个不同模型后继续。')
+            self._loop_wait(state, record, 'aimein_configuration', str(exc), '打开评审设置，保存 1–3 位有效评委后继续。')
             return
         if not record.aimein_run:
             previous = next((r.aimein_run for r in reversed(state.round_loops())
@@ -120,7 +123,7 @@ class AimeinBridge(AimeinLearningBridge):
             same = previous.get('scope') == scope
             repair = same and not previous.get('accepted')
             record.aimein_run = {
-                'version': 1, 'goal': state.goal, 'scope': scope, 'scopeChanged': bool(previous and not same),
+                'version': 2, 'reviewerCount': len(reviewers), 'goal': state.goal, 'scope': scope, 'scopeChanged': bool(previous and not same),
                 'scopeAddonIds': [a.id for a in state.addons],
                 'nativeRequested': native_requested,
                 'feedbackBasis': [{'id': a.id, 'text': a.text, 'source': {key: a.feedback.get(key)
@@ -328,7 +331,7 @@ class AimeinBridge(AimeinLearningBridge):
         if not await asyncio.to_thread(evidence_current, run['reviews'], session.working_dir):
             run['status'] = 'stale'
             raise AimeinError('评审引用的证据已变化，需要重新验收')
-        run['accepted'] = all(r.get('passed') is True for r in run['reviews'])
+        run['accepted'] = review_roster_complete(run) and all(r.get('passed') is True for r in run['reviews'])
         native = record.openspec_run
         verification = native.get('verify', {})
         if native.get('phase') == 'verify' and (not verification.get('valid') or verification.get('remaining')):
@@ -359,7 +362,7 @@ class AimeinBridge(AimeinLearningBridge):
         run['noProgress'] = run['progressObservation']['noProgress']
         state.progress_guard = {**state.progress_guard, 'noProgressCount': run['noProgress']}
         run['status'] = 'accepted' if run['accepted'] else 'repair'
-        run['message'] = '三位评审均通过当前阶段' if run['accepted'] else '当前阶段需要修补，验收标准保持不变'
+        run['message'] = f'{review_count(run)} 位评委均通过当前阶段' if run['accepted'] else '当前阶段需要修补，验收标准保持不变'
         record.completed = True
         record.sub_stage = SUB_DONE
         record.terminal_kind = 'completed'
@@ -394,7 +397,7 @@ class AimeinBridge(AimeinLearningBridge):
             ready_ids=[run.get('sprintId', 'aimein')] if record.completed else []),
             f'{record.round}:{record.seq}:terminal', [f'aimein:{run.get("sprintId", "")}', f'record:{record.seq}'])
         if decision['action'] == 'continue':
-            decision.update(reasonText='当前阶段通过，动态规划下一阶段。' if run.get('accepted') else '保留当前阶段，按三方缺口修补。')
+            decision.update(reasonText='当前阶段通过，动态规划下一阶段。' if run.get('accepted') else '保留当前阶段，按评审缺口修补。')
         self._loop_keep_decision(state, record, decision)
         if decision['action'] in ('complete', 'stop'):
             self._apply_loop_out(state, decision['reasonText'])

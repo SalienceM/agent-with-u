@@ -5888,7 +5888,7 @@ class BridgeWS(AimeinBridge, AsideInspectionBridge, LoopStartupBridge, LoopOpenS
         task_record = next((r for r in task_state.loops if r.seq == seq), None) if task_state else None
         if task_record and task_record.aimein_run and not sub_stage.startswith('aimein-review'):
             prompt = sprint_context(task_record.aimein_run) + prompt
-        scoped_tasks = bool(task_record and (task_record.aimein_run or task_record.openspec_run or task_record.task_plan or task_record.blocker_review or task_state.unresolved_blockers))
+        scoped_tasks = bool(task_record and (task_record.aimein_run or task_record.openspec_run or task_record.stage_details.get('openspecSetup') or task_record.task_plan or task_record.blocker_review or task_state.unresolved_blockers))
         if backend_id and backend_id != session.backend_id:
             try:
                 backend = self._new_backend_instance(backend_id)
@@ -5905,13 +5905,9 @@ class BridgeWS(AimeinBridge, AsideInspectionBridge, LoopStartupBridge, LoopOpenS
             backend = self._new_backend_instance(session.backend_id)
         mid = new_id()
         sid_for_backend = indep_session_id or session.id
-        # Harness 独立调用的 Skills 与 native home 都属于实际目标，不借用主聊目录。
-        if isinstance(backend, DeepSeekHarnessBackend):
-            skill_session = copy.copy(session)
-            skill_session.id, skill_session.backend_id = sid_for_backend, backend_config_id
-            await self._prepare_session_skills(skill_session)
-        else:
-            await self._prepare_session_skills(session)
+        # 所有覆盖 Backend 的调用都按实际目标准备；Harness 的 native home 还按调用隔离。
+        await self._prepare_runtime_skills(session, backend_config_id,
+            sid_for_backend if isinstance(backend, DeepSeekHarnessBackend) else '')
         from .call_trace import CallTrace, traced_send
         call_trace = (CallTrace(session.id, f"loop:{seq}:{sub_stage}:{mid}")
                       if (getattr(session, "token_usage", None) or {}).get("captureEnabled") and sub_stage != "aside" else None)
@@ -6991,6 +6987,8 @@ class BridgeWS(AimeinBridge, AsideInspectionBridge, LoopStartupBridge, LoopOpenS
                 and guard.get('reason') == decision.get('reasonText')
                 and guard.get('round') == record.round and guard.get('seq') == record.seq):
             decision.update(causeRef=guard['causeRef'], causeRevision=guard.get('causeRevision', 0))
+            if guard.get('sourceRevision') == state.task_source.get('revision', 0):
+                decision['basisRefs'] = [*decision.get('basisRefs', []), f"source:{guard['sourceRevision']}"][:16]
         decision.update(round=record.round, seq=record.seq, revision=state.task_source.get('revision', 0))
         record.decision = decision
         if not record.decision_history or record.decision_history[-1].get('decisionId') != decision['decisionId']:
@@ -7010,6 +7008,7 @@ class BridgeWS(AimeinBridge, AsideInspectionBridge, LoopStartupBridge, LoopOpenS
     def _loop_wait(self, state, record, code: str, reason: str, condition: str = '') -> None:
         condition = condition.strip() or '核对原始阶段详情及当前环境，补充原因或解除条件后显式恢复。'
         state.auto = False
+        state.progress_guard.pop('sourceRevision', None)
         state.progress_guard = {**state.progress_guard, 'pause': True, 'reasonCode': code,
                                 'reason': reason, 'resumeCondition': condition, 'seq': record.seq}
         record.outcome_version, record.terminal_kind = 1, 'paused'
@@ -13907,8 +13906,8 @@ except urllib.error.URLError as e:
         Claude Code discovers project skills from `.claude/skills/`; Qwen Code
         discovers project skills from `.qwen/skills/`.  Loops can route one
         session through multiple local agent backends, so deploy to every native
-        root whose backend type is configured *and* whose corresponding CLI is
-        available in the current runtime.
+        root whose backend type is configured and CLI is available. The active
+        native backend always gets its own root, including Backend-local PATHs.
         """
         from pathlib import Path as _Path
 
@@ -13946,15 +13945,15 @@ except urllib.error.URLError as e:
         for cfg in candidate_configs:
             if cfg.type in (BackendType.CLAUDE_AGENT_SDK, BackendType.CLAUDE_CODE_OFFICIAL):
                 from .base import resolve_claude_cli as _resolve_claude_cli
-                if _cli_available(_resolve_claude_cli(getattr(cfg, "cli_path", None))):
+                if cfg is active_cfg or _cli_available(_resolve_claude_cli(getattr(cfg, "cli_path", None))):
                     has_claude_cli = True
             elif cfg.type == BackendType.QWEN_CODE_CLI:
                 from .qwen_code_cli import resolve_qwen_cli as _resolve_qwen_cli
-                if _cli_available(_resolve_qwen_cli(getattr(cfg, "cli_path", None))):
+                if cfg is active_cfg or _cli_available(_resolve_qwen_cli(getattr(cfg, "cli_path", None))):
                     has_qwen_cli = True
             elif cfg.type == BackendType.CODEX_OFFICIAL:
                 from .codex_office import resolve_codex_cli as _resolve_codex_cli
-                if _cli_available(_resolve_codex_cli(getattr(cfg, "cli_path", None))):
+                if cfg is active_cfg or _cli_available(_resolve_codex_cli(getattr(cfg, "cli_path", None))):
                     has_codex_cli = True
 
         roots: list[tuple[str, _Path]] = []
@@ -14000,6 +13999,20 @@ except urllib.error.URLError as e:
             or info.get("hasCallPy")
             or info.get("type") in {"web-search", "web-fetch", "python-script"}
         )
+
+    async def _prepare_runtime_skills(self, session: Session, backend_id: str, call_id: str = '') -> None:
+        """冻结实际调用身份，同时跟踪源 Session 在部署期间发生的绑定变化。"""
+        import copy
+        for _attempt in range(3):
+            target = copy.copy(session)
+            target.abilities = copy.deepcopy(getattr(session, 'abilities', None))
+            target.backend_id = backend_id
+            if call_id:
+                target.id = call_id
+            await self._prepare_session_skills(target)
+            if target.abilities == getattr(session, 'abilities', None):
+                return
+        raise RuntimeError('Skill 绑定在执行准备期间多次变化，请完成选择后重试')
 
     async def _prepare_session_skills(self, session: Session) -> None:
         """在执行边界冻结绑定；准备期间若改了选择，先补齐最新选择再启动模型。"""

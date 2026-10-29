@@ -10,8 +10,8 @@ const Cube: React.FC<{ x: number; y: number; size?: number; height?: number; col
 </g>;
 
 export const AimeinWorldStatic: React.FC<{
-  current?: LoopRecord; selected: AimeinAnchor; built: boolean; onSelect: (value: AimeinAnchor) => void; contained?: boolean;
-}> = ({ current, selected, built, onSelect, contained }) => {
+  current?: LoopRecord; selected: AimeinAnchor; built: boolean; onSelect: (value: AimeinAnchor) => void; contained?: boolean; reviewerCount?: number;
+}> = ({ current, selected, built, onSelect, contained, reviewerCount = 3 }) => {
   const uid = useId().replace(/:/g, '');
   const viewport = useRef<HTMLDivElement>(null);
   const [sceneWidth, setSceneWidth] = useState(0);
@@ -29,13 +29,13 @@ export const AimeinWorldStatic: React.FC<{
     { kind: 'flow', name: '功能工坊', x: 27, y: 39 },
     { kind: 'infra', name: '基础设施', x: 72, y: 51 },
     { kind: 'artifact', name: '成果架', x: 18, y: 70 },
-    ...[0, 1, 2].map(i => ({ kind: 'review' as const, name: `评委 ${i + 1}`, x: 41 + i * 15, y: 86, reviewId: run?.reviews[i]?.id || `review${i + 1}` })),
+    ...Array.from({ length: reviewerCount }, (_, i) => ({ kind: 'review' as const, name: `评委 ${i + 1}`, x: 41 + i * 15, y: 86, reviewId: run?.reviews[i]?.id || `review${i + 1}` })),
   ];
   const active = (item: typeof items[number]) => selected.kind === item.kind && selected.reviewId === item.reviewId;
   return <div data-testid="aimein-world-static" style={{ border: '1px solid #385b57', borderRadius: 16, overflow: 'hidden', background: '#112927', color: '#dceddc', ...(contained ? { display: 'flex', flexDirection: 'column', flex: 1, minHeight: 0 } : {}) }}>
     <div ref={viewport} style={{ position: 'relative', isolation: 'isolate', ...(contained ? { flex: 1, minHeight: 0 } : {}) }}>
     <div style={contained ? { position: 'absolute', left: '50%', top: '50%', transform: 'translate(-50%, -50%)', width: sceneWidth, aspectRatio: '900 / 530' } : { position: 'relative' }}>
-      <svg viewBox="0 0 900 530" role="img" aria-label="AIMEIN 方块建设场景，目标瓶、功能工坊、基础设施、成果与三位评委" style={{ display: 'block', width: '100%' }}>
+      <svg viewBox="0 0 900 530" role="img" aria-label={`AIMEIN 方块建设场景，目标瓶、功能工坊、基础设施、成果与 ${reviewerCount} 位评委`} style={{ display: 'block', width: '100%' }}>
         <defs>
           <linearGradient id={`${uid}-sky`} x2="0" y2="1"><stop stopColor="#193d38" /><stop offset="1" stopColor="#0f2427" /></linearGradient>
           <linearGradient id={`${uid}-glow`}><stop stopColor="#b2e2a5" stopOpacity="0" /><stop offset="1" stopColor="#b2e2a5" stopOpacity=".13" /></linearGradient>
@@ -81,7 +81,7 @@ export const AimeinWorldStatic: React.FC<{
         <Cube x={218} y={320} size={18} height={36} color="#779d9d" />
         <path d="M190 311l18 9l18-9m-1 17l13 7l15-8" stroke="#d5e5bb" fill="none" strokeWidth="3" />
         {/* 三席保持独立，身体和颜色区分评审状态。 */}
-        {[0, 1, 2].map(i => {
+        {Array.from({ length: reviewerCount }, (_, i) => {
           const x = 365 + i * 104;
           const review = run?.reviews[i];
           const color = review?.status === 'passed' ? '#99c3a0' : review?.status === 'changes_requested' ? '#d5b270' : '#87aaa7';

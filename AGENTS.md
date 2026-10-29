@@ -383,6 +383,25 @@ workflow selection does not hide an OpenSpec source dependency. Legacy/offline a
 late identity/revision results remain distinct; never retry writes or fall back nodes.
 The global "俺寻思" entry remains outside this workbench.
 
+AIMEIN shares that controller but uses its own compact sandbox controls and a default
+runtime field, including records that do not yet have a Sprint. `aimeinRuntime.ts`
+projects actual calls and bounded output; `AimeinRuntimePanel` keeps independent
+channels, history, scroll-follow and saved-output paging without polling. Real
+prepare/plan activity drives the matching flow even before a target graph exists;
+waiting, offline and historical state cannot masquerade as active work. Review
+overview preserves all configured reports, disagreements and unknowns without another
+model or majority acceptance. Assembly defaults to saved Sprint targets plus
+dependencies; custom assembly is an explicit next-planning suggestion. The former
+probe is labeled 成果与验证. See `docs/aimein-execution-mode.md` sections 19–20.
+The default observation field prioritizes saved-step progress, verified goal coverage,
+current activity and exceptions; performance/efficiency stay unmeasured without data.
+Full channels/history expand on demand. Targets occupy single-layer pages of at most
+12 plots, with all 40 targets reachable and only focused direct dependency routes.
+Reviewer configuration supports 1–3 distinct models. Version-2 attempts freeze
+`reviewerCount`; legacy missing counts mean three, invalid counts never accept.
+All frozen reviewers must return valid reports. Scene seats, routes, summaries and
+vessel coverage use that attempt's count, never a later policy's smaller roster.
+
 **Sandbox mode removed (UI + default-off).** The Layer-2 working-dir sandbox
 (`validate_tool_sandbox` / `validate_sandbox_path`) had incomplete, false-positive-prone
 support, so its UI was removed everywhere (chat toolbar 🔒, LoopPanel header 🔒, the
@@ -436,6 +455,19 @@ user disposition changes scheduling; unresolved losses and acceptance remain vis
 `loop_openspec_bridge.py` 在用户显式运行/开启 Auto 时，用当前目标指定或唯一真实候选
 自动采用 OpenSpec change；仅查看不发现/绑定/启动。相同来源范围变化记录差异并自动刷新，
 不再反复要求确认。歧义、来源消失、CLI blocked、越界/执行身份变化仍须处理。
+显式要求 OpenSpec 后点击推进，`loop_openspec_preparation.py` 在来源核对前准备绑定 Skill；
+无本地项目/活动 change 或明确缺少必需工件时，最多一次 workspace-write 准备调用，
+初始化当前项目并衔接明确引用的既有方案，无需重复确认。原方案保留，真实 CLI 复核通过才继续；
+准备无验收信用，失败暂停且不自动重放。只读查看和能力绑定不部署/初始化，已绑定来源消失不重建，
+不自动安装 CLI 或借用父项目/store。实际 Backend 决定原生 Skill 根，Codex 为 `.agents/skills`，
+不受主 Session Backend 或宿主全局 PATH 缺失的误导。准备输出在 stageDetails 按需查看。
+prepare+workspace-write 是授权的工件准备，角色提示不得按阶段名强制只读；普通 prepare+read-only 仍仅规划。
+已明确批准的本机 MXC 切换可使用指定 Backend 的独立 cliPath 启动入口（原 CLI 加
+`-c windows.sandbox=mxc`），不修改全局配置、其他 Backend、原访问策略或托管限制。
+切换需核验实际 app-server 和原 Session；不得自动回退、修改 ACL、结束其他程序，
+也不能把一次兼容命令或未支持版本的预检当作生产任务验收。
+准备返回的 openspecPreparation/taskBlockers 仅作有界受阻说明，不绑定虚构任务或猜测原生原因，
+不能被后续缺目录检查覆盖；已有 env_* 暂停优先。命令 stdout 不可伪造原生环境诊断。
 直接根据真实 tasks 勾选运行 apply，不要求第二份 taskPlan/milestone/delivery 台账。
 自动任务完成后调用只读 verify；critical 和需修复 warning 进入修复→verify，建议不导致无限优化。
 用户明确排除的独立人工项保持未勾选；含实现工作的混合项不整体排除。否定和后续恢复安排

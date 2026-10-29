@@ -54,10 +54,16 @@ export function loopWorkbenchView(state: WorkbenchState, options: { readOnly?: b
     issues.push(issue);
   };
   const source = state.taskSource;
-  const sourceBad = source?.status && !['current', 'unbound'].includes(source.status);
+  const sourceBad = source?.status && !['current', 'unbound', 'preparing'].includes(source.status);
   const sourceKey = `source:${state.sessionId}:${source?.executor || ''}:${source?.change || ''}:${source?.revision ?? 'unknown'}`;
-  if (sourceBad) add({ id: sourceKey, priority: 20, title: '核对任务来源', reason: source.reason || '任务范围或来源需要核对',
-    next: '核对范围差异；确认后不会自动运行。', section: 'source', refs: [sourceKey, `source:${source?.revision ?? 0}`] });
+  if (sourceBad) add({ id: sourceKey, priority: 20,
+    title: source.code === 'project_required' ? 'OpenSpec 项目待准备' : source.code === 'preparation_blocked' ? 'OpenSpec 准备受阻' : source.code === 'preparation_incomplete' ? 'OpenSpec 准备未完成' : '核对任务来源',
+    reason: source.code === 'project_required' ? '当前工作区尚未准备 OpenSpec。' : source.reason || '任务来源需要核对',
+    next: source.status === 'conflict' ? '核对范围差异；确认后不会自动运行。'
+      : source.code === 'project_required' ? '目标已明确要求 OpenSpec 时，点击推进会准备当前项目并衔接方案。'
+      : source.code === 'preparation_blocked' ? '查看准备输出，处理所列原因后在原会话再次推进，无需新建 Session。'
+      : source.code === 'preparation_incomplete' ? '查看本次准备输出，处理缺失条件后再次推进。' : '查看来源问题，处理所列条件后再次推进。',
+    section: 'source', refs: [sourceKey, `source:${source?.revision ?? 0}`] });
   const env = state.executionEnvironment;
   const checks = [...(env?.blockers || []), ...(env?.latest && (env.latest.status === 'blocked' || env.latest.quiesced === false) ? [env.latest] : [])];
   checks.forEach((check, index) => {

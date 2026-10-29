@@ -94,8 +94,9 @@ SAFETY_CONSTRAINTS += BLOCKER_INSTRUCTIONS
 
 def call_scope_constraints(sub_stage: str, access: str, *, native_codex: bool) -> str:
     """Describe this call's restriction without turning it into a global blocker."""
-    planning = sub_stage in ("prepare", "intent")
-    role = "规划/方向检查" if planning else "执行/评审"
+    planning = sub_stage in ("prepare", "intent") and access == "read-only"
+    preparing = sub_stage == "prepare" and access == "workspace-write"
+    role = "规划/方向检查" if planning else "项目准备" if preparing else "执行/评审"
     boundary = (
         f"本次 Codex 调用请求原生沙箱 {access}，实际能力仍以 Backend 和工具返回为准。"
         if native_codex else
@@ -110,6 +111,9 @@ def call_scope_constraints(sub_stage: str, access: str, *, native_codex: bool) -
            "可以将已获用户授权的实现/验证编排为 access=write、mode=sequential；"
            "不得仅因当前规划调用只读就返回全局 pause 或要求用户重新授予整个任务写权限。\n"
            if planning else
+           "本次负责执行已获授权的项目准备，可在当前工作区写入任务指定的元数据与规划工件。"
+           "应在本次完成准备并核对结果，不要仅列出留待下次执行的初始化计划。"
+           "这不授权业务实现、发布、用户数据测试或权限修改。\n" if preparing else
            "只在本步访问范围内操作；先前规划或读取步骤的只读模式不是本次写权限的结论。\n")
         + "一次真实数据文件读取被拒绝，只能说明该次读取不可用，不能据此认定整个项目无法交付。"
         "不能绕过拒绝；应列明受影响的检查，并核对是否存在安全、独立的就绪任务。\n"

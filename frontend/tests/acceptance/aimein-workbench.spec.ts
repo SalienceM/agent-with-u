@@ -4,7 +4,7 @@ const { states, record, environmentStates } = require('../home/fixtures/loop-wor
 const sid = 'qa-loop-000';
 test.use({ video: { mode: 'on', size: { width: 1600, height: 1000 } } });
 
-async function fixture(page: Page, name = 'legacy') {
+async function fixture(page: Page, name = 'legacy', runtime = false) {
   let value: any = { ...states()[name], sessionId: sid, policy: { executionMode: 'aimein', aimeinReviewers: [] } };
   let socket: WebSocketRoute;
   const calls: Array<{ method: string; params: any[] }> = [];
@@ -16,6 +16,7 @@ async function fixture(page: Page, name = 'legacy') {
   let rejectGoal = false;
   let rejectWrites = false;
   let unknownWrites = false;
+  let offline = false;
   let memory: any = { revision: 0, profiles: [], calibrations: [] };
   const summary = () => ({ protocolVersion: 1, sessionId: sid, controlMode: 'loop', controlRevision: 0,
     stage: value.stage, round: value.round, auto: value.auto,
@@ -24,6 +25,7 @@ async function fixture(page: Page, name = 'legacy') {
   const push = () => socket.send(JSON.stringify({ event: 'loopUpdated', data: JSON.stringify({ ...value,
     loops: value.loops.map((rec: any) => rec.aimeinSummary ? { ...rec, aimeinRun: {}, detailLoaded: false } : rec) }) }));
   await page.routeWebSocket(/127\.0\.0\.1:45421/, ws => {
+    if (offline) { ws.close({ code: 1001 }); return; }
     socket = ws;
     const server = ws.connectToServer();
     server.onMessage(message => ws.send(message));
@@ -83,8 +85,9 @@ async function fixture(page: Page, name = 'legacy') {
       if (frame.method === 'loopSetAuto' && holdAuto) { pending.push(() => { value.auto = frame.params[1]; reply({ status: 'ok' }); push(); }); return; }
       if (['loopSetGoal', 'loopSealIdea'].includes(frame.method) && rejectGoal) return reply({ status: 'error', message: '隔离夹具拒绝保存' });
       if (frame.method === 'loopGetRecord') {
-        const result = { status: 'ok', record: { ...value.loops.find((item: any) => item.seq === frame.params[1]), detailLoaded: true,
-          result: '隔离持久化成果', stageDetails: {}, callDiagnostics: [] } };
+        const saved = value.loops.find((item: any) => item.seq === frame.params[1]);
+        const result = { status: 'ok', record: { ...saved, detailLoaded: true,
+          result: saved?.result || '隔离持久化成果', stageDetails: saved?.stageDetails || {}, callDiagnostics: saved?.callDiagnostics || [] } };
         if (hold) pending.push(() => reply(result)); else reply(result);
         return;
       }
@@ -106,6 +109,7 @@ async function fixture(page: Page, name = 'legacy') {
   await page.locator('.awu-sidebar').getByText('首页交付 Loop 1', { exact: true }).click();
   const pane = page.locator('[data-session-tab-panel]:visible');
   await expect(pane.getByTestId('loop-workbench')).toBeVisible();
+  if (!runtime && await pane.getByRole('button', { name: '建设场景', exact: true }).isVisible()) await pane.getByRole('button', { name: '建设场景', exact: true }).click();
   return { pane, calls, push, count: (method: string) => calls.filter(call => call.method === method).length,
     replace: (name: string, extra: any = {}) => { value = { ...states()[name], sessionId: sid, ...extra }; push(); },
     update: (fn: (state: any) => void) => { fn(value); push(); }, hold: (on: boolean) => { hold = on; },
@@ -117,6 +121,8 @@ async function fixture(page: Page, name = 'legacy') {
     unknownWrites: (on: boolean) => { unknownWrites = on; },
     memory: (raw: any) => { memory = raw; value.aimeinMemory = { revision: raw.revision, profiles: raw.profiles.length, calibrations: raw.calibrations.length }; push(); },
     progress: () => socket.send(JSON.stringify({ event: 'loopProgress', data: JSON.stringify({ sessionId: sid, seq: 1, subStage: 'step1', text: '实时内容' }) })),
+    emit: (seq: number, subStage: string, text: string) => socket.send(JSON.stringify({ event: 'loopProgress', data: JSON.stringify({ sessionId: sid, seq, subStage, text }) })),
+    disconnect: () => { offline = true; socket.close({ code: 1001 }); },
   };
 }
 
@@ -138,9 +144,10 @@ for (const mode of ['3D', 'static']) test(`advance tolerates empty planning life
   const observer = main.getByRole('region', { name: '场景观察' });
   if (mode === 'static') await main.getByRole('button', { name: '静态视图', exact: true }).click();
   f.startRecord(planningAttempt()); f.hold(true);
-  await f.pane.getByRole('button', { name: '推进下一次尝试', exact: true }).click();
+  await f.pane.getByRole('button', { name: '工坊：点火开工', exact: true }).click();
   await expect.poll(() => f.count('loopGetRecord')).toBe(1);
   await expect(main).toBeVisible();
+  await main.getByRole('button', { name: '建设场景', exact: true }).click();
   await expect(observer).toContainText('正在读取阶段详情');
   f.hold(false); f.release();
   await expect(main).toBeVisible();
@@ -174,7 +181,7 @@ for (const mode of ['3D', 'static']) test(`advance tolerates empty planning life
   await expect(observer).not.toContainText('正在拆解目标并生成阶段计划');
   await main.getByRole('button', { name: '阶段记录', exact: true }).click();
   await expect(main.getByRole('region', { name: '阶段结论' })).toContainText(failed.error);
-  await expect(f.pane.getByRole('button', { name: '继续当前尝试', exact: true })).toBeEnabled();
+  await expect(f.pane.getByRole('button', { name: '工坊：继续建设', exact: true })).toBeEnabled();
   await page.screenshot({ path: info.outputPath(`planning-${mode}-recovered.png`) });
   expect(f.count('loopRunIteration')).toBe(1);
   expect(errors).toEqual([]);
@@ -185,7 +192,7 @@ function attempt(seq: number, passed = false) {
   const reviews = ['Model Alpha', 'Model Beta', 'Model Gamma'].map((model, i) => ({ id: `review${i + 1}`, model, backendId: 'qa-primary',
     status: passed || i < 2 ? 'passed' : 'changes_requested', maturity: passed || i < 2 ? 40 : 25,
     summary: passed || i < 2 ? '保存与重开流程已有验证依据。' : '离线重开时缺少失败反馈。',
-    criteria: [{ id: 'C1', status: 'verified', reason: '已核对行为验证记录', evidence: ['tests/flow.test.ts'] }],
+    criteria: [{ id: 'C1', status: 'verified', reason: '已核对行为验证记录', evidence: ['tests/flow.test.ts'] }, { id: 'C2', status: passed || i < 2 ? 'verified' : 'gap', reason: '核对失败反馈', evidence: ['tests/flow.test.ts'] }],
     targets: [{ id: 'T1', status: 'verified', reason: '已核对保存流程', evidence: ['tests/flow.test.ts'], fingerprints: { 'tests/flow.test.ts': 'fixture-fingerprint' } }, { id: 'T2', status: 'gap', reason: '协作留待后续', evidence: [] }] }));
   return { ...record(), seq, subStage: 'done', completed: true, detailLoaded: false,
     orchestration: [{ index: 1, status: 'done', mode: 'sequential', desc: '实现保存与重开流程', output: '隔离测试已通过' }],
@@ -209,6 +216,68 @@ function worldAttempt(seq: number, verified = 3) {
   result.aimeinRun.reviews.forEach((r: any) => { r.targets = targets.map((t, i) => ({ id: t.id, status: i < verified ? 'verified' : 'gap', reason: '隔离演示依据', evidence: ['tests/flow.test.ts'], fingerprints: i < verified ? { 'tests/flow.test.ts': 'fixture-fingerprint' } : {} })); });
   return result;
 }
+
+test('task landscape keeps plots clear, paginates all targets and follows cross-page dependencies', async ({ page }, info) => {
+  test.setTimeout(65000);
+  const errors: string[] = []; page.on('pageerror', e => errors.push(e.message));
+  const f = await fixture(page);
+  if ((page.viewportSize()?.width || 1600) < 600 && await page.locator('.awu-sidebar').isVisible()) await page.getByRole('button', { name: '收起侧栏', exact: true }).click();
+  f.update(s => { s.loops = [worldAttempt(1)]; });
+  const main = f.pane.getByTestId('aimein-workbench');
+  const world = main.getByTestId('aimein-world');
+  const canvas = world.locator('canvas'); const map = world.getByTestId('aimein-task-map');
+  await expect(canvas).toHaveAttribute('data-task-ids', 'T1,T2,T3,T4,T5,T6,T7,T8');
+  await page.mouse.move(5, 5); await page.waitForTimeout(1500);
+  await main.screenshot({ path: info.outputPath('landscape-eight.png') });
+  await worldControls(world); await sceneButton(world, '拆分目标'); await page.waitForTimeout(1200);
+  await main.screenshot({ path: info.outputPath('landscape-split.png') });
+  await world.getByRole('button', { name: '工具 2：装配' }).click();
+  await expect(canvas).toHaveAttribute('data-assembled', 'T1,T2,T3,T4,T5,T6');
+  await page.waitForTimeout(1200);
+  await main.screenshot({ path: info.outputPath('landscape-assembly.png') });
+  await main.getByRole('button', { name: '我想调整后续范围' }).click();
+  await map.getByLabel('定位子目标').selectOption('T8');
+  await expect(canvas).toHaveAttribute('data-assembled', 'T1,T2,T3,T4,T5,T6');
+  await world.getByRole('button', { name: '工具 1：观察' }).click();
+  f.update(s => {
+    const value = worldAttempt(1, 0);
+    value.aimeinRun.plan.targets = Array.from({ length: 40 }, (_, i) => ({ id: `T${i + 1}`, title: `目标 ${i + 1} · 跨端协作与离线恢复的完整产品流程和可审计验收依据`, acceptance: '以真实结果核实', dependsOn: i === 0 ? ['T13', 'missing'] : [`T${i}`] }));
+    value.aimeinSummary.targetCount = 40; s.loops = [value];
+  });
+  await expect(map).toContainText('1–12 / 40');
+  await expect(canvas).toHaveAttribute('data-task-edges', '0');
+  const reached = new Set<string>();
+  for (let p = 0; p < 4; p++) {
+    await expect(map).toHaveAttribute('data-page', String(p));
+    await expect(canvas).toHaveAttribute('data-task-ids', Array.from({ length: Math.min(12, 40 - p * 12) }, (_, i) => `T${p * 12 + i + 1}`).join(','));
+    const positions = JSON.parse((await canvas.getAttribute('data-task-positions'))!);
+    positions.forEach((t: any) => reached.add(t.id));
+    expect(new Set(positions.map((t: any) => t.at[1])).size).toBe(1);
+    if (p === 0) { await page.waitForTimeout(1200); await main.screenshot({ path: info.outputPath('landscape-forty.png') }); }
+    if (p < 3) await map.getByRole('button', { name: '下一片任务' }).click();
+  }
+  expect(reached.size).toBe(40);
+  f.push(); await expect(map).toHaveAttribute('data-page', '3');
+  await map.getByLabel('定位子目标').selectOption('T1');
+  await expect(map).toHaveAttribute('data-page', '0');
+  await expect(canvas).toHaveAttribute('data-task-edges', '1');
+  await map.locator('summary').click();
+  await expect(map).toContainText('前置 missing · 缺少详情');
+  await map.getByRole('button', { name: '前置 T13 · 第 2 片 ↗' }).click();
+  await expect(map).toHaveAttribute('data-page', '1');
+  await expect(canvas).toHaveAttribute('data-held-target', 'T13');
+  await page.waitForTimeout(1200); await main.screenshot({ path: info.outputPath('landscape-dependency.png') });
+  await world.getByRole('button', { name: '静态视图', exact: true }).click();
+  await expect(world.getByTestId('aimein-world-static')).toBeVisible();
+  await map.getByRole('button', { name: '下一片任务' }).click();
+  await map.getByRole('button', { name: /^地块 T25：/ }).click();
+  await expect(map.getByLabel('定位子目标')).toHaveValue('T25');
+  await world.getByRole('button', { name: '切换 3D 沙盘' }).click();
+  await expect(canvas).toHaveAttribute('data-task-ids', 'T25,T26,T27,T28,T29,T30,T31,T32,T33,T34,T35,T36');
+  expect(await main.evaluate(el => el.scrollWidth <= el.clientWidth + 2)).toBe(true);
+  expect(f.count('loopRunIteration')).toBe(0); expect(f.count('loopAddAddon')).toBe(0); expect(f.count('loopSetPolicy')).toBe(0);
+  expect(errors).toEqual([]);
+});
 
 async function clickReviewerMesh(page: Page, index: number) {
   await clickWorldPoint(page, [-1.5 + index * 2.15, 1.22, 3.5]);
@@ -332,7 +401,7 @@ test('live flow cancels hidden events, respects reduced motion and never animate
   await page.emulateMedia({ reducedMotion: 'no-preference' });
   await page.waitForTimeout(1100);
   // 探针优先航线，拿取/装配优先方块；点击真实曲线可达准确评委。
-  await world.getByRole('button', { name: '工具 3：探针', exact: true }).click();
+  await world.getByRole('button', { name: '工具 3：成果', exact: true }).click();
   await clickWorldPoint(page, [-.1, 2.4, 2.2]);
   await expect(main.getByRole('region', { name: '场景观察' })).toContainText('Model Beta');
   f.update(s => { const next = flowAttempt('executing'); next.seq = 2; s.loops.push(next); });
@@ -490,12 +559,12 @@ test('AIMEIN responsive workbench preserves attempts and lazy evidence', async (
   const errors: string[] = []; page.on('pageerror', e => errors.push(e.message));
   const f = await fixture(page);
   if ((page.viewportSize()?.width || 1600) < 600 && await page.locator('.awu-sidebar').isVisible()) await page.getByRole('button', { name: '收起侧栏', exact: true }).click();
-  await expect(f.pane.getByText('AIMEIN 工作台', { exact: true })).toBeVisible();
-  await expect(f.pane.getByRole('button', { name: '配置三模型评审' })).toBeVisible();
+  await expect(f.pane.getByTestId('aimein-controls')).toBeVisible();
+  await expect(f.pane.getByRole('button', { name: '配置评审组' })).toBeVisible();
   f.update(state => { state.loops = [attempt(1)]; });
   const main = f.pane.getByTestId('aimein-workbench');
   await expect(main.getByRole('region', { name: '阶段成熟度' })).toContainText('本阶段目标成熟度');
-  await expect(main.getByRole('region', { name: '三方验收' })).toContainText('2 / 3 通过');
+  await expect(main.getByRole('region', { name: '评审验收' })).toContainText('2 / 3 通过');
   await expect.poll(() => f.count('loopGetRecord')).toBe(1);
   await main.getByRole('button', { name: '阶段记录', exact: true }).click();
   await main.getByText('目标图与执行记录', { exact: true }).click();
@@ -506,18 +575,18 @@ test('AIMEIN responsive workbench preserves attempts and lazy evidence', async (
   if (viewport.width >= 600) await page.setViewportSize({ width: viewport.width, height: 1200 });
   await page.screenshot({ path: info.outputPath('aimein-stage.png') });
   if (viewport.width >= 600) await page.setViewportSize(viewport);
-  await main.getByRole('region', { name: '三方验收' }).scrollIntoViewIfNeeded();
+  await main.getByRole('region', { name: '评审验收' }).scrollIntoViewIfNeeded();
   await page.screenshot({ path: info.outputPath('aimein-reviews.png') });
   expect(await main.evaluate(el => el.scrollWidth <= el.clientWidth + 2)).toBe(true);
   f.update(state => { state.loops.push(attempt(2, true)); });
-  await expect(main.getByRole('region', { name: '三方验收' })).toContainText('3 / 3 通过');
+  await expect(main.getByRole('region', { name: '评审验收' })).toContainText('3 / 3 通过');
   await main.getByLabel('查看 AIMEIN 阶段').selectOption('1');
-  await expect(main.getByRole('region', { name: '三方验收' })).toContainText('2 / 3 通过');
+  await expect(main.getByRole('region', { name: '评审验收' })).toContainText('2 / 3 通过');
   f.push(); await expect(main.getByLabel('查看 AIMEIN 阶段')).toHaveValue('1');
   await main.getByRole('button', { name: '返回最新阶段' }).click();
   await expect(main.getByLabel('查看 AIMEIN 阶段')).toHaveValue('2');
   expect(f.count('loopRunIteration')).toBe(0);
-  await f.pane.getByRole('button', { name: '推进下一次尝试', exact: true }).click();
+  await f.pane.getByRole('button', { name: '工坊：点火开工', exact: true }).click();
   expect(f.count('loopRunIteration')).toBe(1);
   page.once('dialog', d => d.accept());
   await f.pane.getByRole('button', { name: '停止本轮并查看结果', exact: true }).click();
@@ -542,28 +611,80 @@ test('review retry preserves the attempt and exposes failure history', async ({ 
       recheckRequired: true, basisRefs: [], reasonCode: '', message: '' };
   });
   const main = f.pane.getByTestId('aimein-workbench');
-  await expect(f.pane.getByRole('button', { name: '继续当前尝试', exact: true })).toBeVisible();
+  await expect(f.pane.getByRole('button', { name: '工坊：继续建设', exact: true })).toBeVisible();
   await main.getByRole('button', { name: '阶段记录', exact: true }).click();
   const reviewer = main.getByRole('article').nth(1);
   await reviewer.getByText('查看依据与原文', { exact: true }).click();
   await expect(reviewer).toContainText('第 1 次核对失败：模型响应不完整');
   expect(f.count('loopRunIteration')).toBe(0);
-  await f.pane.getByRole('button', { name: '继续当前尝试', exact: true }).click();
+  await f.pane.getByRole('button', { name: '工坊：继续建设', exact: true }).click();
   expect(f.count('loopRunIteration')).toBe(1);
 });
 
 test('review settings are explicit, saved errors retain the draft and do not run', async ({ page }) => {
   const f = await fixture(page);
   if ((page.viewportSize()?.width || 1600) < 600 && await page.locator('.awu-sidebar').isVisible()) await page.getByRole('button', { name: '收起侧栏', exact: true }).click();
-  await f.pane.getByRole('button', { name: '配置三模型评审', exact: true }).click();
+  await f.pane.getByRole('button', { name: '配置评审组', exact: true }).click();
   const dialog = f.pane.getByRole('dialog');
-  await expect(dialog.getByRole('region', { name: 'AIMEIN 三模型评审' })).toBeVisible();
+  await expect(dialog.getByRole('region', { name: 'AIMEIN 独立评审' })).toBeVisible();
   for (let i = 1; i <= 3; i++) await dialog.getByLabel(`评审 ${i} Backend`).selectOption('qa-primary');
-  await expect(dialog).toContainText('三个评审需要不同模型');
+  await expect(dialog).toContainText('启用的评委需要不同模型');
   f.rejectGoal(true);
   await dialog.getByRole('button', { name: /保存/, exact: false }).last().click();
   await expect(dialog).toContainText('隔离夹具拒绝保存');
   await expect(dialog.getByLabel('评审 3 Backend')).toHaveValue('qa-primary');
+  expect(f.count('loopRunIteration')).toBe(0);
+});
+
+test('reviewer count configures one two or three seats and preserves the historical roster', async ({ page }, info) => {
+  test.setTimeout(65000);
+  const f = await fixture(page);
+  if ((page.viewportSize()?.width || 1600) < 600 && await page.locator('.awu-sidebar').isVisible()) await page.getByRole('button', { name: '收起侧栏', exact: true }).click();
+  const main = f.pane.getByTestId('aimein-workbench');
+  await f.pane.getByRole('button', { name: '配置评审组', exact: true }).click();
+  const dialog = f.pane.getByRole('dialog');
+  const counts = dialog.getByRole('group', { name: '评委人数' });
+  await counts.getByRole('button', { name: '1 位', exact: true }).click();
+  await dialog.getByLabel('评审 1 Backend').selectOption('qa-primary');
+  await expect(dialog.getByLabel('评审 2 Backend')).toHaveCount(0);
+  await expect(dialog).toContainText('1 位评委已配置');
+  await counts.getByRole('button', { name: '2 位', exact: true }).click();
+  await expect(dialog.getByLabel('评审 1 Backend')).toHaveValue('qa-primary');
+  await expect(dialog.getByLabel('评审 2 Backend')).toBeVisible();
+  await counts.getByRole('button', { name: '3 位', exact: true }).click();
+  await expect(dialog.getByLabel('评审 3 Backend')).toBeVisible();
+  await counts.getByRole('button', { name: '1 位', exact: true }).click();
+  await page.screenshot({ path: info.outputPath('reviewer-count-settings.png') });
+  await dialog.getByRole('button', { name: /保存/, exact: false }).last().click();
+  await expect.poll(() => f.count('loopSetPolicy')).toBe(1);
+  await dialog.getByRole('button', { name: '关闭详情，返回工作台' }).click();
+  await expect(dialog).toBeHidden();
+  expect(JSON.parse(f.calls.filter(c => c.method === 'loopSetPolicy').at(-1)!.params[1]).aimeinReviewers).toHaveLength(1);
+  const canvas = main.getByTestId('aimein-world').locator('canvas');
+  for (const count of [1, 2, 3]) {
+    const r: any = worldAttempt(count);
+    r.aimeinRun.reviewerCount = count; r.aimeinRun.reviews = r.aimeinRun.reviews.slice(0, count);
+    r.aimeinSummary.reviewerCount = count; r.aimeinSummary.reviews = r.aimeinRun.reviews;
+    if (count < 3) { r.aimeinSummary.accepted = true; r.aimeinSummary.status = 'accepted'; r.aimeinSummary.issues = []; r.aimeinSummary.message = `${count} 位评委均通过当前阶段`; }
+    r.aimeinSummary.revision = `roster-${count}`;
+    f.update(s => { s.loops = [r]; s.running = false; });
+    await expect(canvas).toHaveAttribute('data-reviewer-count', String(count));
+    await main.getByRole('button', { name: '工具 4：评委' }).click();
+    await expect(main.getByTestId('aimein-review-overview')).toContainText(`汇总 ${count} 位评委报告`);
+    await expect(main.getByTestId('aimein-review-overview')).toBeInViewport();
+    if (count < 3) await expect(main.getByTestId('aimein-review-overview')).toContainText('本阶段通过');
+    await page.screenshot({ path: info.outputPath(`reviewer-${count}-seats.png`) });
+    await main.getByRole('button', { name: '静态视图', exact: true }).click();
+    const world = main.getByTestId('aimein-world');
+    await expect(world.getByRole('button', { name: `观察评委 ${count}`, exact: true })).toBeVisible();
+    await expect(world.getByRole('button', { name: `观察评委 ${count + 1}`, exact: true })).toHaveCount(0);
+    await world.getByRole('button', { name: '切换 3D 沙盘', exact: true }).click();
+  }
+  const old: any = attempt(4, true); old.aimeinRun.reviews = old.aimeinRun.reviews.slice(0, 1); old.aimeinSummary.reviews = old.aimeinRun.reviews;
+  f.update(s => { s.loops = [old]; });
+  await expect(canvas).toHaveAttribute('data-reviewer-count', '3');
+  await expect(main.getByTestId('aimein-review-overview')).toContainText('1/3 已返回');
+  await expect(main.getByTestId('aimein-vessel-value')).toContainText('待核实');
   expect(f.count('loopRunIteration')).toBe(0);
 });
 
@@ -595,10 +716,10 @@ test('new AIMEIN session opens an immersive world before creation and persists w
   expect(await entrance.evaluate(el => el.scrollWidth <= el.clientWidth + 1)).toBe(true);
   await entrance.getByRole('button', { name: '安放工坊，下一步 →', exact: true }).click();
   await expect(page.getByRole('heading', { name: 'New Session' })).toHaveCount(0);
-  await expect(page.getByText('AIMEIN 工作台', { exact: true })).toBeVisible();
+  await expect(page.getByTestId('aimein-controls')).toBeVisible();
   await expect(page.getByTestId('aimein-preparation')).toBeVisible();
   await page.reload();
-  await expect(page.getByText('AIMEIN 工作台', { exact: true })).toBeVisible();
+  await expect(page.getByTestId('aimein-controls')).toBeVisible();
   expect(calls.filter(m => m === 'createSession')).toHaveLength(1);
   expect(calls.filter(m => m === 'loopSetPolicy')).toHaveLength(0);
 });
@@ -631,7 +752,7 @@ test('immersive preparation guides missing fields, retains drafts and starts onl
   await expect(guide.getByTestId('aimein-reviewers-target')).toBeVisible();
   await expect(guide.getByRole('button', { name: /下一步，检查准备/ })).toBeDisabled();
   for (let i = 1; i <= 3; i++) await guide.getByLabel(`评审 ${i} Backend`).selectOption('qa-primary');
-  await expect(guide).toContainText('三个评审需要不同模型');
+  await expect(guide).toContainText('启用的评委需要不同模型');
   for (const [i, model] of ['Model Alpha', 'Model Beta', 'Model Gamma'].entries()) await guide.getByLabel('Codex 模型', { exact: true }).nth(i).fill(model);
   f.rejectGoal(true);
   await guide.getByRole('button', { name: '保存评委，下一步 →' }).click();
@@ -751,7 +872,7 @@ test('reviewer workshop keeps drafts, version history, recommendations and calib
   const library = main.getByRole('region', { name: '评委工坊', exact: true });
   await expect(library).toContainText('样本不足');
   await library.getByRole('button', { name: '勾选推荐组合' }).click();
-  await library.getByRole('button', { name: '选用这三位 (3/3)', exact: true }).click();
+  await library.getByRole('button', { name: '选用 3 位评委', exact: true }).click();
   await expect(library).toContainText('已选用');
   const card = library.getByRole('article').filter({ hasText: '体验观察员' });
   await card.getByRole('button', { name: '编辑档案', exact: true }).click();
@@ -776,7 +897,7 @@ test('reviewer workshop keeps drafts, version history, recommendations and calib
   await expect(editor).toHaveCount(0);
   await library.getByLabel('选择 导入的聚焦档案', { exact: true }).check();
   await library.getByLabel('选择 体验观察员', { exact: true }).check();
-  await expect(library.getByRole('button', { name: '选用这三位 (3/3)' })).toBeDisabled();
+  await expect(library.getByRole('button', { name: '选用 3 位评委' })).toBeDisabled();
   await expect(library).toContainText('同一模型的不同档案不能重复占位');
   await library.getByRole('button', { name: '勾选推荐组合' }).click();
   const calibration = library.getByRole('form', { name: '评委校准' });
@@ -876,6 +997,16 @@ test('persistent canvas survives explicit preparation to execution', async ({ pa
   expect(f.count('loopRunIteration')).toBe(1);
 });
 
+
+async function adjustAssembly(main: Locator, clear = false) {
+  const adjust = main.getByRole('button', { name: '我想调整后续范围', exact: true });
+  if (await adjust.isVisible()) await adjust.click();
+  if (clear) {
+      const roots = main.locator('[aria-label="模块背包"] button[aria-pressed="true"]');
+    while (await roots.count()) await roots.first().click();
+  }
+}
+
 test('playable workshop builds a recipe then runs and probes a real UI lifecycle with recording', async ({ page }, info) => {
   test.setTimeout(65000);
   const errors: string[] = []; page.on('pageerror', error => errors.push(error.message));
@@ -889,19 +1020,20 @@ test('playable workshop builds a recipe then runs and probes a real UI lifecycle
   await expect(world.getByTestId('aimein-vessel-value')).toContainText('3 / 8');
   const original = await canvas.elementHandle();
   await world.getByRole('button', { name: '工具 2：装配' }).click();
+  await adjustAssembly(main, true);
   await expect(main.getByRole('button', { name: '模块 T3：内容编辑' })).toBeVisible();
   // 等待分离动画后，用真实 Canvas 点击模块，不以 DOM 替代三维拾取。
   await page.waitForTimeout(1200);
-  await clickWorldPoint(page, [-3.24, 1.65, -2.3]);
+  await clickWorldPoint(page, [-2.26, .4, -1.16]);
   await expect(canvas).toHaveAttribute('data-held-target', 'T3');
   await expect(canvas).toHaveAttribute('data-assembled', 'T1,T2,T3');
-  await expect(main.getByRole('region', { name: '装配台' })).toContainText('1 个主动选择 · 2 个依赖自动纳入');
+  await expect(main.getByRole('region', { name: '阶段装配' })).toContainText('1 个主动选择 · 2 个依赖自动纳入');
   await page.waitForTimeout(1100);
   await page.screenshot({ path: info.outputPath('playable-assembly.png') });
   await main.getByLabel('装配意图', { exact: true }).fill('先让我完成创作，再接上离线保存。');
   expect(f.count('loopAddAddon')).toBe(0); expect(f.count('loopRunIteration')).toBe(0);
   await main.getByRole('button', { name: '交给下次规划', exact: true }).click();
-  await expect(main.getByRole('region', { name: '装配台' })).toContainText('组合已保存');
+  await expect(main.getByRole('region', { name: '阶段装配' })).toContainText('组合已保存');
   const request = f.calls.find(c => c.method === 'loopAddAddon')!;
   expect(request.params[1]).toContain('来源尝试 #1');
   expect(request.params[1]).toContain('传递依赖：T1、T2');
@@ -921,8 +1053,8 @@ test('playable workshop builds a recipe then runs and probes a real UI lifecycle
   await expect(canvas).toHaveAttribute('data-flow-stage', 'reviewing'); await page.waitForTimeout(1600);
   f.update(s => { const repair = flowAttempt('repair', 6, 3); repair.seq = 2; s.loops = [worldAttempt(1), repair]; s.running = false; });
   await expect(canvas).toHaveAttribute('data-flow-stage', 'repair');
-  await world.getByRole('button', { name: '工具 3：探针' }).click();
-  const probe = main.getByRole('region', { name: '故障探针' });
+  await world.getByRole('button', { name: '工具 3：成果' }).click();
+  const probe = main.getByRole('region', { name: '成果与验证' });
   await expect(probe).toContainText('离线重开时缺少失败反馈');
   await probe.getByText('▣ 已保存 · 离线恢复', { exact: true }).click();
   await expect(probe).toContainText('已保存步骤 4 的实施与验证记录');
@@ -946,30 +1078,34 @@ test('playable assembly keeps failed drafts, separates changed plans and stops u
   const main = f.pane.getByTestId('aimein-workbench');
   await main.getByRole('button', { name: '静态视图', exact: true }).click();
   await main.getByRole('button', { name: '工具 2：装配' }).click();
+  await adjustAssembly(main);
   await main.getByRole('button', { name: '模块 T2：创建项目' }).click();
   await main.getByLabel('装配意图', { exact: true }).fill('先保留这套组合');
   f.rejectWrites(true);
   const submit = main.getByRole('button', { name: '交给下次规划', exact: true });
   await submit.click();
-  await expect(main.getByRole('region', { name: '装配台' })).toContainText('隔离夹具拒绝保存');
+  await expect(main.getByRole('region', { name: '阶段装配' })).toContainText('隔离夹具拒绝保存');
   await expect(main.getByLabel('装配意图', { exact: true })).toHaveValue('先保留这套组合');
   f.update(s => { s.loops = [worldAttempt(1), worldAttempt(2)]; });
   await sceneButton(main, /足迹 #2：/);
   await expect(main.getByLabel('装配意图', { exact: true })).toHaveCount(0);
   await main.getByRole('button', { name: '工具 2：装配' }).click();
+  await adjustAssembly(main);
   await expect(main.getByLabel('装配意图', { exact: true })).toHaveValue('');
-  await expect(submit).toBeDisabled();
+  await expect(submit).toBeEnabled();
   await sceneButton(main, /足迹 #1：/);
   await main.getByRole('button', { name: '工具 2：装配' }).click();
+  await adjustAssembly(main);
   await expect(main.getByLabel('装配意图', { exact: true })).toHaveValue('先保留这套组合');
   await expect(submit).toBeDisabled();
   f.update(s => { s.loops = [worldAttempt(1)]; });
   f.rejectWrites(false); f.unknownWrites(true);
   await expect(submit).toBeEnabled(); await submit.click();
-  await expect(main.getByRole('region', { name: '装配台' })).toContainText('保存结果未知');
+  await expect(main.getByRole('region', { name: '阶段装配' })).toContainText('保存结果未知');
   await expect(submit).toBeDisabled();
-  await main.getByRole('button', { name: '工具 3：探针' }).click();
+  await main.getByRole('button', { name: '工具 3：成果' }).click();
   await main.getByRole('button', { name: '工具 2：装配' }).click();
+  await adjustAssembly(main);
   await expect(submit).toBeDisabled();
   expect(f.count('loopAddAddon')).toBe(2); expect(f.count('loopRunIteration')).toBe(0);
   await expect(main.getByTestId('aimein-world-static')).toBeInViewport({ ratio: .99 });
@@ -985,6 +1121,7 @@ test('playable tools respect keyboard editing and select the exact reviewer for 
   const main = f.pane.getByTestId('aimein-workbench'); const world = main.getByTestId('aimein-world');
   await world.focus(); await page.keyboard.press('2');
   await expect(world).toHaveAttribute('data-tool', 'assemble');
+  await adjustAssembly(main);
   await main.getByLabel('装配意图', { exact: true }).fill('1234');
   await expect(world).toHaveAttribute('data-tool', 'assemble');
   await world.focus(); await page.keyboard.press('4');
@@ -1007,14 +1144,16 @@ test('playable plan revisions, missing dependencies and execution gates remain a
   f.update(s => { s.loops = [worldAttempt(1)]; });
   const main = f.pane.getByTestId('aimein-workbench');
   await main.getByRole('button', { name: '工具 2：装配' }).click();
+  await adjustAssembly(main);
   await main.getByRole('button', { name: '模块 T2：创建项目' }).click();
   await main.getByLabel('装配意图', { exact: true }).fill('只属于旧版的方案');
   f.update(s => { s.loops[0].aimeinRun.plan.targets[1].acceptance = '新的验收要求'; s.loops[0].aimeinSummary.revision = 'changed-plan'; });
+  await expect(main.getByLabel('装配意图', { exact: true })).toHaveCount(0);
+  await adjustAssembly(main);
   await expect(main.getByLabel('装配意图', { exact: true })).toHaveValue('');
-  await expect(main.getByRole('button', { name: '交给下次规划', exact: true })).toBeDisabled();
   f.update(s => { s.loops[0].aimeinRun.plan.targets[1].dependsOn = ['missing']; s.loops[0].aimeinSummary.revision = 'missing-plan'; });
-  await main.getByRole('button', { name: '模块 T2：创建项目' }).click();
-  await expect(main.getByRole('region', { name: '装配台' })).toContainText('缺少依赖详情：missing');
+  await expect(main.getByRole('region', { name: '阶段装配' })).toContainText('缺少依赖详情：missing');
+  await adjustAssembly(main);
   await expect(main.getByRole('button', { name: '交给下次规划', exact: true })).toBeDisabled();
   f.replace('manual', { policy: { executionMode: 'aimein' }, loops: [worldAttempt(1)] });
   await expect(main.getByRole('button', { name: '工坊：点火开工' })).toBeDisabled();
@@ -1023,3 +1162,165 @@ test('playable plan revisions, missing dependencies and execution gates remain a
   expect(f.count('loopRunIteration')).toBe(0); expect(f.count('loopAddAddon')).toBe(0);
 });
 
+
+
+function activeCall(stage: string, phase = 'tools', model = 'Model Alpha') {
+  return { id: stage, stage, status: 'running', phase, startedAt: Date.now() / 1000 - 25,
+    observedAt: Date.now() / 1000, lastActivityAt: Date.now() / 1000, model, textChars: 40,
+    eventCounts: { tool_start: 3 }, promptChars: 100, estimatedPromptTokens: 30, imageCount: 0,
+    thinkingChars: 0, transportAttempts: 1, retryCount: 0, retryWaitSeconds: 0 };
+}
+
+test('runtime field follows preparation planning execution and review with visible flow', async ({ page }, info) => {
+  test.setTimeout(90000);
+  const errors: string[] = []; page.on('pageerror', e => errors.push(e.message));
+  const f = await fixture(page, 'legacy', true);
+  if (info.project.name === 'narrow-mobile-chromium' && await page.locator('.awu-sidebar').isVisible()) await page.getByRole('button', { name: '收起侧栏', exact: true }).click();
+  const main = f.pane.getByTestId('aimein-workbench');
+  const canvas = main.getByTestId('aimein-world').locator('canvas');
+  const initial = { ...record(), seq: 1, completed: false, subStage: 'prepare', orchestration: [], goal: '建设创作、保存与恢复工作台',
+    stageDetails: { openspecSetup: { status: 'running', message: '正在准备正式来源' } }, callDiagnostics: [activeCall('prepare')] };
+  f.update(s => { s.running = true; s.goal = initial.goal; s.loops = [initial]; });
+  const field = main.getByTestId('aimein-runtime');
+  await expect(field).toBeVisible();
+  await expect(field.getByTestId('aimein-runtime-title')).toHaveText('OpenSpec 准备');
+  await expect(field).toContainText(initial.goal);
+  await expect(main.getByText('开始前，选好评审组', { exact: true })).toHaveCount(0);
+  await expect(canvas).toHaveAttribute('data-flow-activity', 'prepare');
+  await expect.poll(() => canvas.getAttribute('data-flow-particles').then(Number)).toBeGreaterThan(0);
+  f.emit(1, 'prepare', '正在核对 OpenSpec 与现有方案。\n');
+  await expect(field.getByTestId('aimein-live-output')).toContainText('正在核对 OpenSpec');
+  await page.screenshot({ path: info.outputPath('runtime-preparation.png') });
+  await page.waitForTimeout(1600);
+  f.update(s => { s.loops[0].callDiagnostics[0].phase = 'turn_accepted'; });
+  await expect(canvas).toHaveAttribute('data-flow-activity', '');
+  await expect.poll(() => canvas.getAttribute('data-flow-particles').then(Number)).toBe(0);
+  const plan: any = planningAttempt(); plan.goal = initial.goal; plan.callDiagnostics = [activeCall('aimein-plan', 'text')];
+  f.update(s => { s.loops = [plan]; });
+  f.emit(1, 'aimein-plan', '将目标拆解为创作、保存、恢复三个可核实的流程。\n');
+  await expect(field.getByTestId('aimein-runtime-title')).toHaveText('目标拆解');
+  await expect(canvas).toHaveAttribute('data-flow-activity', 'plan');
+  await expect(field.getByTestId('aimein-live-output')).toContainText('将目标拆解');
+  await page.waitForTimeout(1600);
+  const executing = flowAttempt('executing'); executing.goal = initial.goal; executing.callDiagnostics = [activeCall('execute', 'text')];
+  f.update(s => { s.loops = [executing]; });
+  f.emit(1, 'execute', Array.from({ length: 80 }, (_, i) => `真实输出行 ${i} · 正在实施保存与恢复`).join('\n'));
+  await expect(canvas).toHaveAttribute('data-flow-activity', 'build,infra,store');
+  await expect(field.getByTestId('aimein-observation')).toHaveAttribute('data-health', 'working');
+  await expect(field.getByTestId('aimein-observation')).toContainText('已保存步骤');
+  await expect(field.getByRole('navigation', { name: '输出通道' })).toBeHidden();
+  if (info.project.name === 'desktop-chromium') await expect(field.getByTestId('aimein-observation')).toContainText('性能 / 效率：未测量');
+  const output = field.getByTestId('aimein-live-output');
+  await expect(output).toContainText('真实输出行 79');
+  await field.getByRole('button', { name: '暂停跟随', exact: true }).click();
+  await output.evaluate(el => { el.scrollTop = 0; });
+  f.emit(1, 'execute', '\n末尾新增：阅读不应被打断');
+  await expect(output).toContainText('末尾新增');
+  expect(await output.evaluate(el => el.scrollTop)).toBeLessThan(30);
+  await field.getByRole('button', { name: '回到最新', exact: true }).click();
+  await expect.poll(() => output.evaluate(el => el.scrollHeight - el.scrollTop - el.clientHeight)).toBeLessThan(30);
+  await expect(field.getByTestId('aimein-runtime-title')).toBeInViewport();
+  expect((await output.boundingBox())!.height).toBeGreaterThan(45);
+  await page.screenshot({ path: info.outputPath('runtime-execution.png') });
+  await page.waitForTimeout(1800);
+  const reviewing = flowAttempt('reviewing', 6); reviewing.goal = initial.goal;
+  reviewing.callDiagnostics = [activeCall('aimein-review1', 'tools'), activeCall('aimein-review2', 'thinking', 'Model Beta')];
+  f.update(s => { s.loops = [reviewing]; });
+  f.emit(1, 'aimein-review1', '评委一：保存重开已经有验证。');
+  f.emit(1, 'aimein-review2', '评委二：正在核对离线恢复。');
+  await expect(canvas).toHaveAttribute('data-flow-activity', 'review0,review1');
+  await expect(output).toContainText('评委二');
+  await field.getByRole('button', { name: '查看完整输出' }).click();
+  await field.getByRole('navigation', { name: '输出通道' }).getByRole('button', { name: /评委 1/ }).click();
+  await expect(output).toContainText('评委一');
+  f.emit(1, 'aimein-review2', '第二份输出不应混入第一份。');
+  await expect(output).not.toContainText('第二份输出');
+  await expect(field.getByTestId('aimein-review-overview')).toBeVisible();
+  await page.screenshot({ path: info.outputPath('runtime-review.png') });
+  await page.waitForTimeout(1800);
+  const stopped = flowAttempt('repair', 6, 3); stopped.goal = initial.goal;
+  f.update(s => { s.running = false; s.loops = [stopped]; });
+  await expect(field.getByTestId('aimein-runtime-title')).toHaveText('需要处理');
+  await page.waitForTimeout(2800);
+  await expect.poll(() => canvas.getAttribute('data-flow-particles').then(Number)).toBe(0);
+  await main.getByRole('button', { name: '工具 4：评委' }).click();
+  await expect(main.getByTestId('aimein-review-overview')).toContainText('整体意见');
+  await page.screenshot({ path: info.outputPath('runtime-overall-opinion.png') });
+  expect(f.count('loopRunIteration')).toBe(0); expect(f.count('loopAddAddon')).toBe(0);
+  expect(errors).toEqual([]);
+});
+
+test('runtime output preserves history and offline state while assembly is automatic', async ({ page }, info) => {
+  const f = await fixture(page, 'legacy', true);
+  if (info.project.name === 'narrow-mobile-chromium' && await page.locator('.awu-sidebar').isVisible()) await page.getByRole('button', { name: '收起侧栏', exact: true }).click();
+  const main = f.pane.getByTestId('aimein-workbench');
+  const current = flowAttempt('executing'); current.seq = 2;
+  current.callDiagnostics = [activeCall('execute')]; current.stageDetails = { execute: { rawOutput: '重连后保存的执行输出' } };
+  const old = attempt(1); (old as any).stageDetails = { execute: { rawOutput: '旧尝试保存输出' } };
+  f.update(s => { s.running = true; s.loops = [old, current]; });
+  const field = main.getByTestId('aimein-runtime');
+  await expect(field.getByTestId('aimein-live-output')).toContainText('重连后保存的执行输出');
+  await field.getByRole('button', { name: '查看完整输出' }).click();
+  await field.getByLabel('运行记录').selectOption('1');
+  await expect(field.getByTestId('aimein-runtime-title')).toHaveText('历史尝试 #1');
+  f.emit(2, 'execute', '仅当前运行的新输出');
+  await expect(field.getByTestId('aimein-live-output')).not.toContainText('仅当前运行');
+  await expect(main.locator('canvas')).toHaveAttribute('data-flow-activity', '');
+  await field.getByRole('button', { name: '返回现场' }).click();
+  await expect(field.getByTestId('aimein-live-output')).toContainText('仅当前运行');
+  await main.getByRole('button', { name: '工具 2：装配' }).click();
+  const assembly = main.getByRole('region', { name: '阶段装配' });
+  await expect(assembly).toContainText('无需手动装配');
+  await expect(assembly.getByRole('button', { name: '装配槽 T1', exact: true })).toBeVisible();
+  await expect(assembly.getByLabel('装配意图', { exact: true })).toHaveCount(0);
+  await page.screenshot({ path: info.outputPath('automatic-assembly.png') });
+  await main.getByRole('button', { name: '工具 3：成果' }).click();
+  await expect(main.getByRole('region', { name: '成果与验证' })).toContainText('有什么验证依据');
+  await main.getByRole('button', { name: /运行现场/, exact: false }).click();
+  f.disconnect();
+  await expect(field.getByTestId('aimein-runtime-title')).toHaveText('连接中断 · 状态待核对');
+  await expect(main.locator('canvas')).toHaveAttribute('data-flow-activity', '');
+  await expect(field.getByTestId('aimein-live-output')).toContainText('仅当前运行的新输出');
+  expect(f.count('loopAddAddon')).toBe(0); expect(f.count('loopRunIteration')).toBe(0);
+});
+
+
+test('runtime saved output can be read completely in bounded pages', async ({ page }) => {
+  const f = await fixture(page, 'legacy', true);
+  const saved = { ...record(), seq: 1, completed: true, subStage: 'done', orchestration: [], stageDetails: { prepare: { status: 'done', rawOutput: '原文开头' + '甲'.repeat(60000) + '原文末尾' } } };
+  f.update(s => { s.running = false; s.loops = [saved]; });
+  const field = f.pane.getByTestId('aimein-runtime');
+  const output = field.getByTestId('aimein-live-output');
+  await expect(output).toContainText('原文末尾');
+  await expect(output).not.toContainText('原文开头');
+  await output.evaluate(el => { el.scrollTop = 0; });
+  await output.getByRole('button', { name: '分段查看已保存内容' }).click();
+  await expect(output).toContainText('原文开头');
+  await expect(output).not.toContainText('原文末尾');
+  await output.getByRole('button', { name: '下一段' }).click();
+  await expect(output).toContainText('原文末尾');
+  await output.getByRole('button', { name: '上一段' }).click();
+  await expect(output).toContainText('原文开头');
+  expect(f.count('loopRunIteration')).toBe(0);
+});
+
+
+test('overall review exposes conflicting evidence without a majority pass', async ({ page }, info) => {
+  const f = await fixture(page);
+  const r = attempt(1);
+  r.aimeinRun.reviews[2].criteria[0] = { id: 'C1', status: 'gap', reason: '断网重开会丢失未同步内容', evidence: ['tests/offline.test.ts'] };
+  r.aimeinSummary.issues = [{ id: 'C1', model: 'Model Gamma', reason: '断网重开会丢失未同步内容' }];
+  f.update(s => { s.loops = [r]; });
+  const main = f.pane.getByTestId('aimein-workbench');
+  await main.getByRole('button', { name: '工具 4：评委' }).click();
+  const overview = main.getByTestId('aimein-review-overview');
+  await expect(overview).toContainText('本阶段尚未通过');
+  await overview.getByText('有分歧 · 保存后重新打开，内容一致。', { exact: true }).click();
+  await expect(overview).toContainText('Model Alpha');
+  await expect(overview).toContainText('Model Beta');
+  await expect(overview).toContainText('断网重开会丢失未同步内容');
+  await expect(overview).toContainText('tests/offline.test.ts');
+  await main.screenshot({ path: info.outputPath('overall-review.png') });
+  expect(f.count('loopRunIteration')).toBe(0);
+  expect(f.count('loopAddAddon')).toBe(0);
+});

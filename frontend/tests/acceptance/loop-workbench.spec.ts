@@ -82,6 +82,51 @@ async function fixture(page: Page, name = 'idle') {
   };
 }
 
+for (const width of [1366, 390]) test(`OpenSpec preparation has no false binding or range-conflict at ${width}`, async ({ page }, info) => {
+  await page.setViewportSize({ width, height: 900 });
+  const f = await fixture(page);
+  if (width === 390 && await page.locator('.awu-sidebar').isVisible()) await page.getByRole('button', { name: '收起侧栏', exact: true }).click();
+  f.update(state => {
+    state.goal = '基于 @docs/proposals/test-change 使用 OpenSpec 开发';
+    state.taskSource = { status: 'unavailable', revision: 0, code: 'project_required', reason: '旧版：不会自动初始化' };
+    const cause = { causeRef: 'wait:source', causeRevision: 1, round: 1, seq: 1 };
+    state.loops = [{ ...record(), decision: { ...cause, action: 'wait', revision: 0, basisRefs: ['source:0'] } }];
+    state.progressGuard = { ...cause, pause: true, reason: '旧版：不会自动初始化' };
+  });
+  const issue = f.pane.getByRole('region', { name: '需要处理', exact: true });
+  await expect(issue).toContainText('OpenSpec 项目待准备');
+  await expect(issue).not.toContainText('还有 1 个问题');
+  await issue.getByRole('button', { name: '查看处理依据' }).click();
+  const card = f.pane.getByTestId('loop-source-card');
+  await expect(card).toContainText('点击推进会自动准备并衔接方案');
+  await expect(card.getByRole('button', { name: '解除绑定…' })).toHaveCount(0);
+  await expect(card).not.toContainText('正式任务勾选');
+  expect(f.count('loopRunIteration')).toBe(0);
+  expect(f.count('loopTaskSourceDiscover')).toBe(0);
+  await page.getByRole('button', { name: '关闭详情，返回工作台' }).click();
+  f.update(state => {
+    state.running = true; state.taskSource = { status: 'preparing', revision: 0 };
+    state.progressGuard = {}; state.loops[0].decision = {};
+    state.loops[0].stageDetails = { openspecSetup: { status: 'running', message: '正在准备 OpenSpec 项目与方案' } };
+  });
+  await expect(f.pane.getByTestId('loop-openspec-preparation')).toContainText('正在准备 OpenSpec 项目与方案');
+  await expect(f.pane.getByRole('region', { name: '需要处理', exact: true })).toHaveCount(0);
+  await page.screenshot({ path: info.outputPath('openspec-preparation.png'), fullPage: true });
+  f.update(state => {
+    state.running = false;
+    const reason = '准备调用报告：helper_unknown_error: setup refresh had errors';
+    state.taskSource = { status: 'unavailable', revision: 0, code: 'preparation_blocked', reason };
+    state.loops[0].stageDetails.openspecSetup = { status: 'blocked', message: reason };
+  });
+  await expect(issue).toContainText('OpenSpec 准备受阻');
+  await expect(issue).toContainText('helper_unknown_error');
+  await expect(issue).not.toContainText('尚未初始化');
+  await issue.getByRole('button', { name: '查看问题详情' }).click();
+  await expect(f.pane.getByRole('dialog')).toContainText('无需新建 Session');
+  expect(f.count('loopRunIteration')).toBe(0);
+  await page.screenshot({ path: info.outputPath('openspec-preparation-blocked.png'), fullPage: true });
+});
+
 for (const width of [1366, 390]) test(`contract recovery is explicit and one cause stays one card at ${width}`, async ({ page }, info) => {
   await page.setViewportSize({ width, height: width === 390 ? 844 : 900 });
   const f = await fixture(page);

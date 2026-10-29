@@ -1,6 +1,6 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { goalObservation, worldProjection, targetPosition } = require('../../.home-test-dist/utils/aimeinWorld.js');
+const { goalObservation, worldProjection, targetPosition, taskPage, targetRelations } = require('../../.home-test-dist/utils/aimeinWorld.js');
 const { flowProjection, flowTransitions, planWaitingMessage } = require('../../.home-test-dist/utils/aimeinWorld.js');
 
 test('initial planning and delayed detail never fabricate targets, flow or coverage', () => {
@@ -9,7 +9,7 @@ test('initial planning and delayed detail never fabricate targets, flow or cover
     assert.deepEqual(worldProjection(r).targets, []);
     assert.equal(goalObservation(r).known, false);
     const flow = flowProjection(r, true, true);
-    assert.equal(flow.ready, false); assert.equal(flow.live, false);
+    assert.equal(flow.ready, false); assert.equal(flow.live, true);
     assert.deepEqual(flow.activity, []); assert.deepEqual(flow.saved, []);
     assert.equal(flow.verified, 0);
     assert.match(planWaitingMessage(r, true), /正在拆解目标/);
@@ -20,6 +20,21 @@ test('initial planning and delayed detail never fabricate targets, flow or cover
   }
   assert.equal(planWaitingMessage(undefined, false), '');
   assert.equal(planWaitingMessage(record(), false), '');
+});
+
+test('pre-plan traffic requires a real active call and stops on waits, errors and historical selection', () => {
+  const r = { seq: 1, completed: false, orchestration: [], callDiagnostics: [{ stage: 'prepare', status: 'running', phase: 'tools' }] };
+  assert.deepEqual(flowProjection(r, true, true).activity, ['prepare']);
+  r.callDiagnostics[0].stage = 'aimein-plan';
+  assert.deepEqual(flowProjection(r, true, true).activity, ['plan']);
+  for (const phase of ['retry_wait', 'backend_dispatch', 'turn_accepted', 'environment_wait']) {
+    r.callDiagnostics[0].phase = phase; assert.deepEqual(flowProjection(r, true, true).activity, []);
+  }
+  r.callDiagnostics[0].phase = 'thinking';
+  assert.deepEqual(flowProjection(r, false, true).activity, []);
+  assert.deepEqual(flowProjection(r, true, false).activity, []);
+  r.error = 'failed'; assert.deepEqual(flowProjection(r, true, true).activity, []);
+  assert.equal(flowProjection(r, true, true).verified, 0);
 });
 
 function record() {
@@ -41,8 +56,39 @@ test('3D projection waits for actual targets and never infers sprint membership 
   r.aimeinRun.plan.sprint = { criteria: [{ targetId: 'b' }] };
   const view = worldProjection(r);
   assert.deepEqual(view.targets.map(t => [t.id, t.inSprint, t.verified]), [['a', false, true], ['b', true, false]]);
-  assert.deepEqual(targetPosition(0, view.targets, 'split'), targetPosition(0, view.targets, 'cluster'));
+  assert.equal(targetPosition(0, view.targets, 'split')[1], targetPosition(0, view.targets, 'cluster')[1]);
   assert.notDeepEqual(targetPosition(1, view.targets, 'split'), targetPosition(1, view.targets, 'cluster'));
+});
+
+test('task plots stay single-layer, inside their district and separated for every reachable page', () => {
+  for (const count of [0, 1, 8, 12, 20, 40]) {
+    const targets = Array.from({ length: count }, (_, i) => ({ id: `T${i}`, title: `target ${i}`, dependsOn: i ? [`T${i - 1}`] : [], inSprint: i % 3 === 0, verified: false }));
+    const before = JSON.stringify(targets);
+    for (const layout of ['split', 'cluster']) {
+      const reached = [];
+      for (let p = 0; p < taskPage(targets).pages; p++) {
+        const page = taskPage(targets, p);
+        const positions = page.targets.map((t, i) => { reached.push(t.id); return targetPosition(page.start + i, targets, layout); });
+        for (let i = 0; i < positions.length; i++) {
+          const [x, y, z] = positions[i];
+          assert.equal(y, .24);
+          assert.ok(x >= -5.1 && x <= -.7 && z >= -2.1 && z <= 1.3);
+          for (let j = 0; j < i; j++) assert.ok(Math.hypot(x - positions[j][0], z - positions[j][2]) >= 1.14);
+        }
+      }
+      assert.deepEqual(reached, targets.map(t => t.id));
+    }
+    assert.equal(JSON.stringify(targets), before);
+    assert.equal(taskPage(targets, -10).page, 0);
+    assert.equal(taskPage(targets, 1000).page, taskPage(targets).pages - 1);
+  }
+});
+
+test('focused dependencies keep direct cross-page and missing relationships without recursive clutter', () => {
+  const targets = [{ id: 'a', dependsOn: ['missing', 'b'] }, { id: 'b', dependsOn: ['a'] }, { id: 'c', dependsOn: ['b'] }];
+  assert.deepEqual(targetRelations(targets, ''), []);
+  assert.deepEqual(targetRelations(targets, 'a'), [{ from: 'missing', to: 'a', missing: true }, { from: 'b', to: 'a', missing: false }, { from: 'a', to: 'b', missing: false }]);
+  assert.ok(!targetRelations(targets, 'a').some(r => r.to === 'c'));
 });
 
 test('3D layout basis changes with stage or history, not scores or repeated pushes', () => {
@@ -65,6 +111,17 @@ test('goal vessel remains unknown for missing, partial or legacy unversioned evi
   assert.equal(goalObservation(value).known, false);
   value.aimeinRun.reviews[0].status = 'passed'; delete value.aimeinRun.reviews[0].targets[0].fingerprints;
   assert.equal(goalObservation(value).known, false);
+});
+
+test('goal vessel uses frozen reviewer count, preserving three-report semantics of legacy records', () => {
+  for (const count of [1, 2, 3]) {
+    const r = record(); r.aimeinRun.reviewerCount = count; r.aimeinRun.reviews = r.aimeinRun.reviews.slice(0, count);
+    assert.equal(goalObservation(r).fraction, .5);
+    r.aimeinRun.reviews.pop(); assert.equal(goalObservation(r).known, false);
+  }
+  const r = record(); r.aimeinRun.reviews = r.aimeinRun.reviews.slice(0, 1);
+  assert.equal(goalObservation(r).known, false);
+  for (const count of [0, 4, '1', null]) { r.aimeinRun.reviewerCount = count; assert.equal(goalObservation(r).known, false); }
 });
 
 function flowRecord(status = 'preparing') {

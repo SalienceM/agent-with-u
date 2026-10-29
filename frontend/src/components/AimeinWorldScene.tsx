@@ -3,21 +3,23 @@ import { Canvas, useFrame, useThree, type ThreeEvent } from '@react-three/fiber'
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import * as THREE from 'three';
 import type { AimeinAnchor, AimeinReview } from '../types/aimein';
-import { targetPosition, type WorldLayout, type WorldPoint, type worldProjection, type FlowSnapshot } from '../utils/aimeinWorld';
+import { targetPosition, taskPage, targetRelations, type WorldLayout, type WorldPoint, type worldProjection, type FlowSnapshot } from '../utils/aimeinWorld';
 import { AimeinFlowMotion } from './AimeinFlowMotion';
-import { assemblyClosure, playablePosition, type AimeinPlayState } from '../utils/aimeinPlay';
+import type { AimeinPlayState } from '../utils/aimeinPlay';
 
 interface Props {
   projection: ReturnType<typeof worldProjection>; layout: WorldLayout; built: boolean; motion: FlowSnapshot;
-  selected: AimeinAnchor; reviews: AimeinReview[];
+  selected: AimeinAnchor; reviews: AimeinReview[]; reviewerCount: number;
   focus: { anchor: AimeinAnchor | null; serial: number };
   active: boolean; reduced: boolean; lowQuality: boolean;
   onSelect: (anchor: AimeinAnchor) => void; onReady: () => void; onFailure: () => void;
   play?: AimeinPlayState;
+  taskPage: number; targetId: string; hoverId: string;
+  onTarget: (id: string) => void; onHover: (id: string) => void;
 }
 
 const boxGeometry = new THREE.BoxGeometry(1, 1, 1);
-const palette = ['#325b50', '#376355', '#3e6a59', '#456f5c'];
+const palette = ['#34564f', '#365950', '#385b52', '#35584f'];
 const materials = new Map<string, THREE.MeshStandardMaterial>();
 function material(color: string) {
   if (!materials.has(color)) materials.set(color, new THREE.MeshStandardMaterial({ color, roughness: .82, metalness: .06 }));
@@ -49,33 +51,32 @@ const Move: React.FC<{ to: WorldPoint; active: boolean; reduced: boolean; arc?: 
   return <group ref={group} position={initial.current}>{children}</group>;
 };
 
-const Label: React.FC<{ text: string; at: WorldPoint; color?: string; width?: number }> = ({ text, at, color = '#dbeddf', width = Math.max(1.3, Math.min(2.8, text.length * .29)) }) => {
-  const textureWidth = Math.max(144, Math.min(576, text.length * 44 + 48));
+const Label: React.FC<{ text: string; at: WorldPoint; color?: string; width?: number; subtle?: boolean }> = ({ text, at, color = '#dbeddf', width = Math.max(1.45, Math.min(2.5, text.length * .3)), subtle = false }) => {
+  const textureWidth = Math.max(96, Math.min(576, text.length * 36 + 24));
   const texture = useMemo(() => {
     const canvas = document.createElement('canvas'); canvas.width = textureWidth; canvas.height = 96;
     const ctx = canvas.getContext('2d')!;
-    ctx.fillStyle = '#102c2be6'; ctx.beginPath(); ctx.roundRect(3, 3, textureWidth - 6, 90, 14); ctx.fill();
-    ctx.strokeStyle = '#739b82'; ctx.lineWidth = 2; ctx.stroke();
+    if (!subtle) { ctx.fillStyle = '#102825b8'; ctx.beginPath(); ctx.roundRect(3, 3, textureWidth - 6, 90, 14); ctx.fill(); }
     ctx.fillStyle = color; ctx.font = '500 40px "Microsoft YaHei", sans-serif'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
     ctx.fillText(text.slice(0, 18), textureWidth / 2, 48, textureWidth - 28);
     const result = new THREE.CanvasTexture(canvas); result.colorSpace = THREE.SRGBColorSpace; return result;
-  }, [text, color]);
+  }, [text, color, subtle]);
   useEffect(() => () => texture.dispose(), [texture]);
-  return <sprite raycast={() => null} position={at} scale={[width, width * 96 / textureWidth, 1]}><spriteMaterial map={texture} transparent depthTest={false} /></sprite>;
+  return <sprite raycast={() => null} position={at} scale={[width, width * 96 / textureWidth, 1]}><spriteMaterial map={texture} transparent depthWrite={false} /></sprite>;
 };
 
 const Ring: React.FC<{ radius: number; color: string }> = ({ radius, color }) => <mesh rotation={[-Math.PI / 2, 0, 0]} position={[0, .065, 0]}>
   <ringGeometry args={[radius, radius + .055, 40]} /><meshBasicMaterial color={color} transparent opacity={.8} side={THREE.DoubleSide} />
 </mesh>;
 
-const ObjectSite: React.FC<{ name: string; at: WorldPoint; selected: boolean; onClick: () => void; children: React.ReactNode; radius?: number }> = ({ name, at, selected, onClick, children, radius = .8 }) => {
+const ObjectSite: React.FC<{ name: string; at: WorldPoint; selected: boolean; onClick: () => void; children: React.ReactNode; radius?: number; quiet?: boolean }> = ({ name, at, selected, onClick, children, radius = .8, quiet = false }) => {
   const [hover, setHover] = useState(false);
   const { gl } = useThree();
   const click = (e: ThreeEvent<MouseEvent>) => { if (e.delta > 6) return; e.stopPropagation(); onClick(); };
   return <group position={at} onClick={click} onPointerOver={e => { e.stopPropagation(); setHover(true); gl.domElement.style.cursor = 'pointer'; }} onPointerOut={() => { setHover(false); gl.domElement.style.cursor = 'grab'; }}>
     {children}
     {(selected || hover) && <Ring radius={radius} color={selected ? '#e8d79b' : '#8fdcc2'} />}
-    <Label text={name} at={[0, -.04, radius + .32]} color={selected ? '#f5e2ae' : '#c5dfce'} />
+    {(!quiet || selected || hover) && <Label text={name} at={[0, .12, radius + .22]} color={selected ? '#f5e2ae' : '#c5dfce'} subtle={!selected && !hover} width={quiet ? .55 : undefined} />}
   </group>;
 };
 
@@ -85,7 +86,7 @@ function Ground() {
     const transform = new THREE.Object3D();
     for (let i = 0; i < 108; i++) {
       transform.position.set(i % 12 - 5.5, .01, Math.floor(i / 12) - 4);
-      transform.scale.set(.96, .045, .96); transform.updateMatrix();
+      transform.scale.set(.99, .035, .99); transform.updateMatrix();
       tiles.current.setMatrixAt(i, transform.matrix); tiles.current.setColorAt(i, new THREE.Color(palette[(i * 7 + Math.floor(i / 12)) % palette.length]));
     }
     tiles.current.instanceMatrix.needsUpdate = true;
@@ -93,14 +94,15 @@ function Ground() {
   }, []);
   return <>
     <Box at={[0, -.48, 0]} size={[12.5, .9, 9.5]} color="#203e38" />
-    <Box at={[0, -.08, 0]} size={[12.7, .16, 9.7]} color="#6b9270" />
+    <Box at={[0, -.08, 0]} size={[12.7, .16, 9.7]} color="#537768" />
     <Box at={[0, -.94, 0]} size={[11.7, .13, 8.8]} color="#193434" />
     <instancedMesh ref={tiles} args={[boxGeometry, material('#ffffff'), 108]} dispose={null} />
     <Box at={[.3, .06, 2.45]} size={[8.6, .05, .34]} color="#adac7b" />
     <Box at={[1.7, .06, .7]} size={[.34, .05, 3.8]} color="#adac7b" />
-    <Box at={[-2.6, .08, -.8]} size={[5.8, .12, 4.8]} color="#264e48" />
+    <Box at={[-2.9, .055, -.45]} size={[5.25, .06, 4.45]} color="#294c46" />
+    <Box at={[-2.9, .09, 1.87]} size={[4.65, .025, .045]} color="#648677" />
     <mesh position={[0, -1.1, 0]} rotation={[-Math.PI / 2, 0, 0]}><circleGeometry args={[9, 48]} /><meshBasicMaterial color="#08191f" transparent opacity={.18} /></mesh>
-    {[[-5.5, -3.7], [-5.6, 2.8], [5.5, 3.7], [5.6, -.9], [.1, -4]].map(([x, z], i) => <group key={i} position={[x, 0, z]}>
+    {[[-5.7, -4], [5.5, 3.7], [5.6, -1]].map(([x, z], i) => <group key={i} position={[x, 0, z]}>
       <Box at={[0, .44, 0]} size={[.15, .8, .15]} color="#af9867" />
       <Box at={[0, 1.0, 0]} size={[.65, .65, .65]} color={i % 2 ? '#9fba79' : '#78a17a'} />
       <Box at={[0, 1.4, 0]} size={[.4, .4, .4]} color="#a3bd82" />
@@ -158,7 +160,7 @@ function CameraRig({ focus, active, reduced, reviews, onReady, onFailure }: Pick
     return () => { controls.removeEventListener('change', change); controls.removeEventListener('start', start); controls.dispose(); orbit.current = undefined; gl.domElement.removeEventListener('webglcontextlost', lost); };
   }, [camera, gl, invalidate]);
   useEffect(() => {
-    const scale = Math.max(1, Math.min(size.width / 19, size.height / 12));
+    const scale = Math.max(1, Math.min(size.width / 19, size.height / 11));
     // 面板开合只调整取景比例，保留用户环视的位置和焦点。
     if (viewScale.current) { camera.zoom *= scale / viewScale.current; motion.current.zoom *= scale / viewScale.current; }
     viewScale.current = scale;
@@ -170,8 +172,8 @@ function CameraRig({ focus, active, reduced, reviews, onReady, onFailure }: Pick
     const key = focus.anchor?.kind === 'review' ? `review${Math.max(0, reviews.findIndex(r => r.id === focus.anchor?.reviewId)) + 1}` : focus.anchor?.kind;
     motion.current.target.set(...(key ? positions[key] || positions.review1 : [0, .5, 0] as WorldPoint));
     motion.current.position.set(12, 10.5, 15).add(motion.current.target);
-    motion.current.zoom = Math.min(size.width / 19, size.height / 12) * (key ? 1.24 : 1);
-    if (orbit.current) { orbit.current.minZoom = Math.min(size.width / 19, size.height / 12) * .8; orbit.current.maxZoom = Math.min(size.width / 19, size.height / 12) * 1.9; }
+    motion.current.zoom = Math.min(size.width / 19, size.height / 11) * (key ? 1.24 : 1);
+    if (orbit.current) { orbit.current.minZoom = Math.min(size.width / 19, size.height / 11) * .8; orbit.current.maxZoom = Math.min(size.width / 19, size.height / 11) * 1.9; }
     motion.current.t = 0; stopped.current = false; invalidate();
   }, [focus.serial, invalidate]);
   useFrame((_, delta) => {
@@ -197,51 +199,65 @@ function World(props: Props) {
   const choose = (kind: AimeinAnchor['kind'], reviewId?: string) => onSelect({ kind, reviewId, seq: projection.seq });
   const targets = projection.targets;
   const { play } = props;
-  const positions = targets.map((_, i) => playablePosition(i, targets, play?.assembled || [], play?.targetId || '', targetPosition(i, targets, layout)));
-  const highlighted = assemblyClosure(targets, play?.targetId ? [play.targetId] : []).ids;
-  const lineGeometry = useMemo(() => {
-    const points: THREE.Vector3[] = [];
-    targets.forEach((t, i) => t.dependsOn.forEach(id => {
-      const j = targets.findIndex(v => v.id === id);
-      if (j >= 0) points.push(new THREE.Vector3(...positions[i]), new THREE.Vector3(...positions[j]));
-    }));
-    return new THREE.BufferGeometry().setFromPoints(points);
-  }, [projection.basis, layout, play?.targetId, play?.assembled.join(',')]);
-  useEffect(() => () => lineGeometry.dispose(), [lineGeometry]);
-  const highlightedGeometry = useMemo(() => {
-    const points: THREE.Vector3[] = [];
-    targets.forEach((t, i) => { if (highlighted.includes(t.id)) t.dependsOn.forEach(id => {
-      const j = targets.findIndex(v => v.id === id); if (j < 0) return;
-      const from = new THREE.Vector3(...positions[i]); const to = new THREE.Vector3(...positions[j]);
-      const middle = from.clone().lerp(to, .5); middle.y += .65;
-      const samples = new THREE.QuadraticBezierCurve3(from, middle, to).getPoints(18);
-      samples.slice(1).forEach((p, n) => points.push(samples[n], p));
-    }); });
-    return new THREE.BufferGeometry().setFromPoints(points);
-  }, [projection.basis, layout, play?.targetId, play?.assembled.join(',')]);
-  useEffect(() => () => highlightedGeometry.dispose(), [highlightedGeometry]);
-  useEffect(() => { gl.domElement.dataset.heldTarget = play?.targetId || ''; gl.domElement.dataset.assembled = (play?.assembled || []).join(','); }, [play?.targetId, play?.assembled.join(','), gl]);
+  const page = taskPage(targets, props.taskPage);
+  const positions = targets.map((_, i) => targetPosition(i, targets, layout));
+  const focused = props.hoverId || props.targetId;
+  const relations = targetRelations(targets, focused);
+  const visible = new Set(page.targets.map(t => t.id));
+  const related = new Set(relations.flatMap(r => [r.from, r.to]));
+  const connections = useMemo(() => relations.filter(r => !r.missing && visible.has(r.from) && visible.has(r.to) && r.from !== r.to).map(r => {
+    const from = new THREE.Vector3(...positions[targets.findIndex(t => t.id === r.from)]);
+    const to = new THREE.Vector3(...positions[targets.findIndex(t => t.id === r.to)]);
+    from.y += .14; to.y += .14;
+    const middle = from.clone().lerp(to, .5); middle.y += .35;
+    const curve = new THREE.QuadraticBezierCurve3(from, middle, to);
+    const samples = curve.getPoints(24);
+    const direction = curve.getTangent(.72).normalize();
+    const tip = curve.getPoint(.72);
+    const sideways = new THREE.Vector3(-direction.z, 0, direction.x).normalize().multiplyScalar(.065);
+    const back = tip.clone().addScaledVector(direction, -.14);
+    const points = samples.slice(1).flatMap((v, i) => [samples[i], v]);
+    points.push(back.clone().add(sideways), tip, tip, back.clone().sub(sideways));
+    return { ...r, geometry: new THREE.BufferGeometry().setFromPoints(points) };
+  }), [projection.basis, layout, focused, page.page]);
+  useEffect(() => () => connections.forEach(c => c.geometry.dispose()), [connections]);
+  useEffect(() => {
+    gl.domElement.dataset.heldTarget = props.targetId;
+    gl.domElement.dataset.assembled = (play?.assembled || []).join(',');
+    gl.domElement.dataset.taskIds = page.targets.map(t => t.id).join(',');
+    gl.domElement.dataset.taskPositions = JSON.stringify(page.targets.map((t, i) => ({ id: t.id, at: positions[page.start + i] })));
+    gl.domElement.dataset.taskEdges = String(connections.length);
+    gl.domElement.dataset.reviewerCount = String(props.reviewerCount);
+  }, [props.targetId, props.reviewerCount, play?.assembled.join(','), projection.basis, page.page, layout, connections.length, gl]);
   return <>
     <ambientLight intensity={1.4} color="#b6d2db" /><directionalLight position={[5, 12, 8]} intensity={2.4} color="#ffebc5" /><directionalLight position={[-7, 6, -4]} intensity={1.2} color="#8dc8c2" />
     <CameraRig {...props} />
     <Ground />
-    <AimeinFlowMotion snapshot={props.motion} active={active} reduced={reduced} lowQuality={props.lowQuality} preferTargets={play?.tool === 'inspect' || play?.tool === 'assemble'} onSelect={onSelect} />
-    <lineSegments geometry={lineGeometry}><lineBasicMaterial color="#add4bd" transparent opacity={.28} /></lineSegments>
-    <lineSegments geometry={highlightedGeometry}><lineBasicMaterial color="#ecda94" transparent opacity={.9} /></lineSegments>
-    {play?.tool === 'assemble' && <group><Box at={[-3.2, .15, .35]} size={[3.75, .16, 3.1]} color="#4b6957" /><Label text="装配台 · 下次建设意图" at={[-3.2, .35, 2.1]} width={3} /></group>}
+    <AimeinFlowMotion snapshot={props.motion} reviewerCount={props.reviewerCount} active={active} reduced={reduced} lowQuality={props.lowQuality} preferTargets={play?.tool === 'inspect' || play?.tool === 'assemble'} onSelect={onSelect} />
+    {connections.map(c => <lineSegments key={`${c.from}:${c.to}`} geometry={c.geometry} raycast={() => null}><lineBasicMaterial color={c.to === focused ? '#dfc68c' : '#86bdb5'} transparent opacity={.8} /></lineSegments>)}
     <group>
-      {targets.map((target, i) => <Move key={`${projection.seq}:${target.id}`} to={positions[i]} active={active} reduced={reduced} arc={.8}>
-        <group userData={{ aimeinTarget: true }} onClick={e => { if (e.delta > 6) return; e.stopPropagation(); if (play) play.onTarget(target.id); else choose('flow'); }} onPointerOver={e => { e.stopPropagation(); gl.domElement.style.cursor = 'pointer'; }} onPointerOut={() => { gl.domElement.style.cursor = 'grab'; }}>
-        <Box size={[.56, .53, .56]} color={play?.targetId === target.id ? '#e1ce8c' : play?.assembled.includes(target.id) ? '#96bfa8' : target.verified ? '#a3d7a8' : target.inSprint ? '#cbb785' : '#709e9a'} />
-        <Box at={[0, .29, 0]} size={[.46, .055, .46]} color={target.verified ? '#d1e9ad' : '#e2d4a6'} />
-        <Box at={[.07, -.05, .29]} size={[.18, .18, .015]} color="#325c50" />
-        {(layout === 'split' || !target.inSprint || play?.targetId === target.id) && <Label text={play?.targetId === target.id ? `${target.id} · ${target.title}` : target.id} at={[0, .63, 0]} width={play?.targetId === target.id ? 2.7 : .72} />}
-        {play?.targetId === target.id && <Ring radius={.43} color="#f5dfa2" />}
-        </group>
-      </Move>)}
-      {layout === 'cluster' && projection.scoped && <Label text={`本阶段 · ${targets.filter(t => t.inSprint).length} 个子目标`} at={[-3, 2.15, .1]} width={2.7} />}
+      {page.targets.map((target, i) => {
+        const selectedTask = focused === target.id;
+        const assembly = play?.assembled.includes(target.id);
+        const color = selectedTask ? '#dfce9d' : target.verified ? '#9ebf9d' : target.inSprint ? '#b6ac89' : '#6f9490';
+        const index = page.start + i;
+        return <Move key={`${projection.seq}:${target.id}`} to={positions[index]} active={active} reduced={reduced} arc={.12}>
+          <group userData={{ aimeinTarget: true }} onClick={e => { if (e.delta > 6) return; e.stopPropagation(); props.onTarget(target.id); }}
+            onPointerOver={e => { e.stopPropagation(); props.onHover(target.id); gl.domElement.style.cursor = 'pointer'; }}
+            onPointerOut={() => { props.onHover(''); gl.domElement.style.cursor = 'grab'; }}>
+            <Box at={[0, -.08, 0]} size={[.88, .12, .86]} color={selectedTask ? '#a69c76' : related.has(target.id) ? '#607e6b' : '#41655a'} />
+            <Box at={[0, -.005, 0]} size={[.8, .045, .78]} color={selectedTask ? '#d5c59c' : '#527367'} />
+            <Box at={[-.12, .13, -.1]} size={[.36, .24, .37]} color={color} />
+            <Box at={[-.12, .27, -.1]} size={[.43, .055, .43]} color={target.verified ? '#c2d4ab' : target.inSprint ? '#dbcea4' : '#92b4ad'} />
+            <Box at={[.21, .07, -.12]} size={[.12, .12, .26]} color={color} />
+            <Box at={[0, .035, .29]} size={[.54, .025, .035]} color={assembly ? '#e4d3a2' : target.verified ? '#b4dab6' : '#34544d'} />
+            <Label text={target.id.length > 7 ? `${index + 1}` : target.id} at={[0, .12, .42]} width={.66} subtle color={selectedTask ? '#fff1ca' : '#c7d9cb'} />
+            {selectedTask && <Ring radius={.5} color="#e8d69e" />}
+          </group>
+        </Move>;
+      })}
     </group>
-    {play?.footprints.map((footprint, i) => <ObjectSite key={footprint.seq} name={`#${footprint.seq}`} at={[-5.1 + i * .88, 0, 4.2]} radius={.27} selected={projection.seq === footprint.seq} onClick={() => play.onHistory(footprint.seq)}>
+    {play?.footprints.map((footprint, i) => <ObjectSite key={footprint.seq} name={`#${footprint.seq}`} quiet at={[-5.1 + i * .88, 0, 4.2]} radius={.27} selected={projection.seq === footprint.seq} onClick={() => play.onHistory(footprint.seq)}>
       <Box at={[0, .15, 0]} size={[.55, .2, .45]} color="#557565" />
       <Box at={[0, .3 + Math.min(footprint.saved ?? 0, 6) * .035, 0]} size={[.33, .13 + Math.min(footprint.saved ?? 0, 6) * .07, .3]} color={footprint.accepted ? '#b9d997' : footprint.saved ? '#c3ac79' : '#638d87'} />
     </ObjectSite>)}
@@ -249,7 +265,7 @@ function World(props: Props) {
       <Box at={[0, .2, 0]} size={[2.4, .3, .85]} color="#7d9f7e" />
       {[0, 1, 2].map(i => <group key={i} position={[-.75 + i * .75, .3, 0]}><Box at={[0, props.built ? .52 : .2, 0]} size={[.62, props.built ? 1.04 : .4, .65]} color="#c1b47f" /><Box at={[0, props.built ? 1.08 : .45, 0]} size={[.72, .13, .75]} color="#e0d29c" /><Box at={[0, .4, .34]} size={[.24, .25, .03]} color="#f1dda4" /></group>)}
     </ObjectSite>
-    <ObjectSite name="目标瓶 / 共同核实" at={[1.5, 0, -1.35]} selected={selected.kind === 'goal'} radius={1.25} onClick={() => choose('goal')}>
+    <ObjectSite name="目标瓶" at={[1.5, 0, -1.35]} selected={selected.kind === 'goal'} radius={1.25} onClick={() => choose('goal')}>
       <Vessel fraction={projection.observation.fraction} active={active} reduced={reduced} />
       <Label text={projection.observation.known ? `${projection.observation.verified} / ${projection.observation.total}` : '待核实'} at={[0, 2.05, 0]} width={1.5} />
     </ObjectSite>
@@ -261,10 +277,10 @@ function World(props: Props) {
       <Box at={[0, .2, 0]} size={[1.65, .25, .9]} color="#b59b70" />
       {[0, 1, 2].map(i => <Box key={i} at={[-.48 + i * .47, .65, 0]} size={[.32, .65 + i * .12, .48]} color={['#a3bf91', '#7aa4a1', '#c4b585'][i]} />)}
     </ObjectSite>
-    {[0, 1, 2].map(i => {
+    {Array.from({ length: props.reviewerCount }, (_, i) => {
       const review = reviews[i]; const id = review?.id || `review${i + 1}`;
       const color = review?.status === 'passed' ? '#a6d3a0' : review?.status === 'changes_requested' ? '#d7b172' : review?.status === 'error' ? '#cc8e80' : '#87aaa6';
-      return <ObjectSite key={id} name={review?.profileName || `评委 ${i + 1}`} at={[-1.5 + i * 2.15, 0, 3.5]} radius={.73} selected={selected.kind === 'review' && selected.reviewId === id} onClick={() => choose('review', id)}>
+      return <ObjectSite key={id} name={`评委 ${i + 1}`} at={[-1.5 + i * 2.15, 0, 3.5]} radius={.73} selected={selected.kind === 'review' && selected.reviewId === id} onClick={() => choose('review', id)}>
         <Box at={[0, .1, 0]} size={[1.15, .18, .9]} color="#6c9279" />
         <Move to={[0, selected.kind === 'review' && selected.reviewId === id ? .16 : 0, 0]} active={active} reduced={reduced}>
           <Box at={[0, .66, 0]} size={[.55, .62, .37]} color={color} />

@@ -15,6 +15,7 @@ function hasTargetHit(hits: THREE.Intersection[]) {
 
 interface Props {
   snapshot: FlowSnapshot; active: boolean; reduced: boolean; lowQuality: boolean;
+  reviewerCount: number;
   preferTargets?: boolean;
   onSelect: (anchor: AimeinAnchor) => void;
 }
@@ -23,6 +24,8 @@ interface Route {
 }
 // 路径只是对象间的工作流示意；没有步骤/目标映射时不制造目标级进度。
 const routes: Route[] = [
+  { id: 'prepare', color: '#8ebfff', kind: 'infra', points: [[4.2, 1.3, .4], [4, 2, -3.5], [-.6, 2.5, -4.6], [-3.5, 1.25, -3.45]] },
+  { id: 'plan', color: '#b8e9a0', kind: 'goal', points: [[1.5, 3.35, -1.35], [-.6, 4.2, -2], [-3.4, 3.2, -2.6], [-3.5, 1.25, -3.45]] },
   { id: 'build', color: '#6efde2', kind: 'flow', points: [[-2.4, .6, .9], [-4.1, .65, .4], [-4.85, .8, -1.5], [-3.5, 1.25, -3.45]] },
   { id: 'infra', color: '#8ebfff', kind: 'infra', points: [[-3.5, 1.25, -3.45], [-1.3, .7, -4.4], [3, .65, -3.8], [4.2, 1.3, .4]] },
   { id: 'store', color: '#ffdb8a', kind: 'artifact', points: [[-3.5, 1.25, -3.45], [-5.7, .8, -2.2], [-5.65, .7, 1.7], [-4.3, 1.15, 3.3]] },
@@ -35,7 +38,7 @@ const routes: Route[] = [
 const PARTICLES = 64;
 const CAPACITY = routes.length * PARTICLES;
 
-export function AimeinFlowMotion({ snapshot, active, reduced, lowQuality, preferTargets = false, onSelect }: Props) {
+export function AimeinFlowMotion({ snapshot, active, reduced, lowQuality, reviewerCount, preferTargets = false, onSelect }: Props) {
   const { invalidate, gl } = useThree();
   const moving = active && !reduced;
   const previous = useRef<{ snapshot: FlowSnapshot; enabled: boolean }>();
@@ -51,17 +54,19 @@ export function AimeinFlowMotion({ snapshot, active, reduced, lowQuality, prefer
   const settling = useRef(new Map<number, number>());
   const scratch = useMemo(() => ({ object: new THREE.Object3D(), point: new THREE.Vector3(), tangent: new THREE.Vector3(),
     axis: new THREE.Vector3(0, 1, 0), color: new THREE.Color() }), []);
-  const paths = useMemo(() => routes.map(route => {
-    const curve = new THREE.CatmullRomCurve3(route.points.map(p => new THREE.Vector3(...p)), false, 'centripetal');
+  const paths = useMemo(() => routes.filter(route => !/^(review|verify)/.test(route.id) || Number(route.id.slice(-1)) < reviewerCount).map(route => {
+    const points = route.id === 'repair' && reviewerCount === 1 ? [[-1.5, 1.65, 3.5] as WorldPoint, ...route.points.slice(1)] : route.points;
+    const curve = new THREE.CatmullRomCurve3(points.map(p => new THREE.Vector3(...p)), false, 'centripetal');
     return { ...route, colorValue: new THREE.Color(route.color), curve,
       rail: new THREE.TubeGeometry(curve, 64, .006, 4, false),
       energy: new THREE.TubeGeometry(curve, 64, .009, 5, false),
       hit: new THREE.TubeGeometry(curve, 64, .085, 4, false),
       samples: curve.getSpacedPoints(256) };
-  }), []);
+  }), [reviewerCount]);
   useEffect(() => () => paths.forEach(p => { p.rail.dispose(); p.energy.dispose(); p.hit.dispose(); }), [paths]);
   useEffect(() => {
     const prior = previous.current;
+    gl.domElement.dataset.flowActivity = moving ? snapshot.activity.join(',') : '';
     // 紧凑推送使详情短暂失效时保留同身份基线，等新详情到达再比较。
     // 隐藏、历史和身份切换仍立即取消，不能借此补播旧事件。
     if (!snapshot.ready && prior?.snapshot.identity === snapshot.identity && prior.enabled === moving && prior.snapshot.latest === snapshot.latest) {
@@ -176,7 +181,7 @@ export function AimeinFlowMotion({ snapshot, active, reduced, lowQuality, prefer
   });
   return <group>
     {paths.map((path, i) => <group key={path.id}>
-      <mesh geometry={path.rail}><meshBasicMaterial color={path.color} transparent opacity={.16} depthWrite={false} /></mesh>
+      <mesh geometry={path.rail}><meshBasicMaterial color={path.color} transparent opacity={snapshot.activity.includes(path.id) ? .16 : .035} depthWrite={false} /></mesh>
       <mesh geometry={path.energy}><meshBasicMaterial ref={material => { currents.current[i] = material; }} color={path.color} transparent opacity={0} blending={THREE.AdditiveBlending} depthWrite={false} toneMapped={false} /></mesh>
       <mesh geometry={path.hit} raycast={path.id.startsWith('verify') && !snapshot.known || path.id === 'repair' && snapshot.status !== 'repair' ? () => null : THREE.Mesh.prototype.raycast}
         onPointerOver={e => { if (preferTargets && hasTargetHit(e.intersections)) return; e.stopPropagation(); gl.domElement.style.cursor = 'pointer'; }} onPointerOut={() => { gl.domElement.style.cursor = 'grab'; }}

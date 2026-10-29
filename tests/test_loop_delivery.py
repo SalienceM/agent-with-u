@@ -48,6 +48,14 @@ class DeliveryTests(unittest.TestCase):
         self.assertNotIn('当前只负责只读核实并产出计划', text)
         self.assertIn('不自动豁免历史损失或验收', text)
 
+    def test_prepare_write_role_does_not_forbid_its_own_authorized_preparation(self):
+        text = call_scope_constraints('prepare', 'workspace-write', native_codex=True)
+        self.assertIn('项目准备', text)
+        self.assertIn('请求原生沙箱 workspace-write', text)
+        self.assertIn('本次完成准备', text)
+        self.assertNotIn('当前只负责只读核实', text)
+        self.assertIn('这不授权业务实现', text)
+
     def test_completion_requires_evidence_scope_verify_and_no_blockers(self):
         self.assertTrue(completion_ready(report('verified')))
         for candidate in [report('pending'), report('implemented'), report('verified', scopeComplete=False),

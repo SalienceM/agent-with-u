@@ -387,19 +387,20 @@ export const LoopPolicyEditor: React.FC<{
 
 export function aimeinReviewerIssue(policy: LoopPolicy, backends: any[]): string {
   const reviewers = policy.aimeinReviewers || [];
-  if (reviewers.length !== 3) return '请选择三个不同模型；每位评审都会开启独立会话。';
+  if (reviewers.length < 1 || reviewers.length > 3) return '请选择 1–3 位评委；每位评审都会开启独立会话。';
   const models = reviewers.map(r => r.model.trim() || backends.find(b => b.id === r.backendId)?.model || '');
   if (reviewers.some(r => !backends.some(b => b.id === r.backendId && b.enabled !== false && !isPoeBackend(b))) || models.some(m => !m)) return '请为每位评审选择可用连接和明确的模型。';
-  if (new Set(models.map(m => m.toLocaleLowerCase())).size !== 3) return '三个评审需要不同模型；更换账号或推理档位不算不同模型。';
+  if (new Set(models.map(m => m.toLocaleLowerCase())).size !== reviewers.length) return '启用的评委需要不同模型；更换账号或推理档位不算不同模型。';
   return '';
 }
 
 const AimeinReviewers: React.FC<{ value: LoopPolicy; onChange: (patch: Partial<LoopPolicy>) => void; backends: any[]; sessionId?: string; execKey?: string }> = ({ value, onChange, backends, sessionId, execKey }) => {
-  const reviewers = Array.from({ length: 3 }, (_, i) => value.aimeinReviewers?.[i] || { backendId: '', model: '' });
+  const reviewers = Array.from({ length: value.aimeinReviewers?.length || 3 }, (_, i) => value.aimeinReviewers?.[i] || { backendId: '', model: '' });
   const issue = aimeinReviewerIssue(value, backends);
-  return <section aria-label="AIMEIN 三模型评审" style={{ padding: 12, border: '1px solid var(--theme-accent)', borderRadius: 10 }}>
-    <strong>三模型独立评审</strong>
-    <p style={{ fontSize: 12, lineHeight: 1.6 }}>三位都通过才推进阶段。每次评审使用新会话和同一份成果；成熟度只针对当前 Sprint 的范围。</p>
+  return <section aria-label="AIMEIN 独立评审" style={{ padding: 12, border: '1px solid var(--theme-accent)', borderRadius: 10 }}>
+    <strong>评审组</strong>
+    <div role="group" aria-label="评委人数" style={{ display: 'flex', gap: 6, margin: '10px 0' }}>{[1, 2, 3].map(count => <button key={count} type="button" aria-pressed={reviewers.length === count} onClick={() => onChange({ aimeinReviewers: Array.from({ length: count }, (_, i) => reviewers[i] || { backendId: '', model: '' }) })} style={{ ...inputBase, cursor: 'pointer', padding: '6px 14px', borderColor: reviewers.length === count ? 'var(--theme-accent)' : 'var(--theme-border)' }}>{count} 位</button>)}</div>
+    <p style={{ fontSize: 12, lineHeight: 1.6 }}>{reviewers.length === 1 ? '一位独立把关，评审视角更集中。' : '不同模型提供互补视角。'}全部启用评委通过才推进；每位使用新会话和同一份成果。人数在下一次尝试冻结。</p>
     {reviewers.map((reviewer, i) => {
       const backend = backends.find(b => b.id === reviewer.backendId);
       const update = (patch: Partial<typeof reviewer>) => onChange({ aimeinReviewers: reviewers.map((r, n) => n === i ? { ...r, ...patch } : r) });
@@ -415,7 +416,7 @@ const AimeinReviewers: React.FC<{ value: LoopPolicy; onChange: (patch: Partial<L
           : backend && <div style={{ fontSize: 12 }}>模型：{backend.model || '此连接未配置模型，请先在模型设置中补齐'}</div>}
       </div>;
     })}
-    <div role="status" style={{ fontSize: 12, color: issue ? 'var(--theme-warning, #bf8700)' : 'var(--theme-text-muted)' }}>{issue || '三个不同模型已配置，运行时会再次核对。'}</div>
+    <div role="status" style={{ fontSize: 12, color: issue ? 'var(--theme-warning, #bf8700)' : 'var(--theme-text-muted)' }}>{issue || `${reviewers.length} 位评委已配置，运行时会再次核对。`}</div>
   </section>;
 };
 

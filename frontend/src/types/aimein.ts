@@ -8,6 +8,7 @@ export interface AimeinReview {
   targets?: Array<{ id: string; status: string; reason: string; evidence: string[]; fingerprints?: Record<string, string> }>;
 }
 export interface AimeinSummary {
+  reviewerCount?: number;
   revision: string; sprintId: string; sprintNumber: number; attempt: number; status: string;
   accepted: boolean; complete: boolean; message?: string; scopeChanged?: boolean; noProgress?: number;
   title: string; outcome: string; maturityTarget?: number; maturityMeaning: string;
@@ -17,11 +18,18 @@ export interface AimeinSummary {
   artifact?: { digest?: string; files?: number; coverage?: string };
 }
 export interface AimeinRun {
+  reviewerCount?: number;
   goal?: string;
   reviews?: AimeinReview[];
   // 首次规划会发布 plan: {}；详情也可能尚未加载，不能假定目标与 Sprint 已生成。
   plan?: { targets?: Array<{ id: string; title: string; acceptance: string; dependsOn: string[] }>;
     sprint?: { deferred?: string[]; criteria?: Array<{ id: string; targetId: string; lane: string }> } };
+}
+
+/** 无字段的历史记录固定为三位；非法元数据不能变成单人通过。 */
+export function expectedReviewers(value?: { reviewerCount?: number }): number {
+  const count = value?.reviewerCount;
+  return count === undefined ? 3 : Number.isInteger(count) && count >= 1 && count <= 3 ? count : 0;
 }
 
 export interface AimeinDocument {

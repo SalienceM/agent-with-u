@@ -1,5 +1,4 @@
 import type { AimeinRun } from '../types/aimein';
-import type { WorldPoint, WorldTarget } from './aimeinWorld';
 
 export type AimeinTool = 'inspect' | 'assemble' | 'probe' | 'reviewers';
 export type BuildTarget = NonNullable<NonNullable<AimeinRun['plan']>['targets']>[number];
@@ -7,6 +6,7 @@ export interface WorldFootprint { seq: number; title: string; accepted: boolean;
 export interface AimeinPlayState {
   tool: AimeinTool; targetId: string; assembled: string[]; roots: string[];
   onTool: (tool: AimeinTool) => void; onTarget: (id: string) => void;
+  onInspectTarget?: (id: string) => void;
   footprints: WorldFootprint[]; onHistory: (seq: number) => void;
   launch?: { label: string; disabled: boolean; reason: string; onClick: () => void };
 }
@@ -27,17 +27,6 @@ export function assemblyClosure(targets: Pick<BuildTarget, 'id' | 'dependsOn'>[]
   };
   roots.forEach(visit);
   return { ids, errors: [...errors] };
-}
-
-export function assemblyPosition(index: number): WorldPoint {
-  return [-4.6 + index % 5 * .7, .85 + Math.floor(index / 20) * .65, -.7 + Math.floor(index % 20 / 5) * .7];
-}
-
-export function playablePosition(index: number, targets: WorldTarget[], assembled: string[], focused: string, fallback: WorldPoint): WorldPoint {
-  const rank = assembled.indexOf(targets[index].id);
-  const position = rank < 0 ? [...fallback] as WorldPoint : assemblyPosition(rank);
-  if (targets[index].id === focused) position[1] += .55;
-  return position;
 }
 
 export function assemblyIntent(seq: number, sprint: string, targets: BuildTarget[], roots: string[], ids: string[], note: string) {

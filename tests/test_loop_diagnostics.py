@@ -59,6 +59,51 @@ class LoopDiagnosticsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(bridge._record_session_usage.call_args.kwargs['usage']['inputTokens'], 50)
         self.assertNotIn('not stored', json.dumps(record.to_dict()))
 
+    async def test_non_harness_override_prepares_actual_backend_without_changing_session(self):
+        class Backend:
+            config = SimpleNamespace(type='openai-compatible', model='fixture')
+            async def send_message(self, **kw):
+                kw['on_delta'](StreamDelta('s', 'm', 'text_delta', text='ok'))
+                return {}
+            def clear_cancelled(self, _sid):
+                pass
+        bridge, session, _ = self.bridge_case(Backend())
+        session.abilities = {'skills': ['first']}
+        prepared = []
+        async def copy_skills(target):
+            prepared.append((target.backend_id, target.abilities['skills']))
+            if len(prepared) == 1:
+                session.abilities = {'skills': ['changed-during-copy']}
+        bridge._prepare_session_skills.side_effect = copy_skills
+        await bridge._loop_run_agent(session, 'prompt', 'prepare', 1, resume=False, backend_id='selected-reviewer')
+        self.assertEqual(prepared, [('selected-reviewer', ['first']), ('selected-reviewer', ['changed-during-copy'])])
+        self.assertEqual(session.backend_id, 'worker')
+
+    async def test_openspec_setup_actual_codex_dispatch_has_consistent_write_contract(self):
+        from src.backend.codex_office import CodexOfficeBackend
+        from src.backend.loop_execution_environment import ExecutionIdentity
+        from src.backend.loop_openspec_preparation import preparation_prompt
+        backend = CodexOfficeBackend(ModelBackendConfig(id='worker', label='fixture', type=BackendType.CODEX_OFFICIAL))
+        backend.send_message = AsyncMock(return_value={})
+        backend.execution_environment_capabilities = lambda _: {'supported': False}
+        bridge, session, record = self.bridge_case(backend)
+        record.stage_details['openspecSetup'] = {'status': 'running'}
+        session.agent_session_id = 'old-native-thread-must-not-resume'
+        bridge._loop_execution_identity = lambda _s, _b, bid, role, access, _kw: ExecutionIdentity(
+            'local', 'fixture', session.id, session.working_dir, bid, 'app-server', role, access)
+        bridge._loop_environment_blocker = Mock(return_value=None)
+        bridge._loop_environment_hooks = Mock(return_value=(AsyncMock(), Mock()))
+        prompt = preparation_prompt({'workspace': '.', 'cli': 'openspec'}, '使用 OpenSpec', '缺目录', '', [])
+        await bridge._loop_run_agent(session, prompt, 'prepare', 1, resume=False,
+            indep_session_id='s:loop1:openspec:setup', execution_access='workspace-write')
+        sent = backend.send_message.call_args.kwargs
+        self.assertIsNone(sent['agent_session_id'])
+        self.assertEqual(sent['execution_access'], 'workspace-write')
+        self.assertEqual(sent['execution_identity'].access, sent['execution_access'])
+        self.assertIn('本次完成准备', sent['constraints'])
+        self.assertNotIn('当前只负责只读核实', sent['constraints'])
+        self.assertIn('不需要再次询问', sent['content'])
+
     async def test_diagnostic_retry_heartbeats_cannot_defeat_inactivity_timeout(self):
         class Backend:
             aborted = False

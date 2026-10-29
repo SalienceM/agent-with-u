@@ -52,7 +52,8 @@ export class LoopActionController {
       if (this.disposed || sequence !== this.sequence) return result;
       const ok = result?.status === 'ok';
       this.update({ label, phase: ok ? accepted ? 'accepted' : 'done' : 'error',
-        message: ok ? `${label}：${result.message || (accepted ? '请求已接收，执行进度见下方' : '已完成')}` : `${label}失败：${result?.message || '执行端未返回有效回执'}` });
+        // 接收回执不是实时状态；启动时的“正在准备”不能在结束/受阻后继续显示。
+        message: ok ? `${label}：${accepted ? '请求已接收，当前进度以执行状态为准。' : result.message || '已完成'}` : `${label}失败：${result?.message || '执行端未返回有效回执'}` });
       return result || { status: 'error', message: '无效回执' };
     } catch (error) {
       if (!this.disposed && sequence === this.sequence) {

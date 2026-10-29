@@ -17,6 +17,16 @@
   探索模式可以推进可验证的假设，不强迫所有工作套用 OpenSpec。
 - **OpenSpec 原生续跑**：已经明确 change 时直接跟踪原 tasks，剩余自动任务继续 apply，完成后 verify；
   必修问题进入修复再 verify，纯建议不无限优化。此路径不再要求模型重复拆解 taskPlan/交付台账。
+- **OpenSpec 执行前准备**：明确要求 OpenSpec 后点击推进，普通 LOOP 和 AIMEIN 都先准备绑定 Skill，
+  再核对当前项目。没有 `openspec` 或活动 change 时，执行一次准备调用，初始化本项目并衔接目标里
+  明确引用的现有方案（例如 `@docs/proposals/02-data-operations-console`），保留原文件；缺必要工件时
+  补齐同一 change。真实 CLI 复核就绪后在同次请求继续，准备不算实现验收。CLI 缺失、多个候选、
+  外部 store、已绑定来源消失及真实环境阻塞仍需处理，不自动安装或借用父项目。准备失败会停止 Auto，
+  输出在阶段详情保留，用户处理原因后再次推进。仅查看或绑定能力不会启动准备。
+  Codex Skill 目录为 `.agents/skills`（不是 `.agent`），由实际执行 Backend 决定，包含 Skill 的支持文件。
+  准备调用使用工作区写访问并在本次完成授权工件，不受普通只读规划角色误限。若返回具体工具失败或
+  其他准备阻塞，保留原文与解除条件，界面显示“OpenSpec 准备受阻”；修复条件后在原会话再次推进即可。
+  新建 Session 不能修复共享执行器故障。原生运行时被占用等环境问题仍须处理，应用不自动结束外部程序或修改 ACL。
 - **阻塞有范围**：评审台账区分局部、全局、安全和人工输入阻塞，并记录影响任务及解除条件。
   局部阻塞不自动阻止独立任务；安全事故未遏制或全局阻塞则暂停 Auto。历史数据无法恢复的损失
   与仍在持续的风险分开记录，不能静默豁免，也不能无限重复相同恢复尝试。
@@ -329,6 +339,15 @@ CLI 还需要能被当前 Backend 解析、访问并在实际原生策略内启�
 `callResult=normal` 与 `taskResult=blocked` 可以同时成立：模型正常返回不是任务完成。
 检查等待不新增 Backend 失败，真实调用错误也不会被后续复查抹掉或重复计数。
 命令未解析不等于整台机器未安装；原生 helper 初始化失败不能被归咎于 OpenSpec 缺失。
+
+Windows 原生执行器若出现 `helper_unknown_error: setup refresh had errors`，应核对 Codex
+sandbox 日志的具体原因，不能通过新建 Session 或重复初始化 OpenSpec 修复。已确认的一类原因是
+旧 elevated 初始化刷新被占用的运行时文件 ACL 失败。用户明确选择 MXC 后，可通过该 Codex
+Backend 已有的 `cliPath` 指向专用启动入口，在原 CLI 前添加 `-c windows.sandbox=mxc`。
+这只选择 Windows 隔离实现；LOOP 的 read-only/workspace-write、托管限制和原会话历史继续保留。
+必须先验证本机 MXC 及实际 app-server 命令，再保存指定 Backend 并从原会话显式推进；
+不自动改全局 Codex 配置、关闭其他程序、修改 ACL 或回退到其他隔离实现。未验证版本的
+预检仍显示覆盖有限，实际工具成功与完整任务验收分别记录。
 
 原生确定性检查当前只验证了 Windows `codex-cli 0.154.0` 的 executor-local app-server。
 入口按项目 `node_modules/.bin`、实际 Backend PATH 的顺序发现，再在原策略中检查；

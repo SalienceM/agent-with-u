@@ -36,8 +36,8 @@ export const AimeinPreparation: React.FC<{
     finally { setPending(false); }
   };
   const next = (value: number) => { setMessage(''); props.onStep(value); };
-  const titles = ['工坊已经安放好', '你希望建成什么？', '让三种视角一起把关', '准备好了，就开始吧'];
-  const hints = ['成果会保存在这座工坊对应的目录。接下来，为它点亮一个清晰的目标。', '描述希望看到的产品与行为。开始后，模型会把它拆成可以逐步核实的阶段。', '邀请三个不同模型，各开独立会话查看同一份成果。评审档案可以在建设中持续完善。', '确认目标与评委后，点击开始。拆分、建设、评审与修补都将在这座沙盘里继续。'];
+  const titles = ['工坊已经安放好', '你希望建成什么？', '选择适合这次任务的评委', '准备好了，就开始吧'];
+  const hints = ['成果会保存在这座工坊对应的目录。接下来，为它点亮一个清晰的目标。', '描述希望看到的产品与行为。开始后，模型会把它拆成可以逐步核实的阶段。', '可邀请 1–3 位评委，各开独立会话查看同一份成果。评审档案可以在建设中持续完善。', '确认目标与评委后，点击开始。拆分、建设、评审与修补都将在这座沙盘里继续。'];
   return <div data-testid="aimein-preparation">
     <AimeinSetupWorld panelOnly step={step} onStep={next} complete={[true, goalReady, reviewersReady, false]} title={titles[step]} hint={hints[step]}>
       <fieldset disabled={disabled} style={{ border: 0, padding: 0, margin: 0, minWidth: 0 }}>
@@ -58,7 +58,7 @@ export const AimeinPreparation: React.FC<{
         </>}
         {step === 2 && <>
           <div data-testid="aimein-reviewers-target" style={{ ...setupHighlight, padding: 8, borderColor: reviewersReady ? '#86ac83' : '#e38d83' }}>
-            <div style={{ ...setupHint, color: '#efaaa0', padding: '4px 6px 10px' }}>{issue ? `03 · ${issue}` : policyDirty ? '03 · 配置有改动，保存后继续' : '03 · 三位评委已配置'}</div>
+            <div style={{ ...setupHint, color: '#efaaa0', padding: '4px 6px 10px' }}>{issue ? `03 · ${issue}` : policyDirty ? '03 · 配置有改动，保存后继续' : '03 · 评委已配置'}</div>
             <LoopPolicyEditor value={policy} onChange={value => { setPolicy(value); setPolicyDirty(true); }} availableBackends={props.backends}
               sessionBackendId={props.sessionBackendId} sessionId={props.sessionId} execKey={props.execKey} />
           </div>
@@ -71,7 +71,7 @@ export const AimeinPreparation: React.FC<{
           <div style={{ ...setupHighlight, borderColor: goalReady && reviewersReady ? '#a7c78b' : '#e38d83' }}>
             <div style={setupHint}>✓ 工坊已创建</div>
             <button type="button" style={{ ...setupButton, display: 'block', width: '100%', textAlign: 'left', marginTop: 9 }} onClick={() => next(1)}>{goalReady ? '✓ 目标已保存' : '02 · 目标还需要确认'} →</button>
-            <button type="button" style={{ ...setupButton, display: 'block', width: '100%', textAlign: 'left', marginTop: 9 }} onClick={() => next(2)}>{reviewersReady ? '✓ 三位不同模型已保存' : '03 · 评委配置还未完成'} →</button>
+            <button type="button" style={{ ...setupButton, display: 'block', width: '100%', textAlign: 'left', marginTop: 9 }} onClick={() => next(2)}>{reviewersReady ? '✓ 评审组已保存' : '03 · 评委配置还未完成'} →</button>
             {goalReady && reviewersReady && <p style={setupHint}>配置齐全。开始时会再次检查连接、权限与执行条件。</p>}
           </div>
           {!goalReady || !reviewersReady ? <button type="button" style={{ ...setupPrimary, width: '100%', marginTop: 18 }} onClick={() => next(!goalReady ? 1 : 2)}>补齐{!goalReady ? '目标' : '评委配置'} →</button> : <>

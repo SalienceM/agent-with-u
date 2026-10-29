@@ -352,6 +352,18 @@ class EnvironmentGateTests(unittest.IsolatedAsyncioTestCase):
                 await gate(SimpleNamespace(server_version='0.154.0'))
         self.assertEqual(state.execution_environment['blockers'][0]['coverage'], 'actual_tool')
 
+    async def test_new_setup_error_variants_require_native_error_envelope(self):
+        for message in ('helper_unknown_error: setup refresh had errors',
+                        'orchestrator_helper_exit_nonzero: setup helper exited with status Some(1)'):
+            bridge, session, state, _, backend, identity = fixture()
+            _, observer = bridge._loop_environment_hooks(session, backend, identity, 1)
+            observer('commandExecution', {'id': 'i', 'status': 'failed', 'exitCode': None,
+                                         'aggregatedOutput': message})
+            self.assertFalse(state.execution_environment['blockers'])
+            observer('nativeError', {'message': message})
+            self.assertEqual(state.execution_environment['latest']['reasonCode'], 'env_runner_setup_failed')
+            self.assertEqual(len(state.execution_environment['blockers']), 1)
+
     async def test_same_policy_explicit_success_clears_native_block_only_and_keeps_pause(self):
         bridge, session, state, record, backend, identity = fixture()
         state.progress_guard = {'pause': True, 'reasonCode': 'env_access_denied'}

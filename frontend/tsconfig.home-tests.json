@@ -11,6 +11,8 @@
     "outDir": ".home-test-dist"
   },
   "include": [
+    "src/utils/aimeinRuntime.ts",
+    "src/utils/aimeinReviewSummary.ts",
     "src/utils/aimeinPlay.ts",
     "src/utils/aimeinWorld.ts",
     "src/utils/filePanelPresentation.ts",

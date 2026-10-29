@@ -44,8 +44,8 @@ def reviewer_settings(raw: Any) -> list[dict]:
 
 def resolve_reviewers(raw: Any, configs: list) -> list[dict]:
     settings = reviewer_settings(raw)
-    if len(settings) != 3:
-        raise AimeinError('请在评审设置中配置三个不同模型')
+    if not isinstance(raw, list) or not 1 <= len(raw) <= 3 or len(settings) != len(raw):
+        raise AimeinError('请在评审设置中配置 1–3 位评委')
     result, identities = [], set()
     for index, item in enumerate(settings, 1):
         cfg = next((c for c in configs if c.id == item['backendId']), None)
@@ -62,7 +62,7 @@ def resolve_reviewers(raw: Any, configs: list) -> list[dict]:
             raise AimeinError(f'评审 {index} 的 Backend 不支持模型覆盖，请使用其已配置模型')
         identity = model.strip().casefold()
         if identity in identities:
-            raise AimeinError('三个评审必须使用不同模型；不同账号或推理档位不算不同模型')
+            raise AimeinError('启用的评委必须使用不同模型；不同账号或推理档位不算不同模型')
         identities.add(identity)
         result.append({**item, 'model': model.strip(), 'id': f'review{index}'})
     return result
@@ -219,6 +219,18 @@ def evidence_current(reviews: list[dict], workspace: str) -> bool:
         for path, fingerprint in item.get('fingerprints', {}).items())
 
 
+def review_count(run: dict) -> int:
+    """旧记录仍要求三份报告；不能把丢失报告误当成减少席位。"""
+    count = run.get('reviewerCount', 3)
+    return count if type(count) is int and 1 <= count <= 3 else 0
+
+
+def review_roster_complete(run: dict) -> bool:
+    count = review_count(run)
+    reviews = run.get('reviews', [])
+    return bool(count and isinstance(reviews, list) and len(reviews) == count)
+
+
 def progress_observation(run: dict, previous: list[dict]) -> dict:
     """同范围跨阶段累计；新编号、评分及无新证据的报告改写不产生进展。"""
     seen_conditions: set[str] = set()
@@ -230,7 +242,7 @@ def progress_observation(run: dict, previous: list[dict]) -> dict:
         plan, reviews = item.get('plan', {}), item.get('reviews', [])
         targets = {t['id']: t for t in plan.get('targets', [])}
         conditions, verified_targets, evidence = set(), set(), set()
-        if len(reviews) == 3 and all(r.get('status') in ('passed', 'changes_requested') for r in reviews):
+        if review_roster_complete(item) and all(r.get('status') in ('passed', 'changes_requested') for r in reviews):
             for key, expected in (('criteria', plan.get('sprint', {}).get('criteria', [])),
                                   ('targets', list(targets.values()))):
                 for criterion in expected:
@@ -265,7 +277,7 @@ def run_summary(run: dict) -> dict:
     sprint = plan.get('sprint', {})
     return {key: run.get(key) for key in ('version', 'sprintId', 'sprintNumber', 'attempt', 'status', 'accepted',
                                         'complete', 'message', 'noProgress', 'scopeChanged')} | {
-        'revision': digest(run), 'title': short(sprint.get('title'), 200), 'outcome': short(sprint.get('outcome'), 500),
+        'reviewerCount': review_count(run), 'revision': digest(run), 'title': short(sprint.get('title'), 200), 'outcome': short(sprint.get('outcome'), 500),
         'maturityTarget': sprint.get('maturityTarget'), 'maturityMeaning': short(sprint.get('maturityMeaning'), 500),
         'flowBuild': short(sprint.get('flowBuild'), 800), 'infra': short(sprint.get('infra'), 800),
         'criteria': [{k: c[k] for k in ('id', 'lane', 'acceptance')} for c in sprint.get('criteria', [])],

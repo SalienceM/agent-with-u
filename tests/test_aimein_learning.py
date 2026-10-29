@@ -58,6 +58,9 @@ class LearningContracts(unittest.TestCase):
         for i in range(3): save(state, document=doc(i))
         ids = [p['id'] for p in state.aimein_memory['profiles']]
         with self.assertRaises(AimeinError): save(state, 'select', profileIds=[ids[0]] * 3)
+        for count in (1, 2):
+            save(state, 'select', profileIds=ids[:count])
+            self.assertEqual(len(state.policy.aimein_reviewers), count)
         save(state, 'select', profileIds=ids)
         frozen = profile_snapshot(state.policy.aimein_reviewers[0], state.aimein_memory)
         save(state, document={**doc(), 'model': 'another-model'}, profileId=ids[0])

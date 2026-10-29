@@ -23,6 +23,7 @@ def bridge_fixture(state, project):
     session.working_dir, session.backend_id, session.session_type, session.owner_id = str(project.root), 'b', 'loop', 'local'
     session.messages = []
     bridge._backend_configs = [SimpleNamespace(id='b')]
+    bridge._prepare_session_skills = AsyncMock()
     bridge._runtime_label = lambda *_: 'fixture'
     bridge._resolved_runtime = lambda *_: {}
     bridge._loop_runtime = lambda *_: {}

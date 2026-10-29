@@ -278,7 +278,7 @@ const LoopPanelContent: React.FC<LoopPanelProps & { identity: string }> = ({
     {section === 'issues' && feedback}
     {view.issues.filter(issue => issue.id !== 'control').map(issue => <section key={issue.id} style={{ ...sealBox, marginBottom: 10 }}>
       <strong>{issue.title}</strong><p>{issue.reason}</p><p>{issue.next}</p>
-      <button style={btn} onClick={() => openIssue(issue)}>{issue.section === 'source' ? '核对范围差异' : issue.section === 'environment' ? '核对该检查' : '查看受影响任务与证据'}</button>
+      <button style={btn} onClick={() => openIssue(issue)}>{issue.section === 'source' ? (state.taskSource?.status === 'conflict' ? '核对范围差异' : '查看来源与准备情况') : issue.section === 'environment' ? '核对该检查' : '查看受影响任务与证据'}</button>
       <details style={{ marginTop: 8 }}><summary>关联依据</summary>{issue.refs.map(ref => <div key={ref}>{ref}</div>)}</details>
     </section>)}
     {!view.issues.length && <p>当前摘要没有待处理问题；这不代表完整验收。</p>}
@@ -322,6 +322,9 @@ const LoopPanelContent: React.FC<LoopPanelProps & { identity: string }> = ({
     {!aimein && <StageRail stage={state.stage} />}
     {!section && !aimeinPreparing && operationFeedback}
     {state.startup?.status !== 'done' && state.startup?.message && <div role="status" data-testid="loop-startup-status" style={{ fontSize: 12 }}>{state.startup.message}</div>}
+    {latest?.stageDetails?.openspecSetup && <div role="status" data-testid="loop-openspec-preparation" style={{ fontSize: 12, padding: '5px 0' }}>
+      {latest.stageDetails.openspecSetup.message}
+    </div>}
     {latest?.openspecSummary && <div data-testid="loop-openspec-status" role="status" style={{ fontSize: 12, padding: '5px 0', overflowWrap: 'anywhere' }}>
       OpenSpec · {latest.openspecSummary.change} · {{ apply: '实现原任务', verify: 'Verify 验证', repair: '修复必修问题' }[latest.openspecSummary.phase] || latest.openspecSummary.phase}
       {' · '}任务 {latest.openspecSummary.checked}/{latest.openspecSummary.total}
@@ -450,12 +453,42 @@ const LoopPanelContent: React.FC<LoopPanelProps & { identity: string }> = ({
           <AddonPanel addons={state.addons || []} onAdd={addAddon} onRemove={removeAddon} onEdit={editAddon} />
         </div>}
   </>;
+  const aimeinControls = (compact: boolean) => {
+    const controlBtn = { ...btn, ...(compact ? { padding: '4px 6px', fontSize: 10 } : {}) };
+    return <div data-testid="aimein-controls" style={{ position: 'relative', zIndex: 8, display: 'flex', gap: 7, alignItems: 'center', flexWrap: 'wrap', padding: compact ? '5px 7px' : '9px 12px', borderBottom: '1px solid #36574d', color: '#cde3d3', fontSize: compact ? 10 : 12 }}>
+    <strong style={{ color: '#d6e5ac', letterSpacing: 1 }}>AIMEIN</strong>
+    <span data-testid="loop-current-status">{!connected ? '连接中断' : view.status}</span><span style={{ color: '#92b09f' }}>第 {state.round} 轮</span>
+    {!compact && <button style={controlBtn} onClick={() => openSection('source')} title={state.taskSource?.change || '查看任务来源与准备情况'}>来源：{boundedText(state.taskSource?.change, 28) || '未绑定'}</button>}
+    {!!view.issues.length && <button style={{ ...controlBtn, color: '#f1cb8f' }} title={view.issues[0].reason} onClick={() => openIssue(view.issues[0])}>需要处理 · {view.issues.length}</button>}
+    <div style={{ display: 'flex', gap: 6, marginLeft: 'auto', flexWrap: 'wrap' }}>
+      {!readOnly && !aimeinPreparing && state.stage !== 'loopidea' && <>
+        <button style={controlBtn} aria-label={state.auto ? '停止后续自动执行' : '开启 Auto'} disabled={busy} onClick={() => void setAuto(!state.auto)}>{compact ? `Auto ${state.auto ? '开' : '关'}` : state.auto ? '停止后续自动执行' : '开启 Auto'}</button>
+        {state.stage === 'loopexecute' && <button style={controlBtn} aria-label={state.running ? '停止本轮并查看结果' : '结束本轮并查看结果'} disabled={busy} onClick={() => void advanceOut()}>{compact ? state.running ? '停止本轮' : '结束本轮' : state.running ? '停止本轮并查看结果' : '结束本轮并查看结果'}</button>}
+      </>}
+      {['manual', 'check'].includes(view.primary) && <button style={controlBtn} disabled={view.primary === 'check' && control.state.checking} onClick={primary}>{labels[view.primary]}</button>}
+      {!compact && <button style={controlBtn} onClick={() => openSection('environment')}>运行诊断</button>}
+      <details style={{ position: 'relative' }}><summary style={{ ...controlBtn, cursor: 'pointer' }}>工作台设置</summary>
+        <div style={{ ...sealBox, position: 'absolute', right: 0, top: '100%', width: 230, maxWidth: '75vw', display: 'grid', gap: 8, boxShadow: '0 8px 24px #0006', background: '#142d2c' }}>
+          {secondaryControls}{compact && <><button style={btn} onClick={() => openSection('source')}>任务来源</button><button style={btn} onClick={() => openSection('environment')}>运行诊断</button>{headerActions}</>}
+          {repairBusy && <button style={controlBtn} disabled={repair.sending || !connected} onClick={() => void cancelRepair()}>停止修复</button>}
+          {!readOnly && !!state.loops.length && <details><summary style={{ ...controlBtn, cursor: 'pointer' }}>更多操作</summary><div data-testid="loop-more-actions"><button style={{ ...controlBtn, color: '#f87171', marginTop: 8 }} disabled={busy} onClick={() => void discardLoop()}>丢弃本次记录…</button></div></details>}
+        </div>
+      </details>
+      {!compact && headerActions}{onClose && <button style={controlBtn} onClick={onClose}>关闭总览</button>}
+    </div>
+  </div>; };
+  const aimeinNotices = !section && !aimeinPreparing && <div style={{ padding: '0 12px', fontSize: 12 }}>
+    {['sending', 'error', 'unknown'].includes(actionFeedback.phase) && operationFeedback}
+    {view.requestReason && !state.running && <div role="status" style={{ color: '#e2bf87' }}>{view.requestReason}</div>}
+    {section !== 'issues' && feedback}
+  </div>;
   return wrap(<LoopPromptContext.Provider value={{ sessionId, workingDir, execKey }}>
-    <LoopWorkbench immersive={aimein} header={<>{header}{aimein && <details style={{ fontSize: 12, marginTop: 6 }}><summary style={{ cursor: 'pointer' }}>工坊状态与来源{view.issues.length ? ` · ${view.issues.length} 项需要处理` : ''}</summary>{statusControls}</details>}</>} section={section} onSection={value => value ? openSection(value) : closeSection()}
+    <LoopWorkbench immersive={aimein} header={aimein ? null : header} section={section} onSection={value => value ? openSection(value) : closeSection()}
       trigger={trigger} details={details} title={activeIssue?.title}>
       {!aimein && <MetricBar state={state} />}
       {!aimein && statusControls}
       {aimein ? <AimeinWorkbench state={state} selected={selected} onSelect={seq => selectLoop(seq)} onSettings={() => openSection('policy')} progress={progress} detailError={selected && detailErrors[selected.seq]?.message} onRetry={retryDetail}
+          connected={connected} controls={aimeinControls} notices={aimeinNotices}
           launch={{ label: state.running ? '建设中' : view.primary === 'resume' ? '继续建设' : view.primary === 'continue' ? '开启新轮' : '点火开工',
             disabled: !connected || readOnly || busy || view.primary === 'running' || !['run', 'resume', 'continue'].includes(view.primary) || ['run', 'resume'].includes(view.primary) && !view.canRequest,
             reason: view.requestReason || view.requestCompatibility || labels[view.primary], onClick: primary }}
@@ -1074,7 +1107,7 @@ const FLOW_STATUS_COLOR: Record<string, string> = {
   done: '#2da44e', running: '#0969da', error: '#f87171', current: '#bf8700', pending: 'var(--theme-text-muted)',
   retrying: '#bf8700', degraded: '#bf8700',
 };
-const STAGE_STATUS_LABEL: Record<string, string> = { done: '已完成', running: '进行中', retrying: '规划重试中', degraded: '已降级', error: '失败', current: '待继续', pending: '未开始' };
+const STAGE_STATUS_LABEL: Record<string, string> = { done: '已完成', running: '进行中', checking: '核对中', paused: '已暂停', blocked: '待处理', interrupted: '未确认完成', retrying: '规划重试中', degraded: '已降级', error: '失败', current: '待继续', pending: '未开始' };
 
 function stageStatus(loop: LoopRecord, stage: string, live: boolean): string {
   if (loop.error && stage === loop.subStage) return 'error';
@@ -1528,6 +1561,8 @@ const LoopDetail: React.FC<{
         )}
       </Section>}
       {show('prepare') && <StageAudit stage="prepare" detail={loop.stageDetails?.prepare} live={livePrep} />}
+      {show('prepare') && loop.stageDetails?.openspecSetup && loop.stageDetails.openspecSetup.rawOutput !== loop.stageDetails.prepare?.rawOutput &&
+        <Section title="OpenSpec 项目与方案准备"><StageAudit stage="prepare" detail={loop.stageDetails.openspecSetup} /></Section>}
       {targetStage === 'prepare' && <Section title="规范化执行计划">
         {loop.orchestration.length ? <ol>{loop.orchestration.map(step => <li key={step.index}>[{step.mode} / {step.access || 'write'}] {step.desc}</li>)}</ol> : '尚未获得有效步骤。'}
       </Section>}

@@ -18,14 +18,14 @@ class LoopSourceBridge:
             self._loop_task_reader = TaskSourceReader()
         return self._loop_task_reader
 
-    def _loop_source_environment(self, session: Any, state: Any) -> tuple[dict, dict]:
+    def _loop_source_environment(self, session: Any, state: Any, *, allow_uninitialized: bool = False) -> tuple[dict, dict]:
         backend_id = state.policy.backend_for('execute') or session.backend_id
         config = next((c for c in self._backend_configs if c.id == backend_id), None)
         if config is None:
             raise SourceError('backend_missing', '指定的 execute Backend 已不存在，不会静默借用其他来源环境。')
         manager = getattr(self, '_relay_runtime_manager', None)
         executor = (manager.status().get('deviceId') if manager else '') or ('local:' + digest([platform.node(), str(Path.home())])[:20])
-        return environment(session, config, executor)
+        return environment(session, config, executor, allow_uninitialized=allow_uninitialized)
 
     def _loop_source_editable(self, state: Any, expected_revision: int) -> None:
         if self._loop_is_running(state.session_id) or state.control_mode != 'loop':

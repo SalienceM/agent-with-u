@@ -188,7 +188,8 @@ def native_error_code(error: Any) -> str:
         return 'env_probe_unsupported'
     if error.get('code') == -32603 and message == 'exec failed: sandbox error: command timed out':
         return 'env_probe_timeout'
-    if 'orchestrator_helper_incomplete' in message:
+    if any(code in message for code in ('orchestrator_helper_incomplete', 'orchestrator_helper_exit_nonzero')) or (
+            'helper_unknown_error' in message and 'setup refresh had errors' in message):
         return 'env_runner_setup_failed'
     if re.search(r'(?i)(access(?: is)? denied|permission denied|UnauthorizedAccess|拒绝访问)', message):
         return 'env_access_denied'

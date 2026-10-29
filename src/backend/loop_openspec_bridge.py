@@ -5,33 +5,83 @@ import copy
 import json
 import time
 from typing import Any
+from pathlib import Path
 
 from .loop_decisions import DecisionFacts, decide_next, digest
-from .loop_openspec import (user_intent, select_change, manual_policy,
+from .loop_openspec import (requested, user_intent, select_change, manual_policy,
                            task_progress, normalize_verify, next_phase)
+from .loop_openspec_preparation import LoopOpenSpecPreparation
 from .loop_store import LoopStep, LoopAnalysis, SUB_PREPARE, SUB_EXECUTE, SUB_ANALYSIS, SUB_DONE
 from .loop_task_source import SourceError, scope_diff, source_summary
 
 
-class LoopOpenSpecBridge:
+class LoopOpenSpecBridge(LoopOpenSpecPreparation):
     async def _loop_openspec_source(self, session: Any, state: Any, record: Any, boundary: str) -> bool:
         previous = state.task_source
+        owned_source = previous
         revision, control = previous.get('revision', 0), state.control_revision
         intent = user_intent(state, record)
+        frozen = digest([session.working_dir, session.backend_id, state.policy.to_dict(), getattr(session, 'abilities', None)])
         try:
-            binding, env = self._loop_source_environment(session, state)
             old = previous.get('binding', {})
-            if old and any(old.get(k) != value for k, value in binding.items()):
-                raise SourceError('environment_changed', '执行节点、工作区或 Backend 环境已变化，请核对实际执行环境。')
-            if old and boundary != 'prepare':
-                change = select_change(intent, [{'name': old['change']}], old['change'])
+            explicit = copy.copy(state)
+            explicit.task_source = {}
+            allow_setup = boundary == 'prepare' and requested(explicit)
+            if boundary == 'prepare':
+                if state.risk_coefficient >= state.policy.risk_threshold or state.unresolved_blockers:
+                    self._loop_wait(state, record, 'risk_limit' if state.risk_coefficient >= state.policy.risk_threshold else 'task_blocked',
+                                    '仍有风险或真实任务阻塞，未开始 OpenSpec 准备。')
+                    return False
+                if getattr(session, 'codex_connection_mode', '') == 'ssh':
+                    raise SourceError('remote_filesystem', '首版不支持 SSH 文件系统来源。')
+                if not Path(session.working_dir).is_dir():
+                    raise SourceError('workspace_missing', '当前工作区不存在，请先核对 Session 目录。')
+                await self._prepare_runtime_skills(session, state.policy.backend_for('execute') or session.backend_id)
+                if (state.control_revision != control or state.control_mode != 'loop' or user_intent(state, record) != intent
+                        or session.id in self._loop_cancel or session.id in self._loop_pending_out
+                        or frozen != digest([session.working_dir, session.backend_id, state.policy.to_dict(), getattr(session, 'abilities', None)])):
+                    raise SourceError('execution_changed', 'Skill 准备期间目标或执行身份变化，请重新推进。')
+            # 最多一次准备调用 + 一次真实重新读取；不能把模型的成功陈述当成来源。
+            setup_change = ''
+            for attempt in range(2):
+                setup_reason, change = '', ''
+                try:
+                    binding, env = self._loop_source_environment(session, state)
+                except SourceError as exc:
+                    if exc.code != 'project_required' or old or not allow_setup:
+                        raise
+                    binding, env = self._loop_source_environment(session, state, allow_uninitialized=True)
+                    setup_reason = '当前工作区尚未初始化 OpenSpec'
+                if old and any(old.get(k) != value for k, value in binding.items()):
+                    raise SourceError('environment_changed', '执行节点、工作区或 Backend 环境已变化，请核对实际执行环境。')
+                if not setup_reason:
+                    if old and boundary != 'prepare':
+                        change = select_change(intent, [{'name': old['change']}], old['change'])
+                    else:
+                        discovery = await self._loop_source_reader().read(binding, env,
+                            f'driver-discover:{record.round}:{record.seq}', revision, force=attempt > 0)
+                        if not discovery['candidates'] and not old and allow_setup:
+                            setup_reason = '当前项目没有活动 change，需要衔接用户方案或创建正式方案'
+                        else:
+                            change = select_change(intent, discovery['candidates'], old.get('change', '') or setup_change)
+                    if change:
+                        snapshot = await self._loop_source_reader().read(binding, env,
+                            f'driver:{record.round}:{record.seq}:{boundary}', revision, change, force=True)
+                        if snapshot['cliState'] == 'blocked' and snapshot.get('missingArtifacts') and allow_setup:
+                            setup_reason = '选定 change 缺少必要工件：' + '、'.join(snapshot['missingArtifacts'])
+                if not setup_reason:
+                    break
+                if attempt or record.stage_details.get('openspecSetup'):
+                    raise SourceError('preparation_incomplete', setup_reason + '；准备后仍未就绪，请查看准备输出后再推进。')
+                if not await self._loop_prepare_openspec(session, state, record, binding, setup_reason, change):
+                    return False
+                setup_change = change
             else:
-                discovery = await self._loop_source_reader().read(binding, env, 'driver-discover', revision)
-                change = select_change(intent, discovery['candidates'], old.get('change', ''))
-            snapshot = await self._loop_source_reader().read(binding, env,
-                f'driver:{record.round}:{record.seq}:{boundary}', revision, change, force=True)
+                raise SourceError('preparation_incomplete', '准备后未取得有效正式来源。')
             if (state.task_source is not previous or state.control_revision != control
                     or user_intent(state, record) != intent or state.control_mode != 'loop'
+                    or session.id in self._loop_cancel or session.id in self._loop_pending_out
+                    or frozen != digest([session.working_dir, session.backend_id, state.policy.to_dict(), getattr(session, 'abilities', None)])
                     or self._loop_source_environment(session, state)[0] != binding):
                 raise SourceError('stale_revision', '来源查询期间目标或执行身份已变化，请重新运行。')
             before = previous.get('snapshot', {})
@@ -47,19 +97,38 @@ class LoopOpenSpecBridge:
                 'binding': {**binding, 'change': change, 'cliVersion': snapshot.get('cliVersion', '')},
                 'snapshot': snapshot, 'history': history, 'reason': '', 'code': '',
                 'status': 'blocked' if snapshot['cliState'] == 'blocked' else 'current'}
+            owned_source = state.task_source
             state.task_source.pop('candidate', None)
             state.task_source.pop('diff', None)
             record.source_snapshots['before' if boundary == 'prepare' else 'after'] = copy.deepcopy(snapshot)
             if snapshot['cliState'] == 'blocked':
                 raise SourceError('workflow_blocked', 'OpenSpec 工作流 blocked：' + snapshot.get('instruction', '请补齐必要工件'))
+            setup = record.stage_details.get('openspecSetup')
+            if setup:
+                setup.update(status='done', message='OpenSpec 准备完成，正式来源已核对', selectedChange=change)
             self._loop_save(state)
             self._emit_loop_updated(state)
             return True
         except (SourceError, ValueError) as exc:
             code = getattr(exc, 'code', 'source_selection')
+            setup = record.stage_details.get('openspecSetup')
+            if setup and setup.get('status') == 'checking':
+                setup.update(status='blocked', message='准备后来源核对未通过：' + str(exc))
+            if state.task_source is not owned_source:
+                self._loop_wait(state, record, 'execution_changed', '准备期间来源已改变；旧输出仅留作历史，请重新推进。')
+                return False
             state.task_source = {**state.task_source, 'status': 'blocked' if code == 'workflow_blocked' else 'unavailable',
                                  'reason': str(exc), 'code': code}
-            self._loop_wait(state, record, code, str(exc), '在来源中选择明确 change 或修复所列条件后运行。')
+            condition = ((setup or {}).get('reportedBlocker', {}).get('resolution')
+                         or '查看准备输出，处理所列原因后在原会话再次推进，无需新建 Session。') if code == 'preparation_blocked' else (
+                         '查看本次准备输出，处理缺失条件后再次推进。' if code == 'preparation_incomplete'
+                         else '在来源中选择明确 change 或修复所列条件后运行。')
+            self._loop_wait(state, record, code, str(exc), condition)
+            # 显式因果引用用于合并本修订的来源告警、调度决定和暂停守卫。
+            state.progress_guard['sourceRevision'] = state.task_source.get('revision', 0)
+            record.decision['basisRefs'] = [*record.decision.get('basisRefs', []), f'source:{state.task_source.get("revision", 0)}']
+            self._loop_save(state)
+            self._emit_loop_updated(state)
             return False
 
     async def _loop_openspec_iteration(self, session: Any, state: Any, record: Any) -> None:

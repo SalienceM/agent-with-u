@@ -2,6 +2,34 @@ const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const { loopWorkbenchView } = require('../../.home-test-dist/utils/loopWorkbenchView.js');
 const { base, record, states, migrations, environmentStates, restored } = require('./fixtures/loop-workbench.cjs');
+
+test('reported OpenSpec preparation failure keeps its reason and original-session recovery', () => {
+  const state = { ...base(), taskSource: { status: 'unavailable', code: 'preparation_blocked', revision: 0,
+    reason: '准备调用报告：helper_unknown_error: setup refresh had errors' } };
+  const issue = loopWorkbenchView(state).issues[0];
+  assert.equal(issue.title, 'OpenSpec 准备受阻');
+  assert.match(issue.reason, /helper_unknown_error/);
+  assert.match(issue.next, /原会话/);
+  assert.doesNotMatch(issue.reason, /尚未初始化/);
+});
+
+test('OpenSpec preparation is observable without fake conflicts or duplicate current pauses', () => {
+  const cause = { causeRef: 'wait:setup', causeRevision: 1, round: 1, seq: 1 };
+  const state = { ...base(), taskSource: { status: 'unavailable', code: 'project_required', revision: 0, reason: 'old no init message' },
+    loops: [{ ...record(), decision: { ...cause, action: 'wait', revision: 0, basisRefs: ['source:0'] } }],
+    progressGuard: { ...cause, pause: true, reason: 'old no init message' } };
+  const view = loopWorkbenchView(state);
+  assert.equal(view.issues.length, 1);
+  assert.equal(view.issues[0].title, 'OpenSpec 项目待准备');
+  assert.match(view.issues[0].next, /点击推进/);
+  assert.doesNotMatch(view.issues[0].reason, /old no init/);
+  state.taskSource.revision = 1;
+  assert.equal(loopWorkbenchView(state).issues.length, 2);
+  state.taskSource.status = 'preparing'; state.progressGuard = {}; state.loops[0].decision = {};
+  assert.equal(loopWorkbenchView(state).issues.length, 0);
+  state.taskSource.status = 'conflict';
+  assert.match(loopWorkbenchView(state).issues[0].next, /核对范围差异/);
+});
 test('only matching current causal revisions merge decision and guard with task evidence', () => {
   const decision = { action: 'wait', decisionId: 'd', reasonCode: 'task_contract_invalid', reasonText: 'same',
     round: 1, seq: 1, causeRef: 'contract:c', causeRevision: 3, affectedIds: ['A'] };

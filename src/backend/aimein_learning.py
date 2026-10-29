@@ -145,7 +145,7 @@ def update_memory(state: Any, command: dict, configs: list) -> dict:
         else:
             current['calibrations'] = [*current['calibrations'], entry][-96:]
     elif action == 'select':
-        ids = rows(command.get('profileIds'), 3, 3)
+        ids = rows(command.get('profileIds'), 3, 1)
         chosen = [next((p for p in current['profiles'] if p['id'] == ident), None) for ident in ids]
         if any(p is None for p in chosen):
             raise AimeinError('选择的档案不存在')

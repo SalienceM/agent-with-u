@@ -3,6 +3,7 @@ import type { AimeinAnchor } from '../types/aimein';
 import type { LoopRecord, LoopStateT } from '../types/loopWorkbench';
 import { assemblyClosure, assemblyIntent, type AimeinTool } from '../utils/aimeinPlay';
 import { aimeinButton as button, aimeinInput as input } from './AimeinReviewLibrary';
+import { AimeinReviewSummary } from './AimeinReviewSummary';
 
 interface Draft { ids: string[]; note: string; notice: string; uncertain?: boolean; }
 const empty: Draft = { ids: [], note: '', notice: '' };
@@ -16,18 +17,22 @@ export function useAimeinPlay(state: LoopStateT, current: LoopRecord | undefined
   const [selection, setSelection] = useState({ basis: '', id: '' });
   const targetId = selection.basis === basis ? selection.id : '';
   const [drafts, setDrafts] = useState<Record<string, Draft>>({});
-  const draft = drafts[basis] || empty;
-  const setDraft = (update: Partial<Draft>) => setDrafts(previous => ({ ...previous, [basis]: { ...(previous[basis] || empty), ...update } }));
+  const [editingBasis, setEditingBasis] = useState('');
+  const editing = editingBasis === basis;
+  const automaticIds = [...new Set((current?.aimeinRun?.plan?.sprint?.criteria || []).map(c => c.targetId).filter(Boolean))];
+  const automatic: Draft = { ...empty, ids: automaticIds };
+  const draft = editing ? drafts[basis] || automatic : automatic;
+  const setDraft = (update: Partial<Draft>) => setDrafts(previous => ({ ...previous, [basis]: { ...(previous[basis] || automatic), ...update } }));
   const [saving, setSaving] = useState(false);
   const inFlight = useRef(false);
   const closure = assemblyClosure(targets, draft.ids);
   const text = assemblyIntent(current?.seq || 0, current?.aimeinSummary?.sprintId || '', targets, draft.ids, closure.ids, draft.note);
   const pick = (id: string) => {
     setSelection({ basis, id });
-    if (tool === 'assemble' && !saving && !draft.uncertain) setDraft({ ids: draft.ids.includes(id) ? draft.ids.filter(v => v !== id) : [...draft.ids, id], notice: '' });
+    if (tool === 'assemble' && editing && !saving && !draft.uncertain) setDraft({ ids: draft.ids.includes(id) ? draft.ids.filter(v => v !== id) : [...draft.ids, id], notice: '' });
   };
   const submit = async () => {
-    if (inFlight.current || locked || !draft.ids.length || closure.errors.length || text.length > 4000 || draft.uncertain) return;
+    if (!editing || inFlight.current || locked || !draft.ids.length || closure.errors.length || text.length > 4000 || draft.uncertain) return;
     const key = basis; inFlight.current = true; setSaving(true); setDraft({ notice: '正在把组合交给下一次规划…' });
     try {
       const result = await onFeedback(text, { kind: 'flow', seq: current?.seq || 0 });
@@ -39,7 +44,8 @@ export function useAimeinPlay(state: LoopStateT, current: LoopRecord | undefined
       setDrafts(previous => ({ ...previous, [key]: { ...(previous[key] || draft), uncertain: true, notice: `${error.message || '保存结果未知'} · 请先核对意见流，不会自动重发。` } }));
     } finally { inFlight.current = false; setSaving(false); }
   };
-  return { tool, setTool, targets, targetId, pick, draft, setDraft, closure, saving, submit, tooLong: text.length > 4000, locked };
+  return { tool, setTool, targets, targetId, pick, inspect: (id: string) => setSelection({ basis, id }), draft, setDraft, closure, saving, submit, tooLong: text.length > 4000, locked, editing,
+    beginAdjust: () => setEditingBasis(basis), cancelAdjust: () => setEditingBasis('') };
 }
 
 export const AimeinPlayPanel: React.FC<{
@@ -48,7 +54,7 @@ export const AimeinPlayPanel: React.FC<{
 }> = ({ play, current, progress, historical, running, onReview, onCalibrate }) => {
   const target = play.targets.find(t => t.id === play.targetId);
   const summary = current?.aimeinSummary;
-  const title = { inspect: '拿起来看', assemble: '装配台', probe: '故障探针', reviewers: '评委席' }[play.tool];
+  const title = { inspect: '拿起来看', assemble: '阶段装配', probe: '成果与验证', reviewers: '评委席' }[play.tool];
   if (play.tool === 'inspect' && !target) return null;
   return <section aria-label={title} style={{ padding: 16, marginBottom: 14, border: '1px solid #647c65', background: 'linear-gradient(145deg, #203c35, #152d2d)', color: '#e0ebd9', borderRadius: 12 }}>
     <div style={{ font: '10px monospace', letterSpacing: 2, color: '#a7b797' }}>WORKSHOP / {play.tool.toUpperCase()} / #{current?.seq || '—'}</div>
@@ -56,12 +62,14 @@ export const AimeinPlayPanel: React.FC<{
     {historical && <p style={{ ...small, color: '#e1c68d' }}>正在回看历史。返回最新阶段后再提交或开工。</p>}
     {(play.tool === 'inspect' || play.tool === 'assemble') && <>
       {play.tool === 'assemble' && <>
-        <p style={{ ...small, color: '#bed0ba' }}>把想一起建的模块放上来。依赖会跟过来；再点一次取回。组合将交给下一次规划。</p>
+        <p style={{ ...small, color: '#bed0ba' }}>{play.editing ? '正在调整后续建议。点击模块增减，依赖会自动纳入；当前执行范围保持原计划。' : '系统已按阶段目标安排模块并纳入依赖，无需手动装配。这里可以查看本次为什么这样组合。'}</p>
+        {!play.editing && !!play.targets.length && <button style={button} onClick={play.beginAdjust}>我想调整后续范围</button>}
         <div aria-label="装配槽" style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit,minmax(68px,1fr))', gap: 6, margin: '12px 0' }}>
-          {play.closure.ids.length ? play.closure.ids.map(id => <button key={id} type="button" aria-label={`装配槽 ${id}`} onClick={() => play.pick(id)} style={{ ...button, minHeight: 57, borderColor: play.draft.ids.includes(id) ? '#dbc892' : '#598a7f', background: play.draft.ids.includes(id) ? '#596143' : '#294940', color: '#e5e8cf' }}><b>{id}</b><small style={{ display: 'block', marginTop: 3 }}>{play.draft.ids.includes(id) ? '已放入' : '所需依赖'}</small></button>)
-            : [1, 2, 3].map(i => <div key={i} style={{ minHeight: 57, border: '1px dashed #6b826e', borderRadius: 6, display: 'grid', placeItems: 'center', color: '#8caa96' }}>＋</div>)}
+          {play.closure.ids.length ? play.closure.ids.map(id => <button key={id} type="button" aria-label={`装配槽 ${id}`} onClick={() => play.pick(id)} style={{ ...button, minHeight: 57, borderColor: play.draft.ids.includes(id) ? '#dbc892' : '#598a7f', background: play.draft.ids.includes(id) ? '#596143' : '#294940', color: '#e5e8cf' }}><b>{id}</b><small style={{ display: 'block', marginTop: 3 }}>{play.draft.ids.includes(id) ? play.editing ? '已选择' : '本阶段' : '所需依赖'}</small></button>)
+            : <p style={small}>{play.editing ? '选择希望调整的模块。' : running ? '系统正在形成阶段计划，模块会随保存的计划出现。' : '尚无已保存的阶段范围；开工后由系统规划。'}</p>}
         </div>
-        {!!play.closure.ids.length && <p style={{ ...small, color: '#b9cebd' }}>{play.draft.ids.length} 个主动选择 · {play.closure.ids.length - play.draft.ids.length} 个依赖自动纳入</p>}
+        {!!play.closure.ids.length && <p style={{ ...small, color: '#b9cebd' }}>{play.draft.ids.length} 个{play.editing ? '主动选择' : '阶段目标'} · {play.closure.ids.length - play.draft.ids.length} 个依赖自动纳入</p>}
+        {play.closure.errors.map(error => <p key={error} role="alert" style={{ fontSize: 12, color: '#efb09a' }}>{error} · 当前组合依据不完整，不能作为可执行安排。</p>)}
       </>}
       {target && <article data-testid="aimein-held-target" style={{ padding: 12, borderLeft: '2px solid #dccb91', background: '#071b1b70', margin: '12px 0' }}>
         <b>{target.id} · {target.title}</b><p style={{ ...small, color: '#d3dfcb' }}>{target.acceptance}</p>
@@ -69,17 +77,17 @@ export const AimeinPlayPanel: React.FC<{
       </article>}
       <div aria-label="模块背包" style={{ display: 'grid', gap: 5, maxHeight: 250, overflowY: 'auto' }}>{play.targets.map(t => <button key={t.id} type="button" aria-label={`模块 ${t.id}：${t.title}`} aria-pressed={play.tool === 'assemble' ? play.draft.ids.includes(t.id) : t.id === play.targetId} onClick={() => play.pick(t.id)} style={{ ...button, textAlign: 'left', display: 'flex', gap: 9, background: t.id === play.targetId ? '#536447' : '#1b3632', borderColor: t.id === play.targetId ? '#decd95' : '#48665a', color: '#d2e0c9' }}><span style={{ color: '#e4ce91', fontFamily: 'monospace' }}>{play.closure.ids.includes(t.id) ? '▣' : '◇'} {t.id}</span><span>{t.title}</span></button>)}</div>
       {!play.targets.length && <p style={small}>目标拆解后，真实模块会出现在这里。先点亮目标，再开工。</p>}
-      {play.tool === 'assemble' && <form onSubmit={e => { e.preventDefault(); void play.submit(); }}>
+      {play.tool === 'assemble' && play.editing && <form onSubmit={e => { e.preventDefault(); void play.submit(); }}>
         <label style={{ display: 'block', fontSize: 12, marginTop: 14 }}>这次组合，希望先玩到什么？<textarea aria-label="装配意图" value={play.draft.note} maxLength={1000} rows={2} disabled={play.saving || play.draft.uncertain} onChange={e => play.setDraft({ note: e.target.value })} style={{ ...input, marginTop: 6 }} placeholder="例如：先让我完成保存、断网、重开这一轮体验" /></label>
-        {play.closure.errors.map(error => <p key={error} role="alert" style={{ fontSize: 12, color: '#efb09a' }}>{error}</p>)}
         {play.tooLong && <p role="alert" style={small}>组合原文超过 4000 字符，请减少模块或补充说明。</p>}
         <button type="submit" disabled={play.locked || play.saving || !play.draft.ids.length || !!play.closure.errors.length || play.tooLong || play.draft.uncertain} style={{ ...button, marginTop: 12, background: '#c8d49f', color: '#253e2d' }}>{play.saving ? '正在交付组合…' : '交给下次规划'}</button>
         {running && <p style={small}>当前工坊正在执行；可以试组合，结束后再提交。</p>}
         {play.draft.notice && <p role="status" style={{ fontSize: 12, lineHeight: 1.7, color: '#e0dcae' }}>{play.draft.notice}</p>}
+        <button type="button" style={{ ...button, marginLeft: 7 }} onClick={play.cancelAdjust}>返回系统安排</button>
       </form>}
     </>}
     {play.tool === 'probe' && <>
-      <p style={{ ...small, color: '#bfd0bd' }}>沿真实步骤向下追。保存产出、尚未执行和待修补各有依据。</p>
+      <p style={{ ...small, color: '#bfd0bd' }}>这里看三件事：已经做了什么、有什么验证依据、还剩哪些缺口。展开步骤可读原始输出。</p>
       {current?.error && <p role="alert" style={{ color: '#f0ba9c', fontSize: 13 }}>{current.error}</p>}
       {summary?.issues.map((issue, i) => <div key={`${issue.id}:${i}`} style={{ padding: 10, marginBottom: 8, borderLeft: '2px solid #d79e6c', background: '#502f202f', fontSize: 12 }}><b>{issue.id} · {issue.model}</b><p>{issue.reason}</p><button style={button} disabled={!summary.reviews.some(r => r.model === issue.model)} onClick={() => { const review = summary.reviews.find(r => r.model === issue.model); if (review) onReview(review.id); }}>追到评审依据</button></div>)}
       {current?.orchestration.map(step => <details key={step.index} open={step.status === 'error' || step.status === 'running'} style={{ borderTop: '1px solid #3b5c4e', padding: '10px 0', fontSize: 12 }}>
@@ -91,6 +99,7 @@ export const AimeinPlayPanel: React.FC<{
       <p style={{ ...small, color: '#bfd0bd' }}>修补意见可以写在下方，连同对象与尝试一起留给下一次规划。</p>
     </>}
     {play.tool === 'reviewers' && <>
+      <AimeinReviewSummary summary={summary} detail={current?.aimeinRun} />
       <p style={{ ...small, color: '#bfd0bd' }}>每位评委都有自己的模型、口味和聚焦。先看判断依据，再调下一次的理解。</p>
       {(summary?.reviews || []).map((review, i) => <div key={review.id} style={{ padding: 12, marginBottom: 8, background: '#0e2424', border: '1px solid #4d685a', borderRadius: 7 }}>
         <b style={{ fontSize: 13 }}>{i + 1} · {review.profileName || review.model}</b><p style={{ fontSize: 12, color: review.status === 'passed' ? '#b6d79c' : '#e0c18b' }}>{review.error || review.summary || '等待独立核对'}</p>

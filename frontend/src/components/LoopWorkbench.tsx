@@ -27,7 +27,7 @@ export const LoopWorkbench: React.FC<{
   useEffect(() => { if (section) { close.current?.focus(); detail.current?.scrollTo(0, 0); } }, [section]);
   return <div ref={root} data-testid="loop-workbench" style={{ position: 'relative', flex: 1, minHeight: 0, minWidth: 0, display: 'flex',
     flexDirection: 'column', color: 'var(--theme-text)', overflow: 'hidden', overflowWrap: 'anywhere' }}>
-    <div style={{ position: 'relative', zIndex: 1, flexShrink: 0, padding: immersive ? '6px 10px' : '12px 14px', maxHeight: immersive ? '22%' : undefined, overflowY: immersive ? 'auto' : undefined, borderBottom: '1px solid var(--theme-border)' }}>{header}</div>
+    {header && <div style={{ position: 'relative', zIndex: 1, flexShrink: 0, padding: immersive ? '6px 10px' : '12px 14px', maxHeight: immersive ? '22%' : undefined, overflowY: immersive ? 'auto' : undefined, borderBottom: '1px solid var(--theme-border)' }}>{header}</div>}
     <div style={{ flex: 1, minHeight: 0, minWidth: 0, display: 'flex', flexDirection: immersive && narrow ? 'column' : 'row', position: immersive ? 'relative' : undefined }}>
       <main aria-label="LOOP 当前任务" aria-hidden={!immersive && section ? true : undefined} style={{ position: 'relative', zIndex: 0, display: immersive ? 'flex' : narrow && section ? 'none' : 'block', flexDirection: 'column',
         flex: 1, minHeight: 0, minWidth: 0, overflow: immersive ? 'hidden' : 'auto', padding: immersive ? 8 : 14 }}>{children}</main>

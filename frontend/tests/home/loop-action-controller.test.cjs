@@ -19,6 +19,16 @@ test('failure is visible even when backend omits message; successful setting is 
   await c.run('Auto', async () => ({ status: 'ok' }));
   assert.equal(c.feedback.phase, 'done');
 });
+test('accepted receipt does not retain a temporary preparing status after execution changes', async () => {
+  const c = new LoopActionController(() => {});
+  await c.run('执行 LOOP', async () => ({ status: 'ok', message: '请求已接收；正在准备工作区，随后显示实际执行阶段。' }), true);
+  assert.equal(c.feedback.phase, 'accepted');
+  assert.match(c.feedback.message, /请求已接收/);
+  assert.match(c.feedback.message, /以执行状态为准/);
+  assert.doesNotMatch(c.feedback.message, /正在准备/);
+  await c.run('设置', async () => ({ status: 'ok', message: '设置已保存' }));
+  assert.match(c.feedback.message, /设置已保存/);
+});
 test('timeout gets one read, never writes again or accepts late result', async () => {
   const gate = defer(); let writes = 0, reads = 0;
   const c = new LoopActionController(() => {}, 5);

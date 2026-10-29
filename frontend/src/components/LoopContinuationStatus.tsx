@@ -58,14 +58,15 @@ export const LoopSourceCard: React.FC<{ sessionId: string; execKey?: string; sou
   };
   const mutate = (action: 'bind' | 'unbind' | 'confirm' | 'refresh') => run(() => api.loopTaskSourceSet(sessionId, action,
     source?.revision || 0, discovery?.binding?.executor || source?.executor || '', selected, discovery?.discoveryId || '', disposition, execKey));
-  const labels: Record<string, string> = { unbound: '未绑定（通用模式）', current: '已核对', stale: '快照已过期', conflict: '范围冲突', unavailable: '暂不可核对', blocked: '工作流 blocked', invalid: '来源记录无效' };
-  const bound = source?.status && source.status !== 'unbound';
+  const labels: Record<string, string> = { unbound: '未绑定（通用模式）', preparing: '正在准备项目与方案', current: '已核对', stale: '快照已过期', conflict: '范围冲突', unavailable: '暂不可核对', blocked: '工作流 blocked', invalid: '来源待核对' };
+  const bound = !!source?.change;
   return <section style={box} aria-label="LOOP 任务来源" data-testid="loop-source-card">
-    <strong>{source?.change || '通用 LOOP'} · {labels[source?.status || 'unbound'] || '待核对'}</strong>
+    <strong>{source?.change || (source?.code || source?.status === 'preparing' ? 'OpenSpec' : '通用 LOOP')} · {labels[source?.status || 'unbound'] || '待核对'}</strong>
     {bound && <details><summary>来源位置与核对身份</summary>{source?.executor} · execute Backend {source?.backendId}<br />{source?.workspace}</details>}
     {bound && <div>正式任务勾选：{source?.checked ?? '?'} / {source?.total ?? '?'}（不是验收比例）
       {!!source?.checkedAt && <> · 核对于 {new Date(source.checkedAt * 1000).toLocaleString()}</>}</div>}
-    {source?.reason && <div role="status">{source.reason}</div>}
+    {source?.reason && <div role="status">{source.code === 'project_required'
+      ? '当前工作区尚未准备 OpenSpec。目标已明确要求 OpenSpec 时，点击推进会自动准备并衔接方案。' : source.reason}</div>}
     {bound && source?.status === 'conflict' && source.diff && <div>范围差异：新增 {source.diff.added?.join('、') || '无'}；删除 {source.diff.removed?.join('、') || '无'}；改义 {source.diff.changed?.join('、') || '无'}{source.diff.artifactsChanged && '；验收工件变化'}</div>}
     {readOnly && <div>当前只读：{lockedReason || '当前身份或状态不允许变更来源'}。</div>}
     <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, marginTop: 6 }}>
