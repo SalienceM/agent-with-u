@@ -10,6 +10,27 @@ use tauri_plugin_notification::NotificationExt;
 use tauri_plugin_shell::process::CommandChild;
 
 mod hacker_mode;
+mod kit_update;
+mod kit_desktop;
+static KIT_DESKTOP_PROOF: Mutex<Option<String>> = Mutex::new(None);
+
+fn kit_desktop_proof() -> Result<String, String> {
+    let mut proof = KIT_DESKTOP_PROOF.lock().map_err(|e| e.to_string())?;
+    Ok(proof.get_or_insert_with(|| uuid::Uuid::new_v4().to_string()).clone())
+}
+
+#[tauri::command]
+fn get_kit_update_identity(window: tauri::WebviewWindow) -> Result<serde_json::Value, String> {
+    if window.label() != "main" { return Err("main desktop connection required".into()); }
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?.canonicalize().map_err(|e| e.to_string())?;
+    let exe = PathBuf::from(exe.to_string_lossy().trim_start_matches("\\\\?\\"));
+    let instance_id = kit_update::digest(&serde_json::json!(exe.to_string_lossy().to_lowercase()))?;
+    Ok(serde_json::json!({"protocol":1, "proof":kit_desktop_proof()?, "instanceId":instance_id,
+        "exe":exe, "pid":std::process::id(), "deviceId":load_or_create_local_device_id()?,
+        "installed":!cfg!(debug_assertions) && kit_desktop::installed(&exe),
+        "release":{"version":env!("AWU_DISPLAY_VERSION"), "packageVersion":env!("AWU_PACKAGE_VERSION"),
+                   "buildId":env!("AWU_BUILD_ID"),"sequence":env!("AWU_BUILD_SEQUENCE").parse::<u64>().unwrap_or(0)}}))
+}
 mod local_documents;
 mod session_windows;
 
@@ -343,6 +364,16 @@ fn write_update_result(plan: &UpdateInstallPlan, ok: bool, error: &str, exit_cod
 /// It intentionally performs no shell parsing: the signed/checksummed plan is
 /// an argv vector, so paths and arbitrary installer formats remain unambiguous.
 pub fn run_update_helper(plan_path: &str) -> i32 {
+    if let Ok(raw) = std::fs::read_to_string(plan_path) {
+        if let Ok(plan) = serde_json::from_str::<serde_json::Value>(&raw) {
+            if plan.get("kitUpdate").is_some() {
+                return match kit_update::run(&update_root(), std::path::Path::new(plan_path), &mut KitUpdateRunner) {
+                    Ok(_) => 0,
+                    Err(_) => 1, // 校验失败不重启、不运行旧助手路径；journal 保留未知保护。
+                };
+            }
+        }
+    }
     let result = (|| -> Result<i32, String> {
         let raw = std::fs::read_to_string(plan_path).map_err(|error| error.to_string())?;
         let plan: UpdateInstallPlan =
@@ -486,6 +517,115 @@ fn update_root() -> PathBuf {
         .join("updates")
 }
 
+struct KitUpdateRunner;
+impl kit_update::Runner for KitUpdateRunner {
+    fn wait_owned(&mut self, pids: &[u32]) -> Result<(), String> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        loop {
+            let mut pending = false;
+            for pid in pids {
+                #[cfg(windows)]
+                unsafe {
+                    use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, ERROR_INVALID_PARAMETER, WAIT_OBJECT_0, WAIT_TIMEOUT};
+                    use windows_sys::Win32::System::Threading::{OpenProcess, WaitForSingleObject};
+                    let handle = OpenProcess(0x0010_0000, 0, *pid);
+                    if handle.is_null() {
+                        if GetLastError() != ERROR_INVALID_PARAMETER { return Err("owned process exit is unknown".into()); }
+                    } else {
+                        let status = WaitForSingleObject(handle, 0);
+                        CloseHandle(handle);
+                        if status == WAIT_TIMEOUT { pending = true; }
+                        else if status != WAIT_OBJECT_0 { return Err("owned process wait failed".into()); }
+                    }
+                }
+                #[cfg(not(windows))]
+                { let _ = pid; return Err("Kit installer requires Windows".into()); }
+            }
+            if !pending { return Ok(()); }
+            if std::time::Instant::now() >= deadline { return Err("owned processes have not exited; no installer started".into()); }
+            std::thread::sleep(std::time::Duration::from_millis(250));
+        }
+    }
+    fn install(&mut self, plan: &serde_json::Value) -> kit_update::Installation {
+        let result = (|| -> Result<kit_update::Installation, String> {
+            let program = plan["install"]["program"].as_str().ok_or("missing installer")?;
+            let executable = if program == "msiexec.exe" {
+                PathBuf::from(std::env::var_os("SystemRoot").ok_or("missing SystemRoot")?).join("System32/msiexec.exe")
+            } else { PathBuf::from(program) };
+            let mut command = std::process::Command::new(executable);
+            for arg in plan["install"]["args"].as_array().ok_or("missing args")? {
+                command.arg(arg.as_str().ok_or("invalid argument")?);
+            }
+            command.stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+            #[cfg(windows)] { use std::os::windows::process::CommandExt; command.creation_flags(0x0800_0000); }
+            let mut child = command.spawn().map_err(|e| e.to_string())?;
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1800);
+            loop {
+                match child.try_wait() {
+                    Ok(Some(status)) => {
+                        let code = status.code().unwrap_or(-1);
+                        return Ok(if code == 0 || (program == "msiexec.exe" && code == 3010) {
+                            kit_update::Installation::Succeeded(code)
+                        } else { kit_update::Installation::Failed(format!("installer exit {code}")) });
+                    }
+                    Err(e) => return Ok(kit_update::Installation::Unknown(e.to_string())),
+                    Ok(None) if std::time::Instant::now() >= deadline =>
+                        return Ok(kit_update::Installation::Unknown("installer timeout; process not killed".into())),
+                    _ => std::thread::sleep(std::time::Duration::from_millis(300)),
+                }
+            }
+        })();
+        result.unwrap_or_else(kit_update::Installation::Failed)
+    }
+    fn restart(&mut self, plan: &serde_json::Value) -> Result<(), String> {
+        let mut command = std::process::Command::new(plan["restart"]["program"].as_str().ok_or("missing restart")?);
+        command.stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+        #[cfg(windows)] { use std::os::windows::process::CommandExt; command.creation_flags(0x0000_0008 | 0x0000_0200 | 0x0800_0000); }
+        command.spawn().map(|_| ()).map_err(|e| e.to_string())
+    }
+}
+
+fn install_kit_update(app: &tauri::AppHandle, root: &std::path::Path, plan_path: &std::path::Path) -> Result<(), String> {
+    if !cfg!(windows) { return Err("Kit install requires Windows".into()); }
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let valid = kit_update::validate(root, plan_path, Some(&exe), Some(std::process::id()))?;
+    if !kit_update::claim_launch(&valid)? { return Ok(()); }
+    let launched = (|| -> Result<(), String> {
+        let helper = root.join(format!("kit-update-helper-{}.exe", valid.request));
+        let mut output = std::fs::OpenOptions::new().write(true).create_new(true).open(&helper).map_err(|e| e.to_string())?;
+        std::io::copy(&mut std::fs::File::open(&exe).map_err(|e| e.to_string())?, &mut output).map_err(|e| e.to_string())?;
+        output.sync_all().map_err(|e| e.to_string())?;
+        drop(output);
+        let mut command = std::process::Command::new(helper);
+        command.arg("--agentwithu-update-helper").arg(plan_path)
+            .stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+        #[cfg(windows)] {
+            use std::os::windows::process::CommandExt;
+            command.creation_flags(0x0000_0008 | 0x0000_0200 | 0x0800_0000 | 0x0100_0000);
+        }
+        // 新链路不降级到未知 Job 归属，不自动尝试第二种启动方式。
+        command.spawn().map_err(|e| e.to_string())?;
+        Ok(())
+    })();
+    if let Err(error) = launched {
+        kit_update::fail_unlaunched(&valid, &error)?;
+        return Err(error);
+    }
+    // 新协议不借用全局 PID 文件兜底。只关闭此壳持有的 sidecar；失去句柄时
+    // 助手会因绑定 PID 未退出而失败，不猜测/结束其他实例。
+    if !APP_EXITING.swap(true, Ordering::SeqCst) {
+        let child = app.state::<BackendProcess>().0.lock().ok().and_then(|mut guard| guard.take());
+        if let Some(child) = child {
+            #[cfg(windows)] {
+                if !kill_windows_process_tree(child.pid()) { let _ = child.kill(); }
+            }
+            #[cfg(not(windows))] { let _ = child.kill(); }
+        }
+        app.exit(0);
+    }
+    Ok(())
+}
+
 #[tauri::command]
 fn install_staged_update(app: tauri::AppHandle, plan_path: String) -> Result<(), String> {
     let root = update_root();
@@ -496,6 +636,10 @@ fn install_staged_update(app: tauri::AppHandle, plan_path: String) -> Result<(),
         return Err("update plan is outside the managed update directory".into());
     }
     let raw = std::fs::read_to_string(&plan_path).map_err(|error| error.to_string())?;
+    let raw_value: serde_json::Value = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
+    if raw_value.get("kitUpdate").is_some() {
+        return install_kit_update(&app, &root, &plan_path);
+    }
     let mut plan: UpdateInstallPlan =
         serde_json::from_str(&raw).map_err(|error| error.to_string())?;
     if plan.marker != "agentwithu-update-plan-v1" || plan.schema_version != 1 {
@@ -1679,6 +1823,9 @@ pub fn run() {
                             }
                             sidecar = sidecar
                                 .env("AGENT_WITH_U_DESKTOP_PID", std::process::id().to_string());
+                            if let Ok(proof) = kit_desktop_proof() {
+                                sidecar = sidecar.env("AGENT_WITH_U_KIT_DESKTOP_PROOF", proof);
+                            }
                             if let Ok(executable) = std::env::current_exe() {
                                 sidecar = sidecar.env(
                                     "AGENT_WITH_U_DESKTOP_EXE",
@@ -1760,6 +1907,7 @@ pub fn run() {
             session_windows::report_workbench_exit_state,
             get_local_device_id,
             get_local_identity_token,
+            get_kit_update_identity,
             get_desktop_logs,
             report_desktop_log,
             show_task_completion_notification,
@@ -1780,6 +1928,9 @@ pub fn run() {
             local_documents::local_document_bind,
             local_documents::local_document_read,
             local_documents::local_document_replace,
+            local_documents::local_sync_review_read,
+            local_documents::local_sync_review_apply,
+            local_documents::local_sync_review_get,
             dir_sync_file_size,
             dir_sync_read_chunk,
             kit_client_file_info,

@@ -20,7 +20,7 @@ import {
 } from '../utils/thoughtsWindow';
 import { AdvancedPromptTextarea } from './AdvancedPromptTextarea';
 import { SpeechToTextControl } from './SpeechToTextControl';
-import { inspectionLabel, matchesThoughtsScope, mergeAsideTurns, sourceStatus, type ThoughtsInspection } from '../utils/thoughtsInspection';
+import { inspectionLabel, matchesThoughtsScope, mergeAsideTurns, sourceStatus, sourceRange, type ThoughtsInspection } from '../utils/thoughtsInspection';
 
 interface AsideTurn {
   id: string;
@@ -549,7 +549,7 @@ export const ThoughtsAssistant: React.FC<Props> = ({
                   {source.change && <div>变更：{source.change}</div>}
                   {source.readAt && <div>读取：{new Date(source.readAt * 1000).toLocaleString()}</div>}
                   {source.revision && <div title={source.revision}>修订：{source.revision.slice(0, 16)}</div>}
-                  {source.offset !== undefined && <div>字符范围：{source.offset}–{source.end ?? '?'}{source.complete === false ? '（非全文）' : ''}</div>}
+                  {sourceRange(source) && <div>{sourceRange(source)}</div>}
                   {source.checked !== undefined && <div>文件勾选：{source.checked}/{source.total}；不等于人工验收</div>}
                 </div>)}
               </details>

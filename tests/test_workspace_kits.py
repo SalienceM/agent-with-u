@@ -720,7 +720,9 @@ class WorkspaceKitGenerationTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("正式上传仍由能力自己的独立确认点拦截", fake.prompt)
 
     def test_inspecting_builds_without_publish_does_not_grant_release_capability(self):
-        bridge = BridgeWS()
+        bridge = BridgeWS.__new__(BridgeWS)
+        from src.backend.kit_capabilities import KitCapabilityRegistry
+        bridge._kit_capabilities = KitCapabilityRegistry()
 
         candidate = bridge._kit_builtin_release_candidate(
             "检查最新打包结果，比较 Windows 和 Linux 制品",
@@ -730,7 +732,9 @@ class WorkspaceKitGenerationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(candidate)
 
     def test_non_software_or_negated_publish_does_not_grant_release_capability(self):
-        bridge = BridgeWS()
+        bridge = BridgeWS.__new__(BridgeWS)
+        from src.backend.kit_capabilities import KitCapabilityRegistry
+        bridge._kit_capabilities = KitCapabilityRegistry()
 
         self.assertIsNone(bridge._kit_builtin_release_candidate(
             "发布一篇项目周报", "文章可在线阅读",

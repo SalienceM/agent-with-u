@@ -341,6 +341,7 @@ class BuildVersionTests(unittest.TestCase):
             self.assertNotEqual(first["packageVersion"], second["packageVersion"])
             self.assertEqual(second["packageVersion"], repeated["packageVersion"])
             self.assertEqual(20260828093145, second["sequence"])
+            self.assertIn("__kit_update_protocol__ = 1", version_file.read_text(encoding="utf-8"))
 
 
 class ReleasePublisherTests(unittest.TestCase):

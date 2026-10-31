@@ -575,7 +575,16 @@ binary files. File I/O and explicit Skill reference reads run as owned async wor
 cancelled waiters cannot release an unconfirmed read/model reservation. This reservation
 belongs only to the aside, never the main LOOP or other Sessions. Questions have 180s,
 4 decision rounds + 1 final answer, 24 read operations, 256 KiB/file, 1 MiB total disk
-reads and 64K project-evidence characters. `aside_openspec.py` reads real tasks without
+reads and 64K project-evidence characters. Discovery (including reference preparation)
+ends at 120s, reserving the final 60s for one evidence-only answer; search consumes at
+most 512 KiB within the same total read budget, leaving room for targeted reads.
+Reads reserve bytes before I/O; cached revisions do not consume disk bytes twice.
+Global limits finalize, local file limits allow other targets, repeated identical
+irrecoverable limit queries do not repeat I/O. Discovery cancellation must settle both
+owned tasks and native Harness activity before summary generation; user cancellation
+never summarizes. Python 3.10 cancellation is explicitly tracked per model Task to
+avoid interrupting cleanup twice. Late packets cannot enter the final answer.
+`aside_openspec.py` reads real tasks without
 CLI, binding or scheduling: explicit target → valid association → unique candidate;
 ambiguous/failed sources do not silently switch. File checkboxes, excluded manual scope
 and model verify remain different evidence. @SKILL adds reference material without
@@ -585,6 +594,11 @@ or file bodies. The UI shows preparation/read/answer and actual terminal/unknown
 strict owner/executor/Session routing and monotonic turn revisions, including legacy
 terminal events without metadata. Timeout reads once, never replays submission. Retry
 fills a draft for a new user submission. See `docs/thoughts-readonly-inspection.md`.
+Source metadata carries only allowlisted limit reasons and bounded counts: directory
+pages, search coverage and text character ranges render separately. Legacy missing
+reasons stay unknown. Timeout cause is independent of exit state: confirmed terminal
+messages say exit confirmed, while unknown retains the reservation. Neither a partial
+answer nor an exit confirmation proves complete project coverage or model success.
 
 Loop state is read/written through a process-level singleton cache
 (`_loop_state` / `_loop_save` / `_loop_create`) so a running iteration's
@@ -1210,7 +1224,21 @@ Workspace Kits are Session-level standard accessories stored separately in
   job owns upload/manifest semantics while bounded progress is mirrored into `KitStepRun`;
   cancelling the Kit also cancels the release job. Capability metadata declares risk,
   physical-node permission and approval policy in `src/backend/kit_capabilities.py`.
-- `kitCancel` is immediate and idempotent: it first persists the authoritative
+- Kit 本机更新能力 `node.update_local_published` 只接受执行器绑定的窄服务 context，
+  不接受模型提供的命令、路径、目标、owner 或发布回执。组合使用真实构建 Kit 的
+  `captureBuild` 回执、`bindBuild` 发布和唯一末尾安装步骤；保存不执行，Schedule 禁用。
+  更新使用当前 run 成功发布的不可变清单及 SHA-256，不改常规更新源，不读取 latest 决定对象。
+  只支持已安装 Windows 桌面；本地壳通过独立握手证明实例，通知不广播到远端控制窗口。
+  发布与安装分别确认；聊天发布委托永远不授权安装。安装确认绑定 owner/Session/run/step/
+  fingerprint/requestId，重新检查权限、实例、忙闲和节点共享预留。交接屏障拒绝新任务；
+  持久化未知 LOOP/Kit 活动、不可读记录不能当作空闲。journal 为安装责任来源，双文件
+  写失败不发安装通知；助手一次性领取，不以安装器退出码代替桌面与 Backend 完整版本验收。
+  新交接只关闭壳实际持有的 sidecar，不借用全局 PID 文件。handing_off/waiting_restart/
+  verifying/result_unknown 都是非成功活动状态；kitResume 只核对，不重跑。交接前只取消
+  本请求，确认后不能保证撤回，不杀安装器、不回滚；未知保持保护。有界恢复最多 13 次，
+  180 秒未验收显示未知。首次协议部署使用原更新入口，构建时才写 kitUpdateProtocol=1。
+  相关测试仅用隔离目录和 fake 发布/安装，不代表生产升级验收。见 `docs/kit-local-update-chain.md`。
+- 普通命令 Kit 的 `kitCancel` is immediate and idempotent: it first persists the authoritative
   `cancelled` run/step state, then cancels any live orchestration task and terminates
   the exact command process tree by run PID. This also repairs orphaned active records
   after an executor exception/restart. Client-side commands are registered by `runId`;
@@ -1770,6 +1798,37 @@ adaptive pause, realtime playback engine, RMS threshold, and interruption switch
 
 ### Directory sync — sidebar file-tree view (`FileTreePanel`)
 
+**Explicit single-file sync review.** After an explicit compare, `DirectorySyncReviewPanel`
+and `useDirectorySyncReview` provide a separate local-copy/executor diff queue (not Git
+diff or an editor). Scope includes owner, explicit executor, Session, authoritative
+workspace revision, real local binding and Git policy; old baselines remain untrusted.
+`sync_review.py` / `SyncReviewBridge` expose bounded `syncReviewCapabilities/Read/Check/Apply/Get`.
+Review reads cap each side at 2 MiB, 20,000 lines and 64 Ki characters per line. A budgeted
+worker produces real line mappings, with folding and windowed rendering. Only confirmed
+whole-file raw bytes are transferred: both sides rechecked, target version checked again
+at publication, no weak ordinary-sync fallback. Existing document atomics remain separate
+from text encoding. Browser device-directory safe creation is unavailable; managed IDB
+uses transactional revision/commitId, native Windows/Linux use protected file primitives.
+Unknown receipts retain shared transfer exclusion; one bounded reconciliation, then explicit
+read-only query, never write replay. Closing review is not cancellation. Current two-sided
+equality is required for trusted baseline advancement. See `docs/directory-sync-review.md`
+and `docs/directory-sync-review-verification.md` for actual limits and tested platforms.
+
+Review inherits the tree's two-sided-only difference scope. Path regex runs in a
+deadline-terminated worker; the dialog uses the opaque theme panel color. Known
+differences expose an explicit comparison action in ordinary preview. A bounded
+window-memory cache restores tree/search/comparison and review preferences across
+Session switches, keyed by owner/executor/Session/root/Chat-or-Engine. It retains no
+file bodies, confirmations or Git-metadata consent; account changes clear it. Restored
+comparisons remain timestamped historical evidence and never bypass current reads or
+transfer version checks. Directory expansion alone also persists in bounded controller
+localStorage, using the same view identity. Reload lazily reads only expanded branches
+confirmed by current parent listings; collapsed ancestors retain child preferences without
+reading them. Collapse-all clears this view's expansion. No file bodies, comparisons or
+grants persist in this preference. Manual refresh invalidates the prior comparison but
+preserves expansion choices. See the
+same user guide for eviction/restart limits.
+
 The old modal diff/pull/push dialog (`DirSyncPanel`, removed) was reworked into a
 VSCode-explorer-style tree living in the **Sidebar** as a switchable view (a 💬/🗂
 tab toggle in the sidebar header; `view: 'sessions' | 'files'`). `FileTreePanel`
@@ -1811,7 +1870,8 @@ Transfers already update their affected manifests/directories, so completion nev
 triggers another full scan. The panel subscribes only to its workspace's progress
 snapshot and is memoized against unrelated Sidebar updates. Unmounting aborts local
 metadata scanning and prevents late operation callbacks from starting directory/Git
-reads; submitted transfers themselves still continue. Tests count RPCs and local scans
+reads; submitted transfers themselves still continue. Cached re-entry restores the
+directory state without repeating scans; Git retains its lightweight entry check. Tests count RPCs and local scans
 across idle time, reconnects, transfers and hidden/collapsed panels.
 
 **Local refresh fast path.** `listDirectory`, `gitDetect` and `gitStatus` run off the

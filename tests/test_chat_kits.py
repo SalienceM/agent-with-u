@@ -91,6 +91,28 @@ class ChatKitTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("approvalDelegation", run.to_dict())
         self.manager.start_publish.assert_not_awaited()
 
+    async def test_local_install_never_inherits_publication_delegation(self):
+        run = await self.publishing_run(True)
+        step = run.steps[0]
+        step.config["capability"] = "node.update_local_published"
+        step.config["capabilityRuntime"]["plan"] = {
+            "desktop": {"deviceId": "executor-A"}, "release": {"buildId": "full-build"},
+            "artifact": {"sha256": "a" * 64}, "warnings": ["需要退出目标节点"]}
+        status = await self.call("status", runId=run.id)
+        pending = status["run"]["pendingApproval"]
+        self.assertFalse(pending["canApprove"])
+        self.assertIn("Kit 面板", pending["reason"])
+        self.assertEqual("executor-A", pending["plan"]["desktop"]["deviceId"])
+        result = await self.call("approve", runId=run.id, stepId=step.id,
+            planFingerprint=pending["planFingerprint"], requestId="install-confirmation")
+        self.assertEqual("error", result["status"])
+        self.manager.start_publish.assert_not_awaited()
+        run.status = step.status = "result_unknown"
+        step.config["capabilityRuntime"].update(phase="result_unknown", installRequestId="r", message="等待核对")
+        status = await self.call("status", runId=run.id)
+        self.assertEqual("result_unknown", status["run"]["localUpdate"]["phase"])
+        self.assertIn("不重新安装", status["run"]["guidance"])
+
     async def test_delegated_approval_requires_status_and_is_audited_idempotent(self):
         run = await self.publishing_run()
         self.assertEqual(run.approval_delegation["plans"]["publish"], "f" * 64)

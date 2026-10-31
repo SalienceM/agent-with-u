@@ -26,7 +26,9 @@ export function loopRecordRevision(record: DetailRevisionSource): string {
     record.manualMessageCount ?? record.manualMessages?.length ?? 0,
     Object.entries(record.stageDetails || {}).sort(([a], [b]) => a.localeCompare(b))
       .map(([stage, detail]) => [stage, detail.status, detail.attemptCount, detail.message]),
-    record.orchestration.map(step => [step.index, step.desc, step.status, step.attempts, step.endedAt]),
+    // 保留缺失/坏类型与明确空集合的版本差异，不能在详情加载前崩溃。
+    Array.isArray(record.orchestration) ? record.orchestration.map(step => step && [step.index, step.desc, step.status, step.attempts, step.endedAt])
+      : { state: record.orchestration === undefined ? 'missing' : 'invalid', value: record.orchestration },
     record.callDiagnostics?.slice(-1).map(call => [call.id, call.status, call.endedAt]),
     record.environmentChecks?.slice(-1).map(check => [check.id, check.revision, check.status]),
   ]);

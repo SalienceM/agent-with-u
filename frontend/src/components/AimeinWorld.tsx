@@ -20,7 +20,7 @@ class SceneBoundary extends React.Component<{ children: React.ReactNode; onFailu
 export const AimeinWorld: React.FC<{
   current?: LoopRecord; selected: AimeinAnchor; built: boolean; running: boolean; latest: boolean; onSelect: (value: AimeinAnchor) => void;
   preparing?: boolean; immersive?: boolean; contained?: boolean;
-  reviewerCount?: number; observing?: boolean;
+  reviewerCount?: number; observing?: boolean; onModeChange?: (value: '3d' | 'static' | 'fallback') => void;
   play?: AimeinPlayState;
   goal?: string; activityLabel?: string;
 }> = props => {
@@ -48,6 +48,8 @@ export const AimeinWorld: React.FC<{
   const [focus, setFocus] = useState<{ anchor: AimeinAnchor | null; serial: number }>({ anchor: null, serial: 0 });
   const layout = props.play?.tool === 'assemble' ? 'split' : choice?.basis === projection.basis ? choice.layout : projection.layout;
   const useStatic = staticView || !!failure;
+  useEffect(() => { props.onModeChange?.(failure ? 'fallback' : staticView ? 'static' : '3d'); }, [failure, staticView, props.onModeChange]);
+  const quietStatic = compact && useStatic && props.observing;
   const taskIdentity = JSON.stringify([projection.seq, projection.targets.map(t => t.id)]);
   const [taskView, setTaskView] = useState({ identity: '', page: 0, target: '' });
   const [hoverId, setHoverId] = useState('');
@@ -95,6 +97,8 @@ export const AimeinWorld: React.FC<{
     { name: '目标灯塔与目标瓶', kind: 'goal' }, { name: '功能工坊', kind: 'flow' }, { name: '基础设施', kind: 'infra' }, { name: '成果架', kind: 'artifact' },
     ...Array.from({ length: props.reviewerCount ?? 3 }, (_, i) => ({ name: `评委 ${i + 1}`, kind: 'review' as const, reviewId: current?.aimeinSummary?.reviews[i]?.id || `review${i + 1}` })),
   ];
+  // 窄屏历史条参与菜单滚动，不再绝对定位压住底部的评委按钮。
+  const historyStrip = props.play && !!props.play.footprints.length && <nav aria-label="世界足迹" style={{ display: (compact || props.observing) && !menu ? 'none' : 'flex', gap: 5, padding: '5px 8px', flexShrink: 0, overflowX: 'auto', fontSize: 10, alignItems: 'center', background: '#0d2325' }}><span style={{ color: '#93ac97', whiteSpace: 'nowrap' }}>世界足迹</span>{props.play.footprints.map(f => <button key={f.seq} aria-label={`足迹 #${f.seq}：${f.title}`} aria-pressed={projection.seq === f.seq} onClick={() => { setMenu(false); props.play!.onHistory(f.seq); }} style={{ ...actionStyle, padding: '3px 7px', font: '11px monospace', color: f.accepted ? '#c6e4aa' : '#cfb786', borderColor: projection.seq === f.seq ? '#d6d5a2' : '#35564b', whiteSpace: 'nowrap' }} title={`${f.title} · ${f.saved === null ? '输出详情待展开' : `${f.saved} 步已保存`} · ${f.accepted ? '阶段通过' : '尚未通过'}`}>{f.accepted ? '▣' : '◇'} {f.seq}</button>)}</nav>;
   return <div ref={root} tabIndex={0} aria-label="交互沙盘" onKeyDown={event => {
     if (event.key === 'Escape' && menu) { event.stopPropagation(); setMenu(false); return; }
     if (!props.play || event.altKey || event.ctrlKey || event.metaKey || (event.target as HTMLElement).closest('input,textarea,select,[contenteditable="true"]')) return;
@@ -149,11 +153,18 @@ export const AimeinWorld: React.FC<{
         const isSelected = selected.kind === item.kind && selected.reviewId === item.reviewId;
         return <button key={item.name} aria-label={`观察${item.name}`} aria-pressed={isSelected} style={{ ...actionStyle, background: isSelected ? '#cee1ad' : '#193634', color: isSelected ? '#16372b' : '#c8dfd1' }} onClick={() => choose({ kind: item.kind, reviewId: item.reviewId, seq: projection.seq })}>{item.name}</button>;
       })}</nav>
+      {compact && historyStrip}
       </div>
       {!props.preparing && !props.contained && <details style={{ margin: '0 18px 16px', fontSize: 12, color: '#a9c7b9' }}><summary style={{ cursor: 'pointer' }}>子目标与阶段范围</summary>{projection.targets.map(t => <p key={t.id}>{t.id} · {t.title} · {t.verified ? '共同核实' : '待核实'} · {t.inSprint ? '本阶段' : projection.scoped ? '阶段外' : '范围待确认'}</p>)}</details>}
     </>}
-    {(!compact || !props.observing || menu || useStatic) && <AimeinTaskMap targets={projection.targets} page={page} selected={targetId} hover={hoverId} quiet={props.observing} compact={compact} staticView={useStatic} onPage={showTaskPage} onTarget={id => chooseTarget(id, true)} />}
-    {props.play && <AimeinHotbar play={{ ...props.play, onTool: tool => { setMenu(false); props.play!.onTool(tool); } }} compact={compact} quiet={props.observing} />}
-    {props.play && !!props.play.footprints.length && <nav aria-label="世界足迹" style={{ display: (compact || props.observing) && !menu ? 'none' : 'flex', ...(compact ? { position: 'absolute', bottom: 62, left: 8, right: 8, zIndex: 6 } as React.CSSProperties : {}), gap: 5, padding: '5px 8px', flexShrink: 0, overflowX: 'auto', fontSize: 10, alignItems: 'center', background: '#0d2325' }}><span style={{ color: '#93ac97', whiteSpace: 'nowrap' }}>世界足迹</span>{props.play.footprints.map(f => <button key={f.seq} aria-label={`足迹 #${f.seq}：${f.title}`} aria-pressed={projection.seq === f.seq} onClick={() => { setMenu(false); props.play!.onHistory(f.seq); }} style={{ ...actionStyle, padding: '3px 7px', font: '11px monospace', color: f.accepted ? '#c6e4aa' : '#cfb786', borderColor: projection.seq === f.seq ? '#d6d5a2' : '#35564b', whiteSpace: 'nowrap' }} title={`${f.title} · ${f.saved === null ? '输出详情待展开' : `${f.saved} 步已保存`} · ${f.accepted ? '阶段通过' : '尚未通过'}`}>{f.accepted ? '▣' : '◇'} {f.seq}</button>)}</nav>}
+    <div style={quietStatic ? { display: menu ? 'flex' : 'none', flexDirection: 'column', position: 'absolute', top: 35, left: 6, right: 6, maxHeight: '75%', overflow: 'auto', zIndex: 5, background: '#102c2c', border: '1px solid #68846c', borderRadius: 8 } : compact && useStatic ? { display: 'flex', flexDirection: 'column', flex: '0 1 auto', minHeight: 60, overflow: 'hidden' } : { display: 'contents' }}>
+      <div style={compact && useStatic ? { minHeight: 0, overflow: 'auto', flex: 1 } : { display: 'contents' }}>
+        {(!compact || !props.observing || menu || useStatic) && <AimeinTaskMap targets={projection.targets} page={page} selected={targetId} hover={hoverId} quiet={props.observing} compact={compact} staticView={useStatic} onPage={showTaskPage} onTarget={id => chooseTarget(id, true)} />}
+      </div>
+      {props.play && <AimeinHotbar play={{ ...props.play, onTool: tool => { setMenu(false); props.play!.onTool(tool); } }} compact={compact} quiet={props.observing || compact && useStatic} />}
+      {quietStatic && historyStrip}
+    </div>
+    {compact && useStatic && !quietStatic && menu && <div style={{ position: 'absolute', top: 35, left: 6, right: 6, maxHeight: '75%', overflow: 'auto', zIndex: 5, background: '#102c2c', border: '1px solid #68846c', borderRadius: 8 }}>{historyStrip}</div>}
+    {!compact && historyStrip}
   </div>;
 };

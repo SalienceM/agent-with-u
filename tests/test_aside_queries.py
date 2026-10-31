@@ -3,7 +3,7 @@ import tempfile
 import threading
 import unittest
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from src.backend.aside_inspection import InspectionError, QueryBudget, QueryIdentity
 from src.backend.aside_queries import InspectionQueries
@@ -61,6 +61,34 @@ class QueryOwnershipTests(unittest.IsolatedAsyncioTestCase):
         self.service.budget.seconds = 0
         with self.assertRaisesRegex(InspectionError, '时间'):
             await self.service.execute({'operation': 'runtime_status'})
+
+    async def test_repeat_file_limit_deduplicates_io_and_sources_not_pages(self):
+        (self.root / 'big').write_bytes(b'x' * 262145)
+        packet = {'operation': 'read_text', 'arguments': {'path': 'big'}}
+        with patch.object(self.service.files, 'text', wraps=self.service.files.text) as read:
+            first = await self.service.execute(packet)
+            again = await self.service.execute(packet)
+            self.assertEqual(first['limitReason'], 'file_bytes')
+            self.assertTrue(again['repeated'])
+            self.assertEqual(read.call_count, 1)
+            self.assertEqual(len(self.service.sources), 1)
+        (self.root / 'small').write_text('abcd', encoding='utf-8')
+        for offset in (0, 2):
+            result = await self.service.execute({'operation': 'read_text', 'arguments': {
+                'path': 'small', 'offset': offset, 'limit': 2}})
+            self.assertEqual(result['content'], 'abcd'[offset:offset+2])
+            self.assertNotIn('repeated', result)
+
+    async def test_source_metadata_has_no_rejected_path_or_body(self):
+        result = await self.service.execute({'operation': 'read_text', 'arguments': {'path': '../.env'}})
+        self.assertEqual(result['status'], 'denied')
+        self.assertNotIn('path', self.service.sources[0])
+        (self.root / 'code.txt').write_text('private code body', encoding='utf-8')
+        result = await self.service.execute({'operation': 'list_directory'})
+        self.assertEqual(self.service.sources[-1]['entryCount'], 1)
+        await self.service.execute({'operation': 'search_text', 'arguments': {'path': '.', 'query': 'code'}})
+        self.assertEqual(self.service.sources[-1]['matchCount'], 1)
+        self.assertNotIn('private code body', str(self.service.sources))
 
 
 if __name__ == '__main__':

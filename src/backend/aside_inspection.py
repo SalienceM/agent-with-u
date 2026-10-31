@@ -10,13 +10,33 @@ from dataclasses import dataclass, field
 from typing import Any
 
 
+LIMIT_REASONS = {
+    'file_bytes': '文件超过单文件 256 KiB 上限。',
+    'total_bytes': '本次累计读取量已达上限。',
+    'search_bytes': '搜索读取额度已达上限，可按已定位路径读取文件。',
+    'context_chars': '项目证据上下文已达上限，本结果未完整带入。',
+    'operations': '本次只读操作次数已达上限。',
+    'rounds': '查询轮数已达上限。',
+    'answer_reserve': '查询发现阶段已结束，剩余时间用于整理已有证据。',
+    'directory_page': '目录分页范围已达上限。',
+    'search_scope': '搜索文件、目录或匹配数量已达上限。',
+    'unreadable_files': '部分搜索目标不可读或不支持，未核验全部范围。',
+}
+
+
 class InspectionError(Exception):
-    def __init__(self, code: str, message: str) -> None:
+    def __init__(self, code: str, message: str, *, reason: str = '') -> None:
         super().__init__(message)
         self.code = code
+        self.reason = reason if reason in LIMIT_REASONS else ''
 
     def result(self) -> dict:
-        return {'status': self.code, 'message': str(self), 'complete': False}
+        return {'status': self.code, 'message': str(self), 'complete': False,
+                **({'limitReason': self.reason} if self.reason else {})}
+
+
+def budget_error(reason: str) -> InspectionError:
+    return InspectionError('limit', LIMIT_REASONS[reason], reason=reason)
 
 
 @dataclass(frozen=True)
@@ -106,14 +126,52 @@ class QueryBudget:
     file_bytes: int = 262_144
     total_bytes: int = 1_048_576
     context_chars: int = 64_000
+    search_bytes: int = 524_288
     started: float = field(default_factory=time.monotonic)
     used_operations: int = 0
     used_bytes: int = 0
     used_chars: int = 0
+    used_search_bytes: int = 0
+    exhausted: str = ''
+    search_exhausted: bool = False
     cancelled: threading.Event = field(default_factory=threading.Event)
 
     def remaining(self) -> float:
         return max(0, self.seconds - (time.monotonic() - self.started))
+
+    def discovery_remaining(self) -> float:
+        return max(0, self.remaining() - min(60, self.seconds / 3))
+
+    @property
+    def search_limit(self) -> int:
+        return min(self.search_bytes, self.total_bytes // 2)
+
+    def finish_reason(self) -> str:
+        self.check()
+        if self.discovery_remaining() <= 0:
+            return 'answer_reserve'
+        if self.exhausted:
+            return self.exhausted
+        if self.used_operations >= self.operations:
+            return 'operations'
+        if self.used_bytes >= self.total_bytes:
+            return 'total_bytes'
+        if self.used_chars >= self.context_chars:
+            return 'context_chars'
+        return ''
+
+    def check_discovery(self) -> None:
+        self.check()
+        if self.discovery_remaining() <= 0:
+            raise budget_error('answer_reserve')
+
+    def snapshot(self) -> dict:
+        return {'discoverySeconds': round(self.discovery_remaining(), 2),
+                'remainingSeconds': round(self.remaining(), 2),
+                'operations': max(0, self.operations - self.used_operations),
+                'readBytes': max(0, self.total_bytes - self.used_bytes),
+                'contextChars': max(0, self.context_chars - self.used_chars),
+                'searchAvailable': not self.search_exhausted and self.used_search_bytes < self.search_limit}
 
     def check(self) -> None:
         if self.cancelled.is_set():
@@ -122,21 +180,29 @@ class QueryBudget:
             raise InspectionError('timeout', '本次查询已达到时间上限；未完成的范围没有被核验。')
 
     def operation(self) -> None:
-        self.check()
+        self.check_discovery()
         if self.used_operations >= self.operations:
-            raise InspectionError('limit', '本次只读操作次数已达上限。')
+            raise budget_error('operations')
         self.used_operations += 1
 
-    def bytes(self, count: int) -> None:
-        self.check()
+    def bytes(self, count: int, *, search: bool = False) -> None:
+        """实际读取前预留字节，短读也保守计费；同一请求只允许一个活动读取。"""
+        self.check_discovery()
         if self.used_bytes + count > self.total_bytes:
-            raise InspectionError('limit', '本次累计读取量已达上限。')
+            self.exhausted = 'total_bytes'
+            raise budget_error('total_bytes')
+        if search and (self.search_exhausted or self.used_search_bytes + count > self.search_limit):
+            self.search_exhausted = True
+            raise budget_error('search_bytes')
         self.used_bytes += count
+        if search:
+            self.used_search_bytes += count
 
     def context(self, result: dict) -> dict:
         size = len(json.dumps(result, ensure_ascii=False))
         if self.used_chars + size > self.context_chars:
-            return InspectionError('limit', '项目证据上下文已达上限，本结果未完整带入。').result()
+            self.exhausted = 'context_chars'
+            return budget_error('context_chars').result()
         self.used_chars += size
         return result
 
@@ -158,11 +224,16 @@ def clean_inspection(raw: Any) -> dict:
             continue
         source = {key: item[key][:500] for key in ('operation', 'path', 'revision', 'status', 'change')
                   if isinstance(item.get(key), str)}
+        if isinstance(item.get('limitReason'), str) and item['limitReason'] in LIMIT_REASONS:
+            source['limitReason'] = item['limitReason']
         for key in ('readAt', 'offset', 'end', 'total', 'checked'):
             if type(item.get(key)) in (int, float):
                 source[key] = item[key]
         if isinstance(item.get('complete'), bool):
             source['complete'] = item['complete']
+        for key in ('entryCount', 'nextOffset', 'visited', 'matchCount'):
+            if type(item.get(key)) is int and 0 <= item[key] <= 262_144:
+                source[key] = item[key]
         sources.append(source)
     if sources:
         out['sources'] = sources

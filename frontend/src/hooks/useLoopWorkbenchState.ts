@@ -5,19 +5,21 @@ import { loopRecordRevision } from '../utils/loopRecordDetail';
 import { activeLoopSeq, mergeCallDiagnostics, type CallDiagnostic } from '../utils/loopDiagnostics';
 import { mergeBlockerDetails } from '../utils/loopTaskBlockers';
 import { LoopContractController, contractSnapshotStale, type RepairFeedback } from '../utils/loopContractController';
+import { projectAimeinRecord } from '../utils/aimeinRecordData';
 
 function mergeLoopRecordDetail(summary: LoopRecord, detail?: LoopRecord): LoopRecord {
   if (summary.detailLoaded !== false) return summary;
   if (!detail) return summary;
-  const detailSteps = new Map((detail.orchestration || []).map((step) => [step.index, step]));
-  const orchestration = (summary.orchestration || []).map((step) => {
+  const detailSteps = new Map((Array.isArray(detail.orchestration) ? detail.orchestration : []).filter(Boolean).map((step) => [step.index, step]));
+  const orchestration = Array.isArray(summary.orchestration) ? summary.orchestration.map((step) => {
+    if (!step) return step;
     const full = detailSteps.get(step.index);
     return full ? {
       ...full,
       ...step,
       output: full.output || step.output,
     } : step;
-  });
+  }) : summary.orchestration === undefined ? detail.orchestration : summary.orchestration;
   const analysis = summary.analysis && detail.analysis ? {
     ...detail.analysis,
     ...summary.analysis,
@@ -38,6 +40,8 @@ function mergeLoopRecordDetail(summary: LoopRecord, detail?: LoopRecord): LoopRe
     delivery: detail.delivery?.mode ? detail.delivery : summary.delivery,
     openspecRun: JSON.stringify(summary.openspecSummary) === JSON.stringify(detail.openspecSummary) ? detail.openspecRun : summary.openspecRun,
     aimeinRun: summary.aimeinSummary?.revision === detail.aimeinSummary?.revision ? detail.aimeinRun : summary.aimeinRun,
+    aimeinSummary: summary.aimeinSummary?.revision && summary.aimeinSummary.revision === detail.aimeinSummary?.revision
+      ? { ...detail.aimeinSummary, ...summary.aimeinSummary } : summary.aimeinSummary,
     analysis,
     orchestration,
     stageDetails: Object.fromEntries(Object.entries(summary.stageDetails || detail.stageDetails || {}).map(
@@ -84,6 +88,8 @@ export function useLoopWorkbenchState(sessionId: string, execKey: string, identi
   const progressTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const activeIdentityRef = useRef(identity);
   activeIdentityRef.current = identity;
+  const latestStateRef = useRef(state);
+  latestStateRef.current = state;
 
   const refresh = useCallback(async () => {
     const requestedIdentity = identity;
@@ -122,7 +128,8 @@ export function useLoopWorkbenchState(sessionId: string, execKey: string, identi
         detailRequests.current.delete(key);
         setDetailErrors(previous => { const next = { ...previous }; delete next[seq]; return next; });
         setRecordDetails((previous) => ({ ...previous, [seq]: result.record as LoopRecord }));
-        if (result.progress) {
+        const latest = latestStateRef.current?.loops.find(record => record.seq === seq);
+        if (result.progress && latest && loopRecordRevision(latest) === selectedRevision) {
           setProgress((previous) => {
             const next = { ...previous };
             for (const [key, replay] of Object.entries(result.progress || {})) {
@@ -219,8 +226,10 @@ export function useLoopWorkbenchState(sessionId: string, execKey: string, identi
 
 
   const stateForView = state ? { ...state, loops: state.loops.map(record => {
-    const merged = mergeLoopRecordDetail(record, recordDetails[record.seq]);
-    return { ...merged, diagnosticLive: record.seq === activeLoopSeq(state),
+    const detail = detailVersions.current[record.seq] === loopRecordRevision(record) ? recordDetails[record.seq] : undefined;
+    const merged = mergeLoopRecordDetail(record, detail);
+    const projected = state.policy?.executionMode === 'aimein' ? projectAimeinRecord(merged) : merged;
+    return { ...projected, diagnosticLive: record.seq === activeLoopSeq(state),
       callDiagnostics: mergeCallDiagnostics(merged.callDiagnostics, callDiagnostics[record.seq]) };
   }) } : null;
   return { state: stateForView, loadError, refresh, selectedSeq, selectLoop, detailTarget, setDetailTarget, detailErrors, retryDetail, progress,

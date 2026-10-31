@@ -327,7 +327,8 @@ test('abrupt page close retains a recoverable branch; offline draft view exports
       write: async blob => { (window as any).exported = await blob.text(); }, close: async () => {},
     }) });
   });
-  await next.locator('.ftp-hdr').hover(); await next.getByRole('button', { name: '本设备草稿', exact: true }).click();
+  await next.getByRole('button', { name: '更多文件工具', exact: true }).click();
+  await next.getByRole('button', { name: '本设备草稿', exact: true }).click();
   const recovery = next.getByRole('dialog', { name: '本设备草稿恢复' });
   await recovery.getByRole('button', { name: '只读恢复草稿' }).click();
   await expect(recovery.getByLabel('离线恢复的草稿（只读）')).toHaveValue('recover after crash');
@@ -360,7 +361,8 @@ test('account switch removes old editor and recovery content; late inventory can
   await expect(page.getByRole('status').filter({ hasText: '草稿已存本设备' })).toBeVisible();
   page.on('dialog', dialog => dialog.accept());
   await page.getByRole('button', { name: '关闭预览', exact: true }).click();
-  await page.locator('.ftp-hdr').hover(); await page.getByRole('button', { name: '本设备草稿', exact: true }).click();
+  await page.getByRole('button', { name: '更多文件工具', exact: true }).click();
+  await page.getByRole('button', { name: '本设备草稿', exact: true }).click();
   const recovery = page.getByRole('dialog', { name: '本设备草稿恢复' });
   await recovery.getByRole('button', { name: '只读恢复草稿' }).click();
   await expect(recovery.getByLabel('离线恢复的草稿（只读）')).toHaveValue('private old-user draft');
@@ -383,7 +385,8 @@ test('account switch removes old editor and recovery content; late inventory can
     (window as any).releaseInventory();
   });
   await expect(recovery).toHaveCount(0); await expect(page.locator('.cm-content')).toHaveCount(0);
-  await page.locator('.ftp-hdr').hover(); await page.getByRole('button', { name: '本设备草稿', exact: true }).click();
+  await page.getByRole('button', { name: '更多文件工具', exact: true }).click();
+  await page.getByRole('button', { name: '本设备草稿', exact: true }).click();
   await expect(page.getByRole('dialog').getByText('本设备没有此账号的持久草稿。')).toBeVisible();
   await expect(page.getByLabel('离线恢复的草稿（只读）')).toHaveCount(0);
 });
@@ -413,7 +416,7 @@ for (const engine of [false, true]) test(`${engine ? 'Engine' : 'Chat'} PDF and 
     api.syncReadChunk = async () => ({ status: 'ok', data: btoa('invalid fixture bytes'), read: 21 });
     api.filePreview = async () => ({ status: 'ok', kind: 'word', blocks: [{ type: 'paragraph', text: 'Specialized Office fixture' }] });
   });
-  await page.locator('.ftp-hdr').hover(); await page.getByTitle('刷新本机与远端目录', { exact: true }).click();
+  await page.getByRole('button', { name: '刷新文件目录', exact: true }).click();
   for (const name of ['sample.pdf', 'sample.docx', 'sample.xlsx', 'sample.pptx']) {
     await page.locator('.ftp-row').filter({ has: page.getByText(name, { exact: true }) }).dblclick();
     await expect(name.endsWith('.pdf') ? page.getByText('PDF 预览失败：', { exact: false }) : page.getByText('Specialized Office fixture', { exact: true })).toBeVisible();

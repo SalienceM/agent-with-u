@@ -16,7 +16,10 @@ export interface FileTransfer {
   workspace: string;
   label: string;
   progress: TransferProgress;
-  status: 'running' | 'done' | 'error' | 'cancelled';
+  status: 'running' | 'preparing' | 'unresolved' | 'done' | 'error' | 'cancelled';
+  protectedReview?: boolean;
+  ownerId?: string;
+  reconcile?: () => Promise<void>;
   message: string;
   abort: { current: boolean };
 }
@@ -35,7 +38,7 @@ export class FileTransferManager {
     this.listeners.forEach(listener => listener());
   }
   active(workspace: string): FileTransfer | undefined {
-    return this.jobs.find(job => job.workspace === workspace && job.status === 'running');
+    return this.jobs.find(job => job.workspace === workspace && ['running', 'preparing', 'unresolved'].includes(job.status));
   }
   start(workspace: string, label: string, direction: 'pull' | 'push' | 'delete', rel: string): FileTransfer | undefined {
     if (this.active(workspace)) return undefined;
@@ -52,18 +55,22 @@ export class FileTransferManager {
     job.progress = progress;
     this.publish();
   }
+  reviewState(job: FileTransfer, status: FileTransfer['status'], message: string, reconcile?: () => Promise<void>): void {
+    job.protectedReview = true; job.status = status; job.message = message; job.reconcile = reconcile;
+    this.publish();
+  }
   finish(job: FileTransfer, message: string, failed = false): void {
     job.status = job.abort.current || !message ? 'cancelled' : failed ? 'error' : 'done';
     job.message = message || '已取消';
     this.publish();
   }
   cancel(job: FileTransfer): void {
-    if (job.status !== 'running' || job.progress.direction === 'delete') return;
+    if (job.protectedReview || job.status !== 'running' || job.progress.direction === 'delete') return;
     job.abort.current = true;
     this.publish();
   }
   dismiss(job: FileTransfer): void {
-    if (job.status === 'running') return;
+    if (['running', 'preparing', 'unresolved'].includes(job.status)) return;
     this.jobs = this.jobs.filter(item => item !== job);
     this.publish();
   }

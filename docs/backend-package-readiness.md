@@ -14,6 +14,21 @@ python scripts/check_backend_package.py dist/agent-with-u-backend.exe
 
 PyInstaller 本身仍需安装到同一构建环境。依赖同步不主动升级所有已满足约束的包。构建者可用标准 pip 配置选择镜像；离线构建先准备包含传递依赖的 wheel 目录，再设置 `PIP_NO_INDEX=1` 和 `PIP_FIND_LINKS` 指向该目录。找不到适用 wheel 会失败，不允许绕过就绪门禁。只读诊断使用 `prepare_backend_build.py --check-only`，它不安装依赖。
 
+### Harness 构建输入与清理范围
+
+`build/deepseek-harness` 是必需输入，包含固定版本 wheels、适配桥和 `bundle-manifest.json`，不能作为普通缓存删除。`build_all.bat` 和 `build_fat_sideonly.bat` 统一由 `build_backend_package.py` 清理 `build/agent-with-u-backend`、本平台 `dist/agent-with-u-backend[.exe]` 及同名 `.readiness.json`；保留 Harness、Web 缓存与其他发行产物。目标越界、链接/junction、类型异常或占用导致的清理失败会阻止冻结。
+
+若旧脚本已经删除整个 `build`，单独修改脚本不足以恢复打包。需要恢复与 `deploy/deepseek-harness.lock.json` 和平台构建收据匹配的 wheels，以及对应桥/清单，然后执行：
+
+```powershell
+python scripts/prepare_deepseek_harness.py --verify-staged build/deepseek-harness/wheels --platform win-x64
+python scripts/prepare_backend_build.py --check-only
+```
+
+Linux 使用 `--platform linux-x64` 及 Linux wheel。不能用未经审计的重建 wheel 替换固定散列，也不能跳过 `verify_bundle`。恢复来源和校验结果应保留；Windows 校验不代表 Linux 制品已准备。完整恢复所有平台 wheels、重建桥后，可通过 `prepare_harness_bundle.py` 重新生成清单。
+
+原 Workspace Kit 仍调用根目录 `build_all.bat`，无需改绑定或重建 Session。Kit 的完成日志和稳定安装包双重判定仍然保留；退出码 7 表示构建未形成成功证据，具体根因需查看该次运行的 `stdout.log`/`stderr.log`。
+
 ## 门禁验证内容
 
 1. 冻结自检检查必需模块、Windows 原生 PTY 导入，以及随包的 JDT/TypeScript 辅助资源。Web 包还检查前端首页资源。它不创建终端、不启动语言服务，也不要求用户 Java/Node 工程工具链已安装。

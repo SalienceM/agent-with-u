@@ -7,7 +7,7 @@ import time
 import hashlib
 from typing import Any
 
-from .aside_inspection import InspectionError, QueryBudget, QueryIdentity, clean_inspection
+from .aside_inspection import InspectionError, QueryBudget, QueryIdentity, budget_error, clean_inspection
 from .aside_openspec import OpenSpecInspection
 from .aside_queries import InspectionQueries
 from .aside_runner import InspectionRunner
@@ -32,6 +32,7 @@ class AsideInspectionBridge:
         return self._chat_extras_get(session.id).aside_backend_id or session.backend_id
 
     def _reserve_inspection(self, sid: str, turn_id: str, loop: bool) -> dict:
+        getattr(self, '_require_update_work_allowed', lambda: None)()
         if not hasattr(self, '_inspection_jobs'):
             self._inspection_jobs = {}
         key = self._inspection_key(sid, loop)
@@ -166,7 +167,10 @@ class AsideInspectionBridge:
             def output(text: str) -> None:
                 turn.answer = text
                 (self._emit_aside_delta if loop else self._emit_chat_aside_delta)(sid, turn_id, text)
-            runner = InspectionRunner(query, generate, publish, output)
+            def native_settled() -> bool:
+                from .deepseek_harness import DeepSeekHarnessBackend
+                return not isinstance(backend, DeepSeekHarnessBackend) or not backend.has_unconfirmed_activity(key)
+            runner = InspectionRunner(query, generate, publish, output, native_settled)
             job['runner'] = runner
             if job['cancelled']:
                 runner.cancel()
@@ -177,15 +181,22 @@ class AsideInspectionBridge:
                 query.pending.add(task)
                 task.add_done_callback(query._finished)
                 try:
-                    value = await asyncio.wait_for(asyncio.shield(task), query.budget.remaining())
+                    value = await asyncio.wait_for(asyncio.shield(task), query.budget.discovery_remaining())
                 except asyncio.TimeoutError:
-                    runner.cancel()
-                    raise InspectionError('timeout', '读取参考资料超时，正在确认退出。') from None
+                    raise budget_error('answer_reserve') from None
                 validate()
-                query.budget.check()
+                query.budget.check_discovery()
                 return value
-            manual = await reference(self._skill_reference_content(turn.question, images))
-            facts = await reference(self._skill_reference_snapshot(turn.question, session, inspect_project=False)) if manual else ''
+            manual, facts, reference_status = '', '', ''
+            try:
+                manual = await reference(self._skill_reference_content(turn.question, images))
+                facts = await reference(self._skill_reference_snapshot(turn.question, session, inspect_project=False)) if manual else ''
+            except InspectionError as exc:
+                if exc.reason != 'answer_reserve':
+                    raise
+                reference_status = '参考资料未完整取得，不能声称已核验手册或注册事实。'
+                query.sources.append({'operation': 'skill_reference', 'status': 'limit',
+                                      'limitReason': 'answer_reserve', 'complete': False})
             backend = self._new_backend_instance(identity.backend_id)  # 失败明确返回，不静默改用主 Backend。
             kind = getattr(backend.config.type, 'value', backend.config.type)
             if kind not in TEXT_ONLY_BACKENDS:
@@ -194,11 +205,11 @@ class AsideInspectionBridge:
             context = {'runtime': runtime_read(), 'attention': attention or {
                 'key': turn.context_key, 'label': turn.context_label, 'detail': turn.context_detail},
                 'recentQuestions': [{'question': t.question[:4000], 'answer': t.answer[:4000]} for t in related],
-                'skillReference': manual, 'registeredSkillFacts': facts,
+                'skillReference': manual, 'registeredSkillFacts': facts, 'referenceStatus': reference_status,
                 'sessionConstraints': str(session.constraints or '')[:12000]}
             await runner.run(context, turn.question)
         except asyncio.CancelledError:
-            terminal, terminal_message = 'cancelled', '本次旁路已停止，主线不受影响'
+            terminal, terminal_message = 'cancelled', '本次旁路已停止'
             if runner:
                 runner.cancel()
         except Exception as exc:
@@ -219,7 +230,7 @@ class AsideInspectionBridge:
                 else:
                     turn.status = terminal
                     try:
-                        publish(terminal, terminal_message)
+                        publish(terminal, self._inspection_terminal_message(terminal, terminal_message))
                     finally:
                         self._release_inspection(sid, key, loop, job)
             elif not job:
@@ -246,9 +257,15 @@ class AsideInspectionBridge:
             return
         turn.status = terminal
         try:
-            publish(terminal, message)
+            publish(terminal, self._inspection_terminal_message(terminal, message))
         finally:
             self._release_inspection(sid, key, loop, job)
+
+    @staticmethod
+    def _inspection_terminal_message(terminal: str, message: str) -> str:
+        if terminal in {'error', 'cancelled'}:
+            return message + '；旁路退出已确认，主线不受影响。'
+        return message
 
     def _release_inspection(self, sid: str, key: str, loop: bool, job: dict) -> None:
         if self._inspection_jobs.get(key) is job:

@@ -11,6 +11,8 @@
     "outDir": ".home-test-dist"
   },
   "include": [
+    "src/utils/sessionFavorites.ts",
+    "src/utils/sessionDeletion.ts",
     "src/utils/aimeinRuntime.ts",
     "src/utils/aimeinReviewSummary.ts",
     "src/utils/aimeinPlay.ts",
@@ -48,6 +50,11 @@
     "src/utils/chatMessageVisibility.ts",
     "src/utils/dirSyncPolicy.ts",
     "src/utils/dirSyncFreshness.ts",
+    "src/utils/directorySyncReview.ts",
+    "src/utils/syncReviewDiff.ts",
+    "src/utils/localSyncReview.ts",
+    "src/utils/reviewPairReader.ts",
+    "src/utils/directorySyncTransfers.ts",
     "src/utils/fileFocus.ts",
     "src/utils/fileSearch.ts",
     "src/utils/fileTransfers.ts",
@@ -88,6 +95,7 @@
     "src/utils/sha256.ts",
     "src/utils/clientAppearance.ts",
     "src/utils/backendManagement.ts",
-    "src/utils/attentionContext.ts"
+    "src/utils/attentionContext.ts",
+    "src/utils/filePanelViewState.ts"
   ]
 }

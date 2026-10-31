@@ -77,6 +77,8 @@ class SequenceScheduler:
             self.kick(sid)
 
     def kick(self, sid: str) -> None:
+        if getattr(self.bridge, '_update_work_blocked', lambda: False)():
+            return
         if not self.started or self.closed or sid in self.deleted:
             return
         previous = self.workers.get(sid)
@@ -133,6 +135,8 @@ class SequenceScheduler:
         current = None
         try:
             while not self.closed and sid not in self.deleted:
+                if getattr(self.bridge, '_update_work_blocked', lambda: False)():
+                    return
                 if getattr(self.bridge, '_loop_control_reserved', lambda _: False)(sid):
                     return  # 转交不领取、不清空队列，交还本身也不自动重启派发。
                 ex = self.bridge._chat_extras_get(sid)

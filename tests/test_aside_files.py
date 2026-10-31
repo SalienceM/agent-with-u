@@ -69,6 +69,46 @@ class ReadonlyFileTests(unittest.TestCase):
         self.assertEqual(len(result['matches']), 2)
         self.assertFalse(result['complete'])
 
+    def test_search_leaves_room_for_targeted_read_and_stops_io(self):
+        self.files.budget = QueryBudget(total_bytes=40, search_bytes=13)
+        with patch('src.backend.aside_files.os.read', wraps=os.read) as read:
+            result = self.files.search('.', 'hello')
+            self.assertEqual(result['matchCount'], 1)
+            (self.root / 'next.txt').write_text('targeted data', encoding='utf-8')
+            second = self.files.search('.', 'targeted')
+            self.assertEqual(second['limitReason'], 'search_bytes')
+            self.assertFalse(second['complete'])
+            before = read.call_count
+            with self.assertRaises(InspectionError):
+                self.files.search('.', 'again')
+            self.assertEqual(read.call_count, before)
+            self.assertEqual(self.files.text('next.txt')['content'], 'targeted data')
+            self.assertLessEqual(self.files.budget.used_bytes, 40)
+
+    def test_total_read_budget_checked_before_io(self):
+        self.files.budget = QueryBudget(total_bytes=5)
+        with patch('src.backend.aside_files.os.read', wraps=os.read) as read:
+            with self.assertRaises(InspectionError) as caught:
+                self.files.text('code.txt')
+            self.assertEqual(caught.exception.reason, 'total_bytes')
+            read.assert_not_called()
+        self.assertEqual(self.files.budget.used_bytes, 0)
+
+    def test_search_does_not_swallow_cancel_or_deadline(self):
+        for error in (InspectionError('cancelled', 'stop'), InspectionError('timeout', 'timeout'),
+                      InspectionError('limit', 'reserve', reason='answer_reserve')):
+            with self.subTest(error=error), patch.object(self.files, 'text', side_effect=error):
+                with self.assertRaises(InspectionError) as caught:
+                    self.files.search('.', 'x')
+                self.assertIs(caught.exception, error)
+
+    def test_local_file_limit_does_not_stop_other_search_targets(self):
+        (self.root / 'too-big.txt').write_bytes(b'x' * 262145)
+        result = self.files.search('.', 'hello')
+        self.assertEqual(result['matchCount'], 1)
+        self.assertFalse(result['complete'])
+        self.assertEqual(result['limitReason'], 'file_bytes')
+
     @unittest.skipUnless(os.name == 'nt', 'Windows junction fixture')
     def test_windows_junction_cannot_escape(self):
         with tempfile.TemporaryDirectory() as outside:

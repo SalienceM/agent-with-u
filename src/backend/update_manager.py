@@ -21,6 +21,7 @@ from urllib.parse import parse_qsl, unquote, urlencode, urljoin, urlparse, urlsp
 import httpx
 
 from . import paths
+from .kit_update_journal import InstallJournal
 
 
 MAX_ARTIFACT_BYTES = 8 * 1024 * 1024 * 1024
@@ -196,6 +197,8 @@ class UpdateManager:
         self.config_path = self.root / "config.json"
         self.state_path = self.root / "state.json"
         self.result_path = self.root / "install-result.json"
+        self.journal = InstallJournal(self.root)
+        self._normal_request = ""
         self._task: Optional[asyncio.Task] = None
         self._selection: Optional[dict[str, Any]] = None
         self._state = _read_json(self.state_path, {"phase": "idle"})
@@ -222,6 +225,7 @@ class UpdateManager:
         }
 
     def configure(self, patch: dict[str, Any]) -> dict[str, Any]:
+        self.journal.require_slot(self._normal_request)
         current = self._config()
         if "manifestUrl" in patch:
             current["manifestUrl"] = str(patch.get("manifestUrl") or "").strip()
@@ -276,6 +280,10 @@ class UpdateManager:
         return self._base_status()
 
     def _reconcile_install_result(self) -> None:
+        active = self.journal.active()
+        if active.get("kind") == "kit":
+            # 旧时间戳回执永远不能验收 Kit 安装或释放其节点预留。
+            return
         result = _read_json(self.result_path, {})
         if not result or float(result.get("finishedAt") or 0) <= float(self._state.get("resultSeenAt") or 0):
             return
@@ -289,6 +297,40 @@ class UpdateManager:
             "updatedAt": _now(),
         }
         _atomic_json(self.state_path, self._state)
+        if active.get("kind") == "normal":
+            self.journal.release(active["requestId"], active["identity"], "succeeded" if ok else "failed")
+            self._normal_request = ""
+
+    def _reserve_normal(self) -> str:
+        self.journal.require_slot(self._normal_request)
+        request_id = self._normal_request or uuid.uuid4().hex
+        self.journal.reserve(request_id, {}, kind="normal")
+        self._normal_request = request_id
+        return request_id
+
+    def reserve_kit(self, request_id: str, identity: dict[str, str]) -> dict[str, Any]:
+        active = self.journal.active()
+        if active.get("requestId") != request_id and (
+                self._task and not self._task.done() or self._state.get("phase") in {
+                    "checking", "downloading", "staged", "installing"}):
+            raise UpdateError("节点已有普通更新或暂存制品，请先完成或取消原更新")
+        return self.journal.reserve(request_id, identity)
+
+    def _release_normal(self, phase: str = "cancelled") -> None:
+        if self._normal_request:
+            self.journal.release(self._normal_request, {}, phase)
+            self._normal_request = ""
+
+    def release_kit(self, request_id: str, identity: dict[str, str], phase: str = "cancelled") -> None:
+        """准备协程已退出后，仅清理本请求的暂存投影，最后才释放节点占用。"""
+        record = self.journal.get(request_id, identity)
+        if record.get("confirmationId"):
+            raise UpdateError("已确认安装只能核对结果")
+        if self._state.get("kitRequestId") == request_id:
+            self._save_state({"phase": phase, "kitRequestId": "", "planPath": "",
+                              "artifactPath": "", "message": "本次安装准备已结束"})
+            self._selection = None
+        self.journal.release(request_id, identity, phase)
 
     @staticmethod
     def _validate_source(source: str, manifest: bool = False) -> None:
@@ -303,14 +345,15 @@ class UpdateManager:
         kind = "manifest" if manifest else "artifact"
         raise UpdateError(f"unsupported {kind} URL; use HTTPS, HTTP or an absolute file path")
 
-    async def _read_source(self, source: str, *, limit: int = 4 * 1024 * 1024) -> bytes:
+    async def _read_source(self, source: str, *, limit: int = 4 * 1024 * 1024,
+                           use_headers: bool = True) -> bytes:
         self._validate_source(source, manifest=True)
         parsed = urlparse(source)
         if parsed.scheme in {"https", "http"}:
             cfg = self._config()
             headers = {
                 str(key): str(value) for key, value in cfg["requestHeaders"].items()
-                if str(key).lower() not in {"cache-control", "pragma"}
+                if use_headers and str(key).lower() not in {"cache-control", "pragma"}
             }
             headers.update({
                 "Cache-Control": "no-cache, no-store, max-age=0",
@@ -439,6 +482,16 @@ class UpdateManager:
         }
 
     async def check(self, manifest_url: str = "", artifact_id: str = "") -> dict[str, Any]:
+        transient = not self._normal_request
+        self._reserve_normal()
+        try:
+            return await self._check(manifest_url, artifact_id)
+        finally:
+            if transient:
+                self._release_normal()
+
+    async def _check(self, manifest_url: str = "", artifact_id: str = "") -> dict[str, Any]:
+        self.journal.require_slot(self._normal_request)
         if self._task and not self._task.done():
             raise UpdateError("an update download is already running")
         source = str(manifest_url or self._config()["manifestUrl"]).strip()
@@ -493,6 +546,79 @@ class UpdateManager:
             self._save_state({"phase": "error", "available": False, "message": "检查更新失败", "error": str(error)})
             raise
 
+    async def inspect_published(self, published: dict[str, Any]) -> dict[str, Any]:
+        """只读核对本次成功发布的不可变对象；不会读取/修改日常通道配置。"""
+        if published.get("schemaVersion") != 1 or not all(published.get(key) for key in (
+                "runId", "stepId", "jobId", "planId", "planFingerprint", "manifestSha256")):
+            raise UpdateError("缺少本次发布凭据")
+        source = str(published.get("manifestUrl") or "")
+        raw = await self._read_source(source, use_headers=False)
+        document = json.loads(raw.decode("utf-8-sig"))
+        if not isinstance(document, dict) or document.get("schemaVersion") != 1:
+            raise UpdateError("unsupported update manifest schema")
+        self._verify_manifest(document)
+        digest = hashlib.sha256(_canonical_manifest_payload(document)).hexdigest()
+        if not hmac.compare_digest(digest, str(published["manifestSha256"])):
+            raise UpdateError("不可变发布清单摘要不匹配")
+        release = self._release(document)
+        if (release != published.get("release") or document.get("artifacts") != published.get("artifacts")
+                or document.get("channel") != published.get("channel")):
+            raise UpdateError("发布身份或制品与冻结记录不匹配")
+        if (type(release.get("kitUpdateProtocol")) is not int or release["kitUpdateProtocol"] != 1
+                or not release.get("buildId") or not release.get("sequence")):
+            raise UpdateError("目标版本不支持 Kit 更新验收协议；请使用原更新入口")
+        if _platform() != "windows" or _runtime() != "desktop":
+            raise UpdateError("Kit 本机更新仅支持已安装 Windows 桌面")
+        if not _is_newer(release, _current_release()):
+            raise UpdateError("目标发布不是比当前节点更新的版本")
+        candidates = []
+        for item in document.get("artifacts", []):
+            if (isinstance(item, dict) and item.get("platform") == "windows"
+                    and item.get("arch") == _arch() and item.get("target") == "desktop"
+                    and item.get("kind") in {"msi", "nsis"}):
+                if item.get("install"):
+                    # 严格链路仅允许产品自带 MSI/NSIS 安装语义，不能注入命令或重启路径。
+                    raise UpdateError("Kit 更新不接受制品中的自定义安装命令")
+                if (not item.get("id") or not re.fullmatch(r"[0-9a-f]{64}", str(item.get("sha256") or ""))
+                        or type(item.get("size")) is not int or not 0 < item["size"] <= MAX_ARTIFACT_BYTES):
+                    raise UpdateError("发布制品身份、大小或摘要无效")
+                artifact = dict(item)
+                artifact["url"] = self._artifact_url(source, artifact)
+                candidates.append(artifact)
+        if not candidates or len({item["id"] for item in candidates}) != len(candidates):
+            raise UpdateError("没有兼容且身份唯一的 Windows 安装制品")
+        return {"manifestUrl": source, "release": release, "artifacts": candidates,
+                "signed": bool(document.get("signature")), "channel": document["channel"]}
+
+    async def stage_published(self, published: dict[str, Any], artifact_id: str = "",
+                              *, request_id: str = "") -> dict[str, Any]:
+        self.journal.require_slot(request_id or self._normal_request)
+        if self._task and not self._task.done():
+            raise UpdateError("an update download is already running")
+        inspected = await self.inspect_published(published)
+        candidates = inspected.pop("artifacts")
+        if not artifact_id and len(candidates) != 1:
+            return {"phase": "needs_selection", "artifacts": candidates, "release": inspected["release"]}
+        selected = [item for item in candidates if not artifact_id or item["id"] == artifact_id]
+        if len(selected) != 1:
+            raise UpdateError("必须明确选择本次发布的兼容安装器")
+        if request_id:
+            self.journal.require_slot(request_id)
+        else:
+            self._reserve_normal()
+        selection = {**inspected, "artifact": selected[0], "strictPublished": True}
+        self._selection = selection
+        self._save_state({"phase": "downloading", "error": "", "message": "下载本次发布的精确版本",
+                          "kitRequestId": request_id,
+                          "release": selection["release"], "artifact": self._public_artifact(selected[0]),
+                          "manifestUrl": selection["manifestUrl"]})
+        self._task = asyncio.create_task(self._download(selection))
+        self._task.add_done_callback(self._consume_task_error)
+        await self._task
+        if self._state.get("phase") != "staged":
+            raise UpdateError(str(self._state.get("error") or "本次发布制品暂存失败"))
+        return self.status()
+
     async def start_stage(self, manifest_url: str = "", artifact_id: str = "",
                           force: bool = False) -> dict[str, Any]:
         if self._task and not self._task.done():
@@ -500,6 +626,7 @@ class UpdateManager:
         await self.check(manifest_url, artifact_id)
         if not force and not bool(self._state.get("available")):
             return self.status()
+        self._reserve_normal()
         selection = dict(self._selection or {})
         self._task = asyncio.create_task(self._download(selection))
         self._task.add_done_callback(self._consume_task_error)
@@ -538,7 +665,7 @@ class UpdateManager:
                 if parsed.scheme in {"http", "https"}:
                     cfg = self._config()
                     async with httpx.AsyncClient(follow_redirects=True, timeout=httpx.Timeout(30, read=120)) as client:
-                        async with client.stream("GET", url, headers=cfg["requestHeaders"]) as response:
+                        async with client.stream("GET", url, headers={} if selection.get("strictPublished") else cfg["requestHeaders"]) as response:
                             response.raise_for_status()
                             header_size = int(response.headers.get("content-length") or 0)
                             if header_size > MAX_ARTIFACT_BYTES:
@@ -692,6 +819,9 @@ class UpdateManager:
         }
 
     async def cancel(self) -> dict[str, Any]:
+        self.journal.require_slot(self._normal_request)
+        if self._state.get("phase") == "installing":
+            raise UpdateError("安装已交接，不能保证撤回")
         task = self._task
         if task and not task.done():
             task.cancel()
@@ -699,24 +829,29 @@ class UpdateManager:
                 await task
             except asyncio.CancelledError:
                 pass
-        elif self._state.get("phase") in {"checking", "downloading"}:
+        elif self._state.get("phase") in {"checking", "downloading", "staged"}:
             # A process restart can leave a persisted in-progress phase without
             # an asyncio task. Treat Cancel as recovery instead of trapping the
             # UI forever in a busy-looking state.
+            self._release_normal()
             return self._save_state({
                 "phase": "cancelled", "message": "已清除中断的更新任务", "error": "",
             })
+        self._release_normal()
         return self.status()
 
     def mark_install_failed(self, message: str) -> dict[str, Any]:
+        self.journal.require_slot(self._normal_request)
         return self._save_state({"phase": "error", "message": "无法启动更新助手", "error": str(message)[:2000]})
 
     def prepare_apply(self) -> dict[str, Any]:
+        self.journal.require_slot(self._normal_request)
         if self._task and not self._task.done():
             raise UpdateError("wait for the update download to finish")
         plan_path = Path(str(self._state.get("planPath") or "")).expanduser()
         if self._state.get("phase") != "staged" or not plan_path.is_file():
             raise UpdateError("no verified staged update is ready")
+        self._reserve_normal()
         try:
             plan = json.loads(plan_path.read_text(encoding="utf-8"))
         except Exception as error:

@@ -2,6 +2,7 @@ import React, { useEffect, useRef, useState } from 'react';
 import type { LoopRecord, LoopStateT } from '../types/loopWorkbench';
 import { AIMEIN_OUTPUT_LIMIT, aimeinRecords, aimeinRuntime, aimeinObservation } from '../utils/aimeinRuntime';
 import { AimeinReviewSummary } from './AimeinReviewSummary';
+import { readCollection } from '../utils/aimeinRecordData';
 
 const muted: React.CSSProperties = { color: '#91b3aa', fontSize: 11, lineHeight: 1.6 };
 const button: React.CSSProperties = { border: '1px solid #355954', background: '#16322f', color: '#cce3d8', borderRadius: 6, padding: '6px 9px', fontSize: 11, cursor: 'pointer' };
@@ -15,6 +16,8 @@ export const AimeinRuntimePanel: React.FC<{
 }> = ({ state, current, progress, connected, onSelect, detailError, onRetry, compact }) => {
   const runtime = aimeinRuntime(state, current, progress, connected);
   const observation = aimeinObservation(state, current, connected);
+  const stopReason = !runtime.historical && state.stage === 'loopout' ? state.stopReason : '';
+  const message = stopReason && runtime.message !== stopReason ? `${stopReason}\n${runtime.message}` : runtime.message;
   const [expanded, setExpanded] = useState(false);
   const records = aimeinRecords(state);
   const [pin, setPin] = useState<{ seq?: number; id: string }>();
@@ -25,7 +28,10 @@ export const AimeinRuntimePanel: React.FC<{
   const output = useRef<HTMLDivElement>(null);
   const channel = (pin?.seq === current?.seq && runtime.channels.find(item => item.id === pin?.id)) || runtime.channel;
   const call = channel?.call;
-  const saved = (channel && (current?.stageDetails?.[channel.id]?.rawOutput || current?.stageDetails?.[channel.id]?.partialOutput || current?.orchestration.find(step => `step${step.index}` === channel.id)?.output)) || '';
+  const steps = readCollection(current?.orchestration).items;
+  const stepLabel = observation.stepState === 'missing' ? '待核对' : observation.stepState === 'invalid' ? '不可用'
+    : observation.total ? `${observation.savedKnown ? observation.saved : '—'} / ${observation.total}` : runtime.live && /prepare|plan/.test(runtime.phase) ? '规划中' : '暂无步骤';
+  const saved = (channel && (current?.stageDetails?.[channel.id]?.rawOutput || current?.stageDetails?.[channel.id]?.partialOutput || steps.find(step => `step${step.index}` === channel.id)?.output)) || '';
   const paging = !!saved && archive?.seq === current?.seq && archive?.id === channel?.id;
   const pages = Math.ceil(saved.length / AIMEIN_OUTPUT_LIMIT);
   const displayed = paging ? saved.slice(archive!.page * AIMEIN_OUTPUT_LIMIT, (archive!.page + 1) * AIMEIN_OUTPUT_LIMIT) : channel?.text;
@@ -55,21 +61,21 @@ export const AimeinRuntimePanel: React.FC<{
       <ol aria-label="当前执行阶段" style={{ display: compact ? 'none' : 'flex', gap: 4, listStyle: 'none', margin: '12px 0 0', padding: 0 }}>
         {['准备', '拆解', '建设', '评审'].map((name, index) => <li key={name} aria-current={runtime.live && index === stage ? 'step' : undefined} style={{ flex: 1, borderTop: `2px solid ${runtime.live && index === stage ? '#a6dfb1' : '#35554b'}`, paddingTop: 6, fontSize: 11, color: runtime.live && index === stage ? '#c4efbe' : '#7c9d90' }}>{index + 1} · {name}</li>)}
       </ol>
-      {runtime.message && (!compact || observation.health === 'attention' || observation.health === 'offline') && <div role="status" style={{ ...muted, color: runtime.error ? '#e2bb83' : '#abc4b2', marginTop: compact ? 2 : 10, maxHeight: compact ? 18 : 75, overflow: 'auto' }}>{runtime.message}</div>}
+      {message && (!compact || observation.health === 'attention' || observation.health === 'offline' || !!stopReason) && <div role="status" style={{ ...muted, whiteSpace: 'pre-wrap', color: runtime.error ? '#e2bb83' : '#abc4b2', marginTop: compact ? 2 : 10, maxHeight: compact ? 36 : 75, overflow: 'auto' }}>{message}</div>}
     </div>
     {!expanded && <div data-testid="aimein-observation" data-health={observation.health} style={{ padding: compact ? '6px 9px' : '18px 16px', flex: compact ? '0 1 auto' : '1 1 140px', minHeight: 0, overflow: 'auto' }}>
       <div style={{ display: 'flex', alignItems: 'baseline', gap: compact ? 10 : 20, justifyContent: 'space-between' }}>
-        <div style={compact ? { display: 'flex', gap: 6, alignItems: 'baseline' } : undefined}><div style={muted}>{compact ? '已保存步骤' : '本阶段 · 已保存步骤'}</div><strong style={{ fontSize: compact ? 18 : 40, fontWeight: 500, color: '#dbe5bd', fontVariantNumeric: 'tabular-nums' }}>{observation.total ? `${observation.saved} / ${observation.total}` : '规划中'}</strong></div>
+        <div style={compact ? { display: 'flex', gap: 6, alignItems: 'baseline' } : undefined}><div style={muted}>{compact ? '已保存步骤' : '本阶段 · 已保存步骤'}</div><strong style={{ fontSize: compact ? 18 : 40, fontWeight: 500, color: '#dbe5bd', fontVariantNumeric: 'tabular-nums' }}>{stepLabel}</strong></div>
         <div style={{ textAlign: 'right', ...(compact ? { display: 'flex', gap: 6, alignItems: 'baseline' } : {}) }}><div style={muted}>{compact ? '核实覆盖' : '整体目标 · 核实覆盖'}</div><strong style={{ fontSize: compact ? 14 : 23, color: '#afc8b9', fontWeight: 400 }}>{observation.coverage.known ? `${observation.coverage.verified} / ${observation.coverage.total}` : '待核实'}</strong></div>
       </div>
-      {!!observation.total && <div aria-label={`本阶段 ${observation.saved} / ${observation.total} 步已保存`} style={{ display: 'flex', gap: 3, marginTop: compact ? 4 : 12 }}>{current?.orchestration.map(step => <span key={step.index} title={`${step.desc} · ${step.status}`} style={{ flex: 1, height: compact ? 3 : 5, borderRadius: 2, background: step.status === 'done' && step.output?.trim() ? '#b1cda3' : step.status === 'error' ? '#d79675' : step.status === 'running' ? '#74b5ab' : '#2c4b43' }} />)}</div>}
+      {observation.savedKnown && !!observation.total && <div aria-label={`本阶段 ${observation.saved} / ${observation.total} 步已保存`} style={{ display: 'flex', gap: 3, marginTop: compact ? 4 : 12 }}>{steps.map(step => <span key={step.index} title={`${step.desc} · ${step.status}`} style={{ flex: 1, height: compact ? 3 : 5, borderRadius: 2, background: step.status === 'done' && step.output?.trim() ? '#b1cda3' : step.status === 'error' ? '#d79675' : step.status === 'running' ? '#74b5ab' : '#2c4b43' }} />)}</div>}
       <div style={{ marginTop: compact ? 5 : 16, display: compact ? 'flex' : 'block', alignItems: 'baseline', gap: 7, fontSize: compact ? 11 : 13, color: ['attention', 'offline'].includes(observation.health) ? '#e4b98d' : '#bdd7c4', overflowWrap: 'anywhere' }}>
         <span style={{ flexShrink: 0 }}>{({ working: '● 当前', waiting: '◇ 等待响应', attention: '⚠ 需留意', offline: '◇ 连接中断', history: '◇ 历史观察', idle: '◇ 当前状态' })[observation.health]}</span>
         <div style={{ marginTop: compact ? 0 : 3, display: '-webkit-box', WebkitLineClamp: compact ? 1 : 2, WebkitBoxOrient: 'vertical', overflow: 'hidden' }}>{observation.issue || observation.current}</div>
       </div>
       {!compact && <p style={{ ...muted, marginTop: 14 }}>已保存步骤表示建设进展，核实覆盖来自完整评审。<br />{observation.measurement}</p>}
     </div>}
-    {(stage === 3 || current?.completed) && !!current?.aimeinSummary?.reviews.length && <div style={{ padding: '8px 12px 0', flexShrink: 0 }}><AimeinReviewSummary compact summary={current.aimeinSummary} detail={current.aimeinRun} /></div>}
+    {(stage === 3 || current?.completed) && !!current?.aimeinSummary?.reviews?.length && <div style={{ padding: '8px 12px 0', flexShrink: 0 }}><AimeinReviewSummary compact summary={current.aimeinSummary} detail={current.aimeinRun} /></div>}
     <div style={{ display: 'flex', gap: 8, alignItems: 'center', padding: compact ? '3px 8px' : '8px 12px', flexShrink: 0, borderTop: '1px solid #2b4c44' }}><span style={muted}>{expanded ? '执行细节' : '最新输出'}</span><button style={{ ...button, marginLeft: 'auto', padding: compact ? '3px 6px' : '5px 8px' }} aria-expanded={expanded} onClick={() => setExpanded(v => !v)}>{expanded ? '收起运行细节' : '查看完整输出'}</button>{compact && followButton}</div>
     {expanded && !compact && <div style={{ padding: '8px 12px', flexShrink: 0, display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 6, borderBottom: '1px solid #2b4c44' }}>
       {history}
@@ -91,7 +97,7 @@ export const AimeinRuntimePanel: React.FC<{
       style={{ flex: expanded ? 1 : compact ? '1 1 40px' : '0 1 150px', minHeight: compact ? 48 : 80, overflow: 'auto', overflowAnchor: 'none', overscrollBehavior: 'contain', padding: compact ? '6px 9px' : '12px 16px', background: '#0b1e20', borderTop: '1px solid #2b4c44', outlineOffset: -3 }}>
       {channel?.truncated && !paging && <p style={muted}>显示最近 50,000 字符。{!!saved && <button style={button} onClick={() => { setArchive({ seq: current?.seq, id: channel.id, page: 0 }); setFollow(false); }}>分段查看已保存内容</button>}</p>}
       {paging && <div style={muted}><button style={button} disabled={!archive!.page} onClick={() => setArchive({ ...archive!, page: archive!.page - 1 })}>上一段</button> {archive!.page + 1}/{pages} <button style={button} disabled={archive!.page + 1 >= pages} onClick={() => setArchive({ ...archive!, page: archive!.page + 1 })}>下一段</button></div>}
-      <pre style={{ font: '12px/1.85 ui-monospace, SFMono-Regular, Consolas, monospace', whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', margin: 0, color: '#c5dbcd' }}>{displayed || (runtime.live ? `${phase}。收到正文后会显示在这里。` : '该通道暂无保存的正文。')}</pre>
+      <pre style={{ font: '12px/1.85 ui-monospace, SFMono-Regular, Consolas, monospace', whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', margin: 0, color: '#c5dbcd' }}>{displayed || (runtime.live ? `${phase}。收到正文后会显示在这里。` : current?.detailLoaded === false ? '输出详情尚未加载。' : ['missing', 'invalid'].includes(observation.stepState) ? '步骤输出待核对。' : '该通道暂无保存的正文。')}</pre>
       {detailError && <p role="alert" style={muted}>{detailError} <button style={button} onClick={onRetry}>重新读取详情</button></p>}
     </div>
     {!compact && <footer style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '8px 12px', flexShrink: 0, ...muted }}><span>{paging ? '正在阅读保存内容' : runtime.historical ? '保存的执行记录' : follow ? '跟随最新输出' : '已暂停跟随'}</span>{followButton}</footer>}

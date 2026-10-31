@@ -246,6 +246,111 @@ class AsideBridgeTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn('SECRET', json.dumps(data))
             self.assertEqual(cls.from_dict(data).inspection, data['inspection'])
 
+    async def test_timeout_immediate_and_delayed_exit_have_consistent_terminal_text(self):
+        from src.backend.aside_inspection import QueryBudget
+        for delayed in (False, True):
+            with self.subTest(delayed=delayed):
+                release = asyncio.Event()
+                self.addCleanup(release.set)
+                calls = []
+                async def slow(*args, **kwargs):
+                    calls.append(True)
+                    try:
+                        await asyncio.Event().wait()
+                    except asyncio.CancelledError:
+                        if delayed:
+                            await release.wait()
+                with patch('src.backend.aside_bridge.QueryBudget', side_effect=lambda **kw: QueryBudget(seconds=.06, operations=0, **kw)), \
+                        patch('src.backend.text_only.send_text_only', side_effect=slow):
+                    self.submit(question='一般问题')
+                    job = self.bridge._inspection_jobs['s:chataside']
+                    await job['task']
+                    turn = self.extras.asides[-1]
+                    if delayed:
+                        self.assertEqual(turn.inspection['phase'], 'unknown')
+                        self.assertIn('s:chataside', self.bridge._inspection_jobs)
+                        release.set()
+                        await job['cleanup']
+                self.assertEqual(turn.status, 'error')
+                self.assertEqual(turn.inspection['errorCode'], 'timeout')
+                self.assertIn('退出已确认', turn.inspection['message'])
+                self.assertNotIn('正在确认', turn.answer + turn.inspection['message'])
+                self.assertEqual(len(calls), 1)
+                self.assertEqual(self.bridge._inspection_jobs, {})
+                self.assertTrue(self.state.auto)
+
+    async def test_harness_discovery_exit_unknown_does_not_start_summary(self):
+        from src.backend.aside_inspection import QueryBudget
+        from src.backend.deepseek_harness import DeepSeekHarnessBackend
+        from src.types import BackendType, ModelBackendConfig
+        backend = DeepSeekHarnessBackend(ModelBackendConfig('b', BackendType.DEEPSEEK_HARNESS, 'fixture'))
+        self.bridge._new_backend_instance.return_value = backend
+        calls = []
+        async def stuck(*args, **kwargs):
+            calls.append(True)
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                finished = asyncio.get_running_loop().create_future()
+                finished.set_result(None)
+                backend._harness_workers = {'s:chataside': SimpleNamespace(task=finished, confirmed=False)}
+        with patch('src.backend.aside_bridge.QueryBudget', side_effect=lambda **kw: QueryBudget(seconds=.06, **kw)), \
+                patch('src.backend.text_only.send_text_only', side_effect=stuck):
+            self.submit(question='一般问题')
+            job = self.bridge._inspection_jobs['s:chataside']
+            await job['task']
+            await job['cleanup']
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(self.extras.asides[-1].inspection['phase'], 'unknown')
+        self.assertIn('s:chataside', self.bridge._inspection_jobs)
+
+    async def test_discovery_disk_timeout_retains_worker_until_real_exit(self):
+        import threading
+        from src.backend.aside_inspection import QueryBudget
+        from src.backend.aside_files import ReadonlyFiles
+        entered, release = threading.Event(), threading.Event()
+        self.addCleanup(release.set)
+        def slow_file(*args, **kwargs):
+            entered.set()
+            release.wait(3)
+            return {'status': 'ok', 'content': 'LATE BODY'}
+        calls = []
+        async def ask(*args, **kwargs):
+            calls.append(True)
+            kwargs['on_delta'](StreamDelta('s', 'm', 'text_delta', text=json.dumps({
+                'type': 'query', 'queries': [{'operation': 'read_text', 'arguments': {'path': 'a.txt'}}]})))
+        with patch('src.backend.aside_bridge.QueryBudget', side_effect=lambda **kw: QueryBudget(seconds=.09, **kw)), \
+                patch.object(ReadonlyFiles, 'text', side_effect=slow_file), \
+                patch('src.backend.text_only.send_text_only', side_effect=ask):
+            self.submit(question='读 a.txt')
+            job = self.bridge._inspection_jobs['s:chataside']
+            await job['task']
+            self.assertTrue(entered.is_set())
+            self.assertEqual(self.extras.asides[-1].inspection['phase'], 'unknown')
+            self.assertEqual(len(calls), 1)
+            release.set()
+            await job['cleanup']
+        self.assertNotIn('LATE BODY', self.extras.asides[-1].answer)
+        self.assertEqual(self.extras.asides[-1].status, 'error')
+        self.assertTrue(self.state.auto)
+
+    async def test_reference_preparation_also_reserves_answer_window(self):
+        from src.backend.aside_inspection import QueryBudget
+        async def delayed_reference(*args):
+            await asyncio.sleep(.12)
+            return 'LATE REFERENCE BODY'
+        self.bridge._skill_reference_content.side_effect = delayed_reference
+        with patch('src.backend.aside_bridge.QueryBudget', side_effect=lambda **kw: QueryBudget(seconds=.15, **kw)), \
+                patch('src.backend.text_only.send_text_only', side_effect=self.answer) as generate:
+            self.submit(question='@SKILL:example 查接入方法')
+            await self.bridge._inspection_jobs['s:chataside']['task']
+        self.assertEqual(generate.call_count, 1)
+        payload = json.loads(generate.call_args.kwargs['content'])
+        self.assertEqual(payload['finishReason'], 'answer_reserve')
+        self.assertIn('未完整取得', payload['context']['referenceStatus'])
+        self.assertNotIn('LATE REFERENCE BODY', str(payload))
+        self.assertEqual(self.extras.asides[-1].status, 'done')
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -8,7 +8,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Protocol, Callable, Awaitable
 
 from .release_center import ReleaseCenterManager
 
@@ -18,10 +18,22 @@ class KitCapabilityError(RuntimeError):
 
 
 @dataclass(frozen=True)
+class KitLocalUpdateServices:
+    """运行器注入的窄接口；闭包固定 Session/run/step，不能接受 RPC/目标/安装命令。"""
+    prepare: Callable[[], Awaitable[dict[str, Any]]]
+    reconcile: Callable[[], dict[str, Any]]
+    cancel: Callable[[], None]
+
+
+@dataclass(frozen=True)
 class KitCapabilityContext:
     release_center: ReleaseCenterManager
     working_dir: Path
     source: str
+    run_id: str = ""
+    step_id: str = ""
+    build_receipt: dict[str, Any] | None = None
+    local_update: KitLocalUpdateServices | None = None
 
 
 class KitCapabilityHandler(Protocol):
@@ -96,7 +108,7 @@ class ReleasePublishLatestCapability:
     permission = "node.release.manage"
     approval = "required"
     requires_explicit_intent = True
-    intent_hints = ("发布", "publish", "release", "上线最新包", "更新发布清单")
+    intent_hints = ("发布", "publish", "release", "上线最新包", "更新发布清单", "打包上传", "上传制品")
     argument_schema = {
         "projectRoot": {
             "type": "string", "default": ".",
@@ -107,6 +119,8 @@ class ReleasePublishLatestCapability:
             "description": "发布通道",
         },
         "notes": {"type": "string", "description": "本次更新说明"},
+        "bindBuild": {"type": "boolean", "optional": True,
+                      "description": "仅发布当前运行的已验证构建输出"},
         "platforms": {
             "type": "string[]", "optional": True,
             "description": "只选择指定平台，如 windows/linux/macos",
@@ -182,12 +196,18 @@ class ReleasePublishLatestCapability:
         self, arguments: dict[str, Any], context: KitCapabilityContext,
     ) -> dict[str, Any]:
         root = self._project_root(arguments, context.working_dir)
-        scanned = await asyncio.to_thread(
-            context.release_center.scan_project,
-            str(root),
-            context.source,
-        )
-        candidate = dict(scanned.get("candidate") or {})
+        if arguments.get("bindBuild") is True:
+            receipt = context.build_receipt or {}
+            if receipt.get("runId") != context.run_id or not context.run_id:
+                raise KitCapabilityError("发布缺少本次运行的构建回执")
+            candidate = await asyncio.to_thread(
+                context.release_center.verify_build_snapshot, receipt, root,
+            )
+        else:
+            scanned = await asyncio.to_thread(
+                context.release_center.scan_project, str(root), context.source,
+            )
+            candidate = dict(scanned.get("candidate") or {})
         selected = self._select_artifacts(candidate, arguments)
         if not selected:
             raise KitCapabilityError(
@@ -199,12 +219,24 @@ class ReleasePublishLatestCapability:
                 "manifestKey", "stableManifestUrl", "requireSignature",
             ) if key in arguments
         }
+        binding = {"kit_binding": {"runId": context.run_id, "stepId": context.step_id}} if arguments.get("bindBuild") is True else {}
         preview = await context.release_center.preview(
             str(candidate.get("id") or ""),
             [str(item.get("id") or "") for item in selected],
             options,
+            **binding,
         )
         plan = dict(preview.get("plan") or {})
+        if binding:
+            frozen = (plan.get("manifest") or {}).get("artifacts") or []
+            expected = {item["id"]: item for item in selected}
+            if (len(frozen) != len(selected) or any(
+                any(item.get(key) != expected.get(item.get("id"), {}).get(key)
+                    for key in ("size", "sha256", "platform", "arch", "target", "kind", "install"))
+                for item in frozen
+            ) or any((plan.get("manifest") or {}).get("release", {}).get(key) != candidate.get(key)
+                     for key in ("buildId", "version", "sequence", "kitUpdateProtocol"))):
+                raise KitCapabilityError("构建候选在冻结发布计划期间已改变")
         public_plan = _public_plan(plan)
         blockers = list(public_plan.get("blockers") or [])
         return {
@@ -243,6 +275,12 @@ class ReleasePublishLatestCapability:
         )
         if job is None:
             raise KitCapabilityError("发布任务已不在发布中心账本中")
+        if job.get("status") == "succeeded" and runtime.get("boundBuild"):
+            job["publishedRelease"] = await asyncio.to_thread(
+                context.release_center.published_result, job_id,
+                str(runtime.get("planId") or ""), str(runtime.get("planFingerprint") or ""),
+                context.run_id, context.step_id,
+            )
         return job
 
     async def cancel(
@@ -253,11 +291,45 @@ class ReleasePublishLatestCapability:
             await context.release_center.cancel_publish(job_id)
 
 
+class LocalPublishedUpdateCapability:
+    id = "node.update_local_published"
+    title = "安装本次发布并验收重启"
+    description = "仅更新 Session 执行设备的已安装 Windows 桌面，必须在 Kit 面板单独确认安装。"
+    risk_level = "high"
+    permission = "node.update.manage"
+    approval = "required"
+    requires_explicit_intent = True
+    intent_hints = ("本机更新", "更新本机", "本机完成更新", "本地更新", "安装本次发布", "local update")
+    argument_schema = {}
+    example = {"type": "awu_capability", "target": "executor", "title": title,
+               "config": {"capability": id, "arguments": {}}}
+
+    @staticmethod
+    def _services(context: KitCapabilityContext) -> KitLocalUpdateServices:
+        if context.local_update is None:
+            raise KitCapabilityError("缺少本次执行器绑定的更新服务")
+        return context.local_update
+
+    async def prepare(self, arguments: dict[str, Any], context: KitCapabilityContext) -> dict[str, Any]:
+        if arguments:
+            raise KitCapabilityError("本机更新不能接受外部参数")
+        return await self._services(context).prepare()
+
+    async def start(self, runtime: dict[str, Any], context: KitCapabilityContext) -> dict[str, Any]:
+        raise KitCapabilityError("安装只能由面板的独立冻结计划确认交接，不能从通用 start 启动")
+
+    async def poll(self, runtime: dict[str, Any], context: KitCapabilityContext) -> dict[str, Any]:
+        return self._services(context).reconcile()
+
+    async def cancel(self, runtime: dict[str, Any], context: KitCapabilityContext) -> None:
+        self._services(context).cancel()
+
+
 class KitCapabilityRegistry:
     """稳定 capability id 白名单及其统一生命周期入口。"""
 
     def __init__(self) -> None:
-        handlers: list[KitCapabilityHandler] = [ReleasePublishLatestCapability()]
+        handlers = [ReleasePublishLatestCapability(), LocalPublishedUpdateCapability()]
         self._handlers = {handler.id: handler for handler in handlers}
 
     def metadata(self, capability_id: str) -> dict[str, Any]:
@@ -302,6 +374,8 @@ class KitCapabilityRegistry:
             return {}
         if not isinstance(arguments, dict):
             raise KitCapabilityError("AgentWithU 能力参数必须是 JSON 对象")
+        if capability_id == LocalPublishedUpdateCapability.id and arguments:
+            raise KitCapabilityError("本机更新不接受目标、路径、命令、owner 或外部发布回执参数")
         return dict(arguments)
 
     async def prepare(

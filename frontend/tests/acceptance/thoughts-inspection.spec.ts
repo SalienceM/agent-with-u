@@ -62,6 +62,46 @@ async function open(page: Page) {
 }
 
 for (const width of [1366, 390]) {
+  test(`budget reasons, typed ranges and confirmed timeout at ${width}px`, async ({ page, context }, info) => {
+    await page.setViewportSize({ width, height: 900 });
+    const f = await fixture(context);
+    const panel = await open(page);
+    await panel.locator('textarea').first().fill('第三方模块怎么接入，配置和代码入口在哪里？');
+    await panel.getByRole('button', { name: '发送', exact: true }).click();
+    await expect.poll(() => f.asks.length).toBe(1);
+    f.update('answering', { inspection: { message: '正在整理已有证据：查询发现阶段已结束', sources: [
+      { operation: 'list_directory', path: 'project', status: 'ok', complete: true, offset: 0, entryCount: 3 },
+      { operation: 'list_directory', path: 'project/docs', status: 'ok', complete: false, offset: 0 },
+      { operation: 'search_text', path: 'project/base', status: 'ok', complete: false, visited: 20, matchCount: 2, limitReason: 'search_bytes' },
+      { operation: 'read_text', path: 'project/base/entry.ts', status: 'ok', complete: false, offset: 0, end: 120 },
+      ...['file_bytes', 'total_bytes', 'context_chars'].map(limitReason => ({ operation: 'read_text', status: 'limit', limitReason })),
+      { operation: 'read_text', status: 'limit' },
+    ] } });
+    await panel.locator('summary').filter({ hasText: '查询来源' }).click();
+    await expect(panel).toContainText('目录项：本页 3 项');
+    await expect(panel).toContainText('目录分页（偏移 0）');
+    await expect(panel).toContainText('搜索覆盖：检查 20 个文件目标，命中 2 处');
+    await expect(panel).toContainText('字符范围：0–120（非全文）');
+    await expect(panel).not.toContainText('0–?');
+    for (const reason of ['搜索读取额度已用尽', '单文件超过 256 KiB', '累计读取额度已用尽', '项目证据上下文已满', '达到查询上限']) {
+      await expect(panel).toContainText(reason);
+    }
+    await page.screenshot({ path: info.outputPath(`budget-sources-${width}.png`) });
+    f.update('unknown', { answer: '❌ 旁路回答超时，未生成完整回答。', inspection: {
+      errorCode: 'timeout', message: '结果待确认：旁路调用尚未确认退出，主线不受影响',
+    } });
+    await expect(panel).toContainText('结果待确认 · 查询超时');
+    f.update('error', { inspection: { message: '旁路回答超时，未生成完整回答；旁路退出已确认，主线不受影响。' } });
+    await expect(panel).toContainText('查询失败 · 查询超时');
+    await expect(panel).toContainText('退出已确认');
+    await expect(panel).not.toContainText('正在确认');
+    await expect(panel).not.toContainText('结果待确认');
+    await expect(panel.getByRole('button', { name: '编辑后重新提问' })).toBeVisible();
+    await page.screenshot({ path: info.outputPath(`budget-timeout-${width}.png`) });
+    expect(f.asks).toHaveLength(1);
+    expect(f.requests).not.toContain('abortMessage');
+  });
+
   test(`readonly phases, sources, failure and stop at ${width}px`, async ({ page, context }, info) => {
     await page.setViewportSize({ width, height: 900 });
     const f = await fixture(context);

@@ -20,6 +20,106 @@ async function treeOffset(panel: Locator): Promise<number> {
   return tree.y - outer.y;
 }
 
+test('directory expansion survives page and tree refresh without reading collapsed branches', async ({ page }) => {
+  const reads: string[] = [];
+  const forbidden: string[] = [];
+  await page.routeWebSocket(/.*/, socket => {
+    const server = socket.connectToServer();
+    socket.onMessage(message => {
+      const frame = JSON.parse(String(message));
+      const reply = (result: unknown) => socket.send(JSON.stringify({ id: frame.id, result: JSON.stringify(result) }));
+      if (frame.method === 'gitDetect') return reply({ isRepo: false });
+      if (['syncManifest', 'syncReadFile', 'syncWriteFile', 'sendMessage'].includes(frame.method)) {
+        forbidden.push(frame.method); return reply({ error: 'Unexpected operation in expansion test' });
+      }
+      if (frame.method === 'listDirectory') {
+        const rel = frame.params[0]; reads.push(rel);
+        return reply(rel === '' ? [{ name: 'src', path: 'src', isDir: true }, { name: 'docs', path: 'docs', isDir: true }]
+          : rel === 'src' ? [{ name: 'nested', path: 'src/nested', isDir: true }]
+          : rel === 'src/nested' ? [{ name: 'deep.txt', path: 'src/nested/deep.txt', isDir: false }] : []);
+      }
+      server.send(message);
+    });
+  });
+  const panel = await openFiles(page);
+  const row = (name: string) => panel.locator('.ftp-row').filter({ hasText: name });
+  await row('src').click(); await row('nested').click();
+  await expect(row('deep.txt')).toBeVisible();
+  const reopenFiles = async () => {
+    const opener = page.getByRole('button', { name: '打开会话列表', exact: true });
+    if (await opener.isVisible()) await opener.click();
+    await page.getByRole('navigation', { name: '功能栏' })
+      .getByRole('button', { name: '文件目录（本地 ⇄ 远端）', exact: true }).click();
+    await expect(row('src')).toBeVisible();
+  };
+  reads.length = 0;
+  await page.reload(); await reopenFiles();
+  await expect(row('deep.txt')).toBeVisible();
+  expect(reads).toEqual(['', 'src', 'src/nested']);
+  // 目录工具的刷新也不能丢掉收起父目录下的子级展开选择。
+  await row('src').click();
+  reads.length = 0;
+  await panel.getByRole('button', { name: '刷新文件目录' }).click();
+  await expect.poll(() => reads.length).toBe(1);
+  await row('src').click();
+  await expect(row('deep.txt')).toBeVisible();
+  expect(reads).toEqual(['', 'src', 'src/nested']);
+  await row('src').click();
+  reads.length = 0;
+  await page.reload(); await reopenFiles();
+  await expect(row('nested')).toHaveCount(0);
+  expect(reads).toEqual(['']);
+  await row('src').click();
+  await expect(row('deep.txt')).toBeVisible();
+  expect(reads).not.toContain('docs');
+  await panel.getByRole('button', { name: '更多文件工具', exact: true }).click();
+  await page.getByRole('button', { name: '全部折叠', exact: true }).click();
+  await expect(row('nested')).toHaveCount(0);
+  reads.length = 0;
+  await page.reload(); await reopenFiles();
+  expect(reads).toEqual(['']);
+  await row('src').click();
+  await expect(row('nested')).toBeVisible();
+  await expect(row('deep.txt')).toHaveCount(0);
+  expect(forbidden).toEqual([]);
+});
+
+test('restored directory failures do not retry on rerender and removed paths are not read', async ({ page }) => {
+  let fail = false;
+  const reads: string[] = [];
+  await page.routeWebSocket(/.*/, socket => {
+    const server = socket.connectToServer();
+    socket.onMessage(message => {
+      const frame = JSON.parse(String(message));
+      const reply = (result: unknown) => socket.send(JSON.stringify({ id: frame.id, result: JSON.stringify(result) }));
+      if (frame.method === 'gitDetect') return reply({ isRepo: false });
+      if (frame.method === 'listDirectory') {
+        const rel = frame.params[0]; reads.push(rel);
+        if (rel === '') return reply([{ name: 'src', path: 'src', isDir: true },
+          ...(!fail ? [{ name: 'removed', path: 'removed', isDir: true }] : [])]);
+        return reply(fail ? { error: 'Fixture read denied' } : []);
+      }
+      server.send(message);
+    });
+  });
+  const panel = await openFiles(page);
+  await panel.locator('.ftp-row').filter({ hasText: 'src' }).click();
+  await panel.locator('.ftp-row').filter({ hasText: 'removed' }).click();
+  await expect.poll(() => reads.length).toBe(3);
+  fail = true; reads.length = 0;
+  await page.reload();
+  const opener = page.getByRole('button', { name: '打开会话列表', exact: true });
+  if (await opener.isVisible()) await opener.click();
+  await page.getByRole('navigation', { name: '功能栏' })
+    .getByRole('button', { name: '文件目录（本地 ⇄ 远端）', exact: true }).click();
+  await expect(panel.getByText('目录同步失败，请点击刷新重试', { exact: true })).toBeVisible();
+  await panel.getByRole('button', { name: /^工作目录 / }).click();
+  await page.keyboard.press('Escape');
+  expect(reads).toEqual(['', 'src']);
+  await panel.getByRole('button', { name: '刷新文件目录' }).click();
+  await expect.poll(() => reads.filter(rel => rel === 'src').length).toBe(2);
+});
+
 test('compact header keeps the tree within 80px and refresh is independent of pending Git', async ({ page }, testInfo) => {
   await page.addInitScript(() => {
     let release!: (value: boolean) => void;

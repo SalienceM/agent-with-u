@@ -261,7 +261,8 @@ class KitCapabilityModelTests(unittest.TestCase):
         self.assertEqual("awu_capability", capability["example"]["type"])
 
     def test_ai_capability_requires_matching_human_contract(self):
-        bridge = BridgeWS()
+        bridge = BridgeWS.__new__(BridgeWS)
+        bridge._kit_capabilities = KitCapabilityRegistry()
         kit = WorkspaceKit.from_dict({
             "title": "Release",
             "steps": [{
@@ -283,7 +284,8 @@ class KitCapabilityModelTests(unittest.TestCase):
         self.assertIn("明确授权", errors[0])
 
     def test_unregistered_ai_capability_is_rejected(self):
-        bridge = BridgeWS()
+        bridge = BridgeWS.__new__(BridgeWS)
+        bridge._kit_capabilities = KitCapabilityRegistry()
         kit = WorkspaceKit.from_dict({
             "title": "Unknown",
             "steps": [{

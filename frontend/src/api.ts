@@ -34,6 +34,8 @@ import { inputHistoryKey, inputHistoryStore } from './utils/inputHistory';
 import { LoopControlStore, controlKey, type ControlTarget, type ControlSummary } from './utils/loopControl';
 import { LoopControlTransport, requestWithReadiness } from './utils/loopControlTransport';
 import { uuid } from './utils/uuid';
+import { SessionFavorites, IndexedFavoriteRepository, favoriteKey, favoriteIdentityTarget, mergeFavoriteRemote, type FavoriteTarget } from './utils/sessionFavorites';
+import { deleteSessionOnTarget, type SessionDeletionResult } from './utils/sessionDeletion';
 
 type StreamDeltaCallback = (delta: any) => void;
 type SessionUpdateCallback = (data: any) => void;
@@ -915,7 +917,7 @@ function handleMessage(e: MessageEvent, source?: Conn) {
       pending.delete(msg.id);
       pendingConn.delete(msg.id);
       if (msg.error !== undefined) {
-        reject(new Error(typeof msg.error === 'string' ? msg.error : JSON.stringify(msg.error)));
+        reject(Object.assign(new Error(typeof msg.error === 'string' ? msg.error : JSON.stringify(msg.error)), { serverRejected: true }));
       } else {
         resolve(msg.result ?? null);
       }
@@ -939,24 +941,26 @@ function handleMessage(e: MessageEvent, source?: Conn) {
         summary: parsed?.summary ? { ...parsed.summary, ...execMeta } : parsed?.summary,
       };
       const sessionId = data?.sessionId || data?.summary?.id;
-      if (sessionId && data.type === 'session_deleted') sessionRoutingCache.delete(sessionId);
-      else if (sessionId && data.summary) sessionRoutingCache.update(sessionId, data.summary);
+      if (source && sessionId && data.type !== 'session_deleted'
+          && confirmedSessionDeletions.has(favoriteKey(favoriteTarget(source, sessionId)))) return;
+      if (sessionId && data.type === 'session_deleted') {
+        if (!source || !observeSessionDeletion(source, sessionId)) return;
+        sessionUpdateCallbacks.forEach(cb => cb(data));
+        return;
+      }
+      if (source && data.summary) data.summary = mergeFavoriteRemote(
+        (sessionListCache.get(source.key) || []).find(item => item.id === sessionId), data.summary);
+      if (sessionId && data.summary) sessionRoutingCache.update(sessionId, data.summary);
       if (source && sessionId) {
-        if (data.type === 'session_deleted') {
-          inputHistoryStore.remove(inputHistoryKey(getCurrentUserProfile(), source.key, sessionId));
-          sessionExec.delete(sessionId);
-          persistSessionExec();
-        } else if (sessionExec.get(sessionId) !== source.key) {
+        if (sessionExec.get(sessionId) !== source.key) {
           sessionExec.set(sessionId, source.key);
           persistSessionExec();
         }
         const cached = sessionListCache.get(source.key) || [];
-        if (data.type === 'session_deleted') {
-          sessionListCache.set(source.key, cached.filter((item) => item?.id !== sessionId));
-        } else if (data.summary?.id) {
+        if (data.summary?.id) {
           const index = cached.findIndex((item) => item?.id === data.summary.id);
           const next = [...cached];
-          if (index >= 0) next[index] = { ...next[index], ...data.summary };
+          if (index >= 0) next[index] = { ...next[index], ...mergeFavoriteRemote(next[index], data.summary) };
           else next.push(data.summary);
           sessionListCache.set(source.key, next);
         } else if (data.type === 'session_renamed') {
@@ -966,6 +970,7 @@ function handleMessage(e: MessageEvent, source?: Conn) {
         }
         persistSessionListCache();
       }
+      if (data.summary && source) data.summary = projectFavorite(data.summary, source);
       sessionUpdateCallbacks.forEach((cb) => cb(data));
     } else if (msg.event === 'permissionRequest') {
       const data = JSON.parse(msg.data);
@@ -998,7 +1003,8 @@ function handleMessage(e: MessageEvent, source?: Conn) {
           )).catch((error) => {
             pendingDesktopUpdatePlan = '';
             const message = error instanceof Error ? error.message : String(error || 'desktop updater failed');
-            void callOn('local', 'nodeUpdateInstallFailed', message);
+            if (data.kitRequestId) void callOn('local', 'kitInstallHandoffFailed', String(data.kitRequestId));
+            else void callOn('local', 'nodeUpdateInstallFailed', message);
           });
         }, delay);
       }
@@ -1035,9 +1041,11 @@ function handleMessage(e: MessageEvent, source?: Conn) {
       chatAsideUpdatedCallbacks.forEach((cb) => cb(data, source?.key || 'local'));
     } else if (msg.event === 'kitUpdated') {
       const data = JSON.parse(msg.data);
+      if (source && sessionExec.get(data.sessionId) !== source.key) return;
       kitUpdatedCallbacks.forEach((cb) => cb(data));
     } else if (msg.event === 'kitGenerationUpdated') {
       const data = JSON.parse(msg.data) as KitGenerationJob;
+      if (source && sessionExec.get(data.sessionId) !== source.key) return;
       kitGenerationUpdatedCallbacks.forEach((cb) => cb(data));
     } else if (msg.event === 'sttStreamText') {
       const data = JSON.parse(msg.data);
@@ -1217,6 +1225,11 @@ class Conn {
       }, HEARTBEAT_INTERVAL_MS);
       this.settleReady();
       if (this.key === 'local') {
+        if (isTauri()) {
+          void import('@tauri-apps/api/core').then(({ invoke }) => invoke('get_kit_update_identity'))
+            .then(identity => this.request('kitDesktopReady', [JSON.stringify(identity)], 5_000))
+            .catch(() => { /* 旧端/源码不支持新交接协议，不降级或重试安装。 */ });
+        }
         // 同源节点的执行资格是服务端全局策略。连接建立后立即同步，确保换浏览器、
         // 换用户也不会把已设为“控制端专用”的弱 Web 节点重新列为候选。
         void this.request('relayNodeStatus', [], 5_000).then((raw) => {
@@ -1300,13 +1313,32 @@ class Conn {
 
   /** 发起一次 RPC。home 离线时回落 mock(保持旧行为);其它节点离线则丢弃返回 null。 */
   async request(method: string, params: any[], timeoutMs?: number): Promise<any> {
-    await this.ready;
+    const strictSession = ['sessionFavoriteGet', 'sessionFavoriteSet', 'deleteSession', 'destroySession'].includes(method);
+    const deadline = Date.now() + (timeoutMs || 10000), requestEpoch = relayIdentityEpoch, socket = this.ws;
+    if (strictSession) {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try { await Promise.race([this.ready, new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(Object.assign(new Error('连接准备超时，未提交操作'), { notSubmitted: true })), Math.max(0, deadline - Date.now()));
+      })]); } finally { if (timer) clearTimeout(timer); }
+    } else await this.ready;
     if (!this.isOpen) {
+      if (strictSession) throw Object.assign(new Error('所属节点离线，未提交操作'), { notSubmitted: true });
       if (this.isHome) return mockDispatch(method, params);
       console.warn(`[api] exec node ${this.key} offline, "${method}" dropped`);
       return null;
     }
-    await ensureWindowMutation(this, method, params);
+    if (strictSession) {
+      let gateTimer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        await Promise.race([ensureWindowMutation(this, method, params), new Promise<never>((_, reject) => {
+          gateTimer = setTimeout(() => reject(new Error('操作准入超时，未提交')), Math.max(0, deadline - Date.now()));
+        })]);
+        if (requestEpoch !== relayIdentityEpoch || this.ws !== socket || !this.isOpen || Date.now() >= deadline)
+          throw new Error('连接或身份已变化，未提交操作');
+        timeoutMs = deadline - Date.now();
+      } catch (error) { throw Object.assign(error instanceof Error ? error : new Error(String(error)), { notSubmitted: true }); }
+      finally { if (gateTimer) clearTimeout(gateTimer); }
+    } else await ensureWindowMutation(this, method, params);
     return await new Promise((resolve, reject) => {
       const id = nextId();
       const timer = timeoutMs && timeoutMs > 0 ? setTimeout(() => {
@@ -1327,7 +1359,7 @@ class Conn {
         if (timer) clearTimeout(timer);
         pending.delete(id);
         pendingConn.delete(id);
-        reject(e as Error);
+        reject(strictSession ? Object.assign(e instanceof Error ? e : new Error(String(e)), { notSubmitted: true }) : e as Error);
       }
     });
   }
@@ -1352,6 +1384,106 @@ let homeConn!: Conn;  // initPool() 在模块加载时立即赋值
 const sessionExec = new Map<string, string>();   // sessionId → conn.key
 const workspaceControllers = new Map<string, { conn: Conn; socket: WebSocket | null; epoch: number }>();
 const workspaceDiscoveredTargets = new Map<string, ExecTarget>();
+
+function favoriteTarget(conn: Conn, session: string): FavoriteTarget {
+  const user = conn.target.user?.userId || (conn.target.mode === 'local' ? 'local' : 'legacy');
+  const sameLocal = isLocalRelayDuplicate(conn) && (pool.get('local')?.target.user?.userId || 'local') === user;
+  return favoriteIdentityTarget({ mode: conn.target.mode, origin: window.location.origin, userId: user,
+    relayUrl: conn.target.mode === 'relay' ? conn.target.url : user !== 'local' && connectionTarget.mode === 'relay' ? connectionTarget.url : undefined,
+    deviceId: conn.target.mode === 'relay' ? conn.target.deviceId : undefined, verifiedLocalAlias: sameLocal,
+  }, session);
+}
+function favoriteConnection(target: FavoriteTarget): Conn | undefined {
+  return Array.from(pool.values()).find(conn => favoriteKey(favoriteTarget(conn, target.session)) === favoriteKey(target));
+}
+function activeFavoriteScopes(): string[] {
+  return [...new Set(Array.from(pool.values()).map(conn => favoriteTarget(conn, '').scope))];
+}
+function projectFavorite(value: any, conn?: Conn): any {
+  const connection = conn || pool.get(value?.execKey || sessionExec.get(value?.id) || '');
+  if (!value?.id || !connection) return value;
+  const observed = (sessionListCache.get(connection.key) || []).find(row => row.id === value.id);
+  return sessionFavorites.project(favoriteTarget(connection, value.id), mergeFavoriteRemote(observed, value));
+}
+function recordRemoteFavorite(target: FavoriteTarget, value: import('./utils/sessionFavorites').FavoriteRemote): void {
+  const conn = favoriteConnection(target); if (!conn) return;
+  // 同一物理节点的已验证别名共用观察值，不能在清除覆盖层后回弹。
+  for (const alias of pool.values()) {
+    if (favoriteKey(favoriteTarget(alias, target.session)) !== favoriteKey(target)) continue;
+    const list = sessionListCache.get(alias.key) || [];
+    sessionListCache.set(alias.key, list.map(row => row.id === target.session ? { ...row, ...mergeFavoriteRemote(row, value) } : row));
+  }
+  const previous = sessionRoutingCache.get(target.session);
+  if (previous?.execKey === conn.key) sessionRoutingCache.update(target.session, { ...previous, ...mergeFavoriteRemote(previous, value) });
+  persistSessionListCache();
+}
+const favoriteChannel = typeof BroadcastChannel === 'function' ? new BroadcastChannel('awu-session-favorites-v1') : null;
+const sessionFavorites = new SessionFavorites(new IndexedFavoriteRepository(), {
+  available: target => {
+    const conn = favoriteConnection(target);
+    if (!conn) return activeFavoriteScopes().includes(target.scope) ? 'removed' : 'inactive';
+    if (conn.target.mode === 'relay' && (!conn.target.user?.userId || conn.target.user.userId === 'legacy')) return 'unsupported';
+    return conn.isOpen ? 'online' : 'offline';
+  },
+  call: async (target, method, params) => {
+    const conn = favoriteConnection(target), epoch = relayIdentityEpoch;
+    if (!conn || !conn.isOpen) throw new Error('所属节点离线，未提交收藏同步');
+    const result = await conn.request(method, params, 10000);
+    if (epoch !== relayIdentityEpoch || favoriteConnection(target) !== conn) throw new Error('收藏身份已变化');
+    return typeof result === 'string' ? JSON.parse(result) : result;
+  },
+  remote: (target, value) => {
+    recordRemoteFavorite(target, value);
+    favoriteChannel?.postMessage({ type: 'remote', target, value });
+  },
+  changed: () => {
+    const summaries = Array.from(pool.values()).flatMap(conn => (sessionListCache.get(conn.key) || []).map(row => ({
+      ...projectFavorite(row, conn), execKey: conn.key,
+    })));
+    sessionUpdateCallbacks.forEach(callback => callback({ type: 'favorite_changed', summaries }));
+  },
+  broadcast: () => favoriteChannel?.postMessage('changed'),
+});
+const favoritesReady = sessionFavorites.reload().catch(() => {});
+if (favoriteChannel) favoriteChannel.onmessage = ({ data }) => {
+  if (data?.type === 'remote' && typeof data.target?.scope === 'string' && typeof data.target?.node === 'string'
+      && typeof data.target?.session === 'string' && typeof data.value?.pinned === 'boolean'
+      && Number.isSafeInteger(data.value?.favoriteRevision) && data.value.favoriteRevision >= 0)
+    recordRemoteFavorite(data.target, data.value);
+  if (data?.type === 'clearing' && Array.isArray(data.scopes)) {
+    if (data.scopes.some((scope: string) => activeFavoriteScopes().includes(scope))) sessionFavorites.invalidate(data.scopes);
+    return;
+  }
+  void sessionFavorites.reload().catch(() => {});
+};
+let favoriteOnline = new Set<string>();
+const confirmedSessionDeletions = new Set<string>();
+function observeSessionDeletion(conn: Conn, session: string): boolean {
+  if (pool.get(conn.key) !== conn) return false;
+  const target = favoriteTarget(conn, session), key = favoriteKey(target);
+  if (confirmedSessionDeletions.has(key)) return false;
+  confirmedSessionDeletions.add(key);
+  if (confirmedSessionDeletions.size > 512) confirmedSessionDeletions.delete(confirmedSessionDeletions.values().next().value!);
+  inputHistoryStore.remove(inputHistoryKey(getCurrentUserProfile(), conn.key, session));
+  sessionListCache.set(conn.key, (sessionListCache.get(conn.key) || []).filter(row => row.id !== session));
+  if (sessionExec.get(session) === conn.key) sessionExec.delete(session);
+  if (sessionRoutingCache.get(session)?.execKey === conn.key) sessionRoutingCache.delete(session);
+  persistSessionListCache(); persistSessionExec();
+  void sessionFavorites.forget(target).catch(error => console.warn('[favorites] deletion cleanup failed', error));
+  return true;
+}
+async function requestSessionDeletion(session: string, destroy: boolean, executor?: string): Promise<SessionDeletionResult> {
+  const conn = pool.get(executor || sessionExec.get(session) || ''), epoch = relayIdentityEpoch;
+  const target = conn ? favoriteTarget(conn, session) : null;
+  const current = () => !!conn && epoch === relayIdentityEpoch && pool.get(conn.key) === conn
+    && favoriteKey(favoriteTarget(conn, session)) === favoriteKey(target!);
+  const result = await deleteSessionOnTarget({ online: () => !!conn?.isOpen, current,
+    request: (method, params, timeout) => conn!.request(method, params, timeout) }, session, destroy);
+  if (result.status === 'succeeded' && current() && observeSessionDeletion(conn!, session)) {
+    sessionUpdateCallbacks.forEach(callback => callback({ type: 'session_deleted', sessionId: session, execKey: conn!.key }));
+  }
+  return result;
+}
 
 async function handleWorkspaceToolRequest(data: WorkspaceToolRequest, source: Conn): Promise<void> {
   const controller = workspaceControllers.get(data?.sessionId);
@@ -1455,9 +1587,28 @@ async function ensureWindowMutation(conn: Conn, method: string, params: any[]): 
 export function getSessionExecKey(sessionId?: string | null): string | undefined {
   return sessionId ? sessionExec.get(sessionId) : undefined;
 }
+
+/** 安装动作固定当前已知执行器及账号；未知路由绝不借用 home。 */
+export function kitUpdateScope(sessionId: string): string {
+  return JSON.stringify([getCurrentUserProfile().userId, relayIdentityEpoch, getSessionExecKey(sessionId) || '', sessionId]);
+}
+
+async function callKitUpdate(sessionId: string, method: string, params: unknown[]): Promise<any> {
+  const executor = getSessionExecKey(sessionId), scope = kitUpdateScope(sessionId);
+  if (!executor) throw new Error('尚未确认 Session 执行设备，请重新打开该 Session');
+  const result = await callOnStrict(executor, method, [sessionId, ...params], 15_000);
+  if (kitUpdateScope(sessionId) !== scope) throw new Error('账号或执行设备已变化；请只读核对原请求，勿重试安装');
+  return result;
+}
 let execStatusCallbacks: (() => void)[] = [];
 
-function notifyExecStatus(): void { execStatusCallbacks.forEach((cb) => cb()); }
+function notifyExecStatus(): void {
+  execStatusCallbacks.forEach((cb) => cb());
+  const online = new Set(Array.from(pool.values()).filter(conn => conn.isOpen).map(conn => conn.key));
+  if ([...online].some(key => !favoriteOnline.has(key)) || [...favoriteOnline].some(key => !pool.has(key)))
+    void favoritesReady.then(() => sessionFavorites.reconnect());
+  favoriteOnline = online;
+}
 
 const SESSION_EXEC_KEY = 'awu.sessionExec';
 function loadSessionExec(): void {
@@ -1580,6 +1731,14 @@ function clearRelaySessionCaches(): void {
 
 /** 身份切换是安全边界：旧用户的全部连接、路由与离线 Session 缓存都丢弃。 */
 function clearRelayIdentityState(): void {
+  confirmedSessionDeletions.clear();
+  const scopes = activeFavoriteScopes();
+  favoriteChannel?.postMessage({ type: 'clearing', scopes });
+  void sessionFavorites.clear(scopes).then(() => favoriteChannel?.postMessage('changed')).catch(error => {
+    console.warn('[favorites] identity cleanup failed', error);
+    sessionUpdateCallbacks.forEach(callback => callback({ type: 'favorite_storage_error', message: '旧身份收藏记录未能清理，请检查浏览器存储；未继续同步。' }));
+  });
+  favoriteOnline.clear();
   windowTransport.clear();
   permissionReadGate.clear();
   terminalResources.clear();
@@ -1739,7 +1898,8 @@ export async function setConnectionTarget(t: ConnectionTarget): Promise<void> {
   const oldHome = homeConn;
   const previousIdentity = targetUserIdentity(connectionTarget);
   const nextIdentity = targetUserIdentity(t);
-  const identityChanged = previousIdentity !== nextIdentity;
+  const identityChanged = previousIdentity !== nextIdentity
+    || connectionTarget.mode === 'relay' && t.mode === 'relay' && connectionTarget.url !== t.url;
   if (identityChanged) clearRelayIdentityState();
   connectionTarget = t;
   try { localStorage.setItem(CONN_TARGET_KEY, JSON.stringify(t)); } catch { /* */ }
@@ -2398,6 +2558,7 @@ export const api = {
    * roster 为空时即等价于「只列 home 的 session」(向后兼容)。
    */
   async listSessions(): Promise<any[]> {
+    await favoritesReady;
     // App 与 Sidebar 在启动时可能同时请求；共享同一轮多节点 RPC，避免双发。
     if (listSessionsInFlight) return listSessionsInFlight;
     const request = (async (): Promise<any[]> => {
@@ -2416,8 +2577,10 @@ export const api = {
         }
         if (typeof r !== 'string') throw new Error('invalid listSessions response');
         const list = JSON.parse(r) || [];
-        const normalized = Array.isArray(list) ? list : [];
-        sessionListCache.set(c.key, normalized);
+        const normalized = Array.isArray(list) ? list.filter(row => row?.id
+          && !confirmedSessionDeletions.has(favoriteKey(favoriteTarget(c, row.id)))) : [];
+        const previous = sessionListCache.get(c.key) || [];
+        sessionListCache.set(c.key, normalized.map(row => mergeFavoriteRemote(previous.find(item => item.id === row.id), row)));
         persistSessionListCache();
         return { c, list: normalized, stale: false };
       } catch (error) {
@@ -2444,7 +2607,7 @@ export const api = {
       sessionExec.set(session.id, session.execKey);
     }
     persistSessionExec();
-    return merged;
+    return merged.map(row => projectFavorite(row));
     })();
     listSessionsInFlight = request;
     try {
@@ -2514,7 +2677,7 @@ export const api = {
       : await call('loadSession', id);
     try {
       const s = JSON.parse(result);
-      return attachSessionExecutor(s);
+      return projectFavorite(attachSessionExecutor(s));
     } catch { return null; }
   },
 
@@ -2550,7 +2713,7 @@ export const api = {
         if (!parsed || parsed.id !== id) throw new Error('会话不可用，请检查执行节点、会话权限或刷新列表');
         const session = sessionRoutingCache.loaded(id, attachSessionExecutor(parsed), revision);
         if (!isSessionMetaReady(session, id)) throw new Error('会话信息不完整：执行端未返回有效的会话类型或 LOOP 控制模式');
-        return session;
+        return projectFavorite(session, connection);
       } catch (error) {
         if (error instanceof Error && /RPC timeout/i.test(error.message)) throw new Error('会话信息加载超时，请重试');
         if (error instanceof Error && /WebSocket connection lost/i.test(error.message)) throw new Error('连接已中断，恢复连接后会自动重试');
@@ -2570,7 +2733,7 @@ export const api = {
   peekSessionMeta(id: string): any | null {
     const cached = cachedSessionMeta(id);
     const fresh = sessionRoutingCache.get(id);
-    return fresh || cached ? { ...cached, ...fresh } : null;
+    return fresh || cached ? projectFavorite({ ...cached, ...fresh }) : null;
   },
 
   /** 翻页加载 session 的更老消息。等价于 messages[offset : offset+limit]。 */
@@ -2599,19 +2762,25 @@ export const api = {
     }
   },
 
-  async deleteSession(id: string): Promise<boolean> {
-    const historyKey = inputHistoryKey(getCurrentUserProfile(), getSessionExecKey(id), id);
-    const deleted = await call('deleteSession', id);
-    if (deleted) inputHistoryStore.remove(historyKey);
-    return deleted;
+  async deleteSession(id: string, execKey?: string): Promise<SessionDeletionResult> {
+    return requestSessionDeletion(id, false, execKey);
   },
 
-  async destroySession(id: string, confirmation: 'DESTROY'): Promise<{
-    status: string; directory?: string; directoryDeleted?: boolean; message?: string;
-  }> {
-    const result = await call('destroySession', id, confirmation);
-    if (result === null || result === undefined) return { status: 'error', message: '无法连接到执行端' };
-    try { return JSON.parse(result); } catch { return { status: 'error', message: '销毁响应格式错误' }; }
+  async destroySession(id: string, confirmation: 'DESTROY', execKey?: string): Promise<SessionDeletionResult> {
+    if (confirmation !== 'DESTROY') return { status: 'not_submitted', message: '请先确认销毁' };
+    return requestSessionDeletion(id, true, execKey);
+  },
+  async checkSessionDeletion(id: string, execKey: string): Promise<SessionDeletionResult> {
+    const conn = pool.get(execKey), epoch = relayIdentityEpoch;
+    if (!conn || !conn.isOpen) return { status: 'unknown', message: '所属节点仍离线，无法核对' };
+    const key = favoriteKey(favoriteTarget(conn, id));
+    if (confirmedSessionDeletions.has(key)) return { status: 'succeeded', message: '已收到会话删除确认；不代表目录销毁已确认' };
+    try {
+      const raw = await callOnStrict(execKey, 'loadSessionMeta', [id], 10000);
+      if (epoch !== relayIdentityEpoch || pool.get(execKey) !== conn) return { status: 'unknown', message: '身份已变化' };
+      const result = typeof raw === 'string' ? JSON.parse(raw) : raw;
+      return { status: 'unknown', message: result?.id === id ? '当前仍可读取该会话；原请求结果未知，不会自动重新删除' : '未取得明确删除回执，结果仍未知' };
+    } catch { return { status: 'unknown', message: '只读核对未成功，不能据此认定已删除' }; }
   },
 
   async renameSession(sessionId: string, newTitle: string): Promise<{ status: string; message?: string }> {
@@ -2662,6 +2831,13 @@ export const api = {
       sessionRoutingCache.update(sessionId, result.summary);
     }
     return result;
+  },
+
+  async syncReview(sessionId: string, execKey: string, workingDir: string, isCurrent: () => boolean) {
+    const user = getCurrentUserProfile().userId, epoch = relayIdentityEpoch;
+    const { RemoteSyncReview } = await import('./utils/syncReviewProtocol');
+    return RemoteSyncReview.connect({ user, executor: execKey, session: sessionId, workingDir }, callOnStrict,
+      () => user === getCurrentUserProfile().userId && epoch === relayIdentityEpoch && isCurrent());
   },
 
   async sessionWorkbenchCapabilities(sessionId: string, execKey: string, workingDir: string) {
@@ -2736,6 +2912,22 @@ export const api = {
     const result = await call('updateSessionAppearance', sessionId, JSON.stringify(patch || {}));
     if (result === null || result === undefined) return { status: 'error', message: '无法连接到执行端' };
     try { return JSON.parse(result); } catch { return { status: 'error', message: '响应格式错误' }; }
+  },
+
+  async setSessionFavorite(sessionId: string, pinned: boolean, execKey?: string): Promise<void> {
+    await favoritesReady;
+    const conn = pool.get(execKey || sessionExec.get(sessionId) || '');
+    if (!conn) throw new Error('Session 执行节点未知，未保存收藏');
+    const row = (sessionListCache.get(conn.key) || []).find(item => item.id === sessionId);
+    if (!row) throw new Error('没有该 Session 的可用缓存，未保存收藏');
+    await sessionFavorites.choose(favoriteTarget(conn, sessionId), pinned, row.favoriteRevision);
+  },
+  async resolveSessionFavorite(sessionId: string, choice: 'local' | 'remote' | 'retry', execKey?: string): Promise<void> {
+    const conn = pool.get(execKey || sessionExec.get(sessionId) || '');
+    if (!conn) throw new Error('所属节点已移除');
+    const target = favoriteTarget(conn, sessionId);
+    if (choice === 'retry') await sessionFavorites.sync(target);
+    else await sessionFavorites.resolve(target, choice);
   },
 
   async updateSessionConstraints(sessionId: string, constraints: string | { constraints: string }): Promise<{ status: string; message?: string }> {
@@ -3479,11 +3671,20 @@ export const api = {
   },
   async kitCapabilityRespond(
     sessionId: string, runId: string, stepId: string, approved: boolean,
+    planFingerprint = '', requestId = '',
   ): Promise<{ status: string; decision?: string; run?: KitRun; message?: string }> {
-    const result = await call('kitCapabilityRespond', sessionId, runId, stepId, approved);
+    const result = planFingerprint
+      ? await callKitUpdate(sessionId, 'kitCapabilityRespond', [runId, stepId, approved, planFingerprint, requestId])
+      : await call('kitCapabilityRespond', sessionId, runId, stepId, approved, planFingerprint, requestId);
     return parseRpcObject(result, {
       status: 'error', message: '执行端未响应能力确认请求，请检查连接后重试',
     });
+  },
+  async kitUpdateSelect(sessionId: string, runId: string, artifactId: string, fingerprint: string, requestId: string): Promise<{ status: string; message?: string }> {
+    return parseRpcObject(await callKitUpdate(sessionId, 'kitUpdateSelect', [runId, artifactId, fingerprint, requestId]), { status: 'error' });
+  },
+  async kitUpdateReconcile(sessionId: string, runId: string): Promise<{ status: string; message?: string }> {
+    return parseRpcObject(await callKitUpdate(sessionId, 'kitUpdateReconcile', [runId]), { status: 'error' });
   },
   async kitOptimizeStart(sessionId: string, kitId: string, prompt: string, backendId = ''): Promise<{
     status: string; running?: boolean; messages?: KitOptimizationMessage[]; message?: string;

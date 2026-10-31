@@ -1,5 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { api, getCurrentUserProfile, onExecStatus } from '../api';
+import { api, getCurrentUserProfile, onExecStatus, onCurrentUserChanged, kitUpdateScope } from '../api';
+import { KitLocalUpdateCard } from './KitLocalUpdateCard';
 import type {
   WorkspaceKitState,
   WorkspaceKit,
@@ -64,6 +65,10 @@ const statusMeta: Record<string, { label: string; color: string }> = {
   running: { label: '执行中', color: '#d29922' },
   waiting_client: { label: '等待客户端', color: '#d2a8ff' },
   waiting_approval: { label: '等待确认', color: '#f0b429' },
+  handing_off: { label: '交接安装', color: '#f0b429' },
+  waiting_restart: { label: '等待重启', color: '#f0b429' },
+  verifying: { label: '启动验收', color: '#58a6ff' },
+  result_unknown: { label: '结果未知', color: '#e3b341' },
   evaluating: { label: '验收中', color: '#58a6ff' },
   succeeded: { label: '成功', color: '#3fb950' },
   failed: { label: '失败', color: '#f85149' },
@@ -77,6 +82,10 @@ function lastRunOf(state: WorkspaceKitState, kit: WorkspaceKit): KitRun | undefi
     if (exact) return exact;
   }
   return [...state.runs].reverse().find((run) => (run.canonicalKitId || run.kitId) === kit.id);
+}
+
+function updateHandedOff(run?: KitRun): boolean {
+  return !!run && ['handing_off', 'waiting_restart', 'verifying', 'result_unknown'].includes(run.status);
 }
 
 function asDisplay(value: unknown): string {
@@ -161,7 +170,7 @@ function defaultInputsOf(kit: WorkspaceKit): Record<string, unknown> {
 }
 
 function isActiveRun(run?: KitRun): boolean {
-  return !!run && ['queued', 'running', 'waiting_client', 'waiting_approval', 'evaluating'].includes(run.status);
+  return !!run && ['queued', 'running', 'waiting_client', 'waiting_approval', 'evaluating', 'handing_off', 'waiting_restart', 'verifying', 'result_unknown'].includes(run.status);
 }
 
 function isActiveGeneration(job?: KitGenerationJob | null): boolean {
@@ -249,6 +258,15 @@ const FieldLabel: React.FC<{ children: React.ReactNode }> = ({ children }) => (
 );
 
 export const WorkspaceKitsPanel: React.FC<Props> = ({ sessionId, open, onClose }) => {
+  const [scope, setScope] = useState(() => kitUpdateScope(sessionId));
+  const liveScope = useRef(scope);
+  liveScope.current = kitUpdateScope(sessionId);
+  useEffect(() => {
+    const refresh = () => setScope(kitUpdateScope(sessionId));
+    refresh();
+    const offUser = onCurrentUserChanged(refresh), offExecutor = onExecStatus(refresh);
+    return () => { liveScope.current = ''; offUser(); offExecutor(); };
+  }, [sessionId]);
   const [state, setState] = useState<WorkspaceKitState>({ ...EMPTY_STATE, sessionId });
   const [selectedId, setSelectedId] = useState('');
   const [detailOpen, setDetailOpen] = useState(false);
@@ -260,6 +278,7 @@ export const WorkspaceKitsPanel: React.FC<Props> = ({ sessionId, open, onClose }
   const [busy, setBusy] = useState(false);
   const [cancellingRunIds, setCancellingRunIds] = useState<Set<string>>(() => new Set());
   const [capabilityResponding, setCapabilityResponding] = useState('');
+  const approvalRequests = useRef(new Map<string, string>());
   const [notice, setNotice] = useState<{ kind: 'error' | 'ok'; text: string } | null>(null);
   const [generationJob, setGenerationJob] = useState<KitGenerationJob | null>(null);
   const [dismissedGenerationJobId, setDismissedGenerationJobId] = useState(
@@ -316,7 +335,7 @@ export const WorkspaceKitsPanel: React.FC<Props> = ({ sessionId, open, onClose }
       setSelectedId((current) => current || next.kits[0]?.id || '');
     });
     return () => { cancelled = true; off(); };
-  }, [open, sessionId]);
+  }, [open, sessionId, scope]);
 
   useEffect(() => {
     let cancelled = false;
@@ -346,11 +365,12 @@ export const WorkspaceKitsPanel: React.FC<Props> = ({ sessionId, open, onClose }
     setInputs({});
     setCancellingRunIds(new Set());
     setCapabilityResponding('');
+    approvalRequests.current.clear();
     setGenerationJob(null);
     setDismissedGenerationJobId(readDismissedGeneration(sessionId));
     setGenerationEditorJobId('');
     setNotice(null);
-  }, [sessionId]);
+  }, [sessionId, scope]);
 
   useEffect(() => {
     if (!open || (!state.runs.some(isActiveRun) && !isActiveGeneration(generationJob))) return;
@@ -540,6 +560,11 @@ export const WorkspaceKitsPanel: React.FC<Props> = ({ sessionId, open, onClose }
 
   const cancelRun = async (runId: string) => {
     if (cancellingRunIds.has(runId)) return;
+    if (updateHandedOff(state.runs.find(run => run.id === runId))) {
+      try { await api.kitUpdateReconcile(sessionId, runId); }
+      catch (error) { setNotice({ kind: 'error', text: String(error) }); }
+      return;
+    }
     setCancellingRunIds((current) => new Set(current).add(runId));
     setNotice(null);
     // 两端并行清理：当前窗口若正代执行 client command，立即终止本地进程；
@@ -575,14 +600,25 @@ export const WorkspaceKitsPanel: React.FC<Props> = ({ sessionId, open, onClose }
 
   const respondCapability = async (runId: string, stepId: string, approved: boolean) => {
     const key = `${runId}:${stepId}`;
+    const step = state.runs.find(run => run.id === runId)?.steps.find(item => item.id === stepId);
+    const localUpdate = step?.config.capability === 'node.update_local_published';
+    const fingerprint = String(step?.config.capabilityRuntime?.planFingerprint || '');
+    const requestScope = `${scope}:${runId}:${stepId}:${fingerprint}`;
+    const submittedScope = kitUpdateScope(sessionId);
+    if (submittedScope !== scope) return;
+    const current = () => liveScope.current === submittedScope && kitUpdateScope(sessionId) === submittedScope;
     if (capabilityResponding) return;
     if (approved && !window.confirm(
-      '确认按当前冻结计划正式发布？确认后会上传制品并切换 channel manifest。',
+      localUpdate ? '确认安装本次发布并退出、重启 Session 执行设备？交接后无法保证撤回。'
+        : '确认按当前冻结计划正式发布？确认后会上传制品并切换 channel manifest。',
     )) return;
     setCapabilityResponding(key);
     setNotice(null);
     try {
-      const result = await api.kitCapabilityRespond(sessionId, runId, stepId, approved);
+      if (!approvalRequests.current.has(requestScope)) approvalRequests.current.set(requestScope, crypto.randomUUID());
+      const result = await api.kitCapabilityRespond(sessionId, runId, stepId, approved,
+        localUpdate ? fingerprint : '', localUpdate ? approvalRequests.current.get(requestScope)! : '');
+      if (!current()) return;
       if (result.status !== 'ok') {
         setNotice({ kind: 'error', text: result.message || '能力确认失败' });
         return;
@@ -590,20 +626,24 @@ export const WorkspaceKitsPanel: React.FC<Props> = ({ sessionId, open, onClose }
       if (result.run) {
         setState((current) => ({
           ...current,
-          runs: current.runs.map((item) => item.id === runId ? result.run! : item),
+          runs: current.runs.map((item) => item.id === runId && (!localUpdate ||
+            item.steps.find(s => s.id === stepId)?.config.capabilityRuntime?.planFingerprint === fingerprint)
+            ? result.run! : item),
         }));
       }
       setNotice({
         kind: 'ok',
-        text: approved ? '已确认，发布中心正在执行冻结计划' : '已拒绝，没有开始正式发布',
+        text: localUpdate ? (approved ? '安装交接已提交，等待真实启动验收' : '已取消本次安装，已发布结果保留')
+          : approved ? '已确认，发布中心正在执行冻结计划' : '已拒绝，没有开始正式发布',
       });
     } catch (error) {
+      if (!current()) return;
       setNotice({
         kind: 'error',
         text: `能力确认失败：${error instanceof Error ? error.message : String(error)}`,
       });
     } finally {
-      setCapabilityResponding('');
+      if (current()) setCapabilityResponding('');
     }
   };
 
@@ -817,7 +857,7 @@ export const WorkspaceKitsPanel: React.FC<Props> = ({ sessionId, open, onClose }
                           {running && run ? (
                             <button style={dangerButton} disabled={cancellingRunIds.has(run.id)}
                               onClick={() => void cancelRun(run.id)}>
-                              {cancellingRunIds.has(run.id) ? '停止中…' : '■ 停止'}
+                              {updateHandedOff(run) ? '核对结果' : cancellingRunIds.has(run.id) ? '停止中…' : '■ 停止'}
                             </button>
                           ) : (
                             <button style={primaryButton} disabled={busy || !kit.enabled}
@@ -1615,11 +1655,14 @@ const EditorGroup: React.FC<{
 );
 
 const CapabilityRunCard: React.FC<{
+  sessionId: string;
   run: KitRun;
   step: KitStepRun;
   responding: boolean;
   onRespond: (approved: boolean) => void;
-}> = ({ run, step, responding, onRespond }) => {
+}> = ({ sessionId, run, step, responding, onRespond }) => {
+  if (step.config.capability === 'node.update_local_published') return <KitLocalUpdateCard
+    key={`${sessionId}:${run.id}:${step.id}`} sessionId={sessionId} run={run} step={step} responding={responding} onRespond={onRespond} />;
   const runtime = (step.config?.capabilityRuntime || {}) as KitCapabilityRuntime;
   const plan = runtime.plan || {};
   const candidate = plan.candidate || {};
@@ -1849,7 +1892,8 @@ const KitDetail: React.FC<{
           })}
           {run?.steps.filter((step) => step.type === 'awu_capability').map((step) => (
             <CapabilityRunCard
-              key={`capability-${step.id}`}
+              key={`capability-${kitUpdateScope(sessionId)}-${run.id}-${step.id}`}
+              sessionId={sessionId}
               run={run}
               step={step}
               responding={capabilityResponding === `${run.id}:${step.id}`}
@@ -1916,7 +1960,7 @@ const KitDetail: React.FC<{
           </div>
           {running ? (
             <button style={dangerButton} disabled={cancelling} onClick={() => onCancel(run!.id)}>
-              {cancelling ? '停止中…' : '■ 停止'}
+              {updateHandedOff(run) ? '核对结果' : cancelling ? '停止中…' : '■ 停止'}
             </button>
           ) : (
             <button style={primaryButton} disabled={busy || !kit.enabled} onClick={onRun}>▶ 执行并验收</button>

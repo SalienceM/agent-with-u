@@ -4,5 +4,5 @@
   "description": "Detached file preview and editor using the original workspace connection",
   "platforms": ["macOS", "windows", "linux"],
   "windows": ["file-preview-*"],
-  "permissions": ["core:default", "core:window:allow-close", "core:window:allow-set-always-on-top", "core:webview:allow-set-webview-zoom", "dialog:allow-save"]
+  "permissions": ["core:default", "core:window:allow-close", "core:window:allow-destroy", "core:window:allow-is-maximized", "core:window:allow-toggle-maximize", "core:window:allow-set-always-on-top", "core:webview:allow-set-webview-zoom", "dialog:allow-save"]
 }

@@ -273,6 +273,7 @@ def _read_version_file(project_root: Path) -> tuple[dict[str, Any], Optional[Pat
         "packageVersion": package,
         "buildId": build_id,
         "sequence": sequence,
+        "kitUpdateProtocol": values.get("__kit_update_protocol__", 0),
         "commit": str(values.get("__commit__") or "").strip(),
     }, version_path if version_path.is_file() else None
 
@@ -761,6 +762,7 @@ class ReleaseCenterManager:
             "packageVersion": str(version.get("packageVersion") or version.get("version") or "0.0.0-dev"),
             "buildId": build_id,
             "sequence": sequence,
+            "kitUpdateProtocol": version.get("kitUpdateProtocol", 0),
             "commit": commit,
             "branch": str(git.get("branch") or ""),
             "dirty": bool(git.get("dirty")),
@@ -834,6 +836,54 @@ class ReleaseCenterManager:
             raise ReleaseCenterError("登记请求中没有有效文件")
         candidate = self._candidate_from_artifacts(root, artifacts, version, _git_info(root), source)
         return {"status": "ok", "candidate": self._upsert_candidate(candidate)}
+
+    def verify_build_snapshot(self, receipt: dict[str, Any], project_root: Path) -> dict[str, Any]:
+        """仅消费运行器捕获的构建快照；不重新扫描或选择 latest。"""
+        snapshot = receipt.get("candidate") or {}
+        if receipt.get("schemaVersion") != 1 or not snapshot.get("artifacts"):
+            raise ReleaseCenterError("本次构建回执缺失或无制品")
+        candidate = self._candidate(str(snapshot.get("id") or ""))
+        if (Path(str(snapshot.get("projectRoot") or "")).resolve() != project_root.resolve()
+                or Path(str(candidate.get("projectRoot") or "")).resolve() != project_root.resolve()
+                or any(candidate.get(key) != snapshot.get(key) for key in (
+                    "buildId", "version", "sequence", "packageVersion", "kitUpdateProtocol"))):
+            raise ReleaseCenterError("构建快照与候选身份不一致")
+        inventory = {item["id"]: item for item in candidate.get("artifacts", [])}
+        for item in snapshot["artifacts"]:
+            current = inventory.get(item.get("id")) or {}
+            if any(current.get(key) != item.get(key) for key in (
+                    "path", "size", "sha256", "platform", "arch", "target", "kind", "install")):
+                raise ReleaseCenterError("构建候选在登记后已改变")
+            path = Path(item["path"])
+            if (not path.resolve().is_relative_to(project_root.resolve()) or not path.is_file()
+                    or path.stat().st_size != item["size"] or sha256_file(path) != item["sha256"]):
+                raise ReleaseCenterError("构建制品在登记后已改变")
+        return json.loads(json.dumps(snapshot))
+
+    def published_result(self, job_id: str, plan_id: str, fingerprint: str,
+                         run_id: str, step_id: str) -> dict[str, Any]:
+        """从真实成功账本生成后续消费凭据，而不是接受调用者提供成功标志。"""
+        with self._guard():
+            job = next((item for item in self._load_state()["jobs"] if item.get("id") == job_id), None)
+        plan = self._plan(plan_id)
+        if (not job or job.get("status") != "succeeded" or job.get("planId") != plan_id
+                or plan.get("fingerprint") != fingerprint or not fingerprint
+                or not run_id or not step_id
+                or plan.get("kitBinding") != {"runId": run_id, "stepId": step_id}
+                or job.get("kitBinding") != plan.get("kitBinding")):
+            raise ReleaseCenterError("发布尚未成功或冻结计划不匹配")
+        manifest = plan.get("manifest") or {}
+        if not plan.get("versionedManifestKey") or not plan.get("baseUrl"):
+            raise ReleaseCenterError("发布没有不可变版本清单地址")
+        return {
+            "schemaVersion": 1, "jobId": job_id, "planId": plan_id,
+            "runId": run_id, "stepId": step_id,
+            "planFingerprint": fingerprint, "channel": plan["channel"],
+            "manifestUrl": public_url(plan["baseUrl"], plan["versionedManifestKey"]),
+            "manifestSha256": hashlib.sha256(canonical_payload(manifest)).hexdigest(),
+            "release": dict(manifest.get("release") or {}),
+            "artifacts": json.loads(json.dumps(manifest.get("artifacts") or [])),
+        }
 
     def update_artifact(self, candidate_id: str, artifact_id: str, patch: dict[str, Any]) -> dict[str, Any]:
         allowed = {"platform", "arch", "target", "kind", "install", "key"}
@@ -953,6 +1003,7 @@ class ReleaseCenterManager:
 
     async def preview(
         self, candidate_id: str, artifact_ids: list[str], options: dict[str, Any],
+        *, kit_binding: Optional[dict[str, str]] = None,
     ) -> dict[str, Any]:
         candidate = self._candidate(candidate_id)
         config = {**self._config(), **{key: value for key, value in (options or {}).items() if key in {
@@ -1088,6 +1139,7 @@ class ReleaseCenterManager:
                 "packageVersion": str(candidate.get("packageVersion") or candidate.get("version") or "0.0.0-dev"),
                 "buildId": str(candidate.get("buildId") or candidate_id),
                 "sequence": int(candidate.get("sequence") or 0),
+                "kitUpdateProtocol": candidate.get("kitUpdateProtocol", 0),
                 "commit": str(candidate.get("commit") or ""),
                 "publishedAt": datetime.now(timezone.utc).isoformat(),
                 "notes": str((options or {}).get("notes") or "")[:40_000],
@@ -1121,6 +1173,10 @@ class ReleaseCenterManager:
             "retentionCount": retention_count,
             "createdAt": _now(),
         }
+        if kit_binding is not None:
+            if set(kit_binding) != {"runId", "stepId"} or not all(kit_binding.values()):
+                raise ReleaseCenterError("Kit 发布归属无效")
+            plan["kitBinding"] = dict(kit_binding)
         fingerprint_source = dict(plan)
         fingerprint_source.pop("id", None)
         plan["fingerprint"] = hashlib.sha256(canonical_payload(fingerprint_source)).hexdigest()
@@ -1167,6 +1223,7 @@ class ReleaseCenterManager:
             job = {
                 "id": job_id,
                 "planId": plan_id,
+                "kitBinding": plan.get("kitBinding"),
                 "candidateId": plan.get("candidateId"),
                 "buildId": (plan.get("candidate") or {}).get("buildId"),
                 "channel": plan.get("channel"),

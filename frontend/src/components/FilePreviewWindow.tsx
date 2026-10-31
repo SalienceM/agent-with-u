@@ -5,6 +5,8 @@ import { StructuredFilePreview } from './StructuredFilePreview';
 import { isDesktopWindow } from '../utils/detachedWindow';
 import { DetachedTextDocument } from './DetachedTextDocument';
 import type { DocumentClient } from '../utils/documentStore';
+import { FilePreviewToolbar, previewToolbarButtonStyle as buttonStyle } from './FilePreviewToolbar';
+import { WorkbenchPopover } from './WorkbenchChrome';
 
 const PdfPreview = lazy(() => import('./PdfPreview'));
 const DocxPreview = lazy(() => import('./DocxPreview'));
@@ -17,6 +19,10 @@ export const FilePreviewWindow: React.FC = () => {
   const [error, setError] = useState('');
   const [connected, setConnected] = useState(false);
   const [pinned, setPinned] = useState(false);
+  const [maximized, setMaximized] = useState(false);
+  const [closeReady, setCloseReady] = useState(!isDesktopWindow());
+  const [textToolbar, setTextToolbar] = useState<HTMLDivElement | null>(null);
+  const [textState, setTextState] = useState({ dirty: false, editing: false });
   const [fullDocument, setFullDocument] = useState(false);
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState('');
@@ -77,17 +83,31 @@ export const FilePreviewWindow: React.FC = () => {
   };
   useEffect(() => {
     if (!isDesktopWindow()) return;
-    let active = true, unlisten: (() => void) | undefined;
+    let active = true, closing = false;
+    const listeners: (() => void)[] = [];
+    const keep = (off: () => void) => { if (active) listeners.push(off); else off(); };
     void import('@tauri-apps/api/window').then(async ({ getCurrentWindow }) => {
-      const off = await getCurrentWindow().onCloseRequested(event => { if (!canNavigate()) event.preventDefault(); });
-      if (active) unlisten = off; else off();
+      const current = getCurrentWindow();
+      keep(await current.onCloseRequested(async event => {
+        // 标题栏 X 与页面关闭共用守卫。显式接管销毁以便权限/原生错误能显示，
+        // 而不是让 SDK 的隐式 destroy 失败后留下一个没有反馈的窗口。
+        event.preventDefault();
+        if (!active || closing || !canNavigate()) return;
+        closing = true;
+        try { await current.destroy(); }
+        catch (reason) { if (active) setError(`关闭窗口失败：${String(reason)}`); }
+        finally { closing = false; }
+      }));
+      if (active) setCloseReady(true);
+      const updateMaximized = async () => { const value = await current.isMaximized(); if (active) setMaximized(value); };
+      keep(await current.onResized(() => { void updateMaximized().catch(reason => { if (active) setError(String(reason)); }); }));
+      await updateMaximized();
     }).catch(reason => setError(String(reason)));
-    return () => { active = false; unlisten?.(); };
+    return () => { active = false; listeners.forEach(off => off()); };
   }, []);
   const close = () => {
-    if (!canNavigate()) return;
     if (isDesktopWindow()) void import('@tauri-apps/api/window').then(({ getCurrentWindow }) => getCurrentWindow().close()).catch(reason => setError(String(reason)));
-    else window.close();
+    else if (canNavigate()) window.close();
   };
   const preview = snapshot?.preview;
   const reveal = () => { if (preview) void request('reveal', { rel: preview.rel }).then(() => setNotice('已在原文件窗口定位。')).catch(reason => setError(String(reason))); };
@@ -96,31 +116,48 @@ export const FilePreviewWindow: React.FC = () => {
       readFile={readFile} onReveal={reveal} onNavigate={(rel, fragment) => void navigate(rel, fragment)} />
     : preview.isMarkdown ? <MarkdownPreview source={text} title={preview.name} initialDark={snapshot.dark} />
       : <pre style={{ margin: 0, padding: 16, whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' }}>{text}</pre>);
-  return <div className="app-root" style={{ ...snapshot?.theme, height: '100dvh', display: 'flex', flexDirection: 'column',
-    background: 'var(--theme-bg, #151c27)', color: 'var(--theme-text, #e2e8f0)', fontFamily: 'system-ui', overflow: 'hidden' } as React.CSSProperties}>
-    <header style={{ display: 'flex', flexWrap: 'wrap', gap: 8, alignItems: 'center', padding: '8px 12px', borderBottom: '1px solid var(--theme-border)', flexShrink: 0 }}>
-      <span style={{ flex: 1, minWidth: 0, overflowWrap: 'anywhere', fontSize: 13 }}>{preview?.name || '文件预览'}</span>
+  return <div className="app-root" data-preview-connected={connected} style={{ ...snapshot?.theme, height: '100dvh', display: 'flex', flexDirection: 'column',
+    background: 'var(--theme-bg-secondary, #161b22)', color: 'var(--theme-text, #c9d1d9)', fontFamily: 'system-ui', overflow: 'hidden' } as React.CSSProperties}>
+    <FilePreviewToolbar name={preview?.name || '文件预览'} relativePath={preview?.rel || ''} source={preview?.source || 'remote'}
+      nodeLabel={snapshot?.nodeLabel} dirty={textState.dirty}
+      icon={preview?.isImage ? '🖼️' : preview?.renderer === 'pdf' ? '📕' : preview?.renderer === 'docx' ? '📘' : preview?.renderer === 'drawio' ? '🧩' : preview?.structured ? '📊' : textState.editing ? '✏️' : '📄'}
+      trailing={<>
+        {isDesktopWindow() && <button style={buttonStyle} title={maximized ? '退出最大化' : '最大化预览'} onClick={() => {
+          void import('@tauri-apps/api/window').then(async ({ getCurrentWindow }) => {
+            const current = getCurrentWindow(); await current.toggleMaximize(); setMaximized(await current.isMaximized());
+          }).catch(reason => setError(String(reason)));
+        }}>{maximized ? '🗗 还原' : '⛶ 最大化'}</button>}
+        <button style={buttonStyle} disabled={!closeReady} onClick={close} title="关闭预览" aria-label="关闭预览">✕</button>
+      </>}>
       {preview && fullDocument && <>
-        <button style={buttonStyle} onClick={reveal}>定位</button>
-        <button style={buttonStyle} disabled={busy} onClick={() => void navigate(preview.rel, preview.htmlFragment)}>重新加载</button>
-        {['md', 'markdown', 'mdx', 'txt', 'png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp'].includes(preview.name.split('.').pop()?.toLowerCase() || '') && preview.source !== 'local'
-          && <button style={buttonStyle} onClick={() => void request('review', { rel: preview.rel }).then(() => setNotice('已在原文件窗口打开审阅工作台。')).catch(reason => setError(String(reason)))}>审阅</button>}
+        <button style={buttonStyle} onClick={reveal} title="在原文件窗口定位">📂 定位</button>
+        {!textState.editing && ['md', 'markdown', 'mdx', 'txt', 'png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp'].includes(preview.name.split('.').pop()?.toLowerCase() || '') && preview.source !== 'local'
+          && <button style={{ ...buttonStyle, borderColor: 'color-mix(in srgb, var(--theme-accent) 45%, var(--theme-border))', color: 'var(--theme-accent)' }}
+            onClick={() => void request('review', { rel: preview.rel }).then(() => setNotice('已在原文件窗口打开审阅工作台。')).catch(reason => setError(String(reason)))}>✦ 审阅</button>}
       </>}
-      {isDesktopWindow() && <button style={buttonStyle} onClick={() => void import('@tauri-apps/api/window').then(async ({ getCurrentWindow }) => {
-        await getCurrentWindow().setAlwaysOnTop(!pinned); setPinned(!pinned);
-      }).catch(reason => setError(String(reason)))}>{pinned ? '取消置顶' : '置顶'}</button>}
-      <button style={buttonStyle} onClick={close}>关闭窗口</button>
-    </header>
+      <div ref={setTextToolbar} style={{ display: 'flex', gap: 8, alignItems: 'center', flexShrink: 0 }} />
+      <WorkbenchPopover label="预览窗口操作" triggerStyle={buttonStyle}>
+        {dismiss => <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+          {snapshot && preview && <div style={{ fontSize: 11, overflowWrap: 'anywhere', color: 'var(--theme-text-muted)' }}>
+            {snapshot.nodeLabel} · {snapshot.root}/{preview.rel} · {fullDocument ? '原文件预览 / 编辑' : '只读预览'}
+          </div>}
+          {preview && fullDocument && <button style={buttonStyle} disabled={busy} onClick={() => { dismiss(); void navigate(preview.rel, preview.htmlFragment); }}>↻ 重新加载</button>}
+          {isDesktopWindow() && <button style={buttonStyle} onClick={() => void import('@tauri-apps/api/window').then(async ({ getCurrentWindow }) => {
+            await getCurrentWindow().setAlwaysOnTop(!pinned); setPinned(!pinned); dismiss();
+          }).catch(reason => setError(String(reason)))}>{pinned ? '取消置顶' : '置顶'}</button>}
+        </div>}
+      </WorkbenchPopover>
+    </FilePreviewToolbar>
     {error && <div role="alert" style={{ padding: 12, color: '#f87171' }}>{error}</div>}
     {notice && <div role="status" style={{ padding: '6px 12px', fontSize: 12 }}>{notice}</div>}
     {!snapshot && !error && <p role="status" style={{ padding: 16 }}>正在连接原文件窗口…</p>}
     {snapshot && preview && <>
-      <div style={{ padding: '6px 12px', fontSize: 11, color: 'var(--theme-text-muted)', overflowWrap: 'anywhere' }}>{snapshot.nodeLabel} · {preview.rel} · {fullDocument ? '原文件预览 / 编辑' : '只读预览'}</div>
       <div style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column', overflow: 'auto' }}>
         <Suspense fallback={<div role="status" style={{ padding: 16 }}>加载预览…</div>}>
           {fullDocument && !preview.isImage && !preview.renderer && !preview.structured
             ? <DetachedTextDocument key={`${preview.rel}:${preview.source}:${navigationRevision}`} preview={preview} dark={snapshot.dark} client={documentClient}
               initialView={snapshot.initialView}
+              toolbarHost={textToolbar} onDocumentState={setTextState}
               renderPreview={renderText} onSaved={() => setNotice('已保存；重新加载可核对磁盘内容。')} />
             : preview.isImage ? <img src={preview.dataUrl} alt={preview.name} style={{ maxWidth: '100%', maxHeight: '100%', objectFit: 'contain' }} />
             : preview.renderer === 'pdf' && preview.bytes ? <PdfPreview data={preview.bytes} />
@@ -137,5 +174,3 @@ export const FilePreviewWindow: React.FC = () => {
     </>}
   </div>;
 };
-const buttonStyle: React.CSSProperties = { padding: '5px 9px', color: 'inherit', background: 'var(--theme-bg-secondary)',
-  border: '1px solid var(--theme-border)', borderRadius: 5, cursor: 'pointer', whiteSpace: 'nowrap' };

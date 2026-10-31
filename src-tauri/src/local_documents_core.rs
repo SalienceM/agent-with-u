@@ -6,6 +6,7 @@ use std::sync::Mutex;
 
 const MAX_BYTES: usize = 8 * 1024 * 1024;
 const PREVIEW_BYTES: usize = 256 * 1024;
+const REVIEW_BYTES: usize = 2 * 1024 * 1024;
 // 所属 worker 持有锁直到实际结束；WebView/RPC 取消不释放提交中的保护。
 static DOCUMENT_IO: Mutex<()> = Mutex::new(());
 
@@ -69,6 +70,70 @@ pub fn replace(
     }
     let _guard = DOCUMENT_IO.lock().map_err(|_| "document_lock_failed")?;
     platform::replace(dir, binding_id, rel, baseline, &bytes)
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReviewRead {
+    kind: String,
+    document: Option<ByteDocument>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReviewReceipt {
+    status: String,
+    request_id: String,
+    scope_key: String,
+    relative_path: String,
+    source_hash: String,
+    version: Option<Version>,
+    reason_code: String,
+}
+struct ReviewJob { key: String, digest: String, receipt: ReviewReceipt }
+static REVIEW_JOBS: std::sync::OnceLock<Mutex<Vec<ReviewJob>>> = std::sync::OnceLock::new();
+fn review_jobs() -> &'static Mutex<Vec<ReviewJob>> { REVIEW_JOBS.get_or_init(|| Mutex::new(Vec::new())) }
+
+pub fn review_read(dir: &str, binding: &str, rel: &str) -> Result<ReviewRead, String> {
+    let _guard = DOCUMENT_IO.lock().map_err(|_| "document_lock_failed")?;
+    platform::review_read(dir, binding, rel)
+}
+pub fn review_get(binding: &str, scope: &str, request: &str) -> Result<ReviewReceipt, String> {
+    let key = format!("{}:{}:{}:{}:{}", binding.len(), binding, scope.len(), scope, request);
+    let jobs = review_jobs().lock().map_err(|_| "journal_unavailable")?;
+    jobs.iter().find(|j| j.key == key).map(|j| j.receipt.clone()).ok_or("receipt_unavailable".into())
+}
+pub fn review_apply(dir: &str, binding: &str, rel: &str, baseline: Option<&Version>,
+    data: &str, scope: &str, request: &str) -> Result<ReviewReceipt, String> {
+    if request.is_empty() || request.len() > 128 || !request.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-')
+        || scope.is_empty() || scope.len() > 16384 || data.len() > (REVIEW_BYTES + 2) / 3 * 4 { return Err("invalid_request".into()); }
+    let bytes = BASE64.decode(data).map_err(|_| "invalid_request")?;
+    if bytes.len() > REVIEW_BYTES { return Err("too_large".into()); }
+    let key = format!("{}:{}:{}:{}:{}", binding.len(), binding, scope.len(), scope, request);
+    let digest = hash(format!("{:?}|{:?}|{:?}|{:?}|{}", dir, binding, rel, baseline, hash(&bytes)).as_bytes());
+    {
+        let mut jobs = review_jobs().lock().map_err(|_| "journal_unavailable")?;
+        if let Some(job) = jobs.iter().find(|j| j.key == key) {
+            return if job.digest == digest { Ok(job.receipt.clone()) } else { Err("request_conflict".into()) };
+        }
+        if jobs.iter().filter(|j| j.receipt.status == "accepted" || j.receipt.status == "unresolved").count() >= 32 { return Err("review_limit".into()); }
+        jobs.push(ReviewJob { key: key.clone(), digest, receipt: ReviewReceipt { status: "accepted".into(), request_id: request.into(), scope_key: scope.into(),
+            relative_path: rel.into(), source_hash: hash(&bytes), version: None, reason_code: String::new() } });
+    }
+    let result = (|| {
+        let _guard = DOCUMENT_IO.lock().map_err(|_| "document_lock_failed".to_string())?;
+        platform::review_replace(dir, binding, rel, baseline, &bytes)
+    })();
+    let mut jobs = review_jobs().lock().map_err(|_| "journal_unavailable")?;
+    let job = jobs.iter_mut().find(|j| j.key == key).ok_or("receipt_unavailable")?;
+    match result {
+        Ok(document) => { job.receipt.status = "succeeded".into(); job.receipt.version = document.version; },
+        Err(reason) => { job.receipt.status = if reason == "save_result_unverified" { "unresolved" } else { "failed" }.into(); job.receipt.reason_code = reason; }
+    }
+    let receipt = job.receipt.clone();
+    let mut terminal = jobs.iter().filter(|j| j.receipt.status == "succeeded" || j.receipt.status == "failed").count();
+    jobs.retain(|j| { if terminal > 256 && (j.receipt.status == "succeeded" || j.receipt.status == "failed") { terminal -= 1; false } else { true } });
+    Ok(receipt)
 }
 
 #[cfg(windows)]
@@ -254,14 +319,15 @@ mod platform {
             changed_ns: basic.ChangeTime.to_string(),
         })
     }
-    fn snapshot(path: &Path) -> Result<ByteDocument, String> {
+    fn snapshot(path: &Path) -> Result<ByteDocument, String> { snapshot_limit(path, MAX_BYTES) }
+    fn snapshot_limit(path: &Path, limit: usize) -> Result<ByteDocument, String> {
         let mut file = open(path, false)?;
         if !same_path(&final_path(&file)?, path) {
             return Err("path_unverifiable".into());
         }
         let first = info(&file)?;
         let size = ((first.nFileSizeHigh as u64) << 32) | first.nFileSizeLow as u64;
-        let complete = size <= MAX_BYTES as u64;
+        let complete = size <= limit as u64;
         let before = version(&file, &[])?;
         let mut bytes = Vec::new();
         (&mut file)
@@ -295,6 +361,70 @@ mod platform {
         let (path, _parents) = target(dir, binding, rel)?;
         snapshot(&path)
     }
+    fn review_target(dir: &str, binding: &str, rel: &str, create: bool) -> Result<Option<(PathBuf, Vec<File>)>, String> {
+        let (root, handle) = root(dir)?;
+        if root.binding_id != binding { return Err("stale_workspace".into()); }
+        let segments = parts(rel)?;
+        let mut path = PathBuf::from(root.canonical_root);
+        let mut parents = vec![handle];
+        for part in &segments[..segments.len() - 1] {
+            path.push(part);
+            match std::fs::symlink_metadata(&path) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    if !create { return Ok(None); }
+                    match std::fs::create_dir(&path) {
+                        Ok(()) => (), Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => (),
+                        Err(_) => return Err("write_not_started".into()),
+                    }
+                },
+                Err(_) => return Err("document_unavailable".into()),
+                Ok(_) => (),
+            }
+            let directory = open(&path, true)?;
+            if !same_path(&final_path(&directory)?, &path) { return Err("path_unverifiable".into()); }
+            parents.push(directory);
+        }
+        path.push(segments.last().unwrap());
+        Ok(Some((path, parents)))
+    }
+    pub(super) fn review_read(dir: &str, binding: &str, rel: &str) -> Result<ReviewRead, String> {
+        let Some((path, _parents)) = review_target(dir, binding, rel, false)? else {
+            return Ok(ReviewRead { kind: "missing".into(), document: None });
+        };
+        match std::fs::symlink_metadata(&path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(ReviewRead { kind: "missing".into(), document: None }),
+            Err(_) => Err("document_unavailable".into()),
+            Ok(meta) if meta.is_dir() => { open(&path, true)?; Ok(ReviewRead { kind: "directory".into(), document: None }) },
+            Ok(_) => Ok(ReviewRead { kind: "file".into(), document: Some(snapshot_limit(&path, REVIEW_BYTES)?) }),
+        }
+    }
+    pub(super) fn review_replace(dir: &str, binding: &str, rel: &str, baseline: Option<&Version>, bytes: &[u8]) -> Result<ByteDocument, String> {
+        let observed = review_read(dir, binding, rel)?;
+        if let Some(version) = baseline {
+            if observed.document.as_ref().and_then(|d| d.version.as_ref()) != Some(version) { return Err("disk_conflict".into()); }
+            return replace_limited(dir, binding, rel, version, bytes, REVIEW_BYTES, || Ok(()));
+        }
+        if observed.kind != "missing" { return Err("disk_conflict".into()); }
+        let (path, _parents) = review_target(dir, binding, rel, true)?.ok_or("write_not_started")?;
+        let temporary = path.with_file_name(format!(".awu-review-{}.tmp", uuid::Uuid::new_v4()));
+        let mut created = false;
+        let mut published = false;
+        let result = (|| {
+            let mut file = OpenOptions::new().write(true).create_new(true).share_mode(FILE_SHARE_READ).open(&temporary).map_err(|_| "write_not_started")?;
+            created = true;
+            if !same_path(&final_path(&file)?, &temporary) { return Err("write_not_started".into()); }
+            file.write_all(bytes).and_then(|_| file.sync_all()).map_err(|_| "write_not_started")?;
+            drop(file);
+            std::fs::hard_link(&temporary, &path).map_err(|e| if e.kind() == std::io::ErrorKind::AlreadyExists { "disk_conflict" } else { "write_not_started" })?;
+            published = true;
+            std::fs::remove_file(&temporary).map_err(|_| "save_result_unverified")?;
+            let result = snapshot_limit(&path, REVIEW_BYTES)?;
+            if result.version.as_ref().map(|v| v.sha256.as_str()) != Some(hash(bytes).as_str()) { return Err("save_result_unverified".into()); }
+            Ok(result)
+        })();
+        if created { let _ = std::fs::remove_file(&temporary); }
+        result.map_err(|e| if published { "save_result_unverified".into() } else { e })
+    }
     pub(super) fn replace(
         dir: &str,
         binding: &str,
@@ -312,11 +442,15 @@ mod platform {
         bytes: &[u8],
         before_commit: impl FnOnce() -> Result<(), String>,
     ) -> Result<ByteDocument, String> {
-        if bytes.len() > MAX_BYTES {
+        replace_limited(dir, binding, rel, baseline, bytes, MAX_BYTES, before_commit)
+    }
+    fn replace_limited(dir: &str, binding: &str, rel: &str, baseline: &Version, bytes: &[u8], limit: usize,
+        before_commit: impl FnOnce() -> Result<(), String>) -> Result<ByteDocument, String> {
+        if bytes.len() > limit {
             return Err("write_not_started".into());
         }
         let (path, _parents) = target(dir, binding, rel).map_err(|_| "write_not_started")?;
-        let original = snapshot(&path).map_err(|_| "write_not_started")?;
+        let original = snapshot_limit(&path, limit).map_err(|_| "write_not_started")?;
         if original.version.as_ref() != Some(baseline) {
             return Err("disk_conflict".into());
         }
@@ -342,7 +476,7 @@ mod platform {
                 .map_err(|_| "write_not_started")?;
             drop(file);
             before_commit()?;
-            if snapshot(&path)?.version.as_ref() != Some(baseline) {
+            if snapshot_limit(&path, limit)?.version.as_ref() != Some(baseline) {
                 return Err("disk_conflict".into());
             }
             let destination = wide(&path);
@@ -362,7 +496,7 @@ mod platform {
             {
                 return Err("save_result_unverified".into());
             }
-            let result = snapshot(&path)?;
+            let result = snapshot_limit(&path, limit)?;
             if result.version.as_ref().map(|v| v.sha256.as_str()) != Some(hash(bytes).as_str()) {
                 return Err("save_result_unverified".into());
             }
@@ -384,6 +518,42 @@ mod platform {
     #[cfg(test)]
     mod tests {
         use super::*;
+        #[test]
+        fn review_real_bytes_create_versions_idempotence_and_bounds() {
+            let f = Fixture::new();
+            let root = super::super::bind(f.dir()).unwrap();
+            let binding = &root.binding_id;
+            let scope = uuid::Uuid::new_v4().to_string();
+            assert_eq!(super::super::review_read(f.dir(), binding, "new/empty").unwrap().kind, "missing");
+            let created = super::super::review_apply(f.dir(), binding, "new/empty", None, "", &scope, "create").unwrap();
+            assert_eq!(created.status, "succeeded");
+            assert_eq!(std::fs::read(f.0.join("new/empty")).unwrap(), b"");
+            assert_eq!(super::super::review_apply(f.dir(), binding, "new/empty", None, "", &scope, "create").unwrap().status, "succeeded");
+            assert_eq!(super::super::review_apply(f.dir(), binding, "new/empty", None, "eA==", &scope, "create").unwrap_err(), "request_conflict");
+            assert_eq!(super::super::review_apply(f.dir(), binding, "new/empty", None, "eA==", &scope, "race").unwrap().status, "failed");
+            let bytes = b"\xef\xbb\xbfa\r\nb\nc\r";
+            let saved = super::super::review_apply(f.dir(), binding, "new/empty", created.version.as_ref(), &BASE64.encode(bytes), &scope, "replace").unwrap();
+            assert_eq!(saved.status, "succeeded");
+            assert_eq!(std::fs::read(f.0.join("new/empty")).unwrap(), bytes);
+            assert_eq!(super::super::review_get(binding, &scope, "replace").unwrap().version, saved.version);
+            std::fs::write(f.0.join("large"), vec![b'a'; REVIEW_BYTES + 1]).unwrap();
+            let large = super::super::review_read(f.dir(), binding, "large").unwrap().document.unwrap();
+            assert!(!large.complete && large.version.is_none());
+            assert!(BASE64.decode(large.data).unwrap().len() <= PREVIEW_BYTES);
+            assert_eq!(super::super::review_read(f.dir(), binding, "new").unwrap().kind, "directory");
+            assert!(super::super::review_read(f.dir(), binding, "new/empty/blocked").is_err());
+            assert!(super::super::review_read(f.dir(), "wrong-binding", "new/empty").is_err());
+            assert!(super::super::review_get(binding, "new-instance", "replace").is_err());
+            let path = f.0.join("new/empty");
+            let base = saved.version.unwrap();
+            let pinned = OpenOptions::new().read(true).share_mode(FILE_SHARE_READ).open(&path).unwrap();
+            let unknown = super::super::review_apply(f.dir(), binding, "new/empty", Some(&base), "bmV4dA==", &scope, "unknown").unwrap();
+            assert_eq!(unknown.status, "unresolved");
+            assert_eq!(super::super::review_get(binding, &scope, "unknown").unwrap().status, "unresolved");
+            drop(pinned);
+            assert_eq!(super::super::review_apply(f.dir(), binding, "new/empty", Some(&base), "bmV4dA==", &scope, "unknown").unwrap().status, "unresolved");
+            assert_eq!(std::fs::read(path).unwrap(), bytes);
+        }
         struct Fixture(PathBuf);
         impl Fixture {
             fn new() -> Self {
@@ -540,6 +710,8 @@ mod platform;
 #[cfg(not(any(windows, target_os = "linux")))]
 mod platform {
     use super::*;
+    pub(super) fn review_read(_: &str, _: &str, _: &str) -> Result<ReviewRead, String> { Err("review_unsupported".into()) }
+    pub(super) fn review_replace(_: &str, _: &str, _: &str, _: Option<&Version>, _: &[u8]) -> Result<ByteDocument, String> { Err("review_unsupported".into()) }
     pub(super) fn bind(_: &str) -> Result<BoundRoot, String> {
         Err("safe_local_documents_unsupported".into())
     }

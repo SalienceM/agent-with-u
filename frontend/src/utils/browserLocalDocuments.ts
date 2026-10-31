@@ -9,9 +9,9 @@ interface GrantedHandle extends FileSystemFileHandle {
 }
 
 export class BrowserDocumentAdapter implements LocalDocumentAdapter {
-  private constructor(readonly bindingId: string, private root: FileSystemDirectoryHandle) {}
-  static async connect(root: FileSystemDirectoryHandle): Promise<BrowserDocumentAdapter> {
-    return new BrowserDocumentAdapter(await browserHandleBinding(root), root);
+  private constructor(readonly bindingId: string, private root: FileSystemDirectoryHandle, private limit = MAX_EDIT_BYTES) {}
+  static async connect(root: FileSystemDirectoryHandle, limit = MAX_EDIT_BYTES): Promise<BrowserDocumentAdapter> {
+    return new BrowserDocumentAdapter(await browserHandleBinding(root), root, limit);
   }
   lock<T>(_relative: string, operation: () => Promise<T>): Promise<T> { return withLocalDocumentLock(operation); }
   private async handle(relative: string): Promise<GrantedHandle> {
@@ -23,8 +23,8 @@ export class BrowserDocumentAdapter implements LocalDocumentAdapter {
   async resourceKey(relative: string): Promise<string> { return browserHandleBinding(await this.handle(relative)); }
   private async snapshot(handle: GrantedHandle): Promise<LocalByteDocument> {
     const file = await handle.getFile();
-    const complete = file.size <= MAX_EDIT_BYTES;
-    const bytes = new Uint8Array(await file.slice(0, complete ? file.size : PREVIEW_BYTES).arrayBuffer());
+    const complete = file.size <= this.limit;
+    const bytes = new Uint8Array(await file.slice(0, complete ? file.size : this.limit === MAX_EDIT_BYTES ? PREVIEW_BYTES : 0).arrayBuffer());
     const id = await browserHandleBinding(handle);
     return { bytes, complete, size: file.size,
       readonly: await handle.queryPermission({ mode: 'readwrite' }) !== 'granted',

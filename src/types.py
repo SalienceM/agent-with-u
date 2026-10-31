@@ -291,6 +291,7 @@ class Session:
     # 侧栏外观属于 Session 元数据，而非某个浏览器客户端的偏好。
     # sidebar_color 只保存受控预设 ID，前端负责映射成固定渐变，禁止任意 CSS。
     pinned: bool = False
+    favorite_revision: int = 0
     sidebar_color: str = ""
     # ★ 自动 AI commit + push：对话/Loop 结束时自动 stage-all → AI 生成 message → commit → push
     auto_commit: bool = False
@@ -340,6 +341,7 @@ class Session:
             "viewMode": normalize_session_view_mode(self.view_mode),
             "loopControlMode": self.loop_control_mode,
             "pinned": self.pinned,
+            "favoriteRevision": self.favorite_revision,
             "sidebarColor": self.sidebar_color,
             "skipPermissions": self.skip_permissions,
             "autoContinue": self.auto_continue,
@@ -373,6 +375,7 @@ class Session:
             "viewMode": normalize_session_view_mode(self.view_mode),
             "loopControlMode": self.loop_control_mode,
             "pinned": self.pinned,
+            "favoriteRevision": self.favorite_revision,
             "sidebarColor": self.sidebar_color,
             "autoCommit": self.auto_commit,
             "autoCommitPush": self.auto_commit_push,

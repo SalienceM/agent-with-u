@@ -2,6 +2,25 @@
 #[path = "local_documents_core.rs"]
 mod core;
 use core::{BoundRoot, ByteDocument, Version};
+use core::{ReviewRead, ReviewReceipt};
+
+#[tauri::command]
+pub async fn local_sync_review_read(window: tauri::Window, dir: String, binding_id: String, rel: String) -> Result<ReviewRead, String> {
+    allow_window(&window)?;
+    tauri::async_runtime::spawn_blocking(move || core::review_read(&dir, &binding_id, &rel)).await.map_err(|_| "document_worker_failed")?
+}
+#[tauri::command]
+pub async fn local_sync_review_apply(window: tauri::Window, dir: String, binding_id: String, rel: String,
+    baseline: Option<Version>, data: String, scope_key: String, request_id: String) -> Result<ReviewReceipt, String> {
+    allow_window(&window)?;
+    tauri::async_runtime::spawn_blocking(move || core::review_apply(&dir, &binding_id, &rel, baseline.as_ref(), &data, &scope_key, &request_id))
+        .await.map_err(|_| "save_result_unverified")?
+}
+#[tauri::command]
+pub async fn local_sync_review_get(window: tauri::Window, binding_id: String, scope_key: String, request_id: String) -> Result<ReviewReceipt, String> {
+    allow_window(&window)?;
+    core::review_get(&binding_id, &scope_key, &request_id)
+}
 
 fn allow_window(window: &tauri::Window) -> Result<(), String> {
     if !crate::session_windows::allows_documents(window.label()) {

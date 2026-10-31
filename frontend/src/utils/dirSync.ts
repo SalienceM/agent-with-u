@@ -21,7 +21,9 @@ import { isIgnored } from './dirSyncPolicy';
 import type { LocalDocumentAdapter } from './localDocuments';
 import { BrowserDocumentAdapter } from './browserLocalDocuments';
 import { TauriDocumentAdapter } from './tauriLocalDocuments';
-import { ManagedDocumentAdapter, type ManagedDocumentRecord } from './managedLocalDocuments';
+import { ManagedDocumentAdapter, ManagedReviewByteAdapter, type ManagedDocumentRecord } from './managedLocalDocuments';
+import { LocalSyncReview, TauriSyncReview, reviewBytes } from './localSyncReview';
+import type { ReviewAdapter } from './syncReviewProtocol';
 import { DocumentProtocolError, documentRelativePath } from './workspaceDocuments';
 export { isGitMetadataPath, isIgnored } from './dirSyncPolicy';
 
@@ -110,6 +112,7 @@ export interface LocalFs {
   id(): string;
   /** 独立于传输接口的有版本编辑路径；不允许回落 writeFile。 */
   documentAdapter?(): Promise<LocalDocumentAdapter>;
+  reviewAdapter?(scopeKey: string): Promise<ReviewAdapter>;
   scan(ignore: string[], includeGit?: boolean, options?: { hash?: boolean; signal?: AbortSignal }): Promise<Manifest>;
   /** 列出某相对目录的直接子项(懒加载逐层浏览用,不递归、不算哈希)。 */
   listDir(rel: string): Promise<LocalEntry[]>;
@@ -170,6 +173,10 @@ export class TauriLocalFs implements LocalFs {
     return `tauri:${this.dir}`;
   }
   documentAdapter(): Promise<LocalDocumentAdapter> { return TauriDocumentAdapter.connect(this.dir, tauriInvoke); }
+  async reviewAdapter(scopeKey: string): Promise<ReviewAdapter> {
+    const adapter = await TauriDocumentAdapter.connect(this.dir, tauriInvoke);
+    return new TauriSyncReview(adapter.bindingId, adapter.canonicalRoot, tauriInvoke, scopeKey);
+  }
   async scan(ignore: string[], includeGit = false, options: { hash?: boolean; signal?: AbortSignal } = {}): Promise<Manifest> {
     const r = await tauriInvoke<{ files: Manifest }>('dir_sync_scan', {
       dir: this.dir,
@@ -231,6 +238,17 @@ export class BrowserLocalFs implements LocalFs {
     return `browser:${this.handle?.name || ''}`;
   }
   documentAdapter(): Promise<LocalDocumentAdapter> { return BrowserDocumentAdapter.connect(this.handle); }
+  async reviewAdapter(scopeKey: string): Promise<ReviewAdapter> {
+    const adapter = await BrowserDocumentAdapter.connect(this.handle, 2 * 1024 * 1024);
+    return new LocalSyncReview(adapter, false, async path => {
+      try { return reviewBytes(await adapter.read(path)); }
+      catch (error) {
+        if (error instanceof DOMException && error.name === 'NotFoundError') return { kind: 'missing', version: { exists: false } };
+        if (error instanceof DOMException && error.name === 'TypeMismatchError') return { kind: 'directory', version: null, reasonCode: 'type_conflict' };
+        throw error;
+      }
+    }, scopeKey);
+  }
   async scan(ignore: string[], includeGit = false, options: { hash?: boolean; signal?: AbortSignal } = {}): Promise<Manifest> {
     const out: Manifest = {};
     await this._walk(this.handle, '', ignore, includeGit, out, options);
@@ -504,6 +522,56 @@ function managedKey(workspace: string, rel: string): string {
 export class ManagedBrowserLocalFs implements LocalFs {
   readonly kind = 'managed' as const;
   private activeWrites = new Map<string, string>();
+
+  async reviewAdapter(scopeKey: string): Promise<ReviewAdapter> {
+    const adapter = new ManagedReviewByteAdapter(this.id(), {
+      read: path => this.reviewTransaction(path),
+      replace: async (path, revision, value, current) => { await this.reviewTransaction(path, { revision, value, current }); },
+    });
+    return new LocalSyncReview(adapter, true, async path => {
+      try { return reviewBytes(await adapter.read(path)); }
+      catch (error) {
+        if (error instanceof DocumentProtocolError && error.reasonCode === 'file_not_found') return { kind: 'missing', version: { exists: false } };
+        if (error instanceof DocumentProtocolError && error.reasonCode === 'type_conflict') return { kind: 'directory', version: null, reasonCode: 'type_conflict' };
+        throw error;
+      }
+    }, scopeKey);
+  }
+  private async reviewTransaction(path: string, replacement?: { revision: string | null; value: ManagedDocumentRecord; current: () => void }): Promise<ManagedDocumentRecord | null> {
+    path = documentRelativePath(path);
+    const db = await idbOpen();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(IDB_FILE_STORE, 'readwrite'), store = tx.objectStore(IDB_FILE_STORE);
+      let result: ManagedDocumentRecord | null = null, failure: unknown;
+      const scan = store.index('workspace').openCursor(IDBKeyRange.only(this.workspace));
+      let record: ManagedFileRecord | undefined;
+      scan.onsuccess = () => {
+        try {
+          const cursor = scan.result;
+          if (cursor) {
+            const row = cursor.value as ManagedFileRecord;
+            if (row.rel === path) record = row;
+            else if (row.rel.startsWith(`${path}/`) || path.startsWith(`${row.rel}/`)) throw new DocumentProtocolError('type_conflict');
+            cursor.continue(); return;
+          }
+          if (replacement) {
+            if ((record?.documentRevision || null) !== replacement.revision || (!!record && !record.documentRevision)) throw new DocumentProtocolError('disk_conflict');
+            replacement.current();
+            const saved = { key: managedKey(this.workspace, path), workspace: this.workspace, rel: path,
+              ...replacement.value, size: replacement.value.data.size } satisfies ManagedFileRecord;
+            store.put(saved); result = saved;
+          } else if (record) {
+            const documentRevision = record.documentRevision || uuid();
+            if (!record.documentRevision) store.put({ ...record, documentRevision });
+            result = { ...record, documentRevision };
+          }
+        } catch (error) { failure = error; tx.abort(); }
+      };
+      tx.oncomplete = () => { db.close(); resolve(result); };
+      tx.onabort = () => { db.close(); reject(failure || new DocumentProtocolError('write_aborted')); };
+      tx.onerror = () => {};
+    });
+  }
 
   constructor(private workspace: string) {
     // 清掉异常退出遗留的一天前临时分块，避免长期占用平板存储。

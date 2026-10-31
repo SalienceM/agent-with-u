@@ -47,10 +47,7 @@ if errorlevel 1 (
     )
 )
 
-:: 清理旧的 build 产物，确保干净重建
-echo [CLEAN] Cleaning old build artifacts...
-rmdir /s /q "build" 2>nul
-rmdir /s /q "dist" 2>nul
+:: 共享冻结入口只清理自身缓存和输出，保留 build/deepseek-harness 构建输入。
 
 echo [BUILD] Running PyInstaller ...
 python scripts\build_backend_package.py

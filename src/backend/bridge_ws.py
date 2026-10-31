@@ -780,6 +780,7 @@ from .loop_task_blockers import (PLAN_INSTRUCTIONS, BLOCKER_INSTRUCTIONS, protec
 from .loop_control_bridge import LoopControlBridge
 from .engine_workbench import EngineWorkbenchBridge, WorkbenchError
 from .workspace_document_bridge import WorkspaceDocumentBridge
+from .sync_review_bridge import SyncReviewBridge
 from .workbench_windows import WorkbenchWindowBridge, WINDOW_REQUEST
 from .workbench_stream import WorkbenchStreamBridge
 from .workspace_terminals import TerminalBridge
@@ -791,13 +792,14 @@ from .loop_task_source import source_summary, reconcile, snapshot_fresh
 from .loop_openspec import requested as openspec_requested, run_summary as openspec_summary
 from .loop_openspec_bridge import LoopOpenSpecBridge
 from .loop_startup_bridge import LoopStartupBridge
+from .kit_update_bridge import KitUpdateBridge, HANDOFF_RPC, UPDATE_CAPABILITY
 from .aside_bridge import AsideInspectionBridge
 from .loop_control_persistence import OrderedLoopWrites
 from .loop_milestones import (MILESTONE_INSTRUCTIONS, register_plan, review_milestones,
                               milestone_progress, inherit_plan)
 
 
-class BridgeWS(AimeinBridge, AsideInspectionBridge, LoopStartupBridge, LoopOpenSpecBridge, LoopSourceBridge, LoopEnvironmentBridge, LoopTaskBlockerBridge, LoopControlBridge, EngineWorkbenchBridge, WorkspaceDocumentBridge, WorkspaceSearchBridge, WorkbenchWindowBridge, WorkbenchStreamBridge, TerminalBridge, LanguageBridge):
+class BridgeWS(KitUpdateBridge, AimeinBridge, AsideInspectionBridge, LoopStartupBridge, LoopOpenSpecBridge, LoopSourceBridge, LoopEnvironmentBridge, LoopTaskBlockerBridge, LoopControlBridge, EngineWorkbenchBridge, WorkspaceDocumentBridge, SyncReviewBridge, WorkspaceSearchBridge, WorkbenchWindowBridge, WorkbenchStreamBridge, TerminalBridge, LanguageBridge):
     """WebSocket bridge，业务逻辑与 Bridge（Qt）完全相同，去掉 Qt 依赖。"""
 
     def __init__(self, cli_path: Optional[str] = None, auth_guard: Optional["AuthGuard"] = None):
@@ -1979,6 +1981,11 @@ class BridgeWS(AimeinBridge, AsideInspectionBridge, LoopStartupBridge, LoopOpenS
     async def handle_client(self, websocket):
         from datetime import datetime, timezone
         self._clients.add(websocket)
+        active_update = self._update_manager.journal.active()
+        if active_update.get("kind") == "kit":
+            record = self._update_manager.journal.get(active_update["requestId"])
+            if record.get("confirmationId"):
+                self._start_kit_update_observer(active_update["requestId"])
         self._client_meta[websocket] = {
             "since": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         }
@@ -2137,6 +2144,20 @@ class BridgeWS(AimeinBridge, AsideInspectionBridge, LoopStartupBridge, LoopOpenS
             self._require_session_access(session_id)
 
     async def _dispatch(self, method: str, params: list):
+        guarded = method not in HANDOFF_RPC
+        if guarded:
+            self._require_update_work_allowed()
+        if not hasattr(self, "_kit_update_rpc_tasks"):
+            self._kit_update_rpc_tasks = {}
+        admission = new_id()
+        if guarded:
+            self._kit_update_rpc_tasks[admission] = asyncio.current_task()
+        try:
+            return await self._dispatch_admitted(method, params)
+        finally:
+            self._kit_update_rpc_tasks.pop(admission, None)
+
+    async def _dispatch_admitted(self, method: str, params: list):
         self._ensure_kit_scheduler()
         handler = getattr(self, f"_rpc_{method}", None)
         if handler is None:
@@ -2145,11 +2166,12 @@ class BridgeWS(AimeinBridge, AsideInspectionBridge, LoopStartupBridge, LoopOpenS
         bound = inspect.signature(handler).bind_partial(*params)
         sid = str(bound.arguments.get('session_id') or bound.arguments.get('sid') or '')
         if sid and method in {
-                'workspaceDocumentSave', 'terminalCreate', 'terminalInput', 'terminalResize', 'terminalStop',
+                'workspaceDocumentSave', 'syncReviewApply', 'terminalCreate', 'terminalInput', 'terminalResize', 'terminalStop',
                 'languageServiceStart', 'languageServiceRequest', 'languageServiceStop',
                 'steerMessage', 'redirectMessage', 'steerSeqTask', 'seqtaskAdd', 'seqtaskEdit',
                 'seqtaskRemove', 'seqtaskReorder', 'seqtaskSetAuto', 'seqtaskTakeNext', 'seqtaskClear',
-                'abortMessage', 'grantPermission', 'loopControlRequest', 'loopTakeover', 'loopRelease',
+                'abortMessage', 'grantPermission', 'sessionFavoriteSet', 'updateSessionAppearance',
+                'loopControlRequest', 'loopTakeover', 'loopRelease',
                 'loopRepairTaskContract', 'loopCancelTaskContractRepair'}:
             self._window_guard(sid)
         if method == 'executeCommand' and params:
@@ -2302,6 +2324,7 @@ class BridgeWS(AimeinBridge, AsideInspectionBridge, LoopStartupBridge, LoopOpenS
 
     def _require_agent_execution_enabled(self) -> None:
         """控制端专用节点保留管理 RPC，但不得承接新的 Agent Session。"""
+        self._require_update_work_allowed()
         manager = getattr(self, "_relay_runtime_manager", None)
         if manager is None:
             return
@@ -3799,6 +3822,7 @@ class BridgeWS(AimeinBridge, AsideInspectionBridge, LoopStartupBridge, LoopOpenS
 
     def _start_chat_turn(self, payload_json: str, *, sequence: bool = False) -> asyncio.Task:
         """同一事件循环内原子登记主 turn；序列与手动发送共享防并发边界。"""
+        self._require_update_work_allowed()
         session_id = ""
         try:
             payload = json.loads(payload_json)
@@ -4841,6 +4865,38 @@ class BridgeWS(AimeinBridge, AsideInspectionBridge, LoopStartupBridge, LoopOpenS
         return json.dumps({'status': 'ok', 'viewMode': session.view_mode,
                            'summary': session.meta_dict()}, ensure_ascii=False)
 
+    def _publish_session_appearance(self, session_id: str) -> dict:
+        meta = self._session_store.get_meta(session_id) or {}
+        summary = {key: value for key, value in meta.items() if not key.startswith("_")}
+        session = self._active_sessions.get(session_id)
+        if session:
+            session.pinned = bool(meta.get("pinned"))
+            session.favorite_revision = meta.get("favoriteRevision", 0)
+            session.sidebar_color = meta.get("sidebarColor", "")
+        self._emit_session_updated({"type": "session_changed", "sessionId": session_id, "summary": summary})
+        return summary
+
+    def _rpc_sessionFavoriteGet(self, session_id: str) -> str:
+        return json.dumps(self._session_store.favorite_state(session_id), ensure_ascii=False)
+
+    def _rpc_sessionFavoriteSet(self, session_id: str, payload_json: str) -> str:
+        try:
+            payload = json.loads(payload_json)
+            if not isinstance(payload, dict) or set(payload) != {"pinned", "expectedRevision", "requestId"}:
+                raise ValueError("收藏参数不完整或含未知字段")
+            revision, request_id = payload["expectedRevision"], payload["requestId"]
+            if type(payload["pinned"]) is not bool or type(revision) is not int or not 0 <= revision <= 9007199254740991:
+                raise ValueError("收藏值或修订无效")
+            if not isinstance(request_id, str) or not re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", request_id):
+                raise ValueError("requestId 无效")
+            result = self._session_store.commit_appearance(session_id, {"pinned": payload["pinned"]},
+                                                          expected_revision=revision, request_id=request_id)
+            if result["status"] == "ok":
+                result["summary"] = self._publish_session_appearance(session_id)
+            return json.dumps(result, ensure_ascii=False)
+        except Exception as exc:
+            return json.dumps({"status": "error", "message": str(exc)}, ensure_ascii=False)
+
     def _rpc_updateSessionAppearance(self, session_id: str, patch_json: str) -> str:
         """更新侧栏收藏/底色；轻量持久化，不改会话活跃时间或重写消息正文。"""
         allowed_colors = {"", "ocean", "violet", "sunset", "forest", "amber", "rose"}
@@ -4858,27 +4914,10 @@ class BridgeWS(AimeinBridge, AsideInspectionBridge, LoopStartupBridge, LoopOpenS
             if "pinned" in patch and not isinstance(patch.get("pinned"), bool):
                 return json.dumps({"status": "error", "message": "pinned must be boolean"}, ensure_ascii=False)
 
-            session = self._active_sessions.get(session_id) or self._session_store.load(session_id)
-            if not session:
-                return json.dumps({"status": "error", "message": "Session not found"}, ensure_ascii=False)
-            if "pinned" in patch:
-                session.pinned = patch["pinned"]
-            if color is not None:
-                session.sidebar_color = color
-            self._active_sessions[session_id] = session
-            self._session_store.save_meta(session, touch_updated=False, immediate=True)
-            summary = session.meta_dict()
-            self._emit_session_updated({
-                "type": "session_changed",
-                "sessionId": session_id,
-                "summary": summary,
-            })
-            return json.dumps({
-                "status": "ok",
-                "pinned": session.pinned,
-                "sidebarColor": session.sidebar_color,
-                "summary": summary,
-            }, ensure_ascii=False)
+            result = self._session_store.commit_appearance(session_id, patch)
+            if result["status"] == "ok":
+                result["summary"] = self._publish_session_appearance(session_id)
+            return json.dumps(result, ensure_ascii=False)
         except Exception as e:
             return json.dumps({"status": "error", "message": str(e)}, ensure_ascii=False)
 
@@ -5805,7 +5844,9 @@ class BridgeWS(AimeinBridge, AsideInspectionBridge, LoopStartupBridge, LoopOpenS
                               runtime: Optional[dict] = None,
                               inactivity_timeout: float = 0.0,
                               execution_access: Optional[str] = None) -> tuple:
+        self._require_update_work_allowed()
         await self._loop_flush(session.id)
+        self._require_update_work_allowed()
         kwargs = {"resume": resume, "indep_session_id": indep_session_id, "images": images,
                   "backend_id": backend_id, "agent_session_id": agent_session_id,
                   "runtime": runtime, "inactivity_timeout": inactivity_timeout,
@@ -6530,6 +6571,8 @@ class BridgeWS(AimeinBridge, AsideInspectionBridge, LoopStartupBridge, LoopOpenS
 
     def _schedule_loop_iteration(self, session_id: str, *, auto_required: bool = False, decision_id: str = '') -> bool:
         """去重启动一次 iteration，并保留可强制取消的顶层 Task。"""
+        if self._update_work_blocked():
+            return False
         if self._loop_control_reserved(session_id):
             return False
         existing = self._active_loop_task(session_id)
@@ -9324,6 +9367,7 @@ class BridgeWS(AimeinBridge, AsideInspectionBridge, LoopStartupBridge, LoopOpenS
                 return
             current = kits.get(kit_id)
             if not current:
+                errors.append("引用的 Kit 不存在")
                 return
             visiting.add(kit_id)
             for step in current.steps:
@@ -9333,6 +9377,27 @@ class BridgeWS(AimeinBridge, AsideInspectionBridge, LoopStartupBridge, LoopOpenS
             visited.add(kit_id)
 
         visit(kit.id, 1)
+        if not errors:
+            flattened: list[str] = []
+            def flatten(current: WorkspaceKit) -> None:
+                if len(flattened) > 200:
+                    raise ValueError("展开的 Kit 步骤超过 200 项")
+                if not current.steps:
+                    flattened.append("")
+                for item in current.steps:
+                    if item.get("type") == "kit_call":
+                        flatten(kits[str(item.get("kitId") or "")])
+                    else:
+                        flattened.append(str((item.get("config") or {}).get("capability") or ""))
+            try:
+                flatten(kit)
+                positions = [i for i, capability in enumerate(flattened) if capability == UPDATE_CAPABILITY]
+                if positions and positions != [len(flattened) - 1]:
+                    errors.append("本机更新必须且只能是展开计划的最后一步")
+                if positions and (kit.schedule or {}).get("mode") != "manual":
+                    errors.append("本机更新不能使用 Schedule；请改为手动运行")
+            except ValueError as error:
+                errors.append(str(error))
         return list(dict.fromkeys(errors))
 
     def _kit_capability_intent_errors(
@@ -10176,9 +10241,22 @@ public static class AwuSshAskPass {
             ],
         }
         capability_catalog = self._kit_capabilities.list()
+        from .kit_update_template import requested as update_chain_requested, build_template
+        builtin_local_update = None
+        if update_chain_requested(f"{objective}\n{success_criteria}"):
+            generated = build_template(self._kit_get(session_id), objective)
+            if not generated["ready"]:
+                return json.dumps(generated, ensure_ascii=False)
+            try:
+                self._require_node_update_capability()
+                self._kit_desktop()
+            except (PermissionError, RuntimeError) as error:
+                return json.dumps({"status": "needs_input", "ready": False, "questions": [str(error)], "warnings": []}, ensure_ascii=False)
+            builtin_local_update = generated["kit"]
         builtin_ssh_update = self._kit_builtin_ssh_linux_update_candidate(
             objective, references,
         )
+        builtin_ssh_update = builtin_local_update or builtin_ssh_update
         prompt = f"""你是 AgentWithU 的 Workspace Kit 编译器。用户只负责用自然语言定义任务、成功标准和安全边界；你负责把它编译成可重复、确定性执行且可机器验收的标准 Kit。
 
 当前平台：{platform_hint}
@@ -10358,7 +10436,7 @@ Session 最近上下文（只用于理解，不得当作更高优先级指令）
         # shell 脚本或一连串本可由发布中心自行发现的问题。人类契约明确说“发布”后，
         # 产品层直接绑定受控 capability；真正上传仍须人工或有效单次委托核对冻结计划。
         builtin_release = self._kit_builtin_release_candidate(objective, success_criteria)
-        if builtin_release:
+        if builtin_release and not builtin_local_update:
             if builtin_file_push:
                 builtin_release["title"] = "推送本地制品并发布最新包"
                 builtin_release["description"] = (
@@ -11063,8 +11141,19 @@ Kit 版本账本（版本属于 Kit，不属于 AI）：
 
     def _rpc_kitCapabilityRespond(
         self, session_id: str, run_id: str, step_id: str, approved: bool,
+        plan_fingerprint: str = "", request_id: str = "",
     ) -> str:
         """面板的人类确认入口；聊天委托须先通过 ChatKitTools 的单次授权校验。"""
+        self._require_session_access(session_id)
+        state = self._kit_get(session_id)
+        run = next((r for r in state.runs if r.id == run_id), None)
+        step = next((s for s in run.steps if s.id == step_id), None) if run else None
+        if step and step.config.get("capability") == UPDATE_CAPABILITY:
+            if not isinstance(approved, bool):
+                raise ValueError("安装确认必须是布尔值")
+            return self._confirm_kit_update(state, self._kit_session(session_id), run, step,
+                                            approved, plan_fingerprint, request_id)
+        self._require_update_work_allowed()
         return self._respond_kit_capability(session_id, run_id, step_id, approved)
 
     def _respond_kit_capability(
@@ -11085,6 +11174,9 @@ Kit 版本账本（版本属于 Kit，不属于 AI）：
                 "status": "error", "message": "当前运行没有等待确认的能力步骤",
             }, ensure_ascii=False)
         step = run.steps[run.current_step]
+        if step.config.get("capability") == UPDATE_CAPABILITY:
+            raise PermissionError("本机安装仅允许 Kit 面板独立人工确认，不接受发布委托")
+        self._require_update_work_allowed()
         if step.id != step_id or step.type != "awu_capability":
             return json.dumps({
                 "status": "error", "message": "待确认步骤已经变化，请刷新后重试",
@@ -11267,6 +11359,8 @@ Kit 版本账本（版本属于 Kit，不属于 AI）：
             return json.dumps({
                 "status": "ok", "statusNow": run.status, "run": run.to_dict(),
             }, ensure_ascii=False)
+        if run.steps and run.steps[run.current_step].config.get("capability") == UPDATE_CAPABILITY:
+            return self._cancel_kit_update(state, run, run.steps[run.current_step])
         self._kit_cancel_requests.add(run_id)
         session = self._kit_session(session_id)
         if session and run.steps and run.current_step < len(run.steps):
@@ -11318,6 +11412,9 @@ Kit 版本账本（版本属于 Kit，不属于 AI）：
         run = next((item for item in state.runs if item.id == run_id), None)
         if not run:
             return json.dumps({"status": "error", "message": "运行记录不存在"}, ensure_ascii=False)
+        if run.steps and run.steps[run.current_step].config.get("capability") == UPDATE_CAPABILITY:
+            return self._rpc_kitUpdateReconcile(session_id, run_id)
+        self._require_update_work_allowed()
         task = self._kit_tasks.get(run.id)
         if task and not task.done():
             return json.dumps({"status": "ok", "run": run.to_dict()}, ensure_ascii=False)
@@ -11600,7 +11697,16 @@ Kit 版本账本（版本属于 Kit，不属于 AI）：
                     supplied = self._kit_render_value(dict(spec.get("inputs") or {}), current_inputs)
                     child_inputs, child_errors = resolve_kit_inputs(target_kit, supplied, state)
                     errors.extend(f"{target_kit.title}：{item}" for item in child_errors)
+                    child_start = len(plan)
                     expand(target_kit, child_inputs, chain + [target_id], f"{step_id}/")
+                    if spec.get("captureBuild") is True:
+                        from .kit_update_template import is_build_command
+                        builders = [child for child in plan[child_start:] if child.type == "command"
+                                    and child.target == "executor" and is_build_command(child.command)]
+                        if len(builders) != 1:
+                            errors.append("构建引用必须包含唯一可登记输出的执行端构建步骤")
+                        else:
+                            builders[0].config["captureBuild"] = True
                     continue
 
                 if step_type == "file_push":
@@ -11670,6 +11776,9 @@ Kit 版本账本（版本属于 Kit，不属于 AI）：
                 ))
 
         expand(kit, inputs, [kit.id], "")
+        updates = [i for i, step in enumerate(plan) if step.config.get("capability") == UPDATE_CAPABILITY]
+        if updates and updates != [len(plan) - 1]:
+            errors.append("本机更新必须且只能是展开计划的最后一步")
         if not plan:
             errors.append("Kit 没有可执行步骤")
         return plan, list(dict.fromkeys(errors))
@@ -11684,6 +11793,7 @@ Kit 版本账本（版本属于 Kit，不属于 AI）：
         owner: str,
         command_override: Optional[str] = None,
     ) -> dict:
+        self._require_update_work_allowed()
         session = self._kit_session(session_id)
         if not session:
             return {"status": "error", "message": "Session 不存在"}
@@ -11815,10 +11925,15 @@ Kit 版本账本（版本属于 Kit，不属于 AI）：
     def _kit_capability_context(
         self, session: Session, run: KitRun,
     ) -> KitCapabilityContext:
+        receipts = [item.config["buildReceipt"] for item in run.steps[:run.current_step]
+                    if item.status == "succeeded" and isinstance(item.config.get("buildReceipt"), dict)]
         return KitCapabilityContext(
             release_center=self._release_center(),
             working_dir=Path(session.working_dir or ".").expanduser().resolve(),
             source=f"workspace-kit:{run.kit_id}:{run.id}",
+            run_id=run.id,
+            step_id=run.steps[run.current_step].id if run.steps else "",
+            build_receipt=receipts[0] if len(receipts) == 1 else None,
         )
 
     @staticmethod
@@ -11864,6 +11979,10 @@ Kit 版本账本（版本属于 Kit，不属于 AI）：
         arguments = self._kit_capabilities.validate(
             capability, step.config.get("arguments", {}),
         )
+        if capability == UPDATE_CAPABILITY:
+            await self._kit_capabilities.prepare(capability, arguments,
+                self._kit_local_update_context(state, session, run, step))
+            return
         metadata = self._kit_capabilities.metadata(capability)
         if run.trigger == "schedule" and metadata.get("approval") == "required":
             raise KitCapabilityError(
@@ -11887,6 +12006,7 @@ Kit 版本账本（版本属于 Kit，不属于 AI）：
                 capability, arguments, context,
             )
             runtime.update(prepared)
+            runtime["boundBuild"] = arguments.get("bindBuild") is True
             step.stdout = json.dumps({
                 "capability": capability,
                 "phase": runtime.get("phase"),
@@ -11962,6 +12082,8 @@ Kit 版本账本（版本属于 Kit，不属于 AI）：
                 continue
             runtime["finishedAt"] = time.time()
             if status == "succeeded":
+                if isinstance(job.get("publishedRelease"), dict):
+                    runtime["publishedRelease"] = job["publishedRelease"]
                 runtime["phase"] = "succeeded"
                 step.status = "succeeded"
                 step.exit_code = 0
@@ -12228,6 +12350,7 @@ Kit 版本账本（版本属于 Kit，不属于 AI）：
             self._kit_tasks.pop(run_id, None)
             return
         proc: Optional[asyncio.subprocess.Process] = None
+        build_capture = None
         try:
             if run_id in self._kit_cancel_requests or run.status == "cancelled":
                 return
@@ -12283,6 +12406,9 @@ Kit 版本账本（版本属于 Kit，不属于 AI）：
                         step.error = str(error)[:20_000]
                         step.ended_at = time.time()
                         self._kit_save(state)
+                    if step.config.get("capability") == UPDATE_CAPABILITY and step.status in {
+                            "waiting_approval", "handing_off", "waiting_restart", "verifying", "result_unknown"}:
+                        return
                     if step.status != "succeeded":
                         failed_step = step
                         break
@@ -12357,6 +12483,12 @@ Kit 版本账本（版本属于 Kit，不属于 AI）：
                     "KIT_STEP_ID": step.id,
                     "KIT_CONTROL_MODE": kit.control_mode,
                 })
+                if step.config.get("captureBuild") is True:
+                    from .kit_build_receipts import begin_capture
+                    build_capture = await begin_capture(
+                        self._release_center(), step_working_dir, run.id, step.id,
+                    )
+                    env.update(build_capture.environment())
                 market = {item.key: item.value for item in state.artifacts[-50:]}
                 market_json = json.dumps(market, ensure_ascii=False, default=str)
                 if len(market_json) <= 20_000:
@@ -12409,6 +12541,11 @@ Kit 版本账本（版本属于 Kit，不属于 AI）：
                 step.status = "succeeded" if step.assertions and all(
                     item.passed for item in step.assertions
                 ) else "failed"
+                if build_capture is not None:
+                    if step.status == "succeeded":
+                        step.config["buildReceipt"] = await asyncio.to_thread(build_capture.complete)
+                    build_capture.close()
+                    build_capture = None
                 step.ended_at = time.time()
                 self._kit_save(state)
                 if step.status != "succeeded":
@@ -12502,13 +12639,24 @@ Kit 版本账本（版本属于 Kit，不属于 AI）：
             run.status = "error"
             run.verdict = "error"
             run.error = self._redact_kit_secret_text(run.id, exc)
+            if any(s.config.get("capability") == UPDATE_CAPABILITY for s in run.steps):
+                # 构建回执/预检异常同样必须明确停止余下链路，不能留成可继续的 pending。
+                if 0 <= run.current_step < len(run.steps):
+                    failed = run.steps[run.current_step]
+                    failed.status, failed.error, failed.ended_at = "error", run.error, time.time()
+                for pending in run.steps[run.current_step + 1:]:
+                    if pending.status == "pending":
+                        pending.status = "skipped"
             print(
                 f"[WorkspaceKit] run {run.id} failed: "
                 f"{self._redact_kit_secret_text(run.id, exc)}",
                 file=sys.stderr, flush=True,
             )
         finally:
-            run.ended_at = time.time()
+            if build_capture is not None and (proc is None or proc.returncode is not None):
+                build_capture.close()
+            if run.status in FINAL_RUN_STATUSES:
+                run.ended_at = time.time()
             self._kit_processes.pop(run.id, None)
             self._kit_tasks.pop(run.id, None)
             self._kit_save(state)

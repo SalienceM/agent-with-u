@@ -19,6 +19,8 @@ export interface LoopAnalysis {
   deliverable: boolean; outputtable: boolean;
 }
 export interface LoopRecord extends TaskBlockerDetails {
+  /** 仅展示投影，不持久化或用于执行授权。 */
+  aimeinData?: import('../utils/aimeinRecordData').AimeinDataState;
   aimeinSummary?: import('./aimein').AimeinSummary;
   aimeinRun?: import('./aimein').AimeinRun;
   openspecSummary?: { change: string; phase: string; status: string; total: number; checked: number; pending: number; manual: number; fixes: number; verified: boolean; message: string };

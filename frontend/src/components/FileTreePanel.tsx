@@ -48,6 +48,11 @@ import {
 import { rankFileSearchPaths } from '../utils/fileSearch';
 import { buildFileAttentionContext, type AttentionContext } from '../utils/attentionContext';
 import { fileTransfers, type TransferProgress } from '../utils/fileTransfers';
+import { compareSnapshot, createReviewQueue, loadReviewBaseline, reviewScopeKey, ReviewGeneration, type CompareSnapshot } from '../utils/directorySyncReview';
+import type { RemoteSyncReview, ReviewAdapter } from '../utils/syncReviewProtocol';
+import { DirectorySyncReviewPanel, type ReviewViewPreferences } from './DirectorySyncReviewPanel';
+import { FilePanelViewCache, filePanelViewKey, loadFileTreeExpansion, saveFileTreeExpansion } from '../utils/filePanelViewState';
+import { reviewTransfers } from '../utils/directorySyncTransfers';
 import { buildLocalManifestTree } from '../utils/localFileTree';
 import { buildGitDirectoryStatuses } from '../utils/fileTreeGit';
 import { loadDocumentPreview, defaultDocumentView, extOf, type DocumentPreview } from '../utils/documentPreview';
@@ -62,6 +67,8 @@ import { handoffParticipants, handoffScope } from '../utils/workbenchHandoffStat
 import type { RecoverableDraft } from '../utils/documentStore';
 import { useLanguageEditor } from '../hooks/useLanguageEditor';
 import { openPreviewWindow } from '../utils/previewWindow';
+import { FilePreviewToolbar, previewToolbarButtonStyle as hdrBtnStyle,
+  previewSegmentStyle as segBtnStyle, previewSegmentActiveStyle as segActiveStyle } from './FilePreviewToolbar';
 
 const CodeEditor = lazy(() => import('./CodeEditor'));
 const PdfPreview = lazy(() => import('./PdfPreview'));
@@ -358,7 +365,36 @@ const SearchHighlightedText: React.FC<{ text: string; query: string }> = ({ text
   ))}</>;
 };
 
-export const FileTreePanel: React.FC<Props> = React.memo(({ sessionId, workingDir, execKey, execLabel, execMode, backendId, focusRequest: externalFocusRequest, onAttentionChange, documentHost, isVisible = true, onDocumentOpen, onBrowseFiles, filesVisible = true, onSearchExit }: Props) => {
+interface SyncReviewState {
+  snapshot: CompareSnapshot; local: ReviewAdapter; remote: RemoteSyncReview; fs: LocalFs; identity: string;
+  views: FilePanelViewCache<ReviewViewPreferences>;
+}
+interface FileTreeViewState {
+  children: Record<string, TNode[]>; expanded: Record<string, boolean>; selected: string | null; scrollTop: number;
+  directoryLimits: Record<string, number>; directoryErrors: Record<string, string>;
+  searchQuery: string; searchResults: TNode[]; searchError: string; searchMatched: number;
+  searchTruncated: boolean; searchSelectedIndex: number; searchReady: boolean;
+  processedFocusRequestId: number;
+  localFs: LocalFs | null; localManifest: Manifest | null; remoteManifest: Manifest | null; localTree: Record<string, TNode[]>;
+  onlyDifferent: boolean; syncReview: SyncReviewState | null;
+}
+const fileTreeViews = new FilePanelViewCache<FileTreeViewState>();
+// 更换账户立即丢弃整个窗口的旧账户缓存，不仅依赖缓存键来隐藏。
+onCurrentUserChanged((_profile, changed) => { if (changed) fileTreeViews.clear(); });
+
+export const FileTreePanel: React.FC<Props> = React.memo(props => {
+  const [owner, setOwner] = useState(() => getCurrentUserProfile().userId);
+  useEffect(() => onCurrentUserChanged(profile => setOwner(profile.userId)), []);
+  const executor = props.execKey || (props.sessionId ? getSessionExecKey(props.sessionId) : '') || '';
+  const viewKey = filePanelViewKey(owner, executor, props.sessionId || '', props.workingDir, props.execMode || '', !!props.documentHost);
+  return <FileTreePanelContent key={viewKey} {...props} execKey={executor} viewKey={viewKey} />;
+});
+
+const FileTreePanelContent: React.FC<Props & { viewKey: string }> = ({ sessionId, workingDir, execKey, execLabel, execMode, backendId, focusRequest: externalFocusRequest, onAttentionChange, documentHost, isVisible = true, onDocumentOpen, onBrowseFiles, filesVisible = true, onSearchExit, viewKey }) => {
+  const [restored] = useState(() => fileTreeViews.get(viewKey));
+  const treeScrollRef = useRef<HTMLDivElement>(null);
+  const savedScrollTop = useRef(restored?.scrollTop || 0);
+  const cacheOwner = useRef(getCurrentUserProfile().userId);
   const mountedRef = useRef(true);
   useEffect(() => {
     mountedRef.current = true;
@@ -380,41 +416,45 @@ export const FileTreePanel: React.FC<Props> = React.memo(({ sessionId, workingDi
   );
 
   // 单树的懒加载层级缓存：key=rel → 直接子项
-  const [children, setChildren] = useState<Record<string, TNode[]>>({});
+  const [children, setChildren] = useState<Record<string, TNode[]>>(restored?.children || {});
   const [loading, setLoading] = useState<Record<string, boolean>>({});
-  const [directoryErrors, setDirectoryErrors] = useState<Record<string, string>>({});
+  const [directoryErrors, setDirectoryErrors] = useState<Record<string, string>>(restored?.directoryErrors || {});
   const directoryRequestRef = useRef<Record<string, number>>({});
   const directoryLoadsRef = useRef(new Map<string, { rel: string; promise: Promise<TNode[]> }>());
   const refreshPendingRef = useRef<Promise<void> | null>(null);
-  const [expanded, setExpanded] = useState<Record<string, boolean>>({});
-  const [selected, setSelected] = useState<string | null>(null);
+  const [expanded, setExpanded] = useState<Record<string, boolean>>(() => restored?.expanded ?? loadFileTreeExpansion(viewKey));
+  useEffect(() => {
+    if (getCurrentUserProfile().userId === cacheOwner.current) saveFileTreeExpansion(viewKey, expanded);
+  }, [viewKey, expanded]);
+  const [selected, setSelected] = useState<string | null>(restored?.selected || null);
   const [focusFlash, setFocusFlash] = useState<string | null>(null);
   const [msg, setMsg] = useState<{ kind: 'ok' | 'err'; text: string } | null>(null);
   const rowRefs = useRef<Map<string, HTMLDivElement>>(new Map());
   const searchInputRef = useRef<HTMLInputElement>(null);
   const searchResultRefs = useRef<Map<number, HTMLDivElement>>(new Map());
   const searchRequestRef = useRef(0);
-  const processedFocusRequestRef = useRef(0);
+  const processedFocusRequestRef = useRef(restored?.processedFocusRequestId || 0);
   const focusFlashTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const [searchQuery, setSearchQuery] = useState('');
-  const [searchResults, setSearchResults] = useState<TNode[]>([]);
+  const [searchQuery, setSearchQuery] = useState(restored?.searchQuery || '');
+  const [searchResults, setSearchResults] = useState<TNode[]>(restored?.searchResults || []);
   const [searchLoading, setSearchLoading] = useState(false);
-  const [searchError, setSearchError] = useState('');
-  const [searchMatched, setSearchMatched] = useState(0);
-  const [searchTruncated, setSearchTruncated] = useState(false);
-  const [searchSelectedIndex, setSearchSelectedIndex] = useState(0);
+  const [searchError, setSearchError] = useState(restored?.searchError || '');
+  const [searchMatched, setSearchMatched] = useState(restored?.searchMatched || 0);
+  const [searchTruncated, setSearchTruncated] = useState(restored?.searchTruncated || false);
+  const [searchSelectedIndex, setSearchSelectedIndex] = useState(restored?.searchSelectedIndex || 0);
 
   // 远端会话的本地副本(离线/比对/同步用)。本地会话不涉及。
-  const [localFs, setLocalFs] = useState<LocalFs | null>(null);
-  const [localRestoring, setLocalRestoring] = useState(isRemote);
-  const [localManifest, setLocalManifest] = useState<Manifest | null>(null);
+  const [localFs, setLocalFs] = useState<LocalFs | null>(restored?.localFs || null);
+  const [localRestoring, setLocalRestoring] = useState(isRemote && !restored?.localFs);
+  const [localManifest, setLocalManifest] = useState<Manifest | null>(restored?.localManifest || null);
+  const completedSearch = useRef(restored?.searchReady ? { query: restored.searchQuery.trim(), manifest: restored.localManifest, git: false, refresh: 0 } : null);
   const localScanRef = useRef<AbortController | null>(null);
-  const [localTree, setLocalTree] = useState<Record<string, TNode[]>>({});
-  const [directoryLimits, setDirectoryLimits] = useState<Record<string, number>>({});
-  const [remoteManifest, setRemoteManifest] = useState<Manifest | null>(null);  // 比对后才有(带哈希)
+  const [localTree, setLocalTree] = useState<Record<string, TNode[]>>(restored?.localTree || {});
+  const [directoryLimits, setDirectoryLimits] = useState<Record<string, number>>(restored?.directoryLimits || {});
+  const [remoteManifest, setRemoteManifest] = useState<Manifest | null>(restored?.remoteManifest || null);  // 比对后才有(带哈希)
   const [baseline, setBaseline] = useState<Manifest>({});
   const [comparing, setComparing] = useState(false);
-  const [onlyDifferent, setOnlyDifferent] = useState(false);
+  const [onlyDifferent, setOnlyDifferent] = useState(restored?.onlyDifferent || false);
   const [sessionOnline, setSessionOnline] = useState(true);
   // `.git` 保持可见，但默认不进入比对或目录传输。高风险授权只在本次
   // 面板生命周期内有效；重新进入即恢复安全默认，不能由远端配置静默打开。
@@ -489,6 +529,57 @@ export const FileTreePanel: React.FC<Props> = React.memo(({ sessionId, workingDi
   const windowFrozen = useWindowWriteBlocked(execKey || '', sessionId);
   const previewScopeRef = useRef(previewScope);
   previewScopeRef.current = previewScope;
+  const compareGeneration = useRef(new ReviewGeneration());
+  const compareIdentity = JSON.stringify([previewScope, includeGitMetadata, localFs?.id()]);
+  const compareIdentityRef = useRef(compareIdentity);
+  compareIdentityRef.current = compareIdentity;
+  const [syncReview, setSyncReview] = useState<SyncReviewState | null>(restored?.syncReview || null);
+  const [reviewUnavailable, setReviewUnavailable] = useState('');
+  const [reviewView, setReviewView] = useState<{ subtree: string; selected?: string; onlyDifferent: boolean; trigger: HTMLElement | null } | null>(null);
+  const reviewCount = useMemo(() => syncReview ? createReviewQueue(syncReview.snapshot, '', undefined, onlyDifferent).entries.length : 0, [syncReview, onlyDifferent]);
+  const previewHasDifference = useMemo(() => !!(preview && syncReview && remoteManifest && syncReview.identity === compareIdentity && syncReview.fs === localFs
+    && createReviewQueue(syncReview.snapshot, '', undefined, onlyDifferent).entries.some(entry => entry.path === preview.rel)
+    && !(localManifest?.[preview.rel]?.hash && localManifest[preview.rel].hash === remoteManifest[preview.rel]?.hash
+      && localManifest[preview.rel].size === remoteManifest[preview.rel]?.size)), [preview?.rel, syncReview, remoteManifest, localManifest, compareIdentity, localFs, onlyDifferent]);
+  const reviewViewKey = JSON.stringify([reviewView?.subtree || '', !!reviewView?.onlyDifferent]);
+  const lastCompareIdentity = useRef(compareIdentity);
+  const reviewResults = React.useSyncExternalStore(reviewTransfers.subscribe, reviewTransfers.getSnapshot);
+  const appliedReviewResults = useRef(new WeakSet<object>());
+  useEffect(() => {
+    if (!syncReview || syncReview.identity !== compareIdentity || syncReview.fs !== localFs) return;
+    for (const result of reviewResults) {
+      if (result.scopeKey !== reviewScopeKey(syncReview.snapshot.scope) || result.compareRevision !== syncReview.snapshot.revision
+        || !['pushed', 'pulled'].includes(result.status) || !result.receipt?.version?.exists) continue;
+      if (appliedReviewResults.current.has(result)) continue;
+      appliedReviewResults.current.add(result);
+      const meta = { hash: result.receipt.version.sha256, size: result.receipt.version.byteLength };
+      setLocalManifest(previous => ({ ...previous, [result.path]: meta }));
+      setRemoteManifest(previous => previous ? { ...previous, [result.path]: meta } : previous);
+    }
+  }, [reviewResults, syncReview, compareIdentity, localFs]);
+  useEffect(() => {
+    if (lastCompareIdentity.current === compareIdentity) return;
+    lastCompareIdentity.current = compareIdentity;
+    compareGeneration.current.invalidate(); setSyncReview(null); setReviewView(null); setReviewUnavailable(''); setComparing(false);
+  }, [compareIdentity, localFs]);
+  useEffect(() => { if (!isVisible) setReviewView(null); }, [isVisible]);
+  const retainedView = useRef<FileTreeViewState | null>(null);
+  retainedView.current = { children, expanded, selected, scrollTop: savedScrollTop.current, directoryLimits, directoryErrors,
+    searchQuery, searchResults, searchError, searchMatched, searchTruncated, searchSelectedIndex, searchReady: !!completedSearch.current && !searchLoading,
+    processedFocusRequestId: processedFocusRequestRef.current,
+    localFs, localTree: includeGitMetadata ? {} : localTree, localManifest: includeGitMetadata ? null : localManifest, remoteManifest: includeGitMetadata ? null : remoteManifest,
+    onlyDifferent: !includeGitMetadata && onlyDifferent, syncReview: includeGitMetadata ? null : syncReview };
+  const includeGitRef = useRef(includeGitMetadata); includeGitRef.current = includeGitMetadata;
+  useEffect(() => () => {
+    const state = retainedView.current;
+    if (!state || getCurrentUserProfile().userId !== cacheOwner.current) return;
+    // 高风险扫描结果与搜索不跨面板生命期恢复；普通目录名称仍可见。
+    const safe = includeGitRef.current ? { ...state, searchQuery: '', searchResults: [], searchError: '', searchReady: false } : state;
+    const weight = Object.values(safe.children).reduce((count, rows) => count + rows.length, 0)
+      + Object.keys(safe.localManifest || {}).length * 3 + Object.keys(safe.remoteManifest || {}).length * 3 + safe.searchResults.length;
+    fileTreeViews.set(viewKey, { ...safe, scrollTop: savedScrollTop.current }, weight);
+  }, [viewKey]);
+  useEffect(() => { if (treeScrollRef.current) treeScrollRef.current.scrollTop = savedScrollTop.current; }, [children, localTree]);
   type Tool = 'more' | 'identity' | 'sync' | 'git' | 'feedback';
   const [tool, setTool] = useState<{ kind: Tool; anchor: HTMLElement; id: number } | null>(null);
   const toolSequence = useRef(0);
@@ -586,7 +677,10 @@ export const FileTreePanel: React.FC<Props> = React.memo(({ sessionId, workingDi
   const [reviewOpening, setReviewOpening] = useState(false);
   const transferKey = JSON.stringify([execKey || 'home', workingDir.replace(/\\/g, '/').replace(/\/$/, '')]);
   // 只订阅当前目录的进度引用，其他工作区传输不应带动整棵文件树重绘。
-  const getTransferSnapshot = useCallback(() => fileTransfers.active(transferKey)?.progress || null, [transferKey]);
+  const getTransferSnapshot = useCallback(() => {
+    const job = fileTransfers.active(transferKey);
+    return job && (!job.ownerId || job.ownerId === documentOwner) ? job.progress : null;
+  }, [transferKey, documentOwner]);
   const transfer = React.useSyncExternalStore(fileTransfers.subscribe, getTransferSnapshot);
   const [contextMenu, setContextMenu] = useState<FileContextMenu | null>(null);
 
@@ -717,19 +811,14 @@ export const FileTreePanel: React.FC<Props> = React.memo(({ sessionId, workingDi
       directoryLoadsRef.current.delete(key);
     }
     setChildren(previous => Object.fromEntries(Object.entries(previous).filter(([rel]) => keys.has(rel))));
-    setExpanded(previous => Object.fromEntries(Object.entries(previous).filter(([rel]) => keys.has(rel))));
     setLoading(previous => Object.fromEntries(Object.entries(previous).filter(([rel]) => keys.has(rel))));
     setDirectoryErrors(previous => Object.fromEntries(Object.entries(previous).filter(([rel]) => keys.has(rel))));
     await Promise.all([...keys].map((k) => loadChildren(k)));
   }, [expanded, loadChildren]);
 
-  // 会话切换 → 重载根
+  // 身份切换由 keyed 容器隔离；缓存命中只恢复视图，不自动重扫/比对。
   useEffect(() => {
-    searchRequestRef.current += 1;
-    setChildren({}); setExpanded({}); setSelected(null);
-    setDirectoryErrors({});
-    setSearchQuery(''); setSearchResults([]); setSearchError(''); setSearchLoading(false);
-    if (workingDir) loadChildren('');
+    if (workingDir && !restored?.children['']) loadChildren('');
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [workingDir, execKey]);
 
@@ -1200,6 +1289,7 @@ export const FileTreePanel: React.FC<Props> = React.memo(({ sessionId, workingDi
     if (!fs) { setLocalManifest(null); return; }
     const controller = new AbortController();
     localScanRef.current = controller;
+    compareGeneration.current.invalidate(); setSyncReview(null); setReviewView(null);
     setRemoteManifest(null);
     try {
       const manifest = await fs.scan([], includeGitMetadata, { hash: false, signal: controller.signal });
@@ -1209,9 +1299,11 @@ export const FileTreePanel: React.FC<Props> = React.memo(({ sessionId, workingDi
     }
   }, [includeGitMetadata]);
   useEffect(() => () => { localScanRef.current?.abort(); }, []);
+  const [searchRefresh, setSearchRefresh] = useState(0);
   const refreshAll = useCallback(async () => {
     if (!mountedRef.current) return;
     if (refreshPendingRef.current) return refreshPendingRef.current;
+    setSearchRefresh(value => value + 1);
     // Git 有独立合并/错误状态，不能让慢 Git 挡住下一次目录刷新。
     void gitRefreshRef.current?.();
     const task = Promise.all([
@@ -1223,7 +1315,11 @@ export const FileTreePanel: React.FC<Props> = React.memo(({ sessionId, workingDi
     finally { if (refreshPendingRef.current === task) refreshPendingRef.current = null; }
   }, [reloadAll, localFs, scanLocal]);
   // 上传/下载/删除处理器已有增量更新；传输结束不再额外全量扫描。
+  const restoreLocalOnce = useRef(true);
   useEffect(() => {
+    const cachedBinding = restoreLocalOnce.current && restored?.localFs && restored.localManifest;
+    restoreLocalOnce.current = false;
+    if (isRemote && cachedBinding) { setLocalRestoring(false); return; }
     if (!isRemote) {
       setLocalRestoring(false);
       setLocalFs(null);
@@ -1276,7 +1372,9 @@ export const FileTreePanel: React.FC<Props> = React.memo(({ sessionId, workingDi
   useEffect(() => {
     const requestId = ++searchRequestRef.current;
     const query = searchQuery.trim();
-    if (!query || !workingDir || !isVisible) {
+    if (!isVisible) { setSearchLoading(false); return; }
+    if (!query || !workingDir) {
+      completedSearch.current = null;
       setSearchResults([]);
       setSearchLoading(false);
       setSearchError('');
@@ -1285,6 +1383,9 @@ export const FileTreePanel: React.FC<Props> = React.memo(({ sessionId, workingDi
       setSearchSelectedIndex(0);
       return;
     }
+    const completed = completedSearch.current;
+    if (completed?.query === query && completed.manifest === localManifest && completed.git === includeGitMetadata && completed.refresh === searchRefresh) return;
+    completedSearch.current = null;
 
     // 查询一变化就清掉旧列表，避免防抖窗口内按 Enter 打开上一条查询的文件。
     setSearchResults([]);
@@ -1338,6 +1439,7 @@ export const FileTreePanel: React.FC<Props> = React.memo(({ sessionId, workingDi
         }
 
         if (requestId !== searchRequestRef.current) return;
+        completedSearch.current = { query, manifest: localManifest, git: includeGitMetadata, refresh: searchRefresh };
         const combined = rankFileSearchPaths(merged.keys(), query, FILE_SEARCH_LIMIT);
         setSearchResults(combined.results.map((item) => merged.get(item.path)!).filter(Boolean));
         setSearchMatched(Math.max(combined.matched, localRanked.matched, remoteMatched));
@@ -1352,7 +1454,7 @@ export const FileTreePanel: React.FC<Props> = React.memo(({ sessionId, workingDi
       window.clearTimeout(timer);
       if (searchRequestRef.current === requestId) searchRequestRef.current += 1;
     };
-  }, [searchQuery, workingDir, execKey, isRemote, localManifest, includeGitMetadata, isVisible, previewScope]);
+  }, [searchQuery, workingDir, execKey, isRemote, localManifest, includeGitMetadata, isVisible, previewScope, searchRefresh]);
 
   useEffect(() => {
     if (!searchQuery.trim()) return;
@@ -1515,13 +1617,23 @@ export const FileTreePanel: React.FC<Props> = React.memo(({ sessionId, workingDi
     ));
   }, [children, isRemote, localTree, remoteManifest, remoteManifestDirs]);
 
-  // 比对后可能发现“原以为仅本机”的已展开目录其实远端也存在，立即补拉远端子项。
+  // 刷新后逐层恢复可见的展开目录；只信任当前父目录返回的子项，不从保存路径直接发起读取。
+  // 折叠祖先下的状态保留但不加载，失败也不在重渲染/重连时自动重试。
   useEffect(() => {
-    if (!isRemote || !remoteManifest) return;
-    for (const [rel, open] of Object.entries(expanded)) {
-      if (open && remoteManifestDirs.has(rel) && children[rel] === undefined) loadChildren(rel);
+    const pending = [''];
+    const visited = new Set<string>();
+    while (pending.length) {
+      const parent = pending.pop()!;
+      if (visited.has(parent)) continue;
+      visited.add(parent);
+      for (const node of mergedChildren(parent)) {
+        if (!node.isDir || expanded[node.rel] !== true) continue;
+        if (node.remote && children[node.rel] === undefined) {
+          if (!loading[node.rel] && !directoryErrors[node.rel]) void loadChildren(node.rel);
+        } else pending.push(node.rel);
+      }
     }
-  }, [isRemote, remoteManifest, remoteManifestDirs, expanded, children, loadChildren]);
+  }, [expanded, children, mergedChildren, loading, directoryErrors, loadChildren]);
 
   // ── 文件状态(仅远端会话)──
   const statusOf = useCallback((node: TNode): FStatus | null => {
@@ -1635,20 +1747,46 @@ export const FileTreePanel: React.FC<Props> = React.memo(({ sessionId, workingDi
       setMsg({ kind: 'err', text: '当前离线；本地修改已保留，恢复连接后再比对或上传' });
       return;
     }
+    const ticket = compareGeneration.current.begin(compareIdentity);
+    const current = () => mountedRef.current && localFsRef.current === localFs
+      && compareGeneration.current.accepts(ticket, compareIdentityRef.current)
+      && getCurrentUserProfile().userId === documentOwner;
     setComparing(true); setMsg(null);
     try {
-      const [lm, rm] = await Promise.all([
+      const [lm, rm, connection] = await Promise.all([
         localFs.scan([], includeGitMetadata),
         api.syncManifest(workingDir, execKey, includeGitMetadata).then((r) => {
           if (r.status !== 'ok' || !r.files) throw new Error(r.message || '无法读取执行端文件清单');
           return r.files;
         }),
+        (async () => {
+          try {
+            const executor = execKey || (sessionId ? getSessionExecKey(sessionId) : '');
+            if (!sessionId || !executor || !localFs.documentAdapter || !localFs.reviewAdapter) throw new Error('当前来源不支持安全审阅');
+            const [remote, bound] = await Promise.all([
+              api.syncReview(sessionId, executor, workingDir, () => getCurrentUserProfile().userId === documentOwner),
+              localFs.documentAdapter(),
+            ]);
+            const scope = { workspace: remote.capability.workspace, execKey: executor, bindingId: bound.bindingId, includeGitMetadata };
+            const local = await localFs.reviewAdapter(reviewScopeKey(scope));
+            if (local.bindingId !== scope.bindingId) throw new Error('副本身份已变化，请重新比对');
+            return { remote, local, scope };
+          } catch (error) { return { error: error instanceof Error ? error.message : '当前来源不支持安全审阅' }; }
+        })(),
       ]);
+      if (!current()) return;
       setLocalManifest(lm); setRemoteManifest(rm);
       setBaseline(loadBaseline(baselineLocalId, workingDir));
-    } catch (e: any) { setMsg({ kind: 'err', text: `比对失败：${e?.message ?? e}` }); }
-    finally { setComparing(false); }
-  }, [workingDir, execKey, localFs, sessionOnline, includeGitMetadata, baselineLocalId]);
+      setReviewView(null);
+      if ('error' in connection) { setSyncReview(null); setReviewUnavailable(connection.error || '审阅能力不可用'); }
+      else {
+        const snapshot = compareSnapshot(connection.scope, ticket.generation, lm, rm, loadReviewBaseline(connection.scope, localStorage));
+        setSyncReview({ snapshot, local: connection.local, remote: connection.remote, fs: localFs, identity: compareIdentity,
+          views: new FilePanelViewCache<ReviewViewPreferences>(16, 100_000) }); setReviewUnavailable('');
+      }
+    } catch (e: any) { if (current()) setMsg({ kind: 'err', text: `比对失败：${e?.message ?? e}` }); }
+    finally { if (current()) setComparing(false); }
+  }, [workingDir, execKey, localFs, sessionOnline, includeGitMetadata, baselineLocalId, sessionId, documentOwner, compareIdentity]);
 
   const bumpBaseline = useCallback((rels: string[], src: Manifest | null) => {
     if (!localFs || !workingDir || !src || !baselineLocalId) return;
@@ -2829,10 +2967,11 @@ export const FileTreePanel: React.FC<Props> = React.memo(({ sessionId, workingDi
         </div>}</WorkbenchPopover>
 
       <WorkbenchPopover label="本机副本与同步" triggerless externalTrigger={tool?.kind === 'sync' ? tool.anchor : undefined}
-        openSignal={tool?.kind === 'sync' ? tool.id : undefined} width={430}>{() => <div className="ftp-local-actions" style={toolBodyStyle} aria-busy={localRestoring}>
+        openSignal={tool?.kind === 'sync' ? tool.id : undefined} width={430}>{closeSync => <div className="ftp-local-actions" style={toolBodyStyle} aria-busy={localRestoring}>
           <div style={toolIdentityStyle}><strong>{localFs?.kind === 'managed' ? '平板离线空间' : '本机副本'}</strong>
             <code style={toolCodeStyle}>{localRestoring ? '恢复中…' : localFs?.label() || '未指定'}</code></div>
           <span>{filePanelComparison(!!remoteManifest, summary)}</span>
+          {syncReview && <small>上次比对：{new Date(syncReview.snapshot.comparedAt).toLocaleString()} · 非实时结果，推拉前重新核验版本</small>}
           <div className="ftp-action-row" style={toolActionRowStyle}>
             <button
               disabled={!localFs || !remoteManifest || localRestoring}
@@ -2853,6 +2992,9 @@ export const FileTreePanel: React.FC<Props> = React.memo(({ sessionId, workingDi
             <button style={localDirButtonStyle} disabled={!localFs || localRestoring || !sessionOnline || comparing || !!transfer} onClick={runCompare} title={sessionOnline ? '扫描两端并比较文件状态' : '恢复连接后可比对'}>
               {comparing ? '比对中…' : '↔ 比对'}
             </button>
+          <button style={localDirButtonStyle} disabled={!syncReview || comparing} title={reviewUnavailable || '先显式比对，再逐个审阅差异'}
+            onClick={event => { setReviewView({ subtree: '', onlyDifferent, trigger: tool?.anchor || event.currentTarget }); closeSync(); }}>审阅差异 {syncReview ? reviewCount : ''}</button>
+          {reviewUnavailable && <span role="status" style={{ fontSize: 11 }}>{reviewUnavailable}</span>}
           {!isTauri() && (
             <>
               <input
@@ -2928,7 +3070,7 @@ export const FileTreePanel: React.FC<Props> = React.memo(({ sessionId, workingDi
       </div>}</WorkbenchPopover>
 
       {/* ★ 文件树滚动区 */}
-      <div className="ftp-tree-scroll" style={treeScrollStyle}>
+      <div className="ftp-tree-scroll" ref={treeScrollRef} onScroll={event => { savedScrollTop.current = event.currentTarget.scrollTop; }} style={treeScrollStyle}>
         {searchQuery.trim() ? (
           <div role="listbox" aria-label="文件搜索结果">
             {searchLoading && searchResults.length === 0 ? (
@@ -3002,7 +3144,7 @@ export const FileTreePanel: React.FC<Props> = React.memo(({ sessionId, workingDi
             <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{visibleFeedback.text}</span>
             {feedbackRows.length > 1 && <span style={feedbackCountStyle}>+{feedbackRows.length - 1}</span>}
           </button>
-          {transfer && transfer.direction !== 'delete' && <button type="button" style={feedbackCancelStyle}
+          {transfer && transfer.direction !== 'delete' && !fileTransfers.active(transferKey)?.protectedReview && <button type="button" style={feedbackCancelStyle}
             onClick={() => { const job = fileTransfers.active(transferKey); if (job) fileTransfers.cancel(job); }}>取消</button>}
         </div>
         <WorkbenchPopover label="文件面板状态" triggerless externalTrigger={tool?.kind === 'feedback' ? tool.anchor : undefined}
@@ -3014,7 +3156,7 @@ export const FileTreePanel: React.FC<Props> = React.memo(({ sessionId, workingDi
                   {row.kind === 'error' ? '⚠' : row.kind === 'active' ? '↻' : row.kind === 'done' ? '✓' : '○'}
                 </span>
                 <span style={{ flex: 1, minWidth: 0 }}>{row.text}</span>
-                {row.id === 'active' && transfer && transfer.direction !== 'delete' && <button type="button" style={feedbackCancelStyle}
+                {row.id === 'active' && transfer && transfer.direction !== 'delete' && !fileTransfers.active(transferKey)?.protectedReview && <button type="button" style={feedbackCancelStyle}
                   onClick={() => { const job = fileTransfers.active(transferKey); if (job) fileTransfers.cancel(job); }}>取消传输</button>}
                 {dismissible && <button type="button" aria-label={`关闭状态：${row.text}`} style={feedbackDismissStyle}
                   onClick={() => {
@@ -3051,6 +3193,11 @@ export const FileTreePanel: React.FC<Props> = React.memo(({ sessionId, workingDi
                 requestId: --treeFocusId.current, sessionId, workingDir, relativePath: n.rel,
               } });
             }}>🎯 在文件树中定位</button>
+            {syncReview && <button style={contextItemStyle}
+              disabled={!createReviewQueue(syncReview.snapshot, n.rel).entries.length} onClick={event => {
+              const trigger = document.querySelector<HTMLElement>('.ftp-search input') || event.currentTarget;
+              setReviewView({ subtree: n.isDir ? n.rel : '', selected: n.isDir ? undefined : n.rel, onlyDifferent, trigger }); setContextMenu(null);
+            }}>审阅此{n.isDir ? '目录' : '文件'}差异</button>}
             {n.remote && !isGitMetadataPath(n.rel) && (
               <button style={{ ...contextItemStyle, color: '#ef4444', ...((!sessionOnline || transfer) ? contextDisabledStyle : {}) }}
                 disabled={!sessionOnline || !!transfer} onClick={() => void deleteRemoteEntry(n)}>
@@ -3415,21 +3562,23 @@ export const FileTreePanel: React.FC<Props> = React.memo(({ sessionId, workingDi
               <button style={hdrBtnStyle} disabled={tabClosing} onClick={() => void finishCloseTab('discard')}>放弃草稿并关闭</button>
               <button style={hdrBtnStyle} disabled={tabClosing} onClick={() => setClosingTab(null)}>取消关闭</button>
             </div>}
-            <div style={{ ...pvHeader, ...(documentHost ? { height: 38, minHeight: 38, padding: '0 8px', gap: 6, overflowX: 'auto' } : {}) }}>
-              {!documentHost && <span style={{ fontSize: 13 }}>{preview.isImage ? '🖼️' : preview.renderer === 'pdf' ? '📕' : preview.renderer === 'docx' ? '📘' : preview.renderer === 'drawio' ? '🧩' : preview.structured ? '📊' : editing ? '✏️' : '📄'}</span>}
-              <span style={{ fontWeight: documentHost ? 400 : 600, fontSize: documentHost ? 11 : 13, minWidth: 35, maxWidth: 240, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', color: documentHost ? 'var(--theme-text-muted)' : undefined }} title={`${preview.rel} · ${execLabel || execKey}`}>
-                {dirty && <span style={{ color: 'var(--theme-accent)' }}>● </span>}{documentHost ? preview.rel : preview.name}
-              </span>
-              <span style={{ ...tagStyle, marginLeft: 0 }}>
-                {documentHost ? preview.source === 'local' ? '本机副本' : '执行端' : preview.source === 'local' ? '💻 本机' : '☁️ 远端'}
-              </span>
-              <div style={{ flex: 1 }} />
+            <FilePreviewToolbar name={preview.name} relativePath={preview.rel} source={preview.source}
+              nodeLabel={execLabel || execKey} dirty={dirty} compact={!!documentHost}
+              icon={preview.isImage ? '🖼️' : preview.renderer === 'pdf' ? '📕' : preview.renderer === 'docx' ? '📘' : preview.renderer === 'drawio' ? '🧩' : preview.structured ? '📊' : editing ? '✏️' : '📄'}
+              trailing={!documentHost && <>
+                <button style={hdrBtnStyle} onClick={() => setPreviewMaximized(value => !value)} title={previewMaximized ? '退出最大化（Esc）' : '最大化预览'}>
+                  {previewMaximized ? '🗗 还原' : '⛶ 最大化'}
+                </button>
+                <button style={hdrBtnStyle} onClick={closePreview} title="关闭预览" aria-label="关闭预览">✕</button>
+              </>}>
               {!preview.loading && !(preview.source === 'local' && !isTauri()) && (
                 <button style={hdrBtnStyle} onClick={revealPreview} title="在系统文件管理器中定位">📂 定位</button>
               )}
               {!preview.loading && preview.source === 'local' && !isTauri() && (
                 <button style={hdrBtnStyle} onClick={exportPreview} title="保存到平板文件 App 或调用系统分享">📤 导出</button>
               )}
+              {previewHasDifference && <button style={hdrBtnStyle} title="对比本机副本与执行端文件" onClick={event =>
+                setReviewView({ subtree: '', selected: preview.rel, onlyDifferent, trigger: event.currentTarget })}>对比</button>}
               {!editing && !preview.loading && !preview.error && (
                 PROV_IMAGE_EXTS.has(extOf(preview.name)) || PROV_TEXT_EXTS.has(extOf(preview.name))
               ) && (
@@ -3504,11 +3653,7 @@ export const FileTreePanel: React.FC<Props> = React.memo(({ sessionId, workingDi
               )}
               <button style={hdrBtnStyle} onClick={detachPreview} disabled={preview.loading || !!preview.error || !!activeDocument?.dirty || needsSaveCheck}
                 title={activeDocument?.dirty || needsSaveCheck ? '请先保存或核对当前改动，再分离文件窗口' : '在可移动、缩放的独立窗口中预览或编辑当前文件'}>↗ 独立窗口</button>
-              {!documentHost && <button style={hdrBtnStyle} onClick={() => setPreviewMaximized((value) => !value)} title={previewMaximized ? '退出最大化（Esc）' : '最大化预览'}>
-                {previewMaximized ? '🗗 还原' : '⛶ 最大化'}
-              </button>}
-              {!documentHost && <button style={hdrBtnStyle} onClick={closePreview} title="关闭预览" aria-label="关闭预览">✕</button>}
-            </div>
+            </FilePreviewToolbar>
             <div style={{ ...pvBody, ...(documentHost ? { display: 'flex', flexDirection: 'column' as const } : {}) }}>
               {previewWindowError && <div role="alert" style={{ padding: '8px 12px', color: '#f87171', fontSize: 12 }}>{previewWindowError}</div>}
               {isRemote && preview.source === 'remote' && <div role="status" style={{ padding: '6px 10px', fontSize: 11, color: 'var(--theme-text-muted)', borderBottom: '1px solid var(--theme-border)' }}>
@@ -3689,9 +3834,19 @@ export const FileTreePanel: React.FC<Props> = React.memo(({ sessionId, workingDi
         </AppModalPortal>
       )}
     </div>
+      {reviewView && syncReview && syncReview.identity === compareIdentity && syncReview.fs === localFs && <DirectorySyncReviewPanel
+        key={`${syncReview.snapshot.revision}:${reviewView.subtree}:${reviewView.selected || ''}:${reviewView.onlyDifferent}`}
+        snapshot={syncReview.snapshot} local={syncReview.local} remote={syncReview.remote}
+        localLabel={localFs.label()} remoteLabel={execLabel || execKey || '执行端'} transferKey={transferKey}
+        subtree={reviewView.subtree} selected={reviewView.selected} onlyDifferent={reviewView.onlyDifferent} trigger={reviewView.trigger}
+        initialPreferences={syncReview.views.get(reviewViewKey)}
+        onPreferencesChange={preferences => syncReview.views.set(reviewViewKey, preferences, preferences.skipped.length + 1)}
+        current={() => compareIdentityRef.current === syncReview.identity && localFsRef.current === syncReview.fs
+          && getCurrentUserProfile().userId === syncReview.snapshot.scope.workspace.ownerId}
+        onClose={() => setReviewView(null)} />}
     </WorkbenchInteractionContext.Provider>
   );
-});
+};
 
 const pvOverlay: React.CSSProperties = {
   position: 'fixed', inset: 0, zIndex: 10020,
@@ -3708,29 +3863,11 @@ const pvBoxMaximized: React.CSSProperties = {
   width: '100vw', maxWidth: 'none', height: '100vh',
   border: 'none', borderRadius: 0, boxShadow: 'none',
 };
-const pvHeader: React.CSSProperties = {
-  height: 42, padding: '0 12px', display: 'flex', alignItems: 'center', gap: 8,
-  overflowX: 'auto',
-  flexShrink: 0, borderBottom: '1px solid var(--theme-border, rgba(255,255,255,0.1))',
-};
 const pvBody: React.CSSProperties = { flex: 1, minHeight: 0, overflow: 'auto' };
 const pvPre: React.CSSProperties = {
   margin: 0, padding: '14px 18px', minHeight: '100%', boxSizing: 'border-box',
   whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', fontSize: 12, lineHeight: 1.55,
   background: 'var(--theme-code-bg, #0d1117)', color: 'var(--theme-text, #c9d1d9)',
-};
-const hdrBtnStyle: React.CSSProperties = {
-  padding: '4px 9px', fontSize: 11, borderRadius: 5,
-  border: '1px solid var(--theme-border, rgba(255,255,255,0.14))',
-  background: 'var(--theme-bg-tertiary, rgba(255,255,255,0.05))',
-  color: 'var(--theme-text, #c9d1d9)', cursor: 'pointer', flexShrink: 0,
-};
-const segBtnStyle: React.CSSProperties = {
-  padding: '3px 8px', fontSize: 10.5, border: 'none', background: 'transparent',
-  color: 'var(--theme-text-muted, #8b949e)', cursor: 'pointer',
-};
-const segActiveStyle: React.CSSProperties = {
-  color: 'var(--theme-accent, #58a6ff)', background: 'var(--theme-accent-bg, rgba(88,166,255,0.12))',
 };
 
 // \u2500\u2500 Git \u5f39\u7a97\u6837\u5f0f \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500

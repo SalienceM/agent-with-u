@@ -371,6 +371,17 @@ class ChatKitTools:
                 )}, "artifacts": (plan.get("artifacts") or [])[:100]},
                 "truncated": len(plan.get("artifacts") or []) > 100,
             }
+            if step.config.get("capability") == "node.update_local_published":
+                view["guidance"] = "本机安装/重启不支持聊天代确认；请到 Kit 面板核对并单独确认"
+                view["pendingApproval"].update(canApprove=False, reason=view["guidance"], plan=plan)
+        if 0 <= run.current_step < len(run.steps):
+            step = run.steps[run.current_step]
+            if step.config.get("capability") == "node.update_local_published":
+                runtime = step.config.get("capabilityRuntime") or {}
+                view["localUpdate"] = {key: runtime.get(key) for key in (
+                    "phase", "installRequestId", "message", "receipt", "verification")}
+                if run.status in {"handing_off", "waiting_restart", "verifying", "result_unknown"}:
+                    view["guidance"] = "安装已交接，不保证撤回；仅核对原请求，不重新安装。可在 Kit 面板查看结果"
         return view
 
     @staticmethod

@@ -664,9 +664,16 @@ export const App: React.FC = () => {
 
   /* ---- 多端同步：其它客户端增删改 session 时刷新侧边栏 ---- */
   useEffect(() => {
-    if (backendConnected !== true) return;
     return api.onSessionUpdated((data: any) => {
       const t = data?.type;
+      if (t === 'favorite_changed') {
+        const project = (session: any) => {
+          const summary = data.summaries?.find((row: any) => row.id === session?.id && row.execKey === session?.execKey);
+          return summary ? { ...session, ...summary } : session;
+        };
+        setSessions(prev => prev.map(project)); setActiveSession(project);
+        return;
+      }
       if (t !== 'session_created' && t !== 'session_deleted' && t !== 'session_renamed' && t !== 'session_changed') {
         return;
       }
@@ -692,8 +699,14 @@ export const App: React.FC = () => {
         refreshSessionList();
       }
       if (t === 'session_deleted') {
-        closeWorkbenchTab(sessionWorkbenchTab(data.sessionId));
-        setSessions((prev) => prev.filter((session) => session.id !== data.sessionId));
+        // API 将成功推送与直接回执合并为一个事件。不能清理其它节点的同 ID 会话。
+        const current = sessionsRef.current.find(session => session.id === data.sessionId);
+        if (current?.execKey === data.execKey) {
+          closeWorkbenchTab(sessionWorkbenchTab(data.sessionId));
+          clearStreamStateForSession(data.sessionId);
+          clearSessionHistoryCache(data.sessionId);
+        }
+        setSessions((prev) => prev.filter((session) => session.id !== data.sessionId || session.execKey !== data.execKey));
       }
     });
   }, [backendConnected, refreshSessionList, closeWorkbenchTab]);
@@ -1635,13 +1648,6 @@ export const App: React.FC = () => {
           });
         }}
         onNewSession={handleNewSession}
-        onDeleteSession={(id) => {
-          closeWorkbenchTab(sessionWorkbenchTab(id));
-          // session 被删后顺手把它在 streamStates Map 和历史缓存里的数据也
-          // 清掉,防止「删而不洗」的内存泄漏。
-          clearStreamStateForSession(id);
-          clearSessionHistoryCache(id);
-        }}
         streamingSessions={streamingSessions}
         completedSessions={completedSessions}
         collapsed={sidebarCollapsed}

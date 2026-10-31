@@ -16,7 +16,8 @@ export interface HandoffReceipt {
 const id = (value: unknown): value is string => typeof value === 'string' && /^[\w-]{1,128}$/.test(value);
 const natural = (value: unknown): value is number => Number.isSafeInteger(value) && Number(value) >= 1;
 const key = (executor: string, session: string) => JSON.stringify([executor, session]);
-export const windowMutations = new Set(['sendMessage', 'executeCommand', 'workspaceDocumentSave',
+export const windowMutations = new Set(['sendMessage', 'executeCommand', 'workspaceDocumentSave', 'syncReviewApply',
+  'sessionFavoriteSet', 'updateSessionAppearance',
   'terminalCreate', 'terminalInput', 'terminalResize', 'terminalStop', 'languageServiceStart', 'languageServiceRequest', 'languageServiceStop',
   'steerMessage', 'redirectMessage', 'steerSeqTask', 'seqtaskAdd', 'seqtaskEdit', 'seqtaskRemove', 'seqtaskReorder',
   'seqtaskSetAuto', 'seqtaskTakeNext', 'seqtaskClear', 'abortMessage', 'grantPermission', 'loopControlRequest', 'loopTakeover', 'loopRelease']);

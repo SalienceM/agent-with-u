@@ -2,11 +2,12 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import Callable
 from typing import Any
 
 from .aside_files import ReadonlyFiles
-from .aside_inspection import InspectionError, QueryBudget, QueryIdentity, ReadQuery, clean_inspection
+from .aside_inspection import InspectionError, QueryBudget, QueryIdentity, ReadQuery, budget_error, clean_inspection
 
 
 class InspectionQueries:
@@ -21,6 +22,7 @@ class InspectionQueries:
         self.openspec = openspec
         self.pending: set[asyncio.Task] = set()
         self.sources: list[dict] = []
+        self.failed_queries: dict[str, dict] = {}
 
     def cancel(self) -> None:
         self.budget.cancelled.set()
@@ -51,6 +53,9 @@ class InspectionQueries:
         query = ReadQuery.parse(packet)
         self.validate()
         self.budget.operation()
+        key = json.dumps([query.operation, query.arguments], sort_keys=True, ensure_ascii=False)
+        if key in self.failed_queries:
+            return {**self.failed_queries[key], 'repeated': True}
         try:
             if query.operation == 'runtime_status':
                 result = self.runtime()
@@ -60,10 +65,10 @@ class InspectionQueries:
                 self.pending.add(task)
                 task.add_done_callback(self._finished)
                 try:
-                    result = await asyncio.wait_for(asyncio.shield(task), self.budget.remaining())
+                    result = await asyncio.wait_for(asyncio.shield(task), self.budget.discovery_remaining())
                 except asyncio.TimeoutError:
-                    self.cancel()
-                    raise InspectionError('timeout', '读取超时，清理结果待确认。') from None
+                    # 不取消 to_thread 的等待 Task：真实磁盘读取仍由本请求拥有。
+                    raise budget_error('answer_reserve') from None
             self.validate()
             self.budget.check()
         except InspectionError as exc:
@@ -75,6 +80,8 @@ class InspectionQueries:
         except OSError:
             result = InspectionError('unavailable', '文件系统查询失败，未把失败当作空结果。').result()
         result = self.budget.context(result)
+        if result.get('status') == 'limit' and result.get('limitReason') in {'file_bytes', 'directory_page', 'search_bytes'}:
+            self.failed_queries[key] = result
         source = {**result, 'operation': query.operation}
         # 错误路径可能是越界/凭据，不从输入复制未核验路径到元数据。
         detail_sources = [{**item, 'operation': query.operation} for item in result.get('results', [])

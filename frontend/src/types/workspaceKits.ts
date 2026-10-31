@@ -1,6 +1,7 @@
 export type KitRunStatus =
   | 'queued' | 'running' | 'waiting_client' | 'waiting_approval' | 'evaluating'
-  | 'succeeded' | 'failed' | 'error' | 'cancelled';
+  | 'succeeded' | 'failed' | 'error' | 'cancelled'
+  | 'handing_off' | 'waiting_restart' | 'verifying' | 'result_unknown';
 
 export type KitExecutionTarget = 'executor' | 'client';
 export type KitStepType = 'command' | 'file_push' | 'kit_call' | 'awu_capability';
@@ -237,7 +238,7 @@ export interface KitStepRun {
   title: string;
   sourceKitId: string;
   status: 'pending' | 'running' | 'waiting_client' | 'waiting_approval' | 'succeeded' | 'failed'
-    | 'error' | 'cancelled' | 'skipped';
+    | 'error' | 'cancelled' | 'skipped' | 'handing_off' | 'waiting_restart' | 'verifying' | 'result_unknown';
   shell: 'powershell' | 'cmd' | 'bash';
   command: string;
   cwd: string;
@@ -279,6 +280,12 @@ export interface KitCapabilityRuntime {
     blockers?: string[];
     warnings?: string[];
     comparison?: Record<string, unknown>;
+    desktop?: Record<string, unknown>;
+    device?: string;
+    instanceId?: string;
+    current?: Record<string, unknown>;
+    artifact?: Record<string, unknown>;
+    preflight?: string[];
   };
   approval?: {
     approved: boolean;

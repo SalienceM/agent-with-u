@@ -1,4 +1,5 @@
 import React, { lazy, Suspense, useEffect, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
 import type { DocumentClient } from '../utils/documentStore';
 import { documentStore } from '../utils/documentStore';
 import { documentDrafts, type StoredDocumentDraft } from '../utils/documentDrafts';
@@ -9,6 +10,8 @@ import { exportGeneratedText } from './FileTreePanel';
 import { documentKey } from '../utils/documentStore';
 import { markdownToHtml } from '../utils/markdown';
 import { buildStandaloneMarkdownHtml, markdownHtmlFilename } from '../utils/markdownExport';
+import { previewToolbarButtonStyle as button, previewSegmentStyle, previewSegmentActiveStyle } from './FilePreviewToolbar';
+import { WorkbenchOverflow } from './WorkbenchChrome';
 
 const CodeEditor = lazy(() => import('./CodeEditor'));
 
@@ -18,8 +21,11 @@ export const DetachedTextDocument: React.FC<{
   renderPreview: (text: string) => React.ReactNode;
   onSaved: () => void;
   initialView?: 'preview' | 'source' | 'split';
-}> = ({ preview, dark, client: connect, renderPreview, onSaved, initialView = 'preview' }) => {
+  toolbarHost?: HTMLElement | null;
+  onDocumentState?: (state: { dirty: boolean; editing: boolean }) => void;
+}> = ({ preview, dark, client: connect, renderPreview, onSaved, initialView = 'preview', toolbarHost, onDocumentState }) => {
   const [view, setView] = useState<'preview' | 'source' | 'split'>(initialView);
+  const [editing, setEditing] = useState(initialView !== 'preview');
   const [key, setKey] = useState('');
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
@@ -33,6 +39,8 @@ export const DetachedTextDocument: React.FC<{
   docRef.current = doc;
   const pending = !!doc?.save && !['succeeded', 'failed'].includes(doc.save.receipt?.status || '');
   useEffect(() => documentStore.subscribe(() => update(value => value + 1)), []);
+  useEffect(() => { onDocumentState?.({ dirty: !!doc?.dirty, editing }); }, [doc?.dirty, editing, onDocumentState]);
+  useEffect(() => () => { onDocumentState?.({ dirty: false, editing: false }); }, [onDocumentState]);
   useEffect(() => {
     alive.current = true;
     return () => { alive.current = false; };
@@ -54,9 +62,9 @@ export const DetachedTextDocument: React.FC<{
     window.addEventListener('awu-preview-before-navigate', guard);
     return () => { window.removeEventListener('beforeunload', beforeClose); window.removeEventListener('awu-preview-before-navigate', guard); };
   }, []);
-  const open = async (next: 'source' | 'split') => {
+  const open = async (next: 'source' | 'split', edit = editing) => {
     if (loading) return;
-    if (doc) { setView(next); return; }
+    if (doc) { setView(next); setEditing(edit && !!doc.read?.editable); return; }
     setLoading(true); setNotice('');
     try {
       const connected = await connect();
@@ -67,7 +75,7 @@ export const DetachedTextDocument: React.FC<{
       }
       const loaded = await documentDrafts.open(connected, preview.rel);
       if (!alive.current) return;
-      client.current = connected; setKey(loaded.document.key); setChoices(loaded.choices); setView(next);
+      client.current = connected; setKey(loaded.document.key); setChoices(loaded.choices); setView(next); setEditing(edit && !!loaded.document.read?.editable);
       if (!loaded.document.read?.editable) setNotice(loaded.document.read?.reasonCode === 'remote_readonly'
         ? '远端文件按现有规则只读。请在原窗口打开本机副本，再分离窗口编辑。' : `只读：${loaded.document.read?.reasonCode || '完整性未确认'}。`);
     } catch (error) { if (alive.current) setNotice(`无法打开编辑器：${String(error)}`); }
@@ -86,25 +94,32 @@ export const DetachedTextDocument: React.FC<{
     finally { if (alive.current) setSaving(false); }
   };
   useEffect(() => {
-    if (initialView !== 'preview') void open(initialView);
+    if (initialView !== 'preview') void open(initialView, true);
   }, []);
   const text = doc?.text ?? preview.text ?? '';
   const editor = <Suspense fallback={<p role="status">加载编辑器…</p>}>
     <CodeEditor key={doc?.lifecycleId} documentKey={doc?.key} value={text} ext={extOf(preview.name)} dark={dark} height="100%"
-      readOnly={!doc?.read?.editable || saving} editorState={doc?.editor as EditorDocumentState | undefined}
+      readOnly={!editing || !doc?.read?.editable || saving} editorState={doc?.editor as EditorDocumentState | undefined}
       onEditorState={state => { if (doc) documentStore.editorState(doc.key, state, doc.lifecycleId); }}
       onChange={value => { if (doc) documentStore.edit(doc.key, value); }} onSave={() => void save()} />
   </Suspense>;
-  return <div style={{ display: 'flex', flex: 1, minHeight: 0, flexDirection: 'column' }}>
-    <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, padding: '6px 12px', borderBottom: '1px solid var(--theme-border)' }}>
-      <button style={button} aria-pressed={view === 'preview'} onClick={() => setView('preview')}>预览</button>
-      <button style={button} disabled={loading} aria-pressed={view === 'source'} onClick={() => void open('source')}>{loading ? '完整读取中…' : '源码 / 编辑'}</button>
-      {(preview.isHtml || preview.isMarkdown) && <button style={button} aria-pressed={view === 'split'} onClick={() => void open('split')}>并排</button>}
-      {preview.isMarkdown && <button style={button} disabled={!doc && preview.truncated} onClick={() => void exportGeneratedText(
+  const toolbar = <>
+      {preview.isMarkdown && !editing && <button style={{ ...button, borderColor: 'rgba(63,185,80,.38)' }} disabled={!doc && preview.truncated} onClick={() => void exportGeneratedText(
         buildStandaloneMarkdownHtml(preview.name, markdownToHtml(text)), markdownHtmlFilename(preview.name), 'text/html;charset=utf-8',
-      ).then(result => setNotice(result.mode === 'cancelled' ? '已取消导出' : 'HTML 已导出。')).catch(error => setNotice(String(error)))}>HTML 另存为</button>}
+      ).then(result => setNotice(result.mode === 'cancelled' ? '已取消导出' : 'HTML 已导出。')).catch(error => setNotice(String(error)))}>⇩ HTML 另存为</button>}
+      <div role="group" aria-label="文档显示方式" style={{ display: 'flex', flexShrink: 0, border: '1px solid var(--theme-border)', borderRadius: 6, overflow: 'hidden', marginRight: 4 }}>
+        <button style={{ ...previewSegmentStyle, ...(view === 'preview' ? previewSegmentActiveStyle : {}) }} aria-pressed={view === 'preview'}
+          onClick={() => { setView('preview'); setEditing(false); }}>{preview.isHtml ? '🌐 页面' : '👁 预览'}</button>
+        <button style={{ ...previewSegmentStyle, ...(view === 'source' ? previewSegmentActiveStyle : {}) }} disabled={loading}
+          aria-pressed={view === 'source'} onClick={() => void open('source')}>{loading ? '完整读取中…' : '</> 源码'}</button>
+        {doc && (preview.isHtml || preview.isMarkdown) && <button style={{ ...previewSegmentStyle, ...(view === 'split' ? previewSegmentActiveStyle : {}) }}
+          aria-pressed={view === 'split'} onClick={() => void open('split')}>并排</button>}
+      </div>
+      {!editing && (!doc || doc.read?.editable) && <button style={button} disabled={loading} onClick={() => void open('source', true)}>✏️ 编辑</button>}
       {doc && <>
-        <button style={button} disabled={saving || !pending && (!doc.dirty || !doc.read?.canSave)} onClick={() => void save()}>{saving ? '保存中…' : pending ? '核对保存' : '保存'}</button>
+        <button style={{ ...button, ...(doc.dirty ? { borderColor: 'var(--theme-accent)', color: 'var(--theme-accent)', background: 'var(--theme-accent-bg)' } : {}) }}
+          disabled={saving || !pending && (!doc.dirty || !doc.read?.canSave)} onClick={() => void save()}>{saving ? '保存中…' : pending ? '核对保存' : '💾 保存'}</button>
+        <WorkbenchOverflow enabled label="文件与草稿操作">
         <button style={button} onClick={() => void exportGeneratedText(text, `${preview.name}.draft.txt`, 'text/plain;charset=utf-8').catch(error => setNotice(String(error)))}>导出草稿</button>
         <button style={button} disabled={saving || pending} onClick={() => void documentStore.open(client.current!, preview.rel, true)
           .then(() => setNotice('已读取最新磁盘版本；未修改当前草稿。')).catch(error => setNotice(String(error)))}>比较磁盘版本</button>
@@ -116,8 +131,12 @@ export const DetachedTextDocument: React.FC<{
             setChoices([]); setNotice('已重新读取原文件。');
           } catch (error) { setNotice(String(error)); }
         }}>重新读取 / 放弃草稿</button>
+        </WorkbenchOverflow>
       </>}
-    </div>
+    </>;
+  return <div style={{ display: 'flex', flex: 1, minHeight: 0, flexDirection: 'column' }}>
+    {toolbarHost ? createPortal(toolbar, toolbarHost) : toolbarHost === undefined
+      ? <div style={{ display: 'flex', gap: 8, padding: '6px 12px', overflowX: 'auto' }}>{toolbar}</div> : null}
     {choices.length > 0 && <div style={{ padding: 8, fontSize: 12 }}>发现其他窗口的草稿：{choices.map(choice => <button key={choice.id} style={button} onClick={() => {
       if (!doc) return;
       void documentDrafts.restore(doc.key, choice, () => alive.current).then(() => setChoices([])).catch(error => setNotice(String(error)));
@@ -138,7 +157,7 @@ export const DetachedTextDocument: React.FC<{
         setNotice('已采用磁盘内容；未写入文件。');
       }}>采用磁盘内容</button>
     </details>}
-    {doc && <div role="status" style={{ padding: '4px 12px', fontSize: 11, color: 'var(--theme-text-muted)' }}>
+    {doc && (view !== 'preview' || doc.dirty || pending) && <div role="status" style={{ padding: '4px 12px', fontSize: 11, color: 'var(--theme-text-muted)' }}>
       {doc.read?.editable ? doc.dirty ? '● 未保存' : '已与原文件保存版本同步' : `只读：${doc.read?.reasonCode || '不支持编辑'}`}
       {doc.dirty && ` · 草稿${doc.persistence === 'saved' ? '已存本设备' : doc.persistence === 'failed' ? '持久化失败，请导出' : '保存中'}`}
       {doc.error && ` · ${doc.error}`}
@@ -149,5 +168,3 @@ export const DetachedTextDocument: React.FC<{
     </div>
   </div>;
 };
-const button: React.CSSProperties = { padding: '5px 9px', border: '1px solid var(--theme-border)', borderRadius: 5,
-  color: 'var(--theme-text)', background: 'var(--theme-bg-secondary)', cursor: 'pointer', fontSize: 12 };

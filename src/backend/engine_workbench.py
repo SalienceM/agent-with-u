@@ -12,7 +12,7 @@ from typing import Any
 import uuid
 
 PROTOCOL_VERSION = 1
-ACTIVITY_KINDS = frozenset({'document-save', 'terminal', 'language-write'})
+ACTIVITY_KINDS = frozenset({'document-save', 'sync-review', 'terminal', 'language-write'})
 
 
 @dataclass(frozen=True)
@@ -157,6 +157,11 @@ class EngineWorkbenchBridge:
                     if job['lease'] is lease:
                         item.update(status=job['receipt']['status'], relativePath=job['receipt']['relativePath'])
                         break
+            if lease.kind == 'sync-review':
+                for job in getattr(self, '_sync_review_jobs', {}).values():
+                    if job['lease'] is lease:
+                        item.update(status=job['receipt']['status'], relativePath=job['receipt']['relativePath'])
+                        break
             result.append(item)
         return result
 
@@ -185,6 +190,7 @@ class EngineWorkbenchBridge:
 
     def _engineering_admit(self, session_id: str, expected: Any,
                            control_revision: int, kind: str) -> EngineeringActivity:
+        getattr(self, '_require_update_work_allowed', lambda: None)()
         registry = self._engineering_registry()
         if kind not in ACTIVITY_KINDS:
             raise WorkbenchError('invalid_activity')

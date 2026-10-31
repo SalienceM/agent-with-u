@@ -8,6 +8,8 @@ import { ActivityBar } from './WorkbenchNavigation';
 import type { SidebarView, WorkbenchTab } from '../utils/workbench';
 import type { SessionViewMetadata, SessionViewMode } from '../utils/sessionWorkbench';
 import { WorkbenchIcon } from './WorkbenchChrome';
+import type { SessionDeletionResult } from '../utils/sessionDeletion';
+import type { FavoritePhase } from '../utils/sessionFavorites';
 
 import { SkillBindingTree } from './SkillBindingTree';
 
@@ -30,6 +32,8 @@ interface Session extends SessionViewMetadata {
   sessionType?: 'normal' | 'loop';
   loopExecutionMode?: 'loop' | 'aimein';
   pinned?: boolean;
+  favoriteStatus?: FavoritePhase;
+  favoriteMessage?: string;
   sidebarColor?: string;
 }
 
@@ -38,6 +42,10 @@ interface Backend {
   label: string;
   type: string;
 }
+
+const favoriteStatusLabel = (phase: FavoritePhase): string => ({
+  pending: '待同步', unknown: '结果未知', conflict: '收藏冲突', unsupported: '仅本设备', blocked: '同步受阻',
+})[phase];
 
 interface Props {
   view?: SidebarView;
@@ -87,6 +95,13 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
   } | null>(null);
   const [sessionToDelete, setSessionToDelete] = useState<Session | null>(null);
   const [sessionToDestroy, setSessionToDestroy] = useState<Session | null>(null);
+  const [deleting, setDeleting] = useState(false);
+  const [deleteResult, setDeleteResult] = useState<SessionDeletionResult | null>(null);
+  const [destroyResult, setDestroyResult] = useState<SessionDeletionResult | null>(null);
+  const [favoriteError, setFavoriteError] = useState('');
+  const managementEpoch = useRef(0);
+  const completedDeletions = useRef(new Set<string>());
+  const deletionBusy = useRef(false);
   const [sessionToConvert, setSessionToConvert] = useState<Session | null>(null);
   const [conversionGoal, setConversionGoal] = useState('');
   const [conversionWorkflow, setConversionWorkflow] = useState('');
@@ -344,6 +359,7 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
       alert(`会话 "${session.title}" 正在进行中，无法删除。请等待完成或停止后再试。`);
       return;
     }
+    setDeleteResult(null);
     setSessionToDelete(session);
   }, [streamingSessions]);
 
@@ -355,39 +371,81 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
     }
     setDestroyConfirmValue('');
     setDestroyError('');
+    setDestroyResult(null);
     setSessionToDestroy(session);
   }, [streamingSessions]);
 
-  const confirmDelete = useCallback(() => {
-    if (sessionToDelete) {
-      const deletedId = sessionToDelete.id;
-      api.deleteSession(deletedId).then(() => {
-        refresh();
-        onDeleteSession?.(deletedId);
-      });
-      setSessionToDelete(null);
+  const completeDeletion = useCallback((id: string, execKey?: string) => {
+    const key = JSON.stringify([execKey, id]);
+    if (completedDeletions.current.has(key)) return;
+    completedDeletions.current.add(key);
+    if (completedDeletions.current.size > 512) completedDeletions.current.delete(completedDeletions.current.values().next().value!);
+    ++refreshGenerationRef.current;
+    setSessions(prev => prev.filter(item => item.id !== id || item.execKey !== execKey));
+    setSessionToDelete(current => current?.id === id && current.execKey === execKey ? null : current);
+    onDeleteSession?.(id);
+  }, [onDeleteSession]);
+
+  const confirmDelete = useCallback(async () => {
+    if (!sessionToDelete || deletionBusy.current || deleteResult?.status === 'unknown') return;
+    const target = sessionToDelete, epoch = managementEpoch.current;
+    deletionBusy.current = true; setDeleting(true); setDeleteResult(null);
+    try {
+      const result = await api.deleteSession(target.id, target.execKey);
+      if (epoch !== managementEpoch.current) return;
+      if (result.status === 'succeeded') completeDeletion(target.id, target.execKey);
+      else setDeleteResult(result);
+    } finally {
+      if (epoch === managementEpoch.current) { deletionBusy.current = false; setDeleting(false); }
     }
-  }, [sessionToDelete, refresh, onDeleteSession]);
+  }, [sessionToDelete, deleteResult, completeDeletion]);
 
   const confirmDestroy = useCallback(async () => {
-    if (!sessionToDestroy || destroyConfirmValue !== '销毁' || destroying) return;
+    if (!sessionToDestroy || destroyConfirmValue !== '销毁' || deletionBusy.current || destroyResult?.status === 'unknown') return;
+    const epoch = managementEpoch.current;
+    deletionBusy.current = true;
     setDestroying(true);
     setDestroyError('');
     const targetId = sessionToDestroy.id;
     try {
-      const result = await api.destroySession(targetId, 'DESTROY');
-      if (result.status !== 'ok') {
+      const result = await api.destroySession(targetId, 'DESTROY', sessionToDestroy.execKey);
+      if (epoch !== managementEpoch.current) return;
+      setDestroyResult(result);
+      if (result.status !== 'succeeded') {
         setDestroyError(result.message || '销毁失败');
         return;
       }
       setSessionToDestroy(null);
       setDestroyConfirmValue('');
-      await refresh();
-      onDeleteSession?.(targetId);
+      completeDeletion(targetId, sessionToDestroy.execKey);
     } finally {
-      setDestroying(false);
+      if (epoch === managementEpoch.current) { deletionBusy.current = false; setDestroying(false); }
     }
-  }, [sessionToDestroy, destroyConfirmValue, destroying, refresh, onDeleteSession]);
+  }, [sessionToDestroy, destroyConfirmValue, destroyResult, completeDeletion]);
+
+  const checkDeletion = useCallback(async (target: Session, destroy = false) => {
+    if (deletionBusy.current) return;
+    const epoch = managementEpoch.current;
+    deletionBusy.current = true;
+    destroy ? setDestroying(true) : setDeleting(true);
+    try {
+      const result = await api.checkSessionDeletion(target.id, target.execKey || '');
+      if (epoch !== managementEpoch.current) return;
+      if (destroy) { setDestroyError(result.message); setDestroyResult({ ...result, status: 'unknown' }); }
+      else if (result.status === 'succeeded') completeDeletion(target.id, target.execKey);
+      else setDeleteResult(result);
+    } finally {
+      if (epoch === managementEpoch.current) { deletionBusy.current = false; setDeleting(false); setDestroying(false); }
+    }
+  }, [completeDeletion]);
+
+  useEffect(() => onCurrentUserChanged((_profile, changed) => {
+    if (!changed) return;
+    ++managementEpoch.current; ++refreshGenerationRef.current;
+    completedDeletions.current.clear(); deletionBusy.current = false;
+    setSessionToDelete(null); setSessionToDestroy(null); setSessionContextMenu(null);
+    setDeleteResult(null); setDestroyResult(null); setDeleting(false); setDestroying(false); setFavoriteError('');
+  }), []);
 
   // ★ 本窗口新建会话时直接插入。createSession 返回的是完整且带节点归属的
   // 最新对象，不再立即整表重拉，避免旧索引把它短暂刷掉。
@@ -429,11 +487,17 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
   useEffect(() => {
     const unsubscribeSession = api.onSessionUpdated((data: any) => {
       const sessionId = data?.sessionId;
+      if (data?.type === 'favorite_storage_error') { setFavoriteError(data.message); return; }
       // 增量事件比任何更早发起的列表请求都新，旧请求完成后不得覆盖它。
-      refreshGenerationRef.current += 1;
+      if (data?.type !== 'favorite_changed') refreshGenerationRef.current += 1;
       let needsRefresh = false;
       if (data?.type === 'session_deleted' && sessionId) {
-        setSessions((prev) => prev.filter((session) => session.id !== sessionId));
+        completeDeletion(sessionId, data.execKey);
+      } else if (data?.type === 'favorite_changed') {
+        setSessions(prev => prev.map(session => {
+          const summary = data.summaries?.find((item: Session) => item.id === session.id && item.execKey === session.execKey);
+          return summary ? { ...session, ...summary } : session;
+        }).sort(sortSessionsByPriority));
       } else if (data?.summary?.id) {
         setSessions((prev) => {
           const index = prev.findIndex((session) => session.id === data.summary.id);
@@ -459,7 +523,15 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
       if (refreshTimerRef.current) clearTimeout(refreshTimerRef.current);
       refreshTimerRef.current = null;
     };
-  }, [scheduleRefresh]);
+  }, [scheduleRefresh, completeDeletion]);
+
+  useEffect(() => {
+    setSessionContextMenu(current => {
+      if (!current) return current;
+      const latest = sessions.find(item => item.id === current.session.id && item.execKey === current.session.execKey);
+      return latest ? { ...current, session: latest } : null;
+    });
+  }, [sessions]);
 
   const getBackendShortLabel = useCallback((backendId: string) => {
     const backend = backends.find((b) => b.id === backendId);
@@ -476,18 +548,34 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
     session: Session,
     patch: { pinned?: boolean; sidebarColor?: string },
   ) => {
-    const previous = { pinned: !!session.pinned, sidebarColor: session.sidebarColor || '' };
+    if (typeof patch.pinned === 'boolean') {
+      const epoch = managementEpoch.current;
+      setFavoriteError('');
+      try { await api.setSessionFavorite(session.id, patch.pinned, session.execKey); }
+      catch (error) { if (epoch === managementEpoch.current) setFavoriteError(`收藏未能保存：${error instanceof Error ? error.message : '本设备存储不可用'}`); }
+      return;
+    }
+    const epoch = managementEpoch.current;
+    const previous = { sidebarColor: session.sidebarColor || '' };
     const applyLocal = (value: { pinned?: boolean; sidebarColor?: string }) => {
       setSessions((current) => current.map((item) => (
-        item.id === session.id ? { ...item, ...value } : item
+        item.id === session.id && item.execKey === session.execKey ? { ...item, ...value } : item
       )).sort(sortSessionsByPriority));
     };
     applyLocal(patch);
     const result = await api.updateSessionAppearance(session.id, patch);
+    if (epoch !== managementEpoch.current) return;
     if (result.status !== 'ok') {
       applyLocal(previous);
       alert(result.message || '会话外观保存失败');
     }
+  }, []);
+
+  const resolveFavorite = useCallback(async (session: Session, choice: 'local' | 'remote' | 'retry') => {
+    const epoch = managementEpoch.current;
+    setFavoriteError('');
+    try { await api.resolveSessionFavorite(session.id, choice, session.execKey); }
+    catch (error) { if (epoch === managementEpoch.current) setFavoriteError(error instanceof Error ? error.message : '收藏核对失败'); }
   }, []);
 
   const openLoopConversion = useCallback((session: Session) => {
@@ -999,6 +1087,13 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
                       {getBackendShortLabel(s.backendId)}
                     </span>
                     {s.pinned && <span style={{ color: '#f5c451', fontSize: 13 }} title="已置顶">★</span>}
+                    {s.favoriteStatus && <button type="button" data-favorite-status={s.favoriteStatus}
+                      aria-label={`收藏状态：${favoriteStatusLabel(s.favoriteStatus)}`}
+                      title={s.favoriteMessage || '本设备已保存；等待原节点同步'}
+                      style={{ border: 0, background: 'transparent', color: 'var(--theme-warning, #b7791f)', cursor: 'pointer', fontSize: 11, padding: 2 }}
+                      onClick={event => { event.stopPropagation(); setSessionContextMenu({ session: s, x: event.clientX, y: event.clientY }); }}>
+                      {favoriteStatusLabel(s.favoriteStatus)}
+                    </button>}
                   </div>
                 </div>
               );
@@ -1020,6 +1115,11 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
         )}
       </div>
       )}
+
+      {favoriteError && <AppModalPortal><div style={overlayStyle}><div role="alertdialog" aria-label="收藏保存失败" style={confirmPanelStyle}>
+        <p role="alert" style={{ fontSize: 13, overflowWrap: 'anywhere' }}>{favoriteError}</p>
+        <button style={cancelBtnStyle} onClick={() => setFavoriteError('')}>知道了</button>
+      </div></div></AppModalPortal>}
 
       {sessionContextMenu && (
         <AppModalPortal>
@@ -1057,6 +1157,19 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
             <span className="awu-session-context-icon">{sessionContextMenu.session.pinned ? '★' : '☆'}</span>
             <span>{sessionContextMenu.session.pinned ? '取消置顶' : '收藏并置顶'}</span>
           </button>
+          {sessionContextMenu.session.favoriteStatus && <>
+            <div style={{ padding: '6px 12px', fontSize: 11, lineHeight: 1.5, whiteSpace: 'normal', overflowWrap: 'anywhere', maxWidth: 260 }}>
+              本设备已保存 · {favoriteStatusLabel(sessionContextMenu.session.favoriteStatus)}<br />
+              {sessionContextMenu.session.favoriteMessage || '所属节点恢复后同步；退出或切换账号会清除未同步选择。'}
+            </div>
+            {(sessionContextMenu.session.favoriteStatus === 'conflict' ? [
+              ['remote', '采用远端收藏值'], ['local', '保留本设备选择并同步'],
+            ] : [['retry', '只读核对并协调收藏']]).map(([choice, label]) => <button type="button" role="menuitem"
+              className="awu-session-context-item" key={choice} onClick={() => {
+                const target = sessionContextMenu.session; setSessionContextMenu(null);
+                void resolveFavorite(target, choice as 'local' | 'remote' | 'retry');
+              }}>{label}</button>)}
+          </>}
           <button
             type="button"
             className="awu-session-context-item"
@@ -1434,7 +1547,7 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
       {/* 删除确认对话框 */}
       {sessionToDelete && (
         <div style={overlayStyle}>
-          <div style={{ ...confirmPanelStyle, animation: 'dialogSlideIn 0.28s cubic-bezier(0.22,0.61,0.36,1)' }} onClick={(e) => e.stopPropagation()}>
+          <div role="dialog" aria-label="确认删除会话" style={{ ...confirmPanelStyle, animation: 'dialogSlideIn 0.28s cubic-bezier(0.22,0.61,0.36,1)' }} onClick={(e) => e.stopPropagation()}>
             <h3 style={{ margin: '0 0 12px 0', fontSize: 16, fontWeight: 600, color: 'var(--theme-text, #1f2328)' }}>
               确认删除会话
             </h3>
@@ -1444,11 +1557,12 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
             <p style={{ fontSize: 12, color: 'var(--theme-text-muted, #656d76)', margin: '0 0 16px 0' }}>
               仅删除会话记录及其 {sessionToDelete.messageCount} 条消息，工作目录和文件会保留。
             </p>
+            {deleteResult && <p role="alert" data-deletion-status={deleteResult.status} style={{ fontSize: 12, color: 'var(--theme-error, #cf222e)', overflowWrap: 'anywhere' }}>{deleteResult.message}</p>}
             <div style={{ display: 'flex', gap: 8 }}>
-              <button onClick={confirmDelete} style={confirmBtnStyle}>
-                删除
-              </button>
-              <button onClick={() => setSessionToDelete(null)} style={cancelBtnStyle}>
+              {deleteResult?.status === 'unknown'
+                ? <button onClick={() => void checkDeletion(sessionToDelete)} disabled={deleting} style={cancelBtnStyle}>只读核对</button>
+                : <button onClick={() => void confirmDelete()} disabled={deleting} style={confirmBtnStyle}>{deleting ? '正在删除…' : '删除'}</button>}
+              <button onClick={() => setSessionToDelete(null)} disabled={deleting} style={cancelBtnStyle}>
                 取消
               </button>
             </div>
@@ -1545,7 +1659,7 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
       {/* 销毁与普通删除严格分离：必须输入中文“销毁”后才能触发执行端目录删除。 */}
       {sessionToDestroy && (
         <div style={overlayStyle}>
-          <div style={{ ...confirmPanelStyle, maxWidth: 460, border: '1px solid rgba(239,68,68,.48)' }} onClick={(e) => e.stopPropagation()}>
+          <div role="dialog" aria-label="销毁 Session 与工作目录" style={{ ...confirmPanelStyle, maxWidth: 460, border: '1px solid rgba(239,68,68,.48)' }} onClick={(e) => e.stopPropagation()}>
             <h3 style={{ margin: '0 0 10px', fontSize: 16, color: 'var(--theme-error, #ef4444)' }}>
               ♨ 销毁 Session 与工作目录
             </h3>
@@ -1559,19 +1673,19 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
             <input
               autoFocus
               value={destroyConfirmValue}
-              onChange={(e) => { setDestroyConfirmValue(e.target.value); setDestroyError(''); }}
+              onChange={(e) => { setDestroyConfirmValue(e.target.value); if (destroyResult?.status !== 'unknown') setDestroyError(''); }}
               onKeyDown={(e) => { if (e.key === 'Enter') void confirmDestroy(); }}
               disabled={destroying}
               style={{ ...renameInputStyle, width: '100%', boxSizing: 'border-box' }}
               placeholder="销毁"
             />
             {destroyError && (
-              <div style={{ marginTop: 9, padding: '7px 9px', borderRadius: 6, background: 'rgba(239,68,68,.10)', color: 'var(--theme-error, #ef4444)', fontSize: 11, lineHeight: 1.5 }}>
+              <div role="alert" style={{ marginTop: 9, padding: '7px 9px', borderRadius: 6, background: 'rgba(239,68,68,.10)', color: 'var(--theme-error, #ef4444)', fontSize: 11, lineHeight: 1.5 }}>
                 {destroyError}
               </div>
             )}
             <div style={{ display: 'flex', gap: 8, marginTop: 15 }}>
-              <button
+              {destroyResult?.status === 'unknown' ? <button disabled={destroying} style={cancelBtnStyle} onClick={() => void checkDeletion(sessionToDestroy, true)}>只读核对</button> : <button
                 onClick={() => void confirmDestroy()}
                 disabled={destroyConfirmValue !== '销毁' || destroying}
                 style={{
@@ -1581,7 +1695,7 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
                 }}
               >
                 {destroying ? '正在销毁…' : '永久销毁'}
-              </button>
+              </button>}
               <button
                 onClick={() => { setSessionToDestroy(null); setDestroyError(''); }}
                 disabled={destroying}
@@ -2035,10 +2149,13 @@ const overlayStyle: React.CSSProperties = {
 };
 
 const confirmPanelStyle: React.CSSProperties = {
+  boxSizing: 'border-box',
+  maxHeight: 'calc(100dvh - 32px)',
+  overflowY: 'auto',
   background: 'var(--theme-panel-solid, var(--theme-bg-secondary, #ffffff))',
   border: '1px solid var(--theme-border, rgba(0,0,0,0.15))',
   borderRadius: 8,
-  padding: 24, width: '90%', maxWidth: 400, maxHeight: '100%', overflowY: 'auto', boxSizing: 'border-box',
+  padding: 24, width: '90%', maxWidth: 400,
   boxShadow: '0 4px 20px rgba(0,0,0,0.15)',
 };
 

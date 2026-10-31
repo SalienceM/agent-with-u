@@ -209,10 +209,11 @@ fn writable(target: &Target, stat: &Metadata) -> bool {
             .is_some_and(|current| stable(stat, &current))
 }
 
-fn snapshot(target: &Target) -> Result<ByteDocument, String> {
+fn snapshot(target: &Target) -> Result<ByteDocument, String> { snapshot_limit(target, MAX_BYTES) }
+fn snapshot_limit(target: &Target, limit: usize) -> Result<ByteDocument, String> {
     let mut file = target.open()?;
     let first = metadata(&file)?;
-    let complete = first.len() <= MAX_BYTES as u64;
+    let complete = first.len() <= limit as u64;
     let mut bytes = Vec::new();
     (&mut file)
         .take(if complete {
@@ -246,6 +247,83 @@ fn snapshot(target: &Target) -> Result<ByteDocument, String> {
 
 pub(super) fn read(dir: &str, binding: &str, rel: &str) -> Result<ByteDocument, String> {
     snapshot(&target(dir, binding, rel)?)
+}
+
+fn review_target(dir: &str, binding: &str, rel: &str, create: bool) -> Result<Option<Target>, String> {
+    let (bound, handle) = root(dir)?;
+    if bound.binding_id != binding { return Err("stale_workspace".into()); }
+    if rel.is_empty() || rel.len() > 4096 || rel.starts_with('/') || rel.contains(['\0', '\\']) { return Err("invalid_path".into()); }
+    let parts: Vec<_> = rel.split('/').collect();
+    if parts.iter().any(|p| p.is_empty() || *p == "." || *p == "..") { return Err("invalid_path".into()); }
+    let mut path = PathBuf::from(bound.canonical_root);
+    let mut parents = vec![(path.clone(), handle)];
+    for part in &parts[..parts.len()-1] {
+        let leaf = name(part.as_ref())?;
+        let parent = parents.last().unwrap().1.as_raw_fd();
+        let handle = match open_at(parent, &leaf, libc::O_RDONLY | libc::O_DIRECTORY) {
+            Ok(handle) => handle,
+            Err(_) if std::io::Error::last_os_error().raw_os_error() == Some(libc::ENOENT) => {
+                if !create { return Ok(None); }
+                if unsafe { libc::mkdirat(parent, leaf.as_ptr(), 0o755) } != 0 && std::io::Error::last_os_error().raw_os_error() != Some(libc::EEXIST) { return Err("write_not_started".into()); }
+                open_at(parent, &leaf, libc::O_RDONLY | libc::O_DIRECTORY)?
+            },
+            Err(error) => return Err(error),
+        };
+        path.push(part);
+        if final_path(&handle)? != path { return Err("path_unverifiable".into()); }
+        parents.push((path.clone(), handle));
+    }
+    let leaf = name(parts.last().unwrap().as_ref())?;
+    path.push(parts.last().unwrap());
+    let target = Target { path, leaf, parents };
+    target.verify()?;
+    Ok(Some(target))
+}
+fn review_kind(target: &Target) -> Result<&'static str, String> {
+    target.verify()?;
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    if unsafe { libc::fstatat(target.parent().as_raw_fd(), target.leaf.as_ptr(), stat.as_mut_ptr(), libc::AT_SYMLINK_NOFOLLOW) } != 0 {
+        return if std::io::Error::last_os_error().raw_os_error() == Some(libc::ENOENT) { Ok("missing") } else { Err("document_unavailable".into()) };
+    }
+    let value = unsafe { stat.assume_init() };
+    match value.st_mode & libc::S_IFMT {
+        libc::S_IFDIR => Ok("directory"), libc::S_IFREG => Ok("file"), _ => Err("linked_path".into()),
+    }
+}
+pub(super) fn review_read(dir: &str, binding: &str, rel: &str) -> Result<ReviewRead, String> {
+    let Some(target) = review_target(dir, binding, rel, false)? else { return Ok(ReviewRead { kind: "missing".into(), document: None }); };
+    let kind = review_kind(&target)?;
+    Ok(ReviewRead { kind: kind.into(), document: if kind == "file" { Some(snapshot_limit(&target, REVIEW_BYTES)?) } else { None } })
+}
+pub(super) fn review_replace(dir: &str, binding: &str, rel: &str, baseline: Option<&Version>, bytes: &[u8]) -> Result<ByteDocument, String> {
+    let observed = review_read(dir, binding, rel)?;
+    if let Some(version) = baseline {
+        if observed.document.as_ref().and_then(|d| d.version.as_ref()) != Some(version) { return Err("disk_conflict".into()); }
+        return replace_limited(dir, binding, rel, version, bytes, &format!(".awu-review-{}.tmp", uuid::Uuid::new_v4()), REVIEW_BYTES, || Ok(()), || Ok(()));
+    }
+    if observed.kind != "missing" { return Err("disk_conflict".into()); }
+    let target = review_target(dir, binding, rel, true)?.ok_or("write_not_started")?;
+    let temp = CString::new(format!(".awu-review-{}.tmp", uuid::Uuid::new_v4())).unwrap();
+    let parent = target.parent().as_raw_fd();
+    let mut created = false;
+    let mut published = false;
+    let result = (|| {
+        let mut file = open_at(parent, &temp, libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL)?;
+        created = true;
+        object_id(&file)?;
+        file.write_all(bytes).and_then(|_| file.sync_all()).map_err(|_| "write_not_started")?;
+        target.verify()?;
+        if unsafe { libc::linkat(parent, temp.as_ptr(), parent, target.leaf.as_ptr(), 0) } != 0 {
+            return Err(if std::io::Error::last_os_error().raw_os_error() == Some(libc::EEXIST) { "disk_conflict" } else { "write_not_started" }.into());
+        }
+        published = true;
+        if unsafe { libc::unlinkat(parent, temp.as_ptr(), 0) } != 0 || unsafe { libc::fsync(parent) } != 0 { return Err("save_result_unverified".into()); }
+        let result = snapshot_limit(&target, REVIEW_BYTES)?;
+        if result.version.as_ref().map(|v| v.sha256.as_str()) != Some(hash(bytes).as_str()) { return Err("save_result_unverified".into()); }
+        Ok(result)
+    })();
+    if created { unsafe { libc::unlinkat(parent, temp.as_ptr(), 0) }; }
+    result.map_err(|e| if published { "save_result_unverified".into() } else { e })
 }
 
 fn copy_attributes(source: &File, destination: &File) -> Result<(), String> {
@@ -361,11 +439,15 @@ fn replace_checked(
     before_commit: impl FnOnce() -> Result<(), String>,
     after_commit: impl FnOnce() -> Result<(), String>,
 ) -> Result<ByteDocument, String> {
-    if bytes.len() > MAX_BYTES {
+    replace_limited(dir, binding, rel, baseline, bytes, temporary, MAX_BYTES, before_commit, after_commit)
+}
+fn replace_limited(dir: &str, binding: &str, rel: &str, baseline: &Version, bytes: &[u8], temporary: &str,
+    limit: usize, before_commit: impl FnOnce() -> Result<(), String>, after_commit: impl FnOnce() -> Result<(), String>) -> Result<ByteDocument, String> {
+    if bytes.len() > limit {
         return Err("write_not_started".into());
     }
     let target = target(dir, binding, rel).map_err(|_| "write_not_started")?;
-    let original = snapshot(&target).map_err(|_| "write_not_started")?;
+    let original = snapshot_limit(&target, limit).map_err(|_| "write_not_started")?;
     if original.version.as_ref() != Some(baseline) {
         return Err("disk_conflict".into());
     }
@@ -394,7 +476,7 @@ fn replace_checked(
         file.sync_all().map_err(|_| "write_not_started")?;
         before_commit()?;
         target.verify()?;
-        let current = snapshot(&target)?;
+        let current = snapshot_limit(&target, limit)?;
         if current.version.as_ref() != Some(baseline) {
             return Err("disk_conflict".into());
         }
@@ -428,7 +510,7 @@ fn replace_checked(
             .sync_all()
             .map_err(|_| "save_result_unverified")?;
         after_commit()?;
-        let saved = snapshot(&target)?;
+        let saved = snapshot_limit(&target, limit)?;
         let committed = saved.version.as_ref().ok_or("save_result_unverified")?;
         if committed.sha256 != hash(bytes) || committed.file_id != temp_id {
             return Err("save_result_unverified".into());

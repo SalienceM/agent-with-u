@@ -1,8 +1,11 @@
 import { activeLoopSeq, type CallDiagnostic } from './loopDiagnostics';
 import type { AimeinRun, AimeinSummary } from '../types/aimein';
 import { goalObservation } from './aimeinWorld';
+import { readCollection, type AimeinDataState } from './aimeinRecordData';
 
 interface RuntimeRecord {
+  aimeinData?: AimeinDataState;
+  detailLoaded?: boolean;
   seq: number; round: number; subStage: string; completed: boolean; error: string; kind?: string; goal?: string; createdAt?: number;
   aimeinRun?: AimeinRun; aimeinSummary?: Pick<AimeinSummary, 'status' | 'message'>;
   orchestration: Array<{ index: number; desc: string; status: string; output: string }>;
@@ -20,12 +23,14 @@ export const aimeinCurrent = <T extends RuntimeRecord,>(state: { loops: T[] }, s
 
 export function aimeinObservation(state: RuntimeState, record: RuntimeRecord | undefined, connected = true) {
   const runtime = aimeinRuntime(state, record, {}, connected);
-  const steps = record?.orchestration || [];
+  const collection = readCollection(record?.orchestration);
+  const steps = collection.items;
+  const stepState = record?.aimeinData?.collections.orchestration || collection.state;
   const saved = steps.filter(step => step.status === 'done' && !!step.output?.trim()).length;
   const failed = steps.filter(step => step.status === 'error').length;
   const waiting = runtime.activeCalls.every(call => !['tools', 'text', 'thinking', 'running', 'local_prepare', 'environment_check'].includes(call.phase));
   const health = !connected ? 'offline' : runtime.historical ? 'history' : runtime.error || failed ? 'attention' : runtime.live ? waiting ? 'waiting' : 'working' : 'idle';
-  return { saved, total: steps.length, failed, coverage: goalObservation(record), health,
+  return { saved, savedKnown: record?.detailLoaded !== false && ['ready', 'empty'].includes(stepState), total: steps.length, stepState, failed, coverage: goalObservation(record), health,
     current: runtime.live ? steps.filter(step => step.status === 'running').map(step => step.desc).join(' · ') || runtime.title : runtime.title,
     issue: runtime.error || (failed ? `${failed} 个执行步骤失败，查看输出后处理。` : ''),
     measurement: '性能 / 效率：未测量' };
@@ -36,7 +41,7 @@ export function aimeinStageLabel(stage: string, record?: RuntimeRecord): string 
   if (stage === 'aimein-plan') return '目标拆解';
   if (stage === 'aimein-prepare') return '步骤编排';
   if (stage.startsWith('aimein-review')) return `评委 ${stage.replace('aimein-review', '')}`;
-  if (stage.startsWith('step')) return record?.orchestration.find(step => `step${step.index}` === stage)?.desc || `执行步骤 ${stage.slice(4)}`;
+  if (stage.startsWith('step')) return readCollection(record?.orchestration).items.find(step => `step${step.index}` === stage)?.desc || `执行步骤 ${stage.slice(4)}`;
   return ({ execute: '建设执行', analysis: '成果核验', done: '本次结束', 'openspec-verify': 'OpenSpec 验证' } as Record<string, string>)[stage] || stage;
 }
 
@@ -54,14 +59,15 @@ export function aimeinRuntime(state: RuntimeState, record: RuntimeRecord | undef
   const activeCalls = live ? calls.filter(call => call.status === 'running') : [];
   const keys = new Set<string>();
   const details = record?.stageDetails || {};
+  const steps = readCollection(record?.orchestration).items;
   Object.keys(details).filter(key => key !== 'openspecSetup').forEach(key => keys.add(key));
   calls.forEach(call => keys.add(call.stage));
   Object.keys(progress).filter(key => record && key.startsWith(`${record.seq}:`)).forEach(key => keys.add(key.slice(key.indexOf(':') + 1)));
-  record?.orchestration.forEach(step => keys.add(`step${step.index}`));
+  steps.forEach(step => keys.add(`step${step.index}`));
   if (!keys.size && record) keys.add(record.subStage || 'prepare');
   const channels: AimeinOutputChannel[] = [...keys].map(id => {
     const call = calls.filter(item => item.stage === id).at(-1);
-    const step = record?.orchestration.find(item => `step${item.index}` === id);
+    const step = steps.find(item => `step${item.index}` === id);
     const saved = details[id]?.rawOutput || details[id]?.partialOutput || step?.output || '';
     const stream = progress[`${record?.seq}:${id}`] || '';
     const active = live && (call?.status === 'running' || step?.status === 'running');

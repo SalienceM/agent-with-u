@@ -89,6 +89,7 @@ def stamp(timestamp: str = "") -> dict[str, str | int]:
         f"__package_version__ = {package_version!r}\n"
         f"__build_id__ = {build_id!r}\n"
         f"__build_sequence__ = {int(timestamp_digits)!r}\n"
+        "__kit_update_protocol__ = 1\n"
         f"__commit__ = {commit!r}\n",
         encoding="utf-8",
     )

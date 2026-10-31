@@ -22,6 +22,7 @@ from . import paths
 RUN_STATUSES = {
     "queued", "running", "waiting_client", "waiting_approval", "evaluating",
     "succeeded", "failed", "error", "cancelled",
+    "handing_off", "waiting_restart", "verifying", "result_unknown",
 }
 FINAL_RUN_STATUSES = {"succeeded", "failed", "error", "cancelled"}
 CONTROL_MODES = {"ai", "human", "shared"}
@@ -31,6 +32,7 @@ KIT_STEP_TYPES = {"command", "file_push", "kit_call", "awu_capability"}
 KIT_STEP_STATUSES = {
     "pending", "running", "waiting_client", "waiting_approval", "succeeded", "failed",
     "error", "cancelled", "skipped",
+    "handing_off", "waiting_restart", "verifying", "result_unknown",
 }
 KIT_GENERATION_STATUSES = {
     "queued", "running", "succeeded", "needs_input", "error", "cancelled",
@@ -882,7 +884,8 @@ class WorkspaceKitState:
 
     def compact(self) -> None:
         """限制 sidecar 增长；保留最近运行及每个数据键的近期版本。"""
-        self.runs = self.runs[-100:]
+        recent = {run.id for run in self.runs[-100:]}
+        self.runs = [run for run in self.runs if run.id in recent or run.status not in FINAL_RUN_STATUSES]
         self.generation_jobs = self.generation_jobs[-10:]
         for kit in self.kits:
             kit.optimization_messages = kit.optimization_messages[-200:]
@@ -944,6 +947,11 @@ class WorkspaceKitStore:
         with self._lock:
             tmp.write_text(payload, encoding="utf-8")
             tmp.replace(target)
+
+    def save_durable(self, state: WorkspaceKitState) -> None:
+        from .kit_update_journal import durable_json
+        with self._lock:
+            durable_json(self._path(state.session_id), state.to_dict())
 
     def delete(self, session_id: str) -> None:
         try:

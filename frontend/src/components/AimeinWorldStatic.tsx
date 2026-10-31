@@ -32,8 +32,8 @@ export const AimeinWorldStatic: React.FC<{
     ...Array.from({ length: reviewerCount }, (_, i) => ({ kind: 'review' as const, name: `评委 ${i + 1}`, x: 41 + i * 15, y: 86, reviewId: run?.reviews[i]?.id || `review${i + 1}` })),
   ];
   const active = (item: typeof items[number]) => selected.kind === item.kind && selected.reviewId === item.reviewId;
-  return <div data-testid="aimein-world-static" style={{ border: '1px solid #385b57', borderRadius: 16, overflow: 'hidden', background: '#112927', color: '#dceddc', ...(contained ? { display: 'flex', flexDirection: 'column', flex: 1, minHeight: 0 } : {}) }}>
-    <div ref={viewport} style={{ position: 'relative', isolation: 'isolate', ...(contained ? { flex: 1, minHeight: 0 } : {}) }}>
+  return <div data-testid="aimein-world-static" style={{ border: '1px solid #385b57', borderRadius: 16, overflow: 'hidden', background: '#112927', color: '#dceddc', ...(contained ? { display: 'flex', flexDirection: 'column', flex: 1, minHeight: compact ? 144 : 0 } : {}) }}>
+    <div ref={viewport} style={{ position: 'relative', isolation: 'isolate', ...(contained ? { flex: 1, minHeight: compact ? 104 : 0 } : {}) }}>
     <div style={contained ? { position: 'absolute', left: '50%', top: '50%', transform: 'translate(-50%, -50%)', width: sceneWidth, aspectRatio: '900 / 530' } : { position: 'relative' }}>
       <svg viewBox="0 0 900 530" role="img" aria-label={`AIMEIN 方块建设场景，目标瓶、功能工坊、基础设施、成果与 ${reviewerCount} 位评委`} style={{ display: 'block', width: '100%' }}>
         <defs>
@@ -98,11 +98,17 @@ export const AimeinWorldStatic: React.FC<{
         <text x="29" y="38" fill="#adccb6" fontSize="12" letterSpacing="4">AIMEIN · BUILDING WORLD</text>
         <text x="29" y="61" fill="#779e88" fontSize="11">保留每一块有依据的成长</text>
       </svg>
-      {items.map(item => <button key={item.name} title={item.name} aria-label={`观察${item.name}`} aria-pressed={active(item)} onClick={() => onSelect({ kind: item.kind, seq: current?.seq || 0, reviewId: item.reviewId })}
-        style={{ position: 'absolute', left: `${item.x}%`, top: `${item.y}%`, transform: 'translate(-50%, -50%)', fontSize: compact ? 9 : 'clamp(9px, 1.1vw, 12px)', padding: compact ? '3px' : '6px 9px', minWidth: compact ? 18 : undefined, borderRadius: 4,
-          background: active(item) ? '#c4dfab' : '#122c29e8', border: `1px solid ${active(item) ? '#e4f4d3' : '#719b80'}`, color: active(item) ? '#173529' : '#e0edd8', cursor: 'pointer', whiteSpace: 'nowrap', boxShadow: '0 3px 0 #071c18aa' }}>{compact ? ({ goal: '瓶', flow: '工', infra: '基', artifact: '果', review: item.name.slice(-1) })[item.kind] : item.name}</button>)}
+      {!compact && items.map(item => <button key={item.name} title={item.name} aria-label={`观察${item.name}`} aria-pressed={active(item)} onClick={() => onSelect({ kind: item.kind, seq: current?.seq || 0, reviewId: item.reviewId })}
+        style={{ position: 'absolute', left: `${item.x}%`, top: `${item.y}%`, transform: 'translate(-50%, -50%)', fontSize: 'clamp(9px, 1.1vw, 12px)', padding: '6px 9px', borderRadius: 4,
+          background: active(item) ? '#c4dfab' : '#122c29e8', border: `1px solid ${active(item) ? '#e4f4d3' : '#719b80'}`, color: active(item) ? '#173529' : '#e0edd8', cursor: 'pointer', whiteSpace: 'nowrap', boxShadow: '0 3px 0 #071c18aa' }}>{item.name}</button>)}
     </div></div>
-    <div style={{ display: 'flex', flexWrap: contained ? 'nowrap' : 'wrap', overflowX: 'auto', whiteSpace: contained ? 'nowrap' : undefined, flexShrink: 0, gap: 6, alignItems: 'center', padding: contained ? '4px 8px' : '12px 16px', borderTop: '1px solid #36554a', fontSize: 11, lineHeight: 1.8 }}>
+    {compact && <nav aria-label="静态场景对象" style={{ display: 'grid', gridTemplateColumns: `repeat(${items.length}, minmax(32px, 1fr))`, gap: 4, padding: 4, overflowX: 'auto', flexShrink: 0 }}>
+      {items.map(item => <button key={item.name} title={item.name} aria-label={`观察${item.name}`} aria-pressed={active(item)} onClick={() => onSelect({ kind: item.kind, seq: current?.seq || 0, reviewId: item.reviewId })}
+        style={{ minHeight: 30, padding: '3px 1px', fontSize: 11, borderRadius: 5, whiteSpace: 'nowrap', cursor: 'pointer', border: '1px solid #719b80', background: active(item) ? '#c4dfab' : '#122c29', color: active(item) ? '#173529' : '#e0edd8' }}>
+        {item.kind === 'review' ? `评${item.name.slice(-1)}` : ({ goal: '目标', flow: '工坊', infra: '基建', artifact: '成果' })[item.kind]}
+      </button>)}
+    </nav>}
+    <div style={{ display: compact ? 'none' : 'flex', flexWrap: contained ? 'nowrap' : 'wrap', overflowX: 'auto', whiteSpace: contained ? 'nowrap' : undefined, flexShrink: 0, gap: 6, alignItems: 'center', padding: contained ? '4px 8px' : '12px 16px', borderTop: '1px solid #36554a', fontSize: 11, lineHeight: 1.8 }}>
       <span style={{ color: '#b8c9ae', marginRight: 'auto' }}>点击场景中的标牌，查看成果与提出建议</span>
       <span>◇ 待核实</span><span style={{ color: '#d7c28c' }}>▣ 已实施</span><span style={{ color: '#a5d5ae' }}>▣ 评审核实</span>
     </div>

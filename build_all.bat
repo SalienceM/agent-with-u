@@ -93,11 +93,8 @@ echo [OK] Build version !DISPLAY_VERSION! ^(package !PACKAGE_VERSION!^)
 :: ============================================================
 echo [1/3] Building Python sidecar...
 echo.
-:: Clean dist directory to force rebuild
-echo [CLEAN] Removing old dist folder...
-rmdir /s /q "dist" 2>nul
-echo [CLEAN] Removing old build folder...
-rmdir /s /q "build" 2>nul
+:: The shared freezer cleans only its own cache/output. build/deepseek-harness
+:: contains required inputs and must survive after dependency preparation.
 python scripts\build_backend_package.py
 if errorlevel 1 ( echo [FAILED] PyInstaller build failed & pause & exit /b 1 )
 python scripts\check_backend_package.py dist\agent-with-u-backend.exe
@@ -177,4 +174,4 @@ echo  ============================================
 echo   Done! Installer is at:
 echo   src-tauri\target\release\bundle\
 echo  ============================================
-pause
+if not defined AWU_KIT_BUILD_RECEIPT pause

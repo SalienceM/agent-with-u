@@ -24,6 +24,7 @@ frontend/public/vendor/docx-preview/
 .DS_Store
 Thumbs.db
 src-tauri/target/
+tools/
 src-tauri/binaries/
 installer/claude-env/
 installer/_staging/

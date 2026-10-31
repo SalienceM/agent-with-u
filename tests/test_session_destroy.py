@@ -3,7 +3,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from src.backend.bridge_ws import BridgeWS
 from src.types import Session
@@ -44,6 +44,40 @@ def _bridge(session: Session, listed=None) -> BridgeWS:
 
 
 class SessionDestroyTests(unittest.IsolatedAsyncioTestCase):
+    def test_ordinary_delete_preserves_workspace_and_emits_once(self) -> None:
+        from src.backend.session_store import SessionStore
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp) / "project"
+            workspace.mkdir()
+            artifact = workspace / "keep.txt"
+            artifact.write_text("keep", encoding="utf-8")
+            with patch("src.backend.session_store.paths.sub", return_value=Path(tmp) / "sessions"):
+                store = SessionStore()
+                session = _session(workspace)
+                store.save(session, async_=False)
+                bridge = _bridge(session)
+                bridge._session_store = store
+                bridge._session_owner_id = Mock(return_value="local")
+                bridge._instance_manager = Mock()
+                bridge._loop_cancel = {}
+                bridge._loop_states = {}
+                bridge._chat_extras = {}
+                bridge._loop_store = Mock()
+                bridge._chat_extras_store = Mock()
+                bridge._kit_store = Mock()
+                bridge._emit_session_updated = Mock()
+                try:
+                    with patch("src.backend.call_trace.clear_traces"):
+                        self.assertTrue(BridgeWS._rpc_deleteSession(bridge, session.id))
+                    self.assertEqual("keep", artifact.read_text(encoding="utf-8"))
+                    self.assertIsNone(store.get_meta(session.id))
+                    bridge._emit_session_updated.assert_called_once_with(
+                        {"type": "session_deleted", "sessionId": session.id}, owner_id="local")
+                finally:
+                    store._io_running = False
+                    if store._index_save_timer:
+                        store._index_save_timer.cancel()
+
     async def test_destroy_removes_workspace_then_session(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             workspace = Path(tmp) / "project"

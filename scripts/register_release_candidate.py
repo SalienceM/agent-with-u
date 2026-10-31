@@ -17,6 +17,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from src.backend.release_center import ReleaseCenterManager  # noqa: E402
+from src.backend.kit_build_receipts import register_build_receipt  # noqa: E402
 
 
 def main() -> int:
@@ -28,6 +29,7 @@ def main() -> int:
 
     result = ReleaseCenterManager().scan_project(args.project_root, args.source)
     candidate = result["candidate"]
+    register_build_receipt(candidate)
     if args.json:
         print(json.dumps(result, ensure_ascii=False, indent=2))
     else:

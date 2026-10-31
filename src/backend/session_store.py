@@ -115,7 +115,8 @@ class SessionStore:
     def list(self) -> list[dict]:
         with self._lock:
             # 返回副本，避免调用方排序/合并时意外改写内存索引。
-            snapshot = [dict(item) for item in self._index.values()]
+            snapshot = [{key: value for key, value in item.items() if not key.startswith("_")}
+                        for item in self._index.values()]
         return sorted(snapshot, key=lambda x: x.get("updatedAt", 0), reverse=True)
 
     def get_meta(self, sid: str) -> Optional[dict]:
@@ -229,7 +230,67 @@ class SessionStore:
         """立即更新会话列表使用的内存索引，不等待后台磁盘 I/O。"""
         meta = session.meta_dict()
         with self._lock:
+            current = self._index.get(session.id, {})
+            # 收藏只有专用提交入口能推进版本；旧正文对象与后台保存不能回滚它。
+            if current.get("favoriteRevision", 0) > 0:
+                for key in ("pinned", "favoriteRevision", "_favoriteReceipt"):
+                    if key in current:
+                        meta[key] = copy.deepcopy(current[key])
+                session.pinned = bool(current.get("pinned"))
+                session.favorite_revision = current["favoriteRevision"]
             self._index[session.id] = meta
+
+    def favorite_state(self, sid: str) -> dict:
+        meta = self.get_meta(sid)
+        if meta is None:
+            return {"status": "not_found", "protocolVersion": 1}
+        receipt = meta.get("_favoriteReceipt") or {}
+        return {"status": "ok", "protocolVersion": 1,
+                "pinned": bool(meta.get("pinned")),
+                "favoriteRevision": meta.get("favoriteRevision", 0),
+                "lastRequestId": receipt.get("requestId", "")}
+
+    def commit_appearance(
+        self, sid: str, patch: dict, *, expected_revision: Optional[int] = None,
+        request_id: str = "",
+    ) -> dict:
+        """收藏字段级 CAS；先提交磁盘，再发布内存。失败无未确认值供 timer 重放。"""
+        with self._index_write_lock:
+            with self._lock:
+                current = copy.deepcopy(self._index.get(sid))
+                if current is None:
+                    return {"status": "not_found", "protocolVersion": 1}
+                revision = current.get("favoriteRevision", 0)
+                receipt = current.get("_favoriteReceipt") or {}
+                signature = {"pinned": patch.get("pinned"), "expectedRevision": expected_revision}
+                if request_id and receipt.get("requestId") == request_id:
+                    if receipt.get("signature") != signature:
+                        return {"status": "error", "message": "requestId 参数不一致"}
+                    return {"status": "ok", "protocolVersion": 1, "pinned": bool(current.get("pinned")),
+                            "favoriteRevision": revision, "lastRequestId": request_id}
+                if expected_revision is not None and revision != expected_revision:
+                    return {"status": "conflict", "protocolVersion": 1,
+                            "pinned": bool(current.get("pinned")), "favoriteRevision": revision}
+                fields = dict(patch)
+                if "pinned" in patch:
+                    # 首次显式提交也建立保护版本，随后相同值不推进。
+                    fields["favoriteRevision"] = revision + int(revision == 0 or patch["pinned"] != bool(current.get("pinned")))
+                    fields["_favoriteReceipt"] = ({"requestId": request_id, "signature": signature} if request_id else {})
+                candidate = {**current, **fields}
+                snapshot = copy.deepcopy(self._index)
+                snapshot[sid] = candidate
+            entries = sorted(snapshot.values(), key=lambda x: x.get("updatedAt", 0), reverse=True)
+            self._atomic_write_text(self._index_path, json.dumps(entries, ensure_ascii=False, indent=2))
+            with self._lock:
+                # 写盘期间其它字段可更新；只安装本次字段，不用整个旧快照回填。
+                latest = self._index.get(sid)
+                if latest is not None:
+                    latest.update(fields)
+                self._index_dirty = self._index != snapshot
+            return {"status": "ok", "protocolVersion": 1,
+                    "pinned": bool(candidate.get("pinned")),
+                    "sidebarColor": candidate.get("sidebarColor", ""),
+                    "favoriteRevision": candidate.get("favoriteRevision", 0), "lastRequestId": request_id}
 
     def save_meta(
         self,
@@ -351,6 +412,7 @@ class SessionStore:
                     else None
                 ),
                 pinned=bool(meta.get("pinned", data.get("pinned", False))),
+                favorite_revision=int(meta.get("favoriteRevision", data.get("favoriteRevision", 0)) or 0),
                 sidebar_color=str(meta.get("sidebarColor", data.get("sidebarColor", "")) or ""),
                 auto_commit=data.get("autoCommit", False),
                 auto_commit_push=data.get("autoCommitPush", False),

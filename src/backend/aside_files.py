@@ -11,7 +11,7 @@ from itertools import islice
 from pathlib import Path
 from typing import Iterator
 
-from .aside_inspection import InspectionError, QueryBudget, QueryIdentity
+from .aside_inspection import InspectionError, QueryBudget, QueryIdentity, budget_error
 
 
 SKIP_DIRS = {'.git', 'node_modules', '__pycache__', 'dist', 'target', '.venv', 'venv'}
@@ -159,42 +159,42 @@ class ReadonlyFiles:
         return path.relative_to(Path(os.path.abspath(self.identity.file_root()))).as_posix()
 
     def directory(self, path: str = '.', offset: int = 0, limit: int = 200) -> dict:
-        self.budget.check()
+        self.budget.check_discovery()
         target = self.path(path)
         limit = min(max(limit, 1), 200)
         if offset > 2000:
-            raise InspectionError('limit', '目录分页范围过大，请缩小查询目录。')
+            raise budget_error('directory_page')
         with secure_open(target, True) as handle:
             with os.scandir(str(target) if os.name == 'nt' else handle) as entries:
                 # 包括过滤项在内有扫描上限，不能为了凑足页无限枚举。
                 page = list(islice(entries, offset, offset + limit + 1))
                 items = []
                 for entry in page[:limit]:
-                    self.budget.check()
+                    self.budget.check_discovery()
                     if sensitive(Path(entry.name)) or entry.name.lower() in SKIP_DIRS:
                         continue
                     info = entry.stat(follow_symlinks=False)
                     if stat.S_ISLNK(info.st_mode) or getattr(info, 'st_file_attributes', 0) & 0x400:
                         continue
                     items.append({'name': entry.name, 'directory': stat.S_ISDIR(info.st_mode)})
-        return {'status': 'ok', 'path': self.relative(target), 'entries': items, 'offset': offset,
+        return {'status': 'ok', 'path': self.relative(target), 'entries': items, 'offset': offset, 'entryCount': len(items),
                 'nextOffset': offset + limit if len(page) > limit else None,
                 'complete': len(page) <= limit and offset == 0, 'readAt': time.time()}
 
     def text(self, path: str, offset: int = 0, limit: int = 16000, revision: str = '',
-             *, whole: bool = False) -> dict:
-        self.budget.check()
+             *, whole: bool = False, search: bool = False) -> dict:
+        self.budget.check_discovery()
         target = self.path(path)
         with secure_open(target, False) as fd:
             before = os.fstat(fd)
             if before.st_size > self.budget.file_bytes:
-                raise InspectionError('limit', '文件超过单文件 256 KiB 上限，请缩小查询目标。')
+                raise budget_error('file_bytes')
             # 重新确认文件签名后才复用本次请求中的原文。
             key = (str(target), before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns)
             cached = self.cache.get(key)
             if cached is None:
-                data = os.read(fd, self.budget.file_bytes + 1)
-                self.budget.bytes(len(data))
+                self.budget.bytes(before.st_size, search=search)
+                data = os.read(fd, before.st_size)
                 after = os.fstat(fd)
                 if (before.st_size, before.st_mtime_ns, before.st_ctime_ns) != (after.st_size, after.st_mtime_ns, after.st_ctime_ns):
                     raise InspectionError('changed', '文件在读取期间变化，未合并不同版本。')
@@ -217,36 +217,56 @@ class ReadonlyFiles:
                 'complete': offset == 0 and end == len(content), 'readAt': time.time()}
 
     def search(self, path: str, query: str, limit: int = 40) -> dict:
+        self.budget.check_discovery()
+        if self.budget.search_exhausted or self.budget.used_search_bytes >= self.budget.search_limit:
+            raise budget_error('search_bytes')
         limit = min(max(limit, 1), 100)
         pending = [path]
         found, visited, directories = [], 0, 0
         limited = False
+        reason = ''
+        stop = False
         while pending and visited < 200 and directories < 40 and len(found) < limit:
             directory = pending.pop(0)
             page = self.directory(directory)
             directories += 1
-            limited |= not page['complete']
+            if not page['complete']:
+                limited, reason = True, 'directory_page'
             for entry in page['entries']:
-                self.budget.check()
+                self.budget.check_discovery()
                 child = (Path(directory) / entry['name']).as_posix()
                 if entry['directory']:
                     pending.append(child)
                     continue
                 if visited >= 200 or len(found) >= limit:
-                    limited = True
+                    limited, reason = True, 'search_scope'
                     break
                 visited += 1
                 try:
-                    document = self.text(child, whole=True)
-                except (InspectionError, OSError):
-                    limited = True
+                    document = self.text(child, whole=True, search=True)
+                except InspectionError as exc:
+                    if exc.code in {'cancelled', 'timeout', 'identity_changed'} or exc.reason == 'answer_reserve':
+                        raise
+                    limited, reason = True, exc.reason or 'unreadable_files'
+                    if exc.reason in {'total_bytes', 'search_bytes'}:
+                        stop = True
+                        break
+                    continue
+                except OSError:
+                    limited, reason = True, 'unreadable_files'
                     continue
                 for number, line in enumerate(document['content'].splitlines(), 1):
                     if query.casefold() in line.casefold():
                         found.append({'path': document['path'], 'line': number, 'text': line[:500],
                                       'revision': document['revision']})
                         if len(found) >= limit:
-                            limited = True
+                            limited, reason = True, 'search_scope'
                             break
+            if stop:
+                break
+        complete = not limited and not pending
+        if not complete and not reason:
+            reason = 'search_scope'
         return {'status': 'ok', 'path': self.relative(self.path(path)), 'matches': found,
-                'visited': visited, 'complete': not limited and not pending, 'readAt': time.time()}
+                'visited': visited, 'matchCount': len(found), 'complete': complete, 'readAt': time.time(),
+                **({'limitReason': reason} if reason else {})}

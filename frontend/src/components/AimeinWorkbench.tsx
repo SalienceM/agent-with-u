@@ -11,6 +11,7 @@ import { AimeinPlayPanel, useAimeinPlay } from './AimeinPlayPanel';
 import type { AimeinPlayState, AimeinTool } from '../utils/aimeinPlay';
 import { goalObservation, planWaitingMessage } from '../utils/aimeinWorld';
 import { AimeinReviewLibrary, aimeinButton as button, aimeinInput as input } from './AimeinReviewLibrary';
+import { aimeinDataMessages } from '../utils/aimeinRecordData';
 
 const muted: React.CSSProperties = { fontSize: 12, lineHeight: 1.8, color: 'var(--theme-text-muted)' };
 const panel: React.CSSProperties = { padding: 18, border: '1px solid var(--theme-border)', borderRadius: 12, background: 'var(--theme-bg-secondary)', minWidth: 0, overflowWrap: 'anywhere' };
@@ -33,11 +34,14 @@ export const AimeinWorkbench: React.FC<{
   const { state, selected, onSelect, onSettings, onFeedback } = props;
   const root = useRef<HTMLDivElement>(null);
   const [compact, setCompact] = useState(false);
+  const [sceneMode, setSceneMode] = useState<'3d' | 'static' | 'fallback'>('3d');
   useEffect(() => { const observer = new ResizeObserver(([entry]) => setCompact(entry.contentRect.width < 600)); if (root.current) observer.observe(root.current); return () => observer.disconnect(); }, []);
   const records = aimeinRecords(state);
   const current = aimeinCurrent(state, selected);
   const runtime = aimeinRuntime(state, current, props.progress, props.connected);
   const summary = current?.aimeinSummary;
+  const dataMessages = aimeinDataMessages(current?.aimeinData, current?.detailLoaded === false && !props.detailError);
+  const reviewState = current?.aimeinData?.collections['summary.reviews'];
   const reviewerCount = summary ? expectedReviewers(summary) : state.policy?.aimeinReviewers?.length || 3;
   const detail = current?.aimeinRun;
   const planMessage = planWaitingMessage(current, state.running && current?.seq === records.at(-1)?.seq);
@@ -92,13 +96,17 @@ export const AimeinWorkbench: React.FC<{
     '--theme-bg-secondary': '#142d2c', '--theme-bg-tertiary': '#1d3730', '--theme-border': '#35574e', '--theme-text-muted': '#9bb7aa', '--theme-accent-bg': '#29483c' } as React.CSSProperties}>
     {props.controls?.(compact)}
     {props.notices}
+    {!!dataMessages.length && <details data-testid="aimein-data-status" style={{ ...muted, color: '#e4c696', padding: '5px 10px', flexShrink: 0 }}>
+      <summary style={{ cursor: 'pointer' }}>部分记录数据待核对 · {dataMessages[0]}</summary>
+      <div style={{ maxHeight: 100, overflow: 'auto' }}>{dataMessages.slice(1).map(message => <div key={message}>{message}</div>)}缺少的数据不计入完成或验收。{props.detailError && <div>{props.detailError} <button style={button} onClick={props.onRetry}>重新读取详情</button></div>}</div>
+    </details>}
     <header style={{ display: props.externalPanel ? 'none' : 'flex', gap: 5, alignItems: 'center', flexShrink: 0, overflowX: 'auto', whiteSpace: 'nowrap' }}>
       {!props.preparation && <nav aria-label="AIMEIN 视图" style={{ display: 'flex', gap: 5 }}>
         {([['live', '运行现场'], ['world', '建设场景'], ['records', '阶段记录'], ['reviewers', '评委工坊']] as const).map(([key, label]) => <button key={key} aria-label={label} style={{ ...button, ...(compact ? { padding: '5px 7px', fontSize: 11 } : {}), background: tab === key ? 'var(--theme-accent-bg)' : 'var(--theme-bg-secondary)', fontWeight: tab === key ? 700 : 400 }} aria-pressed={tab === key} onClick={() => key === 'reviewers' ? openLibrary() : openTab(key)}>{key === 'live' && runtime.live ? '● ' : ''}{compact ? ({ live: '运行', world: '观察', records: '阶段', reviewers: '评委' })[key] : label}</button>)}
       </nav>}
       <button ref={panelToggle} type="button" style={{ ...button, marginLeft: 'auto', ...(compact ? { padding: '5px 7px', fontSize: 11 } : {}) }} aria-expanded={panelOpen && !props.externalPanel} onClick={() => { props.onCloseExternal?.(); setPanelOpen(!panelOpen || !!props.externalPanel); }}>{panelOpen && !props.externalPanel ? '收起面板' : props.preparation ? '继续建设准备' : '展开观察'}</button>
     </header>
-    <AimeinSceneDock live={livePanel} balanced={livePanel} open={panelOpen && !props.externalPanel} scene={<AimeinWorld contained observing={tab === 'live'} reviewerCount={reviewerCount} preparing={!!props.preparation} current={current} selected={anchor} running={runtime.live} latest={current?.seq === records.at(-1)?.seq} goal={runtime.goal} activityLabel={runtime.title} built={records.some(r => r.seq <= (current?.seq || 0) && r.orchestration.some(step => step.status === 'done'))} onSelect={observe}
+    <AimeinSceneDock live={livePanel} balanced={livePanel} sceneMinHeight={compact && sceneMode !== '3d' ? livePanel ? sceneMode === 'fallback' ? 200 : 180 : 244 : 0} open={panelOpen && !props.externalPanel} scene={<AimeinWorld contained onModeChange={setSceneMode} observing={tab === 'live' || props.externalPanel} reviewerCount={reviewerCount} preparing={!!props.preparation} current={current} selected={anchor} running={runtime.live} latest={current?.seq === records.at(-1)?.seq} goal={runtime.goal} activityLabel={runtime.title} built={records.some(r => r.seq <= (current?.seq || 0) && r.orchestration.some(step => step.status === 'done'))} onSelect={observe}
       play={!props.preparation ? { tool: play.tool, targetId: play.targetId, assembled: play.tool === 'assemble' ? play.closure.ids : [], roots: play.draft.ids, onTool: chooseTool, onTarget: chooseTarget, onInspectTarget: id => { play.inspect(id); openTab('world'); },
         footprints: records.slice(-12).map(r => ({ seq: r.seq, title: r.aimeinSummary?.title || '等待规划', accepted: !!r.aimeinSummary?.accepted, saved: r.detailLoaded === false ? null : r.orchestration.filter(s => s.status === 'done' && s.output).length })),
         onHistory: seq => { onSelect(seq); play.setTool('inspect'); openTab('world'); },
@@ -126,7 +134,7 @@ export const AimeinWorkbench: React.FC<{
           <p style={muted}>{summary?.maturityMeaning || '动态拆解目标，让每个阶段都有具体可核实的结果。'}</p><div style={muted}>只针对当前 Sprint 范围，不代表整体完成率。</div>
         </section>
         <section aria-label="评审验收" style={panel}>
-          <div style={muted}>评委席 · 独立观察同版成果</div><h3 style={{ margin: '6px 0 14px', fontSize: 15 }}>{summary?.reviews.filter(r => r.status === 'passed').length || 0} / {reviewerCount || '待确认'} 通过</h3>
+          <div style={muted}>评委席 · 独立观察同版成果</div><h3 style={{ margin: '6px 0 14px', fontSize: 15 }}>{!summary ? '尚未开始评审' : reviewState === 'missing' || reviewState === 'invalid' ? '评审状态待核对' : `${summary.reviews.filter(r => r.status === 'passed').length} / ${reviewerCount || '待确认'} 通过`}</h3>
           {(summary?.reviews || []).map(r => <button key={r.id} style={{ ...button, display: 'block', width: '100%', textAlign: 'left', marginTop: 6 }} onClick={() => observe({ kind: 'review', reviewId: r.id, seq: current!.seq })}>{r.profileName || r.model} <span style={muted}>· {reviewStatus[r.status] || r.status}</span></button>)}
           <p style={muted}>{summary?.message || '可为每个模型建立口味与聚焦档案，逐步积累可校准的经验。'}</p>
         </section>

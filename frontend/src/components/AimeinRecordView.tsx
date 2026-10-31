@@ -17,6 +17,7 @@ export const AimeinRecordView: React.FC<{
   const current = selected?.aimeinSummary?.sprintId ? selected : records.at(-1);
   const run = current?.aimeinSummary;
   const detail = current?.aimeinRun;
+  const reviewState = current?.aimeinData?.collections['summary.reviews'];
   const planMessage = planWaitingMessage(current, state.running && current?.seq === records.at(-1)?.seq);
   const deferred = detail?.plan?.sprint?.deferred || [];
   const stage = !run ? 0 : ['planning', 'preparing'].includes(run.status) ? 1 : run.status === 'executing' ? 2 : 3;
@@ -57,7 +58,7 @@ export const AimeinRecordView: React.FC<{
       </div>
       <section aria-label="评审验收">
         <AimeinReviewSummary summary={run} detail={detail} />
-        <h3 style={{ fontSize: 14, margin: '0 0 10px' }}>评审验收 <span style={muted}>· {run.reviews.filter(r => r.status === 'passed').length} / {run.reviewerCount ?? 3} 通过</span></h3>
+        <h3 style={{ fontSize: 14, margin: '0 0 10px' }}>评审验收 <span style={muted}>· {reviewState === 'missing' || reviewState === 'invalid' ? '评审状态待核对' : `${run.reviews.filter(r => r.status === 'passed').length} / ${run.reviewerCount ?? 3} 通过`}</span></h3>
         <div style={grid}>{run.reviews.map((review, i) => {
           const full = detail?.reviews?.find(r => r.id === review.id);
           const raw = current?.stageDetails?.[`aimein-${review.id}`]?.rawOutput || progress[`${current?.seq}:aimein-${review.id}`];

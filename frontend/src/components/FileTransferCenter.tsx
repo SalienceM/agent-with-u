@@ -1,9 +1,13 @@
-import React, { useEffect, useSyncExternalStore } from 'react';
+import React, { useEffect, useState, useSyncExternalStore } from 'react';
 import { fileTransfers } from '../utils/fileTransfers';
+import { getCurrentUserProfile, onCurrentUserChanged } from '../api';
 
 export const FileTransferCenter: React.FC = () => {
-  const jobs = useSyncExternalStore(fileTransfers.subscribe, fileTransfers.getSnapshot);
-  const running = jobs.some(job => job.status === 'running');
+  const allJobs = useSyncExternalStore(fileTransfers.subscribe, fileTransfers.getSnapshot);
+  const [owner, setOwner] = useState(() => getCurrentUserProfile().userId);
+  useEffect(() => onCurrentUserChanged(profile => setOwner(profile.userId)), []);
+  const jobs = allJobs.filter(job => !job.ownerId || job.ownerId === owner);
+  const running = jobs.some(job => ['running', 'preparing', 'unresolved'].includes(job.status));
   useEffect(() => {
     if (!running) return;
     const warn = (event: BeforeUnloadEvent) => { event.preventDefault(); event.returnValue = ''; };
@@ -16,14 +20,17 @@ export const FileTransferCenter: React.FC = () => {
     padding: 10, borderRadius: 10, background: 'var(--theme-bg-secondary)',
     color: 'var(--theme-text)', border: '1px solid var(--theme-border)', boxShadow: '0 4px 20px #0003' }}>
     <strong>文件传输</strong>
-    <div style={{ fontSize: 11, margin: '4px 0' }}>切换会话可继续；刷新或关闭页面会中断。</div>
+    <div style={{ fontSize: 11, margin: '4px 0' }}>切换会话可继续；关闭页面不代表已提交写入停止。</div>
     {jobs.map(job => <div key={job.id} style={{ padding: '8px 0', borderTop: '1px solid var(--theme-border)', fontSize: 12 }}>
       <div style={{ display: 'flex', gap: 8, justifyContent: 'space-between' }}>
         <span>{job.progress.direction === 'delete' ? '删除执行端' : job.progress.direction === 'push' ? '上传' : '下载'} · {job.label}</span>
-        <button disabled={job.status === 'running' && (job.abort.current || job.progress.direction === 'delete')}
+        {job.protectedReview ? <button disabled={['running','preparing'].includes(job.status)}
+          onClick={() => job.status === 'unresolved' ? void job.reconcile?.() : fileTransfers.dismiss(job)}>
+          {job.status === 'unresolved' ? '核对结果' : ['running','preparing'].includes(job.status) ? '等待确认…' : '关闭'}
+        </button> : <button disabled={job.status === 'running' && (job.abort.current || job.progress.direction === 'delete')}
           onClick={() => job.status === 'running' ? fileTransfers.cancel(job) : fileTransfers.dismiss(job)}>
           {job.status === 'running' ? (job.progress.direction === 'delete' ? '删除中…' : job.abort.current ? '取消中…' : '取消') : '关闭'}
-        </button>
+        </button>}
       </div>
       <div title={job.workspace} style={{ overflowWrap: 'anywhere' }}>{job.progress.rel}</div>
       {job.status === 'running' ? <>
