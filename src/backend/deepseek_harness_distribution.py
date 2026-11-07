@@ -10,7 +10,60 @@ import sys
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-from .deepseek_harness_config import COMMIT, VERSION
+from .deepseek_harness_config import COMMIT, VERSION, RUNTIME_VERSION
+from .deepseek_harness_image_contract import image_resource_contract
+
+IMAGE_CONTRACT_FILE = "image-contract.json"
+BRIDGE_RESOURCE_NAMES = ("lib/index.mjs", "package.json", "UPSTREAM-LICENSE", "THIRD_PARTY_NOTICES.md")
+
+
+def require_image_contract(value: Any) -> None:
+    # JSON 的布尔值不能用 Python 的 True == 1 冒充扩展版本/限额。
+    if json.dumps(value, sort_keys=True, allow_nan=False) != json.dumps(image_resource_contract(), sort_keys=True):
+        raise RuntimeError("Harness 图片资源契约不匹配")
+
+
+def distribution_base() -> Path:
+    return Path(sys._MEIPASS) if getattr(sys, "frozen", False) else Path(__file__).resolve().parents[2]
+
+
+def bundle_directory() -> Path:
+    return distribution_base() / ("deepseek-harness" if getattr(sys, "frozen", False) else "build/deepseek-harness")
+
+
+def verify_image_bridge(entry: Path) -> dict[str, Any]:
+    """只读验证选中的桥；旧文字桥可继续用，但不能取得图片资源资格。"""
+    from .deepseek_harness_state import reject_links
+    try:
+        if entry.name != "index.mjs" or entry.parent.name != "lib":
+            raise ValueError("unexpected bridge layout")
+        folder = entry.parent.parent
+        contract_file = folder / IMAGE_CONTRACT_FILE
+        reject_links(contract_file)
+        if contract_file.stat().st_size > 16 * 1024:
+            raise ValueError("contract too large")
+        record = json.loads(contract_file.read_text(encoding="utf-8"))
+        if (not isinstance(record, dict) or set(record) != {"schema", "contract", "resources"}
+                or type(record["schema"]) is not int or record["schema"] != 1):
+            raise ValueError("contract schema")
+        require_image_contract(record["contract"])
+        resources = record["resources"]
+        if not isinstance(resources, dict) or set(resources) != set(BRIDGE_RESOURCE_NAMES):
+            raise ValueError("contract inventory")
+        for name in BRIDGE_RESOURCE_NAMES:
+            details = resources[name]
+            if (not isinstance(details, dict) or set(details) != {"sha256", "executable"}
+                    or details["executable"] is not False):
+                raise ValueError("contract resource")
+            _verify_file(folder / name, details, folder)
+        package = json.loads((folder / "package.json").read_text(encoding="utf-8"))
+        if (not isinstance(package, dict) or package.get("name") != "@agentwithu/deepseek-harness-bridge"
+                or package.get("version") != RUNTIME_VERSION):
+            raise ValueError("contract package")
+        return record["contract"]
+    except (OSError, ValueError, TypeError, KeyError, RuntimeError):
+        # 不把路径、JSON 或底层异常串到聊天；不执行桥来探测缺失资源。
+        raise RuntimeError("Harness 图片资源缺失或不匹配，禁止提交图片；请重新准备配套桥") from None
 
 
 def _verify_file(path: Path, details: dict[str, Any], root: Path, *, repair_executable: bool = False) -> None:
@@ -37,15 +90,43 @@ def target_platform() -> str:
 
 
 def bundle_manifest() -> tuple[Path, dict[str, Any]]:
-    base = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parents[2]))
-    folder = base / ("deepseek-harness" if getattr(sys, "frozen", False) else "build/deepseek-harness")
+    base = distribution_base()
+    folder = bundle_directory()
     manifest = json.loads((folder / "bundle-manifest.json").read_text(encoding="utf-8"))
     if manifest.get("schema") != 1 or manifest.get("version") != VERSION or manifest.get("commit") != COMMIT:
         raise RuntimeError("Harness 发行清单版本不匹配")
     return base, manifest
 
 
-def verify_bundle(*, repair_executable: bool = False) -> dict[str, Path]:
+def verify_adapter() -> dict[str, Path]:
+    """只验证 AWU 包内轻量层；不导入 runtime-bin、不寻找 Node 或访问网络。"""
+    base, manifest = bundle_manifest()
+    from .deepseek_harness_cli import load_external_contract
+    load_external_contract()
+    if importlib.metadata.version("deepseek-harness-sdk") != VERSION:
+        raise RuntimeError("Harness SDK 版本不匹配")
+    frozen = getattr(sys, "frozen", False)
+    site = Path(importlib.metadata.distribution("deepseek-harness-sdk").locate_file(""))
+    files = {**{name: row for name, row in manifest["platforms"][target_platform()].items()
+                if name.startswith("deepseek_harness_sdk-")}, **manifest["bridge"]}
+    expected = {"deepseek-harness/bridge/" + name for name in (*BRIDGE_RESOURCE_NAMES, IMAGE_CONTRACT_FILE)}
+    if set(manifest["bridge"]) != expected or not any(name.endswith("/METADATA") for name in files):
+        raise RuntimeError("Harness 轻量资源清单缺失")
+    found = {}
+    for name, details in files.items():
+        relative = PurePosixPath(name)
+        if relative.is_absolute() or ".." in relative.parts or "\\" in name or ":" in name:
+            raise RuntimeError("Harness 发行清单路径无效")
+        root = base if frozen else base / "build" if name.startswith("deepseek-harness/") else site
+        path = root.joinpath(*relative.parts)
+        _verify_file(path, details, root)
+        found[name] = path
+    require_image_contract(manifest.get("imageContract"))
+    verify_image_bridge(found["deepseek-harness/bridge/lib/index.mjs"])
+    return found
+
+
+def verify_bundle(*, repair_executable: bool = False, require_images: bool = False) -> dict[str, Path]:
     base, manifest = bundle_manifest()
     target = target_platform()
     frozen = getattr(sys, "frozen", False)
@@ -65,6 +146,12 @@ def verify_bundle(*, repair_executable: bool = False) -> dict[str, Path]:
     for distribution in ("deepseek-harness-sdk", "deepseek-harness-runtime-bin"):
         if importlib.metadata.version(distribution) != VERSION:
             raise RuntimeError("Harness 配套 SDK/runtime 版本不匹配")
+    if require_images or "imageContract" in manifest:
+        require_image_contract(manifest.get("imageContract"))
+        expected = {"deepseek-harness/bridge/" + name for name in (*BRIDGE_RESOURCE_NAMES, IMAGE_CONTRACT_FILE)}
+        if set(manifest["bridge"]) != expected:
+            raise RuntimeError("Harness 图片资源清单缺失或不匹配")
+        verify_image_bridge(found["deepseek-harness/bridge/lib/index.mjs"])
     return found
 
 

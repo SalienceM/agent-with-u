@@ -6,7 +6,7 @@ import time
 from typing import Any, Optional
 
 
-LEDGER_VERSION = 1
+LEDGER_VERSION = 2
 MAX_TREND_EVENTS = 80
 MAX_CONTEXT_EVENTS = 30
 _COUNT_KEYS = (
@@ -20,7 +20,7 @@ _COUNT_KEYS = (
 def _count(value: Any) -> int:
     try:
         return max(0, int(value or 0))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return 0
 
 
@@ -47,6 +47,9 @@ def _empty_ledger() -> dict:
         "cumulativeBaselines": {},
         "events": [],
         "contextEvents": [],
+        "latestContexts": {},
+        "contextScope": "chat",
+        "legacyHistory": False,
     }
 
 
@@ -59,6 +62,12 @@ def _normalize_ledger(raw: Any) -> dict:
     ledger["estimatedTurns"] = _count(source.get("estimatedTurns"))
     ledger["contextEventCount"] = _count(source.get("contextEventCount"))
     ledger["captureEnabled"] = source.get("captureEnabled") is True
+    ledger["legacyHistory"] = source.get("legacyHistory") is True or (
+        source.get("version") == 1 and bool(source.get("actualTurns") or source.get("estimatedTurns")
+                                           or source.get("events") or any(ledger[key] for key in _COUNT_KEYS)))
+    ledger["contextScope"] = source.get("contextScope", "chat")
+    ledger["contextIdentity"] = source.get("contextIdentity")
+    ledger["latestContexts"] = dict(source.get("latestContexts") or {}) if source.get("version") == LEDGER_VERSION else {}
     ledger["cumulativeBaselines"] = {
         str(key): dict(value) for key, value in (source.get("cumulativeBaselines") or {}).items()
         if isinstance(value, dict)
@@ -77,17 +86,26 @@ def _normalize_ledger(raw: Any) -> dict:
 def ensure_session_ledger(session: Any) -> dict:
     """Return a normalized ledger, bootstrapping legacy message usage once."""
     raw = getattr(session, "token_usage", None)
-    if isinstance(raw, dict) and raw.get("version") == LEDGER_VERSION:
+    if isinstance(raw, dict) and raw.get("version") in (1, LEDGER_VERSION):
         ledger = _normalize_ledger(raw)
+        identity = [getattr(session, key, None) or "" for key in ("backend_id", "model_override", "agent_session_id")]
+        if ledger.get("contextIdentity") != identity:
+            ledger["latestContexts"] = {}
+        ledger["contextIdentity"] = identity
+        ledger["contextScope"] = "loop" if getattr(session, "session_type", "normal") == "loop" else "chat"
         session.token_usage = ledger
         return ledger
 
     ledger = _empty_ledger()
+    ledger["contextIdentity"] = [getattr(session, key, None) or "" for key in ("backend_id", "model_override", "agent_session_id")]
+    ledger["contextScope"] = "loop" if getattr(session, "session_type", "normal") == "loop" else "chat"
     session.token_usage = ledger
     for message in getattr(session, "messages", []) or []:
         usage = getattr(message, "usage", None)
         if not isinstance(usage, dict):
             continue
+        if usage.get("usageScope") != "turn":
+            session.token_usage["legacyHistory"] = True
         record_session_usage(
             session,
             usage=usage,
@@ -103,12 +121,18 @@ def ensure_session_ledger(session: Any) -> dict:
 def _normalized_usage(usage: Optional[dict]) -> dict:
     data = usage if isinstance(usage, dict) else {}
     normalized = {key: _count(data.get(key)) for key in _COUNT_KEYS}
-    context_tokens = _count(data.get("contextTokens", data.get("lastInputTokens")))
-    context_window = _count(data.get("contextWindow", data.get("modelContextWindow")))
-    if context_tokens:
+    context_tokens = data.get("contextTokens", data.get("lastInputTokens"))
+    context_window = data.get("contextWindow", data.get("modelContextWindow"))
+    if type(context_tokens) is int and context_tokens >= 0:
         normalized["contextTokens"] = context_tokens
-    if context_window:
+    if type(context_window) is int and context_window > 0:
         normalized["contextWindow"] = context_window
+        normalized["contextWindowSource"] = data.get("contextWindowSource") or "provider"
+    if data.get("contextId") is not None:
+        normalized["contextId"] = str(data["contextId"])[:200]
+    for key in ("usageWarning", "usageScope"):
+        if data.get(key):
+            normalized[key] = str(data[key])[:300]
     if data.get("contextCompacted"):
         normalized["contextCompacted"] = True
     if data.get("cumulative"):
@@ -183,7 +207,8 @@ def record_session_usage(
         return usage_summary(ledger)
 
     normalized = _normalized_usage(usage)
-    actual = bool(normalized.get("reported")) or any(normalized.get(key, 0) for key in _COUNT_KEYS)
+    actual = not (usage or {}).get("estimated") and (
+        bool(normalized.get("reported")) or any(normalized.get(key, 0) for key in _COUNT_KEYS))
     audit = None
     is_qwen = str(normalized.get("usageSource", "")).startswith("qwen-")
     if is_qwen and (normalized.get("providerCumulative") is not None or normalized.get("cumulative")):
@@ -213,7 +238,7 @@ def record_session_usage(
         ledger["cumulativeBaselines"].pop(baseline_key, None)
         ledger["cumulativeBaselines"][baseline_key] = {**totals, "eventId": stable_id}
     ledger["cumulativeBaselines"] = dict(list(ledger["cumulativeBaselines"].items())[-256:])
-    if not actual:
+    if not actual and not (usage or {}).get("estimated"):
         normalized["inputTokens"] = estimate_tokens(prompt_text)
         normalized["outputTokens"] = estimate_tokens(output_text)
     if audit is not None:
@@ -221,24 +246,13 @@ def record_session_usage(
         normalized["qwenAccounting"] = audit
     if context_window and not normalized.get("contextWindow"):
         normalized["contextWindow"] = _count(context_window)
-    if (
-        normalized.get("contextWindow")
-        and not normalized.get("contextTokens")
-        and normalized.get("inputTokens")
-        and normalized["inputTokens"] <= normalized["contextWindow"]
-        and not normalized.get("cumulative")
-        and normalized.get("usageSource") != "qwen-fresh-result"
-    ):
-        # Qwen/OpenAI-compatible usage usually reports the prompt size as inputTokens.
-        # It is useful for warning thresholds, but is labelled approximate because
-        # multi-call agent turns may aggregate more than one request.
-        normalized["contextTokens"] = normalized["inputTokens"]
-        normalized["contextApprox"] = True
+        normalized["contextWindowSource"] = "configured"
+    # 整轮可能有多次请求，累计输入绝不能充当最后一次请求的上下文。
 
     event = {
         "id": stable_id,
         "at": float(timestamp or time.time()),
-        "source": "loop" if source == "loop" else "chat",
+        "source": source if source in {"loop", "followup", "review"} else "chat",
         "stage": str(stage or "reply")[:80],
         "backendId": str(backend_id or ""),
         "model": str(model or "")[:160],
@@ -253,12 +267,9 @@ def record_session_usage(
     context_tokens = _count(event.get("contextTokens"))
     context_limit = _count(event.get("contextWindow"))
     if context_tokens and context_limit:
-        previous = next((
-            item for item in reversed(ledger["events"])
-            if _count(item.get("contextTokens"))
-            and str(item.get("backendId") or "") == event["backendId"]
-            and _count(item.get("contextWindow")) == context_limit
-        ), None)
+        previous = ledger["latestContexts"].get(event["source"])
+        if previous and any(previous.get(key) != event.get(key) for key in ("backendId", "model", "contextId", "contextWindow")):
+            previous = None
         previous_tokens = _count(previous.get("contextTokens")) if previous else 0
         if previous_tokens >= 4096 and context_tokens <= previous_tokens * 0.65:
             event["contextDrop"] = True
@@ -268,6 +279,15 @@ def record_session_usage(
     ledger["actualTurns" if actual else "estimatedTurns"] += 1
     ledger["events"].append(event)
     ledger["events"] = ledger["events"][-MAX_TREND_EVENTS:]
+    # 包括零值/未知值：不得回头捞旧线程、旧模型或辅助调用的上下文。
+    ledger["latestContexts"][event["source"]] = dict(event) if "contextTokens" in event else None
+    if source == "chat" and (
+        (getattr(session, "backend_id", None) and backend_id != session.backend_id)
+        or (getattr(session, "model_override", None) and model != session.model_override)
+        or (getattr(session, "agent_session_id", None) and event.get("contextId")
+            and event["contextId"] != session.agent_session_id)
+    ):
+        ledger["latestContexts"]["chat"] = None
 
     if event.get("contextCompacted"):
         record_context_event(
@@ -276,8 +296,9 @@ def record_session_usage(
             event_id=f"compact:{stable_id}",
             label="模型自动压缩上下文",
             timestamp=event["at"],
+            source=event["source"],
         )
-    return usage_summary(ledger)
+    return usage_summary(session.token_usage)
 
 
 def record_context_event(
@@ -288,6 +309,7 @@ def record_context_event(
     label: str,
     timestamp: Optional[float] = None,
     removed: int = 0,
+    source: Optional[str] = None,
 ) -> dict:
     ledger = ensure_session_ledger(session)
     stable_id = str(event_id or "").strip()
@@ -301,6 +323,10 @@ def record_context_event(
         "removed": _count(removed),
     })
     ledger["contextEventCount"] += 1
+    if source in {"chat", "loop"}:
+        ledger["latestContexts"][source] = None
+    else:
+        ledger["latestContexts"] = {}
     ledger["contextEvents"] = ledger["contextEvents"][-MAX_CONTEXT_EVENTS:]
     return usage_summary(ledger)
 
@@ -308,10 +334,7 @@ def record_context_event(
 def usage_summary(raw: Any) -> dict:
     ledger = _normalize_ledger(raw)
     events = ledger["events"][-24:]
-    latest_context = next((
-        dict(item) for item in reversed(events)
-        if _count(item.get("contextTokens")) and _count(item.get("contextWindow"))
-    ), None)
+    latest_context = ledger["latestContexts"].get(ledger["contextScope"])
     total_turns = ledger["actualTurns"] + ledger["estimatedTurns"]
     return {
         "inputTokens": ledger["inputTokens"],
@@ -328,4 +351,61 @@ def usage_summary(raw: Any) -> dict:
         "contextEventCount": ledger["contextEventCount"],
         "latestContext": latest_context,
         "captureEnabled": ledger.get("captureEnabled", False),
+        "legacyHistory": ledger["legacyHistory"],
     }
+
+
+def turn_usage_from_summary(summary: dict, event_id: str) -> Optional[dict]:
+    """消息脚注保存入账后的本轮值，原生累计值仅保留为审计证据。"""
+    event = next((item for item in summary.get("events", []) if item.get("id") == event_id), None)
+    if event is None:
+        return None
+    return {**{key: value for key, value in event.items()
+               if key not in {"cumulative", "baselineRequired", "id", "at", "source", "stage", "seq"}},
+            "usageScope": "turn"}
+
+
+def merge_call_usage(totals: dict, metadata: dict, incoming: Optional[dict]) -> None:
+    """合并同轮续跑；累计快照替换，普通请求求和，最后一次未知上下文覆盖旧值。"""
+    for key in ("contextTokens", "contextWindow", "contextWindowSource"):
+        metadata.pop(key, None)
+    if not incoming:
+        metadata["usageWarning"] = "部分调用未上报用量；本轮已知计数可能不完整。"
+        return
+    cumulative = bool(incoming.get("cumulative"))
+    previous_cumulative = bool(metadata.get("cumulative"))
+    same_context = incoming.get("contextId") == metadata.get("contextId")
+    had_usage = metadata.get("_hasUsage", False)
+    if had_usage and (cumulative != previous_cumulative or (cumulative and not same_context)):
+        # 不能把不同原生线程的累计快照相减，也不能把累计值和本轮值相加。
+        metadata["_mixedCumulative"] = True
+    for key in _COUNT_KEYS:
+        value = _count(incoming.get(key))
+        totals[key] = value if cumulative else totals[key] + value
+    for key in ("contextTokens", "contextWindow", "contextWindowSource", "contextCompacted", "usageWarning",
+                "cumulative", "contextId", "reported", "baselineRequired", "providerCumulative", "providerUsage",
+                "usageSource", "nativeResumed"):
+        if key in incoming:
+            if key in {"baselineRequired", "nativeResumed"} and had_usage and same_context and key in metadata:
+                continue  # 首次为新线程的续跑仍从零开始，不能误变成“接管旧线程”。
+            metadata[key] = incoming[key]
+        elif key in {"cumulative", "baselineRequired", "providerCumulative", "providerUsage", "contextId", "nativeResumed"}:
+            metadata.pop(key, None)
+    for key in ("usageEventCount", "zeroUsageEventCount", "requestCount"):
+        if key in incoming:
+            metadata[key] = _count(metadata.get(key)) + _count(incoming[key])
+    metadata["_hasUsage"] = True
+
+
+def finish_call_usage(totals: dict, metadata: dict) -> Optional[dict]:
+    if not any(totals.values()) and not metadata.get("reported"):
+        return None
+    result = {**totals, **{key: value for key, value in metadata.items() if not key.startswith("_")}}
+    if metadata.get("_mixedCumulative"):
+        checkpoint = dict(totals) if metadata.get("cumulative") else metadata.get("providerCumulative")
+        result.update({key: 0 for key in _COUNT_KEYS})
+        result.update(reported=False, cumulative=False, usageSource="mixed-cumulative-fallback",
+                      usageWarning="同轮调用切换了累计计数身份/口径，无法可靠差分；本轮使用文本估算，未累加历史快照。")
+        if checkpoint:
+            result["providerCumulative"] = checkpoint
+    return result

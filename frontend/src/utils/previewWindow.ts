@@ -1,10 +1,14 @@
-import { openDetachedWindow } from './detachedWindow';
+import { openDetachedWindow, releaseDetachedWindow } from './detachedWindow';
 import { uuid } from './uuid';
 import type { DocumentPreview } from './documentPreview';
 import type { StructuredPreviewPayload } from '../components/StructuredFilePreview';
 import { normalizeRelativeFilePath } from './fileFocus';
 import type { DocumentClient } from './documentStore';
 import type { DocumentSaveRequest } from './workspaceDocuments';
+import type { PreviewSource } from './previewLifecycle';
+import { samePreviewIdentity } from './previewLifecycle';
+import { registerPreview, removePreviewRegistration } from './previewRegistration';
+import { getPreviewIdentity } from '../api';
 
 export const isPreviewWindow = typeof location !== 'undefined' && new URLSearchParams(location.search).has('filePreview');
 export interface PreviewWindowSnapshot {
@@ -22,6 +26,52 @@ export interface PreviewWindowServices {
   reveal: (rel: string) => Promise<void>;
   review: (rel: string) => Promise<void>;
   structured?: (rel: string) => Promise<StructuredPreviewPayload>;
+}
+
+/** V2：点击栈内先开窗口，来源独立登记；原面板只提供可选 UI 导航。 */
+export function openIndependentPreview(snapshot: PreviewWindowSnapshot, prepare: (id: string) => Promise<PreviewSource>,
+  navigation: Pick<PreviewWindowServices, 'reveal' | 'review'>): { opened: Promise<void>; disposed: Promise<void>; dispose: () => void } {
+  const id = uuid(), channel = new BroadcastChannel(`awu-file-preview-${id}`);
+  let suspended: ReturnType<typeof setTimeout> | undefined;
+  let disposed = false, creationFailed = false, source: PreviewSource | undefined;
+  let settle: (() => void) | undefined, fail: ((reason: Error) => void) | undefined;
+  const ready = new Promise<void>((resolve, reject) => { settle = resolve; fail = reject; });
+  let release: () => void;
+  const released = new Promise<void>(resolve => { release = resolve; });
+  // 即使窗口创建先失败，也观察交接 Promise 的拒绝，避免无主拒绝。
+  void ready.catch(() => {});
+  const timer = setTimeout(() => { fail?.(new Error('独立预览尚未完成初始化，请查看新窗口中的来源状态。')); }, 30000);
+  const dispose = () => { if (disposed) return; disposed = true; fail?.(new Error('原界面已结束初始化协作；文件窗口使用自己的来源继续加载。')); channel.close(); clearTimeout(timer); clearTimeout(suspended); window.removeEventListener('pagehide', dispose); releaseDetachedWindow(`file-preview-${id}`); release(); };
+  channel.onmessage = async ({ data }) => {
+    if (data?.kind === 'resuming') clearTimeout(suspended);
+    else if (data?.kind === 'suspended') { clearTimeout(suspended); suspended = setTimeout(dispose, 30000); }
+    else if (data?.kind === 'initialized') { clearTimeout(timer); clearTimeout(suspended); settle?.(); }
+    else if (data?.kind === 'initializationFailed') { clearTimeout(timer); fail?.(new Error(`独立预览初始化失败：${String(data.message || '来源不可用')}`)); }
+    else if (data?.kind === 'closed') dispose();
+    else if (data?.kind === 'navigate-ui' && source && samePreviewIdentity(source.identity, getPreviewIdentity())
+      && Number.isSafeInteger(data.id) && ['reveal', 'review'].includes(data.method)) {
+      try {
+        const rel = normalizeRelativeFilePath(data.rel); if (!rel) throw new Error('文件路径无效');
+        await navigation[data.method as 'reveal' | 'review'](rel);
+        if (!disposed) channel.postMessage({ kind: 'ui-result', id: data.id });
+      } catch (error) { if (!disposed) channel.postMessage({ kind: 'ui-result', id: data.id, error: String(error) }); }
+    }
+  };
+  window.addEventListener('pagehide', dispose);
+  const url = new URL(location.href); url.search = ''; url.hash = ''; url.searchParams.set('filePreview', id); url.searchParams.set('previewVersion', '2');
+  const created = openDetachedWindow({ label: `file-preview-${id}`, title: `${snapshot.preview.name} · 预览 — AgentWithU`,
+    url: `${url.pathname}${url.search}`, width: 1100, height: 800, minWidth: 400, minHeight: 320 }).catch(async error => {
+      creationFailed = true; if (source) await removePreviewRegistration(id, source.identity).catch(() => {}); throw error;
+    });
+  const prepared = prepare(id).then(async value => {
+    source = value;
+    if (creationFailed) throw new Error('窗口未创建，未登记文件来源');
+    await registerPreview({ source, dark: snapshot.dark, initialView: snapshot.initialView });
+    if (creationFailed) { await removePreviewRegistration(id, source.identity); return; }
+    if (!disposed) channel.postMessage({ kind: 'registered' });
+  }).catch(error => { if (!disposed) channel.postMessage({ kind: 'registrationFailed', message: String(error) }); throw error; });
+  const opened = Promise.all([created, prepared, ready]).then(() => {}).catch(error => { dispose(); throw error; });
+  return { opened, disposed: released, dispose };
 }
 
 /** 窗口传递显示状态；文件操作由原工作区连接执行，保持来源与有版本保存语义。 */

@@ -18,6 +18,7 @@ RUN npm ci
 
 # 再拷源码并构建
 COPY frontend/ ./
+COPY docs/session-scheduled-prompts.md docs/session-scheduled-prompts-release.md /app/docs/
 RUN npm run build
 
 # ── Stage 2：nginx 托管 ──────────────────────────────────────────────

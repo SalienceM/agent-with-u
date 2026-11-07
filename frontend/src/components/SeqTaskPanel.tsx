@@ -24,6 +24,7 @@ export interface SeqTaskT {
   error?: string;
   createdAt?: number;
   syncing?: boolean;
+  scheduleRef?: import('../types/sessionSchedules').ScheduleRef;
 }
 
 interface Props {
@@ -82,6 +83,7 @@ export const SeqTaskPanel: React.FC<Props> = ({
   }, [sessionId]);
 
   const startEdit = useCallback((t: SeqTaskT) => {
+    if (t.scheduleRef) { setMutationError('定时任务请在上方“定时”面板编辑计划或取消本次。'); return; }
     setEditingId(t.id);
     setEditText(t.text);
     setEditImages([]);
@@ -340,9 +342,10 @@ export const SeqTaskPanel: React.FC<Props> = ({
                   onClick={() => { if (['pending', 'error'].includes(t.status) && !t.syncing) startEdit(t); }}
                   title={t.syncing ? '正在同步到执行端' : t.status === 'pending' ? '点击编辑' : '正在引导当前轮'}>
                   <div style={taskLine}>
+                    {t.scheduleRef && <span title={`定时计划 ${t.scheduleRef.scheduleId}；请在定时面板管理`}>定时</span>}
                     <span style={taskText}>{t.text || <span style={{ color: 'var(--theme-text-muted)' }}>（仅附件）</span>}</span>
                     {t.syncing && <span style={syncingBadge}>同步中…</span>}
-                    {!t.syncing && (steeringIds.has(t.id) || t.status === 'steering' || (canSteer && t.status === 'pending')) && (
+                    {!t.syncing && !t.scheduleRef && (steeringIds.has(t.id) || t.status === 'steering' || (canSteer && t.status === 'pending')) && (
                       <button
                         onClick={(event) => {
                           event.stopPropagation();
@@ -382,7 +385,7 @@ export const SeqTaskPanel: React.FC<Props> = ({
                 <button onClick={() => move(i, -1)} disabled={i === 0 || t.status === 'steering' || hasSyncing} style={arrowBtn} title="上移">▲</button>
                 <button onClick={() => move(i, 1)} disabled={i === pending.length - 1 || t.status === 'steering' || hasSyncing} style={arrowBtn} title="下移">▼</button>
               </div>
-              <button onClick={() => void removeTask(t.id)} disabled={t.status === 'steering' || t.syncing} style={removeBtn} title="删除">✕</button>
+              <button onClick={() => void removeTask(t.id)} disabled={!!t.scheduleRef || t.status === 'steering' || t.syncing} style={removeBtn} title={t.scheduleRef ? '请在定时面板取消本次运行' : '删除'}>✕</button>
             </div>
           ))}
 

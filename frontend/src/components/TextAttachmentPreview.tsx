@@ -7,6 +7,7 @@ interface Props {
   onRemove?: (id: string) => void;
   onRestore?: (id: string) => void;
   onUpdate?: (attachment: TextAttachment) => void;
+  onEdit?: (id: string) => void;
 }
 
 function formatChars(size: number): string {
@@ -40,6 +41,7 @@ export const TextAttachmentPreview: React.FC<Props> = ({
   onRemove,
   onRestore,
   onUpdate,
+  onEdit,
 }) => {
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
@@ -79,11 +81,11 @@ export const TextAttachmentPreview: React.FC<Props> = ({
             key={item.id}
             role="button"
             tabIndex={0}
-            onClick={() => setSelectedId(item.id)}
+            onClick={() => onEdit ? onEdit(item.id) : setSelectedId(item.id)}
             onKeyDown={(event) => {
               if (event.key === 'Enter' || event.key === ' ') {
                 event.preventDefault();
-                setSelectedId(item.id);
+                if (onEdit) onEdit(item.id); else setSelectedId(item.id);
               }
             }}
             title="点击查看文本附件"

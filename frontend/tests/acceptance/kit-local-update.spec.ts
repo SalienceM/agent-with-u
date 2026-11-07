@@ -1,6 +1,8 @@
 import { test, expect } from '@playwright/test';
 
-test('local update separates selection, frozen install confirmation and read-only recovery', async ({ page }, testInfo) => {
+for (const capability of ['node.update_local_published', 'node.check_update_local']) {
+test(`${capability} separates selection, frozen install confirmation and read-only recovery`, async ({ page }, testInfo) => {
+  const updateStepIndex = capability === 'node.check_update_local' ? 0 : 1;
   const writes: any[] = [];
   let sid = '';
   let holdConfirmation = false;
@@ -11,7 +13,8 @@ test('local update separates selection, frozen install confirmation and read-onl
   const run: any = { id: 'update-run', kitId: 'combined-kit', status: 'waiting_approval', verdict: '', trigger: 'manual', owner: 'human', inputs: {}, currentStep: 1,
     artifactIds: [], assertions: [], assertionResults: [], stdout: '', stderr: '', error: '', createdAt: 1, startedAt: 1,
     steps: [{ id: 'publish', type: 'awu_capability', target: 'executor', title: '已成功发布', status: 'succeeded', stdout: '', stderr: '', error: '', config: { capability: 'release.publish_latest', capabilityRuntime: { phase: 'succeeded' } } },
-      { id: 'install', type: 'awu_capability', target: 'executor', title: '安装并验收', status: 'waiting_approval', stdout: '', stderr: '', error: '', config: { capability: 'node.update_local_published', capabilityRuntime: runtime } }] };
+      { id: 'install', type: 'awu_capability', target: 'executor', title: '安装并验收', status: 'waiting_approval', stdout: '', stderr: '', error: '', config: { capability, capabilityRuntime: runtime } }] };
+  if (updateStepIndex === 0) { run.steps.shift(); run.currentStep = 0; }
   const kit = { id: 'combined-kit', title: '打包发布本机更新测试', description: '', objective: '', successCriteria: '', safetyConstraints: '', references: [],
     inputs: [], outputs: [], dependencies: [], assertions: [], steps: [], command: '', shell: 'powershell', cwd: '.', timeoutSeconds: 300,
     executionTarget: 'executor', enabled: true, controlMode: 'shared', lastRunId: run.id, versions: [], activeVersionId: '',
@@ -41,9 +44,9 @@ test('local update separates selection, frozen install confirmation and read-onl
           runtime.planFingerprint = 'new-fingerprint';
           reply({ status: 'error', message: '安装计划已过期，请核对新计划' }); push();
         } else if (attempts === 3) reply({ status: 'error', message: '当前用户无设备管理权限' });
-        else { runtime.phase = run.status = run.steps[1].status = 'waiting_restart'; reply({ status: 'ok', run }); push(); }
+        else { runtime.phase = run.status = run.steps[updateStepIndex].status = 'waiting_restart'; reply({ status: 'ok', run }); push(); }
       } else if (frame.method === 'kitUpdateReconcile') {
-        writes.push(frame); runtime.phase = run.status = run.steps[1].status = 'result_unknown';
+        writes.push(frame); runtime.phase = run.status = run.steps[updateStepIndex].status = 'result_unknown';
         runtime.message = '启动验收超时，没有重新安装'; reply({ status: 'ok' }); push();
       } else if (/^(kitRun|kitCancel|kitResume|sendMessage)$/.test(frame.method)) {
         writes.push(frame); reply({ status: 'error', message: 'Forbidden in isolated test' });
@@ -90,13 +93,19 @@ test('local update separates selection, frozen install confirmation and read-onl
   expect(writes).toHaveLength(count);
   await page.getByTitle('Workspace Kits · Session 标准配件（实验）').click();
   await expect(card.getByText('启动验收超时，没有重新安装', { exact: true })).toBeVisible();
-  runtime.phase = run.status = run.steps[1].status = 'failed';
+  runtime.phase = run.status = run.steps[updateStepIndex].status = 'failed';
   runtime.message = '安装失败，发布仍然成功'; push();
   await expect(card.getByText('安装失败，发布仍然成功', { exact: true })).toBeVisible();
-  await expect(panel.getByText('已成功发布', { exact: true }).first()).toBeVisible();
+  if (updateStepIndex === 1) await expect(panel.getByText('已成功发布', { exact: true }).first()).toBeVisible();
+  else {
+    runtime.phase = 'current'; run.status = run.steps[0].status = 'succeeded';
+    runtime.message = '当前无需更新；未安装或重启'; push();
+    await expect(card.getByText('本机更新 · 检查完成，无需更新', { exact: true })).toBeVisible();
+    await expect(card.getByRole('button', { name: /确认安装|只读核对/ })).toHaveCount(0);
+  }
   // 换成另一个真实 run 后，旧卡片状态/反馈不串入。
   run.id = 'new-update-run'; kit.lastRunId = run.id;
-  runtime.phase = run.status = run.steps[1].status = 'waiting_approval'; runtime.message = '新运行待确认'; push();
+  runtime.phase = run.status = run.steps[updateStepIndex].status = 'waiting_approval'; runtime.message = '新运行待确认'; push();
   await expect(card.getByText('新运行待确认', { exact: true })).toBeVisible();
   await expect(card.getByText('安装失败，发布仍然成功', { exact: true })).toHaveCount(0);
   const missingTarget = await page.evaluate(async () => {
@@ -117,3 +126,4 @@ test('local update separates selection, frozen install confirmation and read-onl
   await page.waitForTimeout(400);
   expect(writes).toHaveLength(beforeSwitch);
 });
+}

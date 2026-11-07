@@ -3,11 +3,12 @@ import { api, getCurrentUserProfile } from '../api';
 import { AppModalPortal } from './AppModalPortal';
 import { CallDetailViewer } from './CallDetailViewer';
 import { directionalTokens, tokenCount as count, tokenTrendStats } from '../utils/tokenUsageTrend';
+import { tokenContext } from '../utils/tokenUsageContext';
 
 interface UsageEvent {
   id?: string;
   at?: number;
-  source?: 'chat' | 'loop';
+  source?: 'chat' | 'loop' | 'followup' | 'review';
   stage?: string;
   backendId?: string;
   model?: string;
@@ -21,6 +22,8 @@ interface UsageEvent {
   contextWindow?: number;
   contextApprox?: boolean;
   contextDrop?: boolean;
+  contextWindowSource?: string;
+  usageWarning?: string;
 }
 
 interface ContextEvent {
@@ -46,6 +49,7 @@ export interface TokenUsageSummary {
   contextEventCount?: number;
   latestContext?: UsageEvent | null;
   captureEnabled?: boolean;
+  legacyHistory?: boolean;
 }
 
 interface TokenMonitorPreference {
@@ -73,6 +77,7 @@ function normalizeSummary(value: any): TokenUsageSummary {
   const turnCount = count(value.turnCount) || actualTurns + estimatedTurns;
   return {
     inputTokens: count(value.inputTokens),
+    legacyHistory: value.legacyHistory === true,
     outputTokens: count(value.outputTokens),
     cachedInputTokens: count(value.cachedInputTokens),
     reasoningOutputTokens: count(value.reasoningOutputTokens),
@@ -138,7 +143,7 @@ const STAGE_LABELS: Record<string, string> = {
 function callLabel(event?: UsageEvent): string {
   if (!event) return '暂无调用';
   const stage = STAGE_LABELS[event.stage || ''] || event.stage || '模型调用';
-  return event.source === 'loop' ? `LOOP · ${stage}` : stage;
+  return event.source === 'loop' ? `LOOP · ${stage}` : event.source === 'followup' ? '影子建议（独立调用）' : event.source === 'review' ? '角色评议' : stage;
 }
 
 const UsageLineChart: React.FC<{ events: UsageEvent[]; sessionId: string; detailRevision: number }> = ({ events, sessionId, detailRevision }) => {
@@ -260,6 +265,7 @@ const UsageLineChart: React.FC<{ events: UsageEvent[]; sessionId: string; detail
           <span style={{ color: INPUT_COLOR }}>输入 {exactTokens(count(detail.inputTokens))}</span>
           <span style={{ color: OUTPUT_COLOR }}>输出 {exactTokens(count(detail.outputTokens))}</span>
           <span>合计 {exactTokens(directionalTokens(detail, 'total'))}</span>
+          {detail.usageWarning && <span>{detail.usageWarning}</span>}
         </div>
       </div>
       {detail?.id && <CallDetailViewer key={`${sessionId}:${detail.id}:${detailRevision}`} sessionId={sessionId} eventId={detail.id} />}
@@ -323,10 +329,10 @@ export const TokenUsageMonitor: React.FC<{
     };
   }, [open]);
 
-  const contextTokens = count(summary.latestContext?.contextTokens);
-  const contextWindow = count(summary.latestContext?.contextWindow);
-  const contextPercent = contextTokens && contextWindow
-    ? Math.min(100, Math.round((contextTokens / contextWindow) * 100)) : 0;
+  const context = tokenContext(summary.latestContext);
+  const contextTokens = context.tokens ?? 0;
+  const contextWindow = context.window ?? 0;
+  const contextPercent = context.percent ?? 0;
   const warning = preference.enabled && contextPercent >= preference.warningPercent;
   const inferredDrops = useMemo(
     () => summary.events.filter((event) => event.contextDrop).length,
@@ -384,14 +390,14 @@ export const TokenUsageMonitor: React.FC<{
     <div ref={rootRef} style={placement === 'floating' ? floatingRootStyle : headerRootStyle}
       onClick={(event) => event.stopPropagation()}>
       <button type="button" onClick={() => setOpen((value) => !value)}
-        title={contextPercent
-          ? `当前上下文已使用 ${contextPercent}%，点击查看 Token 详情`
-          : `累计输入 ${exactTokens(summary.inputTokens)}，累计输出 ${exactTokens(summary.outputTokens)}，合计 ${exactTokens(summary.totalTokens)}，点击查看详情`}
+        title={context.tokens !== null
+          ? `${context.label} ${exactTokens(contextTokens)}；${context.percent !== null ? `${contextPercent}%（${context.windowSource}）` : '窗口上限未知'}，点击查看详情`
+          : '上下文尚无有效测量；点击查看独立的累计消耗'}
         style={{ ...triggerStyle, ...(warning ? triggerWarningStyle : {}) }}>
         <span style={triggerDotStyle} />
-        {contextPercent
+        {context.percent !== null
           ? <span><b>上下文</b> {contextPercent}%</span>
-          : <span><b>累计</b> {formatTokens(summary.totalTokens)} Token</span>}
+          : <span><b>上下文</b> {context.tokens !== null ? `${formatTokens(contextTokens)} Token` : '未知'}</span>}
         {warning && <span aria-label="达到预警线">⚠</span>}
       </button>
 
@@ -411,7 +417,7 @@ export const TokenUsageMonitor: React.FC<{
           <div style={overviewGridStyle}>
           <section style={contextSectionStyle}>
             <div style={sectionHeadingStyle}>
-              <span>当前上下文占用</span>
+              <span>{context.label}</span>
               {contextPercent > 0 && (
                 <span style={{
                   ...statusBadgeStyle,
@@ -421,7 +427,7 @@ export const TokenUsageMonitor: React.FC<{
                 </span>
               )}
             </div>
-            {contextTokens && contextWindow ? (
+            {context.percent !== null ? (
               <>
                 <div style={contextLineStyle}>
                   <strong style={{ ...contextPercentStyle, color: warning ? '#f59e0b' : 'var(--theme-text)' }}>
@@ -434,21 +440,19 @@ export const TokenUsageMonitor: React.FC<{
                 </div>
                 <div style={trackStyle}>
                   <div style={{
-                    width: `${contextPercent}%`, height: '100%', borderRadius: 999,
+                    width: `${Math.min(100, contextPercent)}%`, height: '100%', borderRadius: 999,
                     background: warning ? '#f59e0b' : 'linear-gradient(90deg, #22c55e, var(--theme-accent))',
                   }} />
                   {preference.enabled && <span style={{ ...thresholdMarkStyle, left: `${preference.warningPercent}%` }} />}
                 </div>
                 <div style={contextFootStyle}>
-                  <span>{summary.latestContext?.contextApprox ? '近似值：由最近一次输入 Token 推算' : 'Backend 实报的最近上下文'}</span>
+                  <span>最近请求输入 / {context.windowSource}</span>
                   <span>{preference.enabled ? `预警线 ${preference.warningPercent}%` : '预警已关闭'}</span>
                 </div>
                 <div style={contextSourceStyle}>
                   <strong>这个比例从哪里来？</strong>
                   <span>
-                    {summary.latestContext?.contextApprox
-                      ? 'Backend 返回了最近一轮输入 Token，窗口上限来自 Backend 配置；一轮 Agent 任务可能含多次模型请求，所以标记为近似值。'
-                      : 'Backend 在运行时直接上报“最近一次请求的上下文 Token”和“模型窗口上限”；AgentWithU 不根据聊天字数猜测。'}
+                    输入包含缓存命中的 Token，不包含整轮其他请求或历史累计。窗口来源：{context.windowSource}；这是最近请求的测量，不是下一次请求的预测。
                   </span>
                   <code style={contextFormulaStyle}>
                     {contextTokens.toLocaleString()} ÷ {contextWindow.toLocaleString()} = {contextPercent}%
@@ -457,8 +461,8 @@ export const TokenUsageMonitor: React.FC<{
               </>
             ) : (
               <div style={unavailableStyle}>
-                <strong style={unavailableTitleStyle}>暂时无法读取当前上下文占用了多少</strong>
-                <span>当前 Backend 没有同时报告“上下文大小”和“窗口上限”。下面的累计消耗仍可统计，但它不等于当前上下文大小。</span>
+                <strong style={unavailableTitleStyle}>{context.tokens !== null ? `${formatTokens(contextTokens)} Token` : '上下文暂无有效测量'}</strong>
+                <span>{context.tokens !== null ? 'Backend 已报告最近请求的输入量；窗口上限未知，因此不计算占比。' : '当前请求未上报，或上下文已重置、切换；不会沿用旧值。'} 累计消耗另列如下。</span>
               </div>
             )}
           </section>
@@ -476,6 +480,8 @@ export const TokenUsageMonitor: React.FC<{
             <div style={plainExplanationStyle}>
               这是从会话开始到现在所有模型调用的总和，不是模型此刻正在携带的上下文。一个 Agent 任务内部可能调用模型多次，所以累计值可以远大于上下文窗口。
             </div>
+            {summary.legacyHistory && <div style={plainExplanationStyle}>包含旧版统计记录，历史口径未重新核验；原账保留，未清零或补算。</div>}
+            {latestEvent?.usageWarning && <div style={plainExplanationStyle}>{latestEvent.usageWarning}</div>}
             <div style={metricGridStyle}>
               <div aria-label="累计输入统计" style={{ ...metricStyle, color: INPUT_COLOR }} title={exactTokens(summary.inputTokens)}><span>累计输入</span><strong style={directionValueStyle}>{formatTokens(summary.inputTokens)}</strong><span>Token · 发给模型</span></div>
               <div aria-label="累计输出统计" style={{ ...metricStyle, color: OUTPUT_COLOR }} title={exactTokens(summary.outputTokens)}><span>累计输出</span><strong style={directionValueStyle}>{formatTokens(summary.outputTokens)}</strong><span>Token · 模型生成</span></div>

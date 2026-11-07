@@ -6,9 +6,13 @@ import zipfile
 import json
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
-from prepare_deepseek_harness import load_lock, verify_source
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+from scripts.prepare_deepseek_harness import load_lock, verify_source
+from scripts.harness_image_resources import verify_source_contracts, write_bridge_contract
 
 
 def main() -> None:
@@ -24,6 +28,7 @@ def main() -> None:
     if version != "v" + lock["toolchain"]["node"]:
         raise ValueError("Use the locked Node build toolchain")
     root = Path(__file__).resolve().parents[1]
+    verify_source_contracts(root, args.node)
     package = root / "tools/deepseek-harness"
     if json.loads((package / "package.json").read_text())["version"] != lock["version"]:
         raise ValueError("AWU bridge version must match SDK/runtime")
@@ -41,6 +46,8 @@ def main() -> None:
         f"--alias:@deepseek-ai/dsh-sdk-jsonrpc-server={args.source.resolve() / 'packages/sdk/server/src/index.ts'}",
         f"--alias:@deepseek-ai/dsh-sdk-protocol={args.source.resolve() / 'packages/sdk/protocol/src/index.ts'}",
         f"--alias:@deepseek-ai/dsh-mcp-client={args.source.resolve() / 'packages/mcp/mcp-client/src/index.ts'}",
+        f"--alias:@deepseek-ai/dsh-llm-deepseek={args.source.resolve() / 'packages/llm/llm-deepseek/src/index.ts'}",
+        f"--alias:@deepseek-ai/dsh-llm={args.source.resolve() / 'packages/llm/llm/src/index.ts'}",
     ], check=True)
     shutil.copyfile(package / "package.json", output / "package.json")
     shutil.copyfile(args.source / "LICENSE", output / "UPSTREAM-LICENSE")
@@ -49,6 +56,7 @@ def main() -> None:
     with zipfile.ZipFile(wheel) as archive:
         name = next(name for name in archive.namelist() if name.endswith("/licenses/THIRD_PARTY_NOTICES.md"))
         (output / "THIRD_PARTY_NOTICES.md").write_bytes(archive.read(name))
+    write_bridge_contract(output, args.node)
     print(output / "lib/index.mjs")
 
 

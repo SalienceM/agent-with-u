@@ -193,7 +193,7 @@ class FileTransferTests(unittest.TestCase):
 
     def test_dispatch_runs_workspace_scans_off_event_loop(self) -> None:
         self.bridge._ensure_kit_scheduler = Mock()
-        for method in ("syncManifest", "syncFileList", "syncFileSearch"):
+        for method in ("syncManifest", "syncScopedManifest", "syncFileList", "syncFileSearch"):
             with self.subTest(method=method):
                 entered = __import__('threading').Event()
                 release = __import__('threading').Event()

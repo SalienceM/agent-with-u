@@ -110,7 +110,7 @@ export const DirectorySyncReviewPanel: React.FC<DirectorySyncReviewProps> = prop
         <div>本机副本：{props.localLabel}</div><div>执行端：{props.remoteLabel} · {snapshot.scope.workspace.workingDir}</div>
         <div>比对时间 {new Date(snapshot.comparedAt).toLocaleTimeString()} · 只读对比，整文件选择；非逐行合并</div>
         <div role="status">已处理 {reviewed}/{review.queue.entries.length} 项（含跳过，跳过不等于同步）{reviewed > 0 && reviewed === review.queue.entries.length ? ' · 本轮审阅已完成，可返回任意文件查看' : ''}</div>
-        {props.onlyDifferent && <div>仅不同：两端都存在且内容不同，不含仅本机／仅执行端文件</div>}
+        {props.onlyDifferent && <div>仅不同：包含仅本机、仅执行端及两端内容不同的文件</div>}
       </div>
       <div style={{ display: 'flex', flexDirection: narrow ? 'column' : 'row', flex: 1, minHeight: 0 }}>
         {listOpen && <aside aria-label="差异文件列表" style={{ width: narrow ? '100%' : 240, flexShrink: 0, maxHeight: narrow ? 185 : undefined,

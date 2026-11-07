@@ -23,7 +23,8 @@ export const DetachedTextDocument: React.FC<{
   initialView?: 'preview' | 'source' | 'split';
   toolbarHost?: HTMLElement | null;
   onDocumentState?: (state: { dirty: boolean; editing: boolean }) => void;
-}> = ({ preview, dark, client: connect, renderPreview, onSaved, initialView = 'preview', toolbarHost, onDocumentState }) => {
+  ioAvailable?: boolean;
+}> = ({ preview, dark, client: connect, renderPreview, onSaved, initialView = 'preview', toolbarHost, onDocumentState, ioAvailable = true }) => {
   const [view, setView] = useState<'preview' | 'source' | 'split'>(initialView);
   const [editing, setEditing] = useState(initialView !== 'preview');
   const [key, setKey] = useState('');
@@ -65,6 +66,7 @@ export const DetachedTextDocument: React.FC<{
   const open = async (next: 'source' | 'split', edit = editing) => {
     if (loading) return;
     if (doc) { setView(next); setEditing(edit && !!doc.read?.editable); return; }
+    if (!ioAvailable) { setNotice('来源离线，请先重新连接。已加载文本仍可阅读。'); return; }
     setLoading(true); setNotice('');
     try {
       const connected = await connect();
@@ -82,7 +84,7 @@ export const DetachedTextDocument: React.FC<{
     finally { if (alive.current) setLoading(false); }
   };
   const save = async () => {
-    if (!doc || !client.current || saving) return;
+    if (!doc || !client.current || saving || !ioAvailable) return;
     setSaving(true); setNotice('');
     try {
       const receipt = pending ? await documentStore.reconcile(client.current, doc.key) : await documentStore.save(client.current, doc.key);
@@ -118,12 +120,12 @@ export const DetachedTextDocument: React.FC<{
       {!editing && (!doc || doc.read?.editable) && <button style={button} disabled={loading} onClick={() => void open('source', true)}>✏️ 编辑</button>}
       {doc && <>
         <button style={{ ...button, ...(doc.dirty ? { borderColor: 'var(--theme-accent)', color: 'var(--theme-accent)', background: 'var(--theme-accent-bg)' } : {}) }}
-          disabled={saving || !pending && (!doc.dirty || !doc.read?.canSave)} onClick={() => void save()}>{saving ? '保存中…' : pending ? '核对保存' : '💾 保存'}</button>
+          disabled={!ioAvailable || saving || !pending && (!doc.dirty || !doc.read?.canSave)} onClick={() => void save()}>{saving ? '保存中…' : pending ? '核对保存' : '💾 保存'}</button>
         <WorkbenchOverflow enabled label="文件与草稿操作">
         <button style={button} onClick={() => void exportGeneratedText(text, `${preview.name}.draft.txt`, 'text/plain;charset=utf-8').catch(error => setNotice(String(error)))}>导出草稿</button>
-        <button style={button} disabled={saving || pending} onClick={() => void documentStore.open(client.current!, preview.rel, true)
+        <button style={button} disabled={!ioAvailable || saving || pending} onClick={() => void documentStore.open(client.current!, preview.rel, true)
           .then(() => setNotice('已读取最新磁盘版本；未修改当前草稿。')).catch(error => setNotice(String(error)))}>比较磁盘版本</button>
-        <button style={button} disabled={saving || pending} onClick={async () => {
+        <button style={button} disabled={!ioAvailable || saving || pending} onClick={async () => {
           if (doc.dirty && !window.confirm('放弃此窗口未保存的草稿并重新读取原文件？')) return;
           try {
             await documentDrafts.discard(doc.key);

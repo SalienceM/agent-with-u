@@ -22,6 +22,35 @@ class JournalError(RuntimeError):
     pass
 
 
+class NormalUpdateLease:
+    """普通更新准备的进程锁；进程退出由 OS 释放，不能按超时猜测任务已结束。"""
+    def __init__(self, folder: Path):
+        self.stream = (folder / 'normal-preparation.lock').open('a+b')
+        try:
+            if os.name == 'nt':
+                import msvcrt
+                self.stream.seek(0, os.SEEK_END)
+                if not self.stream.tell():
+                    self.stream.write(b'\0')
+                    self.stream.flush()
+                self.stream.seek(0)
+                msvcrt.locking(self.stream.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(self.stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as error:
+            self.stream.close()
+            raise JournalError('另一个进程仍在准备更新，请稍后查看原任务。') from error
+
+    def close(self) -> None:
+        stream = getattr(self, 'stream', None)
+        if stream is not None:
+            stream.close()
+
+    def __del__(self) -> None:
+        self.close()
+
+
 def fingerprint(value: dict[str, Any]) -> str:
     return hashlib.sha256(json.dumps(value, ensure_ascii=False, sort_keys=True,
                                      separators=(",", ":")).encode("utf-8")).hexdigest()

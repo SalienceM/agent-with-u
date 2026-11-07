@@ -6,6 +6,7 @@ export interface ReviewScope {
   execKey: string;
   bindingId: string;
   includeGitMetadata: boolean;
+  scanRulesKey?: string;
 }
 export interface ReviewMeta { hash: string; size: number; mtime?: number; kind?: 'file' | 'directory' }
 export type ReviewManifest = Readonly<Record<string, Readonly<ReviewMeta>>>;
@@ -42,12 +43,12 @@ export const REVIEW_PAGE_SIZE = 100;
 export function reviewScopeKey(scope: ReviewScope): string {
   const w = scope.workspace;
   return JSON.stringify([w.ownerId, scope.execKey, w.sessionId, w.executorInstance,
-    w.workspaceRevision, w.workingDir, scope.bindingId, scope.includeGitMetadata]);
+    w.workspaceRevision, w.workingDir, scope.bindingId, scope.includeGitMetadata, ...(scope.scanRulesKey ? [scope.scanRulesKey] : [])]);
 }
 export function reviewBaselineKey(scope: ReviewScope): string {
   const w = scope.workspace;
   return `awu-sync-review-v1:${JSON.stringify([w.ownerId, scope.execKey, w.sessionId,
-    w.workingDir, scope.bindingId, scope.includeGitMetadata])}`;
+    w.workingDir, scope.bindingId, scope.includeGitMetadata, ...(scope.scanRulesKey ? [scope.scanRulesKey] : [])])}`;
 }
 interface BaselineStorage { getItem(key: string): string | null; setItem(key: string, value: string): void }
 export function loadReviewBaseline(scope: ReviewScope, storage: Pick<BaselineStorage, 'getItem'>): ReviewManifest {
@@ -119,14 +120,26 @@ function directories(manifest: ReviewManifest): Set<string> {
   }
   return dirs;
 }
+/** 单端存在（包括空文件）也是差异；未取得另一端清单不等于该端为空。 */
+function isFileDifference(local?: Readonly<ReviewMeta>, remote?: Readonly<ReviewMeta>): boolean {
+  if ((!local || local.kind === 'directory') && (!remote || remote.kind === 'directory')) return false;
+  if (!local || !remote || local.kind === 'directory' || remote.kind === 'directory') return true;
+  return local.size !== remote.size || !!(local.hash && remote.hash && local.hash !== remote.hash);
+}
+export function fileDifferencePaths(local: ReviewManifest | null, remote: ReviewManifest | null): Set<string> {
+  const paths = new Set<string>();
+  if (!local || !remote) return paths;
+  for (const path of new Set([...Object.keys(local), ...Object.keys(remote)])) {
+    if (isFileDifference(local[path], remote[path])) paths.add(path);
+  }
+  return paths;
+}
 export function createReviewQueue(snapshot: CompareSnapshot, subtree = '', selected?: string, onlyDifferent = false): ReviewQueue {
   const localDirs = directories(snapshot.local), remoteDirs = directories(snapshot.remote);
   const entries: ReviewEntry[] = [];
   for (const path of new Set([...Object.keys(snapshot.local), ...Object.keys(snapshot.remote)])) {
     if (!withinReviewPath(path, subtree)) continue;
     const l = snapshot.local[path], r = snapshot.remote[path], b = snapshot.baseline[path];
-    // 与文件树“仅不同”同口径：两端都存在且哈希不同，不混入单端新增。
-    if (onlyDifferent && (!l || !r || l.hash === r.hash)) continue;
     if ((!l || l.kind === 'directory') && (!r || r.kind === 'directory')) continue;
     const typeConflict = (!!l && l.kind !== 'directory' && remoteDirs.has(path))
       || (!!r && r.kind !== 'directory' && localDirs.has(path))
@@ -135,6 +148,8 @@ export function createReviewQueue(snapshot: CompareSnapshot, subtree = '', selec
         return (!!snapshot.local[parent] && snapshot.local[parent].kind !== 'directory')
           || (!!snapshot.remote[parent] && snapshot.remote[parent].kind !== 'directory');
       });
+    // 与文件树同口径：单端文件、内容差异和类型冲突均保留。
+    if (onlyDifferent && !typeConflict && !isFileDifference(l, r)) continue;
     if (!typeConflict && l && r && l.hash && l.hash === r.hash && l.size === r.size) continue;
     entries.push({ path, typeConflict, conflict: typeConflict || !!(b?.hash && l?.hash && r?.hash
       && l.hash !== b.hash && r.hash !== b.hash && l.hash !== r.hash), status: 'pending' });

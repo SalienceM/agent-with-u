@@ -582,6 +582,7 @@ async def main():
         if relay_status.get("lastError"):
             logging.error("[ws_main] Relay node pending: %s", relay_status["lastError"])
 
+    await bridge._session_prompt_scheduler.start()
     await bridge._sequence_scheduler.start()
     logging.info("[ws_main] Ready.")
     try:
@@ -589,6 +590,7 @@ async def main():
             await asyncio.Future()  # 永久运行直到进程被终止
     finally:
         await bridge._sequence_scheduler.stop()
+        await bridge._session_prompt_scheduler.stop()
         await relay_manager.stop()
 
 

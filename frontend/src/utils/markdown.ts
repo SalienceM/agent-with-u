@@ -1,6 +1,6 @@
 /**
  * Markdown → HTML using marked v9 + highlight.js
- * CSS 类替代 inline style，配合 App.tsx 注入的 .md-content 样式表自动适配主题
+ * CSS 类替代 inline style，配合 MarkdownStyles 的共享样式自动适配主题
  *
  * marked v9 renderer 使用位置参数（非 token 对象），适配该版本 API
  */
@@ -10,15 +10,21 @@ import hljs from 'highlight.js';
 // ── 自定义渲染器（marked v9 positional-arg API）───────────────
 const renderer = new Renderer();
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-(renderer as any).code = function (code: string, lang: string | undefined): string {
+renderer.code = function (code: string, info: string | undefined): string {
   const safeCode = code ?? '';
-  const validLang = lang && hljs.getLanguage(lang) ? lang : null;
-  const highlighted = validLang
-    ? hljs.highlight(safeCode, { language: validLang }).value
-    : safeCode.length > 0 ? hljs.highlightAuto(safeCode).value : safeCode;
-  const langLabel = lang ? `<div class="md-code-lang">${lang}</div>` : '';
-  return `<pre class="md-pre"><code class="hljs">${langLabel}${highlighted}</code></pre>\n`;
+  const lang = (info || '').trim().split(/\s+/, 1)[0];
+  let highlighted = escapeHtml(safeCode);
+  try {
+    if (lang && hljs.getLanguage(lang)) {
+      highlighted = hljs.highlight(safeCode, { language: lang }).value;
+    } else if (!lang && safeCode) {
+      highlighted = hljs.highlightAuto(safeCode).value;
+    }
+  } catch {
+    // 高亮失败只降级当前代码块；未知显式语言不自动猜测成其他语言。
+  }
+  const langLabel = info ? `<span class="md-code-lang">${escapeHtml(info)}</span>` : '';
+  return `<pre class="md-pre">${langLabel}<code class="hljs">${highlighted}</code></pre>\n`;
 };
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -27,8 +33,8 @@ const renderer = new Renderer();
 };
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-(renderer as any).link = function (href: string, _title: string | null, text: string): string {
-  return `<a href="${href}" target="_blank" rel="noopener" class="md-link">${text}</a>`;
+(renderer as any).link = function (href: string, title: string | null, text: string): string {
+  return `<a href="${escapeMarkedAttribute(href)}"${titleAttribute(title)} target="_blank" rel="noopener" class="md-link">${text}</a>`;
 };
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -46,6 +52,13 @@ const renderer = new Renderer();
   return `<blockquote class="md-blockquote">${quote}</blockquote>\n`;
 };
 
+renderer.table = function (header: string, body: string): string {
+  return '<div class="md-table-wrap" role="region" aria-label="表格（可横向滚动）" tabindex="0">'
+    + `<table class="md-table">\n<thead>\n${header}</thead>\n`
+    + (body ? `<tbody>${body}</tbody>` : '')
+    + '</table></div>\n';
+};
+
 /**
  * 后端把 Skill 生成的图片 URL 写成 .../api/skill-images/<文件名>。
  * C–C/S 架构下没有共享的 /api/ 反代（执行节点可能在中继另一端），所以
@@ -59,12 +72,13 @@ function skillImageFilename(href: string): string | null {
 }
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-(renderer as any).image = function (href: string, _title: string | null, text: string): string {
+(renderer as any).image = function (href: string, title: string | null, text: string): string {
   const file = skillImageFilename(href);
+  const metadata = `alt="${escapeMarkedAttribute(text || '')}"${titleAttribute(title)}`;
   if (file) {
-    return `<img data-skill-file="${file}" alt="${text || ''}" class="md-img skill-img" />\n`;
+    return `<img data-skill-file="${escapeMarkedAttribute(file)}" ${metadata} class="md-img skill-img" />\n`;
   }
-  return `<img src="${href}" alt="${text || ''}" loading="lazy" class="md-img" />\n`;
+  return `<img src="${escapeMarkedAttribute(href)}" ${metadata} loading="lazy" class="md-img" />\n`;
 };
 
 marked.use({
@@ -77,6 +91,8 @@ interface ProtectedInlineImage {
   placeholder: string;
   dataUri: string;
   alt: string;
+  title: string | null;
+  original: string;
 }
 
 const INLINE_IMAGE_MIME_TYPES = new Set([
@@ -93,6 +109,17 @@ function escapeHtml(value: string): string {
     .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;')
     .replace(/'/g, '&#39;');
+}
+
+// marked v9 已转义 title/alt 中的实体；仅转义裸字符，防止二次编码。
+function escapeMarkedAttribute(value: string): string {
+  return value.replace(/&(?!(?:#\d+|#x[\da-f]+|[a-z][\da-z]*);)/gi, '&amp;')
+    .replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
+function titleAttribute(title: string | null): string {
+  return title == null ? '' : ` title="${escapeMarkedAttribute(title)}"`;
 }
 
 function isBase64Payload(value: string, start: number, end: number): boolean {
@@ -143,7 +170,7 @@ function protectInlineDataImages(src: string): {
       searchFrom = dataMarker + 2;
       continue;
     }
-    const close = src.indexOf(')', base64Marker + 8);
+    let close = src.indexOf(')', base64Marker + 8);
     if (close < 0) {
       // 未闭合的巨型 data URI 同样不能交给 marked；截掉剩余损坏载荷。
       chunks.push(src.slice(cursor, imageStart), '[内联图片数据不完整，无法显示]');
@@ -155,19 +182,50 @@ function protectInlineDataImages(src: string): {
     chunks.push(src.slice(cursor, imageStart));
     const mime = src.slice(uriStart + 5, base64Marker).toLowerCase();
     const payloadStart = base64Marker + 8;
-    const payloadLength = close - payloadStart;
+    let payloadEnd = close;
+    let title: string | null = null;
+    // 标题不属于 Base64 载荷。线性扫描后缀，避免把巨型 URI 交回 marked。
+    let suffix = payloadStart;
+    while (suffix < close) {
+      const char = src.charCodeAt(suffix);
+      if (char <= 32 || char > 127) break;
+      suffix += 1;
+    }
+    if (suffix < close) {
+      payloadEnd = suffix;
+      while (/\s/.test(src[suffix] || '') && suffix < src.length) suffix += 1;
+      const delimiter = src[suffix];
+      if (delimiter === '"' || delimiter === "'" || delimiter === '(') {
+        const endDelimiter = delimiter === '(' ? ')' : delimiter;
+        suffix += 1;
+        const titleParts: string[] = [];
+        while (suffix < src.length && src[suffix] !== endDelimiter) {
+          if (src[suffix] === '\\' && /[!-/:-@\[-\x60{-~]/.test(src[suffix + 1] || '')) suffix += 1;
+          titleParts.push(src[suffix++]);
+        }
+        if (src[suffix] === endDelimiter) {
+          suffix += 1;
+          while (suffix < src.length && /\s/.test(src[suffix])) suffix += 1;
+          if (src[suffix] === ')') { close = suffix; title = titleParts.join(''); }
+          else payloadEnd = close; // 不完整/损坏后缀仍进入已有无效载荷提示。
+        } else payloadEnd = close;
+      } else if (src[suffix] !== ')') payloadEnd = close;
+    }
+    const payloadLength = payloadEnd - payloadStart;
     const canRender = INLINE_IMAGE_MIME_TYPES.has(mime)
       && payloadLength > 0
       && payloadLength <= MAX_INLINE_IMAGE_BASE64_CHARS
       && images.length < MAX_INLINE_IMAGES_TO_RENDER
-      && isBase64Payload(src, payloadStart, close);
+      && isBase64Payload(src, payloadStart, payloadEnd);
 
     if (canRender) {
       const placeholder = `${placeholderPrefix}${processed}END`;
       images.push({
         placeholder,
-        dataUri: src.slice(uriStart, close),
+        dataUri: src.slice(uriStart, payloadEnd),
         alt,
+        title,
+        original: src.slice(imageStart, close + 1),
       });
       chunks.push(placeholder);
     } else {
@@ -185,9 +243,14 @@ function protectInlineDataImages(src: string): {
 }
 
 function restoreInlineDataImages(html: string, images: ProtectedInlineImage[]): string {
-  let restored = html;
+  if (!images.length) return html;
+  // 代码示例中的图片语法仍是代码，不把保护占位恢复成可见图片。
+  let restored = html.replace(/<code\b[^>]*>[\s\S]*?<\/code>/gi, code => {
+    for (const image of images) code = code.split(image.placeholder).join(escapeHtml(image.original));
+    return code;
+  });
   for (const image of images) {
-    const tag = `<img src="${image.dataUri}" alt="${escapeHtml(image.alt)}" loading="lazy" class="md-img" />`;
+    const tag = `<img src="${image.dataUri}" alt="${escapeMarkedAttribute(image.alt)}"${titleAttribute(image.title)} loading="lazy" class="md-img" />`;
     restored = restored.split(image.placeholder).join(tag);
   }
   return restored;

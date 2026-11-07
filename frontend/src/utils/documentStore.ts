@@ -1,4 +1,4 @@
-import type { DiskVersion, DocumentIdentity } from './sessionWorkbench';
+import type { DiskVersion, DocumentIdentity, WorkspaceIdentity } from './sessionWorkbench';
 import { uuid } from './uuid';
 import { DocumentProtocolError, documentRelativePath, sameDiskVersion, validDiskVersion, sameWorkspace, type DocumentRead, type DocumentSaveReceipt,
   type DocumentSaveRequest, type WorkspaceDocuments } from './workspaceDocuments';
@@ -43,11 +43,44 @@ function errorCode(error: unknown): string {
 export class DocumentStore {
   private documents = new Map<string, Readonly<DocumentBuffer>>();
   private listeners = new Set<() => void>();
+  private projectFreezes = new Map<string, { workspace: WorkspaceIdentity; operationId: string; reads: Map<string, DocumentRead> }>();
+  projectLocks(): Array<{ id: string; workspace: WorkspaceIdentity; operationId: string }> {
+    return [...this.projectFreezes].map(([id, lock]) => ({ id, workspace: lock.workspace, operationId: lock.operationId }));
+  }
+  private sameProject(a: WorkspaceIdentity, b: WorkspaceIdentity): boolean {
+      const path = (value: string) => (/^[a-z]:/i.test(value) ? value.replace(/\\/g, '/').toLowerCase() : value).replace(/\/$/, '');
+      const left = path(a.workingDir), right = path(b.workingDir);
+      return a.ownerId === b.ownerId && a.executorInstance === b.executorInstance && (left === right || left.startsWith(right + '/') || right.startsWith(left + '/'));
+  }
+  freezeProject(id: string, workspace: WorkspaceIdentity, operationId = ''): boolean {
+    if (this.projectFreezes.has(id)) return true;
+    const documents = this.all().filter(doc => doc.identity.source === 'executor' && this.sameProject(doc.identity.workspace, workspace));
+    if (documents.some(doc => doc.dirty || doc.loading || doc.save && !['succeeded', 'failed'].includes(doc.save.receipt?.status || ''))) return false;
+    if ([...this.projectFreezes.values()].some(lock => this.sameProject(lock.workspace, workspace))) return false;
+    this.projectFreezes.set(id, { workspace, operationId, reads: new Map() });
+    documents.forEach(doc => this.put({ ...doc }));
+    return true;
+  }
+  releaseProject(id: string, committed: boolean): void {
+    const lock = this.projectFreezes.get(id); if (!lock) return;
+    this.projectFreezes.delete(id);
+    for (const [key, read] of lock.reads) {
+      const current = this.documents.get(key); if (!current) continue;
+      this.put({ ...current, read: committed ? { ...read, editable: false, canSave: false, reasonCode: 'workspace_changed_after_merge', writeReasonCode: 'workspace_changed_after_merge' } : read,
+        error: committed ? 'workspace_changed_after_merge' : current.error });
+    }
+  }
   constructor(private readonly nextId: () => string = uuid) {}
   subscribe = (listener: () => void): (() => void) => { this.listeners.add(listener); return () => this.listeners.delete(listener); };
   get = (key: string): Readonly<DocumentBuffer> | undefined => this.documents.get(key);
   all = (): Readonly<DocumentBuffer>[] => [...this.documents.values()];
   private put(value: DocumentBuffer): Readonly<DocumentBuffer> {
+    for (const lock of this.projectFreezes.values()) {
+      if (value.identity.source === 'executor' && this.sameProject(value.identity.workspace, lock.workspace) && value.read) {
+        if (value.read.reasonCode !== 'project_write_frozen') lock.reads.set(value.key, value.read);
+        value = { ...value, read: { ...value.read, editable: false, canSave: false, reasonCode: 'project_write_frozen', writeReasonCode: 'project_write_frozen' } };
+      }
+    }
     const snapshot = Object.freeze(value);
     this.documents.set(value.key, snapshot);
     for (const listener of this.listeners) listener();
@@ -120,6 +153,7 @@ export class DocumentStore {
 
   restore(key: string, draft: RecoverableDraft): void {
     const current = this.get(key);
+    if (current?.read?.reasonCode === 'project_write_frozen') throw new DocumentProtocolError('project_write_frozen');
     if (!current?.read || current.dirty || current.save && !['succeeded', 'failed'].includes(current.save.receipt?.status || '')) {
       throw new DocumentProtocolError('draft_restore_conflict');
     }
@@ -145,6 +179,7 @@ export class DocumentStore {
 
   merge(key: string, diskVersion: DiskVersion, bufferRevision: number, text: string): void {
     const current = this.get(key), disk = current?.disk;
+    if (current?.read?.reasonCode === 'project_write_frozen') throw new DocumentProtocolError('project_write_frozen');
     if (!current || !disk?.editable || !disk.complete || !disk.version) throw new DocumentProtocolError('document_readonly');
     if (!sameDiskVersion(diskVersion, disk.version) || current.revision !== bufferRevision) throw new DocumentProtocolError('merge_stale');
     if (current.save && !['succeeded', 'failed'].includes(current.save.receipt?.status || '')) throw new DocumentProtocolError('save_needs_reconciliation');

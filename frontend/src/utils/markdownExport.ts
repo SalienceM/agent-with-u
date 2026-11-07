@@ -147,7 +147,7 @@ export function buildStandaloneMarkdownHtml(sourceName: string, renderedBody: st
     html.awu-export-root[data-awu-toc="closed"] .awu-reader-shell { grid-template-columns: 0 minmax(0, 1fr); }
     html.awu-export-root[data-awu-toc="closed"] .awu-reader-toc { opacity: 0; pointer-events: none; transform: translateX(-18px); }
     .awu-markdown-export, .awu-markdown-export * { box-sizing: border-box; }
-    .awu-markdown-export .md-content { line-height: 1.7; color: var(--awu-text) !important; }
+    .awu-markdown-export .md-content { min-width: 0; max-width: 100%; overflow-wrap: anywhere; line-height: 1.7; color: var(--awu-text) !important; }
     .awu-markdown-export .md-content p,
     .awu-markdown-export .md-content li,
     .awu-markdown-export .md-content dt,
@@ -192,13 +192,20 @@ export function buildStandaloneMarkdownHtml(sourceName: string, renderedBody: st
     }
     .awu-markdown-export .md-content blockquote p { color: var(--awu-muted) !important; }
     .awu-markdown-export .md-content table { width: 100%; margin: 1em 0; border-collapse: collapse; display: block; overflow-x: auto; }
+    .awu-markdown-export .md-table-wrap { max-width: 100%; overflow: auto; margin: 1em 0; }
+    .awu-markdown-export .md-table-wrap:focus-visible { outline: 2px solid var(--awu-accent); outline-offset: 2px; }
+    .awu-markdown-export .md-table-wrap table { display: table; margin: 0; overflow: visible; }
     .awu-markdown-export .md-content th,
     .awu-markdown-export .md-content td {
       padding: .55em .8em;
       color: var(--awu-text) !important;
       border: 1px solid var(--awu-border);
       text-align: left;
+      min-width: 5em; vertical-align: top; overflow-wrap: normal; word-break: normal;
     }
+    .awu-markdown-export .md-content table [align="left"] { text-align: left; }
+    .awu-markdown-export .md-content table [align="center"] { text-align: center; }
+    .awu-markdown-export .md-content table [align="right"] { text-align: right; }
     .awu-markdown-export .md-content th { background: var(--awu-soft-bg); font-weight: 650; }
     .awu-markdown-export .md-content tr:nth-child(even) td { background: color-mix(in srgb, var(--awu-soft-bg) 55%, transparent); }
     .awu-markdown-export .md-content code {
@@ -210,6 +217,7 @@ export function buildStandaloneMarkdownHtml(sourceName: string, renderedBody: st
       font: .88em/1.55 "SFMono-Regular", Consolas, "Liberation Mono", monospace;
     }
     .awu-markdown-export .md-content pre {
+      max-width: 100%; white-space: pre; overflow-wrap: normal; word-break: normal;
       margin: 1em 0;
       padding: 1em 1.15em;
       color: var(--awu-text) !important;
@@ -219,7 +227,7 @@ export function buildStandaloneMarkdownHtml(sourceName: string, renderedBody: st
       border-radius: 6px;
     }
     .awu-markdown-export .md-content pre code { display: block; padding: 0; border: 0; background: transparent; font-size: .9em; }
-    .awu-markdown-export .md-content .md-code-lang { margin-bottom: .4em; color: var(--awu-muted) !important; font: 12px/1.4 sans-serif; }
+    .awu-markdown-export .md-content .md-code-lang { display: block; margin-bottom: .4em; white-space: pre-wrap; overflow-wrap: anywhere; color: var(--awu-muted) !important; font: 12px/1.4 sans-serif; }
     .awu-markdown-export .hljs-doctag, .awu-markdown-export .hljs-keyword,
     .awu-markdown-export .hljs-meta .hljs-keyword, .awu-markdown-export .hljs-template-tag,
     .awu-markdown-export .hljs-type, .awu-markdown-export .hljs-variable.language_ { color: #cf222e !important; font-weight: 600; }

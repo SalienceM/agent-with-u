@@ -737,8 +737,18 @@ event window, explicit context events (`/compact`, `/new`, visible-history clear
 history summarization), and detected large context drops. It survives message pagination and
 manual compaction; legacy Sessions bootstrap once from persisted assistant-message usage.
 Codex app-server additionally maps `thread/tokenUsage/updated.last.inputTokens` to current
-context size and `modelContextWindow` to its limit; a configured Qwen context window may use
-prompt input tokens as an explicitly labelled approximation. `_loop_run_agent` records every
+context size and `modelContextWindow` to its limit. Version-2 accounting never derives context
+from aggregated turn input. Latest request input remains visible without a known window;
+percentages require a provider window or an explicitly labelled matching-model config limit.
+Reset, compaction, backend/model/native-thread changes and new unknown measurements invalidate
+the prior context. Main-chat and LOOP snapshots are separate. Resumed Codex totals require a
+baseline; a missing baseline is explicitly estimated, never charged as fresh history. Message
+footers persist settled turn counts (`usageScope=turn`), with raw provider totals only as audit
+data. Version-1 lifetime totals remain intact and labelled unverified legacy history.
+`provider_usage.py` handles Claude dict/object usage, Anthropic exclusive cache inputs and
+multi-request SSE snapshots, and OpenAI inclusive prompt/cache counts plus usage-only frames.
+POE does not opt into OpenAI stream usage. Harness cache inclusion and Qwen direct-reply/audit
+semantics remain unchanged. See `docs/token-usage-accounting.md`. `_loop_run_agent` records every
 idea/goal/prepare/step/analysis/aside call (and legacy summary calls), while manual LOOP takeover is recorded as
 a LOOP `manual` event. `getSessionTokenUsage` returns a compact summary and
 `token_usage_updated` pushes live changes. `TokenUsageMonitor` is shared by ChatPane and the
@@ -1162,6 +1172,26 @@ Switching documents, users or nodes must not show a late result on another item.
 Returning to original text stops polling, not the accepted background job. Installation
 still requires the independent original-source review checkbox.
 
+### Session 定时指令
+
+普通 Session 的 `SessionPromptScheduler` 在执行节点运行，先独占
+`session-schedules/state.lock` 并恢复账本，再交给 `SequenceScheduler`。
+`session_schedule_rules/store/bridge.py` 分别管理时区计算、SQLite 事务和身份范围 RPC。
+客户端只配置和观察，不计时派发。见 `docs/session-scheduled-prompts.md`。
+
+同一计划最多一个待执行实例；稳定 occurrence/task/user/assistant ID 关联原聊天，
+保留手动队列、暂停和原生退出守卫。一次性计划耗尽下一时点不等于停用。
+主轮次退出并确认聊天保存后才能记完成；claimed/running 恢复缺终态、队列冲突或
+来源损坏均保留未知/受阻，禁止自动重试。通用队列编辑、删除、引导和错误重置不能
+处理定时项；显式重试必须新建 attempt。不得继承历史 Kit 委托、workspace lease 或令牌。
+
+SQLite 在有界后台队列中执行，取消等待不取消已提交写。已提交回执不能因后续对账
+失败变成“未保存”。UI 以 owner/executor/Session 隔离草稿和 requestId，重连只合并
+一次只读核对；不重发写、不回退节点、不按 token 拉历史。`scheduleRef` 白名单独立于
+Skill 来源，实时输出复用原聊天；原生输入必须精确关联原助手消息。
+Windows/冻结分发需携带 tzdata。降级前处理未完成定时项，不能删账本解除未知保护。
+相关测试仅使用临时数据和 fake Backend，不在真实 Session 安排任务。
+
 ### Workspace Kits (experimental)
 
 Workspace Kits are Session-level standard accessories stored separately in
@@ -1238,6 +1268,12 @@ Workspace Kits are Session-level standard accessories stored separately in
   本请求，确认后不能保证撤回，不杀安装器、不回滚；未知保持保护。有界恢复最多 13 次，
   180 秒未验收显示未知。首次协议部署使用原更新入口，构建时才写 kitUpdateProtocol=1。
   相关测试仅用隔离目录和 fake 发布/安装，不代表生产升级验收。见 `docs/kit-local-update-chain.md`。
+- 独立「本机一键检查并更新」使用 `node.check_update_local`，只读执行设备更新中心的已配置源/通道，
+  检查后冻结快照，选择和确认不重读 latest 换装。签名策略、SHA-256、设备身份、人工安装确认、
+  忙闲/预留及重启验收沿用相同边界。完整身份一致才报告 `current`（检查成功，无安装）；离线/未知/
+  旧清单不是无更新。`node.update_local_published` 仍严格绑定当前 run，保存和运行均拒绝缺少唯一
+  `bindBuild` 发布的旧错误单步定义；不得静默迁移生产 Kit。Windows 注册路径仅去空白和成对外引号
+  后 canonicalize，保留唯一目录与真实 exe 匹配，不修改注册表或绕过 installed 守卫。
 - 普通命令 Kit 的 `kitCancel` is immediate and idempotent: it first persists the authoritative
   `cancelled` run/step state, then cancels any live orchestration task and terminates
   the exact command process tree by run PID. This also repairs orphaned active records
@@ -1356,6 +1392,17 @@ account remains a fallback. Keep the legacy
 automation/recovery. Detailed operator instructions live in `docs/release-center.md`.
 
 ### Docker executor runtime and online updates
+
+Ordinary node updates recover abandoned pre-install reservations under an OS process lease;
+old plan paths alone do not imply installation. Live preparation and actual/unknown installation
+handoffs stay exclusive. Stage/apply IDs persist receipts, reject changed/replayed intents,
+and freeze the checked artifact plus verification policy. The client only reconciles lost replies,
+retains last known state on disconnect and bounds consecutive observation failures. Closing the
+panel never cancels accepted work. HTTP preparation retries transient failures at most three times,
+retains identity-bound partials and validates Range, size and the entire SHA-256 before staging.
+Ordinary apply results use request-specific paths (including old helpers without an echoed ID);
+unrelated receipts cannot complete a new installation. Kit approval/handoff rules are unchanged.
+Tests use inert temporary artifacts and fake transports; see `docs/node-updates.md`.
 
 `deploy/docker-compose.example.yml` is a two-service executor deployment by default:
 `awu-backend` and `awu-web`. A no-port `awu-updater` is available only through the optional
@@ -1814,7 +1861,10 @@ read-only query, never write replay. Closing review is not cancellation. Current
 equality is required for trusted baseline advancement. See `docs/directory-sync-review.md`
 and `docs/directory-sync-review-verification.md` for actual limits and tested platforms.
 
-Review inherits the tree's two-sided-only difference scope. Path regex runs in a
+The tree's "only different" filter, total difference count and review include
+local-only and executor-only files (including empty files), as well as two-sided
+content differences and conflicts. Missing manifests remain unknown, not empty.
+Side-specific badges and explicit transfer confirmation remain unchanged. Path regex runs in a
 deadline-terminated worker; the dialog uses the opaque theme panel color. Known
 differences expose an explicit comparison action in ordinary preview. A bounded
 window-memory cache restores tree/search/comparison and review preferences across
@@ -1874,11 +1924,26 @@ reads; submitted transfers themselves still continue. Cached re-entry restores t
 directory state without repeating scans; Git retains its lightweight entry check. Tests count RPCs and local scans
 across idle time, reconnects, transfers and hidden/collapsed panels.
 
-**Local refresh fast path.** `listDirectory`, `gitDetect` and `gitStatus` run off the
-WebSocket event loop. The shared local/Relay receiver allows only these read-only RPCs
-and ping to overlap (16 in flight per connection); other RPCs retain an ordered barrier.
-Each request binds its own owner/client ContextVars and passes normal authorization;
-disconnect cancels pending replies. Ordinary scandir entries reuse the resolved parent,
+**Local/Relay responsiveness.** `listDirectory`, `gitDetect` and `gitStatus` run off the
+WebSocket event loop (16 in flight per connection). A bounded FIFO of 64 waiting
+ordinary requests retains their write/directory-read barriers, while the receiver
+continues accepting explicitly allowlisted observations. Ping, Session metadata/list
+and workbench capabilities use a separate 16-request pool; content hydration, release
+status and existing independent collaboration/catalog calls use another bounded pool.
+Overflow is an explicit unexecuted error, never an implicit write retry. Each request
+binds owner/client ContextVars and passes normal authorization; disconnect cancels
+pending replies and discards unstarted queued writes. Cold Session view reads coalesce
+off-loop and recheck ownership/deletion/newer active state before installing results.
+Workbench capability checks use Session metadata, not transcript loading; frontend
+consumers share only in-flight reads and individually recheck identity (no cached grants).
+Kit inventory discovery runs off-loop and reuses unchanged file revisions. Publishing
+ledger/log/progress I/O runs in ordered workers; cancelling a waiter does not release
+its write ordering before disk completion. Accepted publish jobs are handed to their
+owner task even if the request disconnects during commit. Kit progress reads only its
+job, without repeated account probes. Approval, artifact hash, public-manifest and
+retention checks remain required. Isolated tests: `test_remote_responsiveness.py`,
+`test_file_panel_performance.py`, `test_release_center.py`; not a production load proof.
+Ordinary scandir entries reuse the resolved parent,
 while symlinks and Windows junction/reparse points still resolve and validate containment.
 The tree requests lightweight Git detection and a single NUL-delimited porcelain-v2
 status scan, without diff/numstat or optional index writes. Legacy full Git APIs retain
@@ -1913,7 +1978,7 @@ instantly. Actual file **content** moves only on an explicit per-node ⬆ push /
 ⬇ pull click; the tree never auto-syncs.
 
 **Diff / conflict highlighting is an explicit action** (`🔍 比对`, not on open):
-`runCompare` loads both full manifests (`localFs.scan` + `syncManifest`, hashes only
+`runCompare` loads both manifests (`localFs.scan` + `syncManifest`, hashes only
 — still no content transfer) and runs `computeStatus` (three-way vs `dirSync`'s
 `loadBaseline`/`saveBaseline`): each file is `synced` / `differs` / `conflict` (both
 sides changed vs baseline) / `local-only` / `remote-only`; non-synced nodes get a
@@ -1922,6 +1987,22 @@ counts `冲突/不同/仅本地/仅远端` (`✕` exits compare). A successful p
 transferred files into the baseline (`bumpBaseline`) so they flip to `synced`.
 Folder push/pull gathers its file list from the manifest (compare on) or by walking
 `listDirectory`/`listDir` (compare off).
+
+**Comparison scan scope.** The sync popover's “扫描范围” saves root-relative literal
+include prefixes and a bounded gitignore-like exclusion subset in device-local,
+owner/executor/Session/workdir/view-scoped settings. A trailing slash bounds a directory;
+`config` is a filename/path prefix. `*`, `?`, segment `**`, anchored paths, directory-only
+rules, comments and ordered `!` exceptions are supported, but excluded parents must be
+re-included before children. Defaults/`.git` guards remain authoritative. Python,
+Tauri and browser FSA prune before recursive traversal and hashing; managed IndexedDB
+uses prefix key ranges and never loads excluded records. Nonempty rules require the
+new `syncScopedManifest` / `dir_sync_scan_scoped` endpoints and an exact rules echo;
+old endpoints must never silently perform a full scan. Rule edits invalidate compare
+generations, snapshots and scoped review baselines; saving does not scan/transfer.
+Out-of-scope files are unknown, not missing. Full legacy DirSyncSession remains
+unchanged; scoped comparison directory transfers use their explicit displayed count.
+Shared matcher fixtures and pruning tests live in `test_sync_scan_rules.py`,
+`sync-scan-rules.test.cjs`, Rust `sync_scan` tests and `directory-sync-review.spec.ts`.
 
 **Preview & layout.** Clicking a file (or its 👁 hover action / double-click) opens a
 centered preview overlay. Text/images use `syncReadFile`/`LocalFs.readFile` (remote
@@ -1993,3 +2074,82 @@ row-selection highlight.
 `localStorage['awu.sidebarWidth']`, clamped 200–640; a 4px col-resize handle sits
 between Sidebar and the main column, desktop + expanded only). `Sidebar` takes a
 `width` prop (in its memo comparator) applied to the expanded root.
+
+### Session collaboration and input workflows
+
+`SessionCollaborationBridge` owns owner/executor-scoped SQLite records and CAS request receipts;
+Session JSON stores optional parent/relation/workspace IDs and default-off follow-up settings.
+Unknown requests are queried, never automatically replayed. Names are not IDs. Preserve existing
+Session fields and never propagate native thread IDs, Kit grants, workspace leases or hidden thinking.
+
+`session_roles.py` / `role_reviews.py` freeze role revisions and bounded visible snapshots. Each
+role run uses `_role_review_runtime_state`, separate from `SyncReviewBridge._review_jobs()`;
+regression fixtures compose both real mixins so their registries cannot shadow each other.
+Completed answers expose a direct review action. The composer previews the chosen answer and
+keeps that target fixed when the main conversation advances. Advanced context/summary options
+are collapsed; preparation errors show the batch cause and an explicit new-selection action.
+Role history is a reading view with its own empty state and a return-to-source action, never an
+ordinary chat empty prompt. Review details use the solid theme surface even with wallpaper.
+Each source/role binding has a separate Session/output directory. Same-role calls serialize; at most
+three calls per node and eight roles per batch. Native restricted calls must prove native context
+identity; unsupported routes use text-only history without tools. Working-directory separation is
+not an OS sandbox. Reports retain disagreements, unknowns, failed/raw output and self-rated confidence;
+counts are deterministic and never majority acceptance. `#` launches only selected reviewers;
+`@` inserts immutable report/claim excerpts at the cursor. `reviewReferenceLookup` reads exact IDs
+and revisions on demand; an inaccessible source never resolves to a same-name replacement.
+
+`role_review_output.py` streams visible reviewer text through `reviewUpdated` progress events;
+native `text_only` adapters expose actual partial messages separately from the single final result.
+Hidden reasoning stays excluded. Text pushes are coalesced to 2 Hz, with bounded 24K current text,
+two prior query rounds and 24 milestones; durable checkpoints are at most every two seconds.
+`ReviewProgressPanel` exposes expandable output and query activity, retaining received text offline.
+Progress never reloads the full report per token; reconnect only checks the original task.
+Quote validation accepts Markdown emphasis differences while preserving literal code, wording,
+source IDs and evidence constraints. `reviewRevalidate` explicitly parses saved invalid output
+against its frozen snapshot, retaining the artifact/old validation and never calling a model.
+
+`task_git.py` / `task_workspaces.py` create unique managed branches/worktrees using fixed argv and
+private-index selected-path snapshots. Source index/HEAD/files are not mutated. Credentials,
+ignored paths, links, external objects, oversized files and unsupported repositories are rejected.
+Managed Git readers require the exact registered root/common-dir/repository identity. Task creation
+and initial model start are separate; default ordinary permission is false, no parent grants.
+Archive retains resources; cleanup is separate, only for a verified idle clean merged owned task.
+Unknown cleanup retains its reservation; closing tabs never deletes outputs.
+
+`project_merges.py` prepares frozen commits in a separate integration worktree and creates a real
+integration Session. Conflict repair starts only explicitly. Actual clean Git/ancestry verification
+is separate from project test acceptance. Applying requires the frozen candidate and only ff-only
+merge; never hard-reset, auto-stash, push or auto-clean. The controlled `awu_workspace` merge actions
+reuse this service and retain independent plan approvals (`allow_skip=False`); a chat sentence or
+Kit grant cannot approve a cross-Session merge. Real IDs are discovered and ambiguous names returned.
+
+`project_write_gate.py` shares target reservations with chat/LOOP/queue dispatch, engineering writes,
+terminals and file/Git operations. It probes online windows, freezes clean document buffers and refuses
+dirty/offline-unknown buffers or active/unknown native exits. Durable gates survive restart; owned Git
+workers outlive request waiters. Status checks actual final OID and confirmed exit before reconciliation,
+without replay. After application/reconnect, old buffers require an explicit reload. External writers
+remain outside AWU's process authority; pre/post Git checks are not full-machine isolation.
+
+`composerDrafts` / `ComposerEditor` share main text, ordered blocks, references, selection and undo.
+Accepted unchanged revisions clear the old draft; late replies never clear newer edits. Handoff is a
+whitelist without authorization. IME and open selectors precede Tab suggestions and send shortcuts.
+`followup_suggestions.py` uses bounded isolated `text_only`, no native tools/main-thread resume,
+and separate usage; disabled/history/error/duplicate completions do not call a model. Pending native
+questions, drafts, attachments and menus suppress stale suggestions. Tab edits only, never sends.
+`followupSuggestionsConfig` persists a Session-local Backend/model/reasoning choice and a bounded
+30/60/120-second deadline (including native startup). Empty routing follows the completed main turn;
+an explicit suggestion route never inherits its reasoning override or mutates the main Backend.
+Settings reads/saves never generate suggestions. A route change invalidates the pending helper;
+deleted/disabled/unsupported routes fail visibly without fallback or automatic retry. Text-only API
+and Claude adapters honor the per-call model override. Version-1 nodes keep the Boolean toggle;
+version-2 model settings are only shown as saved after a matching settings response.
+
+Typed `UserInteraction` records correlate original native requests and answers, including multiple
+pending questions, timeout/unknown/reconnect and non-secret drafts. The capability matrix is in
+`docs/native-user-interactions.md`: no invented Qwen/Harness/legacy-exec answer channel. Skip uses
+proven native semantics, never a recommended option; old Boolean approvals retain compatibility.
+Kit opt-in freezes at send; message/run receipts and reminder preferences are not new authorization.
+
+Validation uses fake Backends, temporary users/repos and isolated browser fixtures. The native smoke
+script checks installed CLI startup and Codex initialization only, without production models or Sessions.
+User workflow, defaults and limitations: `docs/session-collaboration-workflows.md`.

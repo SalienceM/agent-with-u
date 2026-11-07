@@ -28,7 +28,7 @@ class QwenTurnUsage:
         self.totals = dict.fromkeys(_FIELDS, 0)
         self.requests = 0
         self.zero_usage_events = 0
-        self.last_input = 0
+        self.last_input: int | None = None
         self.missing = False
 
     def observe(self, message: dict) -> None:
@@ -60,7 +60,7 @@ class QwenTurnUsage:
         if self.requests and not self.missing and (any(self.totals.values()) or not cumulative or not any(cumulative.values())):
             result = {**self.totals, "reported": True, "usageSource": "qwen-assistant-turn",
                       "usageEventCount": self.requests, "zeroUsageEventCount": self.zero_usage_events,
-                      "contextTokens": self.last_input,
+                      **({"contextTokens": self.last_input} if self.last_input is not None else {}),
                       "providerUsage": provider, "nativeResumed": resumed}
             if cumulative is not None and native_id:
                 result.update(providerCumulative=cumulative, contextId=native_id)
@@ -69,6 +69,7 @@ class QwenTurnUsage:
             return None
         if not resumed:
             return {**cumulative, "reported": True, "usageSource": "qwen-fresh-result",
+                    "nativeResumed": False,
                     "providerCumulative": cumulative, "contextId": native_id or "", "providerUsage": provider}
         # 老 SDK 只有终结累计值时，交给持久账本按原生线程差分。
         # 升级后首笔缺少旧基线不能把所有历史算作本轮，必须明确降级。

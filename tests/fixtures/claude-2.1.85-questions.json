@@ -1,0 +1,21 @@
+{
+  "version": "2.1.85",
+  "sdkVersion": "0.2.115",
+  "source": "claude.exe embedded AskUserQuestion schema",
+  "sha256": "4a336dc188dc44289c801a33ba1868fa2b2b39d345e9a3316327218048c91669",
+  "schemaExcerpt": "answers:y.record(y.string(),y.string()).describe(\"The answers provided by the user (question text -> answer string; multi-select answers are comma-separated)\"),annotations:Jq_()}));RhH={name:Cz,searchHint:\"prompt the user with a m",
+  "response": {
+    "type": "control_response",
+    "response": {
+      "subtype": "success",
+      "request_id": "native-request",
+      "response": {
+        "behavior": "allow",
+        "updatedInput": {
+          "questions": [],
+          "answers": {}
+        }
+      }
+    }
+  }
+}

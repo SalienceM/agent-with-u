@@ -47,6 +47,7 @@ HEARTBEAT_PID=$!
 RESULT_PATH="$DEFAULT_RESULT_PATH"
 VERSION=""
 BUILD_ID=""
+APPLY_REQUEST_ID=""
 ERROR_MESSAGE=""
 ROLLBACK_BACKEND=""
 ROLLBACK_WEB=""
@@ -68,15 +69,17 @@ write_result() {
       --argjson finishedAt "$(date +%s)" \
       --arg version "$VERSION" \
       --arg buildId "$BUILD_ID" \
-      '{schemaVersion:1, finishedAt:$finishedAt, version:$version, buildId:$buildId, ok:true, installer:"docker-sidecar"}' \
+      --arg requestId "$APPLY_REQUEST_ID" \
+      '{schemaVersion:1, finishedAt:$finishedAt, version:$version, buildId:$buildId, requestId:$requestId, ok:true, installer:"docker-sidecar"}' \
       > "$temp"
   else
     jq -n \
       --argjson finishedAt "$(date +%s)" \
       --arg version "$VERSION" \
       --arg buildId "$BUILD_ID" \
+      --arg requestId "$APPLY_REQUEST_ID" \
       --arg error "$error" \
-      '{schemaVersion:1, finishedAt:$finishedAt, version:$version, buildId:$buildId, ok:false, installer:"docker-sidecar", error:$error}' \
+      '{schemaVersion:1, finishedAt:$finishedAt, version:$version, buildId:$buildId, requestId:$requestId, ok:false, installer:"docker-sidecar", error:$error}' \
       > "$temp"
   fi
   mv -f "$temp" "$RESULT_PATH"
@@ -170,6 +173,7 @@ apply_request() {
   RESULT_PATH="$DEFAULT_RESULT_PATH"
   VERSION=""
   BUILD_ID=""
+  APPLY_REQUEST_ID=""
   ERROR_MESSAGE=""
   ROLLBACK_BACKEND=""
   ROLLBACK_WEB=""
@@ -211,6 +215,7 @@ apply_request() {
 
   VERSION="$(jq -r '.version // empty' "$plan_real")"
   BUILD_ID="$(jq -r '.buildId // empty' "$plan_real")"
+  APPLY_REQUEST_ID="$(jq -r '.requestId // empty' "$plan_real")"
   configured_result="$(jq -r '.resultPath // empty' "$plan_real")"
   result_real="$(readlink -f "$(dirname "$configured_result")" 2>/dev/null || true)/$(basename "$configured_result")"
   case "$result_real" in

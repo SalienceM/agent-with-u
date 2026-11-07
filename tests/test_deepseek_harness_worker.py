@@ -12,7 +12,8 @@ import time
 import unittest
 import uuid
 from pathlib import Path
-from unittest.mock import patch
+from typing import Any
+from unittest.mock import Mock, patch
 
 from src.backend.deepseek_harness_sdk import MAX_NOTIFICATIONS, SyncOwner, create_client
 from src.backend.deepseek_harness_state import HarnessLayout
@@ -215,6 +216,111 @@ class OwnedSdkTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "启动前已取消"):
             client.start()
         self.assertIsNone(self.owner.process)
+        self.assertTrue(self.owner.confirmed)
+
+    def test_slow_reader_does_not_destroy_already_observed_process_exit_proof(self) -> None:
+        client = self.client()
+        client.start()
+        client.initialize(cwd=str(self.root), provider="deepseek-official", model="fake")
+        actual_reader = client._reader_thread
+        delayed = True
+
+        class DelayedJoin:
+            def join(self, timeout=None):
+                actual_reader.join(timeout=timeout)
+
+            def is_alive(self):
+                return delayed or actual_reader.is_alive()
+
+        client._reader_thread = DelayedJoin()
+        try:
+            client.close()
+            self.assertFalse(self.owner.confirmed, "迟到 reader 仍须保留活动保护")
+            self.assertIsNotNone(self.owner.process.returncode)
+            self.assertFalse(actual_reader.is_alive())
+            self.assertIsNotNone(client._proc)
+            delayed = False
+            client.close()
+            self.assertTrue(self.owner.confirmed, "再次收口使用原有原子退出证明，不按 PID 猜测")
+            self.assertIsNone(client._proc)
+        finally:
+            client._reader_thread = actual_reader
+            client.close()
+
+    @unittest.skipUnless(os.name == "nt", "Windows Job/PID reuse regression")
+    def test_reused_parent_pid_never_claims_another_live_job(self) -> None:
+        """真实独立 Job，加确定性的旧 parent PID 快照；不结束另一个 Session。"""
+        import ctypes
+
+        other = self.client()
+        other.start()
+        other.initialize(cwd=str(self.root), provider="deepseek-official", model="fake")
+        other_owner = self.owner
+        self.owner = SyncOwner(generation=uuid.uuid4().hex, receipt=self.root / "reused-pid-exit.json")
+        client = self.client()
+        native_dll = ctypes.WinDLL
+        kernel = native_dll("kernel32", use_last_error=True)
+        owner = self.owner
+
+        class StaleParentSnapshot:
+            def __init__(self) -> None:
+                self.next_entry = False
+                self.Process32FirstW = Mock(side_effect=self.first)
+                self.Process32NextW = Mock(side_effect=self.next)
+
+            def __getattr__(self, name: str) -> Any:
+                return getattr(kernel, name)
+
+            def first(self, _snapshot: Any, entry: Any) -> bool:
+                entry._obj.pid, entry._obj.parent = owner.process.pid, 0
+                self.next_entry = True
+                return True
+
+            def next(self, _snapshot: Any, entry: Any) -> bool:
+                if not self.next_entry:
+                    return False
+                self.next_entry = False
+                # Windows 保留创建时 parent PID；该父亲早已退出，数字已被新 root 复用。
+                entry._obj.pid, entry._obj.parent = other_owner.process.pid, owner.process.pid
+                return True
+
+        snapshot = StaleParentSnapshot()
+        def dll(name: str, *args: Any, **kwargs: Any) -> Any:
+            return snapshot if name == "kernel32" else native_dll(name, *args, **kwargs)
+
+        try:
+            with patch("ctypes.WinDLL", side_effect=dll):
+                client.start()
+            client.initialize(cwd=str(self.root), provider="deepseek-official", model="fake")
+            held = set(owner.tree.handles)
+            client.close()
+            self.assertTrue(owner.confirmed, "退出不能等待 parent PID 碰巧相同的其他 Job")
+            self.assertNotIn(other_owner.process.pid, held)
+            self.assertIsNone(other_owner.process.poll())
+            self.assertTrue(other.session_prompt("unrelated", [{"type": "text", "text": "still alive"}]))
+        finally:
+            # 两棵树均为本测试独立创建；先结束另一棵，旧实现的失败也能释放夹具。
+            other.close()
+            client.close()
+
+    @unittest.skipUnless(os.name == "nt", "Windows Job exit evidence")
+    def test_live_job_child_and_failed_job_query_do_not_confirm_exit(self) -> None:
+        from pydantic import BaseModel
+        class Empty(BaseModel):
+            pass
+
+        client = self.client("tree")
+        client.start()
+        client.initialize(cwd=str(self.root), provider="deepseek-official", model="fake")
+        client.request("shutdown", None, response_model=Empty)
+        self.owner.process.wait(timeout=3)
+        self.assertFalse(self.owner.settle(timeout=0), "root 退出不等于 Job 后代退出")
+        self.assertTrue(self.owner.tree.job)
+        self.owner.terminate()
+        with patch.object(self.owner.tree, "_job_empty", return_value=False):
+            self.assertFalse(self.owner.settle(timeout=3), "缺少 Job 退出证明必须保持 unknown")
+            self.assertTrue(self.owner.tree.job)
+        client.close()
         self.assertTrue(self.owner.confirmed)
 
     def test_two_process_trees_stopping_one_does_not_stop_the_other(self) -> None:

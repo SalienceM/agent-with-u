@@ -1,12 +1,23 @@
 import React, { useRef, useCallback, useEffect, useLayoutEffect, useImperativeHandle, forwardRef, memo, useState, useMemo } from 'react';
 import { ImagePreview } from './ImagePreview';
 import { TextAttachmentPreview } from './TextAttachmentPreview';
+import { ComposerEditor, ComposerTransformUndo } from './ComposerEditor';
+import { composerDrafts, validateComposerMeta } from '../utils/composerDrafts';
 import { useClipboardImage } from '../hooks/useClipboardImage';
+import { useFollowupSuggestion } from '../hooks/useFollowupSuggestion';
+import { FollowupSettings } from './FollowupSettings';
+import { useRoleReviewComposer } from '../hooks/useRoleReviewComposer';
+import { opinionText } from '../utils/roleReviews';
+import type { OpinionReference } from '../types/sessionCollaboration';
 import type { ImageAttachment } from '../hooks/useClipboardImage';
 import type { TextAttachment, TextAttachmentSource } from '../types/attachments';
 import { SLASH_COMMANDS } from '../hooks/useChat';
 import type { SlashCommand } from '../hooks/useChat';
-import { api, isTauri, onCurrentUserChanged, getExecutors, getCurrentUserProfile, getSessionExecKey } from '../api';
+import { api, isTauri, onCurrentUserChanged, getExecutors, getCurrentUserProfile, getSessionExecKey, harnessImageScope, harnessImageSubmissions, composerSubmissions } from '../api';
+import { ComposerSubmissionStatus } from './ComposerSubmissionStatus';
+import { RoleLibrary } from './RoleLibrary';
+import { WorkflowButton, WorkflowIcon, WorkflowPopover } from './WorkflowControls';
+import { imageReceiptLabel, type ChatSendResult, type ImageDraftContext } from '../utils/harnessImageSubmission';
 import { handoffParticipants, handoffScope } from '../utils/workbenchHandoffState';
 import { isSkillCommand, slashQuery, skillInvocation, suggestedSlashCommand, type SkillInvocation, type SkillCommand } from '../utils/skillCommands';
 import { RealtimeVoiceBar } from './RealtimeVoiceBar';
@@ -25,12 +36,8 @@ import {
 
 // Pane 会在不同 session 间复用，且普通对话/Loop 面板切换时输入组件会卸载。
 // 草稿必须以 session 为键独立保存，不能只放在 textarea DOM 或组件 state 中。
-interface InputDraft {
-  text: string;
-  textAttachments: TextAttachment[];
-}
-
-const sessionInputDrafts = new Map<string, InputDraft>();
+const sessionInputDrafts = composerDrafts;
+onCurrentUserChanged((_profile, identityChanged) => { if (identityChanged) sessionInputDrafts.clear(); });
 const LARGE_PASTE_ATTACHMENT_CHARS = 4_000;
 const LONG_INPUT_ATTACHMENT_CHARS = 6_000;
 const MAX_PICKED_ATTACHMENT_BYTES = 10 * 1024 * 1024;
@@ -136,8 +143,12 @@ interface Props {
     textAttachments?: TextAttachment[],
     kitApprovalDelegation?: boolean,
     skillInvocation?: SkillInvocation,
-  ) => void;
+    imageDraft?: ImageDraftContext,
+  ) => ChatSendResult | Promise<ChatSendResult>;
   onAbort: () => void;
+  onReviewSubmitted?: (id: string) => void;
+  onOpenOpinions?: () => void;
+  workflowTools?: React.ReactNode;
   isStreaming: boolean;
   backends: any[];
   activeBackendId: string;
@@ -153,7 +164,8 @@ interface Props {
     content: string,
     images?: ImageAttachment[],
     textAttachments?: TextAttachment[],
-  ) => void;
+    imageDraft?: ImageDraftContext,
+  ) => ChatSendResult | Promise<ChatSendResult>;
   seqCount?: number;
   onCompact?: () => void;
   fontSize?: number;                         // 当前对话字号(用于 A−/A+ 显示)
@@ -190,6 +202,8 @@ interface Props {
 
 export interface ChatInputHandle {
   insertCommand: (command: string, sourceSessionId: string) => void;
+  insertOpinion: (reference: OpinionReference) => void;
+  startReview: (targetIds?: string[], resetSelection?: boolean) => void;
 }
 
 // ═══════════════════════════════════════
@@ -204,41 +218,17 @@ interface ToolbarBtnProps {
   compact?: boolean;   // 移动端:只显示图标,隐藏文字标签(整排不再撑成好几行)
 }
 
+const toolbarIcons = { '⚡': 'shield', '🧹': 'clear', '⚙': 'settings', '＋': 'plus', '⛶': 'expand', '#': 'role', '📄': 'block', '📷': 'camera' } as const;
 const ToolbarBtn: React.FC<ToolbarBtnProps> = ({ icon, title, active, onClick, loading, compact }) => {
-  const [isHover, setIsHover] = React.useState(false);
-  return (
-    <button
-      onClick={onClick}
-      disabled={loading}
-      title={title}
-      aria-label={title}
-      aria-pressed={active}
-      onMouseEnter={() => setIsHover(true)}
-      onMouseLeave={() => setIsHover(false)}
-      style={{
-        display: 'inline-flex',
-        alignItems: 'center',
-        justifyContent: 'center',
-        gap: compact ? 0 : 4,
-        padding: compact ? '5px 9px' : '4px 8px',
-        fontSize: 11,
-        borderRadius: 5,
-        border: active ? '1px solid var(--theme-accent, #0969da)' : '1px solid var(--theme-border, rgba(0,0,0,0.12))',
-        background: active ? 'var(--theme-accent-bg, rgba(9,105,218,0.1))' : isHover ? 'var(--theme-bg-tertiary, #eaeef2)' : 'var(--theme-bg-secondary, #f6f8fa)',
-        color: active ? 'var(--theme-accent, #0969da)' : isHover ? 'var(--theme-text, #1f2328)' : 'var(--theme-text-muted, #656d76)',
-        cursor: loading ? 'wait' : 'pointer',
-        transition: 'all 0.15s',
-        whiteSpace: 'nowrap',
-        opacity: loading ? 0.6 : 1,
-      }}
-    >
-      <span style={{ fontSize: compact ? 14 : 12 }}>{icon}</span>
-    </button>
-  );
+  const name = toolbarIcons[icon as keyof typeof toolbarIcons];
+  return <WorkflowButton tone="quiet" onClick={onClick} disabled={loading} title={title} aria-label={title} aria-pressed={active}
+    style={{ minWidth: compact ? 36 : 30, minHeight: compact ? 36 : 30, padding: '5px 7px' }}>
+    {name ? <WorkflowIcon name={name} /> : icon}
+  </WorkflowButton>;
 };
 
 const ChatInputInner = forwardRef<ChatInputHandle, Props>(({
-  onSend, onAbort, isStreaming, backends, activeBackendId, sessionId, workingDir, historyKey = null, historySeed,
+  onSend, onAbort, onReviewSubmitted, onOpenOpinions, workflowTools, isStreaming, backends, activeBackendId, sessionId, workingDir, historyKey = null, historySeed,
   skipPermissions = true, onSkipPermissionsChange,
   isMobile = false,
   onQueueTask, seqCount = 0,
@@ -262,12 +252,29 @@ const ChatInputInner = forwardRef<ChatInputHandle, Props>(({
   const [attachmentNotice, setAttachmentNotice] = useState('');
   const [attachmentNoticeTone, setAttachmentNoticeTone] = useState<'error' | 'info'>('error');
   const [kitApprovalDelegation, setKitApprovalDelegation] = useState(false);
+  const [editorOpen, setEditorOpen] = useState(false);
+  const editorOpenRef = useRef(editorOpen); editorOpenRef.current = editorOpen;
+  const [roleLibraryOpen, setRoleLibraryOpen] = useState(false);
+  const [moreToolsOpen, setMoreToolsOpen] = useState(false);
+  useEffect(() => setMoreToolsOpen(false), [sessionId, execKey]);
+  useEffect(() => { setRoleLibraryOpen(false); }, [sessionId, execKey]);
+  const imageScope = harnessImageScope(sessionId || '', execKey || getSessionExecKey(sessionId) || '');
+  const imageScopeRef = useRef(imageScope);
+  imageScopeRef.current = imageScope;
+  const draftKey = `${historyKey || 'composer'}:${imageScope.key}`;
+  const draftKeyRef = useRef(draftKey);
+  draftKeyRef.current = draftKey;
+  const draftRevisionRef = useRef(0);
+  const [, updateImageReceipts] = useState(0);
+  // 不展示额外状态栏，但仍须订阅回执，按草稿修订清理已接收的输入。
+  useEffect(() => harnessImageSubmissions.subscribe(() => updateImageReceipts(value => value + 1)), []);
+  useEffect(() => composerSubmissions.subscribe(() => updateImageReceipts(value => value + 1)), []);
   const kitApprovalDelegationRef = useRef(false);
   kitApprovalDelegationRef.current = kitApprovalDelegation;
   useEffect(() => {
     setKitApprovalDelegation(false);
     kitApprovalDelegationRef.current = false;
-  }, [sessionId, activeBackendId, isStreaming, seqCount, isFocused]);
+  }, [sessionId, activeBackendId, isStreaming, seqCount]);
   const textAttachmentsRef = useRef<TextAttachment[]>([]);
   textAttachmentsRef.current = textAttachments;
 
@@ -439,8 +446,13 @@ const ChatInputInner = forwardRef<ChatInputHandle, Props>(({
     setShowCommands(false);
     setCommandError('');
   }, [sessionId, execKey, activeBackendId]);
-  useEffect(() => onCurrentUserChanged(() => {
+  useEffect(() => onCurrentUserChanged((_profile, identityChanged) => {
     setSkillCommands([]); setShowCommands(false); setCommandRevision(value => value + 1);
+    if (!identityChanged) return;
+    setEditorOpen(false);
+    if (ref.current) ref.current.value = '';
+    textAttachmentsRef.current = []; setTextAttachments([]);
+    imagesRef.current = []; clearImages();
   }), []);
   useEffect(() => {
     const changed = () => { setSkillCommands([]); setCommandRevision(value => value + 1); };
@@ -526,17 +538,32 @@ const ChatInputInner = forwardRef<ChatInputHandle, Props>(({
     text: string,
     attachments: TextAttachment[] = textAttachmentsRef.current,
   ) => {
-    const sid = historyKeyRef.current;
-    if (!sid) return;
-    if (text || attachments.length) {
-      sessionInputDrafts.set(sid, {
-        text,
-        textAttachments: attachments.map((item) => ({ ...item })),
-      });
-    } else {
-      sessionInputDrafts.delete(sid);
-    }
+    const sid = draftKeyRef.current;
+    if (!sid) return 0;
+    const { revision } = composerDrafts.update(sid, { text, textAttachments: attachments, images: imagesRef.current });
+    const el = ref.current;
+    if (el) composerDrafts.select(sid, 'main', { start: el.selectionStart, end: el.selectionEnd, scrollTop: el.scrollTop });
+    draftRevisionRef.current = revision;
+    return revision;
   }, []);
+
+  const applyComposerDraft = useCallback(() => {
+    const row = composerDrafts.get(draftKeyRef.current), el = ref.current;
+    if (!row || !el) return;
+    el.value = row.text;
+    const selection = row.selections.main;
+    if (selection) { el.setSelectionRange(Math.min(row.text.length, selection.start), Math.min(row.text.length, selection.end)); el.scrollTop = selection.scrollTop; }
+    textAttachmentsRef.current = row.textAttachments; setTextAttachments(row.textAttachments);
+    draftRevisionRef.current = row.revision;
+    textareaHeightCappedRef.current = false; scheduleTextareaResize(true);
+  }, [scheduleTextareaResize]);
+
+  const openComposer = useCallback((id = 'main') => {
+    saveSessionDraft(ref.current?.value || '');
+    composerDrafts.activate(draftKeyRef.current, id);
+    setShowCommands(false); setShowFilePicker(false); setShowSessionPicker(false);
+    setEditorOpen(true);
+  }, [saveSessionDraft]);
 
   const setTextAttachmentList = useCallback((next: TextAttachment[]) => {
     textAttachmentsRef.current = next;
@@ -597,6 +624,7 @@ const ChatInputInner = forwardRef<ChatInputHandle, Props>(({
   ) => {
     const input = event.currentTarget;
     const files = Array.from(input.files || []);
+    const sourceScope = draftKeyRef.current;
     // 允许用户连续两次选择同一个文件。
     input.value = '';
     if (!files.length) return;
@@ -614,9 +642,12 @@ const ChatInputInner = forwardRef<ChatInputHandle, Props>(({
       }
       try {
         if (isImageAttachmentFile(file)) {
-          addImage(await readImageAttachment(file), 'file');
+          const image = await readImageAttachment(file);
+          if (sourceScope !== draftKeyRef.current) return;
+          addImage(image, 'file');
         } else if (isTextAttachmentFile(file)) {
           const content = await file.text();
+          if (sourceScope !== draftKeyRef.current) return;
           if (!addTextAttachment(content, 'file', file.name)) {
             errors.push(`${file.name} 没有可读取的文本`);
           }
@@ -646,35 +677,30 @@ const ChatInputInner = forwardRef<ChatInputHandle, Props>(({
   }, [setTextAttachmentList]);
 
   const restoreTextAttachment = useCallback((id: string) => {
-    const attachment = textAttachmentsRef.current.find((item) => item.id === id);
     const el = ref.current;
-    if (!attachment || !el) return;
-    const prefix = el.value;
-    el.value = prefix
-      ? `${prefix}${prefix.endsWith('\n') ? '' : '\n'}${attachment.content}`
-      : attachment.content;
-    el.selectionStart = el.selectionEnd = el.value.length;
-    const next = textAttachmentsRef.current.filter((item) => item.id !== id);
-    textAttachmentsRef.current = next;
-    setTextAttachments(next);
-    saveSessionDraft(el.value, next);
-    textareaHeightCappedRef.current = false;
-    scheduleTextareaResize(true);
-    el.focus();
-  }, [saveSessionDraft, scheduleTextareaResize]);
+    if (!el) return;
+    saveSessionDraft(el.value);
+    composerDrafts.restore(draftKeyRef.current, id);
+    applyComposerDraft(); el.focus();
+  }, [saveSessionDraft, applyComposerDraft]);
 
   useLayoutEffect(() => {
+    setEditorOpen(false);
     const el = ref.current;
     if (el) {
-      const saved = historyKey ? sessionInputDrafts.get(historyKey) : undefined;
+      const saved = draftKey ? sessionInputDrafts.get(draftKey) : undefined;
       const restored = saved?.text || '';
       const restoredAttachments = saved?.textAttachments?.map((item) => ({ ...item })) || [];
       el.value = restored;
       textAttachmentsRef.current = restoredAttachments;
       setTextAttachments(restoredAttachments);
+      imagesRef.current = saved?.images || [];
+      restoreImages(imagesRef.current);
+      draftRevisionRef.current = saved?.revision || 0;
       textareaHeightCappedRef.current = false;
       scheduleTextareaResize(true);
-      el.selectionStart = el.selectionEnd = restored.length;
+      el.setSelectionRange(saved?.selections.main?.start ?? restored.length, saved?.selections.main?.end ?? restored.length);
+      el.scrollTop = saved?.selections.main?.scrollTop || 0;
     }
     setShowCommands(false);
     filePickerLoadVersionRef.current += 1;
@@ -682,21 +708,38 @@ const ChatInputInner = forwardRef<ChatInputHandle, Props>(({
     setShowFilePicker(false);
     setShowSessionPicker(false);
     showAttachmentNotice('');
+  }, [draftKey, sessionId, restoreImages, scheduleTextareaResize, showAttachmentNotice]);
 
-    return () => {
-      if (!historyKey || !ref.current) return;
-      const value = ref.current.value;
-      const attachments = textAttachmentsRef.current;
-      if (value || attachments.length) {
-        sessionInputDrafts.set(historyKey, {
-          text: value,
-          textAttachments: attachments.map((item) => ({ ...item })),
-        });
-      } else {
-        sessionInputDrafts.delete(historyKey);
+  useLayoutEffect(() => {
+    // 身份切换的 layout effect 已换入新图片；旧 render 不可写回新作用域。
+    if (images === imagesRef.current) saveSessionDraft(ref.current?.value || '');
+  }, [images, saveSessionDraft]);
+
+  const clearSubmittedDraft = useCallback(() => {
+    composerDrafts.delete(draftKeyRef.current);
+    if (ref.current) ref.current.value = '';
+    imagesRef.current = []; clearImages();
+    textAttachmentsRef.current = []; setTextAttachments([]);
+    saveSessionDraft('');
+    textareaHeightCappedRef.current = false;
+    scheduleTextareaResize(true);
+  }, [clearImages, saveSessionDraft, scheduleTextareaResize]);
+  useLayoutEffect(() => {
+    // 全部更新仅属于当前范围。接收前后的新编辑都不会被旧回执覆盖。
+    const slot = harnessImageSubmissions.get(imageScopeRef.current);
+    for (const attempt of [slot?.current, slot?.recovery]) {
+      if (attempt && harnessImageSubmissions.shouldClear(attempt, draftRevisionRef.current)) {
+        harnessImageSubmissions.didClear(attempt);
+        clearSubmittedDraft();
       }
-    };
-  }, [historyKey, sessionId, scheduleTextareaResize, showAttachmentNotice]);
+    }
+    for (const attempt of composerSubmissions.list(imageScopeRef.current)) {
+      if (composerSubmissions.shouldClear(attempt, draftRevisionRef.current)) {
+        attempt.cleared = true;
+        clearSubmittedDraft();
+      }
+    }
+  });
 
   useEffect(() => {
     const owner = getCurrentUserProfile().userId, executor = execKey || getSessionExecKey(sessionId);
@@ -709,11 +752,17 @@ const ChatInputInner = forwardRef<ChatInputHandle, Props>(({
           id: item.id, name: item.name, content: item.content, size: item.size, source: item.source })),
           images: imagesRef.current.map(image => ({ id: image.id, base64: image.base64, mime_type: image.mime_type,
             size: image.size, width: image.width, height: image.height })),
-          selectionStart: ref.current.selectionStart, selectionEnd: ref.current.selectionEnd, scrollTop: ref.current.scrollTop };
+          selectionStart: ref.current.selectionStart, selectionEnd: ref.current.selectionEnd, scrollTop: ref.current.scrollTop,
+          composerRequests: composerSubmissions.handoff(imageScopeRef.current, draftRevisionRef.current),
+          composerMeta: { selections: composerDrafts.get(draftKeyRef.current)?.selections || {},
+            activeBlock: composerDrafts.get(draftKeyRef.current)?.activeBlock || 'main',
+            keepLongText: composerDrafts.get(draftKeyRef.current)?.keepLongText || false,
+            references: composerDrafts.get(draftKeyRef.current)?.references || [],
+            review: composerDrafts.get(draftKeyRef.current)?.review } };
       },
       import: value => {
         const row = value as any, el = ref.current;
-        if (!current() || !el || !row || Object.keys(row).some(key => !['text', 'textAttachments', 'images', 'selectionStart', 'selectionEnd', 'scrollTop'].includes(key))
+        if (!current() || !el || !row || Object.keys(row).some(key => !['text', 'textAttachments', 'images', 'selectionStart', 'selectionEnd', 'scrollTop', 'composerRequests', 'composerMeta'].includes(key))
           || typeof row.text !== 'string' || row.text.length > 1024 * 1024 || !Array.isArray(row.textAttachments) || row.textAttachments.length > 100
           || row.textAttachments.some((item: any) => !item || !['id', 'name', 'content'].every(key => typeof item[key] === 'string') || item.content.length > 10 * 1024 * 1024
             || !Number.isFinite(item.size) || item.size < 0 || item.source && !['paste', 'input', 'voice', 'file'].includes(item.source))
@@ -721,19 +770,41 @@ const ChatInputInner = forwardRef<ChatInputHandle, Props>(({
             || typeof image.base64 !== 'string' || image.base64.length > 14 * 1024 * 1024 || !/^[A-Za-z0-9+/=]*$/.test(image.base64)
             || typeof image.mime_type !== 'string' || !/^image\/[\w.+-]+$/.test(image.mime_type) || !Number.isFinite(image.size) || image.size < 0)
           || ![row.selectionStart, row.selectionEnd, row.scrollTop].every(n => Number.isFinite(n) && n >= 0)) throw new Error('输入草稿交接内容无效');
+        validateComposerMeta(row.composerMeta, row.textAttachments);
+        composerSubmissions.adopt(imageScopeRef.current, row.composerRequests, { content: row.text }, 0, true);
         el.value = row.text;
         setTextAttachmentList(row.textAttachments.map((item: TextAttachment) => ({ id: item.id, name: item.name, content: item.content, size: item.size, source: item.source })));
-        restoreImages(row.images.map((image: ImageAttachment) => ({ id: image.id, base64: image.base64, mime_type: image.mime_type, size: image.size, width: image.width, height: image.height })));
+        imagesRef.current = row.images.map((image: ImageAttachment) => ({ id: image.id, base64: image.base64, mime_type: image.mime_type, size: image.size, width: image.width, height: image.height }));
+        restoreImages(imagesRef.current);
         // 单次委托是发送时授权，不属于可迁移的草稿。
         kitApprovalDelegationRef.current = false; setKitApprovalDelegation(false);
         saveSessionDraft(row.text); scheduleTextareaResize(true);
         el.setSelectionRange(Math.min(row.text.length, row.selectionStart), Math.min(row.text.length, row.selectionEnd));
         el.scrollTop = row.scrollTop;
+        const draft = composerDrafts.ensure(draftKeyRef.current);
+        if (row.composerMeta !== undefined) {
+          const meta = row.composerMeta;
+          draft.selections = meta.selections; draft.activeBlock = meta.activeBlock; draft.keepLongText = meta.keepLongText; draft.references = meta.references;
+          if (meta.review) draft.review = meta.review;
+        }
+        composerSubmissions.adopt(imageScopeRef.current, row.composerRequests, { content: row.text, textAttachments: draft.textAttachments, images: draft.images }, draft.revision);
       },
     });
   }, [historyKey, sessionId, execKey, workingDir, restoreImages, setTextAttachmentList, saveSessionDraft, scheduleTextareaResize]);
 
   useImperativeHandle(forwardedRef, () => ({
+    startReview: (targetIds, resetSelection) => roleReviewRef.current.start(targetIds, resetSelection),
+    insertOpinion: reference => {
+      const el = ref.current;
+      if (!el || reference.sourceSessionId !== sessionIdRef.current) return;
+      const text = opinionText(reference), start = el.selectionStart, end = el.selectionEnd;
+      el.value = el.value.slice(0, start) + text + el.value.slice(end);
+      el.setSelectionRange(start + text.length, start + text.length);
+      saveSessionDraft(el.value);
+      composerDrafts.addReference(draftKeyRef.current, reference.fingerprint, JSON.stringify(reference));
+      draftRevisionRef.current = composerDrafts.ensure(draftKeyRef.current).revision;
+      scheduleTextareaResize(true); el.focus();
+    },
     insertCommand: (text, sourceSessionId) => {
       const el = ref.current;
       const command = suggestedSlashCommand(text);
@@ -792,9 +863,10 @@ const ChatInputInner = forwardRef<ChatInputHandle, Props>(({
     if (!el) return;
     const prefix = micPrefixRef.current ?? '';
     const combined = prefix ? `${prefix}\n${transcript}` : transcript;
-    const activeAttachmentId = micAttachmentIdRef.current;
+    const activeAttachmentId = textAttachmentsRef.current.some(item => item.id === micAttachmentIdRef.current) ? micAttachmentIdRef.current : null;
+    if (!activeAttachmentId) micAttachmentIdRef.current = null;
 
-    if (activeAttachmentId || combined.length >= LONG_INPUT_ATTACHMENT_CHARS) {
+    if (activeAttachmentId || (!composerDrafts.get(draftKeyRef.current)?.keepLongText && combined.length >= LONG_INPUT_ATTACHMENT_CHARS)) {
       if (activeAttachmentId) {
         const next = textAttachmentsRef.current.map((item) => (
           item.id === activeAttachmentId
@@ -803,12 +875,12 @@ const ChatInputInner = forwardRef<ChatInputHandle, Props>(({
         ));
         setTextAttachmentList(next);
       } else if (transcript) {
-        const attachment = addTextAttachment(
-          transcript,
-          'voice',
-          `voice-transcript-${textAttachmentsRef.current.filter((item) => item.source === 'voice').length + 1}.txt`,
-        );
-        micAttachmentIdRef.current = attachment?.id || null;
+        const id = uuid();
+        saveSessionDraft(combined);
+        composerDrafts.pack(draftKeyRef.current, { id, name: `voice-transcript-${textAttachmentsRef.current.length + 1}.txt`, content: transcript, size: transcript.length, source: 'voice' }, prefix ? prefix.length + 1 : 0, combined.length);
+        micAttachmentIdRef.current = id;
+        applyComposerDraft();
+        return;
       }
       el.value = prefix;
     } else {
@@ -819,7 +891,7 @@ const ChatInputInner = forwardRef<ChatInputHandle, Props>(({
     textareaHeightCappedRef.current = false;
     scheduleTextareaResize(true);
   }, [
-    addTextAttachment,
+    applyComposerDraft,
     saveSessionDraft,
     scheduleTextareaResize,
     setTextAttachmentList,
@@ -1249,18 +1321,36 @@ const ChatInputInner = forwardRef<ChatInputHandle, Props>(({
   const insertSessionRefRef = useRef(insertSessionRef);
   insertSessionRefRef.current = insertSessionRef;
 
+  const roleReview = useRoleReviewComposer({ session: sessionId || '', executor: imageScope.executor, scope: draftKey, textarea: ref, changed: applyComposerDraft, onSubmitted: onReviewSubmitted, onOpenResults: onOpenOpinions, onManageRoles: () => setRoleLibraryOpen(true) });
+  const roleReviewRef = useRef(roleReview); roleReviewRef.current = roleReview;
+  useEffect(() => { if (roleReview.review.roles.length) { kitApprovalDelegationRef.current = false; setKitApprovalDelegation(false); } }, [roleReview.review.roles.length]);
+  const followup = useFollowupSuggestion(sessionId || '', imageScope.executor, draftKey,
+    isFocused === false || moreToolsOpen || editorOpen || roleLibraryOpen || roleReview.open || roleReview.review.roles.length > 0 || showCommands || showFilePicker || showSessionPicker || voiceConversationActive || seqCount > 0);
+  const followupRef = useRef(followup); followupRef.current = followup;
+  const acceptFollowup = useCallback(() => {
+    const value = followupRef.current.suggestion, el = ref.current;
+    if (!el || el.value || imagesRef.current.length || textAttachmentsRef.current.length || composingRef.current
+      || isStreamingRef.current || value?.state !== 'ready' || showCommandsRef.current || showFilePickerRef.current || showSessionPickerRef.current) return;
+    followupRef.current.dismiss();
+    el.value = value.text; el.setSelectionRange(value.text.length, value.text.length);
+    saveSessionDraft(el.value); scheduleTextareaResize(true); el.focus();
+  }, [saveSessionDraft, scheduleTextareaResize]);
+
   // ── 发送 ──
   const handleSend = useCallback(() => {
+    if (roleReviewRef.current.review.roles.length) { kitApprovalDelegationRef.current = false; setKitApprovalDelegation(false); void roleReviewRef.current.send(); return; }
+    const sendDelegation = kitApprovalDelegationRef.current;
     let text = ref.current?.value.trim() || '';
     const imgs = imagesRef.current;
     const textFiles = textAttachmentsRef.current;
     if (!text && imgs.length === 0 && textFiles.length === 0) return;
+    followupRef.current.dismiss();
     if (isSkillCommand(text) && (isStreamingRef.current || seqCountRef.current > 0)) {
       showAttachmentNotice('Skill 命令尚未发送，请等待当前轮及队列结束；命令与参数已保留在输入框。');
       return;
     }
     // 不把本次委托悄悄带入自动队列、斜杠命令或未来轮次。
-    if (kitApprovalDelegationRef.current && (isStreamingRef.current || seqCountRef.current > 0 || text.startsWith('/'))) {
+    if (sendDelegation && (isStreamingRef.current || seqCountRef.current > 0 || text.startsWith('/'))) {
       showAttachmentNotice('Kit 代确认只支持空闲时直接发送普通消息，请关闭代确认开关或等待当前轮结束。');
       return;
     }
@@ -1271,29 +1361,63 @@ const ChatInputInner = forwardRef<ChatInputHandle, Props>(({
     setShowFilePicker(false);
     setShowSessionPicker(false);
     const historyPersisted = text ? pushHistory(text) : true;
+    const harnessImage = imgs.length > 0 && backends.find(item => item.id === activeBackendId)?.type === 'deepseek-harness';
+    const imageDraft = { scopeKey: imageScopeRef.current.key,
+      draftRevision: saveSessionDraft(ref.current?.value || '', textFiles), originalContent: ref.current?.value || '' };
+    if (!harnessImage && composerSubmissions.list(imageScopeRef.current).some(attempt =>
+      attempt.snapshot.draftRevision === imageDraft.draftRevision && attempt.receipt.state !== 'rejected')) {
+      showAttachmentNotice('这份草稿已有提交，请核对原回执；没有重复发送。'); return;
+    }
     // ★ 图像 backend：自动注入 --size 参数
     if (isImageBackendRef.current && imageSizeRef.current && imageSizeRef.current !== 'auto' && text) {
       text = `${text} --size ${imageSizeRef.current}`;
     }
     // 默认序列行为：空闲且没有队列时直接发送；模型忙碌或已有待发项时，
     // 新输入自动排到队尾，不打断当前回答。
+    let result: ChatSendResult | Promise<ChatSendResult>;
     if ((isStreamingRef.current || seqCountRef.current > 0) && onQueueTaskRef.current) {
-      onQueueTaskRef.current(
+      result = onQueueTaskRef.current(
         text,
         imgs.length > 0 ? imgs : undefined,
         textFiles.length > 0 ? textFiles : undefined,
+        imageDraft,
       );
     } else {
-      onSendRef.current(
+      result = onSendRef.current(
         text,
         imgs.length > 0 ? imgs : undefined,
         textFiles.length > 0 ? textFiles : undefined,
-        kitApprovalDelegationRef.current,
+        sendDelegation,
         isSkillCommand(text) ? skillInvocation(text, skillCommandsRef.current) : undefined,
+        imageDraft,
       );
     }
     kitApprovalDelegationRef.current = false;
     setKitApprovalDelegation(false);
+    if (harnessImage) {
+      // Promise resolve 也不是接收证据；统一订阅回执，根据草稿修订清理。
+      const scopeKey = imageScopeRef.current.key;
+      void Promise.resolve(result).then(value => {
+        if (imageScopeRef.current.key !== scopeKey) return;
+        // 正常发送不增加提示；拒绝和未知结果复用现有错误反馈，不能静默吞掉。
+        if (value?.kind === 'harness-image'
+            && ['not_submitted', 'rejected', 'failed', 'unknown'].includes(value.receipt.state)) {
+          showAttachmentNotice(imageReceiptLabel(value.receipt));
+        }
+      }).catch(() => {
+        if (imageScopeRef.current.key === scopeKey) showAttachmentNotice('图片结果未确认，原输入已保留，请核对回执，勿重复发送。');
+      });
+      setShowCommands(false);
+      return;
+    }
+    const submittedScope = imageScopeRef.current.key;
+    void Promise.resolve(result).then(value => {
+      if (imageScopeRef.current.key !== submittedScope) return;
+      if (value?.kind === 'composer' && ['rejected', 'unknown'].includes(value.receipt.state))
+        showAttachmentNotice(value.receipt.reason || '接收未确认，原草稿已保留');
+    }).catch(() => { if (imageScopeRef.current.key === submittedScope) showAttachmentNotice('接收结果未知，原稿已保留，请核对后处理。'); });
+    // 普通发送/排队均由结构化接收回执清理；本地 slash 命令沿用原交互。
+    if (!text.startsWith('/') || isSkillCommand(text)) { setShowCommands(false); return; }
     showAttachmentNotice(historyPersisted === false ? '输入历史暂时无法保存到本机存储，本窗口仍可回看；重启后可能无法恢复。' : '', 'info');
     if (ref.current) {
       ref.current.value = '';
@@ -1301,18 +1425,26 @@ const ChatInputInner = forwardRef<ChatInputHandle, Props>(({
       scheduleTextareaResize(true);
       ref.current.focus();   // 点击发送按钮后也继续输入，连续任务自然排队
     }
-    if (historyKeyRef.current) sessionInputDrafts.delete(historyKeyRef.current);
+    if (draftKeyRef.current) sessionInputDrafts.delete(draftKeyRef.current);
     textAttachmentsRef.current = [];
     setTextAttachments([]);
     clearImagesRef.current();
     setShowCommands(false);
-  }, [pushHistory, scheduleTextareaResize, showAttachmentNotice]);
+  }, [pushHistory, scheduleTextareaResize, showAttachmentNotice, saveSessionDraft, backends, activeBackendId]);
 
   // ── 键盘事件 ──
   const handleKeyDown = useCallback(
-    (e: React.KeyboardEvent) => {
-      if (e.nativeEvent.isComposing || composingRef.current || e.keyCode === 229)
+    (e: React.KeyboardEvent | KeyboardEvent, expanded = false) => {
+      if (('nativeEvent' in e ? e.nativeEvent.isComposing : e.isComposing) || composingRef.current || e.keyCode === 229)
         return;
+      if (roleReviewRef.current.onKey(e)) return;
+      if (!expanded && (e.ctrlKey || e.metaKey) && ['z', 'y'].includes(e.key.toLowerCase())) {
+        const redo = e.key.toLowerCase() === 'y' || e.shiftKey;
+        if (!redo && composerDrafts.canUndoTransform(draftKeyRef.current)) {
+          e.preventDefault(); composerDrafts.undoTransform(draftKeyRef.current); applyComposerDraft(); return;
+        }
+        if (composerDrafts.undo(draftKeyRef.current, 'main', redo)) { e.preventDefault(); applyComposerDraft(); return; }
+      }
 
       // ★ @SESSION: 会话引用选择器键盘导航（优先于文件选择器）
       if (showSessionPickerRef.current) {
@@ -1444,7 +1576,7 @@ const ChatInputInner = forwardRef<ChatInputHandle, Props>(({
             ref.current.value = cmd.name + (cmd.requiresArguments ? ' ' : '');
           }
           setShowCommands(false);
-          if (cmd?.requiresArguments || cmd?.kind === 'project') {
+          if (expanded || cmd?.requiresArguments || cmd?.kind === 'project') {
             saveSessionDraft(ref.current?.value || '');
             scheduleTextareaResize(true);
             return;
@@ -1452,6 +1584,13 @@ const ChatInputInner = forwardRef<ChatInputHandle, Props>(({
           handleSend();
           return;
         }
+      }
+
+      if (expanded) return;
+      if (!showCommandsRef.current && !showSessionPickerRef.current && !showFilePickerRef.current
+        && followupRef.current.suggestion?.state === 'ready' && !isStreamingRef.current) {
+        if (e.key === 'Tab' && !e.shiftKey && !e.ctrlKey && !e.metaKey && !e.altKey) { e.preventDefault(); acceptFollowup(); return; }
+        if (e.key === 'Escape') { e.preventDefault(); followupRef.current.dismiss(); return; }
       }
 
       // ★ 输入历史浏览（Linux 风格 ↑↓）
@@ -1539,10 +1678,11 @@ const ChatInputInner = forwardRef<ChatInputHandle, Props>(({
         void handleSend();
       }
     },
-    [handleSend, saveSessionDraft, scheduleTextareaResize]
+    [handleSend, saveSessionDraft, scheduleTextareaResize, applyComposerDraft, acceptFollowup]
   );
 
   const handleCompositionStart = useCallback(() => {
+    followupRef.current.dismiss();
     composingRef.current = true;
   }, []);
   const handleCompositionEnd = useCallback(() => {
@@ -1550,6 +1690,7 @@ const ChatInputInner = forwardRef<ChatInputHandle, Props>(({
   }, []);
 
   const handleTextPaste = useCallback((event: React.ClipboardEvent<HTMLTextAreaElement>) => {
+    if (composingRef.current) return;
     const clipboard = event.clipboardData;
     if (!clipboard) return;
     const hasImage = Array.from(clipboard.items || []).some(
@@ -1559,9 +1700,11 @@ const ChatInputInner = forwardRef<ChatInputHandle, Props>(({
     const text = clipboard.getData('text/plain');
     if (text.length < LARGE_PASTE_ATTACHMENT_CHARS) return;
     event.preventDefault();
-    addTextAttachment(text, 'paste');
-    saveSessionDraft(ref.current?.value ?? '', textAttachmentsRef.current);
-  }, [addTextAttachment, saveSessionDraft]);
+    const el = ref.current!;
+    saveSessionDraft(el.value);
+    composerDrafts.pack(draftKeyRef.current, { id: uuid(), name: `pasted-text-${textAttachmentsRef.current.length + 1}.txt`, content: text, size: text.length, source: 'paste' }, el.selectionStart, el.selectionEnd, true);
+    applyComposerDraft(); showAttachmentNotice('长粘贴已收纳，可点击文本块编辑或撤销收纳。', 'info');
+  }, [applyComposerDraft, saveSessionDraft, showAttachmentNotice]);
 
   // ── 输入变化：自动附件化 + 合帧 auto-resize + 斜杠/@ 检测 ──
   const handleInput = useCallback((event: React.FormEvent<HTMLTextAreaElement>) => {
@@ -1575,11 +1718,11 @@ const ChatInputInner = forwardRef<ChatInputHandle, Props>(({
     }
 
     let text = el.value;
-    if (!composingRef.current && text.length >= LONG_INPUT_ATTACHMENT_CHARS) {
-      addTextAttachment(text, 'input');
-      el.value = '';
+    if (!editorOpenRef.current && !composingRef.current && !composerDrafts.get(draftKeyRef.current)?.keepLongText && text.length >= LONG_INPUT_ATTACHMENT_CHARS) {
+      saveSessionDraft(text);
+      composerDrafts.pack(draftKeyRef.current, { id: uuid(), name: `long-input-${textAttachmentsRef.current.length + 1}.txt`, content: text, size: text.length, source: 'input' }, 0, text.length);
+      applyComposerDraft();
       text = '';
-      saveSessionDraft('', textAttachmentsRef.current);
       textareaHeightCappedRef.current = false;
       scheduleTextareaResize(true);
       sessionLookupVersionRef.current += 1;
@@ -1595,6 +1738,9 @@ const ChatInputInner = forwardRef<ChatInputHandle, Props>(({
     scheduleTextareaResize(inputType.startsWith('delete'));
 
     let cursor = el.selectionStart ?? text.length;
+    if (!composingRef.current && roleReviewRef.current.onInput(text, cursor)) {
+      setShowCommands(false); setShowFilePicker(false); setShowSessionPicker(false); return;
+    }
     let beforeCursor = text.substring(0, cursor);
     const lastAt = beforeCursor.lastIndexOf('@');
 
@@ -1677,7 +1823,7 @@ const ChatInputInner = forwardRef<ChatInputHandle, Props>(({
     } else {
       setShowCommands(false);
     }
-  }, [addTextAttachment, loadFileDirectory, saveSessionDraft, scheduleTextareaResize]);
+  }, [applyComposerDraft, loadFileDirectory, saveSessionDraft, scheduleTextareaResize]);
 
   // ── 点击选择命令 ──
   const handleSelectCommand = useCallback((cmd: SlashCommand) => {
@@ -1725,8 +1871,149 @@ const ChatInputInner = forwardRef<ChatInputHandle, Props>(({
   // 是否可以返回上级目录
   const parentDir = showFilePicker ? getParentDir(currentDir) : null;
 
+  const openOpinionSelector = () => {
+    const el = ref.current;
+    if (el) {
+      const end = el.selectionStart, start = el.value.lastIndexOf('@', end - 1);
+      if (start >= 0) {
+        el.value = el.value.slice(0, start) + el.value.slice(end); el.setSelectionRange(start, start);
+        saveSessionDraft(el.value); scheduleTextareaResize(true);
+      }
+    }
+    setShowFilePicker(false); setShowSessionPicker(false); setEditorOpen(false); onOpenOpinions?.();
+  };
+  const referenceMenus = <>
+      {showSessionPicker && (
+        <div style={filePickerPopupStyle}>
+          <div style={filePickerHeaderStyle}>
+            {onOpenOpinions && <button type="button" style={fileActionStyle} onClick={openOpinionSelector}>@ 角色意见</button>}
+            <span style={{ opacity: 0.6, fontSize: 10 }}>💬</span>
+            <span style={{ flex: 1 }}>引用会话 {sessionQuery ? `· ${sessionQuery}` : ''}</span>
+          </div>
+          {sessionRefs.length === 0 && (
+            <div style={{ padding: '8px 12px', color: 'var(--theme-text-muted)', fontSize: 12 }}>无匹配会话</div>
+          )}
+          {sessionRefs.map((s: any, i: number) => (
+            <div
+              key={s.id}
+              style={{
+                ...fileItemStyle,
+                background: i === sessionSelectedIndex ? 'var(--theme-bg-tertiary, #eaeef2)' : 'transparent',
+              }}
+              onClick={() => insertSessionRefRef.current(s)}
+              onMouseEnter={() => setSessionSelectedIndex(i)}
+            >
+              <span>{s.sessionType === 'loop' ? '🔁' : '💬'}</span>
+              <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{s.title || s.id}</span>
+              <span style={{ fontSize: 10, opacity: 0.55 }}>{String(s.id || '').slice(0, 8)}</span>
+            </div>
+          ))}
+          <div style={filePickerFooterStyle}>
+            ↑↓ 导航 · Enter/Tab 引用 · Esc 关闭
+          </div>
+        </div>
+      )}
+
+      {/* ★ @ 文件选择器弹窗 */}
+      {showFilePicker && (
+        <div ref={filePopupRef} style={filePickerPopupStyle} role="dialog" aria-label="引用文件或目录"
+          onMouseDown={(event) => event.preventDefault()}>
+          {/* 当前目录路径 */}
+          <div style={filePickerHeaderStyle}>
+            {onOpenOpinions && <button type="button" style={fileActionStyle} onClick={openOpinionSelector}>@ 角色意见</button>}
+            <span style={{ opacity: 0.6, fontSize: 10 }}>📁</span>
+            {parentDir && <button type="button" tabIndex={-1} aria-label="上级目录" title="上级目录（←）"
+              style={fileActionStyle} onClick={() => navigateToDirRef.current(parentDir)}>←</button>}
+            <span title={currentDir === '.' ? workingDir : currentDir} style={{ flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', direction: 'rtl', textAlign: 'left' }}>
+              {currentDir === '.' ? (workingDir || '.').replace(/\\/g, '/').split('/').pop() || '.' : currentDir}
+            </span>
+            <button type="button" tabIndex={-1} style={fileActionStyle} disabled={fileLoading || !!fileError}
+              title="引用当前目录（Ctrl/⌘+Enter），只填入，不发送"
+              onClick={() => insertFileRefRef.current(currentDir, true)}>引用当前目录</button>
+          </div>
+          {fileLoading && <div role="status" style={{ padding: 10, fontSize: 12 }}>正在读取目录…</div>}
+          {fileError && <div role="alert" style={{ padding: 10, fontSize: 12 }}>{fileError}
+            <button type="button" style={fileActionStyle} onClick={() => loadFileDirectory(currentDir)}>重试</button>
+          </div>}
+          {!fileLoading && !fileError && filteredEntries.length === 0 && (
+            <div style={{ padding: '8px 12px', color: 'var(--theme-text-muted)', fontSize: 12 }}>
+              {fileQuery ? '无匹配文件或目录' : '空目录，可直接引用当前目录'}
+            </div>
+          )}
+          {filteredEntries.map((entry, i) => (
+            <div
+              key={entry.path}
+              data-file-index={i}
+              style={{
+                ...fileItemStyle,
+                background: i === fileSelectedIndex ? 'var(--theme-bg-tertiary, #eaeef2)' : 'transparent',
+              }}
+              onMouseEnter={() => setFileSelectedIndex(i)}
+            >
+              <button type="button" tabIndex={-1} aria-label={`引用${entry.isDir ? '目录' : '文件'} ${entry.name}`}
+                title={`${entry.path} · 点击引用，不发送`}
+                style={{ ...fileActionStyle, flex: 1, minWidth: 0, display: 'flex', gap: 8, textAlign: 'left', border: 0, background: 'transparent' }}
+                onClick={() => insertFileRefRef.current(entry.path, entry.isDir)}>
+                <span>{entry.isDir ? '📁' : '📄'}</span>
+                <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{entry.name}</span>
+              </button>
+              {entry.isDir && <button type="button" tabIndex={-1} aria-label={`进入目录 ${entry.name}`}
+                title="进入目录（Tab / →）" style={fileActionStyle}
+                onClick={() => navigateToDirRef.current(entry.path)}>进入 ›</button>}
+            </div>
+          ))}
+          <div style={filePickerFooterStyle}>
+            ↑↓ 选择 · Enter 引用 · Tab/→ 进入 · Ctrl+Enter 当前目录 · Esc 关闭
+          </div>
+        </div>
+      )}
+
+      {/* ★ 斜杠命令弹窗 */}
+      {showCommands && (
+        <div ref={popupRef} style={commandPopupStyle} role="listbox" aria-label="聊天命令">
+          <div style={{ padding: '6px 10px', fontSize: 11, color: 'var(--theme-text-muted)', overflowWrap: 'anywhere' }}>
+            Skill 执行节点：{getExecutors().find(item => item.key === execKey)?.label || execKey || '当前会话节点'} · {workingDir || '未设置项目目录'}
+            <div>{commandLoading ? '读取 Skill 与项目命令…' : commandError || '扩展命令随对应 Skill 提供；选择只填草稿，发送才执行，不自动安装依赖。'}</div>
+            <button type="button" aria-label="刷新 Skill 命令" onClick={() => setCommandRevision(value => value + 1)} disabled={commandLoading}
+              style={{ marginTop: 4, padding: '4px 8px', borderRadius: 5, fontSize: 11,
+                border: '1px solid var(--theme-border, rgba(255,255,255,0.12))',
+                background: 'var(--theme-bg-tertiary)', color: 'var(--theme-text-muted)',
+                cursor: commandLoading ? 'wait' : 'pointer', opacity: commandLoading ? 0.6 : 1 }}>
+              刷新命令
+            </button>
+          </div>
+          {!commandLoading && !commandError && filteredCommands.length === 0 && <div style={{ padding: 10, fontSize: 12 }}>没有匹配命令。请先在本节点安装并绑定 Skill，或输入 /skill 技能名 参数查看具体检查结果。</div>}
+          {filteredCommands.map((cmd, i) => (
+            <div
+              key={cmd.name}
+              role="option" aria-selected={i === selectedIndex}
+              title={cmd.unavailableReason || cmd.source || 'AgentWithU 应用命令'}
+              style={{
+                ...commandItemStyle,
+                background: i === selectedIndex ? 'var(--theme-bg-tertiary, #eaeef2)' : 'transparent',
+              }}
+              onClick={() => handleSelectCommand(cmd)}
+              onMouseEnter={() => setSelectedIndex(i)}
+            >
+              <span style={{ fontFamily: 'monospace', fontWeight: 600, color: 'var(--theme-accent, #0969da)', minWidth: 0, overflowWrap: 'anywhere', display: 'inline-block' }}>
+                {cmd.name}
+              </span>
+              <span style={{ color: 'var(--theme-text-muted, #656d76)', fontSize: 12 }}>
+                {cmd.unavailableReason || cmd.description}{cmd.source && <small style={{ display: 'block' }}>来源：{cmd.source}</small>}
+              </span>
+            </div>
+          ))}
+          <div style={{ padding: '4px 10px', fontSize: 10, color: 'var(--theme-text-muted, #656d76)', borderTop: '1px solid var(--theme-border, rgba(0,0,0,0.08))' }}>
+            ↑↓ 导航 · Tab 补全 · Skill/带参数命令先填入，发送后执行 · Esc 关闭
+          </div>
+        </div>
+      )}
+
+      {roleReview.menu}
+  </>;
+
   return (
-    <div className="awu-composer" style={{ padding: 'var(--ui-composer-padding, 9px 18px 14px)', borderTop: isStreaming ? '1px solid var(--theme-success-border, rgba(50,182,122,.35))' : '1px solid transparent', background: 'var(--theme-bg, #ffffff)', position: 'relative', transition: 'border-top-color 0.2s ease' }}>
+    <div className="awu-composer" style={{ padding: 'var(--ui-composer-padding, 9px 18px 14px)', borderTop: isStreaming ? '1px solid var(--theme-success-border, rgba(50,182,122,.35))' : '1px solid var(--theme-border, #dce1e8)', background: 'var(--theme-bg, #ffffff)', position: 'relative', transition: 'border-top-color 0.2s ease' }}>
       <input
         ref={attachmentInputRef}
         type="file"
@@ -1788,22 +2075,18 @@ const ChatInputInner = forwardRef<ChatInputHandle, Props>(({
           </div>
         </div>
       )}
-      {/* ★ 工具栏：统一的图标按钮 */}
+      {workflowTools && <div aria-label="会话协作工具" style={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 2, paddingBottom: 7, marginBottom: 6,
+        borderBottom: '1px solid var(--theme-border, #dce1e8)' }}>{workflowTools}</div>}
+      {/* 常用工具保持紧凑；低频操作按需展开。 */}
       <div style={{ display: 'flex', gap: 6, marginBottom: 6, alignItems: 'center', flexWrap: 'wrap' }}>
-        <ToolbarBtn
+        {!isMobile && <ToolbarBtn
           icon="⚡"
           title="跳过确认"
           active={skipPermissions}
           compact={isMobile}
           onClick={() => onSkipPermissionsChange?.(!skipPermissions)}
-        />
-        <ToolbarBtn
-          icon="🧹"
-          title="新会话（清空上下文，同目录）"
-          compact={isMobile}
-          onClick={handleCompact}
-        />
-        {runtimeConfigurable && (
+        />}
+        {!isMobile && runtimeConfigurable && (
           <ToolbarBtn
             icon="⚙"
             title={`切换本 Session 模型${activeBackend?.type === 'codex-office' ? ' / 推理档位' : ''}（当前：${formatRuntimeLabel(activeBackend, sessionRuntime)}）`}
@@ -1812,28 +2095,24 @@ const ChatInputInner = forwardRef<ChatInputHandle, Props>(({
             onClick={() => { if (!showRuntimePicker) onRefreshBackends?.(); setShowRuntimePicker((value) => !value); }}
           />
         )}
-        {onAdjustFontSize && (
-          <div style={{ display: 'inline-flex', alignItems: 'center', gap: 2, marginLeft: 2 }}
-            title={`对话字号${fontSize ? ` ${fontSize}px` : ''}（A− / A+ 调整，全局生效）`}>
-            <ToolbarBtn icon="A−" title="缩小对话字号" compact={isMobile} onClick={() => onAdjustFontSize(-1)} />
-            <ToolbarBtn icon="A+" title="放大对话字号" compact={isMobile} onClick={() => onAdjustFontSize(1)} />
-          </div>
-        )}
         <ToolbarBtn
           icon="＋"
           title="添加附件（图片或文本文件）"
           compact={isMobile}
           onClick={() => attachmentInputRef.current?.click()}
         />
+        <ToolbarBtn icon="⛶" title="展开编辑消息和文本块" compact={isMobile} onClick={() => openComposer()} />
+        <ToolbarBtn icon="#" title="维护角色库" compact={isMobile} onClick={() => setRoleLibraryOpen(true)} />
+        {roleLibraryOpen && sessionId && <RoleLibrary session={sessionId} executor={imageScope.executor} backends={backends || []} backendId={activeBackendId} onClose={() => setRoleLibraryOpen(false)} />}
         {!isImageBackend && <button type="button" role="switch" aria-label="本次允许 Kit 代确认"
-          aria-checked={kitApprovalDelegation} disabled={isStreaming || seqCount > 0}
-          onClick={() => setKitApprovalDelegation(value => !value)}
+          aria-checked={kitApprovalDelegation} disabled={isStreaming || seqCount > 0 || roleReview.review.roles.length > 0}
+          onClick={() => { kitApprovalDelegationRef.current = !kitApprovalDelegationRef.current; setKitApprovalDelegation(kitApprovalDelegationRef.current); }}
           title={isStreaming || seqCount > 0 ? '等待当前轮和队列结束后，可为一次直接发送开启 Kit 代确认' :
             '仅授权本次发送所选的一个 Kit 运行/链，6 小时内有效。Agent 必须核对冻结计划；发送后自动关闭，不继承到队列、语音或下次发送。'}
           style={{ display: 'inline-flex', alignItems: 'center', gap: 5, whiteSpace: 'nowrap',
-            minHeight: isMobile ? 44 : 'var(--ui-control-height, 28px)', padding: '3px 8px', borderRadius: 5,
+            minHeight: isMobile ? 44 : 'var(--ui-control-height, 28px)', padding: '3px 8px', borderRadius: 8,
             border: `1px solid ${kitApprovalDelegation ? 'var(--theme-accent)' : 'var(--theme-border)'}`,
-            background: kitApprovalDelegation ? 'var(--theme-accent-bg)' : 'var(--theme-bg-secondary)',
+            background: kitApprovalDelegation ? 'var(--theme-accent-bg)' : 'transparent',
             color: kitApprovalDelegation ? 'var(--theme-accent)' : 'var(--theme-text-muted)',
             fontSize: 11, cursor: isStreaming || seqCount > 0 ? 'not-allowed' : 'pointer',
             opacity: isStreaming || seqCount > 0 ? .5 : 1 }}>
@@ -1845,6 +2124,38 @@ const ChatInputInner = forwardRef<ChatInputHandle, Props>(({
           </span>
           Kit 代确认{kitApprovalDelegation && <span style={{ fontWeight: 650 }}> · 仅本次</span>}
         </button>}
+        <button type="button" role="switch" aria-label="影子续写建议" aria-checked={followup.enabled}
+          disabled={followup.saving} onClick={() => void followup.toggle()}
+          title={followup.notice || '仅为后续成功回答生成一条建议，独立调用计费；Tab 接受，仅填草稿。默认关闭。'}
+          style={{ display: 'inline-flex', alignItems: 'center', gap: 6, minHeight: isMobile ? 44 : 30, padding: '3px 8px', borderRadius: 8, fontSize: 11,
+            border: '1px solid var(--theme-border)', background: followup.enabled ? 'var(--theme-accent-bg)' : 'transparent',
+            color: followup.enabled ? 'var(--theme-accent)' : 'var(--theme-text-muted)', cursor: 'pointer' }}>
+          <WorkflowIcon name="spark" size={14} />影子建议{followup.saving ? ' · 保存中' : followup.enabled ? ' · 开' : ''}
+        </button>
+        <FollowupSettings key={draftKey} config={followup.config} supported={followup.configSupported} saving={followup.saving} notice={followup.notice}
+          executor={imageScope.executor} backends={backends} backendId={activeBackendId} sessionRuntime={sessionRuntime} onSave={followup.saveConfig} />
+        <WorkflowPopover label="更多输入工具" title={isMobile ? '' : '更多'} icon="more" open={moreToolsOpen} onOpenChange={setMoreToolsOpen} width={300}>
+          <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'stretch', gap: 10 }}>
+            {isMobile && <WorkflowButton icon="shield" aria-pressed={skipPermissions} onClick={() => onSkipPermissionsChange?.(!skipPermissions)}>跳过执行确认{skipPermissions ? ' · 开' : ' · 关'}</WorkflowButton>}
+            {isMobile && runtimeConfigurable && <WorkflowButton icon="settings" onClick={() => { onRefreshBackends?.(); setMoreToolsOpen(false); setShowRuntimePicker(true); }}>模型与推理设置</WorkflowButton>}
+        {onAdjustFontSize && (
+          <div style={{ display: 'inline-flex', alignItems: 'center', gap: 2, marginLeft: 2 }}
+            title={`对话字号${fontSize ? ` ${fontSize}px` : ''}（A− / A+ 调整，全局生效）`}>
+            <ToolbarBtn icon="A−" title="缩小对话字号" compact={isMobile} onClick={() => onAdjustFontSize(-1)} />
+            <ToolbarBtn icon="A+" title="放大对话字号" compact={isMobile} onClick={() => onAdjustFontSize(1)} />
+          </div>
+        )}
+        <WorkflowButton icon="block" aria-label="将选中正文收纳为文本块" onClick={() => {
+          const el = ref.current; if (!el?.value || composingRef.current) return;
+          saveSessionDraft(el.value);
+          const start = el.selectionStart === el.selectionEnd ? 0 : el.selectionStart, end = el.selectionStart === el.selectionEnd ? el.value.length : el.selectionEnd;
+          const content = el.value.slice(start, end);
+          composerDrafts.pack(draftKeyRef.current, { id: uuid(), name: `selected-text-${textAttachmentsRef.current.length + 1}.txt`, content, size: content.length, source: 'input' }, start, end);
+          applyComposerDraft(); setMoreToolsOpen(false);
+        }}>收纳正文为文本块</WorkflowButton>
+            <WorkflowButton icon="clear" onClick={() => { setMoreToolsOpen(false); handleCompact(); }}>新会话 · 同目录</WorkflowButton>
+          </div>
+        </WorkflowPopover>
         {/* 截图按钮:桌面端独有,浏览器无法调起系统截图工具 */}
         {isTauri() && (
           <ToolbarBtn
@@ -1963,160 +2274,57 @@ const ChatInputInner = forwardRef<ChatInputHandle, Props>(({
       )}
 
       <ImagePreview images={images} onRemove={removeImage} />
+      <ComposerSubmissionStatus scope={imageScope} />
+      <ComposerTransformUndo scope={draftKey} onChange={applyComposerDraft} />
+      {editorOpen && <ComposerEditor scope={draftKey} onChange={applyComposerDraft}
+        menu={referenceMenus} onInput={() => ref.current?.dispatchEvent(new Event('input', { bubbles: true }))}
+        onMenuKey={event => handleKeyDown(event, true)}
+        onClose={() => { setEditorOpen(false); ref.current?.focus(); }} onSend={() => handleSend()} />}
       <TextAttachmentPreview
         attachments={textAttachments}
         onRemove={removeTextAttachment}
         onRestore={restoreTextAttachment}
         onUpdate={updateTextAttachment}
+        onEdit={openComposer}
       />
 
       {/* ★ @SESSION: 会话引用选择器弹窗 */}
-      {showSessionPicker && (
-        <div style={filePickerPopupStyle}>
-          <div style={filePickerHeaderStyle}>
-            <span style={{ opacity: 0.6, fontSize: 10 }}>💬</span>
-            <span style={{ flex: 1 }}>引用会话 {sessionQuery ? `· ${sessionQuery}` : ''}</span>
-          </div>
-          {sessionRefs.length === 0 && (
-            <div style={{ padding: '8px 12px', color: 'var(--theme-text-muted)', fontSize: 12 }}>无匹配会话</div>
-          )}
-          {sessionRefs.map((s: any, i: number) => (
-            <div
-              key={s.id}
-              style={{
-                ...fileItemStyle,
-                background: i === sessionSelectedIndex ? 'var(--theme-bg-tertiary, #eaeef2)' : 'transparent',
-              }}
-              onClick={() => insertSessionRefRef.current(s)}
-              onMouseEnter={() => setSessionSelectedIndex(i)}
-            >
-              <span>{s.sessionType === 'loop' ? '🔁' : '💬'}</span>
-              <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{s.title || s.id}</span>
-              <span style={{ fontSize: 10, opacity: 0.55 }}>{String(s.id || '').slice(0, 8)}</span>
-            </div>
-          ))}
-          <div style={filePickerFooterStyle}>
-            ↑↓ 导航 · Enter/Tab 引用 · Esc 关闭
-          </div>
-        </div>
-      )}
+      {!editorOpen && referenceMenus}
 
-      {/* ★ @ 文件选择器弹窗 */}
-      {showFilePicker && (
-        <div ref={filePopupRef} style={filePickerPopupStyle} role="dialog" aria-label="引用文件或目录"
-          onMouseDown={(event) => event.preventDefault()}>
-          {/* 当前目录路径 */}
-          <div style={filePickerHeaderStyle}>
-            <span style={{ opacity: 0.6, fontSize: 10 }}>📁</span>
-            {parentDir && <button type="button" tabIndex={-1} aria-label="上级目录" title="上级目录（←）"
-              style={fileActionStyle} onClick={() => navigateToDirRef.current(parentDir)}>←</button>}
-            <span title={currentDir === '.' ? workingDir : currentDir} style={{ flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', direction: 'rtl', textAlign: 'left' }}>
-              {currentDir === '.' ? (workingDir || '.').replace(/\\/g, '/').split('/').pop() || '.' : currentDir}
-            </span>
-            <button type="button" tabIndex={-1} style={fileActionStyle} disabled={fileLoading || !!fileError}
-              title="引用当前目录（Ctrl/⌘+Enter），只填入，不发送"
-              onClick={() => insertFileRefRef.current(currentDir, true)}>引用当前目录</button>
-          </div>
-          {fileLoading && <div role="status" style={{ padding: 10, fontSize: 12 }}>正在读取目录…</div>}
-          {fileError && <div role="alert" style={{ padding: 10, fontSize: 12 }}>{fileError}
-            <button type="button" style={fileActionStyle} onClick={() => loadFileDirectory(currentDir)}>重试</button>
-          </div>}
-          {!fileLoading && !fileError && filteredEntries.length === 0 && (
-            <div style={{ padding: '8px 12px', color: 'var(--theme-text-muted)', fontSize: 12 }}>
-              {fileQuery ? '无匹配文件或目录' : '空目录，可直接引用当前目录'}
-            </div>
-          )}
-          {filteredEntries.map((entry, i) => (
-            <div
-              key={entry.path}
-              data-file-index={i}
-              style={{
-                ...fileItemStyle,
-                background: i === fileSelectedIndex ? 'var(--theme-bg-tertiary, #eaeef2)' : 'transparent',
-              }}
-              onMouseEnter={() => setFileSelectedIndex(i)}
-            >
-              <button type="button" tabIndex={-1} aria-label={`引用${entry.isDir ? '目录' : '文件'} ${entry.name}`}
-                title={`${entry.path} · 点击引用，不发送`}
-                style={{ ...fileActionStyle, flex: 1, minWidth: 0, display: 'flex', gap: 8, textAlign: 'left', border: 0, background: 'transparent' }}
-                onClick={() => insertFileRefRef.current(entry.path, entry.isDir)}>
-                <span>{entry.isDir ? '📁' : '📄'}</span>
-                <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{entry.name}</span>
-              </button>
-              {entry.isDir && <button type="button" tabIndex={-1} aria-label={`进入目录 ${entry.name}`}
-                title="进入目录（Tab / →）" style={fileActionStyle}
-                onClick={() => navigateToDirRef.current(entry.path)}>进入 ›</button>}
-            </div>
-          ))}
-          <div style={filePickerFooterStyle}>
-            ↑↓ 选择 · Enter 引用 · Tab/→ 进入 · Ctrl+Enter 当前目录 · Esc 关闭
-          </div>
-        </div>
-      )}
-
-      {/* ★ 斜杠命令弹窗 */}
-      {showCommands && (
-        <div ref={popupRef} style={commandPopupStyle} role="listbox" aria-label="聊天命令">
-          <div style={{ padding: '6px 10px', fontSize: 11, color: 'var(--theme-text-muted)', overflowWrap: 'anywhere' }}>
-            Skill 执行节点：{getExecutors().find(item => item.key === execKey)?.label || execKey || '当前会话节点'} · {workingDir || '未设置项目目录'}
-            <div>{commandLoading ? '读取 Skill 与项目命令…' : commandError || '扩展命令随对应 Skill 提供；选择只填草稿，发送才执行，不自动安装依赖。'}</div>
-            <button type="button" aria-label="刷新 Skill 命令" onClick={() => setCommandRevision(value => value + 1)} disabled={commandLoading}
-              style={{ marginTop: 4, padding: '4px 8px', borderRadius: 5, fontSize: 11,
-                border: '1px solid var(--theme-border, rgba(255,255,255,0.12))',
-                background: 'var(--theme-bg-tertiary)', color: 'var(--theme-text-muted)',
-                cursor: commandLoading ? 'wait' : 'pointer', opacity: commandLoading ? 0.6 : 1 }}>
-              刷新命令
-            </button>
-          </div>
-          {!commandLoading && !commandError && filteredCommands.length === 0 && <div style={{ padding: 10, fontSize: 12 }}>没有匹配命令。请先在本节点安装并绑定 Skill，或输入 /skill 技能名 参数查看具体检查结果。</div>}
-          {filteredCommands.map((cmd, i) => (
-            <div
-              key={cmd.name}
-              role="option" aria-selected={i === selectedIndex}
-              title={cmd.unavailableReason || cmd.source || 'AgentWithU 应用命令'}
-              style={{
-                ...commandItemStyle,
-                background: i === selectedIndex ? 'var(--theme-bg-tertiary, #eaeef2)' : 'transparent',
-              }}
-              onClick={() => handleSelectCommand(cmd)}
-              onMouseEnter={() => setSelectedIndex(i)}
-            >
-              <span style={{ fontFamily: 'monospace', fontWeight: 600, color: 'var(--theme-accent, #0969da)', minWidth: 0, overflowWrap: 'anywhere', display: 'inline-block' }}>
-                {cmd.name}
-              </span>
-              <span style={{ color: 'var(--theme-text-muted, #656d76)', fontSize: 12 }}>
-                {cmd.unavailableReason || cmd.description}{cmd.source && <small style={{ display: 'block' }}>来源：{cmd.source}</small>}
-              </span>
-            </div>
-          ))}
-          <div style={{ padding: '4px 10px', fontSize: 10, color: 'var(--theme-text-muted, #656d76)', borderTop: '1px solid var(--theme-border, rgba(0,0,0,0.08))' }}>
-            ↑↓ 导航 · Tab 补全 · Skill/带参数命令先填入，发送后执行 · Esc 关闭
-          </div>
-        </div>
-      )}
-
+      {roleReview.controls}
+      {followup.enabled && (followup.notice || followup.suggestion?.state === 'unavailable') && <div role="status" style={{ fontSize: 11, color: 'var(--theme-text-muted)' }}>
+        {followup.notice || followup.suggestion?.notice}
+      </div>}
+      {followup.suggestion?.state === 'ready' && !isStreaming && <div aria-label="影子建议" style={{ padding: '6px 8px', color: 'var(--theme-text-muted)', fontSize: 12, whiteSpace: 'pre-wrap' }}>
+        <span>{followup.suggestion.text}</span>
+        <button type="button" onClick={acceptFollowup} style={{ marginLeft: 8 }}>Tab 采纳</button>
+        <button type="button" onClick={followup.dismiss} style={{ marginLeft: 4 }}>隐藏</button>
+      </div>}
       <div
         style={{ display: 'flex', gap: 8, alignItems: 'flex-end' }}
       >
         <textarea
           ref={ref}
           className="chat-textarea"
-          placeholder={isStreaming || seqCount > 0
+          placeholder={roleReview.review.roles.length ? '想重点核对什么？可留空，直接开始评议' : isStreaming || seqCount > 0
             ? `继续输入，Enter 自动排队${seqCount ? ` · 待发 ${seqCount}` : ''}`
-            : '输入消息… 长文本会自动收纳为附件 · @ 引用文件/目录 · Ctrl+V 粘贴'}
+            : '输入消息，@ 引用文件 · # 召集角色'}
           onKeyDown={handleKeyDown}
           onCompositionStart={handleCompositionStart}
           onCompositionEnd={handleCompositionEnd}
           onInput={handleInput}
           onPaste={handleTextPaste}
-          style={{ ...textareaStyle, ...(isStreaming ? { opacity: 0.9 } : {}) }}
+          onSelect={() => { const el = ref.current; if (el) composerDrafts.select(draftKey, 'main', { start: el.selectionStart, end: el.selectionEnd, scrollTop: el.scrollTop }); }}
+          onScroll={() => { const el = ref.current; if (el) composerDrafts.select(draftKey, 'main', { start: el.selectionStart, end: el.selectionEnd, scrollTop: el.scrollTop }); }}
+          style={{ ...textareaStyle, minWidth: 0, ...(isStreaming ? { opacity: 0.9 } : {}) }}
           rows={1}
         />
-        <button onClick={handleSend} style={sendBtnStyle}
-          title={isStreaming
+        <button onClick={handleSend} style={{ ...sendBtnStyle, ...(roleReview.review.roles.length ? { width: 'auto', padding: '0 14px', whiteSpace: 'nowrap', fontSize: 13, fontWeight: 600 } : {}) }} disabled={roleReview.busy}
+          aria-label={roleReview.review.roles.length ? '发起评议' : undefined}
+          title={roleReview.review.roles.length ? '发起评议' : isStreaming
             ? '加入序列队列'
             : seqCount > 0 ? '加入序列队列' : '发送（Enter）'}>
-          {isStreaming || seqCount > 0 ? '＋' : '🚀'}
+          {roleReview.review.roles.length ? roleReview.busy ? '提交中…' : '开始评议' : isStreaming || seqCount > 0 ? <WorkflowIcon name="plus" /> : <svg aria-hidden="true" width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M12 19V5m-6 6 6-6 6 6" /></svg>}
         </button>
         {isStreaming && <button onClick={onAbort} style={abortBtnStyle} title="停止当前回答">■</button>}
         <button
@@ -2141,7 +2349,7 @@ const ChatInputInner = forwardRef<ChatInputHandle, Props>(({
             ? '实时语音对话正在使用麦克风'
             : micActive ? '停止实时语音输入' : '开始实时语音输入'}
         >
-          🎙️
+          <svg aria-hidden="true" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round"><rect x="9" y="3" width="6" height="12" rx="3" /><path d="M5 11v1a7 7 0 0 0 14 0v-1M12 19v3m-4 0h8" /></svg>
         </button>
       </div>
       {(micActive || micError || micNotice) && (
@@ -2213,7 +2421,7 @@ const textareaStyle: React.CSSProperties = {
   flex: 1,
   background: 'var(--theme-input-bg, #ffffff)',
   border: '1px solid var(--theme-border, rgba(0,0,0,0.12))',
-  borderRadius: 7,
+  borderRadius: 12,
   color: 'var(--theme-text, #1f2328)',
   padding: 'var(--ui-message-padding, 11px 14px)',
   fontSize: 14,
@@ -2229,7 +2437,7 @@ const textareaStyle: React.CSSProperties = {
 const btnBase: React.CSSProperties = {
   width: 'var(--ui-send-size, 38px)',
   height: 'var(--ui-send-size, 38px)',
-  borderRadius: 6,
+  borderRadius: 10,
   border: '1px solid transparent',
   color: '#fff',
   fontSize: 18,

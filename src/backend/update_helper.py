@@ -82,6 +82,7 @@ def _write_result(plan: dict[str, Any], **payload: Any) -> None:
         "finishedAt": time.time(),
         "version": str(plan.get("version") or ""),
         "buildId": str(plan.get("buildId") or ""),
+        "requestId": str(plan.get("requestId") or ""),
         **payload,
     })
 

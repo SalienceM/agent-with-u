@@ -10,7 +10,7 @@ if TYPE_CHECKING:
     from .bridge_ws import BridgeWS
 
 
-async def dispatch_sequence_message(bridge: BridgeWS, payload_json: str) -> bool:
+async def dispatch_sequence_message(bridge: BridgeWS, payload_json: str, *, image_submission=None) -> bool:
     """可在执行端等价执行的应用命令；不把未知 UI 命令偷偷当模型提示词。"""
     payload = json.loads(payload_json)
     text = str(payload.get("content") or "").strip()
@@ -44,6 +44,8 @@ async def dispatch_sequence_message(bridge: BridgeWS, payload_json: str) -> bool
         definitions, _issues = await asyncio.to_thread(registered_definitions, bridge._skill_store)
         if command not in definitions:
             raise ValueError(f"{command} 未注册或不支持执行端序列，请检查命令配置；未调用模型。")
+    if image_submission:
+        return await bridge._handle_harness_image_turn(json.dumps(payload, ensure_ascii=False), *image_submission)
     return await bridge._handle_send_message(json.dumps(payload, ensure_ascii=False))
 
 
@@ -133,6 +135,8 @@ class SequenceScheduler:
 
     async def _drain(self, sid: str) -> None:
         current = None
+        scheduled = None
+        schedules = getattr(self.bridge, '_session_prompt_scheduler', None)
         try:
             while not self.closed and sid not in self.deleted:
                 if getattr(self.bridge, '_update_work_blocked', lambda: False)():
@@ -152,11 +156,37 @@ class SequenceScheduler:
                 if not session:
                     raise ValueError("会话不存在，无法派发序列")
                 self.bridge._require_agent_execution_enabled()
-                current.status = "running"
-                current.error = ""
-                current.updated_at = time.time()
-                # 必须先落盘，再注册主 turn；中间没有 await、没有第二次客户端 RPC。
-                self.bridge._chat_extras_save(ex)
+                if current.id.startswith('schedule-') and not current.schedule_ref:
+                    raise ValueError('定时来源损坏，不能作为普通指令执行')
+                if current.schedule_ref:
+                    if schedules is None:
+                        raise ValueError('定时服务不可用，不能按普通任务重放')
+                    if not schedules.ready or schedules.error:
+                        return  # 恢复/独占锁未就绪，不写入另一个调度者的失败结果。
+                    try:
+                        self.bridge._check_chat_turn_allowed(sid)
+                    except ValueError:
+                        return  # 守卫阻塞时保留原待执行项，由执行端后续重新核对。
+                    scheduled = await schedules.claim(sid, current)
+                    if scheduled is None:
+                        current = None
+                        continue
+                    # await 期间用户停止/控制变化仍优先；未进入主轮次时不发消息。
+                    if not ex.seq_auto:
+                        await schedules.finish(scheduled, 'interrupted', '用户在启动期间暂停，未调用模型')
+                        return
+                    self.bridge._check_chat_turn_allowed(sid)
+                    session = schedules.runtime_session(scheduled)
+                image_submission = None
+                if current.image_request_id:
+                    current, receipt, runtime = self.bridge._claim_image_queue(ex, current, session)
+                    image_submission = (receipt, runtime)
+                else:
+                    current.status = "running"
+                    current.error = ""
+                    current.updated_at = time.time()
+                    # 必须先落盘，再注册主 turn；中间没有 await、没有第二次客户端 RPC。
+                    self.bridge._chat_extras_save(ex)
                 self.bridge._emit_seqtask_updated(ex)
                 payload = {
                     "sessionId": sid, "backendId": session.backend_id,
@@ -170,9 +200,23 @@ class SequenceScheduler:
                     "messageId": f"seq-assistant-{current.id}-{time.time_ns()}",
                     # 不保存/复用上一轮 Kit 代确认开关与动态令牌。
                 }
-                success = await self.bridge._start_chat_turn(
-                    json.dumps(payload, ensure_ascii=False), sequence=True,
+                if image_submission:
+                    payload["userMessageId"] = receipt.user_message_id
+                    payload["messageId"] = receipt.assistant_message_id
+                if scheduled:
+                    payload['userMessageId'] = scheduled['userMessageId']
+                    payload['messageId'] = scheduled['assistantMessageId']
+                turn = self.bridge._start_chat_turn(
+                    json.dumps(payload, ensure_ascii=False), sequence=True, image_submission=image_submission,
                 )
+                if scheduled:
+                    try:
+                        scheduled = await schedules.started(scheduled, session)
+                    except Exception:
+                        # 主 turn 已注册，必须等真实退出，不能失去停止/去重保护。
+                        await asyncio.shield(turn)
+                        raise
+                success = await turn
                 if self.closed or sid in self.deleted:
                     return
                 interrupted = sid in self.interrupted
@@ -180,6 +224,19 @@ class SequenceScheduler:
                 self.interrupted.discard(sid)
                 self.redirecting.discard(sid)
                 success = success and not interrupted and not redirected
+                if scheduled:
+                    try:
+                        confirmed = getattr(self.bridge._session_store, 'save_confirmed', None)
+                        if confirmed:
+                            await confirmed(session)
+                        else:
+                            await schedules.io.run(self.bridge._session_store.save, session, async_=False)
+                    except Exception as exc:
+                        await schedules.finish(scheduled, 'unknown', f'聊天结果保存未确认：{exc}')
+                        raise
+                    await schedules.finish(scheduled, 'completed' if success else 'interrupted' if interrupted or redirected else 'failed',
+                                           '' if success else '本轮未正常完成，请核对原输出')
+                    scheduled = None
                 current.status = "interrupted" if redirected else "done" if success else "error"
                 current.updated_at = time.time()
                 if redirected:
@@ -198,6 +255,15 @@ class SequenceScheduler:
             raise
         except Exception as exc:
             if not self.closed and sid not in self.deleted:
+                if current and current.schedule_ref and schedules:
+                    try:
+                        await schedules.reject(sid, current, str(exc))
+                    except Exception:
+                        schedules.unknown.add(sid)
+                if current and current.image_request_id:
+                    record = self.bridge._image_receipt(sid, current.image_request_id)
+                    if record and record.state == "platform_accepted":
+                        self.bridge._image_transition(record, "rejected", reason="preflight_rejected")
                 if current:
                     current.status = "error"
                     current.error = str(exc)[:500]

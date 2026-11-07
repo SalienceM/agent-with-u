@@ -15,9 +15,11 @@ test('scope separates all identities, baseline never trusts legacy or restarted 
     assert.notEqual(r.reviewScopeKey(other), r.reviewScopeKey(scope));
     assert.deepEqual(r.loadReviewBaseline(other, io), {});
   }
-  for (const other of [{ ...scope, execKey: 'other' }, { ...scope, bindingId: 'other' }, { ...scope, includeGitMetadata: true }]) {
+  for (const other of [{ ...scope, execKey: 'other' }, { ...scope, bindingId: 'other' }, { ...scope, includeGitMetadata: true }, { ...scope, scanRulesKey: 'scope-a' }]) {
     assert.deepEqual(r.loadReviewBaseline(other, io), {});
   }
+  assert.notEqual(r.reviewScopeKey({ ...scope, scanRulesKey: 'scope-a' }), r.reviewScopeKey({ ...scope, scanRulesKey: 'scope-b' }));
+  assert.equal(r.reviewScopeKey({ ...scope, scanRulesKey: '' }), r.reviewScopeKey(scope));
   assert.equal(storage.has('awu-dirsync-baseline:handle:1::/w'), true);
 });
 test('immutable snapshot and late compare/read generation rejection', () => {
@@ -47,16 +49,34 @@ test('paging never truncates, navigation does not skip; failed/late result never
   assert.equal(r.reviewPage(q, 'f25').count, 1);
 });
 
-test('only different scope excludes one-sided paths and navigation stays within scope', () => {
+test('only different scope includes one-sided paths and navigation stays within scope', () => {
   const snapshot = r.compareSnapshot(scope, 1, { 'src/a.ts': meta('a'), 'src/b.ts': meta('a'), 'src/local': meta('a'), 'src/same': meta('a'), 'src2/a': meta('a') },
     { 'src/a.ts': meta('b'), 'src/b.ts': meta('b'), 'src/remote': meta('b'), 'src/same': meta('a'), 'src2/a': meta('b') });
   let q = r.createReviewQueue(snapshot, 'src', 'src/local', true);
-  assert.deepEqual(q.entries.map(e => e.path), ['src/a.ts', 'src/b.ts']);
+  assert.deepEqual(q.entries.map(e => e.path), ['src/a.ts', 'src/b.ts', 'src/local', 'src/remote']);
+  assert.equal(q.selected, 'src/local');
   q = r.reduceReviewQueue(q, { type: 'navigate', direction: 1 });
   q = r.reduceReviewQueue(q, { type: 'navigate', direction: 1 });
-  assert.equal(q.selected, 'src/b.ts');
+  assert.equal(q.selected, 'src/remote');
   const nextGate = new r.ReviewGeneration(), first = nextGate.begin('a');
   assert.ok(new r.ReviewGeneration().begin('a').generation > first.generation);
+});
+
+test('file difference paths include missing empty files, content, size and type differences', () => {
+  const empty = { hash: 'e'.repeat(64), size: 0 };
+  const local = { 'local/empty': empty, changed: meta('a'), same: meta('a'),
+    size: meta('a'), kind: meta('a'), unknown: { hash: '', size: 1 } };
+  const remote = { 'remote/empty': empty, changed: meta('b'), same: meta('a'),
+    size: { ...meta('a'), size: 2 }, kind: { hash: '', size: 0, kind: 'directory' },
+    unknown: { hash: '', size: 1 } };
+  assert.deepEqual([...r.fileDifferencePaths(local, remote)].sort(), ['changed', 'kind', 'local/empty', 'remote/empty', 'size']);
+  assert.equal(r.fileDifferencePaths(local, null).size, 0);
+  assert.equal(r.fileDifferencePaths(null, remote).size, 0);
+  assert.deepEqual([...r.fileDifferencePaths({}, { 'remote/empty': empty })], ['remote/empty']);
+  assert.deepEqual([...r.fileDifferencePaths({ 'local/empty': empty }, {})], ['local/empty']);
+  const q = r.createReviewQueue(r.compareSnapshot(scope, 2, local, remote), '', undefined, true);
+  assert.deepEqual(q.entries.map(e => e.path).sort(), [...r.fileDifferencePaths(local, remote)].sort());
+  assert.equal(q.entries.find(e => e.path === 'kind').typeConflict, true);
 });
 
 test('regex uses full relative paths, literal mode stays literal and invalid patterns fail closed', () => {

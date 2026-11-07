@@ -32,6 +32,31 @@ class HarnessExtensionTests(unittest.TestCase):
         return DeepSeekHarnessBackend(ModelBackendConfig(id="fixture", label="fixture", type=BackendType.DEEPSEEK_HARNESS,
             model="smoke-model", api_key="fixture-only-secret", base_url=model.url, **kwargs))
 
+    def test_owned_read_edit_and_command_match_actual_isolated_files(self) -> None:
+        project = self.root / "tool-project"
+        project.mkdir()
+        source = project / "probe.txt"
+        source.write_text("before", encoding="utf-8")
+        shell = "pwsh" if os.name == "nt" else "bash"
+        command = "Write-Output AWU-IMAGE-REGRESSION" if os.name == "nt" else "printf AWU-IMAGE-REGRESSION"
+        replies = [("read", {"file_path": str(source)}),
+                   ("edit", {"file_path": str(source), "old_string": "before", "new_string": "after"}),
+                   (shell, {"command": command, "description": "isolated regression marker"}), "tools complete"]
+        with LocalModel(replies) as model:
+            backend = self.backend(model, allowed_tools=["read", "edit", shell], harness_permission_mode="workspace-write")
+            deltas = []
+            result = asyncio.run(backend.send_message([], "isolated tool regression", None, "tool-smoke", "m", deltas.append,
+                working_dir=str(project), skip_permissions=True))
+            self.assertTrue(result.get("success"), str(result))
+            self.assertFalse(backend.has_unconfirmed_activity("tool-smoke"))
+            self.assertEqual(source.read_text(encoding="utf-8"), "after")
+            results = [delta.tool_call for delta in deltas if delta.type == "tool_result"]
+            self.assertEqual(len(results), 3)
+            self.assertTrue(all(row.get("status") == "done" for row in results),
+                            str([row.get("output") for row in results if row.get("status") != "done"]))
+            self.assertTrue(any("AWU-IMAGE-REGRESSION" in row.get("output", "") for row in results))
+            self.assertEqual(len(model.posts), 4)
+
     @unittest.skipUnless(os.environ.get("AWU_TEST_NETWORK_ISOLATED") == "1", "Run only in a network-none namespace")
     def test_session_constraints_and_no_extra_upload_with_os_network_denial(self) -> None:
         import errno

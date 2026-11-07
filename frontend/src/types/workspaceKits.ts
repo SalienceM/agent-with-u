@@ -263,6 +263,9 @@ export interface KitCapabilityMetadata {
   approval: 'required' | 'none' | string;
 }
 
+export const isLocalUpdateCapability = (capability: unknown): boolean =>
+  capability === 'node.update_local_published' || capability === 'node.check_update_local';
+
 export interface KitCapabilityRuntime {
   phase?: 'preparing' | 'blocked' | 'waiting_approval' | 'approved'
     | 'publishing' | 'succeeded' | 'failed' | 'cancelled' | string;

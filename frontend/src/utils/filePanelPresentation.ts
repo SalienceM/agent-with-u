@@ -35,6 +35,6 @@ export function filePanelFeedback(input: {
 
 export function filePanelComparison(compared: boolean, summary?: { differs: number; conflict: number; localOnly: number; cloud: number } | null): string {
   return compared && summary
-    ? `比对结果 · 不同 ${summary.differs} · 冲突 ${summary.conflict} · 仅本机 ${summary.localOnly} · 仅执行端 ${summary.cloud}`
+    ? `比对结果 · 不同 ${summary.differs + summary.conflict + summary.localOnly + summary.cloud} · 冲突 ${summary.conflict} · 仅本机 ${summary.localOnly} · 仅执行端 ${summary.cloud}`
     : '尚未比对 · 文件存在不代表内容一致';
 }

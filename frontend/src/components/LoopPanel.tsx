@@ -2,7 +2,7 @@ import React, { useState, useEffect, useCallback, useContext, useRef } from 'rea
 import { api } from '../api';
 import { LoopActionController, type LoopActionFeedback, type ActionResult } from '../utils/loopActionController';
 import { useLoopControl } from '../hooks/useLoopControl';
-import { markdownToHtml } from '../utils/markdown';
+import { MarkdownBody } from './MarkdownBody';
 import { ImagePreview } from './ImagePreview';
 import { useClipboardImage } from './../hooks/useClipboardImage';
 import type { ImageAttachment } from './../hooks/useClipboardImage';
@@ -1674,10 +1674,9 @@ const Live: React.FC<{ text: string }> = ({ text }) => (
   }}>{text}<span style={{ animation: 'awu-loop-pulse 1s infinite' }}>▋</span></div>
 );
 
-// markdown 渲染（复用全站 .md-content 样式 + markdownToHtml）
+// 只读正文共用样式与解析；不再嵌套两个 .md-content。
 const Md: React.FC<{ text: string }> = ({ text }) => (
-  <div className="md-content" style={{ fontSize: 13, lineHeight: 1.6, color: 'var(--theme-text)' }}
-    dangerouslySetInnerHTML={{ __html: markdownToHtml(text) }} />
+  <MarkdownBody text={text} style={{ fontSize: 13, lineHeight: 1.6, color: 'var(--theme-text)' }} />
 );
 
 // ══ small bits ════════════════════════════════════════════════

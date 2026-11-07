@@ -7,6 +7,17 @@ from src.backend.deepseek_harness_events import HarnessProjection
 
 
 class HarnessEventTests(unittest.TestCase):
+    def test_usage_keeps_root_last_request_separate_from_subagent_and_all_requests(self) -> None:
+        project = HarnessProjection("root", "generation", "fingerprint", lambda *_args, **_kwargs: None)
+        project.account({"usage": {"inputTokens": 10, "outputTokens": 5, "cacheReadTokens": 80, "cacheWriteTokens": 10}}, sid="root")
+        project.account({"usage": {"inputTokens": 20, "outputTokens": 5, "cacheReadTokens": 90, "cacheWriteTokens": 10}}, sid="root")
+        project.account({"usage": {"inputTokens": 300, "outputTokens": 10}}, sid="child")
+        usage = project.usage()
+        self.assertEqual(usage["inputTokens"], 520)
+        self.assertEqual(usage["contextTokens"], 120)
+        self.assertEqual(usage["cachedInputTokens"], 170)
+        self.assertEqual(usage["contextId"], "root")
+
     def setUp(self) -> None:
         self.deltas = []
         self.project = HarnessProjection("root", "generation", "fingerprint", lambda kind, **data: self.deltas.append((kind, data)))

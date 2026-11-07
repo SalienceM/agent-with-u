@@ -113,3 +113,12 @@ export async function browserHandleBinding(handle: FileSystemHandle): Promise<st
     return id;
   });
 }
+
+/** 只恢复原登记句柄；找不到时不选目录、不回落其他存储。 */
+export async function browserHandleByBinding(id: string): Promise<FileSystemDirectoryHandle> {
+  const row = await transaction<{ id: string; handle: FileSystemDirectoryHandle } | undefined>(HANDLES, 'readonly', (store, result) => {
+    const request = store.get(id); request.onsuccess = () => result(request.result);
+  });
+  if (!row || row.id !== id || row.handle.kind !== 'directory') throw new DocumentProtocolError('local_binding_unavailable');
+  return row.handle;
+}

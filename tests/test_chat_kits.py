@@ -53,6 +53,7 @@ class ChatKitTests(unittest.IsolatedAsyncioTestCase):
         self.manager.approval_config_fingerprint.return_value = "config-1"
         self.manager.start_publish = AsyncMock(return_value={"job": {"id": "job"}})
         self.manager.status.return_value = {"jobs": [{"id": "job", "status": "succeeded"}]}
+        self.manager.job_status.return_value = {"id": "job", "status": "succeeded"}
         self.bridge._release_center_manager = self.manager
         self.bridge._kit_capabilities.prepare = AsyncMock(return_value={
             "phase": "waiting_approval", "planId": "plan", "planFingerprint": "f" * 64,
@@ -92,9 +93,15 @@ class ChatKitTests(unittest.IsolatedAsyncioTestCase):
         self.manager.start_publish.assert_not_awaited()
 
     async def test_local_install_never_inherits_publication_delegation(self):
+        await self._check_local_install_delegation("node.update_local_published")
+
+    async def test_standalone_install_never_inherits_publication_delegation(self):
+        await self._check_local_install_delegation("node.check_update_local")
+
+    async def _check_local_install_delegation(self, capability):
         run = await self.publishing_run(True)
         step = run.steps[0]
-        step.config["capability"] = "node.update_local_published"
+        step.config["capability"] = capability
         step.config["capabilityRuntime"]["plan"] = {
             "desktop": {"deviceId": "executor-A"}, "release": {"buildId": "full-build"},
             "artifact": {"sha256": "a" * 64}, "warnings": ["需要退出目标节点"]}
@@ -245,6 +252,62 @@ class ChatKitTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(leases[0]["allowApproval"])
         self.assertTrue(leases[1]["allowApproval"])
         self.assertEqual(leases[1]["messageId"], "explicit")
+
+    async def test_disabled_capability_has_visible_failure_and_no_lease(self):
+        self.session.abilities = {'kitToolsMode': 'off'}
+        with patch.object(self.bridge, '_get_backend', return_value=ClaudeCodeOfficialBackend.__new__(ClaudeCodeOfficialBackend)), patch.object(
+            self.bridge, '_async_send_with_kit_tools', new_callable=AsyncMock) as send:
+            with self.assertRaisesRegex(ValueError, '未启用'):
+                await self.bridge._async_send(self.session, '发布', None, 'fake', 'm', kit_approval_delegation=True, user_message_id='off')
+            send.assert_not_awaited()
+        self.assertFalse(any(row['allowApproval'] for row in self.service.leases.values()))
+
+    async def test_feedback_is_no_secret_receipt_not_authorization(self):
+        self.bridge._emit_event = Mock()
+        run = await self.publishing_run()
+        rows = json.loads(await self.bridge._rpc_kitDelegationList(self.session.id))
+        row = next(item for item in rows['items'] if item['messageId'] == 'human-message')
+        self.assertEqual(row['status'], 'bound')
+        self.assertEqual(row['runId'], run.id)
+        self.assertEqual(row['stepId'], 'publish')
+        self.assertEqual(rows['waitingRuns'][0]['id'], run.id)
+        self.assertNotIn(self.token, json.dumps(rows))
+        fact = (await self.call('list'))['delegation']
+        self.assertTrue(fact['received'])
+        self.assertFalse(fact['canDelegateOneRun'])
+        self.assertIn('不要求用户再在正文', self.service.instructions(self.token, 1))
+        events = [call.args[1] for call in self.bridge._emit_event.call_args_list if call.args[0] == 'kitDelegation']
+        self.assertEqual(events[0]['status'], 'accepted')
+        args = await self.approve_args(run)
+        self.assertEqual((await self.call('approve', **args))['status'], 'ok')
+        await self.bridge._kit_tasks[run.id]
+        row = json.loads(await self.bridge._rpc_kitDelegationList(self.session.id))['items'][0]
+        self.assertEqual((row['status'], row['runStatus']), ('used', 'succeeded'))
+        # 展示回执被伪造也不会生成运行 grant。
+        self.bridge._record_kit_delegation(self.session.id, 'fake-display', 'accepted', expiresAt=time.time() + 99)
+        run.approval_delegation = {}
+        self.assertIn('未获得委托', self.service._delegation_error(run))
+
+    async def test_unbound_grant_expires_and_restart_does_not_recreate_it(self):
+        token = self.service.issue(self.session.id, allow_approval=True, message_id='unused')
+        self.service.revoke(token)
+        row = json.loads(await self.bridge._rpc_kitDelegationList(self.session.id))['items'][0]
+        self.assertEqual(row['status'], 'expired')
+        self.service.issue(self.session.id, allow_approval=True, message_id='interrupted')
+        self.service.leases.clear()
+        rows = json.loads(await self.bridge._rpc_kitDelegationList(self.session.id))['items']
+        self.assertTrue(all(row['status'] == 'expired' for row in rows))
+        self.assertFalse(self.service.leases)
+
+    async def test_manual_approval_advances_without_extra_chat(self):
+        run = await self.publishing_run(False)
+        runtime = run.steps[0].config['capabilityRuntime']
+        result = json.loads(self.bridge._respond_kit_capability(self.session.id, run.id, 'publish', True,
+            expected_fingerprint=runtime['planFingerprint']))
+        self.assertEqual(result['status'], 'ok')
+        await self.bridge._kit_tasks[run.id]
+        self.assertEqual(run.status, 'succeeded')
+        self.assertEqual(json.loads(await self.bridge._rpc_kitDelegationList(self.session.id))['waitingRuns'], [])
 
     async def test_send_payload_delegation_is_strict_boolean_and_not_inherited(self):
         for value in (True, False, "true", None):

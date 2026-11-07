@@ -11,6 +11,16 @@ test('markdown filenames become portable html filenames', () => {
   assert.equal(markdownHtmlFilename('unsafe:name.mdx'), 'unsafe_name.html');
 });
 
+test('export accepts new table wrappers and keeps explicit alignment rules', () => {
+  const { markdownToHtml } = require('../../.home-test-dist/utils/markdown.js');
+  const html = buildStandaloneMarkdownHtml('alignment.md', markdownToHtml('| L | C | R |\n|:--|:-:|--:|\n| a | b | c |'));
+  assert.match(html, /class="md-table-wrap"/);
+  assert.match(html, /<table class="md-table">/);
+  assert.match(html, /table \[align="center"\] \{ text-align: center/);
+  assert.match(html, /table \[align="right"\] \{ text-align: right/);
+  assert.match(html, /\.md-table-wrap table \{ display: table; margin: 0/);
+});
+
 test('standalone markdown html preserves rendered content and escapes metadata', () => {
   const html = buildStandaloneMarkdownHtml(
     'guide<script>.md',

@@ -1,5 +1,6 @@
 import json
 import unittest
+from unittest.mock import Mock
 
 from src.backend.bridge_ws import BridgeWS, _REQUEST_OWNER_ID
 from src.backend.engine_workbench import WorkbenchError
@@ -35,6 +36,17 @@ class EngineWorkbenchProtocolTests(unittest.TestCase):
                 self.capabilities()
         finally:
             _REQUEST_OWNER_ID.reset(token)
+
+    def test_cold_capability_read_uses_metadata_without_transcript_hydration(self):
+        expected = self.capabilities()['identity']
+        self.bridge._active_sessions.clear()
+        self.bridge._session_store = Mock()
+        self.bridge._session_store.get_meta.return_value = self.session.meta_dict()
+        self.bridge._session_store.load.side_effect = AssertionError('must not read transcript')
+        self.assertEqual(self.capabilities()['identity'], expected)
+        self.bridge._session_store.load.assert_not_called()
+        self.bridge._session_store.get_meta.return_value['codexConnectionMode'] = 'ssh'
+        self.assertEqual(self.capabilities()['reasonCode'], 'workspace_unavailable')
 
     def test_frozen_identity_rejected_after_directory_change_or_restart(self):
         identity = self.capabilities()['identity']

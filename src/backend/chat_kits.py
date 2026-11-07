@@ -8,6 +8,7 @@ import time
 from typing import Any
 
 from .workspace_kit_store import WorkspaceKit, FINAL_RUN_STATUSES, CHAT_CHAIN_DESCRIPTION
+from .kit_capabilities import LOCAL_UPDATE_CAPABILITIES
 
 
 TOOL_NAME = "awu_kits"
@@ -74,10 +75,21 @@ class ChatKitTools:
             "allowApproval": allow_approval is True, "messageId": message_id,
             "actor": self.bridge._current_owner_id(), "issuedAt": time.time(), "delegatedRunId": "",
         }
+        if allow_approval:
+            try:
+                self.bridge._record_kit_delegation(session_id, message_id, 'accepted',
+                    issuedAt=self.leases[token]['issuedAt'], expiresAt=self.leases[token]['issuedAt'] + DELEGATION_TTL,
+                    reason='执行器已接收本次委托，等待绑定一个发布运行。')
+            except BaseException:
+                self.leases.pop(token, None)
+                raise
         return token
 
     def revoke(self, token: str) -> None:
-        self.leases.pop(token, None)
+        lease = self.leases.pop(token, None)
+        if lease and lease['allowApproval'] and not lease['delegatedRunId']:
+            self.bridge._record_kit_delegation(lease['session'], lease['messageId'], 'expired',
+                reason='本轮已结束，未绑定运行；下次发送需要独立开启。')
 
     async def call(self, token: str, arguments: dict) -> dict:
         lease = self.leases.get(token)
@@ -102,7 +114,8 @@ class ChatKitTools:
         state = bridge._kit_get(sid)
         action = args.get("action")
         if action == "list":
-            return {"status": "ok", "canDelegateOneRun": self._can_delegate(lease), "kits": [{
+            return {"status": "ok", "canDelegateOneRun": self._can_delegate(lease),
+                    'delegation': self.delegation_fact(lease), "kits": [{
                 "id": kit.id, "title": kit.title, "description": kit.description[:1000],
                 "enabled": kit.enabled,
                 "inputs": [{key: value for key, value in spec.items()
@@ -371,12 +384,12 @@ class ChatKitTools:
                 )}, "artifacts": (plan.get("artifacts") or [])[:100]},
                 "truncated": len(plan.get("artifacts") or []) > 100,
             }
-            if step.config.get("capability") == "node.update_local_published":
+            if step.config.get("capability") in LOCAL_UPDATE_CAPABILITIES:
                 view["guidance"] = "本机安装/重启不支持聊天代确认；请到 Kit 面板核对并单独确认"
                 view["pendingApproval"].update(canApprove=False, reason=view["guidance"], plan=plan)
         if 0 <= run.current_step < len(run.steps):
             step = run.steps[run.current_step]
-            if step.config.get("capability") == "node.update_local_published":
+            if step.config.get("capability") in LOCAL_UPDATE_CAPABILITIES:
                 runtime = step.config.get("capabilityRuntime") or {}
                 view["localUpdate"] = {key: runtime.get(key) for key in (
                     "phase", "installRequestId", "message", "receipt", "verification")}
@@ -385,9 +398,23 @@ class ChatKitTools:
         return view
 
     @staticmethod
-    def instructions(token: str, port: int) -> str:
+    def delegation_fact(lease: dict) -> dict:
+        return {'received': lease.get('allowApproval') is True, 'messageId': lease.get('messageId', ''),
+                'canDelegateOneRun': ChatKitTools._can_delegate(lease), 'runId': lease.get('delegatedRunId', ''),
+                'expiresAt': lease.get('issuedAt', 0) + DELEGATION_TTL if lease.get('allowApproval') else None}
+
+    def delegation_instructions(self, token: str) -> str:
+        lease = self.leases.get(token)
+        if not lease:
+            return ''
+        return ('\n本轮服务端委托回执（仅陈述独立开关的接收事实）：' + json.dumps(self.delegation_fact(lease), ensure_ascii=False)
+                + '。received=true 时不要求用户再在正文说同意；仍须 list/status 核对当前 canApprove 和完整计划，'
+                  '仅按真实指纹 approve。本回执不替代计划审阅，也不授权安装或跨工作区写入。')
+
+    def instructions(self, token: str, port: int) -> str:
         return (
             "【当前 Session 的 Kit 调用工具】\n" + TOOL["description"] +
+            self.delegation_instructions(token) +
             "\nAPI: POST http://127.0.0.1:" + str(port) + "/api/chat-kits\n"
             "Content-Type: application/json；JSON 请求体为 " + json.dumps({
                 "token": token, "arguments": {"action": "list"},

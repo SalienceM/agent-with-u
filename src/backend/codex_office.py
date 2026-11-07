@@ -713,6 +713,7 @@ class CodexOfficeBackend(ModelBackend):
         execution_identity: Optional[ExecutionIdentity] = None,
         environment_gate=None,
         environment_observer=None,
+        on_user_interaction=None,
     ) -> dict:
         """Run one turn through a local executor or SSH Codex app-server."""
         self.clear_cancelled(session_id)
@@ -754,6 +755,7 @@ class CodexOfficeBackend(ModelBackend):
         started_tools: set[str] = set()
         model_requested = False
         environment_pause = None
+        interaction_tasks: set[asyncio.Task] = set()
 
         try:
             print(
@@ -839,6 +841,24 @@ class CodexOfficeBackend(ModelBackend):
 
                 # app-server can ask the client to approve commands or patches.
                 if "id" in msg and method:
+                    if method == "item/tool/requestUserInput":
+                        from .codex_user_interactions import answer_codex_question
+                        # 用户等待不阻塞唯一 reader，也不阻塞同轮其他问题和 turn/steer。
+                        interaction_tasks = {task for task in interaction_tasks if not task.done()}
+                        if len(interaction_tasks) >= 10:
+                            await conn.respond(msg['id'], error={'code': -32000, 'message': '同时待答问题请求已达上限'})
+                            continue
+                        task = asyncio.create_task(answer_codex_question(conn, msg['id'], params,
+                            session_id=session_id, message_id=message_id, thread_id=thread_id, turn_id=turn_id,
+                            callback=on_user_interaction, cancelled=lambda: self.is_cancelled(session_id), emit=emit,
+                            abort=lambda: self.abort(session_id)))
+                        def interaction_finished(done):
+                            if not done.cancelled() and done.exception():
+                                emit('error', error='Codex 原生问题响应通道已失效；未重发答案。')
+                                self.abort(session_id)
+                        task.add_done_callback(interaction_finished)
+                        interaction_tasks.add(task)
+                        continue
                     if method == "item/tool/call":
                         tool_label, response = _unavailable_dynamic_tool_response(params)
                         await conn.respond(msg.get("id"), result=response)
@@ -865,6 +885,7 @@ class CodexOfficeBackend(ModelBackend):
                     if on_permission_request:
                         granted = await on_permission_request(PermissionRequest(
                             session_id, message_id, item_id, tool_name, str(tool_input),
+                            native_request_id=str(msg['id']),
                         ))
                     await conn.respond(msg.get("id"), result={
                         "decision": "accept" if granted else "decline",
@@ -927,7 +948,7 @@ class CodexOfficeBackend(ModelBackend):
                 elif method == "thread/tokenUsage/updated":
                     token_usage = params.get("tokenUsage", {})
                     usage = token_usage.get("total", {})
-                    if isinstance(usage, dict):
+                    if isinstance(usage, dict) and "inputTokens" in usage and "outputTokens" in usage:
                         last = token_usage.get("last", {})
                         final_usage = {
                             "inputTokens": usage.get("inputTokens", 0),
@@ -938,6 +959,10 @@ class CodexOfficeBackend(ModelBackend):
                             # Session 台账会按 contextId 做差，避免每轮重复累加。
                             "cumulative": True,
                             "contextId": thread_id or "",
+                            "reported": True,
+                            "baselineRequired": bool(agent_session_id),
+                            "nativeResumed": bool(agent_session_id),
+                            "usageSource": "codex-thread-total",
                         }
                         if isinstance(last, dict) and last.get("inputTokens") is not None:
                             # last.inputTokens 代表最近一次模型请求携带的上下文规模；
@@ -973,6 +998,10 @@ class CodexOfficeBackend(ModelBackend):
                 raise environment_pause from None
             emit("error", error=_exc_msg(exc))
         finally:
+            for task in interaction_tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*interaction_tasks, return_exceptions=True)
             active_turn = self._active_app_turns.get(session_id)
             if active_turn and active_turn.conn is conn:
                 self._active_app_turns.pop(session_id, None)
@@ -1014,6 +1043,7 @@ class CodexOfficeBackend(ModelBackend):
         execution_identity: Optional[ExecutionIdentity] = None,
         environment_gate=None,
         environment_observer=None,
+        on_user_interaction=None,
     ) -> dict:
         if execution_access not in (None, "read-only", "workspace-write"):
             raise ValueError("Unsupported execution access")
@@ -1036,6 +1066,7 @@ class CodexOfficeBackend(ModelBackend):
                 execution_identity=execution_identity,
                 environment_gate=environment_gate,
                 environment_observer=environment_observer,
+                on_user_interaction=on_user_interaction,
             )
         self.clear_cancelled(session_id)
 
@@ -1067,6 +1098,8 @@ class CodexOfficeBackend(ModelBackend):
             include_history=not bool(codex_resume_id),
             include_constraints=not bool(codex_resume_id),
         )
+        prompt = ('当前为 Codex exec 单向事件模式，没有原生问答响应通道。需要用户信息时，'
+                  '请在最终回复提出问题并结束本轮，等待下一轮回复；不要使用工具或 shell 等待 stdin。\n\n' + prompt)
         model = (model_override or "").strip() or self.config.model or self.get_env("OPENAI_MODEL") or ""
         effort = normalize_codex_reasoning_effort(reasoning_effort)
         skip = self.config.skip_permissions if skip_permissions is None else bool(skip_permissions)
@@ -1206,6 +1239,8 @@ class CodexOfficeBackend(ModelBackend):
                     collected.append(line)
                     emit("text_delta", text=line + "\n")
                     continue
+                if isinstance(obj, dict) and 'id' in obj and 'method' in obj:
+                    raise RuntimeError('Codex exec 收到需要双向响应的请求，但此模式没有回答通道；未自动切换模式，请在下一轮文字回复。')
                 sid = self._extract_session_id(obj)
                 if sid and use_native_resume:
                     new_agent_sid = sid

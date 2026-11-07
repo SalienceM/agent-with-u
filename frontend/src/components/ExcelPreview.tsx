@@ -1,4 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
+import { usePreviewPan } from '../hooks/usePreviewPan';
+import { usePreviewSize } from '../hooks/usePreviewLayout';
 
 export interface ExcelBorder {
   style?: string;
@@ -141,6 +143,14 @@ export const ExcelPreview: React.FC<Props> = ({ sheets, styles = [], calculation
   const searchRef = useRef<HTMLInputElement | null>(null);
   const safeActive = Math.min(active, Math.max(0, sheets.length - 1));
   const sheet = sheets[safeActive];
+  const size = usePreviewSize<HTMLElement>();
+  const compact = size.width < 760;
+  const [toolsOpen, setToolsOpen] = useState(false);
+  const [detailOpen, setDetailOpen] = useState(false);
+  const toolsRef = useRef<HTMLButtonElement>(null);
+  const detailRef = useRef<HTMLButtonElement>(null);
+  const dragging = usePreviewPan(gridRef, true, sheet);
+  useEffect(() => { if (gridRef.current) { gridRef.current.scrollLeft = 0; gridRef.current.scrollTop = 0; } }, [sheet]);
 
   useEffect(() => {
     setActive(0);
@@ -212,8 +222,13 @@ export const ExcelPreview: React.FC<Props> = ({ sheets, styles = [], calculation
     setSelected(next);
     if (reveal) {
       requestAnimationFrame(() => {
-        gridRef.current?.querySelector<HTMLElement>(`[data-cell="${addressOf(next.row, next.column)}"]`)
-          ?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+        const grid = gridRef.current;
+        const cell = grid?.querySelector<HTMLElement>(`[data-cell="${addressOf(next.row, next.column)}"]`);
+        if (!grid || !cell) return;
+        const area = grid.getBoundingClientRect(), rect = cell.getBoundingClientRect();
+        const left = area.left + frozenLeft(frozenColumns), top = area.top + frozenTop(frozenRows + 1);
+        if (next.column >= frozenColumns) grid.scrollLeft += rect.left < left ? rect.left - left : Math.max(0, rect.right - area.left - grid.clientWidth);
+        if (next.row > frozenRows) grid.scrollTop += rect.top < top ? rect.top - top : Math.max(0, rect.bottom - area.top - grid.clientHeight);
       });
     }
   };
@@ -238,17 +253,19 @@ export const ExcelPreview: React.FC<Props> = ({ sheets, styles = [], calculation
   const frozenLeft = (column: number) => ROW_HEADER_WIDTH + columnWidths.slice(0, column).reduce((sum, value) => sum + value, 0);
 
   return (
-    <section style={shellStyle} onKeyDown={(event) => {
+    <section ref={size.ref} data-excel-preview style={{ ...shellStyle, minWidth: 0, overflow: 'hidden' }} onKeyDown={(event) => {
+      if ((event.target as HTMLElement).closest('input, textarea, select, button, [contenteditable="true"]')) return;
       if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'f') {
         event.preventDefault();
-        searchRef.current?.focus();
+        setToolsOpen(true);
+        requestAnimationFrame(() => searchRef.current?.focus());
         return;
       }
       if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'c') {
+        event.preventDefault();
         copySelected();
         return;
       }
-      if ((event.target as HTMLElement).tagName === 'INPUT') return;
       const movement: Record<string, Coordinate> = {
         ArrowUp: { row: -1, column: 0 }, ArrowDown: { row: 1, column: 0 },
         ArrowLeft: { row: 0, column: -1 }, ArrowRight: { row: 0, column: 1 },
@@ -257,21 +274,27 @@ export const ExcelPreview: React.FC<Props> = ({ sheets, styles = [], calculation
       const delta = movement[event.key];
       if (delta) {
         event.preventDefault();
-        selectCell(selected.row + delta.row, selected.column + delta.column, true);
+        let row = selected.row + delta.row, column = selected.column + delta.column;
+        while (row >= 1 && row <= model.rowCount && column >= 0 && column < model.columnCount
+          && (model.rows.get(row)?.hidden || model.columns.get(column)?.hidden || model.mergeCovered.has(`${row}:${column}`))) {
+          row += delta.row; column += delta.column;
+        }
+        selectCell(row, column, true);
       }
     }} tabIndex={0}>
-      <header style={toolbarStyle}>
+      <header style={{ ...toolbarStyle, flexWrap: 'wrap', padding: '4px 8px', gap: 6 }}>
         <div style={workbookIdentityStyle}>
           <span style={workbookIconStyle}>▦</span>
           <strong style={{ fontSize: 12 }}>电子表格预览</strong>
-          <span style={metaPillStyle}>{sheet.rowCount || 0} 行 × {sheet.columnCount || 0} 列</span>
-          {!!sheet.formulaCount && (
+          {!compact && <span style={metaPillStyle}>{sheet.rowCount || 0} 行 × {sheet.columnCount || 0} 列</span>}
+          {!compact && !!sheet.formulaCount && (
             <span style={metaPillStyle}>fx {sheet.cachedFormulaCount || 0}/{sheet.formulaCount} 已有结果</span>
           )}
-          {!!(sheet.frozen?.rows || sheet.frozen?.columns) && <span style={metaPillStyle}>❄ 已冻结窗格</span>}
+          {!compact && !!(sheet.frozen?.rows || sheet.frozen?.columns) && <span style={metaPillStyle}>❄ 已冻结窗格</span>}
         </div>
-        <div style={toolbarActionsStyle}>
-          <div style={searchBoxStyle}>
+        {compact && <button ref={toolsRef} style={{ ...zoomSelectStyle, cursor: 'pointer', minHeight: 36 }} aria-expanded={toolsOpen} onClick={() => setToolsOpen(!toolsOpen)}>查找 / 缩放</button>}
+        <div style={{ ...toolbarActionsStyle, display: !compact || toolsOpen ? 'flex' : 'none', width: compact ? '100%' : undefined, minWidth: 0 }} onKeyDown={e => { if (e.key === 'Escape') { e.stopPropagation(); setToolsOpen(false); toolsRef.current?.focus(); } }}>
+          <div style={{ ...searchBoxStyle, flex: 1, width: compact ? 'auto' : 260, minWidth: 0 }}>
             <span style={{ opacity: .7 }}>⌕</span>
             <input ref={searchRef} value={query} onChange={(event) => setQuery(event.target.value)}
               onKeyDown={(event) => { if (event.key === 'Enter') moveMatch(event.shiftKey ? -1 : 1); }}
@@ -286,6 +309,12 @@ export const ExcelPreview: React.FC<Props> = ({ sheets, styles = [], calculation
         </div>
       </header>
 
+      {compact && toolsOpen && <div style={{ flexShrink: 0, maxHeight: '15%', overflow: 'auto', padding: '4px 8px', fontSize: 11, background: '#fff' }}>
+        {sheet.rowCount || 0} 行 × {sheet.columnCount || 0} 列 · {sheet.name}
+        <div>公式 {sheet.formulaCount || 0} · 已有结果 {sheet.cachedFormulaCount || 0} · {calculation?.mode === 'manual' ? '手动计算工作簿' : '自动计算工作簿'}
+          {!!(sheet.frozen?.rows || sheet.frozen?.columns) && ' · 已冻结窗格'}{sheet.autoFilter && ` · 筛选区域 ${sheet.autoFilter}`}</div>
+      </div>}
+
       <div style={formulaBarStyle}>
         <div style={nameBoxStyle}>{selectedAddress}</div>
         <button style={copyButtonStyle} onClick={copySelected} title="复制公式或单元格值">复制</button>
@@ -294,11 +323,17 @@ export const ExcelPreview: React.FC<Props> = ({ sheets, styles = [], calculation
           title={formulaText || selectedAddress}>
           {formulaText || <span style={{ color: '#9aa0a6' }}>选择单元格查看内容或公式</span>}
         </div>
-        {selectedCell?.formula && selectedCell.formulaCached === false && <span style={notCalculatedStyle}>文件未保存计算结果</span>}
+        {!compact && selectedCell?.formula && selectedCell.formulaCached === false && <span style={notCalculatedStyle}>文件未保存计算结果</span>}
+        <button ref={detailRef} style={{ ...copyButtonStyle, minHeight: 34, flexShrink: 0 }} aria-expanded={detailOpen} onClick={() => setDetailOpen(!detailOpen)}>内容</button>
       </div>
-
-      <div ref={gridRef} style={gridViewportStyle}>
-        <table style={gridStyle} aria-label={`工作表 ${sheet.name}`}>
+      {detailOpen && <div role="region" aria-label="单元格完整内容" style={{ flexShrink: 0, maxHeight: '30%', overflow: 'auto', padding: 8, background: '#fff', fontSize: 12 }} onKeyDown={e => { if (e.key === 'Escape') { e.stopPropagation(); setDetailOpen(false); detailRef.current?.focus(); } }}>
+        <div>{selectedAddress}{selectedCell?.formula && selectedCell.formulaCached === false && ' · 文件未保存计算结果（不在预览中计算）'}</div>
+        <pre style={{ whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', margin: '6px 0' }}>{formulaText || '（空单元格）'}</pre>
+        <button style={copyButtonStyle} onClick={copySelected}>复制完整内容</button>
+        <button style={copyButtonStyle} onClick={() => { setDetailOpen(false); detailRef.current?.focus(); }}>收起内容</button>
+      </div>}
+      <div ref={gridRef} data-excel-grid tabIndex={0} style={{ ...gridViewportStyle, minWidth: 0, overscrollBehavior: 'contain', touchAction: 'pan-x pan-y pinch-zoom', cursor: dragging ? 'grabbing' : 'grab' }}>
+        <table style={{ ...gridStyle, width: ROW_HEADER_WIDTH + columnWidths.reduce((sum, width) => sum + width, 0) }} aria-label={`工作表 ${sheet.name}`}>
           <colgroup>
             <col style={{ width: ROW_HEADER_WIDTH }} />
             {columnWidths.map((width, index) => <col key={index} style={{ width, display: width ? undefined : 'none' }} />)}
@@ -348,7 +383,7 @@ export const ExcelPreview: React.FC<Props> = ({ sheets, styles = [], calculation
                         onClick={() => selectCell(row, column)}
                         title={cell?.formula ? `${cell.address}: =${cell.formula}${cell.formulaCached === false ? '\n文件中没有缓存计算结果' : ''}` : (cell?.value || addressOf(row, column))}
                         style={{
-                          ...cellBaseStyle, ...workbookCellStyle(style, cell), ...sticky,
+                          ...cellBaseStyle, ...workbookCellStyle(style, cell), ...sticky, cursor: dragging ? 'grabbing' : 'grab',
                           height,
                           ...(isMatch ? matchCellStyle : {}),
                           ...(cell?.formula && cell.formulaCached === false ? pendingFormulaCellStyle : {}),
@@ -366,18 +401,18 @@ export const ExcelPreview: React.FC<Props> = ({ sheets, styles = [], calculation
         </table>
       </div>
 
-      <footer style={sheetFooterStyle}>
-        <div style={sheetTabsStyle}>
+      <footer style={{ ...sheetFooterStyle, minWidth: 0 }}>
+        <div style={{ ...sheetTabsStyle, flex: 1 }}>
           <button style={sheetNavStyle} onClick={() => setActive(Math.max(0, safeActive - 1))} disabled={safeActive === 0}>‹</button>
           <button style={sheetNavStyle} onClick={() => setActive(Math.min(sheets.length - 1, safeActive + 1))} disabled={safeActive >= sheets.length - 1}>›</button>
           {sheets.map((item, index) => (
             <button key={`${item.name}-${index}`} onClick={() => { setActive(index); setSelected({ row: 1, column: 0 }); }}
-              style={{ ...sheetTabStyle, ...(index === safeActive ? activeSheetTabStyle : {}) }} title={item.name}>
+              style={{ ...sheetTabStyle, flexShrink: 0, minHeight: 36, ...(index === safeActive ? activeSheetTabStyle : {}) }} title={item.name}>
               {item.name}
             </button>
           ))}
         </div>
-        <div style={statusBarStyle}>
+        <div style={{ ...statusBarStyle, display: compact ? 'none' : 'flex' }}>
           {sheet.autoFilter && <span>筛选区域 {sheet.autoFilter}</span>}
           {!!sheet.formulaCount && <span>公式 {sheet.formulaCount}</span>}
           {sheet.formulaCount !== sheet.cachedFormulaCount && <span style={{ color: '#b54708' }}>待计算 {(sheet.formulaCount || 0) - (sheet.cachedFormulaCount || 0)}</span>}

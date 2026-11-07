@@ -135,7 +135,8 @@ class WorkspaceSearchTests(unittest.IsolatedAsyncioTestCase):
     def test_git_comparison_uses_fixed_object_reads_no_write_or_diff(self):
         self.file('a.py', 'new\n')
         commit, blob = 'a' * 40, 'b' * 40
-        def fake(root, args, budget):
+        def fake(root, args, budget, managed=None):
+            self.assertIsNone(managed)
             if args[0] == 'rev-parse':
                 return commit.encode()
             if args[0] == 'ls-tree':

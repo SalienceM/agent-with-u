@@ -2,8 +2,10 @@ import { useState, useCallback, useEffect, useRef, startTransition } from 'react
 import { api, getSessionExecKey } from '../api';
 import { isSkillCommand, type SkillInvocation } from '../utils/skillCommands';
 import { uuid } from '../utils/uuid';
+import { tokenContext } from '../utils/tokenUsageContext';
 import type { ImageAttachment } from './useClipboardImage';
 import type { TextAttachment } from '../types/attachments';
+import type { ImageDraftContext, ChatSendResult } from '../utils/harnessImageSubmission';
 import {
   hasVisibleMessagePayload,
   shouldKeepChatMessage,
@@ -83,6 +85,10 @@ export interface ChatMessage {
     reasoningOutputTokens?: number;
     contextTokens?: number;
     contextWindow?: number;
+    usageScope?: string;
+    cumulative?: boolean;
+    estimated?: boolean;
+    usageWarning?: string;
   };
   toolCalls?: ToolCall[];
   thinking?: string;
@@ -92,6 +98,7 @@ export interface ChatMessage {
   contentBlocks?: ContentBlock[];  // ★ 有序内容块，按到达顺序排列
   elapsed?: number;  // ★ 本次回复总耗时（毫秒）
   deliveryMode?: 'steer' | 'redirect';
+  scheduleRef?: import('../types/sessionSchedules').ScheduleRef;
 }
 
 // ═══════════════════════════════════════
@@ -272,6 +279,8 @@ export function useChat(
   // 稳定引用 refs
   const isStreamingRef = useRef(false);
   isStreamingRef.current = isStreaming;
+  const activeSessionRef = useRef(sessionId);
+  activeSessionRef.current = sessionId;
   const autoContinueRef = useRef(true);
   autoContinueRef.current = autoContinue;
   const messagesRef = useRef<ChatMessage[]>([]);
@@ -922,7 +931,14 @@ export function useChat(
         | 'realtime-voice-background',
       kitApprovalDelegation: boolean = false,
       skillInvocation?: SkillInvocation,
-    ) => {
+      imageDraft?: ImageDraftContext,
+    ): ChatSendResult | Promise<ChatSendResult> => {
+      if (images?.length && backends?.find(item => item.id === backendId)?.type === 'deepseek-harness') {
+        // 原生接收以专属回执为准；通用 chat_turn_started 仅负责展示服务器消息。
+        return api.harnessImageSend({ sessionId, backendId, content, images, textAttachments,
+          autoContinue: autoContinueRef.current, skipPermissions: skipPermissionsRef.current,
+          kitApprovalDelegation, skillInvocation, deliveryMode, interactionMode }, isStreamingRef.current, imageDraft);
+      }
       if (isStreamingRef.current) return;
 
       const userMsg: ChatMessage = {
@@ -964,7 +980,7 @@ export function useChat(
       streamStartRef.current = Date.now();
       msgIdRef.current = assistantId;
 
-      api.sendMessage({
+      const submission = {
         sessionId,
         content,
         images,
@@ -978,9 +994,20 @@ export function useChat(
         interactionMode,
         kitApprovalDelegation,
         skillInvocation,
+      };
+      if (imageDraft) return api.composerSend(submission, false, imageDraft).then(result => {
+        if (result.receipt.state === 'rejected') {
+          pendingIds.delete(userMsg.id); pendingIds.delete(assistantId);
+          if (activeSessionRef.current === sessionId && msgIdRef.current === assistantId) {
+            setMessages(previous => previous.filter(item => item.id !== userMsg.id && item.id !== assistantId));
+            isStreamingRef.current = false; setIsStreaming(false);
+          }
+        }
+        return result;
       });
+      void api.sendMessage(submission);
     },
-    [sessionId, backendId]
+    [sessionId, backendId, backends]
   );
 
   // 稳定 ref 给命令处理器调用
@@ -1068,11 +1095,12 @@ export function useChat(
           const total = totalInput + totalOutput;
           const actualTurns = Number(usage?.actualTurns || 0);
           const estimatedTurns = Number(usage?.estimatedTurns || 0);
-          const contextTokens = Number(usage?.latestContext?.contextTokens || 0);
-          const contextWindow = Number(usage?.latestContext?.contextWindow || 0);
-          const contextLine = contextTokens && contextWindow
-            ? `\n\n当前上下文：**${Math.round(contextTokens / contextWindow * 100)}%**（${contextTokens.toLocaleString()} / ${contextWindow.toLocaleString()}）`
-            : '';
+          const context = tokenContext(usage?.latestContext);
+          const contextLine = context.tokens !== null
+            ? `\n\n${context.label}：**${context.tokens.toLocaleString()} Token**` + (context.window !== null
+              ? `（${context.percent}%，窗口 ${context.window.toLocaleString()}，${context.windowSource}）`
+              : '（窗口上限未知，不计算占比）')
+            : '\n\n上下文暂无有效测量；累计消耗不代表上下文大小。';
           sys(
             `📊 **当前 Session Token 总览**\n\n` +
             `| 方向 | Tokens |\n` +
@@ -1081,7 +1109,8 @@ export function useChat(
             `| ↓ 输出 | ${totalOutput.toLocaleString()} |\n` +
             `| **累计** | **${total.toLocaleString()}** |` +
             contextLine + `\n\n` +
-            `_精确 usage ${actualTurns} 轮，文本估算 ${estimatedTurns} 轮。会话可能跨 Backend / 模型，未用单一模型价格制造误导性费用。_`
+            `_Backend usage ${actualTurns} 轮，文本估算 ${estimatedTurns} 轮。会话可能跨 Backend / 模型，未用单一模型价格制造误导性费用。_` +
+            (usage?.legacyHistory ? '\n\n包含未重新核验的旧版统计；历史原账保留。' : '')
           );
           break;
         }
@@ -1290,20 +1319,24 @@ export function useChat(
       textAttachments?: TextAttachment[],
       kitApprovalDelegation: boolean = false,
       skillInvocation?: SkillInvocation,
-    ) => {
+      imageDraft?: ImageDraftContext,
+    ): Promise<ChatSendResult> => {
       if (
         !content.trim()
         && (!images || images.length === 0)
         && (!textAttachments || textAttachments.length === 0)
       ) return;
 
+      if (images?.length && backends?.find(item => item.id === backendId)?.type === 'deepseek-harness') {
+        return doSend(content, images, textAttachments, undefined, undefined, kitApprovalDelegation, skillInvocation, imageDraft);
+      }
+
       if (isSkillCommand(content)) {
         if (isStreamingRef.current || kitApprovalDelegation) {
           addSystemMessage('Skill 命令未发送：请等待当前轮结束，并关闭 Kit 代确认后重试。');
           return;
         }
-        doSend(content, images, textAttachments, undefined, undefined, false, skillInvocation);
-        return;
+        return doSend(content, images, textAttachments, undefined, undefined, false, skillInvocation, imageDraft);
       }
 
       if (isStreamingRef.current) {
@@ -1324,9 +1357,9 @@ export function useChat(
         return;
       }
 
-      doSend(content, images, textAttachments, undefined, undefined, kitApprovalDelegation);
+      return doSend(content, images, textAttachments, undefined, undefined, kitApprovalDelegation, undefined, imageDraft);
     },
-    [doSend, handleCommand, sessionId, addSystemMessage]
+    [doSend, handleCommand, sessionId, addSystemMessage, backends, backendId]
   );
 
   const abort = useCallback(() => {

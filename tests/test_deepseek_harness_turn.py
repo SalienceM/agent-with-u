@@ -38,7 +38,7 @@ class HarnessTurnTests(unittest.IsolatedAsyncioTestCase):
         self.config = ModelBackendConfig(id="fixture", type=BackendType.DEEPSEEK_HARNESS, label="fixture",
                                           model="fixture-model", api_key="fixture-secret-never-echo")
 
-    async def send(self, scenario="normal", native=None, trace=None):
+    async def send(self, scenario="normal", native=None, trace=None, working_dir=None):
         backend = DeepSeekHarnessBackend(self.config)
         deltas = []
         def client(*, config, owner):
@@ -47,7 +47,8 @@ class HarnessTurnTests(unittest.IsolatedAsyncioTestCase):
                 "--state", str(self.root / "state.json"), "--scenario", scenario, "--identity-patch", config.patches[0]))
         with patch("src.backend.deepseek_harness_turn.create_client", client):
             kwargs = dict(messages=[], content="new input only", images=None, session_id="test-session", message_id="message",
-                          on_delta=deltas.append, agent_session_id=native, working_dir=str(self.root), owner_id="test-user")
+                          on_delta=deltas.append, agent_session_id=native,
+                          working_dir=working_dir if working_dir is not None else str(self.root), owner_id="test-user")
             if trace is None:
                 result = await backend.send_message(**kwargs)
             else:
@@ -109,12 +110,52 @@ class HarnessTurnTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse((self.root / "data/call-traces").exists())
         from src.backend.call_trace import CallTrace
         trace = CallTrace("test-session", "fixture-event")
-        result, deltas = await self.send("auth", trace=trace)
+        result, deltas = await self.send("http-401", trace=trace)
         self.assertFalse(result["success"])
         text = json.dumps([delta.to_dict() for delta in deltas]) + json.dumps(trace.data)
         self.assertNotIn(self.config.api_key, text)
+        self.assertNotIn("PRIVATE_PROVIDER", text)
+        self.assertIn('"scope": "harness-failure"', text)
         self.assertTrue(any(delta.type == "diagnostic" and delta.diagnostic.get("category") == "auth" for delta in deltas))
         self.assertTrue((self.root / "data/call-traces").is_dir())
+
+    async def test_structured_provider_failure_survives_with_stage_and_no_image_blame(self) -> None:
+        for status, code in ((401, "auth"), (403, "auth"), (404, "not_found"),
+                             (429, "rate_limit"), (503, "server_error")):
+            result, deltas = await self.send(f"http-{status}")
+            self.assertFalse(result["success"])
+            self.assertIn(f"HTTP {status}", result["error"])
+            self.assertIn("模型与工具执行", result["error"])
+            self.assertNotIn("图片", result["error"])
+            self.assertNotIn("PRIVATE_PROVIDER", json.dumps([d.to_dict() for d in deltas]))
+            diagnosis = next(d.diagnostic for d in deltas if d.type == "diagnostic"
+                             and d.diagnostic.get("phase") == "backend_error")
+            self.assertEqual(diagnosis["errorCode"], code)
+            self.assertEqual(diagnosis["httpStatus"], status)
+            self.assertEqual(diagnosis["failureStage"], "execution")
+            self.assertNotIn("done", [d.type for d in deltas])
+
+    async def test_stale_duplicate_and_child_terminal_do_not_poison_root_diagnosis(self) -> None:
+        for scenario in ("stale-end", "duplicate-end", "child-end"):
+            result, deltas = await self.send(scenario)
+            self.assertTrue(result["success"], scenario)
+            self.assertNotIn("error", [d.type for d in deltas])
+
+    async def test_missing_workspace_is_diagnosed_before_spawn(self) -> None:
+        result, deltas = await self.send(working_dir=str(self.root / "missing-PRIVATE_PATH"))
+        self.assertFalse(result["success"])
+        self.assertIn("workspace_missing", result["error"])
+        self.assertIn("执行节点", result["error"])
+        self.assertNotIn("PRIVATE_PATH", json.dumps([d.to_dict() for d in deltas]))
+        self.assertFalse((self.root / "state.json").exists())
+
+    async def test_rpc_text_does_not_masquerade_as_http_evidence(self) -> None:
+        result, deltas = await self.send("auth")
+        self.assertFalse(result["success"])
+        self.assertIn("RPC -32000", result["error"])
+        self.assertIn("运行时初始化", result["error"])
+        self.assertNotIn("HTTP 401", result["error"])
+        self.assertNotIn(self.config.api_key, json.dumps([d.to_dict() for d in deltas]))
 
 
 if __name__ == "__main__":

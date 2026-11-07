@@ -19,7 +19,7 @@ class HarnessProjection:
         self.usage_count = 0
         self.missing_usage = False
         self.text_chars = 0
-        self.last_root_input = 0
+        self.last_root_input: int | None = None
 
     def belongs(self, sid: Any) -> bool:
         visited = set()
@@ -236,4 +236,5 @@ class HarnessProjection:
         if not self.usage_count or self.missing_usage:
             return None  # 由现有 Bridge 的显式 estimated 路径处理。
         return {**self.usage_totals, "reported": True, "usageSource": "harness-committed-turn",
-                "usageEventCount": self.usage_count, "contextTokens": self.last_root_input}
+                "usageEventCount": self.usage_count, "contextId": self.native,
+                **({"contextTokens": self.last_root_input} if self.last_root_input is not None else {})}

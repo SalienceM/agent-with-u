@@ -14,7 +14,8 @@ from typing import Any
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--state", type=Path, required=True)
-    parser.add_argument("--scenario", choices=("normal", "malformed-end", "missing-end", "crash", "slow", "oversize", "flood", "tree", "bad-cap", "no-cap", "error", "aborted", "blocked", "max-tokens", "child", "auth"), default="normal")
+    parser.add_argument("--scenario", choices=("normal", "malformed-end", "missing-end", "crash", "slow", "oversize", "large-frame", "unterminated", "flood", "tree", "bad-cap", "no-cap", "error", "aborted", "blocked", "max-tokens", "child", "auth",
+        "http-401", "http-403", "http-404", "http-429", "http-503", "stale-end", "child-end", "duplicate-end"), default="normal")
     parser.add_argument("--identity-patch", type=Path)
     args = parser.parse_args()
     state: dict[str, int] = json.loads(args.state.read_text()) if args.state.exists() else {}
@@ -53,7 +54,12 @@ def main() -> None:
                 args.state.with_suffix(".child").write_text(str(child.pid))
             emit({"id": request_id, "result": {"serverInfo": {"name": "awu-test-fixture", "version": "0.2.1-rc.3"}}})
             if args.scenario == "oversize":
-                print("x" * (1024 * 1024 + 5), flush=True)
+                print("x" * (16 * 1024 * 1024 + 5), flush=True)
+            if args.scenario == "large-frame":
+                notify("fixture.large", {"value": "x" * (2 * 1024 * 1024)})
+            if args.scenario == "unterminated":
+                sys.stdout.write("x" * (16 * 1024 * 1024 + 1))
+                sys.stdout.flush()
             if args.scenario == "flood":
                 for _index in range(1000):
                     notify("session.status", {"sessionId": "flood", "status": "running"})
@@ -89,11 +95,27 @@ def main() -> None:
                   "content": [{"type": "text", "text": f"reply-{state[session_id]}"}]}, "stream": []})
             if args.scenario == "child":
                 notify("subagent.started", {"parentSessionId": session_id, "childSessionId": "fixture-child"})
+            if args.scenario == "stale-end":
+                notify("session.event", {"sessionId": session_id, "event": {"type": "turn/end", "seq": 0,
+                    "data": {"reason": {"kind": "error", "error": {"code": "AUTH", "status": 401}}}}})
+            if args.scenario == "child-end":
+                notify("subagent.started", {"parentSessionId": session_id, "childSessionId": "fixture-child"})
+                event("fixture-child", "turn/end", {"reason": {"kind": "error", "error": {"status": 401}}})
+                notify("subagent.finished", {"parentSessionId": session_id, "childSessionId": "fixture-child",
+                    "status": "error", "stopReason": {"kind": "error"}})
             if args.scenario == "crash":
                 return
             if args.scenario != "missing-end":
                 reason = args.scenario if args.scenario in {"error", "aborted", "blocked", "max-tokens"} else "completed"
-                event(session_id, "turn/end", {} if args.scenario == "malformed-end" else {"reason": {"kind": reason}})
+                end = {"kind": reason}
+                if args.scenario.startswith("http-"):
+                    end = {"kind": "error", "error": {"status": int(args.scenario[5:]), "code": "INVALID_REQUEST",
+                        "message": "PRIVATE_PROVIDER_BODY " + os.environ.get("DEEPSEEK_API_KEY", ""),
+                        "requestId": "PRIVATE_PROVIDER_REQUEST", "url": "https://fixture.invalid/?token=PRIVATE"}}
+                event(session_id, "turn/end", {} if args.scenario == "malformed-end" else {"reason": end})
+                if args.scenario == "duplicate-end":
+                    notify("session.event", {"sessionId": session_id, "event": {"type": "turn/end", "seq": seq - 1,
+                        "data": {"reason": {"kind": "error", "error": {"status": 401}}}}})
             notify("session.status", {"sessionId": session_id, "status": "idle"})
         elif method == "session/wait":
             if args.scenario == "child":

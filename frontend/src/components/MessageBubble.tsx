@@ -8,6 +8,8 @@ import type { ChatMessage, ToolCall, ContentBlock, SubagentInfo } from '../hooks
 import { shouldKeepChatMessage } from '../utils/chatMessageVisibility';
 import { DiffView, type DiffData } from './DiffView';
 import { TextAttachmentPreview } from './TextAttachmentPreview';
+import { KitDelegationBadge } from './KitDelegationFeedback';
+import { OpinionReferencePreview } from './OpinionReferencePreview';
 import { ImageLightbox } from './ImageLightbox';
 import { AppModalPortal } from './AppModalPortal';
 import { resolveFileLink, type ResolvedFileLink } from '../utils/fileFocus';
@@ -177,17 +179,19 @@ if (typeof document !== 'undefined' && !document.getElementById('msg-bubble-css'
       line-height: 1.6;
       border-radius: 4px;
       border: 1px solid rgba(128,128,128,0.35);
-      background: rgba(255,255,255,0.12);
-      color: rgba(200,200,200,0.85);
+      background: var(--md-panel, var(--theme-bg-secondary, #161b22));
+      color: var(--theme-text, #c9d1d9);
       cursor: pointer;
       opacity: 0;
       transition: opacity 0.15s ease, background 0.15s ease, color 0.15s ease;
       font-family: inherit;
       user-select: none;
     }
-    pre.md-pre:hover .code-copy-btn {
+    pre.md-pre:hover .code-copy-btn, pre.md-pre:focus-within .code-copy-btn {
       opacity: 1;
     }
+    .code-copy-btn:focus-visible { outline: 2px solid var(--theme-accent); outline-offset: 2px; }
+    @media (hover: none) { .code-copy-btn { opacity: 1; } }
     .code-copy-btn.copied {
       color: #3fb950;
       border-color: #3fb95066;
@@ -775,6 +779,7 @@ interface Props {
   onFocusFile?: (relativePath: string, line?: number, column?: number) => void;
   onRedoMessage?: (message: ChatMessage) => void | Promise<void>;
   onInsertCommand?: (command: string) => void;
+  onReviewAnswer?: (messageId: string) => void;
 }
 
 // 复制气泡内容到剪贴板
@@ -1122,6 +1127,7 @@ function MessageBubbleInner({
   onFocusFile,
   onRedoMessage,
   onInsertCommand,
+  onReviewAnswer,
 }: Props) {
   const [lightboxSrc, setLightboxSrc] = useState<string | null>(null);
   const [fileLinkMenu, setFileLinkMenu] = useState<{
@@ -1177,7 +1183,7 @@ function MessageBubbleInner({
     delete anchor.dataset.filePath;
     anchor.target = '_blank';
     anchor.rel = 'noopener';
-    anchor.removeAttribute('title');
+    // Markdown 自带标题由 renderer 管理；定位提示使用独立 aria-description。
     anchor.removeAttribute('aria-description');
 
     const resolved = resolveFileLink(anchor.getAttribute('href') || '', workingDir || '');
@@ -1330,10 +1336,13 @@ function MessageBubbleInner({
     const pres = selectAll<HTMLElement>(root, '.msg-content pre.md-pre');
     pres.forEach(pre => {
       if (pre.querySelector('.code-copy-btn')) return;
+      pre.classList.add('md-pre-copyable');
       const btn = document.createElement('button');
+      btn.type = 'button';
       btn.className = 'code-copy-btn';
       btn.textContent = '复制';
       btn.title = '复制代码';
+      btn.setAttribute('aria-label', '复制代码');
       btn.onclick = async (e) => {
         e.stopPropagation();
         const code = pre.querySelector('code');
@@ -1341,7 +1350,7 @@ function MessageBubbleInner({
         // 克隆后移除语言标签，避免语言名混入复制内容
         const clone = code.cloneNode(true) as HTMLElement;
         clone.querySelector('.md-code-lang')?.remove();
-        await copyToClipboard(clone.textContent?.trimEnd() ?? '');
+        await copyToClipboard(clone.textContent ?? '');
         btn.textContent = '已复制';
         btn.classList.add('copied');
         setTimeout(() => {
@@ -1665,6 +1674,9 @@ function MessageBubbleInner({
           ttsRate={ttsRate}
           onRedoMessage={onRedoMessage}
         />
+        {message.scheduleRef && <div style={{ fontSize: 11, color: 'var(--theme-text-muted)', marginBottom: 6 }}>
+          ◷ 定时指令 · 原定 {new Date(message.scheduleRef.scheduledAt * 1000).toLocaleString()}
+        </div>}
         {isUser && message.deliveryMode && (
           <div style={{
             display: 'inline-flex',
@@ -1828,14 +1840,20 @@ function MessageBubbleInner({
 
         {/* Token 用量 + 耗时 */}
         {!isUser && (message.usage || message.elapsed) && !message.streaming && (
-          <div style={{ fontSize: 11, color: 'var(--theme-text-muted, #656d76)', marginTop: 4 }}>
+          <div title={message.usage?.usageWarning} style={{ fontSize: 11, color: 'var(--theme-text-muted, #656d76)', marginTop: 4 }}>
+            {message.usage && (message.usage.usageScope === 'turn' ? (message.usage.estimated ? '本轮估算 ' : '本轮 ') : message.usage.cumulative ? '线程累计（旧记录） ' : '用量（旧记录） ')}
             {message.usage?.inputTokens != null && `↑${message.usage.inputTokens.toLocaleString()}`}
             {message.usage?.outputTokens != null && ` ↓${message.usage.outputTokens.toLocaleString()}`}
             {message.elapsed != null && ` · ${message.elapsed < 1000 ? `${message.elapsed}ms` : `${(message.elapsed / 1000).toFixed(1)}s`}`}
           </div>
         )}
 
+        {message.role === 'assistant' && !message.streaming && !!message.content?.trim() && onReviewAnswer && <button type="button"
+          onClick={() => onReviewAnswer(message.id)} title="选择角色，评议这条回答" style={{ marginTop: 10, padding: '5px 9px', font: 'inherit', fontSize: 12,
+            color: 'var(--theme-text-muted)', background: 'transparent', border: '1px solid var(--theme-border)', borderRadius: 7, cursor: 'pointer' }}>请角色评议</button>}
         {/* 时间戳 */}
+        {isUser && sessionId && <KitDelegationBadge sessionId={sessionId} messageId={message.id} />}
+        {isUser && sessionId && <OpinionReferencePreview session={sessionId} content={message.content || ''} />}
         {message.timestamp && (
           <div title={formatMessageDateTime(message.timestamp)} style={{ fontSize: 10.5, color: 'var(--theme-text-muted, #656d76)', marginTop: 7, textAlign: 'right', fontVariantNumeric: 'tabular-nums' }}>
             {formatMessageTime(message.timestamp)}
@@ -1880,6 +1898,7 @@ function bubblePropsEqual(prev: Props, next: Props): boolean {
     prev.message.images    === next.message.images    &&
     prev.message.textAttachments === next.message.textAttachments &&
     prev.message.deliveryMode === next.message.deliveryMode &&
+    prev.message.scheduleRef === next.message.scheduleRef &&
     prev.message.timestamp  === next.message.timestamp  &&
     prev.message.elapsed   === next.message.elapsed   &&
     prev.message.usage     === next.message.usage     &&
@@ -1897,7 +1916,8 @@ function bubblePropsEqual(prev: Props, next: Props): boolean {
     prev.workingDir        === next.workingDir        &&
     prev.onFocusFile       === next.onFocusFile       &&
     prev.onRedoMessage     === next.onRedoMessage     &&
-    prev.onInsertCommand   === next.onInsertCommand
+    prev.onInsertCommand   === next.onInsertCommand &&
+    prev.onReviewAnswer    === next.onReviewAnswer
   );
 }
 

@@ -354,6 +354,8 @@ class SessionStore:
                     id=m["id"],
                     role=m["role"],
                     workflow_ref=m.get('workflowRef') if isinstance(m.get('workflowRef'), dict) else None,
+                    schedule_ref=m.get('scheduleRef') if isinstance(m.get('scheduleRef'), dict) else None,
+                    image_request_id=m.get("imageRequestId") if isinstance(m.get("imageRequestId"), str) else None,
                     content=m["content"],
                     timestamp=m.get("timestamp", 0),
                     images=images,
@@ -374,7 +376,7 @@ class SessionStore:
                 if message.role == "assistant" and not message.has_visible_payload():
                     continue
                 messages.append(message)
-            return Session(
+            session = Session(
                 id=data["id"],
                 title=data["title"],
                 created_at=data["createdAt"],
@@ -418,7 +420,18 @@ class SessionStore:
                 auto_commit_push=data.get("autoCommitPush", False),
                 auto_commit_backend_id=data.get("autoCommitBackendId"),
                 token_usage=dict(data.get("tokenUsage") or {}),
+                parent_session_id=data.get("parentSessionId"),
+                relation_kind=data.get("relationKind"),
+                project_group_id=data.get("projectGroupId"),
+                role_id=data.get("roleId"),
+                workspace_id=data.get("workspaceId"),
+                followup_suggestions_enabled=data.get("followupSuggestionsEnabled") is True,
+                followup_suggestions_config=dict(data.get("followupSuggestionsConfig") or {}) if isinstance(data.get("followupSuggestionsConfig"), dict) else {},
             )
+            known_fields = session.to_dict().keys()
+            session.persisted_extra = {key: value for key, value in data.items()
+                                      if key not in known_fields}
+            return session
         except Exception as e:
             print(f"Failed to load session {sid}: {e}")
             return None
@@ -441,14 +454,29 @@ class SessionStore:
         else:
             self._save_sync_impl(session)
 
+    async def save_confirmed(self, session: Session) -> None:
+        """与普通异步保存同队列；等待实际写盘，不因等待者取消丢失结果。"""
+        import asyncio
+        loop = asyncio.get_running_loop()
+        future = loop.create_future()
+        def write() -> None:
+            try:
+                self._save_sync_impl(session)
+            except Exception as exc:
+                loop.call_soon_threadsafe(future.set_exception, exc)
+            else:
+                loop.call_soon_threadsafe(future.set_result, None)
+        future.add_done_callback(lambda done: done.exception() if not done.cancelled() else None)
+        self._queue_io_operation(write)
+        await asyncio.shield(future)
+
     def _save_sync_impl(self, session: Session):
         """Actual save implementation - can be run in background thread."""
         path = self._session_path(session.id)
 
         # ★ Write session file (synchronous for data safety)
-        path.write_text(
-            json.dumps(session.to_dict(), ensure_ascii=False, indent=2),
-            encoding="utf-8",
+        self._atomic_write_text(path,
+            json.dumps({**session.persisted_extra, **session.to_dict()}, ensure_ascii=False, indent=2),
         )
 
         # 写盘期间 session 仍可能产生新状态，再同步一次最新摘要。

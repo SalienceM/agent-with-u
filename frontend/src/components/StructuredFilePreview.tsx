@@ -49,7 +49,10 @@ export const StructuredFilePreview: React.FC<Props> = ({ preview, onReveal }) =>
   }
 
   return (
-    <div style={{ height: '100%', minHeight: 0, display: 'flex', flexDirection: 'column' }}>
+    <div style={{ height: '100%', minWidth: 0, minHeight: 0, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
+      {(preview.kind === 'word' || preview.kind === 'powerpoint') && <div style={{ flexShrink: 0, maxHeight: '15%', overflow: 'auto', padding: '5px 10px', color: 'var(--theme-text-muted)', fontSize: 11 }}>
+        {preview.kind === 'word' ? 'Word 兼容预览' : 'PPT 结构化预览'} · 展示已提取内容，不保证原始排版与动画。
+      </div>}
       {pages && pages.length > 1 && (
         <div style={tabBarStyle}>
           {pages.map((page, index) => (
@@ -61,7 +64,7 @@ export const StructuredFilePreview: React.FC<Props> = ({ preview, onReveal }) =>
       )}
 
       <div style={{
-        flex: 1, minHeight: 0,
+        flex: 1, minWidth: 0, minHeight: 0, overscrollBehavior: 'contain',
         overflow: preview.kind === 'excel' ? 'hidden' : 'auto',
         padding: preview.kind === 'excel' ? 0 : preview.kind === 'drawio' ? 10 : 18,
       }}>
@@ -94,11 +97,11 @@ export const StructuredFilePreview: React.FC<Props> = ({ preview, onReveal }) =>
         )}
 
         {preview.kind === 'powerpoint' && (
-          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(330px, 1fr))', gap: 18 }}>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 330px), 1fr))', gap: 18 }}>
             {(preview.slides || []).map((slide) => (
               <section key={slide.number} style={slideStyle}>
                 <span style={slideNumberStyle}>{slide.number}</span>
-                <h3 style={{ margin: '0 0 12px', fontSize: 18, color: 'var(--theme-text)' }}>{slide.title}</h3>
+                <h3 style={{ margin: '0 0 12px', fontSize: 18, color: 'inherit' }}>{slide.title}</h3>
                 {slide.texts.slice(1).map((text, index) => <p key={index} style={{ margin: '5px 0', lineHeight: 1.55 }}>{text}</p>)}
                 {slide.images.length > 0 && <div style={mediaGridStyle}>{slide.images.map((image) => (
                   <img key={image.name} src={image.dataUrl} alt={image.name} style={mediaImageStyle} />
@@ -111,13 +114,13 @@ export const StructuredFilePreview: React.FC<Props> = ({ preview, onReveal }) =>
 
         {preview.kind === 'drawio' && (drawioUrl ? (
           <div style={{ minWidth: '100%', minHeight: '100%', display: 'flex', alignItems: 'flex-start', justifyContent: 'center', overflow: 'auto', background: '#e5e7eb', borderRadius: 8 }}>
-            <img src={drawioUrl} alt={preview.pages?.[safeActive]?.name || 'Draw.io'} style={{ maxWidth: 'none', padding: 18 }} />
+            <img src={drawioUrl} alt={preview.pages?.[safeActive]?.name || 'Draw.io'} style={{ maxWidth: '100%', padding: 8, boxSizing: 'border-box' }} />
           </div>
         ) : <Empty text="图表中没有可渲染的页面" />)}
       </div>
 
       {preview.truncated && (
-        <div style={{ padding: '6px 12px', borderTop: '1px solid var(--theme-border)', color: '#d29922', fontSize: 11 }}>
+        <div style={{ flexShrink: 0, maxHeight: '20%', overflow: 'auto', padding: '6px 12px', borderTop: '1px solid var(--theme-border)', color: '#d29922', fontSize: 11 }}>
           为保证响应速度，超大文档仅展示部分内容；原文件没有被修改。
         </div>
       )}
@@ -135,12 +138,12 @@ const actionStyle: React.CSSProperties = { border: '1px solid var(--theme-border
 const tabBarStyle: React.CSSProperties = { display: 'flex', gap: 3, overflowX: 'auto', padding: '7px 10px', borderBottom: '1px solid var(--theme-border)', flexShrink: 0 };
 const tabStyle: React.CSSProperties = { border: 'none', borderRadius: 5, padding: '5px 10px', whiteSpace: 'nowrap', background: 'transparent', color: 'var(--theme-text-muted)', cursor: 'pointer', fontSize: 11 };
 const activeTabStyle: React.CSSProperties = { background: 'var(--theme-accent-bg)', color: 'var(--theme-accent)', fontWeight: 700 };
-const paperStyle: React.CSSProperties = { maxWidth: 850, minHeight: 600, margin: '0 auto', padding: '38px 48px', color: '#202124', background: '#fff', boxShadow: '0 3px 18px rgba(0,0,0,.22)', fontFamily: 'system-ui, sans-serif' };
+const paperStyle: React.CSSProperties = { maxWidth: 850, minWidth: 0, minHeight: 600, margin: '0 auto', padding: '24px clamp(12px, 5%, 48px)', overflowWrap: 'anywhere', color: '#202124', background: '#fff', boxShadow: '0 3px 18px rgba(0,0,0,.22)', fontFamily: 'system-ui, sans-serif' };
 const tableStyle: React.CSSProperties = { borderCollapse: 'collapse', fontSize: 12 };
 const cellStyle: React.CSSProperties = { border: '1px solid #cbd5e1', padding: '6px 8px', verticalAlign: 'top', whiteSpace: 'pre-wrap' };
 const mediaGridStyle: React.CSSProperties = { display: 'flex', flexWrap: 'wrap', gap: 10, marginTop: 16 };
-const mediaImageStyle: React.CSSProperties = { maxWidth: 280, maxHeight: 190, objectFit: 'contain', border: '1px solid rgba(0,0,0,.16)', borderRadius: 4, background: '#fff' };
-const slideStyle: React.CSSProperties = { position: 'relative', aspectRatio: '16 / 9', overflow: 'auto', padding: '28px 34px', background: '#fff', color: '#1f2937', borderRadius: 7, boxShadow: '0 3px 14px rgba(0,0,0,.24)' };
+const mediaImageStyle: React.CSSProperties = { maxWidth: 'min(100%, 280px)', maxHeight: 190, objectFit: 'contain', border: '1px solid rgba(0,0,0,.16)', borderRadius: 4, background: '#fff' };
+const slideStyle: React.CSSProperties = { position: 'relative', minWidth: 0, aspectRatio: '16 / 9', overflow: 'auto', overflowWrap: 'anywhere', padding: '20px clamp(12px, 5%, 34px)', background: '#fff', color: '#1f2937', borderRadius: 7, boxShadow: '0 3px 14px rgba(0,0,0,.24)' };
 const slideNumberStyle: React.CSSProperties = { position: 'absolute', right: 10, bottom: 7, color: '#94a3b8', fontSize: 10 };
 
 export default StructuredFilePreview;

@@ -1,4 +1,5 @@
-import React from 'react';
+import React, { useState } from 'react';
+import { usePreviewSize } from '../hooks/usePreviewLayout';
 
 interface Props {
   name: string;
@@ -14,27 +15,41 @@ interface Props {
 
 /** 原预览与分离窗口共用同一标题、来源标记及操作栏；关闭按钮不随工具横向滚走。 */
 export const FilePreviewToolbar: React.FC<Props> = ({ name, relativePath, source, icon, nodeLabel,
-  dirty, compact, trailing, children }) => (
-  <header data-file-preview-toolbar style={{ ...previewToolbarStyle, ...(compact ? { height: 38, padding: '0 8px', gap: 6 } : {}) }}>
+  dirty, compact, trailing, children }) => {
+  const size = usePreviewSize<HTMLDivElement>();
+  const narrow = size.width < 640;
+  const [panel, setPanel] = useState<'identity' | 'tools' | null>(null);
+  return <div ref={size.ref} data-file-preview-toolbar style={{ minWidth: 0, flexShrink: 0 }}>
+  <style>{`[data-preview-exit] button { min-width:44px!important; min-height:44px!important; flex-shrink:0; }
+    [data-preview-tools] button, [data-preview-tools] select { min-height:36px; }
+    [data-preview-tools] > * { flex-shrink:0; }`}</style>
+  <header style={{ ...previewToolbarStyle, padding: '0 4px', gap: 4 }}>
     {!compact && <span aria-hidden style={{ fontSize: 13, flexShrink: 0 }}>{icon}</span>}
-    <span style={{ fontWeight: compact ? 400 : 600, fontSize: compact ? 11 : 13, minWidth: 35, maxWidth: 240,
-      overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', color: compact ? 'var(--theme-text-muted)' : undefined }}
+    <button aria-label="查看文件名和来源" aria-expanded={panel === 'identity'} onClick={() => setPanel(panel === 'identity' ? null : 'identity')}
+      style={{ ...previewToolbarButtonStyle, border: 0, background: 'transparent', flex: '1 1 0', textAlign: 'left', fontWeight: compact ? 400 : 600, minWidth: 0,
+      overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}
       title={`${relativePath} · ${nodeLabel || ''}`}>
       {dirty && <span style={{ color: 'var(--theme-accent)' }}>● </span>}{compact ? relativePath : name}
-    </span>
-    <span style={previewSourceTagStyle} title={nodeLabel}>
+    </button>
+    {!narrow && <span style={previewSourceTagStyle} title={nodeLabel}>
       {compact ? source === 'local' ? '本机副本' : '执行端' : source === 'local' ? '💻 本机' : '☁️ 远端'}
-    </span>
-    <div style={{ flex: 1 }} />
-    <div data-preview-actions style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0, overflowX: 'auto', whiteSpace: 'nowrap' }}>
+    </span>}
+    {narrow && <button style={{ ...previewToolbarButtonStyle, minHeight: 44 }} aria-expanded={panel === 'tools'} onClick={() => setPanel(panel === 'tools' ? null : 'tools')}>工具</button>}
+    {!narrow && <div data-preview-actions style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0, maxWidth: '65%', overflowX: 'auto', whiteSpace: 'nowrap' }}>
       {children}
-    </div>
-    {trailing && <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexShrink: 0 }}>{trailing}</div>}
+    </div>}
+    {trailing && <div data-preview-exit style={{ display: 'flex', alignItems: 'center', gap: 2, flexShrink: 0 }}>{trailing}</div>}
   </header>
-);
+  {panel === 'identity' && <div style={{ padding: 10, maxHeight: 'min(140px, 25dvh)', overflow: 'auto', overflowWrap: 'anywhere', fontSize: 12 }}>
+    <div>{name}</div><div>{relativePath}</div><div>{source === 'local' ? '本机副本' : '执行端'} · {nodeLabel || '当前节点'}</div>
+    <button style={previewToolbarButtonStyle} onClick={() => setPanel(null)}>收起详情</button>
+  </div>}
+  {narrow && panel === 'tools' && <div data-preview-tools style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 6, padding: 6, maxHeight: 'min(140px, 25dvh)', overflow: 'auto' }} onKeyDown={e => { if (e.key === 'Escape') { e.stopPropagation(); setPanel(null); (e.currentTarget.parentElement?.querySelector('button[aria-expanded="true"]') as HTMLElement)?.focus(); } }}>{children}</div>}
+  </div>;
+};
 
 export const previewToolbarStyle: React.CSSProperties = {
-  height: 42, padding: '0 12px', display: 'flex', alignItems: 'center', gap: 8,
+  height: 48, padding: '0 12px', display: 'flex', alignItems: 'center', gap: 8,
   flexShrink: 0, minWidth: 0, borderBottom: '1px solid var(--theme-border, rgba(255,255,255,0.1))',
 };
 export const previewToolbarButtonStyle: React.CSSProperties = {

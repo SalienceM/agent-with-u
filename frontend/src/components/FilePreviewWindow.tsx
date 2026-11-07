@@ -7,6 +7,11 @@ import { DetachedTextDocument } from './DetachedTextDocument';
 import type { DocumentClient } from '../utils/documentStore';
 import { FilePreviewToolbar, previewToolbarButtonStyle as buttonStyle } from './FilePreviewToolbar';
 import { WorkbenchPopover } from './WorkbenchChrome';
+import { useIndependentPreview } from '../hooks/useIndependentPreview';
+import { getPreviewIdentity, observePreviewIdentity } from '../api';
+import { samePreviewIdentity } from '../utils/previewLifecycle';
+import { documentStore } from '../utils/documentStore';
+import { documentDrafts } from '../utils/documentDrafts';
 
 const PdfPreview = lazy(() => import('./PdfPreview'));
 const DocxPreview = lazy(() => import('./DocxPreview'));
@@ -15,22 +20,46 @@ const HtmlPreview = lazy(() => import('./HtmlPreview'));
 const canNavigate = () => window.dispatchEvent(new Event('awu-preview-before-navigate', { cancelable: true }));
 
 export const FilePreviewWindow: React.FC = () => {
-  const [snapshot, setSnapshot] = useState<PreviewWindowSnapshot | null>(null);
-  const [error, setError] = useState('');
-  const [connected, setConnected] = useState(false);
+  const independent = new URLSearchParams(location.search).get('previewVersion') === '2';
+  const own = useIndependentPreview(independent);
+  const [legacySnapshot, setLegacySnapshot] = useState<PreviewWindowSnapshot | null>(null);
+  const [legacyError, setLegacyError] = useState('');
+  const [legacyConnected, setConnected] = useState(false);
+  const snapshot = independent ? own.snapshot : legacySnapshot;
+  const setSnapshot = independent ? own.setSnapshot : setLegacySnapshot;
+  const error = independent ? own.error : legacyError;
+  const setError = independent ? own.setError : setLegacyError;
+  const connected = independent ? own.phase === 'ready' : legacyConnected;
   const [pinned, setPinned] = useState(false);
   const [maximized, setMaximized] = useState(false);
   const [closeReady, setCloseReady] = useState(!isDesktopWindow());
   const [textToolbar, setTextToolbar] = useState<HTMLDivElement | null>(null);
   const [textState, setTextState] = useState({ dirty: false, editing: false });
-  const [fullDocument, setFullDocument] = useState(false);
+  const [legacyFullDocument, setFullDocument] = useState(false);
+  const fullDocument = independent || legacyFullDocument;
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState('');
   const [navigationRevision, setNavigationRevision] = useState(0);
   const channel = useRef<BroadcastChannel | null>(null);
   const requests = useRef(new Map<number, { resolve: (value: any) => void; reject: (error: Error) => void; timer: number }>());
   const seq = useRef(0);
+  // 授权撤销会卸载正文，但不能一并移除未保存/未知回执的退出守卫。
   useEffect(() => {
+    if (!independent || own.phase !== 'revoked') return;
+    const pending = () => documentStore.all().filter(doc => doc.dirty || doc.save && !['succeeded', 'failed'].includes(doc.save.receipt?.status || ''));
+    for (const doc of pending()) void documentDrafts.flush(doc.key).catch(() => {});
+    const guard = (event: Event) => {
+      const docs = pending(); if (!docs.length) return;
+      if (event.type === 'beforeunload') { event.preventDefault(); (event as BeforeUnloadEvent).returnValue = ''; return; }
+      const persisted = docs.every(doc => ['saved', 'restored'].includes(doc.persistence || ''));
+      if (!persisted || !window.confirm('原身份的未保存草稿/待核对保存已隔离保留。关闭此窗口不会保存或重试写入；以后须以原身份恢复。仍要关闭？')) event.preventDefault();
+    };
+    window.addEventListener('awu-preview-before-navigate', guard); window.addEventListener('beforeunload', guard);
+    return () => { window.removeEventListener('awu-preview-before-navigate', guard); window.removeEventListener('beforeunload', guard); };
+  }, [independent, own.phase]);
+  useEffect(() => {
+    if (independent) return;
+    const identity = getPreviewIdentity(); let valid = true;
     const id = new URLSearchParams(location.search).get('filePreview');
     if (!id || !/^[\w-]{1,128}$/.test(id)) { setError('预览窗口标识无效'); return; }
     const bc = new BroadcastChannel(`awu-file-preview-${id}`);
@@ -40,12 +69,18 @@ export const FilePreviewWindow: React.FC = () => {
       requests.current.forEach(request => { window.clearTimeout(request.timer); request.reject(new Error('原文件窗口已断开')); });
       requests.current.clear();
     };
+    const off = observePreviewIdentity(() => {
+      if (samePreviewIdentity(identity, getPreviewIdentity())) return;
+      valid = false; setSnapshot(null); setConnected(false); rejectPending();
+      setError('账号或身份域已变化，旧版预览内容已隔离。'); document.title = '文件预览 · 身份已变化';
+    });
     bc.onmessage = ({ data }) => {
+      if (!valid || !samePreviewIdentity(identity, getPreviewIdentity())) return;
       if (data?.kind === 'snapshot') {
         window.clearTimeout(timeout); setSnapshot(data.snapshot); setConnected(true); setError(''); setFullDocument(data.fullDocument === true);
         document.title = `${data.snapshot.preview.name} · 预览 — AgentWithU`;
       } else if (data?.kind === 'disconnected') {
-        setConnected(false); setSnapshot(null); setError('原预览窗口已关闭或切换身份，请重新打开预览。'); rejectPending();
+        valid = false; setConnected(false); setSnapshot(null); setError('此为旧版代理预览，连接已结束且无法核验完整来源。请重新打开文件使用独立预览。'); rejectPending();
       } else if (data?.kind === 'resource' || data?.kind === 'result') {
         const pending = requests.current.get(data.id);
         if (!pending) return;
@@ -56,7 +91,7 @@ export const FilePreviewWindow: React.FC = () => {
     bc.postMessage({ kind: 'ready' });
     const closed = () => bc.postMessage({ kind: 'closed' });
     window.addEventListener('pagehide', closed);
-    return () => { window.clearTimeout(timeout); window.removeEventListener('pagehide', closed); closed(); bc.close(); channel.current = null; rejectPending(); };
+    return () => { off(); window.clearTimeout(timeout); window.removeEventListener('pagehide', closed); closed(); bc.close(); channel.current = null; rejectPending(); };
   }, []);
   const call = useCallback((kind: string, args: object): Promise<any> => new Promise((resolve, reject) => {
     if (!channel.current || !connected) { reject(new Error('原文件窗口已断开')); return; }
@@ -64,11 +99,26 @@ export const FilePreviewWindow: React.FC = () => {
     const timer = window.setTimeout(() => { requests.current.delete(id); reject(new Error('文件操作超时；保存结果须核对，不能重复写入')); }, 30000);
     requests.current.set(id, { resolve, reject, timer }); channel.current.postMessage({ kind, id, ...args });
   }), [connected]);
-  const request = useCallback((method: string, args: object = {}) => call('request', { method, ...args }), [call]);
-  const readFile = useCallback((rel: string): Promise<Uint8Array> => call('read', { rel }), [call]);
+  // 连接状态更新不能改变 HTML 资源读取器的身份，否则会重建 iframe、丢失阅读状态。
+  const legacyCall = useRef(call); legacyCall.current = call;
+  const request = useCallback((method: string, args: { rel?: string } = {}): Promise<any> => {
+    if (!independent) return call('request', { method, ...args });
+    const access = own.access.current;
+    if (!access) return Promise.reject(new Error('文件来源尚未初始化'));
+    if (method === 'load') return access.load(args.rel);
+    if (method === 'structured') return access.structured(args.rel!);
+    if (method === 'reveal' || method === 'review') return own.navigateUi(method, args.rel!);
+    return Promise.reject(new Error('不支持的文件窗口操作'));
+  }, [call, independent, own.phase]);
+  const readFile = useCallback((rel: string): Promise<Uint8Array> => independent
+    ? own.access.current ? own.access.current.readFile(rel) : Promise.reject(new Error('文件来源尚未初始化')) : legacyCall.current('read', { rel }), [independent]);
   const documentClient = useCallback(async (): Promise<DocumentClient> => {
-    const metadata = await request('document');
-    return { ...metadata, read: rel => request('read', { rel }), save: input => request('save', { request: input }), saveGet: requestId => request('saveGet', { requestId }) };
+    if (independent) {
+      if (!own.access.current) throw new Error('文件来源尚未初始化');
+      return own.access.current.documentClient();
+    }
+    const metadata = await call('request', { method: 'document' });
+    return { ...metadata, read: rel => call('request', { method: 'read', rel }), save: input => call('request', { method: 'save', request: input }), saveGet: requestId => call('request', { method: 'saveGet', requestId }) };
   }, [request]);
   const navigate = async (rel: string, fragment = '') => {
     if (busy || !canNavigate()) return;
@@ -94,7 +144,7 @@ export const FilePreviewWindow: React.FC = () => {
         event.preventDefault();
         if (!active || closing || !canNavigate()) return;
         closing = true;
-        try { await current.destroy(); }
+        try { if (independent) await own.closed(); await current.destroy(); }
         catch (reason) { if (active) setError(`关闭窗口失败：${String(reason)}`); }
         finally { closing = false; }
       }));
@@ -107,9 +157,19 @@ export const FilePreviewWindow: React.FC = () => {
   }, []);
   const close = () => {
     if (isDesktopWindow()) void import('@tauri-apps/api/window').then(({ getCurrentWindow }) => getCurrentWindow().close()).catch(reason => setError(String(reason)));
-    else if (canNavigate()) window.close();
+    else if (canNavigate()) { if (independent) void own.closed().then(() => window.close()); else window.close(); }
   };
   const preview = snapshot?.preview;
+  useEffect(() => {
+    const title = independent && own.phase === 'revoked' ? '文件预览 · 身份已变化'
+      : preview ? `${preview.name} · 预览 — AgentWithU` : '文件预览 — AgentWithU';
+    document.title = title;
+    let active = true;
+    if (isDesktopWindow()) void import('@tauri-apps/api/window').then(({ getCurrentWindow }) => {
+      if (active) return getCurrentWindow().setTitle(title);
+    }).catch(() => {});
+    return () => { active = false; };
+  }, [preview?.name, independent, own.phase]);
   const reveal = () => { if (preview) void request('reveal', { rel: preview.rel }).then(() => setNotice('已在原文件窗口定位。')).catch(reason => setError(String(reason))); };
   const renderText = (text: string) => snapshot && preview && (preview.isHtml
     ? <HtmlPreview source={text} rel={preview.rel} root={snapshot.root} nodeLabel={snapshot.nodeLabel} fragment={preview.htmlFragment}
@@ -141,21 +201,27 @@ export const FilePreviewWindow: React.FC = () => {
           {snapshot && preview && <div style={{ fontSize: 11, overflowWrap: 'anywhere', color: 'var(--theme-text-muted)' }}>
             {snapshot.nodeLabel} · {snapshot.root}/{preview.rel} · {fullDocument ? '原文件预览 / 编辑' : '只读预览'}
           </div>}
-          {preview && fullDocument && <button style={buttonStyle} disabled={busy} onClick={() => { dismiss(); void navigate(preview.rel, preview.htmlFragment); }}>↻ 重新加载</button>}
+          {preview && fullDocument && <button style={buttonStyle} disabled={busy || !connected} onClick={() => { dismiss(); void navigate(preview.rel, preview.htmlFragment); }}>↻ 重新加载</button>}
           {isDesktopWindow() && <button style={buttonStyle} onClick={() => void import('@tauri-apps/api/window').then(async ({ getCurrentWindow }) => {
             await getCurrentWindow().setAlwaysOnTop(!pinned); setPinned(!pinned); dismiss();
           }).catch(reason => setError(String(reason)))}>{pinned ? '取消置顶' : '置顶'}</button>}
         </div>}
       </WorkbenchPopover>
     </FilePreviewToolbar>
-    {error && <div role="alert" style={{ padding: 12, color: '#f87171' }}>{error}</div>}
+    {error && <div role="alert" style={{ padding: 12, color: '#f87171', maxHeight: '25%', overflow: 'auto', overflowWrap: 'anywhere', flexShrink: 0 }}>{error}
+      {independent && !snapshot && own.source && own.phase !== 'revoked' && <div style={{ fontSize: 11 }}>
+        固定来源：{own.source.executor} · {own.source.source === 'local' ? own.source.local!.root : own.source.workingDir}/{own.source.relative}
+      </div>}
+      {independent && !['revoked', 'invalidated', 'closed'].includes(own.phase) && <button style={buttonStyle} onClick={() => void own.retry()}>重新连接 / 核对来源</button>}
+    </div>}
     {notice && <div role="status" style={{ padding: '6px 12px', fontSize: 12 }}>{notice}</div>}
-    {!snapshot && !error && <p role="status" style={{ padding: 16 }}>正在连接原文件窗口…</p>}
+    {!snapshot && !error && <p role="status" style={{ padding: 16 }}>{independent ? '正在核验并读取文件来源…' : '正在连接旧版文件窗口…'}</p>}
     {snapshot && preview && <>
-      <div style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column', overflow: 'auto' }}>
+      <div data-preview-reading style={{ flex: 1, minWidth: 0, minHeight: 0, display: 'flex', flexDirection: 'column', overflow: 'auto', overscrollBehavior: 'contain' }}>
         <Suspense fallback={<div role="status" style={{ padding: 16 }}>加载预览…</div>}>
           {fullDocument && !preview.isImage && !preview.renderer && !preview.structured
             ? <DetachedTextDocument key={`${preview.rel}:${preview.source}:${navigationRevision}`} preview={preview} dark={snapshot.dark} client={documentClient}
+              ioAvailable={connected}
               initialView={snapshot.initialView}
               toolbarHost={textToolbar} onDocumentState={setTextState}
               renderPreview={renderText} onSaved={() => setNotice('已保存；重新加载可核对磁盘内容。')} />

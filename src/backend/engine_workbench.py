@@ -167,6 +167,10 @@ class EngineWorkbenchBridge:
 
     def _engineering_check(self, session_id: str, expected: Any,
                            control_revision: int) -> WorkspaceIdentity:
+        try:
+            getattr(self, '_project_check_write', lambda **kwargs: None)(session_id=session_id)
+        except ValueError as error:
+            raise WorkbenchError('project_write_frozen') from error
         identity = self._workbench_identity(session_id)
         identity.require_match(expected)
         if type(control_revision) is not int or not 0 <= control_revision <= 2**53 - 1:
@@ -221,20 +225,22 @@ class EngineWorkbenchBridge:
 
     def _workbench_identity(self, session_id: str, expected: Any = None) -> WorkspaceIdentity:
         self._require_session_access(session_id)
-        session = self._active_sessions.get(session_id) or self._session_store.load(session_id)
-        if session is None or getattr(session, 'codex_connection_mode', None) == 'ssh':
+        session = self._active_sessions.get(session_id)
+        # 身份只依赖轻量元数据，不能为了窗口能力探测反复解析含附件的整份会话。
+        meta = session.meta_dict() if session is not None else self._session_store.get_meta(session_id)
+        if meta is None or meta.get('codexConnectionMode') == 'ssh':
             raise WorkbenchError('workspace_unavailable')
-        directory = canonical_workspace(session.working_dir)
+        directory = canonical_workspace(meta.get('workingDir'))
         if not Path(directory).is_dir():
             raise WorkbenchError('workspace_unavailable')
         if not hasattr(self, '_workbench_executor_instance'):
             self._workbench_executor_instance = str(uuid.uuid4())
         revision = hashlib.sha256(json.dumps(
-            [session.owner_id, self._workbench_executor_instance, session.id, directory],
+            [meta.get('ownerId') or 'local', self._workbench_executor_instance, session_id, directory],
             ensure_ascii=False, separators=(',', ':'),
         ).encode('utf-8')).hexdigest()
-        identity = WorkspaceIdentity(session.owner_id, self._workbench_executor_instance,
-                                     session.id, directory, revision)
+        identity = WorkspaceIdentity(meta.get('ownerId') or 'local', self._workbench_executor_instance,
+                                     session_id, directory, revision)
         if expected is not None:
             identity.require_match(expected)
         return identity

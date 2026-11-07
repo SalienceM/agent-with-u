@@ -20,18 +20,19 @@ async def check() -> dict:
     parsed = urlparse(url)
     if parsed.scheme != "http" or parsed.hostname != "127.0.0.1" or not parsed.port or parsed.username or parsed.password:
         raise RuntimeError("Harness probe accepts only a loopback fake provider")
-    if shutil.which("node") or shutil.which("pnpm"):
-        raise RuntimeError("Harness frozen acceptance must not use system Node/pnpm")
+    external_cli = os.environ.get("AWU_HARNESS_PROBE_CLI", "")
+    if not external_cli and (shutil.which("node") or shutil.which("pnpm")):
+        raise RuntimeError("Missing-dependency probe must not use system Node/pnpm")
     scenario = os.environ.get("AWU_HARNESS_PROBE_CASE")
-    if scenario not in {"tools", "allow", "deny", "resume", "stop"}:
+    if scenario not in {"missing", "tools", "allow", "deny", "resume", "stop"}:
         raise RuntimeError("Unknown Harness probe case")
     from .backend.deepseek_harness import DeepSeekHarnessBackend
-    from .backend.deepseek_harness_distribution import verify_bundle
+    from .backend.deepseek_harness_distribution import verify_adapter
     from .types import BackendType, ModelBackendConfig
-    inventory = verify_bundle(repair_executable=True)
+    inventory = verify_adapter()
     config = ModelBackendConfig(id="isolated-probe", type=BackendType.DEEPSEEK_HARNESS,
         label="package probe", model="smoke-model", api_key="local-fixture-not-a-credential", base_url=url,
-        skip_permissions=False,
+        skip_permissions=False, cli_path=external_cli or None,
         harness_permission_mode="read-only" if scenario in {"allow", "deny"} else "workspace-write")
     backend = DeepSeekHarnessBackend(config)
     deltas, approvals, turns = [], [], []
@@ -72,6 +73,12 @@ async def check() -> dict:
         native = result.get("agentSessionId")
         if backend.has_unconfirmed_activity("probe"):
             raise RuntimeError("Harness probe native exit is unconfirmed")
+        if scenario == "missing":
+            errors = " ".join(str(item.error or "") for item in deltas if item.type == "error")
+            if result.get("success") or "npm install -g @deepseek-ai/dsh@0.2.1-rc.3" not in errors:
+                raise RuntimeError("Missing CLI must produce the fixed installation guidance: " + errors)
+            return {"ok": True, "case": scenario, "frozen": bool(getattr(sys, "frozen", False)),
+                    "resources": len(inventory), "exitConfirmed": True, "systemNode": False}
         if bool(result.get("success")) != (scenario != "stop"):
             errors = [item.error for item in deltas if item.type == "error"]
             raise RuntimeError("Probe turn result mismatch: " + str(errors))
@@ -90,7 +97,7 @@ async def check() -> dict:
         raise RuntimeError("Stopped probe emitted success")
     return {"ok": True, "case": scenario, "platform": sys.platform, "frozen": bool(getattr(sys, "frozen", False)),
             "resources": len(inventory), "turns": len(turns), "tools": len(tools), "approvals": len(approvals),
-            "nativeId": native, "systemNode": False, "exitConfirmed": True}
+            "nativeId": native, "systemNode": bool(external_cli), "exitConfirmed": True}
 
 
 def run() -> int:

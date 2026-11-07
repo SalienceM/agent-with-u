@@ -23,7 +23,7 @@ import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable, Iterator, Optional
+from typing import Any, Callable, Iterable, Iterator, Optional
 from urllib.parse import parse_qsl, quote, unquote, urlencode, urlparse, urlsplit, urlunsplit
 
 import httpx
@@ -421,6 +421,7 @@ class ReleaseCenterManager:
         self.qshell_workspace = self.root / "qshell-workspace"
         self.qshell_workspace.mkdir(parents=True, exist_ok=True)
         self._thread_lock = threading.RLock()
+        self._io_lock = asyncio.Lock()
         self._tasks: dict[str, asyncio.Task] = {}
         self._processes: dict[str, asyncio.subprocess.Process] = {}
         self._job_account_modes: dict[str, str] = {}
@@ -436,6 +437,33 @@ class ReleaseCenterManager:
         with self._thread_lock:
             with _process_file_lock(self.lock_path):
                 yield
+
+    async def _io(self, function: Callable[..., Any], *args: Any,
+                  committed: Optional[Callable[[Any], None]] = None) -> Any:
+        """发布账本 I/O 顺序执行于工作线程，等待磁盘锁不能冻结 Relay/心跳。
+
+        取消 waiter 后仍等已开始的写入退出，防止较晚的取消/终态记录被旧写覆盖。
+        """
+        async with self._io_lock:
+            async def run() -> Any:
+                value = await asyncio.to_thread(function, *args)
+                if committed is not None:
+                    committed(value)
+                return value
+            task = asyncio.create_task(run())
+            try:
+                return await asyncio.shield(task)
+            except asyncio.CancelledError:
+                while not task.done():
+                    try:
+                        await asyncio.shield(task)
+                    except asyncio.CancelledError:
+                        continue
+                    except Exception:
+                        break
+                if not task.cancelled():
+                    task.exception()
+                raise
 
     def _load_state(self) -> dict[str, Any]:
         state = _read_json(self.state_path, _default_state())
@@ -705,6 +733,15 @@ class ReleaseCenterManager:
             "activeJob": active,
         }
 
+    def job_status(self, job_id: str) -> dict[str, Any]:
+        """运行器只读单个任务，不重探 qshell 账号或复制整个候选列表。"""
+        with self._guard():
+            state = self._load_state()
+        job = next((item for item in state['jobs'] if item.get('id') == job_id), None)
+        if job is None:
+            raise ReleaseCenterError('发布任务不存在')
+        return job
+
     def _discover_artifacts(
         self, project_root: Path, scan_roots: Iterable[str], stamped_at: float,
     ) -> list[dict[str, Any]]:
@@ -966,7 +1003,7 @@ class ReleaseCenterManager:
                 path = Path(unquote(parsed.path)) if parsed.scheme == "file" else Path(source).expanduser()
                 if os.name == "nt" and parsed.scheme == "file" and parsed.netloc:
                     path = Path(f"//{parsed.netloc}{unquote(parsed.path)}")
-                value = json.loads(path.read_text(encoding="utf-8-sig"))
+                value = await self._io(lambda: json.loads(path.read_text(encoding="utf-8-sig")))
             return value if isinstance(value, dict) else None
         except Exception as error:
             raise ReleaseCenterError(f"无法读取当前稳定版：{error}") from error
@@ -1005,8 +1042,8 @@ class ReleaseCenterManager:
         self, candidate_id: str, artifact_ids: list[str], options: dict[str, Any],
         *, kit_binding: Optional[dict[str, str]] = None,
     ) -> dict[str, Any]:
-        candidate = self._candidate(candidate_id)
-        config = {**self._config(), **{key: value for key, value in (options or {}).items() if key in {
+        candidate = await self._io(self._candidate, candidate_id)
+        config = {**await self._io(self._config), **{key: value for key, value in (options or {}).items() if key in {
             "channel", "baseUrl", "qiniuBucket", "prefix", "manifestKey",
             "stableManifestUrl", "requireSignature", "retentionCount",
         }}}
@@ -1180,8 +1217,7 @@ class ReleaseCenterManager:
         fingerprint_source = dict(plan)
         fingerprint_source.pop("id", None)
         plan["fingerprint"] = hashlib.sha256(canonical_payload(fingerprint_source)).hexdigest()
-        self.plans_dir.mkdir(parents=True, exist_ok=True)
-        _atomic_json(self.plans_dir / f"{plan_id}.json", plan)
+        await self._io(_atomic_json, self.plans_dir / f"{plan_id}.json", plan)
         return {"status": "ok" if not blockers else "blocked", "plan": plan}
 
     def _plan(self, plan_id: str) -> dict[str, Any]:
@@ -1198,23 +1234,37 @@ class ReleaseCenterManager:
             job = next((item for item in state["jobs"] if item.get("id") == job_id), None)
             if not job:
                 raise ReleaseCenterError("发布任务不存在")
+            if job.get('status') in {'succeeded', 'failed', 'cancelled', 'interrupted'}:
+                # 已持久化的终态不因 waiter 在落盘后收到取消而改写。
+                return dict(job)
             job.update(patch)
             job["updatedAt"] = _now()
             self._save_state(state)
             return dict(job)
 
     async def start_publish(self, plan_id: str) -> dict[str, Any]:
-        plan = self._plan(plan_id)
+        plan = await self._io(self._plan, plan_id)
         if plan.get("status") != "ready" or plan.get("blockers"):
             raise ReleaseCenterError("发布计划仍有阻断项，请重新预检")
-        candidate = self._candidate(str(plan.get("candidateId") or ""))
+        candidate = await self._io(self._candidate, str(plan.get("candidateId") or ""))
         if candidate.get("status") != "candidate":
             raise ReleaseCenterError("候选状态已经变化，请重新选择并预检；旧计划不能重复发布")
         account = await asyncio.to_thread(
-            self.qiniu_account_status, self._config(), force=True,
+            self.qiniu_account_status, await self._io(self._config), force=True,
         )
         if not account.get("configured"):
             raise ReleaseCenterError("当前执行节点的 qshell 七牛账号不可用，请重新配置并预检")
+        def launch(job: dict[str, Any]) -> None:
+            # 接受落盘与交给所属发布任务是一次交接；客户端断线不能留下无人执行的 queued。
+            job_id = job['id']
+            self._job_account_modes[job_id] = str(account.get("mode") or "user")
+            task = asyncio.create_task(self._run_publish(job_id, plan))
+            self._tasks[job_id] = task
+            task.add_done_callback(lambda finished, jid=job_id: self._consume_task(jid, finished))
+        job = await self._io(self._create_publish_job, plan_id, plan, committed=launch)
+        return {"status": "queued", "job": job}
+
+    def _create_publish_job(self, plan_id: str, plan: dict[str, Any]) -> dict[str, Any]:
         with self._guard():
             state = self._load_state()
             if any(job.get("status") in {"queued", "running"} for job in state["jobs"]):
@@ -1239,11 +1289,7 @@ class ReleaseCenterManager:
             }
             state["jobs"] = [job, *state["jobs"]]
             self._save_state(state)
-        self._job_account_modes[job_id] = str(account.get("mode") or "user")
-        task = asyncio.create_task(self._run_publish(job_id, plan))
-        self._tasks[job_id] = task
-        task.add_done_callback(lambda finished, jid=job_id: self._consume_task(jid, finished))
-        return {"status": "queued", "job": job}
+        return job
 
     def _consume_task(self, job_id: str, task: asyncio.Task) -> None:
         self._tasks.pop(job_id, None)
@@ -1268,7 +1314,7 @@ class ReleaseCenterManager:
             job["updatedAt"] = _now()
             self._save_state(state)
 
-    def _report_upload_progress(
+    async def _report_upload_progress(
         self, job_id: str, current_bytes: int, file_size: int,
         completed_bytes: int, total_bytes: int, *, force: bool = False,
     ) -> None:
@@ -1288,7 +1334,7 @@ class ReleaseCenterManager:
             ):
                 return
         self._upload_progress_marks[job_id] = (now, uploaded_bytes, progress)
-        self._update_job(job_id, {
+        await self._io(self._update_job, job_id, {
             "progress": progress,
             "uploadedBytes": uploaded_bytes,
             "totalBytes": total_bytes,
@@ -1303,8 +1349,8 @@ class ReleaseCenterManager:
         if job_id in self._cancel_requested:
             raise asyncio.CancelledError
         file_size = path.stat().st_size
-        self._append_log(job_id, f"上传 {path.name} → {key}")
-        self._update_job(job_id, {
+        await self._io(self._append_log, job_id, f"上传 {path.name} → {key}")
+        await self._io(self._update_job, job_id, {
             "currentFileName": path.name,
             "currentFileBytes": 0,
             "currentFileSize": file_size,
@@ -1345,7 +1391,7 @@ class ReleaseCenterManager:
                 parse_tail = (parse_tail + chunk.decode("utf-8", errors="replace"))[-1_000:]
                 fraction = _qshell_progress_fraction(parse_tail)
                 if fraction is not None:
-                    self._report_upload_progress(
+                    await self._report_upload_progress(
                         job_id, int(file_size * fraction), file_size,
                         completed_bytes, total_bytes,
                     )
@@ -1363,7 +1409,7 @@ class ReleaseCenterManager:
                 # qshell may read a small amount of config around the upload. Capping at
                 # 98% prevents those reads from claiming completion before qshell exits.
                 current = min(int(file_size * 0.98), max(0, observed - baseline))
-                self._report_upload_progress(
+                await self._report_upload_progress(
                     job_id, current, file_size, completed_bytes, total_bytes,
                 )
 
@@ -1381,10 +1427,10 @@ class ReleaseCenterManager:
         output = bytes(output_tail).decode("utf-8", errors="replace").strip()
         error = bytes(error_tail).decode("utf-8", errors="replace").strip()
         if output:
-            self._append_log(job_id, output)
+            await self._io(self._append_log, job_id, output)
         if process.returncode != 0:
             raise ReleaseCenterError(error or output or f"qshell 退出码 {process.returncode}")
-        self._report_upload_progress(
+        await self._report_upload_progress(
             job_id, file_size, file_size, completed_bytes, total_bytes, force=True,
         )
 
@@ -1415,7 +1461,7 @@ class ReleaseCenterManager:
         error = stderr.decode("utf-8", errors="replace")[-6_000:].strip()
         if process.returncode != 0:
             raise ReleaseCenterError(error or output or f"qshell delete 退出码 {process.returncode}")
-        self._append_log(job_id, f"已删除旧版本对象：{key}")
+        await self._io(self._append_log, job_id, f"已删除旧版本对象：{key}")
 
     async def _apply_retention(
         self, job_id: str, qshell: str, current_history_id: str, retention_count: int,
@@ -1425,30 +1471,33 @@ class ReleaseCenterManager:
         if retention_count <= 0:
             return {"removedReleases": 0, "deletedObjects": 0, "failedObjects": 0}
 
-        with self._guard():
-            state = self._load_state()
-            current = next(
-                (item for item in state["history"] if item.get("id") == current_history_id), None,
-            )
-            if not current:
-                raise ReleaseCenterError("无法读取本次发布记录，已跳过历史版本清理")
-            scope = (
-                str(current.get("qiniuBucket") or ""),
-                str(current.get("channel") or ""),
-                str(current.get("manifestKey") or ""),
-            )
-            scoped = sorted(
-                (
-                    dict(item) for item in state["history"]
-                    if (
-                        str(item.get("qiniuBucket") or ""),
-                        str(item.get("channel") or ""),
-                        str(item.get("manifestKey") or ""),
-                    ) == scope
-                ),
-                key=lambda item: float(item.get("publishedAt") or 0),
-                reverse=True,
-            )
+        def read_scope() -> tuple[tuple[str, str, str], list[dict[str, Any]]]:
+            with self._guard():
+                state = self._load_state()
+                current = next(
+                    (item for item in state["history"] if item.get("id") == current_history_id), None,
+                )
+                if not current:
+                    raise ReleaseCenterError("无法读取本次发布记录，已跳过历史版本清理")
+                scope = (
+                    str(current.get("qiniuBucket") or ""),
+                    str(current.get("channel") or ""),
+                    str(current.get("manifestKey") or ""),
+                )
+                scoped = sorted(
+                    (
+                        dict(item) for item in state["history"]
+                        if (
+                            str(item.get("qiniuBucket") or ""),
+                            str(item.get("channel") or ""),
+                            str(item.get("manifestKey") or ""),
+                        ) == scope
+                    ),
+                    key=lambda item: float(item.get("publishedAt") or 0),
+                    reverse=True,
+                )
+            return scope, scoped
+        scope, scoped = await self._io(read_scope)
 
         retained = scoped[:retention_count]
         stale = scoped[retention_count:]
@@ -1492,7 +1541,7 @@ class ReleaseCenterManager:
                     remaining.append(safe_key)
                     detail = f"{safe_key}：{error}"
                     errors.append(detail)
-                    self._append_log(job_id, f"旧版本对象清理失败：{detail}")
+                    await self._io(self._append_log, job_id, f"旧版本对象清理失败：{detail}")
                     failed_objects += 1
             if remaining:
                 remaining_by_release[release_id] = remaining
@@ -1501,19 +1550,21 @@ class ReleaseCenterManager:
                 removed_release_ids.add(release_id)
 
         if removed_release_ids or remaining_by_release:
-            with self._guard():
-                state = self._load_state()
-                state["history"] = [
-                    item for item in state["history"]
-                    if str(item.get("id") or "") not in removed_release_ids
-                ]
-                for item in state["history"]:
-                    release_id = str(item.get("id") or "")
-                    if release_id in remaining_by_release:
-                        item["objectKeys"] = remaining_by_release[release_id]
-                        item["cleanupError"] = "；".join(errors_by_release[release_id])[:4_000]
-                        item["cleanupAttemptedAt"] = _now()
-                self._save_state(state)
+            def save_cleanup() -> None:
+                with self._guard():
+                    state = self._load_state()
+                    state["history"] = [
+                        item for item in state["history"]
+                        if str(item.get("id") or "") not in removed_release_ids
+                    ]
+                    for item in state["history"]:
+                        release_id = str(item.get("id") or "")
+                        if release_id in remaining_by_release:
+                            item["objectKeys"] = remaining_by_release[release_id]
+                            item["cleanupError"] = "；".join(errors_by_release[release_id])[:4_000]
+                            item["cleanupAttemptedAt"] = _now()
+                    self._save_state(state)
+            await self._io(save_cleanup)
 
         return {
             "removedReleases": len(removed_release_ids),
@@ -1550,11 +1601,11 @@ class ReleaseCenterManager:
         output = stdout.decode("utf-8", errors="replace")[-6_000:].strip()
         error = stderr.decode("utf-8", errors="replace")[-6_000:].strip()
         if process.returncode == 0:
-            self._append_log(job_id, f"已提交 CDN 刷新：{manifest_url}")
+            await self._io(self._append_log, job_id, f"已提交 CDN 刷新：{manifest_url}")
             if output:
-                self._append_log(job_id, output)
+                await self._io(self._append_log, job_id, output)
             return True
-        self._append_log(
+        await self._io(self._append_log,
             job_id,
             "CDN 主动刷新未成功，将继续使用防缓存 URL 回读校验："
             + (error or output or f"qshell 退出码 {process.returncode}"),
@@ -1603,7 +1654,7 @@ class ReleaseCenterManager:
 
     async def _run_publish(self, job_id: str, plan: dict[str, Any]) -> None:
         try:
-            self._update_job(job_id, {"status": "running", "message": "重新校验冻结制品", "startedAt": _now()})
+            await self._io(self._update_job, job_id, {"status": "running", "message": "重新校验冻结制品", "startedAt": _now()})
             for upload in plan.get("uploadJobs") or []:
                 path = Path(str(upload.get("path") or "")).expanduser()
                 if not path.is_file():
@@ -1614,7 +1665,7 @@ class ReleaseCenterManager:
                 if digest != str(upload.get("sha256") or ""):
                     raise ReleaseCenterError(f"制品哈希在预检后发生变化：{path.name}")
 
-            config = self._config()
+            config = await self._io(self._config)
             qshell = self._resolve_qshell(config)
             if not qshell:
                 raise ReleaseCenterError("正式发布时找不到 qshell")
@@ -1634,9 +1685,8 @@ class ReleaseCenterManager:
                     ).hexdigest(),
                 }
             generated = self.generated_dir / _safe_id(job_id)
-            generated.mkdir(parents=True, exist_ok=True)
             manifest_path = generated / "manifest.json"
-            _atomic_json(manifest_path, manifest)
+            await self._io(_atomic_json, manifest_path, manifest)
 
             upload_jobs = list(plan.get("uploadJobs") or [])
             manifest_size = manifest_path.stat().st_size
@@ -1645,7 +1695,7 @@ class ReleaseCenterManager:
             retention_count = max(0, min(100, int(plan.get("retentionCount") or 0)))
             total = len(upload_jobs) + 2 + (1 if retention_count > 0 else 0)
             step = 0
-            self._update_job(job_id, {
+            await self._io(self._update_job, job_id, {
                 "uploadedBytes": 0,
                 "totalBytes": total_bytes,
                 "currentFileBytes": 0,
@@ -1654,7 +1704,7 @@ class ReleaseCenterManager:
             })
             for upload in upload_jobs:
                 step += 1
-                self._update_job(job_id, {
+                await self._io(self._update_job, job_id, {
                     "step": step,
                     "message": f"上传制品 {step}/{len(upload_jobs)}",
                 })
@@ -1666,7 +1716,7 @@ class ReleaseCenterManager:
                 completed_bytes += upload_path.stat().st_size
 
             step += 1
-            self._update_job(job_id, {
+            await self._io(self._update_job, job_id, {
                 "step": step,
                 "message": "上传版本快照 manifest",
             })
@@ -1678,7 +1728,7 @@ class ReleaseCenterManager:
 
             # stable/channel 指针必须是最后一个写入对象。此前任何失败都不会让客户端看到半套发布。
             step += 1
-            self._update_job(job_id, {
+            await self._io(self._update_job, job_id, {
                 "step": step,
                 "message": f"最后切换 {plan.get('channel') or 'stable'} manifest",
             })
@@ -1689,7 +1739,7 @@ class ReleaseCenterManager:
             completed_bytes += manifest_size
 
             manifest_url = str(plan.get("manifestUrl") or "").strip()
-            self._update_job(job_id, {
+            await self._io(self._update_job, job_id, {
                 "progress": 99,
                 "uploadedBytes": completed_bytes,
                 "currentFileBytes": manifest_size,
@@ -1697,63 +1747,66 @@ class ReleaseCenterManager:
                 "message": "刷新 CDN 并核验公开 channel manifest",
             })
             await self._refresh_cdn(job_id, qshell, manifest_url)
-            self._update_job(job_id, {"message": "从公开 URL 回读并确认新版本"})
+            await self._io(self._update_job, job_id, {"message": "从公开 URL 回读并确认新版本"})
             observed = await self._verify_published_manifest(manifest_url, manifest)
             observed_release = dict(observed.get("release") or {})
-            self._append_log(
+            await self._io(self._append_log,
                 job_id,
                 "公开清单已确认："
                 f"{observed_release.get('version') or '?'} / {observed_release.get('buildId') or '?'}",
             )
 
             finished = _now()
-            with self._guard():
-                state = self._load_state()
-                candidate = next(
-                    (item for item in state["candidates"] if item.get("id") == plan.get("candidateId")), None,
-                )
-                if candidate:
-                    candidate.update({
-                        "status": "published", "publishedAt": finished,
-                        "publishedChannel": plan.get("channel"), "updatedAt": finished,
-                    })
-                history = {
-                    "id": str(uuid.uuid4()),
-                    "jobId": job_id,
-                    "planId": plan.get("id"),
-                    "candidateId": plan.get("candidateId"),
-                    "buildId": (plan.get("candidate") or {}).get("buildId"),
-                    "version": (plan.get("candidate") or {}).get("version"),
-                    "channel": plan.get("channel"),
-                    "qiniuBucket": bucket,
-                    "manifestKey": plan.get("manifestKey"),
-                    "manifestUrl": plan.get("manifestUrl"),
-                    "artifactCount": len(plan.get("uploadJobs") or []),
-                    # 仅这些经过本次冻结计划明确记录的不可变对象允许自动清理。
-                    # channel manifest 是可变指针，故意不进入此列表。
-                    "objectKeys": [
-                        *[str(item.get("key") or "") for item in upload_jobs if item.get("key")],
-                        str(plan.get("versionedManifestKey") or ""),
-                    ],
-                    "publishedAt": finished,
-                }
-                state["history"] = [history, *state["history"]]
-                job = next((item for item in state["jobs"] if item.get("id") == job_id), None)
-                if job:
-                    job.update({
-                        "message": (
-                            f"新版本已发布，正在清理旧版本（保留最近 {retention_count} 个）"
-                            if retention_count > 0 else "正式发布完成，channel manifest 已切换"
-                        ),
+            def record_published() -> dict[str, Any]:
+                with self._guard():
+                    state = self._load_state()
+                    candidate = next(
+                        (item for item in state["candidates"] if item.get("id") == plan.get("candidateId")), None,
+                    )
+                    if candidate:
+                        candidate.update({
+                            "status": "published", "publishedAt": finished,
+                            "publishedChannel": plan.get("channel"), "updatedAt": finished,
+                        })
+                    history = {
+                        "id": str(uuid.uuid4()),
+                        "jobId": job_id,
+                        "planId": plan.get("id"),
+                        "candidateId": plan.get("candidateId"),
+                        "buildId": (plan.get("candidate") or {}).get("buildId"),
+                        "version": (plan.get("candidate") or {}).get("version"),
+                        "channel": plan.get("channel"),
+                        "qiniuBucket": bucket,
+                        "manifestKey": plan.get("manifestKey"),
                         "manifestUrl": plan.get("manifestUrl"),
-                        "updatedAt": finished,
-                    })
-                self._save_state(state)
+                        "artifactCount": len(plan.get("uploadJobs") or []),
+                        # 仅这些经过本次冻结计划明确记录的不可变对象允许自动清理。
+                        # channel manifest 是可变指针，故意不进入此列表。
+                        "objectKeys": [
+                            *[str(item.get("key") or "") for item in upload_jobs if item.get("key")],
+                            str(plan.get("versionedManifestKey") or ""),
+                        ],
+                        "publishedAt": finished,
+                    }
+                    state["history"] = [history, *state["history"]]
+                    job = next((item for item in state["jobs"] if item.get("id") == job_id), None)
+                    if job:
+                        job.update({
+                            "message": (
+                                f"新版本已发布，正在清理旧版本（保留最近 {retention_count} 个）"
+                                if retention_count > 0 else "正式发布完成，channel manifest 已切换"
+                            ),
+                            "manifestUrl": plan.get("manifestUrl"),
+                            "updatedAt": finished,
+                        })
+                    self._save_state(state)
+                return history
+            history = await self._io(record_published)
 
             cleanup = {"removedReleases": 0, "deletedObjects": 0, "failedObjects": 0}
             if retention_count > 0:
                 step += 1
-                self._update_job(job_id, {
+                await self._io(self._update_job, job_id, {
                     "step": step,
                     "message": f"清理旧版本（保留最近 {retention_count} 个）",
                     "currentFileName": "",
@@ -1768,7 +1821,7 @@ class ReleaseCenterManager:
                     # stable manifest 已从公网回读确认，此时清理失败不能把成功发布
                     # 伪报成失败；保留旧记录，下一次发布会再次尝试。
                     cleanup = {"removedReleases": 0, "deletedObjects": 0, "failedObjects": 1}
-                    self._append_log(job_id, f"旧版本自动清理失败，已保留旧版本记录：{error}")
+                    await self._io(self._append_log, job_id, f"旧版本自动清理失败，已保留旧版本记录：{error}")
 
             cleanup_failed = int(cleanup.get("failedObjects") or 0)
             removed_releases = int(cleanup.get("removedReleases") or 0)
@@ -1785,7 +1838,7 @@ class ReleaseCenterManager:
                     f"正式发布完成；保留最近 {retention_count} 个版本，"
                     f"已清理 {removed_releases} 个旧版本 / {deleted_objects} 个对象"
                 )
-            self._update_job(job_id, {
+            await self._io(self._update_job, job_id, {
                 "status": "succeeded", "progress": 100, "step": total,
                 "message": final_message,
                 "cleanup": cleanup,
@@ -1793,25 +1846,21 @@ class ReleaseCenterManager:
                 "currentFileName": "", "currentFileBytes": 0, "currentFileSize": 0,
             })
         except asyncio.CancelledError:
-            self._update_job(job_id, {
+            await self._io(self._update_job, job_id, {
                 "status": "cancelled", "message": "发布已取消；未确认切换 channel manifest",
                 "endedAt": _now(),
             })
         except Exception as error:
-            self._append_log(job_id, f"错误：{error}")
-            self._update_job(job_id, {
+            await self._io(self._append_log, job_id, f"错误：{error}")
+            await self._io(self._update_job, job_id, {
                 "status": "failed", "message": "发布失败；channel manifest 未确认切换",
                 "error": str(error)[:4_000], "endedAt": _now(),
             })
 
     async def cancel_publish(self, job_id: str) -> dict[str, Any]:
-        with self._guard():
-            state = self._load_state()
-            job = next((item for item in state["jobs"] if item.get("id") == job_id), None)
-            if not job:
-                raise ReleaseCenterError("发布任务不存在")
-            if job.get("status") not in {"queued", "running"}:
-                return {"status": "ok", "job": job}
+        job = await self._io(self.job_status, job_id)
+        if job.get("status") not in {"queued", "running"}:
+            return {"status": "ok", "job": job}
         self._cancel_requested.add(job_id)
         process = self._processes.get(job_id)
         if process and process.returncode is None:
@@ -1819,4 +1868,4 @@ class ReleaseCenterManager:
                 process.terminate()
             except ProcessLookupError:
                 pass
-        return {"status": "cancelling", "job": self._update_job(job_id, {"message": "正在取消发布"})}
+        return {"status": "cancelling", "job": await self._io(self._update_job, job_id, {"message": "正在取消发布"})}

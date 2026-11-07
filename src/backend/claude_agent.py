@@ -76,6 +76,7 @@ class ClaudeAgentBackend(ModelBackend):
         on_permission_request: Optional[Callable[[PermissionRequest], Awaitable[bool]]] = None,
         constraints: Optional[str] = None,  # ★ Session-level constraints/rules/prompts
         sandbox_enabled: bool = True,  # ★ 沙盒开关
+        on_user_interaction=None,
     ) -> dict:
         self.clear_cancelled(session_id)
 
@@ -240,12 +241,50 @@ class ClaudeAgentBackend(ModelBackend):
                     _stderr_lines.append(line)
                     print(f"[ClaudeAgent][CLI stderr] {line}", file=sys.stderr, flush=True)
 
+            main_loop = asyncio.get_running_loop()
+            import contextvars
+            request_context = contextvars.copy_context()
+
+            async def _permission_on_main(tool_name, tool_input, context):
+                from claude_agent_sdk import PermissionResultAllow, PermissionResultDeny
+                tool_id = getattr(context, 'tool_use_id', None)
+                if not tool_id:
+                    return PermissionResultDeny(message='缺少原生 tool_use_id，未执行。')
+                if tool_name == 'AskUserQuestion':
+                    from .claude_user_interactions import claude_question_input
+                    updated = await claude_question_input(tool_input, tool_id, session_id=session_id,
+                        message_id=message_id, callback=on_user_interaction,
+                        cancelled=lambda: self.is_cancelled(session_id))
+                    if updated is None:
+                        return PermissionResultDeny(message='用户未回答或当前调用没有问答通道。请用普通文字结束本轮，等待下一轮回复。')
+                    return PermissionResultAllow(updated_input=updated)
+                granted = await _wait_for_permission(tool_id, tool_name, json.dumps(tool_input, ensure_ascii=False))
+                return PermissionResultAllow() if granted else PermissionResultDeny(message='用户拒绝了本次工具操作。')
+
+            async def _can_use_tool(tool_name, tool_input, context):
+                # SDK 在独立线程运行，所有 Session 状态和问答 futures 归属主 loop。
+                pending = request_context.copy().run(asyncio.run_coroutine_threadsafe,
+                    _permission_on_main(tool_name, tool_input, context), main_loop)
+                try:
+                    return await asyncio.wrap_future(pending)
+                except BaseException:
+                    pending.cancel()
+                    raise
+
+            async def _question_hook(_input, _tool_id, _context):
+                return {'hookSpecificOutput': {'hookEventName': 'PreToolUse', 'permissionDecision': 'ask',
+                                               'permissionDecisionReason': '通过 AWU 问答卡收集真实答案'}}
+
+            from claude_agent_sdk import HookMatcher
             options_kwargs: dict = dict(
-                allowed_tools=tools,
+                # bypassPermissions 和 allowed_tools 都可能跳过 can_use_tool；问题必须进入回调。
+                allowed_tools=[tool for tool in tools if tool != 'AskUserQuestion'
+                               and (skip_permissions or tool not in PERMISSION_SENSITIVE_TOOLS)],
                 cwd=cwd,
                 env=env_dict,
-                # ★ 始终使用 bypassPermissions，让后端自己处理权限门控
-                permission_mode="bypassPermissions",
+                permission_mode="default",
+                can_use_tool=_can_use_tool,
+                hooks={'PreToolUse': [HookMatcher(matcher='AskUserQuestion', hooks=[_question_hook])]},
                 include_partial_messages=True,
                 # ★ 加载用户级和项目级 settings（~/.claude/skills/ 和 .claude/skills/）
                 # 这是 Skills 系统生效的必要条件，默认 SDK 不加载任何 settings
@@ -298,6 +337,8 @@ class ClaudeAgentBackend(ModelBackend):
                   file=sys.stderr, flush=True)
 
             _done_emitted = False
+            from .provider_usage import ClaudeTurnUsage
+            turn_usage = ClaudeTurnUsage()
             # 无图时直接传字符串，有图时用 async generator 传 content blocks
             # SDK 对 async generator yield str 的处理与直接传 str 行为不一致
             # ★ 注入约束到 prompt 中
@@ -319,13 +360,14 @@ class ClaudeAgentBackend(ModelBackend):
 
             # 若 prompt_arg 是 async generator（有图片时），先在主循环中收集好，
             # 然后在子线程里用简单 list → async gen 的方式重新包装传给 SDK。
+            _collected_prompt: list = []
             if has_images:
-                _collected_prompt: list = []
                 async for _item in prompt_arg:  # type: ignore[union-attr]
                     _collected_prompt.append(_item)
                 _prompt_for_thread: object = _collected_prompt
             else:
-                _prompt_for_thread = prompt_arg  # str
+                # SDK 的 can_use_tool 要求 streaming input，即使纯文本也用相同协议。
+                _prompt_for_thread = [{'type': 'user', 'message': {'role': 'user', 'content': prompt_arg}}]
 
             def _sdk_thread():
                 import asyncio as _aio
@@ -437,10 +479,8 @@ class ClaudeAgentBackend(ModelBackend):
                                 start_payload["parentToolUseId"] = _parent_tool_use_id
                             emit("tool_start", tool_call=start_payload)
                             # ★ 记录待确认 tool，等 content_block_stop 时输入完整再弹权限门 / 沙盒校验
-                            _need_track = (
-                                (not skip_permissions and tool_name in PERMISSION_SENSITIVE_TOOLS)
-                                or (sandbox_enabled and tool_name in SANDBOX_TOOLS)
-                            )
+                            # 实际门控已在 SDK can_use_tool 执行前完成，流事件不可再次询问。
+                            _need_track = False
                             if _need_track and tool_id:
                                 _pending_perms[tool_id] = {
                                     "name": tool_name,
@@ -470,6 +510,9 @@ class ClaudeAgentBackend(ModelBackend):
                               file=sys.stderr, flush=True)
 
                 elif msg_type == "assistant":
+                    turn_usage.observe(getattr(message, "usage", None),
+                                       parent=getattr(message, "parent_tool_use_id", None),
+                                       model=getattr(message, "model", ""))
                     # include_partial_messages=True 时 assistant 消息是已完成块的汇总
                     # 流式增量已通过 stream_event 处理，此处只处理 thinking/tool_use
                     _parent_tool_use_id = getattr(message, "parent_tool_use_id", None)
@@ -558,15 +601,8 @@ class ClaudeAgentBackend(ModelBackend):
                         emit("resume_failed")
                     usage_dict: Optional[dict] = None
                     try:
-                        usage = getattr(message, "usage", None)
-                        if usage:
-                            in_tok = getattr(usage, "input_tokens", None)
-                            out_tok = getattr(usage, "output_tokens", None)
-                            if in_tok is not None or out_tok is not None:
-                                usage_dict = {
-                                    "inputTokens": in_tok or 0,
-                                    "outputTokens": out_tok or 0,
-                                }
+                        usage_dict = turn_usage.finish(getattr(message, "usage", None),
+                                                       getattr(message, "model_usage", None), agent_sid)
                     except Exception as ue:
                         print(f"[ClaudeAgent] usage 读取失败: {ue}",
                               file=sys.stderr, flush=True)

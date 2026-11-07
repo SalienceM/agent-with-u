@@ -26,5 +26,7 @@ deploy/docker-compose*.yml
 
 # ---- Docs / misc ----
 *.md
+!docs/session-scheduled-prompts.md
+!docs/session-scheduled-prompts-release.md
 LICENSE
 !build/deepseek-harness/bridge/THIRD_PARTY_NOTICES.md

@@ -12,9 +12,8 @@ from pathlib import Path
 from typing import Any
 
 from .kit_update_journal import HANDOFF_PHASES, JournalError, durable_json, fingerprint
+from .kit_capabilities import UPDATE_CAPABILITY, CHECK_UPDATE_CAPABILITY, LOCAL_UPDATE_CAPABILITIES
 from .update_manager import _current_release, _platform, _runtime
-
-UPDATE_CAPABILITY = "node.update_local_published"
 
 # 交接期间仅允许观察和停止；其他入口 fail closed，不能通过看似只读的 RPC 启动探测进程。
 HANDOFF_RPC = {
@@ -26,6 +25,8 @@ HANDOFF_RPC = {
     "kitUpdateReconcile", "kitDesktopReady", "kitInstallHandoffFailed",
     "loopGetState", "loopGetRecord", "loopStop", "abortMessage", "getSessionRunState",
     "terminalStop", "terminalList", "terminalRead", "languageServiceStop",
+    "harnessImageStatus", "harnessImageCapabilities",
+    "sessionScheduleList", "sessionScheduleGet", "sessionScheduleOccurrences", "sessionScheduleRequestStatus", "sessionScheduleOutput",
 }
 
 
@@ -98,21 +99,56 @@ class KitUpdateBridge:
             self._reconcile_kit_update(runtime["installRequestId"])
             return
         _client, desktop = self._kit_desktop()
-        published = self._published_for_update(run)
+        standalone = step.config.get("capability") == CHECK_UPDATE_CAPABILITY
+        if standalone and any(not desktop.get("release", {}).get(key)
+                or desktop["release"][key] != _current_release().get(key)
+                for key in ("version", "packageVersion", "buildId", "sequence")):
+            raise JournalError("桌面与 Backend 的当前版本不一致，请先核对安装状态")
+        published = {} if standalone else self._published_for_update(run)
         identity = dict(ownerId=self._session_owner_id(session.id), deviceId=desktop["deviceId"],
                         instanceId=desktop["instanceId"], sessionId=session.id, runId=run.id, stepId=step.id)
         request_id = runtime.get("installRequestId") or uuid.uuid4().hex
         self._update_manager.reserve_kit(request_id, identity)
-        runtime.update(installRequestId=request_id, identity=identity, phase="staging", publishedRelease=published)
+        runtime.update(installRequestId=request_id, identity=identity, phase="checking" if standalone else "staging")
+        if not standalone:
+            runtime["publishedRelease"] = published
         step.started_at = step.started_at or time.time()
         step.status = run.status = "running"
         try:
             self._kit_save(state)
-            staged = await self._update_manager.stage_published(published, artifact_id, request_id=request_id)
+            source = None
+            if standalone:
+                source = self._update_manager.journal.get(request_id, identity).get("updateSource")
+                if source is None:
+                    source = await self._update_manager.check_configured_for_kit(request_id)
+                    self._update_manager.journal.update(request_id, identity, {"updateSource": source})
+                if source["phase"] == "current":
+                    _client, current = self._kit_desktop()
+                    if current != desktop or any(not source["release"].get(key)
+                            or source["release"][key] != current.get("release", {}).get(key)
+                            or source["release"][key] != _current_release().get(key)
+                            for key in ("version", "packageVersion", "buildId", "sequence")):
+                        raise JournalError("桌面与 Backend 的当前版本不一致，不能判定无需更新")
+                    # 检查成功不伪造安装/重启回执；释放未使用的安装预留。
+                    self._update_manager.release_kit(request_id, identity)
+                    runtime.update(phase="current", message="已核对更新源，当前桌面与 Backend 已是该版本；未执行安装或重启",
+                        plan={"desktop": desktop, "current": source["release"], "release": source["release"],
+                              "channel": source["channel"], "manifestUrl": source["manifestUrl"]})
+                    step.status, step.exit_code, step.ended_at = "succeeded", 0, time.time()
+                    step.stdout = runtime["message"]
+                    self._kit_save(state)
+                    return
+                runtime["phase"] = "staging"
+                self._kit_save(state)
+                staged = await self._update_manager.stage_configured_snapshot(source, artifact_id, request_id=request_id)
+                published = source
+            else:
+                staged = await self._update_manager.stage_published(published, artifact_id, request_id=request_id)
             if staged["phase"] == "needs_selection":
                 plan = {"device": desktop["deviceId"], "instanceId": desktop["instanceId"],
                         "release": published["release"], "artifacts": staged["artifacts"],
-                        "channel": published["channel"], "blockers": ["请选择本次发布的安装器"], "warnings": []}
+                        "channel": published["channel"], "manifestUrl": published["manifestUrl"],
+                        "blockers": ["请选择已核对版本的安装器"], "warnings": []}
                 runtime.update(phase="needs_selection", planId=request_id, plan=plan, planFingerprint=fingerprint(plan))
             else:
                 # 下载期间桌面/权限可变化，再核对；最终确认仍会再次检查。
@@ -126,20 +162,24 @@ class KitUpdateBridge:
                 frozen = self._update_manager.journal.freeze(request_id, identity, {
                     "desktop": desktop, "backendPid": os.getpid(), "current": _current_release(),
                     "release": published["release"], "artifact": artifact, "channel": published["channel"],
-                    "publishedRelease": published, "installPlan": install_plan,
+                    **({"updateSource": source} if standalone else {"publishedRelease": published}),
+                    "manifestUrl": published["manifestUrl"], "installPlan": install_plan,
                     "warnings": ["安装将退出目标节点的桌面与 Backend，控制窗口不会被更新", "交接后无法保证撤回；不会自动重装或回滚"],
                     "preflight": reasons,
                 })
                 install_plan["kitUpdate"] = {"protocol": 1, "requestId": request_id, "identity": identity,
                                              "planFingerprint": frozen["planFingerprint"]}
                 durable_json(plan_path, install_plan)
-                public_plan = {key: value for key, value in frozen["plan"].items() if key != "installPlan"}
+                public_plan = {key: value for key, value in frozen["plan"].items()
+                               if key not in {"installPlan", "updateSource"}}
                 public_plan.update(blockers=[], preflight=reasons)
                 runtime.update(phase="waiting_approval", planId=request_id, planPath=str(plan_path),
                                planFingerprint=frozen["planFingerprint"], plan=public_plan)
             step.status = run.status = "waiting_approval"
             self._kit_save(state)
         except BaseException as error:
+            runtime.update(phase="cancelled" if isinstance(error, asyncio.CancelledError) else "failed",
+                           message=str(error))
             self._update_manager.release_kit(request_id, identity,
                 "cancelled" if isinstance(error, asyncio.CancelledError) else "failed")
             raise
@@ -153,7 +193,7 @@ class KitUpdateBridge:
         step = run.steps[-1]
         runtime = step.config.get("capabilityRuntime") or {}
         selection = {"requestId": request_id, "artifactId": artifact_id, "planFingerprint": plan_fingerprint}
-        if not request_id or len(request_id) > 128 or step.config.get("capability") != UPDATE_CAPABILITY:
+        if not request_id or len(request_id) > 128 or step.config.get("capability") not in LOCAL_UPDATE_CAPABILITIES:
             raise JournalError("无效制品选择请求")
         if runtime.get("selection"):
             if runtime["selection"] != selection:
@@ -209,7 +249,12 @@ class KitUpdateBridge:
         client, desktop = self._kit_desktop()
         if desktop != record["plan"]["desktop"]:
             raise JournalError("桌面实例已变化；旧安装确认失效")
-        if self._published_for_update(run) != record["plan"]["publishedRelease"]:
+        if step.config.get("capability") == CHECK_UPDATE_CAPABILITY:
+            source = record["plan"].get("updateSource") or {}
+            if source != record.get("updateSource"):
+                raise JournalError("已检查的更新快照已变化")
+            self._update_manager.inspect_configured_snapshot(source)
+        elif self._published_for_update(run) != record["plan"]["publishedRelease"]:
             raise JournalError("发布凭据已变化")
         self._begin_update_handoff(install_id, run.id)
         try:
@@ -258,6 +303,8 @@ class KitUpdateBridge:
         if not step or (step.config.get("capabilityRuntime") or {}).get("installRequestId") != request_id:
             return record  # 不能创建替代运行或借用历史步骤。
         runtime = step.config["capabilityRuntime"]
+        if runtime.get("phase") == "current" and run.status == "succeeded":
+            return record  # 检查无需更新不是安装取消；只读核对不得覆盖原检查结果。
         runtime.update(phase=record["phase"], receipt=record.get("receipt"), verification=record.get("verification"),
                        message=record.get("message", ""))
         step.status = run.status = record["phase"]

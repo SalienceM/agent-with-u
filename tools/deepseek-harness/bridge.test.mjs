@@ -21,7 +21,10 @@ test('能力握手与根身份检查，不启动另一协议读取者', async ()
   const bridge = setup()
   await assert.rejects(bridge.request('session/prompt', { sessionId: 'root' }), /handshake/)
   await bridge.request('initialize')
-  assert.equal((await bridge.request('awu/capabilities')).protocolVersion, 1)
+  const capabilities = await bridge.request('awu/capabilities')
+  assert.equal(capabilities.protocolVersion, 1)
+  assert.equal(capabilities.questions, false)
+  assert.equal(capabilities.questionProtocol, 'none')
   await assert.rejects(bridge.request('awu/configure', { ...bridge.config, generation: 'old', constraints: '' }), /configuration/)
   await bridge.request('awu/configure', { ...bridge.config, constraints: '{{literal}} !!js data only' })
   await assert.rejects(bridge.request('awu/configure', { ...bridge.config, constraints: '' }), /configuration/)
@@ -88,8 +91,8 @@ test('所有通知共用帧/背压上限；溢出关闭 pending 授权而非静�
     bridge.listeners.get('session/event')(bridge.session,
       { type: 'tool/call', data: { callId: 'call', name: 'write', arguments: '{}' } })
     const pending = bridge.listeners.get('approval/request')({ agent: { session: bridge.session }, toolName: 'write', callId: 'call' })
-    if (backpressure) bridge.io.stdout.writableLength = 1024 * 1024 + 1
-    assert.throws(() => bridge.transport.notify('session.event', { data: backpressure ? '' : 'x'.repeat(1024 * 1024) }), /limit exceeded/)
+    if (backpressure) bridge.io.stdout.writableLength = 32 * 1024 * 1024 + 1
+    assert.throws(() => bridge.transport.notify('session.event', { data: backpressure ? '' : 'x'.repeat(16 * 1024 * 1024) }), /limit exceeded/)
     assert.equal(await pending, 'cancelled')
     assert.equal(destroyed, true)
     await assert.rejects(bridge.request('session/prompt', { sessionId: 'root' }), /closed/)

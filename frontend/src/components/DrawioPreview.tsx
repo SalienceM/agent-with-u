@@ -274,9 +274,9 @@ export const DrawioPreview: React.FC<Props> = ({ xml, fallback, onReveal }) => {
   );
 };
 
-const rootStyle: React.CSSProperties = { height: '100%', minHeight: 0, display: 'flex', flexDirection: 'column' };
+const rootStyle: React.CSSProperties = { height: '100%', minWidth: 0, minHeight: 0, display: 'flex', flexDirection: 'column', overflow: 'hidden' };
 const toolbarStyle: React.CSSProperties = { flexShrink: 0, display: 'flex', alignItems: 'center', gap: 5, padding: '7px 10px', borderBottom: '1px solid var(--theme-border)', background: 'var(--theme-bg-tertiary)', overflowX: 'auto' };
-const buttonStyle: React.CSSProperties = { border: '1px solid var(--theme-border)', borderRadius: 6, padding: '5px 9px', background: 'transparent', color: 'var(--theme-text-muted)', cursor: 'pointer', fontSize: 11, whiteSpace: 'nowrap' };
+const buttonStyle: React.CSSProperties = { minHeight: 36, flexShrink: 0, border: '1px solid var(--theme-border)', borderRadius: 6, padding: '5px 9px', background: 'transparent', color: 'var(--theme-text-muted)', cursor: 'pointer', fontSize: 11, whiteSpace: 'nowrap' };
 const activeButtonStyle: React.CSSProperties = { borderColor: 'var(--theme-accent)', background: 'var(--theme-accent-bg)', color: 'var(--theme-accent)' };
 const dividerStyle: React.CSSProperties = { width: 1, alignSelf: 'stretch', background: 'var(--theme-border)', margin: '0 3px' };
 const labelStyle: React.CSSProperties = { color: 'var(--theme-text-muted)', fontSize: 11, whiteSpace: 'nowrap' };

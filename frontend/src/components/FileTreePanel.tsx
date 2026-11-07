@@ -17,7 +17,7 @@
 import React, { useCallback, useEffect, useMemo, useState, useRef, lazy, Suspense } from 'react';
 import { createPortal } from 'react-dom';
 import hljs from 'highlight.js';
-import { api, isTauri, getCurrentUserProfile, getSessionExecKey, onCurrentUserChanged } from '../api';
+import { api, isTauri, getCurrentUserProfile, getSessionExecKey, onCurrentUserChanged, getPreviewIdentity, getExecTarget, previewExecutorRealm } from '../api';
 import { markdownToHtml } from '../utils/markdown';
 import { buildStandaloneMarkdownHtml, markdownHtmlFilename } from '../utils/markdownExport';
 import { GitPanel } from './GitPanel';
@@ -46,9 +46,11 @@ import {
   type FileFocusRequest,
 } from '../utils/fileFocus';
 import { rankFileSearchPaths } from '../utils/fileSearch';
+import { hasScanRules, loadScanRules, parseScanRules, saveScanRules, scanAllows, type SyncScanRules } from '../utils/syncScanRules';
+import { byteHash } from '../utils/documentCodec';
 import { buildFileAttentionContext, type AttentionContext } from '../utils/attentionContext';
 import { fileTransfers, type TransferProgress } from '../utils/fileTransfers';
-import { compareSnapshot, createReviewQueue, loadReviewBaseline, reviewScopeKey, ReviewGeneration, type CompareSnapshot } from '../utils/directorySyncReview';
+import { compareSnapshot, createReviewQueue, fileDifferencePaths, loadReviewBaseline, reviewScopeKey, ReviewGeneration, type CompareSnapshot } from '../utils/directorySyncReview';
 import type { RemoteSyncReview, ReviewAdapter } from '../utils/syncReviewProtocol';
 import { DirectorySyncReviewPanel, type ReviewViewPreferences } from './DirectorySyncReviewPanel';
 import { FilePanelViewCache, filePanelViewKey, loadFileTreeExpansion, saveFileTreeExpansion } from '../utils/filePanelViewState';
@@ -66,9 +68,12 @@ import type { EditorDocumentState } from '../utils/editorDocumentState';
 import { handoffParticipants, handoffScope } from '../utils/workbenchHandoffState';
 import type { RecoverableDraft } from '../utils/documentStore';
 import { useLanguageEditor } from '../hooks/useLanguageEditor';
-import { openPreviewWindow } from '../utils/previewWindow';
+import { openIndependentPreview } from '../utils/previewWindow';
+import { capturePreviewBinding } from '../utils/previewLocalBinding';
+import { samePreviewIdentity, validatePreviewSource } from '../utils/previewLifecycle';
 import { FilePreviewToolbar, previewToolbarButtonStyle as hdrBtnStyle,
   previewSegmentStyle as segBtnStyle, previewSegmentActiveStyle as segActiveStyle } from './FilePreviewToolbar';
+import { usePreviewViewport } from '../hooks/usePreviewLayout';
 
 const CodeEditor = lazy(() => import('./CodeEditor'));
 const PdfPreview = lazy(() => import('./PdfPreview'));
@@ -377,6 +382,7 @@ interface FileTreeViewState {
   processedFocusRequestId: number;
   localFs: LocalFs | null; localManifest: Manifest | null; remoteManifest: Manifest | null; localTree: Record<string, TNode[]>;
   onlyDifferent: boolean; syncReview: SyncReviewState | null;
+  scanRulesKey?: string;
 }
 const fileTreeViews = new FilePanelViewCache<FileTreeViewState>();
 // 更换账户立即丢弃整个窗口的旧账户缓存，不仅依赖缓存键来隐藏。
@@ -391,7 +397,19 @@ export const FileTreePanel: React.FC<Props> = React.memo(props => {
 });
 
 const FileTreePanelContent: React.FC<Props & { viewKey: string }> = ({ sessionId, workingDir, execKey, execLabel, execMode, backendId, focusRequest: externalFocusRequest, onAttentionChange, documentHost, isVisible = true, onDocumentOpen, onBrowseFiles, filesVisible = true, onSearchExit, viewKey }) => {
-  const [restored] = useState(() => fileTreeViews.get(viewKey));
+  const [scanRules, setScanRules] = useState<SyncScanRules>(() => loadScanRules(viewKey));
+  const scanRulesKey = useMemo(() => hasScanRules(scanRules)
+    ? byteHash(new TextEncoder().encode(JSON.stringify(scanRules))) : '', [scanRules]);
+  const scanRulesRef = useRef(scanRules); scanRulesRef.current = scanRules;
+  const [prefixDraft, setPrefixDraft] = useState(() => scanRules.prefixes.join('\n'));
+  const [excludeDraft, setExcludeDraft] = useState(() => scanRules.excludes.join('\n'));
+  const [rulesError, setRulesError] = useState('');
+  const rulesDirty = prefixDraft !== scanRules.prefixes.join('\n') || excludeDraft !== scanRules.excludes.join('\n');
+  const [restored] = useState(() => {
+    const saved = fileTreeViews.get(viewKey);
+    return saved && (saved.scanRulesKey || '') !== scanRulesKey
+      ? { ...saved, localManifest: null, remoteManifest: null, localTree: {}, syncReview: null, onlyDifferent: false, searchReady: false } : saved;
+  });
   const treeScrollRef = useRef<HTMLDivElement>(null);
   const savedScrollTop = useRef(restored?.scrollTop || 0);
   const cacheOwner = useRef(getCurrentUserProfile().userId);
@@ -516,7 +534,7 @@ const FileTreePanelContent: React.FC<Props & { viewKey: string }> = ({ sessionId
   const [previewWindowError, setPreviewWindowError] = useState('');
   useEffect(() => {
     const dispose = () => { previewWindows.current.forEach(close => close()); previewWindows.current.clear(); };
-    const unsubscribe = onCurrentUserChanged(dispose);
+    const unsubscribe = onCurrentUserChanged((_profile, changed) => { if (changed) dispose(); });
     return () => { unsubscribe(); dispose(); };
   }, [sessionId, workingDir, execKey]);
   const [documentOwner, setDocumentOwner] = useState(() => getCurrentUserProfile().userId);
@@ -530,7 +548,7 @@ const FileTreePanelContent: React.FC<Props & { viewKey: string }> = ({ sessionId
   const previewScopeRef = useRef(previewScope);
   previewScopeRef.current = previewScope;
   const compareGeneration = useRef(new ReviewGeneration());
-  const compareIdentity = JSON.stringify([previewScope, includeGitMetadata, localFs?.id()]);
+  const compareIdentity = JSON.stringify([previewScope, includeGitMetadata, localFs?.id(), scanRulesKey]);
   const compareIdentityRef = useRef(compareIdentity);
   compareIdentityRef.current = compareIdentity;
   const [syncReview, setSyncReview] = useState<SyncReviewState | null>(restored?.syncReview || null);
@@ -568,7 +586,7 @@ const FileTreePanelContent: React.FC<Props & { viewKey: string }> = ({ sessionId
     searchQuery, searchResults, searchError, searchMatched, searchTruncated, searchSelectedIndex, searchReady: !!completedSearch.current && !searchLoading,
     processedFocusRequestId: processedFocusRequestRef.current,
     localFs, localTree: includeGitMetadata ? {} : localTree, localManifest: includeGitMetadata ? null : localManifest, remoteManifest: includeGitMetadata ? null : remoteManifest,
-    onlyDifferent: !includeGitMetadata && onlyDifferent, syncReview: includeGitMetadata ? null : syncReview };
+    onlyDifferent: !includeGitMetadata && onlyDifferent, syncReview: includeGitMetadata ? null : syncReview, scanRulesKey };
   const includeGitRef = useRef(includeGitMetadata); includeGitRef.current = includeGitMetadata;
   useEffect(() => () => {
     const state = retainedView.current;
@@ -621,6 +639,7 @@ const FileTreePanelContent: React.FC<Props & { viewKey: string }> = ({ sessionId
   };
   useEffect(() => { previewRequestRef.current++; setPreview(null); }, [previewScope]);
   const [previewMaximized, setPreviewMaximized] = useState(false);
+  const previewViewport = usePreviewViewport(!!preview && !documentHost);
   const [mdRaw, setMdRaw] = useState(false);
   const [editing, setEditing] = useState(false);
   const [editingDocument, setEditingDocument] = useState<DocumentSelection | null>(null);
@@ -1292,7 +1311,7 @@ const FileTreePanelContent: React.FC<Props & { viewKey: string }> = ({ sessionId
     compareGeneration.current.invalidate(); setSyncReview(null); setReviewView(null);
     setRemoteManifest(null);
     try {
-      const manifest = await fs.scan([], includeGitMetadata, { hash: false, signal: controller.signal });
+      const manifest = await fs.scan([], includeGitMetadata, { hash: false, signal: controller.signal, rules: scanRulesRef.current });
       if (!controller.signal.aborted) setLocalManifest(manifest);
     } catch {
       if (!controller.signal.aborted) setMsg({ kind: 'err', text: '本地目录读取失败，保留上次文件列表，请刷新重试' });
@@ -1534,16 +1553,9 @@ const FileTreePanelContent: React.FC<Props & { viewKey: string }> = ({ sessionId
     if (focusFlashTimerRef.current) clearTimeout(focusFlashTimerRef.current);
   }, []);
 
-  /** 两端都存在、但内容哈希不同的文件；冲突也是内容不同的一种。 */
-  const differentPaths = useMemo(() => {
-    const paths = new Set<string>();
-    if (!localManifest || !remoteManifest) return paths;
-    for (const [rel, local] of Object.entries(localManifest)) {
-      const remote = remoteManifest[rel];
-      if (remote && local.hash !== remote.hash) paths.add(rel);
-    }
-    return paths;
-  }, [localManifest, remoteManifest]);
+  /** 包含仅本机、仅执行端及两端内容不同的文件，与差异审阅共享口径。 */
+  const differentPaths = useMemo(() => new Set([...fileDifferencePaths(localManifest, remoteManifest)]
+    .filter(path => scanAllows(scanRules, path))), [localManifest, remoteManifest, scanRules]);
 
   const toggleOnlyDifferent = useCallback(() => {
     setOnlyDifferent((current) => {
@@ -1638,6 +1650,7 @@ const FileTreePanelContent: React.FC<Props & { viewKey: string }> = ({ sessionId
   // ── 文件状态(仅远端会话)──
   const statusOf = useCallback((node: TNode): FStatus | null => {
     if (!isRemote) return null;
+    if (!scanAllows(scanRules, node.rel, node.isDir)) return null;
     if (node.typeConflict) return 'conflict';
     if (node.local && !node.remote) return 'localOnly';
     if (node.remote && !node.local) return 'cloud';
@@ -1647,15 +1660,16 @@ const FileTreePanelContent: React.FC<Props & { viewKey: string }> = ({ sessionId
     const R = remoteManifest?.[node.rel];
     if (R) {
       if (!L.hash || !R.hash) return 'local';
-      if (L.hash === R.hash) return 'synced';
+      if (L.hash === R.hash && L.size === R.size) return 'synced';
       const B = baseline[node.rel]?.hash;
       return (B && L.hash !== B && R.hash !== B) ? 'conflict' : 'differs';
     }
     return 'local';
-  }, [isRemote, localManifest, remoteManifest, baseline]);
+  }, [isRemote, localManifest, remoteManifest, baseline, scanRules]);
 
   const freshnessOf = useCallback((node: TNode): SyncFreshness | null => {
     if (!isRemote || node.isDir || node.typeConflict) return null;
+    if (!scanAllows(scanRules, node.rel)) return null;
     const local: FileMeta | undefined = localManifest?.[node.rel];
     const remote: FileMeta | undefined = remoteManifest?.[node.rel];
     // 尚未完整比对时，目录列表仍足以确认当前层的远端独有文件，并可直接展示
@@ -1667,24 +1681,25 @@ const FileTreePanelContent: React.FC<Props & { viewKey: string }> = ({ sessionId
       return null;
     }
     return describeSyncFreshness(local, remote, baseline[node.rel]);
-  }, [isRemote, localManifest, remoteManifest, baseline]);
+  }, [isRemote, localManifest, remoteManifest, baseline, scanRules]);
 
   const summary = useMemo(() => {
     if (!isRemote || !localManifest || !remoteManifest) return null;
     let cloud = 0, local = 0, localOnly = 0, differs = 0, conflict = 0;
     const paths = new Set([...Object.keys(localManifest), ...Object.keys(remoteManifest)]);
     for (const rel of paths) {
+      if (!scanAllows(scanRules, rel)) continue;
       const L = localManifest[rel];
       const R = remoteManifest[rel];
       if (!L) { cloud++; continue; }
       if (!R) { localOnly++; continue; }
-      if (L.hash === R.hash) { local++; continue; }
+      if (L.hash === R.hash && L.size === R.size) { local++; continue; }
       const B = baseline[rel]?.hash;
       if (B && L.hash !== B && R.hash !== B) conflict++;
       else differs++;
     }
     return { cloud, local, localOnly, differs, conflict };
-  }, [isRemote, localManifest, remoteManifest, baseline]);
+  }, [isRemote, localManifest, remoteManifest, baseline, scanRules]);
 
   // ── 本地副本操作(远端会话)──
   const chooseLocal = useCallback(async () => {
@@ -1752,10 +1767,12 @@ const FileTreePanelContent: React.FC<Props & { viewKey: string }> = ({ sessionId
       && compareGeneration.current.accepts(ticket, compareIdentityRef.current)
       && getCurrentUserProfile().userId === documentOwner;
     setComparing(true); setMsg(null);
+    const controller = new AbortController();
+    localScanRef.current = controller;
     try {
       const [lm, rm, connection] = await Promise.all([
-        localFs.scan([], includeGitMetadata),
-        api.syncManifest(workingDir, execKey, includeGitMetadata).then((r) => {
+        localFs.scan([], includeGitMetadata, { rules: scanRules, signal: controller.signal }),
+        api.syncManifest(workingDir, execKey, includeGitMetadata, scanRules).then((r) => {
           if (r.status !== 'ok' || !r.files) throw new Error(r.message || '无法读取执行端文件清单');
           return r.files;
         }),
@@ -1767,7 +1784,7 @@ const FileTreePanelContent: React.FC<Props & { viewKey: string }> = ({ sessionId
               api.syncReview(sessionId, executor, workingDir, () => getCurrentUserProfile().userId === documentOwner),
               localFs.documentAdapter(),
             ]);
-            const scope = { workspace: remote.capability.workspace, execKey: executor, bindingId: bound.bindingId, includeGitMetadata };
+            const scope = { workspace: remote.capability.workspace, execKey: executor, bindingId: bound.bindingId, includeGitMetadata, scanRulesKey };
             const local = await localFs.reviewAdapter(reviewScopeKey(scope));
             if (local.bindingId !== scope.bindingId) throw new Error('副本身份已变化，请重新比对');
             return { remote, local, scope };
@@ -1786,7 +1803,19 @@ const FileTreePanelContent: React.FC<Props & { viewKey: string }> = ({ sessionId
       }
     } catch (e: any) { if (current()) setMsg({ kind: 'err', text: `比对失败：${e?.message ?? e}` }); }
     finally { if (current()) setComparing(false); }
-  }, [workingDir, execKey, localFs, sessionOnline, includeGitMetadata, baselineLocalId, sessionId, documentOwner, compareIdentity]);
+  }, [workingDir, execKey, localFs, sessionOnline, includeGitMetadata, baselineLocalId, sessionId, documentOwner, compareIdentity, scanRules, scanRulesKey]);
+
+  const applyScanRules = () => {
+    try {
+      const next = parseScanRules(prefixDraft, excludeDraft);
+      saveScanRules(viewKey, next);
+      localScanRef.current?.abort(); compareGeneration.current.invalidate();
+      setScanRules(next); setPrefixDraft(next.prefixes.join('\n')); setExcludeDraft(next.excludes.join('\n')); setRulesError('');
+      setLocalManifest(null); setRemoteManifest(null); setLocalTree({}); setSyncReview(null); setReviewView(null);
+      setOnlyDifferent(false); setComparing(false);
+      setMsg({ kind: 'ok', text: '扫描范围已保存；点击“比对”按新范围扫描两端。范围外文件不判断缺失。' });
+    } catch (error) { setRulesError(error instanceof Error ? error.message : '规则保存失败'); }
+  };
 
   const bumpBaseline = useCallback((rels: string[], src: Manifest | null) => {
     if (!localFs || !workingDir || !src || !baselineLocalId) return;
@@ -2276,51 +2305,36 @@ const FileTreePanelContent: React.FC<Props & { viewKey: string }> = ({ sessionId
     }
     const detachedSource = preview.source;
     const detachedScope = previewScopeRef.current;
-    const detachedUser = getCurrentUserProfile().userId;
+    const detachedIdentity = getPreviewIdentity();
+    const detachedUser = detachedIdentity.owner;
     const selectedFs = localFs;
     const current = () => mountedRef.current && previewScopeRef.current === detachedScope
       && getCurrentUserProfile().userId === detachedUser && (detachedSource !== 'local' || selectedFs === localFsRef.current);
     const assertCurrent = () => { if (!current()) throw new Error('原文件窗口的工作区或身份已变化'); };
     const nodeFor = (rel: string): TNode => ({ rel, name: rel.split('/').pop()!, isDir: false, size: 0 });
-    let detachedClient: Promise<DocumentClient> | undefined;
-    const getClient = () => {
-      assertCurrent();
-      return detachedClient ||= (async () => {
-        const target = execKey || getSessionExecKey(sessionId);
-        if (!sessionId || !target) throw new DocumentProtocolError('workspace_identity_required');
-        if (detachedSource === 'local') {
-          if (!selectedFs?.documentAdapter) throw new DocumentProtocolError('safe_local_documents_unsupported');
-          return new LocalDocuments(detachedUser, sessionId, target, await selectedFs.documentAdapter(), new IndexedLocalJournal(), current);
-        }
-        const client = await api.workspaceDocuments(sessionId, target, workingDir, current);
-        return isRemote ? readonlyDocumentClient(client) : client;
-      })();
-    };
-    const result = openPreviewWindow({ preview, theme, dark: isDarkTheme(), initialView: editing ? 'source' : 'preview',
+    const target = execKey || getSessionExecKey(sessionId);
+    const result = openIndependentPreview({ preview, theme, dark: isDarkTheme(), initialView: editing ? 'source' : 'preview',
       root: preview.source === 'local' ? localFs?.label() || '本机副本' : workingDir,
       nodeLabel: preview.source === 'local' ? '本机副本' : execLabel || '会话执行节点',
-    }, rel => { assertCurrent(); return readPreviewBytes(nodeFor(rel), detachedSource, 8 * 1024 * 1024); }, {
-      documentClient: getClient,
-      load: async rel => {
-        assertCurrent();
-        const node = nodeFor(rel);
-        const loaded = await loadDocumentPreview<StructuredPreviewPayload>({ rel, name: node.name, source: detachedSource, loading: true }, {
-          bytes: max => readPreviewBytes(node, detachedSource, max),
-          structured: bytes => structuredPreviewFor(node, detachedSource, bytes),
-          base64: async () => {
-            if (detachedSource === 'local') return selectedFs!.readFile(rel);
-            const result = await api.syncReadFile(workingDir, rel, execKey);
-            if (result.status !== 'ok' || result.tooLarge) throw new Error(result.message || '文件无法完整预览');
-            return result.data || '';
-          },
-        });
-        assertCurrent(); return loaded;
-      },
+    }, async id => {
+      if (!sessionId || !target) throw new DocumentProtocolError('workspace_identity_required');
+      const valid = () => samePreviewIdentity(detachedIdentity, getPreviewIdentity());
+      const executor = getExecTarget(target) || (target === 'local' ? { mode: 'local' as const } : null);
+      if (!valid() || !executor) throw new DocumentProtocolError('workspace_identity_required');
+      const local = detachedSource === 'local' && selectedFs ? await capturePreviewBinding(selectedFs) : undefined;
+      const client = detachedSource === 'local' && selectedFs?.documentAdapter
+        ? new LocalDocuments(detachedUser, sessionId, target, await selectedFs.documentAdapter(), new IndexedLocalJournal(), valid)
+        : await api.workspaceDocuments(sessionId, target, workingDir, valid);
+      if (!valid() || detachedSource === 'local' && !local) throw new DocumentProtocolError('stale_workspace');
+      return validatePreviewSource({ version: 2, id, identity: detachedIdentity, executor: target, executorRealm: previewExecutorRealm(executor),
+        session: sessionId, workingDir, workspace: client.identity, relative: preview.rel, source: detachedSource,
+        readonly: detachedSource === 'remote' && isRemote, ...(local ? { local } : {}) });
+    }, {
       reveal: async rel => { assertCurrent(); await revealNode(nodeFor(rel), detachedSource, true); },
       review: async rel => { assertCurrent(); await openReview(rel, detachedSource, true); },
-      structured: async rel => { assertCurrent(); return structuredPreviewFor(nodeFor(rel), detachedSource); },
     });
     previewWindows.current.add(result.dispose);
+    void result.disposed.then(() => previewWindows.current.delete(result.dispose));
     void result.opened.catch(error => {
       previewWindows.current.delete(result.dispose);
       setPreviewWindowError(`独立窗口打开失败：${String(error)}`);
@@ -2650,6 +2664,7 @@ const FileTreePanelContent: React.FC<Props & { viewKey: string }> = ({ sessionId
     const nodes = mergedChildren(rel).filter((node) => {
       if (!onlyDifferent) return true;
       if (!node.isDir) return differentPaths.has(node.rel);
+      if (differentPaths.has(node.rel)) return true; // 文件/目录冲突本身也必须可见。
       const prefix = node.rel ? `${node.rel}/` : '';
       for (const path of differentPaths) {
         if (!node.rel || path.startsWith(prefix)) return true;
@@ -2667,7 +2682,7 @@ const FileTreePanelContent: React.FC<Props & { viewKey: string }> = ({ sessionId
       </div>;
     }
     if (nodes.length === 0 && depth === 0) {
-      return <Empty text={onlyDifferent ? '没有内容不同的文件' : '（空目录）'} />;
+      return <Empty text={onlyDifferent ? '没有差异文件' : '（空目录）'} />;
     }
     const limit = directoryLimits[rel] || 200;
     const visibleNodes = nodes.slice(0, limit);
@@ -2971,6 +2986,27 @@ const FileTreePanelContent: React.FC<Props & { viewKey: string }> = ({ sessionId
           <div style={toolIdentityStyle}><strong>{localFs?.kind === 'managed' ? '平板离线空间' : '本机副本'}</strong>
             <code style={toolCodeStyle}>{localRestoring ? '恢复中…' : localFs?.label() || '未指定'}</code></div>
           <span>{filePanelComparison(!!remoteManifest, summary)}</span>
+          <details>
+            <summary style={{ cursor: 'pointer' }}>扫描范围 · {hasScanRules(scanRules) ? `${scanRules.prefixes.length} 个前缀 / ${scanRules.excludes.length} 条排除` : '全部文件'}{rulesDirty ? '（未保存）' : ''}</summary>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 6, paddingTop: 8 }}>
+              <label>只扫描这些前缀
+                <textarea aria-label="只扫描这些前缀" rows={3} value={prefixDraft} onChange={e => setPrefixDraft(e.target.value)}
+                  placeholder={'src/\nfrontend/src/\nconfig'} style={scanRuleEditorStyle} />
+              </label>
+              <small>每行一个根目录相对前缀；src/ 只含该目录，config 匹配 config 开头的路径。留空表示全部。</small>
+              <label>排除规则
+                <textarea aria-label="排除规则" rows={3} value={excludeDraft} onChange={e => setExcludeDraft(e.target.value)}
+                  placeholder={'# 不扫描这些文件\n*.log\n**/cache/'} style={scanRuleEditorStyle} />
+              </label>
+              <small>支持 # 注释、*、?、**、目录/、/根路径、!重新纳入；排除父目录后需先重新纳入父目录。区分大小写，不支持 []、花括号或转义语法。不修改 .gitignore，.git 仍受独立开关保护。</small>
+              <small>规则用于副本扫描、两端比对及其审阅/目录推拉清单。范围外不判断差异；普通执行端浏览不受限。</small>
+              <div style={toolActionRowStyle}>
+                <button style={localDirButtonStyle} disabled={!!transfer || !rulesDirty} onClick={applyScanRules}>保存扫描规则</button>
+                <button style={localDirButtonStyle} onClick={() => { setPrefixDraft(''); setExcludeDraft(''); setRulesError(''); }}>清空规则草稿</button>
+              </div>
+              {rulesError && <span role="alert">{rulesError}</span>}
+            </div>
+          </details>
           {syncReview && <small>上次比对：{new Date(syncReview.snapshot.comparedAt).toLocaleString()} · 非实时结果，推拉前重新核验版本</small>}
           <div className="ftp-action-row" style={toolActionRowStyle}>
             <button
@@ -2984,12 +3020,12 @@ const FileTreePanelContent: React.FC<Props & { viewKey: string }> = ({ sessionId
                 } : {}),
               }}
               onClick={toggleOnlyDifferent}
-              title="只显示两端都存在但内容不同的文件（包含冲突），不包含仅本机或仅远端"
+              title="显示仅本机、仅执行端及两端内容不同的文件（包含冲突）"
               aria-pressed={onlyDifferent}
             >
               {onlyDifferent ? '✓ ' : ''}仅不同 {differentPaths.size}
             </button>
-            <button style={localDirButtonStyle} disabled={!localFs || localRestoring || !sessionOnline || comparing || !!transfer} onClick={runCompare} title={sessionOnline ? '扫描两端并比较文件状态' : '恢复连接后可比对'}>
+            <button style={localDirButtonStyle} disabled={!localFs || localRestoring || !sessionOnline || comparing || !!transfer || rulesDirty} onClick={runCompare} title={rulesDirty ? '先保存扫描规则' : sessionOnline ? '按已保存规则扫描两端并比较文件状态' : '恢复连接后可比对'}>
               {comparing ? '比对中…' : '↔ 比对'}
             </button>
           <button style={localDirButtonStyle} disabled={!syncReview || comparing} title={reviewUnavailable || '先显式比对，再逐个审阅差异'}
@@ -3536,9 +3572,11 @@ const FileTreePanelContent: React.FC<Props & { viewKey: string }> = ({ sessionId
       </div>, documentHost)}
       {preview && (
         <DocumentSurface host={documentHost}>
-          <div style={documentHost ? { display: 'flex', flex: 1, minWidth: 0, minHeight: 0, overflow: 'hidden' } : pvOverlay}>
+          <div data-preview-surface style={documentHost ? { display: 'flex', flex: 1, minWidth: 0, minHeight: 0, overflow: 'hidden' }
+            : { ...pvOverlay, ...(previewViewport.narrow ? { inset: 'auto', left: previewViewport.left, top: previewViewport.top, width: previewViewport.width, height: previewViewport.height } : {}) }}>
             <div style={documentHost ? { display: 'flex', flexDirection: 'column', flex: 1, minWidth: 0, minHeight: 0, overflow: 'hidden', background: 'var(--theme-panel-solid, var(--theme-bg))' }
-              : { ...pvBox, ...(previewMaximized ? pvBoxMaximized : {}) }} onClick={(e) => e.stopPropagation()}>
+              : { ...pvBox, ...(previewMaximized ? pvBoxMaximized : {}), ...(previewViewport.narrow ? { width: '100%', height: '100%', maxWidth: 'none', border: 0, borderRadius: 0,
+                padding: 'env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left)', boxSizing: 'border-box' } : {}) }} onClick={(e) => e.stopPropagation()}>
             {documentHost && <div role="tablist" aria-label="打开的文件" style={{ display: 'flex', overflowX: 'auto', flexShrink: 0, borderBottom: '1px solid var(--theme-border)', background: 'var(--theme-sidebar-solid)' }}>
               {fileTabs.map((tab, index) => <div key={tab.id} style={{ display: 'flex', flexShrink: 0, borderRight: '1px solid var(--theme-border)', borderTop: `2px solid ${tab.id === fileTabId(preview) ? 'var(--theme-accent)' : 'transparent'}` }}>
                 <button role="tab" aria-selected={tab.id === fileTabId(preview)} tabIndex={tab.id === fileTabId(preview) ? 0 : -1}
@@ -3550,13 +3588,13 @@ const FileTreePanelContent: React.FC<Props & { viewKey: string }> = ({ sessionId
                     event.preventDefault(); selectFileTab(fileTabs[next]);
                     (event.currentTarget.closest('[role="tablist"]')?.querySelectorAll<HTMLButtonElement>('[role="tab"]')[next])?.focus();
                   }}>
-                  <WorkbenchIcon name="code" size={13} />{tab.document && documentStore.get(tab.document.key)?.dirty ? '● ' : ''}{tab.name}{tab.source === 'local' ? ' · 本机' : ''}
+                  <WorkbenchIcon name="code" size={13} /><span style={{ maxWidth: 160, overflow: 'hidden', textOverflow: 'ellipsis' }}>{tab.document && documentStore.get(tab.document.key)?.dirty ? '● ' : ''}{tab.name}{tab.source === 'local' ? ' · 本机' : ''}</span>
                 </button>
                 <button className="awu-wb-control" aria-label={`关闭文件 ${tab.rel}${tab.source === 'local' ? '（本机）' : ''}`} style={{ ...hdrBtnStyle, border: 0, background: 'transparent' }}
                   onClick={() => requestCloseTab(tab)}>×</button>
               </div>)}
             </div>}
-            {documentHost && closingTab && <div role="alertdialog" aria-label="关闭未保存文件" style={{ padding: 12, borderBottom: '1px solid var(--theme-border)', fontSize: 12 }}>
+            {documentHost && closingTab && <div role="alertdialog" aria-label="关闭未保存文件" style={{ padding: 12, maxHeight: '30%', overflow: 'auto', flexShrink: 0, overflowWrap: 'anywhere', borderBottom: '1px solid var(--theme-border)', fontSize: 12 }}>
               <p>{closingTab.rel} 尚未保存或结果待核对。保存成功才能关闭；放弃只丢弃此窗口草稿，不修改磁盘。</p>
               <button style={hdrBtnStyle} disabled={tabClosing} onClick={() => void finishCloseTab('save')}>保存并关闭</button>
               <button style={hdrBtnStyle} disabled={tabClosing} onClick={() => void finishCloseTab('discard')}>放弃草稿并关闭</button>
@@ -3565,10 +3603,10 @@ const FileTreePanelContent: React.FC<Props & { viewKey: string }> = ({ sessionId
             <FilePreviewToolbar name={preview.name} relativePath={preview.rel} source={preview.source}
               nodeLabel={execLabel || execKey} dirty={dirty} compact={!!documentHost}
               icon={preview.isImage ? '🖼️' : preview.renderer === 'pdf' ? '📕' : preview.renderer === 'docx' ? '📘' : preview.renderer === 'drawio' ? '🧩' : preview.structured ? '📊' : editing ? '✏️' : '📄'}
-              trailing={!documentHost && <>
-                <button style={hdrBtnStyle} onClick={() => setPreviewMaximized(value => !value)} title={previewMaximized ? '退出最大化（Esc）' : '最大化预览'}>
+              trailing={documentHost ? <button style={hdrBtnStyle} aria-label="关闭当前文件" onClick={() => { const tab = fileTabs.find(item => item.id === fileTabId(preview)); if (tab) requestCloseTab(tab); }}>✕</button> : <>
+                {!previewViewport.narrow && <button style={hdrBtnStyle} onClick={() => setPreviewMaximized(value => !value)} title={previewMaximized ? '退出最大化（Esc）' : '最大化预览'}>
                   {previewMaximized ? '🗗 还原' : '⛶ 最大化'}
-                </button>
+                </button>}
                 <button style={hdrBtnStyle} onClick={closePreview} title="关闭预览" aria-label="关闭预览">✕</button>
               </>}>
               {!preview.loading && !(preview.source === 'local' && !isTauri()) && (
@@ -3654,7 +3692,8 @@ const FileTreePanelContent: React.FC<Props & { viewKey: string }> = ({ sessionId
               <button style={hdrBtnStyle} onClick={detachPreview} disabled={preview.loading || !!preview.error || !!activeDocument?.dirty || needsSaveCheck}
                 title={activeDocument?.dirty || needsSaveCheck ? '请先保存或核对当前改动，再分离文件窗口' : '在可移动、缩放的独立窗口中预览或编辑当前文件'}>↗ 独立窗口</button>
             </FilePreviewToolbar>
-            <div style={{ ...pvBody, ...(documentHost ? { display: 'flex', flexDirection: 'column' as const } : {}) }}>
+            <div style={pvBody}>
+              <div style={{ minHeight: 0, maxHeight: '40%', overflow: 'auto', flexShrink: 0, overflowWrap: 'anywhere' }}>
               {previewWindowError && <div role="alert" style={{ padding: '8px 12px', color: '#f87171', fontSize: 12 }}>{previewWindowError}</div>}
               {isRemote && preview.source === 'remote' && <div role="status" style={{ padding: '6px 10px', fontSize: 11, color: 'var(--theme-text-muted)', borderBottom: '1px solid var(--theme-border)' }}>
                 远端文件 · 只读。下载到本机副本后编辑，保存不会自动上传。
@@ -3713,6 +3752,8 @@ const FileTreePanelContent: React.FC<Props & { viewKey: string }> = ({ sessionId
                     : '草稿持久化不可用，请保存或导出；刷新可能丢失'}`}
                 </div>
               )}
+              </div>
+              <div data-preview-reading style={{ display: 'flex', flexDirection: 'column', flex: 1, minWidth: 0, minHeight: 0, overflow: 'auto', overscrollBehavior: 'contain' }}>
               {preview.loading ? (
                 <div style={{ padding: 24, textAlign: 'center', color: 'var(--theme-text-muted)' }}>{preview.loadingText || '加载中…'}</div>
               ) : preview.error ? (
@@ -3733,8 +3774,8 @@ const FileTreePanelContent: React.FC<Props & { viewKey: string }> = ({ sessionId
                     onChange={value => { if (activeDocument) documentStore.edit(activeDocument.key, value); }} onSave={saveEdit} onSaveAll={saveAllEdits} />
                 </Suspense>
               ) : preview.isImage ? (
-                <div style={{ padding: 12, textAlign: 'center', overflow: 'auto' }}>
-                  <img src={preview.dataUrl} alt={preview.name} style={{ maxWidth: '100%', maxHeight: '70vh' }} />
+                <div style={{ height: '100%', minHeight: 0, padding: 12, boxSizing: 'border-box', textAlign: 'center', overflow: 'auto' }}>
+                  <img src={preview.dataUrl} alt={preview.name} style={{ maxWidth: '100%', maxHeight: '100%', objectFit: 'contain' }} />
                 </div>
               ) : preview.renderer === 'pdf' && preview.bytes ? (
                 <Suspense fallback={<div style={{ padding: 24, textAlign: 'center', color: 'var(--theme-text-muted)' }}>PDF.js 加载中…</div>}>
@@ -3772,6 +3813,7 @@ const FileTreePanelContent: React.FC<Props & { viewKey: string }> = ({ sessionId
                   <code className="hljs" dangerouslySetInnerHTML={{ __html: highlightCode(preview.text || '', extOf(preview.name)) }} />
                 </pre>
               )}
+              </div>
             </div>
             </div>
           </div>
@@ -3863,7 +3905,7 @@ const pvBoxMaximized: React.CSSProperties = {
   width: '100vw', maxWidth: 'none', height: '100vh',
   border: 'none', borderRadius: 0, boxShadow: 'none',
 };
-const pvBody: React.CSSProperties = { flex: 1, minHeight: 0, overflow: 'auto' };
+const pvBody: React.CSSProperties = { flex: 1, minWidth: 0, minHeight: 0, overflow: 'hidden', display: 'flex', flexDirection: 'column' };
 const pvPre: React.CSSProperties = {
   margin: 0, padding: '14px 18px', minHeight: '100%', boxSizing: 'border-box',
   whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', fontSize: 12, lineHeight: 1.55,
@@ -4064,6 +4106,11 @@ const compactIconButtonStyle: React.CSSProperties = {
 };
 const toolBodyStyle: React.CSSProperties = {
   display: 'flex', flexDirection: 'column', gap: 8, padding: 8, minWidth: 0, color: 'var(--theme-text)', fontSize: 11.5,
+};
+const scanRuleEditorStyle: React.CSSProperties = {
+  display: 'block', width: '100%', boxSizing: 'border-box', resize: 'vertical', marginTop: 4,
+  padding: 6, borderRadius: 4, border: '1px solid var(--theme-border)',
+  background: 'var(--theme-bg-tertiary)', color: 'var(--theme-text)', fontFamily: 'monospace', fontSize: 12,
 };
 const toolCodeStyle: React.CSSProperties = {
   display: 'block', overflowWrap: 'anywhere', padding: '5px 7px', borderRadius: 4,

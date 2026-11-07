@@ -127,6 +127,8 @@ class ReviewBridgeTests(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(self.fixture.__exit__, None, None, None)
         self.session = self.fixture.session()
         self.bridge = BridgeWS.__new__(BridgeWS)
+        # 使用隔离节点身份；Windows 平台探测可能调用 ver，fixture 禁止子进程。
+        self.bridge._loop_environment_executor = lambda: 'sync-review-fixture'
         self.bridge._active_sessions = {self.session.id: self.session}
         self.bridge._loop_control_jobs = {}
         token = _REQUEST_OWNER_ID.set(self.session.owner_id)

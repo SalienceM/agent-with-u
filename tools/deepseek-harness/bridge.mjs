@@ -1,11 +1,13 @@
 // 仅由受信打包入口装配；不创建第二个 stdin/stdout reader。
 import { randomUUID } from 'node:crypto'
 import { AsyncLocalStorage } from 'node:async_hooks'
+import { createImageAdmission } from './image-admission.mjs'
+import { IMAGE_LIMITS, RUNTIME_VERSION, SOURCE_COMMIT } from './image-limits.mjs'
+export { RUNTIME_VERSION, SOURCE_COMMIT } from './image-limits.mjs'
 
 export const PROTOCOL_VERSION = 1
-export const RUNTIME_VERSION = '0.2.1-rc.3'
-export const SOURCE_COMMIT = '1f81c047fc48fa190a683e469daa699857e9afe8'
-const MAX_FRAME = 1024 * 1024
+const MAX_FRAME = IMAGE_LIMITS.maxFrameBytes
+const MAX_PENDING = IMAGE_LIMITS.maxPendingBytes
 const MAX_CALLS = 256
 
 export function installBridge(ctx, transport, server, config, io = process, extensions = {}) {
@@ -30,6 +32,9 @@ export function installBridge(ctx, transport, server, config, io = process, exte
   if (!['read-only', 'workspace-write', 'danger-full-access'].includes(permissionMode)
       || !['ask', 'never'].includes(approvalPolicy)) throw new Error('Invalid AWU access policy')
   let exitTask
+  const images = createImageAdmission(ctx, config,
+    { runtimeVersion: RUNTIME_VERSION, sourceCommit: SOURCE_COMMIT },
+    { maxFrameBytes: MAX_FRAME, maxPendingBytes: MAX_PENDING }, extensions.imageCatalogProtocol)
   const belongs = (id) => {
     const seen = new Set()
     while (typeof id === 'string' && !seen.has(id)) {
@@ -42,7 +47,8 @@ export function installBridge(ctx, transport, server, config, io = process, exte
   const sendNotification = transport.notify.bind(transport)
   const notify = (method, params) => {
     if (closed) throw new Error('AWU bridge closed')
-    if (Buffer.byteLength(JSON.stringify(params), 'utf8') > MAX_FRAME || io.stdout.writableLength > MAX_FRAME) {
+    if (Buffer.byteLength(JSON.stringify({ jsonrpc: '2.0', method, params }) + '\n', 'utf8') > MAX_FRAME
+        || io.stdout.writableLength > MAX_PENDING) {
       // 明确失败，不能无界积压或静默丢掉授权/输出。
       closed = true
       for (const item of pending.values()) item.finish('cancelled')
@@ -61,6 +67,7 @@ export function installBridge(ctx, transport, server, config, io = process, exte
   disposers.push(ctx.on('agent/created', ({ agent }) => {
     if (!belongs(String(agent.session.id))) return
     if (!configured) throw new Error('AWU turn configuration missing before agent creation')
+    images.mount(agent)
     // resume 会恢复旧日志中的权限；每次创建/恢复都在输入前覆盖为当前冻结策略。
     agent.session.append('sandbox/mode', { mode: permissionMode })
     agent.session.append('approval/policy', { policy: approvalPolicy })
@@ -131,7 +138,13 @@ export function installBridge(ctx, transport, server, config, io = process, exte
     if (method === 'awu/capabilities') {
       handshaken = true
       return { protocolVersion: PROTOCOL_VERSION, runtimeVersion: RUNTIME_VERSION, sourceCommit: SOURCE_COMMIT,
-        ...identity(config.sessionId), realtime: true, approvals: true }
+        ...identity(config.sessionId), realtime: true, approvals: true, questions: false,
+        questionProtocol: 'none', imageAdmission: images.descriptor }
+    }
+    if (method === 'awu/imageAdmission') {
+      if (!configured || textOnly) return { version: images.descriptor.version, admitted: false,
+        capability: 'unknown', reason: textOnly ? 'text_only' : 'configuration_required', source: 'none' }
+      return images.admit(params)
     }
     if (method === 'awu/configure') {
       if (!initialized || !handshaken || configured
@@ -190,10 +203,18 @@ export function installBridge(ctx, transport, server, config, io = process, exte
     if (['session/prompt', 'session/resume'].includes(method) && !configured) {
       throw new Error('AWU handshake and turn configuration required before prompt/resume')
     }
+    if (method === 'session/prompt') {
+      const rejection = await images.beforePrompt(params)
+      if (rejection) return rejection
+      // AWU 元数据只在桥中消费，不转发成原生内容或持久附件字段。
+      const { awuImageAdmission: _admission, ...nativeParams } = params
+      params = nativeParams
+    }
     const result = await server.handleRequest(method, params)
-    if (method === 'initialize') initialized = true
+    if (method === 'initialize') { initialized = true; images.initialize(params) }
     if (method === 'shutdown') {
       closed = true
+      images.close()
       for (const item of pending.values()) item.finish('cancelled')
       setImmediate(() => {
         exitTask ??= (async () => {
@@ -207,6 +228,7 @@ export function installBridge(ctx, transport, server, config, io = process, exte
   })
   return async () => {
     closed = true
+    images.close()
     for (const item of pending.values()) item.finish('cancelled')
     for (const dispose of disposers) dispose()
     calls.clear()

@@ -25,6 +25,7 @@ class OpenAICompatibleBackend(ModelBackend):
         on_tool_call: Optional[Callable] = None,
         constraints: Optional[str] = None,  # ★ Session-level constraints/rules/prompts
         model_override: Optional[str] = None,
+        on_user_interaction=None,
         **kwargs,
     ) -> dict:
         self.clear_cancelled(session_id)
@@ -72,6 +73,13 @@ class OpenAICompatibleBackend(ModelBackend):
 
             base_url = self.config.base_url or "https://api.openai.com/v1"
             poe_chat_only = is_poe_api_base_url(base_url)
+            question_tool = None
+            if extra_tools and on_tool_call and on_user_interaction and not poe_chat_only and not kwargs.get('text_only'):
+                from .api_user_questions import ApiQuestionTool, QUESTION_TOOL
+                extra_tools = [*extra_tools, QUESTION_TOOL]
+                question_tool = ApiQuestionTool(session_id, message_id, on_user_interaction, lambda: self.is_cancelled(session_id))
+            from .provider_usage import RequestUsage, stream_usage_unsupported
+            turn_usage = RequestUsage("openai")
             headers = {"Content-Type": "application/json"}
             if self.config.api_key:
                 headers["Authorization"] = f"Bearer {self.config.api_key}"
@@ -116,6 +124,8 @@ class OpenAICompatibleBackend(ModelBackend):
                 }
                 if oai_tools:
                     req_json["tools"] = oai_tools
+                if not poe_chat_only:
+                    req_json["stream_options"] = {"include_usage": True}
 
                 # ★ DEBUG：打印实际发给模型的完整消息（含约束/提示词），方便排查
                 print(f"\n[OpenAI DEBUG] ===== 发送给模型的消息 (round={_tool_round}) =====",
@@ -167,10 +177,22 @@ class OpenAICompatibleBackend(ModelBackend):
                                     last_error = f"API error: 429 (rate limited, retrying {attempt+1}/{_MAX_RETRIES})"
                                     print(f"[OpenAI] 429 rate limit, will retry", file=sys.stderr, flush=True)
                                     continue
+                                if response.status_code == 400 and "stream_options" in req_json and attempt < _MAX_RETRIES:
+                                    try:
+                                        rejection = json.loads((await response.aread())[:8192])
+                                    except (ValueError, UnicodeDecodeError):
+                                        rejection = None
+                                    if stream_usage_unsupported(rejection):
+                                        # 仅对已明确拒绝的参数做一次兼容降级；未接收流/工具，不重放已受理请求。
+                                        req_json.pop("stream_options")
+                                        last_error = "stream usage unsupported"
+                                        continue
                                 if response.status_code != 200:
                                     emit("error", error=f"API error: {response.status_code}")
                                     emit("done")
                                     return {}
+                                if not poe_chat_only:
+                                    turn_usage.start()
 
                                 async for line in response.aiter_lines():
                                     if self.is_cancelled(session_id):
@@ -184,7 +206,9 @@ class OpenAICompatibleBackend(ModelBackend):
                                     try:
                                         parsed = json.loads(data)
                                         trace_response("openai-sse", parsed, "供应商 SSE data JSON（脱敏）。")
-                                        choice = parsed.get("choices", [{}])[0]
+                                        if not poe_chat_only:
+                                            turn_usage.observe(parsed.get("usage"))
+                                        choice = (parsed.get("choices") or [{}])[0]
                                         delta = choice.get("delta", {})
                                         if delta.get("reasoning_content"):
                                             emit("thinking", text=delta["reasoning_content"])
@@ -268,7 +292,7 @@ class OpenAICompatibleBackend(ModelBackend):
                         except json.JSONDecodeError:
                             args = {}
                         try:
-                            result_text = await on_tool_call(tc["name"], args)
+                            result_text = await question_tool.execute(tc['id'], args) if question_tool and tc['name'] == 'awu_ask_user' else await on_tool_call(tc["name"], args)
                             emit("tool_result", tool_call={
                                 "id": tc["id"], "output": result_text, "status": "done",
                             })
@@ -294,7 +318,8 @@ class OpenAICompatibleBackend(ModelBackend):
                 else:
                     break  # 无 tool_use，结束
 
-            emit("done")
+            usage = turn_usage.finish() if not poe_chat_only else None
+            emit("done", **({"usage": usage} if usage is not None else {}))
             return {}
 
         except Exception as e:

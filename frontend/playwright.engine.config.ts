@@ -5,6 +5,6 @@ export default defineConfig({
   testDir: './tests/engine', workers: 1, retries: 0, timeout: 30_000,
   outputDir: '../.qa/engine-browser/results', reporter: 'line',
   use: { baseURL: 'http://127.0.0.1:55191', browserName: 'chromium', trace: 'retain-on-failure' },
-  webServer: { command: 'npx vite --host 127.0.0.1 --port 55191 --strictPort',
+  webServer: process.env.AWU_PREVIEW_TEST_SERVER === 'owned' ? undefined : { command: 'npx vite --host 127.0.0.1 --port 55191 --strictPort',
     url: 'http://127.0.0.1:55191', reuseExistingServer: false },
 });

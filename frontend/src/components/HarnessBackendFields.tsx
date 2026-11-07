@@ -19,7 +19,7 @@ export const HarnessBackendFields: React.FC<{
   value: HarnessConfigFields;
   onChange: (patch: Partial<HarnessConfigFields>) => void;
 }> = ({ value, onChange }) => <section aria-label="DeepSeek Harness 配置" style={{ minWidth: 0 }}>
-  <p style={hintStyle}>DeepSeek Harness 0.2.1-rc.3（预发布）· 原生文件、命令和工具执行。支持排到下一轮；尚不支持同轮引导、接管外部线程或图片输入。</p>
+  <p style={hintStyle}>DeepSeek Harness 0.2.1-rc.3（预发布）· 原生文件、命令和工具执行。支持排到下一轮；尚不支持同轮引导或接管外部线程。图片须通过当前模型及执行节点的能力校验。</p>
   <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 240px), 1fr))', gap: 12 }}>
     <label style={fieldStyle}>API Key
       <input type="password" autoComplete="off" value={value.apiKey || ''} style={inputStyle}
@@ -52,15 +52,16 @@ export const HarnessBackendFields: React.FC<{
         <option value="reject">不询问，拒绝升级</option>
       </select>
     </label>
-    <label style={fieldStyle}>Runtime 绝对路径（可选）
+    <label style={fieldStyle}>Harness CLI 绝对路径（可选）
       <input value={value.cliPath || ''} style={inputStyle} onChange={e => onChange({ cliPath: e.target.value })}
-        placeholder="留空使用随包运行时" />
+        placeholder="发行包留空自动查找 npm 安装的 dsh" />
     </label>
     <label style={fieldStyle}>默认工作目录（可选）
       <input value={value.workingDir || ''} style={inputStyle} onChange={e => onChange({ workingDir: e.target.value })}
         placeholder="Session 可指定自己的工作目录" />
     </label>
   </div>
+  <p style={hintStyle}>桌面/Web 发行包不内置 Harness 运行时。请在 Session 所属执行节点准备 Node 24（至少 24.10），执行 npm install -g @deepseek-ai/dsh@0.2.1-rc.3。支持 npm 入口或 lib/bin.js 的绝对路径；AWU 不会自动安装。源码/Docker 配套部署保留原运行方式。</p>
   <p style={hintStyle}>Provider：deepseek-official。模型候选由你维护，账号可用性未确认。访问策略取决于当前平台的 Harness 实现；“不询问”不会放行权限升级。查看或保存配置不启动模型。</p>
   <CodexModelOptionsEditor backendType="deepseek-harness" value={value.modelOptions} onChange={modelOptions => onChange({ modelOptions })} />
 </section>;

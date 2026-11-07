@@ -19,7 +19,7 @@ function mutableDigest(parts: HandoffState['parts']): string {
   const files = (row: any) => row ? { tabs: row.tabs, active: row.active, documents: row.documents?.map((doc: any) => ({
     identity: doc.identity, text: doc.text, baseText: doc.baseText, baseVersion: doc.baseVersion, revision: doc.revision })) } : undefined;
   // 自动流滚动、光标测量不是新的用户输入，不让后台输出妨碍窗口移动。
-  return byteHash(new TextEncoder().encode(JSON.stringify({ input: input ? { text: input.text, images: input.images, textAttachments: input.textAttachments } : undefined,
+  return byteHash(new TextEncoder().encode(JSON.stringify({ input: input ? { text: input.text, images: input.images, textAttachments: input.textAttachments, composerRequests: input.composerRequests, composerMeta: input.composerMeta } : undefined,
     filesEngine: files(parts.filesEngine), filesChat: files(parts.filesChat), layout: parts.layout, documents: parts.documents })));
 }
 

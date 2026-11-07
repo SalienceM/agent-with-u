@@ -1418,6 +1418,10 @@ export const App: React.FC = () => {
       '--theme-user-bubble-bg': theme.userBubbleBg,
       '--theme-user-bubble-border': theme.userBubbleBorder,
       '--theme-code-bg': ua < 1 ? hexToRgba(theme.codeBg, ua) : theme.codeBg,
+      // Markdown 局部实色保证背景图/透明度变化后表格和代码仍清晰。
+      '--md-panel': theme.bgSecondary,
+      '--md-soft': theme.bgTertiary,
+      '--md-code': theme.codeBg,
       '--theme-input-bg': ua < 1 ? hexToRgba(theme.inputBg, ua) : theme.inputBg,
       '--theme-sidebar-bg': ua < 1 ? hexToRgba(theme.sidebarBg, ua) : theme.sidebarBg,
       '--theme-panel-solid': theme.bg,
@@ -1548,61 +1552,9 @@ export const App: React.FC = () => {
           from { opacity: 0; transform: translateY(8px) scale(.985); }
           to   { opacity: 1; transform: translateY(0) scale(1); }
         }
-        /* ── Markdown 内容 ── */
-        .md-content { line-height: 1.6; }
-        .md-content p { margin: 6px 0; }
-        .md-content h1,.md-content h2,.md-content h3,
-        .md-content h4,.md-content h5,.md-content h6 {
-          color: var(--theme-text); font-weight: 600; margin: 14px 0 4px;
-        }
-        .md-content h1 { font-size: 1.2em; font-weight: 700; }
-        .md-content h2 { font-size: 1.12em; }
-        .md-content h3 { font-size: 1.05em; }
-        .md-content h4 { font-size: 1em; }
-        .md-content ul, .md-content ol { padding-left: 22px; margin: 4px 0; }
-        .md-content li { margin-bottom: 3px; }
-        .md-content a.md-link { color: var(--theme-accent); text-decoration: underline; }
-        .md-content hr.md-hr { border: none; border-top: 1px solid var(--theme-border); margin: 12px 0; }
-        /* 行内代码 */
-        .md-content code.md-code-inline {
-          background: var(--theme-code-bg); color: var(--theme-text);
-          padding: 1px 5px; border-radius: 4px; font-size: 0.88em; font-family: monospace;
-        }
-        /* 代码块 */
-        .md-content pre.md-pre {
-          background: var(--theme-code-bg); border: 1px solid var(--theme-border);
-          border-radius: 8px; padding: 12px 16px; overflow-x: auto;
-          font-size: 13px; line-height: 1.6; margin: 8px 0;
-        }
-        .md-content pre.md-pre code.hljs {
-          background: transparent; padding: 0; font-family: monospace;
-          font-size: inherit; display: block;
-        }
-        .md-content .md-code-lang {
-          font-size: 11px; color: var(--theme-text-muted);
-          margin-bottom: 4px; font-family: sans-serif;
-        }
-        /* 引用块 */
-        .md-content blockquote.md-blockquote {
-          border-left: 3px solid var(--theme-accent); margin: 8px 0;
-          padding: 4px 12px; color: var(--theme-text-muted);
-        }
-        .md-content blockquote.md-blockquote p { margin: 0; }
-        /* 表格 */
-        .md-table-wrap { overflow-x: auto; margin: 8px 0; }
-        .md-table { border-collapse: collapse; width: 100%; font-size: 0.95em; }
-        .md-table th, .md-table td {
-          border: 1px solid var(--theme-border); padding: 6px 12px; text-align: left;
-        }
-        .md-table th { background: var(--theme-bg-secondary); font-weight: 600; }
-        .md-table tr:nth-child(even) td { background: var(--theme-bg-secondary); }
-        /* 任务列表 */
-        .md-content li input[type="checkbox"] { margin-right: 6px; vertical-align: middle; }
         /* ── 移动端适配 ── */
         @media (max-width: 768px) {
           .message-bubble-wrapper { max-width: 94% !important; }
-          .md-content pre.md-pre { padding: 10px 12px; font-size: 12px; }
-          .md-table th, .md-table td { padding: 4px 8px; }
         }
       `}</style>
 
@@ -2019,6 +1971,7 @@ export const App: React.FC = () => {
                     themeBorderFocused="var(--theme-accent)"
                     isMobile={isMobile}
                     onRequestNewSession={handleNewSession}
+                    onOpenSession={id => setSessionInPane(id, idx >= 0 ? idx : undefined)}
                     onSessionDeleted={(sid) => {
                       closeWorkbenchTab(sessionWorkbenchTab(sid));
                     }}

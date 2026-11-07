@@ -1,0 +1,18 @@
+{
+  "version": 1,
+  "bridgeVersion": 1,
+  "runtimeVersion": "0.2.1-rc.3",
+  "sourceCommit": "1f81c047fc48fa190a683e469daa699857e9afe8",
+  "formats": ["image/png", "image/jpeg", "image/webp"],
+  "limits": {
+    "maxImages": 4,
+    "maxImageBytes": 4194304,
+    "maxTotalImageBytes": 8388608,
+    "maxEdge": 8192,
+    "maxImagePixels": 16000000,
+    "maxTotalImagePixels": 32000000,
+    "maxRequestBytes": 12582912,
+    "maxFrameBytes": 16777216,
+    "maxPendingBytes": 33554432
+  }
+}

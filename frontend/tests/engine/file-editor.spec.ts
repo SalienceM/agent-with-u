@@ -517,6 +517,21 @@ test('Engine HTML remains sandboxed and script trust is not inherited by another
   await expect(host.getByRole('button', { name: '启用页面脚本', exact: true })).toHaveAttribute('aria-pressed', 'false');
 });
 
+test('narrow Engine current-file close preserves dirty guard and only closes its tab', async ({ page }) => {
+  await mountFiles(page, false, false, true);
+  await page.locator('#document-host').evaluate(el => { el.parentElement!.style.gridTemplateColumns = '260px 320px'; });
+  await page.locator('.ftp-row').filter({ has: page.getByText('a.py', { exact: true }) }).click();
+  const editor = page.locator('.cm-content'); await editor.fill('retained dirty text');
+  const close = page.getByLabel('关闭当前文件', { exact: true });
+  await close.click();
+  const guard = page.getByRole('alertdialog', { name: '关闭未保存文件' }); await expect(guard).toBeVisible();
+  await guard.getByRole('button', { name: '取消关闭' }).click(); await expect(editor).toContainText('retained dirty text');
+  await close.click(); await guard.getByRole('button', { name: '放弃草稿并关闭' }).click();
+  await expect(page.locator('[data-preview-surface]')).toHaveCount(0);
+  await expect(page.locator('.ftp-panel')).toBeVisible();
+  expect(await page.evaluate(() => (window as any).fixture.saves)).toEqual([]);
+});
+
 test('Engine image, binary, large complete text and old-node read-only defaults never bypass save gates', async ({ page }) => {
   await mountFiles(page, false, false, true);
   const host = page.locator('#document-host');

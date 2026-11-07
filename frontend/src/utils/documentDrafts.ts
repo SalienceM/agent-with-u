@@ -5,6 +5,8 @@ import { DocumentProtocolError } from './workspaceDocuments';
 
 export interface StoredDocumentDraft {
   id: string; documentKey: string; ownerId: string; branch: string; updatedAt: number; payload: string;
+  /** 新独立预览的身份域；旧记录不猜测所属 Relay。 */
+  previewRealm?: string;
 }
 export interface DraftRepository {
   list(documentKey: string, ownerId: string): Promise<StoredDocumentDraft[]>;
@@ -36,6 +38,19 @@ async function transaction<T>(mode: IDBTransactionMode,
 }
 
 export class IndexedDraftRepository implements DraftRepository {
+  private readonly preview = typeof location !== 'undefined' && new URLSearchParams(location.search).get('previewVersion') === '2';
+  private realm(): string {
+    try {
+      const target = JSON.parse(localStorage.getItem('awu.connectionTarget') || 'null');
+      if (target?.mode === 'relay') { const url = new URL(target.url); return JSON.stringify(['relay', `${url.protocol}//${url.host}${url.pathname}`, target.user?.userId || '']); }
+    } catch { /* 本机身份无 Relay 配置 */ }
+    return 'local';
+  }
+  private readonly capturedRealm = this.realm();
+  private visible(record: StoredDocumentDraft): boolean {
+    return record.previewRealm ? record.previewRealm === this.realm() : !this.preview;
+  }
+  private scopedId(id: string) { return this.preview ? JSON.stringify(['preview', this.capturedRealm, id]) : id; }
   listOwner(owner: string): Promise<StoredDocumentDraft[]> {
     return transaction('readonly', (store, result) => {
       const rows: StoredDocumentDraft[] = []; let size = 0;
@@ -44,6 +59,7 @@ export class IndexedDraftRepository implements DraftRepository {
         const cursor = request.result;
         if (!cursor) { result(rows); return; }
         const row = cursor.value as StoredDocumentDraft;
+        if (!this.visible(row)) { cursor.continue(); return; }
         size += typeof row.payload === 'string' ? row.payload.length : MAX_PAYLOAD + 1;
         if (rows.length >= 64 || size > OWNER_BUDGET || typeof row.payload !== 'string' || row.payload.length > MAX_PAYLOAD
           || ![row.id, row.documentKey, row.branch].every(value => typeof value === 'string' && value.length <= 32768)) {
@@ -56,10 +72,11 @@ export class IndexedDraftRepository implements DraftRepository {
   list(key: string, owner: string): Promise<StoredDocumentDraft[]> {
     return transaction('readonly', (store, result) => {
       const request = store.index('documentKey').getAll(key);
-      request.onsuccess = () => result(request.result.filter((record: StoredDocumentDraft) => record.ownerId === owner));
+      request.onsuccess = () => result(request.result.filter((record: StoredDocumentDraft) => record.ownerId === owner && this.visible(record)));
     });
   }
   put(record: StoredDocumentDraft): Promise<void> {
+    if (this.preview) record = { ...record, id: this.scopedId(record.id), previewRealm: this.capturedRealm };
     if (record.payload.length > MAX_PAYLOAD) return Promise.reject(new DocumentProtocolError('draft_too_large'));
     return transaction('readwrite', (store, result) => {
       const request = store.index('ownerId').getAll(record.ownerId);
@@ -74,13 +91,15 @@ export class IndexedDraftRepository implements DraftRepository {
     });
   }
   remove(id: string, owner: string): Promise<void> {
+    id = this.scopedId(id);
     return transaction('readwrite', (store, result) => {
       const request = store.get(id); request.onsuccess = () => {
-        if (request.result?.ownerId === owner) store.delete(id); result(undefined);
+        if (request.result?.ownerId === owner && this.visible(request.result)) store.delete(id); result(undefined);
       };
     });
   }
   removeRecord(record: StoredDocumentDraft): Promise<void> {
+    if (!this.visible(record)) return Promise.reject(new DocumentProtocolError('stale_workspace'));
     return transaction('readwrite', (store, result) => {
       const request = store.get(record.id); request.onsuccess = () => {
         const current = request.result as StoredDocumentDraft | undefined;

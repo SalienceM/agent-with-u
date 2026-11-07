@@ -12,6 +12,10 @@ from typing import Any, Protocol, Callable, Awaitable
 
 from .release_center import ReleaseCenterManager
 
+UPDATE_CAPABILITY = "node.update_local_published"
+CHECK_UPDATE_CAPABILITY = "node.check_update_local"
+LOCAL_UPDATE_CAPABILITIES = frozenset({UPDATE_CAPABILITY, CHECK_UPDATE_CAPABILITY})
+
 
 class KitCapabilityError(RuntimeError):
     """能力不存在、参数无效或能力执行失败。"""
@@ -268,13 +272,7 @@ class ReleasePublishLatestCapability:
         job_id = str(runtime.get("jobId") or "")
         if not job_id:
             raise KitCapabilityError("发布任务 ID 不存在")
-        status = await asyncio.to_thread(context.release_center.status)
-        job = next(
-            (dict(item) for item in (status.get("jobs") or []) if item.get("id") == job_id),
-            None,
-        )
-        if job is None:
-            raise KitCapabilityError("发布任务已不在发布中心账本中")
+        job = await asyncio.to_thread(context.release_center.job_status, job_id)
         if job.get("status") == "succeeded" and runtime.get("boundBuild"):
             job["publishedRelease"] = await asyncio.to_thread(
                 context.release_center.published_result, job_id,
@@ -292,9 +290,9 @@ class ReleasePublishLatestCapability:
 
 
 class LocalPublishedUpdateCapability:
-    id = "node.update_local_published"
+    id = UPDATE_CAPABILITY
     title = "安装本次发布并验收重启"
-    description = "仅更新 Session 执行设备的已安装 Windows 桌面，必须在 Kit 面板单独确认安装。"
+    description = "仅安装同一次运行中唯一成功的 bindBuild 发布；不能独立使用。安装须在 Kit 面板单独确认。"
     risk_level = "high"
     permission = "node.update.manage"
     approval = "required"
@@ -325,11 +323,21 @@ class LocalPublishedUpdateCapability:
         self._services(context).cancel()
 
 
+class LocalCheckUpdateCapability(LocalPublishedUpdateCapability):
+    id = CHECK_UPDATE_CAPABILITY
+    title = "本机检查更新并验收重启"
+    description = "从执行设备更新中心已配置的源与通道检查，冻结版本后下载；无更新则仅报告检查结果，有更新须面板独立确认安装。无需构建或发布步骤。"
+    intent_hints = ("本机更新", "更新本机", "本机一键检查并更新", "检查并更新", "检查更新并安装",
+                    "本地更新", "local update", "check and update")
+    example = {"type": "awu_capability", "target": "executor", "title": title,
+               "config": {"capability": id, "arguments": {}}}
+
+
 class KitCapabilityRegistry:
     """稳定 capability id 白名单及其统一生命周期入口。"""
 
     def __init__(self) -> None:
-        handlers = [ReleasePublishLatestCapability(), LocalPublishedUpdateCapability()]
+        handlers = [ReleasePublishLatestCapability(), LocalPublishedUpdateCapability(), LocalCheckUpdateCapability()]
         self._handlers = {handler.id: handler for handler in handlers}
 
     def metadata(self, capability_id: str) -> dict[str, Any]:
@@ -374,7 +382,7 @@ class KitCapabilityRegistry:
             return {}
         if not isinstance(arguments, dict):
             raise KitCapabilityError("AgentWithU 能力参数必须是 JSON 对象")
-        if capability_id == LocalPublishedUpdateCapability.id and arguments:
+        if capability_id in LOCAL_UPDATE_CAPABILITIES and arguments:
             raise KitCapabilityError("本机更新不接受目标、路径、命令、owner 或外部发布回执参数")
         return dict(arguments)
 

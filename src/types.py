@@ -178,6 +178,8 @@ class ChatMessage:
     # because it is part of the visible Session history.
     delivery_mode: Optional[str] = None  # steer | redirect
     workflow_ref: Optional[dict] = None  # 显式工作流元数据，不含参数或历史授权
+    image_request_id: Optional[str] = None  # 仅关联图片提交台账；不复制载荷或授权
+    schedule_ref: Optional[dict] = None
 
     def has_visible_payload(self) -> bool:
         """正文之外，思考、工具和附件也都属于可展示的有效回复。"""
@@ -216,6 +218,11 @@ class ChatMessage:
             d["thinkingBlocks"] = [tb.to_dict() for tb in self.thinking_blocks]
         if self.delivery_mode in {"steer", "redirect"}:
             d["deliveryMode"] = self.delivery_mode
+        if self.image_request_id:
+            d["imageRequestId"] = self.image_request_id
+        if self.schedule_ref:
+            from .backend.session_schedule_rules import normalize_schedule_ref
+            d['scheduleRef'] = normalize_schedule_ref(self.schedule_ref)
         if self.workflow_ref:
             from .backend.loop_execution_environment import normalize_workflow
             d['workflowRef'] = normalize_workflow(self.workflow_ref)
@@ -302,6 +309,27 @@ class Session:
     token_usage: dict = field(default_factory=dict)
     # 仅影响展示，不转换普通/LOOP 类型，也不更改执行或控制权。
     view_mode: SessionViewMode = "chat"
+    # 组织关系不是原生线程/权限继承；缺失字段保持普通会话行为。
+    parent_session_id: Optional[str] = None
+    relation_kind: Optional[str] = None  # review | task | integration
+    project_group_id: Optional[str] = None
+    role_id: Optional[str] = None
+    workspace_id: Optional[str] = None
+    followup_suggestions_enabled: bool = False
+    followup_suggestions_config: dict = field(default_factory=dict)
+    # 未识别持久字段仅供原样写回，绝不加入跨节点/UI 投影。
+    persisted_extra: dict = field(default_factory=dict, repr=False)
+
+    def collaboration_meta(self) -> dict:
+        return {
+            "parentSessionId": self.parent_session_id,
+            "relationKind": self.relation_kind,
+            "projectGroupId": self.project_group_id,
+            "roleId": self.role_id,
+            "workspaceId": self.workspace_id,
+            "followupSuggestionsEnabled": self.followup_suggestions_enabled,
+            "followupSuggestionsConfig": dict(self.followup_suggestions_config),
+        }
 
     def to_dict(self, message_limit: int = 0) -> dict:
         """序列化 Session；message_limit>0 时只触碰最后 N 条消息。
@@ -349,6 +377,7 @@ class Session:
             "autoCommitPush": self.auto_commit_push,
             "autoCommitBackendId": self.auto_commit_backend_id,
             "tokenUsage": self.token_usage or {},
+            **self.collaboration_meta(),
         }
 
     def meta_dict(self) -> dict:
@@ -380,6 +409,7 @@ class Session:
             "autoCommit": self.auto_commit,
             "autoCommitPush": self.auto_commit_push,
             "autoCommitBackendId": self.auto_commit_backend_id,
+            **self.collaboration_meta(),
         }
 
 

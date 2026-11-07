@@ -3,7 +3,7 @@ import { api, getCurrentUserProfile, onCurrentUserChanged } from '../api';
 import { manualReferences, normalizeManualHistory, openSkillManual, removeManualReferences, skillReferenceLabel, type SkillManualSummary } from '../utils/skillManual';
 import { useClipboardImage } from '../hooks/useClipboardImage';
 import { themes, useConfig } from '../hooks/useConfig';
-import { markdownToHtml } from '../utils/markdown';
+import { MarkdownBody } from './MarkdownBody';
 import {
   attentionIcon,
   bindAttention,
@@ -536,8 +536,8 @@ export const ThoughtsAssistant: React.FC<Props> = ({
               <div style={answerStyle}>
                 <span style={answerTag}>想</span>
                 {answer ? (
-                  <div className="md-content" style={{ flex: 1, minWidth: 0 }}
-                    dangerouslySetInnerHTML={{ __html: markdownToHtml(answer) + (answering ? ' <span class="streaming-cursor">▍</span>' : '') }} />
+                  <MarkdownBody text={answer} style={{ flex: 1 }}
+                    trailing={answering ? <span className="streaming-cursor">▍</span> : undefined} />
                 ) : <span style={{ color: 'var(--theme-text-muted)' }}>{answering ? '问题已接收，进度见上方。' : '本次没有生成回答；问题已保留。'}</span>}
               </div>
               <details style={{ margin: '8px 0 0 27px', fontSize: 10.5, color: 'var(--theme-text-muted)', overflowWrap: 'anywhere', lineHeight: 1.6 }}>
@@ -697,6 +697,7 @@ export const ThoughtsAssistantWindow: React.FC = () => {
     '--theme-bg-tertiary': palette.bgTertiary,
     '--theme-panel-bg': palette.bg,
     '--theme-input-bg': palette.inputBg,
+    '--theme-code-bg': palette.codeBg,
     '--theme-border': palette.border,
     '--theme-text': palette.text,
     '--theme-text-muted': palette.textMuted,
@@ -712,18 +713,12 @@ export const ThoughtsAssistantWindow: React.FC = () => {
   };
 
   return (
-    <div className="awu-thoughts-window" style={rootStyle}>
+    <div className="awu-thoughts-window" data-markdown-theme={config.theme === 'light' || config.theme === 'classic' ? 'light' : 'dark'} style={rootStyle}>
       <style>{`
         .awu-thoughts-window .md-content { line-height: 1.7; overflow-wrap: anywhere; }
         .awu-thoughts-window .md-content p { margin: .55em 0; }
         .awu-thoughts-window .md-content ul,
         .awu-thoughts-window .md-content ol { margin: .55em 0; padding-left: 1.7em; }
-        .awu-thoughts-window .md-content pre { overflow: auto; margin: .65em 0; padding: 10px 12px; border-radius: 8px; background: ${palette.codeBg}; }
-        .awu-thoughts-window .md-content code { font-family: Consolas, "SFMono-Regular", monospace; }
-        .awu-thoughts-window .md-content blockquote { margin: .65em 0; padding-left: 10px; border-left: 3px solid ${palette.accent}; color: ${palette.textMuted}; }
-        .awu-thoughts-window .md-content table { display: block; max-width: 100%; overflow-x: auto; border-collapse: collapse; }
-        .awu-thoughts-window .md-content th,
-        .awu-thoughts-window .md-content td { padding: 6px 8px; border: 1px solid ${palette.border}; }
         .awu-thoughts-window .streaming-cursor { color: ${palette.accent}; animation: awu-thoughts-blink .85s steps(1) infinite; }
         @keyframes awu-thoughts-blink { 50% { opacity: 0; } }
       `}</style>

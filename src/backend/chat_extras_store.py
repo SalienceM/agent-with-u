@@ -14,6 +14,8 @@
 from __future__ import annotations
 
 import json
+import os
+import tempfile
 import threading
 import time
 import uuid
@@ -23,6 +25,7 @@ from typing import Optional
 
 from . import paths
 from .aside_context import migrate_reference_attention
+from .harness_image_receipts import ImageSubmission, ReceiptError, load_records
 
 
 def _now() -> float:
@@ -45,6 +48,9 @@ class SeqTask:
     error: str = ""
     created_at: float = field(default_factory=_now)
     updated_at: float = field(default_factory=_now)
+    image_request_id: str = ""
+    revision: int = 1
+    schedule_ref: Optional[dict] = None
 
     def to_dict(self) -> dict:
         return {
@@ -59,10 +65,16 @@ class SeqTask:
             "error": self.error,
             "createdAt": self.created_at,
             "updatedAt": self.updated_at,
+            "imageRequestId": self.image_request_id,
+            "revision": self.revision,
+            "scheduleRef": self.schedule_ref,
         }
 
     @classmethod
     def from_dict(cls, d: dict) -> "SeqTask":
+        from .session_schedule_rules import normalize_schedule_ref
+        ref = normalize_schedule_ref(d.get('scheduleRef'))
+        invalid_schedule = (str(d.get('id', '')).startswith('schedule-') or d.get('scheduleRef') is not None) and ref is None
         return cls(
             id=d.get("id") or _nid(),
             text=d.get("text", ""),
@@ -71,10 +83,13 @@ class SeqTask:
             delivery_mode=("redirect" if d.get("deliveryMode") == "redirect" else ""),
             # ``steering`` 是进程内的短暂租约；服务重启说明该 steer 已无法
             # 完成，必须恢复为 pending，避免消息永久卡死。
-            status=("pending" if d.get("status") == "steering" else d.get("status", "pending")),
-            error=str(d.get("error") or ""),
+            status=('error' if invalid_schedule else "pending" if d.get("status") == "steering" else d.get("status", "pending")),
+            error=('定时来源损坏，不能作为普通队列执行' if invalid_schedule else str(d.get("error") or "")),
             created_at=d.get("createdAt", _now()),
             updated_at=d.get("updatedAt", _now()),
+            image_request_id=str(d.get("imageRequestId") or ""),
+            revision=int(d.get("revision", 1)),
+            schedule_ref=ref,
         )
 
 
@@ -144,6 +159,7 @@ class ChatExtras:
     aside_backend_id: str = ""   # by-the-way 专用 backend（空=跟随会话 backend）
     created_at: float = field(default_factory=_now)
     updated_at: float = field(default_factory=_now)
+    harness_image_submissions: dict[str, ImageSubmission] = field(default_factory=dict)
 
     def pending_tasks(self) -> list[SeqTask]:
         return [t for t in self.seq_tasks if t.status == "pending"]
@@ -159,6 +175,7 @@ class ChatExtras:
             "asideBackendId": self.aside_backend_id,
             "createdAt": self.created_at,
             "updatedAt": self.updated_at,
+            "harnessImageSubmissions": [item.to_dict() for item in self.harness_image_submissions.values()],
         }
 
     @classmethod
@@ -173,6 +190,7 @@ class ChatExtras:
             aside_backend_id=d.get("asideBackendId", "") or "",
             created_at=d.get("createdAt", _now()),
             updated_at=d.get("updatedAt", _now()),
+            harness_image_submissions=load_records(d.get("harnessImageSubmissions"), d.get("sessionId", "")),
         )
 
 
@@ -194,20 +212,26 @@ class ChatExtrasStore:
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
             return ChatExtras.from_dict(data)
-        except Exception as e:
-            print(f"[ChatExtrasStore] failed to load {sid}: {e}")
-            return None
+        except Exception:
+            # 无法核对持久去重状态不等于空台账；不能新建后覆盖并重放未知提交。
+            raise ReceiptError() from None
 
     def save(self, ex: ChatExtras) -> None:
         ex.updated_at = _now()
         with self._lock:
             target = self._path(ex.session_id)
-            temporary = target.with_suffix(".json.tmp")
-            temporary.write_text(
-                json.dumps(ex.to_dict(), ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
-            temporary.replace(target)
+            fd, temporary = tempfile.mkstemp(prefix=f".{target.name}.", suffix=".tmp", dir=self._dir)
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
+                    json.dump(ex.to_dict(), handle, ensure_ascii=False, indent=2, allow_nan=False)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.replace(temporary, target)
+            finally:
+                try:
+                    os.unlink(temporary)
+                except FileNotFoundError:
+                    pass
 
     def session_ids(self) -> list[str]:
         return [path.stem for path in self._dir.glob("*.json")]

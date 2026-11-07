@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import importlib
+from importlib import resources as package_resources
 import json
 import os
 from pathlib import Path
@@ -10,14 +11,31 @@ from typing import Any
 
 MODULES = (
     "websockets", "PIL.Image", "httpx", "claude_agent_sdk", "qwen_code_sdk",
-    "anthropic", "dashscope", "edge_tts", "yaml", "pydantic_core", "mcp", "pathspec",
+    "anthropic", "dashscope", "edge_tts", "yaml", "pydantic_core", "mcp", "pathspec", "tzdata", "zoneinfo",
 )
+SCHEDULE_MODULES = ("src.backend.session_schedule_rules", "src.backend.session_schedule_store",
+                    "src.backend.session_schedule_bridge", "src.backend.session_prompt_scheduler")
+SCHEDULE_TIMEZONES = ("UTC", "Asia/Shanghai", "America/New_York")
 RESOURCES = ("awu-jdt-diagnostics.jar", "typescript-diagnostics.cjs")
+
+
+def check_schedule_timezones() -> list[str]:
+    """直接读取随包时区数据；宿主系统 ZoneInfo 可用不代表冻结包完整。"""
+    from zoneinfo import ZoneInfo
+    failures: list[str] = []
+    for name in SCHEDULE_TIMEZONES:
+        try:
+            resource = package_resources.files('tzdata').joinpath('zoneinfo', *name.split('/'))
+            with resource.open('rb') as stream:
+                ZoneInfo.from_file(stream, key=name)
+        except (ImportError, OSError, ValueError, TypeError, AttributeError):
+            failures.append('resource:tzdata/zoneinfo/' + name)
+    return failures
 
 
 def check_components(*, resources: bool = True, web: bool = False) -> dict[str, Any]:
     failures: list[str] = []
-    modules = list(MODULES)
+    modules = [*MODULES, *SCHEDULE_MODULES]
     if sys.version_info < (3, 11):
         modules.append("tomli")
     if sys.platform == "win32":
@@ -30,6 +48,7 @@ def check_components(*, resources: bool = True, web: bool = False) -> dict[str, 
         except Exception:
             failures.append("module:" + name)
     if resources:
+        failures.extend(check_schedule_timezones())
         base = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parents[1]))
         directory = base / ("engine-providers" if getattr(sys, "frozen", False) else "tools/engine-providers")
         for name in RESOURCES:
@@ -43,8 +62,8 @@ def check_components(*, resources: bool = True, web: bool = False) -> dict[str, 
             failures.append("resource:frontend_dist/index.html")
         if getattr(sys, "frozen", False):
             try:
-                from .backend.deepseek_harness_distribution import verify_bundle
-                verify_bundle(repair_executable=True)
+                from .backend.deepseek_harness_distribution import verify_adapter
+                verify_adapter()
             except Exception:
                 failures.append("resource:deepseek-harness-bundle")
     from ._version import __version__

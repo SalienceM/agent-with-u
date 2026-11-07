@@ -1,0 +1,84 @@
+import { test, expect, type Page } from '@playwright/test';
+
+async function mount(page: Page, width: number) {
+  await page.setViewportSize({ width, height: 900 });
+  await page.routeWebSocket(/.*/, socket => socket.close());
+  await page.route('**/*', route => {
+    const url = new URL(route.request().url());
+    if (url.origin !== 'http://127.0.0.1:55191') return route.abort();
+    if (url.pathname === '/') return route.fulfill({ contentType: 'text/html', body: '<div id="root"></div><script>window.$RefreshReg$=()=>{};window.$RefreshSig$=()=>type=>type;window.__vite_plugin_react_preamble_installed__=true;</script>' });
+    return route.continue();
+  });
+  await page.goto('/');
+  await page.evaluate(async () => {
+    const { React, createRoot, ProjectTasksPanel, ChatInput, api } = await import('/tests/engine/chat-kit-feedback-harness.ts');
+    const f = { plans: [] as any[], created: [] as any[], started: [] as any[], opened: [] as string[], row: null as any, callbacks: new Set<any>(), fail: false, inspect: 0 };
+    const repo = { root: 'C:/fixture', commonDir: 'C:/fixture/.git', repositoryId: 'repo', head: 'a'.repeat(40), branch: 'main', fingerprint: 'source', dirty: [
+      { path: 'same.txt', status: ' M', sha256: 'sha', bytes: 5, blocked: '' }, { path: '.env', status: '??', sha256: '', bytes: 5, blocked: '凭据路径' }] };
+    api.taskWorkspaceInspect = async () => { f.inspect++; return { ...repo, status: 'ready', notice: '' }; };
+    api.collaborationList = async () => ({ items: f.row ? [f.row] : [], nextOffset: null });
+    api.taskWorkspacePlan = async (_s, _e, _request, config: any) => { f.plans.push(config); return f.row = { id: 'task', revision: 1, sessionId: 'child', sourceSessionId: 'parent', parentSessionId: 'parent', title: config.title,
+      config, repository: repo, root: 'C:/managed/task', branch: 'awu/task/one', status: 'preview', planFingerprint: 'plan' }; };
+    api.taskWorkspaceCreate = async (...args) => { f.created.push(args); f.row = { ...f.row, revision: 2, status: 'creating' }; if (f.fail) throw Error('lost'); return f.row; };
+    api.taskWorkspaceStatus = async () => f.row;
+    api.taskWorkspaceStart = async (...args) => { f.started.push(args); return { status: 'succeeded', result: { notice: '启动已接收' } }; };
+    api.onTaskWorkspaceUpdated = cb => { f.callbacks.add(cb); return () => { f.callbacks.delete(cb); }; };
+    api.listSessionSkillCommands = async () => ({ status: 'ok', commands: [] } as any);
+    api.followupSuggestionSettings = async () => ({ version: 1, enabled: false });
+    const backends = [{ id: 'fake', type: 'openai-compatible', label: 'Fake' }];
+    createRoot(document.getElementById('root')!).render(React.createElement(React.Fragment, null,
+      React.createElement(ProjectTasksPanel, { session: 'parent', executor: 'local', backendId: 'fake', backends, onOpenSession: (id: string) => f.opened.push(id) }),
+      React.createElement(ChatInput, { sessionId: 'parent', historyKey: 'parent', activeBackendId: 'fake', backends, isStreaming: false, onSend: () => {}, onAbort: () => {} })));
+    (window as any).taskFixture = f;
+  });
+}
+
+for (const width of [1300, 390]) test(`task preview freezes selection; explicit create then separate start (${width}px)`, async ({ page }) => {
+  await mount(page, width); await page.locator('.chat-textarea').fill('原会话草稿');
+  await page.getByRole('button', { name: '项目任务与汇合', exact: true }).click();
+  expect(await page.evaluate(() => (window as any).taskFixture.inspect)).toBe(0);
+  await page.getByRole('button', { name: '新建独立任务', exact: true }).click();
+  await page.getByLabel('任务标题', { exact: true }).fill('并行需求');
+  await page.getByLabel('初始需求', { exact: true }).fill('修复功能');
+  await expect(page.getByLabel('.env · 凭据路径', { exact: true })).toBeDisabled();
+  await expect(page.getByLabel('same.txt', { exact: true })).not.toBeChecked();
+  await page.getByLabel('same.txt', { exact: true }).check();
+  await page.getByRole('button', { name: '预览任务创建计划' }).click();
+  expect(await page.evaluate(() => (window as any).taskFixture.created)).toEqual([]);
+  const plan = await page.evaluate(() => (window as any).taskFixture.plans[0]);
+  expect(plan.includePaths).toEqual(['same.txt']); expect(plan.skipPermissions).toBe(false); expect(plan.kitApprovalDelegation).toBeUndefined();
+  await page.getByRole('button', { name: '确认创建独立任务（不运行模型）' }).click();
+  await expect(page.getByRole('dialog', { name: '项目任务', exact: true })).toContainText('正在创建');
+  expect(await page.evaluate(() => (window as any).taskFixture.started)).toEqual([]);
+  await page.getByRole('button', { name: '返回对话', exact: true }).click();
+  await expect(page.locator('.chat-textarea')).toHaveValue('原会话草稿');
+  await page.evaluate(() => { const f = (window as any).taskFixture; f.row = { ...f.row, status: 'ready', revision: 3 }; f.callbacks.forEach((cb: any) => cb(f.row, 'local')); });
+  await page.getByRole('button', { name: '项目任务与汇合', exact: true }).click();
+  await page.getByRole('button', { name: '启动初始需求', exact: true }).click();
+  expect(await page.evaluate(() => (window as any).taskFixture.started)).toHaveLength(1);
+  expect(await page.evaluate(() => (window as any).taskFixture.opened)).toEqual(['child']);
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBeTruthy();
+});
+
+test('lost create receipt is checked without duplicate creation; hierarchy keeps orphan and pinned children reachable', async ({ page }) => {
+  await mount(page, 1200);
+  await page.getByRole('button', { name: '项目任务与汇合', exact: true }).click();
+  await page.getByRole('button', { name: '新建独立任务', exact: true }).click();
+  await page.getByLabel('任务标题', { exact: true }).fill('任务');
+  await page.getByRole('button', { name: '预览任务创建计划' }).click();
+  await page.evaluate(() => { (window as any).taskFixture.fail = true; });
+  await page.getByRole('button', { name: '确认创建独立任务（不运行模型）' }).click();
+  await expect(page.getByRole('status')).toContainText('结果未知');
+  await page.getByRole('button', { name: '核对任务状态' }).click();
+  await expect(page.getByRole('dialog', { name: '项目任务', exact: true })).toContainText('正在创建');
+  expect(await page.evaluate(() => (window as any).taskFixture.created)).toHaveLength(1);
+  const tree = await page.evaluate(async () => {
+    const { taskSessionTree } = await import('/tests/engine/chat-kit-feedback-harness.ts');
+    const rows = [{ id: 'child', relationKind: 'task', parentSessionId: 'parent' }, { id: 'parent' }, { id: 'orphan', relationKind: 'task', parentSessionId: 'gone', pinned: true }];
+    return { expanded: taskSessionTree(rows, new Set(), false).map(row => [row.item.id, row.depth]),
+      collapsed: taskSessionTree(rows, new Set(['local:parent']), false).map(row => row.item.id),
+      searched: taskSessionTree(rows, new Set(['local:parent']), true).map(row => row.item.id) };
+  });
+  expect(tree.expanded).toEqual([['parent', 0], ['child', 1], ['orphan', 0]]);
+  expect(tree.collapsed).toEqual(['parent', 'orphan']); expect(tree.searched).toEqual(['parent', 'child', 'orphan']);
+});

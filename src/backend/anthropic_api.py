@@ -28,6 +28,7 @@ class AnthropicAPIBackend(ModelBackend):
         extra_tools: Optional[list[dict]] = None,
         on_tool_call: Optional[Callable] = None,
         constraints: Optional[str] = None,  # ★ Session-level constraints/rules/prompts
+        on_user_interaction=None,
         **kwargs,
     ) -> dict:
         """
@@ -36,6 +37,11 @@ class AnthropicAPIBackend(ModelBackend):
         on_tool_call: 工具调用回调 async (tool_name, tool_input) -> str
         """
         self.clear_cancelled(session_id)
+        question_tool = None
+        if extra_tools and on_tool_call and on_user_interaction and not kwargs.get('text_only'):
+            from .api_user_questions import ApiQuestionTool, QUESTION_TOOL
+            extra_tools = [*extra_tools, QUESTION_TOOL]
+            question_tool = ApiQuestionTool(session_id, message_id, on_user_interaction, lambda: self.is_cancelled(session_id))
 
         def emit(delta_type: str, **kw):
             if not self.is_cancelled(session_id):
@@ -66,7 +72,8 @@ class AnthropicAPIBackend(ModelBackend):
                 or self.config.base_url
             )
             model = (
-                self.get_env("ANTHROPIC_MODEL")
+                str(kwargs.get('model_override') or '').strip()
+                or self.get_env("ANTHROPIC_MODEL")
                 or self.config.model
                 or "claude-sonnet-4-6"
             )
@@ -142,8 +149,8 @@ class AnthropicAPIBackend(ModelBackend):
                   f"api_key={'set('+str(len(api_key))+'chars, prefix='+repr(api_key[:8])+')' if api_key else 'NONE'}",
                   file=sys.stderr, flush=True)
 
-            input_tokens = 0
-            output_tokens = 0
+            from .provider_usage import RequestUsage
+            turn_usage = RequestUsage("anthropic")
 
             if base_url:
                 # ── 代理模式：httpx 直接调用，完全控制请求头 ──────────────────
@@ -216,6 +223,7 @@ class AnthropicAPIBackend(ModelBackend):
                                         raise Exception(
                                             f"HTTP {resp.status_code}: {body.decode(errors='replace')}"
                                         )
+                                    turn_usage.start()
                                     async for line in resp.aiter_lines():
                                         if self.is_cancelled(session_id):
                                             break
@@ -261,15 +269,9 @@ class AnthropicAPIBackend(ModelBackend):
                                                 })
                                         elif etype == "message_delta":
                                             _stop_reason = evt.get("delta", {}).get("stop_reason")
-                                            output_tokens = evt.get("usage", {}).get(
-                                                "output_tokens", output_tokens
-                                            )
+                                            turn_usage.observe(evt.get("usage"))
                                         elif etype == "message_start":
-                                            input_tokens = (
-                                                evt.get("message", {})
-                                                .get("usage", {})
-                                                .get("input_tokens", input_tokens)
-                                            )
+                                            turn_usage.observe(evt.get("message", {}).get("usage"))
                             _last_err = None
                             break  # success
 
@@ -322,7 +324,7 @@ class AnthropicAPIBackend(ModelBackend):
                             except json.JSONDecodeError:
                                 parsed_input = {}
                             try:
-                                result_text = await on_tool_call(tu["name"], parsed_input)
+                                result_text = await question_tool.execute(tu['id'], parsed_input) if question_tool and tu['name'] == 'awu_ask_user' else await on_tool_call(tu["name"], parsed_input)
                                 emit("tool_result" if tu["name"] in tool_names else "tool_input", tool_call={
                                     "id": tu["id"],
                                     "output": result_text,
@@ -383,6 +385,7 @@ class AnthropicAPIBackend(ModelBackend):
                     from .call_trace import trace_request, trace_response
                     trace_request("anthropic-sdk", {k: v for k, v in stream_kwargs.items() if v is not _anthropic.NOT_GIVEN}, "实际传入 Anthropic SDK 的参数，认证信息未保存。")
                     async with client.messages.stream(**stream_kwargs) as stream:
+                        turn_usage.start()
                         emit("diagnostic", diagnostic={"phase": "sdk_response"})
                         async for event in stream:
                             if hasattr(event, "model_dump"):
@@ -422,14 +425,10 @@ class AnthropicAPIBackend(ModelBackend):
 
                             elif etype == "RawMessageDeltaEvent":
                                 _sdk_stop_reason = getattr(getattr(event, "delta", None), "stop_reason", None)
-                                usage = getattr(event, "usage", None)
-                                if usage:
-                                    output_tokens = getattr(usage, "output_tokens", 0)
+                                turn_usage.observe(getattr(event, "usage", None))
 
                             elif etype == "RawMessageStartEvent":
-                                usage = getattr(event.message, "usage", None)
-                                if usage:
-                                    input_tokens = getattr(usage, "input_tokens", 0)
+                                turn_usage.observe(getattr(event.message, "usage", None))
 
                     # ── Backend Skill tool_use 处理（SDK 模式）──
                     if (_sdk_stop_reason == "tool_use" and _sdk_pending_tools
@@ -459,7 +458,7 @@ class AnthropicAPIBackend(ModelBackend):
                             except json.JSONDecodeError:
                                 pi = {}
                             try:
-                                res = await on_tool_call(tu["name"], pi)
+                                res = await question_tool.execute(tu['id'], pi) if question_tool and tu['name'] == 'awu_ask_user' else await on_tool_call(tu["name"], pi)
                                 emit("tool_result", tool_call={
                                     "id": tu["id"], "output": res, "status": "done",
                                 })
@@ -488,12 +487,7 @@ class AnthropicAPIBackend(ModelBackend):
                         break
 
             if not self.is_cancelled(session_id):
-                usage_dict: Optional[dict] = None
-                if input_tokens or output_tokens:
-                    usage_dict = {
-                        "inputTokens": input_tokens,
-                        "outputTokens": output_tokens,
-                    }
+                usage_dict = turn_usage.finish()
                 emit("done", **({"usage": usage_dict} if usage_dict else {}))
 
             return {}

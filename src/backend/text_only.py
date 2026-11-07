@@ -13,6 +13,7 @@ import base64
 import io
 import os
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, AsyncIterator, Callable
 
@@ -23,6 +24,26 @@ TEXT_ONLY_BACKENDS = {
     "openai-compatible", "anthropic-api", "codex-office", "qwen-code-cli",
     "claude-agent-sdk", "claude-code-official", "deepseek-harness",
 }
+
+
+@dataclass
+class TextOnlyContext:
+    """仅供托管角色的独立原生空间；调用者校验归属并保存真实线程 ID。"""
+    home: Path
+    cwd: Path
+    native_id: str | None
+    save_native: Callable[[str], None]
+    confirmed: bool = False
+
+    def observed(self, value: Any) -> None:
+        if not isinstance(value, str) or not value.strip():
+            return
+        if self.native_id and self.native_id != value:
+            raise ValueError('角色原生线程发生变化；未接受自动重建上下文')
+        if not self.native_id:
+            self.save_native(value)
+            self.native_id = value
+        self.confirmed = True
 
 
 def _reference_images(images: list[ImageAttachment] | None) -> list[ImageAttachment]:
@@ -129,7 +150,8 @@ def _codex_restrictions() -> dict[str, Any]:
 
 async def _codex_text(backend: ModelBackend, content: str, rules: str,
                       home: Path, cwd: Path, model_override: str | None = None,
-                      reasoning_effort: str | None = None, images: list[ImageAttachment] | None = None) -> str:
+                      reasoning_effort: str | None = None, images: list[ImageAttachment] | None = None,
+                      context: TextOnlyContext | None = None, on_activity: Callable[..., None] | None = None) -> str:
     from .codex_app_server import CodexAppServerProcess, local_app_server_command
     from .codex_office import resolve_codex_cli
 
@@ -165,7 +187,7 @@ async def _codex_text(backend: ModelBackend, content: str, rules: str,
     try:
         await conn.start()
         params: dict[str, Any] = {
-            "cwd": str(cwd), "ephemeral": True, "approvalPolicy": "never",
+            "cwd": str(cwd), "ephemeral": context is None, "approvalPolicy": "never",
             "sandbox": "read-only", "environments": [], "dynamicTools": [],
             "selectedCapabilityRoots": [],
             "baseInstructions": rules, "developerInstructions": "只返回文档解读正文。",
@@ -174,10 +196,15 @@ async def _codex_text(backend: ModelBackend, content: str, rules: str,
         model = model_override or backend.config.model or backend.get_env("OPENAI_MODEL")
         if model and model != "default":
             params["model"] = model
-        started = await conn.request("thread/start", params, timeout=45)
+        if context and context.native_id:
+            params.pop('ephemeral', None)
+            params['threadId'] = context.native_id
+        started = await conn.request('thread/resume' if context and context.native_id else 'thread/start', params, timeout=45)
         tid = (started.get("thread") or {}).get("id")
         if not tid:
             raise RuntimeError("Codex did not start an isolated thread")
+        if context:
+            context.observed(tid)
         # 新版 Codex 始终声明 skills.list/read；它们只能读已发现的包。
         # 在提交第三方文档之前验证目录为空，不能仅假定临时 HOME 就足够。
         inventory = await conn.request("skills/list", {"cwds": [str(cwd)], "forceReload": True}, timeout=20)
@@ -200,12 +227,15 @@ async def _codex_text(backend: ModelBackend, content: str, rules: str,
                 await conn.respond(event["id"], error={"code": -32601, "message": "Text-only generation: tools are disabled"})
                 raise RuntimeError("Codex requested a tool during text-only generation")
             if method == "item/agentMessage/delta":
-                partial = (partial + str(data.get("delta") or ""))[:24000]
+                chunk = str(data.get("delta") or "")
+                partial = (partial + chunk)[:24000]
+                if on_activity: on_activity(chunk)
             elif method in {"item/started", "item/completed"}:
                 item = data.get("item") or {}
                 if item.get("type") == "agentMessage":
                     if method == "item/completed":
                         final = str(item.get("text") or "")[:24000]
+                        if on_activity: on_activity(final, replace=True)
                 elif item.get("type") not in {"userMessage", "reasoning", "contextCompaction"}:
                     raise RuntimeError("Unexpected Codex tool event in text-only generation")
             elif method == "error":
@@ -247,7 +277,8 @@ def _assistant_text(blocks: list[Any]) -> str:
 
 async def _qwen_text(backend: ModelBackend, content: str, rules: str,
                      home: Path, cwd: Path, model_override: str | None = None,
-                     images: list[ImageAttachment] | None = None) -> str:
+                     images: list[ImageAttachment] | None = None, context: TextOnlyContext | None = None,
+                     on_activity: Callable[..., None] | None = None) -> str:
     from qwen_code_sdk import query
     original_env = backend._build_env()
     env = _isolated_env(original_env, home)
@@ -270,6 +301,10 @@ async def _qwen_text(backend: ModelBackend, content: str, rules: str,
                    permission_mode="default", core_tools=["read_file"],
                    exclude_tools=["read_file"], can_use_tool=_deny_tool,
                    system_prompt=rules, max_session_turns=1)
+    if on_activity:
+        options['include_partial_messages'] = True
+    if context and context.native_id:
+        options['resume'] = context.native_id
     text = ""
     completed = False
     # JSON 中的 @ 转为等价转义，避免 CLI 将第三方文档误作 @文件附件展开。
@@ -286,9 +321,17 @@ async def _qwen_text(backend: ModelBackend, content: str, rules: str,
             refs.append(f'@reference-images/{filename}')
         prompt = '\n'.join(refs) + '\n\n' + prompt
     async with query(prompt, options) as result:
+        if context:
+            context.observed(result.get_session_id())
         async for message in result:
+            if context:
+                context.observed(message.get('session_id'))
             if message.get("type") == "assistant":
                 text = _assistant_text((message.get("message") or {}).get("content") or [])
+                if on_activity: on_activity(text, replace=True)
+            elif message.get('type') == 'stream_event' and on_activity:
+                delta = (message.get('event') or {}).get('delta') or {}
+                if delta.get('type') == 'text_delta': on_activity(str(delta.get('text') or ''))
             elif message.get("type") == "result":
                 if message.get("is_error") or message.get("subtype") != "success":
                     raise RuntimeError("Qwen text generation did not complete")
@@ -297,11 +340,15 @@ async def _qwen_text(backend: ModelBackend, content: str, rules: str,
                 break
     if not completed:
         raise RuntimeError("Qwen did not return a final result")
+    if context and not context.confirmed:
+        raise RuntimeError('Qwen did not confirm the role native session')
     return text
 
 
 async def _claude_text(backend: ModelBackend, content: str, rules: str,
-                       home: Path, cwd: Path, images: list[ImageAttachment] | None = None) -> str:
+                       home: Path, cwd: Path, images: list[ImageAttachment] | None = None,
+                       context: TextOnlyContext | None = None, on_activity: Callable[..., None] | None = None,
+                       model_override: str | None = None) -> str:
     from claude_agent_sdk import ClaudeAgentOptions, query
     from .base import resolve_claude_cli
     from .claude_code import ClaudeCodeOfficialBackend
@@ -314,15 +361,19 @@ async def _claude_text(backend: ModelBackend, content: str, rules: str,
         env.setdefault("ANTHROPIC_API_KEY", backend.config.api_key)
     if backend.config.base_url:
         env.setdefault("ANTHROPIC_BASE_URL", backend.config.base_url)
-    model = backend.get_env("ANTHROPIC_MODEL") or backend.config.model
+    model = model_override or backend.get_env("ANTHROPIC_MODEL") or backend.config.model
     options = ClaudeAgentOptions(
         cwd=str(cwd), env=env, cli_path=resolve_claude_cli(backend.config.cli_path),
         model=model if model and model != "default" else None,
         tools=[], allowed_tools=[], mcp_servers={}, setting_sources=[],
         permission_mode="default", can_use_tool=_deny_tool, system_prompt=rules,
         max_turns=1, extra_args={"strict-mcp-config": None, "disable-slash-commands": None,
-                                "no-session-persistence": None},
+                                **({} if context else {"no-session-persistence": None})},
     )
+    if on_activity:
+        options.include_partial_messages = True
+    if context and context.native_id:
+        options.resume = context.native_id
 
     async def prompt() -> AsyncIterator[dict[str, Any]]:
         blocks = [{"type": "image", "source": {"type": "base64", "media_type": image.mime_type,
@@ -334,8 +385,16 @@ async def _claude_text(backend: ModelBackend, content: str, rules: str,
     stream = query(prompt=prompt(), options=options)
     try:
         async for message in stream:
+            if context:
+                context.observed(getattr(message, 'session_id', None))
+                if type(message).__name__ == 'SystemMessage':
+                    context.observed((getattr(message, 'data', None) or {}).get('session_id'))
             if type(message).__name__ == "AssistantMessage":
                 text = _assistant_text(message.content)
+                if on_activity: on_activity(text, replace=True)
+            elif type(message).__name__ == 'StreamEvent' and on_activity:
+                delta = (getattr(message, 'event', None) or {}).get('delta') or {}
+                if delta.get('type') == 'text_delta': on_activity(str(delta.get('text') or ''))
             elif type(message).__name__ == "ResultMessage":
                 if message.is_error or message.subtype != "success":
                     raise RuntimeError("Claude text generation did not complete")
@@ -345,6 +404,8 @@ async def _claude_text(backend: ModelBackend, content: str, rules: str,
         await stream.aclose()
     if not completed:
         raise RuntimeError("Claude did not return a final result")
+    if context and not context.confirmed:
+        raise RuntimeError('Claude did not confirm the role native session')
     return text
 
 
@@ -353,7 +414,8 @@ async def send_text_only(backend: ModelBackend, *, content: str, constraints: st
                          on_delta: Callable[[StreamDelta], None],
                          model_override: str | None = None, reasoning_effort: str | None = None,
                          images: list[ImageAttachment] | None = None,
-                         owner_id: str = "local") -> None:
+                         owner_id: str = "local", context: TextOnlyContext | None = None,
+                         on_activity: Callable[..., None] | None = None) -> None:
     images = _reference_images(images)
     kind = getattr(backend.config.type, "value", backend.config.type)
     if kind not in TEXT_ONLY_BACKENDS:
@@ -377,23 +439,35 @@ async def send_text_only(backend: ModelBackend, *, content: str, constraints: st
                 on_delta(delta)
         await backend.send_message(messages=[], content=content, images=images or None,
             session_id=session_id, message_id=message_id, on_delta=receive,
+            model_override=model_override,
             constraints=constraints, extra_tools=None, on_tool_call=None)
         if errors:
             raise RuntimeError(('图片与手册答疑失败，请确认当前模型支持图片。' if images else '文档答疑失败。') + errors[-1][:500])
         return
-    with tempfile.TemporaryDirectory(prefix="awu-text-only-") as root:
-        home, cwd = Path(root) / "home", Path(root) / "work"
-        home.mkdir()
-        cwd.mkdir()
+    async def native(home: Path, cwd: Path) -> None:
+        home.mkdir(parents=True, exist_ok=True)
+        cwd.mkdir(parents=True, exist_ok=True)
         for directory in (".codex", ".qwen", ".claude", ".config"):
-            (home / directory).mkdir()
+            (home / directory).mkdir(exist_ok=True)
         runner = _codex_text if kind == "codex-office" else _qwen_text if kind == "qwen-code-cli" else _claude_text
         runtime: dict[str, Any] = {}
+        if on_activity:
+            runtime['on_activity'] = on_activity
         if images:
             runtime['images'] = images
-        if kind in {'codex-office', 'qwen-code-cli'} and model_override:
+        if model_override:
             runtime['model_override'] = model_override
         if kind == 'codex-office' and reasoning_effort:
             runtime['reasoning_effort'] = reasoning_effort
+        if context:
+            context.confirmed = False
+            runtime['context'] = context
         text = await runner(backend, content, constraints, home, cwd, **runtime)
+        if context and not context.native_id:
+            raise ValueError('角色原生运行未返回线程 ID；未伪造持久上下文')
         on_delta(StreamDelta(session_id, message_id, "text_delta", text=text[:24000]))
+    if context:
+        await native(context.home, context.cwd)
+    else:
+        with tempfile.TemporaryDirectory(prefix="awu-text-only-") as root:
+            await native(Path(root) / 'home', Path(root) / 'work')

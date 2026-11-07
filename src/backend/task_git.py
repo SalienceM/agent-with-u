@@ -1,0 +1,204 @@
+"""托管任务的 Git 边界。所有命令是固定 argv，快照只使用私有索引。"""
+from __future__ import annotations
+
+import hashlib
+import os
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import time
+import uuid
+from typing import Any
+
+from .deepseek_harness_state import reject_links
+from .session_collaboration_store import CollaborationError, fingerprint
+from .workspace_tools import relative_path
+
+MAX_BYTES = 100 * 1024 * 1024
+OID = re.compile(r'[0-9a-f]{40,64}')
+
+
+def canonical_path(path: str | Path) -> str:
+    target = Path(path)
+    if not target.is_absolute():
+        raise CollaborationError('项目目录必须是绝对路径')
+    reject_links(target)
+    return os.path.normcase(str(target.resolve()))
+
+
+class TaskGit:
+    def __init__(self, root: str) -> None:
+        self.root = canonical_path(root)
+        self.executable = shutil.which('git')
+        if not self.executable:
+            raise CollaborationError('本节点未安装 Git')
+        binary = Path(self.executable).resolve()
+        if Path(self.root) in binary.parents or os.name == 'nt' and binary.suffix.lower() != '.exe':
+            raise CollaborationError('Git 启动程序不可信')
+        self.overrides: list[str] = []
+
+    def run(self, *args: str, data: bytes | None = None, env: dict[str, str] | None = None,
+            allowed: tuple[int, ...] = (0,), timeout: float = 30, lifecycle: Any = None) -> bytes:
+        environment = {key: value for key, value in os.environ.items()
+                       if key.upper() in {'SYSTEMROOT', 'WINDIR', 'PATH', 'PATHEXT', 'TEMP', 'TMP'}}
+        environment.update(GIT_CONFIG_NOSYSTEM='1', GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_SYSTEM=os.devnull,
+            GIT_TERMINAL_PROMPT='0', GIT_NO_REPLACE_OBJECTS='1', GIT_NO_LAZY_FETCH='1', GIT_LITERAL_PATHSPECS='1', GIT_OPTIONAL_LOCKS='0',
+            GIT_AUTHOR_NAME='AWU Task', GIT_AUTHOR_EMAIL='task@agentwithu.local',
+            GIT_COMMITTER_NAME='AWU Task', GIT_COMMITTER_EMAIL='task@agentwithu.local', LC_ALL='C')
+        environment.update(env or {})
+        argv = [self.executable, '--no-pager', '-c', 'core.fsmonitor=false', '-c', f'core.hooksPath={os.devnull}',
+            '-c', 'protocol.allow=never', '-c', 'maintenance.auto=false', '-c', 'gc.auto=0',
+            '-c', 'submodule.recurse=false', '-c', 'commit.gpgSign=false', '-c', 'merge.gpgSign=false',
+            *self.overrides, *args]
+        try:
+            with subprocess.Popen(argv, cwd=self.root, env=environment, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0) as process:
+                try:
+                    if lifecycle: lifecycle(process.pid, False)
+                    stdout, stderr = process.communicate(input=data, timeout=timeout)
+                except BaseException:
+                    process.kill(); process.communicate()
+                    raise
+                finally:
+                    if lifecycle and process.returncode is not None: lifecycle(process.pid, True)
+                result = subprocess.CompletedProcess(argv, process.returncode, stdout, stderr)
+        except subprocess.TimeoutExpired as error:
+            raise CollaborationError('Git 操作超时，保留登记与目录；请核对原请求') from error
+        if len(result.stdout) > MAX_BYTES:
+            raise CollaborationError('Git 输出超过范围')
+        if result.returncode not in allowed:
+            raise CollaborationError(result.stderr.decode('utf-8', errors='replace')[:2000] or 'Git 操作失败')
+        return result.stdout
+
+    def merge(self, head: str, *, fast_forward: bool = False, lifecycle: Any = None) -> None:
+        if not OID.fullmatch(head): raise CollaborationError('候选提交无效')
+        self.disable_filters()
+        drivers = self.run('config', '--get-regexp', '^merge[.].*[.]driver$', allowed=(0, 1))
+        if drivers: raise CollaborationError('仓库配置了外部 merge driver，请先显式处理；未执行仓库脚本')
+        self.run('merge', '--ff-only' if fast_forward else '--no-ff', '--no-edit', '--no-stat', '--no-overwrite-ignore', head,
+                 allowed=(0,) if fast_forward else (0, 1), timeout=60, lifecycle=lifecycle)
+
+    def disable_filters(self) -> None:
+        # worktree checkout 不能运行源仓库配置中的 smudge/process 脚本。
+        keys = self.run('config', '--local', '--name-only', '--get-regexp', '^filter[.]', allowed=(0, 1)).decode().splitlines()
+        names = {key.rsplit('.', 1)[0] for key in keys}
+        if len(names) > 100:
+            raise CollaborationError('Git 过滤器配置超过范围')
+        self.overrides = [value for name in names for prop in ('smudge=', 'clean=', 'process=', 'required=false')
+                          for value in ('-c', name + '.' + prop)]
+
+    def repository(self) -> dict[str, Any]:
+        root = canonical_path(self.run('rev-parse', '--show-toplevel').decode('utf-8').strip())
+        if root != self.root:
+            raise CollaborationError('请选择 Git 仓库根目录：' + root)
+        common_value = Path(self.run('rev-parse', '--git-common-dir').decode('utf-8').strip())
+        common = canonical_path(common_value if common_value.is_absolute() else Path(self.root) / common_value)
+        git_dir = canonical_path(self.run('rev-parse', '--absolute-git-dir').decode('utf-8').strip())
+        count = 0; deadline = time.monotonic() + 8
+        for folder in dict.fromkeys((common, git_dir)):
+            for base, dirs, files in os.walk(folder, followlinks=False):
+                count += len(dirs) + len(files)
+                if count > 20000 or time.monotonic() > deadline:
+                    raise CollaborationError('Git 元数据超过检查范围')
+                for name in dirs + files:
+                    reject_links(Path(base) / name)
+                if Path(base).name == 'info' and any(name in files for name in ('alternates', 'http-alternates')):
+                    raise CollaborationError('不支持外部 Git 对象库')
+        head = self.run('rev-parse', '--verify', 'HEAD^{commit}').decode().strip()
+        if not OID.fullmatch(head):
+            raise CollaborationError('没有可用基线提交，请先明确准备仓库')
+        branch = self.run('symbolic-ref', '--quiet', '--short', 'HEAD', allowed=(0, 1)).decode('utf-8').strip()
+        stat = Path(common).stat()
+        return {'root': root, 'commonDir': common, 'gitDir': git_dir, 'head': head, 'branch': branch,
+                'repositoryId': fingerprint([common, stat.st_dev, stat.st_ino])}
+
+    def dirty(self) -> list[dict]:
+        tokens = self.run('status', '--porcelain=v1', '-z', '--untracked-files=all', '--ignore-submodules=none').split(b'\0')
+        names: dict[str, str] = {}; index = 0
+        while index < len(tokens) and tokens[index]:
+            token = tokens[index]; index += 1
+            status = token[:2].decode('ascii'); name = token[3:].decode('utf-8', errors='strict')
+            names[name] = status
+            if 'R' in status or 'C' in status:
+                names[tokens[index].decode('utf-8')] = 'D'; index += 1
+            if len(names) > 500:
+                raise CollaborationError('未提交路径超过500项，请缩小项目范围或先提交')
+        rows = []; total = 0
+        for name, status in sorted(names.items()):
+            blocked = ''; digest = ''; size = 0
+            try:
+                relative_path(name)
+                if Path(name).suffix.lower() in {'.pem', '.key', '.pfx', '.p12'} or any(part.lower() in {'credentials', 'credentials.json', 'secrets.json', 'id_rsa', 'id_ed25519', 'id_ecdsa'} for part in Path(name).parts):
+                    raise CollaborationError('凭据路径不能进入任务快照')
+                path = Path(self.root) / name; reject_links(path)
+                if path.is_dir(): raise CollaborationError('目录或子模块不能进入文件快照')
+                if path.exists():
+                    size = path.stat().st_size; total += size
+                    if size > 20 * 1024 * 1024 or total > MAX_BYTES: raise CollaborationError('文件超过快照大小限制')
+                    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+            except (ValueError, OSError) as error:
+                blocked = str(error)[:200]
+            rows.append({'path': name, 'status': status, 'sha256': digest, 'bytes': size, 'blocked': blocked})
+        return rows
+
+    def inspect(self) -> dict:
+        self.disable_filters()
+        repo = self.repository(); dirty = self.dirty()
+        self.run('worktree', 'list', '--porcelain')
+        view = {**repo, 'dirty': dirty}
+        view['fingerprint'] = fingerprint(view)
+        return view
+
+    def snapshot(self, expected: dict, selected: list[str], scratch: Path) -> str:
+        if self.inspect()['fingerprint'] != expected['fingerprint']:
+            raise CollaborationError('源目录或提交已变化，请重新预览')
+        if not selected: return expected['head']
+        if len(selected) > 100 or len(set(selected)) != len(selected):
+            raise CollaborationError('快照最多100条不同路径')
+        rows = {row['path']: row for row in expected['dirty']}
+        for name in selected:
+            relative_path(name)
+            if name not in rows or rows[name]['blocked']:
+                raise CollaborationError('所选路径不可快照：' + name)
+            if self.run('check-ignore', '--no-index', '--', name, allowed=(0, 1), env={'GIT_LITERAL_PATHSPECS': '0'}):
+                raise CollaborationError('忽略路径不能进入任务快照：' + name)
+        scratch.mkdir(parents=True, exist_ok=True); reject_links(scratch)
+        private_index = scratch / ('index-' + uuid.uuid4().hex)
+        environment = {'GIT_INDEX_FILE': str(private_index)}
+        try:
+            self.run('read-tree', expected['head'], env=environment)
+            for name in selected:
+                path = Path(self.root) / name; reject_links(path)
+                if not path.exists():
+                    self.run('update-index', '--force-remove', '--', name, env=environment); continue
+                data = path.read_bytes()
+                if hashlib.sha256(data).hexdigest() != rows[name]['sha256']:
+                    raise CollaborationError('快照文件已变化：' + name)
+                blob = self.run('hash-object', '-w', '--stdin', data=data).decode().strip()
+                entry = self.run('ls-files', '-s', '--', name).decode()
+                mode = entry[:6] if entry else '100644'
+                if mode not in {'100644', '100755'}:
+                    raise CollaborationError('只支持普通文件快照')
+                self.run('update-index', '--add', '--cacheinfo', mode, blob, name, env=environment)
+            tree = self.run('write-tree', env=environment).decode().strip()
+            if self.inspect()['fingerprint'] != expected['fingerprint']:
+                raise CollaborationError('快照期间源目录变化，未创建任务')
+            return self.run('commit-tree', tree, '-p', expected['head'], data=b'AWU selected-path task baseline\n').decode().strip()
+        finally:
+            # 只删除本次生成的私有索引；绝不触碰主索引。
+            private_index.unlink(missing_ok=True)
+
+    def create(self, expected: dict, root: Path, branch: str, selected: list[str], scratch: Path) -> dict:
+        if root.exists(): raise CollaborationError('任务目录已存在，保留原输出；未认领或覆盖')
+        reject_links(root)
+        self.run('check-ref-format', '--branch', branch)
+        if self.run('show-ref', '--verify', '--hash', 'refs/heads/' + branch, allowed=(0, 1, 128)):
+            raise CollaborationError('任务分支已存在，未覆盖')
+        baseline = self.snapshot(expected, selected, scratch)
+        root.parent.mkdir(parents=True, exist_ok=True)
+        self.run('worktree', 'add', '-b', branch, str(root), baseline, timeout=60)
+        actual = TaskGit(str(root)).inspect()
+        if actual['head'] != baseline or actual['commonDir'] != expected['commonDir'] or actual['branch'] != branch or actual['dirty']:
+            raise CollaborationError('任务 worktree 核验未通过；保留目录等待核对')
+        return {**actual, 'baseline': baseline}

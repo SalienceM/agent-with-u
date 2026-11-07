@@ -2,7 +2,7 @@
 
 ## 构建方式
 
-Windows 的普通、sidecar-only、fat/lite 包装和 Web 冻结构建已接入共享门禁；Linux Web 构建也已接线，但本次没有完成 Linux 原生冻结验收。`build_fat_all.bat` 通过现有子脚本失败传播复用这些检查。
+Windows 的普通、sidecar-only、fat/lite 包装和 Web 冻结构建已接入共享门禁；Linux Web 构建也已接线。下文 2026-10-09 记录保留当时未完成 Linux 验收的事实；2026-11-04 已另行完成 Linux 冻结后端及外部 Harness 六场景验证，见 [外部运行时验证记录](../openspec/changes/archive/2026-11-04-externalize-harness-runtime/verification.md)，不等于完整 Linux Web 发布/安装验收。`build_fat_all.bat` 通过现有子脚本失败传播复用这些检查。
 
 使用选定构建 Python 环境运行构建脚本。`prepare_backend_build.py` 每次用同一解释器同步 `requirements.txt`，再验证版本约束、必需导入及 `pip check`。不能再通过老依赖抽查跳过新依赖。`requirements.txt` 与 `pyproject.toml` 的 pathspec、pywinpty 重叠约束保持一致。
 
@@ -25,7 +25,9 @@ python scripts/prepare_deepseek_harness.py --verify-staged build/deepseek-harnes
 python scripts/prepare_backend_build.py --check-only
 ```
 
-Linux 使用 `--platform linux-x64` 及 Linux wheel。不能用未经审计的重建 wheel 替换固定散列，也不能跳过 `verify_bundle`。恢复来源和校验结果应保留；Windows 校验不代表 Linux 制品已准备。完整恢复所有平台 wheels、重建桥后，可通过 `prepare_harness_bundle.py` 重新生成清单。
+Linux 使用 `--platform linux-x64` 及 Linux wheel。不能用未经审计的重建 wheel 替换固定散列。旧源码/Docker 配套模式继续使用 `verify_bundle`；冻结收集和普通包自检使用 `verify_adapter`，只检查 SDK、桥、许可证和外部 CLI 契约，不要求机器已装可选 CLI。`deploy/deepseek-harness.external.json` 必须随冻结包和 Docker 适配层携带。恢复来源和校验结果应保留；Windows 校验不代表 Linux 制品已准备。完整恢复所有平台 wheels、重建桥后，可通过 `prepare_harness_bundle.py` 重新生成清单。
+
+冻结包同时排除 `faster_whisper`、`ctranslate2`、`onnxruntime`、`av` 和 `deepseek_harness_runtime`，在实际 TOC 上再次拒绝混入。没有卸载构建机依赖，也不排除 numpy/Pillow 等共享库。本地语音沿用外部系统 Python；Harness 见 [外部运行时与验收](harness-external-runtime.md)。
 
 原 Workspace Kit 仍调用根目录 `build_all.bat`，无需改绑定或重建 Session。Kit 的完成日志和稳定安装包双重判定仍然保留；退出码 7 表示构建未形成成功证据，具体根因需查看该次运行的 `stdout.log`/`stderr.log`。
 
@@ -109,3 +111,15 @@ Windows Web SHA-256：`bb2a99264b5da4a143ad329c69edbe5ea0873eab57d59cea35e436eff
 - 额外对已安装 exe 运行临时用户环境门禁：首轮组件通过、启动提前退出、清理确认成功，保留失败报告 `.qa/package-build/installed-backend.readiness.json`；独立复核四个阶段全部通过，报告 `.qa/package-build/installed-backend-recheck.readiness.json`。首轮退出原因未定位，不将复核通过描述为从未失败。
 
 任务 4.3、4.4 仍保持未完成：真实用户安装与连接已通过，但不能冒充任务原要求的完全隔离安装（安装器会写 HKCU 卸载信息和快捷方式）；Linux 完整冻结验收仍缺受支持环境。未发布、未归档，也未修改另一个 change。
+
+## 定时任务制品补充检查
+
+定时功能的冻结包自检会导入四个调度模块，并从 tzdata 包内实际读取 UTC、Asia/Shanghai、America/New_York 时区文件；宿主操作系统的时区数据库不能替代随包数据。两个 PyInstaller spec 显式收集这些模块。
+
+除通用启动探针外，可运行以下只读检查，核对实际 Backend 归档及 `index.html` 引用的前端 bundle 是否包含定时入口和两份内置文档：
+
+```powershell
+python scripts/check_session_schedule_package.py --backend dist/agent-with-u-backend.exe --frontend frontend/dist
+```
+
+报告包含参与检查文件的 SHA-256。该命令不启动程序、不发布、不安装；即使通过，也只证明 sidecar 与前端输入，不能证明 MSI/NSIS 嵌入了同次构建。旧 sidecar 缺少模块时必须重建；不能用旧包自带的旧自检结果替代新功能检查。发布前还需对最终安装器做隔离安装和离线入口验证，参见 [定时任务发布说明](session-scheduled-prompts-release.md)。

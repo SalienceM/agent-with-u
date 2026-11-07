@@ -17,5 +17,7 @@ test('feedback preserves unrelated faults and does not infer compare success', (
   assert.equal(filePanelFeedback({ ...input, gitError: '' }).some(row => row.id === 'directory:src'), true);
   assert.equal(filePanelFeedback({ ...input, compared: false }).some(row => row.id === 'conflicts'), false);
   assert.match(filePanelComparison(false, { differs: 0, conflict: 0, cloud: 0, localOnly: 0 }), /尚未比对/);
-  assert.match(filePanelComparison(true, { differs: 1, conflict: 2, cloud: 3, localOnly: 4 }), /冲突 2/);
+  assert.equal(filePanelComparison(true, { differs: 1, conflict: 2, cloud: 3, localOnly: 4 }),
+    '比对结果 · 不同 10 · 冲突 2 · 仅本机 4 · 仅执行端 3');
+  assert.match(filePanelComparison(true, { differs: 0, conflict: 0, cloud: 2, localOnly: 1 }), /不同 3/);
 });

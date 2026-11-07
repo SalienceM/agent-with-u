@@ -1,0 +1,16 @@
+[
+  {"rules":{"version":1,"prefixes":[],"excludes":[]},"cases":[["data/a",false,true],["src",true,true]]},
+  {"rules":{"version":1,"prefixes":["src/","config","docs/manual"],"excludes":[]},"cases":[
+    ["src",true,true],["src",false,false],["src/a.ts",false,true],["src2/a",false,false],
+    ["config.json",false,true],["config-old/x",false,true],["docs",true,true],
+    ["docs",false,false],["docs/manual.md",false,true],["docs/other",true,false],["data",true,false]]},
+  {"rules":{"version":1,"prefixes":[],"excludes":["*.log","**/cache/","/root.tmp","build/","!keep.log"]},"cases":[
+    ["nested/error.log",false,false],["keep.log",false,true],["nested/keep.log",false,true],
+    ["cache",true,false],["nested/cache/x",false,false],["nested/cache",false,true],
+    ["root.tmp",false,false],["nested/root.tmp",false,true],["build/x",false,false],["build",false,true]]},
+  {"rules":{"version":1,"prefixes":[],"excludes":["src/*/test?.ts","a/**/b.txt","data/","!data/keep"]},"cases":[
+    ["src/x/test1.ts",false,false],["src/x/y/test1.ts",false,true],["src/x/test12.ts",false,true],
+    ["a/b.txt",false,false],["a/x/y/b.txt",false,false],["data",true,false],["data/keep",false,false]]},
+  {"rules":{"version":1,"prefixes":[],"excludes":["data/","!data/","data/*","!data/keep"]},"cases":[
+    ["data",true,true],["data/keep",false,true],["data/drop",false,false],["DATA/drop",false,true]]}
+]

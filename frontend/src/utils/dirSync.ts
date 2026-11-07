@@ -18,6 +18,9 @@ import { sha256BlobHex } from './sha256';
 import { uuid } from './uuid';
 import { yieldToUi } from './cooperativeWork';
 import { isIgnored } from './dirSyncPolicy';
+import { hasScanRules, scanAllows, type SyncScanRules } from './syncScanRules';
+
+export interface ScanOptions { hash?: boolean; signal?: AbortSignal; rules?: SyncScanRules }
 import type { LocalDocumentAdapter } from './localDocuments';
 import { BrowserDocumentAdapter } from './browserLocalDocuments';
 import { TauriDocumentAdapter } from './tauriLocalDocuments';
@@ -113,7 +116,7 @@ export interface LocalFs {
   /** 独立于传输接口的有版本编辑路径；不允许回落 writeFile。 */
   documentAdapter?(): Promise<LocalDocumentAdapter>;
   reviewAdapter?(scopeKey: string): Promise<ReviewAdapter>;
-  scan(ignore: string[], includeGit?: boolean, options?: { hash?: boolean; signal?: AbortSignal }): Promise<Manifest>;
+  scan(ignore: string[], includeGit?: boolean, options?: ScanOptions): Promise<Manifest>;
   /** 列出某相对目录的直接子项(懒加载逐层浏览用,不递归、不算哈希)。 */
   listDir(rel: string): Promise<LocalEntry[]>;
   readFile(rel: string): Promise<string>; // base64
@@ -177,15 +180,20 @@ export class TauriLocalFs implements LocalFs {
     const adapter = await TauriDocumentAdapter.connect(this.dir, tauriInvoke);
     return new TauriSyncReview(adapter.bindingId, adapter.canonicalRoot, tauriInvoke, scopeKey);
   }
-  async scan(ignore: string[], includeGit = false, options: { hash?: boolean; signal?: AbortSignal } = {}): Promise<Manifest> {
-    const r = await tauriInvoke<{ files: Manifest }>('dir_sync_scan', {
+  async scan(ignore: string[], includeGit = false, options: ScanOptions = {}): Promise<Manifest> {
+    options.signal?.throwIfAborted();
+    const scoped = hasScanRules(options.rules);
+    const r = await tauriInvoke<{ files: Manifest; scanRules?: SyncScanRules }>(scoped ? 'dir_sync_scan_scoped' : 'dir_sync_scan', {
       dir: this.dir,
       ignore,
       includeGit,
       hashFiles: options.hash !== false,
+      ...(scoped ? { rules: options.rules } : {}),
     });
-    this._scanCache = r.files || {};
-    return this._scanCache;
+    options.signal?.throwIfAborted();
+    if (scoped && JSON.stringify(r.scanRules) !== JSON.stringify(options.rules)) throw new Error('桌面端未确认扫描规则，请更新应用');
+    if (!scoped) this._scanCache = r.files || {};
+    return r.files || {};
   }
   // Tauri 无逐层列目录命令,用一次性扫描结果推导层级(本地磁盘,代价可接受)。
   async listDir(rel: string): Promise<LocalEntry[]> {
@@ -249,7 +257,7 @@ export class BrowserLocalFs implements LocalFs {
       }
     }, scopeKey);
   }
-  async scan(ignore: string[], includeGit = false, options: { hash?: boolean; signal?: AbortSignal } = {}): Promise<Manifest> {
+  async scan(ignore: string[], includeGit = false, options: ScanOptions = {}): Promise<Manifest> {
     const out: Manifest = {};
     await this._walk(this.handle, '', ignore, includeGit, out, options);
     return out;
@@ -272,7 +280,7 @@ export class BrowserLocalFs implements LocalFs {
     ignore: string[],
     includeGit: boolean,
     out: Manifest,
-    options: { hash?: boolean; signal?: AbortSignal },
+    options: ScanOptions,
   ): Promise<void> {
     let count = 0;
     for await (const [name, h] of dir.entries()) {
@@ -280,6 +288,7 @@ export class BrowserLocalFs implements LocalFs {
       if (++count % 64 === 0) await yieldToUi(options.signal);
       const rel = base ? `${base}/${name}` : name;
       if (isIgnored(rel, ignore, includeGit)) continue;
+      if (!scanAllows(options.rules, rel, h.kind === 'directory')) continue;
       if (h.kind === 'directory') {
         await this._walk(h, rel, ignore, includeGit, out, options);
       } else {
@@ -651,9 +660,33 @@ export class ManagedBrowserLocalFs implements LocalFs {
     await idbStoreDeleteMany(IDB_CHUNK_STORE, chunks.map((item) => item.key));
   }
 
-  async scan(ignore: string[], includeGit = false, options: { hash?: boolean; signal?: AbortSignal } = {}): Promise<Manifest> {
+  async scan(ignore: string[], includeGit = false, options: ScanOptions = {}): Promise<Manifest> {
     const out: Manifest = {};
-    const records = await this.files();
+    // 先按索引键筛选，范围外的 Blob 不进入 JS，也不参与哈希。
+    const db = await idbOpen();
+    const records = await new Promise<ManagedFileRecord[]>((resolve, reject) => {
+      const tx = db.transaction(IDB_FILE_STORE, 'readonly'), store = tx.objectStore(IDB_FILE_STORE);
+      const found: ManagedFileRecord[] = [];
+      const prefixes = options.rules?.prefixes.length ? options.rules.prefixes : [''];
+      // 合并重叠前缀，直接使用主键范围，不逐项访问其他数据目录的键。
+      for (const prefix of prefixes.filter((p, i) => !prefixes.some((other, j) => j !== i && p.startsWith(other) && (other !== p || j < i)))) {
+        const key = managedKey(this.workspace, prefix);
+        const request = store.openKeyCursor(IDBKeyRange.bound(key, key + '\uffff'));
+        request.onsuccess = () => {
+          if (options.signal?.aborted) { tx.abort(); return; }
+          const cursor = request.result;
+          if (!cursor) return;
+          const rel = String(cursor.primaryKey).slice(managedKey(this.workspace, '').length);
+          if (!isIgnored(rel, ignore, includeGit) && scanAllows(options.rules, rel)) {
+            const read = store.get(cursor.primaryKey);
+            read.onsuccess = () => { if (read.result) found.push(read.result); };
+          }
+          cursor.continue();
+        };
+      }
+      tx.oncomplete = () => { db.close(); resolve(found); };
+      tx.onabort = tx.onerror = () => { db.close(); reject(tx.error || new DOMException('Aborted', 'AbortError')); };
+    });
     // 分批计算哈希，避免大量小文件同时把平板主线程和内存打满。
     for (let start = 0; start < records.length; start += 8) {
       await yieldToUi(options.signal);

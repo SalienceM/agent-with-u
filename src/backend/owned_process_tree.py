@@ -8,7 +8,10 @@ from typing import Any
 
 
 class OwnedProcessTree:
-    def __init__(self, process: Any) -> None:
+    def __init__(self, process: Any, *, suspended_root: bool = False) -> None:
+        # 仅限调用方以 CREATE_SUSPENDED 创建、且尚未恢复的 root。
+        # 在首条用户代码前绑定无 breakaway 的 Job，后代归属不再依赖可复用的 PID。
+        self.suspended_root = suspended_root
         self.process = process
         self.handles: dict[int, Any] = {}
         self.complete = True
@@ -63,16 +66,22 @@ class OwnedProcessTree:
             limits = ExtendedLimits(); limits.basic.flags = 0x2000  # KILL_ON_JOB_CLOSE; no breakaway
             if job and root and kernel.SetInformationJobObject(job, 9, ctypes.byref(limits), ctypes.sizeof(limits)) and kernel.AssignProcessToJobObject(job, root):
                 self.job, self.accounting_type = job, Accounting
+                if suspended_root:
+                    self.handles[process.pid] = root
+                    root = None  # 持有绑定 Job 的同一个原子进程句柄，直到退出确认。
             else:
                 if job:
                     kernel.CloseHandle(job)
                 self.complete = False
             if root:
                 kernel.CloseHandle(root)
-            self.capture()
+            if not suspended_root:
+                self.capture()
 
     def capture(self) -> None:
-        if not self.kernel:
+        if not self.kernel or self.suspended_root:
+            # Windows 快照保留创建时的 parent PID；旧父亲退出后，该数字可能
+            # 被本次 root 复用。不能把其他 Job 的存活进程纳入退出/终止范围。
             return
         import ctypes
         kernel = self.kernel
@@ -113,7 +122,7 @@ class OwnedProcessTree:
         self.capture()
         if self.job:
             self.kernel.TerminateJobObject(self.job, 1)
-        if self.kernel and proc.returncode is None and proc.pid in self.handles:
+        if self.kernel and not self.suspended_root and proc.returncode is None and proc.pid in self.handles:
             killer = None
             try:
                 killer = await asyncio.create_subprocess_exec('taskkill', '/F', '/T', '/PID', str(proc.pid),

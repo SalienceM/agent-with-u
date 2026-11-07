@@ -1,5 +1,6 @@
 import React, { useState, useCallback, useEffect, useLayoutEffect, useRef, useMemo } from 'react';
 import { api, getCurrentUserProfile } from '../api';
+import type { ImageDraftContext } from '../utils/harnessImageSubmission';
 import { handoffParticipants, handoffScope } from '../utils/workbenchHandoffState';
 import { backendCatalog } from '../backendCatalog';
 import { mergeSessionRouting, isSessionMetaReady } from '../utils/sessionRouting';
@@ -7,10 +8,17 @@ import type { CurrentUserProfile, FollowUpCapabilities } from '../api';
 import { MessageBubble } from './MessageBubble';
 import { ChatInput, type ChatInputHandle } from './ChatInput';
 import { PermissionGate } from './PermissionGate';
+import { UserInteractionsPanel, focusUserInteraction } from './UserInteractionsPanel';
+import { KitDelegationStatus } from './KitDelegationFeedback';
+import { RoleReviewPanel } from './RoleReviewPanel';
+import { RoleSessionNotice } from './RoleSessionNotice';
+import { ProjectTasksPanel } from './ProjectTasksPanel';
+import { OPEN_KIT_RECEIPT } from '../utils/kitDelegationFeedback';
 import { LoopPanel } from './LoopPanel';
 import { LoopControlStatus } from './LoopControlStatus';
 import { useLoopControl } from '../hooks/useLoopControl';
 import { SeqTaskPanel } from './SeqTaskPanel';
+import { SessionSchedules } from './SessionSchedules';
 import type { SeqTaskT } from './SeqTaskPanel';
 import { WorkspaceKitsPanel } from './WorkspaceKitsPanel';
 import { useChat } from '../hooks/useChat';
@@ -139,6 +147,7 @@ export interface ChatPaneProps {
   isMobile: boolean;
   onRequestNewSession: () => void;          // 用户在这个 pane 想新建 session 时
   onSessionDeleted?: (id: string) => void;  // 删除 session 后回调,清掉这个 pane
+  onOpenSession?: (id: string) => void;
   // 系统级 toast / 错误提示(预留, 当前未使用)
   onToast?: (type: 'success' | 'error' | 'info', message: string) => void;
   // 流式状态变化回调,App 用来聚合所有 pane 的 streaming 状态
@@ -172,6 +181,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
   onGhostStateChange,
   onAdjustFontSize,
   onRequestFileFocus,
+  onOpenSession,
 }) => {
   // ── pane 自己的 session 详情(workingDir / backendId / skip / sandbox) ──
   const [activeSession, setActiveSession] = useState<any | null>(() => sessionId ? api.peekSessionMeta(sessionId) : null);
@@ -184,6 +194,8 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
   const refreshBackends = useCallback(() => refreshBackendsRef.current(), []);
   const [loopRunning, setLoopRunning] = useState(false);
   const [realtimeVoiceActive, setRealtimeVoiceActive] = useState(false);
+  const [reviewOpen, setReviewOpen] = useState(false), [latestReview, setLatestReview] = useState('');
+  useEffect(() => { setReviewOpen(false); setLatestReview(''); }, [sessionId]);
   // 权限 state: 初值从 session 读,变化时持久化
   const [skipPermissions, setSkipPermissions] = useState(true);
   // 可见消息条数(切换 session / 切回历史时只显示最近几条)
@@ -200,6 +212,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
   const prevSessionRef = useRef<string | null>(sessionId);
   const onFocusRef = useRef(onFocus);
   const chatInputRef = useRef<ChatInputHandle>(null);
+  const handleReviewAnswer = useCallback((messageId: string) => { chatInputRef.current?.startReview([messageId]); }, []);
   const onRequestFileFocusRef = useRef(onRequestFileFocus);
   onFocusRef.current = onFocus;
   onRequestFileFocusRef.current = onRequestFileFocus;
@@ -470,6 +483,16 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
   const [followUpRefresh, setFollowUpRefresh] = useState(0);
   const hasPendingSeqTasks = seqTasks.some(task => task.status === 'pending' && !task.syncing);
   const [workspaceKitsOpen, setWorkspaceKitsOpen] = useState(false);
+  const [kitReceiptTarget, setKitReceiptTarget] = useState<{ runId?: string; stepId?: string }>({});
+  useEffect(() => {
+    const open = (event: Event) => {
+      const target = (event as CustomEvent).detail;
+      if (target.sessionId !== sessionId || (target.executor || 'local') !== (activeSession?.execKey || 'local')) return;
+      setKitReceiptTarget(target); setWorkspaceKitsOpen(true);
+    };
+    window.addEventListener(OPEN_KIT_RECEIPT, open);
+    return () => window.removeEventListener(OPEN_KIT_RECEIPT, open);
+  }, [sessionId, activeSession?.execKey]);
   useEffect(() => {
     if (!config.workspaceKitsEnabled) setWorkspaceKitsOpen(false);
   }, [config.workspaceKitsEnabled]);
@@ -602,8 +625,9 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
     textAttachments?: TextAttachment[],
     kitApprovalDelegation?: boolean,
     skillInvocation?: import('../utils/skillCommands').SkillInvocation,
+    imageDraft?: ImageDraftContext,
   ) => {
-    return sendMessageRef.current(content, images, textAttachments, kitApprovalDelegation, skillInvocation);
+    return sendMessageRef.current(content, images, textAttachments, kitApprovalDelegation, skillInvocation, imageDraft);
   }, []); // ★ 通过 ref 调用，无需依赖 chat
 
   // 模型忙碌时 ChatInput 会把后续输入送到这里；无需显式开启模式。
@@ -611,12 +635,16 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
     content: string,
     images?: any[],
     textAttachments?: TextAttachment[],
-    _activateChain = true,
+    imageDraft?: ImageDraftContext,
   ) => {
     if (!sessionId) return;
     const text = (content || '').trim();
     if (!text && !(images && images.length) && !textAttachments?.length) return;
+    if (images?.length && effectiveBackends.find(item => item.id === activeBackendId)?.type === 'deepseek-harness') {
+      return api.harnessImageSend({ sessionId, backendId: activeBackendId, content: text, images, textAttachments }, true, imageDraft);
+    }
     const queuedSessionId = sessionId;
+    if (imageDraft) return api.composerSend({ sessionId, backendId: activeBackendId, content: text, images, textAttachments }, true, imageDraft);
     const optimisticId = `sync-${uuid()}`;
     const optimisticTask: SeqTaskT = {
       id: optimisticId,
@@ -655,7 +683,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
       setSeqTasks((current) => current.filter((task) => task.id !== optimisticId));
       setSeqQueueError(`序列任务同步失败：${error instanceof Error ? error.message : String(error)}`);
     });
-  }, [sessionId]);
+  }, [sessionId, activeBackendId, effectiveBackends]);
 
   // Redo 与输入框的默认投递规则保持一致：空闲时立即发送；当前正在回答或已有
   // 队列时排到下一轮，不能因为点历史消息而意外中断正在生成的内容。
@@ -923,6 +951,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
           <>
             <WorkspaceKitsPanel
               sessionId={sessionId}
+              targetRunId={kitReceiptTarget.runId} targetStepId={kitReceiptTarget.stepId}
               open={workspaceKitsOpen}
               onClose={() => setWorkspaceKitsOpen(false)}
             />
@@ -952,6 +981,13 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
       }}
     >
       <TokenUsageMonitor sessionId={sessionId} placement="floating" />
+      {sessionId && activeSession?.sessionType !== 'loop' && activeSession?.relationKind !== 'review' &&
+        <SessionSchedules key={historyKey} session={sessionId} executor={activeSession?.execKey || 'local'} owner={currentUser.userId} onStop={chat.abort}
+          onLocate={messageId => {
+            const target = scrollContainerRef.current?.querySelector<HTMLElement>(`[data-schedule-message="${CSS.escape(messageId)}"]`);
+            if (!target) return false;
+            autoScrollRef.current = false; target.scrollIntoView({ block: 'center' }); return true;
+          }} onPending={() => { scrollToBottom(); focusUserInteraction(sessionId); }} />}
       {handoffStatus}
       {nodeBackendsError && <div role="alert" style={{ padding: 8, color: '#f85149', fontSize: 12 }}>{nodeBackendsError}</div>}
       {/* ---- 消息列表 ---- */}
@@ -986,6 +1022,8 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
                     加载会话中…
                   </div>
                 </>
+              ) : activeSession?.relationKind === 'review' ? (
+                <RoleSessionNotice empty onReturn={activeSession.parentSessionId && onOpenSession ? () => onOpenSession(activeSession.parentSessionId) : undefined} />
               ) : (
                 <>
                   <div style={{ fontSize: 18, fontWeight: 600, color: 'var(--theme-text-muted, #8c959f)' }}>
@@ -1052,6 +1090,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
             return (
               <React.Fragment key={msg.id}>
                 {showDate && <MessageDateDivider timestamp={msg.timestamp} />}
+                {msg.scheduleRef && <div data-schedule-message={msg.id} />}
                 <MessageBubble
                   message={msg}
                   currentUser={currentUser}
@@ -1066,6 +1105,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
                   onFocusFile={handleFocusLinkedFile}
                   onRedoMessage={handleRedoMessage}
                   onInsertCommand={handleInsertCommand}
+                  onReviewAnswer={activeSession?.relationKind !== 'review' ? handleReviewAnswer : undefined}
                 />
               </React.Fragment>
             );
@@ -1200,10 +1240,25 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
       )}
 
       {/* ---- 输入栏 ---- */}
-      <ChatInput
+      {activeSession?.relationKind === 'review' ? <div>
+        {sessionId && <UserInteractionsPanel key={sessionId} sessionId={sessionId} runtimeKey={`${activeBackendId}:${skipPermissions}`} compact />}
+        {chat.messages.length > 0 && <RoleSessionNotice onReturn={activeSession.parentSessionId && onOpenSession ? () => onOpenSession(activeSession.parentSessionId) : undefined} />}
+      </div> : <ChatInput
         ref={chatInputRef}
+        workflowTools={sessionId ? <>
+          <ProjectTasksPanel session={sessionId} executor={activeSession?.execKey || 'local'} backendId={activeBackendId} backends={effectiveBackends} onOpenSession={onOpenSession} />
+          <RoleReviewPanel session={sessionId} executor={activeSession?.execKey || 'local'}
+            open={reviewOpen} onOpen={() => setReviewOpen(true)} onClose={() => setReviewOpen(false)} latestRequest={latestReview}
+            onReference={reference => chatInputRef.current?.insertOpinion(reference)} onOpenSession={onOpenSession}
+            onStartReview={targets => chatInputRef.current?.startReview(targets, true)} />
+          <span style={{ flex: 1 }} />
+          <UserInteractionsPanel key={sessionId} sessionId={sessionId} runtimeKey={`${activeBackendId}:${skipPermissions}`} compact />
+          <KitDelegationStatus sessionId={sessionId} executor={activeSession?.execKey || 'local'} compact />
+        </> : undefined}
         onSend={handleUserSend}
         onAbort={chat.abort}
+        onReviewSubmitted={setLatestReview}
+        onOpenOpinions={() => setReviewOpen(true)}
         isStreaming={chat.isStreaming}
         backends={effectiveBackends}
         activeBackendId={activeBackendId}
@@ -1250,7 +1305,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
           },
           onActiveChange: setRealtimeVoiceActive,
         }}
-      />
+      />}
 
       {/* Session 内只保留 Session 专属工具；“俺寻思”统一从 App 顶栏进入。 */}
       {sessionId && (
@@ -1265,6 +1320,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
           {config.workspaceKitsEnabled && (
             <WorkspaceKitsPanel
               sessionId={sessionId}
+              targetRunId={kitReceiptTarget.runId} targetStepId={kitReceiptTarget.stepId}
               open={workspaceKitsOpen}
               onClose={() => setWorkspaceKitsOpen(false)}
             />

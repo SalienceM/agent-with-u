@@ -12,6 +12,7 @@ import { SmoothGhostWindow, isSmoothGhostWindow } from './components/SmoothGhost
 import { api } from './api';
 import { installGlobalStreamRouter } from './hooks/useStreamState';
 import { ErrorBoundary } from './components/ErrorBoundary';
+import { MarkdownStyles } from './components/MarkdownStyles';
 
 // Web/平板缓存应用外壳；文件正文另存于 IndexedDB。Tauri 不注册，避免与
 // sidecar 的版本更新产生双重缓存。
@@ -154,6 +155,7 @@ document.head.appendChild(style);
 
 createRoot(document.getElementById('root')!).render(
   <ErrorBoundary>
+    <MarkdownStyles />
     {isSmoothGhostWindow
       ? <SmoothGhostWindow />
       : isSmoothRegionSelector

@@ -1,4 +1,7 @@
 import React, { useEffect, useMemo, useState } from 'react';
+import { MarkdownBody } from './MarkdownBody';
+import scheduledPromptsGuide from '../../../docs/session-scheduled-prompts.md?raw';
+import scheduledPromptsRelease from '../../../docs/session-scheduled-prompts-release.md?raw';
 
 interface ManualPanelProps { onClose: () => void; }
 
@@ -9,12 +12,23 @@ interface ManualItem {
   entry: string;
   tips?: string;
   keywords?: string;
+  document?: string;
   steps?: { title: string; text: string; command?: string }[];
 }
 
 interface ManualSection { id: string; title: string; icon: string; intro: string; items: ManualItem[]; }
 
 const SECTIONS: ManualSection[] = [
+  {
+    id: 'session-schedules', title: 'Session 定时任务', icon: '◷', intro: '到点在已有普通 Session 执行预设指令；计划由所属执行节点调度。',
+    items: [
+      { icon: '◷', title: '配置定时指令', summary: '支持单次、每日、每周和固定间隔。忙时排队，原聊天提供实时输出；默认合并补跑一次，可选跳过。',
+        entry: '普通 Session 顶部 → 定时', tips: '保存为停用不执行。执行节点需保持运行，暂停、失败及结果未知不会被到点触发解除。',
+        keywords: '定时计划 调度 scheduled prompts 时区 弱网 离线', document: scheduledPromptsGuide },
+      { icon: '↶', title: '发布说明与兼容限制', summary: '升级保留普通会话；直接降级旧版本可能重放定时队列，需要先停用计划、核对退出并处理失败项。',
+        entry: '本页 → 展开完整文档', keywords: '迁移 回滚 降级 安装包 tzdata 已知限制', document: scheduledPromptsRelease },
+    ],
+  },
   {
     id: 'workspace-collaboration', title: '跨节点工作区协作', icon: '🌐', intro: '直接在普通对话中协调自己的节点、Session 和文件。',
     items: [{ icon: '🌐', title: '让聊天操作 AWU', summary: '可以询问可见节点，按名称查找 Session、搜索文件、分段读取文本，再按模板生成文件并落到目标节点。重名时返回候选，不会猜测；查询不会执行写操作。',
@@ -99,7 +113,7 @@ const SECTIONS: ManualSection[] = [
     id: 'project', title: '项目与版本', icon: '📦', intro: '查看文件、比较改动并完成 Git 工作流。',
     items: [
       { icon: '🌳', title: '工作目录树', summary: '浏览项目文件和目录，查看已暂存/未暂存计数，打开文本文件预览或编辑。', entry: '左侧栏「文件」视图', tips: '目录按需展开，刷新只读取根和当前展开层，保留原列表，不读取文件正文。Git 状态独立更新，慢 Git 不阻止继续展开和刷新目录；文件树不计算逐文件增删行数。外部程序改动后可手动刷新，不会定时扫描整个项目。远端会话已绑定的本地副本仍会读取本地元数据，比对哈希仅在点击「比对」时执行。' },
-      { icon: '👁', title: '文件预览与编辑', summary: '点击文件查看内容；预览窗可一键最大化。Markdown 可直接转换并导出为独立 HTML；PDF、DOCX 与 Draw.io 使用完全离线的专用渲染器，Excel/PPT 使用快速结构化预览；文本和代码可直接编辑保存。', entry: '文件行的预览图标 / 点击文件名', tips: 'DOCX 版式渲染失败会自动切换兼容预览；Draw.io 支持 Sheet 切换、滚轮缩放、左键拖动画布及官方 / 兼容渲染切换。' },
+      { icon: '👁', title: '文件预览与编辑', summary: '点击文件查看内容；手机弹窗填满可用区域，右上角可直接关闭。窄栏的「工具」展开次要操作，点击文件名查看完整名称与来源。Markdown 可导出独立 HTML；PDF、DOCX 与 Draw.io 使用离线渲染器，Excel/PPT 使用结构化预览；文本和代码可编辑保存。', entry: '文件行的预览图标 / 点击文件名', tips: 'Excel 可按住鼠标左键双向拖动，手机直接滑动；轻点选格，「查找 / 缩放」展开搜索与统计，「内容」展开并复制已加载的长值/公式。标签可横滑；预览不计算公式、不修改原文件。Word/PDF 默认适配宽度，可手动放大；Word 默认选字，切换「手形浏览」后可拖动。DOCX 失败自动回退兼容预览。Draw.io 保留 Sheet、滚轮缩放、左键拖动及两种渲染模式。独立文件窗口固定原文件来源，关闭原预览、换 Session 或切换 Chat/Engine 不影响阅读；源页面关闭后，只要原来源仍可访问就能重新读取。离线保留已加载内容与草稿，重新连接只核对来源，不自动重载或重试保存；刷新页面则需重新读取，不是离线正文缓存。换账号或身份域会遮蔽旧内容。未确认的保存只核对原请求；窗口不会抢占 Session 控制权。旧版窗口请重新打开；退出整个应用若停止 sidecar，独立窗口不保证继续在线。' },
       { icon: '🌐', title: 'HTML 页面与交互预览', summary: 'HTML/HTM 默认显示浏览器渲染页面，可切换源码。CSS、图片、字体和关联页面按原执行节点的工作目录读取；「实际位置」可点击定位，不会改用控制端同名文件。', entry: '文件 → HTML 文件 → 页面 / 源码', tips: '可信页面可点击「启用页面脚本」使用按钮、模块 JS 和本地 fetch 交互；源码切换保留当前页面状态。只读静态预览不等于运行服务：外部 CDN、登录、后端 API、动态计算的模块路径、XHR 和服务端路由需要真实服务地址。不会自动启动服务、提交表单或轮询刷新目录。', keywords: 'html htm 浏览器 渲染 交互 实际位置 JavaScript CSS 相对路径' },
       { icon: '±', title: 'Diff 变更对比', summary: '查看文件相对版本库的新增、删除和修改，辅助确认提交范围。', entry: '提交变更面板 → 点击文件名' },
       { icon: '＋', title: '加入版本追踪', summary: '将未跟踪文件执行 Git add，支持逐项操作和分组全选。', entry: '提交变更 → 未跟踪文件' },
@@ -235,6 +249,10 @@ export const ManualPanel: React.FC<ManualPanelProps> = ({ onClose }) => {
                         <div style={{ marginTop: 5, fontSize: 12, lineHeight: 1.65, color: 'var(--theme-text-muted)' }}>{item.summary}</div>
                         <div style={entryStyle}><b>入口</b><span>{item.entry}</span></div>
                         {item.tips && <div style={tipStyle}>💡 {item.tips}</div>}
+                        {item.document && <details style={{ marginTop: 10, fontSize: 12 }}>
+                          <summary style={{ cursor: 'pointer', color: 'var(--theme-accent)' }}>展开完整文档</summary>
+                          <MarkdownBody text={item.document} style={{ lineHeight: 1.7, overflowWrap: 'anywhere', overflowX: 'auto' }} />
+                        </details>}
                         {item.steps && <details style={{ marginTop: 10, fontSize: 12 }}>
                           <summary style={{ cursor: 'pointer', color: 'var(--theme-accent)' }}>展开操作步骤与命令</summary>
                           {item.steps.map(step => <div key={step.title} style={{ marginTop: 12, lineHeight: 1.65 }}>

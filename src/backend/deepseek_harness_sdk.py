@@ -19,17 +19,51 @@ from typing import Any
 from .deepseek_harness_config import VERSION
 from .deepseek_harness_state import reject_links
 from .owned_process_tree import OwnedProcessTree
+from .deepseek_harness_images import MAX_FRAME_BYTES, MAX_PENDING_BYTES, check_request_budget, encode_frame
 
-MAX_FRAME_BYTES = 1024 * 1024
 MAX_NOTIFICATIONS = 256
 
 
-def bridge_path() -> Path:
-    root = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parents[2]))
-    path = root / ("deepseek-harness/bridge/lib/index.mjs" if getattr(sys, "frozen", False)
-                   else "build/deepseek-harness/bridge/lib/index.mjs")
+class _QueuedNotification:
+    def __init__(self, value: Any, size: int) -> None:
+        self.value, self.size = value, size
+
+
+class NotificationBudgetQueue(queue.Queue):
+    """保留 SDK 的 Queue 接口；计量与入队/出队共用同一把锁。"""
+    def __init__(self) -> None:
+        super().__init__(maxsize=MAX_NOTIFICATIONS)
+        self._pending_bytes = 0
+
+    def put_sized(self, notification: Any, frame_bytes: int) -> None:
+        self.put_nowait(_QueuedNotification(notification, frame_bytes))
+
+    @property
+    def pending_bytes(self) -> int:
+        with self.mutex:
+            return self._pending_bytes
+
+    def _put(self, item: Any) -> None:
+        if not isinstance(item, _QueuedNotification):
+            item = _QueuedNotification(item, len(encode_frame({"jsonrpc": "2.0", "method": item.method, "params": item.payload})))
+        if not 0 < item.size <= MAX_FRAME_BYTES or self._pending_bytes + item.size > MAX_PENDING_BYTES:
+            raise queue.Full
+        super()._put(item)
+        self._pending_bytes += item.size
+
+    def _get(self) -> Any:
+        item = super()._get()
+        self._pending_bytes -= item.size
+        return item.value
+
+
+def bridge_path(*, require_images: bool = False) -> Path:
+    from .deepseek_harness_distribution import bundle_directory, verify_image_bridge
+    path = bundle_directory() / "bridge/lib/index.mjs"
     if not path.is_file():
         raise RuntimeError("缺少版本匹配的 Harness AWU 桥；请准备发行依赖，不会在聊天时下载")
+    if require_images:
+        verify_image_bridge(path)
     return path.resolve()
 
 
@@ -41,6 +75,7 @@ class SyncOwner:
         self.tree: OwnedProcessTree | None = None
         self.spawn_attempted = False
         self.confirmed = False
+        self._process_exit_confirmed = False
         self.cancelled = threading.Event()
 
     def spawn(self, args: list[str], *, cwd: str | None, env: dict[str, str]) -> subprocess.Popen[str]:
@@ -70,7 +105,7 @@ class SyncOwner:
         self.process = proc
         if os.name == "nt":
             try:
-                self.tree = OwnedProcessTree(proc)
+                self.tree = OwnedProcessTree(proc, suspended_root=True)
                 if not self.tree.complete or not self.tree.job:
                     raise RuntimeError("Harness 启动前无法取得 Windows Job 归属")
                 if self.cancelled.is_set():
@@ -107,7 +142,10 @@ class SyncOwner:
             proc.terminate()  # supervisor 收养/kill/reap 后代；不 SIGKILL supervisor。
 
     def settle(self, timeout: float = 7) -> bool:
-        if self.confirmed:
+        if self.confirmed or self._process_exit_confirmed:
+            # Job/监督进程已经给出的退出证明不可因 reader 较慢而丢失；
+            # 完整 confirmed 仍由 close 的线程收口检查约束，不据此释放活动保护。
+            self.confirmed = True
             return True
         proc = self.process
         if proc is None:
@@ -122,6 +160,7 @@ class SyncOwner:
                 time.sleep(.02)
             self.confirmed = self.tree.exit_confirmed()
             if self.confirmed:
+                self._process_exit_confirmed = True
                 self.tree.release()
         elif sys.platform == "linux":
             reject_links(self.receipt)
@@ -130,11 +169,13 @@ class SyncOwner:
                 self.confirmed = (data.get("generation") == self.generation
                                   and data.get("supervisorPid") == proc.pid
                                   and data.get("exitConfirmed") is True)
+                self._process_exit_confirmed = self.confirmed
         return self.confirmed
 
 
-def require_locked_versions() -> None:
-    for distribution in ("deepseek-harness-sdk", "deepseek-harness-runtime-bin"):
+def require_locked_versions(*, runtime: bool = False) -> None:
+    distributions = ("deepseek-harness-sdk", "deepseek-harness-runtime-bin") if runtime else ("deepseek-harness-sdk",)
+    for distribution in distributions:
         try:
             version = importlib.metadata.version(distribution)
         except importlib.metadata.PackageNotFoundError as exc:
@@ -146,11 +187,8 @@ def require_locked_versions() -> None:
 def create_harness_config(**kwargs: Any) -> Any:
     require_locked_versions()
     if getattr(sys, "frozen", False):
-        from .deepseek_harness_distribution import verify_bundle
-        verify_bundle(repair_executable=True)
-    if kwargs.get("dsh_bin"):
-        from .deepseek_harness_distribution import verify_runtime_override
-        kwargs["dsh_bin"] = str(verify_runtime_override(Path(kwargs["dsh_bin"])))
+        from .deepseek_harness_distribution import verify_adapter
+        verify_adapter()
     from deepseek_harness.client import HarnessConfig
     return HarnessConfig(**kwargs)
 
@@ -164,12 +202,13 @@ def default_model() -> str:
 def create_client(*, config: Any, owner: SyncOwner, launch_args: tuple[str, ...] | None = None) -> Any:
     require_locked_versions()
     from deepseek_harness.client import HarnessClient
+    from deepseek_harness.errors import SdkProtocolError, TransportClosedError
     from deepseek_harness.models import Notification
 
     class OwnedClient(HarnessClient):
         def __init__(self) -> None:
             super().__init__(config, _launch_args=launch_args)
-            self._notifications = queue.Queue(maxsize=MAX_NOTIFICATIONS)
+            self._notifications = NotificationBudgetQueue()
             self.fatal: BaseException | None = None
             self.closing = False
             self.owner = owner
@@ -183,7 +222,24 @@ def create_client(*, config: Any, owner: SyncOwner, launch_args: tuple[str, ...]
                 if key.startswith("DSH_") or key in {"NODE_OPTIONS", "NODE_PATH"}:
                     env.pop(key)
             env.update(self.config.env or {})
-            args = list(self._launch_args or self._default_launch_args(env))
+            if self._launch_args is not None:
+                args = list(self._launch_args)  # 显式内部测试接缝，不来自聊天参数。
+            elif self.config.dsh_bin and Path(self.config.dsh_bin).name.startswith("deepseek-harness-sdk-runtime-"):
+                from .deepseek_harness_distribution import verify_runtime_override
+                selected = verify_runtime_override(Path(self.config.dsh_bin))
+                args = [str(selected), "--profile", self.config.profile]
+                for overlay in self.config.patches:
+                    args.extend(("--patch", overlay))
+            elif self.config.dsh_bin or getattr(sys, "frozen", False):
+                from .deepseek_harness_cli import resolve_external_cli
+                selected = resolve_external_cli(self.config.dsh_bin, environment=env)
+                args = list(selected.argv(self.config.profile, self.config.patches))
+            else:
+                # 旧源码/Docker 配套模式；冻结默认绝不进入这一分支。
+                from .deepseek_harness_distribution import verify_bundle
+                require_locked_versions(runtime=True)
+                verify_bundle()
+                args = list(self._default_launch_args(env))
             if self.config.dsh_home:
                 env["DSH_HOME"] = self.config.dsh_home
             env.update(DSH_TELEMETRY_DISABLED="1", DSH_PRIMARY_RUNTIME="", DSH_BUNDLED_OFFICE_CLI="")
@@ -198,19 +254,20 @@ def create_client(*, config: Any, owner: SyncOwner, launch_args: tuple[str, ...]
         def _reader_loop(self) -> None:
             try:
                 while self._proc and self._proc.stdout:
-                    line = self._proc.stdout.readline(MAX_FRAME_BYTES + 1)
+                    # 单 reader 直接读取底层 bytes，不能先读取 16 MiB 字符再扩成 64 MiB。
+                    line = self._proc.stdout.buffer.readline(MAX_FRAME_BYTES + 1)
                     if not line:
                         break
-                    if not line.endswith("\n") or len(line.encode("utf-8")) > MAX_FRAME_BYTES:
+                    if not line.endswith(b"\n") or len(line) > MAX_FRAME_BYTES:
                         raise RuntimeError("Harness 协议帧超出限额或被截断")
-                    message = json.loads(line)
+                    message = json.loads(line.decode("utf-8", errors="strict"))
                     if not isinstance(message, dict):
                         raise RuntimeError("Harness 协议帧不是对象")
-                    self._handle_message(message)
-            except BaseException as exc:
-                self._fail_waiters(RuntimeError("Harness 协议读取失败: " + type(exc).__name__))
+                    self._handle_message(message, frame_bytes=len(line))
+            except BaseException:
+                self._fail_waiters(SdkProtocolError("Harness 协议读取失败"))
             finally:
-                self._fail_waiters(RuntimeError("Harness 协议连接已关闭"))
+                self._fail_waiters(TransportClosedError("Harness 协议连接已关闭"))
 
         def _stderr_loop(self) -> None:
             try:
@@ -219,7 +276,7 @@ def create_client(*, config: Any, owner: SyncOwner, launch_args: tuple[str, ...]
             except (OSError, ValueError, UnicodeError):
                 pass
 
-        def _handle_message(self, message: object) -> None:
+        def _handle_message(self, message: object, *, frame_bytes: int | None = None) -> None:
             if not isinstance(message, dict):
                 raise RuntimeError("Harness 无效协议对象")
             method = message.get("method")
@@ -230,7 +287,8 @@ def create_client(*, config: Any, owner: SyncOwner, launch_args: tuple[str, ...]
                 if not isinstance(payload, dict):
                     raise RuntimeError("Harness 通知缺少 params")
                 try:
-                    self._notifications.put_nowait(Notification(method=method, payload=payload))
+                    self._notifications.put_sized(Notification(method=method, payload=payload),
+                        frame_bytes if frame_bytes is not None else len(encode_frame(message)))
                 except queue.Full as exc:
                     raise RuntimeError("Harness 事件队列溢出，运行失败") from exc
             else:
@@ -250,9 +308,21 @@ def create_client(*, config: Any, owner: SyncOwner, launch_args: tuple[str, ...]
         def _write_message(self, message: dict) -> None:
             if self.fatal:
                 raise self.fatal
-            if len(json.dumps(message, ensure_ascii=False).encode()) > MAX_FRAME_BYTES:
+            frame = encode_frame(message)
+            if len(frame) > MAX_FRAME_BYTES:
                 raise ValueError("Harness 输入超出协议限额")
-            super()._write_message(message)
+            if message.get("method") == "session/prompt":
+                check_request_budget(message)
+            proc = self._proc
+            if proc is None or proc.stdin is None:
+                raise TransportClosedError("Harness 协议连接未启动")
+            try:
+                with self._write_lock:
+                    # 不调用 SDK 的 ensure_ascii 序列化，也不经过 Windows 文本换行转换。
+                    proc.stdin.buffer.write(frame)
+                    proc.stdin.buffer.flush()
+            except (OSError, ValueError):
+                raise TransportClosedError("Harness 协议写入失败") from None
 
         def next_owned_notification(self, timeout: float = .1) -> Any:
             try:

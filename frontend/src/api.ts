@@ -8,8 +8,18 @@
  *   Server → Client: {"event": "sessionUpdated", "data": "..."} // push
  */
 
+import type { UserInteraction, InteractionResponse } from './types/userInteractions';
+import { interactionIndex } from './utils/userInteractions';
+import { kitDelegations, type KitDelegationReceipt } from './utils/kitDelegationFeedback';
+import { ComposerSubmissions } from './utils/composerSubmissions';
+import type { FollowupConfig, FollowupSettings, FollowupSuggestion } from './utils/followupSuggestions';
+import type { ScheduleConfig, ScheduleEvent, ScheduleIntent, ScheduleOccurrence, SchedulePage, ScheduleReceipt, SessionSchedule } from './types/sessionSchedules';
+import type { CollaborationSummary, RoleProfile, ReviewBatch, ReviewReport, ReviewSnapshot, OpinionReference } from './types/sessionCollaboration';
 import type { GitDetectResult, GitStatusResult, GitDiffResult, GitCommitResult, GitLogResult, GitBranchesResult, GitPushPullResult, GitStashListResult } from './types/git';
+import { hasScanRules, type SyncScanRules } from './utils/syncScanRules';
 import type { LoopSourceResponse } from './types/loopContinuation';
+export { HARNESS_IMAGE_CONTRACT, matchesHarnessImageExtension } from './types/harnessImages';
+export type { HarnessImageExtension, HarnessImageLimits } from './types/harnessImages';
 import type {
   WorkspaceKitState, WorkspaceKit, KitRun, KitGenerationRequest, KitGenerationResult,
   KitGenerationJob, KitVersion, KitOptimizationMessage, KitCapabilityMetadata,
@@ -19,8 +29,9 @@ import type {
 } from './types/prov';
 import { filterGitMetadata } from './utils/dirSyncPolicy';
 import { SessionRoutingCache, isSessionMetaReady } from './utils/sessionRouting';
-import { readWorkbenchCapabilities } from './utils/sessionWorkbench';
+import { readWorkbenchCapabilities, type WorkspaceIdentity } from './utils/sessionWorkbench';
 import { WorkspaceDocuments, sameWorkspace } from './utils/workspaceDocuments';
+import { documentStore } from './utils/documentStore';
 import { WorkbenchStreamGate, type StreamTransfer } from './utils/workbenchStream';
 import { getStreamState, restoreStreamState, clearAllStreamStates, configureStreamIdentity } from './hooks/useStreamState';
 import { WindowOwnershipClient, loadWindowNavigation, windowTransport, windowMutations } from './utils/workbenchWindows';
@@ -34,6 +45,8 @@ import { inputHistoryKey, inputHistoryStore } from './utils/inputHistory';
 import { LoopControlStore, controlKey, type ControlTarget, type ControlSummary } from './utils/loopControl';
 import { LoopControlTransport, requestWithReadiness } from './utils/loopControlTransport';
 import { uuid } from './utils/uuid';
+import type { PreviewIdentity } from './utils/previewLifecycle';
+import { HarnessImageSubmissions, type ImageScope, type ImageInput, type ImageDraftContext, type ImageSendResult } from './utils/harnessImageSubmission';
 import { SessionFavorites, IndexedFavoriteRepository, favoriteKey, favoriteIdentityTarget, mergeFavoriteRemote, type FavoriteTarget } from './utils/sessionFavorites';
 import { deleteSessionOnTarget, type SessionDeletionResult } from './utils/sessionDeletion';
 
@@ -156,6 +169,14 @@ export interface NodeUpdateArtifact {
 }
 
 export interface NodeUpdateStatus {
+  updateProtocol?: number;
+  stageRequestId?: string;
+  applyRequestId?: string;
+  applyFailed?: boolean;
+  selectionFingerprint?: string;
+  resumedBytes?: number;
+  retryAttempt?: number;
+  retryInSeconds?: number;
   phase: 'idle' | 'checking' | 'current' | 'stale' | 'available' | 'downloading' | 'staged'
     | 'installing' | 'installed' | 'cancelled' | 'error';
   busy: boolean;
@@ -371,6 +392,12 @@ const streamKey = (executor: string, session: string) => JSON.stringify([getCurr
 configureStreamIdentity((session, executor) => streamKey(executor || getSessionExecKey(session) || '', session));
 let sessionUpdateCallbacks: SessionUpdateCallback[] = [];
 let permissionRequestCallbacks: PermissionRequestCallback[] = [];
+const interactionCallbacks = new Set<(row: UserInteraction, executor: string) => void>();
+const followupCallbacks = new Set<(row: FollowupSuggestion, executor: string) => void>();
+const scheduleCallbacks = new Set<(row: ScheduleEvent, executor: string) => void>();
+const reviewCallbacks = new Set<(row: CollaborationSummary, executor: string) => void>();
+const taskWorkspaceCallbacks = new Set<(row: CollaborationSummary, executor: string) => void>();
+const projectMergeCallbacks = new Set<(row: CollaborationSummary, executor: string) => void>();
 const permissionReadGate = new AuthoritativeReadGate();
 const terminalCallbacks = new Set<(data: any, executor: string) => void>();
 const languageCallbacks = new Set<(data: any, executor: string) => void>();
@@ -411,7 +438,7 @@ type LoopAsideDeltaCallback = (data: { sessionId: string; turnId: string; text: 
 let loopAsideDeltaCallbacks: LoopAsideDeltaCallback[] = [];
 
 // ── 普通 session 侧挂：序列任务 + by-the-way ──────────────────
-type SeqtaskUpdatedCallback = (data: { sessionId: string; seqTasks: any[]; seqAuto: boolean; seqError?: string }) => void;
+type SeqtaskUpdatedCallback = (data: { sessionId: string; seqTasks: any[]; seqAuto: boolean; seqError?: string }, executor: string) => void;
 let seqtaskUpdatedCallbacks: SeqtaskUpdatedCallback[] = [];
 type ChatAsideDeltaCallback = (data: { sessionId: string; turnId: string; text: string }, execKey?: string) => void;
 let chatAsideDeltaCallbacks: ChatAsideDeltaCallback[] = [];
@@ -625,6 +652,32 @@ export type ConnectionTarget =
     };
 
 const CONN_TARGET_KEY = 'awu.connectionTarget';
+const PREVIEW_IDENTITY_EPOCH_KEY = 'awu.preview-identity-epoch-v1';
+
+/** 非凭据身份域；不可把 Relay token/URL 查询参数传入文件窗口描述。 */
+export function previewExecutorRealm(target: ConnectionTarget): string {
+  if (target.mode === 'local') return 'local';
+  const url = new URL(target.url);
+  return `${url.protocol}//${url.host}${url.pathname}`;
+}
+export function getPreviewIdentity(): PreviewIdentity {
+  // 读取共享身份标记，避免另一窗口退出到本窗口收到 storage 事件之间的旧身份访问。
+  const target = loadConnectionTarget();
+  return { mode: target.mode, realm: previewExecutorRealm(target),
+    owner: target.mode === 'relay' ? normalizeRelayProfile(target.user).userId : 'local',
+    epoch: localStorage.getItem(PREVIEW_IDENTITY_EPOCH_KEY) || 'initial' };
+}
+/** 只在文件独立入口同步既有认证配置；不从窗口描述接收任何凭据。 */
+export function observePreviewIdentity(callback: () => void): () => void {
+  const off = onCurrentUserChanged(callback);
+  const storage = (event: StorageEvent) => {
+    if (event.key !== CONN_TARGET_KEY && event.key !== PREVIEW_IDENTITY_EPOCH_KEY && event.key !== null) return;
+    callback();
+    if (event.key === CONN_TARGET_KEY || event.key === null) void setConnectionTarget(loadConnectionTarget(), true).catch(callback);
+  };
+  window.addEventListener('storage', storage);
+  return () => { off(); window.removeEventListener('storage', storage); };
+}
 
 function loadConnectionTarget(): ConnectionTarget {
   try {
@@ -929,6 +982,10 @@ function handleMessage(e: MessageEvent, source?: Conn) {
       streamGate.push(streamKey(source?.key || getSessionExecKey(delta.sessionId) || '', delta.sessionId), delta);
     } else if (msg.event === 'sessionUpdated') {
       const parsed = JSON.parse(msg.data);
+      if (parsed.type === 'harness_image_submission') {
+        if (!source || pool.get(source.key) !== source) return;
+        harnessImageSubmissions.observe(harnessImageScope(parsed.sessionId, source.key), parsed);
+      }
       const execMeta = source ? {
         execKey: source.key,
         execLabel: source.label,
@@ -972,6 +1029,39 @@ function handleMessage(e: MessageEvent, source?: Conn) {
       }
       if (data.summary && source) data.summary = projectFavorite(data.summary, source);
       sessionUpdateCallbacks.forEach((cb) => cb(data));
+    } else if (msg.event === 'projectBufferFreeze') {
+      const data = typeof msg.data === 'string' ? JSON.parse(msg.data) : msg.data;
+      const clean = documentStore.freezeProject(data.probeId, data.workspace, data.operationId);
+      void callOnStrict(source?.key || 'local', 'projectBufferReply', [data.probeId, clean], 12000).catch(() => { /* 不确认回执不能自行解除写入冻结。 */ });
+    } else if (msg.event === 'projectBufferRelease') {
+      const data = typeof msg.data === 'string' ? JSON.parse(msg.data) : msg.data;
+      documentStore.releaseProject(data.probeId, data.committed === true);
+    } else if (msg.event === 'projectMergeUpdated') {
+      const data = typeof msg.data === 'string' ? JSON.parse(msg.data) : msg.data;
+      projectMergeCallbacks.forEach(cb => cb(data, source?.key || 'local'));
+    } else if (msg.event === 'taskWorkspaceUpdated') {
+      const data = typeof msg.data === 'string' ? JSON.parse(msg.data) : msg.data;
+      taskWorkspaceCallbacks.forEach(cb => cb(data, source?.key || 'local'));
+    } else if (msg.event === 'reviewUpdated') {
+      const data = JSON.parse(msg.data);
+      reviewCallbacks.forEach(cb => cb(data, source?.key || 'local'));
+    } else if (msg.event === 'followupSuggestion') {
+      const data = JSON.parse(msg.data);
+      followupCallbacks.forEach(cb => cb(data, source?.key || 'local'));
+    } else if (msg.event === 'sessionScheduleUpdated') {
+      const data = typeof msg.data === 'string' ? JSON.parse(msg.data) : msg.data;
+      scheduleCallbacks.forEach(cb => cb(data, source?.key || 'local'));
+    } else if (msg.event === 'composerSubmission') {
+      const data = JSON.parse(msg.data);
+      composerSubmissions.observe(harnessImageScope(data.sessionId, source?.key || 'local'), data);
+    } else if (msg.event === 'kitDelegation') {
+      const data = JSON.parse(msg.data) as KitDelegationReceipt;
+      kitDelegations.accept(source?.key || 'local', data);
+    } else if (msg.event === 'userInteraction') {
+      const data: UserInteraction = JSON.parse(msg.data);
+      const executor = source?.key || 'local';
+      interactionIndex.accept(executor, data);
+      interactionCallbacks.forEach(cb => cb(data, executor));
     } else if (msg.event === 'permissionRequest') {
       const data = JSON.parse(msg.data);
       const executor = source?.key || 'local';
@@ -1004,7 +1094,9 @@ function handleMessage(e: MessageEvent, source?: Conn) {
             pendingDesktopUpdatePlan = '';
             const message = error instanceof Error ? error.message : String(error || 'desktop updater failed');
             if (data.kitRequestId) void callOn('local', 'kitInstallHandoffFailed', String(data.kitRequestId));
-            else void callOn('local', 'nodeUpdateInstallFailed', message);
+            else void callOn('local', 'nodeUpdateInstallFailed', message, ...(
+              data.applyRequestId ? [String(data.applyRequestId)] : []
+            ));
           });
         }, delay);
       }
@@ -1032,7 +1124,7 @@ function handleMessage(e: MessageEvent, source?: Conn) {
       loopAsideDeltaCallbacks.forEach((cb) => cb(data, source?.key || 'local'));
     } else if (msg.event === 'seqtaskUpdated') {
       const data = JSON.parse(msg.data);
-      seqtaskUpdatedCallbacks.forEach((cb) => cb(data));
+      seqtaskUpdatedCallbacks.forEach((cb) => cb(data, source?.key || 'local'));
     } else if (msg.event === 'chatAsideDelta') {
       const data = JSON.parse(msg.data);
       chatAsideDeltaCallbacks.forEach((cb) => cb(data, source?.key || 'local'));
@@ -1042,6 +1134,7 @@ function handleMessage(e: MessageEvent, source?: Conn) {
     } else if (msg.event === 'kitUpdated') {
       const data = JSON.parse(msg.data);
       if (source && sessionExec.get(data.sessionId) !== source.key) return;
+      kitDelegations.updateRuns(source?.key || 'local', data.sessionId, data.runs || []);
       kitUpdatedCallbacks.forEach((cb) => cb(data));
     } else if (msg.event === 'kitGenerationUpdated') {
       const data = JSON.parse(msg.data) as KitGenerationJob;
@@ -1224,6 +1317,7 @@ class Conn {
         }
       }, HEARTBEAT_INTERVAL_MS);
       this.settleReady();
+      reportProjectBuffers(true);
       if (this.key === 'local') {
         if (isTauri()) {
           void import('@tauri-apps/api/core').then(({ invoke }) => invoke('get_kit_update_identity'))
@@ -1313,7 +1407,8 @@ class Conn {
 
   /** 发起一次 RPC。home 离线时回落 mock(保持旧行为);其它节点离线则丢弃返回 null。 */
   async request(method: string, params: any[], timeoutMs?: number): Promise<any> {
-    const strictSession = ['sessionFavoriteGet', 'sessionFavoriteSet', 'deleteSession', 'destroySession'].includes(method);
+    const strictSession = ['sessionFavoriteGet', 'sessionFavoriteSet', 'deleteSession', 'destroySession',
+      'harnessImageCapabilities', 'harnessImageSubmit', 'harnessImageQueue', 'harnessImageStatus', 'composerSubmit', 'composerStatus'].includes(method);
     const deadline = Date.now() + (timeoutMs || 10000), requestEpoch = relayIdentityEpoch, socket = this.ws;
     if (strictSession) {
       let timer: ReturnType<typeof setTimeout> | undefined;
@@ -1382,6 +1477,35 @@ class Conn {
 const pool = new Map<string, Conn>();
 let homeConn!: Conn;  // initPool() 在模块加载时立即赋值
 const sessionExec = new Map<string, string>();   // sessionId → conn.key
+const projectBufferReports = new Map<string, { workspace: WorkspaceIdentity; opened: boolean; dirty: boolean; sent: string; pending: boolean }>();
+function reportProjectBuffers(force = false): void {
+  if (force) for (const lock of documentStore.projectLocks()) {
+    const executor = sessionExec.get(lock.workspace.sessionId);
+    if (!executor || !pool.get(executor)?.isOpen || lock.workspace.ownerId !== getCurrentUserProfile().userId) continue;
+    void callOnStrict(executor, 'projectBufferStatus', [lock.workspace.sessionId, JSON.stringify(lock.workspace), lock.operationId], 12000)
+      .then(value => { const result = typeof value === 'string' ? JSON.parse(value) : value; if (result?.state === 'released') documentStore.releaseProject(lock.id, true); })
+      .catch(() => { /* 无真实释放回执继续冻结，保留草稿。 */ });
+  }
+  const docs = documentStore.all().filter(doc => doc.identity.source === 'executor' && doc.identity.workspace.ownerId === getCurrentUserProfile().userId);
+  for (const doc of docs) {
+    const w = doc.identity.workspace, key = JSON.stringify([w.ownerId, w.executorInstance, w.sessionId, w.workingDir]);
+    if (!projectBufferReports.has(key)) projectBufferReports.set(key, { workspace: w, opened: false, dirty: false, sent: '', pending: false });
+  }
+  for (const [key, row] of projectBufferReports) {
+    if (row.workspace.ownerId !== getCurrentUserProfile().userId) { projectBufferReports.delete(key); continue; }
+    const related = docs.filter(doc => sameWorkspace(row.workspace, doc.identity.workspace));
+    row.opened = related.length > 0;
+    row.dirty = related.some(doc => doc.dirty || doc.loading || doc.save && !['succeeded', 'failed'].includes(doc.save.receipt?.status || ''));
+    if (force) row.sent = '';
+    const state = JSON.stringify([row.opened, row.dirty]), executor = sessionExec.get(row.workspace.sessionId);
+    if (!executor || !pool.get(executor)?.isOpen || row.pending || row.sent === state) continue;
+    row.pending = true;
+    void callOnStrict(executor, 'projectBufferState', [row.workspace.sessionId, JSON.stringify(row.workspace), row.opened, row.dirty], 12000)
+      .then(() => { row.sent = state; if (!row.opened && !row.dirty) projectBufferReports.delete(key); }).catch(() => { /* 断线状态不能冒充已核对。 */ })
+      .finally(() => { row.pending = false; if (JSON.stringify([row.opened, row.dirty]) !== state) reportProjectBuffers(); });
+  }
+}
+documentStore.subscribe(() => reportProjectBuffers());
 const workspaceControllers = new Map<string, { conn: Conn; socket: WebSocket | null; epoch: number }>();
 const workspaceDiscoveredTargets = new Map<string, ExecTarget>();
 
@@ -1554,6 +1678,13 @@ async function handleWorkspaceToolRequest(data: WorkspaceToolRequest, source: Co
 const windowMutationChecks = new Map<string, Promise<void>>();
 async function ensureWindowMutation(conn: Conn, method: string, params: any[]): Promise<void> {
   if (!windowMutations.has(method)) return;
+  // 文件窗口只使用已有文件权限，绝不注册/抢占整个 Session 的写租约。
+  // 带独立窗口元数据的业务请求仍由服务端 _window_guard 权威校验。
+  if (new URLSearchParams(window.location.search).has('filePreview')) {
+    if (method !== 'workspaceDocumentSave') throw new Error('独立文件预览不能控制 Session');
+    if (!windowTransport.identity) throw new Error('独立文件窗口身份尚未核验');
+    return;
+  }
   const payload = ['sendMessage', 'executeCommand'].includes(method) ? (typeof params[0] === 'string' ? JSON.parse(params[0]) : params[0]) : null;
   const session = payload ? payload.sessionId : params[0];
   if (typeof session !== 'string' || !session || windowTransport.get(conn.key, session)) return;
@@ -1587,6 +1718,44 @@ async function ensureWindowMutation(conn: Conn, method: string, params: any[]): 
 export function getSessionExecKey(sessionId?: string | null): string | undefined {
   return sessionId ? sessionExec.get(sessionId) : undefined;
 }
+
+export function harnessImageScope(sessionId: string, executor = getSessionExecKey(sessionId) || ''): ImageScope {
+  const owner = getCurrentUserProfile().userId;
+  return { key: JSON.stringify([owner, relayIdentityEpoch, executor, sessionId]), owner, executor, session: sessionId };
+}
+
+const parseImageReply = (value: unknown): unknown => typeof value === 'string' ? JSON.parse(value) : value;
+async function imageCall(scope: ImageScope, method: string, params: unknown[]): Promise<unknown> {
+  if (!scope.executor || harnessImageScope(scope.session).key !== scope.key) throw new Error('图片提交身份已变化');
+  const conn = connByKey(scope.executor);
+  if (method === 'harnessImageSubmit') {
+    workspaceControllers.set(scope.session, { conn, socket: conn.ws, epoch: relayIdentityEpoch });
+    const payload = JSON.parse(String(params[0]));
+    if (payload.kitApprovalDelegation === true) kitDelegations.awaiting(scope.executor, scope.session, payload.userMessageId);
+  }
+  const reply = await callOnStrict(scope.executor, method, [scope.session, ...params], 12000);
+  if (harnessImageScope(scope.session).key !== scope.key) throw new Error('图片回执身份已变化');
+  return parseImageReply(reply);
+}
+export const harnessImageSubmissions = new HarnessImageSubmissions({
+  current: scope => harnessImageScope(scope.session).key === scope.key,
+  capabilities: scope => imageCall(scope, 'harnessImageCapabilities', []),
+  write: (scope, queue, payload) => imageCall(scope, queue ? 'harnessImageQueue' : 'harnessImageSubmit',
+    [JSON.stringify({ ...payload, workspaceToolsVersion: 1, userInteractionVersion: 1 })]),
+  read: (scope, requestId) => imageCall(scope, 'harnessImageStatus', [requestId]),
+  id: uuid,
+});
+export const composerSubmissions = new ComposerSubmissions({
+  current: scope => harnessImageScope(scope.session).key === scope.key,
+  write: async (scope, payload, queue) => {
+    const conn = connByKey(scope.executor);
+    workspaceControllers.set(scope.session, { conn, socket: conn.ws, epoch: relayIdentityEpoch });
+    if (payload.kitApprovalDelegation === true) kitDelegations.awaiting(scope.executor, scope.session, String(payload.userMessageId));
+    return parseImageReply(await callOnStrict(scope.executor, 'composerSubmit', [scope.session, JSON.stringify({ ...payload, workspaceToolsVersion: 1, userInteractionVersion: 1 }), queue], 12000));
+  },
+  read: async (scope, id) => parseImageReply(await callOnStrict(scope.executor, 'composerStatus', [scope.session, id], 12000)),
+  id: uuid,
+});
 
 /** 安装动作固定当前已知执行器及账号；未知路由绝不借用 home。 */
 export function kitUpdateScope(sessionId: string): string {
@@ -1731,6 +1900,7 @@ function clearRelaySessionCaches(): void {
 
 /** 身份切换是安全边界：旧用户的全部连接、路由与离线 Session 缓存都丢弃。 */
 function clearRelayIdentityState(): void {
+  harnessImageSubmissions.clear();
   confirmedSessionDeletions.clear();
   const scopes = activeFavoriteScopes();
   favoriteChannel?.postMessage({ type: 'clearing', scopes });
@@ -1743,7 +1913,7 @@ function clearRelayIdentityState(): void {
   permissionReadGate.clear();
   terminalResources.clear();
   languageResources.clear();
-  streamGate.clear(); clearAllStreamStates();
+  streamGate.clear(); clearAllStreamStates(); interactionIndex.clear(); kitDelegations.clear(); composerSubmissions.clear();
   workspaceControllers.clear();
   workspaceDiscoveredTargets.clear();
   sessionRoutingCache.clear();
@@ -1894,7 +2064,7 @@ function routeConn(method: string, params: any[]): Conn {
 }
 
 /** 切换 home 执行节点（本地直连 / 中继远程），持久化并立即重连。 */
-export async function setConnectionTarget(t: ConnectionTarget): Promise<void> {
+export async function setConnectionTarget(t: ConnectionTarget, fromStorage = false): Promise<void> {
   const oldHome = homeConn;
   const previousIdentity = targetUserIdentity(connectionTarget);
   const nextIdentity = targetUserIdentity(t);
@@ -1902,7 +2072,12 @@ export async function setConnectionTarget(t: ConnectionTarget): Promise<void> {
     || connectionTarget.mode === 'relay' && t.mode === 'relay' && connectionTarget.url !== t.url;
   if (identityChanged) clearRelayIdentityState();
   connectionTarget = t;
-  try { localStorage.setItem(CONN_TARGET_KEY, JSON.stringify(t)); } catch { /* */ }
+  try {
+    if (!fromStorage) {
+      if (identityChanged) localStorage.setItem(PREVIEW_IDENTITY_EPOCH_KEY, uuid());
+      localStorage.setItem(CONN_TARGET_KEY, JSON.stringify(t));
+    }
+  } catch { /* */ }
   const newKey = execTargetKey(t);
   if (homeConn && homeConn.key === newKey) {
     if (connectionTransportChanged(homeConn.target, t)) {
@@ -2284,6 +2459,13 @@ function fileSearchError(error: unknown): string {
   return message || '执行端未返回文件搜索结果';
 }
 
+async function collaborationCall<T>(executor: string, method: string, args: unknown[], timeout = 12000): Promise<T> {
+  const epoch = relayIdentityEpoch;
+  const result = await callOnStrict(executor, method, args, timeout);
+  if (epoch !== relayIdentityEpoch) throw new Error('身份已变化，请核对原节点');
+  return typeof result === 'string' ? JSON.parse(result) : result;
+}
+
 function parseRpcObject<T extends Record<string, any>>(result: any, fallback: T): T {
   if (result === null || result === undefined || result === '') return fallback;
   try {
@@ -2437,11 +2619,21 @@ export const api = {
   },
 
   async sendMessage(payload: any): Promise<void> {
+    payload = { ...payload, userInteractionVersion: 1 };
     const conn = routeConn('sendMessage', [JSON.stringify(payload)]);
+    if (payload.kitApprovalDelegation === true) kitDelegations.awaiting(conn.key, payload.sessionId, payload.userMessageId);
     await conn.ready;
     workspaceControllers.set(payload.sessionId, { conn, socket: conn.ws, epoch: relayIdentityEpoch });
     // 只发送协议版本，不传节点凭据/历史/目录列表；真正使用时才按需发现。
     await send('sendMessage', JSON.stringify({ ...payload, workspaceToolsVersion: 1 }));
+  },
+
+  harnessImageSend(payload: ImageInput & { sessionId: string; backendId: string } & Record<string, unknown>,
+    queue = false, draft?: ImageDraftContext): Promise<ImageSendResult> {
+    return harnessImageSubmissions.submit(harnessImageScope(payload.sessionId), payload, queue, draft);
+  },
+  composerSend(payload: ImageInput & { sessionId: string; backendId: string } & Record<string, unknown>, queue: boolean, draft: ImageDraftContext) {
+    return composerSubmissions.submit(harnessImageScope(payload.sessionId), payload, draft, queue);
   },
 
   async resolveWorkspaceSession(execKey: string, sessionId: string): Promise<any> {
@@ -2571,6 +2763,7 @@ export const api = {
         c, list: sessionListCache.get(c.key) || [], stale: requestEpoch !== relayIdentityEpoch,
       };
       try {
+        const interactionRevision = interactionIndex.snapshot();
         const r = await c.request('listSessions', [], LIST_SESSIONS_TIMEOUT_MS);
         if (requestEpoch !== relayIdentityEpoch || pool.get(c.key) !== c) {
           return { c, list: [], stale: true };
@@ -2580,6 +2773,7 @@ export const api = {
         const normalized = Array.isArray(list) ? list.filter(row => row?.id
           && !confirmedSessionDeletions.has(favoriteKey(favoriteTarget(c, row.id)))) : [];
         const previous = sessionListCache.get(c.key) || [];
+        interactionIndex.replaceSessions(c.key, normalized, interactionRevision);
         sessionListCache.set(c.key, normalized.map(row => mergeFavoriteRemote(previous.find(item => item.id === row.id), row)));
         persistSessionListCache();
         return { c, list: normalized, stale: false };
@@ -2850,6 +3044,19 @@ export const api = {
     const user = getCurrentUserProfile().userId;
     return WorkspaceDocuments.connect({ user, executor: execKey, session: sessionId, workingDir }, callOnStrict,
       () => getCurrentUserProfile().userId === user && isCurrent());
+  },
+
+  /** 文件窗口只读核对归属，绝不 register/reclaim；local-copy 写也不能绕过已有交接。 */
+  async previewDocumentWriteAllowed(sessionId: string, execKey: string, workingDir: string, current: () => boolean): Promise<boolean> {
+    const caps = await api.sessionWorkbenchCapabilities(sessionId, execKey, workingDir);
+    if (!current() || !caps.identity) return false;
+    if (!caps.capabilities.windowHandoff) return true;
+    const raw = await callOnStrict(execKey, 'workbenchWindow', [sessionId, JSON.stringify(caps.identity), JSON.stringify({ action: 'get' })], 12000);
+    if (!current()) return false;
+    const row = typeof raw === 'string' ? JSON.parse(raw) : raw;
+    if (!sameWorkspace(caps.identity, row?.workspace)) return false;
+    if (row.status === 'unregistered') return true;
+    return row.status === 'ok' && row.windowId === windowTransport.identity?.windowId && row.frozen === false;
   },
 
   async workspaceTerminals(sessionId: string, execKey: string, workingDir: string, isCurrent: () => boolean) {
@@ -3813,6 +4020,13 @@ export const api = {
     return unsubscribe;
   },
 
+  onExecutorConnectionStatus(executor: string, callback: ConnectionStatusCallback): () => void {
+    let previous = !!pool.get(executor)?.isOpen; callback(previous);
+    return onExecStatus(() => { const connected = !!pool.get(executor)?.isOpen;
+      if (connected !== previous) { previous = connected; callback(connected); }
+    });
+  },
+
   async codexLocalThreads(backendId: string, execKey?: string): Promise<{ status: string; threads: any[]; message?: string }> {
     const conn = (execKey && pool.get(execKey)) || homeConn;
     const result = await conn.request('codexLocalThreads', [backendId], 45000);
@@ -4054,24 +4268,28 @@ export const api = {
   // 自动路由)。所以显式带上该会话的 execKey,把请求发到它归属的节点;缺省回落
   // home(向后兼容)。
   /** 服务器工作目录清单：relpath → {hash, size, mtime}，供客户端做三向增量比对。 */
-  async syncManifest(workingDir: string, execKey?: string, includeGit = false): Promise<{
+  async syncManifest(workingDir: string, execKey?: string, includeGit = false, rules?: SyncScanRules): Promise<{
     status: string; message?: string; root?: string;
     files?: Record<string, { hash: string; size: number; mtime?: number }>;
   }> {
     try {
       const result = await callOnStrict(
-        execKey, 'syncManifest', [workingDir, includeGit], SYNC_MANIFEST_TIMEOUT_MS,
+        execKey, hasScanRules(rules) ? 'syncScopedManifest' : 'syncManifest',
+        hasScanRules(rules) ? [workingDir, includeGit, rules] : [workingDir, includeGit], SYNC_MANIFEST_TIMEOUT_MS,
       );
       const parsed = parseRpcObject<{
-        status: string; message?: string; root?: string;
+        status: string; message?: string; root?: string; scanRules?: SyncScanRules;
         files?: Record<string, { hash: string; size: number; mtime?: number }>;
       }>(result, { status: 'error', message: '执行端返回了空的文件清单响应' });
+      if (hasScanRules(rules) && parsed.status === 'ok' && JSON.stringify(parsed.scanRules) !== JSON.stringify(rules)) {
+        return { status: 'error', message: '执行端未确认扫描范围，请更新执行端；不会回退全量扫描' };
+      }
       return { ...parsed, files: filterGitMetadata(parsed.files, includeGit) };
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error || '');
       // 仅在明确是旧执行端参数数量不兼容时回退一次；超时/断线绝不重扫，避免
       // 在执行端叠加两份大目录哈希任务。
-      if (!includeGit && /positional argument|takes .* argument|unexpected argument/i.test(message)) {
+      if (!hasScanRules(rules) && !includeGit && /positional argument|takes .* argument|unexpected argument/i.test(message)) {
         try {
           const legacy = await callOnStrict(
             execKey, 'syncManifest', [workingDir], SYNC_MANIFEST_TIMEOUT_MS,
@@ -4623,6 +4841,192 @@ export const api = {
     return () => { permissionRequestCallbacks = permissionRequestCallbacks.filter((cb) => cb !== callback); };
   },
 
+  onUserInteraction(callback: (row: UserInteraction, executor: string) => void): () => void {
+    interactionCallbacks.add(callback);
+    return () => { interactionCallbacks.delete(callback); };
+  },
+  async taskWorkspaceInspect(session: string, executor: string): Promise<import('./types/taskWorkspaces').TaskRepository & { status: string; notice: string; preparation?: string }> {
+    return collaborationCall(executor, 'taskWorkspaceInspect', [session]);
+  },
+  async taskWorkspacePlan(session: string, executor: string, request: string, config: unknown): Promise<import('./types/taskWorkspaces').TaskWorkspace> {
+    return collaborationCall(executor, 'taskWorkspacePlan', [session, request, JSON.stringify(config)]);
+  },
+  async taskWorkspaceCreate(session: string, executor: string, id: string, request: string, fingerprint: string): Promise<import('./types/taskWorkspaces').TaskWorkspace> {
+    return collaborationCall(executor, 'taskWorkspaceCreate', [session, id, request, fingerprint]);
+  },
+  async taskWorkspaceStatus(session: string, executor: string, id: string): Promise<import('./types/taskWorkspaces').TaskWorkspace> {
+    return collaborationCall(executor, 'taskWorkspaceStatus', [session, id]);
+  },
+  async taskWorkspaceStart(session: string, executor: string, id: string, request: string): Promise<{ status: string; result?: { notice?: string } }> {
+    return collaborationCall(executor, 'taskWorkspaceStart', [session, id, request]);
+  },
+  async taskWorkspaceArchive(session: string, executor: string, id: string, request: string): Promise<import('./types/taskWorkspaces').TaskWorkspace> {
+    return collaborationCall(executor, 'taskWorkspaceArchive', [session, id, request]);
+  },
+  async taskWorkspaceCleanupPlan(session: string, executor: string, id: string): Promise<import('./types/taskWorkspaces').TaskWorkspace> {
+    return collaborationCall(executor, 'taskWorkspaceCleanupPlan', [session, id]);
+  },
+  async taskWorkspaceCleanup(session: string, executor: string, id: string, request: string, fingerprint: string): Promise<import('./types/taskWorkspaces').TaskWorkspace> {
+    return collaborationCall(executor, 'taskWorkspaceCleanup', [session, id, request, fingerprint]);
+  },
+  async projectMergeDiscover(session: string, executor: string, query = ''): Promise<{ items: Array<{ id: string; title: string; workingDir: string }>; truncated: boolean }> {
+    return collaborationCall(executor, 'projectMergeDiscover', [session, query]);
+  },
+  async projectMergePreview(session: string, executor: string, source: string, target: string, request: string): Promise<import('./types/taskWorkspaces').ProjectMerge> {
+    return collaborationCall(executor, 'projectMergePreview', [session, source, target, request]);
+  },
+  async projectMergeStatus(session: string, executor: string, id: string): Promise<import('./types/taskWorkspaces').ProjectMerge> {
+    return collaborationCall(executor, 'projectMergeStatus', [session, id]);
+  },
+  async projectMergeAction(session: string, executor: string, action: 'Prepare' | 'Verify' | 'Apply' | 'Cancel' | 'Start', row: import('./types/taskWorkspaces').ProjectMerge, request: string): Promise<import('./types/taskWorkspaces').ProjectMerge> {
+    const params = action === 'Prepare' ? [session, row.id, request, row.planFingerprint] : action === 'Apply' ? [session, row.id, request, row.candidate, row.planFingerprint] : action === 'Verify' ? [session, row.id] : [session, row.id, request];
+    const result = await collaborationCall<any>(executor, 'projectMerge' + action, params, 15000);
+    if (action === 'Start') { if (result.status !== 'succeeded') throw new Error(result.result?.notice || result.status); return api.projectMergeStatus(session, executor, row.id); }
+    return result;
+  },
+  onProjectMergeUpdated(callback: (row: CollaborationSummary, executor: string) => void): () => void {
+    projectMergeCallbacks.add(callback); return () => { projectMergeCallbacks.delete(callback); };
+  },
+  onTaskWorkspaceUpdated(callback: (row: CollaborationSummary, executor: string) => void): () => void {
+    taskWorkspaceCallbacks.add(callback); return () => { taskWorkspaceCallbacks.delete(callback); };
+  },
+  async collaborationList(session: string, executor: string, kind: string, offset = 0, search = ''): Promise<{ items: CollaborationSummary[]; nextOffset: number | null }> {
+    const epoch = relayIdentityEpoch;
+    const result = await callOnStrict(executor, 'sessionCollaborationList', [session, kind, offset, 50, search], 12000);
+    if (epoch !== relayIdentityEpoch) throw new Error('身份已变化');
+    const row = typeof result === 'string' ? JSON.parse(result) : result;
+    if (!Array.isArray(row?.items)) throw new Error('协作功能不可用');
+    return row;
+  },
+  async collaborationGet(session: string, executor: string, kind: string, id: string, revision = 0): Promise<any> {
+    const epoch = relayIdentityEpoch;
+    const result = await callOnStrict(executor, 'sessionCollaborationGet', [session, kind, id, revision], 12000);
+    if (epoch !== relayIdentityEpoch) throw new Error('身份已变化');
+    return typeof result === 'string' ? JSON.parse(result) : result;
+  },
+  async roleProfileSave(session: string, executor: string, request: string, profile: Omit<RoleProfile, 'revision'>, revision: number): Promise<{ state: string; role?: RoleProfile; reason?: string }> {
+    const epoch = relayIdentityEpoch;
+    const result = await callOnStrict(executor, 'roleProfileSave', [session, request, JSON.stringify(profile), revision], 12000);
+    if (epoch !== relayIdentityEpoch) throw new Error('身份已变化，请核对原节点');
+    return typeof result === 'string' ? JSON.parse(result) : result;
+  },
+  onReviewUpdated(callback: (row: CollaborationSummary, executor: string) => void): () => void {
+    reviewCallbacks.add(callback); return () => { reviewCallbacks.delete(callback); };
+  },
+  async reviewTargets(session: string, executor: string, selected: string[] = []): Promise<Array<{ id: string; text: string; characters: number }>> {
+    return collaborationCall(executor, 'reviewTargets', selected.length ? [session, JSON.stringify(selected)] : [session]);
+  },
+  async reviewSnapshot(session: string, executor: string, targets: string[]): Promise<ReviewSnapshot> {
+    return collaborationCall(executor, 'reviewSnapshot', [session, JSON.stringify(targets)]);
+  },
+  async reviewSummarize(session: string, executor: string, request: string, targets: string[]): Promise<ReviewSnapshot> {
+    return collaborationCall(executor, 'reviewSummarize', [session, request, JSON.stringify(targets)], 45000);
+  },
+  async reviewSubmit(session: string, executor: string, request: string, intent: unknown): Promise<ReviewBatch> {
+    return collaborationCall(executor, 'reviewSubmit', [session, request, JSON.stringify(intent)]);
+  },
+  async reviewStatus(session: string, executor: string, request: string): Promise<ReviewBatch> {
+    return collaborationCall(executor, 'reviewStatus', [session, request]);
+  },
+  async reviewRevalidate(session: string, executor: string, report: string, revision: number): Promise<ReviewReport> {
+    return collaborationCall(executor, 'reviewRevalidate', [session, report, revision]);
+  },
+  async reviewStop(session: string, executor: string, batch: string, report = ''): Promise<ReviewBatch> {
+    return collaborationCall(executor, 'reviewStop', [session, batch, report]);
+  },
+  async reviewReference(session: string, executor: string, report: string, revision: number, claims: string[] = []): Promise<OpinionReference> {
+    return collaborationCall(executor, 'reviewReference', [session, report, revision, JSON.stringify(claims)]);
+  },
+  async reviewReferenceLookup(session: string, source: string, report: string, revision: number): Promise<{ status: string; notice?: string; reference?: OpinionReference }> {
+    const executor = getSessionExecKey(session);
+    if (!executor) throw new Error('原执行节点不可用');
+    return collaborationCall(executor, 'reviewReferenceLookup', [session, source, report, revision]);
+  },
+  async collaborationOpenSession(session: string, executor: string): Promise<any> {
+    const meta = await collaborationCall<any>(executor, 'loadSessionMeta', [session]);
+    if (!meta || meta.id !== session) throw new Error('目标会话不可用');
+    sessionExec.set(session, executor); persistSessionExec();
+    return meta;
+  },
+  onFollowupSuggestion(callback: (row: FollowupSuggestion, executor: string) => void): () => void {
+    followupCallbacks.add(callback);
+    return () => { followupCallbacks.delete(callback); };
+  },
+  onSessionSchedule(callback: (row: ScheduleEvent, executor: string) => void): () => void {
+    scheduleCallbacks.add(callback); return () => { scheduleCallbacks.delete(callback); };
+  },
+  async sessionScheduleList(session: string, executor: string, offset = 0): Promise<SchedulePage<SessionSchedule>> {
+    const row = await collaborationCall<SchedulePage<SessionSchedule>>(executor, 'sessionScheduleList', [session, offset]);
+    if (row?.version !== 1 || row.sessionId !== session || !Array.isArray(row.items)) throw new Error('执行节点尚未支持定时指令');
+    return row;
+  },
+  async sessionScheduleGet(session: string, executor: string, id: string): Promise<SessionSchedule> {
+    const row = await collaborationCall<SessionSchedule>(executor, 'sessionScheduleGet', [session, id]);
+    if (row?.id !== id || row.sessionId !== session) throw new Error('计划回执不匹配'); return row;
+  },
+  async sessionSchedulePreview(session: string, executor: string, config: ScheduleConfig): Promise<{ nextDueAt: number | null; localTime: string; timezone: string; dstPolicy: string }> {
+    const row = await collaborationCall<any>(executor, 'sessionSchedulePreview', [session, JSON.stringify(config)]);
+    if (!row || row.timezone !== config.timezone) throw new Error('执行节点未返回有效的时间预览'); return row;
+  },
+  async sessionScheduleSave(session: string, executor: string, intent: ScheduleIntent): Promise<ScheduleReceipt> {
+    const row = await collaborationCall<ScheduleReceipt>(executor, 'sessionScheduleSave', [session, JSON.stringify(intent)]);
+    if (!row || row.requestId !== intent.requestId || row.sessionId !== session || row.status !== 'succeeded') throw new Error('未获得匹配保存回执，请核对原请求'); return row;
+  },
+  async sessionScheduleRequestStatus(session: string, executor: string, id: string): Promise<ScheduleReceipt> {
+    const row = await collaborationCall<ScheduleReceipt>(executor, 'sessionScheduleRequestStatus', [session, id]);
+    if (!row || row.requestId !== id || row.sessionId !== session) throw new Error('未获得原请求回执'); return row;
+  },
+  async sessionScheduleOccurrences(session: string, executor: string, offset = 0): Promise<SchedulePage<ScheduleOccurrence>> {
+    const row = await collaborationCall<SchedulePage<ScheduleOccurrence>>(executor, 'sessionScheduleOccurrences', [session, offset]);
+    if (row?.version !== 1 || row.sessionId !== session || !Array.isArray(row.items)) throw new Error('未获得定时运行历史'); return row;
+  },
+  async sessionScheduleOutput(session: string, executor: string, id: string, offset = 0): Promise<{ messageId: string; text: string; nextOffset: number | null }> {
+    const row = await collaborationCall<any>(executor, 'sessionScheduleOutput', [session, id, offset]);
+    if (!row || typeof row.text !== 'string') throw new Error('原输出不可用'); return row;
+  },
+  async followupSuggestionSettings(session: string, executor: string, enabled?: boolean, config?: FollowupConfig): Promise<FollowupSettings> {
+    const epoch = relayIdentityEpoch;
+    const result = await callOnStrict(executor, 'followupSuggestionSettings', [session, ...(config ? [enabled ?? null, JSON.stringify(config)] : enabled === undefined ? [] : [enabled])], 12000);
+    if (epoch !== relayIdentityEpoch) throw new Error('身份已变化');
+    const row = typeof result === 'string' ? JSON.parse(result) : result;
+    if (![1, 2].includes(row?.version) || typeof row.enabled !== 'boolean' || config && (row.version !== 2 || !row.config)) throw new Error('执行节点尚未支持建议模型设置，请更新后重试');
+    if (config && (['backendId', 'model', 'reasoningEffort'].some(key => row.config[key] !== String(config[key as keyof FollowupConfig]).trim())
+      || row.config.timeoutSeconds !== config.timeoutSeconds)) throw new Error('建议设置回执与本次选择不符，请重新读取核对');
+    return row;
+  },
+  async followupSuggestionDismiss(session: string, executor: string, request: string): Promise<void> {
+    await callOnStrict(executor, 'followupSuggestionDismiss', [session, request], 12000);
+  },
+  async userInteractionList(sessionId: string, executor: string): Promise<{ items: UserInteraction[]; capability?: { questions: boolean | string; notice: string; permissionNotice?: string } }> {
+    const owner = getCurrentUserProfile().userId, epoch = relayIdentityEpoch;
+    const result = await callOnStrict(executor, 'userInteractionList', [sessionId, 1], 12000);
+    if (owner !== getCurrentUserProfile().userId || epoch !== relayIdentityEpoch) throw new Error('身份已变化');
+    const data = typeof result === 'string' ? JSON.parse(result) : result;
+    if (data?.version !== 1 || !Array.isArray(data.items)) throw new Error('执行节点尚未支持结构化问答');
+    data.items.forEach((row: UserInteraction) => interactionIndex.accept(executor, row));
+    return data;
+  },
+
+  async kitDelegationList(sessionId: string, executor: string): Promise<KitDelegationReceipt[]> {
+    const epoch = relayIdentityEpoch;
+    const result = await callOnStrict(executor, 'kitDelegationList', [sessionId], 12000);
+    if (epoch !== relayIdentityEpoch) throw new Error('用户已切换');
+    const data = typeof result === 'string' ? JSON.parse(result) : result;
+    if (data?.version !== 1 || !Array.isArray(data.items)) throw new Error('执行器尚未支持委托回执');
+    kitDelegations.updateRuns(executor || 'local', sessionId, data.waitingRuns || []);
+    data.items.filter((row: KitDelegationReceipt) => row.sessionId === sessionId).forEach((row: KitDelegationReceipt) => kitDelegations.accept(executor || 'local', row));
+    return data.items;
+  },
+  async userInteractionRespond(sessionId: string, executor: string, requestId: string, response: InteractionResponse): Promise<UserInteraction> {
+    const owner = getCurrentUserProfile().userId, epoch = relayIdentityEpoch;
+    const result = await callOnStrict(executor, 'userInteractionRespond', [sessionId, requestId, JSON.stringify(response)], 12000);
+    if (owner !== getCurrentUserProfile().userId || epoch !== relayIdentityEpoch) throw new Error('身份已变化，请核对原请求');
+    const row = typeof result === 'string' ? JSON.parse(result) : result;
+    if (!row?.id || row.id !== requestId || row.sessionId !== sessionId) throw new Error('未收到匹配回执');
+    interactionIndex.accept(executor, row);
+    return row;
+  },
+
   /** 获取应用展示版本号（同一天多次构建也不同）。 */
   async getAppVersion(): Promise<string> {
     const result = await call('getAppVersion');
@@ -4658,8 +5062,9 @@ export const api = {
   },
 
   /** 开始后台下载；进度通过 nodeUpdateStatus 轮询，不占住同一条 WebSocket。 */
-  async nodeUpdateStage(execKey: string, manifestUrl = '', artifactId = '', force = false): Promise<NodeUpdateStatus> {
-    const result = await callOnStrict(execKey, 'nodeUpdateStage', [manifestUrl, artifactId, force], 90_000);
+  async nodeUpdateStage(execKey: string, manifestUrl = '', artifactId = '', force = false, requestId = '', selectionFingerprint = ''): Promise<NodeUpdateStatus> {
+    const result = await callOnStrict(execKey, 'nodeUpdateStage', requestId
+      ? [manifestUrl, artifactId, force, requestId, selectionFingerprint] : [manifestUrl, artifactId, force], 90_000);
     return parseRpcObject<NodeUpdateStatus>(result, {
       phase: 'error', busy: false, error: '无法开始下载更新', platform: 'unknown', arch: 'unknown', desktop: false,
       current: { version: 'unknown' },
@@ -4676,8 +5081,8 @@ export const api = {
     });
   },
 
-  async nodeUpdateApply(execKey: string): Promise<{ status: string; requiresDesktop?: boolean; message?: string }> {
-    const result = await callOnStrict(execKey, 'nodeUpdateApply', [], 30_000);
+  async nodeUpdateApply(execKey: string, requestId = '', stageRequestId = ''): Promise<{ status: string; requiresDesktop?: boolean; message?: string }> {
+    const result = await callOnStrict(execKey, 'nodeUpdateApply', requestId ? [requestId, stageRequestId] : [], 30_000);
     return parseRpcObject(result, { status: 'error', message: '无法启动更新安装' });
   },
 

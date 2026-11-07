@@ -904,6 +904,7 @@ class WorkspaceKitStore:
         self._dir = paths.sub("workspace-kits")
         self._dir.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
+        self._inventory: dict[Path, tuple[tuple[int, int], str]] = {}
 
     def _path(self, session_id: str) -> Path:
         safe_id = re.sub(r"[^A-Za-z0-9_.-]", "_", session_id)
@@ -927,15 +928,25 @@ class WorkspaceKitStore:
         return state
 
     def list_session_ids(self) -> list[str]:
+        # 调度发现只重读变化的 sidecar；历史日志不能每两秒重新解析一遍。
+        inventory: dict[Path, tuple[tuple[int, int], str]] = {}
         result: list[str] = []
         for path in self._dir.glob("*.json"):
             try:
-                data = json.loads(path.read_text(encoding="utf-8"))
-                session_id = str(data.get("sessionId") or "").strip()
+                stat = path.stat()
+                version = (stat.st_mtime_ns, stat.st_size)
+                cached = self._inventory.get(path)
+                if cached is not None and cached[0] == version:
+                    session_id = cached[1]
+                else:
+                    data = json.loads(path.read_text(encoding="utf-8"))
+                    session_id = str(data.get("sessionId") or "").strip()
+                inventory[path] = (version, session_id)
                 if session_id:
                     result.append(session_id)
             except Exception:
                 continue
+        self._inventory = inventory
         return result
 
     def save(self, state: WorkspaceKitState) -> None:

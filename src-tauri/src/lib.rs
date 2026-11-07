@@ -272,6 +272,7 @@ struct UpdateInstallPlan {
     schema_version: u32,
     version: String,
     build_id: String,
+    request_id: String,
     artifact_path: String,
     artifact_sha256: String,
     wait_pids: Vec<u32>,
@@ -344,6 +345,7 @@ fn write_update_result(plan: &UpdateInstallPlan, ok: bool, error: &str, exit_cod
             .unwrap_or(0.0),
         "version": plan.version,
         "buildId": plan.build_id,
+        "requestId": plan.request_id,
         "ok": ok,
         "error": error,
         "exitCode": exit_code,
@@ -1017,7 +1019,11 @@ struct SyncFileInfo {
 #[derive(Serialize)]
 struct SyncScanResult {
     files: HashMap<String, SyncFileInfo>,
+    #[serde(rename = "scanRules", skip_serializing_if = "Option::is_none")]
+    scan_rules: Option<sync_scan_rules::ScanRules>,
 }
+
+mod sync_scan_rules;
 
 fn hex_encode(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 2);
@@ -1108,6 +1114,13 @@ fn scan_dir(
     hash_files: bool,
     out: &mut HashMap<String, SyncFileInfo>,
 ) {
+    scan_dir_scoped(root, cur, ignore, include_git, hash_files, out, None);
+}
+
+fn scan_dir_scoped(
+    root: &Path, cur: &Path, ignore: &[String], include_git: bool, hash_files: bool,
+    out: &mut HashMap<String, SyncFileInfo>, rules: Option<&sync_scan_rules::ScanRules>,
+) {
     use std::io::Read;
     let entries = match std::fs::read_dir(cur) {
         Ok(entries) => entries,
@@ -1125,8 +1138,9 @@ fn scan_dir(
             Err(_) => continue,
         };
         if sync_is_ignored(&rel, ignore, include_git) { continue; }
+        if rules.is_some_and(|r| !r.allows(&rel, file_type.is_dir())) { continue; }
         if file_type.is_dir() {
-            scan_dir(root, &path, ignore, include_git, hash_files, out);
+            scan_dir_scoped(root, &path, ignore, include_git, hash_files, out, rules);
         } else if file_type.is_file() {
             let metadata = match entry.metadata() {
                 Ok(metadata) => metadata,
@@ -1170,8 +1184,24 @@ async fn dir_sync_scan(
         if !root.is_dir() { return Err("副本目录不存在".into()); }
         let mut files = HashMap::new();
         scan_dir(&root, &root, &ignore, include_git.unwrap_or(false), hash_files.unwrap_or(true), &mut files);
-        Ok(SyncScanResult { files })
+        Ok(SyncScanResult { files, scan_rules: None })
     }).await.map_err(|error| error.to_string())?
+}
+
+// 独立命令确保旧桌面端不会忽略新参数而偷偷全量扫描。
+#[tauri::command]
+async fn dir_sync_scan_scoped(
+    dir: String, ignore: Vec<String>, include_git: bool, hash_files: bool,
+    rules: sync_scan_rules::ScanRules,
+) -> Result<SyncScanResult, String> {
+    rules.validate()?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let root = std::fs::canonicalize(&dir).map_err(|e| e.to_string())?;
+        if !root.is_dir() { return Err("副本目录不存在".into()); }
+        let mut files = HashMap::new();
+        scan_dir_scoped(&root, &root, &ignore, include_git, hash_files, &mut files, Some(&rules));
+        Ok(SyncScanResult { files, scan_rules: Some(rules) })
+    }).await.map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -1184,6 +1214,27 @@ fn dir_sync_read_file(dir: String, rel: String) -> Result<String, String> {
 #[cfg(test)]
 mod sync_scan_tests {
     use super::*;
+
+    #[test]
+    fn scoped_scan_excludes_other_trees_and_protects_git() {
+        let root = std::env::temp_dir().join(format!("awu-scope-test-{}", uuid::Uuid::new_v4()));
+        for rel in ["src/a.ts", "src/cache/b", "src/error.log", "data/huge/x", ".git/config"] {
+            let file = root.join(rel);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(file, b"fixture").unwrap();
+        }
+        let rules = sync_scan_rules::ScanRules { version: 1, prefixes: vec!["src/".into()], excludes: vec!["cache/".into(), "*.log".into()] };
+        let mut files = HashMap::new();
+        scan_dir_scoped(&root, &root, &[], false, true, &mut files, Some(&rules));
+        assert_eq!(files.len(), 1);
+        assert_eq!(files["src/a.ts"].size, 7);
+        assert_eq!(files["src/a.ts"].hash.len(), 64);
+        let git = sync_scan_rules::ScanRules { version: 1, prefixes: vec![".git/".into()], excludes: vec![] };
+        let mut protected = HashMap::new();
+        scan_dir_scoped(&root, &root, &[], false, true, &mut protected, Some(&git));
+        assert!(protected.is_empty());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
 
     #[test]
     fn metadata_scan_skips_hash_and_full_scan_keeps_digest() {
@@ -1924,6 +1975,7 @@ pub fn run() {
             set_desktop_config,
             install_staged_update,
             dir_sync_scan,
+            dir_sync_scan_scoped,
             dir_sync_read_file,
             local_documents::local_document_bind,
             local_documents::local_document_read,

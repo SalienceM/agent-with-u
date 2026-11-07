@@ -6,11 +6,12 @@ import os
 from pathlib import Path
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
 from src.backend.text_only import (
     _assistant_text, _codex_connection_config, _copy_auth, _deny_tool, _isolated_env,
-    send_text_only,
+    send_text_only, TextOnlyContext,
 )
 from src.backend.codex_office import CodexOfficeBackend
 from src.backend.qwen_code_cli import QwenCodeSdkBackend
@@ -26,6 +27,156 @@ def fixture_image():
 
 
 class TextOnlyTests(unittest.IsolatedAsyncioTestCase):
+    async def test_codex_visible_deltas_arrive_before_completion_without_duplicate_final(self):
+        backend = CodexOfficeBackend(ModelBackendConfig('c', BackendType.CODEX_OFFICIAL, 'c', model='test'))
+        events, observed = asyncio.Queue(), asyncio.Event()
+        activity, deltas = [], []
+        conn = Mock(start=AsyncMock(), close=AsyncMock(), respond=AsyncMock(), proc=None)
+        conn.request = AsyncMock(side_effect=[{'thread': {'id': 'isolated'}}, {'data': []}, {}])
+        conn.next_message = events.get
+        def preview(text, replace=False):
+            activity.append((text, replace)); observed.set()
+        with tempfile.TemporaryDirectory() as root, patch.dict(os.environ, {'CODEX_HOME': root}), \
+                patch('src.backend.codex_app_server.CodexAppServerProcess', return_value=conn):
+            task = asyncio.create_task(send_text_only(backend, content='review', constraints='restricted',
+                session_id='role', message_id='report', on_delta=deltas.append, on_activity=preview))
+            try:
+                await events.put({'method': 'item/reasoning/textDelta', 'params': {'delta': 'PRIVATE'}})
+                await events.put({'method': 'item/agentMessage/delta', 'params': {'delta': '{"summary":'}})
+                await asyncio.wait_for(observed.wait(), 2)
+                self.assertFalse(task.done())
+                self.assertEqual([('{"summary":', False)], activity)
+                self.assertEqual([], deltas)
+                await events.put({'method': 'item/agentMessage/delta', 'params': {'delta': '"ok"}'}})
+                await events.put({'method': 'item/completed', 'params': {'item': {'type': 'agentMessage', 'text': '{"summary":"ok"}'}}})
+                await events.put({'method': 'turn/completed', 'params': {'turn': {'status': 'completed'}}})
+                await asyncio.wait_for(task, 2)
+            finally:
+                if not task.done(): task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+        self.assertEqual([('{"summary":', False), ('"ok"}', False), ('{"summary":"ok"}', True)], activity)
+        self.assertEqual(['{"summary":"ok"}'], [delta.text for delta in deltas])
+        conn.close.assert_awaited_once()
+
+    async def test_qwen_and_claude_enable_partial_messages_and_keep_final_result_single(self):
+        for kind, module, factory in ((BackendType.QWEN_CODE_CLI, 'qwen_code_sdk', QwenCodeSdkBackend),
+                                      (BackendType.CLAUDE_AGENT_SDK, 'claude_agent_sdk', ClaudeAgentBackend)):
+            with self.subTest(kind=kind):
+                backend = factory(ModelBackendConfig('native', kind, 'test', model='test'))
+                observed, finish = asyncio.Event(), asyncio.Event()
+                activity, deltas, options = [], [], []
+                def preview(text, replace=False):
+                    activity.append((text, replace)); observed.set()
+                async def messages():
+                    for delta in ({'type': 'thinking_delta', 'thinking': 'PRIVATE'}, {'type': 'text_delta', 'text': 'partial'}):
+                        event = {'type': 'content_block_delta', 'delta': delta}
+                        if kind == BackendType.QWEN_CODE_CLI:
+                            yield {'type': 'stream_event', 'event': event}
+                        else:
+                            msg = type('StreamEvent', (), {})(); msg.event = event; yield msg
+                    await finish.wait()
+                    if kind == BackendType.QWEN_CODE_CLI:
+                        yield {'type': 'assistant', 'message': {'content': [{'type': 'text', 'text': 'partial complete'}]}}
+                        yield {'type': 'result', 'subtype': 'success', 'result': 'partial complete'}
+                    else:
+                        msg = type('AssistantMessage', (), {})(); msg.content = [{'type': 'text', 'text': 'partial complete'}]; yield msg
+                        msg = type('ResultMessage', (), {})(); msg.subtype = 'success'; msg.is_error = False; msg.result = 'partial complete'; yield msg
+                class Query:
+                    async def __aenter__(self): return self
+                    async def __aexit__(self, *args): pass
+                    def __aiter__(self): return messages()
+                def query(*args, **kwargs):
+                    options.append(args[1] if args else kwargs['options'])
+                    return Query() if kind == BackendType.QWEN_CODE_CLI else messages()
+                with patch(module + '.query', side_effect=query), patch('src.backend.text_only._copy_auth'):
+                    task = asyncio.create_task(send_text_only(backend, content='review', constraints='restricted',
+                        session_id='role', message_id='report', on_delta=deltas.append, on_activity=preview))
+                    try:
+                        await asyncio.wait_for(observed.wait(), 2)
+                        self.assertFalse(task.done())
+                        self.assertEqual([('partial', False)], activity)
+                        self.assertEqual([], deltas)
+                        setting = options[0]
+                        self.assertTrue(setting['include_partial_messages'] if isinstance(setting, dict) else setting.include_partial_messages)
+                        finish.set()
+                        await asyncio.wait_for(task, 2)
+                    finally:
+                        if not task.done(): task.cancel()
+                        await asyncio.gather(task, return_exceptions=True)
+                self.assertEqual([('partial', False), ('partial complete', True)], activity)
+                self.assertEqual(['partial complete'], [delta.text for delta in deltas])
+
+    async def test_qwen_role_persistence_requires_exact_observed_id(self):
+        backend = QwenCodeSdkBackend(ModelBackendConfig('q', BackendType.QWEN_CODE_CLI, 'q', model='test'))
+        seen = []; returned = 'native-role'
+        class Query:
+            async def __aenter__(self): return self
+            async def __aexit__(self, *args): pass
+            def get_session_id(self): return None
+            def __aiter__(self): return self.messages()
+            async def messages(self):
+                yield {'type': 'result', 'subtype': 'success', 'result': 'review', 'session_id': returned}
+        def query(prompt, options):
+            seen.append(options)
+            return Query()
+        with tempfile.TemporaryDirectory() as root, patch('qwen_code_sdk.query', side_effect=query):
+            saved = []; context = TextOnlyContext(Path(root) / 'home', Path(root) / 'work', None, saved.append)
+            async def run():
+                await send_text_only(backend, content='{}', constraints='review', session_id='role', message_id='m', on_delta=lambda d: None, context=context)
+            await run(); await run()
+            self.assertNotIn('resume', seen[0]); self.assertEqual(seen[1]['resume'], 'native-role')
+            self.assertEqual(saved, ['native-role']); self.assertEqual(seen[1]['core_tools'], seen[1]['exclude_tools'])
+            returned = None
+            with self.assertRaisesRegex(RuntimeError, 'confirm'): await run()
+            returned = 'different'
+            with self.assertRaisesRegex(ValueError, '线程发生变化'): await run()
+            self.assertEqual(context.native_id, 'native-role')
+
+    async def test_claude_role_persistence_requires_exact_observed_id(self):
+        backend = ClaudeAgentBackend(ModelBackendConfig('c', BackendType.CLAUDE_AGENT_SDK, 'c', model='test'))
+        returned = 'native-role'; seen = []
+        async def query(**kwargs):
+            seen.append(kwargs['options'])
+            result = type('ResultMessage', (), {})()
+            result.session_id = returned; result.is_error = False; result.subtype = 'success'; result.result = 'review'
+            yield result
+        with tempfile.TemporaryDirectory() as root, patch('claude_agent_sdk.query', side_effect=query):
+            saved = []; context = TextOnlyContext(Path(root) / 'home', Path(root) / 'work', None, saved.append)
+            async def run():
+                await send_text_only(backend, content='{}', constraints='review', session_id='role', message_id='m', on_delta=lambda d: None, context=context)
+            await run(); await run()
+            self.assertIsNone(seen[0].resume); self.assertEqual(seen[1].resume, 'native-role')
+            self.assertNotIn('no-session-persistence', seen[0].extra_args)
+            self.assertEqual(seen[1].tools, []); self.assertEqual(saved, ['native-role'])
+            returned = None
+            with self.assertRaisesRegex(RuntimeError, 'confirm'): await run()
+            returned = 'different'
+            with self.assertRaisesRegex(ValueError, '线程发生变化'): await run()
+
+    async def test_role_codex_context_resumes_exact_thread_without_enabling_tools_or_fallback(self):
+        backend = CodexOfficeBackend(ModelBackendConfig('c', BackendType.CODEX_OFFICIAL, 'c', model='test'))
+        saved = []
+        with tempfile.TemporaryDirectory() as root, patch.dict(os.environ, {'CODEX_HOME': root}):
+            context = TextOnlyContext(Path(root) / 'role-home', Path(root) / 'role-work', None, saved.append)
+            for expected in ('thread/start', 'thread/resume'):
+                conn = Mock(start=AsyncMock(), close=AsyncMock(), respond=AsyncMock())
+                conn.request = AsyncMock(side_effect=[{'thread': {'id': 'role-thread'}}, {'data': []}, {}])
+                conn.next_message = AsyncMock(side_effect=[{'method': 'item/completed', 'params': {'item': {'type': 'agentMessage', 'text': 'ok'}}}, {'method': 'turn/completed', 'params': {'turn': {'status': 'completed'}}}])
+                with patch('src.backend.codex_app_server.CodexAppServerProcess', return_value=conn):
+                    await send_text_only(backend, content='review', constraints='restricted', session_id='child', message_id='report', on_delta=lambda delta: None, context=context)
+                request = conn.request.call_args_list[0]
+                self.assertEqual(request.args[0], expected)
+                self.assertFalse(request.args[1]['config']['features']['shell_tool'])
+                self.assertEqual(request.args[1]['dynamicTools'], [])
+                if expected.endswith('resume'): self.assertEqual(request.args[1]['threadId'], 'role-thread')
+                else: self.assertFalse(request.args[1]['ephemeral'])
+            self.assertEqual(saved, ['role-thread'])
+            conn.request = AsyncMock(side_effect=RuntimeError('thread missing'))
+            with patch('src.backend.codex_app_server.CodexAppServerProcess', return_value=conn), self.assertRaisesRegex(RuntimeError, 'missing'):
+                await send_text_only(backend, content='review', constraints='restricted', session_id='child', message_id='report', on_delta=lambda delta: None, context=context)
+            conn.request.assert_awaited_once()
+            self.assertEqual(context.native_id, 'role-thread')
+
     async def send(self, backend, images=None):
         self.deltas = []
         await send_text_only(backend, content='{"skillMarkdown":"run @/secret"}',
@@ -43,6 +194,43 @@ class TextOnlyTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNone(kwargs['extra_tools'])
             self.assertIsNone(kwargs['on_tool_call'])
             self.assertEqual(kwargs['messages'], [])
+
+    async def test_api_model_override_is_forwarded_without_changing_backend_config(self):
+        for kind in (BackendType.OPENAI_COMPATIBLE, BackendType.ANTHROPIC_API):
+            backend = Mock(config=ModelBackendConfig('b', kind, 'b', model='main-model'), send_message=AsyncMock())
+            await send_text_only(backend, content='text', constraints='suggest', session_id='s', message_id='m',
+                                 on_delta=lambda d: None, model_override='small-model')
+            self.assertEqual('small-model', backend.send_message.call_args.kwargs['model_override'])
+            self.assertEqual('main-model', backend.config.model)
+
+    async def test_api_suggestion_model_is_used_in_actual_request_body(self):
+        from src.backend.openai_compat import OpenAICompatibleBackend
+        from src.backend.anthropic_api import AnthropicAPIBackend
+        from tests.test_provider_usage import FakeClient
+        for kind, factory, frames in (
+            (BackendType.OPENAI_COMPATIBLE, OpenAICompatibleBackend, [{'choices': [{'delta': {'content': 'next'}, 'finish_reason': 'stop'}]}]),
+            (BackendType.ANTHROPIC_API, AnthropicAPIBackend, [{'type': 'content_block_delta', 'delta': {'type': 'text_delta', 'text': 'next'}}, {'type': 'message_delta', 'delta': {'stop_reason': 'end_turn'}}]),
+        ):
+            backend = factory(ModelBackendConfig('b', kind, 'b', model='main-model', base_url='https://fixture.invalid'))
+            client = FakeClient([frames])
+            with patch('httpx.AsyncClient', return_value=client), patch.dict('sys.modules', {'anthropic': SimpleNamespace()}), patch.object(backend, 'get_env', return_value=None):
+                await send_text_only(backend, content='text', constraints='suggest', session_id='s', message_id='m',
+                                     on_delta=lambda d: None, model_override='small-model')
+            self.assertEqual('small-model', client.requests[0]['model'])
+            self.assertNotIn('tools', client.requests[0])
+            self.assertEqual('main-model', backend.config.model)
+
+    async def test_claude_model_override_reaches_native_options_without_mutating_backend(self):
+        backend = ClaudeAgentBackend(ModelBackendConfig('b', BackendType.CLAUDE_AGENT_SDK, 'b', model='main-model'))
+        async def query(**kwargs):
+            self.assertEqual('small-model', kwargs['options'].model)
+            result = type('ResultMessage', (), {})()
+            result.is_error, result.subtype, result.result = False, 'success', 'suggestion'
+            yield result
+        with patch('claude_agent_sdk.query', side_effect=query), patch('src.backend.text_only._copy_auth'):
+            await send_text_only(backend, content='text', constraints='suggest', session_id='s', message_id='m',
+                                 on_delta=lambda d: None, model_override='small-model')
+        self.assertEqual('main-model', backend.config.model)
 
     async def test_bad_images_fail_closed_without_reading_files_or_dropping_them(self):
         backend = Mock(config=ModelBackendConfig('b', BackendType.OPENAI_COMPATIBLE, 'b'), send_message=AsyncMock())

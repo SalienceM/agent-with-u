@@ -172,13 +172,18 @@ def _git_environment() -> dict[str, str]:
 
 
 def _check_git_metadata(root: str, budget: SearchBudget) -> None:
+    _check_git_metadata_path(safe_document_path(root, '.git'), budget)
+
+
+def _check_git_metadata_path(path: Path, budget: SearchBudget) -> None:
     # Git 自身可沿 refs/loose objects/pack 的链接读取；先拒绝任何此类链接，
     # 不把 .git 视为天然可信的路径边界。元数据超预算时明确不可比较。
-    pending = ['.git']
+    root = str(path)
+    pending = ['']
     count = 0
     while pending:
         relative = pending.pop()
-        directory = safe_document_path(root, relative)
+        directory = path if not relative else safe_document_path(root, relative)
         with guarded_parent(Path(root), directory / '.awu-search-boundary') as fd:
             with os.scandir(directory if fd is None else fd) as entries:
                 for entry in entries:
@@ -186,13 +191,13 @@ def _check_git_metadata(root: str, budget: SearchBudget) -> None:
                     count += 1
                     if count > MAX_ENTRIES:
                         raise WorkbenchError('git_metadata_limit')
-                    child = relative + '/' + entry.name
+                    child = (relative + '/' if relative else '') + entry.name
                     safe_document_path(root, child)
                     if entry.is_dir(follow_symlinks=False):
                         pending.append(child)
 
 
-def _git_read(root: str, args: list[str], budget: SearchBudget) -> bytes:
+def _git_read(root: str, args: list[str], budget: SearchBudget, managed: dict | None = None) -> bytes:
     """只接受固定无子进程的对象读取命令；不运行 diff/textconv/filter/项目脚本。"""
     if not args or args[0] not in ('rev-parse', 'ls-tree', 'cat-file'):
         raise WorkbenchError('git_operation_denied')
@@ -205,15 +210,40 @@ def _git_read(root: str, args: list[str], budget: SearchBudget) -> bytes:
         raise WorkbenchError('git_executable_untrusted')
     # 禁止从工作区向上发现其他仓库；拒绝外部 worktree 元数据/对象链接。
     git_dir = safe_document_path(root, '.git')
-    if not git_dir.is_dir():
+    if git_dir.is_file() and managed:
+        from .task_git import canonical_path
+        from .session_collaboration_store import fingerprint
+        from .deepseek_harness_state import reject_links
+        try:
+            if canonical_path(root) != managed['root'] or git_dir.stat().st_size > 4096:
+                raise ValueError('root mismatch')
+            declaration = git_dir.read_text(encoding='utf-8').strip()
+            if not declaration.startswith('gitdir: '): raise ValueError('invalid gitdir')
+            actual = Path(declaration[8:])
+            if not actual.is_absolute(): actual = Path(root) / actual
+            if canonical_path(actual) != canonical_path(managed['gitDir']): raise ValueError('gitdir mismatch')
+            git_dir = actual.resolve(); reject_links(git_dir / 'commondir'); reject_links(git_dir / 'gitdir')
+            common = Path(managed['commonDir']); reject_links(common)
+            if canonical_path(git_dir / (git_dir / 'commondir').read_text().strip()) != canonical_path(common): raise ValueError('common-dir mismatch')
+            if canonical_path((git_dir / 'gitdir').read_text().strip()) != canonical_path(Path(root) / '.git'): raise ValueError('worktree backlink mismatch')
+            stat = common.stat()
+            if fingerprint([canonical_path(common), stat.st_dev, stat.st_ino]) != managed['repositoryId']: raise ValueError('repository mismatch')
+            for name in ('alternates', 'http-alternates'):
+                if (common / 'objects/info' / name).exists(): raise ValueError('external objects')
+            _check_git_metadata_path(common, budget)
+            _check_git_metadata_path(git_dir, budget)
+        except (ValueError, OSError, KeyError) as error:
+            raise WorkbenchError('git_managed_identity_changed') from error
+    elif not git_dir.is_dir():
         raise WorkbenchError('git_repository_unavailable')
-    for relative in ('.git/objects', '.git/objects/info', '.git/objects/pack', '.git/HEAD',
+    else:
+        for relative in ('.git/objects', '.git/objects/info', '.git/objects/pack', '.git/HEAD',
                      '.git/config', '.git/commondir', '.git/objects/info/alternates',
                      '.git/objects/info/http-alternates'):
-        candidate = safe_document_path(root, relative)
-        if candidate.name in ('commondir', 'alternates', 'http-alternates') and candidate.exists():
-            raise WorkbenchError('git_external_objects_unsupported')
-    _check_git_metadata(root, budget)
+            candidate = safe_document_path(root, relative)
+            if candidate.name in ('commondir', 'alternates', 'http-alternates') and candidate.exists():
+                raise WorkbenchError('git_external_objects_unsupported')
+        _check_git_metadata(root, budget)
     command = [str(binary), '--no-pager', '--no-replace-objects', f'--git-dir={git_dir}',
         f'--work-tree={root}', '-c', 'core.fsmonitor=false', '-c', f'core.hooksPath={os.devnull}',
         '-c', 'protocol.allow=never', '-c', 'maintenance.auto=false', '-c', 'gc.auto=0', *args]
@@ -271,16 +301,18 @@ def _git_read(root: str, args: list[str], budget: SearchBudget) -> bytes:
             raise WorkbenchError('git_cleanup_unconfirmed')
 
 
-def git_comparison(identity: WorkspaceIdentity, relative: str, cancelled: threading.Event) -> dict[str, Any]:
+def git_comparison(identity: WorkspaceIdentity, relative: str, cancelled: threading.Event, *, managed: dict | None = None) -> dict[str, Any]:
+    if managed and (managed['ownerId'] != identity.ownerId or managed['sessionId'] != identity.sessionId):
+        raise WorkbenchError('git_managed_identity_changed')
     target = safe_document_path(identity.workingDir, relative)
     relative = target.relative_to(identity.workingDir).as_posix()
     if '.git' in relative.split('/'):
         raise WorkbenchError('invalid_path')
     budget = SearchBudget(cancelled)
-    commit = _git_read(identity.workingDir, ['rev-parse', '--verify', 'HEAD^{commit}'], budget).strip()
+    commit = _git_read(identity.workingDir, ['rev-parse', '--verify', 'HEAD^{commit}'], budget, managed).strip()
     if not re.fullmatch(rb'[a-f0-9]{40,64}', commit):
         raise WorkbenchError('git_invalid_response')
-    entry = _git_read(identity.workingDir, ['ls-tree', '-z', commit.decode(), '--', relative], budget)
+    entry = _git_read(identity.workingDir, ['ls-tree', '-z', commit.decode(), '--', relative], budget, managed)
     blob: str | None = None
     data = b''
     if entry:
@@ -292,7 +324,7 @@ def git_comparison(identity: WorkspaceIdentity, relative: str, cancelled: thread
         if not match or name.decode('utf-8', errors='strict') != relative:
             raise WorkbenchError('git_nontext_entry')
         blob = match[1].decode()
-        data = _git_read(identity.workingDir, ['cat-file', 'blob', blob], budget)
+        data = _git_read(identity.workingDir, ['cat-file', 'blob', blob], budget, managed)
     baseline = decode_document(data, complete=True)
     if baseline['reasonCode']:
         raise WorkbenchError('git_nontext_entry')

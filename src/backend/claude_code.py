@@ -62,7 +62,8 @@ class ClaudeCodeOfficialBackend(ModelBackend):
         return resolve_claude_cli(getattr(self.config, "cli_path", None))
 
     def _build_cmd(self, content: str, agent_session_id: Optional[str], cwd: str,
-                   stdin_mode: bool = False) -> list[str]:
+                   stdin_mode: bool = False, interactive: bool = False,
+                   skip_permissions: Optional[bool] = None) -> list[str]:
         import os as _os
         cmd = [self._resolve_cli()]
 
@@ -80,12 +81,17 @@ class ClaudeCodeOfficialBackend(ModelBackend):
         if "Skill" not in tools:
             tools.append("Skill")
         for tool in tools:
+            if interactive and (tool == 'AskUserQuestion' or not skip_permissions and tool in {'Bash', 'Edit', 'Write'}):
+                continue
             cmd.extend(["--allowedTools", tool])
 
         cmd.extend(["--output-format", "stream-json", "--verbose"])
 
-        skip_permissions = getattr(self.config, "skip_permissions", True)
-        if skip_permissions:
+        if skip_permissions is None:
+            skip_permissions = getattr(self.config, "skip_permissions", True)
+        if interactive:
+            cmd.extend(['--permission-mode', 'default', '--permission-prompt-tool', 'stdio'])
+        elif skip_permissions:
             cmd.append("--dangerously-skip-permissions")
 
         # ★ MCP servers：写入临时配置文件，通过 --mcp-config 传给 CLI
@@ -215,6 +221,7 @@ class ClaudeCodeOfficialBackend(ModelBackend):
         on_permission_request: Optional[Callable[[PermissionRequest], Awaitable[bool]]] = None,
         constraints: Optional[str] = None,  # ★ Session-level constraints/rules/prompts
         sandbox_enabled: bool = True,  # ★ 沙盒开关
+        on_user_interaction=None,
     ) -> dict:
         self.clear_cancelled(session_id)
         _new_agent_sid: Optional[str] = agent_session_id
@@ -224,6 +231,7 @@ class ClaudeCodeOfficialBackend(ModelBackend):
                 on_delta(StreamDelta(session_id, message_id, delta_type, **kwargs))
 
         cwd = working_dir or getattr(self.config, "working_dir", None) or "."
+        skip_permissions = self.config.skip_permissions if skip_permissions is None else skip_permissions
 
         # ★ 注入约束/提示词到 prompt 中
         final_content = content
@@ -259,7 +267,7 @@ class ClaudeCodeOfficialBackend(ModelBackend):
             _stdin_data = stdin_msg.encode("utf-8")
             print(f"[OfficialBackend] images: {len(content_blocks) - 1} block(s), using stdin stream-json",
                   file=sys.stderr, flush=True)
-        elif len(final_content) > 8000:
+        else:
             # ★ 长文本通过 stdin 传递（避免 Windows 命令行 32K 字符限制）
             stdin_msg = json.dumps({
                 "type": "user",
@@ -269,7 +277,8 @@ class ClaudeCodeOfficialBackend(ModelBackend):
             print(f"[OfficialBackend] long content ({len(final_content)} chars), using stdin stream-json",
                   file=sys.stderr, flush=True)
 
-        cmd = self._build_cmd(final_content, agent_session_id, cwd, stdin_mode=bool(_stdin_data))
+        cmd = self._build_cmd(final_content, agent_session_id, cwd, stdin_mode=True,
+                              interactive=True, skip_permissions=skip_permissions)
         proc_env = self._build_env()
         claude_cli = cmd[0] if cmd else self._resolve_cli()
         if not cli_available(claude_cli):
@@ -302,27 +311,33 @@ class ClaudeCodeOfficialBackend(ModelBackend):
             stdin=subprocess.PIPE if _stdin_data else None,
             env=proc_env,
             cwd=cwd,
-            bufsize=1,
+            bufsize=0,
         )
         if sys.platform == "win32":
             # CREATE_NO_WINDOW 避免弹出 cmd 黑窗口
             _popen_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
             # Windows 下不指定 encoding，手动 decode 避免 GBK 崩溃
-        else:
-            _popen_kwargs["encoding"] = "utf-8"
-            _popen_kwargs["errors"] = "replace"
+
+        import threading
+        process_box: list = [None]
+        write_lock = threading.Lock()
+        def write_packet(packet: dict) -> None:
+            data = (json.dumps(packet, ensure_ascii=False) + '\n').encode('utf-8')
+            with write_lock:
+                proc = process_box[0]
+                if proc is None or proc.poll() is not None or proc.stdin.closed:
+                    raise RuntimeError('Claude 原运行已退出，未重发答案')
+                proc.stdin.write(data)
+                proc.stdin.flush()
 
         def _run():
             try:
                 proc = subprocess.Popen(cmd, **_popen_kwargs)
+                process_box[0] = proc
                 print(f"[OfficialBackend] pid={proc.pid}", file=sys.stderr, flush=True)
-                # ★ 有图片时写入 stdin 后立即关闭，触发 CLI 开始处理
-                if _stdin_data and proc.stdin:
-                    try:
-                        proc.stdin.write(_stdin_data)
-                        proc.stdin.close()
-                    except Exception as _e:
-                        print(f"[OfficialBackend] stdin write error: {_e}", file=sys.stderr, flush=True)
+                # 保持 stdin 开放用于 control_response；初始化完成后才发送用户输入。
+                write_packet({'type': 'control_request', 'request_id': 'awu-initialize',
+                              'request': {'subtype': 'initialize'}})
                 line_count = 0
                 while True:
                     raw = proc.stdout.readline()
@@ -335,7 +350,7 @@ class ClaudeCodeOfficialBackend(ModelBackend):
                     if not line:
                         continue
                     line_count += 1
-                    print(f"[OfficialBackend] #{line_count}: {line[:120]}", file=sys.stderr, flush=True)
+                    # 原生问答可能包含保密字段，不将 JSON 原文写入日志。
                     try:
                         obj = json.loads(line)
                         loop.call_soon_threadsafe(msg_queue.put_nowait, ("json", obj))
@@ -366,6 +381,49 @@ class ClaudeCodeOfficialBackend(ModelBackend):
         fut = loop.run_in_executor(None, _run)
         _done_emitted = False
         _usage: Optional[dict] = None
+        from .provider_usage import ClaudeTurnUsage
+        turn_usage = ClaudeTurnUsage()
+        control_tasks: dict[str, asyncio.Task] = {}
+        prompt_sent = False
+
+        async def answer_control(obj: dict) -> None:
+            from .claude_user_interactions import claude_question_input
+            request_id = obj.get('request_id')
+            req = obj.get('request') or {}
+            try:
+                if req.get('subtype') != 'can_use_tool':
+                    raise ValueError(f"尚未支持 Claude 控制请求：{req.get('subtype')}")
+                tool_id = req.get('tool_use_id')
+                if not tool_id:
+                    raise ValueError('Claude 控制请求缺少 tool_use_id')
+                tool_name, tool_input = req.get('tool_name'), req.get('input') or {}
+                if tool_name == 'AskUserQuestion':
+                    async def deliver_question(updated):
+                        decision = {'behavior': 'allow', 'updatedInput': updated} if updated is not None else {
+                            'behavior': 'deny', 'message': '用户未回答。请结束本轮并等待下一轮文字回复。'}
+                        await asyncio.to_thread(write_packet, {'type': 'control_response', 'response': {
+                            'subtype': 'success', 'request_id': request_id, 'response': decision}})
+                    updated = await claude_question_input(tool_input, tool_id, session_id=session_id,
+                        message_id=message_id, callback=on_user_interaction,
+                        cancelled=lambda: self.is_cancelled(session_id), deliver=deliver_question)
+                    if on_user_interaction is not None:
+                        return
+                    decision = {'behavior': 'allow', 'updatedInput': updated} if updated is not None else {
+                        'behavior': 'deny', 'message': '用户未回答。请结束本轮并等待下一轮文字回复。'}
+                else:
+                    granted = bool(skip_permissions)
+                    if on_permission_request:
+                        granted = await on_permission_request(PermissionRequest(session_id, message_id, tool_id,
+                            str(tool_name), json.dumps(tool_input, ensure_ascii=False), native_request_id=str(request_id)))
+                    decision = {'behavior': 'allow', 'updatedInput': tool_input} if granted else {'behavior': 'deny', 'message': '本次执行未获允许'}
+                await asyncio.to_thread(write_packet, {'type': 'control_response', 'response': {
+                    'subtype': 'success', 'request_id': request_id, 'response': decision}})
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                emit('error', error=f'Claude 交互失败：{exc}')
+                # 不重试可能已到达原生进程的答案。
+                self.abort(session_id)
         _suppress_exit_error = [False]  # auth 错误时压制 "exited with code 1" 提示
 
         def _process_json_obj(obj: dict):
@@ -377,6 +435,8 @@ class ClaudeCodeOfficialBackend(ModelBackend):
                 print(f"[OfficialBackend] session init: {_new_agent_sid}", file=sys.stderr, flush=True)
 
             elif msg_type == "assistant":
+                body = obj.get("message") or {}
+                turn_usage.observe(body.get("usage"), parent=obj.get("parent_tool_use_id"), model=body.get("model", ""))
                 for block in obj.get("message", {}).get("content", []):
                     btype = block.get("type", "")
                     if btype == "text":
@@ -471,12 +531,7 @@ class ClaudeCodeOfficialBackend(ModelBackend):
                         ))
                     else:
                         emit("resume_failed")
-                usage = obj.get("usage", {})
-                if usage:
-                    _usage = {
-                        "inputTokens": usage.get("input_tokens", 0),
-                        "outputTokens": usage.get("output_tokens", 0),
-                    }
+                _usage = turn_usage.finish(obj.get("usage"), obj.get("modelUsage"), _new_agent_sid)
 
         try:
             TIMEOUT = 7200
@@ -495,7 +550,26 @@ class ClaudeCodeOfficialBackend(ModelBackend):
                     break
 
                 if tag == "json":
-                    _process_json_obj(payload)
+                    if payload.get('type') == 'control_response':
+                        response = payload.get('response') or {}
+                        if response.get('request_id') == 'awu-initialize' and not prompt_sent:
+                            if response.get('subtype') != 'success':
+                                raise RuntimeError('Claude 原生交互初始化失败，未发送输入')
+                            await asyncio.to_thread(write_packet, json.loads(_stdin_data))
+                            prompt_sent = True
+                    elif payload.get('type') == 'control_request':
+                        key = str(payload.get('request_id') or '')
+                        if not key or key in control_tasks:
+                            raise RuntimeError('Claude 交互请求 ID 缺失或重复')
+                        control_tasks[key] = asyncio.create_task(answer_control(payload))
+                    elif payload.get('type') == 'control_cancel_request':
+                        task = control_tasks.get(str(payload.get('request_id') or ''))
+                        if task:
+                            task.cancel()
+                    else:
+                        _process_json_obj(payload)
+                    if payload.get('type') == 'result':
+                        break
                 elif tag == "text":
                     emit("text_delta", text=payload + "\n")
                 elif tag == "proc_done":
@@ -511,6 +585,19 @@ class ClaudeCodeOfficialBackend(ModelBackend):
             import traceback
             traceback.print_exc()
             emit("error", error=_exc_msg(e))
+        finally:
+            for task in control_tasks.values():
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*control_tasks.values(), return_exceptions=True)
+            proc = process_box[0]
+            if proc is not None:
+                if proc.stdin and not proc.stdin.closed:
+                    proc.stdin.close()
+                try:
+                    await asyncio.to_thread(proc.wait, timeout=3)
+                except subprocess.TimeoutExpired:
+                    proc.terminate()
 
         if not _done_emitted:
             emit("done", **(_usage and {"usage": _usage} or {}))

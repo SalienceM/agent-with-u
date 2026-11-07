@@ -17,6 +17,11 @@ const id = (value: unknown): value is string => typeof value === 'string' && /^[
 const natural = (value: unknown): value is number => Number.isSafeInteger(value) && Number(value) >= 1;
 const key = (executor: string, session: string) => JSON.stringify([executor, session]);
 export const windowMutations = new Set(['sendMessage', 'executeCommand', 'workspaceDocumentSave', 'syncReviewApply',
+  'harnessImageSubmit', 'harnessImageQueue', 'composerSubmit', 'userInteractionRespond',
+  'roleProfileSave', 'reviewSubmit', 'reviewSummarize', 'reviewStop', 'followupSuggestionSettings', 'followupSuggestionDismiss',
+  'taskWorkspacePlan', 'taskWorkspaceCreate', 'taskWorkspaceStart', 'taskWorkspaceArchive', 'taskWorkspaceCleanup',
+  'taskWorkspaceCleanupPlan', 'projectMergePreview', 'projectMergePrepare', 'projectMergeVerify', 'projectMergeApply', 'projectMergeCancel',
+  'projectMergeStart',
   'sessionFavoriteSet', 'updateSessionAppearance',
   'terminalCreate', 'terminalInput', 'terminalResize', 'terminalStop', 'languageServiceStart', 'languageServiceRequest', 'languageServiceStop',
   'steerMessage', 'redirectMessage', 'steerSeqTask', 'seqtaskAdd', 'seqtaskEdit', 'seqtaskRemove', 'seqtaskReorder',

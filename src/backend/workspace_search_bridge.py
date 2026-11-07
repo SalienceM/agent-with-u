@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import json
 import threading
+from functools import partial
 
 from .engine_workbench import WorkbenchError
 from .loop_control import ID_PATTERN
@@ -51,7 +52,8 @@ class WorkspaceSearchBridge:
         self._require_session_access(session_id)
         try:
             identity = self._search_identity(session_id, identity_json, request_id)
-            return await self._search_owned(identity, request_id, git_comparison, relative)
+            authority = getattr(self, '_task_git_authority', lambda sid: None)(session_id)
+            return await self._search_owned(identity, request_id, partial(git_comparison, managed=authority), relative)
         except (ValueError, TypeError, OSError) as error:
             return self._search_error(error)
 

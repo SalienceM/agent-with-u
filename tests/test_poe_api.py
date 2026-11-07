@@ -154,6 +154,7 @@ class PoeApiTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(captured[0]["model"], "GPT-Official-Bot")
         self.assertNotIn("tools", captured[0])
+        self.assertNotIn("stream_options", captured[0])
         self.assertFalse(tool_called)
 
 

@@ -9,6 +9,31 @@ const response = () => ({ status: 'ok', protocolVersion: 1,
   identity: { ownerId: 'alice', executorInstance: 'boot-1', sessionId: 'a', workingDir: '/project', workspaceRevision: 'a'.repeat(64) },
   capabilities: { viewMode: 1, windowHandoff: 0, documents: 0, languageServices: 0, terminal: 0 } });
 
+test('concurrent workbench consumers share only an in-flight read, preserving each identity check', async () => {
+  let finish, calls = 0, current = true;
+  const call = async () => { calls++; return new Promise(resolve => { finish = resolve; }); };
+  const first = readWorkbenchCapabilities(target, call, () => true);
+  const stale = readWorkbenchCapabilities(target, call, () => current);
+  await Promise.resolve();
+  assert.equal(calls, 1);
+  current = false; finish(response());
+  assert.equal((await first).status, 'ok');
+  await assert.rejects(stale, /身份已变化/);
+  const fresh = readWorkbenchCapabilities(target, call, () => true);
+  await Promise.resolve();
+  assert.equal(calls, 2);
+  finish(response()); await fresh;
+});
+
+test('capability failures are not cached or automatically retried', async () => {
+  let calls = 0;
+  const call = async () => { calls++; throw new Error('offline'); };
+  await assert.rejects(readWorkbenchCapabilities(target, call, () => true), /offline/);
+  assert.equal(calls, 1);
+  await assert.rejects(readWorkbenchCapabilities(target, call, () => true), /offline/);
+  assert.equal(calls, 2);
+});
+
 test('legacy view mode defaults to Chat, independently of execution type', () => {
   for (const value of [undefined, null, '', 'loop', {}, []]) assert.equal(normalizeSessionViewMode(value), 'chat');
   assert.equal(normalizeSessionViewMode('engine'), 'engine');

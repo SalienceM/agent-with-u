@@ -117,6 +117,85 @@ class Client:
 
 
 class FilePanelConcurrencyTests(unittest.IsolatedAsyncioTestCase):
+    async def test_slow_release_does_not_block_remote_session_observations(self):
+        from src.backend.relay import RelayClientTransport
+        replies = asyncio.Queue()
+        class Link:
+            async def _send(self, frame):
+                await replies.put(json.loads(frame['msg']))
+        transport = RelayClientTransport('view', Link(), identity='alice')
+        task = asyncio.create_task(self.bridge.handle_client(transport))
+        started, finish = asyncio.Event(), asyncio.Event()
+        async def release_scan():
+            started.set()
+            await finish.wait()
+            return 'scanned'
+        self.bridge._rpc_releaseScan = release_scan
+        self.bridge._rpc_sessionWorkbenchCapabilities = lambda: (_REQUEST_OWNER_ID.get(), _REQUEST_CLIENT.get().cid)
+        self.bridge._rpc_loadSessionMeta = lambda: 'meta'
+        self.bridge._rpc_loadSession = lambda: 'content'
+        self.bridge._rpc_listSessions = lambda: 'sessions'
+        write = Mock(return_value='saved')
+        self.bridge._rpc_testWrite = write
+        def send(number, method):
+            transport.feed(json.dumps({'id': number, 'method': method, 'params': []}))
+        try:
+            send(1, 'releaseScan')
+            await asyncio.wait_for(started.wait(), .5)
+            send(2, 'testWrite')
+            for number, method in enumerate(('sessionWorkbenchCapabilities', 'loadSessionMeta', 'listSessions', 'loadSession', 'ping'), 3):
+                send(number, method)
+            results = [await asyncio.wait_for(replies.get(), .5) for _ in range(5)]
+            self.assertEqual({row['id'] for row in results}, set(range(3, 8)))
+            self.assertEqual(next(row['result'] for row in results if row['id'] == 3), ['alice', 'view'])
+            write.assert_not_called()
+            finish.set()
+            self.assertEqual([ (await asyncio.wait_for(replies.get(), .5))['id'] for _ in range(2)], [1, 2])
+        finally:
+            finish.set()
+            transport.close_feed()
+            await task
+
+    async def test_full_slow_read_pool_does_not_starve_ping_and_is_bounded(self):
+        started, finish = asyncio.Event(), asyncio.Event()
+        count = 0
+        async def status():
+            nonlocal count
+            count += 1
+            if count == 16:
+                started.set()
+            await finish.wait()
+            return 'release'
+        self.bridge._rpc_releaseStatus = status
+        client, _ = self.client('alice')
+        for number in range(16):
+            client.request(number, 'releaseStatus')
+        await asyncio.wait_for(started.wait(), .5)
+        client.request(16, 'releaseStatus')
+        client.request(17, 'ping')
+        try:
+            results = [await asyncio.wait_for(client.outgoing.get(), .5) for _ in range(2)]
+            self.assertEqual({row['id'] for row in results}, {16, 17})
+            self.assertIn('未执行', next(row['error'] for row in results if row['id'] == 16))
+            self.assertEqual(count, 16)
+        finally:
+            finish.set()
+
+    async def test_disconnect_discards_queued_writes(self):
+        started = asyncio.Event()
+        async def scan():
+            started.set()
+            await asyncio.Event().wait()
+        self.bridge._rpc_releaseScan = scan
+        write = self.bridge._rpc_testWrite = Mock()
+        client, task = self.client('alice')
+        client.request(1, 'releaseScan')
+        await asyncio.wait_for(started.wait(), .5)
+        client.request(2, 'testWrite')
+        client.incoming.put_nowait(None)
+        await asyncio.wait_for(task, .5)
+        write.assert_not_called()
+
     async def test_slow_codex_catalog_does_not_block_chat_or_stop(self):
         started = asyncio.Event()
         release = asyncio.Event()
@@ -139,6 +218,9 @@ class FilePanelConcurrencyTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.bridge = BridgeWS.__new__(BridgeWS)
         self.bridge._clients = set()
+        # handle_client 会只读检查更新回执；夹具不接触真实安装日志。
+        self.bridge._update_manager = Mock()
+        self.bridge._update_manager.journal.active.return_value = {}
         self.bridge._client_meta = {}
         self.bridge._owner_id_for_client = lambda client: client.identity
         self.bridge._emit_clients_changed = Mock()

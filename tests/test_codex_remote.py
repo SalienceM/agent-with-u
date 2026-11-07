@@ -500,6 +500,8 @@ class CodexRemoteTurnTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["agentSessionId"], "remote-thread-1")
         self.assertEqual("".join(d.text or "" for d in deltas if d.type == "text_delta"), "远端成功")
         self.assertEqual(deltas[-1].type, "done")
+        self.assertFalse(deltas[-1].usage["baselineRequired"])
+        self.assertTrue(deltas[-1].usage["reported"])
         requests = _FakeAppServer.instances[0].requests
         self.assertEqual([r[0] for r in requests], ["thread/start", "turn/start"])
         self.assertEqual(requests[0][1]["cwd"], "/srv/project")
@@ -528,6 +530,8 @@ class CodexRemoteTurnTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(instance.host)
         self.assertIn("app-server", " ".join(instance.launch_command))
         self.assertEqual(instance.requests[0][0], "thread/resume")
+        self.assertTrue(deltas[-1].usage["baselineRequired"])
+        self.assertTrue(deltas[-1].usage["cumulative"])
         self.assertEqual(instance.requests[0][1]["sandbox"], "workspace-write")
         self.assertNotIn("sandboxPolicy", instance.requests[1][1])
 

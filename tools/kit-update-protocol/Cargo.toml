@@ -1,0 +1,20 @@
+[package]
+name = "awu-kit-update-protocol-tests"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+path = "../../src-tauri/src/kit_update.rs"
+
+[dependencies]
+serde_json = "1"
+sha2 = "0.10"
+uuid = { version = "1", features = ["v4"] }
+
+[[test]]
+name = "kit-desktop"
+path = "../../src-tauri/src/kit_desktop.rs"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Registry"] }

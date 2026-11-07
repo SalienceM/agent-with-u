@@ -25,6 +25,11 @@ frontend/public/vendor/docx-preview/
 Thumbs.db
 src-tauri/target/
 tools/
+!/tools/
+/tools/*
+!/tools/deepseek-harness/
+!/tools/kit-update-protocol/
+/tools/kit-update-protocol/target/
 src-tauri/binaries/
 installer/claude-env/
 installer/_staging/

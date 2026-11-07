@@ -1,6 +1,7 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { api, getCurrentUserProfile, onExecStatus, onCurrentUserChanged, kitUpdateScope } from '../api';
 import { KitLocalUpdateCard } from './KitLocalUpdateCard';
+import { isLocalUpdateCapability } from '../types/workspaceKits';
 import type {
   WorkspaceKitState,
   WorkspaceKit,
@@ -20,6 +21,8 @@ interface Props {
   sessionId: string;
   open: boolean;
   onClose: () => void;
+  targetRunId?: string;
+  targetStepId?: string;
 }
 
 type Draft = Omit<WorkspaceKit, 'id' | 'lastRunId' | 'createdAt' | 'updatedAt'> & { id?: string };
@@ -257,7 +260,7 @@ const FieldLabel: React.FC<{ children: React.ReactNode }> = ({ children }) => (
   <div style={{ fontSize: 11, color: 'var(--theme-text-muted)', marginBottom: 5 }}>{children}</div>
 );
 
-export const WorkspaceKitsPanel: React.FC<Props> = ({ sessionId, open, onClose }) => {
+export const WorkspaceKitsPanel: React.FC<Props> = ({ sessionId, open, onClose, targetRunId, targetStepId }) => {
   const [scope, setScope] = useState(() => kitUpdateScope(sessionId));
   const liveScope = useRef(scope);
   liveScope.current = kitUpdateScope(sessionId);
@@ -480,7 +483,18 @@ export const WorkspaceKitsPanel: React.FC<Props> = ({ sessionId, open, onClose }
 
   const selected = state.kits.find((kit) => kit.id === selectedId);
   const optimizerKit = state.kits.find((kit) => kit.id === optimizerKitId);
-  const lastRun = selected ? lastRunOf(state, selected) : undefined;
+  const lastRun = state.runs.find(run => run.id === targetRunId && (run.canonicalKitId || run.kitId) === selectedId)
+    || (selected ? lastRunOf(state, selected) : undefined);
+  useEffect(() => {
+    if (!open || !targetRunId) return;
+    const run = state.runs.find(item => item.id === targetRunId);
+    if (!run) return;
+    setSelectedId(run.canonicalKitId || run.kitId);
+    setView('kits');
+    setDetailOpen(true);
+    const timer = setTimeout(() => document.getElementById(`kit-step-${targetRunId}-${targetStepId}`)?.scrollIntoView({ block: 'nearest' }), 0);
+    return () => clearTimeout(timer);
+  }, [open, targetRunId, targetStepId, state.runs]);
   const selectedRuns = useMemo(
     () => state.runs.filter((run) => (run.canonicalKitId || run.kitId) === selectedId).slice(-12).reverse(),
     [state.runs, selectedId],
@@ -601,7 +615,7 @@ export const WorkspaceKitsPanel: React.FC<Props> = ({ sessionId, open, onClose }
   const respondCapability = async (runId: string, stepId: string, approved: boolean) => {
     const key = `${runId}:${stepId}`;
     const step = state.runs.find(run => run.id === runId)?.steps.find(item => item.id === stepId);
-    const localUpdate = step?.config.capability === 'node.update_local_published';
+    const localUpdate = isLocalUpdateCapability(step?.config.capability);
     const fingerprint = String(step?.config.capabilityRuntime?.planFingerprint || '');
     const requestScope = `${scope}:${runId}:${stepId}:${fingerprint}`;
     const submittedScope = kitUpdateScope(sessionId);
@@ -1661,7 +1675,7 @@ const CapabilityRunCard: React.FC<{
   responding: boolean;
   onRespond: (approved: boolean) => void;
 }> = ({ sessionId, run, step, responding, onRespond }) => {
-  if (step.config.capability === 'node.update_local_published') return <KitLocalUpdateCard
+  if (isLocalUpdateCapability(step.config.capability)) return <KitLocalUpdateCard
     key={`${sessionId}:${run.id}:${step.id}`} sessionId={sessionId} run={run} step={step} responding={responding} onRespond={onRespond} />;
   const runtime = (step.config?.capabilityRuntime || {}) as KitCapabilityRuntime;
   const plan = runtime.plan || {};
@@ -1707,8 +1721,10 @@ const CapabilityRunCard: React.FC<{
       )}
 
       {run.approvalDelegation?.id && <div style={{ ...subtleStyle, marginTop: 8 }}>
-        本次运行已获用户委托 · 到期 {new Date(run.approvalDelegation.expiresAt * 1000).toLocaleString()}
-        {runtime.approval?.source === 'chat-delegated' ? ' · 已由 Agent 核对并代确认' : ' · 尚需 Agent 核对计划或手动确认'}
+        本次运行委托 · 到期 {new Date(run.approvalDelegation.expiresAt * 1000).toLocaleString()}
+        {runtime.approval?.source === 'chat-delegated' ? ' · 已由 Agent 核对并代确认'
+          : run.approvalDelegation.expiresAt * 1000 <= Date.now() ? ' · 已过期，请人工核对'
+          : ' · 尚需 Agent 核对计划或手动确认'}
       </div>}
 
       {artifacts.length > 0 && (
@@ -1875,7 +1891,7 @@ const KitDetail: React.FC<{
                 : stepStatus === 'waiting_approval' ? '#f0b429'
                   : ['running', 'waiting_client'].includes(stepStatus) ? '#d2a8ff' : '#8b949e';
             return (
-              <div key={step.id || index} style={{ ...assertionRow, color: stepColor }}>
+              <div key={step.id || index} id={`kit-step-${run?.id}-${step.id}`} style={{ ...assertionRow, color: stepColor }}>
                 <span>{index + 1}</span>
                 <span style={{ flex: 1, color: 'var(--theme-text)' }}>{step.title || `步骤 ${index + 1}`}</span>
                 <span style={subtleStyle}>{step.type === 'file_push' ? '文件推送'

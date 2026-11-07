@@ -4,17 +4,22 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import sys
 import zipfile
 from pathlib import Path
 
-from prepare_deepseek_harness import load_lock, verify_wheel
-
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+from scripts.prepare_deepseek_harness import load_lock, verify_wheel
+from scripts.harness_image_resources import verify_frontend_contract
+from src.backend.deepseek_harness_distribution import BRIDGE_RESOURCE_NAMES, IMAGE_CONTRACT_FILE, verify_image_bridge
 
 
 def prepare() -> Path:
     lock = load_lock()
     build = ROOT / "build/deepseek-harness"
+    verify_frontend_contract(ROOT)
+    image_contract = verify_image_bridge(build / "bridge/lib/index.mjs")
     platforms = {}
     for target, suffix in (("win-x64", "windows"), ("linux-x64", "linux")):
         receipt = json.loads((ROOT / f"deploy/deepseek-harness.build-{suffix}.json").read_text(encoding="utf-8"))
@@ -37,10 +42,11 @@ def prepare() -> Path:
                                    "executable": bool((member.external_attr >> 16) & 0o111)}
         platforms[target] = files
     bridge = {}
-    for name in ("lib/index.mjs", "package.json", "UPSTREAM-LICENSE", "THIRD_PARTY_NOTICES.md"):
+    for name in (*BRIDGE_RESOURCE_NAMES, IMAGE_CONTRACT_FILE):
         path = build / "bridge" / name
         bridge["deepseek-harness/bridge/" + name] = {"sha256": hashlib.sha256(path.read_bytes()).hexdigest(), "executable": False}
-    manifest = {"schema": 1, "version": lock["pythonVersion"], "commit": lock["commit"], "platforms": platforms, "bridge": bridge}
+    manifest = {"schema": 1, "version": lock["pythonVersion"], "commit": lock["commit"],
+                "platforms": platforms, "bridge": bridge, "imageContract": image_contract}
     output = build / "bundle-manifest.json"
     output.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     return output

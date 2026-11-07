@@ -3,6 +3,7 @@ import {
   api, getExecutors, onExecStatus,
   type ExecutorInfo, type NodeUpdateStatus,
 } from '../api';
+import { observeNodeUpdate, updateRequestId } from '../utils/nodeUpdateObservation';
 
 const UPDATE_FEED_KEY = 'awu.updateFeed.v1';
 
@@ -123,6 +124,8 @@ export const UpdateCenter: React.FC = () => {
   const [refreshFeedback, setRefreshFeedback] = useState<ActionFeedback | null>(null);
   const [notice, setNotice] = useState('');
   const mountedRef = useRef(true);
+  const actionLocks = useRef(new Set<string>());
+  const batchLock = useRef(false);
   const feedSeededRef = useRef(Boolean(feed.manifestUrl.trim()));
 
   const updateStatus = useCallback((key: string, value: NodeUpdateStatus) => {
@@ -132,23 +135,10 @@ export const UpdateCenter: React.FC = () => {
 
   const updateStatusError = useCallback((key: string, error: unknown) => {
     if (!mountedRef.current) return;
-    setStatuses((current) => {
-      const previous = current[key];
-      const fallback: NodeUpdateStatus = {
-        platform: 'unknown', arch: 'unknown', desktop: false,
-        current: { version: 'unknown' },
-        config: { manifestUrl: '', channel: 'stable', requireSignature: false, hasSignatureKey: false, hasRequestHeaders: false },
-        phase: 'idle', busy: false,
-      };
-      return {
-        ...current,
-        [key]: {
-          ...(previous || fallback),
-          phase: 'error', busy: false,
-          error: error instanceof Error ? error.message : String(error),
-        },
-      };
-    });
+    // 连接错误不是节点任务失败；保留最后一次可信状态。
+    setNodeFeedback(current => ({ ...current, [key]: {
+      tone: 'warning', message: `暂未确认：${error instanceof Error ? error.message : String(error)}`,
+    } }));
   }, []);
 
   const markInstalling = useCallback((key: string) => {
@@ -165,6 +155,7 @@ export const UpdateCenter: React.FC = () => {
 
   const updateBusy = useCallback((key: string, value: boolean) => {
     if (!mountedRef.current) return;
+    if (!value && actionLocks.current.has(key)) return;
     setBusyNodes((current) => {
       const next = new Set(current);
       if (value) next.add(key); else next.delete(key);
@@ -271,7 +262,8 @@ export const UpdateCenter: React.FC = () => {
   };
 
   const configureAll = async () => {
-    if (globalBusy) return;
+    if (batchLock.current || actionLocks.current.size) return;
+    batchLock.current = true;
     setGlobalBusy(true);
     setNotice('');
     try {
@@ -287,6 +279,7 @@ export const UpdateCenter: React.FC = () => {
     } catch (error) {
       setNotice(error instanceof Error ? error.message : String(error));
     } finally {
+      batchLock.current = false;
       setGlobalBusy(false);
     }
   };
@@ -296,14 +289,6 @@ export const UpdateCenter: React.FC = () => {
     updateBusy(node.key, true);
     updateNodeAction(node.key, 'checking');
     updateNodeFeedback(node.key, undefined);
-    setStatuses((current) => {
-      const previous = current[node.key];
-      if (!previous) return current;
-      return {
-        ...current,
-        [node.key]: { ...previous, phase: 'checking', busy: true, error: '', message: '正在读取远端版本清单' },
-      };
-    });
     try {
       // “一键更新”同时把当前控制端的 feed 写入目标节点；以后人在目标机上
       // 打开同一页面时无需重新配置，也避免 beta/stable 通道不一致。
@@ -324,40 +309,55 @@ export const UpdateCenter: React.FC = () => {
     }
   };
 
-  const waitForStage = async (node: ExecutorInfo): Promise<NodeUpdateStatus> => {
-    const deadline = Date.now() + 2 * 60 * 60 * 1000;
-    while (Date.now() < deadline) {
-      await sleep(850);
-      const status = await api.nodeUpdateStatus(node.key);
-      updateStatus(node.key, status);
-      if (status.phase === 'staged') return status;
-      if (status.phase === 'error' || status.phase === 'cancelled') {
-        throw new Error(status.error || status.message || `${node.label} 下载失败`);
-      }
-    }
-    throw new Error(`${node.label} 下载等待超过 2 小时`);
-  };
+  const observe = (node: ExecutorInfo, kind: 'stage' | 'apply', requestId: string) => observeNodeUpdate({
+    read: () => api.nodeUpdateStatus(node.key), kind, requestId,
+    receive: status => updateStatus(node.key, status),
+    waiting: message => updateNodeFeedback(node.key, { tone: 'warning', message }),
+    active: () => mountedRef.current,
+  });
 
-  const stageNode = async (node: ExecutorInfo): Promise<NodeUpdateStatus> => {
+  const stageNode = async (node: ExecutorInfo, checked: NodeUpdateStatus): Promise<NodeUpdateStatus> => {
     updateBusy(node.key, true);
     updateNodeAction(node.key, 'updating');
     try {
-      const started = await api.nodeUpdateStage(node.key, manifestUrl);
+      const requestId = (checked.updateProtocol || 0) >= 2 ? updateRequestId() : '';
+      let started: NodeUpdateStatus;
+      try {
+        started = await api.nodeUpdateStage(node.key, manifestUrl, checked.artifact?.id || '', false,
+          requestId, checked.selectionFingerprint || '');
+      } catch (error) {
+        updateNodeFeedback(node.key, { tone: 'warning', message: '提交回复未收到，正在核对原下载。' });
+        if (!requestId) throw new Error('旧节点无法核对下载请求，请刷新状态；没有自动重发。');
+        started = await observe(node, 'stage', requestId);
+      }
       updateStatus(node.key, started);
-      if (started.phase === 'current' || started.phase === 'stale') return started;
-      if (started.phase === 'error') throw new Error(started.error || '无法开始下载');
-      return await waitForStage(node);
+      const staged = ['checking', 'downloading'].includes(started.phase)
+        ? await observe(node, 'stage', requestId) : started;
+      if (staged.phase !== 'staged') throw new Error(staged.error || staged.message || '下载尚未完成');
+      return staged;
     } finally {
       updateBusy(node.key, false);
       updateNodeAction(node.key, undefined);
     }
   };
 
-  const applyNode = async (node: ExecutorInfo) => {
+  const applyNode = async (node: ExecutorInfo, staged: NodeUpdateStatus) => {
     updateBusy(node.key, true);
     updateNodeAction(node.key, 'updating');
     try {
-      const result = await api.nodeUpdateApply(node.key);
+      if (staged.phase !== 'staged') throw new Error('请先完成下载校验');
+      const requestId = (staged.updateProtocol || 0) >= 2 ? updateRequestId() : '';
+      let result;
+      try {
+        result = await api.nodeUpdateApply(node.key, requestId, staged.stageRequestId || '');
+      } catch {
+        if (!requestId) throw new Error('安装回复未收到，请刷新状态核对；没有重复安装。');
+        const reconciled = await observe(node, 'apply', requestId);
+        if (!['installing', 'installed'].includes(reconciled.phase) || reconciled.applyFailed) {
+          throw new Error(reconciled.error || reconciled.message || '安装未完成');
+        }
+        return;
+      }
       if (result.status !== 'restarting') throw new Error(result.message || '节点未进入重启流程');
       markInstalling(node.key);
     } finally {
@@ -367,9 +367,27 @@ export const UpdateCenter: React.FC = () => {
   };
 
   const oneClickNode = async (node: ExecutorInfo) => {
-    if (globalBusy || busyNodes.has(node.key)) return;
+    if (batchLock.current || actionLocks.current.has(node.key)) return;
+    actionLocks.current.add(node.key);
+    updateBusy(node.key, true);
     setNotice('');
     try {
+      const current = await api.nodeUpdateStatus(node.key);
+      updateStatus(node.key, current);
+      if (current.phase === 'installing') {
+        setNotice('原安装正在交接或等待结果，请刷新状态核对。');
+        return;
+      }
+      if (current.phase === 'downloading' && current.busy) {
+        const staged = await observe(node, 'stage', current.stageRequestId || '');
+        if (staged.phase !== 'staged') throw new Error(staged.error || staged.message || '下载尚未完成');
+        if (window.confirm(`${node.label} 的 ${staged.release?.version || '更新'} 已校验，是否安装并重启？`)) await applyNode(node, staged);
+        return;
+      }
+      if (current.phase === 'staged') {
+        if (window.confirm(`${node.label} 的 ${current.release?.version || '更新'} 已校验，是否安装并重启？`)) await applyNode(node, current);
+        return;
+      }
       const checked = await checkNode(node);
       if (!checked.available) {
         setNotice(checked.phase === 'stale'
@@ -379,16 +397,29 @@ export const UpdateCenter: React.FC = () => {
       }
       const target = checked.release?.version || '新版本';
       if (!window.confirm(`将 ${node.label} 更新到 ${target}。节点会短暂离线并自动重启，是否继续？`)) return;
-      await stageNode(node);
-      await applyNode(node);
+      const staged = await stageNode(node, checked);
+      if (!mountedRef.current) return;
+      await applyNode(node, staged);
       setNotice(`${node.label} 已进入安装重启流程。`);
     } catch (error) {
       setNotice(error instanceof Error ? error.message : String(error));
+    } finally {
+      actionLocks.current.delete(node.key);
+      updateBusy(node.key, false);
     }
   };
 
+  const checkOnlyNode = async (node: ExecutorInfo) => {
+    if (batchLock.current || actionLocks.current.has(node.key)) return;
+    actionLocks.current.add(node.key);
+    try { await checkNode(node); }
+    catch (error) { setNotice(error instanceof Error ? error.message : String(error)); }
+    finally { actionLocks.current.delete(node.key); updateBusy(node.key, false); }
+  };
+
   const updateAll = async () => {
-    if (globalBusy) return;
+    if (batchLock.current || actionLocks.current.size) return;
+    batchLock.current = true;
     setGlobalBusy(true);
     setNotice('');
     try {
@@ -399,14 +430,14 @@ export const UpdateCenter: React.FC = () => {
         item.status === 'fulfilled'
           && item.value.status.runtime === 'docker'
           && item.value.status.dockerUpdaterAvailable === false
-          ? [item.value.node]
+          ? [item.value]
           : []
       ));
       const available = checks.flatMap((item) => (
         item.status === 'fulfilled'
           && item.value.status.available
           && !(item.value.status.runtime === 'docker' && item.value.status.dockerUpdaterAvailable === false)
-          ? [item.value.node]
+          ? [item.value]
           : []
       ));
       const staleNodes = checks.flatMap((item) => (
@@ -432,17 +463,18 @@ export const UpdateCenter: React.FC = () => {
         `将先并行下载并校验 ${available.length} 个节点的更新，再逐个安装重启。控制端所在的本机最后更新。是否继续？`,
       )) return;
 
-      const stages = await Promise.allSettled(available.map(async (node) => ({ node, status: await stageNode(node) })));
+      const stages = await Promise.allSettled(available.map(async ({ node, status }) => ({ node, status: await stageNode(node, status) })));
       const staged = stages.flatMap((item) => (
-        item.status === 'fulfilled' && item.value.status.phase === 'staged' ? [item.value.node] : []
+        item.status === 'fulfilled' && item.value.status.phase === 'staged' ? [item.value] : []
       ));
       const stageFailures = stages.length - staged.length;
       // 控制端本机必须最后退出，否则尚未下发的远端安装命令会丢失。
-      staged.sort((left, right) => Number(left.key === 'local') - Number(right.key === 'local'));
+      staged.sort((left, right) => Number(left.node.key === 'local') - Number(right.node.key === 'local'));
       let applied = 0;
-      for (const node of staged) {
+      for (const { node, status } of staged) {
         try {
-          await applyNode(node);
+          if (!mountedRef.current) break;
+          await applyNode(node, status);
           applied += 1;
           await sleep(350);
         } catch (error) {
@@ -458,6 +490,7 @@ export const UpdateCenter: React.FC = () => {
     } catch (error) {
       setNotice(error instanceof Error ? error.message : String(error));
     } finally {
+      batchLock.current = false;
       setGlobalBusy(false);
     }
   };
@@ -553,7 +586,7 @@ export const UpdateCenter: React.FC = () => {
           const status = statuses[node.key];
           const nodeAction = nodeActions[node.key];
           const feedback = nodeFeedback[node.key];
-          const checkInProgress = nodeAction === 'checking' || status?.phase === 'checking';
+          const checkInProgress = nodeAction === 'checking' || status?.phase === 'checking' && !!status.busy;
           const updateInProgress = nodeAction === 'updating' || status?.phase === 'installing';
           const cancelInProgress = nodeAction === 'cancelling';
           const nodeBusy = globalBusy || busyNodes.has(node.key) || !!status?.busy || !!nodeAction;
@@ -607,10 +640,16 @@ export const UpdateCenter: React.FC = () => {
                   </a>
                 )}
                 {status?.phase === 'downloading' ? (
-                  <button type="button" style={{ ...smallButtonStyle, ...(cancelInProgress ? activeBusyButtonStyle : {}) }}
-                    disabled={cancelInProgress} onClick={() => void cancelNode(node)}>
-                    {cancelInProgress ? <><BusySpinner /> 取消中…</> : '取消'}
+                  <>
+                  <button type="button" style={nodePrimaryButtonStyle}
+                    disabled={!node.connected || globalBusy || busyNodes.has(node.key)} onClick={() => void oneClickNode(node)}>
+                    {busyNodes.has(node.key) ? '正在跟进更新…' : status.busy ? '继续跟进更新' : '继续下载'}
                   </button>
+                  <button type="button" style={{ ...smallButtonStyle, ...(cancelInProgress ? activeBusyButtonStyle : {}) }}
+                    disabled={!node.connected || cancelInProgress} onClick={() => void cancelNode(node)}>
+                    {cancelInProgress ? <><BusySpinner /> 暂停中…</> : '暂停下载'}
+                  </button>
+                  </>
                 ) : (
                   <>
                     <button
@@ -618,7 +657,7 @@ export const UpdateCenter: React.FC = () => {
                         ...smallButtonStyle, ...(checkInProgress ? activeBusyButtonStyle : {}),
                       }}
                       disabled={!node.connected || nodeBusy || !manifestUrl}
-                      onClick={() => void checkNode(node).catch((error) => setNotice(error instanceof Error ? error.message : String(error)))}
+                      onClick={() => void checkOnlyNode(node)}
                     >{checkInProgress
                         ? <><BusySpinner /> 检查中…</>
                         : feedback ? '再次检查' : '检查'}</button>
@@ -631,7 +670,8 @@ export const UpdateCenter: React.FC = () => {
                         ? '该 Docker 节点尚未启动 awu-updater；先在宿主机用新版 Compose 手动重建一次'
                         : undefined}
                       onClick={() => void oneClickNode(node)}
-                    >{updateInProgress ? <><BusySpinner /> 更新中…</> : '一键更新'}</button>
+                    >{updateInProgress ? <><BusySpinner /> 更新中…</> : status?.phase === 'staged' ? '安装已下载更新'
+                      : ['error', 'cancelled'].includes(status?.phase || '') ? '继续 / 重新更新' : '一键更新'}</button>
                   </>
                 )}
               </div>

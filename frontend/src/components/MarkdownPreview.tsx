@@ -1,4 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { usePreviewSize } from '../hooks/usePreviewLayout';
 import {
   markdownHtmlWithOutline,
   markdownToHtml,
@@ -39,6 +40,7 @@ export const MarkdownPreview: React.FC<Props> = ({ source, title = 'Markdown 文
   const [tocOpen, setTocOpen] = useState(storedTocOpen);
   const [activeId, setActiveId] = useState('');
   const scrollRef = useRef<HTMLDivElement | null>(null);
+  const size = usePreviewSize<HTMLDivElement>();
   const rendered = useMemo(
     () => markdownHtmlWithOutline(markdownToHtml(source || '')),
     [source],
@@ -87,11 +89,11 @@ export const MarkdownPreview: React.FC<Props> = ({ source, title = 'Markdown 文
   const navigateTo = useCallback((id: string) => {
     const scroller = scrollRef.current;
     const heading = scroller?.querySelector<HTMLElement>(`#${id}`);
-    if (!heading) return;
-    heading.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    if (!heading || !scroller) return;
+    scroller.scrollTo({ top: scroller.scrollTop + heading.getBoundingClientRect().top - scroller.getBoundingClientRect().top - 26, behavior: 'smooth' });
     setActiveId(id);
-    if (window.matchMedia('(max-width: 760px)').matches) setTocOpen(false);
-  }, []);
+    if (size.width <= 760) setTocOpen(false);
+  }, [size.width]);
 
   const toggleToc = useCallback(() => setTocOpen((open) => !open), []);
   const toggleTheme = useCallback(
@@ -101,6 +103,7 @@ export const MarkdownPreview: React.FC<Props> = ({ source, title = 'Markdown 文
 
   return (
     <div
+      ref={size.ref}
       className={`awu-md-reader ${tocOpen ? 'awu-md-toc-open' : 'awu-md-toc-closed'}`}
       data-reader-theme={theme}
     >
@@ -195,7 +198,7 @@ const readerCss = `
     --theme-code-bg: var(--md-code);
     --theme-accent: var(--md-accent);
     width: 100%; height: 100%; min-width: 0; min-height: 0;
-    display: flex; flex-direction: column; overflow: hidden;
+    display: flex; flex-direction: column; overflow: hidden; container-type: inline-size;
     color: var(--md-text); background: var(--md-bg);
   }
   .awu-md-reader[data-reader-theme="dark"] {
@@ -267,7 +270,7 @@ const readerCss = `
   }
   .awu-md-toc-item.is-active .awu-md-toc-marker { height: 14px; margin-top: 1px; border-radius: 3px; opacity: 1; }
   .awu-md-toc-empty { padding: 16px 12px; color: var(--md-muted); font-size: 11px; line-height: 1.6; }
-  .awu-md-document-scroll { min-width: 0; min-height: 0; overflow: auto; background: var(--md-bg); }
+  .awu-md-document-scroll { min-width: 0; min-height: 0; overflow: auto; overscroll-behavior:contain; background: var(--md-bg); }
   .awu-md-document {
     width: min(900px, calc(100% - 48px)); min-height: calc(100% - 40px); margin: 20px auto;
     padding: clamp(28px, 5vw, 58px); box-sizing: border-box;
@@ -316,14 +319,14 @@ const readerCss = `
   .awu-md-toc-closed .awu-md-reader-layout { grid-template-columns: 0 minmax(0, 1fr); }
   .awu-md-toc-closed .awu-md-toc { opacity: 0; pointer-events: none; transform: translateX(-12px); }
   .awu-md-toc-backdrop { display: none; }
-  @media (max-width: 760px) {
+  @container (max-width: 760px) {
     .awu-md-reader-toolbar { padding: 0 8px; gap: 6px; }
     .awu-md-reader-button { padding: 5px 8px; }
     .awu-md-heading-count { display: none; }
     .awu-md-reader-layout,
     .awu-md-toc-closed .awu-md-reader-layout { display: block; }
     .awu-md-toc {
-      position: absolute; inset: 0 auto 0 0; width: min(82vw, 300px);
+      position: absolute; inset: 0 auto 0 0; width: min(82%, 300px);
       box-shadow: 16px 0 40px rgba(0,0,0,.3); transform: translateX(0);
     }
     .awu-md-toc-closed .awu-md-toc { transform: translateX(-100%); }

@@ -5,6 +5,8 @@ export interface DetachedWindowOptions {
 }
 const browserWindows = new Map<string, Window>();
 const opening = new Map<string, Promise<void>>();
+/** 释放拥有者的窗口引用，不关闭独立窗口；窗口自身仍负责退出保护。 */
+export const releaseDetachedWindow = (label: string) => { browserWindows.delete(label); };
 export const isDesktopWindow = () => typeof (window as any).__TAURI_INTERNALS__ !== 'undefined';
 
 export function detachedUrl(kind: 'scratchpad' | 'thoughts' | 'skillManual', params: Record<string, string> = {}): string {

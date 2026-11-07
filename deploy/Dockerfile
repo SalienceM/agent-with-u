@@ -57,6 +57,7 @@ COPY build/deepseek-harness/wheels/*manylinux_2_28_x86_64.whl /tmp/harness-wheel
 COPY build/deepseek-harness/wheels/deepseek_harness_sdk-0.2.1rc3-py3-none-any.whl /tmp/harness-wheels/
 COPY deploy/requirements-harness.txt ./deploy/requirements-harness.txt
 COPY deploy/deepseek-harness.lock.json deploy/deepseek-harness.build-linux.json ./deploy/
+COPY deploy/deepseek-harness.external.json ./deploy/deepseek-harness.external.json
 COPY scripts/prepare_deepseek_harness.py ./scripts/prepare_deepseek_harness.py
 COPY build/deepseek-harness/bridge ./build/deepseek-harness/bridge
 COPY build/deepseek-harness/bundle-manifest.json ./build/deepseek-harness/bundle-manifest.json

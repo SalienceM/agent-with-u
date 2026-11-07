@@ -22,14 +22,15 @@ async function mount(page: Page, width = 1366) {
     const { RemoteSyncReview } = await import('/src/utils/syncReviewProtocol.ts');
     const { byteHash } = await import('/src/utils/documentCodec.ts');
     const { useManagedLocalDir } = await import('/src/utils/dirSync.ts');
+    const { scanAllows } = await import('/src/utils/syncScanRules.ts');
     const fs = await useManagedLocalDir('review-fixture');
     const long = Array.from({ length: 1100 }, (_, i) => `line ${i}`).join('\n');
     const files: Record<string, string> = { 'src/a.ts': long.replace('line 20\n', '<img src=x onerror=alert(1)>\n').replace('line 900\n', 'second hunk\n'), 'src/b.ts': 'remote b',
       'visual.txt': '\n' + 'y'.repeat(180) + '\n', 'budget.txt': Array.from({ length: 1500 }, (_, i) => 'remote-' + i).join('\n'),
-      'remote-empty.txt': '', 'format.txt': 'same\n', 'binary.txt': '\0remote', 'large.txt': 'r'.repeat(2 * 1024 * 1024 + 1), 'src2/outside': 'outside' };
+      'remote-empty.txt': '', 'same.txt': 'unchanged', 'format.txt': 'same\n', 'binary.txt': '\0remote', 'large.txt': 'r'.repeat(2 * 1024 * 1024 + 1), 'src2/outside': 'outside' };
     for (const [path, text] of Object.entries({ 'src/a.ts': long, 'src/b.ts': 'local b', 'local-empty.txt': '', 'format.txt': '\uFEFFsame\r\n',
       'binary.txt': 'local', 'large.txt': 'local', 'visual.txt': '\n' + 'x'.repeat(220) + '\n',
-      'budget.txt': Array.from({ length: 1500 }, (_, i) => 'local-' + i).join('\n') })) await fs.writeBlob!(path, new Blob([text]));
+      'same.txt': 'unchanged', 'budget.txt': Array.from({ length: 1500 }, (_, i) => 'local-' + i).join('\n') })) await fs.writeBlob!(path, new Blob([text]));
     const workspace = { ownerId: getCurrentUserProfile().userId, executorInstance: 'fixture-executor', sessionId: 'review-fixture', workingDir: '/fixture-only', workspaceRevision: 'a'.repeat(64) };
     const calls: { method: string; path?: string }[] = [], writes: string[] = [], receipts = new Map();
     const scan = fs.scan.bind(fs);
@@ -55,7 +56,7 @@ async function mount(page: Page, width = 1366) {
       calls.push({ method: 'search', path: query });
       return { status: 'ok', matched: 2, results: Object.keys(files).filter(path => path.includes(query)).map(path => ({ path, name: path.split('/').pop(), size: files[path].length })) };
     };
-    api.syncManifest = async () => { calls.push({ method: 'manifest' }); return { status: 'ok', files: Object.fromEntries(Object.keys(files).map(path => [path, { hash: version(path).sha256, size: version(path).byteLength }])) }; };
+    api.syncManifest = async (_dir, _exec, _git, rules) => { calls.push({ method: 'manifest', path: JSON.stringify(rules) }); return { status: 'ok', files: Object.fromEntries(Object.keys(files).filter(path => scanAllows(rules, path)).map(path => [path, { hash: version(path).sha256, size: version(path).byteLength }])) }; };
     api.syncReadFile = async (_dir: string, path: string) => { calls.push({ method: 'ordinary-preview', path }); return { status: 'ok', data: btoa(files[path] || '') }; };
     api.syncReview = async (session: string, executor: string, workingDir: string, current: () => boolean) => RemoteSyncReview.connect({ session, executor, workingDir, user: workspace.ownerId }, async (_e, method, params) => {
       const path = String(params[2] || ''); calls.push({ method, path });
@@ -98,14 +99,137 @@ async function compare(page: Page) {
 }
 async function open(page: Page) { await compare(page); await page.getByRole('button', { name: /^审阅差异 \d+/ }).click(); return page.getByRole('dialog', { name: '目录同步审阅' }); }
 
+for (const width of [1366, 390]) test(`editable scan scope prunes comparison and persists at ${width}px`, async ({ page }, info) => {
+  await mount(page, width); await compare(page);
+  const count = () => page.evaluate(() => (window as any).reviewFixture.calls.filter((c: any) => ['manifest', 'local-scan'].includes(c.method)).length);
+  const before = await count();
+  await page.getByText('扫描范围 · 全部文件', { exact: true }).click();
+  await page.getByLabel('只扫描这些前缀', { exact: true }).fill('src/');
+  await page.getByLabel('排除规则', { exact: true }).fill('# skip second file\n**/b.ts');
+  await expect(page.getByRole('button', { name: '↔ 比对', exact: true })).toBeDisabled();
+  await page.getByRole('button', { name: '保存扫描规则', exact: true }).click();
+  await expect(page.getByRole('button', { name: /^审阅差异/ })).toBeDisabled();
+  expect(await count()).toBe(before); // 打开、编辑、保存均不启动扫描或传输
+  await page.getByRole('button', { name: '↔ 比对', exact: true }).click();
+  await expect(page.getByRole('button', { name: '仅不同 1', exact: true })).toBeEnabled();
+  await page.screenshot({ path: info.outputPath(`scan-rules-${width}.png`), fullPage: true });
+  const sent = await page.evaluate(() => JSON.parse((window as any).reviewFixture.calls.filter((c: any) => c.method === 'manifest').at(-1).path));
+  expect(sent).toEqual({ version: 1, prefixes: ['src/'], excludes: ['**/b.ts'] });
+  await page.getByRole('button', { name: '仅不同 1', exact: true }).click();
+  await page.keyboard.press('Escape');
+  await expect(page.locator('.ftp-row').filter({ has: page.getByText('a.ts', { exact: true }) })).toBeVisible();
+  await expect(page.locator('.ftp-row').filter({ has: page.getByText('b.ts', { exact: true }) })).toHaveCount(0);
+  await expect(page.locator('.ftp-row').filter({ has: page.getByText('src2', { exact: true }) })).toHaveCount(0);
+  await mount(page, width); // 页面重载，规则从当前会话的 localStorage 恢复
+  await compare(page);
+  await expect(page.getByText('扫描范围 · 1 个前缀 / 1 条排除', { exact: true })).toBeVisible();
+  await expect(page.getByRole('button', { name: '仅不同 1', exact: true })).toBeEnabled();
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+  expect(await page.evaluate(() => (window as any).reviewFixture.writes)).toEqual([]);
+});
+
+test('invalid scan rules preserve prior scope and late old comparison cannot refill it', async ({ page }) => {
+  await mount(page); await compare(page);
+  await page.getByText('扫描范围 · 全部文件', { exact: true }).click();
+  await page.getByLabel('只扫描这些前缀', { exact: true }).fill('../outside');
+  await page.getByRole('button', { name: '保存扫描规则', exact: true }).click();
+  await expect(page.getByRole('alert')).toContainText('不支持的扫描规则');
+  await expect(page.getByRole('button', { name: '仅不同 10', exact: true })).toBeEnabled();
+  await page.getByLabel('只扫描这些前缀', { exact: true }).fill('');
+  await page.evaluate(async () => {
+    const { api } = await import('/src/api.ts');
+    const original = api.syncManifest;
+    api.syncManifest = async (...args) => {
+      const result = await original(...args);
+      await new Promise<void>(resolve => { (window as any).reviewFixture.releaseManifest = resolve; });
+      return result;
+    };
+  });
+  await page.getByRole('button', { name: '↔ 比对', exact: true }).click();
+  await expect(page.getByRole('button', { name: '比对中…', exact: true })).toBeVisible();
+  await page.getByLabel('只扫描这些前缀', { exact: true }).fill('src/');
+  await page.getByRole('button', { name: '保存扫描规则', exact: true }).click();
+  await page.evaluate(() => (window as any).reviewFixture.releaseManifest());
+  await expect(page.getByRole('button', { name: /^审阅差异/ })).toBeDisabled();
+  await expect(page.getByRole('button', { name: '仅不同 0', exact: true })).toBeDisabled();
+});
+
+test('browser scans prune before entries/getFile; managed scans never load excluded records', async ({ page }) => {
+  await mount(page);
+  const result = await page.evaluate(async () => {
+    const { BrowserLocalFs } = await import('/src/utils/dirSync.ts');
+    const visited: string[] = [], reads: string[] = [];
+    const file = (path: string) => ({ kind: 'file', getFile: async () => { reads.push(path); return new File(['fixture'], path); } });
+    const dir = (path: string, children: Record<string, any>) => ({ kind: 'directory', name: path,
+      async *entries() { visited.push(path); for (const entry of Object.entries(children)) yield entry; } });
+    const root = dir('', { src: dir('src', { 'a.ts': file('src/a.ts'), cache: dir('src/cache', { huge: file('src/cache/huge') }) }),
+      data: dir('data', { huge: file('data/huge') }), src2: dir('src2', { x: file('src2/x') }) });
+    const rules = { version: 1 as const, prefixes: ['src/'], excludes: ['cache/'] };
+    const fs = new BrowserLocalFs(root);
+    const files = await fs.scan([], false, { rules });
+    const managed = (window as any).reviewFixture.fs;
+    const got: string[] = [];
+    const get = IDBObjectStore.prototype.get;
+    IDBObjectStore.prototype.get = function (key) { got.push(String(key)); return get.call(this, key); };
+    let selected;
+    try { selected = await managed.scan([], false, { rules: { ...rules, excludes: ['b.ts'] } }); }
+    finally { IDBObjectStore.prototype.get = get; }
+    return { visited, reads, files: Object.keys(files), selected: Object.keys(selected), got };
+  });
+  expect(result.visited).toEqual(['', 'src']);
+  expect(result.reads).toEqual(['src/a.ts']);
+  expect(result.files).toEqual(['src/a.ts']);
+  expect(result.selected).toEqual(['src/a.ts']);
+  expect(result.got).toHaveLength(1);
+  expect(result.got[0]).toMatch(/::src\/a.ts$/);
+});
+
+test('old desktop scoped scanner fails without full-scan fallback and scoped cache never hides other directories', async ({ page }) => {
+  await mount(page);
+  const result = await page.evaluate(async () => {
+    const { TauriLocalFs } = await import('/src/utils/dirSync.ts');
+    const w = window as any, saved = w.__TAURI_INTERNALS__, calls: string[] = [];
+    const rules = { version: 1 as const, prefixes: ['src/'], excludes: [] };
+    let fail = true;
+    w.__TAURI_INTERNALS__ = { invoke: async (cmd: string, args: any) => {
+      calls.push(cmd);
+      if (cmd === 'dir_sync_scan_scoped') {
+        if (fail) throw new Error('unknown command');
+        return { scanRules: args.rules, files: { 'src/a': { hash: '', size: 0 } } };
+      }
+      return { files: { 'data/b': { hash: '', size: 0 }, 'src/a': { hash: '', size: 0 } } };
+    } };
+    try {
+      const fs = new TauriLocalFs('fixture-only');
+      let error = '';
+      try { await fs.scan([], false, { rules }); } catch (e) { error = String(e); }
+      const failedCalls = [...calls]; fail = false;
+      await fs.scan([], false, { rules });
+      const entries = await fs.listDir('');
+      return { error, failedCalls, entries: entries.map(e => e.name) };
+    } finally { w.__TAURI_INTERNALS__ = saved; }
+  });
+  expect(result.error).toContain('unknown command');
+  expect(result.failedCalls).toEqual(['dir_sync_scan_scoped']);
+  expect(result.entries).toEqual(['data', 'src']);
+});
+
 for (const width of [1366, 390]) test(`inherited scope, regex filtering and opaque review at ${width}px`, async ({ page }, info) => {
   await mount(page, width); await compare(page);
+  await expect(page.getByText('比对结果 · 不同 10 · 冲突 0 · 仅本机 1 · 仅执行端 2')).toBeVisible();
+  await expect(page.getByRole('button', { name: '仅不同 10', exact: true })).toBeEnabled();
   await page.getByRole('button', { name: /^仅不同/ }).click();
+  for (const name of ['local-empty.txt', 'remote-empty.txt', 'outside']) {
+    await expect(page.locator('.ftp-row').filter({ has: page.getByText(name, { exact: true }) })).toBeVisible();
+  }
+  await expect(page.locator('.ftp-row').filter({ has: page.getByText('same.txt', { exact: true }) })).toHaveCount(0);
   await page.evaluate(() => { document.body.style.setProperty('--theme-bg', 'rgba(21,25,34,.2)'); document.body.style.setProperty('--theme-panel-solid', '#151922'); });
   await page.getByRole('button', { name: /^审阅差异/ }).click();
   const panel = page.getByRole('dialog', { name: '目录同步审阅' });
-  await expect(panel.getByText('仅不同：两端都存在且内容不同，不含仅本机／仅执行端文件')).toBeVisible();
-  await expect(panel.getByRole('button', { name: /remote-empty|local-empty|src2/ })).toHaveCount(0);
+  await expect(panel.getByText('仅不同：包含仅本机、仅执行端及两端内容不同的文件')).toBeVisible();
+  await expect(panel.getByRole('button', { name: /remote-empty|local-empty|src2/ })).toHaveCount(3);
+  await expect(panel.getByRole('button', { name: 'same.txt 未处理', exact: true })).toHaveCount(0);
+  expect(await page.evaluate(() => (window as any).reviewFixture.writes)).toEqual([]);
   await panel.getByLabel('正则 .*', { exact: true }).check();
   await panel.getByRole('textbox', { name: '筛选差异文件' }).fill('^SRC/.*\\.ts$');
   await expect(panel.getByLabel('差异文件列表').getByRole('button', { name: /未处理/ })).toHaveCount(2);
@@ -120,6 +244,21 @@ for (const width of [1366, 390]) test(`inherited scope, regex filtering and opaq
   await page.evaluate(() => { document.body.style.setProperty('--theme-panel-solid', '#f6f8fa'); document.body.style.setProperty('--theme-text', '#24292f'); });
   expect(await panel.evaluate(el => getComputedStyle(el).backgroundColor)).toBe('rgb(246, 248, 250)');
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+});
+
+test('one-sided empty file retains preview comparison while only-different is active', async ({ page }) => {
+  await mount(page); await compare(page);
+  await page.getByRole('button', { name: '仅不同 10', exact: true }).click();
+  await page.keyboard.press('Escape');
+  const scans = await page.evaluate(() => (window as any).reviewFixture.calls.filter((c: any) => ['manifest', 'local-scan'].includes(c.method)).length);
+  await page.locator('.ftp-row').filter({ has: page.getByText('local-empty.txt', { exact: true }) }).click();
+  await page.getByRole('button', { name: '对比', exact: true }).click();
+  const panel = page.getByRole('dialog', { name: '目录同步审阅' });
+  await expect(panel.getByRole('button', { name: 'local-empty.txt 未处理', exact: true })).toHaveAttribute('aria-current', 'true');
+  await expect(panel.getByRole('button', { name: '推送到执行端 →', exact: true })).toBeEnabled();
+  await expect(panel.getByRole('button', { name: '← 拉取到本机', exact: true })).toBeDisabled();
+  expect(await page.evaluate(() => (window as any).reviewFixture.calls.filter((c: any) => ['manifest', 'local-scan'].includes(c.method)).length)).toBe(scans);
+  expect(await page.evaluate(() => (window as any).reviewFixture.writes)).toEqual([]);
 });
 
 test('preview compare opens the exact file, restores focus and never scans or writes', async ({ page }) => {

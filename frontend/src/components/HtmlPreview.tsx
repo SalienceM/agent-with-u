@@ -61,9 +61,10 @@ const HtmlPreview: React.FC<Props> = ({ source, rel, root, nodeLabel, hidden, fr
   }, [source, rel, root, readFile, revision, interactive, fragment]);
 
   const actual = `${root.replace(/[\\/]$/, '')}/${rel}`;
-  return <div style={{ display: hidden ? 'none' : 'flex', flexDirection: 'column', flex: 1, minHeight: 0, height: '100%' }}>
-    <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '6px 10px', minHeight: 32, borderBottom: '1px solid var(--theme-border)', fontSize: 11 }}>
-      <button onClick={onReveal} title={`在原文件所在节点定位：${actual}`} style={{ ...buttonStyle, flex: 1, textAlign: 'left', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>实际位置 · {nodeLabel} · {actual}</button>
+  return <div style={{ display: hidden ? 'none' : 'flex', flexDirection: 'column', flex: 1, minWidth: 0, minHeight: 0, height: '100%', overflow: 'hidden' }}>
+    <div style={{ flexShrink: 0, maxHeight: '45%', overflow: 'auto', overflowWrap: 'anywhere' }}>
+    <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 6, padding: 6, borderBottom: '1px solid var(--theme-border)', fontSize: 11 }}>
+      <button onClick={onReveal} title={`在原文件所在节点定位：${actual}`} style={{ ...buttonStyle, flex: '1 1 100%', minWidth: 0, textAlign: 'left', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>实际位置 · {nodeLabel} · {actual}</button>
       <button style={{ ...buttonStyle, whiteSpace: 'nowrap' }} aria-pressed={interactive} title="仅对可信页面启用：脚本可读取本工作目录内的静态资源；不会获得 AgentWithU 的登录态或写文件接口。" onClick={() => setInteractive(value => !value)}>{interactive ? '脚本交互已启用' : '启用页面脚本'}</button>
       <button style={buttonStyle} onClick={() => setRevision(value => value + 1)}>重载资源</button>
     </div>
@@ -72,11 +73,12 @@ const HtmlPreview: React.FC<Props> = ({ source, rel, root, nodeLabel, hidden, fr
       <summary>页面加载提示（{warnings.length}）</summary>{warnings.map((message, index) => <div key={index}>{message}</div>)}
     </details>}
     {external && <div style={{ padding: 8, fontSize: 12 }}>这是外部链接，确认后可在浏览器打开： <a href={external} target="_blank" rel="noopener noreferrer">{external}</a> <button onClick={() => setExternal('')}>取消</button></div>}
+    </div>
     {loading ? <div role="status" style={{ padding: 20 }}>正在从原节点读取页面资源…</div>
       : error ? <div role="alert" style={{ padding: 20, color: '#f87171' }}>{error} <button onClick={() => setRevision(value => value + 1)}>重试</button></div>
         : <iframe ref={frame} title="HTML 页面预览" srcDoc={srcDoc} sandbox="allow-scripts" referrerPolicy="no-referrer"
-          style={{ width: '100%', flex: 1, minHeight: 240, border: 0, background: '#fff' }} />}
+          style={{ width: '100%', flex: 1, minHeight: 0, border: 0, background: '#fff' }} />}
   </div>;
 };
-const buttonStyle: React.CSSProperties = { cursor: 'pointer', background: 'transparent', border: '1px solid var(--theme-border)', borderRadius: 4, color: 'var(--theme-text)', padding: '3px 6px', fontSize: 11 };
+const buttonStyle: React.CSSProperties = { minHeight: 36, cursor: 'pointer', background: 'transparent', border: '1px solid var(--theme-border)', borderRadius: 4, color: 'var(--theme-text)', padding: '3px 6px', fontSize: 11 };
 export default HtmlPreview;

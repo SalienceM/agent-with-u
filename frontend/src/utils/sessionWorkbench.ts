@@ -64,6 +64,7 @@ export interface WorkbenchCapabilities {
 
 const capabilityNames = ['viewMode', 'windowHandoff', 'documents', 'languageServices', 'terminal'] as const;
 export type WorkbenchCall = (executor: string, method: string, params: unknown[], timeout: number) => Promise<unknown>;
+const capabilityReads = new WeakMap<WorkbenchCall, Map<string, Promise<unknown>>>();
 
 export async function readWorkbenchCapabilities(
   target: WorkbenchTarget, call: WorkbenchCall, isCurrent: () => boolean,
@@ -72,7 +73,18 @@ export async function readWorkbenchCapabilities(
     throw new Error('工作台目标身份不完整');
   }
   if (!isCurrent()) throw new Error('工作台身份已变化');
-  const raw = await call(target.executor, 'sessionWorkbenchCapabilities', [target.session, target.workingDir], 12000);
+  let pending = capabilityReads.get(call);
+  if (!pending) { pending = new Map(); capabilityReads.set(call, pending); }
+  const key = JSON.stringify([target.user, target.executor, target.session, target.workingDir]);
+  let request = pending.get(key);
+  if (!request) {
+    // 只合并在途只读请求；不缓存能力、授权或失败，不增加超时和自动重试。
+    request = Promise.resolve().then(() => call(target.executor, 'sessionWorkbenchCapabilities', [target.session, target.workingDir], 12000));
+    pending.set(key, request);
+    const clear = () => { if (pending!.get(key) === request) pending!.delete(key); };
+    request.then(clear, clear);
+  }
+  const raw = await request;
   if (!isCurrent()) throw new Error('工作台身份已变化');
   const result = typeof raw === 'string' ? JSON.parse(raw) : raw;
   if (result == null) {
@@ -80,7 +92,8 @@ export async function readWorkbenchCapabilities(
   }
   if (typeof result !== 'object') throw new Error('无效的工作台能力响应');
   const row = result as Record<string, any>;
-  if (row.status !== 'ok' || row.protocolVersion !== 1) throw new Error('无法确认执行端工作台能力');
+  if (row.status !== 'ok' || row.protocolVersion !== 1) throw Object.assign(new Error('无法确认执行端工作台能力'),
+    { reasonCode: row.status === 'error' && typeof row.reasonCode === 'string' ? row.reasonCode : 'capability_unavailable' });
   const identity = row.identity as WorkspaceIdentity | undefined;
   if (!identity || identity.ownerId !== target.user || identity.sessionId !== target.session
       || typeof identity.executorInstance !== 'string' || !identity.executorInstance

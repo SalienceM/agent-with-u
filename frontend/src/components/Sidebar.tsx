@@ -12,6 +12,8 @@ import type { SessionDeletionResult } from '../utils/sessionDeletion';
 import type { FavoritePhase } from '../utils/sessionFavorites';
 
 import { SkillBindingTree } from './SkillBindingTree';
+import { InteractionBadge } from './UserInteractionsPanel';
+import { taskSessionTree } from '../utils/taskSessionTree';
 
 interface Session extends SessionViewMetadata {
   id: string;
@@ -30,6 +32,8 @@ interface Session extends SessionViewMetadata {
   codexRemoteHost?: string;
   codexThreadAttached?: boolean;
   sessionType?: 'normal' | 'loop';
+  relationKind?: 'review' | 'task' | 'integration';
+  parentSessionId?: string;
   loopExecutionMode?: 'loop' | 'aimein';
   pinned?: boolean;
   favoriteStatus?: FavoritePhase;
@@ -614,6 +618,7 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
   }, [conversionGoal, conversionChoices, conversionWorkflow, converting, onSelectSession, refresh, sessionToConvert]);
 
   const normalizedSearch = searchQuery.trim().toLocaleLowerCase();
+  const [collapsedTasks, setCollapsedTasks] = useState<Set<string>>(new Set());
   const visibleSessions = useMemo(() => {
     const filtered = normalizedSearch
       ? sessions.filter((session) => [
@@ -623,9 +628,9 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
           session.execLabel,
           session.sessionType,
         ].some((value) => String(value || '').toLocaleLowerCase().includes(normalizedSearch)))
-      : sessions;
+      : sessions.filter(session => session.relationKind !== 'review' || session.pinned || session.id === activeSessionId);
     return [...filtered].sort(sortSessionsByPriority);
-  }, [sessions, normalizedSearch]);
+  }, [sessions, normalizedSearch, activeSessionId]);
 
   const pendingCount = completedSessions.size;
 
@@ -670,6 +675,17 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
       if (a.isDefault !== b.isDefault) return a.isDefault ? -1 : 1;
       return a.label.localeCompare(b.label);
     });
+    // 节点最近条目限额只限制父级；已列父项的直接子任务仍可到达。
+    for (const group of arr) {
+      if (group.key === '__pinned__') continue;
+      for (const child of [...group.sessions]) {
+        const parent = visibleSessions.find(row => !row.pinned && row.id === child.parentSessionId && (row.execKey || 'local') === group.key);
+        if (parent && !group.sessions.some(row => row.id === parent.id)) group.sessions.push(parent);
+      }
+      const parents = new Set(group.sessions.map(row => row.id));
+      const siblings = visibleSessions.filter(row => !row.pinned && (row.execKey || 'local') === group.key && row.parentSessionId && parents.has(row.parentSessionId) && !group.sessions.some(item => item.id === row.id));
+      group.sessions.push(...siblings);
+    }
     return arr;
   }, [visibleSessions, normalizedSearch, maxPerNode]);
 
@@ -998,7 +1014,7 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
               )}
               {!isCollapsed && (
                 <div style={showGroupHeader ? groupSessionsStyle : undefined}>
-                {group.sessions.map((s: Session) => {
+                {taskSessionTree(group.sessions, collapsedTasks, !!normalizedSearch).map(({ item: s, depth, children }) => {
                 const isRunning = streamingSessions.has(s.id);
                 const isCompleted = !isRunning && completedSessions.has(s.id);
                 const isActive = s.id === activeSessionId;
@@ -1025,6 +1041,7 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
                   className={isRunning ? 'session-streaming-item' : undefined}
                   style={{
                     ...itemStyle,
+                    marginLeft: depth ? 16 : 0,
                     background: rowBackground,
                     ...(isContextTarget && !isActive ? { boxShadow: 'inset 0 0 0 1px var(--theme-accent, #7aa2f7)' } : {}),
                     ...(isActive ? { boxShadow: 'inset 2px 0 0 var(--theme-accent, #7aa2f7)' } : {}),
@@ -1033,6 +1050,14 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
                   }}
                   title={[s.title, s.workingDir, getBackendShortLabel(s.backendId)].filter(Boolean).join('\n')}
                 >
+                  {children.length > 0 && <button type="button" aria-label={`${collapsedTasks.has(`${s.execKey || 'local'}:${s.id}`) ? '展开' : '收起'} ${s.title} 的子任务`}
+                    aria-expanded={!collapsedTasks.has(`${s.execKey || 'local'}:${s.id}`)}
+                    title={`${children.length} 个任务 · ${children.filter(row => streamingSessions.has(row.id)).length} 运行 · ${children.filter(row => completedSessions.has(row.id)).length} 完成`}
+                    style={{ border: 0, background: 'transparent', color: 'inherit', cursor: 'pointer', padding: 2, fontSize: 11 }}
+                    onClick={event => { event.stopPropagation(); const key = `${s.execKey || 'local'}:${s.id}`; setCollapsedTasks(old => { const next = new Set(old); if (next.has(key)) next.delete(key); else next.add(key); return next; }); }}>
+                    {collapsedTasks.has(`${s.execKey || 'local'}:${s.id}`) ? '▸' : '▾'}{children.length}
+                  </button>}
+                  {depth > 0 && <span title="独立任务工作区" style={{ fontSize: 11 }}>↳</span>}
                   {isRunning && (
                     <span style={{
                       ...runningDotStyle,
@@ -1077,6 +1102,7 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
                     </div>
                   )}
                   <div style={compactActionsStyle}>
+                    <InteractionBadge sessionId={s.id} executor={s.execKey} onOpen={() => onSelectSession(s.id)} />
                     <span
                       style={{
                         ...compactBackendStyle,

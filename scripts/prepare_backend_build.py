@@ -51,9 +51,9 @@ def prepare(*, install: bool = True) -> int:
     failures = validate_requirements()
     from src.package_readiness import check_components
     failures.extend(check_components()["failures"])
-    from src.backend.deepseek_harness_distribution import verify_bundle
+    from src.backend.deepseek_harness_distribution import verify_adapter
     try:
-        verify_bundle()
+        verify_adapter()
     except Exception as exc:
         failures.append("harness-bundle:" + str(exc))
     result = subprocess.run([sys.executable, "-m", "pip", "check"], check=False)

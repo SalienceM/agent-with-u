@@ -30,12 +30,14 @@ from ..types import (
 class PermissionRequest:
     """工具执行前的权限请求。"""
 
-    def __init__(self, session_id: str, message_id: str, tool_id: str, tool_name: str, tool_input: str):
+    def __init__(self, session_id: str, message_id: str, tool_id: str, tool_name: str, tool_input: str,
+                 native_request_id: str = ''):
         self.session_id = session_id
         self.message_id = message_id
         self.tool_id = tool_id
         self.tool_name = tool_name
         self.tool_input = tool_input
+        self.native_request_id = native_request_id or tool_id
         self._event = asyncio.Event()
         self._granted: Optional[bool] = None
 

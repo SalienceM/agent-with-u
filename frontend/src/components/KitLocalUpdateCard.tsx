@@ -3,9 +3,10 @@ import { api } from '../api';
 import type { KitRun, KitStepRun, KitCapabilityRuntime } from '../types/workspaceKits';
 
 const phases: Record<string, string> = {
-  preparing: '核对执行设备', staging: '下载并校验本次制品', needs_selection: '请选择安装器',
+  preparing: '核对执行设备', checking: '检查已配置的更新源', staging: '下载并校验本次制品', needs_selection: '请选择安装器',
   waiting_approval: '等待独立安装确认', handing_off: '正在交接安装', waiting_restart: '等待目标节点重启',
   verifying: '核对实际启动版本', result_unknown: '安装结果未知', failed: '本机更新失败', succeeded: '重启验收通过', cancelled: '交接前已取消',
+  current: '检查完成，无需更新',
 };
 
 export const KitLocalUpdateCard: React.FC<{
@@ -44,11 +45,12 @@ export const KitLocalUpdateCard: React.FC<{
   return <section aria-label="本机更新安装计划" style={{ marginTop: 10, padding: 13, borderRadius: 10,
     border: '1px solid var(--theme-border)', background: 'var(--theme-panel-bg, #1b2230)', overflowWrap: 'anywhere' }}>
     <strong>本机更新 · {phases[phase] || phase}</strong>
-    <p>目标是 Session 执行设备，不是当前控制窗口。发布与安装分别确认。</p>
+    <p>目标是 Session 执行设备，不是当前控制窗口。安装需单独确认。</p>
     <div>设备：{String(plan.desktop?.deviceId || plan.device || '核对中')} · 安装实例：{String(plan.desktop?.instanceId || plan.instanceId || '—')}</div>
     <div>当前：{String(plan.current?.version || '—')} / {String(plan.current?.buildId || '—')}</div>
     <div>目标：{String(plan.release?.version || '—')} / {String(plan.release?.buildId || '—')} · 序号 {String(plan.release?.sequence || '—')}</div>
-    <div>通道：{String(plan.channel || '—')} · 计划指纹：{runtime.planFingerprint || '准备中'}</div>
+    <div>通道：{String(plan.channel || '—')}{phase !== 'current' && <> · 计划指纹：{runtime.planFingerprint || '准备中'}</>}</div>
+    {plan.manifestUrl && <div>清单：{plan.manifestUrl}</div>}
     {artifact && <div style={{ marginTop: 8 }}>
       <div>{String(artifact.fileName || artifact.id)} · {String(artifact.platform)} / {String(artifact.arch)} · {Number(artifact.size).toLocaleString()} 字节</div>
       <div>SHA-256：{String(artifact.sha256)}</div>

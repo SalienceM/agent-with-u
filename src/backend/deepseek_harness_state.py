@@ -173,7 +173,8 @@ class HarnessReservation:
 
 def make_profile_patch(*, native_id: str, generation: str, fingerprint: str,
                        bridge: Path, cwd: str, mode: str, skip_permissions: bool,
-                       skill_dirs: list[str] | None = None, skill_names: list[str] | None = None) -> list[dict[str, Any]]:
+                       skill_dirs: list[str] | None = None, skill_names: list[str] | None = None,
+                       image_identity: dict[str, str] | None = None) -> list[dict[str, Any]]:
     if mode not in PERMISSION_MODES:
         raise ValueError("Harness 访问策略无效")
     if not bridge.is_absolute() or not bridge.is_file():
@@ -194,6 +195,7 @@ def make_profile_patch(*, native_id: str, generation: str, fingerprint: str,
                      "config": {"sessionId": native_id, "generation": generation,
                                 "configFingerprint": fingerprint, "permissionMode": mode,
                                 "allowedSkills": skill_names or [],
+                                **({"imageIdentity": dict(image_identity)} if image_identity is not None else {}),
                                 "approvalPolicy": "never" if skip_permissions else "ask"}}]},
     ]
 

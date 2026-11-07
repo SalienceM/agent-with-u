@@ -15,6 +15,9 @@ from src.types import Session
 
 
 class FakeReleaseCenter:
+    def job_status(self, job_id: str) -> dict:
+        return next(dict(job) for job in self.jobs if job['id'] == job_id)
+
     def __init__(self, artifact_path: Path) -> None:
         self.artifact_path = artifact_path
         self.start_calls = 0
