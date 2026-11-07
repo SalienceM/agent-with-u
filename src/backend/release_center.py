@@ -142,52 +142,6 @@ def _qshell_progress_fraction(text: str) -> Optional[float]:
         return None
 
 
-def _process_read_bytes(pid: int) -> Optional[int]:
-    """Best-effort byte counter for a qshell subprocess without adding a psutil dependency."""
-    if pid <= 0:
-        return None
-    if os.name == "nt":
-        try:
-            import ctypes
-            from ctypes import wintypes
-
-            class _IoCounters(ctypes.Structure):
-                _fields_ = [
-                    ("ReadOperationCount", ctypes.c_ulonglong),
-                    ("WriteOperationCount", ctypes.c_ulonglong),
-                    ("OtherOperationCount", ctypes.c_ulonglong),
-                    ("ReadTransferCount", ctypes.c_ulonglong),
-                    ("WriteTransferCount", ctypes.c_ulonglong),
-                    ("OtherTransferCount", ctypes.c_ulonglong),
-                ]
-
-            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-            kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
-            kernel32.OpenProcess.restype = wintypes.HANDLE
-            kernel32.GetProcessIoCounters.argtypes = [wintypes.HANDLE, ctypes.POINTER(_IoCounters)]
-            kernel32.GetProcessIoCounters.restype = wintypes.BOOL
-            kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
-            handle = kernel32.OpenProcess(0x1000, False, int(pid))  # PROCESS_QUERY_LIMITED_INFORMATION
-            if not handle:
-                return None
-            try:
-                counters = _IoCounters()
-                if not kernel32.GetProcessIoCounters(handle, ctypes.byref(counters)):
-                    return None
-                return int(counters.ReadTransferCount)
-            finally:
-                kernel32.CloseHandle(handle)
-        except (AttributeError, OSError, TypeError, ValueError):
-            return None
-    try:
-        for line in Path(f"/proc/{int(pid)}/io").read_text(encoding="utf-8", errors="replace").splitlines():
-            if line.startswith("rchar:"):
-                return int(line.split(":", 1)[1].strip())
-    except (OSError, TypeError, ValueError):
-        pass
-    return None
-
-
 def _safe_id(value: object, fallback: str = "item") -> str:
     text = re.sub(r"[^A-Za-z0-9._-]", "-", str(value or "")).strip(".-")
     return text[:180] or fallback
@@ -1321,10 +1275,14 @@ class ReleaseCenterManager:
         file_size = max(0, int(file_size))
         current_bytes = max(0, min(file_size, int(current_bytes)))
         total_bytes = max(0, int(total_bytes))
+        previous = self._upload_progress_marks.get(job_id)
+        if previous:
+            # stdout/stderr 的进度可交错或重放。同一任务只保留最高已观察值；
+            # 扣除已完成文件字节，让下一文件从自身的 0 开始，不继承上个文件百分比。
+            current_bytes = max(current_bytes, min(file_size, max(0, previous[1] - completed_bytes)))
         uploaded_bytes = max(0, min(total_bytes, int(completed_bytes) + current_bytes))
         progress = min(99, int(uploaded_bytes / total_bytes * 100)) if total_bytes else 0
         now = time.monotonic()
-        previous = self._upload_progress_marks.get(job_id)
         if not force and previous:
             previous_at, previous_bytes, previous_progress = previous
             if (
@@ -1396,31 +1354,19 @@ class ReleaseCenterManager:
                         completed_bytes, total_bytes,
                     )
 
-        async def monitor_file_reads() -> None:
-            baseline = _process_read_bytes(int(process.pid or 0))
-            while process.returncode is None:
-                await asyncio.sleep(UPLOAD_PROGRESS_INTERVAL)
-                observed = _process_read_bytes(int(process.pid or 0))
-                if observed is None:
-                    continue
-                if baseline is None:
-                    baseline = observed
-                    continue
-                # qshell may read a small amount of config around the upload. Capping at
-                # 98% prevents those reads from claiming completion before qshell exits.
-                current = min(int(file_size * 0.98), max(0, observed - baseline))
-                await self._report_upload_progress(
-                    job_id, current, file_size, completed_bytes, total_bytes,
-                )
-
+        # 本地读取（预读、哈希、重试）不等于已上传；只采纳 qshell 输出，
+        # 没有百分比时保留最后已知值，成功退出后再计入该文件的完整字节。
         stdout_task = asyncio.create_task(read_stream(process.stdout, output_tail))
         stderr_task = asyncio.create_task(read_stream(process.stderr, error_tail))
-        monitor_task = asyncio.create_task(monitor_file_reads())
         try:
             await process.wait()
             await asyncio.gather(stdout_task, stderr_task)
-            await monitor_task
         finally:
+            # 取消/异常退出也收拢观察协程，防止旧文件的进度在后续阶段继续写入。
+            for task in (stdout_task, stderr_task):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
             self._processes.pop(job_id, None)
         if job_id in self._cancel_requested:
             raise asyncio.CancelledError
