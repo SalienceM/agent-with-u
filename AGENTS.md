@@ -2114,7 +2114,11 @@ links, external objects, oversized files and unsupported repositories are reject
 Managed Git readers require the exact registered root/common-dir/repository identity. Task creation
 and initial model start are separate. Sidebar main-Session context menus create branch copies;
 child menus merge to their recorded parent through the existing frozen-plan flow. The server
-rejects child/integration/review derivation at preview and execution. Only two tree levels are
+creates an ordinary Session for each branch copy: chat, abilities and runtime settings share
+the normal Session UI. Sidebar families start collapsed; selecting a child from another entry
+reveals its parent. A create dialog opens the child only on its own ready receipt, never on
+acceptance, historical reads or a late result after closing; opening does not start a model.
+The server rejects child/integration/review derivation at preview and execution. Only two tree levels are
 displayed, including legacy nested records; favorites keep families together and search retains
 ancestors. Integration Sessions belong under the target's main Session, never a third level.
 New copy forms use `inheritSource=true` and `snapshotMode=current`: explicit allowlisted runtime

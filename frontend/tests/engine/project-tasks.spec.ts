@@ -13,7 +13,7 @@ async function mount(page: Page, width = 1200, sidebar = false) {
   await page.evaluate(async ({ sidebar }) => {
     const { React, createRoot, ProjectTasksPanel, Sidebar, ChatInput, api } = await import('/tests/engine/chat-kit-feedback-harness.ts');
     const f = { plans: [] as any[], created: [] as any[], started: [] as any[], opened: [] as string[], row: null as any, callbacks: new Set<any>(), fail: false, inspect: 0,
-      nodes: [] as any[], merges: [] as any[], actions: [] as any[], mergeRow: null as any };
+      nodes: [] as any[], merges: [] as any[], actions: [] as any[], mergeRow: null as any, activeSession: 'parent', render: () => {} };
     const repo = { root: 'C:/fixture', commonDir: 'C:/fixture/.git', repositoryId: 'repo', head: 'a'.repeat(40), branch: 'main', fingerprint: 'source', dirty: [
       { path: 'same.txt', status: ' M', sha256: 'sha', bytes: 5, blocked: '' }, { path: '.env', status: '??', sha256: '', bytes: 5, blocked: '凭据路径' }] };
     api.taskWorkspaceInspect = async () => { f.inspect++; return { ...repo, status: 'ready', notice: '', defaults: {
@@ -36,11 +36,12 @@ async function mount(page: Page, width = 1200, sidebar = false) {
     api.projectMergePreview = async (...args) => { f.merges.push(args); return f.mergeRow = { id: 'merge', revision: 1, sourceSessionId: 'child', title: '功能副本 → 主项目', status: 'preview', planFingerprint: 'fixed', files: ['same.txt'], blockers: [],
       source: { ...repo, sessionId: args[2], title: '功能副本' }, target: { ...repo, sessionId: args[3], title: '主项目' }, integrationConfig: { backendId: 'fake', skipPermissions: false }, verification: { status: 'not_run', notice: '未运行测试' }, policy: '独立准备后核对应用' }; };
     api.projectMergeAction = async (...args) => { f.actions.push(args); return args[3]; };
-    createRoot(document.getElementById('root')!).render(React.createElement(React.Fragment, null,
-      sidebar ? React.createElement(Sidebar, { activeSessionId: 'parent', streamingSessions: new Set(), onSelectSession: (id: string) => f.opened.push(id), onNewSession: () => {} }) :
+    const root = createRoot(document.getElementById('root')!);
+    f.render = () => root.render(React.createElement(React.Fragment, null,
+      sidebar ? React.createElement(Sidebar, { activeSessionId: f.activeSession, activeExecKey: 'relay:fixture', streamingSessions: new Set(), onSelectSession: (id: string) => { f.opened.push(id); f.activeSession = id; f.render(); }, onNewSession: () => {} }) :
         React.createElement(ProjectTasksPanel, { session: 'parent', executor: 'local', backendId: 'fake', backends, onOpenSession: (id: string) => f.opened.push(id) }),
       React.createElement(ChatInput, { sessionId: 'parent', historyKey: 'parent', activeBackendId: 'fake', backends, isStreaming: false, onSend: () => {}, onAbort: () => {} })));
-    (window as any).taskFixture = f;
+    (window as any).taskFixture = f; f.render();
   }, { sidebar });
 }
 
@@ -48,11 +49,19 @@ for (const width of [1280, 390]) test(`sidebar branch copies keep family togethe
   await mount(page, width, true);
   const parent = page.locator('[aria-haspopup="menu"]').filter({ hasText: '主项目' });
   const child = page.locator('[aria-haspopup="menu"]').filter({ hasText: '功能副本' });
-  await expect(parent).toHaveCount(1); await expect(child).toHaveCount(1);
+  await expect(parent).toHaveCount(1); await expect(child).toHaveCount(0);
+  await page.getByRole('button', { name: '展开 主项目 的子 Session' }).click();
   await expect(parent.locator('..')).toContainText('功能副本');
-  await page.getByRole('button', { name: '收起 主项目 的子任务' }).click();
+  await child.click();
+  expect(await page.evaluate(() => (window as any).taskFixture.opened)).toEqual(['child']);
+  await expect(page.getByRole('dialog')).toHaveCount(0);
+  await page.getByRole('button', { name: '收起 主项目 的子 Session' }).click();
   await expect(child).toHaveCount(0);
-  await page.getByRole('button', { name: '展开 主项目 的子任务' }).click();
+  await page.evaluate(() => (window as any).taskFixture.render());
+  await expect(child).toHaveCount(0);
+  await parent.click();
+  await page.evaluate(() => { const f = (window as any).taskFixture; f.activeSession = 'child'; f.render(); });
+  await expect(child).toBeVisible();
   await parent.click({ button: 'right' });
   await page.getByRole('menuitem', { name: '新建分支副本' }).click();
   await expect(page.getByLabel('副本名称', { exact: true })).toHaveValue('主会话 · 副本');
@@ -60,6 +69,8 @@ for (const width of [1280, 390]) test(`sidebar branch copies keep family togethe
   expect(await page.evaluate(() => (window as any).taskFixture.created)).toEqual([]);
   await page.getByRole('button', { name: '返回对话' }).click();
   await child.click({ button: 'right' });
+  await expect(page.getByRole('menuitem', { name: /重命名/ })).toBeVisible();
+  await expect(page.getByRole('menuitem', { name: /绑定能力/ })).toBeVisible();
   await expect(page.getByRole('menuitem', { name: '新建分支副本' })).toHaveCount(0);
   await page.getByRole('menuitem', { name: '合并到主 Session', exact: true }).click();
   await expect(page.getByRole('button', { name: '发现项目会话' })).toHaveCount(0);
@@ -72,6 +83,26 @@ for (const width of [1280, 390]) test(`sidebar branch copies keep family togethe
   await expect(page.getByRole('dialog')).not.toContainText('Error:');
   await page.screenshot({ path: `../.qa/session-branches/merge-${width}.png` });
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBeTruthy();
+});
+
+for (const closeEarly of [false, true]) test(`new child opens as a Session only after ready; closed dialog stays closed (${closeEarly})`, async ({ page }) => {
+  await mount(page, 1200, true);
+  await page.locator('[aria-haspopup="menu"]').filter({ hasText: '主项目' }).click({ button: 'right' });
+  await page.getByRole('menuitem', { name: '新建分支副本' }).click();
+  await page.getByLabel('项目文件范围', { exact: true }).selectOption('selected');
+  await page.getByRole('button', { name: '预览副本创建计划' }).click();
+  await page.getByRole('button', { name: '确认创建副本（不运行模型）' }).click();
+  await expect(page.getByRole('dialog', { name: '分支副本', exact: true })).toContainText('正在创建');
+  expect(await page.evaluate(() => (window as any).taskFixture.opened)).toEqual([]);
+  if (closeEarly) await page.getByRole('button', { name: '返回对话', exact: true }).click();
+  await page.evaluate(() => {
+    const f = (window as any).taskFixture; f.row = { ...f.row, status: 'ready', revision: 3 };
+    f.callbacks.forEach((cb: any) => cb(f.row, 'relay:fixture'));
+  });
+  await expect(page.getByRole('dialog', { name: '分支副本', exact: true })).toHaveCount(0);
+  expect(await page.evaluate(() => (window as any).taskFixture.opened)).toEqual(closeEarly ? [] : ['child']);
+  expect(await page.evaluate(() => (window as any).taskFixture.started)).toEqual([]);
+  if (!closeEarly) await expect(page.locator('[aria-haspopup="menu"]').filter({ hasText: '功能副本' })).toBeVisible();
 });
 
 test('legacy nested sessions flatten without leaking collapsed descendants or cross-node parents', async ({ page }) => {

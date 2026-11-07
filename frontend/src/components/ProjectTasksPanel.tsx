@@ -23,6 +23,7 @@ export const ProjectTasksPanel: React.FC<Props> = ({ session, executor, backendI
   const [mode, setMode] = useState<'tasks' | 'merge'>(initialAction === 'merge' ? 'merge' : 'tasks');
   const current = useRef(`${executor}:${session}`); current.current = `${executor}:${session}`;
   const busyRef = useRef(false), panel = useRef<HTMLDivElement>(null);
+  const createdHere = useRef('');
   const runtimeBackend = backends.find(row => row.id === config.backendId);
   const close = () => { setOpen(false); onClose?.(); };
   useEffect(() => { current.current = `${executor}:${session}`; return () => { current.current = ''; }; }, [session, executor]);
@@ -46,6 +47,7 @@ export const ProjectTasksPanel: React.FC<Props> = ({ session, executor, backendI
     finally { busyRef.current = false; if (identity === current.current) setBusy(false); }
   };
   const newTask = () => void act(async () => {
+    createdHere.current = '';
     const identity = current.current; const result = await api.taskWorkspaceInspect(session, executor);
     if (identity !== current.current) return;
     if (result.status !== 'ready') { setNotice([result.notice, result.preparation].filter(Boolean).join(' ')); return; }
@@ -63,6 +65,7 @@ export const ProjectTasksPanel: React.FC<Props> = ({ session, executor, backendI
   });
   const create = () => void act(async () => {
     if (!task || uncertain) return;
+    createdHere.current = task.id;
     const identity = current.current; setUncertain(true);
     try {
       const result = await api.taskWorkspaceCreate(session, executor, task.id, uuid(), task.planFingerprint);
@@ -72,6 +75,12 @@ export const ProjectTasksPanel: React.FC<Props> = ({ session, executor, backendI
     } catch { if (identity === current.current) setNotice('创建接收结果未知，请核对原任务；没有重复提交。'); }
   });
   const shown = task?.id === selected ? task : undefined;
+  useEffect(() => {
+    // 仅本次创建得到就绪回执后进入普通会话；查看历史、关闭窗口或接收请求不会跳转。
+    if (!open || editing || mode !== 'tasks' || initialAction !== 'create' || !onOpenSession || shown?.status !== 'ready' || shown.id !== createdHere.current) return;
+    createdHere.current = '';
+    onOpenSession(shown.sessionId); setOpen(false); onClose?.();
+  }, [open, editing, mode, initialAction, shown, onOpenSession, onClose]);
   return <>
     {!initialAction && <WorkflowButton tone="quiet" icon="branch" aria-label="分支副本与合并" onClick={() => setOpen(true)} style={{ whiteSpace: 'nowrap' }}>分支副本</WorkflowButton>}
     {open && <AppModalPortal><div style={{ position: 'fixed', inset: 0, zIndex: 31100, display: 'grid', placeItems: 'center', padding: 10, background: '#0007' }}>
@@ -92,13 +101,13 @@ export const ProjectTasksPanel: React.FC<Props> = ({ session, executor, backendI
           <WorkflowButton onClick={close}>返回对话</WorkflowButton>
         </header>
         {mode === 'merge' ? <ProjectMergePanel key={`${executor}:${session}`} session={session} executor={executor} fixedTarget={mergeTarget} onOpenSession={id => { onOpenSession?.(id); close(); }} /> : <div style={{ display: 'flex', minHeight: 0, flex: 1 }}>
-          <nav aria-label="项目子任务" style={{ ...workflowNavStyle, display: rows.length ? 'flex' : 'none', width: 'clamp(85px, 24%, 230px)', overflow: 'auto', borderRight: '1px solid var(--theme-border)', flexShrink: 0 }}>
+          <nav aria-label="分支副本记录" style={{ ...workflowNavStyle, display: rows.length ? 'flex' : 'none', width: 'clamp(85px, 24%, 230px)', overflow: 'auto', borderRight: '1px solid var(--theme-border)', flexShrink: 0 }}>
             {rows.map(row => <WorkflowButton tone="quiet" key={row.id} aria-pressed={selected === row.id && !editing} disabled={busy} style={{ width: '100%', padding: 9, overflowWrap: 'anywhere' }} onClick={() => { setSelected(row.id); setEditing(false); setUncertain(false); }}>{row.title} · {statusLabel[row.status || ''] || row.status}</WorkflowButton>)}
             {next !== null && <WorkflowButton onClick={() => void act(async () => { const identity = current.current; const result = await api.collaborationList(session, executor, 'workspace', next); if (identity === current.current) { setRows(old => [...old, ...result.items.filter(row => !old.some(item => item.id === row.id))]); setNext(result.nextOffset); } })}>更多任务</WorkflowButton>}
           </nav>
           <section style={{ flex: 1, minWidth: 0, overflow: 'auto', padding: 20 }}>
             {editing && repo ? <div style={{ display: 'grid', gap: 10 }}>
-              <p>从当前分支 {repo.branch || repo.head.slice(0, 12)} 创建独立目录与分支。默认带入当前项目修改、新文件和项目 Skills，继承主 Session 配置。新聊天线程独立，副本不能再次派生。</p>
+              <p>从当前 Git 分支 {repo.branch || repo.head.slice(0, 12)} 派生新分支和独立目录，创建一个普通子 Session，挂在主 Session 下。创建成功后直接进入对话，也可合并回主 Session。默认带入当前项目修改、新文件和项目 Skills，继承主 Session 配置；聊天线程独立，子 Session 不能再次派生。</p>
               <p>其他 Git 忽略文件（含依赖、缓存、构建产物）不复制；队列、定时任务及单次授权不复制。</p>
               <label>副本名称<input style={field} value={config.title} onChange={e => setConfig(old => ({ ...old, title: e.target.value }))} /></label>
               <label>初始需求<textarea rows={4} style={field} value={config.goal} onChange={e => setConfig(old => ({ ...old, goal: e.target.value }))} /></label>
