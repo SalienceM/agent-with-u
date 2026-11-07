@@ -156,3 +156,38 @@ class TaskWorkspaceTests(unittest.IsolatedAsyncioTestCase):
         for extra in [{'node': 'other'}, {'agentSessionId': 'main-native'}, {'kitApprovalDelegation': True}]:
             with self.assertRaises(ValueError):
                 await self.bridge._rpc_taskWorkspacePlan('main', 'invalid', json.dumps({'title': 'task', **extra}))
+
+    async def test_discard_preview_is_durable_idempotent_and_never_touches_git(self):
+        git = self.repository(); plan = await self.plan()
+        before = git.inspect()
+        result = json.loads(self.bridge._rpc_taskWorkspaceDiscardPreview('main', plan['id'], 'discard', plan['planFingerprint']))
+        self.assertEqual(result['status'], 'discarded')
+        self.assertEqual(result['discardReceipt']['status'], 'succeeded')
+        self.assertFalse(Path(plan['root']).exists())
+        self.assertIsNone(self.bridge._session_store.load(plan['sessionId']))
+        self.assertEqual(git.inspect()['fingerprint'], before['fingerprint'])
+        self.assertEqual(self.calls, [])
+        self.assertEqual(json.loads(self.bridge._rpc_taskWorkspaceDiscardPreview('main', plan['id'], 'discard', plan['planFingerprint'])), result)
+        self.assertEqual((await self.plan())['status'], 'discarded')
+        self.assertEqual(json.loads(await self.bridge._rpc_sessionCollaborationList('main', 'workspace'))['items'], [])
+        with self.assertRaises(ValueError):
+            self.bridge._rpc_taskWorkspaceCreate('main', plan['id'], 'late-create', plan['planFingerprint'])
+        with self.assertRaises(ValueError):
+            self.bridge._rpc_taskWorkspaceDiscardPreview('main', plan['id'], 'discard', 'different-intent')
+
+    async def test_discard_rejects_wrong_identity_fingerprint_and_started_work(self):
+        self.repository(); plan = await self.plan()
+        discard = self.bridge._rpc_taskWorkspaceDiscardPreview
+        with self.assertRaises(PermissionError):
+            discard('missing-session', plan['id'], 'wrong-owner', plan['planFingerprint'])
+        with self.assertRaises(ValueError):
+            discard('main', plan['id'], 'wrong-plan', 'wrong-fingerprint')
+        for status in ('creating', 'ready', 'unknown', 'error', 'archived', 'cleaning', 'cleaned'):
+            plan = self.bridge._task_update(self.scope, plan, status=status)
+            with self.subTest(status=status), self.assertRaises(ValueError):
+                discard('main', plan['id'], 'discard-' + status, plan['planFingerprint'])
+        plan = self.bridge._task_update(self.scope, plan, status='preview', requestId='creation-already-accepted')
+        with self.assertRaises(ValueError):
+            discard('main', plan['id'], 'discard-stale-preview', plan['planFingerprint'])
+        self.assertEqual(self.bridge._collaboration_store().read(self.scope, 'workspace', plan['id']), plan)
+        self.assertFalse(Path(plan['root']).exists())

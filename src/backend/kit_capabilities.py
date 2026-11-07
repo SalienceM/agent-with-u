@@ -14,7 +14,8 @@ from .release_center import ReleaseCenterManager
 
 UPDATE_CAPABILITY = "node.update_local_published"
 CHECK_UPDATE_CAPABILITY = "node.check_update_local"
-LOCAL_UPDATE_CAPABILITIES = frozenset({UPDATE_CAPABILITY, CHECK_UPDATE_CAPABILITY})
+BUILD_UPDATE_CAPABILITY = "node.update_local_build"
+LOCAL_UPDATE_CAPABILITIES = frozenset({UPDATE_CAPABILITY, CHECK_UPDATE_CAPABILITY, BUILD_UPDATE_CAPABILITY})
 
 
 class KitCapabilityError(RuntimeError):
@@ -333,11 +334,20 @@ class LocalCheckUpdateCapability(LocalPublishedUpdateCapability):
                "config": {"capability": id, "arguments": {}}}
 
 
+class LocalBuildUpdateCapability(LocalPublishedUpdateCapability):
+    id = BUILD_UPDATE_CAPABILITY
+    title = "安装本次本机构建并验收重启"
+    description = "直接使用当前运行唯一成功构建的本地安装包，校验并暂存后独立确认安装；不上传、不下载、不读取 latest。"
+    intent_hints = ("本机更新", "更新本机", "本地更新", "本机打包", "本地打包", "本机构建", "本地构建", "local build", "local update")
+    example = {"type": "awu_capability", "target": "executor", "title": title,
+               "config": {"capability": id, "arguments": {}}}
+
+
 class KitCapabilityRegistry:
     """稳定 capability id 白名单及其统一生命周期入口。"""
 
     def __init__(self) -> None:
-        handlers = [ReleasePublishLatestCapability(), LocalPublishedUpdateCapability(), LocalCheckUpdateCapability()]
+        handlers = [ReleasePublishLatestCapability(), LocalPublishedUpdateCapability(), LocalCheckUpdateCapability(), LocalBuildUpdateCapability()]
         self._handlers = {handler.id: handler for handler in handlers}
 
     def metadata(self, capability_id: str) -> dict[str, Any]:

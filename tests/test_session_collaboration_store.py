@@ -16,6 +16,17 @@ class CollaborationStoreTests(unittest.TestCase):
         self.store = CollaborationStore(self.path)
         self.scope = CollaborationScope('alice', 'node-a')
 
+    def test_discarded_previews_do_not_consume_list_pages_but_remain_readable(self):
+        for name, status in [('ready', 'ready'), ('preview', 'preview'), ('removed-1', 'discarded'), ('removed-2', 'discarded')]:
+            self.store.write(self.scope, 'workspace', name, {'sourceSessionId': 's', 'status': status}, 0)
+        page = self.store.list(self.scope, 'workspace', session_id='s', limit=1)
+        self.assertEqual([row['id'] for row in page['items']], ['preview'])
+        self.assertEqual(page['nextOffset'], 1)
+        last = self.store.list(self.scope, 'workspace', session_id='s', offset=page['nextOffset'], limit=1)
+        self.assertEqual([row['id'] for row in last['items']], ['ready'])
+        self.assertIsNone(last['nextOffset'])
+        self.assertEqual(self.store.read(self.scope, 'workspace', 'removed-1')['status'], 'discarded')
+
     def test_concurrent_retry_is_claimed_once_and_survives_restart(self):
         def begin(_):
             return CollaborationStore(self.path).begin_request(self.scope, 'req', 'create', {'source': 's'})

@@ -79,3 +79,17 @@ Rust 4 项通过，Tauri 编译检查退出码 0，OpenSpec 严格校验通过�
 全套首次运行发现新测试夹具修改 Backend 序号后未同步假桌面身份，导致提前命中身份守卫；已修正夹具并按各预期失败原因断言，再完整重跑通过。没有放宽身份守卫。
 
 未发布、安装、修改注册表或重启应用；这些结果不代表正在运行的旧桌面已修复。需另行授权发布新版，通过原更新入口升级一次，再在 Kit 编辑页重新生成并保存独立检查更新定义。
+
+## 2026-11-07：本机构建直装
+
+新增 `node.update_local_build`：真实构建 Kit → 当前运行的构建登记 → 本地文件校验/复制 → 独立安装确认 → 原请求的重启验收。没有发布步骤、不读取更新源，不接受任意安装包路径。生成器识别“不用上传”“不需要再上传”等否定表达，避免误选发布链路。更新编辑器仅对发布能力显示发布参数。
+
+本次后端测试均使用随机临时用户根和 APPDATA。新增夹具在临时工作区运行只写惰性 MSI 字节的 Python 脚本，通过真实构建登记和 Kit 执行器流转；网络清单读取与发布入口设置为调用即失败，桌面交接使用 AsyncMock。未执行生产构建、真实安装器或应用重启。
+
+- `tests.test_kit_local_build_update`：11 项，覆盖本地暂存、无网络/发布、取消保留原包、制品改变/缺失/旧版本/跨运行回执、多安装器选择、回执与验证策略变化、拒绝未签名回执、禁用任意路径/参数/Schedule、嵌套构建引用和自然语言生成。
+- 兼容回归 `tests.test_workspace_kits tests.test_kit_capabilities tests.test_chat_kits tests.test_kit_build_receipts tests.test_kit_published_release tests.test_published_update tests.test_kit_update_journal tests.test_kit_update_barrier tests.test_kit_update_identity tests.test_kit_local_update_chain tests.test_kit_standalone_update`：144 项通过。聊天委托回归已涵盖第三种安装能力不可代确认。
+- 最终调整后执行 `python -m unittest tests.test_kit_local_build_update tests.test_kit_local_update_chain tests.test_kit_standalone_update`：33 项通过（35.648 秒）。初次新增测试发现相对 cwd 错误解析到进程目录，已修复为相对 Session 工作区，并通过真实隔离构建复核。
+- `npx playwright test --config playwright.engine.config.ts kit-local-build-update.spec.ts`：9 项通过（11.5 秒）。空页面挂载真实组件、拦截 WebSocket/API，覆盖三种能力的选择/确认/只读恢复，1200px 与 360px 布局，以及本地来源说明、取消和编辑参数。窄屏截图已查看，路径和完整摘要可换行。
+- `npx tsc --noEmit` 与 `git diff --check`：通过。
+
+安装平台/身份、签名策略和真实升级限制保持不变。本地构建回执没有发布清单签名，要求签名或配置验证密钥的节点仍会拒绝此输入。未打包新桌面，因此本记录不能证明当前安装版本已具有入口，也不代表真实 MSI/NSIS 更新验收。

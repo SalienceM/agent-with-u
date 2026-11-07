@@ -69,6 +69,24 @@ class TaskWorkspaces:
             store.finish_request(scope, request_id, receipt['revision'], 'succeeded', {'workspaceId': workspace_id})
         return json.dumps(row, ensure_ascii=False)
 
+    def _rpc_taskWorkspaceDiscardPreview(self, session_id: str, workspace_id: str, request_id: str, plan_fingerprint: str) -> str:
+        self._window_guard(session_id)
+        scope, store, row = self._task_workspace(session_id, workspace_id)
+        intent = {'sessionId': session_id, 'workspaceId': workspace_id, 'fingerprint': plan_fingerprint}
+        if store.request(scope, request_id):
+            store.begin_request(scope, request_id, 'taskDiscardPreview', intent)
+            return self._rpc_taskWorkspaceStatus(session_id, workspace_id)
+        if row['planFingerprint'] != plan_fingerprint:
+            raise CollaborationError('副本计划已变化，请重新读取后移除')
+        if row['status'] != 'preview' or row.get('requestId') or row.get('actual') or workspace_id in self._task_jobs():
+            raise CollaborationError('仅可移除尚未提交创建的预览；已创建或结果未知的副本请核对原操作')
+        receipt, _ = store.begin_request(scope, request_id, 'taskDiscardPreview', intent)
+        # 只注销预览登记，不触碰目录、Git 分支或 Session。CAS 阻止并发创建覆盖终态。
+        row = self._task_update(scope, row, status='discarded', discardRequestId=request_id,
+                                notice='已移除待确认预览；未创建或删除 Session、目录和 Git 分支。')
+        store.finish_request(scope, request_id, receipt['revision'], 'succeeded', {'workspaceId': workspace_id})
+        return self._rpc_taskWorkspaceStatus(session_id, workspace_id)
+
     def _task_cleanup_inspect(self, scope: Any, row: dict) -> dict:
         expected_root = paths.sub('task-workspaces', fingerprint([scope.owner, scope.executor])[:32], row['id'])
         if canonical_path(expected_root) != canonical_path(row['root']) or row['status'] != 'archived' or not row.get('actual'):
@@ -336,7 +354,8 @@ class TaskWorkspaces:
             row = {**row, 'status': 'unknown', 'notice': '原创建进程不可恢复；保留工作区，未自动重放'}
         receipt = store.request(scope, row['requestId']) if row.get('requestId') else None
         start_receipt = store.request(scope, row['startRequestId']) if row.get('startRequestId') else None
-        return json.dumps({**row, 'receipt': receipt, 'startReceipt': start_receipt}, ensure_ascii=False)
+        discard_receipt = store.request(scope, row['discardRequestId']) if row.get('discardRequestId') else None
+        return json.dumps({**row, 'receipt': receipt, 'startReceipt': start_receipt, 'discardReceipt': discard_receipt}, ensure_ascii=False)
 
     def _rpc_taskWorkspaceStart(self, session_id: str, workspace_id: str, request_id: str) -> str:
         self._window_guard(session_id)

@@ -144,6 +144,9 @@ class CollaborationStore:
         # 摘要独立列，列表不加载报告/输入正文。按 session 的过滤也在数据库内完成。
         query = 'FROM records WHERE owner=? AND executor=? AND kind=?'
         args: list[Any] = [scope.owner, scope.executor, kind]
+        if kind == 'workspace':
+            # 已移除的预览保留原 ID/回执供核对，但不占普通列表的分页名额。
+            query += " AND coalesce(json_extract(summary, '$.status'), '') != 'discarded'"
         if not isinstance(search, str) or len(search) > 100:
             raise CollaborationError('协作查询过长')
         if search:

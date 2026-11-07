@@ -623,7 +623,7 @@ export const WorkspaceKitsPanel: React.FC<Props> = ({ sessionId, open, onClose, 
     const current = () => liveScope.current === submittedScope && kitUpdateScope(sessionId) === submittedScope;
     if (capabilityResponding) return;
     if (approved && !window.confirm(
-      localUpdate ? '确认安装本次发布并退出、重启 Session 执行设备？交接后无法保证撤回。'
+      localUpdate ? '确认安装计划中的版本并退出、重启 Session 执行设备？交接后无法保证撤回。'
         : '确认按当前冻结计划正式发布？确认后会上传制品并切换 channel manifest。',
     )) return;
     setCapabilityResponding(key);
@@ -647,7 +647,7 @@ export const WorkspaceKitsPanel: React.FC<Props> = ({ sessionId, open, onClose, 
       }
       setNotice({
         kind: 'ok',
-        text: localUpdate ? (approved ? '安装交接已提交，等待真实启动验收' : '已取消本次安装，已发布结果保留')
+        text: localUpdate ? (approved ? '安装交接已提交，等待真实启动验收' : '已取消本次安装，原制品保留')
           : approved ? '已确认，发布中心正在执行冻结计划' : '已拒绝，没有开始正式发布',
       });
     } catch (error) {
@@ -1483,7 +1483,16 @@ const KitEditor: React.FC<{
                           : step.type === 'awu_capability' ? `AgentWithU 能力：${step.config?.capability || '未指定'}`
                           : `${step.shell || draft.shell} · ${(step.command || '').slice(0, 180)}`}
                     </div>
-                    {step.type === 'awu_capability' && (
+                    {step.type === 'awu_capability' && isLocalUpdateCapability(step.config?.capability) && (
+                      <div style={{ ...subtleStyle, marginTop: 9, lineHeight: 1.5 }}>
+                        {step.config?.capability === 'node.update_local_build'
+                          ? '使用本次构建登记的本地安装包，不上传。运行后核对安装计划并单独确认。'
+                          : step.config?.capability === 'node.check_update_local'
+                            ? '检查执行设备已配置的更新源；有更新时单独确认安装。'
+                            : '使用本次运行已成功发布的版本；发布后还需单独确认安装。'}
+                      </div>
+                    )}
+                    {step.type === 'awu_capability' && step.config?.capability === 'release.publish_latest' && (
                       <div style={{ ...twoColumns, marginTop: 9 }}>
                         <label><FieldLabel>项目目录</FieldLabel>
                           <input style={miniInput} value={String(step.config?.arguments?.projectRoot || '.')}

@@ -264,7 +264,7 @@ export interface KitCapabilityMetadata {
 }
 
 export const isLocalUpdateCapability = (capability: unknown): boolean =>
-  capability === 'node.update_local_published' || capability === 'node.check_update_local';
+  capability === 'node.update_local_published' || capability === 'node.check_update_local' || capability === 'node.update_local_build';
 
 export interface KitCapabilityRuntime {
   phase?: 'preparing' | 'blocked' | 'waiting_approval' | 'approved'
@@ -276,6 +276,8 @@ export interface KitCapabilityRuntime {
     status?: string;
     channel?: string;
     manifestUrl?: string;
+    sourceKind?: string;
+    sourcePath?: string;
     fingerprint?: string;
     candidate?: Record<string, unknown>;
     release?: Record<string, unknown>;

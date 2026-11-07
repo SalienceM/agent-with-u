@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from .kit_update_journal import HANDOFF_PHASES, JournalError, durable_json, fingerprint
-from .kit_capabilities import UPDATE_CAPABILITY, CHECK_UPDATE_CAPABILITY, LOCAL_UPDATE_CAPABILITIES
+from .kit_capabilities import UPDATE_CAPABILITY, CHECK_UPDATE_CAPABILITY, BUILD_UPDATE_CAPABILITY, LOCAL_UPDATE_CAPABILITIES
 from .update_manager import _current_release, _platform, _runtime
 
 # 交接期间仅允许观察和停止；其他入口 fail closed，不能通过看似只读的 RPC 启动探测进程。
@@ -89,6 +89,25 @@ class KitUpdateBridge:
         return self._release_center().published_result(runtime.get("jobId", ""), runtime.get("planId", ""),
             runtime.get("planFingerprint", ""), run.id, source.id)
 
+    def _local_build_for_update(self, session: Any, run: Any) -> tuple[dict[str, Any], dict[str, Any]]:
+        sources = [step for step in run.steps[:run.current_step]
+                   if step.status == 'succeeded' and step.type == 'command' and step.target == 'executor'
+                   and step.config.get('captureBuild') is True]
+        if len(sources) != 1:
+            raise JournalError('需要当前运行唯一且成功的本机构建步骤')
+        source = sources[0]
+        receipt = source.config.get('buildReceipt') or {}
+        base = Path(session.working_dir).resolve()
+        requested = Path(source.cwd or '.').expanduser()
+        project = requested.resolve() if requested.is_absolute() else (base / requested).resolve()
+        if (receipt.get('schemaVersion') != 1 or receipt.get('runId') != run.id or receipt.get('stepId') != source.id
+                or not project.is_relative_to(base)
+                or Path(str((receipt.get('candidate') or {}).get('projectRoot') or '')).resolve() != project):
+            raise JournalError('本机构建回执不属于本次运行、步骤或项目')
+        return receipt, {'runId': run.id, 'stepId': source.id, 'projectRoot': str(project),
+                         'receiptFingerprint': fingerprint(receipt),
+                         'policyFingerprint': self._update_manager._kit_source_fingerprint()}
+
     async def _run_kit_update_step(self, state: Any, session: Any, run: Any, step: Any,
                                     artifact_id: str = "") -> None:
         self._require_node_update_capability()
@@ -100,23 +119,25 @@ class KitUpdateBridge:
             return
         _client, desktop = self._kit_desktop()
         standalone = step.config.get("capability") == CHECK_UPDATE_CAPABILITY
-        if standalone and any(not desktop.get("release", {}).get(key)
+        local_build = step.config.get("capability") == BUILD_UPDATE_CAPABILITY
+        if (standalone or local_build) and any(not desktop.get("release", {}).get(key)
                 or desktop["release"][key] != _current_release().get(key)
                 for key in ("version", "packageVersion", "buildId", "sequence")):
             raise JournalError("桌面与 Backend 的当前版本不一致，请先核对安装状态")
-        published = {} if standalone else self._published_for_update(run)
+        published = {} if standalone or local_build else self._published_for_update(run)
         identity = dict(ownerId=self._session_owner_id(session.id), deviceId=desktop["deviceId"],
                         instanceId=desktop["instanceId"], sessionId=session.id, runId=run.id, stepId=step.id)
         request_id = runtime.get("installRequestId") or uuid.uuid4().hex
         self._update_manager.reserve_kit(request_id, identity)
         runtime.update(installRequestId=request_id, identity=identity, phase="checking" if standalone else "staging")
-        if not standalone:
+        if not standalone and not local_build:
             runtime["publishedRelease"] = published
         step.started_at = step.started_at or time.time()
         step.status = run.status = "running"
         try:
             self._kit_save(state)
             source = None
+            build_binding = None
             if standalone:
                 source = self._update_manager.journal.get(request_id, identity).get("updateSource")
                 if source is None:
@@ -142,19 +163,34 @@ class KitUpdateBridge:
                 self._kit_save(state)
                 staged = await self._update_manager.stage_configured_snapshot(source, artifact_id, request_id=request_id)
                 published = source
+            elif local_build:
+                from .kit_local_build import local_build_manifest
+                receipt, build_binding = self._local_build_for_update(session, run)
+                previous_binding = self._update_manager.journal.get(request_id, identity).get('localBuild')
+                if previous_binding is not None and previous_binding != build_binding:
+                    raise JournalError('本次构建回执或更新策略已变化，请取消后重新运行')
+                if previous_binding is None:
+                    self._update_manager.journal.update(request_id, identity, {'localBuild': build_binding})
+                project = Path(build_binding['projectRoot'])
+                document = await asyncio.to_thread(local_build_manifest, receipt, project)
+                await asyncio.to_thread(self._release_center().verify_build_snapshot, receipt, project)
+                staged = await self._update_manager.stage_local_build(document, artifact_id, request_id=request_id)
+                published = {'release': document['release'], 'channel': 'local', 'manifestUrl': ''}
             else:
                 staged = await self._update_manager.stage_published(published, artifact_id, request_id=request_id)
             if staged["phase"] == "needs_selection":
                 plan = {"device": desktop["deviceId"], "instanceId": desktop["instanceId"],
                         "release": published["release"], "artifacts": staged["artifacts"],
                         "channel": published["channel"], "manifestUrl": published["manifestUrl"],
+                        **({'sourceKind': 'local_build', 'sourcePath': build_binding['projectRoot'],
+                            'localBuild': build_binding} if local_build else {}),
                         "blockers": ["请选择已核对版本的安装器"], "warnings": []}
                 runtime.update(phase="needs_selection", planId=request_id, plan=plan, planFingerprint=fingerprint(plan))
             else:
-                # 下载期间桌面/权限可变化，再核对；最终确认仍会再次检查。
+                # 暂存期间桌面/权限可变化，再核对；最终确认仍会再次检查。
                 _client, current = self._kit_desktop()
                 if current != desktop:
-                    raise JournalError("下载期间本地桌面身份变化，请取消后重新准备")
+                    raise JournalError("暂存期间本地桌面身份变化，请取消后重新准备")
                 plan_path = Path(staged["planPath"])
                 install_plan = json.loads(plan_path.read_text(encoding="utf-8"))
                 artifact = self._update_manager._selection["artifact"]
@@ -162,7 +198,8 @@ class KitUpdateBridge:
                 frozen = self._update_manager.journal.freeze(request_id, identity, {
                     "desktop": desktop, "backendPid": os.getpid(), "current": _current_release(),
                     "release": published["release"], "artifact": artifact, "channel": published["channel"],
-                    **({"updateSource": source} if standalone else {"publishedRelease": published}),
+                    **({'localBuild': build_binding, 'sourceKind': 'local_build', 'sourcePath': build_binding['projectRoot']}
+                       if local_build else {"updateSource": source} if standalone else {"publishedRelease": published}),
                     "manifestUrl": published["manifestUrl"], "installPlan": install_plan,
                     "warnings": ["安装将退出目标节点的桌面与 Backend，控制窗口不会被更新", "交接后无法保证撤回；不会自动重装或回滚"],
                     "preflight": reasons,
@@ -245,7 +282,7 @@ class KitUpdateBridge:
             journal.confirm(install_id, identity, expected_fingerprint, request_id)
             return json.dumps({"status": "ok", "decision": "already_accepted", "run": run.to_dict()}, ensure_ascii=False)
         if runtime.get("phase") != "waiting_approval":
-            raise JournalError("请先完成制品选择和下载校验")
+            raise JournalError("请先完成制品选择和暂存校验")
         client, desktop = self._kit_desktop()
         if desktop != record["plan"]["desktop"]:
             raise JournalError("桌面实例已变化；旧安装确认失效")
@@ -254,6 +291,10 @@ class KitUpdateBridge:
             if source != record.get("updateSource"):
                 raise JournalError("已检查的更新快照已变化")
             self._update_manager.inspect_configured_snapshot(source)
+        elif step.config.get("capability") == BUILD_UPDATE_CAPABILITY:
+            _receipt, binding = self._local_build_for_update(session, run)
+            if binding != record['plan'].get('localBuild'):
+                raise JournalError('本次构建回执或更新策略已变化，旧安装确认失效')
         elif self._published_for_update(run) != record["plan"]["publishedRelease"]:
             raise JournalError("发布凭据已变化")
         self._begin_update_handoff(install_id, run.id)

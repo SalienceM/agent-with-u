@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import stat
 import subprocess
 import time
 import uuid
@@ -16,6 +17,8 @@ from .session_collaboration_store import CollaborationError, fingerprint
 from .workspace_tools import relative_path
 
 MAX_BYTES = 100 * 1024 * 1024
+MAX_GIT_METADATA_ENTRIES = 20000
+GIT_METADATA_TIMEOUT_SECONDS = 8
 OID = re.compile(r'[0-9a-f]{40,64}')
 SKILL_ROOTS = ('.agents/skills', '.claude/skills', '.qwen/skills')
 
@@ -33,6 +36,52 @@ def canonical_path(path: str | Path) -> str:
         raise CollaborationError('项目目录必须是绝对路径')
     reject_links(target)
     return os.path.normcase(str(target.resolve()))
+
+
+def _check_git_metadata(*roots: str) -> None:
+    """目录边界逐层复核，条目只读不跟随链接的属性；不对每个对象重复遍历全部祖先。"""
+    deadline = time.monotonic() + GIT_METADATA_TIMEOUT_SECONDS
+    count = 0
+    pending = list(reversed(dict.fromkeys(roots)))
+    visited: set[str] = set()
+
+    def check_deadline() -> None:
+        if time.monotonic() > deadline:
+            raise CollaborationError(
+                f'Git 元数据检查超时（{GIT_METADATA_TIMEOUT_SECONDS} 秒，已检查 {count} 项）；'
+                '请在磁盘负载降低后重新检查')
+
+    while pending:
+        check_deadline()
+        folder = pending.pop()
+        key = os.path.normcase(os.path.abspath(folder))
+        # linked worktree 的 git-dir 通常已包含在 common-dir 中，不重复扫描/计数。
+        if key in visited:
+            continue
+        try:
+            try:
+                reject_links(Path(folder))
+            except ValueError as error:
+                raise CollaborationError('Git 元数据包含符号链接或重解析点，不支持此仓库') from error
+            with os.scandir(folder) as entries:
+                for entry in entries:
+                    check_deadline()
+                    count += 1
+                    if count > MAX_GIT_METADATA_ENTRIES:
+                        raise CollaborationError(
+                            f'Git 元数据条目超过检查上限（{MAX_GIT_METADATA_ENTRIES} 项）；'
+                            '请检查仓库对象与 worktree 数量')
+                    info = entry.stat(follow_symlinks=False)
+                    if stat.S_ISLNK(info.st_mode) or getattr(info, 'st_file_attributes', 0) & 0x400:
+                        raise CollaborationError('Git 元数据包含符号链接或重解析点，不支持此仓库')
+                    if Path(folder).name == 'info' and entry.name in {'alternates', 'http-alternates'}:
+                        raise CollaborationError('不支持外部 Git 对象库')
+                    if stat.S_ISDIR(info.st_mode):
+                        pending.append(entry.path)
+            visited.add(key)
+        except OSError as error:
+            raise CollaborationError('Git 元数据无法读取，请检查仓库目录权限后重新预览') from error
+    check_deadline()
 
 
 class TaskGit:
@@ -103,16 +152,7 @@ class TaskGit:
         common_value = Path(self.run('rev-parse', '--git-common-dir').decode('utf-8').strip())
         common = canonical_path(common_value if common_value.is_absolute() else Path(self.root) / common_value)
         git_dir = canonical_path(self.run('rev-parse', '--absolute-git-dir').decode('utf-8').strip())
-        count = 0; deadline = time.monotonic() + 8
-        for folder in dict.fromkeys((common, git_dir)):
-            for base, dirs, files in os.walk(folder, followlinks=False):
-                count += len(dirs) + len(files)
-                if count > 20000 or time.monotonic() > deadline:
-                    raise CollaborationError('Git 元数据超过检查范围')
-                for name in dirs + files:
-                    reject_links(Path(base) / name)
-                if Path(base).name == 'info' and any(name in files for name in ('alternates', 'http-alternates')):
-                    raise CollaborationError('不支持外部 Git 对象库')
+        _check_git_metadata(common, git_dir)
         head = self.run('rev-parse', '--verify', 'HEAD^{commit}').decode().strip()
         if not OID.fullmatch(head):
             raise CollaborationError('没有可用基线提交，请先明确准备仓库')

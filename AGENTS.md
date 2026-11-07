@@ -1274,6 +1274,12 @@ Workspace Kits are Session-level standard accessories stored separately in
   旧清单不是无更新。`node.update_local_published` 仍严格绑定当前 run，保存和运行均拒绝缺少唯一
   `bindBuild` 发布的旧错误单步定义；不得静默迁移生产 Kit。Windows 注册路径仅去空白和成对外引号
   后 canonicalize，保留唯一目录与真实 exe 匹配，不修改注册表或绕过 installed 守卫。
+- 本机打包直装 `node.update_local_build` 消费当前 run 唯一成功 executor 构建的 `captureBuild` 回执，
+  不上传、不读更新源/latest，不接受任意路径或安装参数。生成器复用真实构建 Kit；保存与运行均校验
+  唯一构建、禁止发布、唯一末尾安装及手动运行。核对登记候选/本地文件后复制到更新暂存区，校验
+  SHA-256/大小，沿用已安装 Windows 身份、节点预留、独立人工确认和重启验收。选择与确认绑定
+  原回执和验证策略；取消保留原构建。签名策略不放宽：要求签名或配置验证密钥时拒绝未签名本地
+  回执，继续使用已签名发布路径。测试只用临时项目、惰性制品和 fake 桌面，不等于真实安装验收。
 - 普通命令 Kit 的 `kitCancel` is immediate and idempotent: it first persists the authoritative
   `cancelled` run/step state, then cancels any live orchestration task and terminates
   the exact command process tree by run PID. This also repairs orphaned active records
@@ -2111,10 +2117,18 @@ against its frozen snapshot, retaining the artifact/old validation and never cal
 `task_git.py` / `task_workspaces.py` create unique managed branches/worktrees using fixed argv and
 private-index selected-path snapshots. Source index/HEAD/files are not mutated. Credentials,
 links, external objects, oversized files and unsupported repositories are rejected.
+Git metadata checks use bounded `scandir` with no-follow entry attributes and directory-boundary
+ancestor checks; never re-walk all ancestors per loose object. Overlapping common/git directories
+are scanned once per check. The 20000-entry and 8-second guards remain, with distinct diagnostic
+messages; unreadable entries fail closed. No persistent scan cache or automatic Git GC/cleanup.
 Managed Git readers require the exact registered root/common-dir/repository identity. Task creation
 and initial model start are separate. Sidebar main-Session context menus create branch copies;
 child menus merge to their recorded parent through the existing frozen-plan flow. The server
-rejects child/integration/review derivation at preview and execution. Only two tree levels are
+creates an ordinary Session for each branch copy: chat, abilities and runtime settings share
+the normal Session UI. Sidebar families start collapsed; selecting a child from another entry
+reveals its parent. A create dialog opens the child only on its own ready receipt, never on
+acceptance, historical reads or a late result after closing; opening does not start a model.
+The server rejects child/integration/review derivation at preview and execution. Only two tree levels are
 displayed, including legacy nested records; favorites keep families together and search retains
 ancestors. Integration Sessions belong under the target's main Session, never a third level.
 New copy forms use `inheritSource=true` and `snapshotMode=current`: explicit allowlisted runtime
@@ -2127,6 +2141,10 @@ thread/history, queue, schedule or transient grant is inherited. Old requests la
 retain selected-path/default-permission behavior; old nodes without copy defaults are unsupported
 in the new form. `SessionStore` must round-trip `maxContinuations` along with the other preferences.
 Archive retains resources; cleanup is separate, only for a verified idle clean merged owned task.
+Unsubmitted previews expose “移除预览”: `taskWorkspaceDiscardPreview` binds the plan fingerprint,
+checks ownership and preview-only state, and saves a discarded tombstone without Git/filesystem
+deletion. Ordinary workspace pagination excludes these tombstones; exact status/receipts remain
+readable and the old plan cannot create a Session. Lost replies only trigger explicit status reads.
 Unknown cleanup retains its reservation; closing tabs never deletes outputs.
 
 `project_merges.py` prepares frozen commits in a separate integration worktree and creates a real

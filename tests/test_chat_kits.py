@@ -98,6 +98,9 @@ class ChatKitTests(unittest.IsolatedAsyncioTestCase):
     async def test_standalone_install_never_inherits_publication_delegation(self):
         await self._check_local_install_delegation("node.check_update_local")
 
+    async def test_local_build_install_never_inherits_publication_delegation(self):
+        await self._check_local_install_delegation("node.update_local_build")
+
     async def _check_local_install_delegation(self, capability):
         run = await self.publishing_run(True)
         step = run.steps[0]

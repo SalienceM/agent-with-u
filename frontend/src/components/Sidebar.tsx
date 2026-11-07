@@ -452,6 +452,7 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
     completedDeletions.current.clear(); deletionBusy.current = false;
     setSessionToDelete(null); setSessionToDestroy(null); setSessionContextMenu(null);
     setBranchDialog(null);
+    setExpandedSessionFamilies(new Set());
     setDeleteResult(null); setDestroyResult(null); setDeleting(false); setDestroying(false); setFavoriteError('');
   }), []);
 
@@ -622,7 +623,16 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
   }, [conversionGoal, conversionChoices, conversionWorkflow, converting, onSelectSession, refresh, sessionToConvert]);
 
   const normalizedSearch = searchQuery.trim().toLocaleLowerCase();
-  const [collapsedTasks, setCollapsedTasks] = useState<Set<string>>(new Set());
+  const [expandedSessionFamilies, setExpandedSessionFamilies] = useState<Set<string>>(new Set());
+  // 子项是普通 Session，默认收在主项下；从标签页等入口切入子项时展开所属主项。
+  const activeFamilyKey = useMemo(() => {
+    const family = taskSessionTree(sessions, new Set(), true).find(row => row.depth === 0 && row.children.some(child =>
+      child.id === activeSessionId && (!activeExecKey || (child.execKey || 'local') === activeExecKey)));
+    return family ? `${family.item.execKey || 'local'}:${family.item.id}` : '';
+  }, [sessions, activeSessionId, activeExecKey]);
+  useEffect(() => {
+    if (activeFamilyKey) setExpandedSessionFamilies(old => old.has(activeFamilyKey) ? old : new Set(old).add(activeFamilyKey));
+  }, [activeFamilyKey, activeSessionId]);
   const visibleSessions = useMemo(() => {
     const filtered = normalizedSearch
       ? sessions.filter((session) => [
@@ -646,6 +656,8 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
     }
     return [...filtered].sort(sortSessionsByPriority);
   }, [sessions, normalizedSearch, activeSessionId]);
+  const collapsedSessionFamilies = useMemo(() => new Set(visibleSessions
+    .map(row => `${row.execKey || 'local'}:${row.id}`).filter(key => !expandedSessionFamilies.has(key))), [visibleSessions, expandedSessionFamilies]);
 
   const pendingCount = completedSessions.size;
 
@@ -1024,11 +1036,13 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
               )}
               {!isCollapsed && (
                 <div style={showGroupHeader ? groupSessionsStyle : undefined}>
-                {taskSessionTree(group.sessions, collapsedTasks, !!normalizedSearch).map(({ item: s, depth, children }) => {
+                {taskSessionTree(group.sessions, collapsedSessionFamilies, !!normalizedSearch).map(({ item: s, depth, children }) => {
                 const isRunning = streamingSessions.has(s.id);
                 const isCompleted = !isRunning && completedSessions.has(s.id);
                 const isActive = s.id === activeSessionId;
                 const isContextTarget = sessionContextMenu?.session.id === s.id;
+                const familyKey = `${s.execKey || 'local'}:${s.id}`;
+                const familyExpanded = !!normalizedSearch || expandedSessionFamilies.has(familyKey);
                 // “接管既有 thread”是来源，“SSH Codex”是执行位置；两者可同时成立。
                 const isCodexAttached = s.codexThreadAttached === true
                   || (s.codexThreadAttached === undefined && s.codexConnectionMode === 'node');
@@ -1060,14 +1074,14 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
                   }}
                   title={[s.title, s.workingDir, getBackendShortLabel(s.backendId)].filter(Boolean).join('\n')}
                 >
-                  {children.length > 0 && <button type="button" aria-label={`${collapsedTasks.has(`${s.execKey || 'local'}:${s.id}`) ? '展开' : '收起'} ${s.title} 的子任务`}
-                    aria-expanded={!collapsedTasks.has(`${s.execKey || 'local'}:${s.id}`)}
-                    title={`${children.length} 个任务 · ${children.filter(row => streamingSessions.has(row.id)).length} 运行 · ${children.filter(row => completedSessions.has(row.id)).length} 完成`}
-                    style={{ border: 0, background: 'transparent', color: 'inherit', cursor: 'pointer', padding: 2, fontSize: 11 }}
-                    onClick={event => { event.stopPropagation(); const key = `${s.execKey || 'local'}:${s.id}`; setCollapsedTasks(old => { const next = new Set(old); if (next.has(key)) next.delete(key); else next.add(key); return next; }); }}>
-                    {collapsedTasks.has(`${s.execKey || 'local'}:${s.id}`) ? '▸' : '▾'}{children.length}
+                  {children.length > 0 && <button type="button" aria-label={`${familyExpanded ? '收起' : '展开'} ${s.title} 的子 Session`}
+                    aria-expanded={familyExpanded} disabled={!!normalizedSearch}
+                    title={`${children.length} 个子 Session · ${children.filter(row => streamingSessions.has(row.id)).length} 运行 · ${children.filter(row => completedSessions.has(row.id)).length} 完成${normalizedSearch ? ' · 搜索时展开' : ''}`}
+                    style={{ border: 0, background: 'transparent', color: 'var(--theme-text-muted, #656d76)', cursor: normalizedSearch ? 'default' : 'pointer', padding: 2, fontSize: 11, minWidth: 24, minHeight: 24, flexShrink: 0 }}
+                    onClick={event => { event.stopPropagation(); setExpandedSessionFamilies(old => { const next = new Set(old); if (next.has(familyKey)) next.delete(familyKey); else next.add(familyKey); return next; }); }}>
+                    {familyExpanded ? '▾' : '▸'}{children.length}
                   </button>}
-                  {depth > 0 && <span title={s.relationKind === 'integration' ? '独立合并空间' : '分支副本 · 独立目录'} style={{ fontSize: 11, color: s.relationKind === 'integration' ? '#d97706' : '#8b5cf6' }}>{s.relationKind === 'integration' ? '⇄' : '⑂'}</span>}
+                  {depth > 0 && <span title={s.relationKind === 'integration' ? '独立合并空间' : '子 Session · 独立 Git 分支与目录'} style={{ fontSize: 11, color: s.relationKind === 'integration' ? '#d97706' : '#8b5cf6' }}>{s.relationKind === 'integration' ? '⇄' : '⑂'}</span>}
                   {isRunning && (
                     <span style={{
                       ...runningDotStyle,

@@ -4863,6 +4863,9 @@ export const api = {
   async taskWorkspaceArchive(session: string, executor: string, id: string, request: string): Promise<import('./types/taskWorkspaces').TaskWorkspace> {
     return collaborationCall(executor, 'taskWorkspaceArchive', [session, id, request]);
   },
+  async taskWorkspaceDiscardPreview(session: string, executor: string, id: string, request: string, fingerprint: string): Promise<import('./types/taskWorkspaces').TaskWorkspace> {
+    return collaborationCall(executor, 'taskWorkspaceDiscardPreview', [session, id, request, fingerprint]);
+  },
   async taskWorkspaceCleanupPlan(session: string, executor: string, id: string): Promise<import('./types/taskWorkspaces').TaskWorkspace> {
     return collaborationCall(executor, 'taskWorkspaceCleanupPlan', [session, id]);
   },

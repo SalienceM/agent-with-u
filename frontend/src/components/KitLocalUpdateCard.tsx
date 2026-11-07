@@ -15,6 +15,7 @@ export const KitLocalUpdateCard: React.FC<{
   const runtime = (step.config.capabilityRuntime || {}) as KitCapabilityRuntime;
   const plan = runtime.plan || {};
   const phase = String(runtime.phase || step.status);
+  const localBuild = step.config.capability === 'node.update_local_build';
   const handed = ['handing_off', 'waiting_restart', 'verifying', 'result_unknown'].includes(phase);
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState('');
@@ -31,7 +32,7 @@ export const KitLocalUpdateCard: React.FC<{
         if (selection.current.artifact !== artifact) throw new Error('已有选择请求结果待核对，请勿重复提交其他制品');
         const result = await api.kitUpdateSelect(sessionId, run.id, artifact, fp, selection.current.request);
         if (!['ok', 'accepted'].includes(result.status)) throw new Error(result.message || '制品选择未被接受');
-        if (live.current) setNotice('选择已提交，等待执行端下载校验');
+        if (live.current) setNotice(localBuild ? '选择已提交，等待执行端复制并校验本地安装包' : '选择已提交，等待执行端下载校验');
       } else {
         const result = await api.kitUpdateReconcile(sessionId, run.id);
         if (result.status !== 'ok') throw new Error(result.message || '核对未完成');
@@ -44,16 +45,19 @@ export const KitLocalUpdateCard: React.FC<{
   const artifact = plan.artifact;
   return <section aria-label="本机更新安装计划" style={{ marginTop: 10, padding: 13, borderRadius: 10,
     border: '1px solid var(--theme-border)', background: 'var(--theme-panel-bg, #1b2230)', overflowWrap: 'anywhere' }}>
-    <strong>本机更新 · {phases[phase] || phase}</strong>
+    <strong>本机更新 · {localBuild && phase === 'staging' ? '复制并校验本地安装包' : phases[phase] || phase}</strong>
     <p>目标是 Session 执行设备，不是当前控制窗口。安装需单独确认。</p>
+    {localBuild && <div>来源：本次本机构建 · 未上传</div>}
+    {localBuild && plan.sourcePath && <div>构建目录：{plan.sourcePath}</div>}
     <div>设备：{String(plan.desktop?.deviceId || plan.device || '核对中')} · 安装实例：{String(plan.desktop?.instanceId || plan.instanceId || '—')}</div>
     <div>当前：{String(plan.current?.version || '—')} / {String(plan.current?.buildId || '—')}</div>
     <div>目标：{String(plan.release?.version || '—')} / {String(plan.release?.buildId || '—')} · 序号 {String(plan.release?.sequence || '—')}</div>
-    <div>通道：{String(plan.channel || '—')}{phase !== 'current' && <> · 计划指纹：{runtime.planFingerprint || '准备中'}</>}</div>
+    <div>通道：{localBuild ? '本机构建（未发布）' : String(plan.channel || '—')}{phase !== 'current' && <> · 计划指纹：{runtime.planFingerprint || '准备中'}</>}</div>
     {plan.manifestUrl && <div>清单：{plan.manifestUrl}</div>}
     {artifact && <div style={{ marginTop: 8 }}>
       <div>{String(artifact.fileName || artifact.id)} · {String(artifact.platform)} / {String(artifact.arch)} · {Number(artifact.size).toLocaleString()} 字节</div>
       <div>SHA-256：{String(artifact.sha256)}</div>
+      {localBuild && !!artifact.url && <div>本地安装包：{String(artifact.url)}</div>}
     </div>}
     {phase === 'needs_selection' && plan.artifacts?.map(item => <button key={String(item.id)} disabled={busy || responding}
       onClick={() => void act(String(item.id))} style={{ display: 'block', marginTop: 8, maxWidth: '100%', whiteSpace: 'normal' }}>

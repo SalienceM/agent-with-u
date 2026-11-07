@@ -2,7 +2,7 @@
 from __future__ import annotations
 import re
 from typing import Any
-from .kit_capabilities import UPDATE_CAPABILITY, CHECK_UPDATE_CAPABILITY, LOCAL_UPDATE_CAPABILITIES
+from .kit_capabilities import UPDATE_CAPABILITY, CHECK_UPDATE_CAPABILITY, BUILD_UPDATE_CAPABILITY, LOCAL_UPDATE_CAPABILITIES
 
 
 def validate_update_sequence(configs: list[dict[str, Any]]) -> list[str]:
@@ -12,6 +12,11 @@ def validate_update_sequence(configs: list[dict[str, Any]]) -> list[str]:
     if positions and positions != [len(configs) - 1]:
         errors.append("本机更新必须且只能是展开计划的最后一步")
     for index in positions:
+        if configs[index].get("capability") == BUILD_UPDATE_CAPABILITY:
+            if sum(config.get("captureBuild") is True for config in configs[:index]) != 1:
+                errors.append("安装本机构建需要前面唯一的 captureBuild 构建步骤；不能选择任意安装包或其他运行的制品")
+            if any(config.get("capability") == "release.publish_latest" for config in configs[:index]):
+                errors.append("本机构建直装不能包含发布步骤；需要上传时请选择构建、发布并更新链路")
         if configs[index].get("capability") == UPDATE_CAPABILITY:
             sources = [config for config in configs[:index] if config.get("capability") == "release.publish_latest"
                        and (config.get("arguments") or {}).get("bindBuild") is True]
@@ -44,21 +49,41 @@ def is_build_command(command: str) -> bool:
     return bool(re.search(r"(?i)(?:^|[\\/\s\"'])build_all\.bat(?:$|[\s\"'])|register_release_candidate\.py", command))
 
 
+def publication_requested(intent: str) -> bool:
+    # 否定上传/发布不能因为命中名词而生成正式发布步骤。
+    remaining = re.sub(r"(?:无需|无须|不用|不必|不要|不需要|不想|不再|禁止|跳过|免|不)(?:再|先)?\s*(?:上传|发布)", "", intent.casefold())
+    remaining = re.sub(r"(?:without|no|don't|do not|skip)\s+(?:upload(?:ing)?|publish(?:ing)?)", "", remaining)
+    return any(word in remaining for word in ("发布", "上传", "publish", "upload"))
+
+
+def update_prohibited(intent: str) -> bool:
+    return bool(re.search(r"(?:无需|无须|禁止|不(?:要|需要|必|用|再|想)?)(?:本机|本地)?(?:更新|安装)|without (?:updating|installing)", intent.casefold()))
+
+
 def requested(intent: str) -> bool:
     lowered = intent.casefold()
     return (any(word in lowered for word in ("本机更新", "更新本机", "本机完成更新", "本地更新", "local update"))
             and any(word in lowered for word in ("打包", "build", "package"))
-            and any(word in lowered for word in ("发布", "上传", "publish", "upload"))
-            and not any(word in lowered for word in ("不要更新", "不更新本机", "不安装", "without updating")))
+            and publication_requested(lowered)
+            and not update_prohibited(lowered))
 
 
-def build_template(state: Any, intent: str) -> dict[str, Any]:
+def local_build_requested(intent: str) -> bool:
+    lowered = intent.casefold()
+    return (any(word in lowered for word in ("本机", "本地", "local"))
+            and any(word in lowered for word in ("打包", "构建", "build", "package"))
+            and any(word in lowered for word in ("更新", "安装", "update", "install"))
+            and not publication_requested(lowered)
+            and not update_prohibited(lowered))
+
+
+def build_template(state: Any, intent: str, *, local_build: bool = False) -> dict[str, Any]:
     candidates = []
     for kit in state.visible_kits():
         if not kit.enabled:
             continue
         steps = kit.steps or [{"type": "command", "target": kit.execution_target, "command": kit.command}]
-        if (all(step.get("type", "command") == "command" and step.get("target", "executor") == "executor" for step in steps)
+        if (all(step.get("type", "command") == "command" and (step.get("target") or kit.execution_target) == "executor" for step in steps)
                 and sum(is_build_command(step.get("command", "")) for step in steps) == 1):
             candidates.append(kit)
     explicit = [kit for kit in candidates if kit.id in intent]
@@ -70,16 +95,17 @@ def build_template(state: Any, intent: str) -> dict[str, Any]:
                 "candidates": [{"id": kit.id, "title": kit.title} for kit in candidates], "warnings": []}
     build = candidates[0]
     return {"status": "ok", "ready": True, "kit": {
-        "title": "打包、发布并更新本机", "description": "本次构建 → 独立发布确认 → 独立安装确认 → 重启验收",
+        "title": "本机打包并直接更新" if local_build else "打包、发布并更新本机",
+        "description": "本次本机构建 → 本地制品校验 → 独立安装确认 → 重启验收；不上传、不下载" if local_build else "本次构建 → 独立发布确认 → 独立安装确认 → 重启验收",
         "executionTarget": "executor", "shell": "powershell", "cwd": ".", "command": "",
         "timeoutSeconds": 21600, "inputs": build.inputs, "enabled": True,
         "steps": [
             {"id": "build", "type": "kit_call", "target": "executor", "title": build.title, "kitId": build.id,
              "captureBuild": True, "inputs": {item["key"]: "{{" + item["key"] + "}}" for item in build.inputs if item.get("key")}},
-            {"id": "publish", "type": "awu_capability", "target": "executor", "title": "发布本次构建",
-             "config": {"capability": "release.publish_latest", "arguments": {"bindBuild": True, "channel": "stable", "projectRoot": "."}}},
-            {"id": "install", "type": "awu_capability", "target": "executor", "title": "安装本次发布并验收重启",
-             "config": {"capability": "node.update_local_published", "arguments": {}}},
+            *([] if local_build else [{"id": "publish", "type": "awu_capability", "target": "executor", "title": "发布本次构建",
+             "config": {"capability": "release.publish_latest", "arguments": {"bindBuild": True, "channel": "stable", "projectRoot": "."}}}]),
+            {"id": "install", "type": "awu_capability", "target": "executor", "title": "安装本次本机构建并验收重启" if local_build else "安装本次发布并验收重启",
+             "config": {"capability": BUILD_UPDATE_CAPABILITY if local_build else UPDATE_CAPABILITY, "arguments": {}}},
         ], "schedule": {"mode": "manual"}, "assertions": [{"type": "exit_code", "expected": 0}],
         "outputs": [], "view": {"default": "summary", "showLogs": True, "showTerminal": False},
     }}

@@ -658,7 +658,7 @@ class UpdateManager:
         return self._inspect_kit_manifest(document, source)
 
     def _inspect_kit_manifest(self, document: dict[str, Any], source: str) -> dict[str, Any]:
-        """两种 Kit 来源共用安装边界，但不共用/伪造发布凭据。"""
+        """三种 Kit 来源共用安装边界，但不共用/伪造发布凭据。"""
         release = self._release(document)
         if (type(release.get("kitUpdateProtocol")) is not int or release["kitUpdateProtocol"] != 1
                 or not release.get("buildId") or not release.get("sequence")):
@@ -760,6 +760,21 @@ class UpdateManager:
         inspected = await self.inspect_published(published)
         return await self._stage_kit_inspected(inspected, artifact_id, request_id=request_id)
 
+    async def stage_local_build(self, document: dict[str, Any], artifact_id: str = "",
+                                *, request_id: str) -> dict[str, Any]:
+        self.journal.require_slot(request_id)
+        # 构建回执不冒充签名发布清单；节点要求签名时明确拒绝，绝不修改策略。
+        try:
+            self._verify_manifest(document)
+        except UpdateError as error:
+            raise UpdateError(f'本机构建回执没有清单签名，无法满足当前验证策略：{error}；请使用已签名发布更新流程') from error
+        inspected = self._inspect_kit_manifest(document, '')
+        inspected.update(sourceKind='local_build', manifestUrl='')
+        if any(not Path(item['url']).is_absolute() or str(item['url']).startswith(('\\\\', '//'))
+               for item in inspected['artifacts']):
+            raise UpdateError('本机构建只允许本地安装包，不接受网络下载地址')
+        return await self._stage_kit_inspected(inspected, artifact_id, request_id=request_id)
+
     async def _stage_kit_inspected(self, inspected: dict[str, Any], artifact_id: str,
                                   *, request_id: str, configured: bool = False) -> dict[str, Any]:
         self.journal.require_slot(request_id or self._normal_request)
@@ -777,7 +792,7 @@ class UpdateManager:
             self._reserve_normal()
         selection = {**inspected, "artifact": selected[0], "strictPublished": not configured}
         self._selection = selection
-        self._save_state({"phase": "downloading", "error": "", "message": "下载本次发布的精确版本",
+        self._save_state({"phase": "downloading", "error": "", "message": "复制并校验本次本地安装包" if inspected.get('sourceKind') == 'local_build' else "下载本次发布的精确版本",
                           "kitRequestId": request_id,
                           "release": selection["release"], "artifact": self._public_artifact(selected[0]),
                           "manifestUrl": selection["manifestUrl"]})
@@ -932,7 +947,7 @@ class UpdateManager:
             plan_path = release_dir / "install-plan.json"
             _atomic_json(plan_path, plan)
             self._save_state({
-                "phase": "staged", "message": "更新已下载并校验，等待安装", "error": "",
+                "phase": "staged", "message": "本地安装包已复制并校验，等待安装" if selection.get('sourceKind') == 'local_build' else "更新已下载并校验，等待安装", "error": "",
                 "downloadedBytes": downloaded, "totalBytes": downloaded,
                 "stagedPath": str(target), "planPath": str(plan_path),
             })
