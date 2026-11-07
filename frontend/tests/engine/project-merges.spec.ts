@@ -43,8 +43,8 @@ async function mount(page: Page, width = 1200, dark = false) {
 
 for (const [width, dark] of [[1280, false], [390, true]] as const) test(`merge conflict and lost receipt retain draft (${width}, dark=${dark})`, async ({ page }) => {
   await mount(page, width, dark); await page.locator('.chat-textarea').fill('汇合后的下一步草稿');
-  await page.getByRole('button', { name: '项目任务与汇合' }).click();
-  await page.getByRole('button', { name: '成果汇合', exact: true }).click();
+  await page.getByRole('button', { name: '分支副本与合并' }).click();
+  await page.getByRole('button', { name: '合并记录', exact: true }).click();
   await page.getByRole('button', { name: '发现项目会话' }).click();
   await page.getByLabel('来源会话', { exact: true }).selectOption('one');
   await page.getByLabel('目标会话', { exact: true }).selectOption('two');

@@ -7,14 +7,15 @@ import { useCollaborationRead } from '../hooks/useCollaborationRead';
 import { uuid } from '../utils/uuid';
 
 const labels: Record<string, string> = { preview: '待确认准备', blocked: '需要处理', preparing: '准备中', conflict: '待解决冲突', candidate: '候选待核对/应用', applying: '应用中', succeeded: '已完成', unknown: '结果未知', error: '失败', cancelled: '已取消' };
-interface Props { session: string; executor: string; onOpenSession?: (id: string) => void }
-export const ProjectMergePanel: React.FC<Props> = ({ session, executor, onOpenSession }) => {
+interface Props { session: string; executor: string; onOpenSession?: (id: string) => void; fixedTarget?: string }
+export const ProjectMergePanel: React.FC<Props> = ({ session, executor, onOpenSession, fixedTarget }) => {
   const [history, setHistory] = useState<CollaborationSummary[]>([]), [next, setNext] = useState<number | null>(null);
   const [selected, setSelected] = useState(''), [row, setRow] = useState<ProjectMerge>(), [revision, setRevision] = useState(0), [nonce, setNonce] = useState(0);
   const [items, setItems] = useState<Array<{ id: string; title: string; workingDir: string }>>([]);
-  const [source, setSource] = useState(''), [target, setTarget] = useState(''), [query, setQuery] = useState('');
+  const [source, setSource] = useState(fixedTarget ? session : ''), [target, setTarget] = useState(fixedTarget || ''), [query, setQuery] = useState('');
   const [busy, setBusy] = useState(false), [notice, setNotice] = useState(''), [unknown, setUnknown] = useState(false);
   const identity = `${executor}:${session}`, current = useRef(identity); current.current = identity;
+  useEffect(() => { current.current = identity; return () => { current.current = ''; }; }, [identity]);
   const running = useRef(false);
   useEffect(() => api.onProjectMergeUpdated((value, node) => { if (node === executor && value.sourceSessionId === session) setRevision(n => n + 1); }), [session, executor]);
   useCollaborationRead(`${identity}:merges`, revision, true, () => api.collaborationList(session, executor, 'merge'),
@@ -28,7 +29,7 @@ export const ProjectMergePanel: React.FC<Props> = ({ session, executor, onOpenSe
   };
   const discover = () => void run(async () => { const result = await api.projectMergeDiscover(session, executor, query); if (current.current === identity) { setItems(result.items); if (result.truncated) setNotice('候选较多，请输入名称缩小范围。'); } });
   const preview = () => void run(async () => {
-    const result = await api.projectMergePreview(session, executor, source, target, uuid());
+    const result = await api.projectMergePreview(session, executor, fixedTarget ? session : source, fixedTarget || target, uuid());
     if (current.current === identity) { setRow(result); setSelected(result.id); setRevision(n => n + 1); setUnknown(false); }
   });
   const action = (name: 'Prepare' | 'Verify' | 'Apply' | 'Cancel' | 'Start') => void run(async () => {
@@ -48,13 +49,13 @@ export const ProjectMergePanel: React.FC<Props> = ({ session, executor, onOpenSe
     </nav>
     <section style={{ minWidth: 0, flex: 1, overflow: 'auto', padding: 20, overflowWrap: 'anywhere' }}>
       {!selected ? <>
-        <p>选择同节点、同仓库的独立来源和目标。先在整合目录准备，确认后才快进目标。</p>
+        {fixedTarget ? <p>将当前分支副本合并到它的主 Session。先预览差异，在独立目录处理冲突，核对后再确认应用；主 Session 正在运行或有未提交文件时不会覆盖。</p> : <><p>选择同节点、同仓库的独立来源和目标。先在整合目录准备，确认后才快进目标。</p>
         <label style={{ display: 'block', marginBottom: 8 }}>查找会话<input value={query} onChange={e => setQuery(e.target.value)} style={workflowFieldStyle} /></label><WorkflowButton disabled={busy} onClick={discover}>发现项目会话</WorkflowButton>
         {(['source', 'target'] as const).map(side => <label key={side} style={{ display: 'block', margin: '12px 0' }}>{side === 'source' ? '来源会话' : '目标会话'}
           <select aria-label={side === 'source' ? '来源会话' : '目标会话'} style={workflowFieldStyle} value={side === 'source' ? source : target} onChange={e => side === 'source' ? setSource(e.target.value) : setTarget(e.target.value)}>
             <option value="">请选择真实会话</option>{items.map(item => <option key={item.id} value={item.id}>{item.title} · {item.id} · {item.workingDir}</option>)}
-          </select></label>)}
-        <WorkflowButton tone="primary" disabled={busy || !source || !target || source === target} onClick={preview}>预览汇合计划</WorkflowButton>
+          </select></label>)}</>}
+        <WorkflowButton tone="primary" disabled={busy || !source || !target || source === target} onClick={preview}>{fixedTarget ? '预览合并到主 Session' : '预览汇合计划'}</WorkflowButton>
       </> : row?.id === selected ? <>
         <h3>{row.title} · {labels[row.status] || row.status}</h3>
         <p>来源：{row.source.title} · {row.source.head.slice(0, 12)}<br />目标：{row.target.title} · {row.target.head.slice(0, 12)}</p>

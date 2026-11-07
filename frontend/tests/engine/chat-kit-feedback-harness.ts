@@ -10,6 +10,7 @@ export { RoleReviewPanel } from '../../src/components/RoleReviewPanel';
 export { RoleSessionNotice } from '../../src/components/RoleSessionNotice';
 export { MessageBubble } from '../../src/components/MessageBubble';
 export { ProjectTasksPanel } from '../../src/components/ProjectTasksPanel';
+export { Sidebar } from '../../src/components/Sidebar';
 export { ProjectMergePanel } from '../../src/components/ProjectMergePanel';
 export { OpinionReferencePreview } from '../../src/components/OpinionReferencePreview';
 export { documentStore, DocumentStore } from '../../src/utils/documentStore';

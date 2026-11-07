@@ -12,7 +12,6 @@ import { UserInteractionsPanel, focusUserInteraction } from './UserInteractionsP
 import { KitDelegationStatus } from './KitDelegationFeedback';
 import { RoleReviewPanel } from './RoleReviewPanel';
 import { RoleSessionNotice } from './RoleSessionNotice';
-import { ProjectTasksPanel } from './ProjectTasksPanel';
 import { OPEN_KIT_RECEIPT } from '../utils/kitDelegationFeedback';
 import { LoopPanel } from './LoopPanel';
 import { LoopControlStatus } from './LoopControlStatus';
@@ -1246,7 +1245,6 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
       </div> : <ChatInput
         ref={chatInputRef}
         workflowTools={sessionId ? <>
-          <ProjectTasksPanel session={sessionId} executor={activeSession?.execKey || 'local'} backendId={activeBackendId} backends={effectiveBackends} onOpenSession={onOpenSession} />
           <RoleReviewPanel session={sessionId} executor={activeSession?.execKey || 'local'}
             open={reviewOpen} onOpen={() => setReviewOpen(true)} onClose={() => setReviewOpen(false)} latestRequest={latestReview}
             onReference={reference => chatInputRef.current?.insertOpinion(reference)} onOpenSession={onOpenSession}

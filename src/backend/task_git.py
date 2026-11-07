@@ -17,6 +17,14 @@ from .workspace_tools import relative_path
 
 MAX_BYTES = 100 * 1024 * 1024
 OID = re.compile(r'[0-9a-f]{40,64}')
+SKILL_ROOTS = ('.agents/skills', '.claude/skills', '.qwen/skills')
+
+
+def snapshot_path(name: str) -> None:
+    relative_path(name)
+    if Path(name).suffix.lower() in {'.pem', '.key', '.pfx', '.p12'} or any(part.lower() in {
+            'credentials', 'credentials.json', 'secrets.json', 'id_rsa', 'id_ed25519', 'id_ecdsa'} for part in Path(name).parts):
+        raise CollaborationError('凭据路径不能进入副本')
 
 
 def canonical_path(path: str | Path) -> str:
@@ -128,9 +136,7 @@ class TaskGit:
         for name, status in sorted(names.items()):
             blocked = ''; digest = ''; size = 0
             try:
-                relative_path(name)
-                if Path(name).suffix.lower() in {'.pem', '.key', '.pfx', '.p12'} or any(part.lower() in {'credentials', 'credentials.json', 'secrets.json', 'id_rsa', 'id_ed25519', 'id_ecdsa'} for part in Path(name).parts):
-                    raise CollaborationError('凭据路径不能进入任务快照')
+                snapshot_path(name)
                 path = Path(self.root) / name; reject_links(path)
                 if path.is_dir(): raise CollaborationError('目录或子模块不能进入文件快照')
                 if path.exists():
@@ -150,18 +156,55 @@ class TaskGit:
         view['fingerprint'] = fingerprint(view)
         return view
 
+    def skill_files(self) -> list[dict]:
+        """忽略的项目 Skill 另行复制，不强制提交到分支或借用父目录。"""
+        for name in SKILL_ROOTS:
+            reject_links(Path(self.root) / name)
+        names = self.run('ls-files', '--others', '--ignored', '--exclude-standard', '-z', '--', *SKILL_ROOTS).split(b'\0')
+        rows = []; total = 0
+        for raw in sorted(item for item in names if item):
+            name = raw.decode('utf-8'); snapshot_path(name)
+            if not any(name.startswith(root + '/') for root in SKILL_ROOTS):
+                raise CollaborationError('Skill 路径越界')
+            path = Path(self.root) / name; reject_links(path)
+            if not path.is_file(): raise CollaborationError('Skill 副本只支持普通文件：' + name)
+            size = path.stat().st_size; total += size
+            if len(rows) >= 10000 or size > 20 * 1024 * 1024 or total > MAX_BYTES:
+                raise CollaborationError('项目 Skills 超过副本范围（10000文件/100MiB/单文件20MiB）')
+            rows.append({'path': name, 'bytes': size, 'sha256': hashlib.sha256(path.read_bytes()).hexdigest()})
+        return rows
+
+    def copy_skills(self, expected: list[dict], root: Path) -> None:
+        if self.skill_files() != expected:
+            raise CollaborationError('项目 Skills 已变化，请重新预览；保留已创建目录')
+        for row in expected:
+            name = row['path']; snapshot_path(name)
+            source, target = Path(self.root) / name, root / name
+            reject_links(source); reject_links(target)
+            data = source.read_bytes()
+            if hashlib.sha256(data).hexdigest() != row['sha256']:
+                raise CollaborationError('Skill 文件已变化：' + name)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with target.open('xb') as output:
+                output.write(data)
+            shutil.copymode(source, target)
+            if hashlib.sha256(target.read_bytes()).hexdigest() != row['sha256']:
+                raise CollaborationError('Skill 副本校验失败：' + name)
+        if self.skill_files() != expected:
+            raise CollaborationError('复制期间项目 Skills 变化；保留目录待核对')
+
     def snapshot(self, expected: dict, selected: list[str], scratch: Path) -> str:
         if self.inspect()['fingerprint'] != expected['fingerprint']:
             raise CollaborationError('源目录或提交已变化，请重新预览')
         if not selected: return expected['head']
-        if len(selected) > 100 or len(set(selected)) != len(selected):
-            raise CollaborationError('快照最多100条不同路径')
+        if len(selected) > 500 or len(set(selected)) != len(selected):
+            raise CollaborationError('快照最多500条不同路径')
         rows = {row['path']: row for row in expected['dirty']}
         for name in selected:
             relative_path(name)
             if name not in rows or rows[name]['blocked']:
                 raise CollaborationError('所选路径不可快照：' + name)
-            if self.run('check-ignore', '--no-index', '--', name, allowed=(0, 1), env={'GIT_LITERAL_PATHSPECS': '0'}):
+            if self.run('check-ignore', '--', name, allowed=(0, 1), env={'GIT_LITERAL_PATHSPECS': '0'}):
                 raise CollaborationError('忽略路径不能进入任务快照：' + name)
         scratch.mkdir(parents=True, exist_ok=True); reject_links(scratch)
         private_index = scratch / ('index-' + uuid.uuid4().hex)
@@ -189,16 +232,21 @@ class TaskGit:
             # 只删除本次生成的私有索引；绝不触碰主索引。
             private_index.unlink(missing_ok=True)
 
-    def create(self, expected: dict, root: Path, branch: str, selected: list[str], scratch: Path) -> dict:
+    def create(self, expected: dict, root: Path, branch: str, selected: list[str], scratch: Path,
+               skill_files: list[dict] | None = None) -> dict:
         if root.exists(): raise CollaborationError('任务目录已存在，保留原输出；未认领或覆盖')
         reject_links(root)
         self.run('check-ref-format', '--branch', branch)
         if self.run('show-ref', '--verify', '--hash', 'refs/heads/' + branch, allowed=(0, 1, 128)):
             raise CollaborationError('任务分支已存在，未覆盖')
+        if skill_files is not None and self.skill_files() != skill_files:
+            raise CollaborationError('项目 Skills 已变化，请重新预览')
         baseline = self.snapshot(expected, selected, scratch)
         root.parent.mkdir(parents=True, exist_ok=True)
         self.run('worktree', 'add', '-b', branch, str(root), baseline, timeout=60)
+        if skill_files is not None:
+            self.copy_skills(skill_files, root)
         actual = TaskGit(str(root)).inspect()
         if actual['head'] != baseline or actual['commonDir'] != expected['commonDir'] or actual['branch'] != branch or actual['dirty']:
             raise CollaborationError('任务 worktree 核验未通过；保留目录等待核对')
-        return {**actual, 'baseline': baseline}
+        return {**actual, 'baseline': baseline, 'copiedSkillFiles': len(skill_files or [])}

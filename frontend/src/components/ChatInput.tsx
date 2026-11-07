@@ -1321,7 +1321,7 @@ const ChatInputInner = forwardRef<ChatInputHandle, Props>(({
   const insertSessionRefRef = useRef(insertSessionRef);
   insertSessionRefRef.current = insertSessionRef;
 
-  const roleReview = useRoleReviewComposer({ session: sessionId || '', executor: imageScope.executor, scope: draftKey, textarea: ref, changed: applyComposerDraft, onSubmitted: onReviewSubmitted, onOpenResults: onOpenOpinions, onManageRoles: () => setRoleLibraryOpen(true) });
+  const roleReview = useRoleReviewComposer({ session: sessionId || '', executor: imageScope.executor, scope: draftKey, textarea: ref, changed: applyComposerDraft, onSubmitted: onReviewSubmitted, onManageRoles: () => setRoleLibraryOpen(true) });
   const roleReviewRef = useRef(roleReview); roleReviewRef.current = roleReview;
   useEffect(() => { if (roleReview.review.roles.length) { kitApprovalDelegationRef.current = false; setKitApprovalDelegation(false); } }, [roleReview.review.roles.length]);
   const followup = useFollowupSuggestion(sessionId || '', imageScope.executor, draftKey,
@@ -2295,10 +2295,14 @@ const ChatInputInner = forwardRef<ChatInputHandle, Props>(({
       {followup.enabled && (followup.notice || followup.suggestion?.state === 'unavailable') && <div role="status" style={{ fontSize: 11, color: 'var(--theme-text-muted)' }}>
         {followup.notice || followup.suggestion?.notice}
       </div>}
-      {followup.suggestion?.state === 'ready' && !isStreaming && <div aria-label="影子建议" style={{ padding: '6px 8px', color: 'var(--theme-text-muted)', fontSize: 12, whiteSpace: 'pre-wrap' }}>
-        <span>{followup.suggestion.text}</span>
-        <button type="button" onClick={acceptFollowup} style={{ marginLeft: 8 }}>Tab 采纳</button>
-        <button type="button" onClick={followup.dismiss} style={{ marginLeft: 4 }}>隐藏</button>
+      {followup.suggestion?.state === 'ready' && !isStreaming && <div aria-label="影子建议" style={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: '4px 12px', padding: '6px 8px', color: 'var(--theme-text-muted)', fontSize: 12, lineHeight: 1.6 }}>
+        <span style={{ flex: '1 1 240px', minWidth: 0, whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' }}>{followup.suggestion.text}</span>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 4, marginLeft: 'auto', flexShrink: 0 }}>
+          <WorkflowButton tone="quiet" onClick={acceptFollowup} title="采纳建议到输入框（Tab），不会发送" aria-keyshortcuts="Tab" style={{ whiteSpace: 'nowrap' }}>
+            <kbd style={{ padding: '0 4px', border: '1px solid var(--theme-border)', borderRadius: 4, fontFamily: 'inherit', fontSize: 10, lineHeight: '16px', fontWeight: 400 }}>Tab</kbd> 采纳
+          </WorkflowButton>
+          <WorkflowButton tone="quiet" icon="close" onClick={followup.dismiss} title="隐藏建议（Esc）" aria-keyshortcuts="Escape" style={{ whiteSpace: 'nowrap' }}>隐藏</WorkflowButton>
+        </div>
       </div>}
       <div
         style={{ display: 'flex', gap: 8, alignItems: 'flex-end' }}

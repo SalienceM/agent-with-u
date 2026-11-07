@@ -400,6 +400,7 @@ class SessionStore:
                 ),
                 working_dir=data.get("workingDir"),
                 auto_continue=data.get("autoContinue", True),
+                max_continuations=data.get("maxContinuations", 10) if type(data.get("maxContinuations", 10)) is int and data.get("maxContinuations", 10) >= 0 else 10,
                 skip_permissions=data.get("skipPermissions", True),
                 # 沙盒功能已下线（UI 移除、支持不完善），一律关闭，忽略历史持久值。
                 sandbox_enabled=False,

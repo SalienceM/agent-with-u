@@ -30,6 +30,8 @@ class ProjectMerges:
             'controlRevision': state.control_revision if state else 0, 'controlMode': state.control_mode if state else 'manual'}
 
     def _merge_recheck_identity(self, row: dict) -> None:
+        if row.get('integrationParentId') and self._task_root_id(row['target']['sessionId']) != row['integrationParentId']:
+            raise CollaborationError('主 Session 关系已变化，请重新预览')
         for key in ('source', 'target'):
             if self._merge_identity(row[key]['sessionId']) != row[key]['identity']:
                 raise CollaborationError('来源/目标身份、运行配置或控制权已变化，请重新预览')
@@ -96,6 +98,7 @@ class ProjectMerges:
             plan = {'sourceSessionId': origin, 'title': f'{source.title} → {target.title}', 'status': 'blocked' if blockers else 'preview',
                 'source': {'sessionId': source_id, 'title': source.title, **source_repo, 'identity': identities['source']}, 'target': {'sessionId': target_id, 'title': target.title, **target_repo, 'identity': identities['target']},
                 'files': files, 'blockers': blockers, 'activity': activity, 'sourceActivity': source_activity,
+                'integrationParentId': self._task_root_id(target_id),
                 'integrationConfig': {'backendId': target.backend_id, 'model': target.model_override, 'reasoningEffort': target.reasoning_effort, 'skipPermissions': False},
                 'policy': '独立整合空间准备，实际检查冲突后仅快进目标；不自动 push、stash、硬重置或清理。',
                 'verification': {'status': 'not_run', 'notice': '尚未运行项目测试；Git 合并不代表功能验收。'}}
@@ -128,9 +131,10 @@ class ProjectMerges:
         store = self._collaboration_store()
         try:
             sid = 'integration-' + uuid.uuid5(uuid.NAMESPACE_URL, fingerprint([scope.owner, scope.executor, row['id']])).hex
+            parent_id = row.get('integrationParentId') or self._task_root_id(row['target']['sessionId'])
             root = paths.sub('task-workspaces', fingerprint([scope.owner, scope.executor])[:32], sid)
             row = self._merge_update(scope, row, integration={'sessionId': sid, 'root': str(root), 'conflicts': []})
-            workspace = store.write(scope, 'workspace', sid, {'sourceSessionId': row['sourceSessionId'], 'parentSessionId': row['sourceSessionId'],
+            workspace = store.write(scope, 'workspace', sid, {'sourceSessionId': row['sourceSessionId'], 'parentSessionId': parent_id,
                 'sessionId': sid, 'title': '整合 · ' + row['title'], 'root': str(root), 'branch': 'awu/integration/' + sid,
                 'status': 'creating', 'relationKind': 'integration', 'repository': row['target'], 'mergeOperationId': row['id'],
                 'planFingerprint': row['planFingerprint'], 'config': {'title': '整合 · ' + row['title'], 'goal': '',
@@ -158,9 +162,9 @@ class ProjectMerges:
             target = self._task_source(row['target']['sessionId'])
             child = Session(id=result['sessionId'], title='整合 · ' + row['title'], created_at=time.time(), updated_at=time.time(),
                 messages=[], working_dir=result['root'], backend_id=target.backend_id, owner_id=scope.owner,
-                parent_session_id=row['sourceSessionId'], relation_kind='integration', project_group_id=row['sourceSessionId'], workspace_id=result['sessionId'],
+                parent_session_id=parent_id, relation_kind='integration', project_group_id=parent_id, workspace_id=result['sessionId'],
                 model_override=target.model_override, reasoning_effort=target.reasoning_effort, skip_permissions=False)
-            workspace = store.write(scope, 'workspace', child.id, {'sourceSessionId': row['sourceSessionId'], 'parentSessionId': row['sourceSessionId'],
+            workspace = store.write(scope, 'workspace', child.id, {'sourceSessionId': row['sourceSessionId'], 'parentSessionId': parent_id,
                 'sessionId': child.id, 'title': child.title, 'root': child.working_dir, 'branch': result['actual']['branch'], 'status': 'ready',
                 'relationKind': 'integration', 'actual': result['actual'], 'repository': row['target'], 'mergeOperationId': row['id'],
                 'planFingerprint': row['planFingerprint'], 'config': {'title': child.title, 'goal': '', 'backendId': child.backend_id, 'runtime': {},

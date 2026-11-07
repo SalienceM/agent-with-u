@@ -2110,9 +2110,22 @@ against its frozen snapshot, retaining the artifact/old validation and never cal
 
 `task_git.py` / `task_workspaces.py` create unique managed branches/worktrees using fixed argv and
 private-index selected-path snapshots. Source index/HEAD/files are not mutated. Credentials,
-ignored paths, links, external objects, oversized files and unsupported repositories are rejected.
+links, external objects, oversized files and unsupported repositories are rejected.
 Managed Git readers require the exact registered root/common-dir/repository identity. Task creation
-and initial model start are separate; default ordinary permission is false, no parent grants.
+and initial model start are separate. Sidebar main-Session context menus create branch copies;
+child menus merge to their recorded parent through the existing frozen-plan flow. The server
+rejects child/integration/review derivation at preview and execution. Only two tree levels are
+displayed, including legacy nested records; favorites keep families together and search retains
+ancestors. Integration Sessions belong under the target's main Session, never a third level.
+New copy forms use `inheritSource=true` and `snapshotMode=current`: explicit allowlisted runtime
+and ability preferences are deep-copied and frozen, with ordinary permission shown in the plan.
+Current tracked changes/deletions and untracked project files become the private-index baseline;
+blocked files fail the full snapshot rather than disappearing. Ignored project `.agents/skills`,
+`.claude/skills`, `.qwen/skills` files are separately copied with bounded inventories and hashes,
+never hardlinked or force-added to Git. Other ignored files are excluded and disclosed. No native
+thread/history, queue, schedule or transient grant is inherited. Old requests lacking these fields
+retain selected-path/default-permission behavior; old nodes without copy defaults are unsupported
+in the new form. `SessionStore` must round-trip `maxContinuations` along with the other preferences.
 Archive retains resources; cleanup is separate, only for a verified idle clean merged owned task.
 Unknown cleanup retains its reservation; closing tabs never deletes outputs.
 

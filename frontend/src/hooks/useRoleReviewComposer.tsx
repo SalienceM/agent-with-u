@@ -6,8 +6,8 @@ import { roleQueryAt } from '../utils/roleReviews';
 import { uuid } from '../utils/uuid';
 import type { CollaborationSummary, ReviewSnapshot } from '../types/sessionCollaboration';
 
-interface Props { session: string; executor: string; scope: string; textarea: React.RefObject<HTMLTextAreaElement>; changed: () => void; onSubmitted?: (id: string) => void; onOpenResults?: () => void; onManageRoles?: () => void }
-export function useRoleReviewComposer({ session, executor, scope, textarea, changed, onSubmitted, onOpenResults, onManageRoles }: Props) {
+interface Props { session: string; executor: string; scope: string; textarea: React.RefObject<HTMLTextAreaElement>; changed: () => void; onSubmitted?: (id: string) => void; onManageRoles?: () => void }
+export function useRoleReviewComposer({ session, executor, scope, textarea, changed, onSubmitted, onManageRoles }: Props) {
   useSyncExternalStore(composerDrafts.subscribe, composerDrafts.snapshot);
   const review = composerDrafts.ensure(scope).review;
   const [query, setQuery] = useState<string | null>(null), [roles, setRoles] = useState<CollaborationSummary[]>([]), [index, setIndex] = useState(0);
@@ -81,7 +81,8 @@ export function useRoleReviewComposer({ session, executor, scope, textarea, chan
     } else if (composerDrafts.get(scope)?.review.receipt?.request === request) {
       composerDrafts.setReview(scope, { ...composerDrafts.ensure(scope).review, receipt: undefined }); changed();
     }
-    setNotice('评议已提交。可以继续主对话，或查看评议进度与意见。'); setUnknown(''); onSubmitted?.(request);
+    // 已接收后的进度和意见由工具栏「评议」入口提示，输入区只保留待处理反馈。
+    setNotice(''); setUnknown(''); onSubmitted?.(request);
   };
   const send = async () => {
     if (!review.roles.length || pending.current) return;
@@ -150,7 +151,7 @@ export function useRoleReviewComposer({ session, executor, scope, textarea, chan
       {snapshot && <details><summary>查看冻结摘要 · {snapshot.characters} 字{snapshot.omittedCharacters ? ` · 原文省略 ${snapshot.omittedCharacters} 字` : ''}</summary>{snapshot.limits?.map(text => <p key={text}>{text}</p>)}{snapshot.messages.map(item => <p key={item.id}>{item.text}</p>)}</details>}
       <div style={{ color: 'var(--theme-text-muted)', marginTop: 8 }}>下方可补充关注点，点击「开始评议」后在“评议”中查看意见。附件留在当前草稿。</div>
     </section>}
-    {(notice || unknown) && <div role="status" style={{ fontSize: 12, padding: 6, overflowWrap: 'anywhere' }}>{notice || '原评议接收结果待核对'}{unknown && <WorkflowButton onClick={() => void check()}>核对原评议</WorkflowButton>}{notice && onOpenResults && <WorkflowButton onClick={onOpenResults}>查看评议</WorkflowButton>}</div>}
+    {(notice || unknown) && <div role="status" style={{ fontSize: 12, padding: 6, overflowWrap: 'anywhere' }}>{notice || '原评议接收结果待核对'}{unknown && <WorkflowButton onClick={() => void check()}>核对原评议</WorkflowButton>}</div>}
   </>;
   const menu = query !== null && <div role="listbox" aria-label="选择评议角色" style={{ position: 'absolute', bottom: '100%', left: 8, right: 8, zIndex: 20, maxHeight: 240, overflow: 'auto', padding: 8, borderRadius: 10, boxShadow: '0 8px 28px #0002', border: '1px solid var(--theme-border)', background: 'var(--theme-bg-secondary, white)' }}>
     {!candidates.length && <div>没有匹配角色；可在角色库中维护。</div>}

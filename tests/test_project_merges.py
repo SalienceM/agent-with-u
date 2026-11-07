@@ -98,6 +98,22 @@ class ProjectMergeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((self.project / 'feature.txt').read_text(), 'independent output')
         self.assertFalse(self.bridge._collaboration_store().project_gates('test-node'))
 
+    async def test_child_context_merge_integration_is_sibling_not_grandchild(self):
+        child = await self.child()
+        self.commit(child, 'feature.txt', 'output')
+        plan = json.loads(await self.bridge._rpc_projectMergePreview(child.id, child.id, 'main', 'child-preview'))
+        self.assertEqual(plan['integrationParentId'], 'main')
+        self.bridge._rpc_projectMergePrepare(child.id, plan['id'], 'child-prepare', plan['planFingerprint'])
+        await asyncio.gather(*list(self.bridge._merge_jobs().values()))
+        result = json.loads(await self.bridge._rpc_projectMergeStatus(child.id, plan['id']))
+        self.assertEqual(result['status'], 'candidate', result)
+        integration = self.bridge._session_store.load(result['integration']['sessionId'])
+        self.assertEqual(integration.parent_session_id, 'main')
+        self.assertEqual(integration.project_group_id, 'main')
+        self.assertFalse((self.project / 'feature.txt').exists())
+        with self.assertRaisesRegex(ValueError, '两层'):
+            await self.bridge._rpc_taskWorkspacePlan(integration.id, 'no-grandchild', '{"title":"no"}')
+
     async def test_conflict_keeps_target_and_requires_actual_resolved_commit(self):
         child = await self.child()
         self.commit(child, 'proof.txt', 'source answer')

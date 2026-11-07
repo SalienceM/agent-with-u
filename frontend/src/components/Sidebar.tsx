@@ -14,6 +14,7 @@ import type { FavoritePhase } from '../utils/sessionFavorites';
 import { SkillBindingTree } from './SkillBindingTree';
 import { InteractionBadge } from './UserInteractionsPanel';
 import { taskSessionTree } from '../utils/taskSessionTree';
+import { SessionBranchDialog } from './SessionBranchDialog';
 
 interface Session extends SessionViewMetadata {
   id: string;
@@ -34,6 +35,7 @@ interface Session extends SessionViewMetadata {
   sessionType?: 'normal' | 'loop';
   relationKind?: 'review' | 'task' | 'integration';
   parentSessionId?: string;
+  workspaceId?: string;
   loopExecutionMode?: 'loop' | 'aimein';
   pinned?: boolean;
   favoriteStatus?: FavoritePhase;
@@ -98,6 +100,7 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
     y: number;
   } | null>(null);
   const [sessionToDelete, setSessionToDelete] = useState<Session | null>(null);
+  const [branchDialog, setBranchDialog] = useState<{ session: Session; action: 'create' | 'manage' | 'merge' } | null>(null);
   const [sessionToDestroy, setSessionToDestroy] = useState<Session | null>(null);
   const [deleting, setDeleting] = useState(false);
   const [deleteResult, setDeleteResult] = useState<SessionDeletionResult | null>(null);
@@ -448,6 +451,7 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
     ++managementEpoch.current; ++refreshGenerationRef.current;
     completedDeletions.current.clear(); deletionBusy.current = false;
     setSessionToDelete(null); setSessionToDestroy(null); setSessionContextMenu(null);
+    setBranchDialog(null);
     setDeleteResult(null); setDestroyResult(null); setDeleting(false); setDestroying(false); setFavoriteError('');
   }), []);
 
@@ -629,6 +633,17 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
           session.sessionType,
         ].some((value) => String(value || '').toLocaleLowerCase().includes(normalizedSearch)))
       : sessions.filter(session => session.relationKind !== 'review' || session.pinned || session.id === activeSessionId);
+    if (normalizedSearch) {
+      const seen = new Set(filtered.map(row => `${row.execKey || 'local'}:${row.id}`));
+      for (let i = 0; i < filtered.length; i++) {
+        const child = filtered[i];
+        if (!['task', 'integration'].includes(child.relationKind || '') || !child.parentSessionId) continue;
+        const parent = sessions.find(row => row.id === child.parentSessionId && (row.execKey || 'local') === (child.execKey || 'local'));
+        if (parent && !seen.has(`${parent.execKey || 'local'}:${parent.id}`)) {
+          seen.add(`${parent.execKey || 'local'}:${parent.id}`); filtered.push(parent);
+        }
+      }
+    }
     return [...filtered].sort(sortSessionsByPriority);
   }, [sessions, normalizedSearch, activeSessionId]);
 
@@ -644,14 +659,18 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
       isDefault: boolean;
       sessions: Session[];
     }>();
-    const pinnedSessions = visibleSessions.filter((session) => session.pinned);
+    const families = taskSessionTree(visibleSessions, new Set(), true).filter(row => row.depth === 0);
+    const isFavorite = (row: typeof families[number]) => row.item.pinned || row.children.some(child => child.pinned);
+    const pinnedSessions = families.filter(isFavorite).flatMap(row => [row.item, ...row.children]);
     if (pinnedSessions.length) {
       map.set('__pinned__', {
         key: '__pinned__', label: '收藏', isLocal: false, isDefault: false, sessions: pinnedSessions,
       });
     }
-    for (const s of visibleSessions) {
-      if (s.pinned) continue;
+    const familyCounts = new Map<string, number>();
+    for (const family of families) {
+      if (isFavorite(family)) continue;
+      const s = family.item;
       const key = s.execKey || 'local';
       const isLocal = s.execMode === 'local' || key === 'local';
       const label = isLocal ? '本机' : (s.execLabel || key);
@@ -662,8 +681,10 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
       }
       const grp = map.get(key)!;
       grp.isDefault = grp.isDefault || isDefault;
-      if (normalizedSearch || grp.sessions.length < maxPerNode) {
-        grp.sessions.push(s);
+      const count = familyCounts.get(key) || 0;
+      if (normalizedSearch || count < maxPerNode) {
+        grp.sessions.push(s, ...family.children);
+        familyCounts.set(key, count + 1);
       }
     }
     // 物理本机在前，其次是默认远端节点，再按节点名排序。
@@ -675,17 +696,6 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
       if (a.isDefault !== b.isDefault) return a.isDefault ? -1 : 1;
       return a.label.localeCompare(b.label);
     });
-    // 节点最近条目限额只限制父级；已列父项的直接子任务仍可到达。
-    for (const group of arr) {
-      if (group.key === '__pinned__') continue;
-      for (const child of [...group.sessions]) {
-        const parent = visibleSessions.find(row => !row.pinned && row.id === child.parentSessionId && (row.execKey || 'local') === group.key);
-        if (parent && !group.sessions.some(row => row.id === parent.id)) group.sessions.push(parent);
-      }
-      const parents = new Set(group.sessions.map(row => row.id));
-      const siblings = visibleSessions.filter(row => !row.pinned && (row.execKey || 'local') === group.key && row.parentSessionId && parents.has(row.parentSessionId) && !group.sessions.some(item => item.id === row.id));
-      group.sessions.push(...siblings);
-    }
     return arr;
   }, [visibleSessions, normalizedSearch, maxPerNode]);
 
@@ -1057,7 +1067,7 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
                     onClick={event => { event.stopPropagation(); const key = `${s.execKey || 'local'}:${s.id}`; setCollapsedTasks(old => { const next = new Set(old); if (next.has(key)) next.delete(key); else next.add(key); return next; }); }}>
                     {collapsedTasks.has(`${s.execKey || 'local'}:${s.id}`) ? '▸' : '▾'}{children.length}
                   </button>}
-                  {depth > 0 && <span title="独立任务工作区" style={{ fontSize: 11 }}>↳</span>}
+                  {depth > 0 && <span title={s.relationKind === 'integration' ? '独立合并空间' : '分支副本 · 独立目录'} style={{ fontSize: 11, color: s.relationKind === 'integration' ? '#d97706' : '#8b5cf6' }}>{s.relationKind === 'integration' ? '⇄' : '⑂'}</span>}
                   {isRunning && (
                     <span style={{
                       ...runningDotStyle,
@@ -1147,6 +1157,8 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
         <button style={cancelBtnStyle} onClick={() => setFavoriteError('')}>知道了</button>
       </div></div></AppModalPortal>}
 
+      {branchDialog && <SessionBranchDialog key={`${branchDialog.session.execKey || 'local'}:${branchDialog.session.id}:${branchDialog.action}`}
+        session={branchDialog.session} action={branchDialog.action} onClose={() => setBranchDialog(null)} onOpenSession={onSelectSession} />}
       {sessionContextMenu && (
         <AppModalPortal>
         <div
@@ -1161,6 +1173,14 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
           <div className="awu-session-context-title" title={sessionContextMenu.session.title}>
             {sessionContextMenu.session.title}
           </div>
+          {!sessionContextMenu.session.parentSessionId && !sessionContextMenu.session.relationKind && !sessionContextMenu.session.workspaceId && sessionContextMenu.session.codexConnectionMode !== 'ssh' && <button type="button" role="menuitem" className="awu-session-context-item"
+            onClick={() => { setBranchDialog({ session: sessionContextMenu.session, action: 'create' }); setSessionContextMenu(null); }}><span className="awu-session-context-icon">⑂</span><span>新建分支副本</span></button>}
+          {sessionContextMenu.session.relationKind === 'task' && sessionContextMenu.session.parentSessionId && <>
+            <button type="button" role="menuitem" aria-label="合并到主 Session" className="awu-session-context-item" onClick={() => { setBranchDialog({ session: sessionContextMenu.session, action: 'merge' }); setSessionContextMenu(null); }}><span aria-hidden="true" className="awu-session-context-icon">⇄</span><span>合并到主 Session</span></button>
+            <button type="button" role="menuitem" className="awu-session-context-item" onClick={() => { const parent = sessionContextMenu.session.parentSessionId!; setSessionContextMenu(null); onSelectSession(parent); }}>打开主 Session</button>
+          </>}
+          {sessionContextMenu.session.codexConnectionMode !== 'ssh' && sessionContextMenu.session.relationKind !== 'review' && <button type="button" role="menuitem" className="awu-session-context-item"
+            onClick={() => { setBranchDialog({ session: sessionContextMenu.session, action: 'manage' }); setSessionContextMenu(null); }}>分支副本与合并记录</button>}
           {onRequestViewMode && <>
             {(['chat', 'engine'] as const).map(mode => <button key={mode} type="button" className="awu-session-context-item" role="menuitem"
               onClick={() => { const target = sessionContextMenu.session; setSessionContextMenu(null); onRequestViewMode(target.id, mode); }}>

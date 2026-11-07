@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+from copy import deepcopy
 import json
 from pathlib import Path
 import time
@@ -15,6 +16,49 @@ from ..types import Session
 
 
 class TaskWorkspaces:
+    def _task_root_id(self, session_id: str) -> str:
+        seen: set[str] = set()
+        while session_id not in seen and len(seen) < 32:
+            seen.add(session_id)
+            source = self._task_source(session_id)
+            if not source.parent_session_id:
+                return session_id
+            session_id = source.parent_session_id
+        raise CollaborationError('Session 父子关系异常，请先处理原登记')
+
+    def _task_parent(self, session_id: str) -> Any:
+        source = self._task_source(session_id)
+        if source.parent_session_id or source.relation_kind or source.workspace_id:
+            raise CollaborationError('只支持主 Session 和分支副本两层；请从主 Session 新建副本')
+        return source
+
+    def _task_inheritance(self, source: Any) -> dict:
+        # 仅复制持久偏好，不复制原生线程、队列、定时计划、未知扩展或临时授权。
+        abilities = source.abilities or {}
+        return deepcopy({
+            'backend_id': source.backend_id, 'model_override': source.model_override,
+            'reasoning_effort': source.reasoning_effort, 'constraints': source.constraints,
+            'skip_permissions': source.skip_permissions,
+            'abilities': {key: abilities[key] for key in ('skills', 'prompts', 'constraints', 'kitToolsMode', 'workspaceToolsMode') if key in abilities},
+            **{key: getattr(source, key) for key in ('auto_continue', 'max_continuations', 'codex_connection_mode',
+                'auto_commit', 'auto_commit_push', 'auto_commit_backend_id', 'followup_suggestions_enabled', 'followup_suggestions_config')},
+        })
+
+    def _task_defaults(self, source: Any) -> dict:
+        return {'title': source.title + ' · 副本', 'goal': '', 'backendId': source.backend_id,
+            'runtime': {'model': source.model_override or '', 'reasoningEffort': source.reasoning_effort or ''},
+            'constraints': source.constraints or '', 'skills': deepcopy((source.abilities or {}).get('skills', [])),
+            'skipPermissions': source.skip_permissions, 'includePaths': [], 'snapshotMode': 'current', 'inheritSource': True}
+
+    def _task_recheck_source(self, row: dict) -> Any:
+        source = self._task_parent(row['sourceSessionId'])
+        if row.get('inherited') is not None and self._task_inheritance(source) != row['inherited']:
+            raise CollaborationError('主 Session 配置已变化，请重新预览副本计划')
+        backend = next((item for item in self._backend_configs if item.id == row['config']['backendId'] and item.enabled), None)
+        if backend is None or fingerprint(backend.to_dict()) != row['backendFingerprint']:
+            raise CollaborationError('Backend 配置已变化，请重新预览副本计划')
+        return source
+
     def _rpc_taskWorkspaceArchive(self, session_id: str, workspace_id: str, request_id: str) -> str:
         self._window_guard(session_id)
         scope, store, row = self._task_workspace(session_id, workspace_id)
@@ -118,9 +162,17 @@ class TaskWorkspaces:
         return source
 
     def _task_config(self, source: Any, raw: Any) -> dict:
-        if not isinstance(raw, dict) or set(raw) - {'title', 'goal', 'backendId', 'runtime', 'constraints', 'skills', 'skipPermissions', 'includePaths'}:
+        if not isinstance(raw, dict) or set(raw) - {'title', 'goal', 'backendId', 'runtime', 'constraints', 'skills', 'skipPermissions', 'includePaths', 'snapshotMode', 'inheritSource'}:
             raise CollaborationError('任务配置无效，不接受目录、原生线程或委托字段')
+        if type(raw.get('inheritSource', False)) is not bool:
+            raise CollaborationError('继承选项无效')
+        if raw.get('inheritSource'):
+            raw = {**self._task_defaults(source), **raw}
         config = {}
+        config['inheritSource'] = raw.get('inheritSource', False)
+        config['snapshotMode'] = raw.get('snapshotMode', 'selected')
+        if config['snapshotMode'] not in {'current', 'selected'}:
+            raise CollaborationError('副本范围无效')
         for key, maximum in [('title', 120), ('goal', 16000), ('constraints', 8000), ('backendId', 200)]:
             value = raw.get(key, '')
             if not isinstance(value, str) or len(value) > maximum or '\0' in value:
@@ -143,7 +195,7 @@ class TaskWorkspaces:
             from .deepseek_harness_config import REASONING_EFFORTS
             if config['runtime']['reasoningEffort'] not in REASONING_EFFORTS:
                 raise CollaborationError('Harness 不支持该推理档位')
-        for key, maximum in [('skills', 100), ('includePaths', 100)]:
+        for key, maximum in [('skills', 100), ('includePaths', 500)]:
             value = raw.get(key, [])
             if not isinstance(value, list) or len(value) > maximum or any(not isinstance(item, str) or len(item) > 500 or '\0' in item for item in value):
                 raise CollaborationError('任务列表配置无效：' + key)
@@ -153,19 +205,21 @@ class TaskWorkspaces:
         return config
 
     async def _rpc_taskWorkspaceInspect(self, session_id: str) -> str:
-        source = self._task_source(session_id)
+        source = self._task_parent(session_id)
         try:
             view = await asyncio.to_thread(lambda: TaskGit(source.working_dir).inspect())
             self._collaboration_scope(session_id)
-            return json.dumps({'status': 'ready', **view, 'notice': '默认仅包含提交 ' + view['head'][:12] + '；未提交内容须明确选定。'}, ensure_ascii=False)
+            return json.dumps({'status': 'ready', **view, 'defaults': self._task_defaults(source),
+                'notice': '默认复制当前项目修改、新文件和项目 Skills；其他 Git 忽略文件（含缓存、依赖、构建产物）不复制。'}, ensure_ascii=False)
         except (ValueError, OSError) as error:
             return json.dumps({'status': 'unavailable', 'notice': str(error), 'preparation': '请在本项目终端显式初始化 Git 并完成首个提交，再重新检查；不会自动初始化或换节点。'}, ensure_ascii=False)
 
     async def _rpc_taskWorkspacePlan(self, session_id: str, request_id: str, config_json: str) -> str:
         self._window_guard(session_id)
-        source = self._task_source(session_id)
+        source = self._task_parent(session_id)
         scope, store = self._collaboration_scope(session_id), self._collaboration_store()
         config = self._task_config(source, json.loads(config_json))
+        inherited = self._task_inheritance(source) if config['inheritSource'] else None
         receipt, fresh = store.begin_request(scope, request_id, 'taskPlan', {'sessionId': session_id, 'config': config})
         workspace_id = 'task-' + uuid.uuid5(uuid.NAMESPACE_URL, fingerprint([scope.owner, scope.executor, session_id, request_id])).hex
         if not fresh:
@@ -174,8 +228,15 @@ class TaskWorkspaces:
             raise CollaborationError('原预览未完成；请核对原请求，没有自动重建')
         try:
             repo = await asyncio.to_thread(lambda: TaskGit(source.working_dir).inspect())
-            self._task_source(session_id)
+            source = self._task_parent(session_id)
+            if inherited is not None and inherited != self._task_inheritance(source):
+                raise CollaborationError('主 Session 配置已变化，请重新预览')
             if canonical_path(source.working_dir) != repo['root']: raise CollaborationError('源目录已变化')
+            if config['snapshotMode'] == 'current':
+                blocked = [item['path'] for item in repo['dirty'] if item['blocked']]
+                if blocked: raise CollaborationError('当前项目有不可复制路径，请处理或改选部分路径：' + '、'.join(blocked[:10]))
+                config['includePaths'] = [item['path'] for item in repo['dirty']]
+            skill_files = await asyncio.to_thread(lambda: TaskGit(source.working_dir).skill_files()) if config['inheritSource'] else []
             for name in config['includePaths']:
                 row = next((row for row in repo['dirty'] if row['path'] == name), None)
                 if row is None or row['blocked']: raise CollaborationError('路径不可快照：' + name)
@@ -183,6 +244,7 @@ class TaskWorkspaces:
             plan = {'sourceSessionId': session_id, 'parentSessionId': session_id, 'sessionId': workspace_id,
                 'title': config['title'], 'status': 'preview', 'config': config, 'repository': repo,
                 'root': str(root), 'branch': 'awu/task/' + workspace_id, 'relationKind': 'task',
+                'inherited': inherited, 'skillFiles': skill_files,
                 'notice': '仅创建独立 Session、分支和 worktree；不会启动模型、push 或删除源内容。'}
             backend = next(item for item in self._backend_configs if item.id == config['backendId'])
             plan['backendFingerprint'] = fingerprint(backend.to_dict())
@@ -216,7 +278,7 @@ class TaskWorkspaces:
             store.begin_request(scope, request_id, 'taskCreate', {'sessionId': session_id, 'workspaceId': workspace_id, 'fingerprint': plan_fingerprint})
             return self._rpc_taskWorkspaceStatus(session_id, workspace_id)
         if row['status'] != 'preview': raise CollaborationError('任务已提交，不能重复创建；请查询原请求')
-        self._task_config(self._task_source(session_id), row['config'])
+        self._task_config(self._task_recheck_source(row), row['config'])
         backend = next(item for item in self._backend_configs if item.id == row['config']['backendId'])
         if fingerprint(backend.to_dict()) != row['backendFingerprint']:
             raise CollaborationError('Backend 配置已变化，请重新预览任务计划')
@@ -232,17 +294,25 @@ class TaskWorkspaces:
         try:
             root = paths.sub('task-workspaces', fingerprint([scope.owner, scope.executor])[:32], row['id'])
             if canonical_path(root) != canonical_path(row['root']): raise CollaborationError('任务目录归属变化')
-            source = self._task_source(row['sourceSessionId'])
+            source = self._task_recheck_source(row)
             if canonical_path(source.working_dir) != row['repository']['root']: raise CollaborationError('源目录已变化')
             result = await asyncio.to_thread(lambda: TaskGit(source.working_dir).create(row['repository'], root,
-                row['branch'], row['config']['includePaths'], root.parent / '.scratch'))
-            self._task_source(row['sourceSessionId'])
+                row['branch'], row['config']['includePaths'], root.parent / '.scratch',
+                row.get('skillFiles', []) if row['config'].get('inheritSource') else None))
+            self._task_recheck_source(row)
             config = row['config']
+            inherited = deepcopy(row.get('inherited') or {})
+            abilities = inherited.pop('abilities', {'prompts': []})
+            abilities['skills'] = config['skills']
+            for key in ('backend_id', 'model_override', 'reasoning_effort', 'constraints', 'skip_permissions'):
+                inherited.pop(key, None)
+            if config['backendId'] != source.backend_id:
+                inherited.pop('codex_connection_mode', None)
             child = Session(id=row['sessionId'], title=config['title'], created_at=time.time(), updated_at=time.time(),
                 messages=[], working_dir=str(root), backend_id=config['backendId'], owner_id=scope.owner,
                 parent_session_id=row['parentSessionId'], relation_kind='task', project_group_id=row['sourceSessionId'],
                 workspace_id=row['id'], model_override=config['runtime'].get('model'), reasoning_effort=config['runtime'].get('reasoningEffort'),
-                constraints=config['constraints'], abilities={'skills': config['skills'], 'prompts': []}, skip_permissions=config['skipPermissions'])
+                constraints=config['constraints'], abilities=abilities, skip_permissions=config['skipPermissions'], **inherited)
             await asyncio.to_thread(self._session_store.save, child, async_=False)
             verified = self._session_store.load(child.id)
             if not verified or verified.working_dir != str(root) or verified.workspace_id != row['id']:

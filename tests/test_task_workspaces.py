@@ -24,6 +24,91 @@ class TaskWorkspaceTests(unittest.IsolatedAsyncioTestCase):
     async def plan(self, request='plan'):
         return json.loads(await self.bridge._rpc_taskWorkspacePlan('main', request, json.dumps({'title': '独立任务', 'goal': '实现功能', 'backendId': 'api'})))
 
+    async def test_branch_copy_inherits_settings_and_current_files_with_independent_skills(self):
+        from src.types import BackendType
+        self.bridge._backend_configs[0].type = BackendType.CODEX_OFFICIAL
+        self.source.model_override = 'test-model'; self.source.reasoning_effort = 'high'
+        self.source.codex_connection_mode = 'node'; self.source.codex_thread_attached = True
+        (self.project / '.gitignore').write_text('.agents/\nnode_modules/\n', encoding='utf-8')
+        (self.project / 'removed.txt').write_text('remove in working copy')
+        git = self.repository()
+        (self.project / 'proof.txt').write_text('staged'); git.run('add', 'proof.txt')
+        (self.project / 'proof.txt').write_text('current working copy')
+        (self.project / 'new.txt').write_text('new file')
+        (self.project / 'removed.txt').unlink()
+        skill = self.project / '.agents/skills/local/SKILL.md'; skill.parent.mkdir(parents=True); skill.write_text('local skill')
+        cache = self.project / 'node_modules/cache.js'; cache.parent.mkdir(); cache.write_text('cache')
+        self.source.abilities = {'skills': ['local'], 'prompts': ['prompt-1'], 'constraints': 'ability rule',
+            'kitToolsMode': 'off', 'workspaceToolsMode': 'off', 'unknownGrant': 'must not inherit'}
+        self.source.constraints = 'source rules'; self.source.auto_continue = False
+        self.source.max_continuations = 3; self.source.followup_suggestions_enabled = True
+        self.source.followup_suggestions_config = {'backendId': 'api', 'timeoutSeconds': 30}
+        defaults = json.loads(await self.bridge._rpc_taskWorkspaceInspect('main'))['defaults']
+        self.assertTrue(defaults['inheritSource']); self.assertEqual(defaults['snapshotMode'], 'current')
+        self.assertEqual(defaults['skills'], ['local']); self.assertTrue(defaults['skipPermissions'])
+        before = git.inspect(); index = (self.project / '.git/index').read_bytes()
+        plan = json.loads(await self.bridge._rpc_taskWorkspacePlan('main', 'copy-plan', json.dumps(defaults)))
+        again = json.loads(await self.bridge._rpc_taskWorkspacePlan('main', 'copy-plan', json.dumps(defaults)))
+        self.assertEqual(plan['id'], again['id'])
+        self.assertEqual(set(plan['config']['includePaths']), {'proof.txt', 'new.txt', 'removed.txt'})
+        self.assertEqual(len(plan['skillFiles']), 1)
+        self.bridge._rpc_taskWorkspaceCreate('main', plan['id'], 'copy-create', plan['planFingerprint'])
+        await asyncio.gather(*list(self.bridge._task_jobs().values()))
+        result = json.loads(self.bridge._rpc_taskWorkspaceStatus('main', plan['id']))
+        self.assertEqual(result['status'], 'ready', result.get('notice'))
+        child = self.bridge._session_store.load(result['sessionId']); root = Path(child.working_dir)
+        self.assertEqual((root / 'proof.txt').read_text(), 'current working copy')
+        self.assertEqual((root / 'new.txt').read_text(), 'new file'); self.assertFalse((root / 'removed.txt').exists())
+        self.assertEqual((root / '.agents/skills/local/SKILL.md').read_text(), 'local skill')
+        (root / '.agents/skills/local/SKILL.md').write_text('child edits')
+        self.assertEqual(skill.read_text(), 'local skill'); self.assertFalse((root / 'node_modules').exists())
+        self.assertEqual(git.inspect()['fingerprint'], before['fingerprint'])
+        self.assertEqual((self.project / '.git/index').read_bytes(), index)
+        self.assertEqual(child.abilities['prompts'], ['prompt-1']); self.assertNotIn('unknownGrant', child.abilities)
+        self.assertEqual(child.constraints, 'source rules'); self.assertFalse(child.auto_continue)
+        self.assertEqual(child.max_continuations, 3); self.assertTrue(child.followup_suggestions_enabled)
+        self.assertEqual(child.followup_suggestions_config, self.source.followup_suggestions_config)
+        self.assertEqual(child.messages, []); self.assertIsNone(child.agent_session_id)
+        self.assertEqual(child.model_override, 'test-model'); self.assertEqual(child.reasoning_effort, 'high')
+        self.assertEqual(child.codex_connection_mode, 'node'); self.assertFalse(child.codex_thread_attached)
+        self.assertEqual(self.source.agent_session_id, 'main-native'); self.assertEqual(self.calls, [])
+        with self.assertRaisesRegex(ValueError, '两层'):
+            await self.bridge._rpc_taskWorkspacePlan(child.id, 'grandchild', json.dumps(defaults))
+        with self.assertRaisesRegex(ValueError, '两层'):
+            await self.bridge._rpc_taskWorkspaceInspect(child.id)
+
+    async def test_inherited_configuration_and_skills_are_frozen_until_creation(self):
+        (self.project / '.gitignore').write_text('.agents/\n'); self.repository()
+        skill = self.project / '.agents/skills/local/SKILL.md'; skill.parent.mkdir(parents=True); skill.write_text('v1')
+        raw = {'title': 'copy', 'inheritSource': True}
+        plan = json.loads(await self.bridge._rpc_taskWorkspacePlan('main', 'copy-plan', json.dumps(raw)))
+        self.source.constraints = 'changed after preview'
+        with self.assertRaisesRegex(ValueError, '配置已变化'):
+            self.bridge._rpc_taskWorkspaceCreate('main', plan['id'], 'stale', plan['planFingerprint'])
+        self.assertFalse(Path(plan['root']).exists())
+        plan = json.loads(await self.bridge._rpc_taskWorkspacePlan('main', 'new-plan', json.dumps(raw)))
+        skill.write_text('v2')
+        self.bridge._rpc_taskWorkspaceCreate('main', plan['id'], 'stale-skill', plan['planFingerprint'])
+        await asyncio.gather(*list(self.bridge._task_jobs().values()))
+        result = json.loads(self.bridge._rpc_taskWorkspaceStatus('main', plan['id']))
+        self.assertEqual(result['status'], 'error'); self.assertIn('Skills 已变化', result['notice'])
+        self.assertFalse(Path(plan['root']).exists())
+
+    async def test_current_snapshot_cannot_silently_skip_blocked_files(self):
+        self.repository(); (self.project / '.env').write_text('do not copy')
+        with self.assertRaisesRegex(ValueError, '不可复制'):
+            await self.bridge._rpc_taskWorkspacePlan('main', 'current', json.dumps({'title': 'copy', 'inheritSource': True}))
+        plan = await self.plan('legacy-selected')
+        self.assertFalse(plan['config']['inheritSource']); self.assertEqual(plan['config']['includePaths'], [])
+        self.assertFalse(Path(plan['root']).exists())
+
+    async def test_creation_rejects_source_that_became_a_child_after_preview(self):
+        self.repository(); plan = await self.plan()
+        self.source.parent_session_id = 'other'
+        with self.assertRaisesRegex(ValueError, '两层'):
+            self.bridge._rpc_taskWorkspaceCreate('main', plan['id'], 'create', plan['planFingerprint'])
+        self.assertFalse(Path(plan['root']).exists())
+
     async def test_inspect_and_preview_do_not_create_or_run_then_publish_verified_session(self):
         git = self.repository()
         view = json.loads(await self.bridge._rpc_taskWorkspaceInspect('main')); self.assertEqual(view['status'], 'ready')
