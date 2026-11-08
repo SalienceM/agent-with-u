@@ -104,9 +104,18 @@ class KitUpdateBridge:
                 or not project.is_relative_to(base)
                 or Path(str((receipt.get('candidate') or {}).get('projectRoot') or '')).resolve() != project):
             raise JournalError('本机构建回执不属于本次运行、步骤或项目')
-        return receipt, {'runId': run.id, 'stepId': source.id, 'projectRoot': str(project),
-                         'receiptFingerprint': fingerprint(receipt),
-                         'policyFingerprint': self._update_manager._kit_source_fingerprint()}
+        binding = {'runId': run.id, 'stepId': source.id, 'projectRoot': str(project),
+                   'receiptFingerprint': fingerprint(receipt),
+                   'policyFingerprint': self._update_manager._kit_source_fingerprint()}
+        publishers = [item for item in run.steps[:run.current_step]
+                      if item.config.get('capability') == 'release.publish_latest']
+        if publishers:
+            if (len(publishers) != 1 or publishers[0].status != 'succeeded'
+                    or (publishers[0].config.get('arguments') or {}).get('bindBuild') is not True
+                    or run.steps.index(publishers[0]) <= run.steps.index(source)):
+                raise JournalError('本地安装需要本次构建之后唯一成功的严格绑定发布')
+            binding['publishedRelease'] = self._published_for_update(run)
+        return receipt, binding
 
     async def _run_kit_update_step(self, state: Any, session: Any, run: Any, step: Any,
                                     artifact_id: str = "") -> None:
@@ -174,16 +183,25 @@ class KitUpdateBridge:
                 project = Path(build_binding['projectRoot'])
                 document = await asyncio.to_thread(local_build_manifest, receipt, project)
                 await asyncio.to_thread(self._release_center().verify_build_snapshot, receipt, project)
-                staged = await self._update_manager.stage_local_build(document, artifact_id, request_id=request_id)
-                published = {'release': document['release'], 'channel': 'local', 'manifestUrl': ''}
+                published = build_binding.get('publishedRelease')
+                if published:
+                    manifest = await asyncio.to_thread(self._release_center().published_manifest, published)
+                    staged = await self._update_manager.stage_published_local_build(
+                        document, published, manifest, artifact_id, request_id=request_id)
+                    runtime['publishedRelease'] = published
+                else:
+                    staged = await self._update_manager.stage_local_build(document, artifact_id, request_id=request_id)
+                    published = {'release': document['release'], 'channel': 'local', 'manifestUrl': ''}
             else:
                 staged = await self._update_manager.stage_published(published, artifact_id, request_id=request_id)
             if staged["phase"] == "needs_selection":
                 plan = {"device": desktop["deviceId"], "instanceId": desktop["instanceId"],
+                        "current": _current_release(),
                         "release": published["release"], "artifacts": staged["artifacts"],
                         "channel": published["channel"], "manifestUrl": published["manifestUrl"],
                         **({'sourceKind': 'local_build', 'sourcePath': build_binding['projectRoot'],
-                            'localBuild': build_binding} if local_build else {}),
+                            'localBuild': build_binding,
+                            **({'publishedRelease': published} if build_binding.get('publishedRelease') else {})} if local_build else {}),
                         "blockers": ["请选择已核对版本的安装器"], "warnings": []}
                 runtime.update(phase="needs_selection", planId=request_id, plan=plan, planFingerprint=fingerprint(plan))
             else:
@@ -198,7 +216,8 @@ class KitUpdateBridge:
                 frozen = self._update_manager.journal.freeze(request_id, identity, {
                     "desktop": desktop, "backendPid": os.getpid(), "current": _current_release(),
                     "release": published["release"], "artifact": artifact, "channel": published["channel"],
-                    **({'localBuild': build_binding, 'sourceKind': 'local_build', 'sourcePath': build_binding['projectRoot']}
+                    **({'localBuild': build_binding, 'sourceKind': 'local_build', 'sourcePath': build_binding['projectRoot'],
+                        **({'publishedRelease': published} if build_binding.get('publishedRelease') else {})}
                        if local_build else {"updateSource": source} if standalone else {"publishedRelease": published}),
                     "manifestUrl": published["manifestUrl"], "installPlan": install_plan,
                     "warnings": ["安装将退出目标节点的桌面与 Backend，控制窗口不会被更新", "交接后无法保证撤回；不会自动重装或回滚"],

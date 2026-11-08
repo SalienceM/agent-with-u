@@ -1486,7 +1486,7 @@ const KitEditor: React.FC<{
                     {step.type === 'awu_capability' && isLocalUpdateCapability(step.config?.capability) && (
                       <div style={{ ...subtleStyle, marginTop: 9, lineHeight: 1.5 }}>
                         {step.config?.capability === 'node.update_local_build'
-                          ? '使用本次构建登记的本地安装包，不上传。运行后核对安装计划并单独确认。'
+                          ? '使用本次构建登记的本地安装包；可在严格绑定发布后直装，不重新下载。运行后核对安装计划并单独确认。'
                           : step.config?.capability === 'node.check_update_local'
                             ? '检查执行设备已配置的更新源；有更新时单独确认安装。'
                             : '使用本次运行已成功发布的版本；发布后还需单独确认安装。'}
@@ -1523,7 +1523,7 @@ const KitEditor: React.FC<{
                         </label>
                         <label><FieldLabel>制品类型（可选，逗号分隔）</FieldLabel>
                           <input style={miniInput}
-                            placeholder="msi,nsis,docker-bundle"
+                            placeholder="nsis,docker-bundle"
                             value={Array.isArray(step.config?.arguments?.kinds)
                               ? step.config?.arguments?.kinds.join(',') : ''}
                             onChange={(e) => updateStep(index, { config: {
@@ -1533,6 +1533,7 @@ const KitEditor: React.FC<{
                                 kinds: e.target.value.split(',').map((item) => item.trim()).filter(Boolean),
                               },
                             } })} />
+                          <span style={subtleStyle}>留空时 Windows 只发布 NSIS 安装包，其他平台按筛选发布。</span>
                         </label>
                         <label style={{ gridColumn: '1 / -1' }}><FieldLabel>发布说明</FieldLabel>
                           <textarea style={{ ...miniInput, width: '100%', minHeight: 54, resize: 'vertical' }}

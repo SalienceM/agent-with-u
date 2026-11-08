@@ -278,6 +278,7 @@ export interface KitCapabilityRuntime {
     manifestUrl?: string;
     sourceKind?: string;
     sourcePath?: string;
+    publishedRelease?: Record<string, unknown>;
     fingerprint?: string;
     candidate?: Record<string, unknown>;
     release?: Record<string, unknown>;

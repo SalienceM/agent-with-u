@@ -15,8 +15,13 @@ def validate_update_sequence(configs: list[dict[str, Any]]) -> list[str]:
         if configs[index].get("capability") == BUILD_UPDATE_CAPABILITY:
             if sum(config.get("captureBuild") is True for config in configs[:index]) != 1:
                 errors.append("安装本机构建需要前面唯一的 captureBuild 构建步骤；不能选择任意安装包或其他运行的制品")
-            if any(config.get("capability") == "release.publish_latest" for config in configs[:index]):
-                errors.append("本机构建直装不能包含发布步骤；需要上传时请选择构建、发布并更新链路")
+            publishers = [i for i, config in enumerate(configs[:index])
+                          if config.get("capability") == "release.publish_latest"]
+            builds = [i for i, config in enumerate(configs[:index]) if config.get("captureBuild") is True]
+            if publishers and (len(publishers) != 1 or len(builds) != 1
+                    or publishers[0] <= builds[0]
+                    or (configs[publishers[0]].get("arguments") or {}).get("bindBuild") is not True):
+                errors.append("发布后本地安装需要唯一 captureBuild 构建之后的唯一 bindBuild 发布步骤")
         if configs[index].get("capability") == UPDATE_CAPABILITY:
             sources = [config for config in configs[:index] if config.get("capability") == "release.publish_latest"
                        and (config.get("arguments") or {}).get("bindBuild") is True]
@@ -73,7 +78,10 @@ def local_build_requested(intent: str) -> bool:
     return (any(word in lowered for word in ("本机", "本地", "local"))
             and any(word in lowered for word in ("打包", "构建", "build", "package"))
             and any(word in lowered for word in ("更新", "安装", "update", "install"))
-            and not publication_requested(lowered)
+            and (not publication_requested(lowered) or bool(re.search(
+                r"本地(?:直装|安装)|(?:本地|本机)(?:包|安装包|制品).{0,12}(?:安装|更新)|"
+                r"(?:不(?:用|要|需要|再)?|无需).{0,16}(?:下载|远端拉)|"
+                r"(?:without|no|don't|do not).{0,12}(?:download|re-download)|install locally", lowered)))
             and not update_prohibited(lowered))
 
 
@@ -94,15 +102,20 @@ def build_template(state: Any, intent: str, *, local_build: bool = False) -> dic
                 "questions": ["请选择一个当前 Session 的已登记构建 Kit（把真实 ID 写入目标）；需使用支持构建登记的 build_all.bat 或 register_release_candidate.py"],
                 "candidates": [{"id": kit.id, "title": kit.title} for kit in candidates], "warnings": []}
     build = candidates[0]
+    publish = not local_build or publication_requested(intent)
+    title = "打包、发布并本地直装" if local_build and publish else "本机打包并直接更新" if local_build else "打包、发布并更新本机"
+    description = ("本次构建 → 独立发布确认 → 本地包校验 → 独立安装确认 → 重启验收；不重新下载安装包"
+                   if local_build and publish else
+                   "本次本机构建 → 本地制品校验 → 独立安装确认 → 重启验收；不上传、不下载" if local_build else
+                   "本次构建 → 独立发布确认 → 独立安装确认 → 重启验收")
     return {"status": "ok", "ready": True, "kit": {
-        "title": "本机打包并直接更新" if local_build else "打包、发布并更新本机",
-        "description": "本次本机构建 → 本地制品校验 → 独立安装确认 → 重启验收；不上传、不下载" if local_build else "本次构建 → 独立发布确认 → 独立安装确认 → 重启验收",
+        "title": title, "description": description,
         "executionTarget": "executor", "shell": "powershell", "cwd": ".", "command": "",
         "timeoutSeconds": 21600, "inputs": build.inputs, "enabled": True,
         "steps": [
             {"id": "build", "type": "kit_call", "target": "executor", "title": build.title, "kitId": build.id,
              "captureBuild": True, "inputs": {item["key"]: "{{" + item["key"] + "}}" for item in build.inputs if item.get("key")}},
-            *([] if local_build else [{"id": "publish", "type": "awu_capability", "target": "executor", "title": "发布本次构建",
+            *([] if not publish else [{"id": "publish", "type": "awu_capability", "target": "executor", "title": "发布本次构建",
              "config": {"capability": "release.publish_latest", "arguments": {"bindBuild": True, "channel": "stable", "projectRoot": "."}}}]),
             {"id": "install", "type": "awu_capability", "target": "executor", "title": "安装本次本机构建并验收重启" if local_build else "安装本次发布并验收重启",
              "config": {"capability": BUILD_UPDATE_CAPABILITY if local_build else UPDATE_CAPABILITY, "arguments": {}}},

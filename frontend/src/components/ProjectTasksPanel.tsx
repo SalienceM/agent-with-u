@@ -8,19 +8,21 @@ import { BackendRuntimeFields, isRuntimeConfigurableBackend } from './CodexRunti
 import { useCollaborationRead } from '../hooks/useCollaborationRead';
 import { uuid } from '../utils/uuid';
 import { ProjectMergePanel } from './ProjectMergePanel';
+import { ProjectBranchGraph } from './ProjectBranchGraph';
 
 interface Props { session: string; executor: string; backendId: string; backends: any[]; onOpenSession?: (id: string) => void;
-  initialAction?: 'create' | 'manage' | 'merge'; workspaceId?: string; mergeTarget?: string; canCreate?: boolean; onClose?: () => void }
+  initialAction?: 'create' | 'manage' | 'merge'; workspaceId?: string; mergeTarget?: string; initialOperation?: string; canCreate?: boolean; onClose?: () => void }
 const statusLabel: Record<string, string> = { preview: '待确认创建', creating: '正在创建', ready: '工作区就绪', error: '创建失败', unknown: '结果未知', archived: '已归档', cleaned: '已清理', discarded: '预览已移除' };
 const field = workflowFieldStyle;
 
-export const ProjectTasksPanel: React.FC<Props> = ({ session, executor, backendId, backends, onOpenSession, initialAction, workspaceId, mergeTarget, canCreate = true, onClose }) => {
+export const ProjectTasksPanel: React.FC<Props> = ({ session, executor, backendId, backends, onOpenSession, initialAction, workspaceId, mergeTarget, initialOperation, canCreate = true, onClose }) => {
   const [open, setOpen] = useState(!!initialAction), [revision, setRevision] = useState(0), [rows, setRows] = useState<CollaborationSummary[]>([]);
   const [selected, setSelected] = useState(workspaceId || ''), [task, setTask] = useState<TaskWorkspace>(), [next, setNext] = useState<number | null>(null);
   const [editing, setEditing] = useState(false), [busy, setBusy] = useState(false), [notice, setNotice] = useState('');
   const [repo, setRepo] = useState<TaskRepository>(), [config, setConfig] = useState<TaskWorkspace['config']>({ title: '', goal: '', backendId, runtime: {}, constraints: '', skills: [], skipPermissions: false, includePaths: [] });
   const [uncertain, setUncertain] = useState(false), [readNonce, setReadNonce] = useState(0);
-  const [mode, setMode] = useState<'tasks' | 'merge'>(initialAction === 'merge' ? 'merge' : 'tasks');
+  const [mode, setMode] = useState<'tasks' | 'merge' | 'graph'>(initialAction === 'merge' ? 'merge' : 'tasks');
+  const [mergeContext, setMergeContext] = useState({ session, operation: initialOperation, target: mergeTarget });
   const current = useRef(`${executor}:${session}`); current.current = `${executor}:${session}`;
   const busyRef = useRef(false), panel = useRef<HTMLDivElement>(null);
   const createdHere = useRef('');
@@ -111,11 +113,11 @@ export const ProjectTasksPanel: React.FC<Props> = ({ session, executor, backendI
   return <>
     {!initialAction && <WorkflowButton tone="quiet" icon="branch" aria-label="分支副本与合并" onClick={() => setOpen(true)} style={{ whiteSpace: 'nowrap' }}>分支副本</WorkflowButton>}
     {open && <AppModalPortal><div style={{ position: 'fixed', inset: 0, zIndex: 31100, display: 'grid', placeItems: 'center', padding: 10, background: '#0007' }}>
-      <div ref={panel} role="dialog" aria-modal="true" aria-label="分支副本" style={{ ...workflowDialogStyle, width: 'min(1060px, 100%)', height: 'min(86vh, 800px)', display: 'flex', flexDirection: 'column', background: 'var(--theme-bg-secondary, white)', color: 'var(--theme-text, black)', borderRadius: 16, overflow: 'hidden' }}
+      <div ref={panel} role="dialog" aria-modal="true" aria-label="分支副本" style={{ ...workflowDialogStyle, width: 'min(1060px, 100%)', height: 'min(86vh, 800px)', display: 'flex', flexDirection: 'column', background: 'var(--theme-panel-solid, var(--theme-bg-secondary, white))', color: 'var(--theme-text, black)', borderRadius: 16, overflow: 'hidden' }}
         onKeyDown={event => {
           if (event.nativeEvent.isComposing) return;
           if (event.key === 'Escape') { event.preventDefault(); close(); }
-          if (event.key === 'Tab') { const nodes = [...panel.current!.querySelectorAll<HTMLElement>('button:not(:disabled), input:not(:disabled), textarea, select, summary')];
+          if (event.key === 'Tab') { const nodes = [...panel.current!.querySelectorAll<HTMLElement>('button:not(:disabled), input:not(:disabled), textarea, select, summary')].filter(node => node.getClientRects().length > 0);
             const first = nodes[0], last = nodes[nodes.length - 1];
             if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last?.focus(); }
             else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first?.focus(); }
@@ -123,11 +125,16 @@ export const ProjectTasksPanel: React.FC<Props> = ({ session, executor, backendI
         }}>
         <header style={workflowHeaderStyle}><strong style={{ flex: 1 }}>分支副本</strong>
           <WorkflowButton tone="quiet" aria-pressed={mode === 'tasks'} onClick={() => setMode('tasks')}>副本</WorkflowButton><WorkflowButton tone="quiet" aria-pressed={mode === 'merge'} onClick={() => setMode('merge')}>{mergeTarget ? '合并到主 Session' : '合并记录'}</WorkflowButton>
+          <WorkflowButton tone="quiet" aria-pressed={mode === 'graph'} onClick={() => setMode('graph')}>分支图</WorkflowButton>
           {mode === 'tasks' && <>{canCreate && <WorkflowButton tone="primary" icon="plus" disabled={busy} onClick={newTask}>新建分支副本</WorkflowButton>}
           <WorkflowButton onClick={() => { setRevision(n => n + 1); setReadNonce(n => n + 1); }}>核对副本状态</WorkflowButton></>}
           <WorkflowButton onClick={close}>返回对话</WorkflowButton>
         </header>
-        {mode === 'merge' ? <ProjectMergePanel key={`${executor}:${session}`} session={session} executor={executor} fixedTarget={mergeTarget} onOpenSession={id => { onOpenSession?.(id); close(); }} /> : <div style={{ display: 'flex', minHeight: 0, flex: 1 }}>
+        {mode === 'graph' ? <ProjectBranchGraph session={session} executor={executor} onOpenSession={id => { onOpenSession?.(id); close(); }}
+          onOpenMerge={(source, parent) => { setMergeContext({ session: source, operation: undefined, target: parent }); setMode('merge'); }} /> : mode === 'merge' ? <ProjectMergePanel key={`${executor}:${mergeContext.session}:${mergeContext.target || ''}`} session={mergeContext.session} executor={executor}
+          initialOperation={mergeContext.operation} fixedTarget={mergeContext.target}
+          onOpenOrigin={(origin, operation) => setMergeContext({ session: origin, operation, target: origin === session ? mergeTarget : undefined })}
+          onOpenSession={id => { onOpenSession?.(id); close(); }} /> : <div style={{ display: 'flex', minHeight: 0, flex: 1 }}>
           <nav aria-label="分支副本记录" style={{ ...workflowNavStyle, display: rows.length ? 'flex' : 'none', width: 'clamp(85px, 24%, 230px)', overflow: 'auto', borderRight: '1px solid var(--theme-border)', flexShrink: 0 }}>
             {rows.map(row => <WorkflowButton tone="quiet" key={row.id} aria-pressed={selected === row.id && !editing} disabled={busy} style={{ width: '100%', padding: 9, overflowWrap: 'anywhere' }} onClick={() => { setSelected(row.id); setEditing(false); setUncertain(false); }}>{row.title} · {statusLabel[row.status || ''] || row.status}</WorkflowButton>)}
             {next !== null && <WorkflowButton onClick={() => void act(async () => { const identity = current.current; const result = await api.collaborationList(session, executor, 'workspace', next); if (identity === current.current) { setRows(old => [...old, ...result.items.filter(row => row.status !== 'discarded' && !discardedPreviews.current.has(row.id) && !old.some(item => item.id === row.id))]); setNext(result.nextOffset); } })}>更多任务</WorkflowButton>}

@@ -175,6 +175,7 @@ class LocalBuildUpdateTests(unittest.IsolatedAsyncioTestCase):
         self.add_second_installer()
         run, step, runtime = await self.run_update()
         self.assertEqual('needs_selection', runtime.get('phase'), run.to_dict())
+        self.assertEqual(self.current, runtime['plan']['current'])
         artifact = runtime['plan']['artifacts'][1]
         args = (self.session.id, run.id, artifact['id'], runtime['planFingerprint'], 'select-local')
         self.bridge._rpc_kitUpdateSelect(*args)
@@ -209,6 +210,7 @@ class LocalBuildUpdateTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(preview['ready'], preview)
             self.assertEqual(2, len(preview['kit']['steps']))
             self.assertEqual(BUILD_UPDATE_CAPABILITY, preview['kit']['steps'][-1]['config']['capability'])
+            self.assertNotIn('SSH', preview['kit']['implementationSummary'])
         for objective in ('打包上传并更新本机', '本机打包但不安装', '本机打包无需安装', '只构建', '检查更新'):
             self.assertFalse(local_build_requested(objective))
         state = self.bridge._kit_get(self.session.id)
@@ -241,7 +243,7 @@ class LocalBuildUpdateTests(unittest.IsolatedAsyncioTestCase):
                 spec['steps'].insert(0, {**copy.deepcopy(spec['steps'][0]), 'id': 'another-build'})
             elif scenario == 'publish':
                 spec['steps'].insert(1, {'id': 'pub', 'type': 'awu_capability', 'config': {
-                    'capability': 'release.publish_latest', 'arguments': {'bindBuild': True}}})
+                    'capability': 'release.publish_latest', 'arguments': {}}})
             elif scenario == 'schedule':
                 spec['schedule'] = {'mode': 'interval', 'intervalSeconds': 60}
             elif scenario == 'nonlast':

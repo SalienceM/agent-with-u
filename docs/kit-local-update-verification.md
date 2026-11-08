@@ -93,3 +93,44 @@ Rust 4 项通过，Tauri 编译检查退出码 0，OpenSpec 严格校验通过�
 - `npx tsc --noEmit` 与 `git diff --check`：通过。
 
 安装平台/身份、签名策略和真实升级限制保持不变。本地构建回执没有发布清单签名，要求签名或配置验证密钥的节点仍会拒绝此输入。未打包新桌面，因此本记录不能证明当前安装版本已具有入口，也不代表真实 MSI/NSIS 更新验收。
+
+## 2026-11-08：发布后使用同一份本地包
+
+新增可生成的组合：本次捕获构建 → 严格绑定发布 → `node.update_local_build`。保留旧下载路线和不发布直装。发布成功后读取该 job 实际上传的本机 `manifest.json`（包含正式签名），与成功账本及构建回执核对，再将已发布的兼容安装包映射到本地路径。选择和确认复核构建／发布／验证策略绑定；缺失、失败或变更不下载兜底。本机生成摘要不再错误显示 SSH 运维说明，卡片区分未发布和已发布本地包。
+
+验证使用真实发布状态机、假上传／CDN／回读传输、临时构建登记、惰性 MSI/NSIS 字节和假桌面；安装端的远端清单读取与 HTTP 下载均设为调用即失败。所有数据落在临时用户根，完整兼容回归额外隔离 APPDATA。
+
+```text
+python -m unittest tests.test_kit_published_local_build tests.test_kit_local_build_update tests.test_published_update -q
+python -m unittest tests.test_kit_published_local_build tests.test_workspace_kits tests.test_kit_capabilities tests.test_chat_kits tests.test_kit_build_receipts tests.test_kit_published_release tests.test_kit_update_journal tests.test_kit_update_barrier tests.test_kit_update_identity tests.test_kit_local_update_chain tests.test_kit_standalone_update tests.test_release_center tests.test_node_updates -q
+```
+
+- 首轮 33 项通过（59.548 秒）；补充发布范围筛选和选择期间发布漂移测试后，第二条命令 187 项通过（90.176 秒）。新混合链路共 19 项，覆盖分别确认、重启验收、取消、交接失败、身份／权限／忙闲／落盘失败、正确及错误签名、发布失败、包缺失／篡改、错误回执、清单变更、版本／制品不符、多安装器及发布筛选。
+- 前端 `node node_modules/@playwright/test/cli.js test --config playwright.engine.config.ts kit-local-build-update.spec.ts`：11 项通过（10.4 秒），覆盖 1200px／360px、四条来源路线、选择及独立确认、原请求只读核对、编辑说明和取消。初次由 Playwright 启动 Vite 的就绪等待超时，测试尚未执行；改用当前任务启动的独立 Vite（端口 55191），设置 `AWU_PREVIEW_TEST_SERVER=owned` 后完成测试，未连接用户 Backend。
+- `npx tsc --noEmit` 及最终 `node node_modules/typescript/bin/tsc --noEmit` 通过；`openspec validate add-kit-local-update-chain --strict` 与 `git diff --check` 通过。
+
+未运行真实上传、清理、MSI/NSIS 或应用重启，未打包／部署这次扩展，也未改写已保存的生产 Kit。当前安装应用需升级后重新生成并保存“本机打包发布后本地安装，不重新下载”组合；以上是源码与隔离验证完成，不能当作生产安装成功。
+
+## 2026-11-09：默认只发布 Windows NSIS
+
+`release.publish_latest` 未设置制品类型或 ID 时，Windows 桌面仅选 NSIS，MSI 保留在构建输出中；没有符合筛选的 NSIS 不回退 MSI。其他平台、显式类型/ID 与已经冻结的运行计划保持原选择。编辑器说明同步更新；执行节点升级后，新预览采用该规则，已有无类型筛选 Kit 无需重建。
+
+- `python scripts/test_merge_workflow_isolated.py tests.test_kit_capabilities tests.test_kit_published_release.PublishedReleaseTests tests.test_kit_local_update_chain.LocalUpdateChainTests tests.test_kit_published_local_build.PublishedLocalBuildTests`：43 项通过，62.771 秒。独立短 TEMP/APPDATA/DATA_ROOT，假上传和惰性安装包，没有网络发布或运行安装器。
+- 新增默认选择用例覆盖 NSIS+MSI、多平台、平台筛选、空类型筛选、旧 NSIS、只有 MSI 以及显式 MSI/ID。原 MSI 安装协议夹具改为显式选 MSI，继续保留该兼容覆盖。
+- 新增完整默认链路：构建两类安装包 → 冻结计划仅 NSIS → 一份制品及两份清单的假上传 → 本地安装计划仅 NSIS；MSI 文件仍存在，远端清单读取与下载均未调用。
+- `npx tsc --noEmit`、`git diff --check` 通过；严格规格校验发现新增任务编号与原 6.x 重复，改为 7.x 后复核通过。
+
+本轮只查询真实 Kit 列表，没有执行、取消或修改当前发布任务，也未打包安装新版本。
+
+## 2026-11-09：大型 LOOP 历史误触安装预检上限
+
+实际失败运行的打包和发布均成功，安装在准备阶段失败，没有安装/重启回执。只读文件统计定位到一份 24,985,296 字节的 LOOP 文件；它触发旧检查的单文件 16 MiB 限制，不是重定向。正文绝大部分为迭代历史。修复后只读核对本机 16 份 LOOP 文件，活动投影合计 4,464 字节，耗时 2.359 秒，未发现未结束的 LOOP 状态；这不等于整个节点无其他活动，也不构成安装许可。
+
+`kit_activity_json.py` 分块校验完整 JSON，跳过历史对象的构建；`kit_update_activity.py` 只保留活动字段，复用真实文件修订一致的内存投影。保留 512 文件、64 MiB 本次读取和 16 MiB 活动投影上限，损坏/重定向/文件变化仍失败，不写用户历史或 sidecar。Windows 夹具发现 `DirEntry.stat()` 的 dev/ino 为零，已改用路径真实 stat 对比受保护的读取句柄，重新验证通过。
+
+安装器选择计划补充当前版本；选择 accepted 提示按 Session/run/step 和权威阶段显示，失败或进入独立确认后不残留“等待复制/下载”，包括迟到回包。
+
+- `python scripts/test_merge_workflow_isolated.py tests.test_kit_update_activity tests.test_kit_update_barrier tests.test_kit_local_build_update`：27 项通过，19.238 秒。
+- `python scripts/test_merge_workflow_isolated.py tests.test_kit_update_activity tests.test_kit_update_barrier tests.test_kit_local_update_chain.LocalUpdateChainTests tests.test_kit_published_local_build.PublishedLocalBuildTests tests.test_kit_standalone_update.StandaloneUpdateTests`：58 项通过，64.531 秒。两组共 69 个不同用例；用户根、APPDATA、TEMP 隔离，使用假发布和惰性安装包。
+- 前端 `kit-local-build-update.spec.ts`：13 项通过，10.7 秒，涵盖回执先于失败/晚于失败、独立确认、未知恢复以及 1200px/360px。自动 Vite 就绪检测首次超时，改用本任务单独启动的 55191 测试服务；测试禁止连接用户 Backend。
+- `node node_modules/typescript/bin/tsc --noEmit` 通过。未执行真实 Kit、网络发布、安装器或应用重启；旧进程需升级到包含修复的版本后才生效。

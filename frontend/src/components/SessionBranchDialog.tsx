@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { api } from '../api';
 import { ProjectTasksPanel } from './ProjectTasksPanel';
 import { AppModalPortal } from './AppModalPortal';
@@ -7,19 +7,22 @@ import { WorkflowButton, workflowDialogStyle } from './WorkflowControls';
 export interface BranchSession {
   id: string; title: string; backendId: string; execKey?: string; parentSessionId?: string;
   relationKind?: string; workspaceId?: string;
+  mergeLink?: import('../types/taskWorkspaces').MergeLink;
 }
 
 export const SessionBranchDialog: React.FC<{ session: BranchSession; action: 'create' | 'manage' | 'merge';
   onClose: () => void; onOpenSession: (id: string) => void }> = ({ session, action, onClose, onOpenSession }) => {
   const [backends, setBackends] = useState<any[]>(), [error, setError] = useState(''), [nonce, setNonce] = useState(0);
   const executor = session.execKey || 'local';
+  const returnFocus = useRef(document.activeElement as HTMLElement | null);
+  useEffect(() => () => { requestAnimationFrame(() => { if (returnFocus.current?.isConnected) returnFocus.current.focus(); }); }, []);
   useEffect(() => {
     let live = true; setError('');
     api.getBackends(executor).then(value => { if (live) setBackends(value); }, e => { if (live) setError(String(e)); });
     return () => { live = false; };
   }, [executor, session.id, nonce]);
   if (backends) return <ProjectTasksPanel session={session.id} executor={executor} backendId={session.backendId} backends={backends}
-    initialAction={action} workspaceId={session.workspaceId} mergeTarget={session.relationKind === 'task' ? session.parentSessionId : undefined}
+    initialAction={action} workspaceId={session.workspaceId} initialOperation={session.mergeLink?.operationId} mergeTarget={session.relationKind === 'task' ? session.parentSessionId : undefined}
     canCreate={!session.parentSessionId && !session.relationKind && !session.workspaceId} onClose={onClose} onOpenSession={onOpenSession} />;
   return <AppModalPortal><div style={{ position: 'fixed', inset: 0, zIndex: 31100, display: 'grid', placeItems: 'center', padding: 12, background: '#0007' }}>
     <div role="dialog" aria-modal="true" aria-label="分支副本" onKeyDown={e => { if (e.key === 'Escape') onClose(); }}

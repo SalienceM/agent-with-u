@@ -1235,6 +1235,11 @@ Workspace Kits are Session-level standard accessories stored separately in
   AgentWithU product services; a Kit can never name an arbitrary Bridge RPC. The first
   registered capability is `release.publish_latest`. It scans and filters fresh build
   artifacts, calls Release Center preview to freeze a plan, then persists
+  the exact selection. Without explicit kinds/artifact IDs, Windows desktop publishing
+  selects only NSIS (never falls back to MSI); other platforms retain their filters.
+  Explicit kinds/IDs remain supported. Build inventories and frozen/running plans keep
+  their original artifacts; published-local installation uses the resulting published subset.
+  It then persists
   `waiting_approval`. Formal publishing cannot start until `kitCapabilityRespond` records
   a human approval or a validated one-run chat delegation bound to the plan fingerprint.
   ChatInput's default-off `kitApprovalDelegation` send field is the only chat opt-in;
@@ -1261,8 +1266,13 @@ Workspace Kits are Session-level standard accessories stored separately in
   只支持已安装 Windows 桌面；本地壳通过独立握手证明实例，通知不广播到远端控制窗口。
   发布与安装分别确认；聊天发布委托永远不授权安装。安装确认绑定 owner/Session/run/step/
   fingerprint/requestId，重新检查权限、实例、忙闲和节点共享预留。交接屏障拒绝新任务；
-  持久化未知 LOOP/Kit 活动、不可读记录不能当作空闲。journal 为安装责任来源，双文件
-  写失败不发安装通知；助手一次性领取，不以安装器退出码代替桌面与 Backend 完整版本验收。
+  持久化未知 LOOP/Kit 活动、不可读记录不能当作空闲。
+  活动检查流式校验完整 JSON，只投影运行/启动/转交/修复/退出状态，不加载历史正文；
+  16 MiB 约束用于活动投影，另保留 64 MiB 本次读取与 512 文件上限。修订缓存绑定真实
+  dev/ino/size/mtime/ctime，Windows 不用 DirEntry 的零文件 ID。路径句柄及读取前后修订
+  变化、损坏、重定向仍拒绝。选择 accepted 提示只在选择/暂存阶段显示，迟到回包不覆盖失败。
+  journal 为安装责任来源，双文件写失败不发安装通知；助手一次性领取，
+  不以安装器退出码代替桌面与 Backend 完整版本验收。
   新交接只关闭壳实际持有的 sidecar，不借用全局 PID 文件。handing_off/waiting_restart/
   verifying/result_unknown 都是非成功活动状态；kitResume 只核对，不重跑。交接前只取消
   本请求，确认后不能保证撤回，不杀安装器、不回滚；未知保持保护。有界恢复最多 13 次，
@@ -1275,10 +1285,12 @@ Workspace Kits are Session-level standard accessories stored separately in
   `bindBuild` 发布的旧错误单步定义；不得静默迁移生产 Kit。Windows 注册路径仅去空白和成对外引号
   后 canonicalize，保留唯一目录与真实 exe 匹配，不修改注册表或绕过 installed 守卫。
 - 本机打包直装 `node.update_local_build` 消费当前 run 唯一成功 executor 构建的 `captureBuild` 回执，
-  不上传、不读更新源/latest，不接受任意路径或安装参数。生成器复用真实构建 Kit；保存与运行均校验
-  唯一构建、禁止发布、唯一末尾安装及手动运行。核对登记候选/本地文件后复制到更新暂存区，校验
+  不读更新源/latest，不接受任意路径或安装参数。纯本地路径不上传；明确要求发布后本地直装时，
+  允许唯一构建之后的唯一 `bindBuild` 发布，成功后读取本机保存的实际上传签名清单，核对同次版本及
+  发布范围内的制品，直接使用本地包，不重新下载。缺失/变更/失败不走远端兜底。生成器复用真实构建
+  Kit；保存与运行均校验顺序、唯一末尾安装及手动运行。核对登记候选/本地文件后复制到更新暂存区，校验
   SHA-256/大小，沿用已安装 Windows 身份、节点预留、独立人工确认和重启验收。选择与确认绑定
-  原回执和验证策略；取消保留原构建。签名策略不放宽：要求签名或配置验证密钥时拒绝未签名本地
+  原回执、可选发布回执和验证策略；取消保留原构建与已发布结果。签名策略不放宽：要求签名或配置验证密钥时拒绝未签名本地
   回执，继续使用已签名发布路径。测试只用临时项目、惰性制品和 fake 桌面，不等于真实安装验收。
 - 普通命令 Kit 的 `kitCancel` is immediate and idempotent: it first persists the authoritative
   `cancelled` run/step state, then cancels any live orchestration task and terminates
@@ -2131,6 +2143,10 @@ acceptance, historical reads or a late result after closing; opening does not st
 The server rejects child/integration/review derivation at preview and execution. Only two tree levels are
 displayed, including legacy nested records; favorites keep families together and search retains
 ancestors. Integration Sessions belong under the target's main Session, never a third level.
+Their verified `mergeLink` is an ephemeral list projection, not a persisted Session relation.
+`projectTaskSessions` hides linked integration rows from ordinary copies; active/pinned rows,
+search results and missing/orphan links remain reachable. They never count as ordinary copies.
+Source/target entries expose merge activity/history; integration chat exposes “返回合并记录”.
 New copy forms use `inheritSource=true` and `snapshotMode=current`: explicit allowlisted runtime
 and ability preferences are deep-copied and frozen, with ordinary permission shown in the plan.
 Current tracked changes/deletions and untracked project files become the private-index baseline;
@@ -2154,12 +2170,59 @@ merge; never hard-reset, auto-stash, push or auto-clean. The controlled `awu_wor
 reuse this service and retain independent plan approvals (`allow_skip=False`); a chat sentence or
 Kit grant cannot approve a cross-Session merge. Real IDs are discovered and ambiguous names returned.
 
+`project_merge_workflow.py` adds `mergeWorkflow=1`, bounded related `projectMergeOperations` and
+read-only `projectMergeInspect` (`merge_operations` / `merge_inspect` in the controlled chat tool).
+Scope is owner/executor plus actual origin/source/target/integration IDs, not titles. Related main
+or integration Sessions can inspect, but `_merge_row` still rejects writes from a different origin.
+`useProjectMergeWorkflow` restores the unique unfinished operation or asks for explicit selection;
+opening never creates a preview. User/executor/Session selection and unknown request intents survive
+closing; no grants are stored. Checks coalesce in flight, ignore stale revisions and duplicate events,
+and only auto-Verify a visible, online candidate/conflict with an actually idle clean integration.
+Preparation completion, confirmed turn exit and return trigger bounded reads, never polling, Start
+or Apply. Inspect itself does not reconcile unknown apply receipts; original-origin Status retains
+that authority. Two independent plan confirmations remain in the continuous panel.
+Diagnostics distinguish source/target/integration disk paths, index/worktree/untracked state,
+unsaved buffers, activity and unknown details. Buffer paths are bounded and capability-gated;
+other owners' buffer paths remain hidden. File navigation revalidates the executor and workspace.
+The merge panel leads with the current blocker and concrete recovery buttons, never a fixed
+four-step slogan. Dirty file lists start collapsed. The change count describes committed
+differences, not uncommitted files. Explicit re-preview preserves the source/target IDs and
+creates only a new plan; related origins and unknown outcomes cannot use it to bypass guards.
+Branch dialogs use the opaque `--theme-panel-solid` surface even with wallpaper enabled.
+Git verification and project tests have separate displays. Only bounded executor evidence with
+candidate, result, time and log reference is displayed; absent evidence is unknown, changed/dirty
+candidates make old evidence stale. No test runner or chat-text acceptance inference is added.
+Legacy nodes keep original-origin history and explicit checks, without related-query fallback writes.
+Branch copies offer “同步主干到此分支” after merging and before the next round. The original
+copy remains the origin, with its registered parent as source and itself as target. Preview
+recognizes `direction=sync_main`; an ancestor copy uses fast-forward preparation rather than
+manufacturing another merge commit. Diverged histories use the same isolated merge, independent
+Prepare/Apply confirmations, identity rechecks and target reservation. Main merge and sync have
+separate receipts; a failed sync cannot undo a successful main merge. History includes both
+directions. Never auto-sync other active copies, push, rebase, reset or stash.
+`project_branch_graph.py` provides `branchGraph=1` and a read-only Session-scoped snapshot of
+the main Session plus up to 15 ordinary copies, prioritizing the current copy. Actual parent
+OIDs drive the horizontal DAG, with the commit table and lazy diff below. Counts use immutable
+tips; changed HEAD/branch reads fail, unavailable branches stay unknown. The UI opens only on
+“分支图”, reads 80 (explicitly up to 200) commits, discloses omitted branches/ancestry, and offers
+“合并与同步” directly per branch without submitting a preview. No polling, fetch or node fallback.
+Graph shape and text-conflict checks are not proof of functional compatibility.
+Run merge regressions with `python scripts/test_merge_workflow_isolated.py`: short private TEMP,
+APPDATA and DATA_ROOT plus disabled user/system Git config; restore cwd before cleaning that root.
+
 `project_write_gate.py` shares target reservations with chat/LOOP/queue dispatch, engineering writes,
 terminals and file/Git operations. It probes online windows, freezes clean document buffers and refuses
 dirty/offline-unknown buffers or active/unknown native exits. Durable gates survive restart; owned Git
 workers outlive request waiters. Status checks actual final OID and confirmed exit before reconciliation,
 without replay. After application/reconnect, old buffers require an explicit reload. External writers
 remain outside AWU's process authority; pre/post Git checks are not full-machine isolation.
+
+Project buffer freeze/release frames are connection-specific handshakes, processed before local/Relay
+broadcast deduplication. Each live original connection replies on itself; stale/offline connections
+cannot use another path or a mock reply. Pre-Git buffer probe timeouts report missing replies explicitly.
+Verify may recover a failed apply's existing candidate only with a durable failed receipt, no active job
+or persistent gate, and unchanged source/target fingerprints. Unknown exits remain blocked; recovery
+retains the failed request receipt and never applies without a new independent confirmation.
 
 `composerDrafts` / `ComposerEditor` share main text, ordered blocks, references, selection and undo.
 Accepted unchanged revisions clear the old draft; late replies never clear newer edits. Handoff is a

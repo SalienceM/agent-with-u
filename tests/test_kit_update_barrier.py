@@ -92,3 +92,17 @@ class UpdateBarrierTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(JournalError, "序列.*进程"):
             self.bridge._begin_update_handoff("request", "own")
         self.assertIsNone(proc.returncode)
+
+    async def test_large_completed_loop_history_allows_check_but_unknown_still_blocks(self):
+        folder = Path(self.tmp.name) / 'loops'
+        folder.mkdir()
+        self.bridge._loop_store = SimpleNamespace(_dir=folder)
+        path = folder / 's.json'
+        data = {'sessionId': 's', 'loops': [{'output': 'x' * (24 * 1024 * 1024)}], 'startup': {}}
+        path.write_text(json.dumps(data), encoding='utf-8')
+        self.assertEqual([], self.bridge._update_busy_reasons('own'))
+        data['startup'] = {'status': 'unknown'}
+        path.write_text(json.dumps(data), encoding='utf-8')
+        with self.assertRaisesRegex(JournalError, 'LOOP'):
+            self.bridge._begin_update_handoff('request', 'own')
+        self.assertFalse(self.bridge._update_work_blocked())

@@ -24,7 +24,7 @@ TOOL_NAME = "awu_workspace"
 MAX_BYTES = 1024 * 1024
 MAX_FILES = 100
 ACTIONS = {"nodes", "sessions", "backends", "files", "read_file", "create_session", "write_files", "status",
-    "project_sessions", "merge_preview", "merge_prepare", "merge_verify", "merge_apply", "merge_status", "merge_cancel"}
+    "project_sessions", "merge_operations", "merge_inspect", "merge_preview", "merge_prepare", "merge_verify", "merge_apply", "merge_status", "merge_cancel"}
 DESCRIPTION = (
     "按需协作当前 AWU 用户有权访问的节点和 Session 工作区。当前 Session 内普通文件读写优先使用 Backend 原生文件工具，"
     "无需为此查询节点或创建协作计划。需要跨节点时先 nodes 获取真实节点；"
@@ -38,6 +38,7 @@ DESCRIPTION = (
     "节点连接由发起聊天的窗口中转，窗口关闭或离线时明确报错，不回退其他节点。"
     "成功以 succeeded 及文件校验回执为准；返回的 sessionLink 可放入 Markdown 供用户点击。"
     "同节点项目汇合：先 project_sessions 发现真实 ID，再 merge_preview(sourceSession,targetSession,requestId)；"
+    "先用 merge_operations 分页查询当前 Session 的关联记录，merge_inspect(operationId) 只读查看原计划和阻塞；主/整合 Session 不能代用原发起 Session 写入。"
     "用 operationId 查询 merge_status，merge_prepare 在独立空间准备，merge_verify 核对实际 Git 候选，merge_apply 快进目标。"
     "prepare/apply 必须在界面独立确认冻结计划，跳过普通确认不适用；模型不得代确认。"
     "冲突需用户打开整合会话明确启动修复，不能把预览当作执行许可。merge_cancel 仅取消尚未应用的操作且保留成果。"
@@ -521,6 +522,9 @@ class ChatWorkspaceTools:
         if not lease['active'] or lease['client'] not in self.bridge._clients: raise ValueError('发起窗口已离线')
         origin, action = lease['session'], args['action']
         if action == 'project_sessions': return json.loads(self.bridge._rpc_projectMergeDiscover(origin, args.get('query', '')))
+        if action == 'merge_operations':
+            return json.loads(await self.bridge._rpc_projectMergeOperations(origin, args.get('sourceSession', ''),
+                args.get('targetSession', ''), args.get('offset', 0), args.get('limit', 30)))
         if action == 'merge_preview':
             candidates = json.loads(self.bridge._rpc_projectMergeDiscover(origin))['items']
             source, target = choose(candidates, args.get('sourceSession', '')), choose(candidates, args.get('targetSession', ''))
@@ -529,6 +533,7 @@ class ChatWorkspaceTools:
             return json.loads(await self.bridge._rpc_projectMergePreview(origin, source['item']['id'], target['item']['id'], args['requestId']))
         operation = args.get('operationId', '')
         if not operation: raise ValueError('需要真实 operationId')
+        if action == 'merge_inspect': return json.loads(await self.bridge._rpc_projectMergeInspect(origin, operation))
         if action == 'merge_status': return json.loads(await self.bridge._rpc_projectMergeStatus(origin, operation))
         if action == 'merge_verify': return json.loads(await self.bridge._rpc_projectMergeVerify(origin, operation))
         if action == 'merge_cancel': return json.loads(self.bridge._rpc_projectMergeCancel(origin, operation, args['requestId']))

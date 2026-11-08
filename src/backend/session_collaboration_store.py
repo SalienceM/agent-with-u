@@ -161,6 +161,32 @@ class CollaborationStore:
         return {'items': [json.loads(row[0]) for row in rows[:limit]], 'offset': offset,
                 'nextOffset': offset + limit if len(rows) > limit else None}
 
+    def merge_operations(self, scope: CollaborationScope, session_id: str, *, source: str = '',
+                         target: str = '', offset: int = 0, limit: int = 30) -> dict:
+        """旧记录无需迁移；数据库投影有界摘要，不把历史正文载入进程。"""
+        if type(offset) is not int or offset < 0 or type(limit) is not int or not 1 <= limit <= 100:
+            raise CollaborationError('合并分页参数无效')
+        query = "FROM records WHERE owner=? AND executor=? AND kind='merge'"
+        args: list[Any] = [scope.owner, scope.executor]
+        query += " AND ? IN (json_extract(body,'$.sourceSessionId'),json_extract(body,'$.source.sessionId'),json_extract(body,'$.target.sessionId'),json_extract(body,'$.integration.sessionId'))"
+        args.append(session_id)
+        for side, value in (('source', source), ('target', target)):
+            if value:
+                query += f" AND json_extract(body,'$.{side}.sessionId')=?"
+                args.append(value)
+        fields = {'id': '$.id', 'title': '$.title', 'status': '$.status', 'revision': '$.revision',
+                  'updatedAt': '$.updatedAt', 'createdAt': '$.createdAt', 'originSessionId': '$.sourceSessionId',
+                  'sourceSessionId': '$.source.sessionId', 'targetSessionId': '$.target.sessionId',
+                  'integrationSessionId': '$.integration.sessionId', 'sourceHead': '$.source.head',
+                  'targetHead': '$.target.head', 'targetBranch': '$.target.branch', 'finalHead': '$.finalHead',
+                  'candidate': '$.candidate'}
+        projection = ','.join(f"'{key}',json_extract(body,'{path}')" for key, path in fields.items())
+        with self._connection() as db:
+            rows = db.execute('SELECT json_object(' + projection + ') ' + query +
+                              ' ORDER BY updated DESC,id LIMIT ? OFFSET ?', (*args, limit + 1, offset)).fetchall()
+        return {'items': [json.loads(row[0]) for row in rows[:limit]], 'offset': offset,
+                'nextOffset': offset + limit if len(rows) > limit else None}
+
     def begin_request(self, scope: CollaborationScope, request_id: str, kind: str, intent: dict) -> tuple[dict, bool]:
         """返回 (原回执, 是否首次登记)。重试只能查询，不能自动再次执行副作用。"""
         identifier(request_id)

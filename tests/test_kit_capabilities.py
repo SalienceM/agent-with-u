@@ -8,7 +8,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from src.backend.bridge_ws import BridgeWS
-from src.backend.kit_capabilities import KitCapabilityRegistry
+from src.backend.kit_capabilities import KitCapabilityRegistry, ReleasePublishLatestCapability
 from src.backend.workspace_kit_store import WorkspaceKitState
 from src.backend.workspace_kit_store import WorkspaceKit
 from src.types import Session
@@ -39,13 +39,13 @@ class FakeReleaseCenter:
                 "projectRoot": project_root,
                 "source": source,
                 "artifacts": [{
-                    "id": "windows-x86_64-desktop-msi-fixture",
+                    "id": "windows-x86_64-desktop-nsis-fixture",
                     "path": str(self.artifact_path),
                     "fileName": self.artifact_path.name,
                     "platform": "windows",
                     "arch": "x86_64",
                     "target": "desktop",
-                    "kind": "msi",
+                    "kind": "nsis",
                     "size": self.artifact_path.stat().st_size,
                     "sha256": "a" * 64,
                     "fresh": True,
@@ -163,7 +163,7 @@ class KitCapabilityProtocolTests(unittest.IsolatedAsyncioTestCase):
             bridge = BridgeWS()
             workspace = Path(tmp) / "workspace"
             workspace.mkdir()
-            artifact = workspace / "AgentWithU_fixture_x64.msi"
+            artifact = workspace / "AgentWithU_fixture_x64-setup.exe"
             artifact.write_bytes(b"fixture")
             manager = FakeReleaseCenter(artifact)
             bridge._release_center_manager = manager  # type: ignore[assignment]
@@ -198,7 +198,7 @@ class KitCapabilityProtocolTests(unittest.IsolatedAsyncioTestCase):
             bridge = BridgeWS()
             workspace = Path(tmp) / "workspace"
             workspace.mkdir()
-            artifact = workspace / "AgentWithU_fixture_x64.msi"
+            artifact = workspace / "AgentWithU_fixture_x64-setup.exe"
             artifact.write_bytes(b"fixture")
             manager = FakeReleaseCenter(artifact)
             bridge._release_center_manager = manager  # type: ignore[assignment]
@@ -225,7 +225,7 @@ class KitCapabilityProtocolTests(unittest.IsolatedAsyncioTestCase):
             bridge = BridgeWS()
             workspace = Path(tmp) / "workspace"
             workspace.mkdir()
-            artifact = workspace / "AgentWithU_fixture_x64.msi"
+            artifact = workspace / "AgentWithU_fixture_x64-setup.exe"
             artifact.write_bytes(b"fixture")
             manager = FakeReleaseCenter(artifact)
             bridge._release_center_manager = manager  # type: ignore[assignment]
@@ -254,6 +254,22 @@ class KitCapabilityProtocolTests(unittest.IsolatedAsyncioTestCase):
 
 
 class KitCapabilityModelTests(unittest.TestCase):
+    def test_default_windows_publication_selects_only_nsis_and_keeps_other_platforms(self):
+        artifacts = [
+            {'id': 'msi', 'platform': 'windows', 'target': 'desktop', 'kind': 'msi', 'fresh': True},
+            {'id': 'nsis', 'platform': 'windows', 'target': 'desktop', 'kind': 'nsis', 'fresh': True},
+            {'id': 'docker', 'platform': 'linux', 'target': 'docker', 'kind': 'docker-bundle', 'fresh': True},
+            {'id': 'old-nsis', 'platform': 'windows', 'target': 'desktop', 'kind': 'nsis', 'fresh': False},
+        ]
+        select = lambda args: [item['id'] for item in ReleasePublishLatestCapability._select_artifacts({'artifacts': artifacts}, args)]
+        self.assertEqual(['nsis', 'docker'], select({}))
+        self.assertEqual(['nsis', 'docker'], select({'kinds': []}))
+        self.assertEqual(['nsis'], select({'platforms': ['windows']}))
+        self.assertEqual(['msi'], select({'kinds': ['msi']}))
+        self.assertEqual(['msi', 'nsis'], select({'kinds': ['msi', 'nsis']}))
+        self.assertEqual(['msi'], select({'artifactIds': ['msi']}))
+        self.assertEqual([], ReleasePublishLatestCapability._select_artifacts({'artifacts': [artifacts[0], artifacts[3]]}, {}))
+
     def test_dynamic_catalog_exposes_ai_discovery_metadata(self):
         capability = KitCapabilityRegistry().list()[0]
 

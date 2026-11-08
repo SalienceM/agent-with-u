@@ -6,6 +6,7 @@ export interface CollaborationSummary {
   id: string; revision: number; updatedAt: number; name?: string; title?: string; status?: string;
   sessionId?: string; sourceSessionId?: string; roleId?: string; batchId?: string; backendId?: string;
   archived?: boolean; enabled?: boolean; counts?: Record<string, number>;
+  actualSourceSessionId?: string; targetSessionId?: string; integrationSessionId?: string;
   kind?: string; progress?: ReviewProgress;
 }
 export interface ReviewProgress { sequence: number; startedAt: number; updatedAt: number; lastOutputAt?: number | null;

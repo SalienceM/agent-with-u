@@ -1,6 +1,6 @@
 import { test, expect, type Page } from '@playwright/test';
 
-async function mount(page: Page, width = 1200, sidebar = false) {
+async function mount(page: Page, width = 1200, sidebar = false, integration = false) {
   await page.setViewportSize({ width, height: 900 });
   await page.routeWebSocket(/.*/, socket => socket.close());
   await page.route('**/*', route => {
@@ -10,7 +10,7 @@ async function mount(page: Page, width = 1200, sidebar = false) {
     return route.continue();
   });
   await page.goto('/');
-  await page.evaluate(async ({ sidebar }) => {
+  await page.evaluate(async ({ sidebar, integration }) => {
     const { React, createRoot, ProjectTasksPanel, Sidebar, ChatInput, api } = await import('/tests/engine/chat-kit-feedback-harness.ts');
     const f = { plans: [] as any[], created: [] as any[], started: [] as any[], opened: [] as string[], row: null as any, callbacks: new Set<any>(), fail: false, inspect: 0,
       nodes: [] as any[], merges: [] as any[], actions: [] as any[], mergeRow: null as any, activeSession: 'parent', render: () => {}, discarded: [] as any[], failDiscard: false };
@@ -36,8 +36,12 @@ async function mount(page: Page, width = 1200, sidebar = false) {
     const backends = [{ id: 'fake', type: 'openai-compatible', label: 'Fake' }];
     api.getBackends = async (node) => { f.nodes.push(node); return backends; };
     api.listSessions = async () => [{ id: 'parent', title: '主项目', workingDir: 'C:/fixture', backendId: 'fake', updatedAt: 1, execKey: 'relay:fixture', execLabel: '测试节点', pinned: true },
-      { id: 'child', title: '功能副本', workingDir: 'C:/child', backendId: 'fake', updatedAt: 2, execKey: 'relay:fixture', execLabel: '测试节点', relationKind: 'task', parentSessionId: 'parent', workspaceId: 'workspace-child' }];
+      { id: 'child', title: '功能副本', workingDir: 'C:/child', backendId: 'fake', updatedAt: 2, execKey: 'relay:fixture', execLabel: '测试节点', relationKind: 'task', parentSessionId: 'parent', workspaceId: 'workspace-child' },
+      ...(integration ? [{ id: 'integration', title: '整合测试空间', workingDir: 'C:/integration', backendId: 'fake', updatedAt: 3, execKey: 'relay:fixture', relationKind: 'integration', parentSessionId: 'parent', workspaceId: 'integration',
+        mergeLink: { operationId: 'op', originSessionId: 'child', sourceSessionId: 'child', targetSessionId: 'parent', status: 'conflict' } }] : [])];
     api.projectMergeStatus = async () => f.mergeRow;
+    api.projectMergeCapabilities = async () => ({ mergeWorkflow: 0 });
+    api.onExecutorConnectionStatus = (_e, callback) => { callback(true); return () => {}; };
     api.projectMergePreview = async (...args) => { f.merges.push(args); return f.mergeRow = { id: 'merge', revision: 1, sourceSessionId: 'child', title: '功能副本 → 主项目', status: 'preview', planFingerprint: 'fixed', files: ['same.txt'], blockers: [],
       source: { ...repo, sessionId: args[2], title: '功能副本' }, target: { ...repo, sessionId: args[3], title: '主项目' }, integrationConfig: { backendId: 'fake', skipPermissions: false }, verification: { status: 'not_run', notice: '未运行测试' }, policy: '独立准备后核对应用' }; };
     api.projectMergeAction = async (...args) => { f.actions.push(args); return args[3]; };
@@ -47,7 +51,7 @@ async function mount(page: Page, width = 1200, sidebar = false) {
         React.createElement(ProjectTasksPanel, { session: 'parent', executor: 'local', backendId: 'fake', backends, onOpenSession: (id: string) => f.opened.push(id) }),
       React.createElement(ChatInput, { sessionId: 'parent', historyKey: 'parent', activeBackendId: 'fake', backends, isStreaming: false, onSend: () => {}, onAbort: () => {} })));
     (window as any).taskFixture = f; f.render();
-  }, { sidebar });
+  }, { sidebar, integration });
 }
 
 for (const width of [1280, 390]) test(`sidebar branch copies keep family together and merge to parent (${width})`, async ({ page }) => {
@@ -164,6 +168,59 @@ test('legacy nested sessions flatten without leaking collapsed descendants or cr
   });
   expect(result.full).toEqual([['root', 0], ['child', 1], ['grandchild', 1], ['remote', 0]]);
   expect(result.collapsed).toEqual(['root', 'remote']);
+});
+
+test('associated integration projection keeps copy counts, search, favorites and orphan recovery', async ({ page }) => {
+  await mount(page);
+  const result = await page.evaluate(async () => {
+    const { taskSessionTree, projectTaskSessions } = await import('/tests/engine/chat-kit-feedback-harness.ts');
+    const link = { operationId: 'op', originSessionId: 'child', sourceSessionId: 'child', targetSessionId: 'root', status: 'succeeded' };
+    const rows = [{ id: 'root' }, { id: 'child', parentSessionId: 'root', relationKind: 'task' },
+      { id: 'integration', parentSessionId: 'root', relationKind: 'integration', mergeLink: link },
+      { id: 'legacy', parentSessionId: 'root', relationKind: 'integration' },
+      { id: 'pinned', pinned: true, parentSessionId: 'root', relationKind: 'integration', mergeLink: link },
+      { id: 'orphan', parentSessionId: 'gone', relationKind: 'integration', mergeLink: { ...link, targetSessionId: 'gone' } }];
+    const normal = projectTaskSessions(rows);
+    const tree = taskSessionTree(normal, new Set(), false);
+    return { normal: normal.map(row => row.id), search: projectTaskSessions(rows, true).map(row => row.id),
+      active: projectTaskSessions(rows, false, 'local:integration').map(row => row.id),
+      copyCount: tree.find(row => row.item.id === 'root')!.children.map(row => row.id),
+      unchanged: rows[2].parentSessionId };
+  });
+  expect(result.normal).toEqual(['root', 'child', 'legacy', 'pinned', 'orphan']);
+  expect(result.search).toContain('integration'); expect(result.active).toContain('integration');
+  expect(result.copyCount).toEqual(['child', 'legacy']); expect(result.unchanged).toBe('root');
+});
+
+test('integration notice opens read-only history without starting a model', async ({ page }) => {
+  await mount(page);
+  await page.evaluate(async () => {
+    const { React, createRoot, MergeSessionNotice, api } = await import('/tests/engine/chat-kit-feedback-harness.ts');
+    const f = (window as any).taskFixture;
+    const host = document.createElement('div'); document.body.append(host);
+    createRoot(host).render(React.createElement(MergeSessionNotice, { session: { id: 'integration', title: '处理空间', backendId: 'fake', relationKind: 'integration' }, onOpenSession: (id: string) => f.opened.push(id) }));
+    api.collaborationList = async () => ({ items: [], nextOffset: null });
+  });
+  await page.getByRole('button', { name: '返回合并记录' }).click();
+  await expect(page.getByRole('dialog')).toContainText('只支持原发起 Session 历史');
+  expect(await page.evaluate(() => ({ actions: (window as any).taskFixture.actions, started: (window as any).taskFixture.started }))).toEqual({ actions: [], started: [] });
+  await page.keyboard.press('Escape');
+  await expect(page.getByRole('button', { name: '返回合并记录' })).toBeFocused();
+});
+
+test('sidebar shows merge handling indicator while integration stays searchable and out of copy count', async ({ page }) => {
+  await mount(page, 390, true, true);
+  await expect(page.getByRole('button', { name: '主项目 的合并记录' })).toContainText('需处理');
+  const toggle = page.getByRole('button', { name: '展开 主项目 的子 Session' });
+  await expect(toggle).toHaveAttribute('title', /1 个子 Session/);
+  await toggle.click();
+  await expect(page.locator('[aria-haspopup="menu"]').filter({ hasText: '整合测试空间' })).toHaveCount(0);
+  await page.getByPlaceholder('搜索会话').fill('整合测试');
+  await expect(page.locator('[aria-haspopup="menu"]').filter({ hasText: '整合测试空间' })).toBeVisible();
+  await page.getByPlaceholder('搜索会话').fill('');
+  await page.evaluate(() => { const f = (window as any).taskFixture; f.activeSession = 'integration'; f.render(); });
+  await expect(page.locator('[aria-haspopup="menu"]').filter({ hasText: '整合测试空间' })).toBeVisible();
+  expect(await page.evaluate(() => (window as any).taskFixture.started)).toEqual([]);
 });
 
 for (const width of [1300, 390]) test(`task preview freezes selection; explicit create then separate start (${width}px)`, async ({ page }) => {

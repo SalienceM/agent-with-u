@@ -49,17 +49,20 @@ class ProjectWriteGate:
             extras = getattr(self, '_chat_extras_get', lambda value: None)(sid)
             if not reason and extras and extras.pending_tasks(): reason = '目标仍有待派发的序列任务'
             if reason:
-                result.append({'sessionId': sid if row.get('ownerId', 'local') == self._current_owner_id() else '', 'reason': reason})
+                result.append({'sessionId': sid if row.get('ownerId', 'local') == self._current_owner_id() else '',
+                    'code': 'activity', 'reason': reason})
         for row in self._project_state()['buffers'].values():
             if (row['root'] == root or Path(root) in Path(row['root']).parents or Path(row['root']) in Path(root).parents) and row['opened']:
                 if row.get('owner') != self._current_owner_id():
-                    result.append({'sessionId': '', 'reason': '其他用户仍打开目标文件，不能核对其缓冲'})
+                    result.append({'sessionId': '', 'code': 'buffer_unknown', 'reason': '其他用户仍打开目标文件，不能核对其缓冲'})
                 elif row['client'] not in getattr(self, '_clients', set()):
-                    result.append({'sessionId': row['sessionId'], 'reason': '曾打开目标文件的窗口已断线，编辑缓冲状态未知'})
+                    result.append({'sessionId': row['sessionId'], 'code': 'buffer_unknown', 'reason': '曾打开目标文件的窗口已断线，编辑缓冲状态未知'})
                 elif row['dirty']:
-                    result.append({'sessionId': row['sessionId'], 'reason': '目标窗口有未保存或待核对的文件缓冲'})
+                    result.append({'sessionId': row['sessionId'], 'code': 'buffer_dirty', 'root': row['root'],
+                        'paths': [{'path': path, 'status': 'buffer'} for path in row.get('paths', [])],
+                        'reason': '窗口有未保存或待核对的文件缓冲，请打开对应文件处理'})
         if any(value == root or Path(value) in Path(root).parents or Path(root) in Path(value).parents for value in self._project_state()['external'].values()):
-            result.append({'sessionId': '', 'reason': '目标仍有应用文件/Git 写入未完成'})
+            result.append({'sessionId': '', 'code': 'activity', 'reason': '仍有应用文件/Git 写入未完成'})
         return result[:50]
 
     async def _project_guarded_call(self, working_dir: str, operation: Any) -> Any:
@@ -79,10 +82,14 @@ class ProjectWriteGate:
         task.add_done_callback(finished)
         return await asyncio.shield(task)
 
-    def _rpc_projectBufferState(self, session_id: str, identity_json: str, opened: bool, dirty: bool) -> str:
+    def _rpc_projectBufferState(self, session_id: str, identity_json: str, opened: bool, dirty: bool, relative_paths: list | None = None) -> str:
         if type(opened) is not bool or type(dirty) is not bool:
             raise CollaborationError('缓冲状态无效')
         identity = self._workbench_identity(session_id, json.loads(identity_json))
+        from .workspace_tools import relative_path
+        if relative_paths is not None and (not isinstance(relative_paths, list) or len(relative_paths) > 100):
+            raise CollaborationError('缓冲路径列表无效')
+        safe_paths = list(dict.fromkeys(relative_path(path) for path in relative_paths or []))
         meta = WINDOW_REQUEST.get()
         if not meta: raise CollaborationError('文件缓冲需要真实窗口身份')
         key = (identity.ownerId, meta['clientId'], meta['windowId'], session_id, identity.workingDir)
@@ -92,7 +99,7 @@ class ProjectWriteGate:
         else:
             if key not in buffers and len(buffers) >= 2048: raise CollaborationError('文件缓冲登记超过上限')
             buffers[key] = {'root': canonical_path(identity.workingDir), 'sessionId': session_id, 'owner': identity.ownerId,
-                'opened': opened, 'dirty': dirty, 'client': self._current_request_client()}
+                'opened': opened, 'dirty': dirty, 'paths': safe_paths, 'client': self._current_request_client()}
         return json.dumps({'status': 'recorded'})
 
     def _rpc_projectBufferReply(self, probe_id: str, clean: bool) -> str:
@@ -133,7 +140,13 @@ class ProjectWriteGate:
         try:
             await asyncio.gather(*(client.send(json.dumps({'event': 'projectBufferFreeze', 'data': {
                 'probeId': probe_id, 'operationId': operation_id, 'workspace': identity.to_dict()}}, ensure_ascii=False)) for client in clients))
-            clean = await asyncio.wait_for(probe['future'], 10)
+            try:
+                clean = await asyncio.wait_for(probe['future'], 10)
+            except asyncio.TimeoutError as error:
+                raise CollaborationError(
+                    f"目标编辑缓冲核对超时：{len(probe['pending'])} 个窗口连接未回应，尚未开始 Git 合并。"
+                    '请检查在线窗口后重新核对原候选'
+                ) from error
             if not clean: raise CollaborationError('目标有未保存编辑缓冲，未开始写入')
             if not clients.issubset(self._clients): raise CollaborationError('核对期间窗口断线，未开始写入')
             busy = self._project_activity(root)

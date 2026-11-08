@@ -67,6 +67,7 @@ import { messagesToMarkdown, messagesToJson } from './utils/markdown';
 import type { SmoothGhostState } from './utils/smoothGhost';
 import { notifyTaskCompletion } from './utils/desktopNotifications';
 import type { FileFocusRequest } from './utils/fileFocus';
+import { normalizeRelativeFilePath, sameWorkspacePath } from './utils/fileFocus';
 import {
   type AttentionContext,
   type AttentionKind,
@@ -269,6 +270,27 @@ export const App: React.FC = () => {
     setSessionInPane(session);
     setModeRequest({ id: ++sessionMenuSequence.current, user: currentUser.userId, session, mode });
   }, [setSessionInPane, currentUser.userId]);
+  const mergeFileSelect = useRef(setSessionInPane); mergeFileSelect.current = setSessionInPane;
+  useEffect(() => {
+    let alive = true;
+    const focusMergeFile = (event: Event) => {
+      const request = (event as CustomEvent).detail;
+      if (!request || typeof request.relativePath !== 'string' || !normalizeRelativeFilePath(request.relativePath)) return;
+      const owner = currentUser.userId;
+      void api.resolveWorkspaceSession(request.executor, request.sessionId).then(meta => {
+        if (!alive || owner !== getCurrentUserProfile().userId || !meta || (meta.execKey || 'local') !== request.executor
+          || !sameWorkspacePath(meta.workingDir, request.workingDir)) return;
+        if (engineSessionRef.current && engineSessionRef.current !== request.sessionId) {
+          setToast({ type: 'info', message: '请先返回 Chat，再打开对应 Session 的文件；原缓冲与合并保留。' }); return;
+        }
+        mergeFileSelect.current(request.sessionId); setSidebarCollapsed(false);
+        setFileFocusRequest({ sessionId: request.sessionId, workingDir: meta.workingDir,
+          relativePath: request.relativePath, requestId: ++fileFocusRequestIdRef.current });
+      }).catch(error => { if (alive) setToast({ type: 'error', message: '无法打开对应文件：' + String(error) }); });
+    };
+    window.addEventListener('awu:merge-file-focus', focusMergeFile);
+    return () => { alive = false; window.removeEventListener('awu:merge-file-focus', focusMergeFile); };
+  }, [currentUser.userId]);
   const openSessionMenu = useCallback((session: string, anchor: HTMLButtonElement) => {
     if (engineSessionRef.current && session !== engineSessionRef.current) return;
     setSessionInPane(session);

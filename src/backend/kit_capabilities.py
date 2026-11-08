@@ -108,7 +108,7 @@ def _public_plan(plan: dict[str, Any]) -> dict[str, Any]:
 class ReleasePublishLatestCapability:
     id = "release.publish_latest"
     title = "发布最新包"
-    description = "扫描当前工作区的最新制品，冻结发布计划，并在人工或有效的本次委托确认后正式发布。"
+    description = "扫描当前工作区的最新制品，Windows 默认只发布 NSIS 安装包；冻结计划后经人工或有效的本次委托确认再发布。"
     risk_level = "high"
     permission = "node.release.manage"
     approval = "required"
@@ -140,7 +140,7 @@ class ReleasePublishLatestCapability:
         },
         "kinds": {
             "type": "string[]", "optional": True,
-            "description": "只选择指定制品类型，如 msi/nsis/docker-bundle",
+            "description": "只选择指定制品类型，如 nsis/docker-bundle；留空时 Windows 桌面只选 NSIS，显式指定可覆盖默认选择",
         },
         "artifactIds": {
             "type": "string[]", "optional": True,
@@ -195,6 +195,13 @@ class ReleasePublishLatestCapability:
                     ]
             if not bool(arguments.get("includeStale", False)):
                 artifacts = [item for item in artifacts if item.get("fresh") is not False]
+            if not _filter_values(arguments, "kind"):
+                # Windows 同时构建 MSI/NSIS 时，默认仅发布 NSIS；不回退到 MSI。
+                # 显式类型/制品 ID 仍按原请求选择，其他平台不受此默认值影响。
+                artifacts = [item for item in artifacts
+                             if str(item.get("platform") or "").lower() != "windows"
+                             or str(item.get("target") or "").lower() != "desktop"
+                             or str(item.get("kind") or "").lower() == "nsis"]
         return artifacts
 
     async def prepare(
@@ -216,7 +223,7 @@ class ReleasePublishLatestCapability:
         selected = self._select_artifacts(candidate, arguments)
         if not selected:
             raise KitCapabilityError(
-                "没有找到符合条件的本次新制品；请先完成打包，或调整平台/类型筛选"
+                "没有找到符合条件的本次新制品；Windows 默认只发布 NSIS 安装包。请先完成打包，或调整平台/类型筛选"
             )
         options = {
             key: arguments[key] for key in (
@@ -337,7 +344,7 @@ class LocalCheckUpdateCapability(LocalPublishedUpdateCapability):
 class LocalBuildUpdateCapability(LocalPublishedUpdateCapability):
     id = BUILD_UPDATE_CAPABILITY
     title = "安装本次本机构建并验收重启"
-    description = "直接使用当前运行唯一成功构建的本地安装包，校验并暂存后独立确认安装；不上传、不下载、不读取 latest。"
+    description = "使用当前运行唯一成功构建的本地安装包，校验并暂存后独立确认安装；可在严格绑定发布成功后使用同一份本地包，不重新下载、不读取 latest。"
     intent_hints = ("本机更新", "更新本机", "本地更新", "本机打包", "本地打包", "本机构建", "本地构建", "local build", "local update")
     example = {"type": "awu_capability", "target": "executor", "title": title,
                "config": {"capability": id, "arguments": {}}}

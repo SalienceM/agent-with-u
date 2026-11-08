@@ -12,12 +12,13 @@ from typing import Any
 from . import paths
 from .task_git import TaskGit, canonical_path
 from .session_collaboration_store import CollaborationError, fingerprint
+from .project_merge_workflow import ProjectMergeWorkflow
 from ..types import Session
 
 FINAL = {'succeeded', 'cancelled', 'error'}
 
 
-class ProjectMerges:
+class ProjectMerges(ProjectMergeWorkflow):
     def _merge_job_key(self, scope: Any, operation: str) -> str:
         return fingerprint([scope.owner, scope.executor, operation])
 
@@ -61,7 +62,11 @@ class ProjectMerges:
 
     def _merge_update(self, scope: Any, row: dict, **changes: Any) -> dict:
         updated = self._collaboration_store().write(scope, 'merge', row['id'], {**row, **changes}, row['revision'])
-        self._emit_event('projectMergeUpdated', {key: updated[key] for key in ('id', 'revision', 'sourceSessionId', 'status', 'title')})
+        self._emit_event('projectMergeUpdated', {**{key: updated[key] for key in ('id', 'revision', 'sourceSessionId', 'status', 'title')},
+            'actualSourceSessionId': updated['source']['sessionId'], 'targetSessionId': updated['target']['sessionId'],
+            'integrationSessionId': (updated.get('integration') or {}).get('sessionId', '')})
+        if updated.get('integration'):
+            self._emit_session_updated({'type': 'merge_updated', 'sessionId': updated['integration']['sessionId']})
         return updated
 
     async def _rpc_projectMergePreview(self, origin: str, source_id: str, target_id: str, request_id: str) -> str:
@@ -95,7 +100,12 @@ class ProjectMerges:
                 if len(names) > 1000: raise CollaborationError('变化超过1000个路径，请拆分汇合范围')
                 return names
             files = await asyncio.to_thread(changes)
-            plan = {'sourceSessionId': origin, 'title': f'{source.title} → {target.title}', 'status': 'blocked' if blockers else 'preview',
+            syncing = (target.parent_session_id == source_id and target.relation_kind == 'task'
+                       and origin == target_id)
+            fast_forward = syncing and await asyncio.to_thread(lambda:
+                TaskGit(target_repo['root']).run('merge-base', target_repo['head'], source_repo['head']).decode().strip() == target_repo['head'])
+            plan = {'sourceSessionId': origin, 'createdAt': time.time(), 'title': f'{source.title} → {target.title}', 'status': 'blocked' if blockers else 'preview',
+                'direction': 'sync_main' if syncing else 'merge', 'fastForward': bool(fast_forward),
                 'source': {'sessionId': source_id, 'title': source.title, **source_repo, 'identity': identities['source']}, 'target': {'sessionId': target_id, 'title': target.title, **target_repo, 'identity': identities['target']},
                 'files': files, 'blockers': blockers, 'activity': activity, 'sourceActivity': source_activity,
                 'integrationParentId': self._task_root_id(target_id),
@@ -149,7 +159,7 @@ class ProjectMerges:
                     raise CollaborationError('来源或目标已变化，请重新预览；目标未修改')
                 actual = target_git.create(target, root, 'awu/integration/' + sid, [], root.parent / '.scratch')
                 git = TaskGit(str(root)); git.disable_filters()
-                git.merge(row['source']['head'])
+                git.merge(row['source']['head'], fast_forward=row.get('fastForward', False))
                 conflicts = [item.decode('utf-8') for item in git.run('diff', '--name-only', '--diff-filter=U', '-z').split(b'\0') if item]
                 final = git.inspect()
                 if not conflicts and final['dirty']: raise CollaborationError('整合未形成干净候选，保留独立空间')
@@ -191,10 +201,26 @@ class ProjectMerges:
     async def _rpc_projectMergeVerify(self, origin: str, operation: str) -> str:
         self._window_guard(origin)
         scope, store, row = self._merge_row(origin, operation)
-        if row['status'] not in {'conflict', 'candidate'}: raise CollaborationError('当前汇合不在候选核对阶段')
+        recovering = row['status'] == 'error' and bool(row.get('applyRequestId'))
+        if recovering:
+            # 只恢复已落盘的确定失败；未知退出/持久写入预留绝不能借 Verify 解除。
+            receipt = store.request(scope, row['applyRequestId'])
+            if (not receipt or receipt['kind'] != 'mergeApply' or receipt['status'] != 'failed'
+                    or receipt['sessionId'] != origin or not row.get('integration') or not row.get('candidate')
+                    or self._merge_job_key(scope, operation) in self._merge_jobs()
+                    or any(gate['operationId'] == operation and gate['owner'] == scope.owner
+                           for gate in store.project_gates(scope.executor))):
+                raise CollaborationError('上次应用尚未确认失败或退出，请查询原操作，不能重新启用候选')
+            self._merge_recheck_identity(row)
+        elif row['status'] not in {'conflict', 'candidate'}:
+            raise CollaborationError('当前汇合不在候选核对阶段')
         integration = row['integration']; self._require_session_access(integration['sessionId'])
         if self._project_activity(integration['root']): raise CollaborationError('整合会话仍在活动，请等待实际退出后核对')
         def verify() -> dict:
+            if recovering:
+                for side in ('source', 'target'):
+                    if TaskGit(row[side]['root']).inspect()['fingerprint'] != row[side]['fingerprint']:
+                        raise CollaborationError('来源或目标已变化，不能恢复旧候选，请重新预览')
             git = TaskGit(integration['root']); result = git.inspect()
             conflicts = git.run('diff', '--name-only', '--diff-filter=U', '-z')
             if conflicts or result['dirty']: raise CollaborationError('仍有 Git 冲突或未提交修改，请在整合会话解决并提交')
@@ -208,7 +234,8 @@ class ProjectMerges:
         if self._project_activity(integration['root']): raise CollaborationError('核对期间整合会话开始活动，请等待后再核对')
         current = store.read(scope, 'merge', operation)
         if current['revision'] != row['revision']: raise CollaborationError('汇合状态已变化，请重新核对')
-        row = self._merge_update(scope, row, status='candidate', candidate=result['head'], integration={**integration, 'actual': result, 'conflicts': []},
+        recovery_notice = {'notice': '已重新核对原候选；上次失败回执保留，仍需单独确认应用。'} if recovering else {}
+        row = self._merge_update(scope, row, **recovery_notice, status='candidate', candidate=result['head'], integration={**integration, 'actual': result, 'conflicts': []},
             verification={'status': 'git_verified', 'head': result['head'], 'notice': '已核对无冲突、干净工作树及双亲历史；项目测试结果请在整合会话查看，本检查不声明功能通过。'})
         return json.dumps(row, ensure_ascii=False)
 

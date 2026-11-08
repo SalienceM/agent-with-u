@@ -16,6 +16,7 @@ export { OpinionReferencePreview } from '../../src/components/OpinionReferencePr
 export { documentStore, DocumentStore } from '../../src/utils/documentStore';
 export { UserInteractionsPanel } from '../../src/components/UserInteractionsPanel';
 export { interactionIndex } from '../../src/utils/userInteractions';
-export { taskSessionTree } from '../../src/utils/taskSessionTree';
+export { taskSessionTree, projectTaskSessions } from '../../src/utils/taskSessionTree';
+export { MergeSessionNotice } from '../../src/components/MergeSessionNotice';
 export { roleQueryAt } from '../../src/utils/roleReviews';
 export { kitDelegations, OPEN_KIT_RECEIPT } from '../../src/utils/kitDelegationFeedback';

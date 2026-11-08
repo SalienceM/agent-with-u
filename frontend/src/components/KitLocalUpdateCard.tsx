@@ -16,43 +16,54 @@ export const KitLocalUpdateCard: React.FC<{
   const plan = runtime.plan || {};
   const phase = String(runtime.phase || step.status);
   const localBuild = step.config.capability === 'node.update_local_build';
+  const publishedLocal = localBuild && !!plan.publishedRelease;
   const handed = ['handing_off', 'waiting_restart', 'verifying', 'result_unknown'].includes(phase);
   const [busy, setBusy] = useState(false);
-  const [notice, setNotice] = useState('');
+  const context = JSON.stringify([sessionId, run.id, step.id]);
+  const [notice, setNotice] = useState<{ text: string; context: string; phase: string; selection?: boolean }>();
   const live = useRef(true);
-  const selection = useRef<{ fingerprint: string; artifact: string; request: string }>();
+  const currentContext = useRef(context);
+  currentContext.current = context;
+  const selection = useRef<{ context: string; fingerprint: string; artifact: string; request: string }>();
   useEffect(() => { live.current = true; return () => { live.current = false; }; }, []);
   const act = async (artifact?: string) => {
     if (busy) return;
-    setBusy(true); setNotice('');
+    setBusy(true); setNotice(undefined);
+    const show = (text: string, selection = false) => {
+      if (live.current && currentContext.current === context) setNotice({ text, context, phase, selection });
+    };
     try {
       if (artifact) {
         const fp = String(runtime.planFingerprint || '');
-        if (!selection.current || selection.current.fingerprint !== fp) selection.current = { fingerprint: fp, artifact, request: crypto.randomUUID() };
+        if (!selection.current || selection.current.context !== context || selection.current.fingerprint !== fp) selection.current = { context, fingerprint: fp, artifact, request: crypto.randomUUID() };
         if (selection.current.artifact !== artifact) throw new Error('已有选择请求结果待核对，请勿重复提交其他制品');
         const result = await api.kitUpdateSelect(sessionId, run.id, artifact, fp, selection.current.request);
         if (!['ok', 'accepted'].includes(result.status)) throw new Error(result.message || '制品选择未被接受');
-        if (live.current) setNotice(localBuild ? '选择已提交，等待执行端复制并校验本地安装包' : '选择已提交，等待执行端下载校验');
+        show(localBuild ? '选择已提交，等待执行端复制并校验本地安装包' : '选择已提交，等待执行端下载校验', true);
       } else {
         const result = await api.kitUpdateReconcile(sessionId, run.id);
         if (result.status !== 'ok') throw new Error(result.message || '核对未完成');
-        if (live.current) setNotice('已读取原请求结果，没有重新安装');
+        show('已读取原请求结果，没有重新安装');
       }
     } catch (error) {
-      if (live.current) setNotice(String(error instanceof Error ? error.message : error));
+      show(String(error instanceof Error ? error.message : error));
     } finally { if (live.current) setBusy(false); }
   };
   const artifact = plan.artifact;
+  // 推送可能先于选择 RPC 回包到达；迟到的 accepted 不能覆盖已失败/待确认的权威阶段。
+  const visibleNotice = notice?.context === context && (notice.selection
+    ? ['needs_selection', 'staging'].includes(phase) : notice.phase === phase) ? notice.text : '';
   return <section aria-label="本机更新安装计划" style={{ marginTop: 10, padding: 13, borderRadius: 10,
     border: '1px solid var(--theme-border)', background: 'var(--theme-panel-bg, #1b2230)', overflowWrap: 'anywhere' }}>
     <strong>本机更新 · {localBuild && phase === 'staging' ? '复制并校验本地安装包' : phases[phase] || phase}</strong>
     <p>目标是 Session 执行设备，不是当前控制窗口。安装需单独确认。</p>
-    {localBuild && <div>来源：本次本机构建 · 未上传</div>}
+    {localBuild && <div>{publishedLocal ? '来源：本次本机构建 · 已发布 · 使用本地安装包'
+      : plan.sourceKind === 'local_build' ? '来源：本次本机构建 · 未上传' : '来源：本次本机构建 · 正在核对发布状态'}</div>}
     {localBuild && plan.sourcePath && <div>构建目录：{plan.sourcePath}</div>}
     <div>设备：{String(plan.desktop?.deviceId || plan.device || '核对中')} · 安装实例：{String(plan.desktop?.instanceId || plan.instanceId || '—')}</div>
     <div>当前：{String(plan.current?.version || '—')} / {String(plan.current?.buildId || '—')}</div>
     <div>目标：{String(plan.release?.version || '—')} / {String(plan.release?.buildId || '—')} · 序号 {String(plan.release?.sequence || '—')}</div>
-    <div>通道：{localBuild ? '本机构建（未发布）' : String(plan.channel || '—')}{phase !== 'current' && <> · 计划指纹：{runtime.planFingerprint || '准备中'}</>}</div>
+    <div>通道：{localBuild && !publishedLocal && plan.sourceKind === 'local_build' ? '本机构建（未发布）' : String(plan.channel || '—')}{phase !== 'current' && <> · 计划指纹：{runtime.planFingerprint || '准备中'}</>}</div>
     {plan.manifestUrl && <div>清单：{plan.manifestUrl}</div>}
     {artifact && <div style={{ marginTop: 8 }}>
       <div>{String(artifact.fileName || artifact.id)} · {String(artifact.platform)} / {String(artifact.arch)} · {Number(artifact.size).toLocaleString()} 字节</div>
@@ -67,7 +78,7 @@ export const KitLocalUpdateCard: React.FC<{
       <p key={index} style={{ color: '#e3b341' }}>准备时提示：{message}；确认时会重新检查。</p>)}
     {plan.warnings?.map((message, index) => <p key={index}>{message}</p>)}
     {runtime.message ? <p role="status">{String(runtime.message)}</p> : null}
-    {notice && <p role="status">{notice}</p>}
+    {visibleNotice && <p role="status">{visibleNotice}</p>}
     {phase === 'waiting_approval' && <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, marginTop: 12 }}>
       <button disabled={responding} onClick={() => onRespond(false)}>取消本次安装</button>
       <button disabled={responding} onClick={() => onRespond(true)}>{responding ? '提交中…' : '确认安装并重启目标节点'}</button>

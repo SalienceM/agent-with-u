@@ -108,6 +108,8 @@ class LocalUpdateChainTests(unittest.IsolatedAsyncioTestCase):
         state = self.bridge._kit_get(self.session.id)
         original = self.build.to_dict()
         generated = build_template(state, "打包上传并本机更新")
+        # 本组保留显式 MSI 安装协议覆盖；默认 NSIS 发布另有完整链路回归。
+        generated["kit"]["steps"][1]["config"]["arguments"]["kinds"] = ["msi"]
         self.assertTrue(generated["ready"])
         self.assertEqual(original, self.build.to_dict())
         created = json.loads(self.bridge._rpc_kitCreate(self.session.id, json.dumps(generated["kit"])))

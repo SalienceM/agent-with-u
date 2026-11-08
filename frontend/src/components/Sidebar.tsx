@@ -13,7 +13,7 @@ import type { FavoritePhase } from '../utils/sessionFavorites';
 
 import { SkillBindingTree } from './SkillBindingTree';
 import { InteractionBadge } from './UserInteractionsPanel';
-import { taskSessionTree } from '../utils/taskSessionTree';
+import { taskSessionTree, projectTaskSessions } from '../utils/taskSessionTree';
 import { SessionBranchDialog } from './SessionBranchDialog';
 
 interface Session extends SessionViewMetadata {
@@ -36,6 +36,7 @@ interface Session extends SessionViewMetadata {
   relationKind?: 'review' | 'task' | 'integration';
   parentSessionId?: string;
   workspaceId?: string;
+  mergeLink?: import('../types/taskWorkspaces').MergeLink;
   loopExecutionMode?: 'loop' | 'aimein';
   pinned?: boolean;
   favoriteStatus?: FavoritePhase;
@@ -642,7 +643,7 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
           session.execLabel,
           session.sessionType,
         ].some((value) => String(value || '').toLocaleLowerCase().includes(normalizedSearch)))
-      : sessions.filter(session => session.relationKind !== 'review' || session.pinned || session.id === activeSessionId);
+      : projectTaskSessions(sessions, false, `${activeExecKey || 'local'}:${activeSessionId}`).filter(session => session.relationKind !== 'review' || session.pinned || session.id === activeSessionId);
     if (normalizedSearch) {
       const seen = new Set(filtered.map(row => `${row.execKey || 'local'}:${row.id}`));
       for (let i = 0; i < filtered.length; i++) {
@@ -655,7 +656,7 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
       }
     }
     return [...filtered].sort(sortSessionsByPriority);
-  }, [sessions, normalizedSearch, activeSessionId]);
+  }, [sessions, normalizedSearch, activeSessionId, activeExecKey]);
   const collapsedSessionFamilies = useMemo(() => new Set(visibleSessions
     .map(row => `${row.execKey || 'local'}:${row.id}`).filter(key => !expandedSessionFamilies.has(key))), [visibleSessions, expandedSessionFamilies]);
 
@@ -1040,6 +1041,10 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
                 const isRunning = streamingSessions.has(s.id);
                 const isCompleted = !isRunning && completedSessions.has(s.id);
                 const isActive = s.id === activeSessionId;
+                const merges = sessions.filter(item => item.mergeLink && (item.execKey || 'local') === (s.execKey || 'local')
+                  && [item.mergeLink.sourceSessionId, item.mergeLink.targetSessionId].includes(s.id));
+                const mergeActive = merges.some(item => streamingSessions.has(item.id) || ['preparing', 'applying'].includes(item.mergeLink!.status));
+                const mergePending = merges.some(item => !['succeeded', 'cancelled'].includes(item.mergeLink!.status));
                 const isContextTarget = sessionContextMenu?.session.id === s.id;
                 const familyKey = `${s.execKey || 'local'}:${s.id}`;
                 const familyExpanded = !!normalizedSearch || expandedSessionFamilies.has(familyKey);
@@ -1082,6 +1087,10 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
                     {familyExpanded ? '▾' : '▸'}{children.length}
                   </button>}
                   {depth > 0 && <span title={s.relationKind === 'integration' ? '独立合并空间' : '子 Session · 独立 Git 分支与目录'} style={{ fontSize: 11, color: s.relationKind === 'integration' ? '#d97706' : '#8b5cf6' }}>{s.relationKind === 'integration' ? '⇄' : '⑂'}</span>}
+                  {!!merges.length && <button type="button" title="打开关联的合并记录与处理空间" aria-label={`${s.title} 的合并记录`}
+                    style={{ border: 0, background: 'transparent', color: 'var(--theme-text-muted)', cursor: 'pointer', fontSize: 11, flexShrink: 0 }}
+                    onClick={event => { event.stopPropagation(); setBranchDialog({ session: s, action: 'merge' }); }}>⇄ {mergeActive ? '处理中' : mergePending ? '需处理' : '历史'}</button>}
+                  {s.relationKind === 'integration' && <span style={{ fontSize: 10 }}>{s.mergeLink ? '处理空间' : '整合空间（待关联）'}</span>}
                   {isRunning && (
                     <span style={{
                       ...runningDotStyle,
@@ -1195,6 +1204,8 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
           </>}
           {sessionContextMenu.session.codexConnectionMode !== 'ssh' && sessionContextMenu.session.relationKind !== 'review' && <button type="button" role="menuitem" className="awu-session-context-item"
             onClick={() => { setBranchDialog({ session: sessionContextMenu.session, action: 'manage' }); setSessionContextMenu(null); }}>分支副本与合并记录</button>}
+          {sessionContextMenu.session.relationKind !== 'review' && <button type="button" role="menuitem" className="awu-session-context-item"
+            onClick={() => { setBranchDialog({ session: sessionContextMenu.session, action: 'merge' }); setSessionContextMenu(null); }}>{sessionContextMenu.session.relationKind === 'integration' ? '返回合并记录' : '查看合并记录'}</button>}
           {onRequestViewMode && <>
             {(['chat', 'engine'] as const).map(mode => <button key={mode} type="button" className="awu-session-context-item" role="menuitem"
               onClick={() => { const target = sessionContextMenu.session; setSessionContextMenu(null); onRequestViewMode(target.id, mode); }}>

@@ -959,6 +959,19 @@ function handleMessage(e: MessageEvent, source?: Conn) {
       void handleWorkspaceToolRequest(msg.data, source);
       return;
     }
+    // 缓冲冻结是每条连接都必须回应的握手，不是可丢弃的重复广播。
+    // 同机 local/Relay 共用文档锁，但回复必须回到收到请求的原连接。
+    if (msg.event === 'projectBufferFreeze' || msg.event === 'projectBufferRelease') {
+      if (!source || pool.get(source.key) !== source || !source.isOpen) return;
+      const data = typeof msg.data === 'string' ? JSON.parse(msg.data) : msg.data;
+      if (msg.event === 'projectBufferFreeze') {
+        const clean = documentStore.freezeProject(data.probeId, data.workspace, data.operationId);
+        void source.request('projectBufferReply', [data.probeId, clean], 12000).catch(() => {
+          // 回执未知时保留冻结，等待原操作状态核对，不重发或换连接。
+        });
+      } else documentStore.releaseProject(data.probeId, data.committed === true);
+      return;
+    }
     // 同一 sidecar 同时经 local 与 Relay 接入时，RPC 响应仍由各自连接处理，
     // 但 Relay 别名上的广播事件必须丢弃，否则 stream/session 更新会触发两遍。
     if (msg.event && source && isLocalRelayDuplicate(source)
@@ -1029,13 +1042,6 @@ function handleMessage(e: MessageEvent, source?: Conn) {
       }
       if (data.summary && source) data.summary = projectFavorite(data.summary, source);
       sessionUpdateCallbacks.forEach((cb) => cb(data));
-    } else if (msg.event === 'projectBufferFreeze') {
-      const data = typeof msg.data === 'string' ? JSON.parse(msg.data) : msg.data;
-      const clean = documentStore.freezeProject(data.probeId, data.workspace, data.operationId);
-      void callOnStrict(source?.key || 'local', 'projectBufferReply', [data.probeId, clean], 12000).catch(() => { /* 不确认回执不能自行解除写入冻结。 */ });
-    } else if (msg.event === 'projectBufferRelease') {
-      const data = typeof msg.data === 'string' ? JSON.parse(msg.data) : msg.data;
-      documentStore.releaseProject(data.probeId, data.committed === true);
     } else if (msg.event === 'projectMergeUpdated') {
       const data = typeof msg.data === 'string' ? JSON.parse(msg.data) : msg.data;
       projectMergeCallbacks.forEach(cb => cb(data, source?.key || 'local'));
@@ -1385,6 +1391,7 @@ class Conn {
       clearTimeout(connectTimer);
       if (wasCurrent && this.ws === socket) {
         this.ws = null;
+        mergeWorkflowNodes.delete(this.key);
         if (this.heartbeatTimer) { clearInterval(this.heartbeatTimer); this.heartbeatTimer = null; }
         // 只 reject 挂在本连接上的请求,别的节点的请求不受影响。
         pending.forEach((p, id) => {
@@ -1407,7 +1414,7 @@ class Conn {
 
   /** 发起一次 RPC。home 离线时回落 mock(保持旧行为);其它节点离线则丢弃返回 null。 */
   async request(method: string, params: any[], timeoutMs?: number): Promise<any> {
-    const strictSession = ['sessionFavoriteGet', 'sessionFavoriteSet', 'deleteSession', 'destroySession',
+    const strictSession = ['sessionFavoriteGet', 'sessionFavoriteSet', 'deleteSession', 'destroySession', 'projectBufferReply',
       'harnessImageCapabilities', 'harnessImageSubmit', 'harnessImageQueue', 'harnessImageStatus', 'composerSubmit', 'composerStatus'].includes(method);
     const deadline = Date.now() + (timeoutMs || 10000), requestEpoch = relayIdentityEpoch, socket = this.ws;
     if (strictSession) {
@@ -1477,7 +1484,8 @@ class Conn {
 const pool = new Map<string, Conn>();
 let homeConn!: Conn;  // initPool() 在模块加载时立即赋值
 const sessionExec = new Map<string, string>();   // sessionId → conn.key
-const projectBufferReports = new Map<string, { workspace: WorkspaceIdentity; opened: boolean; dirty: boolean; sent: string; pending: boolean }>();
+const mergeWorkflowNodes = new Set<string>();
+const projectBufferReports = new Map<string, { workspace: WorkspaceIdentity; opened: boolean; dirty: boolean; paths?: string[]; sent: string; pending: boolean }>();
 function reportProjectBuffers(force = false): void {
   if (force) for (const lock of documentStore.projectLocks()) {
     const executor = sessionExec.get(lock.workspace.sessionId);
@@ -1496,13 +1504,15 @@ function reportProjectBuffers(force = false): void {
     const related = docs.filter(doc => sameWorkspace(row.workspace, doc.identity.workspace));
     row.opened = related.length > 0;
     row.dirty = related.some(doc => doc.dirty || doc.loading || doc.save && !['succeeded', 'failed'].includes(doc.save.receipt?.status || ''));
+    row.paths = related.filter(doc => doc.dirty || doc.loading || doc.save && !['succeeded', 'failed'].includes(doc.save.receipt?.status || '')).map(doc => doc.identity.relativePath).slice(0, 100);
     if (force) row.sent = '';
-    const state = JSON.stringify([row.opened, row.dirty]), executor = sessionExec.get(row.workspace.sessionId);
+    const state = JSON.stringify([row.opened, row.dirty, row.paths]), executor = sessionExec.get(row.workspace.sessionId);
     if (!executor || !pool.get(executor)?.isOpen || row.pending || row.sent === state) continue;
     row.pending = true;
-    void callOnStrict(executor, 'projectBufferState', [row.workspace.sessionId, JSON.stringify(row.workspace), row.opened, row.dirty], 12000)
+    const paths = mergeWorkflowNodes.has(executor) ? [row.paths] : [];
+    void callOnStrict(executor, 'projectBufferState', [row.workspace.sessionId, JSON.stringify(row.workspace), row.opened, row.dirty, ...paths], 12000)
       .then(() => { row.sent = state; if (!row.opened && !row.dirty) projectBufferReports.delete(key); }).catch(() => { /* 断线状态不能冒充已核对。 */ })
-      .finally(() => { row.pending = false; if (JSON.stringify([row.opened, row.dirty]) !== state) reportProjectBuffers(); });
+      .finally(() => { row.pending = false; if (JSON.stringify([row.opened, row.dirty, row.paths]) !== state) reportProjectBuffers(); });
   }
 }
 documentStore.subscribe(() => reportProjectBuffers());
@@ -4880,6 +4890,24 @@ export const api = {
   },
   async projectMergeStatus(session: string, executor: string, id: string): Promise<import('./types/taskWorkspaces').ProjectMerge> {
     return collaborationCall(executor, 'projectMergeStatus', [session, id]);
+  },
+  async projectBranchGraph(session: string, executor: string, limit = 80): Promise<import('./types/taskWorkspaces').ProjectBranchGraphData> {
+    return collaborationCall(executor, 'projectBranchGraph', [session, limit], 30000);
+  },
+  async projectMergeCapabilities(session: string, executor: string): Promise<{ mergeWorkflow?: number; branchGraph?: number; branchSync?: number }> {
+    const result = await collaborationCall<{ mergeWorkflow?: number; branchGraph?: number; branchSync?: number }>(executor, 'sessionCollaborationCapabilities', [session]);
+    if (result.mergeWorkflow === 1) { mergeWorkflowNodes.add(executor); reportProjectBuffers(true); }
+    else mergeWorkflowNodes.delete(executor);
+    return result;
+  },
+  async projectMergeOperations(session: string, executor: string, source = '', target = '', offset = 0): Promise<{ items: import('./types/taskWorkspaces').MergeSummary[]; nextOffset: number | null }> {
+    return collaborationCall(executor, 'projectMergeOperations', [session, source, target, offset, 30]);
+  },
+  async projectMergeInspect(session: string, executor: string, id: string): Promise<import('./types/taskWorkspaces').ProjectMerge> {
+    return collaborationCall(executor, 'projectMergeInspect', [session, id]);
+  },
+  async collaborationRequestStatus(session: string, executor: string, request: string): Promise<{ status: string }> {
+    return collaborationCall(executor, 'sessionCollaborationRequestStatus', [session, request]);
   },
   async projectMergeAction(session: string, executor: string, action: 'Prepare' | 'Verify' | 'Apply' | 'Cancel' | 'Start', row: import('./types/taskWorkspaces').ProjectMerge, request: string): Promise<import('./types/taskWorkspaces').ProjectMerge> {
     const params = action === 'Prepare' ? [session, row.id, request, row.planFingerprint] : action === 'Apply' ? [session, row.id, request, row.candidate, row.planFingerprint] : action === 'Verify' ? [session, row.id] : [session, row.id, request];

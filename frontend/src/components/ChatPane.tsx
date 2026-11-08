@@ -12,6 +12,7 @@ import { UserInteractionsPanel, focusUserInteraction } from './UserInteractionsP
 import { KitDelegationStatus } from './KitDelegationFeedback';
 import { RoleReviewPanel } from './RoleReviewPanel';
 import { RoleSessionNotice } from './RoleSessionNotice';
+import { MergeSessionNotice } from './MergeSessionNotice';
 import { OPEN_KIT_RECEIPT } from '../utils/kitDelegationFeedback';
 import { LoopPanel } from './LoopPanel';
 import { LoopControlStatus } from './LoopControlStatus';
@@ -980,6 +981,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
       }}
     >
       <TokenUsageMonitor sessionId={sessionId} placement="floating" />
+      {activeSession?.relationKind === 'integration' && <MergeSessionNotice key={historyKey} session={activeSession} onOpenSession={onOpenSession} />}
       {sessionId && activeSession?.sessionType !== 'loop' && activeSession?.relationKind !== 'review' &&
         <SessionSchedules key={historyKey} session={sessionId} executor={activeSession?.execKey || 'local'} owner={currentUser.userId} onStop={chat.abort}
           onLocate={messageId => {

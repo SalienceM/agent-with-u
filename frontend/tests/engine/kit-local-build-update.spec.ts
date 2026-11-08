@@ -62,13 +62,33 @@ test('local install editor does not expose publication parameters', async ({ pag
   await mount(page, 'node.update_local_build');
   await page.getByRole('button', { name: '编辑', exact: true }).click();
   await page.getByText('高级实现 · Shell、命令与机器判言', { exact: true }).click();
-  await expect(page.getByText('使用本次构建登记的本地安装包，不上传。运行后核对安装计划并单独确认。', { exact: true })).toBeVisible();
+  await expect(page.getByText('使用本次构建登记的本地安装包；可在严格绑定发布后直装，不重新下载。运行后核对安装计划并单独确认。', { exact: true })).toBeVisible();
   await expect(page.getByText('发布通道', { exact: true })).toHaveCount(0);
   await expect(page.getByText('平台筛选（可选，逗号分隔）', { exact: true })).toHaveCount(0);
   expect(await page.evaluate(() => (window as any).updateFixture.calls)).toEqual([]);
 });
 
 for (const width of [1200, 360]) {
+  test(`${width}px published local build keeps channel and local source through approval`, async ({ page }) => {
+    await page.setViewportSize({ width, height: 900 });
+    await mount(page, 'node.update_local_build');
+    const card = page.getByRole('region', { name: '本机更新安装计划' });
+    await expect(card).toBeVisible();
+    await page.evaluate(() => {
+      const f = (window as any).updateFixture;
+      f.runtime.plan.publishedRelease = { runId: 'run', stepId: 'publish', channel: 'stable' };
+      f.runtime.plan.channel = 'stable'; f.push();
+    });
+    await expect(card.getByText('来源：本次本机构建 · 已发布 · 使用本地安装包', { exact: true })).toBeVisible();
+    await expect(card.getByText(/通道：stable/)).toBeVisible();
+    await expect(card.getByText(/未上传|未发布/)).toHaveCount(0);
+    expect(await page.evaluate(() => (window as any).updateFixture.calls)).toEqual([]);
+    await card.getByRole('button', { name: /选择 fixture.msi/ }).click();
+    await expect(card.getByText('本地安装包：C:/fixture/project/dist/fixture.msi', { exact: true })).toBeVisible();
+    await expect(card.getByRole('button', { name: '确认安装并重启目标节点' })).toBeVisible();
+    expect(await card.evaluate(el => el.scrollWidth <= el.clientWidth + 1)).toBe(true);
+  });
+
   for (const capability of ['node.update_local_build', 'node.update_local_published', 'node.check_update_local']) {
     test(`${width}px ${capability}: selection, independent approval and read-only recovery`, async ({ page }, testInfo) => {
       await page.setViewportSize({ width, height: 900 });
@@ -85,7 +105,7 @@ for (const width of [1200, 360]) {
       await expect(card.getByText('SHA-256：' + 'a'.repeat(64), { exact: true })).toBeVisible();
       if (capability === 'node.update_local_build') {
         await expect(card.getByText('本地安装包：C:/fixture/project/dist/fixture.msi', { exact: true })).toBeVisible();
-        await expect(card.getByText('选择已提交，等待执行端复制并校验本地安装包', { exact: true })).toBeVisible();
+        await expect(card.getByText('选择已提交，等待执行端复制并校验本地安装包', { exact: true })).toHaveCount(0);
       }
       const dialogs: string[] = [];
       page.on('dialog', async dialog => { dialogs.push(dialog.message()); await dialog.accept(); });
@@ -119,5 +139,38 @@ for (const width of [1200, 360]) {
     await card.getByRole('button', { name: '取消本次安装' }).click();
     await expect(page.getByText('已取消本次安装，原制品保留', { exact: true })).toBeVisible();
     expect(await page.evaluate(() => (window as any).updateFixture.calls[0].slice(0, 5))).toEqual(['confirm', 'fixture', 'run', 'install', false]);
+  });
+}
+
+for (const acknowledgement of ['before-failure', 'after-failure']) {
+  test(`selection acknowledgement ${acknowledgement} never survives failed preparation`, async ({ page }) => {
+    await mount(page, 'node.update_local_build');
+    const card = page.getByRole('region', { name: '本机更新安装计划' });
+    await page.evaluate(async () => {
+      const { api } = await import('/tests/engine/chat-kit-feedback-harness.ts');
+      const f = (window as any).updateFixture;
+      api.kitUpdateSelect = async (...args: any[]) => {
+        f.calls.push(['select', ...args]);
+        f.runtime.phase = 'staging'; f.push();
+        return await new Promise<any>(resolve => { f.ack = () => resolve({ status: 'accepted' }); });
+      };
+    });
+    await card.getByRole('button', { name: /选择 fixture.msi/ }).click();
+    await expect(card.getByText('本机更新 · 复制并校验本地安装包', { exact: true })).toBeVisible();
+    if (acknowledgement === 'before-failure') {
+      await page.evaluate(() => (window as any).updateFixture.ack());
+      await expect(card.getByText('选择已提交，等待执行端复制并校验本地安装包', { exact: true })).toBeVisible();
+    }
+    await page.evaluate(() => {
+      const f = (window as any).updateFixture;
+      f.runtime.phase = 'failed'; f.run.status = f.step.status = 'error';
+      f.runtime.message = '活动记录损坏或不可读；不能确认节点空闲'; f.push();
+    });
+    await expect(card.getByText('本机更新 · 本机更新失败', { exact: true })).toBeVisible();
+    if (acknowledgement === 'after-failure') await page.evaluate(() => (window as any).updateFixture.ack());
+    await expect(card.getByText(/选择已提交/)).toHaveCount(0);
+    await expect(card.getByText('活动记录损坏或不可读；不能确认节点空闲', { exact: true })).toBeVisible();
+    await expect(card.getByRole('button', { name: /确认安装/ })).toHaveCount(0);
+    expect(await page.evaluate(() => (window as any).updateFixture.calls.map((c: any[]) => c[0]))).toEqual(['select']);
   });
 }

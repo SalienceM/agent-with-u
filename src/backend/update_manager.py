@@ -645,6 +645,13 @@ class UpdateManager:
         source = str(published.get("manifestUrl") or "")
         raw = await self._read_source(source, use_headers=False)
         document = json.loads(raw.decode("utf-8-sig"))
+        return self._inspect_published_document(published, document)
+
+    def _inspect_published_document(self, published: dict[str, Any], document: dict[str, Any]) -> dict[str, Any]:
+        """网络清单与本机成功发布账本共用相同签名、身份检查。"""
+        if published.get("schemaVersion") != 1 or not all(published.get(key) for key in (
+                "runId", "stepId", "jobId", "planId", "planFingerprint", "manifestSha256")):
+            raise UpdateError("缺少本次发布凭据")
         if not isinstance(document, dict) or document.get("schemaVersion") != 1:
             raise UpdateError("unsupported update manifest schema")
         self._verify_manifest(document)
@@ -655,7 +662,7 @@ class UpdateManager:
         if (release != published.get("release") or document.get("artifacts") != published.get("artifacts")
                 or document.get("channel") != published.get("channel")):
             raise UpdateError("发布身份或制品与冻结记录不匹配")
-        return self._inspect_kit_manifest(document, source)
+        return self._inspect_kit_manifest(document, str(published.get("manifestUrl") or ""))
 
     def _inspect_kit_manifest(self, document: dict[str, Any], source: str) -> dict[str, Any]:
         """三种 Kit 来源共用安装边界，但不共用/伪造发布凭据。"""
@@ -773,6 +780,31 @@ class UpdateManager:
         if any(not Path(item['url']).is_absolute() or str(item['url']).startswith(('\\\\', '//'))
                for item in inspected['artifacts']):
             raise UpdateError('本机构建只允许本地安装包，不接受网络下载地址')
+        return await self._stage_kit_inspected(inspected, artifact_id, request_id=request_id)
+
+    async def stage_published_local_build(self, local_document: dict[str, Any], published: dict[str, Any],
+                                          manifest: dict[str, Any], artifact_id: str = "",
+                                          *, request_id: str) -> dict[str, Any]:
+        """保留发布签名验证，只将已发布的同次构建制品映射到本地文件。"""
+        self.journal.require_slot(request_id)
+        inspected = self._inspect_published_document(published, manifest)
+        if any(local_document.get('release', {}).get(key) != inspected['release'].get(key)
+               for key in ('version', 'packageVersion', 'buildId', 'sequence', 'kitUpdateProtocol')):
+            raise UpdateError('发布版本与本次本机构建不一致')
+        local_artifacts = local_document.get('artifacts') or []
+        inventory = {item['id']: item for item in local_artifacts}
+        if len(inventory) != len(local_artifacts):
+            raise UpdateError('本次构建制品身份不唯一')
+        for artifact in inspected['artifacts']:
+            local = inventory.get(artifact['id']) or {}
+            if any(local.get(key) != artifact.get(key) for key in
+                   ('id', 'platform', 'arch', 'target', 'kind', 'fileName', 'size', 'sha256', 'install')):
+                raise UpdateError('发布制品与本次本机构建不一致')
+            path = str(local.get('url') or '')
+            if not Path(path).is_absolute() or path.startswith(('\\\\', '//')):
+                raise UpdateError('本次构建缺少本地安装包，不会从远端下载')
+            artifact['url'] = path
+        inspected['sourceKind'] = 'local_build'
         return await self._stage_kit_inspected(inspected, artifact_id, request_id=request_id)
 
     async def _stage_kit_inspected(self, inspected: dict[str, Any], artifact_id: str,

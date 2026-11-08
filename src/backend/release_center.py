@@ -876,6 +876,19 @@ class ReleaseCenterManager:
             "artifacts": json.loads(json.dumps(manifest.get("artifacts") or [])),
         }
 
+    def published_manifest(self, published: dict[str, Any]) -> dict[str, Any]:
+        """从本机成功发布账本取冻结清单；不访问远端，也不把输入当成成功证明。"""
+        actual = self.published_result(
+            published.get("jobId", ""), published.get("planId", ""), published.get("planFingerprint", ""),
+            published.get("runId", ""), published.get("stepId", ""))
+        if actual != published:
+            raise ReleaseCenterError("发布凭据与成功账本不一致")
+        # 签名在正式发布时才生成；必须读取当时上传的原件，不能用未签名的预览替代。
+        manifest_path = self.generated_dir / _safe_id(actual["jobId"]) / "manifest.json"
+        if not manifest_path.is_file() or manifest_path.stat().st_size > 4 * 1024 * 1024:
+            raise ReleaseCenterError("本次发布的本地清单缺失或过大；不会从远端下载兜底")
+        return json.loads(manifest_path.read_text(encoding="utf-8"))
+
     def update_artifact(self, candidate_id: str, artifact_id: str, patch: dict[str, Any]) -> dict[str, Any]:
         allowed = {"platform", "arch", "target", "kind", "install", "key"}
         with self._guard():
