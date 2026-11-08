@@ -48,3 +48,16 @@
 - 初次 Playwright 自动启动服务等待 60 秒超时，改用本轮自建 Vite（55191）和 `AWU_PREVIEW_TEST_SERVER=owned`。旧阻塞 fixture 的真实来源 ID 与固定副本入口不符，双向过滤后暴露此问题，校正 fixture 后原三项阻塞回归通过，随后 35 项全量通过；未放宽服务过滤。
 
 只验证临时仓库和 fake API，不声称多分支不会有文本或功能冲突。图限于已提交历史，默认 80、最多 200 条和主干加 15 个副本，范围外明确提示。已安装桌面版本尚未包含本轮代码。
+
+## 2026-11-09 完成页、待办和入口去重
+
+完成页缩减为一张结果卡和一个继续操作，保留提交摘要与独立 Git/测试状态；完整计划、路径、回执和证据放在“变更与验证详情”。主菜单统一为“分支与合并”。侧栏改用具体状态、精确 operationId 和事件刷新，同一发起方及双方按创建时间选择普通提醒；运行中、结果未知与仍在输出的处理空间不被较新记录隐藏。旧记录不自动取消、结清或删除。
+
+- `python scripts/test_merge_workflow_isolated.py tests.test_project_merges.ProjectMergeTests`：22 项通过，318.295 秒，退出码 0。使用短 TEMP、隔离 APPDATA/DATA_ROOT 与临时 Git 仓库；新增校验列表投影保留权威创建时间。
+- `AWU_PREVIEW_TEST_SERVER=owned` 下运行 `node node_modules/@playwright/test/cli.js test --config playwright.engine.config.ts project-merges.spec.ts project-tasks.spec.ts`：39 项通过，37.5 秒，退出码 0。新增覆盖旧冲突/失败不常驻、反向同步后的普通提醒、不同节点/双方隔离、旧时间未知、运行/unknown 保留、点击准确记录、事件刷新和菜单去重。
+- 最终小幅布局/文案及详情动作核对后，使用 `--grep 'blocked|completed sync|single branch entry|merge success'`：7 项通过，7.3 秒。含两种屏宽的阻塞入口与完成页，以及仍独立确认的同步路径。
+- 复核桌面 1280px 深色、390px 浅色完成页，无横向溢出，长分支名不遮挡动作；完成后新的脏状态不再展示为旧操作待办，未验证测试保持可见。截图保存在 `.qa/merge-ui-review/completed-desktop.png`、`completed-mobile.png` 和 `single-branch-menu.png`。
+- 首轮浏览器测试 36 通过、3 失败：缩短页签后暴露两个同名按钮定位，菜单图标又参与了可访问名称。分别限定到分支状态区域和将装饰图标设为 aria-hidden 后，39 项全部通过。菜单截图禁用过渡动画，避免把淡入中间帧当作实际文字颜色。
+- 前端 `npm run build`（含 TypeScript 检查）、`openspec validate simplify-branch-merge-workflow --strict` 和 `git -c core.safecrlf=false diff --check` 通过。构建仍有已有 CJS 弃用、动静态导入和大分块提示。
+
+浏览器封锁生产 WebSocket 和测试 Vite 以外网络，API 使用 fixture。本轮没有执行真实用户分支合并、Kit、发布或安装；已安装桌面版本仍需后续打包升级。

@@ -321,7 +321,7 @@ async function seedBlocked(page: Page) {
     document.body.style.background = 'repeating-linear-gradient(45deg, #183955 0 30px, #a58464 30px 60px)';
   });
   await page.getByRole('button', { name: '分支副本与合并' }).click();
-  await page.getByRole('button', { name: '合并到主 Session', exact: true }).click();
+  await page.getByRole('button', { name: '合并与同步', exact: true }).click();
 }
 
 for (const [width, height, dark] of [[1314, 738, true], [390, 844, false]] as const) test(`blocked merge exposes recovery above long file list (${width}, dark=${dark})`, async ({ page }, testInfo) => {
@@ -364,7 +364,7 @@ test('blocked recovery cannot repreview a related or unknown operation', async (
 test('merge success offers sync back at the top and preserves both confirmations', async ({ page }) => {
   await mount(page, 1200, false, true);
   await page.getByRole('button', { name: '分支副本与合并' }).click();
-  await page.getByRole('button', { name: '合并到主 Session', exact: true }).click();
+  await page.getByRole('button', { name: '合并与同步', exact: true }).click();
   await page.getByRole('button', { name: '预览合并到主 Session' }).click();
   await page.evaluate(() => { const f = (window as any).mergeFixture; f.row.status = 'succeeded'; f.row.finalHead = 'b'.repeat(40); f.row.revision++; f.callbacks.forEach((cb: any) => cb(f.row, 'local')); });
   const sync = page.getByLabel('下一步').getByRole('button', { name: '同步主干到此分支' });
@@ -379,6 +379,40 @@ test('merge success offers sync back at the top and preserves both confirmations
   await expect(page.getByRole('button', { name: '返回此分支继续开发' })).toBeInViewport();
   await page.getByRole('button', { name: '返回此分支继续开发' }).click();
   expect(await page.evaluate(() => (window as any).mergeFixture.opened)).toEqual(['main']);
+});
+
+for (const [width, dark] of [[1280, true], [390, false]] as const) test(`completed sync has one result and one continue action (${width})`, async ({ page }, testInfo) => {
+  await mount(page, width, dark, true);
+  await page.evaluate(async () => {
+    const { api } = await import('/tests/engine/chat-kit-feedback-harness.ts');
+    const f = (window as any).mergeFixture;
+    await api.projectMergePreview('main', 'local', 'two', 'main', 'finished-sync');
+    f.row = { ...f.row, status: 'succeeded', finalHead: 'b'.repeat(40), candidate: 'b'.repeat(40),
+      integration: { sessionId: 'integration', root: 'C:/test/integration', conflicts: [] },
+      verification: { status: 'git_verified', head: 'b'.repeat(40), notice: 'Git 已核对' },
+      notice: '已快进目标，来源和整合空间均保留' };
+    f.row.source.title = 'AgentWithU-维护'; f.row.target.title = 'AgentWithU-维护 · 副本';
+    f.row.target.branch = 'awu/task/task-d344469b4dfe5019a2b30bb46ce170a2';
+    f.row.files = Array.from({ length: 70 }, (_, i) => `src/file-${i}.ts`);
+    f.diagnostics = [{ side: 'target', code: 'git_dirty', sessionId: 'main', notice: '完成后新的工作区修改', paths: [] }];
+    f.previews = 0;
+  });
+  await page.getByRole('button', { name: '分支副本与合并' }).click();
+  await page.getByRole('button', { name: '合并与同步', exact: true }).click();
+  const panel = page.getByRole('region', { name: '连续合并流程' });
+  await expect(panel.getByText('主干已同步', { exact: true })).toBeVisible();
+  await expect(panel.getByRole('button', { name: '返回此分支继续开发' })).toHaveCount(1);
+  await expect(panel.getByRole('button', { name: '返回此分支继续开发' })).toBeInViewport();
+  await expect(panel.getByRole('button', { name: '打开已同步分支' })).toHaveCount(0);
+  await expect(panel.getByRole('button', { name: '同步主干到此分支' })).toHaveCount(0);
+  await expect(panel.getByLabel('需要处理', { exact: true })).toHaveCount(0);
+  await expect(panel.getByText('最终提交：' + 'b'.repeat(40), { exact: false })).not.toBeVisible();
+  await expect(panel.getByText('项目测试：未验证', { exact: true })).toBeVisible();
+  expect(await page.evaluate(() => ({ actions: (window as any).mergeFixture.actions, previews: (window as any).mergeFixture.previews }))).toEqual({ actions: [], previews: 0 });
+  expect(await panel.evaluate(el => el.scrollWidth <= el.clientWidth)).toBe(true);
+  await page.screenshot({ path: testInfo.outputPath('completed-sync.png'), fullPage: true });
+  await panel.getByText('变更与验证详情', { exact: true }).click();
+  await expect(panel.getByText('最终提交：' + 'b'.repeat(40), { exact: false })).toBeVisible();
 });
 
 for (const [width, dark] of [[1280, false], [390, true]] as const) test(`branch graph connects real parents and commit details (${width})`, async ({ page }, testInfo) => {
@@ -416,7 +450,7 @@ for (const [width, dark] of [[1280, false], [390, true]] as const) test(`branch 
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBeTruthy();
   expect(await page.evaluate(() => { const f = (window as any).mergeFixture; return [f.graphReads, f.actions, f.previews]; })).toEqual([1, [], 0]);
   await page.screenshot({ path: testInfo.outputPath('branch-graph.png'), fullPage: true });
-  await page.getByRole('button', { name: '合并与同步', exact: true }).click();
+  await page.getByLabel('分支状态').getByRole('button', { name: '合并与同步', exact: true }).click();
   await expect(page.getByRole('button', { name: '同步主干到此分支', exact: true })).toBeVisible();
   expect(await page.evaluate(() => { const f = (window as any).mergeFixture; return [f.actions, f.previews, f.graphScope]; })).toEqual([[], 0, ['main', 'local']]);
 });

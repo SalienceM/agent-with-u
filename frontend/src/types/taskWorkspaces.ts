@@ -36,7 +36,7 @@ export interface ProjectBranchGraphData {
   commits: Array<{ hash: string; parents: string[]; author: string; date: string; message: string }>;
 }
 
-export interface MergeLink { operationId: string; originSessionId: string; sourceSessionId: string; targetSessionId: string; status: string }
+export interface MergeLink { operationId: string; originSessionId: string; sourceSessionId: string; targetSessionId: string; status: string; createdAt?: number }
 export interface MergeSummary { id: string; title?: string; status: string; revision: number; updatedAt?: number; createdAt?: number;
   originSessionId: string; sourceSessionId?: string; targetSessionId?: string; integrationSessionId?: string;
   sourceHead?: string; targetHead?: string; targetBranch?: string; candidate?: string; finalHead?: string }

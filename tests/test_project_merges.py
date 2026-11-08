@@ -318,6 +318,7 @@ class ProjectMergeTests(unittest.IsolatedAsyncioTestCase):
         rows = self.bridge._merge_session_links(self.bridge._session_store.list())
         linked = next(item for item in rows if item['id'] == row['integration']['sessionId'])
         self.assertEqual(linked['mergeLink']['operationId'], row['id'])
+        self.assertEqual(linked['mergeLink']['createdAt'], row['createdAt'])
         original = self.bridge._session_store.load(linked['id']).meta_dict()
         self.assertNotIn('mergeLink', original)
         orphan = self.bridge._merge_session_links([original])[0]

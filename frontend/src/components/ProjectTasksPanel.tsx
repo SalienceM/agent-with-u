@@ -123,8 +123,8 @@ export const ProjectTasksPanel: React.FC<Props> = ({ session, executor, backendI
             else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first?.focus(); }
           }
         }}>
-        <header style={workflowHeaderStyle}><strong style={{ flex: 1 }}>分支副本</strong>
-          <WorkflowButton tone="quiet" aria-pressed={mode === 'tasks'} onClick={() => setMode('tasks')}>副本</WorkflowButton><WorkflowButton tone="quiet" aria-pressed={mode === 'merge'} onClick={() => setMode('merge')}>{mergeTarget ? '合并到主 Session' : '合并记录'}</WorkflowButton>
+        <header style={workflowHeaderStyle}><strong style={{ flex: 1, fontWeight: 600, whiteSpace: 'nowrap' }}>分支与合并</strong>
+          <WorkflowButton tone="quiet" aria-pressed={mode === 'tasks'} onClick={() => setMode('tasks')}>副本</WorkflowButton><WorkflowButton tone="quiet" aria-label={mergeTarget ? '合并与同步' : '合并记录'} title={mergeTarget ? '合并与同步' : '合并记录'} aria-pressed={mode === 'merge'} onClick={() => setMode('merge')}>合并</WorkflowButton>
           <WorkflowButton tone="quiet" aria-pressed={mode === 'graph'} onClick={() => setMode('graph')}>分支图</WorkflowButton>
           {mode === 'tasks' && <>{canCreate && <WorkflowButton tone="primary" icon="plus" disabled={busy} onClick={newTask}>新建分支副本</WorkflowButton>}
           <WorkflowButton onClick={() => { setRevision(n => n + 1); setReadNonce(n => n + 1); }}>核对副本状态</WorkflowButton></>}
@@ -141,8 +141,8 @@ export const ProjectTasksPanel: React.FC<Props> = ({ session, executor, backendI
           </nav>
           <section style={{ flex: 1, minWidth: 0, overflow: 'auto', padding: 20 }}>
             {editing && repo ? <div style={{ display: 'grid', gap: 10 }}>
-              <p>从当前 Git 分支 {repo.branch || repo.head.slice(0, 12)} 派生新分支和独立目录，创建一个普通子 Session，挂在主 Session 下。创建成功后直接进入对话，也可合并回主 Session。默认带入当前项目修改、新文件和项目 Skills，继承主 Session 配置；聊天线程独立，子 Session 不能再次派生。</p>
-              <p>其他 Git 忽略文件（含依赖、缓存、构建产物）不复制；队列、定时任务及单次授权不复制。</p>
+              <p style={{ margin: 0, color: 'var(--theme-text-muted)' }}>从 {repo.branch || repo.head.slice(0, 12)} 创建独立分支与目录，继承当前配置。</p>
+              <details><summary>复制范围</summary><p>默认带入当前修改、新文件和项目 Skills。依赖、缓存、构建产物等其他 Git 忽略文件不复制；队列、定时任务及单次授权不复制。聊天线程独立，副本不能再次派生。</p></details>
               <label>副本名称<input style={field} value={config.title} onChange={e => setConfig(old => ({ ...old, title: e.target.value }))} /></label>
               <label>初始需求<textarea rows={4} style={field} value={config.goal} onChange={e => setConfig(old => ({ ...old, goal: e.target.value }))} /></label>
               <label>执行 Backend<select style={field} value={config.backendId} onChange={e => setConfig(old => ({ ...old, backendId: e.target.value, runtime: {} }))}>{backends.filter(row => row.enabled !== false).map(row => <option key={row.id} value={row.id}>{row.label || row.id}</option>)}</select></label>

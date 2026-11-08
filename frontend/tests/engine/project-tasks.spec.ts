@@ -13,7 +13,7 @@ async function mount(page: Page, width = 1200, sidebar = false, integration = fa
   await page.evaluate(async ({ sidebar, integration }) => {
     const { React, createRoot, ProjectTasksPanel, Sidebar, ChatInput, api } = await import('/tests/engine/chat-kit-feedback-harness.ts');
     const f = { plans: [] as any[], created: [] as any[], started: [] as any[], opened: [] as string[], row: null as any, callbacks: new Set<any>(), fail: false, inspect: 0,
-      nodes: [] as any[], merges: [] as any[], actions: [] as any[], mergeRow: null as any, activeSession: 'parent', render: () => {}, discarded: [] as any[], failDiscard: false };
+      nodes: [] as any[], merges: [] as any[], actions: [] as any[], mergeRow: null as any, activeSession: 'parent', render: () => {}, discarded: [] as any[], failDiscard: false, sessions: [] as any[], mergeCallbacks: new Set<any>() };
     const repo = { root: 'C:/fixture', commonDir: 'C:/fixture/.git', repositoryId: 'repo', head: 'a'.repeat(40), branch: 'main', fingerprint: 'source', dirty: [
       { path: 'same.txt', status: ' M', sha256: 'sha', bytes: 5, blocked: '' }, { path: '.env', status: '??', sha256: '', bytes: 5, blocked: '凭据路径' }] };
     api.taskWorkspaceInspect = async () => { f.inspect++; return { ...repo, status: 'ready', notice: '', defaults: {
@@ -35,10 +35,12 @@ async function mount(page: Page, width = 1200, sidebar = false, integration = fa
     api.followupSuggestionSettings = async () => ({ version: 1, enabled: false });
     const backends = [{ id: 'fake', type: 'openai-compatible', label: 'Fake' }];
     api.getBackends = async (node) => { f.nodes.push(node); return backends; };
-    api.listSessions = async () => [{ id: 'parent', title: '主项目', workingDir: 'C:/fixture', backendId: 'fake', updatedAt: 1, execKey: 'relay:fixture', execLabel: '测试节点', pinned: true },
+    f.sessions = [{ id: 'parent', title: '主项目', workingDir: 'C:/fixture', backendId: 'fake', updatedAt: 1, execKey: 'relay:fixture', execLabel: '测试节点', pinned: true },
       { id: 'child', title: '功能副本', workingDir: 'C:/child', backendId: 'fake', updatedAt: 2, execKey: 'relay:fixture', execLabel: '测试节点', relationKind: 'task', parentSessionId: 'parent', workspaceId: 'workspace-child' },
       ...(integration ? [{ id: 'integration', title: '整合测试空间', workingDir: 'C:/integration', backendId: 'fake', updatedAt: 3, execKey: 'relay:fixture', relationKind: 'integration', parentSessionId: 'parent', workspaceId: 'integration',
         mergeLink: { operationId: 'op', originSessionId: 'child', sourceSessionId: 'child', targetSessionId: 'parent', status: 'conflict' } }] : [])];
+    api.listSessions = async () => f.sessions;
+    api.onProjectMergeUpdated = cb => { f.mergeCallbacks.add(cb); return () => { f.mergeCallbacks.delete(cb); }; };
     api.projectMergeStatus = async () => f.mergeRow;
     api.projectMergeCapabilities = async () => ({ mergeWorkflow: 0 });
     api.onExecutorConnectionStatus = (_e, callback) => { callback(true); return () => {}; };
@@ -210,7 +212,7 @@ test('integration notice opens read-only history without starting a model', asyn
 
 test('sidebar shows merge handling indicator while integration stays searchable and out of copy count', async ({ page }) => {
   await mount(page, 390, true, true);
-  await expect(page.getByRole('button', { name: '主项目 的合并记录' })).toContainText('需处理');
+  await expect(page.getByRole('button', { name: '主项目 的合并记录' })).toContainText('待解冲突');
   const toggle = page.getByRole('button', { name: '展开 主项目 的子 Session' });
   await expect(toggle).toHaveAttribute('title', /1 个子 Session/);
   await toggle.click();
@@ -221,6 +223,56 @@ test('sidebar shows merge handling indicator while integration stays searchable 
   await page.evaluate(() => { const f = (window as any).taskFixture; f.activeSession = 'integration'; f.render(); });
   await expect(page.locator('[aria-haspopup="menu"]').filter({ hasText: '整合测试空间' })).toBeVisible();
   expect(await page.evaluate(() => (window as any).taskFixture.started)).toEqual([]);
+});
+
+test('sidebar uses a single branch entry and opens the exact actionable record', async ({ page }, testInfo) => {
+  await mount(page, 1200, true, true);
+  await page.evaluate(async () => {
+    const { api } = await import('/tests/engine/chat-kit-feedback-harness.ts');
+    const f = (window as any).taskFixture;
+    await api.projectMergePreview('child', 'relay:fixture', 'child', 'parent', 'fixture');
+    f.mergeRow.id = 'op'; f.mergeRow.status = 'conflict'; f.merges = []; f.reads = [];
+    api.projectMergeCapabilities = async () => ({ mergeWorkflow: 1 });
+    api.projectMergeOperations = async () => ({ items: [{ ...f.mergeRow, originSessionId: 'child' }], nextOffset: null });
+    api.projectMergeInspect = async (...args) => { f.reads.push(args); return f.mergeRow; };
+  });
+  await page.getByRole('button', { name: '主项目 的合并记录' }).click();
+  await expect(page.getByRole('button', { name: '返回原合并入口' })).toBeVisible();
+  expect(await page.evaluate(() => (window as any).taskFixture.reads[0])).toEqual(['parent', 'relay:fixture', 'op']);
+  await page.getByRole('button', { name: '返回对话' }).click();
+  await page.evaluate(() => {
+    const f = (window as any).taskFixture;
+    f.sessions.find((s: any) => s.id === 'integration').mergeLink.status = 'succeeded';
+    f.mergeCallbacks.forEach((cb: any) => cb({ id: 'op', revision: 2 }, 'relay:fixture'));
+  });
+  await expect(page.getByRole('button', { name: '主项目 的合并记录' })).toHaveCount(0);
+  await page.locator('[aria-haspopup="menu"]').filter({ hasText: '主项目' }).click({ button: 'right' });
+  await expect(page.getByRole('menuitem', { name: '分支与合并', exact: true })).toHaveCount(1);
+  await expect(page.getByRole('menuitem', { name: '分支副本与合并记录', exact: true })).toHaveCount(0);
+  await expect(page.getByRole('menuitem', { name: '查看合并记录', exact: true })).toHaveCount(0);
+  await page.screenshot({ path: testInfo.outputPath('single-branch-menu.png'), fullPage: true, animations: 'disabled' });
+  expect(await page.evaluate(() => ({ merges: (window as any).taskFixture.merges, actions: (window as any).taskFixture.actions }))).toEqual({ merges: [], actions: [] });
+});
+
+test('historic failures do not stay pending; running and unknown records remain visible', async ({ page }) => {
+  await mount(page);
+  const result = await page.evaluate(async () => {
+    const { mergeAttention } = await import('/src/utils/mergeAttention.ts');
+    const row = (id: string, status: string, createdAt: number, reverse = false) => ({ id, execKey: 'node', mergeLink: {
+      operationId: id, originSessionId: 'child', sourceSessionId: reverse ? 'main' : 'child',
+      targetSessionId: reverse ? 'child' : 'main', status, createdAt } });
+    const done = row('new', 'succeeded', 2, true);
+    const select = (rows: any[], stream = new Set<string>()) => mergeAttention(rows, 'main', 'node', stream)?.link.operationId || '';
+    return {
+      oldConflict: select([row('old', 'conflict', 1), done]), error: select([row('old', 'error', 1)]),
+      unknown: select([row('old', 'unknown', 1), done]), running: select([row('old', 'applying', 1), done]),
+      stream: select([row('old', 'candidate', 1), done], new Set(['old'])),
+      foreign: select([{ ...row('foreign', 'unknown', 1), execKey: 'other' }, done]),
+      differentPair: select([row('old', 'conflict', 1), { ...done, mergeLink: { ...done.mergeLink, targetSessionId: 'another-child' } }]),
+      legacy: select([row('legacy', 'conflict', 0), done]),
+    };
+  });
+  expect(result).toEqual({ oldConflict: '', error: '', unknown: 'old', running: 'old', stream: 'old', foreign: '', differentPair: 'old', legacy: 'legacy' });
 });
 
 for (const width of [1300, 390]) test(`task preview freezes selection; explicit create then separate start (${width}px)`, async ({ page }) => {

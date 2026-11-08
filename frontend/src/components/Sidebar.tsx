@@ -2,6 +2,7 @@ import React, { useEffect, useState, useCallback, memo, useRef, useMemo, useLayo
 import { api, getHomeExecKey, isTauri, onExecStatus, onCurrentUserChanged } from '../api';
 import { FileTreePanel } from './FileTreePanel';
 import type { AttentionContext } from '../utils/attentionContext';
+import { mergeAttention } from '../utils/mergeAttention';
 import type { FileFocusRequest } from '../utils/fileFocus';
 import { AppModalPortal } from './AppModalPortal';
 import { ActivityBar } from './WorkbenchNavigation';
@@ -171,6 +172,7 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
       refresh();
     }, delay);
   }, [refresh]);
+  useEffect(() => api.onProjectMergeUpdated(() => scheduleRefresh()), [scheduleRefresh]);
 
   // ★ 能力绑定
   const loadAbilityPicker = useCallback(async (session: Session) => {
@@ -1041,10 +1043,7 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
                 const isRunning = streamingSessions.has(s.id);
                 const isCompleted = !isRunning && completedSessions.has(s.id);
                 const isActive = s.id === activeSessionId;
-                const merges = sessions.filter(item => item.mergeLink && (item.execKey || 'local') === (s.execKey || 'local')
-                  && [item.mergeLink.sourceSessionId, item.mergeLink.targetSessionId].includes(s.id));
-                const mergeActive = merges.some(item => streamingSessions.has(item.id) || ['preparing', 'applying'].includes(item.mergeLink!.status));
-                const mergePending = merges.some(item => !['succeeded', 'cancelled'].includes(item.mergeLink!.status));
+                const attention = mergeAttention(sessions, s.id, s.execKey || 'local', streamingSessions);
                 const isContextTarget = sessionContextMenu?.session.id === s.id;
                 const familyKey = `${s.execKey || 'local'}:${s.id}`;
                 const familyExpanded = !!normalizedSearch || expandedSessionFamilies.has(familyKey);
@@ -1087,9 +1086,9 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
                     {familyExpanded ? '▾' : '▸'}{children.length}
                   </button>}
                   {depth > 0 && <span title={s.relationKind === 'integration' ? '独立合并空间' : '子 Session · 独立 Git 分支与目录'} style={{ fontSize: 11, color: s.relationKind === 'integration' ? '#d97706' : '#8b5cf6' }}>{s.relationKind === 'integration' ? '⇄' : '⑂'}</span>}
-                  {!!merges.length && <button type="button" title="打开关联的合并记录与处理空间" aria-label={`${s.title} 的合并记录`}
+                  {attention && <button type="button" title={`${attention.label} · 点击查看对应合并${attention.count > 1 ? `，另有 ${attention.count - 1} 条` : ''}`} aria-label={`${s.title} 的合并记录`}
                     style={{ border: 0, background: 'transparent', color: 'var(--theme-text-muted)', cursor: 'pointer', fontSize: 11, flexShrink: 0 }}
-                    onClick={event => { event.stopPropagation(); setBranchDialog({ session: s, action: 'merge' }); }}>⇄ {mergeActive ? '处理中' : mergePending ? '需处理' : '历史'}</button>}
+                    onClick={event => { event.stopPropagation(); setBranchDialog({ session: { ...s, mergeLink: attention.link }, action: 'merge' }); }}>⇄ {attention.label}{attention.count > 1 ? ` · ${attention.count}` : ''}</button>}
                   {s.relationKind === 'integration' && <span style={{ fontSize: 10 }}>{s.mergeLink ? '处理空间' : '整合空间（待关联）'}</span>}
                   {isRunning && (
                     <span style={{
@@ -1202,10 +1201,10 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
             <button type="button" role="menuitem" aria-label="合并到主 Session" className="awu-session-context-item" onClick={() => { setBranchDialog({ session: sessionContextMenu.session, action: 'merge' }); setSessionContextMenu(null); }}><span aria-hidden="true" className="awu-session-context-icon">⇄</span><span>合并到主 Session</span></button>
             <button type="button" role="menuitem" className="awu-session-context-item" onClick={() => { const parent = sessionContextMenu.session.parentSessionId!; setSessionContextMenu(null); onSelectSession(parent); }}>打开主 Session</button>
           </>}
-          {sessionContextMenu.session.codexConnectionMode !== 'ssh' && sessionContextMenu.session.relationKind !== 'review' && <button type="button" role="menuitem" className="awu-session-context-item"
-            onClick={() => { setBranchDialog({ session: sessionContextMenu.session, action: 'manage' }); setSessionContextMenu(null); }}>分支副本与合并记录</button>}
-          {sessionContextMenu.session.relationKind !== 'review' && <button type="button" role="menuitem" className="awu-session-context-item"
-            onClick={() => { setBranchDialog({ session: sessionContextMenu.session, action: 'merge' }); setSessionContextMenu(null); }}>{sessionContextMenu.session.relationKind === 'integration' ? '返回合并记录' : '查看合并记录'}</button>}
+          {!['review', 'task', 'integration'].includes(sessionContextMenu.session.relationKind || '') && <button type="button" role="menuitem" className="awu-session-context-item"
+            onClick={() => { setBranchDialog({ session: sessionContextMenu.session, action: sessionContextMenu.session.codexConnectionMode === 'ssh' ? 'merge' : 'manage' }); setSessionContextMenu(null); }}><span aria-hidden="true" className="awu-session-context-icon">⑂</span><span>分支与合并</span></button>}
+          {sessionContextMenu.session.relationKind === 'integration' && <button type="button" role="menuitem" className="awu-session-context-item"
+            onClick={() => { setBranchDialog({ session: sessionContextMenu.session, action: 'merge' }); setSessionContextMenu(null); }}>返回合并记录</button>}
           {onRequestViewMode && <>
             {(['chat', 'engine'] as const).map(mode => <button key={mode} type="button" className="awu-session-context-item" role="menuitem"
               onClick={() => { const target = sessionContextMenu.session; setSessionContextMenu(null); onRequestViewMode(target.id, mode); }}>

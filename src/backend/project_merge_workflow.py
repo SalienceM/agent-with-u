@@ -140,7 +140,8 @@ class ProjectMergeWorkflow(ProjectBranchGraph):
                             and all(sid in by_id for sid in (row['sourceSessionId'], row['source']['sessionId'], row['target']['sessionId']))
                             and canonical_path(row['integration']['root']) == canonical_path(meta.get('workingDir', ''))):
                         value['mergeLink'] = {'operationId': row['id'], 'originSessionId': row['sourceSessionId'],
-                            'sourceSessionId': row['source']['sessionId'], 'targetSessionId': row['target']['sessionId'], 'status': row['status']}
+                            'sourceSessionId': row['source']['sessionId'], 'targetSessionId': row['target']['sessionId'],
+                            'status': row['status'], 'createdAt': row.get('createdAt')}
                 except (ValueError, OSError, KeyError, TypeError):
                     # 旧/缺失关联不阻断整个 Session 列表，也不隐藏待恢复空间。
                     pass

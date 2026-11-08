@@ -2146,7 +2146,13 @@ ancestors. Integration Sessions belong under the target's main Session, never a 
 Their verified `mergeLink` is an ephemeral list projection, not a persisted Session relation.
 `projectTaskSessions` hides linked integration rows from ordinary copies; active/pinned rows,
 search results and missing/orphan links remain reachable. They never count as ordinary copies.
-Source/target entries expose merge activity/history; integration chat exposes “返回合并记录”.
+Source/target entries show concrete merge states and open the exact operation. `mergeAttention`
+uses the newest created record per origin and Session pair (both directions) for ordinary reminders;
+running, applying and unknown records remain visible regardless of newer history. Missing timestamps
+never imply an ordering. Failed/finished history stays readable without becoming a permanent pending
+badge; this display rule never cancels or settles operations. `projectMergeUpdated` refreshes the
+Sidebar through its existing debounce. Main menus use one “分支与合并” entry, child menus retain
+“合并到主 Session”, and integration chat exposes “返回合并记录”.
 New copy forms use `inheritSource=true` and `snapshotMode=current`: explicit allowlisted runtime
 and ability preferences are deep-copied and frozen, with ordinary permission shown in the plan.
 Current tracked changes/deletions and untracked project files become the private-index baseline;
@@ -2189,6 +2195,10 @@ four-step slogan. Dirty file lists start collapsed. The change count describes c
 differences, not uncommitted files. Explicit re-preview preserves the source/target IDs and
 creates only a new plan; related origins and unknown outcomes cannot use it to bypass guards.
 Branch dialogs use the opaque `--theme-panel-solid` surface even with wallpaper enabled.
+Completed merges show one result card and one continuation action. Current workspace diagnostics
+do not turn a completed receipt into an unresolved merge. Compact Git/test states remain visible;
+full plans, paths, evidence and final receipts expand under “变更与验证详情”, with history separate.
+The card's refresh icon retains the accessible name “核对原操作”.
 Git verification and project tests have separate displays. Only bounded executor evidence with
 candidate, result, time and log reference is displayed; absent evidence is unknown, changed/dirty
 candidates make old evidence stale. No test runner or chat-text acceptance inference is added.
