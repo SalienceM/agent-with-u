@@ -64,7 +64,7 @@ const newDraft = (): Draft => ({
 });
 
 const statusMeta: Record<string, { label: string; color: string }> = {
-  queued: { label: '排队', color: '#8b949e' },
+  queued: { label: '等待启动', color: '#8b949e' },
   running: { label: '执行中', color: '#d29922' },
   waiting_client: { label: '等待客户端', color: '#d2a8ff' },
   waiting_approval: { label: '等待确认', color: '#f0b429' },
@@ -869,6 +869,10 @@ export const WorkspaceKitsPanel: React.FC<Props> = ({ sessionId, open, onClose, 
                           </div>
                         </div>
                       </div>
+                      {run?.error && ['error', 'failed'].includes(run.status) && <div title={run.error} style={{
+                        color: '#ff7b72', fontSize: 12, marginTop: 8, overflowWrap: 'anywhere',
+                        display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical', overflow: 'hidden',
+                      }}>{run.error}</div>}
                       <div style={compactKitFooter}>
                         <KitVersionPicker
                           sessionId={sessionId}

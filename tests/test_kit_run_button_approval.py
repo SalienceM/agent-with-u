@@ -120,6 +120,11 @@ class ButtonPublicationTests(unittest.IsolatedAsyncioTestCase):
     spec = publication.PublishedLocalBuildTests.spec
 
     async def test_build_publish_install_run_without_second_confirmation(self):
+        # 真实按钮授权路径必须允许正常增长的 Kit 历史，不能受安装 journal 的 1 MiB 限制。
+        state = self.bridge._kit_get(self.session.id)
+        for index in range(10):
+            state.runs.append(KitRun(id=f"history-{index}", kit_id=self.build.id, session_id=self.session.id,
+                                    status="succeeded", stdout="history\n" * 25000))
         created = json.loads(self.bridge._rpc_kitCreate(self.session.id, json.dumps(self.spec())))
         kit_id = created['kit']['id']
         preview = json.loads(self.bridge._rpc_kitRunPreview(self.session.id, kit_id))

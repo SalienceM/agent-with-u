@@ -1309,6 +1309,13 @@ Workspace Kits are Session-level standard accessories stored separately in
   after an executor exception/restart. Client-side commands are registered by `runId`;
   the desktop that owns the process observes the same state update and terminates its
   local process tree even if the Kits panel is folded or another client pressed Stop.
+- Kit `queued` means waiting for its executor coroutine to start, not waiting for chat
+  completion. Run-button approval is durably saved before launching the worker. Kit history
+  uses its own atomic writer and retention rules, never the install journal's 1 MiB record
+  limit. Save/scheduling/pre-start worker failures end as explicit errors. Reads reconcile
+  only orphan queued runs with no start/step/result evidence or live worker/process/terminal;
+  they never replay a run or release running, approval, installation or unknown-exit states.
+  Startup regressions use temporary stores and fake workers/publication/installation only.
 - “remote Session” by itself means the already-connected Session executor, not an SSH
   destination. Natural-language compilation maps local-file-to-Session requests to the
   built-in `file_push` primitive and does not invent hosts or credentials. The explicit

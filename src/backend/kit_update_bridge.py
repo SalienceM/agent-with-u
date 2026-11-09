@@ -296,7 +296,7 @@ class KitUpdateBridge:
             if done.cancelled():
                 self._update_manager.release_kit(runtime["installRequestId"], runtime["identity"])
         task.add_done_callback(settled)
-        self._kit_track_task(run.id, task)
+        self._kit_track_task(session_id, run.id, task)
         return json.dumps({"status": "accepted", "run": run.to_dict()}, ensure_ascii=False)
 
     def _confirm_kit_update(self, state: Any, session: Any, run: Any, step: Any,

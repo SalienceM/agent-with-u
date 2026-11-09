@@ -26,7 +26,7 @@ import threading
 import time
 from dataclasses import replace
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Coroutine, Optional
 
 import websockets
 import websockets.exceptions
@@ -9189,6 +9189,20 @@ class BridgeWS(SessionCollaborationBridge, HarnessImageBridge, KitUpdateBridge, 
             if interrupted:
                 self._kit_store.save(state)
             self._kit_states[session_id] = state
+        # queued 不是等待聊天/其他 Kit 的队列：它只表示尚未进入执行协程。
+        # 重启或提交中途失败后，仅修复能证明从未启动且没有执行者的记录。
+        recovered = False
+        for run in state.runs:
+            task = self._kit_tasks.get(run.id)
+            if (self._kit_run_never_started(run) and (task is None or task.done())
+                    and run.id not in self._kit_processes
+                    and not any(terminal.get("session_id") == session_id
+                                and terminal.get("kit_id") == run.kit_id
+                                for terminal in self._kit_terminals.values())):
+                self._kit_fail_start(run, "执行端未启动此任务，已结束失效的等待状态；请重新运行")
+                recovered = True
+        if recovered:
+            self._kit_save(state)
         if self._kit_reconcile_chains(state):
             self._kit_store.save(state)
         return state
@@ -9200,10 +9214,13 @@ class BridgeWS(SessionCollaborationBridge, HarnessImageBridge, KitUpdateBridge, 
         protected.update(key[len(prefix):] for key in self._kit_optimization_running if key.startswith(prefix))
         return state.reconcile_chat_chains(protected)
 
-    def _kit_save(self, state: WorkspaceKitState, *, emit: bool = True) -> None:
+    def _kit_save(self, state: WorkspaceKitState, *, emit: bool = True, durable: bool = False) -> None:
         self._kit_states[state.session_id] = state
         self._kit_reconcile_chains(state)
-        self._kit_store.save(state)
+        if durable:
+            self._kit_store.save_durable(state)
+        else:
+            self._kit_store.save(state)
         try:
             self._sync_kit_delegations(state)
         except Exception:
@@ -11464,7 +11481,7 @@ Kit 版本账本（版本属于 Kit，不属于 AI）：
                 self._run_workspace_kit(session_id, run.kit_id, run.id),
                 name=f"workspace-kit-{run.id}-capability-resume",
             )
-            self._kit_track_task(run.id, task)
+            self._kit_track_task(session_id, run.id, task)
         return json.dumps({
             "status": "ok", "decision": "approved", "run": run.to_dict(),
         }, ensure_ascii=False)
@@ -11578,13 +11595,72 @@ Kit 版本账本（版本属于 Kit，不属于 AI）：
             except (ProcessLookupError, PermissionError):
                 pass
 
-    def _kit_track_task(self, run_id: str, task: asyncio.Task) -> None:
-        """登记任务并覆盖“创建后、协程起跑前就被取消”的清理盲区。"""
+    @staticmethod
+    def _kit_run_never_started(run: KitRun) -> bool:
+        plans = run.button_approval.get("plans") or {}
+        if not isinstance(plans, dict):
+            return False
+        return (run.status == "queued" and run.started_at is None and run.ended_at is None
+                and run.current_step == 0 and run.verdict == "pending"
+                and run.exit_code is None and not (run.stdout or run.stderr or run.assertions or run.artifact_ids)
+                and not any(plans.values())
+                and all(step.status == "pending" and step.started_at is None and step.ended_at is None
+                        and step.exit_code is None and not (step.stdout or step.stderr or step.assertions)
+                        and not any(step.config.get(key) for key in (
+                            "capabilityRuntime", "buildReceipt", "_transfer", "_clientClaimedAt"))
+                        for step in run.steps))
+
+    @staticmethod
+    def _kit_fail_start(run: KitRun, message: str) -> None:
+        run.status = run.verdict = "error"
+        run.error = message
+        run.ended_at = time.time()
+        for step in run.steps:
+            step.status = "skipped"
+        if run.button_approval:
+            run.button_approval["invalidated"] = message
+
+    def _kit_launch_run(self, state: WorkspaceKitState, run: KitRun,
+                        runner: Coroutine[Any, Any, None]) -> dict:
+        """先保存本次授权，再启动；保存/调度失败不能遗留永久 queued。"""
+        try:
+            self._kit_save(state, durable=bool(run.button_approval))
+            task = asyncio.create_task(runner, name=f"workspace-kit-{run.id}")
+        except Exception as error:
+            runner.close()
+            self._kit_fail_start(run, f"任务未启动：{self._redact_kit_secret_text(run.id, error)}；请重新运行")
+            try:
+                self._kit_save(state)
+            except Exception:
+                # 磁盘持续不可写时内存仍为失败；重启读取旧 queued 也不会自动执行。
+                print(f"[WorkspaceKit] failed to persist startup failure for {run.id}", file=sys.stderr, flush=True)
+            self._kit_run_secret_env.pop(run.id, None)
+            return {"status": "error", "message": run.error, "run": run.to_dict()}
+        self._kit_track_task(state.session_id, run.id, task)
+        return {"status": "ok", "run": run.to_dict()}
+
+    def _kit_track_task(self, session_id: str, run_id: str, task: asyncio.Task) -> None:
+        """登记任务，收口首次调度前的异常/取消，不覆盖已执行或交接未知状态。"""
         self._kit_tasks[run_id] = task
 
         def _forget(completed: asyncio.Task) -> None:
+            error = None if completed.cancelled() else completed.exception()
+            if error is not None:
+                print(f"[WorkspaceKit] worker {run_id} failed: {self._redact_kit_secret_text(run_id, error)}",
+                      file=sys.stderr, flush=True)
+            if self._kit_tasks.get(run_id) not in (None, completed):
+                return
             if self._kit_tasks.get(run_id) is completed:
                 self._kit_tasks.pop(run_id, None)
+            state = self._kit_states.get(session_id)
+            run = next((item for item in state.runs if item.id == run_id), None) if state else None
+            if run and self._kit_run_never_started(run) and run_id not in self._kit_processes:
+                reason = self._redact_kit_secret_text(run_id, error) if error else "执行任务在启动前结束"
+                self._kit_fail_start(run, f"任务未启动：{reason}；请重新运行")
+                try:
+                    self._kit_save(state)
+                except Exception:
+                    print(f"[WorkspaceKit] failed to persist startup failure for {run_id}", file=sys.stderr, flush=True)
             self._kit_cancel_requests.discard(run_id)
             self._kit_run_secret_env.pop(run_id, None)
 
@@ -11673,7 +11749,7 @@ Kit 版本账本（版本属于 Kit，不属于 AI）：
             self._run_workspace_kit(session_id, run.kit_id, run.id),
             name=f"workspace-kit-{run.id}-resume",
         )
-        self._kit_track_task(run.id, task)
+        self._kit_track_task(session_id, run.id, task)
         self._kit_save(state)
         return json.dumps({"status": "ok", "run": run.to_dict()}, ensure_ascii=False)
 
@@ -12052,6 +12128,8 @@ Kit 版本账本（版本属于 Kit，不属于 AI）：
                                 key: '••••••' if key in grant.get('secretInputs', []) else value
                                 for key, value in supplied_inputs.items()})):
                         return {'status': 'error', 'message': '运行确认与原请求不匹配'}
+                    if previous.status == 'error' and previous.started_at is None:
+                        return {'status': 'error', 'message': previous.error, 'run': previous.to_dict()}
                     return {'status': 'ok', 'run': previous.to_dict()}
         kit = self._kit_find(state, kit_id)
         if not kit:
@@ -12122,18 +12200,12 @@ Kit 版本账本（版本属于 Kit，不属于 AI）：
         state.runs.append(run)
         kit.last_run_id = run.id
         kit.updated_at = time.time()
-        self._kit_save(state)
-        if button_approval:
-            self._kit_store.save_durable(state)
+        result = self._kit_launch_run(state, run, self._run_workspace_kit(
+            session_id, kit.id, run.id, command_override=command_override,
+        ))
+        if button_approval and result["status"] == "ok":
             getattr(self, '_kit_run_previews', {}).pop(approval_preview_id, None)
-        task = asyncio.create_task(
-            self._run_workspace_kit(
-                session_id, kit.id, run.id, command_override=command_override,
-            ),
-            name=f"workspace-kit-{run.id}",
-        )
-        self._kit_track_task(run.id, task)
-        return {"status": "ok", "run": run.to_dict()}
+        return result
 
     def _redact_kit_secret_text(self, run_id: str, value: object) -> str:
         """Remove transient Kit secrets from child output and error messages."""
@@ -12169,13 +12241,9 @@ Kit 版本账本（版本属于 Kit，不属于 AI）：
         state.runs.append(run)
         kit.last_run_id = run.id
         kit.updated_at = time.time()
-        self._kit_save(state)
-        task = asyncio.create_task(
-            self._run_workspace_terminal_command(session_id, kit.id, run.id),
-            name=f"workspace-kit-terminal-{run.id}",
-        )
-        self._kit_track_task(run.id, task)
-        return {"status": "ok", "run": run.to_dict()}
+        return self._kit_launch_run(state, run, self._run_workspace_terminal_command(
+            session_id, kit.id, run.id,
+        ))
 
     def _kit_working_dir(self, session: Session, kit: WorkspaceKit) -> Path:
         root = Path(session.working_dir or self._resolve_working_dir("")).expanduser().resolve()

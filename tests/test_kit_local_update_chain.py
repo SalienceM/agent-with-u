@@ -333,7 +333,7 @@ class LocalUpdateChainTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.Event().wait()
         with patch.object(self.bridge._update_manager, "stage_published", side_effect=slow):
             task = asyncio.create_task(self.bridge._run_kit_update_step(self.bridge._kit_get(self.session.id), self.session, run, step))
-            self.bridge._kit_track_task(run.id, task)
+            self.bridge._kit_track_task(self.session.id, run.id, task)
             await started.wait()
             self.bridge._rpc_kitCancel(self.session.id, run.id)
             await asyncio.gather(task, return_exceptions=True)

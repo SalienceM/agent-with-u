@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import os
 import re
 import threading
 import time
@@ -953,19 +954,34 @@ class WorkspaceKitStore:
         return result
 
     def save(self, state: WorkspaceKitState) -> None:
-        state.updated_at = _now()
-        state.compact()
-        payload = json.dumps(state.to_dict(), ensure_ascii=False, indent=2)
-        target = self._path(state.session_id)
-        tmp = target.with_suffix(".json.tmp")
-        with self._lock:
-            tmp.write_text(payload, encoding="utf-8")
-            tmp.replace(target)
+        self._save(state, durable=False)
 
     def save_durable(self, state: WorkspaceKitState) -> None:
-        from .kit_update_journal import durable_json
+        # Kit 历史包含完整日志与 DSL，不能套用单条安装责任记录的 1 MiB 限制。
+        # 与普通保存使用相同的历史保留规则，额外保证授权在启动前刷盘。
+        self._save(state, durable=True)
+
+    def _save(self, state: WorkspaceKitState, *, durable: bool) -> None:
         with self._lock:
-            durable_json(self._path(state.session_id), state.to_dict())
+            state.updated_at = _now()
+            state.compact()
+            target = self._path(state.session_id)
+            temporary = target.with_name(f"{target.name}.{uuid.uuid4().hex}.tmp")
+            try:
+                with temporary.open("x", encoding="utf-8", newline="\n") as stream:
+                    json.dump(state.to_dict(), stream, ensure_ascii=False, indent=2)
+                    if durable:
+                        stream.flush()
+                        os.fsync(stream.fileno())
+                os.replace(temporary, target)
+                if durable and os.name != "nt":
+                    fd = os.open(target.parent, os.O_RDONLY)
+                    try:
+                        os.fsync(fd)
+                    finally:
+                        os.close(fd)
+            finally:
+                temporary.unlink(missing_ok=True)
 
     def delete(self, session_id: str) -> None:
         try:
