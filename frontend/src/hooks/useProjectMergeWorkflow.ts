@@ -149,6 +149,10 @@ export function useProjectMergeWorkflow(session: string, executor: string, fixed
     });
     const offActivity = api.onSessionUpdated(value => {
       if (value.execKey === executor && value.type === 'merge_activity' && value.sessionId === state.current.row?.integration?.sessionId) refresh();
+      if (value.execKey === executor && value.type === 'session_renamed'
+        && [state.current.row?.source.sessionId, state.current.row?.target.sessionId].includes(value.sessionId)) {
+        refresh(); void list().catch(() => {});
+      }
     });
     const offConnection = api.onExecutorConnectionStatus(executor, connected => {
       if (!valid()) return; setOnline(connected);

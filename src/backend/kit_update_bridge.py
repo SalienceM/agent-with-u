@@ -356,7 +356,17 @@ class KitUpdateBridge:
             pass
         record = journal.reconcile(request_id, record["identity"], desktop=desktop,
                                    backend=_current_release(), ready=desktop is not None)
+        if record["phase"] in HANDOFF_PHASES and desktop is not None:
+            try:
+                record = journal.retire_unlaunched(request_id, record["identity"],
+                    {"desktop": desktop, "backend": _current_release(), "ready": True})
+            except JournalError:
+                pass  # 已启动/未知助手仍受保护；缺失证据不解除屏障。
         identity = record["identity"]
+        # journal 是权威；Kit 历史缺失也不能遗留本进程的旧屏障。
+        if (record["phase"] in {"succeeded", "failed", "cancelled"}
+                and getattr(self, "_kit_update_barrier", "") == request_id):
+            self._kit_update_barrier = ""
         state = self._kit_get(identity["sessionId"])
         run = next((r for r in state.runs if r.id == identity["runId"]), None)
         step = next((s for s in run.steps if s.id == identity["stepId"]), None) if run else None
@@ -373,7 +383,6 @@ class KitUpdateBridge:
             run.verdict = "passed" if record["phase"] == "succeeded" else "failed"
             step.exit_code = 0 if record["phase"] == "succeeded" else 1
             step.error = run.error = "" if step.exit_code == 0 else record.get("message", "安装失败")
-            self._kit_update_barrier = ""
             self._update_manager._save_state({"phase": "installed" if step.exit_code == 0 else "error",
                                              "message": record.get("message", ""), "error": step.error})
         self._kit_save(state, emit=self._session_owner_id(identity["sessionId"]) == identity["ownerId"])

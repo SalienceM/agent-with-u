@@ -91,7 +91,7 @@ export const ProjectBranchGraph: React.FC<Props> = ({ session, executor, onOpenS
             <title>{node.hash}\n{node.message}\n{data.branches.filter(branch => branch.head === node.hash).map(branch => branch.branch).join(', ')}</title>
             <circle cx={node.x} cy={node.y} r={selected === node.hash ? 8 : 5} fill={colors[node.lane % colors.length]} stroke="var(--theme-text)" strokeWidth={selected === node.hash ? 2 : 0} />
             <text x={node.x} y={node.y + 22} textAnchor="middle" fill="var(--theme-text-muted)" fontSize={10}>{node.hash.slice(0, 7)}</text>
-            {!!heads.length && <text x={node.x} y={node.y - 16} textAnchor="middle" fill={colors[node.lane % colors.length]} fontSize={11}>{heads[0].main ? '主干' : heads[0].title.slice(0, 8)}{heads.length > 1 ? ` +${heads.length - 1}` : ''}</text>}
+            {!!heads.length && <text x={node.x} y={node.y - 16} textAnchor="middle" fill={colors[node.lane % colors.length]} fontSize={11}>{heads[0].main ? '主干' : (heads[0].title.split(' · ').pop() || heads[0].title).slice(-16)}{heads.length > 1 ? ` +${heads.length - 1}` : ''}</text>}
           </g>; })}
         </svg>
       </div>

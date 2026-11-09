@@ -1278,6 +1278,10 @@ Workspace Kits are Session-level standard accessories stored separately in
   本请求，确认后不能保证撤回，不杀安装器、不回滚；未知保持保护。有界恢复最多 13 次，
   180 秒未验收显示未知。首次协议部署使用原更新入口，构建时才写 kitUpdateProtocol=1。
   相关测试仅用隔离目录和 fake 发布/安装，不代表生产升级验收。见 `docs/kit-local-update-chain.md`。
+  手动安装后，同一已安装实例的新桌面进程与 Backend 完整版本核对且达到原目标，
+  可用 create-new 原子抢占原请求 launch 标记，关闭从未启动助手的旧请求并恢复操作。
+  原 Kit 保留 failed/recovery，不伪造安装回执或成功；已有 launch/claim/installed/result
+  证据或证据损坏仍保护。清理终态内存屏障按 requestId，不依赖 Kit 历史存在。
 - 独立「本机一键检查并更新」使用 `node.check_update_local`，只读执行设备更新中心的已配置源/通道，
   检查后冻结快照，选择和确认不重读 latest 换装。签名策略、SHA-256、设备身份、人工安装确认、
   忙闲/预留及重启验收沿用相同边界。完整身份一致才报告 `current`（检查成功，无安装）；离线/未知/
@@ -2215,6 +2219,14 @@ Completed merges show one result card and one continuation action. Current works
 do not turn a completed receipt into an unresolved merge. Compact Git/test states remain visible;
 full plans, paths, evidence and final receipts expand under “变更与验证详情”, with history separate.
 The card's refresh icon retains the accessible name “核对原操作”.
+Successful receipts are historical: their old target HEAD/file count/test evidence cannot assert
+that the current branch is synchronized. `workflow.comparison` reads current immutable tips with
+bounded Git counts and rechecks repository/HEAD/branch before returning; unknown remains unknown.
+The branch's new commits lead to “预览本轮合并到主干”; main-only commits lead to sync-back, preserving
+explicit preview plus independent Prepare/Apply. No open/read automatically previews or merges.
+Live Session titles are a separate display projection (`sides.title` / `displayTitle`), refreshed
+on rename; frozen names, plan fingerprint and receipts remain unchanged. Graph tip labels retain
+the distinct title suffix such as Bravo/Charlie rather than truncating their shared prefix.
 Git verification and project tests have separate displays. Only bounded executor evidence with
 candidate, result, time and log reference is displayed; absent evidence is unknown, changed/dirty
 candidates make old evidence stale. No test runner or chat-text acceptance inference is added.

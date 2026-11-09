@@ -254,6 +254,23 @@ mod tests {
         assert_eq!(fake.installs, 1);
         assert_eq!(fake.restarts, 1);
     }
+    #[test] fn retired_unlaunched_request_cannot_launch_from_late_notification() {
+        let fixture = Fixture::new();
+        let valid = validate(&fixture.root, &fixture.plan, None, Some(12)).unwrap();
+        let mut revoked = valid.binding.clone();
+        revoked["revoked"] = json!(true);
+        write(&valid.folder.join(format!("{}.launch.json", valid.request)), &revoked);
+        // Backend recovery can win after validate and before the shell's launch claim.
+        assert!(!claim_launch(&valid).unwrap());
+        let path = valid.folder.join(format!("{}.json", valid.request));
+        let mut record = read(&path).unwrap();
+        record["phase"] = json!("failed");
+        write(&path, &record);
+        let mut fake = Fake::default();
+        assert!(run(&fixture.root, &fixture.plan, &mut fake).is_err());
+        assert_eq!(fake.installs, 0);
+        assert_eq!(fake.restarts, 0);
+    }
     #[test] fn tampered_artifact_plan_instance_and_outside_path_fail() {
         let fixture = Fixture::new();
         assert!(validate(&fixture.root, &fixture.plan, None, Some(99)).is_err());

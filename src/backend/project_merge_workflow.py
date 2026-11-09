@@ -8,7 +8,22 @@ from typing import Any
 
 from .session_collaboration_store import CollaborationError, CollaborationScope
 from .task_git import TaskGit, canonical_path
-from .project_branch_graph import ProjectBranchGraph
+from .project_branch_graph import GraphGit, ProjectBranchGraph
+
+
+def compare_current_tips(source: dict, target: dict) -> dict:
+    """只读比较当前提交；旧成功回执不代表分支仍然同步。"""
+    if source['repositoryId'] != target['repositoryId']:
+        raise CollaborationError('当前双方不属于同一仓库')
+    deadline = time.monotonic() + 10
+    counts = GraphGit(source['root'], deadline).run(
+        'rev-list', '--left-right', '--count', source['head'] + '...' + target['head']).decode().split()
+    for saved in (source, target):
+        actual = GraphGit(saved['root'], deadline).repository()
+        if any(actual[key] != saved[key] for key in ('root', 'gitDir', 'commonDir', 'repositoryId', 'head', 'branch')):
+            raise CollaborationError('读取期间分支已变化，请刷新当前状态')
+    return {'state': 'known', 'sourceHead': source['head'], 'targetHead': target['head'],
+            'sourceAhead': int(counts[0]), 'targetAhead': int(counts[1])}
 
 
 class ProjectMergeWorkflow(ProjectBranchGraph):
@@ -35,6 +50,8 @@ class ProjectMergeWorkflow(ProjectBranchGraph):
             try:
                 for key in ('originSessionId', 'sourceSessionId', 'targetSessionId'):
                     self._require_session_access(row[key])
+                row['displayTitle'] = (self._collaboration_session(row['sourceSessionId']).title + ' → '
+                                       + self._collaboration_session(row['targetSessionId']).title)
             except (PermissionError, ValueError):
                 continue
             items.append(row)
@@ -51,6 +68,7 @@ class ProjectMergeWorkflow(ProjectBranchGraph):
     async def _merge_workflow_view(self, row: dict) -> dict:
         row = dict(row)
         sides: dict[str, dict] = {}
+        actuals: dict[str, dict] = {}
         diagnostics: list[dict] = []
         for side in ('source', 'target', 'integration'):
             saved = row.get(side)
@@ -71,8 +89,11 @@ class ProjectMergeWorkflow(ProjectBranchGraph):
                 dirty = [{**entry, 'index': entry['status'][0] not in {' ', '?'},
                           'worktree': entry['status'][1] not in {' ', '?'},
                           'untracked': entry['status'] == '??'} for entry in actual['dirty']]
-                item.update(state='known', dirty=dirty, activity=activity, fresh=fresh,
+                item.update(state='known', title=self._collaboration_session(saved['sessionId']).title,
+                            dirty=dirty, activity=activity, fresh=fresh,
                             head=actual['head'], branch=actual['branch'], fingerprint=actual['fingerprint'])
+                if side != 'integration' and all(actual[key] == saved.get(key) for key in ('repositoryId', 'branch')):
+                    actuals[side] = actual
                 if actual['dirty']:
                     diagnostics.append({'side': side, 'code': 'git_dirty', 'sessionId': saved['sessionId'],
                                         'root': saved['root'], 'paths': dirty, 'notice': '有 Git 未提交文件'})
@@ -95,6 +116,16 @@ class ProjectMergeWorkflow(ProjectBranchGraph):
                 diagnostics.append({'side': side, 'code': 'unknown', 'sessionId': saved['sessionId'] if permitted else '',
                                     'notice': item['notice']})
             sides[side] = item
+        comparison: dict[str, Any] = {'state': 'unknown', 'notice': '当前分支状态尚未核对'}
+        if row['status'] == 'succeeded' and all(side in actuals for side in ('source', 'target')):
+            try:
+                comparison = await asyncio.to_thread(compare_current_tips, actuals['source'], actuals['target'])
+                for side in ('source', 'target'):
+                    current = self._collaboration_session(row[side]['sessionId'])
+                    if canonical_path(current.working_dir) != actuals[side]['root']:
+                        raise CollaborationError('读取期间 Session 工作区已变化')
+            except (ValueError, OSError, PermissionError, RuntimeError) as error:
+                comparison = {'state': 'unknown', 'notice': '当前分支状态核对失败，请刷新'}
         candidate = row.get('candidate', '')
         integration = sides.get('integration', {})
         verified = (row['verification'].get('status') == 'git_verified' and bool(candidate)
@@ -120,7 +151,7 @@ class ProjectMergeWorkflow(ProjectBranchGraph):
         tests_state = ('failed' if any(t['state'] == 'failed' for t in tests) else
                        'stale' if any(t['state'] == 'stale' for t in tests) else 'passed' if tests else 'unknown')
         return {**row, 'workflow': {'version': 1, 'checkedAt': time.time(), 'sides': sides,
-                'diagnostics': diagnostics, 'gitVerified': bool(verified),
+                'diagnostics': diagnostics, 'gitVerified': bool(verified), 'comparison': comparison,
                 'canAutoVerify': row['status'] in {'candidate', 'conflict'} and integration.get('state') == 'known'
                     and not integration.get('activity') and not integration.get('dirty'),
                 'tests': {'state': tests_state, 'items': tests}}}

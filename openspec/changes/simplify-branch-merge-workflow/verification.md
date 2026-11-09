@@ -72,3 +72,17 @@
 - `node node_modules/typescript/bin/tsc --noEmit`、`npm run build` 通过，最终 Vite 构建 6.61 秒；保留已有 CJS、动静态导入和分块体积提示。`openspec validate simplify-branch-merge-workflow --strict`、`git -c core.safecrlf=false diff --check` 通过。
 
 本轮仅修改前端和相关说明，未更改后台历史、执行 Kit 或打包安装桌面程序。
+
+## 2026-11-09 Bravo / Charlie 持续开发状态
+
+通过当前 Session 的只读项目发现、关联记录与原计划检查，确认主干为 `v2.2`，Bravo、Charlie 各自使用独立的已登记 Git worktree。随后对发现的目录只读核对 Git：主干 HEAD 为 `8d38cae`，Bravo 为 `78369c6`（相对主干领先 1、落后 2），Charlie 为 `897eae9`（领先 0、落后 1）。检查开始时三者均无未提交文件。Bravo 的新开发仍在分支上；Charlie 的开发已合入主干，尚未同步回分支。这是正常的历史分叉，不是提交丢失，也不代表后续合并一定没有冲突。
+
+实际问题是面板恢复了旧的同步成功记录，却把“主干已同步”当成当前状态，并使用冻结计划中的“副本”旧名称。此次增加独立的当前提交比较与名称投影，成功记录的文件数、Git/测试证据和最终提交明确标为上次操作；Bravo 有新提交时直接提供下一轮合入预览，保留原双方身份、冻结计划及独立准备/应用确认。分支图改为显示可区分的标题尾部。
+
+- `python scripts/test_merge_workflow_isolated.py tests.test_project_merges.ProjectMergeTests`：22 项通过，333.971 秒，退出码 0。扩展真实临时仓库的合入→同步→继续开发用例，覆盖当前 0/0 到 1/1 差异、重命名、冻结指纹/持久记录不变、读取中分支变化拒绝、比较失败保持 unknown，以及下一轮候选准备。
+- `node node_modules/@playwright/test/cli.js test --config .qa/branch-cycle-check/playwright.config.cjs project-merges.spec.ts project-tasks.spec.ts`：47 项通过，42.1 秒，退出码 0。使用本轮独立 Vite `127.0.0.1:55203`；临时测试副本与原测试源只替换固定测试 origin，结束前逐字比较确认。所有 WebSocket 与测试 Vite 以外 HTTP 均被 fixture 阻止，未接触生产 Session。
+- 1280px 深色与 390px 浅色复现“旧同步成功之后双方又有新提交”，验证当前 Bravo 名称、双向提交数、首屏下一轮入口、正确预览方向、打开时不预览或写入、未知状态不宣称同步，以及分支图可见 Bravo 标签。人工查看截图，无横向溢出；保存在 `.qa/branch-cycle-review/desktop.png` 和 `mobile.png`。
+- `npm run build`：退出码 0，包含 TypeScript 与 Vite 构建（Vite 5.86 秒）。保留已有 CJS、动静态导入和大分块提示。
+- `openspec validate simplify-branch-merge-workflow --strict` 与 `git -c core.safecrlf=false diff --check` 通过。
+
+自建 Vite 已停止，三份临时测试文件已移除，截图保留。本轮仅在主工作区修改源码与说明，未提交这些修改，未执行实际 Bravo/Charlie 合并、Kit、发布或安装。下一轮实际顺序应为 Bravo 合入主干，再将更新后的主干分别同步回 Bravo 和 Charlie；操作仍需从对应分支入口审阅并独立确认。已安装桌面程序尚未包含此次修复。

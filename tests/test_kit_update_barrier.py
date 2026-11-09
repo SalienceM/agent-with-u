@@ -3,7 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 import json
 
 from src.backend.bridge_ws import BridgeWS
@@ -71,6 +71,39 @@ class UpdateBarrierTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(self.bridge._update_work_blocked())
         self.bridge._update_manager = UpdateManager(Path(self.tmp.name))
         self.assertTrue(self.bridge._update_work_blocked())
+
+    async def test_restarted_manual_install_unblocks_even_without_kit_history(self):
+        for has_history in (True, False):
+            with self.subTest(has_history=has_history):
+                request = ("b" if has_history else "c") * 32
+                identity = dict(ownerId="o", deviceId="d", instanceId="i", sessionId="s", runId="r", stepId="u")
+                release = dict(version="2", packageVersion="2", buildId="new", sequence=2)
+                journal = self.bridge._update_manager.journal
+                journal.reserve(request, identity)
+                record = journal.freeze(request, identity, {"release": release, "desktop": {"pid": 100}})
+                journal.confirm(request, identity, record["planFingerprint"], "confirmation-request")
+                self.bridge._kit_update_barrier = request
+                step = SimpleNamespace(id="u", config={"capabilityRuntime": {"installRequestId": request}}, status="result_unknown")
+                run = SimpleNamespace(id="r", steps=[step], status="result_unknown")
+                state = SimpleNamespace(runs=[run] if has_history else [])
+                self.bridge._kit_get = Mock(return_value=state)
+                self.bridge._kit_save = Mock()
+                self.bridge._session_owner_id = Mock(return_value="o")
+                self.bridge._kit_desktop = Mock(return_value=(object(), {
+                    "pid": 200, "instanceId": "i", "deviceId": "d", "protocol": 1,
+                    "installed": True, "release": release}))
+                self.assertTrue(self.bridge._update_work_blocked())
+                with patch("src.backend.kit_update_bridge._current_release", return_value=release):
+                    checked = self.bridge._reconcile_kit_update(request)
+                self.assertEqual("failed", checked["phase"])
+                self.assertFalse(self.bridge._update_work_blocked())
+                self.assertFalse(journal.active())
+                if has_history:
+                    self.assertEqual("failed", run.status)
+                    self.assertEqual("failed", run.verdict)
+                    self.bridge._kit_save.assert_called_once()
+                else:
+                    self.bridge._kit_save.assert_not_called()
 
     async def test_unhydrated_loop_and_corrupt_activity_never_mean_idle(self):
         folder = Path(self.tmp.name) / "loops"

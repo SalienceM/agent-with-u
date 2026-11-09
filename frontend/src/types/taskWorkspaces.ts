@@ -37,11 +37,12 @@ export interface ProjectBranchGraphData {
 }
 
 export interface MergeLink { operationId: string; originSessionId: string; sourceSessionId: string; targetSessionId: string; status: string; createdAt?: number }
-export interface MergeSummary { id: string; title?: string; status: string; revision: number; updatedAt?: number; createdAt?: number;
+export interface MergeSummary { id: string; title?: string; displayTitle?: string; status: string; revision: number; updatedAt?: number; createdAt?: number;
   originSessionId: string; sourceSessionId?: string; targetSessionId?: string; integrationSessionId?: string;
   sourceHead?: string; targetHead?: string; targetBranch?: string; candidate?: string; finalHead?: string }
 export interface MergeDiagnostic { side: 'source' | 'target' | 'integration'; code: string; sessionId: string; root?: string; notice: string;
   paths?: Array<{ path: string; status: string; index?: boolean; worktree?: boolean; untracked?: boolean }> }
 export interface MergeWorkflow { version: number; checkedAt: number; gitVerified: boolean; canAutoVerify: boolean;
-  sides: Record<string, { sessionId: string; root: string; state: string; head?: string; fingerprint?: string; fresh: boolean | null; dirty: unknown[]; activity: unknown[] }>;
+  comparison?: { state: 'known' | 'unknown'; sourceHead?: string; targetHead?: string; sourceAhead?: number; targetAhead?: number; notice?: string };
+  sides: Record<string, { sessionId: string; title?: string; root: string; state: string; head?: string; branch?: string; fingerprint?: string; fresh: boolean | null; dirty: unknown[]; activity: unknown[] }>;
   diagnostics: MergeDiagnostic[]; tests: { state: string; items: Array<{ candidate: string; name: string; logRef: string; finishedAt: number; exitCode: number; source: string; state: string }> } }

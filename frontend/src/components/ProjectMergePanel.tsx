@@ -35,6 +35,21 @@ export const ProjectMergePanel: React.FC<Props> = ({ session, executor, onOpenSe
   const needsNewPreview = row && (row.status === 'blocked' && !row.integration || activeDiagnostics.some(entry => entry.code === 'changed'));
   const waiting = uncertain || row?.status === 'unknown' || row?.status === 'preparing' || row?.status === 'applying';
   const finished = row?.status === 'succeeded' || row?.status === 'cancelled';
+  const sourceTitle = workflow?.sides.source?.title || row?.source.title;
+  const targetTitle = workflow?.sides.target?.title || row?.target.title;
+  const comparison = workflow?.comparison;
+  const currentPair = !!pairMatches && comparison?.state === 'known'
+    && Number.isInteger(comparison.sourceAhead) && comparison.sourceAhead! >= 0
+    && Number.isInteger(comparison.targetAhead) && comparison.targetAhead! >= 0;
+  const branchIsSource = row?.source.sessionId === session;
+  const branchAhead = currentPair ? (branchIsSource ? comparison!.sourceAhead! : comparison!.targetAhead!) : 0;
+  const mainAhead = currentPair ? (branchIsSource ? comparison!.targetAhead! : comparison!.sourceAhead!) : 0;
+  const branchDirty = !!workflow?.sides[branchIsSource ? 'source' : 'target']?.dirty.length;
+  const canContinue = !!canSync && row?.status === 'succeeded';
+  const nextRound = !canContinue ? '' : currentPair
+    ? branchAhead > 0 || branchDirty ? 'merge' : mainAhead > 0 ? 'sync' : 'return'
+    : syncing ? 'merge' : 'sync';
+  const mergeCurrent = () => { if (canContinue && !blocked) void c.preview({ source: session, target: fixedTarget! }); };
   const repreview = () => { if (row && !blocked && !waiting) void c.preview({ source: row.source.sessionId, target: row.target.sessionId }); };
   const openFile = (sessionId: string, root: string, path: string) => {
     const relativePath = normalizeRelativeFilePath(path);
@@ -67,11 +82,11 @@ export const ProjectMergePanel: React.FC<Props> = ({ session, executor, onOpenSe
       {canSync && <WorkflowButton disabled={busy || c.loading || !online || uncertain} onClick={syncMain}>同步主干到此分支</WorkflowButton>}
     </> : row ? <>
       <header style={{ marginBottom: 18 }}>
-        <h3 style={{ margin: '0 0 8px', fontSize: 18, fontWeight: 600 }}>{row.source.title} <span style={mutedStyle}>→</span> {row.target.title}</h3>
+        <h3 style={{ margin: '0 0 8px', fontSize: 18, fontWeight: 600 }}>{sourceTitle} <span style={mutedStyle}>→</span> {targetTitle}</h3>
         <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, alignItems: 'center' }}>
-          <span style={tagStyle}>{syncing ? '同步主干' : '分支合并'}</span>
+          <span style={tagStyle}>{row.status === 'succeeded' ? '上次操作 · ' : ''}{syncing ? '同步主干' : '分支合并'}</span>
           <span style={tagStyle} title={row.target.branch}>{row.target.branch || '未知分支'}</span>
-          <span style={mutedStyle}>已提交差异：{row.files.length} 个文件</span>
+          <span style={mutedStyle}>{row.status === 'succeeded' ? '上次变化' : '已提交差异'}：{row.files.length} 个文件</span>
           {syncing && !finished && <span style={mutedStyle}>{row.fastForward ? '可直接快进' : '保留双方提交'}</span>}
         </div>
       </header>
@@ -94,12 +109,20 @@ export const ProjectMergePanel: React.FC<Props> = ({ session, executor, onOpenSe
           : row.status === 'conflict' ? <><strong>待解决冲突</strong><p style={mutedStyle}>打开处理空间修复，再核对候选。</p></>
           : row.status === 'candidate' ? <><strong>{verified ? '候选已就绪' : '待核对候选'}</strong><p style={mutedStyle}>{verified ? '确认下方计划后更新目标分支。' : '核对冲突、工作树和提交历史。'}</p></>
           : row.status === 'error' ? <><strong>本次操作失败</strong><p>{row.notice || '请查看原操作结果。'}{row.applyRequestId && row.integration && row.candidate ? '可重新核对原候选。' : '可在“变更与验证详情”中重新预览。'}</p></>
-          : <><strong style={{ fontSize: 18, fontWeight: 600 }}>{row.status === 'succeeded' ? syncing ? '主干已同步' : '合并完成' : labels[row.status] || row.status}</strong>
-            <p style={mutedStyle}>{row.status === 'succeeded' ? syncing ? '此分支可以继续开发。' : canSync ? '可将主干同步回此分支，继续下一轮开发。' : '目标分支已更新。' : '成果和历史记录已保留。'}</p>
-            {row.status === 'succeeded' && !syncing && canSync && <WorkflowButton tone="primary" disabled={blocked} onClick={syncMain}>同步主干到此分支</WorkflowButton>}
-            {row.status === 'succeeded' && syncing && <WorkflowButton tone="primary" disabled={!onOpenSession} onClick={() => onOpenSession?.(row.target.sessionId)}>返回此分支继续开发</WorkflowButton>}
-            {row.status === 'succeeded' && !syncing && !canSync && <WorkflowButton tone="primary" disabled={!onOpenSession} onClick={() => onOpenSession?.(row.target.sessionId)}>返回主 Session</WorkflowButton>}
-            {row.status === 'succeeded' && row.finalHead && <div style={{ ...mutedStyle, marginTop: 14 }}>提交 <code title={row.finalHead}>{row.finalHead.slice(0, 12)}</code></div>}
+          : <><strong style={{ fontSize: 18, fontWeight: 600 }}>{row.status === 'succeeded'
+              ? currentPair ? branchAhead > 0 ? '当前分支有新提交' : mainAhead > 0 ? '主干有新提交' : '已提交内容与主干一致'
+                : syncing ? '上次同步已完成' : '上次合并已完成'
+              : labels[row.status] || row.status}</strong>
+            <p style={mutedStyle}>{row.status === 'succeeded'
+              ? currentPair ? `待合入主干 ${branchAhead} 个提交 · 待同步主干 ${mainAhead} 个提交`
+                : '这是上次操作的回执。当前分支状态尚未确认，可刷新或预览本轮操作。'
+              : '成果和历史记录已保留。'}</p>
+            {row.status === 'succeeded' && branchDirty && <p style={mutedStyle}>当前分支还有未提交改动，提交后再合入。</p>}
+            {nextRound === 'merge' && <WorkflowButton tone="primary" disabled={blocked} onClick={mergeCurrent}>预览本轮合并到主干</WorkflowButton>}
+            {nextRound === 'sync' && <WorkflowButton tone="primary" disabled={blocked} onClick={syncMain}>同步主干到此分支</WorkflowButton>}
+            {nextRound === 'return' && <WorkflowButton tone="primary" disabled={!onOpenSession} onClick={() => onOpenSession?.(session)}>返回此分支继续开发</WorkflowButton>}
+            {row.status === 'succeeded' && !canContinue && <WorkflowButton tone="primary" disabled={!onOpenSession} onClick={() => onOpenSession?.(row.target.sessionId)}>返回目标 Session</WorkflowButton>}
+            {row.status === 'succeeded' && row.finalHead && <div style={{ ...mutedStyle, marginTop: 14 }}>上次{syncing ? '同步' : '合并'}提交 <code title={row.finalHead}>{row.finalHead.slice(0, 12)}</code></div>}
           </>}
         <div style={{ clear: 'both' }} />
       </div>
@@ -138,8 +161,8 @@ export const ProjectMergePanel: React.FC<Props> = ({ session, executor, onOpenSe
       {row.integration && <>
         {!finished && row.integration.conflicts.map(file => <div key={file}>冲突：{file}</div>)}
         <div style={{ ...mutedStyle, display: 'flex', flexWrap: 'wrap', gap: '8px 20px', alignItems: 'center', margin: '16px 0' }}>
-          <span aria-label="Git 核对">Git：{verified ? '已核对' : '未核对'}</span>
-          <span aria-label="项目测试" title="Git 核对与项目测试分别记录" role={workflow?.tests.state === 'failed' ? 'alert' : undefined}>项目测试：{testStates[workflow?.tests.state || 'unknown'] || '未验证'}</span>
+          <span aria-label="Git 核对">{finished ? '上次操作 ' : ''}Git：{verified ? '已核对' : '未核对'}</span>
+          <span aria-label="项目测试" title="Git 核对与项目测试分别记录" role={workflow?.tests.state === 'failed' ? 'alert' : undefined}>{finished ? '上次操作 ' : ''}项目测试：{testStates[workflow?.tests.state || 'unknown'] || '未验证'}</span>
           {workflow && <span title="返回页面或点击刷新时核对">{new Date(workflow.checkedAt * 1000).toLocaleTimeString()} 更新</span>}
         </div>
       </>}
@@ -165,7 +188,7 @@ export const ProjectMergePanel: React.FC<Props> = ({ session, executor, onOpenSe
     {c.notice && <p role="status" style={workflowNoticeStyle}>{c.notice}</p>}
     <details open={!draft.selected && c.history.length > 0} style={detailStyle}><summary style={{ cursor: 'pointer', fontWeight: 500 }}>合并历史（{c.history.length}{c.next !== null ? '+' : ''}）</summary>
       {c.history.map(item => <WorkflowButton tone="quiet" key={item.id} disabled={busy} aria-pressed={draft.selected === item.id} style={{ display: 'block', width: '100%', textAlign: 'left', marginTop: 6, overflowWrap: 'anywhere' }} onClick={() => c.select(item.id)}>
-        {item.title} · {labels[item.status] || item.status}<br />{item.createdAt ? new Date(item.createdAt * 1000).toLocaleString() : '旧记录，创建时间未知'} · {item.id.slice(0, 8)} · {item.sourceHead?.slice(0, 8) || '?'} → {item.targetHead?.slice(0, 8) || '?'}
+        {item.displayTitle || item.title} · {labels[item.status] || item.status}<br />{item.createdAt ? new Date(item.createdAt * 1000).toLocaleString() : '旧记录，创建时间未知'} · {item.id.slice(0, 8)} · {item.sourceHead?.slice(0, 8) || '?'} → {item.targetHead?.slice(0, 8) || '?'}
       </WorkflowButton>)}
       {c.next !== null && <WorkflowButton disabled={busy} onClick={c.more}>更多汇合</WorkflowButton>}
       <WorkflowButton disabled={busy || uncertain} onClick={newPreview}>新建汇合</WorkflowButton>

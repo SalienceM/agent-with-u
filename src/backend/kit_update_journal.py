@@ -265,3 +265,57 @@ class InstallJournal:
             if terminal and read_record(self.slot).get("requestId") == request_id:
                 self.slot.unlink()
             return record
+
+    def retire_unlaunched(self, request_id: str, identity: dict[str, str],
+                          evidence: dict[str, Any]) -> dict[str, Any]:
+        """已核对的新桌面接替旧请求；原子抢占启动标记，不凭超时释放未知助手。"""
+        with _process_file_lock(self.lock):
+            record = self.get(request_id, identity)
+            if record["phase"] in TERMINAL_PHASES:
+                return record
+            slot = read_record(self.slot)
+            if (slot.get("requestId") != request_id or slot.get("identity") != identity
+                    or record["phase"] not in HANDOFF_PHASES or not record.get("confirmationId")
+                    or fingerprint(record.get("plan") or {}) != record.get("planFingerprint")):
+                raise JournalError("旧安装请求已变化，不能关闭")
+            desktop, backend = evidence.get("desktop") or {}, evidence.get("backend") or {}
+            actual, target = desktop.get("release") or {}, record["plan"].get("release") or {}
+            old_desktop = record["plan"].get("desktop") or {}
+            sequence = actual.get("sequence")
+            target_sequence = target.get("sequence")
+            if (evidence.get("ready") is not True or desktop.get("installed") is not True
+                    or desktop.get("protocol") != PROTOCOL
+                    or any(desktop.get(key) != identity[key] for key in ("deviceId", "instanceId"))
+                    or type(desktop.get("pid")) is not int or desktop["pid"] <= 0
+                    or type(old_desktop.get("pid")) is not int or old_desktop["pid"] <= 0
+                    or desktop["pid"] == old_desktop["pid"]
+                    or not all(actual.get(key) and actual[key] == backend.get(key)
+                               for key in ("buildId", "sequence", "version", "packageVersion"))
+                    or type(sequence) is not int or type(target_sequence) is not int
+                    or sequence < target_sequence
+                    or sequence == target_sequence and any(actual.get(key) != target.get(key)
+                        for key in ("buildId", "version", "packageVersion"))):
+                raise JournalError("尚未核对同一安装实例重新启动后的完整版本")
+            # Rust 壳在启动助手前以 create_new 独占同一个 launch 文件。
+            # 抢占成功后，即便迟到通知已经完成 validate，也无法再启动助手。
+            for suffix in (".claim.json", ".installed.json", ".result.json"):
+                path = self.path(request_id).with_suffix(suffix)
+                if os.path.lexists(path):
+                    raise JournalError("安装助手可能已执行；保留原请求保护")
+            revoked = {"protocol": PROTOCOL, "requestId": request_id, "identity": identity,
+                       "planFingerprint": record["planFingerprint"], "revoked": True}
+            launch = self.path(request_id).with_suffix(".launch.json")
+            try:
+                with launch.open("xb") as stream:
+                    stream.write(json.dumps(revoked, ensure_ascii=False, sort_keys=True).encode("utf-8"))
+                    stream.flush()
+                    os.fsync(stream.fileno())
+            except FileExistsError:
+                if read_record(launch) != revoked:
+                    raise JournalError("安装助手已领取或启动结果未知；保留原请求保护")
+            record.update(phase="failed", updatedAt=time.time(),
+                          message="已核对重新启动的已安装版本；旧自动安装未启动，已关闭旧请求并恢复节点操作",
+                          recovery={"reason": "superseded_unlaunched", "evidence": evidence})
+            durable_json(self.path(request_id), record)
+            self.slot.unlink()
+            return record

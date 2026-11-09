@@ -19,7 +19,7 @@ async function mount(page: Page, width = 1200, dark = false, fixedTarget = false
     document.documentElement.style.setProperty('--theme-border', dark ? '#424854' : '#dce1e8');
     document.documentElement.style.setProperty('--theme-panel-solid', dark ? '#191b20' : '#fff');
     const f = { actions: [] as string[], requests: [] as string[], previews: 0, opened: [] as string[], row: null as any, callbacks: new Set<any>(), fail: false, reads: 0,
-      canVerify: false, conflict: true, diagnostics: [] as any[], tests: { state: 'unknown', items: [] }, extra: [] as any[], online: true, supported: true, connection: (_: boolean) => {}, receipt: 'succeeded' };
+      canVerify: false, conflict: true, comparison: undefined as any, liveSides: {} as any, diagnostics: [] as any[], tests: { state: 'unknown', items: [] }, extra: [] as any[], online: true, supported: true, connection: (_: boolean) => {}, receipt: 'succeeded' };
     const repo = { root: 'C:/test/main', commonDir: 'C:/test/main/.git', repositoryId: 'repo', head: 'a'.repeat(40), branch: 'main', fingerprint: 'repo', dirty: [] };
     api.collaborationList = async (_s, _e, kind) => ({ items: kind === 'merge' && f.row ? [f.row] : [], nextOffset: null });
     api.projectMergeDiscover = async () => ({ items: [{ id: 'one', title: '需求', workingDir: 'C:/test/one' }, { id: 'two', title: '需求', workingDir: 'C:/test/two' }], truncated: false });
@@ -27,7 +27,7 @@ async function mount(page: Page, width = 1200, dark = false, fixedTarget = false
     api.onExecutorConnectionStatus = (_e, callback) => { f.connection = callback; callback(f.online); return () => {}; };
     api.collaborationRequestStatus = async () => ({ status: f.receipt });
     api.projectMergeOperations = async () => ({ items: [...(f.row ? [{ ...f.row, originSessionId: f.row.sourceSessionId, sourceSessionId: f.row.source.sessionId, targetSessionId: f.row.target.sessionId, sourceHead: f.row.source.head, targetHead: f.row.target.head }] : []), ...f.extra], nextOffset: null });
-    api.projectMergeInspect = async () => { f.reads++; return { ...f.row, workflow: { version: 1, checkedAt: 1, sides: { integration: { head: f.row?.candidate || 'b'.repeat(40), state: 'known', activity: [], dirty: [] } }, diagnostics: f.diagnostics,
+    api.projectMergeInspect = async () => { f.reads++; return { ...f.row, workflow: { version: 1, checkedAt: 1, comparison: f.comparison, sides: { integration: { head: f.row?.candidate || 'b'.repeat(40), state: 'known', activity: [], dirty: [] }, ...f.liveSides }, diagnostics: f.diagnostics,
       gitVerified: f.row?.verification.status === 'git_verified', canAutoVerify: f.canVerify, tests: f.tests } } as any; };
     api.projectMergePreview = async (_s, _e, source, target, request) => { f.previews++; return f.row = { id: request, revision: 1, sourceSessionId: 'main', title: '需求 → 需求', status: 'preview', planFingerprint: 'frozen', files: ['same.txt'], blockers: [], direction: target === 'main' ? 'sync_main' : 'merge', fastForward: target === 'main',
       source: { ...repo, root: 'C:/test/one', sessionId: source, title: '需求' }, target: { ...repo, sessionId: target, title: '需求' },
@@ -38,7 +38,7 @@ async function mount(page: Page, width = 1200, dark = false, fixedTarget = false
       f.requests.push(request);
       if (action === 'Prepare') f.row = { ...row, revision: 2, status: f.conflict ? 'conflict' : 'candidate', candidate: f.conflict ? '' : 'b'.repeat(40), integration: { sessionId: 'integration', root: 'C:/test/integration', conflicts: f.conflict ? ['same.txt'] : [] } };
       if (action === 'Verify') f.row = { ...row, revision: row.revision + 1, status: 'candidate', candidate: 'b'.repeat(40), integration: { ...row.integration, conflicts: [] }, verification: { status: 'git_verified', head: 'b'.repeat(40), notice: 'Git 已核对，项目测试另见整合会话。' } };
-      if (action === 'Apply') { f.row = { ...row, revision: 4, status: 'succeeded', finalHead: 'b'.repeat(40) }; if (f.fail) throw Error('lost reply'); }
+      if (action === 'Apply') { f.row = { ...row, revision: 4, status: 'succeeded', finalHead: 'b'.repeat(40) }; f.comparison = { state: 'known', sourceAhead: 0, targetAhead: row.direction === 'sync_main' ? 0 : 1 }; if (f.fail) throw Error('lost reply'); }
       if (action === 'Start') f.row = { ...row, startRequestId: 'started' };
       delete f.row.workflow;
       f.callbacks.forEach(cb => cb(f.row, 'local')); return f.row;
@@ -394,25 +394,61 @@ for (const [width, dark] of [[1280, true], [390, false]] as const) test(`complet
     f.row.source.title = 'AgentWithU-维护'; f.row.target.title = 'AgentWithU-维护 · 副本';
     f.row.target.branch = 'awu/task/task-d344469b4dfe5019a2b30bb46ce170a2';
     f.row.files = Array.from({ length: 70 }, (_, i) => `src/file-${i}.ts`);
+    f.comparison = { state: 'known', sourceAhead: 0, targetAhead: 0 };
     f.diagnostics = [{ side: 'target', code: 'git_dirty', sessionId: 'main', notice: '完成后新的工作区修改', paths: [] }];
     f.previews = 0;
   });
   await page.getByRole('button', { name: '分支副本与合并' }).click();
   await page.getByRole('button', { name: '合并与同步', exact: true }).click();
   const panel = page.getByRole('region', { name: '连续合并流程' });
-  await expect(panel.getByText('主干已同步', { exact: true })).toBeVisible();
+  await expect(panel.getByText('已提交内容与主干一致', { exact: true })).toBeVisible();
   await expect(panel.getByRole('button', { name: '返回此分支继续开发' })).toHaveCount(1);
   await expect(panel.getByRole('button', { name: '返回此分支继续开发' })).toBeInViewport();
   await expect(panel.getByRole('button', { name: '打开已同步分支' })).toHaveCount(0);
   await expect(panel.getByRole('button', { name: '同步主干到此分支' })).toHaveCount(0);
   await expect(panel.getByLabel('需要处理', { exact: true })).toHaveCount(0);
   await expect(panel.getByText('最终提交：' + 'b'.repeat(40), { exact: false })).not.toBeVisible();
-  await expect(panel.getByText('项目测试：未验证', { exact: true })).toBeVisible();
+  await expect(panel.getByLabel('项目测试', { exact: true })).toContainText('未验证');
   expect(await page.evaluate(() => ({ actions: (window as any).mergeFixture.actions, previews: (window as any).mergeFixture.previews }))).toEqual({ actions: [], previews: 0 });
   expect(await panel.evaluate(el => el.scrollWidth <= el.clientWidth)).toBe(true);
   await page.screenshot({ path: testInfo.outputPath('completed-sync.png'), fullPage: true });
   await panel.getByText('变更与验证详情', { exact: true }).click();
   await expect(panel.getByText('最终提交：' + 'b'.repeat(40), { exact: false })).toBeVisible();
+});
+
+for (const width of [1280, 390]) test(`completed sync shows new branch work and current names before the next merge (${width})`, async ({ page }, testInfo) => {
+  await mount(page, width, width === 1280, true);
+  await page.evaluate(async () => {
+    const { api } = await import('/tests/engine/chat-kit-feedback-harness.ts');
+    const f = (window as any).mergeFixture;
+    await api.projectMergePreview('main', 'local', 'two', 'main', 'old-sync');
+    f.row = { ...f.row, status: 'succeeded', finalHead: 'b'.repeat(40), candidate: 'b'.repeat(40),
+      integration: { sessionId: 'integration', root: 'C:/test/integration', conflicts: [] },
+      verification: { status: 'git_verified', head: 'b'.repeat(40), notice: '' } };
+    f.row.source.title = '主项目'; f.row.target.title = '旧副本名称';
+    f.liveSides = { source: { title: '主项目', head: 'c'.repeat(40), dirty: [] }, target: { title: 'AgentWithU-维护 · Bravo', head: 'd'.repeat(40), dirty: [] } };
+    f.comparison = { state: 'known', sourceAhead: 2, targetAhead: 1 };
+    f.previews = 0;
+  });
+  await page.getByRole('button', { name: '分支副本与合并' }).click();
+  await page.getByRole('button', { name: '合并与同步', exact: true }).click();
+  const panel = page.getByRole('region', { name: '连续合并流程' });
+  await expect(panel.getByRole('heading')).toContainText('Bravo');
+  await expect(panel.getByRole('heading')).not.toContainText('旧副本名称');
+  await expect(panel.getByText('当前分支有新提交', { exact: true })).toBeVisible();
+  await expect(panel).toContainText('待合入主干 1 个提交 · 待同步主干 2 个提交');
+  await expect(panel.getByText('主干已同步', { exact: true })).toHaveCount(0);
+  const next = panel.getByRole('button', { name: '预览本轮合并到主干', exact: true });
+  await expect(next).toBeInViewport();
+  expect(await page.evaluate(() => { const f = (window as any).mergeFixture; return [f.previews, f.actions]; })).toEqual([0, []]);
+  await page.screenshot({ path: testInfo.outputPath('current-branch-after-sync.png'), fullPage: true, animations: 'disabled' });
+  await page.evaluate(() => { const f = (window as any).mergeFixture; f.comparison = { state: 'unknown' }; });
+  await panel.getByRole('button', { name: '核对原操作' }).click();
+  await expect(panel.getByText('上次同步已完成', { exact: true })).toBeVisible();
+  await expect(panel).toContainText('当前分支状态尚未确认');
+  await next.click();
+  await expect(panel.getByRole('button', { name: '确认准备独立整合空间' })).toBeVisible();
+  expect(await page.evaluate(() => { const f = (window as any).mergeFixture; return [f.row.source.sessionId, f.row.target.sessionId, f.previews, f.actions]; })).toEqual(['main', 'two', 1, []]);
 });
 
 for (const [width, dark] of [[1280, false], [390, true]] as const) test(`branch graph connects real parents and commit details (${width})`, async ({ page }, testInfo) => {
@@ -425,7 +461,7 @@ for (const [width, dark] of [[1280, false], [390, true]] as const) test(`branch 
       f.graphReads++; f.graphScope = [session, executor];
       return { version: 1, snapshot: 'one', checkedAt: 1000, root: 'C:/test/main', repositoryId: 'repo', limit: 80, hasMore: false, omittedBranches: 0,
         branches: [{ sessionId: 'two', title: '主项目', main: true, state: 'known', head: sha('d'), branch: 'main', ahead: 0, behind: 0 },
-          { sessionId: 'main', title: '支付功能 B', main: false, state: 'known', head: sha('b'), branch: 'feature/payment', ahead: 0, behind: 2 }],
+          { sessionId: 'main', title: 'AgentWithU-维护 · Bravo', main: false, state: 'known', head: sha('b'), branch: 'feature/payment', ahead: 0, behind: 2 }],
         commits: [['d', ['c', 'b'], '合并支付功能'], ['b', ['a'], '新增支付流程'], ['c', ['a'], '主干修复登录'], ['a', [], '项目基线']].map(([h, parents, message]) => ({ hash: sha(h as string), parents: (parents as string[]).map(sha), author: 'Developer', date: '2026-11-08T12:00:00+08:00', message: message as string })) };
     };
     api.gitShow = async (...args) => { f.details.push(args); return { message: '新增支付流程', stat: '', files: [{ path: 'payment.ts', status: 'added', added: 1, deleted: 0 }] }; };
@@ -437,6 +473,7 @@ for (const [width, dark] of [[1280, false], [390, true]] as const) test(`branch 
   await expect(page.getByLabel('分支状态')).toContainText('领先 0 · 落后 2');
   await expect(page.locator('path[data-edge]')).toHaveCount(4);
   const merged = 'd'.repeat(40), side = 'b'.repeat(40);
+  await expect(page.locator(`[data-node="${side}"] text`).filter({ hasText: 'Bravo' })).toBeVisible();
   await expect(page.locator(`path[data-edge="${side}:${merged}"]`)).toHaveCount(1);
   await expect(page.getByRole('button', { name: '刷新分支图' })).toBeInViewport();
   await expect(page.getByRole('button', { name: '提交 aaaaaaaa 项目基线', exact: true })).toBeInViewport();

@@ -93,7 +93,33 @@ class ProjectMergeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(synced['status'], 'succeeded', synced)
         self.assertEqual(child_git.inspect()['head'], final['finalHead'])
         self.assertEqual(child_git.inspect()['branch'], plan['source']['branch'])
+        original = self.bridge._collaboration_store().read(self.scope, 'merge', sync['id'])
+        view = json.loads(await self.bridge._rpc_projectMergeInspect(child.id, sync['id']))
+        self.assertEqual(view['workflow']['comparison']['sourceAhead'], 0)
+        self.assertEqual(view['workflow']['comparison']['targetAhead'], 0)
+        self.bridge._collaboration_session(child.id).title = 'Bravo'
         self.commit(child, 'b.txt', 'second round')
+        self.commit(self.source, 'main-next.txt', 'another branch merged')
+        view = json.loads(await self.bridge._rpc_projectMergeInspect(child.id, sync['id']))
+        self.assertEqual(view['status'], 'succeeded')
+        self.assertEqual(view['workflow']['comparison']['sourceAhead'], 1)
+        self.assertEqual(view['workflow']['comparison']['targetAhead'], 1)
+        self.assertEqual(view['workflow']['sides']['target']['title'], 'Bravo')
+        self.assertEqual(view['target']['title'], original['target']['title'])
+        self.assertEqual(view['planFingerprint'], original['planFingerprint'])
+        self.assertEqual(self.bridge._collaboration_store().read(self.scope, 'merge', sync['id']), original)
+        history = json.loads(await self.bridge._rpc_projectMergeOperations(child.id))['items']
+        self.assertTrue(next(item for item in history if item['id'] == sync['id'])['displayTitle'].endswith(' → Bravo'))
+        from src.backend.project_merge_workflow import compare_current_tips
+        from src.backend.project_branch_graph import GraphGit
+        source_tip, target_tip = self.git.inspect(), child_git.inspect()
+        with patch.object(GraphGit, 'repository', return_value={**source_tip, 'branch': 'changed-during-read'}):
+            with self.assertRaisesRegex(CollaborationError, '读取期间分支已变化'):
+                compare_current_tips(source_tip, target_tip)
+        with patch('src.backend.project_merge_workflow.compare_current_tips', side_effect=CollaborationError('unavailable')):
+            view = json.loads(await self.bridge._rpc_projectMergeInspect(child.id, sync['id']))
+            self.assertEqual(view['workflow']['comparison']['state'], 'unknown')
+            self.assertEqual(view['status'], 'succeeded')
         second = await self.preview(child, 'round-two')
         self.assertEqual((await self.prepare(second))['status'], 'candidate')
 
