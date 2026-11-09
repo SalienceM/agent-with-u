@@ -2108,6 +2108,11 @@ keeps that target fixed when the main conversation advances. Advanced context/su
 are collapsed; preparation errors show the batch cause and an explicit new-selection action.
 Role history is a reading view with its own empty state and a return-to-source action, never an
 ordinary chat empty prompt. Review details use the solid theme surface even with wallpaper.
+The composer keeps review history under “更多 → 评议记录”. Only active/unknown batches and
+newly received results get an inline toolbar reminder; reading or dismissing a finished result
+clears its reminder without changing the report. Restored historical disagreements are not alerts.
+An empty paused sequence queue is hidden. Queued/running tasks retain compact state and pause/resume
+controls; queue read failures remain visible. Hiding the panel never changes executor scheduling.
 Each source/role binding has a separate Session/output directory. Same-role calls serialize; at most
 three calls per node and eight roles per batch. Native restricted calls must prove native context
 identity; unsupported routes use text-only history without tools. Working-directory separation is

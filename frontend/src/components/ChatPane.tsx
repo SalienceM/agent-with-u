@@ -1223,7 +1223,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
           <button onClick={() => setSeqQueueError('')} style={seqQueueErrorCloseStyle}>✕</button>
         </div>
       )}
-      {sessionId && (!seqChainActive || seqTasks.some((t) => ['pending', 'steering', 'running', 'error'].includes(t.status))) && (
+      {sessionId && (!!seqStateError || seqTasks.some((t) => ['pending', 'steering', 'running', 'error'].includes(t.status))) && (
         <SeqTaskPanel
           sessionId={sessionId}
           tasks={seqTasks}
@@ -1251,7 +1251,6 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
             open={reviewOpen} onOpen={() => setReviewOpen(true)} onClose={() => setReviewOpen(false)} latestRequest={latestReview}
             onReference={reference => chatInputRef.current?.insertOpinion(reference)} onOpenSession={onOpenSession}
             onStartReview={targets => chatInputRef.current?.startReview(targets, true)} />
-          <span style={{ flex: 1 }} />
           <UserInteractionsPanel key={sessionId} sessionId={sessionId} runtimeKey={`${activeBackendId}:${skipPermissions}`} compact />
           <KitDelegationStatus sessionId={sessionId} executor={activeSession?.execKey || 'local'} compact />
         </> : undefined}

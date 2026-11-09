@@ -10,6 +10,7 @@ interface Props { session: string; executor: string; open: boolean; onOpen: () =
   onReference: (reference: OpinionReference) => void; onOpenSession?: (id: string) => void; onStartReview?: (targetIds?: string[]) => void }
 const labels: Record<string, string> = { preparing: '准备中', queued: '排队中', running: '评议中', stopping: '停止中', done: '已完成', completed_with_issues: '已结束 · 有未完成意见', invalid: '意见校验未通过', error: '失败', cancelled: '已停止', unknown: '结果未知' };
 const stances = { agree: '同意', partial: '部分同意', disagree: '不同意', unknown: '证据不足' };
+const running = (status?: string) => !!status && ['preparing', 'queued', 'running', 'stopping'].includes(status);
 export const RoleReviewPanel: React.FC<Props> = ({ session, executor, open, onOpen, onClose, latestRequest, onReference, onOpenSession, onStartReview }) => {
   const [batches, setBatches] = useState<CollaborationSummary[]>([]), [batchId, setBatchId] = useState('');
   const [batch, setBatch] = useState<ReviewBatch>(), [reportId, setReportId] = useState(''), [report, setReport] = useState<ReviewReport>();
@@ -18,9 +19,11 @@ export const RoleReviewPanel: React.FC<Props> = ({ session, executor, open, onOp
   const [checkNonce, setCheckNonce] = useState(0);
   const [progress, setProgress] = useState<Record<string, ReviewProgress>>({});
   const [connected, setConnected] = useState(true);
+  const [announced, setAnnounced] = useState<Set<string>>(() => new Set());
+  const viewed = useRef(new Set<string>());
   const identity = useRef(`${executor}:${session}`); identity.current = `${executor}:${session}`;
   const panel = useRef<HTMLDivElement>(null);
-  useEffect(() => { setBatches([]); setBatchId(''); setBatch(undefined); setReportId(''); setReport(undefined); setNotice(''); setProgress({}); }, [session, executor]);
+  useEffect(() => { setBatches([]); setBatchId(''); setBatch(undefined); setReportId(''); setReport(undefined); setNotice(''); setProgress({}); setAnnounced(new Set()); viewed.current.clear(); }, [session, executor]);
   useEffect(() => api.onExecutorConnectionStatus(executor, value => {
     setConnected(value);
     if (value) { setRevision(v => v + 1); setCheckNonce(v => v + 1); }
@@ -38,9 +41,15 @@ export const RoleReviewPanel: React.FC<Props> = ({ session, executor, open, onOp
       return;
     }
     if (row.kind === 'report') setBatch(old => old && old.id === row.batchId ? { ...old, reportSummaries: old.reportSummaries.map(item => item.id === row.id && row.revision >= item.revision ? { ...item, ...row } : item) } : old);
+    const id = row.kind === 'report' ? row.batchId : row.id;
+    if (id && !viewed.current.has(id)) setAnnounced(old => new Set([...old, id].slice(-64)));
     setRevision(v => v + 1);
   }), [session, executor]);
-  useEffect(() => { if (latestRequest) { if (!open) setBatchId(latestRequest); setRevision(v => v + 1); } }, [latestRequest]);
+  useEffect(() => { if (latestRequest) {
+    if (!open) setBatchId(latestRequest);
+    if (!viewed.current.has(latestRequest)) setAnnounced(old => new Set([...old, latestRequest].slice(-64)));
+    setRevision(v => v + 1);
+  } }, [latestRequest]);
   useCollaborationRead(`${executor}:${session}:list`, revision, true,
     () => api.collaborationList(session, executor, 'review'),
     result => { setBatches(old => [...result.items, ...old.filter(row => !result.items.some(item => item.id === row.id))]); setNext(result.nextOffset); setBatchId(id => id || result.items[0]?.id || ''); }, error => setNotice(String(error)));
@@ -74,17 +83,32 @@ export const RoleReviewPanel: React.FC<Props> = ({ session, executor, open, onOp
     const value = await api.reviewReference(session, executor, report.id, report.revision, selected);
     if (current === identity.current) { onClose(); onReference(value); }
   };
-  const latest = batches[0], visible = report?.id === reportId ? report : undefined;
+  const visible = report?.id === reportId ? report : undefined;
   const disagreement = (visible?.counts?.disagree || 0) + (visible?.counts?.partial || 0) > 0;
   const activeBatch = batch?.id === batchId ? batch : undefined;
-  const running = (status?: string) => !!status && ['preparing', 'queued', 'running', 'stopping'].includes(status);
+  // 历史异议属于报告内容，不是永久待办。仅提示活动/未知任务和本次收到的新结果。
+  const attention = batches.find(row => running(row.status) || row.status === 'unknown')
+    || batches.find(row => announced.has(row.id));
+  const acknowledge = (id: string) => {
+    viewed.current.add(id);
+    if (viewed.current.size > 100) viewed.current.delete(viewed.current.values().next().value!);
+    setAnnounced(old => { if (!old.has(id)) return old; const next = new Set(old); next.delete(id); return next; });
+  };
+  useEffect(() => {
+    if (open && activeBatch && !running(activeBatch.status) && activeBatch.status !== 'unknown') acknowledge(activeBatch.id);
+  }, [open, activeBatch?.id, activeBatch?.status]);
   const start = (targets?: string[]) => { onClose(); onStartReview?.(targets); };
   return <>
-    <WorkflowButton tone="quiet" icon="review" aria-label="查看角色评议" onClick={onOpen} title={latest ? `${labels[latest.status || ''] || latest.status} · ${latest.counts?.done || 0}/${latest.counts?.total || 0} 个角色完成${latest.counts?.failed ? ` · ${latest.counts.failed} 个未完成` : ''}` : '查看角色意见、分歧与评议历史'} style={{ whiteSpace: 'nowrap' }}>
-      评议{latest && <span style={{ fontSize: 11, color: latest.counts?.disagree || latest.counts?.partial ? 'var(--theme-warning, #b7791f)' : 'var(--theme-text-muted)' }}>
-        {latest.status === 'error' ? '· 未能开始' : latest.status === 'unknown' ? '· 待核对' : latest.counts?.failed ? `· ${latest.counts.failed} 个未完成` : latest.counts?.disagree || latest.counts?.partial ? '· 有异议' : `· ${latest.counts?.done || 0}/${latest.counts?.total || 0}`}
-      </span>}
-    </WorkflowButton>
+    {attention && !open && <span style={{ display: 'inline-flex', alignItems: 'center' }}>
+      <WorkflowButton tone="quiet" icon="review" aria-label="查看角色评议" onClick={() => { setBatchId(attention.id); onOpen(); }}
+        title={`${labels[attention.status || ''] || attention.status} · ${attention.counts?.done || 0}/${attention.counts?.total || 0} 个角色完成`} style={{ whiteSpace: 'nowrap' }}>
+        {running(attention.status) ? `评议中 · ${attention.counts?.done || 0}/${attention.counts?.total || 0}`
+          : attention.status === 'unknown' ? '评议待核对' : attention.status === 'error' ? '评议未能开始'
+          : attention.counts?.failed ? `评议结束 · ${attention.counts.failed} 个未完成` : '新评议结果'}
+      </WorkflowButton>
+      {!running(attention.status) && attention.status !== 'unknown' && <WorkflowButton tone="quiet" aria-label="收起评议提醒" title="记录保留在更多 → 评议记录"
+        onClick={() => acknowledge(attention.id)} style={{ padding: '3px 6px' }}>×</WorkflowButton>}
+    </span>}
     {open && <AppModalPortal><div style={{ position: 'fixed', inset: 0, zIndex: 31000, display: 'grid', placeItems: 'center', padding: 10, background: '#0007' }}>
       <div ref={panel} role="dialog" aria-modal="true" aria-label="角色评议详情" style={{ ...workflowDialogStyle, width: 'min(1080px, 100%)', height: 'min(85vh, 800px)', background: 'var(--theme-panel-solid, var(--theme-bg-secondary, white))', color: 'var(--theme-text, black)', borderRadius: 16, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}
         onKeyDown={event => {

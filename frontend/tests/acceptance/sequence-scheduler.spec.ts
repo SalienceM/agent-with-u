@@ -59,6 +59,14 @@ async function mockSequence(page: Page) {
         tasks.push({ id: `queued-${tasks.length + 1}`, text: frame.params[1], status: 'pending' });
         reply(snapshot()); emit('seqtaskUpdated', snapshot()); return;
       }
+      if (frame.method === 'composerSubmit') {
+        if (frame.params[2] !== true) throw new Error('Sequence fixture must only queue composer submissions');
+        const input = JSON.parse(frame.params[1]);
+        tasks.push({ id: `queued-${tasks.length + 1}`, text: input.content, status: 'pending' });
+        reply({ version: 1, requestId: input.requestId, sessionId: sid, userMessageId: input.userMessageId,
+          messageId: input.messageId, draftRevision: input.draftRevision, revision: 1, state: 'queued', queue: true });
+        emit('seqtaskUpdated', snapshot()); return;
+      }
       server.send(message);
     });
   });
@@ -71,6 +79,7 @@ async function mockSequence(page: Page) {
     releaseCapabilities: () => { heldCapabilities.splice(0).forEach(reply => reply()); },
     disconnect: () => socket.close({ code: 1001, reason: 'QA reconnect' }),
     pauseRemotely: () => { auto = false; emit('seqtaskUpdated', snapshot()); },
+    emptyWhilePaused: () => { auto = false; tasks = []; emit('seqtaskUpdated', snapshot()); },
     fail: () => {
       auto = false; error = '测试：并发不足，核对后重试';
       tasks[0] = { ...tasks[0], status: 'error', error };
@@ -100,7 +109,8 @@ test('executor auto state persists across reload; pause and resume only mutate s
   let pane = await openChat(page);
   await expect(pane.getByRole('button', { name: '⏸ 暂停', exact: true })).toBeVisible();
   await pane.getByRole('button', { name: '⏸ 暂停', exact: true }).click();
-  await expect(pane).toContainText('执行端已暂停后续任务');
+  await expect(pane.getByText('已暂停', { exact: true })).toBeVisible();
+  await expect(pane).not.toContainText('重新打开控制端');
   const input = pane.locator('.chat-textarea');
   await input.fill('暂停期间新增任务');
   await input.press('Enter');
@@ -113,6 +123,9 @@ test('executor auto state persists across reload; pause and resume only mutate s
   await expect(pane.getByRole('button', { name: '⏸ 暂停', exact: true })).toBeVisible();
   expect(fixture.actions).toEqual(['auto:false', 'auto:true']);
   await page.screenshot({ path: info.outputPath('sequence-controls.png') });
+  fixture.emptyWhilePaused();
+  await expect(pane).not.toContainText('序列队列');
+  expect(fixture.state().seqAuto).toBe(false);
 });
 
 test('another controller can pause; failures show retry without model dispatch', async ({ page }) => {

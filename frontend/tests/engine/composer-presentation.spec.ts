@@ -33,10 +33,10 @@ async function mount(page: Page, width: number, dark: boolean) {
       const [review, setReview] = React.useState(false);
       return React.createElement(ChatInput, { sessionId: 'ui-fixture', historyKey: 'ui-fixture', backends: [{ id: 'api', type: 'openai-compatible' }], activeBackendId: 'api',
         isStreaming: false, isMobile: width < 500, skipPermissions: true, onSend: (...args: any[]) => { f.sent.push(args); }, onAbort: () => {}, onAdjustFontSize: () => {},
+        onOpenOpinions: () => setReview(true),
         workflowTools: React.createElement(React.Fragment, null,
           React.createElement(ProjectTasksPanel, { session: 'ui-fixture', executor: 'local', backendId: 'api', backends: [] }),
           React.createElement(RoleReviewPanel, { session: 'ui-fixture', executor: 'local', open: review, onOpen: () => setReview(true), onClose: () => setReview(false), onReference: () => {} }),
-          React.createElement('span', { style: { flex: 1 } }),
           React.createElement(UserInteractionsPanel, { sessionId: 'ui-fixture', compact: true }),
           React.createElement(KitDelegationStatus, { sessionId: 'ui-fixture', executor: 'local', compact: true })) });
     }
@@ -49,6 +49,7 @@ for (const width of [1366, 390]) for (const dark of [true, false]) test(`compact
   await expect(page.getByRole('button', { name: '交互状态', exact: true })).toBeVisible();
   await expect(page.getByRole('button', { name: '核对问答状态' })).not.toBeVisible();
   await expect(page.getByLabel('提醒 Kit 待确认')).not.toBeVisible();
+  await expect(page.getByRole('button', { name: '查看角色评议' })).toHaveCount(0);
   const bar = page.getByLabel('会话协作工具');
   const box = await bar.boundingBox();
   expect(box!.height).toBeLessThan(44);
@@ -64,9 +65,9 @@ for (const width of [1366, 390]) for (const dark of [true, false]) test(`compact
   await page.getByLabel('提醒 Kit 待确认').uncheck();
   await expect(page.getByRole('switch', { name: '本次允许 Kit 代确认' })).not.toBeChecked();
   await page.locator('.chat-textarea').fill('保留我的草稿');
-  await page.getByRole('button', { name: '项目任务与汇合' }).click();
-  await expect(page.getByRole('dialog', { name: '项目任务', exact: true })).toBeVisible();
-  await page.getByRole('dialog', { name: '项目任务', exact: true }).screenshot({ path: info.outputPath('project.png') });
+  await page.getByRole('button', { name: '分支副本与合并' }).click();
+  await expect(page.getByRole('dialog', { name: '分支副本', exact: true })).toBeVisible();
+  await page.getByRole('dialog', { name: '分支副本', exact: true }).screenshot({ path: info.outputPath('project.png') });
   await page.getByRole('button', { name: '返回对话', exact: true }).click();
   await expect(page.locator('.chat-textarea')).toHaveValue('保留我的草稿');
 });

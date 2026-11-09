@@ -73,7 +73,7 @@ for (const width of [1300, 390]) test(`two roles evaluate without main send; dis
   expect(await page.evaluate(() => (window as any).reviewFixture.sent)).toEqual([]);
   const submitted = await page.evaluate(() => (window as any).reviewFixture.reviewCalls[0]);
   expect(submitted.roles).toHaveLength(2); expect(submitted.kitApprovalDelegation).toBeUndefined();
-  await expect(page.getByRole('button', { name: '查看角色评议' })).toContainText('有异议');
+  await expect(page.getByRole('button', { name: '查看角色评议' })).toContainText('新评议结果');
   expect(await page.evaluate(() => (window as any).reviewFixture.detailCalls)).toBe(0);
   await page.locator('.chat-textarea').fill('原草稿 保留');
   await page.locator('input[type=file]').setInputFiles({ name: 'kept.txt', mimeType: 'text/plain', buffer: Buffer.from('attachment kept') });
@@ -90,6 +90,58 @@ for (const width of [1300, 390]) test(`two roles evaluate without main send; dis
   await page.getByRole('button', { name: '展开编辑消息和文本块' }).click();
   await expect(page.getByRole('dialog', { name: '展开编辑消息' })).toContainText('kept.txt');
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBeTruthy();
+});
+
+test('read results stop reminding; history remains reachable through More', async ({ page }) => {
+  await mount(page);
+  await expect(page.getByRole('button', { name: '查看角色评议' })).toHaveCount(0);
+  await choose(page, '#怀', '怀疑者');
+  await page.getByRole('button', { name: '发起评议', exact: true }).click();
+  await page.getByRole('button', { name: '查看角色评议' }).click();
+  const panel = page.getByRole('dialog', { name: '角色评议详情' });
+  await expect(panel.getByRole('button', { name: '#怀疑者 · 已完成' })).toBeVisible();
+  await panel.getByRole('button', { name: '收起评议' }).click();
+  await expect(page.getByRole('button', { name: '查看角色评议' })).toHaveCount(0);
+  await page.evaluate(() => {
+    const f = (window as any).reviewFixture;
+    f.callbacks.forEach((cb: any) => cb(f.batches[0], 'local'));
+  });
+  await expect(page.getByRole('button', { name: '查看角色评议' })).toHaveCount(0);
+  await page.getByRole('button', { name: '更多输入工具', exact: true }).click();
+  await page.getByRole('button', { name: '评议记录', exact: true }).click();
+  await expect(panel.getByRole('button', { name: '#怀疑者 · 已完成' })).toBeVisible();
+  expect(await page.evaluate(() => (window as any).reviewFixture.reviewCalls.length)).toBe(1);
+});
+
+test('dismiss only hides the new result; unknown reviews still require checking', async ({ page }) => {
+  await mount(page);
+  await choose(page, '#审', '审查者');
+  await page.getByRole('button', { name: '发起评议', exact: true }).click();
+  await page.getByRole('button', { name: '收起评议提醒' }).click();
+  await expect(page.getByRole('button', { name: '查看角色评议' })).toHaveCount(0);
+  expect(await page.evaluate(() => (window as any).reviewFixture.batches.length)).toBe(1);
+  await page.evaluate(() => {
+    const f = (window as any).reviewFixture;
+    f.batches.unshift({ id: 'uncertain', revision: 1, status: 'unknown', sourceSessionId: 's', updatedAt: 200, counts: {}, reports: [], reportSummaries: [] });
+    f.callbacks.forEach((cb: any) => cb(f.batches[0], 'local'));
+  });
+  await expect(page.getByRole('button', { name: '查看角色评议' })).toHaveText('评议待核对');
+  await expect(page.getByRole('button', { name: '收起评议提醒' })).toHaveCount(0);
+});
+
+test('restored historical disagreements do not create an alert', async ({ page }) => {
+  await mount(page);
+  await page.evaluate(() => {
+    const f = (window as any).reviewFixture;
+    f.batches.push({ id: 'old', revision: 3, status: 'done', updatedAt: 100, counts: { total: 1, done: 1, disagree: 1 }, reports: [], reportSummaries: [] });
+    f.connection(true);
+  });
+  await page.getByRole('button', { name: '更多输入工具', exact: true }).click();
+  await page.getByRole('button', { name: '评议记录', exact: true }).click();
+  const panel = page.getByRole('dialog', { name: '角色评议详情' });
+  await expect(panel).toContainText('1/1 位角色已给出意见');
+  await panel.getByRole('button', { name: '收起评议' }).click();
+  await expect(page.getByRole('button', { name: '查看角色评议' })).toHaveCount(0);
 });
 
 test('Markdown is text; # and Slash menus work in expanded editor without sending', async ({ page }) => {
