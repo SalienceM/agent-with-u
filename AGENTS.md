@@ -2226,6 +2226,11 @@ Completed merges show one result card and one continuation action. Current works
 do not turn a completed receipt into an unresolved merge. Compact Git/test states remain visible;
 full plans, paths, evidence and final receipts expand under “变更与验证详情”, with history separate.
 The card's refresh icon retains the accessible name “核对原操作”.
+The dialog keeps its entry Session title/role visible while explicit navigation to a branch
+adds “正在操作” and a return-to-entry action. Diagnostics name the actual branch, not just
+source/target. Capable nodes are inspected first to establish the authoritative origin;
+local intents cannot authorize Status/receipt recovery for a related Session. Successful
+reads clear read errors without discarding write intents or other operation feedback.
 Successful receipts are historical: their old target HEAD/file count/test evidence cannot assert
 that the current branch is synchronized. `workflow.comparison` reads current immutable tips with
 bounded Git counts and rechecks repository/HEAD/branch before returning; unknown remains unknown.

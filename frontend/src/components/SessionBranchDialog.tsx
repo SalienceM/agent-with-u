@@ -22,6 +22,7 @@ export const SessionBranchDialog: React.FC<{ session: BranchSession; action: 'cr
     return () => { live = false; };
   }, [executor, session.id, nonce]);
   if (backends) return <ProjectTasksPanel session={session.id} executor={executor} backendId={session.backendId} backends={backends}
+    sessionTitle={session.title} sessionRole={session.relationKind === 'task' ? '分支' : session.relationKind === 'integration' ? '处理空间' : !session.parentSessionId ? '主干' : '会话'}
     initialAction={action} workspaceId={session.workspaceId} initialOperation={session.mergeLink?.operationId} mergeTarget={session.relationKind === 'task' ? session.parentSessionId : undefined}
     canCreate={!session.parentSessionId && !session.relationKind && !session.workspaceId} onClose={onClose} onOpenSession={onOpenSession} />;
   return <AppModalPortal><div style={{ position: 'fixed', inset: 0, zIndex: 31100, display: 'grid', placeItems: 'center', padding: 12, background: '#0007' }}>

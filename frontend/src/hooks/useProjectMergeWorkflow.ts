@@ -34,6 +34,7 @@ export function useProjectMergeWorkflow(session: string, executor: string, fixed
   const [next, setNext] = useState<number | null>(null), [supported, setSupported] = useState<boolean>();
   const [branchSync, setBranchSync] = useState(false);
   const [notice, setNotice] = useState(''), [busy, setBusy] = useState(false), [online, setOnline] = useState(true);
+  const [readNotice, setReadNotice] = useState('');
   const [nonce, setNonce] = useState(0), [loading, setLoading] = useState(true);
   const [items, setItems] = useState<Array<{ id: string; title: string; workingDir: string }>>([]);
   const current = useRef(identity), state = useRef({ draft, row, supported, online }), mounted = useRef(false);
@@ -49,7 +50,7 @@ export function useProjectMergeWorkflow(session: string, executor: string, fixed
   useEffect(() => {
     mounted.current = true;
     const saved = restore(identity, fixedTarget ? session : '', fixedTarget, initialOperation);
-    state.current.draft = saved; setDraft(saved); setRow(undefined); setHistory([]); setSupported(undefined); setBranchSync(false); setNotice('');
+    state.current.draft = saved; setDraft(saved); setRow(undefined); setHistory([]); setSupported(undefined); setBranchSync(false); setNotice(''); setReadNotice('');
     return () => { mounted.current = false; };
   }, [identity, initialOperation]);
   const install = (value: ProjectMerge, fresh = false) => {
@@ -67,20 +68,22 @@ export function useProjectMergeWorkflow(session: string, executor: string, fixed
     if (!promise) {
       promise = (async () => {
         const capability = state.current.supported;
-        // Status 的退出恢复只允许原 origin；相关入口仅用 Inspect，不冒用来源身份。
-        const origin = state.current.row?.id === id ? state.current.row.sourceSessionId : history.find(item => item.id === id)?.originSessionId;
-        if (!capability || origin === session || state.current.draft.intents[id]) {
-          const status = await api.projectMergeStatus(session, executor, id);
-          if (!capability) return status;
-        }
+        if (!capability) return api.projectMergeStatus(session, executor, id);
+        // 本地草稿和列表都不是归属依据；先只读取得服务端原记录，再按原 origin 恢复。
+        const value = await api.projectMergeInspect(session, executor, id);
         if (getCurrentUserProfile().userId !== owner) throw new Error('身份已变化');
-        return api.projectMergeInspect(session, executor, id);
+        if (!valid() || state.current.draft.selected !== id) return value;
+        if (value.sourceSessionId !== session || !(['preparing', 'applying', 'unknown'].includes(value.status) || state.current.draft.intents[id])) return value;
+        const status = await api.projectMergeStatus(session, executor, id);
+        if (status.revision !== value.revision) return api.projectMergeInspect(session, executor, id);
+        return { ...value, status: status.status, notice: status.notice || value.notice };
       })();
       reads.set(key, promise); void promise.finally(() => { if (reads.get(key) === promise) reads.delete(key); }).catch(() => {});
     }
     const value = await promise; install(value, true);
+    if (valid() && state.current.draft.selected === id) setReadNotice('');
     const intent = state.current.draft.intents[id];
-    if (intent && valid()) {
+    if (intent && valid() && value.sourceSessionId === session) {
       try {
         const receipt = await api.collaborationRequestStatus(session, executor, intent.request);
         if (['succeeded', 'failed', 'cancelled'].includes(receipt.status)) save(old => { const intents = { ...old.intents }; delete intents[id]; return { ...old, intents }; });
@@ -119,13 +122,13 @@ export function useProjectMergeWorkflow(session: string, executor: string, fixed
     }).catch(error => { if (live && valid()) setNotice(`读取失败，未创建新操作：${String(error)}`); })
       .finally(() => { if (live && valid()) setLoading(false); });
     return () => { live = false; };
-  }, [identity]);
+  }, [identity, initialOperation]);
   useEffect(() => {
     if (supported === undefined || !draft.selected || !online || !visible || document.visibilityState === 'hidden') return;
     const key = `${identity}:${draft.selected}`;
     if (readTurn.current?.key === key) { readTurn.current.again = true; return; }
     const turn = { key, again: false }; readTurn.current = turn;
-    void inspect().catch(error => { if (valid()) setNotice(`核对失败；未重试写入。${String(error)}`); }).finally(() => {
+    void inspect().catch(error => { if (valid() && state.current.draft.selected === draft.selected) setReadNotice(`状态读取失败，请刷新。${String(error)}`); }).finally(() => {
       if (readTurn.current !== turn) return;
       readTurn.current = undefined;
       if (turn.again && valid()) setNonce(n => n + 1);
@@ -189,10 +192,10 @@ export function useProjectMergeWorkflow(session: string, executor: string, fixed
     autoChecked.set(key, candidate); if (autoChecked.size > 100) autoChecked.delete(autoChecked.keys().next().value!);
     void action('Verify');
   }, [row, busy, online, supported, identity, visible]);
-  return { row: row?.id === draft.selected ? row : undefined, history, next, loading, supported, branchSync, notice, busy: busy || pending.has(identity), online,
-    draft, items, uncertain: !!draft.intents[draft.selected],
+  return { row: row?.id === draft.selected ? row : undefined, history, next, loading, supported, branchSync, notice: readNotice || notice, busy: busy || pending.has(identity), online,
+    draft, items, uncertain: !!draft.intents[draft.selected] && (!row || row.id !== draft.selected || row.sourceSessionId === session),
     change: (patch: Partial<Draft>) => save(old => ({ ...old, ...patch })),
-    select: (id: string) => { save(old => ({ ...old, selected: id })); setRow(undefined); setNotice(''); },
+    select: (id: string) => { save(old => ({ ...old, selected: id })); setRow(undefined); setNotice(''); setReadNotice(''); },
     refresh: () => { setNonce(n => n + 1); if (supported === undefined) void run(async () => {
       const caps = await api.projectMergeCapabilities(session, executor); if (!valid()) return;
       setBranchSync(caps.branchSync === 1);

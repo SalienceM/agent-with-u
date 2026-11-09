@@ -379,7 +379,7 @@ test('sidebar uses a single branch entry and opens the exact actionable record',
     api.projectMergeInspect = async (...args) => { f.reads.push(args); return f.mergeRow; };
   });
   await page.getByRole('button', { name: '主项目 的合并记录' }).click();
-  await expect(page.getByRole('button', { name: '返回原合并入口' })).toBeVisible();
+  await expect(page.getByRole('button', { name: /^进入.+合并$/ })).toBeVisible();
   expect(await page.evaluate(() => (window as any).taskFixture.reads[0])).toEqual(['parent', 'relay:fixture', 'op']);
   await page.getByRole('button', { name: '返回对话' }).click();
   await page.evaluate(() => {

@@ -86,3 +86,17 @@
 - `openspec validate simplify-branch-merge-workflow --strict` 与 `git -c core.safecrlf=false diff --check` 通过。
 
 自建 Vite 已停止，三份临时测试文件已移除，截图保留。本轮仅在主工作区修改源码与说明，未提交这些修改，未执行实际 Bravo/Charlie 合并、Kit、发布或安装。下一轮实际顺序应为 Bravo 合入主干，再将更新后的主干分别同步回 Bravo 和 Charlie；操作仍需从对应分支入口审阅并独立确认。已安装桌面程序尚未包含此次修复。
+
+## 2026-11-09 主干入口与操作归属反馈
+
+用户截图显示主干入口内的 Bravo 合并操作，旧预览记录 `2ad15bb9-3f91-449d-8fca-d419c4536df9` 冻结双方于 `d652302`、来源有 3 个未提交文件。只读 Inspect 时 Bravo 已推进到 `ca41970` 且无未提交文件，主干仍为 `d652302`；旧预览不能冒充当前状态。此轮没有替用户提交或合并这些文件。
+
+界面现在持续标明入口 Session 的名称/角色，进入分支操作时另外显示“正在操作：Bravo”及“返回主干记录”，并保留已知父目标。阻塞与文件入口使用实际名称，冻结的文件数标为本次预览。读取先通过 Inspect 核对真实发起归属，只有原发起会话的运行/未知状态或待核对请求才调用 Status；本地旧意图不再授予归属。读取错误单独保存，成功刷新清除旧读取错误，未知写请求仍保留。
+
+- `node node_modules/@playwright/test/cli.js test --config .qa/merge-entry-check/playwright.config.cjs project-merges.spec.ts project-tasks.spec.ts`：最终 49 项通过，46.8 秒，退出码 0。新增 1280px 深色和 390px 浅色用例，覆盖主干保存副本旧请求、查看不调用外来 Status/回执恢复、分支名称和目录归属、显式进入/返回、未知意图不误报等待、暂时读取失败后恢复，以及零自动预览/写入。
+- 首轮 48 项通过、1 项失败：旧文件导航用例仍定位“目标 Session”，新界面显示真实名称“需求”。更新定位后全量 49 项通过；未放宽权限或行为断言。
+- `node node_modules/typescript/bin/tsc --noEmit` 和 `npm run build` 通过，Vite 构建 6.13 秒；保留已有 CJS、动静态导入和大分块提示。最后仅调整中英文间距，浏览器全量回归覆盖最终文案。
+- 人工复核桌面/窄屏截图，入口与操作身份可区分、返回按钮首屏可见、路径折叠，无横向溢出；截图保留在 `.qa/merge-entry-review/desktop.png` 与 `mobile.png`。
+- 测试使用本轮独立 Vite `127.0.0.1:55209`，临时副本与测试源仅 origin 不同并已逐字验证；所有 WebSocket 和其他 HTTP 均被 fixture 封锁。自建服务停止，三份临时测试文件移除。`openspec validate simplify-branch-merge-workflow --strict` 和 `git -c core.safecrlf=false diff --check` 通过。
+
+本轮只修改前端、回归和说明，未改变后端归属校验或 Git 合并算法，未运行实际分支合并、Kit、发布或安装。当前桌面需要后续打包升级才能使用此次界面修复。

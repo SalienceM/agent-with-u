@@ -11,10 +11,11 @@ import { ProjectMergePanel } from './ProjectMergePanel';
 import { ProjectBranchGraph } from './ProjectBranchGraph';
 
 interface Props { session: string; executor: string; backendId: string; backends: any[]; onOpenSession?: (id: string) => void;
+  sessionTitle?: string; sessionRole?: string;
   initialAction?: 'create' | 'manage' | 'merge'; workspaceId?: string; mergeTarget?: string; initialOperation?: string; canCreate?: boolean; onClose?: () => void }
 const statusLabel: Record<string, string> = { preview: '待确认创建', creating: '正在创建', ready: '工作区就绪', error: '创建失败', unknown: '结果未知', archived: '已归档', cleaned: '已清理', discarded: '预览已移除' };
 
-export const ProjectTasksPanel: React.FC<Props> = ({ session, executor, backendId, backends, onOpenSession, initialAction, workspaceId, mergeTarget, initialOperation, canCreate = true, onClose }) => {
+export const ProjectTasksPanel: React.FC<Props> = ({ session, executor, backendId, backends, onOpenSession, sessionTitle, sessionRole, initialAction, workspaceId, mergeTarget, initialOperation, canCreate = true, onClose }) => {
   const [open, setOpen] = useState(!!initialAction), [revision, setRevision] = useState(0), [rows, setRows] = useState<CollaborationSummary[]>([]);
   const [selected, setSelected] = useState(workspaceId || ''), [task, setTask] = useState<TaskWorkspace>();
   const [editing, setEditing] = useState(false), [busy, setBusy] = useState(false), [notice, setNotice] = useState('');
@@ -156,11 +157,13 @@ export const ProjectTasksPanel: React.FC<Props> = ({ session, executor, backendI
           {mode === 'tasks' && <>{canCreate && <WorkflowButton tone="primary" icon="plus" disabled={busy} onClick={newTask}>新建分支副本</WorkflowButton>}
           <WorkflowButton onClick={checkStatus}>核对副本状态</WorkflowButton></>}
           <WorkflowButton onClick={close}>返回对话</WorkflowButton>
+          {sessionTitle && <div aria-label="当前入口" style={{ width: '100%', color: 'var(--theme-text-muted)', fontSize: 12, overflowWrap: 'anywhere' }}>当前入口：{sessionRole || (mergeTarget ? '分支' : '会话')} · {sessionTitle}</div>}
         </header>}
         {mode === 'graph' ? <ProjectBranchGraph session={session} executor={executor} onOpenSession={id => { onOpenSession?.(id); close(); }}
           onOpenMerge={(source, parent) => { setMergeContext({ session: source, operation: undefined, target: parent }); setMode('merge'); }} /> : mode === 'merge' ? <ProjectMergePanel key={`${executor}:${mergeContext.session}:${mergeContext.target || ''}`} session={mergeContext.session} executor={executor}
           initialOperation={mergeContext.operation} fixedTarget={mergeContext.target}
-          onOpenOrigin={(origin, operation) => setMergeContext({ session: origin, operation, target: origin === session ? mergeTarget : undefined })}
+          entrySession={session} entryRole={sessionRole} onBackToEntry={mergeContext.session !== session ? () => setMergeContext({ session, operation: initialOperation, target: mergeTarget }) : undefined}
+          onOpenOrigin={(origin, operation, parent) => setMergeContext({ session: origin, operation, target: parent || (origin === session ? mergeTarget : undefined) })}
           onOpenSession={id => { onOpenSession?.(id); close(); }} /> : <div style={{ display: 'flex', minHeight: 0, flex: 1 }}>
           <section aria-label="当前分支副本" style={{ flex: 1, minWidth: 0, overflow: 'auto', padding: creationView ? 24 : 20 }}>
             {editing && repo ? <TaskWorkspaceForm config={config} repo={repo} backends={backends} executor={executor}

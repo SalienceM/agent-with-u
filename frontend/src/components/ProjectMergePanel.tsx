@@ -10,15 +10,16 @@ const mutedStyle: React.CSSProperties = { color: 'var(--theme-text-muted)', font
 const detailStyle: React.CSSProperties = { borderTop: '1px solid var(--theme-border)', padding: '12px 0', marginTop: 8 };
 const tagStyle: React.CSSProperties = { ...mutedStyle, padding: '3px 8px', borderRadius: 6, background: 'var(--theme-bg-tertiary)', maxWidth: '100%', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' };
 const diagnosticHelp = (entry: MergeDiagnostic, side: string) => {
-  if (entry.code === 'git_dirty') return `先打开${side}查看改动，将需要保留的改动提交到该分支。仅保存文件不会消除 Git 未提交状态。`;
+  if (entry.code === 'git_dirty') return `先在 ${side} 提交需要合入的改动，再重新预览。`;
   if (entry.code === 'buffer_dirty') return `先打开${side}保存未保存的编辑内容，再检查是否需要提交。`;
   if (entry.code === 'activity') return `等待${side}的运行实际结束，再刷新状态。切换页面不会停止运行。`;
   if (entry.code === 'changed') return `${side}已与原计划不同，需要按当前内容重新预览。原记录和成果会保留。`;
   return `打开${side}核对原因；状态未知时不能继续合并。`;
 };
 interface Props { session: string; executor: string; onOpenSession?: (id: string) => void; fixedTarget?: string;
-  initialOperation?: string; onOpenOrigin?: (session: string, operation: string) => void }
-export const ProjectMergePanel: React.FC<Props> = ({ session, executor, onOpenSession, fixedTarget, initialOperation, onOpenOrigin }) => {
+  entrySession?: string; entryRole?: string; onBackToEntry?: () => void;
+  initialOperation?: string; onOpenOrigin?: (session: string, operation: string, parent?: string) => void }
+export const ProjectMergePanel: React.FC<Props> = ({ session, executor, onOpenSession, fixedTarget, initialOperation, onOpenOrigin, entrySession = session, entryRole, onBackToEntry }) => {
   const c = useProjectMergeWorkflow(session, executor, fixedTarget, initialOperation);
   const { row, draft, busy, uncertain, online } = c;
   const own = row?.sourceSessionId === session, workflow = row?.workflow;
@@ -26,7 +27,12 @@ export const ProjectMergePanel: React.FC<Props> = ({ session, executor, onOpenSe
   const verified = workflow ? workflow.gitVerified : row?.verification.status === 'git_verified' && row?.verification.head === row?.candidate;
   const diagnostics = workflow?.diagnostics || [];
   const syncing = row?.direction === 'sync_main';
-  const sides = { source: syncing ? '主 Session' : '来源副本', target: syncing ? '当前分支' : fixedTarget ? '主 Session' : '目标 Session', integration: '处理空间' };
+  const sourceTitle = workflow?.sides.source?.title || row?.source.title;
+  const targetTitle = workflow?.sides.target?.title || row?.target.title;
+  const shortTitle = (title?: string) => title?.split(' · ').pop() || '';
+  const sourceIsMain = syncing || entryRole === '主干' && row?.source.sessionId === entrySession;
+  const targetIsMain = !syncing && !!fixedTarget || entryRole === '主干' && row?.target.sessionId === entrySession;
+  const sides = { source: sourceIsMain ? '主干' : shortTitle(sourceTitle) || '来源分支', target: targetIsMain ? '主干' : shortTitle(targetTitle) || '目标分支', integration: '处理空间' };
   const pairMatches = row && (row.source.sessionId === session && row.target.sessionId === fixedTarget || row.source.sessionId === fixedTarget && row.target.sessionId === session);
   const canSync = c.branchSync && fixedTarget && (!row || own && pairMatches && ['succeeded', 'cancelled', 'error', 'blocked'].includes(row.status));
   const syncMain = () => { if (canSync && !busy && !uncertain && online) void c.preview({ source: fixedTarget!, target: session }); };
@@ -35,8 +41,6 @@ export const ProjectMergePanel: React.FC<Props> = ({ session, executor, onOpenSe
   const needsNewPreview = row && (row.status === 'blocked' && !row.integration || activeDiagnostics.some(entry => entry.code === 'changed'));
   const waiting = uncertain || row?.status === 'unknown' || row?.status === 'preparing' || row?.status === 'applying';
   const finished = row?.status === 'succeeded' || row?.status === 'cancelled';
-  const sourceTitle = workflow?.sides.source?.title || row?.source.title;
-  const targetTitle = workflow?.sides.target?.title || row?.target.title;
   const comparison = workflow?.comparison;
   const currentPair = !!pairMatches && comparison?.state === 'known'
     && Number.isInteger(comparison.sourceAhead) && comparison.sourceAhead! >= 0
@@ -45,6 +49,7 @@ export const ProjectMergePanel: React.FC<Props> = ({ session, executor, onOpenSe
   const branchAhead = currentPair ? (branchIsSource ? comparison!.sourceAhead! : comparison!.targetAhead!) : 0;
   const mainAhead = currentPair ? (branchIsSource ? comparison!.targetAhead! : comparison!.sourceAhead!) : 0;
   const branchDirty = !!workflow?.sides[branchIsSource ? 'source' : 'target']?.dirty.length;
+  const operationTitle = row?.sourceSessionId === row?.source.sessionId ? shortTitle(sourceTitle) : row?.sourceSessionId === row?.target.sessionId ? shortTitle(targetTitle) : '原会话';
   const canContinue = !!canSync && row?.status === 'succeeded';
   const nextRound = !canContinue ? '' : currentPair
     ? branchAhead > 0 || branchDirty ? 'merge' : mainAhead > 0 ? 'sync' : 'return'
@@ -81,28 +86,33 @@ export const ProjectMergePanel: React.FC<Props> = ({ session, executor, onOpenSe
       <WorkflowButton tone="primary" disabled={busy || c.loading || !online || !draft.source || !draft.target || draft.source === draft.target} onClick={() => void c.preview()}>{fixedTarget ? '预览合并到主 Session' : '预览汇合计划'}</WorkflowButton>
       {canSync && <WorkflowButton disabled={busy || c.loading || !online || uncertain} onClick={syncMain}>同步主干到此分支</WorkflowButton>}
     </> : row ? <>
+      {onBackToEntry && <div aria-label="操作会话" style={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 8, marginBottom: 12 }}>
+        <span style={tagStyle}>正在操作：{operationTitle}</span>
+        <WorkflowButton tone="quiet" disabled={busy} onClick={onBackToEntry}>返回{entryRole === '主干' ? '主干' : '入口'}记录</WorkflowButton>
+      </div>}
       <header style={{ marginBottom: 18 }}>
         <h3 style={{ margin: '0 0 8px', fontSize: 18, fontWeight: 600 }}>{sourceTitle} <span style={mutedStyle}>→</span> {targetTitle}</h3>
         <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, alignItems: 'center' }}>
           <span style={tagStyle}>{row.status === 'succeeded' ? '上次操作 · ' : ''}{syncing ? '同步主干' : '分支合并'}</span>
-          <span style={tagStyle} title={row.target.branch}>{row.target.branch || '未知分支'}</span>
-          <span style={mutedStyle}>{row.status === 'succeeded' ? '上次变化' : '已提交差异'}：{row.files.length} 个文件</span>
+          <span style={tagStyle} title={row.target.branch}>目标：{sides.target} · {row.target.branch || '未知分支'}</span>
+          <span style={mutedStyle}>{row.status === 'succeeded' ? '上次变化' : '本次预览的已提交差异'}：{row.files.length} 个文件</span>
           {syncing && !finished && <span style={mutedStyle}>{row.fastForward ? '可直接快进' : '保留双方提交'}</span>}
         </div>
       </header>
-      {!own && !finished && <div style={workflowNoticeStyle}>关联记录 · 只读
-        <WorkflowButton tone="primary" disabled={!onOpenOrigin || busy} onClick={() => onOpenOrigin?.(row.sourceSessionId, row.id)}>返回原合并入口</WorkflowButton>
+      {!own && !finished && <div style={workflowNoticeStyle}>正在查看 {operationTitle} 发起的合并
+        <WorkflowButton tone="primary" disabled={!onOpenOrigin || busy} onClick={() => onOpenOrigin?.(row.sourceSessionId, row.id,
+          entryRole === '主干' && [row.source.sessionId, row.target.sessionId].includes(entrySession) ? entrySession : undefined)}>进入 {operationTitle} 合并</WorkflowButton>
       </div>}
       <div aria-label="下一步" style={{ padding: '18px 20px', borderRadius: 12, background: 'var(--theme-bg-secondary)', color: 'var(--theme-text)', border: '1px solid var(--theme-border)', marginBottom: 16, position: 'relative' }}>
         <WorkflowButton tone="quiet" icon="refresh" aria-label="核对原操作" title="刷新此条合并的状态" disabled={busy || !online} onClick={c.refresh} style={{ float: 'right', margin: '-5px -8px 4px 8px' }} />
         {!online ? <><strong>执行节点离线，暂时不能继续</strong><p style={mutedStyle}>连接恢复后刷新状态。</p></>
           : waiting ? <><strong>{uncertain || row.status === 'unknown' ? '提交结果待核对' : row.status === 'preparing' ? '正在准备合并' : '正在应用合并'}</strong><p style={mutedStyle}>等待原操作结果，或点击刷新核对。</p></>
           : firstIssue || row.status === 'blocked' ? <>
-            <strong>暂时不能合并：{firstIssue ? `${sides[firstIssue.side]}${firstIssue.code === 'git_dirty' ? ' 有未提交文件' : `：${firstIssue.notice}`}` : row.blockers[0] || row.notice || '需要先处理阻塞'}</strong>
+            <strong>{firstIssue ? `${sides[firstIssue.side]}${firstIssue.code === 'git_dirty' ? firstIssue.paths?.length ? ` 有 ${firstIssue.paths.length} 个未提交文件` : ' 有未提交改动' : firstIssue.code === 'changed' ? ' 已变化，请重新预览' : `：${firstIssue.notice}`}` : row.blockers[0] || row.notice || '需要先处理阻塞'}</strong>
             <p>{firstIssue ? diagnosticHelp(firstIssue, sides[firstIssue.side]) : '请核对下方阻塞详情。处理后重新预览当前内容，再确认准备。'}</p>
-            {row.files.length === 0 && activeDiagnostics.some(entry => entry.code === 'git_dirty') && <p>上面的 0 个文件只表示已提交差异；未提交改动尚未计入。</p>}
+            {row.files.length === 0 && activeDiagnostics.some(entry => entry.code === 'git_dirty') && <p style={mutedStyle}>未提交改动尚未计入本次预览。</p>}
             <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
-              {firstIssue?.sessionId && <WorkflowButton tone="primary" disabled={!onOpenSession} onClick={() => onOpenSession?.(firstIssue.sessionId)}>打开{sides[firstIssue.side]} 处理</WorkflowButton>}
+              {firstIssue?.sessionId && <WorkflowButton tone="primary" disabled={!onOpenSession} onClick={() => onOpenSession?.(firstIssue.sessionId)}>打开 {sides[firstIssue.side]}</WorkflowButton>}
               {own && needsNewPreview && <WorkflowButton disabled={blocked} onClick={repreview}>重新预览合并</WorkflowButton>}
             </div>
           </> : row.status === 'preview' ? <><strong>待确认准备</strong><p style={mutedStyle}>在独立空间准备候选，目标分支暂不变更。</p></>
@@ -148,7 +158,7 @@ export const ProjectMergePanel: React.FC<Props> = ({ session, executor, onOpenSe
         {activeDiagnostics.map((entry, i) => (i > 0 || !!entry.paths?.length) && <div key={i} style={{ ...workflowNoticeStyle, marginBottom: 8 }}>
           {i > 0 && <><strong>{sides[entry.side]}：{entry.notice}</strong>
           {entry.sessionId && <WorkflowButton tone="quiet" disabled={!onOpenSession} onClick={() => onOpenSession?.(entry.sessionId)}>打开对应 Session</WorkflowButton>}</>}
-          {!!entry.paths?.length && <details><summary>查看{sides[entry.side]} 的文件（{entry.paths.length}）</summary>
+          {!!entry.paths?.length && <details><summary>查看 {sides[entry.side]} 的文件（{entry.paths.length}）</summary>
           <p style={{ fontSize: 12 }}>目录：{entry.root || '详情不可用'}</p>
           {entry.paths.slice(0, 20).map(file => <div key={file.path}>
             <WorkflowButton tone="quiet" disabled={!entry.sessionId || !entry.root || !onOpenSession} onClick={() => openFile(entry.sessionId, entry.root || '', file.path)}>{file.path}</WorkflowButton>
