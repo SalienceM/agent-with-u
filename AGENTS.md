@@ -2259,7 +2259,9 @@ the parent. Unknown/offline/busy members cannot produce a global latest badge. S
 independent of list hydration, capped at two projects, coalesced on relevant events, refreshed on
 return/reconnect and every 60 seconds while visible. Hidden views stop reads; old identity/node
 responses are ignored. Managed writes and confirmed chat-task exit emit `branch_changed` after
-the write/registry boundary. Badges preserve ordinary Session selection; their small detail button
+the write/registry boundary. Status is a single-line compact button beside the Backend badge,
+using the ordinary Session row density. Short labels retain full status in the tooltip and accessible
+name/description. Ordinary row selection stays separate; activating the status button
 opens the existing merge UI without creating a plan or executing a write. External changes are
 sampled, not filesystem-watched, and the tooltip records the comparison and checked time.
 Successful receipts are historical: their old target HEAD/file count/test evidence cannot assert

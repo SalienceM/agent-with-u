@@ -29,7 +29,7 @@ export function useSessionBranchStatus(sessions: BranchSessionRef[], visible: Br
       setBadges(old => {
         const next = { ...old };
         for (const id of state.family.ids) next[`${state.family.executor}:${id}`] = rows instanceof Map
-          ? rows.get(id) || { label: '状态待核对', detail: '当前成员不在读取结果中', tone: 'muted' } : rows;
+          ? rows.get(id) || { label: '状态待核对', shortLabel: '待核对', detail: '当前成员不在读取结果中', tone: 'muted' } : rows;
         return next;
       });
     };
@@ -44,7 +44,7 @@ export function useSessionBranchStatus(sessions: BranchSessionRef[], visible: Br
           if (!valid()) return;
           const caps = await api.projectMergeCapabilities(state.family.root, state.family.executor);
           if (!valid()) return;
-          if (caps.branchStatus !== 1) { publish(state, { label: '状态不可用', detail: '原节点尚不支持当前分支状态，请升级该节点', tone: 'muted' }); return; }
+          if (caps.branchStatus !== 1) { publish(state, { label: '状态不可用', shortLabel: '不可用', detail: '原节点尚不支持当前分支状态，请升级该节点', tone: 'muted' }); return; }
           let offset = 0, identity = '', total = -1, checkedAt = 0;
           const tips = new Map<string, SessionBranchTip>();
           do {
@@ -67,7 +67,7 @@ export function useSessionBranchStatus(sessions: BranchSessionRef[], visible: Br
           }
         });
       } catch (error) {
-        if (valid()) publish(state, { label: '状态待核对', detail: `当前分支读取失败：${String(error)}`, tone: 'muted' });
+        if (valid()) publish(state, { label: '状态待核对', shortLabel: '待核对', detail: `当前分支读取失败：${String(error)}`, tone: 'muted' });
       } finally {
         state.reading = false;
         if (current() && state.dirty) schedule(state);
@@ -79,7 +79,7 @@ export function useSessionBranchStatus(sessions: BranchSessionRef[], visible: Br
     };
     const invalidate = (state: typeof states[number]) => {
       state.version++; state.dirty = true;
-      publish(state, { label: !state.online ? '离线 · 待核对' : state.busy ? '运行中 · 待核对' : '核对中…', detail: '当前状态尚未完成核对，不使用旧合并记录判断最新', tone: 'muted' });
+      publish(state, { label: !state.online ? '离线 · 待核对' : state.busy ? '运行中 · 待核对' : '核对中…', shortLabel: !state.online ? '离线' : state.busy ? '待核对' : '核对中', detail: '当前状态尚未完成核对，不使用旧合并记录判断最新', tone: 'muted' });
       schedule(state);
     };
     const refreshAll = () => states.forEach(invalidate);
