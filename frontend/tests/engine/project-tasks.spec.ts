@@ -56,6 +56,96 @@ async function mount(page: Page, width = 1200, sidebar = false, integration = fa
   }, { sidebar, integration });
 }
 
+for (const width of [1280, 390]) test(`compact copy form creates in one click with automatic directory (${width})`, async ({ page }, testInfo) => {
+  await mount(page, width);
+  await page.evaluate(async dark => {
+    const { api } = await import('/tests/engine/chat-kit-feedback-harness.ts');
+    const inspect = api.taskWorkspaceInspect;
+    api.taskWorkspaceInspect = async (...args) => {
+      const repo = await inspect(...args);
+      return { ...repo, dirty: [], defaults: { ...repo.defaults!, skills: Array.from({ length: 30 }, (_, i) => `skill-${i}`), constraints: '长约束'.repeat(200) } };
+    };
+    const theme = { '--theme-bg-secondary': dark ? '#151b25' : '#fff', '--theme-text': dark ? '#e6edf3' : '#222', '--theme-bg': dark ? '#0d1117' : '#f4f6fa', '--theme-text-muted': dark ? '#9ba8bb' : '#687487', '--theme-border': dark ? '#303b4c' : '#dce1e8', '--theme-panel-solid': dark ? '#151b25' : '#fff' };
+    Object.entries(theme).forEach(([key, value]) => document.documentElement.style.setProperty(key, value));
+  }, width === 1280);
+  await page.getByRole('button', { name: '分支副本与合并', exact: true }).click();
+  await page.getByRole('button', { name: '新建分支副本', exact: true }).click();
+  const dialog = page.getByRole('dialog', { name: '分支副本', exact: true });
+  await expect(page.getByLabel('副本名称', { exact: true })).toBeFocused();
+  await expect(page.getByLabel('任务约束', { exact: true })).toBeHidden();
+  await expect(page.getByLabel('项目文件范围', { exact: true })).toBeHidden();
+  await expect(dialog.getByRole('button', { name: '合并', exact: true })).toHaveCount(0);
+  await expect(dialog.getByRole('button', { name: '分支图', exact: true })).toHaveCount(0);
+  await expect(dialog).toContainText('目录和分支自动分配');
+  const create = dialog.getByRole('button', { name: '创建副本', exact: true });
+  expect((await dialog.boundingBox())!.width).toBeLessThanOrEqual(562);
+  expect((await create.boundingBox())!.height).toBeGreaterThanOrEqual(42);
+  await page.getByLabel('副本名称', { exact: true }).fill('新功能对话');
+  await page.getByLabel('初始需求', { exact: true }).fill('创建后由我开始');
+  await page.screenshot({ path: testInfo.outputPath('copy-form.png'), fullPage: true, animations: 'disabled' });
+  await page.setViewportSize({ width, height: 560 });
+  const actionBounds = (await create.boundingBox())!;
+  expect(actionBounds.y + actionBounds.height).toBeLessThanOrEqual(560);
+  expect(await dialog.evaluate(node => node.scrollWidth <= node.clientWidth)).toBeTruthy();
+  await page.screenshot({ path: testInfo.outputPath('copy-form-short.png'), fullPage: true, animations: 'disabled' });
+  await create.click();
+  await expect(dialog).toContainText('正在创建');
+  expect(await page.evaluate(() => {
+    const f = (window as any).taskFixture;
+    return { plans: f.plans.length, name: f.plans[0].title, skills: f.plans[0].skills.length, source: f.plans[0].inheritSource,
+      snapshot: f.plans[0].snapshotMode, created: f.created.length, fingerprint: f.created[0][4], opened: f.opened, started: f.started };
+  })).toEqual({ plans: 1, name: '新功能对话', skills: 30, source: true, snapshot: 'current', created: 1, fingerprint: 'plan', opened: [], started: [] });
+  await page.evaluate(() => {
+    const f = (window as any).taskFixture; f.row = { ...f.row, status: 'ready', revision: 3 };
+    f.callbacks.forEach((cb: any) => cb(f.row, 'local'));
+  });
+  await expect(dialog).toHaveCount(0);
+  expect(await page.evaluate(() => (window as any).taskFixture.opened)).toEqual(['child']);
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBeTruthy();
+});
+
+test('failed copy planning preserves the form and never submits creation', async ({ page }) => {
+  await mount(page);
+  await page.evaluate(async () => {
+    const { api } = await import('/tests/engine/chat-kit-feedback-harness.ts');
+    api.taskWorkspacePlan = async () => { throw Error('项目内容已变化，请重新检查'); };
+  });
+  await page.getByRole('button', { name: '分支副本与合并', exact: true }).click();
+  await page.getByRole('button', { name: '新建分支副本', exact: true }).click();
+  await page.getByLabel('副本名称', { exact: true }).fill('保留我的配置');
+  await page.getByLabel('项目文件范围', { exact: true }).selectOption('selected');
+  await page.getByRole('button', { name: '创建副本', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('项目内容已变化');
+  await expect(page.getByLabel('副本名称', { exact: true })).toHaveValue('保留我的配置');
+  expect(await page.evaluate(() => {
+    const f = (window as any).taskFixture;
+    return { created: f.created, started: f.started, opened: f.opened };
+  })).toEqual({ created: [], started: [], opened: [] });
+});
+
+test('closing during plan preparation cannot reopen a completed copy on a later visit', async ({ page }) => {
+  await mount(page);
+  await page.evaluate(async () => {
+    const { api } = await import('/tests/engine/chat-kit-feedback-harness.ts');
+    const plan = api.taskWorkspacePlan;
+    api.taskWorkspacePlan = (...args) => new Promise(resolve => { (window as any).finishPlan = async () => resolve(await plan(...args)); });
+  });
+  await page.getByRole('button', { name: '分支副本与合并', exact: true }).click();
+  await page.getByRole('button', { name: '新建分支副本', exact: true }).click();
+  await page.getByLabel('项目文件范围', { exact: true }).selectOption('selected');
+  await page.getByRole('button', { name: '创建副本', exact: true }).click();
+  await page.getByRole('button', { name: '返回对话', exact: true }).click();
+  await page.evaluate(async () => { await (window as any).finishPlan(); });
+  await expect.poll(() => page.evaluate(() => (window as any).taskFixture.created.length)).toBe(1);
+  await page.evaluate(() => {
+    const f = (window as any).taskFixture; f.row = { ...f.row, status: 'ready', revision: 3 };
+    f.callbacks.forEach((cb: any) => cb(f.row, 'local'));
+  });
+  await page.getByRole('button', { name: '分支副本与合并', exact: true }).click();
+  await expect(page.getByRole('button', { name: '打开副本 Session' })).toBeVisible();
+  expect(await page.evaluate(() => (window as any).taskFixture.opened)).toEqual([]);
+});
+
 for (const width of [1280, 390]) test(`sidebar branch copies keep family together and merge to parent (${width})`, async ({ page }) => {
   await mount(page, width, true);
   const parent = page.locator('[aria-haspopup="menu"]').filter({ hasText: '主项目' });
@@ -101,8 +191,9 @@ for (const closeEarly of [false, true]) test(`new child opens as a Session only 
   await page.locator('[aria-haspopup="menu"]').filter({ hasText: '主项目' }).click({ button: 'right' });
   await page.getByRole('menuitem', { name: '新建分支副本' }).click();
   await page.getByLabel('项目文件范围', { exact: true }).selectOption('selected');
+  await page.getByText('更多设置', { exact: true }).click();
   await page.getByRole('button', { name: '预览副本创建计划' }).click();
-  await page.getByRole('button', { name: '确认创建副本（不运行模型）' }).click();
+  await page.getByRole('button', { name: '创建副本' }).click();
   await expect(page.getByRole('dialog', { name: '分支副本', exact: true })).toContainText('正在创建');
   expect(await page.evaluate(() => (window as any).taskFixture.opened)).toEqual([]);
   if (closeEarly) await page.getByRole('button', { name: '返回对话', exact: true }).click();
@@ -122,6 +213,7 @@ for (const [width, lost] of [[1280, false], [390, true]] as const) test(`discard
   await page.getByRole('button', { name: '分支副本与合并', exact: true }).click();
   await page.getByRole('button', { name: '新建分支副本', exact: true }).click();
   await page.getByLabel('项目文件范围', { exact: true }).selectOption('selected');
+  await page.getByText('更多设置', { exact: true }).click();
   await page.getByRole('button', { name: '预览副本创建计划' }).click();
   await page.evaluate(async lost => {
     const { api } = await import('/tests/engine/chat-kit-feedback-harness.ts');
@@ -134,7 +226,7 @@ for (const [width, lost] of [[1280, false], [390, true]] as const) test(`discard
   if (lost) {
     await expect(page.getByRole('status')).toContainText('移除结果未知');
     await expect(page.getByRole('button', { name: '移除预览', exact: true })).toBeDisabled();
-    await expect(page.getByRole('button', { name: '确认创建副本（不运行模型）' })).toBeDisabled();
+    await expect(page.getByRole('button', { name: '创建副本' })).toBeDisabled();
     await page.getByRole('button', { name: '核对副本状态' }).click();
   }
   const current = page.getByRole('region', { name: '当前分支副本' });
@@ -336,13 +428,14 @@ for (const width of [1300, 390]) test(`task preview freezes selection; explicit 
   await page.getByLabel('初始需求', { exact: true }).fill('修复功能');
   await expect(page.getByLabel('.env · 凭据路径', { exact: true })).toBeDisabled();
   await expect(page.getByLabel('same.txt', { exact: true })).toBeChecked();
-  await expect(page.getByRole('button', { name: '预览副本创建计划' })).toBeDisabled();
+  await expect(page.getByRole('button', { name: '创建副本', exact: true })).toBeDisabled();
   await page.getByLabel('项目文件范围', { exact: true }).selectOption('selected');
+  await page.getByText('更多设置', { exact: true }).click();
   await page.getByRole('button', { name: '预览副本创建计划' }).click();
   expect(await page.evaluate(() => (window as any).taskFixture.created)).toEqual([]);
   const plan = await page.evaluate(() => (window as any).taskFixture.plans[0]);
   expect(plan.includePaths).toEqual(['same.txt']); expect(plan.skipPermissions).toBe(false); expect(plan.kitApprovalDelegation).toBeUndefined();
-  await page.getByRole('button', { name: '确认创建副本（不运行模型）' }).click();
+  await page.getByRole('button', { name: '创建副本' }).click();
   await expect(page.getByRole('dialog', { name: '分支副本', exact: true })).toContainText('正在创建');
   expect(await page.evaluate(() => (window as any).taskFixture.started)).toEqual([]);
   await page.getByRole('button', { name: '返回对话', exact: true }).click();
@@ -361,9 +454,10 @@ test('lost create receipt is checked without duplicate creation; hierarchy keeps
   await page.getByRole('button', { name: '新建分支副本', exact: true }).click();
   await page.getByLabel('副本名称', { exact: true }).fill('任务');
   await page.getByLabel('项目文件范围', { exact: true }).selectOption('selected');
+  await page.getByText('更多设置', { exact: true }).click();
   await page.getByRole('button', { name: '预览副本创建计划' }).click();
   await page.evaluate(() => { (window as any).taskFixture.fail = true; });
-  await page.getByRole('button', { name: '确认创建副本（不运行模型）' }).click();
+  await page.getByRole('button', { name: '创建副本' }).click();
   await expect(page.getByRole('status')).toContainText('结果未知');
   await page.getByRole('button', { name: '核对副本状态' }).click();
   await expect(page.getByRole('dialog', { name: '分支副本', exact: true })).toContainText('正在创建');
