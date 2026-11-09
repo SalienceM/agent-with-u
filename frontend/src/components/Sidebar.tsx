@@ -16,6 +16,7 @@ import { SkillBindingTree } from './SkillBindingTree';
 import { InteractionBadge } from './UserInteractionsPanel';
 import { taskSessionTree, projectTaskSessions } from '../utils/taskSessionTree';
 import { SessionBranchDialog } from './SessionBranchDialog';
+import { useSessionBranchStatus } from '../hooks/useSessionBranchStatus';
 
 interface Session extends SessionViewMetadata {
   id: string;
@@ -714,6 +715,8 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
     return arr;
   }, [visibleSessions, normalizedSearch, maxPerNode]);
 
+  const branchBadges = useSessionBranchStatus(sessions, groups.filter(group => !collapsedGroups.has(group.key)).flatMap(group => group.sessions), !collapsed && view === 'sessions', streamingSessions);
+
   const toggleGroup = useCallback((key: string) => {
     setCollapsedGroups(prev => {
       const next = new Set(prev);
@@ -1046,6 +1049,7 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
                 const attention = mergeAttention(sessions, s.id, s.execKey || 'local', streamingSessions);
                 const isContextTarget = sessionContextMenu?.session.id === s.id;
                 const familyKey = `${s.execKey || 'local'}:${s.id}`;
+                const branchBadge = s.relationKind !== 'integration' && s.relationKind !== 'review' ? branchBadges[familyKey] : undefined;
                 const familyExpanded = !!normalizedSearch || expandedSessionFamilies.has(familyKey);
                 // “接管既有 thread”是来源，“SSH Codex”是执行位置；两者可同时成立。
                 const isCodexAttached = s.codexThreadAttached === true
@@ -1122,6 +1126,7 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
                       style={renameInputStyle}
                     />
                   ) : (
+                    <div style={{ flex: 1, minWidth: 0 }}>
                     <div style={sessionTitleStyle}>
                       {s.sessionType === 'loop' && <span title={s.loopExecutionMode === 'aimein' ? 'AIMEIN 执行模式' : 'LOOP 会话'}>{s.loopExecutionMode === 'aimein' ? '◎' : '🔁'}</span>}
                       {(s.execMode === 'relay' || String(s.execKey || '').startsWith('relay:'))
@@ -1131,6 +1136,14 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
                       <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', color: isActive ? 'var(--theme-accent, #7aa2f7)' : 'var(--theme-text, #e2e3ea)' }}>
                         {s.title}
                       </span>
+                    </div>
+                    {branchBadge && <div title={branchBadge.detail} style={{ display: 'flex', alignItems: 'center', gap: 4, marginTop: 4, fontSize: 10.5, lineHeight: 1.3,
+                      color: branchBadge.tone === 'good' ? 'var(--theme-success, #4eaa78)' : branchBadge.tone === 'warning' ? 'var(--theme-warning, #d79b43)' : 'var(--theme-text-muted, #8c98aa)' }}>
+                      <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{branchBadge.label}</span>
+                      <button type="button" aria-label={`${s.title} 的当前分支状态：${branchBadge.label}`} title={branchBadge.detail}
+                        style={{ flexShrink: 0, minWidth: 20, minHeight: 20, padding: '0 3px', border: '1px solid var(--theme-border)', borderRadius: 4, background: 'transparent', color: 'inherit', cursor: 'pointer' }}
+                        onClick={event => { event.stopPropagation(); setBranchDialog({ session: { ...s, mergeLink: undefined }, action: 'merge' }); }}>›</button>
+                    </div>}
                     </div>
                   )}
                   <div style={compactActionsStyle}>

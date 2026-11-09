@@ -18,6 +18,7 @@ export interface TaskWorkspace {
   cleanupPlan?: { fingerprint: string; notice: string; workspace: TaskRepository; parent: TaskRepository };
 }
 export interface ProjectMerge {
+  repair?: MergeRepairState;
   direction?: 'merge' | 'sync_main'; fastForward?: boolean;
   id: string; revision: number; sourceSessionId: string; title: string; status: string; notice?: string; planFingerprint: string;
   source: TaskRepository & { sessionId: string; title: string }; target: TaskRepository & { sessionId: string; title: string };
@@ -28,6 +29,11 @@ export interface ProjectMerge {
   workflow?: MergeWorkflow;
 }
 
+export interface MergeRepairState { status: 'idle' | 'running' | 'unknown' | 'needs_attention' | 'failed' | 'ready'; requestId?: string; notice?: string; canStart?: boolean }
+export interface MergeRepairSnapshot { operationId: string; sessionId: string; revision: number; repair: MergeRepairState;
+  messages: Array<{ id: string; role: string; content: string }>; truncated: boolean;
+  permission: import('../components/PermissionGate').PermissionRequestData | null }
+
 export interface ProjectBranchGraphData {
   version: number; snapshot: string; checkedAt: number; root: string; repositoryId: string;
   limit: number; hasMore: boolean; omittedBranches: number;
@@ -35,6 +41,11 @@ export interface ProjectBranchGraphData {
     head?: string; branch?: string; ahead?: number; behind?: number; dirty?: boolean; notice?: string }>;
   commits: Array<{ hash: string; parents: string[]; author: string; date: string; message: string }>;
 }
+
+export interface SessionBranchTip { sessionId: string; title: string; main: boolean; state: 'known' | 'unknown';
+  head?: string; branch?: string; ahead?: number; behind?: number; dirty?: boolean; busy?: boolean; notice?: string }
+export interface SessionBranchStatusPage { version: number; parentSessionId: string; familyRevision: string; checkedAt: number;
+  items: SessionBranchTip[]; total: number; nextOffset: number | null }
 
 export interface MergeLink { operationId: string; originSessionId: string; sourceSessionId: string; targetSessionId: string; status: string; createdAt?: number }
 export interface MergeSummary { id: string; title?: string; displayTitle?: string; status: string; revision: number; updatedAt?: number; createdAt?: number;

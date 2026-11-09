@@ -33,12 +33,15 @@ export function useProjectMergeWorkflow(session: string, executor: string, fixed
   const [row, setRow] = useState<ProjectMerge>(), [history, setHistory] = useState<MergeSummary[]>([]);
   const [next, setNext] = useState<number | null>(null), [supported, setSupported] = useState<boolean>();
   const [branchSync, setBranchSync] = useState(false);
+  const [mergeRepair, setMergeRepair] = useState(false);
   const [notice, setNotice] = useState(''), [busy, setBusy] = useState(false), [online, setOnline] = useState(true);
   const [nonce, setNonce] = useState(0), [loading, setLoading] = useState(true);
+  const [checking, setChecking] = useState(false);
   const [items, setItems] = useState<Array<{ id: string; title: string; workingDir: string }>>([]);
   const current = useRef(identity), state = useRef({ draft, row, supported, online }), mounted = useRef(false);
   const inspected = useRef(false);
-  const readTurn = useRef<{ key: string; again: boolean }>();
+  const readTurn = useRef<{ key: string; again: boolean; force: number }>();
+  const forceRead = useRef(0), requiredRevisions = useRef(new Map<string, number>());
   current.current = identity; state.current = { draft, row, supported, online };
   const valid = () => mounted.current && current.current === identity && getCurrentUserProfile().userId === owner;
   const save = (update: (old: Draft) => Draft) => {
@@ -49,7 +52,8 @@ export function useProjectMergeWorkflow(session: string, executor: string, fixed
   useEffect(() => {
     mounted.current = true;
     const saved = restore(identity, fixedTarget ? session : '', fixedTarget, initialOperation);
-    state.current.draft = saved; setDraft(saved); setRow(undefined); setHistory([]); setSupported(undefined); setBranchSync(false); setNotice('');
+    state.current.draft = saved; setDraft(saved); setRow(undefined); setHistory([]); setSupported(undefined); setBranchSync(false); setMergeRepair(false); setNotice('');
+    inspected.current = false; requiredRevisions.current.clear(); forceRead.current++;
     return () => { mounted.current = false; };
   }, [identity, initialOperation]);
   const install = (value: ProjectMerge, fresh = false) => {
@@ -68,10 +72,13 @@ export function useProjectMergeWorkflow(session: string, executor: string, fixed
       promise = (async () => {
         const capability = state.current.supported;
         // Status 的退出恢复只允许原 origin；相关入口仅用 Inspect，不冒用来源身份。
-        const origin = state.current.row?.id === id ? state.current.row.sourceSessionId : history.find(item => item.id === id)?.originSessionId;
-        if (!capability || origin === session || state.current.draft.intents[id]) {
+        const known = state.current.row?.id === id ? state.current.row : history.find(item => item.id === id);
+        const origin = known && ('originSessionId' in known ? known.originSessionId : known.sourceSessionId);
+        const recover = !!state.current.draft.intents[id] || !known || ['preparing', 'applying', 'unknown'].includes(known.status);
+        if (!capability || recover && (origin === session || state.current.draft.intents[id])) {
           const status = await api.projectMergeStatus(session, executor, id);
           if (!capability) return status;
+          install(status); // 先展示已保存结果；实时检查结束前保持写操作禁用。
         }
         if (getCurrentUserProfile().userId !== owner) throw new Error('身份已变化');
         return api.projectMergeInspect(session, executor, id);
@@ -114,6 +121,7 @@ export function useProjectMergeWorkflow(session: string, executor: string, fixed
       if (!live || !valid()) return;
       const enabled = caps.mergeWorkflow === 1; state.current.supported = enabled; setSupported(enabled);
       setBranchSync(caps.branchSync === 1);
+      setMergeRepair(caps.mergeRepair === 1);
       if (!enabled) setNotice('此节点只支持原发起 Session 历史；关联详情与自动核对不可用。已有操作保留。');
       await list(0, enabled, true);
     }).catch(error => { if (live && valid()) setNotice(`读取失败，未创建新操作：${String(error)}`); })
@@ -124,24 +132,34 @@ export function useProjectMergeWorkflow(session: string, executor: string, fixed
     if (supported === undefined || !draft.selected || !online || !visible || document.visibilityState === 'hidden') return;
     const key = `${identity}:${draft.selected}`;
     if (readTurn.current?.key === key) { readTurn.current.again = true; return; }
-    const turn = { key, again: false }; readTurn.current = turn;
-    void inspect().catch(error => { if (valid()) setNotice(`核对失败；未重试写入。${String(error)}`); }).finally(() => {
+    const turn = { key, again: false, force: forceRead.current }; readTurn.current = turn;
+    setChecking(true);
+    let received: ProjectMerge | undefined;
+    void inspect().then(value => { received = value; }).catch(error => { if (valid()) setNotice(`核对失败；未重试写入。${String(error)}`); }).finally(() => {
       if (readTurn.current !== turn) return;
       readTurn.current = undefined;
-      if (turn.again && valid()) setNonce(n => n + 1);
+      // 推送若已包含在本次读到的修订里，不再扫描全部工作区；手动刷新仍强制重读。
+      const again = turn.again && (turn.force !== forceRead.current || (received?.revision || 0) < (requiredRevisions.current.get(draft.selected) || 0));
+      if (again && valid()) setNonce(n => n + 1);
+      else if (valid()) setChecking(false);
     });
   }, [identity, draft.selected, supported, nonce, online, visible]);
   useEffect(() => {
     const seen = new Map<string, number>();
-    const refresh = () => { if (visibility.current && document.visibilityState !== 'hidden' && valid()) setNonce(n => n + 1); };
-    const finished = (key: string) => { if (key === identity && valid()) { setBusy(false); refresh(); } };
+    const refresh = (force = true) => { if (visibility.current && document.visibilityState !== 'hidden' && valid()) { if (force) forceRead.current++; setNonce(n => n + 1); } };
+    const returned = () => refresh();
+    const finished = (key: string) => { if (key === identity && valid()) { setBusy(false); refresh(false); } };
     settled.add(finished);
     const offMerge = api.onProjectMergeUpdated((value, node) => {
       if (node !== executor || !valid()) return;
       if ((seen.get(value.id) || 0) >= value.revision) return;
       seen.set(value.id, value.revision);
       if (seen.size > 100) seen.delete(seen.keys().next().value!);
-      if (value.id === state.current.draft.selected) refresh();
+      if (value.id === state.current.draft.selected) {
+        requiredRevisions.current.set(value.id, value.revision);
+        if (requiredRevisions.current.size > 100) requiredRevisions.current.delete(requiredRevisions.current.keys().next().value!);
+        refresh(false);
+      }
       if ([value.sourceSessionId, value.actualSourceSessionId, value.targetSessionId, value.integrationSessionId].includes(session)) void list().catch(() => {});
     });
     const offStream = api.onStreamDelta(delta => {
@@ -158,8 +176,8 @@ export function useProjectMergeWorkflow(session: string, executor: string, fixed
       if (!valid()) return; setOnline(connected);
       if (!connected) setNotice('执行节点离线；保留原操作和请求，重连只查询。');
     });
-    document.addEventListener('visibilitychange', refresh); window.addEventListener('focus', refresh);
-    return () => { settled.delete(finished); offMerge(); offStream(); offActivity(); offConnection(); document.removeEventListener('visibilitychange', refresh); window.removeEventListener('focus', refresh); };
+    document.addEventListener('visibilitychange', returned); window.addEventListener('focus', returned);
+    return () => { settled.delete(finished); offMerge(); offStream(); offActivity(); offConnection(); document.removeEventListener('visibilitychange', returned); window.removeEventListener('focus', returned); };
   }, [identity]);
   const run = async (work: () => Promise<void>) => {
     if (pending.has(identity) || !valid() || !state.current.online) return;
@@ -181,21 +199,22 @@ export function useProjectMergeWorkflow(session: string, executor: string, fixed
     } catch (error) { if (valid()) setNotice(`接收结果待核对；没有重发。${String(error)}`); }
   });
   useEffect(() => {
-    if (!row || !['candidate', 'conflict'].includes(row.status) || !row.integration?.sessionId || !inspected.current || busy || !online || !supported || row.sourceSessionId !== session || draft.intents[row.id]
+    if (!row || !['candidate', 'conflict'].includes(row.status) || !row.integration?.sessionId || !inspected.current || checking || busy || !online || !supported || row.sourceSessionId !== session || draft.intents[row.id]
       || !visible || document.visibilityState === 'hidden' || !row.workflow?.canAutoVerify || row.workflow.gitVerified) return;
     const integration = row.workflow.sides.integration;
     const key = `${identity}:${row.id}`, candidate = `${integration?.head}:${integration?.fingerprint || ''}`;
     if (!integration?.head || autoChecked.get(key) === candidate) return;
     autoChecked.set(key, candidate); if (autoChecked.size > 100) autoChecked.delete(autoChecked.keys().next().value!);
     void action('Verify');
-  }, [row, busy, online, supported, identity, visible]);
-  return { row: row?.id === draft.selected ? row : undefined, history, next, loading, supported, branchSync, notice, busy: busy || pending.has(identity), online,
+  }, [row, checking, busy, online, supported, identity, visible]);
+  return { row: row?.id === draft.selected ? row : undefined, history, next, loading, checking, readReady: inspected.current && !checking, supported, branchSync, mergeRepair, notice, busy: busy || pending.has(identity), online,
     draft, items, uncertain: !!draft.intents[draft.selected],
     change: (patch: Partial<Draft>) => save(old => ({ ...old, ...patch })),
     select: (id: string) => { save(old => ({ ...old, selected: id })); setRow(undefined); setNotice(''); },
-    refresh: () => { setNonce(n => n + 1); if (supported === undefined) void run(async () => {
+    refresh: () => { forceRead.current++; setNonce(n => n + 1); if (supported === undefined) void run(async () => {
       const caps = await api.projectMergeCapabilities(session, executor); if (!valid()) return;
       setBranchSync(caps.branchSync === 1);
+      setMergeRepair(caps.mergeRepair === 1);
       state.current.supported = caps.mergeWorkflow === 1; setSupported(state.current.supported); await list();
     }); },
     more: () => next !== null && void run(() => list(next)), action,

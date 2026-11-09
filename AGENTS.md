@@ -2211,9 +2211,26 @@ or integration Sessions can inspect, but `_merge_row` still rejects writes from 
 opening never creates a preview. User/executor/Session selection and unknown request intents survive
 closing; no grants are stored. Checks coalesce in flight, ignore stale revisions and duplicate events,
 and only auto-Verify a visible, online candidate/conflict with an actually idle clean integration.
+In-flight inspection absorbs events already covered by its returned revision; explicit refresh still
+requests a fresh read. Stable known records skip redundant origin Status calls, while running/unknown
+records and unresolved intents retain original-origin recovery. Workspace inspection reads at most
+three sides concurrently, preserving all metadata, ownership and post-read identity checks. The UI
+shows history summaries during loading and disables write actions until a fresh inspection succeeds;
+explicit read-only Verify remains available. No persistent safety-result cache is introduced.
 Preparation completion, confirmed turn exit and return trigger bounded reads, never polling, Start
 or Apply. Inspect itself does not reconcile unknown apply receipts; original-origin Status retains
 that authority. Two independent plan confirmations remain in the continuous panel.
+`mergeRepair=1` adds managed repair within that same B → A request. `project_merge_repair.py`
+keeps Start acceptance separate from saved repair progress; duplicate request IDs never replay,
+and explicit new attempts require an idle known workspace. The owned chat completion callback
+verifies the actual Git candidate even when the panel is closed. Failed/incomplete repairs retain
+their work; unknown native exits block another start. Repair does not Apply or claim test success.
+`projectMergeRepairRead` returns at most 20 recent visible messages / 48k characters and the current
+permission plan after checking the exact integration association. `ProjectMergeRepair` renders
+bounded stream text, original-ID approvals and native questions within the original request,
+with no chat auto-continue or automatic model call. Only the origin gets interactive controls;
+legacy nodes keep their recovery entry. Stream deltas do not repeat Git inspection. Hidden views
+unsubscribe; reopening or reconnecting only reads. Advanced integration history remains available.
 Diagnostics distinguish source/target/integration disk paths, index/worktree/untracked state,
 unsaved buffers, activity and unknown details. Buffer paths are bounded and capability-gated;
 other owners' buffer paths remain hidden. File navigation revalidates the executor and workspace.
@@ -2226,6 +2243,20 @@ Completed merges show one result card and one continuation action. Current works
 do not turn a completed receipt into an unresolved merge. Compact Git/test states remain visible;
 full plans, paths, evidence and final receipts expand under “变更与验证详情”, with history separate.
 The card's refresh icon retains the accessible name “核对原操作”.
+The merge-request header names both source and target branches. Overview and changed-file views
+share the same operation; switching views performs no new read or write. File actions open the exact
+source/target workspace, not a claim of a frozen diff. Prepare and Apply retain separate confirmations.
+The Sidebar separately projects current branch relationships through `branchStatus=1` and
+`projectBranchStatus`: paged ordinary task members, current Git ahead/behind and dirty/busy state,
+without commit-log reads. `useSessionBranchStatus` never derives latest from historical merge
+receipts. It checks complete membership and a consistent main tip across pages before summarizing
+the parent. Unknown/offline/busy members cannot produce a global latest badge. Status reads are
+independent of list hydration, capped at two projects, coalesced on relevant events, refreshed on
+return/reconnect and every 60 seconds while visible. Hidden views stop reads; old identity/node
+responses are ignored. Managed writes and confirmed chat-task exit emit `branch_changed` after
+the write/registry boundary. Badges preserve ordinary Session selection; their small detail button
+opens the existing merge UI without creating a plan or executing a write. External changes are
+sampled, not filesystem-watched, and the tooltip records the comparison and checked time.
 Successful receipts are historical: their old target HEAD/file count/test evidence cannot assert
 that the current branch is synchronized. `workflow.comparison` reads current immutable tips with
 bounded Git counts and rechecks repository/HEAD/branch before returning; unknown remains unknown.
@@ -2246,11 +2277,15 @@ Prepare/Apply confirmations, identity rechecks and target reservation. Main merg
 separate receipts; a failed sync cannot undo a successful main merge. History includes both
 directions. Never auto-sync other active copies, push, rebase, reset or stash.
 `project_branch_graph.py` provides `branchGraph=1` and a read-only Session-scoped snapshot of
-the main Session plus up to 15 ordinary copies, prioritizing the current copy. Actual parent
-OIDs drive the horizontal DAG, with the commit table and lazy diff below. Counts use immutable
-tips; changed HEAD/branch reads fail, unavailable branches stay unknown. The UI opens only on
-“分支图”, reads 80 (explicitly up to 200) commits, discloses omitted branches/ancestry, and offers
-“合并与同步” directly per branch without submitting a preview. No polling, fetch or node fallback.
+the main Session plus up to 15 ordinary copies, prioritizing the current copy. Branch reads and final
+tip rechecks use at most four workers under the same deadline; metadata checks remain complete.
+The “分支” view leads with named branch rows and the selected branch's commits, then “查看合并请求”
+without submitting a preview. Commit labels show every branch proven to contain the commit via the
+bounded parent graph, including shared tips; absence is not proof of exclusion beyond that range.
+The horizontal DAG is optional and computed only when expanded. Counts use immutable tips;
+changed HEAD/branch reads fail, unavailable branches stay unknown. Reads retain the last same-identity
+snapshot during refresh, disclose stale/loading/error states and omitted branches/ancestry, and load
+80 (explicitly up to 200) commits. Commit details/diffs remain lazy. No polling, fetch or node fallback.
 Graph shape and text-conflict checks are not proof of functional compatibility.
 Run merge regressions with `python scripts/test_merge_workflow_isolated.py`: short private TEMP,
 APPDATA and DATA_ROOT plus disabled user/system Git config; restore cwd before cleaning that root.

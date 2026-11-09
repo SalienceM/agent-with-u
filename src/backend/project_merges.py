@@ -13,12 +13,13 @@ from . import paths
 from .task_git import TaskGit, canonical_path
 from .session_collaboration_store import CollaborationError, fingerprint
 from .project_merge_workflow import ProjectMergeWorkflow
+from .project_merge_repair import ProjectMergeRepair
 from ..types import Session
 
 FINAL = {'succeeded', 'cancelled', 'error'}
 
 
-class ProjectMerges(ProjectMergeWorkflow):
+class ProjectMerges(ProjectMergeRepair, ProjectMergeWorkflow):
     def _merge_job_key(self, scope: Any, operation: str) -> str:
         return fingerprint([scope.owner, scope.executor, operation])
 
@@ -223,7 +224,7 @@ class ProjectMerges(ProjectMergeWorkflow):
                         raise CollaborationError('来源或目标已变化，不能恢复旧候选，请重新预览')
             git = TaskGit(integration['root']); result = git.inspect()
             conflicts = git.run('diff', '--name-only', '--diff-filter=U', '-z')
-            if conflicts or result['dirty']: raise CollaborationError('仍有 Git 冲突或未提交修改，请在整合会话解决并提交')
+            if conflicts or result['dirty']: raise CollaborationError('仍有冲突或未提交修改，可在本请求继续修复并生成候选提交')
             for original in (row['source']['head'], row['target']['head']):
                 ancestor = git.run('merge-base', original, result['head']).decode().strip()
                 if ancestor != original: raise CollaborationError('候选没有保留来源与目标历史，不能应用')
@@ -325,28 +326,6 @@ class ProjectMerges(ProjectMergeWorkflow):
             row = self._merge_update(scope, row, status='cancelled', notice='已取消后续应用；保留来源、目标和整合空间。')
             store.finish_request(scope, request_id, receipt['revision'], 'cancelled', {'operationId': operation})
         return json.dumps(row, ensure_ascii=False)
-
-    def _rpc_projectMergeStart(self, origin: str, operation: str, request_id: str) -> str:
-        self._window_guard(origin)
-        scope, store, row = self._merge_row(origin, operation)
-        if row['status'] not in {'conflict', 'candidate'}: raise CollaborationError('当前没有可启动的整合候选')
-        if row.get('startRequestId'): return json.dumps(store.request(scope, row['startRequestId']), ensure_ascii=False)
-        receipt, fresh = store.begin_request(scope, request_id, 'mergeStart', {'sessionId': origin, 'operation': operation})
-        if fresh:
-            try:
-                child = self._task_source(row['integration']['sessionId'])
-                self._check_chat_turn_allowed(child.id)
-                row = self._merge_update(scope, row, startRequestId=request_id)
-                prompt = ('在本独立整合目录解决本次 Git 冲突并执行项目相关验证；保留双方成果。'
-                    '只修改当前整合工作区，完成后提交候选；不要更新原目标、推送、删除分支或清理其他目录。'
-                    '\n冻结来源：' + row['source']['head'] + '\n冻结目标：' + row['target']['head']
-                    + '\n冲突路径：' + json.dumps(row['integration']['conflicts'], ensure_ascii=False))
-                self._start_chat_turn(json.dumps({'sessionId': child.id, 'content': prompt, 'backendId': child.backend_id}))
-                receipt = store.finish_request(scope, request_id, receipt['revision'], 'succeeded', {'sessionId': child.id, 'notice': '已接收整合任务；仍须实际核对候选并单独应用。'})
-            except Exception as error:
-                receipt = store.finish_request(scope, request_id, receipt['revision'], 'failed', {'notice': str(error)[:500]})
-        return json.dumps(receipt, ensure_ascii=False)
-
 
 def process_exited(pid: int) -> bool:
     """只读退出核对；PID 复用只会保守保留预留，不用于终止进程。"""

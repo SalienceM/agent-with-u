@@ -2027,7 +2027,7 @@ class BridgeWS(SessionCollaborationBridge, HarnessImageBridge, KitUpdateBridge, 
         collaboration_independent = {'sessionCollaborationList', 'sessionCollaborationGet', 'sessionCollaborationRequestStatus',
             'reviewStatus', 'reviewTargets', 'reviewSnapshot', 'reviewSummarize', 'userInteractionList', 'userInteractionRespond',
             'taskWorkspaceInspect', 'taskWorkspacePlan', 'taskWorkspaceStatus', 'projectBufferReply', 'projectBufferState',
-            'projectBranchGraph', 'projectMergeDiscover', 'projectMergeOperations', 'projectMergeInspect', 'projectMergePreview', 'projectMergeVerify', 'projectMergeStatus', 'taskWorkspaceCleanupPlan', 'projectBufferStatus'}
+            'projectBranchGraph', 'projectBranchStatus', 'projectMergeDiscover', 'projectMergeOperations', 'projectMergeInspect', 'projectMergePreview', 'projectMergeVerify', 'projectMergeStatus', 'projectMergeRepairRead', 'projectMergeRepairPermission', 'taskWorkspaceCleanupPlan', 'projectBufferStatus'}
         independent_methods = collaboration_independent | {'codexModelCatalog', 'codexSessionModelCatalog',
             'loopControlGet', 'releaseStatus', 'loadSession', 'loadSessionMessages'}
 
@@ -2248,7 +2248,11 @@ class BridgeWS(SessionCollaborationBridge, HarnessImageBridge, KitUpdateBridge, 
         if asyncio.iscoroutinefunction(handler):
             if project_directory:
                 return await self._project_guarded_call(project_directory, handler(*params))
-            return await handler(*params)
+            try:
+                return await handler(*params)
+            finally:
+                if sid and method == 'workspaceDocumentSave':
+                    self._emit_session_updated({'type': 'branch_changed', 'sessionId': sid})
         if method in {'loadSession', 'loadSessionMessages'} and sid:
             await self._load_session_for_view(sid)
         if method == 'loopSetPolicy':
@@ -2277,7 +2281,11 @@ class BridgeWS(SessionCollaborationBridge, HarnessImageBridge, KitUpdateBridge, 
             "updatePromptIcon", "setPromptDefault",
         }:
             return await asyncio.to_thread(handler, *params)
-        result = handler(*params)
+        try:
+            result = handler(*params)
+        finally:
+            if project_directory:
+                self._project_branch_changed(project_directory)
         writer = getattr(self, '_loop_control_writes', {}).get(sid)
         if writer and method.startswith('loop') and method not in {'loopGetState', 'loopGetRecord', 'loopAimeinGet'}:
             # 同步兼容入口仍须等待自己的保存完成才回复 ok；等待期间不持有 Store 锁。
@@ -3952,6 +3960,8 @@ class BridgeWS(SessionCollaborationBridge, HarnessImageBridge, KitUpdateBridge, 
                     success = not completed.cancelled() and completed.exception() is None and completed.result() is not False
                     scheduler.turn_finished(sid, success)
                 session = self._active_sessions.get(sid)
+                if session and getattr(session, 'working_dir', ''):
+                    self._emit_session_updated({'type': 'branch_changed', 'sessionId': sid})
                 if session and session.relation_kind == 'integration':
                     # turn registry 已释放才通知；接收方仍核对原生退出/队列，不能信任完成文字。
                     self._emit_session_updated({'type': 'merge_activity', 'sessionId': sid})

@@ -1,5 +1,23 @@
 import type { ProjectBranchGraphData } from '../types/taskWorkspaces';
 
+/** 一个提交可同时在多个分支历史中；只标注本次有界图内可证明的可达关系。 */
+export function branchMembership(data: ProjectBranchGraphData): Map<string, string[]> {
+  const commits = new Map(data.commits.map(commit => [commit.hash, commit]));
+  const included = new Map<string, string[]>();
+  for (const branch of data.branches) {
+    if (branch.state !== 'known' || !branch.head) continue;
+    const pending = [branch.head], seen = new Set<string>();
+    while (pending.length) {
+      const hash = pending.pop()!;
+      if (seen.has(hash) || !commits.has(hash)) continue;
+      seen.add(hash);
+      included.set(hash, [...(included.get(hash) || []), branch.sessionId]);
+      pending.push(...commits.get(hash)!.parents);
+    }
+  }
+  return included;
+}
+
 /** 拓扑次序决定横坐标；只沿真实 first-parent 分配轨道，所有父提交均保留边。 */
 export function layoutBranchGraph(data: ProjectBranchGraphData) {
   const commits = new Map(data.commits.map(commit => [commit.hash, commit]));
