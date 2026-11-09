@@ -253,7 +253,8 @@ export const SeqTaskPanel: React.FC<Props> = ({
     }
   }, [onSteerTask]);
 
-  const canSendNext = !hasSyncing;
+  const canSendNext = !hasSyncing && pending.length > 0;
+  if (!pending.length && !running && !queueError && !mutationError) return null;
 
   return (
     <div style={wrap}>
@@ -267,8 +268,11 @@ export const SeqTaskPanel: React.FC<Props> = ({
           🧬 序列队列
           {pending.length > 0 && <span style={countPill}>{pending.length}</span>}
         </span>
+        {(pending.length > 0 || running) && <span style={{ fontSize: 11, color: 'var(--theme-text-muted)' }}>
+          {chainActive === false ? running ? '执行中 · 后续已暂停' : '已暂停' : running ? '执行中' : isStreaming ? '等待当前回答' : '等待执行'}
+        </span>}
         <div style={{ flex: 1 }} />
-        {chainActive === false && (
+        {chainActive === false && pending.length > 0 && (
           <button onClick={onSendNext} disabled={!canSendNext}
             title={failed ? '重试失败条目并继续；已执行的部分操作可能重复，请先核对聊天结果' : '恢复执行端自动调度，当前回答结束后继续'}
             style={{ ...sendBtn, opacity: canSendNext ? 1 : 0.45, cursor: canSendNext ? 'pointer' : 'not-allowed' }}>
@@ -296,20 +300,11 @@ export const SeqTaskPanel: React.FC<Props> = ({
         </div>
       )}
 
-      {/* 收起时也给出自动队列状态，避免用户误以为新输入丢失。 */}
-      {(pending.length > 0 || running || chainActive === false) && (
-        <div style={autoHint}>
-          {chainActive === false
-            ? '⏸ 执行端已暂停后续任务；重新打开控制端不会自动解除暂停。'
-            : isStreaming || running ? '⏳ 执行端按序执行，关闭控制端不影响后续任务。' : '⚡ 等待执行端派发下一条…'}
-        </div>
-      )}
-
       {open && (
         <div style={{ display: 'flex', flexDirection: 'column', gap: 6, marginTop: 8 }}>
           {pending.length === 0 ? (
             <div style={emptyHint}>
-              队列为空。模型回答期间继续输入并回车，内容会自动依次排入这里。
+              暂无待发任务
             </div>
           ) : pending.map((t, i) => (
             <div key={t.id} style={card}>
@@ -466,7 +461,6 @@ const chevBtn: React.CSSProperties = { background: 'none', border: 'none', curso
 const countPill: React.CSSProperties = { fontSize: 10.5, fontWeight: 700, color: '#fff', background: 'var(--theme-accent)', borderRadius: 999, padding: '0 7px', lineHeight: 1.7 };
 const sendBtn: React.CSSProperties = { fontSize: 11.5, fontWeight: 600, padding: '4px 10px', borderRadius: 7, border: '1px solid var(--theme-accent)', background: 'var(--theme-accent-bg)', color: 'var(--theme-accent)' };
 const clearBtn: React.CSSProperties = { fontSize: 11, padding: '4px 8px', borderRadius: 7, border: '1px solid var(--theme-border)', background: 'none', color: 'var(--theme-text-muted)', cursor: 'pointer' };
-const autoHint: React.CSSProperties = { fontSize: 11, color: 'var(--theme-text-muted)', marginTop: 6, fontStyle: 'italic' };
 const emptyHint: React.CSSProperties = { fontSize: 11.5, color: 'var(--theme-text-muted)', lineHeight: 1.6, padding: '4px 2px' };
 const card: React.CSSProperties = { display: 'flex', alignItems: 'flex-start', gap: 8, padding: '7px 9px', borderRadius: 8, background: 'var(--theme-bg-tertiary)', border: '1px solid var(--theme-border)' };
 const idxBadge: React.CSSProperties = { fontSize: 10.5, fontWeight: 700, color: 'var(--theme-text-muted)', minWidth: 16, textAlign: 'center', marginTop: 2 };

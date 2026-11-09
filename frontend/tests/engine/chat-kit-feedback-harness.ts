@@ -7,6 +7,7 @@ export { ComposerSubmissions } from '../../src/utils/composerSubmissions';
 export { KitDelegationBadge, KitDelegationStatus } from '../../src/components/KitDelegationFeedback';
 export { WorkspaceKitsPanel } from '../../src/components/WorkspaceKitsPanel';
 export { RoleReviewPanel } from '../../src/components/RoleReviewPanel';
+export { SeqTaskPanel } from '../../src/components/SeqTaskPanel';
 export { RoleSessionNotice } from '../../src/components/RoleSessionNotice';
 export { MessageBubble } from '../../src/components/MessageBubble';
 export { ProjectTasksPanel } from '../../src/components/ProjectTasksPanel';

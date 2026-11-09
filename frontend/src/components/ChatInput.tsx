@@ -2075,8 +2075,6 @@ const ChatInputInner = forwardRef<ChatInputHandle, Props>(({
           </div>
         </div>
       )}
-      {workflowTools && <div aria-label="会话协作工具" style={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 2, paddingBottom: 7, marginBottom: 6,
-        borderBottom: '1px solid var(--theme-border, #dce1e8)' }}>{workflowTools}</div>}
       {/* 常用工具保持紧凑；低频操作按需展开。 */}
       <div style={{ display: 'flex', gap: 6, marginBottom: 6, alignItems: 'center', flexWrap: 'wrap' }}>
         {!isMobile && <ToolbarBtn
@@ -2136,6 +2134,7 @@ const ChatInputInner = forwardRef<ChatInputHandle, Props>(({
           executor={imageScope.executor} backends={backends} backendId={activeBackendId} sessionRuntime={sessionRuntime} onSave={followup.saveConfig} />
         <WorkflowPopover label="更多输入工具" title={isMobile ? '' : '更多'} icon="more" open={moreToolsOpen} onOpenChange={setMoreToolsOpen} width={300}>
           <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'stretch', gap: 10 }}>
+            {onOpenOpinions && <WorkflowButton icon="review" onClick={() => { setMoreToolsOpen(false); openOpinionSelector(); }}>评议记录</WorkflowButton>}
             {isMobile && <WorkflowButton icon="shield" aria-pressed={skipPermissions} onClick={() => onSkipPermissionsChange?.(!skipPermissions)}>跳过执行确认{skipPermissions ? ' · 开' : ' · 关'}</WorkflowButton>}
             {isMobile && runtimeConfigurable && <WorkflowButton icon="settings" onClick={() => { onRefreshBackends?.(); setMoreToolsOpen(false); setShowRuntimePicker(true); }}>模型与推理设置</WorkflowButton>}
         {onAdjustFontSize && (
@@ -2156,6 +2155,7 @@ const ChatInputInner = forwardRef<ChatInputHandle, Props>(({
             <WorkflowButton icon="clear" onClick={() => { setMoreToolsOpen(false); handleCompact(); }}>新会话 · 同目录</WorkflowButton>
           </div>
         </WorkflowPopover>
+        {workflowTools && <div aria-label="会话协作工具" style={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 4, minWidth: 0 }}>{workflowTools}</div>}
         {/* 截图按钮:桌面端独有,浏览器无法调起系统截图工具 */}
         {isTauri() && (
           <ToolbarBtn

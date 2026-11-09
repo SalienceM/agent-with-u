@@ -81,7 +81,7 @@ export function useRoleReviewComposer({ session, executor, scope, textarea, chan
     } else if (composerDrafts.get(scope)?.review.receipt?.request === request) {
       composerDrafts.setReview(scope, { ...composerDrafts.ensure(scope).review, receipt: undefined }); changed();
     }
-    // 已接收后的进度和意见由工具栏「评议」入口提示，输入区只保留待处理反馈。
+    // 新结果由工具栏临时提示，历史意见从「更多 → 评议记录」查看。
     setNotice(''); setUnknown(''); onSubmitted?.(request);
   };
   const send = async () => {
@@ -149,7 +149,7 @@ export function useRoleReviewComposer({ session, executor, scope, textarea, chan
         <WorkflowButton disabled={busy || !targets.length} onClick={() => void summarize()}>先生成摘要再评议</WorkflowButton><p style={{ color: 'var(--theme-text-muted)' }}>长回答可先摘要，会额外调用一次模型。</p>
       </details>
       {snapshot && <details><summary>查看冻结摘要 · {snapshot.characters} 字{snapshot.omittedCharacters ? ` · 原文省略 ${snapshot.omittedCharacters} 字` : ''}</summary>{snapshot.limits?.map(text => <p key={text}>{text}</p>)}{snapshot.messages.map(item => <p key={item.id}>{item.text}</p>)}</details>}
-      <div style={{ color: 'var(--theme-text-muted)', marginTop: 8 }}>下方可补充关注点，点击「开始评议」后在“评议”中查看意见。附件留在当前草稿。</div>
+      <div style={{ color: 'var(--theme-text-muted)', marginTop: 8 }}>可在下方补充关注点。历史意见保留在「更多 → 评议记录」。</div>
     </section>}
     {(notice || unknown) && <div role="status" style={{ fontSize: 12, padding: 6, overflowWrap: 'anywhere' }}>{notice || '原评议接收结果待核对'}{unknown && <WorkflowButton onClick={() => void check()}>核对原评议</WorkflowButton>}</div>}
   </>;
