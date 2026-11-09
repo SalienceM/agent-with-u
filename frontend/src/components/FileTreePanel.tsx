@@ -29,6 +29,7 @@ import { DiffViewer } from './DiffViewer';
 import { StructuredFilePreview, type StructuredPreviewPayload } from './StructuredFilePreview';
 import { MarkdownPreview } from './MarkdownPreview';
 import { AppModalPortal, WorkbenchInteractionContext } from './AppModalPortal';
+import { FileDeleteConfirmation } from './FileDeleteConfirmation';
 import { useWindowWriteBlocked } from '../hooks/useWindowWriteBlocked';
 import type { ProvOpenResult } from '../types/prov';
 import {
@@ -702,6 +703,12 @@ const FileTreePanelContent: React.FC<Props & { viewKey: string }> = ({ sessionId
   }, [transferKey, documentOwner]);
   const transfer = React.useSyncExternalStore(fileTransfers.subscribe, getTransferSnapshot);
   const [contextMenu, setContextMenu] = useState<FileContextMenu | null>(null);
+  const [deleteTarget, setDeleteTarget] = useState<{ node: TNode; scope: string; owner: string } | null>(null);
+  const deleteTargetRef = useRef(deleteTarget);
+  const cancelRemoteDelete = useCallback(() => { deleteTargetRef.current = null; setDeleteTarget(null); }, []);
+  useEffect(() => {
+    if (!isVisible || !filesVisible || !sessionOnline || windowFrozen) cancelRemoteDelete();
+  }, [isVisible, filesVisible, sessionOnline, windowFrozen, cancelRemoteDelete]);
 
   // 把“用户此刻正在看的文件”提升到 App 的全局注意力层。二进制/Base64 会在
   // buildFileAttentionContext 中剔除，正文只留在浏览器内直到用户真正提问。
@@ -1825,23 +1832,31 @@ const FileTreePanelContent: React.FC<Props & { viewKey: string }> = ({ sessionId
     setBaseline(next);
   }, [localFs, workingDir, baselineLocalId]);
 
-  const deleteRemoteEntry = useCallback(async (node: TNode) => {
+  const deleteRemoteEntry = useCallback((node: TNode) => {
     setContextMenu(null);
-    if (!node.remote || !node.rel || !workingDir || !sessionOnline || fileTransfers.active(transferKey)) return;
-    const kind = node.isDir ? '目录及其全部内容（含隐藏文件）' : '文件';
-    if (!window.confirm([
-      '永久删除执行端' + kind + '？',
-      '执行节点：' + (execLabel || execKey || '当前执行端'),
-      '工作目录：' + workingDir,
-      '目标：' + node.rel,
-      '',
-      '不可恢复，不经过回收站。本地副本不会删除；之后重新上传可能把它传回来。',
-    ].join('\n'))) return;
+    if (!node.remote || !node.rel || !workingDir || !sessionOnline || windowFrozen || fileTransfers.active(transferKey)) return;
+    const target = { node: { ...node }, scope: previewScope, owner: getCurrentUserProfile().userId };
+    deleteTargetRef.current = target;
+    setDeleteTarget(target);
+  }, [workingDir, sessionOnline, windowFrozen, transferKey, previewScope]);
+
+  const confirmRemoteDelete = useCallback(async () => {
+    const target = deleteTargetRef.current;
+    cancelRemoteDelete(); // 同一次确认只可消费一次，双击不能重复发送删除。
+    if (!target || !mountedRef.current || target.scope !== previewScopeRef.current
+      || target.owner !== getCurrentUserProfile().userId || !isVisible || !filesVisible
+      || !sessionOnline || windowFrozen || fileTransfers.active(transferKey)) return;
+    const node = target.node;
+    const current = () => mountedRef.current && target.scope === previewScopeRef.current
+      && target.owner === getCurrentUserProfile().userId;
     const job = fileTransfers.start(transferKey, (execLabel || execKey || '执行端') + ' · ' + (sessionId || workingDir), 'delete', node.rel);
     if (!job) return;
     try {
       const result = await api.syncDeleteEntry(workingDir, node.rel, node.isDir, execKey);
       if (result.status !== 'ok') throw new Error(result.message || '删除失败');
+      const message = '已删除执行端：' + node.rel + '；本地副本保留，请重新比对后决定是否同步。';
+      fileTransfers.finish(job, message);
+      if (!current()) return;
       const contains = (path: string) => path === node.rel || path.startsWith(node.rel + '/');
       setRemoteManifest(current => current ? Object.fromEntries(Object.entries(current).filter(([path]) => !contains(path))) : null);
       setChildren(current => Object.fromEntries(Object.entries(current)
@@ -1850,16 +1865,14 @@ const FileTreePanelContent: React.FC<Props & { viewKey: string }> = ({ sessionId
       setSelected(current => current && contains(current) ? null : current);
       setPreview(current => current && current.source === 'remote' && contains(current.rel) ? null : current);
       setSearchResults(current => current.filter(entry => !contains(entry.rel)));
-      const message = '已删除执行端：' + node.rel + '；本地副本保留，请重新比对后决定是否同步。';
       setMsg({ kind: 'ok', text: message });
-      fileTransfers.finish(job, message);
       void gitRefreshRef.current?.();
     } catch (error: any) {
       const message = '删除失败或结果未确认：' + (error?.message || String(error)) + '。请刷新目录核实。';
-      setMsg({ kind: 'err', text: message });
+      if (current()) setMsg({ kind: 'err', text: message });
       fileTransfers.finish(job, message, true);
     }
-  }, [workingDir, execKey, execLabel, sessionId, sessionOnline, transferKey]);
+  }, [workingDir, execKey, execLabel, sessionId, sessionOnline, transferKey, windowFrozen, isVisible, filesVisible, cancelRemoteDelete]);
 
   // 收集某节点下所有文件 rel(比对模式用远端清单;否则递归 listDirectory)
   const collectFiles = useCallback(async (node: TNode): Promise<string[]> => {
@@ -2899,6 +2912,10 @@ const FileTreePanelContent: React.FC<Props & { viewKey: string }> = ({ sessionId
         <button className="awu-wb-control" style={compactIconButtonStyle} aria-label="更多文件工具" title="更多文件工具"
           onClick={event => openTool('more', event.currentTarget)}>•••</button>
       </div>
+
+      {deleteTarget && deleteTarget.scope === previewScope && <FileDeleteConfirmation
+        path={deleteTarget.node.rel} workingDir={workingDir} executor={execLabel || execKey || '当前执行端'}
+        isDirectory={deleteTarget.node.isDir} onCancel={cancelRemoteDelete} onConfirm={() => void confirmRemoteDelete()} />}
 
       {draftRecoveryOpen && <Suspense fallback={null}><DocumentDraftRecovery owner={documentOwner}
         onClose={() => setDraftRecoveryOpen(false)} onExport={exportGeneratedText} /></Suspense>}
