@@ -2160,6 +2160,12 @@ Sidebar through its existing debounce. Main menus use one “分支与合并” 
 “合并到主 Session”, and integration chat exposes “返回合并记录”.
 New copy forms use `inheritSource=true` and `snapshotMode=current`: explicit allowlisted runtime
 and ability preferences are deep-copied and frozen, with ordinary permission shown in the plan.
+Creation uses a compact new-conversation form with automatic directory/branch allocation,
+visible runtime/ordinary permission controls and a fixed primary create action. One click freezes
+the plan and submits its fingerprint; an optional preview remains under expanded settings.
+Skills, constraints and file inventories stay collapsed unless file blockers need attention.
+Only that open creation flow's ready receipt opens the child; closing even during planning revokes
+navigation intent. Unknown replies retain status checking without duplicate creation or model start.
 Current tracked changes/deletions and untracked project files become the private-index baseline;
 blocked files fail the full snapshot rather than disappearing. Ignored project `.agents/skills`,
 `.claude/skills`, `.qwen/skills` files are separately copied with bounded inventories and hashes,
