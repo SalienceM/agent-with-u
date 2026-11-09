@@ -2,7 +2,7 @@ import type { SessionBranchTip } from '../types/taskWorkspaces';
 
 export interface BranchSessionRef { id: string; execKey?: string; parentSessionId?: string; relationKind?: string; workingDir?: string }
 export interface BranchFamily { key: string; executor: string; root: string; ids: string[]; signature: string }
-export interface BranchBadge { label: string; detail: string; tone: 'muted' | 'warning' | 'good' }
+export interface BranchBadge { label: string; shortLabel?: string; detail: string; tone: 'muted' | 'warning' | 'good' }
 export const branchSessionKey = (session: BranchSessionRef) => `${session.execKey || 'local'}:${session.id}`;
 
 export function branchFamilies(sessions: BranchSessionRef[], visible: BranchSessionRef[]): BranchFamily[] {
@@ -43,10 +43,10 @@ export function projectBranchBadges(tips: SessionBranchTip[], checkedAt: number)
   const time = new Date(checkedAt * 1000).toLocaleTimeString();
   for (const tip of tips) {
     if (!usable(tip) || !usable(main)) {
-      result.set(tip.sessionId, { label: tip.busy ? '运行/编辑中 · 待核对' : '状态待核对', detail: tip.notice || '当前工作区无法核对，不能判断为最新', tone: 'muted' });
+      result.set(tip.sessionId, { label: tip.busy ? '运行/编辑中 · 待核对' : '状态待核对', shortLabel: '待核对', detail: tip.notice || '当前工作区无法核对，不能判断为最新', tone: 'muted' });
       continue;
     }
-    let label: string, tone: BranchBadge['tone'] = 'warning';
+    let label: string, shortLabel: string, tone: BranchBadge['tone'] = 'warning';
     let detail = `相对 ${main.title}：待合入 ${tip.ahead} 个提交，待同步 ${tip.behind} 个提交。`;
     if (tip.main) {
       const pending = children.filter(child => usable(child) && child.ahead! > 0).length;
@@ -54,14 +54,16 @@ export function projectBranchBadges(tips: SessionBranchTip[], checkedAt: number)
       const dirty = children.filter(child => child.dirty).length;
       label = pending ? `${pending} 个分支待合并${unknown ? ' · 部分待核对' : ''}`
         : unknown ? '部分分支待核对' : dirty ? `${dirty} 个分支未提交` : '最新 · 分支均已合入';
+      shortLabel = pending ? `${pending} 待合并` : unknown ? '待核对' : dirty ? `${dirty} 未提交` : '最新';
       detail = `当前 ${children.length} 个副本中，${pending} 个有待合入提交，${dirty} 个有未提交文件。${unknown ? '部分成员未知，未判断全项目最新。' : ''}`;
       if (!pending && !unknown && !dirty) tone = 'good';
     } else {
       label = tip.ahead && tip.behind ? '待合并 · 待同步' : tip.ahead ? '待合并' : tip.behind ? '待同步' : '已同步';
+      shortLabel = tip.ahead && tip.behind ? '双向更新' : label;
       if (!tip.ahead && !tip.behind) tone = 'good';
     }
-    if (tip.dirty) { label = tone === 'good' ? '有未提交改动' : `${label} · 未提交`; tone = 'warning'; }
-    result.set(tip.sessionId, { label, detail: `${detail}${tip.dirty ? '当前工作区还有未提交文件。' : ''} 核对于 ${time}；点击查看分支与合并。`, tone });
+    if (tip.dirty) { label = tone === 'good' ? '有未提交改动' : `${label} · 未提交`; shortLabel = '未提交'; tone = 'warning'; }
+    result.set(tip.sessionId, { label, shortLabel, detail: `${detail}${tip.dirty ? '当前工作区还有未提交文件。' : ''} 核对于 ${time}；点击查看分支与合并。`, tone });
   }
   return result;
 }

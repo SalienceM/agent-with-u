@@ -895,6 +895,17 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
           outline: 2px solid var(--theme-accent, #7aa2f7);
           outline-offset: 1px;
         }
+        .awu-session-branch-status {
+          background: var(--theme-bg-tertiary, rgba(127,127,127,.10));
+        }
+        .awu-session-branch-status:hover {
+          background: var(--theme-accent-bg, rgba(122,162,247,.14));
+          border-color: var(--theme-border, rgba(127,127,127,.24)) !important;
+        }
+        .awu-session-branch-status:focus-visible {
+          outline: 2px solid var(--theme-accent, #7aa2f7);
+          outline-offset: 2px;
+        }
       `}</style>
       <div style={{ display: 'flex', alignItems: 'center', gap: 5, padding: 'var(--ui-sidebar-header-padding, 10px 10px 7px)' }}>
         <button
@@ -1085,7 +1096,7 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
                   {children.length > 0 && <button type="button" aria-label={`${familyExpanded ? '收起' : '展开'} ${s.title} 的子 Session`}
                     aria-expanded={familyExpanded} disabled={!!normalizedSearch}
                     title={`${children.length} 个子 Session · ${children.filter(row => streamingSessions.has(row.id)).length} 运行 · ${children.filter(row => completedSessions.has(row.id)).length} 完成${normalizedSearch ? ' · 搜索时展开' : ''}`}
-                    style={{ border: 0, background: 'transparent', color: 'var(--theme-text-muted, #656d76)', cursor: normalizedSearch ? 'default' : 'pointer', padding: 2, fontSize: 11, minWidth: 24, minHeight: 24, flexShrink: 0 }}
+                    style={{ border: 0, background: 'transparent', color: 'var(--theme-text-muted, #656d76)', cursor: normalizedSearch ? 'default' : 'pointer', padding: 2, fontSize: 11, minWidth: 24, minHeight: 'min(24px, calc(var(--ui-session-height, 36px) - 8px))', flexShrink: 0 }}
                     onClick={event => { event.stopPropagation(); setExpandedSessionFamilies(old => { const next = new Set(old); if (next.has(familyKey)) next.delete(familyKey); else next.add(familyKey); return next; }); }}>
                     {familyExpanded ? '▾' : '▸'}{children.length}
                   </button>}
@@ -1126,7 +1137,6 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
                       style={renameInputStyle}
                     />
                   ) : (
-                    <div style={{ flex: 1, minWidth: 0 }}>
                     <div style={sessionTitleStyle}>
                       {s.sessionType === 'loop' && <span title={s.loopExecutionMode === 'aimein' ? 'AIMEIN 执行模式' : 'LOOP 会话'}>{s.loopExecutionMode === 'aimein' ? '◎' : '🔁'}</span>}
                       {(s.execMode === 'relay' || String(s.execKey || '').startsWith('relay:'))
@@ -1137,16 +1147,15 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
                         {s.title}
                       </span>
                     </div>
-                    {branchBadge && <div title={branchBadge.detail} style={{ display: 'flex', alignItems: 'center', gap: 4, marginTop: 4, fontSize: 10.5, lineHeight: 1.3,
-                      color: branchBadge.tone === 'good' ? 'var(--theme-success, #4eaa78)' : branchBadge.tone === 'warning' ? 'var(--theme-warning, #d79b43)' : 'var(--theme-text-muted, #8c98aa)' }}>
-                      <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{branchBadge.label}</span>
-                      <button type="button" aria-label={`${s.title} 的当前分支状态：${branchBadge.label}`} title={branchBadge.detail}
-                        style={{ flexShrink: 0, minWidth: 20, minHeight: 20, padding: '0 3px', border: '1px solid var(--theme-border)', borderRadius: 4, background: 'transparent', color: 'inherit', cursor: 'pointer' }}
-                        onClick={event => { event.stopPropagation(); setBranchDialog({ session: { ...s, mergeLink: undefined }, action: 'merge' }); }}>›</button>
-                    </div>}
-                    </div>
                   )}
                   <div style={compactActionsStyle}>
+                    {branchBadge && <button type="button" className="awu-session-branch-status"
+                      aria-label={`${s.title} 的当前分支状态：${branchBadge.label}`} aria-description={branchBadge.detail}
+                      title={`${branchBadge.label}\n${branchBadge.detail}`}
+                      style={{ ...compactBranchStatusStyle, color: branchBadge.tone === 'warning' ? 'var(--theme-warning, #b7791f)' : 'var(--theme-text-muted, #8c98aa)' }}
+                      onClick={event => { event.stopPropagation(); setBranchDialog({ session: { ...s, mergeLink: undefined }, action: 'merge' }); }}>
+                      {branchBadge.shortLabel || branchBadge.label}
+                    </button>}
                     <InteractionBadge sessionId={s.id} executor={s.execKey} onOpen={() => onSelectSession(s.id)} />
                     <span
                       style={{
@@ -2043,6 +2052,19 @@ const compactBackendStyle: React.CSSProperties = {
   color: 'var(--theme-text, #1f2328)',
   fontSize: 9,
   lineHeight: '14px',
+};
+
+const compactBranchStatusStyle: React.CSSProperties = {
+  ...compactBackendStyle,
+  maxWidth: 76,
+  height: 18,
+  boxSizing: 'border-box',
+  padding: '1px 5px',
+  marginRight: 3,
+  border: '1px solid transparent',
+  fontSize: 10,
+  fontFamily: 'inherit',
+  cursor: 'pointer',
 };
 
 const completedDotStyle: React.CSSProperties = {

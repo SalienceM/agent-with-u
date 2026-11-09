@@ -12,7 +12,11 @@ async function mount(page: Page, width = 1280, projects = 1) {
   await page.goto('/');
   await page.evaluate(async ({ projects }) => {
     const { React, createRoot, Sidebar, api } = await import('/tests/engine/chat-kit-feedback-harness.ts');
-    const f = { sessions: [] as any[], tips: {} as Record<string, any[]>, reads: [] as any[], actions: [] as any[], sessionEvents: new Set<any>(), mergeEvents: new Set<any>(),
+    const { uiDensityCss } = await import('/src/utils/uiDensity.ts');
+    const style = document.createElement('style');
+    style.textContent = `* { box-sizing: border-box; } ${uiDensityCss}`; document.head.appendChild(style);
+    document.getElementById('root')!.className = 'app-root';
+    const f = { sessions: [] as any[], tips: {} as Record<string, any[]>, reads: [] as any[], actions: [] as any[], selections: [] as string[], sessionEvents: new Set<any>(), mergeEvents: new Set<any>(),
       connections: new Set<any>(), online: true, supported: true, hidden: false, collapsed: false, hold: false, releases: [] as (() => void)[], active: 0, max: 0, changedPage: false, paging: false, render: () => {} };
     document.body.style.background = '#191b20'; document.body.style.margin = '0';
     Object.entries({ '--theme-bg': '#191b20', '--theme-bg-secondary': '#22252d', '--theme-bg-tertiary': '#292d38', '--theme-sidebar-bg': '#22252d', '--theme-sidebar-solid': '#22252d', '--theme-panel-solid': '#191b20', '--theme-text': '#e6ebf3', '--theme-text-muted': '#a8b2c4', '--theme-border': '#465063', '--theme-accent': '#88b3fc' }).forEach(([key, value]) => document.documentElement.style.setProperty(key, value));
@@ -28,7 +32,7 @@ async function mount(page: Page, width = 1280, projects = 1) {
     f.sessions.push({ id: 'integration', title: '旧整合空间', workingDir: 'C:/integration', execKey: 'relay:fixture', backendId: 'fake', updatedAt: 1, relationKind: 'integration', parentSessionId: 'root0',
       mergeLink: { operationId: 'old-success', originSessionId: 'b0', sourceSessionId: 'b0', targetSessionId: 'root0', status: 'succeeded' } });
     api.listSessions = async () => f.sessions;
-    api.getBackends = async () => [{ id: 'fake', label: 'Fake', type: 'openai-compatible' }];
+    api.getBackends = async () => [{ id: 'fake', label: 'official-codex', type: 'openai-compatible' }];
     api.onSessionUpdated = cb => { f.sessionEvents.add(cb); return () => { f.sessionEvents.delete(cb); }; };
     api.onProjectMergeUpdated = cb => { f.mergeEvents.add(cb); return () => { f.mergeEvents.delete(cb); }; };
     api.onExecutorConnectionStatus = (_e, cb) => { f.connections.add(cb); cb(f.online); return () => { f.connections.delete(cb); }; };
@@ -45,7 +49,7 @@ async function mount(page: Page, width = 1280, projects = 1) {
     api.projectMergePreview = async (...args) => { f.actions.push(args); throw Error('unexpected write'); };
     const root = createRoot(document.getElementById('root')!);
     f.render = () => root.render(React.createElement(Sidebar, { activeSessionId: 'b0', activeExecKey: 'relay:fixture', streamingSessions: new Set(), collapsed: f.collapsed,
-      width: 320, view: f.hidden ? 'files' : 'sessions', onSelectSession: () => {}, onNewSession: () => {} }));
+      width: 320, view: f.hidden ? 'files' : 'sessions', onSelectSession: id => { f.selections.push(id); }, onNewSession: () => {} }));
     (window as any).branchFixture = f; f.render();
   }, { projects });
 }
@@ -64,17 +68,71 @@ for (const width of [1280, 390]) test(`session badges reflect current siblings r
   });
   await expect(page.getByRole('button', { name: '功能 B 的当前分支状态：已同步', exact: true })).toBeVisible();
   await expect(page.getByRole('button', { name: '功能 C 的当前分支状态：待合并 · 待同步', exact: true })).toBeVisible();
+  await expect(page.getByRole('button', { name: '功能 C 的当前分支状态：待合并 · 待同步', exact: true })).toHaveText('双向更新');
   await expect(page.getByRole('button', { name: '项目 A 的当前分支状态：1 个分支待合并', exact: true })).toBeVisible();
   await page.evaluate(() => {
     const f = (window as any).branchFixture; f.tips.root0[1].dirty = true;
     f.sessionEvents.forEach((cb: any) => cb({ type: 'branch_changed', sessionId: 'b0', execKey: 'relay:fixture' }));
   });
   await expect(page.getByRole('button', { name: '功能 B 的当前分支状态：有未提交改动', exact: true })).toBeVisible();
+  await expect(page.getByRole('button', { name: '功能 B 的当前分支状态：有未提交改动', exact: true })).toHaveText('未提交');
   await page.getByRole('button', { name: '功能 C 的当前分支状态：待合并 · 待同步', exact: true }).click();
   await expect(page.getByRole('dialog')).toBeVisible();
   expect(await page.evaluate(() => (window as any).branchFixture.actions)).toEqual([]);
   expect(await page.evaluate(() => (window as any).branchFixture.reads.every((read: any[]) => read[1] === 'relay:fixture'))).toBe(true);
 });
+
+for (const width of [1280, 390]) for (const theme of ['dark', 'light']) {
+  test(`compact branch badges preserve ordinary row density (${width}, ${theme})`, async ({ page }, testInfo) => {
+    await mount(page, width);
+    await expect(page.getByRole('button', { name: /项目 A 的当前分支状态/ })).toBeVisible();
+    await page.evaluate(({ theme }) => {
+      const f = (window as any).branchFixture;
+      const names = ['AgentWithU-维护', 'AgentWithU-维护 · Charlie', 'AgentWithU-维护 · Bravo — 很长的任务名称'];
+      f.sessions.slice(0, 3).forEach((s: any, i: number) => { s.title = names[i]; });
+      f.sessions[0].pinned = true; f.sessions[0].codexThreadAttached = true;
+      f.tips.root0.forEach((tip: any, i: number) => { tip.ahead = 0; tip.behind = 0; tip.title = names[i]; });
+      f.sessions = [...f.sessions, { id: 'ordinary', title: '普通会话 · 设计讨论', execKey: 'relay:fixture', backendId: 'fake', updatedAt: 1, messageCount: 0 }];
+      if (theme === 'light') {
+        Object.entries({ '--theme-bg': '#ffffff', '--theme-bg-secondary': '#f6f8fa', '--theme-bg-tertiary': '#eaeef2', '--theme-sidebar-bg': '#f6f8fa', '--theme-sidebar-solid': '#f6f8fa', '--theme-text': '#1f2328', '--theme-text-muted': '#656d76', '--theme-border': '#d0d7de', '--theme-accent': '#0969da', '--theme-accent-bg': '#0969da1a' })
+          .forEach(([key, value]) => document.documentElement.style.setProperty(key, value));
+        document.body.style.background = '#fff';
+      }
+      window.dispatchEvent(new Event('focus'));
+    }, { theme });
+    const latest = page.getByRole('button', { name: 'AgentWithU-维护 的当前分支状态：最新 · 分支均已合入', exact: true });
+    const child = page.getByRole('button', { name: 'AgentWithU-维护 · Charlie 的当前分支状态：已同步', exact: true });
+    await expect(latest).toHaveText('最新'); await expect(child).toHaveText('已同步');
+    await expect(page.getByText('普通会话 · 设计讨论', { exact: true })).toBeVisible();
+    await expect(child).toHaveAccessibleDescription(/相对 AgentWithU-维护.*核对于/);
+    const geometry = await page.evaluate(() => {
+      const rowFor = (text: string) => [...document.querySelectorAll<HTMLElement>('[aria-haspopup="menu"]')].find(row => row.title.startsWith(text))!;
+      const baseline = rowFor('普通会话 · 设计讨论').getBoundingClientRect();
+      return [...document.querySelectorAll<HTMLButtonElement>('.awu-session-branch-status')].map(button => {
+        const badge = button.getBoundingClientRect(), row = button.closest<HTMLElement>('[aria-haspopup="menu"]')!, rect = row.getBoundingClientRect();
+        const backend = [...button.parentElement!.children].find(el => el.getAttribute('title') === 'official-codex')!.getBoundingClientRect();
+        return { height: rect.height, baseline: baseline.height, aligned: Math.abs(badge.y + badge.height / 2 - backend.y - backend.height / 2),
+          badgeHeight: badge.height, backendHeight: backend.height, overflow: row.scrollWidth > row.clientWidth };
+      });
+    });
+    expect(geometry).toHaveLength(3);
+    for (const row of geometry) {
+      expect(row.height).toBe(row.baseline); expect(row.height).toBe(width > 768 ? 28 : 36);
+      expect(row.aligned).toBeLessThanOrEqual(1); expect(row.badgeHeight).toBe(row.backendHeight); expect(row.overflow).toBe(false);
+    }
+    await page.screenshot({ path: testInfo.outputPath('compact-session-status.png'), fullPage: true });
+    await page.getByText('AgentWithU-维护 · Charlie', { exact: true }).click();
+    expect(await page.evaluate(() => (window as any).branchFixture.selections)).toEqual(['b0']);
+    await expect(page.getByRole('dialog')).toHaveCount(0);
+    await child.focus();
+    await expect(child).toBeFocused();
+    expect(await child.evaluate(el => getComputedStyle(el).outlineStyle)).toBe('solid');
+    await page.keyboard.press('Enter');
+    await expect(page.getByRole('dialog')).toBeVisible();
+    expect(await page.evaluate(() => (window as any).branchFixture.selections)).toEqual(['b0']);
+    expect(await page.evaluate(() => (window as any).branchFixture.actions)).toEqual([]);
+  });
+}
 
 test('offline, unsupported and partial pages never retain a latest badge', async ({ page }) => {
   await mount(page);

@@ -153,14 +153,14 @@ for (const width of [1280, 390]) test(`sidebar branch copies keep family togethe
   await expect(parent).toHaveCount(1); await expect(child).toHaveCount(0);
   await page.getByRole('button', { name: '展开 主项目 的子 Session' }).click();
   await expect(parent.locator('..')).toContainText('功能副本');
-  await child.click();
+  await child.getByText('功能副本', { exact: true }).click();
   expect(await page.evaluate(() => (window as any).taskFixture.opened)).toEqual(['child']);
   await expect(page.getByRole('dialog')).toHaveCount(0);
   await page.getByRole('button', { name: '收起 主项目 的子 Session' }).click();
   await expect(child).toHaveCount(0);
   await page.evaluate(() => (window as any).taskFixture.render());
   await expect(child).toHaveCount(0);
-  await parent.click();
+  await parent.getByText('主项目', { exact: true }).click();
   await page.evaluate(() => { const f = (window as any).taskFixture; f.activeSession = 'child'; f.render(); });
   await expect(child).toBeVisible();
   await parent.click({ button: 'right' });
