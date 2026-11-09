@@ -16,7 +16,7 @@ import { SkillBindingTree } from './SkillBindingTree';
 import { InteractionBadge } from './UserInteractionsPanel';
 import { taskSessionTree, projectTaskSessions } from '../utils/taskSessionTree';
 import { SessionBranchDialog } from './SessionBranchDialog';
-import { useSessionBranchStatus } from '../hooks/useSessionBranchStatus';
+import { SessionBranchStatusDialog } from './SessionBranchStatusDialog';
 
 interface Session extends SessionViewMetadata {
   id: string;
@@ -101,9 +101,11 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
     session: Session;
     x: number;
     y: number;
+    anchor?: HTMLElement;
   } | null>(null);
   const [sessionToDelete, setSessionToDelete] = useState<Session | null>(null);
   const [branchDialog, setBranchDialog] = useState<{ session: Session; action: 'create' | 'manage' | 'merge' } | null>(null);
+  const [branchStatus, setBranchStatus] = useState<{ session: Session; anchor?: HTMLElement } | null>(null);
   const [sessionToDestroy, setSessionToDestroy] = useState<Session | null>(null);
   const [deleting, setDeleting] = useState(false);
   const [deleteResult, setDeleteResult] = useState<SessionDeletionResult | null>(null);
@@ -715,8 +717,6 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
     return arr;
   }, [visibleSessions, normalizedSearch, maxPerNode]);
 
-  const branchBadges = useSessionBranchStatus(sessions, groups.filter(group => !collapsedGroups.has(group.key)).flatMap(group => group.sessions), !collapsed && view === 'sessions', streamingSessions);
-
   const toggleGroup = useCallback((key: string) => {
     setCollapsedGroups(prev => {
       const next = new Set(prev);
@@ -895,17 +895,6 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
           outline: 2px solid var(--theme-accent, #7aa2f7);
           outline-offset: 1px;
         }
-        .awu-session-branch-status {
-          background: var(--theme-bg-tertiary, rgba(127,127,127,.10));
-        }
-        .awu-session-branch-status:hover {
-          background: var(--theme-accent-bg, rgba(122,162,247,.14));
-          border-color: var(--theme-border, rgba(127,127,127,.24)) !important;
-        }
-        .awu-session-branch-status:focus-visible {
-          outline: 2px solid var(--theme-accent, #7aa2f7);
-          outline-offset: 2px;
-        }
       `}</style>
       <div style={{ display: 'flex', alignItems: 'center', gap: 5, padding: 'var(--ui-sidebar-header-padding, 10px 10px 7px)' }}>
         <button
@@ -1060,7 +1049,6 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
                 const attention = mergeAttention(sessions, s.id, s.execKey || 'local', streamingSessions);
                 const isContextTarget = sessionContextMenu?.session.id === s.id;
                 const familyKey = `${s.execKey || 'local'}:${s.id}`;
-                const branchBadge = s.relationKind !== 'integration' && s.relationKind !== 'review' ? branchBadges[familyKey] : undefined;
                 const familyExpanded = !!normalizedSearch || expandedSessionFamilies.has(familyKey);
                 // “接管既有 thread”是来源，“SSH Codex”是执行位置；两者可同时成立。
                 const isCodexAttached = s.codexThreadAttached === true
@@ -1071,6 +1059,7 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
                 return (
                 <div
                   key={s.id}
+                  tabIndex={-1}
                   onClick={() => {
                     setSessionContextMenu(null);
                     onSelectSession(s.id);
@@ -1078,7 +1067,7 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
                   onContextMenu={(event) => {
                     event.preventDefault();
                     event.stopPropagation();
-                    setSessionContextMenu({ session: s, x: event.clientX, y: event.clientY });
+                    setSessionContextMenu({ session: s, x: event.clientX, y: event.clientY, anchor: event.currentTarget });
                   }}
                   aria-haspopup="menu"
                   className={isRunning ? 'session-streaming-item' : undefined}
@@ -1149,13 +1138,6 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
                     </div>
                   )}
                   <div style={compactActionsStyle}>
-                    {branchBadge && <button type="button" className="awu-session-branch-status"
-                      aria-label={`${s.title} 的当前分支状态：${branchBadge.label}`} aria-description={branchBadge.detail}
-                      title={`${branchBadge.label}\n${branchBadge.detail}`}
-                      style={{ ...compactBranchStatusStyle, color: branchBadge.tone === 'warning' ? 'var(--theme-warning, #b7791f)' : 'var(--theme-text-muted, #8c98aa)' }}
-                      onClick={event => { event.stopPropagation(); setBranchDialog({ session: { ...s, mergeLink: undefined }, action: 'merge' }); }}>
-                      {branchBadge.shortLabel || branchBadge.label}
-                    </button>}
                     <InteractionBadge sessionId={s.id} executor={s.execKey} onOpen={() => onSelectSession(s.id)} />
                     <span
                       style={{
@@ -1203,6 +1185,8 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
 
       {branchDialog && <SessionBranchDialog key={`${branchDialog.session.execKey || 'local'}:${branchDialog.session.id}:${branchDialog.action}`}
         session={branchDialog.session} action={branchDialog.action} onClose={() => setBranchDialog(null)} onOpenSession={onSelectSession} />}
+      {branchStatus && <SessionBranchStatusDialog key={`${branchStatus.session.execKey || 'local'}:${branchStatus.session.id}`}
+        session={branchStatus.session} focusTarget={branchStatus.anchor} onClose={() => setBranchStatus(null)} />}
       {sessionContextMenu && (
         <AppModalPortal>
         <div
@@ -1219,6 +1203,10 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
           </div>
           {!sessionContextMenu.session.parentSessionId && !sessionContextMenu.session.relationKind && !sessionContextMenu.session.workspaceId && sessionContextMenu.session.codexConnectionMode !== 'ssh' && <button type="button" role="menuitem" className="awu-session-context-item"
             onClick={() => { setBranchDialog({ session: sessionContextMenu.session, action: 'create' }); setSessionContextMenu(null); }}><span className="awu-session-context-icon">⑂</span><span>新建分支副本</span></button>}
+          {!sessionContextMenu.session.parentSessionId && !sessionContextMenu.session.relationKind && sessionContextMenu.session.workingDir && <button type="button" role="menuitem" className="awu-session-context-item"
+            onClick={() => { setBranchStatus({ session: sessionContextMenu.session, anchor: sessionContextMenu.anchor }); setSessionContextMenu(null); }}>
+            <span aria-hidden="true" className="awu-session-context-icon">⑂</span><span>检查分支状态</span>
+          </button>}
           {sessionContextMenu.session.relationKind === 'task' && sessionContextMenu.session.parentSessionId && <>
             <button type="button" role="menuitem" aria-label="合并到主 Session" className="awu-session-context-item" onClick={() => { setBranchDialog({ session: sessionContextMenu.session, action: 'merge' }); setSessionContextMenu(null); }}><span aria-hidden="true" className="awu-session-context-icon">⇄</span><span>合并到主 Session</span></button>
             <button type="button" role="menuitem" className="awu-session-context-item" onClick={() => { const parent = sessionContextMenu.session.parentSessionId!; setSessionContextMenu(null); onSelectSession(parent); }}>打开主 Session</button>
@@ -2052,19 +2040,6 @@ const compactBackendStyle: React.CSSProperties = {
   color: 'var(--theme-text, #1f2328)',
   fontSize: 9,
   lineHeight: '14px',
-};
-
-const compactBranchStatusStyle: React.CSSProperties = {
-  ...compactBackendStyle,
-  maxWidth: 76,
-  height: 18,
-  boxSizing: 'border-box',
-  padding: '1px 5px',
-  marginRight: 3,
-  border: '1px solid transparent',
-  fontSize: 10,
-  fontFamily: 'inherit',
-  cursor: 'pointer',
 };
 
 const completedDotStyle: React.CSSProperties = {
