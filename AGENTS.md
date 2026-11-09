@@ -1241,7 +1241,7 @@ Workspace Kits are Session-level standard accessories stored separately in
   their original artifacts; published-local installation uses the resulting published subset.
   It then persists
   `waiting_approval`. Formal publishing cannot start until `kitCapabilityRespond` records
-  a human approval or a validated one-run chat delegation bound to the plan fingerprint.
+  a human approval, a scoped run-button human approval, or a validated one-run chat delegation bound to the plan fingerprint.
   ChatInput's default-off `kitApprovalDelegation` send field is the only chat opt-in;
   Its UI is an inline toolbar switch labelled `Kit 代确认`, with a visible `仅本次`
   state when enabled. Sending, focus/Session/Backend changes, busy/queue transitions
@@ -1264,7 +1264,11 @@ Workspace Kits are Session-level standard accessories stored separately in
   `captureBuild` 回执、`bindBuild` 发布和唯一末尾安装步骤；保存不执行，Schedule 禁用。
   更新使用当前 run 成功发布的不可变清单及 SHA-256，不改常规更新源，不读取 latest 决定对象。
   只支持已安装 Windows 桌面；本地壳通过独立握手证明实例，通知不广播到远端控制窗口。
-  发布与安装分别确认；聊天发布委托永远不授权安装。安装确认绑定 owner/Session/run/step/
+  运行按钮通过 `kitRunPreview` 展开并展示本次发布目的地、来源与安装重启设备；人工确认后
+  `KitRun.button_approval` 绑定 owner/Session/run/Kit/输入/配置/设备范围，逐步绑定首次具体计划。
+  预览仅在内存保留十分钟；授权持久保存、最长一天，仅供本次手动 human run 使用，与聊天委托隔离。
+  重复同一确认只返回原运行；范围/设备变化、过期或交接忙闲失败停止自动继续，保留具体计划人工入口。
+  无运行前授权的旧请求仍分别确认；聊天发布委托永远不授权安装。安装确认绑定 owner/Session/run/step/
   fingerprint/requestId，重新检查权限、实例、忙闲和节点共享预留。交接屏障拒绝新任务；
   持久化未知 LOOP/Kit 活动、不可读记录不能当作空闲。
   活动检查流式校验完整 JSON，只投影运行/启动/转交/修复/退出状态，不加载历史正文；
@@ -1293,9 +1297,12 @@ Workspace Kits are Session-level standard accessories stored separately in
   允许唯一构建之后的唯一 `bindBuild` 发布，成功后读取本机保存的实际上传签名清单，核对同次版本及
   发布范围内的制品，直接使用本地包，不重新下载。缺失/变更/失败不走远端兜底。生成器复用真实构建
   Kit；保存与运行均校验顺序、唯一末尾安装及手动运行。核对登记候选/本地文件后复制到更新暂存区，校验
-  SHA-256/大小，沿用已安装 Windows 身份、节点预留、独立人工确认和重启验收。选择与确认绑定
+  SHA-256/大小，沿用已安装 Windows 身份、节点预留、本次人工确认和重启验收。选择与确认绑定
   原回执、可选发布回执和验证策略；取消保留原构建与已发布结果。签名策略不放宽：要求签名或配置验证密钥时拒绝未签名本地
-  回执，继续使用已签名发布路径。测试只用临时项目、惰性制品和 fake 桌面，不等于真实安装验收。
+  回执，继续使用已签名发布路径。普通更新和 Kit 发布/检查更新优先核对当前版本的暂存包及本机
+  构建登记（完整版本、制品身份、大小、SHA-256），匹配才复用，否则按冻结清单下载；不扫描任意目录。
+  登记查询只读账本，不初始化发布管理器或改写 jobs。显式本地直装仍在本次包缺失/变化时失败。
+  测试只用临时项目、惰性制品和 fake 桌面，不等于真实安装验收。
 - 普通命令 Kit 的 `kitCancel` is immediate and idempotent: it first persists the authoritative
   `cancelled` run/step state, then cancels any live orchestration task and terminates
   the exact command process tree by run PID. This also repairs orphaned active records

@@ -40,7 +40,7 @@ def standalone_requested(intent: str) -> bool:
 
 def standalone_template() -> dict[str, Any]:
     return {"status": "ok", "ready": True, "kit": {
-        "title": "本机一键检查并更新", "description": "检查节点更新源 → 冻结版本 → 独立安装确认 → 重启验收；无更新仅报告检查结果",
+        "title": "本机一键检查并更新", "description": "运行前确认 → 检查更新源 → 优先复用本机包 → 安装与重启验收；无更新仅报告检查结果",
         "executionTarget": "executor", "shell": "powershell", "cwd": ".", "command": "",
         "timeoutSeconds": 21600, "inputs": [], "enabled": True,
         "steps": [{"id": "update", "type": "awu_capability", "target": "executor", "title": "检查更新并验收重启",
@@ -104,10 +104,10 @@ def build_template(state: Any, intent: str, *, local_build: bool = False) -> dic
     build = candidates[0]
     publish = not local_build or publication_requested(intent)
     title = "打包、发布并本地直装" if local_build and publish else "本机打包并直接更新" if local_build else "打包、发布并更新本机"
-    description = ("本次构建 → 独立发布确认 → 本地包校验 → 独立安装确认 → 重启验收；不重新下载安装包"
+    description = ("运行前确认 → 构建与发布 → 本地包校验 → 安装与重启验收；不重新下载安装包"
                    if local_build and publish else
-                   "本次本机构建 → 本地制品校验 → 独立安装确认 → 重启验收；不上传、不下载" if local_build else
-                   "本次构建 → 独立发布确认 → 独立安装确认 → 重启验收")
+                   "运行前确认 → 本机构建 → 本地包校验 → 安装与重启验收；不上传、不下载" if local_build else
+                   "运行前确认 → 构建与发布 → 优先复用本机包 → 安装与重启验收")
     return {"status": "ok", "ready": True, "kit": {
         "title": title, "description": description,
         "executionTarget": "executor", "shell": "powershell", "cwd": ".", "command": "",

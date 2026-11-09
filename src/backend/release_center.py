@@ -851,6 +851,40 @@ class ReleaseCenterManager:
                 raise ReleaseCenterError("构建制品在登记后已改变")
         return json.loads(json.dumps(snapshot))
 
+    @staticmethod
+    def local_update_artifact(release: dict[str, Any], artifact: dict[str, Any], state_path: Path) -> str:
+        """只复用已登记且与更新清单完全匹配的本机包；不扫描目录或猜测最新文件。"""
+        # 原子账本只读快照，无需初始化发布管理器或修复历史 job；文件还会独立校验。
+        candidates = _read_json(state_path, {}).get('candidates') or []
+        if not isinstance(candidates, list) or not all(release.get(key) for key in
+                ('version', 'packageVersion', 'buildId', 'sequence')):
+            return ''
+        for candidate in candidates[:MAX_CANDIDATES]:
+            if not isinstance(candidate, dict) or candidate.get("status") == "discarded" or any(candidate.get(key) != release.get(key)
+                    for key in ("version", "packageVersion", "buildId", "sequence", "kitUpdateProtocol")):
+                continue
+            root = Path(str(candidate.get("projectRoot") or ""))
+            if not root.is_absolute():
+                continue
+            for item in candidate.get("artifacts") or []:
+                if not isinstance(item, dict) or any(item.get(key) != artifact.get(key) for key in
+                       ("id", "platform", "arch", "target", "kind", "size", "sha256", "install")):
+                    continue
+                path = Path(str(item.get("path") or ""))
+                try:
+                    if (not path.is_absolute() or str(path).startswith(('\\\\', '//'))
+                            or not path.resolve().is_relative_to(root.resolve())
+                            or not path.is_file() or path.stat().st_size != artifact["size"]):
+                        continue
+                    if any(part.is_symlink() or getattr(part.lstat(), 'st_file_attributes', 0) & 0x400
+                           for part in (path, *path.parents)):
+                        continue
+                    if sha256_file(path) == artifact["sha256"]:
+                        return str(path)
+                except OSError:
+                    continue  # 原构建已清理或被覆盖：由更新器下载已核验清单中的版本。
+        return ""
+
     def published_result(self, job_id: str, plan_id: str, fingerprint: str,
                          run_id: str, step_id: str) -> dict[str, Any]:
         """从真实成功账本生成后续消费凭据，而不是接受调用者提供成功标志。"""

@@ -216,6 +216,8 @@ class KitUpdateBridge:
                 frozen = self._update_manager.journal.freeze(request_id, identity, {
                     "desktop": desktop, "backendPid": os.getpid(), "current": _current_release(),
                     "release": published["release"], "artifact": artifact, "channel": published["channel"],
+                    "transferSource": staged.get('transferSource', ''),
+                    "localSourcePath": staged.get('localSourcePath', ''),
                     **({'localBuild': build_binding, 'sourceKind': 'local_build', 'sourcePath': build_binding['projectRoot'],
                         **({'publishedRelease': published} if build_binding.get('publishedRelease') else {})}
                        if local_build else {"updateSource": source} if standalone else {"publishedRelease": published}),
@@ -239,6 +241,21 @@ class KitUpdateBridge:
             self._update_manager.release_kit(request_id, identity,
                 "cancelled" if isinstance(error, asyncio.CancelledError) else "failed")
             raise
+
+        if runtime.get('phase') == 'waiting_approval' and run.button_approval:
+            audit = self._kit_button_approval(state, session, run, step)
+            if audit:
+                try:
+                    self._confirm_kit_update(state, session, run, step, True,
+                        runtime['planFingerprint'], audit['requestId'], audit=audit)
+                except Exception as error:
+                    # 忙闲/归属/落盘问题不自动重试。已有确认必须保留未知保护，不能撤销预留。
+                    record = self._update_manager.journal.get(request_id, identity)
+                    if record.get('confirmationId'):
+                        runtime['phase'] = step.status = run.status = 'result_unknown'
+                    run.button_approval['invalidated'] = str(error)
+                    runtime['message'] = f'运行前确认未能继续：{error}。请核对当前状态。'
+                    self._kit_save(state)
 
     def _rpc_kitUpdateSelect(self, session_id: str, run_id: str, artifact_id: str,
                              plan_fingerprint: str, request_id: str) -> str:
@@ -283,7 +300,8 @@ class KitUpdateBridge:
         return json.dumps({"status": "accepted", "run": run.to_dict()}, ensure_ascii=False)
 
     def _confirm_kit_update(self, state: Any, session: Any, run: Any, step: Any,
-                            approved: bool, expected_fingerprint: str, request_id: str) -> str:
+                            approved: bool, expected_fingerprint: str, request_id: str,
+                            *, audit: dict[str, Any] | None = None) -> str:
         self._require_node_update_capability()
         self._require_session_access(session.id)
         runtime = step.config.get("capabilityRuntime") or {}
@@ -319,7 +337,7 @@ class KitUpdateBridge:
         self._begin_update_handoff(install_id, run.id)
         try:
             journal.confirm(install_id, identity, expected_fingerprint, request_id)
-            runtime.update(phase="handing_off", approval={"source": "human", "requestId": request_id,
+            runtime.update(phase="handing_off", approval={**(audit or {"source": "human"}), "requestId": request_id,
                            "planFingerprint": expected_fingerprint, "approved": True, "actor": self._current_owner_id()})
             run.status = step.status = "handing_off"
             self._kit_save(state)

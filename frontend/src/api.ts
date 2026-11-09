@@ -3795,8 +3795,14 @@ export const api = {
     const result = await call('kitDelete', sessionId, kitId);
     try { return JSON.parse(result); } catch { return { status: 'error', message: 'Kit 删除响应解析失败' }; }
   },
-  async kitRun(sessionId: string, kitId: string, inputs: Record<string, unknown>): Promise<{ status: string; run?: KitRun; message?: string }> {
-    const result = await call('kitRun', sessionId, kitId, JSON.stringify(inputs || {}), 'human');
+  async kitRunPreview(sessionId: string, kitId: string, inputs: Record<string, unknown>): Promise<{ status: string; previewId?: string; actions?: string[]; message?: string }> {
+    const result = await callKitUpdate(sessionId, 'kitRunPreview', [kitId, JSON.stringify(inputs || {})]);
+    return parseRpcObject(result, { status: 'error', message: '无法读取运行确认范围，请检查执行端连接与版本' });
+  },
+  async kitRun(sessionId: string, kitId: string, inputs: Record<string, unknown>, approvalPreviewId = ''): Promise<{ status: string; run?: KitRun; message?: string }> {
+    const result = approvalPreviewId
+      ? await callKitUpdate(sessionId, 'kitRun', [kitId, JSON.stringify(inputs || {}), 'human', approvalPreviewId])
+      : await call('kitRun', sessionId, kitId, JSON.stringify(inputs || {}), 'human');
     try { return JSON.parse(result); } catch { return { status: 'error', message: 'Kit 运行响应解析失败' }; }
   },
   async kitCancel(sessionId: string, runId: string): Promise<{ status: string; statusNow?: string; run?: KitRun; message?: string }> {
@@ -5763,7 +5769,7 @@ function mockDispatch(method: string, params: any[]): any {
     case 'kitCreate': case 'kitUpdate': case 'kitDelete':
     case 'kitVersionList': case 'kitVersionGet': case 'kitVersionActivate':
     case 'kitOptimizeGet': case 'kitOptimizeAsk': case 'kitOptimizeFinalize':
-    case 'kitRun': case 'kitCancel': case 'kitResume': case 'kitCapabilityRespond': case 'kitClientStepStart': case 'kitClientStepComplete':
+    case 'kitRunPreview': case 'kitRun': case 'kitCancel': case 'kitResume': case 'kitCapabilityRespond': case 'kitClientStepStart': case 'kitClientStepComplete':
     case 'kitClientFileStart': case 'kitClientFileChunk': case 'kitClientFileFinish':
     case 'kitSetControlMode': case 'kitTerminalCommand':
     case 'kitTerminalClose':
