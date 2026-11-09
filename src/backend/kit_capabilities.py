@@ -300,7 +300,7 @@ class ReleasePublishLatestCapability:
 class LocalPublishedUpdateCapability:
     id = UPDATE_CAPABILITY
     title = "安装本次发布并验收重启"
-    description = "仅安装同一次运行中唯一成功的 bindBuild 发布；不能独立使用。安装须在 Kit 面板单独确认。"
+    description = "仅安装同一次运行中唯一成功的 bindBuild 发布；优先复用匹配的本机包。可在运行按钮确认本次安装与重启，不能独立使用。"
     risk_level = "high"
     permission = "node.update.manage"
     approval = "required"
@@ -334,7 +334,7 @@ class LocalPublishedUpdateCapability:
 class LocalCheckUpdateCapability(LocalPublishedUpdateCapability):
     id = CHECK_UPDATE_CAPABILITY
     title = "本机检查更新并验收重启"
-    description = "从执行设备更新中心已配置的源与通道检查，冻结版本后下载；无更新则仅报告检查结果，有更新须面板独立确认安装。无需构建或发布步骤。"
+    description = "从执行设备已配置的源与通道检查，优先复用匹配的本机包，无有效本机包才下载。可在运行按钮确认本次安装与重启；无更新仅报告检查结果。"
     intent_hints = ("本机更新", "更新本机", "本机一键检查并更新", "检查并更新", "检查更新并安装",
                     "本地更新", "local update", "check and update")
     example = {"type": "awu_capability", "target": "executor", "title": title,
@@ -344,7 +344,7 @@ class LocalCheckUpdateCapability(LocalPublishedUpdateCapability):
 class LocalBuildUpdateCapability(LocalPublishedUpdateCapability):
     id = BUILD_UPDATE_CAPABILITY
     title = "安装本次本机构建并验收重启"
-    description = "使用当前运行唯一成功构建的本地安装包，校验并暂存后独立确认安装；可在严格绑定发布成功后使用同一份本地包，不重新下载、不读取 latest。"
+    description = "使用当前运行唯一成功构建的本地安装包；可在运行按钮确认本次安装与重启，也可严格绑定发布后直装，不重新下载、不读取 latest。"
     intent_hints = ("本机更新", "更新本机", "本地更新", "本机打包", "本地打包", "本机构建", "本地构建", "local build", "local update")
     example = {"type": "awu_capability", "target": "executor", "title": title,
                "config": {"capability": id, "arguments": {}}}

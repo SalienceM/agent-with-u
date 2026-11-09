@@ -798,6 +798,7 @@ from .loop_openspec import requested as openspec_requested, run_summary as opens
 from .loop_openspec_bridge import LoopOpenSpecBridge
 from .loop_startup_bridge import LoopStartupBridge
 from .kit_update_bridge import KitUpdateBridge, HANDOFF_RPC, LOCAL_UPDATE_CAPABILITIES
+from .kit_run_approval import KitRunApprovalBridge
 from .kit_update_template import validate_update_sequence
 from .harness_image_bridge import HarnessImageBridge
 from .aside_bridge import AsideInspectionBridge
@@ -807,7 +808,7 @@ from .loop_milestones import (MILESTONE_INSTRUCTIONS, register_plan, review_mile
                               milestone_progress, inherit_plan)
 
 
-class BridgeWS(SessionCollaborationBridge, HarnessImageBridge, KitUpdateBridge, AimeinBridge, AsideInspectionBridge, LoopStartupBridge, LoopOpenSpecBridge, LoopSourceBridge, LoopEnvironmentBridge, LoopTaskBlockerBridge, LoopControlBridge, EngineWorkbenchBridge, WorkspaceDocumentBridge, SyncReviewBridge, WorkspaceSearchBridge, WorkbenchWindowBridge, WorkbenchStreamBridge, TerminalBridge, LanguageBridge):
+class BridgeWS(SessionCollaborationBridge, HarnessImageBridge, KitUpdateBridge, KitRunApprovalBridge, AimeinBridge, AsideInspectionBridge, LoopStartupBridge, LoopOpenSpecBridge, LoopSourceBridge, LoopEnvironmentBridge, LoopTaskBlockerBridge, LoopControlBridge, EngineWorkbenchBridge, WorkspaceDocumentBridge, SyncReviewBridge, WorkspaceSearchBridge, WorkbenchWindowBridge, WorkbenchStreamBridge, TerminalBridge, LanguageBridge):
     """WebSocket bridge，业务逻辑与 Bridge（Qt）完全相同，去掉 Qt 依赖。"""
 
     def __init__(self, cli_path: Optional[str] = None, auth_guard: Optional["AuthGuard"] = None):
@@ -897,6 +898,9 @@ class BridgeWS(SessionCollaborationBridge, HarnessImageBridge, KitUpdateBridge, 
         # 节点更新状态属于物理执行端，不属于任何 Session/用户。写入单独目录，
         # 由本机用户或 Relay 为该设备指定的主用户统一管理。
         self._update_manager = UpdateManager()
+        self._update_manager.local_artifact_resolver = lambda release, artifact: ReleaseCenterManager.local_update_artifact(
+            release, artifact, self._release_center_manager.state_path if self._release_center_manager
+            else paths.data_root() / 'release-center' / 'state.json')
         # 当前物理 Backend 的 Relay 纳管由 ws_main 注入运行期管理器。保持可空，
         # 兼容单元测试和嵌入式调用；前端会据 supported 明确降级。
         self._relay_runtime_manager = None
@@ -11353,7 +11357,7 @@ Kit 版本账本（版本属于 Kit，不属于 AI）：
         return json.dumps({"status": "ok", "controlMode": requested}, ensure_ascii=False)
 
     def _rpc_kitRun(self, session_id: str, kit_id: str, inputs_json: str = "{}",
-                    owner: str = "human") -> str:
+                    owner: str = "human", approval_preview_id: str = "") -> str:
         try:
             inputs = json.loads(inputs_json) if isinstance(inputs_json, str) else dict(inputs_json or {})
         except (TypeError, json.JSONDecodeError):
@@ -11361,6 +11365,7 @@ Kit 版本账本（版本属于 Kit，不属于 AI）：
         result = self._queue_workspace_kit_run(
             session_id, kit_id, inputs if isinstance(inputs, dict) else {},
             trigger="manual", owner="ai" if owner == "ai" else "human",
+            approval_preview_id=approval_preview_id,
         )
         return json.dumps(result, ensure_ascii=False)
 
@@ -12017,6 +12022,7 @@ Kit 版本账本（版本属于 Kit，不属于 AI）：
         trigger: str,
         owner: str,
         command_override: Optional[str] = None,
+        approval_preview_id: str = "",
     ) -> dict:
         self._require_update_work_allowed()
         session = self._kit_session(session_id)
@@ -12024,6 +12030,19 @@ Kit 版本账本（版本属于 Kit，不属于 AI）：
             return {"status": "error", "message": "Session 不存在"}
         state = self._kit_get(session_id)
         kit_id = state.canonical_chain_id(kit_id)
+        if approval_preview_id:
+            from .kit_update_journal import fingerprint
+            if trigger != 'manual' or owner != 'human' or command_override is not None:
+                return {'status': 'error', 'message': '运行按钮确认仅限本次人工运行'}
+            for previous in state.runs:
+                grant = previous.button_approval
+                if grant.get('previewId') == approval_preview_id:
+                    if (grant.get('ownerId') != self._current_owner_id() or previous.kit_id != kit_id
+                            or grant.get('requestFingerprint') != fingerprint({
+                                key: '••••••' if key in grant.get('secretInputs', []) else value
+                                for key, value in supplied_inputs.items()})):
+                        return {'status': 'error', 'message': '运行确认与原请求不匹配'}
+                    return {'status': 'ok', 'run': previous.to_dict()}
         kit = self._kit_find(state, kit_id)
         if not kit:
             return {"status": "error", "message": "Kit 不存在"}
@@ -12050,6 +12069,13 @@ Kit 版本账本（版本属于 Kit，不属于 AI）：
                 except PermissionError as error:
                     return {"status": "error", "message": str(error)}
         run_id = new_id()
+        button_approval = {}
+        if approval_preview_id:
+            try:
+                button_approval = self._kit_run_button_approval(
+                    approval_preview_id, session, kit, resolved, supplied_inputs, steps, run_id)
+            except (ValueError, RuntimeError, PermissionError) as error:
+                return {'status': 'error', 'message': str(error)}
         secret_env: dict[str, str] = {}
         safe_inputs = dict(resolved)
         for spec in kit.inputs:
@@ -12081,11 +12107,15 @@ Kit 版本账本（版本属于 Kit，不属于 AI）：
             inputs=safe_inputs,
             command=command_override or kit.command,
             steps=steps,
+            button_approval=button_approval,
         )
         state.runs.append(run)
         kit.last_run_id = run.id
         kit.updated_at = time.time()
         self._kit_save(state)
+        if button_approval:
+            self._kit_store.save_durable(state)
+            getattr(self, '_kit_run_previews', {}).pop(approval_preview_id, None)
         task = asyncio.create_task(
             self._run_workspace_kit(
                 session_id, kit.id, run.id, command_override=command_override,
@@ -12256,6 +12286,16 @@ Kit 版本账本（版本属于 Kit，不属于 AI）：
             self._kit_save(state)
 
         approval = runtime.get("approval")
+        if run.button_approval and not runtime.get('jobId') and (not approval or approval.get('source') == 'run_button'):
+            audit = self._kit_button_approval(state, session, run, step)
+            if audit and not approval:
+                step.status = run.status = 'waiting_approval'
+                self._respond_kit_capability(session.id, run.id, step.id, True,
+                    expected_fingerprint=runtime['planFingerprint'], audit=audit)
+                self._kit_store.save_durable(state)
+            elif not audit and approval and approval.get('source') == 'run_button':
+                runtime.pop('approval', None)
+            approval = runtime.get('approval')
         if not isinstance(approval, dict) or not approval.get("approved"):
             step.status = "waiting_approval"
             run.status = "waiting_approval"

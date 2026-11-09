@@ -62,7 +62,7 @@ test('local install editor does not expose publication parameters', async ({ pag
   await mount(page, 'node.update_local_build');
   await page.getByRole('button', { name: '编辑', exact: true }).click();
   await page.getByText('高级实现 · Shell、命令与机器判言', { exact: true }).click();
-  await expect(page.getByText('使用本次构建登记的本地安装包；可在严格绑定发布后直装，不重新下载。运行后核对安装计划并单独确认。', { exact: true })).toBeVisible();
+  await expect(page.getByText('使用本次构建登记的本地安装包；可在严格绑定发布后直装，不重新下载。点击运行时确认本次安装与重启。', { exact: true })).toBeVisible();
   await expect(page.getByText('发布通道', { exact: true })).toHaveCount(0);
   await expect(page.getByText('平台筛选（可选，逗号分隔）', { exact: true })).toHaveCount(0);
   expect(await page.evaluate(() => (window as any).updateFixture.calls)).toEqual([]);

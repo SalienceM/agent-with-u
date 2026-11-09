@@ -15,7 +15,7 @@ import sys
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 from urllib.parse import parse_qsl, unquote, urlencode, urljoin, urlparse, urlsplit, urlunsplit
 
 import httpx
@@ -192,6 +192,7 @@ class UpdateManager:
     """One update state machine per executor process."""
 
     def __init__(self, root: Optional[Path] = None):
+        self.local_artifact_resolver: Optional[Callable[[dict[str, Any], dict[str, Any]], str]] = None
         self.root = (root or paths.sub("updates")).expanduser()
         self.root.mkdir(parents=True, exist_ok=True)
         self.config_path = self.root / "config.json"
@@ -942,10 +943,40 @@ class UpdateManager:
         target = release_dir / name
         temporary = target.with_suffix(target.suffix + ".part")
         try:
+            # 清单已经过签名/来源核对；本地文件只替换传输来源，不能决定更新版本。
+            # 显式本次构建路径保持严格语义，缺包/变更不能偷偷下载兜底。
+            reused = ""
+            remote = urlparse(url).scheme in {"http", "https"}
+            if remote:
+                def cached() -> bool:
+                    try:
+                        if target.is_symlink() or not target.is_file() or target.stat().st_size != expected_size:
+                            return False
+                        with target.open('rb') as stream:
+                            digest = hashlib.sha256()
+                            for block in iter(lambda: stream.read(1024 * 1024), b''):
+                                digest.update(block)
+                        return digest.hexdigest() == expected_hash
+                    except OSError:
+                        return False
+                if await asyncio.to_thread(cached):
+                    reused = 'staged_cache'
+                elif self.local_artifact_resolver:
+                    local = await asyncio.to_thread(self.local_artifact_resolver, release, artifact)
+                    if local:
+                        url, reused = local, 'registered_build'
+                if reused:
+                    self._save_state({'message': '复用本机安装包并校验', 'transferSource': reused,
+                                      'localSourcePath': str(target) if reused == 'staged_cache' else url})
+            if not reused:
+                self._save_state({'transferSource': 'download' if remote else 'local_build',
+                                  'localSourcePath': '' if remote else url})
             digest = hashlib.sha256()
             downloaded = 0
             parsed = urlparse(url)
-            if parsed.scheme in {"http", "https"}:
+            if reused == 'staged_cache':
+                downloaded, actual_hash = expected_size, expected_hash
+            elif parsed.scheme in {"http", "https"}:
                 from .update_download import download_http
                 cfg = self._config()
                 downloaded, actual_hash = await download_http(
@@ -974,12 +1005,13 @@ class UpdateManager:
                 raise UpdateError(f"artifact size mismatch: expected {expected_size}, got {downloaded}")
             if actual_hash != expected_hash:
                 raise UpdateError("artifact SHA-256 mismatch")
-            os.replace(temporary, target)
+            if reused != 'staged_cache':
+                os.replace(temporary, target)
             plan = self._build_plan(selection, target, expected_hash)
             plan_path = release_dir / "install-plan.json"
             _atomic_json(plan_path, plan)
             self._save_state({
-                "phase": "staged", "message": "本地安装包已复制并校验，等待安装" if selection.get('sourceKind') == 'local_build' else "更新已下载并校验，等待安装", "error": "",
+                "phase": "staged", "message": "已复用本机安装包并校验，等待安装" if reused else "本地安装包已复制并校验，等待安装" if selection.get('sourceKind') == 'local_build' else "更新已下载并校验，等待安装", "error": "",
                 "downloadedBytes": downloaded, "totalBytes": downloaded,
                 "stagedPath": str(target), "planPath": str(plan_path),
             })

@@ -225,6 +225,7 @@ export interface KitRun {
   currentStep: number;
   artifactIds: string[];
   approvalDelegation?: { id: string; actor: string; messageId: string; issuedAt: number; expiresAt: number };
+  buttonApproval?: { source: 'run_button'; approvedAt: number; invalidated?: string };
   error: string;
   startedAt?: number | null;
   endedAt?: number | null;
@@ -278,6 +279,8 @@ export interface KitCapabilityRuntime {
     manifestUrl?: string;
     sourceKind?: string;
     sourcePath?: string;
+    transferSource?: string;
+    localSourcePath?: string;
     publishedRelease?: Record<string, unknown>;
     fingerprint?: string;
     candidate?: Record<string, unknown>;
@@ -295,7 +298,7 @@ export interface KitCapabilityRuntime {
   };
   approval?: {
     approved: boolean;
-    source?: 'human' | 'chat-delegated';
+    source?: 'human' | 'chat-delegated' | 'run_button';
     delegationId?: string;
     userMessageId?: string;
     requestId?: string;

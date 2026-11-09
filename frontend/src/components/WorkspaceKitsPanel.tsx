@@ -367,6 +367,7 @@ export const WorkspaceKitsPanel: React.FC<Props> = ({ sessionId, open, onClose, 
     setDraft(null);
     setInputs({});
     setCancellingRunIds(new Set());
+    setBusy(false);
     setCapabilityResponding('');
     approvalRequests.current.clear();
     setGenerationJob(null);
@@ -551,24 +552,37 @@ export const WorkspaceKitsPanel: React.FC<Props> = ({ sessionId, open, onClose, 
   };
 
   const runKit = async (kit: WorkspaceKit, runInputs: Record<string, unknown>) => {
+    if (busy) return;
+    const submittedScope = kitUpdateScope(sessionId);
+    const current = () => liveScope.current === submittedScope && kitUpdateScope(sessionId) === submittedScope;
     setBusy(true);
     setNotice(null);
     try {
-      const result = await api.kitRun(sessionId, kit.id, runInputs);
+      const preview = await api.kitRunPreview(sessionId, kit.id, runInputs);
+      if (!current()) return;
+      if (preview.status !== 'ok' || !Array.isArray(preview.actions)) {
+        throw new Error(preview.message || '未能读取运行确认范围');
+      }
+      if (preview.actions.length && (!preview.previewId || !window.confirm(
+        `运行「${kit.title}」？\n\n${preview.actions.join('\n\n')}\n\n确认后仅本次流程自动继续发布/安装，无需等待步骤再次确认。配置或设备变化时会暂停。`,
+      ))) return;
+      if (!current()) return;
+      const result = await api.kitRun(sessionId, kit.id, runInputs, preview.previewId || '');
+      if (!current()) return;
       if (result.status !== 'ok') {
         setNotice({ kind: 'error', text: result.message || '启动失败' });
       }
     } catch (error) {
-      setNotice({ kind: 'error', text: `启动失败：${error instanceof Error ? error.message : String(error)}` });
+      if (current()) setNotice({ kind: 'error', text: `启动失败：${error instanceof Error ? error.message : String(error)}` });
     } finally {
       // Secret 只为这一轮 RPC 短暂驻留在页面内存；无论启动是否成功都立即清空。
       const secretKeys = new Set(kit.inputs.filter((spec) => spec.type === 'secret').map((spec) => spec.key));
-      if (secretKeys.size > 0) {
+      if (current() && secretKeys.size > 0) {
         setInputs((current) => Object.fromEntries(
           Object.entries(current).filter(([key]) => !secretKeys.has(key)),
         ));
       }
-      setBusy(false);
+      if (current()) setBusy(false);
     }
   };
 
@@ -1486,10 +1500,10 @@ const KitEditor: React.FC<{
                     {step.type === 'awu_capability' && isLocalUpdateCapability(step.config?.capability) && (
                       <div style={{ ...subtleStyle, marginTop: 9, lineHeight: 1.5 }}>
                         {step.config?.capability === 'node.update_local_build'
-                          ? '使用本次构建登记的本地安装包；可在严格绑定发布后直装，不重新下载。运行后核对安装计划并单独确认。'
+                          ? '使用本次构建登记的本地安装包；可在严格绑定发布后直装，不重新下载。点击运行时确认本次安装与重启。'
                           : step.config?.capability === 'node.check_update_local'
-                            ? '检查执行设备已配置的更新源；有更新时单独确认安装。'
-                            : '使用本次运行已成功发布的版本；发布后还需单独确认安装。'}
+                            ? '检查执行设备已配置的更新源；优先复用本机包，点击运行时确认本次安装与重启。'
+                            : '使用本次运行成功发布的版本，优先复用本机包；点击运行时确认发布、安装与重启。'}
                       </div>
                     )}
                     {step.type === 'awu_capability' && step.config?.capability === 'release.publish_latest' && (
@@ -1736,6 +1750,10 @@ const CapabilityRunCard: React.FC<{
           : run.approvalDelegation.expiresAt * 1000 <= Date.now() ? ' · 已过期，请人工核对'
           : ' · 尚需 Agent 核对计划或手动确认'}
       </div>}
+      {run.buttonApproval && <div style={{ ...subtleStyle, marginTop: 8 }}>
+        {run.buttonApproval.invalidated ? '运行前确认已暂停，请核对当前计划。' : '已在运行前确认本次发布。'}
+      </div>}
+      {waiting && runtime.message ? <p role="status">{String(runtime.message)}</p> : null}
 
       {artifacts.length > 0 && (
         <div style={{ display: 'grid', gap: 5, marginTop: 10 }}>

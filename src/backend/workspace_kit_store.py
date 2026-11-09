@@ -579,6 +579,7 @@ class KitRun:
     current_step: int = 0
     artifact_ids: list[str] = field(default_factory=list)
     approval_delegation: dict = field(default_factory=dict)
+    button_approval: dict = field(default_factory=dict)
     error: str = ""
     started_at: Optional[float] = None
     ended_at: Optional[float] = None
@@ -604,6 +605,7 @@ class KitRun:
             "currentStep": self.current_step,
             "artifactIds": self.artifact_ids,
             **({"approvalDelegation": self.approval_delegation} if self.approval_delegation else {}),
+            **({"buttonApproval": self.button_approval} if self.button_approval else {}),
             "error": self.error,
             "startedAt": self.started_at,
             "endedAt": self.ended_at,
@@ -648,6 +650,7 @@ class KitRun:
             current_step=current_step,
             artifact_ids=[str(x) for x in (data.get("artifactIds") or [])],
             approval_delegation=dict(data.get("approvalDelegation") or {}),
+            button_approval=dict(data.get("buttonApproval") or {}),
             error=_safe_text(data.get("error"), 20_000),
             started_at=data.get("startedAt"),
             ended_at=data.get("endedAt"),

@@ -56,7 +56,8 @@ export const KitLocalUpdateCard: React.FC<{
   return <section aria-label="本机更新安装计划" style={{ marginTop: 10, padding: 13, borderRadius: 10,
     border: '1px solid var(--theme-border)', background: 'var(--theme-panel-bg, #1b2230)', overflowWrap: 'anywhere' }}>
     <strong>本机更新 · {localBuild && phase === 'staging' ? '复制并校验本地安装包' : phases[phase] || phase}</strong>
-    <p>目标是 Session 执行设备，不是当前控制窗口。安装需单独确认。</p>
+    <p>{run.buttonApproval && !run.buttonApproval.invalidated ? '已在运行前确认本次安装与重启。' : '核对目标设备与版本后确认安装。'}</p>
+    {['registered_build', 'staged_cache'].includes(String(plan.transferSource)) && <div>安装包：复用本机已有包，已校验 SHA-256</div>}
     {localBuild && <div>{publishedLocal ? '来源：本次本机构建 · 已发布 · 使用本地安装包'
       : plan.sourceKind === 'local_build' ? '来源：本次本机构建 · 未上传' : '来源：本次本机构建 · 正在核对发布状态'}</div>}
     {localBuild && plan.sourcePath && <div>构建目录：{plan.sourcePath}</div>}
